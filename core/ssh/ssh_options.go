@@ -1179,6 +1179,7 @@ func normalizeMultiPathEntries(optionName, raw string, normalizeItem func(string
 		return "", fmt.Errorf("invalid %s: value cannot be empty", optionName)
 	}
 	var normalized []string
+	terminated := false
 	for line := range strings.SplitSeq(raw, "\n") {
 		if hasControlOrLineSepChar(line) {
 			return "", fmt.Errorf("invalid %s %q: value contains invalid ASCII control character", optionName, line)
@@ -1190,6 +1191,14 @@ func normalizeMultiPathEntries(optionName, raw string, normalizeItem func(string
 		norm, err := normalizeItem(item)
 		if err != nil {
 			return "", fmt.Errorf("invalid %s %q: %w", optionName, item, err)
+		}
+		if terminated {
+			continue
+		}
+		if IsNoneValue(norm) {
+			normalized = append(normalized, "none")
+			terminated = true
+			continue
 		}
 		if !slices.Contains(normalized, norm) {
 			normalized = append(normalized, norm)
@@ -1420,6 +1429,8 @@ func parseEscapeCharNormalized(spec string) (byte, bool, string, error) {
 
 // ExpandRemoteCommand expands OpenSSH RemoteCommand percent tokens (%%, %C, %d, %h, %i,
 // %l, %L, %n, %p, %r, %u) against env and target without mutating slashes or cleaning paths.
+// Every referenced percent token is validated against control characters and shell
+// metacharacters before interpolation to prevent remote command injection.
 func ExpandRemoteCommand(pattern string, env Environment, target TargetContext) (string, error) {
 	if hasMultiValueDelimiterOrLineBreak(pattern) {
 		return "", errors.New("RemoteCommand cannot contain null bytes or line breaks")
@@ -1444,9 +1455,15 @@ func ExpandRemoteCommand(pattern string, env Environment, target TargetContext) 
 			return "", errors.New("trailing '%' in RemoteCommand")
 		}
 		i++
-		repl, ok := tokens[pattern[i]]
+		tok := pattern[i]
+		repl, ok := tokens[tok]
 		if !ok {
-			return "", fmt.Errorf("unknown RemoteCommand token %%%c", pattern[i])
+			return "", fmt.Errorf("unknown RemoteCommand token %%%c", tok)
+		}
+		if tok != '%' {
+			if err := validateRemoteCommandToken(tok, repl); err != nil {
+				return "", err
+			}
 		}
 		sb.WriteString(repl)
 	}
@@ -1455,6 +1472,29 @@ func ExpandRemoteCommand(pattern string, env Environment, target TargetContext) 
 		return "", errors.New("expanded RemoteCommand cannot contain null bytes or line breaks")
 	}
 	return expanded, nil
+}
+
+func validateRemoteCommandToken(tok byte, val string) error {
+	if hasControlOrLineSepChar(val) {
+		return fmt.Errorf("%w: %%%c %q contains invalid control character", ErrUnsafeExecToken, tok, val)
+	}
+	if tok == 'd' {
+		return validateSafeRemoteHomeToken(val)
+	}
+	return ValidateSafeExecToken("%"+string(tok), val)
+}
+
+func validateSafeRemoteHomeToken(val string) error {
+	if val == "" || len(val) > maxSafeHomeTokenLen || val[0] == '-' {
+		return fmt.Errorf("%w: invalid %%d %q", ErrUnsafeExecToken, val)
+	}
+	if hasControlOrLineSepChar(val) {
+		return fmt.Errorf("%w: %%d %q contains invalid control character", ErrUnsafeExecToken, val)
+	}
+	if strings.ContainsAny(val, ";|&$`()<>'\"") {
+		return fmt.Errorf("%w: %%d %q contains disallowed shell metacharacter", ErrUnsafeExecToken, val)
+	}
+	return nil
 }
 
 func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]string {
@@ -2112,9 +2152,9 @@ func (o *Options) ValidatedControlConfig() (*ControlConfig, error) {
 }
 
 func (o *Options) projectControl(validateEffective bool) (*ControlConfig, error) {
-	mux := finalizeEffectiveOptions(o.FilterByClasses(OptionClassMux))
-	if mux.IsEmpty() {
-		return nil, nil
+	mux, err := o.prepareProjectedMux(validateEffective)
+	if err != nil || mux.IsEmpty() {
+		return nil, err
 	}
 
 	pathSetting, pathErr := mux.ControlPathSetting()
@@ -2158,6 +2198,19 @@ func (o *Options) projectControl(validateEffective bool) (*ControlConfig, error)
 		Persist:       strings.TrimSpace(mux.ControlPersist()),
 		ImplicitTier4: mux.ImplicitTier4,
 	}, nil
+}
+
+func (o *Options) prepareProjectedMux(validateEffective bool) (*Options, error) {
+	rawMux := o.FilterByClasses(OptionClassMux)
+	if rawMux.IsEmpty() {
+		return nil, nil
+	}
+	if validateEffective && !rawMux.ImplicitTier4 {
+		if err := rawMux.validateControlLayerInvariants(); err != nil {
+			return nil, err
+		}
+	}
+	return finalizeEffectiveOptions(rawMux), nil
 }
 
 func parseProjectedControlMaster(raw ControlMasterMode, validateEffective bool) (ControlMasterMode, error) {
@@ -2525,6 +2578,13 @@ func (o *Options) Validate() error {
 		}
 	}
 
+	return o.validateControlLayerInvariants()
+}
+
+func (o *Options) validateControlLayerInvariants() error {
+	if o.IsEmpty() {
+		return nil
+	}
 	var parsedMaster ControlMasterMode
 	if rawMaster := o.ControlMaster(); rawMaster != "" {
 		parsed, err := ParseControlMasterMode(string(rawMaster))
@@ -2548,6 +2608,10 @@ func (o *Options) Validate() error {
 
 	if pathSetting.Disabled() && isActiveControlMaster(string(parsedMaster)) {
 		return fmt.Errorf("%w: ControlPath cannot be 'none' when ControlMaster is %q", ErrSSHOptionsValidation, o.ControlMaster())
+	}
+
+	if pathSetting.Disabled() && persistSetting.Enabled() {
+		return fmt.Errorf("%w: ControlPath cannot be 'none' when ControlPersist is %q", ErrSSHOptionsValidation, o.ControlPersist())
 	}
 
 	return nil
@@ -2722,6 +2786,14 @@ func EffectiveOptions(layers ...*Options) (*Options, error) {
 // lowest priority via EffectiveOptions and validates the resulting effective
 // option set (including cross-field constraints) via ValidateEffective.
 func MergeEffectiveOptions(layers ...*Options) (*Options, error) {
+	for _, layer := range layers {
+		if layer.IsEmpty() || layer.ImplicitTier4 {
+			continue
+		}
+		if err := layer.validateControlLayerInvariants(); err != nil {
+			return nil, err
+		}
+	}
 	eff, err := EffectiveOptions(layers...)
 	if err != nil {
 		return nil, err

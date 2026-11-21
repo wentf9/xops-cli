@@ -1106,12 +1106,45 @@ func (o *Options) Append(key, rawValue string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 	}
-	if spec.MergeMode.IsOrderedOverride() {
+	switch {
+	case spec.MergeMode.IsOrderedOverride():
 		o.appendOrderedRaw(spec.CanonicalKey, normalized)
-	} else {
+	case spec.MergeMode.IsNoneTerminated():
+		o.appendNoneTerminatedLayerRaw(spec.CanonicalKey, normalized)
+	default:
 		o.appendNormalizedRaw(spec.CanonicalKey, normalized)
 	}
 	return nil
+}
+
+// appendNoneTerminatedLayerRaw appends normalized entries within a single option
+// layer for OptionMergeNoneTerminated options (IdentityFile, CertificateFile),
+// stopping at the first "none" sentinel and retaining "none" as the terminator
+// so lower layers are still truncated on MergeOptionLayers while dropping any
+// subsequent entries in the same layer.
+func (o *Options) appendNoneTerminatedLayerRaw(canonicalKey, normalized string) {
+	if normalized == "" {
+		return
+	}
+	existing := o.GetAll(canonicalKey)
+	if slices.ContainsFunc(existing, IsNoneValue) {
+		return
+	}
+	for item := range strings.SplitSeq(normalized, "\n") {
+		if item == "" {
+			continue
+		}
+		if IsNoneValue(item) {
+			existing = append(existing, "none")
+			break
+		}
+		if !slices.Contains(existing, item) {
+			existing = append(existing, item)
+		}
+	}
+	if len(existing) > 0 {
+		o.setRaw(canonicalKey, strings.Join(existing, "\n"))
+	}
 }
 
 func (o *Options) appendOrderedRaw(canonicalKey, normalized string) {

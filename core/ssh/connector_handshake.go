@@ -19,27 +19,31 @@ import (
 // dialPolicy holds an immutable, normalized, secret-free connection snapshot
 // captured once at the entry of a dial/handshake attempt.
 type dialPolicy struct {
-	nodeID                string
-	address               string
-	baseHost              string
-	port                  int
-	user                  string
-	authType              string
-	keyPath               string
-	keyPaths              []string
-	keyRef                string
-	authUpdateToken       string
-	sudoMode              SudoMode
-	sudoUpdateToken       string
-	proxyJump             string
-	originalHost          string
-	canonicalHost         string
-	originalProxyJump     string
-	hasOriginalProxyJump  bool
-	trustVersion          string
-	passwordPromptPattern string
-	execution             *ExecutionConfig
-	options               *Options
+	nodeID                      string
+	address                     string
+	baseHost                    string
+	port                        int
+	user                        string
+	authType                    string
+	keyPath                     string
+	keyPaths                    []string
+	keyRef                      string
+	authUpdateToken             string
+	sudoMode                    SudoMode
+	sudoUpdateToken             string
+	proxyJump                   string
+	originalHost                string
+	canonicalHost               string
+	originalProxyJump           string
+	hasOriginalProxyJump        bool
+	trustVersion                string
+	passwordPromptPattern       string
+	enforceAdmittedCertificates bool
+	admittedCertificates        []AdmittedCertificate
+	enforceAdmittedKeyDigests   bool
+	admittedKeyDigests          []AdmittedKeyDigest
+	execution                   *ExecutionConfig
+	options                     *Options
 }
 
 func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
@@ -56,79 +60,92 @@ func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
 		origJump = cfg.ProxyJump
 	}
 	return dialPolicy{
-		nodeID:                cfg.NodeID,
-		address:               normalizeHostAddress(cfg.Address),
-		baseHost:              normalizeHostAddress(cfg.BaseHost),
-		port:                  port,
-		user:                  cfg.User,
-		authType:              cfg.AuthType,
-		keyPath:               cfg.KeyPath,
-		keyPaths:              slices.Clone(cfg.KeyPaths),
-		keyRef:                cfg.KeyRef,
-		authUpdateToken:       cfg.AuthUpdateToken,
-		sudoMode:              cfg.SudoMode,
-		sudoUpdateToken:       cfg.SudoUpdateToken,
-		proxyJump:             NormalizeProxyJump(cfg.ProxyJump),
-		originalHost:          cfg.OriginalHost,
-		canonicalHost:         cfg.CanonicalHost,
-		originalProxyJump:     origJump,
-		hasOriginalProxyJump:  hasOriginalJump,
-		trustVersion:          cfg.TrustVersion,
-		passwordPromptPattern: cfg.PasswordPromptPattern,
-		execution:             cfg.Execution.Clone(),
-		options:               cfg.Options.Clone(),
+		nodeID:                      cfg.NodeID,
+		address:                     normalizeHostAddress(cfg.Address),
+		baseHost:                    normalizeHostAddress(cfg.BaseHost),
+		port:                        port,
+		user:                        cfg.User,
+		authType:                    cfg.AuthType,
+		keyPath:                     cfg.KeyPath,
+		keyPaths:                    slices.Clone(cfg.KeyPaths),
+		keyRef:                      cfg.KeyRef,
+		authUpdateToken:             cfg.AuthUpdateToken,
+		sudoMode:                    cfg.SudoMode,
+		sudoUpdateToken:             cfg.SudoUpdateToken,
+		proxyJump:                   NormalizeProxyJump(cfg.ProxyJump),
+		originalHost:                cfg.OriginalHost,
+		canonicalHost:               cfg.CanonicalHost,
+		originalProxyJump:           origJump,
+		hasOriginalProxyJump:        hasOriginalJump,
+		trustVersion:                cfg.TrustVersion,
+		passwordPromptPattern:       cfg.PasswordPromptPattern,
+		enforceAdmittedCertificates: cfg.EnforceAdmittedCertificates,
+		admittedCertificates:        cloneAdmittedCertificates(cfg.AdmittedCertificates),
+		enforceAdmittedKeyDigests:   cfg.EnforceAdmittedKeyDigests,
+		admittedKeyDigests:          cloneAdmittedKeyDigests(cfg.AdmittedKeyDigests),
+		execution:                   cfg.Execution.Clone(),
+		options:                     cfg.Options.Clone(),
 	}
 }
 
 func (p dialPolicy) readOnlyConfig() *ClientConfig {
 	return &ClientConfig{
-		NodeID:                p.nodeID,
-		Address:               p.address,
-		BaseHost:              p.baseHost,
-		Port:                  p.port,
-		User:                  p.user,
-		AuthType:              p.authType,
-		KeyPath:               p.keyPath,
-		KeyPaths:              slices.Clone(p.keyPaths),
-		KeyRef:                p.keyRef,
-		AuthUpdateToken:       p.authUpdateToken,
-		SudoMode:              p.sudoMode,
-		SudoUpdateToken:       p.sudoUpdateToken,
-		ProxyJump:             p.proxyJump,
-		OriginalHost:          p.originalHost,
-		CanonicalHost:         p.canonicalHost,
-		OriginalProxyJump:     p.originalProxyJump,
-		HasOriginalProxyJump:  p.hasOriginalProxyJump,
-		TrustVersion:          p.trustVersion,
-		PasswordPromptPattern: p.passwordPromptPattern,
-		Execution:             p.execution.Clone(),
-		Options:               p.options.Clone(),
+		NodeID:                      p.nodeID,
+		Address:                     p.address,
+		BaseHost:                    p.baseHost,
+		Port:                        p.port,
+		User:                        p.user,
+		AuthType:                    p.authType,
+		KeyPath:                     p.keyPath,
+		KeyPaths:                    slices.Clone(p.keyPaths),
+		KeyRef:                      p.keyRef,
+		AuthUpdateToken:             p.authUpdateToken,
+		SudoMode:                    p.sudoMode,
+		SudoUpdateToken:             p.sudoUpdateToken,
+		ProxyJump:                   p.proxyJump,
+		OriginalHost:                p.originalHost,
+		CanonicalHost:               p.canonicalHost,
+		OriginalProxyJump:           p.originalProxyJump,
+		HasOriginalProxyJump:        p.hasOriginalProxyJump,
+		TrustVersion:                p.trustVersion,
+		PasswordPromptPattern:       p.passwordPromptPattern,
+		EnforceAdmittedCertificates: p.enforceAdmittedCertificates,
+		AdmittedCertificates:        cloneAdmittedCertificates(p.admittedCertificates),
+		EnforceAdmittedKeyDigests:   p.enforceAdmittedKeyDigests,
+		AdmittedKeyDigests:          cloneAdmittedKeyDigests(p.admittedKeyDigests),
+		Execution:                   p.execution.Clone(),
+		Options:                     p.options.Clone(),
 	}
 }
 
 func (p dialPolicy) toConnectionConfig() ConnectionConfig {
 	return ConnectionConfig{
-		KeyRef:                p.keyRef,
-		TrustVersion:          p.trustVersion,
-		NodeID:                p.nodeID,
-		OriginalHost:          p.originalHost,
-		CanonicalHost:         p.canonicalHost,
-		Address:               p.address,
-		BaseHost:              p.baseHost,
-		Port:                  p.port,
-		User:                  p.user,
-		AuthType:              p.authType,
-		KeyPath:               p.keyPath,
-		KeyPaths:              slices.Clone(p.keyPaths),
-		AuthUpdateToken:       p.authUpdateToken,
-		SudoMode:              p.sudoMode,
-		SudoUpdateToken:       p.sudoUpdateToken,
-		ProxyJump:             p.proxyJump,
-		OriginalProxyJump:     p.originalProxyJump,
-		HasOriginalProxyJump:  p.hasOriginalProxyJump,
-		PasswordPromptPattern: p.passwordPromptPattern,
-		Execution:             p.execution.Clone(),
-		Options:               p.options.Clone(),
+		KeyRef:                      p.keyRef,
+		TrustVersion:                p.trustVersion,
+		NodeID:                      p.nodeID,
+		OriginalHost:                p.originalHost,
+		CanonicalHost:               p.canonicalHost,
+		Address:                     p.address,
+		BaseHost:                    p.baseHost,
+		Port:                        p.port,
+		User:                        p.user,
+		AuthType:                    p.authType,
+		configuredAuthType:          p.authType,
+		KeyPath:                     p.keyPath,
+		KeyPaths:                    slices.Clone(p.keyPaths),
+		AuthUpdateToken:             p.authUpdateToken,
+		SudoMode:                    p.sudoMode,
+		SudoUpdateToken:             p.sudoUpdateToken,
+		ProxyJump:                   p.proxyJump,
+		OriginalProxyJump:           p.originalProxyJump,
+		HasOriginalProxyJump:        p.hasOriginalProxyJump,
+		PasswordPromptPattern:       p.passwordPromptPattern,
+		EnforceAdmittedCertificates: p.enforceAdmittedCertificates,
+		AdmittedCertificates:        cloneAdmittedCertificates(p.admittedCertificates),
+		EnforceAdmittedKeyDigests:   p.enforceAdmittedKeyDigests,
+		AdmittedKeyDigests:          cloneAdmittedKeyDigests(p.admittedKeyDigests),
+		Execution:                   p.execution.Clone(),
+		Options:                     p.options.Clone(),
 	}
 }
 
@@ -575,6 +592,17 @@ func (c *Connector) syncRecordedConnection(
 	expected := *connCfg
 	expected.KeyPath = originalKeyPath
 	expected.KeyPaths = slices.Clone(originalKeyPaths)
+	if hasAuthUpdate {
+		if err := applyCommittedAuthMetadata(connCfg, newCfg, nodeName, committedAuthToken, rootConn); err != nil {
+			return err
+		}
+		expected.AuthUpdateToken = connCfg.AuthUpdateToken
+	} else if recordingFailed {
+		// Uncertain durability write: caller clears AuthUpdateToken/SudoUpdateToken
+		// immediately after syncRecordedConnection, so allow an advanced token here
+		// while still validating all host, trust, auth-type, and option fields.
+		expected.AuthUpdateToken = newCfg.AuthUpdateToken
+	}
 	mayHavePersistedKey := discoveredKeyPath != "" && ((hasAuthUpdate && committedAuthToken != "" && committedAuthToken != oldAuthToken) || recordingFailed)
 	if mayHavePersistedKey && isCompatibleRecordedKeyProjection(originalKeyPath, originalKeyPaths, discoveredKeyPath, newCfg.KeyPath, newCfg.KeyPaths) {
 		expected.KeyPath = newCfg.KeyPath
@@ -586,11 +614,6 @@ func (c *Connector) syncRecordedConnection(
 		return closeRootConnWithError(rootConn, fmt.Sprintf("incompatible target update for node %q during connection setup", nodeName), err)
 	}
 
-	if hasAuthUpdate {
-		if err := applyCommittedAuthMetadata(connCfg, newCfg, nodeName, committedAuthToken, rootConn); err != nil {
-			return err
-		}
-	}
 	connCfg.KeyPath = newCfg.KeyPath
 	connCfg.KeyPaths = slices.Clone(newCfg.KeyPaths)
 	return nil
@@ -602,15 +625,20 @@ func (c *Connector) reloadConfigAfterRecording(nodeName string, hasAuthUpdate bo
 		if hasAuthUpdate {
 			return nil, closeRootConnWithError(rootConn, fmt.Sprintf("reload config for node %q after auth update failed", nodeName), err)
 		}
-		return nil, nil
+		return nil, closeRootConnWithError(rootConn, fmt.Sprintf("reload config for node %q failed", nodeName), err)
 	}
 	if newCfg == nil {
+		if hasAuthUpdate {
+			return nil, closeRootConnWithError(rootConn, fmt.Sprintf("reload config for node %q after auth update failed", nodeName), ErrSnapshotMismatch)
+		}
 		return nil, nil
 	}
 	newClone := *newCfg
 	newClone.Address = normalizeHostAddress(newCfg.Address)
 	newClone.BaseHost = normalizeHostAddress(newCfg.BaseHost)
 	newClone.KeyPaths = slices.Clone(newCfg.KeyPaths)
+	newClone.AdmittedCertificates = cloneAdmittedCertificates(newCfg.AdmittedCertificates)
+	newClone.AdmittedKeyDigests = cloneAdmittedKeyDigests(newCfg.AdmittedKeyDigests)
 	return &newClone, nil
 }
 
@@ -984,12 +1012,14 @@ func (c *Connector) resolveAgentAuth(ctx context.Context, authCtx context.Contex
 	if cfg != nil {
 		sshOpts = cfg.Options
 	}
+	materialPolicy := newAdmittedMaterialPolicyFromConfig(cfg)
 	explicitCerts, _ := collectExplicitUserCerts(
 		sshOpts,
 		c.environment,
 		c.authTargetContext(cfg),
 		c.environment.ResolveKeyPath,
 		c.getLogger(),
+		materialPolicy,
 	)
 	if len(explicitCerts) > 0 {
 		signers, signersErr := agentClient.Signers()
@@ -1036,12 +1066,14 @@ func (c *Connector) resolveFilteredAgentAuth(ctx context.Context, authCtx contex
 	if cfg != nil {
 		sshOpts = cfg.Options
 	}
+	materialPolicy := newAdmittedMaterialPolicyFromConfig(cfg)
 	explicitCerts, hasExplicitCerts := collectExplicitUserCerts(
 		sshOpts,
 		c.environment,
 		c.authTargetContext(cfg),
 		c.environment.ResolveKeyPath,
 		c.getLogger(),
+		materialPolicy,
 	)
 
 	var certCandidates []autoAuthCandidate
@@ -1050,11 +1082,14 @@ func (c *Connector) resolveFilteredAgentAuth(ctx context.Context, authCtx contex
 	tracker := newOfferedPubKeyTracker()
 
 	for _, keyPath := range explicitPaths {
-		appendAgentMatchedKeyPath(
+		if _, matchErr := appendAgentMatchedKeyPath(
 			&certCandidates, &plainCandidates, pairedCertPaths, agentByPub,
 			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
-			nil, tracker, c.getLogger(),
-		)
+			nil, tracker, materialPolicy, true, c.getLogger(),
+		); matchErr != nil {
+			cleanup()
+			return nil, nil, matchErr
+		}
 	}
 	appendUnpairedExplicitCertsFromAgent(&certCandidates, pairedCertPaths, agentByPub, explicitCerts, "ssh-agent (IdentitiesOnly cert): ", nil, tracker)
 
@@ -1157,12 +1192,14 @@ func (c *Connector) buildMultiKeyAuth(
 	observer logger.DiagnosticObserver,
 ) (ssh.ClientAuthCallback, func() error, error) {
 	l := c.getLogger()
+	materialPolicy := newAdmittedMaterialPolicyFromConfig(cfg)
 	explicitCerts, hasExplicitCerts := collectExplicitUserCerts(
 		cfg.Options,
 		c.environment,
 		c.authTargetContext(cfg),
 		c.environment.ResolveKeyPath,
 		l,
+		materialPolicy,
 	)
 	if sourced == nil && len(explicitPaths) == 0 && len(explicitCerts) == 0 {
 		return nil, nil, ErrKeyPathRequired
@@ -1209,16 +1246,21 @@ func (c *Connector) buildMultiKeyAuth(
 	passphraseCb := newMultiKeyPassphraseCallback(attempt, recovery != nil)
 	var candidates []autoAuthCandidate
 	var firstErr error
+	var fatalErr error
 	if policy.identitiesOnly {
-		candidates, firstErr = c.buildIdentitiesOnlyMultiKeyCandidates(
+		candidates, firstErr, fatalErr = c.buildIdentitiesOnlyMultiKeyCandidates(
 			ctx, authCtx, cfg, state, explicitPaths, explicitCerts, hasExplicitCerts,
-			provider, passphraseCb, rejectPublicKey, handshakeTimeout, &cleanup, l,
+			provider, passphraseCb, rejectPublicKey, handshakeTimeout, &cleanup, materialPolicy, l,
 		)
 	} else {
-		candidates, firstErr = c.buildAgentFallbackMultiKeyCandidates(
+		candidates, firstErr, fatalErr = c.buildAgentFallbackMultiKeyCandidates(
 			ctx, authCtx, cfg, state, explicitPaths, explicitCerts, hasExplicitCerts,
-			provider, passphraseCb, rejectPublicKey, &cleanup, l,
+			provider, passphraseCb, rejectPublicKey, &cleanup, materialPolicy, l,
 		)
+	}
+	if fatalErr != nil {
+		closeErr := cleanup()
+		return nil, nil, errors.Join(fatalErr, closeErr)
 	}
 	if len(candidates) == 0 {
 		closeErr := cleanup()
@@ -1247,8 +1289,9 @@ func (c *Connector) buildIdentitiesOnlyMultiKeyCandidates(
 	rejectPublicKey func(),
 	handshakeTimeout time.Duration,
 	cleanup *func() error,
+	materialPolicy *admittedMaterialPolicy,
 	l logger.DebugLogger,
-) ([]autoAuthCandidate, error) {
+) ([]autoAuthCandidate, error, error) {
 	var agentByPub map[string]ssh.Signer
 	if len(explicitPaths) > 0 || hasUnpairedExplicitCerts(explicitCerts, state.pairedCertPaths) {
 		if socket, sockErr := c.resolveConfigAgentSocket(cfg); sockErr == nil {
@@ -1266,25 +1309,37 @@ func (c *Connector) buildIdentitiesOnlyMultiKeyCandidates(
 
 	var firstErr error
 	for _, keyPath := range explicitPaths {
-		if appendAgentMatchedKeyPath(
+		matched, matchErr := appendAgentMatchedKeyPath(
 			&state.certCandidates, &state.plainCandidates, state.pairedCertPaths, agentByPub,
 			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
-			rejectPublicKey, state.tracker, l,
-		) {
+			rejectPublicKey, state.tracker, materialPolicy, true, l,
+		)
+		if matchErr != nil {
+			return nil, nil, matchErr
+		}
+		if matched {
 			continue
 		}
-		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, state.tracker, false, l)
+		certMethods, plainMethod, absentAllowed, err := resolveKeySignersWithPolicy(
+			keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, state.tracker, false, materialPolicy, true, l,
+		)
 		if err != nil {
+			if materialPolicy != nil && materialPolicy.enforceKeys && errors.Is(err, ErrSnapshotMismatch) {
+				return nil, nil, err
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
+			continue
+		}
+		if absentAllowed {
 			continue
 		}
 		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, rejectPublicKey, state.pairedCertPaths, &state.certCandidates, &state.plainCandidates)
 	}
 
 	appendUnpairedExplicitCertsFromAgent(&state.certCandidates, state.pairedCertPaths, agentByPub, explicitCerts, "ssh-agent (IdentitiesOnly cert): ", rejectPublicKey, state.tracker)
-	return append(state.certCandidates, state.plainCandidates...), firstErr
+	return append(state.certCandidates, state.plainCandidates...), firstErr, nil
 }
 
 func (c *Connector) buildAgentFallbackMultiKeyCandidates(
@@ -1299,26 +1354,41 @@ func (c *Connector) buildAgentFallbackMultiKeyCandidates(
 	passphraseCb func(string, string),
 	rejectPublicKey func(),
 	cleanup *func() error,
+	materialPolicy *admittedMaterialPolicy,
 	l logger.DebugLogger,
-) ([]autoAuthCandidate, error) {
+) ([]autoAuthCandidate, error, error) {
 	agentClient, agentByPub, agentSignersFn := c.openMultiKeyFallbackAgent(
-		ctx, authCtx, cfg, explicitPaths, explicitCerts, hasExplicitCerts, cleanup, l,
+		ctx, authCtx, cfg, explicitPaths, explicitCerts, hasExplicitCerts, cleanup, materialPolicy, l,
 	)
 
 	var firstErr error
 	for _, keyPath := range explicitPaths {
-		if !isUnencryptedPrivateKeyFile(keyPath) && appendAgentMatchedKeyPath(
-			&state.certCandidates, &state.plainCandidates, state.pairedCertPaths, agentByPub,
-			keyPath, "explicit key", explicitCerts, hasExplicitCerts,
-			rejectPublicKey, state.tracker, l,
-		) {
-			continue
+		if !isUnencryptedPrivateKeyFile(keyPath, materialPolicy) {
+			matched, matchErr := appendAgentMatchedKeyPath(
+				&state.certCandidates, &state.plainCandidates, state.pairedCertPaths, agentByPub,
+				keyPath, "explicit key", explicitCerts, hasExplicitCerts,
+				rejectPublicKey, state.tracker, materialPolicy, true, l,
+			)
+			if matchErr != nil {
+				return nil, nil, matchErr
+			}
+			if matched {
+				continue
+			}
 		}
-		certMethods, plainMethod, err := resolveKeySigners(keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, state.tracker, false, l)
+		certMethods, plainMethod, absentAllowed, err := resolveKeySignersWithPolicy(
+			keyPath, explicitCerts, hasExplicitCerts, provider, passphraseCb, state.tracker, false, materialPolicy, true, l,
+		)
 		if err != nil {
+			if materialPolicy != nil && materialPolicy.enforceKeys && errors.Is(err, ErrSnapshotMismatch) {
+				return nil, nil, err
+			}
 			if firstErr == nil {
 				firstErr = err
 			}
+			continue
+		}
+		if absentAllowed {
 			continue
 		}
 		appendResolvedMultiKeyCandidate(keyPath, certMethods, plainMethod, rejectPublicKey, state.pairedCertPaths, &state.certCandidates, &state.plainCandidates)
@@ -1333,7 +1403,7 @@ func (c *Connector) buildAgentFallbackMultiKeyCandidates(
 			onRejected: rejectPublicKey,
 		})
 	}
-	return append(state.certCandidates, state.plainCandidates...), firstErr
+	return append(state.certCandidates, state.plainCandidates...), firstErr, nil
 }
 
 func (c *Connector) openMultiKeyFallbackAgent(
@@ -1344,6 +1414,7 @@ func (c *Connector) openMultiKeyFallbackAgent(
 	explicitCerts []loadedUserCert,
 	hasExplicitCerts bool,
 	cleanup *func() error,
+	materialPolicy *admittedMaterialPolicy,
 	l logger.DebugLogger,
 ) (*boundedAgentClient, map[string]ssh.Signer, func() ([]ssh.Signer, error)) {
 	socket, err := c.resolveConfigAgentSocket(cfg)
@@ -1365,7 +1436,7 @@ func (c *Connector) openMultiKeyFallbackAgent(
 	}
 	signersFn := agentClient.Signers
 	var agentByPub map[string]ssh.Signer
-	if shouldPreloadAgentSigners(explicitPaths, nil, explicitCerts, hasExplicitCerts) {
+	if shouldPreloadAgentSigners(explicitPaths, nil, explicitCerts, hasExplicitCerts, materialPolicy) {
 		if signers, signersErr := agentClient.Signers(); signersErr != nil {
 			l.Debugf("list ssh-agent signers failed: %v", signersErr)
 		} else {
@@ -1469,29 +1540,33 @@ func (c *Connector) buildSSHConfigWithState(ctx context.Context, dialPolicy dial
 			failClosed = coordinator.FailClosed
 		}
 		plan, release, err := c.buildOwnedAutoAuth(ctx, cfg, AutoAuthOptions{
-			AgentSocket:        c.environment.AgentSocket,
-			DialAgent:          c.environment.DialAgent,
-			DefaultKeyPaths:    c.environment.DefaultKeyPaths,
-			ResolveKeyPath:     c.environment.ResolveKeyPath,
-			Environment:        c.environment,
-			Target:             dialPolicy.targetContext(c.environment),
-			LifecycleCtx:       authCtx,
-			NodeID:             dialPolicy.nodeID,
-			User:               dialPolicy.user,
-			Host:               dialPolicy.address,
-			BaseHost:           dialPolicy.baseHost,
-			Port:               dialPolicy.port,
-			VersionToken:       dialPolicy.authUpdateToken,
-			Resolver:           c.secretResolver,
-			Prompter:           prompter,
-			HandshakeTimeout:   c.getNodeHandshakeTimeout(cfg),
-			InteractionTimeout: c.interactionTimeout,
-			FailClosed:         failClosed,
-			RecoveryPrompter:   credentialRecoveryPrompter(basePrompter),
-			KeyPath:            dialPolicy.keyPath,
-			KeyPaths:           slices.Clone(dialPolicy.keyPaths),
-			SSHOptions:         dialPolicy.options.Clone(),
-			HostKeyChanged:     hostKeyChanged,
+			AgentSocket:                 c.environment.AgentSocket,
+			DialAgent:                   c.environment.DialAgent,
+			DefaultKeyPaths:             c.environment.DefaultKeyPaths,
+			ResolveKeyPath:              c.environment.ResolveKeyPath,
+			Environment:                 c.environment,
+			Target:                      dialPolicy.targetContext(c.environment),
+			LifecycleCtx:                authCtx,
+			NodeID:                      dialPolicy.nodeID,
+			User:                        dialPolicy.user,
+			Host:                        dialPolicy.address,
+			BaseHost:                    dialPolicy.baseHost,
+			Port:                        dialPolicy.port,
+			VersionToken:                dialPolicy.authUpdateToken,
+			Resolver:                    c.secretResolver,
+			Prompter:                    prompter,
+			HandshakeTimeout:            c.getNodeHandshakeTimeout(cfg),
+			InteractionTimeout:          c.interactionTimeout,
+			FailClosed:                  failClosed,
+			RecoveryPrompter:            credentialRecoveryPrompter(basePrompter),
+			KeyPath:                     dialPolicy.keyPath,
+			KeyPaths:                    slices.Clone(dialPolicy.keyPaths),
+			SSHOptions:                  dialPolicy.options.Clone(),
+			EnforceAdmittedCertificates: dialPolicy.enforceAdmittedCertificates,
+			AdmittedCertificates:        cloneAdmittedCertificates(dialPolicy.admittedCertificates),
+			EnforceAdmittedKeyDigests:   dialPolicy.enforceAdmittedKeyDigests,
+			AdmittedKeyDigests:          cloneAdmittedKeyDigests(dialPolicy.admittedKeyDigests),
+			HostKeyChanged:              hostKeyChanged,
 			PasswordCallback: func(s string) {
 				if s != "" {
 					// Preserve any passphrase recorded during an earlier key PartialSuccess in MFA.
@@ -1587,6 +1662,7 @@ func (c *Connector) buildSSHConfigWithState(ctx context.Context, dialPolicy dial
 				c.authTargetContext(cfg),
 				c.environment.ResolveKeyPath,
 				c.getLogger(),
+				newAdmittedMaterialPolicyFromConfig(cfg),
 			)
 			if len(explicitPaths) == 0 && len(explicitCerts) == 0 {
 				return nil, nil, errors.New("ssh-agent authentication disabled by IdentitiesOnly=yes")
@@ -1845,9 +1921,14 @@ func buildKeyAuthMethod(cfg *ClientConfig, extraPassphrase []byte, resolver ...f
 	if cfg == nil || cfg.KeyPath == "" {
 		return nil, ErrKeyPathRequired
 	}
-	keyBytes, err := os.ReadFile(resolveKeyPath(cfg.KeyPath, resolve))
+	resolvedPath := resolveKeyPath(cfg.KeyPath, resolve)
+	materialPolicy := newAdmittedMaterialPolicyFromConfig(cfg)
+	keyBytes, absentAllowed, err := materialPolicy.readKeyFile(resolvedPath, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read key file: %w", err)
+	}
+	if absentAllowed {
+		return nil, fmt.Errorf("failed to read key file: %w", os.ErrNotExist)
 	}
 
 	var signer ssh.Signer

@@ -100,9 +100,10 @@ func (c *Connector) sourcedKeyMethods(ctx context.Context, cfg *ClientConfig) (*
 
 	l := c.getLogger()
 	target := c.authTargetContext(cfg)
-	explicitCerts, hasExplicitCerts := collectExplicitUserCerts(cfg.Options, c.environment, target, c.environment.ResolveKeyPath, l)
+	materialPolicy := newAdmittedMaterialPolicyFromConfig(cfg)
+	explicitCerts, hasExplicitCerts := collectExplicitUserCerts(cfg.Options, c.environment, target, c.environment.ResolveKeyPath, l, materialPolicy)
 	expandedKeyPath, _ := expandIdentityKeyPath(cfg.KeyPath, c.environment, target, c.environment.ResolveKeyPath)
-	matched := matchCertsForKey(expandedKeyPath, signer.PublicKey(), explicitCerts, hasExplicitCerts, l)
+	matched := matchCertsForKey(expandedKeyPath, signer.PublicKey(), explicitCerts, hasExplicitCerts, l, materialPolicy)
 	var certMethods []certAuthCandidateMethod
 	for _, mc := range matched {
 		cs, csErr := newWrappedCertSigner(mc.cert, signer)
@@ -146,6 +147,12 @@ func (c *Connector) buildOwnedAutoAuth(ctx context.Context, cfg *ClientConfig, o
 	policy := newAuthPolicy(options.SSHOptions, options.HostKeyChanged)
 	if !policy.pubkeyAllowed || (cfg.KeyRef == "" && c.keySource == nil) {
 		plan := buildAutoAuthPlan(ctx, options)
+		if plan.err != nil {
+			if plan.cleanup != nil {
+				plan.cleanup()
+			}
+			return autoAuthPlan{}, nil, plan.err
+		}
 		return plan, legacyAuthCleanup(plan.cleanup), nil
 	}
 	if c.keySource == nil {
@@ -155,6 +162,12 @@ func (c *Connector) buildOwnedAutoAuth(ctx context.Context, cfg *ClientConfig, o
 	if err != nil {
 		if cfg.KeyRef == "" && cfg.KeyPath == "" && errors.Is(err, ErrKeyNotFound) {
 			plan := buildAutoAuthPlan(ctx, options)
+			if plan.err != nil {
+				if plan.cleanup != nil {
+					plan.cleanup()
+				}
+				return autoAuthPlan{}, nil, plan.err
+			}
 			return plan, legacyAuthCleanup(plan.cleanup), nil
 		}
 		return autoAuthPlan{}, nil, err
@@ -174,6 +187,12 @@ func (c *Connector) buildOwnedAutoAuth(ctx context.Context, cfg *ClientConfig, o
 	options.ExcludeKeyPath = cfg.KeyPath
 	options.KeyPath = ""
 	plan := buildAutoAuthPlan(ctx, options, bundle.plainMethod)
+	if plan.err != nil {
+		if plan.cleanup != nil {
+			plan.cleanup()
+		}
+		return autoAuthPlan{}, nil, errors.Join(plan.err, bundle.close())
+	}
 	return plan, func() error {
 		if plan.cleanup != nil {
 			plan.cleanup()

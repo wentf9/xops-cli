@@ -2,10 +2,14 @@ package ssh
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -18,7 +22,242 @@ const (
 	goCertAlgoSuffix      = "-cert-v01@golang.org"
 	dsaCertAlgoV01        = "ssh-dss-cert-v01@openssh.com"
 	dsaKeyAlgo            = "ssh-dss"
+
+	maxUserCertFileBytes int64 = 256 * 1024
+	maxKeyFileBytes      int64 = 1024 * 1024
 )
+
+// readBoundedRegularFile reads a regular file bounded to maxBytes. It inspects
+// the path with os.Stat before opening so non-regular files (FIFOs, devices,
+// sockets, directories) are rejected without blocking, then re-checks f.Stat()
+// on the opened descriptor and enforces maxBytes via io.LimitReader.
+func readBoundedRegularFile(path string, maxBytes int64) ([]byte, error) {
+	if path == "" {
+		return nil, errors.New("file path is empty")
+	}
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("invalid maximum file size %d", maxBytes)
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing non-regular file %q (mode %s)", path, st.Mode().Type())
+	}
+	if st.Size() > maxBytes {
+		return nil, fmt.Errorf("file %q exceeds maximum size %d bytes", path, maxBytes)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	fst, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !fst.Mode().IsRegular() {
+		return nil, fmt.Errorf("refusing non-regular file %q (mode %s)", path, fst.Mode().Type())
+	}
+	if fst.Size() > maxBytes {
+		return nil, fmt.Errorf("file %q exceeds maximum size %d bytes", path, maxBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("file %q exceeds maximum size %d bytes", path, maxBytes)
+	}
+	return data, nil
+}
+
+type admittedMaterialPolicy struct {
+	enforceCerts  bool
+	certs         map[string]AdmittedCertificate
+	conflictCerts map[string]struct{}
+	enforceKeys   bool
+	keys          map[string]AdmittedKeyDigest
+	conflictKeys  map[string]struct{}
+}
+
+func canonicalAdmittedPath(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return filepath.Clean(filepath.FromSlash(path))
+}
+
+func equalSHA256Hex(data []byte, wantHex string) bool {
+	normWant := strings.ToLower(strings.TrimSpace(wantHex))
+	if len(normWant) != sha256.Size*2 {
+		return false
+	}
+	sum := sha256.Sum256(data)
+	gotHex := hex.EncodeToString(sum[:])
+	return subtle.ConstantTimeCompare([]byte(gotHex), []byte(normWant)) == 1
+}
+
+func newAdmittedMaterialPolicy(
+	enforceCerts bool,
+	admittedCerts []AdmittedCertificate,
+	enforceKeys bool,
+	admittedKeys []AdmittedKeyDigest,
+) *admittedMaterialPolicy {
+	if !enforceCerts && !enforceKeys {
+		return nil
+	}
+	p := &admittedMaterialPolicy{
+		enforceCerts: enforceCerts,
+		enforceKeys:  enforceKeys,
+	}
+	if enforceCerts {
+		p.certs = make(map[string]AdmittedCertificate, len(admittedCerts))
+		for _, entry := range admittedCerts {
+			key := canonicalAdmittedPath(entry.Path)
+			if key == "" {
+				continue
+			}
+			if prev, exists := p.certs[key]; exists {
+				if !equalAdmittedCertificateMeta(prev, entry) {
+					if p.conflictCerts == nil {
+						p.conflictCerts = make(map[string]struct{})
+					}
+					p.conflictCerts[key] = struct{}{}
+				}
+				continue
+			}
+			cloned := entry
+			cloned.RawBytes = slices.Clone(entry.RawBytes)
+			p.certs[key] = cloned
+		}
+	}
+	if enforceKeys {
+		p.keys = make(map[string]AdmittedKeyDigest, len(admittedKeys))
+		for _, entry := range admittedKeys {
+			key := canonicalAdmittedPath(entry.Path)
+			if key == "" {
+				continue
+			}
+			if prev, exists := p.keys[key]; exists {
+				if prev != entry {
+					if p.conflictKeys == nil {
+						p.conflictKeys = make(map[string]struct{})
+					}
+					p.conflictKeys[key] = struct{}{}
+				}
+				continue
+			}
+			p.keys[key] = entry
+		}
+	}
+	return p
+}
+
+func newAdmittedMaterialPolicyFromConfig(cfg *ClientConfig) *admittedMaterialPolicy {
+	if cfg == nil {
+		return nil
+	}
+	return newAdmittedMaterialPolicy(
+		cfg.EnforceAdmittedCertificates,
+		cfg.AdmittedCertificates,
+		cfg.EnforceAdmittedKeyDigests,
+		cfg.AdmittedKeyDigests,
+	)
+}
+
+func firstAdmittedPolicy(policies []*admittedMaterialPolicy) *admittedMaterialPolicy {
+	if len(policies) > 0 {
+		return policies[0]
+	}
+	return nil
+}
+
+func (p *admittedMaterialPolicy) lookupCert(certPath string) (AdmittedCertificate, bool) {
+	if p == nil || !p.enforceCerts {
+		return AdmittedCertificate{}, false
+	}
+	key := canonicalAdmittedPath(certPath)
+	if key == "" {
+		return AdmittedCertificate{}, false
+	}
+	if _, conflicted := p.conflictCerts[key]; conflicted {
+		return AdmittedCertificate{}, false
+	}
+	entry, ok := p.certs[key]
+	return entry, ok
+}
+
+func (p *admittedMaterialPolicy) readKeyFile(keyPath string, explicit bool) (data []byte, absentAllowed bool, err error) {
+	if p == nil || !p.enforceKeys {
+		data, err = readBoundedRegularFile(keyPath, maxKeyFileBytes)
+		return data, false, err
+	}
+	key := canonicalAdmittedPath(keyPath)
+	if key == "" {
+		return nil, false, fmt.Errorf("%w: empty SSH key path is not admitted", ErrSnapshotMismatch)
+	}
+	if _, conflicted := p.conflictKeys[key]; conflicted {
+		return nil, false, fmt.Errorf("%w: conflicting admitted key digest entries for %q", ErrSnapshotMismatch, keyPath)
+	}
+	entry, ok := p.keys[key]
+	if !ok {
+		if !explicit {
+			if _, statErr := os.Stat(keyPath); errors.Is(statErr, os.ErrNotExist) {
+				return nil, true, nil
+			}
+		}
+		return nil, false, fmt.Errorf("%w: SSH key %q is not in admitted key digests", ErrSnapshotMismatch, keyPath)
+	}
+	if entry.Missing {
+		_, statErr := os.Stat(keyPath)
+		if errors.Is(statErr, os.ErrNotExist) {
+			return nil, true, nil
+		}
+		if statErr == nil {
+			return nil, false, fmt.Errorf("%w: SSH key %q appeared after connection plan admission", ErrSnapshotMismatch, keyPath)
+		}
+		return nil, false, fmt.Errorf("%w: stat admitted-missing SSH key %q failed: %w", ErrSnapshotMismatch, keyPath, statErr)
+	}
+	if entry.NonRegular {
+		return nil, false, fmt.Errorf("%w: SSH key %q was non-regular at connection plan admission", ErrSnapshotMismatch, keyPath)
+	}
+	if len(strings.TrimSpace(entry.SHA256)) != sha256.Size*2 {
+		return nil, false, fmt.Errorf("%w: SSH key %q has invalid admitted SHA-256 digest", ErrSnapshotMismatch, keyPath)
+	}
+	data, err = readBoundedRegularFile(keyPath, maxKeyFileBytes)
+	if err != nil {
+		return nil, false, fmt.Errorf("%w: read admitted SSH key %q failed: %w", ErrSnapshotMismatch, keyPath, err)
+	}
+	if !equalSHA256Hex(data, entry.SHA256) {
+		return nil, false, fmt.Errorf("%w: SSH key %q SHA-256 digest changed after connection plan admission", ErrSnapshotMismatch, keyPath)
+	}
+	return data, false, nil
+}
+
+func (p *admittedMaterialPolicy) readOptionalAdmittedPubFile(pubPath string) ([]byte, bool) {
+	if p == nil || !p.enforceKeys {
+		data, err := readBoundedRegularFile(pubPath, maxKeyFileBytes)
+		return data, err == nil
+	}
+	key := canonicalAdmittedPath(pubPath)
+	if key == "" {
+		return nil, false
+	}
+	if _, conflicted := p.conflictKeys[key]; conflicted {
+		return nil, false
+	}
+	entry, ok := p.keys[key]
+	if !ok || entry.Missing || entry.NonRegular {
+		return nil, false
+	}
+	data, err := readBoundedRegularFile(pubPath, maxKeyFileBytes)
+	if err != nil || !equalSHA256Hex(data, entry.SHA256) {
+		return nil, false
+	}
+	return data, true
+}
 
 // isCertAlgorithm reports whether alg is an SSH certificate public-key or
 // signature algorithm name (covering OpenSSH *-cert-v01@openssh.com and Go
@@ -288,19 +527,9 @@ type loadedUserCert struct {
 	keyRaw string
 }
 
-func parseUserCertFile(certPath string, silentIfMissing bool, l logger.DebugLogger) (*loadedUserCert, bool) {
+func parseUserCertData(certPath string, data []byte, l logger.DebugLogger) (*loadedUserCert, bool) {
 	if l == nil {
 		l = logger.NopLogger
-	}
-	if certPath == "" {
-		return nil, false
-	}
-	data, err := os.ReadFile(certPath)
-	if err != nil {
-		if !silentIfMissing || !errors.Is(err, os.ErrNotExist) {
-			l.Debugf("Failed to read SSH certificate %q: %v", certPath, err)
-		}
-		return nil, false
 	}
 	pubKey, _, _, _, err := cryptoSSH.ParseAuthorizedKey(data)
 	if err != nil {
@@ -323,12 +552,68 @@ func parseUserCertFile(certPath string, silentIfMissing bool, l logger.DebugLogg
 	}, true
 }
 
+func parseUserCertFile(certPath string, silentIfMissing bool, l logger.DebugLogger, policies ...*admittedMaterialPolicy) (*loadedUserCert, bool) {
+	if l == nil {
+		l = logger.NopLogger
+	}
+	if certPath == "" {
+		return nil, false
+	}
+	policy := firstAdmittedPolicy(policies)
+	if policy != nil && policy.enforceCerts {
+		entry, ok := policy.lookupCert(certPath)
+		if !ok {
+			if !silentIfMissing {
+				l.Debugf("Refusing un-admitted SSH certificate %q", certPath)
+			}
+			return nil, false
+		}
+		if entry.Missing || entry.NonRegular {
+			if !silentIfMissing || entry.NonRegular {
+				l.Debugf("Refusing SSH certificate %q admitted as missing=%v non_regular=%v", certPath, entry.Missing, entry.NonRegular)
+			}
+			return nil, false
+		}
+		if len(entry.RawBytes) > 0 {
+			if int64(len(entry.RawBytes)) > maxUserCertFileBytes {
+				l.Debugf("Refusing SSH certificate %q: admitted RawBytes exceed %d bytes", certPath, maxUserCertFileBytes)
+				return nil, false
+			}
+			if !equalSHA256Hex(entry.RawBytes, entry.SHA256) {
+				l.Debugf("Refusing SSH certificate %q: admitted RawBytes SHA-256 mismatch", certPath)
+				return nil, false
+			}
+			return parseUserCertData(certPath, entry.RawBytes, l)
+		}
+		data, err := readBoundedRegularFile(certPath, maxUserCertFileBytes)
+		if err != nil {
+			l.Debugf("Failed to read admitted SSH certificate %q: %v", certPath, err)
+			return nil, false
+		}
+		if !equalSHA256Hex(data, entry.SHA256) {
+			l.Debugf("Refusing SSH certificate %q: file SHA-256 does not match admitted digest", certPath)
+			return nil, false
+		}
+		return parseUserCertData(certPath, data, l)
+	}
+
+	data, err := readBoundedRegularFile(certPath, maxUserCertFileBytes)
+	if err != nil {
+		if !silentIfMissing || !errors.Is(err, os.ErrNotExist) {
+			l.Debugf("Failed to read SSH certificate %q: %v", certPath, err)
+		}
+		return nil, false
+	}
+	return parseUserCertData(certPath, data, l)
+}
+
 func collectExplicitUserCerts(
 	sshOpts *Options,
 	env Environment,
 	target TargetContext,
 	resolve func(string) string,
 	l logger.DebugLogger,
+	policies ...*admittedMaterialPolicy,
 ) ([]loadedUserCert, bool) {
 	if l == nil {
 		l = logger.NopLogger
@@ -337,6 +622,7 @@ func collectExplicitUserCerts(
 	if len(rawCerts) == 0 {
 		return nil, false
 	}
+	policy := firstAdmittedPolicy(policies)
 
 	var loaded []loadedUserCert
 	seenPaths := make(map[string]struct{}, len(rawCerts))
@@ -352,7 +638,7 @@ func collectExplicitUserCerts(
 		}
 		hasExplicit = true
 		if IsNoneValue(trimmed) {
-			continue
+			break
 		}
 		expanded, err := expandIdentityKeyPath(raw, env, target, resolve)
 		if err != nil {
@@ -366,7 +652,7 @@ func collectExplicitUserCerts(
 			continue
 		}
 		seenPaths[expanded] = struct{}{}
-		if cert, ok := parseUserCertFile(expanded, false, l); ok {
+		if cert, ok := parseUserCertFile(expanded, false, l, policy); ok {
 			loaded = append(loaded, *cert)
 		}
 	}
@@ -379,6 +665,7 @@ func matchCertsForKey(
 	explicitCerts []loadedUserCert,
 	hasExplicitCerts bool,
 	l logger.DebugLogger,
+	policies ...*admittedMaterialPolicy,
 ) []loadedUserCert {
 	if pubKey == nil {
 		return nil
@@ -396,7 +683,8 @@ func matchCertsForKey(
 	if keyPath == "" {
 		return nil
 	}
-	if sidecar, ok := parseUserCertFile(sidecarCertPath(keyPath), true, l); ok {
+	policy := firstAdmittedPolicy(policies)
+	if sidecar, ok := parseUserCertFile(sidecarCertPath(keyPath), true, l, policy); ok {
 		if sidecar.keyRaw == pubRaw {
 			return []loadedUserCert{*sidecar}
 		}

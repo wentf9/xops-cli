@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -116,19 +117,36 @@ func TestControlTypedSettingsAndSingleProjection(t *testing.T) {
 	})
 
 	t.Run("control_config_and_validated_control_config_zero_drift", func(t *testing.T) {
-		rawDisabled := OptionsFromControl(&ControlConfig{
-			Master:  ControlMasterYes,
-			Path:    "NONE",
-			Persist: "10m",
-		})
-		projA := rawDisabled.ControlConfig()
-		projB, err := rawDisabled.ValidatedControlConfig()
+		// Cross-layer ControlPath=NONE cleanly disables lower-tier active mux with zero projection drift.
+		mergedDisabled, err := MergeEffectiveOptions(
+			OptionsFromControl(&ControlConfig{Path: "NONE"}),
+			OptionsFromControl(&ControlConfig{Master: ControlMasterYes, Path: "/tmp/cm-%C", Persist: "10m"}),
+		)
 		if err != nil {
-			t.Fatalf("ValidatedControlConfig(NONE) failed: %v", err)
+			t.Fatalf("MergeEffectiveOptions(cross-layer NONE) failed: %v", err)
+		}
+		projA := mergedDisabled.ControlConfig()
+		projB, err := mergedDisabled.ValidatedControlConfig()
+		if err != nil {
+			t.Fatalf("ValidatedControlConfig(cross-layer NONE) failed: %v", err)
 		}
 		wantDisabled := &ControlConfig{Master: ControlMasterNo, Path: "none", Persist: ""}
 		if !projA.Equal(wantDisabled) || !projB.Equal(wantDisabled) {
 			t.Fatalf("projection drift between ControlConfig (%+v) and ValidatedControlConfig (%+v)", projA, projB)
+		}
+
+		// Same-layer contradictory ControlPath=NONE + ControlMaster=yes/ControlPersist=10m
+		// must fail closed in ValidatedControlConfig while lenient ControlConfig stays disabled.
+		contradictory := OptionsFromControl(&ControlConfig{
+			Master:  ControlMasterYes,
+			Path:    "NONE",
+			Persist: "10m",
+		})
+		if got := contradictory.ControlConfig(); !got.Equal(wantDisabled) {
+			t.Fatalf("lenient ControlConfig(contradictory NONE) = %+v, want %+v", got, wantDisabled)
+		}
+		if ctrl, valErr := contradictory.ValidatedControlConfig(); !errors.Is(valErr, ErrSSHOptionsValidation) || ctrl != nil {
+			t.Fatalf("ValidatedControlConfig(same-layer contradictory NONE) = (%+v, %v), want (nil, ErrSSHOptionsValidation)", ctrl, valErr)
 		}
 	})
 

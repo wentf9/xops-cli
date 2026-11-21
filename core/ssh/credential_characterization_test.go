@@ -46,7 +46,12 @@ func (s *characterizationRecordingStore) UpdateAuth(ctx context.Context, nodeID,
 	committedToken := authUpdateToken
 	if s.cfg != nil {
 		s.cfg.Password = password
-		s.cfg.AuthType = "password"
+		if password != "" {
+			s.cfg.AuthType = "password"
+		} else if keyPath != "" {
+			s.cfg.AuthType = "key"
+			s.cfg.KeyPath = keyPath
+		}
 		committedToken = authUpdateToken + "-updated"
 		s.cfg.AuthUpdateToken = committedToken
 	}

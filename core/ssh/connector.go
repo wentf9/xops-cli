@@ -2,8 +2,11 @@ package ssh
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"math"
 	"net"
 	"os"
@@ -512,6 +515,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 	plan := make([]connectionPlanNode, 0, 2)
 	positions := make(map[string]int)
 	current := nodeName
+	var remainingJumps []string
 	for current != "" {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("resolve proxy jump chain for node '%s' canceled: %w", nodeName, err)
@@ -536,6 +540,8 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 		nodeCfg.Address = normalizeHostAddress(nodeCfg.Address)
 		nodeCfg.BaseHost = normalizeHostAddress(nodeCfg.BaseHost)
 		nodeCfg.KeyPaths = slices.Clone(cfg.KeyPaths)
+		nodeCfg.AdmittedCertificates = cloneAdmittedCertificates(cfg.AdmittedCertificates)
+		nodeCfg.AdmittedKeyDigests = cloneAdmittedKeyDigests(cfg.AdmittedKeyDigests)
 		if nodeCfg.Port <= 0 {
 			nodeCfg.Port = 22
 		}
@@ -543,54 +549,23 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			nodeCfg.OriginalProxyJump = nodeCfg.ProxyJump
 			nodeCfg.HasOriginalProxyJump = true
 		}
-		jumps := splitProxyJumpChain(nodeCfg.ProxyJump)
-		nodeCfg.ProxyJump = strings.Join(jumps, ",")
+
+		var activeJumps []string
+		if len(remainingJumps) > 0 {
+			activeJumps = remainingJumps
+		} else {
+			activeJumps = splitProxyJumpChain(nodeCfg.ProxyJump)
+		}
+		nodeCfg.ProxyJump = strings.Join(activeJumps, ",")
 		positions[current] = len(plan)
 		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg, control: c.resolveControl(current, &nodeCfg)})
-		if len(jumps) > 1 {
-			for index := len(jumps) - 1; index >= 0; index-- {
-				jumpName := jumps[index]
-				if cycleStart, ok := positions[jumpName]; ok {
-					path := make([]string, 0, len(plan)-cycleStart+1)
-					for _, item := range plan[cycleStart:] {
-						path = append(path, item.name)
-					}
-					path = append(path, jumpName)
-					return nil, &ProxyCycleError{NodeID: jumpName, Path: path}
-				}
-				jumpCfg, jumpErr := c.provider.GetConfig(jumpName)
-				if jumpErr != nil {
-					return nil, fmt.Errorf("fetch config for proxy jump %q failed: %w", jumpName, jumpErr)
-				}
-				if jumpCfg == nil {
-					return nil, fmt.Errorf("config for proxy jump %q is nil", jumpName)
-				}
-				cloned := *jumpCfg
-				cloned.Address = normalizeHostAddress(jumpCfg.Address)
-				cloned.BaseHost = normalizeHostAddress(jumpCfg.BaseHost)
-				cloned.KeyPaths = slices.Clone(jumpCfg.KeyPaths)
-				if cloned.Port <= 0 {
-					cloned.Port = 22
-				}
-				if !cloned.HasOriginalProxyJump {
-					cloned.OriginalProxyJump = jumpCfg.ProxyJump
-					cloned.HasOriginalProxyJump = true
-				}
-				if index > 0 {
-					cloned.ProxyJump = strings.Join(jumps[:index], ",")
-				} else {
-					cloned.ProxyJump = ""
-				}
-				positions[jumpName] = len(plan)
-				plan = append(plan, connectionPlanNode{name: jumpName, cfg: &cloned, control: c.resolveControl(jumpName, &cloned)})
-			}
-			assignPlanRouteKeys(plan)
-			return plan, nil
-		}
-		if len(jumps) == 1 {
-			current = jumps[0]
+
+		if len(activeJumps) > 0 {
+			current = activeJumps[len(activeJumps)-1]
+			remainingJumps = activeJumps[:len(activeJumps)-1]
 		} else {
 			current = ""
+			remainingJumps = nil
 		}
 	}
 	assignPlanRouteKeys(plan)
@@ -638,16 +613,151 @@ func splitProxyJumpChain(proxyJump string) []string {
 	return jumps
 }
 
+func writeHashStr(h hash.Hash, s string) {
+	_, _ = h.Write([]byte(strconv.Itoa(len(s))))
+	_, _ = h.Write([]byte{':'})
+	_, _ = h.Write([]byte(s))
+	_, _ = h.Write([]byte{';'})
+}
+
+func writeHashBool(h hash.Hash, v bool) {
+	if v {
+		_, _ = h.Write([]byte{'1', ';'})
+	} else {
+		_, _ = h.Write([]byte{'0', ';'})
+	}
+}
+
+func writeHashOptBool(h hash.Hash, v, ok bool) {
+	writeHashBool(h, ok)
+	writeHashBool(h, v)
+}
+
+func writeHashStrings(h hash.Hash, list []string) {
+	_, _ = h.Write([]byte(strconv.Itoa(len(list))))
+	_, _ = h.Write([]byte{'['})
+	for _, s := range list {
+		writeHashStr(h, s)
+	}
+	_, _ = h.Write([]byte{']', ';'})
+}
+
+// targetCompatDigest hashes every compatibility-checked field of cfg so
+// singleflight never coalesces concurrent dials with differing targets,
+// trust/auth versions, auth policies, admitted materials, or transport options.
+func targetCompatDigest(cfg *ClientConfig) string {
+	h := sha256.New()
+	if cfg == nil {
+		writeHashStr(h, "nil")
+		return hex.EncodeToString(h.Sum(nil))
+	}
+	port := cfg.Port
+	if port <= 0 {
+		port = 22
+	}
+	writeHashStr(h, normalizeHostAddress(cfg.Address))
+	writeHashStr(h, strings.TrimSpace(normalizeHostAddress(cfg.BaseHost)))
+	writeHashStr(h, strconv.Itoa(port))
+	writeHashStr(h, cfg.User)
+	writeHashStr(h, effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID))
+	writeHashStr(h, strings.TrimSpace(cfg.CanonicalHost))
+	writeHashStr(h, cfg.KeyRef)
+	writeHashStr(h, cfg.TrustVersion)
+	writeHashStr(h, cfg.AuthUpdateToken)
+	writeHashStr(h, normalizeAuthType(cfg.AuthType))
+	writeHashStr(h, cfg.KeyPath)
+	writeHashStrings(h, cfg.KeyPaths)
+
+	writeHashBool(h, cfg.EnforceAdmittedCertificates)
+	_, _ = h.Write([]byte(strconv.Itoa(len(cfg.AdmittedCertificates))))
+	_, _ = h.Write([]byte{'['})
+	for _, cert := range cfg.AdmittedCertificates {
+		writeHashStr(h, cert.Path)
+		writeHashStr(h, cert.SHA256)
+		writeHashBool(h, cert.Missing)
+		writeHashBool(h, cert.NonRegular)
+	}
+	_, _ = h.Write([]byte{']', ';'})
+
+	writeHashBool(h, cfg.EnforceAdmittedKeyDigests)
+	_, _ = h.Write([]byte(strconv.Itoa(len(cfg.AdmittedKeyDigests))))
+	_, _ = h.Write([]byte{'['})
+	for _, kd := range cfg.AdmittedKeyDigests {
+		writeHashStr(h, kd.Path)
+		writeHashStr(h, kd.SHA256)
+		writeHashBool(h, kd.Missing)
+		writeHashBool(h, kd.NonRegular)
+	}
+	_, _ = h.Write([]byte{']', ';'})
+
+	origJump := cfg.ProxyJump
+	if cfg.HasOriginalProxyJump || cfg.OriginalProxyJump != "" {
+		origJump = cfg.OriginalProxyJump
+	}
+	writeHashStr(h, origJump)
+	activeJump := HasActiveProxyJump(cfg.ProxyJump)
+	writeHashBool(h, activeJump)
+	if !activeJump {
+		writeHashStr(h, cfg.Options.ActiveProxyCommand())
+	}
+
+	opts := cfg.Options
+	writeHashStr(h, opts.StrictHostKeyChecking())
+	writeHashStr(h, opts.UserKnownHostsFile())
+	writeHashStr(h, opts.GlobalKnownHostsFile())
+	writeHashStr(h, opts.VerifyHostKeyDNS())
+	writeHashBool(h, opts.HashKnownHosts())
+	writeHashStrings(h, opts.IdentityFiles())
+	writeHashStrings(h, opts.CertificateFiles())
+	writeHashStr(h, opts.IdentityAgent())
+	writeHashBool(h, opts.IdentitiesOnly())
+	writeHashBool(h, opts.BatchMode())
+	pub, pubOK := opts.PubkeyAuthentication()
+	writeHashOptBool(h, pub, pubOK)
+	pwd, pwdOK := opts.PasswordAuthentication()
+	writeHashOptBool(h, pwd, pwdOK)
+	kbd, kbdOK := opts.KbdInteractiveAuthentication()
+	writeHashOptBool(h, kbd, kbdOK)
+	writeHashStrings(h, opts.PreferredAuthentications())
+	writeHashStr(h, opts.Ciphers())
+	writeHashStr(h, opts.MACs())
+	writeHashStr(h, opts.KexAlgorithms())
+	writeHashStr(h, opts.HostKeyAlgorithms())
+	writeHashStr(h, opts.AddressFamily())
+	writeHashStr(h, strconv.FormatInt(int64(opts.ServerAliveInterval()), 10))
+	writeHashStr(h, strconv.Itoa(opts.ServerAliveCountMax()))
+	tcpKA, tcpKAOK := opts.TCPKeepAlive()
+	writeHashOptBool(h, tcpKA, tcpKAOK)
+	writeHashStr(h, opts.ForwardAgent())
+	writeHashStr(h, opts.GatewayPortsMode())
+	unlink, unlinkOK := opts.StreamLocalBindUnlink()
+	writeHashOptBool(h, unlink, unlinkOK)
+	mask, maskOK := opts.StreamLocalBindMask()
+	writeHashBool(h, maskOK)
+	writeHashStr(h, strconv.FormatUint(uint64(mask), 8))
+	writeHashStr(h, opts.CanonicalizeHostname())
+	writeHashStrings(h, opts.CanonicalDomains())
+	dots, dotsOK := opts.CanonicalizeMaxDots()
+	writeHashBool(h, dotsOK)
+	writeHashStr(h, strconv.Itoa(dots))
+	fb, fbOK := opts.CanonicalizeFallbackLocal()
+	writeHashOptBool(h, fb, fbOK)
+	writeHashStrings(h, opts.CanonicalizePermittedCNAMEs())
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // connectPlannedNode runs the cache/multiplex/connect decision for one node in a
 // shared task. reuseOnly stops before dialing so a jump-chained target can be
 // reused without its bastion; a caller that finds errJumpChainRequired retries
 // with the full chain once the reuse-only task has finished.
 func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, reuseOnly bool) (*Client, error) {
 	routeKey := planNode.poolKey()
+	sfKey := routeKey + "\x00" + targetCompatDigest(planNode.cfg)
 	for {
 		// 缓存复检、失效驱逐和重建位于同一个共享任务内。任务仅绑定 Connector 生命周期，
 		// 单个调用者取消只停止等待，不会关闭连接池中由其他调用者共享的连接。
-		resultCh := c.sf.DoChan(routeKey, func() (any, error) {
+		resultCh := c.sf.DoChan(sfKey, func() (any, error) {
 			sharedCtx, finish, err := c.beginSharedConnect()
 			if err != nil {
 				return nil, err
@@ -724,6 +834,7 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 			} else {
 				probeErr = err
 				c.evictCachedClient(routeKey, cachedClient)
+				c.evictDownstreamGeneration(routeKey, cachedClient)
 				if ctx.Err() != nil {
 					return nil, fmt.Errorf("probe cached SSH connection for node '%s' failed: %w", nodeName, ctx.Err())
 				}
@@ -862,8 +973,10 @@ func isDownstreamRouteKey(parentKey, candidateKey string) bool {
 
 // retireDownstreamGeneration non-disruptively retires cached downstream hops
 // riding on displaced's physical transport generation after parentKey drifted.
+// When displaced.RootConn is nil (e.g. control proxy or test double without a
+// tracked physical root), all cached downstream hops under parentKey are retired.
 func (c *Connector) retireDownstreamGeneration(parentKey string, displaced *PooledClient) {
-	if displaced == nil || displaced.RootConn == nil {
+	if displaced == nil {
 		return
 	}
 	type candidate struct {
@@ -872,13 +985,46 @@ func (c *Connector) retireDownstreamGeneration(parentKey string, displaced *Pool
 	}
 	var downstream []candidate
 	c.clients.IterCb(func(key string, client *PooledClient) bool {
-		if client != nil && client.RootConn == displaced.RootConn && isDownstreamRouteKey(parentKey, key) {
-			downstream = append(downstream, candidate{key: key, client: client})
+		if client == nil || !isDownstreamRouteKey(parentKey, key) {
+			return true
 		}
+		if displaced.RootConn != nil && client.RootConn != displaced.RootConn {
+			return true
+		}
+		downstream = append(downstream, candidate{key: key, client: client})
 		return true
 	})
 	for _, item := range downstream {
 		c.retireIncompatibleClient(item.key, item.client)
+	}
+}
+
+// evictDownstreamGeneration evicts and interrupts cached downstream hops riding
+// on a dead parent generation after a failed liveness probe or keepalive death.
+func (c *Connector) evictDownstreamGeneration(parentKey string, dead *PooledClient) {
+	if dead == nil {
+		return
+	}
+	type candidate struct {
+		key    string
+		client *PooledClient
+	}
+	var downstream []candidate
+	c.clients.IterCb(func(key string, client *PooledClient) bool {
+		if client == nil || !isDownstreamRouteKey(parentKey, key) {
+			return true
+		}
+		if dead.RootConn != nil && client.RootConn != dead.RootConn {
+			return true
+		}
+		downstream = append(downstream, candidate{key: key, client: client})
+		return true
+	})
+	for _, item := range downstream {
+		if concurrent.RemoveIfMatch(c.clients, item.key, item.client) {
+			c.removeKeepAliveFor(item.key, item.client)
+			_ = item.client.interrupt()
+		}
 	}
 }
 
@@ -911,7 +1057,7 @@ func (c *Connector) verifyMuxMasterTarget(muxClient *MuxClient, expandedPath str
 		return nil
 	}
 	masterTarget, ok := muxClient.Extension(muxTargetExtensionName)
-	if !ok || target.MatchesMasterTarget(masterTarget) {
+	if !ok || (masterTarget != "" && target.MatchesMasterTarget(masterTarget)) {
 		return nil
 	}
 	return fmt.Errorf("%w: control socket %q is connected to %s, cannot reuse for %s",
@@ -1705,7 +1851,10 @@ func (c *Connector) removeKeepAliveFor(nodeName string, client *PooledClient) {
 // 使用 RemoveIfMatch 原子"比对并删除"：仅当池/注册表中仍是失败连接本人时才驱逐，
 // 防止"读取-比对-删除"间隙内并发重连写入新连接后被旧心跳误删
 func (c *Connector) evictDeadClient(nodeName string, dead *PooledClient, entry *keepAliveEntry) {
-	concurrent.RemoveIfMatch(c.clients, nodeName, dead)
+	removed := concurrent.RemoveIfMatch(c.clients, nodeName, dead)
+	if removed || (dead != nil && dead.RootConn != nil) {
+		c.evictDownstreamGeneration(nodeName, dead)
+	}
 	concurrent.RemoveIfMatch(c.keepAlives, nodeName, entry)
 	entry.cancel()
 }

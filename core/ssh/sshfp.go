@@ -37,21 +37,32 @@ func sshfpAlgorithmForKey(key cryptoSSH.PublicKey) (uint8, bool) {
 }
 
 // EvaluateSSHFP compares DNS SSHFP records against key. Only SHA-256
-// (fingerprint type 2, 32 bytes) records for the key's algorithm are considered;
-// SHA-1 records are ignored entirely.
+// (fingerprint type 2, 32 bytes, non-zero algorithm) records are considered;
+// SHA-1 records are ignored entirely. When the DNS answer is DNSSEC-authenticated
+// (AD=1) and contains valid SHA-256 SSHFP records for another algorithm (or when
+// the presented key type has no SSHFP algorithm mapping), EvaluateSSHFP fails
+// closed with SSHFPStatusMismatch to prevent algorithm-downgrade MITM attacks.
 func EvaluateSSHFP(result SSHFPResult, key cryptoSSH.PublicKey) SSHFPVerifyStatus {
-	algo, ok := sshfpAlgorithmForKey(key)
-	if !ok {
+	if key == nil {
 		return SSHFPStatusNone
 	}
-	digest := sha256.Sum256(key.Marshal())
-	considered := false
+	algo, algoOK := sshfpAlgorithmForKey(key)
+	var digest [sha256.Size]byte
+	if algoOK {
+		digest = sha256.Sum256(key.Marshal())
+	}
+	consideredSameAlgo := false
+	anyValidSHA256 := false
 	matched := false
 	for _, record := range result.Records {
-		if record.Algorithm != algo || record.FingerprintType != sshfpFingerprintSHA256 || len(record.Fingerprint) != sha256.Size {
+		if record.FingerprintType != sshfpFingerprintSHA256 || len(record.Fingerprint) != sha256.Size || record.Algorithm == 0 {
 			continue
 		}
-		considered = true
+		anyValidSHA256 = true
+		if !algoOK || record.Algorithm != algo {
+			continue
+		}
+		consideredSameAlgo = true
 		if subtle.ConstantTimeCompare(record.Fingerprint, digest[:]) == 1 {
 			matched = true
 		}
@@ -61,7 +72,7 @@ func EvaluateSSHFP(result SSHFPResult, key cryptoSSH.PublicKey) SSHFPVerifyStatu
 		return SSHFPStatusMatchedVerified
 	case matched:
 		return SSHFPStatusMatchedUnverified
-	case considered:
+	case consideredSameAlgo || (result.Authenticated && anyValidSHA256):
 		return SSHFPStatusMismatch
 	default:
 		return SSHFPStatusNone

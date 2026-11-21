@@ -364,13 +364,13 @@ func TestP1_IdentityPathSetting_OptionsDelegation(t *testing.T) {
 	if err := opts.Set(OptionIdentityFile, "NONE\n~/.ssh/id_%h"); err != nil {
 		t.Fatalf("Set IdentityFile: %v", err)
 	}
-	if got := opts.IdentityFiles(); !slices.Equal(got, []string{"none", "~/.ssh/id_%h"}) {
+	if got := opts.IdentityFiles(); !slices.Equal(got, []string{"none"}) {
 		t.Fatalf("IdentityFiles() = %v", got)
 	}
 	if err := opts.Set(OptionCertificateFile, "None\n${CERT_DIR}/id-cert.pub"); err != nil {
 		t.Fatalf("Set CertificateFile: %v", err)
 	}
-	if got := opts.CertificateFiles(); !slices.Equal(got, []string{"none", "${CERT_DIR}/id-cert.pub"}) {
+	if got := opts.CertificateFiles(); !slices.Equal(got, []string{"none"}) {
 		t.Fatalf("CertificateFiles() = %v", got)
 	}
 	if err := opts.Set(OptionIdentityFile, "~/.ssh/id_%k"); !errors.Is(err, ErrSSHOptionsValidation) {

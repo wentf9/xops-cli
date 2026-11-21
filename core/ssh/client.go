@@ -251,26 +251,30 @@ func (c *Client) configSnapshot() (ClientConfig, bool) {
 	c.cfgMu.RLock()
 	defer c.cfgMu.RUnlock()
 	return ClientConfig{
-		KeyRef:                c.connCfg.KeyRef,
-		TrustVersion:          c.connCfg.TrustVersion,
-		NodeID:                c.connCfg.NodeID,
-		OriginalHost:          c.connCfg.OriginalHost,
-		CanonicalHost:         c.connCfg.CanonicalHost,
-		Address:               c.connCfg.Address,
-		Port:                  c.connCfg.Port,
-		User:                  c.connCfg.User,
-		AuthType:              c.connCfg.AuthType,
-		KeyPath:               c.connCfg.KeyPath,
-		KeyPaths:              slices.Clone(c.connCfg.KeyPaths),
-		AuthUpdateToken:       c.connCfg.AuthUpdateToken,
-		SudoMode:              c.connCfg.SudoMode,
-		SudoUpdateToken:       c.connCfg.SudoUpdateToken,
-		ProxyJump:             c.connCfg.ProxyJump,
-		OriginalProxyJump:     c.connCfg.OriginalProxyJump,
-		HasOriginalProxyJump:  c.connCfg.HasOriginalProxyJump,
-		PasswordPromptPattern: c.connCfg.PasswordPromptPattern,
-		Execution:             c.connCfg.Execution.Clone(),
-		Options:               c.connCfg.Options.Clone(),
+		KeyRef:                      c.connCfg.KeyRef,
+		TrustVersion:                c.connCfg.TrustVersion,
+		NodeID:                      c.connCfg.NodeID,
+		OriginalHost:                c.connCfg.OriginalHost,
+		CanonicalHost:               c.connCfg.CanonicalHost,
+		Address:                     c.connCfg.Address,
+		Port:                        c.connCfg.Port,
+		User:                        c.connCfg.User,
+		AuthType:                    c.connCfg.AuthType,
+		KeyPath:                     c.connCfg.KeyPath,
+		KeyPaths:                    slices.Clone(c.connCfg.KeyPaths),
+		AuthUpdateToken:             c.connCfg.AuthUpdateToken,
+		SudoMode:                    c.connCfg.SudoMode,
+		SudoUpdateToken:             c.connCfg.SudoUpdateToken,
+		ProxyJump:                   c.connCfg.ProxyJump,
+		OriginalProxyJump:           c.connCfg.OriginalProxyJump,
+		HasOriginalProxyJump:        c.connCfg.HasOriginalProxyJump,
+		PasswordPromptPattern:       c.connCfg.PasswordPromptPattern,
+		EnforceAdmittedCertificates: c.connCfg.EnforceAdmittedCertificates,
+		AdmittedCertificates:        cloneAdmittedCertificates(c.connCfg.AdmittedCertificates),
+		EnforceAdmittedKeyDigests:   c.connCfg.EnforceAdmittedKeyDigests,
+		AdmittedKeyDigests:          cloneAdmittedKeyDigests(c.connCfg.AdmittedKeyDigests),
+		Execution:                   c.connCfg.Execution.Clone(),
+		Options:                     c.connCfg.Options.Clone(),
 	}, true
 }
 
@@ -1052,8 +1056,12 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 	newClone.Address = normalizeHostAddress(newCfg.Address)
 	newCfg = &newClone
 
-	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
-	if err := validateTargetCompatibility(curCfg, newCfg); err != nil {
+	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致。
+	// AuthUpdateToken 的刷新语义由下方 switch 按 kind 精确校验（auth 必须等于本次 committedToken，
+	// sudo 刷新期间忽略无关并发 auth 令牌推进并严格保留原快照）。
+	expected := curCfg
+	expected.AuthUpdateToken = newCfg.AuthUpdateToken
+	if err := validateTargetCompatibility(expected, newCfg); err != nil {
 		return fmt.Errorf("incompatible target update for node %q: %w", nodeID, err)
 	}
 

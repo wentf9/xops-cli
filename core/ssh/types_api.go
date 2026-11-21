@@ -20,6 +20,62 @@ const (
 	SudoModeAuto   SudoMode = "auto"
 )
 
+// AdmittedCertificate binds an admitted user certificate path to its expected
+// SHA-256 digest and optional pre-read raw bytes captured at ConnectionPlan admission.
+// RawBytes is excluded from JSON serialization so ConnectionKey hashes only
+// deterministic metadata (Path/SHA256/Missing/NonRegular).
+type AdmittedCertificate struct {
+	Path       string `json:",omitempty"`
+	SHA256     string `json:",omitempty"`
+	Missing    bool   `json:",omitempty"`
+	NonRegular bool   `json:",omitempty"`
+	RawBytes   []byte `json:"-"`
+}
+
+// AdmittedKeyDigest binds an admitted key file path to its expected SHA-256
+// digest captured at ConnectionPlan admission. Private key bytes are never stored.
+type AdmittedKeyDigest struct {
+	Path       string `json:",omitempty"`
+	SHA256     string `json:",omitempty"`
+	Missing    bool   `json:",omitempty"`
+	NonRegular bool   `json:",omitempty"`
+}
+
+func cloneAdmittedCertificates(src []AdmittedCertificate) []AdmittedCertificate {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]AdmittedCertificate, len(src))
+	for i, c := range src {
+		c.RawBytes = slices.Clone(c.RawBytes)
+		out[i] = c
+	}
+	return out
+}
+
+func cloneAdmittedKeyDigests(src []AdmittedKeyDigest) []AdmittedKeyDigest {
+	if len(src) == 0 {
+		return nil
+	}
+	return slices.Clone(src)
+}
+
+func equalAdmittedCertificateMeta(a, b AdmittedCertificate) bool {
+	return a.Path == b.Path && a.SHA256 == b.SHA256 && a.Missing == b.Missing && a.NonRegular == b.NonRegular
+}
+
+func equalAdmittedCertificates(a, b []AdmittedCertificate) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !equalAdmittedCertificateMeta(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
 // ClientConfig 定义建立 SSH 连接所需的各种参数，代替原有的 models.Node/Host/Identity。
 type ClientConfig struct {
 	KeyRef       string
@@ -56,9 +112,13 @@ type ClientConfig struct {
 	HasOriginalProxyJump bool   // 是否显式保留了配置态 ProxyJump 快照（区分显式空字符串与未设置）
 	// PasswordPromptPattern 自定义密码提示正则（节点级，可选）。
 	// 为空时回落到 Connector 的全局配置，再为空则使用内置的多语言默认模式。
-	PasswordPromptPattern string
-	Execution             *ExecutionConfig
-	Options               *Options
+	PasswordPromptPattern       string
+	EnforceAdmittedCertificates bool                  `json:",omitempty"`
+	AdmittedCertificates        []AdmittedCertificate `json:",omitempty"`
+	EnforceAdmittedKeyDigests   bool                  `json:",omitempty"`
+	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty"`
+	Execution                   *ExecutionConfig
+	Options                     *Options
 }
 
 // ToConnectionConfig 将 ClientConfig 转换为仅含网络与连接参数的 ConnectionConfig，剥离所有明文密码。
@@ -72,59 +132,71 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		origJump = c.ProxyJump
 	}
 	return ConnectionConfig{
-		KeyRef:                c.KeyRef,
-		TrustVersion:          c.TrustVersion,
-		NodeID:                c.NodeID,
-		OriginalHost:          c.OriginalHost,
-		CanonicalHost:         c.CanonicalHost,
-		Address:               c.Address,
-		BaseHost:              c.BaseHost,
-		Port:                  c.Port,
-		User:                  c.User,
-		AuthType:              c.AuthType,
-		KeyPath:               c.KeyPath,
-		KeyPaths:              slices.Clone(c.KeyPaths),
-		AuthUpdateToken:       c.AuthUpdateToken,
-		SudoMode:              c.SudoMode,
-		SudoUpdateToken:       c.SudoUpdateToken,
-		ProxyJump:             c.ProxyJump,
-		OriginalProxyJump:     origJump,
-		HasOriginalProxyJump:  hasOriginal,
-		PasswordPromptPattern: c.PasswordPromptPattern,
-		Execution:             c.Execution.Clone(),
-		Options:               c.Options.Clone(),
+		KeyRef:                      c.KeyRef,
+		TrustVersion:                c.TrustVersion,
+		NodeID:                      c.NodeID,
+		OriginalHost:                c.OriginalHost,
+		CanonicalHost:               c.CanonicalHost,
+		Address:                     c.Address,
+		BaseHost:                    c.BaseHost,
+		Port:                        c.Port,
+		User:                        c.User,
+		AuthType:                    c.AuthType,
+		configuredAuthType:          c.AuthType,
+		KeyPath:                     c.KeyPath,
+		KeyPaths:                    slices.Clone(c.KeyPaths),
+		AuthUpdateToken:             c.AuthUpdateToken,
+		SudoMode:                    c.SudoMode,
+		SudoUpdateToken:             c.SudoUpdateToken,
+		ProxyJump:                   c.ProxyJump,
+		OriginalProxyJump:           origJump,
+		HasOriginalProxyJump:        hasOriginal,
+		PasswordPromptPattern:       c.PasswordPromptPattern,
+		EnforceAdmittedCertificates: c.EnforceAdmittedCertificates,
+		AdmittedCertificates:        cloneAdmittedCertificates(c.AdmittedCertificates),
+		EnforceAdmittedKeyDigests:   c.EnforceAdmittedKeyDigests,
+		AdmittedKeyDigests:          cloneAdmittedKeyDigests(c.AdmittedKeyDigests),
+		Execution:                   c.Execution.Clone(),
+		Options:                     c.Options.Clone(),
 	}
 }
 
 // ConnectionConfig 包含建立连接所需的目标与网络参数，不包含登录或提权明文机密。
 type ConnectionConfig struct {
-	KeyRef                string
-	TrustVersion          string
-	NodeID                string
-	OriginalHost          string
-	CanonicalHost         string
-	Address               string
-	BaseHost              string `json:"base_host,omitempty"`
-	Port                  int
-	User                  string
-	AuthType              string
-	KeyPath               string
-	KeyPaths              []string
-	AuthUpdateToken       string
-	SudoMode              SudoMode
-	SudoUpdateToken       string
-	ProxyJump             string
-	OriginalProxyJump     string
-	HasOriginalProxyJump  bool
-	PasswordPromptPattern string
-	Execution             *ExecutionConfig
-	Options               *Options
+	KeyRef                      string
+	TrustVersion                string
+	NodeID                      string
+	OriginalHost                string
+	CanonicalHost               string
+	Address                     string
+	BaseHost                    string `json:"base_host,omitempty"`
+	Port                        int
+	User                        string
+	AuthType                    string
+	configuredAuthType          string
+	KeyPath                     string
+	KeyPaths                    []string
+	AuthUpdateToken             string
+	SudoMode                    SudoMode
+	SudoUpdateToken             string
+	ProxyJump                   string
+	OriginalProxyJump           string
+	HasOriginalProxyJump        bool
+	PasswordPromptPattern       string
+	EnforceAdmittedCertificates bool                  `json:",omitempty"`
+	AdmittedCertificates        []AdmittedCertificate `json:",omitempty"`
+	EnforceAdmittedKeyDigests   bool                  `json:",omitempty"`
+	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty"`
+	Execution                   *ExecutionConfig
+	Options                     *Options
 }
 
 // Clone returns a deep copy of ConnectionConfig, isolating mutable Execution and Options pointers.
 func (c ConnectionConfig) Clone() ConnectionConfig {
 	out := c
 	out.KeyPaths = slices.Clone(c.KeyPaths)
+	out.AdmittedCertificates = cloneAdmittedCertificates(c.AdmittedCertificates)
+	out.AdmittedKeyDigests = cloneAdmittedKeyDigests(c.AdmittedKeyDigests)
 	out.Execution = c.Execution.Clone()
 	out.Options = c.Options.Clone()
 	return out
@@ -336,6 +408,12 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 	if newCfg.KeyRef != cur.KeyRef || newCfg.TrustVersion != cur.TrustVersion {
 		return fmt.Errorf("%w: key reference or host trust version changed", ErrSnapshotMismatch)
 	}
+	if newCfg.AuthUpdateToken != cur.AuthUpdateToken {
+		return fmt.Errorf("%w: auth update token changed", ErrSnapshotMismatch)
+	}
+	if err := validateAuthTypeCompatibility(cur, newCfg); err != nil {
+		return err
+	}
 	if newCfg.KeyPath != cur.KeyPath {
 		return fmt.Errorf("%w: key path changed (expected %q, got %q)",
 			ErrSnapshotMismatch, cur.KeyPath, newCfg.KeyPath)
@@ -344,10 +422,42 @@ func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) err
 		return fmt.Errorf("%w: key paths changed (expected %v, got %v)",
 			ErrSnapshotMismatch, cur.KeyPaths, newCfg.KeyPaths)
 	}
+	if err := validateAdmittedMaterialTargetCompatibility(cur, newCfg); err != nil {
+		return err
+	}
 	if err := validateOptionsTargetCompatibility(cur.Options, newCfg.Options); err != nil {
 		return err
 	}
 	return validateRoutingTargetCompatibility(cur, newCfg)
+}
+
+func validateAdmittedMaterialTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
+	if cur.EnforceAdmittedCertificates != newCfg.EnforceAdmittedCertificates ||
+		!equalAdmittedCertificates(cur.AdmittedCertificates, newCfg.AdmittedCertificates) {
+		return fmt.Errorf("%w: admitted certificates changed", ErrSnapshotMismatch)
+	}
+	if cur.EnforceAdmittedKeyDigests != newCfg.EnforceAdmittedKeyDigests ||
+		!slices.Equal(cur.AdmittedKeyDigests, newCfg.AdmittedKeyDigests) {
+		return fmt.Errorf("%w: admitted key digests changed", ErrSnapshotMismatch)
+	}
+	return nil
+}
+
+func normalizeAuthType(authType string) string {
+	return strings.ToLower(strings.TrimSpace(authType))
+}
+
+func validateAuthTypeCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
+	curType := normalizeAuthType(cur.AuthType)
+	newType := normalizeAuthType(newCfg.AuthType)
+	if curType == newType {
+		return nil
+	}
+	if normalizeAuthType(cur.configuredAuthType) == "auto" && newType == "auto" {
+		return nil
+	}
+	return fmt.Errorf("%w: auth type changed (expected %q, got %q)",
+		ErrSnapshotMismatch, cur.AuthType, newCfg.AuthType)
 }
 
 func validateOptionsTargetCompatibility(curOpts, newOpts *Options) error {
@@ -377,7 +487,31 @@ func validateOptionsTargetCompatibility(curOpts, newOpts *Options) error {
 		return fmt.Errorf("%w: address family changed (expected %q, got %q)",
 			ErrSnapshotMismatch, curOpts.AddressFamily(), newOpts.AddressFamily())
 	}
+	if err := validateTransportAndForwardOptionsTargetCompatibility(curOpts, newOpts); err != nil {
+		return err
+	}
 	return validateCanonicalizeOptionsTargetCompatibility(curOpts, newOpts)
+}
+
+func validateTransportAndForwardOptionsTargetCompatibility(curOpts, newOpts *Options) error {
+	curTCPKA, curTCPKAOK := curOpts.TCPKeepAlive()
+	newTCPKA, newTCPKAOK := newOpts.TCPKeepAlive()
+	if curOpts.ServerAliveInterval() != newOpts.ServerAliveInterval() ||
+		curOpts.ServerAliveCountMax() != newOpts.ServerAliveCountMax() ||
+		curTCPKA != newTCPKA || curTCPKAOK != newTCPKAOK {
+		return fmt.Errorf("%w: keepalive options changed", ErrSnapshotMismatch)
+	}
+	curUnlink, curUnlinkOK := curOpts.StreamLocalBindUnlink()
+	newUnlink, newUnlinkOK := newOpts.StreamLocalBindUnlink()
+	curMask, curMaskOK := curOpts.StreamLocalBindMask()
+	newMask, newMaskOK := newOpts.StreamLocalBindMask()
+	if curOpts.ForwardAgent() != newOpts.ForwardAgent() ||
+		curOpts.GatewayPortsMode() != newOpts.GatewayPortsMode() ||
+		curUnlink != newUnlink || curUnlinkOK != newUnlinkOK ||
+		curMask != newMask || curMaskOK != newMaskOK {
+		return fmt.Errorf("%w: forwarding options changed", ErrSnapshotMismatch)
+	}
+	return nil
 }
 
 func validateAuthOptionsTargetCompatibility(curOpts, newOpts *Options) error {
@@ -385,6 +519,7 @@ func validateAuthOptionsTargetCompatibility(curOpts, newOpts *Options) error {
 	newPub, newPubOK := newOpts.PubkeyAuthentication()
 	if curOpts.IdentityAgent() != newOpts.IdentityAgent() ||
 		curOpts.IdentitiesOnly() != newOpts.IdentitiesOnly() ||
+		curOpts.BatchMode() != newOpts.BatchMode() ||
 		curPub != newPub || curPubOK != newPubOK {
 		return fmt.Errorf("%w: publickey or agent authentication options changed", ErrSnapshotMismatch)
 	}

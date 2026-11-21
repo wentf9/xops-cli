@@ -177,7 +177,8 @@ func TestPhase4_EvaluateSSHFPMatrix(t *testing.T) {
 		{"mismatch", SSHFPResult{Authenticated: true, Records: []SSHFPRecord{{4, 2, bad}}}, SSHFPStatusMismatch},
 		{"sha1 ignored", SSHFPResult{Authenticated: true, Records: []SSHFPRecord{{4, 1, sha1Len}}}, SSHFPStatusNone},
 		{"sha256 wrong length ignored", SSHFPResult{Authenticated: true, Records: []SSHFPRecord{{4, 2, good[:31]}}}, SSHFPStatusNone},
-		{"other algorithm ignored", SSHFPResult{Authenticated: true, Records: []SSHFPRecord{{1, 2, good}}}, SSHFPStatusNone},
+		{"other algorithm authenticated mismatches", SSHFPResult{Authenticated: true, Records: []SSHFPRecord{{1, 2, good}}}, SSHFPStatusMismatch},
+		{"other algorithm unauthenticated ignored", SSHFPResult{Authenticated: false, Records: []SSHFPRecord{{1, 2, good}}}, SSHFPStatusNone},
 	}
 	for _, tc := range cases {
 		if got := EvaluateSSHFP(tc.result, key); got != tc.want {

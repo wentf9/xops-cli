@@ -272,33 +272,23 @@ func (t TargetContext) CanonicalTargetIdentity() string {
 
 // MatchesMasterTarget reports whether the requested target is compatible with
 // the master target identity advertised via the "target@xops" hello extension.
+//
+// An empty masterIdentity ("") returns true solely for legacy OpenSSH master
+// interoperability (masters that do not send the "target@xops" extension).
+// Any non-empty masterIdentity is validated fail-closed: an empty local target
+// host, missing/empty "host=", invalid/non-positive/out-of-range "port=",
+// duplicate fields, or malformed key=value segments all return false.
 func (t TargetContext) MatchesMasterTarget(masterIdentity string) bool {
+	if masterIdentity == "" {
+		return true
+	}
 	tHost := strings.ToLower(cleanHostLiteral(t.Host))
-	if strings.TrimSpace(masterIdentity) == "" || tHost == "" {
-		return true
+	if tHost == "" {
+		return false
 	}
-	var mHost, mUser, mJump string
-	mPort := 22
-	for _, part := range strings.Split(masterIdentity, ";") {
-		kv := strings.SplitN(part, "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		switch kv[0] {
-		case "host":
-			mHost = strings.ToLower(cleanHostLiteral(kv[1]))
-		case "port":
-			if p, err := strconv.Atoi(strings.TrimSpace(kv[1])); err == nil && p > 0 {
-				mPort = p
-			}
-		case "user":
-			mUser = strings.TrimSpace(kv[1])
-		case "jump":
-			mJump = strings.ToLower(NormalizeProxyJump(kv[1]))
-		}
-	}
-	if mHost == "" {
-		return true
+	mHost, mPort, mUser, mJump, ok := parseMasterTargetIdentity(masterIdentity)
+	if !ok {
+		return false
 	}
 	tPort := t.Port
 	if tPort <= 0 {
@@ -314,6 +304,54 @@ func (t TargetContext) MatchesMasterTarget(masterIdentity string) bool {
 		return false
 	}
 	return true
+}
+
+func parseMasterTargetIdentity(masterIdentity string) (host string, port int, user, jump string, ok bool) {
+	port = 22
+	var seenHost, seenPort, seenUser, seenJump bool
+	for part := range strings.SplitSeq(masterIdentity, ";") {
+		key, val, found := strings.Cut(part, "=")
+		if !found || key == "" || strings.TrimSpace(key) != key {
+			return "", 0, "", "", false
+		}
+		switch key {
+		case "host":
+			if seenHost {
+				return "", 0, "", "", false
+			}
+			seenHost = true
+			host = strings.ToLower(cleanHostLiteral(val))
+			if host == "" {
+				return "", 0, "", "", false
+			}
+		case "port":
+			if seenPort {
+				return "", 0, "", "", false
+			}
+			seenPort = true
+			p, err := strconv.Atoi(strings.TrimSpace(val))
+			if err != nil || p <= 0 || p > 65535 {
+				return "", 0, "", "", false
+			}
+			port = p
+		case "user":
+			if seenUser {
+				return "", 0, "", "", false
+			}
+			seenUser = true
+			user = strings.TrimSpace(val)
+		case "jump":
+			if seenJump {
+				return "", 0, "", "", false
+			}
+			seenJump = true
+			jump = strings.ToLower(NormalizeProxyJump(val))
+		}
+	}
+	if host == "" {
+		return "", 0, "", "", false
+	}
+	return host, port, user, jump, true
 }
 
 // FormatTargetIdentity formats a canonical target identity string for human-readable error messages.

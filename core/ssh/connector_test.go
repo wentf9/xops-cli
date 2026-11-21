@@ -557,8 +557,9 @@ type mockProxyJumpStore struct {
 func TestConnector_ResolveConnectionPlan_MultiHopProxyJump(t *testing.T) {
 	store := &mockProxyJumpStore{cfgs: map[string]*ClientConfig{
 		"target":         {NodeID: "target", ProxyJump: "openssh:first, openssh:second"},
-		"openssh:first":  {NodeID: "openssh:first", ProxyJump: "ignored"},
+		"openssh:first":  {NodeID: "openssh:first", ProxyJump: "openssh:outer"},
 		"openssh:second": {NodeID: "openssh:second", ProxyJump: "ignored"},
+		"openssh:outer":  {NodeID: "openssh:outer"},
 	}}
 	connector := newTestConnector(store)
 	t.Cleanup(func() {
@@ -571,34 +572,44 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveConnectionPlan failed: %v", err)
 	}
-	if len(plan) != 3 {
-		t.Fatalf("got %d plan nodes, want 3", len(plan))
+	if len(plan) != 4 {
+		t.Fatalf("got %d plan nodes, want 4", len(plan))
 	}
-	if plan[0].name != "target" || plan[1].name != "openssh:second" || plan[2].name != "openssh:first" {
-		t.Fatalf("unexpected plan order: %q, %q, %q", plan[0].name, plan[1].name, plan[2].name)
+	if plan[0].name != "target" || plan[1].name != "openssh:second" || plan[2].name != "openssh:first" || plan[3].name != "openssh:outer" {
+		t.Fatalf("unexpected plan order: %q, %q, %q, %q", plan[0].name, plan[1].name, plan[2].name, plan[3].name)
 	}
 	if plan[1].cfg.ProxyJump != "openssh:first" {
 		t.Fatalf("second hop proxy is %q, want openssh:first", plan[1].cfg.ProxyJump)
 	}
-	if plan[2].cfg.ProxyJump != "" {
-		t.Fatalf("first hop proxy is %q, want direct connection", plan[2].cfg.ProxyJump)
+	if plan[2].cfg.ProxyJump != "openssh:outer" {
+		t.Fatalf("first hop proxy is %q, want openssh:outer", plan[2].cfg.ProxyJump)
+	}
+	if plan[3].cfg.ProxyJump != "" {
+		t.Fatalf("outer hop proxy is %q, want direct connection", plan[3].cfg.ProxyJump)
 	}
 }
 
 func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t *testing.T) {
+	outerJumpCfg := &ClientConfig{
+		NodeID:    "openssh:outer",
+		Address:   "192.168.1.0",
+		Port:      22,
+		User:      "outeruser",
+		ProxyJump: "",
+	}
 	firstJumpCfg := &ClientConfig{
 		NodeID:    "openssh:first",
 		Address:   "192.168.1.1",
 		Port:      22,
 		User:      "jumpuser",
-		ProxyJump: "ignored", // 配置库中首跳配置了 ignored
+		ProxyJump: "openssh:outer", // 首跳自身 ProxyJump 必须递归展开而非被静默清空
 	}
 	secondJumpCfg := &ClientConfig{
 		NodeID:    "openssh:second",
 		Address:   "192.168.1.2",
 		Port:      22,
 		User:      "jumpuser",
-		ProxyJump: "",
+		ProxyJump: "ignored", // 中间跳自身配置被显式链前缀 openssh:first 覆盖，但 OriginalProxyJump 保留 "ignored"
 	}
 	targetCfg := &ClientConfig{
 		NodeID:    "target",
@@ -610,6 +621,7 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t 
 
 	store := &mockProxyJumpStore{cfgs: map[string]*ClientConfig{
 		"target":         targetCfg,
+		"openssh:outer":  outerJumpCfg,
 		"openssh:first":  firstJumpCfg,
 		"openssh:second": secondJumpCfg,
 	}}
@@ -622,29 +634,24 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t 
 	if err != nil {
 		t.Fatalf("resolveConnectionPlan failed: %v", err)
 	}
-
-	// 验证计划节点与校验
-	// plan[2] 是首跳 openssh:first，执行态 ProxyJump 被重写为 ""，但原始快照保留为 "ignored"
-	if plan[2].name != "openssh:first" {
-		t.Fatalf("plan[2] name = %q, want openssh:first", plan[2].name)
-	}
-	if plan[2].cfg.ProxyJump != "" {
-		t.Fatalf("plan[2] runtime ProxyJump = %q, want empty", plan[2].cfg.ProxyJump)
-	}
-	if plan[2].cfg.OriginalProxyJump != "ignored" {
-		t.Fatalf("plan[2] OriginalProxyJump = %q, want ignored", plan[2].cfg.OriginalProxyJump)
+	if len(plan) != 4 {
+		t.Fatalf("len(plan) = %d, want 4 ([target, openssh:second, openssh:first, openssh:outer])", len(plan))
 	}
 
-	// [P2] 核心断言：配置完全未变时，首跳执行态快照与 store 中原始配置校验必须成功，绝不误报 "expected \"\", got \"ignored\""
-	freshFirstCfg, err := store.GetConfig("openssh:first")
-	if err != nil {
-		t.Fatalf("GetConfig openssh:first failed: %v", err)
+	// plan = [target, openssh:second, openssh:first, openssh:outer]
+	if plan[1].name != "openssh:second" || plan[1].cfg.ProxyJump != "openssh:first" || plan[1].cfg.OriginalProxyJump != "ignored" {
+		t.Fatalf("plan[1] = (name=%q ProxyJump=%q OriginalProxyJump=%q), want (openssh:second, openssh:first, ignored)",
+			plan[1].name, plan[1].cfg.ProxyJump, plan[1].cfg.OriginalProxyJump)
 	}
-	if err := validateTargetCompatibility(plan[2].cfg.ToConnectionConfig(), freshFirstCfg); err != nil {
-		t.Fatalf("validateTargetCompatibility unexpectedly failed for first hop: %v", err)
+	if plan[2].name != "openssh:first" || plan[2].cfg.ProxyJump != "openssh:outer" || plan[2].cfg.OriginalProxyJump != "openssh:outer" {
+		t.Fatalf("plan[2] = (name=%q ProxyJump=%q OriginalProxyJump=%q), want (openssh:first, openssh:outer, openssh:outer)",
+			plan[2].name, plan[2].cfg.ProxyJump, plan[2].cfg.OriginalProxyJump)
+	}
+	if plan[3].name != "openssh:outer" || plan[3].cfg.ProxyJump != "" {
+		t.Fatalf("plan[3] = (name=%q ProxyJump=%q), want (openssh:outer, empty)", plan[3].name, plan[3].cfg.ProxyJump)
 	}
 
-	// 同样验证第二跳
+	// [P2] 核心断言：配置完全未变时，运行时重写过 ProxyJump 的中间跳与 store 中原始配置校验必须成功
 	freshSecondCfg, err := store.GetConfig("openssh:second")
 	if err != nil {
 		t.Fatalf("GetConfig openssh:second failed: %v", err)
@@ -653,12 +660,21 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t 
 		t.Fatalf("validateTargetCompatibility unexpectedly failed for second hop: %v", err)
 	}
 
+	// 同样验证首跳与最外层跳
+	freshFirstCfg, err := store.GetConfig("openssh:first")
+	if err != nil {
+		t.Fatalf("GetConfig openssh:first failed: %v", err)
+	}
+	if err := validateTargetCompatibility(plan[2].cfg.ToConnectionConfig(), freshFirstCfg); err != nil {
+		t.Fatalf("validateTargetCompatibility unexpectedly failed for first hop: %v", err)
+	}
+
 	// 验证真正被外部篡改时会被拦截
-	tamperedFirstCfg := *freshFirstCfg
-	tamperedFirstCfg.ProxyJump = "tampered-jump"
-	tamperedFirstCfg.OriginalProxyJump = "tampered-jump"
-	tamperedFirstCfg.HasOriginalProxyJump = true
-	tamperedErr := validateTargetCompatibility(plan[2].cfg.ToConnectionConfig(), &tamperedFirstCfg)
+	tamperedSecondCfg := *freshSecondCfg
+	tamperedSecondCfg.ProxyJump = "tampered-jump"
+	tamperedSecondCfg.OriginalProxyJump = "tampered-jump"
+	tamperedSecondCfg.HasOriginalProxyJump = true
+	tamperedErr := validateTargetCompatibility(plan[1].cfg.ToConnectionConfig(), &tamperedSecondCfg)
 	if tamperedErr == nil {
 		t.Fatal("expected validateTargetCompatibility to fail when proxy jump tampered, got nil")
 	}

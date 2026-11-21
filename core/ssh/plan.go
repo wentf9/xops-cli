@@ -130,6 +130,8 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 			hop.OriginalProxyJump, hop.HasOriginalProxyJump = hop.ProxyJump, true
 		}
 		hop.KeyPaths = slices.Clone(hop.KeyPaths)
+		hop.AdmittedCertificates = cloneAdmittedCertificates(hop.AdmittedCertificates)
+		hop.AdmittedKeyDigests = cloneAdmittedKeyDigests(hop.AdmittedKeyDigests)
 		hop.Execution = hop.Execution.Clone()
 		hop.Options = hop.Options.Clone()
 		// Plans never spawn local processes. An active ProxyCommand defines the
@@ -245,9 +247,13 @@ func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
 		KeyPath: cfg.KeyPath, KeyPaths: slices.Clone(cfg.KeyPaths), KeyRef: cfg.KeyRef, TrustVersion: cfg.TrustVersion,
 		AuthUpdateToken: cfg.AuthUpdateToken, SudoUpdateToken: cfg.SudoUpdateToken, SudoMode: cfg.SudoMode,
 		ProxyJump: cfg.ProxyJump, OriginalProxyJump: cfg.OriginalProxyJump, HasOriginalProxyJump: cfg.HasOriginalProxyJump,
-		PasswordPromptPattern: cfg.PasswordPromptPattern,
-		Execution:             cfg.Execution.Clone(),
-		Options:               opts,
+		PasswordPromptPattern:       cfg.PasswordPromptPattern,
+		EnforceAdmittedCertificates: cfg.EnforceAdmittedCertificates,
+		AdmittedCertificates:        cloneAdmittedCertificates(cfg.AdmittedCertificates),
+		EnforceAdmittedKeyDigests:   cfg.EnforceAdmittedKeyDigests,
+		AdmittedKeyDigests:          cloneAdmittedKeyDigests(cfg.AdmittedKeyDigests),
+		Execution:                   cfg.Execution.Clone(),
+		Options:                     opts,
 	}
 }
 
