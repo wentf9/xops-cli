@@ -13,6 +13,7 @@ import (
 	"time"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 // OperationType 定义凭据事务操作类型。
@@ -341,12 +342,14 @@ func (s *JournalStore) ListPending() ([]JournalEntry, error) {
 	return results, nil
 }
 
+const maxJournalEntryBytes = 1 << 20
+
 func (s *JournalStore) readEntryLocked(id string) (*JournalEntry, error) {
 	p, err := s.entryFilePath(id)
 	if err != nil {
 		return nil, err
 	}
-	data, err := os.ReadFile(p)
+	data, err := fsx.ReadAllBounded(p, fsx.Limits{MaxBytes: maxJournalEntryBytes})
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("%w: journal entry %q not found", coreauth.ErrCredentialNotFound, id)

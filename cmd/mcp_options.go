@@ -3,12 +3,12 @@ package cmd
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/wentf9/xops-cli/core/fsx"
 	mcpruntime "github.com/wentf9/xops-cli/core/mcp/runtime"
 	"github.com/wentf9/xops-cli/internal/mcphost"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -103,7 +103,7 @@ func overrideMCPFlags(cmd *cobra.Command, settings *config.MCPConfig) error {
 	return nil
 }
 
-func readMCPToken(filePath, envName string) (_ string, retErr error) {
+func readMCPToken(filePath, envName string) (string, error) {
 	if (filePath == "") == (envName == "") {
 		return "", errors.New("HTTP MCP requires exactly one token file or token environment variable")
 	}
@@ -114,28 +114,17 @@ func readMCPToken(filePath, envName string) (_ string, retErr error) {
 		}
 		return token, nil
 	}
-	info, err := os.Lstat(filePath)
+	const maxMCPTokenBytes = 4098
+	// Strict no-follow bounded regular-file read; errors never include file contents.
+	data, err := fsx.ReadAllBounded(filePath, fsx.Limits{MaxBytes: maxMCPTokenBytes})
 	if err != nil {
-		return "", fmt.Errorf("inspect MCP token file: %w", err)
-	}
-	if !info.Mode().IsRegular() || info.Size() > 4098 {
-		return "", errors.New("MCP token file must be a regular file of at most 4098 bytes")
-	}
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("open MCP token file: %w", err)
-	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("close MCP token file: %w", err))
+		if errors.Is(err, fsx.ErrTooLarge) {
+			return "", errors.New("MCP token file exceeds size limit")
 		}
-	}()
-	data, err := io.ReadAll(io.LimitReader(file, 4099))
-	if err != nil {
+		if errors.Is(err, fsx.ErrNonRegular) || errors.Is(err, fsx.ErrSymlink) {
+			return "", errors.New("MCP token file must be a regular file of at most 4098 bytes")
+		}
 		return "", fmt.Errorf("read MCP token file: %w", err)
-	}
-	if len(data) > 4098 {
-		return "", errors.New("MCP token file exceeds size limit")
 	}
 	return strings.TrimSpace(string(data)), nil
 }

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/internal/terminal"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -78,26 +80,27 @@ func readExecScriptInput(ctx context.Context, source *os.File, limit int64) (con
 	return content, nil
 }
 
-func readExecScriptFile(ctx context.Context, path string, limit int64) (content []byte, retErr error) {
+func readExecScriptFile(ctx context.Context, path string, limit int64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	info, err := os.Stat(path)
+	maxBytes := limit
+	if maxBytes <= 0 {
+		maxBytes = math.MaxInt64
+	}
+	// Open handle-first without blocking on FIFOs; --shell denotes a local regular script file.
+	content, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: maxBytes}, fsx.FollowSymlinks())
 	if err != nil {
+		if errors.Is(err, fsx.ErrNonRegular) {
+			return nil, fmt.Errorf("script path must be a regular file; use stdin for piped scripts: %w", err)
+		}
+		if errors.Is(err, fsx.ErrTooLarge) && limit > 0 {
+			return nil, fmt.Errorf("script exceeds %d bytes", limit)
+		}
 		return nil, err
 	}
-	// Opening a FIFO can block before cancellation is installed. Pipe scripts
-	// through stdin instead; --shell denotes a local regular script file.
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("script path must be a regular file; use stdin for piped scripts")
-	}
-	if limit > 0 && info.Size() > limit {
-		return nil, fmt.Errorf("script exceeds %d bytes", limit)
-	}
-	file, err := os.Open(path)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	defer func() { retErr = errors.Join(retErr, file.Close()) }()
-	return readExecScriptInput(ctx, file, limit)
+	return content, nil
 }

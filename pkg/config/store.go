@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/concurrent"
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
 )
@@ -78,7 +79,10 @@ type defaultStore struct {
 	atomicWrite func(string, []byte, os.FileMode) (PersistResult, error)
 }
 
-const defaultConfigLockTimeout = 10 * time.Second
+const (
+	defaultConfigLockTimeout = 10 * time.Second
+	maxConfigFileBytes       = 16 << 20
+)
 
 var (
 	_ TransactionStore  = (*defaultStore)(nil)
@@ -258,7 +262,7 @@ func (s *defaultStore) Transact(ctx context.Context, mutate func(Snapshot) (*Con
 }
 
 func configurationVersion(path string) (Version, error) {
-	data, err := os.ReadFile(path)
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: maxConfigFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return sha256.Sum256(nil), nil
@@ -275,7 +279,7 @@ func (s *defaultStore) loadLocked() (*Configuration, error) {
 		Identities: concurrent.NewMap[string, models.Identity](concurrent.HashString),
 	}
 	// 1. 读取文件
-	data, err := os.ReadFile(s.Path)
+	data, err := fsx.ReadAllBounded(s.Path, fsx.Limits{MaxBytes: maxConfigFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			// Only absent configurations receive new-install defaults. Existing

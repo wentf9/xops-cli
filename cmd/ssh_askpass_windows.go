@@ -6,9 +6,12 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 const askpassHeaderReadLimit = 512
@@ -31,7 +34,9 @@ func realWindowsAskpassEnv() windowsAskpassEnv {
 }
 
 func readWindowsAskpassHeader(targetPath string) ([]byte, error) {
-	f, err := os.Open(targetPath)
+	// Executables may exceed askpassHeaderReadLimit; OpenRegular enforces regular
+	// disk file semantics without blocking on pipes, and io.ReadFull bounds the read.
+	f, err := fsx.OpenRegular(targetPath, fsx.Limits{MaxBytes: math.MaxInt64}, fsx.FollowSymlinks())
 	if err != nil {
 		return nil, err
 	}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"gopkg.in/yaml.v3"
 )
@@ -12,7 +13,7 @@ import (
 // ReadMCPSettings reads only service settings and audit policy, without loading
 // credentials, acquiring writable config locks or migrating legacy secrets.
 func ReadMCPSettings(path string) (*MCPConfig, *corepolicy.Config, error) {
-	data, err := os.ReadFile(path)
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: maxConfigFileBytes}, fsx.FollowSymlinks())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil, nil
 	}
@@ -44,7 +45,7 @@ func ReadMCPSettings(path string) (*MCPConfig, *corepolicy.Config, error) {
 // ReadOnlyConfiguration reads Schema v2 without acquiring writable locks.
 // The legacy key parameter is ignored; only the explicit migrator decrypts v1.
 func ReadOnlyConfiguration(path, _ string) (*Configuration, error) {
-	data, err := os.ReadFile(path)
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: maxConfigFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return nil, fmt.Errorf("read configuration without migration: %w", err)
 	}

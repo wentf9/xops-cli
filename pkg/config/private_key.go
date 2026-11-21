@@ -3,11 +3,11 @@ package config
 import (
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	sshcrypto "golang.org/x/crypto/ssh"
 )
@@ -53,51 +53,20 @@ func BindPrivateKeyFingerprint(cfg *Configuration, target credential.Target, pas
 
 const privateKeyFileLimit = 16 << 20
 
-// readPrivateKeyFile follows symbolic links like SSH authentication does.
-// Check before opening to reject special files, then check the opened target
-// again and bound the read in case its size changes. Recovery artifacts use
-// readMigrationFile instead and continue to reject symlinks.
-func readPrivateKeyFile(path string) (data []byte, retErr error) {
-	info, err := os.Stat(path)
+// readPrivateKeyFile follows symbolic links like SSH authentication does while
+// opening handle-first via core/fsx to reject non-regular files without blocking
+// and bound reads to 16 MiB. Recovery artifacts use readMigrationFile instead
+// and continue to reject symlinks.
+func readPrivateKeyFile(path string) ([]byte, error) {
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: privateKeyFileLimit}, fsx.FollowSymlinks())
 	if err != nil {
-		return nil, fmt.Errorf("inspect private key %q: %w", path, err)
-	}
-	if err := validatePrivateKeyFile(info); err != nil {
-		return nil, err
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open private key %q: %w", path, err)
-	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			clear(data)
-			data = nil
-			retErr = errors.Join(retErr, fmt.Errorf("close private key: %w", err))
+		if errors.Is(err, fsx.ErrTooLarge) {
+			return nil, fmt.Errorf("private key exceeds 16 MiB: %w", err)
 		}
-	}()
-	info, err = file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("inspect opened private key: %w", err)
-	}
-	if err := validatePrivateKeyFile(info); err != nil {
-		return nil, err
-	}
-	data, err = io.ReadAll(io.LimitReader(file, privateKeyFileLimit+1))
-	if err != nil {
-		clear(data)
-		return nil, fmt.Errorf("read private key: %w", err)
-	}
-	if len(data) > privateKeyFileLimit {
-		clear(data)
-		return nil, fmt.Errorf("private key exceeds 16 MiB")
+		if errors.Is(err, fsx.ErrNonRegular) {
+			return nil, fmt.Errorf("private key target must be a regular file no larger than 16 MiB: %w", err)
+		}
+		return nil, fmt.Errorf("read private key %q: %w", path, err)
 	}
 	return data, nil
-}
-
-func validatePrivateKeyFile(info os.FileInfo) error {
-	if !info.Mode().IsRegular() || info.Size() > privateKeyFileLimit {
-		return fmt.Errorf("private key target must be a regular file no larger than 16 MiB")
-	}
-	return nil
 }

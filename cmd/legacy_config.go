@@ -7,8 +7,11 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/pkg/config"
 )
+
+const maxConfigSchemaInspectBytes = 16 << 20
 
 // checkConfigurationSchema rejects legacy runtime use without loading secrets.
 // Explicit migration and finalization remain independent of ordinary loading.
@@ -29,7 +32,7 @@ func checkConfigurationSchema(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	data, err := os.ReadFile(path)
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: maxConfigSchemaInspectBytes}, fsx.FollowSymlinks())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}

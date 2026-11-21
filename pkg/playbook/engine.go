@@ -4,10 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -210,15 +210,11 @@ func (e *Engine) preloadScripts() error {
 			if _, ok := freshSources[step.Script]; ok {
 				continue
 			}
-			info, err := os.Stat(step.Script)
+			data, err := fsx.ReadAllBounded(step.Script, fsx.Limits{MaxBytes: ssh.MaxCommandInputBytes}, fsx.FollowSymlinks())
 			if err != nil {
-				return fmt.Errorf("stat script %q: %w", step.Script, err)
-			}
-			if info.Size() > ssh.MaxCommandInputBytes {
-				return fmt.Errorf("script %q exceeds maximum size %d bytes", step.Script, ssh.MaxCommandInputBytes)
-			}
-			data, err := os.ReadFile(step.Script)
-			if err != nil {
+				if errors.Is(err, fsx.ErrTooLarge) {
+					return fmt.Errorf("script %q exceeds maximum size %d bytes: %w", step.Script, ssh.MaxCommandInputBytes, err)
+				}
 				return fmt.Errorf("read script %q: %w", step.Script, err)
 			}
 			freshSources[step.Script] = data

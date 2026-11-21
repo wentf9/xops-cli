@@ -7,11 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -41,26 +41,19 @@ func migrationDigest(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func readMigrationFile(path string) (data []byte, retErr error) {
-	info, err := os.Lstat(path)
+func readMigrationFile(path string) ([]byte, error) {
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: migrationFileLimit})
 	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() || info.Size() > migrationFileLimit {
-		return nil, fmt.Errorf("migration input %q must be a regular file no larger than 16 MiB", path)
-	}
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("open migration input %q: %w", path, err)
-	}
-	defer func() { retErr = errors.Join(retErr, f.Close()) }()
-	data, err = io.ReadAll(io.LimitReader(f, migrationFileLimit+1))
-	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if errors.Is(err, fsx.ErrTooLarge) {
+			return nil, fmt.Errorf("migration input exceeds 16 MiB: %w", err)
+		}
+		if errors.Is(err, fsx.ErrNonRegular) || errors.Is(err, fsx.ErrSymlink) {
+			return nil, fmt.Errorf("migration input %q must be a regular file no larger than 16 MiB: %w", path, err)
+		}
 		return nil, fmt.Errorf("read migration input %q: %w", path, err)
-	}
-	if len(data) > migrationFileLimit {
-		clear(data)
-		return nil, fmt.Errorf("migration input exceeds 16 MiB")
 	}
 	return data, nil
 }

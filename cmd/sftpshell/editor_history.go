@@ -10,9 +10,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
-const commandHistoryLimit = 500
+const (
+	commandHistoryLimit    = 500
+	maxCommandHistoryBytes = 16 << 20
+)
 
 type commandHistory struct {
 	mu      sync.Mutex
@@ -99,7 +104,7 @@ func readCommandHistory(path string) (lines []string, retErr error) {
 	if path == "" {
 		return nil, nil
 	}
-	file, err := os.Open(path)
+	file, err := fsx.OpenRegular(path, fsx.Limits{MaxBytes: maxCommandHistoryBytes})
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}

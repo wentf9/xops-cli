@@ -17,6 +17,7 @@ import (
 	pkgsftp "github.com/pkg/sftp"
 	cryptoSSH "golang.org/x/crypto/ssh"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
@@ -390,7 +391,7 @@ func (e *Engine) runScript(ctx context.Context, client *ssh.Client, scriptPath s
 	}
 	if content == nil {
 		var err error
-		content, err = os.ReadFile(scriptPath)
+		content, err = fsx.ReadAllBounded(scriptPath, fsx.Limits{MaxBytes: ssh.MaxCommandInputBytes}, fsx.FollowSymlinks())
 		if err != nil {
 			return StepResult{
 				Status:    StatusFailed,
@@ -769,7 +770,7 @@ func (e *Engine) runEnsure(ctx context.Context, client *ssh.Client, spec *Ensure
 
 // runTemplate 将本地 Go 模板文件渲染后上传到远程主机。
 func (e *Engine) runTemplate(ctx context.Context, client *ssh.Client, spec *CopySpec, _ bool) (result StepResult) {
-	srcData, err := os.ReadFile(spec.Src)
+	srcData, err := fsx.ReadAllBounded(spec.Src, fsx.Limits{MaxBytes: maxPlaybookFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return StepResult{
 			Status:    StatusFailed,

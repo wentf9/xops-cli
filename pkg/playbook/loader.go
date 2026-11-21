@@ -10,8 +10,11 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 )
+
+const maxPlaybookFileBytes = 16 << 20
 
 // Load 从文件路径加载并解析 Playbook。
 // 支持：
@@ -23,7 +26,7 @@ func Load(path string, extraVars map[string]string) (*Playbook, error) {
 		return nil, fmt.Errorf("playbook not found %q: %w", path, err)
 	}
 
-	data, err := os.ReadFile(resolved)
+	data, err := fsx.ReadAllBounded(resolved, fsx.Limits{MaxBytes: maxPlaybookFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return nil, fmt.Errorf("read playbook %q: %w", resolved, err)
 	}

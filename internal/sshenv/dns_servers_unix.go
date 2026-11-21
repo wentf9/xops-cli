@@ -6,19 +6,23 @@ import (
 	"bufio"
 	"net"
 	"net/netip"
-	"os"
 	"slices"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
-const resolvConfPath = "/etc/resolv.conf"
+const (
+	resolvConfPath     = "/etc/resolv.conf"
+	maxResolvConfBytes = 1 << 20
+)
 
 func systemDNSConfig() dnsConfig {
 	return parseResolvConf(resolvConfPath)
 }
 
 func parseResolvConf(path string) dnsConfig {
-	f, err := os.Open(path)
+	f, err := fsx.OpenRegular(path, fsx.Limits{MaxBytes: maxResolvConfBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		return dnsConfig{servers: []string{"127.0.0.1:53"}}
 	}
