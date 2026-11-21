@@ -4,10 +4,10 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -238,13 +238,9 @@ func (s *JournalStore) AcquireEntryLock(id string) (*EntryLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	file, err := fsx.TryOpenLocked(lockPath, fsx.LockExclusive, true, fsx.OwnerOnlyPerm)
 	if err != nil {
-		return nil, fmt.Errorf("open lock file %q: %w", lockPath, err)
-	}
-	if err := tryLockFile(file); err != nil {
-		_ = file.Close()
-		if isLockContended(err) {
+		if errors.Is(err, fsx.ErrWouldBlock) {
 			return nil, ErrLockContended
 		}
 		return nil, fmt.Errorf("lock file %q: %w", lockPath, err)
@@ -299,11 +295,11 @@ func (s *JournalStore) Remove(id string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(p); err != nil && !os.IsNotExist(err) { //nolint:forbidigo // remove completed journal entry verified inside s.dir
 		return fmt.Errorf("remove journal entry %q: %w", id, err)
 	}
 	if lockPath, err := s.lockFilePath(id); err == nil {
-		_ = os.Remove(lockPath)
+		_ = os.Remove(lockPath) //nolint:forbidigo // best-effort cleanup of completed journal lock file inside s.dir
 	}
 	if err := s.syncDirLocked(); err != nil {
 		return fmt.Errorf("sync journal directory after remove %q: %w", id, err)
@@ -390,34 +386,9 @@ func (s *JournalStore) atomicWriteLocked(entry *JournalEntry) error {
 	if err != nil {
 		return err
 	}
-	tmpPath := fmt.Sprintf("%s.tmp.%d", destPath, time.Now().UnixNano())
 
-	// 权限 0600
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
-	if err != nil {
-		return fmt.Errorf("create journal temp file: %w", err)
-	}
-
-	var writeErr error
-	if _, err := f.Write(data); err != nil {
-		writeErr = fmt.Errorf("write journal temp file: %w", err)
-	} else if err := f.Sync(); err != nil {
-		writeErr = fmt.Errorf("sync journal temp file: %w", err)
-	}
-
-	if closeErr := f.Close(); closeErr != nil && writeErr == nil {
-		writeErr = fmt.Errorf("close journal temp file: %w", closeErr)
-	}
-
-	if writeErr != nil {
-		_ = os.Remove(tmpPath)
-		return writeErr
-	}
-
-	// 原子替换
-	if err := os.Rename(tmpPath, destPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("atomically rename journal file: %w", err)
+	if _, err := fsx.AtomicReplace(destPath, data, fsx.OwnerOnlyPerm, fsx.WithoutDirSync()); err != nil {
+		return fmt.Errorf("atomically write journal file: %w", err)
 	}
 
 	if err := s.syncDirLocked(); err != nil {
@@ -430,25 +401,5 @@ func (s *JournalStore) syncDirLocked() error {
 	if s.syncDirFn != nil {
 		return s.syncDirFn(s.dir)
 	}
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	df, err := os.Open(s.dir)
-	if err != nil {
-		return fmt.Errorf("open journal directory for sync: %w", err)
-	}
-	var syncErr, closeErr error
-	if err := df.Sync(); err != nil {
-		syncErr = fmt.Errorf("sync journal directory: %w", err)
-	}
-	if err := df.Close(); err != nil {
-		closeErr = fmt.Errorf("close journal directory: %w", err)
-	}
-	if syncErr != nil {
-		return syncErr
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	return nil
+	return fsx.SyncDir(s.dir)
 }

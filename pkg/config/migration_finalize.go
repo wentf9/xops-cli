@@ -10,6 +10,7 @@ import (
 	"time"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
@@ -254,10 +255,10 @@ func (m *CredentialMigrator) finalizeFiles(state *migrationState) error {
 		if file.hash == "" {
 			continue
 		}
-		if err := os.Remove(file.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(file.path); err != nil && !errors.Is(err, os.ErrNotExist) { //nolint:forbidigo // remove digest-verified legacy key/backup material during explicit finalize
 			return fmt.Errorf("remove legacy material %q: %w", file.path, err)
 		}
-		if err := syncParentDirectory(filepath.Dir(file.path)); err != nil {
+		if err := fsx.SyncDir(filepath.Dir(file.path)); err != nil {
 			return err
 		}
 		if err := m.step(file.step); err != nil {

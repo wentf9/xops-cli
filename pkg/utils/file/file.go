@@ -1,12 +1,13 @@
 package file
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 func isDirectoryTargetPath(p string) bool {
@@ -29,7 +30,7 @@ func isDirectoryTargetPath(p string) bool {
 }
 
 // CreateFileRecursive 递归创建文件并以原子替换方式写入内容
-func CreateFileRecursive(filePath string, content []byte, perm os.FileMode) (retErr error) {
+func CreateFileRecursive(filePath string, content []byte, perm os.FileMode) error {
 	if strings.TrimSpace(filePath) == "" {
 		return fmt.Errorf("file path must not be empty")
 	}
@@ -53,44 +54,9 @@ func CreateFileRecursive(filePath string, content []byte, perm os.FileMode) (ret
 		return fmt.Errorf("target path %q is a directory", filePath)
 	}
 
-	tmpFile, err := os.CreateTemp(dir, ".xops-tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp file in %q failed: %w", dir, err)
+	if _, err := fsx.AtomicReplace(filePath, content, perm, fsx.WithoutDirSync()); err != nil {
+		return fmt.Errorf("replace file %q failed: %w", filePath, err)
 	}
-	tmpPath := tmpFile.Name()
-	renamed := false
-	defer func() {
-		if !renamed {
-			if removeErr := os.Remove(tmpPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				retErr = errors.Join(retErr, fmt.Errorf("remove temp file %q failed: %w", tmpPath, removeErr))
-			}
-		}
-	}()
-	closed := false
-	defer func() {
-		if !closed {
-			if closeErr := tmpFile.Close(); closeErr != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("close temp file %q failed: %w", tmpPath, closeErr))
-			}
-		}
-	}()
-
-	if err := tmpFile.Chmod(perm); err != nil {
-		return fmt.Errorf("chmod temp file %q failed: %w", tmpPath, err)
-	}
-	if len(content) > 0 {
-		if _, err := tmpFile.Write(content); err != nil {
-			return fmt.Errorf("write temp file %q failed: %w", tmpPath, err)
-		}
-	}
-	closed = true
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("close temp file %q failed: %w", tmpPath, err)
-	}
-	if err := os.Rename(tmpPath, filePath); err != nil {
-		return fmt.Errorf("rename temp file %q to %q failed: %w", tmpPath, filePath, err)
-	}
-	renamed = true
 	return nil
 }
 

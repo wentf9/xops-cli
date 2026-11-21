@@ -12,6 +12,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 )
@@ -75,24 +76,17 @@ func matchesFixture(secret credential.Secret) bool {
 	return secret.ExpiresAt == nil && subtle.ConstantTimeCompare(secret.Value, []byte(fixtureValue)) == 1
 }
 
-func readConfig(path string) (raw []byte, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { err = errors.Join(err, f.Close()) }()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
+func readConfig(path string) ([]byte, error) {
 	const limit = 16 << 20
-	if !st.Mode().IsRegular() || st.Size() > limit {
-		return nil, fmt.Errorf("invalid fixture configuration file")
+	raw, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: limit}, fsx.FollowSymlinks())
+	if err != nil {
+		if errors.Is(err, fsx.ErrTooLarge) {
+			return nil, fmt.Errorf("fixture configuration too large: %w", err)
+		}
+		if errors.Is(err, fsx.ErrNonRegular) {
+			return nil, fmt.Errorf("invalid fixture configuration file: %w", err)
+		}
+		return nil, err
 	}
-	raw, err = io.ReadAll(io.LimitReader(f, limit+1))
-	if len(raw) > limit {
-		clear(raw)
-		return nil, fmt.Errorf("fixture configuration too large")
-	}
-	return raw, err
+	return raw, nil
 }

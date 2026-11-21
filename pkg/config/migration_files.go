@@ -134,7 +134,7 @@ func (m *CredentialMigrator) ensureBackup(path string, data []byte) error {
 		if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 			return fmt.Errorf("migration backup %q must have mode 0600", path)
 		}
-		return syncParentDirectory(filepath.Dir(path))
+		return fsx.SyncDir(filepath.Dir(path))
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -159,7 +159,7 @@ func (m *CredentialMigrator) step(name string) error {
 // Before deleting rollback material, sync both the current file's contents and
 // its directory, including metadata edits made since the migration commit.
 func syncMigrationConfiguration(path string) (retErr error) {
-	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	file, err := os.OpenFile(path, os.O_RDWR, 0) //nolint:forbidigo // open committed configuration RW solely to fsync before finalize cleanup
 	if err != nil {
 		return fmt.Errorf("open migrated configuration for sync: %w", err)
 	}
@@ -167,5 +167,5 @@ func syncMigrationConfiguration(path string) (retErr error) {
 	if err := file.Sync(); err != nil {
 		return fmt.Errorf("sync migrated configuration: %w", err)
 	}
-	return syncParentDirectory(filepath.Dir(path))
+	return fsx.SyncDir(filepath.Dir(path))
 }

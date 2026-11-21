@@ -125,28 +125,11 @@ func readCommandHistory(path string) (lines []string, retErr error) {
 func (h *commandHistory) withFileLock(ctx context.Context, operation func() error) (retErr error) {
 	// Lock a stable sidecar: replacing the history file must not change the
 	// inode/handle on which concurrent sessions synchronize.
-	lock, err := os.OpenFile(h.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	lock, err := fsx.OpenLockedContext(ctx, h.path+".lock", fsx.LockExclusive, true, fsx.OwnerOnlyPerm)
 	if err != nil {
-		return fmt.Errorf("open history lock failed: %w", err)
+		return fmt.Errorf("lock history failed: %w", err)
 	}
 	defer func() { retErr = errors.Join(retErr, lock.Close()) }()
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		acquired, err := tryHistoryLock(lock)
-		if err != nil {
-			return fmt.Errorf("lock history failed: %w", err)
-		}
-		if acquired {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for history lock failed: %w", ctx.Err())
-		case <-ticker.C:
-		}
-	}
-	defer func() { retErr = errors.Join(retErr, unlockHistory(lock)) }()
 	return operation()
 }
 func writeCommandHistory(ctx context.Context, path string, lines []string) (retErr error) {
@@ -159,7 +142,7 @@ func writeCommandHistory(ctx context.Context, path string, lines []string) (retE
 		if !closed {
 			retErr = errors.Join(retErr, file.Close())
 		}
-		if err := os.Remove(file.Name()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(file.Name()); err != nil && !errors.Is(err, os.ErrNotExist) { //nolint:forbidigo // cleanup own CreateTemp file if Windows-retryable rename fails
 			retErr = errors.Join(retErr, err)
 		}
 	}()

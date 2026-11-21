@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/wentf9/xops-cli/core/fsx"
 )
 
 // Journal serializes durable task snapshots under a permanent process lock.
@@ -59,7 +61,17 @@ func OpenJournal(directory string) (_ *Journal, retErr error) {
 		return nil, fmt.Errorf("lock transfer metadata: %w", err)
 	}
 	keepRoot, keepFile = true, true
-	return &Journal{root: root, lock: file, replace: replaceJournalFile, syncDirectory: syncJournalDirectory}, nil
+	return &Journal{root: root, lock: file, replace: replaceJournalFile, syncDirectory: fsx.SyncDir}, nil
+}
+
+func lockJournal(file *os.File) error {
+	if err := fsx.TryLockFile(file, fsx.LockExclusive); err != nil {
+		if errors.Is(err, fsx.ErrWouldBlock) {
+			return ErrStoreLocked
+		}
+		return err
+	}
+	return nil
 }
 
 func createJournalDirectory(directory string) error {
@@ -86,7 +98,7 @@ func createJournalDirectory(directory string) error {
 	if err := os.Mkdir(directory, 0700); err != nil && !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("create transfer metadata directory: %w", err)
 	}
-	if err := syncJournalDirectory(parent); err != nil {
+	if err := fsx.SyncDir(parent); err != nil {
 		return err
 	}
 	return createJournalDirectory(directory)

@@ -113,7 +113,7 @@ func (s *defaultStore) Sync(ctx context.Context) error {
 		_ = lock.Close()
 	}()
 	dir := filepath.Dir(s.Path)
-	return syncParentDirectory(dir)
+	return fsx.SyncDir(dir)
 }
 
 // contextGate serializes in-process configuration access while allowing a
@@ -373,58 +373,16 @@ func (s *defaultStore) writeConfigurationBytes(data []byte) (PersistResult, erro
 	return result, nil
 }
 
-func atomicWriteFile(path string, data []byte, perm os.FileMode) (result PersistResult, retErr error) {
+func atomicWriteFile(path string, data []byte, perm os.FileMode) (PersistResult, error) {
 	dir := filepath.Dir(path)
 	if err := ensureParentDirectory(dir); err != nil {
 		return PersistResult{}, fmt.Errorf("create parent directory %q failed: %w", dir, err)
 	}
-
-	temporary, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*")
+	res, err := fsx.AtomicReplace(path, data, perm)
+	result := PersistResult{Applied: res.Applied, Durable: res.Durable}
 	if err != nil {
-		return PersistResult{}, fmt.Errorf("create temporary configuration file failed: %w", err)
+		return result, err
 	}
-	temporaryPath := temporary.Name()
-	committed := false
-	defer func() {
-		if !committed {
-			if removeErr := os.Remove(temporaryPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				retErr = errors.Join(retErr, fmt.Errorf("remove temporary configuration file failed: %w", removeErr))
-			}
-		}
-	}()
-	temporaryClosed := false
-	defer func() {
-		if !temporaryClosed {
-			if closeErr := temporary.Close(); closeErr != nil {
-				retErr = errors.Join(retErr, fmt.Errorf("close temporary configuration file failed: %w", closeErr))
-			}
-		}
-	}()
-
-	if err := temporary.Chmod(perm); err != nil {
-		return PersistResult{}, fmt.Errorf("set temporary configuration file permissions failed: %w", err)
-	}
-	if _, err := temporary.Write(data); err != nil {
-		return PersistResult{}, fmt.Errorf("write temporary configuration file failed: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		return PersistResult{}, fmt.Errorf("sync temporary configuration file failed: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		temporaryClosed = true
-		return PersistResult{}, fmt.Errorf("close temporary configuration file failed: %w", err)
-	}
-	temporaryClosed = true
-	if err := replaceFile(temporaryPath, path); err != nil {
-		return PersistResult{}, fmt.Errorf("replace configuration file failed: %w", err)
-	}
-	committed = true
-	result.Applied = true
-
-	if err := syncParentDirectory(dir); err != nil {
-		return result, fmt.Errorf("sync configuration directory failed: %w", err)
-	}
-	result.Durable = true
 	return result, nil
 }
 
@@ -433,7 +391,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) (result Persist
 // synced after the replacement in atomicWriteFile; syncing each parent here is
 // what makes a newly-created directory chain survive a crash as well.
 func ensureParentDirectory(directory string) error {
-	return createDirectoryChain(directory, syncParentDirectory)
+	return createDirectoryChain(directory, fsx.SyncDir)
 }
 
 func createDirectoryChain(directory string, syncDirectory func(string) error) error {
