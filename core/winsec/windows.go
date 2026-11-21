@@ -97,15 +97,22 @@ func tokenUserSIDForProcess(procHandle windows.Handle) (*windows.SID, error) {
 }
 
 // IsTrustedPrincipalSID reports whether sid is LocalSystem, Builtin\Administrators,
-// or equal to currentUserSID.
+// or equal to currentUserSID. Passing currentUserSID == nil restricts trust
+// strictly to LocalSystem and Builtin\Administrators (never trusting the current
+// non-admin user).
 func IsTrustedPrincipalSID(sid, currentUserSID *windows.SID) bool {
 	if sid == nil || !sid.IsValid() {
 		return false
 	}
-	if sid.IsWellKnown(windows.WinLocalSystemSid) || sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
-		return true
-	}
-	return currentUserSID != nil && currentUserSID.IsValid() && sid.Equals(currentUserSID)
+	allowCurrentUser := currentUserSID != nil && currentUserSID.IsValid()
+	matchesCurrentUser := allowCurrentUser && sid.Equals(currentUserSID)
+	return EvaluatePrincipalTrust(
+		true,
+		sid.IsWellKnown(windows.WinLocalSystemSid),
+		sid.IsWellKnown(windows.WinBuiltinAdministratorsSid),
+		matchesCurrentUser,
+		allowCurrentUser,
+	)
 }
 
 // GetFileAttributesNoFollow queries Win32 file attributes without traversing reparse points.
@@ -213,6 +220,68 @@ func IsSecureSystemSSHObject(path string, expectDir bool, currSID *windows.SID) 
 	}
 	attrsAfter, ok := GetFileAttributesNoFollow(path)
 	return ok && EvaluateAttributes(attrsAfter, expectDir)
+}
+
+// IsSecureSystemGlobalSSHObject checks that path is a non-reparse, non-device
+// system-global SSH object (such as %ProgramData%\ssh or
+// %ProgramData%\ssh\ssh_known_hosts) owned strictly by SYSTEM or
+// Builtin\Administrators with write/mutate DACL entries restricted to those
+// same system principals (currSID == nil; never trusts the current user).
+func IsSecureSystemGlobalSSHObject(path string, expectDir bool) bool {
+	return IsSecureSystemSSHObject(path, expectDir, nil)
+}
+
+// IsSecureSystemAncestorDirDescriptor evaluates sd for a shared system ancestor
+// directory (such as C:\ProgramData), trusting strictly LocalSystem and
+// Builtin\Administrators (currSID == nil).
+func IsSecureSystemAncestorDirDescriptor(attrs uint32, sd *windows.SECURITY_DESCRIPTOR) bool {
+	if sd == nil {
+		return false
+	}
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil {
+		return false
+	}
+	ownerTrusted := IsTrustedPrincipalSID(owner, nil)
+	if !ownerTrusted {
+		return false
+	}
+	dacl, _, err := sd.DACL()
+	// A nil DACL on Windows means unrestricted full access to Everyone; reject.
+	if err != nil || dacl == nil {
+		return false
+	}
+	aces, ok := ParseACL(dacl, nil)
+	if !ok {
+		return false
+	}
+	return EvaluateSystemAncestorDirSecurity(attrs, ownerTrusted, true, aces)
+}
+
+// IsSecureSystemAncestorDir checks that path is a real directory (not a reparse
+// point or device, verified before and after reading its security descriptor)
+// owned strictly by SYSTEM or Builtin\Administrators with a non-nil DACL that
+// denies destructive/takeover rights to untrusted principals. This accepts
+// standard Windows C:\ProgramData ACLs while rejecting junctions, user-owned
+// roots, nil DACLs, and delete/takeover permissions.
+func IsSecureSystemAncestorDir(path string) bool {
+	attrs, ok := GetFileAttributesNoFollow(path)
+	if !ok || !EvaluateAttributes(attrs, true) {
+		return false
+	}
+	sd, err := windows.GetNamedSecurityInfo(
+		path,
+		windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION,
+	)
+	if err != nil || sd == nil {
+		return false
+	}
+	if !IsSecureSystemAncestorDirDescriptor(attrs, sd) {
+		return false
+	}
+	attrsAfter, ok := GetFileAttributesNoFollow(path)
+	return ok && EvaluateAttributes(attrsAfter, true)
 }
 
 // NewOwnerOnlyACL creates a DACL containing only GENERIC_ALL entries for

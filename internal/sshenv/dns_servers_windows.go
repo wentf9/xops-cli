@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"net/netip"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -84,9 +83,13 @@ func formatWindowsSocketAddressDNS(sockAddr windows.SocketAddress) (string, bool
 }
 
 func defaultGlobalKnownHostsFiles() []string {
-	programData := strings.TrimSpace(os.Getenv("ProgramData"))
-	if programData == "" {
-		programData = `C:\ProgramData`
+	programData, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, windows.KF_FLAG_DONT_VERIFY)
+	if err != nil {
+		return nil
+	}
+	programData = strings.TrimSpace(programData)
+	if programData == "" || !filepath.IsAbs(programData) {
+		return nil
 	}
 	candidate, ok := resolveSecureWindowsGlobalKnownHostsPath(programData)
 	if !ok {
@@ -96,35 +99,43 @@ func defaultGlobalKnownHostsFiles() []string {
 }
 
 func resolveSecureWindowsGlobalKnownHostsPath(programData string) (string, bool) {
-	cleanedProgramData := filepath.Clean(programData)
-	if cleanedProgramData == "" || !filepath.IsAbs(cleanedProgramData) {
+	trimmed := strings.TrimSpace(programData)
+	if trimmed == "" {
 		return "", false
 	}
-	pdAttrs, ok := getWindowsFileAttributesNoFollow(cleanedProgramData)
-	if !ok || !evaluateWindowsAttributes(pdAttrs, true) {
+	cleanedProgramData := filepath.Clean(trimmed)
+	if !filepath.IsAbs(cleanedProgramData) {
+		return "", false
+	}
+	if !isSecureWindowsSystemAncestorDir(cleanedProgramData) {
 		return "", false
 	}
 	sshDir := filepath.Join(cleanedProgramData, "ssh")
 	candidate := filepath.Join(sshDir, "ssh_known_hosts")
-	currSID, _ := currentWindowsProcessUserSID()
-	if !isSecureWindowsSystemSSHObject(sshDir, true, currSID) {
+	if !isSecureWindowsSystemGlobalSSHObject(sshDir, true) {
 		return "", false
 	}
-	if !isSecureWindowsSystemSSHObject(candidate, false, currSID) {
+	if !isSecureWindowsSystemGlobalSSHObject(candidate, false) {
 		return "", false
 	}
 	return candidate, true
 }
 
-// isSecureWindowsGlobalKnownHostsFile mirrors Win32-OpenSSH file permission
-// checks without following reparse points: the ancestor directory, parent
-// directory (%ProgramData%\ssh), and file (%ProgramData%\ssh\ssh_known_hosts)
-// must be free of reparse points, and both the parent directory and target file
-// must be owned by SYSTEM, Administrators, or the current user with every
-// write/delete/DACL/owner allow ACE restricted to that same trusted allowlist.
+// isSecureWindowsGlobalKnownHostsFile enforces strict system-global trust
+// without following reparse points: the ancestor directory (e.g. %ProgramData%)
+// must be a non-reparse directory owned by SYSTEM or Administrators without
+// destructive/takeover rights for untrusted principals, and both the parent
+// directory (%ProgramData%\ssh) and target file (%ProgramData%\ssh\ssh_known_hosts)
+// must be non-reparse objects owned strictly by SYSTEM or Administrators with
+// every write/delete/DACL/owner allow ACE restricted to SYSTEM or Administrators
+// (never trusting the current non-admin user SID).
 func isSecureWindowsGlobalKnownHostsFile(path string) bool {
-	cleaned := filepath.Clean(strings.TrimSpace(path))
-	if cleaned == "" || !filepath.IsAbs(cleaned) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return false
+	}
+	cleaned := filepath.Clean(trimmed)
+	if !filepath.IsAbs(cleaned) {
 		return false
 	}
 	parentDir := filepath.Dir(cleaned)
@@ -132,24 +143,22 @@ func isSecureWindowsGlobalKnownHostsFile(path string) bool {
 		return false
 	}
 	if grandParent := filepath.Dir(parentDir); grandParent != "" && grandParent != parentDir {
-		gpAttrs, ok := getWindowsFileAttributesNoFollow(grandParent)
-		if !ok || !evaluateWindowsAttributes(gpAttrs, true) {
+		if !isSecureWindowsSystemAncestorDir(grandParent) {
 			return false
 		}
 	}
-	currSID, _ := currentWindowsProcessUserSID()
-	if !isSecureWindowsSystemSSHObject(parentDir, true, currSID) {
+	if !isSecureWindowsSystemGlobalSSHObject(parentDir, true) {
 		return false
 	}
-	return isSecureWindowsSystemSSHObject(cleaned, false, currSID)
+	return isSecureWindowsSystemGlobalSSHObject(cleaned, false)
 }
 
-func getWindowsFileAttributesNoFollow(path string) (uint32, bool) {
-	return winsec.GetFileAttributesNoFollow(path)
+func isSecureWindowsSystemAncestorDir(path string) bool {
+	return winsec.IsSecureSystemAncestorDir(path)
 }
 
-func isSecureWindowsSystemSSHObject(path string, expectDir bool, currSID *windows.SID) bool {
-	return winsec.IsSecureSystemSSHObject(path, expectDir, currSID)
+func isSecureWindowsSystemGlobalSSHObject(path string, expectDir bool) bool {
+	return winsec.IsSecureSystemGlobalSSHObject(path, expectDir)
 }
 
 func parseWindowsACL(dacl *windows.ACL, currSID *windows.SID) ([]windowsParsedACE, bool) {

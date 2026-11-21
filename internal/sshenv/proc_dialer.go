@@ -29,6 +29,30 @@ var (
 	onUnixReapRemainingGroup func(pgid int)
 )
 
+type procReapTracker interface {
+	markReaped()
+	bindSentinelObserver(sentinelR *os.File, sentinelDone <-chan struct{})
+	clearSentinelObserver()
+}
+
+func markPlatformProcReaped(p *platformProc) {
+	if tracker, ok := any(p).(procReapTracker); ok {
+		tracker.markReaped()
+	}
+}
+
+func bindPlatformProcSentinel(p *platformProc, sentinelR *os.File, sentinelDone <-chan struct{}) {
+	if tracker, ok := any(p).(procReapTracker); ok {
+		tracker.bindSentinelObserver(sentinelR, sentinelDone)
+	}
+}
+
+func clearPlatformProcSentinel(p *platformProc) {
+	if tracker, ok := any(p).(procReapTracker); ok {
+		tracker.clearSentinelObserver()
+	}
+}
+
 type processAddr string
 
 func (processAddr) Network() string  { return "stdio" }
@@ -127,6 +151,7 @@ func DialProxyCommandWithStderr(ctx context.Context, command string, stderr io.W
 	if sentinelR != nil {
 		sentinelDone = make(chan struct{})
 	}
+	bindPlatformProcSentinel(proc, sentinelR, sentinelDone)
 	conn := &ProcessStdioConn{
 		stdinW:            stdinW,
 		stdoutR:           stdoutR,
@@ -141,6 +166,7 @@ func DialProxyCommandWithStderr(ctx context.Context, command string, stderr io.W
 
 	go func() {
 		_ = cmd.Wait()
+		markPlatformProcReaped(conn.proc)
 		if !conn.closing.Load() {
 			conn.spontaneousExit.Store(true)
 		}
@@ -199,6 +225,7 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 	go func() {
 		defer close(waitDone)
 		waitErr = cmd.Wait()
+		markPlatformProcReaped(proc)
 	}()
 
 	var canceledByCtx atomic.Bool
@@ -516,6 +543,7 @@ func (c *ProcessStdioConn) Close() error {
 		<-c.waitDone
 		groupExited := alreadyExited || c.hasGroupPipesClosed()
 		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone, c.groupSentinelDone, groupExited)
+		clearPlatformProcSentinel(c.proc)
 		_ = c.stderrR.Close()
 		if c.groupSentinelR != nil {
 			_ = c.groupSentinelR.Close()

@@ -243,3 +243,163 @@ func TestEvaluatePeerProcessIdentity_FailClosed(t *testing.T) {
 		})
 	}
 }
+
+func TestEvaluatePrincipalTrust_SystemGlobalVsUserScoped(t *testing.T) {
+	t.Parallel()
+
+	// System-global scope (allowCurrentUser=false, i.e. currSID == nil):
+	// ONLY LocalSystem and Builtin\Administrators are trusted; current non-admin user MUST be rejected.
+	if !EvaluatePrincipalTrust(true, true, false, false, false) {
+		t.Fatal("SYSTEM must be trusted in system-global scope")
+	}
+	if !EvaluatePrincipalTrust(true, false, true, false, false) {
+		t.Fatal("Builtin\\Administrators must be trusted in system-global scope")
+	}
+	if EvaluatePrincipalTrust(true, false, false, true, false) {
+		t.Fatal("current non-admin user must NOT be trusted in system-global scope (currSID == nil)")
+	}
+	if EvaluatePrincipalTrust(true, false, false, false, false) {
+		t.Fatal("other untrusted principal must NOT be trusted in system-global scope")
+	}
+	if EvaluatePrincipalTrust(false, true, true, true, true) {
+		t.Fatal("invalid SID must fail closed regardless of flags")
+	}
+
+	// User-scoped checks (allowCurrentUser=true, i.e. currSID != nil):
+	// LocalSystem, Builtin\Administrators, and current user are trusted.
+	if !EvaluatePrincipalTrust(true, false, false, true, true) {
+		t.Fatal("current user must be trusted in user-scoped check")
+	}
+	if EvaluatePrincipalTrust(true, false, false, false, true) {
+		t.Fatal("other untrusted principal must NOT be trusted in user-scoped check")
+	}
+
+	// Simulate evaluating %ProgramData%\ssh and %ProgramData%\ssh\ssh_known_hosts
+	// with current-user owner or current-user write ACE under system-global vs user-scoped trust.
+	const fileAttrs = uint32(0x00000080)
+	const readExecMask = uint32(0x001200a9)
+
+	for _, allowCurr := range []bool{false, true} {
+		currTrusted := EvaluatePrincipalTrust(true, false, false, true, allowCurr)
+		sysTrusted := EvaluatePrincipalTrust(true, true, false, false, allowCurr)
+		adminTrusted := EvaluatePrincipalTrust(true, false, true, false, allowCurr)
+		usersTrusted := EvaluatePrincipalTrust(true, false, false, false, allowCurr)
+
+		systemGlobalACL := []ParsedACE{
+			{ACEType: AccessAllowedACEType, Mask: AccessGenericAll, SIDValid: true, SIDTrusted: sysTrusted},
+			{ACEType: AccessAllowedACEType, Mask: AccessGenericAll, SIDValid: true, SIDTrusted: adminTrusted},
+			{ACEType: AccessAllowedACEType, Mask: readExecMask, SIDValid: true, SIDTrusted: usersTrusted},
+		}
+		if !EvaluateObjectSecurity(FileAttributeDirectory, true, sysTrusted, true, systemGlobalACL) {
+			t.Fatalf("SYSTEM/Admins dir ACL must pass (allowCurr=%v)", allowCurr)
+		}
+		if !EvaluateObjectSecurity(fileAttrs, false, adminTrusted, true, systemGlobalACL) {
+			t.Fatalf("SYSTEM/Admins file ACL must pass (allowCurr=%v)", allowCurr)
+		}
+
+		// Current-user-owned object with SYSTEM/Admins DACL.
+		if got := EvaluateObjectSecurity(fileAttrs, false, currTrusted, true, systemGlobalACL); got != allowCurr {
+			t.Fatalf("current-user-owned object = %v, want %v (allowCurr=%v)", got, allowCurr, allowCurr)
+		}
+
+		// SYSTEM-owned object with current-user write ACE.
+		currWritableACL := append(append([]ParsedACE(nil), systemGlobalACL...), ParsedACE{
+			ACEType:    AccessAllowedACEType,
+			Mask:       AccessFileWriteData,
+			SIDValid:   true,
+			SIDTrusted: currTrusted,
+		})
+		if got := EvaluateObjectSecurity(FileAttributeDirectory, true, sysTrusted, true, currWritableACL); got != allowCurr {
+			t.Fatalf("current-user-writable dir = %v, want %v (allowCurr=%v)", got, allowCurr, allowCurr)
+		}
+		if got := EvaluateObjectSecurity(fileAttrs, false, sysTrusted, true, currWritableACL); got != allowCurr {
+			t.Fatalf("current-user-writable file = %v, want %v (allowCurr=%v)", got, allowCurr, allowCurr)
+		}
+	}
+}
+
+func TestEvaluateSystemAncestorDirSecurity_ProgramDataModel(t *testing.T) {
+	t.Parallel()
+
+	const (
+		readExecMask       = uint32(0x001200a9)
+		programDataAddMask = AccessFileWriteData | AccessFileAppendData | 0x00000110 // FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES
+	)
+
+	// Standard Windows C:\ProgramData ACL:
+	// SYSTEM:F, Administrators:F, CREATOR OWNER:(OI)(CI)(IO)(F), Users:(OI)(CI)(RX),
+	// Users:(CI)(FILE_ADD_FILE|FILE_ADD_SUBDIRECTORY|FILE_WRITE_EA|FILE_WRITE_ATTRIBUTES).
+	standardProgramDataACL := []ParsedACE{
+		{ACEType: AccessAllowedACEType, ACEFlags: ObjectInheritACEFlag | ContainerInheritACEFlag, Mask: AccessGenericAll, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedACEType, ACEFlags: ObjectInheritACEFlag | ContainerInheritACEFlag, Mask: AccessGenericAll, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedACEType, ACEFlags: ObjectInheritACEFlag | ContainerInheritACEFlag | InheritOnlyACEFlag, Mask: AccessGenericAll, SIDValid: true, SIDTrusted: false},
+		{ACEType: AccessAllowedACEType, ACEFlags: ObjectInheritACEFlag | ContainerInheritACEFlag, Mask: readExecMask, SIDValid: true, SIDTrusted: false},
+		{ACEType: AccessAllowedACEType, ACEFlags: ContainerInheritACEFlag, Mask: programDataAddMask, SIDValid: true, SIDTrusted: false},
+	}
+
+	if !EvaluateSystemAncestorDirSecurity(FileAttributeDirectory, true, true, standardProgramDataACL) {
+		t.Fatal("standard Windows C:\\ProgramData ACL must pass EvaluateSystemAncestorDirSecurity")
+	}
+	// That same ProgramData ACL MUST be rejected for strict leaf/ssh dir checks.
+	if EvaluateObjectSecurity(FileAttributeDirectory, true, true, true, standardProgramDataACL) {
+		t.Fatal("ProgramData Users-append/CREATOR-OWNER ACL must be rejected by strict EvaluateObjectSecurity")
+	}
+
+	// Reparse point, file, device, untrusted owner, and nil DACL must fail closed.
+	if EvaluateSystemAncestorDirSecurity(FileAttributeDirectory|FileAttributeReparsePoint, true, true, standardProgramDataACL) {
+		t.Fatal("reparse point ancestor directory must fail closed")
+	}
+	if EvaluateSystemAncestorDirSecurity(0x80, true, true, standardProgramDataACL) {
+		t.Fatal("regular file must fail ancestor directory check")
+	}
+	if EvaluateSystemAncestorDirSecurity(FileAttributeDevice, true, true, standardProgramDataACL) {
+		t.Fatal("device must fail ancestor directory check")
+	}
+	if EvaluateSystemAncestorDirSecurity(FileAttributeDirectory, false, true, standardProgramDataACL) {
+		t.Fatal("untrusted owner (e.g. current non-admin user) must fail closed on ancestor directory")
+	}
+	if EvaluateSystemAncestorDirSecurity(FileAttributeDirectory, true, false, standardProgramDataACL) {
+		t.Fatal("nil DACL must fail closed on ancestor directory")
+	}
+
+	// Destructive / takeover bits granted to any untrusted principal must fail closed.
+	for _, badMask := range []uint32{
+		AccessFileDeleteChild,
+		AccessDelete,
+		AccessWriteDAC,
+		AccessWriteOwner,
+		AccessGenericAll,
+	} {
+		for _, aceType := range []uint8{AccessAllowedACEType, AccessAllowedCallbackACEType} {
+			aces := append(append([]ParsedACE(nil), standardProgramDataACL...), ParsedACE{
+				ACEType:    aceType,
+				Mask:       badMask,
+				SIDValid:   true,
+				SIDTrusted: false,
+			})
+			if EvaluateSystemAncestorDirSecurity(FileAttributeDirectory, true, true, aces) {
+				t.Fatalf("untrusted ACE type=%d mask=%#x must fail closed on ancestor directory", aceType, badMask)
+			}
+		}
+	}
+
+	// Deny and audit ACEs are harmless; unknown/object/compound allow ACEs and invalid SIDs fail closed.
+	withDeny := append(append([]ParsedACE(nil), standardProgramDataACL...),
+		ParsedACE{ACEType: AccessDeniedACEType, Mask: AccessGenericAll},
+		ParsedACE{ACEType: SystemMandatoryLabelACEType, Mask: AccessGenericAll},
+	)
+	if !EvaluateSystemAncestorDirSecurity(FileAttributeDirectory, true, true, withDeny) {
+		t.Fatal("deny/label ACEs must not reject ancestor directory")
+	}
+	for _, bad := range []ParsedACE{
+		{ACEType: AccessAllowedObjectACEType, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedCompoundACEType, SIDValid: true, SIDTrusted: true},
+		{ACEType: 99, SIDValid: true, SIDTrusted: true},
+		{ACEType: AccessAllowedACEType, Mask: readExecMask, SIDValid: false, SIDTrusted: true},
+	} {
+		aces := append(append([]ParsedACE(nil), standardProgramDataACL...), bad)
+		if EvaluateSystemAncestorDirSecurity(FileAttributeDirectory, true, true, aces) {
+			t.Fatalf("malformed/unknown allow ACE %+v must fail closed on ancestor directory", bad)
+		}
+	}
+}

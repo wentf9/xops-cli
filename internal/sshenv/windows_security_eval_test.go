@@ -2,7 +2,12 @@ package sshenv
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/winsec"
 )
 
 func TestEvaluateWindowsAttributes_RejectsReparsePointsDevicesAndWrongType(t *testing.T) {
@@ -323,4 +328,179 @@ func TestRound6_P1_2_And_P3_4_WindowsAgentDesiredAccessAndUnicodeControls(t *tes
 	if err != nil || !isPipe || gotPipe != defaultWindowsOpenSSHAgentPipe {
 		t.Fatalf("parseWindowsAgentPipePath(spaces) = (%q, %v, %v)", gotPipe, isPipe, err)
 	}
+}
+
+func TestP6_WindowsGlobalKnownHostsSystemOnlyEvalAndAncestorDir(t *testing.T) {
+	t.Parallel()
+
+	const (
+		fileAttrs          = uint32(0x00000080)
+		readExecMask       = uint32(0x001200a9)
+		programDataAddMask = windowsAccessFileWriteData | windowsAccessFileAppendData | 0x00000110
+	)
+
+	// Under system-global scope (allowCurrentUser == false), current non-admin user
+	// is untrusted while SYSTEM and Builtin\Administrators remain trusted.
+	sysTrusted := winsec.EvaluatePrincipalTrust(true, true, false, false, false)
+	adminTrusted := winsec.EvaluatePrincipalTrust(true, false, true, false, false)
+	currUserTrusted := winsec.EvaluatePrincipalTrust(true, false, false, true, false)
+	usersTrusted := winsec.EvaluatePrincipalTrust(true, false, false, false, false)
+
+	if !sysTrusted || !adminTrusted {
+		t.Fatal("SYSTEM and Administrators must be trusted for global known_hosts")
+	}
+	if currUserTrusted || usersTrusted {
+		t.Fatal("current non-admin user and Users must NOT be trusted for global known_hosts")
+	}
+
+	// Standard Windows C:\ProgramData root ACL passes system ancestor check,
+	// whereas current-user ownership or destructive/takeover rights fail closed.
+	programDataACES := []windowsParsedACE{
+		{ACEType: windowsAccessAllowedACEType, Mask: windowsAccessGenericAll, SIDValid: true, SIDTrusted: sysTrusted},
+		{ACEType: windowsAccessAllowedACEType, Mask: windowsAccessGenericAll, SIDValid: true, SIDTrusted: adminTrusted},
+		{ACEType: windowsAccessAllowedACEType, ACEFlags: winsec.ObjectInheritACEFlag | winsec.ContainerInheritACEFlag | windowsInheritOnlyACEFlag, Mask: windowsAccessGenericAll, SIDValid: true, SIDTrusted: usersTrusted},
+		{ACEType: windowsAccessAllowedACEType, Mask: readExecMask, SIDValid: true, SIDTrusted: usersTrusted},
+		{ACEType: windowsAccessAllowedACEType, Mask: programDataAddMask, SIDValid: true, SIDTrusted: usersTrusted},
+	}
+	if !winsec.EvaluateSystemAncestorDirSecurity(windowsFileAttributeDirectory, sysTrusted, true, programDataACES) {
+		t.Fatal("standard Windows ProgramData ancestor ACL must pass")
+	}
+	if winsec.EvaluateSystemAncestorDirSecurity(windowsFileAttributeDirectory, currUserTrusted, true, programDataACES) {
+		t.Fatal("current-user-owned ProgramData ancestor directory must fail closed")
+	}
+	if winsec.EvaluateSystemAncestorDirSecurity(windowsFileAttributeDirectory|windowsFileAttributeReparsePoint, sysTrusted, true, programDataACES) {
+		t.Fatal("reparse-point ProgramData ancestor directory must fail closed")
+	}
+	if winsec.EvaluateSystemAncestorDirSecurity(windowsFileAttributeDirectory, sysTrusted, true, append(append([]windowsParsedACE(nil), programDataACES...), windowsParsedACE{
+		ACEType:    windowsAccessAllowedACEType,
+		Mask:       windowsAccessFileDeleteChild,
+		SIDValid:   true,
+		SIDTrusted: currUserTrusted,
+	})) {
+		t.Fatal("ProgramData ancestor granting FILE_DELETE_CHILD to current user must fail closed")
+	}
+
+	// %ProgramData%\ssh and %ProgramData%\ssh\ssh_known_hosts reject current-user
+	// ownership and current-user write ACEs under system-only evaluation.
+	strictGlobalACES := []windowsParsedACE{
+		{ACEType: windowsAccessAllowedACEType, Mask: windowsAccessGenericAll, SIDValid: true, SIDTrusted: sysTrusted},
+		{ACEType: windowsAccessAllowedACEType, Mask: windowsAccessGenericAll, SIDValid: true, SIDTrusted: adminTrusted},
+		{ACEType: windowsAccessAllowedACEType, Mask: readExecMask, SIDValid: true, SIDTrusted: usersTrusted},
+	}
+	if !evaluateWindowsObjectSecurity(windowsFileAttributeDirectory, true, sysTrusted, true, strictGlobalACES) {
+		t.Fatal("SYSTEM/Admins %ProgramData%\\ssh must pass")
+	}
+	if !evaluateWindowsObjectSecurity(fileAttrs, false, adminTrusted, true, strictGlobalACES) {
+		t.Fatal("SYSTEM/Admins %ProgramData%\\ssh\\ssh_known_hosts must pass")
+	}
+	if evaluateWindowsObjectSecurity(fileAttrs, false, currUserTrusted, true, strictGlobalACES) {
+		t.Fatal("current-user-owned global ssh_known_hosts must fail closed")
+	}
+	currUserWriteACES := append(append([]windowsParsedACE(nil), strictGlobalACES...), windowsParsedACE{
+		ACEType:    windowsAccessAllowedACEType,
+		Mask:       windowsAccessFileWriteData,
+		SIDValid:   true,
+		SIDTrusted: currUserTrusted,
+	})
+	if evaluateWindowsObjectSecurity(windowsFileAttributeDirectory, true, sysTrusted, true, currUserWriteACES) {
+		t.Fatal("current-user-writable %ProgramData%\\ssh must fail closed")
+	}
+	if evaluateWindowsObjectSecurity(fileAttrs, false, sysTrusted, true, currUserWriteACES) {
+		t.Fatal("current-user-writable %ProgramData%\\ssh\\ssh_known_hosts must fail closed")
+	}
+}
+
+func collectFileFuncCallsAndSelectors(t *testing.T, funcs map[string]*ast.FuncDecl, fnName string) (map[string]bool, map[string]bool) {
+	t.Helper()
+	fn := funcs[fnName]
+	if fn == nil || fn.Body == nil {
+		t.Fatalf("missing function %s in dns_servers_windows.go", fnName)
+	}
+	calls := make(map[string]bool)
+	selectors := make(map[string]bool)
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			switch fun := node.Fun.(type) {
+			case *ast.Ident:
+				calls[fun.Name] = true
+			case *ast.SelectorExpr:
+				if pkg, ok := fun.X.(*ast.Ident); ok {
+					calls[pkg.Name+"."+fun.Sel.Name] = true
+				}
+				calls["."+fun.Sel.Name] = true
+			}
+		case *ast.SelectorExpr:
+			if pkg, ok := node.X.(*ast.Ident); ok {
+				selectors[pkg.Name+"."+node.Sel.Name] = true
+			}
+		}
+		return true
+	})
+	return calls, selectors
+}
+
+func assertCallsPresentAndAbsent(t *testing.T, fnName string, calls map[string]bool, required, forbidden []string) {
+	t.Helper()
+	for _, req := range required {
+		if !calls[req] {
+			t.Errorf("%s must call %s (seen: %v)", fnName, req, calls)
+		}
+	}
+	for _, forbid := range forbidden {
+		if calls[forbid] {
+			t.Errorf("%s must not call %s", fnName, forbid)
+		}
+	}
+}
+
+// TestP6_WindowsGlobalKnownHostsStructuralInvariants parses dns_servers_windows.go
+// on every OS (including Linux CI) to guarantee global known_hosts resolution
+// never regresses back to os.Getenv("ProgramData") or current-user SID trust.
+func TestP6_WindowsGlobalKnownHostsStructuralInvariants(t *testing.T) {
+	t.Parallel()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "dns_servers_windows.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse dns_servers_windows.go failed: %v", err)
+	}
+	for _, imp := range file.Imports {
+		if imp.Path.Value == `"os"` {
+			t.Fatal("dns_servers_windows.go must not import os (never read untrusted ProgramData env var)")
+		}
+	}
+
+	funcs := make(map[string]*ast.FuncDecl)
+	for _, decl := range file.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Recv == nil {
+			funcs[fn.Name.Name] = fn
+		}
+	}
+
+	defaultCalls, defaultSels := collectFileFuncCallsAndSelectors(t, funcs, "defaultGlobalKnownHostsFiles")
+	assertCallsPresentAndAbsent(t, "defaultGlobalKnownHostsFiles", defaultCalls,
+		[]string{"windows.KnownFolderPath", "resolveSecureWindowsGlobalKnownHostsPath"},
+		[]string{"os.Getenv", "os.LookupEnv"},
+	)
+	for _, reqSel := range []string{"windows.FOLDERID_ProgramData", "windows.KF_FLAG_DONT_VERIFY"} {
+		if !defaultSels[reqSel] {
+			t.Errorf("defaultGlobalKnownHostsFiles must reference %s (seen: %v)", reqSel, defaultSels)
+		}
+	}
+
+	for _, fnName := range []string{"resolveSecureWindowsGlobalKnownHostsPath", "isSecureWindowsGlobalKnownHostsFile"} {
+		calls, _ := collectFileFuncCallsAndSelectors(t, funcs, fnName)
+		assertCallsPresentAndAbsent(t, fnName, calls,
+			[]string{"isSecureWindowsSystemAncestorDir", "isSecureWindowsSystemGlobalSSHObject"},
+			[]string{"currentWindowsProcessUserSID", "winsec.CurrentProcessUserSID", "winsec.IsSecureSystemSSHObject"},
+		)
+	}
+
+	globalHelperCalls, _ := collectFileFuncCallsAndSelectors(t, funcs, "isSecureWindowsSystemGlobalSSHObject")
+	assertCallsPresentAndAbsent(t, "isSecureWindowsSystemGlobalSSHObject", globalHelperCalls,
+		[]string{"winsec.IsSecureSystemGlobalSSHObject"}, nil)
+	ancestorHelperCalls, _ := collectFileFuncCallsAndSelectors(t, funcs, "isSecureWindowsSystemAncestorDir")
+	assertCallsPresentAndAbsent(t, "isSecureWindowsSystemAncestorDir", ancestorHelperCalls,
+		[]string{"winsec.IsSecureSystemAncestorDir"}, nil)
 }

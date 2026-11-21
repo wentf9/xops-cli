@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/wentf9/xops-cli/core/winsec"
 	"golang.org/x/sys/windows"
 )
 
@@ -165,6 +167,149 @@ func TestWindowsACLAllowlistAndObjectACEFailClosed(t *testing.T) {
 	}
 }
 
+func mustSetProtectedTestDACL(t *testing.T, target string, acl *windows.ACL) {
+	t.Helper()
+	err := windows.SetNamedSecurityInfo(
+		target,
+		windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+		nil, nil, acl, nil,
+	)
+	runtime.KeepAlive(acl)
+	if err != nil {
+		t.Fatalf("SetNamedSecurityInfo(%s): %v", target, err)
+	}
+}
+
+func assertWindowsGlobalKnownHostsSystemTrust(
+	t *testing.T,
+	baseDir, sshDir, knownHosts string,
+	currSID, interactiveSID *windows.SID,
+) {
+	t.Helper()
+
+	daclCurrUserOnly := buildPinnedTestACL(t, nil,
+		testACESpec{sid: currSID, trusteeType: windows.TRUSTEE_IS_USER, permissions: windows.GENERIC_ALL},
+	)
+	mustSetProtectedTestDACL(t, sshDir, daclCurrUserOnly)
+	mustSetProtectedTestDACL(t, knownHosts, daclCurrUserOnly)
+
+	// R6 / Finding 4.12c: global known_hosts MUST trust ONLY SYSTEM and
+	// Builtin\Administrators (never currSID), while user-scoped checks retain currSID.
+	if !isTrustedWindowsPrincipalSID(currSID, nil) {
+		if resolved, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); ok {
+			t.Fatalf("resolveSecureWindowsGlobalKnownHostsPath(%q) = (%q, true), want false for currSID-writable global known_hosts", baseDir, resolved)
+		}
+		if isSecureWindowsGlobalKnownHostsFile(knownHosts) {
+			t.Fatal("currSID-writable ssh directory and ssh_known_hosts must be rejected by global known_hosts check")
+		}
+		if !winsec.IsSecureSystemSSHObject(sshDir, true, currSID) || !winsec.IsSecureSystemSSHObject(knownHosts, false, currSID) {
+			t.Fatal("user-scoped winsec.IsSecureSystemSSHObject must still accept currSID-only directory and file")
+		}
+	}
+
+	// Verify ProgramData env var tampering is ignored (KnownFolderPath is used instead).
+	t.Setenv("ProgramData", baseDir)
+	if slices.Contains(defaultGlobalKnownHostsFiles(), knownHosts) {
+		t.Fatalf("defaultGlobalKnownHostsFiles() followed untrusted ProgramData env var %q", baseDir)
+	}
+
+	// When running elevated (e.g. GitHub Actions windows-latest where Administrators owns TempDir),
+	// also test full SYSTEM/Administrators global acceptance and INTERACTIVE FILE_DELETE_CHILD rejection.
+	if isWindowsDirSystemOwned(baseDir) {
+		assertElevatedWindowsGlobalKnownHosts(t, baseDir, sshDir, knownHosts, currSID, interactiveSID)
+		return
+	}
+	daclDirDeleteChild := buildPinnedTestACL(t, daclCurrUserOnly,
+		testACESpec{sid: interactiveSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.ACCESS_MASK(windowsAccessFileDeleteChild)},
+	)
+	mustSetProtectedTestDACL(t, sshDir, daclDirDeleteChild)
+	if _, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); ok {
+		t.Fatal("parent ssh directory granting FILE_DELETE_CHILD to INTERACTIVE must be rejected")
+	}
+	if winsec.IsSecureSystemSSHObject(sshDir, true, currSID) {
+		t.Fatal("user-scoped check must reject parent ssh directory granting FILE_DELETE_CHILD to INTERACTIVE")
+	}
+}
+
+func isWindowsDirSystemOwned(dir string) bool {
+	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil || sd == nil {
+		return false
+	}
+	owner, _, err := sd.Owner()
+	return err == nil && owner != nil && isTrustedWindowsPrincipalSID(owner, nil)
+}
+
+func assertElevatedWindowsGlobalKnownHosts(
+	t *testing.T,
+	baseDir, sshDir, knownHosts string,
+	currSID, interactiveSID *windows.SID,
+) {
+	t.Helper()
+
+	systemSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminsSID, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	usersSID, err := windows.CreateWellKnownSid(windows.WinBuiltinUsersSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	daclCleanup := buildPinnedTestACL(t, nil,
+		testACESpec{sid: systemSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: adminsSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: currSID, trusteeType: windows.TRUSTEE_IS_USER, permissions: windows.GENERIC_ALL},
+	)
+	t.Cleanup(func() {
+		for _, target := range []string{knownHosts, sshDir, baseDir} {
+			_ = windows.SetNamedSecurityInfo(
+				target,
+				windows.SE_FILE_OBJECT,
+				windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
+				nil, nil, daclCleanup, nil,
+			)
+		}
+		runtime.KeepAlive(daclCleanup)
+	})
+
+	daclProgramDataRoot := buildPinnedTestACL(t, nil,
+		testACESpec{sid: systemSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: adminsSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: usersSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE | windows.FILE_WRITE_DATA | windows.FILE_APPEND_DATA},
+	)
+	daclSystemAdmins := buildPinnedTestACL(t, nil,
+		testACESpec{sid: systemSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: adminsSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.GENERIC_ALL},
+		testACESpec{sid: usersSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE},
+	)
+	mustSetProtectedTestDACL(t, baseDir, daclProgramDataRoot)
+	mustSetProtectedTestDACL(t, sshDir, daclSystemAdmins)
+	mustSetProtectedTestDACL(t, knownHosts, daclSystemAdmins)
+
+	if resolved, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); !ok || resolved != knownHosts {
+		t.Fatalf("resolveSecureWindowsGlobalKnownHostsPath(%q) = (%q, %v), want (%q, true)", baseDir, resolved, ok, knownHosts)
+	}
+	if !isSecureWindowsGlobalKnownHostsFile(knownHosts) {
+		t.Fatal("SYSTEM/Administrators ssh directory and ssh_known_hosts must be accepted")
+	}
+
+	daclDirDeleteChild := buildPinnedTestACL(t, daclSystemAdmins,
+		testACESpec{sid: interactiveSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.ACCESS_MASK(windowsAccessFileDeleteChild)},
+	)
+	mustSetProtectedTestDACL(t, sshDir, daclDirDeleteChild)
+	if _, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); ok {
+		t.Fatal("parent ssh directory granting FILE_DELETE_CHILD to INTERACTIVE must be rejected")
+	}
+	if isSecureWindowsGlobalKnownHostsFile(knownHosts) {
+		t.Fatal("isSecureWindowsGlobalKnownHostsFile must reject FILE_DELETE_CHILD for INTERACTIVE")
+	}
+}
+
 func TestWindowsGlobalKnownHostsAndPipeOwnerFailClosed(t *testing.T) {
 	currSID, err := currentWindowsProcessUserSID()
 	if err != nil || currSID == nil {
@@ -185,40 +330,7 @@ func TestWindowsGlobalKnownHostsAndPipeOwnerFailClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	daclOwnerOnly := buildPinnedTestACL(t, nil,
-		testACESpec{sid: currSID, trusteeType: windows.TRUSTEE_IS_USER, permissions: windows.GENERIC_ALL},
-	)
-	for _, target := range []string{sshDir, knownHosts} {
-		if err := windows.SetNamedSecurityInfo(
-			target,
-			windows.SE_FILE_OBJECT,
-			windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-			nil, nil, daclOwnerOnly, nil,
-		); err != nil {
-			t.Fatalf("SetNamedSecurityInfo(%s): %v", target, err)
-		}
-	}
-	if resolved, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); !ok || resolved != knownHosts {
-		t.Fatalf("resolveSecureWindowsGlobalKnownHostsPath(%q) = (%q, %v), want (%q, true)", baseDir, resolved, ok, knownHosts)
-	}
-	if !isSecureWindowsGlobalKnownHostsFile(knownHosts) {
-		t.Fatal("owner-only ssh directory and ssh_known_hosts must be accepted")
-	}
-
-	daclDirDeleteChild := buildPinnedTestACL(t, daclOwnerOnly,
-		testACESpec{sid: interactiveSID, trusteeType: windows.TRUSTEE_IS_WELL_KNOWN_GROUP, permissions: windows.ACCESS_MASK(windowsAccessFileDeleteChild)},
-	)
-	if err := windows.SetNamedSecurityInfo(
-		sshDir,
-		windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, daclDirDeleteChild, nil,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := resolveSecureWindowsGlobalKnownHostsPath(baseDir); ok {
-		t.Fatal("parent ssh directory granting FILE_DELETE_CHILD to INTERACTIVE must be rejected")
-	}
+	assertWindowsGlobalKnownHostsSystemTrust(t, baseDir, sshDir, knownHosts, currSID, interactiveSID)
 
 	if err := verifyWindowsAgentPipeServerOwner(windows.InvalidHandle); err == nil {
 		t.Fatal("verifyWindowsAgentPipeServerOwner(InvalidHandle) must fail closed")

@@ -78,6 +78,17 @@ const (
 		AccessGenericWrite |
 		AccessGenericAll
 
+	// InsecureSystemAncestorDirMask forbids destructive and takeover rights on
+	// a shared system ancestor directory (such as C:\ProgramData) for untrusted
+	// principals while permitting Windows' default Builtin\Users FILE_ADD_FILE
+	// and FILE_ADD_SUBDIRECTORY rights (and INHERIT_ONLY_ACE entries such as
+	// CREATOR OWNER).
+	InsecureSystemAncestorDirMask uint32 = AccessFileDeleteChild |
+		AccessDelete |
+		AccessWriteDAC |
+		AccessWriteOwner |
+		AccessGenericAll
+
 	// InsecureOwnerOnlyObjectMask forbids ANY access bit for untrusted principals
 	// on strictly owner-only objects such as SSH multiplex control directories and sockets.
 	InsecureOwnerOnlyObjectMask uint32 = ^uint32(0)
@@ -134,9 +145,38 @@ func EvaluateAttributes(attrs uint32, expectDir bool) bool {
 	return attrs&FileAttributeDirectory == 0
 }
 
+// EvaluatePrincipalTrust reports whether a principal SID is trusted under the
+// requested scope. System-global checks (such as %ProgramData%\ssh\ssh_known_hosts)
+// pass allowCurrentUser=false so ONLY LocalSystem and Builtin\Administrators
+// are trusted; user-scoped checks pass allowCurrentUser=true to additionally
+// trust the current process user SID.
+func EvaluatePrincipalTrust(
+	sidValid bool,
+	isLocalSystem bool,
+	isBuiltinAdmins bool,
+	matchesCurrentUser bool,
+	allowCurrentUser bool,
+) bool {
+	if !sidValid {
+		return false
+	}
+	if isLocalSystem || isBuiltinAdmins {
+		return true
+	}
+	return allowCurrentUser && matchesCurrentUser
+}
+
 // EvaluateACE checks a single ACE against InsecureSSHObjectWriteMask.
 func EvaluateACE(ace ParsedACE) bool {
 	return EvaluateACEWithMask(ace, InsecureSSHObjectWriteMask)
+}
+
+// EvaluateSystemAncestorDirACE checks a single ACE on a shared system ancestor
+// directory (such as C:\ProgramData) against InsecureSystemAncestorDirMask,
+// skipping INHERIT_ONLY_ACE entries (such as CREATOR OWNER) that do not apply
+// to the ancestor directory itself.
+func EvaluateSystemAncestorDirACE(ace ParsedACE) bool {
+	return EvaluateACEWithMask(ace, InsecureSystemAncestorDirMask)
 }
 
 // EvaluateOwnerOnlyACE checks a single ACE against InsecureOwnerOnlyObjectMask,
@@ -219,6 +259,31 @@ func EvaluateObjectSecurity(
 	for _, ace := range aces {
 		skipInheritOnly := !expectDir || !isInheritableACE(ace.ACEFlags)
 		if !evaluateACEWithMask(ace, InsecureSSHObjectWriteMask, skipInheritOnly) {
+			return false
+		}
+	}
+	return true
+}
+
+// EvaluateSystemAncestorDirSecurity verifies that a shared system ancestor
+// directory (such as C:\ProgramData) is a real directory (not a reparse point
+// or device), has a trusted system owner (SYSTEM or Builtin\Administrators),
+// has a non-nil DACL, and denies destructive/takeover rights
+// (InsecureSystemAncestorDirMask) to untrusted principals.
+func EvaluateSystemAncestorDirSecurity(
+	attrs uint32,
+	ownerTrusted bool,
+	hasDACL bool,
+	aces []ParsedACE,
+) bool {
+	if !EvaluateAttributes(attrs, true) {
+		return false
+	}
+	if !ownerTrusted || !hasDACL {
+		return false
+	}
+	for _, ace := range aces {
+		if !EvaluateSystemAncestorDirACE(ace) {
 			return false
 		}
 	}
