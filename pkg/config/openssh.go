@@ -700,17 +700,16 @@ func parseOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string) (*ssh.Options
 }
 
 func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec, opts *ssh.Options) error {
-	// Trust-class options (StrictHostKeyChecking, UserKnownHostsFile) are never
-	// inherited from ~/.ssh/config so wildcard host blocks cannot implicitly
-	// weaken host key verification. Only one-way HashKnownHosts=yes is allowed.
-	if spec.Class == ssh.OptionClassTrust && !isAllowedOpenSSHTrustOption(spec.CanonicalKey) {
+	// Enforce declarative Tier-4 (~/.ssh/config) inheritance policy so wildcard
+	// host blocks cannot implicitly weaken host key verification.
+	if spec.Tier4Policy == ssh.OptionTier4Deny {
 		return nil
 	}
 	if spec.MultiValue {
 		rawVals := allMatchingOpenSSHOptionsPasses(doc, passes, spec)
-		if spec.CanonicalKey == ssh.OptionSetEnv {
-			// OpenSSH evaluates only the first matching SetEnv directive
-			// in ssh_config (and retains the first occurrence per key inside it).
+		if spec.MergeMode.SingleDirectivePerLayer() {
+			// OpenSSH evaluates only the first matching directive in ssh_config
+			// (e.g. SetEnv retains the first occurrence per key inside it).
 			// Even if that first directive is invalid, lower blocks must not apply.
 			if len(rawVals) > 0 {
 				_ = opts.Append(spec.CanonicalKey, rawVals[0])
@@ -730,9 +729,9 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 	if skip || val == "" {
 		return nil
 	}
-	if spec.Class == ssh.OptionClassTrust {
-		trimmedTrust := strings.TrimSpace(val)
-		if !strings.EqualFold(trimmedTrust, "yes") && !strings.EqualFold(trimmedTrust, "true") {
+	if spec.Tier4Policy == ssh.OptionTier4OneWayYes {
+		trimmed := strings.TrimSpace(val)
+		if !strings.EqualFold(trimmed, "yes") && !strings.EqualFold(trimmed, "true") {
 			return nil
 		}
 	}
@@ -747,10 +746,10 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 		val = filtered
 	}
 	if err := opts.Set(spec.CanonicalKey, val); err != nil {
-		// Preserve strict error reporting on ControlMaster, ControlPersist, and
-		// AllowList restrictions, while leniently skipping unsupported ~/.ssh/config
-		// values (e.g. ControlPath tokens like %k or PubkeyAuthentication=unbound).
-		if spec.CanonicalKey == ssh.OptionControlMaster || spec.CanonicalKey == ssh.OptionControlPersist || spec.AllowList {
+		// Preserve strict error reporting on options declared StrictInOpenSSHConfig,
+		// while leniently skipping unsupported ~/.ssh/config values (e.g. ControlPath
+		// tokens like %k or PubkeyAuthentication=unbound).
+		if spec.StrictInOpenSSHConfig {
 			hostLabel := passes[0]
 			return fmt.Errorf("invalid %s %q for %q in ssh config: %w", spec.OpenSSHName, val, hostLabel, err)
 		}
@@ -789,27 +788,11 @@ func extractFailClosedPreferredAuths(raw string) string {
 	return strings.Join(kept, ",")
 }
 
-func preservesSSHConfigRawValue(canonicalKey string) bool {
-	switch canonicalKey {
-	case ssh.OptionProxyCommand,
-		ssh.OptionLocalCommand,
-		ssh.OptionRemoteCommand,
-		ssh.OptionSendEnv,
-		ssh.OptionSetEnv,
-		ssh.OptionLocalForward,
-		ssh.OptionRemoteForward,
-		ssh.OptionDynamicForward:
-		return true
-	default:
-		return false
-	}
-}
-
-func sshConfigOptionValue(d *sshConfigDirective, canonicalKey string) string {
+func sshConfigOptionValue(d *sshConfigDirective, spec ssh.OptionSpec) string {
 	if d == nil {
 		return ""
 	}
-	if preservesSSHConfigRawValue(canonicalKey) {
+	if spec.ConfigSyntax.PreservesRawValue() {
 		return d.rawValue
 	}
 	return d.value
@@ -827,8 +810,7 @@ func allMatchingOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string, spec ss
 	keys = append(keys, spec.Aliases...)
 
 	multiPass := len(passes) > 1
-	dedupAcrossPasses := multiPass &&
-		(spec.CanonicalKey == ssh.OptionIdentityFile || spec.CanonicalKey == ssh.OptionCertificateFile)
+	dedupAcrossPasses := multiPass && spec.MergeMode.IsNoneTerminated()
 	var seen map[string]struct{}
 	if dedupAcrossPasses {
 		seen = make(map[string]struct{})
@@ -848,7 +830,7 @@ func allMatchingOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string, spec ss
 		}
 		for _, candidate := range keys {
 			if strings.EqualFold(d.key, candidate) {
-				if v := sshConfigOptionValue(d, spec.CanonicalKey); v != "" {
+				if v := sshConfigOptionValue(d, spec); v != "" {
 					if dedupAcrossPasses {
 						if _, ok := seen[v]; ok {
 							break
@@ -863,12 +845,6 @@ func allMatchingOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string, spec ss
 		return true
 	})
 	return matches
-}
-
-// isAllowedOpenSSHTrustOption reports whether a trust-class option may be inherited
-// (one-way security-preserving) from ssh_config.
-func isAllowedOpenSSHTrustOption(canonicalKey string) bool {
-	return strings.EqualFold(strings.TrimSpace(canonicalKey), "hash_known_hosts")
 }
 
 func resolveOpenSSHSingleOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) (val string, skip bool) {
@@ -887,7 +863,7 @@ func firstMatchingOpenSSHOptionPasses(doc *sshConfigDoc, passes []string, spec s
 	keys := make([]string, 0, 1+len(spec.Aliases))
 	keys = append(keys, spec.OpenSSHName)
 	keys = append(keys, spec.Aliases...)
-	return firstSSHConfigKeyValueRawPasses(doc, passes, preservesSSHConfigRawValue(spec.CanonicalKey), keys...)
+	return firstSSHConfigKeyValueRawPasses(doc, passes, spec.ConfigSyntax.PreservesRawValue(), keys...)
 }
 
 func parseOpenSSHHostSpec(spec string) (host, userName string, port uint16, err error) {
@@ -953,14 +929,11 @@ func expandHomeDir(path string) (string, error) {
 }
 
 func normalizeConfigIdentityKeyPath(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" || strings.EqualFold(trimmed, "none") {
+	setting, err := ssh.ParseIdentityPathSetting(raw, true)
+	if err != nil || !setting.Persistable() {
 		return "", nil
 	}
-	if strings.Contains(trimmed, "%") || strings.Contains(trimmed, "${") {
-		return "", nil
-	}
-	expanded, err := expandHomeDir(trimmed)
+	expanded, err := expandHomeDir(setting.Raw)
 	if err != nil {
 		return "", err
 	}

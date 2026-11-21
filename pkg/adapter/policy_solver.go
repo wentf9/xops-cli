@@ -426,11 +426,22 @@ func filterNonVirtualTier4Options(rawTier4 *ssh.Options) *ssh.Options {
 		ssh.OptionClassMux,
 		ssh.OptionClassTransport,
 	)
-	if strings.EqualFold(strings.TrimSpace(rawTier4.Get(ssh.OptionHashKnownHosts)), "yes") {
-		if filtered == nil {
-			filtered = &ssh.Options{}
+	for _, spec := range ssh.RegisteredOptionSpecs() {
+		if spec.Tier4Policy != ssh.OptionTier4OneWayYes {
+			continue
 		}
-		_ = filtered.Set(ssh.OptionHashKnownHosts, "yes")
+		trimmed := strings.TrimSpace(rawTier4.Get(spec.CanonicalKey))
+		if strings.EqualFold(trimmed, "yes") || strings.EqualFold(trimmed, "true") {
+			if filtered == nil {
+				filtered = &ssh.Options{}
+			}
+			_ = filtered.Set(spec.CanonicalKey, "yes")
+		} else if filtered != nil {
+			filtered.Delete(spec.CanonicalKey)
+		}
+	}
+	if filtered.IsEmpty() {
+		return nil
 	}
 	return filtered
 }

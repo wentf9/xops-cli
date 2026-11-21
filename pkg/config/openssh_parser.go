@@ -378,71 +378,9 @@ func parseOpenSSHMatchBlock(lineNum int, rest string) (*sshConfigBlock, error) {
 	return &sshConfigBlock{isMatch: true, patterns: patterns}, nil
 }
 
-func isOpenSSHMultiTokenListDirective(lowerKey string) bool {
-	switch lowerKey {
-	case "proxyjump", "proxy_jump",
-		"canonicaldomains", "canonical_domains",
-		"canonicalizepermittedcnames", "canonicalize_permitted_cnames",
-		"userknownhostsfile", "user_known_hosts_file",
-		"globalknownhostsfile", "global_known_hosts_file":
-		return true
-	default:
-		return false
-	}
-}
-
-func isStrictOpenSSHScalarDirective(lowerKey string) bool {
-	switch lowerKey {
-	case "user", "port", "hostname",
-		"controlmaster", "control_master",
-		"controlpath", "control_path",
-		"controlpersist", "control_persist",
-		"identitiesonly", "identities_only",
-		"batchmode", "batch_mode",
-		"forwardagent", "forward_agent",
-		"addressfamily", "address_family",
-		"connecttimeout", "connect_timeout",
-		"serveraliveinterval", "server_alive_interval",
-		"serveralivecountmax", "server_alive_count_max",
-		"tcpkeepalive", "tcp_keep_alive",
-		"stricthostkeychecking", "strict_host_key_checking",
-		"hashknownhosts", "hash_known_hosts",
-		"verifyhostkeydns", "verify_host_key_dns",
-		"canonicalizehostname", "canonicalize_hostname",
-		"canonicalizemaxdots", "canonicalize_max_dots",
-		"canonicalizefallbacklocal", "canonicalize_fallback_local",
-		"pubkeyauthentication", "pubkey_authentication",
-		"passwordauthentication", "password_authentication",
-		"kbdinteractiveauthentication", "kbd_interactive_authentication",
-		"challengeresponseauthentication", "challenge_response_authentication",
-		"preferredauthentications", "preferred_authentications",
-		"hostkeyalgorithms", "host_key_algorithms",
-		"ciphers", "macs",
-		"kexalgorithms", "kex_algorithms",
-		"exitonforwardfailure", "exit_on_forward_failure",
-		"clearallforwardings", "clear_all_forwardings",
-		"gatewayports", "gateway_ports",
-		"streamlocalbindunlink", "stream_local_bind_unlink",
-		"streamlocalbindmask", "stream_local_bind_mask",
-		"forkafterauthentication", "fork_after_authentication",
-		"stdinnull", "stdin_null",
-		"sessiontype", "session_type",
-		"tunnel",
-		"tunneldevice", "tunnel_device",
-		"requesttty", "request_tty",
-		"escapechar", "escape_char",
-		"permitlocalcommand", "permit_local_command",
-		"identityfile", "identity_file",
-		"certificatefile", "certificate_file",
-		"identityagent", "identity_agent":
-		return true
-	default:
-		return false
-	}
-}
-
 func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigDirective, error) {
-	if isOpenSSHWholeLineCommandDirective(lowerKey) {
+	syntax, known := ssh.LookupDirectiveSyntax(lowerKey)
+	if known && syntax == ssh.OptionSyntaxWholeLineCommand {
 		trimmed := strings.TrimSpace(rest)
 		return &sshConfigDirective{
 			line:     lineNum,
@@ -457,7 +395,7 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigD
 		return nil, fmt.Errorf("line %d: unterminated quote in %s directive", lineNum, key)
 	}
 	rawVal := strings.TrimSpace(argsPart)
-	if isOpenSSHRawTokenListDirective(lowerKey) {
+	if known && syntax == ssh.OptionSyntaxRawTokenList {
 		return &sshConfigDirective{
 			line:     lineNum,
 			key:      key,
@@ -470,18 +408,21 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigD
 	if err != nil {
 		return nil, fmt.Errorf("line %d: invalid %s directive: %w", lineNum, key, err)
 	}
-	if isOpenSSHMultiTokenListDirective(lowerKey) {
-		val := strings.Join(toks, " ")
-		return &sshConfigDirective{
-			line:     lineNum,
-			key:      key,
-			lowerKey: lowerKey,
-			value:    val,
-			rawValue: rawVal,
-		}, nil
-	}
-	if isStrictOpenSSHScalarDirective(lowerKey) && len(toks) > 1 {
-		return nil, fmt.Errorf("line %d: garbage at end of line in %s directive: %q", lineNum, key, rawVal)
+	if known {
+		switch syntax {
+		case ssh.OptionSyntaxMultiTokenList:
+			return &sshConfigDirective{
+				line:     lineNum,
+				key:      key,
+				lowerKey: lowerKey,
+				value:    strings.Join(toks, " "),
+				rawValue: rawVal,
+			}, nil
+		case ssh.OptionSyntaxStrictScalar:
+			if len(toks) > 1 {
+				return nil, fmt.Errorf("line %d: garbage at end of line in %s directive: %q", lineNum, key, rawVal)
+			}
+		}
 	}
 	val := rawVal
 	if len(toks) == 1 {
@@ -494,30 +435,6 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigD
 		value:    val,
 		rawValue: rawVal,
 	}, nil
-}
-
-func isOpenSSHWholeLineCommandDirective(lowerKey string) bool {
-	switch lowerKey {
-	case "proxycommand", "proxy_command",
-		"localcommand", "local_command",
-		"remotecommand", "remote_command":
-		return true
-	default:
-		return false
-	}
-}
-
-func isOpenSSHRawTokenListDirective(lowerKey string) bool {
-	switch lowerKey {
-	case "setenv", "set_env",
-		"sendenv", "send_env",
-		"localforward", "local_forward",
-		"remoteforward", "remote_forward",
-		"dynamicforward", "dynamic_forward":
-		return true
-	default:
-		return false
-	}
 }
 
 func isOpenSSHArgvEscapable(ch byte) bool {

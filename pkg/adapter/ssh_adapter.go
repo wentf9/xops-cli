@@ -185,8 +185,8 @@ func (s SessionControlOptions) HasExplicitMaster() bool {
 }
 
 // ResolveControl merges this Tier-1 session layer with any lower-priority option
-// layers (filtered to OptionClassMux) via core/ssh.EffectiveOptions, projects and
-// validates the resulting ControlConfig via ValidatedControlConfig(), and applies
+// layers (filtered to OptionClassMux) via core/ssh.MergeEffectiveOptions, projects
+// and validates the resulting ControlConfig via ValidatedControlConfig(), and applies
 // the single canonical AllowReuse derivation rule.
 func (s SessionControlOptions) ResolveControl(lowerLayers ...*ssh.Options) (*ssh.ControlConfig, error) {
 	layers := make([]*ssh.Options, 0, 1+len(lowerLayers))
@@ -194,7 +194,7 @@ func (s SessionControlOptions) ResolveControl(lowerLayers ...*ssh.Options) (*ssh
 	for _, layer := range lowerLayers {
 		layers = append(layers, layer.FilterByClasses(ssh.OptionClassMux))
 	}
-	effMux, err := ssh.EffectiveOptions(layers...)
+	effMux, err := ssh.MergeEffectiveOptions(layers...)
 	if err != nil {
 		return nil, err
 	}
@@ -225,32 +225,7 @@ func (s SessionControlOptions) ConnectionWideOptions() SessionControlOptions {
 // It supports "Key=Value", "Key Value", and "Key = Value" syntax, matching standard
 // OpenSSH -o CLI argument conventions.
 func SplitOptionKeyValue(opt string) (key, val string, err error) {
-	opt = strings.TrimSpace(opt)
-	if opt == "" {
-		return "", "", nil
-	}
-	eqIdx := strings.IndexByte(opt, '=')
-	wsIdx := strings.IndexAny(opt, " \t")
-	if eqIdx >= 0 && (wsIdx == -1 || eqIdx < wsIdx) {
-		key = strings.TrimSpace(opt[:eqIdx])
-		val = strings.TrimSpace(opt[eqIdx+1:])
-		if key == "" {
-			return "", "", fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
-		}
-		return key, val, nil
-	}
-	if wsIdx > 0 {
-		key = strings.TrimSpace(opt[:wsIdx])
-		val = strings.TrimSpace(opt[wsIdx+1:])
-		if strings.HasPrefix(val, "=") {
-			val = strings.TrimSpace(strings.TrimPrefix(val, "="))
-		}
-		if key == "" {
-			return "", "", fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
-		}
-		return key, val, nil
-	}
-	return "", "", fmt.Errorf("invalid -o option format (expected Key=Value): %q", opt)
+	return ssh.SplitOptionKeyValue(opt)
 }
 
 // ParseOptionStrings parses OpenSSH -o Key=Value strings into SessionControlOptions.
@@ -387,22 +362,16 @@ func applySupportedOption(opts *SessionControlOptions, state *optionParseState, 
 		return fmt.Errorf("invalid %s in -o option: value cannot be empty", spec.OpenSSHName)
 	}
 	if spec.MultiValue {
-		if spec.CanonicalKey == ssh.OptionSetEnv {
-			var scratch ssh.Options
-			if err := scratch.Append(spec.CanonicalKey, val); err != nil {
-				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-			}
-			if !state.seen[ssh.OptionSetEnv] {
-				if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
-					return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
-				}
-			}
-			state.seen[ssh.OptionSetEnv] = true
-			return nil
-		}
-		if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
+		var scratch ssh.Options
+		if err := scratch.Append(spec.CanonicalKey, val); err != nil {
 			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
 		}
+		if !spec.MergeMode.SingleDirectivePerLayer() || !state.seen[spec.CanonicalKey] {
+			if err := opts.ensureOptions().Append(spec.CanonicalKey, val); err != nil {
+				return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
+			}
+		}
+		state.seen[spec.CanonicalKey] = true
 		return nil
 	}
 	var scratch ssh.Options
@@ -418,7 +387,7 @@ func applySupportedOption(opts *SessionControlOptions, state *optionParseState, 
 		state.seen[ssh.OptionProxyCommand] = true
 		return nil
 	}
-	if !state.seen[spec.CanonicalKey] {
+	if !spec.MergeMode.SingleDirectivePerLayer() || !state.seen[spec.CanonicalKey] {
 		if err := opts.ensureOptions().Set(spec.CanonicalKey, val); err != nil {
 			return fmt.Errorf("invalid %s in -o option: %w", spec.OpenSSHName, err)
 		}
@@ -971,8 +940,8 @@ func (a *SSHAdapter) GetConfig(nodeID string) (*ssh.ClientConfig, error) {
 	}
 
 	var cliOptKeys []string
-	if sessionCtrlOpts.Options != nil {
-		cliOptKeys = sessionCtrlOpts.Options.IdentityFiles()
+	if effCLI, _ := ssh.EffectiveOptions(sessionCtrlOpts.Options); effCLI != nil {
+		cliOptKeys = effCLI.IdentityFiles()
 	}
 	managedNodeKey := a.resolveManagedNodeKey(nodeID, snapshot)
 	var mergedOptKeys []string
