@@ -481,14 +481,11 @@ func runP3MutationSubtest(t *testing.T, tc p3MutationCase) {
 		t.Fatalf("CloseAll failed: %v", err)
 	}
 	closed = true
-	if connector.clients.Count() != 0 {
-		t.Fatalf("expected empty active pool after CloseAll, got %d", connector.clients.Count())
+	if connector.pool.Count() != 0 {
+		t.Fatalf("expected empty active pool after CloseAll, got %d", connector.pool.Count())
 	}
-	connector.lifecycleMu.Lock()
-	remainingRetired := len(connector.retiredClients)
-	connector.lifecycleMu.Unlock()
-	if remainingRetired != 0 {
-		t.Fatalf("expected empty retiredClients after CloseAll, got %d", remainingRetired)
+	if remainingRetired := connector.pool.RetiredCount(); remainingRetired != 0 {
+		t.Fatalf("expected empty retired pool after CloseAll, got %d", remainingRetired)
 	}
 	assertP3TransportClosed(t, "client1 (retired)", client1)
 	assertP3TransportClosed(t, "client2 (active)", client2)

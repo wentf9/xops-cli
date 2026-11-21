@@ -115,7 +115,8 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		if hop.NodeID == "" || len(hop.NodeID) > 1024 || strings.ContainsAny(hop.NodeID, ",\x00\r\n") || seen[hop.NodeID] {
 			return ConnectionPlan{}, errors.New("connection plan contains an invalid or duplicate node ID")
 		}
-		hop.Address = cleanHostLiteral(hop.Address)
+		hop.Address = normalizeHostAddress(hop.Address)
+		hop.BaseHost = normalizeHostAddress(hop.BaseHost)
 		if hop.Address == "" || hop.User == "" || hop.Port < 0 || hop.Port > 65535 {
 			return ConnectionPlan{}, errors.New("connection plan contains an invalid SSH endpoint")
 		}
@@ -237,24 +238,14 @@ func (c *Connector) acquirePlan(key string, plan ConnectionPlan) (*planEntry, er
 }
 
 func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
-	opts := cfg.Options.Clone()
-	opts.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession, OptionClassLocalExec)
-	if opts.IsEmpty() {
-		opts = nil
+	norm := cfg.toClientConfig()
+	if norm.Options != nil {
+		norm.Options.StripClasses(OptionClassMux, OptionClassForward, OptionClassSession, OptionClassLocalExec)
+		if norm.Options.IsEmpty() {
+			norm.Options = nil
+		}
 	}
-	return ClientConfig{
-		NodeID: cfg.NodeID, OriginalHost: cfg.OriginalHost, CanonicalHost: cfg.CanonicalHost, Address: cfg.Address, BaseHost: cfg.BaseHost, Port: cfg.Port, User: cfg.User, AuthType: cfg.AuthType,
-		KeyPath: cfg.KeyPath, KeyPaths: slices.Clone(cfg.KeyPaths), KeyRef: cfg.KeyRef, TrustVersion: cfg.TrustVersion,
-		AuthUpdateToken: cfg.AuthUpdateToken, SudoUpdateToken: cfg.SudoUpdateToken, SudoMode: cfg.SudoMode,
-		ProxyJump: cfg.ProxyJump, OriginalProxyJump: cfg.OriginalProxyJump, HasOriginalProxyJump: cfg.HasOriginalProxyJump,
-		PasswordPromptPattern:       cfg.PasswordPromptPattern,
-		EnforceAdmittedCertificates: cfg.EnforceAdmittedCertificates,
-		AdmittedCertificates:        cloneAdmittedCertificates(cfg.AdmittedCertificates),
-		EnforceAdmittedKeyDigests:   cfg.EnforceAdmittedKeyDigests,
-		AdmittedKeyDigests:          cloneAdmittedKeyDigests(cfg.AdmittedKeyDigests),
-		Execution:                   cfg.Execution.Clone(),
-		Options:                     opts,
-	}
+	return *norm
 }
 
 // RetirePlan stops new reuse of this cached generation and drains its existing

@@ -538,8 +538,8 @@ func TestPhase4_OriginalHostPropagatesToTokenExpansion(t *testing.T) {
 	}
 
 	connCfg := cfg.ToConnectionConfig()
-	if connCfg.OriginalHost != " web-alias " {
-		t.Fatalf("ToConnectionConfig OriginalHost = %q", connCfg.OriginalHost)
+	if connCfg.OriginalHost != "web-alias" {
+		t.Fatalf("ToConnectionConfig OriginalHost = %q, want %q", connCfg.OriginalHost, "web-alias")
 	}
 	if back := clientConfigFromPlan(connCfg); back.OriginalHost != connCfg.OriginalHost {
 		t.Fatalf("clientConfigFromPlan OriginalHost = %q", back.OriginalHost)

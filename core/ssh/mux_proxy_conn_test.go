@@ -61,7 +61,7 @@ func TestValidateTargetCompatibility_ZeroPortNormalization(t *testing.T) {
 		Port:    0,
 		User:    "root",
 	}
-	if err := validateTargetCompatibility(cur, newCfg); err != nil {
+	if err := checkTargetDigestCompatibility(cur, newCfg); err != nil {
 		t.Fatalf("expected Port=0 and Port=22 to be compatible, got %v", err)
 	}
 	curZero := ConnectionConfig{
@@ -74,7 +74,7 @@ func TestValidateTargetCompatibility_ZeroPortNormalization(t *testing.T) {
 		Port:    22,
 		User:    "root",
 	}
-	if err := validateTargetCompatibility(curZero, newCfg22); err != nil {
+	if err := checkTargetDigestCompatibility(curZero, newCfg22); err != nil {
 		t.Fatalf("expected cur.Port=0 and newCfg.Port=22 to be compatible, got %v", err)
 	}
 	newCfgMismatch := &ClientConfig{
@@ -82,7 +82,7 @@ func TestValidateTargetCompatibility_ZeroPortNormalization(t *testing.T) {
 		Port:    2222,
 		User:    "root",
 	}
-	if err := validateTargetCompatibility(curZero, newCfgMismatch); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(curZero, newCfgMismatch); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Fatalf("expected ErrSnapshotMismatch for cur.Port=0 vs newCfg.Port=2222, got %v", err)
 	}
 }

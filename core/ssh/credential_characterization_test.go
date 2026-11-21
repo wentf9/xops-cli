@@ -327,8 +327,7 @@ func TestCharacterization_AutoAuth_UpdateAuthFailure_ClosesUnpublishedClient(t *
 	}
 
 	// 确认 client 没有被发布到池中
-	_, hasClient := connector.clients.Get("node-auto-fail")
-	if hasClient {
+	if connector.pool.Count() != 0 {
 		t.Fatal("client was published despite UpdateAuth failure")
 	}
 

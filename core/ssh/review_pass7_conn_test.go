@@ -1180,24 +1180,24 @@ func TestPass7Conn_L1_MultiHopFirstHopProxyCommandSnapshotValidation(t *testing.
 
 	// 1. Unchanged raw provider config (ProxyJump="ignored-upstream") and planned config (ProxyJump="") both pass.
 	rawUnchanged, _ := store.GetConfig("openssh:first")
-	if err := validateTargetCompatibility(cur, rawUnchanged); err != nil {
+	if err := checkTargetDigestCompatibility(cur, rawUnchanged); err != nil {
 		t.Fatalf("unchanged raw provider config failed compatibility check: %v", err)
 	}
 	plannedUnchanged := *firstHop
-	if err := validateTargetCompatibility(cur, &plannedUnchanged); err != nil {
+	if err := checkTargetDigestCompatibility(cur, &plannedUnchanged); err != nil {
 		t.Fatalf("unchanged planned config failed compatibility check: %v", err)
 	}
 
 	// 2. Drifted ProxyCommand on raw provider config AND planned config must fail with ErrSnapshotMismatch.
 	rawDrifted := *rawUnchanged
 	rawDrifted.Options = MustOptions(OptionProxyCommand, "evil-proxy %h %p")
-	if err := validateTargetCompatibility(cur, &rawDrifted); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(cur, &rawDrifted); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Fatalf("drifted ProxyCommand on raw provider config = %v, want ErrSnapshotMismatch", err)
 	}
 
 	plannedDrifted := *firstHop
 	plannedDrifted.Options = MustOptions(OptionProxyCommand, "evil-proxy %h %p")
-	if err := validateTargetCompatibility(cur, &plannedDrifted); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(cur, &plannedDrifted); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Fatalf("drifted ProxyCommand on planned config = %v, want ErrSnapshotMismatch", err)
 	}
 

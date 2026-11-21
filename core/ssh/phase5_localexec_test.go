@@ -495,8 +495,8 @@ func TestPhase5_ConnectorProxyCommand_InMemoryEndToEndAndLifecycle(t *testing.T)
 	_ = changedOpts.Set(OptionProxyCommand, "nc %h %p")
 	changedCfg := *store.configs["web"]
 	changedCfg.Options = changedOpts
-	if compatErr := validateTargetCompatibility(client.ConnectionConfig(), &changedCfg); !errors.Is(compatErr, ErrSnapshotMismatch) {
-		t.Fatalf("validateTargetCompatibility on changed ProxyCommand = %v, want ErrSnapshotMismatch", compatErr)
+	if compatErr := checkTargetDigestCompatibility(client.ConnectionConfig(), &changedCfg); !errors.Is(compatErr, ErrSnapshotMismatch) {
+		t.Fatalf("checkTargetDigestCompatibility on changed ProxyCommand = %v, want ErrSnapshotMismatch", compatErr)
 	}
 
 	if err := conn.CloseAll(); err != nil {

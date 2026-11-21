@@ -237,7 +237,8 @@ func TestKeepAliveJumpTrafficDoesNotHideStalledTarget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jump, ok := connector.clients.Get("node-0")
+	jumpKey := DigestClientConfig(NewClientConfig(*store.cfgs["node-0"]), ZeroHopDigest)
+	jump, ok := connector.pool.Get(jumpKey)
 	if !ok {
 		t.Fatal("jump client missing")
 	}

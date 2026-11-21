@@ -263,7 +263,11 @@ func TestClientWaitClosedTargetPreservesHealthyJump(t *testing.T) {
 	if err := client.Wait(ctx); err == nil {
 		t.Fatal("expected closed target to report connection loss")
 	}
-	jump, ok := connector.clients.Get(connectionRouteKey([]string{"node-0"}, "node-1"))
+	plan, err := connector.resolveConnectionPlan(ctx, "node-2")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan(node-2): %v", err)
+	}
+	jump, ok := connector.pool.Get(plan[1].hopDigest())
 	if !ok {
 		t.Fatal("jump client missing")
 	}
@@ -292,17 +296,21 @@ func TestPoolCleanupBlackholedProxyJump(t *testing.T) {
 					timeout = time.Hour
 				}
 				connector.EnableKeepAlive(ctx, 5*time.Millisecond, timeout)
-				targetKey := connectionRouteKey([]string{"node-0", "node-1"}, "node-2")
-				target, ok := connector.clients.Get(targetKey)
+				plan, err := connector.resolveConnectionPlan(ctx, "node-2")
+				if err != nil {
+					t.Fatalf("resolveConnectionPlan(node-2): %v", err)
+				}
+				targetKey := plan[0].hopDigest()
+				target, ok := connector.pool.Get(targetKey)
 				if !ok {
 					t.Fatal("target missing")
 				}
-				connector.startKeepAliveFor(targetKey, target)
-				entry, ok := connector.keepAlives.Get(targetKey)
-				if !ok {
+				connector.attachKeepAliveLocked(targetKey, target, nil)
+				active, kaDone := target.keepAliveState()
+				if !active || kaDone == nil {
 					t.Fatal("keepalive missing")
 				}
-				t.Cleanup(func() { closeTestResource(t, dialer.conn); <-entry.done })
+				t.Cleanup(func() { closeTestResource(t, dialer.conn); <-kaDone })
 				select {
 				case <-dialer.conn.writeSeen:
 				case <-time.After(time.Second):
@@ -312,7 +320,7 @@ func TestPoolCleanupBlackholedProxyJump(t *testing.T) {
 					cancel()
 				}
 				select {
-				case <-entry.done:
+				case <-kaDone:
 				case <-time.After(time.Second):
 					t.Fatal("pooled keepalive did not exit")
 				}

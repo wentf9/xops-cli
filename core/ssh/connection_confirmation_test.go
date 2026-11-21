@@ -85,7 +85,7 @@ func TestDisconnectedEnrollmentProbeDoesNotPublishTransport(t *testing.T) {
 	if client != nil || !errors.As(err, &connectionErr) || connectionErr.NodeID != "node" {
 		t.Fatalf("disconnected enrollment returned client=%v, error=%v, probe=%v", client != nil, err, provider.probeErr)
 	}
-	if _, published := connector.clients.Get("node"); published {
+	if connector.pool.Count() != 0 {
 		t.Fatal("disconnected enrollment published a pooled transport")
 	}
 	if server.Authenticated.Load() != 1 || server.Executed.Load() != 1 {
@@ -167,7 +167,7 @@ func TestConnectionConfirmationRequiresAuthentication(t *testing.T) {
 				if !errors.Is(err, tc.confirmErr) {
 					t.Fatalf("lost confirmation error: %v", err)
 				}
-				if _, exists := connector.clients.Get("node"); exists {
+				if connector.pool.Count() != 0 {
 					t.Fatal("failed confirmation published an SSH client")
 				}
 				select {

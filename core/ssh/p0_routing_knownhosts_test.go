@@ -23,25 +23,33 @@ import (
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
+func merkleChainDigest(upstream []string, node string) HopDigest {
+	parent := ZeroHopDigest
+	for _, hop := range upstream {
+		parent = DigestClientConfig(&ClientConfig{NodeID: hop}, parent)
+	}
+	return DigestClientConfig(&ClientConfig{NodeID: node}, parent)
+}
+
 func TestP0_ConnectionRouteKeyInjectiveProperty(t *testing.T) {
 	t.Parallel()
 
-	// Direct hops preserve bare nodeName.
-	if got := connectionRouteKey(nil, "jumpB"); got != "jumpB" {
-		t.Fatalf("direct routeKey = %q, want %q", got, "jumpB")
+	// Direct hops bind to ZeroHopDigest.
+	if got := merkleChainDigest(nil, "jumpB"); got != DigestClientConfig(&ClientConfig{NodeID: "jumpB"}, ZeroHopDigest) {
+		t.Fatalf("direct digest mismatch: %s", got)
 	}
-	if got := connectionRouteKey([]string{}, "openssh:jumpB"); got != "openssh:jumpB" {
-		t.Fatalf("empty-slice routeKey = %q, want %q", got, "openssh:jumpB")
+	if got := merkleChainDigest([]string{}, "openssh:jumpB"); got != DigestClientConfig(&ClientConfig{NodeID: "openssh:jumpB"}, ZeroHopDigest) {
+		t.Fatalf("empty-slice digest mismatch: %s", got)
 	}
 
 	// Deterministic equality for identical routes.
-	r1 := connectionRouteKey([]string{"jumpA", "jumpB"}, "target")
-	r2 := connectionRouteKey([]string{"jumpA", "jumpB"}, "target")
+	r1 := merkleChainDigest([]string{"jumpA", "jumpB"}, "target")
+	r2 := merkleChainDigest([]string{"jumpA", "jumpB"}, "target")
 	if r1 != r2 {
-		t.Fatalf("non-deterministic routeKey: %q != %q", r1, r2)
+		t.Fatalf("non-deterministic Merkle digest: %s != %s", r1, r2)
 	}
 
-	// Distinct routes — including adversarial delimiter collisions — must all map to distinct keys.
+	// Distinct routes — including adversarial delimiter collisions — must all map to distinct digests.
 	routes := []struct {
 		upstream []string
 		node     string
@@ -62,11 +70,11 @@ func TestP0_ConnectionRouteKeyInjectiveProperty(t *testing.T) {
 		{[]string{"openssh:first"}, "openssh:second"},
 		{[]string{"openssh:first", "openssh:second"}, "target"},
 	}
-	seen := make(map[string]int, len(routes))
+	seen := make(map[HopDigest]int, len(routes))
 	for i, tc := range routes {
-		key := connectionRouteKey(tc.upstream, tc.node)
+		key := merkleChainDigest(tc.upstream, tc.node)
 		if prev, dup := seen[key]; dup {
-			t.Fatalf("route key collision between case %d (%v -> %q) and case %d (%v -> %q): key=%q",
+			t.Fatalf("Merkle hop digest collision between case %d (%v -> %q) and case %d (%v -> %q): key=%s",
 				prev, routes[prev].upstream, routes[prev].node, i, tc.upstream, tc.node, key)
 		}
 		seen[key] = i
@@ -84,10 +92,18 @@ func newP0SSHFixture(t *testing.T, ctx context.Context, name string) (*sshfixtur
 	return srv, host, port
 }
 
-func assertP0DirectVsChainedPoolIsolation(t *testing.T, connector *Connector, directB, targetClient *Client) {
+func assertP0DirectVsChainedPoolIsolation(t *testing.T, ctx context.Context, connector *Connector, directB, targetClient *Client) {
 	t.Helper()
-	pooledDirectB, okDirect := connector.clients.Get("jumpB")
-	pooledChainedB, okChained := connector.clients.Get(connectionRouteKey([]string{"jumpA"}, "jumpB"))
+	directPlan, err := connector.resolveConnectionPlan(ctx, "jumpB")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan(jumpB): %v", err)
+	}
+	chainedPlan, err := connector.resolveConnectionPlan(ctx, "target")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan(target): %v", err)
+	}
+	pooledDirectB, okDirect := connector.pool.Get(directPlan[0].hopDigest())
+	pooledChainedB, okChained := connector.pool.Get(chainedPlan[1].hopDigest())
 	if !okDirect || !okChained {
 		t.Fatalf("expected both direct (%v) and chained (%v) jumpB entries in pool", okDirect, okChained)
 	}
@@ -157,7 +173,7 @@ func TestP0_ProxyJumpRouteIsolation_DirectVsChained(t *testing.T) {
 	}
 
 	// 3. Direct jumpB and chained jumpB must occupy distinct pool slots with distinct SSHClients.
-	assertP0DirectVsChainedPoolIsolation(t, connector, directB, targetClient)
+	assertP0DirectVsChainedPoolIsolation(t, ctx, connector, directB, targetClient)
 
 	// 4. Subsequent Connect(target) reuses the chained route without re-authenticating.
 	if _, err := connector.Connect(ctx, "target"); err != nil {
@@ -168,13 +184,13 @@ func TestP0_ProxyJumpRouteIsolation_DirectVsChained(t *testing.T) {
 			jumpA.Authenticated.Load(), jumpB.Authenticated.Load(), target.Authenticated.Load())
 	}
 
-	// 5. CloseAll cleans up every route-keyed client and keepalive entry.
+	// 5. CloseAll cleans up every active and retired pooled client.
 	if err := connector.CloseAll(); err != nil {
 		t.Fatalf("CloseAll failed: %v", err)
 	}
-	if connector.clients.Count() != 0 || connector.keepAlives.Count() != 0 {
-		t.Fatalf("expected empty pool/keepAlives after CloseAll, got clients=%d keepAlives=%d",
-			connector.clients.Count(), connector.keepAlives.Count())
+	if connector.pool.Count() != 0 || connector.pool.RetiredCount() != 0 {
+		t.Fatalf("expected empty active/retired pools after CloseAll, got active=%d retired=%d",
+			connector.pool.Count(), connector.pool.RetiredCount())
 	}
 }
 
@@ -436,53 +452,54 @@ func TestP0_ReuseJumpChainedTarget_CascadeEvictsAllDownstreamHops(t *testing.T) 
 	}
 	close(deadA.release)
 
-	rootB := &stubCloseConn{}
-	rootC := &stubCloseConn{}
-	rootT := &stubCloseConn{}
+	rootA := &stubCloseConn{}
 	rootDirectB := &stubCloseConn{}
 
-	keyA := plan[3].poolKey()
-	keyB := plan[2].poolKey()
-	keyC := plan[1].poolKey()
-	keyT := plan[0].poolKey()
-
-	pooledA := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: deadA}}
-	pooledB := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootB}
-	pooledC := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootC}
-	pooledT := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootT}
-	pooledDirectB := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootDirectB}
-
-	connector.clients.Set(keyA, pooledA)
-	connector.clients.Set(keyB, pooledB)
-	connector.clients.Set(keyC, pooledC)
-	connector.clients.Set(keyT, pooledT)
-	connector.clients.Set("jumpB", pooledDirectB) // unrelated direct route to jumpB
+	keyA := plan[3].hopDigest()
+	keyB := plan[2].hopDigest()
+	keyC := plan[1].hopDigest()
+	keyT := plan[0].hopDigest()
+	keyDirectB := DigestClientConfig(NewClientConfig(*store.cfgs["jumpB"]), ZeroHopDigest)
 
 	var kaCanceledB, kaCanceledC, kaCanceledT atomic.Bool
-	connector.keepAlives.Set(keyB, &keepAliveEntry{client: pooledB, cancel: func() { kaCanceledB.Store(true) }})
-	connector.keepAlives.Set(keyC, &keepAliveEntry{client: pooledC, cancel: func() { kaCanceledC.Store(true) }})
-	connector.keepAlives.Set(keyT, &keepAliveEntry{client: pooledT, cancel: func() { kaCanceledT.Store(true) }})
+	pooledA := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: deadA}, RootConn: rootA}
+	pooledB := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootA, parentKey: keyA, kaCancel: func() { kaCanceledB.Store(true) }}
+	pooledC := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootA, parentKey: keyB, kaCancel: func() { kaCanceledC.Store(true) }}
+	pooledT := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootA, parentKey: keyC, kaCancel: func() { kaCanceledT.Store(true) }}
+	pooledDirectB := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootDirectB}
 
-	_, validated, reuseErr := connector.reuseJumpChainedTarget(t.Context(), plan)
-	if !errors.Is(reuseErr, errJumpChainRequired) {
-		t.Fatalf("reuseJumpChainedTarget err = %v, want errJumpChainRequired", reuseErr)
+	if _, err := connector.pool.Publish(keyA, pooledA, nil, nil); err != nil {
+		t.Fatalf("publish A: %v", err)
 	}
-	if validated != nil {
-		t.Fatalf("expected nil validated map after outer hop failure, got %v", validated)
+	if _, err := connector.pool.Publish(keyB, pooledB, pooledA, nil); err != nil {
+		t.Fatalf("publish B: %v", err)
+	}
+	if _, err := connector.pool.Publish(keyC, pooledC, pooledB, nil); err != nil {
+		t.Fatalf("publish C: %v", err)
+	}
+	if _, err := connector.pool.Publish(keyT, pooledT, pooledC, nil); err != nil {
+		t.Fatalf("publish T: %v", err)
+	}
+	if _, err := connector.pool.Publish(keyDirectB, pooledDirectB, nil, nil); err != nil {
+		t.Fatalf("publish directB: %v", err)
+	}
+
+	reused, err := connector.validateCachedChain(t.Context(), plan, connector.pool.SnapshotChain(plan))
+	if !errors.Is(err, errJumpChainRequired) {
+		t.Fatalf("validateCachedChain err = %v, want errJumpChainRequired", err)
+	}
+	if reused != nil {
+		t.Fatalf("expected nil reused client after outer hop failure, got %v", reused)
 	}
 
 	// All hops in the failed chain (jumpA + downstream jumpB, jumpC, target) must be evicted!
-	for name, k := range map[string]string{"jumpA": keyA, "jumpB": keyB, "jumpC": keyC, "target": keyT} {
-		if _, exists := connector.clients.Get(k); exists {
-			t.Errorf("hop %s (%q) remained in c.clients after outer hop jumpA failed", name, k)
-		}
-		if _, exists := connector.keepAlives.Get(k); exists {
-			t.Errorf("hop %s (%q) remained in c.keepAlives after outer hop jumpA failed", name, k)
+	for name, k := range map[string]HopDigest{"jumpA": keyA, "jumpB": keyB, "jumpC": keyC, "target": keyT} {
+		if _, exists := connector.pool.Get(k); exists {
+			t.Errorf("hop %s (%s) remained in pool after outer hop jumpA failed", name, k)
 		}
 	}
-	if !rootB.closed.Load() || !rootC.closed.Load() || !rootT.closed.Load() {
-		t.Fatalf("expected all downstream transports interrupted: B=%v C=%v T=%v",
-			rootB.closed.Load(), rootC.closed.Load(), rootT.closed.Load())
+	if !rootA.closed.Load() {
+		t.Fatal("expected shared chain root transport to be interrupted")
 	}
 	if !kaCanceledB.Load() || !kaCanceledC.Load() || !kaCanceledT.Load() {
 		t.Fatalf("expected all downstream keepalives canceled: B=%v C=%v T=%v",
@@ -490,13 +507,13 @@ func TestP0_ReuseJumpChainedTarget_CascadeEvictsAllDownstreamHops(t *testing.T) 
 	}
 
 	// Unrelated direct route to jumpB must remain untouched!
-	if got, ok := connector.clients.Get("jumpB"); !ok || got != pooledDirectB {
+	if got, ok := connector.pool.Get(keyDirectB); !ok || got != pooledDirectB {
 		t.Fatal("unrelated direct route for jumpB was evicted by chained jumpA failure")
 	}
 	if rootDirectB.closed.Load() {
 		t.Fatal("unrelated direct route for jumpB was interrupted")
 	}
-	connector.clients.Clear()
+	connector.pool.Clear()
 }
 
 func TestP0_ReuseJumpChainedTarget_CascadeEvictsOnlySameRootGeneration(t *testing.T) {
@@ -512,9 +529,9 @@ func TestP0_ReuseJumpChainedTarget_CascadeEvictsOnlySameRootGeneration(t *testin
 	if err != nil {
 		t.Fatalf("resolveConnectionPlan failed: %v", err)
 	}
-	keyA := plan[2].poolKey()
-	keyB := plan[1].poolKey()
-	keyT := plan[0].poolKey()
+	keyA := plan[2].hopDigest()
+	keyB := plan[1].hopDigest()
+	keyT := plan[0].hopDigest()
 
 	deadA := &coordinatedDeadConn{
 		requestSeen: make(chan struct{}),
@@ -526,32 +543,36 @@ func TestP0_ReuseJumpChainedTarget_CascadeEvictsOnlySameRootGeneration(t *testin
 	gen2Root := &physicalSSHConn{Conn: &stubCloseConn{}}
 
 	pooledA := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: deadA}, RootConn: gen1Root}
-	pooledBGen1 := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: gen1Root}
+	pooledBGen1 := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: gen1Root, parentKey: keyA}
 	pooledTGen2 := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: gen2Root}
 
-	connector.clients.Set(keyA, pooledA)
-	connector.clients.Set(keyB, pooledBGen1)
-	connector.clients.Set(keyT, pooledTGen2)
+	if _, err := connector.pool.Publish(keyA, pooledA, nil, nil); err != nil {
+		t.Fatalf("publish A: %v", err)
+	}
+	if _, err := connector.pool.Publish(keyB, pooledBGen1, pooledA, nil); err != nil {
+		t.Fatalf("publish B: %v", err)
+	}
+	if _, err := connector.pool.Publish(keyT, pooledTGen2, nil, nil); err != nil {
+		t.Fatalf("publish T: %v", err)
+	}
 
-	// reuseJumpChainedTarget probes jumpA (gen1) -> fails -> cascade-evicts jumpB (gen1),
-	// MUST NOT evict or interrupt target (gen2), and then reuses target (gen2)!
-	client, _, reuseErr := connector.reuseJumpChainedTarget(t.Context(), plan)
-	if reuseErr != nil {
-		t.Fatalf("expected gen2 target to survive gen1 cascade eviction, got err=%v", reuseErr)
+	// Pure reuse decision MUST reject a chain whose parent/child RootConn generations diverge.
+	if canReuseCachedChain(plan, connector.pool.SnapshotChain(plan)) {
+		t.Fatal("canReuseCachedChain accepted divergent RootConn generations")
 	}
-	if client == nil || client.rootConn != gen2Root {
-		t.Fatalf("expected reused client on gen2Root, got %+v", client)
-	}
-	if _, exists := connector.clients.Get(keyB); exists {
+
+	// Evicting gen1 jumpA cascade-evicts gen1 jumpB while preserving unrelated gen2Root target.
+	connector.pool.Evict(keyA, pooledA, true)
+	if _, exists := connector.pool.Get(keyB); exists {
 		t.Fatal("stale gen1 jumpB was not cascade-evicted")
 	}
-	if got, exists := connector.clients.Get(keyT); !exists || got != pooledTGen2 {
+	if got, exists := connector.pool.Get(keyT); !exists || got != pooledTGen2 {
 		t.Fatal("fresher gen2 target was wrongly evicted by gen1 cascade")
 	}
 	if gen2Root.closed.Load() {
 		t.Fatal("fresher gen2 transport was wrongly interrupted by gen1 cascade")
 	}
-	connector.clients.Clear()
+	connector.pool.Clear()
 }
 
 func TestP0_MuxProxyPublishWrapsPhysicalSSHConn(t *testing.T) {
@@ -599,9 +620,10 @@ func TestP0_MuxProxyPublishWrapsPhysicalSSHConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy Connect(bastion) failed: %v", err)
 	}
-	pooled, ok := proxyConnector.clients.Get("bastion")
+	bastionKey := DigestClientConfig(NewClientConfig(*provider.cfgs["bastion"]), ZeroHopDigest)
+	pooled, ok := proxyConnector.pool.Get(bastionKey)
 	if !ok || pooled == nil {
-		t.Fatal("proxy client was not published to connector.clients")
+		t.Fatal("proxy client was not published to connector.pool")
 	}
 	phys, ok := pooled.RootConn.(*physicalSSHConn)
 	if !ok || phys == nil {
@@ -623,12 +645,14 @@ func TestP0_MuxProxyPublishWrapsPhysicalSSHConn(t *testing.T) {
 	}
 
 	// connectNode must observe proxy.transportClosed() and return errProxyTransportClosed.
+	downstreamCfg := NewClientConfig(ClientConfig{NodeID: "target", Address: "192.0.2.99", Port: 22, User: "fixture", ProxyJump: "bastion"})
 	downstreamNode := connectionPlanNode{
-		name:     "target",
-		routeKey: connectionRouteKey([]string{"bastion"}, "target"),
-		cfg:      &ClientConfig{NodeID: "target", Address: "192.0.2.99", Port: 22, User: "fixture", ProxyJump: "bastion"},
+		name:         "target",
+		parentDigest: bastionKey,
+		digest:       DigestClientConfig(downstreamCfg, bastionKey),
+		cfg:          downstreamCfg,
 	}
-	_, nodeErr := proxyConnector.connectNode(ctx, downstreamNode, proxyDialer, false)
+	_, nodeErr := proxyConnector.connectNode(ctx, downstreamNode, proxyDialer, pooled, false)
 	if !errors.Is(nodeErr, errProxyTransportClosed) {
 		t.Fatalf("connectNode with closed mux proxy dialer = %v, want errProxyTransportClosed", nodeErr)
 	}
@@ -664,8 +688,8 @@ func TestP0_StartKeepAliveFor_OverflowSaturation(t *testing.T) {
 		}
 	}
 
-	// Integration with startKeepAliveFor: huge ServerAliveInterval * ServerAliveCountMax must
-	// saturate without negative timeout or immediate eviction.
+	// Integration with publishPooled keepalive attachment: huge ServerAliveInterval * ServerAliveCountMax
+	// must saturate without negative timeout or immediate eviction.
 	conn := NewConnector(nil)
 	defer func() { _ = conn.CloseAll() }()
 
@@ -675,24 +699,26 @@ func TestP0_StartKeepAliveFor_OverflowSaturation(t *testing.T) {
 		OptionServerAliveInterval, strconv.Itoa(math.MaxInt32),
 		OptionServerAliveCountMax, "100",
 	)
-	cfg := &ClientConfig{NodeID: "overflow-node", Options: opts}
+	cfg := NewClientConfig(ClientConfig{NodeID: "overflow-node", Options: opts})
 	pooled := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: &coordinatedHealthyConn{
 		requestSeen: make(chan struct{}),
 		release:     make(chan struct{}),
 	}}}
-	conn.clients.Set("overflow-node", pooled)
-	conn.startKeepAliveFor("overflow-node", pooled, cfg)
+	nodeKey := DigestClientConfig(cfg, ZeroHopDigest)
+	if _, err := conn.publishPooled(nodeKey, pooled, nil, cfg); err != nil {
+		t.Fatalf("publishPooled failed: %v", err)
+	}
 
-	entry, ok := conn.keepAlives.Get("overflow-node")
-	if !ok || entry == nil {
-		t.Fatal("expected keepalive entry to be registered")
+	active, kaDone := pooled.keepAliveState()
+	if !active || kaDone == nil {
+		t.Fatal("expected keepalive to be attached on published client")
 	}
 	select {
-	case <-entry.done:
+	case <-kaDone:
 		t.Fatal("keepalive exited immediately (possible negative timeout overflow)")
 	case <-time.After(30 * time.Millisecond):
 	}
-	if _, stillCached := conn.clients.Get("overflow-node"); !stillCached {
+	if _, stillCached := conn.pool.Get(nodeKey); !stillCached {
 		t.Fatal("client was evicted immediately due to keepalive duration overflow")
 	}
 }
@@ -847,14 +873,14 @@ func TestP0_ValidateTargetCompatibility_BaseHost(t *testing.T) {
 
 	// Exact match succeeds.
 	same := base
-	if err := validateTargetCompatibility(cur, &same); err != nil {
+	if err := checkTargetDigestCompatibility(cur, &same); err != nil {
 		t.Fatalf("identical BaseHost unexpectedly failed: %v", err)
 	}
 
 	// Trimmed whitespace match succeeds.
 	padded := base
 	padded.BaseHost = "  10.0.0.10 \t"
-	if err := validateTargetCompatibility(cur, &padded); err != nil {
+	if err := checkTargetDigestCompatibility(cur, &padded); err != nil {
 		t.Fatalf("whitespace-padded identical BaseHost unexpectedly failed: %v", err)
 	}
 
@@ -874,13 +900,10 @@ func TestP0_ValidateTargetCompatibility_BaseHost(t *testing.T) {
 			cCfg.BaseHost = tc.curBase
 			nCfg := base
 			nCfg.BaseHost = tc.newBase
-			err := validateTargetCompatibility(cCfg, &nCfg)
+			err := checkTargetDigestCompatibility(cCfg, &nCfg)
 			if !errors.Is(err, ErrSnapshotMismatch) {
-				t.Fatalf("validateTargetCompatibility(cur=%q, new=%q) = %v, want ErrSnapshotMismatch",
+				t.Fatalf("checkTargetDigestCompatibility(cur=%q, new=%q) = %v, want ErrSnapshotMismatch",
 					tc.curBase, tc.newBase, err)
-			}
-			if !strings.Contains(err.Error(), "base host changed") {
-				t.Fatalf("unexpected error message %q, want 'base host changed'", err.Error())
 			}
 		})
 	}

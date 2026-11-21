@@ -282,7 +282,7 @@ func TestRound7_P1_2_ConnectorRoutingCompatibilityAndCapturePlan(t *testing.T) {
 		t.Fatalf("intermediate OriginalProxyJump clobbered: got (%q, %v)", planMulti[2].cfg.OriginalProxyJump, planMulti[2].cfg.HasOriginalProxyJump)
 	}
 
-	// TargetContext & validateRoutingTargetCompatibility on " , " + ProxyCommand.
+	// TargetContext & checkTargetDigestCompatibility on " , " + ProxyCommand.
 	planDisabled, err := conn.resolveConnectionPlan(t.Context(), "target")
 	if err != nil {
 		t.Fatalf("resolveConnectionPlan(target): %v", err)
@@ -292,12 +292,12 @@ func TestRound7_P1_2_ConnectorRoutingCompatibilityAndCapturePlan(t *testing.T) {
 		t.Fatalf("buildTargetContext().JumpHost = %q, want empty after normalization", tc.JumpHost)
 	}
 	curCfg := planDisabled[0].cfg.ToConnectionConfig()
-	if err := validateRoutingTargetCompatibility(curCfg, store.configs["target"]); err != nil {
+	if err := checkTargetDigestCompatibility(curCfg, store.configs["target"]); err != nil {
 		t.Fatalf("unchanged disabled ProxyJump compatibility failed: %v", err)
 	}
 	driftedCmd := *store.configs["target"]
 	driftedCmd.Options = MustOptions(OptionProxyCommand, "nc -X 5 %h %p")
-	if err := validateRoutingTargetCompatibility(curCfg, &driftedCmd); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(curCfg, &driftedCmd); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Fatalf("expected ErrSnapshotMismatch on ProxyCommand drift under ProxyJump=' , ', got %v", err)
 	}
 

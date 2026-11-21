@@ -104,7 +104,7 @@ func TestExplicitKeyAndTrustSources(t *testing.T) {
 				if !errors.Is(err, marker) {
 					t.Fatalf("source error lost: %v", err)
 				}
-				if client != nil || connector.clients.Count() != 0 {
+				if client != nil || connector.pool.Count() != 0 {
 					t.Fatal("failed authentication material published a client")
 				}
 			}

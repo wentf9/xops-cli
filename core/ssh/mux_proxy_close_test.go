@@ -280,7 +280,10 @@ func TestJumpHopProbeSurvivesCallerCancellation(t *testing.T) {
 		}
 	}()
 	defer releaseHopProbe()
-	connector.clients.Set("jump", &PooledClient{SSHClient: &cryptoSSH.Client{Conn: hopConn}})
+	jumpKey := DigestClientConfig(NewClientConfig(*provider.cfgs["jump"]), ZeroHopDigest)
+	if _, err := connector.pool.Publish(jumpKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: hopConn}}, nil, nil); err != nil {
+		t.Fatalf("publish jump failed: %v", err)
+	}
 
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)

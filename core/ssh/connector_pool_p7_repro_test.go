@@ -1,5 +1,3 @@
-//go:build p7repro
-
 package ssh
 
 import (
@@ -134,12 +132,11 @@ func newP7FirstTargetBarrierTrust() (*p7BarrierTrust, <-chan struct{}, chan stru
 	return trust, entered, release
 }
 
-// TestP7Repro_H5_MultiHopSingleflightExcludesUpstreamConfig reproduces H5 part 1:
-// connectPlannedNode constructs sfKey from routeKey (node names only) + targetCompatDigest(target.cfg),
-// excluding upstream hop configurations. When an upstream bastion's config drifts while Caller 1 is
-// mid-handshake to target, Caller 2 (resolved with bastionV2) coalesces onto Caller 1's singleflight
-// (inside reuseJumpChainedTarget's target connectPlannedNode) and receives Caller 1's bastionV1
-// transport without ever dialing bastionV2.
+// TestP7Repro_H5_MultiHopSingleflightExcludesUpstreamConfig verifies H5 part 1:
+// Merkle HopDigest includes every upstream hop configuration recursively. When an upstream
+// bastion's config drifts while Caller 1 is mid-handshake to target, Caller 2 (resolved with
+// bastionV2) gets a distinct HopDigest and completes independently over bastionV2 without
+// coalescing onto Caller 1's bastionV1 singleflight.
 func TestP7Repro_H5_MultiHopSingleflightExcludesUpstreamConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -226,10 +223,12 @@ func TestP7Repro_H5_MultiHopSingleflightExcludesUpstreamConfig(t *testing.T) {
 	}
 }
 
-// TestP7Repro_H5_ReuseJumpChainedTarget_StaleParentRootConn reproduces H5 part 2:
-// When a slow Caller 1 publishes target riding on retired bastionV1 after jump has already
-// upgraded to bastionV2, reuseJumpChainedTarget validates jump(bastionV2) and then reuses
-// cached target without checking that target's RootConn matches parent jump's current RootConn.
+// TestP7Repro_H5_ReuseJumpChainedTarget_StaleParentRootConn verifies H5 part 2:
+//  1. When a slow Caller 1 finishes target over bastionV1 after jump upgraded to bastionV2,
+//     Merkle HopDigest separates jump(v1)->target from jump(v2)->target so Caller 3 never reuses
+//     the stale bastionV1 target.
+//  2. When a jump keeps the same HopDigest but reconnects to a newer RootConn generation,
+//     CAS pool.Publish rejects a stale-parent child with errStaleParentGeneration and closes it.
 func TestP7Repro_H5_ReuseJumpChainedTarget_StaleParentRootConn(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
@@ -327,11 +326,56 @@ func TestP7Repro_H5_ReuseJumpChainedTarget_StaleParentRootConn(t *testing.T) {
 	if err := runFixtureSessionCheck(c3); err != nil {
 		t.Fatalf("H5 reproduced: Caller 3 died when retired bastionV1 closed (pool poisoned by stale parent RootConn): %v", err)
 	}
+
+	// Same-digest parent generation CAS check: if jump is replaced with a newer RootConn under
+	// the exact same HopDigest, Publish MUST reject a child bound to the displaced parent and close it.
+	t.Run("same_digest_stale_parent_cas_rejected", assertSameDigestStaleParentCASRejected)
 }
 
-// TestP7Repro_H6_PublishClientOverwriteLeaksDisplacedOnCloseAll reproduces H6 part 1:
-// publishClient overwrites c.clients[nodeName] without retiring the displaced *PooledClient,
-// so Connector.CloseAll never closes the displaced transport.
+func assertSameDigestStaleParentCASRejected(t *testing.T) {
+	casConn := newTestConnector(&mockConfigStore{})
+	t.Cleanup(func() { _ = casConn.CloseAll() })
+
+	jumpKey := DigestClientConfig(&ClientConfig{NodeID: "jump", Address: "10.0.0.1", Port: 22}, ZeroHopDigest)
+	targetKey := DigestClientConfig(&ClientConfig{NodeID: "target", Address: "10.0.0.2", Port: 22, ProxyJump: "jump"}, jumpKey)
+
+	rootV1 := &physicalSSHConn{Conn: &stubCloseConn{}}
+	rootV2 := &physicalSSHConn{Conn: &stubCloseConn{}}
+	parentV1 := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: &closeResultConn{}}, RootConn: rootV1}
+	parentV2 := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: &closeResultConn{}}, RootConn: rootV2}
+
+	if _, err := casConn.pool.Publish(jumpKey, parentV1, nil, nil); err != nil {
+		t.Fatalf("publish parentV1: %v", err)
+	}
+	if _, err := casConn.pool.Publish(jumpKey, parentV2, nil, nil); err != nil {
+		t.Fatalf("publish parentV2: %v", err)
+	}
+
+	staleChildHop := &stubCloseConn{}
+	staleChildSSH := &closeResultConn{}
+	staleChild := &PooledClient{
+		SSHClient: &cryptoSSH.Client{Conn: staleChildSSH},
+		RootConn:  rootV1,
+		hopConn:   staleChildHop,
+		parentKey: jumpKey,
+	}
+	if _, err := casConn.pool.Publish(targetKey, staleChild, parentV1, nil); !errors.Is(err, errStaleParentGeneration) {
+		t.Fatalf("CAS Publish with stale parent = %v, want errStaleParentGeneration", err)
+	}
+	if _, exists := casConn.pool.Get(targetKey); exists {
+		t.Fatal("stale-parent child was published into pool")
+	}
+	if !staleChildHop.closed.Load() && staleChildSSH.calls.Load() == 0 {
+		t.Fatal("rejected stale-parent child was not closed")
+	}
+	if rootV1.closed.Load() {
+		t.Fatal("rejecting stale child must not interrupt retired parentV1's shared RootConn")
+	}
+}
+
+// TestP7Repro_H6_PublishClientOverwriteLeaksDisplacedOnCloseAll verifies H6 part 1:
+// Pool Publish atomically retires any displaced *PooledClient so Connector.CloseAll closes
+// both active and displaced transports with zero leaks.
 func TestP7Repro_H6_PublishClientOverwriteLeaksDisplacedOnCloseAll(t *testing.T) {
 	t.Run("via_connect_overwrite", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
@@ -416,21 +460,22 @@ func TestP7Repro_H6_PublishClientOverwriteLeaksDisplacedOnCloseAll(t *testing.T)
 		}
 		for i, conn := range conns {
 			if !conn.closed.Load() {
-				t.Errorf("H6 reproduced: dialed transport #%d was displaced by publishClient overwrite and leaked unclosed after CloseAll", i+1)
+				t.Errorf("H6 reproduced: dialed transport #%d was displaced and leaked unclosed after CloseAll", i+1)
 			}
 		}
 	})
 
-	t.Run("direct_publishClient_overwrite", func(t *testing.T) {
+	t.Run("direct_pool_publish_overwrite", func(t *testing.T) {
 		connector := newTestConnector(&mockConfigStore{})
 		conn1 := &closeResultConn{}
 		conn2 := &closeResultConn{}
+		nodeKey := DigestClientConfig(&ClientConfig{NodeID: "node-1"}, ZeroHopDigest)
 
-		if err := connector.publishClient("node-1", &PooledClient{SSHClient: &cryptoSSH.Client{Conn: conn1}}); err != nil {
-			t.Fatalf("first publishClient failed: %v", err)
+		if _, err := connector.pool.Publish(nodeKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: conn1}}, nil, nil); err != nil {
+			t.Fatalf("first pool.Publish failed: %v", err)
 		}
-		if err := connector.publishClient("node-1", &PooledClient{SSHClient: &cryptoSSH.Client{Conn: conn2}}); err != nil {
-			t.Fatalf("second publishClient failed: %v", err)
+		if _, err := connector.pool.Publish(nodeKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: conn2}}, nil, nil); err != nil {
+			t.Fatalf("second pool.Publish failed: %v", err)
 		}
 		if err := connector.CloseAll(); err != nil {
 			t.Fatalf("CloseAll failed: %v", err)
@@ -441,56 +486,75 @@ func TestP7Repro_H6_PublishClientOverwriteLeaksDisplacedOnCloseAll(t *testing.T)
 	})
 }
 
-// TestP7Repro_H6_StartKeepAliveForCancelsLiveClientKeepAlive reproduces H6 part 2:
-// startKeepAliveFor unconditionally pops and cancels c.keepAlives[nodeName] without verifying
-// that the caller's client is still the active pool entry, so a delayed stale caller cancels
-// the live pooled client's keepalive.
+// TestP7Repro_H6_StartKeepAliveForCancelsLiveClientKeepAlive verifies H6 part 2:
+// Keepalive lifecycle is owned directly by PooledClient and started atomically at pool.Publish,
+// so displacing an old client stops only the displaced client's keepalive and a rejected stale
+// publish cannot cancel the live pooled client's keepalive.
 func TestP7Repro_H6_StartKeepAliveForCancelsLiveClientKeepAlive(t *testing.T) {
 	c := newKeepAliveTestConnector(t, 40*time.Millisecond, 200*time.Millisecond)
 
 	staleSSH := startHealthyServer(t)
 	liveSSH := startHealthyServer(t)
+	rejectedSSH := startHealthyServer(t)
 	t.Cleanup(func() {
 		_ = staleSSH.Close()
 		_ = liveSSH.Close()
+		_ = rejectedSSH.Close()
 	})
 
+	nodeKey := DigestClientConfig(&ClientConfig{NodeID: "node-1"}, ZeroHopDigest)
+	childKey := DigestClientConfig(&ClientConfig{NodeID: "child-1", ProxyJump: "node-1"}, nodeKey)
 	stalePooled := &PooledClient{SSHClient: staleSSH}
 	livePooled := &PooledClient{SSHClient: liveSSH}
 
-	// Simulate concurrent publish race: stalePooled published first, livePooled overwrote it
-	// and started its keepalive before stalePooled's delayed startKeepAliveFor executes.
-	if err := c.publishClient("node-1", stalePooled); err != nil {
+	if _, err := c.publishPooled(nodeKey, stalePooled, nil, nil); err != nil {
 		t.Fatalf("publish stalePooled failed: %v", err)
 	}
-	if err := c.publishClient("node-1", livePooled); err != nil {
+	_, staleDone := stalePooled.keepAliveState()
+
+	if _, err := c.publishPooled(nodeKey, livePooled, nil, nil); err != nil {
 		t.Fatalf("publish livePooled failed: %v", err)
 	}
-	c.startKeepAliveFor("node-1", livePooled)
 
-	liveEntry, ok := c.keepAlives.Get("node-1")
-	if !ok || liveEntry == nil || liveEntry.client != livePooled {
-		t.Fatalf("expected livePooled keepalive registered before stale call, got ok=%v entry=%v", ok, liveEntry)
+	// Displaced client's keepalive must stop promptly while live client's keepalive stays active.
+	select {
+	case <-staleDone:
+	case <-time.After(time.Second):
+		t.Fatal("displaced stalePooled keepalive did not stop after replacement")
 	}
 
-	// Delayed stale caller now runs startKeepAliveFor for stalePooled.
-	c.startKeepAliveFor("node-1", stalePooled)
+	liveActive, liveDone := livePooled.keepAliveState()
+	if !liveActive || liveDone == nil {
+		t.Fatal("expected livePooled keepalive running after publish")
+	}
+
+	// A delayed stale-parent publish must be rejected without touching livePooled's keepalive.
+	rejectedChild := &PooledClient{SSHClient: rejectedSSH, parentKey: nodeKey}
+	if _, err := c.publishPooled(childKey, rejectedChild, stalePooled, nil); !errors.Is(err, errStaleParentGeneration) {
+		t.Fatalf("expected errStaleParentGeneration for stale child publish, got %v", err)
+	}
 
 	select {
-	case <-liveEntry.done:
-		t.Fatalf("H6 reproduced: delayed startKeepAliveFor(stalePooled) canceled the live pooled client's keepalive")
+	case <-liveDone:
+		t.Fatal("H6 reproduced: stale publish canceled the live pooled client's keepalive")
 	case <-time.After(120 * time.Millisecond):
 	}
 
-	curEntry, ok := c.keepAlives.Get("node-1")
-	if !ok || curEntry.client != livePooled {
-		t.Fatalf("H6 reproduced: keepAlives[node-1] client replaced with stale client (ok=%v)", ok)
+	cur, ok := c.pool.Get(nodeKey)
+	if !ok || cur != livePooled {
+		t.Fatalf("H6 reproduced: active pool entry replaced unexpectedly (ok=%v)", ok)
+	}
+	if active, _ := livePooled.keepAliveState(); !active {
+		t.Fatal("H6 reproduced: livePooled keepalive is no longer active")
+	}
+	if active, _ := rejectedChild.keepAliveState(); active {
+		t.Fatal("rejected stale child unexpectedly started a keepalive")
 	}
 }
 
-// TestP7Repro_MED1_ControlOptionsIgnoredInCompatDigestAndValidation reproduces MED-1:
-// targetCompatDigest and validateTargetCompatibility omit ControlMaster, ControlPath, and ControlPersist,
-// allowing incompatible Control* updates to coalesce or reuse a mismatched cached connection.
+// TestP7Repro_MED1_ControlOptionsIgnoredInCompatDigestAndValidation verifies MED-1:
+// DigestClientConfig and checkTargetDigestCompatibility include ControlMaster, ControlPath,
+// and ControlPersist so Control* drift changes the digest and forces a fresh connection.
 func TestP7Repro_MED1_ControlOptionsIgnoredInCompatDigestAndValidation(t *testing.T) {
 	baseCfg := func() *ClientConfig {
 		return &ClientConfig{
@@ -517,23 +581,23 @@ func TestP7Repro_MED1_ControlOptionsIgnoredInCompatDigestAndValidation(t *testin
 		{name: "ControlPersist", key: OptionControlPersist, value: "10m"},
 	}
 
-	t.Run("targetCompatDigest", func(t *testing.T) {
+	t.Run("DigestClientConfig", func(t *testing.T) {
 		orig := baseCfg()
-		origDigest := targetCompatDigest(orig)
+		origDigest := DigestClientConfig(orig, ZeroHopDigest)
 		for _, tc := range cases {
 			t.Run(tc.name, func(t *testing.T) {
 				mut := baseCfg()
 				if err := mut.Options.Set(tc.key, tc.value); err != nil {
 					t.Fatalf("Options.Set(%s, %q) failed: %v", tc.key, tc.value, err)
 				}
-				if got := targetCompatDigest(mut); got == origDigest {
-					t.Fatalf("MED-1 reproduced: targetCompatDigest ignored %s change (%q); digest unchanged (%s)", tc.name, tc.value, got)
+				if got := DigestClientConfig(mut, ZeroHopDigest); got == origDigest {
+					t.Fatalf("MED-1 reproduced: DigestClientConfig ignored %s change (%q); digest unchanged (%s)", tc.name, tc.value, got)
 				}
 			})
 		}
 	})
 
-	t.Run("validateTargetCompatibility", func(t *testing.T) {
+	t.Run("checkTargetDigestCompatibility", func(t *testing.T) {
 		orig := baseCfg()
 		cur := orig.ToConnectionConfig()
 		for _, tc := range cases {
@@ -542,8 +606,8 @@ func TestP7Repro_MED1_ControlOptionsIgnoredInCompatDigestAndValidation(t *testin
 				if err := mut.Options.Set(tc.key, tc.value); err != nil {
 					t.Fatalf("Options.Set(%s, %q) failed: %v", tc.key, tc.value, err)
 				}
-				if err := validateTargetCompatibility(cur, mut); !errors.Is(err, ErrSnapshotMismatch) {
-					t.Fatalf("MED-1 reproduced: validateTargetCompatibility ignored %s drift (%q): got err=%v, want ErrSnapshotMismatch", tc.name, tc.value, err)
+				if err := checkTargetDigestCompatibility(cur, mut); !errors.Is(err, ErrSnapshotMismatch) {
+					t.Fatalf("MED-1 reproduced: checkTargetDigestCompatibility ignored %s drift (%q): got err=%v, want ErrSnapshotMismatch", tc.name, tc.value, err)
 				}
 			})
 		}

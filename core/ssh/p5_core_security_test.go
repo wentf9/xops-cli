@@ -335,11 +335,17 @@ func TestP5_3_1_RecursiveMultiHopProxyJump_PlanAndCapturePlan(t *testing.T) {
 			t.Fatalf("plan[%d].OriginalProxyJump = %q, want %q", i, resolved[i].cfg.OriginalProxyJump, wantOrigJump[i])
 		}
 	}
+	if !resolved[len(resolved)-1].parentDigest.IsZero() {
+		t.Fatalf("outermost hop %q must have ZeroHopDigest parent, got %s", resolved[len(resolved)-1].name, resolved[len(resolved)-1].parentDigest)
+	}
 	for i := len(resolved) - 1; i > 0; i-- {
-		parentKey := resolved[i].poolKey()
-		childKey := resolved[i-1].poolKey()
-		if !isDownstreamRouteKey(parentKey, childKey) {
-			t.Fatalf("expected %q (%s) to be downstream of %q (%s)", resolved[i-1].name, childKey, resolved[i].name, parentKey)
+		parentKey := resolved[i].hopDigest()
+		child := resolved[i-1]
+		if child.parentDigest != parentKey {
+			t.Fatalf("expected %q parentDigest=%s to match parent %q digest=%s", child.name, child.parentDigest, resolved[i].name, parentKey)
+		}
+		if child.hopDigest() == parentKey {
+			t.Fatalf("child %q digest collided with parent %q digest (%s)", child.name, resolved[i].name, parentKey)
 		}
 	}
 
@@ -410,7 +416,7 @@ func TestP5_3_1_RecursiveMultiHopProxyJump_CycleDetection(t *testing.T) {
 	}
 }
 
-// --- Finding 3.2: Singleflight digest, validateTargetCompatibility, reload fail-closed, cascade eviction ---
+// --- Finding 3.2: Singleflight digest, target digest compatibility, reload fail-closed, cascade eviction ---
 
 type p5SequenceProvider struct {
 	mu   sync.Mutex
@@ -453,8 +459,8 @@ func TestP5_3_2_SingleflightDoesNotCoalesceDifferingConfigs(t *testing.T) {
 
 	cfgV1 := &ClientConfig{NodeID: "n1", Address: "127.0.0.1", Port: 22, User: "u", AuthType: "password", Password: "p", TrustVersion: "v1"}
 	cfgV2 := &ClientConfig{NodeID: "n1", Address: "127.0.0.1", Port: 22, User: "u", AuthType: "password", Password: "p", TrustVersion: "v2"}
-	if targetCompatDigest(cfgV1) == targetCompatDigest(cfgV2) {
-		t.Fatal("targetCompatDigest must differ across TrustVersion")
+	if DigestClientConfig(cfgV1, ZeroHopDigest) == DigestClientConfig(cfgV2, ZeroHopDigest) {
+		t.Fatal("DigestClientConfig must differ across TrustVersion")
 	}
 
 	dialer := &p5GateDialer{firstEntered: make(chan struct{}), release: make(chan struct{})}
@@ -513,7 +519,7 @@ func TestP5_3_2_ValidateTargetCompatibility_AuthAndNewOptions(t *testing.T) {
 		),
 	}
 	cur := baseCfg.ToConnectionConfig()
-	if err := validateTargetCompatibility(cur, baseCfg); err != nil {
+	if err := checkTargetDigestCompatibility(cur, baseCfg); err != nil {
 		t.Fatalf("identical config failed compatibility: %v", err)
 	}
 
@@ -525,13 +531,13 @@ func TestP5_3_2_ValidateTargetCompatibility_AuthAndNewOptions(t *testing.T) {
 	for _, allowed := range []string{"auto", "password"} {
 		cand := autoBase
 		cand.AuthType = allowed
-		if err := validateTargetCompatibility(autoCur, &cand); err != nil {
+		if err := checkTargetDigestCompatibility(autoCur, &cand); err != nil {
 			t.Fatalf("auto->password snapshot should accept %q, got %v", allowed, err)
 		}
 	}
 	autoToKey := autoBase
 	autoToKey.AuthType = "key"
-	if err := validateTargetCompatibility(autoCur, &autoToKey); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(autoCur, &autoToKey); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Fatalf("auto->password snapshot must reject explicit key, got %v", err)
 	}
 
@@ -551,17 +557,17 @@ func TestP5_3_2_ValidateTargetCompatibility_AuthAndNewOptions(t *testing.T) {
 		{"StreamLocalBindUnlink", func(c *ClientConfig) { _ = c.Options.Set(OptionStreamLocalBindUnlink, "yes") }},
 		{"StreamLocalBindMask", func(c *ClientConfig) { _ = c.Options.Set(OptionStreamLocalBindMask, "0111") }},
 	}
-	baseDigest := targetCompatDigest(baseCfg)
+	baseDigest := DigestClientConfig(baseCfg, ZeroHopDigest)
 	for _, tc := range mutations {
 		t.Run(tc.name, func(t *testing.T) {
 			cand := *baseCfg
 			cand.Options = baseCfg.Options.Clone()
 			tc.mutate(&cand)
-			if err := validateTargetCompatibility(cur, &cand); !errors.Is(err, ErrSnapshotMismatch) {
+			if err := checkTargetDigestCompatibility(cur, &cand); !errors.Is(err, ErrSnapshotMismatch) {
 				t.Fatalf("%s: expected ErrSnapshotMismatch, got %v", tc.name, err)
 			}
-			if targetCompatDigest(&cand) == baseDigest {
-				t.Fatalf("%s: targetCompatDigest did not change", tc.name)
+			if DigestClientConfig(&cand, ZeroHopDigest) == baseDigest {
+				t.Fatalf("%s: DigestClientConfig did not change", tc.name)
 			}
 		})
 	}
@@ -612,7 +618,7 @@ func TestP5_3_2_ReloadConfigAfterRecording_FailClosedOnDeletedNode(t *testing.T)
 	if err == nil || !strings.Contains(err.Error(), "node deleted concurrently") {
 		t.Fatalf("expected fail-closed error when node deleted during handshake, got %v", err)
 	}
-	if _, ok := conn.clients.Get("ephemeral"); ok {
+	if conn.pool.Count() != 0 {
 		t.Fatal("deleted node client must not be published into pool")
 	}
 }
@@ -635,71 +641,96 @@ func TestP5_3_2_CascadeEvictionAndRetireDownstream(t *testing.T) {
 		newGenConn := &coordinatedHealthyConn{requestSeen: make(chan struct{}), release: make(chan struct{})}
 		otherConn := &coordinatedHealthyConn{requestSeen: make(chan struct{}), release: make(chan struct{})}
 
+		bastionKey := DigestClientConfig(NewClientConfig(*store.cfg), ZeroHopDigest)
+		childKey := DigestClientConfig(&ClientConfig{NodeID: "target"}, bastionKey)
+		newGenKey := DigestClientConfig(&ClientConfig{NodeID: "fresh"}, bastionKey)
+		unrelatedKey := DigestClientConfig(&ClientConfig{NodeID: "unrelated"}, ZeroHopDigest)
+
 		bastionClient := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: deadBastionConn}, RootConn: rootOld}
-		childKey := connectionRouteKey([]string{"bastion"}, "target")
-		newGenKey := connectionRouteKey([]string{"bastion"}, "fresh")
-		conn.clients.Set("bastion", bastionClient)
-		conn.clients.Set(childKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: childConn}, RootConn: rootOld})
-		conn.clients.Set(newGenKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: newGenConn}, RootConn: rootNew})
-		conn.clients.Set("unrelated", &PooledClient{SSHClient: &cryptoSSH.Client{Conn: otherConn}})
+		if _, err := conn.pool.Publish(bastionKey, bastionClient, nil, nil); err != nil {
+			t.Fatalf("publish bastion: %v", err)
+		}
+		if _, err := conn.pool.Publish(childKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: childConn}, RootConn: rootOld, parentKey: bastionKey}, bastionClient, nil); err != nil {
+			t.Fatalf("publish child: %v", err)
+		}
+		if _, err := conn.pool.Publish(newGenKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: newGenConn}, RootConn: rootNew}, nil, nil); err != nil {
+			t.Fatalf("publish newGen: %v", err)
+		}
+		if _, err := conn.pool.Publish(unrelatedKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: otherConn}}, nil, nil); err != nil {
+			t.Fatalf("publish unrelated: %v", err)
+		}
 
 		_, err := conn.Connect(t.Context(), "bastion")
 		if err == nil {
 			t.Fatal("expected dead bastion reconnect to fail on port 1")
 		}
-		if _, ok := conn.clients.Get(childKey); ok {
+		if _, ok := conn.pool.Get(childKey); ok {
 			t.Fatal("downstream hop on dead RootConn was not cascade-evicted")
 		}
 		if childConn.closeCount.Load() == 0 {
 			t.Fatal("cascade-evicted downstream hop was not interrupted")
 		}
-		if _, ok := conn.clients.Get(newGenKey); !ok {
+		if _, ok := conn.pool.Get(newGenKey); !ok {
 			t.Fatal("downstream hop on newer RootConn generation was erroneously evicted")
 		}
-		if _, ok := conn.clients.Get("unrelated"); !ok {
+		if _, ok := conn.pool.Get(unrelatedKey); !ok {
 			t.Fatal("unrelated cached route was erroneously evicted")
 		}
 	})
 
-	t.Run("evictDeadClient_cascades_downstream", func(t *testing.T) {
+	t.Run("evict_cascades_downstream", func(t *testing.T) {
 		conn := newTestConnector(nil)
 		t.Cleanup(func() { _ = conn.CloseAll() })
 
 		root, peer := net.Pipe()
 		defer func() { _ = peer.Close() }()
+		jumpKey := DigestClientConfig(&ClientConfig{NodeID: "jump"}, ZeroHopDigest)
+		childKey := DigestClientConfig(&ClientConfig{NodeID: "app"}, jumpKey)
 		deadParent := &PooledClient{SSHClient: &cryptoSSH.Client{Conn: &coordinatedDeadConn{}}, RootConn: root}
 		childConn := &coordinatedHealthyConn{}
-		childKey := connectionRouteKey([]string{"jump"}, "app")
-		conn.clients.Set("jump", deadParent)
-		conn.clients.Set(childKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: childConn}, RootConn: root})
+		if _, err := conn.pool.Publish(jumpKey, deadParent, nil, nil); err != nil {
+			t.Fatalf("publish jump: %v", err)
+		}
+		if _, err := conn.pool.Publish(childKey, &PooledClient{SSHClient: &cryptoSSH.Client{Conn: childConn}, RootConn: root, parentKey: jumpKey}, deadParent, nil); err != nil {
+			t.Fatalf("publish child: %v", err)
+		}
 
-		entry := &keepAliveEntry{client: deadParent, cancel: func() {}}
-		conn.evictDeadClient("jump", deadParent, entry)
+		conn.pool.Evict(jumpKey, deadParent, true)
 
-		if _, ok := conn.clients.Get(childKey); ok {
-			t.Fatal("evictDeadClient did not cascade-evict downstream hop")
+		if _, ok := conn.pool.Get(childKey); ok {
+			t.Fatal("pool.Evict did not cascade-evict downstream hop")
 		}
 		if childConn.closeCount.Load() == 0 {
-			t.Fatal("evictDeadClient did not interrupt downstream hop")
+			t.Fatal("pool.Evict did not interrupt downstream hop")
 		}
 	})
 
-	t.Run("retireDownstreamGeneration_handles_nil_RootConn", func(t *testing.T) {
+	t.Run("retire_handles_nil_RootConn", func(t *testing.T) {
 		conn := newTestConnector(nil)
 		t.Cleanup(func() { _ = conn.CloseAll() })
 
+		jumpKey := DigestClientConfig(&ClientConfig{NodeID: "jump"}, ZeroHopDigest)
+		childKey := DigestClientConfig(&ClientConfig{NodeID: "app"}, jumpKey)
+		otherKey := DigestClientConfig(&ClientConfig{NodeID: "other"}, ZeroHopDigest)
+
 		displaced := &PooledClient{SSHClient: &cryptoSSH.Client{}} // RootConn == nil
-		childKey := connectionRouteKey([]string{"jump"}, "app")
-		conn.clients.Set(childKey, &PooledClient{SSHClient: &cryptoSSH.Client{}})
-		conn.clients.Set("other", &PooledClient{SSHClient: &cryptoSSH.Client{}})
-
-		conn.retireDownstreamGeneration("jump", displaced)
-
-		if _, ok := conn.clients.Get(childKey); ok {
-			t.Fatal("retireDownstreamGeneration skipped downstream hop when displaced.RootConn == nil")
+		if _, err := conn.pool.Publish(jumpKey, displaced, nil, nil); err != nil {
+			t.Fatalf("publish jump: %v", err)
 		}
-		if _, ok := conn.clients.Get("other"); !ok {
-			t.Fatal("retireDownstreamGeneration retired unrelated hop")
+		if _, err := conn.pool.Publish(childKey, &PooledClient{SSHClient: &cryptoSSH.Client{}, parentKey: jumpKey}, displaced, nil); err != nil {
+			t.Fatalf("publish child: %v", err)
+		}
+		if _, err := conn.pool.Publish(otherKey, &PooledClient{SSHClient: &cryptoSSH.Client{}}, nil, nil); err != nil {
+			t.Fatalf("publish other: %v", err)
+		}
+
+		conn.pool.Retire(jumpKey, displaced)
+
+		if _, ok := conn.pool.Get(childKey); ok {
+			t.Fatal("pool.Retire skipped downstream hop when displaced.RootConn == nil")
+		}
+		if _, ok := conn.pool.Get(otherKey); !ok {
+			t.Fatal("pool.Retire retired unrelated hop")
 		}
 	})
 }

@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/wentf9/xops-cli/core/concurrent"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -43,8 +42,14 @@ func TestConnector_CloseAll_CloseResults(t *testing.T) {
 			connector := newTestConnector(&mockConfigStore{})
 			conn := &closeResultConn{err: tt.err}
 			other := &closeResultConn{}
-			connector.clients.Set("target", &PooledClient{SSHClient: &ssh.Client{Conn: conn}})
-			connector.clients.Set("other", &PooledClient{SSHClient: &ssh.Client{Conn: other}})
+			targetKey := DigestClientConfig(&ClientConfig{NodeID: "target"}, ZeroHopDigest)
+			otherKey := DigestClientConfig(&ClientConfig{NodeID: "other"}, ZeroHopDigest)
+			if _, err := connector.pool.Publish(targetKey, &PooledClient{SSHClient: &ssh.Client{Conn: conn}}, nil, nil); err != nil {
+				t.Fatalf("publish target failed: %v", err)
+			}
+			if _, err := connector.pool.Publish(otherKey, &PooledClient{SSHClient: &ssh.Client{Conn: other}}, nil, nil); err != nil {
+				t.Fatalf("publish other failed: %v", err)
+			}
 
 			var wg sync.WaitGroup
 			for range 10 {
@@ -58,7 +63,7 @@ func TestConnector_CloseAll_CloseResults(t *testing.T) {
 			if conn.calls.Load() != 1 || other.calls.Load() != 1 {
 				t.Errorf("close calls = (%d, %d), want (1, 1)", conn.calls.Load(), other.calls.Load())
 			}
-			if connector.clients.Count() != 0 {
+			if connector.pool.Count() != 0 {
 				t.Fatal("client pool was not cleared")
 			}
 		})
@@ -67,7 +72,7 @@ func TestConnector_CloseAll_CloseResults(t *testing.T) {
 
 func TestConnector_CloseAll_Idempotent(t *testing.T) {
 	c := &Connector{
-		clients:   concurrent.NewMap[string, *PooledClient](concurrent.HashString),
+		pool:      newConnPool(),
 		closeDone: make(chan struct{}),
 	}
 	c.closeErr = fmt.Errorf("initial close error")

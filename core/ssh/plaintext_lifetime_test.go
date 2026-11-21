@@ -1378,48 +1378,48 @@ func TestTargetCompatibility_ValidatesAllTargetFields(t *testing.T) {
 		KeyPath:   base.KeyPath,
 		ProxyJump: base.ProxyJump,
 	}
-	if err := validateTargetCompatibility(cur, matchedCfg); err != nil {
+	if err := checkTargetDigestCompatibility(cur, matchedCfg); err != nil {
 		t.Errorf("expected matched config to pass, got: %v", err)
 	}
 
 	// 2. nil 配置
-	if err := validateTargetCompatibility(cur, nil); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(cur, nil); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Errorf("expected ErrSnapshotMismatch for nil config, got: %v", err)
 	}
 
 	// 3. Address 变动
 	addrDiff := *matchedCfg
 	addrDiff.Address = "10.0.0.2"
-	if err := validateTargetCompatibility(cur, &addrDiff); !errors.Is(err, ErrSnapshotMismatch) || !strings.Contains(err.Error(), "host address changed") {
-		t.Errorf("expected host address changed error, got: %v", err)
+	if err := checkTargetDigestCompatibility(cur, &addrDiff); !errors.Is(err, ErrSnapshotMismatch) {
+		t.Errorf("expected ErrSnapshotMismatch on host address change, got: %v", err)
 	}
 
 	// 4. Port 变动
 	portDiff := *matchedCfg
 	portDiff.Port = 2222
-	if err := validateTargetCompatibility(cur, &portDiff); !errors.Is(err, ErrSnapshotMismatch) || !strings.Contains(err.Error(), "host port changed") {
-		t.Errorf("expected host port changed error, got: %v", err)
+	if err := checkTargetDigestCompatibility(cur, &portDiff); !errors.Is(err, ErrSnapshotMismatch) {
+		t.Errorf("expected ErrSnapshotMismatch on host port change, got: %v", err)
 	}
 
 	// 5. User 变动
 	userDiff := *matchedCfg
 	userDiff.User = "otheruser"
-	if err := validateTargetCompatibility(cur, &userDiff); !errors.Is(err, ErrSnapshotMismatch) || !strings.Contains(err.Error(), "user changed") {
-		t.Errorf("expected user changed error, got: %v", err)
+	if err := checkTargetDigestCompatibility(cur, &userDiff); !errors.Is(err, ErrSnapshotMismatch) {
+		t.Errorf("expected ErrSnapshotMismatch on user change, got: %v", err)
 	}
 
 	// 6. KeyPath 变动
 	keyDiff := *matchedCfg
 	keyDiff.KeyPath = "/other/key"
-	if err := validateTargetCompatibility(cur, &keyDiff); !errors.Is(err, ErrSnapshotMismatch) || !strings.Contains(err.Error(), "key path changed") {
-		t.Errorf("expected key path changed error, got: %v", err)
+	if err := checkTargetDigestCompatibility(cur, &keyDiff); !errors.Is(err, ErrSnapshotMismatch) {
+		t.Errorf("expected ErrSnapshotMismatch on key path change, got: %v", err)
 	}
 
 	// 7. ProxyJump 变动
 	jumpDiff := *matchedCfg
 	jumpDiff.ProxyJump = "other-jump"
-	if err := validateTargetCompatibility(cur, &jumpDiff); !errors.Is(err, ErrSnapshotMismatch) || !strings.Contains(err.Error(), "proxy jump changed") {
-		t.Errorf("expected proxy jump changed error, got: %v", err)
+	if err := checkTargetDigestCompatibility(cur, &jumpDiff); !errors.Is(err, ErrSnapshotMismatch) {
+		t.Errorf("expected ErrSnapshotMismatch on proxy jump change, got: %v", err)
 	}
 }
 

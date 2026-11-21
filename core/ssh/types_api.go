@@ -64,18 +64,6 @@ func equalAdmittedCertificateMeta(a, b AdmittedCertificate) bool {
 	return a.Path == b.Path && a.SHA256 == b.SHA256 && a.Missing == b.Missing && a.NonRegular == b.NonRegular
 }
 
-func equalAdmittedCertificates(a, b []AdmittedCertificate) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !equalAdmittedCertificateMeta(a[i], b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
 // ClientConfig 定义建立 SSH 连接所需的各种参数，代替原有的 models.Node/Host/Identity。
 type ClientConfig struct {
 	KeyRef       string `digest:"include"`
@@ -121,17 +109,77 @@ type ClientConfig struct {
 	Options                     *Options              `digest:"include"`
 }
 
+// NewClientConfig returns a deep-cloned, canonically normalized ClientConfig.
+// It normalizes Address and BaseHost (trimming whitespace and stripping IPv6
+// brackets), defaults non-positive Port to DefaultSSHPort (22), trims
+// OriginalHost and CanonicalHost, normalizes AuthType, and clones all mutable
+// slice/pointer fields. NewClientConfig is idempotent.
+func NewClientConfig(raw ClientConfig) *ClientConfig {
+	out := raw
+	out.Address = normalizeHostAddress(raw.Address)
+	out.BaseHost = normalizeHostAddress(raw.BaseHost)
+	if out.Port <= 0 {
+		out.Port = int(DefaultSSHPort)
+	}
+	out.OriginalHost = strings.TrimSpace(raw.OriginalHost)
+	out.CanonicalHost = strings.TrimSpace(raw.CanonicalHost)
+	out.AuthType = normalizeAuthType(raw.AuthType)
+	if !out.HasOriginalProxyJump {
+		out.OriginalProxyJump = out.ProxyJump
+		out.HasOriginalProxyJump = true
+	}
+	out.KeyPaths = slices.Clone(raw.KeyPaths)
+	out.AdmittedCertificates = cloneAdmittedCertificates(raw.AdmittedCertificates)
+	out.AdmittedKeyDigests = cloneAdmittedKeyDigests(raw.AdmittedKeyDigests)
+	out.Execution = raw.Execution.Clone()
+	out.Options = raw.Options.Clone()
+	return &out
+}
+
 // ToConnectionConfig 将 ClientConfig 转换为仅含网络与连接参数的 ConnectionConfig，剥离所有明文密码。
 func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 	if c == nil {
 		return ConnectionConfig{}
 	}
-	origJump := c.OriginalProxyJump
-	hasOriginal := c.HasOriginalProxyJump
+	norm := NewClientConfig(*c)
+	origJump := norm.OriginalProxyJump
+	hasOriginal := norm.HasOriginalProxyJump
 	if !hasOriginal && origJump == "" {
-		origJump = c.ProxyJump
+		origJump = norm.ProxyJump
 	}
 	return ConnectionConfig{
+		KeyRef:                      norm.KeyRef,
+		TrustVersion:                norm.TrustVersion,
+		NodeID:                      norm.NodeID,
+		OriginalHost:                norm.OriginalHost,
+		CanonicalHost:               norm.CanonicalHost,
+		Address:                     norm.Address,
+		BaseHost:                    norm.BaseHost,
+		Port:                        norm.Port,
+		User:                        norm.User,
+		AuthType:                    norm.AuthType,
+		configuredAuthType:          norm.AuthType,
+		KeyPath:                     norm.KeyPath,
+		KeyPaths:                    norm.KeyPaths,
+		AuthUpdateToken:             norm.AuthUpdateToken,
+		SudoMode:                    norm.SudoMode,
+		SudoUpdateToken:             norm.SudoUpdateToken,
+		ProxyJump:                   norm.ProxyJump,
+		OriginalProxyJump:           origJump,
+		HasOriginalProxyJump:        hasOriginal,
+		PasswordPromptPattern:       norm.PasswordPromptPattern,
+		EnforceAdmittedCertificates: norm.EnforceAdmittedCertificates,
+		AdmittedCertificates:        norm.AdmittedCertificates,
+		EnforceAdmittedKeyDigests:   norm.EnforceAdmittedKeyDigests,
+		AdmittedKeyDigests:          norm.AdmittedKeyDigests,
+		Execution:                   norm.Execution,
+		Options:                     norm.Options,
+	}
+}
+
+// toClientConfig converts ConnectionConfig back into a normalized, secret-free ClientConfig.
+func (c ConnectionConfig) toClientConfig() *ClientConfig {
+	return NewClientConfig(ClientConfig{
 		KeyRef:                      c.KeyRef,
 		TrustVersion:                c.TrustVersion,
 		NodeID:                      c.NodeID,
@@ -142,23 +190,22 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		Port:                        c.Port,
 		User:                        c.User,
 		AuthType:                    c.AuthType,
-		configuredAuthType:          c.AuthType,
 		KeyPath:                     c.KeyPath,
-		KeyPaths:                    slices.Clone(c.KeyPaths),
+		KeyPaths:                    c.KeyPaths,
 		AuthUpdateToken:             c.AuthUpdateToken,
 		SudoMode:                    c.SudoMode,
 		SudoUpdateToken:             c.SudoUpdateToken,
 		ProxyJump:                   c.ProxyJump,
-		OriginalProxyJump:           origJump,
-		HasOriginalProxyJump:        hasOriginal,
+		OriginalProxyJump:           c.OriginalProxyJump,
+		HasOriginalProxyJump:        c.HasOriginalProxyJump,
 		PasswordPromptPattern:       c.PasswordPromptPattern,
 		EnforceAdmittedCertificates: c.EnforceAdmittedCertificates,
-		AdmittedCertificates:        cloneAdmittedCertificates(c.AdmittedCertificates),
+		AdmittedCertificates:        c.AdmittedCertificates,
 		EnforceAdmittedKeyDigests:   c.EnforceAdmittedKeyDigests,
-		AdmittedKeyDigests:          cloneAdmittedKeyDigests(c.AdmittedKeyDigests),
-		Execution:                   c.Execution.Clone(),
-		Options:                     c.Options.Clone(),
-	}
+		AdmittedKeyDigests:          c.AdmittedKeyDigests,
+		Execution:                   c.Execution,
+		Options:                     c.Options,
+	})
 }
 
 // ConnectionConfig 包含建立连接所需的目标与网络参数，不包含登录或提权明文机密。
@@ -368,212 +415,71 @@ const (
 	tokenRefreshKindSudo
 )
 
-// validateTargetCompatibility 校验新配置的目标属性是否与已建立的连接快照完全一致
-func validateTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
-	if newCfg == nil {
-		return fmt.Errorf("%w: target configuration is nil", ErrSnapshotMismatch)
-	}
-	if newCfg.Address != cur.Address {
-		return fmt.Errorf("%w: host address changed (expected %q, got %q)",
-			ErrSnapshotMismatch, cur.Address, newCfg.Address)
-	}
-	if curBase, newBase := strings.TrimSpace(cur.BaseHost), strings.TrimSpace(newCfg.BaseHost); curBase != newBase {
-		return fmt.Errorf("%w: base host changed (expected %q, got %q)",
-			ErrSnapshotMismatch, curBase, newBase)
-	}
-	curPort := cur.Port
-	if curPort <= 0 {
-		curPort = 22
-	}
-	newPort := newCfg.Port
-	if newPort <= 0 {
-		newPort = 22
-	}
-	if newPort != curPort {
-		return fmt.Errorf("%w: host port changed (expected %d, got %d)",
-			ErrSnapshotMismatch, curPort, newPort)
-	}
-	if newCfg.User != cur.User {
-		return fmt.Errorf("%w: user changed (expected %q, got %q)",
-			ErrSnapshotMismatch, cur.User, newCfg.User)
-	}
-	if curOrig, newOrig := effectiveOriginalHost(cur.OriginalHost, cur.NodeID), effectiveOriginalHost(newCfg.OriginalHost, newCfg.NodeID); curOrig != newOrig {
-		return fmt.Errorf("%w: original host changed (expected %q, got %q)",
-			ErrSnapshotMismatch, curOrig, newOrig)
-	}
-	if curCanon, newCanon := strings.TrimSpace(cur.CanonicalHost), strings.TrimSpace(newCfg.CanonicalHost); curCanon != newCanon {
-		return fmt.Errorf("%w: canonical host changed (expected %q, got %q)",
-			ErrSnapshotMismatch, curCanon, newCanon)
-	}
-	if newCfg.KeyRef != cur.KeyRef || newCfg.TrustVersion != cur.TrustVersion {
-		return fmt.Errorf("%w: key reference or host trust version changed", ErrSnapshotMismatch)
-	}
-	if newCfg.AuthUpdateToken != cur.AuthUpdateToken {
-		return fmt.Errorf("%w: auth update token changed", ErrSnapshotMismatch)
-	}
-	if err := validateAuthTypeCompatibility(cur, newCfg); err != nil {
-		return err
-	}
-	if newCfg.KeyPath != cur.KeyPath {
-		return fmt.Errorf("%w: key path changed (expected %q, got %q)",
-			ErrSnapshotMismatch, cur.KeyPath, newCfg.KeyPath)
-	}
-	if !slices.Equal(newCfg.KeyPaths, cur.KeyPaths) {
-		return fmt.Errorf("%w: key paths changed (expected %v, got %v)",
-			ErrSnapshotMismatch, cur.KeyPaths, newCfg.KeyPaths)
-	}
-	if err := validateAdmittedMaterialTargetCompatibility(cur, newCfg); err != nil {
-		return err
-	}
-	if err := validateOptionsTargetCompatibility(cur.Options, newCfg.Options); err != nil {
-		return err
-	}
-	return validateRoutingTargetCompatibility(cur, newCfg)
-}
-
-func validateAdmittedMaterialTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
-	if cur.EnforceAdmittedCertificates != newCfg.EnforceAdmittedCertificates ||
-		!equalAdmittedCertificates(cur.AdmittedCertificates, newCfg.AdmittedCertificates) {
-		return fmt.Errorf("%w: admitted certificates changed", ErrSnapshotMismatch)
-	}
-	if cur.EnforceAdmittedKeyDigests != newCfg.EnforceAdmittedKeyDigests ||
-		!slices.Equal(cur.AdmittedKeyDigests, newCfg.AdmittedKeyDigests) {
-		return fmt.Errorf("%w: admitted key digests changed", ErrSnapshotMismatch)
-	}
-	return nil
-}
-
 func normalizeAuthType(authType string) string {
 	return strings.ToLower(strings.TrimSpace(authType))
 }
 
-func validateAuthTypeCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
-	curType := normalizeAuthType(cur.AuthType)
-	newType := normalizeAuthType(newCfg.AuthType)
-	if curType == newType {
-		return nil
+func stripProxyCommandForDigestMatch(cfg *ClientConfig) {
+	if cfg == nil || cfg.Options == nil {
+		return
 	}
-	if normalizeAuthType(cur.configuredAuthType) == "auto" && newType == "auto" {
-		return nil
+	cfg.Options.Delete(OptionProxyCommand)
+	if cfg.Options.IsEmpty() {
+		cfg.Options = nil
 	}
-	return fmt.Errorf("%w: auth type changed (expected %q, got %q)",
-		ErrSnapshotMismatch, cur.AuthType, newCfg.AuthType)
 }
 
-func validateOptionsTargetCompatibility(curOpts, newOpts *Options) error {
-	if curOpts.StrictHostKeyChecking() != newOpts.StrictHostKeyChecking() ||
-		curOpts.UserKnownHostsFile() != newOpts.UserKnownHostsFile() ||
-		curOpts.GlobalKnownHostsFile() != newOpts.GlobalKnownHostsFile() ||
-		curOpts.VerifyHostKeyDNS() != newOpts.VerifyHostKeyDNS() ||
-		curOpts.HashKnownHosts() != newOpts.HashKnownHosts() {
-		return fmt.Errorf("%w: host trust options changed", ErrSnapshotMismatch)
+// checkTargetDigestCompatibility compares cur against newCfg by computing
+// canonical HopDigests via DigestClientConfig. Only documented fields that
+// legitimately advance after handshake (resolved auth method for configured
+// "auto", planned vs raw intermediate-hop ProxyJump, inactive ProxyCommand when
+// ProxyJump is active, and runtime sudo/execution/prompt metadata) are aligned
+// before hashing; every other behavioral field of ClientConfig and Options
+// (including Control*) is enforced automatically by DigestClientConfig.
+func checkTargetDigestCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
+	if newCfg == nil {
+		return fmt.Errorf("%w: target configuration is nil", ErrSnapshotMismatch)
 	}
-	if !slices.Equal(newOpts.IdentityFiles(), curOpts.IdentityFiles()) {
-		return fmt.Errorf("%w: identity files changed", ErrSnapshotMismatch)
-	}
-	if !slices.Equal(newOpts.CertificateFiles(), curOpts.CertificateFiles()) {
-		return fmt.Errorf("%w: certificate files changed", ErrSnapshotMismatch)
-	}
-	if err := validateAuthOptionsTargetCompatibility(curOpts, newOpts); err != nil {
-		return err
-	}
-	if curOpts.Ciphers() != newOpts.Ciphers() ||
-		curOpts.MACs() != newOpts.MACs() ||
-		curOpts.KexAlgorithms() != newOpts.KexAlgorithms() ||
-		curOpts.HostKeyAlgorithms() != newOpts.HostKeyAlgorithms() {
-		return fmt.Errorf("%w: transport algorithm options changed", ErrSnapshotMismatch)
-	}
-	if newOpts.AddressFamily() != curOpts.AddressFamily() {
-		return fmt.Errorf("%w: address family changed (expected %q, got %q)",
-			ErrSnapshotMismatch, curOpts.AddressFamily(), newOpts.AddressFamily())
-	}
-	if err := validateTransportAndForwardOptionsTargetCompatibility(curOpts, newOpts); err != nil {
-		return err
-	}
-	return validateCanonicalizeOptionsTargetCompatibility(curOpts, newOpts)
-}
+	expected := cur.toClientConfig()
+	actual := NewClientConfig(*newCfg)
 
-func validateTransportAndForwardOptionsTargetCompatibility(curOpts, newOpts *Options) error {
-	curTCPKA, curTCPKAOK := curOpts.TCPKeepAlive()
-	newTCPKA, newTCPKAOK := newOpts.TCPKeepAlive()
-	if curOpts.ServerAliveInterval() != newOpts.ServerAliveInterval() ||
-		curOpts.ServerAliveCountMax() != newOpts.ServerAliveCountMax() ||
-		curTCPKA != newTCPKA || curTCPKAOK != newTCPKAOK {
-		return fmt.Errorf("%w: keepalive options changed", ErrSnapshotMismatch)
-	}
-	curUnlink, curUnlinkOK := curOpts.StreamLocalBindUnlink()
-	newUnlink, newUnlinkOK := newOpts.StreamLocalBindUnlink()
-	curMask, curMaskOK := curOpts.StreamLocalBindMask()
-	newMask, newMaskOK := newOpts.StreamLocalBindMask()
-	if curOpts.ForwardAgent() != newOpts.ForwardAgent() ||
-		curOpts.GatewayPortsMode() != newOpts.GatewayPortsMode() ||
-		curUnlink != newUnlink || curUnlinkOK != newUnlinkOK ||
-		curMask != newMask || curMaskOK != newMaskOK {
-		return fmt.Errorf("%w: forwarding options changed", ErrSnapshotMismatch)
-	}
-	return nil
-}
+	expected.OriginalHost = effectiveOriginalHost(expected.OriginalHost, expected.NodeID)
+	actual.OriginalHost = effectiveOriginalHost(actual.OriginalHost, actual.NodeID)
 
-func validateAuthOptionsTargetCompatibility(curOpts, newOpts *Options) error {
-	curPub, curPubOK := curOpts.PubkeyAuthentication()
-	newPub, newPubOK := newOpts.PubkeyAuthentication()
-	if curOpts.IdentityAgent() != newOpts.IdentityAgent() ||
-		curOpts.IdentitiesOnly() != newOpts.IdentitiesOnly() ||
-		curOpts.BatchMode() != newOpts.BatchMode() ||
-		curPub != newPub || curPubOK != newPubOK {
-		return fmt.Errorf("%w: publickey or agent authentication options changed", ErrSnapshotMismatch)
+	expected.ProxyJump = NormalizeProxyJump(expected.ProxyJump)
+	actual.ProxyJump = NormalizeProxyJump(actual.ProxyJump)
+	if !expected.HasOriginalProxyJump && expected.OriginalProxyJump == "" {
+		expected.OriginalProxyJump = expected.ProxyJump
+	} else {
+		expected.OriginalProxyJump = NormalizeProxyJump(expected.OriginalProxyJump)
 	}
-	curPwd, curPwdOK := curOpts.PasswordAuthentication()
-	newPwd, newPwdOK := newOpts.PasswordAuthentication()
-	curKbd, curKbdOK := curOpts.KbdInteractiveAuthentication()
-	newKbd, newKbdOK := newOpts.KbdInteractiveAuthentication()
-	if curPwd != newPwd || curPwdOK != newPwdOK ||
-		curKbd != newKbd || curKbdOK != newKbdOK ||
-		!slices.Equal(curOpts.PreferredAuthentications(), newOpts.PreferredAuthentications()) {
-		return fmt.Errorf("%w: authentication policy options changed", ErrSnapshotMismatch)
+	expected.HasOriginalProxyJump = true
+	if !actual.HasOriginalProxyJump && actual.OriginalProxyJump == "" {
+		actual.OriginalProxyJump = actual.ProxyJump
+	} else {
+		actual.OriginalProxyJump = NormalizeProxyJump(actual.OriginalProxyJump)
 	}
-	return nil
-}
+	actual.HasOriginalProxyJump = true
+	if actual.OriginalProxyJump == expected.OriginalProxyJump {
+		actual.ProxyJump = expected.ProxyJump
+	}
 
-func validateCanonicalizeOptionsTargetCompatibility(curOpts, newOpts *Options) error {
-	curDots, curDotsOK := curOpts.CanonicalizeMaxDots()
-	newDots, newDotsOK := newOpts.CanonicalizeMaxDots()
-	curFallback, curFallbackOK := curOpts.CanonicalizeFallbackLocal()
-	newFallback, newFallbackOK := newOpts.CanonicalizeFallbackLocal()
-	if curOpts.CanonicalizeHostname() != newOpts.CanonicalizeHostname() ||
-		!slices.Equal(curOpts.CanonicalDomains(), newOpts.CanonicalDomains()) ||
-		curDots != newDots || curDotsOK != newDotsOK ||
-		curFallback != newFallback || curFallbackOK != newFallbackOK ||
-		!slices.Equal(curOpts.CanonicalizePermittedCNAMEs(), newOpts.CanonicalizePermittedCNAMEs()) {
-		return fmt.Errorf("%w: hostname canonicalization options changed", ErrSnapshotMismatch)
+	if HasActiveProxyJump(expected.ProxyJump) {
+		stripProxyCommandForDigestMatch(expected)
+		stripProxyCommandForDigestMatch(actual)
 	}
-	return nil
-}
 
-func validateRoutingTargetCompatibility(cur ConnectionConfig, newCfg *ClientConfig) error {
-	expectedJump := cur.ProxyJump
-	if cur.HasOriginalProxyJump {
-		expectedJump = cur.OriginalProxyJump
-	} else if cur.OriginalProxyJump != "" {
-		expectedJump = cur.OriginalProxyJump
+	if normalizeAuthType(cur.configuredAuthType) == "auto" && normalizeAuthType(actual.AuthType) == "auto" {
+		expected.AuthType = actual.AuthType
 	}
-	actualJump := newCfg.ProxyJump
-	if newCfg.HasOriginalProxyJump {
-		actualJump = newCfg.OriginalProxyJump
-	} else if newCfg.OriginalProxyJump != "" {
-		actualJump = newCfg.OriginalProxyJump
-	}
-	if actualJump != expectedJump {
-		return fmt.Errorf("%w: proxy jump changed (expected %q, got %q)",
-			ErrSnapshotMismatch, expectedJump, actualJump)
-	}
-	if !HasActiveProxyJump(cur.ProxyJump) {
-		expectedProxyCmd := cur.Options.ActiveProxyCommand()
-		actualProxyCmd := newCfg.Options.ActiveProxyCommand()
-		if actualProxyCmd != expectedProxyCmd {
-			return fmt.Errorf("%w: proxy command changed (expected %q, got %q)",
-				ErrSnapshotMismatch, expectedProxyCmd, actualProxyCmd)
-		}
+
+	expected.SudoMode = actual.SudoMode
+	expected.SudoUpdateToken = actual.SudoUpdateToken
+	expected.Execution = actual.Execution.Clone()
+	expected.PasswordPromptPattern = actual.PasswordPromptPattern
+
+	if !DigestClientConfig(expected, ZeroHopDigest).Equal(DigestClientConfig(actual, ZeroHopDigest)) {
+		return fmt.Errorf("%w: target configuration digest changed", ErrSnapshotMismatch)
 	}
 	return nil
 }

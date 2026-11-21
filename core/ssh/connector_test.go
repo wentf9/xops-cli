@@ -101,7 +101,10 @@ func TestConnector_Connect_ConcurrentStaleProbeRunsOnce(t *testing.T) {
 		requestSeen: make(chan struct{}),
 		release:     make(chan struct{}),
 	}
-	connector.clients.Set("node-1", &PooledClient{SSHClient: &ssh.Client{Conn: deadConn}})
+	nodeKey := DigestClientConfig(NewClientConfig(*store.cfg), ZeroHopDigest)
+	if _, err := connector.pool.Publish(nodeKey, &PooledClient{SSHClient: &ssh.Client{Conn: deadConn}}, nil, nil); err != nil {
+		t.Fatalf("publish dead client failed: %v", err)
+	}
 
 	firstDone := make(chan error, 1)
 	secondDone := make(chan error, 1)
@@ -131,7 +134,7 @@ func TestConnector_Connect_ConcurrentStaleProbeRunsOnce(t *testing.T) {
 	if got := deadConn.requestCount.Load(); got != 1 {
 		t.Errorf("expected one serialized stale probe, got %d", got)
 	}
-	if _, ok := connector.clients.Get("node-1"); ok {
+	if _, ok := connector.pool.Get(nodeKey); ok {
 		t.Error("stale client remained in pool")
 	}
 }
@@ -156,7 +159,10 @@ func TestConnector_Connect_CallerCancellationDoesNotCloseSharedClient(t *testing
 		requestSeen: make(chan struct{}),
 		release:     make(chan struct{}),
 	}
-	connector.clients.Set("node-1", &PooledClient{SSHClient: &ssh.Client{Conn: healthyConn}})
+	nodeKey := DigestClientConfig(NewClientConfig(*store.cfg), ZeroHopDigest)
+	if _, err := connector.pool.Publish(nodeKey, &PooledClient{SSHClient: &ssh.Client{Conn: healthyConn}}, nil, nil); err != nil {
+		t.Fatalf("publish healthy client failed: %v", err)
+	}
 
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
@@ -272,8 +278,8 @@ func TestConnector_CloseAllCancelsInFlightHandshake(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("in-flight Connect did not return after CloseAll")
 	}
-	if connector.clients.Count() != 0 {
-		t.Errorf("expected empty client pool after CloseAll, got %d", connector.clients.Count())
+	if connector.pool.Count() != 0 {
+		t.Errorf("expected empty client pool after CloseAll, got %d", connector.pool.Count())
 	}
 	if _, connectErr := connector.Connect(context.Background(), "node-1"); !errors.Is(connectErr, ErrConnectorClosed) {
 		t.Errorf("expected ErrConnectorClosed after CloseAll, got %v", connectErr)
@@ -355,7 +361,10 @@ func TestConnector_Connect_Cached(t *testing.T) {
 
 	// 模拟已存在缓存连接
 	dummyClient := &ssh.Client{}
-	connector.clients.Set("node-1", &PooledClient{SSHClient: dummyClient})
+	nodeKey := DigestClientConfig(NewClientConfig(*store.cfg), ZeroHopDigest)
+	if _, err := connector.pool.Publish(nodeKey, &PooledClient{SSHClient: dummyClient}, nil, nil); err != nil {
+		t.Fatalf("publish cached client failed: %v", err)
+	}
 
 	ctx := context.Background()
 	client, err := connector.Connect(ctx, "node-1")
@@ -411,7 +420,10 @@ func TestConnector_Connect_Reconnection(t *testing.T) {
 	dummyClient := &ssh.Client{
 		Conn: mc,
 	}
-	connector.clients.Set("node-1", &PooledClient{SSHClient: dummyClient})
+	nodeKey := DigestClientConfig(NewClientConfig(*store.cfg), ZeroHopDigest)
+	if _, err := connector.pool.Publish(nodeKey, &PooledClient{SSHClient: dummyClient}, nil, nil); err != nil {
+		t.Fatalf("publish stale client failed: %v", err)
+	}
 
 	ctx := context.Background()
 	_, err := connector.Connect(ctx, "node-1")
@@ -420,7 +432,7 @@ func TestConnector_Connect_Reconnection(t *testing.T) {
 	}
 
 	// 验证连接是否已从缓存中移除
-	if _, ok := connector.clients.Get("node-1"); ok {
+	if _, ok := connector.pool.Get(nodeKey); ok {
 		t.Error("expected node-1 to be evicted from clients cache")
 	}
 
@@ -487,8 +499,18 @@ func TestConnector_Connect_ResolvedProxyChainUsesRootClient(t *testing.T) {
 	}}
 	connector := newTestConnector(store, WithInteractionHandler(&mockUI{}))
 	// nil Conn 的客户端仅用于验证计划顺序和包装结果，不执行网络探测。
-	connector.clients.Set(connectionRouteKey([]string{"jump"}, "target"), &PooledClient{SSHClient: &ssh.Client{}})
-	connector.clients.Set("jump", &PooledClient{SSHClient: &ssh.Client{}})
+	plan, err := connector.resolveConnectionPlan(context.Background(), "target")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan failed: %v", err)
+	}
+	jumpPooled := &PooledClient{SSHClient: &ssh.Client{}}
+	if _, err := connector.pool.Publish(plan[1].hopDigest(), jumpPooled, nil, nil); err != nil {
+		t.Fatalf("publish jump failed: %v", err)
+	}
+	targetPooled := &PooledClient{SSHClient: &ssh.Client{}, parentKey: plan[0].parentDigest}
+	if _, err := connector.pool.Publish(plan[0].hopDigest(), targetPooled, jumpPooled, nil); err != nil {
+		t.Fatalf("publish target failed: %v", err)
+	}
 
 	client, err := connector.Connect(context.Background(), "target")
 	if err != nil {
@@ -499,7 +521,7 @@ func TestConnector_Connect_ResolvedProxyChainUsesRootClient(t *testing.T) {
 	}
 
 	// 测试客户端没有底层 Conn，清空后再关闭 Connector，避免对无效 mock 执行 Close。
-	connector.clients.Clear()
+	connector.pool.Clear()
 	if err := connector.CloseAll(); err != nil {
 		t.Logf("CloseAll failed: %v", err)
 	}
@@ -656,8 +678,8 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t 
 	if err != nil {
 		t.Fatalf("GetConfig openssh:second failed: %v", err)
 	}
-	if err := validateTargetCompatibility(plan[1].cfg.ToConnectionConfig(), freshSecondCfg); err != nil {
-		t.Fatalf("validateTargetCompatibility unexpectedly failed for second hop: %v", err)
+	if err := checkTargetDigestCompatibility(plan[1].cfg.ToConnectionConfig(), freshSecondCfg); err != nil {
+		t.Fatalf("checkTargetDigestCompatibility unexpectedly failed for second hop: %v", err)
 	}
 
 	// 同样验证首跳与最外层跳
@@ -665,8 +687,8 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t 
 	if err != nil {
 		t.Fatalf("GetConfig openssh:first failed: %v", err)
 	}
-	if err := validateTargetCompatibility(plan[2].cfg.ToConnectionConfig(), freshFirstCfg); err != nil {
-		t.Fatalf("validateTargetCompatibility unexpectedly failed for first hop: %v", err)
+	if err := checkTargetDigestCompatibility(plan[2].cfg.ToConnectionConfig(), freshFirstCfg); err != nil {
+		t.Fatalf("checkTargetDigestCompatibility unexpectedly failed for first hop: %v", err)
 	}
 
 	// 验证真正被外部篡改时会被拦截
@@ -674,9 +696,9 @@ func TestConnector_ResolveConnectionPlan_MultiHopProxyJump_CompatibilityCheck(t 
 	tamperedSecondCfg.ProxyJump = "tampered-jump"
 	tamperedSecondCfg.OriginalProxyJump = "tampered-jump"
 	tamperedSecondCfg.HasOriginalProxyJump = true
-	tamperedErr := validateTargetCompatibility(plan[1].cfg.ToConnectionConfig(), &tamperedSecondCfg)
+	tamperedErr := checkTargetDigestCompatibility(plan[1].cfg.ToConnectionConfig(), &tamperedSecondCfg)
 	if tamperedErr == nil {
-		t.Fatal("expected validateTargetCompatibility to fail when proxy jump tampered, got nil")
+		t.Fatal("expected checkTargetDigestCompatibility to fail when proxy jump tampered, got nil")
 	}
 	if !errors.Is(tamperedErr, ErrSnapshotMismatch) {
 		t.Fatalf("expected ErrSnapshotMismatch when proxy jump tampered, got: %v", tamperedErr)
@@ -690,9 +712,22 @@ func TestConnector_Connect_MultiHopProxyJump(t *testing.T) {
 		"openssh:second": {NodeID: "openssh:second"},
 	}}
 	connector := newTestConnector(store, WithInteractionHandler(&mockUI{}))
-	connector.clients.Set("openssh:first", &PooledClient{SSHClient: &ssh.Client{}})
-	connector.clients.Set(connectionRouteKey([]string{"openssh:first"}, "openssh:second"), &PooledClient{SSHClient: &ssh.Client{}})
-	connector.clients.Set(connectionRouteKey([]string{"openssh:first", "openssh:second"}, "target"), &PooledClient{SSHClient: &ssh.Client{}})
+	plan, err := connector.resolveConnectionPlan(t.Context(), "target")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan failed: %v", err)
+	}
+	firstPooled := &PooledClient{SSHClient: &ssh.Client{}}
+	if _, err := connector.pool.Publish(plan[2].hopDigest(), firstPooled, nil, nil); err != nil {
+		t.Fatalf("publish first failed: %v", err)
+	}
+	secondPooled := &PooledClient{SSHClient: &ssh.Client{}, parentKey: plan[1].parentDigest}
+	if _, err := connector.pool.Publish(plan[1].hopDigest(), secondPooled, firstPooled, nil); err != nil {
+		t.Fatalf("publish second failed: %v", err)
+	}
+	targetPooled := &PooledClient{SSHClient: &ssh.Client{}, parentKey: plan[0].parentDigest}
+	if _, err := connector.pool.Publish(plan[0].hopDigest(), targetPooled, secondPooled, nil); err != nil {
+		t.Fatalf("publish target failed: %v", err)
+	}
 
 	client, err := connector.Connect(t.Context(), "target")
 	if err != nil {
@@ -701,7 +736,7 @@ func TestConnector_Connect_MultiHopProxyJump(t *testing.T) {
 	if client.Config().NodeID != "target" {
 		t.Fatalf("got final node %q, want target", client.Config().NodeID)
 	}
-	connector.clients.Clear()
+	connector.pool.Clear()
 	if err := connector.CloseAll(); err != nil {
 		t.Errorf("close connector: %v", err)
 	}

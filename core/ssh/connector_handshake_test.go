@@ -260,8 +260,9 @@ func assertKeyDiscoveryAndReconnectUnmutated(t *testing.T) {
 	}
 
 	// Evict and reconnect via second Connect to confirm repeated handshakes stay immutable.
-	if pooled, ok := conn.clients.Get("immutable-key-node"); ok {
-		conn.evictCachedClient("immutable-key-node", pooled)
+	key := DigestClientConfig(NewClientConfig(*sharedCfg), ZeroHopDigest)
+	if pooled, ok := conn.pool.Get(key); ok {
+		conn.pool.Evict(key, pooled, true)
 	}
 	if _, err := conn.Connect(ctx, "immutable-key-node"); err != nil {
 		t.Fatalf("reconnect failed: %v", err)
@@ -325,7 +326,7 @@ func assertRejectedKeyFallbackAndFailUnmutated(t *testing.T) {
 	origFail := cloneClientConfigForAssertion(failCfg)
 	failConn := NewConnector(nil, WithHostKeyVerifier(staticTestVerifier{}), WithHandshakeTimeout(2*time.Second))
 	defer func() { _ = failConn.CloseAll() }()
-	if _, failErr := failConn.initializeConnection(t.Context(), connectionPlanNode{name: "fail-node", cfg: failCfg}, nil); failErr == nil {
+	if _, failErr := failConn.initializeConnection(t.Context(), connectionPlanNode{name: "fail-node", cfg: failCfg}, nil, nil); failErr == nil {
 		t.Fatal("expected initializeConnection failure with wrong password")
 	}
 	if !reflect.DeepEqual(failCfg, origFail) {
@@ -363,7 +364,7 @@ func assertPortZeroAndCompatResolverUnmutated(t *testing.T) {
 	conn := NewConnector(nil, WithHostKeyVerifier(staticTestVerifier{}), WithHandshakeTimeout(3*time.Second))
 	defer func() { _ = conn.CloseAll() }()
 
-	client, err := conn.initializeConnection(t.Context(), connectionPlanNode{name: "port-zero-compat", cfg: sharedCfg}, fixedDialer)
+	client, err := conn.initializeConnection(t.Context(), connectionPlanNode{name: "port-zero-compat", cfg: sharedCfg}, fixedDialer, nil)
 	if err != nil {
 		t.Fatalf("initializeConnection(Port:0): %v", err)
 	}

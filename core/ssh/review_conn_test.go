@@ -711,8 +711,8 @@ func TestReviewConn_L6_ValidateTargetCompatibilityCoversTrustAuthAndCryptoOption
 	bc := baseCfg()
 	cur := (&bc).ToConnectionConfig()
 	identical := baseCfg()
-	if err := validateTargetCompatibility(cur, &identical); err != nil {
-		t.Fatalf("validateTargetCompatibility on identical config failed: %v", err)
+	if err := checkTargetDigestCompatibility(cur, &identical); err != nil {
+		t.Fatalf("checkTargetDigestCompatibility on identical config failed: %v", err)
 	}
 
 	mutations := []struct {
@@ -736,7 +736,7 @@ func TestReviewConn_L6_ValidateTargetCompatibilityCoversTrustAuthAndCryptoOption
 		t.Run(tc.name, func(t *testing.T) {
 			mut := baseCfg()
 			tc.mutate(mut.Options)
-			err := validateTargetCompatibility(cur, &mut)
+			err := checkTargetDigestCompatibility(cur, &mut)
 			if !errors.Is(err, ErrSnapshotMismatch) {
 				t.Fatalf("mutation %s: error = %v, want ErrSnapshotMismatch", tc.name, err)
 			}

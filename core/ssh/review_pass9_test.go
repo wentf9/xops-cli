@@ -439,7 +439,7 @@ func TestPass9_L2_InitializeConnectionPortZeroNormalizedBeforeVerifier(t *testin
 			AuthType: "password",
 			Password: "pw",
 		},
-	}, dialer)
+	}, dialer, nil)
 	if err != nil {
 		t.Fatalf("initializeConnection(Port:0): %v", err)
 	}

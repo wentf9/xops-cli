@@ -242,13 +242,13 @@ func TestRound5_P2_2_CanonicalHostPlanPropagationAndCompatibility(t *testing.T) 
 
 	cur := plan.Hops[0]
 	sameCfg := baseCfg
-	if err := validateTargetCompatibility(cur, &sameCfg); err != nil {
-		t.Fatalf("validateTargetCompatibility matching CanonicalHost failed: %v", err)
+	if err := checkTargetDigestCompatibility(cur, &sameCfg); err != nil {
+		t.Fatalf("checkTargetDigestCompatibility matching CanonicalHost failed: %v", err)
 	}
 	driftedCfg := baseCfg
 	driftedCfg.CanonicalHost = "other.corp.example.com"
-	if err := validateTargetCompatibility(cur, &driftedCfg); !errors.Is(err, ErrSnapshotMismatch) {
-		t.Fatalf("validateTargetCompatibility drifted CanonicalHost = %v, want ErrSnapshotMismatch", err)
+	if err := checkTargetDigestCompatibility(cur, &driftedCfg); !errors.Is(err, ErrSnapshotMismatch) {
+		t.Fatalf("checkTargetDigestCompatibility drifted CanonicalHost = %v, want ErrSnapshotMismatch", err)
 	}
 }
 

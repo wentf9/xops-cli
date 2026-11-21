@@ -48,43 +48,40 @@ type dialPolicy struct {
 
 func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
 	if cfg == nil {
-		return dialPolicy{port: 22}
+		return dialPolicy{port: int(DefaultSSHPort)}
 	}
-	port := cfg.Port
-	if port <= 0 {
-		port = 22
-	}
-	origJump := cfg.OriginalProxyJump
-	hasOriginalJump := cfg.HasOriginalProxyJump
+	norm := NewClientConfig(*cfg)
+	origJump := norm.OriginalProxyJump
+	hasOriginalJump := norm.HasOriginalProxyJump
 	if !hasOriginalJump && origJump == "" {
-		origJump = cfg.ProxyJump
+		origJump = norm.ProxyJump
 	}
 	return dialPolicy{
-		nodeID:                      cfg.NodeID,
-		address:                     normalizeHostAddress(cfg.Address),
-		baseHost:                    normalizeHostAddress(cfg.BaseHost),
-		port:                        port,
-		user:                        cfg.User,
-		authType:                    cfg.AuthType,
-		keyPath:                     cfg.KeyPath,
-		keyPaths:                    slices.Clone(cfg.KeyPaths),
-		keyRef:                      cfg.KeyRef,
-		authUpdateToken:             cfg.AuthUpdateToken,
-		sudoMode:                    cfg.SudoMode,
-		sudoUpdateToken:             cfg.SudoUpdateToken,
-		proxyJump:                   NormalizeProxyJump(cfg.ProxyJump),
-		originalHost:                cfg.OriginalHost,
-		canonicalHost:               cfg.CanonicalHost,
+		nodeID:                      norm.NodeID,
+		address:                     norm.Address,
+		baseHost:                    norm.BaseHost,
+		port:                        norm.Port,
+		user:                        norm.User,
+		authType:                    norm.AuthType,
+		keyPath:                     norm.KeyPath,
+		keyPaths:                    norm.KeyPaths,
+		keyRef:                      norm.KeyRef,
+		authUpdateToken:             norm.AuthUpdateToken,
+		sudoMode:                    norm.SudoMode,
+		sudoUpdateToken:             norm.SudoUpdateToken,
+		proxyJump:                   NormalizeProxyJump(norm.ProxyJump),
+		originalHost:                norm.OriginalHost,
+		canonicalHost:               norm.CanonicalHost,
 		originalProxyJump:           origJump,
 		hasOriginalProxyJump:        hasOriginalJump,
-		trustVersion:                cfg.TrustVersion,
-		passwordPromptPattern:       cfg.PasswordPromptPattern,
-		enforceAdmittedCertificates: cfg.EnforceAdmittedCertificates,
-		admittedCertificates:        cloneAdmittedCertificates(cfg.AdmittedCertificates),
-		enforceAdmittedKeyDigests:   cfg.EnforceAdmittedKeyDigests,
-		admittedKeyDigests:          cloneAdmittedKeyDigests(cfg.AdmittedKeyDigests),
-		execution:                   cfg.Execution.Clone(),
-		options:                     cfg.Options.Clone(),
+		trustVersion:                norm.TrustVersion,
+		passwordPromptPattern:       norm.PasswordPromptPattern,
+		enforceAdmittedCertificates: norm.EnforceAdmittedCertificates,
+		admittedCertificates:        norm.AdmittedCertificates,
+		enforceAdmittedKeyDigests:   norm.EnforceAdmittedKeyDigests,
+		admittedKeyDigests:          norm.AdmittedKeyDigests,
+		execution:                   norm.Execution,
+		options:                     norm.Options,
 	}
 }
 
@@ -418,7 +415,7 @@ func (c *Connector) recordAndSyncAuthAfterHandshake(
 	confirmedExec *ExecutionConfig,
 	outcome authOutcome,
 	rootConn net.Conn,
-) (ConnectionConfig, error) {
+) (ConnectionConfig, *ClientConfig, error) {
 	oldAuthToken := policy.authUpdateToken
 	discoveredKeyPath := ""
 	if outcome.passphrase != "" && outcome.keyPath != "" {
@@ -439,7 +436,7 @@ func (c *Connector) recordAndSyncAuthAfterHandshake(
 			recordingFailed = true
 			hasAuthUpdate = false
 		} else if err != nil {
-			return ConnectionConfig{}, err
+			return ConnectionConfig{}, nil, err
 		}
 	}
 
@@ -451,21 +448,22 @@ func (c *Connector) recordAndSyncAuthAfterHandshake(
 		finalConnCfg.Execution = confirmedExec.Clone()
 	}
 
-	if err := c.syncRecordedConnection(
+	reloadedCfg, err := c.syncRecordedConnection(
 		nodeName, &finalConnCfg, oldAuthToken, committedAuthToken, hasAuthUpdate, recordingFailed,
 		policy.keyPath, policy.keyPaths, discoveredKeyPath, rootConn,
-	); err != nil {
-		return ConnectionConfig{}, err
+	)
+	if err != nil {
+		return ConnectionConfig{}, nil, err
 	}
 
 	if recordingFailed {
 		finalConnCfg.AuthUpdateToken = ""
 		finalConnCfg.SudoUpdateToken = ""
 	}
-	return finalConnCfg, nil
+	return finalConnCfg, reloadedCfg, nil
 }
 
-func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer) (_ *Client, retErr error) {
+func (c *Connector) initializeConnection(ctx context.Context, planNode connectionPlanNode, dialer Dialer, expectParent *PooledClient) (_ *Client, retErr error) {
 	nodeName := planNode.name
 	policy := freezeDialPolicy(planNode.cfg)
 	attempt := newHandshakeAttempt(planNode.cfg, nil)
@@ -502,7 +500,12 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	if proxy, ok := dialer.(*SSHProxyDialer); ok && proxy.RootConn != nil {
 		transportRoot = proxy.RootConn
 	}
-	pooled := &PooledClient{SSHClient: rawClient, RootConn: transportRoot}
+	pooled := &PooledClient{
+		SSHClient: rawClient,
+		RootConn:  transportRoot,
+		hopConn:   rootConn,
+		parentKey: planNode.parentDigest,
+	}
 	client := c.wrapAuthenticatedClient(policy, attempt, pooled)
 	confirmedExec, err := c.confirmAuthenticatedConnection(ctx, nodeName, rootConn, client)
 	if err != nil {
@@ -513,7 +516,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		return nil, err
 	}
 
-	finalConnCfg, err := c.recordAndSyncAuthAfterHandshake(ctx, nodeName, policy, confirmedExec, outcome, rootConn)
+	finalConnCfg, reloadedCfg, err := c.recordAndSyncAuthAfterHandshake(ctx, nodeName, policy, confirmedExec, outcome, rootConn)
 	if err != nil {
 		return nil, err
 	}
@@ -529,14 +532,20 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	pooled.Snapshot = finalConnCfg.Clone()
 	pooled.hasSnapshot = true
 
-	routeKey := planNode.poolKey()
-	if err := c.publishClient(routeKey, pooled); err != nil {
-		if closeErr := rootConn.Close(); closeErr != nil {
-			return nil, fmt.Errorf("%w; close unpublished SSH client failed: %w", err, closeErr)
+	hopKey := planNode.hopDigest()
+	if reloadedCfg != nil {
+		publishedCfg := NewClientConfig(*reloadedCfg)
+		if planNode.cfg != nil {
+			publishedCfg.ProxyJump = planNode.cfg.ProxyJump
+		}
+		hopKey = DigestClientConfig(publishedCfg, planNode.parentDigest)
+	}
+	if _, err := c.publishPooled(hopKey, pooled, expectParent, roPolicy); err != nil {
+		if errors.Is(err, errStaleParentGeneration) {
+			return nil, fmt.Errorf("rebuild proxy chain for '%s': %w", nodeName, errors.Join(errProxyTransportClosed, err))
 		}
 		return nil, err
 	}
-	c.startKeepAliveFor(routeKey, pooled, roPolicy)
 	// Start multiplexing master if configured. Pass rootConn (this hop's own
 	// connection, not the bastion's transportRoot) so shutting down a jump-target
 	// master never closes the underlying bastion TCP connection.
@@ -577,16 +586,16 @@ func (c *Connector) syncRecordedConnection(
 	originalKeyPaths []string,
 	discoveredKeyPath string,
 	rootConn net.Conn,
-) error {
+) (*ClientConfig, error) {
 	if c.provider == nil {
 		if hasAuthUpdate && discoveredKeyPath != "" && committedAuthToken != oldAuthToken {
 			connCfg.KeyPath = discoveredKeyPath
 		}
-		return nil
+		return nil, nil
 	}
 	newCfg, err := c.reloadConfigAfterRecording(nodeName, hasAuthUpdate, rootConn)
 	if err != nil || newCfg == nil {
-		return err
+		return nil, err
 	}
 
 	expected := *connCfg
@@ -594,7 +603,7 @@ func (c *Connector) syncRecordedConnection(
 	expected.KeyPaths = slices.Clone(originalKeyPaths)
 	if hasAuthUpdate {
 		if err := applyCommittedAuthMetadata(connCfg, newCfg, nodeName, committedAuthToken, rootConn); err != nil {
-			return err
+			return nil, err
 		}
 		expected.AuthUpdateToken = connCfg.AuthUpdateToken
 	} else if recordingFailed {
@@ -609,14 +618,14 @@ func (c *Connector) syncRecordedConnection(
 		expected.KeyPaths = slices.Clone(newCfg.KeyPaths)
 	}
 
-	// [P1] 校验完整连接目标（Address, Port, User, KeyPath, ProxyJump）是否仍然与当前已建立的连接一致
-	if err := validateTargetCompatibility(expected, newCfg); err != nil {
-		return closeRootConnWithError(rootConn, fmt.Sprintf("incompatible target update for node %q during connection setup", nodeName), err)
+	// [P1] 校验完整连接目标是否仍然与当前已建立的连接一致
+	if err := checkTargetDigestCompatibility(expected, newCfg); err != nil {
+		return nil, closeRootConnWithError(rootConn, fmt.Sprintf("incompatible target update for node %q during connection setup", nodeName), err)
 	}
 
 	connCfg.KeyPath = newCfg.KeyPath
 	connCfg.KeyPaths = slices.Clone(newCfg.KeyPaths)
-	return nil
+	return newCfg, nil
 }
 
 func (c *Connector) reloadConfigAfterRecording(nodeName string, hasAuthUpdate bool, rootConn net.Conn) (*ClientConfig, error) {
@@ -633,13 +642,7 @@ func (c *Connector) reloadConfigAfterRecording(nodeName string, hasAuthUpdate bo
 		}
 		return nil, nil
 	}
-	newClone := *newCfg
-	newClone.Address = normalizeHostAddress(newCfg.Address)
-	newClone.BaseHost = normalizeHostAddress(newCfg.BaseHost)
-	newClone.KeyPaths = slices.Clone(newCfg.KeyPaths)
-	newClone.AdmittedCertificates = cloneAdmittedCertificates(newCfg.AdmittedCertificates)
-	newClone.AdmittedKeyDigests = cloneAdmittedKeyDigests(newCfg.AdmittedKeyDigests)
-	return &newClone, nil
+	return NewClientConfig(*newCfg), nil
 }
 
 func applyCommittedAuthMetadata(connCfg *ConnectionConfig, newCfg *ClientConfig, nodeName, committedAuthToken string, rootConn net.Conn) error {
@@ -1976,7 +1979,7 @@ func (c *Connector) syncConnectionAfterRecording(node string, policy dialPolicy,
 	if outcome.keyPath != "" && outcome.keyPath != policy.keyPath {
 		discoveredKeyPath = outcome.keyPath
 	}
-	if err := c.syncRecordedConnection(
+	if _, err := c.syncRecordedConnection(
 		node, &connCfg, policy.authUpdateToken, token, updated, failed,
 		policy.keyPath, policy.keyPaths, discoveredKeyPath, rootConn,
 	); err != nil {

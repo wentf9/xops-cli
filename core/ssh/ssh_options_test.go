@@ -1106,10 +1106,10 @@ func TestClientBatchModeAndSnapshotCloningAndTargetTrustValidation(t *testing.T)
 		t.Fatal("expected mutating Client.ConnectionConfig().Options not to affect live client")
 	}
 
-	// Verify validateTargetCompatibility detects trust option drift
+	// Verify checkTargetDigestCompatibility detects trust option drift
 	newCfg := *cfg
 	newCfg.Options = MustOptions(OptionStrictHostKeyChecking, "no")
-	if err := validateTargetCompatibility(client.ConnectionConfig(), &newCfg); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(client.ConnectionConfig(), &newCfg); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Fatalf("expected ErrSnapshotMismatch when StrictHostKeyChecking changed, got %v", err)
 	}
 }

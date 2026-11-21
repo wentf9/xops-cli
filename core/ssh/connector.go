@@ -2,22 +2,17 @@ package ssh
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"math"
 	"net"
 	"os"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/wentf9/xops-cli/core/concurrent"
 	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
 	"golang.org/x/crypto/ssh"
@@ -47,9 +42,10 @@ type Connector struct {
 	interactionTimeout time.Duration
 	handshakeTimeout   time.Duration
 	baseDialer         Dialer
-	// 连接池：按规范路由键（routeKey）缓存 *PooledClient，隔离不同 ProxyJump 路径到达的同名节点
-	clients *concurrent.Map[string, *PooledClient]
-	// singleflight 组，按规范路由键控制并发和去重
+	// pool stores live and retired *PooledClient instances keyed solely by Merkle
+	// HopDigest, owning CAS parent-generation checks and per-client keepalives.
+	pool *connPool
+	// singleflight group keyed by HopDigest.String() to coalesce identical hops.
 	sf singleflight.Group
 	// 自动接受新的主机密钥
 	AcceptNewHostKey atomic.Bool
@@ -65,19 +61,14 @@ type Connector struct {
 	closed          bool
 	closeDone       chan struct{}
 	closeErr        error
-	// retiredClients tracks pooled transports displaced by incompatible config
-	// updates so active sessions keep running while CloseAll still shuts them down.
-	// Guarded by lifecycleMu.
-	retiredClients []*PooledClient
-	connectWG      sync.WaitGroup
+	connectWG       sync.WaitGroup
 
-	// kaMu 保护 keepAliveCfg 的启用/关闭（keepAlives 自带分片锁，无需 kaMu）
+	// kaMu protects keepAliveCfg (connector-wide keepalive enable/disable).
+	// Lock ordering: connPool.mu -> kaMu -> PooledClient.kaMu; lifecycleMu -> kaMu.
 	kaMu sync.Mutex
 	// keepAliveCfg 为 nil 表示未启用周期心跳（CLI 短生命周期命令默认不启用）
 	keepAliveCfg *keepAliveConfig
-	// keepAlives 心跳注册表：routeKey -> 运行中的心跳条目
-	keepAlives *concurrent.Map[string, *keepAliveEntry]
-	// keepAliveWG 覆盖配置 watcher 及已从注册表驱逐、但尚未完全返回的心跳 goroutine。
+	// keepAliveWG covers the config watcher and all PooledClient-owned keepalive goroutines.
 	keepAliveWG sync.WaitGroup
 	logger      logger.DebugLogger
 	diagnostics logger.DiagnosticObserver
@@ -85,17 +76,9 @@ type Connector struct {
 
 // keepAliveConfig 描述 Connector 级心跳配置（见 EnableKeepAlive）
 type keepAliveConfig struct {
-	ctx               context.Context // 根心跳 ctx，取消后级联终止所有 per-node 心跳
+	ctx               context.Context // 根心跳 ctx，取消后级联终止所有非节点级心跳
 	cancel            context.CancelFunc
 	interval, timeout time.Duration
-}
-
-// keepAliveEntry 单个连接的心跳注册条目
-type keepAliveEntry struct {
-	cancel     context.CancelFunc // per-node ctx 的取消函数
-	client     *PooledClient      // 心跳目标，用于驱逐时指针比对防止误删新连接
-	done       <-chan struct{}    // 心跳 goroutine 的退出通知
-	nodeScoped bool               // 是否由节点自身的 ServerAliveInterval 驱动（独立于全局 keepAliveCfg 生命周期）
 }
 
 // ErrConnectorClosed 表示 Connector 已执行 CloseAll，不能再建立或返回连接。
@@ -164,11 +147,10 @@ func NewConnector(provider ConnectionProvider, opts ...Option) *Connector {
 		secretPrompter:     rejectInteraction{},
 		hostKeyConfirmer:   rejectInteraction{},
 		interactionTimeout: DefaultInteractionTimeout,
-		clients:            concurrent.NewMap[string, *PooledClient](concurrent.HashString),
+		pool:               newConnPool(),
 		lifecycleCtx:       lifecycleCtx,
 		lifecycleCancel:    lifecycleCancel,
 		closeDone:          make(chan struct{}),
-		keepAlives:         concurrent.NewMap[string, *keepAliveEntry](concurrent.HashString),
 		logger:             logger.NopLogger,
 	}
 	if resolver, ok := provider.(SecretResolver); ok {
@@ -228,54 +210,27 @@ func WithSessionConfirmer(confirmer SessionConfirmer) Option {
 }
 
 type connectionPlanNode struct {
-	name     string
-	routeKey string
-	cfg      *ClientConfig
-	control  *ControlConfig
+	name         string
+	digest       HopDigest
+	parentDigest HopDigest
+	cfg          *ClientConfig
+	control      *ControlConfig
 }
 
-// connectionRouteKey returns the canonical pool/singleflight/keepalive key for
-// reaching nodeName through the ordered upstream jump chain (outermost hop first).
-// Direct hops (no upstream jumps) keep bare nodeName as their key; jump-chained
-// hops use a length-prefixed encoding so distinct routes to the same node can
-// never collide or bypass an upstream bastion regardless of node ID characters.
-func connectionRouteKey(upstream []string, nodeName string) string {
-	if len(upstream) == 0 {
-		return nodeName
-	}
-	var b strings.Builder
-	b.WriteString("\x00route\x00")
-	for _, hop := range upstream {
-		b.WriteString(strconv.Itoa(len(hop)))
-		b.WriteByte(':')
-		b.WriteString(hop)
-		b.WriteByte(';')
-	}
-	b.WriteString(strconv.Itoa(len(nodeName)))
-	b.WriteByte(':')
-	b.WriteString(nodeName)
-	b.WriteByte(';')
-	return b.String()
-}
-
-func assignPlanRouteKeys(plan []connectionPlanNode) {
-	upstream := make([]string, 0, len(plan))
+func assignPlanDigests(plan []connectionPlanNode) {
+	parent := ZeroHopDigest
 	for i := len(plan) - 1; i >= 0; i-- {
-		plan[i].routeKey = connectionRouteKey(upstream, plan[i].name)
-		upstream = append(upstream, plan[i].name)
+		plan[i].parentDigest = parent
+		plan[i].digest = DigestClientConfig(plan[i].cfg, parent)
+		parent = plan[i].digest
 	}
 }
 
-func (n connectionPlanNode) poolKey() string {
-	if n.routeKey != "" {
-		return n.routeKey
+func (n connectionPlanNode) hopDigest() HopDigest {
+	if !n.digest.IsZero() {
+		return n.digest
 	}
-	if n.cfg != nil {
-		if jumps := splitProxyJumpChain(n.cfg.ProxyJump); len(jumps) > 0 {
-			return connectionRouteKey(jumps, n.name)
-		}
-	}
-	return n.name
+	return DigestClientConfig(n.cfg, n.parentDigest)
 }
 
 var errProxyTransportClosed = errors.New("proxy transport generation is closed")
@@ -300,9 +255,9 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 		return nil, err
 	}
 
-	// A downstream probe can invalidate the jump clients already visited in
-	// this plan. Restart outside singleflight, so no node task waits recursively
-	// for another node task. Bound restarts even under repeated concurrent loss.
+	// A downstream probe or stale parent generation can invalidate a hop already
+	// visited in this plan. Restart outside singleflight, so no node task waits
+	// recursively for another node task. Bound restarts even under repeated loss.
 	rebuildLimit := len(plan) - 1
 	for rebuilds := 0; ; rebuilds++ {
 		client, err := c.connectPlan(ctx, plan)
@@ -318,138 +273,116 @@ func (c *Connector) Connect(ctx context.Context, nodeName string) (*Client, erro
 	}
 }
 
-// reuseJumpChainedTarget reuses the final target without rebuilding its jump
-// chain. Cached intermediate hops are still validated first: a bastion that
-// stops answering while it keeps forwarding would otherwise go unnoticed,
-// because the target's own probe only exercises the outermost session. A hop
-// without a cached transport contributes nothing to check, which is exactly the
-// case where the target's control master must be used without dialing the
-// bastion. Hops go through the node's shared task so the probe runs on the
-// connector lifecycle: one caller's cancellation must not interrupt a transport
-// other callers still use. The validated hops are returned so the chain build
-// can reuse them instead of probing the same transports a second time.
 func isClientTransportClosed(client *Client) bool {
 	if client == nil {
 		return true
 	}
-	root, ok := client.rootConn.(*physicalSSHConn)
-	return ok && root.closed.Load()
+	return isRootConnClosed(client.rootConn)
 }
 
-func (c *Connector) cascadeInvalidateDownstream(
-	plan []connectionPlanNode,
-	index int,
-	cached *PooledClient,
-	beforeDownstream []*PooledClient,
-	nonDisruptive bool,
-) {
-	for downstream := 0; downstream < index; downstream++ {
-		dsKey := plan[downstream].poolKey()
-		staleDownstream, exists := c.clients.Get(dsKey)
-		if !exists {
-			continue
-		}
-		sameGeneration := (cached.RootConn != nil && staleDownstream.RootConn == cached.RootConn) ||
-			(cached.RootConn == nil && staleDownstream == beforeDownstream[downstream])
-		if !sameGeneration {
-			continue
-		}
-		if nonDisruptive {
-			c.retireIncompatibleClient(dsKey, staleDownstream)
-		} else {
-			c.evictCachedClient(dsKey, staleDownstream)
-			_ = staleDownstream.interrupt()
-		}
-	}
-}
-
-func (c *Connector) reuseJumpChainedTarget(ctx context.Context, plan []connectionPlanNode) (*Client, map[string]*Client, error) {
-	validated := make(map[string]*Client, len(plan)-1)
-	for index := len(plan) - 1; index > 0; index-- {
-		planNode := plan[index]
-		routeKey := planNode.poolKey()
-		cached, ok := c.clients.Get(routeKey)
-		if !ok || cached.SSHClient == nil || (cached.SSHClient.Conn == nil && !cached.hasSnapshot) {
-			continue
-		}
-		var beforeDownstream []*PooledClient
-		if cached.RootConn == nil {
-			beforeDownstream = make([]*PooledClient, index)
-			for downstream := 0; downstream < index; downstream++ {
-				if cur, exists := c.clients.Get(plan[downstream].poolKey()); exists {
-					beforeDownstream[downstream] = cur
-				}
+// validateCachedChain probes every hop of a cached chain approved by
+// canReuseCachedChain, verifying that parent/child RootConn generations remain
+// consistent across probes.
+func (c *Connector) validateCachedChain(ctx context.Context, plan []connectionPlanNode, snapshot []*PooledClient) (*Client, error) {
+	if snapshot[0] != nil && snapshot[0].ControlSocketPath != "" {
+		// ControlMaster-attached target: still probe any cached intermediate hops
+		// so a dead bastion cannot go unnoticed, then validate the target proxy.
+		for index := len(plan) - 1; index > 0; index-- {
+			if snapshot[index] == nil {
+				continue
+			}
+			if _, err := c.connectPlannedNode(ctx, plan[index], nil, nil, true); err != nil {
+				return nil, err
 			}
 		}
-		hopClient, err := c.connectPlannedNode(ctx, planNode, nil, true)
+		return c.connectPlannedNode(ctx, plan[0], nil, nil, true)
+	}
+
+	var prevClient *Client
+	for index := len(plan) - 1; index >= 0; index-- {
+		var expectParent *PooledClient
+		if prevClient != nil {
+			expectParent = prevClient.pooled
+		}
+		hopClient, err := c.connectPlannedNode(ctx, plan[index], nil, expectParent, true)
 		if err != nil {
-			// Only "not reusable" falls back to building the chain; a canceled caller
-			// or a closed connector must surface as itself so the caller stops here and
-			// the failure keeps the hop it happened on.
-			c.getLogger().Debugf("mux: cached jump hop %s is not reusable (%v)", planNode.name, err)
-			if errors.Is(err, errJumpChainRequired) {
-				// The cached hop was stale and evicted (or retired due to config change);
-				// cascade-invalidate all in-process cached downstream hops (plan[0..index-1])
-				// that rode on the same transport generation, without clobbering a fresher
-				// replacement published concurrently by another caller, while still letting
-				// plan[0] attach to an external control master socket if one exists on disk.
-				// Config-change retirements leave live sessions on the previous generation
-				// running until CloseAll; failed liveness probes interrupt dead transports.
-				c.cascadeInvalidateDownstream(plan, index, cached, beforeDownstream, errors.Is(err, ErrSnapshotMismatch))
-				validated = nil
-				break
+			return nil, err
+		}
+		if expectParent != nil && !isConsistentParentChildTransport(expectParent, hopClient.pooled) {
+			if hopClient.pooled != nil {
+				c.pool.Retire(plan[index].hopDigest(), hopClient.pooled)
 			}
-			return nil, nil, err
+			return nil, errJumpChainRequired
 		}
-		if hopClient.sshClient != cached.SSHClient {
-			c.cascadeInvalidateDownstream(plan, index, cached, beforeDownstream, true)
-		}
-		// This transport was validated a moment ago on the connector lifecycle;
-		// probing it again while the chain is rebuilt would repeat a network
-		// round trip per cached hop.
-		validated[routeKey] = hopClient
+		prevClient = hopClient
 	}
-	client, err := c.connectPlannedNode(ctx, plan[0], nil, true)
-	return client, validated, err
+	return prevClient, nil
+}
+
+// tryAttachTargetControlMaster attempts to attach a jump-chained target to an
+// already-running ControlMaster socket on disk without dialing or
+// re-authenticating to its bastion.
+func (c *Connector) tryAttachTargetControlMaster(ctx context.Context, plan []connectionPlanNode, snapshot []*PooledClient) (*Client, error) {
+	for index := len(plan) - 1; index > 0; index-- {
+		if snapshot[index] == nil {
+			continue
+		}
+		if _, err := c.connectPlannedNode(ctx, plan[index], nil, nil, true); err != nil {
+			return nil, err
+		}
+	}
+	return c.connectPlannedNode(ctx, plan[0], nil, nil, true)
+}
+
+func reanchorPlanNodeParent(planNode *connectionPlanNode, expectParent *PooledClient) {
+	if expectParent == nil || expectParent.digest.IsZero() || expectParent.digest == planNode.parentDigest {
+		return
+	}
+	planNode.parentDigest = expectParent.digest
+	planNode.digest = DigestClientConfig(planNode.cfg, planNode.parentDigest)
 }
 
 func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) (*Client, error) {
-	var connected *Client
-	// A cached target transport or an active control master already carries the
-	// whole jump chain, so reusing it must not dial (and re-authenticate to) the
-	// bastion first. Probe the final target alone before building the chain; an
-	// unreusable target reports errJumpChainRequired and falls through below.
-	var validatedHops map[string]*Client
+	// For multi-hop plans, reuse a fully cached chain (or attach to an active
+	// target ControlMaster) before dialing intermediate hops. The reuse predicate
+	// is pure: every hop's Merkle HopDigest must hit and parent/child RootConn
+	// generations must match.
 	if len(plan) > 1 {
-		reused, validated, err := c.reuseJumpChainedTarget(ctx, plan)
-		if err == nil {
-			return reused, nil
+		snapshot := c.pool.SnapshotChain(plan)
+		if canReuseCachedChain(plan, snapshot) {
+			if reused, err := c.validateCachedChain(ctx, plan, snapshot); err == nil {
+				return reused, nil
+			} else if !errors.Is(err, errJumpChainRequired) {
+				return nil, err
+			}
+		} else if snapshot[0] == nil && isMultiplexControlEnabled(c.buildTargetContext(plan[0])) {
+			if reused, err := c.tryAttachTargetControlMaster(ctx, plan, snapshot); err == nil && reused != nil {
+				return reused, nil
+			} else if err != nil && !errors.Is(err, errJumpChainRequired) {
+				return nil, err
+			}
 		}
-		if !errors.Is(err, errJumpChainRequired) {
-			return nil, err
-		}
-		validatedHops = validated
 	}
+
+	var connected *Client
 	for index := len(plan) - 1; index >= 0; index-- {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("connect node '%s' canceled: %w", plan[0].name, err)
 		}
 
 		planNode := plan[index]
-		if validated, ok := validatedHops[planNode.poolKey()]; ok && validated != nil && !isClientTransportClosed(validated) {
-			// Already validated in this call and its physical transport is still open;
-			// reuse it instead of dialing the hop again. It still carries the whole
-			// chain for the next hop below.
-			connected = validated
-			continue
-		}
-		var dialer Dialer
+		var (
+			dialer       Dialer
+			expectParent *PooledClient
+		)
 		switch {
 		case planNode.cfg.ProxyJump != "":
 			if connected == nil {
 				return nil, fmt.Errorf("resolved proxy jump '%s' for node '%s' has no client", planNode.cfg.ProxyJump, planNode.name)
 			}
 			dialer = &SSHProxyDialer{Client: connected.sshClient, RootConn: connected.rootConn}
+			expectParent = connected.pooled
+			reanchorPlanNodeParent(&planNode, expectParent)
 		case planNode.cfg.Options.ActiveProxyCommand() != "":
 			dialer = &proxyCommandDialer{connector: c, planNode: planNode}
 		case c.baseDialer != nil:
@@ -459,7 +392,7 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 		}
 
 		var err error
-		connected, err = c.connectPlannedNode(ctx, planNode, dialer, false)
+		connected, err = c.connectPlannedNode(ctx, planNode, dialer, expectParent, false)
 		if err != nil {
 			return nil, err
 		}
@@ -537,15 +470,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 		if cfg == nil {
 			return nil, fmt.Errorf("config for node '%s' is nil", current)
 		}
-		nodeCfg := *cfg
-		nodeCfg.Address = normalizeHostAddress(nodeCfg.Address)
-		nodeCfg.BaseHost = normalizeHostAddress(nodeCfg.BaseHost)
-		nodeCfg.KeyPaths = slices.Clone(cfg.KeyPaths)
-		nodeCfg.AdmittedCertificates = cloneAdmittedCertificates(cfg.AdmittedCertificates)
-		nodeCfg.AdmittedKeyDigests = cloneAdmittedKeyDigests(cfg.AdmittedKeyDigests)
-		if nodeCfg.Port <= 0 {
-			nodeCfg.Port = 22
-		}
+		nodeCfg := NewClientConfig(*cfg)
 		if !nodeCfg.HasOriginalProxyJump {
 			nodeCfg.OriginalProxyJump = nodeCfg.ProxyJump
 			nodeCfg.HasOriginalProxyJump = true
@@ -559,7 +484,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 		}
 		nodeCfg.ProxyJump = strings.Join(activeJumps, ",")
 		positions[current] = len(plan)
-		plan = append(plan, connectionPlanNode{name: current, cfg: &nodeCfg, control: c.resolveControl(current, &nodeCfg)})
+		plan = append(plan, connectionPlanNode{name: current, cfg: nodeCfg, control: c.resolveControl(current, nodeCfg)})
 
 		if len(activeJumps) > 0 {
 			current = activeJumps[len(activeJumps)-1]
@@ -569,7 +494,7 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			remainingJumps = nil
 		}
 	}
-	assignPlanRouteKeys(plan)
+	assignPlanDigests(plan)
 	return plan, nil
 }
 
@@ -614,147 +539,11 @@ func splitProxyJumpChain(proxyJump string) []string {
 	return jumps
 }
 
-func writeHashStr(h hash.Hash, s string) {
-	_, _ = h.Write([]byte(strconv.Itoa(len(s))))
-	_, _ = h.Write([]byte{':'})
-	_, _ = h.Write([]byte(s))
-	_, _ = h.Write([]byte{';'})
-}
-
-func writeHashBool(h hash.Hash, v bool) {
-	if v {
-		_, _ = h.Write([]byte{'1', ';'})
-	} else {
-		_, _ = h.Write([]byte{'0', ';'})
-	}
-}
-
-func writeHashOptBool(h hash.Hash, v, ok bool) {
-	writeHashBool(h, ok)
-	writeHashBool(h, v)
-}
-
-func writeHashStrings(h hash.Hash, list []string) {
-	_, _ = h.Write([]byte(strconv.Itoa(len(list))))
-	_, _ = h.Write([]byte{'['})
-	for _, s := range list {
-		writeHashStr(h, s)
-	}
-	_, _ = h.Write([]byte{']', ';'})
-}
-
-// targetCompatDigest hashes every compatibility-checked field of cfg so
-// singleflight never coalesces concurrent dials with differing targets,
-// trust/auth versions, auth policies, admitted materials, or transport options.
-func targetCompatDigest(cfg *ClientConfig) string {
-	h := sha256.New()
-	if cfg == nil {
-		writeHashStr(h, "nil")
-		return hex.EncodeToString(h.Sum(nil))
-	}
-	port := cfg.Port
-	if port <= 0 {
-		port = 22
-	}
-	writeHashStr(h, normalizeHostAddress(cfg.Address))
-	writeHashStr(h, strings.TrimSpace(normalizeHostAddress(cfg.BaseHost)))
-	writeHashStr(h, strconv.Itoa(port))
-	writeHashStr(h, cfg.User)
-	writeHashStr(h, effectiveOriginalHost(cfg.OriginalHost, cfg.NodeID))
-	writeHashStr(h, strings.TrimSpace(cfg.CanonicalHost))
-	writeHashStr(h, cfg.KeyRef)
-	writeHashStr(h, cfg.TrustVersion)
-	writeHashStr(h, cfg.AuthUpdateToken)
-	writeHashStr(h, normalizeAuthType(cfg.AuthType))
-	writeHashStr(h, cfg.KeyPath)
-	writeHashStrings(h, cfg.KeyPaths)
-
-	writeHashBool(h, cfg.EnforceAdmittedCertificates)
-	_, _ = h.Write([]byte(strconv.Itoa(len(cfg.AdmittedCertificates))))
-	_, _ = h.Write([]byte{'['})
-	for _, cert := range cfg.AdmittedCertificates {
-		writeHashStr(h, cert.Path)
-		writeHashStr(h, cert.SHA256)
-		writeHashBool(h, cert.Missing)
-		writeHashBool(h, cert.NonRegular)
-	}
-	_, _ = h.Write([]byte{']', ';'})
-
-	writeHashBool(h, cfg.EnforceAdmittedKeyDigests)
-	_, _ = h.Write([]byte(strconv.Itoa(len(cfg.AdmittedKeyDigests))))
-	_, _ = h.Write([]byte{'['})
-	for _, kd := range cfg.AdmittedKeyDigests {
-		writeHashStr(h, kd.Path)
-		writeHashStr(h, kd.SHA256)
-		writeHashBool(h, kd.Missing)
-		writeHashBool(h, kd.NonRegular)
-	}
-	_, _ = h.Write([]byte{']', ';'})
-
-	origJump := cfg.ProxyJump
-	if cfg.HasOriginalProxyJump || cfg.OriginalProxyJump != "" {
-		origJump = cfg.OriginalProxyJump
-	}
-	writeHashStr(h, origJump)
-	activeJump := HasActiveProxyJump(cfg.ProxyJump)
-	writeHashBool(h, activeJump)
-	if !activeJump {
-		writeHashStr(h, cfg.Options.ActiveProxyCommand())
-	}
-
-	opts := cfg.Options
-	writeHashStr(h, opts.StrictHostKeyChecking())
-	writeHashStr(h, opts.UserKnownHostsFile())
-	writeHashStr(h, opts.GlobalKnownHostsFile())
-	writeHashStr(h, opts.VerifyHostKeyDNS())
-	writeHashBool(h, opts.HashKnownHosts())
-	writeHashStrings(h, opts.IdentityFiles())
-	writeHashStrings(h, opts.CertificateFiles())
-	writeHashStr(h, opts.IdentityAgent())
-	writeHashBool(h, opts.IdentitiesOnly())
-	writeHashBool(h, opts.BatchMode())
-	pub, pubOK := opts.PubkeyAuthentication()
-	writeHashOptBool(h, pub, pubOK)
-	pwd, pwdOK := opts.PasswordAuthentication()
-	writeHashOptBool(h, pwd, pwdOK)
-	kbd, kbdOK := opts.KbdInteractiveAuthentication()
-	writeHashOptBool(h, kbd, kbdOK)
-	writeHashStrings(h, opts.PreferredAuthentications())
-	writeHashStr(h, opts.Ciphers())
-	writeHashStr(h, opts.MACs())
-	writeHashStr(h, opts.KexAlgorithms())
-	writeHashStr(h, opts.HostKeyAlgorithms())
-	writeHashStr(h, opts.AddressFamily())
-	writeHashStr(h, strconv.FormatInt(int64(opts.ServerAliveInterval()), 10))
-	writeHashStr(h, strconv.Itoa(opts.ServerAliveCountMax()))
-	tcpKA, tcpKAOK := opts.TCPKeepAlive()
-	writeHashOptBool(h, tcpKA, tcpKAOK)
-	writeHashStr(h, opts.ForwardAgent())
-	writeHashStr(h, opts.GatewayPortsMode())
-	unlink, unlinkOK := opts.StreamLocalBindUnlink()
-	writeHashOptBool(h, unlink, unlinkOK)
-	mask, maskOK := opts.StreamLocalBindMask()
-	writeHashBool(h, maskOK)
-	writeHashStr(h, strconv.FormatUint(uint64(mask), 8))
-	writeHashStr(h, opts.CanonicalizeHostname())
-	writeHashStrings(h, opts.CanonicalDomains())
-	dots, dotsOK := opts.CanonicalizeMaxDots()
-	writeHashBool(h, dotsOK)
-	writeHashStr(h, strconv.Itoa(dots))
-	fb, fbOK := opts.CanonicalizeFallbackLocal()
-	writeHashOptBool(h, fb, fbOK)
-	writeHashStrings(h, opts.CanonicalizePermittedCNAMEs())
-
-	return hex.EncodeToString(h.Sum(nil))
-}
-
 // connectPlannedNode runs the cache/multiplex/connect decision for one node in a
-// shared task. reuseOnly stops before dialing so a jump-chained target can be
-// reused without its bastion; a caller that finds errJumpChainRequired retries
-// with the full chain once the reuse-only task has finished.
-func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, reuseOnly bool) (*Client, error) {
-	routeKey := planNode.poolKey()
-	sfKey := routeKey + "\x00" + targetCompatDigest(planNode.cfg)
+// shared task keyed by its Merkle HopDigest. reuseOnly stops before dialing so a
+// cached hop or control master can be validated without dialing.
+func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, expectParent *PooledClient, reuseOnly bool) (*Client, error) {
+	sfKey := planNode.hopDigest().String()
 	for {
 		// 缓存复检、失效驱逐和重建位于同一个共享任务内。任务仅绑定 Connector 生命周期，
 		// 单个调用者取消只停止等待，不会关闭连接池中由其他调用者共享的连接。
@@ -764,16 +553,14 @@ func (c *Connector) connectPlannedNode(ctx context.Context, planNode connectionP
 				return nil, err
 			}
 			defer finish()
-			return c.connectNode(sharedCtx, planNode, dialer, reuseOnly)
+			return c.connectNode(sharedCtx, planNode, dialer, expectParent, reuseOnly)
 		})
 
 		client, err := c.awaitPlannedNode(ctx, planNode.name, resultCh)
 		if err != nil && !reuseOnly && errors.Is(err, errJumpChainRequired) {
 			// This call joined another caller's reuse-only task, so the target was
 			// reported as not reusable. The task is finished; asking again runs the
-			// full chain. Each repeat needs another caller to start a fresh probe and
-			// the wait stays bounded by ctx, so a full-mode call never surfaces the
-			// internal sentinel.
+			// full chain.
 			continue
 		}
 		return client, err
@@ -811,20 +598,16 @@ func (c *Connector) beginSharedConnect() (context.Context, func(), error) {
 	return c.lifecycleCtx, c.connectWG.Done, nil
 }
 
-func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, reuseOnly bool) (*Client, error) {
+func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode, dialer Dialer, expectParent *PooledClient, reuseOnly bool) (*Client, error) {
 	nodeName := planNode.name
-	routeKey := planNode.poolKey()
+	hopKey := planNode.hopDigest()
 	var probeErr error
-	var compatErr error
-	if cachedClient, ok := c.clients.Get(routeKey); ok {
-		if cachedClient.hasSnapshot {
-			compatErr = validateTargetCompatibility(cachedClient.Snapshot, planNode.cfg)
-		}
+	if cachedClient, ok := c.pool.Get(hopKey); ok {
 		switch {
-		case compatErr != nil:
-			c.getLogger().Debugf("ssh: cached connection for node %q is incompatible with updated config (%v); retiring", nodeName, compatErr)
-			c.retireIncompatibleClient(routeKey, cachedClient)
-			c.retireDownstreamGeneration(routeKey, cachedClient)
+		case expectParent != nil && !isConsistentParentChildTransport(expectParent, cachedClient):
+			c.pool.Retire(hopKey, cachedClient)
+		case cachedClient.SSHClient == nil:
+			c.pool.Evict(hopKey, cachedClient, true)
 		case cachedClient.SSHClient.Conn == nil:
 			logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})
 			return c.wrapCachedClient(planNode.cfg, cachedClient), nil
@@ -834,8 +617,7 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 				return c.wrapCachedClient(planNode.cfg, cachedClient), nil
 			} else {
 				probeErr = err
-				c.evictCachedClient(routeKey, cachedClient)
-				c.evictDownstreamGeneration(routeKey, cachedClient)
+				c.pool.Evict(hopKey, cachedClient, true)
 				if ctx.Err() != nil {
 					return nil, fmt.Errorf("probe cached SSH connection for node '%s' failed: %w", nodeName, ctx.Err())
 				}
@@ -855,13 +637,10 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 	}
 
 	if reuseOnly {
-		if compatErr != nil {
-			return nil, fmt.Errorf("%w: %w", errJumpChainRequired, compatErr)
-		}
 		return nil, errJumpChainRequired
 	}
 
-	client, err := c.initializeConnection(ctx, planNode, dialer)
+	client, err := c.initializeConnection(ctx, planNode, dialer, expectParent)
 	// Another caller can invalidate the same root after the check above.
 	if proxy, ok := dialer.(*SSHProxyDialer); err != nil && ok && proxy.transportClosed() && ctx.Err() == nil {
 		return nil, fmt.Errorf("rebuild proxy chain for '%s': %w", nodeName, errors.Join(errProxyTransportClosed, err))
@@ -901,6 +680,7 @@ func (c *Connector) wrapPoolClientWithResolver(cfg *ClientConfig, cachedClient *
 		c.getInteractionTimeout(),
 		c.getLogger(),
 	))
+	client.pooled = cachedClient
 	cachedClient.probeMu.Lock()
 	if cachedClient.probeCache == nil {
 		cachedClient.probeCache = &executionProbeCache{}
@@ -930,103 +710,6 @@ func (c *Connector) keepAliveProbeTimeout() time.Duration {
 		return c.keepAliveCfg.timeout
 	}
 	return DefaultKeepAliveTimeout
-}
-
-func (c *Connector) evictCachedClient(nodeName string, stale *PooledClient) {
-	concurrent.RemoveIfMatch(c.clients, nodeName, stale)
-	c.removeKeepAliveFor(nodeName, stale)
-}
-
-// retireIncompatibleClient removes displaced from the active pool and cancels
-// its keepalive without interrupting its transport while the connector remains
-// open, preserving live sessions on earlier generations until CloseAll.
-func (c *Connector) retireIncompatibleClient(routeKey string, displaced *PooledClient) {
-	if displaced == nil {
-		return
-	}
-	c.lifecycleMu.Lock()
-	if c.closed {
-		c.lifecycleMu.Unlock()
-		c.removeKeepAliveFor(routeKey, displaced)
-		_ = displaced.interrupt()
-		return
-	}
-	concurrent.RemoveIfMatch(c.clients, routeKey, displaced)
-	if !slices.Contains(c.retiredClients, displaced) {
-		c.retiredClients = append(c.retiredClients, displaced)
-	}
-	c.lifecycleMu.Unlock()
-	c.removeKeepAliveFor(routeKey, displaced)
-}
-
-func isDownstreamRouteKey(parentKey, candidateKey string) bool {
-	if candidateKey == "" || candidateKey == parentKey {
-		return false
-	}
-	var prefix string
-	if strings.HasPrefix(parentKey, "\x00route\x00") {
-		prefix = parentKey
-	} else {
-		prefix = "\x00route\x00" + strconv.Itoa(len(parentKey)) + ":" + parentKey + ";"
-	}
-	return len(candidateKey) > len(prefix) && strings.HasPrefix(candidateKey, prefix)
-}
-
-// retireDownstreamGeneration non-disruptively retires cached downstream hops
-// riding on displaced's physical transport generation after parentKey drifted.
-// When displaced.RootConn is nil (e.g. control proxy or test double without a
-// tracked physical root), all cached downstream hops under parentKey are retired.
-func (c *Connector) retireDownstreamGeneration(parentKey string, displaced *PooledClient) {
-	if displaced == nil {
-		return
-	}
-	type candidate struct {
-		key    string
-		client *PooledClient
-	}
-	var downstream []candidate
-	c.clients.IterCb(func(key string, client *PooledClient) bool {
-		if client == nil || !isDownstreamRouteKey(parentKey, key) {
-			return true
-		}
-		if displaced.RootConn != nil && client.RootConn != displaced.RootConn {
-			return true
-		}
-		downstream = append(downstream, candidate{key: key, client: client})
-		return true
-	})
-	for _, item := range downstream {
-		c.retireIncompatibleClient(item.key, item.client)
-	}
-}
-
-// evictDownstreamGeneration evicts and interrupts cached downstream hops riding
-// on a dead parent generation after a failed liveness probe or keepalive death.
-func (c *Connector) evictDownstreamGeneration(parentKey string, dead *PooledClient) {
-	if dead == nil {
-		return
-	}
-	type candidate struct {
-		key    string
-		client *PooledClient
-	}
-	var downstream []candidate
-	c.clients.IterCb(func(key string, client *PooledClient) bool {
-		if client == nil || !isDownstreamRouteKey(parentKey, key) {
-			return true
-		}
-		if dead.RootConn != nil && client.RootConn != dead.RootConn {
-			return true
-		}
-		downstream = append(downstream, candidate{key: key, client: client})
-		return true
-	})
-	for _, item := range downstream {
-		if concurrent.RemoveIfMatch(c.clients, item.key, item.client) {
-			c.removeKeepAliveFor(item.key, item.client)
-			_ = item.client.interrupt()
-		}
-	}
 }
 
 func (c *Connector) resolveSecret(cfg *ClientConfig, req SecretRequest) ([]byte, error) {
@@ -1222,18 +905,17 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 	pooled := &PooledClient{
 		SSHClient:          rawClient,
 		RootConn:           rootConn,
+		hopConn:            rootConn,
 		ControlSocketPath:  expandedPath,
 		ControlExpectedUID: c.expectedPeerUID(),
 		Snapshot:           planNode.cfg.ToConnectionConfig(),
 		hasSnapshot:        true,
 	}
-	routeKey := planNode.poolKey()
-	if err := c.publishClient(routeKey, pooled); err != nil {
-		_ = rawClient.Close()
+	hopKey := planNode.hopDigest()
+	if _, err := c.publishPooled(hopKey, pooled, nil, planNode.cfg); err != nil {
 		_ = proxyConn.Close()
 		return nil, err
 	}
-	c.startKeepAliveFor(routeKey, pooled, planNode.cfg)
 	logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{
 		Kind:   logger.ConnectionReused,
 		NodeID: planNode.name,
@@ -1680,14 +1362,50 @@ func (c *Connector) confirmSessionCallback(nodeName string, cfg *ClientConfig) f
 	}
 }
 
-func (c *Connector) publishClient(nodeName string, client *PooledClient) error {
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-	if c.closed {
-		return ErrConnectorClosed
+// publishPooled publishes client into the Merkle-keyed CAS pool and atomically
+// starts its owned keepalive (if configured) under the pool lock.
+func (c *Connector) publishPooled(key HopDigest, client *PooledClient, expectParent *PooledClient, clientCfg *ClientConfig) (*PooledClient, error) {
+	return c.pool.Publish(key, client, expectParent, func(published *PooledClient) {
+		c.attachKeepAliveLocked(key, published, clientCfg)
+	})
+}
+
+func (c *Connector) resolveKeepAliveParams(clientCfg *ClientConfig) (parentCtx context.Context, interval, timeout time.Duration, nodeScoped bool) {
+	c.kaMu.Lock()
+	if cfg := c.keepAliveCfg; cfg != nil && cfg.ctx.Err() == nil {
+		parentCtx = cfg.ctx
+		interval = cfg.interval
+		timeout = cfg.timeout
 	}
-	c.clients.Set(nodeName, client)
-	return nil
+	c.kaMu.Unlock()
+
+	if clientCfg != nil && clientCfg.Options != nil {
+		countMax := clientCfg.Options.ServerAliveCountMax()
+		if nodeInterval := clientCfg.Options.ServerAliveInterval(); nodeInterval > 0 {
+			nodeScoped = true
+			parentCtx = c.lifecycleCtx
+			interval = nodeInterval
+			if countMax <= 0 {
+				countMax = 3
+			}
+			timeout = multiplyDurationSaturated(nodeInterval, countMax)
+		} else if interval > 0 && countMax > 0 {
+			timeout = multiplyDurationSaturated(interval, countMax)
+		}
+	}
+	return parentCtx, interval, timeout, nodeScoped
+}
+
+// attachKeepAliveLocked starts client's owned keepalive while connPool.mu is held.
+// Lock ordering: connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
+func (c *Connector) attachKeepAliveLocked(key HopDigest, client *PooledClient, clientCfg *ClientConfig) {
+	parentCtx, interval, timeout, nodeScoped := c.resolveKeepAliveParams(clientCfg)
+	if parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
+		return
+	}
+	client.startKeepAlive(parentCtx, interval, timeout, nodeScoped, func(error) {
+		c.pool.Evict(key, client, false)
+	}, &c.keepAliveWG)
 }
 
 // EnableKeepAlive 启用连接池周期心跳（opt-in，幂等）。
@@ -1744,84 +1462,14 @@ func (c *Connector) watchKeepAliveConfig(cfg *keepAliveConfig) {
 	<-cfg.ctx.Done()
 
 	c.kaMu.Lock()
-	defer c.kaMu.Unlock()
 	if c.keepAliveCfg != cfg {
+		c.kaMu.Unlock()
 		return
 	}
 	c.keepAliveCfg = nil
-	var globalNodes []string
-	c.keepAlives.IterCb(func(nodeName string, entry *keepAliveEntry) bool {
-		if !entry.nodeScoped {
-			entry.cancel()
-			globalNodes = append(globalNodes, nodeName)
-		}
-		return true
-	})
-	for _, nodeName := range globalNodes {
-		c.keepAlives.Remove(nodeName)
-	}
-}
+	c.kaMu.Unlock()
 
-// startKeepAliveFor 为入池连接挂载心跳；未启用心跳时为 no-op。
-// 全程持有 kaMu：与 CloseAll（cancel 根 ctx + 清空注册表）完全互斥，
-// 杜绝"读到 cfg 后、写入注册表前"窗口内 CloseAll 先行清空导致的孤儿注册条目。
-// 同节点重连时先取消旧心跳，避免同一节点存在多个心跳 goroutine。
-// 锁序恒为 kaMu -> keepAlives 分片锁，evictDeadClient 不取 kaMu，无死锁风险
-func (c *Connector) startKeepAliveFor(nodeName string, client *PooledClient, clientCfgs ...*ClientConfig) {
-	c.kaMu.Lock()
-	defer c.kaMu.Unlock()
-
-	var clientCfg *ClientConfig
-	if len(clientCfgs) > 0 {
-		clientCfg = clientCfgs[0]
-	}
-
-	var parentCtx context.Context
-	var interval, timeout time.Duration
-	var nodeScoped bool
-	if cfg := c.keepAliveCfg; cfg != nil && cfg.ctx.Err() == nil {
-		parentCtx = cfg.ctx
-		interval = cfg.interval
-		timeout = cfg.timeout
-	}
-	if clientCfg != nil && clientCfg.Options != nil {
-		countMax := clientCfg.Options.ServerAliveCountMax()
-		if nodeInterval := clientCfg.Options.ServerAliveInterval(); nodeInterval > 0 {
-			nodeScoped = true
-			parentCtx = c.lifecycleCtx
-			interval = nodeInterval
-			if countMax <= 0 {
-				countMax = 3
-			}
-			timeout = multiplyDurationSaturated(nodeInterval, countMax)
-		} else if interval > 0 && countMax > 0 {
-			timeout = multiplyDurationSaturated(interval, countMax)
-		}
-	}
-	if parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
-		return
-	}
-
-	// 终止同节点旧心跳（入池点在 singleflight 保护内，无并发冲突）
-	if old, ok := c.keepAlives.Pop(nodeName); ok {
-		old.cancel()
-	}
-
-	nodeCtx, cancel := context.WithCancel(parentCtx)
-	entry := &keepAliveEntry{
-		cancel:     cancel,
-		client:     client,
-		nodeScoped: nodeScoped,
-	}
-	c.keepAlives.Set(nodeName, entry)
-	c.keepAliveWG.Add(1)
-	entry.done = startKeepAlive(nodeCtx, client.SSHClient, interval, timeout, func(error) {
-		c.evictDeadClient(nodeName, client, entry)
-	}, client.interrupt)
-	go func() {
-		<-entry.done
-		c.keepAliveWG.Done()
-	}()
+	c.pool.StopGlobalKeepAlives()
 }
 
 func multiplyDurationSaturated(d time.Duration, count int) time.Duration {
@@ -1832,30 +1480,6 @@ func multiplyDurationSaturated(d time.Duration, count int) time.Duration {
 		return time.Duration(math.MaxInt64)
 	}
 	return d * time.Duration(count)
-}
-
-func (c *Connector) removeKeepAliveFor(nodeName string, client *PooledClient) {
-	c.kaMu.Lock()
-	defer c.kaMu.Unlock()
-	entry, ok := c.keepAlives.Get(nodeName)
-	if !ok || entry.client != client {
-		return
-	}
-	if concurrent.RemoveIfMatch(c.keepAlives, nodeName, entry) {
-		entry.cancel()
-	}
-}
-
-// evictDeadClient 心跳失败后的池驱逐（StartKeepAlive 已 Close 该连接）。
-// 使用 RemoveIfMatch 原子"比对并删除"：仅当池/注册表中仍是失败连接本人时才驱逐，
-// 防止"读取-比对-删除"间隙内并发重连写入新连接后被旧心跳误删
-func (c *Connector) evictDeadClient(nodeName string, dead *PooledClient, entry *keepAliveEntry) {
-	removed := concurrent.RemoveIfMatch(c.clients, nodeName, dead)
-	if removed || (dead != nil && dead.RootConn != nil) {
-		c.evictDownstreamGeneration(nodeName, dead)
-	}
-	concurrent.RemoveIfMatch(c.keepAlives, nodeName, entry)
-	entry.cancel()
 }
 
 func normalizeHostAddress(host string) string {
@@ -1924,8 +1548,6 @@ func (c *Connector) CloseAll() error {
 			ownedMasters = append(ownedMasters, master)
 		}
 	}
-	retiredClients := c.retiredClients
-	c.retiredClients = nil
 	c.masters = nil
 	c.masterOrder = nil
 	clear(c.plans)
@@ -1943,35 +1565,27 @@ func (c *Connector) CloseAll() error {
 		}
 	}
 
-	// Closing forbids new publication. Snapshot the existing clients without
-	// holding map locks during network cleanup, then interrupt their physical
-	// transports BEFORE joining connection workers. A downstream handshake can
-	// otherwise remain blocked in a ProxyJump channel after context cancellation.
+	// Closing the pool forbids new publication, stops all per-client keepalives,
+	// and drains both active and retired transports BEFORE joining connection
+	// workers. A downstream handshake can otherwise remain blocked in a ProxyJump
+	// channel after context cancellation.
 	var pooledClients []*PooledClient
-	c.clients.IterCb(func(_ string, client *PooledClient) bool {
-		pooledClients = append(pooledClients, client)
-		return true
-	})
+	if c.pool != nil {
+		pooledClients = c.pool.Close()
+	}
 	for _, plan := range planConnectors {
 		if err := c.closePlan(plan); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
 	}
-	closeErrs = append(closeErrs, interruptUniquePooledClients(pooledClients, retiredClients)...)
+	closeErrs = append(closeErrs, interruptUniquePooledClients(pooledClients)...)
 	c.connectWG.Wait()
-	c.clients.Clear()
 
-	// startKeepAliveFor 只可能由已结束的 Connect 调用，此处可完整取得并清空注册表。
 	c.kaMu.Lock()
 	if c.keepAliveCfg != nil {
 		c.keepAliveCfg.cancel()
 		c.keepAliveCfg = nil
 	}
-	c.keepAlives.IterCb(func(_ string, entry *keepAliveEntry) bool {
-		entry.cancel()
-		return true
-	})
-	c.keepAlives.Clear()
 	c.kaMu.Unlock()
 
 	c.keepAliveWG.Wait()
@@ -2005,25 +1619,4 @@ func interruptUniquePooledClients(groups ...[]*PooledClient) []error {
 		}
 	}
 	return errs
-}
-
-// PooledClient retains the outermost transport, including for ProxyJump clients.
-// Interrupting it also terminates other clients sharing that transport.
-type PooledClient struct {
-	SSHClient          *ssh.Client
-	RootConn           net.Conn
-	probeMu            sync.Mutex
-	probeCache         *executionProbeCache
-	ControlSocketPath  string
-	ControlExpectedUID uint32
-	Snapshot           ConnectionConfig
-	hasSnapshot        bool
-}
-
-func (c *PooledClient) interrupt() error {
-	var sshClient *ssh.Client
-	if c.SSHClient != nil && c.SSHClient.Conn != nil {
-		sshClient = c.SSHClient
-	}
-	return interruptSSHTransport(c.RootConn, sshClient)
 }

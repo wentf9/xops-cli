@@ -1229,13 +1229,13 @@ func assertPass2ValidateTargetCompatibility(t *testing.T) {
 	cur := (&base).ToConnectionConfig()
 
 	same := makeBase()
-	if err := validateTargetCompatibility(cur, &same); err != nil {
+	if err := checkTargetDigestCompatibility(cur, &same); err != nil {
 		t.Fatalf("identical config failed compatibility check: %v", err)
 	}
 
 	origMut := makeBase()
 	origMut.OriginalHost = "other.prod"
-	if err := validateTargetCompatibility(cur, &origMut); !errors.Is(err, ErrSnapshotMismatch) {
+	if err := checkTargetDigestCompatibility(cur, &origMut); !errors.Is(err, ErrSnapshotMismatch) {
 		t.Fatalf("OriginalHost change = %v, want ErrSnapshotMismatch", err)
 	}
 
@@ -1254,7 +1254,7 @@ func assertPass2ValidateTargetCompatibility(t *testing.T) {
 		if err := mut.Options.Set(m[0], m[1]); err != nil {
 			t.Fatal(err)
 		}
-		if err := validateTargetCompatibility(cur, &mut); !errors.Is(err, ErrSnapshotMismatch) {
+		if err := checkTargetDigestCompatibility(cur, &mut); !errors.Is(err, ErrSnapshotMismatch) {
 			t.Fatalf("mutation %s=%s: got %v, want ErrSnapshotMismatch", m[0], m[1], err)
 		}
 	}
