@@ -11,12 +11,12 @@ import (
 	"charm.land/bubbles/v2/key"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/huh/v2"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
-	fileutil "github.com/wentf9/xops-cli/pkg/utils/file"
 )
 
 type nodeFormState struct {
@@ -381,6 +381,35 @@ func (m *Model) validateTags(s string) error {
 	return nil
 }
 
+// normalizeFormIdentityKeyPath expands concrete literal key paths (~/ and
+// relative paths) via config.NormalizePersistableIdentityPath while preserving
+// OpenSSH templates (%tokens, ${VAR}), the "none" sentinel, and unresolved
+// ~user prefixes without CWD mangling.
+func normalizeFormIdentityKeyPath(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	if abs := config.NormalizePersistableIdentityPath(raw); abs != "" {
+		return abs, nil
+	}
+	setting, err := ssh.ParseIdentityPathSetting(raw, true)
+	if err != nil {
+		return "", err
+	}
+	if setting.Unset() {
+		return "", nil
+	}
+	return setting.Raw, nil
+}
+
+// resolveFormKeyPath normalizes keyPath when key authentication is selected.
+func resolveFormKeyPath(authType, keyPath string) (string, error) {
+	if authType != "key" || keyPath == "" {
+		return "", nil
+	}
+	return normalizeFormIdentityKeyPath(keyPath)
+}
+
 func (m *Model) validateFormState() error {
 	s := m.formState
 	if err := m.validateAliases(s.alias); err != nil {
@@ -396,6 +425,9 @@ func (m *Model) validateFormState() error {
 		return err
 	}
 	if _, err := parseFormPort(s.port); err != nil {
+		return err
+	}
+	if _, err := resolveFormKeyPath(s.authType, s.keyPath); err != nil {
 		return err
 	}
 	if err := m.validateTags(s.tags); err != nil {
@@ -500,10 +532,11 @@ func (m *Model) saveFormCmd() tea.Cmd {
 		}
 	}
 
-	// Standardize key path
-	absKeyPath := ""
-	if s.authType == "key" && s.keyPath != "" {
-		absKeyPath = fileutil.ToAbsolutePath(s.keyPath)
+	// Standardize key path without mangling OpenSSH templates (%tokens, ${VAR}) or "none".
+	absKeyPath, err := resolveFormKeyPath(s.authType, s.keyPath)
+	if err != nil {
+		m.status = errorStyle.Render(err.Error())
+		return nil
 	}
 
 	// Preserve the actual identity referenced by an edited node. The canonical

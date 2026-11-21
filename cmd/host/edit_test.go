@@ -8,7 +8,7 @@ import (
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
-// mockProvider supplies the alias lookup required by applyNodeUpdates.
+// mockProvider supplies the alias lookup required by validateHostNodeAliases.
 type mockProvider struct {
 	aliases map[string]string
 }
@@ -24,7 +24,15 @@ func TestApplyNodeUpdates(t *testing.T) {
 	identity := &models.Identity{User: "old_user"}
 	node := &models.Node{Alias: []string{"old_alias"}}
 	provider := newMockProvider()
+	provider.aliases["taken"] = "other@10.0.0.2:22"
 	oldName := "old_user@old_ip:22"
+
+	if err := validateHostNodeAliases(provider, oldName, []string{"new_alias"}); err != nil {
+		t.Fatalf("validateHostNodeAliases(new_alias) unexpected error: %v", err)
+	}
+	if err := validateHostNodeAliases(provider, oldName, []string{"taken"}); err == nil {
+		t.Fatalf("validateHostNodeAliases(taken) expected conflict error, got nil")
+	}
 
 	cmd := &cobra.Command{}
 	cmd.Flags().StringSlice("alias", []string{}, "")
@@ -37,7 +45,7 @@ func TestApplyNodeUpdates(t *testing.T) {
 		user:    "new_user",
 	}
 
-	updated, nameChanged := applyNodeUpdates(cmd, provider, oldName, host, identity, node, flags)
+	updated, nameChanged := applyNodeUpdates(cmd, host, identity, node, flags)
 	if !updated || !nameChanged {
 		t.Errorf("expected updated/nameChanged = true, got %v/%v", updated, nameChanged)
 	}
@@ -52,7 +60,7 @@ func TestApplyNodeUpdates(t *testing.T) {
 	if err := cmd.Flags().Set("alias", "new_alias"); err != nil {
 		t.Fatalf("set alias flag: %v", err)
 	}
-	updated, nameChanged = applyNodeUpdates(cmd, provider, oldName, host, identity, node, flags2)
+	updated, nameChanged = applyNodeUpdates(cmd, host, identity, node, flags2)
 	if !updated || nameChanged {
 		t.Errorf("expected updated=true, nameChanged=false, got %v/%v", updated, nameChanged)
 	}
@@ -64,7 +72,7 @@ func TestApplyNodeUpdates(t *testing.T) {
 	flags3 := &editFlags{
 		password: "new_password",
 	}
-	updated, nameChanged = applyNodeUpdates(cmd, provider, oldName, host, identity, node, flags3)
+	updated, nameChanged = applyNodeUpdates(cmd, host, identity, node, flags3)
 	if !updated || nameChanged {
 		t.Errorf("expected updated=true, nameChanged=false, got %v/%v", updated, nameChanged)
 	}
@@ -78,7 +86,7 @@ func TestApplyNodeUpdates(t *testing.T) {
 		addTags: []string{"prod,api"},
 		rmTags:  []string{"legacy"},
 	}
-	updated, nameChanged = applyNodeUpdates(cmd, provider, oldName, host, identity, node, flags4)
+	updated, nameChanged = applyNodeUpdates(cmd, host, identity, node, flags4)
 	if !updated || nameChanged {
 		t.Errorf("expected updated=true, nameChanged=false, got %v/%v", updated, nameChanged)
 	}

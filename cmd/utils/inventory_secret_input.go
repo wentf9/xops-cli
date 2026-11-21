@@ -56,7 +56,7 @@ func (s *InventorySecretInput) Read(cmd *cobra.Command) (password, passphrase st
 	if s.askPassphrase {
 		prompt := i18n.T("prompt_enter_key_passphrase")
 		if keyPath, _ := cmd.Flags().GetString("key"); keyPath != "" {
-			prompt = i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": ToAbsolutePath(keyPath)})
+			prompt = i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": NormalizeIdentityKeyPath(keyPath)})
 		}
 		secret, err := ReadPasswordFromTerminal(prompt)
 		if err != nil {

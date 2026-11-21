@@ -96,14 +96,14 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	if _, ok := repository.GetNode(name); ok {
 		return fmt.Errorf("节点 %s 已存在", name)
 	}
-	if err := validateNewNodeAliases(repository, flags.alias); err != nil {
+	if err := validateHostNodeAliases(repository, "", flags.alias); err != nil {
 		return err
 	}
 
 	hostObj := models.Host{Address: flags.address, Port: flags.port}
-	resolvedJump, err := repository.ResolveProxyJumpChain(flags.jump)
+	resolvedJump, err := validateHostProxyJump(repository, "", name, nil, flags.alias, flags.jump)
 	if err != nil {
-		return fmt.Errorf("resolve jump host for new node: %w", err)
+		return err
 	}
 	node := models.Node{
 		HostRef:     config.FormatHostPort(flags.address, flags.port),
@@ -291,18 +291,6 @@ func mergeTargetAddressSpec(spec string, address, user *string, port *uint16, po
 	return nil
 }
 
-func validateNewNodeAliases(repo *config.Repository, aliases []string) error {
-	for _, alias := range aliases {
-		if err := config.ValidateNodeAlias(alias); err != nil {
-			return err
-		}
-		if existing := repo.FindAlias(alias); existing != "" {
-			return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": alias, "Node": existing}))
-		}
-	}
-	return nil
-}
-
 // newInventoryIdentity keeps prompted and stdin credentials outside the model.
 func newInventoryIdentity(user, password, keyPath string, skipVerify bool) (models.Identity, string, error) {
 	if user == "" {
@@ -315,7 +303,7 @@ func newInventoryIdentity(user, password, keyPath string, skipVerify bool) (mode
 	identity := models.Identity{User: user}
 	switch {
 	case keyPath != "":
-		identity.KeyPath, identity.AuthType = utils.ToAbsolutePath(keyPath), "key"
+		identity.KeyPath, identity.AuthType = utils.NormalizeIdentityKeyPath(keyPath), "key"
 	case password != "":
 		identity.AuthType = "password"
 	case skipVerify:

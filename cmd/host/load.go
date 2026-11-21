@@ -315,11 +315,8 @@ func prepareImport(repo *config.Repository, addr utils.HostInfo, tag string) (*i
 		}
 	}
 	if addr.Alias != "" {
-		if err := config.ValidateNodeAlias(addr.Alias); err != nil {
+		if err := validateHostNodeAliases(repo, draft.nodeID, []string{addr.Alias}); err != nil {
 			return nil, err
-		}
-		if existing := repo.FindAlias(addr.Alias); existing != "" && existing != draft.nodeID {
-			return nil, fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": addr.Alias, "Node": existing}))
 		}
 		draft.bundle.Node.Alias, _ = appendUnique(draft.bundle.Node.Alias, addr.Alias)
 	}
@@ -334,7 +331,7 @@ func (d *importDraft) verificationBundle() config.ConnectionSnapshot {
 		bundle.Identity.LoginPasswordRef = nil
 	} else if d.addr.KeyPath != "" || d.addr.Passphrase != "" {
 		if d.addr.KeyPath != "" {
-			bundle.Identity.KeyPath = utils.ToAbsolutePath(d.addr.KeyPath)
+			bundle.Identity.KeyPath = utils.NormalizeIdentityKeyPath(d.addr.KeyPath)
 		}
 		bundle.Identity.Passphrase, bundle.Identity.AuthType = d.addr.Passphrase, "key"
 		bundle.Identity.PassphraseRef = nil
@@ -345,7 +342,7 @@ func (d *importDraft) verificationBundle() config.ConnectionSnapshot {
 func (d *importDraft) save(ctx context.Context, repo *config.Repository) error {
 	node, host, identity := d.bundle.Node, d.bundle.Host, d.bundle.Identity
 	if repo.Snapshot().SchemaVersion == 2 && d.ref.ID == "" && d.addr.KeyPath != "" && d.addr.Passphrase == "" && d.addr.Password == "" {
-		identity.KeyPath, identity.AuthType = utils.ToAbsolutePath(d.addr.KeyPath), "key"
+		identity.KeyPath, identity.AuthType = utils.NormalizeIdentityKeyPath(d.addr.KeyPath), "key"
 		write, err := utils.PrepareInventoryCredential(repo, credential.Target{NodeID: d.nodeID}, identity, "", "", d.addr.KeyPath, nil)
 		if err != nil {
 			return err
@@ -389,7 +386,7 @@ func updateLegacyImportAuth(identity *models.Identity, addr utils.HostInfo) bool
 		return changed
 	}
 	if addr.KeyPath != "" {
-		path := utils.ToAbsolutePath(addr.KeyPath)
+		path := utils.NormalizeIdentityKeyPath(addr.KeyPath)
 		changed := identity.KeyPath != path || identity.Passphrase != addr.Passphrase || identity.AuthType != "key"
 		identity.KeyPath, identity.Passphrase, identity.AuthType = path, addr.Passphrase, "key"
 		return changed

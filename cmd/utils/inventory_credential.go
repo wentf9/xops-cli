@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
 
 	coreauth "github.com/wentf9/xops-cli/core/auth"
+	coreSSH "github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -14,6 +17,29 @@ import (
 	sshcrypto "golang.org/x/crypto/ssh"
 	"golang.org/x/term"
 )
+
+// NormalizeIdentityKeyPath expands concrete literal key paths (~/ and relative
+// paths) via config.NormalizePersistableIdentityPath while preserving OpenSSH
+// templates (%tokens, ${VAR}), the "none" sentinel, and unresolved ~user
+// prefixes without CWD mangling.
+func NormalizeIdentityKeyPath(raw string) string {
+	if abs := config.NormalizePersistableIdentityPath(raw); abs != "" {
+		return abs
+	}
+	setting, err := coreSSH.ParseIdentityPathSetting(raw, true)
+	if err != nil {
+		if strings.TrimSpace(raw) == "" {
+			return ""
+		}
+		// Preserve invalid syntax/control chars verbatim so downstream
+		// validation fails closed instead of mangling or dropping the input.
+		return raw
+	}
+	if setting.Unset() {
+		return ""
+	}
+	return setting.Raw
+}
 
 // InventoryCredentialWrite keeps secret material outside inventory models.
 // Metadata creation may precede Save; a failed Save never falls back to YAML.
@@ -50,16 +76,11 @@ func PrepareInventoryCredential(repo *config.Repository, target credential.Targe
 	target.AuthType = "password"
 	target.ClearKeyPath = true
 	if passphrase != "" || keyPath != "" {
-		if keyPath == "" {
-			keyPath = identity.KeyPath
+		var err error
+		target, err = preparePassphraseTarget(target, identity, keyPath, passphrase)
+		if err != nil {
+			return nil, err
 		}
-		if keyPath == "" {
-			return nil, fmt.Errorf("private-key path is required for a passphrase")
-		}
-		target.Kind = credential.KindPassphrase
-		target.AuthType = "key"
-		target.KeyPath = ToAbsolutePath(keyPath)
-		target.ClearKeyPath = false
 		oldRef = identity.PassphraseRef
 		value = passphrase
 	}
@@ -81,6 +102,27 @@ func PrepareInventoryCredential(repo *config.Repository, target credential.Targe
 		return nil, err
 	}
 	return &InventoryCredentialWrite{service: service, updater: updater, target: target, oldRef: oldRef.Clone(), storeID: credCfg.DefaultStore, secret: credential.NewSecret([]byte(value))}, nil
+}
+
+func preparePassphraseTarget(target credential.Target, identity models.Identity, keyPath, passphrase string) (credential.Target, error) {
+	if keyPath == "" {
+		keyPath = identity.KeyPath
+	}
+	if keyPath == "" {
+		return target, fmt.Errorf("private-key path is required for a passphrase")
+	}
+	setting, err := coreSSH.ParseIdentityPathSetting(keyPath, true)
+	if err != nil {
+		return target, fmt.Errorf("invalid private-key path: %w", err)
+	}
+	target.Kind = credential.KindPassphrase
+	target.AuthType = "key"
+	target.KeyPath = NormalizeIdentityKeyPath(keyPath)
+	target.ClearKeyPath = false
+	if passphrase != "" && (setting.Disabled() || setting.IsTemplate()) {
+		return target, fmt.Errorf("private-key passphrase cannot be bound to non-concrete key path %q", target.KeyPath)
+	}
+	return target, nil
 }
 
 // Clear releases the write's temporary secret on every caller return path.
@@ -122,10 +164,75 @@ func validateInventoryCredentialStore(cfg *config.CredentialConfig) error {
 	return nil
 }
 
+const maxPrivateKeyCheckBytes = 1 << 20 // 1 MiB
+
+// readBoundedPrivateKeyFile rejects non-regular files (such as FIFOs or
+// character devices like /dev/zero) both before and after opening, and bounds
+// the read to maxBytes so malicious or special key paths cannot hang or OOM.
+func readBoundedPrivateKeyFile(path string, maxBytes int64) (data []byte, retErr error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("inspect private key: %w", err)
+	}
+	if err := validatePrivateKeyFileInfo(info, maxBytes); err != nil {
+		return nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open private key: %w", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			clear(data)
+			data = nil
+			retErr = errors.Join(retErr, fmt.Errorf("close private key: %w", closeErr))
+		}
+	}()
+	openInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect opened private key: %w", err)
+	}
+	if err := validatePrivateKeyFileInfo(openInfo, maxBytes); err != nil {
+		return nil, err
+	}
+	data, err = io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		clear(data)
+		return nil, fmt.Errorf("read private key: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		clear(data)
+		return nil, fmt.Errorf("private key target exceeds %d bytes", maxBytes)
+	}
+	return data, nil
+}
+
+func validatePrivateKeyFileInfo(info os.FileInfo, maxBytes int64) error {
+	if !info.Mode().IsRegular() || info.Size() > maxBytes {
+		return fmt.Errorf("private key target must be a regular file no larger than %d bytes", maxBytes)
+	}
+	return nil
+}
+
 // Never discard a passphrase reference until the replacement key is known to
-// work without one. ReadFile closes its file; clear the temporary key bytes.
+// work without one. Template paths (%tokens, ${VAR}) and "none" do not denote a
+// concrete static on-disk file and skip local file parsing.
 func validateUnencryptedKey(path string) error {
-	data, err := os.ReadFile(path)
+	setting, err := coreSSH.ParseIdentityPathSetting(path, true)
+	if err != nil {
+		return fmt.Errorf("invalid replacement private key path: %w", err)
+	}
+	if setting.Unset() {
+		return fmt.Errorf("replacement private key path cannot be empty")
+	}
+	if setting.Disabled() || setting.IsTemplate() {
+		return nil
+	}
+	resolved := config.NormalizePersistableIdentityPath(setting.Raw)
+	if resolved == "" {
+		return fmt.Errorf("replacement private key path %q cannot be resolved to a local file", setting.Raw)
+	}
+	data, err := readBoundedPrivateKeyFile(resolved, maxPrivateKeyCheckBytes)
 	if err != nil {
 		return fmt.Errorf("read replacement private key: %w", err)
 	}
@@ -136,21 +243,23 @@ func validateUnencryptedKey(path string) error {
 	return nil
 }
 
-const maxPrivateKeyCheckBytes = 16 << 20
-
 // KeyNeedsPassphrase checks whether the private key at path is encrypted and requires a passphrase.
+// Template paths (%tokens, ${VAR}) and "none" are not concrete on-disk keys and return (false, nil).
 func KeyNeedsPassphrase(path string) (bool, error) {
-	resolved := ToAbsolutePath(path)
-	info, err := os.Stat(resolved)
+	setting, err := coreSSH.ParseIdentityPathSetting(path, true)
 	if err != nil {
-		return false, fmt.Errorf("inspect private key: %w", err)
+		return false, fmt.Errorf("invalid private key path: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxPrivateKeyCheckBytes {
-		return false, fmt.Errorf("private key target must be a regular file no larger than 16 MiB")
+	if setting.Unset() || setting.Disabled() || setting.IsTemplate() {
+		return false, nil
 	}
-	data, err := os.ReadFile(resolved)
+	resolved := config.NormalizePersistableIdentityPath(setting.Raw)
+	if resolved == "" {
+		return false, fmt.Errorf("private key path %q cannot be resolved to a local file", setting.Raw)
+	}
+	data, err := readBoundedPrivateKeyFile(resolved, maxPrivateKeyCheckBytes)
 	if err != nil {
-		return false, fmt.Errorf("read private key: %w", err)
+		return false, err
 	}
 	defer clear(data)
 	_, err = sshcrypto.ParsePrivateKey(data)
@@ -174,6 +283,6 @@ func PromptPassphraseIfEncryptedKey(keyPath, currentPassphrase string) (string, 
 	if err != nil || !needs {
 		return currentPassphrase, nil
 	}
-	resolved := ToAbsolutePath(keyPath)
+	resolved := NormalizeIdentityKeyPath(keyPath)
 	return ReadPasswordFromTerminal(i18n.Tf("prompt_enter_passphrase", map[string]any{"Path": resolved}))
 }

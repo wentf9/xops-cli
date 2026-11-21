@@ -84,13 +84,13 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		return err
 	}
 	if cmd.Flags().Changed("alias") {
-		if err := validateEditNodeAliases(repository, oldName, flags.alias); err != nil {
+		if err := validateHostNodeAliases(repository, oldName, flags.alias); err != nil {
 			return err
 		}
 	}
 
 	oldAliases := slices.Clone(node.Alias)
-	updated, nameChanged := applyNodeUpdates(cmd, repository, oldName, &host, &identity, &node, flags)
+	updated, nameChanged := applyNodeUpdates(cmd, &host, &identity, &node, flags)
 	if err := applyEditedIdentityTemplate(view, flags.identityAlias, &node, &identity, &updated, &nameChanged); err != nil {
 		return err
 	}
@@ -100,7 +100,7 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		return err
 	}
 	if cmd.Flags().Changed("jump") {
-		resolvedJump, err := validateEditProxyJump(repository, oldName, newName, oldAliases, node.Alias, flags.jump)
+		resolvedJump, err := validateHostProxyJump(repository, oldName, newName, oldAliases, node.Alias, flags.jump)
 		if err != nil {
 			return err
 		}
@@ -210,19 +210,19 @@ type aliasResolver interface {
 	FindAlias(string) string
 }
 
-func validateEditNodeAliases(provider aliasResolver, oldName string, aliases []string) error {
+func validateHostNodeAliases(provider aliasResolver, selfNodeID string, aliases []string) error {
 	for _, a := range aliases {
 		if err := config.ValidateNodeAlias(a); err != nil {
 			return err
 		}
-		if existingNode := provider.FindAlias(a); existingNode != "" && existingNode != oldName {
+		if existingNode := provider.FindAlias(a); existingNode != "" && existingNode != selfNodeID {
 			return fmt.Errorf("%s", i18n.Tf("alias_err_exists", map[string]any{"Alias": a, "Node": existingNode}))
 		}
 	}
 	return nil
 }
 
-func applyNodeUpdates(cmd *cobra.Command, provider aliasResolver, oldName string, host *models.Host, identity *models.Identity, node *models.Node, flags *editFlags) (updated, nameChanged bool) {
+func applyNodeUpdates(cmd *cobra.Command, host *models.Host, identity *models.Identity, node *models.Node, flags *editFlags) (updated, nameChanged bool) {
 	if flags.address != "" {
 		host.Address, updated, nameChanged = flags.address, true, true
 	}
@@ -234,21 +234,11 @@ func applyNodeUpdates(cmd *cobra.Command, provider aliasResolver, oldName string
 	}
 	// Secret replacements commit authentication metadata with the new ref.
 	if flags.keyPath != "" && flags.keyPass == "" && flags.password == "" {
-		identity.KeyPath, identity.AuthType, updated = utils.ToAbsolutePath(flags.keyPath), "key", true
+		identity.KeyPath, identity.AuthType, updated = utils.NormalizeIdentityKeyPath(flags.keyPath), "key", true
 	}
 
 	if cmd.Flags().Changed("alias") {
-		filtered := make([]string, 0, len(flags.alias))
-		for _, a := range flags.alias {
-			if err := config.ValidateNodeAlias(a); err != nil {
-				continue
-			}
-			if existingNode := provider.FindAlias(a); existingNode != "" && existingNode != oldName {
-				continue
-			}
-			filtered = append(filtered, a)
-		}
-		node.Alias, updated = filtered, true
+		node.Alias, updated = slices.Clone(flags.alias), true
 	}
 	if cmd.Flags().Changed("jump") {
 		node.ProxyJump, updated = flags.jump, true
@@ -259,7 +249,7 @@ func applyNodeUpdates(cmd *cobra.Command, provider aliasResolver, oldName string
 	return updated, nameChanged
 }
 
-func validateEditProxyJump(
+func validateHostProxyJump(
 	repository *config.Repository,
 	oldName, newName string,
 	oldAliases, newAliases []string,
@@ -270,13 +260,13 @@ func validateEditProxyJump(
 	}
 	selfIDs := buildSelfJumpIdentitySet(oldName, newName, oldAliases, newAliases)
 	for _, hop := range splitActiveJumpHops(rawJump) {
-		if _, isSelf := selfIDs[hop]; isSelf {
-			return "", fmt.Errorf("jump host %q cannot reference the edited node %q", rawJump, newName)
+		if rawHopMatchesSelfIdentity(hop, selfIDs) {
+			return "", fmt.Errorf("jump host %q cannot reference node %q", rawJump, newName)
 		}
 	}
 	resolvedJump, err := repository.ResolveProxyJumpChain(rawJump)
 	if err != nil {
-		return "", fmt.Errorf("resolve jump host for edited node: %w", err)
+		return "", fmt.Errorf("resolve jump host for node %q: %w", newName, err)
 	}
 	queue := splitActiveJumpHops(resolvedJump)
 	visited := make(map[string]struct{}, len(queue))
@@ -293,6 +283,28 @@ func validateEditProxyJump(
 		queue = append(queue, resolveNextJumpHops(repository, hop)...)
 	}
 	return resolvedJump, nil
+}
+
+func rawHopMatchesSelfIdentity(hop string, selfIDs map[string]struct{}) bool {
+	if _, isSelf := selfIDs[hop]; isSelf {
+		return true
+	}
+	ref, err := config.ParseTargetRef(hop)
+	if err != nil || ref.OpenSSH {
+		return false
+	}
+	if _, isSelf := selfIDs[ref.Host]; isSelf {
+		return true
+	}
+	if ref.User == "" {
+		return false
+	}
+	port := ref.Port
+	if port == 0 {
+		port = 22
+	}
+	_, isSelf := selfIDs[config.FormatNodeID(ref.User, ref.Host, port)]
+	return isSelf
 }
 
 func buildSelfJumpIdentitySet(oldName, newName string, oldAliases, newAliases []string) map[string]struct{} {
@@ -314,7 +326,7 @@ func buildSelfJumpIdentitySet(oldName, newName string, oldAliases, newAliases []
 }
 
 func hopMatchesSelfIdentity(repository *config.Repository, hop string, selfIDs map[string]struct{}) bool {
-	if _, isSelf := selfIDs[hop]; isSelf {
+	if rawHopMatchesSelfIdentity(hop, selfIDs) {
 		return true
 	}
 	if config.IsOpenSSHNodeID(hop) {
@@ -338,11 +350,20 @@ func resolveNextJumpHops(repository *config.Repository, hop string) []string {
 	if !ssh.HasActiveProxyJump(nextJump) {
 		return nil
 	}
+	rawHops := splitActiveJumpHops(nextJump)
 	resolvedNext, nextErr := repository.ResolveProxyJumpChain(nextJump)
 	if nextErr != nil {
-		resolvedNext = nextJump
+		return rawHops
 	}
-	return splitActiveJumpHops(resolvedNext)
+	resolvedHops := splitActiveJumpHops(resolvedNext)
+	out := make([]string, 0, len(rawHops)+len(resolvedHops))
+	out = append(out, resolvedHops...)
+	for _, rh := range rawHops {
+		if !slices.Contains(out, rh) {
+			out = append(out, rh)
+		}
+	}
+	return out
 }
 
 func splitActiveJumpHops(chain string) []string {

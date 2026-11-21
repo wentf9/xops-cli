@@ -311,7 +311,7 @@ func resolveIdentityAddNameAndUser(args []string, name, user string, usesStdin b
 func buildNewIdentityModel(user, keyPath, password string) (models.Identity, string, error) {
 	identity := models.Identity{User: user}
 	if keyPath != "" {
-		identity.KeyPath = utils.ToAbsolutePath(keyPath)
+		identity.KeyPath = utils.NormalizeIdentityKeyPath(keyPath)
 		identity.AuthType = "key"
 		return identity, password, nil
 	}
