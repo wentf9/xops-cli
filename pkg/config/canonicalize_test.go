@@ -299,10 +299,11 @@ Host jump-host
 		}
 	}
 
-	t.Run("M10 proxy-none CLI precedence separates ProxyJump and ProxyCommand", func(t *testing.T) {
+	t.Run("M10 proxy-none CLI precedence matches OpenSSH ProxySetting monoid", func(t *testing.T) {
 		assertCanon(t, proxyProv, "cmd-host", []string{"ProxyCommand=none"}, "", true, "cmd-host.corp.example.com", true)
 		assertCanon(t, proxyProv, "cmd-host", nil, "none", false, "", false)
-		assertCanon(t, proxyProv, "jump-host", []string{"ProxyCommand=none"}, "", false, "", false)
+		// OpenSSH ProxyCommand=none disables both ProxyCommand and lower ProxyJump.
+		assertCanon(t, proxyProv, "jump-host", []string{"ProxyCommand=none"}, "", true, "jump-host.corp.example.com", true)
 
 		p := resolveCanonicalizePolicy(proxyParser, nil, "cmd-host", nil, "bastion")
 		if !p.hasProxyJump || p.hasProxyCommand {
@@ -328,8 +329,9 @@ Host jump-host
 		if p := resolveCanonicalizePolicy(proxyParser, t3NoneOpts, "cmd-host", nil, ""); p.hasProxyCommand {
 			t.Fatalf("expected Tier 3 ProxyCommand=none to clear Tier 4 ProxyCommand, got %+v", p)
 		}
-		if p := resolveCanonicalizePolicy(proxyParser, t3NoneOpts, "jump-host", nil, ""); !p.hasProxyJump || p.hasProxyCommand {
-			t.Fatalf("expected Tier 3 ProxyCommand=none to preserve Tier 4 ProxyJump under Decision 1.A, got %+v", p)
+		// Under ProxySetting monoid (matching OpenSSH), ProxyCommand=none absorbs lower ProxyJump.
+		if p := resolveCanonicalizePolicy(proxyParser, t3NoneOpts, "jump-host", nil, ""); p.hasProxyJump || p.hasProxyCommand {
+			t.Fatalf("expected Tier 3 ProxyCommand=none to disable Tier 4 ProxyJump, got %+v", p)
 		}
 	})
 }
@@ -574,12 +576,12 @@ func TestCanonicalizeHost_Round2PolicyAndFallbackFixes(t *testing.T) {
 			t.Fatalf("-o ProxyCommand=none -o ProxyJump=none must clear Tier-4 ProxyJump: %+v", polCleared)
 		}
 		polBlocked := resolveCanonicalizePolicy(p, nil, "web", []string{"ProxyCommand=none", "ProxyJump=bastion"}, "")
-		if !polBlocked.hasProxyJump {
-			t.Fatalf("same-tier -o ProxyCommand=none -o ProxyJump=bastion expected Tier-4 hasProxyJump=true intact: %+v", polBlocked)
+		if polBlocked.hasProxyJump || polBlocked.hasProxyCommand {
+			t.Fatalf("same-tier -o ProxyCommand=none -o ProxyJump=bastion must disable proxying (OpenSSH ProxyCommand=none absorbs ProxyJump): %+v", polBlocked)
 		}
 	})
 
-	t.Run("ConnectTimeout none/0/0s resets and huge int clamps without overflow", func(t *testing.T) {
+	t.Run("ConnectTimeout none/0/0s resets and large valid duration clamps without overflow", func(t *testing.T) {
 		for _, tc := range []struct {
 			input string
 			want  time.Duration
@@ -588,18 +590,19 @@ func TestCanonicalizeHost_Round2PolicyAndFallbackFixes(t *testing.T) {
 			{input: "0", want: maxCanonicalProbeTimeout},
 			{input: "0s", want: maxCanonicalProbeTimeout},
 			{input: "none", want: maxCanonicalProbeTimeout},
-			{input: "100000000000000000000", want: maxCanonicalProbeTimeout},
+			{input: "3600s", want: maxCanonicalProbeTimeout},
 		} {
-			pol := canonicalizePolicy{timeout: time.Second}
-			pol.setTimeoutSeconds(tc.input)
+			pol := resolveCanonicalizePolicy(nil, nil, "web", []string{"ConnectTimeout=" + tc.input}, "")
 			if pol.timeout != tc.want {
-				t.Fatalf("setTimeoutSeconds(%q) = %v, want %v", tc.input, pol.timeout, tc.want)
+				t.Fatalf("resolveCanonicalizePolicy(ConnectTimeout=%q).timeout = %v, want %v", tc.input, pol.timeout, tc.want)
 			}
 		}
-		polNeg := canonicalizePolicy{timeout: 2 * time.Second}
-		polNeg.setTimeoutSeconds("-99999999999999999999")
-		if polNeg.timeout != 2*time.Second {
-			t.Fatalf("negative overflowing timeout altered policy: %v", polNeg.timeout)
+		t3 := ssh.MustOptions(ssh.OptionConnectTimeout, "2")
+		for _, invalid := range []string{"-99999999999999999999", "100000000000000000000", "0m", "00"} {
+			pol := resolveCanonicalizePolicy(nil, t3, "web", []string{"ConnectTimeout=" + invalid}, "")
+			if pol.timeout != 2*time.Second {
+				t.Fatalf("invalid ConnectTimeout %q altered lower valid timeout: got %v, want 2s", invalid, pol.timeout)
+			}
 		}
 	})
 }

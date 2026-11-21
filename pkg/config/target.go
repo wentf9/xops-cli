@@ -1123,12 +1123,16 @@ func (r *Repository) matchOpenSSHVirtualNode(selector, effectiveUser string, eff
 	if err != nil {
 		return "", "", nil
 	}
+	vhostEp, vErr := ssh.NewEndpoint(vhost.Address, int(vhost.Port))
 	if cleanExpected := StripHostBrackets(expectedAddr); cleanExpected != "" {
-		if !SameHostAddress(cleanExpected, vhost.Address) {
+		expEp, eErr := ssh.NewEndpoint(cleanExpected, int(effectivePort))
+		if vErr != nil || eErr != nil || !expEp.Equal(vhostEp) {
 			return "", "", nil
 		}
+	} else if normalizedHostPort(vhost.Port) != effectivePort {
+		return "", "", nil
 	}
-	if vident.User == effectiveUser && normalizedHostPort(vhost.Port) == effectivePort {
+	if vident.User == effectiveUser {
 		alias := cleanSelector
 		if hasCanonicalAlias {
 			alias = orig
@@ -1238,8 +1242,10 @@ func nodeMatchesEndpoint(cfg *Configuration, nodeID, user, addr string, port uin
 	if !hok || !iok {
 		return false
 	}
-	return SameHostAddress(host.Address, addr) &&
-		normalizedHostPort(host.Port) == normalizedHostPort(port) &&
+	hostEp, hErr := ssh.NewEndpoint(host.Address, int(host.Port))
+	targetEp, tErr := ssh.NewEndpoint(addr, int(port))
+	return hErr == nil && tErr == nil &&
+		hostEp.Equal(targetEp) &&
 		normalizedIdentityUser(ident.User) == user
 }
 
@@ -1260,7 +1266,10 @@ func allocateAvailableNodeID(cfg *Configuration, baseID string) string {
 
 func findMatchingNodes(snapshot *Configuration, user, addr string, port uint16) []string {
 	var matches []string
-	targetPort := normalizedHostPort(port)
+	targetEp, tErr := ssh.NewEndpoint(addr, int(port))
+	if tErr != nil {
+		return nil
+	}
 	for _, nid := range snapshot.Nodes.Keys() {
 		n, ok := snapshot.Nodes.Get(nid)
 		if !ok {
@@ -1270,7 +1279,8 @@ func findMatchingNodes(snapshot *Configuration, user, addr string, port uint16) 
 		ident, iok := snapshot.Identities.Get(n.IdentityRef)
 		if hok && iok {
 			nodeUser := normalizedIdentityUser(ident.User)
-			if SameHostAddress(h.Address, addr) && normalizedHostPort(h.Port) == targetPort && nodeUser == user {
+			hostEp, hErr := ssh.NewEndpoint(h.Address, int(h.Port))
+			if hErr == nil && hostEp.Equal(targetEp) && nodeUser == user {
 				matches = append(matches, nid)
 			}
 		}
@@ -1561,7 +1571,9 @@ func (r *Repository) resolveConsistentCandidates(cfg *Configuration, selector st
 			firstUser = user
 			initialized = true
 		} else {
-			if !SameHostAddress(firstAddr, clean) || firstPort != port {
+			firstEp, fErr := ssh.NewEndpoint(firstAddr, int(firstPort))
+			curEp, cErr := ssh.NewEndpoint(clean, int(port))
+			if fErr != nil || cErr != nil || !firstEp.Equal(curEp) {
 				addrPortConsistent = false
 				break
 			}
@@ -1625,7 +1637,9 @@ func (r *Repository) resolveCandidateAddressFallback(cfg *Configuration, selecto
 			firstUser = user
 			initialized = true
 		} else {
-			if !SameHostAddress(firstAddr, clean) {
+			firstEp, fErr := ssh.NewEndpoint(firstAddr, int(firstPort))
+			curEp, cErr := ssh.NewEndpoint(clean, int(port))
+			if fErr != nil || cErr != nil || !firstEp.HostEqual(curEp) {
 				addrConsistent = false
 				break
 			}
@@ -1783,12 +1797,14 @@ func ensureMatchingHost(cfg *Configuration, canonicalAddr string, port uint16, t
 	var matchingHostRefs []string
 	var unaliasedHostRef string
 	targetPort := normalizedHostPort(port)
+	targetEp, tErr := ssh.NewEndpoint(canonicalAddr, int(targetPort))
 	for _, href := range cfg.Hosts.Keys() {
 		h, ok := cfg.Hosts.Get(href)
 		if !ok {
 			continue
 		}
-		if SameHostAddress(h.Address, canonicalAddr) && normalizedHostPort(h.Port) == targetPort {
+		hostEp, hErr := ssh.NewEndpoint(h.Address, int(h.Port))
+		if tErr == nil && hErr == nil && hostEp.Equal(targetEp) {
 			matchingHostRefs = append(matchingHostRefs, href)
 			if len(h.Alias) == 0 && unaliasedHostRef == "" {
 				unaliasedHostRef = href
@@ -1800,7 +1816,8 @@ func ensureMatchingHost(cfg *Configuration, canonicalAddr string, port uint16, t
 		candidateRef := FormatHostPort(canonicalAddr, targetPort)
 		hostRef := candidateRef
 		if existing, exists := cfg.Hosts.Get(candidateRef); exists {
-			if !SameHostAddress(existing.Address, canonicalAddr) || normalizedHostPort(existing.Port) != targetPort || len(existing.Alias) > 0 {
+			existEp, eErr := ssh.NewEndpoint(existing.Address, int(existing.Port))
+			if tErr != nil || eErr != nil || !existEp.Equal(targetEp) || len(existing.Alias) > 0 {
 				hostRef = privateHostReference(cfg, targetNodeID)
 			}
 		}
@@ -1848,6 +1865,7 @@ func (r *Repository) resolveJumpForNode(
 	}
 
 	targetPort := normalizedHostPort(port)
+	targetEp, tErr := ssh.NewEndpoint(canonicalAddr, int(targetPort))
 	jumpSet := make(map[string]struct{})
 	for _, nid := range cfg.Nodes.Keys() {
 		n, ok := cfg.Nodes.Get(nid)
@@ -1858,7 +1876,8 @@ func (r *Repository) resolveJumpForNode(
 		if !hok {
 			continue
 		}
-		if SameHostAddress(h.Address, canonicalAddr) && normalizedHostPort(h.Port) == targetPort {
+		hostEp, hErr := ssh.NewEndpoint(h.Address, int(h.Port))
+		if tErr == nil && hErr == nil && hostEp.Equal(targetEp) {
 			trimmedJump := ssh.NormalizeProxyJump(n.ProxyJump)
 			jumpSet[trimmedJump] = struct{}{}
 		}
@@ -2012,6 +2031,7 @@ func filterHostCandidates(cfg *Configuration, candidates []string, hopUser strin
 
 func resolveHopAddressFromCandidates(cfg *Configuration, hostCandidates []string) (string, bool) {
 	var firstAddr string
+	var firstEp ssh.Endpoint
 	for _, cid := range hostCandidates {
 		node, ok := cfg.Nodes.Get(cid)
 		if !ok {
@@ -2022,9 +2042,14 @@ func resolveHopAddressFromCandidates(cfg *Configuration, hostCandidates []string
 			continue
 		}
 		clean := StripHostBrackets(h.Address)
+		curEp, err := ssh.NewEndpoint(clean, int(h.Port))
+		if err != nil {
+			return "", false
+		}
 		if firstAddr == "" {
 			firstAddr = clean
-		} else if !SameHostAddress(firstAddr, clean) {
+			firstEp = curEp
+		} else if !firstEp.HostEqual(curEp) {
 			return "", false
 		}
 	}
@@ -2072,6 +2097,7 @@ func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort 
 			effectivePort = 22
 		}
 	}
+	targetEp, tErr := ssh.NewEndpoint(firstAddr, int(effectivePort))
 	var matchingNodes []string
 	for _, nid := range cfg.Nodes.Keys() {
 		n, ok := cfg.Nodes.Get(nid)
@@ -2081,7 +2107,8 @@ func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort 
 		h, hok := cfg.Hosts.Get(n.HostRef)
 		ident, iok := cfg.Identities.Get(n.IdentityRef)
 		if hok && iok {
-			if SameHostAddress(h.Address, firstAddr) && normalizedHostPort(h.Port) == normalizedHostPort(effectivePort) {
+			hostEp, hErr := ssh.NewEndpoint(h.Address, int(h.Port))
+			if tErr == nil && hErr == nil && hostEp.Equal(targetEp) {
 				if hopUser == "" || normalizedIdentityUser(ident.User) == hopUser {
 					matchingNodes = append(matchingNodes, nid)
 				}

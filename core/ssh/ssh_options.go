@@ -2995,27 +2995,30 @@ func MergeEffectiveOptions(layers ...*Options) (*Options, error) {
 
 // SplitOptionKeyValue parses an OpenSSH -o directive into its key and value tokens.
 // It supports "Key=Value", "Key Value", and "Key = Value" syntax, matching standard
-// OpenSSH -o CLI argument conventions.
+// OpenSSH -o CLI argument conventions. Control characters and line breaks are rejected.
 func SplitOptionKeyValue(opt string) (key, val string, err error) {
-	opt = strings.TrimSpace(opt)
+	if hasControlOrLineSepChar(strings.ReplaceAll(opt, "\t", " ")) {
+		return "", "", fmt.Errorf("%w: invalid -o option %q: contains invalid control character", ErrSSHOptionsValidation, opt)
+	}
+	opt = strings.Trim(opt, " \t")
 	if opt == "" {
 		return "", "", nil
 	}
 	eqIdx := strings.IndexByte(opt, '=')
 	wsIdx := strings.IndexAny(opt, " \t")
 	if eqIdx >= 0 && (wsIdx == -1 || eqIdx < wsIdx) {
-		key = strings.TrimSpace(opt[:eqIdx])
-		val = strings.TrimSpace(opt[eqIdx+1:])
+		key = strings.Trim(opt[:eqIdx], " \t")
+		val = strings.Trim(opt[eqIdx+1:], " \t")
 		if key == "" {
 			return "", "", fmt.Errorf("%w: invalid -o option format (expected Key=Value): %q", ErrSSHOptionsValidation, opt)
 		}
 		return key, val, nil
 	}
 	if wsIdx > 0 {
-		key = strings.TrimSpace(opt[:wsIdx])
-		val = strings.TrimSpace(opt[wsIdx+1:])
+		key = strings.Trim(opt[:wsIdx], " \t")
+		val = strings.Trim(opt[wsIdx+1:], " \t")
 		if strings.HasPrefix(val, "=") {
-			val = strings.TrimSpace(strings.TrimPrefix(val, "="))
+			val = strings.Trim(strings.TrimPrefix(val, "="), " \t")
 		}
 		if key == "" {
 			return "", "", fmt.Errorf("%w: invalid -o option format (expected Key=Value): %q", ErrSSHOptionsValidation, opt)

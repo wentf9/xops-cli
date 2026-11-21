@@ -239,8 +239,20 @@ func originCompatibleWithOverrideParser(parser *OpenSSHParser, snap *Configurati
 	host, hasHost := snap.Hosts.Get(node.HostRef)
 	if resolvedHost, explicit, err := parser.ResolveExplicitHostName(alias); err != nil {
 		return false
-	} else if explicit && hasHost && !SameHostAddress(resolvedHost, host.Address) {
-		return false
+	} else if explicit && hasHost {
+		nodeEp, nErr := ssh.NewEndpoint(host.Address, int(host.Port))
+		resolvedPort := 22
+		if rawPort := strings.TrimSpace(parser.getVal(alias, "Port", "22")); rawPort != "" {
+			if p, pErr := strconv.ParseUint(rawPort, 10, 16); pErr == nil && p > 0 {
+				resolvedPort = int(p)
+			} else {
+				return false
+			}
+		}
+		resolvedEp, rErr := ssh.NewEndpoint(resolvedHost, resolvedPort)
+		if nErr != nil || rErr != nil || !resolvedEp.Equal(nodeEp) {
+			return false
+		}
 	}
 	return true
 }
@@ -617,33 +629,101 @@ func resolveOpenSSHHostName(doc *sshConfigDoc, alias string) (string, error) {
 }
 
 // FindConcreteHostsByAddress returns concrete Host pattern names in ssh_config
-// whose resolved HostName matches address and (when port > 0) whose resolved
-// Port matches port.
-func (p *OpenSSHParser) FindConcreteHostsByAddress(address string, port uint16) []string {
-	if p == nil || p.cfg == nil {
-		return nil
-	}
-	cleanAddr := StripHostBrackets(address)
-	if cleanAddr == "" {
+// whose resolved (HostName, Port) endpoint matches ep via strict ssh.Endpoint.Equal.
+func (p *OpenSSHParser) FindConcreteHostsByAddress(ep ssh.Endpoint) []string {
+	if p == nil || p.cfg == nil || !ep.IsValid() {
 		return nil
 	}
 	var matches []string
 	walkConcreteSSHHostNames(p.cfg, func(name string) bool {
-		cleanHost, expErr := resolveOpenSSHHostName(p.cfg, name)
-		if expErr != nil || !SameHostAddress(cleanHost, cleanAddr) {
+		candEp, ok := p.resolveConcreteEndpoint(name)
+		if !ok || !candEp.Equal(ep) {
 			return true
-		}
-		if port > 0 {
-			portStr := p.getVal(name, "Port", "22")
-			parsedPort, parseErr := strconv.ParseUint(strings.TrimSpace(portStr), 10, 16)
-			if parseErr != nil || uint16(parsedPort) != port {
-				return true
-			}
 		}
 		matches = append(matches, name)
 		return true
 	})
 	return matches
+}
+
+// FindConcreteHostsByHost returns concrete Host pattern names in ssh_config
+// whose resolved HostName matches ep's canonical host ignoring port.
+//
+// SECURITY: Port-agnostic helper; NOT for Tier-4 security scoping. Use
+// FindConcreteHostsByAddress for all security scoping and option inheritance.
+func (p *OpenSSHParser) FindConcreteHostsByHost(ep ssh.Endpoint) []string {
+	if p == nil || p.cfg == nil || !ep.IsValid() {
+		return nil
+	}
+	var matches []string
+	walkConcreteSSHHostNames(p.cfg, func(name string) bool {
+		candEp, ok := p.resolveConcreteEndpoint(name)
+		if !ok || !candEp.HostEqual(ep) {
+			return true
+		}
+		matches = append(matches, name)
+		return true
+	})
+	return matches
+}
+
+func (p *OpenSSHParser) resolveConcreteEndpoint(name string) (ssh.Endpoint, bool) {
+	cleanHost, expErr := resolveOpenSSHHostName(p.cfg, name)
+	if expErr != nil || cleanHost == "" {
+		return ssh.Endpoint{}, false
+	}
+	portStr := strings.TrimSpace(p.getVal(name, "Port", "22"))
+	parsedPort, parseErr := strconv.ParseUint(portStr, 10, 16)
+	if parseErr != nil || parsedPort == 0 {
+		return ssh.Endpoint{}, false
+	}
+	ep, err := ssh.NewEndpoint(cleanHost, int(parsedPort))
+	if err != nil {
+		return ssh.Endpoint{}, false
+	}
+	return ep, true
+}
+
+// ResolveEndpoint resolves the canonical (HostName, Port) Endpoint for alias
+// in ssh_config (defaulting Port to 22).
+func (p *OpenSSHParser) ResolveEndpoint(alias string) (ssh.Endpoint, error) {
+	if p == nil || p.cfg == nil {
+		return ssh.Endpoint{}, fmt.Errorf("openssh parser is empty")
+	}
+	cleanHost, err := resolveOpenSSHHostName(p.cfg, alias)
+	if err != nil {
+		return ssh.Endpoint{}, err
+	}
+	portStr := strings.TrimSpace(p.getVal(alias, "Port", "22"))
+	parsedPort, parseErr := strconv.ParseUint(portStr, 10, 16)
+	if parseErr != nil || parsedPort == 0 {
+		return ssh.Endpoint{}, fmt.Errorf("invalid port %q for %q in ssh config", portStr, alias)
+	}
+	return ssh.NewEndpoint(cleanHost, int(parsedPort))
+}
+
+// ResolveProxySetting folds all matching ProxyJump and ProxyCommand directives
+// for alias into a typed ssh.ProxySetting (preserving shadowed ProxyCommand
+// fallback beneath a higher ProxyJump for associative cross-tier merging).
+func (p *OpenSSHParser) ResolveProxySetting(alias string) ssh.ProxySetting {
+	if p == nil || p.cfg == nil || strings.TrimSpace(alias) == "" {
+		return ssh.UnsetProxySetting()
+	}
+	return resolveOpenSSHProxySettingPasses(p.cfg, []string{alias})
+}
+
+// ResolveProxySettingWithCanonical folds all matching ProxyJump and ProxyCommand
+// directives across Pass 1 (originalAlias) and Pass 2 (canonicalHost).
+func (p *OpenSSHParser) ResolveProxySettingWithCanonical(originalAlias, canonicalHost string) ssh.ProxySetting {
+	if p == nil || p.cfg == nil || strings.TrimSpace(originalAlias) == "" {
+		return ssh.UnsetProxySetting()
+	}
+	passes := []string{originalAlias}
+	cleanCanon := StripHostBrackets(canonicalHost)
+	if cleanCanon != "" && !strings.EqualFold(cleanCanon, originalAlias) {
+		passes = append(passes, cleanCanon)
+	}
+	return resolveOpenSSHProxySettingPasses(p.cfg, passes)
 }
 
 // GetVirtualNode 根据 alias 从 ssh_config 生成运行时的内存 Node / Host / Identity
@@ -756,7 +836,11 @@ func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 		return models.Node{}, models.Host{}, models.Identity{}, expErr
 	}
 
-	_, proxyJump, _ := firstMatchingOpenSSHProxyPasses(p.cfg, passes)
+	proxySetting := resolveOpenSSHProxySettingPasses(p.cfg, passes)
+	proxyJump := ""
+	if targets, ok := proxySetting.JumpTargets(); ok {
+		proxyJump = parseOpenSSHProxyJump(strings.Join(targets, ","))
+	}
 
 	sshOpts, err := parseOpenSSHOptionsPasses(p.cfg, passes)
 	if err != nil {
@@ -883,14 +967,14 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 		}
 	}
 	if spec.AllowList {
-		filtered, keep, err := filterOpenSSHAllowListOption(spec, val, passes[0])
+		parsed, err := ssh.ParseOption(spec.CanonicalKey, val, ssh.OptionSourceOpenSSHConfig)
 		if err != nil {
-			return err
+			return fmt.Errorf("invalid %s %q for %q in ssh config: %w", spec.OpenSSHName, val, passes[0], err)
 		}
-		if !keep {
+		if parsed.IsNoOp {
 			return nil
 		}
-		val = filtered
+		val = parsed.Normalized
 	}
 	if err := opts.Set(spec.CanonicalKey, val); err != nil {
 		// Preserve strict error reporting on options declared StrictInOpenSSHConfig,
@@ -902,21 +986,6 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 		}
 	}
 	return nil
-}
-
-func filterOpenSSHAllowListOption(spec ssh.OptionSpec, val, hostLabel string) (filtered string, keep bool, err error) {
-	trimmedVal := strings.TrimSpace(val)
-	isModifier := spec.CanonicalKey != ssh.OptionPreferredAuthentications &&
-		len(trimmedVal) > 0 &&
-		(trimmedVal[0] == '+' || trimmedVal[0] == '-' || trimmedVal[0] == '^')
-	filtered = ssh.FilterSupportedListValue(spec.CanonicalKey, val)
-	if filtered != "" {
-		return filtered, true, nil
-	}
-	if isModifier {
-		return "", false, nil
-	}
-	return "", false, fmt.Errorf("no supported %s in %q for %q", spec.OpenSSHName, val, hostLabel)
 }
 
 func sshConfigOptionValue(d *sshConfigDirective, spec ssh.OptionSpec) string {
@@ -980,12 +1049,21 @@ func allMatchingOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string, spec ss
 
 func resolveOpenSSHSingleOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) (val string, skip bool) {
 	if spec.CanonicalKey == ssh.OptionProxyCommand {
-		var winner string
-		winner, _, val = firstMatchingOpenSSHProxyPasses(doc, passes)
-		if winner == "proxyjump" {
+		ps := resolveOpenSSHProxySettingPasses(doc, passes)
+		switch ps.Kind() {
+		case ssh.ProxyJump:
 			return "", true
+		case ssh.ProxyCommand:
+			cmd, _ := ps.Command()
+			return cmd, false
+		case ssh.ProxyDisabled:
+			if !ps.IsJumpDisabledOnly() {
+				return "none", false
+			}
+			return "", false
+		default:
+			return "", false
 		}
-		return val, false
 	}
 	return firstMatchingOpenSSHOptionPasses(doc, passes, spec), false
 }
@@ -1090,61 +1168,26 @@ func parseOpenSSHProxyJump(raw string) string {
 	return strings.Join(parsedHops, ",")
 }
 
-// firstMatchingOpenSSHProxy resolves ProxyJump and ProxyCommand in OpenSSH
-// first-match-wins order across matching Host blocks (including Include files),
-// including "none" stopping further search for that directive.
-func firstMatchingOpenSSHProxy(doc *sshConfigDoc, host string) (winner, proxyJump, proxyCommand string) {
-	return firstMatchingOpenSSHProxyPasses(doc, []string{host})
-}
-
-func firstMatchingOpenSSHProxyPasses(doc *sshConfigDoc, passes []string) (winner, proxyJump, proxyCommand string) {
+// resolveOpenSSHProxySettingPasses folds all matching ProxyJump and ProxyCommand
+// directives top-to-bottom into an associative typed ssh.ProxySetting, preserving
+// any shadowed ProxyCommand fallback beneath a higher-priority ProxyJump.
+func resolveOpenSSHProxySettingPasses(doc *sshConfigDoc, passes []string) ssh.ProxySetting {
 	if doc == nil || len(passes) == 0 {
-		return "", "", ""
+		return ssh.UnsetProxySetting()
 	}
-	var sawJump, sawCmd bool
-	var jumpVal, cmdVal string
+	acc := ssh.UnsetProxySetting()
 	walkMatchingSSHConfigDirectivesPasses(doc, passes, func(_ int, _ string, d *sshConfigDirective) bool {
 		switch d.lowerKey {
 		case "proxyjump":
-			v := d.value
-			if v == "" {
-				return true
-			}
-			if !sawJump {
-				sawJump = true
-				jumpVal = v
-				if winner == "" && ssh.HasActiveProxyJump(v) {
-					winner = "proxyjump"
-				}
+			if ps, err := ssh.ParseProxyJump(d.value); err == nil {
+				acc = acc.Merge(ps)
 			}
 		case "proxycommand":
-			v := d.rawValue
-			if v == "" {
-				return true
-			}
-			if !sawCmd {
-				sawCmd = true
-				cmdVal = v
-				if winner == "" {
-					if strings.EqualFold(v, "none") {
-						winner = "none"
-					} else {
-						winner = "proxycommand"
-					}
-				}
+			if ps, err := ssh.ParseProxyCommand(d.rawValue); err == nil {
+				acc = acc.Merge(ps)
 			}
 		}
-		return !sawJump || !sawCmd
+		return true
 	})
-	switch winner {
-	case "proxyjump":
-		return winner, parseOpenSSHProxyJump(jumpVal), ""
-	case "proxycommand":
-		return winner, "", cmdVal
-	default:
-		if sawCmd {
-			return winner, "", cmdVal
-		}
-		return "", "", ""
-	}
+	return acc
 }

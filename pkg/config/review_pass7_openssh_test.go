@@ -129,13 +129,21 @@ func assertPass7IncludedHostLookup(t *testing.T, parser *OpenSSHParser) {
 	if parser.HasHost("nonexistent-included") {
 		t.Fatal("HasHost(nonexistent-included) = true, want false")
 	}
-	if got := parser.FindConcreteHostsByAddress("10.77.0.10", 2222); !slices.Equal(got, []string{"included-app"}) {
+	mustEp := func(host string, port int) ssh.Endpoint {
+		t.Helper()
+		ep, err := ssh.NewEndpoint(host, port)
+		if err != nil {
+			t.Fatalf("NewEndpoint(%q, %d): %v", host, port, err)
+		}
+		return ep
+	}
+	if got := parser.FindConcreteHostsByAddress(mustEp("10.77.0.10", 2222)); !slices.Equal(got, []string{"included-app"}) {
 		t.Fatalf("FindConcreteHostsByAddress(10.77.0.10, 2222) = %v, want [included-app]", got)
 	}
-	if got := parser.FindConcreteHostsByAddress("10.77.0.10", 22); len(got) != 0 {
+	if got := parser.FindConcreteHostsByAddress(mustEp("10.77.0.10", 22)); len(got) != 0 {
 		t.Fatalf("FindConcreteHostsByAddress(10.77.0.10, 22) = %v, want empty", got)
 	}
-	if got := parser.FindConcreteHostsByAddress("10.77.0.11", 2201); !slices.Equal(got, []string{"included-cmd"}) {
+	if got := parser.FindConcreteHostsByAddress(mustEp("10.77.0.11", 2201)); !slices.Equal(got, []string{"included-cmd"}) {
 		t.Fatalf("FindConcreteHostsByAddress(10.77.0.11, 2201) = %v, want [included-cmd]", got)
 	}
 }
@@ -311,7 +319,8 @@ func assertConditionalIncludeMatching(t *testing.T, parser *OpenSSHParser) {
 	if !parser.HasHost("db.prod.corp.example.com") {
 		t.Fatal("expected db.prod.corp.example.com inside matching conditional Include to be found")
 	}
-	if got := parser.FindConcreteHostsByAddress("10.80.0.1", 2299); !slices.Equal(got, []string{"db.prod.corp.example.com"}) {
+	epDB, _ := ssh.NewEndpoint("10.80.0.1", 2299)
+	if got := parser.FindConcreteHostsByAddress(epDB); !slices.Equal(got, []string{"db.prod.corp.example.com"}) {
 		t.Fatalf("FindConcreteHostsByAddress(10.80.0.1, 2299) = %v, want [db.prod.corp.example.com]", got)
 	}
 	node, host, ident, err := parser.GetVirtualNode("db.prod.corp.example.com")
@@ -332,7 +341,8 @@ func assertConditionalIncludeIsolation(t *testing.T, parser *OpenSSHParser, root
 	if parser.HasHost("leaked-outside-prod") {
 		t.Fatal("HasHost(leaked-outside-prod) = true, want false")
 	}
-	if got := parser.FindConcreteHostsByAddress("10.99.99.99", 22); len(got) != 0 {
+	epLeak, _ := ssh.NewEndpoint("10.99.99.99", 22)
+	if got := parser.FindConcreteHostsByAddress(epLeak); len(got) != 0 {
 		t.Fatalf("FindConcreteHostsByAddress leaked conditional host: %v", got)
 	}
 	leakNode, leakHost, leakIdent, err := parser.GetVirtualNode("leaked-outside-prod")
@@ -445,13 +455,15 @@ func assertInMemoryASTCycleGuard(t *testing.T) {
 	if !memParser.HasHost("mem-1") || !memParser.HasHost("mem-2") || memParser.HasHost("missing") {
 		t.Fatal("unexpected HasHost result on cyclic in-memory AST")
 	}
-	if got := memParser.FindConcreteHostsByAddress("10.1.1.2", 22); !slices.Equal(got, []string{"mem-2"}) {
+	epMem, _ := ssh.NewEndpoint("10.1.1.2", 22)
+	if got := memParser.FindConcreteHostsByAddress(epMem); !slices.Equal(got, []string{"mem-2"}) {
 		t.Fatalf("unexpected FindConcreteHostsByAddress on cyclic in-memory AST: %v", got)
 	}
 }
 
 func assertConcurrentOpenSSHReads(parser *OpenSSHParser) {
 	prov := NewProviderWithOpenSSHParser(nil, parser)
+	epCycle, _ := ssh.NewEndpoint("10.66.0.2", 22)
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Add(1)
@@ -459,7 +471,7 @@ func assertConcurrentOpenSSHReads(parser *OpenSSHParser) {
 			defer wg.Done()
 			for range 20 {
 				_ = parser.HasHost("cycle-a")
-				_ = parser.FindConcreteHostsByAddress("10.66.0.2", 22)
+				_ = parser.FindConcreteHostsByAddress(epCycle)
 				_, _, _, _ = parser.GetVirtualNode("cycle-b")
 				_, _ = prov.GetOpenSSHOptions("cycle-a")
 			}

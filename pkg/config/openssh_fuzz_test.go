@@ -3,6 +3,8 @@ package config
 import (
 	"bytes"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 func FuzzOpenSSHConfigParser(f *testing.F) {
@@ -34,6 +36,8 @@ func FuzzOpenSSHConfigParser(f *testing.F) {
 		_, _, _, _ = parser.GetVirtualNode("app")
 		_, _ = parser.GetSSHOptions("app")
 		_, _ = parser.GetControlConfig("app")
-		_ = parser.FindConcreteHostsByAddress("10.0.0.1", 22)
+		if ep, epErr := ssh.NewEndpoint("10.0.0.1", 22); epErr == nil {
+			_ = parser.FindConcreteHostsByAddress(ep)
+		}
 	})
 }

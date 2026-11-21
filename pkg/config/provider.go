@@ -392,7 +392,9 @@ func (p *Provider) pruneStaleOpenSSHMetadataLocked(oldCfg, updated *Configuratio
 		newAddr, newPort, hasNew := resolveConfigNodeHostAddrPort(updated, nodeID)
 		stale := false
 		if hadOld {
-			stale = !hasNew || !SameHostAddress(oldAddr, newAddr) || oldPort != newPort
+			oldEp, oldErr := ssh.NewEndpoint(oldAddr, int(oldPort))
+			newEp, newErr := ssh.NewEndpoint(newAddr, int(newPort))
+			stale = !hasNew || oldErr != nil || newErr != nil || !oldEp.Equal(newEp)
 		} else if configHasNode(oldCfg, nodeID) || configHasNode(updated, nodeID) {
 			stale = true
 		}

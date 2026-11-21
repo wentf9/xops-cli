@@ -68,13 +68,9 @@ func openSSHHostFromConfig(doc *sshConfigDoc, name, defaultUser string) (OpenSSH
 		return OpenSSHHost{}, fmt.Errorf("parse openssh port for host %q: %q", name, portValue)
 	}
 	keyPath := openSSHValue(doc, name, "IdentityFile", "")
-	proxyWinner, _, _ := firstMatchingOpenSSHProxy(doc, name)
 	var proxyJump string
-	if proxyWinner == "proxyjump" {
-		proxyJump = openSSHValue(doc, name, "ProxyJump", "")
-		if !ssh.HasActiveProxyJump(proxyJump) {
-			proxyJump = ""
-		}
+	if targets, ok := resolveOpenSSHProxySettingPasses(doc, []string{name}).JumpTargets(); ok {
+		proxyJump = strings.Join(targets, ",")
 	}
 
 	expandedKeyPath, err := normalizeConfigIdentityKeyPath(keyPath)

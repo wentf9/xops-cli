@@ -922,11 +922,33 @@ func assertDifferentialCertAndAgent(t *testing.T, dump map[string][]string, opts
 	}
 }
 
+// normalizeSSHDumpForwardDisplay removes brackets that `ssh -G` unconditionally
+// prints around non-IPv6 hosts (e.g. "[127.0.0.1]:8080 [10.0.0.1]:80") while
+// preserving brackets on IPv6 literals and wildcards ("[*]:8080", "[::1]:8080").
+func normalizeSSHDumpForwardDisplay(entry string) string {
+	fields := strings.Fields(entry)
+	for i, f := range fields {
+		if !strings.HasPrefix(f, "[") {
+			continue
+		}
+		closeIdx := strings.IndexByte(f, ']')
+		if closeIdx <= 1 {
+			continue
+		}
+		inner := f[1:closeIdx]
+		if inner == "*" || strings.ContainsRune(inner, ':') {
+			continue
+		}
+		fields[i] = inner + f[closeIdx+1:]
+	}
+	return strings.Join(fields, " ")
+}
+
 func normalizeSSHDumpLocalForwards(t *testing.T, raw []string) []string {
 	t.Helper()
 	out := make([]string, 0, len(raw))
 	for _, entry := range raw {
-		spec, err := ssh.ParseForwardSpec(entry)
+		spec, err := ssh.ParseForwardSpec(normalizeSSHDumpForwardDisplay(entry))
 		if err != nil {
 			t.Fatalf("ParseForwardSpec(%q) from ssh -G: %v", entry, err)
 		}
@@ -944,7 +966,7 @@ func normalizeSSHDumpRemoteForwards(t *testing.T, raw []string) []string {
 		if bind, ok := strings.CutSuffix(trimmed, " [socks]:0"); ok {
 			trimmed = strings.TrimSpace(bind)
 		}
-		spec, err := ssh.ParseRemoteForwardSpec(trimmed)
+		spec, err := ssh.ParseRemoteForwardSpec(normalizeSSHDumpForwardDisplay(trimmed))
 		if err != nil {
 			t.Fatalf("ParseRemoteForwardSpec(%q) from ssh -G: %v", entry, err)
 		}
@@ -957,7 +979,7 @@ func normalizeSSHDumpDynamicForwards(t *testing.T, raw []string) []string {
 	t.Helper()
 	out := make([]string, 0, len(raw))
 	for _, entry := range raw {
-		norm, err := ssh.ParseDynamicForwardSpec(entry)
+		norm, err := ssh.ParseDynamicForwardSpec(normalizeSSHDumpForwardDisplay(entry))
 		if err != nil {
 			t.Fatalf("ParseDynamicForwardSpec(%q) from ssh -G: %v", entry, err)
 		}

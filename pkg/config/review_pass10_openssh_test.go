@@ -105,8 +105,11 @@ func assertPass10App1SessionAndEnvOptions(t *testing.T, opts *ssh.Options) {
 	if got := opts.RemoteCommand(); got != `echo 'rc # 1' # trailing remote` {
 		t.Errorf("RemoteCommand = %q, want whole line with # preserved", got)
 	}
-	if got := opts.SendEnvPatterns(); !slices.Equal(got, []string{"LANG", "LC_*", "-FOO_*"}) {
-		t.Errorf("SendEnvPatterns = %#v, want [LANG LC_* -FOO_*]", got)
+	if got := opts.SendEnvPatterns(); !slices.Equal(got, []string{"LANG", "LC_*"}) {
+		t.Errorf("SendEnvPatterns = %#v, want [LANG LC_*]", got)
+	}
+	if got := opts.GetAll(ssh.OptionSendEnv); !slices.Equal(got, []string{"-FOO_*", "LANG", "LC_*"}) {
+		t.Errorf("GetAll(OptionSendEnv) = %#v, want [-FOO_* LANG LC_*]", got)
 	}
 	envVars, err := ssh.ResolveSessionEnv(opts, func() []string { return nil })
 	if err != nil {

@@ -1814,14 +1814,18 @@ func resolveMasterConcreteCanonicalNodeID(provider config.ConfigProvider, cleanO
 	if parser == nil || targetHost == "" {
 		return ""
 	}
-	candHosts := append(parser.FindConcreteHostsByAddress(targetHost, port), config.CanonicalDomainCandidates(provider, cleanOrig)...)
-	if port != 0 {
-		for _, extra := range parser.FindConcreteHostsByAddress(targetHost, 0) {
-			if !slices.Contains(candHosts, extra) {
-				candHosts = append(candHosts, extra)
+	var candHosts []string
+	if ep, err := ssh.NewEndpoint(targetHost, int(port)); err == nil {
+		candHosts = append(candHosts, parser.FindConcreteHostsByAddress(ep)...)
+		if port != 0 {
+			for _, extra := range parser.FindConcreteHostsByHost(ep) {
+				if !slices.Contains(candHosts, extra) {
+					candHosts = append(candHosts, extra)
+				}
 			}
 		}
 	}
+	candHosts = append(candHosts, config.CanonicalDomainCandidates(provider, cleanOrig)...)
 	for _, cand := range candHosts {
 		candID := config.OpenSSHNodePrefix + cand
 		if canon := resolveNodeCanonicalHost(provider, candID); canon != "" && strings.EqualFold(canon, cand) && strings.EqualFold(resolveNodeOpenSSHAlias(provider, candID), cleanOrig) {

@@ -685,7 +685,9 @@ func (a *SSHAdapter) buildTier4FallbackLookupKeys(parser *config.OpenSSHParser, 
 	}
 	if addr, port, ok := parseFallbackNodeIDAddressPort(nodeName); ok {
 		if openSSHAlias == "" {
-			appendUnique(parser.FindConcreteHostsByAddress(addr, port)...)
+			if ep, err := ssh.NewEndpoint(addr, int(port)); err == nil {
+				appendUnique(parser.FindConcreteHostsByAddress(ep)...)
+			}
 		}
 		if addr != nodeName {
 			appendUnique(addr)
@@ -729,7 +731,9 @@ func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(parser *config.OpenSSHParser, n
 	}
 	if snapshot.Host.Address != "" {
 		if openSSHAlias == "" {
-			appendKeys(false, parser.FindConcreteHostsByAddress(snapshot.Host.Address, uint16(effectiveSnapshotPort(snapshot.Host.Port)))...)
+			if ep, err := ssh.NewEndpoint(snapshot.Host.Address, effectiveSnapshotPort(snapshot.Host.Port)); err == nil {
+				appendKeys(false, parser.FindConcreteHostsByAddress(ep)...)
+			}
 		}
 		if snapshot.Host.Address != nodeName {
 			appendKeys(true, snapshot.Host.Address)

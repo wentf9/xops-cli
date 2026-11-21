@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -268,9 +269,12 @@ func TestPass9_H3_MultiPatternIncludeOrderAndQuotedDirectives(t *testing.T) {
 	if got := opts.ConnectTimeout(); got != 7*time.Second {
 		t.Errorf("ConnectTimeout = %v, want 7s (z_override before a_default)", got)
 	}
-	wantSendEnv := []string{"FOO_1", "-FOO_*", "LC_*", "LANG"}
+	wantSendEnv := []string{"LC_*", "LANG"}
 	if !slices.Equal(opts.SendEnvPatterns(), wantSendEnv) {
 		t.Errorf("SendEnvPatterns = %#v, want %#v", opts.SendEnvPatterns(), wantSendEnv)
+	}
+	if !slices.Equal(opts.GetAll(ssh.OptionSendEnv), []string{"-FOO_*", "LC_*", "LANG"}) {
+		t.Errorf("GetAll(OptionSendEnv) = %#v, want [-FOO_* LC_* LANG]", opts.GetAll(ssh.OptionSendEnv))
 	}
 	if !slices.Equal(opts.SetEnvDirectives(), []string{`"FOO=hello world"`}) {
 		t.Errorf("SetEnvDirectives = %#v, want [\"FOO=hello world\"]", opts.SetEnvDirectives())

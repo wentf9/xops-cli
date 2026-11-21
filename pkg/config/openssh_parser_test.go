@@ -215,7 +215,11 @@ func TestOpenSSHParserProxyJumpQuotesCommentsBOMAndCRLF(t *testing.T) {
 		t.Errorf("pj-list ProxyJump = %q, want %q", nodeL.ProxyJump, "openssh:jump-a,openssh:ops@jump-b:2222")
 	}
 
-	if got := parser.FindConcreteHostsByAddress("pj-quoted", 0); !slices.Equal(got, []string{"pj-quoted"}) {
+	ep, err := ssh.NewEndpoint("pj-quoted", 22)
+	if err != nil {
+		t.Fatalf("NewEndpoint(pj-quoted): %v", err)
+	}
+	if got := parser.FindConcreteHostsByAddress(ep); !slices.Equal(got, []string{"pj-quoted"}) {
 		t.Errorf("FindConcreteHostsByAddress(pj-quoted) = %v, want [pj-quoted]", got)
 	}
 }

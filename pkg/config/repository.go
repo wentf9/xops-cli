@@ -1326,6 +1326,10 @@ func findImportedProxyByConnection(cfg *Configuration, hop string) (string, bool
 	if err != nil {
 		return "", false
 	}
+	targetEp, epErr := ssh.NewEndpoint(hostName, int(port))
+	if epErr != nil {
+		return "", false
+	}
 	candidates := make([]string, 0)
 	for _, nodeID := range cfg.Nodes.Keys() {
 		node, exists := cfg.Nodes.Get(nodeID)
@@ -1334,10 +1338,18 @@ func findImportedProxyByConnection(cfg *Configuration, hop string) (string, bool
 		}
 		host, hostExists := cfg.Hosts.Get(node.HostRef)
 		identity, identityExists := cfg.Identities.Get(node.IdentityRef)
-		if !hostExists || !identityExists || !SameHostAddress(host.Address, hostName) {
+		if !hostExists || !identityExists {
 			continue
 		}
-		if port != 0 && normalizedHostPort(host.Port) != normalizedHostPort(port) {
+		hostEp, hErr := ssh.NewEndpoint(host.Address, int(host.Port))
+		if hErr != nil {
+			continue
+		}
+		if port != 0 {
+			if !hostEp.Equal(targetEp) {
+				continue
+			}
+		} else if !hostEp.HostEqual(targetEp) {
 			continue
 		}
 		if userName != "" && normalizedIdentityUser(identity.User) != userName {
