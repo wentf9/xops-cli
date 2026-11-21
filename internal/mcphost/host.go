@@ -4,12 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
+	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 	"github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
@@ -338,7 +342,11 @@ func (b *backend) RunTunnel(ctx context.Context, permit ports.Permit, spec tunne
 		return err
 	}
 	defer cancel()
-	id, _, err := permit.Snapshot().Resolve(spec.NodeID)
+	view := permit.Snapshot().Clone()
+	if err := permit.Binding().Validate(view); err != nil {
+		return err
+	}
+	_, target, err := view.Resolve(spec.NodeID)
 	if err != nil {
 		return err
 	}
@@ -348,14 +356,15 @@ func (b *backend) RunTunnel(ctx context.Context, permit ports.Permit, spec tunne
 	}
 	connector := newNonInteractiveMCPConnector(provider, b.config.Logger, b.config.Registry)
 	defer func() { retErr = errors.Join(retErr, connector.CloseAll()) }()
-	client, err := connector.Connect(work, id)
+	connection, err := connector.ConnectPlan(work, target.Plan)
 	if err != nil {
 		if work.Err() != nil {
 			return nil
 		}
 		return fmt.Errorf("connect tunnel SSH node: %w", mcpruntime.FormatMCPError(err))
 	}
-	return sshexec.RunDedicatedForward(work, client, spec, ready, report)
+	defer func() { retErr = errors.Join(retErr, connection.Close()) }()
+	return sshexec.RunDedicatedForward(work, connection.Client, spec, ready, report)
 }
 
 type backend struct {
@@ -479,40 +488,181 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 	res := client.ExecuteCommand(work, plan)
 	return ports.FromSSHResult(res, true), res.Err()
 }
-func (b *backend) files(ctx context.Context, permit ports.Permit, nodeID string, phases ...ports.Phase) (*sftp.Client, error) {
+
+type leasedFileSession struct {
+	*sftp.Client
+	permit  ports.Permit
+	phases  []ports.Phase
+	release func() error
+}
+
+var _ ports.FileSession = (*leasedFileSession)(nil)
+
+func (s *leasedFileSession) Close() error { return s.release() }
+func (s *leasedFileSession) Do(ctx context.Context, operation func(*pkgsftp.Client) error) error {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.Do(work, operation)
+}
+func (s *leasedFileSession) Upload(ctx context.Context, local, remote string, progress sftp.ProgressCallback) error {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.Upload(work, local, remote, progress)
+}
+func (s *leasedFileSession) Download(ctx context.Context, remote, local string, progress sftp.ProgressCallback) error {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.Download(work, remote, local, progress)
+}
+func (s *leasedFileSession) CreatePrivateExclusive(ctx context.Context, name string, write func(io.Writer) error) (bool, bool, error) {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return false, false, err
+	}
+	defer cancel()
+	return s.Client.CreatePrivateExclusive(work, name, write)
+}
+func (s *leasedFileSession) RemoveAll(ctx context.Context, remotePath string) error {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.RemoveAll(work, remotePath)
+}
+func (s *leasedFileSession) RemoteCopy(ctx context.Context, src, dst string) error {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.RemoteCopy(work, src, dst)
+}
+func (s *leasedFileSession) Stat(ctx context.Context, remotePath string) (os.FileInfo, error) {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	return s.Client.Stat(work, remotePath)
+}
+func (s *leasedFileSession) Lstat(ctx context.Context, remotePath string) (os.FileInfo, error) {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	return s.Client.Lstat(work, remotePath)
+}
+func (s *leasedFileSession) RealPath(ctx context.Context, remotePath string) (string, error) {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return "", err
+	}
+	defer cancel()
+	return s.Client.RealPath(work, remotePath)
+}
+
+type leasedTransferFiles struct {
+	*sftp.Client
+	release func() error
+}
+
+func (f *leasedTransferFiles) Close() error { return f.release() }
+
+func (b *backend) connectPlan(work context.Context, permit ports.Permit, plan ssh.ConnectionPlan) (*ssh.PlanConnection, func() error, error) {
+	if provider, ok := permit.Context().Value(providerKey{}).(config.ConfigProvider); ok && !ports.Nil(provider) {
+		connector := newNonInteractiveMCPConnector(provider, b.config.Logger, b.config.Registry)
+		kaCtx, kaCancel := context.WithCancel(context.WithoutCancel(work))
+		connector.EnableKeepAlive(kaCtx, ssh.DefaultKeepAliveInterval, ssh.DefaultKeepAliveTimeout)
+		connection, err := connector.ConnectPlan(work, plan)
+		if err != nil {
+			kaCancel()
+			return nil, nil, errors.Join(err, connector.CloseAll())
+		}
+		release := sync.OnceValue(func() error {
+			kaCancel()
+			return errors.Join(connection.Close(), connector.CloseAll())
+		})
+		return connection, release, nil
+	}
+	connection, err := b.connector.ConnectPlan(work, plan)
+	if err != nil {
+		return nil, nil, err
+	}
+	return connection, connection.Close, nil
+}
+
+func (b *backend) openFiles(ctx context.Context, permit ports.Permit, nodeID string, phases ...ports.Phase) (*leasedFileSession, error) {
 	work, cancel, err := ports.WorkContext(ctx, permit, phases...)
 	if err != nil {
 		return nil, err
 	}
 	defer cancel()
-	id, _, err := permit.Snapshot().Resolve(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	client, err := b.connector.Connect(work, id)
-	if err != nil {
-		return nil, err
-	}
-	return sftp.NewClient(work, client)
+	return b.openFilesWithWork(work, permit, nodeID, phases...)
 }
+
+func (b *backend) openFilesWithWork(work context.Context, permit ports.Permit, nodeID string, phases ...ports.Phase) (*leasedFileSession, error) {
+	view := permit.Snapshot().Clone()
+	if err := permit.Binding().Validate(view); err != nil {
+		return nil, err
+	}
+	_, target, err := view.Resolve(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	connection, releaseConn, err := b.connectPlan(work, permit, target.Plan)
+	if err != nil {
+		return nil, err
+	}
+	files, err := sftp.NewClient(work, connection.Client)
+	if err != nil {
+		return nil, errors.Join(err, releaseConn())
+	}
+	return &leasedFileSession{
+		Client: files,
+		permit: permit,
+		phases: slices.Clone(phases),
+		release: sync.OnceValue(func() error {
+			return errors.Join(files.Close(), releaseConn())
+		}),
+	}, nil
+}
+
 func (b *backend) OpenFiles(ctx context.Context, permit ports.Permit, nodeID string) (ports.FileSession, error) {
-	return b.files(ctx, permit, nodeID, ports.Execute)
+	return b.openFiles(ctx, permit, nodeID, ports.Execute)
 }
+
 func (b *backend) Inspect(ctx context.Context, permit ports.Permit, nodeID string, request ports.InspectRequest) (_ remotefile.Metadata, retErr error) {
-	files, err := b.files(ctx, permit, nodeID, ports.Inspect, ports.Execute, ports.Recovery)
+	work, cancel, err := ports.WorkContext(ctx, permit, ports.Inspect, ports.Execute, ports.TransferStart, ports.Recovery)
+	if err != nil {
+		return remotefile.Metadata{}, err
+	}
+	defer cancel()
+	files, err := b.openFilesWithWork(work, permit, nodeID, ports.Inspect, ports.Execute, ports.TransferStart, ports.Recovery)
 	if err != nil {
 		return remotefile.Metadata{}, err
 	}
 	remote := remotefile.New(files)
 	defer func() { retErr = errors.Join(retErr, remote.Close()) }()
-	return remote.Inspect(ctx, request.Path, request.Upload, request.Overwrite)
+	return remote.Inspect(work, request.Path, request.Upload, request.Overwrite)
 }
+
 func (b *backend) OpenTransfer(ctx context.Context, permit ports.Permit, nodeID string) (ports.TransferSession, error) {
-	files, err := b.files(ctx, permit, nodeID, ports.TransferStart, ports.Commit, ports.Recovery)
+	files, err := b.openFiles(ctx, permit, nodeID, ports.TransferStart, ports.Commit, ports.Recovery)
 	if err != nil {
 		return nil, err
 	}
-	return ports.GuardTransfer(context.WithoutCancel(ctx), remotefile.New(files), permit)
+	return ports.GuardTransfer(context.WithoutCancel(ctx), remotefile.New(&leasedTransferFiles{Client: files.Client, release: files.release}), permit)
 }
 func (b *backend) OpenPTY(ctx context.Context, permit ports.Permit, nodeID string) (ports.PTYSession, error) {
 	work, cancel, err := ports.WorkContext(ctx, permit, ports.Execute)

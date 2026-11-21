@@ -98,8 +98,9 @@ func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigPr
 	if configPath == "" {
 		return base, nil
 	}
+	isNone := strings.EqualFold(strings.TrimSpace(configPath), "none")
 	var parser *OpenSSHParser
-	if strings.EqualFold(strings.TrimSpace(configPath), "none") {
+	if isNone {
 		parser = &OpenSSHParser{cfg: nil}
 	} else {
 		info, err := os.Stat(configPath)
@@ -131,26 +132,97 @@ func WithOpenSSHConfigOverride(base ConfigProvider, configPath string) (ConfigPr
 	if err != nil {
 		return nil, fmt.Errorf("create ephemeral ssh config override provider: %w", err)
 	}
-	if snap != nil && snap.Nodes != nil {
-		if origins != nil {
-			for nodeID, origin := range origins {
-				if _, exists := snap.Nodes.Get(nodeID); exists && !origin.IsZero() {
-					repo.provider.setSavedNodeOpenSSHMetadataIfPresent(nodeID, origin.Alias, origin.CanonicalHost)
-				}
-			}
-		} else if base != nil {
-			for _, nodeID := range snap.Nodes.Keys() {
-				baseNode, ok := base.GetNode(nodeID)
-				if !ok {
-					continue
-				}
-				if baseNode.OpenSSHAlias != "" || baseNode.CanonicalHost != "" {
-					repo.provider.setSavedNodeOpenSSHMetadataIfPresent(nodeID, baseNode.OpenSSHAlias, baseNode.CanonicalHost)
-				}
-			}
-		}
+	if !isNone {
+		copyOverrideOpenSSHOrigins(repo.provider, base, parser, snap, origins, configPath)
 	}
 	return &openSSHOverrideProvider{ConfigProvider: repo, repo: repo}, nil
+}
+
+func copyOverrideOpenSSHOrigins(
+	dst *Provider,
+	base ConfigProvider,
+	parser *OpenSSHParser,
+	snap *Configuration,
+	origins map[string]OpenSSHOrigin,
+	configPath string,
+) {
+	if dst == nil || snap == nil || snap.Nodes == nil {
+		return
+	}
+	sameDefault := sameDefaultOpenSSHConfigPath(configPath)
+	copyOriginIfAllowed := func(nodeID string, origin OpenSSHOrigin) {
+		if origin.IsZero() {
+			return
+		}
+		if !sameDefault && !originCompatibleWithOverrideParser(parser, snap, nodeID, origin) {
+			return
+		}
+		dst.setSavedNodeOpenSSHMetadataIfPresent(nodeID, origin.Alias, origin.CanonicalHost)
+	}
+	if origins != nil {
+		for nodeID, origin := range origins {
+			if _, exists := snap.Nodes.Get(nodeID); exists {
+				copyOriginIfAllowed(nodeID, origin)
+			}
+		}
+		return
+	}
+	if base == nil {
+		return
+	}
+	for _, nodeID := range snap.Nodes.Keys() {
+		baseNode, ok := base.GetNode(nodeID)
+		if !ok {
+			continue
+		}
+		copyOriginIfAllowed(nodeID, OpenSSHOrigin{
+			Alias:         baseNode.OpenSSHAlias,
+			CanonicalHost: baseNode.CanonicalHost,
+		})
+	}
+}
+
+func sameDefaultOpenSSHConfigPath(configPath string) bool {
+	homeDir, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(homeDir) == "" {
+		return false
+	}
+	defaultPath := filepath.Join(homeDir, ".ssh", "config")
+	absConfig, errA := filepath.Abs(configPath)
+	absDefault, errB := filepath.Abs(defaultPath)
+	if errA != nil || errB != nil {
+		return false
+	}
+	if absConfig == absDefault {
+		return true
+	}
+	infoA, errA := os.Stat(absConfig)
+	infoB, errB := os.Stat(absDefault)
+	return errA == nil && errB == nil && os.SameFile(infoA, infoB)
+}
+
+func originCompatibleWithOverrideParser(parser *OpenSSHParser, snap *Configuration, nodeID string, origin OpenSSHOrigin) bool {
+	if parser == nil || parser.cfg == nil || origin.IsZero() {
+		return false
+	}
+	alias := strings.TrimSpace(origin.Alias)
+	if alias == "" || !parser.HasHost(alias) {
+		return false
+	}
+	if snap == nil || snap.Nodes == nil {
+		return false
+	}
+	node, ok := snap.Nodes.Get(nodeID)
+	if !ok {
+		return false
+	}
+	host, hasHost := snap.Hosts.Get(node.HostRef)
+	if resolvedHost, explicit, err := parser.ResolveExplicitHostName(alias); err != nil {
+		return false
+	} else if explicit && hasHost && !SameHostAddress(resolvedHost, host.Address) {
+		return false
+	}
+	return true
 }
 
 type readOnlyRejectStore struct{}

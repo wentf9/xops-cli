@@ -210,11 +210,26 @@ func executeCanonicalizeProbe(
 		}
 	}
 
+	return probeLocalCanonicalCNAME(parentCtx, probeCtx, resolver, parser, policy, probeTarget, res)
+}
+
+func probeLocalCanonicalCNAME(
+	parentCtx context.Context,
+	probeCtx context.Context,
+	resolver CanonicalResolver,
+	parser *OpenSSHParser,
+	policy canonicalizePolicy,
+	probeTarget string,
+	res CanonicalizeResult,
+) (CanonicalizeResult, error) {
 	if parentCtx != nil && parentCtx.Err() != nil {
 		return CanonicalizeResult{}, parentCtx.Err()
 	}
+	if len(policy.permittedCNAMEs) == 0 {
+		return res, nil
+	}
 	if addrs, err := resolver.LookupHost(probeCtx, probeTarget); err == nil && len(addrs) > 0 {
-		chosen, cErr := resolveCanonicalCNAME(parentCtx, probeCtx, resolver, probeTarget, policy.permittedCNAMEs)
+		chosen, cErr := resolveCanonicalCNAME(parentCtx, probeCtx, resolver, probeTarget, probeTarget, policy.permittedCNAMEs)
 		if cErr != nil {
 			return CanonicalizeResult{}, cErr
 		}
@@ -255,20 +270,39 @@ func resolveCanonicalEffectiveInputHost(parser *OpenSSHParser, rawCLI []string, 
 	return orig
 }
 
+func isRealNetCanonicalResolver(resolver CanonicalResolver) bool {
+	switch r := resolver.(type) {
+	case netCanonicalResolver, *netCanonicalResolver:
+		return true
+	case *net.Resolver:
+		return r != nil
+	default:
+		return false
+	}
+}
+
+func canonicalDomainProbeName(resolver CanonicalResolver, fqdn string) string {
+	if isRealNetCanonicalResolver(resolver) && !strings.HasSuffix(fqdn, ".") {
+		return fqdn + "."
+	}
+	return fqdn
+}
+
 func probeCanonicalDomains(parentCtx, probeCtx context.Context, resolver CanonicalResolver, orig string, policy canonicalizePolicy) (string, bool, error) {
 	for _, domain := range policy.domains {
 		if parentCtx != nil && parentCtx.Err() != nil {
 			return "", false, parentCtx.Err()
 		}
 		fqdn := orig + "." + domain
-		addrs, err := resolver.LookupHost(probeCtx, fqdn)
+		lookupHost := canonicalDomainProbeName(resolver, fqdn)
+		addrs, err := resolver.LookupHost(probeCtx, lookupHost)
 		if err != nil || len(addrs) == 0 {
 			if parentCtx != nil && parentCtx.Err() != nil {
 				return "", false, parentCtx.Err()
 			}
 			continue
 		}
-		chosen, cErr := resolveCanonicalCNAME(parentCtx, probeCtx, resolver, fqdn, policy.permittedCNAMEs)
+		chosen, cErr := resolveCanonicalCNAME(parentCtx, probeCtx, resolver, fqdn, lookupHost, policy.permittedCNAMEs)
 		if cErr != nil {
 			return "", false, cErr
 		}
@@ -307,14 +341,14 @@ func pass2OpenSSHOptions(parser *OpenSSHParser, host string) *ssh.Options {
 	return opts
 }
 
-func resolveCanonicalCNAME(parentCtx, probeCtx context.Context, resolver CanonicalResolver, host string, rules []cnameRule) (string, error) {
+func resolveCanonicalCNAME(parentCtx, probeCtx context.Context, resolver CanonicalResolver, host, lookupHost string, rules []cnameRule) (string, error) {
 	if parentCtx != nil && parentCtx.Err() != nil {
 		return "", parentCtx.Err()
 	}
 	if len(rules) == 0 {
 		return host, nil
 	}
-	cname, err := resolver.LookupCNAME(probeCtx, host)
+	cname, err := resolver.LookupCNAME(probeCtx, lookupHost)
 	if err != nil {
 		if parentCtx != nil && parentCtx.Err() != nil {
 			return "", parentCtx.Err()

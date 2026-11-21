@@ -2123,13 +2123,45 @@ func resolveHopFromHostCandidates(cfg *Configuration, hop, hopUser string, hopPo
 	}
 }
 
+func isResolvedOpenSSHJumpHost(openSSH *OpenSSHParser, hop string) (bool, error) {
+	if openSSH == nil || openSSH.cfg == nil {
+		return false, nil
+	}
+	if openSSH.HasHost(hop) {
+		return true, nil
+	}
+	cleanHop := strings.TrimSpace(strings.TrimPrefix(hop, OpenSSHNodePrefix))
+	if cleanHop == "" {
+		return false, nil
+	}
+	lookupAlias, _, _, parseErr := parseOpenSSHHostSpec(cleanHop)
+	if parseErr != nil || lookupAlias == "" {
+		return false, nil
+	}
+	hostName, explicit, err := openSSH.ResolveExplicitHostName(lookupAlias)
+	if err != nil {
+		return false, err
+	}
+	if !explicit || ValidateConcreteHostAddress(hostName) != nil {
+		return false, nil
+	}
+	if isDirectJumpTarget(hostName) {
+		return true, nil
+	}
+	return !strings.EqualFold(StripHostBrackets(hostName), StripHostBrackets(lookupAlias)), nil
+}
+
 // resolveOpenSSHJumpHop handles jump targets that are explicitly prefixed with OpenSSHNodePrefix.
 func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, hop string) (string, error) {
 	cleanHop := strings.TrimPrefix(hop, OpenSSHNodePrefix)
 	if err := openSSH.Err(); err != nil {
 		return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, err)
 	}
-	if openSSH != nil && openSSH.cfg != nil && openSSH.HasHost(cleanHop) {
+	matched, matchErr := isResolvedOpenSSHJumpHost(openSSH, cleanHop)
+	if matchErr != nil {
+		return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, matchErr)
+	}
+	if matched {
 		if _, _, _, vErr := openSSH.GetVirtualNode(cleanHop); vErr != nil {
 			return "", fmt.Errorf("resolve openssh jump %q: %w", cleanHop, vErr)
 		}
@@ -2167,7 +2199,11 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 	if err := openSSH.Err(); err != nil {
 		return "", fmt.Errorf("resolve openssh jump %q: %w", hop, err)
 	}
-	if openSSH != nil && openSSH.cfg != nil && openSSH.HasHost(hop) {
+	matched, matchErr := isResolvedOpenSSHJumpHost(openSSH, hop)
+	if matchErr != nil {
+		return "", fmt.Errorf("resolve openssh jump %q: %w", hop, matchErr)
+	}
+	if matched {
 		if _, _, _, vErr := openSSH.GetVirtualNode(hop); vErr != nil {
 			return "", fmt.Errorf("resolve openssh jump %q: %w", hop, vErr)
 		}

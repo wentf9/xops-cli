@@ -185,6 +185,14 @@ func (r *Repository) View() ConfigView {
 }
 
 func (r *Repository) lockCommit(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("wait for in-process configuration transaction: %w", err)
+		}
+	}
+	if r.commitMu.TryLock() {
+		return nil
+	}
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -1964,11 +1972,16 @@ func (r *Repository) CheckRefUnreferenced(ctx context.Context, ref credential.Re
 	if ref.IsEmpty() {
 		return true, nil
 	}
+	if ctx == nil {
+		return false, fmt.Errorf("configuration ref check context is nil")
+	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
 
-	r.commitMu.Lock()
+	if err := r.lockCommit(ctx); err != nil {
+		return false, err
+	}
 	defer r.commitMu.Unlock()
 
 	// 1. 从持久化存储重新加载最新权威配置
@@ -2227,10 +2240,15 @@ func confirmIdentityRefDurable(diskCfg *Configuration, target credential.Target,
 
 // ConfirmRefDurable 从底层权威持久化存储重新检查指定 target 的凭据引用是否已持久化生效（Durable）。
 func (r *Repository) ConfirmRefDurable(ctx context.Context, target credential.Target, ref *credential.Ref) (bool, error) {
+	if ctx == nil {
+		return false, fmt.Errorf("configuration durability check context is nil")
+	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-	r.commitMu.Lock()
+	if err := r.lockCommit(ctx); err != nil {
+		return false, err
+	}
 	defer r.commitMu.Unlock()
 
 	// 1. 先从底层权威存储读取最新配置并比对引用

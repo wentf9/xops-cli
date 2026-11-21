@@ -105,6 +105,8 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 		var resolvedAgents []resolvedIdentityAgentBinding
 		if identityAgent != "" {
 			resolvedAgents = resolveHopIdentityAgentBindings(identityAgent, env, targets)
+		} else if !identitiesOnly {
+			resolvedAgents = resolveHopIdentityAgentBindings("", env, targets)
 		}
 		dependencies = append(dependencies, dependency{
 			NodeID: hop.NodeID, IdentityRef: snapshot.Node.IdentityRef, Identity: snapshot.Identity,

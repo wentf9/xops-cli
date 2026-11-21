@@ -857,66 +857,157 @@ func indexAddressLookups(lookup map[string][]string, user, address string, port 
 	}
 }
 
+type indexBuildState struct {
+	lookup             map[string][]string
+	aliases            map[string]string
+	hostRefCount       map[string]int
+	nodeHostRef        map[string]string
+	nodeAliasOwner     map[string]string
+	hostAliasHostRef   map[string]string
+	hostAliasFirstNode map[string]string
+	rejectConflicts    bool
+}
+
 func buildIndexes(cfg *Configuration, rejectAliasConflicts bool) (map[string][]string, map[string]string, error) {
-	lookup := make(map[string][]string)
-	aliases := make(map[string]string)
-	for _, nodeID := range cfg.Nodes.Keys() {
+	nodeIDs := cfg.Nodes.Keys()
+	sort.Strings(nodeIDs)
+
+	state := &indexBuildState{
+		lookup:             make(map[string][]string),
+		aliases:            make(map[string]string),
+		hostRefCount:       make(map[string]int, len(nodeIDs)),
+		nodeHostRef:        make(map[string]string, len(nodeIDs)),
+		nodeAliasOwner:     make(map[string]string),
+		hostAliasHostRef:   make(map[string]string),
+		hostAliasFirstNode: make(map[string]string),
+		rejectConflicts:    rejectAliasConflicts,
+	}
+
+	if err := state.indexNodeAliases(cfg, nodeIDs); err != nil {
+		return nil, nil, err
+	}
+	if err := state.indexNodesHostAndUser(cfg, nodeIDs); err != nil {
+		return nil, nil, err
+	}
+	for key := range state.lookup {
+		sort.Strings(state.lookup[key])
+	}
+	return state.lookup, state.aliases, nil
+}
+
+func (s *indexBuildState) indexNodeAliases(cfg *Configuration, nodeIDs []string) error {
+	for _, nodeID := range nodeIDs {
 		node, ok := cfg.Nodes.Get(nodeID)
 		if !ok {
 			continue
 		}
+		s.hostRefCount[node.HostRef]++
+		s.nodeHostRef[nodeID] = node.HostRef
 		for _, alias := range node.Alias {
-			if err := addAlias(lookup, aliases, alias, nodeID, rejectAliasConflicts); err != nil {
-				return nil, nil, err
+			if err := addAlias(s.lookup, s.aliases, alias, nodeID, s.rejectConflicts); err != nil {
+				return err
 			}
+			if alias != "" {
+				if _, exists := s.nodeAliasOwner[alias]; !exists {
+					s.nodeAliasOwner[alias] = nodeID
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (s *indexBuildState) indexNodesHostAndUser(cfg *Configuration, nodeIDs []string) error {
+	for _, nodeID := range nodeIDs {
+		node, ok := cfg.Nodes.Get(nodeID)
+		if !ok {
+			continue
 		}
 		host, hostOK := cfg.Hosts.Get(node.HostRef)
 		identity, identityOK := cfg.Identities.Get(node.IdentityRef)
 		if !hostOK || !identityOK {
 			continue
 		}
-		addLookup(lookup, host.Address, nodeID)
-		cleanHost := StripHostBrackets(host.Address)
-		addLookup(lookup, cleanHost, nodeID)
-		canonHost := NormalizeHostAddress(cleanHost)
-		addLookup(lookup, canonHost, nodeID)
-		if strings.Contains(cleanHost, ":") {
-			addLookup(lookup, fmt.Sprintf("[%s]", cleanHost), nodeID)
-		}
-		if canonHost != "" && strings.Contains(canonHost, ":") {
-			addLookup(lookup, fmt.Sprintf("[%s]", canonHost), nodeID)
-		}
+		indexHostAddressKeys(s.lookup, host.Address, nodeID)
 		for _, alias := range host.Alias {
-			if err := addAlias(lookup, aliases, alias, nodeID, rejectAliasConflicts); err != nil {
-				return nil, nil, err
-			}
-			if normAlias := NormalizeHostAddress(alias); normAlias != "" && normAlias != alias {
-				addLookup(lookup, normAlias, nodeID)
-			}
-		}
-		user := normalizedIdentityUser(identity.User)
-		if user == "" {
-			continue
-		}
-		port := normalizedHostPort(host.Port)
-		for _, address := range append(slices.Clone(host.Alias), host.Address) {
-			if address == "" {
-				continue
-			}
-			indexAddressLookups(lookup, user, address, port, nodeID)
-		}
-		for _, alias := range node.Alias {
 			if alias == "" {
 				continue
 			}
-			addLookup(lookup, fmt.Sprintf("%s@%s", user, alias), nodeID)
-			addLookup(lookup, fmt.Sprintf("%s@%s:%d", user, alias, port), nodeID)
+			if err := s.addHostAlias(alias, nodeID, node.HostRef); err != nil {
+				return err
+			}
+			if normAlias := NormalizeHostAddress(alias); normAlias != "" && normAlias != alias {
+				addLookup(s.lookup, normAlias, nodeID)
+			}
+		}
+		indexNodeUserLookups(s.lookup, node, host, identity, nodeID)
+	}
+	return nil
+}
+
+func indexHostAddressKeys(lookup map[string][]string, rawAddr, nodeID string) {
+	addLookup(lookup, rawAddr, nodeID)
+	cleanHost := StripHostBrackets(rawAddr)
+	addLookup(lookup, cleanHost, nodeID)
+	canonHost := NormalizeHostAddress(cleanHost)
+	addLookup(lookup, canonHost, nodeID)
+	if strings.Contains(cleanHost, ":") {
+		addLookup(lookup, fmt.Sprintf("[%s]", cleanHost), nodeID)
+	}
+	if canonHost != "" && strings.Contains(canonHost, ":") {
+		addLookup(lookup, fmt.Sprintf("[%s]", canonHost), nodeID)
+	}
+}
+
+func indexNodeUserLookups(lookup map[string][]string, node models.Node, host models.Host, identity models.Identity, nodeID string) {
+	user := normalizedIdentityUser(identity.User)
+	if user == "" {
+		return
+	}
+	port := normalizedHostPort(host.Port)
+	for _, address := range append(slices.Clone(host.Alias), host.Address) {
+		if address == "" {
+			continue
+		}
+		indexAddressLookups(lookup, user, address, port, nodeID)
+	}
+	for _, alias := range node.Alias {
+		if alias == "" {
+			continue
+		}
+		addLookup(lookup, fmt.Sprintf("%s@%s", user, alias), nodeID)
+		addLookup(lookup, fmt.Sprintf("%s@%s:%d", user, alias, port), nodeID)
+	}
+}
+
+func (s *indexBuildState) addHostAlias(alias, nodeID, hostRef string) error {
+	if ownerNode, ok := s.nodeAliasOwner[alias]; ok && s.nodeHostRef[ownerNode] != hostRef {
+		if s.rejectConflicts {
+			return fmt.Errorf("alias %q is already assigned to node %q", alias, ownerNode)
+		}
+		s.aliases[alias] = ""
+		addLookup(s.lookup, alias, nodeID)
+		return nil
+	}
+	if existingHostRef, ok := s.hostAliasHostRef[alias]; ok && existingHostRef != hostRef {
+		if s.rejectConflicts {
+			return fmt.Errorf("alias %q is already assigned to node %q", alias, s.hostAliasFirstNode[alias])
+		}
+		s.aliases[alias] = ""
+		addLookup(s.lookup, alias, nodeID)
+		return nil
+	}
+	if _, ok := s.hostAliasHostRef[alias]; !ok {
+		s.hostAliasHostRef[alias] = hostRef
+		s.hostAliasFirstNode[alias] = nodeID
+	}
+	addLookup(s.lookup, alias, nodeID)
+	if s.hostRefCount[hostRef] == 1 {
+		if _, exists := s.aliases[alias]; !exists {
+			s.aliases[alias] = nodeID
 		}
 	}
-	for key := range lookup {
-		sort.Strings(lookup[key])
-	}
-	return lookup, aliases, nil
+	return nil
 }
 
 func addAlias(lookup map[string][]string, aliases map[string]string, alias, nodeID string, rejectConflict bool) error {

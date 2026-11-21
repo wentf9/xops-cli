@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/winsec"
@@ -47,9 +48,53 @@ func platformDialAgent() func(ctx context.Context, socket string) (net.Conn, err
 		if isPipe {
 			return dialWindowsNamedPipe(ctx, pipePath)
 		}
-		dialer := net.Dialer{Timeout: agentDialDefaultTimeout}
-		return dialer.DialContext(ctx, "unix", strings.TrimSpace(target))
+		return dialWindowsAFUnixAgent(ctx, strings.TrimSpace(target))
 	}
+}
+
+func dialWindowsAFUnixAgent(ctx context.Context, socketPath string) (net.Conn, error) {
+	addr := &net.UnixAddr{Name: socketPath, Net: "unix"}
+	if err := winsec.VerifyOwnerOnlySocketFile(socketPath); err != nil {
+		return nil, &net.OpError{
+			Op:   "dial",
+			Net:  "unix",
+			Addr: addr,
+			Err:  fmt.Errorf("verify ssh-agent unix socket file security: %w", err),
+		}
+	}
+	dialer := net.Dialer{Timeout: agentDialDefaultTimeout}
+	conn, err := dialer.DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyWindowsAFUnixAgentPeer(conn); err != nil {
+		_ = conn.Close()
+		return nil, &net.OpError{
+			Op:   "dial",
+			Net:  "unix",
+			Addr: addr,
+			Err:  fmt.Errorf("verify ssh-agent unix socket peer: %w", err),
+		}
+	}
+	return conn, nil
+}
+
+func verifyWindowsAFUnixAgentPeer(conn net.Conn) error {
+	sc, ok := conn.(syscall.Conn)
+	if !ok {
+		return fmt.Errorf("%w: ssh-agent unix connection does not support raw socket control", winsec.ErrUnauthorizedControlPeer)
+	}
+	rawConn, err := sc.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("%w: %w", winsec.ErrUnauthorizedControlPeer, err)
+	}
+	var peerErr error
+	if err := rawConn.Control(func(fd uintptr) {
+		peerErr = winsec.VerifyAFUnixPeerCurrentUser(fd)
+	}); err != nil {
+		return fmt.Errorf("%w: %w", winsec.ErrUnauthorizedControlPeer, err)
+	}
+	return peerErr
 }
 
 type windowsPipeAddr string

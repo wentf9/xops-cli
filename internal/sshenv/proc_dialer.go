@@ -24,6 +24,11 @@ const (
 	stderrLineChunkSize         = 4096
 )
 
+var (
+	probeControllingTTY      func() bool
+	onUnixReapRemainingGroup func(pgid int)
+)
+
 type processAddr string
 
 func (processAddr) Network() string  { return "stdio" }
@@ -461,6 +466,12 @@ func waitBoundedDone(ch <-chan struct{}, d time.Duration) {
 	}
 }
 
+func (c *ProcessStdioConn) hasGroupPipesClosed() bool {
+	sentinelClosed := c.groupSentinelR == nil || isClosedChan(c.groupSentinelDone) || !pipeHasOpenWriter(c.groupSentinelR)
+	stderrClosed := isClosedChan(c.stderrDone) || !pipeHasOpenWriter(c.stderrR)
+	return sentinelClosed && stderrClosed
+}
+
 func (c *ProcessStdioConn) hasSpontaneouslyExitedLocked() bool {
 	sentinelClosed := c.groupSentinelR == nil || isClosedChan(c.groupSentinelDone) || !pipeHasOpenWriter(c.groupSentinelR)
 	stdoutClosed := c.stdoutEOF.Load() || !pipeHasOpenWriter(c.stdoutR)
@@ -503,7 +514,8 @@ func (c *ProcessStdioConn) Close() error {
 		}
 
 		<-c.waitDone
-		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone, c.groupSentinelDone, alreadyExited)
+		groupExited := alreadyExited || c.hasGroupPipesClosed()
+		c.proc.reapRemainingGroup(proxyTermGracePeriod, c.stderrDone, c.groupSentinelDone, groupExited)
 		_ = c.stderrR.Close()
 		if c.groupSentinelR != nil {
 			_ = c.groupSentinelR.Close()

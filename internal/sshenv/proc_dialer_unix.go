@@ -18,10 +18,9 @@ import (
 
 const fallbackPosixShell = "/bin/sh"
 
-var (
-	probeControllingTTY      = defaultHasControllingTTY
-	onUnixReapRemainingGroup func(pgid int)
-)
+func init() {
+	probeControllingTTY = defaultHasControllingTTY
+}
 
 type platformProc struct {
 	process        *os.Process
@@ -54,22 +53,20 @@ func isForegroundTerminalFD(fd int) bool {
 	return err == nil && fgPGID > 0 && fgPGID == unix.Getpgrp()
 }
 
-func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr io.Writer, killTreeOnNormalExit bool) (*platformProc, *exec.Cmd, error) {
+func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr io.Writer, _ bool) (*platformProc, *exec.Cmd, error) {
 	shell := resolveUserShell(os.Getenv("SHELL"))
 	cmd := exec.Command(shell, "-c", command)
 	foregroundTTY := probeControllingTTY()
 	var sentinelR, sentinelW *os.File
 	if !foregroundTTY {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		if killTreeOnNormalExit {
-			r, w, err := os.Pipe()
-			if err != nil {
-				return nil, nil, fmt.Errorf("create ProxyCommand sentinel pipe: %w", err)
-			}
-			sentinelR = r
-			sentinelW = w
-			cmd.ExtraFiles = []*os.File{sentinelW}
+		r, w, err := os.Pipe()
+		if err != nil {
+			return nil, nil, fmt.Errorf("create process group sentinel pipe: %w", err)
 		}
+		sentinelR = r
+		sentinelW = w
+		cmd.ExtraFiles = []*os.File{sentinelW}
 	}
 	attachCommandIO(cmd, stdin, stdout, stderr)
 	err := cmd.Start()
@@ -232,6 +229,9 @@ func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone, s
 	if p == nil || p.foregroundTTY || p.pgid <= 0 || alreadyExited {
 		return
 	}
+	if isClosedChan(stderrDone) && (sentinelDone == nil || isClosedChan(sentinelDone)) {
+		return
+	}
 	if hook := onUnixReapRemainingGroup; hook != nil {
 		hook(p.pgid)
 	}
@@ -248,13 +248,32 @@ func (p *platformProc) reapRemainingGroup(termGrace time.Duration, stderrDone, s
 }
 
 func (p *platformProc) cleanupAfterWait(canceled bool) {
-	if p == nil || p.foregroundTTY || p.pgid <= 0 || !canceled {
+	if p == nil {
 		return
+	}
+	sentinelR := p.detachSentinelPipe()
+	if sentinelR != nil {
+		defer func() { _ = sentinelR.Close() }()
+	}
+	if p.foregroundTTY || p.pgid <= 0 || !canceled {
+		return
+	}
+	if sentinelR != nil && !pipeHasOpenWriter(sentinelR) {
+		return
+	}
+	if hook := onUnixReapRemainingGroup; hook != nil {
+		hook(p.pgid)
 	}
 	if syscall.Kill(-p.pgid, 0) == nil {
 		_ = syscall.Kill(-p.pgid, syscall.SIGTERM)
-		time.Sleep(10 * time.Millisecond)
-		if syscall.Kill(-p.pgid, 0) == nil {
+		deadline := time.Now().Add(10 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if (sentinelR != nil && !pipeHasOpenWriter(sentinelR)) || syscall.Kill(-p.pgid, 0) != nil {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if (sentinelR == nil || pipeHasOpenWriter(sentinelR)) && syscall.Kill(-p.pgid, 0) == nil {
 			_ = syscall.Kill(-p.pgid, syscall.SIGKILL)
 		}
 	}

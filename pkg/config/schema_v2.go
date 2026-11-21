@@ -230,7 +230,19 @@ func ValidateV2(cfg *ConfigurationV2) error {
 		}
 	}
 
-	for nodeName, node := range cfg.Nodes {
+	return validateV2Nodes(cfg)
+}
+
+func validateV2Nodes(cfg *ConfigurationV2) error {
+	nodeNames := make([]string, 0, len(cfg.Nodes))
+	for nodeName := range cfg.Nodes {
+		nodeNames = append(nodeNames, nodeName)
+	}
+	slices.Sort(nodeNames)
+	nodeAliasOwners := make(map[string]string)
+
+	for _, nodeName := range nodeNames {
+		node := cfg.Nodes[nodeName]
 		if err := ValidateNodeAlias(nodeName); err != nil {
 			return fmt.Errorf("%w: node %q name invalid: %w", ErrSchemaValidation, nodeName, err)
 		}
@@ -240,8 +252,51 @@ func ValidateV2(cfg *ConfigurationV2) error {
 		if err := validateNodeRefs(nodeName, node, cfg); err != nil {
 			return err
 		}
+		if err := recordV2NodeAliases(nodeAliasOwners, nodeName, node.Alias); err != nil {
+			return err
+		}
 	}
+	return validateV2HostAliasConflicts(cfg, nodeNames, nodeAliasOwners)
+}
 
+func recordV2NodeAliases(nodeAliasOwners map[string]string, nodeName string, aliases []string) error {
+	for _, alias := range aliases {
+		if alias == "" {
+			continue
+		}
+		if existing, ok := nodeAliasOwners[alias]; ok && existing != nodeName {
+			return fmt.Errorf("%w: alias %q is already assigned to node %q", ErrSchemaValidation, alias, existing)
+		}
+		nodeAliasOwners[alias] = nodeName
+	}
+	return nil
+}
+
+func validateV2HostAliasConflicts(cfg *ConfigurationV2, nodeNames []string, nodeAliasOwners map[string]string) error {
+	hostAliasHostRef := make(map[string]string)
+	hostAliasNode := make(map[string]string)
+	for _, nodeName := range nodeNames {
+		node := cfg.Nodes[nodeName]
+		host, ok := cfg.Hosts[node.HostRef]
+		if !ok {
+			continue
+		}
+		for _, alias := range host.Alias {
+			if alias == "" {
+				continue
+			}
+			if ownerNode, exists := nodeAliasOwners[alias]; exists && cfg.Nodes[ownerNode].HostRef != node.HostRef {
+				return fmt.Errorf("%w: alias %q is already assigned to node %q", ErrSchemaValidation, alias, ownerNode)
+			}
+			if existingHostRef, exists := hostAliasHostRef[alias]; exists && existingHostRef != node.HostRef {
+				return fmt.Errorf("%w: alias %q is already assigned to node %q", ErrSchemaValidation, alias, hostAliasNode[alias])
+			}
+			if _, exists := hostAliasHostRef[alias]; !exists {
+				hostAliasHostRef[alias] = node.HostRef
+				hostAliasNode[alias] = nodeName
+			}
+		}
+	}
 	return nil
 }
 
@@ -480,15 +535,17 @@ func validateNoSecretRefOrCommand(idName, ruleDesc, source string, rule models.C
 }
 
 func validateNodeRefs(nodeName string, node NodeV2, cfg *ConfigurationV2) error {
-	if node.HostRef != "" {
-		if _, exists := cfg.Hosts[node.HostRef]; !exists {
-			return fmt.Errorf("%w: node %q references non-existent host %q", ErrSchemaValidation, nodeName, node.HostRef)
-		}
+	if strings.TrimSpace(node.HostRef) == "" {
+		return fmt.Errorf("%w: node %q host_ref cannot be empty", ErrSchemaValidation, nodeName)
 	}
-	if node.IdentityRef != "" {
-		if _, exists := cfg.Identities[node.IdentityRef]; !exists {
-			return fmt.Errorf("%w: node %q references non-existent identity %q", ErrSchemaValidation, nodeName, node.IdentityRef)
-		}
+	if _, exists := cfg.Hosts[node.HostRef]; !exists {
+		return fmt.Errorf("%w: node %q references non-existent host %q", ErrSchemaValidation, nodeName, node.HostRef)
+	}
+	if strings.TrimSpace(node.IdentityRef) == "" {
+		return fmt.Errorf("%w: node %q identity_ref cannot be empty", ErrSchemaValidation, nodeName)
+	}
+	if _, exists := cfg.Identities[node.IdentityRef]; !exists {
+		return fmt.Errorf("%w: node %q references non-existent identity %q", ErrSchemaValidation, nodeName, node.IdentityRef)
 	}
 
 	if node.PrivilegePasswordRef != nil {
