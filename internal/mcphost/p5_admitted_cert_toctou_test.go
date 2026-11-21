@@ -283,7 +283,7 @@ func p5WriteFile(t *testing.T, path string, data []byte) {
 
 func p5NewHostConfig(hostAddr string, port uint16, user, authType, keyPath string, opts *ssh.Options) *config.Configuration {
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
-	cfg.Guardrail = &corepolicy.Config{Enabled: false}
+	cfg.Guardrail = &corepolicy.Config{Disabled: true}
 	cfg.Hosts.Set("h", models.Host{Address: hostAddr, Port: port})
 	cfg.Identities.Set("id", models.Identity{
 		User:     user,

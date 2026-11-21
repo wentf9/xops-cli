@@ -82,7 +82,7 @@ func setupPublicationWithAdmission(t *testing.T, options *mcp.ClientOptions, ena
 			t.Error(err)
 		}
 	})
-	view := ports.OperationSnapshot{DomainID: "publication-test", Revision: "1", PolicyRevision: "policy-1", Policy: policy.Config{Enabled: enabled, ApprovalThreshold: "safe", NoElicitFallback: "deny"}, Targets: map[string]ports.Target{"node": publicationTarget(t, f.first.Address)}}
+	view := ports.OperationSnapshot{DomainID: "publication-test", Revision: "1", PolicyRevision: "policy-1", Policy: policy.Config{Disabled: !enabled, ApprovalThreshold: "safe", NoElicitFallback: "deny"}, Targets: map[string]ports.Target{"node": publicationTarget(t, f.first.Address)}}
 	f.coordinator, err = state.New(view, admissionOptions)
 	if err != nil {
 		t.Fatal(err)
@@ -400,7 +400,7 @@ func TestTunnelCreationUsesPublishedPolicy(t *testing.T) {
 	next := f.coordinator.Snapshot()
 	next.Revision = "2"
 	next.PolicyRevision = "policy-2"
-	next.Policy.Enabled = true
+	next.Policy.Disabled = false
 	update, err := f.coordinator.BeginUpdate(f.ctx, "1", next)
 	if err != nil {
 		t.Fatal(err)

@@ -36,7 +36,7 @@ func TestUpdatedPolicyFallbackDoesNotInheritStartupOptIn(t *testing.T) {
 				}
 			}()
 			for _, startup := range []string{FallbackAllow, FallbackDeny} {
-				g := NewWithAuditSink(&policy.Config{Enabled: true, ApprovalThreshold: "safe", NoElicitFallback: startup}, &contextualAudit{})
+				g := NewWithAuditSink(&policy.Config{ApprovalThreshold: "safe", NoElicitFallback: startup}, &contextualAudit{})
 				for _, current := range []string{"", FallbackAllow, FallbackDeny, FallbackDowngrade} {
 					for _, dangerous := range []bool{false, true} {
 						tool := "file"
@@ -51,7 +51,7 @@ func TestUpdatedPolicyFallbackDoesNotInheritStartupOptIn(t *testing.T) {
 							executed = true
 							return nil, struct{}{}, nil
 						})
-						work := WithPolicy(ctx, policy.Config{Enabled: true, ApprovalThreshold: "safe", NoElicitFallback: current}, "current-policy")
+						work := WithPolicy(ctx, policy.Config{ApprovalThreshold: "safe", NoElicitFallback: current}, "current-policy")
 						_, _, err := wrapped(work, &mcp.CallToolRequest{Session: ss, Params: &mcp.CallToolParamsRaw{}}, struct{}{})
 						allowed := current == FallbackAllow || !dangerous && (current == "" || current == FallbackDowngrade)
 						if executed != allowed || (err == nil) != allowed {

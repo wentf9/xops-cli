@@ -149,7 +149,7 @@ func TestFilteredTunnelListRetainsDisabledAndDeletedNodeHistory(t *testing.T) {
 				t.Fatal("state filter ignored")
 			}
 			view = f.coordinator.Snapshot()
-			view.Policy.Enabled = true
+			view.Policy.Disabled = false
 			view.Policy.ApprovalThreshold = "dangerous"
 			view.Policy.NoElicitFallback = "deny"
 			view.Policy.NodeOverrides = map[string]policy.NodeConfig{"node": {ApprovalThreshold: "safe"}}

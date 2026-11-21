@@ -26,7 +26,7 @@ func runtimeTestProvider(id string) *config.Provider {
 	cfg.Nodes.Set(id, models.Node{HostRef: "host", IdentityRef: "identity"})
 	cfg.Hosts.Set("host", models.Host{Address: "192.0.2.1", Port: 22})
 	cfg.Identities.Set("identity", models.Identity{User: "operator"})
-	cfg.Guardrail = &corepolicy.Config{Enabled: false}
+	cfg.Guardrail = &corepolicy.Config{Disabled: true}
 	return config.NewProviderWithoutOpenSSH(cfg)
 }
 

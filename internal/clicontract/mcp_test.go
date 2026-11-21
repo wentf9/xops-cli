@@ -103,7 +103,7 @@ func sameMCPContract(want, got []byte) (bool, error) {
 func contractOptions(t *testing.T, httpOptions *mcpruntime.HTTPOptions) []mcpruntime.Option {
 	t.Helper()
 	cfg := mcphost.Config{Provider: config.NewProviderWithoutOpenSSH(
-		&config.Configuration{Guardrail: &policy.Config{Enabled: false}},
+		&config.Configuration{Guardrail: &policy.Config{Disabled: true}},
 	), HTTP: httpOptions}
 	options, err := cfg.RuntimeOptions()
 	if err != nil {

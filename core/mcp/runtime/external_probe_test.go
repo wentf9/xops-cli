@@ -34,7 +34,7 @@ func TestExternalClientProbe(t *testing.T) {
 		t.Fatal("probe directory must already exist")
 	}
 	r, server, _ := startTransferRuntime(t, nil, pkgsftp.InMemHandler(), func(r *Runtime) {
-		policy := guardrail.New(&config.GuardrailConfig{Enabled: true, ApprovalThreshold: "dangerous", NoElicitFallback: guardrail.FallbackDeny})
+		policy := guardrail.New(&config.GuardrailConfig{ApprovalThreshold: "dangerous", NoElicitFallback: guardrail.FallbackDeny})
 		mcp.AddTool(r.server, &mcp.Tool{Name: "xops_probe_approval", Description: "Harmless approval compatibility probe; no remote or filesystem side effects"},
 			guardrail.WithGuardrail(policy, "xops_probe_approval", func(struct{}) guardrail.RiskInput { return guardrail.RiskInput{} },
 				func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, map[string]bool, error) {

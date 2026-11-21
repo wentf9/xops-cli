@@ -25,7 +25,7 @@ import (
 
 func credentialBindingConfig() *config.Configuration {
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
-	cfg.Guardrail = &corepolicy.Config{Enabled: false}
+	cfg.Guardrail = &corepolicy.Config{Disabled: true}
 	cfg.Credential = &config.CredentialConfig{
 		Stores: map[string]config.StoreConfig{
 			"fixture":         {Type: config.StoreTypeHelper, Command: "original-helper"},

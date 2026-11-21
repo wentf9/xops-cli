@@ -211,7 +211,7 @@ func TestHTTPGuardrailApprovalRoundTrip(t *testing.T) {
 	for _, action := range []string{"accept", "decline", "cancel", "unsupported"} {
 		t.Run(action, func(t *testing.T) {
 			var executed atomic.Int32
-			policy := &config.GuardrailConfig{Enabled: true, ApprovalThreshold: "dangerous"}
+			policy := &config.GuardrailConfig{ApprovalThreshold: "dangerous"}
 			_, server := startHTTPTestRuntime(t, nil, policy, func(r *Runtime) {
 				mcp.AddTool(r.server, &mcp.Tool{Name: "guarded_probe"}, guardrail.WithGuardrail(r.guardrail, "guarded_probe",
 					func(struct{}) guardrail.RiskInput { return guardrail.RiskInput{} },

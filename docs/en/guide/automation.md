@@ -92,7 +92,7 @@ xops mcp serve
 
 Configure your AI client to launch the absolute path to `xops` with arguments `["mcp", "serve"]`.
 
-Under `guardrail` in `~/.xops/xops_config.yaml`, you can configure approval thresholds, blocked command patterns, protected file paths, and audit logs:
+Under `guardrail` in `~/.xops/xops_config.yaml`, you can configure approval thresholds, blocked command patterns, protected file paths, and audit logs (guardrails are enabled by default and can only be turned off explicitly with `disabled: true`):
 - **Interactive approvals**: Operations that meet or exceed the approval risk threshold trigger an approval prompt in the client (`approved=true` required); rejections, cancellations, or timeouts abort the operation before execution.
 - **Timeouts and non-interactive credentials**: Stdio tool calls default to a 5-minute timeout (configurable via `mcp.tool_timeout`, e.g. `30m`). MCP runs strictly in non-interactive mode and never opens terminal password prompts or keyring unlock dialogs—run `xops credential doctor` beforehand to verify credential access.
 

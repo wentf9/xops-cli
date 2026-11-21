@@ -56,7 +56,7 @@ func (s executionRiskSource) Resolve(ctx context.Context, request ports.ResolveR
 		return view, err
 	}
 	view = view.Clone()
-	view.Policy = policy.Config{Enabled: true, ApprovalThreshold: "moderate", NoElicitFallback: guardrail.FallbackDeny}
+	view.Policy = policy.Config{ApprovalThreshold: "moderate", NoElicitFallback: guardrail.FallbackDeny}
 	for id, target := range view.Targets {
 		target.Execution = s.execution.Clone()
 		target.ExecutionVersion = ports.ExecutionVersion(target.Execution)

@@ -23,7 +23,6 @@ import (
 
 func TestRound8_P1_3_P2_6_CanonicalOpenSSHSelectorAndPolicyBypassPrevention(t *testing.T) {
 	f := tunnelOpenSSHFixture(t, &corepolicy.Config{
-		Enabled:           true,
 		ApprovalThreshold: "dangerous",
 		NoElicitFallback:  guardrail.FallbackDeny,
 		NodeOverrides: map[string]corepolicy.NodeConfig{
@@ -164,7 +163,7 @@ func TestRound8_P2_5_P3_3_ExpandMCPBindingPathAnd3HopJumpAndTruncatedCert(t *tes
 	writeDummyUserCert(t, certFile, 1)
 
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
-	cfg.Guardrail = &corepolicy.Config{Enabled: false}
+	cfg.Guardrail = &corepolicy.Config{Disabled: true}
 	cfg.Hosts.Set("h1", models.Host{Address: "192.0.2.1", Port: 22})
 	cfg.Hosts.Set("h2", models.Host{Address: "192.0.2.2", Port: 22})
 	cfg.Hosts.Set("h3", models.Host{Address: "192.0.2.3", Port: 22})

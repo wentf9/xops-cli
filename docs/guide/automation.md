@@ -92,7 +92,7 @@ xops mcp serve
 
 在 AI 客户端的 MCP 配置中，将启动命令设为 `xops` 的绝对路径，参数设为 `["mcp", "serve"]`。
 
-在 `~/.xops/xops_config.yaml` 的 `guardrail` 字段中可配置审批阈值、高危命令拦截、受保护文件路径和审计日志路径：
+在 `~/.xops/xops_config.yaml` 的 `guardrail` 字段中可配置审批阈值、高危命令拦截、受保护文件路径和审计日志路径（护栏默认开启，仅可通过 `disabled: true` 显式关闭）：
 - **操作审批**：当工具调用达到需审批的风险级别时，客户端会弹出审批请求（需确认 `approved=true`），拒绝、取消或超时均不会执行远端操作。
 - **默认超时与非交互凭据**：单次工具调用默认超时为 5 分钟（可通过 `mcp.tool_timeout` 调整，如 `30m`）。MCP 全程运行在非交互模式下，不会弹出终端密码提示或密钥环解锁窗口，启动前可用 `xops credential doctor` 检查凭据可用性。
 

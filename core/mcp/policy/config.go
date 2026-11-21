@@ -8,8 +8,11 @@ import (
 )
 
 // Config configures the MCP safety guardrail.
+//
+// Zero value fails closed: Disabled == false means the guardrail is active.
+// Set Disabled to true (YAML "disabled: true") to explicitly disable it.
 type Config struct {
-	Enabled           bool                  `yaml:"enabled"`
+	Disabled          bool                  `yaml:"disabled,omitempty"`
 	AuditLog          string                `yaml:"audit_log,omitempty"`
 	ApprovalThreshold string                `yaml:"approval_threshold,omitempty"` // "safe"|"moderate"|"dangerous"
 	BlockedPatterns   []string              `yaml:"blocked_patterns,omitempty"`
@@ -29,9 +32,8 @@ type NodeConfig struct {
 	ApprovalThreshold string `yaml:"approval_threshold"`
 }
 
-// UnmarshalYAML decodes Config while failing closed when the YAML block omits
-// "enabled" (defaulting Enabled to true). Explicit "enabled: false" still sets
-// Enabled to false, and Go struct literals keep Enabled as a plain bool.
+// UnmarshalYAML decodes Config and rejects unknown fields (including the removed
+// legacy "enabled" key; use "disabled: true" to disable the guardrail).
 func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 	if value == nil {
 		return nil
@@ -40,7 +42,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 		value = value.Alias
 	}
 	if value.Kind == yaml.ScalarNode && value.Tag == "!!null" {
-		*c = Config{Enabled: true}
+		*c = Config{}
 		return nil
 	}
 	if value.Kind != yaml.MappingNode {
@@ -48,7 +50,7 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 	}
 
 	knownFields := map[string]struct{}{
-		"enabled":            {},
+		"disabled":           {},
 		"audit_log":          {},
 		"approval_threshold": {},
 		"blocked_patterns":   {},
@@ -60,35 +62,12 @@ func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 
-	type rawConfig struct {
-		Enabled           *bool                 `yaml:"enabled"`
-		AuditLog          string                `yaml:"audit_log,omitempty"`
-		ApprovalThreshold string                `yaml:"approval_threshold,omitempty"`
-		BlockedPatterns   []string              `yaml:"blocked_patterns,omitempty"`
-		ProtectedPaths    []string              `yaml:"protected_paths,omitempty"`
-		NodeOverrides     map[string]NodeConfig `yaml:"nodes,omitempty"`
-		NoElicitFallback  string                `yaml:"no_elicit_fallback,omitempty"`
-	}
-
+	type rawConfig Config
 	var decoded rawConfig
 	if err := value.Decode(&decoded); err != nil {
 		return err
 	}
-
-	enabled := true
-	if decoded.Enabled != nil {
-		enabled = *decoded.Enabled
-	}
-
-	*c = Config{
-		Enabled:           enabled,
-		AuditLog:          decoded.AuditLog,
-		ApprovalThreshold: decoded.ApprovalThreshold,
-		BlockedPatterns:   decoded.BlockedPatterns,
-		ProtectedPaths:    decoded.ProtectedPaths,
-		NodeOverrides:     decoded.NodeOverrides,
-		NoElicitFallback:  decoded.NoElicitFallback,
-	}
+	*c = Config(decoded)
 	return nil
 }
 

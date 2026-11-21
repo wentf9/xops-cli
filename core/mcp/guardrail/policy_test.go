@@ -9,7 +9,6 @@ import (
 
 func defaultTestConfig() *config.Config {
 	return &config.Config{
-		Enabled:           true,
 		ApprovalThreshold: "dangerous",
 		ProtectedPaths:    []string{"/etc", "/boot"},
 	}
@@ -17,7 +16,7 @@ func defaultTestConfig() *config.Config {
 
 func TestPolicyEvaluate_Disabled(t *testing.T) {
 	cfg := defaultTestConfig()
-	cfg.Enabled = false
+	cfg.Disabled = true
 	p := NewPolicy(cfg)
 
 	got := p.Evaluate(Dangerous, RiskInput{ToolName: "terminal", Command: "rm -rf /", Paths: []string{"/"}})
@@ -144,11 +143,11 @@ func TestPolicyEvaluateBatchNodes(t *testing.T) {
 	if got := p.Evaluate(Safe, input); got != Deny {
 		t.Fatalf("batch approval overrode deny: %s", got)
 	}
-	cfg.Enabled = false
+	cfg.Disabled = true
 	if got := p.Evaluate(Safe, input); got != Allow {
 		t.Fatalf("disabled guardrail: %s", got)
 	}
-	cfg.Enabled, cfg.BlockedPatterns, cfg.ApprovalThreshold = true, nil, "safe"
+	cfg.Disabled, cfg.BlockedPatterns, cfg.ApprovalThreshold = false, nil, "safe"
 	cfg.NodeOverrides = map[string]config.NodeConfig{"public": {ApprovalThreshold: "dangerous"}}
 	if got := p.Evaluate(Safe, RiskInput{ToolName: "tunnel", Action: "list", NodeIDs: []string{"public"}}); got != NeedApproval {
 		t.Fatal("batch nodes weakened the global policy")

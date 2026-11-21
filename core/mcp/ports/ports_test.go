@@ -12,7 +12,7 @@ import (
 )
 
 func fixtureSnapshot() OperationSnapshot {
-	return OperationSnapshot{DomainID: "domain", Revision: "display-1", PolicyRevision: "policy-1", Policy: policy.Config{Enabled: true, ApprovalThreshold: "dangerous"},
+	return OperationSnapshot{DomainID: "domain", Revision: "display-1", PolicyRevision: "policy-1", Policy: policy.Config{ApprovalThreshold: "dangerous"},
 		Targets:   map[string]Target{"node": {Info: NodeInfo{ID: "node", Alias: []string{"alias"}}, Version: "execution-1", Plan: ssh.ConnectionPlan{Scope: "scope", Hops: []ssh.ConnectionConfig{{NodeID: "node", Address: "192.0.2.1", Port: 22, User: "fixture", AuthType: "key", KeyRef: "key", AuthUpdateToken: "key-1"}}}}},
 		Selectors: map[string]string{"alias": "node"},
 	}

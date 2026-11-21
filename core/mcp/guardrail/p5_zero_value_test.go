@@ -199,12 +199,17 @@ func TestWithGuardrail_UnknownDecisionFailsClosedAndAudits(t *testing.T) {
 	})
 }
 
-func TestGuardrail_YAMLOmittingEnabledDefaultsEnabledAndBlocksDangerous(t *testing.T) {
+func TestGuardrail_ZeroValueAndYAMLDisabledDefaultBlocksDangerous(t *testing.T) {
+	// 0. Go zero-value policy.Config{} is active (Disabled == false) and blocks dangerous commands.
+	if got := NewPolicy(&policy.Config{}).Evaluate(Dangerous, RiskInput{ToolName: "terminal", Command: "rm -rf /"}); got != Deny {
+		t.Fatalf("NewPolicy(&policy.Config{}).Evaluate(rm -rf /) = %v, want Deny", got)
+	}
+
 	type rootConfig struct {
 		Guardrail *policy.Config `yaml:"guardrail,omitempty"`
 	}
 
-	const yamlOmittedEnabled = `
+	const yamlOmittedDisabled = `
 guardrail:
   approval_threshold: dangerous
   no_elicit_fallback: deny
@@ -212,14 +217,14 @@ guardrail:
     - /etc
 `
 	var parsed rootConfig
-	if err := yaml.Unmarshal([]byte(yamlOmittedEnabled), &parsed); err != nil {
+	if err := yaml.Unmarshal([]byte(yamlOmittedDisabled), &parsed); err != nil {
 		t.Fatalf("yaml.Unmarshal failed: %v", err)
 	}
 	if parsed.Guardrail == nil {
 		t.Fatal("expected parsed guardrail config, got nil")
 	}
-	if !parsed.Guardrail.Enabled {
-		t.Fatal("YAML guardrail block omitting enabled must default to Enabled=true")
+	if parsed.Guardrail.Disabled {
+		t.Fatal("YAML guardrail block omitting disabled must default to Disabled=false")
 	}
 
 	g := New(parsed.Guardrail)
@@ -237,7 +242,7 @@ guardrail:
 
 	// 1. Hard-blocked dangerous command must be denied.
 	if _, _, err := wrapped(context.Background(), &mcp.CallToolRequest{}, dummyInput{Command: "rm -rf /"}); err == nil {
-		t.Fatal("expected rm -rf / to be denied when YAML omits enabled")
+		t.Fatal("expected rm -rf / to be denied when YAML omits disabled")
 	}
 	if len(calledCommands) != 0 {
 		t.Fatalf("blocked command must not execute handler, called: %v", calledCommands)
@@ -261,15 +266,19 @@ guardrail:
 		t.Fatalf("expected only safe command to execute, got %v", calledCommands)
 	}
 
-	// 4. Explicit enabled: false still disables guardrail policy.
+	// 4. Explicit disabled: true disables guardrail policy; legacy enabled: key is rejected.
 	var parsedDisabled rootConfig
-	if err := yaml.Unmarshal([]byte("guardrail:\n  enabled: false\n"), &parsedDisabled); err != nil {
-		t.Fatalf("yaml.Unmarshal explicit false failed: %v", err)
+	if err := yaml.Unmarshal([]byte("guardrail:\n  disabled: true\n"), &parsedDisabled); err != nil {
+		t.Fatalf("yaml.Unmarshal explicit disabled: true failed: %v", err)
 	}
-	if parsedDisabled.Guardrail == nil || parsedDisabled.Guardrail.Enabled {
-		t.Fatalf("expected explicit enabled: false, got %+v", parsedDisabled.Guardrail)
+	if parsedDisabled.Guardrail == nil || !parsedDisabled.Guardrail.Disabled {
+		t.Fatalf("expected explicit disabled: true, got %+v", parsedDisabled.Guardrail)
 	}
 	if got := NewPolicy(parsedDisabled.Guardrail).Evaluate(Dangerous, RiskInput{ToolName: "terminal", Command: "rm -rf /"}); got != Allow {
 		t.Fatalf("explicitly disabled guardrail policy returned %v, want Allow", got)
+	}
+	var legacy rootConfig
+	if err := yaml.Unmarshal([]byte("guardrail:\n  enabled: false\n"), &legacy); err == nil {
+		t.Fatalf("expected legacy enabled: key to fail with unknown field error, got %+v", legacy.Guardrail)
 	}
 }

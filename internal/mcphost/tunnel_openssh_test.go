@@ -178,7 +178,7 @@ func TestMCPTunnelOpenSSHWhitespaceCannotBypassPolicy(t *testing.T) {
 	for _, protocol := range []string{"2025-11-25", "2026-07-28"} {
 		t.Run(protocol, func(t *testing.T) {
 			f := tunnelOpenSSHFixture(t, &corepolicy.Config{
-				Enabled: true, ApprovalThreshold: "dangerous", NoElicitFallback: guardrail.FallbackDeny,
+				ApprovalThreshold: "dangerous", NoElicitFallback: guardrail.FallbackDeny,
 				NodeOverrides: map[string]corepolicy.NodeConfig{
 					"openssh:web": {ApprovalThreshold: "safe"}, "openssh:fixture@web": {ApprovalThreshold: "safe"},
 				},

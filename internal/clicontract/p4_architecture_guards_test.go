@@ -840,22 +840,26 @@ func TestP5_ZeroValueAndFailClosedSecurityInvariants(t *testing.T) {
 		}
 	})
 
-	t.Run("PolicyConfigYAMLOmittingEnabledDefaultsTrue", func(t *testing.T) {
-		const yamlWithoutEnabled = "approval_threshold: dangerous\nno_elicit_fallback: deny\n"
+	t.Run("PolicyConfigZeroValueAndYAMLDisabledSemantics", func(t *testing.T) {
+		const yamlWithoutDisabled = "approval_threshold: dangerous\nno_elicit_fallback: deny\n"
 		var cfg corepolicy.Config
-		if err := yaml.Unmarshal([]byte(yamlWithoutEnabled), &cfg); err != nil {
-			t.Fatalf("yaml.Unmarshal(policy.Config without enabled): %v", err)
+		if err := yaml.Unmarshal([]byte(yamlWithoutDisabled), &cfg); err != nil {
+			t.Fatalf("yaml.Unmarshal(policy.Config without disabled): %v", err)
 		}
-		if !cfg.Enabled {
-			t.Fatal("YAML policy.Config omitting enabled must default to Enabled == true")
+		if cfg.Disabled {
+			t.Fatal("YAML policy.Config omitting disabled must default to Disabled == false (guardrail ON)")
 		}
 
 		var disabledCfg corepolicy.Config
-		if err := yaml.Unmarshal([]byte("enabled: false\n"), &disabledCfg); err != nil {
-			t.Fatalf("yaml.Unmarshal(policy.Config enabled:false): %v", err)
+		if err := yaml.Unmarshal([]byte("disabled: true\n"), &disabledCfg); err != nil {
+			t.Fatalf("yaml.Unmarshal(policy.Config disabled:true): %v", err)
 		}
-		if disabledCfg.Enabled {
-			t.Fatal("YAML policy.Config with explicit enabled:false must decode Enabled == false")
+		if !disabledCfg.Disabled {
+			t.Fatal("YAML policy.Config with explicit disabled:true must decode Disabled == true")
+		}
+		var legacyCfg corepolicy.Config
+		if err := yaml.Unmarshal([]byte("enabled: false\n"), &legacyCfg); err == nil {
+			t.Fatal("YAML policy.Config with removed legacy enabled: key must fail")
 		}
 	})
 

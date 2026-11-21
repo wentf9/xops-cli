@@ -20,7 +20,7 @@ func TestCLIBindingSurvivesRuntimeRecreationAndRejectsChangedTarget(t *testing.T
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
-	cfg.Guardrail = &corepolicy.Config{Enabled: false}
+	cfg.Guardrail = &corepolicy.Config{Disabled: true}
 	cfg.Hosts.Set("host", models.Host{Address: "192.0.2.1", Port: 22})
 	cfg.Identities.Set("identity", models.Identity{User: "fixture", AuthType: "password", Password: "synthetic"})
 	cfg.Nodes.Set("node", models.Node{HostRef: "host", IdentityRef: "identity"})
@@ -63,7 +63,7 @@ func TestCLIBindingSurvivesRuntimeRecreationAndRejectsChangedTarget(t *testing.T
 }
 
 func TestCLIRecoveryReconstructsHTTPPolicyDefaults(t *testing.T) {
-	for _, policy := range []*corepolicy.Config{nil, {Enabled: true, ApprovalThreshold: "dangerous"}, {Enabled: true, NoElicitFallback: "allow"}} {
+	for _, policy := range []*corepolicy.Config{nil, {ApprovalThreshold: "dangerous"}, {NoElicitFallback: "allow"}} {
 		cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
 		cfg.Guardrail = policy
 		provider := config.NewProviderWithoutOpenSSH(cfg)
@@ -92,7 +92,7 @@ func TestCLIBindingInvalidatesOnExecutionChangeAndPreservesOnUnrelatedChange(t *
 	defer cancel()
 
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
-	cfg.Guardrail = &corepolicy.Config{Enabled: false}
+	cfg.Guardrail = &corepolicy.Config{Disabled: true}
 	cfg.Hosts.Set("host", models.Host{Address: "192.0.2.1", Port: 22})
 	cfg.Identities.Set("identity", models.Identity{User: "fixture", AuthType: "password", Password: "synthetic"})
 	cfg.Execution = &ssh.ExecutionConfig{Interpreter: ssh.InterpreterBash, LaunchDialect: ssh.LaunchPOSIX}

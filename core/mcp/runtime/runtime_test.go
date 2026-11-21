@@ -23,7 +23,7 @@ func runtimeTestProvider(nodeID string) *config.Provider {
 	identities.Set("identity", models.Identity{User: "operator"})
 	return config.NewProviderWithoutOpenSSH(&config.Configuration{
 		Nodes: nodes, Hosts: hosts, Identities: identities,
-		Guardrail: &config.GuardrailConfig{Enabled: false},
+		Guardrail: &config.GuardrailConfig{Disabled: true},
 	})
 }
 

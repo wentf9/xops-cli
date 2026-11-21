@@ -12,7 +12,7 @@ import (
 )
 
 func TestPolicyConfigurationRoundTrip(t *testing.T) {
-	const source = "enabled: true\naudit_log: /var/lib/xops/audit.jsonl\napproval_threshold: dangerous\nblocked_patterns:\n    - '*forbidden*'\nprotected_paths:\n    - /etc\nnodes:\n    production:\n        approval_threshold: safe\nno_elicit_fallback: deny\n"
+	const source = "audit_log: /var/lib/xops/audit.jsonl\napproval_threshold: dangerous\nblocked_patterns:\n    - '*forbidden*'\nprotected_paths:\n    - /etc\nnodes:\n    production:\n        approval_threshold: safe\nno_elicit_fallback: deny\n"
 	var configuration config.Configuration
 	input := "guardrail:\n  " + strings.ReplaceAll(strings.TrimSuffix(source, "\n"), "\n", "\n  ") + "\n"
 	if err := yaml.Unmarshal([]byte(input), &configuration); err != nil {

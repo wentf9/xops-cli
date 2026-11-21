@@ -141,9 +141,9 @@ func TestMCPExecutionProbeRespectsOverridesAndFailures(t *testing.T) {
 		{name: "incomplete probe", incomplete: true, probes: 1, denied: true},
 		{name: "empty probe", empty: true, probes: 1, denied: true},
 		{name: "stale execution admission", stale: true, probes: 1, denied: true},
-		{name: "fish still needs approval", policy: policy.Config{Enabled: true, ApprovalThreshold: "moderate", NoElicitFallback: "deny"}, probes: 1, denied: true},
-		{name: "hard deny does not probe", policy: policy.Config{Enabled: true, BlockedPatterns: []string{"*"}}, denied: true},
-		{name: "built-in block does not probe", command: "rm -rf /", policy: policy.Config{Enabled: true}, denied: true},
+		{name: "fish still needs approval", policy: policy.Config{ApprovalThreshold: "moderate", NoElicitFallback: "deny"}, probes: 1, denied: true},
+		{name: "hard deny does not probe", policy: policy.Config{BlockedPatterns: []string{"*"}}, denied: true},
+		{name: "built-in block does not probe", command: "rm -rf /", policy: policy.Config{}, denied: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			provider := runtimeTestProvider("node")
@@ -211,7 +211,7 @@ func TestMCPProbedPOSIXCommandsStillRequireApproval(t *testing.T) {
 	} {
 		t.Run(tc.command, func(t *testing.T) {
 			provider := runtimeTestProvider("node")
-			source := probeRuntimeSource{StateSource: provider, policy: policy.Config{Enabled: true, ApprovalThreshold: "moderate", NoElicitFallback: "deny"}}
+			source := probeRuntimeSource{StateSource: provider, policy: policy.Config{ApprovalThreshold: "moderate", NoElicitFallback: "deny"}}
 			backend := &probeRuntimeBackend{executed: make(chan *ssh.ExecutionConfig, 1), result: &ssh.ProbeResult{DetectedDialect: ssh.LaunchPOSIX, SuggestedConfig: ssh.ExecutionConfig{Interpreter: ssh.InterpreterZsh, LaunchDialect: ssh.LaunchPOSIX}}}
 			r, err := NewRuntime(t.Context(), WithDependencies(ports.Dependencies{State: source, Gate: &probeRuntimeGate{domain: source.DomainID()}, Audit: ports.NoopAudit{}, NewBackend: func(context.Context) (ports.Backend, error) { return backend, nil }}))
 			if err != nil {

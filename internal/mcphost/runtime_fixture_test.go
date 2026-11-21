@@ -37,7 +37,7 @@ type runtimeFixture struct {
 func newRuntimeFixture(t *testing.T, ctx context.Context, provider config.ConfigProvider, log corelog.DebugLogger, connector *ssh.Connector) *runtimeFixture {
 	t.Helper()
 	cfg := provider.Snapshot()
-	cfg.Guardrail = &corepolicy.Config{Enabled: false}
+	cfg.Guardrail = &corepolicy.Config{Disabled: true}
 	r, err := newTestRuntime(ctx, Config{Provider: config.NewProviderWithoutOpenSSH(cfg), Logger: log})
 	if err != nil {
 		t.Fatal(err)

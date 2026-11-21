@@ -175,8 +175,8 @@ nodes:
 # =============================================================================
 guardrail:
 
-  # 是否启用护栏。设为 false 则所有操作直接放行（不推荐用于生产环境）
-  enabled: true
+  # 护栏默认启用（fail-closed）；仅在明确设置 disabled: true 时禁用（不推荐用于生产环境）
+  disabled: false
 
   # 审计日志路径（JSON Lines 格式，记录所有工具调用的风险等级和执行结果）
   audit_log: ~/.xops/audit.log

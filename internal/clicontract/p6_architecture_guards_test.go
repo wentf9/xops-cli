@@ -216,7 +216,7 @@ func TestP6_SecurityStructsZeroValueReflectionGuard(t *testing.T) {
 
 	t.Run("MuxServerOptionsZeroValueEnforcesPeerCheck", checkMuxServerOptionsZeroValue)
 	t.Run("GuardrailDecisionZeroValueIsDeny", checkGuardrailDecisionZeroValue)
-	t.Run("PolicyConfigYAMLOmittingEnabledDefaultsTrue", checkPolicyConfigYAMLDefaultEnabled)
+	t.Run("PolicyConfigYAMLDisabledSemantics", checkPolicyConfigYAMLDisabledSemantics)
 	t.Run("AllowListSpecsDeclareSupportedAndFailClosedTokens", checkAllowListSpecCapabilities)
 }
 
@@ -257,24 +257,28 @@ func checkGuardrailDecisionZeroValue(t *testing.T) {
 	}
 }
 
-func checkPolicyConfigYAMLDefaultEnabled(t *testing.T) {
+func checkPolicyConfigYAMLDisabledSemantics(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		rawYAML     string
-		wantEnabled bool
+		name         string
+		rawYAML      string
+		wantDisabled bool
 	}{
-		{"omitted_with_other_fields", "approval_threshold: dangerous\nno_elicit_fallback: deny\n", true},
-		{"empty_mapping", "{}\n", true},
-		{"explicit_false", "enabled: false\n", false},
-		{"explicit_true", "enabled: true\n", true},
+		{"omitted_with_other_fields", "approval_threshold: dangerous\nno_elicit_fallback: deny\n", false},
+		{"empty_mapping", "{}\n", false},
+		{"explicit_true", "disabled: true\n", true},
+		{"explicit_false", "disabled: false\n", false},
 	} {
 		var cfg corepolicy.Config
 		if err := yaml.Unmarshal([]byte(tc.rawYAML), &cfg); err != nil {
 			t.Fatalf("%s: yaml.Unmarshal failed: %v", tc.name, err)
 		}
-		if cfg.Enabled != tc.wantEnabled {
-			t.Errorf("%s: Enabled = %v, want %v", tc.name, cfg.Enabled, tc.wantEnabled)
+		if cfg.Disabled != tc.wantDisabled {
+			t.Errorf("%s: Disabled = %v, want %v", tc.name, cfg.Disabled, tc.wantDisabled)
 		}
+	}
+	var legacy corepolicy.Config
+	if err := yaml.Unmarshal([]byte("enabled: false\n"), &legacy); err == nil {
+		t.Error("legacy enabled: key must be rejected as unknown field")
 	}
 }
 

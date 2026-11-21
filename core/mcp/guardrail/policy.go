@@ -34,7 +34,6 @@ func (d Decision) String() string {
 // DefaultGuardrailConfig returns sensible defaults when no config is provided.
 func DefaultGuardrailConfig() *policy.Config {
 	return &policy.Config{
-		Enabled:           true,
 		ApprovalThreshold: "dangerous",
 		NoElicitFallback:  FallbackDowngrade,
 		ProtectedPaths:    []string{"/etc", "/boot", "/usr", "/sbin", "/root"},
@@ -77,7 +76,7 @@ func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
 	if p == nil || p.cfg == nil {
 		return Deny
 	}
-	if !p.cfg.Enabled {
+	if p.cfg.Disabled {
 		return Allow
 	}
 

@@ -20,7 +20,7 @@ import (
 func tunnelListPolicyRuntime(t *testing.T) *Runtime {
 	t.Helper()
 	return tunnelListRuntimeWithPolicy(t, &config.GuardrailConfig{
-		Enabled: true, ApprovalThreshold: "dangerous", NoElicitFallback: guardrail.FallbackDeny,
+		ApprovalThreshold: "dangerous", NoElicitFallback: guardrail.FallbackDeny,
 		NodeOverrides: map[string]config.NodeGuardrailCfg{"restricted-*": {ApprovalThreshold: "safe"}},
 	})
 }
@@ -188,7 +188,7 @@ func TestMCPTunnelListGlobalThresholdWithWildcard(t *testing.T) {
 		for _, action := range []string{"accept", "decline", "cancel", "unsupported"} {
 			t.Run(protocol+"/"+action, func(t *testing.T) {
 				r := tunnelListRuntimeWithPolicy(t, &config.GuardrailConfig{
-					Enabled: true, ApprovalThreshold: "safe", NoElicitFallback: guardrail.FallbackDeny,
+					ApprovalThreshold: "safe", NoElicitFallback: guardrail.FallbackDeny,
 					NodeOverrides: map[string]config.NodeGuardrailCfg{"*": {ApprovalThreshold: "dangerous"}},
 				})
 				record := seedTunnelListTask(t, r, "node", "wildcard")

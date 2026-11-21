@@ -28,9 +28,9 @@ func (a *contextualAudit) Append(ctx context.Context, entry AuditEntry) error {
 
 func TestInvocationPoliciesAreIndependentDefensiveViews(t *testing.T) {
 	g := New(nil)
-	allowed := policy.Config{Enabled: false, BlockedPatterns: []string{"forbidden"}}
+	allowed := policy.Config{Disabled: true, BlockedPatterns: []string{"forbidden"}}
 	first := WithPolicy(t.Context(), allowed, "first")
-	allowed.Enabled = true
+	allowed.Disabled = false
 	allowed.BlockedPatterns[0] = "*"
 	second := WithPolicy(t.Context(), allowed, "second")
 	risk := RiskInput{ToolName: "terminal", Action: "once", Command: "hostname"}
@@ -41,10 +41,10 @@ func TestInvocationPoliciesAreIndependentDefensiveViews(t *testing.T) {
 
 func TestOutcomeAuditSurvivesRequestCancellation(t *testing.T) {
 	audit := &contextualAudit{}
-	g := NewWithAuditSink(&policy.Config{Enabled: false}, audit)
+	g := NewWithAuditSink(&policy.Config{Disabled: true}, audit)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	ctx = WithPolicy(ctx, policy.Config{Enabled: false}, "bound-target")
+	ctx = WithPolicy(ctx, policy.Config{Disabled: true}, "bound-target")
 	handler := WithGuardrail(g, "nodes", func(struct{}) RiskInput { return RiskInput{} },
 		func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {
 			cancel()
@@ -64,7 +64,7 @@ func (a failingContextAudit) Append(context.Context, AuditEntry) error { return 
 
 func TestIntentAuditFailurePreventsExecution(t *testing.T) {
 	marker := errors.New("audit unavailable")
-	g := NewWithAuditSink(&policy.Config{Enabled: false}, failingContextAudit{marker})
+	g := NewWithAuditSink(&policy.Config{Disabled: true}, failingContextAudit{marker})
 	executed := false
 	handler := WithGuardrail(g, "nodes", func(struct{}) RiskInput { return RiskInput{} },
 		func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, struct{}, error) {

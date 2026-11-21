@@ -28,7 +28,7 @@ func TestP7_SecurityTypesZeroValueTable(t *testing.T) {
 		check func(t *testing.T, zeroVal reflect.Value)
 	}{
 		{"ssh.MuxServerOptions", reflect.TypeFor[ssh.MuxServerOptions](), assertZeroMuxServerOptions},
-		{"policy.Config_YAMLDefaultsEnabled", reflect.TypeFor[corepolicy.Config](), assertZeroPolicyConfig},
+		{"policy.Config", reflect.TypeFor[corepolicy.Config](), assertZeroPolicyConfig},
 		{"guardrail.Decision", reflect.TypeFor[guardrail.Decision](), assertZeroGuardrailDecision},
 		{"guardrail.Policy", reflect.TypeFor[guardrail.Policy](), assertZeroGuardrailPolicy},
 		{"guardrail.RiskInput", reflect.TypeFor[guardrail.RiskInput](), assertZeroGuardrailRiskInput},
@@ -73,27 +73,39 @@ func assertZeroMuxServerOptions(t *testing.T, rv reflect.Value) {
 func assertZeroPolicyConfig(t *testing.T, rv reflect.Value) {
 	t.Helper()
 	zero := rv.Interface().(corepolicy.Config)
+	if zero.Disabled {
+		t.Fatal("zero policy.Config must have Disabled == false (guardrail ON)")
+	}
 	if zero.AuditLog != "" || zero.ApprovalThreshold != "" || zero.NoElicitFallback != "" {
 		t.Fatalf("zero policy.Config has non-empty string fields: %+v", zero)
 	}
 	if len(zero.BlockedPatterns) != 0 || len(zero.ProtectedPaths) != 0 || len(zero.NodeOverrides) != 0 {
 		t.Fatalf("zero policy.Config has populated collections: %+v", zero)
 	}
+	if got := guardrail.NewPolicy(&zero).Evaluate(guardrail.Dangerous, guardrail.RiskInput{ToolName: "terminal", Command: "rm -rf /"}); got != guardrail.Deny {
+		t.Fatalf("NewPolicy(&zero policy.Config).Evaluate(rm -rf /) = %v, want Deny", got)
+	}
 	for _, tc := range []struct {
-		doc  string
-		want bool
+		doc          string
+		wantDisabled bool
 	}{
-		{"{}\n", true},
-		{"approval_threshold: dangerous\nno_elicit_fallback: deny\n", true},
-		{"enabled: true\n", true},
-		{"enabled: false\n", false},
+		{"{}\n", false},
+		{"approval_threshold: dangerous\nno_elicit_fallback: deny\n", false},
+		{"disabled: false\n", false},
+		{"disabled: true\n", true},
 	} {
 		var cfg corepolicy.Config
 		if err := yaml.Unmarshal([]byte(tc.doc), &cfg); err != nil {
 			t.Fatalf("yaml.Unmarshal(%q): %v", tc.doc, err)
 		}
-		if cfg.Enabled != tc.want {
-			t.Fatalf("yaml.Unmarshal(%q): Enabled = %v, want %v", tc.doc, cfg.Enabled, tc.want)
+		if cfg.Disabled != tc.wantDisabled {
+			t.Fatalf("yaml.Unmarshal(%q): Disabled = %v, want %v", tc.doc, cfg.Disabled, tc.wantDisabled)
+		}
+	}
+	for _, legacyDoc := range []string{"enabled: true\n", "enabled: false\n"} {
+		var cfg corepolicy.Config
+		if err := yaml.Unmarshal([]byte(legacyDoc), &cfg); err == nil {
+			t.Fatalf("yaml.Unmarshal(%q) succeeded, want unknown-field error", legacyDoc)
 		}
 	}
 }

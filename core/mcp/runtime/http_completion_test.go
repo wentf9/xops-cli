@@ -55,7 +55,7 @@ func waitHTTPInitialization(t *testing.T, ctx context.Context, finished <-chan s
 func TestApprovalReplyCompletesAtHTTPRequestLimit(t *testing.T) {
 	var executed atomic.Int32
 	initialized := make(chan struct{})
-	policy := &config.GuardrailConfig{Enabled: true, ApprovalThreshold: "dangerous"}
+	policy := &config.GuardrailConfig{ApprovalThreshold: "dangerous"}
 	_, server := startHTTPTestRuntime(t, func(o *HTTPOptions) { o.MaxRequests = 2; o.ToolTimeout = 800 * time.Millisecond }, policy, func(r *Runtime) {
 		observeHTTPInitialization(r, initialized)
 		mcp.AddTool(r.server, &mcp.Tool{Name: "guarded_probe"}, guardrail.WithGuardrail(r.guardrail, "guarded_probe",
