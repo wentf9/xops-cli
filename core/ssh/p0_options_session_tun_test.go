@@ -448,38 +448,49 @@ func testP0ForwardParsersRejectControlChars(t *testing.T) {
 	}
 }
 
-// TestP0_SendEnv_NegativePatternDoesNotPruneBroaderWildcard verifies that a
-// narrower negative wildcard pattern (e.g. -LC_?) does not falsely delete an
-// earlier broader positive wildcard pattern (e.g. LC_*).
+// TestP0_SendEnv_NegativePatternOpenSSHMergeSemantics verifies OpenSSH readconf.c
+// SendEnv -PATTERN merge-time pattern-against-pattern removal semantics (LOW-3).
 func TestP0_SendEnv_NegativePatternDoesNotPruneBroaderWildcard(t *testing.T) {
 	t.Parallel()
 
-	t.Run("lc_star_then_minus_lc_qmark", func(t *testing.T) {
+	t.Run("negative_literal_does_not_remove_wildcard_pattern", func(t *testing.T) {
 		opts := &Options{}
-		if err := opts.Append(OptionSendEnv, "LC_*"); err != nil {
-			t.Fatalf("Append(LC_*): %v", err)
+		if err := opts.Append(OptionSendEnv, "FOO_*"); err != nil {
+			t.Fatalf("Append(FOO_*): %v", err)
 		}
-		if err := opts.Append(OptionSendEnv, "-LC_?"); err != nil {
-			t.Fatalf("Append(-LC_?): %v", err)
+		if err := opts.Append(OptionSendEnv, "-FOO_SECRET"); err != nil {
+			t.Fatalf("Append(-FOO_SECRET): %v", err)
+		}
+		if got := opts.SendEnvPatterns(); !slices.Equal(got, []string{"FOO_*"}) {
+			t.Fatalf("SendEnvPatterns = %v, want [FOO_*]", got)
 		}
 		got, err := ResolveSessionEnv(opts, func() []string {
-			return []string{
-				"LC_ALL=C.UTF-8",
-				"LC_CTYPE=en_US.UTF-8",
-				"LC_X=should_be_excluded",
-				"LC_1=should_also_be_excluded",
-				"OTHER=ignored",
-			}
+			return []string{"FOO_PUBLIC=1", "FOO_SECRET=2", "OTHER=3"}
 		})
 		if err != nil {
 			t.Fatalf("ResolveSessionEnv: %v", err)
 		}
 		want := []EnvVar{
-			{Name: "LC_ALL", Value: "C.UTF-8"},
-			{Name: "LC_CTYPE", Value: "en_US.UTF-8"},
+			{Name: "FOO_PUBLIC", Value: "1"},
+			{Name: "FOO_SECRET", Value: "2"},
 		}
 		if !slices.Equal(got, want) {
 			t.Fatalf("ResolveSessionEnv = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("negative_qmark_matches_single_char_wildcard_pattern_like_openssh", func(t *testing.T) {
+		opts := &Options{}
+		if err := opts.Append(OptionSendEnv, "LC_*"); err != nil {
+			t.Fatalf("Append(LC_*): %v", err)
+		}
+		// In OpenSSH readconf.c, match_pattern("LC_*", "LC_?") is true because '?'
+		// matches the single character '*', so "LC_*" is removed at parse/merge time.
+		if err := opts.Append(OptionSendEnv, "-LC_?"); err != nil {
+			t.Fatalf("Append(-LC_?): %v", err)
+		}
+		if got := opts.SendEnvPatterns(); len(got) != 0 {
+			t.Fatalf("SendEnvPatterns = %v, want empty", got)
 		}
 	})
 
@@ -487,7 +498,7 @@ func TestP0_SendEnv_NegativePatternDoesNotPruneBroaderWildcard(t *testing.T) {
 		merged, err := EffectiveOptions(
 			MustOptions(OptionSendEnv, "LC_X"),
 			MustOptions(OptionSendEnv, "-LC_?"),
-			MustOptions(OptionSendEnv, "LC_*"),
+			MustOptions(OptionSendEnv, "LC_Y LC_ALL"),
 		)
 		if err != nil {
 			t.Fatalf("EffectiveOptions: %v", err)

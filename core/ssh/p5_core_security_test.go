@@ -1323,12 +1323,20 @@ func TestP5_R2_ExpandRemoteCommand_TokenSafety(t *testing.T) {
 		t.Fatalf("unexpected expansion %q", got)
 	}
 
-	// Spaces and backslashes in home dirs (macOS/Windows) remain allowed when free of shell metachars/controls.
-	for _, home := range []string{"/Users/Jane Doe", `C:\Users\John Doe`} {
+	// Clean POSIX and Windows drive-letter home dirs without spaces or shell metachars expand cleanly.
+	for _, home := range []string{"/Users/jane.doe", `C:\Users\john.doe`} {
 		env := baseEnv
 		env.HomeDir = home
 		if out, err := ExpandRemoteCommand("cd %d && exec bash", env, baseTarget); err != nil || !strings.Contains(out, home) {
 			t.Fatalf("expected valid home %q to expand cleanly, got (%q, %v)", home, out, err)
+		}
+	}
+	// Spaces in home dirs fail closed under the shared strict allowlist (MED-12).
+	for _, home := range []string{"/Users/Jane Doe", `C:\Users\John Doe`} {
+		env := baseEnv
+		env.HomeDir = home
+		if out, err := ExpandRemoteCommand("cd %d && exec bash", env, baseTarget); !errors.Is(err, ErrUnsafeExecToken) {
+			t.Fatalf("expected space-containing home %q to fail with ErrUnsafeExecToken, got (%q, %v)", home, out, err)
 		}
 	}
 

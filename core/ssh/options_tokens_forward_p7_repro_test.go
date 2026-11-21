@@ -1,5 +1,3 @@
-//go:build p7repro
-
 package ssh
 
 import (

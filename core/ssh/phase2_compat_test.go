@@ -104,8 +104,11 @@ func buildPopulatedPhase2Options(t *testing.T) *Options {
 	if err := opts.Set("EscapeChar", "^A"); err != nil {
 		t.Fatalf("Set(EscapeChar, ^A): %v", err)
 	}
-	if !slices.Equal(opts.SendEnvPatterns(), []string{"LANG", "LC_*", "-LC_ALL"}) {
+	if !slices.Equal(opts.SendEnvPatterns(), []string{"LANG", "LC_*"}) {
 		t.Fatalf("SendEnvPatterns() = %v", opts.SendEnvPatterns())
+	}
+	if !slices.Equal(opts.GetAll(OptionSendEnv), []string{"-LC_ALL", "LANG", "LC_*"}) {
+		t.Fatalf("GetAll(OptionSendEnv) = %v", opts.GetAll(OptionSendEnv))
 	}
 	if !slices.Equal(opts.SetEnvDirectives(), []string{`FOO="bar baz"`}) {
 		t.Fatalf("SetEnvDirectives() = %v", opts.SetEnvDirectives())

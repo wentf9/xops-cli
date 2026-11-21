@@ -251,17 +251,55 @@ func validateSafeHomeToken(kind, val string) error {
 	if val == "" || len(val) > maxSafeHomeTokenLen || val[0] == '-' {
 		return fmt.Errorf("%w: invalid %s %q", ErrUnsafeExecToken, kind, val)
 	}
+	// Accept pure Windows drive paths (e.g. C:\Users\alice.dev) without trailing
+	// backslash or mixed POSIX separators, so a backslash can never act as a shell
+	// escape in POSIX paths (e.g. /home/alice\escape).
+	if isWindowsDriveHomePath(val) {
+		return validateSafeWindowsHomeToken(kind, val)
+	}
 	for i := 0; i < len(val); i++ {
-		if !isSafeHomeTokenChar(val[i]) {
+		if !isSafePOSIXHomeTokenChar(val[i]) {
 			return fmt.Errorf("%w: %s %q contains disallowed character %q", ErrUnsafeExecToken, kind, val, val[i])
 		}
 	}
 	return nil
 }
 
-func isSafeHomeTokenChar(c byte) bool {
+func isWindowsDriveHomePath(val string) bool {
+	return len(val) >= 4 &&
+		((val[0] >= 'a' && val[0] <= 'z') || (val[0] >= 'A' && val[0] <= 'Z')) &&
+		val[1] == ':' && val[2] == '\\'
+}
+
+func validateSafeWindowsHomeToken(kind, val string) error {
+	if val[len(val)-1] == '\\' {
+		return fmt.Errorf("%w: %s %q cannot end with backslash", ErrUnsafeExecToken, kind, val)
+	}
+	prevSlash := true
+	for i := 3; i < len(val); i++ {
+		c := val[i]
+		if c == '\\' {
+			if prevSlash {
+				return fmt.Errorf("%w: %s %q contains empty path segment", ErrUnsafeExecToken, kind, val)
+			}
+			prevSlash = true
+			continue
+		}
+		prevSlash = false
+		if !isSafeHomeSegmentChar(c) {
+			return fmt.Errorf("%w: %s %q contains disallowed character %q", ErrUnsafeExecToken, kind, val, c)
+		}
+	}
+	return nil
+}
+
+func isSafeHomeSegmentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-		c == '.' || c == '_' || c == '-' || c == '/' || c == '\\' || c == ':'
+		c == '.' || c == '_' || c == '-'
+}
+
+func isSafePOSIXHomeTokenChar(c byte) bool {
+	return isSafeHomeSegmentChar(c) || c == '/'
 }
 
 // ExpandProxyCommand expands OpenSSH ProxyCommand percent tokens (%%, %h, %p, %r, %n)

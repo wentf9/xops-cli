@@ -568,8 +568,11 @@ func TestP2_ParseCLIOptions_MergeModesAndValidation(t *testing.T) {
 		if got := parsed.SetEnvDirectives(); !slices.Equal(got, []string{"A=first B=first"}) {
 			t.Fatalf("SetEnvDirectives = %v, want [A=first B=first]", got)
 		}
-		if got := parsed.SendEnvPatterns(); !slices.Equal(got, []string{"LANG", "-LC_ALL", "LANG"}) {
-			t.Fatalf("SendEnvPatterns = %v, want [LANG -LC_ALL LANG]", got)
+		if got := parsed.SendEnvPatterns(); !slices.Equal(got, []string{"LANG", "LANG"}) {
+			t.Fatalf("SendEnvPatterns = %v, want [LANG LANG]", got)
+		}
+		if got := parsed.GetAll(OptionSendEnv); !slices.Equal(got, []string{"-LC_ALL", "LANG", "LANG"}) {
+			t.Fatalf("GetAll(OptionSendEnv) = %v, want [-LC_ALL LANG LANG]", got)
 		}
 		if got := parsed.LocalForwards(); !slices.Equal(got, []string{"8080 127.0.0.1:80", "9090 127.0.0.1:90"}) {
 			t.Fatalf("LocalForwards = %v", got)
@@ -666,9 +669,9 @@ func TestP2_ProjectCLIOptions_SetEnvLosslessAndDeterministic(t *testing.T) {
 
 	projected := ProjectCLIOptions(merged)
 	wantProjected := []string{
+		`SendEnv=-LC_ALL`,
 		`SendEnv=LANG`,
 		`SendEnv=LC_*`,
-		`SendEnv=-LC_ALL`,
 		`SetEnv="B=node" "A=cli \"val\" \\ end" "GITHUB_TOKEN=secret_tok" "EMPTY=" "SPECIAL=x	y\\" "C=added"`,
 	}
 	if !slices.Equal(projected, wantProjected) {

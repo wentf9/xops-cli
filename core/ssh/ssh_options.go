@@ -1421,23 +1421,7 @@ func validateRemoteCommandToken(tok byte, val string) error {
 	if hasControlOrLineSepChar(val) {
 		return fmt.Errorf("%w: %%%c %q contains invalid control character", ErrUnsafeExecToken, tok, val)
 	}
-	if tok == 'd' {
-		return validateSafeRemoteHomeToken(val)
-	}
 	return ValidateSafeExecToken("%"+string(tok), val)
-}
-
-func validateSafeRemoteHomeToken(val string) error {
-	if val == "" || len(val) > maxSafeHomeTokenLen || val[0] == '-' {
-		return fmt.Errorf("%w: invalid %%d %q", ErrUnsafeExecToken, val)
-	}
-	if hasControlOrLineSepChar(val) {
-		return fmt.Errorf("%w: %%d %q contains invalid control character", ErrUnsafeExecToken, val)
-	}
-	if strings.ContainsAny(val, ";|&$`()<>'\"") {
-		return fmt.Errorf("%w: %%d %q contains disallowed shell metacharacter", ErrUnsafeExecToken, val)
-	}
-	return nil
 }
 
 func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]string {
@@ -1446,7 +1430,7 @@ func buildRemoteCommandTokenMap(env Environment, target TargetContext) map[byte]
 	if target.Port > 0 {
 		portStr = strconv.Itoa(target.Port)
 	}
-	origHost := target.OriginalHost
+	origHost := cleanHostLiteral(target.OriginalHost)
 	if origHost == "" {
 		origHost = host
 	}
@@ -2439,17 +2423,27 @@ func (o *Options) KexAlgorithms() string {
 	return o.Get(OptionKexAlgorithms)
 }
 
-// SendEnvPatterns returns all configured SendEnv pattern tokens in evaluation order, or nil if unset.
+// SendEnvPatterns returns the effective positive SendEnv patterns in evaluation
+// order (after applying merge-time '-PATTERN' removals per OpenSSH readconf.c),
+// or nil if no positive patterns remain.
 func (o *Options) SendEnvPatterns() []string {
 	entries := o.GetAll(OptionSendEnv)
 	if len(entries) == 0 {
 		return nil
 	}
-	var out []string
+	var raw []string
 	for _, entry := range entries {
 		for tok := range strings.FieldsSeq(entry) {
-			out = append(out, tok)
+			raw = append(raw, tok)
 		}
+	}
+	reduced := reduceSendEnvTokens(nil, raw)
+	var out []string
+	for _, tok := range reduced {
+		if strings.HasPrefix(tok, "-") {
+			continue
+		}
+		out = append(out, tok)
 	}
 	if len(out) == 0 {
 		return nil

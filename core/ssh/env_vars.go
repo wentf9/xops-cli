@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	corelog "github.com/wentf9/xops-cli/core/log"
@@ -21,11 +22,6 @@ const (
 type EnvVar struct {
 	Name  string
 	Value string
-}
-
-type sendEnvRule struct {
-	pattern string
-	negate  bool
 }
 
 func isEnvIdentStart(ch byte) bool {
@@ -167,7 +163,50 @@ func validateSendEnvOption(raw string) (string, error) {
 	if len(tokens) == 0 {
 		return "", errors.New("invalid SendEnv: value cannot be empty")
 	}
-	return strings.Join(tokens, "\n"), nil
+	return strings.Join(reduceSendEnvTokens(nil, tokens), "\n"), nil
+}
+
+// reduceSendEnvTokens folds incoming SendEnv tokens onto existing tokens using
+// OpenSSH readconf.c pattern-against-pattern removal semantics:
+//   - A negative token "-PAT" removes every previously accumulated positive
+//     pattern p for which matchOpenSSHPattern(PAT, p) is true, and records
+//     "-PAT" in the leading sorted deduplicated negation set so that merging
+//     this layer over a lower layer removes matching lower-layer patterns
+//     associatively.
+//   - A positive token is appended after all leading negations in arrival order.
+func reduceSendEnvTokens(existing, incoming []string) []string {
+	var negations []string
+	var positives []string
+	apply := func(tokens []string) {
+		for _, tok := range tokens {
+			if tok == "" {
+				continue
+			}
+			if strings.HasPrefix(tok, "-") {
+				negPat := tok[1:]
+				kept := positives[:0]
+				for _, p := range positives {
+					if matchOpenSSHPattern(negPat, p) {
+						continue
+					}
+					kept = append(kept, p)
+				}
+				positives = kept
+				if !slices.Contains(negations, tok) {
+					negations = append(negations, tok)
+				}
+				continue
+			}
+			positives = append(positives, tok)
+		}
+	}
+	apply(existing)
+	apply(incoming)
+	slices.Sort(negations)
+	out := make([]string, 0, len(negations)+len(positives))
+	out = append(out, negations...)
+	out = append(out, positives...)
+	return out
 }
 
 func validateSetEnvOption(raw string) (string, error) {
@@ -305,67 +344,47 @@ func stepQuotedEnvByte(s string, i int, quote byte, sb *strings.Builder) (int, b
 	return i + 1, quote
 }
 
-func buildSendEnvRules(patterns []string) ([]sendEnvRule, bool, error) {
-	var rules []sendEnvRule
-	for _, entry := range patterns {
+func collectEffectiveSendEnvPatterns(rawEntries []string) ([]string, error) {
+	var all []string
+	for _, entry := range rawEntries {
 		parsed, err := splitQuotedEnvTokens(entry)
 		if err != nil {
-			return nil, false, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+			return nil, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 		}
 		for _, tok := range parsed {
 			if err := validateSendEnvToken(tok); err != nil {
-				return nil, false, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+				return nil, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 			}
-			if strings.HasPrefix(tok, "-") {
-				negPat := tok[1:]
-				kept := rules[:0]
-				for _, r := range rules {
-					if !r.negate && r.pattern == negPat {
-						continue
-					}
-					kept = append(kept, r)
-				}
-				rules = append(kept, sendEnvRule{pattern: negPat, negate: true})
-				continue
-			}
-			kept := rules[:0]
-			for _, r := range rules {
-				if r.negate && r.pattern == tok {
-					continue
-				}
-				kept = append(kept, r)
-			}
-			rules = append(kept, sendEnvRule{pattern: tok, negate: false})
+			all = append(all, tok)
 		}
 	}
-	hasPositive := false
-	for _, r := range rules {
-		if !r.negate {
-			hasPositive = true
-			break
+	reduced := reduceSendEnvTokens(nil, all)
+	var positive []string
+	for _, tok := range reduced {
+		if strings.HasPrefix(tok, "-") {
+			continue
 		}
+		positive = append(positive, tok)
 	}
-	return rules, hasPositive, nil
+	return positive, nil
 }
 
-func shouldSendEnvVar(rules []sendEnvRule, name string) bool {
-	send := false
-	for _, r := range rules {
-		if matchOpenSSHPattern(r.pattern, name) {
-			send = !r.negate
+func shouldSendEnvVar(patterns []string, name string) bool {
+	for _, pat := range patterns {
+		if matchOpenSSHPattern(pat, name) {
+			return true
 		}
 	}
-	return send
+	return false
 }
 
 // ResolveSessionEnv computes the ordered list of environment variables to transmit on a new SSH
 // user session from SendEnv patterns (matched against hostEnviron with non-bypassable denylist
 // filtering) and explicit SetEnv KEY=VALUE directives.
 //
-// Slice entries in opts are processed left-to-right (Tier 4 -> Tier 3 -> Tier 2 -> Tier 1 when
-// merged via EffectiveOptions / MergeOptionLayers): '-PATTERN' removes/suppresses previously
-// accumulated SendEnv patterns, and later SetEnv directives override earlier SetEnv directives
-// as well as SendEnv values.
+// SendEnv '-PATTERN' directives are evaluated at parse/merge time using OpenSSH readconf.c
+// pattern-against-pattern removal; only surviving positive patterns match host environment names.
+// Later SetEnv directives override earlier SetEnv directives as well as SendEnv values.
 func ResolveSessionEnv(opts *Options, hostEnviron func() []string) ([]EnvVar, error) {
 	return resolveSessionEnvWithLogger(opts, hostEnviron, corelog.NopLogger)
 }
@@ -378,7 +397,7 @@ func resolveSessionEnvWithLogger(opts *Options, hostEnviron func() []string, log
 		log = corelog.NopLogger
 	}
 
-	rules, hasPositiveSendEnv, err := buildSendEnvRules(opts.SendEnvPatterns())
+	patterns, err := collectEffectiveSendEnvPatterns(opts.GetAll(OptionSendEnv))
 	if err != nil {
 		return nil, err
 	}
@@ -389,8 +408,8 @@ func resolveSessionEnvWithLogger(opts *Options, hostEnviron func() []string, log
 	}
 
 	acc := newSessionEnvAccumulator()
-	if hasPositiveSendEnv && hostEnviron != nil {
-		acc.addMatchingHostEnv(hostEnviron(), rules, setEnvNames, log)
+	if len(patterns) > 0 && hostEnviron != nil {
+		acc.addMatchingHostEnv(hostEnviron(), patterns, setEnvNames, log)
 	}
 
 	for _, ev := range setEnvPairs {
@@ -518,7 +537,7 @@ func (a *sessionEnvAccumulator) upsert(ev EnvVar) error {
 
 func (a *sessionEnvAccumulator) addMatchingHostEnv(
 	environ []string,
-	rules []sendEnvRule,
+	patterns []string,
 	reservedSetEnv map[string]struct{},
 	log corelog.DebugLogger,
 ) {
@@ -529,7 +548,7 @@ func (a *sessionEnvAccumulator) addMatchingHostEnv(
 		if !ok || !isValidEnvVarName(name) || strings.ContainsRune(val, 0) {
 			continue
 		}
-		if isDeniedSendEnvName(name) || !shouldSendEnvVar(rules, name) {
+		if isDeniedSendEnvName(name) || !shouldSendEnvVar(patterns, name) {
 			continue
 		}
 		if entryLen := len(name) + 1 + len(val); entryLen > MaxSessionEnvEntryBytes {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -637,9 +638,6 @@ func parseDestEndpoint(token string) (ForwardEndpoint, error) {
 }
 
 func splitForwardFields(trimmed string) ([]string, error) {
-	if !strings.ContainsAny(trimmed, `"'`) {
-		return strings.Fields(trimmed), nil
-	}
 	return splitQuotedEnvTokens(trimmed)
 }
 
@@ -910,7 +908,7 @@ func parseSingleFieldRemoteForward(raw, trimmed, tok string) (ForwardSpec, error
 
 	parts, err := splitBracketAwareColons(tok)
 	if err != nil {
-		if isExplicitStreamLocalPath(tok) {
+		if isUnixSocketToken(tok) {
 			return buildDynamicUnixRemoteForward(tok)
 		}
 		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: %w", raw, err)
@@ -922,7 +920,7 @@ func parseSingleFieldRemoteForward(raw, trimmed, tok string) (ForwardSpec, error
 	case 2:
 		return parseRemoteForwardColon2(raw, tok, parts)
 	case 3:
-		if isExplicitStreamLocalPath(parts[0]) {
+		if isUnixSocketToken(parts[0]) {
 			if spec, parseErr := ParseForwardSpec(raw); parseErr == nil {
 				return spec, nil
 			}
@@ -930,12 +928,12 @@ func parseSingleFieldRemoteForward(raw, trimmed, tok string) (ForwardSpec, error
 		}
 		return ParseForwardSpec(raw)
 	case 4:
-		if isExplicitStreamLocalPath(parts[0]) {
+		if isUnixSocketToken(parts[0]) {
 			return buildDynamicUnixRemoteForward(tok)
 		}
 		return ParseForwardSpec(raw)
 	default:
-		if isExplicitStreamLocalPath(parts[0]) {
+		if isUnixSocketToken(parts[0]) {
 			return buildDynamicUnixRemoteForward(tok)
 		}
 		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q", raw)
@@ -964,7 +962,7 @@ func parseRemoteForwardColon1(raw, token string) (ForwardSpec, error) {
 }
 
 func parseRemoteForwardColon2(raw, tok string, parts []string) (ForwardSpec, error) {
-	if isExplicitStreamLocalPath(parts[0]) {
+	if isUnixSocketToken(parts[0]) {
 		if isExplicitStreamLocalPath(parts[1]) {
 			return ParseForwardSpec(raw)
 		}
@@ -975,9 +973,6 @@ func parseRemoteForwardColon2(raw, tok string, parts []string) (ForwardSpec, err
 	}
 	if isUnixSocketToken(parts[1]) {
 		return ParseForwardSpec(raw)
-	}
-	if isUnixSocketToken(parts[0]) {
-		return ForwardSpec{}, fmt.Errorf("invalid remote forward specification %q: unix socket cannot have a port", raw)
 	}
 	port, err := parsePortNumber(parts[1], true)
 	if err != nil {
@@ -1056,6 +1051,10 @@ func unwrapForwardHost(token string, allowEmpty bool) (string, error) {
 				return "", nil
 			}
 			return "", errors.New("wildcard host '*' is not allowed")
+		}
+		addr, err := netip.ParseAddr(inner)
+		if err != nil || !addr.Is6() {
+			return "", fmt.Errorf("bracketed host %q must be a valid IPv6 literal", token)
 		}
 		return inner, nil
 	}
@@ -1239,11 +1238,22 @@ func (o *Options) appendOrderedRaw(canonicalKey, normalized string) {
 		return
 	}
 	existing := o.GetAll(canonicalKey)
+	incoming := make([]string, 0, 4)
 	for item := range strings.SplitSeq(normalized, "\n") {
 		if item != "" {
-			existing = append(existing, item)
+			incoming = append(incoming, item)
 		}
 	}
+	if canonicalKey == OptionSendEnv {
+		reduced := reduceSendEnvTokens(existing, incoming)
+		if len(reduced) > 0 {
+			o.setRaw(canonicalKey, strings.Join(reduced, "\n"))
+		} else {
+			o.Delete(canonicalKey)
+		}
+		return
+	}
+	existing = append(existing, incoming...)
 	if len(existing) > 0 {
 		o.setRaw(canonicalKey, strings.Join(existing, "\n"))
 	}
