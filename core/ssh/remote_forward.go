@@ -34,6 +34,9 @@ func (c *Client) runRemoteForwardRequest(ctx context.Context, request func() err
 }
 
 func (c *Client) listenRemoteContext(ctx context.Context, network, addr string, timeout time.Duration) (net.Listener, error) {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
+	}
 	requestCtx, cancel := withTimeoutOrDefault(ctx, timeout, remoteForwardRequestTimeout)
 	defer cancel()
 	var listener net.Listener

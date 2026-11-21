@@ -13,6 +13,8 @@ import (
 	_ "image/png" // Register PNG decoder
 	"regexp"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 const (
@@ -111,7 +113,7 @@ func BuildScript(req Request) (string, error) {
 	b.WriteString("  fi\n")
 	b.WriteString("fi\n")
 	if req.Display != "" {
-		fmt.Fprintf(&b, "export DISPLAY=%s\n", shellQuote(req.Display))
+		fmt.Fprintf(&b, "export DISPLAY=%s\n", ssh.ShellQuote(req.Display))
 	} else {
 		b.WriteString("if [ -z \"${WAYLAND_DISPLAY:-}\" ] && [ -n \"${XDG_RUNTIME_DIR:-}\" ]; then\n")
 		b.WriteString("  if [ -S \"$XDG_RUNTIME_DIR/wayland-0\" ]; then\n")
@@ -260,7 +262,7 @@ func buildActionSnippet(req Request) string {
 			"  exit 127\n" +
 			"fi\n"
 	case ActionType:
-		quoted := shellQuote(req.Text)
+		quoted := ssh.ShellQuote(req.Text)
 		return fmt.Sprintf("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n"+
 			"  ydotool type -- %s\n"+
 			"elif command -v xdotool >/dev/null 2>&1; then\n"+
@@ -270,7 +272,7 @@ func buildActionSnippet(req Request) string {
 			"  exit 127\n"+
 			"fi\n", quoted, quoted)
 	case ActionKey:
-		quoted := shellQuote(req.Text)
+		quoted := ssh.ShellQuote(req.Text)
 		return fmt.Sprintf("if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n"+
 			"  ydotool key %s\n"+
 			"elif command -v xdotool >/dev/null 2>&1; then\n"+
@@ -313,10 +315,6 @@ func buildActionSnippet(req Request) string {
 	default:
 		return ""
 	}
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
 }
 
 // ExtractAndProcessImage extracts the base64 screenshot payload from script

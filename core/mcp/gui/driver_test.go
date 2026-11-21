@@ -14,6 +14,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 func TestBuildScriptAndValidate(t *testing.T) {
@@ -375,7 +377,7 @@ if [ -n "$out" ]; then
   exit 0
 fi
 exit 1
-`, shellQuote(samplePngPath))
+`, ssh.ShellQuote(samplePngPath))
 
 	mockSpectacle := filepath.Join(binDir, "spectacle")
 	if err := os.WriteFile(mockSpectacle, []byte(spectacleScript), 0755); err != nil {

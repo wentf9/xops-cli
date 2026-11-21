@@ -97,6 +97,15 @@ func TestReviewSess_M3_AddressFamilyDefaultLoopbackForwarding(t *testing.T) {
 		t.Fatalf("Set(AddressFamily, inet6): %v", err)
 	}
 	cli := NewTestClient(ConnectionConfig{Options: opts})
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	rawCli := cryptoSSH.NewClient(&dummyMuxGateConn{}, chans, reqs)
+	defer func() {
+		close(chans)
+		close(reqs)
+		_ = rawCli.Close()
+	}()
+	cli.sshClient = rawCli
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()

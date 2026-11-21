@@ -19,6 +19,9 @@ func (c *Client) Socks5Forward(ctx context.Context, listenAddr string, opts ...F
 	if ctx == nil {
 		return nil, fmt.Errorf("socks5 forward context is nil")
 	}
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
+	}
 	listener, err := (&net.ListenConfig{}).Listen(ctx, c.dialNetwork(), listenAddr)
 	if err != nil {
 		c.observeForward("dynamic", "listen failed", listenAddr, "")
@@ -36,6 +39,9 @@ func (c *Client) Socks5Forward(ctx context.Context, listenAddr string, opts ...F
 func (c *Client) DynamicForwardEndpoint(ctx context.Context, bind ForwardEndpoint, gatewayPorts bool, opts ...ForwardOption) (*Forward, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("dynamic forward context is nil")
+	}
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
 	}
 	fopts := c.forwardOptions(opts...)
 	listenNet, listenAddr := bind.LocalListenAddressWithNetwork(gatewayPorts, c.dialNetwork())
@@ -260,6 +266,11 @@ func handleSocks5Handshake(conn net.Conn) (string, error) {
 		writeErr := writeSocksReply(conn, []byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		drainErr := drainSocksResponse(conn)
 		return "", errors.Join(fmt.Errorf("unsupported command: 0x%02x (only CONNECT is supported)", buf[1]), writeErr, drainErr)
+	}
+	if buf[2] != 0x00 { // RFC 1928 RSV must be 0x00
+		writeErr := writeSocksReply(conn, []byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		drainErr := drainSocksResponse(conn)
+		return "", errors.Join(fmt.Errorf("invalid SOCKS5 reserved byte: 0x%02x (expected 0x00)", buf[2]), writeErr, drainErr)
 	}
 
 	atyp := buf[3]

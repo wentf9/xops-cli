@@ -732,14 +732,37 @@ func (s *lazySigner) getDecryptedSigner() (ssh.Signer, error) {
 
 // savePublicKey 自动将公钥以 authorized_keys 格式保存到对应的 .pub 文件中
 func savePublicKey(keyPath string, pubKey ssh.PublicKey) error {
+	if pubKey == nil {
+		return errors.New("public key is nil")
+	}
 	pubKeyPath := keyPath + ".pub"
-	if _, err := os.Stat(pubKeyPath); err == nil {
+	if info, err := os.Lstat(pubKeyPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refuse to write public key %q: path is a symlink", pubKeyPath)
+		}
 		// 如果公钥文件已经存在，不需要重复保存
 		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat public key %q failed: %w", pubKeyPath, err)
+	}
+	f, err := os.OpenFile(pubKeyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			if info, lerr := os.Lstat(pubKeyPath); lerr == nil && info.Mode().IsRegular() {
+				return nil
+			}
+		}
+		return fmt.Errorf("create public key %q failed: %w", pubKeyPath, err)
 	}
 	pubBytes := ssh.MarshalAuthorizedKey(pubKey)
-	if err := os.WriteFile(pubKeyPath, pubBytes, 0644); err != nil {
-		return fmt.Errorf("write public key %q failed: %w", pubKeyPath, err)
+	_, writeErr := f.Write(pubBytes)
+	closeErr := f.Close()
+	if writeErr != nil {
+		_ = os.Remove(pubKeyPath)
+		return fmt.Errorf("write public key %q failed: %w", pubKeyPath, errors.Join(writeErr, closeErr))
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close public key %q failed: %w", pubKeyPath, closeErr)
 	}
 	return nil
 }

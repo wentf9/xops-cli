@@ -233,6 +233,11 @@ func (p CommandPlan) LaunchDialect() LaunchDialect { return p.dialect }
 func (p CommandPlan) LoginMode() LoginMode         { return p.login }
 func (p CommandPlan) Digest() string               { return p.digest }
 
+// ShellQuote quotes value as a single POSIX shell token.
+func ShellQuote(value string) string {
+	return shellQuote(value)
+}
+
 // fishQuote preserves literal backslashes as well as quotes in fish arguments.
 // POSIX single-quote escaping alone is insufficient for a fish outer shell.
 func fishQuote(value string) string {

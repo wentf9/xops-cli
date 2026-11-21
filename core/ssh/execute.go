@@ -53,23 +53,27 @@ func (c *Client) configuredSudoOptions(ctx context.Context, command string, exec
 	if execution == nil {
 		return nil, nil
 	}
+	if !isExecutionConfigured(execution) {
+		if err := c.maybeDetectSudoMode(ctx, c.defaultPrivilegeRunConfig()); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
 	opts, err := execution.SudoRunOptions(command)
 	if err != nil {
 		return nil, err
 	}
-	if isExecutionConfigured(execution) {
-		// Legacy su cannot enforce a configured interpreter/login contract.
-		// The portable adapter pins /bin/sh for control and starts user code separately.
-		config := c.defaultPrivilegeRunConfig()
-		for _, opt := range opts {
-			opt(config)
-		}
-		if err := c.maybeDetectSudoMode(ctx, config); err != nil {
-			return nil, err
-		}
-		if c.ConnectionConfig().SudoMode == SudoModeSu && !usesPortableShellAdapter(config) && config.Interpreter != InterpreterSh {
-			return nil, fmt.Errorf("%w: configured su execution is not supported", ErrExecutionValidation)
-		}
+	// Legacy su cannot enforce a configured interpreter/login contract.
+	// The portable adapter pins /bin/sh for control and starts user code separately.
+	config := c.defaultPrivilegeRunConfig()
+	for _, opt := range opts {
+		opt(config)
+	}
+	if err := c.maybeDetectSudoMode(ctx, config); err != nil {
+		return nil, err
+	}
+	if c.ConnectionConfig().SudoMode == SudoModeSu && !usesPortableShellAdapter(config) && config.Interpreter != InterpreterSh {
+		return nil, fmt.Errorf("%w: configured su execution is not supported", ErrExecutionValidation)
 	}
 	return opts, nil
 }
@@ -293,7 +297,7 @@ func (c *Client) RunInteractiveWithSudoExecution(ctx context.Context, command st
 // RunInteractiveWithSudoExecutionIO applies a per-operation execution configuration
 // using caller-provided streams without mutating the shared client's defaults.
 func (c *Client) RunInteractiveWithSudoExecutionIO(ctx context.Context, command string, execution *ExecutionConfig, streams InteractiveIO) (retErr error) {
-	if execution == nil {
+	if !isExecutionConfigured(execution) {
 		return c.RunInteractiveWithSudoIO(ctx, command, streams)
 	}
 	opts, err := c.configuredSudoOptions(ctx, command, execution)
@@ -378,6 +382,9 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 		return "", fmt.Errorf("sudo password is required but not provided")
 	}
 
+	var pwdBuf []byte
+	defer func() { clear(pwdBuf) }()
+
 	session, err := c.newSessionContext(ctx)
 	if err != nil {
 		return "", err
@@ -397,11 +404,13 @@ func (c *Client) runWithSudo(ctx context.Context, command string, password []byt
 	}
 
 	if len(password) > 0 {
-		pwdStr := string(password) + "\n"
+		pwdBuf = make([]byte, 0, len(password)+1)
+		pwdBuf = append(pwdBuf, password...)
+		pwdBuf = append(pwdBuf, '\n')
 		if extraStdin != nil {
-			session.Stdin = io.MultiReader(strings.NewReader(pwdStr), extraStdin)
+			session.Stdin = io.MultiReader(bytes.NewReader(pwdBuf), extraStdin)
 		} else {
-			session.Stdin = strings.NewReader(pwdStr)
+			session.Stdin = bytes.NewReader(pwdBuf)
 		}
 	} else if extraStdin != nil {
 		session.Stdin = extraStdin

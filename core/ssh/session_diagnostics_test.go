@@ -9,6 +9,7 @@ import (
 	"time"
 
 	corelog "github.com/wentf9/xops-cli/core/log"
+	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 type cancelStartedDiagnostic struct {
@@ -112,7 +113,15 @@ func TestSessionDiagnosticsPreserveResults(t *testing.T) {
 
 func TestForwardDiagnosticLifecycle(t *testing.T) {
 	recorder := &diagnosticRecorder{}
-	client := &Client{diagnostics: recorder}
+	chans := make(chan cryptoSSH.NewChannel)
+	reqs := make(chan *cryptoSSH.Request)
+	rawCli := cryptoSSH.NewClient(&dummyMuxGateConn{}, chans, reqs)
+	defer func() {
+		close(chans)
+		close(reqs)
+		_ = rawCli.Close()
+	}()
+	client := &Client{sshClient: rawCli, diagnostics: recorder}
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	forward, err := client.Socks5Forward(ctx, "127.0.0.1:0")

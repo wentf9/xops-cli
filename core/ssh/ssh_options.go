@@ -847,25 +847,27 @@ func normalizeMultiPathEntries(optionName, raw string, normalizeItem func(string
 
 func validateIdentityFiles(raw string) (string, error) {
 	return normalizeMultiPathEntries("IdentityFile", raw, func(item string) (string, error) {
-		if strings.EqualFold(item, "none") {
-			return "none", nil
-		}
-		if err := validatePathTokenSyntax(item, "IdentityFile"); err != nil {
+		setting, err := ParseIdentityPathSetting(item, true)
+		if err != nil {
 			return "", err
 		}
-		return item, nil
+		if setting.Unset() {
+			return "", errors.New("value cannot be empty")
+		}
+		return setting.Raw, nil
 	})
 }
 
 func validateCertificateFiles(raw string) (string, error) {
 	return normalizeMultiPathEntries("CertificateFile", raw, func(item string) (string, error) {
-		if strings.EqualFold(item, "none") {
-			return "none", nil
-		}
-		if err := validatePathTokenSyntax(item, "CertificateFile"); err != nil {
+		setting, err := ParseIdentityPathSetting(item, true)
+		if err != nil {
 			return "", err
 		}
-		return item, nil
+		if setting.Unset() {
+			return "", errors.New("value cannot be empty")
+		}
+		return setting.Raw, nil
 	})
 }
 

@@ -33,6 +33,10 @@ const (
 // so this uses DefaultInteractionTimeout rather than a sub-second grace window.
 var agentNonHalfCloseTimeout = DefaultInteractionTimeout
 
+// agentForwardDialTimeout bounds each local ssh-agent dial for forwarded channels
+// so an unresponsive local agent socket cannot pin channel slots indefinitely.
+var agentForwardDialTimeout = defaultSSHHandshakeTimeout
+
 var (
 	errAgentLeaseConflict = errors.New("conflicting agent forwarding target is already active on this SSH connection")
 	errEmptyAgentSocket   = errors.New("agent forwarding socket path cannot be empty")
@@ -387,7 +391,13 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 		_ = newCh.Reject(cryptoSSH.Prohibited, "agent forwarding session closed")
 		return
 	}
-	agentConn, err := dialAgentConn(lease.ctx, lease.dialAgent, lease.socket)
+	dialTimeout := agentForwardDialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = defaultSSHHandshakeTimeout
+	}
+	dialCtx, dialCancel := context.WithTimeout(lease.ctx, dialTimeout)
+	agentConn, err := dialAgentConn(dialCtx, lease.dialAgent, lease.socket)
+	dialCancel()
 	if err != nil {
 		r.releaseChannelSlot()
 		lease.logger.Debugf("ForwardAgent: dial local agent %q failed: %v", lease.socket, err)
@@ -395,8 +405,13 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 		return
 	}
 
+	stopClose := context.AfterFunc(lease.ctx, func() {
+		_ = agentConn.Close()
+	})
+
 	sshCh, reqs, err := newCh.Accept()
 	if err != nil {
+		stopClose()
 		r.releaseChannelSlot()
 		_ = agentConn.Close()
 		return
@@ -407,12 +422,14 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 		sshCh:     sshCh,
 	}
 	if !lease.registerActive(entry) {
+		stopClose()
 		r.releaseChannelSlot()
 		_ = agentConn.Close()
 		_ = sshCh.Close()
 		go cryptoSSH.DiscardRequests(reqs)
 		return
 	}
+	stopClose()
 
 	reverseDone := make(chan struct{})
 	closedCh := make(chan struct{})

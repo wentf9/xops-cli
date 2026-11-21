@@ -142,6 +142,9 @@ func (c *Client) LocalForward(ctx context.Context, localAddr, remoteAddr string,
 	if ctx == nil {
 		return nil, fmt.Errorf("local forward context is nil")
 	}
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
+	}
 	listener, err := (&net.ListenConfig{}).Listen(ctx, c.dialNetwork(), localAddr)
 	if err != nil {
 		c.observeForward("local", "listen failed", localAddr, remoteAddr)
@@ -167,6 +170,9 @@ func (c *Client) handleLocalForward(ctx context.Context, localConn net.Conn, rem
 func (c *Client) LocalForwardEndpoint(ctx context.Context, bind ForwardEndpoint, dest ForwardEndpoint, gatewayPorts bool, opts ...ForwardOption) (*Forward, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("local forward context is nil")
+	}
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
 	}
 	fopts := c.forwardOptions(opts...)
 	dialNet := c.dialNetwork()
@@ -208,6 +214,9 @@ func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string
 	if ctx == nil {
 		return nil, fmt.Errorf("remote forward context is nil")
 	}
+	if c == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
+	}
 	if c.muxSocketPath != "" {
 		bindEp, err := parseBindEndpoint(remoteAddr)
 		if err != nil {
@@ -225,12 +234,18 @@ func (c *Client) RemoteForward(ctx context.Context, remoteAddr, localAddr string
 		}
 		return c.remoteForwardViaMux(ctx, spec, opts...)
 	}
+	if c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
+	}
 	return c.remoteForward(ctx, remoteAddr, localAddr, remoteForwardRequestTimeout, opts...)
 }
 
 func (c *Client) remoteForward(ctx context.Context, remoteAddr, localAddr string, timeout time.Duration, opts ...ForwardOption) (*Forward, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("remote forward context is nil")
+	}
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
 	}
 	listener, err := c.listenRemoteContext(ctx, c.dialNetwork(), remoteAddr, timeout)
 	if err != nil {
@@ -258,8 +273,14 @@ func (c *Client) RemoteForwardEndpoint(ctx context.Context, spec ForwardSpec, op
 	if ctx == nil {
 		return nil, fmt.Errorf("remote forward context is nil")
 	}
+	if c == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
+	}
 	if c.muxSocketPath != "" {
 		return c.remoteForwardViaMux(ctx, spec, opts...)
+	}
+	if c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
 	}
 	dialNet := c.dialNetwork()
 	listenNet, listenAddr := spec.Bind.RemoteListenAddressForMode(c.gatewayPortsMode(), dialNet)
@@ -520,6 +541,9 @@ func handleForwardConnection(ctx context.Context, conn net.Conn, handle func(con
 }
 
 func (c *Client) dialSSH(ctx context.Context, network, addr string) (net.Conn, error) {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return nil, fmt.Errorf("SSH client is not connected")
+	}
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	conn, err := c.sshClient.DialContext(dialCtx, network, addr)

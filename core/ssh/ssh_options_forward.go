@@ -953,6 +953,9 @@ func unwrapForwardHost(token string, allowEmpty bool) (string, error) {
 	if strings.ContainsAny(token, "/\\") {
 		return "", fmt.Errorf("unix domain socket path %q is not supported", token)
 	}
+	if strings.ContainsAny(token, `"'`) || strings.IndexFunc(token, unicode.IsSpace) >= 0 {
+		return "", fmt.Errorf("host %q contains invalid quote or whitespace character", token)
+	}
 	if strings.HasPrefix(token, "[") {
 		if !strings.HasSuffix(token, "]") {
 			return "", fmt.Errorf("unclosed bracket in host %q", token)
