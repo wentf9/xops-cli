@@ -137,7 +137,7 @@ func (h *host) resolveSnapshot(ctx context.Context, request ports.ResolveRequest
 		if err != nil {
 			return ports.OperationSnapshot{}, err
 		}
-		version, err := credentialVersion(p, plan)
+		version, err := bindPlanCredentials(p, &plan)
 		if err != nil {
 			return ports.OperationSnapshot{}, err
 		}

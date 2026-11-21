@@ -467,11 +467,16 @@ func assertOpenSSHDiffCaseOptions(
 		assertDifferentialProxy(t, dump, proxyJump, opts)
 	}
 	expectedIDs := tc.explicitIDs
+	expectedDumpIDs := tc.explicitIDs
 	if tc.expectIDNone {
-		expectedIDs = []string{"none", "~/.ssh/id_global"}
+		// P5 Finding 4.2: core/ssh Options.Append truncates subsequent IdentityFile
+		// entries within a single layer while preserving the "none" sentinel, whereas
+		// raw `ssh -G` still dumps later Host * IdentityFile lines after "none".
+		expectedIDs = []string{"none"}
+		expectedDumpIDs = []string{"none", "~/.ssh/id_global"}
 	}
 	if tc.checkIdentities {
-		assertDifferentialIdentityFiles(t, dump, opts, expectedIDs, tc.expectIDNone)
+		assertDifferentialIdentityFiles(t, dump, opts, expectedIDs, expectedDumpIDs, tc.expectIDNone)
 	}
 	if tc.checkSendEnv {
 		assertDifferentialSendEnv(t, dump, opts)
@@ -562,23 +567,23 @@ func assertDifferentialProxy(t *testing.T, dump map[string][]string, nodeJump st
 	}
 }
 
-func assertDifferentialIdentityFiles(t *testing.T, dump map[string][]string, opts *ssh.Options, wantExplicit []string, expectNone bool) {
+func assertDifferentialIdentityFiles(t *testing.T, dump map[string][]string, opts *ssh.Options, wantOpts, wantDump []string, expectNone bool) {
 	t.Helper()
 	dumpIDs := dump["identityfile"]
 	if opts == nil {
-		t.Fatalf("opts is nil, want identity files %v", wantExplicit)
+		t.Fatalf("opts is nil, want identity files %v", wantOpts)
 	}
-	if !slices.Equal(opts.IdentityFiles(), wantExplicit) {
-		t.Errorf("opts.IdentityFiles() = %v, want %v", opts.IdentityFiles(), wantExplicit)
+	if !slices.Equal(opts.IdentityFiles(), wantOpts) {
+		t.Errorf("opts.IdentityFiles() = %v, want %v", opts.IdentityFiles(), wantOpts)
 	}
 	if expectNone {
-		if !slices.Equal(dumpIDs, wantExplicit) {
-			t.Errorf("ssh -G identityfile for IdentityFile=none = %v, want %v", dumpIDs, wantExplicit)
+		if !slices.Equal(dumpIDs, wantDump) {
+			t.Errorf("ssh -G identityfile for IdentityFile=none = %v, want %v", dumpIDs, wantDump)
 		}
 		return
 	}
-	if len(dumpIDs) < len(wantExplicit) || !slices.Equal(dumpIDs[:len(wantExplicit)], wantExplicit) {
-		t.Errorf("ssh -G identityfile prefix = %v, want prefix %v", dumpIDs, wantExplicit)
+	if len(dumpIDs) < len(wantDump) || !slices.Equal(dumpIDs[:len(wantDump)], wantDump) {
+		t.Errorf("ssh -G identityfile prefix = %v, want prefix %v", dumpIDs, wantDump)
 	}
 }
 

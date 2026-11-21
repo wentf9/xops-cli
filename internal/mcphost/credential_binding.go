@@ -3,8 +3,11 @@ package mcphost
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -17,7 +20,10 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const maxMCPCertBindingBytes = 256 * 1024
+const (
+	maxMCPCertBindingBytes = 256 * 1024
+	maxMCPKeyBindingBytes  = 1024 * 1024
+)
 
 type certificateFileBinding struct {
 	Path        string
@@ -32,6 +38,15 @@ type certificateFileBinding struct {
 	KeySHA256   string
 }
 
+type keyFileBinding struct {
+	Path       string
+	Missing    bool
+	NonRegular bool
+	Unreadable bool
+	Truncated  bool
+	SHA256     string
+}
+
 type resolvedIdentityAgentBinding struct {
 	Socket   string
 	Disabled bool
@@ -43,11 +58,29 @@ type resolvedIdentityAgentBinding struct {
 // or persisting secrets in the connection plan. The provider is the same frozen
 // view used to capture all hops; no secret-store reads are performed here.
 func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) (string, error) {
+	copied := plan
+	copied.Hops = slices.Clone(plan.Hops)
+	for i := range copied.Hops {
+		copied.Hops[i] = copied.Hops[i].Clone()
+	}
+	return bindPlanCredentials(provider, &copied)
+}
+
+// bindPlanCredentials computes the deterministic credential dependency version
+// for plan and populates every hop's EnforceAdmittedCertificates /
+// AdmittedCertificates (including pre-read RawBytes for valid regular certs)
+// and EnforceAdmittedKeyDigests / AdmittedKeyDigests (digests only; private key
+// bytes are never retained in ConnectionPlan).
+func bindPlanCredentials(provider config.ConfigProvider, plan *ssh.ConnectionPlan) (string, error) {
+	if plan == nil {
+		return "", errors.New("connection plan is required")
+	}
 	type dependency struct {
 		NodeID, IdentityRef    string
 		Identity               models.Identity
 		KeyPaths               []string
 		IdentityFiles          []string
+		KeyFileBindings        []keyFileBinding
 		CertificateFiles       []string
 		CertificateBindings    []certificateFileBinding
 		IdentityAgent          string
@@ -61,7 +94,8 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 	configuration := provider.Snapshot()
 	env := sshenv.Discover()
 	prevHopIDs := make([]string, 0, len(plan.Hops))
-	for _, hop := range plan.Hops {
+	for i := range plan.Hops {
+		hop := &plan.Hops[i]
 		snapshot, err := provider.ResolveConnection(hop.NodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve MCP credential dependencies for %q: %w", hop.NodeID, err)
@@ -91,17 +125,30 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 			}
 		}
 		cumulativeJump := strings.Join(prevHopIDs, ",")
-		targets := buildHopBindingTargets(env, hop, snapshot.Identity.KeyPath, snapshot.Node.ProxyJump, cumulativeJump)
+		targets := buildHopBindingTargets(env, *hop, snapshot.Identity.KeyPath, snapshot.Node.ProxyJump, cumulativeJump)
 		prevHopIDs = append(prevHopIDs, hop.NodeID)
-		certBindings := collectHopCertificateBindings(
+		certBindings, admittedCerts := collectHopCertificateBindings(
 			env,
-			hop,
+			*hop,
 			snapshot.Identity.KeyPath,
 			identityFiles,
 			certificateFiles,
 			identitiesOnly,
 			targets,
 		)
+		keyBindings, admittedKeys := collectHopKeyBindings(
+			env,
+			*hop,
+			snapshot.Identity.KeyPath,
+			identityFiles,
+			identitiesOnly,
+			targets,
+		)
+		hop.EnforceAdmittedCertificates = true
+		hop.AdmittedCertificates = admittedCerts
+		hop.EnforceAdmittedKeyDigests = true
+		hop.AdmittedKeyDigests = admittedKeys
+
 		var resolvedAgents []resolvedIdentityAgentBinding
 		if identityAgent != "" {
 			resolvedAgents = resolveHopIdentityAgentBindings(identityAgent, env, targets)
@@ -111,6 +158,7 @@ func credentialVersion(provider config.ConfigProvider, plan ssh.ConnectionPlan) 
 		dependencies = append(dependencies, dependency{
 			NodeID: hop.NodeID, IdentityRef: snapshot.Node.IdentityRef, Identity: snapshot.Identity,
 			KeyPaths: append([]string(nil), hop.KeyPaths...), IdentityFiles: identityFiles,
+			KeyFileBindings:  keyBindings,
 			CertificateFiles: certificateFiles, CertificateBindings: certBindings,
 			IdentityAgent: identityAgent, ResolvedIdentityAgents: resolvedAgents,
 			SudoMode: snapshot.Node.SudoMode, SuPassword: snapshot.Node.SuPwd, PrivilegePasswordRef: snapshot.Node.PrivilegePasswordRef,
@@ -170,37 +218,47 @@ func expandMCPBindingPath(raw string, env ssh.Environment, target ssh.TargetCont
 }
 
 func inspectCertificateBinding(certPath string, includeMissing bool) (certificateFileBinding, bool) {
+	binding, _, ok := inspectCertificateBindingWithRaw(certPath, includeMissing)
+	return binding, ok
+}
+
+func inspectCertificateBindingWithRaw(certPath string, includeMissing bool) (certificateFileBinding, ssh.AdmittedCertificate, bool) {
+	cleanPath := filepath.Clean(filepath.FromSlash(certPath))
 	f, _, nonRegular, err := openRegularCertFile(certPath)
 	if nonRegular {
 		if includeMissing {
-			return certificateFileBinding{Path: certPath, NonRegular: true}, true
+			return certificateFileBinding{Path: certPath, NonRegular: true},
+				ssh.AdmittedCertificate{Path: cleanPath, NonRegular: true}, true
 		}
-		return certificateFileBinding{}, false
+		return certificateFileBinding{}, ssh.AdmittedCertificate{}, false
 	}
 	if err != nil || f == nil {
 		if includeMissing {
-			return certificateFileBinding{Path: certPath, Missing: true}, true
+			return certificateFileBinding{Path: certPath, Missing: true},
+				ssh.AdmittedCertificate{Path: cleanPath, Missing: true}, true
 		}
-		return certificateFileBinding{}, false
+		return certificateFileBinding{}, ssh.AdmittedCertificate{}, false
 	}
 	defer func() { _ = f.Close() }()
 
 	data, err := io.ReadAll(io.LimitReader(f, maxMCPCertBindingBytes+1))
 	if err != nil {
 		if includeMissing {
-			return certificateFileBinding{Path: certPath, Missing: true}, true
+			return certificateFileBinding{Path: certPath, Missing: true},
+				ssh.AdmittedCertificate{Path: cleanPath, Missing: true}, true
 		}
-		return certificateFileBinding{}, false
+		return certificateFileBinding{}, ssh.AdmittedCertificate{}, false
 	}
 	truncated := len(data) > maxMCPCertBindingBytes
 	if truncated {
 		data = data[:maxMCPCertBindingBytes]
 	}
 	rawSum := sha256.Sum256(data)
+	rawHex := hex.EncodeToString(rawSum[:])
 	binding := certificateFileBinding{
 		Path:      certPath,
 		Truncated: truncated,
-		RawSHA256: hex.EncodeToString(rawSum[:]),
+		RawSHA256: rawHex,
 	}
 	if pub, _, _, _, parseErr := cryptoSSH.ParseAuthorizedKey(data); parseErr == nil {
 		if cert, ok := pub.(*cryptoSSH.Certificate); ok {
@@ -214,7 +272,67 @@ func inspectCertificateBinding(certPath string, includeMissing bool) (certificat
 			}
 		}
 	}
-	return binding, true
+	if truncated {
+		// Oversized files exceed core/ssh maxUserCertFileBytes (256 KiB).
+		// Leave SHA256 empty and RawBytes nil so handshake always fails closed.
+		return binding, ssh.AdmittedCertificate{Path: cleanPath}, true
+	}
+	admitted := ssh.AdmittedCertificate{
+		Path:   cleanPath,
+		SHA256: rawHex,
+	}
+	if len(data) > 0 {
+		admitted.RawBytes = data
+	}
+	return binding, admitted, true
+}
+
+func inspectKeyFileBinding(keyPath string, includeMissing bool) (keyFileBinding, ssh.AdmittedKeyDigest, bool) {
+	cleanPath := filepath.Clean(filepath.FromSlash(keyPath))
+	f, _, nonRegular, err := openRegularCertFile(keyPath)
+	if nonRegular {
+		if includeMissing {
+			return keyFileBinding{Path: cleanPath, NonRegular: true},
+				ssh.AdmittedKeyDigest{Path: cleanPath, NonRegular: true}, true
+		}
+		return keyFileBinding{}, ssh.AdmittedKeyDigest{}, false
+	}
+	if err != nil || f == nil {
+		if !includeMissing {
+			return keyFileBinding{}, ssh.AdmittedKeyDigest{}, false
+		}
+		if errors.Is(err, os.ErrNotExist) || os.IsNotExist(err) {
+			return keyFileBinding{Path: cleanPath, Missing: true},
+				ssh.AdmittedKeyDigest{Path: cleanPath, Missing: true}, true
+		}
+		// Existing but unreadable file (e.g. EACCES): record non-missing with empty
+		// SHA-256 so handshake fails closed with ErrSnapshotMismatch instead of
+		// silently treating it as absent.
+		return keyFileBinding{Path: cleanPath, Unreadable: true},
+			ssh.AdmittedKeyDigest{Path: cleanPath}, true
+	}
+	defer func() { _ = f.Close() }()
+
+	hasher := sha256.New()
+	var scratch [32 * 1024]byte
+	defer clear(scratch[:])
+	n, readErr := io.CopyBuffer(hasher, io.LimitReader(f, maxMCPKeyBindingBytes+1), scratch[:])
+	if readErr != nil {
+		if !includeMissing {
+			return keyFileBinding{}, ssh.AdmittedKeyDigest{}, false
+		}
+		return keyFileBinding{Path: cleanPath, Unreadable: true},
+			ssh.AdmittedKeyDigest{Path: cleanPath}, true
+	}
+	sumHex := hex.EncodeToString(hasher.Sum(nil))
+	if n > maxMCPKeyBindingBytes {
+		// Exceeds core/ssh maxKeyFileBytes (1 MiB): keep bounded digest for version
+		// invalidation, and leave AdmittedKeyDigest.SHA256 empty to fail closed.
+		return keyFileBinding{Path: cleanPath, Truncated: true, SHA256: sumHex},
+			ssh.AdmittedKeyDigest{Path: cleanPath}, true
+	}
+	return keyFileBinding{Path: cleanPath, SHA256: sumHex},
+		ssh.AdmittedKeyDigest{Path: cleanPath, SHA256: sumHex}, true
 }
 
 func buildHopBindingTarget(env ssh.Environment, hop ssh.ConnectionConfig, identityKeyPath string) ssh.TargetContext {
@@ -281,6 +399,69 @@ func buildHopBindingTargets(
 	return targets
 }
 
+func rawHopExplicitKeys(hop ssh.ConnectionConfig, identityKeyPath string, identityFiles []string) []string {
+	var explicitKeys []string
+	explicitKeys = append(explicitKeys, hop.KeyPaths...)
+	if hop.KeyPath != "" {
+		explicitKeys = append(explicitKeys, hop.KeyPath)
+	}
+	if identityKeyPath != "" && identityKeyPath != hop.KeyPath {
+		explicitKeys = append(explicitKeys, identityKeyPath)
+	}
+	explicitKeys = append(explicitKeys, identityFiles...)
+	return explicitKeys
+}
+
+func expandTargetCandidateKeys(
+	rawExplicitKeys []string,
+	env ssh.Environment,
+	target ssh.TargetContext,
+	identitiesOnly bool,
+) (explicitPaths []string, defaultPaths []string) {
+	hasExplicit := false
+	seenExplicit := make(map[string]struct{}, len(rawExplicitKeys))
+	for _, raw := range rawExplicitKeys {
+		if hasControlOrLineSep(raw) {
+			continue
+		}
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		hasExplicit = true
+		if ssh.IsNoneValue(trimmed) {
+			break
+		}
+		expanded := expandMCPBindingPath(raw, env, target)
+		if expanded == "" {
+			continue
+		}
+		if _, dup := seenExplicit[expanded]; dup {
+			continue
+		}
+		seenExplicit[expanded] = struct{}{}
+		explicitPaths = append(explicitPaths, expanded)
+	}
+	if !identitiesOnly || !hasExplicit {
+		seenDefault := make(map[string]struct{}, len(env.DefaultKeyPaths))
+		for _, rawDefault := range env.DefaultKeyPaths {
+			expanded := expandMCPBindingPath(rawDefault, env, target)
+			if expanded == "" {
+				continue
+			}
+			if _, dup := seenExplicit[expanded]; dup {
+				continue
+			}
+			if _, dup := seenDefault[expanded]; dup {
+				continue
+			}
+			seenDefault[expanded] = struct{}{}
+			defaultPaths = append(defaultPaths, expanded)
+		}
+	}
+	return explicitPaths, defaultPaths
+}
+
 func collectHopCertificateBindings(
 	env ssh.Environment,
 	hop ssh.ConnectionConfig,
@@ -289,12 +470,34 @@ func collectHopCertificateBindings(
 	certificateFiles []string,
 	identitiesOnly bool,
 	targets []ssh.TargetContext,
-) []certificateFileBinding {
+) ([]certificateFileBinding, []ssh.AdmittedCertificate) {
 	var bindings []certificateFileBinding
+	var admitted []ssh.AdmittedCertificate
 	seen := make(map[string]struct{})
-	if len(certificateFiles) > 0 {
+
+	hasExplicitCerts := false
+	for _, raw := range certificateFiles {
+		if hasControlOrLineSep(raw) {
+			continue
+		}
+		if strings.TrimSpace(raw) != "" {
+			hasExplicitCerts = true
+			break
+		}
+	}
+	if hasExplicitCerts {
 		for _, target := range targets {
 			for _, raw := range certificateFiles {
+				if hasControlOrLineSep(raw) {
+					continue
+				}
+				trimmed := strings.TrimSpace(raw)
+				if trimmed == "" {
+					continue
+				}
+				if ssh.IsNoneValue(trimmed) {
+					break
+				}
 				expanded := expandMCPBindingPath(raw, env, target)
 				if expanded == "" {
 					continue
@@ -303,52 +506,79 @@ func collectHopCertificateBindings(
 					continue
 				}
 				seen[expanded] = struct{}{}
-				if b, ok := inspectCertificateBinding(expanded, true); ok {
+				if b, a, ok := inspectCertificateBindingWithRaw(expanded, true); ok {
 					bindings = append(bindings, b)
+					admitted = append(admitted, a)
 				}
 			}
 		}
-		return bindings
+		return bindings, admitted
 	}
 
-	var explicitKeys []string
-	explicitKeys = append(explicitKeys, hop.KeyPaths...)
-	if hop.KeyPath != "" {
-		explicitKeys = append(explicitKeys, hop.KeyPath)
-	}
-	if identityKeyPath != "" {
-		explicitKeys = append(explicitKeys, identityKeyPath)
-	}
-	explicitKeys = append(explicitKeys, identityFiles...)
-
+	rawExplicitKeys := rawHopExplicitKeys(hop, identityKeyPath, identityFiles)
 	for _, target := range targets {
-		hasExplicitCandidate := false
-		for _, rawKey := range explicitKeys {
-			if expandMCPBindingPath(rawKey, env, target) != "" {
-				hasExplicitCandidate = true
-				break
-			}
-		}
-		candidateKeys := explicitKeys
-		if !identitiesOnly || !hasExplicitCandidate {
-			candidateKeys = append(append([]string(nil), explicitKeys...), env.DefaultKeyPaths...)
-		}
-		for _, rawKey := range candidateKeys {
-			expandedKey := expandMCPBindingPath(rawKey, env, target)
-			if expandedKey == "" {
-				continue
-			}
+		explicitPaths, defaultPaths := expandTargetCandidateKeys(rawExplicitKeys, env, target, identitiesOnly)
+		for _, expandedKey := range append(explicitPaths, defaultPaths...) {
 			sidecarPath := strings.TrimSuffix(expandedKey, ".pub") + "-cert.pub"
 			if _, dup := seen[sidecarPath]; dup {
 				continue
 			}
 			seen[sidecarPath] = struct{}{}
-			if b, ok := inspectCertificateBinding(sidecarPath, false); ok {
+			if b, a, ok := inspectCertificateBindingWithRaw(sidecarPath, false); ok {
 				bindings = append(bindings, b)
+				admitted = append(admitted, a)
 			}
 		}
 	}
-	return bindings
+	return bindings, admitted
+}
+
+func collectHopKeyBindings(
+	env ssh.Environment,
+	hop ssh.ConnectionConfig,
+	identityKeyPath string,
+	identityFiles []string,
+	identitiesOnly bool,
+	targets []ssh.TargetContext,
+) ([]keyFileBinding, []ssh.AdmittedKeyDigest) {
+	var bindings []keyFileBinding
+	var admitted []ssh.AdmittedKeyDigest
+	seen := make(map[string]struct{})
+	var nonPubCandidates []string
+
+	rawExplicitKeys := rawHopExplicitKeys(hop, identityKeyPath, identityFiles)
+	for _, target := range targets {
+		explicitPaths, defaultPaths := expandTargetCandidateKeys(rawExplicitKeys, env, target, identitiesOnly)
+		for _, expandedKey := range append(explicitPaths, defaultPaths...) {
+			cleanKey := filepath.Clean(filepath.FromSlash(expandedKey))
+			if _, dup := seen[cleanKey]; dup {
+				continue
+			}
+			seen[cleanKey] = struct{}{}
+			if b, a, ok := inspectKeyFileBinding(cleanKey, true); ok {
+				bindings = append(bindings, b)
+				admitted = append(admitted, a)
+			}
+			if !strings.HasSuffix(cleanKey, ".pub") {
+				nonPubCandidates = append(nonPubCandidates, cleanKey)
+			}
+		}
+	}
+
+	// Also bind existing companion .pub files (used by core/ssh for lazy encrypted-key
+	// probing and IdentitiesOnly agent matching) without masking explicit .pub entries.
+	for _, keyPath := range nonPubCandidates {
+		pubPath := keyPath + ".pub"
+		if _, dup := seen[pubPath]; dup {
+			continue
+		}
+		seen[pubPath] = struct{}{}
+		if b, a, ok := inspectKeyFileBinding(pubPath, false); ok {
+			bindings = append(bindings, b)
+			admitted = append(admitted, a)
+		}
+	}
+	return bindings, admitted
 }
 
 func hopCredentialRefs(snapshot config.ConnectionSnapshot) []*credential.Ref {

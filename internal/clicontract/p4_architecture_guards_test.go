@@ -1,6 +1,9 @@
 package clicontract
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -13,7 +16,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/wentf9/xops-cli/core/mcp/guardrail"
+	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/core/ssh"
+	cryptoSSH "golang.org/x/crypto/ssh"
+	"gopkg.in/yaml.v3"
 )
 
 const coreSSHImportPath = "github.com/wentf9/xops-cli/core/ssh"
@@ -492,7 +499,9 @@ func TestP4_MCPHostUsesConnectPlanExclusively(t *testing.T) {
 }
 
 // TestP4_FailClosedSecurityPredicateGuard parses pkg/adapter/ssh_adapter.go
-// (isNonInteractiveForNode) to ensure error branches never return literal false.
+// (isNonInteractiveForNode) to ensure every error branch MUST return literal
+// true (not merely forbidding literal false, which can be bypassed by
+// fall-through or dead-code boolean expressions).
 func TestP4_FailClosedSecurityPredicateGuard(t *testing.T) {
 	t.Parallel()
 
@@ -511,10 +520,10 @@ func TestP4_FailClosedSecurityPredicateGuard(t *testing.T) {
 		}
 		if isErrNilComparison(ifStmt.Cond, token.NEQ) {
 			errBranches++
-			assertNoLiteralFalseReturn(t, pf, ifStmt.Body)
+			assertBranchReturnsLiteralTrue(t, pf, ifStmt.Body)
 		} else if isErrNilComparison(ifStmt.Cond, token.EQL) && ifStmt.Else != nil {
 			errBranches++
-			assertNoLiteralFalseReturn(t, pf, ifStmt.Else)
+			assertBranchReturnsLiteralTrue(t, pf, ifStmt.Else)
 		}
 		return true
 	})
@@ -540,8 +549,19 @@ func isErrorIdent(expr ast.Expr) bool {
 	return ident.Name == "err" || strings.HasSuffix(ident.Name, "Err")
 }
 
-func assertNoLiteralFalseReturn(t *testing.T, pf parsedGoFile, branch ast.Node) {
+func isLiteralTrueIdent(expr ast.Expr) bool {
+	ident, ok := unwrapParen(expr).(*ast.Ident)
+	return ok && ident.Name == "true"
+}
+
+func isLiteralTrueReturnStmt(stmt ast.Stmt) bool {
+	ret, ok := stmt.(*ast.ReturnStmt)
+	return ok && len(ret.Results) == 1 && isLiteralTrueIdent(ret.Results[0])
+}
+
+func assertBranchReturnsLiteralTrue(t *testing.T, pf parsedGoFile, branch ast.Node) {
 	t.Helper()
+	returnCount := 0
 	ast.Inspect(branch, func(n ast.Node) bool {
 		if _, isFuncLit := n.(*ast.FuncLit); isFuncLit {
 			return false
@@ -550,14 +570,28 @@ func assertNoLiteralFalseReturn(t *testing.T, pf parsedGoFile, branch ast.Node) 
 		if !ok {
 			return true
 		}
-		for _, res := range ret.Results {
-			if ident, ok := unwrapParen(res).(*ast.Ident); ok && ident.Name == "false" {
-				pos := pf.fset.Position(res.Pos())
-				t.Errorf("%s:%d: error branch in isNonInteractiveForNode must not fail open by returning literal false", pf.relPath, pos.Line)
-			}
+		returnCount++
+		if !isLiteralTrueReturnStmt(ret) {
+			pos := pf.fset.Position(ret.Pos())
+			t.Errorf("%s:%d: error branch in isNonInteractiveForNode must return literal true (fail closed), not a non-literal expression or false", pf.relPath, pos.Line)
 		}
 		return true
 	})
+	if returnCount == 0 {
+		pos := pf.fset.Position(branch.Pos())
+		t.Errorf("%s:%d: error branch in isNonInteractiveForNode must unconditionally return literal true", pf.relPath, pos.Line)
+		return
+	}
+	switch b := branch.(type) {
+	case *ast.BlockStmt:
+		if len(b.List) == 0 || !isLiteralTrueReturnStmt(b.List[len(b.List)-1]) {
+			pos := pf.fset.Position(b.Pos())
+			t.Errorf("%s:%d: error branch in isNonInteractiveForNode must terminate with literal return true (no fall-through)", pf.relPath, pos.Line)
+		}
+	default:
+		pos := pf.fset.Position(branch.Pos())
+		t.Errorf("%s:%d: error branch in isNonInteractiveForNode must be a block terminating with literal return true", pf.relPath, pos.Line)
+	}
 }
 
 // TestP4_OptionRegistryCrossLayerCompleteness validates core/ssh.RegisteredOptionSpecs()
@@ -672,4 +706,186 @@ func validateOptionSpecPoliciesAndLookup(t *testing.T, spec ssh.OptionSpec, nonZ
 			t.Errorf("LookupOptionSpec(alias %q) failed for %q", alias, spec.CanonicalKey)
 		}
 	}
+}
+
+// TestP5_NoEnvVarChildAuthReadsGuard ensures zero non-test os.Getenv / os.LookupEnv
+// / syscall.Getenv reads of legacy child markers XOPS_CLI_SSH_MUX_DAEMON or
+// XOPS_CLI_SSH_BG_CHILD (or their constant aliases sshMuxDaemonEnv /
+// sshBackgroundChildEnv) exist across cmd/, pkg/, internal/, and core/.
+func TestP5_NoEnvVarChildAuthReadsGuard(t *testing.T) {
+	t.Parallel()
+
+	root := p4RepoRoot(t)
+	files := parseNonTestGoFiles(t, root, "core", "pkg", "internal", "cmd")
+
+	forbiddenLiterals := map[string]struct{}{
+		"XOPS_CLI_SSH_MUX_DAEMON": {},
+		"XOPS_CLI_SSH_BG_CHILD":   {},
+	}
+	forbiddenIdents := map[string]struct{}{
+		"sshMuxDaemonEnv":       {},
+		"sshBackgroundChildEnv": {},
+	}
+
+	sawCmdFlagFile := false
+	for _, pf := range files {
+		if pf.relPath == "cmd/ssh_option_flag.go" {
+			sawCmdFlagFile = true
+		}
+		// Discover any const/var identifier initialized to a forbidden env var string.
+		ast.Inspect(pf.file, func(n ast.Node) bool {
+			vs, ok := n.(*ast.ValueSpec)
+			if !ok {
+				return true
+			}
+			for i, val := range vs.Values {
+				if i >= len(vs.Names) {
+					break
+				}
+				if exprMatchesForbiddenChildEnv(val, forbiddenLiterals, forbiddenIdents) {
+					forbiddenIdents[vs.Names[i].Name] = struct{}{}
+				}
+			}
+			return true
+		})
+	}
+	if !sawCmdFlagFile {
+		t.Fatal("expected cmd/ssh_option_flag.go to be scanned")
+	}
+
+	for _, pf := range files {
+		checkFileForbiddenChildEnvReads(t, pf, forbiddenLiterals, forbiddenIdents)
+	}
+}
+
+func checkFileForbiddenChildEnvReads(t *testing.T, pf parsedGoFile, forbiddenLiterals, forbiddenIdents map[string]struct{}) {
+	t.Helper()
+	localForbidden := make(map[string]struct{}, len(forbiddenIdents))
+	for k := range forbiddenIdents {
+		localForbidden[k] = struct{}{}
+	}
+	ast.Inspect(pf.file, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for i, rhs := range assign.Rhs {
+			if i >= len(assign.Lhs) {
+				break
+			}
+			if ident, ok := assign.Lhs[i].(*ast.Ident); ok && ident.Name != "_" &&
+				exprMatchesForbiddenChildEnv(rhs, forbiddenLiterals, localForbidden) {
+				localForbidden[ident.Name] = struct{}{}
+			}
+		}
+		return true
+	})
+	osPkg := importLocalName(pf.file, "os")
+	syscallPkg := importLocalName(pf.file, "syscall")
+	ast.Inspect(pf.file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		isEnvRead := isSelectorCall(call, osPkg, "Getenv") ||
+			isSelectorCall(call, osPkg, "LookupEnv") ||
+			isSelectorCall(call, syscallPkg, "Getenv")
+		if !isEnvRead {
+			return true
+		}
+		for _, arg := range call.Args {
+			if exprMatchesForbiddenChildEnv(arg, forbiddenLiterals, localForbidden) {
+				pos := pf.fset.Position(call.Pos())
+				t.Errorf("%s:%d: forbidden environment read of legacy child marker (XOPS_CLI_SSH_MUX_DAEMON / XOPS_CLI_SSH_BG_CHILD); authenticate child modes via pipe-FD spec flags only", pf.relPath, pos.Line)
+			}
+		}
+		return true
+	})
+}
+
+func exprMatchesForbiddenChildEnv(expr ast.Expr, literals, idents map[string]struct{}) bool {
+	matched := false
+	ast.Inspect(expr, func(n ast.Node) bool {
+		if matched {
+			return false
+		}
+		switch node := n.(type) {
+		case *ast.BasicLit:
+			if node.Kind == token.STRING {
+				if unquoted, err := strconv.Unquote(node.Value); err == nil {
+					if _, bad := literals[strings.ToUpper(strings.TrimSpace(unquoted))]; bad {
+						matched = true
+						return false
+					}
+				}
+			}
+		case *ast.Ident:
+			if _, bad := idents[node.Name]; bad {
+				matched = true
+				return false
+			}
+		}
+		return true
+	})
+	return matched
+}
+
+// TestP5_ZeroValueAndFailClosedSecurityInvariants locks in critical Phase 5
+// fail-closed behavioral invariants across guardrail, policy YAML decoding,
+// and DNSSEC-authenticated SSHFP evaluation.
+func TestP5_ZeroValueAndFailClosedSecurityInvariants(t *testing.T) {
+	t.Parallel()
+
+	t.Run("GuardrailDecisionZeroValueIsDeny", func(t *testing.T) {
+		var d guardrail.Decision
+		if d != guardrail.Deny {
+			t.Fatalf("zero-value guardrail.Decision = %v (%d), want guardrail.Deny (%d)", d, d, guardrail.Deny)
+		}
+		if d.String() != "deny" {
+			t.Fatalf("zero-value guardrail.Decision.String() = %q, want %q", d.String(), "deny")
+		}
+	})
+
+	t.Run("PolicyConfigYAMLOmittingEnabledDefaultsTrue", func(t *testing.T) {
+		const yamlWithoutEnabled = "approval_threshold: dangerous\nno_elicit_fallback: deny\n"
+		var cfg corepolicy.Config
+		if err := yaml.Unmarshal([]byte(yamlWithoutEnabled), &cfg); err != nil {
+			t.Fatalf("yaml.Unmarshal(policy.Config without enabled): %v", err)
+		}
+		if !cfg.Enabled {
+			t.Fatal("YAML policy.Config omitting enabled must default to Enabled == true")
+		}
+
+		var disabledCfg corepolicy.Config
+		if err := yaml.Unmarshal([]byte("enabled: false\n"), &disabledCfg); err != nil {
+			t.Fatalf("yaml.Unmarshal(policy.Config enabled:false): %v", err)
+		}
+		if disabledCfg.Enabled {
+			t.Fatal("YAML policy.Config with explicit enabled:false must decode Enabled == false")
+		}
+	})
+
+	t.Run("EvaluateSSHFPAuthenticatedOtherAlgorithmMismatch", func(t *testing.T) {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("ed25519.GenerateKey: %v", err)
+		}
+		hostPub, err := cryptoSSH.NewPublicKey(pub)
+		if err != nil {
+			t.Fatalf("cryptoSSH.NewPublicKey: %v", err)
+		}
+		otherAlgoDigest := make([]byte, sha256.Size)
+		otherAlgoDigest[0] = 0xA5
+		result := ssh.SSHFPResult{
+			Authenticated: true,
+			Records: []ssh.SSHFPRecord{{
+				Algorithm:       1, // RSA, while presented host key is Ed25519 (Algorithm 4)
+				FingerprintType: 2, // SHA-256
+				Fingerprint:     otherAlgoDigest,
+			}},
+		}
+		if got := ssh.EvaluateSSHFP(result, hostPub); got != ssh.SSHFPStatusMismatch {
+			t.Fatalf("ssh.EvaluateSSHFP(authenticated other-algorithm SHA-256) = %q, want %q", got, ssh.SSHFPStatusMismatch)
+		}
+	})
 }
