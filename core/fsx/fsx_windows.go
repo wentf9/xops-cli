@@ -136,6 +136,45 @@ func createExclusiveOS(path string, _ os.FileMode) (*os.File, error) {
 		return nil, classifyWindowsOpenError(path, createErr)
 	}
 
+	return wrapValidatedWindowsHandle(handle, path)
+}
+
+func createReplaceTempOS(path string, perm os.FileMode) (*os.File, error) {
+	if perm.Perm()&0o077 == 0 {
+		return createExclusiveOS(path, perm)
+	}
+
+	safePath := fixLongPathWindows(path)
+	pathPtr, err := windows.UTF16PtrFromString(safePath)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+
+	const share = uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
+	const flags = uint32(
+		windows.FILE_ATTRIBUTE_NORMAL |
+			windows.FILE_FLAG_OPEN_REPARSE_POINT |
+			windows.SECURITY_SQOS_PRESENT |
+			windows.SECURITY_ANONYMOUS,
+	)
+
+	handle, createErr := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		share,
+		nil,
+		windows.CREATE_NEW,
+		flags,
+		0,
+	)
+	if createErr != nil {
+		return nil, classifyWindowsOpenError(path, createErr)
+	}
+
+	return wrapValidatedWindowsHandle(handle, path)
+}
+
+func wrapValidatedWindowsHandle(handle windows.Handle, path string) (*os.File, error) {
 	if _, valErr := validateWindowsRegularHandle(handle, path); valErr != nil {
 		_ = windows.CloseHandle(handle)
 		return nil, valErr
@@ -227,6 +266,66 @@ func lockFileOS(f *os.File, exclusive bool) error {
 	err := windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, ^uint32(0), ^uint32(0), &ol)
 	runtime.KeepAlive(f)
 	return err
+}
+
+func tryLockFileOS(f *os.File, exclusive bool) error {
+	if f == nil {
+		return os.ErrInvalid
+	}
+	flags := uint32(windows.LOCKFILE_FAIL_IMMEDIATELY)
+	if exclusive {
+		flags |= windows.LOCKFILE_EXCLUSIVE_LOCK
+	}
+	var ol windows.Overlapped
+	err := windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, ^uint32(0), ^uint32(0), &ol)
+	runtime.KeepAlive(f)
+	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) || errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
+		return fmt.Errorf("%w: %w", ErrWouldBlock, err)
+	}
+	return err
+}
+
+func replaceFileOS(source, destination string) error {
+	srcPtr, err := windows.UTF16PtrFromString(fixLongPathWindows(source))
+	if err != nil {
+		return fmt.Errorf("encode temp path %q: %w", source, err)
+	}
+	dstPtr, err := windows.UTF16PtrFromString(fixLongPathWindows(destination))
+	if err != nil {
+		return fmt.Errorf("encode destination path %q: %w", destination, err)
+	}
+	if err := windows.MoveFileEx(srcPtr, dstPtr, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+		return err
+	}
+	return nil
+}
+
+func syncDirOS(dir string) (retErr error) {
+	dirPtr, err := windows.UTF16PtrFromString(fixLongPathWindows(dir))
+	if err != nil {
+		return fmt.Errorf("fsx: encode directory path %q: %w", dir, err)
+	}
+	handle, err := windows.CreateFile(
+		dirPtr,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_FLAG_BACKUP_SEMANTICS,
+		0,
+	)
+	if err != nil {
+		return fmt.Errorf("fsx: open directory handle %q: %w", dir, err)
+	}
+	defer func() {
+		if closeErr := windows.CloseHandle(handle); closeErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("fsx: close directory handle %q: %w", dir, closeErr))
+		}
+	}()
+	if flushErr := windows.FlushFileBuffers(handle); flushErr != nil {
+		return fmt.Errorf("fsx: flush directory buffers %q: %w", dir, flushErr)
+	}
+	return nil
 }
 
 func unlockFileOS(f *os.File) error {

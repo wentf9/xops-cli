@@ -1,11 +1,15 @@
 package fsx
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
+
+const lockPollInterval = 10 * time.Millisecond
 
 // LockMode specifies the advisory lock mode and access rights for OpenLocked.
 //
@@ -95,10 +99,103 @@ func OpenLocked(path string, mode LockMode, create bool, perm os.FileMode) (*Loc
 	if mode != LockShared && mode != LockExclusive {
 		return nil, fmt.Errorf("%w: %d", ErrInvalidLockMode, mode)
 	}
-	return openLockedWithRetries(path, mode, create, perm, DefaultLockRetries)
+	return openLockedWithOptions(path, mode, create, perm, DefaultLockRetries, false)
 }
 
-func openLockedWithRetries(path string, mode LockMode, create bool, perm os.FileMode, maxRetries int) (*LockedFile, error) {
+// TryOpenLocked is the non-blocking counterpart to OpenLocked. It opens path
+// without following symlinks/reparse points, validates that the handle is a
+// regular disk file, attempts a non-blocking OS advisory lock, and verifies
+// os.SameFile(fstat, lstat(path)) while holding the lock.
+//
+// If another caller holds a conflicting lock, TryOpenLocked closes the handle
+// immediately and returns an error wrapping ErrWouldBlock.
+//
+// Ownership: on success the caller owns *LockedFile and must call Close.
+func TryOpenLocked(path string, mode LockMode, create bool, perm os.FileMode) (*LockedFile, error) {
+	if path == "" {
+		return nil, ErrEmptyPath
+	}
+	if mode != LockShared && mode != LockExclusive {
+		return nil, fmt.Errorf("%w: %d", ErrInvalidLockMode, mode)
+	}
+	return openLockedWithOptions(path, mode, create, perm, DefaultLockRetries, true)
+}
+
+// OpenLockedContext acquires an OS advisory lock using TryOpenLocked, polling
+// at a short bounded interval until the lock is acquired or ctx is canceled.
+// Handles opened on contended attempts are closed before waiting, so context
+// cancellation never leaks an open file descriptor.
+//
+// Ownership: on success the caller owns *LockedFile and must call Close.
+func OpenLockedContext(ctx context.Context, path string, mode LockMode, create bool, perm os.FileMode) (*LockedFile, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("fsx: lock context is nil: %w", os.ErrInvalid)
+	}
+	if path == "" {
+		return nil, ErrEmptyPath
+	}
+	if mode != LockShared && mode != LockExclusive {
+		return nil, fmt.Errorf("%w: %d", ErrInvalidLockMode, mode)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("fsx: lock %q (%s) canceled: %w", path, mode, err)
+	}
+
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("fsx: wait for lock %q (%s): %w", path, mode, err)
+		}
+		lf, err := TryOpenLocked(path, mode, create, perm)
+		if err == nil {
+			return lf, nil
+		}
+		if !errors.Is(err, ErrWouldBlock) {
+			return nil, err
+		}
+
+		if timer == nil {
+			timer = time.NewTimer(lockPollInterval)
+		} else {
+			timer.Reset(lockPollInterval)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("fsx: wait for lock %q (%s): %w", path, mode, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+// TryLockFile acquires a non-blocking OS advisory lock on an already-open file
+// handle, returning an error wrapping ErrWouldBlock if another caller holds a
+// conflicting lock.
+//
+// Security contract: callers MUST only pass handles whose filesystem identity
+// is already pinned (for example opened through os.Root or dirfd-relative
+// openat with fstat/fstatat verification). Do NOT use TryLockFile on
+// path-opened handles where OpenLocked, TryOpenLocked, or OpenLockedContext
+// apply.
+//
+// Ownership: TryLockFile borrows f and never closes it. Closing f (or calling
+// the platform unlock before close) releases the lock.
+func TryLockFile(f *os.File, mode LockMode) error {
+	if f == nil {
+		return os.ErrInvalid
+	}
+	if mode != LockShared && mode != LockExclusive {
+		return fmt.Errorf("%w: %d", ErrInvalidLockMode, mode)
+	}
+	return tryLockFileOS(f, mode == LockExclusive)
+}
+
+func openLockedWithOptions(path string, mode LockMode, create bool, perm os.FileMode, maxRetries int, nonBlocking bool) (*LockedFile, error) {
 	if maxRetries <= 0 {
 		maxRetries = DefaultLockRetries
 	}
@@ -111,7 +208,13 @@ func openLockedWithRetries(path string, mode LockMode, create bool, perm os.File
 			continue
 		}
 
-		if lockErr := lockFileOS(f, mode == LockExclusive); lockErr != nil {
+		var lockErr error
+		if nonBlocking {
+			lockErr = tryLockFileOS(f, mode == LockExclusive)
+		} else {
+			lockErr = lockFileOS(f, mode == LockExclusive)
+		}
+		if lockErr != nil {
 			_ = f.Close()
 			return nil, fmt.Errorf("fsx: lock %q (%s): %w", path, mode, lockErr)
 		}

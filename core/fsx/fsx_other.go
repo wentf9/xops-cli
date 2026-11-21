@@ -28,6 +28,22 @@ func lockFileOS(_ *os.File, _ bool) error {
 	return fmt.Errorf("%w: file locking on %s", ErrUnsupported, runtime.GOOS)
 }
 
+func tryLockFileOS(_ *os.File, _ bool) error {
+	return fmt.Errorf("%w: non-blocking file locking on %s", ErrUnsupported, runtime.GOOS)
+}
+
+func createReplaceTempOS(_ string, _ os.FileMode) (*os.File, error) {
+	return nil, fmt.Errorf("%w: AtomicReplace on %s", ErrUnsupported, runtime.GOOS)
+}
+
+func replaceFileOS(_, _ string) error {
+	return fmt.Errorf("%w: AtomicReplace on %s", ErrUnsupported, runtime.GOOS)
+}
+
+func syncDirOS(_ string) error {
+	return fmt.Errorf("%w: SyncDir on %s", ErrUnsupported, runtime.GOOS)
+}
+
 func unlockFileOS(_ *os.File) error {
 	return nil
 }

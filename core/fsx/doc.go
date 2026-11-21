@@ -9,10 +9,15 @@
 //   - CreateExclusive creates a brand new file without following symlinks and,
 //     on Windows, applies a protected owner-only SECURITY_DESCRIPTOR atomically
 //     at creation time.
-//   - OpenLocked acquires a shared or exclusive OS advisory lock on an open
-//     no-follow regular file handle and verifies os.SameFile(fstat, lstat(path))
-//     under the lock, retrying up to DefaultLockRetries times on concurrent
-//     replacement.
+//   - OpenLocked / TryOpenLocked / OpenLockedContext acquire a shared or
+//     exclusive OS advisory lock on an open no-follow regular file handle and
+//     verify os.SameFile(fstat, lstat(path)) under the lock, retrying up to
+//     DefaultLockRetries times on concurrent replacement. TryLockFile locks an
+//     already-pinned handle (for example from os.Root or dirfd openat).
+//   - AtomicReplace writes via an exclusive no-follow temporary file in the
+//     destination directory (with owner-only SD on Windows for 0o077-masked
+//     modes), syncs the file, atomically replaces the destination, and syncs
+//     the parent directory (via SyncDir) unless WithoutDirSync is passed.
 //   - SocketSlot is the sole owner of a control socket path, serializing bind,
 //     stale replacement, and release under a real directory lock on both Unix
 //     and Windows. Release strictly unlinks (after SameFile verification under
@@ -70,6 +75,10 @@ var (
 	// ErrRetryExhausted indicates OpenLocked observed concurrent path replacement
 	// across all bounded retry attempts.
 	ErrRetryExhausted = errors.New("fsx: file lock retry budget exhausted due to concurrent replacement")
+
+	// ErrWouldBlock indicates a non-blocking lock attempt (TryOpenLocked or
+	// TryLockFile) encountered a conflicting lock held by another caller.
+	ErrWouldBlock = errors.New("fsx: file lock is held by another caller")
 
 	// ErrSlotOccupied indicates a control socket path is already occupied by a
 	// live or unverified entry.

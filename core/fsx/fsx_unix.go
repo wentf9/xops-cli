@@ -46,9 +46,11 @@ func openRegularOS(path string, l Limits, cfg openConfig) (*RegularFile, error) 
 	}
 
 	if (st.Mode & unix.S_IFMT) != unix.S_IFREG {
-		if cfg.allowDevNull && isUnixDevNullStat(&st) {
-			_ = unix.Close(fd)
-			return newDevNullRegularFile(path, l.MaxBytes, nil), nil
+		if cfg.allowDevNull {
+			if isNull, nullErr := isUnixDevNullStat(&st); nullErr == nil && isNull {
+				_ = unix.Close(fd)
+				return newDevNullRegularFile(path, l.MaxBytes, nil), nil
+			}
 		}
 		_ = unix.Close(fd)
 		return nil, fmt.Errorf("%w: %q", ErrNonRegular, path)
@@ -92,17 +94,17 @@ func openRegularOS(path string, l Limits, cfg openConfig) (*RegularFile, error) 
 	}, nil
 }
 
-func isUnixDevNullStat(st *unix.Stat_t) bool {
+func isUnixDevNullStat(st *unix.Stat_t) (bool, error) {
 	if st == nil || (st.Mode&unix.S_IFMT) != unix.S_IFCHR {
-		return false
+		return false, nil
 	}
 	var nullSt unix.Stat_t
 	if err := unix.Stat(os.DevNull, &nullSt); err != nil {
-		return false
+		return false, err
 	}
 	return (nullSt.Mode&unix.S_IFMT) == unix.S_IFCHR &&
 		st.Dev == nullSt.Dev &&
-		st.Rdev == nullSt.Rdev
+		st.Rdev == nullSt.Rdev, nil
 }
 
 func createExclusiveOS(path string, perm os.FileMode) (*os.File, error) {
@@ -162,6 +164,60 @@ func lockFileOS(f *os.File, exclusive bool) error {
 		how = unix.LOCK_EX
 	}
 	return unixFlockFile(f, how)
+}
+
+func tryLockFileOS(f *os.File, exclusive bool) error {
+	if f == nil {
+		return os.ErrInvalid
+	}
+	how := unix.LOCK_SH | unix.LOCK_NB
+	if exclusive {
+		how = unix.LOCK_EX | unix.LOCK_NB
+	}
+	err := unixFlockFile(f, how)
+	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
+		return fmt.Errorf("%w: %w", ErrWouldBlock, err)
+	}
+	return err
+}
+
+func createReplaceTempOS(path string, perm os.FileMode) (*os.File, error) {
+	f, err := createExclusiveOS(path, perm)
+	if err != nil {
+		return nil, err
+	}
+	if chmodErr := f.Chmod(perm.Perm()); chmodErr != nil {
+		origInfo, _ := f.Stat()
+		_ = f.Close()
+		_ = removeTempIfSameFile(path, origInfo)
+		return nil, fmt.Errorf("fsx: chmod temp file %q: %w", path, chmodErr)
+	}
+	return f, nil
+}
+
+func replaceFileOS(source, destination string) error {
+	return os.Rename(source, destination)
+}
+
+func syncDirOS(dir string) (retErr error) {
+	fd, err := unixOpenNoIntr(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return &os.PathError{Op: "open", Path: dir, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), dir)
+	if f == nil {
+		_ = unix.Close(fd)
+		return fmt.Errorf("fsx: os.NewFile returned nil for directory %q", dir)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("fsx: close directory %q: %w", dir, closeErr))
+		}
+	}()
+	if syncErr := f.Sync(); syncErr != nil {
+		return fmt.Errorf("fsx: sync directory %q: %w", dir, syncErr)
+	}
+	return nil
 }
 
 func unlockFileOS(f *os.File) error {
