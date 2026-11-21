@@ -1082,8 +1082,9 @@ func normalizeMultiForwardEntries(optionName, raw string, normalizeItem func(str
 }
 
 // Append validates and appends rawValue for multi-value options (LocalForward,
-// RemoteForward, DynamicForward), deduplicating identical normalized entries while
-// preserving insertion order. For scalar options, Append behaves identically to Set.
+// RemoteForward, DynamicForward, IdentityFile, CertificateFile, SendEnv, SetEnv)
+// according to the option's MergeMode. For scalar options, Append behaves
+// identically to Set.
 func (o *Options) Append(key, rawValue string) error {
 	if o == nil {
 		return fmt.Errorf("%w: options receiver is nil", ErrSSHOptionsValidation)
@@ -1092,7 +1093,7 @@ func (o *Options) Append(key, rawValue string) error {
 	if !ok {
 		return fmt.Errorf("%w: unknown ssh option %q", ErrSSHOptionsValidation, key)
 	}
-	if !spec.MultiValue {
+	if !spec.MergeMode.IsMultiValue() {
 		return o.Set(key, rawValue)
 	}
 	if strings.TrimSpace(rawValue) == "" {
@@ -1105,7 +1106,7 @@ func (o *Options) Append(key, rawValue string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
 	}
-	if isOrderedOverrideMultiValue(spec.CanonicalKey) {
+	if spec.MergeMode.IsOrderedOverride() {
 		o.appendOrderedRaw(spec.CanonicalKey, normalized)
 	} else {
 		o.appendNormalizedRaw(spec.CanonicalKey, normalized)
@@ -1150,7 +1151,7 @@ func (o *Options) GetAll(key string) []string {
 		return nil
 	}
 	spec, ok := LookupOptionSpec(key)
-	if ok && spec.MultiValue {
+	if ok && spec.MergeMode.IsMultiValue() {
 		parts := strings.Split(val, "\n")
 		out := make([]string, 0, len(parts))
 		for _, p := range parts {

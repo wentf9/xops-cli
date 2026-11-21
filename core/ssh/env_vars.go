@@ -431,6 +431,66 @@ func collectValidatedSetEnv(directives []string, log corelog.DebugLogger) ([]Env
 	return pairs, uniqueNames, nil
 }
 
+// flattenSetEnvDirectives resolves a slice of SetEnv directives in evaluation
+// order (lowest-priority layer to highest-priority layer) using OpenSSH
+// semantics: duplicate variable names within a single directive keep their
+// first occurrence, while later directives overwrite earlier values while
+// preserving first-appearance order. Unlike ResolveSessionEnv, this does not
+// filter isDeniedSendEnvName so CLI projection round-trips syntactically
+// without loss.
+func flattenSetEnvDirectives(directives []string) ([]EnvVar, error) {
+	if len(directives) == 0 {
+		return nil, nil
+	}
+	var resolved []EnvVar
+	indexByName := make(map[string]int)
+	for _, directive := range directives {
+		parsed, err := parseSetEnvDirective(directive)
+		if err != nil {
+			return nil, err
+		}
+		for _, ev := range parsed {
+			if idx, exists := indexByName[ev.Name]; exists {
+				resolved[idx].Value = ev.Value
+				continue
+			}
+			indexByName[ev.Name] = len(resolved)
+			resolved = append(resolved, ev)
+		}
+	}
+	return resolved, nil
+}
+
+// formatQuotedEnvToken encodes token inside double quotes, escaping '\' and '"'
+// so splitQuotedEnvTokens decodes the exact original string.
+func formatQuotedEnvToken(token string) string {
+	var sb strings.Builder
+	sb.Grow(len(token) + 2)
+	sb.WriteByte('"')
+	for i := 0; i < len(token); i++ {
+		switch token[i] {
+		case '\\', '"':
+			sb.WriteByte('\\')
+			sb.WriteByte(token[i])
+		default:
+			sb.WriteByte(token[i])
+		}
+	}
+	sb.WriteByte('"')
+	return sb.String()
+}
+
+func formatCanonicalSetEnvDirective(vars []EnvVar) string {
+	if len(vars) == 0 {
+		return ""
+	}
+	tokens := make([]string, len(vars))
+	for i, ev := range vars {
+		tokens[i] = formatQuotedEnvToken(ev.Name + "=" + ev.Value)
+	}
+	return strings.Join(tokens, " ")
+}
+
 type sessionEnvAccumulator struct {
 	resolved    []EnvVar
 	indexByName map[string]int

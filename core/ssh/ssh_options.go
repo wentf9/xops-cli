@@ -148,16 +148,134 @@ const (
 	OptionScopeConnectionWide
 )
 
+// OptionMergeMode declares how an option resolves within a single CLI or
+// ssh_config layer and across priority layers in MergeOptionLayers.
+type OptionMergeMode uint8
+
+const (
+	// OptionMergeUnset indicates an uninitialized merge mode (invalid in optionRegistry).
+	OptionMergeUnset OptionMergeMode = iota
+	// OptionMergeFirstWins selects the first directive within a layer and the
+	// highest-priority layer across layers.
+	OptionMergeFirstWins
+	// OptionMergeAppendDedup appends normalized entries in order, deduplicating
+	// identical entries (LocalForward, RemoteForward, DynamicForward).
+	OptionMergeAppendDedup
+	// OptionMergeNoneTerminated appends normalized entries in order, deduplicating
+	// identical entries and truncating accumulation at "none" during MergeOptionLayers
+	// (IdentityFile, CertificateFile).
+	OptionMergeNoneTerminated
+	// OptionMergeOrderedEnv appends all directives within a layer and merges layers
+	// lowest-to-highest without dropping repeated tokens (SendEnv).
+	OptionMergeOrderedEnv
+	// OptionMergeSingleDirectiveOrderedEnv accepts only the first directive within
+	// a single CLI/ssh_config layer while merging layers lowest-to-highest (SetEnv).
+	OptionMergeSingleDirectiveOrderedEnv
+)
+
+// IsMultiValue reports whether m represents a multi-value option stored as
+// newline-delimited entries internally and as a YAML/JSON sequence externally.
+func (m OptionMergeMode) IsMultiValue() bool {
+	switch m {
+	case OptionMergeAppendDedup, OptionMergeNoneTerminated, OptionMergeOrderedEnv, OptionMergeSingleDirectiveOrderedEnv:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsOrderedOverride reports whether layers must be merged lowest-to-highest
+// without dropping repeated entries (SendEnv, SetEnv).
+func (m OptionMergeMode) IsOrderedOverride() bool {
+	return m == OptionMergeOrderedEnv || m == OptionMergeSingleDirectiveOrderedEnv
+}
+
+// IsNoneTerminated reports whether encountering "none" terminates accumulation
+// of subsequent and lower-priority entries during MergeOptionLayers.
+func (m OptionMergeMode) IsNoneTerminated() bool {
+	return m == OptionMergeNoneTerminated
+}
+
+// SingleDirectivePerLayer reports whether only the first directive within a
+// single CLI or ssh_config layer takes effect.
+func (m OptionMergeMode) SingleDirectivePerLayer() bool {
+	return m == OptionMergeFirstWins || m == OptionMergeSingleDirectiveOrderedEnv
+}
+
+// OptionConfigSyntax declares how an OpenSSH ssh_config directive line is
+// tokenized after its keyword and optional '=' separator.
+type OptionConfigSyntax uint8
+
+const (
+	// OptionSyntaxUnset indicates an uninitialized config syntax (invalid in optionRegistry).
+	OptionSyntaxUnset OptionConfigSyntax = iota
+	// OptionSyntaxStrictScalar expects a single argv token; >1 token is rejected by ssh_config parser.
+	OptionSyntaxStrictScalar
+	// OptionSyntaxMultiTokenList joins parsed argv tokens with a single space " ".
+	OptionSyntaxMultiTokenList
+	// OptionSyntaxRawTokenList preserves the raw comment-stripped token list verbatim.
+	OptionSyntaxRawTokenList
+	// OptionSyntaxWholeLineCommand preserves the trimmed rest of line without comment/quote stripping.
+	OptionSyntaxWholeLineCommand
+)
+
+// PreservesRawValue reports whether ssh_config option evaluation reads the
+// raw directive text rather than the argv-unquoted value.
+func (s OptionConfigSyntax) PreservesRawValue() bool {
+	return s == OptionSyntaxRawTokenList || s == OptionSyntaxWholeLineCommand
+}
+
+// OptionTier4Policy declares whether an option may be inherited from Tier 4
+// (~/.ssh/config) and under what security restriction.
+type OptionTier4Policy uint8
+
+const (
+	// OptionTier4Unset indicates an uninitialized Tier-4 policy (invalid in optionRegistry).
+	OptionTier4Unset OptionTier4Policy = iota
+	// OptionTier4Inherit permits normal inheritance from ~/.ssh/config.
+	OptionTier4Inherit
+	// OptionTier4Deny blocks inheritance from ~/.ssh/config so wildcard host
+	// blocks cannot implicitly weaken host trust verification.
+	OptionTier4Deny
+	// OptionTier4OneWayYes permits inheritance from ~/.ssh/config only when the
+	// value enables the security-hardening setting ("yes"/"true").
+	OptionTier4OneWayYes
+)
+
+// OptionMuxPolicy declares how the detached ControlPersist mux daemon handles
+// an option in MuxDaemonSpec.
+type OptionMuxPolicy uint8
+
+const (
+	// OptionMuxUnset indicates an uninitialized mux policy (invalid in optionRegistry).
+	OptionMuxUnset OptionMuxPolicy = iota
+	// OptionMuxAuthoritative means MuxDaemonSpec carries this setting in a
+	// dedicated authoritative field rather than in raw Options.
+	OptionMuxAuthoritative
+	// OptionMuxAllowNoneOnly permits the option in MuxDaemonSpec.Options only
+	// when its value is "none" (ProxyCommand).
+	OptionMuxAllowNoneOnly
+	// OptionMuxAllow permits the option in MuxDaemonSpec.Options.
+	OptionMuxAllow
+	// OptionMuxReject forbids the option in MuxDaemonSpec.Options.
+	OptionMuxReject
+)
+
 // OptionSpec describes a supported OpenSSH client option in the registry.
 type OptionSpec struct {
-	CanonicalKey string      // Persistent snake_case key (e.g. "control_master")
-	OpenSSHName  string      // Canonical OpenSSH name (e.g. "ControlMaster")
-	Class        OptionClass // Functional/security category
-	Scope        OptionScope // Propagation scope across ProxyJump hops (default: TargetOnly)
-	Aliases      []string    // Accepted aliases (e.g. "ChallengeResponseAuthentication")
-	AllowList    bool        // Whether YAML sequence values are accepted and joined with ","
-	MultiValue   bool        // Whether multiple directives accumulate (newline-delimited internally, YAML/JSON array externally)
-	Normalize    func(raw string) (string, error)
+	CanonicalKey          string             // Persistent snake_case key (e.g. "control_master")
+	OpenSSHName           string             // Canonical OpenSSH name (e.g. "ControlMaster")
+	Class                 OptionClass        // Functional/security category
+	Scope                 OptionScope        // Propagation scope across ProxyJump hops (default: TargetOnly)
+	MergeMode             OptionMergeMode    // Single-layer and multi-layer merge semantics
+	ConfigSyntax          OptionConfigSyntax // ssh_config line lexing syntax
+	Tier4Policy           OptionTier4Policy  // Tier-4 (~/.ssh/config) inheritance policy
+	StrictInOpenSSHConfig bool               // Whether invalid ~/.ssh/config values fail closed instead of skipping
+	MuxPolicy             OptionMuxPolicy    // Detached ControlPersist mux daemon option policy
+	Aliases               []string           // Accepted aliases (e.g. "ChallengeResponseAuthentication")
+	AllowList             bool               // Whether YAML sequence values are accepted and joined with ","
+	MultiValue            bool               // Whether multiple directives accumulate (matches MergeMode.IsMultiValue())
+	Normalize             func(raw string) (string, error)
 }
 
 // IsConnectionWide reports whether CLI Tier-1 overrides for this option propagate
@@ -168,9 +286,14 @@ func (s OptionSpec) IsConnectionWide() bool {
 
 var optionRegistry = []OptionSpec{
 	{
-		CanonicalKey: OptionControlMaster,
-		OpenSSHName:  "ControlMaster",
-		Class:        OptionClassMux,
+		CanonicalKey:          OptionControlMaster,
+		OpenSSHName:           "ControlMaster",
+		Class:                 OptionClassMux,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAuthoritative,
 		Normalize: func(raw string) (string, error) {
 			if hasControlOrLineSepChar(raw) {
 				return "", fmt.Errorf("unsupported ControlMaster option %q: contains invalid control character", raw)
@@ -190,6 +313,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionControlPath,
 		OpenSSHName:  "ControlPath",
 		Class:        OptionClassMux,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAuthoritative,
 		Normalize: func(raw string) (string, error) {
 			setting, err := ParseControlPathSetting(raw, false)
 			if err != nil {
@@ -202,9 +329,14 @@ var optionRegistry = []OptionSpec{
 		},
 	},
 	{
-		CanonicalKey: OptionControlPersist,
-		OpenSSHName:  "ControlPersist",
-		Class:        OptionClassMux,
+		CanonicalKey:          OptionControlPersist,
+		OpenSSHName:           "ControlPersist",
+		Class:                 OptionClassMux,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAuthoritative,
 		Normalize: func(raw string) (string, error) {
 			if hasControlOrLineSepChar(raw) {
 				return "", fmt.Errorf("invalid ControlPersist %q: contains invalid control character", raw)
@@ -224,6 +356,10 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "AddressFamily",
 		Class:        OptionClassTransport,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateAddressFamily,
 	},
 	{
@@ -231,6 +367,10 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "ConnectTimeout",
 		Class:        OptionClassTransport,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeOptionalDurationOption("ConnectTimeout", raw)
 		},
@@ -239,6 +379,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionServerAliveInterval,
 		OpenSSHName:  "ServerAliveInterval",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeOptionalDurationOption("ServerAliveInterval", raw)
 		},
@@ -247,6 +391,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionServerAliveCountMax,
 		OpenSSHName:  "ServerAliveCountMax",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			if hasControlOrLineSepChar(raw) {
 				return "", fmt.Errorf("invalid ServerAliveCountMax %q: contains invalid control character", raw)
@@ -263,6 +411,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionTCPKeepAlive,
 		OpenSSHName:  "TCPKeepAlive",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("TCPKeepAlive", raw)
 		},
@@ -272,6 +424,10 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "StrictHostKeyChecking",
 		Class:        OptionClassTrust,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Deny,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    ParseStrictHostKeyChecking,
 	},
 	{
@@ -279,6 +435,10 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "UserKnownHostsFile",
 		Class:        OptionClassTrust,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxMultiTokenList,
+		Tier4Policy:  OptionTier4Deny,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateUserKnownHostsFile,
 	},
 	{
@@ -286,6 +446,10 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "GlobalKnownHostsFile",
 		Class:        OptionClassTrust,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxMultiTokenList,
+		Tier4Policy:  OptionTier4Deny,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateGlobalKnownHostsFile,
 	},
 	{
@@ -293,6 +457,10 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "HashKnownHosts",
 		Class:        OptionClassTrust,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4OneWayYes,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("HashKnownHosts", raw)
 		},
@@ -302,30 +470,50 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "VerifyHostKeyDNS",
 		Class:        OptionClassTrust,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Deny,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateVerifyHostKeyDNS,
 	},
 	{
 		CanonicalKey: OptionCanonicalizeHostname,
 		OpenSSHName:  "CanonicalizeHostname",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateCanonicalizeHostname,
 	},
 	{
 		CanonicalKey: OptionCanonicalDomains,
 		OpenSSHName:  "CanonicalDomains",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxMultiTokenList,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateCanonicalDomains,
 	},
 	{
 		CanonicalKey: OptionCanonicalizeMaxDots,
 		OpenSSHName:  "CanonicalizeMaxDots",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateCanonicalizeMaxDots,
 	},
 	{
 		CanonicalKey: OptionCanonicalizeFallbackLocal,
 		OpenSSHName:  "CanonicalizeFallbackLocal",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("CanonicalizeFallbackLocal", raw)
 		},
@@ -334,12 +522,20 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionCanonicalizePermittedCNAMEs,
 		OpenSSHName:  "CanonicalizePermittedCNAMEs",
 		Class:        OptionClassTransport,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxMultiTokenList,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateCanonicalizePermittedCNAMEs,
 	},
 	{
 		CanonicalKey: OptionIdentityFile,
 		OpenSSHName:  "IdentityFile",
 		Class:        OptionClassAuth,
+		MergeMode:    OptionMergeNoneTerminated,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAuthoritative,
 		MultiValue:   true,
 		Normalize:    validateIdentityFiles,
 	},
@@ -347,6 +543,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionCertificateFile,
 		OpenSSHName:  "CertificateFile",
 		Class:        OptionClassAuth,
+		MergeMode:    OptionMergeNoneTerminated,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		MultiValue:   true,
 		Normalize:    validateCertificateFiles,
 	},
@@ -355,12 +555,20 @@ var optionRegistry = []OptionSpec{
 		OpenSSHName:  "IdentityAgent",
 		Class:        OptionClassAuth,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateIdentityAgent,
 	},
 	{
 		CanonicalKey: OptionPubkeyAuthentication,
 		OpenSSHName:  "PubkeyAuthentication",
 		Class:        OptionClassAuth,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("PubkeyAuthentication", raw)
 		},
@@ -369,6 +577,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionPasswordAuthentication,
 		OpenSSHName:  "PasswordAuthentication",
 		Class:        OptionClassAuth,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("PasswordAuthentication", raw)
 		},
@@ -377,6 +589,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionKbdInteractiveAuthentication,
 		OpenSSHName:  "KbdInteractiveAuthentication",
 		Class:        OptionClassAuth,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Aliases:      []string{"ChallengeResponseAuthentication", "challenge_response_authentication"},
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("KbdInteractiveAuthentication", raw)
@@ -386,31 +602,49 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionIdentitiesOnly,
 		OpenSSHName:  "IdentitiesOnly",
 		Class:        OptionClassAuth,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("IdentitiesOnly", raw)
 		},
 	},
 	{
-		CanonicalKey: OptionPreferredAuthentications,
-		OpenSSHName:  "PreferredAuthentications",
-		Class:        OptionClassAuth,
-		AllowList:    true,
-		Normalize:    normalizePreferredAuthentications,
+		CanonicalKey:          OptionPreferredAuthentications,
+		OpenSSHName:           "PreferredAuthentications",
+		Class:                 OptionClassAuth,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllow,
+		AllowList:             true,
+		Normalize:             normalizePreferredAuthentications,
 	},
 	{
 		CanonicalKey: OptionBatchMode,
 		OpenSSHName:  "BatchMode",
 		Class:        OptionClassAuth,
 		Scope:        OptionScopeConnectionWide,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("BatchMode", raw)
 		},
 	},
 	{
-		CanonicalKey: OptionHostKeyAlgorithms,
-		OpenSSHName:  "HostKeyAlgorithms",
-		Class:        OptionClassTransport,
-		AllowList:    true,
+		CanonicalKey:          OptionHostKeyAlgorithms,
+		OpenSSHName:           "HostKeyAlgorithms",
+		Class:                 OptionClassTransport,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllow,
+		AllowList:             true,
 		Normalize: func(raw string) (string, error) {
 			defaults := cryptoSSH.SupportedAlgorithms().HostKeys
 			return normalizeAlgorithmSpec("HostKeyAlgorithms", raw, defaults, allSupportedAlgorithms(
@@ -420,10 +654,15 @@ var optionRegistry = []OptionSpec{
 		},
 	},
 	{
-		CanonicalKey: OptionCiphers,
-		OpenSSHName:  "Ciphers",
-		Class:        OptionClassTransport,
-		AllowList:    true,
+		CanonicalKey:          OptionCiphers,
+		OpenSSHName:           "Ciphers",
+		Class:                 OptionClassTransport,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllow,
+		AllowList:             true,
 		Normalize: func(raw string) (string, error) {
 			defaults := cryptoSSH.SupportedAlgorithms().Ciphers
 			return normalizeAlgorithmSpec("Ciphers", raw, defaults, allSupportedAlgorithms(
@@ -433,10 +672,15 @@ var optionRegistry = []OptionSpec{
 		},
 	},
 	{
-		CanonicalKey: OptionMACs,
-		OpenSSHName:  "MACs",
-		Class:        OptionClassTransport,
-		AllowList:    true,
+		CanonicalKey:          OptionMACs,
+		OpenSSHName:           "MACs",
+		Class:                 OptionClassTransport,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllow,
+		AllowList:             true,
 		Normalize: func(raw string) (string, error) {
 			defaults := cryptoSSH.SupportedAlgorithms().MACs
 			return normalizeAlgorithmSpec("MACs", raw, defaults, allSupportedAlgorithms(
@@ -446,10 +690,15 @@ var optionRegistry = []OptionSpec{
 		},
 	},
 	{
-		CanonicalKey: OptionKexAlgorithms,
-		OpenSSHName:  "KexAlgorithms",
-		Class:        OptionClassTransport,
-		AllowList:    true,
+		CanonicalKey:          OptionKexAlgorithms,
+		OpenSSHName:           "KexAlgorithms",
+		Class:                 OptionClassTransport,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxStrictScalar,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllow,
+		AllowList:             true,
 		Normalize: func(raw string) (string, error) {
 			defaults := cryptoSSH.SupportedAlgorithms().KeyExchanges
 			return normalizeAlgorithmSpec("KexAlgorithms", raw, defaults, allSupportedAlgorithms(
@@ -462,6 +711,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionExitOnForwardFailure,
 		OpenSSHName:  "ExitOnForwardFailure",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("ExitOnForwardFailure", raw)
 		},
@@ -470,6 +723,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionClearAllForwardings,
 		OpenSSHName:  "ClearAllForwardings",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAuthoritative,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("ClearAllForwardings", raw)
 		},
@@ -478,18 +735,30 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionForwardAgent,
 		OpenSSHName:  "ForwardAgent",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize:    validateForwardAgent,
 	},
 	{
 		CanonicalKey: OptionGatewayPorts,
 		OpenSSHName:  "GatewayPorts",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    validateGatewayPorts,
 	},
 	{
 		CanonicalKey: OptionStreamLocalBindUnlink,
 		OpenSSHName:  "StreamLocalBindUnlink",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("StreamLocalBindUnlink", raw)
 		},
@@ -498,12 +767,20 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionStreamLocalBindMask,
 		OpenSSHName:  "StreamLocalBindMask",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllow,
 		Normalize:    ParseStreamLocalBindMaskOption,
 	},
 	{
 		CanonicalKey: OptionForkAfterAuthentication,
 		OpenSSHName:  "ForkAfterAuthentication",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("ForkAfterAuthentication", raw)
 		},
@@ -512,6 +789,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionStdinNull,
 		OpenSSHName:  "StdinNull",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("StdinNull", raw)
 		},
@@ -520,6 +801,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionSessionType,
 		OpenSSHName:  "SessionType",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			m, err := ParseSessionTypeMode(raw)
 			if err != nil {
@@ -532,12 +817,20 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionTunnel,
 		OpenSSHName:  "Tunnel",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize:    ParseTunnelOption,
 	},
 	{
 		CanonicalKey: OptionTunnelDevice,
 		OpenSSHName:  "TunnelDevice",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			spec, err := ParseTunnelDevice(raw)
 			if err != nil {
@@ -550,6 +843,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionRequestTTY,
 		OpenSSHName:  "RequestTTY",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			mode, err := ParseRequestTTYMode(raw)
 			if err != nil {
@@ -562,6 +859,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionLocalForward,
 		OpenSSHName:  "LocalForward",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeAppendDedup,
+		ConfigSyntax: OptionSyntaxRawTokenList,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		MultiValue:   true,
 		Normalize: func(raw string) (string, error) {
 			return normalizeMultiForwardEntries("LocalForward", raw, func(item string) (string, error) {
@@ -577,6 +878,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionRemoteForward,
 		OpenSSHName:  "RemoteForward",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeAppendDedup,
+		ConfigSyntax: OptionSyntaxRawTokenList,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		MultiValue:   true,
 		Normalize: func(raw string) (string, error) {
 			return normalizeMultiForwardEntries("RemoteForward", raw, func(item string) (string, error) {
@@ -592,6 +897,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionDynamicForward,
 		OpenSSHName:  "DynamicForward",
 		Class:        OptionClassForward,
+		MergeMode:    OptionMergeAppendDedup,
+		ConfigSyntax: OptionSyntaxRawTokenList,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		MultiValue:   true,
 		Normalize: func(raw string) (string, error) {
 			return normalizeMultiForwardEntries("DynamicForward", raw, ParseDynamicForwardSpec)
@@ -601,6 +910,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionSendEnv,
 		OpenSSHName:  "SendEnv",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeOrderedEnv,
+		ConfigSyntax: OptionSyntaxRawTokenList,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		MultiValue:   true,
 		Normalize:    validateSendEnvOption,
 	},
@@ -608,6 +921,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionSetEnv,
 		OpenSSHName:  "SetEnv",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeSingleDirectiveOrderedEnv,
+		ConfigSyntax: OptionSyntaxRawTokenList,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		MultiValue:   true,
 		Normalize:    validateSetEnvOption,
 	},
@@ -615,18 +932,30 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionRemoteCommand,
 		OpenSSHName:  "RemoteCommand",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxWholeLineCommand,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize:    validateRemoteCommandOption,
 	},
 	{
 		CanonicalKey: OptionEscapeChar,
 		OpenSSHName:  "EscapeChar",
 		Class:        OptionClassSession,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize:    validateEscapeCharOption,
 	},
 	{
 		CanonicalKey: OptionProxyCommand,
 		OpenSSHName:  "ProxyCommand",
 		Class:        OptionClassLocalExec,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxWholeLineCommand,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxAllowNoneOnly,
 		Normalize: func(raw string) (string, error) {
 			return validateLocalExecCommandOption("ProxyCommand", raw)
 		},
@@ -635,6 +964,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionLocalCommand,
 		OpenSSHName:  "LocalCommand",
 		Class:        OptionClassLocalExec,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxWholeLineCommand,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			return validateLocalExecCommandOption("LocalCommand", raw)
 		},
@@ -643,6 +976,10 @@ var optionRegistry = []OptionSpec{
 		CanonicalKey: OptionPermitLocalCommand,
 		OpenSSHName:  "PermitLocalCommand",
 		Class:        OptionClassLocalExec,
+		MergeMode:    OptionMergeFirstWins,
+		ConfigSyntax: OptionSyntaxStrictScalar,
+		Tier4Policy:  OptionTier4Inherit,
+		MuxPolicy:    OptionMuxReject,
 		Normalize: func(raw string) (string, error) {
 			return normalizeYesNoOption("PermitLocalCommand", raw)
 		},
@@ -677,6 +1014,25 @@ func LookupOptionSpec(key string) (OptionSpec, bool) {
 	}
 	spec, ok := optionLookupMap[trimmed]
 	return spec, ok
+}
+
+// LookupDirectiveSyntax resolves the ssh_config parsing syntax for any
+// registered OpenSSH option (canonical snake_case, OpenSSH name, or alias,
+// case-insensitive) or target-level directive (Port, User, HostName, ProxyJump).
+func LookupDirectiveSyntax(key string) (OptionConfigSyntax, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(key))
+	switch trimmed {
+	case "":
+		return OptionSyntaxUnset, false
+	case "port", "user", "hostname":
+		return OptionSyntaxStrictScalar, true
+	case "proxyjump", "proxy_jump":
+		return OptionSyntaxMultiTokenList, true
+	}
+	if spec, ok := optionLookupMap[trimmed]; ok {
+		return spec.ConfigSyntax, true
+	}
+	return OptionSyntaxUnset, false
 }
 
 // CanonicalOptionKey resolves any supported OpenSSH option or target-level CLI
@@ -2234,26 +2590,14 @@ func isActiveControlMaster(mode string) bool {
 		mode == string(ControlMasterAutoAsk)
 }
 
-// isOrderedOverrideMultiValue reports whether canonicalKey represents an order-sensitive
-// override sequence (SendEnv '-PATTERN' exclusions, SetEnv KEY=VALUE overrides) that must
-// accumulate from lowest-priority layer to highest-priority layer without dropping repeated entries.
-func isOrderedOverrideMultiValue(canonicalKey string) bool {
-	return canonicalKey == OptionSendEnv || canonicalKey == OptionSetEnv
-}
-
-// isNoneTerminatedMultiValue reports whether canonicalKey is a multi-value path list
-// where an entry of "none" (case-insensitive) terminates accumulation of any subsequent
-// or lower-priority entries (IdentityFile, CertificateFile).
-func isNoneTerminatedMultiValue(canonicalKey string) bool {
-	return canonicalKey == OptionIdentityFile || canonicalKey == OptionCertificateFile
-}
-
 // MergeOptionLayers merges a slice of Options from highest priority to lowest priority
-// using first-match-wins per option key, without applying cross-field effective finalization.
-// Order-sensitive session environment options (SendEnv, SetEnv) merge from lowest priority to
-// highest priority so higher-tier exclusions and overrides win left-to-right.
-// For IdentityFile and CertificateFile, encountering "none" stops accumulation of all
-// subsequent and lower-priority entries for that key.
+// according to each registered OptionSpec's MergeMode, without applying cross-field
+// effective finalization:
+//   - OptionMergeFirstWins: highest-priority layer wins.
+//   - OptionMergeAppendDedup: appends normalized entries in order, deduplicating identical entries.
+//   - OptionMergeNoneTerminated: appends normalized entries in order, truncating at "none".
+//   - OptionMergeOrderedEnv / OptionMergeSingleDirectiveOrderedEnv: merges lowest-to-highest
+//     without dropping repeated entries so higher-tier exclusions and overrides win left-to-right.
 func MergeOptionLayers(layers ...*Options) *Options {
 	res := &Options{}
 	hasExplicitPersist := false
@@ -2276,9 +2620,12 @@ func MergeOptionLayers(layers ...*Options) *Options {
 		if layer.IsEmpty() {
 			continue
 		}
-		for _, key := range []string{OptionSendEnv, OptionSetEnv} {
-			if v, ok := layer.values[key]; ok && v != "" {
-				res.appendOrderedRaw(key, v)
+		for _, spec := range optionRegistry {
+			if !spec.MergeMode.IsOrderedOverride() {
+				continue
+			}
+			if v, ok := layer.values[spec.CanonicalKey]; ok && v != "" {
+				res.appendOrderedRaw(spec.CanonicalKey, v)
 			}
 		}
 	}
@@ -2291,19 +2638,19 @@ func MergeOptionLayers(layers ...*Options) *Options {
 
 func mergeOptionLayerValues(res, layer *Options, noneTerminated map[string]bool) {
 	for k, v := range layer.values {
-		spec, ok := LookupOptionSpec(k)
-		if ok && spec.MultiValue {
-			if isOrderedOverrideMultiValue(spec.CanonicalKey) {
+		if spec, ok := LookupOptionSpec(k); ok {
+			switch spec.MergeMode {
+			case OptionMergeOrderedEnv, OptionMergeSingleDirectiveOrderedEnv:
 				continue
-			}
-			if isNoneTerminatedMultiValue(spec.CanonicalKey) {
+			case OptionMergeNoneTerminated:
 				if !noneTerminated[spec.CanonicalKey] && res.appendNoneTerminatedRaw(spec.CanonicalKey, v) {
 					noneTerminated[spec.CanonicalKey] = true
 				}
 				continue
+			case OptionMergeAppendDedup:
+				res.appendNormalizedRaw(spec.CanonicalKey, v)
+				continue
 			}
-			res.appendNormalizedRaw(spec.CanonicalKey, v)
-			continue
 		}
 		if _, exists := res.values[k]; !exists {
 			res.setRaw(k, v)
@@ -2369,6 +2716,181 @@ func ResolveOptions(child, parent *Options) (*Options, error) {
 // EffectiveOptions resolves a hierarchy of Options from highest priority to lowest priority.
 func EffectiveOptions(layers ...*Options) (*Options, error) {
 	return finalizeEffectiveOptions(MergeOptionLayers(layers...)), nil
+}
+
+// MergeEffectiveOptions resolves a hierarchy of Options from highest priority to
+// lowest priority via EffectiveOptions and validates the resulting effective
+// option set (including cross-field constraints) via ValidateEffective.
+func MergeEffectiveOptions(layers ...*Options) (*Options, error) {
+	eff, err := EffectiveOptions(layers...)
+	if err != nil {
+		return nil, err
+	}
+	if eff.IsEmpty() {
+		return nil, nil
+	}
+	if err := eff.ValidateEffective(); err != nil {
+		return nil, err
+	}
+	return eff, nil
+}
+
+// SplitOptionKeyValue parses an OpenSSH -o directive into its key and value tokens.
+// It supports "Key=Value", "Key Value", and "Key = Value" syntax, matching standard
+// OpenSSH -o CLI argument conventions.
+func SplitOptionKeyValue(opt string) (key, val string, err error) {
+	opt = strings.TrimSpace(opt)
+	if opt == "" {
+		return "", "", nil
+	}
+	eqIdx := strings.IndexByte(opt, '=')
+	wsIdx := strings.IndexAny(opt, " \t")
+	if eqIdx >= 0 && (wsIdx == -1 || eqIdx < wsIdx) {
+		key = strings.TrimSpace(opt[:eqIdx])
+		val = strings.TrimSpace(opt[eqIdx+1:])
+		if key == "" {
+			return "", "", fmt.Errorf("%w: invalid -o option format (expected Key=Value): %q", ErrSSHOptionsValidation, opt)
+		}
+		return key, val, nil
+	}
+	if wsIdx > 0 {
+		key = strings.TrimSpace(opt[:wsIdx])
+		val = strings.TrimSpace(opt[wsIdx+1:])
+		if strings.HasPrefix(val, "=") {
+			val = strings.TrimSpace(strings.TrimPrefix(val, "="))
+		}
+		if key == "" {
+			return "", "", fmt.Errorf("%w: invalid -o option format (expected Key=Value): %q", ErrSSHOptionsValidation, opt)
+		}
+		return key, val, nil
+	}
+	return "", "", fmt.Errorf("%w: invalid -o option format (expected Key=Value): %q", ErrSSHOptionsValidation, opt)
+}
+
+// ProjectCLIOptions deterministically projects o in optionRegistry order to
+// OpenSSH CLI "-o" strings ("<OpenSSHName>=<value>").
+//
+// Multi-value options emit one "<OpenSSHName>=<entry>" per non-empty line,
+// except SetEnv (OptionMergeSingleDirectiveOrderedEnv), which flattens all
+// layers with last-value-wins preserving first-appearance position (without
+// applying the session denylist) into a single canonical
+// SetEnv="K1=V1" "K2=V2" directive so re-parsing via ParseCLIOptions is
+// lossless and idempotent.
+func ProjectCLIOptions(o *Options) []string {
+	if o.IsEmpty() {
+		return nil
+	}
+	var out []string
+	for _, spec := range optionRegistry {
+		val, ok := o.values[spec.CanonicalKey]
+		if !ok || val == "" {
+			continue
+		}
+		switch spec.MergeMode {
+		case OptionMergeSingleDirectiveOrderedEnv:
+			out = appendProjectedSetEnv(out, spec.OpenSSHName, o.GetAll(spec.CanonicalKey))
+		case OptionMergeAppendDedup, OptionMergeNoneTerminated, OptionMergeOrderedEnv:
+			for _, entry := range o.GetAll(spec.CanonicalKey) {
+				if entry != "" {
+					out = append(out, spec.OpenSSHName+"="+entry)
+				}
+			}
+		default:
+			out = append(out, spec.OpenSSHName+"="+val)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func appendProjectedSetEnv(out []string, openSSHName string, directives []string) []string {
+	flattened, err := flattenSetEnvDirectives(directives)
+	if err == nil {
+		if formatted := formatCanonicalSetEnvDirective(flattened); formatted != "" {
+			return append(out, openSSHName+"="+formatted)
+		}
+		return out
+	}
+	for _, entry := range directives {
+		if trimmed := strings.TrimSpace(entry); trimmed != "" {
+			out = append(out, openSSHName+"="+trimmed)
+		}
+	}
+	return out
+}
+
+// ParseCLIOptions parses OpenSSH CLI "-o" option strings into a single Options
+// layer according to each registered OptionSpec's MergeMode.
+//
+// Unknown keys and target-level directives (Port, User, HostName, ProxyJump)
+// are rejected. Every directive's syntax is validated even when an earlier
+// directive has already won for FirstWins or SingleDirectiveOrderedEnv options.
+func ParseCLIOptions(optionStrings []string) (*Options, error) {
+	if len(optionStrings) == 0 {
+		return nil, nil
+	}
+	opts := &Options{}
+	seen := make(map[string]bool)
+	for _, raw := range optionStrings {
+		key, val, err := SplitOptionKeyValue(raw)
+		if err != nil {
+			return nil, err
+		}
+		if key == "" {
+			continue
+		}
+		spec, ok := LookupOptionSpec(key)
+		if !ok {
+			return nil, fmt.Errorf("%w: unsupported -o option %q", ErrSSHOptionsValidation, key)
+		}
+		if val == "" {
+			return nil, fmt.Errorf("%w: invalid %s in -o option: value cannot be empty", ErrSSHOptionsValidation, spec.OpenSSHName)
+		}
+		if err := applyCLIOptionDirective(opts, seen, spec, val); err != nil {
+			return nil, err
+		}
+	}
+	if opts.IsEmpty() {
+		return nil, nil
+	}
+	return opts, nil
+}
+
+func applyCLIOptionDirective(opts *Options, seen map[string]bool, spec OptionSpec, val string) error {
+	switch spec.MergeMode {
+	case OptionMergeFirstWins:
+		normalized, err := spec.Normalize(val)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+		}
+		if !seen[spec.CanonicalKey] {
+			if spec.CanonicalKey == OptionControlPath {
+				opts.LiteralControlPath = false
+			}
+			opts.setRaw(spec.CanonicalKey, normalized)
+		}
+		seen[spec.CanonicalKey] = true
+		return nil
+	case OptionMergeSingleDirectiveOrderedEnv:
+		if hasMultiValueDelimiterOrLineBreak(val) || hasKnownHostsControlChar(val) {
+			return fmt.Errorf("%w: invalid %s: value cannot contain newlines or control characters", ErrSSHOptionsValidation, spec.OpenSSHName)
+		}
+		normalized, err := spec.Normalize(val)
+		if err != nil {
+			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+		}
+		if !seen[spec.CanonicalKey] {
+			opts.appendOrderedRaw(spec.CanonicalKey, normalized)
+		}
+		seen[spec.CanonicalKey] = true
+		return nil
+	case OptionMergeAppendDedup, OptionMergeNoneTerminated, OptionMergeOrderedEnv:
+		return opts.Append(spec.CanonicalKey, val)
+	default:
+		return fmt.Errorf("%w: unsupported merge mode for %s", ErrSSHOptionsValidation, spec.OpenSSHName)
+	}
 }
 
 // MarshalYAML serializes Options as a YAML mapping using canonical snake_case keys in registry order.
