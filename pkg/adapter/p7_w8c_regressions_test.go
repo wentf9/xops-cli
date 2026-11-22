@@ -368,7 +368,7 @@ func assertDE8M1PrefixPreservesShadowedCommandSlot(t *testing.T) {
 	t.Helper()
 
 	// 1. Direct ProxySetting monoid check: shadowed active ProxyCommand survives prefixing.
-	jumpOnly, err := ssh.NewProxyJump("jump-a", "openssh:jump-b")
+	jumpOnly, err := ssh.NewProxyJump("jump-a", "jump-b")
 	if err != nil {
 		t.Fatalf("NewProxyJump: %v", err)
 	}

@@ -698,7 +698,11 @@ func (o *SshOptions) canConfigSupplyBackgroundSession() (verdict.Verdict, error)
 	if provider == nil {
 		return verdict.Deny, nil
 	}
-	if o.probeTargetBackgroundSession(provider, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
+	ok, err := o.probeTargetBackgroundSession(provider, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked)
+	if err != nil {
+		return verdict.Deny, err
+	}
+	if ok {
 		return verdict.Allow, nil
 	}
 	return verdict.Deny, nil
@@ -753,23 +757,32 @@ func (o *SshOptions) probeTargetBackgroundSession(
 	provider config.ConfigProvider,
 	sessionOpts adapter.SessionControlOptions,
 	cliSessionTypeLocked, cliRemoteCmdLocked bool,
-) bool {
+) (bool, error) {
 	probe := *o
 	connTarget := effectiveConnectionTarget(&probe, "")
 	nodeID := ""
-	if resolved, err := config.ResolveTarget(provider, connTarget); err == nil {
-		if resolved.MatchedNodeID != "" {
-			nodeID = resolved.MatchedNodeID
+	matchedSavedNode := false
+	if strings.TrimSpace(connTarget.Selector) != "" {
+		resolved, err := config.ResolveTarget(provider, connTarget)
+		if err != nil {
+			if !errors.Is(err, config.ErrNodeNotFound) {
+				return false, err
+			}
 		} else {
-			nodeID = resolved.NodeID
+			matchedSavedNode = isResolvedSavedNode(resolved)
+			if resolved.MatchedNodeID != "" {
+				nodeID = resolved.MatchedNodeID
+			} else {
+				nodeID = resolved.NodeID
+			}
 		}
 	}
 	if probe.probeCandidateBackgroundSession(provider, nodeID, connTarget, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
-		return true
+		return true, nil
 	}
 	rawHost := strings.TrimSpace(connTarget.Selector)
-	if rawHost == "" || config.IsOpenSSHNodeID(rawHost) {
-		return false
+	if rawHost == "" || matchedSavedNode || config.IsOpenSSHNodeID(rawHost) {
+		return false, nil
 	}
 	for _, fqdn := range config.CanonicalDomainCandidatesWithOptions(provider, rawHost, probe.control.Options, probe.effectiveCLIJumpHost()) {
 		candProbe := *o
@@ -781,7 +794,12 @@ func (o *SshOptions) probeTargetBackgroundSession(
 		candProbe.Target.OriginalHost = rawHost
 		candTarget := effectiveConnectionTarget(&candProbe, "")
 		candNodeID := config.OpenSSHNodePrefix + fqdn
-		if resolved, err := config.ResolveTarget(provider, candTarget); err == nil {
+		resolved, err := config.ResolveTarget(provider, candTarget)
+		if err != nil {
+			if !errors.Is(err, config.ErrNodeNotFound) {
+				return false, err
+			}
+		} else {
 			if resolved.MatchedNodeID != "" {
 				candNodeID = resolved.MatchedNodeID
 			} else if resolved.NodeID != "" {
@@ -789,10 +807,10 @@ func (o *SshOptions) probeTargetBackgroundSession(
 			}
 		}
 		if candProbe.probeCandidateBackgroundSession(provider, candNodeID, candTarget, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 func (o *SshOptions) probeCandidateBackgroundSession(
@@ -3053,7 +3071,13 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 		return nil
 	}
 	var matchedSavedNode bool
-	if resolved, err := config.ResolveTarget(provider, effectiveConnectionTarget(o, "")); err == nil {
+	connTarget := effectiveConnectionTarget(o, "")
+	resolved, err := config.ResolveTarget(provider, connTarget)
+	if err != nil {
+		if !errors.Is(err, config.ErrNodeNotFound) {
+			return fmt.Errorf("resolve target %q failed: %w", connTarget.Selector, err)
+		}
+	} else {
 		matchedSavedNode = isResolvedSavedNode(resolved)
 	}
 	if resolver == nil {

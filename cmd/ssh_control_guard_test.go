@@ -1521,8 +1521,10 @@ func TestControlCandidateFallbackAndPortOverrideJumpAlignment(t *testing.T) {
 	}
 	cfg.Hosts.Set("h-22", models.Host{Address: "10.0.0.5", Port: 22})
 	cfg.Hosts.Set("h-2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Hosts.Set("h-upstream", models.Host{Address: "10.0.0.254", Port: 22})
 	cfg.Identities.Set("id-root", models.Identity{User: "root", AuthType: "password"})
 	cfg.Identities.Set("id-admin", models.Identity{User: "admin", AuthType: "password"})
+	cfg.Nodes.Set("upstream", models.Node{HostRef: "h-upstream", IdentityRef: "id-root"})
 
 	// Case 1a: Same IP, different ports -> -l test without -p must return AmbiguousNodeError.
 	cfg.Nodes.Set("root@10.0.0.5:22", models.Node{HostRef: "h-22", IdentityRef: "id-root"})

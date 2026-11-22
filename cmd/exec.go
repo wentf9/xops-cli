@@ -1381,10 +1381,17 @@ func (o *ExecOptions) resolveExecHostTargetWithHint(ctx context.Context, reposit
 		resolved          config.ResolvedTarget
 		hasResolved       bool
 	)
-	if r, rErr := config.ResolveTarget(repository, target); rErr == nil {
-		resolved = r
-		hasResolved = true
-		matchedSavedNode = matchedSavedNode || isResolvedSavedNode(r)
+	if repository != nil && strings.TrimSpace(target.Selector) != "" {
+		r, rErr := config.ResolveTarget(repository, target)
+		if rErr != nil {
+			if !errors.Is(rErr, config.ErrNodeNotFound) {
+				return target, resolved, hasResolved, "", "", rErr
+			}
+		} else {
+			resolved = r
+			hasResolved = true
+			matchedSavedNode = matchedSavedNode || isResolvedSavedNode(r)
+		}
 	}
 	if target.Selector != "" && !config.IsOpenSSHNodeID(target.Selector) {
 		canonRes, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
@@ -1403,9 +1410,16 @@ func (o *ExecOptions) resolveExecHostTargetWithHint(ctx context.Context, reposit
 			canonOriginalHost = canonRes.OriginalHost
 			target.Selector = canonRes.CanonicalHost
 			target.OriginalHost = canonRes.OriginalHost
-			if r, rErr := config.ResolveTarget(repository, target); rErr == nil {
-				resolved = r
-				hasResolved = true
+			if repository != nil {
+				r, rErr := config.ResolveTarget(repository, target)
+				if rErr != nil {
+					if !errors.Is(rErr, config.ErrNodeNotFound) {
+						return target, resolved, hasResolved, "", "", rErr
+					}
+				} else {
+					resolved = r
+					hasResolved = true
+				}
 			}
 		}
 	}

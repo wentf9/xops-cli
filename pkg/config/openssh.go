@@ -995,7 +995,11 @@ func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 	}
 	proxyJump := ""
 	if targets, ok := proxySetting.JumpTargets(); ok {
-		proxyJump = parseOpenSSHProxyJump(strings.Join(targets, ","))
+		var pjErr error
+		proxyJump, pjErr = parseOpenSSHProxyJump(strings.Join(targets, ","))
+		if pjErr != nil {
+			return models.Node{}, models.Host{}, models.Identity{}, pjErr
+		}
 	}
 
 	sshOpts, err := parseOpenSSHOptionsPasses(p.cfg, passes)
@@ -1323,20 +1327,48 @@ func normalizeConfigIdentityKeyPath(raw string) (string, error) {
 	return expanded, nil
 }
 
-func parseOpenSSHProxyJump(raw string) string {
-	if raw == "" || strings.EqualFold(strings.TrimSpace(raw), "none") {
-		return ""
+func validateOpenSSHConfigProxyJumpHop(rawHop string) (string, error) {
+	hop := strings.TrimSpace(rawHop)
+	if hop == "" {
+		return "", fmt.Errorf("%w: empty OpenSSH ProxyJump hop", ssh.ErrSSHOptionsValidation)
 	}
-	hops := strings.Split(raw, ",")
-	var parsedHops []string
-	for _, rawHop := range hops {
-		hop := strings.TrimSpace(rawHop)
-		if hop == "" || strings.EqualFold(hop, "none") {
-			continue
+	if hasControlOrLineSepChar(rawHop) || hasAnyWhitespace(hop) {
+		return "", fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q: contains whitespace or control character", ssh.ErrSSHOptionsValidation, rawHop)
+	}
+	if IsOpenSSHNodeID(hop) {
+		return "", fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q: reserved %q prefix is not allowed in ssh_config", ssh.ErrSSHOptionsValidation, hop, OpenSSHNodePrefix)
+	}
+	ref, err := ParseTargetRef(OpenSSHNodePrefix + hop)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+	}
+	if err := ref.Validate(); err != nil {
+		return "", fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+	}
+	return ref.NormalizedString(), nil
+}
+
+func parseOpenSSHProxyJump(raw string) (string, error) {
+	if raw == "" {
+		return "", nil
+	}
+	ps, err := ssh.ParseProxyJump(raw)
+	if err != nil {
+		return "", err
+	}
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return "", nil
+	}
+	parsedHops := make([]string, 0, len(targets))
+	for _, rawHop := range targets {
+		norm, hErr := validateOpenSSHConfigProxyJumpHop(rawHop)
+		if hErr != nil {
+			return "", hErr
 		}
-		parsedHops = append(parsedHops, OpenSSHNodePrefix+hop)
+		parsedHops = append(parsedHops, norm)
 	}
-	return strings.Join(parsedHops, ",")
+	return strings.Join(parsedHops, ","), nil
 }
 
 // resolveOpenSSHProxySettingPasses folds all matching ProxyJump and ProxyCommand
@@ -1356,6 +1388,12 @@ func resolveOpenSSHProxySettingPasses(doc *sshConfigDoc, passes []string) (ssh.P
 			if err != nil {
 				parseErr = fmt.Errorf("line %d: invalid ProxyJump %q for %q in ssh config: %w", d.line, d.value, passes[0], err)
 				return false
+			}
+			if targets, ok := ps.JumpTargets(); ok {
+				if _, hopErr := parseOpenSSHProxyJump(strings.Join(targets, ",")); hopErr != nil {
+					parseErr = fmt.Errorf("line %d: invalid ProxyJump %q for %q in ssh config: %w", d.line, d.value, passes[0], hopErr)
+					return false
+				}
 			}
 			acc = acc.Merge(ps)
 		case "proxycommand":

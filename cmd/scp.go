@@ -250,6 +250,9 @@ func parsePath(p string) (PathInfo, error) {
 	if config.IsOpenSSHNodeID(p) {
 		return parseOpenSSHPath(p)
 	}
+	if trimmed := strings.TrimSpace(p); trimmed != p && config.IsOpenSSHNodeID(trimmed) {
+		return PathInfo{}, fmt.Errorf("invalid openssh remote path %q: contains leading or trailing whitespace", p)
+	}
 	if isWindowsDrivePath(p) {
 		return PathInfo{IsRemote: false, Path: p}, nil
 	}
@@ -954,6 +957,12 @@ func (o *ScpOptions) createTransferProgress(ctx context.Context, size int64, des
 	if output.disabled {
 		return nil, output.finish
 	}
+	_, progress, finish := newTransferProgressBar(size, description, output, startOffset)
+	return progress, finish
+}
+
+func newTransferProgressBar(size int64, description string, output *scpDiagnostics, startOffset int64) (*progressbar.ProgressBar, sftp.ProgressCallback, func() error) {
+	errs := &transferProgressErrors{}
 	bar := progressbar.NewOptions64(size,
 		progressbar.OptionSetDescription(description),
 		progressbar.OptionSetWriter(output),
@@ -972,11 +981,19 @@ func (o *ScpOptions) createTransferProgress(ctx context.Context, size int64, des
 	if startOffset > 0 {
 		progress(startOffset)
 	}
-	return progress, func() error {
-		// Interrupted or indeterminate bars do not run OptionOnCompletion.
+	return bar, progress, func() error {
+		// Interrupted or indeterminate (size == -1) bars do not run
+		// OptionOnCompletion on their own; closing non-zero bars marks them
+		// finished so indeterminate directory bars stop their 100ms spinner
+		// goroutine and time.Ticker cleanly before output.finish().
 		if !bar.IsFinished() {
-			_, err := fmt.Fprintln(output)
-			errs.Add("progress final newline", err)
+			if size != 0 {
+				_ = bar.Close()
+			}
+			if !bar.IsFinished() {
+				_, err := fmt.Fprintln(output)
+				errs.Add("progress final newline", err)
+			}
 		}
 		return errors.Join(errs.Err(), output.finish())
 	}
@@ -1415,8 +1432,17 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 		return p, nil
 	}
 	var matchedSavedNode bool
-	if target, tErr := o.resolveTargetForPath(p); tErr == nil {
-		if resolved, rErr := config.ResolveTarget(provider, target); rErr == nil {
+	if provider != nil {
+		target, tErr := o.resolveTargetForPath(p)
+		if tErr != nil {
+			return p, tErr
+		}
+		resolved, rErr := config.ResolveTarget(provider, target)
+		if rErr != nil {
+			if !errors.Is(rErr, config.ErrNodeNotFound) {
+				return p, rErr
+			}
+		} else {
 			matchedSavedNode = isResolvedSavedNode(resolved)
 		}
 	}

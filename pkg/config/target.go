@@ -810,7 +810,7 @@ func (r *Repository) buildMatchedResolvedTarget(
 			user = defUser
 		}
 	}
-	jump, err := normalizeTargetJump(provider, node.ProxyJump, target)
+	jump, err := normalizeTargetJumpForNode(provider, matchedID, node.ProxyJump, target)
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
@@ -867,7 +867,7 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 			user = defUser
 		}
 	}
-	jump, err := normalizeTargetJump(provider, node.ProxyJump, target)
+	jump, err := normalizeTargetJumpForNode(provider, matchedID, node.ProxyJump, target)
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
@@ -892,17 +892,6 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 	}, nil
 }
 
-func isProxyJumpHardValidationError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, ssh.ErrSSHOptionsValidation) {
-		return true
-	}
-	var cycleErr *ssh.ProxyCycleError
-	return errors.As(err, &cycleErr)
-}
-
 func parseOptionalNodeProxyJump(raw string) (ssh.ProxySetting, error) {
 	if hasControlOrLineSepChar(raw) {
 		return ssh.UnsetProxySetting(), fmt.Errorf("invalid node ProxyJump %q: %w", raw, ssh.ErrSSHOptionsValidation)
@@ -917,10 +906,112 @@ func parseOptionalNodeProxyJump(raw string) (ssh.ProxySetting, error) {
 	return ps, nil
 }
 
+func validateJumpTargetsSyntax(targets []string) ([]string, error) {
+	out := make([]string, 0, len(targets))
+	for _, rawHop := range targets {
+		hop := strings.TrimSpace(rawHop)
+		if hop == "" {
+			return nil, fmt.Errorf("%w: empty ProxyJump hop", ssh.ErrSSHOptionsValidation)
+		}
+		ref, err := ParseTargetRef(hop)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+		}
+		if err := ref.Validate(); err != nil {
+			return nil, fmt.Errorf("%w: invalid jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+		}
+		if ref.OpenSSH {
+			out = append(out, ref.NormalizedString())
+		} else {
+			out = append(out, hop)
+		}
+	}
+	return out, nil
+}
+
+func isSameJumpTarget(destNodeID, hop string) (bool, error) {
+	if destNodeID == "" || hop == "" {
+		return false, nil
+	}
+	if hop == destNodeID {
+		return true, nil
+	}
+	if IsOpenSSHNodeID(destNodeID) && IsOpenSSHNodeID(hop) {
+		destRef, dErr := ParseTargetRef(destNodeID)
+		if dErr != nil {
+			return false, fmt.Errorf("%w: invalid destination openssh selector %q: %w", ssh.ErrSSHOptionsValidation, destNodeID, dErr)
+		}
+		hopRef, hErr := ParseTargetRef(hop)
+		if hErr != nil {
+			return false, fmt.Errorf("%w: invalid jump openssh selector %q: %w", ssh.ErrSSHOptionsValidation, hop, hErr)
+		}
+		return destRef.NormalizedString() == hopRef.NormalizedString(), nil
+	}
+	return false, nil
+}
+
+func checkJumpChainSelfLoop(provider ConfigProvider, destNodeID, resolvedChain, rawJump string) error {
+	if destNodeID == "" || resolvedChain == "" {
+		return nil
+	}
+	for hop := range strings.SplitSeq(resolvedChain, ",") {
+		trimmed := strings.TrimSpace(hop)
+		if trimmed == "" {
+			continue
+		}
+		same, err := isSameJumpTarget(destNodeID, trimmed)
+		if err != nil {
+			return err
+		}
+		if same {
+			return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, destNodeID, &ssh.ProxyCycleError{
+				NodeID: destNodeID,
+				Path:   []string{destNodeID, trimmed},
+			})
+		}
+		if provider != nil && !IsOpenSSHNodeID(trimmed) {
+			if aliasID := provider.FindAlias(trimmed); aliasID != "" {
+				sameAlias, aliasErr := isSameJumpTarget(destNodeID, aliasID)
+				if aliasErr != nil {
+					return aliasErr
+				}
+				if sameAlias {
+					return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, destNodeID, &ssh.ProxyCycleError{
+						NodeID: destNodeID,
+						Path:   []string{destNodeID, aliasID},
+					})
+				}
+			}
+			if resolvedHop, rErr := provider.ResolveProxyJumpChain(trimmed); rErr == nil {
+				sameResolved, resErr := isSameJumpTarget(destNodeID, resolvedHop)
+				if resErr != nil {
+					return resErr
+				}
+				if sameResolved {
+					return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, destNodeID, &ssh.ProxyCycleError{
+						NodeID: destNodeID,
+						Path:   []string{destNodeID, resolvedHop},
+					})
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func normalizeTargetJump(provider ConfigProvider, baseJump string, target ConnectionTarget) (string, error) {
+	return normalizeTargetJumpForNode(provider, "", baseJump, target)
+}
+
+func normalizeTargetJumpForNode(provider ConfigProvider, destNodeID, baseJump string, target ConnectionTarget) (string, error) {
 	basePS, err := parseOptionalNodeProxyJump(baseJump)
 	if err != nil {
 		return "", err
+	}
+	if baseTargets, ok := basePS.JumpTargets(); ok {
+		if _, vErr := validateJumpTargetsSyntax(baseTargets); vErr != nil {
+			return "", vErr
+		}
 	}
 	if target.HasProxyJump || target.ProxyJump != "" {
 		ps, pErr := ssh.ParseProxyJump(target.ProxyJump)
@@ -933,44 +1024,50 @@ func normalizeTargetJump(provider ConfigProvider, baseJump string, target Connec
 		jump := strings.TrimSpace(target.ProxyJump)
 		if provider != nil {
 			resolvedJump, jErr := provider.ResolveProxyJumpChain(jump)
-			if jErr == nil {
-				return resolvedJump, nil
-			}
-			if isProxyJumpHardValidationError(jErr) {
+			if jErr != nil {
 				return "", jErr
 			}
+			if cErr := checkJumpChainSelfLoop(provider, destNodeID, resolvedJump, jump); cErr != nil {
+				return "", cErr
+			}
+			return resolvedJump, nil
 		}
 		targets, _ := ps.JumpTargets()
-		return strings.Join(targets, ","), nil
+		validated, vErr := validateJumpTargetsSyntax(targets)
+		if vErr != nil {
+			return "", vErr
+		}
+		joined := strings.Join(validated, ",")
+		if cErr := checkJumpChainSelfLoop(nil, destNodeID, joined, jump); cErr != nil {
+			return "", cErr
+		}
+		return joined, nil
 	}
 	if basePS.Kind() != ssh.ProxyJump {
 		return "", nil
 	}
 	targets, _ := basePS.JumpTargets()
-	return strings.Join(targets, ","), nil
+	validated, vErr := validateJumpTargetsSyntax(targets)
+	if vErr != nil {
+		return "", vErr
+	}
+	joined := strings.Join(validated, ",")
+	if cErr := checkJumpChainSelfLoop(provider, destNodeID, joined, baseJump); cErr != nil {
+		return "", cErr
+	}
+	return joined, nil
 }
 
 func (r *Repository) resolveCreatedTargetJump(
 	cfg *Configuration,
+	targetNodeID string,
 	canonicalInfo canonicalTargetInfo,
 	effectivePort uint16,
 	target ConnectionTarget,
 ) (string, error) {
 	jump, err := r.resolveJumpForNode(cfg, EnsureNodeOptions{Target: target}, canonicalInfo, canonicalInfo.Address, effectivePort)
 	if err != nil {
-		if isProxyJumpHardValidationError(err) {
-			return "", err
-		}
-		if target.HasProxyJump || target.ProxyJump != "" {
-			jump = target.ProxyJump
-		} else {
-			jump = ""
-		}
-	}
-	if target.HasProxyJump || target.ProxyJump != "" {
-		if _, pErr := ssh.ParseProxyJump(target.ProxyJump); pErr != nil {
-			return "", fmt.Errorf("invalid target ProxyJump %q: %w", target.ProxyJump, pErr)
-		}
+		return "", err
 	}
 	if jump == "" {
 		return "", nil
@@ -979,10 +1076,19 @@ func (r *Repository) resolveCreatedTargetJump(
 	if pErr != nil {
 		return "", pErr
 	}
-	if targets, ok := ps.JumpTargets(); ok {
-		return strings.Join(targets, ","), nil
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return "", nil
 	}
-	return "", nil
+	validated, vErr := validateJumpTargetsSyntax(targets)
+	if vErr != nil {
+		return "", vErr
+	}
+	joined := strings.Join(validated, ",")
+	if cErr := checkJumpChainSelfLoop(r, targetNodeID, joined, jump); cErr != nil {
+		return "", cErr
+	}
+	return joined, nil
 }
 
 func (r *Repository) applyPendingCreatedTargetMetadata(
@@ -1032,7 +1138,7 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		return ResolvedTarget{}, &AmbiguousNodeError{Selector: target.Selector, Candidates: matches}
 	}
 	targetNodeID := allocateAvailableNodeID(cfg, FormatNodeID(effectiveUser, canonicalInfo.Address, effectivePort))
-	jump, err := r.resolveCreatedTargetJump(cfg, canonicalInfo, effectivePort, target)
+	jump, err := r.resolveCreatedTargetJump(cfg, targetNodeID, canonicalInfo, effectivePort, target)
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
@@ -2043,7 +2149,11 @@ func (r *Repository) resolveJumpForNode(
 			}
 			var trimmedJump string
 			if targets, ok := ps.JumpTargets(); ok {
-				trimmedJump = strings.Join(targets, ",")
+				validated, vErr := validateJumpTargetsSyntax(targets)
+				if vErr != nil {
+					return "", vErr
+				}
+				trimmedJump = strings.Join(validated, ",")
 			}
 			jumpSet[trimmedJump] = struct{}{}
 		}
@@ -2304,7 +2414,7 @@ func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort 
 			HasPort: effectivePort > 0,
 		}
 		if err := candidateRef.Validate(); err != nil {
-			return "", fmt.Errorf("invalid jump host %q: %w", hop, err)
+			return "", fmt.Errorf("%w: invalid jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
 		}
 		if isDirectJumpTargetRef(candidateRef) {
 			return candidateRef.NormalizedString(), nil
@@ -2364,7 +2474,7 @@ func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, ref TargetRef) (string, error
 		return "", fmt.Errorf("resolve openssh jump %q: missing openssh prefix", ref.NormalizedString())
 	}
 	if err := ref.Validate(); err != nil {
-		return "", fmt.Errorf("invalid openssh jump %q: %w", ref.NormalizedString(), err)
+		return "", fmt.Errorf("%w: invalid openssh jump %q: %w", ssh.ErrSSHOptionsValidation, ref.NormalizedString(), err)
 	}
 	cleanHop := ref.formatNormalizedBody()
 	if err := openSSH.Err(); err != nil {
@@ -2416,12 +2526,12 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 	if matched {
 		ref, refErr := ParseTargetRef(hop)
 		if refErr != nil {
-			return "", fmt.Errorf("invalid jump host address %q: %w", hop, refErr)
+			return "", fmt.Errorf("%w: invalid jump host address %q: %w", ssh.ErrSSHOptionsValidation, hop, refErr)
 		}
 		outRef := ref
 		outRef.OpenSSH = true
 		if err := outRef.Validate(); err != nil {
-			return "", fmt.Errorf("invalid jump host address %q: %w", hop, err)
+			return "", fmt.Errorf("%w: invalid jump host address %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
 		}
 		if _, _, _, vErr := openSSH.GetVirtualNode(outRef.formatNormalizedBody()); vErr != nil {
 			return "", fmt.Errorf("resolve openssh jump %q: %w", hop, vErr)
@@ -2430,16 +2540,16 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 	}
 
 	ref, refErr := ParseTargetRef(hop)
-	if refErr == nil && isDirectJumpTargetRef(ref) {
+	if refErr != nil {
+		return "", fmt.Errorf("%w: invalid jump host address %q: %w", ssh.ErrSSHOptionsValidation, hop, refErr)
+	}
+	if isDirectJumpTargetRef(ref) {
 		outRef := ref
 		outRef.OpenSSH = true
 		if err := outRef.Validate(); err != nil {
-			return "", fmt.Errorf("invalid jump host address %q: %w", hop, err)
+			return "", fmt.Errorf("%w: invalid jump host address %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
 		}
 		return outRef.NormalizedString(), nil
-	}
-	if v, vErr := isDirectJumpTarget(hop); vErr == nil && v.Allowed() && parseErr != nil {
-		return "", fmt.Errorf("invalid jump host address %q: %w", hop, parseErr)
 	}
 
 	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
@@ -2460,7 +2570,7 @@ func resolveSingleJumpHopWithConfig(cfg *Configuration, openSSH *OpenSSHParser, 
 	if hasOpenSSHPrefix(hop) {
 		ref, err := ParseTargetRef(hop)
 		if err != nil {
-			return "", fmt.Errorf("invalid jump host %q: %w", hop, err)
+			return "", fmt.Errorf("%w: invalid jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
 		}
 		return resolveOpenSSHJumpHop(openSSH, ref)
 	}

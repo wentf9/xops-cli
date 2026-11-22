@@ -215,6 +215,36 @@ func hasControlOrLineSepChar(s string) bool {
 	return false
 }
 
+func hasAnyWhitespace(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+func isSameJumpDestination(destNodeID, hop string) (bool, error) {
+	if destNodeID == "" || hop == "" {
+		return false, nil
+	}
+	if hop == destNodeID {
+		return true, nil
+	}
+	if config.IsOpenSSHNodeID(destNodeID) && config.IsOpenSSHNodeID(hop) {
+		destRef, dErr := config.ParseTargetRef(destNodeID)
+		if dErr != nil {
+			return false, fmt.Errorf("%w: invalid destination openssh selector %q: %w", ssh.ErrSSHOptionsValidation, destNodeID, dErr)
+		}
+		hopRef, hErr := config.ParseTargetRef(hop)
+		if hErr != nil {
+			return false, fmt.Errorf("%w: invalid jump openssh selector %q: %w", ssh.ErrSSHOptionsValidation, hop, hErr)
+		}
+		return destRef.NormalizedString() == hopRef.NormalizedString(), nil
+	}
+	return false, nil
+}
+
 func proxySettingFromJumpString(raw string) (ssh.ProxySetting, error) {
 	if hasControlOrLineSepChar(raw) {
 		return ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ssh.ErrSSHOptionsValidation, raw)
@@ -315,37 +345,85 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	if err != nil {
 		return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
 	}
-	if nodeID != "" {
-		for hop := range strings.SplitSeq(resolved, ",") {
-			if strings.TrimSpace(hop) == nodeID {
-				return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, &ssh.ProxyCycleError{
-					NodeID: nodeID,
-					Path:   []string{nodeID, nodeID},
-				})
-			}
-		}
+	if err := a.checkPolicyJumpSelfLoop(nodeID, hasSnapshot, rawJump, resolved); err != nil {
+		return "", err
 	}
 	return resolved, nil
 }
 
+func (a *SSHAdapter) checkPolicyJumpSelfLoop(nodeID string, hasSnapshot bool, rawJump, resolved string) error {
+	if nodeID == "" {
+		return nil
+	}
+	effectiveDestID := nodeID
+	if !hasSnapshot && a.cfgProvider != nil && !config.IsOpenSSHNodeID(nodeID) {
+		if aliasID := a.cfgProvider.FindAlias(nodeID); aliasID != "" {
+			effectiveDestID = aliasID
+		}
+	}
+	for hop := range strings.SplitSeq(resolved, ",") {
+		trimmedHop := strings.TrimSpace(hop)
+		sameEff, effErr := isSameJumpDestination(effectiveDestID, trimmedHop)
+		if effErr != nil {
+			return effErr
+		}
+		sameRaw, rawErr := isSameJumpDestination(nodeID, trimmedHop)
+		if rawErr != nil {
+			return rawErr
+		}
+		if sameEff || sameRaw {
+			return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, effectiveDestID, &ssh.ProxyCycleError{
+				NodeID: effectiveDestID,
+				Path:   []string{effectiveDestID, trimmedHop},
+			})
+		}
+	}
+	return nil
+}
+
 // resolveUnpersistedOpenSSHJumpChain resolves non-OpenSSH hops (such as saved
 // xops inventory node IDs or aliases inherited onto ProvenanceOpenSSHDerived
-// nodes) through provider.ResolveProxyJumpChain while preserving OpenSSH-origin
-// "openssh:..." hops verbatim so unconfigured single-label OpenSSH jumps are
-// not rejected by local inventory rules.
+// nodes) through provider.ResolveProxyJumpChain while validating and normalizing
+// OpenSSH-origin "openssh:..." hops via config.ParseTargetRef so unconfigured
+// single-label OpenSSH jumps are not rejected by local inventory rules while
+// casing drift ("OPENSSH:...") and malformed tokens fail closed.
 func resolveUnpersistedOpenSSHJumpChain(provider config.ConfigProvider, rawJump string) (string, error) {
-	parts := strings.Split(rawJump, ",")
-	out := make([]string, 0, len(parts))
-	for _, rawHop := range parts {
+	ps, err := proxySettingFromJumpString(rawJump)
+	if err != nil {
+		return "", err
+	}
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return "", nil
+	}
+	out := make([]string, 0, len(targets))
+	for _, rawHop := range targets {
 		hop := strings.TrimSpace(rawHop)
 		if hop == "" {
 			continue
 		}
 		if config.IsOpenSSHNodeID(hop) {
-			out = append(out, hop)
+			if hasControlOrLineSepChar(rawHop) || hasAnyWhitespace(hop) {
+				return "", fmt.Errorf("%w: invalid openssh jump host %q", ssh.ErrSSHOptionsValidation, rawHop)
+			}
+			ref, refErr := config.ParseTargetRef(hop)
+			if refErr != nil {
+				return "", fmt.Errorf("%w: invalid openssh jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, refErr)
+			}
+			if vErr := ref.Validate(); vErr != nil {
+				return "", fmt.Errorf("%w: invalid openssh jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, vErr)
+			}
+			out = append(out, ref.NormalizedString())
 			continue
 		}
 		if provider == nil {
+			ref, refErr := config.ParseTargetRef(hop)
+			if refErr != nil {
+				return "", fmt.Errorf("%w: invalid jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, refErr)
+			}
+			if vErr := ref.Validate(); vErr != nil {
+				return "", fmt.Errorf("%w: invalid jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, vErr)
+			}
 			out = append(out, hop)
 			continue
 		}
@@ -363,18 +441,30 @@ func resolveUnpersistedOpenSSHJumpChain(provider config.ConfigProvider, rawJump 
 // prefixTier4OpenSSHProxySetting prefixes unprefixed Tier-4 OpenSSH parser
 // ProxyJump hops with "openssh:" at the parser source while preserving any
 // shadowed ProxyCommand / ProxyCommand=none fallback slot carried by ps.
+// Raw ssh_config hops that already carry an "openssh:" prefix or fail
+// ParseTargetRef("openssh:" + hop) (including interior whitespace) fail closed.
 func prefixTier4OpenSSHProxySetting(ps ssh.ProxySetting) (ssh.ProxySetting, error) {
 	targets, ok := ps.JumpTargets()
 	if !ok {
 		return ps, nil
 	}
 	prefixed := make([]string, len(targets))
-	for i, hop := range targets {
-		if config.IsOpenSSHNodeID(hop) {
-			prefixed[i] = hop
-		} else {
-			prefixed[i] = config.OpenSSHNodePrefix + hop
+	for i, rawHop := range targets {
+		hop := strings.TrimSpace(rawHop)
+		if hop == "" || hasControlOrLineSepChar(rawHop) || hasAnyWhitespace(hop) {
+			return ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q", ssh.ErrSSHOptionsValidation, rawHop)
 		}
+		if config.IsOpenSSHNodeID(hop) {
+			return ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q: reserved %q prefix is not allowed in ssh_config", ssh.ErrSSHOptionsValidation, hop, config.OpenSSHNodePrefix)
+		}
+		ref, err := config.ParseTargetRef(config.OpenSSHNodePrefix + hop)
+		if err != nil {
+			return ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+		}
+		if err := ref.Validate(); err != nil {
+			return ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid OpenSSH ProxyJump hop %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+		}
+		prefixed[i] = ref.NormalizedString()
 	}
 	prefixedJump, err := ssh.NewProxyJump(prefixed...)
 	if err != nil {
