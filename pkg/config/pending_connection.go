@@ -61,14 +61,32 @@ func WithPendingNode(ctx context.Context, provider ConfigProvider, req EnsureNod
 	if pnp, ok := provider.(PendingNodeProvider); ok {
 		return pnp.WithPendingNode(ctx, req, fn)
 	}
-	if req.ExistingUpdate.JumpHost != "" {
-		if _, err := provider.ResolveProxyJumpChain(req.ExistingUpdate.JumpHost); err != nil {
-			return fmt.Errorf("resolve proxy jump %q failed: %w", req.ExistingUpdate.JumpHost, err)
-		}
-	}
 	resolved, err := ResolveTarget(provider, req.Target)
 	if err != nil {
 		return err
+	}
+	if req.ExistingUpdate.JumpHost != "" {
+		resolvedJump, jErr := provider.ResolveProxyJumpChain(req.ExistingUpdate.JumpHost)
+		if jErr != nil {
+			return fmt.Errorf("resolve proxy jump %q failed: %w", req.ExistingUpdate.JumpHost, jErr)
+		}
+		destID := resolved.NodeID
+		if resolved.MatchedNodeID != "" {
+			destID = resolved.MatchedNodeID
+		}
+		dest := ProxyJumpTarget{
+			NodeID:        destID,
+			Selector:      strings.TrimSpace(req.Target.Selector),
+			OpenSSHAlias:  strings.TrimSpace(resolved.OpenSSHAlias),
+			CanonicalHost: strings.TrimSpace(resolved.CanonicalHost),
+			Host:          strings.TrimSpace(resolved.Host),
+			Port:          resolved.Port,
+			User:          strings.TrimSpace(resolved.User),
+			IsAdHoc:       resolved.Created && resolved.OpenSSHAlias == "",
+		}
+		if cErr := ValidateProxyJumpChainCycle(provider, dest, resolvedJump, req.ExistingUpdate.JumpHost); cErr != nil {
+			return cErr
+		}
 	}
 	nodeID := resolved.NodeID
 	if resolved.MatchedNodeID != "" {
@@ -215,13 +233,14 @@ func (r *Repository) prepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 	r.pendingMu.Lock()
 	defer r.pendingMu.Unlock()
 	defaultUser := strings.TrimSpace(opts.DefaultUser)
-	if decision, err := r.findExistingNodeDecision(opts.Target, defaultUser); err != nil {
+	snap := r.provider.Snapshot()
+	if decision, err := r.findExistingNodeDecisionWithSnapshot(snap, opts.Target, defaultUser); err != nil {
 		return EnsureNodeResult{}, nil, err
 	} else if !decision.NeedsCreation && decision.MatchedNodeID != "" {
-		return r.prepareExistingNodeLocked(decision, opts)
+		return r.prepareExistingNodeLocked(snap, decision, opts)
 	}
 	var outcome ensureTransactionOutcome
-	cfg, _, _, err := prepareConfiguration(r.provider.Snapshot(), func(cfg *Configuration) error {
+	cfg, _, _, err := prepareConfiguration(snap, func(cfg *Configuration) error {
 		return r.ensureTargetInTransaction(cfg, opts, defaultUser, &outcome)
 	})
 	if err != nil {
@@ -240,21 +259,41 @@ func (r *Repository) prepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 	return EnsureNodeResult{NodeID: nodeID, Created: false}, nil, nil
 }
 
-func (r *Repository) prepareExistingNodeLocked(decision targetDecision, opts EnsureNodeOptions) (EnsureNodeResult, *pendingConnection, error) {
+func (r *Repository) validateExistingNodeJumpLocked(snap *Configuration, decision targetDecision, opts EnsureNodeOptions) (string, error) {
 	id := decision.MatchedNodeID
-	var resolvedJump string
-	if opts.ExistingUpdate.JumpHost != "" {
-		var err error
-		resolvedJump, err = r.ResolveProxyJumpChain(opts.ExistingUpdate.JumpHost)
-		if err != nil {
-			return EnsureNodeResult{}, nil, fmt.Errorf("resolve proxy jump %q failed: %w", opts.ExistingUpdate.JumpHost, err)
-		}
+	effectiveDecision := decision
+	if opts.ExistingUpdate.Enabled && !IsOpenSSHNodeID(id) && opts.ExistingUpdate.JumpHost != "" &&
+		!effectiveDecision.NormalizedTarget.HasProxyJump && effectiveDecision.NormalizedTarget.ProxyJump == "" {
+		effectiveDecision.NormalizedTarget.ProxyJump = opts.ExistingUpdate.JumpHost
+		effectiveDecision.NormalizedTarget.HasProxyJump = true
+	}
+	destTarget, err := r.validateMatchedDecisionJumpReturningDest(snap, effectiveDecision, opts.DefaultUser)
+	if err != nil {
+		return "", err
+	}
+	if opts.ExistingUpdate.JumpHost == "" {
+		return "", nil
+	}
+	resolvedJump, err := r.resolveProxyJumpChain(snap, opts.ExistingUpdate.JumpHost)
+	if err != nil {
+		return "", fmt.Errorf("resolve proxy jump %q failed: %w", opts.ExistingUpdate.JumpHost, err)
+	}
+	if cErr := validateProxyJumpChainCycleWithConfig(snap, r.openSSHParserOrNil(), destTarget, resolvedJump, opts.ExistingUpdate.JumpHost); cErr != nil {
+		return "", cErr
+	}
+	return resolvedJump, nil
+}
+
+func (r *Repository) prepareExistingNodeLocked(snap *Configuration, decision targetDecision, opts EnsureNodeOptions) (EnsureNodeResult, *pendingConnection, error) {
+	id := decision.MatchedNodeID
+	resolvedJump, err := r.validateExistingNodeJumpLocked(snap, decision, opts)
+	if err != nil {
+		return EnsureNodeResult{}, nil, err
 	}
 	if !opts.ExistingUpdate.Enabled || IsOpenSSHNodeID(id) {
 		r.syncPreparedExistingMetadataLocked(decision)
 		return EnsureNodeResult{NodeID: id}, nil, nil
 	}
-	snap := r.provider.Snapshot()
 	ver, err := nodeEntityVersion(snap, id)
 	if err != nil {
 		return EnsureNodeResult{}, nil, fmt.Errorf("resolve node %q reference: %w", id, err)
@@ -299,11 +338,34 @@ func (r *Repository) prepareExistingNodeLocked(decision targetDecision, opts Ens
 	if !ok {
 		return EnsureNodeResult{}, nil, fmt.Errorf("resolve staged identity %q for node %q: %w", stagedNode.IdentityRef, id, ErrIdentityNotFound)
 	}
+	if err := r.validateStagedSavedNodeJumpCycle(stagedCfg, id, stagedNode, stagedHost, stagedIdentity, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget.Selector); err != nil {
+		return EnsureNodeResult{}, nil, fmt.Errorf("validate staged update for node %q: %w", id, err)
+	}
 	entry, err := r.registerPendingUpdateLocked(id, baseRef, stagedNode, stagedHost, stagedIdentity, decision.OpenSSHAlias, decision.CanonicalHost)
 	if err != nil {
 		return EnsureNodeResult{}, nil, err
 	}
 	return EnsureNodeResult{NodeID: id}, entry, nil
+}
+
+func (r *Repository) validateStagedSavedNodeJumpCycle(
+	cfg *Configuration,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	openSSHAlias, canonicalHost, selector string,
+) error {
+	ps, err := parseOptionalNodeProxyJump(node.ProxyJump)
+	if err != nil {
+		return err
+	}
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return nil
+	}
+	dest := buildProxyJumpTargetFromSavedNode(nodeID, openSSHAlias, canonicalHost, selector, host, identity)
+	return validateProxyJumpChainCycleWithConfig(cfg, r.openSSHParserOrNil(), dest, strings.Join(targets, ","), node.ProxyJump)
 }
 
 func applyPendingNodeUpdate(

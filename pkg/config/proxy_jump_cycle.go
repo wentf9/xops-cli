@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -15,34 +16,36 @@ const maxProxyJumpWalkDepth = 64
 // resolved ProxyJump chain is being validated for direct self-loops,
 // duplicate hops, and transitive multi-hop cycles across Tiers 1, 2, and 4.
 type ProxyJumpTarget struct {
-	NodeID       string
-	Selector     string
-	OpenSSHAlias string
-	Host         string
-	Port         uint16
-	User         string
-	IsAdHoc      bool
+	NodeID        string
+	Selector      string
+	OpenSSHAlias  string
+	CanonicalHost string
+	Host          string
+	Port          uint16
+	User          string
+	IsAdHoc       bool
 }
 
 type jumpNodeIdentity struct {
-	label         string
-	canonicalID   string
-	aliases       []string
-	openSSHAlias  string
-	isOpenSSH     bool
-	openSSHRef    TargetRef
-	hasOpenSSHRef bool
-	endpoint      ssh.Endpoint
-	hasEndpoint   bool
-	user          string
-	explicitUser  bool
-	isSavedNode   bool
-	isDirect      bool
-	nextRawJump   string
+	label          string
+	canonicalID    string
+	aliases        []string
+	openSSHAliases []string
+	openSSHAlias   string
+	isOpenSSH      bool
+	openSSHRef     TargetRef
+	hasOpenSSHRef  bool
+	endpoint       ssh.Endpoint
+	hasEndpoint    bool
+	user           string
+	explicitUser   bool
+	isSavedNode    bool
+	isDirect       bool
+	nextRawJump    string
 }
 
 func (id jumpNodeIdentity) hasIdentity() bool {
-	return id.canonicalID != "" || id.hasEndpoint || id.openSSHAlias != "" || len(id.aliases) > 0
+	return id.canonicalID != "" || id.hasEndpoint || id.openSSHAlias != "" || len(id.aliases) > 0 || len(id.openSSHAliases) > 0
 }
 
 func (id jumpNodeIdentity) effectivePort() uint16 {
@@ -75,6 +78,12 @@ func ValidateProxyJumpChainCycle(provider ConfigProvider, dest ProxyJumpTarget, 
 	return validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, resolvedChain, rawJump)
 }
 
+type jumpWalkOptions struct {
+	graphMode bool
+	lookup    map[string][]string
+	aliases   map[string]string
+}
+
 func validateProxyJumpChainCycleWithConfig(
 	cfg *Configuration,
 	openSSH *OpenSSHParser,
@@ -105,7 +114,90 @@ func validateProxyJumpChainCycleWithConfig(
 	if strings.TrimSpace(rawJump) == "" {
 		rawJump = resolvedChain
 	}
-	return walkJumpChain(cfg, openSSH, path, hops, destIdent.label, rawJump, 0)
+	return walkJumpChain(cfg, openSSH, jumpWalkOptions{}, path, hops, destIdent.label, rawJump, 0)
+}
+
+func validateSavedNodeProxyJumpGraphCycle(
+	cfg *Configuration,
+	lookup map[string][]string,
+	aliases map[string]string,
+	nodeID string,
+	node models.Node,
+	targets []string,
+) error {
+	if cfg == nil || len(targets) == 0 {
+		return nil
+	}
+	destIdent := buildSavedJumpNodeIdentity(cfg, nodeID)
+	var path []jumpNodeIdentity
+	if destIdent.hasIdentity() {
+		path = []jumpNodeIdentity{destIdent}
+	}
+	opts := jumpWalkOptions{
+		graphMode: true,
+		lookup:    lookup,
+		aliases:   aliases,
+	}
+	return walkJumpChain(cfg, nil, opts, path, targets, destIdent.label, node.ProxyJump, 0)
+}
+
+func findNodeChainFlattenCycleHop(
+	cfg *Configuration,
+	lookup map[string][]string,
+	aliases map[string]string,
+	nodeID string,
+	node models.Node,
+) (string, []string, bool) {
+	if cfg == nil || strings.TrimSpace(node.ProxyJump) == "" {
+		return "", nil, false
+	}
+	ps, err := parseOptionalNodeProxyJump(node.ProxyJump)
+	if err != nil {
+		return "", nil, false
+	}
+	targets, ok := ps.JumpTargets()
+	if !ok || len(targets) < 2 {
+		return "", nil, false
+	}
+	opts := jumpWalkOptions{
+		graphMode: true,
+		lookup:    lookup,
+		aliases:   aliases,
+	}
+	destIdent := buildSavedJumpNodeIdentity(cfg, nodeID)
+	hopIdents := make([]jumpNodeIdentity, 0, len(targets))
+	for _, hop := range targets {
+		ident, hErr := buildHopJumpIdentityWithOpts(cfg, nil, opts, hop)
+		if hErr != nil {
+			return "", nil, false
+		}
+		hopIdents = append(hopIdents, ident)
+	}
+	var basePath []jumpNodeIdentity
+	if destIdent.hasIdentity() {
+		basePath = []jumpNodeIdentity{destIdent}
+	}
+	for i := len(hopIdents) - 1; i >= 0; i-- {
+		ident := hopIdents[i]
+		if strings.TrimSpace(ident.nextRawJump) == "" {
+			continue
+		}
+		nextHops, nErr := resolveUpstreamHopsForIdentityWithOpts(cfg, nil, opts, ident)
+		if nErr != nil || len(nextHops) == 0 {
+			continue
+		}
+		childPath := make([]jumpNodeIdentity, 0, len(basePath)+len(hopIdents)-i)
+		childPath = append(childPath, basePath...)
+		for j := len(hopIdents) - 1; j >= i; j-- {
+			childPath = append(childPath, hopIdents[j])
+		}
+		wErr := walkJumpChain(cfg, nil, opts, childPath, nextHops, destIdent.label, node.ProxyJump, 1)
+		var cycleErr *ssh.ProxyCycleError
+		if errors.As(wErr, &cycleErr) {
+			return targets[i], cycleErr.Path, true
+		}
+	}
+	return "", nil, false
 }
 
 func splitValidatedJumpHops(chain string) ([]string, error) {
@@ -127,6 +219,7 @@ func splitValidatedJumpHops(chain string) ([]string, error) {
 func walkJumpChain(
 	cfg *Configuration,
 	openSSH *OpenSSHParser,
+	opts jumpWalkOptions,
 	path []jumpNodeIdentity,
 	hops []string,
 	rootLabel, rawJump string,
@@ -137,7 +230,7 @@ func walkJumpChain(
 	}
 	hopIdents := make([]jumpNodeIdentity, 0, len(hops))
 	for _, hop := range hops {
-		ident, err := buildHopJumpIdentity(cfg, openSSH, hop)
+		ident, err := buildHopJumpIdentityWithOpts(cfg, openSSH, opts, hop)
 		if err != nil {
 			return err
 		}
@@ -156,7 +249,7 @@ func walkJumpChain(
 		if strings.TrimSpace(ident.nextRawJump) == "" {
 			continue
 		}
-		nextHops, err := resolveUpstreamHopsForIdentity(cfg, openSSH, ident)
+		nextHops, err := resolveUpstreamHopsForIdentityWithOpts(cfg, openSSH, opts, ident)
 		if err != nil {
 			return err
 		}
@@ -172,14 +265,14 @@ func walkJumpChain(
 		for j := len(hopIdents) - 1; j >= i; j-- {
 			childPath = append(childPath, hopIdents[j])
 		}
-		if err := walkJumpChain(cfg, openSSH, childPath, nextHops, rootLabel, rawJump, depth+1); err != nil {
+		if err := walkJumpChain(cfg, openSSH, opts, childPath, nextHops, rootLabel, rawJump, depth+1); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func resolveUpstreamHopsForIdentity(cfg *Configuration, openSSH *OpenSSHParser, ident jumpNodeIdentity) ([]string, error) {
+func resolveUpstreamHopsForIdentityWithOpts(cfg *Configuration, openSSH *OpenSSHParser, opts jumpWalkOptions, ident jumpNodeIdentity) ([]string, error) {
 	ps, err := parseOptionalNodeProxyJump(ident.nextRawJump)
 	if err != nil {
 		return nil, err
@@ -187,6 +280,9 @@ func resolveUpstreamHopsForIdentity(cfg *Configuration, openSSH *OpenSSHParser, 
 	targets, ok := ps.JumpTargets()
 	if !ok {
 		return nil, nil
+	}
+	if opts.graphMode {
+		return validateJumpTargetsSyntax(targets)
 	}
 	if ident.isSavedNode {
 		resolved, rErr := ResolveProxyJumpChainWithConfig(cfg, openSSH, strings.Join(targets, ","))
@@ -232,7 +328,11 @@ func buildDestJumpIdentity(cfg *Configuration, openSSH *OpenSSHParser, dest Prox
 	if nodeID != "" && !IsOpenSSHNodeID(nodeID) && !dest.IsAdHoc && cfg != nil && cfg.Nodes != nil {
 		if savedID, ok := resolveSavedJumpNodeID(cfg, nodeID); ok {
 			ident := buildSavedJumpNodeIdentity(cfg, savedID)
-			appendUniqueJumpAlias(&ident.aliases, dest.OpenSSHAlias, selector)
+			if ident.openSSHAlias == "" && strings.TrimSpace(dest.OpenSSHAlias) != "" {
+				ident.openSSHAlias = strings.TrimSpace(dest.OpenSSHAlias)
+			}
+			appendUniqueJumpAlias(&ident.aliases, dest.OpenSSHAlias, dest.CanonicalHost, selector)
+			appendUniqueJumpAlias(&ident.openSSHAliases, dest.OpenSSHAlias, dest.CanonicalHost)
 			return ident, nil
 		}
 	}
@@ -275,9 +375,11 @@ func buildSavedJumpNodeIdentity(cfg *Configuration, nodeID string) jumpNodeIdent
 		return ident
 	}
 	ident.nextRawJump = node.ProxyJump
+	ident.openSSHAlias = strings.TrimSpace(node.OpenSSHAlias)
 	appendUniqueJumpAlias(&ident.aliases, nodeID)
 	appendUniqueJumpAlias(&ident.aliases, node.Alias...)
-	appendUniqueJumpAlias(&ident.aliases, node.OpenSSHAlias)
+	appendUniqueJumpAlias(&ident.aliases, node.OpenSSHAlias, node.CanonicalHost)
+	appendUniqueJumpAlias(&ident.openSSHAliases, node.OpenSSHAlias, node.CanonicalHost)
 	if cfg.Hosts != nil {
 		if host, hOK := cfg.Hosts.Get(node.HostRef); hOK {
 			appendUniqueJumpAlias(&ident.aliases, host.Alias...)
@@ -319,7 +421,8 @@ func buildOpenSSHJumpIdentity(openSSH *OpenSSHParser, rawID string, dest ProxyJu
 	if dest.OpenSSHAlias != "" {
 		ident.openSSHAlias = strings.TrimSpace(dest.OpenSSHAlias)
 	}
-	appendUniqueJumpAlias(&ident.aliases, ref.Host, dest.OpenSSHAlias)
+	appendUniqueJumpAlias(&ident.aliases, ref.Host, dest.OpenSSHAlias, dest.CanonicalHost)
+	appendUniqueJumpAlias(&ident.openSSHAliases, ref.Host, dest.OpenSSHAlias, dest.CanonicalHost)
 
 	hostAddr := ref.Host
 	port := normalizedHostPort(ref.Port)
@@ -328,19 +431,29 @@ func buildOpenSSHJumpIdentity(openSSH *OpenSSHParser, rawID string, dest ProxyJu
 			return jumpNodeIdentity{}, fmt.Errorf("resolve openssh jump %q: %w", rawID, pErr)
 		}
 		if openSSH.cfg != nil {
-			if openSSH.HasHost(ref.Host) {
+			if openSSH.HasHost(ref.Host) || (dest.OpenSSHAlias != "" && openSSH.HasHost(dest.OpenSSHAlias)) {
 				ident.isDirect = false
 			}
-			vnode, vhost, vident, vErr := openSSH.GetVirtualNode(ref.formatNormalizedBody())
+			var (
+				vnode  models.Node
+				vhost  models.Host
+				vident models.Identity
+				vErr   error
+			)
+			if orig := strings.TrimSpace(dest.OpenSSHAlias); orig != "" && !strings.EqualFold(orig, ref.Host) {
+				vnode, vhost, vident, vErr = openSSH.getVirtualNodeWithCanonical(orig, ref.Host, ref.User, ref.Port, ref.formatNormalizedBody())
+			} else {
+				vnode, vhost, vident, vErr = openSSH.GetVirtualNode(ref.formatNormalizedBody())
+			}
 			if vErr != nil {
 				return jumpNodeIdentity{}, fmt.Errorf("resolve openssh jump %q: %w", rawID, vErr)
 			}
 			hostAddr = StripHostBrackets(vhost.Address)
 			port = normalizedHostPort(vhost.Port)
 			ident.nextRawJump = vnode.ProxyJump
-			if ref.User != "" || strings.TrimSpace(firstSSHConfigKeyValue(openSSH.cfg, ref.Host, "User")) != "" {
-				ident.user = strings.TrimSpace(vident.User)
-				ident.explicitUser = ident.user != ""
+			if u := strings.TrimSpace(vident.User); u != "" {
+				ident.user = u
+				ident.explicitUser = true
 			}
 		}
 	}
@@ -368,11 +481,15 @@ func buildDirectDestJumpIdentity(nodeID, selector string, dest ProxyJumpTarget) 
 		openSSHAlias: strings.TrimSpace(dest.OpenSSHAlias),
 		isDirect:     true,
 	}
-	appendUniqueJumpAlias(&ident.aliases, dest.OpenSSHAlias)
+	appendUniqueJumpAlias(&ident.aliases, dest.OpenSSHAlias, dest.CanonicalHost)
+	appendUniqueJumpAlias(&ident.openSSHAliases, dest.OpenSSHAlias, dest.CanonicalHost)
 	if selector != "" && !IsOpenSSHNodeID(selector) {
 		appendUniqueJumpAlias(&ident.aliases, selector)
 		if ref, err := ParseTargetRef(selector); err == nil && !ref.OpenSSH && ref.Host != "" {
 			appendUniqueJumpAlias(&ident.aliases, ref.Host)
+			if ident.openSSHAlias != "" {
+				appendUniqueJumpAlias(&ident.openSSHAliases, ref.Host)
+			}
 		}
 	}
 
@@ -406,7 +523,15 @@ func buildDirectDestJumpIdentity(nodeID, selector string, dest ProxyJumpTarget) 
 	return ident
 }
 
-func buildHopJumpIdentity(cfg *Configuration, openSSH *OpenSSHParser, hop string) (jumpNodeIdentity, error) {
+func buildGraphHopJumpIdentity(cfg *Configuration, lookup map[string][]string, aliases map[string]string, hop string) (jumpNodeIdentity, error) {
+	return buildHopJumpIdentityWithOpts(cfg, nil, jumpWalkOptions{
+		graphMode: true,
+		lookup:    lookup,
+		aliases:   aliases,
+	}, hop)
+}
+
+func buildHopJumpIdentityWithOpts(cfg *Configuration, openSSH *OpenSSHParser, opts jumpWalkOptions, hop string) (jumpNodeIdentity, error) {
 	if hasControlOrLineSepChar(hop) {
 		return jumpNodeIdentity{}, fmt.Errorf("%w: invalid jump host %q: contains control character", ssh.ErrSSHOptionsValidation, hop)
 	}
@@ -416,6 +541,13 @@ func buildHopJumpIdentity(cfg *Configuration, openSSH *OpenSSHParser, hop string
 	if cfg != nil && cfg.Nodes != nil {
 		if savedID, ok := resolveSavedJumpNodeID(cfg, hop); ok {
 			return buildSavedJumpNodeIdentity(cfg, savedID), nil
+		}
+		if opts.graphMode {
+			if ref, err := ParseTargetRef(hop); err == nil && !ref.OpenSSH {
+				if localTargets := resolveLocalJumpTargets(cfg, opts.lookup, opts.aliases, hop, ref); len(localTargets) == 1 {
+					return buildSavedJumpNodeIdentity(cfg, localTargets[0]), nil
+				}
+			}
 		}
 	}
 	ref, err := ParseTargetRef(hop)
@@ -479,15 +611,23 @@ func sameDirectOrEndpointJumpIdentity(a, b jumpNodeIdentity) bool {
 }
 
 func sameOpenSSHAliasJumpIdentity(a, b jumpNodeIdentity) bool {
-	aliasA := strings.TrimSpace(a.openSSHAlias)
-	aliasB := strings.TrimSpace(b.openSSHAlias)
-	if aliasA == "" || aliasB == "" || !strings.EqualFold(aliasA, aliasB) {
+	if len(a.openSSHAliases) == 0 || len(b.openSSHAliases) == 0 {
 		return false
 	}
 	if a.effectivePort() != b.effectivePort() {
 		return false
 	}
-	return jumpUsersCompatible(a, b)
+	if !jumpUsersCompatible(a, b) {
+		return false
+	}
+	for _, aliasA := range a.openSSHAliases {
+		for _, aliasB := range b.openSSHAliases {
+			if strings.EqualFold(aliasA, aliasB) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func directJumpMatchesAlias(target, direct jumpNodeIdentity) bool {
@@ -553,19 +693,13 @@ func wrapProxyJumpCycleError(rawJump, destLabel, cycleNode string, path []string
 	return fmt.Errorf("resolve proxy jump %q failed: %w", rawJump, cycleErr)
 }
 
-// validateVirtualJumpTargets normalizes a virtual OpenSSH node's base ProxyJump
-// targets: non-OpenSSH hops are resolved via provider.ResolveProxyJumpChain,
+// validateVirtualJumpTargetsWithConfig normalizes a virtual OpenSSH node's base
+// ProxyJump targets: non-OpenSSH hops are resolved via ResolveProxyJumpChainWithConfig,
 // while OpenSSH-prefixed hops validate syntax and check any broken OpenSSHParser.
-func validateVirtualJumpTargets(provider ConfigProvider, targets []string) (string, error) {
+func validateVirtualJumpTargetsWithConfig(cfg *Configuration, openSSH *OpenSSHParser, targets []string) (string, error) {
 	validated, err := validateJumpTargetsSyntax(targets)
 	if err != nil {
 		return "", err
-	}
-	var openSSH *OpenSSHParser
-	if provider != nil {
-		if r, _ := resolveTargetHelper(provider); r != nil && r.provider != nil {
-			openSSH = r.provider.openSSH
-		}
 	}
 	out := make([]string, 0, len(validated))
 	for _, hop := range validated {
@@ -576,11 +710,11 @@ func validateVirtualJumpTargets(provider ConfigProvider, targets []string) (stri
 			out = append(out, hop)
 			continue
 		}
-		if provider == nil {
+		if cfg == nil {
 			out = append(out, hop)
 			continue
 		}
-		resolved, rErr := provider.ResolveProxyJumpChain(hop)
+		resolved, rErr := ResolveProxyJumpChainWithConfig(cfg, openSSH, hop)
 		if rErr != nil {
 			return "", rErr
 		}
@@ -593,13 +727,14 @@ func validateVirtualJumpTargets(provider ConfigProvider, targets []string) (stri
 
 // buildProxyJumpTargetFromSavedNode constructs a ProxyJumpTarget from a saved
 // node triple for shared cycle validation.
-func buildProxyJumpTargetFromSavedNode(nodeID, openSSHAlias, selector string, host models.Host, ident models.Identity) ProxyJumpTarget {
+func buildProxyJumpTargetFromSavedNode(nodeID, openSSHAlias, canonicalHost, selector string, host models.Host, ident models.Identity) ProxyJumpTarget {
 	return ProxyJumpTarget{
-		NodeID:       nodeID,
-		Selector:     selector,
-		OpenSSHAlias: openSSHAlias,
-		Host:         StripHostBrackets(host.Address),
-		Port:         normalizedHostPort(host.Port),
-		User:         strings.TrimSpace(ident.User),
+		NodeID:        nodeID,
+		Selector:      selector,
+		OpenSSHAlias:  openSSHAlias,
+		CanonicalHost: canonicalHost,
+		Host:          StripHostBrackets(host.Address),
+		Port:          normalizedHostPort(host.Port),
+		User:          strings.TrimSpace(ident.User),
 	}
 }

@@ -114,6 +114,11 @@ func isTargetMissingError(err error) bool {
 
 func (a *SSHAdapter) resolveConnectionSnapshot(nodeID string) (config.ConnectionSnapshot, SessionAuth, bool, error) {
 	tier1Auth, hasTier1Auth := a.getSessionOverride(nodeID)
+	if hasTier1Auth {
+		if err := validateSessionAuthOpenSSHSelectors(tier1Auth); err != nil {
+			return config.ConnectionSnapshot{}, SessionAuth{}, false, err
+		}
+	}
 	if config.IsOpenSSHNodeID(nodeID) && hasTier1Auth && strings.TrimSpace(tier1Auth.OriginalHost) != "" {
 		if origProvider, ok := a.cfgProvider.(interface {
 			ResolveConnectionWithOrigin(string, string) (config.ConnectionSnapshot, error)
@@ -346,14 +351,20 @@ func buildPolicyProxyJumpTarget(nodeID string, snapshot config.ConnectionSnapsho
 		Selector: strings.TrimSpace(nodeID),
 	}
 	if !hasSnapshot {
+		if dest.NodeID != "" {
+			if ref, err := config.ParseTargetRef(dest.NodeID); err == nil && ref.User != "" {
+				dest.User = ref.User
+			} else {
+				dest.User = effectiveSnapshotUser("")
+			}
+		}
 		return dest
 	}
 	dest.OpenSSHAlias = strings.TrimSpace(snapshot.Node.OpenSSHAlias)
+	dest.CanonicalHost = strings.TrimSpace(snapshot.Node.CanonicalHost)
 	dest.Host = strings.TrimSpace(snapshot.Host.Address)
 	dest.Port = snapshot.Host.Port
-	if snapshot.Provenance != config.ProvenanceOpenSSHVirtual {
-		dest.User = strings.TrimSpace(snapshot.Identity.User)
-	}
+	dest.User = effectiveSnapshotUser(snapshot.Identity.User)
 	dest.IsAdHoc = snapshot.Provenance == config.ProvenanceAdHocPending
 	return dest
 }
@@ -668,7 +679,8 @@ func (p EffectivePolicy) controlTargetContextWithEnv(nodeID string, env ssh.Envi
 	if p.originalHost != "" {
 		origHost = p.originalHost
 	}
-	if p.hasTier1Auth && strings.TrimSpace(p.tier1Auth.OriginalHost) != "" {
+	if p.hasTier1Auth && validateOpenSSHControlSelector("session original host", p.tier1Auth.OriginalHost) == nil &&
+		strings.TrimSpace(p.tier1Auth.OriginalHost) != "" {
 		origHost = strings.TrimSpace(p.tier1Auth.OriginalHost)
 		if cleanOrig, ok := config.OpenSSHOriginalHost(origHost); ok {
 			origHost = cleanOrig

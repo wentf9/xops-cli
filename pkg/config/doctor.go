@@ -481,6 +481,22 @@ func diagnoseV2ProxyJumps(v2 *ConfigurationV2) []DoctorIssue {
 			FixSummary: fmt.Sprintf("remove cyclic proxy_jump hop %q from node %q", cyc.hop, cyc.from),
 		})
 	}
+	for _, nodeID := range nodeIDs {
+		node, ok := cfg.Nodes.Get(nodeID)
+		if !ok || strings.TrimSpace(node.ProxyJump) == "" {
+			continue
+		}
+		if hop, path, found := findNodeChainFlattenCycleHop(cfg, lookup, aliases, nodeID, node); found {
+			issues = append(issues, DoctorIssue{
+				Code:       "proxy_jump_cycle",
+				Entity:     "node:" + nodeID,
+				Severity:   DoctorSeverityError,
+				Message:    fmt.Sprintf("proxy_jump chain-flattening cycle detected: %s", strings.Join(path, " -> ")),
+				Fixable:    true,
+				FixSummary: fmt.Sprintf("remove cyclic proxy_jump hop %q from node %q", hop, nodeID),
+			})
+		}
+	}
 	return issues
 }
 
@@ -506,6 +522,7 @@ func diagnoseNodeProxyJumpHops(
 	} else if ps.Kind() != ssh.ProxyJump {
 		return nil, nil
 	}
+	var seenIdents []jumpNodeIdentity
 	for rawHop := range strings.SplitSeq(strings.TrimSpace(node.ProxyJump), ",") {
 		hop := strings.TrimSpace(rawHop)
 		if hop == "" || strings.EqualFold(hop, "none") {
@@ -544,6 +561,20 @@ func diagnoseNodeProxyJumpHops(
 				FixSummary: fmt.Sprintf("remove self-referencing proxy_jump hop %q from node %q", hop, nodeID),
 			})
 			continue
+		}
+		if ident, iErr := buildGraphHopJumpIdentity(cfg, lookup, aliases, hop); iErr == nil {
+			if findMatchingJumpIdentity(seenIdents, ident) >= 0 {
+				issues = append(issues, DoctorIssue{
+					Code:       "proxy_jump_duplicate",
+					Entity:     "node:" + nodeID,
+					Severity:   DoctorSeverityError,
+					Message:    fmt.Sprintf("proxy_jump hop %q duplicates an earlier hop on node %q", hop, nodeID),
+					Fixable:    true,
+					FixSummary: fmt.Sprintf("remove duplicate proxy_jump hop %q from node %q", hop, nodeID),
+				})
+				continue
+			}
+			seenIdents = append(seenIdents, ident)
 		}
 		if ref.OpenSSH {
 			continue
@@ -807,6 +838,41 @@ func repairV2ProxyJumps(v2 *ConfigurationV2) []DoctorFix {
 			Summary: fmt.Sprintf("removed cyclic proxy_jump hop %q from node %q (%s)", cyc.hop, cyc.from, strings.Join(cyc.path, " -> ")),
 		})
 	}
+
+	// Iteratively break any remaining right-to-left chain-flattening cycles deterministically.
+	for {
+		cfg = configurationFromV2Unchecked(v2)
+		lookup, aliases, _ = buildIndexes(cfg, false)
+		nodeIDs := sortedMapKeys(v2.Nodes)
+		repairedAny := false
+		for _, nodeID := range nodeIDs {
+			node, ok := cfg.Nodes.Get(nodeID)
+			if !ok || strings.TrimSpace(node.ProxyJump) == "" {
+				continue
+			}
+			hop, path, found := findNodeChainFlattenCycleHop(cfg, lookup, aliases, nodeID, node)
+			if !found {
+				continue
+			}
+			nodeV2 := v2.Nodes[nodeID]
+			updatedChain, removed := removeJumpHopFromChain(nodeV2.ProxyJump, hop)
+			if !removed {
+				continue
+			}
+			nodeV2.ProxyJump = updatedChain
+			v2.Nodes[nodeID] = nodeV2
+			fixes = append(fixes, DoctorFix{
+				Code:    "proxy_jump_cycle",
+				Entity:  "node:" + nodeID,
+				Summary: fmt.Sprintf("removed cyclic proxy_jump hop %q from node %q (%s)", hop, nodeID, strings.Join(path, " -> ")),
+			})
+			repairedAny = true
+			break
+		}
+		if !repairedAny {
+			break
+		}
+	}
 	return fixes
 }
 
@@ -845,6 +911,7 @@ func filterValidNonSelfJumpHops(
 	node models.Node,
 ) ([]string, []DoctorFix) {
 	var kept []string
+	var seenIdents []jumpNodeIdentity
 	var fixes []DoctorFix
 	for rawHop := range strings.SplitSeq(strings.TrimSpace(node.ProxyJump), ",") {
 		hop := strings.TrimSpace(rawHop)
@@ -875,6 +942,17 @@ func filterValidNonSelfJumpHops(
 				Summary: fmt.Sprintf("removed self-referencing proxy_jump hop %q from node %q", hop, nodeID),
 			})
 			continue
+		}
+		if ident, iErr := buildGraphHopJumpIdentity(cfg, lookup, aliases, hop); iErr == nil {
+			if findMatchingJumpIdentity(seenIdents, ident) >= 0 {
+				fixes = append(fixes, DoctorFix{
+					Code:    "proxy_jump_duplicate",
+					Entity:  "node:" + nodeID,
+					Summary: fmt.Sprintf("removed duplicate proxy_jump hop %q from node %q", hop, nodeID),
+				})
+				continue
+			}
+			seenIdents = append(seenIdents, ident)
 		}
 		kept = append(kept, hop)
 	}

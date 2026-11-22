@@ -572,6 +572,12 @@ func (o *ScpOptions) preparePendingTarget(ctx context.Context, provider config.C
 		}
 		return scpPendingTarget{}, err
 	}
+	if err := o.validateSurvivingScpTargetJump(provider, req.Target); err != nil {
+		if role != "" {
+			return scpPendingTarget{}, fmt.Errorf("connect %s failed: %w", role, err)
+		}
+		return scpPendingTarget{}, err
+	}
 	return scpPendingTarget{
 		label:            label,
 		role:             role,
@@ -579,6 +585,14 @@ func (o *ScpOptions) preparePendingTarget(ctx context.Context, provider config.C
 		specificPassword: specificPassword,
 		ensureReq:        req,
 	}, nil
+}
+
+func (o *ScpOptions) validateSurvivingScpTargetJump(provider config.ConfigProvider, target config.ConnectionTarget) error {
+	if provider == nil || !o.hasExcludeFlags() || o.JumpHost == "" || ssh.IsDisabledProxyJump(o.JumpHost) {
+		return nil
+	}
+	_, err := config.ResolveTarget(provider, target)
+	return err
 }
 
 func (o *ScpOptions) withPendingScpTargets(
@@ -1023,6 +1037,12 @@ func (o *ScpOptions) planBatchTransfer(ctx context.Context, provider config.Conf
 	if o.Alias != "" {
 		return scpTransferPlan{}, fmt.Errorf("--alias %q cannot be used with batch selectors (--host, --tag, --ifile)", o.Alias)
 	}
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return scpTransferPlan{}, err
+	}
+	if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
+		return scpTransferPlan{}, err
+	}
 	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
 		return scpTransferPlan{}, err
 	}
@@ -1131,6 +1151,9 @@ func (o *ScpOptions) planBatchTaggedTargets(
 		if reqErr != nil {
 			return nil, fmt.Errorf("prepare tagged scp node %q failed: %w", nodeID, reqErr)
 		}
+		if jErr := o.validateSurvivingScpTargetJump(provider, req.Target); jErr != nil {
+			return nil, fmt.Errorf("prepare tagged scp node %q failed: %w", nodeID, jErr)
+		}
 		targets = append(targets, scpPendingTarget{
 			label:            nodeID,
 			path:             canonAddr,
@@ -1175,6 +1198,9 @@ func (o *ScpOptions) planBatchHostTargets(
 		req, reqErr := o.buildScpEnsureOptions(provider, canonAddr, h.Password)
 		if reqErr != nil {
 			return nil, fmt.Errorf("[%s] connect failed: %w", h.Host, reqErr)
+		}
+		if jErr := o.validateSurvivingScpTargetJump(provider, req.Target); jErr != nil {
+			return nil, fmt.Errorf("[%s] connect failed: %w", h.Host, jErr)
 		}
 		targets = append(targets, scpPendingTarget{
 			label:            h.Host,
@@ -1247,7 +1273,7 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 		in.HostNameOverride = o.overriddenExcludeHost(fallbackExpandHost)
 		return cmdutils.BuildExcludeTargetInfo(in), nil
 	}
-	if target, tErr := o.resolveTargetForPath(canonAddr); tErr == nil && target.Selector != "" {
+	if target, tErr := o.resolveTargetForPathIdentity(canonAddr); tErr == nil && target.Selector != "" {
 		resolved, rErr := config.ResolveTarget(provider, target)
 		if rErr != nil {
 			return cmdutils.BuildExcludeTargetInfo(in), fmt.Errorf("resolve excluded host %q: %w", canonAddr.Host, rErr)
@@ -1381,6 +1407,9 @@ func (o *ScpOptions) canonicalizeEndpoints(ctx context.Context, provider config.
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
 	}
+	if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
+		return err
+	}
 	if provider == nil {
 		return nil
 	}
@@ -1412,6 +1441,9 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return p, err
 	}
+	if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
+		return p, err
+	}
 	if p.Host == "" {
 		return p, nil
 	}
@@ -1439,7 +1471,7 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 	}
 	var matchedSavedNode bool
 	if provider != nil {
-		target, tErr := o.resolveTargetForPath(p)
+		target, tErr := o.resolveTargetForPathWithJump(p, !o.hasExcludeFlags())
 		if tErr != nil {
 			return p, tErr
 		}
@@ -1561,6 +1593,14 @@ func (o *ScpOptions) resolvePathInfo(path PathInfo) (string, string, uint16, err
 }
 
 func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarget, error) {
+	return o.resolveTargetForPathWithJump(path, true)
+}
+
+func (o *ScpOptions) resolveTargetForPathIdentity(path PathInfo) (config.ConnectionTarget, error) {
+	return o.resolveTargetForPathWithJump(path, false)
+}
+
+func (o *ScpOptions) resolveTargetForPathWithJump(path PathInfo, attachCLIJump bool) (config.ConnectionTarget, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return config.ConnectionTarget{}, err
 	}
@@ -1573,6 +1613,15 @@ func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarge
 	}
 
 	user, hasUser, port, hasPort := o.resolveUserAndPort(path)
+	proxyJump := o.JumpHost
+	hasProxyJump := o.JumpHost != ""
+	if !attachCLIJump && o.JumpHost != "" {
+		if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
+			return config.ConnectionTarget{}, err
+		}
+		proxyJump = "none"
+		hasProxyJump = true
+	}
 
 	return config.ConnectionTarget{
 		Selector:     strings.TrimSpace(host),
@@ -1581,8 +1630,8 @@ func (o *ScpOptions) resolveTargetForPath(path PathInfo) (config.ConnectionTarge
 		HasUser:      hasUser,
 		Port:         port,
 		HasPort:      hasPort,
-		ProxyJump:    o.JumpHost,
-		HasProxyJump: o.JumpHost != "",
+		ProxyJump:    proxyJump,
+		HasProxyJump: hasProxyJump,
 	}, nil
 }
 

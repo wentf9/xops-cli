@@ -117,6 +117,9 @@ func validateProxyJumpGraph(cfg *Configuration, lookup map[string][]string, alia
 		if err != nil {
 			return err
 		}
+		if err := validateSavedNodeProxyJumpGraphCycle(cfg, lookup, aliases, nodeID, node, targets); err != nil {
+			return fmt.Errorf("%w: %w", ErrSchemaValidation, err)
+		}
 		adj[nodeID] = edges
 	}
 	return detectProxyJumpCycles(nodeIDs, adj)

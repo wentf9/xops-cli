@@ -210,9 +210,9 @@ func ValidateNodeAliases(aliases []string) error {
 
 // ValidateConcreteHostAddress ensures raw is a concrete host address or hostname
 // suitable for persisted inventory host records, rejecting empty values, control
-// or line-separator characters, internal whitespace, malformed brackets, '@'
-// user delimiters, non-IPv6 ':' delimiters, and the reserved "openssh:" virtual
-// namespace prefix (case-insensitive).
+// or line-separator characters, internal whitespace, malformed brackets, ','
+// separators, '@' user delimiters, non-IPv6 ':' delimiters, and the reserved
+// "openssh" / "openssh:" virtual namespace (case-insensitive).
 func ValidateConcreteHostAddress(raw string) error {
 	if hasControlOrLineSepChar(raw) {
 		return fmt.Errorf("%w: invalid host address %q: contains invalid control character", ssh.ErrSSHOptionsValidation, raw)
@@ -221,13 +221,16 @@ func ValidateConcreteHostAddress(raw string) error {
 	if trimmed == "" {
 		return fmt.Errorf("%w: host address cannot be empty", ssh.ErrSSHOptionsValidation)
 	}
-	if hasOpenSSHPrefix(trimmed) {
+	if strings.EqualFold(trimmed, "openssh") || hasOpenSSHPrefix(trimmed) {
 		return fmt.Errorf("%w: invalid host address %q: openssh selector cannot be used as a concrete host address", ssh.ErrSSHOptionsValidation, raw)
 	}
 	for _, r := range trimmed {
 		if unicode.IsSpace(r) {
 			return fmt.Errorf("%w: invalid host address %q: contains whitespace", ssh.ErrSSHOptionsValidation, raw)
 		}
+	}
+	if strings.ContainsRune(trimmed, ',') {
+		return fmt.Errorf("%w: invalid host address %q: cannot contain ','", ssh.ErrSSHOptionsValidation, raw)
 	}
 	if strings.ContainsRune(trimmed, '@') {
 		return fmt.Errorf("%w: invalid host address %q: cannot contain '@'", ssh.ErrSSHOptionsValidation, raw)
@@ -821,7 +824,7 @@ func (r *Repository) buildMatchedResolvedTarget(
 		}
 	}
 	alias, canon := r.resolveSavedNodeDecisionMetadata(matchedID, node, target, target.Selector, openSSHAlias, canonicalHost)
-	destTarget := buildProxyJumpTargetFromSavedNode(matchedID, alias, target.Selector, host, ident)
+	destTarget := buildProxyJumpTargetFromSavedNode(matchedID, alias, canon, target.Selector, host, ident)
 	jump, err := normalizeTargetJumpForTarget(provider, destTarget, node.ProxyJump, target)
 	if err != nil {
 		return ResolvedTarget{}, err
@@ -883,17 +886,14 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 		alias = canonicalOriginalAlias(parser, target.OriginalHost, lookupHost)
 	}
 	backfillCanonicalTargetMetadata(target, lookupHost, &alias, &canonicalHost)
-	explicitUser := ""
-	if target.HasUser && strings.TrimSpace(target.User) != "" {
-		explicitUser = strings.TrimSpace(target.User)
-	}
 	destTarget := ProxyJumpTarget{
-		NodeID:       matchedID,
-		Selector:     target.Selector,
-		OpenSSHAlias: alias,
-		Host:         cleanAddr,
-		Port:         port,
-		User:         explicitUser,
+		NodeID:        matchedID,
+		Selector:      target.Selector,
+		OpenSSHAlias:  alias,
+		CanonicalHost: canonicalHost,
+		Host:          cleanAddr,
+		Port:          port,
+		User:          user,
 	}
 	jump, err := normalizeTargetJumpForTarget(provider, destTarget, node.ProxyJump, target)
 	if err != nil {
@@ -957,6 +957,21 @@ func normalizeTargetJump(provider ConfigProvider, baseJump string, target Connec
 }
 
 func normalizeTargetJumpForTarget(provider ConfigProvider, dest ProxyJumpTarget, baseJump string, target ConnectionTarget) (string, error) {
+	var (
+		cfg     *Configuration
+		openSSH *OpenSSHParser
+	)
+	if provider != nil {
+		var r *Repository
+		r, cfg = resolveTargetHelper(provider)
+		if r != nil && r.provider != nil {
+			openSSH = r.provider.openSSH
+		}
+	}
+	return normalizeTargetJumpForTargetWithConfig(cfg, openSSH, dest, baseJump, target)
+}
+
+func normalizeTargetJumpForTargetWithConfig(cfg *Configuration, openSSH *OpenSSHParser, dest ProxyJumpTarget, baseJump string, target ConnectionTarget) (string, error) {
 	basePS, err := parseOptionalNodeProxyJump(baseJump)
 	if err != nil {
 		return "", err
@@ -967,23 +982,23 @@ func normalizeTargetJumpForTarget(provider ConfigProvider, dest ProxyJumpTarget,
 		}
 	}
 	if target.HasProxyJump || target.ProxyJump != "" {
-		return resolveExplicitTargetJump(provider, dest, target.ProxyJump)
+		return resolveExplicitTargetJumpWithConfig(cfg, openSSH, dest, target.ProxyJump)
 	}
 	if basePS.Kind() != ssh.ProxyJump {
 		return "", nil
 	}
 	targets, _ := basePS.JumpTargets()
-	resolvedJump, err := resolveBaseTargetJump(provider, dest, targets)
+	resolvedJump, err := resolveBaseTargetJumpWithConfig(cfg, openSSH, dest, targets)
 	if err != nil {
 		return "", err
 	}
-	if cErr := ValidateProxyJumpChainCycle(provider, dest, resolvedJump, baseJump); cErr != nil {
+	if cErr := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, resolvedJump, baseJump); cErr != nil {
 		return "", cErr
 	}
 	return resolvedJump, nil
 }
 
-func resolveExplicitTargetJump(provider ConfigProvider, dest ProxyJumpTarget, rawJump string) (string, error) {
+func resolveExplicitTargetJumpWithConfig(cfg *Configuration, openSSH *OpenSSHParser, dest ProxyJumpTarget, rawJump string) (string, error) {
 	ps, pErr := ssh.ParseProxyJump(rawJump)
 	if pErr != nil {
 		return "", fmt.Errorf("invalid target ProxyJump %q: %w", rawJump, pErr)
@@ -993,9 +1008,9 @@ func resolveExplicitTargetJump(provider ConfigProvider, dest ProxyJumpTarget, ra
 	}
 	jump := strings.TrimSpace(rawJump)
 	var resolvedJump string
-	if provider != nil {
+	if cfg != nil {
 		var jErr error
-		resolvedJump, jErr = provider.ResolveProxyJumpChain(jump)
+		resolvedJump, jErr = ResolveProxyJumpChainWithConfig(cfg, openSSH, jump)
 		if jErr != nil {
 			return "", jErr
 		}
@@ -1007,14 +1022,14 @@ func resolveExplicitTargetJump(provider ConfigProvider, dest ProxyJumpTarget, ra
 		}
 		resolvedJump = strings.Join(validated, ",")
 	}
-	if cErr := ValidateProxyJumpChainCycle(provider, dest, resolvedJump, jump); cErr != nil {
+	if cErr := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, resolvedJump, jump); cErr != nil {
 		return "", cErr
 	}
 	return resolvedJump, nil
 }
 
-func resolveBaseTargetJump(provider ConfigProvider, dest ProxyJumpTarget, targets []string) (string, error) {
-	if provider == nil {
+func resolveBaseTargetJumpWithConfig(cfg *Configuration, openSSH *OpenSSHParser, dest ProxyJumpTarget, targets []string) (string, error) {
+	if cfg == nil {
 		validated, err := validateJumpTargetsSyntax(targets)
 		if err != nil {
 			return "", err
@@ -1022,13 +1037,108 @@ func resolveBaseTargetJump(provider ConfigProvider, dest ProxyJumpTarget, target
 		return strings.Join(validated, ","), nil
 	}
 	if IsOpenSSHNodeID(dest.NodeID) {
-		return validateVirtualJumpTargets(provider, targets)
+		return validateVirtualJumpTargetsWithConfig(cfg, openSSH, targets)
 	}
 	validated, err := validateJumpTargetsSyntax(targets)
 	if err != nil {
 		return "", err
 	}
-	return provider.ResolveProxyJumpChain(strings.Join(validated, ","))
+	return ResolveProxyJumpChainWithConfig(cfg, openSSH, strings.Join(validated, ","))
+}
+
+func (r *Repository) openSSHParserOrNil() *OpenSSHParser {
+	if r != nil && r.provider != nil {
+		return r.provider.openSSH
+	}
+	return nil
+}
+
+func (r *Repository) validateMatchedDecisionJump(cfg *Configuration, decision targetDecision, explicitDefaultUser string) error {
+	_, err := r.validateMatchedDecisionJumpReturningDest(cfg, decision, explicitDefaultUser)
+	return err
+}
+
+func (r *Repository) validateMatchedDecisionJumpReturningDest(cfg *Configuration, decision targetDecision, explicitDefaultUser string) (ProxyJumpTarget, error) {
+	dest, baseJump, err := r.matchedDecisionJumpTarget(cfg, decision.MatchedNodeID, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget, explicitDefaultUser)
+	if err != nil {
+		return ProxyJumpTarget{}, err
+	}
+	if _, err := normalizeTargetJumpForTargetWithConfig(cfg, r.openSSHParserOrNil(), dest, baseJump, decision.NormalizedTarget); err != nil {
+		return ProxyJumpTarget{}, err
+	}
+	return dest, nil
+}
+
+func (r *Repository) matchedDecisionJumpTarget(
+	cfg *Configuration,
+	matchedID, openSSHAlias, canonicalHost string,
+	target ConnectionTarget,
+	explicitDefaultUser string,
+) (ProxyJumpTarget, string, error) {
+	if IsOpenSSHNodeID(matchedID) {
+		cleanMatched, _ := cutOpenSSHPrefix(matchedID)
+		lookupHost, inlineUser, inlinePort, parseErr := parseOpenSSHHostSpec(cleanMatched)
+		if parseErr != nil {
+			return ProxyJumpTarget{}, "", fmt.Errorf("parse openssh host %q failed: %w", cleanMatched, parseErr)
+		}
+		parser := r.openSSHParserOrEmpty()
+		node, host, ident, err := resolveVirtualNodeForTarget(parser, lookupHost, target)
+		if err != nil {
+			return ProxyJumpTarget{}, "", err
+		}
+		cleanAddr := StripHostBrackets(host.Address)
+		port := host.Port
+		if target.HasPort && target.Port > 0 {
+			port = target.Port
+		} else if inlinePort != 0 {
+			port = inlinePort
+		}
+		if port == 0 {
+			port = 22
+		}
+		user := ident.User
+		if target.HasUser && strings.TrimSpace(target.User) != "" {
+			user = strings.TrimSpace(target.User)
+		} else if inlineUser != "" {
+			user = inlineUser
+		}
+		if user == "" {
+			if defUser, uErr := resolveEffectiveUser(target, explicitDefaultUser, ""); uErr == nil {
+				user = defUser
+			}
+		}
+		alias := openSSHAlias
+		if alias == "" {
+			alias = canonicalOriginalAlias(parser, target.OriginalHost, lookupHost)
+		}
+		backfillCanonicalTargetMetadata(target, lookupHost, &alias, &canonicalHost)
+		return ProxyJumpTarget{
+			NodeID:        matchedID,
+			Selector:      target.Selector,
+			OpenSSHAlias:  alias,
+			CanonicalHost: canonicalHost,
+			Host:          cleanAddr,
+			Port:          port,
+			User:          user,
+		}, node.ProxyJump, nil
+	}
+	if cfg == nil || cfg.Nodes == nil {
+		return ProxyJumpTarget{}, "", fmt.Errorf("node %q: %w", matchedID, ErrNodeNotFound)
+	}
+	node, ok := cfg.Nodes.Get(matchedID)
+	if !ok {
+		return ProxyJumpTarget{}, "", fmt.Errorf("node %q: %w", matchedID, ErrNodeNotFound)
+	}
+	host, hOK := cfg.Hosts.Get(node.HostRef)
+	if !hOK {
+		return ProxyJumpTarget{}, "", fmt.Errorf("host %q for node %q: %w", node.HostRef, matchedID, ErrHostNotFound)
+	}
+	ident, iOK := cfg.Identities.Get(node.IdentityRef)
+	if !iOK {
+		return ProxyJumpTarget{}, "", fmt.Errorf("identity %q for node %q: %w", node.IdentityRef, matchedID, ErrIdentityNotFound)
+	}
+	alias, canon := r.resolveSavedNodeDecisionMetadata(matchedID, node, target, target.Selector, openSSHAlias, canonicalHost)
+	return buildProxyJumpTargetFromSavedNode(matchedID, alias, canon, target.Selector, host, ident), node.ProxyJump, nil
 }
 
 func (r *Repository) resolveCreatedTargetJump(
@@ -1060,19 +1170,16 @@ func (r *Repository) resolveCreatedTargetJump(
 	}
 	joined := strings.Join(validated, ",")
 	dest := ProxyJumpTarget{
-		NodeID:       targetNodeID,
-		Selector:     target.Selector,
-		OpenSSHAlias: canonicalInfo.OpenSSHAlias,
-		Host:         canonicalInfo.Address,
-		Port:         effectivePort,
-		User:         effectiveUser,
-		IsAdHoc:      true,
+		NodeID:        targetNodeID,
+		Selector:      target.Selector,
+		OpenSSHAlias:  canonicalInfo.OpenSSHAlias,
+		CanonicalHost: canonicalInfo.CanonicalHost,
+		Host:          canonicalInfo.Address,
+		Port:          effectivePort,
+		User:          effectiveUser,
+		IsAdHoc:       true,
 	}
-	var openSSH *OpenSSHParser
-	if r != nil && r.provider != nil {
-		openSSH = r.provider.openSSH
-	}
-	if cErr := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, joined, jump); cErr != nil {
+	if cErr := validateProxyJumpChainCycleWithConfig(cfg, r.openSSHParserOrNil(), dest, joined, jump); cErr != nil {
 		return "", cErr
 	}
 	return joined, nil
@@ -1141,19 +1248,16 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 	}
 	if jump != "" && jump != prevJump {
 		dest := ProxyJumpTarget{
-			NodeID:       targetNodeID,
-			Selector:     target.Selector,
-			OpenSSHAlias: openSSHAlias,
-			Host:         canonicalInfo.Address,
-			Port:         effectivePort,
-			User:         effectiveUser,
-			IsAdHoc:      true,
+			NodeID:        targetNodeID,
+			Selector:      target.Selector,
+			OpenSSHAlias:  openSSHAlias,
+			CanonicalHost: canonHost,
+			Host:          canonicalInfo.Address,
+			Port:          effectivePort,
+			User:          effectiveUser,
+			IsAdHoc:       true,
 		}
-		var openSSH *OpenSSHParser
-		if r != nil && r.provider != nil {
-			openSSH = r.provider.openSSH
-		}
-		if cErr := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, jump, jump); cErr != nil {
+		if cErr := validateProxyJumpChainCycleWithConfig(cfg, r.openSSHParserOrNil(), dest, jump, jump); cErr != nil {
 			return ResolvedTarget{}, cErr
 		}
 	}
@@ -1201,14 +1305,20 @@ func (r *Repository) EnsureNodeContext(ctx context.Context, opts EnsureNodeOptio
 
 	explicitDefaultUser := strings.TrimSpace(opts.DefaultUser)
 
-	// 1. Fast-path check: inspect read-only first, then sync session metadata under pendingMu.
+	// 1. Fast-path check: inspect read-only first, then validate matched ProxyJump
+	// invariants and sync session metadata under pendingMu.
 	r.pendingMu.Lock()
-	decision, fastErr := r.findExistingNodeDecision(target, explicitDefaultUser)
+	snapshot := r.provider.Snapshot()
+	decision, fastErr := r.findExistingNodeDecisionWithSnapshot(snapshot, target, explicitDefaultUser)
 	if fastErr != nil {
 		r.pendingMu.Unlock()
 		return EnsureNodeResult{}, fastErr
 	}
 	if !decision.NeedsCreation && decision.MatchedNodeID != "" {
+		if jErr := r.validateMatchedDecisionJump(snapshot, decision, explicitDefaultUser); jErr != nil {
+			r.pendingMu.Unlock()
+			return EnsureNodeResult{}, jErr
+		}
 		r.syncPreparedExistingMetadataLocked(decision)
 		r.pendingMu.Unlock()
 		return EnsureNodeResult{NodeID: decision.MatchedNodeID, Created: false}, nil
@@ -1276,6 +1386,9 @@ func (r *Repository) ensureTargetInTransaction(
 		return err
 	}
 	if !decision.NeedsCreation {
+		if jErr := r.validateMatchedDecisionJump(cfg, decision, explicitDefaultUser); jErr != nil {
+			return jErr
+		}
 		*outcome = ensureTransactionOutcome{
 			nodeID:        decision.MatchedNodeID,
 			created:       false,
@@ -1449,10 +1562,7 @@ func resolveEffectiveUser(target ConnectionTarget, explicitDefaultUser, canonica
 	return curr.Username, nil
 }
 
-// findExistingNodeDecision performs a read-only check in the current snapshot to determine
-// whether target already resolves to a saved or OpenSSH virtual node.
-func (r *Repository) findExistingNodeDecision(target ConnectionTarget, explicitDefaultUser string) (targetDecision, error) {
-	snapshot := r.provider.Snapshot()
+func (r *Repository) findExistingNodeDecisionWithSnapshot(snapshot *Configuration, target ConnectionTarget, explicitDefaultUser string) (targetDecision, error) {
 	lookup, aliases, err := buildIndexes(snapshot, false)
 	if err != nil {
 		return targetDecision{}, err
@@ -2011,6 +2121,19 @@ func (r *Repository) createNodeInTransaction(
 	}
 	defaultNodeID := FormatNodeID(effectiveUser, canonicalAddr, effectivePort)
 	if matches := findMatchingNodes(cfg, effectiveUser, canonicalAddr, effectivePort); len(matches) == 1 {
+		matchedDecision := targetDecision{
+			NormalizedTarget: opts.Target,
+			Selector:         opts.Target.Selector,
+			MatchedNodeID:    matches[0],
+			BaseNodeID:       matches[0],
+			OpenSSHAlias:     canonicalInfo.OpenSSHAlias,
+			CanonicalHost:    canonicalInfo.CanonicalHost,
+			EffectiveUser:    effectiveUser,
+			EffectivePort:    effectivePort,
+		}
+		if jErr := r.validateMatchedDecisionJump(cfg, matchedDecision, opts.DefaultUser); jErr != nil {
+			return jErr
+		}
 		*outcome = ensureTransactionOutcome{
 			nodeID:        matches[0],
 			created:       false,
@@ -2065,6 +2188,20 @@ func (r *Repository) createNodeInTransaction(
 	}
 
 	cfg.Nodes.Set(targetNodeID, newNode)
+	if strings.TrimSpace(finalJump) != "" {
+		dest := ProxyJumpTarget{
+			NodeID:        targetNodeID,
+			Selector:      opts.Target.Selector,
+			OpenSSHAlias:  canonicalInfo.OpenSSHAlias,
+			CanonicalHost: canonicalInfo.CanonicalHost,
+			Host:          canonicalAddr,
+			Port:          effectivePort,
+			User:          effectiveUser,
+		}
+		if cErr := validateProxyJumpChainCycleWithConfig(cfg, r.openSSHParserOrNil(), dest, finalJump, finalJump); cErr != nil {
+			return cErr
+		}
+	}
 	*outcome = ensureTransactionOutcome{
 		nodeID:        targetNodeID,
 		created:       true,

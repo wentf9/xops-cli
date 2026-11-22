@@ -490,6 +490,13 @@ func (o *ExecOptions) runWithProvider(ctx context.Context, cfg *config.Configura
 		}
 	}
 
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
+	if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
+		return err
+	}
+
 	var (
 		tasks    []execHostTask
 		hostErrs []error
@@ -527,6 +534,13 @@ func (o *ExecOptions) runWithProvider(ctx context.Context, cfg *config.Configura
 			}
 		}
 		tasks = filtered
+		var postHostErrs []error
+		var postErr error
+		tasks, postHostErrs, postErr = o.validateSurvivingExecTasksJump(provider, tasks)
+		if postErr != nil {
+			return postErr
+		}
+		hostErrs = append(hostErrs, postHostErrs...)
 	}
 
 	if len(tasks) == 0 {
@@ -1163,8 +1177,42 @@ func assignExecTaskLogNames(tasks []execHostTask) {
 	}
 }
 
+func validateCLIProxyJumpSyntax(rawJump string) error {
+	if rawJump == "" {
+		return nil
+	}
+	if _, err := ssh.ParseOption(ssh.OptionProxyJump, rawJump, ssh.OptionSourceCLI); err != nil {
+		return fmt.Errorf("invalid --jump (-J): %w", err)
+	}
+	return nil
+}
+
+func (o *ExecOptions) validateSurvivingExecTasksJump(provider config.ConfigProvider, tasks []execHostTask) ([]execHostTask, []error, error) {
+	if provider == nil || !o.hasExcludeFlags() || o.JumpHost == "" || ssh.IsDisabledProxyJump(o.JumpHost) {
+		return tasks, nil, nil
+	}
+	surviving := make([]execHostTask, 0, len(tasks))
+	var hostErrs []error
+	for _, t := range tasks {
+		if t.pendingTarget != nil {
+			if _, err := config.ResolveTarget(provider, *t.pendingTarget); err != nil {
+				if t.isTaggedTask {
+					return nil, nil, fmt.Errorf("prepare tagged node %q failed: %w", t.rawHost, err)
+				}
+				hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", t.host, err))
+				continue
+			}
+		}
+		surviving = append(surviving, t)
+	}
+	return surviving, hostErrs, nil
+}
+
 func (o *ExecOptions) planTasksFromTags(ctx context.Context, provider config.ConfigProvider) ([]execHostTask, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, err
+	}
+	if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
 		return nil, err
 	}
 	o.syncIdentityFiles()
@@ -1255,10 +1303,17 @@ func (o *ExecOptions) planTaggedHostTask(
 		ProxyJump:    o.JumpHost,
 		HasProxyJump: o.JumpHost != "",
 	}
-	target, resolved, hasResolved, originalHost, expandHost, cErr := o.resolveExecHostTargetWithHint(ctx, provider, target, true)
+	probeTarget := target
+	if o.hasExcludeFlags() && o.JumpHost != "" {
+		probeTarget.ProxyJump = "none"
+		probeTarget.HasProxyJump = true
+	}
+	target, resolved, hasResolved, originalHost, expandHost, cErr := o.resolveExecHostTargetWithHint(ctx, provider, probeTarget, true)
 	if cErr != nil {
 		return execHostTask{}, fmt.Errorf("canonicalize tagged host %q: %w", nodeID, cErr)
 	}
+	target.ProxyJump = o.JumpHost
+	target.HasProxyJump = o.JumpHost != ""
 	effectiveUser, password := o.resolveTaggedCredentials(userOverride, identity, resolved, hasResolved)
 	hasOverrides := o.User != "" || o.Port != 0 || o.JumpHost != "" || target.Selector != nodeID
 	taskNodeID := nodeID
@@ -1460,8 +1515,101 @@ func (o *ExecOptions) resolveExecEntryCredentials(h utils.HostInfo, isBatchHosts
 	return user, hasUser, port, hasPort, password
 }
 
+func (o *ExecOptions) planSingleHostTask(ctx context.Context, repository config.ConfigProvider, h utils.HostInfo, isBatchHosts bool) (execHostTask, error) {
+	user, hasUser, port, hasPort, password := o.resolveExecEntryCredentials(h, isBatchHosts)
+	passphrase := h.Passphrase
+	if passphrase == "" {
+		passphrase = o.Passphrase
+	}
+	keyPath := h.KeyPath
+	if keyPath == "" {
+		keyPath = o.IdentityFile
+	}
+	alias := h.Alias
+	if alias == "" {
+		alias = o.Alias
+	}
+
+	rawHost := strings.TrimSpace(h.Host)
+	target := config.ConnectionTarget{
+		Selector:     rawHost,
+		User:         strings.TrimSpace(user),
+		HasUser:      hasUser,
+		Port:         port,
+		HasPort:      hasPort,
+		ProxyJump:    o.JumpHost,
+		HasProxyJump: o.JumpHost != "",
+	}
+	probeTarget := target
+	if o.hasExcludeFlags() && o.JumpHost != "" {
+		probeTarget.ProxyJump = "none"
+		probeTarget.HasProxyJump = true
+	}
+	target, resolved, hasResolved, originalHost, expandHost, cErr := o.resolveExecHostTarget(ctx, repository, probeTarget)
+	if cErr != nil {
+		return execHostTask{}, cErr
+	}
+	target.ProxyJump = o.JumpHost
+	target.HasProxyJump = o.JumpHost != ""
+	h.Host = target.Selector
+
+	targetCopy := target
+	addrCopy := utils.HostInfo{
+		Host:       h.Host,
+		Port:       port,
+		User:       user,
+		Password:   password,
+		Alias:      alias,
+		KeyPath:    keyPath,
+		Passphrase: passphrase,
+	}
+	taskUser := user
+	if taskUser == "" && hasResolved {
+		taskUser = resolved.User
+	}
+	taskPort := port
+	if taskPort == 0 && hasResolved {
+		taskPort = resolved.Port
+	}
+	if taskPort == 0 {
+		taskPort = 22
+	}
+	nodeID := ""
+	if hasResolved {
+		if resolved.MatchedNodeID != "" {
+			nodeID = resolved.MatchedNodeID
+		} else {
+			nodeID = resolved.NodeID
+		}
+	} else if taskUser != "" {
+		nodeID = config.FormatNodeID(taskUser, h.Host, taskPort)
+	}
+	return execHostTask{
+		nodeID:        nodeID,
+		matchedNodeID: resolved.MatchedNodeID,
+		baseNodeID:    resolved.BaseNodeID,
+		openSSHAlias:  resolved.OpenSSHAlias,
+		canonicalHost: resolved.CanonicalHost,
+		resolvedHost:  resolved.Host,
+		rawHost:       rawHost,
+		host:          h.Host,
+		originalHost:  originalHost,
+		expandHost:    expandHost,
+		port:          taskPort,
+		user:          taskUser,
+		pass:          password,
+		passphrase:    passphrase,
+		keyPath:       normalizeCLIIdentityPath(keyPath),
+		pendingTarget: &targetCopy,
+		pendingAddr:   &addrCopy,
+	}, nil
+}
+
 func (o *ExecOptions) planTasksFromHosts(ctx context.Context, repository config.ConfigProvider) ([]execHostTask, []error, error) {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return nil, nil, err
+	}
+	if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
 		return nil, nil, err
 	}
 	var tasks []execHostTask
@@ -1472,91 +1620,12 @@ func (o *ExecOptions) planTasksFromHosts(ctx context.Context, repository config.
 	}
 	isBatchHosts := o.HostFile != "" || len(hosts) > 1 || strings.Contains(o.Host, ",")
 	for _, h := range hosts {
-		user, hasUser, port, hasPort, password := o.resolveExecEntryCredentials(h, isBatchHosts)
-		passphrase := h.Passphrase
-		if passphrase == "" {
-			passphrase = o.Passphrase
-		}
-		keyPath := h.KeyPath
-		if keyPath == "" {
-			keyPath = o.IdentityFile
-		}
-		alias := h.Alias
-		if alias == "" {
-			alias = o.Alias
-		}
-
-		rawHost := strings.TrimSpace(h.Host)
-		target := config.ConnectionTarget{
-			Selector:     rawHost,
-			User:         strings.TrimSpace(user),
-			HasUser:      hasUser,
-			Port:         port,
-			HasPort:      hasPort,
-			ProxyJump:    o.JumpHost,
-			HasProxyJump: o.JumpHost != "",
-		}
-		var resolved config.ResolvedTarget
-		var hasResolved bool
-		var originalHost, expandHost string
-		var cErr error
-		target, resolved, hasResolved, originalHost, expandHost, cErr = o.resolveExecHostTarget(ctx, repository, target)
-		if cErr != nil {
-			hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, cErr))
+		task, taskErr := o.planSingleHostTask(ctx, repository, h, isBatchHosts)
+		if taskErr != nil {
+			hostErrs = append(hostErrs, fmt.Errorf("[%s] %w", h.Host, taskErr))
 			continue
 		}
-		h.Host = target.Selector
-
-		targetCopy := target
-		addrCopy := utils.HostInfo{
-			Host:       h.Host,
-			Port:       port,
-			User:       user,
-			Password:   password,
-			Alias:      alias,
-			KeyPath:    keyPath,
-			Passphrase: passphrase,
-		}
-		taskUser := user
-		if taskUser == "" && hasResolved {
-			taskUser = resolved.User
-		}
-		taskPort := port
-		if taskPort == 0 && hasResolved {
-			taskPort = resolved.Port
-		}
-		if taskPort == 0 {
-			taskPort = 22
-		}
-		nodeID := ""
-		if hasResolved {
-			if resolved.MatchedNodeID != "" {
-				nodeID = resolved.MatchedNodeID
-			} else {
-				nodeID = resolved.NodeID
-			}
-		} else if taskUser != "" {
-			nodeID = config.FormatNodeID(taskUser, h.Host, taskPort)
-		}
-		tasks = append(tasks, execHostTask{
-			nodeID:        nodeID,
-			matchedNodeID: resolved.MatchedNodeID,
-			baseNodeID:    resolved.BaseNodeID,
-			openSSHAlias:  resolved.OpenSSHAlias,
-			canonicalHost: resolved.CanonicalHost,
-			resolvedHost:  resolved.Host,
-			rawHost:       rawHost,
-			host:          h.Host,
-			originalHost:  originalHost,
-			expandHost:    expandHost,
-			port:          taskPort,
-			user:          taskUser,
-			pass:          password,
-			passphrase:    passphrase,
-			keyPath:       normalizeCLIIdentityPath(keyPath),
-			pendingTarget: &targetCopy,
-			pendingAddr:   &addrCopy,
-		})
+		tasks = append(tasks, task)
 	}
 	return tasks, hostErrs, nil
 }

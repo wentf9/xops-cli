@@ -975,12 +975,14 @@ func (p EffectivePolicy) ClientConfig() (*ssh.ClientConfig, error) {
 		Options:               sshOpts,
 	})
 
-	p.applyClientConfigIdentityKeys(cfg, snapshot, sshOpts)
+	if err := p.applyClientConfigIdentityKeys(cfg, snapshot, sshOpts); err != nil {
+		return nil, err
+	}
 
 	return ssh.NewClientConfig(*cfg), nil
 }
 
-func (p EffectivePolicy) applyClientConfigIdentityKeys(cfg *ssh.ClientConfig, snapshot config.ConnectionSnapshot, sshOpts *ssh.Options) {
+func (p EffectivePolicy) applyClientConfigIdentityKeys(cfg *ssh.ClientConfig, snapshot config.ConnectionSnapshot, sshOpts *ssh.Options) error {
 	cliFlagList := ssh.UnsetPathList()
 	if p.hasTier1Auth {
 		cliFlagList = pathListFromSessionAuth(p.tier1Auth)
@@ -993,7 +995,9 @@ func (p EffectivePolicy) applyClientConfigIdentityKeys(cfg *ssh.ClientConfig, sn
 
 	cliKeys := cliFlagList.Merge(cliOptList)
 	if p.hasTier1Auth || !cliOptList.IsUnset() {
-		applySessionOverrideToConfig(cfg, p.tier1Auth, cliKeys)
+		if err := applySessionOverrideToConfig(cfg, p.tier1Auth, cliKeys); err != nil {
+			return err
+		}
 		if p.hasTier1Auth && strings.TrimSpace(p.tier1Auth.HostName) != "" {
 			cfg.BaseHost = config.StripHostBrackets(snapshot.Host.Address)
 		}
@@ -1021,6 +1025,7 @@ func (p EffectivePolicy) applyClientConfigIdentityKeys(cfg *ssh.ClientConfig, sn
 			cfg.KeyPath = items[0]
 		}
 	}
+	return nil
 }
 
 // GetConfig implements ssh.ConnectionProvider by delegating to Resolve.
@@ -1104,7 +1109,10 @@ func effectiveSnapshotHost(snapshot config.ConnectionSnapshot, hasOverride bool,
 	return host
 }
 
-func applySessionOverrideToConfig(cfg *ssh.ClientConfig, override SessionAuth, overrideKeys ssh.PathList) {
+func applySessionOverrideToConfig(cfg *ssh.ClientConfig, override SessionAuth, overrideKeys ssh.PathList) error {
+	if err := validateSessionAuthOpenSSHSelectors(override); err != nil {
+		return err
+	}
 	if strings.TrimSpace(override.HostName) != "" {
 		cfg.Address = config.StripHostBrackets(override.HostName)
 	}
@@ -1135,6 +1143,7 @@ func applySessionOverrideToConfig(cfg *ssh.ClientConfig, override SessionAuth, o
 	if override.SuPwd != "" {
 		cfg.SuPwd = override.SuPwd
 	}
+	return nil
 }
 
 func (a *SSHAdapter) interactiveVerdictForNode(nodeID string) (verdict.Verdict, error) {
