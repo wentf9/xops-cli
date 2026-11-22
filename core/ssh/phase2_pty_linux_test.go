@@ -45,12 +45,13 @@ func openPhase2TestPTY(t *testing.T) (master *os.File, slave *os.File) {
 }
 
 type phase2PTYFixture struct {
-	addr       string
-	mu         sync.Mutex
-	reqOrders  [][]string
-	receivedIn bytes.Buffer
-	shellReady chan struct{}
-	subsysDone chan []byte
+	addr        string
+	mu          sync.Mutex
+	receivedIn  bytes.Buffer
+	reqOrdersCh chan []string
+	shellReady  chan struct{}
+	subsysReady chan struct{}
+	subsysDone  chan []byte
 }
 
 func startPhase2PTYServer(t *testing.T, ctx context.Context) *phase2PTYFixture {
@@ -59,9 +60,11 @@ func startPhase2PTYServer(t *testing.T, ctx context.Context) *phase2PTYFixture {
 	listener, sshSrvCfg := startKeepAliveTestSSHServer(t)
 
 	fix := &phase2PTYFixture{
-		addr:       listener.Addr().String(),
-		shellReady: make(chan struct{}, 4),
-		subsysDone: make(chan []byte, 2),
+		addr:        listener.Addr().String(),
+		reqOrdersCh: make(chan []string, 8),
+		shellReady:  make(chan struct{}, 4),
+		subsysReady: make(chan struct{}, 4),
+		subsysDone:  make(chan []byte, 2),
 	}
 
 	var serverGroup sync.WaitGroup
@@ -101,27 +104,28 @@ func (f *phase2PTYFixture) serveConn(ctx context.Context, conn net.Conn, sshSrvC
 		if err != nil {
 			continue
 		}
-		wg.Go(func() { f.serveChannel(ch, chReqs) })
+		wg.Go(func() { f.serveChannel(ctx, ch, chReqs) })
 	}
 }
 
-func (f *phase2PTYFixture) serveChannel(ch cryptoSSH.Channel, chReqs <-chan *cryptoSSH.Request) {
-	defer func() { _ = ch.Close() }()
+func (f *phase2PTYFixture) serveChannel(ctx context.Context, ch cryptoSSH.Channel, chReqs <-chan *cryptoSSH.Request) {
 	var order []string
 	defer func() {
-		f.mu.Lock()
-		f.reqOrders = append(f.reqOrders, slices.Clone(order))
-		f.mu.Unlock()
+		_ = ch.Close()
+		select {
+		case f.reqOrdersCh <- slices.Clone(order):
+		case <-ctx.Done():
+		}
 	}()
 	for req := range chReqs {
 		order = append(order, req.Type)
-		if f.handleChannelReq(ch, req) {
+		if f.handleChannelReq(ctx, ch, req) {
 			return
 		}
 	}
 }
 
-func (f *phase2PTYFixture) handleChannelReq(ch cryptoSSH.Channel, req *cryptoSSH.Request) bool {
+func (f *phase2PTYFixture) handleChannelReq(ctx context.Context, ch cryptoSSH.Channel, req *cryptoSSH.Request) bool {
 	switch req.Type {
 	case "env", "pty-req", "window-change":
 		replyIfWanted(req, true)
@@ -136,7 +140,15 @@ func (f *phase2PTYFixture) handleChannelReq(ch cryptoSSH.Channel, req *cryptoSSH
 		return true
 	case "subsystem":
 		replyIfWanted(req, true)
-		f.subsysDone <- readChannelUntilSuffix(ch, []byte("DONE"))
+		select {
+		case f.subsysReady <- struct{}{}:
+		default:
+		}
+		got := readChannelUntilSuffix(ch, []byte("DONE"))
+		select {
+		case f.subsysDone <- got:
+		case <-ctx.Done():
+		}
 		sendExitStatus(ch, 0)
 		return true
 	default:
@@ -145,19 +157,32 @@ func (f *phase2PTYFixture) handleChannelReq(ch cryptoSSH.Channel, req *cryptoSSH
 	}
 }
 
+func (f *phase2PTYFixture) appendReceivedIn(p []byte) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receivedIn.Write(p)
+	return bytes.Contains(f.receivedIn.Bytes(), []byte("EXIT\n"))
+}
+
+func (f *phase2PTYFixture) resetReceivedIn() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.receivedIn.Reset()
+}
+
+func (f *phase2PTYFixture) receivedInString() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.receivedIn.String()
+}
+
 func (f *phase2PTYFixture) readShellUntilExit(ch cryptoSSH.Channel) {
 	buf := make([]byte, 256)
 	for {
 		n, readErr := ch.Read(buf)
-		if n > 0 {
-			f.mu.Lock()
-			f.receivedIn.Write(buf[:n])
-			hasExit := bytes.Contains(f.receivedIn.Bytes(), []byte("EXIT\n"))
-			f.mu.Unlock()
-			if hasExit {
-				sendExitStatus(ch, 0)
-				return
-			}
+		if n > 0 && f.appendReceivedIn(buf[:n]) {
+			sendExitStatus(ch, 0)
+			return
 		}
 		if readErr != nil {
 			return
@@ -209,7 +234,7 @@ func (f *phase2PTYFixture) newClient(t *testing.T, opts *Options, env Environmen
 }
 
 func TestPhase2_PTYInteractive_EscapeCharSuspendChannelsAndEnvOrder(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	fix := startPhase2PTYServer(t, ctx)
 
@@ -250,8 +275,8 @@ func assertPhase2PTYShellEscapes(t *testing.T, ctx context.Context, fix *phase2P
 		done <- cli.ShellWithIO(ctx, InteractiveIO{Stdin: slave, Stdout: io.Discard, Stderr: &localStderr})
 	}()
 
-	<-fix.shellReady
-	waitForRawTermios(slave, origTermios.Lflag)
+	waitSignal(t, ctx, fix.shellReady, done, "shellReady")
+	waitForRawTermios(t, ctx, slave, origTermios.Lflag, done)
 
 	if _, err := master.Write([]byte{'~', 0x1a, '~', '#', '~', '.'}); err != nil {
 		t.Fatalf("master.Write: %v", err)
@@ -261,8 +286,8 @@ func assertPhase2PTYShellEscapes(t *testing.T, ctx context.Context, fix *phase2P
 		if !errors.Is(shellErr, ErrEscapeDisconnect) {
 			t.Fatalf("ShellWithIO after ~. returned error %v, want ErrEscapeDisconnect", shellErr)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("ShellWithIO did not terminate on ~.")
+	case <-ctx.Done():
+		t.Fatalf("ShellWithIO did not terminate on ~.: %v", ctx.Err())
 	}
 
 	if !suspendChecked.Load() || !suspendWasRestored.Load() {
@@ -277,22 +302,52 @@ func assertPhase2PTYShellEscapes(t *testing.T, ctx context.Context, fix *phase2P
 		t.Fatalf("unexpected local escape output: %q", outStr)
 	}
 
-	fix.mu.Lock()
-	firstOrder := slices.Clone(fix.reqOrders[0])
-	fix.mu.Unlock()
+	firstOrder := waitReqOrder(t, ctx, fix.reqOrdersCh)
 	if len(firstOrder) < 3 || !slices.Equal(firstOrder[:3], []string{"env", "pty-req", "shell"}) {
 		t.Fatalf("unexpected PTY request order: %v", firstOrder)
 	}
 }
 
-func waitForRawTermios(slave *os.File, origLflag uint32) {
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+func waitSignal(t *testing.T, ctx context.Context, ch <-chan struct{}, done <-chan error, name string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case err := <-done:
+		t.Fatalf("session exited before %s: %v", name, err)
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for %s: %v", name, ctx.Err())
+	}
+}
+
+func waitReqOrder(t *testing.T, ctx context.Context, ch <-chan []string) []string {
+	t.Helper()
+	select {
+	case order := <-ch:
+		return order
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for server channel request order: %v", ctx.Err())
+		return nil
+	}
+}
+
+func waitForRawTermios(t *testing.T, ctx context.Context, slave *os.File, origLflag uint32, done <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
 		cur, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
-		if err == nil && cur.Lflag != origLflag {
+		if err == nil && cur.Lflag != origLflag &&
+			cur.Lflag&(unix.ICANON|unix.ISIG|unix.ECHO) == 0 &&
+			cur.Iflag&unix.ICRNL == 0 {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case err := <-done:
+			t.Fatalf("session exited before raw termios: %v", err)
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for raw termios (origLflag=0x%x): %v", origLflag, ctx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -301,9 +356,11 @@ func assertPhase2PTYShellEscapeNone(t *testing.T, ctx context.Context, fix *phas
 	if !term.IsTerminal(int(slave.Fd())) {
 		t.Fatal("expected slave fd to be a terminal")
 	}
-	fix.mu.Lock()
-	fix.receivedIn.Reset()
-	fix.mu.Unlock()
+	origTermios, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+	if err != nil {
+		t.Fatalf("TCGETS initial: %v", err)
+	}
+	fix.resetReceivedIn()
 
 	cli := fix.newClient(t, MustOptions(OptionEscapeChar, "none"), Environment{})
 	done := make(chan error, 1)
@@ -311,17 +368,22 @@ func assertPhase2PTYShellEscapeNone(t *testing.T, ctx context.Context, fix *phas
 		done <- cli.ShellWithIO(ctx, InteractiveIO{Stdin: slave, Stdout: io.Discard, Stderr: io.Discard})
 	}()
 
-	<-fix.shellReady
-	time.Sleep(30 * time.Millisecond)
+	waitSignal(t, ctx, fix.shellReady, done, "shellReady")
+	waitForRawTermios(t, ctx, slave, origTermios.Lflag, done)
 	if _, err := master.Write([]byte("~.EXIT\n")); err != nil {
 		t.Fatalf("master.Write: %v", err)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("ShellWithIO(EscapeChar=none) failed: %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ShellWithIO(EscapeChar=none) failed: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("ShellWithIO(EscapeChar=none) timed out: %v", ctx.Err())
 	}
-	fix.mu.Lock()
-	gotRemote := fix.receivedIn.String()
-	fix.mu.Unlock()
+	_ = waitReqOrder(t, ctx, fix.reqOrdersCh)
+
+	gotRemote := fix.receivedInString()
 	if !strings.Contains(gotRemote, "~.EXIT") {
 		t.Fatalf("expected ~. to reach remote shell under EscapeChar=none, got %q", gotRemote)
 	}
@@ -329,6 +391,10 @@ func assertPhase2PTYShellEscapeNone(t *testing.T, ctx context.Context, fix *phas
 
 func assertPhase2PTYSubsystemTransparency(t *testing.T, ctx context.Context, fix *phase2PTYFixture) {
 	master, slave := openPhase2TestPTY(t)
+	origTermios, err := unix.IoctlGetTermios(int(slave.Fd()), unix.TCGETS)
+	if err != nil {
+		t.Fatalf("TCGETS initial: %v", err)
+	}
 	cli := fix.newClient(t, MustOptions(OptionEscapeChar, "~"), Environment{})
 
 	done := make(chan error, 1)
@@ -336,15 +402,27 @@ func assertPhase2PTYSubsystemTransparency(t *testing.T, ctx context.Context, fix
 		done <- cli.RunSubsystemWithIO(ctx, "tty-subsys", slave, io.Discard, io.Discard, true)
 	}()
 
-	time.Sleep(40 * time.Millisecond)
+	waitSignal(t, ctx, fix.subsysReady, done, "subsysReady")
+	waitForRawTermios(t, ctx, slave, origTermios.Lflag, done)
 	payload := []byte("bin\r~.dataDONE")
 	if _, err := master.Write(payload); err != nil {
 		t.Fatalf("master.Write: %v", err)
 	}
-	if err := <-done; err != nil {
-		t.Fatalf("RunSubsystemWithIO(TTY) returned error: %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("RunSubsystemWithIO(TTY) returned error: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("RunSubsystemWithIO(TTY) timed out: %v", ctx.Err())
 	}
-	got := <-fix.subsysDone
+	var got []byte
+	select {
+	case got = <-fix.subsysDone:
+	case <-ctx.Done():
+		t.Fatalf("timed out waiting for subsystem output: %v", ctx.Err())
+	}
+	_ = waitReqOrder(t, ctx, fix.reqOrdersCh)
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("TTY subsystem altered binary stream: got %q, want %q", got, payload)
 	}
