@@ -21,6 +21,22 @@ import (
 // error/shutdown exit while bounding goroutine lifetime by serverCtx and
 // sessionShutdownTimeout so unclosed mock channels cannot leak goroutines.
 func discardAbortedChannelRequests(serverCtx context.Context, reqs <-chan *cryptoSSH.Request) {
+	discardAbortedChannelRequestsWithReply(serverCtx, reqs, func(req *cryptoSSH.Request) {
+		_ = req.Reply(false, nil)
+	})
+}
+
+func (s *MuxServer) discardAbortedChannelRequests(serverCtx context.Context, reqs <-chan *cryptoSSH.Request) {
+	discardAbortedChannelRequestsWithReply(serverCtx, reqs, func(req *cryptoSSH.Request) {
+		_ = s.replyMuxChannelRequestBounded(req, false, nil)
+	})
+}
+
+func discardAbortedChannelRequestsWithReply(
+	serverCtx context.Context,
+	reqs <-chan *cryptoSSH.Request,
+	replyFalse func(*cryptoSSH.Request),
+) {
 	if reqs == nil {
 		return
 	}
@@ -37,7 +53,7 @@ func discardAbortedChannelRequests(serverCtx context.Context, reqs <-chan *crypt
 				return
 			}
 			if req != nil && req.WantReply {
-				_ = req.Reply(false, nil)
+				replyFalse(req)
 			}
 		case <-serverDone:
 			for {
@@ -47,7 +63,7 @@ func discardAbortedChannelRequests(serverCtx context.Context, reqs <-chan *crypt
 						return
 					}
 					if req != nil && req.WantReply {
-						_ = req.Reply(false, nil)
+						replyFalse(req)
 					}
 				default:
 					return
@@ -280,8 +296,17 @@ func (q *remoteRequestQueue) pop() (*cryptoSSH.Request, bool) {
 	return req, true
 }
 
-// drain replies false to every request still waiting, releasing the remote side.
-func (q *remoteRequestQueue) drain() {
+func (q *remoteRequestQueue) clear() {
+	q.mu.Lock()
+	clear(q.items)
+	q.items = nil
+	q.mu.Unlock()
+}
+
+// drain replies false to every request still waiting, releasing the remote side
+// while bounding each reply via s.replyMuxChannelRequestBounded so a write-wedged
+// transport escalates instead of blocking proxy teardown.
+func (q *remoteRequestQueue) drain(s *MuxServer) {
 	if q == nil {
 		return
 	}
@@ -290,7 +315,10 @@ func (q *remoteRequestQueue) drain() {
 		if !ok {
 			return
 		}
-		_ = req.Reply(false, nil)
+		if err := s.replyMuxChannelRequestBounded(req, false, nil); err != nil {
+			q.clear()
+			return
+		}
 	}
 }
 
@@ -429,10 +457,14 @@ func (ps *proxySessionState) closeAll() {
 			if pc.requests != nil {
 				pc.requests.close()
 			}
-			if pc.pendingRemoteReqs != nil {
-				pc.pendingRemoteReqs.drain()
-			}
+			// Close pc.remoteCh BEFORE draining pendingRemoteReqs: once
+			// x/crypto/ssh marks sentClose=true (or escalates on a write-wedged
+			// transport), any remaining req.Reply is a fast io.EOF no-op, and
+			// drain remains bounded as defense in depth.
 			_ = ps.server.closeMuxChannelBounded(pc.remoteCh, nil)
+			if pc.pendingRemoteReqs != nil {
+				pc.pendingRemoteReqs.drain(ps.server)
+			}
 			pc.releaseAgentProxyLease()
 		}
 		return true
@@ -568,7 +600,7 @@ func (ps *proxySessionState) handleRemoteRequestReply(payload []byte, accepted b
 	if accepted && r.Remaining() > 0 {
 		replyPayload = slices.Clone(r.data[r.off:])
 	}
-	_ = req.Reply(accepted, replyPayload)
+	_ = ps.server.replyMuxChannelRequestBounded(req, accepted, replyPayload)
 }
 
 func (ps *proxySessionState) handleOpen(payload []byte) {
@@ -638,7 +670,7 @@ func (ps *proxySessionState) openRemoteChannelContext(chType string, extra []byt
 		case <-abandoned:
 			if ch != nil {
 				if reqs != nil {
-					go discardAbortedChannelRequests(serverCtx, reqs)
+					go server.discardAbortedChannelRequests(serverCtx, reqs)
 				}
 				_ = server.closeMuxChannelBounded(ch, nil)
 			}
@@ -691,7 +723,7 @@ func (ps *proxySessionState) openRemoteChannel(pc *proxyChan, chType string, ext
 		ps.channels.CompareAndDelete(pc.serverCh, pc)
 		pc.clientWindow.close()
 		pc.input.close()
-		go discardAbortedChannelRequests(ps.serverBaseContext(), reqs)
+		go ps.server.discardAbortedChannelRequests(ps.serverBaseContext(), reqs)
 		_ = ps.server.closeMuxChannelBounded(remoteCh, nil)
 		return
 	}
@@ -716,7 +748,7 @@ func (ps *proxySessionState) forwardRequests(pc *proxyChan, reqs <-chan *cryptoS
 	for req := range reqs {
 		if writeFailed {
 			if req.WantReply {
-				_ = req.Reply(false, nil)
+				_ = ps.server.replyMuxChannelRequestBounded(req, false, nil)
 			}
 			continue
 		}
@@ -731,13 +763,13 @@ func (ps *proxySessionState) forwardRequests(pc *proxyChan, reqs <-chan *cryptoS
 		rw.buf = append(rw.buf, req.Payload...)
 		if err := ps.writeChannelPacket(pc, rw.Bytes()); err != nil {
 			writeFailed = true
-			pc.pendingRemoteReqs.drain()
+			pc.pendingRemoteReqs.drain(ps.server)
 		}
 	}
 	// The remote request stream ended (or the client closed the channel). Any
 	// request still awaiting an answer can no longer be satisfied, so release the
 	// remote side instead of leaving it blocked on a reply that will never arrive.
-	pc.pendingRemoteReqs.drain()
+	pc.pendingRemoteReqs.drain(ps.server)
 }
 
 // streamRemoteStdout forwards SSH channel data (stdout) to the proxy client.
@@ -961,7 +993,7 @@ func (ps *proxySessionState) relayChannelInput(pc *proxyChan) {
 			}
 			written, err = stderr.Write(item.payload)
 		case msgChannelEOF:
-			if eofErr := pc.remoteCh.CloseWrite(); eofErr != nil {
+			if eofErr := ps.server.closeMuxChannelWriteBounded(pc.remoteCh); eofErr != nil {
 				writeFailed = true
 			}
 			continue
@@ -1081,11 +1113,15 @@ func (ps *proxySessionState) acquireChannelAgentLease() (*agentForwardLease, boo
 		ps.server.getLogger().Debugf("mux: failed to initialize agent router for MUX_C_PROXY session: %v", rErr)
 		return nil, false
 	}
-	lease, lErr := router.acquireLocalLease(
+	lease, lErr := router.acquireLocalLeaseWithControl(
 		ps.server.baseContext(),
 		ps.server.agentSocket,
 		ps.server.dialAgent,
 		ps.server.getLogger(),
+		agentForwardTransportControl{
+			interrupt:    ps.server.interruptTransportAndShutdown,
+			closeTimeout: ps.server.channelCloseTimeout,
+		},
 	)
 	if lErr != nil || lease == nil {
 		return nil, false
@@ -1237,35 +1273,45 @@ func (ps *proxySessionState) retireChannel(pc *proxyChan, closeRemote bool) {
 		pc.clientWindow.close()
 	}
 	ps.closeChannel(pc)
-	// Drain pendingRemoteReqs only after closeChannel sets pc.closeSent=true so
-	// concurrent forwardRequests cannot push a new orphan request afterward.
+	// Drain pendingRemoteReqs, close pc.remoteCh, and release any agent lease
+	// asynchronously under ps.closeWG after closeChannel sets pc.closeSent=true
+	// so concurrent forwardRequests cannot push a new orphan request afterward
+	// and a slow or write-wedged transport cannot stall the proxy read loop.
+	ps.startAsyncRemoteRetire(pc, closeRemote)
+}
+
+func (ps *proxySessionState) retireChannelRemote(pc *proxyChan, closeRemote bool) {
+	if pc == nil {
+		return
+	}
 	if pc.pendingRemoteReqs != nil {
-		pc.pendingRemoteReqs.drain()
+		pc.pendingRemoteReqs.drain(ps.server)
 	}
 	if closeRemote && pc.remoteCh != nil {
-		ps.startAsyncRemoteClose(pc.remoteCh)
+		_ = ps.server.closeMuxChannelBounded(pc.remoteCh, nil)
 	}
 	pc.releaseAgentProxyLease()
 }
 
-// startAsyncRemoteClose offloads bounded remote channel closing so a slow or
-// stalled peer channel does not stall the proxy read loop for sibling channels,
-// while tracking the goroutine under ps.closeWG so closeAll waits for exit.
-func (ps *proxySessionState) startAsyncRemoteClose(remoteCh io.Closer) {
-	if remoteCh == nil {
+// startAsyncRemoteRetire offloads bounded remote request draining, remote
+// channel closing, and agent lease release so a slow or stalled peer channel
+// does not stall the proxy read loop for sibling channels, while tracking the
+// goroutine under ps.closeWG so closeAll waits for exit.
+func (ps *proxySessionState) startAsyncRemoteRetire(pc *proxyChan, closeRemote bool) {
+	if pc == nil {
 		return
 	}
 	ps.closedMu.Lock()
 	if ps.closed.Load() {
 		ps.closedMu.Unlock()
-		_ = ps.server.closeMuxChannelBounded(remoteCh, nil)
+		ps.retireChannelRemote(pc, closeRemote)
 		return
 	}
 	ps.closeWG.Add(1)
 	ps.closedMu.Unlock()
 	go func() {
 		defer ps.closeWG.Done()
-		_ = ps.server.closeMuxChannelBounded(remoteCh, nil)
+		ps.retireChannelRemote(pc, closeRemote)
 	}()
 }
 

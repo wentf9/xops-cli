@@ -704,14 +704,11 @@ func testW9bC9M2StalledCloseAfterHealthyCloseWrite(t *testing.T) {
 		closeDone:    closeDone,
 		closeOnce:    &closeOnce,
 	}
-	reqsDone := make(chan struct{})
-	close(reqsDone)
 	wrapped := &muxForwardChannelConn{
 		ch:         stalledCh,
 		server:     srv,
 		localAddr:  &net.TCPAddr{IP: net.IPv4zero, Port: 0},
 		remoteAddr: forwardTCPAddr{addr: "127.0.0.1:80"},
-		reqsDone:   reqsDone,
 	}
 
 	// CloseWrite succeeds on this channel, while Close stalls until abort.

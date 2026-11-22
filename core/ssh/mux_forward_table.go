@@ -536,7 +536,7 @@ func (s *MuxServer) dialSSHMuxChannel(parent context.Context, network, addr stri
 		case <-abandoned:
 			if ch != nil {
 				if reqs != nil {
-					go discardAbortedChannelRequests(base, reqs)
+					go s.discardAbortedChannelRequests(base, reqs)
 				}
 				_ = s.closeMuxChannelBounded(ch, nil)
 			}
@@ -562,7 +562,6 @@ type muxForwardChannelConn struct {
 	server     *MuxServer
 	localAddr  net.Addr
 	remoteAddr net.Addr
-	reqsDone   chan struct{}
 }
 
 func (c *muxForwardChannelConn) Read(p []byte) (int, error) {
@@ -584,7 +583,11 @@ func (c *muxForwardChannelConn) Close() error {
 	if c == nil || c.ch == nil {
 		return nil
 	}
-	return c.server.closeMuxChannelBounded(c.ch, c.reqsDone)
+	// Pass nil for workersDone: ch.Close() sends outbound SSH_MSG_CHANNEL_CLOSE
+	// locally, whereas draining reqs only completes once the remote peer echoes
+	// SSH_MSG_CHANNEL_CLOSE. Waiting for the remote echo under channelCloseTimeout
+	// would wrongly tear down a healthy shared MuxServer on a slow remote peer.
+	return c.server.closeMuxChannelBounded(c.ch, nil)
 }
 
 func (c *muxForwardChannelConn) closeRaw() error {
@@ -655,11 +658,10 @@ func (s *MuxServer) dialSSHMux(parent context.Context, network, addr string) (ne
 	if err != nil {
 		return nil, err
 	}
-	reqsDone := make(chan struct{})
+	go s.discardMuxChannelRequests(reqs)
 	go func() {
-		defer close(reqsDone)
-		if reqs != nil {
-			cryptoSSH.DiscardRequests(reqs)
+		if se := ch.Stderr(); se != nil {
+			_, _ = io.Copy(io.Discard, se)
 		}
 	}()
 	var localAddr, remoteAddr net.Addr
@@ -675,7 +677,6 @@ func (s *MuxServer) dialSSHMux(parent context.Context, network, addr string) (ne
 		server:     s,
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
-		reqsDone:   reqsDone,
 	}, nil
 }
 

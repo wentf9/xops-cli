@@ -122,7 +122,7 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	handoffReqs := false
 	defer func() {
 		if !handoffReqs {
-			go discardAbortedChannelRequests(s.baseContext(), reqs)
+			go s.discardAbortedChannelRequests(s.baseContext(), reqs)
 		}
 	}()
 	releasePassengerAgent, err := enablePassengerAgentForward(s, ch, req.WantAgent)
@@ -325,7 +325,16 @@ func enablePassengerAgentForward(s *MuxServer, ch cryptoSSH.Channel, wantAgent b
 		s.getLogger().Debugf("mux: failed to initialize agent router for passenger session: %v", err)
 		return func() {}, nil
 	}
-	lease, err := router.acquireLocalLease(s.baseContext(), s.agentSocket, s.dialAgent, s.getLogger())
+	lease, err := router.acquireLocalLeaseWithControl(
+		s.baseContext(),
+		s.agentSocket,
+		s.dialAgent,
+		s.getLogger(),
+		agentForwardTransportControl{
+			interrupt:    s.interruptTransportAndShutdown,
+			closeTimeout: s.channelCloseTimeout,
+		},
+	)
 	if err != nil {
 		return func() {}, nil
 	}
@@ -892,7 +901,7 @@ func runPassengerChannelIO(s *MuxServer, conn net.Conn, ch cryptoSSH.Channel, re
 				}
 			}
 			if r.WantReply {
-				_ = r.Reply(recognized, nil)
+				_ = s.replyMuxChannelRequestBounded(r, recognized, nil)
 			}
 		}
 	}()
@@ -1072,16 +1081,14 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	defer func() { _ = s.closeMuxChannelBounded(ch, nil) }()
 
 	if err := sendSessionOpened(conn, reqID, 1); err != nil {
-		go discardAbortedChannelRequests(s.baseContext(), reqs)
+		go s.discardAbortedChannelRequests(s.baseContext(), reqs)
 		return err
 	}
 
 	remoteClosed := make(chan struct{})
 	go func() {
 		defer close(remoteClosed)
-		if reqs != nil {
-			cryptoSSH.DiscardRequests(reqs)
-		}
+		s.discardMuxChannelRequests(reqs)
 	}()
 	stderrDone := make(chan struct{})
 	go func() {

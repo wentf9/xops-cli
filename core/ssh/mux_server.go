@@ -1537,7 +1537,7 @@ func (s *MuxServer) openBoundedMuxChannel(ctx context.Context, channelType strin
 			return nil, nil, opened.err
 		}
 		if ctxErr := work.Err(); ctxErr != nil {
-			go discardAbortedChannelRequests(s.baseContext(), opened.requests)
+			go s.discardAbortedChannelRequests(s.baseContext(), opened.requests)
 			_ = s.closeMuxChannelBounded(opened.channel, nil)
 			return nil, nil, ctxErr
 		}
@@ -1546,7 +1546,7 @@ func (s *MuxServer) openBoundedMuxChannel(ctx context.Context, channelType strin
 		select {
 		case opened := <-result:
 			if opened.channel != nil {
-				go discardAbortedChannelRequests(s.baseContext(), opened.requests)
+				go s.discardAbortedChannelRequests(s.baseContext(), opened.requests)
 				_ = s.closeMuxChannelBounded(opened.channel, nil)
 			}
 			return nil, nil, errors.Join(work.Err(), opened.err)
@@ -1555,7 +1555,7 @@ func (s *MuxServer) openBoundedMuxChannel(ctx context.Context, channelType strin
 		interruptErr := s.interruptTransportAndShutdown()
 		opened := <-result
 		if opened.channel != nil {
-			go discardAbortedChannelRequests(s.baseContext(), opened.requests)
+			go s.discardAbortedChannelRequests(s.baseContext(), opened.requests)
 			_ = closeResource(opened.channel, "late SSH mux channel")
 		}
 		return nil, nil, errors.Join(work.Err(), interruptErr, opened.err)
@@ -1630,6 +1630,52 @@ func (s *MuxServer) closeMuxChannelWriteBounded(hc interface{ CloseWrite() error
 		interruptErr := s.interruptTransportAndShutdown()
 		closeErr := <-done
 		return errors.Join(fmt.Errorf("mux channel CloseWrite exceeded %s", timeout), interruptErr, closeErr)
+	}
+}
+
+// replyMuxChannelRequestBounded answers an incoming SSH channel request within
+// channelCloseTimeout, escalating to transport interruption and shutdown if
+// writing the reply stalls over a write-wedged transport.
+func (s *MuxServer) replyMuxChannelRequestBounded(req *cryptoSSH.Request, ok bool, payload []byte) error {
+	if req == nil || !req.WantReply {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := req.Reply(ok, payload)
+		if err != nil && (errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed)) {
+			err = nil
+		}
+		done <- err
+	}()
+	timeout := s.channelCloseTimeout()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		if s == nil {
+			return fmt.Errorf("mux channel request reply exceeded %s", timeout)
+		}
+		interruptErr := s.interruptTransportAndShutdown()
+		replyErr := <-done
+		return errors.Join(fmt.Errorf("mux channel request reply exceeded %s", timeout), interruptErr, replyErr)
+	}
+}
+
+// discardMuxChannelRequests drains incoming channel requests on a mux forward
+// or stdio channel, bounding any WantReply rejection via
+// replyMuxChannelRequestBounded so a write-wedged transport cannot leak the
+// request-drain goroutine.
+func (s *MuxServer) discardMuxChannelRequests(reqs <-chan *cryptoSSH.Request) {
+	if reqs == nil {
+		return
+	}
+	for req := range reqs {
+		if req != nil && req.WantReply {
+			_ = s.replyMuxChannelRequestBounded(req, false, nil)
+		}
 	}
 }
 
