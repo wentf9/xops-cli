@@ -92,7 +92,7 @@ func TestRound6_P2_4_SavedNodeWildcardPass2ExplicitIsolationAndSnapErrPrecedence
 	if pubOpts := pubPol.Options(); pubOpts != nil && pubOpts.Get(ssh.OptionServerAliveInterval) != "" {
 		t.Fatalf("public Resolve(unsaved-node) leaked old-alias option ServerAliveInterval=%q", pubOpts.Get(ssh.OptionServerAliveInterval))
 	}
-	gotAlias, gotCanon := adpUnsaved.resolveSessionOpenSSHMetadata(parser, "unsaved-node", config.ErrNodeNotFound, config.ConnectionSnapshot{}, SessionAuth{
+	gotAlias, gotCanon := adpUnsaved.resolveSessionOpenSSHMetadata(parser, "unsaved-node", config.ErrNodeNotFound, config.ConnectionSnapshot{}, true, SessionAuth{
 		OriginalHost: "short-b",
 	})
 	if gotAlias != "short-b" || gotCanon != "" {

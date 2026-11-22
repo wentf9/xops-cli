@@ -685,16 +685,48 @@ func NewNonInteractiveConnector(cfgProvider config.ConfigProvider, opts ...ssh.O
 	return newConnector(adp, opts...)
 }
 
-func (a *SSHAdapter) getSessionOverride(nodeID string) (SessionAuth, bool) {
+func (a *SSHAdapter) resolveAliasTarget(nodeID string) string {
+	if a == nil || a.cfgProvider == nil || nodeID == "" || config.IsOpenSSHNodeID(nodeID) {
+		return ""
+	}
+	if _, ok := a.cfgProvider.GetNode(nodeID); ok {
+		return ""
+	}
+	if target := a.cfgProvider.FindAlias(strings.TrimSpace(nodeID)); target != "" && target != nodeID {
+		return target
+	}
+	return ""
+}
+
+func (a *SSHAdapter) getSessionOverrideForResolved(reqNodeID, resolvedNodeID string, aliases []string) (SessionAuth, bool) {
+	if a == nil {
+		return SessionAuth{}, false
+	}
 	if a.sessionOverrides != nil {
-		if override, ok := a.sessionOverrides[nodeID]; ok {
+		if override, ok := a.sessionOverrides[reqNodeID]; ok {
 			return override, true
+		}
+		if resolvedNodeID != "" && resolvedNodeID != reqNodeID {
+			if override, ok := a.sessionOverrides[resolvedNodeID]; ok {
+				return override, true
+			}
+		}
+		if resolvedNodeID != "" && reqNodeID == resolvedNodeID && a.cfgProvider != nil {
+			for _, al := range aliases {
+				if override, ok := a.sessionOverrides[al]; ok && a.cfgProvider.FindAlias(al) == resolvedNodeID {
+					return override, true
+				}
+			}
 		}
 	}
 	if a.globalSessionAuth != nil {
 		return *a.globalSessionAuth, true
 	}
 	return SessionAuth{}, false
+}
+
+func (a *SSHAdapter) getSessionOverride(nodeID string) (SessionAuth, bool) {
+	return a.getSessionOverrideForResolved(nodeID, a.resolveAliasTarget(nodeID), nil)
 }
 
 func cloneSessionControlOptions(s SessionControlOptions) SessionControlOptions {
@@ -808,7 +840,7 @@ func mergeSessionControlAllowReuse(override, base SessionControlOptions, overrid
 	return base.AllowReuse
 }
 
-func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOptions, bool) {
+func (a *SSHAdapter) getSessionControlOverrideForResolved(reqNodeID, resolvedNodeID string, aliases []string) (SessionControlOptions, bool) {
 	if a == nil {
 		return SessionControlOptions{}, false
 	}
@@ -817,7 +849,19 @@ func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOpt
 		hasOverride bool
 	)
 	if a.sessionControlOverrides != nil {
-		override, hasOverride = a.sessionControlOverrides[nodeID]
+		override, hasOverride = a.sessionControlOverrides[reqNodeID]
+		if !hasOverride && resolvedNodeID != "" && resolvedNodeID != reqNodeID {
+			override, hasOverride = a.sessionControlOverrides[resolvedNodeID]
+		}
+		if !hasOverride && resolvedNodeID != "" && reqNodeID == resolvedNodeID && a.cfgProvider != nil {
+			for _, al := range aliases {
+				if ov, ok := a.sessionControlOverrides[al]; ok && a.cfgProvider.FindAlias(al) == resolvedNodeID {
+					override = ov
+					hasOverride = true
+					break
+				}
+			}
+		}
 	}
 	hasGlobal := a.globalSessionControl != nil
 	switch {
@@ -830,6 +874,10 @@ func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOpt
 	default:
 		return SessionControlOptions{}, false
 	}
+}
+
+func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOptions, bool) {
+	return a.getSessionControlOverrideForResolved(nodeID, a.resolveAliasTarget(nodeID), nil)
 }
 
 // GetControlConfig implements ssh.ControlProvider by delegating to Resolve.
@@ -896,7 +944,7 @@ func (a *SSHAdapter) ExpandControlPath(nodeID string, rawPath string) (string, e
 		return "", fmt.Errorf("resolve node %q for control path expansion: %w", nodeID, err)
 	}
 	env := sshenv.Discover()
-	return ssh.ExpandControlPath(rawPath, env, pol.controlTargetContextWithEnv(nodeID, env))
+	return ssh.ExpandControlPath(rawPath, env, pol.controlTargetContextWithEnv(pol.nodeID, env))
 }
 
 // SessionAuthMaterial captures typed session-level authentication inputs used
@@ -1166,7 +1214,7 @@ func (a *SSHAdapter) interactiveVerdictForNode(nodeID string) (verdict.Verdict, 
 	if a == nil || a.nonInteractive {
 		return verdict.Deny, nil
 	}
-	sessionCtrlOpts, _ := a.getSessionControlOverride(nodeID)
+	sessionCtrlOpts, hasCtrlOverride := a.getSessionControlOverride(nodeID)
 	if sessionCtrlOpts.Options != nil && sessionCtrlOpts.Options.Get(ssh.OptionBatchMode) != "" {
 		if sessionCtrlOpts.Options.BatchMode() {
 			return verdict.Deny, nil
@@ -1176,9 +1224,13 @@ func (a *SSHAdapter) interactiveVerdictForNode(nodeID string) (verdict.Verdict, 
 	if a.cfgProvider == nil {
 		return verdict.Deny, fmt.Errorf("configuration provider is nil")
 	}
+	var sessionCtrlPtr *SessionControlOptions
+	if hasCtrlOverride {
+		sessionCtrlPtr = &sessionCtrlOpts
+	}
 	pol, err := a.Resolve(context.Background(), ResolveRequest{
 		NodeID:         nodeID,
-		SessionControl: &sessionCtrlOpts,
+		SessionControl: sessionCtrlPtr,
 	})
 	if err != nil {
 		return verdict.Deny, err
@@ -1251,14 +1303,14 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 }
 
 func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
-	snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
+	snapshot, resolvedNodeID, _, _, err := a.resolveConnectionSnapshotResolved(nodeID)
 	if err != nil {
 		return "", fmt.Errorf("resolve node %q for remembered authentication: %w", nodeID, err)
 	}
 	version := authUpdateToken
 	if password != "" {
 		ref, nextVersion, rotateErr := a.credentialService.Rotate(ctx,
-			credential.Target{NodeID: nodeID, Kind: credential.KindLoginPassword},
+			credential.Target{NodeID: resolvedNodeID, Kind: credential.KindLoginPassword},
 			version, snapshot.Identity.LoginPasswordRef, a.defaultStoreID(), credential.Secret{Value: []byte(password)})
 		if rotateErr != nil {
 			return "", fmt.Errorf("persist remembered login password: %w", rotateErr)
@@ -1269,11 +1321,11 @@ func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpda
 	if passphrase != "" {
 		// The first rotation may have advanced the auth version; resolve the
 		// latest snapshot before rotating the independent passphrase ref.
-		snapshot, _, _, err = a.resolveConnectionSnapshot(nodeID)
+		snapshot, resolvedNodeID, _, _, err = a.resolveConnectionSnapshotResolved(nodeID)
 		if err != nil {
 			return "", fmt.Errorf("refresh node %q before persisting passphrase: %w", nodeID, err)
 		}
-		target, err := config.BindPrivateKeyFingerprint(a.cfgProvider.Snapshot(), credential.Target{NodeID: nodeID, Kind: credential.KindPassphrase, KeyPath: keyPath}, []byte(passphrase))
+		target, err := config.BindPrivateKeyFingerprint(a.cfgProvider.Snapshot(), credential.Target{NodeID: resolvedNodeID, Kind: credential.KindPassphrase, KeyPath: keyPath}, []byte(passphrase))
 		if err != nil {
 			return "", err
 		}
@@ -1349,12 +1401,12 @@ func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateT
 		}
 	}
 	if a.credentialService != nil && suPwd != "" {
-		snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
+		snapshot, resolvedNodeID, _, _, err := a.resolveConnectionSnapshotResolved(nodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve node %q for remembered privilege password: %w", nodeID, err)
 		}
 		_, version, rotateErr := a.credentialService.Rotate(ctx,
-			credential.Target{NodeID: nodeID, Kind: credential.KindPrivilegePassword},
+			credential.Target{NodeID: resolvedNodeID, Kind: credential.KindPrivilegePassword},
 			sudoUpdateToken, snapshot.Node.PrivilegePasswordRef, a.defaultStoreID(), credential.Secret{Value: []byte(suPwd)})
 		if rotateErr != nil {
 			return "", fmt.Errorf("persist remembered privilege password: %w", rotateErr)
@@ -1460,7 +1512,8 @@ func (a *SSHAdapter) resolveOTP(
 		if promptText == "" {
 			promptText = "OTP"
 		}
-		effectiveUser := effectiveSnapshotUser(snapshot.Identity.User)
+		effectiveHost := effectiveSnapshotHost(snapshot, hasOverride, override)
+		_, _, effectiveUser := effectiveSnapshotPortAndUser(snapshot, hasOverride, override)
 		identityName := snapshot.Node.IdentityRef
 		if identityName == "" {
 			identityName = effectiveUser
@@ -1470,7 +1523,7 @@ func (a *SSHAdapter) resolveOTP(
 			Args:           otpCfg.Args,
 			Timeout:        timeout,
 			Node:           req.NodeID,
-			Host:           snapshot.Host.Address,
+			Host:           effectiveHost,
 			User:           effectiveUser,
 			Identity:       identityName,
 			Prompt:         promptText,
@@ -1585,7 +1638,8 @@ func (a *SSHAdapter) resolveChallengeRuleAnswer(
 		if timeout <= 0 {
 			timeout = credentialhelper.DefaultAnswerCommandTimeout
 		}
-		effectiveUser := effectiveSnapshotUser(snapshot.Identity.User)
+		effectiveHost := effectiveSnapshotHost(snapshot, hasOverride, override)
+		_, _, effectiveUser := effectiveSnapshotPortAndUser(snapshot, hasOverride, override)
 		identityName := snapshot.Node.IdentityRef
 		if identityName == "" {
 			identityName = effectiveUser
@@ -1595,7 +1649,7 @@ func (a *SSHAdapter) resolveChallengeRuleAnswer(
 			Args:           rule.Args,
 			Timeout:        timeout,
 			Node:           req.NodeID,
-			Host:           snapshot.Host.Address,
+			Host:           effectiveHost,
 			User:           effectiveUser,
 			Identity:       identityName,
 			Prompt:         req.Prompt,

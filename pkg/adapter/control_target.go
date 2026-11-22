@@ -124,11 +124,11 @@ func ResolveControlTarget(req ControlTargetRequest) (ControlTargetResolution, er
 	}
 	env := resolveControlEnvironment(req.Environment)
 	connTarget := prepareControlConnectionTarget(req)
-	target, err := resolveControlTargetContext(req, connTarget, env)
+	target, hasResolved, err := resolveControlTargetContext(req, connTarget, env)
 	if err != nil {
 		return ControlTargetResolution{}, err
 	}
-	lookupKey, sessionAuth := resolveControlSessionLookup(req, connTarget, target)
+	lookupKey, sessionAuth := resolveControlSessionLookup(req, connTarget, target, hasResolved)
 	return ControlTargetResolution{
 		Target:      target,
 		LookupKey:   lookupKey,
@@ -309,12 +309,29 @@ func applyCanonicalHostToPlainSelector(
 	connTarget.Selector = canonHost
 }
 
+func controlTargetResolved(req ControlTargetRequest, connTarget config.ConnectionTarget) bool {
+	if strings.TrimSpace(connTarget.Selector) == "" {
+		return false
+	}
+	effectiveProvider := req.Provider
+	if effectiveProvider == nil {
+		effectiveProvider = config.NewProviderWithoutOpenSSH(nil)
+	}
+	lookupTarget := connTarget
+	if req.Provider == nil || (req.ApplyTargetNodeOverrides && strings.TrimSpace(req.OverrideExpandedHost) != "") {
+		lookupTarget.ProxyJump = "none"
+		lookupTarget.HasProxyJump = true
+	}
+	_, err := config.ResolveTarget(effectiveProvider, lookupTarget)
+	return err == nil
+}
+
 // ResolveControlSessionLookup computes the effective adapter lookup key and
 // SessionAuth metadata for an already-resolved TargetContext purely from caller
 // inputs and read-only provider lookups without mutating provider state.
 func ResolveControlSessionLookup(req ControlTargetRequest, target ssh.TargetContext) (string, SessionAuth) {
 	connTarget := prepareControlConnectionTarget(req)
-	return resolveControlSessionLookup(req, connTarget, target)
+	return resolveControlSessionLookup(req, connTarget, target, controlTargetResolved(req, connTarget))
 }
 
 func validateControlConfigSelectors(lookupKey, selector string, sessionAuth SessionAuth) error {
@@ -578,7 +595,7 @@ func resolveControlEnvironment(env *ssh.Environment) ssh.Environment {
 	return sshenv.Discover()
 }
 
-func resolveControlTargetContext(req ControlTargetRequest, connTarget config.ConnectionTarget, env ssh.Environment) (ssh.TargetContext, error) {
+func resolveControlTargetContext(req ControlTargetRequest, connTarget config.ConnectionTarget, env ssh.Environment) (ssh.TargetContext, bool, error) {
 	var (
 		target         ssh.TargetContext
 		resolvedTarget config.ResolvedTarget
@@ -597,7 +614,7 @@ func resolveControlTargetContext(req ControlTargetRequest, connTarget config.Con
 		resolved, err := config.ResolveTarget(effectiveProvider, lookupTarget)
 		if err != nil {
 			if !isTargetMissingError(err) {
-				return ssh.TargetContext{}, err
+				return ssh.TargetContext{}, false, err
 			}
 		} else {
 			resolvedTarget = resolved
@@ -629,10 +646,10 @@ func resolveControlTargetContext(req ControlTargetRequest, connTarget config.Con
 	}
 	jumpHost, err := resolveControlEffectiveJumpHost(req, connTarget, hasResolved, resolvedTarget)
 	if err != nil {
-		return ssh.TargetContext{}, err
+		return ssh.TargetContext{}, false, err
 	}
 	target.JumpHost = jumpHost
-	return ssh.NormalizeTargetContext(target, env), nil
+	return ssh.NormalizeTargetContext(target, env), hasResolved, nil
 }
 
 func applyTargetNodeOverrides(req ControlTargetRequest, target *ssh.TargetContext) {
@@ -1070,39 +1087,48 @@ func effectiveControlSessionProxyJump(connTarget config.ConnectionTarget, sessio
 	return ""
 }
 
-func explicitControlSessionUserPort(req ControlTargetRequest, connTarget config.ConnectionTarget) (user string, port uint16) {
-	isExactSavedNode := func(sel string) bool {
-		if req.Provider == nil || config.IsOpenSSHNodeID(sel) {
-			return false
-		}
-		_, ok := req.Provider.GetNode(sel)
-		return ok
-	}
-	for _, rawSel := range []string{connTarget.RawSelector, connTarget.Selector, req.Target.RawSelector, req.Target.Selector} {
+func parseExplicitSelectorUserPort(provider config.ConfigProvider, selectors []string) (user string, port uint16) {
+	for _, rawSel := range selectors {
 		sel := strings.TrimSpace(rawSel)
-		if sel == "" || isExactSavedNode(sel) {
+		if sel == "" {
 			continue
 		}
-		if ref, err := config.ParseTargetRef(sel); err == nil {
-			if user == "" && ref.User != "" {
-				user = ref.User
-			}
-			if port == 0 && ref.HasPort && ref.Port > 0 {
-				port = ref.Port
+		if provider != nil && !config.IsOpenSSHNodeID(sel) {
+			if _, ok := provider.GetNode(sel); ok {
+				continue
 			}
 		}
+		ref, err := config.ParseTargetRef(sel)
+		if err != nil {
+			continue
+		}
+		if user == "" && ref.User != "" {
+			user = ref.User
+		}
+		if port == 0 && ref.HasPort && ref.Port > 0 {
+			port = ref.Port
+		}
 	}
+	return user, port
+}
+
+func explicitControlSessionUserPort(req ControlTargetRequest, connTarget config.ConnectionTarget, hasResolved bool) (user string, port uint16) {
+	user, port = parseExplicitSelectorUserPort(req.Provider, []string{
+		connTarget.RawSelector, connTarget.Selector, req.Target.RawSelector, req.Target.Selector,
+	})
 	if connTarget.HasUser && strings.TrimSpace(connTarget.User) != "" {
 		user = strings.TrimSpace(connTarget.User)
 	}
 	if connTarget.HasPort && connTarget.Port > 0 {
 		port = connTarget.Port
 	}
-	if user == "" && strings.TrimSpace(req.FallbackUser) != "" {
-		user = strings.TrimSpace(req.FallbackUser)
-	}
-	if port == 0 && req.FallbackPort > 0 {
-		port = req.FallbackPort
+	if !hasResolved {
+		if user == "" && strings.TrimSpace(req.FallbackUser) != "" {
+			user = strings.TrimSpace(req.FallbackUser)
+		}
+		if port == 0 && req.FallbackPort > 0 {
+			port = req.FallbackPort
+		}
 	}
 	return user, port
 }
@@ -1121,47 +1147,13 @@ func controlOverrideLookupTarget(req ControlTargetRequest, connTarget config.Con
 	return overrideHostName, lookupTarget
 }
 
-func resolveControlSessionLookup(
-	req ControlTargetRequest,
+func finalizeControlSessionLookup(
+	lookupKey string,
 	connTarget config.ConnectionTarget,
-	target ssh.TargetContext,
+	origHost, canonHost, targetOrig string,
+	resolvedVirtual bool,
+	auth SessionAuth,
 ) (string, SessionAuth) {
-	lookupKey := trimNonPaddedOpenSSH(req.NodeID)
-	sel := trimNonPaddedOpenSSH(connTarget.Selector)
-	if sel == "" {
-		sel = lookupKey
-	}
-	origHost := strings.TrimSpace(req.CanonicalOriginalHost)
-	canonHost := strings.TrimSpace(req.CanonicalHost)
-	if !shouldPropagateControlCanonicalOrigin(req.Provider, sel, origHost, canonHost) {
-		origHost = ""
-		canonHost = ""
-	}
-	targetOrig := strings.TrimSpace(target.OriginalHost)
-	proxyJump := effectiveControlSessionProxyJump(req.Target, req.SessionControl)
-	sessUser, sessPort := explicitControlSessionUserPort(req, connTarget)
-	overrideHostName, lookupTarget := controlOverrideLookupTarget(req, connTarget)
-	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
-		req.Provider, lookupKey, req.NodeID, lookupTarget, origHost, canonHost, targetOrig, proxyJump,
-	)
-	if handled {
-		savedAuth.User = sessUser
-		savedAuth.Port = sessPort
-		savedAuth.HostName = overrideHostName
-		return key, savedAuth
-	}
-	if lookupKey == "" && key != "" {
-		lookupKey = key
-	}
-	if canonHost == "" {
-		canonHost = strings.TrimSpace(target.CanonicalHost)
-	}
-	auth := SessionAuth{
-		User:      sessUser,
-		Port:      sessPort,
-		HostName:  overrideHostName,
-		ProxyJump: proxyJump,
-	}
 	if canonHost != "" {
 		if lookupKey == "" || !config.IsOpenSSHNodeID(lookupKey) {
 			lookupKey = config.OpenSSHNodePrefix + canonHost
@@ -1184,13 +1176,54 @@ func resolveControlSessionLookup(
 		return lookupKey, auth
 	}
 	if lookupKey == "" {
-		if targetOrig != "" {
-			lookupKey = targetOrig
-		} else {
-			lookupKey = strings.TrimSpace(connTarget.Selector)
-		}
+		lookupKey = firstNonEmptySessionValue(targetOrig, connTarget.Selector)
 	}
 	auth.OriginalHost = firstNonEmptySessionValue(origHost, targetOrig)
 	auth.CanonicalHost = canonHost
 	return lookupKey, auth
+}
+
+func resolveControlSessionLookup(
+	req ControlTargetRequest,
+	connTarget config.ConnectionTarget,
+	target ssh.TargetContext,
+	hasResolved bool,
+) (string, SessionAuth) {
+	lookupKey := trimNonPaddedOpenSSH(req.NodeID)
+	sel := trimNonPaddedOpenSSH(connTarget.Selector)
+	if sel == "" {
+		sel = lookupKey
+	}
+	origHost := strings.TrimSpace(req.CanonicalOriginalHost)
+	canonHost := strings.TrimSpace(req.CanonicalHost)
+	if !shouldPropagateControlCanonicalOrigin(req.Provider, sel, origHost, canonHost) {
+		origHost = ""
+		canonHost = ""
+	}
+	targetOrig := strings.TrimSpace(target.OriginalHost)
+	proxyJump := effectiveControlSessionProxyJump(req.Target, req.SessionControl)
+	overrideHostName, lookupTarget := controlOverrideLookupTarget(req, connTarget)
+	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
+		req.Provider, lookupKey, req.NodeID, lookupTarget, origHost, canonHost, targetOrig, proxyJump,
+	)
+	sessUser, sessPort := explicitControlSessionUserPort(req, connTarget, hasResolved || handled || resolvedVirtual)
+	if handled {
+		savedAuth.User = sessUser
+		savedAuth.Port = sessPort
+		savedAuth.HostName = overrideHostName
+		return key, savedAuth
+	}
+	if lookupKey == "" && key != "" {
+		lookupKey = key
+	}
+	if canonHost == "" {
+		canonHost = strings.TrimSpace(target.CanonicalHost)
+	}
+	auth := SessionAuth{
+		User:      sessUser,
+		Port:      sessPort,
+		HostName:  overrideHostName,
+		ProxyJump: proxyJump,
+	}
+	return finalizeControlSessionLookup(lookupKey, connTarget, origHost, canonHost, targetOrig, resolvedVirtual, auth)
 }
