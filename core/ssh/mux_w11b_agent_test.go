@@ -609,11 +609,11 @@ func testW11bC11M1ProxyJumpSlowRemoteAgentClose(t *testing.T) {
 		t.Fatalf("CheckInvariants after ProxyJump slow remote agent close: %v", err)
 	}
 
-	// Once remote finally closes the agent channel, l.pumps must finish cleanly
+	// Once remote finally closes the agent channel, epoch.pumps must finish cleanly
 	// and release its channel slot with 0 leaked goroutines.
 	releaseRemoteAgent()
-	waitWithin(t, "ProxyJump lease.pumps drain after remote agent close", 2*time.Second, func() {
-		lease.pumps.Wait()
+	waitWithin(t, "ProxyJump epoch.pumps drain after remote agent close", 2*time.Second, func() {
+		lease.epoch.pumps.Wait()
 	})
 	waitForCondition(t, 2*time.Second, func() bool {
 		return router.activeChannels.Load() == 0

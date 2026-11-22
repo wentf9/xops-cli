@@ -640,7 +640,8 @@ func TestP1_AgentForward_DialTimeout(t *testing.T) {
 	}
 	defer lease.Release()
 
-	if !router.tryAcquireChannelSlot() || !lease.tryBeginPump() {
+	epoch := router.beginActiveEpoch()
+	if !router.tryAcquireChannelSlot() || epoch == nil {
 		t.Fatal("failed to reserve channel slot and pump")
 	}
 	ch := &p1StallingAcceptNewChannel{
@@ -649,9 +650,9 @@ func TestP1_AgentForward_DialTimeout(t *testing.T) {
 	}
 	done := make(chan struct{})
 	go func() {
-		defer lease.pumps.Done()
+		defer epoch.pumps.Done()
 		defer close(done)
-		router.serveLocalAgentChannel(lease, ch)
+		router.serveLocalAgentChannel(epoch, ch)
 	}()
 
 	select {
@@ -689,7 +690,8 @@ func TestP1_AgentForward_StalledAcceptRelease(t *testing.T) {
 		}
 	}()
 
-	if !router.tryAcquireChannelSlot() || !lease.tryBeginPump() {
+	epoch := router.beginActiveEpoch()
+	if !router.tryAcquireChannelSlot() || epoch == nil {
 		t.Fatal("failed to reserve channel slot and pump")
 	}
 	ch := &p1StallingAcceptNewChannel{
@@ -698,9 +700,9 @@ func TestP1_AgentForward_StalledAcceptRelease(t *testing.T) {
 	}
 	done := make(chan struct{})
 	go func() {
-		defer lease.pumps.Done()
+		defer epoch.pumps.Done()
 		defer close(done)
-		router.serveLocalAgentChannel(lease, ch)
+		router.serveLocalAgentChannel(epoch, ch)
 	}()
 
 	select {

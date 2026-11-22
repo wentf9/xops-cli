@@ -20,6 +20,8 @@ import (
 type muxProxySSHConn struct {
 	cryptoSSH.Conn
 	rawConn    net.Conn
+	physRoot   *physicalSSHConn
+	activity   *sshActivityConn
 	target     TargetContext
 	remoteAddr net.Addr
 	localAddr  net.Addr
@@ -38,6 +40,10 @@ func (a *targetTCPAddr) Network() string { return a.network }
 func (a *targetTCPAddr) String() string  { return a.address }
 
 func newMuxProxySSHConn(underlying cryptoSSH.Conn, raw net.Conn, target TargetContext) *muxProxySSHConn {
+	return newMuxProxySSHConnWithActivity(underlying, raw, nil, target)
+}
+
+func newMuxProxySSHConnWithActivity(underlying cryptoSSH.Conn, raw net.Conn, activity *sshActivityConn, target TargetContext) *muxProxySSHConn {
 	port := target.Port
 	if port <= 0 {
 		port = 22
@@ -45,14 +51,21 @@ func newMuxProxySSHConn(underlying cryptoSSH.Conn, raw net.Conn, target TargetCo
 	remoteStr := joinHostPort(target.Host, port)
 	remoteAddr := &targetTCPAddr{network: "tcp", address: remoteStr}
 
-	localAddr := raw.LocalAddr()
+	var localAddr net.Addr
+	if raw != nil {
+		localAddr = raw.LocalAddr()
+	}
 	if localAddr == nil {
 		localAddr = &targetTCPAddr{network: "unix", address: "local-controlmaster"}
 	}
 
+	physRoot, _ := raw.(*physicalSSHConn)
+
 	return &muxProxySSHConn{
 		Conn:       underlying,
 		rawConn:    raw,
+		physRoot:   physRoot,
+		activity:   activity,
 		target:     target,
 		remoteAddr: remoteAddr,
 		localAddr:  localAddr,
@@ -230,16 +243,18 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 		return nil, nil, fmt.Errorf("dial control socket %q: %w", socketPath, err)
 	}
 
-	unbind := bindConnContext(ctx, rawConn, DefaultInteractionTimeout)
+	physRoot := &physicalSSHConn{Conn: rawConn}
+	unbind := bindConnContext(ctx, physRoot, DefaultInteractionTimeout)
 	defer unbind()
 
 	if err := checkPeerUID(rawConn, options.expectedUID); err != nil {
-		_ = rawConn.Close()
+		_ = physRoot.Close()
 		return nil, nil, fmt.Errorf("control socket %q rejected: %w", socketPath, err)
 	}
 
+	activity := newSSHActivityConn(physRoot)
 	inspector := &muxHandshakeInspectorConn{
-		Conn:       rawConn,
+		Conn:       activity,
 		socketPath: socketPath,
 		target:     target,
 	}
@@ -251,7 +266,7 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 	inspector.readBuf.Reset()
 	unbind()
 	if err != nil {
-		_ = rawConn.Close()
+		_ = physRoot.Close()
 		if inspector.mismatchErr != nil {
 			return nil, nil, inspector.mismatchErr
 		}
@@ -273,16 +288,16 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 	}
 	if inspector.mismatchErr != nil {
 		_ = abortUnclaimedSSHConn(sshConn, chans, reqs)
-		_ = rawConn.Close()
+		_ = physRoot.Close()
 		return nil, nil, inspector.mismatchErr
 	}
 	if err := ctx.Err(); err != nil {
 		_ = abortUnclaimedSSHConn(sshConn, chans, reqs)
-		_ = rawConn.Close()
+		_ = physRoot.Close()
 		return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, err)
 	}
 
-	proxyConn := newMuxProxySSHConn(sshConn, rawConn, target)
+	proxyConn := newMuxProxySSHConnWithActivity(sshConn, physRoot, activity, target)
 	sshClient := cryptoSSH.NewClient(proxyConn, chans, reqs)
 
 	return sshClient, proxyConn, nil

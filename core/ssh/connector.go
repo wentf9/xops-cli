@@ -974,11 +974,6 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 	}
 
 	rootConn := proxyConn.RawConn()
-	if rootConn != nil {
-		if _, ok := rootConn.(*physicalSSHConn); !ok {
-			rootConn = &physicalSSHConn{Conn: rootConn}
-		}
-	}
 	var publishedCfg *ClientConfig
 	if planNode.cfg != nil {
 		publishedCfg = NewClientConfig(*planNode.cfg)

@@ -453,15 +453,16 @@ func TestReviewSess_L1_L2_AgentHalfCloseNonCloseWriteAndConcurrentDrain(t *testi
 	if !router.tryAcquireChannelSlot() {
 		t.Fatal("tryAcquireChannelSlot failed")
 	}
-	if !lease.tryBeginPump() {
-		t.Fatal("tryBeginPump failed")
+	epoch := router.beginActiveEpoch()
+	if epoch == nil {
+		t.Fatal("beginActiveEpoch failed")
 	}
 	fakeNewCh, peerSSHCh, closeRemoteReqs := newFakeAgentNewChannel()
 	pumpDone := make(chan struct{})
 	go func() {
-		defer lease.pumps.Done()
+		defer epoch.pumps.Done()
 		defer close(pumpDone)
-		router.serveLocalAgentChannel(lease, fakeNewCh)
+		router.serveLocalAgentChannel(epoch, fakeNewCh)
 	}()
 
 	if _, err := peerSSHCh.Write([]byte("PING")); err != nil {
@@ -502,15 +503,16 @@ func TestReviewSess_L1_L2_AgentHalfCloseNonCloseWriteAndConcurrentDrain(t *testi
 	}
 	defer leasePipe.Release()
 
-	if !router.tryAcquireChannelSlot() || !leasePipe.tryBeginPump() {
+	epoch2 := router.beginActiveEpoch()
+	if !router.tryAcquireChannelSlot() || epoch2 == nil {
 		t.Fatal("failed to start second pump")
 	}
 	fakeNewCh2, peerSSHCh2, closeRemoteReqs2 := newFakeAgentNewChannel()
 	pumpDone2 := make(chan struct{})
 	go func() {
-		defer leasePipe.pumps.Done()
+		defer epoch2.pumps.Done()
 		defer close(pumpDone2)
-		router.serveLocalAgentChannel(leasePipe, fakeNewCh2)
+		router.serveLocalAgentChannel(epoch2, fakeNewCh2)
 	}()
 
 	_, _ = peerSSHCh2.Write([]byte("DATA"))

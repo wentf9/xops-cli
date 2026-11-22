@@ -21,6 +21,13 @@ type sshActivityConn struct {
 
 type sshTransportFailure struct{ err error }
 
+func newSSHActivityConn(conn net.Conn) *sshActivityConn {
+	return &sshActivityConn{
+		Conn:      conn,
+		startedAt: time.Now(),
+	}
+}
+
 func (c *sshActivityConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
@@ -54,9 +61,26 @@ func (c *Client) transportError() error {
 	if c == nil || c.sshClient == nil {
 		return net.ErrClosed
 	}
-	if conn, ok := c.sshClient.Conn.(*activitySSHConn); ok {
-		if failure := conn.activity.failure.Load(); failure != nil {
-			return failure.err
+	switch conn := c.sshClient.Conn.(type) {
+	case *activitySSHConn:
+		if conn != nil && conn.activity != nil {
+			if failure := conn.activity.failure.Load(); failure != nil {
+				return failure.err
+			}
+		}
+	case *muxProxySSHConn:
+		if conn != nil {
+			if conn.activity != nil {
+				if failure := conn.activity.failure.Load(); failure != nil {
+					return failure.err
+				}
+			}
+			if conn.physRoot != nil && conn.physRoot.closed.Load() {
+				return net.ErrClosed
+			}
+			if conn.closed.Load() {
+				return net.ErrClosed
+			}
 		}
 	}
 	if root, ok := c.rootConn.(*physicalSSHConn); ok && root.closed.Load() {
@@ -78,8 +102,18 @@ type activitySSHConn struct {
 }
 
 func keepAliveReadTimeout(client *ssh.Client, timeout time.Duration) time.Duration {
-	if conn, ok := client.Conn.(*activitySSHConn); ok {
-		return timeout - conn.activity.readIdle()
+	if client == nil {
+		return 0
+	}
+	switch conn := client.Conn.(type) {
+	case *activitySSHConn:
+		if conn != nil && conn.activity != nil {
+			return timeout - conn.activity.readIdle()
+		}
+	case *muxProxySSHConn:
+		if conn != nil && conn.activity != nil {
+			return timeout - conn.activity.readIdle()
+		}
 	}
 	// Externally constructed clients have no receive tracker. Retain their
 	// bounded request timeout rather than assuming the connection is healthy.
