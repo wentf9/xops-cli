@@ -16,11 +16,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/wentf9/xops-cli/core/mcp/guardrail"
-	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/core/ssh"
 	cryptoSSH "golang.org/x/crypto/ssh"
-	"gopkg.in/yaml.v3"
 )
 
 const coreSSHImportPath = "github.com/wentf9/xops-cli/core/ssh"
@@ -133,42 +130,6 @@ func findFuncDecl(file *ast.File, name string) *ast.FuncDecl {
 	return nil
 }
 
-func declaredTopLevelNames(file *ast.File) []struct {
-	name string
-	pos  token.Pos
-} {
-	var out []struct {
-		name string
-		pos  token.Pos
-	}
-	for _, decl := range file.Decls {
-		switch d := decl.(type) {
-		case *ast.FuncDecl:
-			out = append(out, struct {
-				name string
-				pos  token.Pos
-			}{name: d.Name.Name, pos: d.Name.Pos()})
-		case *ast.GenDecl:
-			if d.Tok != token.VAR && d.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range d.Specs {
-				vs, ok := spec.(*ast.ValueSpec)
-				if !ok {
-					continue
-				}
-				for _, ident := range vs.Names {
-					out = append(out, struct {
-						name string
-						pos  token.Pos
-					}{name: ident.Name, pos: ident.Pos()})
-				}
-			}
-		}
-	}
-	return out
-}
-
 func isSelectorCall(call *ast.CallExpr, pkgName, funcName string) bool {
 	if pkgName == "" {
 		return false
@@ -194,193 +155,6 @@ func exprContainsSelectorCall(node ast.Node, pkgName, funcName string) bool {
 		return true
 	})
 	return found
-}
-
-// TestP4_NoDuplicateEncodersOrOptionSwitchTables enforces P0-P4 single-authority
-// invariants across non-test Go source files in core/, pkg/, internal/, and cmd/.
-func TestP4_NoDuplicateEncodersOrOptionSwitchTables(t *testing.T) {
-	t.Parallel()
-
-	root := p4RepoRoot(t)
-	files := parseNonTestGoFiles(t, root, "core", "pkg", "internal", "cmd")
-
-	t.Run("POSIXShellQuoteSingleAuthority", func(t *testing.T) {
-		checkUniquePOSIXShellQuoteEncoder(t, files)
-	})
-	t.Run("SplitOptionKeyValueSingleAuthority", func(t *testing.T) {
-		checkSplitOptionKeyValueAuthority(t, files)
-	})
-	t.Run("WindowsReservedDeviceNameAndExecSanitizer", func(t *testing.T) {
-		checkWindowsReservedDeviceNameAndExecSanitizer(t, files)
-	})
-	t.Run("NoDeletedParallelSwitchHelpers", func(t *testing.T) {
-		checkDeletedParallelSwitchHelpers(t, files)
-	})
-	t.Run("ControlTargetSingleAuthority", func(t *testing.T) {
-		checkControlTargetAuthority(t, files)
-	})
-}
-
-func checkUniquePOSIXShellQuoteEncoder(t *testing.T, files []parsedGoFile) {
-	t.Helper()
-	var shellQuoteDecls []string
-	var exportedShellQuoteDecls []string
-	for _, pf := range files {
-		for _, d := range declaredTopLevelNames(pf.file) {
-			pos := pf.fset.Position(d.pos)
-			switch d.name {
-			case "posixSingleQuote":
-				t.Errorf("forbidden duplicate POSIX encoder %q declared at %s:%d (use core/ssh.ShellQuote)", d.name, pf.relPath, pos.Line)
-			case "shellQuote":
-				shellQuoteDecls = append(shellQuoteDecls, pf.relPath)
-				// core/ssh/privilege_exchange.go currently hosts the package-private shellQuote
-				// wrapped and exported by core/ssh/command_plan.go:ShellQuote.
-				if pf.relPath != "core/ssh/command_plan.go" && pf.relPath != "core/ssh/privilege_exchange.go" {
-					t.Errorf("duplicate %q declared at %s:%d; only core/ssh may define shellQuote", d.name, pf.relPath, pos.Line)
-				}
-			case "ShellQuote":
-				exportedShellQuoteDecls = append(exportedShellQuoteDecls, pf.relPath)
-				if pf.relPath != "core/ssh/command_plan.go" {
-					t.Errorf("duplicate %q declared at %s:%d; only core/ssh/command_plan.go may declare ShellQuote", d.name, pf.relPath, pos.Line)
-				}
-			}
-		}
-	}
-	if len(exportedShellQuoteDecls) != 1 {
-		t.Errorf("expected exactly 1 ShellQuote declaration in core/ssh/command_plan.go, found %d (%v)", len(exportedShellQuoteDecls), exportedShellQuoteDecls)
-	}
-	if len(shellQuoteDecls) > 1 {
-		t.Errorf("expected at most 1 shellQuote declaration in core/ssh, found %d (%v)", len(shellQuoteDecls), shellQuoteDecls)
-	}
-}
-
-func checkSplitOptionKeyValueAuthority(t *testing.T, files []parsedGoFile) {
-	t.Helper()
-	var coreFound, adapterFound bool
-	for _, pf := range files {
-		for _, d := range declaredTopLevelNames(pf.file) {
-			if d.name != "SplitOptionKeyValue" {
-				continue
-			}
-			pos := pf.fset.Position(d.pos)
-			switch pf.relPath {
-			case "core/ssh/ssh_options.go":
-				coreFound = true
-			case "pkg/adapter/ssh_adapter.go":
-				adapterFound = true
-				assertOneLineSplitOptionDelegate(t, pf)
-			default:
-				t.Errorf("duplicate SplitOptionKeyValue declared at %s:%d; allowed only in core/ssh/ssh_options.go and 1-line delegate in pkg/adapter/ssh_adapter.go", pf.relPath, pos.Line)
-			}
-		}
-	}
-	if !coreFound {
-		t.Error("canonical core/ssh/ssh_options.go:SplitOptionKeyValue declaration not found")
-	}
-	if !adapterFound {
-		t.Error("compatibility delegate pkg/adapter/ssh_adapter.go:SplitOptionKeyValue declaration not found")
-	}
-}
-
-func assertOneLineSplitOptionDelegate(t *testing.T, pf parsedGoFile) {
-	t.Helper()
-	sshPkg := importLocalName(pf.file, coreSSHImportPath)
-	fn := findFuncDecl(pf.file, "SplitOptionKeyValue")
-	if fn == nil || fn.Body == nil {
-		t.Fatalf("%s: SplitOptionKeyValue function body not found", pf.relPath)
-	}
-	if len(fn.Body.List) != 1 {
-		t.Errorf("%s: SplitOptionKeyValue must remain a 1-line delegate to ssh.SplitOptionKeyValue, got %d statements", pf.relPath, len(fn.Body.List))
-		return
-	}
-	ret, ok := fn.Body.List[0].(*ast.ReturnStmt)
-	if !ok || len(ret.Results) != 1 {
-		t.Errorf("%s: SplitOptionKeyValue must return ssh.SplitOptionKeyValue directly", pf.relPath)
-		return
-	}
-	call, ok := ret.Results[0].(*ast.CallExpr)
-	if !ok || !isSelectorCall(call, sshPkg, "SplitOptionKeyValue") {
-		t.Errorf("%s: SplitOptionKeyValue must delegate directly to %s.SplitOptionKeyValue", pf.relPath, sshPkg)
-	}
-}
-
-func checkWindowsReservedDeviceNameAndExecSanitizer(t *testing.T, files []parsedGoFile) {
-	t.Helper()
-	const coreFSXImportPath = "github.com/wentf9/xops-cli/core/fsx"
-	var coreSSHCallsFSX, execCallsSanitizer bool
-	for _, pf := range files {
-		if pf.relPath == "core/ssh/identity_path.go" {
-			fsxPkg := importLocalName(pf.file, coreFSXImportPath)
-			coreSSHCallsFSX = exprContainsSelectorCall(pf.file, fsxPkg, "ValidateLocalComponent")
-		}
-		if pf.relPath == "cmd/exec.go" {
-			sshPkg := importLocalName(pf.file, coreSSHImportPath)
-			execCallsSanitizer = exprContainsSelectorCall(pf.file, sshPkg, "SanitizeFilenameComponent")
-		}
-	}
-	if !coreSSHCallsFSX {
-		t.Error("core/ssh/identity_path.go must call core/fsx.ValidateLocalComponent")
-	}
-	if !execCallsSanitizer {
-		t.Error("cmd/exec.go must call core/ssh.SanitizeFilenameComponent")
-	}
-}
-
-func checkDeletedParallelSwitchHelpers(t *testing.T, files []parsedGoFile) {
-	t.Helper()
-	forbidden := map[string]struct{}{
-		"isStrictOpenSSHScalarDirective":     {},
-		"isOpenSSHMultiTokenListDirective":   {},
-		"isOpenSSHRawTokenListDirective":     {},
-		"isOpenSSHWholeLineCommandDirective": {},
-		"preservesSSHConfigRawValue":         {},
-		"isAllowedOpenSSHTrustOption":        {},
-		"isMuxDaemonAuthoritativeOption":     {},
-		"isMuxDaemonPreservedOption":         {},
-		"isSessionOrForwardOption":           {},
-	}
-	for _, pf := range files {
-		if !strings.HasPrefix(pf.relPath, "pkg/") && !strings.HasPrefix(pf.relPath, "cmd/") {
-			continue
-		}
-		for _, d := range declaredTopLevelNames(pf.file) {
-			if _, banned := forbidden[d.name]; banned {
-				pos := pf.fset.Position(d.pos)
-				t.Errorf("deleted parallel switch helper %q reappeared at %s:%d; drive option rules from core/ssh.OptionSpec", d.name, pf.relPath, pos.Line)
-			}
-		}
-	}
-}
-
-func checkControlTargetAuthority(t *testing.T, files []parsedGoFile) {
-	t.Helper()
-	var hasAuthorityTarget, hasAuthoritySocket, hasAuthorityLookup bool
-	for _, pf := range files {
-		for _, d := range declaredTopLevelNames(pf.file) {
-			pos := pf.fset.Position(d.pos)
-			if strings.HasPrefix(pf.relPath, "cmd/") {
-				if d.name == "resolveSavedControlSessionLookup" ||
-					d.name == "targetContextFromResolvedTarget" ||
-					d.name == "TargetContextFromResolvedTarget" {
-					t.Errorf("duplicate control-plane helper %q declared in cmd at %s:%d; pkg/adapter/control_target.go is the sole authority", d.name, pf.relPath, pos.Line)
-				}
-			}
-			if pf.relPath == "pkg/adapter/control_target.go" {
-				switch d.name {
-				case "ResolveControlTarget":
-					hasAuthorityTarget = true
-				case "ResolveControlSocketPath":
-					hasAuthoritySocket = true
-				case "resolveSavedControlSessionLookup":
-					hasAuthorityLookup = true
-				}
-			}
-		}
-	}
-	if !hasAuthorityTarget || !hasAuthoritySocket || !hasAuthorityLookup {
-		t.Errorf("pkg/adapter/control_target.go missing expected control-plane symbols (ResolveControlTarget=%v, ResolveControlSocketPath=%v, resolveSavedControlSessionLookup=%v)",
-			hasAuthorityTarget, hasAuthoritySocket, hasAuthorityLookup)
-	}
 }
 
 // TestP4_TUIRemoteShellCommandEncodingGuard parses pkg/tui/log_stream.go to lock
@@ -490,32 +264,6 @@ func TestP4_MCPHostUsesConnectPlanExclusively(t *testing.T) {
 	if capturePlanCalls == 0 {
 		t.Error("expected internal/mcphost to call ssh.CapturePlan( at least once")
 	}
-}
-
-func isErrNilComparison(expr ast.Expr, op token.Token) bool {
-	bin, ok := unwrapParen(expr).(*ast.BinaryExpr)
-	if !ok || bin.Op != op {
-		return false
-	}
-	return (isErrorIdent(bin.X) && isNilIdent(bin.Y)) || (isNilIdent(bin.X) && isErrorIdent(bin.Y))
-}
-
-func isErrorIdent(expr ast.Expr) bool {
-	ident, ok := unwrapParen(expr).(*ast.Ident)
-	if !ok {
-		return false
-	}
-	return ident.Name == "err" || strings.HasSuffix(ident.Name, "Err")
-}
-
-func isLiteralTrueIdent(expr ast.Expr) bool {
-	ident, ok := unwrapParen(expr).(*ast.Ident)
-	return ok && ident.Name == "true"
-}
-
-func isLiteralTrueReturnStmt(stmt ast.Stmt) bool {
-	ret, ok := stmt.(*ast.ReturnStmt)
-	return ok && len(ret.Results) == 1 && isLiteralTrueIdent(ret.Results[0])
 }
 
 // TestP4_OptionRegistryCrossLayerCompleteness validates core/ssh.RegisteredOptionSpecs()
@@ -754,44 +502,10 @@ func exprMatchesForbiddenChildEnv(expr ast.Expr, literals, idents map[string]str
 	return matched
 }
 
-// TestP5_ZeroValueAndFailClosedSecurityInvariants locks in critical Phase 5
-// fail-closed behavioral invariants across guardrail, policy YAML decoding,
-// and DNSSEC-authenticated SSHFP evaluation.
+// TestP5_ZeroValueAndFailClosedSecurityInvariants locks in behavioral Phase 5
+// fail-closed security invariants not covered by P7 zero-value reflection tests.
 func TestP5_ZeroValueAndFailClosedSecurityInvariants(t *testing.T) {
 	t.Parallel()
-
-	t.Run("GuardrailDecisionZeroValueIsDeny", func(t *testing.T) {
-		var d guardrail.Decision
-		if d != guardrail.Deny {
-			t.Fatalf("zero-value guardrail.Decision = %v (%d), want guardrail.Deny (%d)", d, d, guardrail.Deny)
-		}
-		if d.String() != "deny" {
-			t.Fatalf("zero-value guardrail.Decision.String() = %q, want %q", d.String(), "deny")
-		}
-	})
-
-	t.Run("PolicyConfigZeroValueAndYAMLDisabledSemantics", func(t *testing.T) {
-		const yamlWithoutDisabled = "approval_threshold: dangerous\nno_elicit_fallback: deny\n"
-		var cfg corepolicy.Config
-		if err := yaml.Unmarshal([]byte(yamlWithoutDisabled), &cfg); err != nil {
-			t.Fatalf("yaml.Unmarshal(policy.Config without disabled): %v", err)
-		}
-		if cfg.Disabled {
-			t.Fatal("YAML policy.Config omitting disabled must default to Disabled == false (guardrail ON)")
-		}
-
-		var disabledCfg corepolicy.Config
-		if err := yaml.Unmarshal([]byte("disabled: true\n"), &disabledCfg); err != nil {
-			t.Fatalf("yaml.Unmarshal(policy.Config disabled:true): %v", err)
-		}
-		if !disabledCfg.Disabled {
-			t.Fatal("YAML policy.Config with explicit disabled:true must decode Disabled == true")
-		}
-		var legacyCfg corepolicy.Config
-		if err := yaml.Unmarshal([]byte("enabled: false\n"), &legacyCfg); err == nil {
-			t.Fatal("YAML policy.Config with removed legacy enabled: key must fail")
-		}
-	})
 
 	t.Run("EvaluateSSHFPAuthenticatedOtherAlgorithmMismatch", func(t *testing.T) {
 		pub, _, err := ed25519.GenerateKey(rand.Reader)

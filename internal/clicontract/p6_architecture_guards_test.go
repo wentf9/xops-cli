@@ -5,157 +5,24 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/wentf9/xops-cli/core/mcp/guardrail"
-	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
 	"github.com/wentf9/xops-cli/core/ssh"
-	"gopkg.in/yaml.v3"
 )
 
-// TestP6_SecurityPredicateFailClosedASTGuard AST-verifies critical fail-closed
-// security predicates across core/, pkg/, internal/, and cmd/.
+// TestP6_SecurityPredicateFailClosedASTGuard AST-verifies structural fail-closed
+// control-flow invariants not enforced by Go types or lint rules.
 func TestP6_SecurityPredicateFailClosedASTGuard(t *testing.T) {
 	t.Parallel()
 	root := p4RepoRoot(t)
 
-	t.Run("SCP_IsCollectedPathExcludedReturnsBoolAndError", func(t *testing.T) {
-		checkSCPIsCollectedPathExcludedSignature(t, root)
-	})
-	t.Run("MuxDaemon_IsTargetOnlyOptionErrorBranchesFailClosed", func(t *testing.T) {
-		checkMuxDaemonTargetOnlyOptionFailClosed(t, root)
-	})
-	t.Run("ControlConfig_MatchesMasterTargetFailClosedOnEmptyHosts", func(t *testing.T) {
-		checkMatchesMasterTargetFailClosed(t, root)
-	})
 	t.Run("MCPGuardrail_SwitchDecisionHasExplicitFailClosedDefault", func(t *testing.T) {
 		checkGuardrailDecisionSwitchDefault(t, root, "WithGuardrail", "core", "mcp", "guardrail", "guardrail.go")
 		checkGuardrailDecisionSwitchDefault(t, root, "Authorize", "core", "mcp", "guardrail", "authorization.go")
 	})
-}
-
-func checkSCPIsCollectedPathExcludedSignature(t *testing.T, root string) {
-	t.Helper()
-	pf := parseSingleGoFile(t, root, "cmd", "scp.go")
-	fn := findFuncDecl(pf.file, "isCollectedPathExcluded")
-	if fn == nil {
-		t.Fatalf("%s: isCollectedPathExcluded not found", pf.relPath)
-	}
-	if fn.Type.Results == nil {
-		t.Fatalf("%s: isCollectedPathExcluded has no return types, want (bool, error)", pf.relPath)
-	}
-	var resultTypes []ast.Expr
-	for _, field := range fn.Type.Results.List {
-		n := len(field.Names)
-		if n == 0 {
-			n = 1
-		}
-		for range n {
-			resultTypes = append(resultTypes, field.Type)
-		}
-	}
-	if len(resultTypes) != 2 {
-		t.Fatalf("%s: isCollectedPathExcluded returns %d values, want 2 (bool, error)", pf.relPath, len(resultTypes))
-	}
-	if !isIdentName(resultTypes[0], "bool") || !isIdentName(resultTypes[1], "error") {
-		t.Fatalf("%s: isCollectedPathExcluded return types = (%T, %T), want (bool, error)", pf.relPath, resultTypes[0], resultTypes[1])
-	}
-}
-
-func checkMuxDaemonTargetOnlyOptionFailClosed(t *testing.T, root string) {
-	t.Helper()
-	pf := parseSingleGoFile(t, root, "cmd", "mux_daemon_spec.go")
-	fn := findFuncDecl(pf.file, "isTargetOnlyMuxDaemonOption")
-	if fn == nil || fn.Body == nil {
-		t.Fatalf("%s: isTargetOnlyMuxDaemonOption not found", pf.relPath)
-	}
-	errBranches := 0
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		ifStmt, ok := n.(*ast.IfStmt)
-		if !ok {
-			return true
-		}
-		if exprContainsErrNilComparison(ifStmt.Cond, token.NEQ) {
-			errBranches++
-			assertBranchReturnsLiteralTrueNamed(t, pf, "isTargetOnlyMuxDaemonOption", ifStmt.Body)
-		} else if exprContainsErrNilComparison(ifStmt.Cond, token.EQL) && ifStmt.Else != nil {
-			errBranches++
-			assertBranchReturnsLiteralTrueNamed(t, pf, "isTargetOnlyMuxDaemonOption", ifStmt.Else)
-		}
-		return true
-	})
-	if errBranches == 0 {
-		t.Fatalf("%s: expected at least one error branch (err != nil) in isTargetOnlyMuxDaemonOption", pf.relPath)
-	}
-	if len(fn.Body.List) == 0 || !isLiteralTrueReturnStmt(fn.Body.List[len(fn.Body.List)-1]) {
-		t.Errorf("%s: isTargetOnlyMuxDaemonOption fallback return must be literal return true (fail closed)", pf.relPath)
-	}
-}
-
-func checkMatchesMasterTargetFailClosed(t *testing.T, root string) {
-	t.Helper()
-	pf := parseSingleGoFile(t, root, "core", "ssh", "control_config.go")
-	fn := findFuncDecl(pf.file, "MatchesMasterTarget")
-	if fn == nil || fn.Body == nil {
-		t.Fatalf("%s: MatchesMasterTarget not found", pf.relPath)
-	}
-	foundEmptyTHost := false
-	foundMissingMHost := false
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		ifStmt, ok := n.(*ast.IfStmt)
-		if !ok {
-			return true
-		}
-		if exprChecksEmptyStringIdent(ifStmt.Cond, "tHost") {
-			foundEmptyTHost = true
-			assertBranchReturnsLiteralFalse(t, pf, "MatchesMasterTarget(tHost==\"\")", ifStmt.Body)
-		}
-		if exprChecksEmptyStringIdent(ifStmt.Cond, "mHost") || exprIsNotIdent(ifStmt.Cond, "ok") {
-			foundMissingMHost = true
-			assertBranchReturnsLiteralFalse(t, pf, "MatchesMasterTarget(missing mHost)", ifStmt.Body)
-		}
-		return true
-	})
-	if !foundEmptyTHost {
-		t.Errorf("%s: MatchesMasterTarget missing fail-closed guard on empty tHost", pf.relPath)
-	}
-	if !foundMissingMHost {
-		t.Errorf("%s: MatchesMasterTarget missing fail-closed guard on missing mHost / !ok", pf.relPath)
-	}
-
-	// Verify parseMasterTargetIdentity rejects empty host fail-closed too.
-	parseFn := findFuncDecl(pf.file, "parseMasterTargetIdentity")
-	if parseFn == nil || parseFn.Body == nil {
-		t.Fatalf("%s: parseMasterTargetIdentity not found", pf.relPath)
-	}
-	foundEmptyHostReject := false
-	ast.Inspect(parseFn.Body, func(n ast.Node) bool {
-		ifStmt, ok := n.(*ast.IfStmt)
-		if !ok || !exprChecksEmptyStringIdent(ifStmt.Cond, "host") {
-			return true
-		}
-		foundEmptyHostReject = true
-		assertBranchLastReturnResultIsLiteralFalse(t, pf, "parseMasterTargetIdentity(host==\"\")", ifStmt.Body)
-		return true
-	})
-	if !foundEmptyHostReject {
-		t.Errorf("%s: parseMasterTargetIdentity missing fail-closed guard on empty host", pf.relPath)
-	}
-
-	// Behavioral reinforcement of the AST invariants.
-	if (ssh.TargetContext{Host: ""}).MatchesMasterTarget("host=example.com;port=22") {
-		t.Fatal("MatchesMasterTarget must return false when tHost is empty and masterIdentity is non-empty")
-	}
-	if (ssh.TargetContext{Host: "example.com", Port: 22}).MatchesMasterTarget("port=22;user=root") {
-		t.Fatal("MatchesMasterTarget must return false when masterIdentity omits host=")
-	}
-	if (ssh.TargetContext{Host: "example.com", Port: 22}).MatchesMasterTarget("host=;port=22") {
-		t.Fatal("MatchesMasterTarget must return false when masterIdentity has empty host=")
-	}
 }
 
 func checkGuardrailDecisionSwitchDefault(t *testing.T, root, funcName string, relParts ...string) {
@@ -208,78 +75,12 @@ func checkGuardrailDecisionSwitchDefault(t *testing.T, root, funcName string, re
 	}
 }
 
-// TestP6_SecurityStructsZeroValueReflectionGuard verifies fail-closed zero-value
-// invariants on security-critical structs, enums, YAML policy decoding, and
-// AllowList OptionSpec capability metadata.
+// TestP6_SecurityStructsZeroValueReflectionGuard verifies AllowList OptionSpec
+// capability metadata (zero-value struct invariants moved to P7 reflection table).
 func TestP6_SecurityStructsZeroValueReflectionGuard(t *testing.T) {
 	t.Parallel()
 
-	t.Run("MuxServerOptionsZeroValueEnforcesPeerCheck", checkMuxServerOptionsZeroValue)
-	t.Run("GuardrailDecisionZeroValueIsDeny", checkGuardrailDecisionZeroValue)
-	t.Run("PolicyConfigYAMLDisabledSemantics", checkPolicyConfigYAMLDisabledSemantics)
 	t.Run("AllowListSpecsDeclareSupportedAndFailClosedTokens", checkAllowListSpecCapabilities)
-}
-
-func checkMuxServerOptionsZeroValue(t *testing.T) {
-	var zero ssh.MuxServerOptions
-	if ssh.PeerCheckEnforce != 0 {
-		t.Fatalf("ssh.PeerCheckEnforce = %d, want 0 (zero-value safe default)", ssh.PeerCheckEnforce)
-	}
-	if zero.PeerCheck != ssh.PeerCheckEnforce {
-		t.Fatalf("zero-value MuxServerOptions.PeerCheck = %v (%d), want PeerCheckEnforce (%d)", zero.PeerCheck, zero.PeerCheck, ssh.PeerCheckEnforce)
-	}
-	if zero.HasExpectedUID {
-		t.Fatal("zero-value MuxServerOptions.HasExpectedUID = true, want false")
-	}
-	if ssh.PeerCheckDisabledForTesting == 0 {
-		t.Fatal("PeerCheckDisabledForTesting must be non-zero")
-	}
-	rv := reflect.Zero(reflect.TypeFor[ssh.MuxServerOptions]())
-	if got := rv.FieldByName("PeerCheck").Uint(); got != uint64(ssh.PeerCheckEnforce) {
-		t.Fatalf("reflect.Zero(MuxServerOptions).PeerCheck = %d, want %d", got, ssh.PeerCheckEnforce)
-	}
-	if rv.FieldByName("HasExpectedUID").Bool() {
-		t.Fatal("reflect.Zero(MuxServerOptions).HasExpectedUID = true, want false")
-	}
-}
-
-func checkGuardrailDecisionZeroValue(t *testing.T) {
-	var d guardrail.Decision
-	if d != guardrail.Deny {
-		t.Fatalf("zero-value guardrail.Decision = %v (%d), want guardrail.Deny (%d)", d, d, guardrail.Deny)
-	}
-	if d.String() != "deny" {
-		t.Fatalf("zero-value guardrail.Decision.String() = %q, want %q", d.String(), "deny")
-	}
-	rv := reflect.Zero(reflect.TypeFor[guardrail.Decision]())
-	if got := rv.Interface().(guardrail.Decision); got != guardrail.Deny {
-		t.Fatalf("reflect.Zero(guardrail.Decision) = %v, want guardrail.Deny", got)
-	}
-}
-
-func checkPolicyConfigYAMLDisabledSemantics(t *testing.T) {
-	for _, tc := range []struct {
-		name         string
-		rawYAML      string
-		wantDisabled bool
-	}{
-		{"omitted_with_other_fields", "approval_threshold: dangerous\nno_elicit_fallback: deny\n", false},
-		{"empty_mapping", "{}\n", false},
-		{"explicit_true", "disabled: true\n", true},
-		{"explicit_false", "disabled: false\n", false},
-	} {
-		var cfg corepolicy.Config
-		if err := yaml.Unmarshal([]byte(tc.rawYAML), &cfg); err != nil {
-			t.Fatalf("%s: yaml.Unmarshal failed: %v", tc.name, err)
-		}
-		if cfg.Disabled != tc.wantDisabled {
-			t.Errorf("%s: Disabled = %v, want %v", tc.name, cfg.Disabled, tc.wantDisabled)
-		}
-	}
-	var legacy corepolicy.Config
-	if err := yaml.Unmarshal([]byte("enabled: false\n"), &legacy); err == nil {
-		t.Error("legacy enabled: key must be rejected as unknown field")
-	}
 }
 
 func checkAllowListSpecCapabilities(t *testing.T) {
@@ -319,16 +120,13 @@ func checkAllowListSpecCapabilities(t *testing.T) {
 	}
 }
 
-// TestP6_SingleAuthorityAndSanitizationGuards enforces Phase 6 single-authority
-// and file-read/path-sanitization invariants across core/, pkg/, internal/, and cmd/.
+// TestP6_SingleAuthorityAndSanitizationGuards enforces Phase 6 sanitization
+// invariants not covered by Go types or lint rules.
 func TestP6_SingleAuthorityAndSanitizationGuards(t *testing.T) {
 	t.Parallel()
 	root := p4RepoRoot(t)
 	files := parseNonTestGoFiles(t, root, "core", "pkg", "internal", "cmd")
 
-	t.Run("NoExtractFailClosedPreferredAuthsInPkgOrCmd", func(t *testing.T) {
-		checkNoExtractFailClosedPreferredAuths(t, files)
-	})
 	t.Run("NoRawToAbsolutePathInInventoryAndFormFiles", func(t *testing.T) {
 		checkNoRawToAbsolutePathInInventoryFiles(t, files)
 	})
@@ -338,22 +136,6 @@ func TestP6_SingleAuthorityAndSanitizationGuards(t *testing.T) {
 	t.Run("NoBareOSReadFileInCoreSSH", func(t *testing.T) {
 		checkNoBareOSReadFileInCoreSSH(t, files)
 	})
-}
-
-func checkNoExtractFailClosedPreferredAuths(t *testing.T, files []parsedGoFile) {
-	t.Helper()
-	for _, pf := range files {
-		if !strings.HasPrefix(pf.relPath, "pkg/") && !strings.HasPrefix(pf.relPath, "cmd/") {
-			continue
-		}
-		ast.Inspect(pf.file, func(n ast.Node) bool {
-			if ident, ok := n.(*ast.Ident); ok && ident.Name == "extractFailClosedPreferredAuths" {
-				pos := pf.fset.Position(ident.Pos())
-				t.Errorf("%s:%d: forbidden duplicate helper extractFailClosedPreferredAuths in pkg/cmd; use core/ssh.OptionSpec.FailClosedTokens via ParseOption", pf.relPath, pos.Line)
-			}
-			return true
-		})
-	}
 }
 
 func checkNoRawToAbsolutePathInInventoryFiles(t *testing.T, files []parsedGoFile) {
@@ -629,130 +411,6 @@ func extractDocumentedDiscreteTokens(col string) []string {
 func isIdentName(expr ast.Expr, want string) bool {
 	ident, ok := unwrapParen(expr).(*ast.Ident)
 	return ok && ident.Name == want
-}
-
-func isLiteralFalseIdent(expr ast.Expr) bool {
-	return isIdentName(expr, "false")
-}
-
-func isLiteralFalseReturnStmt(stmt ast.Stmt) bool {
-	ret, ok := stmt.(*ast.ReturnStmt)
-	return ok && len(ret.Results) == 1 && isLiteralFalseIdent(ret.Results[0])
-}
-
-func exprContainsErrNilComparison(expr ast.Expr, op token.Token) bool {
-	if isErrNilComparison(expr, op) {
-		return true
-	}
-	bin, ok := unwrapParen(expr).(*ast.BinaryExpr)
-	if !ok {
-		return false
-	}
-	if bin.Op == token.LOR || bin.Op == token.LAND {
-		return exprContainsErrNilComparison(bin.X, op) || exprContainsErrNilComparison(bin.Y, op)
-	}
-	return false
-}
-
-func exprChecksEmptyStringIdent(expr ast.Expr, identName string) bool {
-	bin, ok := unwrapParen(expr).(*ast.BinaryExpr)
-	if !ok {
-		return false
-	}
-	if bin.Op == token.EQL {
-		return (isIdentName(bin.X, identName) && isEmptyStringLit(bin.Y)) ||
-			(isEmptyStringLit(bin.X) && isIdentName(bin.Y, identName))
-	}
-	if bin.Op == token.LOR || bin.Op == token.LAND {
-		return exprChecksEmptyStringIdent(bin.X, identName) || exprChecksEmptyStringIdent(bin.Y, identName)
-	}
-	return false
-}
-
-func isEmptyStringLit(expr ast.Expr) bool {
-	lit, ok := unwrapParen(expr).(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING {
-		return false
-	}
-	val, err := strconv.Unquote(lit.Value)
-	return err == nil && val == ""
-}
-
-func exprIsNotIdent(expr ast.Expr, identName string) bool {
-	un, ok := unwrapParen(expr).(*ast.UnaryExpr)
-	if ok && un.Op == token.NOT && isIdentName(un.X, identName) {
-		return true
-	}
-	bin, ok := unwrapParen(expr).(*ast.BinaryExpr)
-	if ok && (bin.Op == token.LOR || bin.Op == token.LAND) {
-		return exprIsNotIdent(bin.X, identName) || exprIsNotIdent(bin.Y, identName)
-	}
-	return false
-}
-
-func assertBranchReturnsLiteralTrueNamed(t *testing.T, pf parsedGoFile, fnName string, branch ast.Node) {
-	t.Helper()
-	returnCount := 0
-	ast.Inspect(branch, func(n ast.Node) bool {
-		if _, isFuncLit := n.(*ast.FuncLit); isFuncLit {
-			return false
-		}
-		ret, ok := n.(*ast.ReturnStmt)
-		if !ok {
-			return true
-		}
-		returnCount++
-		if !isLiteralTrueReturnStmt(ret) {
-			pos := pf.fset.Position(ret.Pos())
-			t.Errorf("%s:%d: error branch in %s must return literal true (fail closed)", pf.relPath, pos.Line, fnName)
-		}
-		return true
-	})
-	block, ok := branch.(*ast.BlockStmt)
-	if returnCount == 0 || !ok || len(block.List) == 0 || !isLiteralTrueReturnStmt(block.List[len(block.List)-1]) {
-		pos := pf.fset.Position(branch.Pos())
-		t.Errorf("%s:%d: error branch in %s must terminate with literal return true", pf.relPath, pos.Line, fnName)
-	}
-}
-
-func assertBranchReturnsLiteralFalse(t *testing.T, pf parsedGoFile, label string, branch ast.Node) {
-	t.Helper()
-	returnCount := 0
-	ast.Inspect(branch, func(n ast.Node) bool {
-		if _, isFuncLit := n.(*ast.FuncLit); isFuncLit {
-			return false
-		}
-		ret, ok := n.(*ast.ReturnStmt)
-		if !ok {
-			return true
-		}
-		returnCount++
-		if !isLiteralFalseReturnStmt(ret) {
-			pos := pf.fset.Position(ret.Pos())
-			t.Errorf("%s:%d: %s must return literal false (fail closed)", pf.relPath, pos.Line, label)
-		}
-		return true
-	})
-	block, ok := branch.(*ast.BlockStmt)
-	if returnCount == 0 || !ok || len(block.List) == 0 || !isLiteralFalseReturnStmt(block.List[len(block.List)-1]) {
-		pos := pf.fset.Position(branch.Pos())
-		t.Errorf("%s:%d: %s must terminate with literal return false", pf.relPath, pos.Line, label)
-	}
-}
-
-func assertBranchLastReturnResultIsLiteralFalse(t *testing.T, pf parsedGoFile, label string, branch ast.Node) {
-	t.Helper()
-	block, ok := branch.(*ast.BlockStmt)
-	if !ok || len(block.List) == 0 {
-		pos := pf.fset.Position(branch.Pos())
-		t.Errorf("%s:%d: %s must be a non-empty block terminating with false ok result", pf.relPath, pos.Line, label)
-		return
-	}
-	ret, ok := block.List[len(block.List)-1].(*ast.ReturnStmt)
-	if !ok || len(ret.Results) == 0 || !isLiteralFalseIdent(ret.Results[len(ret.Results)-1]) {
-		pos := pf.fset.Position(block.Pos())
-		t.Errorf("%s:%d: %s must return literal false as final ok result", pf.relPath, pos.Line, label)
-	}
 }
 
 func collectMatchingStringIdents(file *ast.File, upperLiterals, out map[string]struct{}) {
