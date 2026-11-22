@@ -557,7 +557,7 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 	// a jump-target master over a healthy bastion never closes the underlying
 	// bastion TCP connection, while passing transportRoot as PhysicalRootConn
 	// so bounded shutdown can escalate if the bastion is write-wedged.
-	c.maybeStartMasterListener(planNode, finalConnCfg.KeyPath, rawClient, rootConn, transportRoot)
+	c.maybeStartMasterListener(planNode, finalConnCfg.KeyPath, rawClient, rootConn, transportRoot, pooled)
 	return client, nil
 }
 

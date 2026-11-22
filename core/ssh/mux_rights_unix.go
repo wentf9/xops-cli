@@ -260,12 +260,12 @@ func applyPassengerEnvAndPTYWithFiles(s *MuxServer, ch cryptoSSH.Channel, req Mu
 
 type muxTransportInterruptConn struct {
 	net.Conn
-	onClose func()
+	closeFn func() error
 }
 
 func (c *muxTransportInterruptConn) Close() error {
-	if c.onClose != nil {
-		c.onClose()
+	if c.closeFn != nil {
+		return c.closeFn()
 	}
 	if c.Conn != nil {
 		return c.Conn.Close()
@@ -280,14 +280,12 @@ func (s *MuxServer) sendBoundedPassengerRequest(ch cryptoSSH.Channel, reqType st
 	}
 	var (
 		sshCli      *cryptoSSH.Client
-		root        net.Conn
 		timeout     time.Duration
 		log         logger.DebugLogger
 		interrupted atomic.Bool
 	)
 	if s != nil {
 		sshCli = s.sshClient
-		root = s.rootConn
 		timeout = s.requestTimeout
 		log = s.logger
 	}
@@ -295,10 +293,14 @@ func (s *MuxServer) sendBoundedPassengerRequest(ch cryptoSSH.Channel, reqType st
 		return false, net.ErrClosed
 	}
 	helper := &Client{
-		sshClient: sshCli,
 		rootConn: &muxTransportInterruptConn{
-			Conn:    root,
-			onClose: func() { interrupted.Store(true) },
+			closeFn: func() error {
+				interrupted.Store(true)
+				if s != nil {
+					return s.closeTransportBounded()
+				}
+				return nil
+			},
 		},
 		handshakeTimeout: timeout,
 		logger:           log,
@@ -1377,7 +1379,7 @@ func (s *MuxServer) dialSSHMuxChannel(parent context.Context, network, addr stri
 				if reqs != nil {
 					go discardAbortedChannelRequests(base, reqs)
 				}
-				_ = closeSSHChannel(ch)
+				_ = s.closeMuxChannelBounded(ch, nil)
 			}
 		}
 	}()

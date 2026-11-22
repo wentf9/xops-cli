@@ -360,11 +360,15 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 			} else if !errors.Is(err, errJumpChainRequired) {
 				return nil, err
 			}
-		} else if snapshot[0] == nil && isMultiplexControlEnabled(c.buildTargetContext(plan[0])) {
-			if reused, err := c.tryAttachTargetControlMaster(ctx, plan, snapshot); err == nil && reused != nil {
-				return reused, nil
-			} else if err != nil && !errors.Is(err, errJumpChainRequired) {
-				return nil, err
+		} else if snapshot[0] == nil {
+			if hasSocket, sockErr := c.hasControlSocket(plan[0]); sockErr == nil && hasSocket {
+				if reused, err := c.tryAttachTargetControlMaster(ctx, plan, snapshot); err == nil && reused != nil {
+					return reused, nil
+				} else if err != nil && !errors.Is(err, errJumpChainRequired) {
+					return nil, err
+				}
+			} else if sockErr != nil {
+				c.getLogger().Debugf("mux: skip target control master probe for node %s: %v", plan[0].name, sockErr)
 			}
 		}
 	}
@@ -1115,11 +1119,80 @@ func (c *Connector) upstreamAbortFunc(parentPooled *PooledClient, rootConn net.C
 	}
 }
 
-func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolvedKeyPath string, rawClient *ssh.Client, rootConn net.Conn, transportRoots ...net.Conn) {
-	var physicalRoot net.Conn
-	if len(transportRoots) > 0 {
-		physicalRoot = transportRoots[0]
+func (c *Connector) hasControlSocket(planNode connectionPlanNode) (bool, error) {
+	target := c.buildTargetContext(planNode)
+	if !isMultiplexControlEnabled(target) {
+		return false, nil
 	}
+	expandedPath, err := target.Control.ResolvePath(c.environment, target)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(expandedPath) == "" || IsNoneValue(expandedPath) {
+		return false, nil
+	}
+	if err := ValidateControlPath(expandedPath); err != nil {
+		return false, err
+	}
+	fi, err := os.Lstat(expandedPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return isControlSocketFileInfo(fi), nil
+}
+
+func (c *Connector) buildMuxMasterOptions(planNode connectionPlanNode, target TargetContext, expandedPath string, rootConn, physicalRoot net.Conn) MuxMasterOptions {
+	opts := MuxMasterOptions{
+		Path:                  expandedPath,
+		Target:                target,
+		Environment:           c.environment,
+		RootConn:              rootConn,
+		PhysicalRootConn:      physicalRoot,
+		InitialActiveSessions: 1,
+		ConfirmSession:        c.confirmSessionCallback(planNode.name, planNode.cfg),
+		DialAgent:             c.environment.DialAgent,
+		Logger:                c.getLogger(),
+	}
+	if planNode.cfg == nil || planNode.cfg.Options == nil {
+		return opts
+	}
+	cfgOpts := planNode.cfg.Options
+	opts.GatewayPorts = cfgOpts.EffectiveGatewayPorts()
+	opts.GatewayPortsMode = cfgOpts.GatewayPortsMode()
+	opts.DialNetwork = cfgOpts.DialNetwork()
+	opts.StreamLocalBindUnlink = cfgOpts.EffectiveStreamLocalBindUnlink()
+	if mask, ok := cfgOpts.StreamLocalBindMask(); ok {
+		opts.StreamLocalBindMask = mask
+		opts.HasStreamLocalBindMask = true
+	}
+	if sock, enabled, fwdErr := ResolveForwardAgent(
+		cfgOpts.ForwardAgent(),
+		cfgOpts.IdentityAgent(),
+		c.environment,
+		target,
+	); fwdErr == nil && enabled && sock != "" && c.environment.DialAgent != nil {
+		opts.AllowAgentForward = true
+		opts.AgentSocket = sock
+	}
+	return opts
+}
+
+func (c *Connector) masterBeforeTransportClose(pooled *PooledClient, evicted *atomic.Bool) func() func() {
+	if c.pool == nil || pooled == nil {
+		return nil
+	}
+	return func() func() {
+		evicted.Store(true)
+		batch := c.pool.detachForEvict(ZeroHopDigest, pooled, true)
+		return batch.closeDescendantsAndRelease
+	}
+}
+
+func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolvedKeyPath string, rawClient *ssh.Client, rootConn, transportRoot net.Conn, pooled *PooledClient) {
+	physicalRoot := transportRoot
 	if physicalRoot == nil {
 		physicalRoot = rootConn
 	}
@@ -1140,53 +1213,9 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolv
 		return
 	}
 
-	var gatewayPorts bool
-	var gatewayPortsMode string
-	var dialNetwork string
-	var streamLocalBindUnlink bool
-	var streamLocalBindMask uint32
-	var hasStreamLocalBindMask bool
-	var allowAgentForward bool
-	var agentSocket string
-	if planNode.cfg != nil && planNode.cfg.Options != nil {
-		gatewayPorts = planNode.cfg.Options.EffectiveGatewayPorts()
-		gatewayPortsMode = planNode.cfg.Options.GatewayPortsMode()
-		dialNetwork = planNode.cfg.Options.DialNetwork()
-		streamLocalBindUnlink = planNode.cfg.Options.EffectiveStreamLocalBindUnlink()
-		if mask, ok := planNode.cfg.Options.StreamLocalBindMask(); ok {
-			streamLocalBindMask = mask
-			hasStreamLocalBindMask = true
-		}
-		if sock, enabled, fwdErr := ResolveForwardAgent(
-			planNode.cfg.Options.ForwardAgent(),
-			planNode.cfg.Options.IdentityAgent(),
-			c.environment,
-			target,
-		); fwdErr == nil && enabled && sock != "" && c.environment.DialAgent != nil {
-			allowAgentForward = true
-			agentSocket = sock
-		}
-	}
-
-	server, err := StartMuxServer(context.Background(), rawClient, MuxMasterOptions{
-		Path:                   expandedPath,
-		Target:                 target,
-		Environment:            c.environment,
-		RootConn:               rootConn,
-		PhysicalRootConn:       physicalRoot,
-		InitialActiveSessions:  1,
-		ConfirmSession:         c.confirmSessionCallback(planNode.name, planNode.cfg),
-		GatewayPorts:           gatewayPorts,
-		GatewayPortsMode:       gatewayPortsMode,
-		DialNetwork:            dialNetwork,
-		StreamLocalBindUnlink:  streamLocalBindUnlink,
-		StreamLocalBindMask:    streamLocalBindMask,
-		HasStreamLocalBindMask: hasStreamLocalBindMask,
-		AllowAgentForward:      allowAgentForward,
-		AgentSocket:            agentSocket,
-		DialAgent:              c.environment.DialAgent,
-		Logger:                 c.getLogger(),
-	})
+	var evicted atomic.Bool
+	masterOpts := c.buildMuxMasterOptions(planNode, target, expandedPath, rootConn, physicalRoot)
+	server, err := startMuxServer(context.Background(), rawClient, masterOpts, c.masterBeforeTransportClose(pooled, &evicted))
 	if err != nil {
 		// A concurrent master already owns this path (or the bind was rejected).
 		// OpenSSH reports the conflict and continues without sharing.
@@ -1194,7 +1223,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolv
 		c.warnOrDebugf(explicitMaster, "mux: start master server on %q failed: %v; continuing without connection sharing", expandedPath, err)
 		return
 	}
-	c.trackMaster(server, planNode.name)
+	c.trackMasterWithPooled(server, planNode.name, pooled, &evicted)
 }
 
 // masterOwnership records this connector's hold on a master it started.
@@ -1246,7 +1275,7 @@ func (c *Connector) pruneClosedMastersLocked() {
 	c.masterOrder = c.masterOrder[:n]
 }
 
-func (c *Connector) watchMasterShutdown(lifecycleCtx context.Context, waitCh <-chan struct{}) {
+func (c *Connector) watchMasterShutdown(lifecycleCtx context.Context, waitCh <-chan struct{}, pooled *PooledClient, evicted *atomic.Bool) {
 	if waitCh == nil {
 		return
 	}
@@ -1261,22 +1290,34 @@ func (c *Connector) watchMasterShutdown(lifecycleCtx context.Context, waitCh <-c
 			<-waitCh
 		}
 		c.lifecycleMu.Lock()
-		if !c.closed {
+		closed := c.closed
+		if !closed {
 			c.pruneClosedMastersLocked()
 		}
 		c.lifecycleMu.Unlock()
+		// Never hold lifecycleMu across connPool.mu or transport teardown.
+		// Normally beforeTransportClose already evicted pooled synchronously
+		// inside closeTransportBounded(); this fallback covers masters whose
+		// Wait() channel closed without running closeTransportBounded().
+		if !closed && c.pool != nil && pooled != nil && (evicted == nil || !evicted.Swap(true)) {
+			c.pool.EvictByClient(pooled)
+		}
 	}()
 }
 
 // trackMaster records an owned master so CloseAll can release it. A connector
 // that is already closed shuts the master down immediately.
 func (c *Connector) trackMaster(server *MuxServer, nodeIDs ...string) {
-	if server == nil {
-		return
-	}
 	var nodeID string
 	if len(nodeIDs) > 0 {
 		nodeID = nodeIDs[0]
+	}
+	c.trackMasterWithPooled(server, nodeID, nil, nil)
+}
+
+func (c *Connector) trackMasterWithPooled(server *MuxServer, nodeID string, pooled *PooledClient, evicted *atomic.Bool) {
+	if server == nil {
+		return
 	}
 	c.lifecycleMu.Lock()
 	if c.closed {
@@ -1287,6 +1328,9 @@ func (c *Connector) trackMaster(server *MuxServer, nodeIDs ...string) {
 	c.pruneClosedMastersLocked()
 	if isMuxServerClosed(server) {
 		c.lifecycleMu.Unlock()
+		if c.pool != nil && pooled != nil && (evicted == nil || !evicted.Swap(true)) {
+			c.pool.EvictByClient(pooled)
+		}
 		return
 	}
 	if c.masters == nil {
@@ -1304,7 +1348,7 @@ func (c *Connector) trackMaster(server *MuxServer, nodeIDs ...string) {
 	c.lifecycleMu.Unlock()
 
 	if !exists {
-		c.watchMasterShutdown(lifecycleCtx, server.Wait())
+		c.watchMasterShutdown(lifecycleCtx, server.Wait(), pooled, evicted)
 	}
 }
 

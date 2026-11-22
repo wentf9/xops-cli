@@ -149,14 +149,15 @@ type MuxServer struct {
 	idleNotify                    chan struct{}
 	forwardTable                  muxForwardTable
 
-	shutdownOnce       sync.Once
-	shutdownChan       chan struct{}
-	transportCloseOnce sync.Once
-	transportCloseErr  error
-	slot               *fsx.SocketSlot
-	slotReleaseOnce    sync.Once
-	askConfirmation    bool
-	confirmSession     func(action string) bool
+	shutdownOnce         sync.Once
+	shutdownChan         chan struct{}
+	beforeTransportClose func() func()
+	transportCloseOnce   sync.Once
+	transportCloseErr    error
+	slot                 *fsx.SocketSlot
+	slotReleaseOnce      sync.Once
+	askConfirmation      bool
+	confirmSession       func(action string) bool
 
 	serverCtx    context.Context
 	serverCancel context.CancelFunc
@@ -178,6 +179,10 @@ type MuxServer struct {
 
 // NewMuxServer creates and binds a new OpenSSH multiplex master server.
 func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
+	return newMuxServer(opts, nil)
+}
+
+func newMuxServer(opts MuxServerOptions, beforeTransportClose func() func()) (*MuxServer, error) {
 	if strings.TrimSpace(opts.ControlPath) == "" || IsNoneValue(opts.ControlPath) {
 		return nil, fmt.Errorf("control path cannot be empty or none")
 	}
@@ -232,6 +237,7 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		listener:              slot.Listener(),
 		slot:                  slot,
 		shutdownChan:          make(chan struct{}),
+		beforeTransportClose:  beforeTransportClose,
 		idleNotify:            make(chan struct{}),
 		askConfirmation:       opts.AskConfirmation,
 		confirmSession:        opts.ConfirmSession,
@@ -322,6 +328,10 @@ type MuxMasterOptions struct {
 // the returned server and must shut it down; nothing else releases the control
 // socket or the SSH transport it references.
 func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMasterOptions) (*MuxServer, error) {
+	return startMuxServer(ctx, sshClient, opts, nil)
+}
+
+func startMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMasterOptions, beforeTransportClose func() func()) (*MuxServer, error) {
 	target := opts.Target
 	env := opts.Environment
 
@@ -366,7 +376,7 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 		agentSocket = normalizeExpandedAgentSocketPathWithTilde(agentSocket, env, expandAgentTilde)
 	}
 
-	server, err := NewMuxServer(MuxServerOptions{
+	server, err := newMuxServer(MuxServerOptions{
 		ControlPath:            opts.Path,
 		ExpectedUID:            expectedUID,
 		HasExpectedUID:         true,
@@ -390,7 +400,7 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 		AgentSocket:            agentSocket,
 		DialAgent:              dialAgent,
 		Logger:                 opts.Logger,
-	})
+	}, beforeTransportClose)
 	if err != nil {
 		return nil, err
 	}
@@ -1330,16 +1340,27 @@ func (s *MuxServer) closeTransportBounded() error {
 		return nil
 	}
 	s.transportCloseOnce.Do(func() {
+		var afterClose func()
+		if s.beforeTransportClose != nil {
+			afterClose = s.beforeTransportClose()
+		}
+		if afterClose != nil {
+			defer afterClose()
+		}
+
 		var sshCli *cryptoSSH.Client
 		if s.sshClient != nil && s.sshClient.Conn != nil {
 			sshCli = s.sshClient
 		}
 		if s.rootConn == nil && sshCli == nil {
+			if s.physicalRoot != nil {
+				s.transportCloseErr = closeResource(s.physicalRoot, "physical root SSH transport")
+			}
 			return
 		}
 
 		hasFallback := s.physicalRoot != nil && s.physicalRoot != s.rootConn
-		_, isProxyChan := s.rootConn.(*proxyChanConn)
+		proxyChan, isProxyChan := s.rootConn.(*proxyChanConn)
 		if !hasFallback && !isProxyChan {
 			s.transportCloseErr = interruptSSHTransport(s.rootConn, sshCli)
 			return
@@ -1368,8 +1389,11 @@ func (s *MuxServer) closeTransportBounded() error {
 			s.transportCloseErr = err
 		case <-timer.C:
 			var fallbackErr error
+			if isProxyChan && proxyChan.abortUpstream != nil {
+				fallbackErr = proxyChan.abortUpstream(proxyChan)
+			}
 			if hasFallback {
-				fallbackErr = closeResource(s.physicalRoot, "physical root SSH transport")
+				fallbackErr = errors.Join(fallbackErr, closeResource(s.physicalRoot, "physical root SSH transport"))
 			}
 			s.transportCloseErr = errors.Join(fallbackErr, <-done)
 		}

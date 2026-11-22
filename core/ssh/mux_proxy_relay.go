@@ -627,7 +627,8 @@ func (ps *proxySessionState) openRemoteChannelContext(chType string, extra []byt
 		return nil, nil, net.ErrClosed
 	}
 	serverCtx := ps.serverBaseContext()
-	client := ps.server.sshClient
+	server := ps.server
+	client := server.sshClient
 	result := make(chan openChannelResult)
 	abandoned := make(chan struct{})
 	go func() {
@@ -639,7 +640,7 @@ func (ps *proxySessionState) openRemoteChannelContext(chType string, extra []byt
 				if reqs != nil {
 					go discardAbortedChannelRequests(serverCtx, reqs)
 				}
-				_ = closeSSHChannel(ch)
+				_ = server.closeMuxChannelBounded(ch, nil)
 			}
 		}
 	}()

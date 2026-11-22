@@ -478,7 +478,7 @@ func TestMultiplexDisableGuard_CaseInsensitiveAndEnvExpandedNone(t *testing.T) {
 		if cli, tryErr := conn.tryConnectMultiplex(t.Context(), planNode); cli != nil || tryErr != nil {
 			t.Fatalf("tryConnectMultiplex(env=%q) = (%v, %v), want (nil, nil)", envVal, cli, tryErr)
 		}
-		conn.maybeStartMasterListener(planNode, "", nil, nil)
+		conn.maybeStartMasterListener(planNode, "", nil, nil, nil, nil)
 		if _, statErr := os.Lstat(filepath.Join(tmpDir, envVal)); !os.IsNotExist(statErr) {
 			t.Fatalf("expected no ./%s socket created in CWD, stat err = %v", envVal, statErr)
 		}
