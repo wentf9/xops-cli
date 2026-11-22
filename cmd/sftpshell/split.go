@@ -20,13 +20,12 @@ func writeEscapedCommandLineRune(r rune, inQuote rune, current *strings.Builder)
 		}
 		return
 	}
-	switch r {
-	case ' ', '\t', '\n', '\r', '\'', '"', '\\':
+	if unicode.IsSpace(r) || r == '\'' || r == '"' || r == '\\' {
 		current.WriteRune(r)
-	default:
-		current.WriteRune('\\')
-		current.WriteRune(r)
+		return
 	}
+	current.WriteRune('\\')
+	current.WriteRune(r)
 }
 
 // splitCommandLine 将命令行输入解析为参数切片，支持：

@@ -22,7 +22,7 @@ type completionMenu struct {
 func newCompletionMenu(candidates []string) completionMenu {
 	menu := completionMenu{labels: make([]string, len(candidates))}
 	for i, candidate := range candidates {
-		menu.labels[i] = normalizePastedText(candidate)
+		menu.labels[i] = sanitizeDisplayText(candidate)
 		menu.labelWidth = max(menu.labelWidth, ansi.StringWidth(menu.labels[i]))
 	}
 	return menu

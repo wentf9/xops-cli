@@ -125,15 +125,7 @@ func (c *Client) globDir(ctx context.Context, parent RemotePath, filePattern str
 	if !fi.IsDir() {
 		return nil, nil
 	}
-	entries, err := c.SFTPClient().ReadDirContext(ctx, parent.String())
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, nil
-	}
-
-	validated, err := validateRemoteDirEntries(ctx, parent, entries, "glob")
+	validated, err := readValidatedRemoteDirIgnoreReadErr(ctx, c.SFTPClient(), parent, "glob")
 	if err != nil {
 		return nil, err
 	}

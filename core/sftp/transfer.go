@@ -2065,11 +2065,11 @@ func (w *downloadDirWalkState) walkDir(curRemote RemotePath, curLocal LocalTarge
 	if err := w.groupCtx.Err(); err != nil {
 		return err
 	}
-	entries, readErr := w.client.SFTPClient().ReadDir(curRemote.String())
+	validatedDir, readErr := readValidatedRemoteDir(w.groupCtx, w.client.SFTPClient(), curRemote, "download")
 	if readErr != nil {
 		return readErr
 	}
-	validated, err := w.validateDirEntries(curRemote, curLocal, entries)
+	validated, err := w.validateValidatedDirEntries(curRemote, curLocal, validatedDir)
 	if err != nil {
 		return err
 	}
@@ -2087,7 +2087,14 @@ func (w *downloadDirWalkState) walkDir(curRemote RemotePath, curLocal LocalTarge
 // creating any child directories, reading symlinks, or enqueueing download
 // workers.
 func (w *downloadDirWalkState) validateDirEntries(curRemote RemotePath, curLocal LocalTarget, entries []os.FileInfo) ([]validatedWalkEntry, error) {
-	seen := make(map[string]struct{}, len(entries))
+	validatedDir, err := validateRemoteDirEntries(w.groupCtx, curRemote, entries, "download")
+	if err != nil {
+		return nil, err
+	}
+	return w.validateValidatedDirEntries(curRemote, curLocal, validatedDir)
+}
+
+func (w *downloadDirWalkState) validateValidatedDirEntries(curRemote RemotePath, curLocal LocalTarget, entries []validatedRemoteDirEntry) ([]validatedWalkEntry, error) {
 	var seenFold map[string]string
 	var seenNorm map[string]string
 	if w.caseInsensitive {
@@ -2096,22 +2103,13 @@ func (w *downloadDirWalkState) validateDirEntries(curRemote RemotePath, curLocal
 		seenNorm = make(map[string]string, len(entries))
 	}
 	validated := make([]validatedWalkEntry, 0, len(entries))
-	for _, entry := range entries {
+	for _, item := range entries {
 		if err := w.groupCtx.Err(); err != nil {
 			return nil, err
 		}
-		if entry == nil {
-			return nil, fmt.Errorf("missing file metadata for entry in %q", curRemote.String())
-		}
-		entryName, nameErr := ParseRemoteName(entry.Name())
-		if nameErr != nil {
-			return nil, fmt.Errorf("download %q: unsafe remote filename %q: %w", curRemote.String(), entry.Name(), nameErr)
-		}
+		entry := item.info
+		entryName := item.name
 		rawName := entryName.String()
-		if _, dup := seen[rawName]; dup {
-			return nil, fmt.Errorf("download %q: duplicate remote directory entry %q", curRemote.String(), rawName)
-		}
-		seen[rawName] = struct{}{}
 		if seenFold != nil {
 			folded := foldDownloadSegment(rawName)
 			if prev, dup := seenFold[folded]; dup {
@@ -2126,7 +2124,7 @@ func (w *downloadDirWalkState) validateDirEntries(curRemote RemotePath, curLocal
 			seenNorm[decomposed] = rawName
 		}
 
-		childRemote := curRemote.Join(entryName)
+		childRemote := item.child
 		if _, relErr := childRemote.RelativeTo(w.remoteRoot); relErr != nil {
 			return nil, fmt.Errorf("download %q: %w", childRemote.String(), relErr)
 		}

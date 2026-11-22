@@ -229,7 +229,7 @@ func TestWordCompleter_SpaceAndQuoteHandling(t *testing.T) {
 		if res.head != "put " {
 			t.Errorf("head = %q, want %q", res.head, "put ")
 		}
-		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse`+sep)
+		assertContainsCandidate(t, res.candidates, escapeShellArg("Witch of Eclipse"+sep))
 		assertContainsCandidate(t, res.candidates, `Witch\ of\ Eclipse.png`)
 	})
 
@@ -241,7 +241,7 @@ func TestWordCompleter_SpaceAndQuoteHandling(t *testing.T) {
 		if res.head != `put "` {
 			t.Errorf("head = %q, want %q", res.head, `put "`)
 		}
-		assertContainsCandidate(t, res.candidates, "Witch of Eclipse"+sep)
+		assertContainsCandidate(t, res.candidates, escapeDoubleQuotedArg("Witch of Eclipse"+sep))
 		assertContainsCandidate(t, res.candidates, `Witch of Eclipse.png"`)
 	})
 

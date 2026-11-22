@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -1196,7 +1197,7 @@ func (s *Shell) handleLs(ctx context.Context, args []string, long bool) error {
 		multi := len(matches) > 1
 		for _, m := range matches {
 			if multi {
-				s.fprintfStdout("\n%s:\n", m)
+				s.fprintfStdout("\n%s:\n", sanitizeDisplayText(m))
 			}
 			if err := s.listRemoteOne(ctx, m, long); err != nil {
 				return err
@@ -1234,12 +1235,11 @@ func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) error
 		}
 		defer release()
 
-		err = cli.Do(ctx, func(client *pkgsftp.Client) error {
-			var readErr error
-			files, readErr = client.ReadDir(path)
-			return readErr
-		})
+		files, err = cli.ReadDir(ctx, path)
 		if err != nil {
+			if isContextError(err) {
+				s.invalidateClient(cli)
+			}
 			return fmt.Errorf("read remote directory %q: %w", path, err)
 		}
 	} else {
@@ -1253,7 +1253,7 @@ func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) error
 		for _, f := range files {
 			modTime := f.ModTime().Format("Jan 02 15:04")
 			size := formatBytes(f.Size())
-			name := f.Name()
+			name := sanitizeDisplayText(f.Name())
 			if f.IsDir() {
 				name += "/"
 			}
@@ -1269,7 +1269,7 @@ func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) error
 		// 简单列表模式 (多列输出)
 		names := make([]string, 0, len(files))
 		for _, f := range files {
-			name := f.Name()
+			name := sanitizeDisplayText(f.Name())
 			if f.IsDir() {
 				name += "/"
 			}
@@ -1290,7 +1290,7 @@ func (s *Shell) handleLocalLs(args []string, long bool) error {
 		multi := len(matches) > 1
 		for _, m := range matches {
 			if multi {
-				s.fprintfStdout("\n%s:\n", m)
+				s.fprintfStdout("\n%s:\n", sanitizeDisplayText(m))
 			}
 			if err := s.listLocalOne(m, long); err != nil {
 				return err
@@ -1334,7 +1334,7 @@ func (s *Shell) listLocalOne(path string, long bool) error {
 		for _, fi := range infos {
 			modTime := fi.ModTime().Format("Jan 02 15:04")
 			size := formatBytes(fi.Size())
-			name := fi.Name()
+			name := sanitizeDisplayText(fi.Name())
 			if fi.IsDir() {
 				name += string(filepath.Separator)
 			}
@@ -1350,7 +1350,7 @@ func (s *Shell) listLocalOne(path string, long bool) error {
 		// 简单列表模式 (多列输出)
 		names := make([]string, 0, len(infos))
 		for _, fi := range infos {
-			name := fi.Name()
+			name := sanitizeDisplayText(fi.Name())
 			if fi.IsDir() {
 				name += string(filepath.Separator)
 			}
@@ -1740,6 +1740,19 @@ func (s *Shell) checkRemoteStorageSpace(ctx context.Context, client *sftp.Client
 	}
 }
 
+func saturatingAddInt64(a, b int64) int64 {
+	if a < 0 {
+		a = 0
+	}
+	if b <= 0 {
+		return a
+	}
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
 func (s *Shell) computeLocalUploadDirSize(local string) (int64, error) {
 	resolveRoot := s.resolveLocalUploadRootFn
 	if resolveRoot == nil {
@@ -1749,8 +1762,17 @@ func (s *Shell) computeLocalUploadDirSize(local string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return computeLocalUploadDirSizeWith(local, walkRoot, filepath.Walk, os.Readlink)
+}
+
+func computeLocalUploadDirSizeWith(
+	local string,
+	walkRoot string,
+	walkFn func(string, filepath.WalkFunc) error,
+	readlinkFn func(string) (string, error),
+) (int64, error) {
 	var totalSize int64
-	walkErr := filepath.Walk(walkRoot, func(p string, info os.FileInfo, err error) error {
+	walkErr := walkFn(walkRoot, func(p string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1764,16 +1786,16 @@ func (s *Shell) computeLocalUploadDirSize(local string) (int64, error) {
 			return nil
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			target, readErr := os.Readlink(p)
+			target, readErr := readlinkFn(p)
 			if readErr != nil {
 				return fmt.Errorf("read local symbolic link %q failed: %w", p, readErr)
 			}
 			target = filepath.ToSlash(target)
-			totalSize += int64(len(target))
+			totalSize = saturatingAddInt64(totalSize, int64(len(target)))
 			return nil
 		}
 		if !info.IsDir() {
-			totalSize += info.Size()
+			totalSize = saturatingAddInt64(totalSize, info.Size())
 		}
 		return nil
 	})
@@ -3050,19 +3072,21 @@ func (s *Shell) printColumns(names []string) {
 		return
 	}
 
+	sanitized := make([]string, len(names))
+	maxLen := 0
+	for i, name := range names {
+		clean := sanitizeDisplayText(name)
+		sanitized[i] = clean
+		if len(clean) > maxLen {
+			maxLen = len(clean)
+		}
+	}
+
 	// 获取终端宽度
 	width := 80 // 默认宽度
 	if fd := int(os.Stdout.Fd()); term.IsTerminal(fd) {
 		if w, _, err := term.GetSize(fd); err == nil && w > 0 {
 			width = w
-		}
-	}
-
-	// 找出最长名称
-	maxLen := 0
-	for _, name := range names {
-		if len(name) > maxLen {
-			maxLen = len(name)
 		}
 	}
 
@@ -3079,16 +3103,16 @@ func (s *Shell) printColumns(names []string) {
 	}
 
 	// 计算行数
-	rows := (len(names) + cols - 1) / cols
+	rows := (len(sanitized) + cols - 1) / cols
 
 	// 按列优先顺序输出
 	for row := range rows {
 		for col := 0; col < cols; col++ {
 			idx := col*rows + row
-			if idx >= len(names) {
+			if idx >= len(sanitized) {
 				break
 			}
-			name := names[idx]
+			name := sanitized[idx]
 			// 使用固定宽度格式化，左对齐
 			s.fprintfStdout("%-*s", colWidth, name)
 		}

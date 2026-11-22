@@ -8,8 +8,6 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	pkgsftp "github.com/pkg/sftp"
 )
 
 type completionCursor struct {
@@ -20,25 +18,6 @@ type completionCursor struct {
 	quoteChar         rune // 0: 无引号, '\'': 单引号, '"': 双引号
 	head              string
 	prefixBeforeQuote string
-}
-
-func writeEscapedCompletionRune(r rune, inQuote rune, current *strings.Builder) {
-	if inQuote == '"' {
-		if r == '"' || r == '\\' {
-			current.WriteRune(r)
-		} else {
-			current.WriteRune('\\')
-			current.WriteRune(r)
-		}
-		return
-	}
-	switch r {
-	case ' ', '\t', '\n', '\r', '\'', '"', '\\':
-		current.WriteRune(r)
-	default:
-		current.WriteRune('\\')
-		current.WriteRune(r)
-	}
 }
 
 // parseCompletionCursor 词法分析光标前的输入，提取补全上下文
@@ -61,7 +40,7 @@ func parseCompletionCursor(content string) completionCursor {
 		if escaped {
 			escaped = false
 			inToken = true
-			writeEscapedCompletionRune(r, inQuote, &current)
+			writeEscapedCommandLineRune(r, inQuote, &current)
 			continue
 		}
 
@@ -199,19 +178,30 @@ func parseCompletionCursor(content string) completionCursor {
 	}
 }
 
-// escapeShellArg 在无引号模式下对路径中的空格和特殊字符进行转义
+// escapeShellArg 在无引号模式下转义反斜杠、引号以及所有 unicode.IsSpace 空白字符，
+// 使 splitCommandLine 能够无损还原原始候选路径。
 func escapeShellArg(s string) string {
 	var b strings.Builder
 	for _, r := range s {
+		if r == '\\' || r == '\'' || r == '"' || unicode.IsSpace(r) {
+			b.WriteRune('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+// escapeDoubleQuotedArg 在双引号模式下转义反斜杠和双引号：
+// 反斜杠翻倍以避免触发 splitCommandLine 的 Windows 尾部 `\"` 规则，
+// 嵌入式双引号通过 `"\""` 跳出再重开双引号以避免后续空白拆分参数。
+func escapeDoubleQuotedArg(s string) string {
+	var b strings.Builder
+	for _, r := range s {
 		switch r {
-		case ' ':
-			b.WriteString(`\ `)
-		case '\t':
-			b.WriteString(`\` + "\t")
-		case '\'':
-			b.WriteString(`\'`)
+		case '\\':
+			b.WriteString(`\\`)
 		case '"':
-			b.WriteString(`\"`)
+			b.WriteString(`"\""`)
 		default:
 			b.WriteRune(r)
 		}
@@ -219,21 +209,31 @@ func escapeShellArg(s string) string {
 	return b.String()
 }
 
-// formatCompletionCandidate 格式化补全候选词
-// 1. 无引号时转义空格等字符；
-// 2. 引号内时不转义空格，若为普通文件自动补全闭合引号，目录则保留以供继续补全下一级。
+// escapeSingleQuotedArg 在单引号模式下通过 POSIX 跳出序列 `'\”` 转义嵌入式单引号。
+func escapeSingleQuotedArg(s string) string {
+	if !strings.ContainsRune(s, '\'') {
+		return s
+	}
+	return strings.ReplaceAll(s, `'`, `'\''`)
+}
+
+// formatCompletionCandidate 格式化补全候选词，作为 splitCommandLine 的无损逆变换：
+// 1. 无引号时转义反斜杠、引号和所有 unicode.IsSpace 字符；
+// 2. 引号内保留空白并转义嵌入式引号/反斜杠，非目录自动补全闭合引号，目录保留开放以继续补全下一级。
 func formatCompletionCandidate(candidate string, quoteChar rune, isDir bool) string {
 	switch quoteChar {
 	case '\'':
+		escaped := escapeSingleQuotedArg(candidate)
 		if isDir {
-			return candidate
+			return escaped
 		}
-		return candidate + "'"
+		return escaped + "'"
 	case '"':
+		escaped := escapeDoubleQuotedArg(candidate)
 		if isDir {
-			return candidate
+			return escaped
 		}
-		return candidate + `"`
+		return escaped + `"`
 	default:
 		return escapeShellArg(candidate)
 	}
@@ -261,8 +261,10 @@ func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head s
 	}
 
 	var rawCandidates []string
+	isRemote := false
 	switch cursor.cmd {
 	case "cd", "ls", "ll", "mkdir", "rm", "cp", "mv":
+		isRemote = true
 		rawCandidates, err = s.completeRemotePath(ctx, cursor.partial)
 	case "lcd", "lls", "lll", "lmkdir", "lrm", "lcp", "lmv":
 		rawCandidates, err = s.completeLocalPath(cursor.partial)
@@ -270,10 +272,12 @@ func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head s
 		if cursor.argIndex <= 1 {
 			rawCandidates, err = s.completeLocalPath(cursor.partial)
 		} else {
+			isRemote = true
 			rawCandidates, err = s.completeRemotePath(ctx, cursor.partial)
 		}
 	case "get":
 		if cursor.argIndex <= 1 {
+			isRemote = true
 			rawCandidates, err = s.completeRemotePath(ctx, cursor.partial)
 		} else {
 			rawCandidates, err = s.completeLocalPath(cursor.partial)
@@ -285,10 +289,16 @@ func (s *Shell) wordCompleter(ctx context.Context, line string, pos int) (head s
 	}
 
 	for _, cand := range rawCandidates {
+		if hasTerminalControlRune(cand) {
+			continue
+		}
 		if cursor.prefixBeforeQuote != "" {
 			cand = strings.TrimPrefix(cand, cursor.prefixBeforeQuote)
 		}
-		isDir := strings.HasSuffix(cand, "/") || strings.HasSuffix(cand, string(filepath.Separator))
+		isDir := strings.HasSuffix(cand, "/")
+		if !isRemote {
+			isDir = isDir || strings.HasSuffix(cand, string(filepath.Separator))
+		}
 		completions = append(completions, formatCompletionCandidate(cand, cursor.quoteChar, isDir))
 	}
 
@@ -310,9 +320,11 @@ func (s *Shell) completeRemotePath(ctx context.Context, partial string) ([]strin
 	defer release()
 
 	var dir, prefix string
+	hasDirPrefix := false
 	if lastSlash := strings.LastIndex(partial, "/"); lastSlash >= 0 {
 		dir = partial[:lastSlash+1]
 		prefix = partial[lastSlash+1:]
+		hasDirPrefix = true
 	} else {
 		dir = s.cwd
 		prefix = partial
@@ -323,12 +335,7 @@ func (s *Shell) completeRemotePath(ctx context.Context, partial string) ([]strin
 		targetDir = cli.JoinPath(s.cwd, targetDir)
 	}
 
-	var entries []os.FileInfo
-	err = cli.Do(ctx, func(c *pkgsftp.Client) error {
-		var readErr error
-		entries, readErr = c.ReadDir(targetDir)
-		return readErr
-	})
+	entries, err := cli.ReadDir(ctx, targetDir)
 	if err != nil {
 		if isContextError(err) {
 			s.invalidateClient(cli)
@@ -344,7 +351,7 @@ func (s *Shell) completeRemotePath(ctx context.Context, partial string) ([]strin
 				name += "/"
 			}
 			// 拼接上目录前缀供 line editor 替换
-			if dir != s.cwd {
+			if hasDirPrefix {
 				candidates = append(candidates, dir+name)
 			} else {
 				candidates = append(candidates, name)
@@ -377,6 +384,9 @@ func (s *Shell) completeLocalPath(partial string) ([]string, error) {
 
 	var candidates []string
 	for _, entry := range entries {
+		if hasTerminalControlRune(entry.Name()) {
+			continue
+		}
 		if strings.HasPrefix(entry.Name(), prefix) {
 			name := entry.Name()
 			if entry.IsDir() {

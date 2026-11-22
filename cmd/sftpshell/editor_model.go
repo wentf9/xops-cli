@@ -214,6 +214,35 @@ func normalizePastedText(text string) string {
 		return r
 	}, strings.ReplaceAll(text, "\r\n", "\n"))
 }
+
+// isTerminalControlRune reports whether r is a C0/DEL/C1 control character or
+// Unicode line/paragraph separator that must never be written raw to terminal
+// output or accepted into shell completion candidates.
+func isTerminalControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
+}
+
+func hasTerminalControlRune(s string) bool {
+	for _, r := range s {
+		if isTerminalControlRune(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeDisplayText strips ANSI/CSI/OSC escape sequences and replaces any
+// remaining control or line-separator runes with '?' so untrusted filenames
+// and error text cannot inject terminal control sequences into stdout/stderr.
+func sanitizeDisplayText(s string) string {
+	stripped := ansi.Strip(s)
+	return strings.Map(func(r rune) rune {
+		if isTerminalControlRune(r) {
+			return '?'
+		}
+		return r
+	}, stripped)
+}
 func (m *editorModel) insertText(text string) {
 	line := []rune(m.input.Value())
 	pos := m.input.Position()
@@ -328,23 +357,39 @@ func (m *editorModel) acceptCompletion(msg completionMsg) {
 		m.pendingCancel = nil
 	}
 	if msg.result.err != nil {
-		m.hint = "completion failed: " + normalizePastedText(msg.result.err.Error())
+		m.hint = "completion failed: " + sanitizeDisplayText(msg.result.err.Error())
 		return
 	}
-	m.completion = &msg.result
+	safeCandidates := make([]string, 0, len(msg.result.candidates))
+	rejected := 0
+	for _, candidate := range msg.result.candidates {
+		if hasTerminalControlRune(candidate) {
+			rejected++
+			continue
+		}
+		safeCandidates = append(safeCandidates, candidate)
+	}
+	filtered := msg.result
+	filtered.candidates = safeCandidates
+	m.completion = &filtered
 	m.candidate = -1
-	switch len(msg.result.candidates) {
+	switch len(safeCandidates) {
 	case 0:
-		m.hint = "no completions"
+		m.completion = nil
+		if rejected > 0 {
+			m.hint = "unsafe completion candidate rejected"
+		} else {
+			m.hint = "no completions"
+		}
 	case 1:
-		m.replaceCompletion(msg.result.candidates[0])
+		m.replaceCompletion(safeCandidates[0])
 		// A unique result is accepted, not a candidate-cycling session. The
 		// next Tab must query the new input (for example, children of bin/).
 		m.invalidateCompletion()
 	default:
-		m.menu = newCompletionMenu(msg.result.candidates)
-		prefix := commonCompletionPrefix(msg.result.candidates)
-		typed := []rune(msg.line)[len([]rune(msg.result.head)):msg.pos]
+		m.menu = newCompletionMenu(safeCandidates)
+		prefix := commonCompletionPrefix(safeCandidates)
+		typed := []rune(msg.line)[len([]rune(filtered.head)):msg.pos]
 		if len([]rune(prefix)) > len(typed) {
 			m.replaceCompletion(prefix)
 		}
@@ -352,6 +397,9 @@ func (m *editorModel) acceptCompletion(msg completionMsg) {
 	}
 }
 func (m *editorModel) replaceCompletion(value string) {
+	if hasTerminalControlRune(value) {
+		return
+	}
 	m.input.SetValue(m.completion.head + value + m.completion.tail)
 	m.input.SetCursor(len([]rune(m.completion.head + value)))
 }

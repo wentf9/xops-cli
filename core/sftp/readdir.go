@@ -3,10 +3,24 @@ package sftp
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 
 	"github.com/pkg/sftp"
 )
+
+func saturatingAddInt64(a, b int64) int64 {
+	if a < 0 {
+		a = 0
+	}
+	if b <= 0 {
+		return a
+	}
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
 
 // validatedRemoteDirEntry holds a single remote directory entry whose name has
 // been validated via ParseRemoteName and whose joined path is verified to stay
@@ -81,11 +95,81 @@ func readValidatedRemoteDir(
 	if !parent.IsValid() {
 		return nil, fmt.Errorf("%s: %w: invalid remote directory path", op, ErrInvalidRemotePath)
 	}
-	entries, err := client.ReadDirContext(ctx, parent.String())
+	readCtx := ctx
+	if readCtx == nil {
+		readCtx = context.Background()
+	}
+	entries, err := client.ReadDirContext(readCtx, parent.String())
 	if err != nil {
 		return nil, fmt.Errorf("read remote directory %q failed: %w", parent.String(), err)
 	}
 	return validateRemoteDirEntries(ctx, parent, entries, op)
+}
+
+// readValidatedRemoteDirIgnoreReadErr reads and validates parent, ignoring
+// non-context SFTP read errors (matching Glob semantics) while still failing
+// closed on hostile directory entries.
+func readValidatedRemoteDirIgnoreReadErr(
+	ctx context.Context,
+	client *sftp.Client,
+	parent RemotePath,
+	op string,
+) ([]validatedRemoteDirEntry, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if !parent.IsValid() {
+		return nil, fmt.Errorf("%s: %w: invalid remote directory path", op, ErrInvalidRemotePath)
+	}
+	readCtx := ctx
+	if readCtx == nil {
+		readCtx = context.Background()
+	}
+	entries, err := client.ReadDirContext(readCtx, parent.String())
+	if err != nil {
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+		}
+		return nil, nil
+	}
+	return validateRemoteDirEntries(ctx, parent, entries, op)
+}
+
+// ReadDir lists dir over SFTP and validates every returned entry through
+// ParseRemoteName, rejecting ".", "..", "/", path separators, NUL/control
+// characters, exact duplicates, and any child escaping dir. Cancellation
+// interrupts this SFTP subsystem, so the client must not be reused afterwards.
+func (c *Client) ReadDir(ctx context.Context, dir string) ([]os.FileInfo, error) {
+	if c == nil || c.SFTPClient() == nil {
+		return nil, fmt.Errorf("sftp client is nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("context is nil")
+	}
+	parent, err := ParseRemotePath(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []os.FileInfo
+	err = runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
+		validated, readErr := readValidatedRemoteDir(ctx, c.SFTPClient(), parent, "readdir")
+		if readErr != nil {
+			return readErr
+		}
+		out = make([]os.FileInfo, len(validated))
+		for i, item := range validated {
+			out[i] = item.info
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // WalkFunc is the callback invoked by Client.Walk for each validated remote
@@ -197,10 +281,7 @@ func (c *Client) downloadTransferSize(ctx context.Context, remoteRoot RemotePath
 		return 0, err
 	}
 	if rootInfo.Mode()&os.ModeType != os.ModeDir {
-		if rootInfo.Size() > 0 {
-			return rootInfo.Size(), nil
-		}
-		return 0, nil
+		return saturatingAddInt64(0, rootInfo.Size()), nil
 	}
 
 	var total int64
@@ -216,12 +297,10 @@ func (c *Client) downloadTransferSize(ctx context.Context, remoteRoot RemotePath
 			if readErr != nil {
 				return fmt.Errorf("read remote symbolic link %q failed: %w", child.String(), readErr)
 			}
-			total += int64(len(target))
+			total = saturatingAddInt64(total, int64(len(target)))
 			return nil
 		default:
-			if info.Size() > 0 {
-				total += info.Size()
-			}
+			total = saturatingAddInt64(total, info.Size())
 			return nil
 		}
 	})
