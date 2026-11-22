@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -860,27 +861,33 @@ func (conn *routedSessionSSHConn) OpenChannel(name string, _ []byte) (cryptoSSH.
 
 func waitPipeWriteBackpressured(t *testing.T, writeFD int) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	pfd := []unix.PollFd{{Fd: int32(writeFD), Events: unix.POLLOUT}}
 	for time.Now().Before(deadline) {
+		if err := t.Context().Err(); err != nil {
+			t.Fatalf("context canceled waiting for write backpressure: %v", err)
+		}
 		pfd[0].Revents = 0
 		n, err := unix.Poll(pfd, 0)
 		if err == nil && (n == 0 || pfd[0].Revents&unix.POLLOUT == 0) {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("stdout pipe never became write-backpressured")
 }
 
 func waitServerActiveSessionsZero(t *testing.T, server *MuxServer) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if server.ActiveSessions() == 0 {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		if err := t.Context().Err(); err != nil {
+			t.Fatalf("context canceled waiting for ActiveSessions()==0 (current=%d): %v", server.ActiveSessions(), err)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("MuxServer ActiveSessions() = %d, want 0", server.ActiveSessions())
 }
@@ -1160,6 +1167,7 @@ func TestCopyToPollableFD_LazyWakePipeLeavesZeroOpenWakePipesWhileIdle(t *testin
 type newlineFloodReader struct {
 	chunk []byte
 	done  chan struct{}
+	reads atomic.Int64
 }
 
 func (r *newlineFloodReader) Read(p []byte) (int, error) {
@@ -1167,6 +1175,7 @@ func (r *newlineFloodReader) Read(p []byte) (int, error) {
 	case <-r.done:
 		return 0, io.EOF
 	default:
+		r.reads.Add(1)
 		n := copy(p, r.chunk)
 		return n, nil
 	}
@@ -1192,6 +1201,11 @@ func TestCopyToPollableFD_ReopenedBlockingPTYDoesNotBlockOnCancel(t *testing.T) 
 		_ = unix.SetNonblock(int(fd), false)
 	})
 
+	// Pre-saturate master's n_tty receive buffer on Linux so flush_to_ldisc cannot
+	// asynchronously drain 4095 bytes out of tty_buffer after copyToPollableFD parks
+	// in poll(POLLOUT) (which would flip POLLOUT back to 1 without waking write_wait).
+	saturatePTYMasterInput(t, master, slave)
+
 	stop := make(chan struct{})
 	srcDone := make(chan struct{})
 	src := &newlineFloodReader{
@@ -1203,11 +1217,32 @@ func TestCopyToPollableFD_ReopenedBlockingPTYDoesNotBlockOnCancel(t *testing.T) 
 		done <- copyToPollableFD(slave, src, stop)
 	}()
 
-	// Wait deterministically until the un-drained PTY slave reports POLLOUT==0.
+	// Wait deterministically until the un-drained PTY slave reports POLLOUT==0
+	// (failing fast if copyToPollableFD exits prematurely).
 	if ctrlErr := slaveConn.Control(func(fd uintptr) {
-		waitPipeWriteBackpressured(t, int(fd))
+		deadline := time.Now().Add(5 * time.Second)
+		pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+		for time.Now().Before(deadline) {
+			select {
+			case copyErr := <-done:
+				t.Fatalf("copyToPollableFD(PTY) exited before backpressure: %v", copyErr)
+			case <-t.Context().Done():
+				t.Fatalf("context canceled waiting for PTY write backpressure: %v", t.Context().Err())
+			default:
+			}
+			pfd[0].Revents = 0
+			n, pollErr := unix.Poll(pfd, 0)
+			if pollErr == nil && (n == 0 || pfd[0].Revents&unix.POLLOUT == 0) {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatal("stdout pipe never became write-backpressured")
 	}); ctrlErr != nil {
 		t.Fatalf("slave Control: %v", ctrlErr)
+	}
+	if src.reads.Load() == 0 {
+		t.Fatal("copyToPollableFD(PTY) never read newline flood before backpressure")
 	}
 	close(stop)
 	close(srcDone)

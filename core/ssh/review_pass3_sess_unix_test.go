@@ -1022,7 +1022,7 @@ func TestReviewPass3_M3_PassengerStdioFwdStreamLocalIPv6AndPortValidation(t *tes
 	go func() { _ = srv.Serve() }()
 
 	// 1. StreamLocal (MUX_SPECIAL_PORT_UNIX) -> direct-streamlocal@openssh.com
-	gotUnix := runPass3StdioFwdSuccess(t, ctrlSock, MuxNewStdioFwdRequest{
+	gotUnix := runPass3StdioFwdSuccess(t, srv, ctrlSock, MuxNewStdioFwdRequest{
 		RequestID:   1,
 		ConnectHost: "/var/run/remote-app.sock",
 		ConnectPort: MUX_SPECIAL_PORT_UNIX,
@@ -1032,7 +1032,7 @@ func TestReviewPass3_M3_PassengerStdioFwdStreamLocalIPv6AndPortValidation(t *tes
 	}
 
 	// 2. Bracketed IPv6 "[::1]" -> direct-tcpip with Host="::1", Port=8443
-	gotIPv6 := runPass3StdioFwdSuccess(t, ctrlSock, MuxNewStdioFwdRequest{
+	gotIPv6 := runPass3StdioFwdSuccess(t, srv, ctrlSock, MuxNewStdioFwdRequest{
 		RequestID:   2,
 		ConnectHost: "[::1]",
 		ConnectPort: 8443,
@@ -1077,7 +1077,7 @@ func TestReviewPass3_M3_PassengerStdioFwdStreamLocalIPv6AndPortValidation(t *tes
 	}
 }
 
-func runPass3StdioFwdSuccess(t *testing.T, ctrlSock string, req MuxNewStdioFwdRequest) string {
+func runPass3StdioFwdSuccess(t *testing.T, srv *MuxServer, ctrlSock string, req MuxNewStdioFwdRequest) string {
 	t.Helper()
 	c, err := net.Dial("unix", ctrlSock)
 	if err != nil {
@@ -1110,6 +1110,18 @@ func runPass3StdioFwdSuccess(t *testing.T, ctrlSock string, req MuxNewStdioFwdRe
 	if err != nil {
 		t.Fatalf("ReadAll(stdio stdout): %v", err)
 	}
+	// Drain MUX_S_EXIT_MESSAGE and wait for handlePassengerStdioFwd's deferred
+	// releaseSession() to decrement ActiveSessions back to 0 before returning.
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	exitPkt, exitPayload, err := ReadMuxPacket(c)
+	if err != nil || exitPkt != MUX_S_EXIT_MESSAGE {
+		t.Fatalf("ReadMuxPacket(stdio fwd exit) = (0x%x, %v), want MUX_S_EXIT_MESSAGE", exitPkt, err)
+	}
+	if _, exitVal, decErr := DecodeMuxExitMessage(exitPayload); decErr != nil || exitVal != 0 {
+		t.Fatalf("DecodeMuxExitMessage = (status=%d, err=%v), want (0, nil)", exitVal, decErr)
+	}
+	_ = c.Close()
+	waitServerActiveSessionsZero(t, srv)
 	return string(data)
 }
 

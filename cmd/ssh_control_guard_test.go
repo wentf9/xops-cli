@@ -370,9 +370,7 @@ func TestReleaseMastersForHandoffRestoresSessionOnFailure(t *testing.T) {
 	default:
 	}
 
-	if err := muxCli.CloseForward(ctx, fwd); err != nil {
-		t.Fatalf("CloseForward failed: %v", err)
-	}
+	closeForwardAndSyncMux(t, ctx, muxCli, fwd)
 	ready, err = releaseMastersForHandoff(connector, master, sockPath)
 	if err != nil || !ready {
 		t.Fatalf("expected releaseMastersForHandoff to succeed after forward closed, got ready=%v, err=%v", ready, err)

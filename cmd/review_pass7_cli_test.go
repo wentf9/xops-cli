@@ -858,15 +858,26 @@ func verifyPass7M72ReserveNonPersistentJumpMaster(t *testing.T, ctx context.Cont
 	}
 
 	// Close the active forward; handoff reservation & shutdown of both masters now succeeds.
-	if err := muxCli.CloseForward(ctx, fwd); err != nil {
-		t.Fatalf("CloseForward(jump): %v", err)
-	}
+	closeForwardAndSyncMux(t, ctx, muxCli, fwd)
 	ready2, abort2, err2 := releaseMastersForHandoffWithProvider(connector, repo, targetMaster, targetSock)
 	if err2 != nil || !ready2 || abort2 {
 		t.Fatalf("expected handoff release to succeed once jumpMaster drained, got (%v, %v, %v)", ready2, abort2, err2)
 	}
 	if !isMasterClosed(jumpMaster) || !isMasterClosed(targetMaster) {
 		t.Fatal("expected both targetMaster and non-persistent jumpMaster to shut down after reservation")
+	}
+}
+
+// closeForwardAndSyncMux closes fwd and issues AliveCheck on the same sequential
+// mux connection so handleCloseFwd's deferred releaseWork() (closeFwdsInFlight--)
+// has completed before single-shot handoff reservation inspects in-flight work.
+func closeForwardAndSyncMux(t *testing.T, ctx context.Context, muxCli *ssh.MuxClient, fwd ssh.ForwardRequest) {
+	t.Helper()
+	if err := muxCli.CloseForward(ctx, fwd); err != nil {
+		t.Fatalf("CloseForward: %v", err)
+	}
+	if _, err := muxCli.AliveCheck(ctx); err != nil {
+		t.Fatalf("AliveCheck after CloseForward: %v", err)
 	}
 }
 
