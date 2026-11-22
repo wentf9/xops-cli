@@ -37,7 +37,10 @@ type PooledClient struct {
 	hasSnapshot        bool
 
 	// kaMu guards this client's owned keepalive lifecycle.
-	// Lock ordering: PooledClient.probeMu -> connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
+	// Lock ordering: connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
+	// PooledClient.probeMu guards Snapshot, hasSnapshot, and probeCache only and
+	// is never held across connPool.mu; publishedCfg/digest/parentKey/parent are
+	// guarded by connPool.mu once published.
 	kaMu         sync.Mutex
 	kaCancel     context.CancelFunc
 	kaDone       <-chan struct{}
@@ -49,19 +52,25 @@ func (c *PooledClient) updateSnapshot(fn func(*ConnectionConfig, *ClientConfig))
 		return
 	}
 	c.probeMu.Lock()
-	defer c.probeMu.Unlock()
-	if !c.hasSnapshot && c.publishedCfg == nil {
+	if c.hasSnapshot {
+		fn(&c.Snapshot, nil)
+	}
+	pool := c.pool
+	c.probeMu.Unlock()
+
+	if pool != nil {
+		pool.Reindex(c, func(cfg *ClientConfig) {
+			fn(nil, cfg)
+		})
 		return
 	}
-	var snapPtr *ConnectionConfig
-	if c.hasSnapshot {
-		snapPtr = &c.Snapshot
+	c.probeMu.Lock()
+	if c.publishedCfg != nil {
+		cloned := NewClientConfig(*c.publishedCfg)
+		fn(nil, cloned)
+		c.publishedCfg = NewClientConfig(*cloned)
 	}
-	fn(snapPtr, c.publishedCfg)
-	if c.publishedCfg != nil && c.pool != nil {
-		newKey := DigestClientConfig(c.publishedCfg, c.parentKey)
-		c.pool.Reindex(c, newKey)
-	}
+	c.probeMu.Unlock()
 }
 
 func (c *PooledClient) interrupt() error {
@@ -75,32 +84,65 @@ func (c *PooledClient) interrupt() error {
 	return interruptSSHTransport(c.RootConn, sshClient)
 }
 
-// closeSelf closes this hop's own SSH client and hop connection without tearing
-// down a shared upstream bastion's RootConn that other sessions may still use.
-func (c *PooledClient) closeSelf() error {
+// isJumpChild reports whether c rides on an upstream in-memory parent hop,
+// reading parentKey under c.pool.mu when pooled so concurrent Reindex never races.
+func (c *PooledClient) isJumpChild() bool {
+	if c == nil || c.ControlSocketPath != "" {
+		return false
+	}
+	if c.parent != nil {
+		return true
+	}
+	if c.pool != nil {
+		c.pool.mu.Lock()
+		hasParent := !c.parentKey.IsZero()
+		c.pool.mu.Unlock()
+		return hasParent
+	}
+	return !c.parentKey.IsZero()
+}
+
+// closeHopTransport closes this hop's own SSH client and hop connection without
+// tearing down a shared upstream bastion's RootConn that other sessions may
+// still use. For a direct root hop (or an external ControlMaster proxy), this
+// closes its own RootConn + SSHClient.
+func (c *PooledClient) closeHopTransport() error {
 	if c == nil {
 		return nil
 	}
-	c.stopKeepAlive()
 	var sshClient *ssh.Client
 	if c.SSHClient != nil && c.SSHClient.Conn != nil {
 		sshClient = c.SSHClient
 	}
 	ownConn := c.hopConn
-	if ownConn == nil && c.parentKey.IsZero() && c.parent == nil {
+	if ownConn == nil && !c.isJumpChild() {
 		ownConn = c.RootConn
 	}
 	return interruptSSHTransport(ownConn, sshClient)
 }
 
+// closeSelf stops this hop's keepalive and closes its own hop transport without
+// tearing down a shared upstream bastion's RootConn that other sessions may still use.
+func (c *PooledClient) closeSelf() error {
+	if c == nil {
+		return nil
+	}
+	c.stopKeepAlive()
+	return c.closeHopTransport()
+}
+
 func (c *PooledClient) startKeepAlive(
-	parentCtx context.Context,
+	stopParentCtx context.Context,
+	abortCtx context.Context,
 	interval, timeout time.Duration,
 	nodeScoped bool,
 	onDead func(error),
 	wg *sync.WaitGroup,
 ) {
-	if c == nil || c.SSHClient == nil || parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
+	if c == nil || c.SSHClient == nil || stopParentCtx == nil || stopParentCtx.Err() != nil || interval <= 0 {
+		return
+	}
+	if abortCtx != nil && abortCtx.Err() != nil {
 		return
 	}
 	c.kaMu.Lock()
@@ -108,18 +150,19 @@ func (c *PooledClient) startKeepAlive(
 	if c.kaCancel != nil {
 		return
 	}
-	nodeCtx, cancel := context.WithCancel(parentCtx)
+	stopCtx, cancel := context.WithCancel(stopParentCtx)
 	c.kaCancel = cancel
 	c.kaNodeScoped = nodeScoped
-	done := startKeepAlive(nodeCtx, c.SSHClient, interval, timeout, onDead, c.interrupt)
-	c.kaDone = done
 	if wg != nil {
 		wg.Add(1)
-		go func() {
-			<-done
-			wg.Done()
-		}()
 	}
+	var beforeClose func()
+	if c.pool != nil {
+		beforeClose = func() {
+			c.pool.Evict(ZeroHopDigest, c, false)
+		}
+	}
+	c.kaDone = startKeepAliveWithContexts(stopCtx, abortCtx, c.SSHClient, interval, timeout, onDead, c.closeHopTransport, beforeClose, wg)
 }
 
 func (c *PooledClient) detachKeepAlive() context.CancelFunc {
@@ -199,6 +242,9 @@ func isConsistentParentChildTransport(parent, child *PooledClient) bool {
 	}
 	if child.ControlSocketPath != "" {
 		return true
+	}
+	if isRootConnClosed(parent.RootConn) || isRootConnClosed(child.RootConn) {
+		return false
 	}
 	if parent.RootConn != nil || child.RootConn != nil {
 		if parent.RootConn == nil || child.RootConn == nil || parent.RootConn != child.RootConn {
@@ -315,7 +361,7 @@ func (p *connPool) Publish(
 		_ = next.closeSelf()
 		return nil, ErrConnectorClosed
 	}
-	if expectParent != nil || !next.parentKey.IsZero() {
+	if expectParent != nil || (!next.parentKey.IsZero() && next.ControlSocketPath == "") {
 		parentKey := next.parentKey
 		if parentKey.IsZero() || expectParent == nil {
 			p.mu.Unlock()
@@ -397,6 +443,9 @@ func (p *connPool) isLineageDescendantLocked(candidateKey HopDigest, candidate *
 }
 
 func (p *connPool) isDescendantLocked(candidateKey HopDigest, candidate *PooledClient, ancestorKey HopDigest, ancestor *PooledClient) bool {
+	if candidate == nil || candidate.ControlSocketPath != "" {
+		return false
+	}
 	if !p.isLineageDescendantLocked(candidateKey, candidate, ancestorKey, ancestor) {
 		return false
 	}
@@ -541,37 +590,130 @@ func (p *connPool) Evict(key HopDigest, dead *PooledClient, closeDead bool) []*P
 	return descendants
 }
 
-// Reindex atomically moves an active pooled entry from its current HopDigest
-// key to newKey when caller-side post-connect confirmation updates committed
-// metadata (such as Execution or AuthUpdateToken) without replacing the
-// underlying transport. If target is no longer active, another entry already
-// occupies newKey, or active descendants depend on target's current parent key,
-// active membership is left untouched.
-func (p *connPool) Reindex(target *PooledClient, newKey HopDigest) {
-	if p == nil || target == nil || newKey.IsZero() {
-		return
+type reindexStep struct {
+	client       *PooledClient
+	oldKey       HopDigest
+	newKey       HopDigest
+	newParentKey HopDigest
+	newCfg       *ClientConfig
+}
+
+func (p *connPool) buildReindexStepsLocked(
+	target *PooledClient,
+	oldKey, newKey HopDigest,
+	nextCfg *ClientConfig,
+) ([]reindexStep, bool) {
+	steps := []reindexStep{{
+		client:       target,
+		oldKey:       oldKey,
+		newKey:       newKey,
+		newParentKey: target.parentKey,
+		newCfg:       nextCfg,
+	}}
+	moving := map[*PooledClient]HopDigest{target: newKey}
+	frontier := map[HopDigest]*PooledClient{oldKey: target}
+
+	for len(frontier) > 0 {
+		nextFrontier := make(map[HopDigest]*PooledClient)
+		for k, child := range p.active {
+			if child == nil || child.ControlSocketPath != "" {
+				continue
+			}
+			if _, seen := moving[child]; seen {
+				continue
+			}
+			parent, ok := frontier[child.parentKey]
+			if !ok || !isConsistentParentChildTransport(parent, child) {
+				continue
+			}
+			if child.publishedCfg == nil {
+				return nil, false
+			}
+			parentNewKey := moving[parent]
+			childNewKey := DigestClientConfig(child.publishedCfg, parentNewKey)
+			if childNewKey.IsZero() {
+				return nil, false
+			}
+			steps = append(steps, reindexStep{
+				client:       child,
+				oldKey:       k,
+				newKey:       childNewKey,
+				newParentKey: parentNewKey,
+			})
+			moving[child] = childNewKey
+			nextFrontier[k] = child
+		}
+		frontier = nextFrontier
+	}
+
+	// Fail closed if any descendant riding on target was not reached via active parentKey links.
+	for k, child := range p.active {
+		if _, seen := moving[child]; !seen && p.isDescendantLocked(k, child, oldKey, target) {
+			return nil, false
+		}
+	}
+
+	seenNew := make(map[HopDigest]struct{}, len(steps))
+	for _, step := range steps {
+		if _, dup := seenNew[step.newKey]; dup {
+			return nil, false
+		}
+		seenNew[step.newKey] = struct{}{}
+		if existing, occupied := p.active[step.newKey]; occupied {
+			if _, isMoving := moving[existing]; !isMoving {
+				return nil, false
+			}
+		}
+	}
+	return steps, true
+}
+
+// Reindex atomically applies mutate to a cloned copy of target.publishedCfg and
+// moves target (along with any active in-memory descendants riding on target)
+// from their current HopDigest keys to their recomputed Merkle keys under p.mu.
+// If target is no longer active, any descendant lacks publishedCfg, or any
+// target key collides with an unrelated active occupant, active membership and
+// target.publishedCfg are left untouched in full sync with target.digest.
+func (p *connPool) Reindex(target *PooledClient, mutate func(*ClientConfig)) bool {
+	if p == nil || target == nil || mutate == nil {
+		return false
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return
+		return false
 	}
 	oldKey := target.digest
-	if cur, ok := p.active[oldKey]; !ok || cur != target {
-		return
+	if cur, ok := p.active[oldKey]; !ok || cur != target || target.publishedCfg == nil {
+		return false
+	}
+	nextCfg := NewClientConfig(*target.publishedCfg)
+	mutate(nextCfg)
+	nextCfg = NewClientConfig(*nextCfg)
+	newKey := DigestClientConfig(nextCfg, target.parentKey)
+	if newKey.IsZero() {
+		return false
 	}
 	if newKey == oldKey {
-		return
+		target.publishedCfg = nextCfg
+		return true
 	}
-	if existing, occupied := p.active[newKey]; occupied && existing != target {
-		return
+	steps, ok := p.buildReindexStepsLocked(target, oldKey, newKey, nextCfg)
+	if !ok {
+		return false
 	}
-	if descKeys, _ := p.collectDescendantsLocked(oldKey, target); len(descKeys) > 0 {
-		return
+	for _, step := range steps {
+		delete(p.active, step.oldKey)
 	}
-	delete(p.active, oldKey)
-	target.digest = newKey
-	p.active[newKey] = target
+	for _, step := range steps {
+		if step.newCfg != nil {
+			step.client.publishedCfg = step.newCfg
+		}
+		step.client.parentKey = step.newParentKey
+		step.client.digest = step.newKey
+		p.active[step.newKey] = step.client
+	}
+	return true
 }
 
 // EvictByClient atomically removes target (if currently active in the pool)
@@ -646,9 +788,10 @@ func (p *connPool) Close() []*PooledClient {
 }
 
 // CheckInvariants verifies structural pool safety properties under p.mu:
-//  1. Every active jump-chained client references a live active parent with matching RootConn.
-//  2. No retired client remains in active or retains an active keepalive.
-//  3. When requireKeepAlive is true, every active client has an active keepalive.
+//  1. Every active client has a live (unclosed) RootConn and consistent digest/publishedCfg.
+//  2. Every active jump-chained client references a live active parent with matching RootConn.
+//  3. No retired client remains in active or retains an active keepalive.
+//  4. When requireKeepAlive is true, every active client has an active keepalive.
 func (p *connPool) CheckInvariants(requireKeepAlive bool) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -660,6 +803,14 @@ func (p *connPool) CheckInvariants(requireKeepAlive bool) error {
 		}
 		if client.digest != key {
 			return fmt.Errorf("pool invariant violated: active client %p digest %s != map key %s", client, client.digest, key)
+		}
+		if isRootConnClosed(client.RootConn) {
+			return fmt.Errorf("pool invariant violated: active client %s has closed RootConn", key)
+		}
+		if client.publishedCfg != nil {
+			if wantKey := DigestClientConfig(client.publishedCfg, client.parentKey); wantKey != key {
+				return fmt.Errorf("pool invariant violated: active client %p DigestClientConfig(publishedCfg, parentKey) %s != map key %s", client, wantKey, key)
+			}
 		}
 		activeSet[client] = key
 		if !client.parentKey.IsZero() && client.ControlSocketPath == "" {

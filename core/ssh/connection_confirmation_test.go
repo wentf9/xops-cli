@@ -18,11 +18,6 @@ type unusedConfirmationProvider struct {
 	calls atomic.Int32
 }
 
-func (p *unusedConfirmationProvider) ConfirmConnection(context.Context, string) error {
-	p.calls.Add(1)
-	return errors.New("connector must not invoke confirmation callbacks")
-}
-
 func (p *unusedConfirmationProvider) ConfirmAuthenticatedConnection(context.Context, string, *Client) (*ExecutionConfig, error) {
 	p.calls.Add(1)
 	return nil, errors.New("connector must not invoke confirmation callbacks")
@@ -205,6 +200,12 @@ func TestClientMetadataUpdateReindexesPoolAndPreservesEviction(t *testing.T) {
 	if cur, ok := pool.Get(newKey); !ok || cur != pooled {
 		t.Fatal("Reindex dropped original entry when destination HopDigest was already occupied")
 	}
+	if err := pool.CheckInvariants(false); err != nil {
+		t.Fatalf("pool invariants violated after Reindex collision rollback: %v", err)
+	}
+	if pooled.publishedCfg.AuthUpdateToken != "v2" {
+		t.Fatalf("Reindex collision mutated publishedCfg.AuthUpdateToken = %q, want rollback to %q", pooled.publishedCfg.AuthUpdateToken, "v2")
+	}
 
 	// EvictByClient still finds and removes the reindexed client cleanly.
 	pool.EvictByClient(pooled)
@@ -224,8 +225,9 @@ func TestClientMetadataUpdateReindexesPoolAndPreservesEviction(t *testing.T) {
 func TestReindexParentRefusalAndStaleKeyRetirePreserveInvariants(t *testing.T) {
 	pool := newConnPool()
 
-	// Reindex on a parent hop with an active descendant must leave the parent
-	// at its existing key so child.parentKey never points to a missing parent.
+	// Reindex on a parent hop whose active descendant lacks publishedCfg must
+	// refuse and roll back publishedCfg so child.parentKey and parent.publishedCfg
+	// remain in full sync with active map keys.
 	parentCfg := NewClientConfig(ClientConfig{
 		NodeID: "bastion", Address: "10.0.0.1", Port: 22, User: "ops", AuthType: "password", AuthUpdateToken: "b1",
 	})
@@ -260,7 +262,10 @@ func TestReindexParentRefusalAndStaleKeyRetirePreserveInvariants(t *testing.T) {
 	parentClient := &Client{connCfg: parentCfg.ToConnectionConfig(), pooled: parentPooled}
 	parentClient.ApplyRecordedAuth("b2", "", nil)
 	if cur, ok := pool.Get(parentKey); !ok || cur != parentPooled {
-		t.Fatal("Reindex moved parent out from under an active descendant")
+		t.Fatal("Reindex moved parent out from under a descendant lacking publishedCfg")
+	}
+	if parentPooled.publishedCfg.AuthUpdateToken != "b1" {
+		t.Fatalf("Reindex refusal did not roll back parent.publishedCfg.AuthUpdateToken: got %q, want %q", parentPooled.publishedCfg.AuthUpdateToken, "b1")
 	}
 	if err := pool.CheckInvariants(false); err != nil {
 		t.Fatalf("pool invariants violated after parent Reindex refusal: %v", err)

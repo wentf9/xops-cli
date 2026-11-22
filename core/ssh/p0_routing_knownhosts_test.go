@@ -620,7 +620,11 @@ func TestP0_MuxProxyPublishWrapsPhysicalSSHConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("proxy Connect(bastion) failed: %v", err)
 	}
-	bastionKey := DigestClientConfig(NewClientConfig(*provider.cfgs["bastion"]), ZeroHopDigest)
+	bastionPlan, err := proxyConnector.resolveConnectionPlan(ctx, "bastion")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan(bastion) failed: %v", err)
+	}
+	bastionKey := bastionPlan[0].hopDigest()
 	pooled, ok := proxyConnector.pool.Get(bastionKey)
 	if !ok || pooled == nil {
 		t.Fatal("proxy client was not published to connector.pool")

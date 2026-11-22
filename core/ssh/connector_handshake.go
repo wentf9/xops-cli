@@ -44,6 +44,7 @@ type dialPolicy struct {
 	admittedKeyDigests          []AdmittedKeyDigest
 	execution                   *ExecutionConfig
 	options                     *Options
+	control                     *ControlConfig
 }
 
 func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
@@ -82,6 +83,7 @@ func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
 		admittedKeyDigests:          norm.AdmittedKeyDigests,
 		execution:                   norm.Execution,
 		options:                     norm.Options,
+		control:                     norm.Control,
 	}
 }
 
@@ -112,6 +114,7 @@ func (p dialPolicy) readOnlyConfig() *ClientConfig {
 		AdmittedKeyDigests:          p.admittedKeyDigests,
 		Execution:                   p.execution,
 		Options:                     p.options,
+		Control:                     p.control,
 	})
 }
 
@@ -143,6 +146,7 @@ func (p dialPolicy) toConnectionConfig() ConnectionConfig {
 		AdmittedKeyDigests:          cloneAdmittedKeyDigests(p.admittedKeyDigests),
 		Execution:                   p.execution.Clone(),
 		Options:                     p.options.Clone(),
+		Control:                     normalizeControlConfig(p.control),
 	}
 }
 
@@ -644,7 +648,9 @@ func (c *Connector) reloadConfigAfterRecording(nodeName string, hasAuthUpdate bo
 		}
 		return nil, nil
 	}
-	return NewClientConfig(*newCfg), nil
+	norm := NewClientConfig(*newCfg)
+	norm.Control = normalizeControlConfig(c.resolveControl(nodeName, norm))
+	return norm, nil
 }
 
 func applyCommittedAuthMetadata(connCfg *ConnectionConfig, newCfg *ClientConfig, nodeName, committedAuthToken string, rootConn net.Conn) error {

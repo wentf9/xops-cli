@@ -107,6 +107,7 @@ type ClientConfig struct {
 	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty" digest:"include"`
 	Execution                   *ExecutionConfig      `digest:"include"`
 	Options                     *Options              `digest:"include"`
+	Control                     *ControlConfig        `json:",omitempty" digest:"include"`
 }
 
 // NewClientConfig returns a deep-cloned, canonically normalized ClientConfig.
@@ -133,6 +134,7 @@ func NewClientConfig(raw ClientConfig) *ClientConfig {
 	out.AdmittedKeyDigests = cloneAdmittedKeyDigests(raw.AdmittedKeyDigests)
 	out.Execution = raw.Execution.Clone()
 	out.Options = raw.Options.Clone()
+	out.Control = normalizeControlConfig(raw.Control)
 	return &out
 }
 
@@ -174,6 +176,7 @@ func (c *ClientConfig) ToConnectionConfig() ConnectionConfig {
 		AdmittedKeyDigests:          norm.AdmittedKeyDigests,
 		Execution:                   norm.Execution,
 		Options:                     norm.Options,
+		Control:                     norm.Control,
 	}
 }
 
@@ -205,6 +208,7 @@ func (c ConnectionConfig) toClientConfig() *ClientConfig {
 		AdmittedKeyDigests:          c.AdmittedKeyDigests,
 		Execution:                   c.Execution,
 		Options:                     c.Options,
+		Control:                     c.Control,
 	})
 }
 
@@ -236,9 +240,10 @@ type ConnectionConfig struct {
 	AdmittedKeyDigests          []AdmittedKeyDigest   `json:",omitempty" digest:"include"`
 	Execution                   *ExecutionConfig      `digest:"include"`
 	Options                     *Options              `digest:"include"`
+	Control                     *ControlConfig        `json:",omitempty" digest:"include"`
 }
 
-// Clone returns a deep copy of ConnectionConfig, isolating mutable Execution and Options pointers.
+// Clone returns a deep copy of ConnectionConfig, isolating mutable Execution, Options, and Control pointers.
 func (c ConnectionConfig) Clone() ConnectionConfig {
 	out := c
 	out.KeyPaths = slices.Clone(c.KeyPaths)
@@ -246,6 +251,7 @@ func (c ConnectionConfig) Clone() ConnectionConfig {
 	out.AdmittedKeyDigests = cloneAdmittedKeyDigests(c.AdmittedKeyDigests)
 	out.Execution = c.Execution.Clone()
 	out.Options = c.Options.Clone()
+	out.Control = normalizeControlConfig(c.Control)
 	return out
 }
 

@@ -487,8 +487,10 @@ func (c *Connector) resolveConnectionPlan(ctx context.Context, nodeName string) 
 			activeJumps = splitProxyJumpChain(nodeCfg.ProxyJump)
 		}
 		nodeCfg.ProxyJump = strings.Join(activeJumps, ",")
+		ctrl := c.resolveControl(current, nodeCfg)
+		nodeCfg.Control = normalizeControlConfig(ctrl)
 		positions[current] = len(plan)
-		plan = append(plan, connectionPlanNode{name: current, cfg: nodeCfg, control: c.resolveControl(current, nodeCfg)})
+		plan = append(plan, connectionPlanNode{name: current, cfg: nodeCfg, control: ctrl})
 
 		if len(activeJumps) > 0 {
 			current = activeJumps[len(activeJumps)-1]
@@ -510,23 +512,36 @@ func (c *Connector) expectedPeerUID() uint32 {
 }
 
 func (c *Connector) resolveControl(nodeName string, cfg *ClientConfig) *ControlConfig {
-	if c.controlProvider != nil {
-		if ctrl, err := c.controlProvider.GetControlConfig(nodeName); err == nil && ctrl != nil {
+	return resolveControlConfig(c.controlProvider, c.provider, nodeName, cfg, c.getLogger())
+}
+
+func resolveControlConfig(
+	controlProvider ControlProvider,
+	provider ConnectionProvider,
+	nodeName string,
+	cfg *ClientConfig,
+	l logger.DebugLogger,
+) *ControlConfig {
+	if controlProvider != nil {
+		if ctrl, err := controlProvider.GetControlConfig(nodeName); err == nil && ctrl != nil {
 			return ctrl
 		}
 		return nil
 	}
-	if cp, ok := c.provider.(ControlProvider); ok {
+	if cp, ok := provider.(ControlProvider); ok {
 		if ctrl, err := cp.GetControlConfig(nodeName); err == nil && ctrl != nil {
 			return ctrl
 		}
 		return nil
 	}
+	if cfg != nil && cfg.Control != nil {
+		return cfg.Control.Clone()
+	}
 	if cfg != nil && cfg.Options != nil {
 		if ctrl, err := cfg.Options.ValidatedControlConfig(); err == nil {
 			return ctrl
-		} else {
-			c.getLogger().Debugf("ssh: ignoring invalid effective control options for %q: %v", nodeName, err)
+		} else if l != nil {
+			l.Debugf("ssh: ignoring invalid effective control options for %q: %v", nodeName, err)
 		}
 	}
 	return nil
@@ -685,6 +700,7 @@ func (c *Connector) wrapPoolClientWithResolver(cfg *ClientConfig, cachedClient *
 		c.getLogger(),
 	))
 	client.pooled = cachedClient
+	client.controlProvider = c.controlProvider
 	cachedClient.probeMu.Lock()
 	if cachedClient.probeCache == nil {
 		cachedClient.probeCache = &executionProbeCache{}
@@ -704,7 +720,25 @@ func (c *Connector) probeCachedClient(ctx context.Context, client *PooledClient)
 	timeout := c.keepAliveProbeTimeout()
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return probeWithTimeoutAndInterrupt(probeCtx, client.SSHClient, timeout, client.interrupt)
+	beforeClose := func() {
+		if c.pool != nil {
+			c.pool.Evict(ZeroHopDigest, client, false)
+		}
+	}
+	var fallbackInterrupt func() error
+	if client.isJumpChild() {
+		fallbackInterrupt = func() error {
+			if c.pool != nil {
+				root := client
+				for root.parent != nil {
+					root = root.parent
+				}
+				c.pool.Evict(ZeroHopDigest, root, false)
+			}
+			return client.interrupt()
+		}
+	}
+	return probeWithContexts(probeCtx, probeCtx, client.SSHClient, timeout, client.closeHopTransport, fallbackInterrupt, beforeClose, nil)
 }
 
 func (c *Connector) keepAliveProbeTimeout() time.Duration {
@@ -930,6 +964,7 @@ func (c *Connector) tryDialAndPublishProxy(ctx context.Context, planNode connect
 		SSHClient:          rawClient,
 		RootConn:           rootConn,
 		hopConn:            rootConn,
+		parentKey:          planNode.parentDigest,
 		pool:               c.pool,
 		publishedCfg:       publishedCfg,
 		ControlSocketPath:  expandedPath,
@@ -1423,14 +1458,14 @@ func (c *Connector) resolveKeepAliveParams(clientCfg *ClientConfig) (parentCtx c
 }
 
 // attachKeepAliveLocked starts client's owned keepalive while connPool.mu is held.
-// Lock ordering: PooledClient.probeMu -> connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
+// Lock ordering: connPool.mu -> Connector.kaMu -> PooledClient.kaMu.
 func (c *Connector) attachKeepAliveLocked(client *PooledClient, clientCfg *ClientConfig) {
 	parentCtx, interval, timeout, nodeScoped := c.resolveKeepAliveParams(clientCfg)
 	if parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
 		return
 	}
-	client.startKeepAlive(parentCtx, interval, timeout, nodeScoped, func(error) {
-		c.pool.Evict(ZeroHopDigest, client, false)
+	client.startKeepAlive(parentCtx, c.lifecycleCtx, interval, timeout, nodeScoped, func(error) {
+		c.pool.Evict(ZeroHopDigest, client, true)
 	}, &c.keepAliveWG)
 }
 

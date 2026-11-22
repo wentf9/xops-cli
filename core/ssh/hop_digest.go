@@ -33,6 +33,7 @@ var (
 	clientConfigReflectType     = reflect.TypeFor[ClientConfig]()
 	connectionConfigReflectType = reflect.TypeFor[ConnectionConfig]()
 	optionsReflectType          = reflect.TypeFor[Options]()
+	controlConfigReflectType    = reflect.TypeFor[ControlConfig]()
 )
 
 // IsZero reports whether d is the all-zero ZeroHopDigest.
@@ -216,8 +217,30 @@ func digestNormalizedConfigField(h hash.Hash, fieldName string, fv reflect.Value
 		if fv.Kind() == reflect.Pointer && fv.Type().Elem() == optionsReflectType {
 			return true, digestOptionsPointer(h, fv)
 		}
+	case "Control":
+		if fv.Kind() == reflect.Pointer && fv.Type().Elem() == controlConfigReflectType {
+			return true, digestControlPointer(h, fv)
+		}
 	}
 	return false, nil
+}
+
+func digestControlPointer(h hash.Hash, ptr reflect.Value) error {
+	if err := ValidateDigestTags(controlConfigReflectType); err != nil {
+		return err
+	}
+	if ptr.IsNil() {
+		_, _ = h.Write([]byte("C0;"))
+		return nil
+	}
+	ctrl, _ := ptr.Interface().(*ControlConfig)
+	norm := normalizeControlConfig(ctrl)
+	if norm == nil {
+		_, _ = h.Write([]byte("C0;"))
+		return nil
+	}
+	_, _ = h.Write([]byte("C1;"))
+	return digestStructValue(h, reflect.ValueOf(*norm))
 }
 
 func canonicalDigestHost(raw string) string {

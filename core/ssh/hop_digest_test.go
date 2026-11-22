@@ -107,7 +107,8 @@ func TestHopDigest_MerkleChainAndNormalization(t *testing.T) {
 		t.Fatal("nil ClientConfig digest must still include parent HopDigest")
 	}
 
-	// Canonical equivalences: port 0 == 22, case-folded host, bracketed IPv6, nil vs empty Options.
+	// Canonical equivalences: port 0 == 22, case-folded host, bracketed IPv6, nil vs empty Options,
+	// and nil vs zero/disabled ControlConfig.
 	eqA := &ClientConfig{
 		NodeID:   "n1",
 		Address:  "Web.Example.COM",
@@ -115,6 +116,7 @@ func TestHopDigest_MerkleChainAndNormalization(t *testing.T) {
 		Port:     0,
 		AuthType: " KEY ",
 		Options:  nil,
+		Control:  nil,
 	}
 	eqB := &ClientConfig{
 		NodeID:   "n1",
@@ -123,9 +125,21 @@ func TestHopDigest_MerkleChainAndNormalization(t *testing.T) {
 		Port:     22,
 		AuthType: "key",
 		Options:  &Options{},
+		Control:  &ControlConfig{},
+	}
+	eqC := &ClientConfig{
+		NodeID:   "n1",
+		Address:  "web.example.com",
+		BaseHost: "2001:db8::1",
+		Port:     22,
+		AuthType: "key",
+		Control:  &ControlConfig{Master: ControlMasterNo, Path: "NONE", Persist: "no", ImplicitTier4: true},
 	}
 	if !DigestClientConfig(eqA, ZeroHopDigest).Equal(DigestClientConfig(eqB, ZeroHopDigest)) {
 		t.Fatal("canonically equivalent ClientConfigs produced different HopDigests")
+	}
+	if !DigestClientConfig(eqA, ZeroHopDigest).Equal(DigestClientConfig(eqC, ZeroHopDigest)) {
+		t.Fatal("disabled ControlConfig must hash identically to nil ControlConfig")
 	}
 }
 
@@ -163,6 +177,14 @@ func TestHopDigest_IncludeSensitivityAndExcludeInvariance(t *testing.T) {
 			AdmittedKeyDigests:          []AdmittedKeyDigest{{Path: "/k", SHA256: "def"}},
 			Execution:                   &ExecutionConfig{Interpreter: InterpreterBash, LaunchDialect: LaunchPOSIX, Login: &loginTrue},
 			Options:                     MustOptions(OptionControlMaster, "auto", OptionControlPath, "~/.ssh/cm-%C", OptionControlPersist, "10m"),
+			Control: &ControlConfig{
+				Master:        ControlMasterAuto,
+				Path:          "~/.ssh/cm-%C",
+				LiteralPath:   false,
+				Persist:       "10m",
+				ImplicitTier4: false,
+				AllowReuse:    false,
+			},
 		}
 	}
 
@@ -215,6 +237,13 @@ func TestHopDigest_IncludeSensitivityAndExcludeInvariance(t *testing.T) {
 		{"Options.ControlPersist", func(c *ClientConfig) { _ = c.Options.Set(OptionControlPersist, "20m") }},
 		{"Options.ImplicitTier4", func(c *ClientConfig) { c.Options.ImplicitTier4 = true }},
 		{"Options.LiteralControlPath", func(c *ClientConfig) { c.Options.LiteralControlPath = true }},
+		{"Control.Master", func(c *ClientConfig) { c.Control.Master = ControlMasterYes }},
+		{"Control.Path", func(c *ClientConfig) { c.Control.Path = "/tmp/other-%C" }},
+		{"Control.LiteralPath", func(c *ClientConfig) { c.Control.LiteralPath = true }},
+		{"Control.Persist", func(c *ClientConfig) { c.Control.Persist = "30m" }},
+		{"Control.ImplicitTier4", func(c *ClientConfig) { c.Control.ImplicitTier4 = true }},
+		{"Control.AllowReuse", func(c *ClientConfig) { c.Control.AllowReuse = true }},
+		{"Control.Disabled", func(c *ClientConfig) { c.Control = nil }},
 	}
 
 	for _, tc := range mutations {

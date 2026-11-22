@@ -221,6 +221,24 @@ func (c *ControlConfig) Clone() *ControlConfig {
 	return &cloned
 }
 
+// normalizeControlConfig returns a canonically normalized clone of ctrl,
+// collapsing nil, zero-valued, and disabled (empty or "none" Path) configs to
+// nil so unset and disabled states hash identically in HopDigest.
+func normalizeControlConfig(ctrl *ControlConfig) *ControlConfig {
+	if ctrl == nil || !ctrl.IsEnabled() {
+		return nil
+	}
+	out := *ctrl
+	if !out.LiteralPath {
+		out.Path = strings.TrimSpace(out.Path)
+	}
+	if parsed, err := ParseControlMasterMode(string(out.Master)); err == nil {
+		out.Master = parsed
+	}
+	out.Persist = strings.TrimSpace(out.Persist)
+	return &out
+}
+
 // Equal reports whether two ControlConfig values are equal.
 func (c *ControlConfig) Equal(other *ControlConfig) bool {
 	if c == other {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -11,6 +12,10 @@ import (
 
 // errKeepaliveTimeout 等待心跳回复期间持续未收到远端数据
 var errKeepaliveTimeout = errors.New("keepalive probe timed out")
+
+// errKeepaliveStopped reports a non-disruptive keepalive detach (e.g. pool
+// displacement, retire, or StopGlobalKeepAlives) while abortCtx remains active.
+var errKeepaliveStopped = errors.New("keepalive stopped non-disruptively")
 
 // 心跳默认参数：接收空闲 15s 后探测；等待回复期间连续 10s 无接收进展才超时。
 // 网络拥塞下的有效接收进展会推迟探测或刷新等待时间，网络黑洞仍有确定的退出路径。
@@ -36,6 +41,28 @@ func StartKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout t
 }
 
 func startKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout time.Duration, fallback func(error), interrupt func() error) <-chan struct{} {
+	return startKeepAliveWithContexts(ctx, ctx, client, interval, timeout, fallback, interrupt, nil, nil)
+}
+
+// startKeepAliveWithContexts separates stopCtx (non-disruptive detach such as
+// pool displacement, Retire, or StopGlobalKeepAlives) from abortCtx (hard
+// lifecycle shutdown such as Connector.CloseAll or public StartKeepAlive cancel).
+// When stopCtx cancels while abortCtx is still active, an in-flight probe exits
+// cleanly without calling interrupt or fallback, leaving the live transport
+// intact. When wg is non-nil, the caller has already added 1 for this keepalive
+// loop; startKeepAliveWithContexts releases that count on exit and tracks any
+// in-flight SendRequest goroutine on wg so CloseAll joins it after closing
+// pooled transports.
+func startKeepAliveWithContexts(
+	stopCtx context.Context,
+	abortCtx context.Context,
+	client *ssh.Client,
+	interval, timeout time.Duration,
+	fallback func(error),
+	interrupt func() error,
+	beforeClose func(),
+	wg *sync.WaitGroup,
+) <-chan struct{} {
 	done := make(chan struct{})
 	if interval <= 0 {
 		interval = DefaultKeepAliveInterval
@@ -44,23 +71,40 @@ func startKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout t
 		timeout = DefaultKeepAliveTimeout
 	}
 
+	var stopDone <-chan struct{}
+	if stopCtx != nil {
+		stopDone = stopCtx.Done()
+	}
+	var abortDone <-chan struct{}
+	if abortCtx != nil {
+		abortDone = abortCtx.Done()
+	}
+
 	go func() {
 		defer close(done)
+		if wg != nil {
+			defer wg.Done()
+		}
 		timer := time.NewTimer(interval)
 		defer timer.Stop()
 
 		for {
 			select {
-			case <-ctx.Done():
+			case <-abortDone:
+				return
+			case <-stopDone:
 				return
 			case <-timer.C:
+				if (abortCtx != nil && abortCtx.Err() != nil) || (stopCtx != nil && stopCtx.Err() != nil) {
+					return
+				}
 				if remaining := keepAliveReadTimeout(client, interval); remaining > 0 {
 					timer.Reset(remaining)
 					continue
 				}
 				// 发送心跳请求
-				if err := probeWithTimeoutAndInterrupt(ctx, client, timeout, interrupt); err != nil {
-					if ctx.Err() != nil {
+				if err := probeWithContexts(stopCtx, abortCtx, client, timeout, interrupt, nil, beforeClose, wg); err != nil {
+					if errors.Is(err, errKeepaliveStopped) || (abortCtx != nil && abortCtx.Err() != nil) {
 						return
 					}
 					// 请求失败，或等待期间持续没有远端数据
@@ -92,48 +136,165 @@ func probeWithTimeout(ctx context.Context, client *ssh.Client, timeout time.Dura
 // Synchronous acquisition must also supply a context deadline, since receive
 // progress can extend this idle timeout for the lifetime of a busy connection.
 func probeWithTimeoutAndInterrupt(ctx context.Context, client *ssh.Client, timeout time.Duration, interrupt func() error) error {
-	if timeout <= 0 {
-		timeout = DefaultKeepAliveTimeout
-	}
+	return probeWithContexts(ctx, ctx, client, timeout, interrupt, nil, nil, nil)
+}
 
-	type probeResult struct{ err error }
-	done := make(chan probeResult, 1)
+func ctxDoneCh(ctx context.Context) <-chan struct{} {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Done()
+}
+
+func isCtxCanceled(ctx context.Context) bool {
+	return ctx != nil && ctx.Err() != nil
+}
+
+func isNonDisruptiveKeepAliveStop(stopCtx, abortCtx context.Context) bool {
+	return stopCtx != abortCtx && isCtxCanceled(stopCtx) && !isCtxCanceled(abortCtx)
+}
+
+type keepAliveProbeResult struct{ err error }
+
+func launchKeepAliveProbe(client *ssh.Client, probeWG *sync.WaitGroup) <-chan keepAliveProbeResult {
+	done := make(chan keepAliveProbeResult, 1)
+	if probeWG != nil {
+		probeWG.Add(1)
+	}
 	go func() {
+		if probeWG != nil {
+			defer probeWG.Done()
+		}
 		// payload = nil: 不需要携带额外数据
 		// "keepalive@openssh.com" 是 OpenSSH 标准的心跳请求类型
 		// wantReply = true: 要求服务器回复。如果服务器挂了或网络断了，探测会报错或超时
 		_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
-		done <- probeResult{err: err}
+		done <- keepAliveProbeResult{err: err}
 	}()
+	return done
+}
+
+func terminateKeepAliveProbe(
+	probeErr error,
+	timeout time.Duration,
+	interrupt func() error,
+	fallbackInterrupt func() error,
+	beforeClose func(),
+	done <-chan keepAliveProbeResult,
+	abortDone <-chan struct{},
+	boundedJoin bool,
+) error {
+	if beforeClose != nil {
+		beforeClose()
+	}
+	closeErr := interrupt()
+	if boundedJoin || fallbackInterrupt != nil {
+		// A hop-scoped close on a child over a healthy bastion replies
+		// with SSH_MSG_CHANNEL_CLOSE promptly; if the bastion itself is
+		// blackholed, either return under probeWG tracking (background
+		// keepalive) or escalate to fallbackInterrupt (synchronous probe).
+		grace := min(timeout, 50*time.Millisecond)
+		if grace <= 0 {
+			grace = 50 * time.Millisecond
+		}
+		graceTimer := time.NewTimer(grace)
+		defer graceTimer.Stop()
+		select {
+		case <-done:
+		case <-abortDone:
+			if fallbackInterrupt != nil {
+				closeErr = errors.Join(closeErr, fallbackInterrupt())
+			}
+			<-done
+		case <-graceTimer.C:
+			if fallbackInterrupt != nil {
+				closeErr = errors.Join(closeErr, fallbackInterrupt())
+				<-done
+			}
+		}
+	} else {
+		// Abort the transport before joining the pending request.
+		<-done
+	}
+	if closeErr != nil {
+		return fmt.Errorf("%w; close SSH client after keepalive failed: %w", probeErr, closeErr)
+	}
+	return probeErr
+}
+
+func probeWithContexts(
+	stopCtx context.Context,
+	abortCtx context.Context,
+	client *ssh.Client,
+	timeout time.Duration,
+	interrupt func() error,
+	fallbackInterrupt func() error,
+	beforeClose func(),
+	probeWG *sync.WaitGroup,
+) error {
+	if timeout <= 0 {
+		timeout = DefaultKeepAliveTimeout
+	}
+	if isCtxCanceled(abortCtx) {
+		return fmt.Errorf("ssh keepalive canceled: %w", abortCtx.Err())
+	}
+	if isCtxCanceled(stopCtx) {
+		return errKeepaliveStopped
+	}
+
+	done := launchKeepAliveProbe(client, probeWG)
+	stopDone := ctxDoneCh(stopCtx)
+	abortDone := ctxDoneCh(abortCtx)
+	nonDisruptiveStop := stopCtx != abortCtx
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	terminateProbe := func(probeErr error) error {
-		closeErr := interrupt()
-		// Abort the transport before joining the pending request.
-		<-done
-		if closeErr != nil {
-			return fmt.Errorf("%w; close SSH client after keepalive failed: %w", probeErr, closeErr)
-		}
-		return probeErr
-	}
 	for {
 		select {
-		case r := <-done:
-			if r.err == nil {
+		case res := <-done:
+			if res.err == nil {
 				return nil
+			}
+			if isNonDisruptiveKeepAliveStop(stopCtx, abortCtx) {
+				return errKeepaliveStopped
+			}
+			if beforeClose != nil {
+				beforeClose()
 			}
 			// The request has already returned. A closed target can be replaced
 			// over a healthy jump, so do not abort the shared root in this case.
-			return errors.Join(fmt.Errorf("ssh keepalive request failed: %w", r.err), closeResource(client, "SSH client after keepalive"))
+			return errors.Join(fmt.Errorf("ssh keepalive request failed: %w", res.err), closeResource(client, "SSH client after keepalive"))
 		case <-timer.C:
+			if isNonDisruptiveKeepAliveStop(stopCtx, abortCtx) {
+				return errKeepaliveStopped
+			}
 			if remaining := keepAliveReadTimeout(client, timeout); remaining > 0 {
 				timer.Reset(remaining)
 				continue
 			}
-			return terminateProbe(fmt.Errorf("ssh keepalive: %w", errKeepaliveTimeout))
-		case <-ctx.Done():
-			return terminateProbe(fmt.Errorf("ssh keepalive canceled: %w", ctx.Err()))
+			return terminateKeepAliveProbe(
+				fmt.Errorf("ssh keepalive: %w", errKeepaliveTimeout),
+				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, nonDisruptiveStop && probeWG != nil,
+			)
+		case <-abortDone:
+			return terminateKeepAliveProbe(
+				fmt.Errorf("ssh keepalive canceled: %w", abortCtx.Err()),
+				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false,
+			)
+		case <-stopDone:
+			if isCtxCanceled(abortCtx) {
+				return terminateKeepAliveProbe(
+					fmt.Errorf("ssh keepalive canceled: %w", abortCtx.Err()),
+					timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false,
+				)
+			}
+			if nonDisruptiveStop {
+				return errKeepaliveStopped
+			}
+			return terminateKeepAliveProbe(
+				fmt.Errorf("ssh keepalive canceled: %w", stopCtx.Err()),
+				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false,
+			)
 		}
 	}
 }

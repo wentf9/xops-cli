@@ -176,6 +176,15 @@ func TestClientConfig_AllIngestionPointsNormalize(t *testing.T) {
 	if got := client.Config().SudoUpdateToken; got != "sudo-v2" {
 		t.Fatalf("refreshed SudoUpdateToken = %q, want %q", got, "sudo-v2")
 	}
+	expectedRefreshed := NewClientConfig(*rawLive)
+	expectedRefreshed.SudoUpdateToken = "sudo-v2"
+	expectedRefreshedKey := DigestClientConfig(expectedRefreshed, ZeroHopDigest)
+	if gotKey := connector.pool.DigestOf(client.pooled); gotKey != expectedRefreshedKey {
+		t.Fatalf("refreshConnectionTokens did not reindex pooled client: got %s, want %s", gotKey, expectedRefreshedKey)
+	}
+	if err := connector.pool.CheckInvariants(false); err != nil {
+		t.Fatalf("post-refreshConnectionTokens CheckInvariants failed: %v", err)
+	}
 }
 
 type poolModelStormState struct {
@@ -194,6 +203,10 @@ type poolModelStormState struct {
 	successfulOps atomic.Int32
 	reindexOps    atomic.Int32
 	evictOps      atomic.Int32
+	refreshOps    atomic.Int32
+	kaCycleOps    atomic.Int32
+	kaCheckMu     sync.RWMutex
+	requireKA     bool
 }
 
 func (s *poolModelStormState) recordInvErr(err error) {
@@ -314,11 +327,39 @@ func (s *poolModelStormState) runInvariantChecker() {
 			return
 		default:
 		}
-		if err := s.connector.pool.CheckInvariants(true); err != nil {
+		s.kaCheckMu.RLock()
+		err := s.connector.pool.CheckInvariants(s.requireKA)
+		s.kaCheckMu.RUnlock()
+		if err != nil {
 			s.recordInvErr(err)
 			return
 		}
 		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func (s *poolModelStormState) runTokenRefreshWorker(ctx context.Context) {
+	tokens := []string{"sudo-v2", "sudo-v3", "sudo-v4", "sudo-v5"}
+	for idx := 0; ; idx++ {
+		select {
+		case <-s.stopStorm:
+			return
+		default:
+		}
+		reqCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
+		cli, err := s.connector.Connect(reqCtx, "token-node")
+		cancel()
+		if err != nil || cli == nil {
+			continue
+		}
+		nextTok := tokens[idx%len(tokens)]
+		s.provider.mu.Lock()
+		s.provider.cfgs["token-node"].SudoUpdateToken = nextTok
+		s.provider.mu.Unlock()
+		if err := cli.refreshConnectionTokens(tokenRefreshKindSudo, nextTok); err == nil {
+			s.refreshOps.Add(1)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -345,6 +386,11 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 				User: "fixture", AuthType: "password", Password: sshfixture.Password,
 				ProxyJump: "jump",
 			},
+			"token-node": {
+				NodeID: "token-node", Address: tHost, Port: tPort,
+				User: "fixture", AuthType: "password", Password: sshfixture.Password,
+				SudoMode: SudoModeAuto, SudoUpdateToken: "sudo-v1",
+			},
 		},
 	}
 
@@ -353,7 +399,7 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 	connector := newTestConnector(provider, WithDialer(dialer), WithHostKeyVerifier(statelessTrust))
 	kaCtx, cancelKA := context.WithCancel(ctx)
 	defer cancelKA()
-	connector.EnableKeepAlive(kaCtx, 40*time.Millisecond, 500*time.Millisecond)
+	connector.EnableKeepAlive(kaCtx, 15*time.Millisecond, 500*time.Millisecond)
 	t.Cleanup(func() { _ = connector.CloseAll() })
 
 	if _, err := connector.Connect(ctx, "target"); err != nil {
@@ -374,6 +420,7 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 		tPort:     tPort,
 		stopStorm: make(chan struct{}),
 	}
+	storm.requireKA = true
 
 	var wg sync.WaitGroup
 	for workerID := range 4 {
@@ -381,9 +428,17 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 	}
 	wg.Go(storm.runConfigFlipper)
 	wg.Go(storm.runRetireAndStaleCASActor)
+	wg.Go(func() { storm.runTokenRefreshWorker(ctx) })
 	wg.Go(storm.runInvariantChecker)
 
-	time.Sleep(150 * time.Millisecond)
+	time.Sleep(120 * time.Millisecond)
+	// Also exercise StopGlobalKeepAlives concurrently with active probes, then stop storm.
+	storm.kaCheckMu.Lock()
+	storm.requireKA = false
+	connector.pool.StopGlobalKeepAlives()
+	storm.kaCheckMu.Unlock()
+	storm.kaCycleOps.Add(1)
+	time.Sleep(30 * time.Millisecond)
 	close(storm.stopStorm)
 	wg.Wait()
 
@@ -393,7 +448,7 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 	if gotInvErr != nil {
 		t.Fatalf("pool invariant violated during concurrent storm: %v", gotInvErr)
 	}
-	if err := connector.pool.CheckInvariants(true); err != nil {
+	if err := connector.pool.CheckInvariants(false); err != nil {
 		t.Fatalf("post-storm pool invariant failed: %v", err)
 	}
 	if storm.successfulOps.Load() == 0 {
@@ -404,6 +459,9 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 	}
 	if storm.evictOps.Load() == 0 {
 		t.Fatal("expected at least one concurrent EvictClient operation during storm")
+	}
+	if storm.refreshOps.Load() == 0 {
+		t.Fatal("expected at least one concurrent refreshConnectionTokens operation during storm")
 	}
 
 	if err := connector.CloseAll(); err != nil {
@@ -483,6 +541,225 @@ func TestModel_ConnectorPool_KeepAliveDeathAfterReindex(t *testing.T) {
 	}
 	if err := connector.pool.CheckInvariants(true); err != nil {
 		t.Fatalf("post-keepalive-death pool invariant failed: %v", err)
+	}
+}
+
+func assertModelCascadeRefresh(t *testing.T, connector *Connector, provider *mutableRouteProvider, bastionClient, c2 *Client) {
+	t.Helper()
+	oldBastionKey := connector.pool.DigestOf(bastionClient.pooled)
+	oldTarget2Key := connector.pool.DigestOf(c2.pooled)
+	provider.mu.Lock()
+	provider.cfgs["bastion"].SudoUpdateToken = "b-s2"
+	provider.cfgs["bastion"].SudoMode = SudoModeSudo
+	provider.mu.Unlock()
+	if err := bastionClient.refreshConnectionTokens(tokenRefreshKindSudo, "b-s2"); err != nil {
+		t.Fatalf("bastion.refreshConnectionTokens: %v", err)
+	}
+	if got := connector.pool.DigestOf(bastionClient.pooled); got == oldBastionKey {
+		t.Fatal("bastion did not reindex on refreshConnectionTokens with active descendants")
+	}
+	if got := connector.pool.DigestOf(c2.pooled); got == oldTarget2Key {
+		t.Fatal("active descendant target2 did not cascade-reindex with bastion")
+	}
+	if err := connector.pool.CheckInvariants(true); err != nil {
+		t.Fatalf("post-cascade CheckInvariants(true): %v", err)
+	}
+}
+
+func assertModelChildKeepAliveTimeout(t *testing.T, connector *Connector, target1Srv *keepAliveBarrierServer, bastionClient, c1, c2 *Client) {
+	t.Helper()
+	target1Srv.setStall(true)
+	waitForCondition(t, 3*time.Second, func() bool {
+		_, stillActive := connector.pool.Get(connector.pool.DigestOf(c1.pooled))
+		return !stillActive && connector.pool.Count() == 2
+	}, "timed-out child target1 was not evicted while keeping bastion and target2")
+	if isRootConnClosed(bastionClient.rootConn) {
+		t.Fatal("child-hop keepalive timeout closed shared bastion RootConn")
+	}
+	if err := runBarrierExecCheck(bastionClient); err != nil {
+		t.Fatalf("bastion unhealthy after target1 keepalive timeout: %v", err)
+	}
+	if err := runBarrierExecCheck(c2); err != nil {
+		t.Fatalf("sibling target2 unhealthy after target1 keepalive timeout: %v", err)
+	}
+	if err := connector.pool.CheckInvariants(true); err != nil {
+		t.Fatalf("post-child-timeout CheckInvariants(true): %v", err)
+	}
+}
+
+func assertModelPublishDisplacementInFlight(
+	t *testing.T,
+	connector *Connector,
+	provider *mutableRouteProvider,
+	target2Srv *keepAliveBarrierServer,
+	bastionClient, c2 *Client,
+) *PooledClient {
+	t.Helper()
+	target2Srv.setStall(true)
+	target2Srv.waitProbeInFlight(t, 2*time.Second)
+	t2Key := connector.pool.DigestOf(c2.pooled)
+	_, t2DisplacedDone := c2.pooled.keepAliveState()
+	replacementT2SSH := dialBarrierTestClient(t, target2Srv.addr)
+	t.Cleanup(func() { _ = replacementT2SSH.Close() })
+	replacementT2 := &PooledClient{
+		SSHClient:    replacementT2SSH,
+		RootConn:     bastionClient.rootConn,
+		hopConn:      &stubCloseConn{},
+		parentKey:    connector.pool.DigestOf(bastionClient.pooled),
+		publishedCfg: NewClientConfig(*provider.cfgs["target2"]),
+	}
+	if _, err := connector.publishPooled(t2Key, replacementT2, bastionClient.pooled, nil); err != nil {
+		t.Fatalf("publishPooled replacement target2: %v", err)
+	}
+	select {
+	case <-t2DisplacedDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("displaced target2 keepalive did not exit on Publish displacement")
+	}
+	if isRootConnClosed(bastionClient.rootConn) {
+		t.Fatal("Publish displacement of child target2 closed shared bastion RootConn")
+	}
+	if err := runBarrierExecCheck(c2); err != nil {
+		t.Fatalf("displaced target2 session failed after Publish displacement: %v", err)
+	}
+	if err := runBarrierExecCheck(bastionClient); err != nil {
+		t.Fatalf("bastion session failed after target2 Publish displacement: %v", err)
+	}
+	if err := connector.pool.CheckInvariants(true); err != nil {
+		t.Fatalf("post-Publish-displacement CheckInvariants(true): %v", err)
+	}
+	return replacementT2
+}
+
+func assertModelStopGlobalAndRetireInFlight(
+	t *testing.T,
+	connector *Connector,
+	bastionSrv, target2Srv *keepAliveBarrierServer,
+	cancelKA context.CancelFunc,
+	bastionClient, c2 *Client,
+	replacementT2 *PooledClient,
+) {
+	t.Helper()
+	bastionSrv.setStall(true)
+	bastionSrv.waitProbeInFlight(t, 2*time.Second)
+	target2Srv.waitProbeInFlight(t, 2*time.Second)
+
+	cancelKA()
+	_, bDone := bastionClient.pooled.keepAliveState()
+	_, t2Done := replacementT2.keepAliveState()
+	for label, ch := range map[string]<-chan struct{}{"bastion": bDone, "target2": t2Done} {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s keepalive did not detach on StopGlobalKeepAlives", label)
+		}
+	}
+	if isRootConnClosed(bastionClient.rootConn) {
+		t.Fatal("StopGlobalKeepAlives closed live RootConn while probe was in flight")
+	}
+	if err := runBarrierExecCheck(bastionClient); err != nil {
+		t.Fatalf("bastion session failed after StopGlobalKeepAlives during in-flight probe: %v", err)
+	}
+	if err := runBarrierExecCheck(c2); err != nil {
+		t.Fatalf("target2 session failed after StopGlobalKeepAlives during in-flight probe: %v", err)
+	}
+	if err := connector.pool.CheckInvariants(false); err != nil {
+		t.Fatalf("post-StopGlobalKeepAlives CheckInvariants(false): %v", err)
+	}
+
+	bastionSrv.setStall(false)
+	target2Srv.setStall(false)
+	connector.pool.Retire(ZeroHopDigest, bastionClient.pooled)
+	if err := runBarrierExecCheck(bastionClient); err != nil {
+		t.Fatalf("retired bastion session failed after Retire: %v", err)
+	}
+	if err := runBarrierExecCheck(c2); err != nil {
+		t.Fatalf("retired target2 session failed after Retire: %v", err)
+	}
+	if err := connector.pool.CheckInvariants(false); err != nil {
+		t.Fatalf("post-Retire CheckInvariants(false): %v", err)
+	}
+}
+
+// TestModel_ConnectorPool_InFlightKeepAliveCancelAndChildTimeout verifies under
+// -race that:
+//  1. Concurrent in-flight keepalive probes survive Publish displacement, Retire,
+//     and StopGlobalKeepAlives without closing live RootConns.
+//  2. A child hop timing out over a shared bastion evicts only the timed-out
+//     child while keeping the bastion and healthy sibling target live.
+//  3. Parent-hop refreshConnectionTokens atomically cascades Reindex to active
+//     descendants without breaking pool invariants or stranding entries.
+func TestModel_ConnectorPool_InFlightKeepAliveCancelAndChildTimeout(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+
+	bastionSrv := newKeepAliveBarrierServer(t, ctx)
+	target1Srv := newKeepAliveBarrierServer(t, ctx)
+	target2Srv := newKeepAliveBarrierServer(t, ctx)
+
+	bHost, bPort := fixtureEndpoint(t, bastionSrv.addr)
+	t1Host, t1Port := fixtureEndpoint(t, target1Srv.addr)
+	t2Host, t2Port := fixtureEndpoint(t, target2Srv.addr)
+
+	provider := &mutableRouteProvider{
+		cfgs: map[string]*ClientConfig{
+			"bastion": {
+				NodeID: "bastion", Address: bHost, Port: bPort,
+				User: "fixture", AuthType: "password", Password: sshfixture.Password,
+				SudoMode: SudoModeAuto, SudoUpdateToken: "b-s1",
+			},
+			"target1": {
+				NodeID: "target1", Address: t1Host, Port: t1Port,
+				User: "fixture", AuthType: "password", Password: sshfixture.Password,
+				ProxyJump: "bastion",
+			},
+			"target2": {
+				NodeID: "target2", Address: t2Host, Port: t2Port,
+				User: "fixture", AuthType: "password", Password: sshfixture.Password,
+				ProxyJump: "bastion",
+			},
+		},
+	}
+
+	dialer := &p7TrackingDialer{}
+	statelessTrust := &p7BarrierTrust{onCheck: func(context.Context, HostKeyRequest) error { return nil }}
+	connector := newTestConnector(provider, WithDialer(dialer), WithHostKeyVerifier(statelessTrust))
+	kaCtx, cancelKA := context.WithCancel(ctx)
+	defer cancelKA()
+	connector.EnableKeepAlive(kaCtx, 15*time.Millisecond, 90*time.Millisecond)
+	t.Cleanup(func() { _ = connector.CloseAll() })
+
+	c1, err := connector.Connect(ctx, "target1")
+	if err != nil {
+		t.Fatalf("Connect(target1): %v", err)
+	}
+	c2, err := connector.Connect(ctx, "target2")
+	if err != nil {
+		t.Fatalf("Connect(target2): %v", err)
+	}
+	bastionClient, err := connector.Connect(ctx, "bastion")
+	if err != nil {
+		t.Fatalf("Connect(bastion): %v", err)
+	}
+	if c1.rootConn != c2.rootConn {
+		t.Fatal("expected target1 and target2 to share bastion RootConn")
+	}
+	if err := connector.pool.CheckInvariants(true); err != nil {
+		t.Fatalf("initial CheckInvariants(true): %v", err)
+	}
+
+	assertModelCascadeRefresh(t, connector, provider, bastionClient, c2)
+	assertModelChildKeepAliveTimeout(t, connector, target1Srv, bastionClient, c1, c2)
+	replacementT2 := assertModelPublishDisplacementInFlight(t, connector, provider, target2Srv, bastionClient, c2)
+	assertModelStopGlobalAndRetireInFlight(t, connector, bastionSrv, target2Srv, cancelKA, bastionClient, c2, replacementT2)
+
+	if err := connector.CloseAll(); err != nil {
+		t.Fatalf("CloseAll failed: %v", err)
+	}
+	for i, c := range dialer.snapshot() {
+		if !c.closed.Load() {
+			t.Errorf("leaked unclosed transport #%d after CloseAll", i+1)
+		}
 	}
 }
 

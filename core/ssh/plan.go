@@ -147,6 +147,7 @@ func normalizePlan(plan ConnectionPlan) (ConnectionPlan, error) {
 		if hop.Options.IsEmpty() {
 			hop.Options = nil
 		}
+		hop.Control = nil
 		seen[hop.NodeID] = true
 		plan.Hops[index], previous = hop, hop.NodeID
 	}
@@ -245,6 +246,7 @@ func clientConfigFromPlan(cfg ConnectionConfig) ClientConfig {
 			norm.Options = nil
 		}
 	}
+	norm.Control = nil
 	return *norm
 }
 

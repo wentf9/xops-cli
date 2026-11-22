@@ -525,7 +525,11 @@ func TestProxyJump_TargetMasterShutdownPreservesBastion(t *testing.T) {
 		t.Fatalf("bastion master AliveCheck failed after target master shutdown: %v", err)
 	}
 
-	bastionKey := DigestClientConfig(NewClientConfig(*provider.cfgs["bastion"]), ZeroHopDigest)
+	bastionPlan, err := connector.resolveConnectionPlan(ctx, "bastion")
+	if err != nil {
+		t.Fatalf("resolveConnectionPlan(bastion) failed: %v", err)
+	}
+	bastionKey := bastionPlan[0].hopDigest()
 	bastionPooled, ok := connector.pool.Get(bastionKey)
 	if !ok || bastionPooled == nil || bastionPooled.SSHClient == nil {
 		t.Fatal("expected cached bastion client to remain in connector")

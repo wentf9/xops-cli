@@ -29,6 +29,7 @@ type Client struct {
 	sudoMu                 sync.Mutex
 	connCfg                ConnectionConfig
 	provider               ConnectionProvider
+	controlProvider        ControlProvider
 	resolver               SecretResolver
 	prompter               SecretPrompter
 	recorder               CredentialRecorder
@@ -1107,6 +1108,72 @@ func (c *Client) updateSudoMode(ctx context.Context, mode SudoMode) error {
 	return nil
 }
 
+func validateCommittedTokenRefresh(kind tokenRefreshKind, nodeID, committedToken string, newCfg *ClientConfig) error {
+	if committedToken == "" {
+		return nil
+	}
+	switch kind {
+	case tokenRefreshKindAuth:
+		if newCfg.AuthUpdateToken != committedToken {
+			return fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q)",
+				ErrSnapshotMismatch, nodeID, committedToken, newCfg.AuthUpdateToken)
+		}
+	case tokenRefreshKindSudo:
+		if newCfg.SudoUpdateToken != committedToken {
+			return fmt.Errorf("%w: sudo version mismatch after update for node %q (expected %q, got %q)",
+				ErrSnapshotMismatch, nodeID, committedToken, newCfg.SudoUpdateToken)
+		}
+	}
+	return nil
+}
+
+func applyOriginalProxyJump(orig *string, hasOrig *bool, nextOrig string, nextHasOrig bool) {
+	if nextHasOrig {
+		*orig = nextOrig
+		*hasOrig = true
+	} else if nextOrig != "" {
+		*orig = nextOrig
+	}
+}
+
+func applyRefreshedTokensToPooled(
+	pooled *PooledClient,
+	kind tokenRefreshKind,
+	refreshSudoMode bool,
+	pubAuthType string,
+	snap ConnectionConfig,
+) {
+	if pooled == nil {
+		return
+	}
+	pooled.updateSnapshot(func(dstSnap *ConnectionConfig, pub *ClientConfig) {
+		if dstSnap != nil {
+			dstSnap.SudoMode = snap.SudoMode
+			dstSnap.SudoUpdateToken = snap.SudoUpdateToken
+			dstSnap.AuthUpdateToken = snap.AuthUpdateToken
+			dstSnap.AuthType = snap.AuthType
+			dstSnap.KeyRef = snap.KeyRef
+			dstSnap.TrustVersion = snap.TrustVersion
+			applyOriginalProxyJump(&dstSnap.OriginalProxyJump, &dstSnap.HasOriginalProxyJump, snap.OriginalProxyJump, snap.HasOriginalProxyJump)
+		}
+		if pub != nil {
+			switch kind {
+			case tokenRefreshKindAuth:
+				pub.AuthUpdateToken = snap.AuthUpdateToken
+			case tokenRefreshKindSudo:
+				pub.SudoUpdateToken = snap.SudoUpdateToken
+				if refreshSudoMode {
+					pub.SudoMode = snap.SudoMode
+				}
+			}
+			pub.AuthType = pubAuthType
+			pub.KeyRef = snap.KeyRef
+			pub.TrustVersion = snap.TrustVersion
+			applyOriginalProxyJump(&pub.OriginalProxyJump, &pub.HasOriginalProxyJump, snap.OriginalProxyJump, snap.HasOriginalProxyJump)
+		}
+	})
+}
+
 // refreshConnectionTokens 从底层 ConnectionProvider 刷新最新的版本令牌并校验目标与版本兼容性
 func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken string) error {
 	if c == nil || c.provider == nil {
@@ -1128,9 +1195,10 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 		return fmt.Errorf("%w: config not found for node %q", ErrSnapshotMismatch, nodeID)
 	}
 	newCfg = NewClientConfig(*newCfg)
+	newCfg.Control = normalizeControlConfig(resolveControlConfig(c.controlProvider, c.provider, nodeID, newCfg, c.getLogger()))
 
 	// [P1] 校验完整连接目标是否仍然与当前已建立的连接一致。
-	// AuthUpdateToken 的刷新语义由下方 switch 按 kind 精确校验（auth 必须等于本次 committedToken，
+	// AuthUpdateToken 的刷新语义由下方校验按 kind 精确处理（auth 必须等于本次 committedToken，
 	// sudo 刷新期间忽略无关并发 auth 令牌推进并严格保留原快照）。
 	expected := curCfg
 	expected.AuthUpdateToken = newCfg.AuthUpdateToken
@@ -1139,18 +1207,11 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 	}
 
 	// [P1] 校验刷新版本与本次写回的对应关系：必须严格等于本次事务实际提交的版本，拒绝采纳后续无关更新，且允许幂等未变
-	switch kind {
-	case tokenRefreshKindAuth:
-		if committedToken != "" && newCfg.AuthUpdateToken != committedToken {
-			return fmt.Errorf("%w: auth version mismatch after update for node %q (expected %q, got %q)",
-				ErrSnapshotMismatch, nodeID, committedToken, newCfg.AuthUpdateToken)
-		}
-	case tokenRefreshKindSudo:
-		if committedToken != "" && newCfg.SudoUpdateToken != committedToken {
-			return fmt.Errorf("%w: sudo version mismatch after update for node %q (expected %q, got %q)",
-				ErrSnapshotMismatch, nodeID, committedToken, newCfg.SudoUpdateToken)
-		}
+	if err := validateCommittedTokenRefresh(kind, nodeID, committedToken, newCfg); err != nil {
+		return err
 	}
+
+	refreshSudoMode := kind == tokenRefreshKindSudo && shouldRefreshSudoMode(curCfg, newCfg)
 
 	c.cfgMu.Lock()
 	switch kind {
@@ -1160,17 +1221,17 @@ func (c *Client) refreshConnectionTokens(kind tokenRefreshKind, committedToken s
 		c.connCfg.SudoUpdateToken = newCfg.SudoUpdateToken
 		// A no-save recorder returns the unchanged token. Do not overwrite
 		// verified session-local discovery with the repository's old mode.
-		if shouldRefreshSudoMode(curCfg, newCfg) {
+		if refreshSudoMode {
 			c.connCfg.SudoMode = newCfg.SudoMode
 		}
 	}
-	if newCfg.HasOriginalProxyJump {
-		c.connCfg.OriginalProxyJump = newCfg.OriginalProxyJump
-		c.connCfg.HasOriginalProxyJump = true
-	} else if newCfg.OriginalProxyJump != "" {
-		c.connCfg.OriginalProxyJump = newCfg.OriginalProxyJump
-	}
+	c.connCfg.KeyRef = newCfg.KeyRef
+	c.connCfg.TrustVersion = newCfg.TrustVersion
+	applyOriginalProxyJump(&c.connCfg.OriginalProxyJump, &c.connCfg.HasOriginalProxyJump, newCfg.OriginalProxyJump, newCfg.HasOriginalProxyJump)
+	snap := c.connCfg
 	c.cfgMu.Unlock()
+
+	applyRefreshedTokensToPooled(c.pooled, kind, refreshSudoMode, newCfg.AuthType, snap)
 	return nil
 }
 
