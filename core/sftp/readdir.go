@@ -2,12 +2,17 @@ package sftp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 
 	"github.com/pkg/sftp"
 )
+
+// ErrUnsafeRemoteDirEntry indicates a remote SFTP server returned a malformed,
+// duplicate, or parent-escaping directory entry during ReadDir validation.
+var ErrUnsafeRemoteDirEntry = errors.New("unsafe remote directory entry")
 
 func saturatingAddInt64(a, b int64) int64 {
 	if a < 0 {
@@ -53,22 +58,22 @@ func validateRemoteDirEntries(
 			}
 		}
 		if entry == nil {
-			return nil, fmt.Errorf("%s %q: %w: missing file metadata", op, parent.String(), ErrInvalidRemoteName)
+			return nil, fmt.Errorf("%s %q: %w: %w: missing file metadata", op, parent.String(), ErrUnsafeRemoteDirEntry, ErrInvalidRemoteName)
 		}
 		entryName, nameErr := ParseRemoteName(entry.Name())
 		if nameErr != nil {
-			return nil, fmt.Errorf("%s %q: unsafe remote filename %q: %w", op, parent.String(), entry.Name(), nameErr)
+			return nil, fmt.Errorf("%s %q: %w: unsafe remote filename %q: %w", op, parent.String(), ErrUnsafeRemoteDirEntry, entry.Name(), nameErr)
 		}
 		rawName := entryName.String()
 		if _, dup := seen[rawName]; dup {
-			return nil, fmt.Errorf("%s %q: duplicate remote directory entry %q", op, parent.String(), rawName)
+			return nil, fmt.Errorf("%s %q: %w: duplicate remote directory entry %q", op, parent.String(), ErrUnsafeRemoteDirEntry, rawName)
 		}
 		seen[rawName] = struct{}{}
 
 		child := parent.Join(entryName)
 		rels, relErr := child.RelativeTo(parent)
 		if relErr != nil || len(rels) != 1 || !rels[0].Equal(entryName) {
-			return nil, fmt.Errorf("%s %q: entry %q escapes parent directory", op, parent.String(), child.String())
+			return nil, fmt.Errorf("%s %q: %w: entry %q escapes parent directory", op, parent.String(), ErrUnsafeRemoteDirEntry, child.String())
 		}
 		validated = append(validated, validatedRemoteDirEntry{
 			info:  entry,
@@ -77,6 +82,56 @@ func validateRemoteDirEntries(
 		})
 	}
 	return validated, nil
+}
+
+// ValidateRemoteDirEntries validates raw SFTP ReadDir entries beneath parent
+// through ParseRemoteName (rejecting ".", "..", "/", path separators, NUL, and
+// control characters), exact duplicate rejection, and strict parent containment.
+func ValidateRemoteDirEntries(parent string, entries []os.FileInfo) ([]os.FileInfo, error) {
+	parentPath, err := ParseRemotePath(parent)
+	if err != nil {
+		return nil, err
+	}
+	validated, err := validateRemoteDirEntries(context.Background(), parentPath, entries, "readdir")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]os.FileInfo, len(validated))
+	for i, item := range validated {
+		out[i] = item.info
+	}
+	return out, nil
+}
+
+// ReadValidatedDir lists dir on a raw *sftp.Client and validates every returned
+// entry through ValidateRemoteDirEntries before yielding any child to the caller.
+func ReadValidatedDir(client *sftp.Client, dir string) ([]os.FileInfo, error) {
+	return ReadValidatedDirContext(context.Background(), client, dir)
+}
+
+// ReadValidatedDirContext lists dir on a raw *sftp.Client using ctx and
+// validates every returned entry through ValidateRemoteDirEntries before
+// yielding any child to the caller.
+func ReadValidatedDirContext(ctx context.Context, client *sftp.Client, dir string) ([]os.FileInfo, error) {
+	if client == nil {
+		return nil, fmt.Errorf("sftp client is nil")
+	}
+	if ctx == nil {
+		return nil, fmt.Errorf("context is nil")
+	}
+	parent, err := ParseRemotePath(dir)
+	if err != nil {
+		return nil, err
+	}
+	validated, err := readValidatedRemoteDir(ctx, client, parent, "readdir")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]os.FileInfo, len(validated))
+	for i, item := range validated {
+		out[i] = item.info
+	}
+	return out, nil
 }
 
 // readValidatedRemoteDir reads parent via SFTP ReadDir and validates every

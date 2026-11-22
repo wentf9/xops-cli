@@ -30,7 +30,19 @@ var (
 	// ErrLocalDestNotDir indicates multiple download sources targeted a local
 	// destination that is not an existing directory.
 	ErrLocalDestNotDir = errors.New("local destination must be an existing directory")
+	// ErrInvalidRemoteSize indicates a remote SFTP server reported a negative file
+	// size (e.g. wire uint64 >= 1<<63 overflowing signed int64).
+	ErrInvalidRemoteSize = errors.New("invalid remote file size")
 )
+
+// validateRemoteFileSize fails closed when a remote regular file reports a
+// negative size (wire SSH_FXP_ATTRS uint64 >= 1<<63).
+func validateRemoteFileSize(remotePath string, size int64) error {
+	if size < 0 {
+		return fmt.Errorf("%w: remote file %q has negative size %d", ErrInvalidRemoteSize, remotePath, size)
+	}
+	return nil
+}
 
 // LocalDestMode specifies how Client.Download interprets an existing local
 // directory destination.
@@ -289,6 +301,11 @@ func (c *Client) downloadOne(ctx context.Context, remote RemotePath, dest LocalD
 	}
 	if err := validateRemoteDownloadMode(remote.String(), info.Mode(), false); err != nil {
 		return err
+	}
+	if !info.IsDir() {
+		if err := validateRemoteFileSize(remote.String(), info.Size()); err != nil {
+			return fmt.Errorf("download %q: %w", remote.String(), err)
+		}
 	}
 
 	resolvedLocal, err := resolveDownloadLocalPath(remote, info, dest, opts.ContentsOnly)

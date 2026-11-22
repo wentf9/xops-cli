@@ -59,6 +59,14 @@ func parseCompletionCursor(content string) completionCursor {
 		if inQuote == '"' {
 			inToken = true
 			if r == '\\' {
+				if isDoubleQuoteTrailingBackslashClose(runes, i) {
+					current.WriteRune('\\')
+					inQuote = 0
+					quoteStartRune = -1
+					prefixBeforeQuote = ""
+					i++ // 消费该闭合双引号
+					continue
+				}
 				escaped = true
 				continue
 			}

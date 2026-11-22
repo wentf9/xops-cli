@@ -16,6 +16,7 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/guardrail"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
 	"github.com/wentf9/xops-cli/core/mcp/session"
+	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/core/ssh"
 )
 
@@ -329,7 +330,11 @@ func (r *Runtime) saveFoldedLog(ctx context.Context, nodeID, content string) str
 		if err != nil {
 			return err
 		}
-		dir := path.Join(home, foldedLogDir)
+		homePath, err := sftp.ParseRemotePath(home)
+		if err != nil || !homePath.IsAbs() {
+			return fmt.Errorf("invalid remote home path %q", home)
+		}
+		dir := path.Join(homePath.String(), foldedLogDir)
 		if err := c.MkdirAll(dir); err != nil {
 			return err
 		}
@@ -343,7 +348,11 @@ func (r *Runtime) saveFoldedLog(ctx context.Context, nodeID, content string) str
 		if err := c.Chmod(dir, 0o700); err != nil {
 			return err
 		}
-		pruneFoldedLogs(c, dir, maxFoldedLogs-1)
+		if err := pruneFoldedLogs(c, dir, maxFoldedLogs-1); err != nil {
+			if errors.Is(err, sftp.ErrUnsafeRemoteDirEntry) || errors.Is(err, sftp.ErrInvalidRemotePath) {
+				return err
+			}
+		}
 		logPath = path.Join(dir, "cmd-"+time.Now().UTC().Format("20060102T150405")+"-"+suffix+".log")
 		return nil
 	}); err != nil {
@@ -358,10 +367,10 @@ func (r *Runtime) saveFoldedLog(ctx context.Context, nodeID, content string) str
 	return logPath
 }
 
-func pruneFoldedLogs(c *pkgsftp.Client, dir string, keep int) {
-	entries, err := c.ReadDir(dir)
+func pruneFoldedLogs(c *pkgsftp.Client, dir string, keep int) error {
+	entries, err := sftp.ReadValidatedDir(c, dir)
 	if err != nil {
-		return
+		return err
 	}
 	var names []string
 	for _, entry := range entries {
@@ -371,12 +380,13 @@ func pruneFoldedLogs(c *pkgsftp.Client, dir string, keep int) {
 		}
 	}
 	if len(names) <= keep {
-		return
+		return nil
 	}
 	slices.Sort(names)
 	for _, old := range names[:len(names)-keep] {
 		_ = c.Remove(path.Join(dir, old))
 	}
+	return nil
 }
 
 func terminalRiskInput(in TerminalInput) guardrail.RiskInput {

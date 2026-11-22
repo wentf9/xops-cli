@@ -27,10 +27,14 @@ func expandSCPRemotePath(ctx context.Context, client *sftp.Client, remotePath st
 	if err != nil {
 		return "", fmt.Errorf("resolve remote home directory failed: %w", err)
 	}
+	homePath, err := sftp.ParseRemotePath(home)
+	if err != nil || !homePath.IsAbs() {
+		return "", fmt.Errorf("resolve remote home directory failed: invalid non-absolute remote home %q", home)
+	}
 	if remotePath == "~" {
-		return home, nil
+		return homePath.String(), nil
 	}
 	// Preserve trailing slashes and path components; the remote server resolves
 	// them, including any symbolic links in intermediate directories.
-	return strings.TrimSuffix(home, "/") + remotePath[1:], nil
+	return strings.TrimSuffix(homePath.String(), "/") + remotePath[1:], nil
 }

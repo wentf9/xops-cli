@@ -22,6 +22,7 @@ import (
 	"github.com/wentf9/xops-cli/core/mcp/patch"
 	"github.com/wentf9/xops-cli/core/mcp/ports"
 	"github.com/wentf9/xops-cli/core/mcp/remotefile"
+	"github.com/wentf9/xops-cli/core/sftp"
 )
 
 const (
@@ -523,7 +524,9 @@ func fileStat(ctx context.Context, files ports.FileSession, input FileInput) (Fi
 		}
 		b.WriteByte('\n')
 		count := 0
-		buildDirTree(c, input.Path, "", 1, &b, &count)
+		if err := buildDirTree(c, input.Path, "", 1, &b, &count); err != nil {
+			return err
+		}
 		treeContent = strings.TrimSuffix(b.String(), "\n")
 		return nil
 	})
@@ -540,14 +543,17 @@ func fileStat(ctx context.Context, files ports.FileSession, input FileInput) (Fi
 	}, nil
 }
 
-func buildDirTree(c *pkgsftp.Client, dirPath, prefix string, depth int, b *strings.Builder, count *int) {
+func buildDirTree(c *pkgsftp.Client, dirPath, prefix string, depth int, b *strings.Builder, count *int) error {
 	if depth > maxStatTreeDepth || *count >= maxStatTreeEntries {
-		return
+		return nil
 	}
-	entries, err := c.ReadDir(dirPath)
+	entries, err := sftp.ReadValidatedDir(c, dirPath)
 	if err != nil {
+		if errors.Is(err, sftp.ErrUnsafeRemoteDirEntry) || errors.Is(err, sftp.ErrInvalidRemotePath) {
+			return err
+		}
 		fmt.Fprintf(b, "%s└── [unreadable: %v]\n", prefix, err)
-		return
+		return nil
 	}
 	var filtered []os.FileInfo
 	for _, entry := range entries {
@@ -569,7 +575,7 @@ func buildDirTree(c *pkgsftp.Client, dirPath, prefix string, depth int, b *strin
 	for i, entry := range filtered {
 		if *count >= maxStatTreeEntries {
 			fmt.Fprintf(b, "%s└── [... truncated after %d entries ...]\n", prefix, maxStatTreeEntries)
-			return
+			return nil
 		}
 		*count++
 		connector := "├── "
@@ -581,12 +587,15 @@ func buildDirTree(c *pkgsftp.Client, dirPath, prefix string, depth int, b *strin
 		if entry.IsDir() {
 			fmt.Fprintf(b, "%s%s%s/\n", prefix, connector, entry.Name())
 			if depth < maxStatTreeDepth {
-				buildDirTree(c, path.Join(dirPath, entry.Name()), childPrefix, depth+1, b, count)
+				if err := buildDirTree(c, path.Join(dirPath, entry.Name()), childPrefix, depth+1, b, count); err != nil {
+					return err
+				}
 			}
 		} else {
 			fmt.Fprintf(b, "%s%s%s (%d B)\n", prefix, connector, entry.Name(), entry.Size())
 		}
 	}
+	return nil
 }
 
 // lintContent performs a local syntax check for formats that can be validated

@@ -516,14 +516,25 @@ func (c *Client) interruptTransfers() error {
 	return c.state.interruptErr
 }
 
-// Cwd returns the remote working directory using the caller's cancellation boundary.
+// Cwd returns the validated, POSIX-cleaned remote working directory using the
+// caller's cancellation boundary.
 func (c *Client) Cwd(ctx context.Context) (cwd string, retErr error) {
 	retErr = c.Do(ctx, func(rawClient *sftp.Client) error {
-		var err error
-		cwd, err = rawClient.Getwd()
-		return err
+		raw, err := rawClient.Getwd()
+		if err != nil {
+			return err
+		}
+		parsed, err := ParseRemotePath(raw)
+		if err != nil {
+			return fmt.Errorf("invalid remote working directory: %w", err)
+		}
+		cwd = parsed.String()
+		return nil
 	})
-	return cwd, retErr
+	if retErr != nil {
+		return "", retErr
+	}
+	return cwd, nil
 }
 
 // Stat returns the FileInfo for a remote path using the caller's cancellation boundary.
@@ -549,16 +560,26 @@ func (c *Client) Lstat(ctx context.Context, remotePath string) (os.FileInfo, err
 	return info, err
 }
 
-// RealPath returns the canonicalized absolute path on the remote host,
+// RealPath returns the validated, canonicalized path on the remote host,
 // using the caller's cancellation boundary.
 func (c *Client) RealPath(ctx context.Context, remotePath string) (string, error) {
 	var realPath string
 	err := c.Do(ctx, func(rawClient *sftp.Client) error {
-		var realErr error
-		realPath, realErr = rawClient.RealPath(remotePath)
-		return realErr
+		raw, realErr := rawClient.RealPath(remotePath)
+		if realErr != nil {
+			return realErr
+		}
+		parsed, parseErr := ParseRemotePath(raw)
+		if parseErr != nil {
+			return fmt.Errorf("invalid remote realpath for %q: %w", remotePath, parseErr)
+		}
+		realPath = parsed.String()
+		return nil
 	})
-	return realPath, err
+	if err != nil {
+		return "", err
+	}
+	return realPath, nil
 }
 
 // StatVFS returns VFS statistics for the remote path. If the server does not support

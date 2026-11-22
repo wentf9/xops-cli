@@ -870,7 +870,9 @@ func TestPruneFoldedLogsBoundsCacheDirectory(t *testing.T) {
 	}
 	_ = keepFile.Close()
 
-	pruneFoldedLogs(fs.client, dir, maxFoldedLogs)
+	if err := pruneFoldedLogs(fs.client, dir, maxFoldedLogs); err != nil {
+		t.Fatal(err)
+	}
 	entries, err := fs.client.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)

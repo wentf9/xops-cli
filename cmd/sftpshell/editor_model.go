@@ -41,6 +41,7 @@ type editorModel struct {
 }
 
 func newEditorModel(options promptOptions, history []string, schedule completionScheduler) *editorModel {
+	options.text = sanitizeDisplayText(options.text)
 	input := textinput.New()
 	input.Prompt = options.text
 	input.SetVirtualCursor(false)

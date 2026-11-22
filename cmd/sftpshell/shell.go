@@ -661,7 +661,7 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		return err
 	}
 	defer s.endRun()
-	readCommand := func() (string, error) { return s.prompt(runCtx, fmt.Sprintf("sftp:%s> ", s.cwd)) }
+	readCommand := func() (string, error) { return s.prompt(runCtx, fmt.Sprintf("sftp:%s> ", sanitizeDisplayText(s.cwd))) }
 	if s.batch {
 		read, closeInput, err := batchCommandReader(runCtx, s.stdin)
 		if err != nil {
@@ -997,9 +997,9 @@ func (s *Shell) dispatchTransferCmd(ctx context.Context, cmd string, params []st
 
 func (s *Shell) handlePwd(cmd string) error {
 	if cmd == "pwd" {
-		s.fprintlnStdout(s.cwd)
+		s.fprintlnStdout(sanitizeDisplayText(s.cwd))
 	} else {
-		s.fprintlnStdout(s.localCwd)
+		s.fprintlnStdout(sanitizeDisplayText(s.localCwd))
 	}
 	return nil
 }

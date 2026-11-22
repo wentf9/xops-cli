@@ -789,6 +789,8 @@ func (o *ScpOptions) runDownloadWithLease(ctx context.Context, src PathInfo, loc
 			size := target.Info.Size()
 			if target.Info.IsDir() {
 				size = -1
+			} else if size < 0 {
+				return nil, fmt.Errorf("download %q: %w: negative size %d", target.Remote.String(), sftp.ErrInvalidRemoteSize, size)
 			}
 			progress, finishProgress := o.createTransferProgress(transferCtx, size, "Downloading "+sftp.DisplayRemoteName(target.Remote), 0)
 			return &sftp.DownloadTransferHooks{
@@ -860,6 +862,9 @@ func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst P
 	}
 	if preStat.IsDir() {
 		return fmt.Errorf("remote-to-remote directory transfer is not supported for %q: download locally and upload instead", srcRemote.String())
+	}
+	if preStat.Size() < 0 {
+		return fmt.Errorf("remote source %q: %w: negative size %d", srcRemote.String(), sftp.ErrInvalidRemoteSize, preStat.Size())
 	}
 
 	dstPath := dstRemote.String()
@@ -982,12 +987,13 @@ func newTransferProgressBar(size int64, description string, output *scpDiagnosti
 		progress(startOffset)
 	}
 	return bar, progress, func() error {
-		// Interrupted or indeterminate (size == -1) bars do not run
-		// OptionOnCompletion on their own; closing non-zero bars marks them
-		// finished so indeterminate directory bars stop their 100ms spinner
-		// goroutine and time.Ticker cleanly before output.finish().
+		// Interrupted or indeterminate (size < 0) bars do not run
+		// OptionOnCompletion on their own. Only indeterminate directory bars
+		// spawn a background 100ms spinner goroutine that must be stopped via
+		// bar.Close(); closing a failed or canceled determinate bar (size > 0)
+		// would jump its rendered progress to 100%.
 		if !bar.IsFinished() {
-			if size != 0 {
+			if size < 0 {
 				_ = bar.Close()
 			}
 			if !bar.IsFinished() {

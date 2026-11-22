@@ -386,7 +386,10 @@ func (c *Client) doUpload(ctx context.Context, srcFile *os.File, dstFile *sftp.F
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if (size - startOffset) <= 0 {
+	if size < 0 || startOffset < 0 || startOffset > size {
+		return fmt.Errorf("invalid upload range: startOffset=%d size=%d", startOffset, size)
+	}
+	if startOffset == size {
 		return nil
 	}
 	if (size-startOffset) < c.config.ChunkSize || c.config.ThreadsPerFile <= 1 {
@@ -514,6 +517,9 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := validateRemoteFileSize(remotePath, size); err != nil {
+		return err
+	}
 	srcFile, err := c.SFTPClient().Open(remotePath)
 	if err != nil {
 		return fmt.Errorf("open remote source file failed: %w", err)
@@ -528,6 +534,9 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 	}
 	if !srcStat.Mode().IsRegular() {
 		return fmt.Errorf("remote source %q is not a regular file (mode %s)", remotePath, srcStat.Mode())
+	}
+	if err := validateRemoteFileSize(remotePath, srcStat.Size()); err != nil {
+		return err
 	}
 	if srcStat.Size() != size {
 		return fmt.Errorf("remote source size changed: expected %d bytes, got %d", size, srcStat.Size())
@@ -709,6 +718,9 @@ func (c *Client) prepareDownloadFile(ctx context.Context, tempPath string, size 
 	if err := ctx.Err(); err != nil {
 		return 0, nil, nil, err
 	}
+	if err := validateRemoteFileSize(tempPath, size); err != nil {
+		return 0, nil, nil, err
+	}
 	dstFile, openedInfo, created, err := fsx.OpenStagingFile(tempPath, stagingFilePerm)
 	if err != nil {
 		return 0, nil, nil, err
@@ -769,7 +781,10 @@ func (c *Client) doDownload(ctx context.Context, srcFile *sftp.File, dstFile *os
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if (size - startOffset) <= 0 {
+	if size < 0 || startOffset < 0 || startOffset > size {
+		return fmt.Errorf("%w: invalid download range startOffset=%d size=%d", ErrInvalidRemoteSize, startOffset, size)
+	}
+	if startOffset == size {
 		return nil
 	}
 	if (size-startOffset) < c.config.ChunkSize || c.config.ThreadsPerFile <= 1 {
@@ -906,6 +921,9 @@ func (c *Client) RelayFileFrom(
 		if !srcInfo.Mode().IsRegular() {
 			return fmt.Errorf("remote source %q is not a regular file (mode %s)", srcPath.String(), srcInfo.Mode())
 		}
+		if err := validateRemoteFileSize(srcPath.String(), srcInfo.Size()); err != nil {
+			return err
+		}
 	}
 	interrupt := func() error {
 		return errors.Join(srcClient.interruptTransfers(), c.interruptTransfers())
@@ -937,6 +955,9 @@ func (c *Client) relayFileFrom(
 		if !preStat.Mode().IsRegular() {
 			return fmt.Errorf("remote source %q is not a regular file (mode %s)", srcPath.String(), preStat.Mode())
 		}
+		if err := validateRemoteFileSize(srcPath.String(), preStat.Size()); err != nil {
+			return err
+		}
 	}
 	srcFile, err := srcClient.SFTPClient().Open(srcPath.String())
 	if err != nil {
@@ -955,6 +976,9 @@ func (c *Client) relayFileFrom(
 	}
 	if !srcStat.Mode().IsRegular() {
 		return fmt.Errorf("remote source %q is not a regular file", srcPath.String())
+	}
+	if err := validateRemoteFileSize(srcPath.String(), srcStat.Size()); err != nil {
+		return err
 	}
 	if srcInfo != nil && srcStat.Size() != srcInfo.Size() {
 		return fmt.Errorf("remote source size changed: expected %d bytes, got %d", srcInfo.Size(), srcStat.Size())
@@ -987,6 +1011,9 @@ func (c *Client) stageRelayFile(
 	size int64,
 	progress ProgressCallback,
 ) (retErr error) {
+	if err := validateRemoteFileSize(srcLabel, size); err != nil {
+		return err
+	}
 	var fileTransferred atomic.Int64
 	if c.fileProgress != nil {
 		if size > 0 {
@@ -1057,7 +1084,10 @@ func (c *Client) copyRelayContent(
 	transferred *atomic.Int64,
 	progress ProgressCallback,
 ) error {
-	if startOffset >= size {
+	if size < 0 || startOffset < 0 || startOffset > size {
+		return fmt.Errorf("%w: invalid relay range startOffset=%d size=%d", ErrInvalidRemoteSize, startOffset, size)
+	}
+	if startOffset == size {
 		return nil
 	}
 	if startOffset > 0 {
@@ -1373,6 +1403,9 @@ func (c *Client) resolveRemoteCopyFileDestination(src, dst string) (string, os.F
 }
 
 func (c *Client) openVerifiedRemoteCopySource(src string, srcStat os.FileInfo) (*sftp.File, os.FileInfo, error) {
+	if err := validateRemoteFileSize(src, srcStat.Size()); err != nil {
+		return nil, nil, err
+	}
 	srcFile, err := c.SFTPClient().Open(src)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open remote source file failed: %w", err)
@@ -1390,6 +1423,12 @@ func (c *Client) openVerifiedRemoteCopySource(src string, srcStat os.FileInfo) (
 			closeTransferResource(srcFile, "remote source file"),
 		)
 	}
+	if err := validateRemoteFileSize(src, openedStat.Size()); err != nil {
+		return nil, nil, errors.Join(
+			err,
+			closeTransferResource(srcFile, "remote source file"),
+		)
+	}
 	if openedStat.Size() != srcStat.Size() {
 		return nil, nil, errors.Join(
 			fmt.Errorf("remote source size changed: expected %d bytes, got %d", srcStat.Size(), openedStat.Size()),
@@ -1402,6 +1441,9 @@ func (c *Client) openVerifiedRemoteCopySource(src string, srcStat os.FileInfo) (
 func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os.FileInfo) (retErr error) {
 	if !srcStat.Mode().IsRegular() {
 		return fmt.Errorf("remote source %q is not a regular file (mode %s)", src, srcStat.Mode())
+	}
+	if err := validateRemoteFileSize(src, srcStat.Size()); err != nil {
+		return err
 	}
 	dst, existingMode, dstExisted, err := c.resolveRemoteCopyFileDestination(src, dst)
 	if err != nil {
@@ -1525,7 +1567,11 @@ func (c *Client) absoluteRemotePath(remotePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get remote working directory failed: %w", err)
 	}
-	return path.Join(cwd, cleanPath), nil
+	parsedCwd, err := ParseRemotePath(cwd)
+	if err != nil || !parsedCwd.IsAbs() {
+		return "", fmt.Errorf("invalid remote working directory %q: %w", cwd, ErrInvalidRemotePath)
+	}
+	return path.Join(parsedCwd.String(), cleanPath), nil
 }
 
 // canonicalRemoteEntryPath resolves the parent directory while preserving the
@@ -2134,6 +2180,11 @@ func (w *downloadDirWalkState) validateValidatedDirEntries(curRemote RemotePath,
 		}
 		if modeErr := validateRemoteDownloadMode(childRemote.String(), entry.Mode(), true); modeErr != nil {
 			return nil, modeErr
+		}
+		if entry.Mode().IsRegular() {
+			if sizeErr := validateRemoteFileSize(childRemote.String(), entry.Size()); sizeErr != nil {
+				return nil, fmt.Errorf("download %q: %w", childRemote.String(), sizeErr)
+			}
 		}
 		validated = append(validated, validatedWalkEntry{
 			entry:       entry,

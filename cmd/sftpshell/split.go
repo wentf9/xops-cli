@@ -10,6 +10,17 @@ var (
 	errUnclosedQuote = errors.New("unclosed quote in command line")
 )
 
+// isDoubleQuoteTrailingBackslashClose reports whether runes[i] ('\\') inside a
+// double-quoted token is immediately followed by a closing '"' at end-of-input
+// or before whitespace (Windows directory path syntax such as "C:\test\" or
+// "bin036\" /remote").
+func isDoubleQuoteTrailingBackslashClose(runes []rune, i int) bool {
+	if i+1 >= len(runes) || runes[i+1] != '"' {
+		return false
+	}
+	return i+1 == len(runes)-1 || unicode.IsSpace(runes[i+2])
+}
+
 func writeEscapedCommandLineRune(r rune, inQuote rune, current *strings.Builder) {
 	if inQuote == '"' {
 		if r == '"' || r == '\\' {
@@ -68,13 +79,11 @@ func splitCommandLine(input string) ([]string, error) {
 			inToken = true
 			if r == '\\' {
 				// 若下一个字符是双引号，且处于行尾或紧跟空白，说明是 Windows 路径末尾的反斜杠加闭合双引号（如 "C:\test\" 或 "bin036\"）
-				if i+1 < len(runes) && runes[i+1] == '"' {
-					if i+1 == len(runes)-1 || unicode.IsSpace(runes[i+2]) {
-						current.WriteRune('\\')
-						inQuote = 0
-						i++ // 消费该闭合双引号
-						continue
-					}
+				if isDoubleQuoteTrailingBackslashClose(runes, i) {
+					current.WriteRune('\\')
+					inQuote = 0
+					i++ // 消费该闭合双引号
+					continue
 				}
 				escaped = true
 				continue
