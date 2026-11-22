@@ -41,7 +41,7 @@ func StartKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout t
 }
 
 func startKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout time.Duration, fallback func(error), interrupt func() error) <-chan struct{} {
-	return startKeepAliveWithContexts(ctx, ctx, client, interval, timeout, fallback, interrupt, nil, nil)
+	return startKeepAliveWithContexts(ctx, ctx, client, interval, timeout, fallback, interrupt, nil, false, nil)
 }
 
 // startKeepAliveWithContexts separates stopCtx (non-disruptive detach such as
@@ -51,8 +51,8 @@ func startKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout t
 // cleanly without calling interrupt or fallback, leaving the live transport
 // intact. When wg is non-nil, the caller has already added 1 for this keepalive
 // loop; startKeepAliveWithContexts releases that count on exit and tracks any
-// in-flight SendRequest goroutine on wg so CloseAll joins it after closing
-// pooled transports.
+// in-flight SendRequest (and async hop-scoped interrupt) goroutines on wg so
+// CloseAll joins them after closing pooled transports.
 func startKeepAliveWithContexts(
 	stopCtx context.Context,
 	abortCtx context.Context,
@@ -60,7 +60,8 @@ func startKeepAliveWithContexts(
 	interval, timeout time.Duration,
 	fallback func(error),
 	interrupt func() error,
-	beforeClose func(),
+	beforeClose func() func(),
+	hopScopedClose bool,
 	wg *sync.WaitGroup,
 ) <-chan struct{} {
 	done := make(chan struct{})
@@ -103,7 +104,7 @@ func startKeepAliveWithContexts(
 					continue
 				}
 				// 发送心跳请求
-				if err := probeWithContexts(stopCtx, abortCtx, client, timeout, interrupt, nil, beforeClose, wg); err != nil {
+				if err := probeWithContexts(stopCtx, abortCtx, client, timeout, interrupt, nil, beforeClose, hopScopedClose, wg); err != nil {
 					if errors.Is(err, errKeepaliveStopped) || (abortCtx != nil && abortCtx.Err() != nil) {
 						return
 					}
@@ -136,7 +137,7 @@ func probeWithTimeout(ctx context.Context, client *ssh.Client, timeout time.Dura
 // Synchronous acquisition must also supply a context deadline, since receive
 // progress can extend this idle timeout for the lifetime of a busy connection.
 func probeWithTimeoutAndInterrupt(ctx context.Context, client *ssh.Client, timeout time.Duration, interrupt func() error) error {
-	return probeWithContexts(ctx, ctx, client, timeout, interrupt, nil, nil, nil)
+	return probeWithContexts(ctx, ctx, client, timeout, interrupt, nil, nil, false, nil)
 }
 
 func ctxDoneCh(ctx context.Context) <-chan struct{} {
@@ -174,48 +175,136 @@ func launchKeepAliveProbe(client *ssh.Client, probeWG *sync.WaitGroup) <-chan ke
 	return done
 }
 
+func launchAsyncKeepAliveClose(
+	closeFn func() error,
+	afterClose func(),
+	probeWG *sync.WaitGroup,
+) <-chan error {
+	closeDone := make(chan error, 1)
+	if probeWG != nil {
+		probeWG.Add(1)
+	}
+	go func() {
+		if probeWG != nil {
+			defer probeWG.Done()
+		}
+		err := closeFn()
+		if afterClose != nil {
+			afterClose()
+		}
+		closeDone <- err
+	}()
+	return closeDone
+}
+
+func escalateBoundedClose(
+	fallbackInterrupt func() error,
+	probeDone bool,
+	waitDone <-chan keepAliveProbeResult,
+	closed bool,
+	waitClose <-chan error,
+) error {
+	if fallbackInterrupt == nil {
+		return nil
+	}
+	closeErr := fallbackInterrupt()
+	if !probeDone {
+		<-waitDone
+	}
+	if !closed {
+		closeErr = errors.Join(closeErr, <-waitClose)
+	}
+	return closeErr
+}
+
+// runBoundedClose runs closeFn (followed by afterClose) either synchronously
+// (when neither boundedJoin nor fallbackInterrupt is requested, e.g. root hops
+// whose RootConn.Close never blocks on an upstream bastion) or asynchronously
+// behind a bounded grace timer. Running closeFn asynchronously prevents a
+// write-wedged upstream bastion (full TCP SO_SNDBUF or stalled KEX) from
+// blocking graceTimer before fallbackInterrupt can close the shared RootConn
+// and unblock both closeFn and any in-flight SendRequest.
+func runBoundedClose(
+	timeout time.Duration,
+	closeFn func() error,
+	afterClose func(),
+	fallbackInterrupt func() error,
+	done <-chan keepAliveProbeResult,
+	abortDone <-chan struct{},
+	boundedJoin bool,
+	probeWG *sync.WaitGroup,
+) error {
+	if !boundedJoin && fallbackInterrupt == nil {
+		closeErr := closeFn()
+		if afterClose != nil {
+			afterClose()
+		}
+		if done != nil {
+			<-done
+		}
+		return closeErr
+	}
+
+	waitClose := launchAsyncKeepAliveClose(closeFn, afterClose, probeWG)
+
+	// A hop-scoped close on a child over a healthy bastion replies with
+	// SSH_MSG_CHANNEL_CLOSE promptly; if the bastion itself is blackholed or
+	// write-wedged, either return under probeWG tracking (background keepalive)
+	// or escalate to fallbackInterrupt (synchronous probe) and join both
+	// goroutines once RootConn closes.
+	grace := min(timeout, 50*time.Millisecond)
+	if grace <= 0 {
+		grace = 50 * time.Millisecond
+	}
+	graceTimer := time.NewTimer(grace)
+	defer graceTimer.Stop()
+
+	probeDone := done == nil
+	waitDone := done
+	closed := false
+	var closeErr error
+	for !probeDone || !closed {
+		// When abortDone is already closed (e.g. probeCachedClient's probeCtx
+		// deadline expired), escalate deterministically rather than racing
+		// select against an already-closed abortDone channel.
+		select {
+		case <-abortDone:
+			return errors.Join(closeErr, escalateBoundedClose(fallbackInterrupt, probeDone, waitDone, closed, waitClose))
+		default:
+		}
+		select {
+		case <-waitDone:
+			probeDone = true
+			waitDone = nil
+		case err := <-waitClose:
+			closeErr = errors.Join(closeErr, err)
+			closed = true
+			waitClose = nil
+		case <-abortDone:
+			return errors.Join(closeErr, escalateBoundedClose(fallbackInterrupt, probeDone, waitDone, closed, waitClose))
+		case <-graceTimer.C:
+			return errors.Join(closeErr, escalateBoundedClose(fallbackInterrupt, probeDone, waitDone, closed, waitClose))
+		}
+	}
+	return closeErr
+}
+
 func terminateKeepAliveProbe(
 	probeErr error,
 	timeout time.Duration,
 	interrupt func() error,
 	fallbackInterrupt func() error,
-	beforeClose func(),
+	beforeClose func() func(),
 	done <-chan keepAliveProbeResult,
 	abortDone <-chan struct{},
 	boundedJoin bool,
+	probeWG *sync.WaitGroup,
 ) error {
+	var afterClose func()
 	if beforeClose != nil {
-		beforeClose()
+		afterClose = beforeClose()
 	}
-	closeErr := interrupt()
-	if boundedJoin || fallbackInterrupt != nil {
-		// A hop-scoped close on a child over a healthy bastion replies
-		// with SSH_MSG_CHANNEL_CLOSE promptly; if the bastion itself is
-		// blackholed, either return under probeWG tracking (background
-		// keepalive) or escalate to fallbackInterrupt (synchronous probe).
-		grace := min(timeout, 50*time.Millisecond)
-		if grace <= 0 {
-			grace = 50 * time.Millisecond
-		}
-		graceTimer := time.NewTimer(grace)
-		defer graceTimer.Stop()
-		select {
-		case <-done:
-		case <-abortDone:
-			if fallbackInterrupt != nil {
-				closeErr = errors.Join(closeErr, fallbackInterrupt())
-			}
-			<-done
-		case <-graceTimer.C:
-			if fallbackInterrupt != nil {
-				closeErr = errors.Join(closeErr, fallbackInterrupt())
-				<-done
-			}
-		}
-	} else {
-		// Abort the transport before joining the pending request.
-		<-done
-	}
+	closeErr := runBoundedClose(timeout, interrupt, afterClose, fallbackInterrupt, done, abortDone, boundedJoin, probeWG)
 	if closeErr != nil {
 		return fmt.Errorf("%w; close SSH client after keepalive failed: %w", probeErr, closeErr)
 	}
@@ -229,7 +318,8 @@ func probeWithContexts(
 	timeout time.Duration,
 	interrupt func() error,
 	fallbackInterrupt func() error,
-	beforeClose func(),
+	beforeClose func() func(),
+	hopScopedClose bool,
 	probeWG *sync.WaitGroup,
 ) error {
 	if timeout <= 0 {
@@ -246,6 +336,7 @@ func probeWithContexts(
 	stopDone := ctxDoneCh(stopCtx)
 	abortDone := ctxDoneCh(abortCtx)
 	nonDisruptiveStop := stopCtx != abortCtx
+	boundedJoin := hopScopedClose && nonDisruptiveStop && probeWG != nil
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -258,12 +349,24 @@ func probeWithContexts(
 			if isNonDisruptiveKeepAliveStop(stopCtx, abortCtx) {
 				return errKeepaliveStopped
 			}
+			var afterClose func()
 			if beforeClose != nil {
-				beforeClose()
+				afterClose = beforeClose()
 			}
 			// The request has already returned. A closed target can be replaced
-			// over a healthy jump, so do not abort the shared root in this case.
-			return errors.Join(fmt.Errorf("ssh keepalive request failed: %w", res.err), closeResource(client, "SSH client after keepalive"))
+			// over a healthy jump, so close only the client transport unless a
+			// wedged upstream bastion blocks close and forces fallbackInterrupt.
+			closeErr := runBoundedClose(
+				timeout,
+				func() error { return closeResource(client, "SSH client after keepalive") },
+				afterClose,
+				fallbackInterrupt,
+				nil,
+				abortDone,
+				boundedJoin,
+				probeWG,
+			)
+			return errors.Join(fmt.Errorf("ssh keepalive request failed: %w", res.err), closeErr)
 		case <-timer.C:
 			if isNonDisruptiveKeepAliveStop(stopCtx, abortCtx) {
 				return errKeepaliveStopped
@@ -274,18 +377,18 @@ func probeWithContexts(
 			}
 			return terminateKeepAliveProbe(
 				fmt.Errorf("ssh keepalive: %w", errKeepaliveTimeout),
-				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, nonDisruptiveStop && probeWG != nil,
+				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, boundedJoin, probeWG,
 			)
 		case <-abortDone:
 			return terminateKeepAliveProbe(
 				fmt.Errorf("ssh keepalive canceled: %w", abortCtx.Err()),
-				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false,
+				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false, probeWG,
 			)
 		case <-stopDone:
 			if isCtxCanceled(abortCtx) {
 				return terminateKeepAliveProbe(
 					fmt.Errorf("ssh keepalive canceled: %w", abortCtx.Err()),
-					timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false,
+					timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false, probeWG,
 				)
 			}
 			if nonDisruptiveStop {
@@ -293,7 +396,7 @@ func probeWithContexts(
 			}
 			return terminateKeepAliveProbe(
 				fmt.Errorf("ssh keepalive canceled: %w", stopCtx.Err()),
-				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false,
+				timeout, interrupt, fallbackInterrupt, beforeClose, done, abortDone, false, probeWG,
 			)
 		}
 	}

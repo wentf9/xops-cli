@@ -363,6 +363,17 @@ func (s *poolModelStormState) runTokenRefreshWorker(ctx context.Context) {
 	}
 }
 
+func (s *poolModelStormState) waitMinimumCoverage(maxWait time.Duration) {
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if s.successfulOps.Load() > 0 && s.reindexOps.Load() > 0 &&
+			s.evictOps.Load() > 0 && s.refreshOps.Load() > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll exercises concurrent
 // multi-hop Connects, live upstream bastion config flips, retire/evict transitions,
 // stale-parent CAS publish attempts, and CloseAll under -race, checking structural
@@ -432,6 +443,7 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 	wg.Go(storm.runInvariantChecker)
 
 	time.Sleep(120 * time.Millisecond)
+	storm.waitMinimumCoverage(2 * time.Second)
 	// Also exercise StopGlobalKeepAlives concurrently with active probes, then stop storm.
 	storm.kaCheckMu.Lock()
 	storm.requireKA = false

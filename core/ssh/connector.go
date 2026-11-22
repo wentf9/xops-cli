@@ -720,25 +720,36 @@ func (c *Connector) probeCachedClient(ctx context.Context, client *PooledClient)
 	timeout := c.keepAliveProbeTimeout()
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	beforeClose := func() {
-		if c.pool != nil {
-			c.pool.Evict(ZeroHopDigest, client, false)
+	var beforeClose func() func()
+	if c.pool != nil {
+		beforeClose = func() func() {
+			batch := c.pool.detachForEvict(ZeroHopDigest, client, true)
+			return batch.closeDescendantsAndRelease
 		}
 	}
+	hopScopedClose := client.isJumpChild()
 	var fallbackInterrupt func() error
-	if client.isJumpChild() {
+	if hopScopedClose {
 		fallbackInterrupt = func() error {
+			var batch *evictionBatch
 			if c.pool != nil {
 				root := client
 				for root.parent != nil {
 					root = root.parent
 				}
-				c.pool.Evict(ZeroHopDigest, root, false)
+				batch = c.pool.detachForEvict(ZeroHopDigest, root, true)
 			}
-			return client.interrupt()
+			// Abort RootConn BEFORE closing multiplexed child channels so a
+			// write-wedged bastion cannot deadlock descendant teardown.
+			err := client.interrupt()
+			if batch != nil {
+				_ = batch.dead.closeSelf()
+				batch.closeDescendantsAndRelease()
+			}
+			return err
 		}
 	}
-	return probeWithContexts(probeCtx, probeCtx, client.SSHClient, timeout, client.closeHopTransport, fallbackInterrupt, beforeClose, nil)
+	return probeWithContexts(probeCtx, probeCtx, client.SSHClient, timeout, client.closeHopTransport, fallbackInterrupt, beforeClose, hopScopedClose, nil)
 }
 
 func (c *Connector) keepAliveProbeTimeout() time.Duration {
@@ -1464,8 +1475,15 @@ func (c *Connector) attachKeepAliveLocked(client *PooledClient, clientCfg *Clien
 	if parentCtx == nil || parentCtx.Err() != nil || interval <= 0 {
 		return
 	}
-	client.startKeepAlive(parentCtx, c.lifecycleCtx, interval, timeout, nodeScoped, func(error) {
-		c.pool.Evict(ZeroHopDigest, client, true)
+	hopScopedClose := client.isJumpChildLocked()
+	client.startKeepAlive(parentCtx, c.lifecycleCtx, interval, timeout, nodeScoped, func(err error) {
+		if errors.Is(err, errKeepaliveTimeout) {
+			// Timeout termination already detached and closed client (and its
+			// descendants) via beforeClose/interrupt/afterClose; avoid issuing
+			// a duplicate synchronous child.closeSelf() on a wedged bastion.
+			return
+		}
+		c.pool.Evict(ZeroHopDigest, client, !hopScopedClose)
 	}, &c.keepAliveWG)
 }
 

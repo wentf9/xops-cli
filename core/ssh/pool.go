@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -84,6 +85,15 @@ func (c *PooledClient) interrupt() error {
 	return interruptSSHTransport(c.RootConn, sshClient)
 }
 
+// isJumpChildLocked reports whether c rides on an upstream in-memory parent
+// hop. Callers must hold c.pool.mu (or own c exclusively before publication).
+func (c *PooledClient) isJumpChildLocked() bool {
+	if c == nil || c.ControlSocketPath != "" {
+		return false
+	}
+	return c.parent != nil || !c.parentKey.IsZero()
+}
+
 // isJumpChild reports whether c rides on an upstream in-memory parent hop,
 // reading parentKey under c.pool.mu when pooled so concurrent Reindex never races.
 func (c *PooledClient) isJumpChild() bool {
@@ -131,6 +141,8 @@ func (c *PooledClient) closeSelf() error {
 	return c.closeHopTransport()
 }
 
+// startKeepAlive starts this pooled client's background keepalive while
+// c.pool.mu is held (from Publish's onPublished callback).
 func (c *PooledClient) startKeepAlive(
 	stopParentCtx context.Context,
 	abortCtx context.Context,
@@ -156,13 +168,15 @@ func (c *PooledClient) startKeepAlive(
 	if wg != nil {
 		wg.Add(1)
 	}
-	var beforeClose func()
+	hopScopedClose := c.isJumpChildLocked()
+	var beforeClose func() func()
 	if c.pool != nil {
-		beforeClose = func() {
-			c.pool.Evict(ZeroHopDigest, c, false)
+		beforeClose = func() func() {
+			batch := c.pool.detachForEvict(ZeroHopDigest, c, true)
+			return batch.closeDescendantsAndRelease
 		}
 	}
-	c.kaDone = startKeepAliveWithContexts(stopCtx, abortCtx, c.SSHClient, interval, timeout, onDead, c.closeHopTransport, beforeClose, wg)
+	c.kaDone = startKeepAliveWithContexts(stopCtx, abortCtx, c.SSHClient, interval, timeout, onDead, c.closeHopTransport, beforeClose, hopScopedClose, wg)
 }
 
 func (c *PooledClient) detachKeepAlive() context.CancelFunc {
@@ -284,20 +298,23 @@ func canReuseCachedChain(plan []connectionPlanNode, cached []*PooledClient) bool
 	return true
 }
 
-// connPool stores live and retired PooledClients keyed solely by Merkle HopDigest.
-// All membership transitions (Publish CAS, Retire, Evict, Close) execute under a
-// single mutex so displaced clients are never leaked and stale parent generations
-// can never publish into the pool.
+// connPool stores live, retired, and closing PooledClients keyed solely by
+// Merkle HopDigest. All membership transitions (Publish CAS, Retire, Evict,
+// Close) execute under a single mutex so displaced clients are never leaked,
+// evicted-but-not-yet-closed transports remain visible to CloseAll(), and stale
+// parent generations can never publish into the pool.
 type connPool struct {
 	mu      sync.Mutex
 	closed  bool
 	active  map[HopDigest]*PooledClient
 	retired []*PooledClient
+	closing map[*PooledClient]int
 }
 
 func newConnPool() *connPool {
 	return &connPool{
-		active: make(map[HopDigest]*PooledClient),
+		active:  make(map[HopDigest]*PooledClient),
+		closing: make(map[*PooledClient]int),
 	}
 }
 
@@ -329,6 +346,22 @@ func (p *connPool) RetiredCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.retired)
+}
+
+func (p *connPool) ClosingCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.closing)
+}
+
+func (p *connPool) trackClosingLocked(c *PooledClient) {
+	if c == nil || p.closed {
+		return
+	}
+	if p.closing == nil {
+		p.closing = make(map[*PooledClient]int)
+	}
+	p.closing[c]++
 }
 
 func (p *connPool) SnapshotChain(plan []connectionPlanNode) []*PooledClient {
@@ -388,9 +421,7 @@ func (p *connPool) Publish(
 		}
 		// Retire any active descendants that rode on the displaced parent so
 		// active entries never reference a retired parent generation.
-		// Collect keys in a read-only pass first so map iteration order cannot
-		// sever parentKey links before grandchildren are visited.
-		descKeys, descClients := p.collectDescendantsLocked(key, displaced)
+		descKeys, descClients := p.collectDescendantsLocked(displaced)
 		for i, k := range descKeys {
 			delete(p.active, k)
 			child := descClients[i]
@@ -416,57 +447,58 @@ func (p *connPool) Publish(
 	return displaced, nil
 }
 
-func (p *connPool) isLineageDescendantLocked(candidateKey HopDigest, candidate *PooledClient, ancestorKey HopDigest, ancestor *PooledClient) bool {
-	if candidate == nil || candidateKey == ancestorKey || candidate == ancestor {
+// isDescendantLocked reports whether candidate is a downstream in-memory hop
+// riding on ancestor. Every published in-memory jump child carries an exact
+// parent pointer chain set atomically in Publish, so lineage is established by
+// pointer identity (never HopDigest key matching, which would conflate replaced
+// intermediate hops sharing a healthy upstream bastion). When ancestor is a
+// root hop owning a physical RootConn, any in-memory hop sharing that exact
+// RootConn is also treated as a descendant of that root generation.
+func (p *connPool) isDescendantLocked(candidate, ancestor *PooledClient) bool {
+	if candidate == nil || ancestor == nil || candidate == ancestor || candidate.ControlSocketPath != "" {
 		return false
 	}
 	for cur := candidate.parent; cur != nil; cur = cur.parent {
 		if cur == ancestor {
+			if ancestor.RootConn != nil {
+				return candidate.RootConn == ancestor.RootConn
+			}
 			return true
 		}
 	}
-	curKey := candidate.parentKey
-	for steps := 0; !curKey.IsZero() && steps < len(p.active); steps++ {
-		if curKey == ancestorKey {
-			return true
-		}
-		parent, ok := p.active[curKey]
-		if !ok || parent == nil {
-			break
-		}
-		if parent == ancestor {
-			return true
-		}
-		curKey = parent.parentKey
+	if ancestor.parent == nil && ancestor.parentKey.IsZero() && ancestor.ControlSocketPath == "" && ancestor.RootConn != nil {
+		return candidate.RootConn == ancestor.RootConn
 	}
 	return false
 }
 
-func (p *connPool) isDescendantLocked(candidateKey HopDigest, candidate *PooledClient, ancestorKey HopDigest, ancestor *PooledClient) bool {
-	if candidate == nil || candidate.ControlSocketPath != "" {
-		return false
-	}
-	if !p.isLineageDescendantLocked(candidateKey, candidate, ancestorKey, ancestor) {
-		return false
-	}
-	if ancestor.RootConn != nil {
-		// Match strictly by transport generation so fresher generations sharing
-		// the same parentKey are preserved.
-		return candidate.RootConn == ancestor.RootConn
-	}
-	return true
-}
-
-func (p *connPool) collectDescendantsLocked(ancestorKey HopDigest, ancestor *PooledClient) ([]HopDigest, []*PooledClient) {
+func (p *connPool) collectDescendantsLocked(ancestor *PooledClient) ([]HopDigest, []*PooledClient) {
 	var keys []HopDigest
 	var clients []*PooledClient
 	for k, child := range p.active {
-		if p.isDescendantLocked(k, child, ancestorKey, ancestor) {
+		if p.isDescendantLocked(child, ancestor) {
 			keys = append(keys, k)
 			clients = append(clients, child)
 		}
 	}
 	return keys, clients
+}
+
+func parentDepth(c *PooledClient) int {
+	depth := 0
+	for cur := c; cur != nil && cur.parent != nil; cur = cur.parent {
+		depth++
+	}
+	return depth
+}
+
+func sortByParentDepth(clients []*PooledClient) {
+	if len(clients) < 2 {
+		return
+	}
+	slices.SortFunc(clients, func(a, b *PooledClient) int {
+		return cmp.Compare(parentDepth(a), parentDepth(b))
+	})
 }
 
 // activeKeyLocked resolves the active map key currently holding target under
@@ -486,7 +518,7 @@ func (p *connPool) activeKeyLocked(hint HopDigest, target *PooledClient) (HopDig
 }
 
 // Retire non-disruptively removes displaced (and any active downstream hops
-// sharing its generation) from active, stops their keepalives, and tracks them
+// riding on its lineage) from active, stops their keepalives, and tracks them
 // in retired so CloseAll shuts them down without interrupting live sessions.
 func (p *connPool) Retire(key HopDigest, displaced *PooledClient) []*PooledClient {
 	if displaced == nil {
@@ -503,13 +535,7 @@ func (p *connPool) Retire(key HopDigest, displaced *PooledClient) []*PooledClien
 	var toStop []*PooledClient
 	var cancels []context.CancelFunc
 	activeKey, isActive := p.activeKeyLocked(key, displaced)
-	effectiveKey := key
-	if isActive {
-		effectiveKey = activeKey
-	} else if effectiveKey.IsZero() {
-		effectiveKey = displaced.digest
-	}
-	descKeys, descClients := p.collectDescendantsLocked(effectiveKey, displaced)
+	descKeys, descClients := p.collectDescendantsLocked(displaced)
 	if isActive {
 		delete(p.active, activeKey)
 	}
@@ -540,32 +566,70 @@ func (p *connPool) Retire(key HopDigest, displaced *PooledClient) []*PooledClien
 	return toStop
 }
 
-// Evict removes a dead client and any active downstream hops sharing its
-// transport generation, stops their keepalives, and closes evicted downstream
-// hop transports (plus dead itself when closeDead is true) without killing
-// healthy upstream ancestors.
-func (p *connPool) Evict(key HopDigest, dead *PooledClient, closeDead bool) []*PooledClient {
-	if dead == nil {
+// evictionBatch holds pooled clients atomically detached from p.active and
+// recorded in p.closing so connPool.Close() / Connector.CloseAll() always
+// observes their RootConn even while eviction or keepalive abort is in progress.
+type evictionBatch struct {
+	pool        *connPool
+	dead        *PooledClient
+	descendants []*PooledClient
+	tracked     []*PooledClient
+}
+
+func (b *evictionBatch) closeDescendants() {
+	if b == nil {
+		return
+	}
+	for _, child := range b.descendants {
+		_ = child.closeSelf()
+	}
+}
+
+func (b *evictionBatch) release() {
+	if b == nil || b.pool == nil || len(b.tracked) == 0 {
+		return
+	}
+	b.pool.mu.Lock()
+	for _, c := range b.tracked {
+		if n := b.pool.closing[c]; n <= 1 {
+			delete(b.pool.closing, c)
+		} else {
+			b.pool.closing[c] = n - 1
+		}
+	}
+	b.tracked = nil
+	b.pool.mu.Unlock()
+}
+
+func (b *evictionBatch) closeDescendantsAndRelease() {
+	if b == nil {
+		return
+	}
+	defer b.release()
+	b.closeDescendants()
+}
+
+// detachForEvict atomically removes dead (if currently active) and any active
+// in-memory descendants from p.active, detaches their keepalives, and tracks
+// all detached entries (plus dead when trackDead is true) in p.closing without
+// performing any blocking transport I/O. Callers must close dead BEFORE closing
+// descendants so a dead parent's RootConn aborts before child channel closes.
+func (p *connPool) detachForEvict(key HopDigest, dead *PooledClient, trackDead bool) *evictionBatch {
+	if p == nil || dead == nil {
 		return nil
 	}
 	p.mu.Lock()
 	var descKeys []HopDigest
 	var descendants []*PooledClient
 	activeKey, removedSelf := p.activeKeyLocked(key, dead)
-	effectiveKey := key
-	if removedSelf {
-		effectiveKey = activeKey
-	} else if effectiveKey.IsZero() {
-		effectiveKey = dead.digest
-	}
-	if removedSelf || dead.RootConn != nil {
-		descKeys, descendants = p.collectDescendantsLocked(effectiveKey, dead)
+	if removedSelf || trackDead || dead.RootConn != nil {
+		descKeys, descendants = p.collectDescendantsLocked(dead)
 	}
 	if removedSelf {
 		delete(p.active, activeKey)
 	}
 	var cancels []context.CancelFunc
-	if removedSelf || closeDead {
+	if removedSelf || trackDead {
 		if cancel := dead.detachKeepAlive(); cancel != nil {
 			cancels = append(cancels, cancel)
 		}
@@ -576,18 +640,56 @@ func (p *connPool) Evict(key HopDigest, dead *PooledClient, closeDead bool) []*P
 			cancels = append(cancels, cancel)
 		}
 	}
+	var tracked []*PooledClient
+	if !p.closed {
+		if removedSelf || trackDead {
+			p.trackClosingLocked(dead)
+			tracked = append(tracked, dead)
+		}
+		for _, child := range descendants {
+			p.trackClosingLocked(child)
+			tracked = append(tracked, child)
+		}
+	}
 	p.mu.Unlock()
 
 	for _, cancel := range cancels {
 		cancel()
 	}
+	sortByParentDepth(descendants)
+	return &evictionBatch{
+		pool:        p,
+		dead:        dead,
+		descendants: descendants,
+		tracked:     tracked,
+	}
+}
+
+// Evict removes a dead client and any active downstream hops riding on its
+// lineage, stops their keepalives, and closes evicted transports (closing dead
+// FIRST when closeDead is true so a dead root hop's RootConn aborts before
+// closing multiplexed child channels) without killing healthy upstream
+// ancestors. Evicted clients remain tracked in p.closing until teardown
+// completes so a concurrent connPool.Close() / Connector.CloseAll() always
+// interrupts their RootConn.
+func (p *connPool) Evict(key HopDigest, dead *PooledClient, closeDead bool) []*PooledClient {
+	if dead == nil {
+		return nil
+	}
+	batch := p.detachForEvict(key, dead, closeDead)
+	if batch == nil {
+		return nil
+	}
 	if closeDead {
+		defer batch.release()
 		_ = dead.closeSelf()
+		batch.closeDescendants()
+		return batch.descendants
 	}
-	for _, child := range descendants {
-		_ = child.closeSelf()
-	}
-	return descendants
+	// When closeDead is false, dead's transport has not been closed yet; never
+	// block synchronously closing multiplexed child channels over an unclosed
+	// parent transport. Detached entries remain tracked in p.closing for CloseAll.
+	return batch.descendants
 }
 
 type reindexStep struct {
@@ -647,8 +749,8 @@ func (p *connPool) buildReindexStepsLocked(
 	}
 
 	// Fail closed if any descendant riding on target was not reached via active parentKey links.
-	for k, child := range p.active {
-		if _, seen := moving[child]; !seen && p.isDescendantLocked(k, child, oldKey, target) {
+	for _, child := range p.active {
+		if _, seen := moving[child]; !seen && p.isDescendantLocked(child, target) {
 			return nil, false
 		}
 	}
@@ -758,39 +860,66 @@ func (p *connPool) Clear() {
 	}
 }
 
-// Close marks the pool closed, drains all active and retired clients, stops
-// their keepalives, and returns them for transport shutdown.
+// Close marks the pool closed, drains all active, retired, and in-flight
+// closing clients, stops their keepalives, and returns them ordered from roots
+// to descendants so root transports always abort before multiplexed children.
 func (p *connPool) Close() []*PooledClient {
 	p.mu.Lock()
 	p.closed = true
-	all := make([]*PooledClient, 0, len(p.active)+len(p.retired))
+	all := make([]*PooledClient, 0, len(p.active)+len(p.retired)+len(p.closing))
+	seen := make(map[*PooledClient]struct{}, len(p.active)+len(p.retired)+len(p.closing))
 	var cancels []context.CancelFunc
-	for _, c := range p.active {
+	collect := func(c *PooledClient) {
+		if c == nil {
+			return
+		}
+		if _, dup := seen[c]; dup {
+			return
+		}
+		seen[c] = struct{}{}
 		all = append(all, c)
 		if cancel := c.detachKeepAlive(); cancel != nil {
 			cancels = append(cancels, cancel)
 		}
 	}
+	for _, c := range p.active {
+		collect(c)
+	}
 	for _, c := range p.retired {
-		all = append(all, c)
-		if cancel := c.detachKeepAlive(); cancel != nil {
-			cancels = append(cancels, cancel)
-		}
+		collect(c)
+	}
+	for c := range p.closing {
+		collect(c)
 	}
 	clear(p.active)
 	p.retired = nil
+	clear(p.closing)
 	p.mu.Unlock()
 
 	for _, cancel := range cancels {
 		cancel()
 	}
+	sortByParentDepth(all)
 	return all
+}
+
+func checkInactivePoolClient(label string, client *PooledClient, activeSet map[*PooledClient]HopDigest) error {
+	if client == nil {
+		return nil
+	}
+	if key, stillActive := activeSet[client]; stillActive {
+		return fmt.Errorf("pool invariant violated: %s client %p is also active at %s", label, client, key)
+	}
+	if active, _ := client.keepAliveState(); active {
+		return fmt.Errorf("pool invariant violated: %s client %p still has an active keepalive", label, client)
+	}
+	return nil
 }
 
 // CheckInvariants verifies structural pool safety properties under p.mu:
 //  1. Every active client has a live (unclosed) RootConn and consistent digest/publishedCfg.
 //  2. Every active jump-chained client references a live active parent with matching RootConn.
-//  3. No retired client remains in active or retains an active keepalive.
+//  3. No retired or closing client remains in active or retains an active keepalive.
 //  4. When requireKeepAlive is true, every active client has an active keepalive.
 func (p *connPool) CheckInvariants(requireKeepAlive bool) error {
 	p.mu.Lock()
@@ -798,46 +927,52 @@ func (p *connPool) CheckInvariants(requireKeepAlive bool) error {
 
 	activeSet := make(map[*PooledClient]HopDigest, len(p.active))
 	for key, client := range p.active {
-		if client == nil {
-			return fmt.Errorf("pool invariant violated: nil client at key %s", key)
-		}
-		if client.digest != key {
-			return fmt.Errorf("pool invariant violated: active client %p digest %s != map key %s", client, client.digest, key)
-		}
-		if isRootConnClosed(client.RootConn) {
-			return fmt.Errorf("pool invariant violated: active client %s has closed RootConn", key)
-		}
-		if client.publishedCfg != nil {
-			if wantKey := DigestClientConfig(client.publishedCfg, client.parentKey); wantKey != key {
-				return fmt.Errorf("pool invariant violated: active client %p DigestClientConfig(publishedCfg, parentKey) %s != map key %s", client, wantKey, key)
-			}
+		if err := p.checkActiveClientLocked(key, client, requireKeepAlive); err != nil {
+			return err
 		}
 		activeSet[client] = key
-		if !client.parentKey.IsZero() && client.ControlSocketPath == "" {
-			parent, ok := p.active[client.parentKey]
-			if !ok || parent == nil {
-				return fmt.Errorf("pool invariant violated: active child %s missing active parent %s", key, client.parentKey)
-			}
-			if !isConsistentParentChildTransport(parent, client) {
-				return fmt.Errorf("pool invariant violated: active child %s has stale parent generation (parent=%p child.parent=%p)", key, parent, client.parent)
-			}
-		}
-		if requireKeepAlive && client.SSHClient != nil {
-			if active, _ := client.keepAliveState(); !active {
-				return fmt.Errorf("pool invariant violated: active client %s missing live keepalive", key)
-			}
-		}
 	}
 
 	for _, r := range p.retired {
-		if r == nil {
-			continue
+		if err := checkInactivePoolClient("retired", r, activeSet); err != nil {
+			return err
 		}
-		if key, stillActive := activeSet[r]; stillActive {
-			return fmt.Errorf("pool invariant violated: retired client %p is also active at %s", r, key)
+	}
+	for c := range p.closing {
+		if err := checkInactivePoolClient("closing", c, activeSet); err != nil {
+			return err
 		}
-		if active, _ := r.keepAliveState(); active {
-			return fmt.Errorf("pool invariant violated: retired client %p still has an active keepalive", r)
+	}
+	return nil
+}
+
+func (p *connPool) checkActiveClientLocked(key HopDigest, client *PooledClient, requireKeepAlive bool) error {
+	if client == nil {
+		return fmt.Errorf("pool invariant violated: nil client at key %s", key)
+	}
+	if client.digest != key {
+		return fmt.Errorf("pool invariant violated: active client %p digest %s != map key %s", client, client.digest, key)
+	}
+	if isRootConnClosed(client.RootConn) {
+		return fmt.Errorf("pool invariant violated: active client %s has closed RootConn", key)
+	}
+	if client.publishedCfg != nil {
+		if wantKey := DigestClientConfig(client.publishedCfg, client.parentKey); wantKey != key {
+			return fmt.Errorf("pool invariant violated: active client %p DigestClientConfig(publishedCfg, parentKey) %s != map key %s", client, wantKey, key)
+		}
+	}
+	if !client.parentKey.IsZero() && client.ControlSocketPath == "" {
+		parent, ok := p.active[client.parentKey]
+		if !ok || parent == nil {
+			return fmt.Errorf("pool invariant violated: active child %s missing active parent %s", key, client.parentKey)
+		}
+		if client.parent != parent || !isConsistentParentChildTransport(parent, client) {
+			return fmt.Errorf("pool invariant violated: active child %s has stale parent generation (parent=%p child.parent=%p)", key, parent, client.parent)
+		}
+	}
+	if requireKeepAlive && client.SSHClient != nil {
+		if active, _ := client.keepAliveState(); !active {
+			return fmt.Errorf("pool invariant violated: active client %s missing live keepalive", key)
 		}
 	}
 	return nil
