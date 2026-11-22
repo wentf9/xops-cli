@@ -74,8 +74,8 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	}
 
 	portChanged := cmd.Flags().Changed("port")
-	if portChanged && flags.port == 0 {
-		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
+	if err := validateAddPreFlags(cmd, flags, portChanged); err != nil {
+		return err
 	}
 	if err := resolveAddTargetAndAlias(args, flags, secretInput.UsesStdin(), portChanged); err != nil {
 		return err
@@ -117,20 +117,8 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	draft.Hosts.Set(draftNode.HostRef, hostObj)
 	draft.Identities.Set(draftNode.IdentityRef, identity)
 	draft.Nodes.Set(name, draftNode)
-	if strings.TrimSpace(flags.jump) != "" {
-		ps, pErr := ssh.ParseProxyJump(flags.jump)
-		if pErr != nil {
-			return fmt.Errorf("invalid jump host for node %q: %w", name, pErr)
-		}
-		if ps.Kind() == ssh.ProxyJump {
-			resolvedJump, jErr := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), flags.jump)
-			if jErr != nil {
-				return fmt.Errorf("resolve jump host for node %q: %w", name, jErr)
-			}
-			node.ProxyJump = resolvedJump
-			draftNode.ProxyJump = resolvedJump
-			draft.Nodes.Set(name, draftNode)
-		}
+	if err := applyAddedNodeProxyJump(cmd, repository, draft, name, &node, &draftNode, flags.jump); err != nil {
+		return err
 	}
 	if err := config.ValidateGraph(draft); err != nil {
 		return fmt.Errorf("validate node %q failed: %w", name, err)
@@ -145,6 +133,45 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 		}
 	}
 	return commitAddedNode(cmd, repository, name, node, hostObj, identity, password, keyPass, flags.keyPath)
+}
+
+func validateAddPreFlags(cmd *cobra.Command, flags *addFlags, portChanged bool) error {
+	if portChanged && flags.port == 0 {
+		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
+	}
+	if cmd.Flags().Changed("jump") || flags.jump != "" {
+		if _, pErr := ssh.ParseProxyJump(flags.jump); pErr != nil {
+			return fmt.Errorf("invalid jump host: %w", pErr)
+		}
+	}
+	return nil
+}
+
+func applyAddedNodeProxyJump(
+	cmd *cobra.Command,
+	repository *config.Repository,
+	draft *config.Configuration,
+	name string,
+	node, draftNode *models.Node,
+	rawJump string,
+) error {
+	if !cmd.Flags().Changed("jump") && rawJump == "" {
+		return nil
+	}
+	ps, pErr := ssh.ParseProxyJump(rawJump)
+	if pErr != nil {
+		return fmt.Errorf("invalid jump host for node %q: %w", name, pErr)
+	}
+	if ps.Kind() == ssh.ProxyJump {
+		resolvedJump, jErr := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), rawJump)
+		if jErr != nil {
+			return fmt.Errorf("resolve jump host for node %q: %w", name, jErr)
+		}
+		node.ProxyJump = resolvedJump
+		draftNode.ProxyJump = resolvedJump
+		draft.Nodes.Set(name, *draftNode)
+	}
+	return nil
 }
 
 func resolveValidatedAddedIdentity(cfg *config.Configuration, flags *addFlags, password, keyPass string, stdinUsed bool) (models.Identity, string, string, string, error) {

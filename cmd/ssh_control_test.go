@@ -1665,7 +1665,10 @@ func TestControlContextCanceledExits255_AndProxyFallbackLookupViaRealControlTarg
 			User:     "overrideuser",
 			HasUser:  true,
 		}
-		tSaved := controlTarget(oSaved, provider, "")
+		tSaved, err := controlTarget(oSaved, provider, "")
+		if err != nil {
+			t.Fatalf("controlTarget(saved): %v", err)
+		}
 		if got := resolveControlProxyFallbackLookup(tSaved, provider, oSaved); got != "node-1" {
 			t.Fatalf("saved node -l override fallbackLookup = %q, want %q (target=%+v)", got, "node-1", tSaved)
 		}
@@ -1674,7 +1677,10 @@ func TestControlContextCanceledExits255_AndProxyFallbackLookupViaRealControlTarg
 		oVirtual := NewSshOptions()
 		oVirtual.Host = "openssh:other@web"
 		oVirtual.Target = config.ConnectionTarget{Selector: "openssh:other@web"}
-		tVirtual := controlTarget(oVirtual, provider, "")
+		tVirtual, err := controlTarget(oVirtual, provider, "")
+		if err != nil {
+			t.Fatalf("controlTarget(virtual): %v", err)
+		}
 		if got := resolveControlProxyFallbackLookup(tVirtual, provider, oVirtual); !config.IsOpenSSHNodeID(got) {
 			t.Fatalf("explicit openssh: target collapsed to non-OpenSSH ID %q", got)
 		}

@@ -300,13 +300,21 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	if rawJump == "" {
 		rawJump = strings.TrimSpace(snapshot.Node.ProxyJump)
 	}
-	if !resolveProxy || rawJump == "" {
+	if !tier1JumpWon && hasSnapshot && snapshot.Provenance.IsUnpersistedOpenSSH() {
+		if targets, ok := effectiveProxy.JumpTargets(); ok {
+			for i, hop := range targets {
+				if !config.IsOpenSSHNodeID(hop) {
+					targets[i] = config.OpenSSHNodePrefix + hop
+				}
+			}
+			return strings.Join(targets, ","), nil
+		}
+		if rawJump != "" && !config.IsOpenSSHNodeID(rawJump) {
+			return config.OpenSSHNodePrefix + rawJump, nil
+		}
 		return rawJump, nil
 	}
-	// Tier-4 unpersisted OpenSSH virtual/derived jumps are already normalized into
-	// the openssh: namespace by OpenSSHParser; preserve them without forcing local
-	// saved-inventory resolution against unconfigured OpenSSH single-label hosts.
-	if !tier1JumpWon && hasSnapshot && snapshot.Provenance.IsUnpersistedOpenSSH() {
+	if !resolveProxy || rawJump == "" {
 		return rawJump, nil
 	}
 	resolved, err := a.cfgProvider.ResolveProxyJumpChain(rawJump)

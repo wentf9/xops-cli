@@ -257,7 +257,10 @@ func TestPhase1Flags_ControlTargetAppliesHostNameOverride(t *testing.T) {
 		t.Fatalf("ApplyGeneralOptions failed: %v", err)
 	}
 
-	target := controlTarget(opts, provider, "openssh:mybox")
+	target, err := controlTarget(opts, provider, "openssh:mybox")
+	if err != nil {
+		t.Fatalf("controlTarget failed: %v", err)
+	}
 	if target.Host != "mybox.corp" {
 		t.Fatalf("controlTarget.Host = %q, want %q", target.Host, "mybox.corp")
 	}

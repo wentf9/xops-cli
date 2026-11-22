@@ -61,8 +61,8 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		return err
 	}
 	portChanged := cmd.Flags().Changed("port")
-	if portChanged && flags.port == 0 {
-		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
+	if err := validateEditPreFlags(cmd, flags, portChanged); err != nil {
+		return err
 	}
 	if err := applyEditTargetArgs(args[1:], flags, portChanged); err != nil {
 		return err
@@ -106,6 +106,18 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 	return commitEditedNode(cmd, repository, view.NodeRefs[oldName], oldName, newName, node, host, identity, flags, updated)
 }
 
+func validateEditPreFlags(cmd *cobra.Command, flags *editFlags, portChanged bool) error {
+	if portChanged && flags.port == 0 {
+		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
+	}
+	if cmd.Flags().Changed("jump") && flags.jump != "" {
+		if _, pErr := ssh.ParseProxyJump(flags.jump); pErr != nil {
+			return fmt.Errorf("invalid jump host: %w", pErr)
+		}
+	}
+	return nil
+}
+
 func applyEditedProxyJump(
 	repository *config.Repository,
 	oldName, newName string,
@@ -114,7 +126,7 @@ func applyEditedProxyJump(
 	identity models.Identity,
 	rawJump string,
 ) error {
-	if strings.TrimSpace(rawJump) == "" {
+	if rawJump == "" {
 		node.ProxyJump = ""
 		return nil
 	}

@@ -501,7 +501,10 @@ func (o *SshOptions) resolveAndCacheSessionOptions(provider config.ConfigProvide
 		return eff, nil
 	}
 	connTarget := effectiveConnectionTarget(o, nodeID)
-	target := controlTarget(o, provider, nodeID)
+	target, err := controlTarget(o, provider, nodeID)
+	if err != nil {
+		return nil, err
+	}
 	o.resolvedTarget = &target
 	lookupKey, sessionAuth := resolveControlSessionLookup(o, provider, nodeID, connTarget, target)
 	adpOpts := []adapter.Option{adapter.WithLocalExecution(!o.isMuxDaemon() && !isChild)}
@@ -906,7 +909,11 @@ func (o *SshOptions) resolveSessionForwardConfig() (sessionForwardConfig, error)
 	if o != nil && o.resolvedTarget != nil {
 		target = *o.resolvedTarget
 	} else {
-		target = controlTarget(o, nil, "")
+		var err error
+		target, err = controlTarget(o, nil, "")
+		if err != nil {
+			return sessionForwardConfig{}, err
+		}
 	}
 	return o.resolveSessionForwardConfigWithTarget(nil, "", target)
 }
@@ -927,7 +934,10 @@ func (o *SshOptions) resolveSessionForwardConfigWithTarget(provider config.Confi
 		if err != nil {
 			return out, err
 		}
-		target = controlTarget(o, provider, nodeID)
+		target, err = controlTarget(o, provider, nodeID)
+		if err != nil {
+			return out, err
+		}
 	} else {
 		eff, err = o.effectiveSessionOptions()
 		if err != nil {

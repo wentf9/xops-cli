@@ -576,7 +576,10 @@ func (p *Provider) resolveWithProvenance(nodeID string) (models.Node, models.Hos
 		if parser == nil {
 			parser = &OpenSSHParser{cfg: nil}
 		}
-		spec, _ := cutOpenSSHPrefix(nodeID)
+		spec, _ := TrimOpenSSHNodePrefix(nodeID)
+		if spec == "" || IsOpenSSHNodeID(strings.TrimSpace(spec)) {
+			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("parse openssh host %q failed: invalid openssh selector", nodeID)
+		}
 		lookupHost, inlineUser, inlinePort, specErr := parseOpenSSHHostSpec(spec)
 		if specErr != nil {
 			return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, fmt.Errorf("parse openssh host %q failed: %w", spec, specErr)
@@ -638,7 +641,10 @@ func (p *Provider) ResolveConnectionWithOrigin(nodeID, originalHost string) (Con
 	if parser == nil {
 		parser = &OpenSSHParser{cfg: nil}
 	}
-	spec, _ := cutOpenSSHPrefix(nodeID)
+	spec, _ := TrimOpenSSHNodePrefix(nodeID)
+	if spec == "" || IsOpenSSHNodeID(strings.TrimSpace(spec)) {
+		return ConnectionSnapshot{}, fmt.Errorf("parse openssh host %q failed: invalid openssh selector", nodeID)
+	}
 	lookupHost, inlineUser, inlinePort, specErr := parseOpenSSHHostSpec(spec)
 	if specErr != nil {
 		return ConnectionSnapshot{}, fmt.Errorf("parse openssh host %q failed: %w", spec, specErr)

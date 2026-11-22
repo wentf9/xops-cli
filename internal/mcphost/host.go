@@ -221,7 +221,7 @@ func hasLeadingZeroPortInOpenSSHSpec(raw string, ref config.TargetRef) bool {
 	if !ref.HasPort {
 		return false
 	}
-	spec := strings.TrimPrefix(raw, config.OpenSSHNodePrefix)
+	spec, _ := config.TrimOpenSSHNodePrefix(raw)
 	lastColon := strings.LastIndexByte(spec, ':')
 	if lastColon < 0 || lastColon+1 >= len(spec) {
 		return false
@@ -235,9 +235,7 @@ func canonicalizeOpenSSHSelector(provider config.ConfigProvider, raw string) (st
 	}
 	ref, err := config.ParseTargetRef(raw)
 	if err != nil {
-		// Let malformed explicit openssh: specs (e.g. "openssh:", "openssh:web:65536")
-		// reach connection validation so they fail closed with a config error.
-		return raw, nil
+		return "", fmt.Errorf("invalid OpenSSH config selector %q: %w", raw, err)
 	}
 	if hasLeadingZeroPortInOpenSSHSpec(raw, ref) {
 		return "", fmt.Errorf("non-canonical OpenSSH node ID %q: leading-zero port is not allowed", raw)
@@ -264,31 +262,33 @@ func canonicalizeOpenSSHSelector(provider config.ConfigProvider, raw string) (st
 			if basePort == 0 {
 				basePort = 22
 			}
-			if effUser != "" && effUser == baseUser {
-				effUser = ""
-			}
 			if hasPort && effPort == basePort {
 				hasPort = false
 				effPort = 0
 			}
+			if effUser != "" && effUser == baseUser && (!hasPort || !strings.EqualFold(canonHost, "openssh")) {
+				effUser = ""
+			}
 		}
 	}
-	return config.TargetRef{
+	norm := config.TargetRef{
 		OpenSSH: true,
 		User:    effUser,
 		Host:    canonHost,
 		Port:    effPort,
 		HasPort: hasPort,
-	}.NormalizedString(), nil
+	}.NormalizedString()
+	if norm == "" {
+		return "", fmt.Errorf("invalid OpenSSH config selector %q", raw)
+	}
+	return norm, nil
 }
 
 func resolveSelector(provider config.ConfigProvider, selector string) (string, error) {
-	if len(selector) >= len(config.OpenSSHNodePrefix) &&
-		strings.EqualFold(selector[:len(config.OpenSSHNodePrefix)], config.OpenSSHNodePrefix) &&
-		!strings.HasPrefix(selector, config.OpenSSHNodePrefix) {
-		return "", errors.New("OpenSSH node IDs must use lowercase \"openssh:\" prefix")
-	}
-	if strings.HasPrefix(selector, config.OpenSSHNodePrefix) {
+	if config.IsOpenSSHNodeID(selector) {
+		if selector[:len(config.OpenSSHNodePrefix)] != config.OpenSSHNodePrefix {
+			return "", errors.New("OpenSSH node IDs must use lowercase \"openssh:\" prefix")
+		}
 		return canonicalizeOpenSSHSelector(provider, selector)
 	}
 	if strings.TrimSpace(selector) != selector || hasControlOrLineSep(selector) {
@@ -304,7 +304,7 @@ func resolveSelector(provider config.ConfigProvider, selector string) (string, e
 	if id == "" {
 		return "", ports.ErrNotFound
 	}
-	if strings.HasPrefix(id, config.OpenSSHNodePrefix) {
+	if config.IsOpenSSHNodeID(id) {
 		return canonicalizeOpenSSHSelector(provider, id)
 	}
 	return id, nil

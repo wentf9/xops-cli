@@ -1336,7 +1336,10 @@ func TestControlTargetNormalizesProxyJump(t *testing.T) {
 		HasProxyJump: true,
 	}
 
-	target := controlTarget(opts, provider, "openssh:demo-target")
+	target, err := controlTarget(opts, provider, "openssh:demo-target")
+	if err != nil {
+		t.Fatalf("controlTarget(openssh:demo-target): %v", err)
+	}
 	if target.JumpHost != "openssh:bastion" {
 		t.Fatalf("expected normalized JumpHost %q, got %q", "openssh:bastion", target.JumpHost)
 	}
@@ -1551,7 +1554,10 @@ func TestControlCandidateFallbackAndPortOverrideJumpAlignment(t *testing.T) {
 	optsSamePort.Host = "10.0.0.5"
 	optsSamePort.User = "test"
 	optsSamePort.Target = targetSamePort
-	ctxSamePort := controlTarget(optsSamePort, providerConsistent, nodeID)
+	ctxSamePort, err := controlTarget(optsSamePort, providerConsistent, nodeID)
+	if err != nil {
+		t.Fatalf("controlTarget(same port): %v", err)
+	}
 	if ctxSamePort.Port != 2222 || ctxSamePort.JumpHost != "upstream" || ctxSamePort.OriginalHost != "test@10.0.0.5:2222" {
 		t.Fatalf("unexpected controlTarget for consistent candidates: %+v", ctxSamePort)
 	}
@@ -1573,7 +1579,10 @@ func TestControlCandidateFallbackAndPortOverrideJumpAlignment(t *testing.T) {
 	optsDiffPort.User = "test"
 	optsDiffPort.Port = 2223
 	optsDiffPort.Target = targetDiffPort
-	ctxDiffPort := controlTarget(optsDiffPort, providerConsistent, nodeIDDiffPort)
+	ctxDiffPort, err := controlTarget(optsDiffPort, providerConsistent, nodeIDDiffPort)
+	if err != nil {
+		t.Fatalf("controlTarget(diff port): %v", err)
+	}
 	if ctxDiffPort.JumpHost != "" {
 		t.Fatalf("expected empty JumpHost when local node port is overridden to 2223, got %q", ctxDiffPort.JumpHost)
 	}
@@ -1969,7 +1978,10 @@ func verifyScpIsolationAndHostFlagAndLookupAlias(t *testing.T, ctx context.Conte
 	ctlOpts.Host = "gw"
 	ctlOpts.Port = 2222
 	ctlOpts.Target = targetPortOverride
-	ctlCtx := controlTarget(ctlOpts, provider, "openssh:gw")
+	ctlCtx, err := controlTarget(ctlOpts, provider, "openssh:gw")
+	if err != nil {
+		t.Fatalf("controlTarget(openssh:gw): %v", err)
+	}
 	if ctlCtx.JumpHost != "openssh:gw" {
 		t.Fatalf("expected controlTarget(openssh:gw, -p 2222) to inherit JumpHost %q from 10.0.0.10:2222, got %q", "openssh:gw", ctlCtx.JumpHost)
 	}
@@ -2450,6 +2462,15 @@ Host demo
 	}
 }
 
+func mustControlTarget(t *testing.T, opts *SshOptions, provider config.ConfigProvider, nodeID string) ssh.TargetContext {
+	t.Helper()
+	got, err := controlTarget(opts, provider, nodeID)
+	if err != nil {
+		t.Fatalf("controlTarget(%q): %v", nodeID, err)
+	}
+	return got
+}
+
 func verifyRound11UnifiedInvariantMatrix(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
@@ -2546,12 +2567,12 @@ Host jump-alias
 			opts.JumpHost = target.ProxyJump
 			opts.Target = target
 
-			connectCtx := controlTarget(opts, repo, prepNodeID)
+			connectCtx := mustControlTarget(t, opts, repo, prepNodeID)
 			ctlNodeID, err := resolveControlNodeID(readOnlyProvider, target)
 			if err != nil {
 				t.Fatalf("target %+v: resolveControlNodeID failed: %v", target, err)
 			}
-			ctlCtx := controlTarget(opts, readOnlyProvider, ctlNodeID)
+			ctlCtx := mustControlTarget(t, opts, readOnlyProvider, ctlNodeID)
 			if connectCtx.CanonicalTargetIdentity() != ctlCtx.CanonicalTargetIdentity() {
 				t.Fatalf("target %+v: connect TargetContext %+v != control TargetContext %+v", target, connectCtx, ctlCtx)
 			}
@@ -2642,7 +2663,7 @@ Host jump-alias
 	// R13-1a: controlSocketPath and controlTarget with empty opts.Host and nodeID="openssh:app-alias"
 	// must strip internal "openssh:" prefix to OriginalHost="app-alias" (not rewrite into "dev@10.0.0.20:2200").
 	emptyHostOpts := NewSshOptions()
-	tCtx := controlTarget(emptyHostOpts, repo, "openssh:app-alias")
+	tCtx := mustControlTarget(t, emptyHostOpts, repo, "openssh:app-alias")
 	if tCtx.OriginalHost != "app-alias" {
 		t.Fatalf("expected OriginalHost='app-alias' when opts.Host is empty, got %q", tCtx.OriginalHost)
 	}
@@ -2657,7 +2678,7 @@ Host jump-alias
 		Target:       config.ConnectionTarget{Selector: "10.0.0.88", User: "ops", HasUser: true, Port: 2222, HasPort: true},
 		IdentityFile: customKeyPath,
 	}, func(lease config.PendingLease) error {
-		pendingCtx := controlTarget(NewSshOptions(), repo, lease.NodeID())
+		pendingCtx := mustControlTarget(t, NewSshOptions(), repo, lease.NodeID())
 		if pendingCtx.KeyPath != customKeyPath {
 			t.Fatalf("expected controlTarget on pending node %q to retain KeyPath %q, got %q", lease.NodeID(), customKeyPath, pendingCtx.KeyPath)
 		}
@@ -2669,7 +2690,7 @@ Host jump-alias
 	// R13-2: controlTarget with provider == nil matches provider != nil for composite and explicit targets.
 	compOpts := NewSshOptions()
 	compOpts.Host = "ops@10.0.0.10:2222"
-	nilCtx1 := controlTarget(compOpts, nil, "")
+	nilCtx1 := mustControlTarget(t, compOpts, nil, "")
 	if nilCtx1.Host != "10.0.0.10" || nilCtx1.User != "ops" || nilCtx1.Port != 2222 || nilCtx1.OriginalHost != "ops@10.0.0.10:2222" {
 		t.Fatalf("unexpected nil-provider controlTarget for composite Host: %+v", nilCtx1)
 	}
@@ -2678,7 +2699,7 @@ Host jump-alias
 	expOpts.User = "ops"
 	expOpts.Port = 2222
 	expOpts.JumpHost = "none"
-	nilCtx2 := controlTarget(expOpts, nil, "")
+	nilCtx2 := mustControlTarget(t, expOpts, nil, "")
 	if nilCtx2.OriginalHost != "ops@10.0.0.10:2222" || nilCtx2.JumpHost != "" {
 		t.Fatalf("unexpected nil-provider controlTarget for explicit flags: %+v", nilCtx2)
 	}

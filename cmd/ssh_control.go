@@ -242,6 +242,24 @@ func canonicalizeControlOptions(ctx context.Context, o *SshOptions, provider con
 	return nil
 }
 
+func prepareControlOptionsForContext(ctx context.Context, o *SshOptions, provider config.ConfigProvider, stderr io.Writer) error {
+	if err := canonicalizeControlOptions(ctx, o, provider, stderr); err != nil {
+		return err
+	}
+	if o == nil {
+		return nil
+	}
+	if provider != nil {
+		o.syncResolvedTargetHosts(provider)
+	}
+	if o.cliHostName != "" {
+		if _, err := o.effectiveHostName(); err != nil {
+			return controlError(stderr, err.Error())
+		}
+	}
+	return nil
+}
+
 func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer) (string, ssh.TargetContext, config.ConfigProvider, string, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
@@ -258,18 +276,8 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 	if providerErr != nil && o != nil && o.control.ConfigFile != "" {
 		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
 	}
-	if err := canonicalizeControlOptions(ctx, o, provider, stderr); err != nil {
+	if err := prepareControlOptionsForContext(ctx, o, provider, stderr); err != nil {
 		return "", ssh.TargetContext{}, nil, "", err
-	}
-	if o != nil {
-		if provider != nil {
-			o.syncResolvedTargetHosts(provider)
-		}
-		if o.cliHostName != "" {
-			if _, err := o.effectiveHostName(); err != nil {
-				return "", ssh.TargetContext{}, nil, "", controlError(stderr, err.Error())
-			}
-		}
 	}
 	nodeID := ""
 	connTarget := effectiveConnectionTarget(o, "")
@@ -285,7 +293,10 @@ func resolveControlContext(ctx context.Context, o *SshOptions, stderr io.Writer)
 		return "", ssh.TargetContext{}, nil, "", controlError(stderr, fmt.Sprintf("%s: %v", i18n.T("ssh_err_load_config"), providerErr))
 	}
 
-	target := controlTarget(o, provider, nodeID)
+	target, err := controlTarget(o, provider, nodeID)
+	if err != nil {
+		return "", ssh.TargetContext{}, nil, "", controlError(stderr, err.Error())
+	}
 	expanded, err := expandControlSocketPath(o, provider, nodeID, target, stderr)
 	if err != nil {
 		return "", ssh.TargetContext{}, nil, "", err
@@ -1119,7 +1130,11 @@ func executeInfo(ctx context.Context, socketPath string, infoType string, stream
 }
 
 func parseForwardRequestsFromOptions(o *SshOptions) ([]ssh.ForwardRequest, error) {
-	return parseForwardRequestsFromOptionsWithTarget(o, controlTarget(o, nil, ""))
+	target, err := controlTarget(o, nil, "")
+	if err != nil {
+		return nil, err
+	}
+	return parseForwardRequestsFromOptionsWithTarget(o, target)
 }
 
 func buildForwardRequestsFromSpecs(

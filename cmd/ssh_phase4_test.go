@@ -167,7 +167,10 @@ Host *
 	if err != nil {
 		t.Fatalf("resolveControlNodeID() error = %v", err)
 	}
-	target := controlTarget(opts, provider, nodeID)
+	target, err := controlTarget(opts, provider, nodeID)
+	if err != nil {
+		t.Fatalf("controlTarget() error = %v", err)
+	}
 	if target.OriginalHost != "web" {
 		t.Fatalf("controlTarget.OriginalHost = %q, want %q", target.OriginalHost, "web")
 	}

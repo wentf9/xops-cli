@@ -137,7 +137,10 @@ func resolveCmdControlForScenario(t *testing.T, tc cmdP3EquivalenceScenario, rea
 	if err != nil {
 		t.Fatalf("resolveControlNodeID: %v", err)
 	}
-	ctlTarget := controlTarget(ctlOpts, readOnlyProv, ctlNodeID)
+	ctlTarget, err := controlTarget(ctlOpts, readOnlyProv, ctlNodeID)
+	if err != nil {
+		t.Fatalf("controlTarget: %v", err)
+	}
 	ctlSock, err := controlSocketPath(ctlOpts, readOnlyProv, ctlNodeID)
 	if err != nil {
 		t.Fatalf("controlSocketPath: %v", err)

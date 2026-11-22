@@ -182,7 +182,10 @@ func TestP7W6c_DEF6M2_ControlTargetAppliesGeneralOptionsAndMatchesDial(t *testin
 			ctlOpts.Host = "web-01"
 			ctlOpts.control.Options = append([]string(nil), tc.rawOpts...)
 
-			gotTarget := controlTarget(ctlOpts, readOnlyProv, "web-01")
+			gotTarget, err := controlTarget(ctlOpts, readOnlyProv, "web-01")
+			if err != nil {
+				t.Fatalf("controlTarget(-o %v): %v", tc.rawOpts, err)
+			}
 			if gotTarget.JumpHost != tc.wantJump {
 				t.Fatalf("controlTarget(-o %v).JumpHost = %q, want %q", tc.rawOpts, gotTarget.JumpHost, tc.wantJump)
 			}
@@ -395,7 +398,7 @@ func TestP7W6c_DEF6L1_NoCaseSensitiveOpenSSHPrefixChecksInCmdOrPkg(t *testing.T)
 	fset := token.NewFileSet()
 	var violations []string
 
-	for _, rootDir := range []string{"cmd", "pkg"} {
+	for _, rootDir := range []string{"cmd", "pkg", "internal"} {
 		absRoot := filepath.Join(repoRoot, rootDir)
 		err := filepath.WalkDir(absRoot, func(path string, d fs.DirEntry, walkErr error) error {
 			if walkErr != nil {

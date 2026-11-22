@@ -497,7 +497,14 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 		selector = trimmedRaw
 	}
 
-	hasJump := o.JumpHost != "" || o.isMuxDaemon()
+	proxyJump := o.JumpHost
+	hasJump := proxyJump != ""
+	if o.isMuxDaemon() {
+		hasJump = true
+		if proxyJump == "" {
+			proxyJump = "none"
+		}
+	}
 	targetOrig := o.resolveTargetOriginalHost(selector)
 
 	o.Target = config.ConnectionTarget{
@@ -508,7 +515,7 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 		HasUser:      hasUser,
 		Port:         finalPort,
 		HasPort:      hasPort,
-		ProxyJump:    o.JumpHost,
+		ProxyJump:    proxyJump,
 		HasProxyJump: hasJump,
 	}
 	return nil
@@ -795,7 +802,10 @@ func (o *SshOptions) probeCandidateBackgroundSession(
 	sessionOpts adapter.SessionControlOptions,
 	cliSessionTypeLocked, cliRemoteCmdLocked bool,
 ) bool {
-	target := controlTarget(o, provider, nodeID)
+	target, err := controlTarget(o, provider, nodeID)
+	if err != nil {
+		return false
+	}
 	lookupKey, sessionAuth := resolveControlSessionLookup(o, provider, nodeID, connTarget, target)
 	var adpOpts []adapter.Option
 	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "") {
@@ -1208,18 +1218,30 @@ func (o *SshOptions) shouldSkipMasterHandoff(ctx context.Context, connector *ssh
 }
 
 func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider, nodeID string, connector *ssh.Connector) (bool, error) {
+	return o.hasActiveProxyCommandInPathForTarget(provider, nodeID, connector, isTargetControlNode(o, nodeID))
+}
+
+func (o *SshOptions) hasActiveProxyCommandInPathForTarget(
+	provider config.ConfigProvider,
+	nodeID string,
+	connector *ssh.Connector,
+	isTarget bool,
+) (bool, error) {
 	sessionCtrlOpts, hasDirectProxy, err := o.resolveProxyCommandCheckSessionOptions()
-	if err != nil || hasDirectProxy {
+	if err != nil {
 		return true, err
+	}
+	if isTarget && hasDirectProxy {
+		return true, nil
 	}
 	if provider == nil {
 		return false, nil
 	}
-	checker := o.buildProxyCommandPathChecker(provider, nodeID, sessionCtrlOpts)
-	if hasProxy, err := checker.checkNode(nodeID, true); err != nil || hasProxy {
+	checker := o.buildProxyCommandPathChecker(provider, nodeID, isTarget, sessionCtrlOpts)
+	if hasProxy, err := checker.checkNode(nodeID, isTarget); err != nil || hasProxy {
 		return true, err
 	}
-	if nodeID == "" {
+	if nodeID == "" && isTarget {
 		jumpChain, err := o.effectiveProxyJumpChain(provider, "")
 		if err != nil {
 			return true, err
@@ -1237,12 +1259,12 @@ func (o *SshOptions) resolveProxyCommandCheckSessionOptions() (adapter.SessionCo
 	if o == nil {
 		return adapter.SessionControlOptions{}, false, nil
 	}
-	if o.effectiveSSHOptions != nil && o.effectiveSSHOptions.ActiveProxyCommand() != "" {
-		return adapter.SessionControlOptions{}, true, nil
-	}
 	parsed, err := o.toSessionControlOptions()
 	if err != nil {
 		return adapter.SessionControlOptions{}, true, err
+	}
+	if o.effectiveSSHOptions != nil && o.effectiveSSHOptions.ActiveProxyCommand() != "" {
+		return parsed, true, nil
 	}
 	if opts := parsed.ToSSHOptions(); opts != nil && opts.ActiveProxyCommand() != "" {
 		return parsed, true, nil
@@ -1253,10 +1275,11 @@ func (o *SshOptions) resolveProxyCommandCheckSessionOptions() (adapter.SessionCo
 func (o *SshOptions) buildProxyCommandPathChecker(
 	provider config.ConfigProvider,
 	nodeID string,
+	isTarget bool,
 	sessionCtrlOpts adapter.SessionControlOptions,
 ) *proxyCommandPathChecker {
 	adpOpts := []adapter.Option{adapter.WithLocalExecution(true)}
-	if o != nil && nodeID != "" {
+	if o != nil && isTarget && nodeID != "" {
 		origHost, canonHost := canonicalControlOriginAndHost(o)
 		if origHost == "" {
 			origHost = strings.TrimSpace(o.originalHost)
@@ -1620,13 +1643,35 @@ func isSuppressedJumpMaster(jumps map[string]bool, rawOwnedID, resolvedNodeID st
 	return jumpMasterMatchesKeys(jumps, resolvedNodeID, resExplicit)
 }
 
+func (o *SshOptions) isTargetMasterNode(rawOwnedID, resolvedNodeID string) bool {
+	if o == nil {
+		return false
+	}
+	if len(o.targetNodeIDs) == 0 {
+		return true
+	}
+	raw := strings.TrimSpace(rawOwnedID)
+	resolved := strings.TrimSpace(resolvedNodeID)
+	if raw == "" && resolved == "" {
+		return true
+	}
+	if resolved != "" && slices.Contains(o.targetNodeIDs, resolved) {
+		return true
+	}
+	if raw != "" && slices.Contains(o.targetNodeIDs, raw) {
+		return true
+	}
+	return false
+}
+
 func (o *SshOptions) hasActiveProxyCommandForMaster(provider config.ConfigProvider, rawOwnedID, resolvedNodeID string) (bool, error) {
-	hasProxy, err := o.hasActiveProxyCommandInPath(provider, resolvedNodeID, nil)
+	isTarget := o.isTargetMasterNode(rawOwnedID, resolvedNodeID)
+	hasProxy, err := o.hasActiveProxyCommandInPathForTarget(provider, resolvedNodeID, nil, isTarget)
 	if err != nil || hasProxy {
 		return true, err
 	}
 	if rawOwnedID != "" && rawOwnedID != resolvedNodeID {
-		return o.hasActiveProxyCommandInPath(provider, rawOwnedID, nil)
+		return o.hasActiveProxyCommandInPathForTarget(provider, rawOwnedID, nil, isTarget)
 	}
 	return false, nil
 }
@@ -2859,7 +2904,11 @@ func (o *SshOptions) runConnectedSession(runCtx context.Context, connector *ssh.
 	if o.resolvedTarget != nil {
 		target = *o.resolvedTarget
 	} else {
-		target = controlTarget(o, provider, nodeID)
+		var targetErr error
+		target, targetErr = controlTarget(o, provider, nodeID)
+		if targetErr != nil {
+			return targetErr
+		}
 	}
 	rc, rcErr := o.resolveEffectiveRemoteCommand(target)
 	if rcErr != nil {

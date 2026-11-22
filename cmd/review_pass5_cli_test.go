@@ -324,7 +324,10 @@ func verifyPass5M5SavedAndUnsafeHostName(t *testing.T, repo *config.Repository) 
 			if clientCfg.Address != "10.238.221.181" || clientCfg.OriginalHost != "" {
 				t.Fatalf("saved alias %q ClientConfig = (Address=%q, OriginalHost=%q), want (10.238.221.181, empty)", savedAlias, clientCfg.Address, clientCfg.OriginalHost)
 			}
-			ctlTarget := controlTarget(oSaved, repo, nodeID)
+			ctlTarget, err := controlTarget(oSaved, repo, nodeID)
+			if err != nil {
+				t.Fatalf("controlTarget(%q): %v", savedAlias, err)
+			}
 			if ctlTarget.Host != "10.238.221.181" || ctlTarget.OriginalHost != "iaas@10.238.221.181:22" {
 				t.Fatalf("saved alias %q controlTarget = %+v, want Host=10.238.221.181 OriginalHost=iaas@10.238.221.181:22", savedAlias, ctlTarget)
 			}
@@ -376,7 +379,10 @@ func verifyPass5M5OpenSSHAliasParity(t *testing.T, repo *config.Repository) {
 		if aliasCfg.OriginalHost != "app-alias" || aliasCfg.Address != "app-alias.corp" {
 			t.Fatalf("OpenSSH alias ClientConfig = (OriginalHost=%q, Address=%q), want (app-alias, app-alias.corp)", aliasCfg.OriginalHost, aliasCfg.Address)
 		}
-		aliasCtlTarget := controlTarget(oAlias, repo, aliasNodeID)
+		aliasCtlTarget, err := controlTarget(oAlias, repo, aliasNodeID)
+		if err != nil {
+			t.Fatalf("controlTarget(%q): %v", aliasNodeID, err)
+		}
 		if aliasCtlTarget.OriginalHost != "app-alias" || aliasCtlTarget.Host != "app-alias.corp" || aliasCtlTarget.User != "alice" {
 			t.Fatalf("OpenSSH alias controlTarget = %+v, want OriginalHost=app-alias Host=app-alias.corp User=alice", aliasCtlTarget)
 		}

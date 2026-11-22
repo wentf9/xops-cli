@@ -239,7 +239,10 @@ Host web-alias
 		if err != nil {
 			t.Fatal(err)
 		}
-		tCtx := controlTarget(sshOpt, repo, nodeID)
+		tCtx, err := controlTarget(sshOpt, repo, nodeID)
+		if err != nil {
+			t.Fatalf("controlTarget failed: %v", err)
+		}
 		expandedCmd, err := ssh.ExpandRemoteCommand(cfg.Options.RemoteCommand(), sshenv.Discover(), tCtx)
 		if err != nil {
 			t.Fatalf("ExpandRemoteCommand failed: %v", err)

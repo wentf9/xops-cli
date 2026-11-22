@@ -324,20 +324,27 @@ func resolveControlSessionLookup(
 
 // controlTarget builds the canonical token expansion context by delegating to
 // adapter.ResolveControlTarget, mirroring Connector.buildTargetContext.
-func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID string) ssh.TargetContext {
+func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID string) (ssh.TargetContext, error) {
 	var sessionOpts adapter.SessionControlOptions
 	if opts != nil {
-		if err := opts.ensureGeneralOptionsApplied(); err == nil {
-			if parsed, err := opts.toSessionControlOptions(); err == nil {
-				sessionOpts = parsed
-			}
+		if err := opts.ensureGeneralOptionsApplied(); err != nil {
+			return ssh.TargetContext{}, err
 		}
+		parsed, err := opts.toSessionControlOptions()
+		if err != nil {
+			return ssh.TargetContext{}, err
+		}
+		sessionOpts = parsed
 		if provider != nil {
 			opts.syncResolvedTargetHosts(provider)
 		}
 	}
 	req := buildControlTargetRequest(opts, provider, nodeID, effectiveConnectionTarget(opts, nodeID), sessionOpts)
-	return adapter.ResolveControlTarget(req).Target
+	res, err := adapter.ResolveControlTarget(req)
+	if err != nil {
+		return ssh.TargetContext{}, err
+	}
+	return res.Target, nil
 }
 
 func isTargetControlNode(opts *SshOptions, nodeID string) bool {
