@@ -60,9 +60,9 @@ func replaceLocalEntry(tempPath, localPath string, allowSymlinkDestination bool,
 		}
 		return promotionErr
 	}
-	if err := os.Remove(backupPath); err != nil {
+	if err := os.Remove(backupPath); err != nil { //nolint:forbidigo // cleanup randomly-suffixed backup created during local download replacement
 		_ = os.Chmod(backupPath, 0o600)
-		if retryErr := os.Remove(backupPath); retryErr != nil {
+		if retryErr := os.Remove(backupPath); retryErr != nil { //nolint:forbidigo // retry cleanup after chmod on read-only download backup
 			return fmt.Errorf("remove local destination backup %q failed: %w", backupPath, err)
 		}
 	}

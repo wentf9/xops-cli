@@ -1958,7 +1958,7 @@ func (s *Shell) handleLocalRm(ctx context.Context, args []string) error {
 			}
 		}
 		// 为了方便，lrm 直接支持递归删除
-		if err := os.RemoveAll(p); err != nil {
+		if err := os.RemoveAll(p); err != nil { //nolint:forbidigo // user-initiated interactive lrm local removal
 			return fmt.Errorf("lrm: %w", err)
 		}
 	}
@@ -2154,7 +2154,7 @@ func copyLocalLink(src, dst string) error {
 		return fmt.Errorf("create local symbolic link parent failed: %w", err)
 	}
 	if _, err := os.Lstat(dst); err == nil {
-		if err := os.Remove(dst); err != nil {
+		if err := os.Remove(dst); err != nil { //nolint:forbidigo // user-initiated lcp replacing existing local symlink target
 			return fmt.Errorf("remove local symbolic link destination %q failed: %w", dst, err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -2167,7 +2167,7 @@ func copyLocalLink(src, dst string) error {
 }
 
 func copyLocalFile(src, dst string) (retErr error) {
-	srcFile, err := os.Open(src)
+	srcFile, err := os.Open(src) //nolint:forbidigo // user-initiated lcp streams arbitrarily large local file
 	if err != nil {
 		return fmt.Errorf("open local source file %q failed: %w", src, err)
 	}
@@ -2182,7 +2182,7 @@ func copyLocalFile(src, dst string) (retErr error) {
 		return fmt.Errorf("stat local source file %q failed: %w", src, err)
 	}
 
-	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode())
+	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode()) //nolint:forbidigo // user-initiated lcp streams write to local destination file
 	if err != nil {
 		return fmt.Errorf("open local destination file %q failed: %w", dst, err)
 	}

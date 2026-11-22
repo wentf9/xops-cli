@@ -78,7 +78,7 @@ func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, s
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	srcFile, err := os.Open(localPath)
+	srcFile, err := os.Open(localPath) //nolint:forbidigo // SFTP upload streams arbitrarily large local file with handle stat verification
 	if err != nil {
 		return fmt.Errorf("open local source file failed: %w", err)
 	}
@@ -614,9 +614,9 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 		return fmt.Errorf("rename to final temporary path failed: %w", err)
 	}
 	defer func() {
-		if rmErr := os.Remove(finalTempPath); rmErr != nil && !os.IsNotExist(rmErr) {
+		if rmErr := os.Remove(finalTempPath); rmErr != nil && !os.IsNotExist(rmErr) { //nolint:forbidigo // deferred cleanup of randomly-suffixed download temp file created by this transfer
 			_ = os.Chmod(finalTempPath, 0o600)
-			if retryErr := os.Remove(finalTempPath); retryErr != nil && !os.IsNotExist(retryErr) {
+			if retryErr := os.Remove(finalTempPath); retryErr != nil && !os.IsNotExist(retryErr) { //nolint:forbidigo // retry cleanup after chmod on read-only download temp file
 				retErr = errors.Join(retErr, fmt.Errorf("remove final temporary path failed: %w", rmErr))
 			}
 		}
@@ -702,7 +702,7 @@ func (c *Client) prepareDownloadFile(tempPath string, size int64, mode os.FileMo
 		}
 	}
 
-	dstFile, err := os.OpenFile(tempPath, flags, perm)
+	dstFile, err := os.OpenFile(tempPath, flags, perm) //nolint:forbidigo // download staging temp file with resume support and SameFile handle verification
 	if err != nil {
 		return 0, nil, err
 	}
@@ -1802,7 +1802,7 @@ func (c *Client) downloadLink(ctx context.Context, remotePath, localPath string,
 		if promoted {
 			return
 		}
-		if rmErr := os.Remove(tempPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+		if rmErr := os.Remove(tempPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) { //nolint:forbidigo // deferred cleanup of randomly-suffixed temporary symlink created by this call
 			retErr = errors.Join(retErr, fmt.Errorf("remove local temporary symbolic link failed: %w", rmErr))
 		}
 	}()
