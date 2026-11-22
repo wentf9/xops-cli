@@ -22,8 +22,8 @@ script/ensure/cwd 的受限操作探测只缓存结果，录入探测则随新�
   Linux pwsh 的 POSIX 路径不转换。`/C:` 驱动器根目录会转换成绝对路径 `C:/`。
 - 缓存由物理连接的 PooledClient 共享，重新获取的 Client 包装对象也复用同一成功或失败结果。
   `CachedExecutionProbe` 不发起网络操作、不等待正在进行的探测，并返回深拷贝。
-- 新增可选 Core `AuthenticatedConnectionConfirmer` 能力，在认证成功后、节点确认及凭据写入前
-  接收已认证 Client，禁止保留/关闭它或执行用户命令。旧 ConnectionConfirmer 保持回退行为。
+- 节点确认统一由 `config.WithPendingNode` 签发的作用域化 `config.PendingLease` / `config.PendingExecutionLease` 驱动：
+  认证成功后、执行用户命令前由 `(*SSHAdapter).FinalizePendingConnection(ctx, lease, client)` 接收已认证 Client 完成可选录入探针、节点确认及延后凭据落盘，禁止保留/关闭 Client 或执行用户命令；未确认租约在作用域退出时自动丢弃。
 - CLI 仅在允许记忆凭据时启用 `WithEnrollmentProbing`。适配器再检查非交互、录入选项、Remember、
   pending 节点及缺省执行配置；已有节点、会话凭据、非交互批处理和显式配置均不探测。
   CLI 通过 `WithEnrollmentProbeExclusions` 按节点排除显式执行参数的目标，包括 `--interpreter`、
@@ -32,7 +32,7 @@ script/ensure/cwd 的受限操作探测只缓存结果，录入探测则随新�
   认证失败不探测、不新增节点；探针失败只警告，继续原有认证成功录入。
   若底层传输已出现读写错误或关闭，Core 保留已确认节点，但返回连接错误，不记录凭据、
   不发布失效连接、不执行用户命令。该检查复用传输状态，不增加网络请求或监控 goroutine。
-- `ConfirmNodeWithExecutionContext` 在原节点确认事务中加入推荐，不改变认证/提权字段版本，
+- `PendingExecutionLease.ConfirmWithExecution` 在原节点确认事务中加入推荐，不改变认证/提权字段版本，
   保留并发修改冲突和已应用但持久性不确定的错误语义；已确认的节点不会被后到探针覆盖。
   当前 Client 仅采用仓库实际发布的 execution，普通命令失败不重试。
 

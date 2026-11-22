@@ -544,13 +544,13 @@ func testP5MuxDaemonIdentityTruncationAndFailClosed(t *testing.T) {
 	}
 
 	for _, malformed := range []string{"", "   ", "NoDelimiter", "=val", "ServerAliveInterval=", "StrictHostKeyChecking=", "UnknownOption=1"} {
-		if !isTargetOnlyMuxDaemonOption(malformed) {
+		if targetOnly, _ := isTargetOnlyMuxDaemonOption(malformed); !targetOnly {
 			t.Errorf("isTargetOnlyMuxDaemonOption(%q) = false, want true (fail closed)", malformed)
 		}
 	}
 	for _, connWide := range []string{"StrictHostKeyChecking=yes", "ConnectTimeout=5", "BatchMode=yes", "UserKnownHostsFile=/tmp/kh"} {
-		if isTargetOnlyMuxDaemonOption(connWide) {
-			t.Errorf("isTargetOnlyMuxDaemonOption(%q) = true, want false (connection-wide)", connWide)
+		if targetOnly, err := isTargetOnlyMuxDaemonOption(connWide); err != nil || targetOnly {
+			t.Errorf("isTargetOnlyMuxDaemonOption(%q) = (%v, %v), want (false, nil) (connection-wide)", connWide, targetOnly, err)
 		}
 	}
 }

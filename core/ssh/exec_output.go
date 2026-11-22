@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"runtime"
+
+	"github.com/wentf9/xops-cli/core/verdict"
 )
 
 // OutputError marks a failed output write. Hosts must not report it back to
@@ -49,14 +51,20 @@ func (w regularFileOutput) WriteContext(ctx context.Context, data []byte) (int, 
 
 // isNullDevice reports the platform null device, whose writes never block but
 // which cannot register for deadlines like other character devices.
-func isNullDevice(info os.FileInfo) bool {
+func isNullDevice(info os.FileInfo) (verdict.Verdict, error) {
 	// Windows device/pipe FileInfo values may all carry zero file IDs.
 	// Its platform binding identifies NUL by kernel object name instead.
 	if runtime.GOOS == "windows" || info.Mode()&os.ModeCharDevice == 0 {
-		return false
+		return verdict.Deny, nil
 	}
 	null, err := os.Stat(os.DevNull)
-	return err == nil && os.SameFile(info, null)
+	if err != nil {
+		return verdict.Deny, err
+	}
+	if os.SameFile(info, null) {
+		return verdict.Allow, nil
+	}
+	return verdict.Deny, nil
 }
 
 // BindOutput prepares a non-PTY command output sink with cancellation-aware
@@ -105,7 +113,9 @@ func BindOutput(ctx context.Context, target io.Writer) (writer io.Writer, closeF
 	}
 	if file, ok := target.(*os.File); ok {
 		info, statErr := file.Stat()
-		if statErr == nil && (info.Mode().IsRegular() || isNullDevice(info)) {
+		if statErr == nil && (info.Mode().IsRegular() || verdict.Decide(func() (verdict.Verdict, error) {
+			return isNullDevice(info)
+		}).Allowed()) {
 			return contextOutput{ctx, regularFileOutput{file}, file}, noop, true, nil
 		}
 	}

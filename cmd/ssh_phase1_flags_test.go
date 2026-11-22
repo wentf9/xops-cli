@@ -174,8 +174,8 @@ func TestPhase1Flags_HostNameExpansionAndJumpIsolation(t *testing.T) {
 	if got != "mybox.corp.%local" {
 		t.Fatalf("effectiveHostName = %q, want %q", got, "mybox.corp.%local")
 	}
-	if !isTargetOnlyMuxDaemonOption("HostName=10.0.0.5") {
-		t.Fatalf("expected HostName to be target-specific so jump hosts never inherit it")
+	if targetOnly, err := isTargetOnlyMuxDaemonOption("HostName=10.0.0.5"); err != nil || !targetOnly {
+		t.Fatalf("expected HostName to be target-specific so jump hosts never inherit it, got (%v, %v)", targetOnly, err)
 	}
 }
 

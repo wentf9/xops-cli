@@ -57,7 +57,7 @@ func IsPlainOpenSSHHostSelector(s string) bool {
 			return false
 		}
 	}
-	if strings.Contains(s, "@") {
+	if strings.ContainsAny(s, "@,") {
 		return false
 	}
 	if strings.Contains(s, ":") || strings.ContainsAny(s, "[]") {
@@ -73,6 +73,9 @@ func validateTargetRefRaw(raw, emptyMsg string) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", fmt.Errorf("%s", emptyMsg)
+	}
+	if strings.ContainsRune(trimmed, ',') {
+		return "", fmt.Errorf("invalid address %q: contains comma", raw)
 	}
 	for _, r := range trimmed {
 		if unicode.IsSpace(r) {
@@ -93,6 +96,9 @@ func validateBareAliasTargetRef(raw string) (string, bool, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return "", false, fmt.Errorf("address cannot be empty")
+	}
+	if strings.ContainsRune(trimmed, ',') {
+		return "", false, fmt.Errorf("invalid address %q: contains comma", raw)
 	}
 	if hasOpenSSHPrefix(trimmed) || strings.ContainsAny(trimmed, "@:[]") {
 		return "", false, nil

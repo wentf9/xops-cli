@@ -1567,17 +1567,29 @@ func isUnencryptedPrivateKeyFile(keyPath string, policies ...*admittedMaterialPo
 	return verdict.Allow, nil
 }
 
-func hasSidecarCertFile(keyPath string, policies ...*admittedMaterialPolicy) bool {
+func hasSidecarCertFile(keyPath string, policies ...*admittedMaterialPolicy) (verdict.Verdict, error) {
 	certPath := sidecarCertPath(keyPath)
 	if certPath == "" {
-		return false
+		return verdict.Deny, nil
 	}
 	if policy := firstAdmittedPolicy(policies); policy != nil && policy.enforceCerts {
 		entry, ok := policy.lookupCert(certPath)
-		return ok && !entry.Missing && !entry.NonRegular
+		if ok && !entry.Missing && !entry.NonRegular {
+			return verdict.Allow, nil
+		}
+		return verdict.Deny, nil
 	}
 	st, err := os.Stat(certPath)
-	return err == nil && st.Mode().IsRegular()
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return verdict.Deny, nil
+		}
+		return verdict.Deny, err
+	}
+	if st.Mode().IsRegular() {
+		return verdict.Allow, nil
+	}
+	return verdict.Deny, nil
 }
 
 func dialAgentSignersByPubKey(
@@ -2148,7 +2160,9 @@ func shouldPreloadAgentSigners(
 	}
 	if !hasExplicitCerts {
 		for _, p := range defaultPaths {
-			if hasSidecarCertFile(p, policy) {
+			if verdict.Decide(func() (verdict.Verdict, error) {
+				return hasSidecarCertFile(p, policy)
+			}).Allowed() {
 				return true
 			}
 		}

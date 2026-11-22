@@ -130,8 +130,12 @@ func runDetachedInheritedPTYSubprocessHelper() {
 		_, _ = fmt.Fprintln(os.Stderr, "expected stdin/stderr to be PTY slave FDs")
 		os.Exit(21)
 	}
-	if isForegroundTerminalFD(int(os.Stdin.Fd())) || isForegroundTerminalFD(int(os.Stderr.Fd())) {
-		_, _ = fmt.Fprintln(os.Stderr, "isForegroundTerminalFD returned true on non-controlling PTY")
+	if stdinV, _ := isForegroundTerminalFD(int(os.Stdin.Fd())); stdinV.Allowed() {
+		_, _ = fmt.Fprintln(os.Stderr, "isForegroundTerminalFD returned Allow on non-controlling stdin PTY")
+		os.Exit(22)
+	}
+	if stderrV, _ := isForegroundTerminalFD(int(os.Stderr.Fd())); stderrV.Allowed() {
+		_, _ = fmt.Fprintln(os.Stderr, "isForegroundTerminalFD returned Allow on non-controlling stderr PTY")
 		os.Exit(22)
 	}
 	if defaultHasControllingTTY() {

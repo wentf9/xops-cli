@@ -168,14 +168,14 @@ func TestM15_HasActiveProxyCommandInPath_JumpOverrideAndNilConnector(t *testing.
 	}
 
 	oNoJump := NewSshOptions()
-	if !oNoJump.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"target", nil) {
-		t.Fatalf("expected ProxyCommand to be active for target without -J")
+	if hasProxy, err := oNoJump.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"target", nil); err != nil || !hasProxy {
+		t.Fatalf("expected ProxyCommand to be active for target without -J, got (%v, %v)", hasProxy, err)
 	}
 
 	oWithJump := NewSshOptions()
 	oWithJump.JumpHost = "bastion"
-	if oWithJump.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"target", nil) {
-		t.Fatalf("expected CLI -J bastion to mask target's lower-tier ProxyCommand")
+	if hasProxy, err := oWithJump.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"target", nil); err != nil || hasProxy {
+		t.Fatalf("expected CLI -J bastion to mask target's lower-tier ProxyCommand, got (%v, %v)", hasProxy, err)
 	}
 }
 

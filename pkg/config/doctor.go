@@ -307,7 +307,22 @@ func diagnoseV2Issues(v2 *ConfigurationV2) []DoctorIssue {
 	var issues []DoctorIssue
 	issues = append(issues, diagnoseV2Aliases(v2)...)
 	issues = append(issues, diagnoseV2ProxyJumps(v2)...)
-	if err := ValidateV2(v2); err != nil && !hasMatchingDoctorIssue(issues, err) {
+
+	// Validate the in-memory repaired configuration so unfixable schema errors
+	// that coexist with fixable alias/ProxyJump issues are always surfaced
+	// during read-only diagnosis instead of being masked.
+	validationTarget := v2
+	if len(issues) > 0 {
+		validationTarget, _ = repairV2(v2)
+	}
+	if err := ValidateV2(validationTarget); err != nil {
+		issues = append(issues, DoctorIssue{
+			Code:     "schema_validation",
+			Entity:   "config",
+			Severity: DoctorSeverityError,
+			Message:  err.Error(),
+		})
+	} else if _, err := FromV2(validationTarget); err != nil {
 		issues = append(issues, DoctorIssue{
 			Code:     "schema_validation",
 			Entity:   "config",
@@ -316,10 +331,6 @@ func diagnoseV2Issues(v2 *ConfigurationV2) []DoctorIssue {
 		})
 	}
 	return issues
-}
-
-func hasMatchingDoctorIssue(issues []DoctorIssue, _ error) bool {
-	return len(issues) > 0
 }
 
 func sortedMapKeys[V any](m map[string]V) []string {

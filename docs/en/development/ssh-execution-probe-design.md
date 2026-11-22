@@ -57,8 +57,8 @@ Targets the critical lifecycle event when a node is added for the first time:
      - Explicit `--interpreter` or `--launch-dialect` flags take precedence over recommended values and skip probing corresponding fields.
 
 2. **Dynamic JIT Enrollment (`xops exec --host ...` / `xops ssh ...`)**:
-   - When connecting to an unconfigured target host, `repository.PrepareNodeContext` returns `res.Created == true`.
-   - If credential remembering is enabled (e.g. `--remember` or configured remember policy), a lightweight probe executes before the first command, saving the generated `ExecutionConfig` alongside node metadata.
+   - When connecting to an unconfigured target host, `config.WithPendingNode` / `Repository.WithPendingNode` prepares a scoped `config.PendingLease` (identified as a new unconfirmed node by `PendingNodeExecution(nodeID)`), and `(*SSHAdapter).FinalizePendingConnection` finalizes confirmation after authentication succeeds.
+   - If credential remembering is enabled (e.g. `--remember` or configured remember policy), a lightweight probe executes before the first command and commits the generated `ExecutionConfig` atomically alongside node metadata via `PendingExecutionLease.ConfirmWithExecution`.
 
 3. **Batch Import Path (`xops host load`)**:
    - Executes probes concurrently across the verification pool during import.

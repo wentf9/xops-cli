@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/verdict"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
@@ -47,15 +48,27 @@ func defaultHasControllingTTY() bool {
 		_ = unix.Close(fd)
 		return pgrpErr == nil && fgPGID > 0 && fgPGID == unix.Getpgrp()
 	}
-	return isForegroundTerminalFD(int(os.Stdin.Fd())) || isForegroundTerminalFD(int(os.Stderr.Fd()))
+	stdinFG := verdict.Decide(func() (verdict.Verdict, error) {
+		return isForegroundTerminalFD(int(os.Stdin.Fd()))
+	}).Allowed()
+	stderrFG := verdict.Decide(func() (verdict.Verdict, error) {
+		return isForegroundTerminalFD(int(os.Stderr.Fd()))
+	}).Allowed()
+	return stdinFG || stderrFG
 }
 
-func isForegroundTerminalFD(fd int) bool {
+func isForegroundTerminalFD(fd int) (verdict.Verdict, error) {
 	if !term.IsTerminal(fd) {
-		return false
+		return verdict.Deny, nil
 	}
 	fgPGID, err := unix.IoctlGetInt(fd, unix.TIOCGPGRP)
-	return err == nil && fgPGID > 0 && fgPGID == unix.Getpgrp()
+	if err != nil {
+		return verdict.Deny, err
+	}
+	if fgPGID > 0 && fgPGID == unix.Getpgrp() {
+		return verdict.Allow, nil
+	}
+	return verdict.Deny, nil
 }
 
 func startPlatformShellCommand(command string, stdin io.Reader, stdout, stderr io.Writer, _ bool) (*platformProc, *exec.Cmd, error) {

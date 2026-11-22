@@ -4,7 +4,7 @@
 
 ## F1 CLI SSH 连通/执行
 
-`cmd/cli/main.go:main` → `cmd/root.go:Execute`（构造 `config.NewEncryptedRuntime` 并注入 `utils.InstallCredentialRuntime`）→ `cmd/ssh.go:NewCmdSsh`（或 `cmd/exec.go:NewCmdExec`）→ `(*SshOptions).Validate` & `cmd/ssh_execution.go:(*SshOptions).prepareCommandPlan` → `(*SshOptions).runConnection` → `(*SshOptions).resolveNode`（`Repository.PrepareNodeContext` / `ReplaceNodeAtRefContext`）→ `(*SshOptions).buildAdapterOptions` → `pkg/adapter.NewSSHAdapter`（注入 `sshenv.Discover()`）→ `core/ssh.(*Connector).Connect` → `(*SshOptions).runCommand` / `runShell` → CLI 输出与 `defer` 资源回收。
+`cmd/cli/main.go:main` → `cmd/root.go:Execute`（构造 `config.NewEncryptedRuntime` 并注入 `utils.InstallCredentialRuntime`）→ `cmd/ssh.go:NewCmdSsh`（或 `cmd/exec.go:NewCmdExec`）→ `(*SshOptions).Validate` & `cmd/ssh_execution.go:(*SshOptions).prepareCommandPlan` → `(*SshOptions).runConnection` → `(*SshOptions).withValidatedConnectionNode`（`config.WithPendingNode` / `Repository.WithPendingNode` 作用域化 `config.PendingLease`）→ `(*SshOptions).buildAdapterOptions` → `pkg/adapter.NewSSHAdapter`（注入 `sshenv.Discover()`）→ `core/ssh.(*Connector).Connect` → `(*SSHAdapter).FinalizePendingConnection`（`lease.Confirm` / `PendingExecutionLease.ConfirmWithExecution`）→ `(*SshOptions).runCommand` / `runShell` → CLI 输出与 `defer` 资源回收。
 
 - **普通 `ssh`、`exec`、交互 PTY、sudo 路径差异**：
   - `xops ssh`：无命令终端走 `Client.Shell` / `ShellWithSudo`；Linux 下无 sudo 普通命令走 `ssh.PlanCommand` + `Client.RunCommandPlanWithIO`，管道脚本且解释器为 `server` 走 `Client.RunShellWithoutPTY`；非 Linux 客户端或带 `--sudo` 回退至 `Client.RunCommandWithIO`（`cmd/ssh_execution.go:13` 限制 `xops ssh` 显式执行参数仅在 Linux 原生可取消输出下开放）。

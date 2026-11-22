@@ -307,7 +307,8 @@ func TestBindOutputStandardFileHandles(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		for _, target := range []*os.File{os.Stdout, os.Stderr} {
 			info, statErr := target.Stat()
-			isRegularOrNull := statErr == nil && (info.Mode().IsRegular() || isNullDevice(info))
+			isNull, _ := isNullDevice(info)
+			isRegularOrNull := statErr == nil && (info.Mode().IsRegular() || isNull.Allowed())
 			_, closeFn, cancelable, err := BindOutput(t.Context(), target)
 			if err != nil {
 				t.Fatalf("bind %s on %s: unexpected error %v", target.Name(), runtime.GOOS, err)

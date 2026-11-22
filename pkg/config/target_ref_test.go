@@ -146,6 +146,14 @@ func TestParseTargetRef_Matrix(t *testing.T) {
 		{name: "zero port", input: "host:0", wantErr: true},
 		{name: "overflow port", input: "host:65536", wantErr: true},
 		{name: "invalid multi colon", input: "a:b:c", wantErr: true},
+		{name: "trailing comma", input: "a,", wantErr: true},
+		{name: "leading comma", input: ",a", wantErr: true},
+		{name: "bare comma", input: ",", wantErr: true},
+		{name: "multi target comma", input: "a,b", wantErr: true},
+		{name: "bare alias with comma", input: "Prod Web,01", wantErr: true},
+		{name: "user with comma", input: "alice,bob@web-01", wantErr: true},
+		{name: "openssh with comma", input: "openssh:a,", wantErr: true},
+		{name: "host port with comma", input: "10.0.0.1:22,", wantErr: true},
 	}
 
 	for _, tc := range tests {

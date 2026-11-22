@@ -137,43 +137,61 @@ func TestP6_SingleAuthorityAndSanitizationGuards(t *testing.T) {
 
 func checkNoRawToAbsolutePathInInventoryFiles(t *testing.T, files []parsedGoFile) {
 	t.Helper()
-	guardedFiles := map[string]bool{
-		"cmd/host/add.go":                     false,
-		"cmd/host/edit.go":                    false,
-		"cmd/host/load.go":                    false,
-		"cmd/identity.go":                     false,
-		"pkg/tui/form.go":                     false,
-		"cmd/utils/inventory_credential.go":   false,
-		"cmd/utils/inventory_secret_input.go": false,
+	// Walk ALL non-test .go files under cmd/ and pkg/. Direct ToAbsolutePath
+	// calls are allowed solely inside the verified template-aware identity path
+	// authorities and the single cmd/utils forwarding wrapper.
+	allowedAuthorities := map[string]bool{
+		"cmd/utils/utils.go:ToAbsolutePath":                     false,
+		"pkg/config/target.go:ValidatePersistableIdentityPath":  false,
+		"pkg/config/target.go:NormalizePersistableIdentityPath": false,
+		"cmd/ssh.go:normalizeCLIIdentityPath":                   false,
+		"cmd/ssh_option_flag.go:normalizeCLIIdentityFlagPath":   false,
 	}
+	scannedCount := 0
 	for _, pf := range files {
-		if _, guarded := guardedFiles[pf.relPath]; !guarded {
+		if !strings.HasPrefix(pf.relPath, "cmd/") && !strings.HasPrefix(pf.relPath, "pkg/") {
 			continue
 		}
-		guardedFiles[pf.relPath] = true
-		ast.Inspect(pf.file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
+		scannedCount++
+		var currentFunc string
+		for _, decl := range pf.file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			currentFunc = fn.Name.Name
+			key := pf.relPath + ":" + currentFunc
+			if _, allowed := allowedAuthorities[key]; allowed {
+				allowedAuthorities[key] = true
+				continue
+			}
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok {
+					return true
+				}
+				switch fun := call.Fun.(type) {
+				case *ast.Ident:
+					if fun.Name == "ToAbsolutePath" {
+						pos := pf.fset.Position(call.Pos())
+						t.Errorf("%s:%d: forbidden raw ToAbsolutePath call in %s; use template-aware identity path normalization", pf.relPath, pos.Line, currentFunc)
+					}
+				case *ast.SelectorExpr:
+					if fun.Sel.Name == "ToAbsolutePath" {
+						pos := pf.fset.Position(call.Pos())
+						t.Errorf("%s:%d: forbidden raw ToAbsolutePath call in %s; use template-aware identity path normalization", pf.relPath, pos.Line, currentFunc)
+					}
+				}
 				return true
-			}
-			switch fun := call.Fun.(type) {
-			case *ast.Ident:
-				if fun.Name == "ToAbsolutePath" {
-					pos := pf.fset.Position(call.Pos())
-					t.Errorf("%s:%d: forbidden raw ToAbsolutePath call; use template-aware identity path normalization", pf.relPath, pos.Line)
-				}
-			case *ast.SelectorExpr:
-				if fun.Sel.Name == "ToAbsolutePath" {
-					pos := pf.fset.Position(call.Pos())
-					t.Errorf("%s:%d: forbidden raw ToAbsolutePath call; use template-aware identity path normalization", pf.relPath, pos.Line)
-				}
-			}
-			return true
-		})
+			})
+		}
 	}
-	for rel, scanned := range guardedFiles {
-		if !scanned {
-			t.Errorf("expected guarded file %q to be scanned, but it was not found", rel)
+	if scannedCount < 50 {
+		t.Fatalf("expected to scan all non-test .go files under cmd/ and pkg/, found only %d", scannedCount)
+	}
+	for key, seen := range allowedAuthorities {
+		if !seen {
+			t.Errorf("expected allowed ToAbsolutePath authority %q to be present, but it was not found", key)
 		}
 	}
 }

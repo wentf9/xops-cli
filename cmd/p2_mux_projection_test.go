@@ -108,9 +108,9 @@ func TestP2_MuxDaemonSpec_ExhaustiveOptionSpecMatrix(t *testing.T) {
 			verifyP2SpecTargetProjectionMatrix(t, spec, sample)
 			verifyP2SpecJumpProjectionMatrix(t, spec, sample)
 
-			gotTargetOnly := isTargetOnlyMuxDaemonOption(spec.CanonicalKey + "=" + sample.primary)
-			if gotTargetOnly != !spec.IsConnectionWide() {
-				t.Errorf("isTargetOnlyMuxDaemonOption(%s) = %v, want %v (!IsConnectionWide)", spec.CanonicalKey, gotTargetOnly, !spec.IsConnectionWide())
+			gotTargetOnly, err := isTargetOnlyMuxDaemonOption(spec.CanonicalKey + "=" + sample.primary)
+			if err != nil || gotTargetOnly != !spec.IsConnectionWide() {
+				t.Errorf("isTargetOnlyMuxDaemonOption(%s) = (%v, %v), want (%v, nil) (!IsConnectionWide)", spec.CanonicalKey, gotTargetOnly, err, !spec.IsConnectionWide())
 			}
 		})
 	}
@@ -134,8 +134,8 @@ func TestP2_MuxDaemonSpec_ExhaustiveOptionSpecMatrix(t *testing.T) {
 			if got := opts.collectMuxDaemonJumpOptions(); len(got) != 0 {
 				t.Errorf("collectMuxDaemonJumpOptions(%q) = %v, want empty", raw, got)
 			}
-			if !isTargetOnlyMuxDaemonOption(raw) {
-				t.Errorf("isTargetOnlyMuxDaemonOption(%q) = false, want true", raw)
+			if targetOnly, err := isTargetOnlyMuxDaemonOption(raw); err != nil || !targetOnly {
+				t.Errorf("isTargetOnlyMuxDaemonOption(%q) = (%v, %v), want (true, nil)", raw, targetOnly, err)
 			}
 		}
 	})

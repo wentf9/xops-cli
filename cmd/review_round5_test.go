@@ -49,8 +49,8 @@ func TestRound5_P2_12_And_P3_11_SnakeCaseGeneralAndDaemonOptions(t *testing.T) {
 		"proxy_jump=jump-snake",
 		"proxy_command=nc %h %p",
 	} {
-		if !isTargetOnlyMuxDaemonOption(opt) {
-			t.Fatalf("isTargetOnlyMuxDaemonOption(%q) = false, want true", opt)
+		if targetOnly, err := isTargetOnlyMuxDaemonOption(opt); err != nil || !targetOnly {
+			t.Fatalf("isTargetOnlyMuxDaemonOption(%q) = (%v, %v), want (true, nil)", opt, targetOnly, err)
 		}
 	}
 	if !isProxyCommandOptionKey("proxy_command") || !isProxyCommandOptionKey("ProxyCommand") {

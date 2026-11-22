@@ -668,15 +668,18 @@ func matchesTargetSelector(nodeID string, master *ssh.MuxServer, host, selector 
 	return false
 }
 
-func isTargetOnlyMuxDaemonOption(opt string) bool {
+func isTargetOnlyMuxDaemonOption(opt string) (bool, error) {
 	key, val, err := ssh.SplitOptionKeyValue(opt)
-	if err != nil || key == "" || strings.TrimSpace(val) == "" {
-		return true
+	if err != nil {
+		return true, err
+	}
+	if key == "" || strings.TrimSpace(val) == "" {
+		return true, fmt.Errorf("malformed mux daemon option %q", opt)
 	}
 	if spec, ok := ssh.LookupOptionSpec(key); ok {
-		return !spec.IsConnectionWide()
+		return !spec.IsConnectionWide(), nil
 	}
-	return true
+	return true, nil
 }
 
 func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer) (host string, port int, user string) {

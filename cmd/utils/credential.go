@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/verdict"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"golang.org/x/term"
@@ -178,29 +179,37 @@ func EffectiveRememberPolicy(override string, cfg *config.Configuration) string 
 // ShouldRememberConfiguredCredential skips confirmation when persistence is
 // disabled or no writable default store is configured, without probing stores.
 func ShouldRememberConfiguredCredential(policy, targetName string, cfg *config.Configuration) bool {
-	return cfg.CanRememberCredentials() && ShouldRememberCredential(policy, targetName)
+	if !cfg.CanRememberCredentials() {
+		return false
+	}
+	return verdict.Decide(func() (verdict.Verdict, error) {
+		return ShouldRememberCredential(policy, targetName)
+	}).Allowed()
 }
 
 // ShouldRememberCredential applies the policy, asking only on a terminal.
-func ShouldRememberCredential(policy string, targetName string) bool {
+func ShouldRememberCredential(policy string, targetName string) (verdict.Verdict, error) {
 	p := strings.ToLower(strings.TrimSpace(policy))
 	switch p {
 	case RememberPolicyAlways:
-		return true
+		return verdict.Allow, nil
 	case RememberPolicyNever:
-		return false
+		return verdict.Deny, nil
 	case RememberPolicyAsk:
 		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			return false
+			return verdict.Deny, nil
 		}
 		ok, err := AskConfirmation(fmt.Sprintf("Save credential for %q?", targetName))
 		if err != nil {
-			return false
+			return verdict.Deny, err
 		}
-		return ok
+		if ok {
+			return verdict.Allow, nil
+		}
+		return verdict.Deny, nil
 	case "":
 		return ShouldRememberCredential(RememberPolicyAsk, targetName)
 	default:
-		return false
+		return verdict.Deny, nil
 	}
 }

@@ -58,8 +58,8 @@ Level 4: 连接级会话缓存 (Session Cache)   ──► 单次 SSH Client 生
      - 若用户显式指定了 `--interpreter` 或 `--launch-dialect`，以用户显式指定为准，跳过对应字段探测。
 
 2. **动态即时录入路径 (`xops exec --host ...` / `xops ssh ...`)**：
-   - 当用户直接向未配置的新主机发起连接时，`repository.PrepareNodeContext` 返回 `res.Created == true`。
-   - 若当前运行策略启用了凭据记忆或持久化（如 `--remember` 或已配置记住策略），则在首条命令执行前执行轻量探测，将生成的 `ExecutionConfig` 随节点元数据一同固化。
+   - 当用户直接向未配置的新主机发起连接时，`config.WithPendingNode` / `Repository.WithPendingNode` 为新节点创建作用域化 `config.PendingLease`（`PendingNodeExecution(nodeID)` 识别为未确认的新节点），认证成功后由 `(*SSHAdapter).FinalizePendingConnection` 接管确认流程。
+   - 若当前运行策略启用了凭据记忆或持久化（如 `--remember` 或已配置记住策略），则在首条命令执行前执行轻量探测，经 `PendingExecutionLease.ConfirmWithExecution` 将生成的 `ExecutionConfig` 随节点元数据一同原子固化。
 
 3. **批量导入路径 (`xops host load`)**：
    - 导入主机列表时，在并发验证线程池内并行执行探测；

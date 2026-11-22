@@ -22,8 +22,8 @@ func TestPhase5_TargetSpecificLocalExecOptions(t *testing.T) {
 		"PermitLocalCommand=yes",
 		"permit_local_command=yes",
 	} {
-		if !isTargetOnlyMuxDaemonOption(opt) {
-			t.Fatalf("isTargetOnlyMuxDaemonOption(%q) = false, want true", opt)
+		if targetOnly, err := isTargetOnlyMuxDaemonOption(opt); err != nil || !targetOnly {
+			t.Fatalf("isTargetOnlyMuxDaemonOption(%q) = (%v, %v), want (true, nil)", opt, targetOnly, err)
 		}
 	}
 }
@@ -38,8 +38,8 @@ func TestPhase5_ShouldSkipMasterHandoffForProxyCommand(t *testing.T) {
 		t.Fatalf("Set(ProxyCommand) error = %v", err)
 	}
 	opts.effectiveSSHOptions = effActive
-	if !opts.shouldSkipMasterHandoff(t.Context(), nil, nil, "") {
-		t.Fatalf("expected shouldSkipMasterHandoff=true when active ProxyCommand is set")
+	if skip, err := opts.shouldSkipMasterHandoff(t.Context(), nil, nil, ""); err != nil || !skip {
+		t.Fatalf("expected shouldSkipMasterHandoff=(true, nil) when active ProxyCommand is set, got (%v, %v)", skip, err)
 	}
 
 	effNone, err := ssh.NewOptions()
@@ -50,8 +50,8 @@ func TestPhase5_ShouldSkipMasterHandoffForProxyCommand(t *testing.T) {
 		t.Fatalf("Set(ProxyCommand=none) error = %v", err)
 	}
 	opts.effectiveSSHOptions = effNone
-	if opts.shouldSkipMasterHandoff(t.Context(), nil, nil, "") {
-		t.Fatalf("expected shouldSkipMasterHandoff=false when ProxyCommand=none")
+	if skip, err := opts.shouldSkipMasterHandoff(t.Context(), nil, nil, ""); err != nil || skip {
+		t.Fatalf("expected shouldSkipMasterHandoff=(false, nil) when ProxyCommand=none, got (%v, %v)", skip, err)
 	}
 
 	// Jump hop with active ProxyCommand also skips master handoff.
@@ -73,8 +73,8 @@ Host jump-cmd
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 	optsJump := NewSshOptions()
 	optsJump.JumpHost = "jump-cmd"
-	if !optsJump.shouldSkipMasterHandoff(t.Context(), nil, provider, "") {
-		t.Fatalf("expected shouldSkipMasterHandoff=true when jump hop has active ProxyCommand")
+	if skip, err := optsJump.shouldSkipMasterHandoff(t.Context(), nil, provider, ""); err != nil || !skip {
+		t.Fatalf("expected shouldSkipMasterHandoff=(true, nil) when jump hop has active ProxyCommand, got (%v, %v)", skip, err)
 	}
 }
 

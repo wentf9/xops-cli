@@ -18,6 +18,7 @@ import (
 	"github.com/wentf9/xops-cli/cmd/utils"
 	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/core/verdict"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -478,7 +479,7 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 	} else if finalHost != "" && !o.preserveDaemonSelector {
 		u, h, p, err := utils.ParseAddr(finalHost)
 		if err != nil {
-			if strings.HasPrefix(strings.TrimSpace(finalHost), config.OpenSSHNodePrefix) {
+			if config.IsOpenSSHNodeID(strings.TrimSpace(finalHost)) || strings.ContainsRune(finalHost, ',') {
 				return err
 			}
 		} else if h != "" {
@@ -646,8 +647,19 @@ func (o *SshOptions) validateBackgroundFlags() error {
 	if err := o.validateBackgroundCredentialInvariants(); err != nil {
 		return err
 	}
-	if !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript && !o.hasNonEmptyRemoteCommand() {
-		if o.canConfigSupplyBackgroundSession() {
+	if !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript {
+		hasRemoteCmd, err := o.hasNonEmptyRemoteCommand()
+		if err != nil {
+			return err
+		}
+		if hasRemoteCmd {
+			return nil
+		}
+		allowed, err := o.canConfigSupplyBackgroundSession()
+		if err != nil {
+			return err
+		}
+		if allowed.Allowed() {
 			return nil
 		}
 		return errors.New(i18n.T("ssh_err_background_requires_nocmd"))
@@ -655,13 +667,13 @@ func (o *SshOptions) validateBackgroundFlags() error {
 	return nil
 }
 
-func (o *SshOptions) canConfigSupplyBackgroundSession() bool {
+func (o *SshOptions) canConfigSupplyBackgroundSession() (verdict.Verdict, error) {
 	if o == nil || o.isMuxDaemon() {
-		return false
+		return verdict.Deny, nil
 	}
 	sessionOpts, err := o.toSessionControlOptions()
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	cliSessionTypeLocked := false
 	cliRemoteCmdLocked := false
@@ -670,59 +682,64 @@ func (o *SshOptions) canConfigSupplyBackgroundSession() bool {
 		cliRemoteCmdLocked = strings.TrimSpace(cliOpts.Get(ssh.OptionRemoteCommand)) != ""
 	}
 	if cliSessionTypeLocked && cliRemoteCmdLocked {
-		return false
+		return verdict.Deny, nil
 	}
-	provider, deferOnErr := o.loadBackgroundSessionProbeProvider()
-	if deferOnErr {
-		return true
+	provider, err := o.loadBackgroundSessionProbeProvider()
+	if err != nil {
+		return verdict.Deny, err
 	}
 	if provider == nil {
-		return false
+		return verdict.Deny, nil
 	}
-	return o.probeTargetBackgroundSession(provider, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked)
+	if o.probeTargetBackgroundSession(provider, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
+		return verdict.Allow, nil
+	}
+	return verdict.Deny, nil
 }
 
-func (o *SshOptions) loadBackgroundSessionProbeProvider() (config.ConfigProvider, bool) {
+func (o *SshOptions) loadBackgroundSessionProbeProvider() (config.ConfigProvider, error) {
 	var cfg *config.Configuration
-	if configPath, keyPath, pathErr := utils.GetConfigFilePath(); pathErr == nil {
-		if _, statErr := os.Stat(configPath); statErr == nil {
-			loaded, loadErr := config.NewDefaultStore(configPath, keyPath).Load()
-			if loadErr != nil {
-				return nil, true
-			}
-			cfg = loaded
+	configPath, keyPath, pathErr := utils.GetConfigFilePath()
+	if pathErr != nil {
+		return nil, fmt.Errorf("get config file path failed: %w", pathErr)
+	}
+	if _, statErr := os.Stat(configPath); statErr == nil {
+		loaded, loadErr := config.NewDefaultStore(configPath, keyPath).Load()
+		if loadErr != nil {
+			return nil, fmt.Errorf("%s: %w", i18n.T("ssh_err_load_config"), loadErr)
 		}
+		cfg = loaded
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat config file %q: %w", configPath, statErr)
 	}
 	var openSSH *config.OpenSSHParser
 	cfgFile := strings.TrimSpace(o.control.ConfigFile)
-	switch {
-	case ssh.IsNoneValue(cfgFile):
-		// -F none explicitly disables OpenSSH config.
-	case cfgFile != "":
-		p, parseErr := config.NewOpenSSHParserFromPath(cfgFile)
-		if parseErr != nil {
-			return nil, true
+	if cfgFile != "" {
+		var base config.ConfigProvider
+		if cfg != nil {
+			base = config.NewProviderWithoutOpenSSH(cfg)
 		}
-		openSSH = p
-	default:
-		if home, homeErr := os.UserHomeDir(); homeErr == nil && strings.TrimSpace(home) != "" {
-			defaultPath := filepath.Join(home, ".ssh", "config")
-			if _, statErr := os.Stat(defaultPath); statErr == nil {
-				p, parseErr := config.NewOpenSSHParserFromPath(defaultPath)
-				if parseErr != nil {
-					return nil, true
-				}
-				openSSH = p
+		return config.WithOpenSSHConfigOverride(base, cfgFile)
+	}
+	if home, homeErr := os.UserHomeDir(); homeErr == nil && strings.TrimSpace(home) != "" {
+		defaultPath := filepath.Join(home, ".ssh", "config")
+		if _, statErr := os.Stat(defaultPath); statErr == nil {
+			p, parseErr := config.NewOpenSSHParserFromPath(defaultPath)
+			if parseErr != nil {
+				return nil, parseErr
 			}
+			openSSH = p
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat OpenSSH config %q: %w", defaultPath, statErr)
 		}
 	}
 	if cfg == nil && openSSH == nil {
-		return nil, false
+		return nil, nil
 	}
 	if openSSH != nil {
-		return config.NewProviderWithOpenSSHParser(cfg, openSSH), false
+		return config.NewProviderWithOpenSSHParser(cfg, openSSH), nil
 	}
-	return config.NewProviderWithoutOpenSSH(cfg), false
+	return config.NewProviderWithoutOpenSSH(cfg), nil
 }
 
 func (o *SshOptions) probeTargetBackgroundSession(
@@ -883,7 +900,14 @@ func (o *SshOptions) runParentDaemonWithProvider(ctx context.Context, cfg *confi
 }
 
 func (o *SshOptions) validateBackgroundProxyCommand(provider config.ConfigProvider, nodeID string) error {
-	if o != nil && o.effectiveBgRun() && o.hasActiveProxyCommandInPath(provider, nodeID, nil) {
+	if o == nil || !o.effectiveBgRun() {
+		return nil
+	}
+	hasProxy, err := o.hasActiveProxyCommandInPath(provider, nodeID, nil)
+	if err != nil {
+		return fmt.Errorf("verify background mode (-f) ProxyCommand failed: %w", err)
+	}
+	if hasProxy {
 		return fmt.Errorf("background mode (-f) cannot be combined with ProxyCommand")
 	}
 	return nil
@@ -905,8 +929,14 @@ func (o *SshOptions) validatePostResolutionSessionInvariants() error {
 	if err := o.validateBackgroundCredentialInvariants(); err != nil {
 		return o.control.controlUsageError(err)
 	}
-	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript && !o.hasNonEmptyRemoteCommand() {
-		return o.control.controlUsageError(errors.New(i18n.T("ssh_err_background_requires_nocmd")))
+	if o.effectiveBgRun() && !o.effectiveNoCmd() && o.Command == "" && !o.stdinScript {
+		hasRemoteCmd, err := o.hasNonEmptyRemoteCommand()
+		if err != nil {
+			return o.control.controlUsageError(err)
+		}
+		if !hasRemoteCmd {
+			return o.control.controlUsageError(errors.New(i18n.T("ssh_err_background_requires_nocmd")))
+		}
 	}
 	return nil
 }
@@ -1145,49 +1175,86 @@ func (o *SshOptions) getActiveMuxServer(ctx context.Context, provider config.Con
 // handoffPersistentMaster releases this process's master and starts a detached
 // master so ControlPersist survives the session, matching OpenSSH behavior for a
 // command or interactive shell that finished.
-func (o *SshOptions) shouldSkipMasterHandoff(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) bool {
+func (o *SshOptions) shouldSkipMasterHandoff(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) (bool, error) {
 	if o.isMuxDaemon() || o.effectiveBgRun() || o.effectiveNoCmd() {
-		return true
+		return true, nil
 	}
 	if ctx != nil && ctx.Err() != nil {
 		// The session was interrupted (Ctrl-C/cancellation). Reviving the master
 		// would resurrect what the user just stopped.
-		return true
+		return true, nil
 	}
 	if err := drainOwnedMastersWithProvider(ctx, provider, connector); err != nil {
-		return true
+		return true, err
 	}
 	if o.OTP != "" {
 		// A one-time code was already consumed by this process. Re-playing it in
 		// the daemon cannot succeed and may trip server-side MFA lockouts.
 		logger.DefaultLogger().Debugf("mux: skipping master handoff because a one-time password was used")
-		return true
+		return true, nil
 	}
-	if o.hasActiveProxyCommandInPath(provider, nodeID, connector) {
+	hasProxy, err := o.hasActiveProxyCommandInPath(provider, nodeID, connector)
+	if err != nil {
+		logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand check failed: %v", err)
+		return true, err
+	}
+	if hasProxy {
 		// Detached --mux-daemon runs with localExecution disabled; keep ProxyCommand
 		// masters in foreground instead of handing off to a daemon that cannot re-dial.
 		logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand is active")
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
-func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider, nodeID string, connector *ssh.Connector) bool {
-	var sessionCtrlOpts adapter.SessionControlOptions
-	if o != nil {
-		if o.effectiveSSHOptions != nil && o.effectiveSSHOptions.ActiveProxyCommand() != "" {
-			return true
+func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider, nodeID string, connector *ssh.Connector) (bool, error) {
+	sessionCtrlOpts, hasDirectProxy, err := o.resolveProxyCommandCheckSessionOptions()
+	if err != nil || hasDirectProxy {
+		return true, err
+	}
+	if provider == nil {
+		return false, nil
+	}
+	checker := o.buildProxyCommandPathChecker(provider, nodeID, sessionCtrlOpts)
+	if hasProxy, err := checker.checkNode(nodeID, true); err != nil || hasProxy {
+		return true, err
+	}
+	if nodeID == "" {
+		jumpChain, err := o.effectiveProxyJumpChain(provider, "")
+		if err != nil {
+			return true, err
 		}
-		if parsed, err := o.toSessionControlOptions(); err == nil {
-			sessionCtrlOpts = parsed
-			if opts := sessionCtrlOpts.ToSSHOptions(); opts != nil && opts.ActiveProxyCommand() != "" {
-				return true
+		for _, hop := range strings.Split(jumpChain, ",") {
+			if hasProxy, err := checker.checkNode(hop, false); err != nil || hasProxy {
+				return true, err
 			}
 		}
 	}
-	if provider == nil {
-		return false
+	return checker.checkConnectorMasters(connector)
+}
+
+func (o *SshOptions) resolveProxyCommandCheckSessionOptions() (adapter.SessionControlOptions, bool, error) {
+	if o == nil {
+		return adapter.SessionControlOptions{}, false, nil
 	}
+	if o.effectiveSSHOptions != nil && o.effectiveSSHOptions.ActiveProxyCommand() != "" {
+		return adapter.SessionControlOptions{}, true, nil
+	}
+	parsed, err := o.toSessionControlOptions()
+	if err != nil {
+		return adapter.SessionControlOptions{}, true, err
+	}
+	if opts := parsed.ToSSHOptions(); opts != nil && opts.ActiveProxyCommand() != "" {
+		return parsed, true, nil
+	}
+	return parsed, false, nil
+}
+
+func (o *SshOptions) buildProxyCommandPathChecker(
+	provider config.ConfigProvider,
+	nodeID string,
+	sessionCtrlOpts adapter.SessionControlOptions,
+) *proxyCommandPathChecker {
 	adpOpts := []adapter.Option{adapter.WithLocalExecution(true)}
 	if o != nil && nodeID != "" {
 		origHost, canonHost := canonicalControlOriginAndHost(o)
@@ -1203,24 +1270,13 @@ func (o *SshOptions) hasActiveProxyCommandInPath(provider config.ConfigProvider,
 			}))
 		}
 	}
-	checker := &proxyCommandPathChecker{
+	return &proxyCommandPathChecker{
 		opts:            o,
 		provider:        provider,
 		adp:             adapter.NewSSHAdapter(provider, adpOpts...),
 		sessionCtrlOpts: sessionCtrlOpts,
 		visited:         make(map[string]struct{}),
 	}
-	if checker.checkNode(nodeID, true) {
-		return true
-	}
-	if nodeID == "" {
-		for _, hop := range strings.Split(o.effectiveProxyJumpChain(provider, ""), ",") {
-			if checker.checkNode(hop, false) {
-				return true
-			}
-		}
-	}
-	return checker.checkConnectorMasters(connector)
 }
 
 type proxyCommandPathChecker struct {
@@ -1231,100 +1287,124 @@ type proxyCommandPathChecker struct {
 	visited         map[string]struct{}
 }
 
-func (c *proxyCommandPathChecker) checkNode(id string, isTarget bool) bool {
+func (c *proxyCommandPathChecker) checkNode(id string, isTarget bool) (bool, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return false
+		return false, nil
 	}
 	if _, seen := c.visited[id]; seen {
-		return false
+		return false, nil
 	}
 	c.visited[id] = struct{}{}
 	ctrlOpts := c.sessionCtrlOpts.ConnectionWideOptions()
 	if isTarget {
 		ctrlOpts = c.sessionCtrlOpts
 	}
-	if pol, err := c.adp.Resolve(context.Background(), adapter.ResolveRequest{
+	pol, err := c.adp.Resolve(context.Background(), adapter.ResolveRequest{
 		NodeID:         id,
 		SessionControl: &ctrlOpts,
-	}); err == nil {
-		if opts := pol.Options(); opts != nil && opts.ActiveProxyCommand() != "" {
-			return true
-		}
+	})
+	if err != nil {
+		// Fail closed: if effective policy resolution fails, treat as unsafe to detach/handoff.
+		return true, err
+	}
+	if opts := pol.Options(); opts != nil && opts.ActiveProxyCommand() != "" {
+		return true, nil
 	}
 	var jumpChain string
 	if isTarget {
-		jumpChain = c.opts.effectiveProxyJumpChain(c.provider, id)
-	} else if snap, err := c.provider.ResolveConnection(id); err == nil {
-		jumpChain = strings.TrimSpace(snap.Node.ProxyJump)
-	}
-	for _, hop := range strings.Split(jumpChain, ",") {
-		if c.checkNode(hop, false) {
-			return true
+		jumpChain, err = c.opts.effectiveProxyJumpChain(c.provider, id)
+		if err != nil {
+			return true, err
+		}
+	} else {
+		snap, snapErr := c.provider.ResolveConnection(id)
+		if snapErr != nil && !errors.Is(snapErr, config.ErrNodeNotFound) {
+			return true, snapErr
+		}
+		if snapErr == nil {
+			jumpChain = strings.TrimSpace(snap.Node.ProxyJump)
 		}
 	}
-	return false
+	for _, hop := range strings.Split(jumpChain, ",") {
+		if hasProxy, hopErr := c.checkNode(hop, false); hopErr != nil || hasProxy {
+			return true, hopErr
+		}
+	}
+	return false, nil
 }
 
-func (c *proxyCommandPathChecker) checkConnectorMasters(connector *ssh.Connector) bool {
+func (c *proxyCommandPathChecker) checkConnectorMasters(connector *ssh.Connector) (bool, error) {
 	if connector == nil {
-		return false
+		return false, nil
 	}
 	for _, m := range connector.Masters() {
 		if m == nil {
 			continue
 		}
-		if c.checkOwnedMaster(connector, m) {
-			return true
+		if hasProxy, err := c.checkOwnedMaster(connector, m); err != nil || hasProxy {
+			return true, err
 		}
 	}
-	return false
+	return false, nil
 }
 
-func (c *proxyCommandPathChecker) checkOwnedMaster(connector *ssh.Connector, m *ssh.MuxServer) bool {
+func (c *proxyCommandPathChecker) checkOwnedMaster(connector *ssh.Connector, m *ssh.MuxServer) (bool, error) {
 	if ownedID := strings.TrimSpace(connector.MasterNodeID(m)); ownedID != "" {
-		if c.checkNode(ownedID, false) {
-			return true
+		if hasProxy, err := c.checkNode(ownedID, false); err != nil || hasProxy {
+			return true, err
 		}
 	}
 	if resolvedID := resolveOwnedMasterNodeID(c.provider, connector, m); resolvedID != "" {
-		if c.checkNode(resolvedID, false) {
-			return true
+		if hasProxy, err := c.checkNode(resolvedID, false); err != nil || hasProxy {
+			return true, err
 		}
 	}
 	targetHost := strings.TrimSpace(m.Target().OriginalHost)
 	if targetHost == "" {
-		return false
+		return false, nil
 	}
-	if c.checkNode(targetHost, false) {
-		return true
+	if hasProxy, err := c.checkNode(targetHost, false); err != nil || hasProxy {
+		return true, err
 	}
-	return !strings.HasPrefix(targetHost, config.OpenSSHNodePrefix) && c.checkNode(config.OpenSSHNodePrefix+targetHost, false)
+	if !config.IsOpenSSHNodeID(targetHost) {
+		return c.checkNode(config.OpenSSHNodePrefix+targetHost, false)
+	}
+	return false, nil
 }
 
-func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nodeID string) string {
+func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nodeID string) (string, error) {
 	if o != nil {
 		jump := strings.TrimSpace(o.JumpHost)
 		if ssh.IsDisabledProxyJump(jump) {
-			return ""
+			return "", nil
 		}
 		if jump != "" {
-			if resolved, err := provider.ResolveProxyJumpChain(jump); err == nil {
-				return resolved
+			if provider == nil {
+				return jump, nil
 			}
-			return jump
+			resolved, err := provider.ResolveProxyJumpChain(jump)
+			if err != nil {
+				return "", err
+			}
+			return resolved, nil
 		}
 	}
-	if nodeID != "" {
-		if snap, err := provider.ResolveConnection(nodeID); err == nil {
-			return strings.TrimSpace(snap.Node.ProxyJump)
+	if nodeID != "" && provider != nil {
+		snap, err := provider.ResolveConnection(nodeID)
+		if err != nil {
+			if errors.Is(err, config.ErrNodeNotFound) {
+				return "", nil
+			}
+			return "", err
 		}
+		return strings.TrimSpace(snap.Node.ProxyJump), nil
 	}
-	return ""
+	return "", nil
 }
 
 func (o *SshOptions) handoffPersistentMaster(ctx context.Context, connector *ssh.Connector, provider config.ConfigProvider, nodeID string) error {
-	if o.shouldSkipMasterHandoff(ctx, connector, provider, nodeID) {
+	if skip, err := o.shouldSkipMasterHandoff(ctx, connector, provider, nodeID); err != nil || skip {
 		return nil
 	}
 	if nodeID != "" && len(o.targetNodeIDs) == 0 {
@@ -1475,7 +1555,12 @@ func (o *SshOptions) handoffConnectorMasters(ctx context.Context, provider confi
 		if rawOwnedID != "" {
 			o.recordTargetHandoffNodeID(rawOwnedID, nodeID)
 		}
-		if o.hasActiveProxyCommandForMaster(provider, rawOwnedID, nodeID) {
+		hasProxy, proxyErr := o.hasActiveProxyCommandForMaster(provider, rawOwnedID, nodeID)
+		if proxyErr != nil {
+			logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand check failed: %v", proxyErr)
+			continue
+		}
+		if hasProxy {
 			logger.DefaultLogger().Debugf("mux: skipping master handoff because ProxyCommand is active")
 			continue
 		}
@@ -1529,11 +1614,15 @@ func isSuppressedJumpMaster(jumps map[string]bool, rawOwnedID, resolvedNodeID st
 	return false
 }
 
-func (o *SshOptions) hasActiveProxyCommandForMaster(provider config.ConfigProvider, rawOwnedID, resolvedNodeID string) bool {
-	if o.hasActiveProxyCommandInPath(provider, resolvedNodeID, nil) {
-		return true
+func (o *SshOptions) hasActiveProxyCommandForMaster(provider config.ConfigProvider, rawOwnedID, resolvedNodeID string) (bool, error) {
+	hasProxy, err := o.hasActiveProxyCommandInPath(provider, resolvedNodeID, nil)
+	if err != nil || hasProxy {
+		return true, err
 	}
-	return rawOwnedID != "" && rawOwnedID != resolvedNodeID && o.hasActiveProxyCommandInPath(provider, rawOwnedID, nil)
+	if rawOwnedID != "" && rawOwnedID != resolvedNodeID {
+		return o.hasActiveProxyCommandInPath(provider, rawOwnedID, nil)
+	}
+	return false, nil
 }
 
 func resolveOwnedMasterNodeID(provider config.ConfigProvider, connector *ssh.Connector, m *ssh.MuxServer) string {

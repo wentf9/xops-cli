@@ -225,3 +225,66 @@ func TestDoctor_MissingFileIsHealthy(t *testing.T) {
 		t.Fatalf("unexpected report for missing file: %+v", report)
 	}
 }
+
+// TestDoctor_DiagnoseSurfacesUnfixableSchemaErrorAlongsideFixableIssues
+// verifies EFG-L1: read-only DiagnoseConfigFile runs in-memory repair +
+// ValidateV2 so unfixable schema errors coexisting with fixable alias or
+// ProxyJump issues are surfaced rather than masked.
+func TestDoctor_DiagnoseSurfacesUnfixableSchemaErrorAlongsideFixableIssues(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "xops_config.yaml")
+	mixedYAML := strings.Join([]string{
+		"schema_version: 2",
+		"credential:",
+		"  stores: {}",
+		"hosts: {}",
+		"identities:",
+		"  id-a:",
+		"    user: ops",
+		"    auth_type: auto",
+		"nodes:",
+		"  node-a:",
+		"    host_ref: missing-host",
+		"    identity_ref: id-a",
+		"    alias:",
+		"      - bad@alias",
+		"    sudo_mode: auto",
+	}, "\n") + "\n"
+	if err := os.WriteFile(cfgPath, []byte(mixedYAML), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	report, err := DiagnoseConfigFile(cfgPath)
+	if err != nil {
+		t.Fatalf("DiagnoseConfigFile: %v", err)
+	}
+	if !report.HasErrors() || !report.HasFixableIssues() {
+		t.Fatalf("unexpected report flags: %+v", report)
+	}
+
+	var sawFixableAlias, sawUnfixableSchema bool
+	for _, issue := range report.Issues {
+		if issue.Code == "invalid_node_alias" && issue.Fixable {
+			sawFixableAlias = true
+		}
+		if issue.Code == "schema_validation" && !issue.Fixable && strings.Contains(issue.Message, "missing-host") {
+			sawUnfixableSchema = true
+		}
+	}
+	if !sawFixableAlias {
+		t.Errorf("expected fixable invalid_node_alias issue, got %+v", report.Issues)
+	}
+	if !sawUnfixableSchema {
+		t.Errorf("expected unfixable schema_validation issue mentioning missing-host, got %+v", report.Issues)
+	}
+
+	after, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(after) != mixedYAML {
+		t.Fatal("DiagnoseConfigFile modified file on disk")
+	}
+}

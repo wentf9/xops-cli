@@ -72,15 +72,14 @@ func TestRememberPolicyValidation(t *testing.T) {
 }
 
 func TestShouldRememberCredential(t *testing.T) {
-	if !cmdutils.ShouldRememberCredential(cmdutils.RememberPolicyAlways, "host1") {
-		t.Errorf("always policy should return true")
+	if v, err := cmdutils.ShouldRememberCredential(cmdutils.RememberPolicyAlways, "host1"); err != nil || !v.Allowed() {
+		t.Errorf("always policy = (%v, %v), want (Allow, nil)", v, err)
 	}
-	if cmdutils.ShouldRememberCredential(cmdutils.RememberPolicyNever, "host1") {
-		t.Errorf("never policy should return false")
+	if v, err := cmdutils.ShouldRememberCredential(cmdutils.RememberPolicyNever, "host1"); err != nil || v.Allowed() {
+		t.Errorf("never policy = (%v, %v), want (Deny, nil)", v, err)
 	}
 	// Empty flags inherit configuration; without configuration they remain ask.
 	if got := cmdutils.EffectiveRememberPolicy("", nil); got != "ask" {
 		t.Fatalf("default policy = %q", got)
 	}
-
 }

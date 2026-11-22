@@ -524,8 +524,8 @@ func verifyPass6M6ProxyCommandCheckUsesMasterNodeID(
 	defer func() { _ = client.Close() }()
 
 	checkOpts := NewSshOptions()
-	if !checkOpts.hasActiveProxyCommandInPath(repo, "web-01", connector) {
-		t.Fatal("expected hasActiveProxyCommandInPath to detect ProxyCommand via connector.MasterNodeID(m)")
+	if hasProxy, err := checkOpts.hasActiveProxyCommandInPath(repo, "web-01", connector); err != nil || !hasProxy {
+		t.Fatalf("expected hasActiveProxyCommandInPath to detect ProxyCommand via connector.MasterNodeID(m), got (%v, %v)", hasProxy, err)
 	}
 }
 
@@ -847,7 +847,7 @@ func verifyPass6M6SavedJumpChainAndRace(
 					return
 				}
 				opts := NewSshOptions()
-				_ = opts.hasActiveProxyCommandInPath(savedRepo, "target-01", connector)
+				_, _ = opts.hasActiveProxyCommandInPath(savedRepo, "target-01", connector)
 				_ = savedRepo.WithPendingNode(ctx, config.EnsureNodeOptions{
 					Target: config.ConnectionTarget{
 						Selector: "app-alias",

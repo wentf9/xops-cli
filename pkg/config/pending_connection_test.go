@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
 
@@ -613,6 +615,137 @@ func assertStagedUpdatePersistsOnConfirm(t *testing.T, repo *Repository, store S
 	if persisted.ProxyJump != "bastion" || len(persisted.Alias) != 1 || persisted.Alias[0] != "confirmed-web" {
 		t.Fatalf("persisted node = %+v, want ProxyJump=bastion Alias=[confirmed-web]", persisted)
 	}
+}
+
+// TestWithPendingNode_EFG_M1_SharedIdentityRefForkPreservesAuthVersionOnConfirm
+// verifies EFG-M1: when two saved nodes share an IdentityRef and a staged
+// update mutates auth (e.g. --remember=always -i <key>), prepareExistingNodeLocked
+// captures the forked IdentityRef from detachSharedNodeRefs so AuthVersion
+// before Confirm matches AuthVersion after Confirm and subsequent
+// UpdateAuthAtVersionContext (flushDeferredAuth) does not hit ErrConfigConflict.
+func newSharedIdentityRefTestRepo(t *testing.T) (*Repository, Store) {
+	t.Helper()
+	dir := t.TempDir()
+	store := NewDefaultStore(filepath.Join(dir, "config.yaml"), filepath.Join(dir, "config.key"))
+	baseCfg := cloneConfiguration(nil)
+	baseCfg.SchemaVersion = 2
+	baseCfg.Credential = &CredentialConfig{
+		DefaultStore:     "test-store",
+		RememberPrompted: "always",
+		Stores: map[string]StoreConfig{
+			"test-store": {
+				Type:   StoreTypeEncryptedFile,
+				Path:   filepath.Join(dir, "vault"),
+				Unlock: "prompt",
+			},
+		},
+	}
+	if err := store.Save(baseCfg); err != nil {
+		t.Fatalf("store.Save: %v", err)
+	}
+	repo, err := NewRepositoryWithoutOpenSSH(baseCfg, store)
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH: %v", err)
+	}
+	sharedIdentity := models.Identity{User: "ops", AuthType: "auto"}
+	for _, n := range []struct {
+		id, hRef, addr string
+	}{
+		{"node-a", "h-a", "10.0.0.11"},
+		{"node-b", "h-b", "10.0.0.12"},
+	} {
+		if _, err := repo.CreateNodeContext(t.Context(), n.id,
+			models.Node{HostRef: n.hRef, IdentityRef: "id-shared"},
+			models.Host{Address: n.addr, Port: 22},
+			sharedIdentity,
+		); err != nil {
+			t.Fatalf("CreateNodeContext(%s): %v", n.id, err)
+		}
+	}
+	return repo, store
+}
+
+func assertEFGM1PersistedState(t *testing.T, store Store, stagedIdentityRef, keyPath string, passRef *credential.Ref) {
+	t.Helper()
+	disk, err := store.Load()
+	if err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	nodeA, _ := disk.Nodes.Get("node-a")
+	nodeB, _ := disk.Nodes.Get("node-b")
+	if nodeA.IdentityRef != stagedIdentityRef || nodeA.IdentityRef == "id-shared" {
+		t.Fatalf("persisted node-a IdentityRef = %q, want private forked ref %q", nodeA.IdentityRef, stagedIdentityRef)
+	}
+	identA, ok := disk.Identities.Get(nodeA.IdentityRef)
+	if !ok || identA.KeyPath != keyPath || identA.PassphraseRef == nil || identA.PassphraseRef.ItemID != passRef.ItemID {
+		t.Fatalf("persisted forked identity = %+v (ok=%v), want KeyPath=%q PassphraseRef=%+v", identA, ok, keyPath, passRef)
+	}
+	if nodeB.IdentityRef != "id-shared" {
+		t.Fatalf("sibling node-b IdentityRef = %q, want untouched id-shared", nodeB.IdentityRef)
+	}
+	identB, ok := disk.Identities.Get("id-shared")
+	if !ok || identB.KeyPath != "" || identB.AuthType != "auto" || identB.PassphraseRef != nil {
+		t.Fatalf("shared identity id-shared mutated: %+v (ok=%v)", identB, ok)
+	}
+}
+
+func TestWithPendingNode_EFG_M1_SharedIdentityRefForkPreservesAuthVersionOnConfirm(t *testing.T) {
+	t.Parallel()
+
+	repo, store := newSharedIdentityRefTestRepo(t)
+	keyPath := filepath.Join(t.TempDir(), "id_ed25519")
+	passRef := &credential.Ref{StoreID: "test-store", ItemID: "passphrase-node-a"}
+	var stagedIdentityRef string
+	err := repo.WithPendingNode(t.Context(), EnsureNodeOptions{
+		Target: ConnectionTarget{Selector: "node-a"},
+		ExistingUpdate: PendingNodeUpdate{
+			Enabled:      true,
+			RememberAuth: true,
+			IdentityFile: keyPath,
+		},
+	}, func(lease PendingLease) error {
+		if lease.NodeID() != "node-a" || !repo.IsPendingNode("node-a") {
+			t.Fatalf("expected pending staged update for node-a, got id=%q pending=%v", lease.NodeID(), repo.IsPendingNode("node-a"))
+		}
+		snapBefore, resolveErr := repo.ResolveConnection("node-a")
+		if resolveErr != nil {
+			t.Fatalf("ResolveConnection(node-a) before Confirm: %v", resolveErr)
+		}
+		if snapBefore.Node.IdentityRef == "id-shared" || snapBefore.Identity.KeyPath != keyPath || snapBefore.Identity.AuthType != "key" || snapBefore.UpdateRef == nil {
+			t.Fatalf("unexpected staged snapshot before Confirm: node=%+v ident=%+v updateRef=%v", snapBefore.Node, snapBefore.Identity, snapBefore.UpdateRef)
+		}
+		stagedIdentityRef = snapBefore.Node.IdentityRef
+		authVerBefore := string(snapBefore.UpdateRef.AuthVersion[:])
+
+		if confirmErr := lease.Confirm(t.Context()); confirmErr != nil {
+			return fmt.Errorf("Confirm: %w", confirmErr)
+		}
+
+		snapAfter, afterErr := repo.ResolveConnection("node-a")
+		if afterErr != nil {
+			t.Fatalf("ResolveConnection(node-a) after Confirm: %v", afterErr)
+		}
+		if snapAfter.Node.IdentityRef != stagedIdentityRef || snapAfter.UpdateRef == nil || string(snapAfter.UpdateRef.AuthVersion[:]) != authVerBefore {
+			t.Fatalf("IdentityRef/AuthVersion changed across Confirm: before=%q after=%+v", stagedIdentityRef, snapAfter.Node)
+		}
+
+		// Simulate flushDeferredAuth applying a credential ref using authVerBefore.
+		updater := NewRepositoryConfigUpdater(repo)
+		outcome, _, applyErr := updater.ApplyCredentialRefAtVersion(
+			t.Context(),
+			credential.Target{NodeID: "node-a", Kind: credential.KindPassphrase, KeyFingerprint: "SHA256:test-efg-m1-fp"},
+			authVerBefore,
+			passRef,
+		)
+		if applyErr != nil || !outcome.Applied {
+			t.Fatalf("ApplyCredentialRefAtVersion after Confirm failed (expected no ErrConfigConflict): outcome=%+v err=%v", outcome, applyErr)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithPendingNode: %v", err)
+	}
+	assertEFGM1PersistedState(t, store, stagedIdentityRef, keyPath, passRef)
 }
 
 type blockingUpgradeStore struct {

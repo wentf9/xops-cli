@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
@@ -87,7 +88,7 @@ func newCmdExecWithOptions(o *ExecOptions) *cobra.Command {
 	o.control.RegisterCommonFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
-	registerSelectorFlag(cmd.Flags(), &o.Host, "host", "", i18n.T("flag_hosts"))
+	registerCommaSelectorFlag(cmd.Flags(), &o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
@@ -893,7 +894,7 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 
 	if o.OutDir != "" {
 		logFile := resolveTaskLogPath(o.OutDir, t)
-		f, openErr := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600) //nolint:forbidigo // append user-requested exec log output file
+		f, openErr := fsx.OpenAppendRegular(logFile, 0o600)
 		if openErr != nil {
 			return fmt.Errorf("[%s] open log file %s failed: %w", t.host, logFile, openErr)
 		}

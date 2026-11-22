@@ -321,7 +321,7 @@ const (
 - **校验逻辑**：Master 校验连入对端的 UID 必须与期望 UID（当前执行用户 UID）完全一致；若不匹配立即切断连接并记录安全审计日志，返回 `ErrUnauthorizedPeer`。
 - **客户端侧同等校验**：`DialMuxClient` / `DialMuxProxyStream` / `DialControlProxy` 在握手前调用同一个 `checkPeerUID`，在 Unix 上要求 Master 端 UID 等于本进程有效 UID（默认 `localPeerUID()`）或 `0`（root），在 Windows 上校验对端进程令牌用户 SID 与当前用户一致。否则任何本地用户在 `/tmp` 或共享目录抢先创建同名套接字，即可冒充 Master 收取受害者的命令、提权口令与传输内容。`WithExpectedPeerUID` 只能改期望的 UID，不能关闭校验：`0` 表示“期望对端是 root”，因此以 root 运行的客户端同样会拒绝普通用户预先植入的套接字（先前把 `0` 当作“跳过校验”会让 root 会话被劫持）。
 - **Windows** (`mux_rights_windows.go` + `core/winsec`)：
-  - **目录与套接字 NTFS DACL**：`bindAndLinkSocket` 先校验 `sockaddr_un` 路径长度上限，再通过 `winsec.EnsureOwnerOnlyDirectory` 对缺失的控制目录逐级创建受保护 DACL（`SE_DACL_PROTECTED`，仅授予当前用户 SID 与 `SYSTEM` `GENERIC_ALL`）；对已存在目录仅校验非 reparse point/非设备、受信任所有者与严格 owner-only DACL（拒绝任何非受信任主体的任意访问位），不通过则 fail-closed 返回 `ErrInsecureControlDir`，**不自动修改既有目录权限**。绑定套接字后再通过 `SetNamedSecurityInfo` 施加受保护 owner-only DACL 并复验作为纵深防御。
+  - **目录与套接字 NTFS DACL**：`bindAndLinkSocket` 先校验 `sockaddr_un` 路径长度上限，再经 `fsx.BindSocketSlot`（`core/fsx/fsx_windows.go`）调用 `winsec.EnsureOwnerOnlyDirectory` 对缺失的控制目录逐级创建受保护 DACL（`SE_DACL_PROTECTED`，仅授予当前用户 SID 与 `SYSTEM` `GENERIC_ALL`）；对已存在目录仅校验非 reparse point/非设备、受信任所有者与严格 owner-only DACL（拒绝任何非受信任主体的任意访问位），不通过则 fail-closed 返回 `ErrInsecureControlDir`，**不自动修改既有目录权限**。在目录锁下绑定套接字后，通过基于句柄的 `winsec.HardenSocketOwnerOnlyByHandle`（`SetSecurityInfo`）施加受保护 owner-only DACL，并通过 `winsec.VerifyOwnerOnlySocketByHandle`（`GetSecurityInfo`）复验作为纵深防御，避免基于路径的 TOCTOU 竞争。
   - **双向对端 SID 校验**：`checkPeerUID` 通过 `WSAIoctl(SIO_AF_UNIX_GETPEERPID)` 查询已连接 `AF_UNIX` 套接字的对端 PID，经 `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `OpenProcessToken` + `TokenUser` 校验其用户 SID 必须等于当前进程用户 SID；任一步骤失败均 fail-closed 返回 `ErrUnauthorizedPeer`，若 IOCTL 不支持（如早期 Windows 10）同时包装 `ErrUnsupportedMuxPlatform`（存在极窄的 PID 复用时间窗，但新进程仍须同用户才可通过校验）。除 Linux/macOS/FreeBSD/Windows 外的其余平台（`!linux && !darwin && !freebsd && !windows`）由 `mux_rights_other.go` fail-closed 拒绝。
 - **服务端默认值**：`StartMuxServer` 在 `Environment.LocalUID` 缺失或无法解析时回退到 `localPeerUID()`（Unix 下即有效 UID），绝不因宿主漏注入宿主上下文而静默关闭 Master 侧校验；显式 `LocalUID` 仍优先。`Connector` 用同一个 `expectedPeerUIDFromEnvironment` 派生客户端侧期望值，使容器等注入 UID 与有效 UID 不一致时两端仍然一致。
 
@@ -467,7 +467,7 @@ nodes:
 
 `-O` 是"对既有 Master 的查询"，不得产生任何配置副作用：
 
-- 配置通过只读 `config.Provider` 加载（`cmd/ssh_control.go:loadReadOnlyControlProvider`），结合 `cmd/ssh_option_flag.go:resolveControlSessionLookup` 解析只读连接快照，绝不走 `Repository.PrepareNodeContext` 或任何持久化写回路径；`-O check` 等查询不会因 `remember=always` 改写 `xops_config.yaml`。
+- 配置通过只读 `config.Provider` 加载（`cmd/ssh_control.go:loadReadOnlyControlProvider`），结合 `cmd/ssh_option_flag.go:resolveControlSessionLookup` 解析只读连接快照，绝不走 `Repository.WithPendingNode` 或任何持久化写回路径；`-O check` 等查询不会因 `remember=always` 改写 `xops_config.yaml`。
 - 目标解析使用 `ResolveSelector` 与只读 `ResolveTarget`，歧义（`AmbiguousNodeError`）与未找到一律返回退出码 `255`，不再静默降级为空节点。
 - `ControlPath` 令牌（`%h/%p/%r/%j/%C`）始终基于**解析后的连接目标**展开（`cmd/ssh_option_flag.go:controlSocketPath`），与 `Connector.buildTargetContext` 完全一致；即使显式传入 `-S`，也先解析节点再展开，避免用户用节点别名调用时算出与 Master 实际路径不同的套接字。
 

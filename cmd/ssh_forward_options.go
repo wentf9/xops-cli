@@ -644,16 +644,19 @@ func (o *SshOptions) subsystemAllocatePTY(stdin io.Reader) bool {
 }
 
 // hasNonEmptyRemoteCommand reports whether an effective RemoteCommand (not "none") is configured.
-func (o *SshOptions) hasNonEmptyRemoteCommand() bool {
+func (o *SshOptions) hasNonEmptyRemoteCommand() (bool, error) {
 	if o == nil || o.NoCmd || o.StdioForward != "" || o.Subsystem || o.isMuxDaemon() {
-		return false
+		return false, nil
 	}
 	eff, err := o.effectiveSessionOptions()
-	if err != nil || eff == nil {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if eff == nil {
+		return false, nil
 	}
 	rc := strings.TrimSpace(eff.RemoteCommand())
-	return rc != "" && !strings.EqualFold(rc, "none")
+	return rc != "" && !strings.EqualFold(rc, "none"), nil
 }
 
 // resolveEffectiveRemoteCommand returns the expanded RemoteCommand option when no explicit CLI command,

@@ -277,14 +277,14 @@ Host jump2
 	provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 
 	opts := NewSshOptions()
-	if !opts.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"target", nil) {
-		t.Fatalf("expected transitive ProxyJump chain target->jump1->jump2 to detect ProxyCommand")
+	if hasProxy, err := opts.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"target", nil); err != nil || !hasProxy {
+		t.Fatalf("expected transitive ProxyJump chain target->jump1->jump2 to detect ProxyCommand, got (%v, %v)", hasProxy, err)
 	}
 
 	optsCLI := NewSshOptions()
 	optsCLI.control.Options = []string{"ProxyCommand=nc %h %p"}
-	if !optsCLI.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"jump1", nil) {
-		t.Fatalf("expected CLI -o ProxyCommand to be detected by hasActiveProxyCommandInPath")
+	if hasProxy, err := optsCLI.hasActiveProxyCommandInPath(provider, config.OpenSSHNodePrefix+"jump1", nil); err != nil || !hasProxy {
+		t.Fatalf("expected CLI -o ProxyCommand to be detected by hasActiveProxyCommandInPath, got (%v, %v)", hasProxy, err)
 	}
 }
 

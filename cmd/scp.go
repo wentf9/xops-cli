@@ -89,7 +89,7 @@ func NewCmdScp() *cobra.Command {
 	o.control.RegisterAddressFamilyFlags(cmd)
 
 	// xops-enhanced flags (long-form only, no short flags to avoid OpenSSH conflicts)
-	registerSelectorFlag(cmd.Flags(), &o.Host, "host", "", i18n.T("flag_hosts"))
+	registerCommaSelectorFlag(cmd.Flags(), &o.Host, "host", "", i18n.T("flag_hosts"))
 	cmd.Flags().BoolVar(&o.PasswordStdin, "password-stdin", false, i18n.T("flag_password_stdin"))
 	cmd.Flags().BoolVar(&o.PassphraseStdin, "passphrase-stdin", false, i18n.T("flag_passphrase_stdin"))
 	cmd.Flags().StringVar(&o.OTP, "otp", "", i18n.T("flag_otp"))
@@ -226,7 +226,7 @@ func parsePath(p string) (PathInfo, error) {
 	if p == "" {
 		return PathInfo{IsRemote: false, Path: ""}, nil
 	}
-	if strings.HasPrefix(p, config.OpenSSHNodePrefix) {
+	if config.IsOpenSSHNodeID(p) {
 		return parseOpenSSHPath(p)
 	}
 	if isWindowsDrivePath(p) {
@@ -265,7 +265,7 @@ func parsePlainScpPath(p string) (PathInfo, error) {
 
 func parseOpenSSHPath(p string) (PathInfo, error) {
 	rest := p[len(config.OpenSSHNodePrefix):]
-	if rest == "" || strings.HasPrefix(rest, config.OpenSSHNodePrefix) {
+	if rest == "" || config.IsOpenSSHNodeID(rest) {
 		return PathInfo{}, fmt.Errorf("invalid openssh remote path %q", p)
 	}
 	firstColon := strings.Index(rest, ":")
@@ -365,22 +365,64 @@ func (o *ScpOptions) RunContext(ctx context.Context) (retErr error) {
 	if err != nil {
 		return err
 	}
-	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
+	return o.runWithProvider(ctx, cfg, provider)
+}
+
+type scpTransferMode uint8
+
+const (
+	scpModeBatch scpTransferMode = iota + 1
+	scpModeUpload
+	scpModeDownload
+	scpModeRemoteToRemote
+)
+
+type scpPendingTarget struct {
+	label            string
+	role             string
+	path             PathInfo
+	specificPassword string
+	ensureReq        config.EnsureNodeOptions
+}
+
+type scpTransferPlan struct {
+	mode     scpTransferMode
+	localSrc string
+	localDst string
+	targets  []scpPendingTarget
+}
+
+func (o *ScpOptions) runWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider) (retErr error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
 	}
-	connector, err := o.credentialConnector(provider, cfg)
+	if diagnostics, ok := o.diagnostics.(*scpDiagnostics); ok {
+		diagnostics.transfer(o.Source, o.Dest, "starting")
+		defer func() {
+			status := "completed"
+			if retErr != nil {
+				status = "failed"
+			}
+			diagnostics.transfer(o.Source, o.Dest, status)
+		}()
+	}
+	plan, err := o.planTransfer(ctx, provider)
 	if err != nil {
 		return err
 	}
-
-	defer func() {
-		if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
-			logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+	return o.withPendingScpTargets(ctx, provider, plan, func(leases []config.PendingLease, prepErrs []error) (innerErr error) {
+		connector, err := o.credentialConnector(provider, cfg)
+		if err != nil {
+			return err
 		}
-		joinConnectorCloseError(&retErr, connector)
-	}()
-
-	return o.runTransfer(ctx, provider, connector)
+		defer func() {
+			if handoffErr := o.handoffConnectorMasters(ctx, provider, connector); handoffErr != nil {
+				logger.DefaultLogger().Debugf("mux: master handoff failed: %v", handoffErr)
+			}
+			joinConnectorCloseError(&innerErr, connector)
+		}()
+		return o.executePlannedTransfer(ctx, provider, connector, plan, leases, prepErrs)
+	})
 }
 
 func (o *ScpOptions) currentAdapter() *adapter.SSHAdapter {
@@ -417,45 +459,149 @@ func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProv
 			diagnostics.transfer(o.Source, o.Dest, status)
 		}()
 	}
+	plan, err := o.planTransfer(ctx, provider)
+	if err != nil {
+		return err
+	}
+	return o.withPendingScpTargets(ctx, provider, plan, func(leases []config.PendingLease, prepErrs []error) error {
+		return o.executePlannedTransfer(ctx, provider, connector, plan, leases, prepErrs)
+	})
+}
+
+func (o *ScpOptions) planTransfer(ctx context.Context, provider config.ConfigProvider) (scpTransferPlan, error) {
 	// Selectors always mean upload. Paths are literal, including ':', '@' and '['.
 	if o.Host != "" || o.Tag != "" || o.HostFile != "" {
-		return o.runBatch(ctx, provider, connector)
+		return o.planBatchTransfer(ctx, provider)
 	}
 	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
-		return err
+		return scpTransferPlan{}, err
 	}
 	src, srcErr := parsePath(o.Source)
 	if srcErr != nil {
-		return fmt.Errorf("parse source path failed: %w", srcErr)
+		return scpTransferPlan{}, fmt.Errorf("parse source path failed: %w", srcErr)
 	}
 	var dst PathInfo
 	if o.Dest != "" {
 		var dstErr error
 		dst, dstErr = parsePath(o.Dest)
 		if dstErr != nil {
-			return fmt.Errorf("parse dest path failed: %w", dstErr)
+			return scpTransferPlan{}, fmt.Errorf("parse dest path failed: %w", dstErr)
 		}
 	}
-
 	if err := o.validateTransferExcludes(provider, src, dst); err != nil {
-		return err
+		return scpTransferPlan{}, err
 	}
-
-	// 2. 远程到远程
 	if src.IsRemote && dst.IsRemote {
-		return o.runRemoteToRemote(ctx, src, dst, provider, connector)
+		srcTarget, err := o.preparePendingTarget(ctx, provider, src, "", "remote source", "")
+		if err != nil {
+			return scpTransferPlan{}, err
+		}
+		dstTarget, err := o.preparePendingTarget(ctx, provider, dst, "", "remote destination", "")
+		if err != nil {
+			return scpTransferPlan{}, err
+		}
+		return scpTransferPlan{
+			mode:    scpModeRemoteToRemote,
+			targets: []scpPendingTarget{srcTarget, dstTarget},
+		}, nil
 	}
-
-	// 3. 单主机上传/下载
 	if src.IsRemote {
-		var localPath = o.Dest
-		return o.runDownload(ctx, src, localPath, provider, connector)
-	} else if dst.IsRemote {
-		var localPath = o.Source
-		return o.runUpload(ctx, localPath, dst, provider, connector)
+		srcTarget, err := o.preparePendingTarget(ctx, provider, src, "", "download source", "")
+		if err != nil {
+			return scpTransferPlan{}, err
+		}
+		return scpTransferPlan{
+			mode:     scpModeDownload,
+			localDst: o.Dest,
+			targets:  []scpPendingTarget{srcTarget},
+		}, nil
 	}
+	if dst.IsRemote {
+		dstTarget, err := o.preparePendingTarget(ctx, provider, dst, "", "upload destination", "")
+		if err != nil {
+			return scpTransferPlan{}, err
+		}
+		return scpTransferPlan{
+			mode:     scpModeUpload,
+			localSrc: o.Source,
+			targets:  []scpPendingTarget{dstTarget},
+		}, nil
+	}
+	return scpTransferPlan{}, fmt.Errorf("%s", i18n.T("scp_err_both_local"))
+}
 
-	return fmt.Errorf("%s", i18n.T("scp_err_both_local"))
+func (o *ScpOptions) preparePendingTarget(ctx context.Context, provider config.ConfigProvider, p PathInfo, specificPassword, role, label string) (scpPendingTarget, error) {
+	canonP, cErr := o.canonicalizePathInfo(ctx, provider, p)
+	if cErr != nil {
+		if role != "" {
+			return scpPendingTarget{}, fmt.Errorf("connect %s failed: %w", role, cErr)
+		}
+		return scpPendingTarget{}, cErr
+	}
+	req, err := o.buildScpEnsureOptions(provider, canonP, specificPassword)
+	if err != nil {
+		if role != "" {
+			return scpPendingTarget{}, fmt.Errorf("connect %s failed: %w", role, err)
+		}
+		return scpPendingTarget{}, err
+	}
+	return scpPendingTarget{
+		label:            label,
+		role:             role,
+		path:             canonP,
+		specificPassword: specificPassword,
+		ensureReq:        req,
+	}, nil
+}
+
+func (o *ScpOptions) withPendingScpTargets(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	plan scpTransferPlan,
+	fn func(leases []config.PendingLease, prepErrs []error) error,
+) error {
+	var step func(idx int, leases []config.PendingLease, prepErrs []error) error
+	step = func(idx int, leases []config.PendingLease, prepErrs []error) error {
+		if idx >= len(plan.targets) {
+			return fn(leases, prepErrs)
+		}
+		target := plan.targets[idx]
+		entered := false
+		prepErr := config.WithPendingNode(ctx, provider, target.ensureReq, func(lease config.PendingLease) error {
+			entered = true
+			return step(idx+1, append(leases, lease), prepErrs)
+		})
+		if entered {
+			return prepErr
+		}
+		if plan.mode == scpModeBatch {
+			return step(idx+1, append(leases, nil), append(prepErrs, fmt.Errorf("[%s] connect failed: %w", target.label, prepErr)))
+		}
+		return fmt.Errorf("connect %s failed: %w", target.role, prepErr)
+	}
+	return step(0, make([]config.PendingLease, 0, len(plan.targets)), nil)
+}
+
+func (o *ScpOptions) executePlannedTransfer(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	connector *ssh.Connector,
+	plan scpTransferPlan,
+	leases []config.PendingLease,
+	prepErrs []error,
+) error {
+	switch plan.mode {
+	case scpModeBatch:
+		return o.executeBatchPlan(ctx, provider, connector, plan.targets, leases, prepErrs)
+	case scpModeRemoteToRemote:
+		return o.runRemoteToRemoteWithLeases(ctx, plan.targets[0].path, plan.targets[1].path, provider, connector, leases[0], leases[1])
+	case scpModeDownload:
+		return o.runDownloadWithLease(ctx, plan.targets[0].path, plan.localDst, provider, connector, leases[0])
+	case scpModeUpload:
+		return o.runUploadWithLease(ctx, plan.localSrc, plan.targets[0].path, provider, connector, leases[0])
+	default:
+		return fmt.Errorf("%s", i18n.T("scp_err_both_local"))
+	}
 }
 
 func (o *ScpOptions) validateTransferExcludes(provider config.ConfigProvider, src, dst PathInfo) error {
@@ -482,8 +628,18 @@ func (o *ScpOptions) validateTransferExcludes(provider config.ConfigProvider, sr
 	return nil
 }
 
-func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
-	_, sftpCli, err := o.connectSftpForPath(ctx, dst, "", provider, connector)
+func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) error {
+	target, err := o.preparePendingTarget(ctx, provider, dst, "", "upload destination", "")
+	if err != nil {
+		return err
+	}
+	return config.WithPendingNode(ctx, provider, target.ensureReq, func(lease config.PendingLease) error {
+		return o.runUploadWithLease(ctx, localPath, target.path, provider, connector, lease)
+	})
+}
+
+func (o *ScpOptions) runUploadWithLease(ctx context.Context, localPath string, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector, lease config.PendingLease) (err error) {
+	_, sftpCli, err := o.connectSftpWithLease(ctx, provider, connector, lease)
 	if err != nil {
 		return fmt.Errorf("connect upload destination failed: %w", err)
 	}
@@ -553,8 +709,18 @@ func (o *ScpOptions) runUpload(ctx context.Context, localPath string, dst PathIn
 	return errors.Join(uploadErr, finishProgress())
 }
 
-func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
-	_, sftpCli, err := o.connectSftpForPath(ctx, src, "", provider, connector)
+func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector) error {
+	target, err := o.preparePendingTarget(ctx, provider, src, "", "download source", "")
+	if err != nil {
+		return err
+	}
+	return config.WithPendingNode(ctx, provider, target.ensureReq, func(lease config.PendingLease) error {
+		return o.runDownloadWithLease(ctx, target.path, localPath, provider, connector, lease)
+	})
+}
+
+func (o *ScpOptions) runDownloadWithLease(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector, lease config.PendingLease) (err error) {
+	_, sftpCli, err := o.connectSftpWithLease(ctx, provider, connector, lease)
 	if err != nil {
 		return fmt.Errorf("connect download source failed: %w", err)
 	}
@@ -608,15 +774,31 @@ func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath st
 	})
 }
 
+func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) error {
+	srcTarget, err := o.preparePendingTarget(ctx, provider, src, "", "remote source", "")
+	if err != nil {
+		return err
+	}
+	dstTarget, err := o.preparePendingTarget(ctx, provider, dst, "", "remote destination", "")
+	if err != nil {
+		return err
+	}
+	return config.WithPendingNode(ctx, provider, srcTarget.ensureReq, func(srcLease config.PendingLease) error {
+		return config.WithPendingNode(ctx, provider, dstTarget.ensureReq, func(dstLease config.PendingLease) error {
+			return o.runRemoteToRemoteWithLeases(ctx, srcTarget.path, dstTarget.path, provider, connector, srcLease, dstLease)
+		})
+	})
+}
+
 //nolint:gocyclo
-func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) (retErr error) {
-	_, srcSftp, err := o.connectSftpForPath(ctx, src, "", provider, connector)
+func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector, srcLease, dstLease config.PendingLease) (retErr error) {
+	_, srcSftp, err := o.connectSftpWithLease(ctx, provider, connector, srcLease)
 	if err != nil {
 		return fmt.Errorf("connect remote source failed: %w", err)
 	}
 	defer joinCloseError(&retErr, "source SFTP client", srcSftp.Close)
 
-	_, dstSftp, err := o.connectSftpForPath(ctx, dst, "", provider, connector)
+	_, dstSftp, err := o.connectSftpWithLease(ctx, provider, connector, dstLease)
 	if err != nil {
 		return fmt.Errorf("connect remote destination failed: %w", err)
 	}
@@ -898,22 +1080,58 @@ func taggedNodePathInfo(nodeID string) PathInfo {
 }
 
 func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector) error {
-	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
+	plan, err := o.planBatchTransfer(ctx, provider)
+	if err != nil {
 		return err
+	}
+	return o.withPendingScpTargets(ctx, provider, plan, func(leases []config.PendingLease, prepErrs []error) error {
+		return o.executeBatchPlan(ctx, provider, connector, plan.targets, leases, prepErrs)
+	})
+}
+
+func (o *ScpOptions) planBatchTransfer(ctx context.Context, provider config.ConfigProvider) (scpTransferPlan, error) {
+	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
+		return scpTransferPlan{}, err
 	}
 	// 解析 --exclude 排除规则（在 Worker Pool 启动前完成，确保无歧义）
 	var excludes map[string]struct{}
 	if o.hasExcludeFlags() {
 		resolved, err := o.resolveExcludes(provider)
 		if err != nil {
-			return fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
+			return scpTransferPlan{}, fmt.Errorf("%s: %w", i18n.T("scp_err_exclude"), err)
 		}
 		excludes = resolved
 	}
 
 	if o.TaskCount < 0 || o.TaskCount > maxBatchTaskCount {
-		return fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
+		return scpTransferPlan{}, fmt.Errorf("invalid --task value %d: must be between 1 and %d", o.TaskCount, maxBatchTaskCount)
 	}
+	var (
+		targets []scpPendingTarget
+		err     error
+	)
+	if o.Tag != "" {
+		targets, err = o.planBatchTaggedTargets(ctx, provider, excludes)
+	} else {
+		targets, err = o.planBatchHostTargets(ctx, provider, excludes)
+	}
+	if err != nil {
+		return scpTransferPlan{}, err
+	}
+	return scpTransferPlan{
+		mode:    scpModeBatch,
+		targets: targets,
+	}, nil
+}
+
+func (o *ScpOptions) executeBatchPlan(
+	ctx context.Context,
+	provider config.ConfigProvider,
+	connector *ssh.Connector,
+	targets []scpPendingTarget,
+	leases []config.PendingLease,
+	prepErrs []error,
+) error {
 	var (
 		errMu        sync.Mutex
 		transferErrs []error
@@ -924,52 +1142,51 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 		transferErrs = append(transferErrs, fmt.Errorf("[%s] %w", label, err))
 		errMu.Unlock()
 	}
-
-	var prepErr error
-	if o.Tag != "" {
-		prepErr = o.runBatchTagged(ctx, provider, connector, excludes, wp, recordTransferErr)
-	} else {
-		prepErr = o.runBatchHosts(ctx, provider, connector, excludes, wp, recordTransferErr)
+	for i, target := range targets {
+		lease := leases[i]
+		if lease == nil {
+			continue
+		}
+		t := target
+		wp.Execute(func() {
+			if tErr := o.executeTransferWithLease(ctx, t.label, provider, connector, lease); tErr != nil {
+				recordTransferErr(t.label, tErr)
+			}
+		})
 	}
-
 	wp.Wait()
-	if prepErr != nil {
-		return errors.Join(prepErr, errors.Join(transferErrs...))
-	}
-	return errors.Join(transferErrs...)
+	allErrs := append(prepErrs, transferErrs...)
+	return errors.Join(allErrs...)
 }
 
-func (o *ScpOptions) runBatchTagged(
+func (o *ScpOptions) planBatchTaggedTargets(
 	ctx context.Context,
 	provider config.ConfigProvider,
-	connector *ssh.Connector,
 	excludes map[string]struct{},
-	wp pkgutils.WorkerPool,
-	recordErr func(string, error),
-) error {
+) ([]scpPendingTarget, error) {
 	nodes := provider.GetNodesByTag(o.Tag)
 	if len(nodes) == 0 {
-		return fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
+		return nil, fmt.Errorf("%s", i18n.Tf("err_tag_empty", map[string]any{"Tag": o.Tag}))
 	}
+	targets := make([]scpPendingTarget, 0, len(nodes))
 	for _, nodeID := range slices.Sorted(maps.Keys(nodes)) {
 		addr := taggedNodePathInfo(nodeID)
 		canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
 		if canonErr != nil {
-			return fmt.Errorf("canonicalize tagged host %q: %w", nodeID, canonErr)
+			return nil, fmt.Errorf("canonicalize tagged host %q: %w", nodeID, canonErr)
 		}
 		if excludes != nil {
 			excluded, exclErr := o.isBatchHostExcluded(provider, excludes, nodeID, canonAddr)
 			if exclErr != nil {
-				return exclErr
+				return nil, exclErr
 			}
 			if excluded {
 				continue
 			}
 		}
-		nid := nodeID // capture
-		_, _, identity, resolveErr := provider.Resolve(nid)
+		_, _, identity, resolveErr := provider.Resolve(nodeID)
 		if resolveErr != nil {
-			return fmt.Errorf("resolve tagged scp node %q failed: %w", nid, resolveErr)
+			return nil, fmt.Errorf("resolve tagged scp node %q failed: %w", nodeID, resolveErr)
 		}
 		specificPass := ""
 		if o.Password != "" {
@@ -977,29 +1194,31 @@ func (o *ScpOptions) runBatchTagged(
 		} else if o.User == "" || strings.TrimSpace(o.User) == identity.User {
 			specificPass = identity.Password
 		}
-		wp.Execute(func() {
-			if tErr := o.executeTransfer(ctx, nid, canonAddr, specificPass, provider, connector); tErr != nil {
-				recordErr(nid, tErr)
-			}
+		req, reqErr := o.buildScpEnsureOptions(provider, canonAddr, specificPass)
+		if reqErr != nil {
+			return nil, fmt.Errorf("prepare tagged scp node %q failed: %w", nodeID, reqErr)
+		}
+		targets = append(targets, scpPendingTarget{
+			label:            nodeID,
+			path:             canonAddr,
+			specificPassword: specificPass,
+			ensureReq:        req,
 		})
 	}
-	return nil
+	return targets, nil
 }
 
-func (o *ScpOptions) runBatchHosts(
+func (o *ScpOptions) planBatchHostTargets(
 	ctx context.Context,
 	provider config.ConfigProvider,
-	connector *ssh.Connector,
 	excludes map[string]struct{},
-	wp pkgutils.WorkerPool,
-	recordErr func(string, error),
-) error {
+) ([]scpPendingTarget, error) {
 	hosts, err := cmdutils.ParseHosts(o.Host, o.HostFile, "")
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// 处理 普通主机列表
+	targets := make([]scpPendingTarget, 0, len(hosts))
 	for _, h := range hosts {
 		h.User, _, h.Port, _ = o.resolveUserAndPort(PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true})
 		if h.Password == "" {
@@ -1008,27 +1227,30 @@ func (o *ScpOptions) runBatchHosts(
 		addr := PathInfo{Host: h.Host, User: h.User, Port: h.Port, IsRemote: true}
 		canonAddr, canonErr := o.canonicalizePathInfo(ctx, provider, addr)
 		if canonErr != nil {
-			return fmt.Errorf("canonicalize host %q: %w", h.Host, canonErr)
+			return nil, fmt.Errorf("canonicalize host %q: %w", h.Host, canonErr)
 		}
 		// 若主机已映射到已知节点且在排除集合中，则跳过
 		if excludes != nil {
 			excluded, exclErr := o.isBatchHostExcluded(provider, excludes, h.Host, canonAddr)
 			if exclErr != nil {
-				return exclErr
+				return nil, exclErr
 			}
 			if excluded {
 				continue
 			}
 		}
-
-		hostItem := h
-		wp.Execute(func() {
-			if tErr := o.executeTransfer(ctx, hostItem.Host, canonAddr, hostItem.Password, provider, connector); tErr != nil {
-				recordErr(hostItem.Host, tErr)
-			}
+		req, reqErr := o.buildScpEnsureOptions(provider, canonAddr, h.Password)
+		if reqErr != nil {
+			return nil, fmt.Errorf("[%s] connect failed: %w", h.Host, reqErr)
+		}
+		targets = append(targets, scpPendingTarget{
+			label:            h.Host,
+			path:             canonAddr,
+			specificPassword: h.Password,
+			ensureReq:        req,
 		})
 	}
-	return nil
+	return targets, nil
 }
 
 func (o *ScpOptions) isBatchHostExcluded(provider config.ConfigProvider, excludes map[string]struct{}, rawHost string, canonAddr PathInfo) (bool, error) {
@@ -1127,8 +1349,18 @@ func (o *ScpOptions) excludeTargetInfoForPath(provider config.ConfigProvider, ra
 	return cmdutils.BuildExcludeTargetInfo(in), nil
 }
 
-func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (err error) {
-	_, sftpCli, err := o.connectSftpForPath(ctx, addr, specificPassword, provider, connector)
+func (o *ScpOptions) executeTransfer(ctx context.Context, label string, addr PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) error {
+	target, err := o.preparePendingTarget(ctx, provider, addr, specificPassword, "", label)
+	if err != nil {
+		return fmt.Errorf("connect failed: %w", err)
+	}
+	return config.WithPendingNode(ctx, provider, target.ensureReq, func(lease config.PendingLease) error {
+		return o.executeTransferWithLease(ctx, label, provider, connector, lease)
+	})
+}
+
+func (o *ScpOptions) executeTransferWithLease(ctx context.Context, label string, provider config.ConfigProvider, connector *ssh.Connector, lease config.PendingLease) (err error) {
+	_, sftpCli, err := o.connectSftpWithLease(ctx, provider, connector, lease)
 	if err != nil {
 		return fmt.Errorf("connect failed: %w", err)
 	}
@@ -1284,7 +1516,7 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 	if p.Host == "" {
 		return p, nil
 	}
-	if strings.HasPrefix(p.Host, config.OpenSSHNodePrefix) {
+	if config.IsOpenSSHNodeID(p.Host) {
 		if stripped, ok := config.OpenSSHOriginalHost(p.Host); ok && p.OriginalHost == "" {
 			p.OriginalHost = stripped
 		}
@@ -1338,6 +1570,33 @@ func (o *ScpOptions) canonicalizePathInfo(ctx context.Context, provider config.C
 	return p, nil
 }
 
+func (o *ScpOptions) connectSftpWithLease(ctx context.Context, provider config.ConfigProvider, connector *ssh.Connector, lease config.PendingLease) (string, *sftp.Client, error) {
+	if lease == nil {
+		return "", nil, fmt.Errorf("pending lease is nil")
+	}
+	nodeID := lease.NodeID()
+	client, connErr := connector.Connect(ctx, nodeID)
+	if connErr != nil {
+		return "", nil, connErr
+	}
+	if finalizeErr := o.finalizeScpPendingConnection(ctx, provider, lease, client); finalizeErr != nil {
+		_ = connector.EvictClient(client)
+		return "", nil, finalizeErr
+	}
+	cli, sftpErr := sftp.NewClient(
+		ctx,
+		client,
+		sftp.WithDiagnostics(o.diagnostics),
+		sftp.WithThreadsPerFile(o.ThreadCount),
+		sftp.WithForce(o.Force),
+		sftp.WithSudo(o.Sudo),
+	)
+	if sftpErr != nil {
+		return "", nil, sftpErr
+	}
+	return nodeID, cli, nil
+}
+
 func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specificPassword string, provider config.ConfigProvider, connector *ssh.Connector) (string, *sftp.Client, error) {
 	var cErr error
 	p, cErr = o.canonicalizePathInfo(ctx, provider, p)
@@ -1353,29 +1612,9 @@ func (o *ScpOptions) connectSftpForPath(ctx context.Context, p PathInfo, specifi
 		sftpCli        *sftp.Client
 	)
 	err = config.WithPendingNode(ctx, provider, req, func(lease config.PendingLease) error {
-		nodeID := lease.NodeID()
-		client, connErr := connector.Connect(ctx, nodeID)
-		if connErr != nil {
-			return connErr
-		}
-		if finalizeErr := o.finalizeScpPendingConnection(ctx, provider, lease, client); finalizeErr != nil {
-			_ = connector.EvictClient(client)
-			return finalizeErr
-		}
-		cli, sftpErr := sftp.NewClient(
-			ctx,
-			client,
-			sftp.WithDiagnostics(o.diagnostics),
-			sftp.WithThreadsPerFile(o.ThreadCount),
-			sftp.WithForce(o.Force),
-			sftp.WithSudo(o.Sudo),
-		)
-		if sftpErr != nil {
-			return sftpErr
-		}
-		resolvedNodeID = nodeID
-		sftpCli = cli
-		return nil
+		var connErr error
+		resolvedNodeID, sftpCli, connErr = o.connectSftpWithLease(ctx, provider, connector, lease)
+		return connErr
 	})
 	if err != nil {
 		return "", nil, err
@@ -1465,6 +1704,7 @@ func (o *ScpOptions) buildScpEnsureOptions(provider config.ConfigProvider, path 
 		ExistingUpdate: config.PendingNodeUpdate{
 			Enabled:      !suppressConfirm,
 			JumpHost:     o.JumpHost,
+			Alias:        o.Alias,
 			RememberAuth: shouldRemember,
 			HasPassword:  hasPassword,
 			IdentityFile: o.IdentityFile,

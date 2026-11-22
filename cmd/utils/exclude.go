@@ -893,6 +893,7 @@ func matchesUserPortFilter(cand ExcludeTargetInfo, wantUser string, wantPort uin
 	return true
 }
 
+//nolint:secpred // pure composite user@host:port syntax check via ParseAddr
 func hasCompositeExcludeAddr(nodeID string) bool {
 	unwrapped := strings.TrimPrefix(strings.TrimSpace(nodeID), config.OpenSSHNodePrefix)
 	u, _, p, err := ParseAddr(unwrapped)

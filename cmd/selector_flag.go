@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/csv"
 	"fmt"
 	"strings"
 
@@ -105,15 +106,34 @@ func registerSelectorSliceFlag(flags *pflag.FlagSet, target *[]string, name, usa
 func (f *selectorSliceFlag) String() string { return f.innerVal.String() }
 func (f *selectorSliceFlag) Type() string   { return f.innerVal.Type() }
 
+func validateSelectorSliceCSV(flagName, val string) error {
+	if strings.TrimSpace(val) == "" {
+		return fmt.Errorf("flag --%s must not be empty", flagName)
+	}
+	records, err := csv.NewReader(strings.NewReader(val)).Read()
+	if err != nil {
+		return fmt.Errorf("invalid --%s %q: %w", flagName, val, err)
+	}
+	if len(records) == 0 {
+		return fmt.Errorf("flag --%s must not be empty", flagName)
+	}
+	for _, item := range records {
+		if strings.TrimSpace(item) == "" {
+			return fmt.Errorf("invalid --%s %q: empty target segment", flagName, val)
+		}
+	}
+	return nil
+}
+
 func (f *selectorSliceFlag) Set(val string) error {
-	if err := validateSelectorValue(f.flagName, val, true); err != nil {
+	if err := validateSelectorSliceCSV(f.flagName, val); err != nil {
 		return err
 	}
 	return f.innerVal.Set(val)
 }
 
 func (f *selectorSliceFlag) Append(val string) error {
-	if err := validateSelectorValue(f.flagName, val, true); err != nil {
+	if err := validateSelectorSliceCSV(f.flagName, val); err != nil {
 		return err
 	}
 	return f.innerSlc.Append(val)
@@ -124,7 +144,7 @@ func (f *selectorSliceFlag) Replace(vals []string) error {
 		return fmt.Errorf("flag --%s must not be empty", f.flagName)
 	}
 	for _, val := range vals {
-		if err := validateSelectorValue(f.flagName, val, true); err != nil {
+		if err := validateSelectorSliceCSV(f.flagName, val); err != nil {
 			return err
 		}
 	}

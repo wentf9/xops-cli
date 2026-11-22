@@ -274,13 +274,32 @@ func (r *Repository) prepareExistingNodeLocked(decision targetDecision, opts Ens
 	}
 	// Validate the staged update against the full configuration graph (including
 	// ProxyJump cycle detection and strict alias rules) before dialing, without
-	// writing anything to disk until Confirm succeeds.
-	if _, _, _, err := prepareConfiguration(snap, func(cfg *Configuration) error {
-		return replaceNodeAtRef(cfg, baseRef, id, node, host, identity)
-	}); err != nil {
+	// writing anything to disk until Confirm succeeds. Capture the exact staged
+	// (node, host, identity) produced by replaceNodeAtRef so any forked
+	// IdentityRef/HostRef from detachSharedNodeRefs is reflected consistently in
+	// pending.provider and AuthVersion computation before and after Confirm.
+	stagedNode := cloneNode(node)
+	stagedNode.OpenSSHAlias = ""
+	stagedNode.CanonicalHost = ""
+	stagedCfg, _, _, err := prepareConfiguration(snap, func(cfg *Configuration) error {
+		return replaceNodeAtRef(cfg, baseRef, id, stagedNode, host, identity)
+	})
+	if err != nil {
 		return EnsureNodeResult{}, nil, fmt.Errorf("validate staged update for node %q: %w", id, err)
 	}
-	entry, err := r.registerPendingUpdateLocked(id, baseRef, node, host, identity, decision.OpenSSHAlias, decision.CanonicalHost)
+	stagedNode, ok := stagedCfg.Nodes.Get(id)
+	if !ok {
+		return EnsureNodeResult{}, nil, fmt.Errorf("resolve staged node %q: %w", id, ErrNodeNotFound)
+	}
+	stagedHost, ok := stagedCfg.Hosts.Get(stagedNode.HostRef)
+	if !ok {
+		return EnsureNodeResult{}, nil, fmt.Errorf("resolve staged host %q for node %q: %w", stagedNode.HostRef, id, ErrHostNotFound)
+	}
+	stagedIdentity, ok := stagedCfg.Identities.Get(stagedNode.IdentityRef)
+	if !ok {
+		return EnsureNodeResult{}, nil, fmt.Errorf("resolve staged identity %q for node %q: %w", stagedNode.IdentityRef, id, ErrIdentityNotFound)
+	}
+	entry, err := r.registerPendingUpdateLocked(id, baseRef, stagedNode, stagedHost, stagedIdentity, decision.OpenSSHAlias, decision.CanonicalHost)
 	if err != nil {
 		return EnsureNodeResult{}, nil, err
 	}
