@@ -202,6 +202,27 @@ func (o *ScpOptions) Validate() error {
 	if o.Dest == "" {
 		return fmt.Errorf("%s", i18n.T("scp_err_no_dest"))
 	}
+	return o.validateAliasUsage()
+}
+
+func (o *ScpOptions) validateAliasUsage() error {
+	if o == nil || o.Alias == "" {
+		return nil
+	}
+	if o.isBatchMode() {
+		return fmt.Errorf("--alias %q cannot be used with batch selectors (--host, --tag, --ifile)", o.Alias)
+	}
+	src, srcErr := parsePath(o.Source)
+	if srcErr != nil {
+		return fmt.Errorf("parse source path failed: %w", srcErr)
+	}
+	dst, dstErr := parsePath(o.Dest)
+	if dstErr != nil {
+		return fmt.Errorf("parse dest path failed: %w", dstErr)
+	}
+	if src.IsRemote && dst.IsRemote {
+		return fmt.Errorf("--alias %q cannot be used with remote-to-remote scp transfers", o.Alias)
+	}
 	return nil
 }
 
@@ -469,6 +490,9 @@ func (o *ScpOptions) runTransfer(ctx context.Context, provider config.ConfigProv
 }
 
 func (o *ScpOptions) planTransfer(ctx context.Context, provider config.ConfigProvider) (scpTransferPlan, error) {
+	if err := o.validateAliasUsage(); err != nil {
+		return scpTransferPlan{}, err
+	}
 	// Selectors always mean upload. Paths are literal, including ':', '@' and '['.
 	if o.Host != "" || o.Tag != "" || o.HostFile != "" {
 		return o.planBatchTransfer(ctx, provider)
@@ -775,6 +799,9 @@ func (o *ScpOptions) runDownloadWithLease(ctx context.Context, src PathInfo, loc
 }
 
 func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector) error {
+	if o.Alias != "" {
+		return fmt.Errorf("--alias %q cannot be used with remote-to-remote scp transfers", o.Alias)
+	}
 	srcTarget, err := o.preparePendingTarget(ctx, provider, src, "", "remote source", "")
 	if err != nil {
 		return err
@@ -790,7 +817,6 @@ func (o *ScpOptions) runRemoteToRemote(ctx context.Context, src, dst PathInfo, p
 	})
 }
 
-//nolint:gocyclo
 func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst PathInfo, provider config.ConfigProvider, connector *ssh.Connector, srcLease, dstLease config.PendingLease) (retErr error) {
 	_, srcSftp, err := o.connectSftpWithLease(ctx, provider, connector, srcLease)
 	if err != nil {
@@ -821,33 +847,6 @@ func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst P
 		return err
 	}
 
-	// The cancellation watcher closes srcSftp/dstSftp when the caller's ctx
-	// is cancelled, unblocking any in-flight SFTP operations on those clients.
-	// Correct defer LIFO order: register Wait FIRST so it executes LAST, then
-	// register cancelCtx so it executes FIRST and unblocks the goroutine
-	// before we wait for it. Reversing this order causes a guaranteed deadlock
-	// on normal return.
-	var cancelWg sync.WaitGroup
-	cancelWg.Add(1)
-	stopCtx, cancelCtx := context.WithCancel(context.WithoutCancel(ctx))
-	defer cancelWg.Wait() // executes second (LIFO): waits after goroutine is signalled
-	defer cancelCtx()     // executes first (LIFO): signals goroutine to exit
-	go func() {
-		defer cancelWg.Done()
-		select {
-		case <-stopCtx.Done():
-			// normal return path: cancelCtx() was called, goroutine exits cleanly
-		case <-ctx.Done():
-			// cancellation path: close both clients to unblock in-flight ops
-			if closeErr := srcSftp.Close(); closeErr != nil {
-				logger.DefaultLogger().Debugf("async cancel source SFTP client failed: %v", closeErr)
-			}
-			if closeErr := dstSftp.Close(); closeErr != nil {
-				logger.DefaultLogger().Debugf("async cancel destination SFTP client failed: %v", closeErr)
-			}
-		}
-	}()
-
 	var preStat os.FileInfo
 	if err = srcSftp.Do(ctx, func(c *pkgsftp.Client) error {
 		var statErr error
@@ -860,31 +859,12 @@ func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst P
 		return fmt.Errorf("remote-to-remote directory transfer is not supported for %q: download locally and upload instead", srcRemote.String())
 	}
 
-	var srcFile *pkgsftp.File
-	err = srcSftp.Do(ctx, func(c *pkgsftp.Client) error {
-		var err error
-		srcFile, err = c.Open(srcRemote.String())
-		return err
-	})
-	if err != nil {
-		return fmt.Errorf("open remote source %q failed: %w", srcRemote.String(), err)
-	}
-	defer joinCloseError(&retErr, "remote source file", srcFile.Close)
-
-	srcStat, err := srcFile.Stat()
-	if err != nil {
-		return fmt.Errorf("stat remote source %q failed: %w", srcRemote.String(), err)
-	}
-	if srcStat.IsDir() {
-		return fmt.Errorf("remote-to-remote directory transfer is not supported for %q: download locally and upload instead", srcRemote.String())
-	}
-
 	dstPath := dstRemote.String()
 	var dstStat os.FileInfo
 	err = dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
-		var err error
-		dstStat, err = c.Stat(dstPath)
-		return err
+		var statErr error
+		dstStat, statErr = c.Stat(dstPath)
+		return statErr
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat destination failed: %w", err)
@@ -894,12 +874,12 @@ func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst P
 		if !srcBase.IsValid() {
 			return fmt.Errorf("unsafe remote filename %q: invalid source basename", srcRemote.String())
 		}
-		statName, nameErr := sftp.ParseRemoteName(srcStat.Name())
+		statName, nameErr := sftp.ParseRemoteName(preStat.Name())
 		if nameErr != nil {
-			return fmt.Errorf("unsafe remote filename %q: %w", srcStat.Name(), nameErr)
+			return fmt.Errorf("unsafe remote filename %q: %w", preStat.Name(), nameErr)
 		}
 		if !statName.Equal(srcBase) {
-			return fmt.Errorf("unsafe remote filename %q: stat name does not match source basename %q", srcStat.Name(), srcBase.String())
+			return fmt.Errorf("unsafe remote filename %q: stat name does not match source basename %q", preStat.Name(), srcBase.String())
 		}
 		dstRemote = dstRemote.Join(srcBase)
 		dstPath = dstRemote.String()
@@ -915,58 +895,14 @@ func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst P
 		return nil
 	}
 
-	// 2. 使用临时文件进行传输
-	tempPath := dstPath + dstSftp.Config().TempSuffix
-	startOffset, dstFile, err := o.prepareRemoteToRemoteFile(ctx, dstSftp, tempPath, srcStat.Size())
-	if err != nil {
-		return err
-	}
-
-	if startOffset > 0 && dstFile != nil {
-		if valErr := o.validateRemoteRelayResumePrefix(ctx, srcFile, dstFile, startOffset); valErr != nil {
-			if !errors.Is(valErr, errPrefixMismatch) {
-				if closeErr := dstFile.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) && !errors.Is(closeErr, io.EOF) {
-					return errors.Join(valErr, fmt.Errorf("close file failed: %w", closeErr))
-				}
-				return valErr
-			}
-			startOffset = 0
-			if _, seekErr := dstFile.Seek(0, 0); seekErr != nil {
-				if closeErr := dstFile.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) && !errors.Is(closeErr, io.EOF) {
-					return errors.Join(fmt.Errorf("seek failed after mismatch: %w", seekErr), fmt.Errorf("close file failed: %w", closeErr))
-				}
-				return fmt.Errorf("seek failed after mismatch: %w", seekErr)
-			}
-			if truncErr := dstFile.Truncate(0); truncErr != nil {
-				if closeErr := dstFile.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) && !errors.Is(closeErr, io.EOF) {
-					return errors.Join(fmt.Errorf("truncate failed after mismatch: %w", truncErr), fmt.Errorf("close file failed: %w", closeErr))
-				}
-				return fmt.Errorf("truncate failed after mismatch: %w", truncErr)
-			}
-		}
-	}
-
-	progress, finishProgress := o.createTransferProgress(ctx, srcStat.Size(), "Relaying "+sftp.DisplayRemoteName(srcRemote), startOffset)
+	progress, finishProgress := o.createTransferProgress(ctx, preStat.Size(), "Relaying "+sftp.DisplayRemoteName(srcRemote), 0)
 	defer func() {
 		if pErr := finishProgress(); pErr != nil {
 			retErr = errors.Join(retErr, pErr)
 		}
 	}()
 
-	if err := o.doRemoteToRemote(ctx, srcSftp, srcFile, dstFile, startOffset, srcStat.Size(), dstSftp, progress); err != nil {
-		retErr = err
-		return retErr
-	}
-
-	// 3. 传输完成：同步修改时间并安全替换目标文件
-	if err := dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
-		return c.Chtimes(tempPath, srcStat.ModTime(), srcStat.ModTime())
-	}); err != nil {
-		retErr = fmt.Errorf("sync modtime failed: %w", err)
-		return retErr
-	}
-	retErr = dstSftp.ReplaceRemoteFile(ctx, tempPath, dstPath)
-	return retErr
+	return dstSftp.RelayFileFrom(ctx, srcSftp, srcRemote, dstRemote, preStat, progress)
 }
 
 func (o *ScpOptions) confirmRemoteToRemoteOverwrite(ctx context.Context, dstSftp *sftp.Client, dstPath string) (bool, error) {
@@ -1046,35 +982,6 @@ func (o *ScpOptions) createTransferProgress(ctx context.Context, size int64, des
 	}
 }
 
-func (o *ScpOptions) doRemoteToRemote(ctx context.Context, srcSftp *sftp.Client, srcFile *pkgsftp.File, dstFile *pkgsftp.File, startOffset, size int64, dstSftp *sftp.Client, progress sftp.ProgressCallback) (err error) {
-	if dstFile != nil {
-		defer func() {
-			if closeErr := dstFile.Close(); closeErr != nil && !errors.Is(closeErr, os.ErrClosed) && !errors.Is(closeErr, io.EOF) {
-				err = errors.Join(err, fmt.Errorf("close destination file failed: %w", closeErr))
-			}
-		}()
-	}
-	if startOffset < size {
-		if startOffset > 0 {
-			if _, seekErr := srcFile.Seek(startOffset, io.SeekStart); seekErr != nil {
-				return seekErr
-			}
-			if dstFile != nil {
-				if _, seekErr := dstFile.Seek(startOffset, io.SeekStart); seekErr != nil {
-					return seekErr
-				}
-			}
-		}
-		if dstFile != nil {
-			transferErr := dstSftp.StreamTransfer(ctx, srcSftp, srcFile, dstFile, size-startOffset, progress)
-			if transferErr != nil {
-				return transferErr
-			}
-		}
-	}
-	return nil
-}
-
 func taggedNodePathInfo(nodeID string) PathInfo {
 	return PathInfo{Host: nodeID, IsRemote: true}
 }
@@ -1090,6 +997,9 @@ func (o *ScpOptions) runBatch(ctx context.Context, provider config.ConfigProvide
 }
 
 func (o *ScpOptions) planBatchTransfer(ctx context.Context, provider config.ConfigProvider) (scpTransferPlan, error) {
+	if o.Alias != "" {
+		return scpTransferPlan{}, fmt.Errorf("--alias %q cannot be used with batch selectors (--host, --tag, --ifile)", o.Alias)
+	}
 	if err := o.canonicalizeEndpoints(ctx, provider); err != nil {
 		return scpTransferPlan{}, err
 	}
@@ -1444,40 +1354,6 @@ func joinCloseError(target *error, resource string, closeFn func() error) {
 	}
 }
 
-func (o *ScpOptions) prepareRemoteToRemoteFile(ctx context.Context, dstSftp *sftp.Client, tempPath string, srcSize int64) (int64, *pkgsftp.File, error) {
-	var startOffset int64
-	var dstFile *pkgsftp.File
-	var err error
-
-	flags := os.O_RDWR | os.O_TRUNC | os.O_CREATE
-
-	var ts os.FileInfo
-	err = dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
-		var statErr error
-		ts, statErr = c.Stat(tempPath)
-		return statErr
-	})
-	if err == nil {
-		if dstSftp.Config().EnableResume && ts.Size() <= srcSize {
-			startOffset = ts.Size()
-			flags = os.O_RDWR
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return 0, nil, fmt.Errorf("stat temp file %q failed: %w", tempPath, err)
-	}
-
-	err = dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
-		var err error
-		dstFile, err = c.OpenFile(tempPath, flags)
-		return err
-	})
-	if err != nil {
-		return 0, nil, err
-	}
-
-	return startOffset, dstFile, nil
-}
-
 func (o *ScpOptions) canonicalizeEndpoints(ctx context.Context, provider config.ConfigProvider) error {
 	if err := o.ensureGeneralOptionsApplied(); err != nil {
 		return err
@@ -1711,47 +1587,6 @@ func (o *ScpOptions) buildScpEnsureOptions(provider config.ConfigProvider, path 
 		},
 	}, nil
 }
-
-func (o *ScpOptions) validateRemoteRelayResumePrefix(ctx context.Context, srcFile, dstFile *pkgsftp.File, startOffset int64) error {
-	const chunkSize = 32 * 1024
-	buf1 := make([]byte, chunkSize)
-	buf2 := make([]byte, chunkSize)
-
-	var offset int64
-	for offset < startOffset {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		readSize := int64(chunkSize)
-		if startOffset-offset < readSize {
-			readSize = startOffset - offset
-		}
-
-		n1, err1 := srcFile.ReadAt(buf1[:readSize], offset)
-		if err1 != nil && !errors.Is(err1, io.EOF) {
-			return fmt.Errorf("read source failed at offset %d: %w", offset, err1)
-		}
-
-		n2, err2 := dstFile.ReadAt(buf2[:readSize], offset)
-		if err2 != nil && !errors.Is(err2, io.EOF) {
-			return fmt.Errorf("read destination failed at offset %d: %w", offset, err2)
-		}
-
-		if n1 != n2 || string(buf1[:n1]) != string(buf2[:n2]) {
-			return fmt.Errorf("%w at offset %d", errPrefixMismatch, offset)
-		}
-		if n1 == 0 {
-			break
-		}
-		offset += int64(n1)
-	}
-	if offset != startOffset {
-		return fmt.Errorf("%w: file shorter than expected", errPrefixMismatch)
-	}
-	return nil
-}
-
-var errPrefixMismatch = errors.New("resume prefix mismatch")
 
 func (o *ScpOptions) credentialConnector(provider config.ConfigProvider, cfg *config.Configuration) (*ssh.Connector, error) {
 	if o.interaction == nil {

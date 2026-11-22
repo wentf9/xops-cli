@@ -95,11 +95,12 @@ type clientState struct {
 }
 
 type Client struct {
-	state              *clientState
-	config             TransferConfig
-	diagnostics        corelog.DiagnosticObserver
-	diagnosticStreamID uint64
-	fileProgress       FileProgressCallback
+	state                   *clientState
+	config                  TransferConfig
+	diagnostics             corelog.DiagnosticObserver
+	diagnosticStreamID      uint64
+	fileProgress            FileProgressCallback
+	caseInsensitiveDirProbe func(string) bool
 }
 
 // NewClient creates an SFTP subsystem on an existing SSH connection. Setup is

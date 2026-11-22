@@ -2,14 +2,18 @@ package sftp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
+	"unicode"
 
 	"github.com/wentf9/xops-cli/core/fsx"
 )
@@ -465,74 +469,199 @@ func validateDownloadSymlinkSyntax(target string) error {
 	return nil
 }
 
+type foldedSymlinkEntry struct {
+	exactRel string
+	target   string
+}
+
+type downloadSymlinkIndex struct {
+	exact  map[string]string
+	folded map[string]foldedSymlinkEntry
+}
+
+type downloadDiskInspector struct {
+	lstat    func(string) (os.FileInfo, error)
+	readlink func(string) (string, error)
+}
+
+func defaultDownloadDiskInspector() downloadDiskInspector {
+	return downloadDiskInspector{
+		lstat:    os.Lstat,
+		readlink: os.Readlink,
+	}
+}
+
+type downloadSymlinkMatch struct {
+	target   string
+	fromTree bool
+}
+
+func canonicalFoldRune(r rune) rune {
+	minR := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < minR {
+			minR = f
+		}
+	}
+	return minR
+}
+
+func foldDownloadRelPath(rel string) string {
+	lower := strings.ToLower(rel)
+	return strings.Map(canonicalFoldRune, lower)
+}
+
+func buildDownloadSymlinkIndex(inTreeSymlinks map[string]string) (*downloadSymlinkIndex, error) {
+	idx := &downloadSymlinkIndex{
+		exact:  make(map[string]string, len(inTreeSymlinks)),
+		folded: make(map[string]foldedSymlinkEntry, len(inTreeSymlinks)),
+	}
+	if len(inTreeSymlinks) == 0 {
+		return idx, nil
+	}
+	keys := make([]string, 0, len(inTreeSymlinks))
+	for k := range inTreeSymlinks {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	for _, rel := range keys {
+		target := inTreeSymlinks[rel]
+		idx.exact[rel] = target
+		folded := foldDownloadRelPath(rel)
+		if existing, dup := idx.folded[folded]; dup && existing.exactRel != rel {
+			return nil, fmt.Errorf("%w: case-colliding staged symbolic links %q and %q", ErrUnsafeDownloadSymlink, existing.exactRel, rel)
+		}
+		idx.folded[folded] = foldedSymlinkEntry{exactRel: rel, target: target}
+	}
+	return idx, nil
+}
+
 // validateDownloadSymlinkInTree resolves a remote symlink target step-by-step
-// against both the complete staged in-tree symlink map and any pre-existing
-// symlinks on local disk beneath localRoot. It enforces:
+// against both the complete staged in-tree symlink map (exact and Unicode
+// case-folded) and any pre-existing symlinks or non-regular entries on local
+// disk beneath localRoot. It enforces:
 //   - lexical policy (b) on target itself,
-//   - no parent component of linkRelPath is a symlink,
+//   - no case-folding collision among staged symlinks,
+//   - no parent component of linkRelPath is a symlink or unsafe non-regular entry,
 //   - step-by-step expansion of every in-tree or pre-existing local symlink
-//     encountered along the path (including chained symlinks and the final
-//     component), bounded by maxDownloadSymlinkHops and maxDownloadSymlinkSteps,
+//     encountered along the path (including chained symlinks, case-folded hits,
+//     both staged and on-disk targets when overlapping, and the final component),
+//     bounded by maxDownloadSymlinkHops and maxDownloadSymlinkSteps,
 //   - depth never dips below 0 (outside localRoot) at any point.
 func validateDownloadSymlinkInTree(localRoot, linkRelPath, target string, inTreeSymlinks map[string]string) error {
+	idx, err := buildDownloadSymlinkIndex(inTreeSymlinks)
+	if err != nil {
+		return err
+	}
+	return validateDownloadSymlinkInTreeWithIndex(localRoot, linkRelPath, target, idx, defaultDownloadDiskInspector())
+}
+
+func validateDownloadSymlinkInTreeWithIndex(
+	localRoot, linkRelPath, target string,
+	idx *downloadSymlinkIndex,
+	inspector downloadDiskInspector,
+) error {
+	if inspector.lstat == nil {
+		inspector.lstat = os.Lstat
+	}
+	if inspector.readlink == nil {
+		inspector.readlink = os.Readlink
+	}
 	linkParts, err := parseDownloadLinkRelParts(linkRelPath)
 	if err != nil {
 		return err
+	}
+	if idx != nil {
+		if existing, ok := idx.folded[foldDownloadRelPath(linkRelPath)]; ok && existing.exactRel != linkRelPath {
+			return fmt.Errorf("%w: case-colliding staged symbolic links %q and %q", ErrUnsafeDownloadSymlink, existing.exactRel, linkRelPath)
+		}
 	}
 	parentParts := linkParts[:len(linkParts)-1]
 	if err := validateDownloadSymlinkTarget(target, len(parentParts)); err != nil {
 		return err
 	}
-	if err := validateDownloadSymlinkParents(localRoot, parentParts, inTreeSymlinks); err != nil {
+	if err := validateDownloadSymlinkParents(localRoot, parentParts, idx, inspector); err != nil {
 		return err
 	}
 
 	cur := append([]string(nil), parentParts...)
 	queue := splitPOSIXRelativeSegments(target)
-	hops := 0
-	steps := 0
+	totalSteps := 0
+	return resolveDownloadSymlinkBranch(localRoot, target, cur, queue, 0, &totalSteps, idx, inspector)
+}
 
+func resolveDownloadSymlinkBranch(
+	localRoot, origTarget string,
+	cur, queue []string,
+	hops int,
+	totalSteps *int,
+	idx *downloadSymlinkIndex,
+	inspector downloadDiskInspector,
+) error {
 	for len(queue) > 0 {
-		steps++
-		if steps > maxDownloadSymlinkSteps {
-			return fmt.Errorf("%w: %q exceeds resolution step limit (%d)", ErrUnsafeDownloadSymlink, target, maxDownloadSymlinkSteps)
+		*totalSteps++
+		if *totalSteps > maxDownloadSymlinkSteps {
+			return fmt.Errorf("%w: %q exceeds resolution step limit (%d)", ErrUnsafeDownloadSymlink, origTarget, maxDownloadSymlinkSteps)
 		}
 		seg := queue[0]
 		queue = queue[1:]
 		if seg == ".." {
 			if len(cur) == 0 {
-				return fmt.Errorf("%w: %q escapes download root via chained symlink", ErrUnsafeDownloadSymlink, target)
+				return fmt.Errorf("%w: %q escapes download root via chained symlink", ErrUnsafeDownloadSymlink, origTarget)
 			}
 			cur = cur[:len(cur)-1]
 			continue
 		}
 
-		nextCur := append(cur, seg)
+		nextCur := append(slices.Clip(cur), seg)
 		candRel := strings.Join(nextCur, "/")
-		symTarget, fromTree, isSym, lookupErr := lookupDownloadSymlink(localRoot, candRel, inTreeSymlinks)
+		matches, lookupErr := lookupDownloadSymlinks(localRoot, candRel, idx, inspector)
 		if lookupErr != nil {
 			return lookupErr
 		}
-		if !isSym {
+		if len(matches) == 0 {
 			cur = nextCur
 			continue
 		}
 
-		hops++
-		if hops > maxDownloadSymlinkHops {
-			return fmt.Errorf("%w: %q exceeds maximum symlink hops (%d)", ErrUnsafeDownloadSymlink, target, maxDownloadSymlinkHops)
+		nextHops := hops + 1
+		if nextHops > maxDownloadSymlinkHops {
+			return fmt.Errorf("%w: %q exceeds maximum symlink hops (%d)", ErrUnsafeDownloadSymlink, origTarget, maxDownloadSymlinkHops)
 		}
-		expandedTarget, expandErr := validateExpandedDownloadSymlinkTarget(symTarget, fromTree)
-		if expandErr != nil {
-			return fmt.Errorf("%w: symlink %q -> %q in resolution of %q: %w", ErrUnsafeDownloadSymlink, candRel, symTarget, target, expandErr)
+		if len(matches) == 1 {
+			expanded, expandErr := expandDownloadSymlinkMatch(candRel, origTarget, matches[0], queue)
+			if expandErr != nil {
+				return expandErr
+			}
+			hops = nextHops
+			queue = expanded
+			continue
 		}
-		expanded := splitPOSIXRelativeSegments(expandedTarget)
-		nextQueue := make([]string, 0, len(expanded)+len(queue))
-		nextQueue = append(nextQueue, expanded...)
-		nextQueue = append(nextQueue, queue...)
-		queue = nextQueue
+		for _, match := range matches {
+			expanded, expandErr := expandDownloadSymlinkMatch(candRel, origTarget, match, queue)
+			if expandErr != nil {
+				return expandErr
+			}
+			branchCur := append([]string(nil), cur...)
+			if err := resolveDownloadSymlinkBranch(localRoot, origTarget, branchCur, expanded, nextHops, totalSteps, idx, inspector); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	return nil
+}
+
+func expandDownloadSymlinkMatch(candRel, origTarget string, match downloadSymlinkMatch, remaining []string) ([]string, error) {
+	expandedTarget, expandErr := validateExpandedDownloadSymlinkTarget(match.target, match.fromTree)
+	if expandErr != nil {
+		return nil, fmt.Errorf("%w: symlink %q -> %q in resolution of %q: %w", ErrUnsafeDownloadSymlink, candRel, match.target, origTarget, expandErr)
+	}
+	expanded := splitPOSIXRelativeSegments(expandedTarget)
+	nextQueue := make([]string, 0, len(expanded)+len(remaining))
+	nextQueue = append(nextQueue, expanded...)
+	nextQueue = append(nextQueue, remaining...)
+	return nextQueue, nil
 }
 
 func parseDownloadLinkRelParts(linkRelPath string) ([]string, error) {
@@ -548,43 +677,172 @@ func parseDownloadLinkRelParts(linkRelPath string) ([]string, error) {
 	return parts, nil
 }
 
-func validateDownloadSymlinkParents(localRoot string, parentParts []string, inTreeSymlinks map[string]string) error {
+func validateDownloadSymlinkParents(localRoot string, parentParts []string, idx *downloadSymlinkIndex, inspector downloadDiskInspector) error {
 	for i := range parentParts {
 		prefix := strings.Join(parentParts[:i+1], "/")
-		_, _, isSym, err := lookupDownloadSymlink(localRoot, prefix, inTreeSymlinks)
+		matches, err := lookupDownloadSymlinks(localRoot, prefix, idx, inspector)
 		if err != nil {
 			return err
 		}
-		if isSym {
+		if len(matches) > 0 {
 			return fmt.Errorf("%w: parent component %q is a symbolic link", ErrUnsafeDownloadSymlink, prefix)
 		}
 	}
 	return nil
 }
 
-func lookupDownloadSymlink(localRoot, candRel string, inTreeSymlinks map[string]string) (target string, fromTree bool, isSym bool, err error) {
-	if t, ok := inTreeSymlinks[candRel]; ok {
-		return t, true, true, nil
+func lookupDownloadSymlinks(localRoot, candRel string, idx *downloadSymlinkIndex, inspector downloadDiskInspector) ([]downloadSymlinkMatch, error) {
+	var matches []downloadSymlinkMatch
+	var treeExactRel string
+	if idx != nil {
+		if t, ok := idx.exact[candRel]; ok {
+			treeExactRel = candRel
+			matches = append(matches, downloadSymlinkMatch{target: t, fromTree: true})
+		} else if entry, ok := idx.folded[foldDownloadRelPath(candRel)]; ok {
+			treeExactRel = entry.exactRel
+			matches = append(matches, downloadSymlinkMatch{target: entry.target, fromTree: true})
+		}
 	}
+
+	diskTarget, isSym, err := inspectDownloadDiskPath(localRoot, candRel, inspector)
+	if err != nil {
+		return nil, err
+	}
+	if isSym {
+		matches = appendDownloadSymlinkMatch(matches, downloadSymlinkMatch{target: diskTarget, fromTree: false})
+	}
+	if treeExactRel != "" && treeExactRel != candRel {
+		exactDiskTarget, exactIsSym, exactErr := inspectDownloadDiskPath(localRoot, treeExactRel, inspector)
+		if exactErr != nil {
+			return nil, exactErr
+		}
+		if exactIsSym {
+			matches = appendDownloadSymlinkMatch(matches, downloadSymlinkMatch{target: exactDiskTarget, fromTree: false})
+		}
+	}
+	return matches, nil
+}
+
+func appendDownloadSymlinkMatch(matches []downloadSymlinkMatch, cand downloadSymlinkMatch) []downloadSymlinkMatch {
+	for _, existing := range matches {
+		if existing.target == cand.target && (existing.fromTree || !cand.fromTree) {
+			return matches
+		}
+	}
+	return append(matches, cand)
+}
+
+func inspectDownloadDiskPath(localRoot, rel string, inspector downloadDiskInspector) (string, bool, error) {
 	if localRoot == "" {
-		return "", false, false, nil
+		return "", false, nil
 	}
-	diskPath := filepath.Join(localRoot, filepath.FromSlash(candRel))
-	fi, lstatErr := os.Lstat(diskPath)
+	diskPath := filepath.Join(localRoot, filepath.FromSlash(rel))
+	fi, lstatErr := inspector.lstat(diskPath)
 	if lstatErr != nil {
 		if errors.Is(lstatErr, os.ErrNotExist) || errors.Is(lstatErr, syscall.ENOTDIR) {
-			return "", false, false, nil
+			return "", false, nil
 		}
-		return "", false, false, fmt.Errorf("%w: lstat %q failed: %w", ErrUnsafeDownloadSymlink, candRel, lstatErr)
+		return "", false, fmt.Errorf("%w: lstat %q failed: %w", ErrUnsafeDownloadSymlink, rel, lstatErr)
 	}
-	if fi.Mode()&os.ModeSymlink == 0 {
-		return "", false, false, nil
+	modeType := fi.Mode() & os.ModeType
+	if modeType&os.ModeSymlink != 0 {
+		diskTarget, readErr := inspector.readlink(diskPath)
+		if readErr != nil {
+			return "", false, fmt.Errorf("%w: read local symlink %q failed: %w", ErrUnsafeDownloadSymlink, rel, readErr)
+		}
+		return diskTarget, true, nil
 	}
-	diskTarget, readErr := os.Readlink(diskPath)
-	if readErr != nil {
-		return "", false, false, fmt.Errorf("%w: read local symlink %q failed: %w", ErrUnsafeDownloadSymlink, candRel, readErr)
+	if modeType != 0 && modeType != os.ModeDir {
+		return "", false, fmt.Errorf("%w: local path %q has unsafe non-regular mode %s", ErrUnsafeDownloadSymlink, rel, fi.Mode())
 	}
-	return diskTarget, false, true, nil
+	return "", false, nil
+}
+
+// probeCaseInsensitiveDir probes whether dir resides on a case-insensitive
+// filesystem by creating and removing a unique temporary subdirectory via a
+// pinned os.Root handle and comparing flipped-case Lstat metadata with
+// os.SameFile. When probing is inconclusive (e.g. a read-only empty directory),
+// it fails closed by returning true so case-colliding siblings are rejected.
+func probeCaseInsensitiveDir(dir string) bool {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return true
+	}
+	defer func() { _ = root.Close() }()
+
+	rb := make([]byte, 12)
+	if _, randErr := rand.Read(rb); randErr == nil {
+		suffix := hex.EncodeToString(rb)
+		lower := ".xops-case-" + suffix
+		upper := ".XOPS-CASE-" + suffix
+		if mkErr := root.Mkdir(lower, 0o700); mkErr == nil {
+			defer func() { _ = root.Remove(lower) }()
+			fiLower, errLower := root.Lstat(lower)
+			fiUpper, errUpper := root.Lstat(upper)
+			if errLower == nil {
+				if errUpper == nil {
+					return os.SameFile(fiLower, fiUpper)
+				}
+				if errors.Is(errUpper, os.ErrNotExist) {
+					return false
+				}
+			}
+		}
+	}
+
+	if caseInsensitive, ok := probeCaseInsensitiveExistingDir(root, dir); ok {
+		return caseInsensitive
+	}
+	return true
+}
+
+func probeCaseInsensitiveExistingDir(root *os.Root, dir string) (bool, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return false, false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		flipped, ok := flipFirstASCIILetter(name)
+		if !ok {
+			continue
+		}
+		fiOrig, errOrig := root.Lstat(name)
+		if errOrig != nil {
+			continue
+		}
+		fiFlip, errFlip := root.Lstat(flipped)
+		if errors.Is(errFlip, os.ErrNotExist) {
+			return false, true
+		}
+		if errFlip != nil {
+			continue
+		}
+		if !os.SameFile(fiOrig, fiFlip) {
+			return false, true
+		}
+		// Only treat SameFile as conclusive for directories so regular-file
+		// hardlinks on case-sensitive filesystems cannot trigger false positives.
+		if fiOrig.Mode()&os.ModeType == os.ModeDir {
+			return true, true
+		}
+	}
+	return false, false
+}
+
+func flipFirstASCIILetter(name string) (string, bool) {
+	b := []byte(name)
+	for i, c := range b {
+		switch {
+		case c >= 'a' && c <= 'z':
+			b[i] = c - ('a' - 'A')
+			return string(b), true
+		case c >= 'A' && c <= 'Z':
+			b[i] = c + ('a' - 'A')
+			return string(b), true
+		}
+	}
+	return "", false
 }
 
 func validateExpandedDownloadSymlinkTarget(symTarget string, fromTree bool) (string, error) {
