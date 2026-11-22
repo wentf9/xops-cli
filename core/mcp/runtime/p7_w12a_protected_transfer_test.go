@@ -299,6 +299,7 @@ func TestP7W12a_AB12M1_HTTPPreparePullProtectedPathsPosixBackslashAndWindowsDriv
 		lstats: map[string]os.FileInfo{
 			`/opt/custom-protected/\../secret`: w10aSynthFileInfo{name: "secret", size: 16, mode: 0o600},
 			"/C:/ProgramData/ssh/sshd_config":  w10aSynthFileInfo{name: "sshd_config", size: 32, mode: 0o600},
+			"/C:/programdata/ssh/sshd_config":  w10aSynthFileInfo{name: "sshd_config", size: 32, mode: 0o600},
 			"/c:/programdata/ssh/sshd_config":  w10aSynthFileInfo{name: "sshd_config", size: 32, mode: 0o600},
 			"/C:/Windows/System32/config/SAM":  w10aSynthFileInfo{name: "SAM", size: 64, mode: 0o600},
 			"/tmp/public.bin":                  w10aSynthFileInfo{name: "public.bin", size: 12, mode: 0o644},
@@ -306,6 +307,7 @@ func TestP7W12a_AB12M1_HTTPPreparePullProtectedPathsPosixBackslashAndWindowsDriv
 	}
 	h.stats[`/opt/custom-protected/\..`] = w10aSynthFileInfo{name: `\..`, mode: os.ModeDir | 0o755}
 	h.stats["/C:/ProgramData/ssh"] = w10aSynthFileInfo{name: "ssh", mode: os.ModeDir | 0o755}
+	h.stats["/C:/programdata/ssh"] = w10aSynthFileInfo{name: "ssh", mode: os.ModeDir | 0o755}
 	h.stats["/c:/programdata/ssh"] = w10aSynthFileInfo{name: "ssh", mode: os.ModeDir | 0o755}
 	h.stats["/C:/Windows/System32/config"] = w10aSynthFileInfo{name: "config", mode: os.ModeDir | 0o755}
 	h.stats["/tmp"] = w10aSynthFileInfo{name: "tmp", mode: os.ModeDir | 0o755}

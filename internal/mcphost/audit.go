@@ -15,12 +15,22 @@ func defaultPolicyConfig() *policy.Config {
 	return cfg
 }
 
-func newAuditLogger(path string) *guardrail.AuditLogger {
-	if strings.HasPrefix(path, "~/") {
-		if directory, err := os.UserHomeDir(); err == nil {
-			path = filepath.Join(directory, path[2:])
+func expandAuditLogPath(path string) string {
+	switch {
+	case path == "~":
+		if directory, err := os.UserHomeDir(); err == nil && directory != "" {
+			return directory
+		}
+	case strings.HasPrefix(path, "~/"), strings.HasPrefix(path, `~\`):
+		if directory, err := os.UserHomeDir(); err == nil && directory != "" {
+			rel := strings.ReplaceAll(path[2:], `\`, "/")
+			return filepath.Join(directory, filepath.FromSlash(rel))
 		}
 	}
+	return path
+}
+
+func newAuditLogger(path string) *guardrail.AuditLogger {
 	// Unresolved shorthand is rejected on write by the shared audit logger.
-	return guardrail.NewAuditLogger(path)
+	return guardrail.NewAuditLogger(expandAuditLogPath(path))
 }

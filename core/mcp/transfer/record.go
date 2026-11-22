@@ -101,8 +101,48 @@ func (s Spec) validateIdentity() error {
 	return nil
 }
 
+func isASCIIAlpha(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
 func isDriveRoot(p string) bool {
-	return len(p) == 3 && p[0] == '/' && p[2] == ':' && ((p[1] >= 'A' && p[1] <= 'Z') || (p[1] >= 'a' && p[1] <= 'z'))
+	return len(p) == 3 && p[0] == '/' && p[2] == ':' && isASCIIAlpha(p[1])
+}
+
+func canonicalTransferDrivePath(p string) (string, bool) {
+	raw := p
+	if strings.HasPrefix(raw, "/") {
+		raw = strings.TrimLeft(raw, "/")
+	}
+	if len(raw) < 2 || !isASCIIAlpha(raw[0]) || raw[1] != ':' {
+		return "", false
+	}
+	if len(raw) > 2 && raw[2] != '/' && raw[2] != '\\' {
+		return "", false
+	}
+	drive := strings.ToUpper(raw[:1])
+	rest := strings.ReplaceAll(raw[2:], `\`, "/")
+	cleanRest := path.Clean("/" + rest)
+	if cleanRest == "/" {
+		return "/" + drive + ":", true
+	}
+	return "/" + drive + ":" + cleanRest, true
+}
+
+// sameTransferRemotePath reports whether two normalized remote transfer paths
+// target the same destination. Canonical Windows drive paths (/X:... or X:\...)
+// are compared case-insensitively because NTFS paths are case-insensitive; POSIX
+// paths preserve exact case sensitivity.
+func sameTransferRemotePath(a, b string) bool {
+	ca, okA := canonicalTransferDrivePath(a)
+	cb, okB := canonicalTransferDrivePath(b)
+	if okA && okB {
+		return strings.EqualFold(ca, cb)
+	}
+	if okA || okB {
+		return false
+	}
+	return a == b
 }
 
 func (s Spec) validate() error {

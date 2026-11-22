@@ -62,12 +62,16 @@ func NewAuditLogger(path string) *AuditLogger {
 	return &AuditLogger{path: path}
 }
 
+func isUnexpandedHomeShorthand(p string) bool {
+	return p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`)
+}
+
 // Log appends an audit entry to the log file and returns any error encountered.
 func (a *AuditLogger) Log(entry AuditEntry) (err error) {
 	if a == nil || a.path == "" {
 		return nil
 	}
-	if strings.HasPrefix(a.path, "~/") {
+	if isUnexpandedHomeShorthand(a.path) {
 		return fmt.Errorf("audit path must be expanded by the host")
 	}
 	entry.Timestamp = time.Now().UTC()

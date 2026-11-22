@@ -302,7 +302,7 @@ func (m *Manager) pathBlocked(spec Spec) bool {
 		return false
 	}
 	for _, record := range m.records {
-		if record.State == Unknown && !record.Resolved && record.Spec.TargetID == spec.TargetID && record.Spec.RemotePath == spec.RemotePath {
+		if record.State == Unknown && !record.Resolved && record.Spec.TargetID == spec.TargetID && sameTransferRemotePath(record.Spec.RemotePath, spec.RemotePath) {
 			return true
 		}
 	}

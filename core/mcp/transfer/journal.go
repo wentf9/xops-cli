@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -44,7 +43,10 @@ func OpenJournal(directory string) (_ *Journal, retErr error) {
 			retErr = errors.Join(retErr, closeJournalResource(root, "directory"))
 		}
 	}()
-	file, err := root.OpenFile("service.lock", os.O_CREATE|os.O_RDWR, 0600)
+	if err := verifyJournalRoot(root); err != nil {
+		return nil, err
+	}
+	file, err := openJournalLockFile(root, "service.lock")
 	if err != nil {
 		return nil, fmt.Errorf("open transfer metadata lock: %w", err)
 	}
@@ -74,36 +76,6 @@ func lockJournal(file *os.File) error {
 	return nil
 }
 
-func createJournalDirectory(directory string) error {
-	info, err := os.Lstat(directory)
-	if err == nil {
-		if !info.IsDir() || !privateJournalMode(info.Mode()) {
-			return errors.New("transfer metadata directory must be a private directory, not a symbolic link")
-		}
-		return nil
-	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("inspect transfer metadata directory: %w", err)
-	}
-	parent := filepath.Dir(directory)
-	if parent != directory {
-		if _, err := os.Stat(parent); errors.Is(err, os.ErrNotExist) {
-			if err := createJournalDirectory(parent); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return fmt.Errorf("inspect transfer metadata parent: %w", err)
-		}
-	}
-	if err := os.Mkdir(directory, 0700); err != nil && !errors.Is(err, os.ErrExist) {
-		return fmt.Errorf("create transfer metadata directory: %w", err)
-	}
-	if err := fsx.SyncDir(parent); err != nil {
-		return err
-	}
-	return createJournalDirectory(directory)
-}
-
 func checkJournalFile(root *os.Root, file *os.File, name string) error {
 	opened, err := file.Stat()
 	if err != nil {
@@ -113,10 +85,10 @@ func checkJournalFile(root *os.Root, file *os.File, name string) error {
 	if err != nil {
 		return fmt.Errorf("inspect transfer metadata entry: %w", err)
 	}
-	if !opened.Mode().IsRegular() || !entry.Mode().IsRegular() || !os.SameFile(opened, entry) || !privateJournalMode(opened.Mode()) {
+	if !opened.Mode().IsRegular() || !entry.Mode().IsRegular() || !os.SameFile(opened, entry) {
 		return errors.New("transfer metadata must be a private regular file")
 	}
-	return nil
+	return checkJournalFilePrivacy(file, opened.Mode())
 }
 
 func (j *Journal) Load(limit int) (_ []Record, retErr error) {
@@ -210,7 +182,7 @@ func (j *Journal) Save(record Record) (retErr error) {
 		return err
 	}
 	temporary := ".pending-" + id
-	file, err := j.root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	file, err := createJournalTempFile(j.root, temporary)
 	if err != nil {
 		return fmt.Errorf("create transfer record temporary file: %w", err)
 	}

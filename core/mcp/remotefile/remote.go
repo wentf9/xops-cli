@@ -83,7 +83,7 @@ func validateResolvedRealPath(raw string) (string, error) {
 	if err := ValidateWindowsDrivePath(parsed.String()); err != nil {
 		return "", fmt.Errorf("invalid resolved remote path: %w", err)
 	}
-	return parsed.String(), nil
+	return NormalizeSFTPPath(parsed.String()), nil
 }
 
 func validateTransferInputPath(name string) (string, error) {
@@ -423,10 +423,111 @@ func parseDrivePath(p string) (drive string, rest string, ok bool) {
 	return "", "", false
 }
 
-// extractDrivePath detects Windows drive paths (C:..., /C:..., //C:..., or
-// absolute paths collapsing via ".." to /C:...) and returns the uppercase drive
-// letter together with the raw (pre-Clean) path remainder beneath that drive.
-func extractDrivePath(p string) (drive string, rawRest string, ok bool) {
+func isWin32Sep(b byte) bool {
+	return b == '/' || b == '\\'
+}
+
+func hasCaseInsensitivePrefixSeg(s, prefix string) (string, bool) {
+	if len(s) < len(prefix) || !strings.EqualFold(s[:len(prefix)], prefix) {
+		return "", false
+	}
+	if len(s) == len(prefix) {
+		return "", true
+	}
+	if isWin32Sep(s[len(prefix)]) {
+		return s[len(prefix)+1:], true
+	}
+	return "", false
+}
+
+func isForwardDeviceWin32Namespace(after string) bool {
+	if _, _, ok := parseBareDriveSegment(after); ok {
+		return true
+	}
+	for _, ns := range []string{"UNC", "GLOBALROOT", "pipe"} {
+		if _, ok := hasCaseInsensitivePrefixSeg(after, ns); ok {
+			return true
+		}
+	}
+	lower := strings.ToLower(after)
+	if strings.HasPrefix(lower, "volume{") || strings.HasPrefix(lower, "physicaldrive") {
+		return true
+	}
+	if len(lower) >= 3 && lower[:3] == "nul" && (len(lower) == 3 || isWin32Sep(lower[3]) || lower[3] == '.' || lower[3] == ':') {
+		return true
+	}
+	return false
+}
+
+func stripRawWin32DevicePrefix(p string) (string, bool) {
+	if len(p) < 4 {
+		return "", false
+	}
+	if p[0] == '\\' && p[1] == '?' && p[2] == '?' && isWin32Sep(p[3]) {
+		return p[4:], true
+	}
+	if !isWin32Sep(p[0]) || !isWin32Sep(p[1]) || !isWin32Sep(p[3]) {
+		return "", false
+	}
+	switch p[2] {
+	case '?', '.':
+		if p[0] == '/' && p[1] == '/' && p[3] == '/' && !isForwardDeviceWin32Namespace(p[4:]) {
+			return "", false
+		}
+		return p[4:], true
+	default:
+		return "", false
+	}
+}
+
+func stripGlobalRootPrefix(after string) string {
+	rem, matched := hasCaseInsensitivePrefixSeg(after, "GLOBALROOT")
+	if !matched {
+		return after
+	}
+	if len(rem) >= 4 && isWin32Sep(rem[0]) && rem[1] == '?' && rem[2] == '?' && isWin32Sep(rem[3]) {
+		return rem[4:]
+	}
+	if len(rem) >= 3 && rem[0] == '?' && rem[1] == '?' && isWin32Sep(rem[2]) {
+		return rem[3:]
+	}
+	return rem
+}
+
+func stripWin32DevicePrefix(p string) (rest string, isUNC bool, ok bool) {
+	after, matched := stripRawWin32DevicePrefix(p)
+	if !matched {
+		return "", false, false
+	}
+	after = stripGlobalRootPrefix(after)
+	if rem, isUNCPrefix := hasCaseInsensitivePrefixSeg(after, "UNC"); isUNCPrefix {
+		return rem, true, true
+	}
+	return after, false, true
+}
+
+func isWin32DeviceOrUNCPath(p string) bool {
+	if strings.HasPrefix(p, `\`) {
+		return true
+	}
+	_, _, ok := stripWin32DevicePrefix(p)
+	return ok
+}
+
+func isWin32UNCRoot(body string) bool {
+	slash := strings.ReplaceAll(body, `\`, "/")
+	parts := strings.SplitN(slash, "/", 3)
+	if len(parts) == 0 || parts[0] == "" {
+		return false
+	}
+	if len(parts) < 3 || parts[2] == "" {
+		return true
+	}
+	canonRest, _ := canonicalizeDriveRest("/" + parts[2])
+	return canonRest == "/"
+}
+
+func extractDrivePathSlash(p string) (drive string, rawRest string, ok bool) {
 	if d, rest, matched := parseDrivePath(p); matched {
 		return d, rest, true
 	}
@@ -444,8 +545,12 @@ func extractDrivePath(p string) (drive string, rawRest string, ok bool) {
 		case "", ".":
 			continue
 		case "..":
-			if len(stack) > 0 {
+			if len(stack) > 1 {
 				stack = stack[:len(stack)-1]
+			} else if len(stack) == 1 {
+				if _, _, isDrive := parseBareDriveSegment(stack[0].seg); !isDrive {
+					stack = stack[:0]
+				}
 			}
 		default:
 			stack = append(stack, segEntry{seg: seg, rawIdx: i})
@@ -462,6 +567,24 @@ func extractDrivePath(p string) (drive string, rawRest string, ok bool) {
 		rest += "/" + strings.Join(segs[stack[0].rawIdx+1:], "/")
 	}
 	return d, rest, true
+}
+
+// extractDrivePath detects Windows drive paths (C:..., /C:..., //C:...,
+// absolute paths collapsing via ".." to /C:..., or mixed-backslash SFTP paths
+// such as /\C:\... and /tmp/..\C:\... that collapse to /C: after '\' -> '/')
+// and returns the uppercase drive letter, the raw (pre-Clean) path remainder
+// beneath that drive, and whether mixed-separator pre-drive traversal was needed.
+func extractDrivePath(p string) (drive string, rawRest string, mixed bool, ok bool) {
+	if d, rest, matched := extractDrivePathSlash(p); matched {
+		return d, rest, false, true
+	}
+	if strings.HasPrefix(p, "/") && strings.Contains(p, `\`) && !isWin32DeviceOrUNCPath(p) {
+		slash := strings.ReplaceAll(p, `\`, "/")
+		if d, rest, matched := extractDrivePathSlash(slash); matched {
+			return d, rest, true, true
+		}
+	}
+	return "", "", false, false
 }
 
 func hasWin32AmbiguousSegment(slashPath string) bool {
@@ -508,18 +631,26 @@ func canonicalizeDriveRest(rest string) (canonicalRest string, ambiguous bool) {
 	return canonicalRest, ambiguous
 }
 
-// ValidateWindowsDrivePath rejects Windows drive paths (C:..., /C:..., //C:...,
-// or /tmp/../C:...) whose path components contain NTFS alternate data stream
-// syntax (':' after the drive prefix) or Win32-ambiguous trailing '.' or ' '
-// characters (including whitespace-only or multi-dot "..." components) on
-// non-"."/".." segments. Non-drive POSIX paths are never rejected.
+// ValidateWindowsDrivePath rejects Win32 extended/device/UNC paths (\\?\, \\.\,
+// \??\, \\server\share, //?/, //./C:..., or leading '\'), mixed-separator SFTP
+// pre-drive traversals (/\C:\..., /tmp/..\C:\...), and Windows drive paths
+// whose components contain NTFS alternate data stream syntax (':' after the
+// drive prefix) or Win32-ambiguous trailing '.' or ' ' characters (including
+// whitespace-only or multi-dot "..." components) on non-"."/".." segments.
+// Non-drive POSIX paths starting with '/' are never rejected.
 func ValidateWindowsDrivePath(p string) error {
-	_, rest, ok := extractDrivePath(p)
+	if isWin32DeviceOrUNCPath(p) {
+		return fmt.Errorf("%w: Win32 device, extended, or UNC path %q is not permitted", sftp.ErrInvalidRemotePath, p)
+	}
+	_, rest, mixed, ok := extractDrivePath(p)
 	if !ok {
 		return nil
 	}
 	if _, ambiguous := canonicalizeDriveRest(rest); ambiguous {
 		return fmt.Errorf("%w: Windows drive path %q contains NTFS ADS or Win32-ambiguous trailing dot/space component", sftp.ErrInvalidRemotePath, p)
+	}
+	if mixed {
+		return fmt.Errorf("%w: mixed-separator Windows drive path %q is not permitted", sftp.ErrInvalidRemotePath, p)
 	}
 	return nil
 }
@@ -549,9 +680,9 @@ func normalizeLeadingDrivePath(p string, allowBare bool) (string, bool) {
 }
 
 // NormalizeSFTPPath converts Windows drive paths (C:\..., c:/..., /C:\...,
-// //c:\..., /tmp/../C:/...) into OpenSSH SFTP canonical form (/C:/...) with an
-// uppercase drive letter and forward slashes. Non-drive POSIX paths are cleaned
-// without altering backslashes.
+// //c:\..., /tmp/../C:/..., /tmp/..\C:\..., /\C:\...) into OpenSSH SFTP
+// canonical form (/C:/...) with an uppercase drive letter and forward slashes.
+// Non-drive POSIX paths are cleaned without altering backslashes.
 func NormalizeSFTPPath(p string) string {
 	if p == "" {
 		return ""
@@ -565,13 +696,19 @@ func NormalizeSFTPPath(p string) string {
 			return norm
 		}
 	}
+	if strings.HasPrefix(p, "/") && !isWin32DeviceOrUNCPath(p) {
+		if d, rest, _, ok := extractDrivePath(p); ok {
+			return formatNormalizedDrivePath(d, rest)
+		}
+	}
 	return cleaned
 }
 
-// IsRootPath reports whether p represents a POSIX or Windows drive root directory
-// (including Windows drive paths that collapse to the drive root after Win32
-// trailing '.' / ' ' or NTFS ADS stripping, such as "C:\ ", "/C:/...", or
-// "C:\::$DATA").
+// IsRootPath reports whether p represents a POSIX root, Windows drive root
+// (including collapsed/mixed-backslash drive roots and paths collapsing to the
+// drive root after Win32 trailing '.' / ' ' or NTFS ADS stripping, such as
+// "C:\ ", "/C:/...", "C:\::$DATA", "/tmp/..\C:\ ", "/\C:\"), or a Win32
+// extended/device drive root or UNC share root.
 func IsRootPath(cleaned string) bool {
 	norm := NormalizeSFTPPath(cleaned)
 	if norm == "/" {
@@ -580,10 +717,23 @@ func IsRootPath(cleaned string) bool {
 	if len(norm) == 3 && norm[0] == '/' && isAlpha(norm[1]) && norm[2] == ':' {
 		return true
 	}
-	if _, rest, ok := extractDrivePath(cleaned); ok {
+	if _, rest, _, ok := extractDrivePath(cleaned); ok {
 		if canonRest, _ := canonicalizeDriveRest(rest); canonRest == "/" {
 			return true
 		}
+	}
+	if rest, isUNC, ok := stripWin32DevicePrefix(cleaned); ok {
+		if isUNC {
+			return isWin32UNCRoot(rest)
+		}
+		if _, driveRest, _, matched := extractDrivePath(rest); matched {
+			if canonRest, _ := canonicalizeDriveRest(driveRest); canonRest == "/" {
+				return true
+			}
+		}
+	}
+	if strings.HasPrefix(cleaned, `\\`) && isWin32UNCRoot(cleaned[2:]) {
+		return true
 	}
 	return false
 }

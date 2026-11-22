@@ -119,7 +119,7 @@ func (m *Manager) hasCapacity(spec Spec) bool {
 			continue
 		}
 		onTarget++
-		if other.Direction == Upload && spec.Direction == Upload && other.RemotePath == spec.RemotePath {
+		if other.Direction == Upload && spec.Direction == Upload && sameTransferRemotePath(other.RemotePath, spec.RemotePath) {
 			return false
 		}
 	}

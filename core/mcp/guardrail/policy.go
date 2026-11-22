@@ -163,32 +163,73 @@ func matchesUnder(target, prefix string) bool {
 	// (e.g. `\etc\passwd` or `/tmp/\../etc/passwd`). Evaluating POSIX-clean
 	// first and OR-ing with slash-converted clean is strictly more protective:
 	// POSIX `/opt/custom-protected/\../drop` matches via POSIX-clean while
-	// Windows backslash separators match via slash-clean.
+	// Windows backslash separators match via slash-clean. Win32 device/UNC
+	// paths already handle separator canonicalization natively and must not
+	// be reinterpreted as POSIX paths.
 	if strings.Contains(target, "\\") || strings.Contains(prefix, "\\") {
-		slashTarget := strings.ReplaceAll(target, "\\", "/")
-		slashPrefix := strings.ReplaceAll(prefix, "\\", "/")
-		if matchesUnderNormalized(slashTarget, slashPrefix) {
+		altTarget := target
+		if !isWin32DeviceOrUNCPath(target) {
+			altTarget = strings.ReplaceAll(target, "\\", "/")
+		}
+		altPrefix := prefix
+		if !isWin32DeviceOrUNCPath(prefix) {
+			altPrefix = strings.ReplaceAll(prefix, "\\", "/")
+		}
+		if (altTarget != target || altPrefix != prefix) && matchesUnderNormalized(altTarget, altPrefix) {
 			return true
 		}
 	}
 	return false
 }
 
+func matchesUNCPath(tUNC, pUNC win32UNCPath) bool {
+	if tUNC.server != pUNC.server {
+		return false
+	}
+	if pUNC.share == "" {
+		return true
+	}
+	return tUNC.share == pUNC.share && matchesCleanPath(strings.ToLower(tUNC.cleanRest), strings.ToLower(pUNC.cleanRest))
+}
+
+func matchesDeviceNamespace(target, prefix string) (matched bool, handled bool) {
+	tDev, tDevRest, tIsDev := canonicalDeviceNamespacePath(target)
+	pDev, pDevRest, pIsDev := canonicalDeviceNamespacePath(prefix)
+	if tIsDev && pIsDev {
+		if tDev != pDev {
+			return false, true
+		}
+		return matchesCleanPath(strings.ToLower(tDevRest), strings.ToLower(pDevRest)), true
+	}
+	if tIsDev {
+		return path.Clean(prefix) == "/", true
+	}
+	if pIsDev {
+		return false, true
+	}
+	return false, false
+}
+
 func matchesUnderNormalized(target, prefix string) bool {
+	tUNC, tIsUNC := canonicalUNCPath(target)
+	pUNC, pIsUNC := canonicalUNCPath(prefix)
+	if tIsUNC && pIsUNC && matchesUNCPath(tUNC, pUNC) {
+		return true
+	}
+
 	tDrive, tRest, _, tIsDrive := canonicalDrivePath(target)
 	pDrive, pRest, _, pIsDrive := canonicalDrivePath(prefix)
-
 	if tIsDrive && pIsDrive {
-		if tDrive != pDrive {
-			return false
-		}
-		return matchesCleanPath(strings.ToLower(tRest), strings.ToLower(pRest))
+		return tDrive == pDrive && matchesCleanPath(strings.ToLower(tRest), strings.ToLower(pRest))
 	}
-	if tIsDrive {
-		return path.Clean(prefix) == "/"
+	if tIsDrive || tIsUNC {
+		return !pIsDrive && !pIsUNC && path.Clean(prefix) == "/"
 	}
-	if pIsDrive {
+	if pIsDrive || pIsUNC {
 		return false
+	}
+	if matched, handled := matchesDeviceNamespace(target, prefix); handled {
+		return matched
 	}
 	return matchesCleanPath(path.Clean(target), path.Clean(prefix))
 }

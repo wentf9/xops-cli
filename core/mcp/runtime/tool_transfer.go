@@ -10,6 +10,7 @@ import (
 	"net"
 	"path"
 	"path/filepath"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -50,8 +51,18 @@ func hasControlOrLineSep(s string) bool {
 	return false
 }
 
+func isUnsupportedWindowsLocalPath(raw string) bool {
+	if goruntime.GOOS != "windows" {
+		return false
+	}
+	if strings.HasPrefix(raw, `\`) {
+		return true
+	}
+	return len(raw) >= 2 && (raw[0] == '/' || raw[0] == '\\') && (raw[1] == '/' || raw[1] == '\\')
+}
+
 func riskLocalPath(raw string) string {
-	if hasControlOrLineSep(raw) || !filepath.IsAbs(raw) || remotefile.ValidateWindowsDrivePath(raw) != nil {
+	if hasControlOrLineSep(raw) || isUnsupportedWindowsLocalPath(raw) || !filepath.IsAbs(raw) || remotefile.ValidateWindowsDrivePath(raw) != nil {
 		return raw
 	}
 	return filepath.Clean(raw)
@@ -78,6 +89,9 @@ func validateStdioLocalPath(raw string) (string, error) {
 	if hasControlOrLineSep(raw) {
 		return "", errors.New("localPath must not contain NUL or control characters")
 	}
+	if isUnsupportedWindowsLocalPath(raw) {
+		return "", fmt.Errorf("invalid localPath: %w: Win32 device, extended, or UNC path %q is not permitted", sftp.ErrInvalidRemotePath, raw)
+	}
 	if err := remotefile.ValidateWindowsDrivePath(raw); err != nil {
 		return "", fmt.Errorf("invalid localPath: %w", err)
 	}
@@ -85,6 +99,9 @@ func validateStdioLocalPath(raw string) (string, error) {
 		return "", errors.New("localPath must be an absolute non-root file path")
 	}
 	cleaned := filepath.Clean(raw)
+	if isUnsupportedWindowsLocalPath(cleaned) {
+		return "", fmt.Errorf("invalid localPath: %w: Win32 device, extended, or UNC path %q is not permitted", sftp.ErrInvalidRemotePath, raw)
+	}
 	if err := remotefile.ValidateWindowsDrivePath(cleaned); err != nil {
 		return "", fmt.Errorf("invalid localPath: %w", err)
 	}
