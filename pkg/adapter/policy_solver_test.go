@@ -323,7 +323,7 @@ func TestPolicySolverSingleResolveConnectionPerGetConfig(t *testing.T) {
 				wantOrig string
 				wantJump string
 			}{
-				{name: "saved", nodeID: "saved-node", wantOrig: "", wantJump: "jump-host"},
+				{name: "saved", nodeID: "saved-node", wantOrig: "", wantJump: "openssh:jump-host"},
 				{name: "openssh_virtual", nodeID: "openssh:edge", wantOrig: "edge", wantJump: "openssh:jump-host"},
 				{name: "openssh_derived", nodeID: derivedLease.NodeID(), wantOrig: "edge", wantJump: "openssh:jump-host"},
 				{name: "adhoc_pending", nodeID: adHocLease.NodeID(), wantOrig: "", wantJump: ""},

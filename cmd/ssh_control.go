@@ -159,6 +159,9 @@ func executeControlCommandWithStreams(ctx context.Context, o *SshOptions, stream
 	if err := o.control.Validate(); err != nil {
 		return controlError(streams.Stderr, err.Error())
 	}
+	if _, err := o.toSessionControlOptions(); err != nil {
+		return controlError(streams.Stderr, err.Error())
+	}
 	// -o Port/User/IdentityFile/ProxyJump are applied by the command's Complete
 	// step, where the parsed flag set is available to keep primary flags winning.
 	if err := o.ensureArgsParsed(); err != nil {

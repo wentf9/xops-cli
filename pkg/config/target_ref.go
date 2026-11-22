@@ -32,6 +32,13 @@ func IsOpenSSHNodeID(id string) bool {
 	return hasOpenSSHPrefix(id)
 }
 
+// TrimOpenSSHNodePrefix trims a leading case-insensitive "openssh:" namespace
+// prefix from id while preserving any user@host:port qualifiers intact.
+// Unlike UnwrapOpenSSHSelector, it does not strip user@ or :port components.
+func TrimOpenSSHNodePrefix(id string) (string, bool) {
+	return cutOpenSSHPrefix(id)
+}
+
 func isBareOrBracketedIPv6Literal(s string) bool {
 	if s == "" {
 		return false

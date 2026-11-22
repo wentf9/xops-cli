@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/cmd/utils"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
@@ -62,6 +63,11 @@ func validateCommonSSHBaseOptions(o *SshOptions) error {
 	}
 	if err := validateProgrammaticSelectors(selectorField{name: "host", val: o.Host}); err != nil {
 		return err
+	}
+	if o.JumpHost != "" {
+		if _, err := ssh.ParseOption(ssh.OptionProxyJump, o.JumpHost, ssh.OptionSourceCLI); err != nil {
+			return fmt.Errorf("invalid --jump (-J): %w", err)
+		}
 	}
 	if err := utils.ValidateRememberPolicy(o.Remember); err != nil {
 		return err

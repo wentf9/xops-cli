@@ -194,6 +194,16 @@ func TestRound7_P2_4_SavedNodeProxyJumpMasksT2ProxyCommandAndUnpersistedMasksT4(
 	if err != nil {
 		t.Fatalf("NewRepositoryWithOpenSSHParser: %v", err)
 	}
+	if _, err := repo.CreateNodeContext(t.Context(), "bastion",
+		models.Node{
+			HostRef:     "h-bastion",
+			IdentityRef: "id-bastion",
+		},
+		models.Host{Address: "10.79.0.253", Port: 22},
+		models.Identity{User: "ops", AuthType: "auto"},
+	); err != nil {
+		t.Fatalf("CreateNodeContext(bastion): %v", err)
+	}
 	if _, err := repo.CreateNodeContext(t.Context(), "saved-jump",
 		models.Node{
 			HostRef:     "h1",

@@ -56,6 +56,13 @@ func (s SessionControlOptions) IsEmpty() bool {
 	return s.Master == nil && s.Path == nil && !s.LiteralPath && s.Persist == nil && s.Options.IsEmpty() && s.proxySetting.IsUnset()
 }
 
+// ProxySetting returns a defensive clone of the Tier-1 ssh.ProxySetting
+// captured by ParseSessionOptions, preserving shadowed ProxyCommand monoid
+// state.
+func (s SessionControlOptions) ProxySetting() ssh.ProxySetting {
+	return s.proxySetting.Merge(ssh.UnsetProxySetting())
+}
+
 func (s *SessionControlOptions) ensureOptions() *ssh.Options {
 	if s.Options == nil {
 		s.Options = &ssh.Options{}
@@ -215,8 +222,8 @@ func ParseSessionOptions(options []string, cliProxyJump string) (SessionControlO
 	var opts SessionControlOptions
 	seen := make(map[string]bool)
 	proxy := ssh.UnsetProxySetting()
-	if trimmedJump := strings.TrimSpace(cliProxyJump); trimmedJump != "" {
-		parsedJump, err := ssh.ParseOption(ssh.OptionProxyJump, trimmedJump, ssh.OptionSourceCLI)
+	if cliProxyJump != "" {
+		parsedJump, err := ssh.ParseOption(ssh.OptionProxyJump, cliProxyJump, ssh.OptionSourceCLI)
 		if err != nil {
 			return opts, fmt.Errorf("invalid ProxyJump: %w", err)
 		}

@@ -263,7 +263,7 @@ func (o *SshOptions) effectiveCLIJumpHost() string {
 	if o == nil {
 		return ""
 	}
-	return strings.TrimSpace(o.JumpHost)
+	return o.JumpHost
 }
 
 func (o *SshOptions) controlSessionOptions() (adapter.SessionControlOptions, error) {
@@ -1261,7 +1261,7 @@ func (o *SshOptions) buildProxyCommandPathChecker(
 		if origHost == "" {
 			origHost = strings.TrimSpace(o.originalHost)
 		}
-		jump := strings.TrimSpace(o.JumpHost)
+		jump := o.JumpHost
 		if jump != "" || origHost != "" || canonHost != "" {
 			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
 				ProxyJump:     jump,
@@ -1303,7 +1303,7 @@ func (c *proxyCommandPathChecker) checkNode(id string, isTarget bool) (bool, err
 	pol, err := c.adp.Resolve(context.Background(), adapter.ResolveRequest{
 		NodeID:         id,
 		SessionControl: &ctrlOpts,
-		ResolveProxy:   isTarget,
+		ResolveProxy:   true,
 	})
 	if err != nil {
 		// Fail closed: if effective policy resolution fails, treat as unsafe to detach/handoff.
@@ -1364,26 +1364,23 @@ func (c *proxyCommandPathChecker) checkOwnedMaster(connector *ssh.Connector, m *
 }
 
 func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nodeID string) (string, error) {
-	if o != nil {
-		jump := strings.TrimSpace(o.JumpHost)
-		if jump != "" {
-			ps, err := ssh.ParseProxyJump(jump)
-			if err != nil {
-				return "", err
-			}
-			targets, ok := ps.JumpTargets()
-			if !ok {
-				return "", nil
-			}
-			if provider == nil {
-				return strings.Join(targets, ","), nil
-			}
-			resolved, err := provider.ResolveProxyJumpChain(jump)
-			if err != nil {
-				return "", err
-			}
-			return resolved, nil
+	if o != nil && o.JumpHost != "" {
+		ps, err := ssh.ParseProxyJump(o.JumpHost)
+		if err != nil {
+			return "", err
 		}
+		targets, ok := ps.JumpTargets()
+		if !ok {
+			return "", nil
+		}
+		if provider == nil {
+			return strings.Join(targets, ","), nil
+		}
+		resolved, err := provider.ResolveProxyJumpChain(o.JumpHost)
+		if err != nil {
+			return "", err
+		}
+		return resolved, nil
 	}
 	if nodeID != "" && provider != nil {
 		snap, err := provider.ResolveConnection(nodeID)
@@ -1393,7 +1390,18 @@ func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nod
 			}
 			return "", err
 		}
-		return strings.TrimSpace(snap.Node.ProxyJump), nil
+		rawJump := strings.TrimSpace(snap.Node.ProxyJump)
+		if rawJump == "" || snap.Provenance.IsUnpersistedOpenSSH() {
+			return rawJump, nil
+		}
+		ps, err := ssh.ParseProxyJump(snap.Node.ProxyJump)
+		if err != nil {
+			return "", err
+		}
+		if ps.Kind() != ssh.ProxyJump {
+			return "", nil
+		}
+		return provider.ResolveProxyJumpChain(rawJump)
 	}
 	return "", nil
 }
@@ -1483,7 +1491,7 @@ func resolvePersistentHandoffNodeID(provider config.ConfigProvider, connector *s
 	if connector != nil && strings.TrimSpace(connector.MasterNodeID(master)) != "" {
 		return resolvedID
 	}
-	if handoffNodeID == "" || (!strings.HasPrefix(handoffNodeID, config.OpenSSHNodePrefix) && strings.HasPrefix(resolvedID, config.OpenSSHNodePrefix)) {
+	if handoffNodeID == "" || (!config.IsOpenSSHNodeID(handoffNodeID) && config.IsOpenSSHNodeID(resolvedID)) {
 		return resolvedID
 	}
 	return handoffNodeID
@@ -1571,7 +1579,7 @@ func parseJumpHopSpec(spec string) (user, host string, port uint16, hasExplicit 
 	if trimmed == "" {
 		return "", "", 0, false
 	}
-	unwrapped := strings.TrimPrefix(trimmed, config.OpenSSHNodePrefix)
+	unwrapped, _ := config.TrimOpenSSHNodePrefix(trimmed)
 	u, h, p, err := utils.ParseAddr(unwrapped)
 	if err != nil {
 		clean, _ := config.OpenSSHOriginalHost(trimmed)
@@ -1580,33 +1588,36 @@ func parseJumpHopSpec(spec string) (user, host string, port uint16, hasExplicit 
 	return u, h, p, u != "" || p != 0
 }
 
+func jumpMasterMatchesKeys(jumps map[string]bool, id string, explicit bool) bool {
+	if id == "" {
+		return false
+	}
+	if jumps[id] {
+		return true
+	}
+	if unwrapped, ok := config.TrimOpenSSHNodePrefix(id); ok && unwrapped != "" && jumps[config.OpenSSHNodePrefix+unwrapped] {
+		return true
+	}
+	if explicit {
+		return false
+	}
+	clean, ok := config.OpenSSHOriginalHost(id)
+	return ok && (jumps[clean] || jumps[config.OpenSSHNodePrefix+clean])
+}
+
 func isSuppressedJumpMaster(jumps map[string]bool, rawOwnedID, resolvedNodeID string) bool {
 	if len(jumps) == 0 {
 		return false
 	}
 	_, _, _, rawExplicit := parseJumpHopSpec(rawOwnedID)
-	if rawOwnedID != "" {
-		if jumps[rawOwnedID] {
-			return true
-		}
-		if !rawExplicit {
-			if clean, ok := config.OpenSSHOriginalHost(rawOwnedID); ok && (jumps[clean] || jumps[config.OpenSSHNodePrefix+clean]) {
-				return true
-			}
-		}
-	}
-	if resolvedNodeID == "" || (strings.HasPrefix(rawOwnedID, config.OpenSSHNodePrefix) && rawExplicit) {
-		return false
-	}
-	if jumps[resolvedNodeID] {
+	if jumpMasterMatchesKeys(jumps, rawOwnedID, rawExplicit) {
 		return true
 	}
-	if _, _, _, resExplicit := parseJumpHopSpec(resolvedNodeID); !resExplicit {
-		if clean, ok := config.OpenSSHOriginalHost(resolvedNodeID); ok && (jumps[clean] || jumps[config.OpenSSHNodePrefix+clean]) {
-			return true
-		}
+	if resolvedNodeID == "" || (config.IsOpenSSHNodeID(rawOwnedID) && rawExplicit) {
+		return false
 	}
-	return false
+	_, _, _, resExplicit := parseJumpHopSpec(resolvedNodeID)
+	return jumpMasterMatchesKeys(jumps, resolvedNodeID, resExplicit)
 }
 
 func (o *SshOptions) hasActiveProxyCommandForMaster(provider config.ConfigProvider, rawOwnedID, resolvedNodeID string) (bool, error) {
@@ -1633,7 +1644,7 @@ func resolveOwnedMasterNodeID(provider config.ConfigProvider, connector *ssh.Con
 }
 
 func normalizeOwnedMasterNodeID(provider config.ConfigProvider, ownedID string, m *ssh.MuxServer) string {
-	if strings.HasPrefix(ownedID, config.OpenSSHNodePrefix) {
+	if config.IsOpenSSHNodeID(ownedID) {
 		return normalizeOwnedOpenSSHMasterNodeID(provider, ownedID, m)
 	}
 	if provider == nil {
@@ -1684,6 +1695,9 @@ func normalizeOwnedOpenSSHMasterNodeID(provider config.ConfigProvider, ownedID s
 	}
 	if alias != "" {
 		return config.OpenSSHNodePrefix + alias
+	}
+	if unwrapped, ok := config.TrimOpenSSHNodePrefix(ownedID); ok && unwrapped != "" {
+		return config.OpenSSHNodePrefix + unwrapped
 	}
 	return ownedID
 }
@@ -1794,7 +1808,7 @@ func collectSavedMasterCandidates(provider config.ConfigProvider, orig, user str
 	var candidates []string
 	addCand := func(id string) {
 		id = strings.TrimSpace(id)
-		if id != "" && !strings.HasPrefix(id, config.OpenSSHNodePrefix) && !slices.Contains(candidates, id) {
+		if id != "" && !config.IsOpenSSHNodeID(id) && !slices.Contains(candidates, id) {
 			candidates = append(candidates, id)
 		}
 	}
@@ -1847,7 +1861,7 @@ func savedMasterNodeMatches(snap config.ConnectionSnapshot, targetHost, user str
 
 func resolveSavedMasterNodeID(provider config.ConfigProvider, orig, targetHost, user string, port uint16) string {
 	orig = strings.TrimSpace(orig)
-	if provider == nil || orig == "" || strings.HasPrefix(orig, config.OpenSSHNodePrefix) {
+	if provider == nil || orig == "" || config.IsOpenSSHNodeID(orig) {
 		return ""
 	}
 	for _, candID := range collectSavedMasterCandidates(provider, orig, user, port) {
@@ -1977,7 +1991,7 @@ func resolveJumpHopConnection(provider config.ConfigProvider, hop string, hasExp
 	if provider == nil || hop == "" {
 		return config.ConnectionSnapshot{}, false
 	}
-	unwrapped := strings.TrimPrefix(hop, config.OpenSSHNodePrefix)
+	unwrapped, _ := config.TrimOpenSSHNodePrefix(hop)
 	candidates := []string{hop, config.OpenSSHNodePrefix + unwrapped}
 	if !hasExplicit {
 		if cleanHop, ok := config.OpenSSHOriginalHost(hop); ok && cleanHop != "" {
@@ -2000,7 +2014,7 @@ func resolveJumpHopConnection(provider config.ConfigProvider, hop string, hasExp
 
 func addPersistentJumpHopKeys(jumps map[string]bool, hop string, hasExplicit bool) {
 	jumps[hop] = true
-	unwrapped := strings.TrimPrefix(hop, config.OpenSSHNodePrefix)
+	unwrapped, _ := config.TrimOpenSSHNodePrefix(hop)
 	if unwrapped != "" {
 		jumps[unwrapped] = true
 		jumps[config.OpenSSHNodePrefix+unwrapped] = true
@@ -2346,7 +2360,7 @@ func lookupJumpHopMaster(
 	hop string,
 	hasExplicit bool,
 ) (*ssh.MuxServer, string) {
-	unwrapped := strings.TrimPrefix(hop, config.OpenSSHNodePrefix)
+	unwrapped, _ := config.TrimOpenSSHNodePrefix(hop)
 	candidates := []string{hop, unwrapped, config.OpenSSHNodePrefix + unwrapped}
 	if !hasExplicit {
 		if cleanHop, isOpenSSH := config.OpenSSHOriginalHost(hop); isOpenSSH && cleanHop != "" {
@@ -2404,7 +2418,7 @@ func indexSingleJumpChainMaster(byHost map[string]*ssh.MuxServer, connector *ssh
 		if ownedID := strings.TrimSpace(connector.MasterNodeID(m)); ownedID != "" {
 			byHost[ownedID] = m
 			_, _, _, ownedExplicit = parseJumpHopSpec(ownedID)
-			unwrapped := strings.TrimPrefix(ownedID, config.OpenSSHNodePrefix)
+			unwrapped, _ := config.TrimOpenSSHNodePrefix(ownedID)
 			if unwrapped != "" {
 				byHost[unwrapped] = m
 				byHost[config.OpenSSHNodePrefix+unwrapped] = m

@@ -487,11 +487,8 @@ func parseTier4CanonicalOptions(doc *sshConfigDoc, host string) *ssh.Options {
 func parseCLICanonicalLayer(rawCLI []string, cliProxyJump string) (*ssh.Options, ssh.ProxySetting, error) {
 	cliOpts := &ssh.Options{}
 	cliProxy := ssh.UnsetProxySetting()
-	if hasControlOrLineSepChar(cliProxyJump) {
-		return nil, ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ssh.ErrSSHOptionsValidation, cliProxyJump)
-	}
-	if pj := strings.TrimSpace(cliProxyJump); pj != "" {
-		ps, err := ssh.ParseProxyJump(pj)
+	if cliProxyJump != "" {
+		ps, err := ssh.ParseProxyJump(cliProxyJump)
 		if err != nil {
 			return nil, ssh.UnsetProxySetting(), fmt.Errorf("invalid ProxyJump %q: %w", cliProxyJump, err)
 		}

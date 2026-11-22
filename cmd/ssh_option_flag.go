@@ -127,7 +127,7 @@ func (f *SSHControlFlags) ToSessionControlOptionsWithJump(cliJump string) (adapt
 	var sessionOpts adapter.SessionControlOptions
 
 	// 1. Parse -o options and explicit CLI -J / --jump override if provided
-	if len(f.Options) > 0 || strings.TrimSpace(cliJump) != "" {
+	if len(f.Options) > 0 || cliJump != "" {
 		parsed, err := adapter.ParseSessionOptions(f.Options, cliJump)
 		if err != nil {
 			return sessionOpts, err
@@ -237,8 +237,8 @@ func effectiveConnectionTarget(opts *SshOptions, nodeID string) config.Connectio
 			target.Port = opts.Port
 			target.HasPort = true
 		}
-		if strings.TrimSpace(opts.JumpHost) != "" && (!target.HasProxyJump || target.ProxyJump != strings.TrimSpace(opts.JumpHost)) {
-			target.ProxyJump = strings.TrimSpace(opts.JumpHost)
+		if opts.JumpHost != "" && (!target.HasProxyJump || target.ProxyJump != opts.JumpHost) {
+			target.ProxyJump = opts.JumpHost
 			target.HasProxyJump = true
 		}
 	}
@@ -307,9 +307,17 @@ func resolveControlSessionLookup(
 	connTarget config.ConnectionTarget,
 	target ssh.TargetContext,
 ) (string, adapter.SessionAuth) {
-	req := buildControlTargetRequest(opts, provider, nodeID, connTarget, adapter.SessionControlOptions{})
+	var sessionOpts adapter.SessionControlOptions
 	if opts != nil {
-		req.Target.ProxyJump = strings.TrimSpace(opts.JumpHost)
+		if err := opts.ensureGeneralOptionsApplied(); err == nil {
+			if parsed, err := opts.toSessionControlOptions(); err == nil {
+				sessionOpts = parsed
+			}
+		}
+	}
+	req := buildControlTargetRequest(opts, provider, nodeID, connTarget, sessionOpts)
+	if opts != nil {
+		req.Target.ProxyJump = opts.JumpHost
 	}
 	return adapter.ResolveControlSessionLookup(req, target)
 }
@@ -319,11 +327,13 @@ func resolveControlSessionLookup(
 func controlTarget(opts *SshOptions, provider config.ConfigProvider, nodeID string) ssh.TargetContext {
 	var sessionOpts adapter.SessionControlOptions
 	if opts != nil {
+		if err := opts.ensureGeneralOptionsApplied(); err == nil {
+			if parsed, err := opts.toSessionControlOptions(); err == nil {
+				sessionOpts = parsed
+			}
+		}
 		if provider != nil {
 			opts.syncResolvedTargetHosts(provider)
-		}
-		if parsed, err := opts.toSessionControlOptions(); err == nil {
-			sessionOpts = parsed
 		}
 	}
 	req := buildControlTargetRequest(opts, provider, nodeID, effectiveConnectionTarget(opts, nodeID), sessionOpts)
@@ -371,6 +381,15 @@ func validateExplicitNonEmptyFlags(flags *pflag.FlagSet) error {
 			continue
 		}
 		val, err := flags.GetString(name)
+		if err == nil && name == "jump" {
+			if _, parseErr := ssh.ParseOption(ssh.OptionProxyJump, val, ssh.OptionSourceCLI); parseErr != nil {
+				if strings.TrimSpace(val) == "" {
+					return fmt.Errorf("flag --jump must not be empty: %w", parseErr)
+				}
+				return fmt.Errorf("invalid --jump (-J): %w", parseErr)
+			}
+			continue
+		}
 		if err == nil && strings.TrimSpace(val) == "" {
 			if name == "control-command" {
 				return (&SSHControlFlags{CtlCmd: val, ctlCmdSet: true}).controlUsageError(fmt.Errorf("unknown control command %q (supported: check, exit, stop, forward, cancel, proxy, proxy-stream, conninfo, channels)", val))

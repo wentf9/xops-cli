@@ -503,8 +503,22 @@ func TestCommands_SSHSessionOnlyDoesNotInitializeSystemStore(t *testing.T) {
 	}
 }
 
+func seedTestJumpNode(t *testing.T, repo *config.Repository, nodeID string) {
+	t.Helper()
+	if _, err := repo.CreateNodeContext(
+		t.Context(),
+		nodeID,
+		models.Node{HostRef: "host-" + nodeID, IdentityRef: "id-" + nodeID},
+		models.Host{Address: "10.238.221.1", Port: 22},
+		models.Identity{User: "iaas", AuthType: "auto"},
+	); err != nil {
+		t.Fatalf("seed jump node %q: %v", nodeID, err)
+	}
+}
+
 func TestCommands_SSHRememberNeverCoversProxyJump(t *testing.T) {
 	repo := setupTestRepository(t)
+	seedTestJumpNode(t, repo, "jump-01")
 	o := NewSshOptions()
 	o.Remember = "never"
 	opts, err := o.buildAdapterOptions("final-node", repo.Snapshot(), repo)
@@ -559,6 +573,7 @@ func TestCommands_SSHLegacyWithoutStoreKeepsDiscoveredCredentialsInSession(t *te
 
 func TestCommands_SSHSessionOnlyUsesSelectedKey(t *testing.T) {
 	repo := setupTestRepository(t)
+	seedTestJumpNode(t, repo, "jump-01")
 	o := NewSshOptions()
 	o.Remember = "never"
 	o.IdentityFile = t.TempDir()
@@ -592,6 +607,7 @@ func TestCommands_ExecBatchNeverPromptsOrRecords(t *testing.T) {
 
 func TestCommands_ExecRememberNeverCoversProxyJump(t *testing.T) {
 	repo := setupTestRepository(t)
+	seedTestJumpNode(t, repo, "jump-01")
 	o := NewExecOptions()
 	o.Interactive = true
 	o.Remember = utils.RememberPolicyNever
@@ -619,6 +635,7 @@ func TestCommands_ExecRememberNeverCoversProxyJump(t *testing.T) {
 
 func TestCommands_ExecUsesSelectedSessionKey(t *testing.T) {
 	repo := setupTestRepository(t)
+	seedTestJumpNode(t, repo, "jump-01")
 	o := NewExecOptions()
 	o.Host = "iaas@10.238.221.181"
 	o.IdentityFile = t.TempDir()

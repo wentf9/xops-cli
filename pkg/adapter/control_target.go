@@ -172,9 +172,7 @@ func resolveControlTargetContext(req ControlTargetRequest, connTarget config.Con
 			target.Port = int(connTarget.Port)
 		}
 	}
-	if proxyCommandOverridesControlJump(req, connTarget, hasResolved, resolvedTarget) {
-		target.JumpHost = ""
-	}
+	target.JumpHost = resolveControlEffectiveJumpHost(req, connTarget, hasResolved, resolvedTarget)
 	return ssh.NormalizeTargetContext(target, env)
 }
 
@@ -193,36 +191,128 @@ func applyTargetNodeOverrides(req ControlTargetRequest, target *ssh.TargetContex
 	}
 }
 
-// proxyCommandOverridesControlJump mirrors ProxySetting precedence so a
-// higher-tier ProxyCommand (active or "none") clears a lower-tier ProxyJump in
-// TargetContext.JumpHost (closing %j / %C drift between control-plane lookups
-// and SSHAdapter.GetConfig).
-func proxyCommandOverridesControlJump(
+func resolveControlTier1ProxySetting(connTarget config.ConnectionTarget, sessionCtrl SessionControlOptions) ssh.ProxySetting {
+	t1Jump := ssh.UnsetProxySetting()
+	if connTarget.ProxyJump != "" {
+		if ps, err := ssh.ParseProxyJump(connTarget.ProxyJump); err == nil {
+			t1Jump = ps
+		}
+	}
+	return ssh.MergeProxySettings(
+		t1Jump,
+		sessionCtrl.ProxySetting(),
+		proxyCommandSetting(sessionCtrl.Options),
+	)
+}
+
+func resolveControlTier2ProxySetting(
+	provider config.ConfigProvider,
+	connTarget config.ConnectionTarget,
+	hasResolved bool,
+	resolved config.ResolvedTarget,
+) ssh.ProxySetting {
+	if !hasResolved || resolved.Provenance.IsUnpersistedOpenSSH() {
+		return ssh.UnsetProxySetting()
+	}
+	var t2Jump, t2Cmd ssh.ProxySetting
+	if provider != nil && resolved.MatchedNodeID != "" && !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
+		if node, ok := provider.GetNode(resolved.MatchedNodeID); ok {
+			if ps, err := proxySettingFromJumpString(node.ProxyJump); err == nil {
+				t2Jump = ps
+			}
+			t2Cmd = proxyCommandSetting(node.SSHOptions)
+			return t2Jump.Merge(t2Cmd)
+		}
+	}
+	if !connTarget.HasProxyJump && resolved.ProxyJump != "" {
+		if ps, err := proxySettingFromJumpString(resolved.ProxyJump); err == nil {
+			t2Jump = ps
+		}
+	}
+	return t2Jump
+}
+
+func resolveControlTier3ProxySetting(provider config.ConfigProvider) ssh.ProxySetting {
+	if provider == nil {
+		return ssh.UnsetProxySetting()
+	}
+	if snap := provider.Snapshot(); snap != nil {
+		return proxyCommandSetting(snap.SSHOptions)
+	}
+	return ssh.UnsetProxySetting()
+}
+
+func resolveControlTier4ProxySetting(
+	provider config.ConfigProvider,
+	connTarget config.ConnectionTarget,
+	hasResolved bool,
+	resolved config.ResolvedTarget,
+) ssh.ProxySetting {
+	if !hasResolved || !resolved.Provenance.IsUnpersistedOpenSSH() {
+		return ssh.UnsetProxySetting()
+	}
+	var t4Jump, t4Parser ssh.ProxySetting
+	if connTarget.ProxyJump == "" && resolved.ProxyJump != "" {
+		if ps, err := proxySettingFromJumpString(resolved.ProxyJump); err == nil {
+			t4Jump = ps
+		}
+	}
+	if parserSrc, ok := provider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok && parserSrc != nil {
+		if parser := parserSrc.GetOpenSSHParser(); parser != nil && parser.Err() == nil {
+			alias := strings.TrimSpace(resolved.OpenSSHAlias)
+			if alias == "" {
+				alias = strings.TrimSpace(config.UnwrapOpenSSHSelector(resolved.NodeID))
+			}
+			canon := strings.TrimSpace(resolved.CanonicalHost)
+			if alias != "" || canon != "" {
+				if ps, err := parser.ResolveProxySettingWithCanonical(alias, canon); err == nil {
+					t4Parser = ps
+				}
+			}
+		}
+	}
+	return t4Jump.Merge(t4Parser)
+}
+
+// resolveControlEffectiveJumpHost folds ProxyJump and ProxyCommand across all
+// 4 tiers using the same ssh.ProxySetting monoid as resolveFourTierProxySetting
+// so %j / %C ControlPath expansion and CanonicalTargetIdentity stay aligned
+// with SSHAdapter.GetConfig.
+func resolveControlEffectiveJumpHost(
 	req ControlTargetRequest,
 	connTarget config.ConnectionTarget,
 	hasResolved bool,
 	resolved config.ResolvedTarget,
-) bool {
-	if strings.TrimSpace(connTarget.ProxyJump) != "" {
-		if ps, err := ssh.ParseProxyJump(connTarget.ProxyJump); err == nil && ps.Kind() == ssh.ProxyJump {
-			return false
-		}
+) string {
+	t1Proxy := resolveControlTier1ProxySetting(connTarget, req.SessionControl)
+	t2Proxy := resolveControlTier2ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+	t3Proxy := resolveControlTier3ProxySetting(req.Provider)
+	t4Proxy := resolveControlTier4ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+
+	effective := ssh.MergeProxySettings(t1Proxy, t2Proxy, t3Proxy, t4Proxy)
+	if effective.Kind() != ssh.ProxyJump {
+		return ""
 	}
-	if req.SessionControl.Options != nil {
-		t1Proxy := req.SessionControl.Options.ProxyCommandSetting()
-		if t1Proxy.Kind() == ssh.ProxyCommand || t1Proxy.Equal(ssh.DisabledProxySetting()) {
-			return true
-		}
+	targets, ok := effective.JumpTargets()
+	if !ok {
+		return ""
 	}
-	if hasResolved && resolved.Provenance.IsUnpersistedOpenSSH() && req.Provider != nil {
-		if snap := req.Provider.Snapshot(); snap != nil && snap.SSHOptions != nil {
-			t3Proxy := snap.SSHOptions.ProxyCommandSetting()
-			if t3Proxy.Kind() == ssh.ProxyCommand || t3Proxy.Equal(ssh.DisabledProxySetting()) {
-				return true
+	tier1Won := t1Proxy.Kind() == ssh.ProxyJump
+	if !tier1Won && hasResolved && resolved.Provenance.IsUnpersistedOpenSSH() {
+		for i, hop := range targets {
+			if !config.IsOpenSSHNodeID(hop) {
+				targets[i] = config.OpenSSHNodePrefix + hop
 			}
 		}
+		return strings.Join(targets, ",")
 	}
-	return false
+	rawJump := strings.Join(targets, ",")
+	if req.Provider != nil {
+		if resolvedJump, err := req.Provider.ResolveProxyJumpChain(rawJump); err == nil {
+			return resolvedJump
+		}
+	}
+	return rawJump
 }
 
 func isResolvedSavedNode(r config.ResolvedTarget) bool {
@@ -333,6 +423,22 @@ func resolveSavedControlSessionLookup(
 	return "", auth, false, resolvedVirtual
 }
 
+func effectiveControlSessionProxyJump(connTarget config.ConnectionTarget, sessionCtrl SessionControlOptions) string {
+	if connTarget.ProxyJump != "" {
+		return connTarget.ProxyJump
+	}
+	ps := sessionCtrl.ProxySetting()
+	switch {
+	case ps.Kind() == ssh.ProxyJump:
+		if targets, ok := ps.JumpTargets(); ok {
+			return strings.Join(targets, ",")
+		}
+	case ps.IsJumpDisabledOnly():
+		return "none"
+	}
+	return ""
+}
+
 func resolveControlSessionLookup(
 	req ControlTargetRequest,
 	connTarget config.ConnectionTarget,
@@ -341,7 +447,7 @@ func resolveControlSessionLookup(
 	origHost := strings.TrimSpace(req.CanonicalOriginalHost)
 	canonHost := strings.TrimSpace(req.CanonicalHost)
 	targetOrig := strings.TrimSpace(target.OriginalHost)
-	proxyJump := strings.TrimSpace(connTarget.ProxyJump)
+	proxyJump := effectiveControlSessionProxyJump(connTarget, req.SessionControl)
 	lookupKey := strings.TrimSpace(req.NodeID)
 	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
 		req.Provider, lookupKey, req.NodeID, connTarget, origHost, canonHost, targetOrig, proxyJump,
