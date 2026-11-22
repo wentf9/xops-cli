@@ -38,6 +38,7 @@ type nodeFormState struct {
 	skipVerify bool
 
 	// 凭据状态与操作
+	keyPathLoaded           bool
 	passwordAction          string // "keep", "replace", "delete"
 	passwordStoreStatus     string // "stored in <StoreID>", "legacy plaintext", "not set"
 	passphraseAction        string // "keep", "replace", "delete"
@@ -138,6 +139,7 @@ func (m *Model) initForm(nodeID string) (Model, tea.Cmd) {
 				huh.NewOption("Key File", "key"),
 				huh.NewOption("OTP / 2FA", "otp"),
 				huh.NewOption("Keyboard-Interactive", "keyboard-interactive"),
+				huh.NewOption("Auto", "auto"),
 			).
 			Value(&state.authType).
 			Inline(true),
@@ -308,6 +310,7 @@ func (m *Model) newNodeFormState(nodeID string) (*nodeFormState, error) {
 
 	state.password = ""
 	state.keyPath = identity.KeyPath
+	state.keyPathLoaded = true
 	state.passphrase = ""
 	state.sudoMode = string(node.SudoMode)
 	if state.sudoMode == "" {
@@ -402,9 +405,23 @@ func normalizeFormIdentityKeyPath(raw string) (string, error) {
 	return setting.Raw, nil
 }
 
-// resolveFormKeyPath normalizes keyPath when key authentication is selected.
+func authTypeSupportsPassword(authType string) bool {
+	return authType != "key"
+}
+
+func authTypeSupportsKey(authType string) bool {
+	switch authType {
+	case "key", "otp", "keyboard-interactive", "auto":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveFormKeyPath normalizes keyPath when the selected authentication mode
+// supports private-key material ("key", "otp", "keyboard-interactive", "auto").
 func resolveFormKeyPath(authType, keyPath string) (string, error) {
-	if authType != "key" || keyPath == "" {
+	if !authTypeSupportsKey(authType) || keyPath == "" {
 		return "", nil
 	}
 	return normalizeFormIdentityKeyPath(keyPath)
@@ -522,45 +539,86 @@ func (m *Model) saveFormCmd() tea.Cmd {
 	// The read and conditional write are tied to the same revision. This keeps
 	// fields which the form does not own intact without overwriting a concurrent
 	// edit made after the form was opened.
-	var node models.Node
-	if s.isEdit {
-		var ok bool
-		node, ok = view.Configuration.Nodes.Get(s.originalID)
-		if !ok {
-			m.status = errorStyle.Render(fmt.Sprintf("resolve node %q before saving: %v", s.originalID, config.ErrNodeNotFound))
-			return nil
-		}
-	}
-
-	// Standardize key path without mangling OpenSSH templates (%tokens, ${VAR}) or "none".
-	absKeyPath, err := resolveFormKeyPath(s.authType, s.keyPath)
+	nodeID, node, host, identity, err := resolveSubmittedFormAssets(&s, view, identityID, hostID, nodeID, port)
 	if err != nil {
 		m.status = errorStyle.Render(err.Error())
 		return nil
 	}
 
-	// Preserve the actual identity referenced by an edited node. The canonical
-	// ID is only suitable for a new node or a deliberate rename.
-	identity, ok := view.Configuration.Identities.Get(identityID)
-	if s.isEdit && node.IdentityRef != "" {
-		identity, ok = view.Configuration.Identities.Get(node.IdentityRef)
+	// Standardize key path without mangling OpenSSH templates (%tokens, ${VAR}) or "none".
+	rawKeyPath := s.keyPath
+	if s.isEdit && !s.keyPathLoaded && rawKeyPath == "" && authTypeSupportsKey(s.authType) {
+		rawKeyPath = identity.KeyPath
 	}
-	if !ok {
-		identity = models.Identity{}
+	absKeyPath, err := resolveFormKeyPath(s.authType, rawKeyPath)
+	if err != nil {
+		m.status = errorStyle.Render(err.Error())
+		return nil
 	}
-	actions := s.applyIdentityCredentials(&identity, absKeyPath)
 
-	// Try to get existing host to preserve any extra fields (like Host.Alias).
-	host, _ := view.Configuration.Hosts.Get(hostID)
-	host.Address = s.address
-	host.Port = port
-	node.HostRef = hostID
-	node.IdentityRef = identityID
+	actions := s.applyIdentityCredentials(&identity, absKeyPath)
 	node.SudoMode = models.SudoMode(s.sudoMode)
 	node.Alias = splitComma(s.alias)
 	node.Tags = splitComma(s.tags)
 
-	var run func(context.Context) error
+	run := m.buildFormSaveRunner(view, s, nodeID, node, host, identity, actions)
+	if !s.isEdit && !s.skipVerify {
+		return m.beginFormVerification(run, s, nodeID, node, host, identity, absKeyPath)
+	}
+	return m.beginConfigurationMutation(configurationMutationForm, nodeID, 0, run)
+}
+
+func resolveSubmittedFormAssets(
+	s *nodeFormState,
+	view config.ConfigView,
+	identityID, hostID, canonicalNodeID string,
+	port uint16,
+) (string, models.Node, models.Host, models.Identity, error) {
+	if !s.isEdit {
+		node := models.Node{
+			IdentityRef: allocateFormIdentityRef(view.Configuration, identityID, canonicalNodeID),
+		}
+		var host models.Host
+		node.HostRef, host = allocateFormHostRef(view.Configuration, hostID, canonicalNodeID, s.address, port)
+		return canonicalNodeID, node, host, models.Identity{}, nil
+	}
+
+	node, ok := view.Configuration.Nodes.Get(s.originalID)
+	if !ok {
+		return "", models.Node{}, models.Host{}, models.Identity{}, fmt.Errorf("resolve node %q before saving: %w", s.originalID, config.ErrNodeNotFound)
+	}
+	oldHost, oldHostOK := view.Configuration.Hosts.Get(node.HostRef)
+	oldIdent, oldIdentOK := view.Configuration.Identities.Get(node.IdentityRef)
+	nodeID := resolveSubmittedFormNodeID(*s, canonicalNodeID, oldHost, oldHostOK, oldIdent, oldIdentOK)
+
+	var identity models.Identity
+	if node.IdentityRef != "" && oldIdentOK {
+		identity = oldIdent
+	} else {
+		node.IdentityRef = allocateFormIdentityRef(view.Configuration, identityID, nodeID)
+	}
+	populateEditedFormExistingSecrets(s, identity)
+
+	var host models.Host
+	if node.HostRef != "" && oldHostOK {
+		host = oldHost
+		host.Address = s.address
+		host.Port = port
+	} else {
+		node.HostRef, host = allocateFormHostRef(view.Configuration, hostID, nodeID, s.address, port)
+	}
+	return nodeID, node, host, identity, nil
+}
+
+func (m *Model) buildFormSaveRunner(
+	view config.ConfigView,
+	s nodeFormState,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	actions formCredentialActions,
+) func(context.Context) error {
 	repository := m.repository
 	credentialService := m.credentialService
 	if s.isEdit {
@@ -571,51 +629,170 @@ func (m *Model) saveFormCmd() tea.Cmd {
 			// the form opens; this fallback preserves that internal construction path.
 			ref = view.NodeRefs[s.originalID]
 		}
-		run = func(ctx context.Context) error {
+		return func(ctx context.Context) error {
 			authVersion, err := repository.ReplaceNodeAtRefWithAuthVersionContext(ctx, ref, nodeID, node, host, identity)
 			if err != nil {
 				return err
 			}
 			return syncCredentialsToStore(ctx, repository, credentialService, nodeID, authVersion, s, actions)
 		}
-	} else {
-		run = func(ctx context.Context) error {
-			mutation, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
-			if err != nil {
-				return err
-			}
-			return syncCredentialsToStore(ctx, repository, credentialService, nodeID, mutation.AuthVersion, s, actions)
-		}
 	}
-	if !s.isEdit && !s.skipVerify {
-		checkIdentity := identity
-		checkIdentity.AuthType = s.authType
-		if s.authType != "key" && s.password != "" {
-			checkIdentity.Password = s.password
-			checkIdentity.LoginPasswordRef = nil
+	return func(ctx context.Context) error {
+		mutation, err := repository.CreateNodeContext(ctx, nodeID, node, host, identity)
+		if err != nil {
+			return err
 		}
-		if s.authType == "key" {
-			checkIdentity.KeyPath, checkIdentity.Passphrase = absKeyPath, s.passphrase
+		return syncCredentialsToStore(ctx, repository, credentialService, nodeID, mutation.AuthVersion, s, actions)
+	}
+}
+
+func (m *Model) beginFormVerification(
+	run func(context.Context) error,
+	s nodeFormState,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	absKeyPath string,
+) tea.Cmd {
+	checkIdentity := buildFormVerificationIdentity(s, identity, absKeyPath)
+	preview, err := m.repository.PreviewConnection(nodeID, node, host, checkIdentity)
+	if err != nil {
+		m.status = errorStyle.Render(err.Error())
+		return nil
+	}
+	verify := m.connectionConfig.verifyConnection
+	if verify == nil {
+		verify = adapter.VerifyConnection
+	}
+	m.formVerifiedSave, m.formVerifyNodeID = run, nodeID
+	registry := m.connectionConfig.credentialRegistry
+	cmd := m.beginConfigurationMutation(configurationMutationVerify, nodeID, 0, func(ctx context.Context) error {
+		return verify(ctx, preview, nodeID, registry)
+	})
+	m.status = i18n.T("tui_status_verifying")
+	return cmd
+}
+
+func buildFormVerificationIdentity(s nodeFormState, base models.Identity, absKeyPath string) models.Identity {
+	checkIdentity := base
+	checkIdentity.AuthType = s.authType
+	if authTypeSupportsPassword(s.authType) && s.password != "" {
+		checkIdentity.Password = s.password
+		checkIdentity.LoginPasswordRef = nil
+	}
+	if authTypeSupportsKey(s.authType) {
+		if absKeyPath != "" {
+			checkIdentity.KeyPath = absKeyPath
+		}
+		if s.passphrase != "" {
+			checkIdentity.Passphrase = s.passphrase
 			checkIdentity.PassphraseRef = nil
 		}
-		preview, err := repository.PreviewConnection(nodeID, node, host, checkIdentity)
-		if err != nil {
-			m.status = errorStyle.Render(err.Error())
-			return nil
-		}
-		verify := m.connectionConfig.verifyConnection
-		if verify == nil {
-			verify = adapter.VerifyConnection
-		}
-		m.formVerifiedSave, m.formVerifyNodeID = run, nodeID
-		registry := m.connectionConfig.credentialRegistry
-		cmd := m.beginConfigurationMutation(configurationMutationVerify, nodeID, 0, func(ctx context.Context) error {
-			return verify(ctx, preview, nodeID, registry)
-		})
-		m.status = i18n.T("tui_status_verifying")
-		return cmd
 	}
-	return m.beginConfigurationMutation(configurationMutationForm, nodeID, 0, run)
+	return checkIdentity
+}
+
+func resolveSubmittedFormNodeID(
+	s nodeFormState,
+	canonicalNodeID string,
+	oldHost models.Host,
+	oldHostOK bool,
+	oldIdentity models.Identity,
+	oldIdentityOK bool,
+) string {
+	if !s.isEdit || s.originalID == "" {
+		return canonicalNodeID
+	}
+	if !oldHostOK || !oldIdentityOK {
+		return s.originalID
+	}
+	oldPort := oldHost.Port
+	if oldPort == 0 {
+		oldPort = 22
+	}
+	if s.originalID != config.FormatNodeID(oldIdentity.User, oldHost.Address, oldPort) {
+		// Preserve non-canonical custom or OpenSSH-imported node IDs across edits.
+		return s.originalID
+	}
+	return canonicalNodeID
+}
+
+func populateEditedFormExistingSecrets(s *nodeFormState, identity models.Identity) {
+	if s.existingPasswordRef == nil && identity.LoginPasswordRef != nil {
+		s.existingPasswordRef = identity.LoginPasswordRef.Clone()
+	}
+	if s.existingPlainPassword == "" && identity.Password != "" {
+		s.existingPlainPassword = identity.Password
+	}
+	if s.existingPassphraseRef == nil && identity.PassphraseRef != nil {
+		s.existingPassphraseRef = identity.PassphraseRef.Clone()
+	}
+	if s.existingPlainPassphrase == "" && identity.Passphrase != "" {
+		s.existingPlainPassphrase = identity.Passphrase
+	}
+}
+
+func allocateUnusedFormRef(inUse func(string) bool, base string) string {
+	if !inUse(base) {
+		return base
+	}
+	for suffix := 2; ; suffix++ {
+		candidate := fmt.Sprintf("%s:%d", base, suffix)
+		if !inUse(candidate) {
+			return candidate
+		}
+	}
+}
+
+func allocateFormIdentityRef(cfg *config.Configuration, canonicalIdentityID, nodeID string) string {
+	if cfg == nil || cfg.Identities == nil {
+		return canonicalIdentityID
+	}
+	if _, exists := cfg.Identities.Get(canonicalIdentityID); !exists {
+		return canonicalIdentityID
+	}
+	return allocateUnusedFormRef(func(candidate string) bool {
+		_, exists := cfg.Identities.Get(candidate)
+		return exists
+	}, fmt.Sprintf("node:%s:identity", nodeID))
+}
+
+func allocateFormHostRef(cfg *config.Configuration, canonicalHostID, nodeID, address string, port uint16) (string, models.Host) {
+	fresh := models.Host{Address: address, Port: port}
+	if cfg == nil || cfg.Hosts == nil {
+		return canonicalHostID, fresh
+	}
+	targetEp, tErr := ssh.NewEndpoint(address, int(port))
+	matchesUnaliased := func(h models.Host) bool {
+		if len(h.Alias) > 0 {
+			return false
+		}
+		hp := h.Port
+		if hp == 0 {
+			hp = 22
+		}
+		hostEp, hErr := ssh.NewEndpoint(h.Address, int(hp))
+		return tErr == nil && hErr == nil && hostEp.Equal(targetEp)
+	}
+	if existing, exists := cfg.Hosts.Get(canonicalHostID); exists && matchesUnaliased(existing) {
+		return canonicalHostID, existing
+	}
+	keys := cfg.Hosts.Keys()
+	sort.Strings(keys)
+	for _, href := range keys {
+		if existing, exists := cfg.Hosts.Get(href); exists && matchesUnaliased(existing) {
+			return href, existing
+		}
+	}
+	if _, exists := cfg.Hosts.Get(canonicalHostID); !exists {
+		return canonicalHostID, fresh
+	}
+	privateRef := allocateUnusedFormRef(func(candidate string) bool {
+		_, exists := cfg.Hosts.Get(candidate)
+		return exists
+	}, fmt.Sprintf("node:%s:host", nodeID))
+	return privateRef, fresh
 }
 
 //nolint:gocyclo // credential actions and cross-authentication transitions must stay in one atomic state calculation
@@ -642,147 +819,192 @@ func (s *nodeFormState) applyIdentityCredentials(identity *models.Identity, absK
 		}
 	}
 
+	prevSupportsPassword := previousAuthType != "" && authTypeSupportsPassword(previousAuthType)
+	prevSupportsKey := authTypeSupportsKey(previousAuthType) ||
+		(previousAuthType == "" && (identity.KeyPath != "" || identity.PassphraseRef != nil || identity.Passphrase != ""))
+	supportsPassword := authTypeSupportsPassword(s.authType)
+	supportsKey := authTypeSupportsKey(s.authType)
+
+	droppingPassword := !supportsPassword && (prevSupportsPassword || identity.LoginPasswordRef != nil || identity.Password != "")
+	droppingKey := !supportsKey && (prevSupportsKey || identity.KeyPath != "" || identity.PassphraseRef != nil || identity.Passphrase != "")
+
+	passwordReplacement := supportsPassword && actions.password == "replace" && s.password != ""
+	passphraseReplacement := supportsKey && actions.passphrase == "replace" && s.passphrase != ""
+
 	// A credential store write occurs after this metadata mutation. Keep the
 	// previous authentication usable until that write atomically installs the
 	// new reference and key path.
-	previousUsesKey := previousAuthType == "key"
-	currentUsesKey := s.authType == "key"
-	credentialReplacement := (!currentUsesKey && actions.password == "replace" && s.password != "") ||
-		(currentUsesKey && actions.passphrase == "replace" && s.passphrase != "")
-	previousRef := (*credential.Ref)(nil)
-	if previousUsesKey {
-		previousRef = identity.PassphraseRef
-	} else if previousAuthType != "" {
-		previousRef = identity.LoginPasswordRef
-	}
-	deferSwitch := previousUsesKey != currentUsesKey && (credentialReplacement || previousRef != nil)
-	deferKeyPath := previousUsesKey && currentUsesKey && credentialReplacement
-	deferCredentialMetadata := deferSwitch || deferKeyPath
+	deferSwitch := (droppingPassword && (passphraseReplacement || identity.LoginPasswordRef != nil)) ||
+		(droppingKey && (passwordReplacement || identity.PassphraseRef != nil))
+	deferKeyPath := s.isEdit && supportsKey && passphraseReplacement
+
 	identity.AuthType = s.authType
 	if deferSwitch {
 		identity.AuthType = previousAuthType
-		if !previousUsesKey {
+	}
+	if droppingPassword {
+		if identity.LoginPasswordRef != nil {
 			actions.cleanupKind = credential.KindLoginPassword
 			actions.cleanupRef = identity.LoginPasswordRef.Clone()
-		} else {
+		}
+		if deferSwitch && identity.Password != "" {
+			actions.clearLegacyLoginPassword = true
+		}
+	}
+	if droppingKey {
+		if identity.PassphraseRef != nil {
 			actions.cleanupKind = credential.KindPassphrase
 			actions.cleanupRef = identity.PassphraseRef.Clone()
 		}
-	}
-	if deferSwitch && previousUsesKey && !currentUsesKey {
-		actions.clearKeyPath = true
-	}
-	if previousUsesKey != currentUsesKey {
-		if !previousUsesKey && previousAuthType != "" {
-			actions.cleanupKind = credential.KindLoginPassword
-			actions.cleanupRef = identity.LoginPasswordRef.Clone()
-			if deferSwitch && identity.Password != "" {
-				actions.clearLegacyLoginPassword = true
-			}
-		} else if previousUsesKey {
-			actions.cleanupKind = credential.KindPassphrase
-			actions.cleanupRef = identity.PassphraseRef.Clone()
-			if deferSwitch && identity.Passphrase != "" {
+		if deferSwitch {
+			actions.clearKeyPath = true
+			if identity.Passphrase != "" {
 				actions.clearLegacyPassphrase = true
 			}
 		}
 	}
 
-	if !currentUsesKey {
-		if !deferCredentialMetadata {
-			identity.KeyPath = ""
-			identity.Passphrase = ""
-			identity.PassphraseRef = nil
-		}
+	if supportsPassword {
+		applyPasswordFormAction(identity, s, actions.password)
+	} else if !deferSwitch {
+		identity.Password = ""
+		identity.LoginPasswordRef = nil
+	}
 
-		switch actions.password {
-		case "keep":
-			identity.Password = s.existingPlainPassword
-			identity.LoginPasswordRef = s.existingPasswordRef
-		case "delete":
-			if s.existingPasswordRef != nil {
-				// Keep the reference until credential.Service completes its
-				// transactional delete. This preserves a usable configuration if
-				// the store operation fails.
-				identity.Password = s.existingPlainPassword
-				identity.LoginPasswordRef = s.existingPasswordRef.Clone()
-			} else {
-				identity.Password = ""
-				identity.LoginPasswordRef = nil
-			}
-		case "replace":
-			// The secret is committed by credential.Service after this metadata
-			// update. Keep the previous ref until that transaction succeeds, so a
-			// store failure leaves a usable, secret-free configuration.
-			identity.Password = s.existingPlainPassword
-			identity.LoginPasswordRef = s.existingPasswordRef.Clone()
-		}
-	} else {
-		if !deferCredentialMetadata {
+	if supportsKey {
+		if !deferSwitch && !deferKeyPath {
 			identity.KeyPath = absKeyPath
-			identity.Password = ""
-			identity.LoginPasswordRef = nil
 		}
-
-		switch actions.passphrase {
-		case "keep":
-			identity.Passphrase = s.existingPlainPassphrase
-			identity.PassphraseRef = s.existingPassphraseRef
-		case "delete":
-			if s.existingPassphraseRef != nil {
-				identity.Passphrase = s.existingPlainPassphrase
-				identity.PassphraseRef = s.existingPassphraseRef.Clone()
-			} else {
-				identity.Passphrase = ""
-				identity.PassphraseRef = nil
-			}
-		case "replace":
-			identity.Passphrase = s.existingPlainPassphrase
-			identity.PassphraseRef = s.existingPassphraseRef.Clone()
-		}
+		applyPassphraseFormAction(identity, s, actions.passphrase)
+	} else if !deferSwitch {
+		identity.KeyPath = ""
+		identity.KeyFingerprint = ""
+		identity.Passphrase = ""
+		identity.PassphraseRef = nil
 	}
 	return actions
 }
 
+func applyPasswordFormAction(identity *models.Identity, s *nodeFormState, action string) {
+	switch action {
+	case "keep":
+		identity.Password = s.existingPlainPassword
+		identity.LoginPasswordRef = s.existingPasswordRef.Clone()
+	case "delete":
+		if s.existingPasswordRef != nil {
+			// Keep the reference until credential.Service completes its
+			// transactional delete. This preserves a usable configuration if
+			// the store operation fails.
+			identity.Password = s.existingPlainPassword
+			identity.LoginPasswordRef = s.existingPasswordRef.Clone()
+		} else {
+			identity.Password = ""
+			identity.LoginPasswordRef = nil
+		}
+	case "replace":
+		// The secret is committed by credential.Service after this metadata
+		// update. Keep the previous ref until that transaction succeeds, so a
+		// store failure leaves a usable, secret-free configuration.
+		identity.Password = s.existingPlainPassword
+		identity.LoginPasswordRef = s.existingPasswordRef.Clone()
+	}
+}
+
+func applyPassphraseFormAction(identity *models.Identity, s *nodeFormState, action string) {
+	switch action {
+	case "keep":
+		identity.Passphrase = s.existingPlainPassphrase
+		identity.PassphraseRef = s.existingPassphraseRef.Clone()
+	case "delete":
+		if s.existingPassphraseRef != nil {
+			identity.Passphrase = s.existingPlainPassphrase
+			identity.PassphraseRef = s.existingPassphraseRef.Clone()
+		} else {
+			identity.Passphrase = ""
+			identity.PassphraseRef = nil
+		}
+	case "replace":
+		identity.Passphrase = s.existingPlainPassphrase
+		identity.PassphraseRef = s.existingPassphraseRef.Clone()
+	}
+}
+
+func needsFormCredentialAction(supported bool, action, secret string, existingRef *credential.Ref) bool {
+	if !supported {
+		return false
+	}
+	return (action == "replace" && secret != "") || (action == "delete" && existingRef != nil)
+}
+
 func syncCredentialsToStore(ctx context.Context, repository *config.Repository, credSvc *credential.Service, nodeID, authVersion string, s nodeFormState, actions formCredentialActions) error {
+	needsPasswordSync := needsFormCredentialAction(authTypeSupportsPassword(s.authType), actions.password, s.password, s.existingPasswordRef)
+	needsPassphraseSync := needsFormCredentialAction(authTypeSupportsKey(s.authType), actions.passphrase, s.passphrase, s.existingPassphraseRef)
+
 	if credSvc == nil {
-		if repository.Snapshot().Credential != nil && ((s.authType != "key" && (actions.password == "replace" || actions.password == "delete")) ||
-			(s.authType == "key" && (actions.passphrase == "replace" || actions.passphrase == "delete"))) {
+		if repository.Snapshot().Credential != nil && (needsPasswordSync || needsPassphraseSync || actions.cleanupRef != nil) {
 			return errors.New("credential service is unavailable")
 		}
 		return nil
 	}
 	cfg := repository.Snapshot()
-	targetStore := "none"
-	if cfg != nil && cfg.Credential != nil {
-		targetStore = cfg.Credential.DefaultStore
-	}
+	targetStore := defaultFormTargetStore(cfg)
 
-	keyFingerprint := ""
-	if s.authType == "key" && actions.passphrase == "replace" {
-		target, err := config.BindPrivateKeyFingerprint(cfg, credential.Target{Kind: credential.KindPassphrase, KeyPath: actions.keyPath}, []byte(s.passphrase))
+	version := authVersion
+	if needsPasswordSync {
+		var err error
+		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, version, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, "", actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
 		if err != nil {
 			return err
 		}
+	}
+	if needsPassphraseSync {
+		var err error
+		version, err = syncFormPassphraseCredential(ctx, cfg, credSvc, nodeID, version, targetStore, s, actions)
+		if err != nil {
+			return err
+		}
+	}
+	return cleanupReplacedFormCredential(ctx, credSvc, nodeID, version, s, actions)
+}
+
+func defaultFormTargetStore(cfg *config.Configuration) string {
+	if cfg != nil && cfg.Credential != nil {
+		return cfg.Credential.DefaultStore
+	}
+	return "none"
+}
+
+func syncFormPassphraseCredential(ctx context.Context, cfg *config.Configuration, credSvc *credential.Service, nodeID, version, targetStore string, s nodeFormState, actions formCredentialActions) (string, error) {
+	keyFingerprint := ""
+	if actions.passphrase == "replace" && s.passphrase != "" {
+		target, err := config.BindPrivateKeyFingerprint(cfg, credential.Target{Kind: credential.KindPassphrase, KeyPath: actions.keyPath}, []byte(s.passphrase))
+		if err != nil {
+			return "", err
+		}
 		keyFingerprint = target.KeyFingerprint
 	}
-	var (
-		version string
-		err     error
-	)
-	if s.authType == "key" {
-		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, authVersion, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
-	} else {
-		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, authVersion, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, keyFingerprint, actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+	return syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, version, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, keyFingerprint, false, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+}
+
+func cleanupReplacedFormCredential(ctx context.Context, credSvc *credential.Service, nodeID, version string, s nodeFormState, actions formCredentialActions) error {
+	if actions.cleanupRef == nil {
+		return nil
 	}
-	if err != nil {
-		return err
+	cleanupKeyPath := ""
+	if authTypeSupportsKey(s.authType) {
+		cleanupKeyPath = actions.keyPath
 	}
-	if actions.cleanupRef != nil {
-		target := credential.Target{NodeID: nodeID, Kind: actions.cleanupKind, KeyPath: actions.keyPath, AuthType: s.authType, ClearKeyPath: actions.clearKeyPath, ClearLegacyLoginPassword: actions.clearLegacyLoginPassword, ClearLegacyPassphrase: actions.clearLegacyPassphrase}
-		if _, err := credSvc.Delete(ctx, target, version, *actions.cleanupRef); err != nil {
-			return fmt.Errorf("remove replaced %s from credential store: %w", actions.cleanupKind, err)
-		}
+	target := credential.Target{
+		NodeID:                   nodeID,
+		Kind:                     actions.cleanupKind,
+		KeyPath:                  cleanupKeyPath,
+		AuthType:                 s.authType,
+		ClearKeyPath:             actions.clearKeyPath,
+		ClearLegacyLoginPassword: actions.clearLegacyLoginPassword,
+		ClearLegacyPassphrase:    actions.clearLegacyPassphrase,
+	}
+	if _, err := credSvc.Delete(ctx, target, version, *actions.cleanupRef); err != nil {
+		return fmt.Errorf("remove replaced %s from credential store: %w", actions.cleanupKind, err)
 	}
 	return nil
 }

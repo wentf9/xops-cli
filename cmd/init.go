@@ -93,31 +93,41 @@ func (o *InitOptions) RunContext(ctx context.Context) (initResult, error) {
 	if err != nil {
 		return initResult{}, fmt.Errorf("load xops configuration: %w", err)
 	}
-	repository, repositoryErr := config.NewRepositoryWithoutOpenSSH(cfg, store)
-	if repositoryErr != nil {
-		return initResult{}, fmt.Errorf("create configuration repository: %w", repositoryErr)
-	}
-
-	result := initResult{configCreated: configCreated}
+	var (
+		hosts         []config.OpenSSHHost
+		openSSHParser *config.OpenSSHParser
+		shouldImport  bool
+	)
 	if !o.SkipSSHImport && o.SSHConfigPath != "" {
 		currUser, userErr := utils.GetCurrentUser()
 		if userErr != nil {
 			return initResult{}, fmt.Errorf("get current user failed: %w", userErr)
 		}
-		hosts, loadErr := loadOpenSSHHosts(o.SSHConfigPath, currUser)
+		var loadErr error
+		hosts, openSSHParser, loadErr = loadOpenSSHHostsAndParser(o.SSHConfigPath, currUser)
 		if loadErr != nil {
 			if !errors.Is(loadErr, os.ErrNotExist) || o.SSHConfigChanged {
 				return initResult{}, loadErr
 			}
 		} else {
-			importResult, importErr := repository.ImportOpenSSHHostsContext(ctx, hosts)
-			if importErr != nil {
-				return initResult{}, fmt.Errorf("import openssh hosts: %w", importErr)
-			}
-			result.imported = importResult.Imported
-			result.skipped = importResult.Skipped
-			result.issues = importResult.Issues
+			shouldImport = true
 		}
+	}
+
+	repository, repositoryErr := config.NewRepositoryWithOpenSSHParser(cfg, store, openSSHParser)
+	if repositoryErr != nil {
+		return initResult{}, fmt.Errorf("create configuration repository: %w", repositoryErr)
+	}
+
+	result := initResult{configCreated: configCreated}
+	if shouldImport {
+		importResult, importErr := repository.ImportOpenSSHHostsContext(ctx, hosts)
+		if importErr != nil {
+			return initResult{}, fmt.Errorf("import openssh hosts: %w", importErr)
+		}
+		result.imported = importResult.Imported
+		result.skipped = importResult.Skipped
+		result.issues = importResult.Issues
 	}
 	if result.configCreated && result.imported == 0 {
 		if err := repository.InitializeContext(ctx); err != nil {
@@ -185,12 +195,21 @@ func loadOpenSSHHosts(path, defaultUser string) ([]config.OpenSSHHost, error) {
 	return loadOpenSSHHostsWithLimit(path, defaultUser, maxInitOpenSSHConfigBytes)
 }
 
-func loadOpenSSHHostsWithLimit(path, defaultUser string, maxBytes int64) (hosts []config.OpenSSHHost, err error) {
+func loadOpenSSHHostsWithLimit(path, defaultUser string, maxBytes int64) ([]config.OpenSSHHost, error) {
+	hosts, _, err := loadOpenSSHHostsAndParserWithLimit(path, defaultUser, maxBytes)
+	return hosts, err
+}
+
+func loadOpenSSHHostsAndParser(path, defaultUser string) ([]config.OpenSSHHost, *config.OpenSSHParser, error) {
+	return loadOpenSSHHostsAndParserWithLimit(path, defaultUser, maxInitOpenSSHConfigBytes)
+}
+
+func loadOpenSSHHostsAndParserWithLimit(path, defaultUser string, maxBytes int64) (hosts []config.OpenSSHHost, parser *config.OpenSSHParser, err error) {
 	// OpenSSH follows symlinks for ~/.ssh/config and allows /dev/null as an
 	// empty config; fsx.OpenRegular opens handle-first without Stat-then-Open.
 	rf, openErr := fsx.OpenRegular(path, fsx.Limits{MaxBytes: maxBytes}, fsx.AllowDevNull(), fsx.FollowSymlinks())
 	if openErr != nil {
-		return nil, formatInitOpenSSHOpenError(path, maxBytes, openErr)
+		return nil, nil, formatInitOpenSSHOpenError(path, maxBytes, openErr)
 	}
 	defer func() {
 		if closeErr := rf.Close(); closeErr != nil {
@@ -198,21 +217,25 @@ func loadOpenSSHHostsWithLimit(path, defaultUser string, maxBytes int64) (hosts 
 		}
 	}()
 	if rf.IsDevNull() {
-		return nil, nil
+		return nil, nil, nil
 	}
 	data, readErr := rf.ReadAll()
 	if readErr != nil {
 		if errors.Is(readErr, fsx.ErrTooLarge) {
-			return nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes: %w", path, maxBytes, readErr)
+			return nil, nil, fmt.Errorf("openssh configuration %q exceeds maximum size of %d bytes: %w", path, maxBytes, readErr)
 		}
-		return nil, fmt.Errorf("read openssh configuration %q: %w", path, readErr)
+		return nil, nil, fmt.Errorf("read openssh configuration %q: %w", path, readErr)
 	}
 
 	hosts, err = config.ParseOpenSSHHosts(namedOpenSSHReader{Reader: bytes.NewReader(data), name: rf.Name()}, defaultUser)
 	if err != nil {
-		return nil, fmt.Errorf("load openssh configuration %q: %w", path, err)
+		return nil, nil, fmt.Errorf("load openssh configuration %q: %w", path, err)
 	}
-	return hosts, nil
+	parser, err = config.NewOpenSSHParserFromReader(namedOpenSSHReader{Reader: bytes.NewReader(data), name: rf.Name()})
+	if err != nil {
+		return nil, nil, fmt.Errorf("load openssh configuration %q: %w", path, err)
+	}
+	return hosts, parser, nil
 }
 
 func formatInitOpenSSHOpenError(path string, maxBytes int64, err error) error {

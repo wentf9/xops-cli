@@ -19,7 +19,6 @@ import (
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/logger"
-	"github.com/wentf9/xops-cli/pkg/models"
 )
 
 // NewCmdCredential 创建凭据管理根命令
@@ -445,29 +444,5 @@ func checkOfflineDoctor(ctx context.Context, id string, cfg config.StoreConfig, 
 }
 
 func storeHasReferences(cfg *config.Configuration, id string) bool {
-	if cfg == nil {
-		return true
-	}
-	found := false
-	if cfg.Identities != nil {
-		cfg.Identities.IterCb(func(_ string, identity models.Identity) bool {
-			for _, ref := range []*credential.Ref{identity.LoginPasswordRef, identity.PassphraseRef} {
-				if ref != nil && ref.StoreID == id {
-					found = true
-					return false
-				}
-			}
-			return true
-		})
-	}
-	if cfg.Nodes != nil {
-		cfg.Nodes.IterCb(func(_ string, node models.Node) bool {
-			if node.PrivilegePasswordRef != nil && node.PrivilegePasswordRef.StoreID == id {
-				found = true
-				return false
-			}
-			return true
-		})
-	}
-	return found
+	return config.ConfigurationReferencesCredentialStore(cfg, id)
 }

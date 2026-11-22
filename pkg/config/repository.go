@@ -1265,6 +1265,12 @@ func (r *Repository) ImportOpenSSHHostsContext(ctx context.Context, hosts []Open
 			node.ProxyJump = resolveImportedProxyJump(cfg, node.ProxyJump)
 			cfg.Nodes.Set(nodeID, node)
 		}
+		openSSH := r.openSSHParserOrNil()
+		for _, nodeID := range importedNodeIDs {
+			if err := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, openSSH, nodeID); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -2551,6 +2557,7 @@ func applyIdentityAuthModifications(identity *models.Identity, keyPath, authType
 	}
 	if clearKeyPath {
 		identity.KeyPath = ""
+		identity.KeyFingerprint = ""
 	}
 	if clearLegacyLoginPassword {
 		identity.Password = ""

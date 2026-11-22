@@ -144,6 +144,21 @@ func (s coreSSHScope) isNewBuiltinClientConfigCall(call *ast.CallExpr) bool {
 	return s.isClientConfigType(call.Args[0])
 }
 
+func (s coreSSHScope) isMakeSliceOfClientConfigCall(call *ast.CallExpr) bool {
+	if call == nil || len(call.Args) < 2 || len(call.Args) > 3 {
+		return false
+	}
+	ident, ok := unwrapParen(call.Fun).(*ast.Ident)
+	if !ok || ident.Name != "make" {
+		return false
+	}
+	arr, ok := s.resolveTypeAlias(call.Args[0]).(*ast.ArrayType)
+	if !ok || arr.Len != nil {
+		return false
+	}
+	return s.isClientConfigType(arr.Elt)
+}
+
 func (s coreSSHScope) resolveCompositeLitType(lit *ast.CompositeLit, stack []ast.Node) ast.Expr {
 	if lit == nil {
 		return nil
@@ -325,6 +340,13 @@ func inspectClientConfigNode(
 				relPath: relPath,
 				line:    fset.Position(node.Pos()).Line,
 				reason:  "new(core/ssh.ClientConfig) allocation outside NewClientConfig(...)",
+			}}
+		}
+		if scope.isMakeSliceOfClientConfigCall(node) {
+			return []clientConfigViolation{{
+				relPath: relPath,
+				line:    fset.Position(node.Pos()).Line,
+				reason:  "make([]core/ssh.ClientConfig, ...) allocation outside NewClientConfig(...)",
 			}}
 		}
 	case *ast.ValueSpec:
@@ -515,12 +537,21 @@ func badDeepNestedContainers() {
 	_ = [1]map[string][1]ssh.ClientConfig{{"k": {{Address: "c"}}}}
 	_ = []ssh.ClientConfig{0: {Address: "d"}}
 }
+
+func badMakeSliceAllocations(n int) {
+	_ = make([]ssh.ClientConfig, 1)
+	_ = make([]ssh.ClientConfig, n)
+	_ = make([]ssh.ClientConfig, 0, 2)
+	type S = []ssh.ClientConfig
+	_ = make(S, 1)
+}
 `,
 			// 1 (badNew) + 1 (badVar) + 1 (badNamedReturn)
 			// + 2 (badLocalAlias: type T + &T{})
 			// + 4 (badChainedAliasNewAndVar: type A + type B + new(B) + var x B)
 			// + 4 (badDeepNestedContainers: 4 elided literals)
-			wantViolations: 13,
+			// + 4 (badMakeSliceAllocations: 4 make([]ClientConfig, ...) calls)
+			wantViolations: 17,
 		},
 		{
 			name:    "dot_import_flagged_and_allowed",
@@ -567,7 +598,12 @@ func ok4() (coressh.ClientConfig, bool) { return coressh.ClientConfig{}, false }
 func ok5() *ssh.ClientConfig { return &ssh.ClientConfig{User: "ops"} }
 func ok6() (cfg *coressh.ClientConfig, err error) { return nil, nil }
 func ok7() { var p *coressh.ClientConfig; _ = p }
-func ok8() { var x ssh.ClientConfig; _ = x }`,
+func ok8() { var x ssh.ClientConfig; _ = x }
+func ok9() {
+	_ = make([]*coressh.ClientConfig, 2)
+	_ = make(map[string]coressh.ClientConfig)
+	_ = make([]ssh.ClientConfig, 1)
+}`,
 			wantViolations: 0,
 		},
 	}

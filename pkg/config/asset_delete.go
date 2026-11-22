@@ -87,6 +87,56 @@ func appendCredentialRefs(refs []credential.Ref, candidates ...*credential.Ref) 
 	return refs
 }
 
+// ConfigurationReferencesCredentialStore reports whether cfg contains any
+// credential reference targeting storeID across all identity and node
+// credential fields (login password, key passphrase, TOTP secret,
+// keyboard-interactive challenge answers, and privilege password).
+func ConfigurationReferencesCredentialStore(cfg *Configuration, storeID string) bool {
+	if cfg == nil {
+		return true
+	}
+	found := false
+	if cfg.Identities != nil {
+		cfg.Identities.IterCb(func(_ string, identity models.Identity) bool {
+			if identityReferencesStore(identity, storeID) {
+				found = true
+				return false
+			}
+			return true
+		})
+	}
+	if !found && cfg.Nodes != nil {
+		cfg.Nodes.IterCb(func(_ string, node models.Node) bool {
+			if node.PrivilegePasswordRef != nil && node.PrivilegePasswordRef.StoreID == storeID {
+				found = true
+				return false
+			}
+			return true
+		})
+	}
+	return found
+}
+
+func identityReferencesStore(identity models.Identity, storeID string) bool {
+	if identity.LoginPasswordRef != nil && identity.LoginPasswordRef.StoreID == storeID {
+		return true
+	}
+	if identity.PassphraseRef != nil && identity.PassphraseRef.StoreID == storeID {
+		return true
+	}
+	if identity.OTP != nil && identity.OTP.TOTPSecretRef != nil && identity.OTP.TOTPSecretRef.StoreID == storeID {
+		return true
+	}
+	if identity.KeyboardInteractive != nil {
+		for _, rule := range identity.KeyboardInteractive.Rules {
+			if rule.SecretRef != nil && rule.SecretRef.StoreID == storeID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func deleteAssetsWithCredentials(ctx context.Context, service *credential.Service, refs []credential.Ref, commit func(context.Context) (MutationOutcome, error)) error {
 	if len(refs) == 0 {
 		_, err := commit(ctx)

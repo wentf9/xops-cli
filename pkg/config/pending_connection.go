@@ -858,12 +858,10 @@ func (r *Repository) confirmPendingEntry(ctx context.Context, nodeID string, ent
 			if err != nil {
 				return err
 			}
-			if routingChanged {
-				if err := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID); err != nil {
-					return err
-				}
+			if !routingChanged {
+				return nil
 			}
-			return nil
+			return r.validateConfirmedPendingJumpCycle(cfg, pending, nodeID, node, storedNode, host, identity)
 		}, action)
 		if err != nil {
 			return fmt.Errorf("save authenticated node update %q: %w", nodeID, err)
@@ -877,12 +875,35 @@ func (r *Repository) confirmPendingEntry(ctx context.Context, nodeID string, ent
 		if err := mergeConfirmedNodeConfig(cfg, nodeID, node, host, identity); err != nil {
 			return err
 		}
-		return ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID)
+		return r.validateConfirmedPendingJumpCycle(cfg, pending, nodeID, node, node, host, identity)
 	}, action)
 	if err != nil {
 		return fmt.Errorf("save authenticated connection %q: %w", nodeID, err)
 	}
 	return nil
+}
+
+func (r *Repository) validateConfirmedPendingJumpCycle(
+	cfg *Configuration,
+	pending *pendingConnection,
+	nodeID string,
+	pendingNode models.Node,
+	storedNode models.Node,
+	host models.Host,
+	identity models.Identity,
+) error {
+	if strings.TrimSpace(storedNode.ProxyJump) != "" {
+		confirmAlias := strings.TrimSpace(pendingNode.OpenSSHAlias)
+		confirmCanon := strings.TrimSpace(pendingNode.CanonicalHost)
+		if origin := pending.provider.NodeOpenSSHOrigin(nodeID); !origin.IsZero() {
+			confirmAlias = origin.Alias
+			confirmCanon = origin.CanonicalHost
+		}
+		if err := r.validateSavedNodeJumpWithOrigin(cfg, nodeID, storedNode, host, identity, confirmAlias, confirmCanon, nodeID); err != nil {
+			return err
+		}
+	}
+	return ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID)
 }
 
 func (r *Repository) acquirePendingConfirmationGate(ctx context.Context, nodeID string, entry *pendingConnection) (*pendingConnection, error) {
