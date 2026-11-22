@@ -338,6 +338,40 @@ func (l *agentForwardLease) Release() {
 	l.releaseWithDeadline(time.Now().Add(l.drainTimeout()))
 }
 
+func waitChanUntilDeadline(ch <-chan struct{}, deadline time.Time) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-ch:
+			return true
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func drainSSHChannelStderr(sshCh cryptoSSH.Channel) {
+	if sshCh == nil {
+		return
+	}
+	if se := sshCh.Stderr(); se != nil {
+		_, _ = io.Copy(io.Discard, se)
+	}
+}
+
 func (l *agentForwardLease) releaseWithDeadline(deadline time.Time) {
 	if l == nil {
 		return
@@ -359,6 +393,7 @@ func (l *agentForwardLease) releaseWithDeadline(deadline time.Time) {
 		l.mu.Unlock()
 
 		var closeWG sync.WaitGroup
+		hasCloseWork := false
 		for _, entry := range entries {
 			if entry.agentConn != nil {
 				_ = entry.agentConn.Close()
@@ -367,6 +402,7 @@ func (l *agentForwardLease) releaseWithDeadline(deadline time.Time) {
 				// Close entry.sshCh asynchronously inside the drain deadline
 				// window so a write-wedged SSH transport cannot block
 				// releaseWithDeadline before its escalation timer starts.
+				hasCloseWork = true
 				closeWG.Add(1)
 				go func(ch cryptoSSH.Channel) {
 					defer closeWG.Done()
@@ -378,43 +414,49 @@ func (l *agentForwardLease) releaseWithDeadline(deadline time.Time) {
 			}
 		}
 
-		drained := make(chan struct{})
+		// Separate outbound channel-close completion (closeWG) from inbound
+		// pump drain (l.pumps): in golang.org/x/crypto/ssh, (*channel).Close()
+		// sends outbound SSH_MSG_CHANNEL_CLOSE promptly on a healthy transport
+		// without EOF-ing sshCh.Read until the remote peer echoes
+		// SSH_MSG_CHANNEL_CLOSE. Only an outbound closeWG timeout proves the
+		// transport is write-wedged and justifies interruptTransportNow().
+		closeDone := make(chan struct{})
+		if hasCloseWork {
+			go func() {
+				closeWG.Wait()
+				close(closeDone)
+			}()
+		} else {
+			close(closeDone)
+		}
+
+		pumpsDone := make(chan struct{})
 		go func() {
 			l.pumps.Wait()
-			closeWG.Wait()
-			close(drained)
+			close(pumpsDone)
 		}()
 
-		timedOut := false
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			select {
-			case <-drained:
-			default:
-				timedOut = true
-			}
-		} else {
-			timer := time.NewTimer(remaining)
-			select {
-			case <-drained:
-				timer.Stop()
-			case <-timer.C:
-				timedOut = true
-			}
-		}
-		if timedOut {
+		if !waitChanUntilDeadline(closeDone, deadline) {
 			if l.logger != nil {
-				l.logger.Debugf("ForwardAgent: timed out after %s waiting for forwarded agent channels to drain", l.drainTimeout())
+				l.logger.Debugf("ForwardAgent: timed out after %s waiting for outbound SSH channel close; interrupting transport", l.drainTimeout())
 			}
 			if l.hasInterruptTransport() {
 				_ = l.interruptTransportNow()
-				postTimer := time.NewTimer(l.drainTimeout())
-				select {
-				case <-drained:
-					postTimer.Stop()
-				case <-postTimer.C:
+				postDeadline := time.Now().Add(l.drainTimeout())
+				if waitChanUntilDeadline(closeDone, postDeadline) {
+					_ = waitChanUntilDeadline(pumpsDone, postDeadline)
 				}
 			}
+			return
+		}
+
+		// Outbound SSH_MSG_CHANNEL_CLOSE completed within deadline, so the
+		// transport is healthy. Wait best-effort up to the remaining deadline
+		// for inbound pumps to exit, but never interrupt a healthy shared
+		// MuxServer / pooled Client / ProxyJump bastion when the remote peer
+		// keeps the agent channel open without echoing SSH_MSG_CHANNEL_CLOSE.
+		if !waitChanUntilDeadline(pumpsDone, deadline) && l.logger != nil {
+			l.logger.Debugf("ForwardAgent: outbound channel close completed; returning without transport interrupt while remote agent channel remains open")
 		}
 	})
 }
@@ -712,6 +754,7 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 		_ = agentConn.Close()
 		_ = lease.closeSSHChannelBounded(sshCh)
 		go lease.discardChannelRequests(reqs)
+		go drainSSHChannelStderr(sshCh)
 		return
 	}
 	stopClose()
@@ -733,6 +776,7 @@ func (r *sshAgentChannelRouter) serveLocalAgentChannel(lease *agentForwardLease,
 		lease.discardChannelRequests(reqs)
 		closeBoth()
 	}()
+	go drainSSHChannelStderr(sshCh)
 
 	var copyWG sync.WaitGroup
 	copyWG.Add(2)

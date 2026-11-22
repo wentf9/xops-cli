@@ -554,7 +554,7 @@ type fakeBidirectionalSSHChannel struct {
 func (f *fakeBidirectionalSSHChannel) Read(p []byte) (int, error)  { return f.r.Read(p) }
 func (f *fakeBidirectionalSSHChannel) Write(p []byte) (int, error) { return f.w.Write(p) }
 func (f *fakeBidirectionalSSHChannel) CloseWrite() error           { return f.w.Close() }
-func (f *fakeBidirectionalSSHChannel) Stderr() io.ReadWriter       { return f }
+func (f *fakeBidirectionalSSHChannel) Stderr() io.ReadWriter       { return &nopRW{} }
 func (f *fakeBidirectionalSSHChannel) SendRequest(string, bool, []byte) (bool, error) {
 	return false, nil
 }
