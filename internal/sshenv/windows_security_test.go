@@ -377,7 +377,7 @@ func TestWindowsGlobalKnownHostsAndPipeOwnerFailClosed(t *testing.T) {
 	}
 }
 
-func startTestWindowsNamedPipeServer(t *testing.T, acl *windows.ACL) (string, <-chan error, func()) {
+func createTestWindowsNamedPipe(t *testing.T, acl *windows.ACL) (string, windows.Handle, windows.Handle) {
 	t.Helper()
 	sd, err := windows.NewSecurityDescriptor()
 	if err != nil {
@@ -418,6 +418,50 @@ func startTestWindowsNamedPipeServer(t *testing.T, acl *windows.ACL) (string, <-
 		_ = windows.CloseHandle(ev)
 		t.Fatalf("CreateNamedPipe(%s): %v", pipeName, err)
 	}
+	return pipeName, h, ev
+}
+
+func serveTestWindowsNamedPipeOnce(h windows.Handle, runOverlapped func(op func(ov *windows.Overlapped) error, okIfErr ...error) (uint32, error)) error {
+	if _, cErr := runOverlapped(func(ov *windows.Overlapped) error {
+		return windows.ConnectNamedPipe(h, ov)
+	}, windows.ERROR_PIPE_CONNECTED); cErr != nil {
+		return cErr
+	}
+	var buf [4]byte
+	readOff := 0
+	for readOff < len(buf) {
+		n, rErr := runOverlapped(func(ov *windows.Overlapped) error {
+			var immediate uint32
+			return windows.ReadFile(h, buf[readOff:], &immediate, ov)
+		})
+		readOff += int(n)
+		if rErr != nil {
+			return rErr
+		}
+		if n == 0 {
+			return windows.ERROR_BROKEN_PIPE
+		}
+	}
+	reply := []byte("pong:" + string(buf[:]))
+	for len(reply) > 0 {
+		n, wErr := runOverlapped(func(ov *windows.Overlapped) error {
+			var immediate uint32
+			return windows.WriteFile(h, reply, &immediate, ov)
+		})
+		if wErr != nil {
+			return wErr
+		}
+		if n == 0 {
+			return windows.ERROR_BROKEN_PIPE
+		}
+		reply = reply[int(n):]
+	}
+	return nil
+}
+
+func startTestWindowsNamedPipeServer(t *testing.T, acl *windows.ACL) (string, <-chan error, func()) {
+	t.Helper()
+	pipeName, h, ev := createTestWindowsNamedPipe(t, acl)
 
 	var ioMu sync.Mutex
 	closed := false
@@ -465,44 +509,8 @@ func startTestWindowsNamedPipeServer(t *testing.T, acl *windows.ACL) (string, <-
 			close(srvDone)
 			close(exited)
 		}()
-		if _, cErr := runOverlapped(func(ov *windows.Overlapped) error {
-			return windows.ConnectNamedPipe(h, ov)
-		}, windows.ERROR_PIPE_CONNECTED); cErr != nil {
-			srvDone <- cErr
-			return
-		}
-		var buf [4]byte
-		readOff := 0
-		for readOff < len(buf) {
-			n, rErr := runOverlapped(func(ov *windows.Overlapped) error {
-				var immediate uint32
-				return windows.ReadFile(h, buf[readOff:], &immediate, ov)
-			})
-			readOff += int(n)
-			if rErr != nil {
-				srvDone <- rErr
-				return
-			}
-			if n == 0 {
-				srvDone <- windows.ERROR_BROKEN_PIPE
-				return
-			}
-		}
-		reply := []byte("pong:" + string(buf[:]))
-		for len(reply) > 0 {
-			n, wErr := runOverlapped(func(ov *windows.Overlapped) error {
-				var immediate uint32
-				return windows.WriteFile(h, reply, &immediate, ov)
-			})
-			if wErr != nil {
-				srvDone <- wErr
-				return
-			}
-			if n == 0 {
-				srvDone <- windows.ERROR_BROKEN_PIPE
-				return
-			}
-			reply = reply[int(n):]
+		if err := serveTestWindowsNamedPipeOnce(h, runOverlapped); err != nil {
+			srvDone <- err
 		}
 	}()
 	cleanup := func() {

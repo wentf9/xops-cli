@@ -133,7 +133,7 @@ func dialWindowsNamedPipe(ctx context.Context, pipePath string) (net.Conn, error
 	const desiredAccess = uint32(windows.FILE_GENERIC_READ | windows.FILE_WRITE_DATA)
 	// Compile-time lockstep check ensuring the Windows constant matches the
 	// cross-platform windowsAgentPipeDesiredAccess invariant (0x0012008b).
-	const _ = uint32(windowsAgentPipeDesiredAccess-desiredAccess) + uint32(desiredAccess-windowsAgentPipeDesiredAccess)
+	const _ uint32 = (windowsAgentPipeDesiredAccess - desiredAccess) + (desiredAccess - windowsAgentPipeDesiredAccess)
 	for {
 		if err := dialCtx.Err(); err != nil {
 			return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: windowsPipeAddr(pipePath), Err: err}

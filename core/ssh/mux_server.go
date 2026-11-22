@@ -1617,15 +1617,3 @@ func sendProxy(conn io.Writer, reqID uint32) error {
 func sendRemotePort(conn io.Writer, reqID uint32, port uint32) error {
 	return WriteMuxPacket(conn, MUX_S_REMOTE_PORT, EncodeMuxRemotePort(reqID, port))
 }
-
-func sendSessionOpened(conn io.Writer, reqID uint32, sessionID uint32) error {
-	return WriteMuxPacket(conn, MUX_S_SESSION_OPENED, EncodeMuxSessionOpened(reqID, sessionID))
-}
-
-func sendExitMessage(conn io.Writer, sessionID uint32, exitValue uint32) error {
-	return WriteMuxPacket(conn, MUX_S_EXIT_MESSAGE, EncodeMuxExitMessage(sessionID, exitValue))
-}
-
-func sendTTYAllocFail(conn io.Writer, sessionID uint32) error {
-	return WriteMuxPacket(conn, MUX_S_TTY_ALLOC_FAIL, EncodeMuxTTYAllocFail(sessionID))
-}

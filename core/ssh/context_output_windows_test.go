@@ -132,54 +132,7 @@ func TestWindowsOutputPipeBorrowedHandleAndBytes(t *testing.T) {
 
 func TestWindowsOutputConsoleFallback(t *testing.T) {
 	if os.Getenv("XOPS_TEST_OUTPUT_CONSOLE") == "1" {
-		kernel := windows.NewLazySystemDLL("kernel32.dll")
-		create := kernel.NewProc("CreateConsoleScreenBuffer")
-		handle, _, callErr := create.Call(windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, 0, 1, 0)
-		if windows.Handle(handle) == windows.InvalidHandle {
-			t.Fatal(callErr)
-		}
-		file := os.NewFile(handle, "test console screen")
-		defer func() { _ = file.Close() }()
-		var before uint32
-		if err := windows.GetConsoleMode(windows.Handle(handle), &before); err != nil {
-			t.Fatal(err)
-		}
-		fallback, release, supported, err := BindOutput(t.Context(), file)
-		if err != nil || supported || fallback != io.Writer(file) {
-			t.Fatalf("console without host injection must remain unsupported: %v %v", supported, err)
-		}
-		if err := release(); err != nil {
-			t.Fatal(err)
-		}
-		ctx := testConsoleRelayContext(t, t.Context(), "")
-		bound, closeFn, supported, err := BindOutput(ctx, file)
-		if err != nil || !supported || bound == io.Writer(file) {
-			t.Fatalf("console binding failed: %v %v", supported, err)
-		}
-		payload := []byte("原生 console")
-		if n, err := bound.Write(payload); err != nil || n != len(payload) {
-			t.Fatalf("console relay write: %d %v", n, err)
-		}
-		if err := closeFn(); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := file.Write([]byte("!")); err != nil {
-			t.Fatalf("borrowed console unusable: %v", err)
-		}
-		var after uint32
-		if err := windows.GetConsoleMode(windows.Handle(handle), &after); err != nil || before != after {
-			t.Fatalf("console mode changed: %v", err)
-		}
-		if err := ctx.Value(consoleOutputRelayKey{}).(*consoleRelayScope).close(); err != nil {
-			t.Fatal(err)
-		}
-		_, releaseClosed, supported, err := BindOutput(ctx, file)
-		if err == nil || supported {
-			t.Fatalf("closed scope silently fell back to direct output: %v %v", supported, err)
-		}
-		if err := releaseClosed(); err != nil {
-			t.Fatal(err)
-		}
+		runWindowsOutputConsoleFallbackChild(t)
 		return
 	}
 	exe, err := os.Executable()
@@ -193,5 +146,62 @@ func TestWindowsOutputConsoleFallback(t *testing.T) {
 	child.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NEW_CONSOLE}
 	if output, err := child.CombinedOutput(); err != nil {
 		t.Fatalf("native console helper: %v\n%s", err, output)
+	}
+}
+
+func runWindowsOutputConsoleFallbackChild(t *testing.T) {
+	t.Helper()
+	kernel := windows.NewLazySystemDLL("kernel32.dll")
+	create := kernel.NewProc("CreateConsoleScreenBuffer")
+	handle, _, callErr := create.Call(windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, 0, 1, 0)
+	if windows.Handle(handle) == windows.InvalidHandle {
+		t.Fatal(callErr)
+	}
+	file := os.NewFile(handle, "test console screen")
+	defer func() { _ = file.Close() }()
+	var before uint32
+	if err := windows.GetConsoleMode(windows.Handle(handle), &before); err != nil {
+		t.Fatal(err)
+	}
+	fallback, release, supported, err := BindOutput(t.Context(), file)
+	if err != nil || supported || fallback != io.Writer(file) {
+		t.Fatalf("console without host injection must remain unsupported: %v %v", supported, err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	verifyWindowsConsoleRelayBinding(t, file, handle, before)
+}
+
+func verifyWindowsConsoleRelayBinding(t *testing.T, file *os.File, handle uintptr, before uint32) {
+	t.Helper()
+	ctx := testConsoleRelayContext(t, t.Context(), "")
+	bound, closeFn, supported, err := BindOutput(ctx, file)
+	if err != nil || !supported || bound == io.Writer(file) {
+		t.Fatalf("console binding failed: %v %v", supported, err)
+	}
+	payload := []byte("原生 console")
+	if n, err := bound.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("console relay write: %d %v", n, err)
+	}
+	if err := closeFn(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte("!")); err != nil {
+		t.Fatalf("borrowed console unusable: %v", err)
+	}
+	var after uint32
+	if err := windows.GetConsoleMode(windows.Handle(handle), &after); err != nil || before != after {
+		t.Fatalf("console mode changed: %v", err)
+	}
+	if err := ctx.Value(consoleOutputRelayKey{}).(*consoleRelayScope).close(); err != nil {
+		t.Fatal(err)
+	}
+	_, releaseClosed, supported, err := BindOutput(ctx, file)
+	if err == nil || supported {
+		t.Fatalf("closed scope silently fell back to direct output: %v %v", supported, err)
+	}
+	if err := releaseClosed(); err != nil {
+		t.Fatal(err)
 	}
 }
