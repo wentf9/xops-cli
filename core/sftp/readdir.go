@@ -1,0 +1,232 @@
+package sftp
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/pkg/sftp"
+)
+
+// validatedRemoteDirEntry holds a single remote directory entry whose name has
+// been validated via ParseRemoteName and whose joined path is verified to stay
+// strictly beneath its parent directory.
+type validatedRemoteDirEntry struct {
+	info  os.FileInfo
+	name  RemoteName
+	child RemotePath
+}
+
+// validateRemoteDirEntries is the single authority validating raw SFTP ReadDir
+// entries: non-nil metadata, ParseRemoteName validation (rejecting ".", "..",
+// "/", path separators, NUL, and control characters), exact duplicate entry
+// rejection, and strict parent containment via RemotePath.Join and RelativeTo.
+func validateRemoteDirEntries(
+	ctx context.Context,
+	parent RemotePath,
+	entries []os.FileInfo,
+	op string,
+) ([]validatedRemoteDirEntry, error) {
+	if !parent.IsValid() {
+		return nil, fmt.Errorf("%s: %w: invalid remote directory path", op, ErrInvalidRemotePath)
+	}
+	seen := make(map[string]struct{}, len(entries))
+	validated := make([]validatedRemoteDirEntry, 0, len(entries))
+	for _, entry := range entries {
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		if entry == nil {
+			return nil, fmt.Errorf("%s %q: %w: missing file metadata", op, parent.String(), ErrInvalidRemoteName)
+		}
+		entryName, nameErr := ParseRemoteName(entry.Name())
+		if nameErr != nil {
+			return nil, fmt.Errorf("%s %q: unsafe remote filename %q: %w", op, parent.String(), entry.Name(), nameErr)
+		}
+		rawName := entryName.String()
+		if _, dup := seen[rawName]; dup {
+			return nil, fmt.Errorf("%s %q: duplicate remote directory entry %q", op, parent.String(), rawName)
+		}
+		seen[rawName] = struct{}{}
+
+		child := parent.Join(entryName)
+		rels, relErr := child.RelativeTo(parent)
+		if relErr != nil || len(rels) != 1 || !rels[0].Equal(entryName) {
+			return nil, fmt.Errorf("%s %q: entry %q escapes parent directory", op, parent.String(), child.String())
+		}
+		validated = append(validated, validatedRemoteDirEntry{
+			info:  entry,
+			name:  entryName,
+			child: child,
+		})
+	}
+	return validated, nil
+}
+
+// readValidatedRemoteDir reads parent via SFTP ReadDir and validates every
+// returned entry before yielding any child to the caller.
+func readValidatedRemoteDir(
+	ctx context.Context,
+	client *sftp.Client,
+	parent RemotePath,
+	op string,
+) ([]validatedRemoteDirEntry, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	if !parent.IsValid() {
+		return nil, fmt.Errorf("%s: %w: invalid remote directory path", op, ErrInvalidRemotePath)
+	}
+	entries, err := client.ReadDirContext(ctx, parent.String())
+	if err != nil {
+		return nil, fmt.Errorf("read remote directory %q failed: %w", parent.String(), err)
+	}
+	return validateRemoteDirEntries(ctx, parent, entries, op)
+}
+
+// WalkFunc is the callback invoked by Client.Walk for each validated remote
+// entry visited under remoteRoot.
+type WalkFunc func(remotePath RemotePath, info os.FileInfo) error
+
+// Walk traverses remoteRoot over SFTP, dereferencing remoteRoot via Stat
+// (matching Download/Upload top-level semantics) and recursively reading
+// directories through the ParseRemoteName-validated directory reader. Child
+// symbolic links are visited as links and never followed. Cancellation
+// interrupts this SFTP subsystem, so the client must not be reused afterwards.
+func (c *Client) Walk(ctx context.Context, remoteRoot RemotePath, fn WalkFunc) error {
+	if c == nil || c.SFTPClient() == nil {
+		return fmt.Errorf("sftp client is nil")
+	}
+	if !remoteRoot.IsValid() {
+		return fmt.Errorf("%w: remote walk root is invalid", ErrInvalidRemotePath)
+	}
+	if fn == nil {
+		return fmt.Errorf("sftp walk callback is nil")
+	}
+	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
+		return c.walkRemote(ctx, remoteRoot, fn)
+	})
+}
+
+func (c *Client) walkRemote(ctx context.Context, remoteRoot RemotePath, fn WalkFunc) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	rootInfo, err := c.SFTPClient().Stat(remoteRoot.String())
+	if err != nil {
+		return fmt.Errorf("stat remote path %q failed: %w", remoteRoot.String(), err)
+	}
+	if err := fn(remoteRoot, rootInfo); err != nil {
+		return err
+	}
+	if rootInfo.Mode()&os.ModeType != os.ModeDir {
+		return nil
+	}
+	return c.walkRemoteDir(ctx, remoteRoot, remoteRoot, fn)
+}
+
+func (c *Client) walkRemoteDir(ctx context.Context, root, current RemotePath, fn WalkFunc) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := readValidatedRemoteDir(ctx, c.SFTPClient(), current, "walk")
+	if err != nil {
+		return err
+	}
+	for _, item := range entries {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, relErr := item.child.RelativeTo(root); relErr != nil {
+			return fmt.Errorf("walk %q: entry %q escapes root %q: %w", current.String(), item.child.String(), root.String(), relErr)
+		}
+		if err := fn(item.child, item.info); err != nil {
+			return err
+		}
+		if item.info.Mode()&os.ModeType == os.ModeDir {
+			if err := c.walkRemoteDir(ctx, root, item.child, fn); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// DownloadTransferSize calculates the total progress byte count that
+// Client.Download will emit for remoteRoot. It dereferences remoteRoot via Stat
+// (matching downloadOne), walks directories through the ParseRemoteName-validated
+// directory reader without following child symlinks, and accounts for child
+// symlinks using int64(len(ReadLink(child))) to match createDownloadLink.
+// Cancellation interrupts this SFTP subsystem, so the client must not be reused
+// afterwards.
+func (c *Client) DownloadTransferSize(ctx context.Context, remoteRoot RemotePath) (int64, error) {
+	if c == nil || c.SFTPClient() == nil {
+		return 0, fmt.Errorf("sftp client is nil")
+	}
+	if !remoteRoot.IsValid() {
+		return 0, fmt.Errorf("%w: remote path is invalid", ErrInvalidRemotePath)
+	}
+	var total int64
+	err := runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
+		size, walkErr := c.downloadTransferSize(ctx, remoteRoot)
+		if walkErr != nil {
+			return walkErr
+		}
+		total = size
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}
+
+func (c *Client) downloadTransferSize(ctx context.Context, remoteRoot RemotePath) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	rootInfo, err := c.SFTPClient().Stat(remoteRoot.String())
+	if err != nil {
+		return 0, fmt.Errorf("stat remote path %q failed: %w", remoteRoot.String(), err)
+	}
+	if err := validateRemoteDownloadMode(remoteRoot.String(), rootInfo.Mode(), false); err != nil {
+		return 0, err
+	}
+	if rootInfo.Mode()&os.ModeType != os.ModeDir {
+		if rootInfo.Size() > 0 {
+			return rootInfo.Size(), nil
+		}
+		return 0, nil
+	}
+
+	var total int64
+	err = c.walkRemoteDir(ctx, remoteRoot, remoteRoot, func(child RemotePath, info os.FileInfo) error {
+		if err := validateRemoteDownloadMode(child.String(), info.Mode(), true); err != nil {
+			return err
+		}
+		switch info.Mode() & os.ModeType {
+		case os.ModeDir:
+			return nil
+		case os.ModeSymlink:
+			target, readErr := c.SFTPClient().ReadLink(child.String())
+			if readErr != nil {
+				return fmt.Errorf("read remote symbolic link %q failed: %w", child.String(), readErr)
+			}
+			total += int64(len(target))
+			return nil
+		default:
+			if info.Size() > 0 {
+				total += info.Size()
+			}
+			return nil
+		}
+	})
+	if err != nil {
+		return 0, err
+	}
+	return total, nil
+}

@@ -2,6 +2,8 @@ package sftpshell
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -27,40 +29,41 @@ import (
 
 // Shell 定义交互式 SFTP 环境
 type Shell struct {
-	clientMu        sync.RWMutex
-	client          *sftp.Client
-	clientInvalid   bool
-	clientUses      map[*sftp.Client]*clientUse
-	clientChange    *clientChange
-	closed          bool
-	closeErr        error
-	sshClient       *ssh.Client
-	lifecycleMu     sync.Mutex
-	state           shellState
-	runCancel       context.CancelFunc
-	runDone         chan struct{}
-	closeDone       chan struct{}
-	lifecycleErr    error
-	cwd             string
-	localCwd        string
-	stdin           io.Reader
-	lineMu          sync.Mutex
-	editorStateMu   sync.Mutex
-	editorState     *editorSession
-	line            *lineEditor
-	displayMu       sync.Mutex
-	displayErr      error
-	historyFile     string // SFTP command history file
-	stdout          io.Writer
-	stderr          io.Writer
-	askConfirmHook  func(prompt string) bool
-	logger          corelog.DebugLogger
-	noOverwrite     bool
-	batch           bool // Non-terminal command input: stop at the first failure.
-	sudo            bool
-	transferConfig  sftp.TransferConfig
-	newClientFn     clientFactory
-	newLineEditorFn lineEditorFactory
+	clientMu                 sync.RWMutex
+	client                   *sftp.Client
+	clientInvalid            bool
+	clientUses               map[*sftp.Client]*clientUse
+	clientChange             *clientChange
+	closed                   bool
+	closeErr                 error
+	sshClient                *ssh.Client
+	lifecycleMu              sync.Mutex
+	state                    shellState
+	runCancel                context.CancelFunc
+	runDone                  chan struct{}
+	closeDone                chan struct{}
+	lifecycleErr             error
+	cwd                      string
+	localCwd                 string
+	stdin                    io.Reader
+	lineMu                   sync.Mutex
+	editorStateMu            sync.Mutex
+	editorState              *editorSession
+	line                     *lineEditor
+	displayMu                sync.Mutex
+	displayErr               error
+	historyFile              string // SFTP command history file
+	stdout                   io.Writer
+	stderr                   io.Writer
+	askConfirmHook           func(prompt string) bool
+	logger                   corelog.DebugLogger
+	noOverwrite              bool
+	batch                    bool // Non-terminal command input: stop at the first failure.
+	sudo                     bool
+	transferConfig           sftp.TransferConfig
+	newClientFn              clientFactory
+	newLineEditorFn          lineEditorFactory
+	resolveLocalUploadRootFn func(string) (string, error)
 }
 
 // shellState is a terminal, single-use lifecycle. A Shell can make exactly
@@ -1462,39 +1465,33 @@ func (s *Shell) prepareDownloadTransferHooks(ctx context.Context, cli *sftp.Clie
 	remote := target.Remote.String()
 	s.fprintlnStdout(i18n.Tf("sftp_shell_downloading", map[string]any{"Remote": remote, "Local": target.LocalPath}))
 
+	rootInfo := target.Info
+	if rootInfo == nil || rootInfo.Mode()&os.ModeSymlink != 0 {
+		var statErr error
+		rootInfo, statErr = cli.Stat(ctx, remote)
+		if statErr != nil {
+			return nil, fmt.Errorf("get: stat remote source failed: %w", statErr)
+		}
+	}
+
+	isDir := rootInfo.IsDir()
 	var totalSize int64
 	description := "Downloading"
-	if target.Info.IsDir() {
+	if isDir {
 		description = "Total"
-		walkErr := cli.Do(ctx, func(client *pkgsftp.Client) error {
-			walker := client.Walk(remote)
-			for walker.Step() {
-				if err := walker.Err(); err != nil {
-					return err
-				}
-				if fi := walker.Stat(); !fi.IsDir() {
-					totalSize += fi.Size()
-				}
-			}
-			return walker.Err()
-		})
+		size, walkErr := cli.DownloadTransferSize(ctx, target.Remote)
 		if walkErr != nil {
 			return nil, fmt.Errorf("get: walk remote source failed: %w", walkErr)
 		}
-	} else {
-		totalSize = target.Info.Size()
+		totalSize = size
+	} else if rootInfo.Size() > 0 {
+		totalSize = rootInfo.Size()
 	}
 
-	bar, tracker := s.newTransferProgressBar(description, totalSize, target.Info.IsDir())
-	callback := func(n int64) {
-		if totalSize > 0 && n > 0 {
-			if err := bar.Add64(n); err != nil {
-				s.recordDisplayError(fmt.Errorf("update download progress failed: %w", err))
-			}
-		}
-	}
+	bar, tracker := s.newTransferProgressBar(description, totalSize, isDir)
+	callback := s.newClampedProgressCallback(bar, totalSize, "update download progress failed")
 	var fileProgress sftp.FileProgressCallback
-	if target.Info.IsDir() && tracker != nil {
+	if isDir && tracker != nil {
 		fileProgress = tracker.onFileProgress
 	}
 	return &sftp.DownloadTransferHooks{
@@ -1636,36 +1633,23 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	s.fprintlnStdout(i18n.Tf("sftp_shell_uploading", map[string]any{"Local": local, "Remote": remote}))
 
 	// 计算本地文件大小以显示准确的进度条
-	var totalSize int64
 	localStat, localStatErr := os.Stat(local)
 	if localStatErr != nil {
 		return fmt.Errorf("upload failed: %w", localStatErr)
 	}
 	isDir := localStat.IsDir()
 
-	walkRoot := local
-	if isDir {
-		cleanLocal := filepath.Clean(local)
-		if linfo, lstatErr := os.Lstat(cleanLocal); lstatErr == nil && linfo.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
-			resolved, evalErr := filepath.EvalSymlinks(cleanLocal)
-			if evalErr != nil {
-				return fmt.Errorf("upload failed: %w", evalErr)
-			}
-			walkRoot = resolved
+	var totalSize int64
+	if !isDir {
+		if localStat.Size() > 0 {
+			totalSize = localStat.Size()
 		}
-	}
-
-	walkErr := filepath.Walk(walkRoot, func(_ string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	} else {
+		dirSize, walkErr := s.computeLocalUploadDirSize(local)
+		if walkErr != nil {
+			return fmt.Errorf("upload failed: %w", walkErr)
 		}
-		if info != nil && !info.IsDir() {
-			totalSize += info.Size()
-		}
-		return nil
-	})
-	if walkErr != nil {
-		return fmt.Errorf("upload failed: %w", walkErr)
+		totalSize = dirSize
 	}
 
 	s.checkRemoteStorageSpace(ctx, clientToUse, remote, totalSize, destinationExists)
@@ -1676,13 +1660,7 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	}
 
 	bar, tracker := s.newTransferProgressBar(description, totalSize, isDir)
-	callback := func(n int64) {
-		if totalSize > 0 && n > 0 {
-			if err := bar.Add64(n); err != nil {
-				s.recordDisplayError(fmt.Errorf("update upload progress failed: %w", err))
-			}
-		}
-	}
+	callback := s.newClampedProgressCallback(bar, totalSize, "update upload progress failed")
 	if isDir && tracker != nil {
 		clientToUse = clientToUse.WithFileProgress(tracker.onFileProgress)
 	}
@@ -1758,6 +1736,79 @@ func (s *Shell) checkRemoteStorageSpace(ctx context.Context, client *sftp.Client
 				"Total": formatBytes(int64(total)),
 				"Need":  formatBytes(totalSize),
 			}))
+		}
+	}
+}
+
+func (s *Shell) computeLocalUploadDirSize(local string) (int64, error) {
+	resolveRoot := s.resolveLocalUploadRootFn
+	if resolveRoot == nil {
+		resolveRoot = sftp.ResolveLocalUploadRootDir
+	}
+	walkRoot, err := resolveRoot(local)
+	if err != nil {
+		return 0, err
+	}
+	var totalSize int64
+	walkErr := filepath.Walk(walkRoot, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info == nil {
+			return nil
+		}
+		if p == walkRoot {
+			if info.Mode()&os.ModeType != os.ModeDir {
+				return fmt.Errorf("local upload root %q is no longer a directory", local)
+			}
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, readErr := os.Readlink(p)
+			if readErr != nil {
+				return fmt.Errorf("read local symbolic link %q failed: %w", p, readErr)
+			}
+			target = filepath.ToSlash(target)
+			totalSize += int64(len(target))
+			return nil
+		}
+		if !info.IsDir() {
+			totalSize += info.Size()
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return 0, walkErr
+	}
+	return totalSize, nil
+}
+
+// newClampedProgressCallback wraps bar.Add64 in a concurrency-safe, monotonic
+// clamp bounded by totalSize so metadata drift or file growth during transfer
+// can never trigger progressbar's "current number exceeds max" display error,
+// while still surfacing genuine output stream write errors.
+func (s *Shell) newClampedProgressCallback(bar *progressbar.ProgressBar, totalSize int64, errOp string) sftp.ProgressCallback {
+	if bar == nil || totalSize <= 0 {
+		return func(int64) {}
+	}
+	var mu sync.Mutex
+	var added int64
+	return func(n int64) {
+		if n <= 0 {
+			return
+		}
+		mu.Lock()
+		remaining := totalSize - added
+		if remaining <= 0 {
+			mu.Unlock()
+			return
+		}
+		delta := min(n, remaining)
+		added += delta
+		mu.Unlock()
+
+		if err := bar.Add64(delta); err != nil {
+			s.recordDisplayError(fmt.Errorf("%s: %w", errOp, err))
 		}
 	}
 }
@@ -2276,23 +2327,59 @@ func ensureLocalCopyDirectory(src, dst string, perm os.FileMode) (bool, error) {
 }
 
 func checkLocalDirNotSelfContained(src, dst string) error {
-	canonicalSrc, err := canonicalLocalPath(src)
+	return checkLocalDirNotSelfContainedWith(src, dst, canonicalLocalPath, os.Stat, os.SameFile)
+}
+
+func checkLocalDirNotSelfContainedWith(
+	src, dst string,
+	canonicalFn func(string) (string, error),
+	statFn func(string) (os.FileInfo, error),
+	sameFileFn func(os.FileInfo, os.FileInfo) bool,
+) error {
+	canonicalSrc, err := canonicalFn(src)
 	if err != nil {
 		return fmt.Errorf("resolve local source directory %q failed: %w", src, err)
 	}
-	canonicalDst, err := canonicalLocalPath(dst)
+	canonicalDst, err := canonicalFn(dst)
 	if err != nil {
 		return fmt.Errorf("resolve local destination directory %q failed: %w", dst, err)
 	}
-	rel, relErr := filepath.Rel(canonicalSrc, canonicalDst)
-	if relErr != nil {
-		return nil
+	if rel, relErr := filepath.Rel(canonicalSrc, canonicalDst); relErr == nil {
+		if rel == "." {
+			return fmt.Errorf("cannot copy local directory %q into itself", src)
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel) {
+			return fmt.Errorf("local destination %q is inside source directory %q", dst, src)
+		}
 	}
-	if rel == "." {
-		return fmt.Errorf("cannot copy local directory %q into itself", src)
+
+	srcInfo, err := statFn(src)
+	if err != nil {
+		return fmt.Errorf("stat local source directory %q failed: %w", src, err)
 	}
-	if rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel) {
-		return fmt.Errorf("local destination %q is inside source directory %q", dst, src)
+	absDst, err := filepath.Abs(dst)
+	if err != nil {
+		return fmt.Errorf("resolve absolute local destination %q failed: %w", dst, err)
+	}
+	absDst = filepath.Clean(absDst)
+	cur := absDst
+	for {
+		ancInfo, statErr := statFn(cur)
+		if statErr == nil {
+			if sameFileFn(srcInfo, ancInfo) {
+				if cur == absDst {
+					return fmt.Errorf("cannot copy local directory %q into itself", src)
+				}
+				return fmt.Errorf("local destination %q is inside source directory %q", dst, src)
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("stat local destination ancestor %q failed: %w", cur, statErr)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
+		}
+		cur = parent
 	}
 	return nil
 }
@@ -2334,23 +2421,54 @@ func canonicalLocalPath(p string) (string, error) {
 }
 
 func copyLocalLink(src, dst string) error {
+	return copyLocalLinkWith(src, dst, os.Symlink, sftp.ReplaceLocalLink)
+}
+
+func copyLocalLinkWith(
+	src, dst string,
+	symlinkFn func(oldname, newname string) error,
+	replaceFn func(tempPath, localPath string) error,
+) (retErr error) {
 	target, err := os.Readlink(src)
 	if err != nil {
 		return fmt.Errorf("read local symbolic link %q failed: %w", src, err)
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	cleanDst := filepath.Clean(dst)
+	if info, lstatErr := os.Lstat(cleanDst); lstatErr == nil {
+		if info.Mode()&os.ModeType == os.ModeDir {
+			return fmt.Errorf("cannot overwrite local destination directory %q with symbolic link", cleanDst)
+		}
+	} else if !errors.Is(lstatErr, os.ErrNotExist) {
+		return fmt.Errorf("lstat local symbolic link destination %q failed: %w", cleanDst, lstatErr)
+	}
+
+	parentDir := filepath.Dir(cleanDst)
+	if err := os.MkdirAll(parentDir, 0o755); err != nil {
 		return fmt.Errorf("create local symbolic link parent failed: %w", err)
 	}
-	if _, err := os.Lstat(dst); err == nil {
-		if err := os.Remove(dst); err != nil { //nolint:forbidigo // user-initiated lcp replacing existing local symlink target
-			return fmt.Errorf("remove local symbolic link destination %q failed: %w", dst, err)
+
+	rb := make([]byte, 16)
+	if _, err := rand.Read(rb); err != nil {
+		return fmt.Errorf("generate random bytes failed: %w", err)
+	}
+	tempPath := filepath.Join(parentDir, ".xops-lcp-link-"+hex.EncodeToString(rb))
+	if err := symlinkFn(target, tempPath); err != nil {
+		return fmt.Errorf("create local temporary symbolic link %q failed: %w", tempPath, err)
+	}
+	promoted := false
+	defer func() {
+		if promoted {
+			return
 		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("lstat local symbolic link destination %q failed: %w", dst, err)
+		if rmErr := os.Remove(tempPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) { //nolint:forbidigo // deferred cleanup of randomly-named temporary symlink created by this call
+			retErr = errors.Join(retErr, fmt.Errorf("remove local temporary symbolic link %q failed: %w", tempPath, rmErr))
+		}
+	}()
+
+	if err := replaceFn(tempPath, cleanDst); err != nil {
+		return fmt.Errorf("replace local symbolic link %q failed: %w", cleanDst, err)
 	}
-	if err := os.Symlink(target, dst); err != nil {
-		return fmt.Errorf("create local symbolic link %q failed: %w", dst, err)
-	}
+	promoted = true
 	return nil
 }
 

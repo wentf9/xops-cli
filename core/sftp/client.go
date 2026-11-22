@@ -101,6 +101,7 @@ type Client struct {
 	diagnosticStreamID      uint64
 	fileProgress            FileProgressCallback
 	caseInsensitiveDirProbe func(string) bool
+	resolveUploadRoot       func(string) (string, error)
 }
 
 // NewClient creates an SFTP subsystem on an existing SSH connection. Setup is

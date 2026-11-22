@@ -13,6 +13,13 @@ func replaceLocalFile(tempPath, localPath string, rename func(string, string) er
 	return replaceLocalEntry(tempPath, localPath, false, rename)
 }
 
+// ReplaceLocalLink atomically promotes the staged temporary symbolic link at
+// tempPath to localPath, falling back to a backup-and-rollback exchange when
+// the filesystem rejects renaming over an existing regular file or symlink.
+func ReplaceLocalLink(tempPath, localPath string) error {
+	return replaceLocalLink(tempPath, localPath, os.Rename)
+}
+
 // replaceLocalLink replaces an existing regular file or symbolic link with the
 // temporary symbolic link at tempPath, using a backup fallback when rename
 // rejects overwriting an existing entry.

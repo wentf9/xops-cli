@@ -125,7 +125,7 @@ func (c *Client) globDir(ctx context.Context, parent RemotePath, filePattern str
 	if !fi.IsDir() {
 		return nil, nil
 	}
-	entries, err := c.SFTPClient().ReadDir(parent.String())
+	entries, err := c.SFTPClient().ReadDirContext(ctx, parent.String())
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
@@ -133,38 +133,20 @@ func (c *Client) globDir(ctx context.Context, parent RemotePath, filePattern str
 		return nil, nil
 	}
 
-	seen := make(map[string]struct{}, len(entries))
-	matches := make([]RemotePath, 0, len(entries))
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		if entry == nil {
-			return nil, fmt.Errorf("glob %q: %w: missing file metadata", parent.String(), ErrInvalidRemoteName)
-		}
-		entryName, nameErr := ParseRemoteName(entry.Name())
-		if nameErr != nil {
-			return nil, fmt.Errorf("glob %q: unsafe remote filename %q: %w", parent.String(), entry.Name(), nameErr)
-		}
-		rawName := entryName.String()
-		if _, dup := seen[rawName]; dup {
-			return nil, fmt.Errorf("glob %q: duplicate remote directory entry %q", parent.String(), rawName)
-		}
-		seen[rawName] = struct{}{}
-
-		matched, matchErr := path.Match(filePattern, rawName)
+	validated, err := validateRemoteDirEntries(ctx, parent, entries, "glob")
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]RemotePath, 0, len(validated))
+	for _, item := range validated {
+		matched, matchErr := path.Match(filePattern, item.name.String())
 		if matchErr != nil {
 			return nil, matchErr
 		}
 		if !matched {
 			continue
 		}
-		child := parent.Join(entryName)
-		rels, relErr := child.RelativeTo(parent)
-		if relErr != nil || len(rels) != 1 || !rels[0].Equal(entryName) {
-			return nil, fmt.Errorf("glob %q: match %q escapes parent directory", parent.String(), child.String())
-		}
-		matches = append(matches, child)
+		matches = append(matches, item.child)
 	}
 	return matches, nil
 }
