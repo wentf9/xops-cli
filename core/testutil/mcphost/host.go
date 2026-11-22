@@ -109,7 +109,7 @@ func (p *Provider) GetConfig(id string) (*ssh.ClientConfig, error) {
 	if !ok {
 		return nil, errors.New("fixture identity is missing")
 	}
-	return &ssh.ClientConfig{NodeID: id, Address: host.Address, Port: int(host.Port), User: identity.User, AuthType: identity.AuthType, KeyPath: identity.KeyPath, AuthUpdateToken: "fixture", SudoUpdateToken: "fixture", ProxyJump: node.ProxyJump, SudoMode: node.SudoMode, PasswordPromptPattern: node.PasswordPromptPattern}, nil
+	return ssh.NewClientConfig(ssh.ClientConfig{NodeID: id, Address: host.Address, Port: int(host.Port), User: identity.User, AuthType: identity.AuthType, KeyPath: identity.KeyPath, AuthUpdateToken: "fixture", SudoUpdateToken: "fixture", ProxyJump: node.ProxyJump, SudoMode: node.SudoMode, PasswordPromptPattern: node.PasswordPromptPattern}), nil
 }
 func (p *Provider) nodeInfo(id string) (ports.NodeInfo, error) {
 	config, err := p.GetConfig(id)

@@ -325,21 +325,21 @@ func effectiveControlProxyConfig(cfg *ClientConfig, target TargetContext) *Clien
 		if port <= 0 {
 			port = 22
 		}
-		return &ClientConfig{
+		return NewClientConfig(ClientConfig{
 			OriginalHost:  target.OriginalHost,
 			CanonicalHost: target.CanonicalHost,
 			Address:       target.Host,
 			Port:          port,
 			User:          target.User,
 			ProxyJump:     normTargetJump,
-		}
+		})
 	}
 	normJump := NormalizeProxyJump(cfg.ProxyJump)
 	if cfg.ProxyJump == "" && normTargetJump != "" {
 		normJump = normTargetJump
 	}
 	if !controlProxyConfigNeedsClone(cfg, target, normJump) {
-		return cfg
+		return NewClientConfig(*cfg)
 	}
 	cloned := *cfg
 	if cloned.Port <= 0 {
@@ -361,7 +361,7 @@ func effectiveControlProxyConfig(cfg *ClientConfig, target TargetContext) *Clien
 		cloned.CanonicalHost = target.CanonicalHost
 	}
 	cloned.ProxyJump = normJump
-	return &cloned
+	return NewClientConfig(cloned)
 }
 
 func DialControlProxyClient(

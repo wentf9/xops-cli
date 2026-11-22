@@ -807,7 +807,7 @@ func newControlProxyFallbackConfig(
 	if o != nil {
 		pw = o.Password
 	}
-	return &ssh.ClientConfig{
+	return ssh.NewClientConfig(ssh.ClientConfig{
 		Address:               target.Host,
 		Port:                  port,
 		User:                  target.User,
@@ -819,7 +819,7 @@ func newControlProxyFallbackConfig(
 		Execution:             resolvedExec,
 		Options:               resolveControlProxyFallbackOptions(adp, fallbackLookup, o),
 		PasswordPromptPattern: globalPattern,
-	}
+	})
 }
 
 func resolveControlProxyFallbackLookup(target ssh.TargetContext, provider config.ConfigProvider, o *SshOptions) string {

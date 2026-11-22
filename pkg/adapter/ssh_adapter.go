@@ -939,7 +939,7 @@ func (p EffectivePolicy) ClientConfig() (*ssh.ClientConfig, error) {
 		}
 	}
 
-	cfg := &ssh.ClientConfig{
+	cfg := ssh.NewClientConfig(ssh.ClientConfig{
 		NodeID:                p.nodeID,
 		Address:               effectiveSnapshotHost(snapshot, false, SessionAuth{}),
 		Port:                  effectiveSnapshotPort(snapshot.Host.Port),
@@ -960,7 +960,7 @@ func (p EffectivePolicy) ClientConfig() (*ssh.ClientConfig, error) {
 		PasswordPromptPattern: snapshot.Node.PasswordPromptPattern,
 		Execution:             execCfg,
 		Options:               sshOpts,
-	}
+	})
 
 	cliFlagList := ssh.UnsetPathList()
 	if p.hasTier1Auth {
@@ -999,7 +999,7 @@ func (p EffectivePolicy) ClientConfig() (*ssh.ClientConfig, error) {
 		}
 	}
 
-	return cfg, nil
+	return ssh.NewClientConfig(*cfg), nil
 }
 
 // GetConfig implements ssh.ConnectionProvider by delegating to Resolve.

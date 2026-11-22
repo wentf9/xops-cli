@@ -86,7 +86,7 @@ func freezeDialPolicy(cfg *ClientConfig) dialPolicy {
 }
 
 func (p dialPolicy) readOnlyConfig() *ClientConfig {
-	return &ClientConfig{
+	return NewClientConfig(ClientConfig{
 		NodeID:                      p.nodeID,
 		Address:                     p.address,
 		BaseHost:                    p.baseHost,
@@ -94,7 +94,7 @@ func (p dialPolicy) readOnlyConfig() *ClientConfig {
 		User:                        p.user,
 		AuthType:                    p.authType,
 		KeyPath:                     p.keyPath,
-		KeyPaths:                    slices.Clone(p.keyPaths),
+		KeyPaths:                    p.keyPaths,
 		KeyRef:                      p.keyRef,
 		AuthUpdateToken:             p.authUpdateToken,
 		SudoMode:                    p.sudoMode,
@@ -107,12 +107,12 @@ func (p dialPolicy) readOnlyConfig() *ClientConfig {
 		TrustVersion:                p.trustVersion,
 		PasswordPromptPattern:       p.passwordPromptPattern,
 		EnforceAdmittedCertificates: p.enforceAdmittedCertificates,
-		AdmittedCertificates:        cloneAdmittedCertificates(p.admittedCertificates),
+		AdmittedCertificates:        p.admittedCertificates,
 		EnforceAdmittedKeyDigests:   p.enforceAdmittedKeyDigests,
-		AdmittedKeyDigests:          cloneAdmittedKeyDigests(p.admittedKeyDigests),
-		Execution:                   p.execution.Clone(),
-		Options:                     p.options.Clone(),
-	}
+		AdmittedKeyDigests:          p.admittedKeyDigests,
+		Execution:                   p.execution,
+		Options:                     p.options,
+	})
 }
 
 func (p dialPolicy) toConnectionConfig() ConnectionConfig {
