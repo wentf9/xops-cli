@@ -169,84 +169,7 @@ func TestP7W5a_AB5H1_CaseFoldedChainedSymlinksRejected(t *testing.T) {
 		}
 	})
 
-	t.Run("case_insensitive_walkdir_rejects_colliding_siblings", func(t *testing.T) {
-		cases := []struct {
-			name    string
-			entries []os.FileInfo
-		}{
-			{
-				name: "regular_files_foo_and_FOO",
-				entries: []os.FileInfo{
-					syntheticFileInfo{name: "foo", size: 3, mode: 0o644},
-					syntheticFileInfo{name: "FOO", size: 3, mode: 0o644},
-				},
-			},
-			{
-				name: "symlinks_up_and_UP",
-				entries: []os.FileInfo{
-					syntheticFileInfo{name: "up", mode: os.ModeSymlink | 0o777},
-					syntheticFileInfo{name: "UP", mode: os.ModeSymlink | 0o777},
-				},
-			},
-			{
-				name: "dir_and_file_collision",
-				entries: []os.FileInfo{
-					syntheticFileInfo{name: "sub", mode: os.ModeDir | 0o755},
-					syntheticFileInfo{name: "SUB", size: 3, mode: 0o644},
-				},
-			},
-			{
-				name: "unicode_sigma_collision",
-				entries: []os.FileInfo{
-					syntheticFileInfo{name: "σ", size: 3, mode: 0o644},
-					syntheticFileInfo{name: "ς", size: 3, mode: 0o644},
-				},
-			},
-		}
-
-		for _, tc := range cases {
-			t.Run(tc.name, func(t *testing.T) {
-				handler := &customReadLinkHandler{
-					maliciousSFTPHandler: maliciousSFTPHandler{
-						statInfos: map[string]os.FileInfo{
-							"/ci":     syntheticFileInfo{name: "ci", mode: os.ModeDir | 0o755},
-							"/ci/sub": syntheticFileInfo{name: "sub", mode: os.ModeDir | 0o755},
-						},
-						dirLists: map[string][]os.FileInfo{
-							"/ci":     tc.entries,
-							"/ci/sub": {},
-						},
-						files: map[string][]byte{
-							"/ci/foo": []byte("one"),
-							"/ci/FOO": []byte("two"),
-							"/ci/SUB": []byte("two"),
-							"/ci/σ":   []byte("one"),
-							"/ci/ς":   []byte("two"),
-						},
-					},
-					readLinks: map[string][]string{
-						"/ci/up": {"safe"},
-						"/ci/UP": {"../.."},
-					},
-				}
-				client := newTestSFTPClientWithHandlers(t, pkgsftp.Handlers{
-					FileGet:  handler,
-					FilePut:  handler,
-					FileCmd:  handler,
-					FileList: handler,
-				})
-				client.caseInsensitiveDirProbe = func(string) bool { return true }
-
-				localDst := t.TempDir()
-				remoteRoot, _ := ParseRemotePath("/ci")
-				dest, _ := LocalDestPath(localDst)
-				err := client.Download(t.Context(), remoteRoot, dest, DownloadOptions{})
-				if err == nil || !strings.Contains(err.Error(), "case-colliding remote directory entries") {
-					t.Fatalf("Download on case-insensitive root = %v, want case-colliding remote directory entries error", err)
-				}
-			})
-		}
-	})
+	t.Run("case_insensitive_walkdir_rejects_colliding_siblings", testP7W5aCaseInsensitiveWalkDirRejectsCollidingSiblings)
 
 	t.Run("probeCaseInsensitiveDir_leaves_no_temp_entries_and_matches_fs", func(t *testing.T) {
 		dir := t.TempDir()
@@ -273,6 +196,98 @@ func TestP7W5a_AB5H1_CaseFoldedChainedSymlinksRejected(t *testing.T) {
 			t.Fatalf("probeCaseInsensitiveDir(%q) = %v, want %v", dir, got, want)
 		}
 	})
+}
+
+func testP7W5aCaseInsensitiveWalkDirRejectsCollidingSiblings(t *testing.T) {
+	t.Helper()
+	cases := []struct {
+		name    string
+		entries []os.FileInfo
+	}{
+		{
+			name: "regular_files_foo_and_FOO",
+			entries: []os.FileInfo{
+				syntheticFileInfo{name: "foo", size: 3, mode: 0o644},
+				syntheticFileInfo{name: "FOO", size: 3, mode: 0o644},
+			},
+		},
+		{
+			name: "symlinks_up_and_UP",
+			entries: []os.FileInfo{
+				syntheticFileInfo{name: "up", mode: os.ModeSymlink | 0o777},
+				syntheticFileInfo{name: "UP", mode: os.ModeSymlink | 0o777},
+			},
+		},
+		{
+			name: "dir_and_file_collision",
+			entries: []os.FileInfo{
+				syntheticFileInfo{name: "sub", mode: os.ModeDir | 0o755},
+				syntheticFileInfo{name: "SUB", size: 3, mode: 0o644},
+			},
+		},
+		{
+			name: "unicode_sigma_collision",
+			entries: []os.FileInfo{
+				syntheticFileInfo{name: "σ", size: 3, mode: 0o644},
+				syntheticFileInfo{name: "ς", size: 3, mode: 0o644},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := &customReadLinkHandler{
+				maliciousSFTPHandler: maliciousSFTPHandler{
+					statInfos: map[string]os.FileInfo{
+						"/ci":     syntheticFileInfo{name: "ci", mode: os.ModeDir | 0o755},
+						"/ci/sub": syntheticFileInfo{name: "sub", mode: os.ModeDir | 0o755},
+						"/ci/foo": syntheticFileInfo{name: "foo", size: 3, mode: 0o644},
+						"/ci/FOO": syntheticFileInfo{name: "FOO", size: 3, mode: 0o644},
+						"/ci/SUB": syntheticFileInfo{name: "SUB", size: 3, mode: 0o644},
+						"/ci/σ":   syntheticFileInfo{name: "σ", size: 3, mode: 0o644},
+						"/ci/ς":   syntheticFileInfo{name: "ς", size: 3, mode: 0o644},
+					},
+					dirLists: map[string][]os.FileInfo{
+						"/ci":     tc.entries,
+						"/ci/sub": {},
+					},
+					files: map[string][]byte{
+						"/ci/foo": []byte("one"),
+						"/ci/FOO": []byte("two"),
+						"/ci/SUB": []byte("two"),
+						"/ci/σ":   []byte("one"),
+						"/ci/ς":   []byte("two"),
+					},
+				},
+				readLinks: map[string][]string{
+					"/ci/up": {"safe"},
+					"/ci/UP": {"../.."},
+				},
+			}
+			client := newTestSFTPClientWithHandlers(t, pkgsftp.Handlers{
+				FileGet:  handler,
+				FilePut:  handler,
+				FileCmd:  handler,
+				FileList: handler,
+			})
+			client.caseInsensitiveDirProbe = func(string) bool { return true }
+
+			localDst := t.TempDir()
+			remoteRoot, _ := ParseRemotePath("/ci")
+			dest, _ := LocalDestPath(localDst)
+			err := client.Download(t.Context(), remoteRoot, dest, DownloadOptions{})
+			if err == nil || !strings.Contains(err.Error(), "case-colliding remote directory entries") {
+				t.Fatalf("Download on case-insensitive root = %v, want case-colliding remote directory entries error", err)
+			}
+			entries, readErr := os.ReadDir(localDst)
+			if readErr != nil {
+				t.Fatalf("ReadDir(%q): %v", localDst, readErr)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("localDst must remain empty after sibling collision rejection, got %d entries", len(entries))
+			}
+		})
+	}
 }
 
 func TestP7W5a_AB5M1_WindowsJunctionAndUnreplacedDiskSymlink(t *testing.T) {

@@ -1911,6 +1911,12 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteRoot RemotePath, l
 	return c.applyStagedDownloadSymlinks(ctx, localRoot.Path(), walker.symlinks, walker.symlinkMap, progress)
 }
 
+type validatedWalkEntry struct {
+	entry       os.FileInfo
+	childRemote RemotePath
+	childLocal  LocalTarget
+}
+
 func (w *downloadDirWalkState) walkDir(curRemote RemotePath, curLocal LocalTarget) error {
 	if err := w.groupCtx.Err(); err != nil {
 		return err
@@ -1919,51 +1925,77 @@ func (w *downloadDirWalkState) walkDir(curRemote RemotePath, curLocal LocalTarge
 	if readErr != nil {
 		return readErr
 	}
-	seen := make(map[string]struct{}, len(entries))
-	var seenFold map[string]string
-	if w.caseInsensitive {
-		seenFold = make(map[string]string, len(entries))
+	validated, err := w.validateDirEntries(curRemote, curLocal, entries)
+	if err != nil {
+		return err
 	}
-	for _, entry := range entries {
-		if err := w.handleEntry(curRemote, curLocal, seen, seenFold, entry); err != nil {
+	for _, item := range validated {
+		if err := w.applyValidatedEntry(curRemote, item); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (w *downloadDirWalkState) handleEntry(curRemote RemotePath, curLocal LocalTarget, seen map[string]struct{}, seenFold map[string]string, entry os.FileInfo) error {
+// validateDirEntries pre-validates every sibling entry in curRemote (non-nil
+// metadata, safe remote name, exact duplicate, case-folded collision on
+// case-insensitive destinations, and local target containment) BEFORE creating
+// any child directories, reading symlinks, or enqueueing download workers.
+func (w *downloadDirWalkState) validateDirEntries(curRemote RemotePath, curLocal LocalTarget, entries []os.FileInfo) ([]validatedWalkEntry, error) {
+	seen := make(map[string]struct{}, len(entries))
+	var seenFold map[string]string
+	if w.caseInsensitive {
+		seenFold = make(map[string]string, len(entries))
+	}
+	validated := make([]validatedWalkEntry, 0, len(entries))
+	for _, entry := range entries {
+		if err := w.groupCtx.Err(); err != nil {
+			return nil, err
+		}
+		if entry == nil {
+			return nil, fmt.Errorf("missing file metadata for entry in %q", curRemote.String())
+		}
+		entryName, nameErr := ParseRemoteName(entry.Name())
+		if nameErr != nil {
+			return nil, fmt.Errorf("download %q: unsafe remote filename %q: %w", curRemote.String(), entry.Name(), nameErr)
+		}
+		rawName := entryName.String()
+		if _, dup := seen[rawName]; dup {
+			return nil, fmt.Errorf("download %q: duplicate remote directory entry %q", curRemote.String(), rawName)
+		}
+		seen[rawName] = struct{}{}
+		if seenFold != nil {
+			folded := foldDownloadRelPath(rawName)
+			if prev, dup := seenFold[folded]; dup {
+				return nil, fmt.Errorf("download %q: case-colliding remote directory entries %q and %q on case-insensitive filesystem", curRemote.String(), prev, rawName)
+			}
+			seenFold[folded] = rawName
+		}
+
+		childRemote := curRemote.Join(entryName)
+		if _, relErr := childRemote.RelativeTo(w.remoteRoot); relErr != nil {
+			return nil, fmt.Errorf("download %q: %w", childRemote.String(), relErr)
+		}
+		childLocal, targetErr := curLocal.Join(entryName)
+		if targetErr != nil {
+			return nil, fmt.Errorf("download %q: unsafe remote filename %q: %w", childRemote.String(), rawName, targetErr)
+		}
+		validated = append(validated, validatedWalkEntry{
+			entry:       entry,
+			childRemote: childRemote,
+			childLocal:  childLocal,
+		})
+	}
+	return validated, nil
+}
+
+func (w *downloadDirWalkState) applyValidatedEntry(curRemote RemotePath, item validatedWalkEntry) error {
 	if err := w.groupCtx.Err(); err != nil {
 		return err
 	}
-	if entry == nil {
-		return fmt.Errorf("missing file metadata for entry in %q", curRemote.String())
-	}
-	entryName, nameErr := ParseRemoteName(entry.Name())
-	if nameErr != nil {
-		return fmt.Errorf("download %q: unsafe remote filename %q: %w", curRemote.String(), entry.Name(), nameErr)
-	}
-	rawName := entryName.String()
-	if _, dup := seen[rawName]; dup {
-		return fmt.Errorf("download %q: duplicate remote directory entry %q", curRemote.String(), rawName)
-	}
-	seen[rawName] = struct{}{}
-	if seenFold != nil {
-		folded := foldDownloadRelPath(rawName)
-		if prev, dup := seenFold[folded]; dup {
-			return fmt.Errorf("download %q: case-colliding remote directory entries %q and %q on case-insensitive filesystem", curRemote.String(), prev, rawName)
-		}
-		seenFold[folded] = rawName
-	}
-
-	childRemote := curRemote.Join(entryName)
-	if _, relErr := childRemote.RelativeTo(w.remoteRoot); relErr != nil {
-		return fmt.Errorf("download %q: %w", childRemote.String(), relErr)
-	}
-	childLocal, targetErr := curLocal.Join(entryName)
-	if targetErr != nil {
-		return fmt.Errorf("download %q: unsafe remote filename %q: %w", childRemote.String(), entryName.String(), targetErr)
-	}
+	entry := item.entry
+	childRemote := item.childRemote
+	childLocal := item.childLocal
 
 	if entry.Mode()&os.ModeSymlink != 0 {
 		target, readErr := w.client.SFTPClient().ReadLink(childRemote.String())
