@@ -932,7 +932,7 @@ func directJumpMatchesAlias(target, direct jumpNodeIdentity) bool {
 	if direct.isOpenSSH && target.isSavedNode {
 		return false
 	}
-	if direct.openSSHRef.HasPort && normalizedHostPort(direct.openSSHRef.Port) != target.effectivePort() {
+	if (direct.openSSHRef.HasPort || direct.isOpenSSH) && direct.effectivePort() != target.effectivePort() {
 		return false
 	}
 	if !slices.Contains(target.aliases, direct.openSSHRef.Host) {

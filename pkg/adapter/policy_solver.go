@@ -402,34 +402,98 @@ func buildPolicyProxyJumpTarget(
 	return buildSnapshotPolicyProxyJumpTarget(dest, snapshot, tier1Auth, hasTier1Auth)
 }
 
+func formatOverriddenOpenSSHNodeID(nodeID, fallbackHost, user string, port uint16) string {
+	var hostToken string
+	if ref, err := config.ParseTargetRef(nodeID); err == nil && ref.Host != "" {
+		hostToken = ref.Host
+	}
+	if hostToken == "" {
+		hostToken = strings.TrimSpace(fallbackHost)
+	}
+	if hostToken == "" {
+		hostToken = config.UnwrapOpenSSHSelector(nodeID)
+	}
+	if hostToken == "" {
+		return nodeID
+	}
+	effectivePort := port
+	if effectivePort == 0 {
+		effectivePort = 22
+	}
+	ref := config.TargetRef{
+		OpenSSH: true,
+		User:    strings.TrimSpace(user),
+		Host:    config.StripHostBrackets(hostToken),
+		Port:    effectivePort,
+		HasPort: true,
+	}
+	if norm := ref.NormalizedString(); norm != "" {
+		return norm
+	}
+	if trimmedUser := strings.TrimSpace(user); trimmedUser != "" {
+		return config.OpenSSHNodePrefix + config.FormatNodeID(trimmedUser, hostToken, effectivePort)
+	}
+	return config.OpenSSHNodePrefix + config.FormatHostPort(hostToken, effectivePort)
+}
+
+func extractNoSnapshotTargetRefDefaults(nodeID, openSSHAlias string) (user string, port uint16, lookupAlias string) {
+	lookupAlias = openSSHAlias
+	if nodeID == "" {
+		return "", 0, lookupAlias
+	}
+	ref, err := config.ParseTargetRef(nodeID)
+	if err != nil {
+		return "", 0, lookupAlias
+	}
+	if ref.User != "" {
+		user = ref.User
+	}
+	if ref.HasPort && ref.Port > 0 {
+		port = ref.Port
+	}
+	if lookupAlias == "" && ref.OpenSSH && ref.Host != "" {
+		lookupAlias = ref.Host
+	}
+	return user, port, lookupAlias
+}
+
+func applyNoSnapshotTier1Overrides(
+	tier1Auth SessionAuth,
+	hasTier1Auth bool,
+	explicitUser *string,
+	explicitPort *uint16,
+	host *string,
+) bool {
+	if !hasTier1Auth {
+		return false
+	}
+	overrode := false
+	if u := strings.TrimSpace(tier1Auth.User); u != "" {
+		overrode = overrode || u != *explicitUser
+		*explicitUser = u
+	}
+	if tier1Auth.Port > 0 {
+		overrode = overrode || tier1Auth.Port != *explicitPort
+		*explicitPort = tier1Auth.Port
+	}
+	if h := config.StripHostBrackets(tier1Auth.HostName); h != "" {
+		*host = h
+		overrode = true
+	}
+	return overrode
+}
+
 func buildNoSnapshotPolicyProxyJumpTarget(
 	parser *config.OpenSSHParser,
 	dest config.ProxyJumpTarget,
 	tier1Auth SessionAuth,
 	hasTier1Auth bool,
 ) config.ProxyJumpTarget {
-	explicitUser := ""
-	var explicitPort uint16
-	if dest.NodeID != "" {
-		if ref, err := config.ParseTargetRef(dest.NodeID); err == nil {
-			if ref.User != "" {
-				explicitUser = ref.User
-			}
-			if ref.HasPort && ref.Port > 0 {
-				explicitPort = ref.Port
-			}
-		}
-	}
-	if hasTier1Auth {
-		if u := strings.TrimSpace(tier1Auth.User); u != "" {
-			explicitUser = u
-		}
-		if tier1Auth.Port > 0 {
-			explicitPort = tier1Auth.Port
-		}
-	}
-	if dest.OpenSSHAlias != "" {
-		host, port, user := resolveOpenSSHPolicyTargetDefaults(parser, dest.OpenSSHAlias, dest.CanonicalHost)
+	explicitUser, explicitPort, openSSHLookupAlias := extractNoSnapshotTargetRefDefaults(dest.NodeID, dest.OpenSSHAlias)
+	var overrideHost string
+	tier1Overrode := applyNoSnapshotTier1Overrides(tier1Auth, hasTier1Auth, &explicitUser, &explicitPort, &overrideHost)
+	if openSSHLookupAlias != "" {
+		host, port, user := resolveOpenSSHPolicyTargetDefaults(parser, openSSHLookupAlias, dest.CanonicalHost)
 		if host != "" {
 			dest.Host = host
 		}
@@ -440,16 +504,19 @@ func buildNoSnapshotPolicyProxyJumpTarget(
 			explicitUser = user
 		}
 	}
-	if hasTier1Auth && strings.TrimSpace(tier1Auth.HostName) != "" {
-		dest.Host = config.StripHostBrackets(tier1Auth.HostName)
+	if overrideHost != "" {
+		dest.Host = overrideHost
 	}
 	if explicitPort > 0 {
 		dest.Port = explicitPort
 	}
 	if explicitUser != "" {
 		dest.User = explicitUser
-	} else if dest.NodeID != "" {
+	} else if dest.NodeID != "" && !config.IsOpenSSHNodeID(dest.NodeID) {
 		dest.User = effectiveSnapshotUser("")
+	}
+	if tier1Overrode && config.IsOpenSSHNodeID(dest.NodeID) {
+		dest.NodeID = formatOverriddenOpenSSHNodeID(dest.NodeID, openSSHLookupAlias, explicitUser, dest.Port)
 	}
 	return dest
 }
@@ -495,13 +562,7 @@ func buildSnapshotPolicyProxyJumpTarget(
 	}
 	if endpointOverridden {
 		if config.IsOpenSSHNodeID(dest.NodeID) {
-			hostToken := config.UnwrapOpenSSHSelector(dest.NodeID)
-			if hostToken == "" {
-				hostToken = dest.OpenSSHAlias
-			}
-			if hostToken != "" {
-				dest.NodeID = config.OpenSSHNodePrefix + config.FormatNodeID(dest.User, hostToken, dest.Port)
-			}
+			dest.NodeID = formatOverriddenOpenSSHNodeID(dest.NodeID, dest.OpenSSHAlias, dest.User, dest.Port)
 		} else {
 			dest.IsAdHoc = true
 			dest.NodeID = config.FormatNodeID(dest.User, dest.Host, dest.Port)

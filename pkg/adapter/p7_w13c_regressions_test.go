@@ -448,6 +448,11 @@ Host short.corp.example.com
 		}
 	})
 
+	t.Run("composite_and_ipv6_openssh_NodeID_with_session_overrides", func(t *testing.T) {
+		t.Parallel()
+		assertW13cCompositeAndNoSnapshotOpenSSHOverrides(t, prov, muxOpts, &env)
+	})
+
 	t.Run("genuine_cycles_on_overridden_port_or_user_still_fail_closed", func(t *testing.T) {
 		t.Parallel()
 		for _, tc := range []struct {
@@ -499,4 +504,121 @@ Host short.corp.example.com
 			}
 		}
 	})
+}
+
+type w13cNoSnapshotProvider struct {
+	config.ConfigProvider
+}
+
+func (p w13cNoSnapshotProvider) ResolveConnection(string) (config.ConnectionSnapshot, error) {
+	return config.ConnectionSnapshot{}, config.ErrNodeNotFound
+}
+
+func (p w13cNoSnapshotProvider) GetOpenSSHParser() *config.OpenSSHParser {
+	if src, ok := p.ConfigProvider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok {
+		return src.GetOpenSSHParser()
+	}
+	return nil
+}
+
+func assertW13cCompositeAndNoSnapshotOpenSSHOverrides(
+	t *testing.T,
+	prov config.ConfigProvider,
+	muxOpts SessionControlOptions,
+	env *ssh.Environment,
+) {
+	t.Helper()
+
+	// 1. hasSnapshot composite OpenSSH NodeIDs ("openssh:alice@web" + Port 2222, "openssh:web:22" + User alice, "openssh:[::1]:22" + Port 2222).
+	for _, tc := range []struct {
+		name   string
+		nodeID string
+		auth   SessionAuth
+		want   string
+	}{
+		{
+			name:   "openssh_inline_user_with_port_override",
+			nodeID: "openssh:alice@web",
+			auth:   SessionAuth{Port: 2222, ProxyJump: "openssh:alice@web"},
+			want:   "openssh:alice@web",
+		},
+		{
+			name:   "openssh_inline_port_with_user_override",
+			nodeID: "openssh:web:22",
+			auth:   SessionAuth{User: "alice", ProxyJump: "openssh:web:22"},
+			want:   "openssh:web:22",
+		},
+		{
+			name:   "openssh_ipv6_with_port_override",
+			nodeID: "openssh:[::1]:22",
+			auth:   SessionAuth{Port: 2222, ProxyJump: "openssh:[::1]:22"},
+			want:   "openssh:[::1]:22",
+		},
+	} {
+		adp := NewSSHAdapter(prov, WithSessionAuthOverride(tc.nodeID, tc.auth))
+		pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: tc.nodeID, ResolveProxy: true})
+		if err != nil || pol.EffectiveJump() != tc.want {
+			t.Errorf("SSHAdapter.Resolve(%s, nodeID=%q) = (%q, %v), want %q", tc.name, tc.nodeID, pol.EffectiveJump(), err, tc.want)
+		}
+		sock, _, sErr := ResolveControlSocketPath(ControlTargetRequest{
+			Provider: prov,
+			NodeID:   tc.nodeID,
+			Target: config.ConnectionTarget{
+				Selector:     tc.nodeID,
+				User:         tc.auth.User,
+				HasUser:      tc.auth.User != "",
+				Port:         tc.auth.Port,
+				HasPort:      tc.auth.Port > 0,
+				ProxyJump:    tc.auth.ProxyJump,
+				HasProxyJump: true,
+			},
+			SessionControl: muxOpts,
+			Environment:    env,
+		})
+		if sErr != nil || sock == "" {
+			t.Errorf("ResolveControlSocketPath(%s) = (%q, %v), want valid socket", tc.name, sock, sErr)
+		}
+	}
+
+	// 2. !hasSnapshot openssh: NodeID + SessionAuth{Port: 2222} / {User: "bob"} must not falsely self-loop
+	//    (both without OpenSSH config and with OpenSSH config via w13cNoSnapshotProvider),
+	//    while matching the overridden port/user MUST still fail closed with *ssh.ProxyCycleError.
+	noOpenSSHProv := config.NewProviderWithoutOpenSSH(nil)
+	noSnapWithOpenSSH := w13cNoSnapshotProvider{ConfigProvider: prov}
+	for _, tc := range []struct {
+		name     string
+		provider config.ConfigProvider
+		nodeID   string
+		auth     SessionAuth
+	}{
+		{"nosnap_no_openssh_user_port_override", noOpenSSHProv, "openssh:alice@web", SessionAuth{Port: 2222, ProxyJump: "openssh:alice@web"}},
+		{"nosnap_no_openssh_fqdn_port_override", noOpenSSHProv, "openssh:web.example.com", SessionAuth{Port: 2222, ProxyJump: "openssh:web.example.com"}},
+		{"nosnap_no_openssh_ipv6_port_override", noOpenSSHProv, "openssh:[::1]:22", SessionAuth{Port: 2222, ProxyJump: "openssh:[::1]:22"}},
+		{"nosnap_with_openssh_bare_port_override", noSnapWithOpenSSH, "openssh:web", SessionAuth{Port: 2222, ProxyJump: "openssh:web"}},
+		{"nosnap_with_openssh_user_port_override", noSnapWithOpenSSH, "openssh:alice@web", SessionAuth{Port: 2222, ProxyJump: "openssh:alice@web"}},
+		{"nosnap_with_openssh_bare_user_override", noSnapWithOpenSSH, "openssh:web", SessionAuth{User: "alice", ProxyJump: "openssh:web"}},
+	} {
+		adp := NewSSHAdapter(tc.provider, WithSessionAuthOverride(tc.nodeID, tc.auth))
+		pol, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: tc.nodeID, ResolveProxy: true})
+		if err != nil || pol.EffectiveJump() != tc.auth.ProxyJump {
+			t.Errorf("SSHAdapter.Resolve(%s) = (%q, %v), want %q", tc.name, pol.EffectiveJump(), err, tc.auth.ProxyJump)
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		provider config.ConfigProvider
+		nodeID   string
+		auth     SessionAuth
+	}{
+		{"nosnap_true_cycle_overridden_port_2222", noOpenSSHProv, "openssh:alice@web", SessionAuth{Port: 2222, ProxyJump: "openssh:alice@web:2222"}},
+		{"nosnap_true_cycle_same_port_22", noSnapWithOpenSSH, "openssh:web", SessionAuth{Port: 22, ProxyJump: "openssh:web"}},
+		{"nosnap_true_cycle_same_overridden_user", noSnapWithOpenSSH, "openssh:web", SessionAuth{User: "alice", ProxyJump: "openssh:alice@web"}},
+	} {
+		var cycleErr *ssh.ProxyCycleError
+		adp := NewSSHAdapter(tc.provider, WithSessionAuthOverride(tc.nodeID, tc.auth))
+		if _, err := adp.Resolve(t.Context(), ResolveRequest{NodeID: tc.nodeID, ResolveProxy: true}); !errors.As(err, &cycleErr) {
+			t.Errorf("SSHAdapter.Resolve(%s) = %v, want *ssh.ProxyCycleError", tc.name, err)
+		}
+	}
 }
