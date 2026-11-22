@@ -47,16 +47,16 @@ func (c *Client) sessionRequest(ctx context.Context, session *cryptoSSH.Session,
 	}
 }
 
-func (c *Client) waitTerminalSession(ctx context.Context, session *cryptoSSH.Session, done, outputFailed <-chan error, abort context.CancelFunc) error {
+func (c *Client) waitTerminalSession(ctx context.Context, session *cryptoSSH.Session, done, outputFailed <-chan error, abort context.CancelFunc) (waitErr, outputFailedErr error) {
 	select {
 	case err := <-done:
-		return err
+		return err, nil
 	case err := <-outputFailed:
 		abort()
-		return errors.Join(err, c.closeCanceledSession(ctx, session, done))
+		return c.closeCanceledSession(ctx, session, done), err
 	case <-ctx.Done():
 		abort()
-		return c.closeCanceledSession(ctx, session, done)
+		return c.closeCanceledSession(ctx, session, done), nil
 	}
 }
 
@@ -145,7 +145,7 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 	// EOF closes only the sending direction. On cancellation, closing the SSH
 	// session unblocks both an input write and this final CloseWrite.
 	go func() { inputJoined <- errors.Join(<-inputDone, closeResource(stdin, "terminal stdin")) }()
-	waitErr := c.waitTerminalSession(work, session, waitDone, output.failed, abort)
+	waitErr, outputFailedErr := c.waitTerminalSession(work, session, waitDone, output.failed, abort)
 	cancel()
 	closeErr := c.closeSessionBounded(session)
 	inputErr := errors.Join(stopInput(), <-inputJoined)
@@ -158,6 +158,12 @@ func (c *Client) runTerminalSession(ctx context.Context, payload string, streams
 			return ErrEscapeDisconnect
 		}
 		return errors.Join(ErrEscapeDisconnect, closeErr)
+	}
+	if outputFailedErr != nil {
+		if outputErr != nil && errors.Is(outputErr, outputFailedErr) {
+			return errors.Join(outputErr, waitErr, closeErr, inputErr)
+		}
+		return errors.Join(outputFailedErr, waitErr, closeErr, inputErr, outputErr)
 	}
 	return errors.Join(waitErr, closeErr, inputErr, outputErr)
 }

@@ -866,6 +866,9 @@ func combineOutputCancels(cancel context.CancelFunc, cancelOutput []context.Canc
 
 func resolveSessionErrors(workErr, waitErr, outputFailedErr, closeErr, inputErr, outputErr error) error {
 	if outputFailedErr != nil {
+		if outputErr != nil && errors.Is(outputErr, outputFailedErr) {
+			return errors.Join(outputErr, waitErr, closeErr, inputErr)
+		}
 		return errors.Join(outputFailedErr, waitErr, closeErr, inputErr, outputErr)
 	}
 	if workErr != nil && waitErr != nil && (errors.Is(waitErr, context.Canceled) || errors.Is(waitErr, context.DeadlineExceeded)) {

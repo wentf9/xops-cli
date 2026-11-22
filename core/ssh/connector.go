@@ -281,20 +281,35 @@ func isClientTransportClosed(client *Client) bool {
 	return isRootConnClosed(client.rootConn)
 }
 
+// probeCachedIntermediateHops probes any cached intermediate hops (index > 0)
+// in reuse-only mode so dead cached bastions are evicted before attempting to
+// reuse or attach to plan[0]'s ControlMaster. A dead intermediate hop returns
+// errJumpChainRequired after eviction and does NOT abort the fast-path; only
+// fatal/cancellation/security errors abort immediately.
+func (c *Connector) probeCachedIntermediateHops(ctx context.Context, plan []connectionPlanNode, snapshot []*PooledClient) error {
+	for index := len(plan) - 1; index > 0; index-- {
+		if snapshot[index] == nil {
+			continue
+		}
+		if _, err := c.connectPlannedNode(ctx, plan[index], nil, nil, true); err != nil {
+			if errors.Is(err, errJumpChainRequired) {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // validateCachedChain probes every hop of a cached chain approved by
 // canReuseCachedChain, verifying that parent/child RootConn generations remain
 // consistent across probes.
 func (c *Connector) validateCachedChain(ctx context.Context, plan []connectionPlanNode, snapshot []*PooledClient) (*Client, error) {
 	if snapshot[0] != nil && snapshot[0].ControlSocketPath != "" {
 		// ControlMaster-attached target: still probe any cached intermediate hops
-		// so a dead bastion cannot go unnoticed, then validate the target proxy.
-		for index := len(plan) - 1; index > 0; index-- {
-			if snapshot[index] == nil {
-				continue
-			}
-			if _, err := c.connectPlannedNode(ctx, plan[index], nil, nil, true); err != nil {
-				return nil, err
-			}
+		// so a dead bastion is evicted, then validate or re-attach the target proxy.
+		if err := c.probeCachedIntermediateHops(ctx, plan, snapshot); err != nil {
+			return nil, err
 		}
 		return c.connectPlannedNode(ctx, plan[0], nil, nil, true)
 	}
@@ -324,13 +339,8 @@ func (c *Connector) validateCachedChain(ctx context.Context, plan []connectionPl
 // already-running ControlMaster socket on disk without dialing or
 // re-authenticating to its bastion.
 func (c *Connector) tryAttachTargetControlMaster(ctx context.Context, plan []connectionPlanNode, snapshot []*PooledClient) (*Client, error) {
-	for index := len(plan) - 1; index > 0; index-- {
-		if snapshot[index] == nil {
-			continue
-		}
-		if _, err := c.connectPlannedNode(ctx, plan[index], nil, nil, true); err != nil {
-			return nil, err
-		}
+	if err := c.probeCachedIntermediateHops(ctx, plan, snapshot); err != nil {
+		return nil, err
 	}
 	return c.connectPlannedNode(ctx, plan[0], nil, nil, true)
 }
@@ -354,6 +364,7 @@ func isPooledTargetUnusable(target *PooledClient) bool {
 func (c *Connector) tryReuseMultiHopPlan(ctx context.Context, plan []connectionPlanNode) (*Client, bool, error) {
 	snapshot := c.pool.SnapshotChain(plan)
 	if canReuseCachedChain(plan, snapshot) {
+		alreadyTriedTargetMux := snapshot[0] != nil && snapshot[0].ControlSocketPath != ""
 		reused, err := c.validateCachedChain(ctx, plan, snapshot)
 		if err == nil {
 			return reused, true, nil
@@ -361,7 +372,13 @@ func (c *Connector) tryReuseMultiHopPlan(ctx context.Context, plan []connectionP
 		if !errors.Is(err, errJumpChainRequired) {
 			return nil, true, err
 		}
-		return nil, false, nil
+		if alreadyTriedTargetMux {
+			return nil, false, nil
+		}
+		// A cached in-memory jump chain was evicted/retired during validation;
+		// refresh the snapshot and fall through to check for an independent
+		// live ControlMaster on plan[0] before dialing the jump chain.
+		snapshot = c.pool.SnapshotChain(plan)
 	}
 	if !isPooledTargetUnusable(snapshot[0]) {
 		return nil, false, nil

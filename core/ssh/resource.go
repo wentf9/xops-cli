@@ -73,12 +73,15 @@ func startSessionOutput(stdout, stderr io.Reader, stdoutWriter, stderrWriter io.
 	failed := make(chan error, 1)
 	var wg sync.WaitGroup
 
+	var recordMu sync.Mutex
 	recordFailure := func(err error) {
+		recordMu.Lock()
 		select {
 		case failed <- err:
 		default:
 		}
 		errCh <- err
+		recordMu.Unlock()
 	}
 	copyOne := func(name string, dst io.Writer, src io.Reader) {
 		wg.Go(func() {

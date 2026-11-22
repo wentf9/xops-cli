@@ -273,6 +273,9 @@ func waitSubsystemCompletion(work context.Context, reqDone <-chan struct{}, outp
 
 func finalizeSubsystemResult(ctx context.Context, snap CommandResult, outputFailedErr, cleanupErr, inputErr, outputErr error) error {
 	if outputFailedErr != nil {
+		if outputErr != nil && errors.Is(outputErr, outputFailedErr) {
+			return errors.Join(outputErr, snap.ExecutionErr, snap.IOErr, cleanupErr, inputErr)
+		}
 		return errors.Join(outputFailedErr, snap.ExecutionErr, snap.IOErr, cleanupErr, inputErr, outputErr)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {

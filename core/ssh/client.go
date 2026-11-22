@@ -202,6 +202,8 @@ func (c *Client) Interrupt() error {
 	var batch *evictionBatch
 	if c.pooled != nil && c.pooled.pool != nil {
 		batch = c.pooled.pool.detachActiveForInterrupt(c.pooled, c.rootConn)
+	} else if c.pooled != nil {
+		c.pooled.triggerEvictHook()
 	}
 	if batch != nil {
 		defer batch.release()
@@ -218,6 +220,12 @@ func (c *Client) Interrupt() error {
 			_ = batch.dead.closeSelf()
 		}
 		for _, child := range batch.descendants {
+			if child == nil || child == c.pooled {
+				continue
+			}
+			_ = child.closeSelf()
+		}
+		for _, child := range batch.retiredDescendants {
 			if child == nil || child == c.pooled {
 				continue
 			}
@@ -250,6 +258,8 @@ func (c *Client) Close() error {
 	var batch *evictionBatch
 	if c.pooled != nil && c.pooled.pool != nil {
 		batch = c.pooled.pool.detachActiveForEvict(c.pooled)
+	} else if c.pooled != nil {
+		c.pooled.triggerEvictHook()
 	}
 	if batch != nil {
 		defer batch.release()
@@ -257,7 +267,7 @@ func (c *Client) Close() error {
 	var closeErr error
 	if c.sshClient != nil && c.sshClient.Conn != nil {
 		closeErr = closeResource(c.sshClient, "SSH transport")
-	} else if batch != nil {
+	} else if c.pooled != nil {
 		closeErr = c.pooled.closeHopTransport()
 	}
 	if batch != nil {

@@ -894,7 +894,15 @@ func (r *sshAgentChannelRouter) releaseChannelSlot() {
 }
 
 func (r *sshAgentChannelRouter) dispatchLoop(chans <-chan cryptoSSH.NewChannel) {
-	defer sshAgentRouters.Delete(r.sshClient)
+	defer func() {
+		sshAgentRouters.Delete(r.sshClient)
+		r.mu.Lock()
+		epoch := r.epoch
+		r.mu.Unlock()
+		if epoch != nil && epoch.cancel != nil {
+			epoch.cancel()
+		}
+	}()
 	for newCh := range chans {
 		epoch := r.beginActiveEpoch()
 		if epoch == nil {

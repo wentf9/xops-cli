@@ -619,6 +619,33 @@ func (p *connPool) collectDescendantsLocked(ancestor *PooledClient) ([]HopDigest
 	return keys, clients
 }
 
+func (p *connPool) collectRetiredDescendantsLocked(ancestor *PooledClient) []*PooledClient {
+	var clients []*PooledClient
+	for _, child := range p.retired {
+		if p.isDescendantLocked(child, ancestor) {
+			clients = append(clients, child)
+		}
+	}
+	return clients
+}
+
+func (p *connPool) collectRetiredForInterruptLocked(
+	root, target *PooledClient,
+	rootConn net.Conn,
+	comparableRoot bool,
+) []*PooledClient {
+	var clients []*PooledClient
+	for _, entry := range p.retired {
+		if entry == nil || entry == target {
+			continue
+		}
+		if entry == root || p.matchesInterruptedEntryLocked(entry, root, target, rootConn, comparableRoot) {
+			clients = append(clients, entry)
+		}
+	}
+	return clients
+}
+
 func parentDepth(c *PooledClient) int {
 	depth := 0
 	for cur := c; cur != nil && cur.parent != nil; cur = cur.parent {
@@ -704,11 +731,15 @@ func (p *connPool) Retire(key HopDigest, displaced *PooledClient) []*PooledClien
 // evictionBatch holds pooled clients atomically detached from p.active and
 // recorded in p.closing so connPool.Close() / Connector.CloseAll() always
 // observes their RootConn even while eviction or keepalive abort is in progress.
+// Matching p.retired entries are recorded separately in retiredDescendants so
+// their reverse MuxServer hooks and transports tear down without mutating
+// p.retired or p.closing.
 type evictionBatch struct {
-	pool        *connPool
-	dead        *PooledClient
-	descendants []*PooledClient
-	tracked     []*PooledClient
+	pool               *connPool
+	dead               *PooledClient
+	descendants        []*PooledClient
+	retiredDescendants []*PooledClient
+	tracked            []*PooledClient
 }
 
 func (b *evictionBatch) closeDescendants() {
@@ -716,6 +747,9 @@ func (b *evictionBatch) closeDescendants() {
 		return
 	}
 	for _, child := range b.descendants {
+		_ = child.closeSelf()
+	}
+	for _, child := range b.retiredDescendants {
 		_ = child.closeSelf()
 	}
 }
@@ -748,6 +782,7 @@ func (p *connPool) finalizeEvictionBatch(
 	dead *PooledClient,
 	triggerDeadHook bool,
 	descendants []*PooledClient,
+	retiredDescendants []*PooledClient,
 	tracked []*PooledClient,
 	cancels []context.CancelFunc,
 ) *evictionBatch {
@@ -755,20 +790,26 @@ func (p *connPool) finalizeEvictionBatch(
 		cancel()
 	}
 	sortByParentDepth(descendants)
+	sortByParentDepth(retiredDescendants)
 	// Synchronously tear down any Connector-owned MuxServer listeners attached
-	// to evicted entries (unlinking control sockets and closing Unix listeners
-	// without blocking on SSH transport I/O) before returning to callers.
+	// to evicted or matching retired entries (unlinking control sockets and
+	// closing Unix listeners without blocking on SSH transport I/O) before
+	// returning to callers.
 	if triggerDeadHook && dead != nil {
 		dead.triggerEvictHook()
 	}
 	for _, child := range descendants {
 		child.triggerEvictHook()
 	}
+	for _, child := range retiredDescendants {
+		child.triggerEvictHook()
+	}
 	return &evictionBatch{
-		pool:        p,
-		dead:        dead,
-		descendants: descendants,
-		tracked:     tracked,
+		pool:               p,
+		dead:               dead,
+		descendants:        descendants,
+		retiredDescendants: retiredDescendants,
+		tracked:            tracked,
 	}
 }
 
@@ -784,9 +825,11 @@ func (p *connPool) detachForEvict(key HopDigest, dead *PooledClient, trackDead b
 	p.mu.Lock()
 	var descKeys []HopDigest
 	var descendants []*PooledClient
+	var retiredDescendants []*PooledClient
 	activeKey, removedSelf := p.activeKeyLocked(key, dead)
 	if removedSelf || trackDead || dead.RootConn != nil {
 		descKeys, descendants = p.collectDescendantsLocked(dead)
+		retiredDescendants = p.collectRetiredDescendantsLocked(dead)
 	}
 	if removedSelf {
 		delete(p.active, activeKey)
@@ -816,13 +859,14 @@ func (p *connPool) detachForEvict(key HopDigest, dead *PooledClient, trackDead b
 	}
 	p.mu.Unlock()
 
-	return p.finalizeEvictionBatch(dead, removedSelf || trackDead, descendants, tracked, cancels)
+	return p.finalizeEvictionBatch(dead, removedSelf || trackDead, descendants, retiredDescendants, tracked, cancels)
 }
 
 // detachActiveForEvict atomically detaches target and any active in-memory
 // descendants ONLY when target is currently in p.active. When target is already
-// retired, closing, or closed, it is an idempotent no-op returning nil without
-// mutating p.retired or p.closing.
+// retired, closing, or closed, it preserves p.retired and p.closing untouched
+// while still synchronously triggering evict hooks (and returning any matching
+// retired descendants for transport teardown after target closes).
 func (p *connPool) detachActiveForEvict(target *PooledClient) *evictionBatch {
 	if p == nil || target == nil {
 		return nil
@@ -830,12 +874,18 @@ func (p *connPool) detachActiveForEvict(target *PooledClient) *evictionBatch {
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
+		target.triggerEvictHook()
 		return nil
 	}
+	retiredDescendants := p.collectRetiredDescendantsLocked(target)
 	activeKey, isActive := p.activeKeyLocked(ZeroHopDigest, target)
 	if !isActive {
 		p.mu.Unlock()
-		return nil
+		batch := p.finalizeEvictionBatch(target, true, nil, retiredDescendants, nil, nil)
+		if len(retiredDescendants) == 0 {
+			return nil
+		}
+		return batch
 	}
 	descKeys, descendants := p.collectDescendantsLocked(target)
 	delete(p.active, activeKey)
@@ -857,7 +907,7 @@ func (p *connPool) detachActiveForEvict(target *PooledClient) *evictionBatch {
 	}
 	p.mu.Unlock()
 
-	return p.finalizeEvictionBatch(target, true, descendants, tracked, cancels)
+	return p.finalizeEvictionBatch(target, true, descendants, retiredDescendants, tracked, cancels)
 }
 
 func (p *connPool) resolveInterruptRootLocked(target *PooledClient, rootConn net.Conn) (*PooledClient, net.Conn) {
@@ -917,10 +967,9 @@ func (p *connPool) detachEntriesLocked(
 
 // detachActiveForInterrupt atomically detaches the outermost root hop of target
 // and any active entries in p.active riding on that lineage or sharing rootConn
-// before Client.Interrupt forcefully closes rootConn. If no active entries belong
-// to the interrupted lineage/rootConn (e.g., already retired, closing, or pool
-// closed), it is an idempotent no-op returning nil without mutating p.retired
-// or p.closing.
+// before Client.Interrupt forcefully closes rootConn. Matching p.retired
+// entries (and target/root themselves) still have their reverse MuxServer evict
+// hooks triggered synchronously without mutating p.retired or p.closing.
 func (p *connPool) detachActiveForInterrupt(target *PooledClient, rootConn net.Conn) *evictionBatch {
 	if p == nil || target == nil {
 		return nil
@@ -928,6 +977,7 @@ func (p *connPool) detachActiveForInterrupt(target *PooledClient, rootConn net.C
 	p.mu.Lock()
 	if p.closed {
 		p.mu.Unlock()
+		target.triggerEvictHook()
 		return nil
 	}
 	root, effectiveRootConn := p.resolveInterruptRootLocked(target, rootConn)
@@ -951,15 +1001,28 @@ func (p *connPool) detachActiveForInterrupt(target *PooledClient, rootConn net.C
 			descendants = append(descendants, entry)
 		}
 	}
+	retiredMatches := p.collectRetiredForInterruptLocked(root, target, effectiveRootConn, comparableRoot)
 	if detachedRoot == nil && len(descendants) == 0 {
 		p.mu.Unlock()
-		return nil
+		target.triggerEvictHook()
+		if root != nil && root != target {
+			root.triggerEvictHook()
+		}
+		batch := p.finalizeEvictionBatch(nil, false, nil, retiredMatches, nil, nil)
+		if len(retiredMatches) == 0 {
+			return nil
+		}
+		return batch
 	}
 
 	tracked, cancels := p.detachEntriesLocked(detachedRoot, descendants, toDelete)
 	p.mu.Unlock()
 
-	return p.finalizeEvictionBatch(detachedRoot, detachedRoot != nil, descendants, tracked, cancels)
+	target.triggerEvictHook()
+	if root != nil && root != target && root != detachedRoot {
+		root.triggerEvictHook()
+	}
+	return p.finalizeEvictionBatch(detachedRoot, detachedRoot != nil, descendants, retiredMatches, tracked, cancels)
 }
 
 // Evict removes a dead client and any active downstream hops riding on its
