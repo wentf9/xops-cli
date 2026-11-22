@@ -437,7 +437,7 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 			}
 			if norm != "" {
 				normalized = append(normalized, norm)
-				if persistable == "" && config.IsPersistableIdentityPath(norm) {
+				if persistable == "" && config.ValidatePersistableIdentityPath(norm) == nil {
 					persistable = norm
 				}
 			}
@@ -524,7 +524,7 @@ func applyIdentityFileGeneralOption(opts *SshOptions, st *generalOptionState, ke
 	}
 	pathVal := items[0]
 	opts.IdentityFiles = append(opts.IdentityFiles, pathVal)
-	if opts.IdentityFile == "" && config.IsPersistableIdentityPath(pathVal) {
+	if opts.IdentityFile == "" && config.ValidatePersistableIdentityPath(pathVal) == nil {
 		opts.IdentityFile = pathVal
 	}
 	return nil

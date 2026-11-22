@@ -18,6 +18,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/fsx"
 	logger "github.com/wentf9/xops-cli/core/log"
+	"github.com/wentf9/xops-cli/core/verdict"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -1548,17 +1549,22 @@ func indexAgentSignersByPubKey(signers []ssh.Signer) map[string]ssh.Signer {
 	return agentByPub
 }
 
-func isUnencryptedPrivateKeyFile(keyPath string, policies ...*admittedMaterialPolicy) bool {
+func isUnencryptedPrivateKeyFile(keyPath string, policies ...*admittedMaterialPolicy) (verdict.Verdict, error) {
 	if keyPath == "" {
-		return false
+		return verdict.Deny, nil
 	}
 	policy := firstAdmittedPolicy(policies)
 	data, absentAllowed, err := policy.readKeyFile(keyPath, true)
-	if err != nil || absentAllowed {
-		return false
+	if err != nil {
+		return verdict.Deny, err
 	}
-	_, err = ssh.ParsePrivateKey(data)
-	return err == nil
+	if absentAllowed {
+		return verdict.Deny, nil
+	}
+	if _, err = ssh.ParsePrivateKey(data); err != nil {
+		return verdict.Deny, err
+	}
+	return verdict.Allow, nil
 }
 
 func hasSidecarCertFile(keyPath string, policies ...*admittedMaterialPolicy) bool {
@@ -2100,7 +2106,7 @@ func appendExplicitAutoKeyPath(
 	materialPolicy *admittedMaterialPolicy,
 	l logger.DebugLogger,
 ) error {
-	if !isUnencryptedPrivateKeyFile(keyPath, materialPolicy) {
+	if v, _ := isUnencryptedPrivateKeyFile(keyPath, materialPolicy); !v.Allowed() {
 		if _, seen := seenKeyPaths[keyPath]; !seen {
 			matched, matchErr := appendAgentMatchedKeyPath(
 				certCandidates, plainCandidates, pairedCertPaths, agentByPub,
@@ -2136,7 +2142,7 @@ func shouldPreloadAgentSigners(
 	}
 	policy := firstAdmittedPolicy(policies)
 	for _, p := range explicitPaths {
-		if !isUnencryptedPrivateKeyFile(p, policy) {
+		if v, _ := isUnencryptedPrivateKeyFile(p, policy); !v.Allowed() {
 			return true
 		}
 	}

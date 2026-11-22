@@ -58,15 +58,15 @@ func TestP5_IsNonInteractiveForNodeFailClosed(t *testing.T) {
 
 func testP5IsNonInteractiveNilAdapterAndProvider(t *testing.T) {
 	var nilAdp *SSHAdapter
-	if !nilAdp.isNonInteractiveForNode("any-node") {
-		t.Fatal("(*SSHAdapter)(nil).isNonInteractiveForNode must return true (fail closed)")
+	if !nilAdp.interactiveDecisionForNode("any-node").Denied() {
+		t.Fatal("(*SSHAdapter)(nil).interactiveDecisionForNode must deny (fail closed)")
 	}
 	if tok, err := nilAdp.UpdateAuth(t.Context(), "any-node", "v1", "pw", "", ""); err != nil || tok != "v1" {
 		t.Fatalf("nil adapter UpdateAuth = (%q, %v), want (v1, nil)", tok, err)
 	}
 	noProvAdp := NewSSHAdapter(nil)
-	if !noProvAdp.isNonInteractiveForNode("any-node") {
-		t.Fatal("SSHAdapter with nil cfgProvider must fail closed (return true)")
+	if !noProvAdp.interactiveDecisionForNode("any-node").Denied() {
+		t.Fatal("SSHAdapter with nil cfgProvider must fail closed (Deny)")
 	}
 }
 
@@ -84,8 +84,8 @@ func testP5IsNonInteractiveUnlatchedBrokenConfig(t *testing.T) {
 		}),
 	)
 
-	if !adp.isNonInteractiveForNode("unlatched-node") {
-		t.Fatal("isNonInteractiveForNode must fail closed (true) for unlatched node when Resolve fails")
+	if !adp.interactiveDecisionForNode("unlatched-node").Denied() {
+		t.Fatal("interactiveDecisionForNode must fail closed (Deny) for unlatched node when Resolve fails")
 	}
 	tok, err := adp.UpdateAuth(t.Context(), "unlatched-node", "auth-v1", "discovered-secret", "", "")
 	if err != nil || tok != "auth-v1" {
@@ -121,8 +121,8 @@ func testP5IsNonInteractiveSavedInvalidTier4(t *testing.T) {
 
 	resolver := &interactionCaptureResolver{}
 	adp := NewSSHAdapter(config.NewProviderWithOpenSSHParser(cfg, parser), WithCredentialSource(resolver))
-	if !adp.isNonInteractiveForNode("edge") {
-		t.Fatal("expected isNonInteractiveForNode(edge)=true when Resolve fails on invalid ControlMaster")
+	if !adp.interactiveDecisionForNode("edge").Denied() {
+		t.Fatal("expected interactiveDecisionForNode(edge)=Deny when Resolve fails on invalid ControlMaster")
 	}
 	sec, err := adp.ResolveSecret(t.Context(), ssh.SecretRequest{
 		NodeID: "edge",
@@ -452,7 +452,7 @@ func TestP5_LayeredSessionControlOverridesAndDisableSharing(t *testing.T) {
 
 func assertP5LayeredSessionOptionsBeforeDisable(t *testing.T, adp *SSHAdapter) {
 	t.Helper()
-	if !adp.isNonInteractiveForNode("app") {
+	if !adp.interactiveDecisionForNode("app").Denied() {
 		t.Fatal("node override must inherit global BatchMode=yes instead of shadowing globalSessionControl")
 	}
 	ctrl, err := adp.GetControlConfig("app")

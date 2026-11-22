@@ -181,7 +181,7 @@ func TestRound4_P2_18_BatchModeLatchedAcrossFinalizePendingConnection(t *testing
 			t.Fatalf("FinalizePendingConnection: %v", err)
 		}
 
-		if !adp.isNonInteractiveForNode(nodeID) {
+		if !adp.interactiveDecisionForNode(nodeID).Denied() {
 			t.Fatal("expected BatchMode=yes latch to keep node non-interactive after FinalizePendingConnection")
 		}
 		clientCfg, err := adp.GetConfig(nodeID)
@@ -204,7 +204,7 @@ func TestRound4_P2_18_BatchModeLatchedAcrossFinalizePendingConnection(t *testing
 			adp.sessionControlOverrides = make(map[string]SessionControlOptions)
 		}
 		adp.sessionControlOverrides[nodeID] = overrideOpts
-		if adp.isNonInteractiveForNode(nodeID) {
+		if adp.interactiveDecisionForNode(nodeID).Denied() {
 			t.Fatal("explicit Tier-1 BatchMode=no must override latched BatchMode=yes")
 		}
 		return nil

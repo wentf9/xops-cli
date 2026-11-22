@@ -198,7 +198,7 @@ func (o *SshOptions) syncIdentityFiles() {
 	}
 	if len(o.IdentityFiles) > 0 {
 		o.IdentityFiles = canonicalIdentityFileSlice(o.IdentityFiles)
-		if o.IdentityFile == "" && config.IsPersistableIdentityPath(o.IdentityFiles[0]) {
+		if o.IdentityFile == "" && config.ValidatePersistableIdentityPath(o.IdentityFiles[0]) == nil {
 			o.IdentityFile = o.IdentityFiles[0]
 		}
 	} else if o.IdentityFile != "" {

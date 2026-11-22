@@ -13,6 +13,7 @@ import (
 	"time"
 
 	logger "github.com/wentf9/xops-cli/core/log"
+	"github.com/wentf9/xops-cli/core/verdict"
 	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
@@ -611,13 +612,13 @@ func (c *Client) isMultiplexedProxy() bool {
 // shouldRequestMuxProxyAgentForward reports whether a multiplexed control-proxy
 // passenger should send auth-agent-req@openssh.com to ask the ControlMaster to
 // forward the Master's own verified ssh-agent (matching native OpenSSH mux.c).
-func (c *Client) shouldRequestMuxProxyAgentForward() bool {
+func (c *Client) shouldRequestMuxProxyAgentForward() (verdict.Verdict, error) {
 	if c == nil || c.sshClient == nil {
-		return false
+		return verdict.Deny, nil
 	}
 	connCfg := c.ConnectionConfig()
 	if connCfg.Options == nil {
-		return false
+		return verdict.Deny, nil
 	}
 	_, enabled, err := resolveForwardAgentSpec(
 		connCfg.Options.ForwardAgent(),
@@ -627,10 +628,12 @@ func (c *Client) shouldRequestMuxProxyAgentForward() bool {
 		true,
 	)
 	if err != nil {
-		c.getLogger().Debugf("ForwardAgent disabled over mux proxy: %v", err)
-		return false
+		return verdict.Deny, err
 	}
-	return enabled
+	if !enabled {
+		return verdict.Deny, nil
+	}
+	return verdict.Allow, nil
 }
 
 func (c *Client) prepareChannelAgentForward(ctx context.Context) (wantAgent bool, release func()) {
@@ -638,7 +641,12 @@ func (c *Client) prepareChannelAgentForward(ctx context.Context) (wantAgent bool
 		return false, func() {}
 	}
 	if c.isMultiplexedProxy() {
-		return c.shouldRequestMuxProxyAgentForward(), func() {}
+		v, err := c.shouldRequestMuxProxyAgentForward()
+		if err != nil {
+			c.getLogger().Debugf("ForwardAgent disabled over mux proxy: %v", err)
+			return false, func() {}
+		}
+		return v.Allowed(), func() {}
 	}
 	lease := c.acquireSessionAgentLease(ctx)
 	if lease == nil {

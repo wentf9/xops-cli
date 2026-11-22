@@ -420,15 +420,10 @@ func check(string) error           { return nil }
 func TestP7_SecurityPredicateAnalyzer_NoNewBareBoolErrSwallow(t *testing.T) {
 	t.Parallel()
 
-	// Remaining pre-W2b/c/d/fsx violations — will be removed completely in W3
-	// finalization once owning W2 lanes land (zero-baseline goal).
+	// Sole remaining entry is core/fsx/fsx_unix.go:isUnixDevNullStat (fixed in
+	// W3-fsx); this map will be deleted completely once W3-fsx lands (0 baseline).
 	transitionBaseline := map[string]string{
-		"core/fsx/fsx_unix.go:isUnixDevNullStat":                      "pending W3 fsx coordination with p7-w1-fsx",
-		"core/ssh/agent_forward.go:shouldRequestMuxProxyAgentForward": "pending W2b/W2c land",
-		"core/ssh/auth.go:isUnencryptedPrivateKeyFile":                "pending W2b land",
-		"pkg/adapter/ssh_adapter.go:isNonInteractiveForNode":          "pending W2b land",
-		"pkg/config/target.go:IsPersistableIdentityPath":              "pending W2d land",
-		"pkg/config/target.go:isDirectJumpTarget":                     "pending W2d land",
+		"core/fsx/fsx_unix.go:isUnixDevNullStat": "fixed in W3-fsx branch; remove map upon rebase",
 	}
 
 	root := p4RepoRoot(t)

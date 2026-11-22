@@ -1368,7 +1368,7 @@ func (c *Connector) buildAgentFallbackMultiKeyCandidates(
 
 	var firstErr error
 	for _, keyPath := range explicitPaths {
-		if !isUnencryptedPrivateKeyFile(keyPath, materialPolicy) {
+		if v, _ := isUnencryptedPrivateKeyFile(keyPath, materialPolicy); !v.Allowed() {
 			matched, matchErr := appendAgentMatchedKeyPath(
 				&state.certCandidates, &state.plainCandidates, state.pairedCertPaths, agentByPub,
 				keyPath, "explicit key", explicitCerts, hasExplicitCerts,

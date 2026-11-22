@@ -219,24 +219,24 @@ func TestP0_DisableSessionControlSharingPreservesGlobalOptions(t *testing.T) {
 func TestP0_IsNonInteractiveForNodeFailClosedAndValidateSecretMissingBaseHost(t *testing.T) {
 	t.Parallel()
 
-	t.Run("isNonInteractiveForNode honors Tier-1 BatchMode and latch even when Resolve fails", func(t *testing.T) {
+	t.Run("interactiveDecisionForNode honors Tier-1 BatchMode and latch even when Resolve fails", func(t *testing.T) {
 		brokenProv := config.NewProviderWithOpenSSHParser(nil, config.NewBrokenOpenSSHParser(errors.New("broken ssh_config")))
 		batchOpts, err := ParseSessionOptions([]string{"BatchMode=yes"}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		// 1. Tier-1 BatchMode=yes returns true even when Resolve fails on broken ssh_config.
+		// 1. Tier-1 BatchMode=yes denies interactivity even when Resolve fails on broken ssh_config.
 		adpTier1 := NewSSHAdapter(brokenProv, WithSessionControlOverride("unsaved-node", batchOpts))
-		if !adpTier1.isNonInteractiveForNode("unsaved-node") {
-			t.Fatal("expected isNonInteractiveForNode=true with Tier-1 BatchMode=yes despite broken parser")
+		if !adpTier1.interactiveDecisionForNode("unsaved-node").Denied() {
+			t.Fatal("expected interactiveDecisionForNode=Deny with Tier-1 BatchMode=yes despite broken parser")
 		}
 
-		// 2. Latched BatchMode returns true even when Resolve fails on broken ssh_config.
+		// 2. Latched BatchMode denies interactivity even when Resolve fails on broken ssh_config.
 		adpLatched := NewSSHAdapter(brokenProv)
 		adpLatched.latchBatchMode("unsaved-node")
-		if !adpLatched.isNonInteractiveForNode("unsaved-node") {
-			t.Fatal("expected isNonInteractiveForNode=true with latched BatchMode despite broken parser")
+		if !adpLatched.interactiveDecisionForNode("unsaved-node").Denied() {
+			t.Fatal("expected interactiveDecisionForNode=Deny with latched BatchMode despite broken parser")
 		}
 
 		// 3. Explicit Tier-1 BatchMode=no still overrides latched BatchMode.
@@ -246,14 +246,14 @@ func TestP0_IsNonInteractiveForNodeFailClosedAndValidateSecretMissingBaseHost(t 
 		}
 		adpNo := NewSSHAdapter(brokenProv, WithSessionControlOverride("unsaved-node", batchNoOpts))
 		adpNo.latchBatchMode("unsaved-node")
-		if adpNo.isNonInteractiveForNode("unsaved-node") {
+		if adpNo.interactiveDecisionForNode("unsaved-node").Denied() {
 			t.Fatal("expected explicit Tier-1 BatchMode=no to override latch")
 		}
 
-		// 4. Nil cfgProvider with Tier-1 BatchMode=yes or latch still returns true.
+		// 4. Nil cfgProvider with Tier-1 BatchMode=yes or latch still denies interactivity.
 		adpNil := NewSSHAdapter(nil, WithSessionControlOverride("n1", batchOpts))
-		if !adpNil.isNonInteractiveForNode("n1") {
-			t.Fatal("expected isNonInteractiveForNode=true with nil cfgProvider and Tier-1 BatchMode=yes")
+		if !adpNil.interactiveDecisionForNode("n1").Denied() {
+			t.Fatal("expected interactiveDecisionForNode=Deny with nil cfgProvider and Tier-1 BatchMode=yes")
 		}
 	})
 

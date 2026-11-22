@@ -1069,7 +1069,7 @@ func resolveManagedNodeKey(nodeID string, snapshot config.ConnectionSnapshot) st
 	if snapshot.Provenance.IsUnpersistedOpenSSH() || config.IsOpenSSHNodeID(nodeID) {
 		return ""
 	}
-	if !config.IsPersistableIdentityPath(snapshot.Identity.KeyPath) {
+	if err := config.ValidatePersistableIdentityPath(snapshot.Identity.KeyPath); err != nil {
 		return ""
 	}
 	return snapshot.Identity.KeyPath
@@ -1143,17 +1143,15 @@ func (a *SSHAdapter) interactiveVerdictForNode(nodeID string) (verdict.Verdict, 
 	return verdict.Allow, nil
 }
 
-func (a *SSHAdapter) isNonInteractiveForNode(nodeID string) bool {
-	v, err := a.interactiveVerdictForNode(nodeID)
-	if err != nil {
-		return true
-	}
-	return v.Denied()
+func (a *SSHAdapter) interactiveDecisionForNode(nodeID string) verdict.Verdict {
+	return verdict.Decide(func() (verdict.Verdict, error) {
+		return a.interactiveVerdictForNode(nodeID)
+	})
 }
 
 // UpdateAuth 处理密码或私钥密码的回写并返回本次提交后的新认证令牌
 func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
-	if a.isNonInteractiveForNode(nodeID) {
+	if a.interactiveDecisionForNode(nodeID).Denied() {
 		// 非交互模式或 BatchMode=yes 禁止写回自动发现的秘密
 		return authUpdateToken, nil
 	}
@@ -1253,7 +1251,7 @@ func (a *SSHAdapter) defaultStoreID() string {
 
 // UpdateSudo 处理提权密码和模式的回写并返回本次提交后的新提权令牌
 func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode ssh.SudoMode, suPwd string) (string, error) {
-	if a.isNonInteractiveForNode(nodeID) {
+	if a.interactiveDecisionForNode(nodeID).Denied() {
 		// 非交互模式或 BatchMode=yes 禁止写回自动发现的秘密
 		return sudoUpdateToken, nil
 	}
@@ -1331,7 +1329,7 @@ func (a *SSHAdapter) ResolveSecret(ctx context.Context, req ssh.SecretRequest) (
 	if ctx == nil {
 		return nil, fmt.Errorf("secret resolution context is nil")
 	}
-	if a.isNonInteractiveForNode(req.NodeID) {
+	if a.interactiveDecisionForNode(req.NodeID).Denied() {
 		ctx = credential.WithoutInteraction(ctx)
 	}
 	if ctx != nil {
@@ -1432,7 +1430,7 @@ func (a *SSHAdapter) resolveOTP(
 			Prompt:         promptText,
 			Instruction:    req.Instruction,
 			Echo:           req.Echo,
-			NonInteractive: a.isNonInteractiveForNode(req.NodeID) || credential.InteractionDisabled(ctx),
+			NonInteractive: a.interactiveDecisionForNode(req.NodeID).Denied() || credential.InteractionDisabled(ctx),
 		}
 		ans, err := credentialhelper.RunAnswerCommand(ctx, opts)
 		if err != nil {
@@ -1557,7 +1555,7 @@ func (a *SSHAdapter) resolveChallengeRuleAnswer(
 			Prompt:         req.Prompt,
 			Instruction:    req.Instruction,
 			Echo:           req.Echo,
-			NonInteractive: a.isNonInteractiveForNode(req.NodeID) || credential.InteractionDisabled(ctx),
+			NonInteractive: a.interactiveDecisionForNode(req.NodeID).Denied() || credential.InteractionDisabled(ctx),
 		}
 		ans, err := credentialhelper.RunAnswerCommand(ctx, opts)
 		if err != nil {

@@ -13,6 +13,7 @@ import (
 	"unicode"
 
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/core/verdict"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 	"github.com/wentf9/xops-cli/pkg/models"
 	fileutils "github.com/wentf9/xops-cli/pkg/utils/file"
@@ -117,23 +118,30 @@ func FormatNodeID(user, address string, port uint16) string {
 	return fmt.Sprintf("%s@%s", user, FormatHostPort(address, port))
 }
 
-// IsPersistableIdentityPath reports whether raw is a concrete identity key path
-// suitable for persisting into Identity.KeyPath (excluding "none", OpenSSH % tokens,
-// ${ENV} placeholders, invalid control/token syntax, and unresolved ~user prefixes).
-func IsPersistableIdentityPath(raw string) bool {
+// ValidatePersistableIdentityPath verifies that raw is a concrete identity key
+// path suitable for persisting into Identity.KeyPath (excluding "none", OpenSSH
+// % tokens, ${ENV} placeholders, invalid control/token syntax, and unresolved
+// ~user prefixes).
+func ValidatePersistableIdentityPath(raw string) error {
 	setting, err := ssh.ParseIdentityPathSetting(raw, true)
-	if err != nil || !setting.Persistable() {
-		return false
+	if err != nil {
+		return err
+	}
+	if !setting.Persistable() {
+		return fmt.Errorf("identity path %q is not persistable", raw)
 	}
 	expanded := fileutils.ToAbsolutePath(setting.Raw)
-	return expanded != "" && !strings.HasPrefix(expanded, "~")
+	if expanded == "" || strings.HasPrefix(expanded, "~") {
+		return fmt.Errorf("identity path %q cannot be resolved to an absolute local path", raw)
+	}
+	return nil
 }
 
 // NormalizePersistableIdentityPath converts a persistable identity key path into an
 // absolute path, returning "" for non-persistable syntaxes ("none", %tokens, ${ENV},
 // or unresolved ~user).
 func NormalizePersistableIdentityPath(raw string) string {
-	if !IsPersistableIdentityPath(raw) {
+	if err := ValidatePersistableIdentityPath(raw); err != nil {
 		return ""
 	}
 	return fileutils.ToAbsolutePath(strings.TrimSpace(raw))
@@ -2238,7 +2246,7 @@ func isResolvedOpenSSHJumpHost(openSSH *OpenSSHParser, hop string) (bool, error)
 	if !explicit || ValidateConcreteHostAddress(hostName) != nil {
 		return false, nil
 	}
-	if isDirectJumpTarget(hostName) {
+	if v, vErr := isDirectJumpTarget(hostName); vErr == nil && v.Allowed() {
 		return true, nil
 	}
 	return !strings.EqualFold(StripHostBrackets(hostName), StripHostBrackets(lookupAlias)), nil
@@ -2326,7 +2334,7 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 		}
 		return outRef.NormalizedString(), nil
 	}
-	if isDirectJumpTarget(hop) && parseErr != nil {
+	if v, vErr := isDirectJumpTarget(hop); vErr == nil && v.Allowed() && parseErr != nil {
 		return "", fmt.Errorf("invalid jump host address %q: %w", hop, parseErr)
 	}
 
@@ -2368,21 +2376,21 @@ func isDirectJumpTargetRef(ref TargetRef) bool {
 	return isDNSHostname(ref.Host)
 }
 
-func isDirectJumpTarget(cleanHop string) bool {
+func isDirectJumpTarget(cleanHop string) (verdict.Verdict, error) {
 	lookupAlias, _, _, err := parseOpenSSHHostSpec(cleanHop)
 	if err != nil {
-		return false
+		return verdict.Deny, err
 	}
 	if strings.Contains(cleanHop, "@") || strings.Contains(cleanHop, ":") {
-		return true
+		return verdict.Allow, nil
 	}
 	if net.ParseIP(lookupAlias) != nil {
-		return true
+		return verdict.Allow, nil
 	}
 	if isDNSHostname(lookupAlias) {
-		return true
+		return verdict.Allow, nil
 	}
-	return false
+	return verdict.Deny, nil
 }
 
 func isDNSHostname(host string) bool {

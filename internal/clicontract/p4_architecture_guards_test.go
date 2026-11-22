@@ -492,41 +492,6 @@ func TestP4_MCPHostUsesConnectPlanExclusively(t *testing.T) {
 	}
 }
 
-// TestP4_FailClosedSecurityPredicateGuard parses pkg/adapter/ssh_adapter.go
-// (isNonInteractiveForNode) to ensure every error branch MUST return literal
-// true (not merely forbidding literal false, which can be bypassed by
-// fall-through or dead-code boolean expressions).
-func TestP4_FailClosedSecurityPredicateGuard(t *testing.T) {
-	t.Parallel()
-
-	root := p4RepoRoot(t)
-	pf := parseSingleGoFile(t, root, "pkg", "adapter", "ssh_adapter.go")
-	fn := findFuncDecl(pf.file, "isNonInteractiveForNode")
-	if fn == nil || fn.Body == nil {
-		t.Fatalf("%s: isNonInteractiveForNode not found", pf.relPath)
-	}
-
-	errBranches := 0
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		ifStmt, ok := n.(*ast.IfStmt)
-		if !ok {
-			return true
-		}
-		if isErrNilComparison(ifStmt.Cond, token.NEQ) {
-			errBranches++
-			assertBranchReturnsLiteralTrue(t, pf, ifStmt.Body)
-		} else if isErrNilComparison(ifStmt.Cond, token.EQL) && ifStmt.Else != nil {
-			errBranches++
-			assertBranchReturnsLiteralTrue(t, pf, ifStmt.Else)
-		}
-		return true
-	})
-
-	if errBranches == 0 {
-		t.Fatalf("%s: expected at least one error-handling branch (if err != nil) in isNonInteractiveForNode", pf.relPath)
-	}
-}
-
 func isErrNilComparison(expr ast.Expr, op token.Token) bool {
 	bin, ok := unwrapParen(expr).(*ast.BinaryExpr)
 	if !ok || bin.Op != op {
@@ -551,41 +516,6 @@ func isLiteralTrueIdent(expr ast.Expr) bool {
 func isLiteralTrueReturnStmt(stmt ast.Stmt) bool {
 	ret, ok := stmt.(*ast.ReturnStmt)
 	return ok && len(ret.Results) == 1 && isLiteralTrueIdent(ret.Results[0])
-}
-
-func assertBranchReturnsLiteralTrue(t *testing.T, pf parsedGoFile, branch ast.Node) {
-	t.Helper()
-	returnCount := 0
-	ast.Inspect(branch, func(n ast.Node) bool {
-		if _, isFuncLit := n.(*ast.FuncLit); isFuncLit {
-			return false
-		}
-		ret, ok := n.(*ast.ReturnStmt)
-		if !ok {
-			return true
-		}
-		returnCount++
-		if !isLiteralTrueReturnStmt(ret) {
-			pos := pf.fset.Position(ret.Pos())
-			t.Errorf("%s:%d: error branch in isNonInteractiveForNode must return literal true (fail closed), not a non-literal expression or false", pf.relPath, pos.Line)
-		}
-		return true
-	})
-	if returnCount == 0 {
-		pos := pf.fset.Position(branch.Pos())
-		t.Errorf("%s:%d: error branch in isNonInteractiveForNode must unconditionally return literal true", pf.relPath, pos.Line)
-		return
-	}
-	switch b := branch.(type) {
-	case *ast.BlockStmt:
-		if len(b.List) == 0 || !isLiteralTrueReturnStmt(b.List[len(b.List)-1]) {
-			pos := pf.fset.Position(b.Pos())
-			t.Errorf("%s:%d: error branch in isNonInteractiveForNode must terminate with literal return true (no fall-through)", pf.relPath, pos.Line)
-		}
-	default:
-		pos := pf.fset.Position(branch.Pos())
-		t.Errorf("%s:%d: error branch in isNonInteractiveForNode must be a block terminating with literal return true", pf.relPath, pos.Line)
-	}
 }
 
 // TestP4_OptionRegistryCrossLayerCompleteness validates core/ssh.RegisteredOptionSpecs()

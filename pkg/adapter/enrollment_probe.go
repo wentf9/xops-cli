@@ -120,7 +120,7 @@ func (a *SSHAdapter) FinalizePendingConnection(ctx context.Context, lease config
 }
 
 func (a *SSHAdapter) needsEnrollmentProbe(nodeID string, auth SessionAuth, hasOverride bool, client *ssh.Client) (bool, error) {
-	if client == nil || !a.enrollmentProbe || !a.credentialRecording || !hasOverride || !auth.Remember || a.isNonInteractiveForNode(nodeID) {
+	if client == nil || !a.enrollmentProbe || !a.credentialRecording || !hasOverride || !auth.Remember || a.interactiveDecisionForNode(nodeID).Denied() {
 		return false, nil
 	}
 	if _, excluded := a.enrollmentProbeExcluded[nodeID]; excluded {

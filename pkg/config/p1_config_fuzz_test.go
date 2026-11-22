@@ -551,7 +551,7 @@ func TestP1_RepositoryRefChecksRespectContextWhileCommitLocked(t *testing.T) {
 	}
 }
 
-func TestP1_IsPersistableIdentityPath_DelegatesCanonicalRules(t *testing.T) {
+func TestP1_ValidatePersistableIdentityPath_DelegatesCanonicalRules(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -581,8 +581,9 @@ func TestP1_IsPersistableIdentityPath_DelegatesCanonicalRules(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := IsPersistableIdentityPath(tc.raw); got != tc.want {
-				t.Errorf("IsPersistableIdentityPath(%q) = %v, want %v", tc.raw, got, tc.want)
+			err := ValidatePersistableIdentityPath(tc.raw)
+			if got := err == nil; got != tc.want {
+				t.Errorf("ValidatePersistableIdentityPath(%q) err=%v (ok=%v), want ok=%v", tc.raw, err, got, tc.want)
 			}
 		})
 	}
