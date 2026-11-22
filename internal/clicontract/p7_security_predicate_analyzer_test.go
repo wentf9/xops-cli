@@ -79,10 +79,6 @@ type securityPredicateViolation struct {
 	retKind  string
 }
 
-func (v securityPredicateViolation) key() string {
-	return v.relPath + ":" + v.funcName
-}
-
 func (v securityPredicateViolation) String() string {
 	return fmt.Sprintf("%s:%d: %s returns bare bool while swallowing err!=nil at line %d (returns %s); return (verdict.Verdict, error) instead",
 		v.relPath, v.line, v.funcName, v.branchAt, v.retKind)
@@ -413,24 +409,17 @@ func check(string) error           { return nil }
 	}
 }
 
-// TestP7_SecurityPredicateAnalyzer_NoNewBareBoolErrSwallow runs the analyzer
-// across all 10 security packages (every OS build tag). Pre-existing violations
-// tracked during W2/W3 transition are explicitly listed below and will be
-// burned down to zero (or explicitly justified) in W3 finalization.
-func TestP7_SecurityPredicateAnalyzer_NoNewBareBoolErrSwallow(t *testing.T) {
+// TestP7_SecurityPredicateAnalyzer_ZeroBareBoolErrSwallow runs the analyzer
+// across all 10 security packages (every OS build tag) with zero baseline:
+// every bare-bool security predicate swallowing err != nil must be migrated to
+// (verdict.Verdict, error) / error, or carry an explicit justified
+// "//nolint:secpred // <reason>" annotation for external interface constraints.
+func TestP7_SecurityPredicateAnalyzer_ZeroBareBoolErrSwallow(t *testing.T) {
 	t.Parallel()
-
-	// Sole remaining entry is core/fsx/fsx_unix.go:isUnixDevNullStat (fixed in
-	// W3-fsx); this map will be deleted completely once W3-fsx lands (0 baseline).
-	transitionBaseline := map[string]string{
-		"core/fsx/fsx_unix.go:isUnixDevNullStat": "fixed in W3-fsx branch; remove map upon rebase",
-	}
 
 	root := p4RepoRoot(t)
 	violations := analyzeSecurityPredicatePackages(t, root, securityPredicatePackages)
 	for _, v := range violations {
-		if _, known := transitionBaseline[v.key()]; !known {
-			t.Error(v.String())
-		}
+		t.Error(v.String())
 	}
 }

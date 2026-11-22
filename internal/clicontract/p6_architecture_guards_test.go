@@ -133,9 +133,6 @@ func TestP6_SingleAuthorityAndSanitizationGuards(t *testing.T) {
 	t.Run("NoProgramDataEnvReadInSSHEnv", func(t *testing.T) {
 		checkNoProgramDataEnvInSSHEnv(t, files)
 	})
-	t.Run("NoBareOSReadFileInCoreSSH", func(t *testing.T) {
-		checkNoBareOSReadFileInCoreSSH(t, files)
-	})
 }
 
 func checkNoRawToAbsolutePathInInventoryFiles(t *testing.T, files []parsedGoFile) {
@@ -222,31 +219,6 @@ func checkNoProgramDataEnvInSSHEnv(t *testing.T, files []parsedGoFile) {
 	}
 	if !sawKnownFolderCall {
 		t.Error("expected internal/sshenv/ to call windows.KnownFolderPath(windows.FOLDERID_ProgramData, ...)")
-	}
-}
-
-func checkNoBareOSReadFileInCoreSSH(t *testing.T, files []parsedGoFile) {
-	t.Helper()
-	scannedCount := 0
-	for _, pf := range files {
-		if !strings.HasPrefix(pf.relPath, "core/ssh/") {
-			continue
-		}
-		scannedCount++
-		osPkg := importLocalName(pf.file, "os")
-		if osPkg == "" {
-			continue
-		}
-		ast.Inspect(pf.file, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok && isSelectorCall(call, osPkg, "ReadFile") {
-				pos := pf.fset.Position(call.Pos())
-				t.Errorf("%s:%d: forbidden bare %s.ReadFile in core/ssh; use bounded file reader", pf.relPath, pos.Line, osPkg)
-			}
-			return true
-		})
-	}
-	if scannedCount == 0 {
-		t.Fatal("expected non-test files under core/ssh/, found 0")
 	}
 }
 
