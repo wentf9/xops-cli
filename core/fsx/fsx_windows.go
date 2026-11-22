@@ -395,6 +395,39 @@ func replaceFileOS(source, destination string) error {
 	return nil
 }
 
+// windowsSyncDirFlags opens an existing directory handle for FlushFileBuffers
+// while blocking named-pipe impersonation (SECURITY_SQOS_PRESENT |
+// SECURITY_ANONYMOUS). FILE_FLAG_OPEN_REPARSE_POINT is intentionally omitted so
+// SyncDir(filepath.Dir(target)) continues to work when dir itself is a valid
+// directory symlink, junction, or volume mount point (matching Unix
+// O_RDONLY|O_DIRECTORY without O_NOFOLLOW); validateWindowsDirectoryHandle then
+// verifies FILE_TYPE_DISK and FILE_ATTRIBUTE_DIRECTORY on the open handle
+// before calling FlushFileBuffers.
+const windowsSyncDirFlags = uint32(
+	windows.FILE_FLAG_BACKUP_SEMANTICS |
+		windows.SECURITY_SQOS_PRESENT |
+		windows.SECURITY_ANONYMOUS,
+)
+
+func validateWindowsDirectoryHandle(handle windows.Handle, dir string) error {
+	fileType, typeErr := windows.GetFileType(handle)
+	if typeErr != nil {
+		return &os.PathError{Op: "getfiletype", Path: dir, Err: typeErr}
+	}
+	if fileType != windows.FILE_TYPE_DISK {
+		return fmt.Errorf("%w: %q (type=%d)", ErrNonRegular, dir, fileType)
+	}
+	var info windows.ByHandleFileInformation
+	if infoErr := windows.GetFileInformationByHandle(handle, &info); infoErr != nil {
+		return &os.PathError{Op: "stat", Path: dir, Err: infoErr}
+	}
+	if info.FileAttributes&windows.FILE_ATTRIBUTE_DEVICE != 0 ||
+		info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return fmt.Errorf("%w: %q is not a directory", ErrNonRegular, dir)
+	}
+	return nil
+}
+
 func syncDirOS(dir string) (retErr error) {
 	dirPtr, err := windows.UTF16PtrFromString(fixLongPathWindows(dir))
 	if err != nil {
@@ -406,17 +439,20 @@ func syncDirOS(dir string) (retErr error) {
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
 		nil,
 		windows.OPEN_EXISTING,
-		windows.FILE_FLAG_BACKUP_SEMANTICS,
+		windowsSyncDirFlags,
 		0,
 	)
 	if err != nil {
-		return fmt.Errorf("fsx: open directory handle %q: %w", dir, err)
+		return fmt.Errorf("fsx: open directory handle %q: %w", dir, classifyWindowsOpenError(dir, err))
 	}
 	defer func() {
 		if closeErr := windows.CloseHandle(handle); closeErr != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("fsx: close directory handle %q: %w", dir, closeErr))
 		}
 	}()
+	if valErr := validateWindowsDirectoryHandle(handle, dir); valErr != nil {
+		return valErr
+	}
 	if flushErr := windows.FlushFileBuffers(handle); flushErr != nil {
 		return fmt.Errorf("fsx: flush directory buffers %q: %w", dir, flushErr)
 	}

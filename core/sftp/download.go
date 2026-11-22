@@ -16,6 +16,8 @@ import (
 	"unicode"
 
 	"github.com/wentf9/xops-cli/core/fsx"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 var (
@@ -285,6 +287,9 @@ func (c *Client) downloadOne(ctx context.Context, remote RemotePath, dest LocalD
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := validateRemoteDownloadMode(remote.String(), info.Mode(), false); err != nil {
+		return err
+	}
 
 	resolvedLocal, err := resolveDownloadLocalPath(remote, info, dest, opts.ContentsOnly)
 	if err != nil {
@@ -348,7 +353,7 @@ func (c *Client) downloadOne(ctx context.Context, remote RemotePath, dest LocalD
 			transferErr = clientToUse.downloadDirectory(ctx, remote, localRoot, progress)
 		}
 	} else {
-		if dlErr := clientToUse.downloadFile(ctx, remote.String(), resolvedLocal, info.Size(), info.Mode(), progress); dlErr != nil {
+		if dlErr := clientToUse.downloadFile(ctx, remote.String(), resolvedLocal, info.Size(), sanitizeTransferFilePerm(info.Mode()), progress); dlErr != nil {
 			transferErr = fmt.Errorf("download %q to %q: %w", remote.String(), resolvedLocal, dlErr)
 		}
 	}
@@ -496,6 +501,22 @@ type downloadSymlinkMatch struct {
 	fromTree bool
 }
 
+// validateRemoteDownloadMode verifies that a remote entry's file-type bits are
+// supported for download (regular file, directory, or symlink when allowSymlink
+// is true), failing closed on FIFOs, sockets, devices, irregular entries, and
+// malformed multi-type bitmasks before any SFTP Open or local side effect.
+func validateRemoteDownloadMode(remotePath string, mode os.FileMode, allowSymlink bool) error {
+	switch mode & os.ModeType {
+	case 0, os.ModeDir:
+		return nil
+	case os.ModeSymlink:
+		if allowSymlink {
+			return nil
+		}
+	}
+	return fmt.Errorf("download %q: unsupported non-regular remote entry (mode %s)", remotePath, mode)
+}
+
 func canonicalFoldRune(r rune) rune {
 	minR := r
 	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
@@ -506,9 +527,27 @@ func canonicalFoldRune(r rune) rune {
 	return minR
 }
 
+// foldDownloadSegment normalizes a single relative path segment into one
+// canonical key covering NFC/NFD equivalence (macOS APFS/HFS+, Linux ext4 +F
+// casefold), full multi-rune Unicode case folding (e.g. U+0130 "İ" vs "i\u0307"
+// vs "I\u0307", "ß" vs "ss"), and remaining single-rune SimpleFold equivalence
+// classes.
+func foldDownloadSegment(seg string) string {
+	decomposed := norm.NFD.String(seg)
+	folded := cases.Fold().String(decomposed)
+	canonical := norm.NFD.String(folded)
+	return strings.Map(canonicalFoldRune, canonical)
+}
+
 func foldDownloadRelPath(rel string) string {
-	lower := strings.ToLower(rel)
-	return strings.Map(canonicalFoldRune, lower)
+	if !strings.ContainsRune(rel, '/') {
+		return foldDownloadSegment(rel)
+	}
+	parts := strings.Split(rel, "/")
+	for i, seg := range parts {
+		parts[i] = foldDownloadSegment(seg)
+	}
+	return strings.Join(parts, "/")
 }
 
 func buildDownloadSymlinkIndex(inTreeSymlinks map[string]string) (*downloadSymlinkIndex, error) {

@@ -147,7 +147,9 @@ func AtomicReplace(path string, data []byte, perm os.FileMode, opts ...ReplaceOp
 //
 // On Unix, SyncDir opens dir with O_RDONLY|O_DIRECTORY|O_CLOEXEC and calls
 // Sync on the directory handle. On Windows, SyncDir opens dir with
-// FILE_FLAG_BACKUP_SEMANTICS and calls FlushFileBuffers.
+// FILE_FLAG_BACKUP_SEMANTICS|SECURITY_SQOS_PRESENT|SECURITY_ANONYMOUS,
+// verifies on the open handle that it is a FILE_TYPE_DISK directory, and calls
+// FlushFileBuffers.
 func SyncDir(dir string) error {
 	if strings.TrimSpace(dir) == "" {
 		return ErrEmptyPath

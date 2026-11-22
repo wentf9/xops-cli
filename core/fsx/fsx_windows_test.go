@@ -205,3 +205,36 @@ func TestWindowsDirLock_PostLockSameFileRetryAndExhaustion(t *testing.T) {
 		t.Fatalf("observed %d attempts, want %d", attempts, DefaultLockRetries)
 	}
 }
+
+func TestWindowsSyncDir_HardenedFlagsAndTypeValidation(t *testing.T) {
+	wantRequired := uint32(
+		windows.FILE_FLAG_BACKUP_SEMANTICS |
+			windows.SECURITY_SQOS_PRESENT |
+			windows.SECURITY_ANONYMOUS,
+	)
+	if windowsSyncDirFlags&wantRequired != wantRequired {
+		t.Fatalf("windowsSyncDirFlags = %#x, missing required backup/anonymous SQOS flags %#x", windowsSyncDirFlags, wantRequired)
+	}
+	if windowsSyncDirFlags&windows.FILE_FLAG_OPEN_REPARSE_POINT != 0 {
+		t.Fatalf("windowsSyncDirFlags = %#x must omit FILE_FLAG_OPEN_REPARSE_POINT so SyncDir works on valid directory symlinks/mount points", windowsSyncDirFlags)
+	}
+
+	dir := t.TempDir()
+	if err := SyncDir(dir); err != nil {
+		t.Fatalf("SyncDir(%q): %v", dir, err)
+	}
+
+	regularFile := filepath.Join(dir, "not-a-dir.txt")
+	if err := os.WriteFile(regularFile, []byte("hello"), OwnerOnlyPerm); err != nil {
+		t.Fatalf("WriteFile(%q): %v", regularFile, err)
+	}
+	if err := SyncDir(regularFile); !errors.Is(err, ErrNonRegular) {
+		t.Fatalf("SyncDir(regular file) = %v, want ErrNonRegular", err)
+	}
+
+	for _, dev := range []string{"NUL", `\\.\NUL`} {
+		if err := SyncDir(dev); !errors.Is(err, ErrNonRegular) {
+			t.Fatalf("SyncDir(%q) = %v, want ErrNonRegular", dev, err)
+		}
+	}
+}

@@ -249,4 +249,38 @@ func TestSyncDir(t *testing.T) {
 	if err := SyncDir(filepath.Join(dir, "does-not-exist")); err == nil {
 		t.Fatal("SyncDir on missing directory succeeded")
 	}
+
+	regularFile := filepath.Join(dir, "regular.txt")
+	if err := os.WriteFile(regularFile, []byte("data"), OwnerOnlyPerm); err != nil {
+		t.Fatalf("WriteFile(%q): %v", regularFile, err)
+	}
+	if err := SyncDir(regularFile); err == nil {
+		t.Fatal("SyncDir on regular file succeeded, want error")
+	}
+
+	// SyncDir and AtomicReplace must continue working when the parent directory
+	// itself is accessed through a valid directory symlink (e.g. macOS /var ->
+	// /private/var or a symlinked config/temp directory).
+	realSub := filepath.Join(dir, "real-dir")
+	if err := os.MkdirAll(realSub, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", realSub, err)
+	}
+	linkDir := filepath.Join(dir, "link-dir")
+	if err := os.Symlink(realSub, linkDir); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable on Windows: %v", err)
+		}
+		t.Fatalf("Symlink(%q -> %q): %v", linkDir, realSub, err)
+	}
+	if err := SyncDir(linkDir); err != nil {
+		t.Fatalf("SyncDir on directory symlink %q failed: %v", linkDir, err)
+	}
+	target := filepath.Join(linkDir, "config.yaml")
+	res, err := AtomicReplace(target, []byte("synced\n"), OwnerOnlyPerm)
+	if err != nil {
+		t.Fatalf("AtomicReplace inside symlinked directory failed: %v", err)
+	}
+	if !res.Applied || !res.Durable {
+		t.Fatalf("AtomicReplace inside symlinked directory = %+v, want Applied=true Durable=true", res)
+	}
 }
