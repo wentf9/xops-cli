@@ -99,8 +99,8 @@ func validateProxyJumpGraph(cfg *Configuration, lookup map[string][]string, alia
 		if !ok {
 			continue
 		}
-		if hasControlOrLineSepChar(node.ProxyJump) {
-			return fmt.Errorf("%w: node %q proxy_jump %q invalid: contains control character", ErrSchemaValidation, nodeID, node.ProxyJump)
+		if err := ValidateRawProxyJumpTokens(node.ProxyJump); err != nil {
+			return fmt.Errorf("%w: node %q proxy_jump %q invalid: %w", ErrSchemaValidation, nodeID, node.ProxyJump, err)
 		}
 		if strings.TrimSpace(node.ProxyJump) == "" {
 			continue

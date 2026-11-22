@@ -219,6 +219,25 @@ func (f *SSHControlFlags) ControlCommandWithoutTarget() bool {
 	return path != "" && !ssh.IsNoneValue(path)
 }
 
+// effectiveTargetProxyJump computes the effective Tier-1 ConnectionTarget
+// (ProxyJump, HasProxyJump) from o.control.Options and o.JumpHost via
+// adapter.EffectiveCLIProxyJumpOverride. When Tier-1 resolves to ProxyDisabled
+// (ProxyJump=none / ProxyCommand=none) or active ProxyCommand, it returns
+// ("none", true) so config.ResolveTarget / config.WithPendingNode cancel
+// lower-tier ProxyJump validation.
+func (o *SshOptions) effectiveTargetProxyJump() (string, bool) {
+	if o == nil {
+		return "", false
+	}
+	if jump, hasJump, err := adapter.EffectiveCLIProxyJumpOverride(o.control.Options, o.JumpHost); err == nil {
+		return jump, hasJump
+	}
+	if o.JumpHost != "" {
+		return o.JumpHost, true
+	}
+	return "", false
+}
+
 func effectiveConnectionTarget(opts *SshOptions, nodeID string) config.ConnectionTarget {
 	var target config.ConnectionTarget
 	if opts != nil {
@@ -237,8 +256,8 @@ func effectiveConnectionTarget(opts *SshOptions, nodeID string) config.Connectio
 			target.Port = opts.Port
 			target.HasPort = true
 		}
-		if opts.JumpHost != "" && (!target.HasProxyJump || target.ProxyJump != opts.JumpHost) {
-			target.ProxyJump = opts.JumpHost
+		if jump, hasJump := opts.effectiveTargetProxyJump(); hasJump && (!target.HasProxyJump || target.ProxyJump != jump) {
+			target.ProxyJump = jump
 			target.HasProxyJump = true
 		}
 	}
@@ -318,6 +337,7 @@ func resolveControlSessionLookup(
 	req := buildControlTargetRequest(opts, provider, nodeID, connTarget, sessionOpts)
 	if opts != nil {
 		req.Target.ProxyJump = opts.JumpHost
+		req.Target.HasProxyJump = opts.JumpHost != ""
 	}
 	return adapter.ResolveControlSessionLookup(req, target)
 }
@@ -389,6 +409,9 @@ func validateExplicitNonEmptyFlags(flags *pflag.FlagSet) error {
 		}
 		val, err := flags.GetString(name)
 		if err == nil && name == "jump" {
+			if rawErr := config.ValidateRawProxyJumpTokens(val); rawErr != nil {
+				return fmt.Errorf("invalid --jump (-J): %w", rawErr)
+			}
 			if _, parseErr := ssh.ParseOption(ssh.OptionProxyJump, val, ssh.OptionSourceCLI); parseErr != nil {
 				if strings.TrimSpace(val) == "" {
 					return fmt.Errorf("flag --jump must not be empty: %w", parseErr)
@@ -488,6 +511,11 @@ func ApplyGeneralOptions(opts *SshOptions, optionStrings []string, flags *pflag.
 		}
 		if key == "" {
 			continue
+		}
+		if ssh.CanonicalOptionKey(key) == ssh.OptionProxyJump {
+			if err := config.ValidateRawProxyJumpOption(opt, val); err != nil {
+				return fmt.Errorf("invalid %s in -o option: %w", key, err)
+			}
 		}
 		if err := applyGeneralOption(opts, &st, key, val); err != nil {
 			return err

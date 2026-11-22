@@ -588,7 +588,7 @@ func (o *ScpOptions) preparePendingTarget(ctx context.Context, provider config.C
 }
 
 func (o *ScpOptions) validateSurvivingScpTargetJump(provider config.ConfigProvider, target config.ConnectionTarget) error {
-	if provider == nil || !o.hasExcludeFlags() || o.JumpHost == "" || ssh.IsDisabledProxyJump(o.JumpHost) {
+	if provider == nil || !o.hasExcludeFlags() || !target.HasProxyJump || ssh.IsDisabledProxyJump(target.ProxyJump) {
 		return nil
 	}
 	_, err := config.ResolveTarget(provider, target)
@@ -1613,11 +1613,12 @@ func (o *ScpOptions) resolveTargetForPathWithJump(path PathInfo, attachCLIJump b
 	}
 
 	user, hasUser, port, hasPort := o.resolveUserAndPort(path)
-	proxyJump := o.JumpHost
-	hasProxyJump := o.JumpHost != ""
-	if !attachCLIJump && o.JumpHost != "" {
-		if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
-			return config.ConnectionTarget{}, err
+	proxyJump, hasProxyJump := o.effectiveTargetProxyJump()
+	if !attachCLIJump && hasProxyJump {
+		if o.JumpHost != "" {
+			if err := validateCLIProxyJumpSyntax(o.JumpHost); err != nil {
+				return config.ConnectionTarget{}, err
+			}
 		}
 		proxyJump = "none"
 		hasProxyJump = true

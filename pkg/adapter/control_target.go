@@ -225,6 +225,12 @@ func prepareControlConnectionTarget(req ControlTargetRequest) config.ConnectionT
 	if strings.TrimSpace(connTarget.Selector) == "" && strings.TrimSpace(req.NodeID) != "" {
 		connTarget.Selector = trimNonPaddedOpenSSH(req.NodeID)
 	}
+	if !connTarget.HasProxyJump && connTarget.ProxyJump == "" {
+		if jump, hasJump := EffectiveTier1ProxyJumpOverride(req.SessionControl, ""); hasJump {
+			connTarget.ProxyJump = jump
+			connTarget.HasProxyJump = true
+		}
+	}
 	canonOrig := strings.TrimSpace(req.CanonicalOriginalHost)
 	canonHost := strings.TrimSpace(req.CanonicalHost)
 	if canonOrig == "" && canonHost == "" {
@@ -324,6 +330,31 @@ func validateControlConfigSelectors(lookupKey, selector string, sessionAuth Sess
 		}
 	}
 	return validateSessionAuthOpenSSHSelectors(sessionAuth)
+}
+
+// EffectiveTier1ProxyJumpOverride computes the effective Tier-1 ConnectionTarget
+// ProxyJump override from an already-parsed SessionControlOptions and optional
+// explicit jump override. Per core/ssh.ProxySetting precedence, Tier-1
+// ProxyDisabled (ProxyJump=none / ProxyCommand=none) or active ProxyCommand
+// maps to ("none", true) so lower-tier ProxyJump validation is canceled.
+func EffectiveTier1ProxyJumpOverride(sessionOpts SessionControlOptions, explicitJump string) (string, bool) {
+	return effectiveControlConfigJumpOverride(SessionAuth{ProxyJump: explicitJump}, sessionOpts)
+}
+
+// EffectiveCLIProxyJumpOverride parses rawCLIOptions and explicit cliProxyJump
+// through ParseSessionOptions and computes the effective Tier-1 ConnectionTarget
+// ProxyJump override. When Tier-1 resolves to ProxyDisabled or ProxyCommand, it
+// returns ("none", true, nil) so lower-tier ProxyJump validation is canceled.
+func EffectiveCLIProxyJumpOverride(rawCLIOptions []string, cliProxyJump string) (string, bool, error) {
+	if len(rawCLIOptions) == 0 && cliProxyJump == "" {
+		return "", false, nil
+	}
+	sessionOpts, err := ParseSessionOptions(rawCLIOptions, cliProxyJump)
+	if err != nil {
+		return "", false, err
+	}
+	jump, hasJump := EffectiveTier1ProxyJumpOverride(sessionOpts, "")
+	return jump, hasJump, nil
 }
 
 func effectiveControlConfigJumpOverride(sessionAuth SessionAuth, sessionOpts SessionControlOptions) (string, bool) {
@@ -764,16 +795,16 @@ func resolveControlEffectiveJumpHost(
 	hasResolved bool,
 	resolved config.ResolvedTarget,
 ) (string, error) {
-	t1Proxy, err := resolveControlTier1ProxySetting(connTarget, req.SessionControl)
+	t1Proxy, err := resolveControlTier1ProxySetting(req.Target, req.SessionControl)
 	if err != nil {
 		return "", err
 	}
-	t2Proxy, err := resolveControlTier2ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+	t2Proxy, err := resolveControlTier2ProxySetting(req.Provider, req.Target, hasResolved, resolved)
 	if err != nil {
 		return "", err
 	}
 	t3Proxy := resolveControlTier3ProxySetting(req.Provider)
-	t4Proxy, err := resolveControlTier4ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+	t4Proxy, err := resolveControlTier4ProxySetting(req.Provider, req.Target, hasResolved, resolved)
 	if err != nil {
 		return "", err
 	}
@@ -976,7 +1007,7 @@ func resolveControlSessionLookup(
 		canonHost = ""
 	}
 	targetOrig := strings.TrimSpace(target.OriginalHost)
-	proxyJump := effectiveControlSessionProxyJump(connTarget, req.SessionControl)
+	proxyJump := effectiveControlSessionProxyJump(req.Target, req.SessionControl)
 	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
 		req.Provider, lookupKey, req.NodeID, connTarget, origHost, canonHost, targetOrig, proxyJump,
 	)

@@ -223,6 +223,9 @@ func ParseSessionOptions(options []string, cliProxyJump string) (SessionControlO
 	seen := make(map[string]bool)
 	proxy := ssh.UnsetProxySetting()
 	if cliProxyJump != "" {
+		if err := config.ValidateRawProxyJumpTokens(cliProxyJump); err != nil {
+			return opts, fmt.Errorf("invalid ProxyJump: %w", err)
+		}
 		parsedJump, err := ssh.ParseOption(ssh.OptionProxyJump, cliProxyJump, ssh.OptionSourceCLI)
 		if err != nil {
 			return opts, fmt.Errorf("invalid ProxyJump: %w", err)
@@ -237,6 +240,11 @@ func ParseSessionOptions(options []string, cliProxyJump string) (SessionControlO
 		}
 		if key == "" {
 			continue
+		}
+		if ssh.CanonicalOptionKey(key) == ssh.OptionProxyJump {
+			if err := config.ValidateRawProxyJumpOption(opt, val); err != nil {
+				return opts, fmt.Errorf("invalid ProxyJump: %w", err)
+			}
 		}
 		parsed, err := ssh.ParseOption(key, val, ssh.OptionSourceCLI)
 		if err != nil {

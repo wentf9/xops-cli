@@ -1181,6 +1181,9 @@ func validateCLIProxyJumpSyntax(rawJump string) error {
 	if rawJump == "" {
 		return nil
 	}
+	if err := config.ValidateRawProxyJumpTokens(rawJump); err != nil {
+		return fmt.Errorf("invalid --jump (-J): %w", err)
+	}
 	if _, err := ssh.ParseOption(ssh.OptionProxyJump, rawJump, ssh.OptionSourceCLI); err != nil {
 		return fmt.Errorf("invalid --jump (-J): %w", err)
 	}
@@ -1188,7 +1191,11 @@ func validateCLIProxyJumpSyntax(rawJump string) error {
 }
 
 func (o *ExecOptions) validateSurvivingExecTasksJump(provider config.ConfigProvider, tasks []execHostTask) ([]execHostTask, []error, error) {
-	if provider == nil || !o.hasExcludeFlags() || o.JumpHost == "" || ssh.IsDisabledProxyJump(o.JumpHost) {
+	if provider == nil || !o.hasExcludeFlags() {
+		return tasks, nil, nil
+	}
+	proxyJump, hasProxyJump := o.effectiveTargetProxyJump()
+	if !hasProxyJump || ssh.IsDisabledProxyJump(proxyJump) {
 		return tasks, nil, nil
 	}
 	surviving := make([]execHostTask, 0, len(tasks))
@@ -1294,17 +1301,18 @@ func (o *ExecOptions) planTaggedHostTask(
 	if resolveErr != nil {
 		return execHostTask{}, fmt.Errorf("resolve tagged node %q failed: %w", nodeID, resolveErr)
 	}
+	proxyJump, hasProxyJump := o.effectiveTargetProxyJump()
 	target := config.ConnectionTarget{
 		Selector:     nodeID,
 		User:         userOverride,
 		HasUser:      o.User != "",
 		Port:         o.Port,
 		HasPort:      o.Port != 0,
-		ProxyJump:    o.JumpHost,
-		HasProxyJump: o.JumpHost != "",
+		ProxyJump:    proxyJump,
+		HasProxyJump: hasProxyJump,
 	}
 	probeTarget := target
-	if o.hasExcludeFlags() && o.JumpHost != "" {
+	if o.hasExcludeFlags() && hasProxyJump {
 		probeTarget.ProxyJump = "none"
 		probeTarget.HasProxyJump = true
 	}
@@ -1312,8 +1320,8 @@ func (o *ExecOptions) planTaggedHostTask(
 	if cErr != nil {
 		return execHostTask{}, fmt.Errorf("canonicalize tagged host %q: %w", nodeID, cErr)
 	}
-	target.ProxyJump = o.JumpHost
-	target.HasProxyJump = o.JumpHost != ""
+	target.ProxyJump = proxyJump
+	target.HasProxyJump = hasProxyJump
 	effectiveUser, password := o.resolveTaggedCredentials(userOverride, identity, resolved, hasResolved)
 	hasOverrides := o.User != "" || o.Port != 0 || o.JumpHost != "" || target.Selector != nodeID
 	taskNodeID := nodeID
@@ -1531,17 +1539,18 @@ func (o *ExecOptions) planSingleHostTask(ctx context.Context, repository config.
 	}
 
 	rawHost := strings.TrimSpace(h.Host)
+	proxyJump, hasProxyJump := o.effectiveTargetProxyJump()
 	target := config.ConnectionTarget{
 		Selector:     rawHost,
 		User:         strings.TrimSpace(user),
 		HasUser:      hasUser,
 		Port:         port,
 		HasPort:      hasPort,
-		ProxyJump:    o.JumpHost,
-		HasProxyJump: o.JumpHost != "",
+		ProxyJump:    proxyJump,
+		HasProxyJump: hasProxyJump,
 	}
 	probeTarget := target
-	if o.hasExcludeFlags() && o.JumpHost != "" {
+	if o.hasExcludeFlags() && hasProxyJump {
 		probeTarget.ProxyJump = "none"
 		probeTarget.HasProxyJump = true
 	}
@@ -1549,8 +1558,8 @@ func (o *ExecOptions) planSingleHostTask(ctx context.Context, repository config.
 	if cErr != nil {
 		return execHostTask{}, cErr
 	}
-	target.ProxyJump = o.JumpHost
-	target.HasProxyJump = o.JumpHost != ""
+	target.ProxyJump = proxyJump
+	target.HasProxyJump = hasProxyJump
 	h.Host = target.Selector
 
 	targetCopy := target

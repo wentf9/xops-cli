@@ -495,8 +495,7 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 		selector = trimmedRaw
 	}
 
-	proxyJump := o.JumpHost
-	hasJump := proxyJump != ""
+	proxyJump, hasJump := o.effectiveTargetProxyJump()
 	if o.isMuxDaemon() {
 		hasJump = true
 		if proxyJump == "" {
@@ -1384,8 +1383,8 @@ func (c *proxyCommandPathChecker) checkOwnedMaster(connector *ssh.Connector, m *
 }
 
 func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nodeID string) (string, error) {
-	if o != nil && o.JumpHost != "" {
-		ps, err := ssh.ParseProxyJump(o.JumpHost)
+	if jump, hasJump := o.effectiveTargetProxyJump(); hasJump {
+		ps, err := ssh.ParseProxyJump(jump)
 		if err != nil {
 			return "", err
 		}
@@ -1396,7 +1395,7 @@ func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nod
 		if provider == nil {
 			return strings.Join(targets, ","), nil
 		}
-		resolved, err := provider.ResolveProxyJumpChain(o.JumpHost)
+		resolved, err := provider.ResolveProxyJumpChain(jump)
 		if err != nil {
 			return "", err
 		}
@@ -3086,7 +3085,14 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 }
 
 func (o *SshOptions) buildPendingEnsureOptions(ctx context.Context, provider config.ConfigProvider) (config.EnsureNodeOptions, error) {
+	if err := o.ensureGeneralOptionsApplied(); err != nil {
+		return config.EnsureNodeOptions{}, err
+	}
 	o.syncIdentityFiles()
+	if jump, hasJump := o.effectiveTargetProxyJump(); hasJump && (!o.Target.HasProxyJump || o.Target.ProxyJump != jump) {
+		o.Target.ProxyJump = jump
+		o.Target.HasProxyJump = true
+	}
 	if err := o.applyHostnameCanonicalization(ctx, provider, nil); err != nil {
 		return config.EnsureNodeOptions{}, err
 	}

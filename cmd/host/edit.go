@@ -103,6 +103,12 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 			return err
 		}
 	}
+	if updated || nameChanged {
+		draft := buildEditedNodeDraft(repository, oldName, newName, node, host, identity)
+		if err := config.ValidateSavedNodeJumpCycleWithOpenSSH(draft, repository.GetOpenSSHParser(), newName); err != nil {
+			return fmt.Errorf("validate node %q failed: %w", newName, err)
+		}
+	}
 	return commitEditedNode(cmd, repository, view.NodeRefs[oldName], oldName, newName, node, host, identity, flags, updated)
 }
 
@@ -111,11 +117,57 @@ func validateEditPreFlags(cmd *cobra.Command, flags *editFlags, portChanged bool
 		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
 	}
 	if cmd.Flags().Changed("jump") && flags.jump != "" {
+		if err := config.ValidateRawProxyJumpTokens(flags.jump); err != nil {
+			return fmt.Errorf("invalid jump host: %w", err)
+		}
 		if _, pErr := ssh.ParseProxyJump(flags.jump); pErr != nil {
 			return fmt.Errorf("invalid jump host: %w", pErr)
 		}
 	}
 	return nil
+}
+
+func isEditedRefSharedWithOtherNode(cfg *config.Configuration, excludeNodeID string, getRef func(models.Node) string, ref string) bool {
+	if cfg == nil || cfg.Nodes == nil || ref == "" {
+		return false
+	}
+	for _, nid := range cfg.Nodes.Keys() {
+		if nid == excludeNodeID {
+			continue
+		}
+		if n, ok := cfg.Nodes.Get(nid); ok && getRef(n) == ref {
+			return true
+		}
+	}
+	return false
+}
+
+func buildEditedNodeDraft(
+	repository *config.Repository,
+	oldName, newName string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+) *config.Configuration {
+	draft := repository.Snapshot()
+	draftNode := node
+	hostRef := draftNode.HostRef
+	if hostRef == "" || isEditedRefSharedWithOtherNode(draft, oldName, func(n models.Node) string { return n.HostRef }, hostRef) {
+		hostRef = "__edit_host__" + newName
+		draftNode.HostRef = hostRef
+	}
+	identRef := draftNode.IdentityRef
+	if identRef == "" || isEditedRefSharedWithOtherNode(draft, oldName, func(n models.Node) string { return n.IdentityRef }, identRef) {
+		identRef = "__edit_ident__" + newName
+		draftNode.IdentityRef = identRef
+	}
+	draft.Hosts.Set(hostRef, host)
+	draft.Identities.Set(identRef, identity)
+	if oldName != newName {
+		draft.Nodes.Remove(oldName)
+	}
+	draft.Nodes.Set(newName, draftNode)
+	return draft
 }
 
 func applyEditedProxyJump(
@@ -130,6 +182,9 @@ func applyEditedProxyJump(
 		node.ProxyJump = ""
 		return nil
 	}
+	if err := config.ValidateRawProxyJumpTokens(rawJump); err != nil {
+		return fmt.Errorf("invalid jump host for node %q: %w", newName, err)
+	}
 	ps, pErr := ssh.ParseProxyJump(rawJump)
 	if pErr != nil {
 		return fmt.Errorf("invalid jump host for node %q: %w", newName, pErr)
@@ -138,13 +193,7 @@ func applyEditedProxyJump(
 		node.ProxyJump = ""
 		return nil
 	}
-	draft := repository.Snapshot()
-	draft.Hosts.Set(node.HostRef, host)
-	draft.Identities.Set(node.IdentityRef, identity)
-	if oldName != newName {
-		draft.Nodes.Remove(oldName)
-	}
-	draft.Nodes.Set(newName, *node)
+	draft := buildEditedNodeDraft(repository, oldName, newName, *node, host, identity)
 	resolvedJump, err := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), rawJump)
 	if err != nil {
 		return fmt.Errorf("resolve jump host for node %q: %w", newName, err)

@@ -443,6 +443,10 @@ type targetDecision struct {
 // using the exact same resolution rules as WithPendingNode / EnsureNodeContext,
 // without mutating persisted state or creating pending nodes.
 func ResolveTarget(provider ConfigProvider, target ConnectionTarget) (ResolvedTarget, error) {
+	return resolveTargetWithDefaultUser(provider, target, "")
+}
+
+func resolveTargetWithDefaultUser(provider ConfigProvider, target ConnectionTarget, explicitDefaultUser string) (ResolvedTarget, error) {
 	if provider == nil {
 		return ResolvedTarget{}, fmt.Errorf("configuration provider is nil")
 	}
@@ -454,12 +458,13 @@ func ResolveTarget(provider ConfigProvider, target ConnectionTarget) (ResolvedTa
 	if err != nil {
 		return ResolvedTarget{}, fmt.Errorf("build configuration indexes failed: %w", err)
 	}
-	decision, err := r.evaluateTargetDecision(cfg, lookup, aliases, target, "")
+	defaultUser := strings.TrimSpace(explicitDefaultUser)
+	decision, err := r.evaluateTargetDecision(cfg, lookup, aliases, target, defaultUser)
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
 	if !decision.NeedsCreation {
-		return r.buildMatchedResolvedTarget(provider, decision.MatchedNodeID, decision.BaseNodeID, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget)
+		return r.buildMatchedResolvedTarget(provider, decision.MatchedNodeID, decision.BaseNodeID, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget, defaultUser)
 	}
 	return r.buildCreatedResolvedTargetWithUserPort(provider, cfg, decision.Canonical, decision.EffectiveUser, decision.EffectivePort, decision.NormalizedTarget)
 }
@@ -804,9 +809,10 @@ func (r *Repository) buildMatchedResolvedTarget(
 	provider ConfigProvider,
 	matchedID, baseID, openSSHAlias, canonicalHost string,
 	target ConnectionTarget,
+	explicitDefaultUser string,
 ) (ResolvedTarget, error) {
 	if IsOpenSSHNodeID(matchedID) {
-		return r.buildMatchedOpenSSHResolvedTarget(provider, matchedID, baseID, openSSHAlias, canonicalHost, target)
+		return r.buildMatchedOpenSSHResolvedTarget(provider, matchedID, baseID, openSSHAlias, canonicalHost, target, explicitDefaultUser)
 	}
 	node, host, ident, err := provider.Resolve(matchedID)
 	if err != nil {
@@ -819,7 +825,7 @@ func (r *Repository) buildMatchedResolvedTarget(
 	}
 	user := ident.User
 	if user == "" {
-		if defUser, uErr := resolveEffectiveUser(target, "", ""); uErr == nil {
+		if defUser, uErr := resolveEffectiveUser(target, explicitDefaultUser, ""); uErr == nil {
 			user = defUser
 		}
 	}
@@ -849,6 +855,7 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 	provider ConfigProvider,
 	matchedID, baseID, openSSHAlias, canonicalHost string,
 	target ConnectionTarget,
+	explicitDefaultUser string,
 ) (ResolvedTarget, error) {
 	cleanMatched, _ := cutOpenSSHPrefix(matchedID)
 	lookupHost, inlineUser, inlinePort, parseErr := parseOpenSSHHostSpec(cleanMatched)
@@ -877,7 +884,7 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 		user = inlineUser
 	}
 	if user == "" {
-		if defUser, uErr := resolveEffectiveUser(target, "", ""); uErr == nil {
+		if defUser, uErr := resolveEffectiveUser(target, explicitDefaultUser, ""); uErr == nil {
 			user = defUser
 		}
 	}
@@ -916,8 +923,8 @@ func (r *Repository) buildMatchedOpenSSHResolvedTarget(
 }
 
 func parseOptionalNodeProxyJump(raw string) (ssh.ProxySetting, error) {
-	if hasControlOrLineSepChar(raw) {
-		return ssh.UnsetProxySetting(), fmt.Errorf("invalid node ProxyJump %q: %w", raw, ssh.ErrSSHOptionsValidation)
+	if err := ValidateRawProxyJumpTokens(raw); err != nil {
+		return ssh.UnsetProxySetting(), fmt.Errorf("invalid node ProxyJump %q: %w", raw, err)
 	}
 	if strings.TrimSpace(raw) == "" {
 		return ssh.UnsetProxySetting(), nil
@@ -999,6 +1006,9 @@ func normalizeTargetJumpForTargetWithConfig(cfg *Configuration, openSSH *OpenSSH
 }
 
 func resolveExplicitTargetJumpWithConfig(cfg *Configuration, openSSH *OpenSSHParser, dest ProxyJumpTarget, rawJump string) (string, error) {
+	if err := ValidateRawProxyJumpTokens(rawJump); err != nil {
+		return "", fmt.Errorf("invalid target ProxyJump %q: %w", rawJump, err)
+	}
 	ps, pErr := ssh.ParseProxyJump(rawJump)
 	if pErr != nil {
 		return "", fmt.Errorf("invalid target ProxyJump %q: %w", rawJump, pErr)
@@ -1010,7 +1020,7 @@ func resolveExplicitTargetJumpWithConfig(cfg *Configuration, openSSH *OpenSSHPar
 	var resolvedJump string
 	if cfg != nil {
 		var jErr error
-		resolvedJump, jErr = ResolveProxyJumpChainWithConfig(cfg, openSSH, jump)
+		resolvedJump, jErr = ResolveProxyJumpChainWithConfig(cfg, openSSH, rawJump)
 		if jErr != nil {
 			return "", jErr
 		}
@@ -1230,7 +1240,7 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 		if baseID == "" {
 			baseID = matchedID
 		}
-		return r.buildMatchedResolvedTarget(provider, matchedID, baseID, canonicalInfo.OpenSSHAlias, canonicalInfo.CanonicalHost, target)
+		return r.buildMatchedResolvedTarget(provider, matchedID, baseID, canonicalInfo.OpenSSHAlias, canonicalInfo.CanonicalHost, target, effectiveUser)
 	} else if len(matches) > 1 {
 		return ResolvedTarget{}, &AmbiguousNodeError{Selector: target.Selector, Candidates: matches}
 	}
@@ -2188,6 +2198,15 @@ func (r *Repository) createNodeInTransaction(
 	}
 
 	cfg.Nodes.Set(targetNodeID, newNode)
+	if opts.Alias != "" && (opts.Target.HasProxyJump || opts.Target.ProxyJump != "") {
+		reResolved, rErr := r.resolveProxyJumpChain(cfg, opts.Target.ProxyJump)
+		if rErr != nil {
+			return rErr
+		}
+		finalJump = reResolved
+		newNode.ProxyJump = finalJump
+		cfg.Nodes.Set(targetNodeID, newNode)
+	}
 	if strings.TrimSpace(finalJump) != "" {
 		dest := ProxyJumpTarget{
 			NodeID:        targetNodeID,
@@ -2275,6 +2294,9 @@ func (r *Repository) resolveJumpForNode(
 	port uint16,
 ) (string, error) {
 	if opts.Target.HasProxyJump || opts.Target.ProxyJump != "" {
+		if err := ValidateRawProxyJumpTokens(opts.Target.ProxyJump); err != nil {
+			return "", fmt.Errorf("invalid target ProxyJump %q: %w", opts.Target.ProxyJump, err)
+		}
 		if _, err := ssh.ParseProxyJump(opts.Target.ProxyJump); err != nil {
 			return "", fmt.Errorf("invalid target ProxyJump %q: %w", opts.Target.ProxyJump, err)
 		}
@@ -2393,8 +2415,8 @@ func (r *Repository) resolveProxyJumpChain(cfg *Configuration, jumpChain string)
 
 // ResolveProxyJumpChainWithConfig validates and normalizes a comma-separated jump host chain.
 func ResolveProxyJumpChainWithConfig(cfg *Configuration, openSSH *OpenSSHParser, jumpChain string) (string, error) {
-	if hasControlOrLineSepChar(jumpChain) {
-		return "", fmt.Errorf("%w: invalid proxy_jump %q: contains control character", ssh.ErrSSHOptionsValidation, jumpChain)
+	if err := ValidateRawProxyJumpTokens(jumpChain); err != nil {
+		return "", err
 	}
 	if strings.TrimSpace(jumpChain) == "" {
 		return "", nil

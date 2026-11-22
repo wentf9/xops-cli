@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/wentf9/xops-cli/core/ssh"
+	"github.com/wentf9/xops-cli/pkg/adapter"
 	"github.com/wentf9/xops-cli/pkg/config"
 )
 
@@ -175,7 +176,7 @@ func resolveSingleExclude(
 		return false, nil
 	}
 
-	matched, err := resolveExcludeViaTarget(provider, ex, hasOpenSSHPrefix, addrUser, addrHost, addrPort, candidates, resolved, cliProxyJump)
+	matched, err := resolveExcludeViaTarget(provider, ex, hasOpenSSHPrefix, addrUser, addrHost, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump)
 	if err != nil {
 		return false, err
 	}
@@ -206,10 +207,17 @@ func excludeHostInSavedInventory(provider config.ConfigProvider, rawEx, addrHost
 	return false
 }
 
-func applyDisabledCLIProxyJump(target config.ConnectionTarget, cliProxyJump string) config.ConnectionTarget {
+func applyDisabledCLIProxyJump(target config.ConnectionTarget, rawCLIOptions []string, cliProxyJump string) config.ConnectionTarget {
 	if ssh.IsDisabledProxyJump(cliProxyJump) {
 		target.ProxyJump = "none"
 		target.HasProxyJump = true
+		return target
+	}
+	if len(rawCLIOptions) > 0 {
+		if jump, hasJump, err := adapter.EffectiveCLIProxyJumpOverride(rawCLIOptions, cliProxyJump); err == nil && hasJump && ssh.IsDisabledProxyJump(jump) {
+			target.ProxyJump = "none"
+			target.HasProxyJump = true
+		}
 	}
 	return target
 }
@@ -266,7 +274,7 @@ func resolveOpenSSHExcludeBySelector(
 	rawCLIOptions []string,
 	cliProxyJump string,
 ) (bool, error) {
-	hasConcrete, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, nodeID, cliProxyJump)
+	hasConcrete, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, nodeID, rawCLIOptions, cliProxyJump)
 	if concreteErr != nil {
 		return false, fmt.Errorf("resolve excluded node %q failed: %w", ex, concreteErr)
 	}
@@ -274,7 +282,7 @@ func resolveOpenSSHExcludeBySelector(
 		return false, nil
 	}
 	recordExcludeKey(resolved, nodeID)
-	res, rErr := config.ResolveTarget(provider, applyDisabledCLIProxyJump(config.ConnectionTarget{Selector: nodeID}, cliProxyJump))
+	res, rErr := config.ResolveTarget(provider, applyDisabledCLIProxyJump(config.ConnectionTarget{Selector: nodeID}, rawCLIOptions, cliProxyJump))
 	if rErr != nil {
 		if !errors.Is(rErr, config.ErrNodeNotFound) {
 			return false, fmt.Errorf("resolve excluded node %q failed: %w", ex, rErr)
@@ -307,12 +315,13 @@ func resolveExcludeViaTarget(
 	addrPort uint16,
 	candidates []ExcludeTargetInfo,
 	resolved map[string]struct{},
+	rawCLIOptions []string,
 	cliProxyJump string,
 ) (bool, error) {
 	if provider == nil {
 		return false, nil
 	}
-	hasConcreteOpenSSH, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, addrHost, cliProxyJump)
+	hasConcreteOpenSSH, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, addrHost, rawCLIOptions, cliProxyJump)
 	if concreteErr != nil {
 		return false, fmt.Errorf("resolve excluded node %q failed: %w", rawEx, concreteErr)
 	}
@@ -331,7 +340,7 @@ func resolveExcludeViaTarget(
 		HasUser:  addrUser != "",
 		Port:     addrPort,
 		HasPort:  addrPort != 0,
-	}, cliProxyJump))
+	}, rawCLIOptions, cliProxyJump))
 	if err != nil {
 		if !errors.Is(err, config.ErrNodeNotFound) {
 			return false, fmt.Errorf("resolve excluded node %q failed: %w", rawEx, err)
@@ -473,7 +482,7 @@ func expandExcludeCanonicalCandidates(
 	canonHosts := config.CanonicalDomainCandidatesWithOptions(provider, addrHost, rawCLIOptions, cliProxyJump)
 	matchedAny := false
 	for _, fqdn := range canonHosts {
-		concreteFQDN, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, fqdn, cliProxyJump)
+		concreteFQDN, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, fqdn, rawCLIOptions, cliProxyJump)
 		if concreteErr != nil {
 			return false, fmt.Errorf("resolve excluded node %q failed: %w", fqdn, concreteErr)
 		}
@@ -487,7 +496,7 @@ func expandExcludeCanonicalCandidates(
 		if !concreteFQDN && !matchedCandidate {
 			continue
 		}
-		ok, err := resolveExcludeViaTarget(provider, fqdn, false, addrUser, fqdn, addrPort, candidates, resolved, cliProxyJump)
+		ok, err := resolveExcludeViaTarget(provider, fqdn, false, addrUser, fqdn, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump)
 		if err != nil {
 			return false, err
 		}
@@ -713,11 +722,11 @@ func recordCandidateTrialExclude(
 }
 
 func providerOpenSSHHasConcreteHost(provider config.ConfigProvider, host string) bool {
-	ok, err := providerOpenSSHHasConcreteHostChecked(provider, host, "")
+	ok, err := providerOpenSSHHasConcreteHostChecked(provider, host, nil, "")
 	return err == nil && ok
 }
 
-func providerOpenSSHHasConcreteHostChecked(provider config.ConfigProvider, host, cliProxyJump string) (bool, error) {
+func providerOpenSSHHasConcreteHostChecked(provider config.ConfigProvider, host string, rawCLIOptions []string, cliProxyJump string) (bool, error) {
 	clean := config.UnwrapOpenSSHSelector(host)
 	if provider == nil || clean == "" || !config.HasOpenSSHConfig(provider) {
 		return false, nil
@@ -734,7 +743,7 @@ func providerOpenSSHHasConcreteHostChecked(provider config.ConfigProvider, host,
 	}
 	res, err := config.ResolveTarget(provider, applyDisabledCLIProxyJump(config.ConnectionTarget{
 		Selector: config.OpenSSHNodePrefix + clean,
-	}, cliProxyJump))
+	}, rawCLIOptions, cliProxyJump))
 	if err != nil {
 		if errors.Is(err, config.ErrNodeNotFound) {
 			return false, nil

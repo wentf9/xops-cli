@@ -481,21 +481,17 @@ func diagnoseV2ProxyJumps(v2 *ConfigurationV2) []DoctorIssue {
 			FixSummary: fmt.Sprintf("remove cyclic proxy_jump hop %q from node %q", cyc.hop, cyc.from),
 		})
 	}
-	for _, nodeID := range nodeIDs {
-		node, ok := cfg.Nodes.Get(nodeID)
-		if !ok || strings.TrimSpace(node.ProxyJump) == "" {
-			continue
-		}
-		if hop, path, found := findNodeChainFlattenCycleHop(cfg, lookup, aliases, nodeID, node); found {
-			issues = append(issues, DoctorIssue{
-				Code:       "proxy_jump_cycle",
-				Entity:     "node:" + nodeID,
-				Severity:   DoctorSeverityError,
-				Message:    fmt.Sprintf("proxy_jump chain-flattening cycle detected: %s", strings.Join(path, " -> ")),
-				Fixable:    true,
-				FixSummary: fmt.Sprintf("remove cyclic proxy_jump hop %q from node %q", hop, nodeID),
-			})
-		}
+	working := cloneV2ForRepair(v2)
+	repairV2NodeProxyJumpHopsAndDFSCycles(working)
+	for _, cyc := range collectAndBreakRemainingProxyJumpCycles(working) {
+		issues = append(issues, DoctorIssue{
+			Code:       "proxy_jump_cycle",
+			Entity:     "node:" + cyc.from,
+			Severity:   DoctorSeverityError,
+			Message:    fmt.Sprintf("proxy_jump cycle detected: %s", strings.Join(cyc.path, " -> ")),
+			Fixable:    true,
+			FixSummary: fmt.Sprintf("remove cyclic proxy_jump hop %q from node %q", cyc.hop, cyc.from),
+		})
 	}
 	return issues
 }
@@ -523,9 +519,20 @@ func diagnoseNodeProxyJumpHops(
 		return nil, nil
 	}
 	var seenIdents []jumpNodeIdentity
-	for rawHop := range strings.SplitSeq(strings.TrimSpace(node.ProxyJump), ",") {
+	for rawHop := range strings.SplitSeq(node.ProxyJump, ",") {
 		hop := strings.TrimSpace(rawHop)
 		if hop == "" || strings.EqualFold(hop, "none") {
+			continue
+		}
+		if rawErr := ValidateRawProxyJumpTokens(rawHop); rawErr != nil {
+			issues = append(issues, DoctorIssue{
+				Code:       "proxy_jump_invalid",
+				Entity:     "node:" + nodeID,
+				Severity:   DoctorSeverityError,
+				Message:    fmt.Sprintf("proxy_jump hop %q invalid: %v", rawHop, rawErr),
+				Fixable:    true,
+				FixSummary: fmt.Sprintf("normalize or remove invalid proxy_jump hop %q from node %q", rawHop, nodeID),
+			})
 			continue
 		}
 		ref, err := ParseTargetRef(hop)
@@ -785,6 +792,18 @@ func repairV2HostAliasConflicts(v2 *ConfigurationV2, nodeNames []string, nodeAli
 }
 
 func repairV2ProxyJumps(v2 *ConfigurationV2) []DoctorFix {
+	fixes := repairV2NodeProxyJumpHopsAndDFSCycles(v2)
+	for _, cyc := range collectAndBreakRemainingProxyJumpCycles(v2) {
+		fixes = append(fixes, DoctorFix{
+			Code:    "proxy_jump_cycle",
+			Entity:  "node:" + cyc.from,
+			Summary: fmt.Sprintf("removed cyclic proxy_jump hop %q from node %q (%s)", cyc.hop, cyc.from, strings.Join(cyc.path, " -> ")),
+		})
+	}
+	return fixes
+}
+
+func repairV2NodeProxyJumpHopsAndDFSCycles(v2 *ConfigurationV2) []DoctorFix {
 	var fixes []DoctorFix
 	cfg := configurationFromV2Unchecked(v2)
 	lookup, aliases, _ := buildIndexes(cfg, false)
@@ -802,7 +821,7 @@ func repairV2ProxyJumps(v2 *ConfigurationV2) []DoctorFix {
 		}
 	}
 
-	// Iteratively break any remaining cycles deterministically.
+	// Iteratively break any remaining pure saved-node DFS cycles deterministically.
 	for {
 		cfg = configurationFromV2Unchecked(v2)
 		lookup, aliases, _ = buildIndexes(cfg, false)
@@ -838,42 +857,63 @@ func repairV2ProxyJumps(v2 *ConfigurationV2) []DoctorFix {
 			Summary: fmt.Sprintf("removed cyclic proxy_jump hop %q from node %q (%s)", cyc.hop, cyc.from, strings.Join(cyc.path, " -> ")),
 		})
 	}
+	return fixes
+}
 
-	// Iteratively break any remaining right-to-left chain-flattening cycles deterministically.
-	for {
-		cfg = configurationFromV2Unchecked(v2)
-		lookup, aliases, _ = buildIndexes(cfg, false)
-		nodeIDs := sortedMapKeys(v2.Nodes)
-		repairedAny := false
-		for _, nodeID := range nodeIDs {
-			node, ok := cfg.Nodes.Get(nodeID)
-			if !ok || strings.TrimSpace(node.ProxyJump) == "" {
-				continue
-			}
-			hop, path, found := findNodeChainFlattenCycleHop(cfg, lookup, aliases, nodeID, node)
-			if !found {
-				continue
-			}
-			nodeV2 := v2.Nodes[nodeID]
-			updatedChain, removed := removeJumpHopFromChain(nodeV2.ProxyJump, hop)
-			if !removed {
-				continue
-			}
-			nodeV2.ProxyJump = updatedChain
-			v2.Nodes[nodeID] = nodeV2
-			fixes = append(fixes, DoctorFix{
-				Code:    "proxy_jump_cycle",
-				Entity:  "node:" + nodeID,
-				Summary: fmt.Sprintf("removed cyclic proxy_jump hop %q from node %q (%s)", hop, nodeID, strings.Join(path, " -> ")),
-			})
-			repairedAny = true
-			break
+func findNextProxyJumpCycleToBreak(
+	cfg *Configuration,
+	lookup map[string][]string,
+	aliases map[string]string,
+	nodeIDs []string,
+) (cycleBackEdge, bool) {
+	var fallback cycleBackEdge
+	hasFallback := false
+	for _, nodeID := range nodeIDs {
+		node, ok := cfg.Nodes.Get(nodeID)
+		if !ok || strings.TrimSpace(node.ProxyJump) == "" {
+			continue
 		}
-		if !repairedAny {
-			break
+		hop, path, found := findNodeProxyJumpCycleHop(cfg, lookup, aliases, nodeID, node)
+		if !found {
+			continue
+		}
+		edge := cycleBackEdge{from: nodeID, hop: hop, path: path}
+		if len(path) > 0 && path[0] == nodeID {
+			return edge, true
+		}
+		if !hasFallback {
+			fallback = edge
+			hasFallback = true
 		}
 	}
-	return fixes
+	return fallback, hasFallback
+}
+
+// collectAndBreakRemainingProxyJumpCycles iteratively breaks any remaining
+// ProxyJump cycles detected by the shared walkJumpChain detector (including
+// 1-hop/2-hop/N-hop openssh:<endpoint> back-edges and chain-flattening cycles),
+// preferring cycles rooted directly at the cyclic node so upstream callers
+// remain intact when possible.
+func collectAndBreakRemainingProxyJumpCycles(v2 *ConfigurationV2) []cycleBackEdge {
+	var broken []cycleBackEdge
+	for {
+		cfg := configurationFromV2Unchecked(v2)
+		lookup, aliases, _ := buildIndexes(cfg, false)
+		nodeIDs := sortedMapKeys(v2.Nodes)
+		cyc, found := findNextProxyJumpCycleToBreak(cfg, lookup, aliases, nodeIDs)
+		if !found {
+			break
+		}
+		nodeV2 := v2.Nodes[cyc.from]
+		updatedChain, removed := removeJumpHopFromChain(nodeV2.ProxyJump, cyc.hop)
+		if !removed {
+			break
+		}
+		nodeV2.ProxyJump = updatedChain
+		v2.Nodes[cyc.from] = nodeV2
+		broken = append(broken, cyc)
+	}
+	return broken
 }
 
 func repairNodeProxyJump(
@@ -883,7 +923,11 @@ func repairNodeProxyJump(
 	nodeID string,
 	node models.Node,
 ) (string, []DoctorFix) {
+	rawErr := ValidateRawProxyJumpTokens(node.ProxyJump)
 	ps, parseErr := ssh.ParseProxyJump(node.ProxyJump)
+	if parseErr == nil && rawErr != nil {
+		parseErr = rawErr
+	}
 	if parseErr == nil && ps.Kind() != ssh.ProxyJump {
 		return node.ProxyJump, nil
 	}

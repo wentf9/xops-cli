@@ -488,6 +488,9 @@ func parseCLICanonicalLayer(rawCLI []string, cliProxyJump string) (*ssh.Options,
 	cliOpts := &ssh.Options{}
 	cliProxy := ssh.UnsetProxySetting()
 	if cliProxyJump != "" {
+		if err := ValidateRawProxyJumpTokens(cliProxyJump); err != nil {
+			return nil, ssh.UnsetProxySetting(), fmt.Errorf("invalid ProxyJump %q: %w", cliProxyJump, err)
+		}
 		ps, err := ssh.ParseProxyJump(cliProxyJump)
 		if err != nil {
 			return nil, ssh.UnsetProxySetting(), fmt.Errorf("invalid ProxyJump %q: %w", cliProxyJump, err)
@@ -508,6 +511,11 @@ func parseCLICanonicalLayer(rawCLI []string, cliProxyJump string) (*ssh.Options,
 		}
 		canonical := ssh.CanonicalOptionKey(key)
 		if canonical == ssh.OptionProxyJump || canonical == ssh.OptionProxyCommand {
+			if canonical == ssh.OptionProxyJump {
+				if vErr := ValidateRawProxyJumpOption(raw, val); vErr != nil {
+					return nil, ssh.UnsetProxySetting(), vErr
+				}
+			}
 			parsed, pErr := ssh.ParseOption(canonical, val, ssh.OptionSourceCLI)
 			if pErr != nil {
 				return nil, ssh.UnsetProxySetting(), pErr

@@ -167,7 +167,7 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 	}
 
 	parser := a.getOpenSSHParser()
-	_, canonHost := a.resolveSessionOpenSSHMetadata(parser, req.NodeID, snapErr, snapshot, tier1Auth)
+	openSSHAlias, canonHost := a.resolveSessionOpenSSHMetadata(parser, req.NodeID, snapErr, snapshot, tier1Auth)
 	pol := EffectivePolicy{
 		nodeID:          req.NodeID,
 		snapshot:        snapshot,
@@ -195,7 +195,9 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 	pol.proxySetting = effectiveProxy
 
 	if effectiveProxy.Kind() == ssh.ProxyJump {
-		resolvedJump, err := a.resolveEffectiveJumpChain(req.NodeID, req.ResolveProxy, tier1JumpWon, tier1Auth, effectiveProxy, snapshot, pol.hasSnapshot)
+		resolvedJump, err := a.resolveEffectiveJumpChain(
+			req.NodeID, req.ResolveProxy, tier1JumpWon, tier1Auth, effectiveProxy, snapshot, pol.hasSnapshot, openSSHAlias, canonHost,
+		)
 		if err != nil {
 			return pol, err
 		}
@@ -239,8 +241,8 @@ func trimControlAndSpace(s string) string {
 }
 
 func proxySettingFromJumpString(raw string) (ssh.ProxySetting, error) {
-	if hasControlOrLineSepChar(raw) {
-		return ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ssh.ErrSSHOptionsValidation, raw)
+	if err := config.ValidateRawProxyJumpTokens(raw); err != nil {
+		return ssh.UnsetProxySetting(), err
 	}
 	if strings.TrimSpace(raw) == "" {
 		return ssh.UnsetProxySetting(), nil
@@ -270,6 +272,9 @@ func resolveFourTierProxySetting(
 ) (effective ssh.ProxySetting, tier1JumpWon bool, err error) {
 	t1Jump := ssh.UnsetProxySetting()
 	if hasTier1Auth && tier1Auth.ProxyJump != "" {
+		if err = config.ValidateRawProxyJumpTokens(tier1Auth.ProxyJump); err != nil {
+			return ssh.UnsetProxySetting(), false, fmt.Errorf("invalid session ProxyJump %q: %w", tier1Auth.ProxyJump, err)
+		}
 		t1Jump, err = ssh.ParseProxyJump(tier1Auth.ProxyJump)
 		if err != nil {
 			return ssh.UnsetProxySetting(), false, fmt.Errorf("invalid session ProxyJump %q: %w", tier1Auth.ProxyJump, err)
@@ -310,9 +315,13 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	effectiveProxy ssh.ProxySetting,
 	snapshot config.ConnectionSnapshot,
 	hasSnapshot bool,
+	openSSHAlias, canonHost string,
 ) (string, error) {
 	var rawJump string
 	if tier1JumpWon {
+		if err := config.ValidateRawProxyJumpTokens(tier1Auth.ProxyJump); err != nil {
+			return "", fmt.Errorf("invalid session ProxyJump %q: %w", tier1Auth.ProxyJump, err)
+		}
 		rawJump = strings.TrimSpace(tier1Auth.ProxyJump)
 	}
 	if rawJump == "" {
@@ -321,7 +330,15 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 		}
 	}
 	if rawJump == "" {
+		if err := config.ValidateRawProxyJumpTokens(snapshot.Node.ProxyJump); err != nil {
+			return "", fmt.Errorf("invalid node ProxyJump %q: %w", snapshot.Node.ProxyJump, err)
+		}
 		rawJump = strings.TrimSpace(snapshot.Node.ProxyJump)
+	}
+	if rawJump != "" {
+		if err := config.ValidateRawProxyJumpTokens(rawJump); err != nil {
+			return "", fmt.Errorf("invalid ProxyJump %q: %w", rawJump, err)
+		}
 	}
 	if !resolveProxy || rawJump == "" {
 		return rawJump, nil
@@ -338,30 +355,76 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	if err != nil {
 		return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
 	}
-	dest := buildPolicyProxyJumpTarget(nodeID, snapshot, hasSnapshot)
+	dest := buildPolicyProxyJumpTarget(a.getOpenSSHParser(), nodeID, snapshot, hasSnapshot, openSSHAlias, canonHost)
 	if err := config.ValidateProxyJumpChainCycle(a.cfgProvider, dest, resolved, rawJump); err != nil {
 		return "", err
 	}
 	return resolved, nil
 }
 
-func buildPolicyProxyJumpTarget(nodeID string, snapshot config.ConnectionSnapshot, hasSnapshot bool) config.ProxyJumpTarget {
+func resolveOpenSSHPolicyTargetDefaults(parser *config.OpenSSHParser, alias, canon string) (host string, port uint16, user string) {
+	if parser == nil || alias == "" || parser.Err() != nil {
+		return "", 0, ""
+	}
+	if canon != "" && !strings.EqualFold(alias, canon) {
+		_, vhost, vident, err := parser.GetVirtualNodeWithCanonical(alias, canon)
+		if err != nil {
+			return "", 0, ""
+		}
+		return strings.TrimSpace(vhost.Address), vhost.Port, strings.TrimSpace(vident.User)
+	}
+	_, vhost, vident, err := parser.GetVirtualNode(alias)
+	if err != nil {
+		return "", 0, ""
+	}
+	return strings.TrimSpace(vhost.Address), vhost.Port, strings.TrimSpace(vident.User)
+}
+
+func buildPolicyProxyJumpTarget(
+	parser *config.OpenSSHParser,
+	nodeID string,
+	snapshot config.ConnectionSnapshot,
+	hasSnapshot bool,
+	openSSHAlias, canonHost string,
+) config.ProxyJumpTarget {
 	dest := config.ProxyJumpTarget{
-		NodeID:   strings.TrimSpace(nodeID),
-		Selector: strings.TrimSpace(nodeID),
+		NodeID:        strings.TrimSpace(nodeID),
+		Selector:      strings.TrimSpace(nodeID),
+		OpenSSHAlias:  strings.TrimSpace(openSSHAlias),
+		CanonicalHost: strings.TrimSpace(canonHost),
 	}
 	if !hasSnapshot {
+		explicitUser := ""
 		if dest.NodeID != "" {
 			if ref, err := config.ParseTargetRef(dest.NodeID); err == nil && ref.User != "" {
-				dest.User = ref.User
-			} else {
-				dest.User = effectiveSnapshotUser("")
+				explicitUser = ref.User
 			}
+		}
+		if dest.OpenSSHAlias != "" {
+			host, port, user := resolveOpenSSHPolicyTargetDefaults(parser, dest.OpenSSHAlias, dest.CanonicalHost)
+			if host != "" {
+				dest.Host = host
+			}
+			if port > 0 {
+				dest.Port = port
+			}
+			if explicitUser == "" && user != "" {
+				explicitUser = user
+			}
+		}
+		if explicitUser != "" {
+			dest.User = explicitUser
+		} else if dest.NodeID != "" {
+			dest.User = effectiveSnapshotUser("")
 		}
 		return dest
 	}
-	dest.OpenSSHAlias = strings.TrimSpace(snapshot.Node.OpenSSHAlias)
-	dest.CanonicalHost = strings.TrimSpace(snapshot.Node.CanonicalHost)
+	if dest.OpenSSHAlias == "" {
+		dest.OpenSSHAlias = strings.TrimSpace(snapshot.Node.OpenSSHAlias)
+	}
+	if dest.CanonicalHost == "" {
+		dest.CanonicalHost = strings.TrimSpace(snapshot.Node.CanonicalHost)
+	}
 	dest.Host = strings.TrimSpace(snapshot.Host.Address)
 	dest.Port = snapshot.Host.Port
 	dest.User = effectiveSnapshotUser(snapshot.Identity.User)

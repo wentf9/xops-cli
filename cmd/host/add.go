@@ -123,6 +123,9 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	if err := config.ValidateGraph(draft); err != nil {
 		return fmt.Errorf("validate node %q failed: %w", name, err)
 	}
+	if err := config.ValidateSavedNodeJumpCycleWithOpenSSH(draft, repository.GetOpenSSHParser(), name); err != nil {
+		return fmt.Errorf("validate node %q failed: %w", name, err)
+	}
 
 	if !flags.skipVerify {
 		bundle := inventoryVerification{ConnectionSnapshot: config.ConnectionSnapshot{Node: node, Host: hostObj, Identity: identity}, Probe: probe}
@@ -140,6 +143,9 @@ func validateAddPreFlags(cmd *cobra.Command, flags *addFlags, portChanged bool) 
 		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
 	}
 	if cmd.Flags().Changed("jump") || flags.jump != "" {
+		if err := config.ValidateRawProxyJumpTokens(flags.jump); err != nil {
+			return fmt.Errorf("invalid jump host: %w", err)
+		}
 		if _, pErr := ssh.ParseProxyJump(flags.jump); pErr != nil {
 			return fmt.Errorf("invalid jump host: %w", pErr)
 		}

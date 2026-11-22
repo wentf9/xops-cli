@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -250,6 +251,14 @@ func (o *SftpOptions) RunContext(ctx context.Context) error {
 //nolint:gocyclo
 func (o *SftpOptions) runWithProvider(ctx context.Context, cfg *config.Configuration, provider config.ConfigProvider, batch bool) error {
 	connectionOptions := o.SshOptions
+	if err := connectionOptions.ensureGeneralOptionsApplied(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(connectionOptions.Target.Selector) == "" && (strings.TrimSpace(connectionOptions.Host) != "" || len(connectionOptions.args) > 0) {
+		if err := connectionOptions.ensureArgsParsed(); err != nil {
+			return err
+		}
+	}
 	if batch {
 		ctx = credential.WithoutInteraction(ctx)
 		connectionOptions.Remember = "never"

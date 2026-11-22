@@ -5,10 +5,63 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 )
+
+// ValidateRawProxyJumpTokens validates raw comma-separated ProxyJump tokens
+// BEFORE ssh.ParseProxyJump trims whitespace. Any control/line-separator
+// character or any whitespace-padded, malformed, or double-prefixed "openssh:"
+// hop fails closed with ssh.ErrSSHOptionsValidation.
+func ValidateRawProxyJumpTokens(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	if hasControlOrLineSepChar(raw) {
+		return fmt.Errorf("%w: invalid proxy_jump %q: contains control character", ssh.ErrSSHOptionsValidation, raw)
+	}
+	for hop := range strings.SplitSeq(raw, ",") {
+		stripped := strings.TrimFunc(hop, func(r rune) bool {
+			return unicode.IsSpace(r) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
+		})
+		if !hasOpenSSHPrefix(hop) && !hasOpenSSHPrefix(stripped) {
+			continue
+		}
+		if stripped != hop || hasControlOrLineSepChar(hop) || hasAnyWhitespace(hop) {
+			return fmt.Errorf("%w: invalid openssh jump host %q: contains whitespace or control characters", ssh.ErrSSHOptionsValidation, hop)
+		}
+		ref, err := ParseTargetRef(hop)
+		if err != nil {
+			return fmt.Errorf("%w: invalid openssh jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+		}
+		if err := ref.Validate(); err != nil {
+			return fmt.Errorf("%w: invalid openssh jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, err)
+		}
+	}
+	return nil
+}
+
+// ValidateRawProxyJumpOption validates a raw OpenSSH -o ProxyJump directive
+// string before ssh.SplitOptionKeyValue / ssh.ParseProxyJump trims leading or
+// trailing whitespace in Key=Value syntax.
+func ValidateRawProxyJumpOption(opt, val string) error {
+	rawVal := val
+	trimmed := strings.Trim(opt, " \t")
+	eqIdx := strings.IndexByte(trimmed, '=')
+	wsIdx := strings.IndexAny(trimmed, " \t")
+	if eqIdx >= 0 && (wsIdx == -1 || eqIdx < wsIdx) {
+		rawVal = opt[strings.IndexByte(opt, '=')+1:]
+	}
+	if err := ValidateRawProxyJumpTokens(rawVal); err != nil {
+		return err
+	}
+	if rawVal != val {
+		return ValidateRawProxyJumpTokens(val)
+	}
+	return nil
+}
 
 const maxProxyJumpWalkDepth = 64
 
@@ -141,7 +194,92 @@ func validateSavedNodeProxyJumpGraphCycle(
 	return walkJumpChain(cfg, nil, opts, path, targets, destIdent.label, node.ProxyJump, 0)
 }
 
-func findNodeChainFlattenCycleHop(
+// ValidateSavedNodeJumpCycleWithOpenSSH validates the saved node nodeID (and
+// any saved nodes in cfg whose saved ProxyJump graph can reach nodeID) for
+// direct self-loops, duplicate hops, and transitive multi-hop ProxyJump cycles
+// across both Tier-2 saved nodes and Tier-4 OpenSSH stanzas.
+func ValidateSavedNodeJumpCycleWithOpenSSH(cfg *Configuration, openSSH *OpenSSHParser, nodeID string) error {
+	if cfg == nil || cfg.Nodes == nil || strings.TrimSpace(nodeID) == "" {
+		return nil
+	}
+	lookup, aliases, err := buildIndexes(cfg, false)
+	if err != nil {
+		return fmt.Errorf("build configuration indexes for jump cycle validation: %w", err)
+	}
+	affected := collectSavedNodesReachingNode(cfg, lookup, aliases, nodeID)
+	for _, nid := range affected {
+		node, ok := cfg.Nodes.Get(nid)
+		if !ok || strings.TrimSpace(node.ProxyJump) == "" {
+			continue
+		}
+		host, hOK := cfg.Hosts.Get(node.HostRef)
+		ident, iOK := cfg.Identities.Get(node.IdentityRef)
+		if !hOK || !iOK {
+			continue
+		}
+		ps, pErr := parseOptionalNodeProxyJump(node.ProxyJump)
+		if pErr != nil {
+			return pErr
+		}
+		targets, ok := ps.JumpTargets()
+		if !ok {
+			continue
+		}
+		dest := buildProxyJumpTargetFromSavedNode(nid, node.OpenSSHAlias, node.CanonicalHost, nid, host, ident)
+		if err := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, strings.Join(targets, ","), node.ProxyJump); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func collectSavedNodesReachingNode(cfg *Configuration, lookup map[string][]string, aliases map[string]string, targetNodeID string) []string {
+	rev := make(map[string][]string)
+	for _, nid := range cfg.Nodes.Keys() {
+		node, ok := cfg.Nodes.Get(nid)
+		if !ok || strings.TrimSpace(node.ProxyJump) == "" {
+			continue
+		}
+		ps, err := parseOptionalNodeProxyJump(node.ProxyJump)
+		if err != nil {
+			continue
+		}
+		targets, ok := ps.JumpTargets()
+		if !ok {
+			continue
+		}
+		for _, hop := range targets {
+			ref, rErr := ParseTargetRef(hop)
+			if rErr != nil || ref.OpenSSH {
+				continue
+			}
+			for _, dst := range resolveLocalJumpTargets(cfg, lookup, aliases, hop, ref) {
+				if !slices.Contains(rev[dst], nid) {
+					rev[dst] = append(rev[dst], nid)
+				}
+			}
+		}
+	}
+	seen := map[string]struct{}{targetNodeID: {}}
+	queue := []string{targetNodeID}
+	var upstream []string
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, parent := range rev[cur] {
+			if _, ok := seen[parent]; ok {
+				continue
+			}
+			seen[parent] = struct{}{}
+			upstream = append(upstream, parent)
+			queue = append(queue, parent)
+		}
+	}
+	slices.Sort(upstream)
+	return append([]string{targetNodeID}, upstream...)
+}
+
+func findNodeProxyJumpCycleHop(
 	cfg *Configuration,
 	lookup map[string][]string,
 	aliases map[string]string,
@@ -156,7 +294,7 @@ func findNodeChainFlattenCycleHop(
 		return "", nil, false
 	}
 	targets, ok := ps.JumpTargets()
-	if !ok || len(targets) < 2 {
+	if !ok || len(targets) == 0 {
 		return "", nil, false
 	}
 	opts := jumpWalkOptions{
@@ -165,17 +303,25 @@ func findNodeChainFlattenCycleHop(
 		aliases:   aliases,
 	}
 	destIdent := buildSavedJumpNodeIdentity(cfg, nodeID)
+	var basePath []jumpNodeIdentity
+	if destIdent.hasIdentity() {
+		basePath = []jumpNodeIdentity{destIdent}
+	}
 	hopIdents := make([]jumpNodeIdentity, 0, len(targets))
-	for _, hop := range targets {
+	for i, hop := range targets {
 		ident, hErr := buildHopJumpIdentityWithOpts(cfg, nil, opts, hop)
 		if hErr != nil {
 			return "", nil, false
 		}
+		if idx := findMatchingJumpIdentity(basePath, ident); idx >= 0 {
+			cyclePath := append(formatJumpIdentityPath(basePath[idx:]), ident.label)
+			return targets[i], cyclePath, true
+		}
+		if idx := findMatchingJumpIdentity(hopIdents, ident); idx >= 0 {
+			cyclePath := append(formatJumpIdentityPath(basePath), hopIdents[idx].label, ident.label)
+			return targets[i], cyclePath, true
+		}
 		hopIdents = append(hopIdents, ident)
-	}
-	var basePath []jumpNodeIdentity
-	if destIdent.hasIdentity() {
-		basePath = []jumpNodeIdentity{destIdent}
 	}
 	for i := len(hopIdents) - 1; i >= 0; i-- {
 		ident := hopIdents[i]
@@ -201,6 +347,9 @@ func findNodeChainFlattenCycleHop(
 }
 
 func splitValidatedJumpHops(chain string) ([]string, error) {
+	if err := ValidateRawProxyJumpTokens(chain); err != nil {
+		return nil, err
+	}
 	parts := strings.Split(chain, ",")
 	out := make([]string, 0, len(parts))
 	for _, rawHop := range parts {
@@ -427,34 +576,10 @@ func buildOpenSSHJumpIdentity(openSSH *OpenSSHParser, rawID string, dest ProxyJu
 	hostAddr := ref.Host
 	port := normalizedHostPort(ref.Port)
 	if openSSH != nil {
-		if pErr := openSSH.Err(); pErr != nil {
-			return jumpNodeIdentity{}, fmt.Errorf("resolve openssh jump %q: %w", rawID, pErr)
-		}
-		if openSSH.cfg != nil {
-			if openSSH.HasHost(ref.Host) || (dest.OpenSSHAlias != "" && openSSH.HasHost(dest.OpenSSHAlias)) {
-				ident.isDirect = false
-			}
-			var (
-				vnode  models.Node
-				vhost  models.Host
-				vident models.Identity
-				vErr   error
-			)
-			if orig := strings.TrimSpace(dest.OpenSSHAlias); orig != "" && !strings.EqualFold(orig, ref.Host) {
-				vnode, vhost, vident, vErr = openSSH.getVirtualNodeWithCanonical(orig, ref.Host, ref.User, ref.Port, ref.formatNormalizedBody())
-			} else {
-				vnode, vhost, vident, vErr = openSSH.GetVirtualNode(ref.formatNormalizedBody())
-			}
-			if vErr != nil {
-				return jumpNodeIdentity{}, fmt.Errorf("resolve openssh jump %q: %w", rawID, vErr)
-			}
-			hostAddr = StripHostBrackets(vhost.Address)
-			port = normalizedHostPort(vhost.Port)
-			ident.nextRawJump = vnode.ProxyJump
-			if u := strings.TrimSpace(vident.User); u != "" {
-				ident.user = u
-				ident.explicitUser = true
-			}
+		var pErr error
+		hostAddr, port, pErr = populateOpenSSHJumpIdentityFromParser(openSSH, rawID, ref, dest, hostAddr, port, &ident)
+		if pErr != nil {
+			return jumpNodeIdentity{}, pErr
 		}
 	}
 	if strings.TrimSpace(dest.Host) != "" {
@@ -472,6 +597,69 @@ func buildOpenSSHJumpIdentity(openSSH *OpenSSHParser, rawID string, dest ProxyJu
 		ident.hasEndpoint = true
 	}
 	return ident, nil
+}
+
+func populateOpenSSHJumpIdentityFromParser(
+	openSSH *OpenSSHParser,
+	rawID string,
+	ref TargetRef,
+	dest ProxyJumpTarget,
+	hostAddr string,
+	port uint16,
+	ident *jumpNodeIdentity,
+) (string, uint16, error) {
+	if pErr := openSSH.Err(); pErr != nil {
+		return "", 0, fmt.Errorf("resolve openssh jump %q: %w", rawID, pErr)
+	}
+	if openSSH.cfg == nil {
+		return hostAddr, port, nil
+	}
+	var (
+		vnode  models.Node
+		vhost  models.Host
+		vident models.Identity
+		vErr   error
+	)
+	if orig := strings.TrimSpace(dest.OpenSSHAlias); orig != "" && !strings.EqualFold(orig, ref.Host) {
+		vnode, vhost, vident, vErr = openSSH.getVirtualNodeWithCanonical(orig, ref.Host, ref.User, ref.Port, ref.formatNormalizedBody())
+	} else {
+		vnode, vhost, vident, vErr = openSSH.GetVirtualNode(ref.formatNormalizedBody())
+	}
+	if vErr != nil {
+		return "", 0, fmt.Errorf("resolve openssh jump %q: %w", rawID, vErr)
+	}
+	hostAddr = StripHostBrackets(vhost.Address)
+	port = normalizedHostPort(vhost.Port)
+	concrete, cErr := isOpenSSHJumpConcrete(openSSH, ref, dest, hostAddr)
+	if cErr != nil {
+		return "", 0, fmt.Errorf("resolve openssh jump %q: %w", rawID, cErr)
+	}
+	if concrete {
+		ident.isDirect = false
+	}
+	ident.nextRawJump = vnode.ProxyJump
+	if u := strings.TrimSpace(vident.User); u != "" {
+		ident.user = u
+		ident.explicitUser = true
+	}
+	return hostAddr, port, nil
+}
+
+func isOpenSSHJumpConcrete(openSSH *OpenSSHParser, ref TargetRef, dest ProxyJumpTarget, hostAddr string) (bool, error) {
+	if openSSH.HasHost(ref.Host) || (dest.OpenSSHAlias != "" && openSSH.HasHost(dest.OpenSSHAlias)) {
+		return true, nil
+	}
+	if hostAddr == "" {
+		return false, nil
+	}
+	if !strings.EqualFold(hostAddr, StripHostBrackets(ref.Host)) {
+		return true, nil
+	}
+	_, explicit, hErr := openSSH.ResolveExplicitHostName(ref.Host)
+	if hErr != nil {
+		return false, hErr
+	}
+	return explicit, nil
 }
 
 func buildDirectDestJumpIdentity(nodeID, selector string, dest ProxyJumpTarget) jumpNodeIdentity {
@@ -601,11 +789,11 @@ func sameCanonicalJumpID(a, b jumpNodeIdentity) bool {
 }
 
 func sameDirectOrEndpointJumpIdentity(a, b jumpNodeIdentity) bool {
-	if !a.isDirect && !b.isDirect {
-		return false
-	}
-	if directJumpMatchesAlias(a, b) || directJumpMatchesAlias(b, a) {
+	if (a.isDirect || b.isDirect) && (directJumpMatchesAlias(a, b) || directJumpMatchesAlias(b, a)) {
 		return true
+	}
+	if !a.isDirect && !b.isDirect && a.isOpenSSH && b.isOpenSSH {
+		return false
 	}
 	return a.hasEndpoint && b.hasEndpoint && a.endpoint.Equal(b.endpoint) && jumpUsersCompatible(a, b)
 }
@@ -632,6 +820,9 @@ func sameOpenSSHAliasJumpIdentity(a, b jumpNodeIdentity) bool {
 
 func directJumpMatchesAlias(target, direct jumpNodeIdentity) bool {
 	if !direct.isDirect || !direct.hasOpenSSHRef || direct.isSavedNode {
+		return false
+	}
+	if direct.isOpenSSH && target.isSavedNode {
 		return false
 	}
 	if direct.openSSHRef.HasPort && normalizedHostPort(direct.openSSHRef.Port) != target.effectivePort() {
