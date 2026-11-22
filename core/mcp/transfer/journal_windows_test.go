@@ -237,3 +237,35 @@ func testWindowsJournalRejectsTamperedFileACLs(t *testing.T, currSID, everyoneSI
 		t.Fatalf("OpenJournal(tampered service.lock ACL) = %v, want private regular file / ErrInsecureControlDir", openErr)
 	}
 }
+
+func TestP7W15a_AB15L1_ReplaceJournalFileLongPath(t *testing.T) {
+	dir := t.TempDir()
+	for len(dir) < 260 {
+		dir = filepath.Join(dir, "long-state-segment-0123456789")
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q): %v", filepath.Dir(dir), err)
+	}
+
+	j, err := OpenJournal(dir)
+	if err != nil {
+		t.Fatalf("OpenJournal(long path len=%d): %v", len(dir), err)
+	}
+	defer func() { _ = j.Close() }()
+
+	rec := sampleRecord(t)
+	if err := j.Save(rec); err != nil {
+		t.Fatalf("first Save(long path len=%d): %v", len(dir), err)
+	}
+	rec.State = Transferring
+	if err := j.Save(rec); err != nil {
+		t.Fatalf("replacement Save(long path len=%d): %v", len(dir), err)
+	}
+	loaded, err := j.Load(10)
+	if err != nil {
+		t.Fatalf("Load(long path len=%d): %v", len(dir), err)
+	}
+	if len(loaded) != 1 || loaded[0].ID != rec.ID || loaded[0].State != Transferring {
+		t.Fatalf("Load(long path) = %+v, want single Transferring record %q", loaded, rec.ID)
+	}
+}

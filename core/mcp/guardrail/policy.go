@@ -156,6 +156,12 @@ func matchesUnder(target, prefix string) bool {
 	if target == "" || prefix == "" {
 		return false
 	}
+	// POSIX-first check: never let Win32 UNC/device/drive reclassification hide
+	// a literal POSIX ProtectedPaths match (e.g. "/opt/custom-protected/\../drop"
+	// or a POSIX prefix configured as "/\protected").
+	if matchesCleanPath(path.Clean(target), path.Clean(prefix)) {
+		return true
+	}
 	if matchesUnderNormalized(target, prefix) {
 		return true
 	}
@@ -164,15 +170,16 @@ func matchesUnder(target, prefix string) bool {
 	// first and OR-ing with slash-converted clean is strictly more protective:
 	// POSIX `/opt/custom-protected/\../drop` matches via POSIX-clean while
 	// Windows backslash separators match via slash-clean. Win32 device/UNC
-	// paths already handle separator canonicalization natively and must not
+	// paths (including those revealed after collapsing leading POSIX ".." or
+	// "//") already handle separator canonicalization natively and must not
 	// be reinterpreted as POSIX paths.
 	if strings.Contains(target, "\\") || strings.Contains(prefix, "\\") {
 		altTarget := target
-		if !isWin32DeviceOrUNCPath(target) {
+		if !isWin32DeviceOrUNCPath(win32CollapseCandidate(target)) {
 			altTarget = strings.ReplaceAll(target, "\\", "/")
 		}
 		altPrefix := prefix
-		if !isWin32DeviceOrUNCPath(prefix) {
+		if !isWin32DeviceOrUNCPath(win32CollapseCandidate(prefix)) {
 			altPrefix = strings.ReplaceAll(prefix, "\\", "/")
 		}
 		if (altTarget != target || altPrefix != prefix) && matchesUnderNormalized(altTarget, altPrefix) {
@@ -211,14 +218,17 @@ func matchesDeviceNamespace(target, prefix string) (matched bool, handled bool) 
 }
 
 func matchesUnderNormalized(target, prefix string) bool {
-	tUNC, tIsUNC := canonicalUNCPath(target)
-	pUNC, pIsUNC := canonicalUNCPath(prefix)
+	winTarget := win32CollapseCandidate(target)
+	winPrefix := win32CollapseCandidate(prefix)
+
+	tUNC, tIsUNC := canonicalUNCPath(winTarget)
+	pUNC, pIsUNC := canonicalUNCPath(winPrefix)
 	if tIsUNC && pIsUNC && matchesUNCPath(tUNC, pUNC) {
 		return true
 	}
 
-	tDrive, tRest, _, tIsDrive := canonicalDrivePath(target)
-	pDrive, pRest, _, pIsDrive := canonicalDrivePath(prefix)
+	tDrive, tRest, _, tIsDrive := canonicalDrivePath(winTarget)
+	pDrive, pRest, _, pIsDrive := canonicalDrivePath(winPrefix)
 	if tIsDrive && pIsDrive {
 		return tDrive == pDrive && matchesCleanPath(strings.ToLower(tRest), strings.ToLower(pRest))
 	}
@@ -228,7 +238,7 @@ func matchesUnderNormalized(target, prefix string) bool {
 	if pIsDrive || pIsUNC {
 		return false
 	}
-	if matched, handled := matchesDeviceNamespace(target, prefix); handled {
+	if matched, handled := matchesDeviceNamespace(winTarget, winPrefix); handled {
 		return matched
 	}
 	return matchesCleanPath(path.Clean(target), path.Clean(prefix))

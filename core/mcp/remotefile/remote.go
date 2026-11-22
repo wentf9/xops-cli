@@ -506,12 +506,42 @@ func stripWin32DevicePrefix(p string) (rest string, isUNC bool, ok bool) {
 	return after, false, true
 }
 
+func isWin32PlainUNC(p string) bool {
+	if len(p) < 2 || !isWin32Sep(p[0]) || !isWin32Sep(p[1]) || (p[0] != '\\' && p[1] != '\\') {
+		return false
+	}
+	_, _, isDevice := stripWin32DevicePrefix(p)
+	return !isDevice
+}
+
 func isWin32DeviceOrUNCPath(p string) bool {
-	if strings.HasPrefix(p, `\`) {
+	if strings.HasPrefix(p, `\`) || isWin32PlainUNC(p) {
 		return true
 	}
 	_, _, ok := stripWin32DevicePrefix(p)
 	return ok
+}
+
+func isWin32DeviceOrUNCRoot(p string) bool {
+	if rest, isUNC, ok := stripWin32DevicePrefix(p); ok {
+		if isUNC {
+			return isWin32UNCRoot(rest)
+		}
+		if _, driveRest, _, matched := extractDrivePath(rest); matched {
+			if canonRest, _ := canonicalizeDriveRest(driveRest); canonRest == "/" {
+				return true
+			}
+		}
+		return false
+	}
+	if isWin32PlainUNC(p) {
+		if _, driveRest, matched := parseBareDriveSegment(p[2:]); matched {
+			canonRest, _ := canonicalizeDriveRest(driveRest)
+			return canonRest == "/"
+		}
+		return isWin32UNCRoot(p[2:])
+	}
+	return false
 }
 
 func isWin32UNCRoot(body string) bool {
@@ -578,10 +608,21 @@ func extractDrivePath(p string) (drive string, rawRest string, mixed bool, ok bo
 	if d, rest, matched := extractDrivePathSlash(p); matched {
 		return d, rest, false, true
 	}
-	if strings.HasPrefix(p, "/") && strings.Contains(p, `\`) && !isWin32DeviceOrUNCPath(p) {
-		slash := strings.ReplaceAll(p, `\`, "/")
-		if d, rest, matched := extractDrivePathSlash(slash); matched {
-			return d, rest, true, true
+	if strings.HasPrefix(p, "/") && strings.Contains(p, `\`) {
+		cleaned := path.Clean(p)
+		if !isWin32DeviceOrUNCPath(p) && !isWin32DeviceOrUNCPath(cleaned) {
+			slash := strings.ReplaceAll(p, `\`, "/")
+			if d, rest, matched := extractDrivePathSlash(slash); matched {
+				return d, rest, true, true
+			}
+		} else if isWin32PlainUNC(p) {
+			if d, rest, matched := parseBareDriveSegment(p[2:]); matched {
+				return d, rest, true, true
+			}
+		} else if isWin32PlainUNC(cleaned) {
+			if d, rest, matched := parseBareDriveSegment(cleaned[2:]); matched {
+				return d, rest, true, true
+			}
 		}
 	}
 	return "", "", false, false
@@ -642,6 +683,11 @@ func ValidateWindowsDrivePath(p string) error {
 	if isWin32DeviceOrUNCPath(p) {
 		return fmt.Errorf("%w: Win32 device, extended, or UNC path %q is not permitted", sftp.ErrInvalidRemotePath, p)
 	}
+	if strings.HasPrefix(p, "/") {
+		if cleaned := path.Clean(p); isWin32DeviceOrUNCPath(cleaned) {
+			return fmt.Errorf("%w: Win32 device, extended, or UNC path %q is not permitted", sftp.ErrInvalidRemotePath, p)
+		}
+	}
 	_, rest, mixed, ok := extractDrivePath(p)
 	if !ok {
 		return nil
@@ -696,7 +742,7 @@ func NormalizeSFTPPath(p string) string {
 			return norm
 		}
 	}
-	if strings.HasPrefix(p, "/") && !isWin32DeviceOrUNCPath(p) {
+	if strings.HasPrefix(p, "/") {
 		if d, rest, _, ok := extractDrivePath(p); ok {
 			return formatNormalizedDrivePath(d, rest)
 		}
@@ -708,7 +754,8 @@ func NormalizeSFTPPath(p string) string {
 // (including collapsed/mixed-backslash drive roots and paths collapsing to the
 // drive root after Win32 trailing '.' / ' ' or NTFS ADS stripping, such as
 // "C:\ ", "/C:/...", "C:\::$DATA", "/tmp/..\C:\ ", "/\C:\"), or a Win32
-// extended/device drive root or UNC share root.
+// extended/device drive root or UNC share root (including mixed-separator and
+// pre-prefix collapsed forms).
 func IsRootPath(cleaned string) bool {
 	norm := NormalizeSFTPPath(cleaned)
 	if norm == "/" {
@@ -722,18 +769,13 @@ func IsRootPath(cleaned string) bool {
 			return true
 		}
 	}
-	if rest, isUNC, ok := stripWin32DevicePrefix(cleaned); ok {
-		if isUNC {
-			return isWin32UNCRoot(rest)
-		}
-		if _, driveRest, _, matched := extractDrivePath(rest); matched {
-			if canonRest, _ := canonicalizeDriveRest(driveRest); canonRest == "/" {
-				return true
-			}
-		}
-	}
-	if strings.HasPrefix(cleaned, `\\`) && isWin32UNCRoot(cleaned[2:]) {
+	if isWin32DeviceOrUNCRoot(cleaned) {
 		return true
+	}
+	if strings.HasPrefix(cleaned, "/") {
+		if posixCleaned := path.Clean(cleaned); posixCleaned != cleaned && isWin32DeviceOrUNCRoot(posixCleaned) {
+			return true
+		}
 	}
 	return false
 }

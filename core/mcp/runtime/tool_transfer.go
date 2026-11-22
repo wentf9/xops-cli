@@ -65,7 +65,11 @@ func riskLocalPath(raw string) string {
 	if hasControlOrLineSep(raw) || isUnsupportedWindowsLocalPath(raw) || !filepath.IsAbs(raw) || remotefile.ValidateWindowsDrivePath(raw) != nil {
 		return raw
 	}
-	return filepath.Clean(raw)
+	cleaned := filepath.Clean(raw)
+	if isUnsupportedWindowsLocalPath(cleaned) || remotefile.ValidateWindowsDrivePath(cleaned) != nil {
+		return raw
+	}
+	return cleaned
 }
 
 func riskRemotePath(raw string) string {
@@ -76,7 +80,7 @@ func riskRemotePath(raw string) string {
 		return raw
 	}
 	norm := remotefile.NormalizeSFTPPath(raw)
-	if !strings.HasPrefix(norm, "/") {
+	if !strings.HasPrefix(norm, "/") || remotefile.ValidateWindowsDrivePath(norm) != nil {
 		return raw
 	}
 	return norm

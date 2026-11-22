@@ -255,7 +255,7 @@ func stripWin32DevicePrefix(p string) (rest string, isUNC bool, ok bool) {
 }
 
 func isWin32PlainUNC(p string) bool {
-	if len(p) < 2 || p[0] != '\\' || p[1] != '\\' {
+	if len(p) < 2 || !isWin32Sep(p[0]) || !isWin32Sep(p[1]) || (p[0] != '\\' && p[1] != '\\') {
 		return false
 	}
 	_, _, isDevice := stripWin32DevicePrefix(p)
@@ -268,6 +268,23 @@ func isWin32DeviceOrUNCPath(p string) bool {
 	}
 	_, _, ok := stripWin32DevicePrefix(p)
 	return ok
+}
+
+// win32CollapseCandidate returns path.Clean(p) when a POSIX-rooted path
+// collapses leading ".." or "//" onto a Win32 device or UNC prefix (e.g.
+// "/tmp/../\\?\\C:\\..." or "//\\localhost\\C$\\..."). Paths that already carry
+// a Win32 device/UNC prefix (such as "//?/C:/...") are returned unchanged so
+// path.Clean does not strip their leading "//".
+func win32CollapseCandidate(p string) string {
+	if isWin32DeviceOrUNCPath(p) {
+		return p
+	}
+	if strings.HasPrefix(p, "/") {
+		if cleaned := path.Clean(p); isWin32DeviceOrUNCPath(cleaned) {
+			return cleaned
+		}
+	}
+	return p
 }
 
 type win32UNCPath struct {
@@ -316,6 +333,9 @@ func canonicalUNCPath(p string) (win32UNCPath, bool) {
 		return parseWin32UNCBody(rest)
 	}
 	if isWin32PlainUNC(p) {
+		if _, _, isDrive := parseBareDriveSegment(p[2:]); isDrive {
+			return win32UNCPath{}, false
+		}
 		return parseWin32UNCBody(p[2:])
 	}
 	return win32UNCPath{}, false
@@ -496,6 +516,10 @@ func canonicalDrivePath(p string) (drive string, cleanRest string, ambiguous boo
 				return d, cr, true, true
 			}
 		}
+		if d, rawRest, matched := parseBareDriveSegment(p[2:]); matched {
+			cr, _ := canonicalizeDriveRest(rawRest)
+			return d, cr, true, true
+		}
 		return "", "", false, false
 	}
 	d, rest, matched := extractDrivePath(p)
@@ -576,6 +600,9 @@ func analyzeCleanDriveRest(cleanRest string, ambiguous bool) RiskLevel {
 
 func analyzeCleanedPosix(cleaned string) RiskLevel {
 	if cleaned == "" || cleaned == "/" || cleaned == "." || !strings.HasPrefix(cleaned, "/") {
+		return Dangerous
+	}
+	if isWin32DeviceOrUNCPath(cleaned) {
 		return Dangerous
 	}
 	if _, cleanRest, ambiguous, ok := canonicalDrivePath(cleaned); ok {

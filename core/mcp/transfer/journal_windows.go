@@ -205,6 +205,10 @@ func checkJournalFilePrivacy(file *os.File, _ os.FileMode) error {
 	return nil
 }
 
+func fixLongPathWindows(p string) string {
+	return normalizeWindowsLongPath(p, filepath.IsAbs, os.Getwd, windows.FullPath)
+}
+
 func replaceJournalFile(root *os.Root, source, destination string) error {
 	if err := validateJournalEntryName(source); err != nil {
 		return err
@@ -215,11 +219,11 @@ func replaceJournalFile(root *os.Root, source, destination string) error {
 	if err := verifyRootPathMatchesHandle(root); err != nil {
 		return err
 	}
-	from, err := windows.UTF16PtrFromString(filepath.Join(root.Name(), source))
+	from, err := windows.UTF16PtrFromString(fixLongPathWindows(filepath.Join(root.Name(), source)))
 	if err != nil {
 		return fmt.Errorf("encode temporary transfer metadata path: %w", err)
 	}
-	to, err := windows.UTF16PtrFromString(filepath.Join(root.Name(), destination))
+	to, err := windows.UTF16PtrFromString(fixLongPathWindows(filepath.Join(root.Name(), destination)))
 	if err != nil {
 		return fmt.Errorf("encode transfer metadata path: %w", err)
 	}

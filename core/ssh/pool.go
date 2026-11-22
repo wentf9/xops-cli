@@ -454,11 +454,21 @@ func (p *connPool) releaseClosing(c *PooledClient) {
 	p.mu.Unlock()
 }
 
+func closeBatchDescendantsSkipping(children []*PooledClient, skipClient *PooledClient, skipHop *proxyChanConn) {
+	for _, child := range children {
+		if child == nil || (skipClient != nil && child == skipClient) || (skipHop != nil && child.hopConn == skipHop) {
+			continue
+		}
+		_ = child.closeSelf()
+	}
+}
+
 // detachAndAbortRoot atomically detaches the outermost root hop (and any active
-// in-memory descendants) into p.closing, aborts the physical rootConn FIRST so
-// a write-wedged or blackholed upstream unblocks immediately, closes the root
-// and remaining descendants (skipping skipClient / skipHop to avoid re-entering
-// an already-closing child), and releases all closing entries.
+// in-memory descendants, while also collecting matching retired descendants)
+// into p.closing, aborts the physical rootConn FIRST so a write-wedged or
+// blackholed upstream unblocks immediately, closes the root and remaining
+// active and retired descendants (skipping skipClient / skipHop to avoid
+// re-entering an already-closing child), and releases all closing entries.
 func (p *connPool) detachAndAbortRoot(root *PooledClient, rootConn net.Conn, skipClient *PooledClient, skipHop *proxyChanConn) error {
 	if root != nil {
 		for root.parent != nil {
@@ -485,12 +495,8 @@ func (p *connPool) detachAndAbortRoot(root *PooledClient, rootConn net.Conn, ski
 	}
 	if batch != nil {
 		defer batch.release()
-		for _, child := range batch.descendants {
-			if child == nil || (skipClient != nil && child == skipClient) || (skipHop != nil && child.hopConn == skipHop) {
-				continue
-			}
-			_ = child.closeSelf()
-		}
+		closeBatchDescendantsSkipping(batch.descendants, skipClient, skipHop)
+		closeBatchDescendantsSkipping(batch.retiredDescendants, skipClient, skipHop)
 	}
 	return errors.Join(errs...)
 }
