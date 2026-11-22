@@ -116,7 +116,7 @@ func isTargetMissingError(err error) bool {
 }
 
 func (a *SSHAdapter) resolveConnectionSnapshotResolved(nodeID string) (config.ConnectionSnapshot, string, SessionAuth, bool, error) {
-	tier1Auth, hasTier1Auth := a.getSessionOverrideForResolved(nodeID, "", nil)
+	tier1Auth, hasTier1Auth := a.getSessionOverride(nodeID)
 	if hasTier1Auth {
 		if err := validateSessionAuthOpenSSHSelectors(tier1Auth); err != nil {
 			return config.ConnectionSnapshot{}, nodeID, SessionAuth{}, false, err

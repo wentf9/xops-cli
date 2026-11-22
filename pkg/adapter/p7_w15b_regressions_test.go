@@ -483,6 +483,113 @@ func assertW15bM2SavedAliasOverrideLookup(t *testing.T, prov config.ConfigProvid
 	}
 }
 
+func newW15bM2LegacyAliasRepo(t *testing.T) *config.Repository {
+	t.Helper()
+	baseCfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	baseCfg.Hosts.Set("h-1", models.Host{Address: "10.235.0.10", Port: 2200})
+	baseCfg.Identities.Set("id-1", models.Identity{User: "ops", AuthType: "password", Password: "initial-pw"})
+	baseCfg.Nodes.Set("node-1", models.Node{HostRef: "h-1", IdentityRef: "id-1", Alias: []string{"web-alias"}})
+	repo, err := config.NewRepositoryWithoutOpenSSH(baseCfg, adapterTestStore{})
+	if err != nil {
+		t.Fatalf("NewRepositoryWithoutOpenSSH: %v", err)
+	}
+	return repo
+}
+
+func assertW15bM2AliasCallbackGuards(t *testing.T) {
+	t.Helper()
+	repo := newW15bM2LegacyAliasRepo(t)
+
+	// 1. Session-only Remember:false registered on "web-alias" must prevent UpdateAuth/UpdateSudo
+	//    when Connector calls back using canonical ClientConfig.NodeID ("node-1").
+	adpNoRemember := NewSSHAdapter(repo, WithSessionAuthOverride("web-alias", SessionAuth{
+		Password: "session-only-pw",
+		Remember: false,
+	}))
+	cfgNoRem, err := adpNoRemember.GetConfig("web-alias")
+	if err != nil || cfgNoRem.NodeID != "node-1" {
+		t.Fatalf("GetConfig(web-alias) = (%+v, %v), want NodeID=node-1", cfgNoRem, err)
+	}
+	if tok, err := adpNoRemember.UpdateAuth(t.Context(), cfgNoRem.NodeID, cfgNoRem.AuthUpdateToken, "leaked-pw", "", ""); err != nil || tok != cfgNoRem.AuthUpdateToken {
+		t.Fatalf("UpdateAuth(node-1 with Remember:false on web-alias) = (%q, %v), want unchanged token", tok, err)
+	}
+	if tok, err := adpNoRemember.UpdateSudo(t.Context(), cfgNoRem.NodeID, cfgNoRem.SudoUpdateToken, ssh.SudoModeSu, "leaked-su"); err != nil || tok != cfgNoRem.SudoUpdateToken {
+		t.Fatalf("UpdateSudo(node-1 with Remember:false on web-alias) = (%q, %v), want unchanged token", tok, err)
+	}
+	snap, err := repo.ResolveConnection("node-1")
+	if err != nil || snap.Identity.Password != "initial-pw" || snap.Node.SuPwd != "" {
+		t.Fatalf("session-only alias override persisted secrets onto node-1: ident=%+v node=%+v err=%v", snap.Identity, snap.Node, err)
+	}
+
+	// 2. Alias-keyed BatchMode=yes must still deny interactiveDecisionForNode("node-1")
+	//    even when a globalSessionControl override (e.g. ConnectTimeout=5) is also set.
+	batchOpts, err := ParseSessionOptions([]string{"BatchMode=yes"}, "")
+	if err != nil {
+		t.Fatalf("ParseSessionOptions(BatchMode=yes): %v", err)
+	}
+	globalOpts, err := ParseSessionOptions([]string{"ConnectTimeout=5"}, "")
+	if err != nil {
+		t.Fatalf("ParseSessionOptions(ConnectTimeout=5): %v", err)
+	}
+	adpBatch := NewSSHAdapter(repo,
+		WithSessionControlOverride("web-alias", batchOpts),
+		WithGlobalSessionControl(globalOpts),
+		WithSessionAuthOverride("web-alias", SessionAuth{Remember: true}),
+	)
+	if !adpBatch.interactiveDecisionForNode("node-1").Denied() {
+		t.Fatal("interactiveDecisionForNode(node-1) bypassed BatchMode=yes registered on web-alias under globalSessionControl")
+	}
+	if tok, err := adpBatch.UpdateAuth(t.Context(), "node-1", cfgNoRem.AuthUpdateToken, "batch-leaked-pw", "", ""); err != nil || tok != cfgNoRem.AuthUpdateToken {
+		t.Fatalf("UpdateAuth(node-1 under BatchMode=yes on web-alias) = (%q, %v), want unchanged token", tok, err)
+	}
+}
+
+func assertW15bM2DirectAliasWritebackAndDisableMux(t *testing.T) {
+	t.Helper()
+	repo := newW15bM2LegacyAliasRepo(t)
+
+	// 1. Direct UpdateAuth("web-alias", ...) & UpdateSudo("web-alias", ...) on legacy provider
+	//    must persist against canonical "node-1".
+	adpWrite := NewSSHAdapter(repo, WithSessionAuthOverride("web-alias", SessionAuth{Remember: true}))
+	cfgWrite, err := adpWrite.GetConfig("web-alias")
+	if err != nil {
+		t.Fatalf("GetConfig(web-alias): %v", err)
+	}
+	nextAuthTok, err := adpWrite.UpdateAuth(t.Context(), "web-alias", cfgWrite.AuthUpdateToken, "updated-pw", "", "")
+	if err != nil || nextAuthTok == cfgWrite.AuthUpdateToken {
+		t.Fatalf("UpdateAuth(web-alias) = (%q, %v), want updated version token", nextAuthTok, err)
+	}
+	nextSudoTok, err := adpWrite.UpdateSudo(t.Context(), "web-alias", cfgWrite.SudoUpdateToken, ssh.SudoModeSu, "updated-su")
+	if err != nil || nextSudoTok == cfgWrite.SudoUpdateToken {
+		t.Fatalf("UpdateSudo(web-alias) = (%q, %v), want updated version token", nextSudoTok, err)
+	}
+	snap, err := repo.ResolveConnection("node-1")
+	if err != nil || snap.Identity.Password != "updated-pw" || snap.Node.SuPwd != "updated-su" || snap.Node.SudoMode != models.SudoModeSu {
+		t.Fatalf("direct alias writeback failed to update node-1: ident=%+v node=%+v err=%v", snap.Identity, snap.Node, err)
+	}
+
+	// 2. DisableSessionControlSharing("node-1") must disable an alias-keyed mux override on
+	//    "web-alias" (and preserve non-mux options like ConnectTimeout=9).
+	muxOpts, err := ParseSessionOptions([]string{"ControlMaster=yes", "ControlPath=/tmp/cm-%C", "ConnectTimeout=9"}, "")
+	if err != nil {
+		t.Fatalf("ParseSessionOptions(mux): %v", err)
+	}
+	adpMux := NewSSHAdapter(repo, WithSessionControlOverride("web-alias", muxOpts))
+	adpMux.DisableSessionControlSharing("node-1")
+	for _, id := range []string{"node-1", "web-alias"} {
+		pol, err := adpMux.Resolve(t.Context(), ResolveRequest{NodeID: id})
+		if err != nil {
+			t.Fatalf("Resolve(%q) after DisableSessionControlSharing: %v", id, err)
+		}
+		if ctrl := pol.Control(); ctrl == nil || ctrl.Path != "none" || ctrl.Master != ssh.ControlMasterNo {
+			t.Fatalf("Resolve(%q).Control() = %+v, want disabled none", id, ctrl)
+		}
+		if opts := pol.Options(); opts == nil || opts.Get(ssh.OptionConnectTimeout) != "9" {
+			t.Fatalf("Resolve(%q) dropped ConnectTimeout=9 after DisableSessionControlSharing: %v", id, opts)
+		}
+	}
+}
+
 func TestP7W15b_L3_15_M2_NoSnapshotTargetContextAndSavedAliasResolution(t *testing.T) {
 	t.Parallel()
 
@@ -500,6 +607,14 @@ func TestP7W15b_L3_15_M2_NoSnapshotTargetContextAndSavedAliasResolution(t *testi
 	t.Run("saved_node_alias_honors_overrides_keyed_by_alias_or_canonical_node_id", func(t *testing.T) {
 		t.Parallel()
 		assertW15bM2SavedAliasOverrideLookup(t, prov)
+	})
+	t.Run("saved_node_alias_callback_guards_for_writeback_and_batchmode", func(t *testing.T) {
+		t.Parallel()
+		assertW15bM2AliasCallbackGuards(t)
+	})
+	t.Run("saved_node_alias_direct_writeback_and_disable_control_sharing", func(t *testing.T) {
+		t.Parallel()
+		assertW15bM2DirectAliasWritebackAndDisableMux(t)
 	})
 }
 

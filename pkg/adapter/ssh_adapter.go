@@ -382,6 +382,33 @@ func WithGlobalSessionControl(opts SessionControlOptions) Option {
 	}
 }
 
+func (a *SSHAdapter) disablePeerSessionControlOverrides(nodeID string, disable func(SessionControlOptions) SessionControlOptions) bool {
+	disabled := false
+	if existing, ok := a.sessionControlOverrides[nodeID]; ok {
+		a.sessionControlOverrides[nodeID] = disable(existing)
+		disabled = true
+	}
+	resolvedNodeID, aliases := a.resolveNodeIDAndAliases(nodeID)
+	if resolvedNodeID != "" && resolvedNodeID != nodeID {
+		if existing, ok := a.sessionControlOverrides[resolvedNodeID]; ok {
+			a.sessionControlOverrides[resolvedNodeID] = disable(existing)
+			disabled = true
+		}
+	}
+	if resolvedNodeID != "" && a.cfgProvider != nil {
+		for _, al := range aliases {
+			if al == nodeID || al == resolvedNodeID {
+				continue
+			}
+			if existing, ok := a.sessionControlOverrides[al]; ok && a.cfgProvider.FindAlias(al) == resolvedNodeID {
+				a.sessionControlOverrides[al] = disable(existing)
+				disabled = true
+			}
+		}
+	}
+	return disabled
+}
+
 // DisableSessionControlSharing forces ControlPath=none for the session (both
 // globally and on nodeID) while preserving any non-multiplexing session SSH
 // options already registered for nodeID or globally.
@@ -410,7 +437,9 @@ func (a *SSHAdapter) DisableSessionControlSharing(nodeID string) {
 	if a.sessionControlOverrides == nil {
 		a.sessionControlOverrides = make(map[string]SessionControlOptions)
 	}
-	a.sessionControlOverrides[nodeID] = disable(a.sessionControlOverrides[nodeID])
+	if !a.disablePeerSessionControlOverrides(nodeID, disable) {
+		a.sessionControlOverrides[nodeID] = disable(SessionControlOptions{})
+	}
 }
 
 // WithOpenSSHParser injects an explicit OpenSSHParser for Tier 4 resolution (e.g. in tests).
@@ -685,39 +714,59 @@ func NewNonInteractiveConnector(cfgProvider config.ConfigProvider, opts ...ssh.O
 	return newConnector(adp, opts...)
 }
 
-func (a *SSHAdapter) resolveAliasTarget(nodeID string) string {
+func (a *SSHAdapter) resolveNodeIDAndAliases(nodeID string) (string, []string) {
 	if a == nil || a.cfgProvider == nil || nodeID == "" || config.IsOpenSSHNodeID(nodeID) {
-		return ""
+		return nodeID, nil
 	}
-	if _, ok := a.cfgProvider.GetNode(nodeID); ok {
-		return ""
+	if node, ok := a.cfgProvider.GetNode(nodeID); ok {
+		return nodeID, node.Alias
 	}
 	if target := a.cfgProvider.FindAlias(strings.TrimSpace(nodeID)); target != "" && target != nodeID {
-		return target
+		if node, ok := a.cfgProvider.GetNode(target); ok {
+			return target, node.Alias
+		}
+		return target, nil
 	}
-	return ""
+	return nodeID, nil
+}
+
+func lookupAdapterOverrideByAlias[T any](
+	overrides map[string]T,
+	provider config.ConfigProvider,
+	reqNodeID, resolvedNodeID string,
+	aliases []string,
+) (T, bool) {
+	var zero T
+	if overrides == nil {
+		return zero, false
+	}
+	if v, ok := overrides[reqNodeID]; ok {
+		return v, true
+	}
+	if resolvedNodeID != "" && resolvedNodeID != reqNodeID {
+		if v, ok := overrides[resolvedNodeID]; ok {
+			return v, true
+		}
+	}
+	if resolvedNodeID != "" && provider != nil {
+		for _, al := range aliases {
+			if al == reqNodeID || al == resolvedNodeID {
+				continue
+			}
+			if v, ok := overrides[al]; ok && provider.FindAlias(al) == resolvedNodeID {
+				return v, true
+			}
+		}
+	}
+	return zero, false
 }
 
 func (a *SSHAdapter) getSessionOverrideForResolved(reqNodeID, resolvedNodeID string, aliases []string) (SessionAuth, bool) {
 	if a == nil {
 		return SessionAuth{}, false
 	}
-	if a.sessionOverrides != nil {
-		if override, ok := a.sessionOverrides[reqNodeID]; ok {
-			return override, true
-		}
-		if resolvedNodeID != "" && resolvedNodeID != reqNodeID {
-			if override, ok := a.sessionOverrides[resolvedNodeID]; ok {
-				return override, true
-			}
-		}
-		if resolvedNodeID != "" && reqNodeID == resolvedNodeID && a.cfgProvider != nil {
-			for _, al := range aliases {
-				if override, ok := a.sessionOverrides[al]; ok && a.cfgProvider.FindAlias(al) == resolvedNodeID {
-					return override, true
-				}
-			}
-		}
+	if override, ok := lookupAdapterOverrideByAlias(a.sessionOverrides, a.cfgProvider, reqNodeID, resolvedNodeID, aliases); ok {
+		return override, true
 	}
 	if a.globalSessionAuth != nil {
 		return *a.globalSessionAuth, true
@@ -726,7 +775,8 @@ func (a *SSHAdapter) getSessionOverrideForResolved(reqNodeID, resolvedNodeID str
 }
 
 func (a *SSHAdapter) getSessionOverride(nodeID string) (SessionAuth, bool) {
-	return a.getSessionOverrideForResolved(nodeID, a.resolveAliasTarget(nodeID), nil)
+	resolvedNodeID, aliases := a.resolveNodeIDAndAliases(nodeID)
+	return a.getSessionOverrideForResolved(nodeID, resolvedNodeID, aliases)
 }
 
 func cloneSessionControlOptions(s SessionControlOptions) SessionControlOptions {
@@ -844,25 +894,7 @@ func (a *SSHAdapter) getSessionControlOverrideForResolved(reqNodeID, resolvedNod
 	if a == nil {
 		return SessionControlOptions{}, false
 	}
-	var (
-		override    SessionControlOptions
-		hasOverride bool
-	)
-	if a.sessionControlOverrides != nil {
-		override, hasOverride = a.sessionControlOverrides[reqNodeID]
-		if !hasOverride && resolvedNodeID != "" && resolvedNodeID != reqNodeID {
-			override, hasOverride = a.sessionControlOverrides[resolvedNodeID]
-		}
-		if !hasOverride && resolvedNodeID != "" && reqNodeID == resolvedNodeID && a.cfgProvider != nil {
-			for _, al := range aliases {
-				if ov, ok := a.sessionControlOverrides[al]; ok && a.cfgProvider.FindAlias(al) == resolvedNodeID {
-					override = ov
-					hasOverride = true
-					break
-				}
-			}
-		}
-	}
+	override, hasOverride := lookupAdapterOverrideByAlias(a.sessionControlOverrides, a.cfgProvider, reqNodeID, resolvedNodeID, aliases)
 	hasGlobal := a.globalSessionControl != nil
 	switch {
 	case hasOverride && hasGlobal:
@@ -877,7 +909,8 @@ func (a *SSHAdapter) getSessionControlOverrideForResolved(reqNodeID, resolvedNod
 }
 
 func (a *SSHAdapter) getSessionControlOverride(nodeID string) (SessionControlOptions, bool) {
-	return a.getSessionControlOverrideForResolved(nodeID, a.resolveAliasTarget(nodeID), nil)
+	resolvedNodeID, aliases := a.resolveNodeIDAndAliases(nodeID)
+	return a.getSessionControlOverrideForResolved(nodeID, resolvedNodeID, aliases)
 }
 
 // GetControlConfig implements ssh.ControlProvider by delegating to Resolve.
@@ -1260,17 +1293,18 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		// 显式指定 session-only 覆盖，不写回持久化配置
 		return authUpdateToken, nil
 	}
-	if a.isPendingNode(nodeID) {
+	resolvedNodeID, _ := a.resolveNodeIDAndAliases(nodeID)
+	if a.isPendingNode(resolvedNodeID) {
 		// Defer credential persistence until the caller explicitly confirms
 		// the scoped PendingLease via FinalizePendingConnection.
 		if password != "" || passphrase != "" {
-			a.stageDeferredAuth(nodeID, authUpdateToken, password, keyPath, passphrase)
+			a.stageDeferredAuth(resolvedNodeID, authUpdateToken, password, keyPath, passphrase)
 		}
 		return authUpdateToken, nil
 	}
 	if password != "" || passphrase != "" {
 		var err error
-		password, passphrase, err = a.newAuthenticationMaterial(ctx, nodeID, password, keyPath, passphrase)
+		password, passphrase, err = a.newAuthenticationMaterial(ctx, resolvedNodeID, password, keyPath, passphrase)
 		if err != nil {
 			return "", err
 		}
@@ -1279,7 +1313,7 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		}
 	}
 	if a.rememberConfirmation != nil && (password != "" || passphrase != "") {
-		ok, err := a.rememberConfirmation(ctx, nodeID)
+		ok, err := a.rememberConfirmation(ctx, resolvedNodeID)
 		if err != nil {
 			return "", fmt.Errorf("confirm credential persistence: %w", err)
 		}
@@ -1297,9 +1331,9 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 		if !ok {
 			return "", fmt.Errorf("configuration provider does not support versioned authentication updates")
 		}
-		return provider.UpdateAuthAtVersionContext(ctx, nodeID, authUpdateToken, password, keyPath, passphrase)
+		return provider.UpdateAuthAtVersionContext(ctx, resolvedNodeID, authUpdateToken, password, keyPath, passphrase)
 	}
-	return a.persistAuthentication(ctx, nodeID, authUpdateToken, password, keyPath, passphrase)
+	return a.persistAuthentication(ctx, resolvedNodeID, authUpdateToken, password, keyPath, passphrase)
 }
 
 func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
@@ -1364,8 +1398,9 @@ func (a *SSHAdapter) UpdateSudo(ctx context.Context, nodeID, sudoUpdateToken str
 }
 
 func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateToken string, mode ssh.SudoMode, suPwd string) (string, error) {
+	resolvedNodeID, _ := a.resolveNodeIDAndAliases(nodeID)
 	if mode == ssh.SudoModeSudo {
-		snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
+		snapshot, _, _, err := a.resolveConnectionSnapshot(resolvedNodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve privilege binding: %w", err)
 		}
@@ -1379,7 +1414,7 @@ func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateT
 		}
 	}
 	if a.credentialService != nil && suPwd != "" {
-		snapshot, _, _, err := a.resolveConnectionSnapshot(nodeID)
+		snapshot, _, _, err := a.resolveConnectionSnapshot(resolvedNodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve privilege before recording: %w", err)
 		}
@@ -1392,7 +1427,7 @@ func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateT
 		}
 	}
 	if a.rememberConfirmation != nil && suPwd != "" {
-		ok, err := a.rememberConfirmation(ctx, nodeID)
+		ok, err := a.rememberConfirmation(ctx, resolvedNodeID)
 		if err != nil {
 			return "", fmt.Errorf("confirm privilege credential persistence: %w", err)
 		}
@@ -1401,7 +1436,7 @@ func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateT
 		}
 	}
 	if a.credentialService != nil && suPwd != "" {
-		snapshot, resolvedNodeID, _, _, err := a.resolveConnectionSnapshotResolved(nodeID)
+		snapshot, _, _, err := a.resolveConnectionSnapshot(resolvedNodeID)
 		if err != nil {
 			return "", fmt.Errorf("resolve node %q for remembered privilege password: %w", nodeID, err)
 		}
@@ -1419,7 +1454,7 @@ func (a *SSHAdapter) updateRecordedSudo(ctx context.Context, nodeID, sudoUpdateT
 	if !ok {
 		return "", fmt.Errorf("configuration provider does not support versioned sudo updates")
 	}
-	return provider.UpdateSudoAtVersionContext(ctx, nodeID, sudoUpdateToken, models.SudoMode(mode), suPwd)
+	return provider.UpdateSudoAtVersionContext(ctx, resolvedNodeID, sudoUpdateToken, models.SudoMode(mode), suPwd)
 }
 
 // ResolveSecret 从当前配置模型解析认证或提权所需机密，并严格校验与连接快照的一致性
