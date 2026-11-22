@@ -112,8 +112,8 @@ func handlePassengerSession(s *MuxServer, conn net.Conn, reqID uint32, payload [
 	}
 	defer releaseSession()
 
-	s.trackStream(conn)
-	defer s.untrackStream(conn)
+	s.trackLocalStream(conn)
+	defer s.untrackLocalStream(conn)
 
 	ch, reqs, err := s.openBoundedMuxChannel(s.baseContext(), "session", nil)
 	if err != nil {
@@ -1060,8 +1060,8 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	}
 	defer releaseSession()
 
-	s.trackStream(conn)
-	defer s.untrackStream(conn)
+	s.trackLocalStream(conn)
+	defer s.untrackLocalStream(conn)
 
 	ch, reqs, err := s.dialSSHMuxChannel(s.baseContext(), dialNetwork, targetAddr)
 	if err != nil {

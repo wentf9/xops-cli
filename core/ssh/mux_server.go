@@ -161,10 +161,19 @@ type MuxServer struct {
 	serverCtx    context.Context
 	serverCancel context.CancelFunc
 
-	// liveStreams holds every accepted connection the master is currently piping:
-	// proxy sockets and forwarded client connections. Shutdown closes them so
-	// idle readers unblock instead of outliving the master.
-	liveStreams sync.Map // net.Conn -> struct{}
+	// streamsMu serializes liveLocalStreams, liveRemoteStreams, and streamsClosed.
+	// It is a strict leaf lock (never held across I/O or idleMu).
+	// liveLocalStreams tracks local accepted/dialed sockets (mux control/proxy/
+	// passenger sockets, -L/-D client sockets, and -R local destination sockets).
+	// liveRemoteStreams tracks raw SSH channel streams opened on s.sshClient
+	// (-L/-D direct-* and -R forwarded-* channels). Shutdown closes the SSH
+	// transport via closeTransportBounded() BEFORE draining and closing either
+	// set so neither remote.Close() nor pipeBidirectional -> remote.CloseWrite()
+	// can block on a write-wedged direct or ProxyJump SSH transport.
+	streamsMu         sync.Mutex
+	streamsClosed     bool
+	liveLocalStreams  map[net.Conn]struct{}
+	liveRemoteStreams map[net.Conn]struct{}
 }
 
 // NewMuxServer creates and binds a new OpenSSH multiplex master server.
@@ -501,15 +510,6 @@ func (s *MuxServer) isShuttingDown() bool {
 	return s.isShuttingDownLocked()
 }
 
-func (s *MuxServer) isClosed() bool {
-	if s == nil {
-		return true
-	}
-	s.idleMu.Lock()
-	defer s.idleMu.Unlock()
-	return s.phase == muxPhaseClosed
-}
-
 func (s *MuxServer) isClosedOrStoppedListening() bool {
 	if s == nil {
 		return true
@@ -727,10 +727,10 @@ func (s *MuxServer) retireUnlinkedOrReplacedListener() {
 }
 
 func (s *MuxServer) handleClient(conn net.Conn) {
-	s.trackStream(conn)
+	s.trackLocalStream(conn)
 	defer func() {
 		_ = conn.Close()
-		s.untrackStream(conn)
+		s.untrackLocalStream(conn)
 	}()
 
 	if s.checkPeerUID {
@@ -970,8 +970,8 @@ func (s *MuxServer) handleProxy(conn net.Conn, reqID uint32) error {
 		return err
 	}
 
-	s.trackStream(conn)
-	defer s.untrackStream(conn)
+	s.trackLocalStream(conn)
+	defer s.untrackLocalStream(conn)
 
 	return s.serveProxyConn(conn)
 }
@@ -1383,10 +1383,6 @@ func (s *MuxServer) Shutdown() error {
 		return nil
 	}
 	s.shutdownOnce.Do(func() {
-		if s.serverCancel != nil {
-			s.serverCancel()
-		}
-
 		s.idleMu.Lock()
 		s.phase = muxPhaseClosed
 		s.disarmIdleTimerLocked()
@@ -1394,25 +1390,32 @@ func (s *MuxServer) Shutdown() error {
 		localItems, remoteItems := s.forwardTable.snapshotAndDrainForShutdownLocked()
 		s.idleMu.Unlock()
 
-		s.releaseControlSocketSlot()
+		s.beginShutdown()
 
 		for _, item := range localItems {
 			closeShutdownForwardItem(item)
 		}
 
-		s.liveStreams.Range(func(key, _ any) bool {
-			if conn, ok := key.(net.Conn); ok {
-				_ = conn.Close()
-			}
-			return true
-		})
-
+		// Close/abort the underlying SSH transport BEFORE closing tracked remote
+		// or local streams. Once closeTransportBounded() returns, s.sshClient's
+		// mux is dead/EOF (even when s.rootConn or a ProxyJump upstream
+		// s.physicalRoot is write-wedged), so neither remote.Close() nor
+		// pipeBidirectional -> remote.CloseWrite() triggered by closing
+		// liveLocalStreams can block on SSH packet writes.
 		_ = s.closeTransportBounded()
+
+		localStreams, remoteStreams := s.drainTrackedStreams()
+		for _, conn := range remoteStreams {
+			_ = conn.Close()
+		}
+		for _, conn := range localStreams {
+			_ = conn.Close()
+		}
+
 		for _, item := range remoteItems {
 			closeShutdownForwardItem(item)
 		}
 
-		activeMuxServers.CompareAndDelete(s.controlPath, s)
 		if s.shutdownChan != nil {
 			close(s.shutdownChan)
 		}

@@ -342,7 +342,7 @@ func (s *MuxServer) listenRemoteMux(network, listenAddr string) (net.Listener, e
 	if s == nil || s.sshClient == nil || s.sshClient.Conn == nil {
 		return nil, errors.New("ssh client is nil")
 	}
-	reqCtx, cancel := context.WithTimeout(s.baseContext(), remoteForwardRequestTimeout)
+	reqCtx, cancel := withTimeoutOrDefault(s.baseContext(), s.requestTimeout, remoteForwardRequestTimeout)
 	defer cancel()
 	done := make(chan struct{})
 	stop := context.AfterFunc(reqCtx, func() {
@@ -395,7 +395,11 @@ func (s *MuxServer) closeMuxForwardEntryWithShadows(entry *muxForwardEntry, shad
 		}
 		return
 	}
-	closeCtx, cancel := context.WithTimeout(context.Background(), remoteForwardRequestTimeout)
+	var reqTimeout time.Duration
+	if s != nil {
+		reqTimeout = s.requestTimeout
+	}
+	closeCtx, cancel := withTimeoutOrDefault(context.Background(), reqTimeout, remoteForwardRequestTimeout)
 	defer cancel()
 	done := make(chan struct{})
 	stop := context.AfterFunc(closeCtx, func() {
@@ -667,9 +671,9 @@ func (t *muxForwardTable) deleteEndpointEntryLocked(entry *muxForwardEntry) {
 }
 
 // snapshotAndDrainForShutdownLocked extracts and deletes every tracked forward
-// entry for Shutdown. Local listeners are returned before liveStreams/sshClient
-// teardown, while remote listeners are closed after sshClient shutdown so dead
-// transports cannot block Shutdown.
+// entry for Shutdown. Local listeners are closed before SSH transport teardown,
+// while tracked streams and remote listeners are closed after
+// closeTransportBounded() so write-wedged transports cannot block Shutdown.
 func (t *muxForwardTable) snapshotAndDrainForShutdownLocked() (local []shutdownForwardItem, remote []shutdownForwardItem) {
 	if t == nil || len(t.entries) == 0 {
 		return nil, nil
@@ -1303,23 +1307,90 @@ func (s *MuxServer) retireForward(key string, entry *muxForwardEntry) {
 	}
 }
 
-// trackStream registers an accepted connection for shutdown-driven teardown.
-func (s *MuxServer) trackStream(conn net.Conn) {
-	if conn == nil {
+// trackLocalStream registers a local accepted/dialed connection (mux client
+// socket, -L/-D client socket, or -R local destination socket) for shutdown
+// teardown. If Shutdown has already closed the SSH transport and drained live
+// streams, conn is closed immediately.
+func (s *MuxServer) trackLocalStream(conn net.Conn) {
+	if s == nil || conn == nil {
 		return
 	}
-	s.liveStreams.Store(conn, struct{}{})
-	if s.isClosed() {
-		// Shutdown may have already taken its snapshot; close immediately.
+	s.streamsMu.Lock()
+	if s.streamsClosed {
+		s.streamsMu.Unlock()
 		_ = conn.Close()
+		return
 	}
+	if s.liveLocalStreams == nil {
+		s.liveLocalStreams = make(map[net.Conn]struct{})
+	}
+	s.liveLocalStreams[conn] = struct{}{}
+	s.streamsMu.Unlock()
 }
 
-func (s *MuxServer) untrackStream(conn net.Conn) {
-	if conn == nil {
+func (s *MuxServer) untrackLocalStream(conn net.Conn) {
+	if s == nil || conn == nil {
 		return
 	}
-	s.liveStreams.Delete(conn)
+	s.streamsMu.Lock()
+	delete(s.liveLocalStreams, conn)
+	s.streamsMu.Unlock()
+}
+
+// trackRemoteStream registers an SSH channel stream opened on s.sshClient for
+// shutdown teardown. Closing is deferred until after closeTransportBounded()
+// sets streamsClosed so a write-wedged transport can never block remote.Close().
+func (s *MuxServer) trackRemoteStream(conn net.Conn) {
+	if s == nil || conn == nil {
+		return
+	}
+	s.streamsMu.Lock()
+	if s.streamsClosed {
+		s.streamsMu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	if s.liveRemoteStreams == nil {
+		s.liveRemoteStreams = make(map[net.Conn]struct{})
+	}
+	s.liveRemoteStreams[conn] = struct{}{}
+	s.streamsMu.Unlock()
+}
+
+func (s *MuxServer) untrackRemoteStream(conn net.Conn) {
+	if s == nil || conn == nil {
+		return
+	}
+	s.streamsMu.Lock()
+	delete(s.liveRemoteStreams, conn)
+	s.streamsMu.Unlock()
+}
+
+// drainTrackedStreams atomically marks stream tracking closed (called strictly
+// after closeTransportBounded()) and returns snapshots of all tracked local and
+// remote streams to close outside streamsMu.
+func (s *MuxServer) drainTrackedStreams() (local, remote []net.Conn) {
+	if s == nil {
+		return nil, nil
+	}
+	s.streamsMu.Lock()
+	s.streamsClosed = true
+	if len(s.liveLocalStreams) > 0 {
+		local = make([]net.Conn, 0, len(s.liveLocalStreams))
+		for conn := range s.liveLocalStreams {
+			local = append(local, conn)
+		}
+		clear(s.liveLocalStreams)
+	}
+	if len(s.liveRemoteStreams) > 0 {
+		remote = make([]net.Conn, 0, len(s.liveRemoteStreams))
+		for conn := range s.liveRemoteStreams {
+			remote = append(remote, conn)
+		}
+		clear(s.liveRemoteStreams)
+	}
+	s.streamsMu.Unlock()
+	return local, remote
 }
 
 func (s *MuxServer) serveLocalForward(ln net.Listener, connectHost string, connectPort ...uint32) {
@@ -1334,10 +1405,10 @@ func (s *MuxServer) serveLocalForward(ln net.Listener, connectHost string, conne
 				_ = local.Close()
 				return
 			}
-			s.trackStream(local)
+			s.trackLocalStream(local)
 			defer func() {
 				_ = local.Close()
-				s.untrackStream(local)
+				s.untrackLocalStream(local)
 				s.removeActiveForwardStream()
 			}()
 			var remote net.Conn
@@ -1353,10 +1424,10 @@ func (s *MuxServer) serveLocalForward(ln net.Listener, connectHost string, conne
 			if dialErr != nil {
 				return
 			}
-			s.trackStream(remote)
+			s.trackRemoteStream(remote)
 			defer func() {
 				_ = remote.Close()
-				s.untrackStream(remote)
+				s.untrackRemoteStream(remote)
 			}()
 			pipeBidirectional(local, remote)
 		}(c)
@@ -1376,10 +1447,10 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 				_ = remote.Close()
 				return
 			}
-			s.trackStream(remote)
+			s.trackRemoteStream(remote)
 			defer func() {
 				_ = remote.Close()
-				s.untrackStream(remote)
+				s.untrackRemoteStream(remote)
 				s.removeActiveForwardStream()
 			}()
 
@@ -1388,7 +1459,7 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 				var dialedLocal net.Conn
 				defer func() {
 					if dialedLocal != nil {
-						s.untrackStream(dialedLocal)
+						s.untrackLocalStream(dialedLocal)
 					}
 				}()
 				_ = serveSocksConn(s.baseContext(), remote, func(ctx context.Context, destAddr string) (net.Conn, error) {
@@ -1398,7 +1469,7 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 						return nil, err
 					}
 					dialedLocal = local
-					s.trackStream(local)
+					s.trackLocalStream(local)
 					return local, nil
 				}, func(ctx context.Context, c1, c2 net.Conn) error {
 					pipeBidirectional(c1, c2)
@@ -1419,10 +1490,10 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 			if dialErr != nil {
 				return
 			}
-			s.trackStream(local)
+			s.trackLocalStream(local)
 			defer func() {
 				_ = local.Close()
-				s.untrackStream(local)
+				s.untrackLocalStream(local)
 			}()
 			pipeBidirectional(local, remote)
 		}(c)
@@ -1447,17 +1518,17 @@ func (s *MuxServer) serveDynamicConn(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
-	s.trackStream(conn)
+	s.trackLocalStream(conn)
 	defer func() {
 		_ = conn.Close()
-		s.untrackStream(conn)
+		s.untrackLocalStream(conn)
 		s.removeActiveForwardStream()
 	}()
 
 	var dialedRemote net.Conn
 	defer func() {
 		if dialedRemote != nil {
-			s.untrackStream(dialedRemote)
+			s.untrackRemoteStream(dialedRemote)
 		}
 	}()
 	dialNet := s.effectiveDialNetwork()
@@ -1467,7 +1538,7 @@ func (s *MuxServer) serveDynamicConn(conn net.Conn) {
 			return nil, err
 		}
 		dialedRemote = remoteConn
-		s.trackStream(remoteConn)
+		s.trackRemoteStream(remoteConn)
 		return remoteConn, nil
 	}, func(ctx context.Context, c1, c2 net.Conn) error {
 		pipeBidirectional(c1, c2)
