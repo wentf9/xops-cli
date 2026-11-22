@@ -177,9 +177,12 @@ func (m *CredentialMigrator) step(name string) error {
 // Before deleting rollback material, verify and sync both the current file's
 // contents and its directory on one no-follow, regular-file, os.SameFile-checked
 // locked handle so no pathname swap can slip between digest check and fsync.
-func readAndSyncMigrationConfiguration(path, expectedHash, conflictMsg string) (data []byte, retErr error) {
-	lf, err := fsx.OpenLocked(path, fsx.LockExclusive, false, 0)
+func readAndSyncMigrationConfiguration(ctx context.Context, path, expectedHash, conflictMsg string) (data []byte, retErr error) {
+	lf, err := fsx.OpenLockedContext(ctx, path, fsx.LockExclusive, false, 0)
 	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("open migrated configuration for sync: %w", err)
+		}
 		return nil, fmt.Errorf("open migrated configuration for sync: %w", classifyMigrationReadError(path, err))
 	}
 	defer func() { retErr = errors.Join(retErr, lf.Close()) }()

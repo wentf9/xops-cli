@@ -1126,6 +1126,12 @@ func applySessionOverrideToConfig(cfg *ssh.ClientConfig, override SessionAuth, o
 	if strings.TrimSpace(override.HostName) != "" {
 		cfg.Address = config.StripHostBrackets(override.HostName)
 	}
+	if override.Port > 0 {
+		cfg.Port = int(override.Port)
+	}
+	if u := strings.TrimSpace(override.User); u != "" {
+		cfg.User = u
+	}
 	if orig := strings.TrimSpace(override.OriginalHost); orig != "" {
 		if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
 			orig = cleanOrig
@@ -1694,6 +1700,22 @@ func (a *SSHAdapter) validateSecretRequestSnapshot(
 	return validateSecretRequestSnapshotWithState(snapshot, hasOverride, override, req.BaseHost, req)
 }
 
+func effectiveSnapshotPortAndUser(snapshot config.ConnectionSnapshot, hasOverride bool, override SessionAuth) (basePort, effectivePort int, effectiveUser string) {
+	basePort = effectiveSnapshotPort(snapshot.Host.Port)
+	effectivePort = basePort
+	effectiveUser = effectiveSnapshotUser(snapshot.Identity.User)
+	if !hasOverride {
+		return basePort, effectivePort, effectiveUser
+	}
+	if override.Port > 0 {
+		effectivePort = int(override.Port)
+	}
+	if u := strings.TrimSpace(override.User); u != "" {
+		effectiveUser = u
+	}
+	return basePort, effectivePort, effectiveUser
+}
+
 func validateSecretRequestSnapshotWithState(
 	snapshot config.ConnectionSnapshot,
 	hasOverride bool,
@@ -1723,8 +1745,8 @@ func validateSecretRequestSnapshotWithState(
 		return fmt.Errorf("%w: missing base host for node %q under HostName override",
 			ssh.ErrSnapshotMismatch, req.NodeID)
 	}
-	effectivePort := effectiveSnapshotPort(snapshot.Host.Port)
-	if observedBaseHost != "" && !endpointsMatch(observedBaseHost, effectivePort, snapshot.Host.Address, effectivePort) {
+	basePort, effectivePort, effectiveUser := effectiveSnapshotPortAndUser(snapshot, hasOverride, override)
+	if observedBaseHost != "" && !endpointsMatch(observedBaseHost, basePort, snapshot.Host.Address, basePort) {
 		return fmt.Errorf("%w: underlying host address changed for node %q: expected %q, got %q",
 			ssh.ErrSnapshotMismatch, req.NodeID, observedBaseHost, snapshot.Host.Address)
 	}
@@ -1745,7 +1767,6 @@ func validateSecretRequestSnapshotWithState(
 				ssh.ErrSnapshotMismatch, req.NodeID, req.Host, effectiveHost)
 		}
 	}
-	effectiveUser := effectiveSnapshotUser(snapshot.Identity.User)
 	if req.User != "" && effectiveUser != req.User {
 		return fmt.Errorf("%w: user changed for node %q: expected %q, got %q",
 			ssh.ErrSnapshotMismatch, req.NodeID, req.User, effectiveUser)

@@ -57,15 +57,25 @@ func (u *credentialEditUpdater) ApplyCredentialRefAtVersion(ctx context.Context,
 	result, err := u.repo.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
 		var err error
 		if u.nodeRef.ID != "" {
-			if err := replaceNodeAtRef(cfg, u.nodeRef, u.nodeID, u.node, u.host, identity); err != nil {
-				return err
+			routingChanged, rErr := replaceNodeAtRefWithRoutingCheck(cfg, u.nodeRef, u.nodeID, u.node, u.host, identity)
+			if rErr != nil {
+				return rErr
+			}
+			if routingChanged {
+				if cErr := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, u.repo.openSSHParserOrNil(), u.nodeID); cErr != nil {
+					return cErr
+				}
 			}
 			version, err = nodeAuthVersion(cfg, u.nodeID)
 		} else {
 			if err := ensureIdentityRef(cfg, u.identityRef); err != nil {
 				return err
 			}
+			oldIdentity, _ := cfg.Identities.Get(u.identityRef.ID)
 			cfg.Identities.Set(u.identityRef.ID, identity)
+			if cErr := u.repo.validateIdentityUserChangeJumpCycle(cfg, u.identityRef.ID, oldIdentity, identity); cErr != nil {
+				return cErr
+			}
 			version, err = identityEntityVersion(cfg, u.identityRef.ID)
 		}
 		return err

@@ -132,14 +132,25 @@ func ValidateProxyJumpChainCycle(provider ConfigProvider, dest ProxyJumpTarget, 
 }
 
 type jumpWalkOptions struct {
-	graphMode bool
-	lookup    map[string][]string
-	aliases   map[string]string
+	graphMode                bool
+	allowUnresolvedSavedHops bool
+	lookup                   map[string][]string
+	aliases                  map[string]string
 }
 
 func validateProxyJumpChainCycleWithConfig(
 	cfg *Configuration,
 	openSSH *OpenSSHParser,
+	dest ProxyJumpTarget,
+	resolvedChain, rawJump string,
+) error {
+	return validateProxyJumpChainCycleWithOpts(cfg, openSSH, jumpWalkOptions{}, dest, resolvedChain, rawJump)
+}
+
+func validateProxyJumpChainCycleWithOpts(
+	cfg *Configuration,
+	openSSH *OpenSSHParser,
+	opts jumpWalkOptions,
 	dest ProxyJumpTarget,
 	resolvedChain, rawJump string,
 ) error {
@@ -167,7 +178,7 @@ func validateProxyJumpChainCycleWithConfig(
 	if strings.TrimSpace(rawJump) == "" {
 		rawJump = resolvedChain
 	}
-	return walkJumpChain(cfg, openSSH, jumpWalkOptions{}, path, hops, destIdent.label, rawJump, 0)
+	return walkJumpChain(cfg, openSSH, opts, path, hops, destIdent.label, rawJump, 0)
 }
 
 func validateSavedNodeProxyJumpGraphCycle(
@@ -226,15 +237,38 @@ func ValidateSavedNodeJumpCycleWithOpenSSH(cfg *Configuration, openSSH *OpenSSHP
 			continue
 		}
 		dest := buildProxyJumpTargetFromSavedNode(nid, node.OpenSSHAlias, node.CanonicalHost, nid, host, ident)
-		resolvedJump, rErr := resolveBaseTargetJumpWithConfig(cfg, openSSH, dest, targets)
+		resolvedHops, rErr := resolveSavedGraphJumpHops(cfg, openSSH, targets)
 		if rErr != nil {
 			return rErr
 		}
-		if err := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, resolvedJump, node.ProxyJump); err != nil {
+		if err := validateProxyJumpChainCycleWithOpts(cfg, openSSH, jumpWalkOptions{allowUnresolvedSavedHops: true}, dest, strings.Join(resolvedHops, ","), node.ProxyJump); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func resolveSavedGraphJumpHops(cfg *Configuration, openSSH *OpenSSHParser, targets []string) ([]string, error) {
+	validated, err := validateJumpTargetsSyntax(targets)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(validated))
+	for _, hop := range validated {
+		resolved, rErr := resolveSingleJumpHopWithConfig(cfg, openSSH, hop)
+		if rErr != nil {
+			var unresolvedErr unresolvedSavedJumpError
+			if errors.As(rErr, &unresolvedErr) {
+				out = append(out, hop)
+				continue
+			}
+			return nil, rErr
+		}
+		if resolved != "" {
+			out = append(out, resolved)
+		}
+	}
+	return out, nil
 }
 
 func collectSavedNodesReachingNode(
@@ -538,6 +572,9 @@ func resolveUpstreamHopsForIdentityWithOpts(cfg *Configuration, openSSH *OpenSSH
 		return validateJumpTargetsSyntax(targets)
 	}
 	if ident.isSavedNode {
+		if opts.allowUnresolvedSavedHops {
+			return resolveSavedGraphJumpHops(cfg, openSSH, targets)
+		}
 		resolved, rErr := ResolveProxyJumpChainWithConfig(cfg, openSSH, strings.Join(targets, ","))
 		if rErr != nil {
 			return nil, rErr
@@ -1021,6 +1058,51 @@ func validateVirtualJumpTargetsWithConfig(cfg *Configuration, openSSH *OpenSSHPa
 		}
 	}
 	return strings.Join(out, ","), nil
+}
+
+// NodeJumpRoutingChanged reports whether replacing (oldNodeID, oldNode, oldHost,
+// oldIdentity) with (newNodeID, newNode, newHost, newIdentity) modifies any
+// jump-routing-relevant attribute (nodeID, Host.Address, Host.Port,
+// Identity.User, Node.Alias, Host.Alias, or Node.ProxyJump) in a way that could
+// introduce a ProxyJump cycle or duplicate hop. Non-routing edits (Tags,
+// SudoMode, SuPwd, credentials, Execution, PasswordPromptPattern, etc.) and
+// pure ProxyJump clearing (ProxyJump -> "" with identity, endpoint, and aliases
+// unchanged) return false so secret binding, sudo probing, and broken-jump
+// repair (`-J ""`) remain unblocked.
+func NodeJumpRoutingChanged(
+	oldNodeID string,
+	oldNode models.Node,
+	oldHost models.Host,
+	oldIdentity models.Identity,
+	newNodeID string,
+	newNode models.Node,
+	newHost models.Host,
+	newIdentity models.Identity,
+) bool {
+	if oldNodeID != newNodeID {
+		return true
+	}
+	if !strings.EqualFold(StripHostBrackets(oldHost.Address), StripHostBrackets(newHost.Address)) {
+		return true
+	}
+	if normalizedHostPort(oldHost.Port) != normalizedHostPort(newHost.Port) {
+		return true
+	}
+	if strings.TrimSpace(oldIdentity.User) != strings.TrimSpace(newIdentity.User) {
+		return true
+	}
+	if !slices.Equal(oldNode.Alias, newNode.Alias) {
+		return true
+	}
+	if !slices.Equal(oldHost.Alias, newHost.Alias) {
+		return true
+	}
+	oldJump := strings.TrimSpace(oldNode.ProxyJump)
+	newJump := strings.TrimSpace(newNode.ProxyJump)
+	if oldJump != newJump {
+		return newJump != ""
+	}
+	return false
 }
 
 // buildProxyJumpTargetFromSavedNode constructs a ProxyJumpTarget from a saved

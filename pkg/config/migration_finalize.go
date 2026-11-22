@@ -79,7 +79,7 @@ func (m *CredentialMigrator) finishVerification(ctx context.Context, state *migr
 		return report, err
 	}
 	err = m.withConfigLock(ctx, func() error {
-		current, err := readAndSyncMigrationConfiguration(m.path, state.CandidateHash, "configuration changed during verification")
+		current, err := readAndSyncMigrationConfiguration(ctx, m.path, state.CandidateHash, "configuration changed during verification")
 		if err != nil {
 			return err
 		}
@@ -207,7 +207,7 @@ func (m *CredentialMigrator) Finalize(ctx context.Context) (report MigrationRepo
 		return report, err
 	}
 	err = m.withConfigLock(ctx, func() error {
-		current, err := readAndSyncMigrationConfiguration(m.path, migrationDigest(raw), "configuration changed during finalization")
+		current, err := readAndSyncMigrationConfiguration(ctx, m.path, migrationDigest(raw), "configuration changed during finalization")
 		if err != nil {
 			return err
 		}

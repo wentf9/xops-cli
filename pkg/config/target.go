@@ -2218,6 +2218,7 @@ func (r *Repository) createNodeInTransaction(
 		newNode.ProxyJump = finalJump
 		cfg.Nodes.Set(targetNodeID, newNode)
 	}
+	openSSH := r.openSSHParserOrNil()
 	if strings.TrimSpace(finalJump) != "" {
 		dest := ProxyJumpTarget{
 			NodeID:        targetNodeID,
@@ -2228,9 +2229,12 @@ func (r *Repository) createNodeInTransaction(
 			Port:          effectivePort,
 			User:          effectiveUser,
 		}
-		if cErr := validateProxyJumpChainCycleWithConfig(cfg, r.openSSHParserOrNil(), dest, finalJump, finalJump); cErr != nil {
+		if cErr := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, finalJump, finalJump); cErr != nil {
 			return cErr
 		}
+	}
+	if cErr := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, openSSH, targetNodeID); cErr != nil {
+		return cErr
 	}
 	*outcome = ensureTransactionOutcome{
 		nodeID:        targetNodeID,
@@ -2562,13 +2566,23 @@ func resolveHopPortFromCandidates(cfg *Configuration, hostCandidates []string) (
 	return firstPort, true
 }
 
+type unresolvedSavedJumpError struct {
+	msg string
+}
+
+func (e unresolvedSavedJumpError) Error() string { return e.msg }
+
+func newUnresolvedSavedJumpError(host string) error {
+	return unresolvedSavedJumpError{msg: i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": host})}
+}
+
 func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort uint16, hostCandidates []string) (string, error) {
 	firstAddr, consistent := resolveHopAddressFromCandidates(cfg, hostCandidates)
 	if !consistent {
 		return "", &AmbiguousNodeError{Selector: hop, Candidates: slices.Clone(hostCandidates)}
 	}
 	if firstAddr == "" {
-		return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+		return "", newUnresolvedSavedJumpError(hop)
 	}
 	effectivePort := hopPort
 	if effectivePort == 0 {
@@ -2618,7 +2632,7 @@ func resolveHopAddressFallback(cfg *Configuration, hop, hopUser string, hopPort 
 		if isDirectJumpTargetRef(candidateRef) {
 			return candidateRef.NormalizedString(), nil
 		}
-		return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+		return "", newUnresolvedSavedJumpError(hop)
 	default:
 		return "", &AmbiguousNodeError{Selector: hop, Candidates: matchingNodes}
 	}
@@ -2694,7 +2708,7 @@ func resolveOpenSSHJumpHop(openSSH *OpenSSHParser, ref TargetRef) (string, error
 		return ref.NormalizedString(), nil
 	}
 
-	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": ref.NormalizedString()}))
+	return "", newUnresolvedSavedJumpError(ref.NormalizedString())
 }
 
 // resolveLocalOrDirectJumpHop handles jump targets with unspecified origin (local first, then OpenSSH, then direct).
@@ -2751,7 +2765,7 @@ func resolveLocalOrDirectJumpHop(cfg *Configuration, openSSH *OpenSSHParser, hop
 		return outRef.NormalizedString(), nil
 	}
 
-	return "", errors.New(i18n.Tf("ssh_err_jump_not_found", map[string]any{"Host": hop}))
+	return "", newUnresolvedSavedJumpError(hop)
 }
 
 // resolveSingleJumpHopWithConfig resolves a single jump hop selector to a canonical node ID or OpenSSH node.

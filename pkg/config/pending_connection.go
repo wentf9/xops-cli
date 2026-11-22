@@ -341,6 +341,9 @@ func (r *Repository) prepareExistingNodeLocked(snap *Configuration, decision tar
 	if err != nil {
 		return EnsureNodeResult{}, nil, fmt.Errorf("resolve node %q for update failed: %w", id, err)
 	}
+	origNode := cloneNode(node)
+	origHost := cloneHost(host)
+	origIdentity := cloneIdentity(identity)
 	changed, err := applyPendingNodeUpdate(r.provider, id, &node, &identity, opts.ExistingUpdate, resolvedJump)
 	if err != nil {
 		return EnsureNodeResult{}, nil, err
@@ -379,7 +382,8 @@ func (r *Repository) prepareExistingNodeLocked(snap *Configuration, decision tar
 	if !ok {
 		return EnsureNodeResult{}, nil, fmt.Errorf("resolve staged identity %q for node %q: %w", stagedNode.IdentityRef, id, ErrIdentityNotFound)
 	}
-	if err := r.validateStagedSavedNodeJumpCycle(stagedCfg, id, stagedNode, stagedHost, stagedIdentity, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget.Selector); err != nil {
+	routingChanged := NodeJumpRoutingChanged(id, origNode, origHost, origIdentity, id, stagedNode, stagedHost, stagedIdentity)
+	if err := r.validateStagedSavedNodeJumpCycle(stagedCfg, id, stagedNode, stagedHost, stagedIdentity, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget.Selector, routingChanged); err != nil {
 		return EnsureNodeResult{}, nil, fmt.Errorf("validate staged update for node %q: %w", id, err)
 	}
 	entry, err := r.registerPendingUpdateLocked(id, baseRef, stagedNode, stagedHost, stagedIdentity, decision.OpenSSHAlias, decision.CanonicalHost)
@@ -415,10 +419,10 @@ func (r *Repository) revalidateStagedAliasUpdateJumpLocked(
 	if !hOK || !iOK {
 		return nil
 	}
-	return r.validateStagedSavedNodeJumpCycle(cfg, id, cur, h, ident, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget.Selector)
+	return r.validateStagedSavedNodeJumpCycle(cfg, id, cur, h, ident, decision.OpenSSHAlias, decision.CanonicalHost, decision.NormalizedTarget.Selector, true)
 }
 
-func (r *Repository) validateStagedSavedNodeJumpCycle(
+func (r *Repository) validateSavedNodeJumpWithOrigin(
 	cfg *Configuration,
 	nodeID string,
 	node models.Node,
@@ -441,6 +445,28 @@ func (r *Repository) validateStagedSavedNodeJumpCycle(
 		return rErr
 	}
 	return validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, resolvedJump, node.ProxyJump)
+}
+
+func (r *Repository) validateStagedSavedNodeJumpCycle(
+	cfg *Configuration,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	openSSHAlias, canonicalHost, selector string,
+	routingChanged bool,
+) error {
+	if strings.TrimSpace(node.ProxyJump) != "" {
+		if err := r.validateSavedNodeJumpWithOrigin(cfg, nodeID, node, host, identity, openSSHAlias, canonicalHost, selector); err != nil {
+			return err
+		}
+	}
+	if routingChanged {
+		if err := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func applyPendingNodeUpdate(
@@ -828,7 +854,16 @@ func (r *Repository) confirmPendingEntry(ctx context.Context, nodeID string, ent
 		storedNode.OpenSSHAlias = ""
 		storedNode.CanonicalHost = ""
 		_, err = r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
-			return replaceNodeAtRef(cfg, pending.baseRef, nodeID, storedNode, host, identity)
+			routingChanged, err := replaceNodeAtRefWithRoutingCheck(cfg, pending.baseRef, nodeID, storedNode, host, identity)
+			if err != nil {
+				return err
+			}
+			if routingChanged {
+				if err := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID); err != nil {
+					return err
+				}
+			}
+			return nil
 		}, action)
 		if err != nil {
 			return fmt.Errorf("save authenticated node update %q: %w", nodeID, err)
@@ -839,7 +874,10 @@ func (r *Repository) confirmPendingEntry(ctx context.Context, nodeID string, ent
 		node.Execution = execution.Clone()
 	}
 	_, err = r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
-		return mergeConfirmedNodeConfig(cfg, nodeID, node, host, identity)
+		if err := mergeConfirmedNodeConfig(cfg, nodeID, node, host, identity); err != nil {
+			return err
+		}
+		return ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID)
 	}, action)
 	if err != nil {
 		return fmt.Errorf("save authenticated connection %q: %w", nodeID, err)

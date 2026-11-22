@@ -89,6 +89,7 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		}
 	}
 
+	origNode, origHost, origIdentity := node, host, identity
 	updated, nameChanged := applyNodeUpdates(cmd, &host, &identity, &node, flags)
 	if err := applyEditedIdentityTemplate(view, flags.identityAlias, &node, &identity, &updated, &nameChanged); err != nil {
 		return err
@@ -103,13 +104,31 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 			return err
 		}
 	}
-	if updated || nameChanged {
-		draft := buildEditedNodeDraft(repository, oldName, newName, node, host, identity)
-		if err := config.ValidateSavedNodeJumpCycleWithOpenSSH(draft, repository.GetOpenSSHParser(), newName); err != nil {
-			return fmt.Errorf("validate node %q failed: %w", newName, err)
-		}
+	if err := validateEditedNodeJumpCycles(repository, oldName, newName, origNode, origHost, origIdentity, node, host, identity, updated || nameChanged); err != nil {
+		return err
 	}
 	return commitEditedNode(cmd, repository, view.NodeRefs[oldName], oldName, newName, node, host, identity, flags, updated)
+}
+
+func validateEditedNodeJumpCycles(
+	repository *config.Repository,
+	oldName, newName string,
+	origNode models.Node,
+	origHost models.Host,
+	origIdentity models.Identity,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	changed bool,
+) error {
+	if !changed || !config.NodeJumpRoutingChanged(oldName, origNode, origHost, origIdentity, newName, node, host, identity) {
+		return nil
+	}
+	draft := buildEditedNodeDraft(repository, oldName, newName, node, host, identity)
+	if err := config.ValidateSavedNodeJumpCycleWithOpenSSH(draft, repository.GetOpenSSHParser(), newName); err != nil {
+		return fmt.Errorf("validate node %q failed: %w", newName, err)
+	}
+	return nil
 }
 
 func validateEditPreFlags(cmd *cobra.Command, flags *editFlags, portChanged bool) error {

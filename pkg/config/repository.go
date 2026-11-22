@@ -774,10 +774,26 @@ func (r *Repository) ReplaceIdentityAtRefContext(ctx context.Context, ref Identi
 		if err := ensureIdentityRef(cfg, ref); err != nil {
 			return err
 		}
+		oldIdentity, _ := cfg.Identities.Get(ref.ID)
 		cfg.Identities.Set(ref.ID, cloneIdentity(identity))
-		return nil
+		return r.validateIdentityUserChangeJumpCycle(cfg, ref.ID, oldIdentity, identity)
 	})
 	return MutationOutcome{Applied: result.Applied, Durable: result.Durable}, err
+}
+
+func (r *Repository) validateIdentityUserChangeJumpCycle(cfg *Configuration, identityID string, oldIdentity, newIdentity models.Identity) error {
+	if strings.TrimSpace(oldIdentity.User) == strings.TrimSpace(newIdentity.User) {
+		return nil
+	}
+	openSSH := r.openSSHParserOrNil()
+	for _, nid := range cfg.Nodes.Keys() {
+		if n, ok := cfg.Nodes.Get(nid); ok && n.IdentityRef == identityID {
+			if err := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, openSSH, nid); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // DeleteIdentityAtRefContext removes an unreferenced identity only when it
@@ -799,23 +815,64 @@ func (r *Repository) DeleteIdentityAtRefContext(ctx context.Context, ref Identit
 	return MutationOutcome{Applied: result.Applied, Durable: result.Durable}, err
 }
 
+func validateCreateNodeInputs(nodeID string, node models.Node, host models.Host) error {
+	if nodeID == "" {
+		return fmt.Errorf("node ID is empty")
+	}
+	if err := ValidateNodeID(nodeID); err != nil {
+		return err
+	}
+	if err := ValidateNodeAliases(node.Alias); err != nil {
+		return err
+	}
+	if err := ValidateNodeAliases(host.Alias); err != nil {
+		return err
+	}
+	return ValidateConcreteHostAddress(host.Address)
+}
+
+func (r *Repository) applyCreateNodeInTransaction(
+	cfg *Configuration,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	initAlias, initCanon string,
+) error {
+	if _, exists := cfg.Nodes.Get(nodeID); exists {
+		return fmt.Errorf("create node %q: %w", nodeID, ErrConfigConflict)
+	}
+	if existing, exists := cfg.Hosts.Get(node.HostRef); exists {
+		if !reflect.DeepEqual(existing, host) {
+			return fmt.Errorf("create node %q host ref %q: %w", nodeID, node.HostRef, ErrConfigConflict)
+		}
+	} else {
+		cfg.Hosts.Set(node.HostRef, cloneHost(host))
+	}
+	if existing, exists := cfg.Identities.Get(node.IdentityRef); exists {
+		if !reflect.DeepEqual(existing, identity) {
+			return fmt.Errorf("create node %q identity ref %q: %w", nodeID, node.IdentityRef, ErrConfigConflict)
+		}
+	} else {
+		cfg.Identities.Set(node.IdentityRef, cloneIdentity(identity))
+	}
+	storedNode := cloneNode(node)
+	storedNode.OpenSSHAlias = ""
+	storedNode.CanonicalHost = ""
+	cfg.Nodes.Set(nodeID, storedNode)
+	if (initAlias != "" || initCanon != "") && strings.TrimSpace(storedNode.ProxyJump) != "" {
+		if err := r.validateSavedNodeJumpWithOrigin(cfg, nodeID, storedNode, host, identity, initAlias, initCanon, nodeID); err != nil {
+			return err
+		}
+	}
+	return ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID)
+}
+
 // CreateNodeContext creates one complete node bundle. Existing referenced
 // records may be reused only when their values are exactly equal; creation can
 // therefore never overwrite another process's host or identity.
 func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node models.Node, host models.Host, identity models.Identity) (mutation NodeMutation, retErr error) {
-	if nodeID == "" {
-		return NodeMutation{}, fmt.Errorf("node ID is empty")
-	}
-	if err := ValidateNodeID(nodeID); err != nil {
-		return NodeMutation{}, err
-	}
-	if err := ValidateNodeAliases(node.Alias); err != nil {
-		return NodeMutation{}, err
-	}
-	if err := ValidateNodeAliases(host.Alias); err != nil {
-		return NodeMutation{}, err
-	}
-	if err := ValidateConcreteHostAddress(host.Address); err != nil {
+	if err := validateCreateNodeInputs(nodeID, node, host); err != nil {
 		return NodeMutation{}, err
 	}
 	initAlias := strings.TrimSpace(node.OpenSSHAlias)
@@ -834,28 +891,7 @@ func (r *Repository) CreateNodeContext(ctx context.Context, nodeID string, node 
 		}
 	}
 	result, err := r.commitResultWithPublishAction(ctx, anyRevision, func(cfg *Configuration) error {
-		if _, exists := cfg.Nodes.Get(nodeID); exists {
-			return fmt.Errorf("create node %q: %w", nodeID, ErrConfigConflict)
-		}
-		if existing, exists := cfg.Hosts.Get(node.HostRef); exists {
-			if !reflect.DeepEqual(existing, host) {
-				return fmt.Errorf("create node %q host ref %q: %w", nodeID, node.HostRef, ErrConfigConflict)
-			}
-		} else {
-			cfg.Hosts.Set(node.HostRef, cloneHost(host))
-		}
-		if existing, exists := cfg.Identities.Get(node.IdentityRef); exists {
-			if !reflect.DeepEqual(existing, identity) {
-				return fmt.Errorf("create node %q identity ref %q: %w", nodeID, node.IdentityRef, ErrConfigConflict)
-			}
-		} else {
-			cfg.Identities.Set(node.IdentityRef, cloneIdentity(identity))
-		}
-		storedNode := cloneNode(node)
-		storedNode.OpenSSHAlias = ""
-		storedNode.CanonicalHost = ""
-		cfg.Nodes.Set(nodeID, storedNode)
-		return nil
+		return r.applyCreateNodeInTransaction(cfg, nodeID, node, host, identity, initAlias, initCanon)
 	}, action)
 	mutation.Outcome = MutationOutcome{Applied: result.Applied, Durable: result.Durable}
 	if !result.Applied {
@@ -935,8 +971,14 @@ func (r *Repository) replaceNodeAtRefWithOutcome(ctx context.Context, ref NodeRe
 	}
 	var authVersion string
 	result, err := r.commitResultContext(ctx, anyRevision, func(cfg *Configuration) error {
-		if err := replaceNodeAtRef(cfg, ref, nodeID, node, host, identity); err != nil {
+		routingChanged, err := replaceNodeAtRefWithRoutingCheck(cfg, ref, nodeID, node, host, identity)
+		if err != nil {
 			return err
+		}
+		if routingChanged {
+			if err := ValidateSavedNodeJumpCycleWithOpenSSH(cfg, r.openSSHParserOrNil(), nodeID); err != nil {
+				return err
+			}
 		}
 		version, versionErr := nodeAuthVersion(cfg, nodeID)
 		if versionErr != nil {
@@ -951,29 +993,42 @@ func (r *Repository) replaceNodeAtRefWithOutcome(ctx context.Context, ref NodeRe
 // replaceNodeAtRef mutates a transaction-local snapshot. Both ordinary edits
 // and credential transactions use the same conflict and shared-reference rules.
 func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
+	_, err := replaceNodeAtRefWithRoutingCheck(cfg, ref, nodeID, node, host, identity)
+	return err
+}
+
+func replaceNodeAtRefWithRoutingCheck(cfg *Configuration, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) (bool, error) {
 	if err := ValidateNodeID(nodeID); err != nil {
-		return err
+		return false, err
 	}
 	if err := ValidateNodeAliases(node.Alias); err != nil {
-		return err
+		return false, err
 	}
 	if err := ValidateNodeAliases(host.Alias); err != nil {
-		return err
+		return false, err
 	}
 	if err := ValidateConcreteHostAddress(host.Address); err != nil {
-		return err
+		return false, err
 	}
 	oldNodeID := ref.ID
-	var oldNode models.Node
+	var (
+		oldNode     models.Node
+		oldHost     models.Host
+		oldIdentity models.Identity
+		hadOldNode  bool
+	)
 	if oldNodeID != "" {
 		if err := ensureNodeRefs(cfg, []NodeRef{ref}); err != nil {
-			return err
+			return false, err
 		}
 		var err error
 		oldNode, err = detachSharedNodeRefs(cfg, ref, nodeID, &node, host, identity)
 		if err != nil {
-			return err
+			return false, err
 		}
+		hadOldNode = true
+		oldHost, _ = cfg.Hosts.Get(oldNode.HostRef)
+		oldIdentity, _ = cfg.Identities.Get(oldNode.IdentityRef)
 	}
 	cfg.Hosts.Set(node.HostRef, cloneHost(host))
 	cfg.Identities.Set(node.IdentityRef, cloneIdentity(identity))
@@ -983,7 +1038,10 @@ func replaceNodeAtRef(cfg *Configuration, ref NodeRef, nodeID string, node model
 	} else if oldNodeID != "" {
 		removeUnusedRefs(cfg, oldNode.HostRef, oldNode.IdentityRef)
 	}
-	return nil
+	if !hadOldNode {
+		return true, nil
+	}
+	return NodeJumpRoutingChanged(oldNodeID, oldNode, oldHost, oldIdentity, nodeID, node, host, identity), nil
 }
 
 func detachSharedNodeRefs(cfg *Configuration, ref NodeRef, nodeID string, node *models.Node, host models.Host, identity models.Identity) (models.Node, error) {

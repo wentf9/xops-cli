@@ -232,7 +232,7 @@ func (m *CredentialMigrator) finishBackendMigration(ctx context.Context, state *
 		return report, err
 	}
 	err = m.withConfigLock(ctx, func() error {
-		current, err := readAndSyncMigrationConfiguration(m.path, state.CandidateHash, "configuration changed during backend verification")
+		current, err := readAndSyncMigrationConfiguration(ctx, m.path, state.CandidateHash, "configuration changed during backend verification")
 		if err != nil {
 			return err
 		}

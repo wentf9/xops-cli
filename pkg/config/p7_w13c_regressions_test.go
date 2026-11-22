@@ -590,20 +590,20 @@ func TestP7W13c_L4_13_L1_MigrationFilesHandleBoundVerificationAndSync(t *testing
 		}
 		digest := migrationDigest(content)
 
-		got, err := readAndSyncMigrationConfiguration(goodPath, digest, "conflict")
+		got, err := readAndSyncMigrationConfiguration(t.Context(), goodPath, digest, "conflict")
 		if err != nil || string(got) != string(content) {
 			t.Fatalf("readAndSyncMigrationConfiguration(good) = (%q, %v), want %q", got, err, content)
 		}
 
 		// Digest mismatch returns ErrConfigConflict.
-		if _, err := readAndSyncMigrationConfiguration(goodPath, migrationDigest([]byte("other")), "changed"); !errors.Is(err, ErrConfigConflict) {
+		if _, err := readAndSyncMigrationConfiguration(t.Context(), goodPath, migrationDigest([]byte("other")), "changed"); !errors.Is(err, ErrConfigConflict) {
 			t.Errorf("readAndSyncMigrationConfiguration(mismatch) = %v, want ErrConfigConflict", err)
 		}
 
 		// Symlink target fails closed with fsx.ErrSymlink.
 		linkPath := filepath.Join(sub, "config.link.yaml")
 		if err := os.Symlink(goodPath, linkPath); err == nil {
-			if _, err := readAndSyncMigrationConfiguration(linkPath, digest, "conflict"); !errors.Is(err, fsx.ErrSymlink) {
+			if _, err := readAndSyncMigrationConfiguration(t.Context(), linkPath, digest, "conflict"); !errors.Is(err, fsx.ErrSymlink) {
 				t.Errorf("readAndSyncMigrationConfiguration(symlink) = %v, want fsx.ErrSymlink", err)
 			}
 		}
@@ -613,7 +613,7 @@ func TestP7W13c_L4_13_L1_MigrationFilesHandleBoundVerificationAndSync(t *testing
 		if err := os.MkdirAll(dirPath, 0o700); err != nil {
 			t.Fatalf("MkdirAll: %v", err)
 		}
-		if _, err := readAndSyncMigrationConfiguration(dirPath, digest, "conflict"); !errors.Is(err, fsx.ErrNonRegular) {
+		if _, err := readAndSyncMigrationConfiguration(t.Context(), dirPath, digest, "conflict"); !errors.Is(err, fsx.ErrNonRegular) {
 			t.Errorf("readAndSyncMigrationConfiguration(dir) = %v, want fsx.ErrNonRegular", err)
 		}
 	})
