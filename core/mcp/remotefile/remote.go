@@ -13,6 +13,7 @@ import (
 
 	pkgsftp "github.com/pkg/sftp"
 	sshfx "github.com/pkg/sftp/v2/encoding/ssh/filexfer"
+	"github.com/wentf9/xops-cli/core/sftp"
 )
 
 type Metadata struct {
@@ -68,24 +69,63 @@ func (r *Session) Inspect(ctx context.Context, name string, upload, overwrite bo
 	return metadata, retErr
 }
 
-func inspectTransferFile(client *pkgsftp.Client, name string, upload, overwrite bool) (Metadata, error) {
-	name = NormalizeSFTPPath(name)
-	if !path.IsAbs(name) || IsRootPath(name) || len(name) > 4096 || strings.ContainsRune(name, '\x00') {
-		return Metadata{}, errors.New("transfer requires an absolute remote file path")
-	}
-	name = path.Clean(name)
-	parent, err := client.RealPath(path.Dir(name))
+func validateResolvedRealPath(raw string) (string, error) {
+	parsed, err := sftp.ParseRemotePath(raw)
 	if err != nil {
-		return Metadata{}, fmt.Errorf("resolve transfer parent directory: %w", err)
+		return "", fmt.Errorf("invalid resolved remote path: %w", err)
+	}
+	if !parsed.IsAbs() {
+		return "", fmt.Errorf("%w: resolved remote path %q is not absolute", sftp.ErrInvalidRemotePath, raw)
+	}
+	return parsed.String(), nil
+}
+
+func validateTransferInputPath(name string) (string, error) {
+	if _, err := sftp.ParseRemotePath(name); err != nil {
+		return "", fmt.Errorf("transfer requires an absolute remote file path: %w", err)
+	}
+	norm := NormalizeSFTPPath(name)
+	parsed, err := sftp.ParseRemotePath(norm)
+	if err != nil || !parsed.IsAbs() || IsRootPath(parsed.String()) || len(parsed.String()) > 4096 {
+		return "", errors.New("transfer requires an absolute remote file path")
+	}
+	return parsed.String(), nil
+}
+
+func resolveTransferTargetPath(client *pkgsftp.Client, name string) (string, error) {
+	rawParent, err := client.RealPath(path.Dir(name))
+	if err != nil {
+		return "", fmt.Errorf("resolve transfer parent directory: %w", err)
+	}
+	parent, err := validateResolvedRealPath(rawParent)
+	if err != nil {
+		return "", fmt.Errorf("resolve transfer parent directory: %w", err)
 	}
 	parentInfo, err := client.Stat(parent)
 	if err != nil {
-		return Metadata{}, fmt.Errorf("inspect transfer parent directory: %w", err)
+		return "", fmt.Errorf("inspect transfer parent directory: %w", err)
 	}
 	if !parentInfo.IsDir() {
-		return Metadata{}, errors.New("transfer parent is not a directory")
+		return "", errors.New("transfer parent is not a directory")
 	}
-	metadata := Metadata{Path: path.Join(parent, path.Base(name))}
+	resolved := path.Join(parent, path.Base(name))
+	parsed, err := sftp.ParseRemotePath(resolved)
+	if err != nil || !parsed.IsAbs() || IsRootPath(parsed.String()) || len(parsed.String()) > 4096 {
+		return "", fmt.Errorf("resolve transfer file path: %w", sftp.ErrInvalidRemotePath)
+	}
+	return parsed.String(), nil
+}
+
+func inspectTransferFile(client *pkgsftp.Client, name string, upload, overwrite bool) (Metadata, error) {
+	validName, err := validateTransferInputPath(name)
+	if err != nil {
+		return Metadata{}, err
+	}
+	resolvedPath, err := resolveTransferTargetPath(client, validName)
+	if err != nil {
+		return Metadata{}, err
+	}
+	metadata := Metadata{Path: resolvedPath}
 	info, err := client.Lstat(metadata.Path)
 	if err != nil && (!upload || !errors.Is(err, os.ErrNotExist)) {
 		return metadata, fmt.Errorf("inspect transfer file: %w", err)
@@ -93,6 +133,9 @@ func inspectTransferFile(client *pkgsftp.Client, name string, upload, overwrite 
 	if err == nil {
 		if !info.Mode().IsRegular() {
 			return metadata, errors.New("transfer accepts ordinary files only, not symbolic links or special files")
+		}
+		if info.Size() < 0 {
+			return Metadata{}, fmt.Errorf("%w: remote file %q has negative size %d", sftp.ErrInvalidRemoteSize, metadata.Path, info.Size())
 		}
 		if upload && !overwrite {
 			return metadata, fmt.Errorf("upload destination already exists: %w", os.ErrExist)
@@ -176,6 +219,9 @@ func verifyDownloadHandle(file *pkgsftp.File, expected Metadata) error {
 	info, err := file.Stat()
 	if err != nil {
 		return fmt.Errorf("inspect opened download file: %w", err)
+	}
+	if info.Size() < 0 {
+		return fmt.Errorf("%w: remote file %q has negative size %d", sftp.ErrInvalidRemoteSize, expected.Path, info.Size())
 	}
 	if !info.Mode().IsRegular() || info.Size() != expected.Size || info.ModTime().UnixNano() != expected.ModTime {
 		return errors.New("opened download source changed during transfer")
@@ -292,8 +338,17 @@ func IsPermissionDenied(err error) bool {
 }
 
 func (r *Session) Remove(ctx context.Context, name string) error {
+	parsedName, err := sftp.ParseRemotePath(name)
+	if err != nil || !parsedName.IsAbs() || IsRootPath(parsedName.String()) {
+		return fmt.Errorf("%w: cleanup requires an absolute remote file path", sftp.ErrInvalidRemotePath)
+	}
+	name = parsedName.String()
 	return r.client.Do(ctx, func(client *pkgsftp.Client) error {
-		parent, err := client.RealPath(path.Dir(name))
+		rawParent, err := client.RealPath(path.Dir(name))
+		if err != nil {
+			return fmt.Errorf("resolve cleanup parent: %w", err)
+		}
+		parent, err := validateResolvedRealPath(rawParent)
 		if err != nil {
 			return fmt.Errorf("resolve cleanup parent: %w", err)
 		}

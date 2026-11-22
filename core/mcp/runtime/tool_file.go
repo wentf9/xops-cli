@@ -85,15 +85,48 @@ type replacePreset struct {
 
 var errPreserveOwnerFallback = errors.New("cannot preserve original file ownership on temporary file")
 
+func validateRemoteFilePath(raw string) (string, error) {
+	if raw == "" || strings.TrimSpace(raw) == "" {
+		return "", errors.New("file path must be absolute")
+	}
+	// Check raw input before path cleaning so control characters inside
+	// segments collapsed by ".." (e.g. "/tmp/bad\n/../good") cannot slip through.
+	if _, err := sftp.ParseRemotePath(raw); err != nil {
+		return "", fmt.Errorf("invalid file path: %w", err)
+	}
+	norm := remotefile.NormalizeSFTPPath(raw)
+	if !strings.HasPrefix(norm, "/") {
+		return "", errors.New("file path must be absolute")
+	}
+	parsed, err := sftp.ParseRemotePath(norm)
+	if err != nil {
+		return "", fmt.Errorf("invalid file path: %w", err)
+	}
+	if !parsed.IsAbs() {
+		return "", errors.New("file path must be absolute")
+	}
+	return parsed.String(), nil
+}
+
 func (r *Runtime) fileHandler(ctx context.Context, _ *mcp.CallToolRequest, input FileInput) (_ *mcp.CallToolResult, _ FileOutput, handlerErr error) {
 	if input.NodeID == "" || input.Path == "" || input.Action == "" {
 		return nil, FileOutput{}, errors.New("nodeID, action, and path are required")
 	}
-	input.Path = remotefile.NormalizeSFTPPath(input.Path)
 	switch input.Action {
 	case "read", "write", "patch", "stat":
 	default:
 		return nil, FileOutput{}, fmt.Errorf("unsupported file action %q (expected read, write, patch, or stat)", input.Action)
+	}
+	validPath, err := validateRemoteFilePath(input.Path)
+	if err != nil {
+		return nil, FileOutput{}, err
+	}
+	input.Path = validPath
+	if input.Action != "stat" && remotefile.IsRootPath(input.Path) {
+		if input.Action == "read" {
+			return nil, FileOutput{}, errors.New("cannot read root directory as a file")
+		}
+		return nil, FileOutput{}, errors.New("cannot replace root directory")
 	}
 
 	files, err := r.getMCPSFTPClient(ctx, input.NodeID)
@@ -138,6 +171,12 @@ func readBounded(ctx context.Context, files ports.FileSession, name string) (dat
 		if info.IsDir() {
 			return fmt.Errorf("%s is a directory; use action=stat", name)
 		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file (mode %s)", name, info.Mode().String())
+		}
+		if info.Size() < 0 {
+			return fmt.Errorf("%w: remote file %q has negative size %d", sftp.ErrInvalidRemoteSize, name, info.Size())
+		}
 		data, err = io.ReadAll(io.LimitReader(f, maxFileReadBytes+1))
 		if err != nil {
 			return fmt.Errorf("read remote file: %w", err)
@@ -151,10 +190,11 @@ func readBounded(ctx context.Context, files ports.FileSession, name string) (dat
 }
 
 func validateReadInput(input FileInput) (FileInput, error) {
-	input.Path = remotefile.NormalizeSFTPPath(input.Path)
-	if !path.IsAbs(input.Path) || strings.ContainsRune(input.Path, '\x00') {
-		return FileInput{}, errors.New("file path must be absolute")
+	validPath, err := validateRemoteFilePath(input.Path)
+	if err != nil {
+		return FileInput{}, err
 	}
+	input.Path = validPath
 	if remotefile.IsRootPath(input.Path) {
 		return FileInput{}, errors.New("cannot read root directory as a file")
 	}
@@ -244,6 +284,14 @@ func fileWrite(ctx context.Context, files ports.FileSession, input FileInput) (F
 }
 
 func filePatch(ctx context.Context, files ports.FileSession, input FileInput) (FileOutput, error) {
+	validPath, err := validateRemoteFilePath(input.Path)
+	if err != nil {
+		return FileOutput{}, err
+	}
+	if remotefile.IsRootPath(validPath) {
+		return FileOutput{}, errors.New("cannot replace root directory")
+	}
+	input.Path = validPath
 	if input.Content == "" {
 		return FileOutput{}, errors.New("patch action requires non-empty content with <<<< ==== >>>> blocks")
 	}
@@ -291,14 +339,14 @@ func filePatch(ctx context.Context, files ports.FileSession, input FileInput) (F
 // content hash must still match so concurrent edits are never overwritten.
 // Symbolic links and special files are always refused.
 func replaceFile(ctx context.Context, files ports.FileSession, name string, content []byte, expected *fileSnapshot) (bool, error) {
-	name = remotefile.NormalizeSFTPPath(name)
-	if !path.IsAbs(name) || strings.ContainsRune(name, '\x00') {
-		return false, errors.New("file path must be absolute")
+	validName, err := validateRemoteFilePath(name)
+	if err != nil {
+		return false, err
 	}
-	if remotefile.IsRootPath(name) {
+	if remotefile.IsRootPath(validName) {
 		return false, errors.New("cannot replace root directory")
 	}
-	name = path.Clean(name)
+	name = validName
 	dir := path.Dir(name)
 
 	preset, err := prepareReplace(ctx, files, name, dir, expected)
@@ -334,6 +382,8 @@ func prepareReplace(ctx context.Context, files ports.FileSession, name, dir stri
 			return fmt.Errorf("inspect %s: %w", name, lstatErr)
 		case !info.Mode().IsRegular():
 			return fmt.Errorf("%s is not a regular file (symbolic links and special files are not replaced)", name)
+		case info.Size() < 0:
+			return fmt.Errorf("%w: remote file %q has negative size %d", sftp.ErrInvalidRemoteSize, name, info.Size())
 		}
 		if expected != nil && (info.Size() != expected.size || !info.ModTime().Equal(expected.modTime)) {
 			return fmt.Errorf("%s changed since it was read; re-read and retry", name)
@@ -465,6 +515,9 @@ func writeInPlace(ctx context.Context, files ports.FileSession, name string, con
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("%s is not a regular file (symbolic links and special files are not replaced)", name)
 		}
+		if info.Size() < 0 {
+			return fmt.Errorf("%w: remote file %q has negative size %d", sftp.ErrInvalidRemoteSize, name, info.Size())
+		}
 		if err := verifyUnchanged(c, name, info, expected); err != nil {
 			return err
 		}
@@ -502,14 +555,23 @@ func randomHex(n int) (string, error) {
 }
 
 func fileStat(ctx context.Context, files ports.FileSession, input FileInput) (FileOutput, error) {
+	validPath, err := validateRemoteFilePath(input.Path)
+	if err != nil {
+		return FileOutput{}, err
+	}
+	input.Path = validPath
+
 	var info os.FileInfo
 	var treeContent string
 
-	err := files.Do(ctx, func(c *pkgsftp.Client) error {
+	err = files.Do(ctx, func(c *pkgsftp.Client) error {
 		var statErr error
 		info, statErr = c.Stat(input.Path)
 		if statErr != nil {
 			return fmt.Errorf("stat failed: %w", statErr)
+		}
+		if info.Size() < 0 {
+			return fmt.Errorf("%w: remote path %q has negative size %d", sftp.ErrInvalidRemoteSize, input.Path, info.Size())
 		}
 		if !info.IsDir() {
 			treeContent = fmt.Sprintf("%s (%s, %d bytes, modified %s)",
@@ -549,7 +611,7 @@ func buildDirTree(c *pkgsftp.Client, dirPath, prefix string, depth int, b *strin
 	}
 	entries, err := sftp.ReadValidatedDir(c, dirPath)
 	if err != nil {
-		if errors.Is(err, sftp.ErrUnsafeRemoteDirEntry) || errors.Is(err, sftp.ErrInvalidRemotePath) {
+		if errors.Is(err, sftp.ErrUnsafeRemoteDirEntry) || errors.Is(err, sftp.ErrInvalidRemotePath) || errors.Is(err, sftp.ErrInvalidRemoteSize) {
 			return err
 		}
 		fmt.Fprintf(b, "%s└── [unreadable: %v]\n", prefix, err)
@@ -557,6 +619,9 @@ func buildDirTree(c *pkgsftp.Client, dirPath, prefix string, depth int, b *strin
 	}
 	var filtered []os.FileInfo
 	for _, entry := range entries {
+		if entry.Size() < 0 {
+			return fmt.Errorf("%w: remote entry %q has negative size %d", sftp.ErrInvalidRemoteSize, path.Join(dirPath, entry.Name()), entry.Size())
+		}
 		if entry.IsDir() && ignoredStatDirs[entry.Name()] {
 			continue
 		}
@@ -624,7 +689,7 @@ func (r *Runtime) registerFile(server *mcp.Server, g *guardrail.Guardrail) {
 				return guardrail.RiskInput{
 					Action: in.Action,
 					NodeID: in.NodeID,
-					Paths:  []string{remotefile.NormalizeSFTPPath(in.Path)},
+					Paths:  []string{riskRemotePath(in.Path)},
 				}
 			},
 			r.fileHandler,

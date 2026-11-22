@@ -12,6 +12,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type Direction string
@@ -70,11 +71,25 @@ type Spec struct {
 	SourceModTime int64     `json:"sourceModTime,omitempty"`
 }
 
+func hasControlOrLineSep(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return true
+		}
+	}
+	return false
+}
+
 func (s Spec) validateIdentity() error {
 	if s.RequestDigest != "" && !validHex(s.RequestDigest, sha256.Size) {
 		return errors.New("invalid transfer request digest")
 	}
-	if len(s.RequestedPath) > 4096 || strings.ContainsRune(s.RequestedPath, '\x00') {
+	if len(s.RequestedPath) > 4096 || hasControlOrLineSep(s.RequestedPath) {
 		return errors.New("invalid requested transfer path")
 	}
 	if s.RequestID == "" || len(s.RequestID) > 128 || s.Scope == "" || len(s.Scope) > 256 {
@@ -95,7 +110,7 @@ func (s Spec) validate() error {
 		return err
 	}
 	if !path.IsAbs(s.RemotePath) || path.Clean(s.RemotePath) != s.RemotePath || s.RemotePath == "/" || isDriveRoot(s.RemotePath) ||
-		len(s.RemotePath) > 4096 || strings.ContainsRune(s.RemotePath, '\x00') {
+		len(s.RemotePath) > 4096 || hasControlOrLineSep(s.RemotePath) {
 		return errors.New("transfer requires a normalized absolute remote file path")
 	}
 	if s.Size < 0 {

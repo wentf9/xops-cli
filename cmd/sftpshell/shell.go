@@ -711,7 +711,7 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 		}
 
 		if err := s.saveCommandHistory(input); err != nil {
-			s.fprintfStderr("save SFTP shell history failed: %v\n", err)
+			s.fprintfStderr("save SFTP shell history failed: %s\n", sanitizeDisplayText(err.Error()))
 		}
 
 		// ! 前缀：本地执行快捷方式（如 `!ls` 或 `! ls -la`）
@@ -759,7 +759,7 @@ func (s *Shell) Run(ctx context.Context) (runErr error) {
 				if s.batch {
 					return fmt.Errorf("restore sftp client failed: %w", err)
 				}
-				s.fprintfStderr("restore sftp client failed: %v\n", err)
+				s.fprintfStderr("restore sftp client failed: %s\n", sanitizeDisplayText(err.Error()))
 				if outputErr := s.takeDisplayError(); outputErr != nil {
 					return outputErr
 				}
@@ -870,7 +870,7 @@ func (s *Shell) reportCommandError(err error) error {
 	if errors.Is(err, ErrPromptInterrupted) {
 		return nil
 	}
-	s.fprintfStderr("%v\n", err)
+	s.fprintfStderr("%s\n", sanitizeDisplayText(err.Error()))
 	return s.takeDisplayError()
 }
 
@@ -1463,7 +1463,7 @@ func (s *Shell) handleGet(ctx context.Context, args []string) error {
 
 func (s *Shell) prepareDownloadTransferHooks(ctx context.Context, cli *sftp.Client, target sftp.DownloadTargetInfo) (*sftp.DownloadTransferHooks, error) {
 	remote := target.Remote.String()
-	s.fprintlnStdout(i18n.Tf("sftp_shell_downloading", map[string]any{"Remote": remote, "Local": target.LocalPath}))
+	s.fprintlnStdout(i18n.Tf("sftp_shell_downloading", map[string]any{"Remote": sanitizeDisplayText(remote), "Local": sanitizeDisplayText(target.LocalPath)}))
 
 	rootInfo := target.Info
 	if rootInfo == nil || rootInfo.Mode()&os.ModeSymlink != 0 {
@@ -1630,7 +1630,7 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 		}
 	}
 
-	s.fprintlnStdout(i18n.Tf("sftp_shell_uploading", map[string]any{"Local": local, "Remote": remote}))
+	s.fprintlnStdout(i18n.Tf("sftp_shell_uploading", map[string]any{"Local": sanitizeDisplayText(local), "Remote": sanitizeDisplayText(remote)}))
 
 	// 计算本地文件大小以显示准确的进度条
 	localStat, localStatErr := os.Stat(local)

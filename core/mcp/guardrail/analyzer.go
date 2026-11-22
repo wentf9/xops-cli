@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
 )
 
 // blocked patterns are always denied — no approval can override them.
@@ -177,8 +178,26 @@ func AnalyzePaths(paths []string) RiskLevel {
 	return level
 }
 
+func isControlOrLineSep(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
+}
+
+func hasControlOrLineSep(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	for _, r := range s {
+		if isControlOrLineSep(r) {
+			return true
+		}
+	}
+	return false
+}
+
 func analyzeSinglePath(p string) RiskLevel {
-	if p == "" {
+	if p == "" || hasControlOrLineSep(p) {
 		return Dangerous
 	}
 	if _, rest, ok := parseDrivePath(p); ok {
@@ -208,8 +227,13 @@ func analyzeDrivePath(rest string) RiskLevel {
 }
 
 func analyzePosixPath(p string) RiskLevel {
+	// Relative paths cannot be proven outside protected directories or root
+	// without knowing the working directory; fail closed as Dangerous.
+	if !strings.HasPrefix(p, "/") {
+		return Dangerous
+	}
 	cleaned := path.Clean(p)
-	if cleaned == "" || cleaned == "/" || cleaned == "." {
+	if cleaned == "" || cleaned == "/" || cleaned == "." || !strings.HasPrefix(cleaned, "/") {
 		return Dangerous
 	}
 	for _, sensitive := range sensitivePaths {
