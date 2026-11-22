@@ -345,8 +345,8 @@ func verifyPass5M5SavedAndUnsafeHostName(t *testing.T, repo *config.Repository) 
 	if err := oUnsafe.Complete(cmdUnsafe, cmdUnsafe.Flags().Args()); err != nil {
 		t.Fatalf("Complete(unsafe): %v", err)
 	}
-	if err := oUnsafe.Validate(); err != nil {
-		t.Fatalf("Validate(unsafe): %v", err)
+	if err := oUnsafe.Validate(); err == nil || !strings.Contains(err.Error(), "control character") {
+		t.Fatalf("Validate(unsafe) err = %v, want fail-closed control character error", err)
 	}
 	if _, err := oUnsafe.buildAdapterOptions("ops@Bad\tHost:22", repo.Snapshot(), repo); err == nil || !strings.Contains(err.Error(), "ASCII control") {
 		t.Fatalf("expected ASCII control error for non-saved tab host with -o HostName=%%h, got: %v", err)

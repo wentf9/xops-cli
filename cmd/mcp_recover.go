@@ -60,10 +60,7 @@ func newCmdMCPRecover() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			provider, err = config.NewProvider(cfg)
-			if err != nil {
-				return err
-			}
+			provider = config.NewProviderWithBrokenOpenSSHFallback(cfg)
 			registry, err := utils.GetCredentialRegistry(cfg)
 			if err != nil {
 				return err

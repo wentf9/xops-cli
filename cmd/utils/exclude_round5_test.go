@@ -58,7 +58,7 @@ Host 2001:db8::9
   Port 2222
 
 Host fe80::1%eth0
-  HostName fe80::1%eth0
+  HostName fe80::1%%eth0
   User root
 `)
 

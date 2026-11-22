@@ -22,7 +22,12 @@ func TestEnsureNodeContext_ExplicitUserReusesHostCreatesIdentityAndNode(t *testi
 	cfg := cloneConfiguration(nil)
 
 	cfg.Hosts.Set("10.238.221.181:22", models.Host{Address: "10.238.221.181", Port: 22})
+	cfg.Hosts.Set("10.238.221.254:22", models.Host{Address: "10.238.221.254", Port: 22})
 	cfg.Identities.Set("iaas@10.238.221.181", models.Identity{User: "iaas", AuthType: "auto", Password: "secretPassword"})
+	cfg.Nodes.Set("jump-01", models.Node{
+		HostRef:     "10.238.221.254:22",
+		IdentityRef: "iaas@10.238.221.181",
+	})
 	cfg.Nodes.Set("iaas@10.238.221.181:22", models.Node{
 		HostRef:     "10.238.221.181:22",
 		IdentityRef: "iaas@10.238.221.181",
@@ -61,9 +66,9 @@ func TestEnsureNodeContext_ExplicitUserReusesHostCreatesIdentityAndNode(t *testi
 	}
 
 	snap := repo.Snapshot()
-	// Host must be reused (still 1 host)
-	if len(snap.Hosts.Keys()) != 1 {
-		t.Errorf("expected 1 host, got %d", len(snap.Hosts.Keys()))
+	// Host must be reused (still 2 hosts: target + jump-01)
+	if len(snap.Hosts.Keys()) != 2 {
+		t.Errorf("expected 2 hosts (target reused + jump-01), got %d", len(snap.Hosts.Keys()))
 	}
 	node, ok := snap.Nodes.Get(expectedNodeID)
 	if !ok {
@@ -360,7 +365,12 @@ func TestEnsureNodeContext_ProxyJumpInheritance(t *testing.T) {
 	t.Run("inherits unique proxy jump", func(t *testing.T) {
 		cfg := cloneConfiguration(nil)
 		cfg.Hosts.Set("10.0.0.1:22", models.Host{Address: "10.0.0.1", Port: 22})
+		cfg.Hosts.Set("10.0.0.254:22", models.Host{Address: "10.0.0.254", Port: 22})
 		cfg.Identities.Set("user1@10.0.0.1", models.Identity{User: "user1", AuthType: "auto"})
+		cfg.Nodes.Set("bastion", models.Node{
+			HostRef:     "10.0.0.254:22",
+			IdentityRef: "user1@10.0.0.1",
+		})
 		cfg.Nodes.Set("user1@10.0.0.1:22", models.Node{
 			HostRef:     "10.0.0.1:22",
 			IdentityRef: "user1@10.0.0.1",
@@ -389,8 +399,13 @@ func TestEnsureNodeContext_ProxyJumpInheritance(t *testing.T) {
 	t.Run("inherits when multiple nodes have same proxy jump", func(t *testing.T) {
 		cfg := cloneConfiguration(nil)
 		cfg.Hosts.Set("10.0.0.1:22", models.Host{Address: "10.0.0.1", Port: 22})
+		cfg.Hosts.Set("10.0.0.254:22", models.Host{Address: "10.0.0.254", Port: 22})
 		cfg.Identities.Set("user1@10.0.0.1", models.Identity{User: "user1", AuthType: "auto"})
 		cfg.Identities.Set("user2@10.0.0.1", models.Identity{User: "user2", AuthType: "auto"})
+		cfg.Nodes.Set("bastion", models.Node{
+			HostRef:     "10.0.0.254:22",
+			IdentityRef: "user1@10.0.0.1",
+		})
 		cfg.Nodes.Set("user1@10.0.0.1:22", models.Node{
 			HostRef:     "10.0.0.1:22",
 			IdentityRef: "user1@10.0.0.1",
@@ -1588,7 +1603,12 @@ func TestEnsureNodeContext_ChangeUserPreservesPortAndProxyJump(t *testing.T) {
 	ctx := context.Background()
 	cfg := cloneConfiguration(nil)
 	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Hosts.Set("10.0.0.254:22", models.Host{Address: "10.0.0.254", Port: 22})
 	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	cfg.Nodes.Set("upstream", models.Node{
+		HostRef:     "10.0.0.254:22",
+		IdentityRef: "root@10.0.0.5:2222",
+	})
 	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
 		HostRef:     "10.0.0.5:2222",
 		IdentityRef: "root@10.0.0.5:2222",
@@ -1680,8 +1700,13 @@ func TestEnsureNodeContext_ChangeUserMultiNodeSamePort(t *testing.T) {
 	ctx := context.Background()
 	cfg := cloneConfiguration(nil)
 	cfg.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	cfg.Hosts.Set("10.0.0.254:22", models.Host{Address: "10.0.0.254", Port: 22})
 	cfg.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
 	cfg.Identities.Set("admin@10.0.0.5:2222", models.Identity{User: "admin", AuthType: "auto"})
+	cfg.Nodes.Set("upstream", models.Node{
+		HostRef:     "10.0.0.254:22",
+		IdentityRef: "root@10.0.0.5:2222",
+	})
 	cfg.Nodes.Set("root@10.0.0.5:2222", models.Node{
 		HostRef:     "10.0.0.5:2222",
 		IdentityRef: "root@10.0.0.5:2222",

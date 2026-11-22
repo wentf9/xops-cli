@@ -216,11 +216,8 @@ func resolveSingleExcludeBySelector(
 			if canonID, canonErr := provider.ResolveSelector(canonEx); canonErr == nil && canonID != "" {
 				nodeID = canonID
 				err = nil
-			} else {
-				var ambigErr *config.AmbiguousNodeError
-				if errors.As(canonErr, &ambigErr) {
-					err = canonErr
-				}
+			} else if canonErr != nil && !errors.Is(canonErr, config.ErrNodeNotFound) {
+				err = canonErr
 			}
 		}
 	}
@@ -234,22 +231,48 @@ func resolveSingleExcludeBySelector(
 		}
 		return true, nil
 	}
-	if config.IsOpenSSHNodeID(nodeID) && providerOpenSSHHasConcreteHost(provider, nodeID) {
-		recordExcludeKey(resolved, nodeID)
-		if !hasOpenSSHPrefix && len(candidates) > 0 {
-			aliasHost := config.UnwrapOpenSSHSelector(nodeID)
-			if res, rErr := config.ResolveTarget(provider, config.ConnectionTarget{Selector: nodeID}); rErr == nil {
-				addOpenSSHSavedCandidates(resolved, aliasHost, res.Host, res.Port, "", 0, candidates)
-			}
-		}
-		if !hasOpenSSHPrefix && addrHost != "" {
-			if _, cErr := expandExcludeCanonicalCandidates(provider, addrUser, addrHost, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump); cErr != nil {
-				return false, cErr
-			}
-		}
-		return true, nil
+	if config.IsOpenSSHNodeID(nodeID) {
+		return resolveOpenSSHExcludeBySelector(provider, ex, nodeID, hasOpenSSHPrefix, addrUser, addrHost, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump)
 	}
 	return false, nil
+}
+
+func resolveOpenSSHExcludeBySelector(
+	provider config.ConfigProvider,
+	ex, nodeID string,
+	hasOpenSSHPrefix bool,
+	addrUser, addrHost string,
+	addrPort uint16,
+	candidates []ExcludeTargetInfo,
+	resolved map[string]struct{},
+	rawCLIOptions []string,
+	cliProxyJump string,
+) (bool, error) {
+	hasConcrete, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, nodeID)
+	if concreteErr != nil {
+		return false, fmt.Errorf("resolve excluded node %q failed: %w", ex, concreteErr)
+	}
+	if !hasConcrete {
+		return false, nil
+	}
+	recordExcludeKey(resolved, nodeID)
+	if !hasOpenSSHPrefix && len(candidates) > 0 {
+		aliasHost := config.UnwrapOpenSSHSelector(nodeID)
+		res, rErr := config.ResolveTarget(provider, config.ConnectionTarget{Selector: nodeID})
+		if rErr != nil {
+			if !errors.Is(rErr, config.ErrNodeNotFound) {
+				return false, fmt.Errorf("resolve excluded node %q failed: %w", ex, rErr)
+			}
+		} else {
+			addOpenSSHSavedCandidates(resolved, aliasHost, res.Host, res.Port, "", 0, candidates)
+		}
+	}
+	if !hasOpenSSHPrefix && addrHost != "" {
+		if _, cErr := expandExcludeCanonicalCandidates(provider, addrUser, addrHost, addrPort, candidates, resolved, rawCLIOptions, cliProxyJump); cErr != nil {
+			return false, cErr
+		}
+	}
+	return true, nil
 }
 
 func parseExcludeSpec(ex string) (hasOpenSSHPrefix bool, user, host string, port uint16, ok bool) {
@@ -272,7 +295,10 @@ func resolveExcludeViaTarget(
 	if provider == nil {
 		return false, nil
 	}
-	hasConcreteOpenSSH := providerOpenSSHHasConcreteHost(provider, addrHost)
+	hasConcreteOpenSSH, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, addrHost)
+	if concreteErr != nil {
+		return false, fmt.Errorf("resolve excluded node %q failed: %w", rawEx, concreteErr)
+	}
 	inSaved := !hasOpenSSHPrefix && selectorInSavedInventory(provider, addrHost)
 	if !hasConcreteOpenSSH && !inSaved {
 		return false, nil
@@ -290,8 +316,7 @@ func resolveExcludeViaTarget(
 		HasPort:  addrPort != 0,
 	})
 	if err != nil {
-		var ambigErr *config.AmbiguousNodeError
-		if errors.As(err, &ambigErr) {
+		if !errors.Is(err, config.ErrNodeNotFound) {
 			return false, fmt.Errorf("resolve excluded node %q failed: %w", rawEx, err)
 		}
 		return false, nil
@@ -431,7 +456,10 @@ func expandExcludeCanonicalCandidates(
 	canonHosts := config.CanonicalDomainCandidatesWithOptions(provider, addrHost, rawCLIOptions, cliProxyJump)
 	matchedAny := false
 	for _, fqdn := range canonHosts {
-		concreteFQDN := providerOpenSSHHasConcreteHost(provider, fqdn)
+		concreteFQDN, concreteErr := providerOpenSSHHasConcreteHostChecked(provider, fqdn)
+		if concreteErr != nil {
+			return false, fmt.Errorf("resolve excluded node %q failed: %w", fqdn, concreteErr)
+		}
 		matchedCandidate := false
 		for _, cand := range candidates {
 			if candidateMatchesHost(cand, fqdn, "") && matchesUserPortFilter(cand, addrUser, addrPort) {
@@ -668,18 +696,35 @@ func recordCandidateTrialExclude(
 }
 
 func providerOpenSSHHasConcreteHost(provider config.ConfigProvider, host string) bool {
+	ok, err := providerOpenSSHHasConcreteHostChecked(provider, host)
+	return err == nil && ok
+}
+
+func providerOpenSSHHasConcreteHostChecked(provider config.ConfigProvider, host string) (bool, error) {
 	clean := config.UnwrapOpenSSHSelector(host)
 	if provider == nil || clean == "" || !config.HasOpenSSHConfig(provider) {
-		return false
+		return false, nil
 	}
 	if src, ok := provider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok {
 		parser := src.GetOpenSSHParser()
-		return parser != nil && parser.HasHost(clean)
+		if parser == nil {
+			return false, nil
+		}
+		if err := parser.Err(); err != nil {
+			return false, err
+		}
+		return parser.HasHost(clean), nil
 	}
 	res, err := config.ResolveTarget(provider, config.ConnectionTarget{
 		Selector: config.OpenSSHNodePrefix + clean,
 	})
-	return err == nil && res.OpenSSHAlias != ""
+	if err != nil {
+		if errors.Is(err, config.ErrNodeNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	return res.OpenSSHAlias != "", nil
 }
 
 func isOpenSSHCandidate(cand ExcludeTargetInfo) bool {

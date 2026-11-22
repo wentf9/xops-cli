@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -479,10 +478,9 @@ func (o *SshOptions) parseTarget(allowMissingHost bool) error {
 	} else if finalHost != "" && !o.preserveDaemonSelector {
 		u, h, p, err := utils.ParseAddr(finalHost)
 		if err != nil {
-			if config.IsOpenSSHNodeID(strings.TrimSpace(finalHost)) || strings.ContainsRune(finalHost, ',') {
-				return err
-			}
-		} else if h != "" {
+			return err
+		}
+		if h != "" {
 			finalHost, finalUser, hasUser, finalPort, hasPort = applyParsedAddr("", finalUser, hasUser, finalPort, hasPort, h, u, p)
 		}
 	}
@@ -723,7 +721,6 @@ func (o *SshOptions) loadBackgroundSessionProbeProvider() (config.ConfigProvider
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return nil, fmt.Errorf("stat config file %q: %w", configPath, statErr)
 	}
-	var openSSH *config.OpenSSHParser
 	cfgFile := strings.TrimSpace(o.control.ConfigFile)
 	if cfgFile != "" {
 		var base config.ConfigProvider
@@ -732,25 +729,7 @@ func (o *SshOptions) loadBackgroundSessionProbeProvider() (config.ConfigProvider
 		}
 		return config.WithOpenSSHConfigOverride(base, cfgFile)
 	}
-	if home, homeErr := os.UserHomeDir(); homeErr == nil && strings.TrimSpace(home) != "" {
-		defaultPath := filepath.Join(home, ".ssh", "config")
-		if _, statErr := os.Stat(defaultPath); statErr == nil {
-			p, parseErr := config.NewOpenSSHParserFromPath(defaultPath)
-			if parseErr != nil {
-				return nil, parseErr
-			}
-			openSSH = p
-		} else if !errors.Is(statErr, os.ErrNotExist) {
-			return nil, fmt.Errorf("stat OpenSSH config %q: %w", defaultPath, statErr)
-		}
-	}
-	if cfg == nil && openSSH == nil {
-		return nil, nil
-	}
-	if openSSH != nil {
-		return config.NewProviderWithOpenSSHParser(cfg, openSSH), nil
-	}
-	return config.NewProviderWithoutOpenSSH(cfg), nil
+	return config.NewProviderWithBrokenOpenSSHFallback(cfg), nil
 }
 
 func (o *SshOptions) probeTargetBackgroundSession(

@@ -63,6 +63,18 @@ func NewProvider(cfg *Configuration) (*Provider, error) {
 	return newProvider(cfg, openSSH), nil
 }
 
+// NewProviderWithBrokenOpenSSHFallback creates a read-only provider using cfg
+// and the default ~/.ssh/config. If loading or parsing ~/.ssh/config fails, the
+// error is recorded in NewBrokenOpenSSHParser so saved-node operations continue
+// working while OpenSSH-backed lookups still fail closed.
+func NewProviderWithBrokenOpenSSHFallback(cfg *Configuration) *Provider {
+	openSSH, err := NewOpenSSHParser()
+	if err != nil {
+		return newProvider(cfg, NewBrokenOpenSSHParser(fmt.Errorf("load openssh config: %w", err)))
+	}
+	return newProvider(cfg, openSSH)
+}
+
 // NewProviderWithoutOpenSSH creates a provider without an OpenSSH fallback.
 func NewProviderWithoutOpenSSH(cfg *Configuration) *Provider {
 	return newProvider(cfg, &OpenSSHParser{cfg: nil})

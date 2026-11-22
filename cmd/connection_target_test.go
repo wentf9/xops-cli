@@ -38,10 +38,18 @@ func setupTestRepository(t *testing.T) *config.Repository {
 		Address: "10.238.221.181",
 		Port:    22,
 	})
+	snapshot.Hosts.Set("10.238.221.254:22", models.Host{
+		Address: "10.238.221.254",
+		Port:    22,
+	})
 	snapshot.Identities.Set("iaas@10.238.221.181", models.Identity{
 		User:     "iaas",
 		AuthType: "auto",
 		Password: "secretPassword",
+	})
+	snapshot.Nodes.Set("jump-01", models.Node{
+		HostRef:     "10.238.221.254:22",
+		IdentityRef: "iaas@10.238.221.181",
 	})
 	snapshot.Nodes.Set("iaas@10.238.221.181:22", models.Node{
 		HostRef:     "10.238.221.181:22",
@@ -88,8 +96,8 @@ func testSSHExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 			t.Errorf("ssh got nodeID=%q, pending=%v, want test@10.238.221.181:22, true", nodeID, repo.IsPendingNode(nodeID))
 		}
 		snap := repo.Snapshot()
-		if len(snap.Hosts.Keys()) != 1 {
-			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		if len(snap.Hosts.Keys()) != 2 {
+			t.Errorf("expected host to be reused (2 hosts including jump-01), got %d", len(snap.Hosts.Keys()))
 		}
 		node, _, ident, resolveErr := repo.Resolve(nodeID)
 		if resolveErr != nil || node.ProxyJump != "jump-01" {
@@ -120,8 +128,8 @@ func testSFTPExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 			t.Errorf("sftp got nodeID=%q, pending=%v, want test@10.238.221.181:22, true", nodeID, repo.IsPendingNode(nodeID))
 		}
 		snap := repo.Snapshot()
-		if len(snap.Hosts.Keys()) != 1 {
-			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		if len(snap.Hosts.Keys()) != 2 {
+			t.Errorf("expected host to be reused (2 hosts including jump-01), got %d", len(snap.Hosts.Keys()))
 		}
 		return nil
 	}); err != nil {
@@ -144,8 +152,8 @@ func testSCPExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 			t.Errorf("scp got nodeID=%q, pending=%v, want test@10.238.221.181:22, true", nodeID, repo.IsPendingNode(nodeID))
 		}
 		snap := repo.Snapshot()
-		if len(snap.Hosts.Keys()) != 1 {
-			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		if len(snap.Hosts.Keys()) != 2 {
+			t.Errorf("expected host to be reused (2 hosts including jump-01), got %d", len(snap.Hosts.Keys()))
 		}
 		return nil
 	}); err != nil {
@@ -165,8 +173,8 @@ func testExecExplicitUserReusesHost(t *testing.T, ctx context.Context) {
 			t.Errorf("exec got tasks=%+v, want 1 task with nodeID=test@10.238.221.181:22", tasks)
 		}
 		snap := repo.Snapshot()
-		if len(snap.Hosts.Keys()) != 1 {
-			t.Errorf("expected host to be reused (1 host), got %d", len(snap.Hosts.Keys()))
+		if len(snap.Hosts.Keys()) != 2 {
+			t.Errorf("expected host to be reused (2 hosts including jump-01), got %d", len(snap.Hosts.Keys()))
 		}
 		return nil
 	}); err != nil {
@@ -295,7 +303,7 @@ func TestCommands_Consistency_ExplicitPort(t *testing.T) {
 			t.Errorf("got nodeID=%q, want test@10.238.221.181:2222", nodeID)
 		}
 		snap := repo.Snapshot()
-		if len(snap.Hosts.Keys()) != 1 {
+		if len(snap.Hosts.Keys()) != 2 {
 			t.Errorf("pending port must not create a saved host, got %d hosts", len(snap.Hosts.Keys()))
 		}
 		_, host, _, err := repo.Resolve(nodeID)
@@ -505,6 +513,9 @@ func TestCommands_SSHSessionOnlyDoesNotInitializeSystemStore(t *testing.T) {
 
 func seedTestJumpNode(t *testing.T, repo *config.Repository, nodeID string) {
 	t.Helper()
+	if _, ok := repo.GetNode(nodeID); ok {
+		return
+	}
 	if _, err := repo.CreateNodeContext(
 		t.Context(),
 		nodeID,
@@ -1059,7 +1070,12 @@ func setupNonDefaultPortWithProxyJumpRepo(t *testing.T) *config.Repository {
 	}
 	snapshot := cfg.Snapshot()
 	snapshot.Hosts.Set("10.0.0.5:2222", models.Host{Address: "10.0.0.5", Port: 2222})
+	snapshot.Hosts.Set("10.0.0.254:22", models.Host{Address: "10.0.0.254", Port: 22})
 	snapshot.Identities.Set("root@10.0.0.5:2222", models.Identity{User: "root", AuthType: "auto"})
+	snapshot.Nodes.Set("upstream", models.Node{
+		HostRef:     "10.0.0.254:22",
+		IdentityRef: "root@10.0.0.5:2222",
+	})
 	snapshot.Nodes.Set("root@10.0.0.5:2222", models.Node{
 		HostRef:     "10.0.0.5:2222",
 		IdentityRef: "root@10.0.0.5:2222",

@@ -2427,7 +2427,12 @@ Host demo
 	}
 	cfg := newEmptyTestConfig()
 	cfg.Hosts.Set("10.0.0.70:2200", models.Host{Address: "10.0.0.70", Port: 2200})
+	cfg.Hosts.Set("10.0.0.254:22", models.Host{Address: "10.0.0.254", Port: 22})
 	cfg.Identities.Set("ubuntu@10.0.0.70", models.Identity{User: "ubuntu", AuthType: "auto"})
+	cfg.Nodes.Set("saved-jump", models.Node{
+		HostRef:     "10.0.0.254:22",
+		IdentityRef: "ubuntu@10.0.0.70",
+	})
 	cfg.Nodes.Set("saved-demo", models.Node{
 		HostRef:     "10.0.0.70:2200",
 		IdentityRef: "ubuntu@10.0.0.70",

@@ -44,11 +44,11 @@ func validateOpenSSHControlSelector(field, raw string) error {
 	if raw == "" {
 		return nil
 	}
-	trimmed := strings.TrimSpace(raw)
-	if !config.IsOpenSSHNodeID(raw) && !config.IsOpenSSHNodeID(trimmed) {
+	stripped := trimControlAndSpace(raw)
+	if !config.IsOpenSSHNodeID(raw) && !config.IsOpenSSHNodeID(stripped) {
 		return nil
 	}
-	if trimmed != raw || hasControlOrLineSepChar(raw) || hasAnyWhitespace(raw) {
+	if stripped != raw || hasControlOrLineSepChar(raw) || hasAnyWhitespace(raw) {
 		return fmt.Errorf("%w: invalid openssh %s %q: contains whitespace or control characters", ssh.ErrSSHOptionsValidation, field, raw)
 	}
 	if _, err := config.ParseTargetRef(raw); err != nil {
@@ -64,8 +64,11 @@ func validateControlTargetRequest(req ControlTargetRequest) error {
 	}{
 		{"node ID", req.NodeID},
 		{"target selector", req.Target.Selector},
+		{"target raw selector", req.Target.RawSelector},
 		{"target original host", req.Target.OriginalHost},
+		{"fallback host", req.FallbackHost},
 		{"override original host", req.OverrideOriginalHost},
+		{"override expanded host", req.OverrideExpandedHost},
 		{"canonical original host", req.CanonicalOriginalHost},
 		{"canonical host", req.CanonicalHost},
 	} {
@@ -108,6 +111,19 @@ func ResolveControlTarget(req ControlTargetRequest) (ControlTargetResolution, er
 	}, nil
 }
 
+func savedHostMatchesSelector(addr string, aliases []string, selector, normSel string) bool {
+	if addr == selector || (normSel != "" && config.NormalizeHostAddress(addr) == normSel) {
+		return true
+	}
+	for _, alias := range aliases {
+		if alias == selector || strings.EqualFold(alias, selector) ||
+			(normSel != "" && config.NormalizeHostAddress(alias) == normSel) {
+			return true
+		}
+	}
+	return false
+}
+
 func isSavedControlNodeID(provider config.ConfigProvider, selector string) bool {
 	if provider == nil || selector == "" || config.IsOpenSSHNodeID(selector) {
 		return false
@@ -119,21 +135,23 @@ func isSavedControlNodeID(provider config.ConfigProvider, selector string) bool 
 		return true
 	}
 	snap := provider.Snapshot()
-	if snap == nil {
+	if snap == nil || snap.Nodes == nil {
 		return false
 	}
-	if snap.Nodes != nil {
-		for _, nid := range snap.Nodes.Keys() {
-			if n, ok := snap.Nodes.Get(nid); ok && slices.Contains(n.Alias, selector) {
-				return true
-			}
+	normSel := config.NormalizeHostAddress(selector)
+	for _, nid := range snap.Nodes.Keys() {
+		n, ok := snap.Nodes.Get(nid)
+		if !ok {
+			continue
 		}
-	}
-	if snap.Hosts != nil {
-		for _, hid := range snap.Hosts.Keys() {
-			if h, ok := snap.Hosts.Get(hid); ok && slices.Contains(h.Alias, selector) {
-				return true
-			}
+		if slices.Contains(n.Alias, selector) {
+			return true
+		}
+		if snap.Hosts == nil {
+			continue
+		}
+		if h, hOK := snap.Hosts.Get(n.HostRef); hOK && savedHostMatchesSelector(h.Address, h.Alias, selector, normSel) {
+			return true
 		}
 	}
 	return false
@@ -285,8 +303,45 @@ func validateControlConfigSelectors(lookupKey, selector string, sessionAuth Sess
 	return nil
 }
 
-func resolveControlConfigLookupKey(provider config.ConfigProvider, lookupKey, selector string) string {
+func effectiveControlConfigJumpOverride(sessionAuth SessionAuth, sessionOpts SessionControlOptions) (string, bool) {
+	if sessionAuth.ProxyJump != "" {
+		return sessionAuth.ProxyJump, true
+	}
+	ps := ssh.MergeProxySettings(sessionOpts.ProxySetting(), proxyCommandSetting(sessionOpts.Options))
+	switch {
+	case ps.Kind() == ssh.ProxyJump:
+		if targets, ok := ps.JumpTargets(); ok {
+			return strings.Join(targets, ","), true
+		}
+	case ps.Kind() == ssh.ProxyDisabled || ps.Kind() == ssh.ProxyCommand:
+		return "none", true
+	}
+	return "", false
+}
+
+func resolveControlConfigLookupKey(
+	provider config.ConfigProvider,
+	lookupKey, selector string,
+	sessionAuth SessionAuth,
+	sessionOpts SessionControlOptions,
+) (string, error) {
 	if lookupKey == "" {
+		if provider != nil && strings.TrimSpace(selector) != "" {
+			jump, hasJump := effectiveControlConfigJumpOverride(sessionAuth, sessionOpts)
+			resolved, err := config.ResolveTarget(provider, config.ConnectionTarget{
+				Selector:     selector,
+				OriginalHost: strings.TrimSpace(sessionAuth.OriginalHost),
+				ProxyJump:    jump,
+				HasProxyJump: hasJump,
+			})
+			if err != nil {
+				if !isTargetMissingError(err) {
+					return "", err
+				}
+			} else if resolved.MatchedNodeID != "" {
+				return resolved.MatchedNodeID, nil
+			}
+		}
 		// Resolve treats an unknown selector as "no node layer" and falls
 		// back to session > global > OpenSSH, which is the ad-hoc case.
 		lookupKey = selector
@@ -294,11 +349,11 @@ func resolveControlConfigLookupKey(provider config.ConfigProvider, lookupKey, se
 	if provider != nil && lookupKey != "" && !config.IsOpenSSHNodeID(lookupKey) {
 		if _, ok := provider.GetNode(lookupKey); !ok {
 			if aliasID := provider.FindAlias(lookupKey); aliasID != "" {
-				return aliasID
+				return aliasID, nil
 			}
 		}
 	}
-	return lookupKey
+	return lookupKey, nil
 }
 
 // ResolveControlConfig resolves the effective multiplexing ControlConfig for
@@ -323,7 +378,11 @@ func ResolveControlConfig(
 		}
 		sessionJumpPS = ps
 	}
-	lookupKey = resolveControlConfigLookupKey(provider, lookupKey, selector)
+	var err error
+	lookupKey, err = resolveControlConfigLookupKey(provider, lookupKey, selector, sessionAuth, sessionOpts)
+	if err != nil {
+		return nil, err
+	}
 	if provider == nil {
 		if err := validateNilProviderSessionJump(lookupKey, sessionAuth.ProxyJump, sessionJumpPS); err != nil {
 			return nil, err
@@ -332,6 +391,14 @@ func ResolveControlConfig(
 			return nil, nil
 		}
 		provider = config.NewProviderWithoutOpenSSH(nil)
+	} else if lookupKey == "" && sessionJumpPS.Kind() == ssh.ProxyJump {
+		resolvedJump, jErr := provider.ResolveProxyJumpChain(strings.TrimSpace(sessionAuth.ProxyJump))
+		if jErr != nil {
+			return nil, fmt.Errorf("resolve session proxy jump %q failed: %w", sessionAuth.ProxyJump, jErr)
+		}
+		if cErr := config.ValidateProxyJumpChainCycle(provider, config.ProxyJumpTarget{Selector: strings.TrimSpace(selector)}, resolvedJump, sessionAuth.ProxyJump); cErr != nil {
+			return nil, cErr
+		}
 	}
 	adpOpts := []Option{WithControlProxyMode(true)}
 	if lookupKey != "" && (sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "" || sessionAuth.ProxyJump != "") {
@@ -357,7 +424,11 @@ func validateNilProviderSessionJump(lookupKey, rawJump string, ps ssh.ProxySetti
 	if err != nil {
 		return err
 	}
-	return checkControlJumpSelfLoop(nil, strings.TrimSpace(lookupKey), validated, rawJump)
+	return config.ValidateProxyJumpChainCycle(nil, config.ProxyJumpTarget{
+		NodeID:   strings.TrimSpace(lookupKey),
+		Selector: strings.TrimSpace(lookupKey),
+		IsAdHoc:  true,
+	}, validated, rawJump)
 }
 
 // ResolveControlSocketPath resolves the control-plane target, lookup metadata,
@@ -619,39 +690,48 @@ func resolveControlDestinationNodeID(
 	return strings.TrimSpace(connTarget.Selector)
 }
 
-func checkControlJumpSelfLoop(provider config.ConfigProvider, destNodeID, resolvedJump, rawJump string) error {
-	if destNodeID == "" || resolvedJump == "" {
-		return nil
-	}
-	effectiveDestID := destNodeID
-	if provider != nil && !config.IsOpenSSHNodeID(destNodeID) {
-		if _, ok := provider.GetNode(destNodeID); !ok {
-			if aliasID := provider.FindAlias(destNodeID); aliasID != "" {
-				effectiveDestID = aliasID
+func buildControlProxyJumpTarget(
+	req ControlTargetRequest,
+	connTarget config.ConnectionTarget,
+	hasResolved bool,
+	resolved config.ResolvedTarget,
+) config.ProxyJumpTarget {
+	destID := resolveControlDestinationNodeID(req, connTarget, hasResolved, resolved)
+	if hasResolved {
+		user := strings.TrimSpace(resolved.User)
+		if resolved.Provenance == config.ProvenanceOpenSSHVirtual {
+			if connTarget.HasUser && strings.TrimSpace(connTarget.User) != "" {
+				user = strings.TrimSpace(connTarget.User)
+			} else {
+				user = ""
 			}
 		}
-	}
-	for hop := range strings.SplitSeq(resolvedJump, ",") {
-		trimmed := strings.TrimSpace(hop)
-		if trimmed == "" {
-			continue
-		}
-		sameEff, effErr := isSameJumpDestination(effectiveDestID, trimmed)
-		if effErr != nil {
-			return effErr
-		}
-		sameRaw, rawErr := isSameJumpDestination(destNodeID, trimmed)
-		if rawErr != nil {
-			return rawErr
-		}
-		if sameEff || sameRaw {
-			return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, effectiveDestID, &ssh.ProxyCycleError{
-				NodeID: effectiveDestID,
-				Path:   []string{effectiveDestID, trimmed},
-			})
+		return config.ProxyJumpTarget{
+			NodeID:       destID,
+			Selector:     strings.TrimSpace(connTarget.Selector),
+			OpenSSHAlias: strings.TrimSpace(resolved.OpenSSHAlias),
+			Host:         strings.TrimSpace(resolved.Host),
+			Port:         resolved.Port,
+			User:         user,
+			IsAdHoc:      resolved.Created && resolved.OpenSSHAlias == "",
 		}
 	}
-	return nil
+	user := strings.TrimSpace(req.FallbackUser)
+	if connTarget.HasUser && strings.TrimSpace(connTarget.User) != "" {
+		user = strings.TrimSpace(connTarget.User)
+	}
+	port := req.FallbackPort
+	if connTarget.HasPort && connTarget.Port > 0 {
+		port = connTarget.Port
+	}
+	return config.ProxyJumpTarget{
+		NodeID:   destID,
+		Selector: strings.TrimSpace(connTarget.Selector),
+		Host:     strings.TrimSpace(req.FallbackHost),
+		Port:     port,
+		User:     user,
+		IsAdHoc:  true,
+	}
 }
 
 // resolveControlEffectiveJumpHost folds ProxyJump and ProxyCommand across all
@@ -707,8 +787,8 @@ func resolveControlEffectiveJumpHost(
 			return "", jErr
 		}
 	}
-	destNodeID := resolveControlDestinationNodeID(req, connTarget, hasResolved, resolved)
-	if cErr := checkControlJumpSelfLoop(req.Provider, destNodeID, resolvedJump, rawJump); cErr != nil {
+	dest := buildControlProxyJumpTarget(req, connTarget, hasResolved, resolved)
+	if cErr := config.ValidateProxyJumpChainCycle(req.Provider, dest, resolvedJump, rawJump); cErr != nil {
 		return "", cErr
 	}
 	return resolvedJump, nil
@@ -844,11 +924,19 @@ func resolveControlSessionLookup(
 	connTarget config.ConnectionTarget,
 	target ssh.TargetContext,
 ) (string, SessionAuth) {
+	lookupKey := trimNonPaddedOpenSSH(req.NodeID)
+	sel := trimNonPaddedOpenSSH(connTarget.Selector)
+	if sel == "" {
+		sel = lookupKey
+	}
 	origHost := strings.TrimSpace(req.CanonicalOriginalHost)
 	canonHost := strings.TrimSpace(req.CanonicalHost)
+	if !shouldPropagateControlCanonicalOrigin(req.Provider, sel, origHost, canonHost) {
+		origHost = ""
+		canonHost = ""
+	}
 	targetOrig := strings.TrimSpace(target.OriginalHost)
 	proxyJump := effectiveControlSessionProxyJump(connTarget, req.SessionControl)
-	lookupKey := trimNonPaddedOpenSSH(req.NodeID)
 	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
 		req.Provider, lookupKey, req.NodeID, connTarget, origHost, canonHost, targetOrig, proxyJump,
 	)

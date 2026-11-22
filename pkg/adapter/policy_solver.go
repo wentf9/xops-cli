@@ -140,6 +140,9 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 	if a == nil || a.cfgProvider == nil {
 		return EffectivePolicy{}, fmt.Errorf("configuration provider is nil")
 	}
+	if err := validateOpenSSHControlSelector("node ID", req.NodeID); err != nil {
+		return EffectivePolicy{}, err
+	}
 
 	var sessionOpts SessionControlOptions
 	if req.SessionControl != nil {
@@ -224,25 +227,10 @@ func hasAnyWhitespace(s string) bool {
 	return false
 }
 
-func isSameJumpDestination(destNodeID, hop string) (bool, error) {
-	if destNodeID == "" || hop == "" {
-		return false, nil
-	}
-	if hop == destNodeID {
-		return true, nil
-	}
-	if config.IsOpenSSHNodeID(destNodeID) && config.IsOpenSSHNodeID(hop) {
-		destRef, dErr := config.ParseTargetRef(destNodeID)
-		if dErr != nil {
-			return false, fmt.Errorf("%w: invalid destination openssh selector %q: %w", ssh.ErrSSHOptionsValidation, destNodeID, dErr)
-		}
-		hopRef, hErr := config.ParseTargetRef(hop)
-		if hErr != nil {
-			return false, fmt.Errorf("%w: invalid jump openssh selector %q: %w", ssh.ErrSSHOptionsValidation, hop, hErr)
-		}
-		return destRef.NormalizedString() == hopRef.NormalizedString(), nil
-	}
-	return false, nil
+func trimControlAndSpace(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
+	})
 }
 
 func proxySettingFromJumpString(raw string) (ssh.ProxySetting, error) {
@@ -345,40 +333,29 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	if err != nil {
 		return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
 	}
-	if err := a.checkPolicyJumpSelfLoop(nodeID, hasSnapshot, rawJump, resolved); err != nil {
+	dest := buildPolicyProxyJumpTarget(nodeID, snapshot, hasSnapshot)
+	if err := config.ValidateProxyJumpChainCycle(a.cfgProvider, dest, resolved, rawJump); err != nil {
 		return "", err
 	}
 	return resolved, nil
 }
 
-func (a *SSHAdapter) checkPolicyJumpSelfLoop(nodeID string, hasSnapshot bool, rawJump, resolved string) error {
-	if nodeID == "" {
-		return nil
+func buildPolicyProxyJumpTarget(nodeID string, snapshot config.ConnectionSnapshot, hasSnapshot bool) config.ProxyJumpTarget {
+	dest := config.ProxyJumpTarget{
+		NodeID:   strings.TrimSpace(nodeID),
+		Selector: strings.TrimSpace(nodeID),
 	}
-	effectiveDestID := nodeID
-	if !hasSnapshot && a.cfgProvider != nil && !config.IsOpenSSHNodeID(nodeID) {
-		if aliasID := a.cfgProvider.FindAlias(nodeID); aliasID != "" {
-			effectiveDestID = aliasID
-		}
+	if !hasSnapshot {
+		return dest
 	}
-	for hop := range strings.SplitSeq(resolved, ",") {
-		trimmedHop := strings.TrimSpace(hop)
-		sameEff, effErr := isSameJumpDestination(effectiveDestID, trimmedHop)
-		if effErr != nil {
-			return effErr
-		}
-		sameRaw, rawErr := isSameJumpDestination(nodeID, trimmedHop)
-		if rawErr != nil {
-			return rawErr
-		}
-		if sameEff || sameRaw {
-			return fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, effectiveDestID, &ssh.ProxyCycleError{
-				NodeID: effectiveDestID,
-				Path:   []string{effectiveDestID, trimmedHop},
-			})
-		}
+	dest.OpenSSHAlias = strings.TrimSpace(snapshot.Node.OpenSSHAlias)
+	dest.Host = strings.TrimSpace(snapshot.Host.Address)
+	dest.Port = snapshot.Host.Port
+	if snapshot.Provenance != config.ProvenanceOpenSSHVirtual {
+		dest.User = strings.TrimSpace(snapshot.Identity.User)
 	}
-	return nil
+	dest.IsAdHoc = snapshot.Provenance == config.ProvenanceAdHocPending
+	return dest
 }
 
 // resolveUnpersistedOpenSSHJumpChain resolves non-OpenSSH hops (such as saved
@@ -386,7 +363,7 @@ func (a *SSHAdapter) checkPolicyJumpSelfLoop(nodeID string, hasSnapshot bool, ra
 // nodes) through provider.ResolveProxyJumpChain while validating and normalizing
 // OpenSSH-origin "openssh:..." hops via config.ParseTargetRef so unconfigured
 // single-label OpenSSH jumps are not rejected by local inventory rules while
-// casing drift ("OPENSSH:...") and malformed tokens fail closed.
+// casing drift ("OPENSSH:..."), broken OpenSSHParser, and malformed tokens fail closed.
 func resolveUnpersistedOpenSSHJumpChain(provider config.ConfigProvider, rawJump string) (string, error) {
 	ps, err := proxySettingFromJumpString(rawJump)
 	if err != nil {
@@ -395,6 +372,10 @@ func resolveUnpersistedOpenSSHJumpChain(provider config.ConfigProvider, rawJump 
 	targets, ok := ps.JumpTargets()
 	if !ok {
 		return "", nil
+	}
+	var parser *config.OpenSSHParser
+	if src, ok := provider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok && src != nil {
+		parser = src.GetOpenSSHParser()
 	}
 	out := make([]string, 0, len(targets))
 	for _, rawHop := range targets {
@@ -412,6 +393,11 @@ func resolveUnpersistedOpenSSHJumpChain(provider config.ConfigProvider, rawJump 
 			}
 			if vErr := ref.Validate(); vErr != nil {
 				return "", fmt.Errorf("%w: invalid openssh jump host %q: %w", ssh.ErrSSHOptionsValidation, hop, vErr)
+			}
+			if parser != nil {
+				if pErr := parser.Err(); pErr != nil {
+					return "", fmt.Errorf("resolve openssh jump %q: %w", hop, pErr)
+				}
 			}
 			out = append(out, ref.NormalizedString())
 			continue
