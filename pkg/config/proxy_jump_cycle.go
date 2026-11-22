@@ -195,9 +195,9 @@ func validateSavedNodeProxyJumpGraphCycle(
 }
 
 // ValidateSavedNodeJumpCycleWithOpenSSH validates the saved node nodeID (and
-// any saved nodes in cfg whose saved ProxyJump graph can reach nodeID) for
-// direct self-loops, duplicate hops, and transitive multi-hop ProxyJump cycles
-// across both Tier-2 saved nodes and Tier-4 OpenSSH stanzas.
+// any saved nodes in cfg whose resolved ProxyJump graph across Tier-2 saved
+// nodes and Tier-4 OpenSSH stanzas can reach nodeID) for direct self-loops,
+// duplicate hops, and transitive multi-hop ProxyJump cycles.
 func ValidateSavedNodeJumpCycleWithOpenSSH(cfg *Configuration, openSSH *OpenSSHParser, nodeID string) error {
 	if cfg == nil || cfg.Nodes == nil || strings.TrimSpace(nodeID) == "" {
 		return nil
@@ -206,7 +206,7 @@ func ValidateSavedNodeJumpCycleWithOpenSSH(cfg *Configuration, openSSH *OpenSSHP
 	if err != nil {
 		return fmt.Errorf("build configuration indexes for jump cycle validation: %w", err)
 	}
-	affected := collectSavedNodesReachingNode(cfg, lookup, aliases, nodeID)
+	affected := collectSavedNodesReachingNode(cfg, openSSH, lookup, aliases, nodeID)
 	for _, nid := range affected {
 		node, ok := cfg.Nodes.Get(nid)
 		if !ok || strings.TrimSpace(node.ProxyJump) == "" {
@@ -226,57 +226,161 @@ func ValidateSavedNodeJumpCycleWithOpenSSH(cfg *Configuration, openSSH *OpenSSHP
 			continue
 		}
 		dest := buildProxyJumpTargetFromSavedNode(nid, node.OpenSSHAlias, node.CanonicalHost, nid, host, ident)
-		if err := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, strings.Join(targets, ","), node.ProxyJump); err != nil {
+		resolvedJump, rErr := resolveBaseTargetJumpWithConfig(cfg, openSSH, dest, targets)
+		if rErr != nil {
+			return rErr
+		}
+		if err := validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, resolvedJump, node.ProxyJump); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func collectSavedNodesReachingNode(cfg *Configuration, lookup map[string][]string, aliases map[string]string, targetNodeID string) []string {
-	rev := make(map[string][]string)
+func collectSavedNodesReachingNode(
+	cfg *Configuration,
+	openSSH *OpenSSHParser,
+	lookup map[string][]string,
+	aliases map[string]string,
+	targetNodeID string,
+) []string {
+	targetIdent := buildSavedJumpNodeIdentity(cfg, targetNodeID)
+	var upstream []string
 	for _, nid := range cfg.Nodes.Keys() {
+		if nid == targetNodeID {
+			continue
+		}
 		node, ok := cfg.Nodes.Get(nid)
 		if !ok || strings.TrimSpace(node.ProxyJump) == "" {
 			continue
 		}
-		ps, err := parseOptionalNodeProxyJump(node.ProxyJump)
-		if err != nil {
-			continue
-		}
-		targets, ok := ps.JumpTargets()
-		if !ok {
-			continue
-		}
-		for _, hop := range targets {
-			ref, rErr := ParseTargetRef(hop)
-			if rErr != nil || ref.OpenSSH {
-				continue
-			}
-			for _, dst := range resolveLocalJumpTargets(cfg, lookup, aliases, hop, ref) {
-				if !slices.Contains(rev[dst], nid) {
-					rev[dst] = append(rev[dst], nid)
-				}
-			}
-		}
-	}
-	seen := map[string]struct{}{targetNodeID: {}}
-	queue := []string{targetNodeID}
-	var upstream []string
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
-		for _, parent := range rev[cur] {
-			if _, ok := seen[parent]; ok {
-				continue
-			}
-			seen[parent] = struct{}{}
-			upstream = append(upstream, parent)
-			queue = append(queue, parent)
+		if savedNodeReachesTarget(cfg, openSSH, lookup, aliases, nid, targetNodeID, targetIdent) {
+			upstream = append(upstream, nid)
 		}
 	}
 	slices.Sort(upstream)
 	return append([]string{targetNodeID}, upstream...)
+}
+
+type jumpReachabilityState struct {
+	cfg          *Configuration
+	openSSH      *OpenSSHParser
+	lookup       map[string][]string
+	aliases      map[string]string
+	targetNodeID string
+	targetIdent  jumpNodeIdentity
+	visited      map[string]struct{}
+	queue        []jumpReachHop
+}
+
+type jumpReachHop struct {
+	hop   string
+	depth int
+}
+
+func (s *jumpReachabilityState) enqueueRawJump(raw string, depth int) {
+	if depth > maxProxyJumpWalkDepth || strings.TrimSpace(raw) == "" {
+		return
+	}
+	ps, err := parseOptionalNodeProxyJump(raw)
+	if err != nil {
+		return
+	}
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return
+	}
+	for _, hop := range targets {
+		s.queue = append(s.queue, jumpReachHop{hop: hop, depth: depth})
+	}
+}
+
+func (s *jumpReachabilityState) visitSavedTarget(dst string, nextDepth int) bool {
+	if dst == s.targetNodeID {
+		return true
+	}
+	key := "saved:" + dst
+	if _, seen := s.visited[key]; seen {
+		return false
+	}
+	s.visited[key] = struct{}{}
+	if dstNode, ok := s.cfg.Nodes.Get(dst); ok {
+		s.enqueueRawJump(dstNode.ProxyJump, nextDepth)
+	}
+	return false
+}
+
+func (s *jumpReachabilityState) stepHop(cur jumpReachHop) bool {
+	if cur.depth > maxProxyJumpWalkDepth {
+		return false
+	}
+	if !hasOpenSSHPrefix(cur.hop) {
+		if ref, rErr := ParseTargetRef(cur.hop); rErr == nil && !ref.OpenSSH {
+			if localTargets := resolveLocalJumpTargets(s.cfg, s.lookup, s.aliases, cur.hop, ref); len(localTargets) > 0 {
+				for _, dst := range localTargets {
+					if s.visitSavedTarget(dst, cur.depth+1) {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	resolved, rErr := resolveSingleJumpHopWithConfig(s.cfg, s.openSSH, cur.hop)
+	if rErr != nil || resolved == "" {
+		return false
+	}
+	if _, isSaved := s.cfg.Nodes.Get(resolved); isSaved && !IsOpenSSHNodeID(resolved) {
+		return s.visitSavedTarget(resolved, cur.depth+1)
+	}
+	if !IsOpenSSHNodeID(resolved) {
+		return false
+	}
+	hopIdent, hErr := buildOpenSSHJumpIdentity(s.openSSH, resolved, ProxyJumpTarget{})
+	if hErr != nil {
+		return false
+	}
+	if sameJumpNodeIdentity(s.targetIdent, hopIdent) {
+		return true
+	}
+	key := "openssh:" + hopIdent.canonicalID
+	if _, seen := s.visited[key]; seen {
+		return false
+	}
+	s.visited[key] = struct{}{}
+	s.enqueueRawJump(hopIdent.nextRawJump, cur.depth+1)
+	return false
+}
+
+func savedNodeReachesTarget(
+	cfg *Configuration,
+	openSSH *OpenSSHParser,
+	lookup map[string][]string,
+	aliases map[string]string,
+	startNodeID, targetNodeID string,
+	targetIdent jumpNodeIdentity,
+) bool {
+	st := &jumpReachabilityState{
+		cfg:          cfg,
+		openSSH:      openSSH,
+		lookup:       lookup,
+		aliases:      aliases,
+		targetNodeID: targetNodeID,
+		targetIdent:  targetIdent,
+		visited:      map[string]struct{}{"saved:" + startNodeID: {}},
+		queue:        make([]jumpReachHop, 0, 8),
+	}
+	if startNode, ok := cfg.Nodes.Get(startNodeID); ok {
+		st.enqueueRawJump(startNode.ProxyJump, 0)
+	}
+	for len(st.queue) > 0 {
+		cur := st.queue[0]
+		st.queue = st.queue[1:]
+		if st.stepHop(cur) {
+			return true
+		}
+	}
+	return false
 }
 
 func findNodeProxyJumpCycleHop(
@@ -694,6 +798,9 @@ func buildDirectDestJumpIdentity(nodeID, selector string, dest ProxyJumpTarget) 
 		}
 		if port == 0 && ref.HasPort {
 			port = ref.Port
+		} else if port > 0 {
+			ident.openSSHRef.Port = port
+			ident.openSSHRef.HasPort = true
 		}
 		if user == "" && ref.User != "" {
 			user = ref.User

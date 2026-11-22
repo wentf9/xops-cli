@@ -382,9 +382,14 @@ func resolveControlConfigLookupKey(
 	if lookupKey == "" {
 		if provider != nil && strings.TrimSpace(selector) != "" {
 			jump, hasJump := effectiveControlConfigJumpOverride(sessionAuth, sessionOpts)
+			sessUser := strings.TrimSpace(sessionAuth.User)
 			resolved, err := config.ResolveTarget(provider, config.ConnectionTarget{
 				Selector:     selector,
 				OriginalHost: strings.TrimSpace(sessionAuth.OriginalHost),
+				User:         sessUser,
+				HasUser:      sessUser != "",
+				Port:         sessionAuth.Port,
+				HasPort:      sessionAuth.Port > 0,
 				ProxyJump:    jump,
 				HasProxyJump: hasJump,
 			})
@@ -438,7 +443,7 @@ func ResolveControlConfig(
 		return nil, err
 	}
 	if provider == nil {
-		if err := validateNilProviderSessionJump(lookupKey, sessionAuth.ProxyJump, sessionJumpPS); err != nil {
+		if err := validateNilProviderSessionJump(lookupKey, sessionAuth, sessionJumpPS); err != nil {
 			return nil, err
 		}
 		if sessionOpts.IsEmpty() {
@@ -450,12 +455,16 @@ func ResolveControlConfig(
 		if jErr != nil {
 			return nil, fmt.Errorf("resolve session proxy jump %q failed: %w", sessionAuth.ProxyJump, jErr)
 		}
-		if cErr := config.ValidateProxyJumpChainCycle(provider, config.ProxyJumpTarget{Selector: strings.TrimSpace(selector)}, resolvedJump, sessionAuth.ProxyJump); cErr != nil {
+		if cErr := config.ValidateProxyJumpChainCycle(provider, config.ProxyJumpTarget{
+			Selector: strings.TrimSpace(selector),
+			User:     strings.TrimSpace(sessionAuth.User),
+			Port:     sessionAuth.Port,
+		}, resolvedJump, sessionAuth.ProxyJump); cErr != nil {
 			return nil, cErr
 		}
 	}
 	adpOpts := []Option{WithControlProxyMode(true)}
-	if lookupKey != "" && (sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "" || sessionAuth.ProxyJump != "") {
+	if lookupKey != "" && (sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "" || sessionAuth.ProxyJump != "" || sessionAuth.HostName != "" || sessionAuth.User != "" || sessionAuth.Port > 0) {
 		adpOpts = append(adpOpts, WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
 	pol, err := NewSSHAdapter(provider, adpOpts...).Resolve(context.Background(), ResolveRequest{
@@ -469,7 +478,7 @@ func ResolveControlConfig(
 	return pol.Control(), nil
 }
 
-func validateNilProviderSessionJump(lookupKey, rawJump string, ps ssh.ProxySetting) error {
+func validateNilProviderSessionJump(lookupKey string, sessionAuth SessionAuth, ps ssh.ProxySetting) error {
 	targets, ok := ps.JumpTargets()
 	if !ok {
 		return nil
@@ -481,8 +490,10 @@ func validateNilProviderSessionJump(lookupKey, rawJump string, ps ssh.ProxySetti
 	return config.ValidateProxyJumpChainCycle(nil, config.ProxyJumpTarget{
 		NodeID:   strings.TrimSpace(lookupKey),
 		Selector: strings.TrimSpace(lookupKey),
+		User:     strings.TrimSpace(sessionAuth.User),
+		Port:     sessionAuth.Port,
 		IsAdHoc:  true,
-	}, validated, rawJump)
+	}, validated, sessionAuth.ProxyJump)
 }
 
 // ResolveControlSocketPath resolves the control-plane target, lookup metadata,
@@ -756,13 +767,17 @@ func buildControlProxyJumpTarget(
 		if connTarget.HasUser && strings.TrimSpace(connTarget.User) != "" {
 			user = strings.TrimSpace(connTarget.User)
 		}
+		port := resolved.Port
+		if connTarget.HasPort && connTarget.Port > 0 {
+			port = connTarget.Port
+		}
 		return config.ProxyJumpTarget{
 			NodeID:        destID,
 			Selector:      strings.TrimSpace(connTarget.Selector),
 			OpenSSHAlias:  strings.TrimSpace(resolved.OpenSSHAlias),
 			CanonicalHost: strings.TrimSpace(resolved.CanonicalHost),
 			Host:          strings.TrimSpace(resolved.Host),
-			Port:          resolved.Port,
+			Port:          port,
 			User:          user,
 			IsAdHoc:       resolved.Created && resolved.OpenSSHAlias == "",
 		}
@@ -990,6 +1005,43 @@ func effectiveControlSessionProxyJump(connTarget config.ConnectionTarget, sessio
 	return ""
 }
 
+func explicitControlSessionUserPort(req ControlTargetRequest, connTarget config.ConnectionTarget) (user string, port uint16) {
+	isExactSavedNode := func(sel string) bool {
+		if req.Provider == nil || config.IsOpenSSHNodeID(sel) {
+			return false
+		}
+		_, ok := req.Provider.GetNode(sel)
+		return ok
+	}
+	for _, rawSel := range []string{connTarget.RawSelector, connTarget.Selector, req.Target.RawSelector, req.Target.Selector} {
+		sel := strings.TrimSpace(rawSel)
+		if sel == "" || isExactSavedNode(sel) {
+			continue
+		}
+		if ref, err := config.ParseTargetRef(sel); err == nil {
+			if user == "" && ref.User != "" {
+				user = ref.User
+			}
+			if port == 0 && ref.HasPort && ref.Port > 0 {
+				port = ref.Port
+			}
+		}
+	}
+	if connTarget.HasUser && strings.TrimSpace(connTarget.User) != "" {
+		user = strings.TrimSpace(connTarget.User)
+	}
+	if connTarget.HasPort && connTarget.Port > 0 {
+		port = connTarget.Port
+	}
+	if user == "" && strings.TrimSpace(req.FallbackUser) != "" {
+		user = strings.TrimSpace(req.FallbackUser)
+	}
+	if port == 0 && req.FallbackPort > 0 {
+		port = req.FallbackPort
+	}
+	return user, port
+}
+
 func resolveControlSessionLookup(
 	req ControlTargetRequest,
 	connTarget config.ConnectionTarget,
@@ -1008,10 +1060,13 @@ func resolveControlSessionLookup(
 	}
 	targetOrig := strings.TrimSpace(target.OriginalHost)
 	proxyJump := effectiveControlSessionProxyJump(req.Target, req.SessionControl)
+	sessUser, sessPort := explicitControlSessionUserPort(req, connTarget)
 	key, savedAuth, handled, resolvedVirtual := resolveSavedControlSessionLookup(
 		req.Provider, lookupKey, req.NodeID, connTarget, origHost, canonHost, targetOrig, proxyJump,
 	)
 	if handled {
+		savedAuth.User = sessUser
+		savedAuth.Port = sessPort
 		return key, savedAuth
 	}
 	if lookupKey == "" && key != "" {
@@ -1020,7 +1075,11 @@ func resolveControlSessionLookup(
 	if canonHost == "" {
 		canonHost = strings.TrimSpace(target.CanonicalHost)
 	}
-	auth := SessionAuth{ProxyJump: proxyJump}
+	auth := SessionAuth{
+		User:      sessUser,
+		Port:      sessPort,
+		ProxyJump: proxyJump,
+	}
 	if canonHost != "" {
 		if lookupKey == "" || !config.IsOpenSSHNodeID(lookupKey) {
 			lookupKey = config.OpenSSHNodePrefix + canonHost

@@ -79,16 +79,11 @@ func (m *CredentialMigrator) finishVerification(ctx context.Context, state *migr
 		return report, err
 	}
 	err = m.withConfigLock(ctx, func() error {
-		current, err := readMigrationFile(m.path)
+		current, err := readAndSyncMigrationConfiguration(m.path, state.CandidateHash, "configuration changed during verification")
 		if err != nil {
 			return err
 		}
-		if migrationDigest(current) != state.CandidateHash {
-			return fmt.Errorf("%w: configuration changed during verification", ErrConfigConflict)
-		}
-		if err := syncMigrationConfiguration(m.path); err != nil {
-			return err
-		}
+		clear(current)
 		state.Phase = "verified"
 		return m.saveState(state)
 	})
@@ -212,16 +207,11 @@ func (m *CredentialMigrator) Finalize(ctx context.Context) (report MigrationRepo
 		return report, err
 	}
 	err = m.withConfigLock(ctx, func() error {
-		current, err := readMigrationFile(m.path)
+		current, err := readAndSyncMigrationConfiguration(m.path, migrationDigest(raw), "configuration changed during finalization")
 		if err != nil {
 			return err
 		}
-		if migrationDigest(current) != migrationDigest(raw) {
-			return fmt.Errorf("%w: configuration changed during finalization", ErrConfigConflict)
-		}
-		if err := syncMigrationConfiguration(m.path); err != nil {
-			return err
-		}
+		defer clear(current)
 		if err := m.protectFinalizationKeys(current); err != nil {
 			return err
 		}

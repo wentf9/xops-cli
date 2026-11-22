@@ -434,8 +434,13 @@ func (r *Repository) validateStagedSavedNodeJumpCycle(
 	if !ok {
 		return nil
 	}
+	openSSH := r.openSSHParserOrNil()
 	dest := buildProxyJumpTargetFromSavedNode(nodeID, openSSHAlias, canonicalHost, selector, host, identity)
-	return validateProxyJumpChainCycleWithConfig(cfg, r.openSSHParserOrNil(), dest, strings.Join(targets, ","), node.ProxyJump)
+	resolvedJump, rErr := resolveBaseTargetJumpWithConfig(cfg, openSSH, dest, targets)
+	if rErr != nil {
+		return rErr
+	}
+	return validateProxyJumpChainCycleWithConfig(cfg, openSSH, dest, resolvedJump, node.ProxyJump)
 }
 
 func applyPendingNodeUpdate(

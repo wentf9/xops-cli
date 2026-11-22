@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -41,21 +42,42 @@ func migrationDigest(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func readMigrationFile(path string) ([]byte, error) {
-	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: migrationFileLimit})
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-		if errors.Is(err, fsx.ErrTooLarge) {
-			return nil, fmt.Errorf("migration input exceeds 16 MiB: %w", err)
-		}
-		if errors.Is(err, fsx.ErrNonRegular) || errors.Is(err, fsx.ErrSymlink) {
-			return nil, fmt.Errorf("migration input %q must be a regular file no larger than 16 MiB: %w", path, err)
-		}
-		return nil, fmt.Errorf("read migration input %q: %w", path, err)
+func classifyMigrationReadError(path string, err error) error {
+	if err == nil {
+		return nil
 	}
-	return data, nil
+	if errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if errors.Is(err, fsx.ErrTooLarge) {
+		return fmt.Errorf("migration input exceeds 16 MiB: %w", err)
+	}
+	if errors.Is(err, fsx.ErrNonRegular) || errors.Is(err, fsx.ErrSymlink) {
+		return fmt.Errorf("migration input %q must be a regular file no larger than 16 MiB: %w", path, err)
+	}
+	return fmt.Errorf("read migration input %q: %w", path, err)
+}
+
+func readMigrationFileWithInfo(path string) ([]byte, os.FileInfo, error) {
+	rf, err := fsx.OpenRegular(path, fsx.Limits{MaxBytes: migrationFileLimit})
+	if err != nil {
+		return nil, nil, classifyMigrationReadError(path, err)
+	}
+	defer func() { _ = rf.Close() }()
+	info, err := rf.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stat migration input %q: %w", path, err)
+	}
+	data, err := rf.ReadAll()
+	if err != nil {
+		return nil, nil, classifyMigrationReadError(path, err)
+	}
+	return data, info, nil
+}
+
+func readMigrationFile(path string) ([]byte, error) {
+	data, _, err := readMigrationFileWithInfo(path)
+	return data, err
 }
 
 func (m *CredentialMigrator) withConfigLock(ctx context.Context, fn func() error) (retErr error) {
@@ -121,15 +143,11 @@ func (m *CredentialMigrator) saveState(state *migrationState) error {
 }
 
 func (m *CredentialMigrator) ensureBackup(path string, data []byte) error {
-	stored, err := readMigrationFile(path)
+	stored, info, err := readMigrationFileWithInfo(path)
 	if err == nil {
 		defer clear(stored)
 		if migrationDigest(stored) != migrationDigest(data) {
 			return fmt.Errorf("existing migration backup %q differs from source", path)
-		}
-		info, err := os.Stat(path)
-		if err != nil {
-			return err
 		}
 		if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 			return fmt.Errorf("migration backup %q must have mode 0600", path)
@@ -156,16 +174,41 @@ func (m *CredentialMigrator) step(name string) error {
 	return nil
 }
 
-// Before deleting rollback material, sync both the current file's contents and
-// its directory, including metadata edits made since the migration commit.
-func syncMigrationConfiguration(path string) (retErr error) {
-	file, err := os.OpenFile(path, os.O_RDWR, 0) //nolint:forbidigo // open committed configuration RW solely to fsync before finalize cleanup
+// Before deleting rollback material, verify and sync both the current file's
+// contents and its directory on one no-follow, regular-file, os.SameFile-checked
+// locked handle so no pathname swap can slip between digest check and fsync.
+func readAndSyncMigrationConfiguration(path, expectedHash, conflictMsg string) (data []byte, retErr error) {
+	lf, err := fsx.OpenLocked(path, fsx.LockExclusive, false, 0)
 	if err != nil {
-		return fmt.Errorf("open migrated configuration for sync: %w", err)
+		return nil, fmt.Errorf("open migrated configuration for sync: %w", classifyMigrationReadError(path, err))
 	}
-	defer func() { retErr = errors.Join(retErr, file.Close()) }()
-	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync migrated configuration: %w", err)
+	defer func() { retErr = errors.Join(retErr, lf.Close()) }()
+	info, err := lf.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat migrated configuration %q: %w", path, err)
 	}
-	return fsx.SyncDir(filepath.Dir(path))
+	if info.Size() > migrationFileLimit {
+		return nil, fmt.Errorf("migration input exceeds 16 MiB: %w", fsx.ErrTooLarge)
+	}
+	current, err := io.ReadAll(io.LimitReader(lf, migrationFileLimit+1))
+	if err != nil {
+		return nil, fmt.Errorf("read migration input %q: %w", path, err)
+	}
+	if int64(len(current)) > migrationFileLimit {
+		clear(current)
+		return nil, fmt.Errorf("migration input exceeds 16 MiB: %w", fsx.ErrTooLarge)
+	}
+	if migrationDigest(current) != expectedHash {
+		clear(current)
+		return nil, fmt.Errorf("%w: %s", ErrConfigConflict, conflictMsg)
+	}
+	if err := lf.Sync(); err != nil {
+		clear(current)
+		return nil, fmt.Errorf("sync migrated configuration: %w", err)
+	}
+	if err := fsx.SyncDir(filepath.Dir(path)); err != nil {
+		clear(current)
+		return nil, err
+	}
+	return current, nil
 }

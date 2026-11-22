@@ -978,6 +978,14 @@ func normalizeTargetJumpForTarget(provider ConfigProvider, dest ProxyJumpTarget,
 	return normalizeTargetJumpForTargetWithConfig(cfg, openSSH, dest, baseJump, target)
 }
 
+func tier3ShadowsTier4ProxyJump(cfg *Configuration) bool {
+	if cfg == nil || cfg.SSHOptions == nil {
+		return false
+	}
+	ps := cfg.SSHOptions.ProxyCommandSetting()
+	return ps.Kind() == ssh.ProxyCommand || ps.Kind() == ssh.ProxyDisabled
+}
+
 func normalizeTargetJumpForTargetWithConfig(cfg *Configuration, openSSH *OpenSSHParser, dest ProxyJumpTarget, baseJump string, target ConnectionTarget) (string, error) {
 	basePS, err := parseOptionalNodeProxyJump(baseJump)
 	if err != nil {
@@ -992,6 +1000,9 @@ func normalizeTargetJumpForTargetWithConfig(cfg *Configuration, openSSH *OpenSSH
 		return resolveExplicitTargetJumpWithConfig(cfg, openSSH, dest, target.ProxyJump)
 	}
 	if basePS.Kind() != ssh.ProxyJump {
+		return "", nil
+	}
+	if IsOpenSSHNodeID(dest.NodeID) && tier3ShadowsTier4ProxyJump(cfg) {
 		return "", nil
 	}
 	targets, _ := basePS.JumpTargets()
@@ -2335,14 +2346,7 @@ func (r *Repository) resolveJumpForNode(
 
 	switch len(jumpSet) {
 	case 0:
-		ps, pErr := parseOptionalNodeProxyJump(canonicalInfo.ProxyJump)
-		if pErr != nil {
-			return "", pErr
-		}
-		if targets, ok := ps.JumpTargets(); ok {
-			return r.resolveProxyJumpChain(cfg, strings.Join(targets, ","))
-		}
-		return "", nil
+		return r.resolveCanonicalTier4JumpForNode(cfg, canonicalInfo.ProxyJump)
 	case 1:
 		for j := range jumpSet {
 			if j == "" {
@@ -2355,6 +2359,24 @@ func (r *Repository) resolveJumpForNode(
 		return "", fmt.Errorf("ambiguous proxy jump: multiple nodes for host %s have conflicting proxy jumps",
 			FormatHostPort(canonicalAddr, targetPort))
 	}
+}
+
+func (r *Repository) resolveCanonicalTier4JumpForNode(cfg *Configuration, rawJump string) (string, error) {
+	ps, pErr := parseOptionalNodeProxyJump(rawJump)
+	if pErr != nil {
+		return "", pErr
+	}
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return "", nil
+	}
+	if _, vErr := validateJumpTargetsSyntax(targets); vErr != nil {
+		return "", vErr
+	}
+	if tier3ShadowsTier4ProxyJump(cfg) {
+		return "", nil
+	}
+	return r.resolveProxyJumpChain(cfg, strings.Join(targets, ","))
 }
 
 func (r *Repository) createIdentityForNode(

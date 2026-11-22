@@ -65,6 +65,9 @@ func validateCommonSSHBaseOptions(o *SshOptions) error {
 		return err
 	}
 	if o.JumpHost != "" {
+		if err := config.ValidateRawProxyJumpTokens(o.JumpHost); err != nil {
+			return fmt.Errorf("invalid --jump (-J): %w", err)
+		}
 		if _, err := ssh.ParseOption(ssh.OptionProxyJump, o.JumpHost, ssh.OptionSourceCLI); err != nil {
 			return fmt.Errorf("invalid --jump (-J): %w", err)
 		}

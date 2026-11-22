@@ -196,7 +196,7 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 
 	if effectiveProxy.Kind() == ssh.ProxyJump {
 		resolvedJump, err := a.resolveEffectiveJumpChain(
-			req.NodeID, req.ResolveProxy, tier1JumpWon, tier1Auth, effectiveProxy, snapshot, pol.hasSnapshot, openSSHAlias, canonHost,
+			req.NodeID, req.ResolveProxy, tier1JumpWon, tier1Auth, hasTier1Auth, effectiveProxy, snapshot, pol.hasSnapshot, openSSHAlias, canonHost,
 		)
 		if err != nil {
 			return pol, err
@@ -312,6 +312,7 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	resolveProxy bool,
 	tier1JumpWon bool,
 	tier1Auth SessionAuth,
+	hasTier1Auth bool,
 	effectiveProxy ssh.ProxySetting,
 	snapshot config.ConnectionSnapshot,
 	hasSnapshot bool,
@@ -355,7 +356,7 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	if err != nil {
 		return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
 	}
-	dest := buildPolicyProxyJumpTarget(a.getOpenSSHParser(), nodeID, snapshot, hasSnapshot, openSSHAlias, canonHost)
+	dest := buildPolicyProxyJumpTarget(a.getOpenSSHParser(), nodeID, snapshot, hasSnapshot, openSSHAlias, canonHost, tier1Auth, hasTier1Auth)
 	if err := config.ValidateProxyJumpChainCycle(a.cfgProvider, dest, resolved, rawJump); err != nil {
 		return "", err
 	}
@@ -386,6 +387,8 @@ func buildPolicyProxyJumpTarget(
 	snapshot config.ConnectionSnapshot,
 	hasSnapshot bool,
 	openSSHAlias, canonHost string,
+	tier1Auth SessionAuth,
+	hasTier1Auth bool,
 ) config.ProxyJumpTarget {
 	dest := config.ProxyJumpTarget{
 		NodeID:        strings.TrimSpace(nodeID),
@@ -394,41 +397,116 @@ func buildPolicyProxyJumpTarget(
 		CanonicalHost: strings.TrimSpace(canonHost),
 	}
 	if !hasSnapshot {
-		explicitUser := ""
-		if dest.NodeID != "" {
-			if ref, err := config.ParseTargetRef(dest.NodeID); err == nil && ref.User != "" {
+		return buildNoSnapshotPolicyProxyJumpTarget(parser, dest, tier1Auth, hasTier1Auth)
+	}
+	return buildSnapshotPolicyProxyJumpTarget(dest, snapshot, tier1Auth, hasTier1Auth)
+}
+
+func buildNoSnapshotPolicyProxyJumpTarget(
+	parser *config.OpenSSHParser,
+	dest config.ProxyJumpTarget,
+	tier1Auth SessionAuth,
+	hasTier1Auth bool,
+) config.ProxyJumpTarget {
+	explicitUser := ""
+	var explicitPort uint16
+	if dest.NodeID != "" {
+		if ref, err := config.ParseTargetRef(dest.NodeID); err == nil {
+			if ref.User != "" {
 				explicitUser = ref.User
 			}
-		}
-		if dest.OpenSSHAlias != "" {
-			host, port, user := resolveOpenSSHPolicyTargetDefaults(parser, dest.OpenSSHAlias, dest.CanonicalHost)
-			if host != "" {
-				dest.Host = host
-			}
-			if port > 0 {
-				dest.Port = port
-			}
-			if explicitUser == "" && user != "" {
-				explicitUser = user
+			if ref.HasPort && ref.Port > 0 {
+				explicitPort = ref.Port
 			}
 		}
-		if explicitUser != "" {
-			dest.User = explicitUser
-		} else if dest.NodeID != "" {
-			dest.User = effectiveSnapshotUser("")
-		}
-		return dest
 	}
+	if hasTier1Auth {
+		if u := strings.TrimSpace(tier1Auth.User); u != "" {
+			explicitUser = u
+		}
+		if tier1Auth.Port > 0 {
+			explicitPort = tier1Auth.Port
+		}
+	}
+	if dest.OpenSSHAlias != "" {
+		host, port, user := resolveOpenSSHPolicyTargetDefaults(parser, dest.OpenSSHAlias, dest.CanonicalHost)
+		if host != "" {
+			dest.Host = host
+		}
+		if explicitPort == 0 && port > 0 {
+			explicitPort = port
+		}
+		if explicitUser == "" && user != "" {
+			explicitUser = user
+		}
+	}
+	if hasTier1Auth && strings.TrimSpace(tier1Auth.HostName) != "" {
+		dest.Host = config.StripHostBrackets(tier1Auth.HostName)
+	}
+	if explicitPort > 0 {
+		dest.Port = explicitPort
+	}
+	if explicitUser != "" {
+		dest.User = explicitUser
+	} else if dest.NodeID != "" {
+		dest.User = effectiveSnapshotUser("")
+	}
+	return dest
+}
+
+func buildSnapshotPolicyProxyJumpTarget(
+	dest config.ProxyJumpTarget,
+	snapshot config.ConnectionSnapshot,
+	tier1Auth SessionAuth,
+	hasTier1Auth bool,
+) config.ProxyJumpTarget {
 	if dest.OpenSSHAlias == "" {
 		dest.OpenSSHAlias = strings.TrimSpace(snapshot.Node.OpenSSHAlias)
 	}
 	if dest.CanonicalHost == "" {
 		dest.CanonicalHost = strings.TrimSpace(snapshot.Node.CanonicalHost)
 	}
-	dest.Host = strings.TrimSpace(snapshot.Host.Address)
-	dest.Port = snapshot.Host.Port
-	dest.User = effectiveSnapshotUser(snapshot.Identity.User)
+	baseHost := strings.TrimSpace(snapshot.Host.Address)
+	basePort := snapshot.Host.Port
+	if basePort == 0 {
+		basePort = 22
+	}
+	baseUser := effectiveSnapshotUser(snapshot.Identity.User)
+
+	dest.Host = baseHost
+	dest.Port = basePort
+	dest.User = baseUser
 	dest.IsAdHoc = snapshot.Provenance == config.ProvenanceAdHocPending
+
+	endpointOverridden := false
+	if hasTier1Auth {
+		if h := config.StripHostBrackets(tier1Auth.HostName); h != "" && !strings.EqualFold(h, config.StripHostBrackets(baseHost)) {
+			dest.Host = h
+			endpointOverridden = true
+		}
+		if tier1Auth.Port > 0 && tier1Auth.Port != basePort {
+			dest.Port = tier1Auth.Port
+			endpointOverridden = true
+		}
+		if u := strings.TrimSpace(tier1Auth.User); u != "" && u != baseUser {
+			dest.User = u
+			endpointOverridden = true
+		}
+	}
+	if endpointOverridden {
+		if config.IsOpenSSHNodeID(dest.NodeID) {
+			hostToken := config.UnwrapOpenSSHSelector(dest.NodeID)
+			if hostToken == "" {
+				hostToken = dest.OpenSSHAlias
+			}
+			if hostToken != "" {
+				dest.NodeID = config.OpenSSHNodePrefix + config.FormatNodeID(dest.User, hostToken, dest.Port)
+			}
+		} else {
+			dest.IsAdHoc = true
+			dest.NodeID = config.FormatNodeID(dest.User, dest.Host, dest.Port)
+		}
+	}
 	return dest
 }
 
@@ -750,11 +828,19 @@ func (p EffectivePolicy) controlTargetContextWithEnv(nodeID string, env ssh.Envi
 		}
 	}
 	host := effectiveSnapshotHost(p.snapshot, p.hasTier1Auth, p.tier1Auth)
+	port := effectiveSnapshotPort(p.snapshot.Host.Port)
+	if p.hasTier1Auth && p.tier1Auth.Port > 0 {
+		port = int(p.tier1Auth.Port)
+	}
+	user := strings.TrimSpace(p.snapshot.Identity.User)
+	if p.hasTier1Auth && strings.TrimSpace(p.tier1Auth.User) != "" {
+		user = strings.TrimSpace(p.tier1Auth.User)
+	}
 	jumpHost := p.EffectiveJump()
 	return ssh.NormalizeTargetContext(ssh.TargetContext{
 		Host:          host,
-		Port:          effectiveSnapshotPort(p.snapshot.Host.Port),
-		User:          strings.TrimSpace(p.snapshot.Identity.User),
+		Port:          port,
+		User:          user,
 		OriginalHost:  origHost,
 		CanonicalHost: p.canonicalHost,
 		JumpHost:      jumpHost,

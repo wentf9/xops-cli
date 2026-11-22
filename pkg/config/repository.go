@@ -729,7 +729,10 @@ func (r *Repository) publishWithAction(
 		action.afterProviderLocked()
 	}
 	if updated != nil && updated.Nodes != nil {
-		for pendingID := range r.pending {
+		for pendingID, entry := range r.pending {
+			if entry != nil && entry.isUpdate {
+				continue
+			}
 			if _, saved := updated.Nodes.Get(pendingID); saved {
 				delete(r.pending, pendingID)
 			}

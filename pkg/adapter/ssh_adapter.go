@@ -30,6 +30,8 @@ type SessionAuth struct {
 	KeyPath                  string
 	KeyPaths                 []string
 	HostName                 string
+	User                     string
+	Port                     uint16
 	OriginalHost             string
 	CanonicalHost            string
 	SuPwd                    string
