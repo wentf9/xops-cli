@@ -1252,7 +1252,10 @@ func (s *Shell) listRemoteOne(ctx context.Context, path string, long bool) error
 		w := tabwriter.NewWriter(s.stdout, 0, 0, 1, ' ', 0)
 		for _, f := range files {
 			modTime := f.ModTime().Format("Jan 02 15:04")
-			size := formatBytes(f.Size())
+			// SFTP wire SSH_FXP_ATTRS encodes size as uint64; format as
+			// unsigned so high-bit wire sizes (>= 1<<63) never display as
+			// negative byte counts.
+			size := sftp.FormatByteSize(uint64(f.Size()))
 			name := sanitizeDisplayText(f.Name())
 			if f.IsDir() {
 				name += "/"
@@ -1732,8 +1735,8 @@ func (s *Shell) checkRemoteStorageSpace(ctx context.Context, client *sftp.Client
 		total := sftp.TotalStorageSpace(vfs)
 		if avail == 0 || (totalSize > 0 && avail < uint64(totalSize)) {
 			s.fprintlnStdout(i18n.Tf("sftp_shell_storage_insufficient_warning", map[string]any{
-				"Free":  formatBytes(int64(avail)),
-				"Total": formatBytes(int64(total)),
+				"Free":  sftp.FormatByteSize(avail),
+				"Total": sftp.FormatByteSize(total),
 				"Need":  formatBytes(totalSize),
 			}))
 		}
@@ -3054,16 +3057,10 @@ func (s *Shell) resetLineEditor(ctx context.Context) error {
 }
 
 func formatBytes(bytes int64) string {
-	const unit = 1024
-	if bytes < unit {
-		return fmt.Sprintf("%d B", bytes)
+	if bytes <= 0 {
+		return "0 B"
 	}
-	div, exp := int64(unit), 0
-	for n := bytes / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+	return sftp.FormatByteSize(uint64(bytes))
 }
 
 // printColumns 多列格式输出，类似 Linux ls 命令

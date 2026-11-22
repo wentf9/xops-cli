@@ -336,6 +336,9 @@ func (c *Client) downloadTransferSize(ctx context.Context, remoteRoot RemotePath
 		return 0, err
 	}
 	if rootInfo.Mode()&os.ModeType != os.ModeDir {
+		if err := validateRemoteFileSize(remoteRoot.String(), rootInfo.Size()); err != nil {
+			return 0, err
+		}
 		return saturatingAddInt64(0, rootInfo.Size()), nil
 	}
 
@@ -355,6 +358,9 @@ func (c *Client) downloadTransferSize(ctx context.Context, remoteRoot RemotePath
 			total = saturatingAddInt64(total, int64(len(target)))
 			return nil
 		default:
+			if err := validateRemoteFileSize(child.String(), info.Size()); err != nil {
+				return err
+			}
 			total = saturatingAddInt64(total, info.Size())
 			return nil
 		}

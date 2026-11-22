@@ -153,37 +153,132 @@ func isAlpha(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
-func parseDrivePath(p string) (drive string, rest string, ok bool) {
-	if len(p) >= 2 && isAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
-		return strings.ToUpper(string(p[0])), p[2:], true
-	}
-	trimmed := strings.TrimLeft(p, "/")
-	if len(trimmed) < len(p) && len(trimmed) >= 2 && isAlpha(trimmed[0]) && trimmed[1] == ':' && (len(trimmed) == 2 || trimmed[2] == '/' || trimmed[2] == '\\') {
-		return strings.ToUpper(string(trimmed[0])), trimmed[2:], true
+func parseBareDriveSegment(seg string) (drive string, rest string, ok bool) {
+	if len(seg) >= 2 && isAlpha(seg[0]) && seg[1] == ':' && (len(seg) == 2 || seg[2] == '/' || seg[2] == '\\') {
+		return strings.ToUpper(string(seg[0])), seg[2:], true
 	}
 	return "", "", false
 }
 
-// canonicalDrivePath detects Windows drive paths (C:..., /C:..., //C:..., or
-// absolute paths collapsing via ".." to /C:...) and returns the uppercase drive
-// letter together with the POSIX-cleaned path beneath that drive root.
-func canonicalDrivePath(p string) (drive string, cleanRest string, ok bool) {
-	if d, rest, matched := parseDrivePath(p); matched {
-		return d, cleanDriveRest(rest), true
+func parseDrivePath(p string) (drive string, rest string, ok bool) {
+	if d, r, matched := parseBareDriveSegment(p); matched {
+		return d, r, true
 	}
-	if strings.HasPrefix(p, "/") {
-		cleaned := path.Clean(p)
-		if strings.HasPrefix(cleaned, "/") {
-			if d, rest, matched := parseDrivePath(cleaned); matched {
-				return d, cleanDriveRest(rest), true
-			}
+	trimmed := strings.TrimLeft(p, "/")
+	if len(trimmed) < len(p) {
+		if d, r, matched := parseBareDriveSegment(trimmed); matched {
+			return d, r, true
 		}
 	}
 	return "", "", false
 }
 
-func cleanDriveRest(rest string) string {
-	return path.Clean("/" + strings.ReplaceAll(rest, "\\", "/"))
+// extractDrivePath detects Windows drive paths (C:..., /C:..., //C:..., or
+// absolute paths collapsing via ".." to /C:...) and returns the uppercase drive
+// letter together with the raw (pre-Clean) path remainder beneath that drive
+// root so Win32 component anomalies collapsed by ".." are still observable.
+func extractDrivePath(p string) (drive string, rawRest string, ok bool) {
+	if d, rest, matched := parseDrivePath(p); matched {
+		return d, rest, true
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", "", false
+	}
+	type segEntry struct {
+		seg    string
+		rawIdx int
+	}
+	segs := strings.Split(p, "/")
+	stack := make([]segEntry, 0, len(segs))
+	for i, seg := range segs {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		default:
+			stack = append(stack, segEntry{seg: seg, rawIdx: i})
+		}
+	}
+	if len(stack) == 0 {
+		return "", "", false
+	}
+	d, rest, matched := parseBareDriveSegment(stack[0].seg)
+	if !matched {
+		return "", "", false
+	}
+	if stack[0].rawIdx+1 < len(segs) {
+		rest += "/" + strings.Join(segs[stack[0].rawIdx+1:], "/")
+	}
+	return d, rest, true
+}
+
+func hasWin32AmbiguousSegment(slashPath string) bool {
+	for _, seg := range strings.Split(slashPath, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		if strings.ContainsRune(seg, ':') || strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
+			return true
+		}
+	}
+	return false
+}
+
+// canonicalizeDriveRest cleans a Windows drive-relative path (after C:),
+// returning:
+//   - canonicalRest: POSIX-cleaned path beneath the drive root with NTFS ADS
+//     (:stream) suffixes and trailing ASCII '.' / ' ' stripped on non-dot
+//     navigation segments (matching Win32 RtlDosPathNameToNtPathName semantics).
+//   - ambiguous: true if any segment before or after path.Clean carries a
+//     secondary ':' (NTFS ADS) or Win32-stripped trailing '.' / ' ' on a
+//     non-"."/".." component (including whitespace-only or multi-dot "..."
+//     components).
+func canonicalizeDriveRest(rest string) (canonicalRest string, ambiguous bool) {
+	slashRest := strings.ReplaceAll(rest, "\\", "/")
+	ambiguous = hasWin32AmbiguousSegment(slashRest)
+
+	cleaned := path.Clean("/" + slashRest)
+	if !ambiguous && hasWin32AmbiguousSegment(cleaned) {
+		ambiguous = true
+	}
+
+	rawSegs := strings.Split(cleaned, "/")
+	canonSegs := make([]string, 0, len(rawSegs))
+	for _, seg := range rawSegs {
+		if seg == "" {
+			continue
+		}
+		if seg == "." || seg == ".." {
+			canonSegs = append(canonSegs, seg)
+			continue
+		}
+		if idx := strings.IndexByte(seg, ':'); idx >= 0 {
+			seg = seg[:idx]
+		}
+		seg = strings.TrimRight(seg, ". ")
+		if seg == "" {
+			continue
+		}
+		canonSegs = append(canonSegs, seg)
+	}
+	canonicalRest = path.Clean("/" + strings.Join(canonSegs, "/"))
+	return canonicalRest, ambiguous
+}
+
+// canonicalDrivePath detects Windows drive paths (C:..., /C:..., //C:..., or
+// absolute paths collapsing via ".." to /C:...) and returns the uppercase drive
+// letter, Win32-canonicalized path beneath that drive root, and whether any
+// segment had NTFS ADS or Win32-ambiguous trailing '.' / ' ' characters.
+func canonicalDrivePath(p string) (drive string, cleanRest string, ambiguous bool, ok bool) {
+	d, rest, matched := extractDrivePath(p)
+	if !matched {
+		return "", "", false, false
+	}
+	cleanRest, ambiguous = canonicalizeDriveRest(rest)
+	return d, cleanRest, ambiguous, true
 }
 
 func hasSensitivePrefix(cleaned string) bool {
@@ -238,14 +333,14 @@ func analyzeSinglePath(p string) RiskLevel {
 	if p == "" || hasControlOrLineSep(p) {
 		return Dangerous
 	}
-	if _, cleanRest, ok := canonicalDrivePath(p); ok {
-		return analyzeCleanDriveRest(cleanRest)
+	if _, cleanRest, ambiguous, ok := canonicalDrivePath(p); ok {
+		return analyzeCleanDriveRest(cleanRest, ambiguous)
 	}
 	return analyzePosixPath(p)
 }
 
-func analyzeCleanDriveRest(cleanRest string) RiskLevel {
-	if cleanRest == "/" {
+func analyzeCleanDriveRest(cleanRest string, ambiguous bool) RiskLevel {
+	if cleanRest == "/" || ambiguous {
 		return Dangerous
 	}
 	if hasSensitivePrefix(cleanRest) {
@@ -258,8 +353,8 @@ func analyzeCleanedPosix(cleaned string) RiskLevel {
 	if cleaned == "" || cleaned == "/" || cleaned == "." || !strings.HasPrefix(cleaned, "/") {
 		return Dangerous
 	}
-	if _, rest, ok := parseDrivePath(cleaned); ok {
-		return analyzeCleanDriveRest(cleanDriveRest(rest))
+	if _, cleanRest, ambiguous, ok := canonicalDrivePath(cleaned); ok {
+		return analyzeCleanDriveRest(cleanRest, ambiguous)
 	}
 	if hasSensitivePrefix(cleaned) {
 		return Moderate
@@ -275,7 +370,13 @@ func analyzePosixPath(p string) RiskLevel {
 	}
 	level := analyzeCleanedPosix(path.Clean(p))
 	if strings.Contains(p, "\\") {
-		slashRisk := analyzeCleanedPosix(path.Clean("/" + strings.ReplaceAll(p, "\\", "/")))
+		slashPath := "/" + strings.ReplaceAll(p, "\\", "/")
+		var slashRisk RiskLevel
+		if _, cleanRest, ambiguous, ok := canonicalDrivePath(slashPath); ok {
+			slashRisk = analyzeCleanDriveRest(cleanRest, ambiguous)
+		} else {
+			slashRisk = analyzeCleanedPosix(path.Clean(slashPath))
+		}
 		if slashRisk > level {
 			level = slashRisk
 		}

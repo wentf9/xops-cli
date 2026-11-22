@@ -273,7 +273,7 @@ func TestP7W9a_DownloadTransferSizeSaturatingInt64(t *testing.T) {
 		}
 	})
 
-	t.Run("negative_sizes_clamped_to_zero", func(t *testing.T) {
+	t.Run("negative_sizes_fail_closed_with_err_invalid_remote_size", func(t *testing.T) {
 		h := newW8aHostileTrackingHandler()
 		h.stats["/neg"] = syntheticFileInfo{name: "neg", mode: os.ModeDir | 0o755}
 		h.dirLists["/neg"] = []os.FileInfo{
@@ -289,24 +289,16 @@ func TestP7W9a_DownloadTransferSizeSaturatingInt64(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		gotDir, err := client.DownloadTransferSize(t.Context(), negDir)
-		if err != nil {
-			t.Fatalf("DownloadTransferSize(/neg) err = %v", err)
-		}
-		if gotDir != 123 {
-			t.Fatalf("DownloadTransferSize(/neg) = %d, want 123", gotDir)
+		if gotDir, err := client.DownloadTransferSize(t.Context(), negDir); !errors.Is(err, ErrInvalidRemoteSize) || gotDir != 0 {
+			t.Fatalf("DownloadTransferSize(/neg) = (%d, %v), want (0, ErrInvalidRemoteSize)", gotDir, err)
 		}
 
 		singleNeg, err := ParseRemotePath("/single_neg")
 		if err != nil {
 			t.Fatal(err)
 		}
-		gotSingle, err := client.DownloadTransferSize(t.Context(), singleNeg)
-		if err != nil {
-			t.Fatalf("DownloadTransferSize(/single_neg) err = %v", err)
-		}
-		if gotSingle != 0 {
-			t.Fatalf("DownloadTransferSize(/single_neg) = %d, want 0", gotSingle)
+		if gotSingle, err := client.DownloadTransferSize(t.Context(), singleNeg); !errors.Is(err, ErrInvalidRemoteSize) || gotSingle != 0 {
+			t.Fatalf("DownloadTransferSize(/single_neg) = (%d, %v), want (0, ErrInvalidRemoteSize)", gotSingle, err)
 		}
 	})
 }

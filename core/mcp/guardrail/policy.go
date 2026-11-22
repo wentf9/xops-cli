@@ -175,8 +175,8 @@ func matchesUnder(target, prefix string) bool {
 }
 
 func matchesUnderNormalized(target, prefix string) bool {
-	tDrive, tRest, tIsDrive := canonicalDrivePath(target)
-	pDrive, pRest, pIsDrive := canonicalDrivePath(prefix)
+	tDrive, tRest, _, tIsDrive := canonicalDrivePath(target)
+	pDrive, pRest, _, pIsDrive := canonicalDrivePath(prefix)
 
 	if tIsDrive && pIsDrive {
 		if tDrive != pDrive {

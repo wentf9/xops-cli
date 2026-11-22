@@ -3,6 +3,8 @@ package sftpshell
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -132,20 +134,57 @@ func (h *commandHistory) withFileLock(ctx context.Context, operation func() erro
 	defer func() { retErr = errors.Join(retErr, lock.Close()) }()
 	return operation()
 }
+
+const historyStagingRetries = 16
+
+func createHistoryStagingFile(dir string) (*os.File, string, error) {
+	var lastErr error
+	for range historyStagingRetries {
+		var token [8]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return nil, "", fmt.Errorf("generate history staging filename: %w", err)
+		}
+		tempPath := filepath.Join(dir, ".xops-history-"+hex.EncodeToString(token[:]))
+		file, err := fsx.CreateExclusive(tempPath, fsx.OwnerOnlyPerm)
+		if err == nil {
+			return file, tempPath, nil
+		}
+		lastErr = err
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", lastErr
+}
+
 func writeCommandHistory(ctx context.Context, path string, lines []string) (retErr error) {
-	file, err := os.CreateTemp(filepath.Dir(path), ".xops-history-*")
+	// Create the staging file handle-first with fsx.CreateExclusive so Unix gets
+	// 0600 O_NOFOLLOW|O_EXCL|O_CLOEXEC and Windows applies an explicit
+	// SE_DACL_PROTECTED owner-only SECURITY_DESCRIPTOR at creation time rather
+	// than inheriting parent directory ACEs via os.CreateTemp.
+	file, tempPath, err := createHistoryStagingFile(filepath.Dir(path))
 	if err != nil {
 		return fmt.Errorf("create history temporary file failed: %w", err)
 	}
+	stagingInfo, statErr := file.Stat()
+	committed := false
 	closed := false
 	defer func() {
 		if !closed {
 			retErr = errors.Join(retErr, file.Close())
 		}
-		if err := os.Remove(file.Name()); err != nil && !errors.Is(err, os.ErrNotExist) { //nolint:forbidigo // cleanup own CreateTemp file if Windows-retryable rename fails
-			retErr = errors.Join(retErr, err)
+		if !committed && stagingInfo != nil {
+			currInfo, lstatErr := os.Lstat(tempPath)
+			if lstatErr == nil && os.SameFile(stagingInfo, currInfo) {
+				if rmErr := os.Remove(tempPath); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) { //nolint:forbidigo // cleanup own handle-verified staging file if write or Windows-retryable rename fails
+					retErr = errors.Join(retErr, rmErr)
+				}
+			}
 		}
 	}()
+	if statErr != nil {
+		return fmt.Errorf("stat history temporary file failed: %w", statErr)
+	}
 	if _, err = file.WriteString(strings.Join(lines, "\n") + "\n"); err != nil {
 		return fmt.Errorf("write history failed: %w", err)
 	}
@@ -154,9 +193,10 @@ func writeCommandHistory(ctx context.Context, path string, lines []string) (retE
 		return fmt.Errorf("close history failed: %w", err)
 	}
 	closed = true
-	if err = renameCommandHistory(ctx, file.Name(), path); err != nil {
+	if err = renameCommandHistory(ctx, tempPath, path); err != nil {
 		return fmt.Errorf("replace history failed: %w", err)
 	}
+	committed = true
 	return nil
 }
 

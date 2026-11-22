@@ -77,6 +77,12 @@ func validateResolvedRealPath(raw string) (string, error) {
 	if !parsed.IsAbs() {
 		return "", fmt.Errorf("%w: resolved remote path %q is not absolute", sftp.ErrInvalidRemotePath, raw)
 	}
+	if err := ValidateWindowsDrivePath(raw); err != nil {
+		return "", fmt.Errorf("invalid resolved remote path: %w", err)
+	}
+	if err := ValidateWindowsDrivePath(parsed.String()); err != nil {
+		return "", fmt.Errorf("invalid resolved remote path: %w", err)
+	}
 	return parsed.String(), nil
 }
 
@@ -84,10 +90,16 @@ func validateTransferInputPath(name string) (string, error) {
 	if _, err := sftp.ParseRemotePath(name); err != nil {
 		return "", fmt.Errorf("transfer requires an absolute remote file path: %w", err)
 	}
+	if err := ValidateWindowsDrivePath(name); err != nil {
+		return "", fmt.Errorf("transfer requires an absolute remote file path: %w", err)
+	}
 	norm := NormalizeSFTPPath(name)
 	parsed, err := sftp.ParseRemotePath(norm)
 	if err != nil || !parsed.IsAbs() || IsRootPath(parsed.String()) || len(parsed.String()) > 4096 {
 		return "", errors.New("transfer requires an absolute remote file path")
+	}
+	if err := ValidateWindowsDrivePath(parsed.String()); err != nil {
+		return "", fmt.Errorf("transfer requires an absolute remote file path: %w", err)
 	}
 	return parsed.String(), nil
 }
@@ -109,9 +121,15 @@ func resolveTransferTargetPath(client *pkgsftp.Client, name string) (string, err
 		return "", errors.New("transfer parent is not a directory")
 	}
 	resolved := path.Join(parent, path.Base(name))
+	if err := ValidateWindowsDrivePath(resolved); err != nil {
+		return "", fmt.Errorf("resolve transfer file path: %w", err)
+	}
 	parsed, err := sftp.ParseRemotePath(resolved)
 	if err != nil || !parsed.IsAbs() || IsRootPath(parsed.String()) || len(parsed.String()) > 4096 {
 		return "", fmt.Errorf("resolve transfer file path: %w", sftp.ErrInvalidRemotePath)
+	}
+	if err := ValidateWindowsDrivePath(parsed.String()); err != nil {
+		return "", fmt.Errorf("resolve transfer file path: %w", err)
 	}
 	return parsed.String(), nil
 }
@@ -151,6 +169,9 @@ func inspectTransferFile(client *pkgsftp.Client, name string, upload, overwrite 
 }
 
 func (r *Session) Upload(ctx context.Context, temporary string, source io.Reader, size int64, confirm func() error, progress func(int64) error) (result StreamResult, retErr error) {
+	if err := ValidateWindowsDrivePath(temporary); err != nil {
+		return StreamResult{}, fmt.Errorf("invalid temporary upload path: %w", err)
+	}
 	retErr = r.client.Do(ctx, func(client *pkgsftp.Client) (opErr error) {
 		if _, err := client.Lstat(temporary); err == nil {
 			result.CreationRejected = true
@@ -277,6 +298,9 @@ func CopyStream(ctx context.Context, destination io.Writer, source io.Reader, si
 }
 
 func (r *Session) Commit(ctx context.Context, temporary, destination string, overwrite bool) (result CommitResult, retErr error) {
+	if err := ValidateWindowsDrivePath(temporary); err != nil {
+		return CommitResult{}, fmt.Errorf("invalid temporary upload path: %w", err)
+	}
 	retErr = r.client.Do(ctx, func(client *pkgsftp.Client) error {
 		metadata, err := inspectTransferFile(client, destination, true, overwrite)
 		if err != nil {
@@ -338,8 +362,11 @@ func IsPermissionDenied(err error) bool {
 }
 
 func (r *Session) Remove(ctx context.Context, name string) error {
+	if err := ValidateWindowsDrivePath(name); err != nil {
+		return fmt.Errorf("cleanup requires an absolute remote file path: %w", err)
+	}
 	parsedName, err := sftp.ParseRemotePath(name)
-	if err != nil || !parsedName.IsAbs() || IsRootPath(parsedName.String()) {
+	if err != nil || !parsedName.IsAbs() || IsRootPath(parsedName.String()) || ValidateWindowsDrivePath(parsedName.String()) != nil {
 		return fmt.Errorf("%w: cleanup requires an absolute remote file path", sftp.ErrInvalidRemotePath)
 	}
 	name = parsedName.String()
@@ -376,6 +403,127 @@ func isAlpha(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
+func parseBareDriveSegment(seg string) (drive string, rest string, ok bool) {
+	if len(seg) >= 2 && isAlpha(seg[0]) && seg[1] == ':' && (len(seg) == 2 || seg[2] == '/' || seg[2] == '\\') {
+		return strings.ToUpper(string(seg[0])), seg[2:], true
+	}
+	return "", "", false
+}
+
+func parseDrivePath(p string) (drive string, rest string, ok bool) {
+	if d, r, matched := parseBareDriveSegment(p); matched {
+		return d, r, true
+	}
+	trimmed := strings.TrimLeft(p, "/")
+	if len(trimmed) < len(p) {
+		if d, r, matched := parseBareDriveSegment(trimmed); matched {
+			return d, r, true
+		}
+	}
+	return "", "", false
+}
+
+// extractDrivePath detects Windows drive paths (C:..., /C:..., //C:..., or
+// absolute paths collapsing via ".." to /C:...) and returns the uppercase drive
+// letter together with the raw (pre-Clean) path remainder beneath that drive.
+func extractDrivePath(p string) (drive string, rawRest string, ok bool) {
+	if d, rest, matched := parseDrivePath(p); matched {
+		return d, rest, true
+	}
+	if !strings.HasPrefix(p, "/") {
+		return "", "", false
+	}
+	type segEntry struct {
+		seg    string
+		rawIdx int
+	}
+	segs := strings.Split(p, "/")
+	stack := make([]segEntry, 0, len(segs))
+	for i, seg := range segs {
+		switch seg {
+		case "", ".":
+			continue
+		case "..":
+			if len(stack) > 0 {
+				stack = stack[:len(stack)-1]
+			}
+		default:
+			stack = append(stack, segEntry{seg: seg, rawIdx: i})
+		}
+	}
+	if len(stack) == 0 {
+		return "", "", false
+	}
+	d, rest, matched := parseBareDriveSegment(stack[0].seg)
+	if !matched {
+		return "", "", false
+	}
+	if stack[0].rawIdx+1 < len(segs) {
+		rest += "/" + strings.Join(segs[stack[0].rawIdx+1:], "/")
+	}
+	return d, rest, true
+}
+
+func hasWin32AmbiguousSegment(slashPath string) bool {
+	for _, seg := range strings.Split(slashPath, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		if strings.ContainsRune(seg, ':') || strings.HasSuffix(seg, ".") || strings.HasSuffix(seg, " ") {
+			return true
+		}
+	}
+	return false
+}
+
+func canonicalizeDriveRest(rest string) (canonicalRest string, ambiguous bool) {
+	slashRest := strings.ReplaceAll(rest, "\\", "/")
+	ambiguous = hasWin32AmbiguousSegment(slashRest)
+
+	cleaned := path.Clean("/" + slashRest)
+	if !ambiguous && hasWin32AmbiguousSegment(cleaned) {
+		ambiguous = true
+	}
+
+	rawSegs := strings.Split(cleaned, "/")
+	canonSegs := make([]string, 0, len(rawSegs))
+	for _, seg := range rawSegs {
+		if seg == "" {
+			continue
+		}
+		if seg == "." || seg == ".." {
+			canonSegs = append(canonSegs, seg)
+			continue
+		}
+		if idx := strings.IndexByte(seg, ':'); idx >= 0 {
+			seg = seg[:idx]
+		}
+		seg = strings.TrimRight(seg, ". ")
+		if seg == "" {
+			continue
+		}
+		canonSegs = append(canonSegs, seg)
+	}
+	canonicalRest = path.Clean("/" + strings.Join(canonSegs, "/"))
+	return canonicalRest, ambiguous
+}
+
+// ValidateWindowsDrivePath rejects Windows drive paths (C:..., /C:..., //C:...,
+// or /tmp/../C:...) whose path components contain NTFS alternate data stream
+// syntax (':' after the drive prefix) or Win32-ambiguous trailing '.' or ' '
+// characters (including whitespace-only or multi-dot "..." components) on
+// non-"."/".." segments. Non-drive POSIX paths are never rejected.
+func ValidateWindowsDrivePath(p string) error {
+	_, rest, ok := extractDrivePath(p)
+	if !ok {
+		return nil
+	}
+	if _, ambiguous := canonicalizeDriveRest(rest); ambiguous {
+		return fmt.Errorf("%w: Windows drive path %q contains NTFS ADS or Win32-ambiguous trailing dot/space component", sftp.ErrInvalidRemotePath, p)
+	}
+	return nil
+}
+
 func formatNormalizedDrivePath(drive, rest string) string {
 	rest = strings.ReplaceAll(rest, "\\", "/")
 	cleanRest := path.Clean("/" + rest)
@@ -386,12 +534,16 @@ func formatNormalizedDrivePath(drive, rest string) string {
 }
 
 func normalizeLeadingDrivePath(p string, allowBare bool) (string, bool) {
-	if allowBare && len(p) >= 2 && isAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
-		return formatNormalizedDrivePath(strings.ToUpper(string(p[0])), p[2:]), true
+	if allowBare {
+		if d, r, ok := parseBareDriveSegment(p); ok {
+			return formatNormalizedDrivePath(d, r), true
+		}
 	}
 	trimmed := strings.TrimLeft(p, "/")
-	if len(trimmed) < len(p) && len(trimmed) >= 2 && isAlpha(trimmed[0]) && trimmed[1] == ':' && (len(trimmed) == 2 || trimmed[2] == '/' || trimmed[2] == '\\') {
-		return formatNormalizedDrivePath(strings.ToUpper(string(trimmed[0])), trimmed[2:]), true
+	if len(trimmed) < len(p) {
+		if d, r, ok := parseBareDriveSegment(trimmed); ok {
+			return formatNormalizedDrivePath(d, r), true
+		}
 	}
 	return "", false
 }
@@ -416,11 +568,22 @@ func NormalizeSFTPPath(p string) string {
 	return cleaned
 }
 
-// IsRootPath reports whether p represents a POSIX or Windows drive root directory.
+// IsRootPath reports whether p represents a POSIX or Windows drive root directory
+// (including Windows drive paths that collapse to the drive root after Win32
+// trailing '.' / ' ' or NTFS ADS stripping, such as "C:\ ", "/C:/...", or
+// "C:\::$DATA").
 func IsRootPath(cleaned string) bool {
 	norm := NormalizeSFTPPath(cleaned)
 	if norm == "/" {
 		return true
 	}
-	return len(norm) == 3 && norm[0] == '/' && isAlpha(norm[1]) && norm[2] == ':'
+	if len(norm) == 3 && norm[0] == '/' && isAlpha(norm[1]) && norm[2] == ':' {
+		return true
+	}
+	if _, rest, ok := extractDrivePath(cleaned); ok {
+		if canonRest, _ := canonicalizeDriveRest(rest); canonRest == "/" {
+			return true
+		}
+	}
+	return false
 }

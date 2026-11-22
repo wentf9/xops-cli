@@ -89,9 +89,13 @@ func validateRemoteFilePath(raw string) (string, error) {
 	if raw == "" || strings.TrimSpace(raw) == "" {
 		return "", errors.New("file path must be absolute")
 	}
-	// Check raw input before path cleaning so control characters inside
-	// segments collapsed by ".." (e.g. "/tmp/bad\n/../good") cannot slip through.
+	// Check raw input before path cleaning so control characters or Win32
+	// ADS / trailing dot/space anomalies inside segments collapsed by ".."
+	// (e.g. "/tmp/bad\n/../good" or "C:\foo.\..\bar") cannot slip through.
 	if _, err := sftp.ParseRemotePath(raw); err != nil {
+		return "", fmt.Errorf("invalid file path: %w", err)
+	}
+	if err := remotefile.ValidateWindowsDrivePath(raw); err != nil {
 		return "", fmt.Errorf("invalid file path: %w", err)
 	}
 	norm := remotefile.NormalizeSFTPPath(raw)
@@ -104,6 +108,9 @@ func validateRemoteFilePath(raw string) (string, error) {
 	}
 	if !parsed.IsAbs() {
 		return "", errors.New("file path must be absolute")
+	}
+	if err := remotefile.ValidateWindowsDrivePath(parsed.String()); err != nil {
+		return "", fmt.Errorf("invalid file path: %w", err)
 	}
 	return parsed.String(), nil
 }

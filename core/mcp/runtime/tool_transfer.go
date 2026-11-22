@@ -51,7 +51,7 @@ func hasControlOrLineSep(s string) bool {
 }
 
 func riskLocalPath(raw string) string {
-	if hasControlOrLineSep(raw) || !filepath.IsAbs(raw) {
+	if hasControlOrLineSep(raw) || !filepath.IsAbs(raw) || remotefile.ValidateWindowsDrivePath(raw) != nil {
 		return raw
 	}
 	return filepath.Clean(raw)
@@ -59,6 +59,9 @@ func riskLocalPath(raw string) string {
 
 func riskRemotePath(raw string) string {
 	if _, err := sftp.ParseRemotePath(raw); err != nil {
+		return raw
+	}
+	if remotefile.ValidateWindowsDrivePath(raw) != nil {
 		return raw
 	}
 	norm := remotefile.NormalizeSFTPPath(raw)
@@ -75,11 +78,17 @@ func validateStdioLocalPath(raw string) (string, error) {
 	if hasControlOrLineSep(raw) {
 		return "", errors.New("localPath must not contain NUL or control characters")
 	}
+	if err := remotefile.ValidateWindowsDrivePath(raw); err != nil {
+		return "", fmt.Errorf("invalid localPath: %w", err)
+	}
 	if !filepath.IsAbs(raw) {
 		return "", errors.New("localPath must be an absolute non-root file path")
 	}
 	cleaned := filepath.Clean(raw)
-	if cleaned == filepath.Dir(cleaned) || remotefile.IsRootPath(cleaned) {
+	if err := remotefile.ValidateWindowsDrivePath(cleaned); err != nil {
+		return "", fmt.Errorf("invalid localPath: %w", err)
+	}
+	if cleaned == filepath.Dir(cleaned) || remotefile.IsRootPath(raw) || remotefile.IsRootPath(cleaned) {
 		return "", errors.New("localPath must be an absolute non-root file path")
 	}
 	return cleaned, nil
@@ -235,7 +244,7 @@ func (r *Runtime) httpTransferHandler(ctx context.Context, req *mcp.CallToolRequ
 
 func (r *Runtime) prepareUpload(ctx context.Context, req *mcp.CallToolRequest, input PrepareUploadInput) (*mcp.CallToolResult, PreparedTransferOutput, error) {
 	input.Action = ""
-	if hasControlOrLineSep(input.RemotePath) {
+	if hasControlOrLineSep(input.RemotePath) || remotefile.ValidateWindowsDrivePath(input.RemotePath) != nil {
 		return nil, PreparedTransferOutput{}, errors.New("an absolute remote file path is required")
 	}
 	input.RemotePath = remotefile.NormalizeSFTPPath(input.RemotePath)
@@ -253,7 +262,7 @@ func (r *Runtime) prepareUpload(ctx context.Context, req *mcp.CallToolRequest, i
 
 func (r *Runtime) prepareDownload(ctx context.Context, req *mcp.CallToolRequest, input PrepareDownloadInput) (*mcp.CallToolResult, PreparedTransferOutput, error) {
 	input.Action = ""
-	if hasControlOrLineSep(input.RemotePath) {
+	if hasControlOrLineSep(input.RemotePath) || remotefile.ValidateWindowsDrivePath(input.RemotePath) != nil {
 		return nil, PreparedTransferOutput{}, errors.New("an absolute remote file path is required")
 	}
 	input.RemotePath = remotefile.NormalizeSFTPPath(input.RemotePath)
@@ -267,7 +276,8 @@ func validateTransferRequest(spec transfer.Spec) error {
 		return errors.New("bounded requestID and nodeID are required")
 	}
 	if !path.IsAbs(spec.RemotePath) || remotefile.IsRootPath(spec.RemotePath) || len(spec.RemotePath) > 4096 ||
-		hasControlOrLineSep(spec.RemotePath) || hasControlOrLineSep(spec.RequestedPath) {
+		hasControlOrLineSep(spec.RemotePath) || hasControlOrLineSep(spec.RequestedPath) ||
+		remotefile.ValidateWindowsDrivePath(spec.RemotePath) != nil || remotefile.ValidateWindowsDrivePath(spec.RequestedPath) != nil {
 		return errors.New("an absolute remote file path is required")
 	}
 	return nil
