@@ -3,12 +3,19 @@
 // All file and socket lifecycle operations in this package operate on open OS
 // handles rather than path-based Stat-then-Open or Lstat-then-Remove sequences:
 //
-//   - OpenRegular / ReadAllBounded open regular files without blocking on FIFOs
-//     or following symlinks/reparse points, verify file type and size limits on
-//     the open handle, and enforce MaxBytes across reads.
+//   - OpenRegular / ReadAllBounded / OpenRegularUnbounded open regular files
+//     without blocking on FIFOs or following symlinks/reparse points, verify
+//     file type on the open handle, and (for OpenRegular/ReadAllBounded) enforce
+//     MaxBytes across reads.
 //   - CreateExclusive creates a brand new file without following symlinks and,
 //     on Windows, applies a protected owner-only SECURITY_DESCRIPTOR atomically
 //     at creation time.
+//   - OpenStagingFile opens or exclusively creates a regular staging file
+//     strictly without O_TRUNC and without following symlinks/reparse points,
+//     so callers only truncate via f.Truncate(0) after handle verification.
+//   - OpenAppendRegular opens or exclusively creates an append-only regular
+//     file without following symlinks/FIFOs/reparse points, applying an
+//     owner-only SECURITY_DESCRIPTOR on Windows when perm&0o077 == 0.
 //   - OpenLocked / TryOpenLocked / OpenLockedContext acquire a shared or
 //     exclusive OS advisory lock on an open no-follow regular file handle and
 //     verify os.SameFile(fstat, lstat(path)) under the lock, retrying up to

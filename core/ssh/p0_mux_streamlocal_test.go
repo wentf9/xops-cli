@@ -659,7 +659,8 @@ func TestP0_StreamLocal_WindowsStructuralInvariants(t *testing.T) {
 	mrFuncs := inspectFile("mux_rights_windows.go")
 	assertCalls("mux_rights_windows.go", mrFuncs, "bindAndLinkSocket",
 		"validateWindowsSocketPath",
-		"fsx.BindSocketSlot",
+		"fsx.ReplaceStaleSocketSlot",
+		"fsx.ProbeStaleUnixSocket",
 	)
 }
 

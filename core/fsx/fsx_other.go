@@ -10,14 +10,26 @@ import (
 )
 
 func openRegularOS(path string, l Limits, cfg openConfig) (*RegularFile, error) {
-	if cfg.allowDevNull && IsDevNullPath(path) {
+	if cfg.allowDevNull && IsDevNullSentinel(path) {
 		return newDevNullRegularFile(path, l.MaxBytes, nil), nil
 	}
 	return nil, fmt.Errorf("%w: OpenRegular on %s", ErrUnsupported, runtime.GOOS)
 }
 
+func openRegularUnboundedOS(_ string, _ openConfig) (*os.File, os.FileInfo, error) {
+	return nil, nil, fmt.Errorf("%w: OpenRegularUnbounded on %s", ErrUnsupported, runtime.GOOS)
+}
+
+func openAppendRegularOS(_ string, _ os.FileMode) (*os.File, error) {
+	return nil, fmt.Errorf("%w: OpenAppendRegular on %s", ErrUnsupported, runtime.GOOS)
+}
+
 func createExclusiveOS(_ string, _ os.FileMode) (*os.File, error) {
 	return nil, fmt.Errorf("%w: CreateExclusive on %s", ErrUnsupported, runtime.GOOS)
+}
+
+func openExistingRegularOS(_ string, _ bool) (*os.File, error) {
+	return nil, fmt.Errorf("%w: OpenStagingFile on %s", ErrUnsupported, runtime.GOOS)
 }
 
 func openExistingRegularForLockOS(_ string, _ bool) (*os.File, error) {

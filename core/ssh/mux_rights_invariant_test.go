@@ -57,7 +57,8 @@ func TestWindowsMuxRights_StructuralSecurityInvariants(t *testing.T) {
 	assertCalls("bindAndLinkSocket",
 		"validateWindowsSocketPath",
 		"MaxControlPathLength",
-		"fsx.BindSocketSlot",
+		"fsx.ReplaceStaleSocketSlot",
+		"fsx.ProbeStaleUnixSocket",
 	)
 	assertCalls("checkPeerUID",
 		"winsec.VerifyAFUnixPeerCurrentUser",
@@ -104,6 +105,8 @@ func assertFSXWindowsSocketSecurityCalls(t *testing.T, fset *token.FileSet) {
 		"winsec.HardenSocketOwnerOnlyByHandle",
 		"winsec.VerifyOwnerOnlySocketByHandle",
 		"withDirLockOS",
+		"acquireWindowsDirLockFile",
+		"verifyLockedFileIdentity",
 	} {
 		if !fsxCalls[req] {
 			t.Errorf("core/fsx/fsx_windows.go must call %s (seen calls: %v)", req, fsxCalls)

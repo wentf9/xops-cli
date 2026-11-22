@@ -28,14 +28,40 @@ const (
 )
 
 func openRegularOS(path string, l Limits, cfg openConfig) (*RegularFile, error) {
-	if cfg.allowDevNull && IsDevNullPath(path) {
+	if cfg.allowDevNull && IsDevNullSentinel(path) {
 		return newDevNullRegularFile(path, l.MaxBytes, nil), nil
 	}
 
+	f, st, size, err := openWindowsRegularReadHandle(path, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if size < 0 || size > l.MaxBytes || st.Size() > l.MaxBytes {
+		_ = f.Close()
+		return nil, fmt.Errorf("%w: %q (%d > %d bytes)", ErrTooLarge, path, st.Size(), l.MaxBytes)
+	}
+
+	return &RegularFile{
+		file:     f,
+		info:     st,
+		path:     path,
+		maxBytes: l.MaxBytes,
+	}, nil
+}
+
+func openRegularUnboundedOS(path string, cfg openConfig) (*os.File, os.FileInfo, error) {
+	f, st, _, err := openWindowsRegularReadHandle(path, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return f, st, nil
+}
+
+func openWindowsRegularReadHandle(path string, cfg openConfig) (*os.File, os.FileInfo, int64, error) {
 	safePath := fixLongPathWindows(path)
 	pathPtr, err := windows.UTF16PtrFromString(safePath)
 	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+		return nil, nil, 0, &os.PathError{Op: "open", Path: path, Err: err}
 	}
 
 	flags := uint32(
@@ -50,47 +76,32 @@ func openRegularOS(path string, l Limits, cfg openConfig) (*RegularFile, error) 
 
 	handle, err := windows.CreateFile(pathPtr, windows.GENERIC_READ, share, nil, windows.OPEN_EXISTING, flags, 0)
 	if err != nil {
-		return nil, classifyWindowsOpenError(path, err)
+		return nil, nil, 0, classifyWindowsOpenError(path, err)
 	}
 
 	info, err := validateWindowsRegularHandle(handle, path)
 	if err != nil {
 		_ = windows.CloseHandle(handle)
-		return nil, err
+		return nil, nil, 0, err
 	}
-
 	size := (int64(info.FileSizeHigh) << 32) | int64(info.FileSizeLow)
-	if size < 0 || size > l.MaxBytes {
-		_ = windows.CloseHandle(handle)
-		return nil, fmt.Errorf("%w: %q (%d > %d bytes)", ErrTooLarge, path, size, l.MaxBytes)
-	}
 
 	f := os.NewFile(uintptr(handle), path)
 	if f == nil {
 		_ = windows.CloseHandle(handle)
-		return nil, fmt.Errorf("fsx: os.NewFile returned nil for %q", path)
+		return nil, nil, 0, fmt.Errorf("fsx: os.NewFile returned nil for %q", path)
 	}
 
 	st, statErr := f.Stat()
 	if statErr != nil {
 		_ = f.Close()
-		return nil, statErr
+		return nil, nil, 0, statErr
 	}
 	if !st.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, fmt.Errorf("%w: %q", ErrNonRegular, path)
+		return nil, nil, 0, fmt.Errorf("%w: %q", ErrNonRegular, path)
 	}
-	if st.Size() > l.MaxBytes {
-		_ = f.Close()
-		return nil, fmt.Errorf("%w: %q (%d > %d bytes)", ErrTooLarge, path, st.Size(), l.MaxBytes)
-	}
-
-	return &RegularFile{
-		file:     f,
-		info:     st,
-		path:     path,
-		maxBytes: l.MaxBytes,
-	}, nil
+	return f, st, size, nil
 }
 
 func createExclusiveOS(path string, _ os.FileMode) (*os.File, error) {
@@ -188,6 +199,10 @@ func wrapValidatedWindowsHandle(handle windows.Handle, path string) (*os.File, e
 	return f, nil
 }
 
+func openExistingRegularOS(path string, writable bool) (*os.File, error) {
+	return openExistingRegularForLockOS(path, writable)
+}
+
 func openExistingRegularForLockOS(path string, exclusive bool) (*os.File, error) {
 	safePath := fixLongPathWindows(path)
 	pathPtr, err := windows.UTF16PtrFromString(safePath)
@@ -223,6 +238,86 @@ func openExistingRegularForLockOS(path string, exclusive bool) (*os.File, error)
 		return nil, fmt.Errorf("fsx: os.NewFile returned nil for %q", path)
 	}
 	return f, nil
+}
+
+func openAppendRegularOS(path string, perm os.FileMode) (*os.File, error) {
+	safePath := fixLongPathWindows(path)
+	pathPtr, err := windows.UTF16PtrFromString(safePath)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+
+	const (
+		appendAccess = uint32(
+			windows.FILE_APPEND_DATA |
+				windows.FILE_READ_ATTRIBUTES |
+				windows.FILE_WRITE_ATTRIBUTES |
+				windows.FILE_WRITE_EA |
+				windows.STANDARD_RIGHTS_WRITE |
+				windows.SYNCHRONIZE,
+		)
+		share         = uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
+		existingFlags = uint32(
+			windows.FILE_FLAG_BACKUP_SEMANTICS |
+				windows.FILE_FLAG_OPEN_REPARSE_POINT |
+				windows.SECURITY_SQOS_PRESENT |
+				windows.SECURITY_ANONYMOUS,
+		)
+		createFlags = uint32(
+			windows.FILE_ATTRIBUTE_NORMAL |
+				windows.FILE_FLAG_OPEN_REPARSE_POINT |
+				windows.SECURITY_SQOS_PRESENT |
+				windows.SECURITY_ANONYMOUS,
+		)
+	)
+
+	for attempt := 0; attempt < DefaultLockRetries; attempt++ {
+		handle, openErr := windows.CreateFile(pathPtr, appendAccess, share, nil, windows.OPEN_EXISTING, existingFlags, 0)
+		if openErr == nil {
+			return wrapValidatedWindowsHandle(handle, path)
+		}
+		if !errors.Is(openErr, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(openErr, os.ErrNotExist) {
+			return nil, classifyWindowsOpenError(path, openErr)
+		}
+
+		f, createErr := createWindowsExclusiveWithAccess(path, pathPtr, appendAccess, createFlags, perm.Perm()&0o077 == 0)
+		if createErr == nil {
+			return f, nil
+		}
+		if !errors.Is(createErr, os.ErrExist) {
+			return nil, createErr
+		}
+	}
+	return nil, fmt.Errorf("%w: open append file %q", ErrRetryExhausted, path)
+}
+
+func createWindowsExclusiveWithAccess(path string, pathPtr *uint16, access, flags uint32, ownerOnly bool) (*os.File, error) {
+	var (
+		sd *windows.SECURITY_DESCRIPTOR
+		sa *windows.SecurityAttributes
+	)
+	if ownerOnly {
+		currSID, err := winsec.CurrentProcessUserSID()
+		if err != nil {
+			return nil, fmt.Errorf("fsx: query current Windows user SID: %w", err)
+		}
+		sd, err = winsec.NewOwnerOnlySecurityDescriptor(currSID, windows.NO_INHERITANCE)
+		if err != nil {
+			return nil, fmt.Errorf("fsx: build owner-only security descriptor: %w", err)
+		}
+		sa = &windows.SecurityAttributes{
+			Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+			SecurityDescriptor: sd,
+		}
+	}
+	const share = uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
+	handle, createErr := windows.CreateFile(pathPtr, access, share, sa, windows.CREATE_NEW, flags, 0)
+	runtime.KeepAlive(sd)
+	runtime.KeepAlive(sa)
+	if createErr != nil {
+		return nil, classifyWindowsOpenError(path, createErr)
+	}
+	return wrapValidatedWindowsHandle(handle, path)
 }
 
 func validateWindowsRegularHandle(handle windows.Handle, path string) (windows.ByHandleFileInformation, error) {
@@ -338,9 +433,15 @@ func unlockFileOS(f *os.File) error {
 	return err
 }
 
+// windowsDirLockPostAcquireHook is a package-private test hook invoked
+// immediately after acquiring the Windows directory lock file and before
+// verifyLockedFileIdentity. Nil in production.
+var windowsDirLockPostAcquireHook func(lockPath string, attempt int)
+
 // withDirLockOS implements a real cross-goroutine and cross-process directory
 // lock on Windows by locking a fixed regular file inside the verified
-// owner-only directory using LockFileEx(LOCKFILE_EXCLUSIVE_LOCK).
+// owner-only directory using LockFileEx(LOCKFILE_EXCLUSIVE_LOCK), verifying
+// post-lock file identity via verifyLockedFileIdentity with bounded retry.
 func withDirLockOS(dir string, fn func() error) error {
 	currSID, err := winsec.CurrentProcessUserSID()
 	if err != nil {
@@ -351,18 +452,46 @@ func withDirLockOS(dir string, fn func() error) error {
 	}
 
 	lockPath := filepath.Join(dir, windowsDirLockFileName)
-	f, err := openOrCreateWindowsDirLockFile(lockPath)
+	f, err := acquireWindowsDirLockFile(lockPath)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }()
-
-	if lockErr := lockFileOS(f, true); lockErr != nil {
-		return fmt.Errorf("fsx: lock socket directory %q: %w", dir, lockErr)
-	}
-	defer func() { _ = unlockFileOS(f) }()
+	defer func() {
+		_ = unlockFileOS(f)
+		_ = f.Close()
+	}()
 
 	return fn()
+}
+
+func acquireWindowsDirLockFile(lockPath string) (*os.File, error) {
+	for attempt := 0; attempt < DefaultLockRetries; attempt++ {
+		f, err := openOrCreateWindowsDirLockFile(lockPath)
+		if err != nil {
+			return nil, err
+		}
+		if lockErr := lockFileOS(f, true); lockErr != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("fsx: lock socket directory lock %q: %w", lockPath, lockErr)
+		}
+		if hook := windowsDirLockPostAcquireHook; hook != nil {
+			hook(lockPath, attempt)
+		}
+		matched, verifyErr := verifyLockedFileIdentity(f, lockPath)
+		if verifyErr != nil {
+			_ = unlockFileOS(f)
+			_ = f.Close()
+			return nil, verifyErr
+		}
+		if matched {
+			return f, nil
+		}
+		// Lock file was unlinked or replaced with a different file while
+		// waiting on LockFileEx: unlock, close stale handle, and retry.
+		_ = unlockFileOS(f)
+		_ = f.Close()
+	}
+	return nil, fmt.Errorf("%w: socket directory lock %q replaced across %d attempts", ErrRetryExhausted, lockPath, DefaultLockRetries)
 }
 
 func openOrCreateWindowsDirLockFile(lockPath string) (*os.File, error) {
@@ -429,7 +558,11 @@ func bindSocketSlotOS(targetPath string, listenFn ListenFunc, allowReplace bool,
 		var listenErr error
 		ln, listenErr = listenFn(targetPath)
 		if listenErr != nil {
-			if isWindowsAddrInUse(listenErr, targetPath) {
+			occupied, checkErr := isWindowsAddrInUse(listenErr, targetPath)
+			if checkErr != nil {
+				return errors.Join(fmt.Errorf("fsx: listen on socket %q: %w", targetPath, listenErr), checkErr)
+			}
+			if occupied {
 				return fmt.Errorf("%w: %s", ErrSlotOccupied, targetPath)
 			}
 			return fmt.Errorf("fsx: listen on socket %q: %w", targetPath, listenErr)
@@ -558,25 +691,28 @@ func isWindowsSharingViolation(err error) bool {
 	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }
 
-func isWindowsAddrInUse(err error, targetPath string) bool {
+func isWindowsAddrInUse(err error, targetPath string) (bool, error) {
 	if err == nil {
-		return false
+		return false, nil
 	}
 	var sysErr syscall.Errno
 	if errors.As(err, &sysErr) && (sysErr == syscall.EADDRINUSE || sysErr == syscall.EEXIST || sysErr == windows.WSAEADDRINUSE) {
-		return true
+		return true, nil
 	}
 	lower := strings.ToLower(err.Error())
 	if strings.Contains(lower, "address already in use") ||
 		strings.Contains(lower, "only one usage of each socket address") ||
 		strings.Contains(lower, "file exists") {
-		return true
+		return true, nil
 	}
 	if strings.Contains(lower, "access is denied") {
-		_, statErr := os.Lstat(targetPath)
-		return statErr == nil
+		if _, statErr := os.Lstat(targetPath); statErr == nil {
+			return true, nil
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			return false, fmt.Errorf("fsx: lstat socket %q after access-denied bind: %w", targetPath, statErr)
+		}
 	}
-	return false
+	return false, nil
 }
 
 func isConnRefusedOS(err error) bool {

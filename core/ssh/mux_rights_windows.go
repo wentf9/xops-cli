@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"syscall"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/winsec"
@@ -22,7 +23,9 @@ func bindAndLinkSocket(targetPath string) (*fsx.SocketSlot, error) {
 	if len(targetPath) > maxPathLen {
 		return nil, fmt.Errorf("control path %q exceeds maximum Unix socket path length (%d bytes)", targetPath, maxPathLen)
 	}
-	slot, err := fsx.BindSocketSlot(targetPath, nil)
+	slot, err := fsx.ReplaceStaleSocketSlot(targetPath, nil, func() bool {
+		return fsx.ProbeStaleUnixSocket(targetPath, 500*time.Millisecond)
+	})
 	if err != nil {
 		if errors.Is(err, fsx.ErrSlotOccupied) {
 			return nil, fmt.Errorf("%w: %s", ErrMasterAlreadyExists, targetPath)

@@ -126,3 +126,82 @@ func TestSocketSlot_WindowsRealDirLockAndHandleACL(t *testing.T) {
 		t.Fatalf("socket still exists after Release: %v", err)
 	}
 }
+
+func TestWindowsOpenAppendRegular_OwnerOnlySDAndDevNullSentinel(t *testing.T) {
+	dir := t.TempDir()
+	auditPath := filepath.Join(dir, "audit.jsonl")
+
+	f, err := OpenAppendRegular(auditPath, OwnerOnlyPerm)
+	if err != nil {
+		t.Fatalf("OpenAppendRegular failed: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	sd, err := winsec.GetSecurityInfoByHandle(windows.Handle(f.Fd()))
+	if err != nil {
+		t.Fatalf("GetSecurityInfoByHandle failed: %v", err)
+	}
+	ctrl, _, err := sd.Control()
+	if err != nil {
+		t.Fatalf("sd.Control failed: %v", err)
+	}
+	if ctrl&windows.SE_DACL_PROTECTED == 0 {
+		t.Fatalf("expected SE_DACL_PROTECTED on OpenAppendRegular(0600), got control=%#x", ctrl)
+	}
+
+	// OpenRegular with AllowDevNull recognizes "/dev/null", "NUL", and "\\\\.\\NUL" on Windows.
+	for _, p := range []string{"/dev/null", "NUL", "nul", `\\.\NUL`, `\\.\nul`} {
+		rf, openErr := OpenRegular(p, Limits{MaxBytes: 64}, AllowDevNull())
+		if openErr != nil {
+			t.Fatalf("OpenRegular(%q, AllowDevNull()) failed: %v", p, openErr)
+		}
+		if !rf.IsDevNull() {
+			_ = rf.Close()
+			t.Fatalf("OpenRegular(%q, AllowDevNull()).IsDevNull() = false, want true", p)
+		}
+		_ = rf.Close()
+	}
+}
+
+func TestWindowsDirLock_PostLockSameFileRetryAndExhaustion(t *testing.T) {
+	base := t.TempDir()
+	dir := filepath.Join(base, "mux-retry")
+	if err := winsec.EnsureOwnerOnlyDirectory(dir); err != nil {
+		t.Fatalf("EnsureOwnerOnlyDirectory failed: %v", err)
+	}
+
+	// 1. Single concurrent replacement triggers bounded retry and succeeds on attempt 2.
+	attempts := 0
+	prevHook := windowsDirLockPostAcquireHook
+	windowsDirLockPostAcquireHook = func(lockPath string, attempt int) {
+		attempts++
+		if attempt == 0 {
+			tmp := filepath.Join(dir, "lock-swap.tmp")
+			_ = os.WriteFile(tmp, []byte("new"), 0o600)
+			_ = replaceFileOS(tmp, lockPath)
+		}
+	}
+	t.Cleanup(func() { windowsDirLockPostAcquireHook = prevHook })
+
+	if err := withDirLockOS(dir, func() error { return nil }); err != nil {
+		t.Fatalf("withDirLockOS after single replacement failed: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("observed %d attempts, want 2", attempts)
+	}
+
+	// 2. Continuous replacement across all attempts returns ErrRetryExhausted.
+	attempts = 0
+	windowsDirLockPostAcquireHook = func(lockPath string, _ int) {
+		attempts++
+		tmp := filepath.Join(dir, "lock-churn.tmp")
+		_ = os.WriteFile(tmp, []byte("churn"), 0o600)
+		_ = replaceFileOS(tmp, lockPath)
+	}
+	if err := withDirLockOS(dir, func() error { return nil }); !errors.Is(err, ErrRetryExhausted) {
+		t.Fatalf("withDirLockOS under continuous replacement = %v, want ErrRetryExhausted", err)
+	}
+	if attempts != DefaultLockRetries {
+		t.Fatalf("observed %d attempts, want %d", attempts, DefaultLockRetries)
+	}
+}

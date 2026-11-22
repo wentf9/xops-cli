@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 
 	"github.com/pkg/sftp"
+	"github.com/wentf9/xops-cli/core/fsx"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -54,7 +55,7 @@ func (c *Client) upload(ctx context.Context, localPath, remotePath string, progr
 	}
 	remotePath = remoteTarget.String()
 
-	if err := c.uploadFile(ctx, localPath, remotePath, info.Size(), info.Mode(), progress); err != nil {
+	if err := c.uploadFile(ctx, localPath, remotePath, info.Size(), info.Mode(), progress, fsx.FollowSymlinks()); err != nil {
 		return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, err)
 	}
 	return nil
@@ -72,13 +73,13 @@ func (c *Client) UploadFile(ctx context.Context, localPath, remotePath string, s
 }
 
 //nolint:gocyclo
-func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, size int64, mode os.FileMode, progress ProgressCallback) (retErr error) {
+func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, size int64, mode os.FileMode, progress ProgressCallback, openOpts ...fsx.OpenOption) (retErr error) {
 	finishDiagnostic := c.observeFileTransfer("upload", localPath, remotePath, size)
 	defer func() { finishDiagnostic(retErr) }()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	srcFile, err := os.Open(localPath) //nolint:forbidigo // SFTP upload streams arbitrarily large local file with handle stat verification
+	srcFile, srcStat, err := fsx.OpenRegularUnbounded(localPath, openOpts...)
 	if err != nil {
 		return fmt.Errorf("open local source file failed: %w", err)
 	}
@@ -86,10 +87,6 @@ func (c *Client) uploadFile(ctx context.Context, localPath, remotePath string, s
 		retErr = errors.Join(retErr, closeTransferResource(srcFile, "local source file"))
 	}()
 
-	srcStat, err := srcFile.Stat()
-	if err != nil {
-		return fmt.Errorf("stat local source file failed: %w", err)
-	}
 	if srcStat.Size() != size {
 		return fmt.Errorf("local source size changed: expected %d bytes, got %d", size, srcStat.Size())
 	}
@@ -623,8 +620,8 @@ func (c *Client) downloadFile(ctx context.Context, remotePath, localPath string,
 	}()
 
 	if dstStat != nil {
-		stat, err := os.Stat(finalTempPath)
-		if err != nil || !os.SameFile(dstStat, stat) {
+		stat, err := os.Lstat(finalTempPath)
+		if err != nil || !stat.Mode().IsRegular() || !os.SameFile(dstStat, stat) {
 			return fmt.Errorf("local temporary file was replaced during finalization")
 		}
 	} else if err := verifyLocalTemporaryFile(finalTempPath); err != nil {
@@ -683,54 +680,30 @@ func (c *Client) shouldSkipDownload(localPath string, srcStat os.FileInfo) (bool
 	return false, nil
 }
 
-func (c *Client) prepareDownloadFile(tempPath string, size int64, mode os.FileMode, srcFile *sftp.File) (int64, *os.File, error) {
-	tempInfo, exists, err := inspectLocalTemporaryFile(tempPath)
+func (c *Client) prepareDownloadFile(tempPath string, size int64, _ os.FileMode, srcFile *sftp.File) (int64, *os.File, error) {
+	dstFile, openedInfo, created, err := fsx.OpenStagingFile(tempPath, fsx.OwnerOnlyPerm)
 	if err != nil {
 		return 0, nil, err
 	}
 
 	startOffset := int64(0)
-	flags := os.O_RDWR | os.O_TRUNC
-	perm := os.FileMode(0o600)
-	if !exists {
-		flags = os.O_RDWR | os.O_CREATE | os.O_EXCL
-	} else {
-		perm = mode.Perm()
-		if c.config.EnableResume && tempInfo.Size() <= size && tempInfo.Size() >= c.config.ResumeMinSize {
-			startOffset = tempInfo.Size()
-			flags = os.O_RDWR
-		}
-	}
-
-	dstFile, err := os.OpenFile(tempPath, flags, perm) //nolint:forbidigo // download staging temp file with resume support and SameFile handle verification
-	if err != nil {
-		return 0, nil, err
-	}
-	openedInfo, statErr := dstFile.Stat()
-	if statErr != nil {
-		return 0, nil, errors.Join(
-			fmt.Errorf("stat opened local temporary file failed: %w", statErr),
-			closeTransferResource(dstFile, "local temporary file after stat failure"),
-		)
-	}
-	if !openedInfo.Mode().IsRegular() || (exists && !os.SameFile(tempInfo, openedInfo)) {
-		return 0, nil, errors.Join(
-			fmt.Errorf("local temporary path %q changed during open", tempPath),
-			closeTransferResource(dstFile, "unsafe local temporary file"),
-		)
-	}
-	if exists && startOffset > 0 {
+	resuming := !created && c.config.EnableResume && openedInfo.Size() <= size && openedInfo.Size() >= c.config.ResumeMinSize
+	if resuming {
+		startOffset = openedInfo.Size()
 		if err := c.validateResumePrefixDownload(dstFile, srcFile, startOffset); err != nil {
 			if !errors.Is(err, errPrefixMismatch) {
 				return 0, nil, errors.Join(fmt.Errorf("validate prefix failed: %w", err), closeTransferResource(dstFile, "local temporary file"))
 			}
 			startOffset = 0
-			if _, err := dstFile.Seek(0, 0); err != nil {
-				return 0, nil, errors.Join(fmt.Errorf("seek failed: %w", err), closeTransferResource(dstFile, "local temporary file"))
-			}
-			if err := dstFile.Truncate(0); err != nil {
-				return 0, nil, errors.Join(fmt.Errorf("truncate failed: %w", err), closeTransferResource(dstFile, "local temporary file"))
-			}
+			resuming = false
+		}
+	}
+	if !created && !resuming {
+		if _, err := dstFile.Seek(0, io.SeekStart); err != nil {
+			return 0, nil, errors.Join(fmt.Errorf("seek failed: %w", err), closeTransferResource(dstFile, "local temporary file"))
+		}
+		if err := dstFile.Truncate(0); err != nil {
+			return 0, nil, errors.Join(fmt.Errorf("truncate failed: %w", err), closeTransferResource(dstFile, "local temporary file"))
 		}
 	}
 	return startOffset, dstFile, nil
@@ -1629,6 +1602,13 @@ func (c *Client) uploadLink(ctx context.Context, localPath, remotePath string, p
 	return nil
 }
 
+type stagedDownloadSymlink struct {
+	remotePath string
+	localPath  string
+	relPath    string
+	target     string
+}
+
 type downloadDirWalkState struct {
 	client     *Client
 	remoteRoot RemotePath
@@ -1636,6 +1616,9 @@ type downloadDirWalkState struct {
 	group      *errgroup.Group
 	sem        chan struct{}
 	progress   ProgressCallback
+
+	symlinks   []stagedDownloadSymlink
+	symlinkMap map[string]string
 }
 
 func (c *Client) downloadDirectory(ctx context.Context, remoteRoot RemotePath, localRoot LocalTarget, progress ProgressCallback) error {
@@ -1669,13 +1652,23 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteRoot RemotePath, l
 		group:      g,
 		sem:        make(chan struct{}, c.config.ConcurrentFiles),
 		progress:   progress,
+		symlinkMap: make(map[string]string),
 	}
 
-	traversalErr := walker.walkDir(remoteRoot, localRoot, 0)
-	return finishTransferGroup(ctx, cancel, g, traversalErr)
+	// Phase 1: walk directories, create local directories, download regular
+	// files, and stage all symlinks with their ReadLink targets without
+	// creating any local symlinks yet.
+	traversalErr := walker.walkDir(remoteRoot, localRoot)
+	if err := finishTransferGroup(ctx, cancel, g, traversalErr); err != nil {
+		return err
+	}
+
+	// Phase 2: validate EVERY staged symlink against the complete in-tree
+	// symlink map and local disk state before creating any symlink on disk.
+	return c.applyStagedDownloadSymlinks(ctx, localRoot.Path(), walker.symlinks, walker.symlinkMap, progress)
 }
 
-func (w *downloadDirWalkState) walkDir(curRemote RemotePath, curLocal LocalTarget, depth int) error {
+func (w *downloadDirWalkState) walkDir(curRemote RemotePath, curLocal LocalTarget) error {
 	if err := w.groupCtx.Err(); err != nil {
 		return err
 	}
@@ -1683,15 +1676,16 @@ func (w *downloadDirWalkState) walkDir(curRemote RemotePath, curLocal LocalTarge
 	if readErr != nil {
 		return readErr
 	}
+	seen := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
-		if err := w.handleEntry(curRemote, curLocal, depth, entry); err != nil {
+		if err := w.handleEntry(curRemote, curLocal, seen, entry); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (w *downloadDirWalkState) handleEntry(curRemote RemotePath, curLocal LocalTarget, depth int, entry os.FileInfo) error {
+func (w *downloadDirWalkState) handleEntry(curRemote RemotePath, curLocal LocalTarget, seen map[string]struct{}, entry os.FileInfo) error {
 	if err := w.groupCtx.Err(); err != nil {
 		return err
 	}
@@ -1702,6 +1696,11 @@ func (w *downloadDirWalkState) handleEntry(curRemote RemotePath, curLocal LocalT
 	if nameErr != nil {
 		return fmt.Errorf("download %q: unsafe remote filename %q: %w", curRemote.String(), entry.Name(), nameErr)
 	}
+	if _, dup := seen[entryName.String()]; dup {
+		return fmt.Errorf("download %q: duplicate remote directory entry %q", curRemote.String(), entryName.String())
+	}
+	seen[entryName.String()] = struct{}{}
+
 	childRemote := curRemote.Join(entryName)
 	if _, relErr := childRemote.RelativeTo(w.remoteRoot); relErr != nil {
 		return fmt.Errorf("download %q: %w", childRemote.String(), relErr)
@@ -1712,18 +1711,28 @@ func (w *downloadDirWalkState) handleEntry(curRemote RemotePath, curLocal LocalT
 	}
 
 	if entry.Mode()&os.ModeSymlink != 0 {
-		return w.enqueueTask(func() error {
-			if err := w.client.downloadLink(w.groupCtx, childRemote.String(), childLocal.Path(), depth, w.progress); err != nil {
-				return fmt.Errorf("download %q to %q: %w", childRemote.String(), childLocal.Path(), err)
-			}
-			return nil
+		target, readErr := w.client.SFTPClient().ReadLink(childRemote.String())
+		if readErr != nil {
+			return fmt.Errorf("download %q to %q: read remote symbolic link %q failed: %w", childRemote.String(), childLocal.Path(), childRemote.String(), readErr)
+		}
+		relPath := childLocal.RelSlash()
+		if _, dup := w.symlinkMap[relPath]; dup {
+			return fmt.Errorf("download %q: duplicate remote symbolic link %q", curRemote.String(), relPath)
+		}
+		w.symlinkMap[relPath] = target
+		w.symlinks = append(w.symlinks, stagedDownloadSymlink{
+			remotePath: childRemote.String(),
+			localPath:  childLocal.Path(),
+			relPath:    relPath,
+			target:     target,
 		})
+		return nil
 	}
 	if entry.IsDir() {
 		if err := ensureLocalDownloadDirectory(childRemote.String(), childLocal.Path(), entry.Mode()|0700); err != nil {
 			return fmt.Errorf("create local directory %q failed: %w", childLocal.Path(), err)
 		}
-		return w.walkDir(childRemote, childLocal, depth+1)
+		return w.walkDir(childRemote, childLocal)
 	}
 	return w.enqueueTask(func() error {
 		if err := w.client.downloadFile(w.groupCtx, childRemote.String(), childLocal.Path(), entry.Size(), entry.Mode(), w.progress); err != nil {
@@ -1731,6 +1740,32 @@ func (w *downloadDirWalkState) handleEntry(curRemote RemotePath, curLocal LocalT
 		}
 		return nil
 	})
+}
+
+func (c *Client) applyStagedDownloadSymlinks(
+	ctx context.Context,
+	localRoot string,
+	symlinks []stagedDownloadSymlink,
+	symlinkMap map[string]string,
+	progress ProgressCallback,
+) error {
+	for _, sym := range symlinks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := validateDownloadSymlinkInTree(localRoot, sym.relPath, sym.target, symlinkMap); err != nil {
+			return fmt.Errorf("download %q to %q: reject remote symbolic link %q -> %q: %w", sym.remotePath, sym.localPath, sym.remotePath, sym.target, err)
+		}
+	}
+	for _, sym := range symlinks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := c.createDownloadLink(ctx, sym.remotePath, sym.localPath, sym.target, progress); err != nil {
+			return fmt.Errorf("download %q to %q: %w", sym.remotePath, sym.localPath, err)
+		}
+	}
+	return nil
 }
 
 func (w *downloadDirWalkState) enqueueTask(fn func() error) error {
@@ -1765,18 +1800,11 @@ func (c *Client) shouldSkipDownloadLink(localPath, target string) (bool, error) 
 	return false, nil
 }
 
-func (c *Client) downloadLink(ctx context.Context, remotePath, localPath string, linkDirDepth int, progress ProgressCallback) (retErr error) {
+func (c *Client) createDownloadLink(ctx context.Context, remotePath, localPath, target string, progress ProgressCallback) (retErr error) {
 	finishDiagnostic := c.observeFileTransfer("download", remotePath, localPath, 0)
 	defer func() { finishDiagnostic(retErr) }()
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	target, err := c.SFTPClient().ReadLink(remotePath)
-	if err != nil {
-		return fmt.Errorf("read remote symbolic link %q failed: %w", remotePath, err)
-	}
-	if err := validateDownloadSymlinkTarget(target, linkDirDepth); err != nil {
-		return fmt.Errorf("reject remote symbolic link %q -> %q: %w", remotePath, target, err)
 	}
 	linkSize := int64(len(target))
 

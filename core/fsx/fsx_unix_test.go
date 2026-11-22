@@ -71,6 +71,46 @@ func TestOpenRegularAndOpenLocked_FIFODoesNotBlock(t *testing.T) {
 				return err
 			},
 		},
+		{
+			name: "OpenRegularUnbounded",
+			fn: func() error {
+				f, _, err := OpenRegularUnbounded(fifoPath)
+				if f != nil {
+					_ = f.Close()
+				}
+				return err
+			},
+		},
+		{
+			name: "OpenRegularUnbounded_FollowSymlinks",
+			fn: func() error {
+				f, _, err := OpenRegularUnbounded(fifoPath, FollowSymlinks())
+				if f != nil {
+					_ = f.Close()
+				}
+				return err
+			},
+		},
+		{
+			name: "OpenStagingFile",
+			fn: func() error {
+				f, _, _, err := OpenStagingFile(fifoPath, OwnerOnlyPerm)
+				if f != nil {
+					_ = f.Close()
+				}
+				return err
+			},
+		},
+		{
+			name: "OpenAppendRegular",
+			fn: func() error {
+				f, err := OpenAppendRegular(fifoPath, OwnerOnlyPerm)
+				if f != nil {
+					_ = f.Close()
+				}
+				return err
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -185,6 +225,29 @@ func TestOpenRegularAndCreateExclusive_UnixDescriptorFlags(t *testing.T) {
 	}
 	if rfdFlags&unix.FD_CLOEXEC == 0 {
 		t.Fatalf("OpenRegular fd missing FD_CLOEXEC (flags=%#x)", rfdFlags)
+	}
+
+	af, err := OpenAppendRegular(p, OwnerOnlyPerm)
+	if err != nil {
+		t.Fatalf("OpenAppendRegular failed: %v", err)
+	}
+	defer func() { _ = af.Close() }()
+	aflFlags, err := unix.FcntlInt(af.Fd(), unix.F_GETFL, 0)
+	if err != nil {
+		t.Fatalf("OpenAppendRegular F_GETFL failed: %v", err)
+	}
+	if aflFlags&unix.O_NONBLOCK != 0 {
+		t.Fatalf("OpenAppendRegular failed to clear O_NONBLOCK (flags=%#x)", aflFlags)
+	}
+	if aflFlags&unix.O_APPEND == 0 {
+		t.Fatalf("OpenAppendRegular missing O_APPEND (flags=%#x)", aflFlags)
+	}
+	afdFlags, err := unix.FcntlInt(af.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatalf("OpenAppendRegular F_GETFD failed: %v", err)
+	}
+	if afdFlags&unix.FD_CLOEXEC == 0 {
+		t.Fatalf("OpenAppendRegular missing FD_CLOEXEC (flags=%#x)", afdFlags)
 	}
 }
 

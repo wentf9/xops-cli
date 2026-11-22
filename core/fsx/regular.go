@@ -6,7 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
+	pathpkg "path"
 	"runtime"
 	"strings"
 	"sync"
@@ -94,6 +94,106 @@ func OpenRegular(path string, l Limits, opts ...OpenOption) (*RegularFile, error
 		}
 	}
 	return openRegularOS(path, l, cfg)
+}
+
+// OpenRegularUnbounded opens path handle-first (never Stat-then-Open), verifies
+// on the open handle that it is a regular disk file, and returns the owned raw
+// *os.File together with its handle-verified os.FileInfo.
+//
+// Unlike OpenRegular, OpenRegularUnbounded does not enforce a byte limit and
+// returns the raw *os.File so streaming callers can use ReadAt and Seek
+// directly on arbitrarily large files without blocking on FIFOs or following
+// symlinks/reparse points (unless FollowSymlinks() is explicitly passed).
+//
+// Ownership: the caller owns the returned *os.File and must call Close.
+func OpenRegularUnbounded(path string, opts ...OpenOption) (*os.File, os.FileInfo, error) {
+	if path == "" {
+		return nil, nil, ErrEmptyPath
+	}
+	var cfg openConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	return openRegularUnboundedOS(path, cfg)
+}
+
+// OpenStagingFile opens or creates a local regular staging file strictly
+// without O_TRUNC and without following symlinks or Windows reparse points.
+//
+// It attempts CreateExclusive(path, perm) first; if the entry already exists,
+// it opens the existing entry handle-first (O_RDWR|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC|O_NOCTTY
+// on Unix, CreateFile(OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT|SECURITY_SQOS_PRESENT|SECURITY_ANONYMOUS)
+// on Windows), verifies on the open handle that it is a regular disk file, and
+// clears O_NONBLOCK on Unix. Callers that are not resuming must truncate via
+// f.Truncate(0) only after receiving the verified handle.
+//
+// Ownership: the caller owns the returned *os.File and must call Close.
+func OpenStagingFile(path string, perm os.FileMode) (*os.File, os.FileInfo, bool, error) {
+	if path == "" {
+		return nil, nil, false, ErrEmptyPath
+	}
+	for attempt := 0; attempt < DefaultLockRetries; attempt++ {
+		f, err := createExclusiveOS(path, perm)
+		if err == nil {
+			info, statErr := verifyRegularHandleInfo(f, path)
+			if statErr != nil {
+				_ = f.Close()
+				return nil, nil, false, statErr
+			}
+			return f, info, true, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, nil, false, err
+		}
+
+		existing, openErr := openExistingRegularOS(path, true)
+		if openErr == nil {
+			info, statErr := verifyRegularHandleInfo(existing, path)
+			if statErr != nil {
+				_ = existing.Close()
+				return nil, nil, false, statErr
+			}
+			return existing, info, false, nil
+		}
+		if !errors.Is(openErr, os.ErrNotExist) {
+			return nil, nil, false, openErr
+		}
+	}
+	return nil, nil, false, fmt.Errorf("%w: open staging file %q", ErrRetryExhausted, path)
+}
+
+// OpenAppendRegular opens or creates an append-only regular file strictly
+// without following symlinks, FIFOs, devices, or Windows reparse points.
+//
+// On Unix, existing files are opened with O_WRONLY|O_APPEND|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC|O_NOCTTY,
+// verified as S_IFREG via fstat, and cleared of O_NONBLOCK; missing files are
+// created exclusively with O_CREAT|O_EXCL|O_NOFOLLOW|O_APPEND.
+//
+// On Windows, existing files are opened with FILE_APPEND_DATA (without
+// FILE_WRITE_DATA) and FILE_FLAG_OPEN_REPARSE_POINT|SECURITY_SQOS_PRESENT|SECURITY_ANONYMOUS
+// and verified as FILE_TYPE_DISK non-reparse regular files; missing files are
+// created with CREATE_NEW and a protected owner-only SECURITY_DESCRIPTOR when
+// perm.Perm()&0o077 == 0.
+//
+// Ownership: the caller owns the returned *os.File and must call Close.
+func OpenAppendRegular(path string, perm os.FileMode) (*os.File, error) {
+	if path == "" {
+		return nil, ErrEmptyPath
+	}
+	return openAppendRegularOS(path, perm)
+}
+
+func verifyRegularHandleInfo(f *os.File, path string) (os.FileInfo, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %q", ErrNonRegular, path)
+	}
+	return info, nil
 }
 
 // ReadAllBounded opens path via OpenRegular, reads all bytes bounded to
@@ -245,18 +345,41 @@ func newDevNullRegularFile(path string, maxBytes int64, info os.FileInfo) *Regul
 	}
 }
 
-// IsDevNullPath reports whether path canonically names os.DevNull on the
-// current operating system (matching NUL and \\.\NUL case-insensitively on
-// Windows, and /dev/null on Unix).
+// IsDevNullSentinel reports whether path is an explicit null-device sentinel
+// recognized when AllowDevNull() is enabled: "/dev/null" on all operating
+// systems, plus "NUL" and `\\.\NUL` (case-insensitive) on Windows.
+func IsDevNullSentinel(path string) bool {
+	return isDevNullSentinelForOS(runtime.GOOS, path)
+}
+
+// IsDevNullPath reports whether path canonically names the null-device
+// sentinel (matching "NUL" and `\\.\NUL` case-insensitively on Windows, and
+// "/dev/null" on all operating systems).
 func IsDevNullPath(path string) bool {
-	if path == "" {
+	return IsDevNullSentinel(path)
+}
+
+func isDevNullSentinelForOS(goos, raw string) bool {
+	if raw == "" {
 		return false
 	}
-	clean := filepath.Clean(path)
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(clean, os.DevNull) || strings.EqualFold(clean, `\\.\`+os.DevNull)
+	if goos == "windows" {
+		winNorm := strings.ReplaceAll(raw, "/", `\`)
+		if strings.EqualFold(winNorm, "NUL") || strings.EqualFold(winNorm, `\\.\NUL`) {
+			return true
+		}
+		if !strings.HasPrefix(winNorm, `\\`) {
+			slash := strings.ReplaceAll(raw, `\`, "/")
+			if strings.HasPrefix(slash, "/") && pathpkg.Clean(slash) == "/dev/null" {
+				return true
+			}
+		}
+		return false
 	}
-	return clean == os.DevNull
+	if strings.HasPrefix(raw, "/") && pathpkg.Clean(raw) == "/dev/null" {
+		return true
+	}
+	return raw == os.DevNull
 }
 
 type devNullFileInfo struct {

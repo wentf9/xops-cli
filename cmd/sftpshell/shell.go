@@ -17,6 +17,7 @@ import (
 
 	pkgsftp "github.com/pkg/sftp"
 	"github.com/schollz/progressbar/v3"
+	"github.com/wentf9/xops-cli/core/fsx"
 	corelog "github.com/wentf9/xops-cli/core/log"
 	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/core/ssh"
@@ -2167,7 +2168,7 @@ func copyLocalLink(src, dst string) error {
 }
 
 func copyLocalFile(src, dst string) (retErr error) {
-	srcFile, err := os.Open(src) //nolint:forbidigo // user-initiated lcp streams arbitrarily large local file
+	srcFile, srcInfo, err := fsx.OpenRegularUnbounded(src)
 	if err != nil {
 		return fmt.Errorf("open local source file %q failed: %w", src, err)
 	}
@@ -2177,12 +2178,7 @@ func copyLocalFile(src, dst string) (retErr error) {
 		}
 	}()
 
-	srcInfo, err := srcFile.Stat()
-	if err != nil {
-		return fmt.Errorf("stat local source file %q failed: %w", src, err)
-	}
-
-	dstFile, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, srcInfo.Mode()) //nolint:forbidigo // user-initiated lcp streams write to local destination file
+	dstFile, dstInfo, created, err := fsx.OpenStagingFile(dst, srcInfo.Mode().Perm())
 	if err != nil {
 		return fmt.Errorf("open local destination file %q failed: %w", dst, err)
 	}
@@ -2192,11 +2188,22 @@ func copyLocalFile(src, dst string) (retErr error) {
 		}
 	}()
 
-	_, err = io.Copy(dstFile, srcFile)
-	if err != nil {
+	if !created {
+		if os.SameFile(srcInfo, dstInfo) {
+			return fmt.Errorf("local source file %q and destination %q are the same file", src, dst)
+		}
+		if _, err := dstFile.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("seek local destination file %q failed: %w", dst, err)
+		}
+		if err := dstFile.Truncate(0); err != nil {
+			return fmt.Errorf("truncate local destination file %q failed: %w", dst, err)
+		}
+	}
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
 		return fmt.Errorf("copy local file %q to %q failed: %w", src, dst, err)
 	}
-	if err := os.Chmod(dst, srcInfo.Mode()); err != nil {
+	if err := dstFile.Chmod(srcInfo.Mode().Perm()); err != nil {
 		return fmt.Errorf("set local destination mode failed: %w", err)
 	}
 	return nil

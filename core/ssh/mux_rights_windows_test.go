@@ -121,3 +121,25 @@ func TestWindowsMuxSocket_BindHardensDACLAndRejectsInsecureDir(t *testing.T) {
 		t.Fatalf("bindAndLinkSocket(insecureDir) = %v, want winsec.ErrInsecureControlDir", err)
 	}
 }
+
+func TestWindowsMuxSocket_ReplaceStaleSocketAndRejectLive(t *testing.T) {
+	base := t.TempDir()
+	stalePath := filepath.Join(base, "stale-mux", "cm.sock")
+	firstSlot, err := bindAndLinkSocket(stalePath)
+	if err != nil {
+		t.Fatalf("initial bindAndLinkSocket(%q) failed: %v", stalePath, err)
+	}
+	if _, dupErr := bindAndLinkSocket(stalePath); !errors.Is(dupErr, ErrMasterAlreadyExists) {
+		_ = firstSlot.Release()
+		t.Fatalf("bindAndLinkSocket(live %q) = %v, want ErrMasterAlreadyExists", stalePath, dupErr)
+	}
+	// Close listener directly without unlinking to simulate a crashed master leaving a stale socket file.
+	if err := firstSlot.Listener().Close(); err != nil {
+		t.Fatalf("close listener to create stale socket: %v", err)
+	}
+	replacedSlot, err := bindAndLinkSocket(stalePath)
+	if err != nil {
+		t.Fatalf("bindAndLinkSocket(stale %q) failed: %v", stalePath, err)
+	}
+	defer func() { _ = replacedSlot.Release() }()
+}

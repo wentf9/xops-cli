@@ -20,8 +20,9 @@ import (
 //   - trailing dots '.' or trailing ASCII spaces ' '
 //   - volume names / drive prefixes
 //   - Windows reserved DOS device stems (case-insensitive, stem before the first
-//     '.', trailing ASCII spaces trimmed): CON, PRN, AUX, NUL, COM1-COM9,
-//     LPT1-LPT9, and Unicode superscript variants COM¹, COM², COM³, LPT¹, LPT², LPT³.
+//     '.', trailing ASCII spaces trimmed): CON, PRN, AUX, NUL, CONIN$, CONOUT$,
+//     COM1-COM9, LPT1-LPT9, and Unicode superscript variants COM¹, COM², COM³,
+//     LPT¹, LPT², LPT³.
 //
 // All rejections wrap ErrInvalidComponent.
 func ValidateLocalComponent(name string) error {
@@ -83,6 +84,9 @@ func hasReservedDeviceStem(name string) bool {
 			strings.EqualFold(stem, "PRN") ||
 			strings.EqualFold(stem, "AUX") ||
 			strings.EqualFold(stem, "NUL")
+	}
+	if strings.EqualFold(stem, "CONIN$") || strings.EqualFold(stem, "CONOUT$") {
+		return true
 	}
 	prefix := stem[:3]
 	if !strings.EqualFold(prefix, "COM") && !strings.EqualFold(prefix, "LPT") {

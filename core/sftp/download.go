@@ -7,7 +7,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/wentf9/xops-cli/core/fsx"
 )
@@ -406,6 +408,11 @@ func validatedDownloadBasename(remote RemotePath, info os.FileInfo) (RemoteName,
 	return pathBase, nil
 }
 
+const (
+	maxDownloadSymlinkHops  = 40
+	maxDownloadSymlinkSteps = 4096
+)
+
 // validateDownloadSymlinkTarget enforces download symlink policy (b):
 // only relative POSIX symlink targets whose step-by-step resolution stays
 // inside the download root (depth >= 0) and whose components satisfy
@@ -413,14 +420,8 @@ func validatedDownloadBasename(remote RemotePath, info os.FileInfo) (RemoteName,
 // prefixes, backslashes, control characters, and escaping targets return an
 // error wrapping ErrUnsafeDownloadSymlink.
 func validateDownloadSymlinkTarget(target string, linkDirDepth int) error {
-	if target == "" {
-		return fmt.Errorf("%w: empty target", ErrUnsafeDownloadSymlink)
-	}
-	if hasPathControlChar(target) {
-		return fmt.Errorf("%w: %q contains NUL or control character", ErrUnsafeDownloadSymlink, target)
-	}
-	if strings.HasPrefix(target, "/") || strings.ContainsRune(target, '\\') || (len(target) >= 2 && target[1] == ':') {
-		return fmt.Errorf("%w: %q must be a relative POSIX path inside download root", ErrUnsafeDownloadSymlink, target)
+	if err := validateDownloadSymlinkSyntax(target); err != nil {
+		return err
 	}
 	if linkDirDepth < 0 {
 		return fmt.Errorf("%w: invalid link directory depth %d", ErrUnsafeDownloadSymlink, linkDirDepth)
@@ -437,13 +438,190 @@ func validateDownloadSymlinkTarget(target string, linkDirDepth int) error {
 				return fmt.Errorf("%w: %q escapes download root", ErrUnsafeDownloadSymlink, target)
 			}
 		default:
-			if err := fsx.ValidateLocalComponent(seg); err != nil {
-				return fmt.Errorf("%w: %q has unsafe component %q: %w", ErrUnsafeDownloadSymlink, target, seg, err)
-			}
 			depth++
 		}
 	}
 	return nil
+}
+
+func validateDownloadSymlinkSyntax(target string) error {
+	if target == "" {
+		return fmt.Errorf("%w: empty target", ErrUnsafeDownloadSymlink)
+	}
+	if hasPathControlChar(target) {
+		return fmt.Errorf("%w: %q contains NUL or control character", ErrUnsafeDownloadSymlink, target)
+	}
+	if strings.HasPrefix(target, "/") || strings.ContainsRune(target, '\\') || (len(target) >= 2 && target[1] == ':') {
+		return fmt.Errorf("%w: %q must be a relative POSIX path inside download root", ErrUnsafeDownloadSymlink, target)
+	}
+	for _, seg := range strings.Split(target, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			continue
+		}
+		if err := fsx.ValidateLocalComponent(seg); err != nil {
+			return fmt.Errorf("%w: %q has unsafe component %q: %w", ErrUnsafeDownloadSymlink, target, seg, err)
+		}
+	}
+	return nil
+}
+
+// validateDownloadSymlinkInTree resolves a remote symlink target step-by-step
+// against both the complete staged in-tree symlink map and any pre-existing
+// symlinks on local disk beneath localRoot. It enforces:
+//   - lexical policy (b) on target itself,
+//   - no parent component of linkRelPath is a symlink,
+//   - step-by-step expansion of every in-tree or pre-existing local symlink
+//     encountered along the path (including chained symlinks and the final
+//     component), bounded by maxDownloadSymlinkHops and maxDownloadSymlinkSteps,
+//   - depth never dips below 0 (outside localRoot) at any point.
+func validateDownloadSymlinkInTree(localRoot, linkRelPath, target string, inTreeSymlinks map[string]string) error {
+	linkParts, err := parseDownloadLinkRelParts(linkRelPath)
+	if err != nil {
+		return err
+	}
+	parentParts := linkParts[:len(linkParts)-1]
+	if err := validateDownloadSymlinkTarget(target, len(parentParts)); err != nil {
+		return err
+	}
+	if err := validateDownloadSymlinkParents(localRoot, parentParts, inTreeSymlinks); err != nil {
+		return err
+	}
+
+	cur := append([]string(nil), parentParts...)
+	queue := splitPOSIXRelativeSegments(target)
+	hops := 0
+	steps := 0
+
+	for len(queue) > 0 {
+		steps++
+		if steps > maxDownloadSymlinkSteps {
+			return fmt.Errorf("%w: %q exceeds resolution step limit (%d)", ErrUnsafeDownloadSymlink, target, maxDownloadSymlinkSteps)
+		}
+		seg := queue[0]
+		queue = queue[1:]
+		if seg == ".." {
+			if len(cur) == 0 {
+				return fmt.Errorf("%w: %q escapes download root via chained symlink", ErrUnsafeDownloadSymlink, target)
+			}
+			cur = cur[:len(cur)-1]
+			continue
+		}
+
+		nextCur := append(cur, seg)
+		candRel := strings.Join(nextCur, "/")
+		symTarget, fromTree, isSym, lookupErr := lookupDownloadSymlink(localRoot, candRel, inTreeSymlinks)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if !isSym {
+			cur = nextCur
+			continue
+		}
+
+		hops++
+		if hops > maxDownloadSymlinkHops {
+			return fmt.Errorf("%w: %q exceeds maximum symlink hops (%d)", ErrUnsafeDownloadSymlink, target, maxDownloadSymlinkHops)
+		}
+		expandedTarget, expandErr := validateExpandedDownloadSymlinkTarget(symTarget, fromTree)
+		if expandErr != nil {
+			return fmt.Errorf("%w: symlink %q -> %q in resolution of %q: %w", ErrUnsafeDownloadSymlink, candRel, symTarget, target, expandErr)
+		}
+		expanded := splitPOSIXRelativeSegments(expandedTarget)
+		nextQueue := make([]string, 0, len(expanded)+len(queue))
+		nextQueue = append(nextQueue, expanded...)
+		nextQueue = append(nextQueue, queue...)
+		queue = nextQueue
+	}
+	return nil
+}
+
+func parseDownloadLinkRelParts(linkRelPath string) ([]string, error) {
+	if linkRelPath == "" || linkRelPath == "." || strings.HasPrefix(linkRelPath, "/") {
+		return nil, fmt.Errorf("%w: invalid link relative path %q", ErrUnsafeDownloadSymlink, linkRelPath)
+	}
+	parts := strings.Split(linkRelPath, "/")
+	for _, p := range parts {
+		if p == "" || p == "." || p == ".." {
+			return nil, fmt.Errorf("%w: invalid link relative path %q", ErrUnsafeDownloadSymlink, linkRelPath)
+		}
+	}
+	return parts, nil
+}
+
+func validateDownloadSymlinkParents(localRoot string, parentParts []string, inTreeSymlinks map[string]string) error {
+	for i := range parentParts {
+		prefix := strings.Join(parentParts[:i+1], "/")
+		_, _, isSym, err := lookupDownloadSymlink(localRoot, prefix, inTreeSymlinks)
+		if err != nil {
+			return err
+		}
+		if isSym {
+			return fmt.Errorf("%w: parent component %q is a symbolic link", ErrUnsafeDownloadSymlink, prefix)
+		}
+	}
+	return nil
+}
+
+func lookupDownloadSymlink(localRoot, candRel string, inTreeSymlinks map[string]string) (target string, fromTree bool, isSym bool, err error) {
+	if t, ok := inTreeSymlinks[candRel]; ok {
+		return t, true, true, nil
+	}
+	if localRoot == "" {
+		return "", false, false, nil
+	}
+	diskPath := filepath.Join(localRoot, filepath.FromSlash(candRel))
+	fi, lstatErr := os.Lstat(diskPath)
+	if lstatErr != nil {
+		if errors.Is(lstatErr, os.ErrNotExist) || errors.Is(lstatErr, syscall.ENOTDIR) {
+			return "", false, false, nil
+		}
+		return "", false, false, fmt.Errorf("%w: lstat %q failed: %w", ErrUnsafeDownloadSymlink, candRel, lstatErr)
+	}
+	if fi.Mode()&os.ModeSymlink == 0 {
+		return "", false, false, nil
+	}
+	diskTarget, readErr := os.Readlink(diskPath)
+	if readErr != nil {
+		return "", false, false, fmt.Errorf("%w: read local symlink %q failed: %w", ErrUnsafeDownloadSymlink, candRel, readErr)
+	}
+	return diskTarget, false, true, nil
+}
+
+func validateExpandedDownloadSymlinkTarget(symTarget string, fromTree bool) (string, error) {
+	if fromTree {
+		if err := validateDownloadSymlinkSyntax(symTarget); err != nil {
+			return "", err
+		}
+		return symTarget, nil
+	}
+	if symTarget == "" {
+		return "", errors.New("empty local symlink target")
+	}
+	if hasPathControlChar(symTarget) {
+		return "", errors.New("local symlink target contains control character")
+	}
+	if filepath.IsAbs(symTarget) || strings.HasPrefix(symTarget, "/") || strings.HasPrefix(symTarget, `\`) || (len(symTarget) >= 2 && symTarget[1] == ':') {
+		return "", errors.New("local symlink target must be relative inside download root")
+	}
+	if runtime.GOOS == "windows" {
+		symTarget = filepath.ToSlash(symTarget)
+		if strings.HasPrefix(symTarget, "/") {
+			return "", errors.New("local symlink target must be relative inside download root")
+		}
+	}
+	return symTarget, nil
+}
+
+func splitPOSIXRelativeSegments(target string) []string {
+	raw := strings.Split(target, "/")
+	out := make([]string, 0, len(raw))
+	for _, seg := range raw {
+		if seg == "" || seg == "." {
+			continue
+		}
+		out = append(out, seg)
+	}
+	return out
 }
 
 // DisplayRemoteName returns a safe display label for a RemotePath using POSIX

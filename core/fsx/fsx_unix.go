@@ -61,25 +61,9 @@ func openRegularOS(path string, l Limits, cfg openConfig) (*RegularFile, error) 
 		return nil, fmt.Errorf("%w: %q (%d > %d bytes)", ErrTooLarge, path, st.Size, l.MaxBytes)
 	}
 
-	if clearErr := clearUnixNonBlock(fd, path); clearErr != nil {
-		_ = unix.Close(fd)
-		return nil, clearErr
-	}
-
-	f := os.NewFile(uintptr(fd), path)
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("fsx: os.NewFile returned nil for %q", path)
-	}
-
-	info, statErr := f.Stat()
-	if statErr != nil {
-		_ = f.Close()
-		return nil, statErr
-	}
-	if !info.Mode().IsRegular() {
-		_ = f.Close()
-		return nil, fmt.Errorf("%w: %q", ErrNonRegular, path)
+	f, info, wrapErr := wrapVerifiedRegularUnixFD(fd, path, true)
+	if wrapErr != nil {
+		return nil, wrapErr
 	}
 	if info.Size() > l.MaxBytes {
 		_ = f.Close()
@@ -92,6 +76,77 @@ func openRegularOS(path string, l Limits, cfg openConfig) (*RegularFile, error) 
 		path:     path,
 		maxBytes: l.MaxBytes,
 	}, nil
+}
+
+func openRegularUnboundedOS(path string, cfg openConfig) (*os.File, os.FileInfo, error) {
+	openFlags := unix.O_RDONLY | unix.O_NONBLOCK | unix.O_CLOEXEC | unix.O_NOCTTY
+	if !cfg.followSymlinks {
+		openFlags |= unix.O_NOFOLLOW
+	}
+	fd, err := unixOpenNoIntr(path, openFlags, 0)
+	if err != nil {
+		return nil, nil, classifyUnixOpenError(path, err)
+	}
+	return wrapVerifiedRegularUnixFD(fd, path, true)
+}
+
+func openAppendRegularOS(path string, perm os.FileMode) (*os.File, error) {
+	const (
+		openExistingFlags = unix.O_WRONLY | unix.O_APPEND | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC | unix.O_NOCTTY
+		createFlags       = unix.O_WRONLY | unix.O_APPEND | unix.O_CREAT | unix.O_EXCL | unix.O_NOFOLLOW | unix.O_CLOEXEC | unix.O_NOCTTY
+	)
+	for attempt := 0; attempt < DefaultLockRetries; attempt++ {
+		fd, err := unixOpenNoIntr(path, openExistingFlags, 0)
+		if err == nil {
+			f, _, wrapErr := wrapVerifiedRegularUnixFD(fd, path, true)
+			return f, wrapErr
+		}
+		if !errors.Is(err, unix.ENOENT) {
+			return nil, classifyUnixOpenError(path, err)
+		}
+		cfd, createErr := unixOpenNoIntr(path, createFlags, uint32(perm.Perm()))
+		if createErr == nil {
+			f, _, wrapErr := wrapVerifiedRegularUnixFD(cfd, path, false)
+			return f, wrapErr
+		}
+		if !errors.Is(createErr, unix.EEXIST) {
+			return nil, classifyUnixOpenError(path, createErr)
+		}
+	}
+	return nil, fmt.Errorf("%w: open append file %q", ErrRetryExhausted, path)
+}
+
+func wrapVerifiedRegularUnixFD(fd int, path string, clearNonBlock bool) (*os.File, os.FileInfo, error) {
+	var st unix.Stat_t
+	if fstatErr := unix.Fstat(fd, &st); fstatErr != nil {
+		_ = unix.Close(fd)
+		return nil, nil, &os.PathError{Op: "fstat", Path: path, Err: fstatErr}
+	}
+	if (st.Mode & unix.S_IFMT) != unix.S_IFREG {
+		_ = unix.Close(fd)
+		return nil, nil, fmt.Errorf("%w: %q", ErrNonRegular, path)
+	}
+	if clearNonBlock {
+		if clearErr := clearUnixNonBlock(fd, path); clearErr != nil {
+			_ = unix.Close(fd)
+			return nil, nil, clearErr
+		}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	if f == nil {
+		_ = unix.Close(fd)
+		return nil, nil, fmt.Errorf("fsx: os.NewFile returned nil for %q", path)
+	}
+	info, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return nil, nil, statErr
+	}
+	if !info.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, nil, fmt.Errorf("%w: %q", ErrNonRegular, path)
+	}
+	return f, info, nil
 }
 
 func isUnixDevNullStat(st *unix.Stat_t) (bool, error) {
@@ -122,8 +177,12 @@ func createExclusiveOS(path string, perm os.FileMode) (*os.File, error) {
 }
 
 func openExistingRegularForLockOS(path string, exclusive bool) (*os.File, error) {
+	return openExistingRegularOS(path, exclusive)
+}
+
+func openExistingRegularOS(path string, writable bool) (*os.File, error) {
 	flags := unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC | unix.O_NOCTTY
-	if exclusive {
+	if writable {
 		flags |= unix.O_RDWR
 	} else {
 		flags |= unix.O_RDONLY
@@ -132,27 +191,8 @@ func openExistingRegularForLockOS(path string, exclusive bool) (*os.File, error)
 	if err != nil {
 		return nil, classifyUnixOpenError(path, err)
 	}
-
-	var st unix.Stat_t
-	if fstatErr := unix.Fstat(fd, &st); fstatErr != nil {
-		_ = unix.Close(fd)
-		return nil, &os.PathError{Op: "fstat", Path: path, Err: fstatErr}
-	}
-	if (st.Mode & unix.S_IFMT) != unix.S_IFREG {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("%w: %q", ErrNonRegular, path)
-	}
-	if clearErr := clearUnixNonBlock(fd, path); clearErr != nil {
-		_ = unix.Close(fd)
-		return nil, clearErr
-	}
-
-	f := os.NewFile(uintptr(fd), path)
-	if f == nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("fsx: os.NewFile returned nil for %q", path)
-	}
-	return f, nil
+	f, _, wrapErr := wrapVerifiedRegularUnixFD(fd, path, true)
+	return f, wrapErr
 }
 
 func lockFileOS(f *os.File, exclusive bool) error {

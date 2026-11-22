@@ -420,3 +420,297 @@ func TestOpenLocked_RetryExhaustedAndSymlinkSwap(t *testing.T) {
 		t.Fatalf("OpenLocked after symlink swap = %v, want ErrSymlink", err)
 	}
 }
+
+func TestIsDevNullSentinel_CrossPlatform(t *testing.T) {
+	winCases := []struct {
+		path string
+		want bool
+	}{
+		{"NUL", true},
+		{"nul", true},
+		{"NuL", true},
+		{`\\.\NUL`, true},
+		{`\\.\nul`, true},
+		{"//./NUL", true},
+		{"/dev/null", true},
+		{"/dev//null", true},
+		{`\dev\null`, true},
+		{"", false},
+		{"NUL.txt", false},
+		{"/dev/zero", false},
+		{`C:\dev\null`, false},
+		{`\\?\NUL`, false},
+	}
+	for _, tc := range winCases {
+		if got := isDevNullSentinelForOS("windows", tc.path); got != tc.want {
+			t.Errorf("isDevNullSentinelForOS(windows, %q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+
+	unixCases := []struct {
+		path string
+		want bool
+	}{
+		{"/dev/null", true},
+		{"/dev//null", true},
+		{"/dev/./null", true},
+		{"NUL", false},
+		{"nul", false},
+		{`\\.\NUL`, false},
+		{`\dev\null`, false},
+		{"/dev/zero", false},
+		{"/dev/null/extra", false},
+		{"", false},
+	}
+	for _, goos := range []string{"linux", "darwin"} {
+		for _, tc := range unixCases {
+			if got := isDevNullSentinelForOS(goos, tc.path); got != tc.want {
+				t.Errorf("isDevNullSentinelForOS(%s, %q) = %v, want %v", goos, tc.path, got, tc.want)
+			}
+		}
+	}
+
+	if !IsDevNullSentinel("/dev/null") || !IsDevNullPath("/dev/null") || !IsDevNullSentinel(os.DevNull) {
+		t.Fatalf("expected /dev/null and os.DevNull (%q) to be recognized on %s", os.DevNull, runtime.GOOS)
+	}
+}
+
+func TestOpenRegularUnbounded(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stream.bin")
+	payload := []byte("0123456789abcdef")
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f, info, err := OpenRegularUnbounded(path)
+	if err != nil {
+		t.Fatalf("OpenRegularUnbounded failed: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+	if info.Size() != int64(len(payload)) {
+		t.Fatalf("info.Size() = %d, want %d", info.Size(), len(payload))
+	}
+	buf := make([]byte, 6)
+	if n, err := f.ReadAt(buf, 10); err != nil || n != 6 || string(buf) != "abcdef" {
+		t.Fatalf("ReadAt = (%q, %d, %v), want (\"abcdef\", 6, nil)", string(buf), n, err)
+	}
+	if _, err := f.Seek(4, io.SeekStart); err != nil {
+		t.Fatalf("Seek failed: %v", err)
+	}
+	rest, err := io.ReadAll(f)
+	if err != nil || string(rest) != "456789abcdef" {
+		t.Fatalf("Seek+ReadAll = (%q, %v), want (\"456789abcdef\", nil)", string(rest), err)
+	}
+
+	if _, _, err := OpenRegularUnbounded(""); !errors.Is(err, ErrEmptyPath) {
+		t.Fatalf("OpenRegularUnbounded('') = %v, want ErrEmptyPath", err)
+	}
+	if _, _, err := OpenRegularUnbounded(filepath.Join(dir, "missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("OpenRegularUnbounded(missing) = %v, want os.ErrNotExist", err)
+	}
+	if _, _, err := OpenRegularUnbounded(dir); !errors.Is(err, ErrNonRegular) {
+		t.Fatalf("OpenRegularUnbounded(dir) = %v, want ErrNonRegular", err)
+	}
+
+	link := filepath.Join(dir, "stream.link")
+	if err := os.Symlink(path, link); err == nil {
+		if lf, _, err := OpenRegularUnbounded(link); !errors.Is(err, ErrSymlink) {
+			if lf != nil {
+				_ = lf.Close()
+			}
+			t.Fatalf("OpenRegularUnbounded(symlink) = %v, want ErrSymlink", err)
+		}
+		lf, linfo, err := OpenRegularUnbounded(link, FollowSymlinks())
+		if err != nil {
+			t.Fatalf("OpenRegularUnbounded(symlink, FollowSymlinks()) failed: %v", err)
+		}
+		_ = lf.Close()
+		if linfo.Size() != int64(len(payload)) {
+			t.Fatalf("FollowSymlinks size = %d, want %d", linfo.Size(), len(payload))
+		}
+	}
+}
+
+func TestOpenStagingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "staging.tmp")
+
+	// 1. Fresh creation returns created=true.
+	f1, info1, created1, err := OpenStagingFile(path, OwnerOnlyPerm)
+	if err != nil {
+		t.Fatalf("OpenStagingFile(create) failed: %v", err)
+	}
+	if !created1 || info1.Size() != 0 {
+		_ = f1.Close()
+		t.Fatalf("created=%v size=%d, want true, 0", created1, info1.Size())
+	}
+	if _, err := f1.WriteString("existing-partial-data"); err != nil {
+		_ = f1.Close()
+		t.Fatal(err)
+	}
+	if err := f1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Reopening existing staging file MUST NOT truncate before caller verifies handle.
+	f2, info2, created2, err := OpenStagingFile(path, OwnerOnlyPerm)
+	if err != nil {
+		t.Fatalf("OpenStagingFile(existing) failed: %v", err)
+	}
+	if created2 || info2.Size() != int64(len("existing-partial-data")) {
+		_ = f2.Close()
+		t.Fatalf("created=%v size=%d, want false, %d", created2, info2.Size(), len("existing-partial-data"))
+	}
+	got, err := io.ReadAll(f2)
+	if err != nil || string(got) != "existing-partial-data" {
+		_ = f2.Close()
+		t.Fatalf("existing staging file was truncated or corrupted: (%q, %v)", string(got), err)
+	}
+	if err := f2.Truncate(0); err != nil {
+		_ = f2.Close()
+		t.Fatal(err)
+	}
+	if err := f2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 3. Symlink and dangling symlink rejection.
+	t.Run("symlink_rejection", func(t *testing.T) {
+		testOpenStagingFileSymlinkRejection(t, dir)
+	})
+
+	// 4. Directory and empty path rejected.
+	if _, _, _, err := OpenStagingFile(dir, OwnerOnlyPerm); !errors.Is(err, ErrNonRegular) {
+		t.Fatalf("OpenStagingFile(dir) = %v, want ErrNonRegular", err)
+	}
+	if _, _, _, err := OpenStagingFile("", OwnerOnlyPerm); !errors.Is(err, ErrEmptyPath) {
+		t.Fatalf("OpenStagingFile('') = %v, want ErrEmptyPath", err)
+	}
+}
+
+func testOpenStagingFileSymlinkRejection(t *testing.T, dir string) {
+	t.Helper()
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("must-survive"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symPath := filepath.Join(dir, "staging.link")
+	if err := os.Symlink(victim, symPath); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable on Windows: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if sf, _, _, err := OpenStagingFile(symPath, OwnerOnlyPerm); !errors.Is(err, ErrSymlink) {
+		if sf != nil {
+			_ = sf.Close()
+		}
+		t.Fatalf("OpenStagingFile(symlink) = %v, want ErrSymlink", err)
+	}
+	after, readErr := os.ReadFile(victim)
+	if readErr != nil || string(after) != "must-survive" {
+		t.Fatalf("victim file altered after OpenStagingFile(symlink): (%q, %v)", string(after), readErr)
+	}
+	dangling := filepath.Join(dir, "dangling.link")
+	missingTarget := filepath.Join(dir, "never-created.txt")
+	if err := os.Symlink(missingTarget, dangling); err != nil {
+		t.Fatal(err)
+	}
+	if df, _, _, err := OpenStagingFile(dangling, OwnerOnlyPerm); !errors.Is(err, ErrSymlink) {
+		if df != nil {
+			_ = df.Close()
+		}
+		t.Fatalf("OpenStagingFile(dangling symlink) = %v, want ErrSymlink", err)
+	}
+	if _, statErr := os.Lstat(missingTarget); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("OpenStagingFile created dangling symlink target: %v", statErr)
+	}
+}
+
+func TestOpenAppendRegular(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.jsonl")
+
+	// 1. Creates new file and appends across multiple opens without truncating.
+	f1, err := OpenAppendRegular(logPath, OwnerOnlyPerm)
+	if err != nil {
+		t.Fatalf("OpenAppendRegular(create) failed: %v", err)
+	}
+	if _, err := f1.WriteString("line1\n"); err != nil {
+		_ = f1.Close()
+		t.Fatal(err)
+	}
+	if err := f1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	f2, err := OpenAppendRegular(logPath, OwnerOnlyPerm)
+	if err != nil {
+		t.Fatalf("OpenAppendRegular(existing) failed: %v", err)
+	}
+	if _, err := f2.WriteString("line2\n"); err != nil {
+		_ = f2.Close()
+		t.Fatal(err)
+	}
+	if err := f2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil || string(data) != "line1\nline2\n" {
+		t.Fatalf("appended log = (%q, %v), want \"line1\\nline2\\n\"", string(data), err)
+	}
+
+	// 2. Rejects symlinks (valid & dangling) without modifying target.
+	t.Run("symlink_rejection", func(t *testing.T) {
+		testOpenAppendRegularSymlinkRejection(t, dir)
+	})
+
+	// 3. Directory and empty path rejected.
+	if _, err := OpenAppendRegular(dir, OwnerOnlyPerm); !errors.Is(err, ErrNonRegular) {
+		t.Fatalf("OpenAppendRegular(dir) = %v, want ErrNonRegular", err)
+	}
+	if _, err := OpenAppendRegular("", OwnerOnlyPerm); !errors.Is(err, ErrEmptyPath) {
+		t.Fatalf("OpenAppendRegular('') = %v, want ErrEmptyPath", err)
+	}
+}
+
+func testOpenAppendRegularSymlinkRejection(t *testing.T, dir string) {
+	t.Helper()
+	victim := filepath.Join(dir, "victim-log.txt")
+	if err := os.WriteFile(victim, []byte("original\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symPath := filepath.Join(dir, "audit.link")
+	if err := os.Symlink(victim, symPath); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation unavailable on Windows: %v", err)
+		}
+		t.Fatal(err)
+	}
+	if sf, err := OpenAppendRegular(symPath, OwnerOnlyPerm); !errors.Is(err, ErrSymlink) {
+		if sf != nil {
+			_ = sf.Close()
+		}
+		t.Fatalf("OpenAppendRegular(symlink) = %v, want ErrSymlink", err)
+	}
+	after, readErr := os.ReadFile(victim)
+	if readErr != nil || string(after) != "original\n" {
+		t.Fatalf("victim altered after OpenAppendRegular(symlink): (%q, %v)", string(after), readErr)
+	}
+	dangling := filepath.Join(dir, "dangling-audit.link")
+	missing := filepath.Join(dir, "must-not-exist.log")
+	if err := os.Symlink(missing, dangling); err != nil {
+		t.Fatal(err)
+	}
+	if df, err := OpenAppendRegular(dangling, OwnerOnlyPerm); !errors.Is(err, ErrSymlink) {
+		if df != nil {
+			_ = df.Close()
+		}
+		t.Fatalf("OpenAppendRegular(dangling) = %v, want ErrSymlink", err)
+	}
+	if _, statErr := os.Lstat(missing); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("OpenAppendRegular followed dangling symlink: %v", statErr)
+	}
+}
