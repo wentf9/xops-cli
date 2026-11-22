@@ -20,6 +20,11 @@ const (
 	AlgoOpRemove
 	// AlgoOpPrepend ('^') prepends the specified tokens ahead of the defaults.
 	AlgoOpPrepend
+	// AlgoOpDefault represents an explicit default-retaining policy (for example
+	// an OpenSSH "+algo" or "^algo" modifier whose tokens are unsupported
+	// locally): it resolves to unmodified defaults while shadowing lower layers
+	// during Merge.
+	AlgoOpDefault
 )
 
 // String returns the canonical operation name.
@@ -35,6 +40,8 @@ func (op AlgoOp) String() string {
 		return "remove"
 	case AlgoOpPrepend:
 		return "prepend"
+	case AlgoOpDefault:
+		return "default"
 	default:
 		return fmt.Sprintf("invalid(%d)", uint8(op))
 	}
@@ -54,6 +61,21 @@ type AlgoPolicy struct {
 // UnsetAlgoPolicy returns the zero-value unset AlgoPolicy (identity for Merge).
 func UnsetAlgoPolicy() AlgoPolicy {
 	return AlgoPolicy{}
+}
+
+// DefaultAlgoPolicy returns an explicit default-retaining AlgoPolicy bound to
+// optionKey. Unlike UnsetAlgoPolicy (the Merge identity), DefaultAlgoPolicy
+// shadows lower-priority layers in Merge while resolving to the unmodified
+// default algorithm list.
+func DefaultAlgoPolicy(optionKey string) (AlgoPolicy, error) {
+	spec, err := lookupAlgorithmOptionSpec(optionKey)
+	if err != nil {
+		return AlgoPolicy{}, err
+	}
+	return AlgoPolicy{
+		optionKey: spec.CanonicalKey,
+		op:        AlgoOpDefault,
+	}, nil
 }
 
 // ParseAlgoPolicy strictly parses an OpenSSH algorithm specification for
@@ -140,9 +162,13 @@ func (p AlgoPolicy) Op() AlgoOp { return p.op }
 // IsUnset reports whether p is the unset identity policy.
 func (p AlgoPolicy) IsUnset() bool { return p.op == AlgoOpUnset }
 
+// IsDefault reports whether p is an explicit default-retaining policy that
+// resolves to unmodified defaults while shadowing lower layers in Merge.
+func (p AlgoPolicy) IsDefault() bool { return p.op == AlgoOpDefault }
+
 // Tokens returns a defensive copy of the deduplicated algorithm tokens.
 func (p AlgoPolicy) Tokens() []string {
-	if p.op == AlgoOpUnset || len(p.tokens) == 0 {
+	if p.op == AlgoOpUnset || p.op == AlgoOpDefault || len(p.tokens) == 0 {
 		return nil
 	}
 	return slices.Clone(p.tokens)
@@ -165,7 +191,7 @@ func (p AlgoPolicy) clone() AlgoPolicy {
 func (p AlgoPolicy) Resolve(defaults []string) ([]string, error) {
 	var result []string
 	switch p.op {
-	case AlgoOpUnset:
+	case AlgoOpUnset, AlgoOpDefault:
 		result = dedupNonEmpty(defaults)
 	case AlgoOpReplace:
 		result = slices.Clone(p.tokens)
@@ -243,11 +269,11 @@ func (p AlgoPolicy) Equal(other AlgoPolicy) bool {
 		slices.Equal(p.tokens, other.tokens)
 }
 
-// String formats p in canonical OpenSSH syntax ("" for Unset, or optional
+// String formats p in canonical OpenSSH syntax ("" for Unset/Default, or optional
 // "+", "-", "^" prefix followed by comma-separated tokens).
 func (p AlgoPolicy) String() string {
 	switch p.op {
-	case AlgoOpUnset:
+	case AlgoOpUnset, AlgoOpDefault:
 		return ""
 	case AlgoOpReplace:
 		return strings.Join(p.tokens, ",")

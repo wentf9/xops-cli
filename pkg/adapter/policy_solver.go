@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/core/verdict"
@@ -155,19 +156,22 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 		canonicalHost:   canonHost,
 	}
 
-	t2, t3, t4, tierErr := a.resolvePolicyTiers(req.NodeID, snapshot, snapErr, tier3Global, pol.tier1Auth)
+	t2, t3, t4, t4ParserProxy, tierErr := a.resolvePolicyTiers(req.NodeID, snapshot, snapErr, tier3Global, pol.tier1Auth)
 	if tierErr != nil {
 		return pol, tierErr
 	}
 
 	tier1Opts := sessionOpts.ToSSHOptions()
-	effectiveProxy, tier1JumpWon := resolveFourTierProxySetting(
-		hasTier1Auth, tier1Auth, tier1Opts, snapshot, pol.hasSnapshot, t2, t3, t4,
+	effectiveProxy, tier1JumpWon, proxyErr := resolveFourTierProxySetting(
+		hasTier1Auth, tier1Auth, sessionOpts.proxySetting, tier1Opts, snapshot, pol.hasSnapshot, t2, t3, t4, t4ParserProxy,
 	)
+	if proxyErr != nil {
+		return pol, proxyErr
+	}
 	pol.proxySetting = effectiveProxy
 
 	if effectiveProxy.Kind() == ssh.ProxyJump {
-		resolvedJump, err := a.resolveEffectiveJumpChain(req.NodeID, req.ResolveProxy, tier1JumpWon, tier1Auth, snapshot)
+		resolvedJump, err := a.resolveEffectiveJumpChain(req.NodeID, req.ResolveProxy, tier1JumpWon, tier1Auth, effectiveProxy, snapshot)
 		if err != nil {
 			return pol, err
 		}
@@ -186,27 +190,46 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 	return pol, nil
 }
 
-func proxySettingFromJumpString(raw string) ssh.ProxySetting {
-	switch ssh.ClassifyProxyJump(raw) {
-	case ssh.ProxyJumpDisabled:
-		return ssh.DisabledProxyJumpSetting()
-	case ssh.ProxyJumpActive:
-		if ps, err := ssh.ParseProxyJump(raw); err == nil {
-			return ps
-		}
-		var hops []string
-		for part := range strings.SplitSeq(raw, ",") {
-			if tok := strings.TrimSpace(part); tok != "" && !ssh.IsNoneValue(tok) {
-				hops = append(hops, tok)
-			}
-		}
-		if len(hops) > 0 {
-			if ps, err := ssh.NewProxyJump(hops...); err == nil {
-				return ps
-			}
+func hasControlOrLineSepChar(s string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return true
 		}
 	}
-	return ssh.UnsetProxySetting()
+	return false
+}
+
+func proxySettingFromJumpString(raw string) (ssh.ProxySetting, error) {
+	if hasControlOrLineSepChar(raw) {
+		return ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ssh.ErrSSHOptionsValidation, raw)
+	}
+	if strings.TrimSpace(raw) == "" {
+		return ssh.UnsetProxySetting(), nil
+	}
+	ps, err := ssh.ParseProxyJump(raw)
+	if err == nil {
+		return ps, nil
+	}
+	if ssh.ClassifyProxyJump(raw) == ssh.ProxyJumpDisabled {
+		return ssh.DisabledProxyJumpSetting(), nil
+	}
+	// Accept mixed "hop1,none,hop2" strings only when every comma-separated
+	// token is non-empty (no empty hops such as "a,,b" or "a,"); reject all
+	// other malformed strings fail-closed.
+	var hops []string
+	for part := range strings.SplitSeq(raw, ",") {
+		tok := strings.TrimSpace(part)
+		if tok == "" {
+			return ssh.UnsetProxySetting(), err
+		}
+		if !ssh.IsNoneValue(tok) {
+			hops = append(hops, tok)
+		}
+	}
+	if len(hops) == 0 {
+		return ssh.UnsetProxySetting(), err
+	}
+	return ssh.NewProxyJump(hops...)
 }
 
 func proxyCommandSetting(opts *ssh.Options) ssh.ProxySetting {
@@ -222,20 +245,28 @@ func proxyCommandSetting(opts *ssh.Options) ssh.ProxySetting {
 func resolveFourTierProxySetting(
 	hasTier1Auth bool,
 	tier1Auth SessionAuth,
+	tier1SessionProxy ssh.ProxySetting,
 	tier1Opts *ssh.Options,
 	snapshot config.ConnectionSnapshot,
 	hasSnapshot bool,
 	t2, t3, t4 *ssh.Options,
-) (effective ssh.ProxySetting, tier1JumpWon bool) {
+	t4ParserProxy ssh.ProxySetting,
+) (effective ssh.ProxySetting, tier1JumpWon bool, err error) {
 	t1Jump := ssh.UnsetProxySetting()
-	if hasTier1Auth && strings.TrimSpace(tier1Auth.ProxyJump) != "" {
-		t1Jump = proxySettingFromJumpString(tier1Auth.ProxyJump)
+	if hasTier1Auth && tier1Auth.ProxyJump != "" {
+		t1Jump, err = proxySettingFromJumpString(tier1Auth.ProxyJump)
+		if err != nil {
+			return ssh.UnsetProxySetting(), false, fmt.Errorf("invalid session ProxyJump %q: %w", tier1Auth.ProxyJump, err)
+		}
 	}
-	t1Proxy := t1Jump.Merge(proxyCommandSetting(tier1Opts))
+	t1Proxy := ssh.MergeProxySettings(t1Jump, tier1SessionProxy, proxyCommandSetting(tier1Opts))
 
 	t2Jump := ssh.UnsetProxySetting()
 	if hasSnapshot && !snapshot.Provenance.IsUnpersistedOpenSSH() {
-		t2Jump = proxySettingFromJumpString(snapshot.Node.ProxyJump)
+		t2Jump, err = proxySettingFromJumpString(snapshot.Node.ProxyJump)
+		if err != nil {
+			return ssh.UnsetProxySetting(), false, fmt.Errorf("invalid node ProxyJump %q: %w", snapshot.Node.ProxyJump, err)
+		}
 	}
 	t2Proxy := t2Jump.Merge(proxyCommandSetting(t2))
 
@@ -243,13 +274,16 @@ func resolveFourTierProxySetting(
 
 	t4Jump := ssh.UnsetProxySetting()
 	if hasSnapshot && snapshot.Provenance.IsUnpersistedOpenSSH() {
-		t4Jump = proxySettingFromJumpString(snapshot.Node.ProxyJump)
+		t4Jump, err = proxySettingFromJumpString(snapshot.Node.ProxyJump)
+		if err != nil {
+			return ssh.UnsetProxySetting(), false, fmt.Errorf("invalid OpenSSH ProxyJump %q: %w", snapshot.Node.ProxyJump, err)
+		}
 	}
-	t4Proxy := t4Jump.Merge(proxyCommandSetting(t4))
+	t4Proxy := ssh.MergeProxySettings(t4Jump, t4ParserProxy, proxyCommandSetting(t4))
 
 	effective = ssh.MergeProxySettings(t1Proxy, t2Proxy, t3Proxy, t4Proxy)
-	tier1JumpWon = t1Jump.Kind() == ssh.ProxyJump && effective.Kind() == ssh.ProxyJump
-	return effective, tier1JumpWon
+	tier1JumpWon = t1Proxy.Kind() == ssh.ProxyJump && effective.Kind() == ssh.ProxyJump
+	return effective, tier1JumpWon, nil
 }
 
 func (a *SSHAdapter) resolveEffectiveJumpChain(
@@ -257,15 +291,22 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	resolveProxy bool,
 	tier1JumpWon bool,
 	tier1Auth SessionAuth,
+	effectiveProxy ssh.ProxySetting,
 	snapshot config.ConnectionSnapshot,
 ) (string, error) {
 	if tier1JumpWon {
-		if !resolveProxy {
-			return strings.TrimSpace(tier1Auth.ProxyJump), nil
+		rawJump := strings.TrimSpace(tier1Auth.ProxyJump)
+		if rawJump == "" {
+			if targets, ok := effectiveProxy.JumpTargets(); ok {
+				rawJump = strings.Join(targets, ",")
+			}
 		}
-		resolved, err := a.cfgProvider.ResolveProxyJumpChain(tier1Auth.ProxyJump)
+		if !resolveProxy {
+			return rawJump, nil
+		}
+		resolved, err := a.cfgProvider.ResolveProxyJumpChain(rawJump)
 		if err != nil {
-			return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", tier1Auth.ProxyJump, nodeID, err)
+			return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
 		}
 		return resolved, nil
 	}
@@ -342,7 +383,13 @@ func applyEffectiveProxyToOptions(merged *ssh.Options, effectiveProxy ssh.ProxyS
 			}
 		}
 	case ssh.ProxyDisabled:
-		if !effectiveProxy.Equal(ssh.DisabledProxySetting()) && merged != nil && merged.ActiveProxyCommand() != "" {
+		if effectiveProxy.Equal(ssh.DisabledProxySetting()) {
+			if merged != nil && merged.ActiveProxyCommand() != "" {
+				if err := merged.Set(ssh.OptionProxyCommand, "none"); err != nil {
+					return nil, err
+				}
+			}
+		} else if merged != nil && merged.ActiveProxyCommand() != "" {
 			merged.Delete(ssh.OptionProxyCommand)
 		}
 	}
@@ -496,7 +543,7 @@ func (a *SSHAdapter) resolvePolicyTiers(
 	snapErr error,
 	tier3Global *ssh.Options,
 	tier1Auth SessionAuth,
-) (tier2Node, tier3Out, tier4OpenSSH *ssh.Options, err error) {
+) (tier2Node, tier3Out, tier4OpenSSH *ssh.Options, tier4Proxy ssh.ProxySetting, err error) {
 	tier3Out = tier3Global
 	if snapErr == nil {
 		switch snapshot.Provenance {
@@ -504,17 +551,25 @@ func (a *SSHAdapter) resolvePolicyTiers(
 			var rawT4 *ssh.Options
 			rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1Auth)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, ssh.UnsetProxySetting(), err
 			}
 			tier4OpenSSH = rawT4.Clone()
+			tier4Proxy, err = a.resolveTier4OpenSSHProxySetting(a.getOpenSSHParser(), nodeName, snapErr, snapshot)
+			if err != nil {
+				return nil, nil, nil, ssh.UnsetProxySetting(), err
+			}
 		case config.ProvenanceOpenSSHVirtual:
 			tier4OpenSSH = snapshot.Node.SSHOptions.Clone()
+			tier4Proxy, err = a.resolveTier4OpenSSHProxySetting(a.getOpenSSHParser(), nodeName, snapErr, snapshot)
+			if err != nil {
+				return nil, nil, nil, ssh.UnsetProxySetting(), err
+			}
 		default:
 			tier2Node = snapshot.Node.SSHOptions
 			var rawT4 *ssh.Options
 			rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1Auth)
 			if err != nil {
-				return nil, nil, nil, err
+				return nil, nil, nil, ssh.UnsetProxySetting(), err
 			}
 			tier4OpenSSH = filterNonVirtualTier4Options(rawT4)
 		}
@@ -522,7 +577,7 @@ func (a *SSHAdapter) resolvePolicyTiers(
 		var rawT4 *ssh.Options
 		rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, tier1Auth)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, ssh.UnsetProxySetting(), err
 		}
 		tier4OpenSSH = filterNonVirtualTier4Options(rawT4)
 	}
@@ -530,7 +585,48 @@ func (a *SSHAdapter) resolvePolicyTiers(
 	if tier4OpenSSH != nil && !tier4OpenSSH.FilterByClasses(ssh.OptionClassMux).IsEmpty() {
 		tier4OpenSSH.ImplicitTier4 = true
 	}
-	return tier2Node, tier3Out, tier4OpenSSH, nil
+	return tier2Node, tier3Out, tier4OpenSSH, tier4Proxy, nil
+}
+
+func (a *SSHAdapter) resolveTier4OpenSSHProxySetting(
+	parser *config.OpenSSHParser,
+	nodeName string,
+	snapErr error,
+	snapshot config.ConnectionSnapshot,
+) (ssh.ProxySetting, error) {
+	if parser == nil || snapErr != nil {
+		return ssh.UnsetProxySetting(), nil
+	}
+	switch snapshot.Provenance {
+	case config.ProvenanceOpenSSHDerived:
+		if err := parser.Err(); err != nil {
+			return ssh.UnsetProxySetting(), err
+		}
+		alias := strings.TrimSpace(snapshot.Node.OpenSSHAlias)
+		canonicalHost := strings.TrimSpace(snapshot.Node.CanonicalHost)
+		if alias == "" {
+			alias = nodeName
+		}
+		return parser.ResolveProxySettingWithCanonical(alias, canonicalHost)
+	case config.ProvenanceOpenSSHVirtual:
+		if err := parser.Err(); err != nil {
+			return ssh.UnsetProxySetting(), err
+		}
+		alias := strings.TrimSpace(snapshot.Node.OpenSSHAlias)
+		canonicalHost := strings.TrimSpace(snapshot.Node.CanonicalHost)
+		if alias == "" {
+			if orig, ok := config.OpenSSHOriginalHost(nodeName); ok {
+				alias = orig
+			} else {
+				alias = config.UnwrapOpenSSHSelector(nodeName)
+			}
+		}
+		return parser.ResolveProxySettingWithCanonical(alias, canonicalHost)
+	default:
+		// Saved managed nodes and ad-hoc pending nodes block Tier-4 ProxyJump
+		// and OptionClassLocalExec (ProxyCommand) per Tier-4 trust policy.
+		return ssh.UnsetProxySetting(), nil
+	}
 }
 
 func filterNonVirtualTier4Options(rawTier4 *ssh.Options) *ssh.Options {

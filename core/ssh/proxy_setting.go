@@ -120,8 +120,10 @@ func NewProxyJump(targets ...string) (ProxySetting, error) {
 	return ProxySetting{kind: ProxyJump, jump: cleaned}, nil
 }
 
-// ParseProxyJump parses an OpenSSH ProxyJump directive value ("none" ->
-// DisabledProxyJumpSetting, or a comma-separated list of non-empty jump targets).
+// ParseProxyJump parses an OpenSSH ProxyJump directive value ("none" /
+// "none,none" -> DisabledProxyJumpSetting, or a comma-separated list of
+// non-empty jump targets). Empty hop tokens (e.g. ",", "a,,b", "none,") and
+// mixed "none" + hop chains are rejected with ErrSSHOptionsValidation.
 func ParseProxyJump(raw string) (ProxySetting, error) {
 	if hasControlOrLineSepChar(raw) {
 		return ProxySetting{}, fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ErrSSHOptionsValidation, raw)
@@ -130,10 +132,16 @@ func ParseProxyJump(raw string) (ProxySetting, error) {
 	if trimmed == "" {
 		return ProxySetting{}, fmt.Errorf("%w: invalid ProxyJump: value cannot be empty", ErrSSHOptionsValidation)
 	}
-	if IsNoneValue(trimmed) {
+	parts := strings.Split(trimmed, ",")
+	for _, part := range parts {
+		if strings.TrimSpace(part) == "" {
+			return ProxySetting{}, fmt.Errorf("%w: invalid ProxyJump %q: empty target", ErrSSHOptionsValidation, raw)
+		}
+	}
+	if IsDisabledProxyJump(trimmed) {
 		return DisabledProxyJumpSetting(), nil
 	}
-	return NewProxyJump(strings.Split(trimmed, ",")...)
+	return NewProxyJump(parts...)
 }
 
 // NewProxyCommand constructs an active ProxyCommand setting using the canonical

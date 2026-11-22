@@ -171,9 +171,9 @@ func TestP7Repro_MED8_ConnectTimeoutParity_0m_00(t *testing.T) {
 			if _, err := ssh.ParseOption(ssh.OptionConnectTimeout, raw, ssh.OptionSourceCLI); err == nil {
 				t.Errorf("MED-8: ParseOption(ConnectTimeout, %q) = nil, want error", raw)
 			}
-			pol := resolveCanonicalizePolicy(nil, t3, "app", []string{"ConnectTimeout=" + raw}, "")
-			if pol.timeout != time.Second {
-				t.Errorf("MED-8: resolveCanonicalizePolicy(ConnectTimeout=%q).timeout = %v, want 1s", raw, pol.timeout)
+			pol, err := resolveCanonicalizePolicy(nil, t3, "app", []string{"ConnectTimeout=" + raw}, "")
+			if err != nil || pol.timeout != time.Second {
+				t.Errorf("MED-8: resolveCanonicalizePolicy(ConnectTimeout=%q).timeout = (%v, %v), want 1s", raw, pol.timeout, err)
 			}
 		}
 	})

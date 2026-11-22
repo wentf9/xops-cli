@@ -59,8 +59,8 @@ func TestParseOption_OpenSSHAlgoFiltering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseOption unsupported +Kex: %v", err)
 	}
-	if !noop.IsNoOp || !noop.AlgoPolicy.IsUnset() {
-		t.Fatalf("expected IsNoOp=true unset AlgoPolicy, got %+v", noop)
+	if !noop.IsNoOp || noop.AlgoPolicy.IsUnset() || !noop.AlgoPolicy.IsDefault() || noop.AlgoPolicy.OptionKey() != OptionKexAlgorithms {
+		t.Fatalf("expected IsNoOp=true DefaultAlgoPolicy(kex_algorithms), got %+v", noop)
 	}
 
 	if _, err := ParseOption("Ciphers", "unsupported-cipher@example.com", OptionSourceOpenSSHConfig); err == nil {

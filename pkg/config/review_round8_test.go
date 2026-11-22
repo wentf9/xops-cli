@@ -242,7 +242,7 @@ func TestRound8_P2_11_P2_12_P3_4_OpenSSHTrustTrueCanonicalizeBoundsAndControlAli
 	}
 
 	// P2-12: setMaxDots enforces <= 64 and setDomains rejects invalid domains & "none,corp.com".
-	pol := resolveCanonicalizePolicy(nil, nil, "web", []string{
+	pol, err := resolveCanonicalizePolicy(nil, nil, "web", []string{
 		"CanonicalizeHostname=yes",
 		"CanonicalizeMaxDots=999", // out of range (>64): must NOT latch!
 		"CanonicalizeMaxDots=3",
@@ -250,8 +250,8 @@ func TestRound8_P2_11_P2_12_P3_4_OpenSSHTrustTrueCanonicalizeBoundsAndControlAli
 		"CanonicalDomains=-bad.example.com",  // invalid: must NOT latch!
 		"CanonicalDomains=good.example.com.", // valid single trailing dot
 	}, "")
-	if pol.maxDots != 3 {
-		t.Fatalf("pol.maxDots = %d, want 3 (999 must not latch)", pol.maxDots)
+	if err != nil || pol.maxDots != 3 {
+		t.Fatalf("pol.maxDots = (%d, %v), want 3 (999 must not latch)", pol.maxDots, err)
 	}
 	if len(pol.domains) != 1 || pol.domains[0] != "good.example.com" {
 		t.Fatalf("pol.domains = %v, want [good.example.com]", pol.domains)

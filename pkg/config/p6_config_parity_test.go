@@ -24,32 +24,35 @@ func TestP6_CanonicalizeDelegatesToCoreSSHOptionSpec(t *testing.T) {
 }
 
 func testP6CanonicalDomainsParity(t *testing.T) {
-	pol := resolveCanonicalizePolicy(nil, nil, "web", []string{
+	pol, err := resolveCanonicalizePolicy(nil, nil, "web", []string{
 		"CanonicalizeHostname=yes",
 		"CanonicalDomains=dev.example.com,corp.example.com",
 		"CanonicalDomains=none,corp.example.com",
 		"CanonicalDomains=corp.example.com\n",
 		"CanonicalDomains=DEV.EXAMPLE.COM.\tcorp.example.com dev.example.com",
 	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if want := []string{"dev.example.com", "corp.example.com"}; !slices.Equal(pol.domains, want) {
 		t.Fatalf("pol.domains = %v, want %v (comma list and newline must not latch)", pol.domains, want)
 	}
 
-	polCommaOnly := resolveCanonicalizePolicy(nil, nil, "web", []string{
+	polCommaOnly, err := resolveCanonicalizePolicy(nil, nil, "web", []string{
 		"CanonicalizeHostname=yes",
 		"CanonicalDomains=a.example.com,b.example.com",
 	}, "")
-	if len(polCommaOnly.domains) != 0 {
-		t.Fatalf("comma-separated CanonicalDomains unexpectedly accepted: %v", polCommaOnly.domains)
+	if err != nil || len(polCommaOnly.domains) != 0 {
+		t.Fatalf("comma-separated CanonicalDomains unexpectedly accepted: (%v, %v)", polCommaOnly.domains, err)
 	}
 
 	p, err := NewOpenSSHParserFromReader(strings.NewReader("Host *\n  CanonicalizeHostname yes\n  CanonicalDomains corp.example.com\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	polCleared := resolveCanonicalizePolicy(p, nil, "web", []string{"CanonicalDomains=NONE"}, "")
-	if len(polCleared.domains) != 0 {
-		t.Fatalf("CanonicalDomains=NONE did not clear Tier-4 domains: %v", polCleared.domains)
+	polCleared, err := resolveCanonicalizePolicy(p, nil, "web", []string{"CanonicalDomains=NONE"}, "")
+	if err != nil || len(polCleared.domains) != 0 {
+		t.Fatalf("CanonicalDomains=NONE did not clear Tier-4 domains: (%v, %v)", polCleared.domains, err)
 	}
 }
 
@@ -63,20 +66,23 @@ func testP6CanonicalPermittedCNAMEsParity(t *testing.T) {
 		"*.a.example.com:*.b.example.com\r",
 	}
 	for _, bad := range invalidCNAMEs {
-		pol := resolveCanonicalizePolicy(nil, nil, "web", []string{
+		pol, err := resolveCanonicalizePolicy(nil, nil, "web", []string{
 			"CanonicalizeHostname=yes",
 			"CanonicalizePermittedCNAMEs=" + bad,
 		}, "")
-		if len(pol.permittedCNAMEs) != 0 {
-			t.Errorf("CanonicalizePermittedCNAMEs=%q silently accepted rules %+v, want rejection", bad, pol.permittedCNAMEs)
+		if err != nil || len(pol.permittedCNAMEs) != 0 {
+			t.Errorf("CanonicalizePermittedCNAMEs=%q silently accepted rules (%+v, %v), want rejection", bad, pol.permittedCNAMEs, err)
 		}
 	}
 
-	pol := resolveCanonicalizePolicy(nil, nil, "web", []string{
+	pol, err := resolveCanonicalizePolicy(nil, nil, "web", []string{
 		"CanonicalizeHostname=yes",
 		"CanonicalizePermittedCNAMEs=*.a.example.com:*.b.example.com malformed_no_colon",
 		"CanonicalizePermittedCNAMEs=*.corp.example.com.:!blocked.cdn.net.,*.cdn.net.",
 	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(pol.permittedCNAMEs) != 1 ||
 		pol.permittedCNAMEs[0].sourcePatternList != "*.corp.example.com" ||
 		pol.permittedCNAMEs[0].targetPatternList != "!blocked.cdn.net,*.cdn.net" {
@@ -104,7 +110,7 @@ func testP6CanonicalPermittedCNAMEsParity(t *testing.T) {
 }
 
 func testP6CanonicalControlCharsAndBounds(t *testing.T) {
-	pol := resolveCanonicalizePolicy(nil, nil, "web", []string{
+	pol, err := resolveCanonicalizePolicy(nil, nil, "web", []string{
 		"CanonicalizeHostname=yes\n",
 		"CanonicalizeHostname=always",
 		"CanonicalizeFallbackLocal=no\r",
@@ -114,8 +120,8 @@ func testP6CanonicalControlCharsAndBounds(t *testing.T) {
 		"CanonicalizeMaxDots=65",
 		"CanonicalizeMaxDots=64",
 	}, "")
-	if pol.mode != "always" || pol.fallbackLocal || pol.maxDots != 64 {
-		t.Fatalf("unexpected policy after control-char/bound rejection: %+v", pol)
+	if err != nil || pol.mode != "always" || pol.fallbackLocal || pol.maxDots != 64 {
+		t.Fatalf("unexpected policy after control-char/bound rejection: (%+v, %v)", pol, err)
 	}
 
 	p, err := NewOpenSSHParserFromReader(strings.NewReader(strings.Join([]string{
@@ -127,9 +133,9 @@ func testP6CanonicalControlCharsAndBounds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	polSSH := resolveCanonicalizePolicy(p, nil, "web", nil, "")
-	if polSSH.mode != "yes" || len(polSSH.domains) != 0 || len(polSSH.permittedCNAMEs) != 0 {
-		t.Fatalf("invalid ssh_config directives should be leniently ignored, got %+v", polSSH)
+	polSSH, err := resolveCanonicalizePolicy(p, nil, "web", nil, "")
+	if err != nil || polSSH.mode != "yes" || len(polSSH.domains) != 0 || len(polSSH.permittedCNAMEs) != 0 {
+		t.Fatalf("invalid ssh_config directives should be leniently ignored, got (%+v, %v)", polSSH, err)
 	}
 }
 

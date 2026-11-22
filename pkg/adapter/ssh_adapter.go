@@ -42,17 +42,18 @@ type SessionAuth struct {
 // SessionControlOptions specifies session-level OpenSSH option overrides (Tier 1).
 // Pointers indicate whether a multiplexing flag was explicitly specified on the CLI.
 type SessionControlOptions struct {
-	Master      *ssh.ControlMasterMode
-	Path        *string
-	LiteralPath bool
-	Persist     *string
-	Options     *ssh.Options
-	AllowReuse  bool
+	Master       *ssh.ControlMasterMode
+	Path         *string
+	LiteralPath  bool
+	Persist      *string
+	Options      *ssh.Options
+	AllowReuse   bool
+	proxySetting ssh.ProxySetting
 }
 
 // IsEmpty returns true if no session control or SSH option flags were provided.
 func (s SessionControlOptions) IsEmpty() bool {
-	return s.Master == nil && s.Path == nil && !s.LiteralPath && s.Persist == nil && s.Options.IsEmpty()
+	return s.Master == nil && s.Path == nil && !s.LiteralPath && s.Persist == nil && s.Options.IsEmpty() && s.proxySetting.IsUnset()
 }
 
 func (s *SessionControlOptions) ensureOptions() *ssh.Options {
@@ -300,6 +301,7 @@ func applyParsedGenericSessionOption(
 }
 
 func finalizeSessionProxyOption(opts *SessionControlOptions, proxy ssh.ProxySetting) error {
+	opts.proxySetting = proxy
 	if cmd, ok := proxy.Command(); ok {
 		if err := opts.ensureOptions().Set(ssh.OptionProxyCommand, cmd); err != nil {
 			return fmt.Errorf("invalid ProxyCommand in -o option: %w", err)
@@ -371,7 +373,9 @@ func (a *SSHAdapter) DisableSessionControlSharing(nodeID string) {
 		return
 	}
 	disable := func(s SessionControlOptions) SessionControlOptions {
-		var out SessionControlOptions
+		out := SessionControlOptions{
+			proxySetting: s.proxySetting.Merge(ssh.UnsetProxySetting()),
+		}
 		if s.Options != nil {
 			out.Options = s.Options.Clone()
 			out.Options.StripClasses(ssh.OptionClassMux)
@@ -678,8 +682,9 @@ func (a *SSHAdapter) getSessionOverride(nodeID string) (SessionAuth, bool) {
 
 func cloneSessionControlOptions(s SessionControlOptions) SessionControlOptions {
 	out := SessionControlOptions{
-		LiteralPath: s.LiteralPath,
-		AllowReuse:  s.AllowReuse,
+		LiteralPath:  s.LiteralPath,
+		AllowReuse:   s.AllowReuse,
+		proxySetting: s.proxySetting.Merge(ssh.UnsetProxySetting()),
 	}
 	if s.Master != nil {
 		m := *s.Master
@@ -717,12 +722,13 @@ func mergeSessionControlOptions(override, base SessionControlOptions) SessionCon
 
 	path, literalPath := mergeSessionControlPath(override, base, overrideOpts)
 	return SessionControlOptions{
-		Master:      mergeSessionControlMaster(override, base, overrideOpts, overridePathIsNone),
-		Path:        path,
-		LiteralPath: literalPath,
-		Persist:     mergeSessionControlPersist(override, base, overrideOpts, overridePathIsNone),
-		Options:     mergedOpts,
-		AllowReuse:  mergeSessionControlAllowReuse(override, base, overridePathIsNone),
+		Master:       mergeSessionControlMaster(override, base, overrideOpts, overridePathIsNone),
+		Path:         path,
+		LiteralPath:  literalPath,
+		Persist:      mergeSessionControlPersist(override, base, overrideOpts, overridePathIsNone),
+		Options:      mergedOpts,
+		AllowReuse:   mergeSessionControlAllowReuse(override, base, overridePathIsNone),
+		proxySetting: override.proxySetting.Merge(base.proxySetting),
 	}
 }
 
@@ -962,18 +968,28 @@ func (p EffectivePolicy) ClientConfig() (*ssh.ClientConfig, error) {
 		Options:               sshOpts,
 	})
 
+	p.applyClientConfigIdentityKeys(cfg, snapshot, sshOpts)
+
+	return ssh.NewClientConfig(*cfg), nil
+}
+
+func (p EffectivePolicy) applyClientConfigIdentityKeys(cfg *ssh.ClientConfig, snapshot config.ConnectionSnapshot, sshOpts *ssh.Options) {
 	cliFlagList := ssh.UnsetPathList()
 	if p.hasTier1Auth {
 		cliFlagList = pathListFromSessionAuth(p.tier1Auth)
-		applySessionOverrideToConfig(cfg, p.tier1Auth, cliFlagList)
-		if strings.TrimSpace(p.tier1Auth.HostName) != "" {
-			cfg.BaseHost = config.StripHostBrackets(snapshot.Host.Address)
-		}
 	}
 
 	cliOptList := ssh.UnsetPathList()
 	if p.sessionCtrlOpts.Options != nil {
 		cliOptList = p.sessionCtrlOpts.Options.IdentityPathList()
+	}
+
+	cliKeys := cliFlagList.Merge(cliOptList)
+	if p.hasTier1Auth || !cliOptList.IsUnset() {
+		applySessionOverrideToConfig(cfg, p.tier1Auth, cliKeys)
+		if p.hasTier1Auth && strings.TrimSpace(p.tier1Auth.HostName) != "" {
+			cfg.BaseHost = config.StripHostBrackets(snapshot.Host.Address)
+		}
 	}
 	managedNodeList := ssh.UnsetPathList()
 	if managedKey := resolveManagedNodeKey(p.nodeID, snapshot); managedKey != "" {
@@ -998,8 +1014,6 @@ func (p EffectivePolicy) ClientConfig() (*ssh.ClientConfig, error) {
 			cfg.KeyPath = items[0]
 		}
 	}
-
-	return ssh.NewClientConfig(*cfg), nil
 }
 
 // GetConfig implements ssh.ConnectionProvider by delegating to Resolve.

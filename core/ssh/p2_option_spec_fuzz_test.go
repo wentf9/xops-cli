@@ -291,6 +291,7 @@ func assertSpecStrictConfig(t *testing.T, spec OptionSpec) {
 
 	wantStrict := spec.CanonicalKey == OptionControlMaster ||
 		spec.CanonicalKey == OptionControlPersist ||
+		spec.CanonicalKey == OptionProxyCommand ||
 		spec.AllowList
 	if spec.StrictInOpenSSHConfig != wantStrict {
 		t.Errorf("%s: StrictInOpenSSHConfig = %v, want %v", spec.CanonicalKey, spec.StrictInOpenSSHConfig, wantStrict)

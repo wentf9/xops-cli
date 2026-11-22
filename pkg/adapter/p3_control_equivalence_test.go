@@ -468,13 +468,17 @@ func TestP3_ControlTargetContextNormalization(t *testing.T) {
 		LocalUID:  "1000",
 	}
 
+	ps, err := proxySettingFromJumpString(" jump1 , none , jump2 ")
+	if err != nil {
+		t.Fatalf("proxySettingFromJumpString: %v", err)
+	}
 	pol := EffectivePolicy{
 		snapshot: config.ConnectionSnapshot{
 			Host:     models.Host{Address: "[fe80::1%eth0]", Port: 0},
 			Identity: models.Identity{User: "   "},
 			Node:     models.Node{ProxyJump: " jump1 , none , jump2 "},
 		},
-		proxySetting:  proxySettingFromJumpString(" jump1 , none , jump2 "),
+		proxySetting:  ps,
 		originalHost:  "  edge-v6  ",
 		canonicalHost: "  edge-v6.corp.example.com  ",
 	}

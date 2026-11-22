@@ -46,7 +46,10 @@ func TestSolveProxyPrecedencePureMatrix(t *testing.T) {
 			Node:       models.Node{ProxyJump: "saved-jump"},
 			Provenance: config.ProvenanceSavedManaged,
 		}
-		eff, _ := resolveFourTierProxySetting(true, SessionAuth{ProxyJump: "none"}, nil, snap, true, nil, t3, nil)
+		eff, _, err := resolveFourTierProxySetting(true, SessionAuth{ProxyJump: "none"}, ssh.UnsetProxySetting(), nil, snap, true, nil, t3, nil, ssh.UnsetProxySetting())
+		if err != nil {
+			t.Fatalf("resolveFourTierProxySetting: %v", err)
+		}
 		cmd, ok := eff.Command()
 		if !ok || cmd != "global-cmd %h %p" {
 			t.Fatalf("expected tier1 -J none to reveal Tier-3 ProxyCommand, got (%v, %q)", eff.Kind(), cmd)
@@ -59,7 +62,10 @@ func TestSolveProxyPrecedencePureMatrix(t *testing.T) {
 			Node:       models.Node{ProxyJump: "openssh:jump"},
 			Provenance: config.ProvenanceOpenSSHVirtual,
 		}
-		eff, _ := resolveFourTierProxySetting(false, SessionAuth{}, mkProxyOpts("none"), snap, true, nil, t3, nil)
+		eff, _, err := resolveFourTierProxySetting(false, SessionAuth{}, ssh.UnsetProxySetting(), mkProxyOpts("none"), snap, true, nil, t3, nil, ssh.UnsetProxySetting())
+		if err != nil {
+			t.Fatalf("resolveFourTierProxySetting: %v", err)
+		}
 		if !eff.Equal(ssh.DisabledProxySetting()) {
 			t.Fatalf("tier1 ProxyCommand=none must disable all lower proxy directives, got %v", eff)
 		}
@@ -75,7 +81,10 @@ func assertTier1JumpMasksAllLower(t *testing.T, mkProxyOpts func(string) *ssh.Op
 		Node:       models.Node{ProxyJump: "saved-jump"},
 		Provenance: config.ProvenanceSavedManaged,
 	}
-	eff, tier1Won := resolveFourTierProxySetting(true, SessionAuth{ProxyJump: "cli-jump"}, mkProxyOpts("t1-cmd %h %p"), snap, true, t2, t3, t4)
+	eff, tier1Won, err := resolveFourTierProxySetting(true, SessionAuth{ProxyJump: "cli-jump"}, ssh.UnsetProxySetting(), mkProxyOpts("t1-cmd %h %p"), snap, true, t2, t3, t4, ssh.UnsetProxySetting())
+	if err != nil {
+		t.Fatalf("resolveFourTierProxySetting: %v", err)
+	}
 	if !tier1Won || eff.Kind() != ssh.ProxyJump {
 		t.Fatalf("expected tier1 active ProxyJump to win, got (%v, tier1Won=%v)", eff, tier1Won)
 	}
@@ -93,15 +102,24 @@ func assertSavedJumpMasksLowerAndTier1CmdOverrides(t *testing.T, mkProxyOpts fun
 		Node:       models.Node{ProxyJump: "saved-jump"},
 		Provenance: config.ProvenanceSavedManaged,
 	}
-	effNoT1, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, snap, true, t2, t3, t4)
+	effNoT1, _, err := resolveFourTierProxySetting(false, SessionAuth{}, ssh.UnsetProxySetting(), nil, snap, true, t2, t3, t4, ssh.UnsetProxySetting())
+	if err != nil {
+		t.Fatalf("resolveFourTierProxySetting(no T1): %v", err)
+	}
 	if effNoT1.Kind() != ssh.ProxyJump {
 		t.Fatalf("saved node ProxyJump must mask tier2/tier3/tier4 ProxyCommand, got %v", effNoT1)
 	}
-	effWithT1, _ := resolveFourTierProxySetting(false, SessionAuth{}, mkProxyOpts("cli-cmd %h %p"), snap, true, t2, t3, t4)
+	effWithT1, _, err := resolveFourTierProxySetting(false, SessionAuth{}, ssh.UnsetProxySetting(), mkProxyOpts("cli-cmd %h %p"), snap, true, t2, t3, t4, ssh.UnsetProxySetting())
+	if err != nil {
+		t.Fatalf("resolveFourTierProxySetting(T1 cmd): %v", err)
+	}
 	if cmd, ok := effWithT1.Command(); !ok || cmd != "cli-cmd %h %p" {
 		t.Fatalf("tier1 ProxyCommand must override saved node ProxyJump, got %v", effWithT1)
 	}
-	effNoneCmd, _ := resolveFourTierProxySetting(false, SessionAuth{}, mkProxyOpts("none"), snap, true, t2, t3, t4)
+	effNoneCmd, _, err := resolveFourTierProxySetting(false, SessionAuth{}, ssh.UnsetProxySetting(), mkProxyOpts("none"), snap, true, t2, t3, t4, ssh.UnsetProxySetting())
+	if err != nil {
+		t.Fatalf("resolveFourTierProxySetting(T1 none): %v", err)
+	}
 	if !effNoneCmd.Equal(ssh.DisabledProxySetting()) {
 		t.Fatalf("tier1 ProxyCommand=none must disable saved node ProxyJump (OpenSSH semantics), got %v", effNoneCmd)
 	}
@@ -116,7 +134,10 @@ func assertUnpersistedJumpOverriddenByTier3(t *testing.T, mkProxyOpts func(strin
 			Node:       models.Node{ProxyJump: "openssh:jump"},
 			Provenance: prov,
 		}
-		eff, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, snap, true, nil, t3, t4)
+		eff, _, err := resolveFourTierProxySetting(false, SessionAuth{}, ssh.UnsetProxySetting(), nil, snap, true, nil, t3, t4, ssh.UnsetProxySetting())
+		if err != nil {
+			t.Fatalf("%s: resolveFourTierProxySetting: %v", prov, err)
+		}
 		if cmd, ok := eff.Command(); !ok || cmd != "global-cmd %h %p" {
 			t.Errorf("%s: expected tier3 global ProxyCommand to override Tier-4 ProxyJump, got %v", prov, eff)
 		}
@@ -131,7 +152,10 @@ func assertUnpersistedJumpMasksTier4(t *testing.T, mkProxyOpts func(string) *ssh
 			Node:       models.Node{ProxyJump: "openssh:jump"},
 			Provenance: prov,
 		}
-		eff, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, snap, true, nil, nil, t4)
+		eff, _, err := resolveFourTierProxySetting(false, SessionAuth{}, ssh.UnsetProxySetting(), nil, snap, true, nil, nil, t4, ssh.UnsetProxySetting())
+		if err != nil {
+			t.Fatalf("%s: resolveFourTierProxySetting: %v", prov, err)
+		}
 		if eff.Kind() != ssh.ProxyJump {
 			t.Errorf("%s: unpersisted OpenSSH ProxyJump must mask tier4 ProxyCommand, got %v", prov, eff)
 		}

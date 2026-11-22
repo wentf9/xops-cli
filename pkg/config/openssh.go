@@ -56,6 +56,11 @@ func NewOpenSSHParser() (*OpenSSHParser, error) {
 }
 
 func loadOpenSSHParserFromPath(path string, requireExist bool) (parser *OpenSSHParser, isDevNull bool, retErr error) {
+	// Treat platform null-device sentinels ("/dev/null" on all OSes, plus "NUL"
+	// and "\\.\NUL" case-insensitively on Windows) uniformly as empty no-op configs.
+	if isOpenSSHNullDevicePath(path) {
+		return &OpenSSHParser{cfg: nil}, true, nil
+	}
 	// OpenSSH follows symlinks for root config files (~/.ssh/config and -F)
 	// and accepts os.DevNull as an empty config; fsx.OpenRegular opens
 	// handle-first without Stat-then-Open and rejects FIFOs/devices/oversize.
@@ -536,14 +541,16 @@ func (*openSSHOverrideProvider) UpdateSudoAtVersionContext(_ context.Context, _,
 }
 
 // OpenSSHOriginalHost extracts the effective original host (%n) for an
-// "openssh:" virtual node ID by stripping OpenSSHNodePrefix and decomposing
-// composite user@host[:port] specs into their host token.
+// "openssh:" virtual node ID (case-insensitive prefix) by stripping the prefix
+// and decomposing composite user@host[:port] specs into their host token.
+// Empty or double-prefixed selectors (e.g. "openssh:OPENSSH:web") are rejected.
 func OpenSSHOriginalHost(nodeID string) (string, bool) {
-	if !strings.HasPrefix(nodeID, OpenSSHNodePrefix) {
+	rest, ok := cutOpenSSHPrefix(nodeID)
+	if !ok {
 		return "", false
 	}
-	clean := strings.TrimSpace(strings.TrimPrefix(nodeID, OpenSSHNodePrefix))
-	if clean == "" {
+	clean := strings.TrimSpace(rest)
+	if clean == "" || hasOpenSSHPrefix(clean) {
 		return "", false
 	}
 	if parsedHost, _, _, err := parseOpenSSHHostSpec(clean); err == nil && parsedHost != "" {
@@ -553,17 +560,33 @@ func OpenSSHOriginalHost(nodeID string) (string, bool) {
 }
 
 // UnwrapOpenSSHSelector extracts the host/alias token from an optional
-// "openssh:" virtual selector (including disambiguated "openssh:user@alias:port"),
-// or returns the trimmed input unchanged if it does not carry OpenSSHNodePrefix.
+// case-insensitive "openssh:" virtual selector (including disambiguated
+// "openssh:user@alias:port"), returns "" for empty or double-prefixed
+// "openssh:" selectors, and returns the trimmed input unchanged otherwise.
 func UnwrapOpenSSHSelector(selector string) string {
 	trimmed := strings.TrimSpace(selector)
 	if orig, ok := OpenSSHOriginalHost(trimmed); ok {
 		return orig
 	}
-	if strings.HasPrefix(trimmed, OpenSSHNodePrefix) {
+	if hasOpenSSHPrefix(trimmed) {
 		return ""
 	}
 	return trimmed
+}
+
+func stripOpenSSHSelectorForLookup(alias string) (string, bool) {
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" {
+		return "", false
+	}
+	if rest, ok := cutOpenSSHPrefix(trimmed); ok {
+		clean := strings.TrimSpace(rest)
+		if clean == "" || hasOpenSSHPrefix(clean) {
+			return "", false
+		}
+		return clean, true
+	}
+	return trimmed, true
 }
 
 // Find 尝试在 ssh_config 中寻找匹配的主机名
@@ -582,8 +605,8 @@ func (p *OpenSSHParser) HasHost(alias string) bool {
 	if p == nil || p.cfg == nil || alias == "" {
 		return false
 	}
-	cleanAlias := strings.TrimSpace(strings.TrimPrefix(alias, OpenSSHNodePrefix))
-	if cleanAlias == "" {
+	cleanAlias, ok := stripOpenSSHSelectorForLookup(alias)
+	if !ok {
 		return false
 	}
 	lookupAlias, _, _, err := parseOpenSSHHostSpec(cleanAlias)
@@ -648,8 +671,8 @@ func (p *OpenSSHParser) ResolveExplicitHostName(alias string) (hostName string, 
 	if p.err != nil {
 		return "", false, p.err
 	}
-	cleanAlias := strings.TrimSpace(strings.TrimPrefix(alias, OpenSSHNodePrefix))
-	if cleanAlias == "" {
+	cleanAlias, ok := stripOpenSSHSelectorForLookup(alias)
+	if !ok {
 		return "", false, nil
 	}
 	lookupAlias, _, _, parseErr := parseOpenSSHHostSpec(cleanAlias)
@@ -675,8 +698,8 @@ func (p *OpenSSHParser) ResolveExplicitPort(alias string) (port uint16, explicit
 	if p.err != nil {
 		return 0, false, p.err
 	}
-	cleanAlias := strings.TrimSpace(strings.TrimPrefix(alias, OpenSSHNodePrefix))
-	if cleanAlias == "" {
+	cleanAlias, ok := stripOpenSSHSelectorForLookup(alias)
+	if !ok {
 		return 0, false, nil
 	}
 	lookupAlias, _, _, parseErr := parseOpenSSHHostSpec(cleanAlias)
@@ -790,22 +813,35 @@ func (p *OpenSSHParser) ResolveEndpoint(alias string) (ssh.Endpoint, error) {
 // ResolveProxySetting folds all matching ProxyJump and ProxyCommand directives
 // for alias into a typed ssh.ProxySetting (preserving shadowed ProxyCommand
 // fallback beneath a higher ProxyJump for associative cross-tier merging).
-func (p *OpenSSHParser) ResolveProxySetting(alias string) ssh.ProxySetting {
-	if p == nil || p.cfg == nil || strings.TrimSpace(alias) == "" {
-		return ssh.UnsetProxySetting()
-	}
-	return resolveOpenSSHProxySettingPasses(p.cfg, []string{alias})
+// Malformed ProxyJump/ProxyCommand directives return an error fail-closed.
+func (p *OpenSSHParser) ResolveProxySetting(alias string) (ssh.ProxySetting, error) {
+	return p.ResolveProxySettingWithCanonical(alias, "")
 }
 
 // ResolveProxySettingWithCanonical folds all matching ProxyJump and ProxyCommand
 // directives across Pass 1 (originalAlias) and Pass 2 (canonicalHost).
-func (p *OpenSSHParser) ResolveProxySettingWithCanonical(originalAlias, canonicalHost string) ssh.ProxySetting {
-	if p == nil || p.cfg == nil || strings.TrimSpace(originalAlias) == "" {
-		return ssh.UnsetProxySetting()
+// Malformed ProxyJump/ProxyCommand directives return an error fail-closed.
+func (p *OpenSSHParser) ResolveProxySettingWithCanonical(originalAlias, canonicalHost string) (ssh.ProxySetting, error) {
+	if p != nil && p.err != nil {
+		return ssh.UnsetProxySetting(), p.err
 	}
-	passes := []string{originalAlias}
+	if p == nil || p.cfg == nil || strings.TrimSpace(originalAlias) == "" {
+		return ssh.UnsetProxySetting(), nil
+	}
+	cleanAlias, ok := stripOpenSSHSelectorForLookup(originalAlias)
+	if !ok {
+		if hasOpenSSHPrefix(strings.TrimSpace(originalAlias)) {
+			return ssh.UnsetProxySetting(), fmt.Errorf("invalid openssh selector %q", originalAlias)
+		}
+		return ssh.UnsetProxySetting(), nil
+	}
+	lookupAlias, _, _, err := parseOpenSSHHostSpec(cleanAlias)
+	if err != nil || lookupAlias == "" {
+		lookupAlias = cleanAlias
+	}
+	passes := []string{lookupAlias}
 	cleanCanon := StripHostBrackets(canonicalHost)
-	if cleanCanon != "" && !strings.EqualFold(cleanCanon, originalAlias) {
+	if cleanCanon != "" && !strings.EqualFold(cleanCanon, lookupAlias) {
 		passes = append(passes, cleanCanon)
 	}
 	return resolveOpenSSHProxySettingPasses(p.cfg, passes)
@@ -921,7 +957,10 @@ func (p *OpenSSHParser) getVirtualNodeWithCanonical(
 		return models.Node{}, models.Host{}, models.Identity{}, expErr
 	}
 
-	proxySetting := resolveOpenSSHProxySettingPasses(p.cfg, passes)
+	proxySetting, proxyErr := resolveOpenSSHProxySettingPasses(p.cfg, passes)
+	if proxyErr != nil {
+		return models.Node{}, models.Host{}, models.Identity{}, proxyErr
+	}
 	proxyJump := ""
 	if targets, ok := proxySetting.JumpTargets(); ok {
 		proxyJump = parseOpenSSHProxyJump(strings.Join(targets, ","))
@@ -973,7 +1012,13 @@ func (p *OpenSSHParser) GetSSHOptionsWithCanonical(originalAlias, canonicalHost 
 	if p == nil || p.cfg == nil || originalAlias == "" {
 		return nil, nil
 	}
-	cleanAlias := strings.TrimPrefix(originalAlias, OpenSSHNodePrefix)
+	cleanAlias, ok := stripOpenSSHSelectorForLookup(originalAlias)
+	if !ok {
+		if hasOpenSSHPrefix(strings.TrimSpace(originalAlias)) {
+			return nil, fmt.Errorf("invalid openssh selector %q", originalAlias)
+		}
+		return nil, nil
+	}
 	lookupAlias, _, _, err := parseOpenSSHHostSpec(cleanAlias)
 	if err != nil {
 		lookupAlias = cleanAlias
@@ -1041,7 +1086,10 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 		}
 		return nil
 	}
-	val, skip := resolveOpenSSHSingleOptionPasses(doc, passes, spec)
+	val, skip, err := resolveOpenSSHSingleOptionPasses(doc, passes, spec)
+	if err != nil {
+		return err
+	}
 	if skip || val == "" {
 		return nil
 	}
@@ -1057,6 +1105,9 @@ func applyOpenSSHSpecOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.O
 			return fmt.Errorf("invalid %s %q for %q in ssh config: %w", spec.OpenSSHName, val, passes[0], err)
 		}
 		if parsed.IsNoOp {
+			if !parsed.AlgoPolicy.IsUnset() {
+				opts.SetAlgoPolicy(parsed.AlgoPolicy)
+			}
 			return nil
 		}
 		val = parsed.Normalized
@@ -1132,25 +1183,28 @@ func allMatchingOpenSSHOptionsPasses(doc *sshConfigDoc, passes []string, spec ss
 	return matches
 }
 
-func resolveOpenSSHSingleOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) (val string, skip bool) {
+func resolveOpenSSHSingleOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) (val string, skip bool, err error) {
 	if spec.CanonicalKey == ssh.OptionProxyCommand {
-		ps := resolveOpenSSHProxySettingPasses(doc, passes)
+		ps, pErr := resolveOpenSSHProxySettingPasses(doc, passes)
+		if pErr != nil {
+			return "", false, pErr
+		}
 		switch ps.Kind() {
 		case ssh.ProxyJump:
-			return "", true
+			return "", true, nil
 		case ssh.ProxyCommand:
 			cmd, _ := ps.Command()
-			return cmd, false
+			return cmd, false, nil
 		case ssh.ProxyDisabled:
 			if !ps.IsJumpDisabledOnly() {
-				return "none", false
+				return "none", false, nil
 			}
-			return "", false
+			return "", false, nil
 		default:
-			return "", false
+			return "", false, nil
 		}
 	}
-	return firstMatchingOpenSSHOptionPasses(doc, passes, spec), false
+	return firstMatchingOpenSSHOptionPasses(doc, passes, spec), false, nil
 }
 
 func firstMatchingOpenSSHOptionPasses(doc *sshConfigDoc, passes []string, spec ssh.OptionSpec) string {
@@ -1256,23 +1310,34 @@ func parseOpenSSHProxyJump(raw string) string {
 // resolveOpenSSHProxySettingPasses folds all matching ProxyJump and ProxyCommand
 // directives top-to-bottom into an associative typed ssh.ProxySetting, preserving
 // any shadowed ProxyCommand fallback beneath a higher-priority ProxyJump.
-func resolveOpenSSHProxySettingPasses(doc *sshConfigDoc, passes []string) ssh.ProxySetting {
+// Malformed ProxyJump/ProxyCommand directives fail closed with an error.
+func resolveOpenSSHProxySettingPasses(doc *sshConfigDoc, passes []string) (ssh.ProxySetting, error) {
 	if doc == nil || len(passes) == 0 {
-		return ssh.UnsetProxySetting()
+		return ssh.UnsetProxySetting(), nil
 	}
 	acc := ssh.UnsetProxySetting()
+	var parseErr error
 	walkMatchingSSHConfigDirectivesPasses(doc, passes, func(_ int, _ string, d *sshConfigDirective) bool {
 		switch d.lowerKey {
 		case "proxyjump":
-			if ps, err := ssh.ParseProxyJump(d.value); err == nil {
-				acc = acc.Merge(ps)
+			ps, err := ssh.ParseProxyJump(d.value)
+			if err != nil {
+				parseErr = fmt.Errorf("line %d: invalid ProxyJump %q for %q in ssh config: %w", d.line, d.value, passes[0], err)
+				return false
 			}
+			acc = acc.Merge(ps)
 		case "proxycommand":
-			if ps, err := ssh.ParseProxyCommand(d.rawValue); err == nil {
-				acc = acc.Merge(ps)
+			ps, err := ssh.ParseProxyCommand(d.rawValue)
+			if err != nil {
+				parseErr = fmt.Errorf("line %d: invalid ProxyCommand %q for %q in ssh config: %w", d.line, d.rawValue, passes[0], err)
+				return false
 			}
+			acc = acc.Merge(ps)
 		}
 		return true
 	})
-	return acc
+	if parseErr != nil {
+		return ssh.UnsetProxySetting(), parseErr
+	}
+	return acc, nil
 }

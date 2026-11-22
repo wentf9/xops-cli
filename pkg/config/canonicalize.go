@@ -95,15 +95,18 @@ func CanonicalizeHost(ctx context.Context, in CanonicalizeInput) (CanonicalizeRe
 	if !in.MatchedSavedNode && parser != nil && parser.Err() != nil {
 		return CanonicalizeResult{}, parser.Err()
 	}
-	if in.MatchedSavedNode || isIPOrLocalhost(orig) {
+	if in.MatchedSavedNode {
+		return res, nil
+	}
+	policy, err := resolveCanonicalizePolicy(parser, canonicalProviderTier3Options(in.Provider), orig, in.RawCLIOptions, in.CLIProxyJump)
+	if err != nil {
+		return CanonicalizeResult{}, err
+	}
+	if isIPOrLocalhost(orig) {
 		return res, nil
 	}
 	probeTarget := resolveCanonicalEffectiveInputHost(parser, in.RawCLIOptions, orig)
-	if isIPOrLocalhost(probeTarget) {
-		return res, nil
-	}
-	policy := resolveCanonicalizePolicy(parser, canonicalProviderTier3Options(in.Provider), orig, in.RawCLIOptions, in.CLIProxyJump)
-	if !shouldCanonicalize(probeTarget, policy) {
+	if isIPOrLocalhost(probeTarget) || !shouldCanonicalize(probeTarget, policy) {
 		return res, nil
 	}
 
@@ -148,8 +151,8 @@ func CanonicalDomainCandidatesWithOptions(provider ConfigProvider, host string, 
 	if isIPOrLocalhost(probeTarget) || strings.HasSuffix(probeTarget, ".") {
 		return nil
 	}
-	policy := resolveCanonicalizePolicy(parser, canonicalProviderTier3Options(provider), orig, rawCLIOptions, cliProxyJump)
-	if !shouldProbeCanonicalDomains(probeTarget, policy) {
+	policy, err := resolveCanonicalizePolicy(parser, canonicalProviderTier3Options(provider), orig, rawCLIOptions, cliProxyJump)
+	if err != nil || !shouldProbeCanonicalDomains(probeTarget, policy) {
 		return nil
 	}
 	out := make([]string, 0, len(policy.domains))
@@ -194,10 +197,14 @@ func executeCanonicalizeProbe(
 		if ok {
 			res.CanonicalHost = chosen
 			res.Canonicalized = !strings.EqualFold(chosen, res.OriginalHost)
+			var optErr error
 			if res.Canonicalized {
-				res.Pass2Options = pass2OpenSSHOptionsWithCanonical(parser, res.OriginalHost, chosen)
+				res.Pass2Options, optErr = pass2OpenSSHOptionsWithCanonical(parser, res.OriginalHost, chosen)
 			} else {
-				res.Pass2Options = pass2OpenSSHOptions(parser, chosen)
+				res.Pass2Options, optErr = pass2OpenSSHOptions(parser, chosen)
+			}
+			if optErr != nil {
+				return CanonicalizeResult{}, optErr
 			}
 			return res, nil
 		}
@@ -235,7 +242,11 @@ func probeLocalCanonicalCNAME(
 		if !strings.EqualFold(chosen, probeTarget) {
 			res.CanonicalHost = chosen
 			res.Canonicalized = true
-			res.Pass2Options = pass2OpenSSHOptionsWithCanonical(parser, res.OriginalHost, chosen)
+			pass2Opts, optErr := pass2OpenSSHOptionsWithCanonical(parser, res.OriginalHost, chosen)
+			if optErr != nil {
+				return CanonicalizeResult{}, optErr
+			}
+			res.Pass2Options = pass2Opts
 		}
 	} else if parentCtx != nil && parentCtx.Err() != nil {
 		return CanonicalizeResult{}, parentCtx.Err()
@@ -310,34 +321,21 @@ func probeCanonicalDomains(parentCtx, probeCtx context.Context, resolver Canonic
 	return "", false, nil
 }
 
-func pass2OpenSSHOptionsWithCanonical(parser *OpenSSHParser, origAlias, canonicalHost string) *ssh.Options {
+func pass2OpenSSHOptionsWithCanonical(parser *OpenSSHParser, origAlias, canonicalHost string) (*ssh.Options, error) {
 	if parser == nil {
-		return nil
+		return nil, nil
 	}
-	var (
-		opts *ssh.Options
-		err  error
-	)
 	if strings.TrimSpace(origAlias) != "" {
-		opts, err = parser.GetSSHOptionsWithCanonical(origAlias, canonicalHost)
-	} else {
-		opts, err = parser.GetSSHOptions(canonicalHost)
+		return parser.GetSSHOptionsWithCanonical(origAlias, canonicalHost)
 	}
-	if err != nil {
-		return nil
-	}
-	return opts
+	return parser.GetSSHOptions(canonicalHost)
 }
 
-func pass2OpenSSHOptions(parser *OpenSSHParser, host string) *ssh.Options {
+func pass2OpenSSHOptions(parser *OpenSSHParser, host string) (*ssh.Options, error) {
 	if parser == nil {
-		return nil
+		return nil, nil
 	}
-	opts, err := parser.GetSSHOptions(host)
-	if err != nil {
-		return nil
-	}
-	return opts
+	return parser.GetSSHOptions(host)
 }
 
 func resolveCanonicalCNAME(parentCtx, probeCtx context.Context, resolver CanonicalResolver, host, lookupHost string, rules []cnameRule) (string, error) {
@@ -384,7 +382,7 @@ func isValidRFC1123CanonicalCNAME(name string) bool {
 	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") {
 		return false
 	}
-	if strings.HasPrefix(name, OpenSSHNodePrefix) {
+	if hasOpenSSHPrefix(name) {
 		return false
 	}
 	if isIPOrLocalhost(name) {
@@ -521,14 +519,18 @@ func parseCLICanonicalLayer(rawCLI []string, cliProxyJump string) (*ssh.Options,
 	return cliOpts, cliProxy
 }
 
-func resolveCanonicalizePolicy(parser *OpenSSHParser, tier3Opts *ssh.Options, host string, rawCLI []string, cliProxyJump string) canonicalizePolicy {
+func resolveCanonicalizePolicy(parser *OpenSSHParser, tier3Opts *ssh.Options, host string, rawCLI []string, cliProxyJump string) (canonicalizePolicy, error) {
 	var (
 		t4Opts  *ssh.Options
 		t4Proxy = ssh.UnsetProxySetting()
 	)
 	if parser != nil && parser.cfg != nil {
 		t4Opts = parseTier4CanonicalOptions(parser.cfg, host)
-		t4Proxy = parser.ResolveProxySetting(host)
+		var err error
+		t4Proxy, err = parser.ResolveProxySetting(host)
+		if err != nil {
+			return canonicalizePolicy{}, err
+		}
 	}
 	t3Proxy := ssh.UnsetProxySetting()
 	if tier3Opts != nil {
@@ -539,7 +541,7 @@ func resolveCanonicalizePolicy(parser *OpenSSHParser, tier3Opts *ssh.Options, ho
 	effOpts := ssh.MergeOptions(cliOpts, tier3Opts, t4Opts)
 	effProxy := cliProxy.Merge(t3Proxy).Merge(t4Proxy)
 
-	return canonicalizePolicyFromEffective(effOpts, effProxy)
+	return canonicalizePolicyFromEffective(effOpts, effProxy), nil
 }
 
 func canonicalizePolicyFromEffective(effOpts *ssh.Options, effProxy ssh.ProxySetting) canonicalizePolicy {

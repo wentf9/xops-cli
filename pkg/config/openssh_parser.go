@@ -7,7 +7,9 @@ import (
 	"io"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -374,6 +376,9 @@ func parseOpenSSHHostBlock(lineNum int, rest string) (*sshConfigBlock, error) {
 	}
 	patterns := make([]sshHostPattern, 0, len(rawPatterns))
 	for _, raw := range rawPatterns {
+		if raw == "" {
+			return nil, fmt.Errorf("line %d: Host directive contains empty pattern", lineNum)
+		}
 		patterns = append(patterns, newSSHHostPattern(raw))
 	}
 	return &sshConfigBlock{patterns: patterns}, nil
@@ -436,10 +441,26 @@ func parseOpenSSHMatchBlock(lineNum int, rest string) (*sshConfigBlock, error) {
 	return &sshConfigBlock{isMatch: true, patterns: patterns}, nil
 }
 
+func isEmptyQuotedWholeLine(trimmed string) bool {
+	if trimmed == "" {
+		return true
+	}
+	if len(trimmed) >= 2 && (trimmed[0] == '"' || trimmed[0] == '\'') && trimmed[len(trimmed)-1] == trimmed[0] {
+		return strings.TrimSpace(trimmed[1:len(trimmed)-1]) == ""
+	}
+	return false
+}
+
 func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigDirective, error) {
 	syntax, known := ssh.LookupDirectiveSyntax(lowerKey)
 	if known && syntax == ssh.OptionSyntaxWholeLineCommand {
 		trimmed := strings.TrimSpace(rest)
+		if trimmed == "" {
+			return nil, fmt.Errorf("line %d: missing argument for %s directive", lineNum, key)
+		}
+		if isEmptyQuotedWholeLine(trimmed) {
+			return nil, fmt.Errorf("line %d: empty argument for %s directive", lineNum, key)
+		}
 		return &sshConfigDirective{
 			line:     lineNum,
 			key:      key,
@@ -453,7 +474,19 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigD
 		return nil, fmt.Errorf("line %d: unterminated quote in %s directive", lineNum, key)
 	}
 	rawVal := strings.TrimSpace(argsPart)
+	toks, err := splitOpenSSHArgvTokens(argsPart)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: invalid %s directive: %w", lineNum, key, err)
+	}
+	if len(toks) == 0 {
+		return nil, fmt.Errorf("line %d: missing argument for %s directive", lineNum, key)
+	}
 	if known && syntax == ssh.OptionSyntaxRawTokenList {
+		for _, tok := range toks {
+			if strings.TrimSpace(tok) == "" {
+				return nil, fmt.Errorf("line %d: empty argument for %s directive", lineNum, key)
+			}
+		}
 		return &sshConfigDirective{
 			line:     lineNum,
 			key:      key,
@@ -462,13 +495,14 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigD
 			rawValue: rawVal,
 		}, nil
 	}
-	toks, err := splitOpenSSHArgvTokens(argsPart)
-	if err != nil {
-		return nil, fmt.Errorf("line %d: invalid %s directive: %w", lineNum, key, err)
-	}
 	if known {
 		switch syntax {
 		case ssh.OptionSyntaxMultiTokenList:
+			for _, tok := range toks {
+				if strings.TrimSpace(tok) == "" {
+					return nil, fmt.Errorf("line %d: empty argument for %s directive", lineNum, key)
+				}
+			}
 			return &sshConfigDirective{
 				line:     lineNum,
 				key:      key,
@@ -479,6 +513,9 @@ func parseOpenSSHDirective(lineNum int, key, lowerKey, rest string) (*sshConfigD
 		case ssh.OptionSyntaxStrictScalar:
 			if len(toks) > 1 {
 				return nil, fmt.Errorf("line %d: garbage at end of line in %s directive: %q", lineNum, key, rawVal)
+			}
+			if strings.TrimSpace(toks[0]) == "" {
+				return nil, fmt.Errorf("line %d: empty argument for %s directive", lineNum, key)
 			}
 		}
 	}
@@ -837,7 +874,31 @@ func openIncludedSSHConfigFile(match string, budget *includeLoadBudget) (*fsx.Re
 	return nil, false, fmt.Errorf("open included ssh config %q: %w", match, err)
 }
 
+func isOpenSSHNullDevicePath(rawPath string) bool {
+	return isOpenSSHNullDevicePathForOS(rawPath, runtime.GOOS)
+}
+
+func isOpenSSHNullDevicePathForOS(rawPath, goos string) bool {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return false
+	}
+	if goos == "windows" {
+		slash := strings.ReplaceAll(trimmed, `\`, "/")
+		if strings.EqualFold(slash, "//./nul") {
+			return true
+		}
+		cleaned := path.Clean(slash)
+		return strings.EqualFold(cleaned, "/dev/null") || strings.EqualFold(cleaned, "nul")
+	}
+	return path.Clean(trimmed) == "/dev/null"
+}
+
 func expandOpenSSHIncludePattern(pat string, system bool) (string, bool, error) {
+	return expandOpenSSHIncludePatternForOS(pat, system, runtime.GOOS)
+}
+
+func expandOpenSSHIncludePatternForOS(pat string, system bool, goos string) (string, bool, error) {
 	expanded, skip, err := expandIncludeTokens(pat, pat, system)
 	if err != nil || skip {
 		return "", skip, err
@@ -854,6 +915,9 @@ func expandOpenSSHIncludePattern(pat string, system bool) (string, bool, error) 
 		combined = resolved
 	}
 	if combined == "" {
+		return "", true, nil
+	}
+	if isOpenSSHNullDevicePathForOS(combined, goos) {
 		return "", true, nil
 	}
 	if filepath.IsAbs(combined) {
@@ -1029,15 +1093,12 @@ func firstSSHConfigKeyValueRawPasses(doc *sshConfigDoc, passes []string, preserv
 	walkMatchingSSHConfigDirectivesPasses(doc, passes, func(_ int, _ string, d *sshConfigDirective) bool {
 		for _, candidate := range keys {
 			if strings.EqualFold(d.key, candidate) {
-				v := d.value
 				if preserveRaw {
-					v = d.rawValue
+					found = d.rawValue
+				} else {
+					found = d.value
 				}
-				if v != "" {
-					found = v
-					return false
-				}
-				break
+				return false
 			}
 		}
 		return true

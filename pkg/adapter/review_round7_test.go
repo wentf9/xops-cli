@@ -275,10 +275,13 @@ func verifyRound7UnpersistedJumpPrecedence(t *testing.T, repo *config.Repository
 	// Pure unit check on resolveFourTierProxySetting as well.
 	t4Only, _ := ssh.NewOptions()
 	_ = t4Only.Set(ssh.OptionProxyCommand, "t4-shadow %h %p")
-	effProxy, _ := resolveFourTierProxySetting(false, SessionAuth{}, nil, config.ConnectionSnapshot{
+	effProxy, _, err := resolveFourTierProxySetting(false, SessionAuth{}, ssh.UnsetProxySetting(), nil, config.ConnectionSnapshot{
 		Node:       models.Node{ProxyJump: "openssh:bastion-t4"},
 		Provenance: config.ProvenanceOpenSSHDerived,
-	}, true, nil, nil, t4Only)
+	}, true, nil, nil, t4Only, ssh.UnsetProxySetting())
+	if err != nil {
+		t.Fatalf("resolveFourTierProxySetting: %v", err)
+	}
 	if effProxy.Kind() != ssh.ProxyJump {
 		t.Fatalf("unpersisted OpenSSH ProxyJump leaked T4 ProxyCommand: effProxy=%v", effProxy)
 	}

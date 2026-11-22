@@ -255,7 +255,7 @@ func TestRound7_P2_5_And_P3_5_CanonicalizeBooleansCaseNonLatchingAndParentCancel
 	prov := NewProviderWithOpenSSHParser(nil, parser)
 
 	// 1. CanonicalizeHostname=true + uppercase CanonicalDomains + invalid CLI directives must NOT latch.
-	pol := resolveCanonicalizePolicy(parser, nil, "web", []string{
+	pol, err := resolveCanonicalizePolicy(parser, nil, "web", []string{
 		"CanonicalizeHostname=bogus",
 		"CanonicalizeHostname=true",
 		"CanonicalDomains= . , .. ",
@@ -265,8 +265,8 @@ func TestRound7_P2_5_And_P3_5_CanonicalizeBooleansCaseNonLatchingAndParentCancel
 		"CanonicalizePermittedCNAMEs=malformed_no_colon",
 		"ConnectTimeout=notaduration",
 	}, "")
-	if pol.mode != "yes" || len(pol.domains) != 1 || pol.domains[0] != "corp.example.com" || pol.maxDots != 1 || !pol.fallbackLocal {
-		t.Fatalf("unexpected canonicalize policy after invalid/bool/case directives: %+v", pol)
+	if err != nil || pol.mode != "yes" || len(pol.domains) != 1 || pol.domains[0] != "corp.example.com" || pol.maxDots != 1 || !pol.fallbackLocal {
+		t.Fatalf("unexpected canonicalize policy after invalid/bool/case directives: (%+v, %v)", pol, err)
 	}
 
 	// 2. Parent context cancellation propagates even when CanonicalizeFallbackLocal=yes.

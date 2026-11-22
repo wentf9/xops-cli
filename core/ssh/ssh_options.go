@@ -892,13 +892,14 @@ var optionRegistry = []OptionSpec{
 		Normalize:    validateEscapeCharOption,
 	},
 	{
-		CanonicalKey: OptionProxyCommand,
-		OpenSSHName:  "ProxyCommand",
-		Class:        OptionClassLocalExec,
-		MergeMode:    OptionMergeFirstWins,
-		ConfigSyntax: OptionSyntaxWholeLineCommand,
-		Tier4Policy:  OptionTier4Inherit,
-		MuxPolicy:    OptionMuxAllowNoneOnly,
+		CanonicalKey:          OptionProxyCommand,
+		OpenSSHName:           "ProxyCommand",
+		Class:                 OptionClassLocalExec,
+		MergeMode:             OptionMergeFirstWins,
+		ConfigSyntax:          OptionSyntaxWholeLineCommand,
+		Tier4Policy:           OptionTier4Inherit,
+		StrictInOpenSSHConfig: true,
+		MuxPolicy:             OptionMuxAllowNoneOnly,
 		Normalize: func(raw string) (string, error) {
 			return validateLocalExecCommandOption("ProxyCommand", raw)
 		},
@@ -1603,7 +1604,9 @@ func normalizeAlgorithmSpec(name, raw string, defaults, supported []string) (str
 		if modifier != '-' && !slices.Contains(supported, algo) {
 			return "", fmt.Errorf("invalid %s %q: unsupported algorithm %q", name, raw, algo)
 		}
-		cleanAlgos = append(cleanAlgos, algo)
+		if !slices.Contains(cleanAlgos, algo) {
+			cleanAlgos = append(cleanAlgos, algo)
+		}
 	}
 	rebuilt := prefix + strings.Join(cleanAlgos, ",")
 	if _, err := ResolveAlgorithmList(rebuilt, defaults); err != nil {
@@ -1817,9 +1820,9 @@ func OptionsFromControl(ctrl *ControlConfig) *Options {
 	return opts
 }
 
-// IsEmpty reports whether no options are configured.
+// IsEmpty reports whether no options or typed algorithm policies are configured.
 func (o *Options) IsEmpty() bool {
-	return o == nil || len(o.values) == 0
+	return o == nil || (len(o.values) == 0 && len(o.algoPolicies) == 0)
 }
 
 // IsZero implements yaml.IsZeroer so empty non-nil Options are omitted with omitempty.
@@ -1881,6 +1884,14 @@ func (o *Options) Equal(other *Options) bool {
 			return false
 		}
 	}
+	if len(o.algoPolicies) != len(other.algoPolicies) {
+		return false
+	}
+	for k, p := range o.algoPolicies {
+		if !p.Equal(other.algoPolicies[k]) {
+			return false
+		}
+	}
 	return true
 }
 
@@ -1911,6 +1922,9 @@ func (o *Options) Set(key, rawValue string) error {
 
 func (o *Options) applyParsedOption(parsed ParsedOption) {
 	if parsed.IsNoOp {
+		if !parsed.AlgoPolicy.IsUnset() {
+			o.setAlgoPolicy(parsed.CanonicalKey, parsed.AlgoPolicy)
+		}
 		return
 	}
 	switch parsed.CanonicalKey {
@@ -1957,6 +1971,15 @@ func (o *Options) setAlgoPolicy(canonicalKey string, policy AlgoPolicy) {
 		o.algoPolicies = make(map[string]AlgoPolicy)
 	}
 	o.algoPolicies[canonicalKey] = policy.clone()
+	if policy.Op() == AlgoOpDefault {
+		if o.values != nil {
+			delete(o.values, canonicalKey)
+			if len(o.values) == 0 {
+				o.values = nil
+			}
+		}
+		return
+	}
 	if o.values == nil {
 		o.values = make(map[string]string)
 	}
@@ -1987,12 +2010,14 @@ func (o *Options) syncTypedFieldFromRaw(canonicalKey, val string) {
 	case OptionIdentityFile:
 		if pl, err := ParsePathList(val); err == nil {
 			o.identityFiles = pl
+			o.values[canonicalKey] = pl.String()
 		} else {
 			o.identityFiles = UnsetPathList()
 		}
 	case OptionCertificateFile:
 		if pl, err := ParsePathList(val); err == nil {
 			o.certificateFiles = pl
+			o.values[canonicalKey] = pl.String()
 		} else {
 			o.certificateFiles = UnsetPathList()
 		}
@@ -2002,12 +2027,18 @@ func (o *Options) syncTypedFieldFromRaw(canonicalKey, val string) {
 				o.algoPolicies = make(map[string]AlgoPolicy)
 			}
 			o.algoPolicies[canonicalKey] = policy
+			o.values[canonicalKey] = policy.String()
 		} else if o.algoPolicies != nil {
 			delete(o.algoPolicies, canonicalKey)
 		}
 	case OptionProxyCommand:
 		if ps, err := ParseProxyCommand(val); err == nil {
 			o.proxyCommand = ps
+			if cmd, ok := ps.Command(); ok {
+				o.values[OptionProxyCommand] = cmd
+			} else {
+				o.values[OptionProxyCommand] = "none"
+			}
 		} else {
 			o.proxyCommand = UnsetProxySetting()
 		}
@@ -2663,6 +2694,13 @@ func (o *Options) FilterByClasses(allowed ...OptionClass) *Options {
 			}
 		}
 	}
+	if slices.Contains(allowed, OptionClassTransport) {
+		for k, p := range o.algoPolicies {
+			if p.Op() == AlgoOpDefault {
+				res.setAlgoPolicy(k, p)
+			}
+		}
+	}
 	if res.IsEmpty() {
 		return nil
 	}
@@ -2677,6 +2715,11 @@ func (o *Options) StripClasses(classes ...OptionClass) {
 	for k := range o.values {
 		spec, ok := LookupOptionSpec(k)
 		if ok && slices.Contains(classes, spec.Class) {
+			o.Delete(k)
+		}
+	}
+	if slices.Contains(classes, OptionClassTransport) && len(o.algoPolicies) > 0 {
+		for k := range o.algoPolicies {
 			o.Delete(k)
 		}
 	}
@@ -2882,6 +2925,16 @@ func mergeOptionLayerValues(res, layer *Options) {
 				res.LiteralControlPath = layer.LiteralControlPath && !IsNoneValue(v)
 			}
 		}
+	}
+	for k, lp := range layer.algoPolicies {
+		if lp.IsUnset() {
+			continue
+		}
+		if _, inValues := layer.values[k]; inValues {
+			continue
+		}
+		cur, _ := res.AlgoPolicy(k)
+		res.setAlgoPolicy(k, cur.Merge(lp))
 	}
 }
 
@@ -3152,11 +3205,11 @@ func (o *Options) UnmarshalYAML(value *yaml.Node) error {
 		if err != nil {
 			return fmt.Errorf("%w: option %q: %w", ErrSSHOptionsValidation, rawKey, err)
 		}
-		normVal, err := spec.Normalize(rawVal)
+		parsedOpt, err := ParseOption(spec.CanonicalKey, rawVal, OptionSourceYAML)
 		if err != nil {
-			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+			return err
 		}
-		parsed.setRaw(spec.CanonicalKey, normVal)
+		parsed.applyParsedOption(parsedOpt)
 	}
 
 	if err := parsed.Validate(); err != nil {
@@ -3271,11 +3324,11 @@ func (o *Options) UnmarshalJSON(data []byte) error {
 		if err != nil {
 			return fmt.Errorf("%w: option %q: %w", ErrSSHOptionsValidation, rawKey, err)
 		}
-		normVal, err := spec.Normalize(rawVal)
+		parsedOpt, err := ParseOption(spec.CanonicalKey, rawVal, OptionSourceJSON)
 		if err != nil {
-			return fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+			return err
 		}
-		parsed.setRaw(spec.CanonicalKey, normVal)
+		parsed.applyParsedOption(parsedOpt)
 	}
 	if err := parsed.Validate(); err != nil {
 		return err

@@ -237,8 +237,8 @@ func TestRound5_P2_10_ProxyJumpCommaPreservesProxyCommand(t *testing.T) {
 	}
 	prov := config.NewProviderWithOpenSSHParser(nil, parser)
 
-	if ps := proxySettingFromJumpString(" , "); ps.Kind() == ssh.ProxyJump {
-		t.Fatalf("proxySettingFromJumpString(\" , \") = %v, must not be ProxyJump", ps)
+	if ps, err := proxySettingFromJumpString(" , "); err != nil || ps.Kind() == ssh.ProxyJump {
+		t.Fatalf("proxySettingFromJumpString(\" , \") = (%v, %v), must not be ProxyJump", ps, err)
 	}
 
 	adp := NewSSHAdapter(prov, WithLocalExecution(true), WithSessionAuthOverride(config.OpenSSHNodePrefix+"target-box", SessionAuth{

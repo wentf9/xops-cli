@@ -196,18 +196,6 @@ func parseTargetHostNameOption(raw string) (ParsedOption, error) {
 }
 
 func parseTargetProxyJumpOption(raw string) (ParsedOption, error) {
-	if hasControlOrLineSepChar(raw) {
-		return ParsedOption{}, fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ErrSSHOptionsValidation, raw)
-	}
-	if IsDisabledProxyJump(raw) {
-		return ParsedOption{
-			CanonicalKey:   OptionProxyJump,
-			OpenSSHName:    "ProxyJump",
-			Normalized:     "none",
-			IsTargetOption: true,
-			ProxySetting:   DisabledProxyJumpSetting(),
-		}, nil
-	}
 	ps, err := ParseProxyJump(raw)
 	if err != nil {
 		return ParsedOption{}, err
@@ -262,9 +250,12 @@ func parseControlPathOption(spec OptionSpec, raw string) (ParsedOption, error) {
 }
 
 func parseControlPersistOption(spec OptionSpec, raw string) (ParsedOption, error) {
+	if hasControlOrLineSepChar(raw) {
+		return ParsedOption{}, fmt.Errorf("%w: invalid ControlPersist %q: contains invalid control character", ErrSSHOptionsValidation, raw)
+	}
 	setting, err := ParsePersistSetting(raw)
 	if err != nil {
-		return ParsedOption{}, fmt.Errorf("%w: %w", ErrSSHOptionsValidation, err)
+		return ParsedOption{}, fmt.Errorf("%w: invalid ControlPersist %q: %w", ErrSSHOptionsValidation, raw, err)
 	}
 	if !setting.Explicit() {
 		return ParsedOption{}, fmt.Errorf("%w: invalid ControlPersist: value cannot be empty", ErrSSHOptionsValidation)
@@ -375,11 +366,15 @@ func parseOpenSSHAlgorithmOption(spec OptionSpec, raw, trimmed string) (ParsedOp
 	}
 	if len(kept) == 0 {
 		if prefix == "+" || prefix == "^" {
+			defPolicy, err := DefaultAlgoPolicy(spec.CanonicalKey)
+			if err != nil {
+				return ParsedOption{}, err
+			}
 			return ParsedOption{
 				CanonicalKey: spec.CanonicalKey,
 				OpenSSHName:  spec.OpenSSHName,
 				IsNoOp:       true,
-				AlgoPolicy:   UnsetAlgoPolicy(),
+				AlgoPolicy:   defPolicy,
 			}, nil
 		}
 		return ParsedOption{}, fmt.Errorf("%w: no supported %s in %q", ErrSSHOptionsValidation, spec.OpenSSHName, raw)

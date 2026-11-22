@@ -465,17 +465,17 @@ func TestRound3_P1_4_And_P3_6_CanonicalDomainCandidatesAndStrictTimeout(t *testi
 		{"1m30s", maxCanonicalProbeTimeout},
 		{"3600s", maxCanonicalProbeTimeout},
 	} {
-		pol := resolveCanonicalizePolicy(nil, nil, "app", []string{"ConnectTimeout=" + tc.in}, "")
-		if pol.timeout != tc.want {
-			t.Fatalf("resolveCanonicalizePolicy(ConnectTimeout=%q).timeout = %v, want %v", tc.in, pol.timeout, tc.want)
+		pol, err := resolveCanonicalizePolicy(nil, nil, "app", []string{"ConnectTimeout=" + tc.in}, "")
+		if err != nil || pol.timeout != tc.want {
+			t.Fatalf("resolveCanonicalizePolicy(ConnectTimeout=%q).timeout = (%v, %v), want %v", tc.in, pol.timeout, err, tc.want)
 		}
 	}
 
 	t3Base := ssh.MustOptions(ssh.OptionConnectTimeout, "2")
 	for _, invalid := range []string{"00", "0m", "+2", "-2", "1.5s", "500ms", "10bad", "99999999999999999999s", "99999999999999999999bad"} {
-		pol := resolveCanonicalizePolicy(nil, t3Base, "app", []string{"ConnectTimeout=" + invalid}, "")
-		if pol.timeout != 2*time.Second {
-			t.Fatalf("resolveCanonicalizePolicy(ConnectTimeout=%q) mutated timeout to %v, want unchanged 2s", invalid, pol.timeout)
+		pol, err := resolveCanonicalizePolicy(nil, t3Base, "app", []string{"ConnectTimeout=" + invalid}, "")
+		if err != nil || pol.timeout != 2*time.Second {
+			t.Fatalf("resolveCanonicalizePolicy(ConnectTimeout=%q) mutated timeout to (%v, %v), want unchanged 2s", invalid, pol.timeout, err)
 		}
 	}
 
