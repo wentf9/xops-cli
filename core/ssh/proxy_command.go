@@ -182,8 +182,10 @@ func resolveLocalExecOriginalHost(explicitOriginalHost, nodeID, fallbackName, fa
 		return strings.TrimSpace(fallbackAddr), nil
 	}
 
+	const openSSHPrefix = "openssh:"
 	candidate := rawID
-	if after, ok := strings.CutPrefix(candidate, "openssh:"); ok {
+	if len(candidate) >= len(openSSHPrefix) && strings.EqualFold(candidate[:len(openSSHPrefix)], openSSHPrefix) {
+		after := candidate[len(openSSHPrefix):]
 		if after == "" {
 			return "", fmt.Errorf("%w: empty host in node identifier %q", ErrUnsafeExecToken, rawID)
 		}

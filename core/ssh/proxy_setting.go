@@ -133,12 +133,17 @@ func ParseProxyJump(raw string) (ProxySetting, error) {
 		return ProxySetting{}, fmt.Errorf("%w: invalid ProxyJump: value cannot be empty", ErrSSHOptionsValidation)
 	}
 	parts := strings.Split(trimmed, ",")
+	allNone := true
 	for _, part := range parts {
-		if strings.TrimSpace(part) == "" {
+		tok := strings.TrimSpace(part)
+		if tok == "" {
 			return ProxySetting{}, fmt.Errorf("%w: invalid ProxyJump %q: empty target", ErrSSHOptionsValidation, raw)
 		}
+		if !IsNoneValue(tok) {
+			allNone = false
+		}
 	}
-	if IsDisabledProxyJump(trimmed) {
+	if allNone {
 		return DisabledProxyJumpSetting(), nil
 	}
 	return NewProxyJump(parts...)

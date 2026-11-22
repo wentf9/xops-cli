@@ -117,14 +117,20 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	draft.Hosts.Set(draftNode.HostRef, hostObj)
 	draft.Identities.Set(draftNode.IdentityRef, identity)
 	draft.Nodes.Set(name, draftNode)
-	if ssh.HasActiveProxyJump(flags.jump) {
-		resolvedJump, jErr := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), flags.jump)
-		if jErr != nil {
-			return fmt.Errorf("resolve jump host for node %q: %w", name, jErr)
+	if strings.TrimSpace(flags.jump) != "" {
+		ps, pErr := ssh.ParseProxyJump(flags.jump)
+		if pErr != nil {
+			return fmt.Errorf("invalid jump host for node %q: %w", name, pErr)
 		}
-		node.ProxyJump = resolvedJump
-		draftNode.ProxyJump = resolvedJump
-		draft.Nodes.Set(name, draftNode)
+		if ps.Kind() == ssh.ProxyJump {
+			resolvedJump, jErr := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), flags.jump)
+			if jErr != nil {
+				return fmt.Errorf("resolve jump host for node %q: %w", name, jErr)
+			}
+			node.ProxyJump = resolvedJump
+			draftNode.ProxyJump = resolvedJump
+			draft.Nodes.Set(name, draftNode)
+		}
 	}
 	if err := config.ValidateGraph(draft); err != nil {
 		return fmt.Errorf("validate node %q failed: %w", name, err)

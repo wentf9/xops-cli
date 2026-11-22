@@ -884,20 +884,30 @@ func normalizeTargetJump(provider ConfigProvider, baseJump string, target Connec
 	jump := strings.TrimSpace(baseJump)
 	if target.HasProxyJump {
 		jump = strings.TrimSpace(target.ProxyJump)
-		if !ssh.HasActiveProxyJump(jump) {
+		if jump == "" {
+			return ""
+		}
+		ps, err := ssh.ParseProxyJump(jump)
+		if err != nil || ps.Kind() != ssh.ProxyJump {
 			return ""
 		}
 		if provider != nil {
 			if resolvedJump, jErr := provider.ResolveProxyJumpChain(jump); jErr == nil {
-				jump = resolvedJump
+				return resolvedJump
 			}
 		}
-		return jump
+		targets, _ := ps.JumpTargets()
+		return strings.Join(targets, ",")
 	}
-	if !ssh.HasActiveProxyJump(jump) {
+	if jump == "" {
 		return ""
 	}
-	return jump
+	ps, err := ssh.ParseProxyJump(jump)
+	if err != nil || ps.Kind() != ssh.ProxyJump {
+		return ""
+	}
+	targets, _ := ps.JumpTargets()
+	return strings.Join(targets, ",")
 }
 
 func (r *Repository) buildCreatedResolvedTargetWithUserPort(
@@ -927,8 +937,10 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 			jump = ""
 		}
 	}
-	if !ssh.HasActiveProxyJump(jump) {
-		jump = ""
+	if jump != "" {
+		if ps, pErr := ssh.ParseProxyJump(jump); pErr != nil || ps.Kind() != ssh.ProxyJump {
+			jump = ""
+		}
 	}
 	openSSHAlias := canonicalInfo.OpenSSHAlias
 	canonHost := canonicalInfo.CanonicalHost
@@ -1929,11 +1941,7 @@ func (r *Repository) resolveJumpForNode(
 	port uint16,
 ) (string, error) {
 	if opts.Target.HasProxyJump {
-		finalJump := ssh.NormalizeProxyJump(opts.Target.ProxyJump)
-		if finalJump != "" {
-			return r.resolveProxyJumpChain(cfg, finalJump)
-		}
-		return "", nil
+		return r.resolveProxyJumpChain(cfg, opts.Target.ProxyJump)
 	}
 
 	targetPort := normalizedHostPort(port)
@@ -2030,16 +2038,22 @@ func (r *Repository) resolveProxyJumpChain(cfg *Configuration, jumpChain string)
 
 // ResolveProxyJumpChainWithConfig validates and normalizes a comma-separated jump host chain.
 func ResolveProxyJumpChainWithConfig(cfg *Configuration, openSSH *OpenSSHParser, jumpChain string) (string, error) {
-	if !ssh.HasActiveProxyJump(jumpChain) {
+	if hasControlOrLineSepChar(jumpChain) {
+		return "", fmt.Errorf("%w: invalid proxy_jump %q: contains control character", ssh.ErrSSHOptionsValidation, jumpChain)
+	}
+	if strings.TrimSpace(jumpChain) == "" {
 		return "", nil
 	}
-	rawHops := strings.Split(strings.TrimSpace(jumpChain), ",")
-	resolvedHops := make([]string, 0, len(rawHops))
-	for _, rawHop := range rawHops {
-		hop := strings.TrimSpace(rawHop)
-		if hop == "" || strings.EqualFold(hop, "none") {
-			continue
-		}
+	ps, err := ssh.ParseProxyJump(jumpChain)
+	if err != nil {
+		return "", err
+	}
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return "", nil
+	}
+	resolvedHops := make([]string, 0, len(targets))
+	for _, hop := range targets {
 		resolved, err := resolveSingleJumpHopWithConfig(cfg, openSSH, hop)
 		if err != nil {
 			return "", err

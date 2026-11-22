@@ -454,7 +454,7 @@ func checkTargetDigestCompatibility(cur ConnectionConfig, newCfg *ClientConfig) 
 		actual.ProxyJump = expected.ProxyJump
 	}
 
-	if HasActiveProxyJump(expected.ProxyJump) {
+	if expected.ProxyJump != "" {
 		stripProxyCommandForDigestMatch(expected)
 		stripProxyCommandForDigestMatch(actual)
 	}

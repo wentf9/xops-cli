@@ -96,10 +96,24 @@ func validateProxyJumpGraph(cfg *Configuration, lookup map[string][]string, alia
 	adj := make(map[string][]string, len(nodeIDs))
 	for _, nodeID := range nodeIDs {
 		node, ok := cfg.Nodes.Get(nodeID)
-		if !ok || !ssh.HasActiveProxyJump(node.ProxyJump) {
+		if !ok {
 			continue
 		}
-		edges, err := validateNodeProxyJumpHops(cfg, lookup, aliases, nodeID, node)
+		if hasControlOrLineSepChar(node.ProxyJump) {
+			return fmt.Errorf("%w: node %q proxy_jump %q invalid: contains control character", ErrSchemaValidation, nodeID, node.ProxyJump)
+		}
+		if strings.TrimSpace(node.ProxyJump) == "" {
+			continue
+		}
+		ps, err := ssh.ParseProxyJump(node.ProxyJump)
+		if err != nil {
+			return fmt.Errorf("%w: node %q proxy_jump %q invalid: %w", ErrSchemaValidation, nodeID, node.ProxyJump, err)
+		}
+		targets, ok := ps.JumpTargets()
+		if !ok {
+			continue
+		}
+		edges, err := validateNodeProxyJumpHops(cfg, lookup, aliases, nodeID, node, targets)
 		if err != nil {
 			return err
 		}
@@ -114,13 +128,10 @@ func validateNodeProxyJumpHops(
 	aliases map[string]string,
 	nodeID string,
 	node models.Node,
+	hops []string,
 ) ([]string, error) {
 	var edges []string
-	for rawHop := range strings.SplitSeq(strings.TrimSpace(node.ProxyJump), ",") {
-		hop := strings.TrimSpace(rawHop)
-		if hop == "" || strings.EqualFold(hop, "none") {
-			continue
-		}
+	for _, hop := range hops {
 		ref, err := ParseTargetRef(hop)
 		if err != nil {
 			return nil, fmt.Errorf("%w: node %q proxy_jump hop %q invalid: %w", ErrSchemaValidation, nodeID, hop, err)

@@ -573,7 +573,13 @@ func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer
 	if master == nil {
 		return true
 	}
-	hasActiveCLIJump := ssh.HasActiveProxyJump(o.JumpHost)
+	var cliJumpTargets []string
+	if strings.TrimSpace(o.JumpHost) != "" {
+		if ps, err := ssh.ParseProxyJump(o.JumpHost); err == nil {
+			cliJumpTargets, _ = ps.JumpTargets()
+		}
+	}
+	hasActiveCLIJump := len(cliJumpTargets) > 0
 	if hasActiveCLIJump && master.Target().JumpHost == "" {
 		return false
 	}
@@ -586,7 +592,7 @@ func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer
 	if o.User != "" && master.Target().User != "" && o.User != master.Target().User {
 		return false
 	}
-	if hasActiveCLIJump && isMasterInJumpSpec(nodeID, master, o.JumpHost) {
+	if hasActiveCLIJump && isMasterInJumpTargets(nodeID, master, cliJumpTargets) {
 		return false
 	}
 	if o.Host != "" || o.Target.Selector != "" {
@@ -595,12 +601,8 @@ func (o *SshOptions) shouldPassIdentityFile(nodeID string, master *ssh.MuxServer
 	return true
 }
 
-func isMasterInJumpSpec(nodeID string, master *ssh.MuxServer, jumpSpec string) bool {
-	for hop := range strings.SplitSeq(jumpSpec, ",") {
-		hop = strings.TrimSpace(hop)
-		if hop == "" || ssh.IsDisabledProxyJump(hop) {
-			continue
-		}
+func isMasterInJumpTargets(nodeID string, master *ssh.MuxServer, targets []string) bool {
+	for _, hop := range targets {
 		if matchesTargetSelector(nodeID, master, hop, hop) {
 			return true
 		}
@@ -722,9 +724,9 @@ func extractMuxDaemonTargetComponents(provider config.ConfigProvider, rawSelecto
 			return rawSelector, "", 0, true
 		}
 	}
-	if strings.HasPrefix(rawSelector, config.OpenSSHNodePrefix) {
+	if config.IsOpenSSHNodeID(rawSelector) {
 		host = config.UnwrapOpenSSHSelector(rawSelector)
-		if u, _, p, err := utils.ParseAddr(strings.TrimPrefix(rawSelector, config.OpenSSHNodePrefix)); err == nil {
+		if u, _, p, err := utils.ParseAddr(rawSelector[len(config.OpenSSHNodePrefix):]); err == nil {
 			parsedUser = u
 			parsedPort = int(p)
 		}

@@ -35,7 +35,7 @@ func NewAddrEndpoint(addr netip.Addr, port uint16) (Endpoint, error) {
 	if !addr.IsValid() {
 		return Endpoint{}, fmt.Errorf("%w: invalid IP address", ErrInvalidEndpoint)
 	}
-	if err := validateIPv6Zone(addr.Zone()); err != nil {
+	if err := ValidateIPv6Zone(addr.Zone()); err != nil {
 		return Endpoint{}, err
 	}
 	if port == 0 {
@@ -271,7 +271,11 @@ func parseStrictEndpointPort(raw string) (int, error) {
 	return p, nil
 }
 
-func validateIPv6Zone(zone string) error {
+// ValidateIPv6Zone validates an IPv6 link-local zone identifier (the portion
+// after '%' in an IPv6 literal) as the single authority shared across Endpoint
+// and config TargetRef parsing. Control/whitespace/line-separator characters
+// and structural delimiters ('[', ']', ':', '%', '/', '\', '@', ',') are rejected.
+func ValidateIPv6Zone(zone string) error {
 	if zone == "" {
 		return nil
 	}
@@ -280,7 +284,7 @@ func validateIPv6Zone(zone string) error {
 			return fmt.Errorf("%w: invalid IPv6 zone %q", ErrInvalidEndpoint, zone)
 		}
 		switch r {
-		case '[', ']', ':', '%', '/', '\\':
+		case '[', ']', ':', '%', '/', '\\', '@', ',':
 			return fmt.Errorf("%w: invalid character %q in IPv6 zone %q", ErrInvalidEndpoint, r, zone)
 		}
 	}

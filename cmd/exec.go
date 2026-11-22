@@ -1351,8 +1351,8 @@ func isResolvedSavedNode(r config.ResolvedTarget) bool {
 	if strings.TrimSpace(r.Host) == "" {
 		return false
 	}
-	return (r.MatchedNodeID != "" && !strings.HasPrefix(r.MatchedNodeID, config.OpenSSHNodePrefix)) ||
-		(r.BaseNodeID != "" && !strings.HasPrefix(r.BaseNodeID, config.OpenSSHNodePrefix))
+	return (r.MatchedNodeID != "" && !config.IsOpenSSHNodeID(r.MatchedNodeID)) ||
+		(r.BaseNodeID != "" && !config.IsOpenSSHNodeID(r.BaseNodeID))
 }
 
 func resolveTargetOriginalAndExpandHosts(canonicalized bool, canonOriginalHost, selector string, resolved config.ResolvedTarget, hasResolved bool) (originalHost, expandHost string) {
@@ -1386,7 +1386,7 @@ func (o *ExecOptions) resolveExecHostTargetWithHint(ctx context.Context, reposit
 		hasResolved = true
 		matchedSavedNode = matchedSavedNode || isResolvedSavedNode(r)
 	}
-	if target.Selector != "" && !strings.HasPrefix(target.Selector, config.OpenSSHNodePrefix) {
+	if target.Selector != "" && !config.IsOpenSSHNodeID(target.Selector) {
 		canonRes, cErr := config.CanonicalizeHost(ctx, config.CanonicalizeInput{
 			Provider:         repository,
 			Host:             target.Selector,

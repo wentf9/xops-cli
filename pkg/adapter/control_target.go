@@ -203,8 +203,10 @@ func proxyCommandOverridesControlJump(
 	hasResolved bool,
 	resolved config.ResolvedTarget,
 ) bool {
-	if ssh.HasActiveProxyJump(connTarget.ProxyJump) {
-		return false
+	if strings.TrimSpace(connTarget.ProxyJump) != "" {
+		if ps, err := ssh.ParseProxyJump(connTarget.ProxyJump); err == nil && ps.Kind() == ssh.ProxyJump {
+			return false
+		}
 	}
 	if req.SessionControl.Options != nil {
 		t1Proxy := req.SessionControl.Options.ProxyCommandSetting()

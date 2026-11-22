@@ -237,19 +237,27 @@ func TestRound5_P2_10_ProxyJumpCommaPreservesProxyCommand(t *testing.T) {
 	}
 	prov := config.NewProviderWithOpenSSHParser(nil, parser)
 
-	if ps, err := proxySettingFromJumpString(" , "); err != nil || ps.Kind() == ssh.ProxyJump {
-		t.Fatalf("proxySettingFromJumpString(\" , \") = (%v, %v), must not be ProxyJump", ps, err)
+	// D5-H1: Malformed comma-only ProxyJump=" , " must fail closed rather than silently disabling ProxyJump.
+	if ps, err := proxySettingFromJumpString(" , "); !errors.Is(err, ssh.ErrSSHOptionsValidation) {
+		t.Fatalf("proxySettingFromJumpString(\" , \") = (%v, %v), want ErrSSHOptionsValidation", ps, err)
+	}
+	adpMalformed := NewSSHAdapter(prov, WithLocalExecution(true), WithSessionAuthOverride(config.OpenSSHNodePrefix+"target-box", SessionAuth{
+		ProxyJump: " , ",
+	}))
+	if _, err := adpMalformed.GetConfig(config.OpenSSHNodePrefix + "target-box"); !errors.Is(err, ssh.ErrSSHOptionsValidation) {
+		t.Fatalf("GetConfig(ProxyJump=\" , \") = %v, want ErrSSHOptionsValidation", err)
 	}
 
+	// Valid ProxyJump="none,none" explicitly disables ProxyJump and preserves lower ProxyCommand.
 	adp := NewSSHAdapter(prov, WithLocalExecution(true), WithSessionAuthOverride(config.OpenSSHNodePrefix+"target-box", SessionAuth{
-		ProxyJump: " , ",
+		ProxyJump: "none,none",
 	}))
 	cfg, err := adp.GetConfig(config.OpenSSHNodePrefix + "target-box")
 	if err != nil {
 		t.Fatalf("GetConfig failed: %v", err)
 	}
 	if got := cfg.Options.ActiveProxyCommand(); got != "nc %h %p" {
-		t.Fatalf("ProxyJump=\" , \" masked ProxyCommand: got %q, want \"nc %%h %%p\"", got)
+		t.Fatalf("ProxyJump=\"none,none\" masked ProxyCommand: got %q, want \"nc %%h %%p\"", got)
 	}
 }
 

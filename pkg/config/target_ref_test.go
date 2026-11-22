@@ -201,6 +201,12 @@ func FuzzTargetRefParse(f *testing.F) {
 		"[invalid]",
 		"host:0",
 		"a:b:c",
+		"[::%[]",
+		"[::%]]",
+		"[::%@]",
+		"[::%,]",
+		"[::%:]",
+		"::%[",
 	}
 	for _, s := range seeds {
 		f.Add(s)

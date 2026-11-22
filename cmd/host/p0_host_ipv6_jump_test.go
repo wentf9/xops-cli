@@ -286,4 +286,26 @@ func TestP0_HostEdit_ProxyJumpValidationAndCycles(t *testing.T) {
 	if n, _ := cfg.Nodes.Get("ops@10.0.0.10:22"); n.ProxyJump != "" {
 		t.Fatalf("app-a ProxyJump after --jump '' = %q, want empty", n.ProxyJump)
 	}
+
+	// 6. Malformed --jump chains must fail closed on edit (never silently clear/disable ProxyJump).
+	verifyHostEditRejectsMalformedProxyJump(t, runHostEditCLI, store)
+}
+
+func verifyHostEditRejectsMalformedProxyJump(t *testing.T, runHostEditCLI func(args ...string) error, store config.Store) {
+	t.Helper()
+	if err := runHostEditCLI("app-a", "--jump", "bastion"); err != nil {
+		t.Fatalf("host edit app-a --jump bastion failed: %v", err)
+	}
+	for _, badJump := range []string{",", " , ", "none,", "bastion,", "bastion,none", "a,,b"} {
+		if err := runHostEditCLI("app-a", "--jump", badJump); err == nil {
+			t.Errorf("host edit app-a --jump %q succeeded, want fail-closed error", badJump)
+		}
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("store.Load after rejected malformed jumps: %v", err)
+	}
+	if n, _ := cfg.Nodes.Get("ops@10.0.0.10:22"); n.ProxyJump != "jump@10.0.0.1:22" {
+		t.Fatalf("app-a ProxyJump was mutated by malformed --jump: got %q, want %q", n.ProxyJump, "jump@10.0.0.1:22")
+	}
 }

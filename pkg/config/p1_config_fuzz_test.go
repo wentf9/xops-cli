@@ -47,6 +47,12 @@ func FuzzTargetRefRoundTrip(f *testing.F) {
 		"a:b:c",
 		"web\n",
 		"web\u2028",
+		"[::%[]",
+		"[::%]]",
+		"[::%@]",
+		"[::%,]",
+		"[::%:]",
+		"::%[",
 	}
 	for _, s := range seeds {
 		f.Add(s)

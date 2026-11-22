@@ -484,25 +484,38 @@ func parseTier4CanonicalOptions(doc *sshConfigDoc, host string) *ssh.Options {
 	return opts
 }
 
-func parseCLICanonicalLayer(rawCLI []string, cliProxyJump string) (*ssh.Options, ssh.ProxySetting) {
+func parseCLICanonicalLayer(rawCLI []string, cliProxyJump string) (*ssh.Options, ssh.ProxySetting, error) {
 	cliOpts := &ssh.Options{}
 	cliProxy := ssh.UnsetProxySetting()
+	if hasControlOrLineSepChar(cliProxyJump) {
+		return nil, ssh.UnsetProxySetting(), fmt.Errorf("%w: invalid ProxyJump %q: contains control character", ssh.ErrSSHOptionsValidation, cliProxyJump)
+	}
 	if pj := strings.TrimSpace(cliProxyJump); pj != "" {
-		if parsed, err := ssh.ParseOption(ssh.OptionProxyJump, pj, ssh.OptionSourceCLI); err == nil {
-			cliProxy = cliProxy.Merge(parsed.ProxySetting)
+		ps, err := ssh.ParseProxyJump(pj)
+		if err != nil {
+			return nil, ssh.UnsetProxySetting(), fmt.Errorf("invalid ProxyJump %q: %w", cliProxyJump, err)
 		}
+		cliProxy = cliProxy.Merge(ps)
 	}
 	seen := make(map[string]bool, len(canonicalOptionKeys))
 	for _, raw := range rawCLI {
 		key, val, err := ssh.SplitOptionKeyValue(raw)
-		if err != nil || key == "" {
+		if err != nil {
+			if isRawProxyOptionDirective(raw) {
+				return nil, ssh.UnsetProxySetting(), err
+			}
+			continue
+		}
+		if key == "" {
 			continue
 		}
 		canonical := ssh.CanonicalOptionKey(key)
 		if canonical == ssh.OptionProxyJump || canonical == ssh.OptionProxyCommand {
-			if parsed, pErr := ssh.ParseOption(canonical, val, ssh.OptionSourceCLI); pErr == nil {
-				cliProxy = cliProxy.Merge(parsed.ProxySetting)
+			parsed, pErr := ssh.ParseOption(canonical, val, ssh.OptionSourceCLI)
+			if pErr != nil {
+				return nil, ssh.UnsetProxySetting(), pErr
 			}
+			cliProxy = cliProxy.Merge(parsed.ProxySetting)
 			continue
 		}
 		if !isCanonicalOptionKey(canonical) || seen[canonical] {
@@ -516,7 +529,16 @@ func parseCLICanonicalLayer(rawCLI []string, cliProxyJump string) (*ssh.Options,
 	if cliOpts.IsEmpty() {
 		cliOpts = nil
 	}
-	return cliOpts, cliProxy
+	return cliOpts, cliProxy, nil
+}
+
+func isRawProxyOptionDirective(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if idx := strings.IndexAny(trimmed, "= \t"); idx > 0 {
+		canonical := ssh.CanonicalOptionKey(trimmed[:idx])
+		return canonical == ssh.OptionProxyJump || canonical == ssh.OptionProxyCommand
+	}
+	return false
 }
 
 func resolveCanonicalizePolicy(parser *OpenSSHParser, tier3Opts *ssh.Options, host string, rawCLI []string, cliProxyJump string) (canonicalizePolicy, error) {
@@ -536,7 +558,10 @@ func resolveCanonicalizePolicy(parser *OpenSSHParser, tier3Opts *ssh.Options, ho
 	if tier3Opts != nil {
 		t3Proxy = tier3Opts.ProxyCommandSetting()
 	}
-	cliOpts, cliProxy := parseCLICanonicalLayer(rawCLI, cliProxyJump)
+	cliOpts, cliProxy, err := parseCLICanonicalLayer(rawCLI, cliProxyJump)
+	if err != nil {
+		return canonicalizePolicy{}, err
+	}
 
 	effOpts := ssh.MergeOptions(cliOpts, tier3Opts, t4Opts)
 	effProxy := cliProxy.Merge(t3Proxy).Merge(t4Proxy)

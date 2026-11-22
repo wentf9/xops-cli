@@ -126,8 +126,8 @@ func (f *SSHControlFlags) ToSessionControlOptions() (adapter.SessionControlOptio
 func (f *SSHControlFlags) ToSessionControlOptionsWithJump(cliJump string) (adapter.SessionControlOptions, error) {
 	var sessionOpts adapter.SessionControlOptions
 
-	// 1. Parse -o options first if provided
-	if len(f.Options) > 0 {
+	// 1. Parse -o options and explicit CLI -J / --jump override if provided
+	if len(f.Options) > 0 || strings.TrimSpace(cliJump) != "" {
 		parsed, err := adapter.ParseSessionOptions(f.Options, cliJump)
 		if err != nil {
 			return sessionOpts, err

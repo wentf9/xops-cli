@@ -121,7 +121,13 @@ func normalizeImportedSSHOptions(opts *ssh.Options) *ssh.Options {
 	// Only import mux and transport options into persisted node configurations;
 	// never persist trust or auth-policy options from ~/.ssh/config into nodes.
 	cloned := opts.FilterByClasses(ssh.OptionClassMux, ssh.OptionClassTransport)
-	if cloned == nil || cloned.IsEmpty() {
+	if cloned == nil {
+		return nil
+	}
+	// Drop unpersisted AlgoOpDefault markers so in-memory imported Tier-2 nodes
+	// never shadow Tier-3 globals and always match YAML reload identically.
+	cloned.DropDefaultAlgoPolicies()
+	if cloned.IsEmpty() {
 		return nil
 	}
 	pathSetting, pathErr := cloned.ControlPathSetting()

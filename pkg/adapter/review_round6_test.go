@@ -106,11 +106,18 @@ func TestRound6_P2_6_ProxyJumpCommaConsistencyBetweenControlAndGetConfig(t *test
 	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
 	cfg.Hosts.Set("h1", models.Host{Address: "10.61.0.1", Port: 22})
 	cfg.Hosts.Set("h2", models.Host{Address: "10.61.0.2", Port: 22})
+	cfg.Hosts.Set("h3", models.Host{Address: "10.61.0.3", Port: 22})
 	cfg.Identities.Set("id1", models.Identity{User: "ops"})
 	cfg.Nodes.Set("comma-saved", models.Node{
 		HostRef:     "h1",
 		IdentityRef: "id1",
 		ProxyJump:   " , ",
+		SSHOptions:  ssh.MustOptions(ssh.OptionControlPath, "/tmp/cm-%j-%h"),
+	})
+	cfg.Nodes.Set("none-saved", models.Node{
+		HostRef:     "h3",
+		IdentityRef: "id1",
+		ProxyJump:   "none,none",
 		SSHOptions:  ssh.MustOptions(ssh.OptionControlPath, "/tmp/cm-%j-%h"),
 	})
 	cfg.Nodes.Set("bastion-saved", models.Node{
@@ -121,27 +128,45 @@ func TestRound6_P2_6_ProxyJumpCommaConsistencyBetweenControlAndGetConfig(t *test
 	})
 	prov := config.NewProviderWithoutOpenSSH(cfg)
 
-	// 1. Saved node with ProxyJump=" , " must expand %j as "" (not ",") matching GetConfig.
+	// 1. D5-H1: Malformed ProxyJump=" , " on a saved node or CLI override must fail closed
+	// consistently across both GetConfig and ExpandControlPath.
 	adp := NewSSHAdapter(prov)
-	gotCfg, err := adp.GetConfig("comma-saved")
-	if err != nil {
-		t.Fatalf("GetConfig(comma-saved): %v", err)
+	if _, err := adp.GetConfig("comma-saved"); err == nil {
+		t.Fatal("GetConfig(comma-saved) succeeded, want fail-closed error")
 	}
-	if gotCfg.ProxyJump != "" {
-		t.Fatalf("GetConfig(comma-saved).ProxyJump = %q, want empty", gotCfg.ProxyJump)
+	if _, err := adp.ExpandControlPath("comma-saved", "/tmp/cm-%j-%h"); err == nil {
+		t.Fatal("ExpandControlPath(comma-saved) succeeded, want fail-closed error")
 	}
-	ctrlPath, err := adp.ExpandControlPath("comma-saved", "/tmp/cm-%j-%h")
-	if err != nil {
-		t.Fatalf("ExpandControlPath(comma-saved): %v", err)
+	adpBadOverride := NewSSHAdapter(prov, WithLocalExecution(true), WithSessionAuthOverride("bastion-saved", SessionAuth{
+		ProxyJump: " , ",
+	}))
+	if _, err := adpBadOverride.GetConfig("bastion-saved"); err == nil {
+		t.Fatal("GetConfig(bastion-saved, ProxyJump=\" , \") succeeded, want fail-closed error")
 	}
-	if ctrlPath != "/tmp/cm--10.61.0.1" {
-		t.Fatalf("ExpandControlPath(comma-saved) = %q, want /tmp/cm--10.61.0.1 (JumpHost must be empty)", ctrlPath)
+	if _, err := adpBadOverride.ExpandControlPath("bastion-saved", "/tmp/cm-%j-%h"); err == nil {
+		t.Fatal("ExpandControlPath(bastion-saved, ProxyJump=\" , \") succeeded, want fail-closed error")
 	}
 
-	// 2. CLI SessionAuth{ProxyJump: " , "} disables lower-tier saved ProxyJump="bastion"
+	// 2. Valid ProxyJump="none,none" expands %j as "" consistently across GetConfig and ExpandControlPath.
+	gotNoneCfg, err := adp.GetConfig("none-saved")
+	if err != nil {
+		t.Fatalf("GetConfig(none-saved): %v", err)
+	}
+	if gotNoneCfg.ProxyJump != "" {
+		t.Fatalf("GetConfig(none-saved).ProxyJump = %q, want empty", gotNoneCfg.ProxyJump)
+	}
+	ctrlPath, err := adp.ExpandControlPath("none-saved", "/tmp/cm-%j-%h")
+	if err != nil {
+		t.Fatalf("ExpandControlPath(none-saved): %v", err)
+	}
+	if ctrlPath != "/tmp/cm--10.61.0.3" {
+		t.Fatalf("ExpandControlPath(none-saved) = %q, want /tmp/cm--10.61.0.3 (JumpHost must be empty)", ctrlPath)
+	}
+
+	// 3. CLI SessionAuth{ProxyJump: "none,none"} disables lower-tier saved ProxyJump="bastion"
 	// consistently across GetConfig and ExpandControlPath while preserving ProxyCommand.
 	adpOverride := NewSSHAdapter(prov, WithLocalExecution(true), WithSessionAuthOverride("bastion-saved", SessionAuth{
-		ProxyJump: " , ",
+		ProxyJump: "none,none",
 	}))
 	gotOverride, err := adpOverride.GetConfig("bastion-saved")
 	if err != nil {

@@ -386,9 +386,6 @@ func buildHopBindingTargets(
 	seenJumps := []string{base.JumpHost}
 
 	addAltJump := func(raw string) {
-		if !ssh.HasActiveProxyJump(raw) {
-			return
-		}
 		jump := ssh.NormalizeProxyJump(raw)
 		if jump == "" || slices.Contains(seenJumps, jump) {
 			return

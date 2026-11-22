@@ -99,24 +99,46 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		return err
 	}
 	if cmd.Flags().Changed("jump") {
-		if !ssh.HasActiveProxyJump(flags.jump) {
-			node.ProxyJump = ""
-		} else {
-			draft := repository.Snapshot()
-			draft.Hosts.Set(node.HostRef, host)
-			draft.Identities.Set(node.IdentityRef, identity)
-			if oldName != newName {
-				draft.Nodes.Remove(oldName)
-			}
-			draft.Nodes.Set(newName, node)
-			resolvedJump, err := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), flags.jump)
-			if err != nil {
-				return fmt.Errorf("resolve jump host for node %q: %w", newName, err)
-			}
-			node.ProxyJump = resolvedJump
+		if err := applyEditedProxyJump(repository, oldName, newName, &node, host, identity, flags.jump); err != nil {
+			return err
 		}
 	}
 	return commitEditedNode(cmd, repository, view.NodeRefs[oldName], oldName, newName, node, host, identity, flags, updated)
+}
+
+func applyEditedProxyJump(
+	repository *config.Repository,
+	oldName, newName string,
+	node *models.Node,
+	host models.Host,
+	identity models.Identity,
+	rawJump string,
+) error {
+	if strings.TrimSpace(rawJump) == "" {
+		node.ProxyJump = ""
+		return nil
+	}
+	ps, pErr := ssh.ParseProxyJump(rawJump)
+	if pErr != nil {
+		return fmt.Errorf("invalid jump host for node %q: %w", newName, pErr)
+	}
+	if ps.Kind() != ssh.ProxyJump {
+		node.ProxyJump = ""
+		return nil
+	}
+	draft := repository.Snapshot()
+	draft.Hosts.Set(node.HostRef, host)
+	draft.Identities.Set(node.IdentityRef, identity)
+	if oldName != newName {
+		draft.Nodes.Remove(oldName)
+	}
+	draft.Nodes.Set(newName, *node)
+	resolvedJump, err := config.ResolveProxyJumpChainWithConfig(draft, repository.GetOpenSSHParser(), rawJump)
+	if err != nil {
+		return fmt.Errorf("resolve jump host for node %q: %w", newName, err)
+	}
+	node.ProxyJump = resolvedJump
+	return nil
 }
 
 func applyEditedIdentityTemplate(

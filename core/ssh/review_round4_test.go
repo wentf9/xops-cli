@@ -22,24 +22,31 @@ import (
 func TestRound4_ProxyJumpHelpers(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		raw        string
-		wantDis    bool
-		wantActive bool
+		raw      string
+		wantDis  bool
+		wantKind ProxyKind
+		wantErr  bool
 	}{
-		{"", false, false},
-		{" , ", true, false},
-		{"none", true, false},
-		{"NONE", true, false},
-		{"none,none", true, false},
-		{" none , NONE ", true, false},
-		{"bastion", false, true},
-		{"none,bastion", false, true},
+		{"", false, ProxyUnset, true},
+		{" , ", false, ProxyUnset, true},
+		{"none,", false, ProxyUnset, true},
+		{"none", true, ProxyDisabled, false},
+		{"NONE", true, ProxyDisabled, false},
+		{"none,none", true, ProxyDisabled, false},
+		{" none , NONE ", true, ProxyDisabled, false},
+		{"bastion", false, ProxyJump, false},
+		{"none,bastion", false, ProxyUnset, true},
 	} {
 		if got := IsDisabledProxyJump(tc.raw); got != tc.wantDis {
 			t.Errorf("IsDisabledProxyJump(%q) = %v, want %v", tc.raw, got, tc.wantDis)
 		}
-		if got := HasActiveProxyJump(tc.raw); got != tc.wantActive {
-			t.Errorf("HasActiveProxyJump(%q) = %v, want %v", tc.raw, got, tc.wantActive)
+		ps, err := ParseProxyJump(tc.raw)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ParseProxyJump(%q) err = %v, wantErr=%v", tc.raw, err, tc.wantErr)
+			continue
+		}
+		if err == nil && ps.Kind() != tc.wantKind {
+			t.Errorf("ParseProxyJump(%q).Kind() = %v, want %v", tc.raw, ps.Kind(), tc.wantKind)
 		}
 	}
 }

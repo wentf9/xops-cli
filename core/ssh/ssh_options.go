@@ -1002,49 +1002,29 @@ func CanonicalOptionKey(key string) string {
 	return ""
 }
 
-// ProxyJumpKind classifies a ProxyJump directive into its canonical tri-state.
-type ProxyJumpKind uint8
-
-const (
-	// ProxyJumpUnset means no ProxyJump directive was supplied (empty/whitespace).
-	ProxyJumpUnset ProxyJumpKind = iota
-	// ProxyJumpDisabled means ProxyJump was explicitly supplied with no active hop
-	// (e.g. "none", "none,none", ",", " , ").
-	ProxyJumpDisabled
-	// ProxyJumpActive means ProxyJump contains at least one concrete non-"none" hop.
-	ProxyJumpActive
-)
-
-// ClassifyProxyJump classifies raw into ProxyJumpUnset, ProxyJumpDisabled, or ProxyJumpActive.
-func ClassifyProxyJump(raw string) ProxyJumpKind {
-	if strings.TrimSpace(raw) == "" {
-		return ProxyJumpUnset
-	}
-	for part := range strings.SplitSeq(raw, ",") {
-		tok := strings.TrimSpace(part)
-		if tok != "" && !strings.EqualFold(tok, "none") {
-			return ProxyJumpActive
-		}
-	}
-	return ProxyJumpDisabled
-}
-
 // NormalizeProxyJump extracts active non-"none" hops joined by ",", or returns ""
 // when ProxyJump is unset or disabled.
 func NormalizeProxyJump(raw string) string {
 	return strings.Join(splitProxyJumpChain(raw), ",")
 }
 
-// IsDisabledProxyJump reports whether raw explicitly disables ProxyJump
-// (e.g. "none", "none,none", or comma-only values with no active hop).
+// IsDisabledProxyJump reports whether raw is a valid ProxyJump directive that
+// explicitly disables proxying (e.g. "none" or "none,none"). Empty or malformed
+// values such as "", ",", "none,", or strings with control characters return false.
 func IsDisabledProxyJump(raw string) bool {
-	return ClassifyProxyJump(raw) == ProxyJumpDisabled
-}
-
-// HasActiveProxyJump reports whether raw contains at least one non-empty hop
-// other than "none".
-func HasActiveProxyJump(raw string) bool {
-	return ClassifyProxyJump(raw) == ProxyJumpActive
+	if hasControlOrLineSepChar(raw) {
+		return false
+	}
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return false
+	}
+	for part := range strings.SplitSeq(trimmed, ",") {
+		if !IsNoneValue(part) {
+			return false
+		}
+	}
+	return true
 }
 
 // IsNoneValue reports whether s is the OpenSSH sentinel value "none"
@@ -1763,7 +1743,7 @@ type Options struct {
 	// Equal, and YAML/JSON serialization share one deterministic representation.
 	identityFiles    PathList              `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
 	certificateFiles PathList              `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
-	algoPolicies     map[string]AlgoPolicy `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
+	algoPolicies     map[string]AlgoPolicy `json:"-" yaml:"-" digest:"exclude,reason=non-default policies mirrored into values map; AlgoOpDefault hashed explicitly by digestOptionsValue"`
 	proxyCommand     ProxySetting          `json:"-" yaml:"-" digest:"exclude,reason=canonically mirrored into values map"`
 	// ImplicitTier4 is true when multiplexing was resolved solely from ~/.ssh/config
 	// without any CLI flag or xops node/global configuration.
@@ -2438,6 +2418,24 @@ func (o *Options) SetAlgoPolicy(policy AlgoPolicy) {
 	o.setAlgoPolicy(policy.OptionKey(), policy)
 }
 
+// DropDefaultAlgoPolicies removes any explicit AlgoOpDefault entries from o
+// so persisted Tier-2 options (for example imported from ~/.ssh/config) never
+// carry unserialized default-retaining markers that shadow Tier-3 globals in
+// memory or diverge from YAML/JSON reload.
+func (o *Options) DropDefaultAlgoPolicies() {
+	if o == nil || len(o.algoPolicies) == 0 {
+		return
+	}
+	for k, p := range o.algoPolicies {
+		if p.Op() == AlgoOpDefault {
+			delete(o.algoPolicies, k)
+		}
+	}
+	if len(o.algoPolicies) == 0 {
+		o.algoPolicies = nil
+	}
+}
+
 // ProxyCommandSetting returns the typed ProxySetting for OptionProxyCommand.
 func (o *Options) ProxyCommandSetting() ProxySetting {
 	if o.IsEmpty() {
@@ -2681,7 +2679,7 @@ func (o *Options) FilterByClasses(allowed ...OptionClass) *Options {
 	if o.IsEmpty() || len(allowed) == 0 {
 		return nil
 	}
-	res := &Options{ImplicitTier4: o.ImplicitTier4}
+	res := &Options{ImplicitTier4: o.ImplicitTier4 && slices.Contains(allowed, OptionClassMux)}
 	for k, v := range o.values {
 		spec, ok := LookupOptionSpec(k)
 		if !ok {
@@ -2709,7 +2707,13 @@ func (o *Options) FilterByClasses(allowed ...OptionClass) *Options {
 
 // StripClasses removes all options belonging to any of the specified OptionClasses in place.
 func (o *Options) StripClasses(classes ...OptionClass) {
-	if o.IsEmpty() || len(classes) == 0 {
+	if o == nil || len(classes) == 0 {
+		return
+	}
+	if slices.Contains(classes, OptionClassMux) {
+		o.ImplicitTier4 = false
+	}
+	if o.IsEmpty() {
 		return
 	}
 	for k := range o.values {

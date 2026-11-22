@@ -11,8 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"path/filepath"
+	pathpkg "path"
 	"runtime"
 	"slices"
 	"strconv"
@@ -533,16 +532,32 @@ func wrapNilRemoteHostKeyCallback(cb cryptoSSH.HostKeyCallback) cryptoSSH.HostKe
 
 const maxKnownHostsFileBytes int64 = 16 << 20 // 16 MiB
 
-func isKnownHostsDevNull(path string) bool {
-	trimmed := strings.TrimSpace(path)
+func isKnownHostsDevNull(rawPath string) bool {
+	return isKnownHostsDevNullForOS(runtime.GOOS, rawPath)
+}
+
+func isKnownHostsDevNullForOS(goos, rawPath string) bool {
+	trimmed := strings.TrimSpace(rawPath)
 	if trimmed == "" {
 		return false
 	}
-	cleaned := filepath.Clean(trimmed)
-	if trimmed == "/dev/null" || cleaned == "/dev/null" || cleaned == os.DevNull {
+	if goos == runtime.GOOS && fsx.IsDevNullSentinel(trimmed) {
 		return true
 	}
-	return runtime.GOOS == "windows" && strings.EqualFold(cleaned, os.DevNull)
+	if goos == "windows" {
+		winNorm := strings.ReplaceAll(trimmed, "/", `\`)
+		if strings.EqualFold(winNorm, "NUL") || strings.EqualFold(winNorm, `\\.\NUL`) {
+			return true
+		}
+		if !strings.HasPrefix(winNorm, `\\`) {
+			slash := strings.ReplaceAll(trimmed, `\`, "/")
+			if strings.HasPrefix(slash, "/") && strings.EqualFold(pathpkg.Clean(slash), "/dev/null") {
+				return true
+			}
+		}
+		return false
+	}
+	return strings.HasPrefix(trimmed, "/") && pathpkg.Clean(trimmed) == "/dev/null"
 }
 
 type boundedKnownHostsReader struct {

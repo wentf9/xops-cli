@@ -267,6 +267,7 @@ func digestOptionsPointer(h hash.Hash, ptr reflect.Value) error {
 func digestOptionsValue(h hash.Hash, v reflect.Value) error {
 	t := v.Type()
 	valuesField := v.FieldByName("values")
+	defaultAlgoKeys := collectDefaultAlgoPolicyKeys(v.FieldByName("algoPolicies"))
 	allExtraZero := true
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
@@ -281,7 +282,7 @@ func digestOptionsValue(h hash.Hash, v reflect.Value) error {
 			allExtraZero = false
 		}
 	}
-	if valuesField.Len() == 0 && allExtraZero {
+	if valuesField.Len() == 0 && len(defaultAlgoKeys) == 0 && allExtraZero {
 		_, _ = h.Write([]byte("O0;"))
 		return nil
 	}
@@ -301,8 +302,42 @@ func digestOptionsValue(h hash.Hash, v reflect.Value) error {
 		}
 	}
 	digestOptionsValuesMap(h, valuesField)
+	for _, k := range defaultAlgoKeys {
+		writeDigestTag(h, 'D', k)
+	}
 	_, _ = h.Write([]byte{'}'})
 	return nil
+}
+
+func collectDefaultAlgoPolicyKeys(algoField reflect.Value) []string {
+	if !algoField.IsValid() || algoField.Len() == 0 {
+		return nil
+	}
+	var keys []string
+	seen := make(map[string]struct{}, algoField.Len())
+	for _, spec := range optionRegistry {
+		mv := algoField.MapIndex(reflect.ValueOf(spec.CanonicalKey))
+		if !mv.IsValid() {
+			continue
+		}
+		if AlgoOp(mv.FieldByName("op").Uint()) == AlgoOpDefault {
+			keys = append(keys, spec.CanonicalKey)
+			seen[spec.CanonicalKey] = struct{}{}
+		}
+	}
+	if len(seen) < algoField.Len() {
+		var extras []string
+		iter := algoField.MapRange()
+		for iter.Next() {
+			k := iter.Key().String()
+			if _, ok := seen[k]; !ok && AlgoOp(iter.Value().FieldByName("op").Uint()) == AlgoOpDefault {
+				extras = append(extras, k)
+			}
+		}
+		slices.Sort(extras)
+		keys = append(keys, extras...)
+	}
+	return keys
 }
 
 func digestOptionsValuesMap(h hash.Hash, valuesField reflect.Value) {

@@ -807,7 +807,7 @@ func (c *Connector) handleHandshakeFailure(ctx context.Context, coordinator *han
 }
 
 func (c *Connector) resolveHandshakeDialer(nodeName string, policy dialPolicy, dialer Dialer) (Dialer, bool, bool) {
-	if dialer == nil && !HasActiveProxyJump(policy.proxyJump) && policy.options.ActiveProxyCommand() != "" {
+	if dialer == nil && policy.proxyJump == "" && policy.options.ActiveProxyCommand() != "" {
 		roCfg := policy.readOnlyConfig()
 		dialer = &proxyCommandDialer{
 			connector: c,

@@ -334,17 +334,35 @@ func TestRound7_P3_4_MCPBindingNormalizesDisabledProxyJumpAndSkipsTildeVarRescan
 	)
 	cfgNone.Nodes.Set("node", nodeNone)
 
+	cfgNoneNone := credentialBindingConfig()
+	nodeNoneNone, _ := cfgNoneNone.Nodes.Get("node")
+	nodeNoneNone.ProxyJump = "none,none"
+	nodeNoneNone.SSHOptions = nodeNone.SSHOptions.Clone()
+	cfgNoneNone.Nodes.Set("node", nodeNoneNone)
+
 	cfgEmpty := credentialBindingConfig()
 	nodeEmpty, _ := cfgEmpty.Nodes.Get("node")
-	nodeEmpty.ProxyJump = " , "
+	nodeEmpty.ProxyJump = ""
 	nodeEmpty.SSHOptions = nodeNone.SSHOptions.Clone()
 	cfgEmpty.Nodes.Set("node", nodeEmpty)
 
 	admNone := persistedAdmission(t, t.Context(), credentialBindingHost(cfgNone, false))
+	admNoneNone := persistedAdmission(t, t.Context(), credentialBindingHost(cfgNoneNone, false))
 	admEmpty := persistedAdmission(t, t.Context(), credentialBindingHost(cfgEmpty, false))
-	if admNone.Snapshot.Targets["node"].Version != admEmpty.Snapshot.Targets["node"].Version {
-		t.Fatalf("proxy_jump:none vs ' , ' produced differing credential versions: %q vs %q",
-			admNone.Snapshot.Targets["node"].Version, admEmpty.Snapshot.Targets["node"].Version)
+	if admNone.Snapshot.Targets["node"].Version != admNoneNone.Snapshot.Targets["node"].Version ||
+		admNone.Snapshot.Targets["node"].Version != admEmpty.Snapshot.Targets["node"].Version {
+		t.Fatalf("proxy_jump:none vs none,none vs empty produced differing credential versions: %q vs %q vs %q",
+			admNone.Snapshot.Targets["node"].Version, admNoneNone.Snapshot.Targets["node"].Version, admEmpty.Snapshot.Targets["node"].Version)
+	}
+
+	// Malformed comma-only ProxyJump must fail closed rather than silently disabling ProxyJump.
+	cfgMalformed := credentialBindingConfig()
+	nodeMalformed, _ := cfgMalformed.Nodes.Get("node")
+	nodeMalformed.ProxyJump = " , "
+	nodeMalformed.SSHOptions = nodeNone.SSHOptions.Clone()
+	cfgMalformed.Nodes.Set("node", nodeMalformed)
+	if _, err := credentialBindingHost(cfgMalformed, false).Resolve(t.Context(), ports.ResolveRequest{Selectors: []string{"node"}}); err == nil {
+		t.Fatal("malformed proxy_jump ' , ' unexpectedly succeeded in MCP host Resolve")
 	}
 
 	// Verify buildHopBindingTargets filters disabled jumps and normalizes mixed jumps.

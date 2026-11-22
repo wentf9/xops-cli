@@ -1303,6 +1303,7 @@ func (c *proxyCommandPathChecker) checkNode(id string, isTarget bool) (bool, err
 	pol, err := c.adp.Resolve(context.Background(), adapter.ResolveRequest{
 		NodeID:         id,
 		SessionControl: &ctrlOpts,
+		ResolveProxy:   isTarget,
 	})
 	if err != nil {
 		// Fail closed: if effective policy resolution fails, treat as unsafe to detach/handoff.
@@ -1311,21 +1312,10 @@ func (c *proxyCommandPathChecker) checkNode(id string, isTarget bool) (bool, err
 	if opts := pol.Options(); opts != nil && opts.ActiveProxyCommand() != "" {
 		return true, nil
 	}
-	var jumpChain string
-	if isTarget {
-		jumpChain, err = c.opts.effectiveProxyJumpChain(c.provider, id)
-		if err != nil {
-			return true, err
-		}
-	} else {
-		snap, snapErr := c.provider.ResolveConnection(id)
-		if snapErr != nil && !errors.Is(snapErr, config.ErrNodeNotFound) {
-			return true, snapErr
-		}
-		if snapErr == nil {
-			jumpChain = strings.TrimSpace(snap.Node.ProxyJump)
-		}
+	if pol.Proxy().Kind() != ssh.ProxyJump {
+		return false, nil
 	}
+	jumpChain := pol.EffectiveJump()
 	for _, hop := range strings.Split(jumpChain, ",") {
 		if hasProxy, hopErr := c.checkNode(hop, false); hopErr != nil || hasProxy {
 			return true, hopErr
@@ -1376,12 +1366,17 @@ func (c *proxyCommandPathChecker) checkOwnedMaster(connector *ssh.Connector, m *
 func (o *SshOptions) effectiveProxyJumpChain(provider config.ConfigProvider, nodeID string) (string, error) {
 	if o != nil {
 		jump := strings.TrimSpace(o.JumpHost)
-		if ssh.IsDisabledProxyJump(jump) {
-			return "", nil
-		}
 		if jump != "" {
+			ps, err := ssh.ParseProxyJump(jump)
+			if err != nil {
+				return "", err
+			}
+			targets, ok := ps.JumpTargets()
+			if !ok {
+				return "", nil
+			}
 			if provider == nil {
-				return jump, nil
+				return strings.Join(targets, ","), nil
 			}
 			resolved, err := provider.ResolveProxyJumpChain(jump)
 			if err != nil {
@@ -2991,7 +2986,7 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 	if host == "" {
 		host = strings.TrimSpace(o.Host)
 	}
-	if host == "" || strings.HasPrefix(host, config.OpenSSHNodePrefix) {
+	if host == "" || config.IsOpenSSHNodeID(host) {
 		return nil
 	}
 	var matchedSavedNode bool

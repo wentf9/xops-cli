@@ -76,6 +76,22 @@ func (p EffectivePolicy) Proxy() ssh.ProxySetting {
 	return p.proxySetting
 }
 
+// EffectiveJump returns the resolved active ProxyJump chain when
+// Proxy().Kind() == ssh.ProxyJump, or "" when ProxyJump is unset, disabled,
+// or superseded by ProxyCommand.
+func (p EffectivePolicy) EffectiveJump() string {
+	if p.proxySetting.Kind() != ssh.ProxyJump {
+		return ""
+	}
+	if p.resolvedJumpChain != "" {
+		return p.resolvedJumpChain
+	}
+	if targets, ok := p.proxySetting.JumpTargets(); ok {
+		return strings.Join(targets, ",")
+	}
+	return ""
+}
+
 // OriginalHost returns the original OpenSSH selector host for token expansion (%n).
 func (p EffectivePolicy) OriginalHost() string {
 	return p.originalHost
@@ -206,30 +222,7 @@ func proxySettingFromJumpString(raw string) (ssh.ProxySetting, error) {
 	if strings.TrimSpace(raw) == "" {
 		return ssh.UnsetProxySetting(), nil
 	}
-	ps, err := ssh.ParseProxyJump(raw)
-	if err == nil {
-		return ps, nil
-	}
-	if ssh.ClassifyProxyJump(raw) == ssh.ProxyJumpDisabled {
-		return ssh.DisabledProxyJumpSetting(), nil
-	}
-	// Accept mixed "hop1,none,hop2" strings only when every comma-separated
-	// token is non-empty (no empty hops such as "a,,b" or "a,"); reject all
-	// other malformed strings fail-closed.
-	var hops []string
-	for part := range strings.SplitSeq(raw, ",") {
-		tok := strings.TrimSpace(part)
-		if tok == "" {
-			return ssh.UnsetProxySetting(), err
-		}
-		if !ssh.IsNoneValue(tok) {
-			hops = append(hops, tok)
-		}
-	}
-	if len(hops) == 0 {
-		return ssh.UnsetProxySetting(), err
-	}
-	return ssh.NewProxyJump(hops...)
+	return ssh.ParseProxyJump(raw)
 }
 
 func proxyCommandSetting(opts *ssh.Options) ssh.ProxySetting {
@@ -518,15 +511,7 @@ func (p EffectivePolicy) controlTargetContextWithEnv(nodeID string, env ssh.Envi
 		}
 	}
 	host := effectiveSnapshotHost(p.snapshot, p.hasTier1Auth, p.tier1Auth)
-	jumpHost := ""
-	if p.proxySetting.Kind() == ssh.ProxyJump {
-		jumpHost = p.resolvedJumpChain
-		if jumpHost == "" {
-			if targets, ok := p.proxySetting.JumpTargets(); ok {
-				jumpHost = strings.Join(targets, ",")
-			}
-		}
-	}
+	jumpHost := p.EffectiveJump()
 	return ssh.NormalizeTargetContext(ssh.TargetContext{
 		Host:          host,
 		Port:          effectiveSnapshotPort(p.snapshot.Host.Port),

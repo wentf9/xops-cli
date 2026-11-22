@@ -468,7 +468,10 @@ func TestP3_ControlTargetContextNormalization(t *testing.T) {
 		LocalUID:  "1000",
 	}
 
-	ps, err := proxySettingFromJumpString(" jump1 , none , jump2 ")
+	if _, err := proxySettingFromJumpString(" jump1 , none , jump2 "); err == nil {
+		t.Fatal("proxySettingFromJumpString must fail closed on mixed none hop chain")
+	}
+	ps, err := proxySettingFromJumpString(" jump1 , jump2 ")
 	if err != nil {
 		t.Fatalf("proxySettingFromJumpString: %v", err)
 	}
@@ -476,7 +479,7 @@ func TestP3_ControlTargetContextNormalization(t *testing.T) {
 		snapshot: config.ConnectionSnapshot{
 			Host:     models.Host{Address: "[fe80::1%eth0]", Port: 0},
 			Identity: models.Identity{User: "   "},
-			Node:     models.Node{ProxyJump: " jump1 , none , jump2 "},
+			Node:     models.Node{ProxyJump: " jump1 , jump2 "},
 		},
 		proxySetting:  ps,
 		originalHost:  "  edge-v6  ",

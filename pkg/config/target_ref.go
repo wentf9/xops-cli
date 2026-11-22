@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/wentf9/xops-cli/core/ssh"
 )
 
 // hasOpenSSHPrefix reports whether s starts with the reserved "openssh:" prefix
@@ -42,7 +44,7 @@ func isBareOrBracketedIPv6Literal(s string) bool {
 		candidate = s[1 : len(s)-1]
 	}
 	addr, err := netip.ParseAddr(candidate)
-	return err == nil && addr.Is6()
+	return err == nil && addr.Is6() && ssh.ValidateIPv6Zone(addr.Zone()) == nil
 }
 
 // IsPlainOpenSSHHostSelector reports whether s is a single host/alias selector
@@ -291,6 +293,9 @@ func ParseHostPort(raw string) (host string, port uint16, hasPort bool, err erro
 		return "", 0, false, fmt.Errorf("malformed bracketed address %q", raw)
 	}
 	if addr, addrErr := netip.ParseAddr(s); addrErr == nil && addr.Is6() {
+		if zErr := ssh.ValidateIPv6Zone(addr.Zone()); zErr != nil {
+			return "", 0, false, fmt.Errorf("invalid IPv6 address %q: %w", raw, zErr)
+		}
 		return s, 0, false, nil
 	}
 	if strings.HasSuffix(s, ":") {
@@ -325,6 +330,9 @@ func parseBracketedHostPort(s, raw string) (host string, port uint16, hasPort bo
 	addr, addrErr := netip.ParseAddr(inner)
 	if addrErr != nil || !addr.Is6() {
 		return "", 0, false, fmt.Errorf("invalid bracketed IPv6 address %q", raw)
+	}
+	if zErr := ssh.ValidateIPv6Zone(addr.Zone()); zErr != nil {
+		return "", 0, false, fmt.Errorf("invalid bracketed IPv6 address %q: %w", raw, zErr)
 	}
 	suffix := s[end+1:]
 	if suffix == "" {

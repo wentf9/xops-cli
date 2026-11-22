@@ -408,21 +408,26 @@ func verifyRound6ProxyJumpTable(t *testing.T) {
 	t.Helper()
 	for _, tc := range []struct {
 		raw      string
-		wantKind ProxyJumpKind
+		wantKind ProxyKind
+		wantErr  bool
 		wantNorm string
 	}{
-		{"", ProxyJumpUnset, ""},
-		{"   ", ProxyJumpUnset, ""},
-		{",", ProxyJumpDisabled, ""},
-		{" , ", ProxyJumpDisabled, ""},
-		{"none", ProxyJumpDisabled, ""},
-		{"NONE,none", ProxyJumpDisabled, ""},
-		{"bastion", ProxyJumpActive, "bastion"},
-		{"none,bastion,", ProxyJumpActive, "bastion"},
-		{"jump1, none , jump2", ProxyJumpActive, "jump1,jump2"},
+		{"", ProxyUnset, true, ""},
+		{"   ", ProxyUnset, true, ""},
+		{",", ProxyUnset, true, ""},
+		{" , ", ProxyUnset, true, ""},
+		{"none", ProxyDisabled, false, ""},
+		{"NONE,none", ProxyDisabled, false, ""},
+		{"bastion", ProxyJump, false, "bastion"},
+		{"none,bastion,", ProxyUnset, true, "bastion"},
+		{"jump1, none , jump2", ProxyUnset, true, "jump1,jump2"},
+		{"jump1 , jump2", ProxyJump, false, "jump1,jump2"},
 	} {
-		if got := ClassifyProxyJump(tc.raw); got != tc.wantKind {
-			t.Errorf("ClassifyProxyJump(%q) = %v, want %v", tc.raw, got, tc.wantKind)
+		ps, err := ParseProxyJump(tc.raw)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("ParseProxyJump(%q) err = %v, wantErr=%v", tc.raw, err, tc.wantErr)
+		} else if err == nil && ps.Kind() != tc.wantKind {
+			t.Errorf("ParseProxyJump(%q).Kind() = %v, want %v", tc.raw, ps.Kind(), tc.wantKind)
 		}
 		if got := NormalizeProxyJump(tc.raw); got != tc.wantNorm {
 			t.Errorf("NormalizeProxyJump(%q) = %q, want %q", tc.raw, got, tc.wantNorm)

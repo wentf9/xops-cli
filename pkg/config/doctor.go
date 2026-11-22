@@ -464,7 +464,7 @@ func diagnoseV2ProxyJumps(v2 *ConfigurationV2) []DoctorIssue {
 	adj := make(map[string][]jumpEdge, len(nodeIDs))
 	for _, nodeID := range nodeIDs {
 		node, ok := cfg.Nodes.Get(nodeID)
-		if !ok || !ssh.HasActiveProxyJump(node.ProxyJump) {
+		if !ok || (strings.TrimSpace(node.ProxyJump) == "" && !hasControlOrLineSepChar(node.ProxyJump)) {
 			continue
 		}
 		edges, nodeIssues := diagnoseNodeProxyJumpHops(cfg, lookup, aliases, nodeID, node)
@@ -493,6 +493,19 @@ func diagnoseNodeProxyJumpHops(
 ) ([]jumpEdge, []DoctorIssue) {
 	var edges []jumpEdge
 	var issues []DoctorIssue
+	ps, parseErr := ssh.ParseProxyJump(node.ProxyJump)
+	if parseErr != nil {
+		issues = append(issues, DoctorIssue{
+			Code:       "proxy_jump_invalid",
+			Entity:     "node:" + nodeID,
+			Severity:   DoctorSeverityError,
+			Message:    fmt.Sprintf("proxy_jump %q invalid: %v", node.ProxyJump, parseErr),
+			Fixable:    true,
+			FixSummary: fmt.Sprintf("normalize malformed proxy_jump %q on node %q", node.ProxyJump, nodeID),
+		})
+	} else if ps.Kind() != ssh.ProxyJump {
+		return nil, nil
+	}
 	for rawHop := range strings.SplitSeq(strings.TrimSpace(node.ProxyJump), ",") {
 		hop := strings.TrimSpace(rawHop)
 		if hop == "" || strings.EqualFold(hop, "none") {
@@ -746,13 +759,13 @@ func repairV2ProxyJumps(v2 *ConfigurationV2) []DoctorFix {
 	lookup, aliases, _ := buildIndexes(cfg, false)
 	for _, nodeID := range sortedMapKeys(v2.Nodes) {
 		nodeV2 := v2.Nodes[nodeID]
-		if !ssh.HasActiveProxyJump(nodeV2.ProxyJump) {
+		if strings.TrimSpace(nodeV2.ProxyJump) == "" && !hasControlOrLineSepChar(nodeV2.ProxyJump) {
 			continue
 		}
 		nodeModel, _ := cfg.Nodes.Get(nodeID)
-		kept, nodeFixes := filterValidNonSelfJumpHops(cfg, lookup, aliases, nodeID, nodeModel)
+		repairedJump, nodeFixes := repairNodeProxyJump(cfg, lookup, aliases, nodeID, nodeModel)
 		if len(nodeFixes) > 0 {
-			nodeV2.ProxyJump = strings.Join(kept, ",")
+			nodeV2.ProxyJump = repairedJump
 			v2.Nodes[nodeID] = nodeV2
 			fixes = append(fixes, nodeFixes...)
 		}
@@ -766,7 +779,11 @@ func repairV2ProxyJumps(v2 *ConfigurationV2) []DoctorFix {
 		adj := make(map[string][]jumpEdge, len(nodeIDs))
 		for _, nodeID := range nodeIDs {
 			node, ok := cfg.Nodes.Get(nodeID)
-			if !ok || !ssh.HasActiveProxyJump(node.ProxyJump) {
+			if !ok || strings.TrimSpace(node.ProxyJump) == "" {
+				continue
+			}
+			ps, pErr := ssh.ParseProxyJump(node.ProxyJump)
+			if pErr != nil || ps.Kind() != ssh.ProxyJump {
 				continue
 			}
 			edges, _ := diagnoseNodeProxyJumpHops(cfg, lookup, aliases, nodeID, node)
@@ -791,6 +808,33 @@ func repairV2ProxyJumps(v2 *ConfigurationV2) []DoctorFix {
 		})
 	}
 	return fixes
+}
+
+func repairNodeProxyJump(
+	cfg *Configuration,
+	lookup map[string][]string,
+	aliases map[string]string,
+	nodeID string,
+	node models.Node,
+) (string, []DoctorFix) {
+	ps, parseErr := ssh.ParseProxyJump(node.ProxyJump)
+	if parseErr == nil && ps.Kind() != ssh.ProxyJump {
+		return node.ProxyJump, nil
+	}
+	kept, fixes := filterValidNonSelfJumpHops(cfg, lookup, aliases, nodeID, node)
+	repaired := strings.Join(kept, ",")
+	if parseErr != nil {
+		summary := fmt.Sprintf("normalized malformed proxy_jump %q to %q on node %q", node.ProxyJump, repaired, nodeID)
+		if repaired == "" {
+			summary = fmt.Sprintf("cleared malformed proxy_jump %q on node %q", node.ProxyJump, nodeID)
+		}
+		fixes = append([]DoctorFix{{
+			Code:    "proxy_jump_invalid",
+			Entity:  "node:" + nodeID,
+			Summary: summary,
+		}}, fixes...)
+	}
+	return repaired, fixes
 }
 
 func filterValidNonSelfJumpHops(
