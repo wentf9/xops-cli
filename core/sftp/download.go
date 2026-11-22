@@ -228,7 +228,7 @@ func (c *Client) download(ctx context.Context, remote RemotePath, dest LocalDest
 }
 
 func (c *Client) downloadGlob(ctx context.Context, pattern RemotePath, dest LocalDest, opts DownloadOptions) error {
-	matches, err := c.SFTPClient().Glob(pattern.String())
+	matches, err := c.globPaths(ctx, pattern)
 	if err != nil {
 		return fmt.Errorf("expand remote pattern %q failed: %w", pattern.String(), err)
 	}
@@ -239,7 +239,7 @@ func (c *Client) downloadGlob(ctx context.Context, pattern RemotePath, dest Loca
 	itemOpts := opts
 	itemOpts.ExpandGlob = false
 	if len(matches) == 1 {
-		itemRemote, contentsOnly, parseErr := ParseRemoteDownloadPath(matches[0])
+		itemRemote, contentsOnly, parseErr := ParseRemoteDownloadPath(matches[0].String())
 		if parseErr != nil {
 			return parseErr
 		}
@@ -259,11 +259,11 @@ func (c *Client) downloadGlob(ctx context.Context, pattern RemotePath, dest Loca
 	}
 
 	dirDest := LocalDest{path: dest.path, mode: LocalDestPreserveDirBasename}
-	for _, rawMatch := range matches {
+	for _, match := range matches {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		itemRemote, contentsOnly, parseErr := ParseRemoteDownloadPath(rawMatch)
+		itemRemote, contentsOnly, parseErr := ParseRemoteDownloadPath(match.String())
 		if parseErr != nil {
 			return parseErr
 		}

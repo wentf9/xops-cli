@@ -1094,7 +1094,7 @@ func (s *Shell) resolvePath(p string) string {
 	// 使用 strings.HasPrefix 判断绝对路径，而非 filepath.IsAbs
 	// 因为 filepath.IsAbs 依赖本地操作系统规则（Windows 会认为 /home 是相对路径）
 	if strings.HasPrefix(p, "/") {
-		return p
+		return path.Clean(p)
 	}
 	s.clientMu.RLock()
 	defer s.clientMu.RUnlock()
@@ -1102,6 +1102,13 @@ func (s *Shell) resolvePath(p string) string {
 		return s.client.JoinPath(s.cwd, p)
 	}
 	return path.Join(s.cwd, p)
+}
+
+func (s *Shell) resolveValidatedRemotePath(raw string) (sftp.RemotePath, error) {
+	if raw == "" {
+		return sftp.RemotePath{}, fmt.Errorf("%w: empty path", sftp.ErrInvalidRemotePath)
+	}
+	return sftp.ParseRemotePath(s.resolvePath(raw))
 }
 
 func (s *Shell) resolveLocalPath(p string) string {
@@ -1127,7 +1134,11 @@ func (s *Shell) handleCd(ctx context.Context, args []string) error {
 		}
 		target = single[0]
 	} else {
-		target = s.resolvePath(args[0])
+		resolved, err := s.resolveValidatedRemotePath(args[0])
+		if err != nil {
+			return fmt.Errorf("cd: %w", err)
+		}
+		target = resolved.String()
 	}
 
 	// 检查目录是否存在
@@ -1190,11 +1201,15 @@ func (s *Shell) handleLs(ctx context.Context, args []string, long bool) error {
 		}
 		return nil
 	}
-	path := s.cwd
+	remoteTarget := s.cwd
 	if len(args) > 0 {
-		path = s.resolvePath(args[0])
+		resolved, err := s.resolveValidatedRemotePath(args[0])
+		if err != nil {
+			return fmt.Errorf("ls: %w", err)
+		}
+		remoteTarget = resolved.String()
 	}
-	return s.listRemoteOne(ctx, path, long)
+	return s.listRemoteOne(ctx, remoteTarget, long)
 }
 
 // listRemoteOne 列出单个远程路径的内容
@@ -1391,7 +1406,7 @@ func (s *Shell) handleGet(ctx context.Context, args []string) error {
 		contentsOnly bool
 	)
 	if expandGlob {
-		remotePath, err = sftp.ParseRemotePath(s.resolvePath(args[0]))
+		remotePath, err = s.resolveValidatedRemotePath(args[0])
 		if err != nil {
 			return fmt.Errorf("get: %w", err)
 		}
@@ -1528,7 +1543,11 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 	if len(locals) > 1 {
 		var remoteDir string
 		if len(args) > 1 {
-			remoteDir = s.resolvePath(args[1])
+			resolvedDir, resolveErr := s.resolveValidatedRemotePath(args[1])
+			if resolveErr != nil {
+				return fmt.Errorf("put: %w", resolveErr)
+			}
+			remoteDir = resolvedDir.String()
 			info, exists, statErr := s.remoteStat(ctx, remoteDir, true)
 			if statErr != nil {
 				return fmt.Errorf("put: %w", statErr)
@@ -1555,7 +1574,11 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 	local := locals[0]
 	var remote string
 	if len(args) > 1 {
-		remote = s.resolvePath(args[1])
+		resolvedRemote, resolveErr := s.resolveValidatedRemotePath(args[1])
+		if resolveErr != nil {
+			return fmt.Errorf("put: %w", resolveErr)
+		}
+		remote = resolvedRemote.String()
 	} else {
 		remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(s.cwd, local, true)
 		if targetErr != nil {
@@ -1620,7 +1643,19 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	}
 	isDir := localStat.IsDir()
 
-	walkErr := filepath.Walk(local, func(_ string, info os.FileInfo, err error) error {
+	walkRoot := local
+	if isDir {
+		cleanLocal := filepath.Clean(local)
+		if linfo, lstatErr := os.Lstat(cleanLocal); lstatErr == nil && linfo.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+			resolved, evalErr := filepath.EvalSymlinks(cleanLocal)
+			if evalErr != nil {
+				return fmt.Errorf("upload failed: %w", evalErr)
+			}
+			walkRoot = resolved
+		}
+	}
+
+	walkErr := filepath.Walk(walkRoot, func(_ string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1869,7 +1904,10 @@ func (s *Shell) handleMkdir(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("%s", i18n.T("sftp_shell_mkdir_usage"))
 	}
-	path := s.resolvePath(args[0])
+	remotePath, err := s.resolveValidatedRemotePath(args[0])
+	if err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
 		return fmt.Errorf("mkdir: %w", err)
@@ -1877,7 +1915,7 @@ func (s *Shell) handleMkdir(ctx context.Context, args []string) error {
 	defer release()
 
 	if err := cli.Do(ctx, func(client *pkgsftp.Client) error {
-		return client.Mkdir(path)
+		return client.Mkdir(remotePath.String())
 	}); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
@@ -1978,7 +2016,11 @@ func (s *Shell) handleCp(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("cp: %w", err)
 	}
-	dst := s.resolvePath(args[1])
+	dstPath, err := s.resolveValidatedRemotePath(args[1])
+	if err != nil {
+		return fmt.Errorf("cp: %w", err)
+	}
+	dst := dstPath.String()
 
 	// 提前计算目标地址并进行交互式确认
 	dstIsDir, statErr := s.remotePathIsDirectory(ctx, dst)
@@ -2029,7 +2071,11 @@ func (s *Shell) handleMv(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("mv: %w", err)
 	}
-	dst := s.resolvePath(args[1])
+	dstPath, err := s.resolveValidatedRemotePath(args[1])
+	if err != nil {
+		return fmt.Errorf("mv: %w", err)
+	}
+	dst := dstPath.String()
 
 	dstIsDir, statErr := s.remotePathIsDirectory(ctx, dst)
 	if statErr != nil {
@@ -2076,14 +2122,14 @@ func (s *Shell) handleLocalCp(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("lcp: %w", err)
 	}
-	dst := s.resolveLocalPath(args[1])
+	dst := filepath.Clean(s.resolveLocalPath(args[1]))
 
-	// 检查目标是否是目录
-	dstInfo, dstExists, statErr := inspectPath(os.Stat, dst)
+	// 检查目标是否是真实目录（使用 Lstat 防止通过符号链接/重解析点重定向目标）
+	dstInfo, dstExists, statErr := inspectPath(os.Lstat, dst)
 	if statErr != nil {
 		return fmt.Errorf("lcp: %w", statErr)
 	}
-	dstIsDir := dstExists && dstInfo.IsDir()
+	dstIsDir := dstExists && dstInfo.Mode()&os.ModeType == os.ModeDir
 	finalDsts, err := resolveMultiSrcLocal(srcs, dst, dstIsDir)
 	if err != nil {
 		return fmt.Errorf("lcp: %w", err)
@@ -2129,21 +2175,162 @@ func copyLocal(src, dst string) error {
 	return copyLocalFile(src, dst)
 }
 
+type pendingLocalDirMode struct {
+	path      string
+	finalPerm os.FileMode
+}
+
 func copyLocalDir(src, dst string) error {
-	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
+	cleanSrc := filepath.Clean(src)
+	cleanDst := filepath.Clean(dst)
+	srcInfo, err := os.Lstat(cleanSrc)
+	if err != nil {
+		return fmt.Errorf("lstat local source directory %q failed: %w", src, err)
+	}
+	if srcInfo.Mode()&os.ModeSymlink != 0 || srcInfo.Mode()&os.ModeType != os.ModeDir {
+		return fmt.Errorf("local source %q is not a directory", src)
+	}
+	if err := checkLocalDirNotSelfContained(cleanSrc, cleanDst); err != nil {
+		return err
+	}
+
+	var pendingModes []pendingLocalDirMode
+	walkErr := filepath.Walk(cleanSrc, func(curPath string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
 		}
-		relPath, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
+		relPath, relErr := filepath.Rel(cleanSrc, curPath)
+		if relErr != nil {
+			return relErr
 		}
-		targetPath := filepath.Join(dst, relPath)
+		targetPath := cleanDst
+		if relPath != "." {
+			targetPath = filepath.Join(cleanDst, relPath)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return copyLocalLink(curPath, targetPath)
+		}
 		if info.IsDir() {
-			return os.MkdirAll(targetPath, info.Mode())
+			finalPerm := info.Mode().Perm()
+			createPerm := (finalPerm | 0o700) & 0o777
+			created, mkErr := ensureLocalCopyDirectory(curPath, targetPath, createPerm)
+			if mkErr != nil {
+				return mkErr
+			}
+			if created && finalPerm != 0 && finalPerm != createPerm {
+				pendingModes = append(pendingModes, pendingLocalDirMode{
+					path:      targetPath,
+					finalPerm: finalPerm,
+				})
+			}
+			return nil
 		}
-		return copyLocal(path, targetPath)
+		return copyLocalFile(curPath, targetPath)
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+
+	for i := len(pendingModes) - 1; i >= 0; i-- {
+		pm := pendingModes[i]
+		info, lstatErr := os.Lstat(pm.path)
+		if lstatErr != nil {
+			return fmt.Errorf("lstat local destination directory %q failed: %w", pm.path, lstatErr)
+		}
+		if info.Mode()&os.ModeType != os.ModeDir {
+			return fmt.Errorf("local destination %q is no longer a directory", pm.path)
+		}
+		if chmodErr := os.Chmod(pm.path, pm.finalPerm); chmodErr != nil {
+			return fmt.Errorf("set local destination directory mode %q failed: %w", pm.path, chmodErr)
+		}
+	}
+	return nil
+}
+
+func ensureLocalCopyDirectory(src, dst string, perm os.FileMode) (bool, error) {
+	cleanDst := filepath.Clean(dst)
+	info, err := os.Lstat(cleanDst)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return false, fmt.Errorf("cannot overwrite local symbolic link %q with directory %q", cleanDst, src)
+		}
+		if info.Mode()&os.ModeType != os.ModeDir {
+			return false, fmt.Errorf("cannot overwrite non-directory local destination %q with directory %q", cleanDst, src)
+		}
+		return false, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("lstat local destination %q failed: %w", cleanDst, err)
+	}
+	sanitizedPerm := (perm | 0o700) & 0o777
+	if mkErr := os.Mkdir(cleanDst, sanitizedPerm); mkErr != nil {
+		return false, fmt.Errorf("create local directory %q failed: %w", cleanDst, mkErr)
+	}
+	if createdInfo, lstatErr := os.Lstat(cleanDst); lstatErr == nil &&
+		createdInfo.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+		if chmodErr := os.Chmod(cleanDst, createdInfo.Mode().Perm()); chmodErr != nil {
+			return true, fmt.Errorf("clear special mode bits on local directory %q failed: %w", cleanDst, chmodErr)
+		}
+	}
+	return true, nil
+}
+
+func checkLocalDirNotSelfContained(src, dst string) error {
+	canonicalSrc, err := canonicalLocalPath(src)
+	if err != nil {
+		return fmt.Errorf("resolve local source directory %q failed: %w", src, err)
+	}
+	canonicalDst, err := canonicalLocalPath(dst)
+	if err != nil {
+		return fmt.Errorf("resolve local destination directory %q failed: %w", dst, err)
+	}
+	rel, relErr := filepath.Rel(canonicalSrc, canonicalDst)
+	if relErr != nil {
+		return nil
+	}
+	if rel == "." {
+		return fmt.Errorf("cannot copy local directory %q into itself", src)
+	}
+	if rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel) {
+		return fmt.Errorf("local destination %q is inside source directory %q", dst, src)
+	}
+	return nil
+}
+
+func canonicalLocalPath(p string) (string, error) {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return "", err
+	}
+	cur := abs
+	var suffix []string
+	for {
+		resolved, evalErr := filepath.EvalSymlinks(cur)
+		if evalErr == nil {
+			if len(suffix) == 0 {
+				return filepath.Clean(resolved), nil
+			}
+			parts := make([]string, 0, len(suffix)+1)
+			parts = append(parts, resolved)
+			for i := len(suffix) - 1; i >= 0; i-- {
+				parts = append(parts, suffix[i])
+			}
+			return filepath.Clean(filepath.Join(parts...)), nil
+		}
+		if !errors.Is(evalErr, os.ErrNotExist) {
+			return "", evalErr
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		rel, relErr := filepath.Rel(parent, cur)
+		if relErr != nil {
+			return "", relErr
+		}
+		suffix = append(suffix, rel)
+		cur = parent
+	}
 }
 
 func copyLocalLink(src, dst string) error {

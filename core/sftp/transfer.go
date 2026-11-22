@@ -1351,6 +1351,33 @@ func (c *Client) resolveRemoteCopyFileDestination(src, dst string) (string, os.F
 	return dst, info.Mode(), true, nil
 }
 
+func (c *Client) openVerifiedRemoteCopySource(src string, srcStat os.FileInfo) (*sftp.File, os.FileInfo, error) {
+	srcFile, err := c.SFTPClient().Open(src)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open remote source file failed: %w", err)
+	}
+	openedStat, err := srcFile.Stat()
+	if err != nil {
+		return nil, nil, errors.Join(
+			fmt.Errorf("stat remote source file failed: %w", err),
+			closeTransferResource(srcFile, "remote source file"),
+		)
+	}
+	if !openedStat.Mode().IsRegular() {
+		return nil, nil, errors.Join(
+			fmt.Errorf("remote source %q is not a regular file (mode %s)", src, openedStat.Mode()),
+			closeTransferResource(srcFile, "remote source file"),
+		)
+	}
+	if openedStat.Size() != srcStat.Size() {
+		return nil, nil, errors.Join(
+			fmt.Errorf("remote source size changed: expected %d bytes, got %d", srcStat.Size(), openedStat.Size()),
+			closeTransferResource(srcFile, "remote source file"),
+		)
+	}
+	return srcFile, openedStat, nil
+}
+
 func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os.FileInfo) (retErr error) {
 	if !srcStat.Mode().IsRegular() {
 		return fmt.Errorf("remote source %q is not a regular file (mode %s)", src, srcStat.Mode())
@@ -1359,17 +1386,21 @@ func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os
 	if err != nil {
 		return err
 	}
-	finalMode := sanitizeTransferFilePerm(srcStat.Mode())
-	if dstExisted {
-		finalMode = sanitizeTransferFilePerm(existingMode)
-	}
-	srcFile, err := c.SFTPClient().Open(src)
+	srcFile, openedStat, err := c.openVerifiedRemoteCopySource(src, srcStat)
 	if err != nil {
-		return fmt.Errorf("open remote source file failed: %w", err)
+		return err
 	}
 	defer func() {
 		retErr = errors.Join(retErr, closeTransferResource(srcFile, "remote source file"))
 	}()
+
+	finalMode := sanitizeTransferFilePerm(openedStat.Mode())
+	if finalMode == 0 {
+		finalMode = sanitizeTransferFilePerm(srcStat.Mode())
+	}
+	if dstExisted {
+		finalMode = sanitizeTransferFilePerm(existingMode)
+	}
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -1402,7 +1433,7 @@ func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os
 		return fmt.Errorf("set remote temporary destination mode failed: %w", err)
 	}
 
-	if err := copyExactContext(ctx, dstFile, srcFile, srcStat.Size(), nil); err != nil {
+	if err := copyExactContext(ctx, dstFile, srcFile, openedStat.Size(), nil); err != nil {
 		return fmt.Errorf("copy remote source %q to %q failed: %w", src, dst, err)
 	}
 	if err := dstFile.Close(); err != nil {
@@ -1410,7 +1441,7 @@ func (c *Client) remoteCopyFile(ctx context.Context, src, dst string, srcStat os
 		return fmt.Errorf("close remote temporary destination file failed: %w", err)
 	}
 	dstFile = nil
-	return c.finalizeRemoteTempFile(ctx, tempPath, dst, srcStat.ModTime(), finalMode)
+	return c.finalizeRemoteTempFile(ctx, tempPath, dst, openedStat.ModTime(), finalMode)
 }
 
 func (c *Client) canonicalRemotePath(remotePath string) (string, error) {
@@ -1621,24 +1652,55 @@ func (c *Client) ensureRemoteUploadDirectory(src, dst string) error {
 	return c.SFTPClient().MkdirAll(dst)
 }
 
-func ensureLocalDownloadDirectory(src, dst string, perm os.FileMode) error {
+func ensureLocalDownloadDirectory(src, dst string, perm os.FileMode) (bool, error) {
 	dst = filepath.Clean(dst)
 	dstLstat, err := os.Lstat(dst)
 	if err == nil {
 		if dstLstat.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("cannot overwrite local symbolic link %q with directory %q", dst, src)
+			return false, fmt.Errorf("cannot overwrite local symbolic link %q with directory %q", dst, src)
 		}
 		if dstLstat.Mode()&os.ModeType != os.ModeDir {
-			return fmt.Errorf("cannot overwrite non-directory local destination %q with directory %q", dst, src)
+			return false, fmt.Errorf("cannot overwrite non-directory local destination %q with directory %q", dst, src)
 		}
+		return false, nil
 	} else if !errors.Is(err, os.ErrNotExist) && !os.IsNotExist(err) {
-		return fmt.Errorf("lstat local destination %q failed: %w", dst, err)
+		return false, fmt.Errorf("lstat local destination %q failed: %w", dst, err)
 	}
 	dirPerm := sanitizeTransferDirPerm(perm)
 	if dirPerm == 0 {
 		dirPerm = 0o700
 	}
-	return os.MkdirAll(dst, dirPerm)
+	if mkErr := os.MkdirAll(dst, dirPerm); mkErr != nil {
+		return false, mkErr
+	}
+	return true, nil
+}
+
+func resolveLocalUploadRootDir(localDir string) (string, error) {
+	if localDir == "" {
+		return "", fmt.Errorf("stat local directory %q failed: %w", localDir, os.ErrNotExist)
+	}
+	cleanLocal := filepath.Clean(localDir)
+	linfo, err := os.Lstat(cleanLocal)
+	if err != nil {
+		return "", fmt.Errorf("lstat local directory %q failed: %w", localDir, err)
+	}
+	walkRoot := cleanLocal
+	if linfo.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		resolved, evalErr := filepath.EvalSymlinks(cleanLocal)
+		if evalErr != nil {
+			return "", fmt.Errorf("resolve local directory symlink %q failed: %w", localDir, evalErr)
+		}
+		walkRoot = resolved
+	}
+	info, err := os.Stat(walkRoot)
+	if err != nil {
+		return "", fmt.Errorf("stat local directory %q failed: %w", localDir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("local upload path %q is not a directory", localDir)
+	}
+	return walkRoot, nil
 }
 
 func (c *Client) emitLinkProgress(path string, linkSize int64, progress ProgressCallback) {
@@ -1663,8 +1725,12 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 	if err != nil {
 		return fmt.Errorf("invalid remote upload directory %q: %w", remoteDir, err)
 	}
+	walkRoot, err := resolveLocalUploadRootDir(localDir)
+	if err != nil {
+		return err
+	}
 	// 1. 确保远程根目录存在且不是符号链接/非目录条目
-	if err := c.ensureRemoteUploadDirectory(localDir, remoteRoot.String()); err != nil {
+	if err := c.ensureRemoteUploadDirectory(walkRoot, remoteRoot.String()); err != nil {
 		return fmt.Errorf("create remote destination directory failed: %w", err)
 	}
 
@@ -1674,7 +1740,7 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 	g, groupCtx := errgroup.WithContext(transferCtx)
 	sem := make(chan struct{}, c.config.ConcurrentFiles)
 
-	err = filepath.Walk(localDir, func(localPath string, info os.FileInfo, walkErr error) error {
+	err = filepath.Walk(walkRoot, func(localPath string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -1682,9 +1748,15 @@ func (c *Client) uploadDirectory(ctx context.Context, localDir, remoteDir string
 			return groupCtx.Err()
 		}
 
-		relPath, relErr := filepath.Rel(localDir, localPath)
+		relPath, relErr := filepath.Rel(walkRoot, localPath)
 		if relErr != nil {
 			return relErr
+		}
+		if relPath == "." {
+			if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+				return fmt.Errorf("local upload root %q is no longer a directory", localDir)
+			}
+			return nil
 		}
 
 		remoteDest, destErr := joinUploadRemoteRel(remoteRoot, relPath)
@@ -1884,8 +1956,11 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteRoot RemotePath, l
 	if rootInfo.Mode()&os.ModeType != os.ModeDir {
 		return fmt.Errorf("download %q: unsafe remote filename %q: root is not a directory", remoteRoot.String(), rootInfo.Name())
 	}
-	if err := ensureLocalDownloadDirectory(remoteRoot.String(), localRoot.Path(), 0755); err != nil {
-		return fmt.Errorf("create local download directory failed: %w", err)
+	rootFinalPerm := sanitizeTransferDirPerm(rootInfo.Mode())
+	rootCreatePerm := rootFinalPerm | 0o700
+	rootCreated, mkdirErr := ensureLocalDownloadDirectory(remoteRoot.String(), localRoot.Path(), rootCreatePerm)
+	if mkdirErr != nil {
+		return fmt.Errorf("create local download directory failed: %w", mkdirErr)
 	}
 	caseInsensitive := c.isCaseInsensitiveDir(localRoot.Path())
 
@@ -1913,7 +1988,22 @@ func (c *Client) downloadDirectory(ctx context.Context, remoteRoot RemotePath, l
 
 	// Phase 2: validate EVERY staged symlink against the complete in-tree
 	// symlink map and local disk state before creating any symlink on disk.
-	return c.applyStagedDownloadSymlinks(ctx, localRoot.Path(), walker.symlinks, walker.symlinkMap, progress)
+	if err := c.applyStagedDownloadSymlinks(ctx, localRoot.Path(), walker.symlinks, walker.symlinkMap, progress); err != nil {
+		return err
+	}
+	if rootCreated && rootFinalPerm != 0 && rootFinalPerm != rootCreatePerm {
+		linfo, lstatErr := os.Lstat(localRoot.Path())
+		if lstatErr != nil {
+			return fmt.Errorf("lstat local download directory %q failed: %w", localRoot.Path(), lstatErr)
+		}
+		if linfo.Mode()&os.ModeType != os.ModeDir {
+			return fmt.Errorf("local download directory %q is no longer a directory", localRoot.Path())
+		}
+		if chmodErr := os.Chmod(localRoot.Path(), rootFinalPerm); chmodErr != nil {
+			return fmt.Errorf("set local download directory mode failed: %w", chmodErr)
+		}
+	}
+	return nil
 }
 
 type validatedWalkEntry struct {
@@ -2034,7 +2124,7 @@ func (w *downloadDirWalkState) applyValidatedEntry(curRemote RemotePath, item va
 		return nil
 	}
 	if entry.IsDir() {
-		if err := ensureLocalDownloadDirectory(childRemote.String(), childLocal.Path(), sanitizeTransferDirPerm(entry.Mode())|0o700); err != nil {
+		if _, err := ensureLocalDownloadDirectory(childRemote.String(), childLocal.Path(), sanitizeTransferDirPerm(entry.Mode())|0o700); err != nil {
 			return fmt.Errorf("create local directory %q failed: %w", childLocal.Path(), err)
 		}
 		return w.walkDir(childRemote, childLocal)

@@ -4,10 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path"
 	"path/filepath"
+	"strings"
 
-	pkgsftp "github.com/pkg/sftp"
 	"github.com/wentf9/xops-cli/core/sftp"
 	"github.com/wentf9/xops-cli/pkg/i18n"
 )
@@ -45,13 +44,16 @@ func (s *Shell) expandLocal(pattern string) ([]string, error) {
 }
 
 // expandRemote 在远程 SFTP 服务器上展开通配符模式
-// sftp.Client.Glob 基于绝对路径，相对模式先用 s.resolvePath 解析
-// 无通配符时直接返回 [resolved]
+// sftp.Client.Glob 基于清理并校验后的远程路径，相对模式先用 s.resolveValidatedRemotePath 解析
+// 无通配符时直接返回 [remotePattern]
 // 展开结果为空时返回 sftp_shell_glob_no_match 错误
 func (s *Shell) expandRemote(ctx context.Context, pattern string) ([]string, error) {
-	resolved := s.resolvePath(pattern)
+	remotePattern, err := s.resolveValidatedRemotePath(pattern)
+	if err != nil {
+		return nil, err
+	}
 	if !hasWildcard(pattern) {
-		return []string{resolved}, nil
+		return []string{remotePattern.String()}, nil
 	}
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
@@ -59,14 +61,8 @@ func (s *Shell) expandRemote(ctx context.Context, pattern string) ([]string, err
 	}
 	defer release()
 
-	var matches []string
-	err = cli.Do(ctx, func(c *pkgsftp.Client) error {
-		var globErr error
-		matches, globErr = c.Glob(resolved)
-		return globErr
-	})
+	matches, err := cli.Glob(ctx, remotePattern.String())
 	if err != nil {
-		// sftp.Glob 仅返回 ErrBadPattern
 		return nil, fmt.Errorf("expand remote pattern %q failed: %w", pattern, err)
 	}
 	if len(matches) == 0 {
@@ -92,7 +88,7 @@ func classifyGlobResult(pattern string, matches []string, expectSingle bool) ([]
 	return matches, nil
 }
 
-// resolveMultiSrc 远程多源到单一 dst 的目标路径解析（用 path.Join，SFTP 强制 /）
+// resolveMultiSrc 远程多源到单一 dst 的目标路径解析（使用核心 RemotePath/RemoteName 校验，SFTP 强制 /）
 //
 //	单源 + dst 非目录 → [dst]
 //	单源 + dst 是目录 → [dst/base(src)]
@@ -102,20 +98,56 @@ func resolveMultiSrc(srcs []string, dst string, dstIsDir bool) ([]string, error)
 	if len(srcs) == 0 {
 		return nil, errors.New(i18n.T("sftp_shell_glob_no_match"))
 	}
+	dstPath, err := sftp.ParseRemotePath(dst)
+	if err != nil {
+		return nil, err
+	}
 	if len(srcs) == 1 {
 		if dstIsDir {
-			return []string{path.Join(dst, path.Base(srcs[0]))}, nil
+			target, targetErr := resolveRemoteMultiSrcTarget(srcs[0], dstPath)
+			if targetErr != nil {
+				return nil, targetErr
+			}
+			return []string{target}, nil
 		}
-		return []string{dst}, nil
+		if _, srcErr := sftp.ParseRemotePath(srcs[0]); srcErr != nil {
+			return nil, srcErr
+		}
+		return []string{dstPath.String()}, nil
 	}
 	if !dstIsDir {
 		return nil, errors.New(i18n.T("sftp_shell_dest_must_be_dir"))
 	}
 	out := make([]string, 0, len(srcs))
 	for _, src := range srcs {
-		out = append(out, path.Join(dst, path.Base(src)))
+		target, targetErr := resolveRemoteMultiSrcTarget(src, dstPath)
+		if targetErr != nil {
+			return nil, targetErr
+		}
+		out = append(out, target)
 	}
 	return out, nil
+}
+
+func resolveRemoteMultiSrcTarget(src string, dstPath sftp.RemotePath) (string, error) {
+	srcPath, err := sftp.ParseRemotePath(src)
+	if err != nil {
+		return "", err
+	}
+	trimmed := strings.TrimRight(src, "/")
+	if trimmed == "" || trimmed == "." || trimmed == ".." ||
+		strings.HasSuffix(trimmed, "/.") || strings.HasSuffix(trimmed, "/..") {
+		return "", fmt.Errorf("%w: remote source %q has no valid basename", sftp.ErrInvalidRemoteName, src)
+	}
+	base := srcPath.Base()
+	if !base.IsValid() {
+		return "", fmt.Errorf("%w: remote source %q has no valid basename", sftp.ErrInvalidRemoteName, src)
+	}
+	validatedBase, err := sftp.ParseRemoteName(base.String())
+	if err != nil {
+		return "", err
+	}
+	return dstPath.Join(validatedBase).String(), nil
 }
 
 // resolveMultiSrcLocal 本地变体，使用 filepath.Join
