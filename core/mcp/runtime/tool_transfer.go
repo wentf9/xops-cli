@@ -51,7 +51,7 @@ func hasControlOrLineSep(s string) bool {
 }
 
 func riskLocalPath(raw string) string {
-	if hasControlOrLineSep(raw) {
+	if hasControlOrLineSep(raw) || !filepath.IsAbs(raw) {
 		return raw
 	}
 	return filepath.Clean(raw)
@@ -61,7 +61,11 @@ func riskRemotePath(raw string) string {
 	if _, err := sftp.ParseRemotePath(raw); err != nil {
 		return raw
 	}
-	return remotefile.NormalizeSFTPPath(raw)
+	norm := remotefile.NormalizeSFTPPath(raw)
+	if !strings.HasPrefix(norm, "/") {
+		return raw
+	}
+	return norm
 }
 
 func validateStdioLocalPath(raw string) (string, error) {

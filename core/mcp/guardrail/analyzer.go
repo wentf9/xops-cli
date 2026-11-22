@@ -157,10 +157,48 @@ func parseDrivePath(p string) (drive string, rest string, ok bool) {
 	if len(p) >= 2 && isAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
 		return strings.ToUpper(string(p[0])), p[2:], true
 	}
-	if len(p) >= 3 && p[0] == '/' && isAlpha(p[1]) && p[2] == ':' && (len(p) == 3 || p[3] == '/' || p[3] == '\\') {
-		return strings.ToUpper(string(p[1])), p[3:], true
+	trimmed := strings.TrimLeft(p, "/")
+	if len(trimmed) < len(p) && len(trimmed) >= 2 && isAlpha(trimmed[0]) && trimmed[1] == ':' && (len(trimmed) == 2 || trimmed[2] == '/' || trimmed[2] == '\\') {
+		return strings.ToUpper(string(trimmed[0])), trimmed[2:], true
 	}
 	return "", "", false
+}
+
+// canonicalDrivePath detects Windows drive paths (C:..., /C:..., //C:..., or
+// absolute paths collapsing via ".." to /C:...) and returns the uppercase drive
+// letter together with the POSIX-cleaned path beneath that drive root.
+func canonicalDrivePath(p string) (drive string, cleanRest string, ok bool) {
+	if d, rest, matched := parseDrivePath(p); matched {
+		return d, cleanDriveRest(rest), true
+	}
+	if strings.HasPrefix(p, "/") {
+		cleaned := path.Clean(p)
+		if strings.HasPrefix(cleaned, "/") {
+			if d, rest, matched := parseDrivePath(cleaned); matched {
+				return d, cleanDriveRest(rest), true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func cleanDriveRest(rest string) string {
+	return path.Clean("/" + strings.ReplaceAll(rest, "\\", "/"))
+}
+
+func hasSensitivePrefix(cleaned string) bool {
+	for _, sensitive := range sensitivePaths {
+		if cleaned == sensitive || strings.HasPrefix(cleaned, sensitive+"/") {
+			return true
+		}
+	}
+	lower := strings.TrimRight(strings.ToLower(cleaned), "/")
+	for _, sensitive := range sensitiveWindowsPaths {
+		if lower == sensitive || strings.HasPrefix(lower, sensitive+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // AnalyzePaths returns the highest risk level implied by the given paths.
@@ -200,28 +238,31 @@ func analyzeSinglePath(p string) RiskLevel {
 	if p == "" || hasControlOrLineSep(p) {
 		return Dangerous
 	}
-	if _, rest, ok := parseDrivePath(p); ok {
-		return analyzeDrivePath(rest)
+	if _, cleanRest, ok := canonicalDrivePath(p); ok {
+		return analyzeCleanDriveRest(cleanRest)
 	}
 	return analyzePosixPath(p)
 }
 
-func analyzeDrivePath(rest string) RiskLevel {
-	rest = strings.ReplaceAll(rest, "\\", "/")
-	cleanRest := path.Clean("/" + rest)
+func analyzeCleanDriveRest(cleanRest string) RiskLevel {
 	if cleanRest == "/" {
 		return Dangerous
 	}
-	for _, sensitive := range sensitivePaths {
-		if cleanRest == sensitive || strings.HasPrefix(cleanRest, sensitive+"/") {
-			return Moderate
-		}
+	if hasSensitivePrefix(cleanRest) {
+		return Moderate
 	}
-	lowerRest := strings.TrimRight(strings.ToLower(cleanRest), "/")
-	for _, sensitive := range sensitiveWindowsPaths {
-		if lowerRest == sensitive || strings.HasPrefix(lowerRest, sensitive+"/") {
-			return Moderate
-		}
+	return Safe
+}
+
+func analyzeCleanedPosix(cleaned string) RiskLevel {
+	if cleaned == "" || cleaned == "/" || cleaned == "." || !strings.HasPrefix(cleaned, "/") {
+		return Dangerous
+	}
+	if _, rest, ok := parseDrivePath(cleaned); ok {
+		return analyzeCleanDriveRest(cleanDriveRest(rest))
+	}
+	if hasSensitivePrefix(cleaned) {
+		return Moderate
 	}
 	return Safe
 }
@@ -232,26 +273,14 @@ func analyzePosixPath(p string) RiskLevel {
 	if !strings.HasPrefix(p, "/") {
 		return Dangerous
 	}
-	cleaned := path.Clean(p)
-	if cleaned == "" || cleaned == "/" || cleaned == "." || !strings.HasPrefix(cleaned, "/") {
-		return Dangerous
-	}
-	for _, sensitive := range sensitivePaths {
-		if cleaned == sensitive || strings.HasPrefix(cleaned, sensitive+"/") {
-			return Moderate
+	level := analyzeCleanedPosix(path.Clean(p))
+	if strings.Contains(p, "\\") {
+		slashRisk := analyzeCleanedPosix(path.Clean("/" + strings.ReplaceAll(p, "\\", "/")))
+		if slashRisk > level {
+			level = slashRisk
 		}
 	}
-	lower := strings.ToLower(strings.ReplaceAll(p, "\\", "/"))
-	cleanLower := strings.TrimRight(path.Clean("/"+lower), "/")
-	if cleanLower == "" {
-		return Dangerous
-	}
-	for _, sensitive := range sensitiveWindowsPaths {
-		if cleanLower == sensitive || strings.HasPrefix(cleanLower, sensitive+"/") {
-			return Moderate
-		}
-	}
-	return Safe
+	return level
 }
 
 func containsChaining(cmd string) bool {

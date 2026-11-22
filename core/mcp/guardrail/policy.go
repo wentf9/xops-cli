@@ -153,8 +153,47 @@ func (p *Policy) isPathProtected(paths []string) bool {
 }
 
 func matchesUnder(target, prefix string) bool {
-	target = normalizeRemotePath(target)
-	prefix = normalizeRemotePath(prefix)
+	if target == "" || prefix == "" {
+		return false
+	}
+	if matchesUnderNormalized(target, prefix) {
+		return true
+	}
+	// Defense-in-depth for paths carrying Windows backslash separators
+	// (e.g. `\etc\passwd` or `/tmp/\../etc/passwd`). Evaluating POSIX-clean
+	// first and OR-ing with slash-converted clean is strictly more protective:
+	// POSIX `/opt/custom-protected/\../drop` matches via POSIX-clean while
+	// Windows backslash separators match via slash-clean.
+	if strings.Contains(target, "\\") || strings.Contains(prefix, "\\") {
+		slashTarget := strings.ReplaceAll(target, "\\", "/")
+		slashPrefix := strings.ReplaceAll(prefix, "\\", "/")
+		if matchesUnderNormalized(slashTarget, slashPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesUnderNormalized(target, prefix string) bool {
+	tDrive, tRest, tIsDrive := canonicalDrivePath(target)
+	pDrive, pRest, pIsDrive := canonicalDrivePath(prefix)
+
+	if tIsDrive && pIsDrive {
+		if tDrive != pDrive {
+			return false
+		}
+		return matchesCleanPath(strings.ToLower(tRest), strings.ToLower(pRest))
+	}
+	if tIsDrive {
+		return path.Clean(prefix) == "/"
+	}
+	if pIsDrive {
+		return false
+	}
+	return matchesCleanPath(path.Clean(target), path.Clean(prefix))
+}
+
+func matchesCleanPath(target, prefix string) bool {
 	if target == prefix {
 		return true
 	}
@@ -162,8 +201,4 @@ func matchesUnder(target, prefix string) bool {
 		return strings.HasPrefix(target, "/")
 	}
 	return strings.HasPrefix(target, prefix+"/")
-}
-
-func normalizeRemotePath(value string) string {
-	return path.Clean(strings.ReplaceAll(value, `\`, "/"))
 }

@@ -376,34 +376,44 @@ func isAlpha(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
 
-// NormalizeSFTPPath converts Windows drive paths (C:\..., c:/..., /C:\...) into
-// OpenSSH SFTP canonical form (/C:/...) with an uppercase drive letter and
-// forward slashes. Non-drive POSIX paths are cleaned without altering backslashes.
+func formatNormalizedDrivePath(drive, rest string) string {
+	rest = strings.ReplaceAll(rest, "\\", "/")
+	cleanRest := path.Clean("/" + rest)
+	if cleanRest == "/" {
+		return "/" + drive + ":"
+	}
+	return "/" + drive + ":" + cleanRest
+}
+
+func normalizeLeadingDrivePath(p string, allowBare bool) (string, bool) {
+	if allowBare && len(p) >= 2 && isAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
+		return formatNormalizedDrivePath(strings.ToUpper(string(p[0])), p[2:]), true
+	}
+	trimmed := strings.TrimLeft(p, "/")
+	if len(trimmed) < len(p) && len(trimmed) >= 2 && isAlpha(trimmed[0]) && trimmed[1] == ':' && (len(trimmed) == 2 || trimmed[2] == '/' || trimmed[2] == '\\') {
+		return formatNormalizedDrivePath(strings.ToUpper(string(trimmed[0])), trimmed[2:]), true
+	}
+	return "", false
+}
+
+// NormalizeSFTPPath converts Windows drive paths (C:\..., c:/..., /C:\...,
+// //c:\..., /tmp/../C:/...) into OpenSSH SFTP canonical form (/C:/...) with an
+// uppercase drive letter and forward slashes. Non-drive POSIX paths are cleaned
+// without altering backslashes.
 func NormalizeSFTPPath(p string) string {
 	if p == "" {
 		return ""
 	}
-	// Case 1: C:\... or C:/... or C:\ or C:
-	if len(p) >= 2 && isAlpha(p[0]) && p[1] == ':' && (len(p) == 2 || p[2] == '/' || p[2] == '\\') {
-		drive := strings.ToUpper(string(p[0]))
-		rest := strings.ReplaceAll(p[2:], "\\", "/")
-		cleanRest := path.Clean("/" + rest)
-		if cleanRest == "/" {
-			return "/" + drive + ":"
-		}
-		return "/" + drive + ":" + cleanRest
+	if norm, ok := normalizeLeadingDrivePath(p, true); ok {
+		return norm
 	}
-	// Case 2: /C:\... or /c:/... or /C: or /C:/
-	if len(p) >= 3 && p[0] == '/' && isAlpha(p[1]) && p[2] == ':' && (len(p) == 3 || p[3] == '/' || p[3] == '\\') {
-		drive := strings.ToUpper(string(p[1]))
-		rest := strings.ReplaceAll(p[3:], "\\", "/")
-		cleanRest := path.Clean("/" + rest)
-		if cleanRest == "/" {
-			return "/" + drive + ":"
+	cleaned := path.Clean(p)
+	if strings.HasPrefix(cleaned, "/") {
+		if norm, ok := normalizeLeadingDrivePath(cleaned, false); ok {
+			return norm
 		}
-		return "/" + drive + ":" + cleanRest
 	}
-	return path.Clean(p)
+	return cleaned
 }
 
 // IsRootPath reports whether p represents a POSIX or Windows drive root directory.
