@@ -995,7 +995,7 @@ func spawnBackgroundSSHChild() (err error) {
 	}
 
 	// 子进程的 stdin/stdout/stderr 均重定向到 /dev/null（Windows 下 stdin 为 spec 匿名管道）
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0) //nolint:forbidigo // open os.DevNull for detached child stdio redirection
 	if err != nil {
 		return fmt.Errorf("failed to open /dev/null: %w", err)
 	}
@@ -2027,7 +2027,7 @@ func (o *SshOptions) handoffMasterInstanceWithProviderAndRawNode(
 	if err != nil {
 		return fmt.Errorf("resolve executable for multiplexing daemon failed: %w", err)
 	}
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0) //nolint:forbidigo // open os.DevNull for detached multiplexing daemon stdio redirection
 	if err != nil {
 		return fmt.Errorf("open %s for multiplexing daemon failed: %w", os.DevNull, err)
 	}
@@ -2589,7 +2589,7 @@ func (o *SshOptions) maybeRedirectStdinNull() (func() error, error) {
 	if !o.effectiveStdinNull() || o.stdinRedirected {
 		return func() error { return nil }, nil
 	}
-	devNull, devErr := os.Open(os.DevNull)
+	devNull, devErr := os.Open(os.DevNull) //nolint:forbidigo // open os.DevNull for SSH -n stdin redirection
 	if devErr != nil {
 		return nil, fmt.Errorf("open %s for SSH stdin failed: %w", os.DevNull, devErr)
 	}

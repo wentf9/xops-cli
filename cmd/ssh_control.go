@@ -593,7 +593,7 @@ func executeProxy(
 		return controlError(streams.Stderr, err.Error())
 	}
 	if o.effectiveStdinNull() && streams.Stdin != nil {
-		devNull, err := os.Open(os.DevNull)
+		devNull, err := os.Open(os.DevNull) //nolint:forbidigo // open os.DevNull for SSH -n control proxy stdin redirection
 		if err != nil {
 			return controlError(streams.Stderr, fmt.Sprintf("open %s for SSH stdin failed: %v", os.DevNull, err))
 		}

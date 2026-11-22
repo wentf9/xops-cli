@@ -750,7 +750,7 @@ func savePublicKey(keyPath string, pubKey ssh.PublicKey) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat public key %q failed: %w", pubKeyPath, err)
 	}
-	f, err := os.OpenFile(pubKeyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := fsx.CreateExclusive(pubKeyPath, 0o644)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
 			if info, lerr := os.Lstat(pubKeyPath); lerr == nil && info.Mode().IsRegular() {
@@ -759,11 +759,16 @@ func savePublicKey(keyPath string, pubKey ssh.PublicKey) error {
 		}
 		return fmt.Errorf("create public key %q failed: %w", pubKeyPath, err)
 	}
+	origInfo, _ := f.Stat()
 	pubBytes := ssh.MarshalAuthorizedKey(pubKey)
 	_, writeErr := f.Write(pubBytes)
 	closeErr := f.Close()
 	if writeErr != nil {
-		_ = os.Remove(pubKeyPath)
+		if origInfo != nil {
+			if currInfo, lerr := os.Lstat(pubKeyPath); lerr == nil && os.SameFile(origInfo, currInfo) {
+				_ = os.Remove(pubKeyPath) //nolint:forbidigo // rollback newly created pubkey file verified by SameFile on write failure
+			}
+		}
 		return fmt.Errorf("write public key %q failed: %w", pubKeyPath, errors.Join(writeErr, closeErr))
 	}
 	if closeErr != nil {

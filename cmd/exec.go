@@ -893,7 +893,7 @@ func (o *ExecOptions) executeTask(ctx context.Context, connector *ssh.Connector,
 
 	if o.OutDir != "" {
 		logFile := resolveTaskLogPath(o.OutDir, t)
-		f, openErr := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		f, openErr := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600) //nolint:forbidigo // append user-requested exec log output file
 		if openErr != nil {
 			return fmt.Errorf("[%s] open log file %s failed: %w", t.host, logFile, openErr)
 		}

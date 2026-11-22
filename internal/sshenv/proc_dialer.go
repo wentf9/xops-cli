@@ -210,7 +210,7 @@ func RunLocalCommandWithIO(ctx context.Context, command string, stdout, stderr i
 		return err
 	}
 
-	devNull, err := os.Open(os.DevNull)
+	devNull, err := os.Open(os.DevNull) //nolint:forbidigo // open os.DevNull for LocalCommand child stdin redirection
 	if err != nil {
 		return fmt.Errorf("open %s for LocalCommand stdin: %w", os.DevNull, err)
 	}

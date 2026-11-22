@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/fsx"
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/models"
 	"gopkg.in/yaml.v3"
@@ -227,7 +228,7 @@ func (r *Repository) commitDoctorRepairContext(ctx context.Context, expectedVers
 }
 
 func readDoctorFile(path string) ([]byte, bool, error) {
-	data, err := os.ReadFile(path)
+	data, err := fsx.ReadAllBounded(path, fsx.Limits{MaxBytes: maxConfigFileBytes}, fsx.FollowSymlinks())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, false, nil
