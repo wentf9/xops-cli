@@ -244,7 +244,7 @@ func ParseTargetRef(raw string) (TargetRef, error) {
 	var isOpenSSH bool
 	rest := trimmed
 	if after, ok := cutOpenSSHPrefix(trimmed); ok {
-		if after == "" || hasOpenSSHPrefix(after) {
+		if after == "" || hasOpenSSHPrefix(after) || hasAnyWhitespace(raw) {
 			return TargetRef{}, fmt.Errorf("invalid openssh selector %q", raw)
 		}
 		isOpenSSH = true

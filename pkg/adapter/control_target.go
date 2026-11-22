@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -47,10 +48,7 @@ func ResolveControlTarget(req ControlTargetRequest) (ControlTargetResolution, er
 		return ControlTargetResolution{}, err
 	}
 	env := resolveControlEnvironment(req.Environment)
-	connTarget := req.Target
-	if strings.TrimSpace(connTarget.Selector) == "" && strings.TrimSpace(req.NodeID) != "" {
-		connTarget.Selector = strings.TrimSpace(req.NodeID)
-	}
+	connTarget := prepareControlConnectionTarget(req)
 	target, err := resolveControlTargetContext(req, connTarget, env)
 	if err != nil {
 		return ControlTargetResolution{}, err
@@ -61,6 +59,94 @@ func ResolveControlTarget(req ControlTargetRequest) (ControlTargetResolution, er
 		LookupKey:   lookupKey,
 		SessionAuth: sessionAuth,
 	}, nil
+}
+
+func isSavedControlNodeID(provider config.ConfigProvider, selector string) bool {
+	if provider == nil || selector == "" || config.IsOpenSSHNodeID(selector) {
+		return false
+	}
+	_, ok := provider.GetNode(selector)
+	return ok
+}
+
+func shouldPropagateControlCanonicalOrigin(provider config.ConfigProvider, sel, canonOrig, canonHost string) bool {
+	if sel == "" || config.IsOpenSSHNodeID(sel) {
+		return true
+	}
+	if canonHost != "" && isSavedControlNodeID(provider, sel) &&
+		!strings.EqualFold(sel, canonOrig) && !strings.EqualFold(sel, canonHost) {
+		return false
+	}
+	return true
+}
+
+func rewriteOpenSSHLookupKeyHost(lookupKey, canonHost string) string {
+	canonHost = strings.TrimSpace(canonHost)
+	if canonHost == "" {
+		return lookupKey
+	}
+	if ref, err := config.ParseTargetRef(lookupKey); err == nil && ref.OpenSSH {
+		ref.Host = canonHost
+		if norm := ref.NormalizedString(); norm != "" {
+			return norm
+		}
+	}
+	return config.OpenSSHNodePrefix + canonHost
+}
+
+func prepareControlConnectionTarget(req ControlTargetRequest) config.ConnectionTarget {
+	connTarget := req.Target
+	if strings.TrimSpace(connTarget.Selector) == "" && strings.TrimSpace(req.NodeID) != "" {
+		connTarget.Selector = strings.TrimSpace(req.NodeID)
+	}
+	canonOrig := strings.TrimSpace(req.CanonicalOriginalHost)
+	canonHost := strings.TrimSpace(req.CanonicalHost)
+	if canonOrig == "" && canonHost == "" {
+		return connTarget
+	}
+	sel := strings.TrimSpace(connTarget.Selector)
+	if strings.TrimSpace(connTarget.OriginalHost) == "" && canonOrig != "" &&
+		shouldPropagateControlCanonicalOrigin(req.Provider, sel, canonOrig, canonHost) {
+		connTarget.OriginalHost = canonOrig
+	}
+	if canonHost != "" && sel != "" {
+		applyCanonicalHostToControlSelector(req.Provider, &connTarget, sel, canonOrig, canonHost)
+	}
+	return connTarget
+}
+
+func applyCanonicalHostToControlSelector(
+	provider config.ConfigProvider,
+	connTarget *config.ConnectionTarget,
+	sel, canonOrig, canonHost string,
+) {
+	if config.IsOpenSSHNodeID(sel) {
+		ref, err := config.ParseTargetRef(connTarget.Selector)
+		if err != nil || !ref.OpenSSH || strings.EqualFold(ref.Host, canonHost) {
+			return
+		}
+		if canonOrig != "" && !strings.EqualFold(ref.Host, canonOrig) {
+			return
+		}
+		if strings.TrimSpace(connTarget.OriginalHost) == "" {
+			connTarget.OriginalHost = ref.Host
+		}
+		ref.Host = canonHost
+		if norm := ref.NormalizedString(); norm != "" {
+			connTarget.Selector = norm
+		}
+		return
+	}
+	if isSavedControlNodeID(provider, sel) || strings.EqualFold(sel, canonHost) {
+		return
+	}
+	if canonOrig != "" && !strings.EqualFold(sel, canonOrig) {
+		return
+	}
+	if strings.TrimSpace(connTarget.OriginalHost) == "" {
+		connTarget.OriginalHost = sel
+	}
+	connTarget.Selector = canonHost
 }
 
 // ResolveControlSessionLookup computes the effective adapter lookup key and
@@ -148,6 +234,17 @@ func resolveControlEnvironment(env *ssh.Environment) ssh.Environment {
 	return sshenv.Discover()
 }
 
+func isControlTargetValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ssh.ErrSSHOptionsValidation) {
+		return true
+	}
+	var cycleErr *ssh.ProxyCycleError
+	return errors.As(err, &cycleErr)
+}
+
 func resolveControlTargetContext(req ControlTargetRequest, connTarget config.ConnectionTarget, env ssh.Environment) (ssh.TargetContext, error) {
 	var (
 		target         ssh.TargetContext
@@ -159,7 +256,12 @@ func resolveControlTargetContext(req ControlTargetRequest, connTarget config.Con
 		if effectiveProvider == nil {
 			effectiveProvider = config.NewProviderWithoutOpenSSH(nil)
 		}
-		if resolved, err := config.ResolveTarget(effectiveProvider, connTarget); err == nil {
+		resolved, err := config.ResolveTarget(effectiveProvider, connTarget)
+		if err != nil {
+			if isControlTargetValidationError(err) {
+				return ssh.TargetContext{}, err
+			}
+		} else {
 			resolvedTarget = resolved
 			hasResolved = true
 			target = TargetContextFromResolvedTarget(resolved, env)
@@ -238,26 +340,30 @@ func resolveControlTier2ProxySetting(
 	connTarget config.ConnectionTarget,
 	hasResolved bool,
 	resolved config.ResolvedTarget,
-) ssh.ProxySetting {
+) (ssh.ProxySetting, error) {
 	if !hasResolved || resolved.Provenance.IsUnpersistedOpenSSH() {
-		return ssh.UnsetProxySetting()
+		return ssh.UnsetProxySetting(), nil
 	}
 	var t2Jump, t2Cmd ssh.ProxySetting
 	if provider != nil && resolved.MatchedNodeID != "" && !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
 		if node, ok := provider.GetNode(resolved.MatchedNodeID); ok {
-			if ps, err := proxySettingFromJumpString(node.ProxyJump); err == nil {
-				t2Jump = ps
+			ps, err := proxySettingFromJumpString(node.ProxyJump)
+			if err != nil {
+				return ssh.UnsetProxySetting(), fmt.Errorf("invalid node ProxyJump %q: %w", node.ProxyJump, err)
 			}
+			t2Jump = ps
 			t2Cmd = proxyCommandSetting(node.SSHOptions)
-			return t2Jump.Merge(t2Cmd)
+			return t2Jump.Merge(t2Cmd), nil
 		}
 	}
 	if !connTarget.HasProxyJump && resolved.ProxyJump != "" {
-		if ps, err := proxySettingFromJumpString(resolved.ProxyJump); err == nil {
-			t2Jump = ps
+		ps, err := proxySettingFromJumpString(resolved.ProxyJump)
+		if err != nil {
+			return ssh.UnsetProxySetting(), fmt.Errorf("invalid node ProxyJump %q: %w", resolved.ProxyJump, err)
 		}
+		t2Jump = ps
 	}
-	return t2Jump
+	return t2Jump, nil
 }
 
 func resolveControlTier3ProxySetting(provider config.ConfigProvider) ssh.ProxySetting {
@@ -275,31 +381,41 @@ func resolveControlTier4ProxySetting(
 	connTarget config.ConnectionTarget,
 	hasResolved bool,
 	resolved config.ResolvedTarget,
-) ssh.ProxySetting {
+) (ssh.ProxySetting, error) {
 	if !hasResolved || !resolved.Provenance.IsUnpersistedOpenSSH() {
-		return ssh.UnsetProxySetting()
+		return ssh.UnsetProxySetting(), nil
 	}
 	var t4Jump, t4Parser ssh.ProxySetting
-	if connTarget.ProxyJump == "" && resolved.ProxyJump != "" {
-		if ps, err := proxySettingFromJumpString(resolved.ProxyJump); err == nil {
-			t4Jump = ps
+	if !connTarget.HasProxyJump && connTarget.ProxyJump == "" && resolved.ProxyJump != "" {
+		ps, err := proxySettingFromJumpString(resolved.ProxyJump)
+		if err != nil {
+			return ssh.UnsetProxySetting(), fmt.Errorf("invalid OpenSSH ProxyJump %q: %w", resolved.ProxyJump, err)
 		}
+		t4Jump = ps
 	}
 	if parserSrc, ok := provider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok && parserSrc != nil {
-		if parser := parserSrc.GetOpenSSHParser(); parser != nil && parser.Err() == nil {
+		if parser := parserSrc.GetOpenSSHParser(); parser != nil {
+			if err := parser.Err(); err != nil {
+				return ssh.UnsetProxySetting(), err
+			}
 			alias := strings.TrimSpace(resolved.OpenSSHAlias)
 			if alias == "" {
 				alias = strings.TrimSpace(config.UnwrapOpenSSHSelector(resolved.NodeID))
 			}
 			canon := strings.TrimSpace(resolved.CanonicalHost)
+			if alias == "" {
+				alias = canon
+			}
 			if alias != "" || canon != "" {
-				if ps, err := parser.ResolveProxySettingWithCanonical(alias, canon); err == nil {
-					t4Parser = ps
+				ps, err := resolvePrefixedTier4OpenSSHProxySetting(parser, alias, canon)
+				if err != nil {
+					return ssh.UnsetProxySetting(), err
 				}
+				t4Parser = ps
 			}
 		}
 	}
-	return t4Jump.Merge(t4Parser)
+	return t4Jump.Merge(t4Parser), nil
 }
 
 // resolveControlEffectiveJumpHost folds ProxyJump and ProxyCommand across all
@@ -316,9 +432,15 @@ func resolveControlEffectiveJumpHost(
 	if err != nil {
 		return "", err
 	}
-	t2Proxy := resolveControlTier2ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+	t2Proxy, err := resolveControlTier2ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+	if err != nil {
+		return "", err
+	}
 	t3Proxy := resolveControlTier3ProxySetting(req.Provider)
-	t4Proxy := resolveControlTier4ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+	t4Proxy, err := resolveControlTier4ProxySetting(req.Provider, connTarget, hasResolved, resolved)
+	if err != nil {
+		return "", err
+	}
 
 	effective := ssh.MergeProxySettings(t1Proxy, t2Proxy, t3Proxy, t4Proxy)
 	if effective.Kind() != ssh.ProxyJump {
@@ -329,18 +451,22 @@ func resolveControlEffectiveJumpHost(
 		return "", nil
 	}
 	tier1Won := t1Proxy.Kind() == ssh.ProxyJump
-	if !tier1Won && hasResolved && resolved.Provenance.IsUnpersistedOpenSSH() {
-		for i, hop := range targets {
-			if !config.IsOpenSSHNodeID(hop) {
-				targets[i] = config.OpenSSHNodePrefix + hop
-			}
-		}
-		return strings.Join(targets, ","), nil
-	}
 	rawJump := strings.Join(targets, ",")
 	if req.Provider != nil {
-		if resolvedJump, err := req.Provider.ResolveProxyJumpChain(rawJump); err == nil {
+		var (
+			resolvedJump string
+			jErr         error
+		)
+		if !tier1Won && hasResolved && resolved.Provenance.IsUnpersistedOpenSSH() {
+			resolvedJump, jErr = resolveUnpersistedOpenSSHJumpChain(req.Provider, rawJump)
+		} else {
+			resolvedJump, jErr = req.Provider.ResolveProxyJumpChain(rawJump)
+		}
+		if jErr == nil {
 			return resolvedJump, nil
+		}
+		if isControlTargetValidationError(jErr) {
+			return "", jErr
 		}
 	}
 	return rawJump, nil
@@ -494,6 +620,8 @@ func resolveControlSessionLookup(
 	if canonHost != "" {
 		if lookupKey == "" || !config.IsOpenSSHNodeID(lookupKey) {
 			lookupKey = config.OpenSSHNodePrefix + canonHost
+		} else if unwrapped := extractOpenSSHHost(lookupKey); unwrapped != "" && !strings.EqualFold(unwrapped, canonHost) {
+			lookupKey = rewriteOpenSSHLookupKeyHost(lookupKey, canonHost)
 		}
 		auth.OriginalHost = firstNonEmptySessionValue(origHost, targetOrig)
 		auth.CanonicalHost = canonHost

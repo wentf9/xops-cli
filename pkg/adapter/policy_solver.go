@@ -300,24 +300,18 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 	if rawJump == "" {
 		rawJump = strings.TrimSpace(snapshot.Node.ProxyJump)
 	}
-	if !tier1JumpWon && hasSnapshot && snapshot.Provenance.IsUnpersistedOpenSSH() {
-		if targets, ok := effectiveProxy.JumpTargets(); ok {
-			for i, hop := range targets {
-				if !config.IsOpenSSHNodeID(hop) {
-					targets[i] = config.OpenSSHNodePrefix + hop
-				}
-			}
-			return strings.Join(targets, ","), nil
-		}
-		if rawJump != "" && !config.IsOpenSSHNodeID(rawJump) {
-			return config.OpenSSHNodePrefix + rawJump, nil
-		}
-		return rawJump, nil
-	}
 	if !resolveProxy || rawJump == "" {
 		return rawJump, nil
 	}
-	resolved, err := a.cfgProvider.ResolveProxyJumpChain(rawJump)
+	var (
+		resolved string
+		err      error
+	)
+	if !tier1JumpWon && hasSnapshot && snapshot.Provenance.IsUnpersistedOpenSSH() {
+		resolved, err = resolveUnpersistedOpenSSHJumpChain(a.cfgProvider, rawJump)
+	} else {
+		resolved, err = a.cfgProvider.ResolveProxyJumpChain(rawJump)
+	}
 	if err != nil {
 		return "", fmt.Errorf("resolve proxy jump %q for node %q failed: %w", rawJump, nodeID, err)
 	}
@@ -332,6 +326,72 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 		}
 	}
 	return resolved, nil
+}
+
+// resolveUnpersistedOpenSSHJumpChain resolves non-OpenSSH hops (such as saved
+// xops inventory node IDs or aliases inherited onto ProvenanceOpenSSHDerived
+// nodes) through provider.ResolveProxyJumpChain while preserving OpenSSH-origin
+// "openssh:..." hops verbatim so unconfigured single-label OpenSSH jumps are
+// not rejected by local inventory rules.
+func resolveUnpersistedOpenSSHJumpChain(provider config.ConfigProvider, rawJump string) (string, error) {
+	parts := strings.Split(rawJump, ",")
+	out := make([]string, 0, len(parts))
+	for _, rawHop := range parts {
+		hop := strings.TrimSpace(rawHop)
+		if hop == "" {
+			continue
+		}
+		if config.IsOpenSSHNodeID(hop) {
+			out = append(out, hop)
+			continue
+		}
+		if provider == nil {
+			out = append(out, hop)
+			continue
+		}
+		resolvedHop, err := provider.ResolveProxyJumpChain(hop)
+		if err != nil {
+			return "", err
+		}
+		if resolvedHop != "" {
+			out = append(out, resolvedHop)
+		}
+	}
+	return strings.Join(out, ","), nil
+}
+
+// prefixTier4OpenSSHProxySetting prefixes unprefixed Tier-4 OpenSSH parser
+// ProxyJump hops with "openssh:" at the parser source while preserving any
+// shadowed ProxyCommand / ProxyCommand=none fallback slot carried by ps.
+func prefixTier4OpenSSHProxySetting(ps ssh.ProxySetting) (ssh.ProxySetting, error) {
+	targets, ok := ps.JumpTargets()
+	if !ok {
+		return ps, nil
+	}
+	prefixed := make([]string, len(targets))
+	for i, hop := range targets {
+		if config.IsOpenSSHNodeID(hop) {
+			prefixed[i] = hop
+		} else {
+			prefixed[i] = config.OpenSSHNodePrefix + hop
+		}
+	}
+	prefixedJump, err := ssh.NewProxyJump(prefixed...)
+	if err != nil {
+		return ssh.UnsetProxySetting(), err
+	}
+	return prefixedJump.Merge(ps), nil
+}
+
+func resolvePrefixedTier4OpenSSHProxySetting(parser *config.OpenSSHParser, alias, canonicalHost string) (ssh.ProxySetting, error) {
+	if parser == nil {
+		return ssh.UnsetProxySetting(), nil
+	}
+	ps, err := parser.ResolveProxySettingWithCanonical(alias, canonicalHost)
+	if err != nil {
+		return ssh.UnsetProxySetting(), err
+	}
+	return prefixTier4OpenSSHProxySetting(ps)
 }
 
 func cloneStrippingMux(opts *ssh.Options) *ssh.Options {
@@ -620,7 +680,7 @@ func (a *SSHAdapter) resolveTier4OpenSSHProxySetting(
 		if alias == "" {
 			alias = nodeName
 		}
-		return parser.ResolveProxySettingWithCanonical(alias, canonicalHost)
+		return resolvePrefixedTier4OpenSSHProxySetting(parser, alias, canonicalHost)
 	case config.ProvenanceOpenSSHVirtual:
 		if err := parser.Err(); err != nil {
 			return ssh.UnsetProxySetting(), err
@@ -634,7 +694,7 @@ func (a *SSHAdapter) resolveTier4OpenSSHProxySetting(
 				alias = config.UnwrapOpenSSHSelector(nodeName)
 			}
 		}
-		return parser.ResolveProxySettingWithCanonical(alias, canonicalHost)
+		return resolvePrefixedTier4OpenSSHProxySetting(parser, alias, canonicalHost)
 	default:
 		// Saved managed nodes and ad-hoc pending nodes block Tier-4 ProxyJump
 		// and OptionClassLocalExec (ProxyCommand) per Tier-4 trust policy.

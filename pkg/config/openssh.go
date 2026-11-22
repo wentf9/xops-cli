@@ -543,31 +543,35 @@ func (*openSSHOverrideProvider) UpdateSudoAtVersionContext(_ context.Context, _,
 // OpenSSHOriginalHost extracts the effective original host (%n) for an
 // "openssh:" virtual node ID (case-insensitive prefix) by stripping the prefix
 // and decomposing composite user@host[:port] specs into their host token.
-// Empty or double-prefixed selectors (e.g. "openssh:OPENSSH:web") are rejected.
+// Empty, whitespace-padded, control-containing, or double-prefixed selectors
+// (e.g. "openssh: web", "openssh:OPENSSH:web") are rejected.
 func OpenSSHOriginalHost(nodeID string) (string, bool) {
 	rest, ok := cutOpenSSHPrefix(nodeID)
 	if !ok {
 		return "", false
 	}
-	clean := strings.TrimSpace(rest)
-	if clean == "" || hasOpenSSHPrefix(clean) {
+	if rest == "" || hasControlOrLineSepChar(rest) || hasAnyWhitespace(rest) || hasOpenSSHPrefix(rest) {
 		return "", false
 	}
-	if parsedHost, _, _, err := parseOpenSSHHostSpec(clean); err == nil && parsedHost != "" {
+	if parsedHost, _, _, err := parseOpenSSHHostSpec(rest); err == nil && parsedHost != "" {
 		return parsedHost, true
 	}
-	return clean, true
+	return rest, true
 }
 
 // UnwrapOpenSSHSelector extracts the host/alias token from an optional
 // case-insensitive "openssh:" virtual selector (including disambiguated
-// "openssh:user@alias:port"), returns "" for empty or double-prefixed
-// "openssh:" selectors, and returns the trimmed input unchanged otherwise.
+// "openssh:user@alias:port"), returns "" for empty, whitespace-padded, or
+// double-prefixed "openssh:" selectors, and returns the trimmed input unchanged
+// otherwise.
 func UnwrapOpenSSHSelector(selector string) string {
-	trimmed := strings.TrimSpace(selector)
-	if orig, ok := OpenSSHOriginalHost(trimmed); ok {
-		return orig
+	if hasOpenSSHPrefix(selector) {
+		if orig, ok := OpenSSHOriginalHost(selector); ok {
+			return orig
+		}
+		return ""
 	}
+	trimmed := strings.TrimSpace(selector)
 	if hasOpenSSHPrefix(trimmed) {
 		return ""
 	}
@@ -575,18 +579,46 @@ func UnwrapOpenSSHSelector(selector string) string {
 }
 
 func stripOpenSSHSelectorForLookup(alias string) (string, bool) {
-	trimmed := strings.TrimSpace(alias)
-	if trimmed == "" {
-		return "", false
-	}
-	if rest, ok := cutOpenSSHPrefix(trimmed); ok {
-		clean := strings.TrimSpace(rest)
-		if clean == "" || hasOpenSSHPrefix(clean) {
+	if hasOpenSSHPrefix(alias) {
+		rest, _ := cutOpenSSHPrefix(alias)
+		if rest == "" || hasControlOrLineSepChar(rest) || hasAnyWhitespace(rest) || hasOpenSSHPrefix(rest) {
 			return "", false
 		}
-		return clean, true
+		return rest, true
+	}
+	trimmed := strings.TrimSpace(alias)
+	if trimmed == "" || hasOpenSSHPrefix(trimmed) {
+		return "", false
 	}
 	return trimmed, true
+}
+
+func hasAnyWhitespace(s string) bool {
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
+// parseExplicitOpenSSHSelector validates and parses an explicit "openssh:"
+// selector body fail-closed without trimming leading/trailing whitespace
+// padding (rejecting "openssh: web", "openssh:\u00a0web", "openssh:web ",
+// control characters, and duplicate "openssh:" prefixes).
+func parseExplicitOpenSSHSelector(raw string) (spec, lookupHost, inlineUser string, inlinePort uint16, err error) {
+	after, ok := TrimOpenSSHNodePrefix(raw)
+	if !ok {
+		return "", "", "", 0, fmt.Errorf("parse openssh host %q failed: invalid openssh selector", raw)
+	}
+	if after == "" || hasControlOrLineSepChar(after) || hasAnyWhitespace(after) || hasOpenSSHPrefix(after) {
+		return "", "", "", 0, fmt.Errorf("parse openssh host %q failed: invalid openssh selector", raw)
+	}
+	lookupHost, inlineUser, inlinePort, err = parseOpenSSHHostSpec(after)
+	if err != nil {
+		return "", "", "", 0, fmt.Errorf("parse openssh host %q failed: %w", after, err)
+	}
+	return after, lookupHost, inlineUser, inlinePort, nil
 }
 
 // Find 尝试在 ssh_config 中寻找匹配的主机名

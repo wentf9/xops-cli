@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -353,8 +354,9 @@ func TestRound5_P2_11_P3_8_P3_9_HostNameNoneCanonicalKeyAndProxyJumpNormalize(t 
 		t.Fatalf("HostName=none did not behave literally: %+v", canonRes)
 	}
 
-	// P3-9: baseJump="none,none" or " , " normalizes resolved ProxyJump to "" across
-	// both OpenSSH virtual targets and saved nodes (exercising normalizeTargetJump directly).
+	// P3-9 (updated DE8-M2): valid disabled ProxyJump ("none,none") normalizes to "",
+	// while malformed empty-hop ProxyJump ("none, ,none" and " , ") fails closed with
+	// ssh.ErrSSHOptionsValidation across ResolveTarget and normalizeTargetJump.
 	res, err := ResolveTarget(prov, ConnectionTarget{Selector: OpenSSHNodePrefix + "app.corp.example.com"})
 	if err != nil {
 		t.Fatalf("ResolveTarget failed: %v", err)
@@ -365,7 +367,8 @@ func TestRound5_P2_11_P3_8_P3_9_HostNameNoneCanonicalKeyAndProxyJumpNormalize(t 
 	savedJumpCfg := cloneConfiguration(nil)
 	savedJumpCfg.Hosts.Set("hj", models.Host{Address: "10.50.0.99", Port: 22})
 	savedJumpCfg.Identities.Set("ij", models.Identity{User: "ops"})
-	savedJumpCfg.Nodes.Set("saved-none-jump", models.Node{HostRef: "hj", IdentityRef: "ij", ProxyJump: "none, ,none"})
+	savedJumpCfg.Nodes.Set("saved-none-jump", models.Node{HostRef: "hj", IdentityRef: "ij", ProxyJump: "none,none"})
+	savedJumpCfg.Nodes.Set("saved-bad-jump", models.Node{HostRef: "hj", IdentityRef: "ij", ProxyJump: "none, ,none"})
 	savedJumpProv := NewProviderWithoutOpenSSH(savedJumpCfg)
 	savedRes, err := ResolveTarget(savedJumpProv, ConnectionTarget{Selector: "saved-none-jump"})
 	if err != nil {
@@ -374,8 +377,11 @@ func TestRound5_P2_11_P3_8_P3_9_HostNameNoneCanonicalKeyAndProxyJumpNormalize(t 
 	if savedRes.ProxyJump != "" {
 		t.Fatalf("saved-none-jump ProxyJump = %q, want empty", savedRes.ProxyJump)
 	}
-	if got := normalizeTargetJump(savedJumpProv, " , ", ConnectionTarget{}); got != "" {
-		t.Fatalf("normalizeTargetJump(\" , \") = %q, want empty", got)
+	if badRes, badErr := ResolveTarget(savedJumpProv, ConnectionTarget{Selector: "saved-bad-jump"}); !errors.Is(badErr, ssh.ErrSSHOptionsValidation) {
+		t.Fatalf("ResolveTarget(saved-bad-jump) = (%+v, %v), want ErrSSHOptionsValidation", badRes, badErr)
+	}
+	if got, nErr := normalizeTargetJump(savedJumpProv, " , ", ConnectionTarget{}); !errors.Is(nErr, ssh.ErrSSHOptionsValidation) {
+		t.Fatalf("normalizeTargetJump(\" , \") = (%q, %v), want ErrSSHOptionsValidation", got, nErr)
 	}
 }
 
