@@ -199,9 +199,13 @@ func (c *muxHandshakeInspectorConn) inspectBufferedPackets() {
 				}
 			}
 		case 2:
-			if msgType == MUX_S_PERMISSION_DENIED || msgType == MUX_S_FAILURE {
+			switch msgType {
+			case MUX_S_PERMISSION_DENIED:
 				_, reason, _ := DecodeMuxError(payload)
 				c.rejectedErr = fmt.Errorf("control proxy handshake failed on %q: %w: %s (0x%08x)", c.socketPath, ErrControlProxyRejected, reason, msgType)
+			case MUX_S_FAILURE:
+				_, reason, _ := DecodeMuxError(payload)
+				c.rejectedErr = fmt.Errorf("control proxy handshake failed on %q: %w: %s (0x%08x)", c.socketPath, ErrControlMasterUnavailable, reason, msgType)
 			}
 			c.inspecting.Store(false)
 		}
@@ -255,9 +259,12 @@ func DialControlProxy(ctx context.Context, socketPath string, target TargetConte
 			return nil, nil, inspector.rejectedErr
 		}
 		errMsg := err.Error()
-		if strings.Contains(errMsg, "2147483650") || strings.Contains(errMsg, "2147483651") ||
+		if strings.Contains(errMsg, "2147483650") ||
 			strings.Contains(strings.ToLower(errMsg), "permission denied") {
 			return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w: %w", socketPath, ErrControlProxyRejected, err)
+		}
+		if strings.Contains(errMsg, "2147483651") {
+			return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w: %w", socketPath, ErrControlMasterUnavailable, err)
 		}
 		if ctxErr := contextErrForConnIO(ctx, err); ctxErr != nil {
 			return nil, nil, fmt.Errorf("control proxy handshake failed on %q: %w", socketPath, ctxErr)

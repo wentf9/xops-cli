@@ -599,8 +599,14 @@ func (m *MuxClient) RequestInfo(ctx context.Context, name string) (string, error
 	return info, nil
 }
 
-// ErrControlProxyRejected reports that the master refused a MUX_C_PROXY request.
+// ErrControlProxyRejected reports that the master refused a MUX_C_PROXY request
+// due to an explicit authorization/policy denial (MUX_S_PERMISSION_DENIED).
 var ErrControlProxyRejected = errors.New("control master rejected proxy mode")
+
+// ErrControlMasterUnavailable reports that the master rejected a MUX_C_PROXY
+// request due to a lifecycle or operational failure (MUX_S_FAILURE), such as
+// shutting down, handoff reservation, or -O stop.
+var ErrControlMasterUnavailable = errors.New("control master unavailable")
 
 // DialMuxProxyStream connects to the control socket, verifies the endpoint's peer
 // user, completes the HELLO handshake, and switches to MUX_C_PROXY transport
@@ -676,9 +682,12 @@ func DialMuxProxyStream(ctx context.Context, socketPath string, opts ...MuxClien
 		if respID != requestID {
 			return fail(fmt.Errorf("proxy response request id mismatch on %q: expected %d, got %d", socketPath, requestID, respID))
 		}
-	case MUX_S_PERMISSION_DENIED, MUX_S_FAILURE:
+	case MUX_S_PERMISSION_DENIED:
 		_, reason, _ := DecodeMuxError(payload)
 		return fail(fmt.Errorf("%w on %q: %s", ErrControlProxyRejected, socketPath, reason))
+	case MUX_S_FAILURE:
+		_, reason, _ := DecodeMuxError(payload)
+		return fail(fmt.Errorf("%w on %q: %s", ErrControlMasterUnavailable, socketPath, reason))
 	default:
 		return fail(fmt.Errorf("%w on %q: unexpected response 0x%08x", ErrControlProxyRejected, socketPath, msgType))
 	}

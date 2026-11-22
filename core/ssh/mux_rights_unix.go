@@ -925,7 +925,7 @@ func runPassengerChannelIO(s *MuxServer, conn net.Conn, ch cryptoSSH.Channel, re
 	go func() {
 		defer close(stdinDone)
 		_ = copyFromPollableFD(ch, stdinFile, stopStdin)
-		_ = ch.CloseWrite()
+		_ = s.closeMuxChannelWriteBounded(ch)
 	}()
 
 	outDone := make(chan struct{})
@@ -1101,7 +1101,7 @@ func handlePassengerStdioFwd(s *MuxServer, conn net.Conn, reqID uint32, payload 
 	stdoutRes := newPassengerCopyResult()
 	go func() {
 		copyErr := copyFromPollableFD(ch, stdinFile, stopStdin)
-		_ = ch.CloseWrite()
+		_ = s.closeMuxChannelWriteBounded(ch)
 		stdinRes.finish(copyErr)
 	}()
 	go func() {
@@ -1336,85 +1336,6 @@ func closeFDRange(fds []int) {
 func closeFiles(files []*os.File) {
 	for _, file := range files {
 		_ = file.Close()
-	}
-}
-
-type directStreamlocalOpenMsg struct {
-	SocketPath string
-	Reserved0  string
-	Reserved1  uint32
-}
-
-// dialSSHMuxChannel opens a raw forwarded SSH channel ("direct-tcpip" or
-// "direct-streamlocal@openssh.com") under s.requestTimeout without tearing down
-// the shared MuxServer on a slow remote open.
-func (s *MuxServer) dialSSHMuxChannel(parent context.Context, network, addr string) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
-	if s == nil || s.sshClient == nil || s.sshClient.Conn == nil {
-		return nil, nil, errors.New("ssh client is nil")
-	}
-	chType, payload, err := encodeMuxForwardChannelOpen(network, addr)
-	if err != nil {
-		return nil, nil, err
-	}
-	base := parent
-	if base == nil {
-		base = s.baseContext()
-	}
-	timeout := 15 * time.Second
-	if s.requestTimeout > 0 {
-		timeout = s.requestTimeout
-	}
-	dialCtx, cancel := context.WithTimeout(base, timeout)
-	defer cancel()
-
-	client := s.sshClient
-	chCh := make(chan openChannelResult)
-	abandoned := make(chan struct{})
-	go func() {
-		ch, reqs, openErr := client.OpenChannel(chType, payload)
-		select {
-		case chCh <- openChannelResult{channel: ch, requests: reqs, err: openErr}:
-		case <-abandoned:
-			if ch != nil {
-				if reqs != nil {
-					go discardAbortedChannelRequests(base, reqs)
-				}
-				_ = s.closeMuxChannelBounded(ch, nil)
-			}
-		}
-	}()
-	select {
-	case res := <-chCh:
-		return res.channel, res.requests, res.err
-	case <-dialCtx.Done():
-		close(abandoned)
-		return nil, nil, dialCtx.Err()
-	}
-}
-
-func encodeMuxForwardChannelOpen(network, addr string) (string, []byte, error) {
-	switch network {
-	case "unix":
-		return "direct-streamlocal@openssh.com", cryptoSSH.Marshal(&directStreamlocalOpenMsg{
-			SocketPath: addr,
-		}), nil
-	case "tcp", "tcp4", "tcp6":
-		host, portStr, err := net.SplitHostPort(addr)
-		if err != nil {
-			return "", nil, err
-		}
-		port, err := strconv.ParseUint(portStr, 10, 32)
-		if err != nil || port == 0 || port > 65535 {
-			return "", nil, fmt.Errorf("invalid tcp forward port %q", portStr)
-		}
-		return "direct-tcpip", cryptoSSH.Marshal(&directTCPIPOpenMsg{
-			DestAddr:   host,
-			DestPort:   uint32(port),
-			OriginAddr: "0.0.0.0",
-			OriginPort: 0,
-		}), nil
-	default:
-		return "", nil, fmt.Errorf("unsupported forward network %q", network)
 	}
 }
 

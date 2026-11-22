@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	cryptoSSH "golang.org/x/crypto/ssh"
 )
 
 func normalizeMuxForwardHost(host string, port uint32) string {
@@ -457,7 +459,7 @@ func (s *MuxServer) closeUnpublishedMuxForward(entry *muxForwardEntry) {
 		}
 		conn, err := ln.Accept()
 		if err == nil {
-			_ = conn.Close()
+			_ = s.closeMuxChannelBounded(conn, nil)
 			continue
 		}
 		select {
@@ -468,9 +470,50 @@ func (s *MuxServer) closeUnpublishedMuxForward(entry *muxForwardEntry) {
 	}
 }
 
-func (s *MuxServer) dialSSHMux(parent context.Context, network, addr string) (net.Conn, error) {
+type directStreamlocalOpenMsg struct {
+	SocketPath string
+	Reserved0  string
+	Reserved1  uint32
+}
+
+func encodeMuxForwardChannelOpen(network, addr string) (string, []byte, error) {
+	switch network {
+	case "unix":
+		return "direct-streamlocal@openssh.com", cryptoSSH.Marshal(&directStreamlocalOpenMsg{
+			SocketPath: addr,
+		}), nil
+	case "tcp", "tcp4", "tcp6":
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil {
+			return "", nil, err
+		}
+		port, err := strconv.ParseUint(portStr, 10, 32)
+		if err != nil || port == 0 || port > 65535 {
+			return "", nil, fmt.Errorf("invalid tcp forward port %q", portStr)
+		}
+		return "direct-tcpip", cryptoSSH.Marshal(&directTCPIPOpenMsg{
+			DestAddr:   host,
+			DestPort:   uint32(port),
+			OriginAddr: "0.0.0.0",
+			OriginPort: 0,
+		}), nil
+	default:
+		return "", nil, fmt.Errorf("unsupported forward network %q", network)
+	}
+}
+
+// dialSSHMuxChannel opens a raw forwarded SSH channel ("direct-tcpip" or
+// "direct-streamlocal@openssh.com") under s.requestTimeout without tearing down
+// the shared MuxServer on a slow remote open. If a late open completes after
+// abandonment, it closes the channel via s.closeMuxChannelBounded so a
+// write-wedged transport cannot leak goroutines.
+func (s *MuxServer) dialSSHMuxChannel(parent context.Context, network, addr string) (cryptoSSH.Channel, <-chan *cryptoSSH.Request, error) {
 	if s == nil || s.sshClient == nil || s.sshClient.Conn == nil {
-		return nil, errors.New("ssh client is nil")
+		return nil, nil, errors.New("ssh client is nil")
+	}
+	chType, payload, err := encodeMuxForwardChannelOpen(network, addr)
+	if err != nil {
+		return nil, nil, err
 	}
 	base := parent
 	if base == nil {
@@ -482,7 +525,158 @@ func (s *MuxServer) dialSSHMux(parent context.Context, network, addr string) (ne
 	}
 	dialCtx, cancel := context.WithTimeout(base, timeout)
 	defer cancel()
-	return s.sshClient.DialContext(dialCtx, network, addr)
+
+	client := s.sshClient
+	chCh := make(chan openChannelResult)
+	abandoned := make(chan struct{})
+	go func() {
+		ch, reqs, openErr := client.OpenChannel(chType, payload)
+		select {
+		case chCh <- openChannelResult{channel: ch, requests: reqs, err: openErr}:
+		case <-abandoned:
+			if ch != nil {
+				if reqs != nil {
+					go discardAbortedChannelRequests(base, reqs)
+				}
+				_ = s.closeMuxChannelBounded(ch, nil)
+			}
+		}
+	}()
+	select {
+	case res := <-chCh:
+		return res.channel, res.requests, res.err
+	case <-dialCtx.Done():
+		close(abandoned)
+		return nil, nil, dialCtx.Err()
+	}
+}
+
+var errMuxForwardDeadlineUnsupported = errors.New("ssh: deadline not supported")
+
+// muxForwardChannelConn adapts a direct-tcpip or direct-streamlocal SSH channel
+// opened by MuxServer into a net.Conn whose CloseWrite and Close are bounded
+// via MuxServer escalation so a write-wedged transport cannot wedge forward
+// stream teardown, -O stop, WaitForDrain, or ControlPersist exit.
+type muxForwardChannelConn struct {
+	ch         cryptoSSH.Channel
+	server     *MuxServer
+	localAddr  net.Addr
+	remoteAddr net.Addr
+	reqsDone   chan struct{}
+}
+
+func (c *muxForwardChannelConn) Read(p []byte) (int, error) {
+	return c.ch.Read(p)
+}
+
+func (c *muxForwardChannelConn) Write(p []byte) (int, error) {
+	return c.ch.Write(p)
+}
+
+func (c *muxForwardChannelConn) CloseWrite() error {
+	if c == nil || c.ch == nil {
+		return nil
+	}
+	return c.server.closeMuxChannelWriteBounded(c.ch)
+}
+
+func (c *muxForwardChannelConn) Close() error {
+	if c == nil || c.ch == nil {
+		return nil
+	}
+	return c.server.closeMuxChannelBounded(c.ch, c.reqsDone)
+}
+
+func (c *muxForwardChannelConn) closeRaw() error {
+	if c == nil || c.ch == nil {
+		return nil
+	}
+	return closeSSHChannel(c.ch)
+}
+
+func (c *muxForwardChannelConn) LocalAddr() net.Addr         { return c.localAddr }
+func (c *muxForwardChannelConn) RemoteAddr() net.Addr        { return c.remoteAddr }
+func (c *muxForwardChannelConn) SetDeadline(time.Time) error { return errMuxForwardDeadlineUnsupported }
+func (c *muxForwardChannelConn) SetReadDeadline(time.Time) error {
+	return errMuxForwardDeadlineUnsupported
+}
+func (c *muxForwardChannelConn) SetWriteDeadline(time.Time) error {
+	return errMuxForwardDeadlineUnsupported
+}
+
+// muxForwardRemoteConn wraps an accepted remote-forward SSH channel stream so
+// CloseWrite and Close are bounded via MuxServer escalation on write-wedged
+// transports while Shutdown can still close the raw channel directly after
+// closeTransportBounded without re-entering Shutdown.
+type muxForwardRemoteConn struct {
+	net.Conn
+	server *MuxServer
+}
+
+func (s *MuxServer) wrapForwardRemoteConn(raw net.Conn) net.Conn {
+	if s == nil || raw == nil {
+		return raw
+	}
+	if _, ok := raw.(*muxForwardRemoteConn); ok {
+		return raw
+	}
+	if _, ok := raw.(*muxForwardChannelConn); ok {
+		return raw
+	}
+	return &muxForwardRemoteConn{Conn: raw, server: s}
+}
+
+func (c *muxForwardRemoteConn) CloseWrite() error {
+	if c == nil || c.Conn == nil {
+		return nil
+	}
+	if hc, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return c.server.closeMuxChannelWriteBounded(hc)
+	}
+	return c.Close()
+}
+
+func (c *muxForwardRemoteConn) Close() error {
+	if c == nil || c.Conn == nil {
+		return nil
+	}
+	return c.server.closeMuxChannelBounded(c.Conn, nil)
+}
+
+func (c *muxForwardRemoteConn) closeRaw() error {
+	if c == nil || c.Conn == nil {
+		return nil
+	}
+	return closeSSHChannel(c.Conn)
+}
+
+func (s *MuxServer) dialSSHMux(parent context.Context, network, addr string) (net.Conn, error) {
+	ch, reqs, err := s.dialSSHMuxChannel(parent, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	reqsDone := make(chan struct{})
+	go func() {
+		defer close(reqsDone)
+		if reqs != nil {
+			cryptoSSH.DiscardRequests(reqs)
+		}
+	}()
+	var localAddr, remoteAddr net.Addr
+	if network == "unix" {
+		localAddr = &net.UnixAddr{Net: "unix", Name: "@"}
+		remoteAddr = &net.UnixAddr{Net: "unix", Name: addr}
+	} else {
+		localAddr = &net.TCPAddr{IP: net.IPv4zero, Port: 0}
+		remoteAddr = forwardTCPAddr{addr: addr}
+	}
+	return &muxForwardChannelConn{
+		ch:         ch,
+		server:     s,
+		localAddr:  localAddr,
+		remoteAddr: remoteAddr,
+		reqsDone:   reqsDone,
+	}, nil
 }
 
 type muxForwardScope uint8
@@ -1347,7 +1541,11 @@ func (s *MuxServer) trackRemoteStream(conn net.Conn) {
 	s.streamsMu.Lock()
 	if s.streamsClosed {
 		s.streamsMu.Unlock()
-		_ = conn.Close()
+		if rc, ok := conn.(interface{ closeRaw() error }); ok {
+			_ = rc.closeRaw()
+		} else {
+			_ = conn.Close()
+		}
 		return
 	}
 	if s.liveRemoteStreams == nil {
@@ -1442,7 +1640,8 @@ func (s *MuxServer) serveRemoteForward(ln net.Listener, connectHost string, conn
 		if err != nil {
 			return
 		}
-		go func(remote net.Conn) {
+		go func(rawRemote net.Conn) {
+			remote := s.wrapForwardRemoteConn(rawRemote)
 			if !s.addActiveForwardStream() {
 				_ = remote.Close()
 				return

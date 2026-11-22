@@ -505,6 +505,15 @@ func (s *MuxServer) PersistIndefinite() bool {
 	return s.persistIndefinite
 }
 
+func (s *MuxServer) currentPhase() muxPhase {
+	if s == nil {
+		return muxPhaseClosed
+	}
+	s.idleMu.Lock()
+	defer s.idleMu.Unlock()
+	return s.phase
+}
+
 func (s *MuxServer) isShuttingDownLocked() bool {
 	return s.phase == muxPhaseHandoffReserved || s.phase == muxPhaseShuttingDown || s.phase == muxPhaseClosed
 }
@@ -886,6 +895,9 @@ func (s *MuxServer) dispatchRequest(conn net.Conn, msgType uint32, reqPayload []
 }
 
 func (s *MuxServer) handleAliveCheck(conn net.Conn, reqID uint32) error {
+	if s.currentPhase() != muxPhaseRunning || s.StoppedListening() || isRootConnClosed(s.rootConn) || isRootConnClosed(s.physicalRoot) {
+		return sendFailure(conn, reqID, "mux master is not running")
+	}
 	pid := uint32(os.Getpid())
 	return sendAlive(conn, reqID, pid)
 }
@@ -1331,6 +1343,20 @@ func (s *MuxServer) beginShutdown() {
 	activeMuxServers.CompareAndDelete(s.controlPath, s)
 }
 
+// evictFromPool is the reverse PooledClient -> MuxServer teardown hook invoked
+// synchronously upon pool detachment. It unlinks the control socket and closes
+// the Unix listener without blocking on SSH transport I/O, then triggers full
+// Shutdown asynchronously if Shutdown has not already started.
+func (s *MuxServer) evictFromPool() {
+	if s == nil {
+		return
+	}
+	s.beginShutdown()
+	if s.currentPhase() != muxPhaseClosed {
+		go func() { _ = s.Shutdown() }()
+	}
+}
+
 // closeTransportBounded closes this master's SSH transport exactly once:
 // closing s.rootConn before s.sshClient and bounding any multiplexed jump hop
 // behind a grace timeout that escalates to s.physicalRoot if the upstream
@@ -1430,7 +1456,11 @@ func (s *MuxServer) Shutdown() error {
 
 		localStreams, remoteStreams := s.drainTrackedStreams()
 		for _, conn := range remoteStreams {
-			_ = conn.Close()
+			if rc, ok := conn.(interface{ closeRaw() error }); ok {
+				_ = rc.closeRaw()
+			} else {
+				_ = conn.Close()
+			}
 		}
 		for _, conn := range localStreams {
 			_ = conn.Close()
@@ -1532,8 +1562,15 @@ func (s *MuxServer) openBoundedMuxChannel(ctx context.Context, channelType strin
 	}
 }
 
+func (s *MuxServer) channelCloseTimeout() time.Duration {
+	if s != nil && s.requestTimeout > 0 && s.requestTimeout < sessionShutdownTimeout {
+		return s.requestTimeout
+	}
+	return sessionShutdownTimeout
+}
+
 // closeMuxChannelBounded closes a mux channel (and optionally joins its worker drain signal)
-// within sessionShutdownTimeout, escalating to transport interruption if the peer stalls.
+// within channelCloseTimeout, escalating to transport interruption if the peer stalls.
 func (s *MuxServer) closeMuxChannelBounded(ch io.Closer, workersDone <-chan struct{}) error {
 	if ch == nil && workersDone == nil {
 		return nil
@@ -1549,18 +1586,50 @@ func (s *MuxServer) closeMuxChannelBounded(ch io.Closer, workersDone <-chan stru
 		}
 		done <- closeErr
 	}()
-	timer := time.NewTimer(sessionShutdownTimeout)
+	timeout := s.channelCloseTimeout()
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case err := <-done:
 		return err
 	case <-timer.C:
 		if s == nil {
-			return fmt.Errorf("mux channel shutdown exceeded %s", sessionShutdownTimeout)
+			return fmt.Errorf("mux channel shutdown exceeded %s", timeout)
 		}
 		interruptErr := s.interruptTransportAndShutdown()
 		closeErr := <-done
-		return errors.Join(fmt.Errorf("mux channel shutdown exceeded %s", sessionShutdownTimeout), interruptErr, closeErr)
+		return errors.Join(fmt.Errorf("mux channel shutdown exceeded %s", timeout), interruptErr, closeErr)
+	}
+}
+
+// closeMuxChannelWriteBounded half-closes a mux SSH channel within
+// channelCloseTimeout, escalating to transport interruption and shutdown if
+// sending SSH_MSG_CHANNEL_EOF stalls over a write-wedged transport.
+func (s *MuxServer) closeMuxChannelWriteBounded(hc interface{ CloseWrite() error }) error {
+	if hc == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := hc.CloseWrite()
+		if err != nil && (errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed)) {
+			err = nil
+		}
+		done <- err
+	}()
+	timeout := s.channelCloseTimeout()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		if s == nil {
+			return fmt.Errorf("mux channel CloseWrite exceeded %s", timeout)
+		}
+		interruptErr := s.interruptTransportAndShutdown()
+		closeErr := <-done
+		return errors.Join(fmt.Errorf("mux channel CloseWrite exceeded %s", timeout), interruptErr, closeErr)
 	}
 }
 

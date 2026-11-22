@@ -1347,6 +1347,9 @@ func (c *Connector) trackMasterWithPooled(server *MuxServer, nodeID string, pool
 	lifecycleCtx := c.lifecycleCtx
 	c.lifecycleMu.Unlock()
 
+	if pooled != nil {
+		pooled.setEvictHook(server.evictFromPool)
+	}
 	if !exists {
 		c.watchMasterShutdown(lifecycleCtx, server.Wait(), pooled, evicted)
 	}

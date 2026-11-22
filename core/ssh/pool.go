@@ -46,6 +46,47 @@ type PooledClient struct {
 	kaCancel     context.CancelFunc
 	kaDone       <-chan struct{}
 	kaNodeScoped bool
+
+	// evictMu is a strict leaf lock guarding evicted and onEvict (the reverse
+	// PooledClient -> MuxServer teardown hook installed when a Connector-owned
+	// MuxServer attaches to this pooled transport). Never held across connPool.mu,
+	// kaMu, probeMu, MuxServer.idleMu, or any I/O.
+	evictMu sync.Mutex
+	evicted bool
+	onEvict func()
+}
+
+// setEvictHook registers a reverse teardown callback invoked synchronously upon
+// pool eviction (outside connPool.mu). If c was already evicted before the hook
+// was attached, fn is invoked immediately.
+func (c *PooledClient) setEvictHook(fn func()) {
+	if c == nil || fn == nil {
+		return
+	}
+	c.evictMu.Lock()
+	if c.evicted {
+		c.evictMu.Unlock()
+		fn()
+		return
+	}
+	c.onEvict = fn
+	c.evictMu.Unlock()
+}
+
+// triggerEvictHook marks c as evicted and runs any attached reverse teardown
+// hook at most once outside evictMu.
+func (c *PooledClient) triggerEvictHook() {
+	if c == nil {
+		return
+	}
+	c.evictMu.Lock()
+	c.evicted = true
+	fn := c.onEvict
+	c.onEvict = nil
+	c.evictMu.Unlock()
+	if fn != nil {
+		fn()
+	}
 }
 
 func (c *PooledClient) updateSnapshot(fn func(*ConnectionConfig, *ClientConfig)) {
@@ -141,6 +182,7 @@ func (c *PooledClient) closeSelf() error {
 		return nil
 	}
 	c.stopKeepAlive()
+	c.triggerEvictHook()
 	if !c.isJumpChild() || c.RootConn == nil {
 		return c.closeHopTransport()
 	}
@@ -750,6 +792,15 @@ func (p *connPool) detachForEvict(key HopDigest, dead *PooledClient, trackDead b
 		cancel()
 	}
 	sortByParentDepth(descendants)
+	// Synchronously tear down any Connector-owned MuxServer listeners attached
+	// to evicted entries (unlinking control sockets and closing Unix listeners
+	// without blocking on SSH transport I/O) before returning to callers.
+	if removedSelf || trackDead {
+		dead.triggerEvictHook()
+	}
+	for _, child := range descendants {
+		child.triggerEvictHook()
+	}
 	return &evictionBatch{
 		pool:        p,
 		dead:        dead,
