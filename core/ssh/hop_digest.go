@@ -180,7 +180,7 @@ func digestStructValue(h hash.Hash, v reflect.Value) error {
 		writeDigestTag(h, 'F', sf.Name)
 		fv := v.Field(i)
 		if isConfig {
-			if handled, err := digestNormalizedConfigField(h, sf.Name, fv); handled {
+			if handled, err := digestNormalizedConfigField(h, v, sf.Name, fv); handled {
 				if err != nil {
 					return err
 				}
@@ -195,14 +195,14 @@ func digestStructValue(h hash.Hash, v reflect.Value) error {
 	return nil
 }
 
-func digestNormalizedConfigField(h hash.Hash, fieldName string, fv reflect.Value) (bool, error) {
+func digestNormalizedConfigField(h hash.Hash, structVal reflect.Value, fieldName string, fv reflect.Value) (bool, error) {
 	switch fieldName {
 	case "Address", "BaseHost":
 		writeDigestString(h, canonicalDigestHost(fv.String()))
 		return true, nil
 	case "Port":
 		port := fv.Int()
-		if port == 0 {
+		if port <= 0 {
 			port = int64(DefaultSSHPort)
 		}
 		writeDigestInt64(h, port)
@@ -212,6 +212,16 @@ func digestNormalizedConfigField(h hash.Hash, fieldName string, fv reflect.Value
 		return true, nil
 	case "OriginalHost", "CanonicalHost":
 		writeDigestString(h, strings.TrimSpace(fv.String()))
+		return true, nil
+	case "OriginalProxyJump":
+		if !structVal.FieldByName("HasOriginalProxyJump").Bool() {
+			writeDigestString(h, structVal.FieldByName("ProxyJump").String())
+			return true, nil
+		}
+		writeDigestString(h, fv.String())
+		return true, nil
+	case "HasOriginalProxyJump":
+		writeDigestBool(h, true)
 		return true, nil
 	case "Options":
 		if fv.Kind() == reflect.Pointer && fv.Type().Elem() == optionsReflectType {
@@ -244,13 +254,14 @@ func digestControlPointer(h hash.Hash, ptr reflect.Value) error {
 }
 
 func canonicalDigestHost(raw string) string {
-	if raw == "" {
+	cleaned := cleanHostLiteral(raw)
+	if cleaned == "" {
 		return ""
 	}
-	if ep, err := NewEndpoint(raw, int(DefaultSSHPort)); err == nil {
+	if ep, err := NewEndpoint(cleaned, int(DefaultSSHPort)); err == nil {
 		return ep.Host()
 	}
-	return cleanHostLiteral(raw)
+	return cleaned
 }
 
 func digestOptionsPointer(h hash.Hash, ptr reflect.Value) error {

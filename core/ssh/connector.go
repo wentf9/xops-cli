@@ -347,29 +347,51 @@ func (c *Connector) reanchorPlanNodeParent(planNode *connectionPlanNode, expectP
 	planNode.digest = DigestClientConfig(planNode.cfg, planNode.parentDigest)
 }
 
+func isPooledTargetUnusable(target *PooledClient) bool {
+	return target == nil || target.SSHClient == nil || isRootConnClosed(target.RootConn)
+}
+
+func (c *Connector) tryReuseMultiHopPlan(ctx context.Context, plan []connectionPlanNode) (*Client, bool, error) {
+	snapshot := c.pool.SnapshotChain(plan)
+	if canReuseCachedChain(plan, snapshot) {
+		reused, err := c.validateCachedChain(ctx, plan, snapshot)
+		if err == nil {
+			return reused, true, nil
+		}
+		if !errors.Is(err, errJumpChainRequired) {
+			return nil, true, err
+		}
+		return nil, false, nil
+	}
+	if !isPooledTargetUnusable(snapshot[0]) {
+		return nil, false, nil
+	}
+	hasSocket, sockErr := c.hasControlSocket(plan[0])
+	if sockErr != nil {
+		c.getLogger().Debugf("mux: skip target control master probe for node %s: %v", plan[0].name, sockErr)
+		return nil, false, nil
+	}
+	if !hasSocket {
+		return nil, false, nil
+	}
+	reused, err := c.tryAttachTargetControlMaster(ctx, plan, snapshot)
+	if err == nil && reused != nil {
+		return reused, true, nil
+	}
+	if err != nil && !errors.Is(err, errJumpChainRequired) {
+		return nil, true, err
+	}
+	return nil, false, nil
+}
+
 func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) (*Client, error) {
 	// For multi-hop plans, reuse a fully cached chain (or attach to an active
 	// target ControlMaster) before dialing intermediate hops. The reuse predicate
 	// is pure: every hop's Merkle HopDigest must hit and parent/child RootConn
 	// generations must match.
 	if len(plan) > 1 {
-		snapshot := c.pool.SnapshotChain(plan)
-		if canReuseCachedChain(plan, snapshot) {
-			if reused, err := c.validateCachedChain(ctx, plan, snapshot); err == nil {
-				return reused, nil
-			} else if !errors.Is(err, errJumpChainRequired) {
-				return nil, err
-			}
-		} else if snapshot[0] == nil {
-			if hasSocket, sockErr := c.hasControlSocket(plan[0]); sockErr == nil && hasSocket {
-				if reused, err := c.tryAttachTargetControlMaster(ctx, plan, snapshot); err == nil && reused != nil {
-					return reused, nil
-				} else if err != nil && !errors.Is(err, errJumpChainRequired) {
-					return nil, err
-				}
-			} else if sockErr != nil {
-				c.getLogger().Debugf("mux: skip target control master probe for node %s: %v", plan[0].name, sockErr)
-			}
+		if reused, handled, err := c.tryReuseMultiHopPlan(ctx, plan); handled {
+			return reused, err
 		}
 	}
 
@@ -634,7 +656,7 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 		switch {
 		case expectParent != nil && !isConsistentParentChildTransport(expectParent, cachedClient):
 			c.pool.Retire(hopKey, cachedClient)
-		case cachedClient.SSHClient == nil:
+		case cachedClient.SSHClient == nil || isRootConnClosed(cachedClient.RootConn):
 			c.pool.Evict(hopKey, cachedClient, true)
 		case cachedClient.SSHClient.Conn == nil:
 			logger.EmitDiagnostic(c.diagnostics, logger.Diagnostic{Kind: logger.ConnectionReused, NodeID: nodeName})

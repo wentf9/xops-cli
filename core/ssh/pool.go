@@ -744,6 +744,34 @@ func (b *evictionBatch) closeDescendantsAndRelease() {
 	b.closeDescendants()
 }
 
+func (p *connPool) finalizeEvictionBatch(
+	dead *PooledClient,
+	triggerDeadHook bool,
+	descendants []*PooledClient,
+	tracked []*PooledClient,
+	cancels []context.CancelFunc,
+) *evictionBatch {
+	for _, cancel := range cancels {
+		cancel()
+	}
+	sortByParentDepth(descendants)
+	// Synchronously tear down any Connector-owned MuxServer listeners attached
+	// to evicted entries (unlinking control sockets and closing Unix listeners
+	// without blocking on SSH transport I/O) before returning to callers.
+	if triggerDeadHook && dead != nil {
+		dead.triggerEvictHook()
+	}
+	for _, child := range descendants {
+		child.triggerEvictHook()
+	}
+	return &evictionBatch{
+		pool:        p,
+		dead:        dead,
+		descendants: descendants,
+		tracked:     tracked,
+	}
+}
+
 // detachForEvict atomically removes dead (if currently active) and any active
 // in-memory descendants from p.active, detaches their keepalives, and tracks
 // all detached entries (plus dead when trackDead is true) in p.closing without
@@ -788,25 +816,150 @@ func (p *connPool) detachForEvict(key HopDigest, dead *PooledClient, trackDead b
 	}
 	p.mu.Unlock()
 
-	for _, cancel := range cancels {
-		cancel()
+	return p.finalizeEvictionBatch(dead, removedSelf || trackDead, descendants, tracked, cancels)
+}
+
+// detachActiveForEvict atomically detaches target and any active in-memory
+// descendants ONLY when target is currently in p.active. When target is already
+// retired, closing, or closed, it is an idempotent no-op returning nil without
+// mutating p.retired or p.closing.
+func (p *connPool) detachActiveForEvict(target *PooledClient) *evictionBatch {
+	if p == nil || target == nil {
+		return nil
 	}
-	sortByParentDepth(descendants)
-	// Synchronously tear down any Connector-owned MuxServer listeners attached
-	// to evicted entries (unlinking control sockets and closing Unix listeners
-	// without blocking on SSH transport I/O) before returning to callers.
-	if removedSelf || trackDead {
-		dead.triggerEvictHook()
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
 	}
+	activeKey, isActive := p.activeKeyLocked(ZeroHopDigest, target)
+	if !isActive {
+		p.mu.Unlock()
+		return nil
+	}
+	descKeys, descendants := p.collectDescendantsLocked(target)
+	delete(p.active, activeKey)
+	var cancels []context.CancelFunc
+	if cancel := target.detachKeepAlive(); cancel != nil {
+		cancels = append(cancels, cancel)
+	}
+	tracked := make([]*PooledClient, 0, 1+len(descendants))
+	p.trackClosingLocked(target)
+	tracked = append(tracked, target)
+	for i, k := range descKeys {
+		delete(p.active, k)
+		child := descendants[i]
+		if cancel := child.detachKeepAlive(); cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+		p.trackClosingLocked(child)
+		tracked = append(tracked, child)
+	}
+	p.mu.Unlock()
+
+	return p.finalizeEvictionBatch(target, true, descendants, tracked, cancels)
+}
+
+func (p *connPool) resolveInterruptRootLocked(target *PooledClient, rootConn net.Conn) (*PooledClient, net.Conn) {
+	root := target
+	for root.parent != nil {
+		root = root.parent
+	}
+	if rootConn == nil {
+		rootConn = root.RootConn
+	}
+	if rootConn == nil {
+		rootConn = target.RootConn
+	}
+	return root, rootConn
+}
+
+func (p *connPool) matchesInterruptedEntryLocked(
+	entry, root, target *PooledClient,
+	rootConn net.Conn,
+	comparableRoot bool,
+) bool {
+	if entry == target || p.isDescendantLocked(entry, root) {
+		return true
+	}
+	if target != root && p.isDescendantLocked(entry, target) {
+		return true
+	}
+	return comparableRoot && entry.RootConn == rootConn
+}
+
+func (p *connPool) detachEntriesLocked(
+	detachedRoot *PooledClient,
+	descendants []*PooledClient,
+	toDelete []HopDigest,
+) ([]*PooledClient, []context.CancelFunc) {
+	for _, k := range toDelete {
+		delete(p.active, k)
+	}
+	var cancels []context.CancelFunc
+	tracked := make([]*PooledClient, 0, len(toDelete))
+	detachOne := func(c *PooledClient) {
+		if c == nil {
+			return
+		}
+		if cancel := c.detachKeepAlive(); cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+		p.trackClosingLocked(c)
+		tracked = append(tracked, c)
+	}
+	detachOne(detachedRoot)
 	for _, child := range descendants {
-		child.triggerEvictHook()
+		detachOne(child)
 	}
-	return &evictionBatch{
-		pool:        p,
-		dead:        dead,
-		descendants: descendants,
-		tracked:     tracked,
+	return tracked, cancels
+}
+
+// detachActiveForInterrupt atomically detaches the outermost root hop of target
+// and any active entries in p.active riding on that lineage or sharing rootConn
+// before Client.Interrupt forcefully closes rootConn. If no active entries belong
+// to the interrupted lineage/rootConn (e.g., already retired, closing, or pool
+// closed), it is an idempotent no-op returning nil without mutating p.retired
+// or p.closing.
+func (p *connPool) detachActiveForInterrupt(target *PooledClient, rootConn net.Conn) *evictionBatch {
+	if p == nil || target == nil {
+		return nil
 	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	root, effectiveRootConn := p.resolveInterruptRootLocked(target, rootConn)
+	comparableRoot := isComparableConn(effectiveRootConn)
+
+	var (
+		detachedRoot *PooledClient
+		descendants  []*PooledClient
+		toDelete     []HopDigest
+	)
+	if rootKey, ok := p.activeKeyLocked(ZeroHopDigest, root); ok {
+		detachedRoot = root
+		toDelete = append(toDelete, rootKey)
+	}
+	for k, entry := range p.active {
+		if entry == nil || entry == detachedRoot {
+			continue
+		}
+		if p.matchesInterruptedEntryLocked(entry, root, target, effectiveRootConn, comparableRoot) {
+			toDelete = append(toDelete, k)
+			descendants = append(descendants, entry)
+		}
+	}
+	if detachedRoot == nil && len(descendants) == 0 {
+		p.mu.Unlock()
+		return nil
+	}
+
+	tracked, cancels := p.detachEntriesLocked(detachedRoot, descendants, toDelete)
+	p.mu.Unlock()
+
+	return p.finalizeEvictionBatch(detachedRoot, detachedRoot != nil, descendants, tracked, cancels)
 }
 
 // Evict removes a dead client and any active downstream hops riding on its

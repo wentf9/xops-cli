@@ -199,7 +199,32 @@ func (c *Client) Interrupt() error {
 	if c == nil {
 		return nil
 	}
-	return interruptSSHTransport(c.rootConn, c.sshClient)
+	var batch *evictionBatch
+	if c.pooled != nil && c.pooled.pool != nil {
+		batch = c.pooled.pool.detachActiveForInterrupt(c.pooled, c.rootConn)
+	}
+	if batch != nil {
+		defer batch.release()
+	}
+	var sshClient *ssh.Client
+	if c.sshClient != nil && c.sshClient.Conn != nil {
+		sshClient = c.sshClient
+	}
+	// Abort the physical root transport FIRST so a write-wedged bastion
+	// unblocks before closing multiplexed child channels.
+	err := interruptSSHTransport(c.rootConn, sshClient)
+	if batch != nil {
+		if batch.dead != nil && batch.dead != c.pooled {
+			_ = batch.dead.closeSelf()
+		}
+		for _, child := range batch.descendants {
+			if child == nil || child == c.pooled {
+				continue
+			}
+			_ = child.closeSelf()
+		}
+	}
+	return err
 }
 
 func interruptSSHTransport(root net.Conn, client *ssh.Client) error {
@@ -222,9 +247,21 @@ func (c *Client) Close() error {
 	if c == nil {
 		return nil
 	}
+	var batch *evictionBatch
+	if c.pooled != nil && c.pooled.pool != nil {
+		batch = c.pooled.pool.detachActiveForEvict(c.pooled)
+	}
+	if batch != nil {
+		defer batch.release()
+	}
 	var closeErr error
-	if c.sshClient != nil {
+	if c.sshClient != nil && c.sshClient.Conn != nil {
 		closeErr = closeResource(c.sshClient, "SSH transport")
+	} else if batch != nil {
+		closeErr = c.pooled.closeHopTransport()
+	}
+	if batch != nil {
+		batch.closeDescendants()
 	}
 	c.releaseAllAgentLeases()
 	return closeErr

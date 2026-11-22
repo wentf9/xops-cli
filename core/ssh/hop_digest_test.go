@@ -168,7 +168,7 @@ func TestHopDigest_IncludeSensitivityAndExcludeInvariance(t *testing.T) {
 			SuPwd:                       "su-1",
 			SudoUpdateToken:             "sudo-tok-1",
 			ProxyJump:                   "bastion-1",
-			OriginalProxyJump:           "bastion-1",
+			OriginalProxyJump:           "orig-bastion-1",
 			HasOriginalProxyJump:        true,
 			PasswordPromptPattern:       "password:",
 			EnforceAdmittedCertificates: true,

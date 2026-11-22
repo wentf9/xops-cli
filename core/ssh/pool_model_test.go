@@ -203,6 +203,8 @@ type poolModelStormState struct {
 	successfulOps atomic.Int32
 	reindexOps    atomic.Int32
 	evictOps      atomic.Int32
+	closeOps      atomic.Int32
+	interruptOps  atomic.Int32
 	refreshOps    atomic.Int32
 	kaCycleOps    atomic.Int32
 	kaCheckMu     sync.RWMutex
@@ -236,9 +238,9 @@ func (s *poolModelStormState) runConnectWorker(ctx context.Context, id int) {
 		reqCancel()
 		if err == nil && client != nil {
 			s.successfulOps.Add(1)
-			// Exercise concurrent Reindex (leaf + parent hops) and EvictByClient
-			// against live Connect/Retire/keepalive transitions.
-			switch (id + i) % 5 {
+			// Exercise concurrent Reindex (leaf + parent hops), EvictClient,
+			// Client.Close, and Client.Interrupt against live Connect/Retire/keepalive transitions.
+			switch (id + i) % 7 {
 			case 0:
 				client.SetExecution(&ExecutionConfig{Interpreter: InterpreterSh, LaunchDialect: LaunchPOSIX})
 				s.reindexOps.Add(1)
@@ -253,6 +255,12 @@ func (s *poolModelStormState) runConnectWorker(ctx context.Context, id int) {
 					s.recordInvErr(err)
 				}
 				s.evictOps.Add(1)
+			case 4:
+				_ = client.Close()
+				s.closeOps.Add(1)
+			case 5:
+				_ = client.Interrupt()
+				s.interruptOps.Add(1)
 			}
 		}
 	}
@@ -367,7 +375,8 @@ func (s *poolModelStormState) waitMinimumCoverage(maxWait time.Duration) {
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
 		if s.successfulOps.Load() > 0 && s.reindexOps.Load() > 0 &&
-			s.evictOps.Load() > 0 && s.refreshOps.Load() > 0 {
+			s.evictOps.Load() > 0 && s.closeOps.Load() > 0 &&
+			s.interruptOps.Load() > 0 && s.refreshOps.Load() > 0 {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -471,6 +480,12 @@ func TestModel_ConnectorPool_ConcurrentConnectFlipRetireCloseAll(t *testing.T) {
 	}
 	if storm.evictOps.Load() == 0 {
 		t.Fatal("expected at least one concurrent EvictClient operation during storm")
+	}
+	if storm.closeOps.Load() == 0 {
+		t.Fatal("expected at least one concurrent Client.Close operation during storm")
+	}
+	if storm.interruptOps.Load() == 0 {
+		t.Fatal("expected at least one concurrent Client.Interrupt operation during storm")
 	}
 	if storm.refreshOps.Load() == 0 {
 		t.Fatal("expected at least one concurrent refreshConnectionTokens operation during storm")
