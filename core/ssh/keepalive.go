@@ -17,6 +17,11 @@ var errKeepaliveTimeout = errors.New("keepalive probe timed out")
 // displacement, retire, or StopGlobalKeepAlives) while abortCtx remains active.
 var errKeepaliveStopped = errors.New("keepalive stopped non-disruptively")
 
+// keepAliveCloseGrace caps how long runBoundedClose waits for a hop-scoped
+// close on a jump child before escalating to fallbackInterrupt (or returning
+// under probeWG tracking for background keepalives).
+var keepAliveCloseGrace = 50 * time.Millisecond
+
 // 心跳默认参数：接收空闲 15s 后探测；等待回复期间连续 10s 无接收进展才超时。
 // 网络拥塞下的有效接收进展会推迟探测或刷新等待时间，网络黑洞仍有确定的退出路径。
 const (
@@ -252,9 +257,13 @@ func runBoundedClose(
 	// write-wedged, either return under probeWG tracking (background keepalive)
 	// or escalate to fallbackInterrupt (synchronous probe) and join both
 	// goroutines once RootConn closes.
-	grace := min(timeout, 50*time.Millisecond)
+	maxGrace := keepAliveCloseGrace
+	if maxGrace <= 0 {
+		maxGrace = 50 * time.Millisecond
+	}
+	grace := min(timeout, maxGrace)
 	if grace <= 0 {
-		grace = 50 * time.Millisecond
+		grace = maxGrace
 	}
 	graceTimer := time.NewTimer(grace)
 	defer graceTimer.Stop()

@@ -133,12 +133,47 @@ func (c *PooledClient) closeHopTransport() error {
 
 // closeSelf stops this hop's keepalive and closes its own hop transport without
 // tearing down a shared upstream bastion's RootConn that other sessions may still use.
+// Jump children whose hopConn is not already a bounded proxyChanConn are bounded
+// behind proxyChanCloseGrace with escalation to RootConn so eviction/rejection
+// can never block indefinitely over a write-wedged bastion.
 func (c *PooledClient) closeSelf() error {
 	if c == nil {
 		return nil
 	}
 	c.stopKeepAlive()
-	return c.closeHopTransport()
+	if !c.isJumpChild() || c.RootConn == nil {
+		return c.closeHopTransport()
+	}
+	if _, ok := c.hopConn.(*proxyChanConn); ok {
+		return c.closeHopTransport()
+	}
+	return c.closeHopTransportBounded()
+}
+
+func (c *PooledClient) closeHopTransportBounded() error {
+	done := make(chan error, 1)
+	go func() {
+		done <- c.closeHopTransport()
+	}()
+
+	grace := proxyChanCloseGrace
+	if grace <= 0 {
+		grace = 90 * time.Millisecond
+	}
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		root := c.parent
+		if root == nil {
+			root = c
+		}
+		abortErr := c.pool.detachAndAbortRoot(root, c.RootConn, c, nil)
+		return errors.Join(abortErr, <-done)
+	}
 }
 
 // startKeepAlive starts this pooled client's background keepalive while
@@ -364,6 +399,60 @@ func (p *connPool) trackClosingLocked(c *PooledClient) {
 	p.closing[c]++
 }
 
+func (p *connPool) releaseClosing(c *PooledClient) {
+	if p == nil || c == nil {
+		return
+	}
+	p.mu.Lock()
+	if n := p.closing[c]; n <= 1 {
+		delete(p.closing, c)
+	} else {
+		p.closing[c] = n - 1
+	}
+	p.mu.Unlock()
+}
+
+// detachAndAbortRoot atomically detaches the outermost root hop (and any active
+// in-memory descendants) into p.closing, aborts the physical rootConn FIRST so
+// a write-wedged or blackholed upstream unblocks immediately, closes the root
+// and remaining descendants (skipping skipClient / skipHop to avoid re-entering
+// an already-closing child), and releases all closing entries.
+func (p *connPool) detachAndAbortRoot(root *PooledClient, rootConn net.Conn, skipClient *PooledClient, skipHop *proxyChanConn) error {
+	if root != nil {
+		for root.parent != nil {
+			root = root.parent
+		}
+		if rootConn == nil {
+			rootConn = root.RootConn
+		}
+	}
+	var batch *evictionBatch
+	if p != nil && root != nil {
+		batch = p.detachForEvict(ZeroHopDigest, root, true)
+	}
+	var errs []error
+	if rootConn != nil {
+		if err := closeResource(rootConn, "upstream root SSH transport"); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if root != nil && (skipClient == nil || root != skipClient) {
+		if err := root.closeSelf(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if batch != nil {
+		defer batch.release()
+		for _, child := range batch.descendants {
+			if child == nil || (skipClient != nil && child == skipClient) || (skipHop != nil && child.hopConn == skipHop) {
+				continue
+			}
+			_ = child.closeSelf()
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (p *connPool) SnapshotChain(plan []connectionPlanNode) []*PooledClient {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -397,13 +486,17 @@ func (p *connPool) Publish(
 	if expectParent != nil || (!next.parentKey.IsZero() && next.ControlSocketPath == "") {
 		parentKey := next.parentKey
 		if parentKey.IsZero() || expectParent == nil {
+			p.trackClosingLocked(next)
 			p.mu.Unlock()
+			defer p.releaseClosing(next)
 			_ = next.closeSelf()
 			return nil, errStaleParentGeneration
 		}
 		curParent, ok := p.active[parentKey]
 		if !ok || !isSameParentGeneration(curParent, expectParent) {
+			p.trackClosingLocked(next)
 			p.mu.Unlock()
+			defer p.releaseClosing(next)
 			_ = next.closeSelf()
 			return nil, errStaleParentGeneration
 		}
@@ -718,7 +811,7 @@ func (p *connPool) buildReindexStepsLocked(
 	for len(frontier) > 0 {
 		nextFrontier := make(map[HopDigest]*PooledClient)
 		for k, child := range p.active {
-			if child == nil || child.ControlSocketPath != "" {
+			if child == nil || (child.parentKey.IsZero() && child.ControlSocketPath != "") {
 				continue
 			}
 			if _, seen := moving[child]; seen {
@@ -961,13 +1054,20 @@ func (p *connPool) checkActiveClientLocked(key HopDigest, client *PooledClient, 
 			return fmt.Errorf("pool invariant violated: active client %p DigestClientConfig(publishedCfg, parentKey) %s != map key %s", client, wantKey, key)
 		}
 	}
-	if !client.parentKey.IsZero() && client.ControlSocketPath == "" {
-		parent, ok := p.active[client.parentKey]
-		if !ok || parent == nil {
-			return fmt.Errorf("pool invariant violated: active child %s missing active parent %s", key, client.parentKey)
-		}
-		if client.parent != parent || !isConsistentParentChildTransport(parent, client) {
-			return fmt.Errorf("pool invariant violated: active child %s has stale parent generation (parent=%p child.parent=%p)", key, parent, client.parent)
+	if !client.parentKey.IsZero() {
+		if client.ControlSocketPath == "" {
+			parent, ok := p.active[client.parentKey]
+			if !ok || parent == nil {
+				return fmt.Errorf("pool invariant violated: active child %s missing active parent %s", key, client.parentKey)
+			}
+			if client.parent != parent || !isConsistentParentChildTransport(parent, client) {
+				return fmt.Errorf("pool invariant violated: active child %s has stale parent generation (parent=%p child.parent=%p)", key, parent, client.parent)
+			}
+		} else if client.parent != nil {
+			parent, ok := p.active[client.parentKey]
+			if !ok || parent != client.parent {
+				return fmt.Errorf("pool invariant violated: active mux child %s has stale parent pointer %p", key, client.parent)
+			}
 		}
 	}
 	if requireKeepAlive && client.SSHClient != nil {

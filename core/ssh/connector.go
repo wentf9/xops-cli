@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -384,7 +385,11 @@ func (c *Connector) connectPlan(ctx context.Context, plan []connectionPlanNode) 
 			if connected == nil {
 				return nil, fmt.Errorf("resolved proxy jump '%s' for node '%s' has no client", planNode.cfg.ProxyJump, planNode.name)
 			}
-			dialer = &SSHProxyDialer{Client: connected.sshClient, RootConn: connected.rootConn}
+			dialer = &SSHProxyDialer{
+				Client:        connected.sshClient,
+				RootConn:      connected.rootConn,
+				abortUpstream: c.upstreamAbortFunc(connected.pooled, connected.rootConn),
+			}
 			expectParent = connected.pooled
 			c.reanchorPlanNodeParent(&planNode, expectParent)
 		case planNode.cfg.Options.ActiveProxyCommand() != "":
@@ -661,7 +666,10 @@ func (c *Connector) connectNode(ctx context.Context, planNode connectionPlanNode
 
 	client, err := c.initializeConnection(ctx, planNode, dialer, expectParent)
 	// Another caller can invalidate the same root after the check above.
-	if proxy, ok := dialer.(*SSHProxyDialer); err != nil && ok && proxy.transportClosed() && ctx.Err() == nil {
+	// When this dialer's own proxyChanConn escalated to abort a wedged/blackholed
+	// upstream bastion during handshake or post-handshake cleanup, surface the
+	// failure directly instead of silently doubling ConnectTimeout.
+	if proxy, ok := dialer.(*SSHProxyDialer); err != nil && ok && proxy.transportClosed() && !proxy.abortedBySelf() && ctx.Err() == nil {
 		return nil, fmt.Errorf("rebuild proxy chain for '%s': %w", nodeName, errors.Join(errProxyTransportClosed, err))
 	}
 	return client, err
@@ -1097,7 +1105,24 @@ func (c *Connector) tryAttachReactivatedSocket(
 	return nil, nil, false
 }
 
-func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolvedKeyPath string, rawClient *ssh.Client, rootConn net.Conn) {
+func (c *Connector) upstreamAbortFunc(parentPooled *PooledClient, rootConn net.Conn) func(self net.Conn) error {
+	return func(self net.Conn) error {
+		var skipHop *proxyChanConn
+		if pc, ok := self.(*proxyChanConn); ok {
+			skipHop = pc
+		}
+		return c.pool.detachAndAbortRoot(parentPooled, rootConn, nil, skipHop)
+	}
+}
+
+func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolvedKeyPath string, rawClient *ssh.Client, rootConn net.Conn, transportRoots ...net.Conn) {
+	var physicalRoot net.Conn
+	if len(transportRoots) > 0 {
+		physicalRoot = transportRoots[0]
+	}
+	if physicalRoot == nil {
+		physicalRoot = rootConn
+	}
 	target := c.buildTargetContext(planNode)
 	if resolvedKeyPath != "" {
 		target.KeyPath = resolvedKeyPath
@@ -1148,6 +1173,7 @@ func (c *Connector) maybeStartMasterListener(planNode connectionPlanNode, resolv
 		Target:                 target,
 		Environment:            c.environment,
 		RootConn:               rootConn,
+		PhysicalRootConn:       physicalRoot,
 		InitialActiveSessions:  1,
 		ConfirmSession:         c.confirmSessionCallback(planNode.name, planNode.cfg),
 		GatewayPorts:           gatewayPorts,
@@ -1621,8 +1647,7 @@ func (c *Connector) CloseAll() error {
 		planConnectors = append(planConnectors, plan)
 	}
 	ownedMasters := make([]*MuxServer, 0, len(c.masterOrder))
-	for i := len(c.masterOrder) - 1; i >= 0; i-- {
-		master := c.masterOrder[i]
+	for _, master := range c.masterOrder {
 		if _, ok := c.masters[master]; ok {
 			ownedMasters = append(ownedMasters, master)
 		}
@@ -1635,29 +1660,39 @@ func (c *Connector) CloseAll() error {
 
 	var closeErrs []error
 
-	// Masters own the control socket, its registry entry, and the SSH transport
-	// they serve. Closing the connector without them would leave a dead socket
-	// file that later commands must detect and unlink.
+	// 1. Immediately stop listening and unlink control sockets on all owned
+	// masters without performing any blocking SSH channel I/O so no new clients
+	// attach during teardown.
+	for _, master := range ownedMasters {
+		master.beginShutdown()
+	}
+
+	// 2. Close the pool to forbid new publication, stop all per-client
+	// keepalives, and drain active, retired, and closing transports ordered
+	// root-first before shutting down masters or joining connect workers.
+	var pooledClients []*PooledClient
+	if c.pool != nil {
+		pooledClients = c.pool.Close()
+	}
+
+	// 3. Abort physical root transports FIRST so any write-wedged or blackholed
+	// upstream bastion unblocks immediately before child masters or multiplexed
+	// child channels shut down.
+	closedRoots, rootErrs := abortPhysicalRootConns(pooledClients, ownedMasters)
+	closeErrs = append(closeErrs, rootErrs...)
+
+	// 4. Finish shutting down owned masters (root-first) and plan connectors.
 	for _, master := range ownedMasters {
 		if err := master.Shutdown(); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
-	}
-
-	// Closing the pool forbids new publication, stops all per-client keepalives,
-	// and drains both active and retired transports BEFORE joining connection
-	// workers. A downstream handshake can otherwise remain blocked in a ProxyJump
-	// channel after context cancellation.
-	var pooledClients []*PooledClient
-	if c.pool != nil {
-		pooledClients = c.pool.Close()
 	}
 	for _, plan := range planConnectors {
 		if err := c.closePlan(plan); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
 	}
-	closeErrs = append(closeErrs, interruptUniquePooledClients(pooledClients)...)
+	closeErrs = append(closeErrs, interruptUniquePooledClients(closedRoots, pooledClients)...)
 	c.connectWG.Wait()
 
 	c.kaMu.Lock()
@@ -1676,7 +1711,53 @@ func (c *Connector) CloseAll() error {
 	return c.closeErr
 }
 
-func interruptUniquePooledClients(groups ...[]*PooledClient) []error {
+func isComparableConn(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	t := reflect.TypeOf(conn)
+	return t != nil && t.Comparable()
+}
+
+func abortPhysicalRootConns(pooled []*PooledClient, masters []*MuxServer) (map[net.Conn]struct{}, []error) {
+	closedRoots := make(map[net.Conn]struct{})
+	var errs []error
+	closeConn := func(conn net.Conn) {
+		if conn == nil {
+			return
+		}
+		if _, isProxyChan := conn.(*proxyChanConn); isProxyChan {
+			return
+		}
+		if isComparableConn(conn) {
+			if _, seen := closedRoots[conn]; seen {
+				return
+			}
+			closedRoots[conn] = struct{}{}
+		}
+		if err := closeResource(conn, "root SSH transport"); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	for _, client := range pooled {
+		if client != nil {
+			closeConn(client.RootConn)
+		}
+	}
+	for _, master := range masters {
+		if master == nil {
+			continue
+		}
+		if master.physicalRoot != nil {
+			closeConn(master.physicalRoot)
+		} else {
+			closeConn(master.rootConn)
+		}
+	}
+	return closedRoots, errs
+}
+
+func interruptUniquePooledClients(closedRoots map[net.Conn]struct{}, groups ...[]*PooledClient) []error {
 	total := 0
 	for _, group := range groups {
 		total += len(group)
@@ -1692,7 +1773,17 @@ func interruptUniquePooledClients(groups ...[]*PooledClient) []error {
 				continue
 			}
 			seen[client] = struct{}{}
-			if err := client.interrupt(); err != nil {
+			rootConn := client.RootConn
+			if rootConn != nil && closedRoots != nil && isComparableConn(rootConn) {
+				if _, alreadyClosed := closedRoots[rootConn]; alreadyClosed {
+					rootConn = nil
+				}
+			}
+			var sshClient *ssh.Client
+			if client.SSHClient != nil && client.SSHClient.Conn != nil {
+				sshClient = client.SSHClient
+			}
+			if err := interruptSSHTransport(rootConn, sshClient); err != nil {
 				errs = append(errs, err)
 			}
 		}

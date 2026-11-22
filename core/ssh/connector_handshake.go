@@ -553,9 +553,11 @@ func (c *Connector) initializeConnection(ctx context.Context, planNode connectio
 		return nil, err
 	}
 	// Start multiplexing master if configured. Pass rootConn (this hop's own
-	// connection, not the bastion's transportRoot) so shutting down a jump-target
-	// master never closes the underlying bastion TCP connection.
-	c.maybeStartMasterListener(planNode, finalConnCfg.KeyPath, rawClient, rootConn)
+	// connection, not the bastion's transportRoot) as RootConn so shutting down
+	// a jump-target master over a healthy bastion never closes the underlying
+	// bastion TCP connection, while passing transportRoot as PhysicalRootConn
+	// so bounded shutdown can escalate if the bastion is write-wedged.
+	c.maybeStartMasterListener(planNode, finalConnCfg.KeyPath, rawClient, rootConn, transportRoot)
 	return client, nil
 }
 

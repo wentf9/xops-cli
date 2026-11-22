@@ -81,6 +81,7 @@ type MuxServerOptions struct {
 	AskConfirmation        bool
 	SSHClient              *cryptoSSH.Client
 	RootConn               net.Conn      // Optional underlying conn to close on Shutdown
+	PhysicalRootConn       net.Conn      // Optional outermost physical transport fallback for ProxyJump masters
 	InitialActiveSessions  int32         // Initial active session count (e.g. 1 for foreground master)
 	Target                 TargetContext // Optional target identity advertised via target@xops hello extension
 	GatewayPorts           bool
@@ -110,6 +111,7 @@ type MuxServer struct {
 	persistIndefinite bool
 	sshClient         *cryptoSSH.Client
 	rootConn          net.Conn
+	physicalRoot      net.Conn
 
 	gatewayPorts          bool
 	gatewayPortsMode      string
@@ -147,12 +149,14 @@ type MuxServer struct {
 	idleNotify                    chan struct{}
 	forwardTable                  muxForwardTable
 
-	shutdownOnce    sync.Once
-	shutdownChan    chan struct{}
-	slot            *fsx.SocketSlot
-	slotReleaseOnce sync.Once
-	askConfirmation bool
-	confirmSession  func(action string) bool
+	shutdownOnce       sync.Once
+	shutdownChan       chan struct{}
+	transportCloseOnce sync.Once
+	transportCloseErr  error
+	slot               *fsx.SocketSlot
+	slotReleaseOnce    sync.Once
+	askConfirmation    bool
+	confirmSession     func(action string) bool
 
 	serverCtx    context.Context
 	serverCancel context.CancelFunc
@@ -215,6 +219,7 @@ func NewMuxServer(opts MuxServerOptions) (*MuxServer, error) {
 		persistIndefinite:     opts.PersistIndefinite,
 		sshClient:             opts.SSHClient,
 		rootConn:              opts.RootConn,
+		physicalRoot:          opts.PhysicalRootConn,
 		listener:              slot.Listener(),
 		slot:                  slot,
 		shutdownChan:          make(chan struct{}),
@@ -279,10 +284,11 @@ func GetActiveMuxServer(controlPath string) *MuxServer {
 // MuxMasterOptions carries the master configuration a Connector applies for one
 // resolved control path.
 type MuxMasterOptions struct {
-	Path        string
-	Target      TargetContext
-	Environment Environment
-	RootConn    net.Conn
+	Path             string
+	Target           TargetContext
+	Environment      Environment
+	RootConn         net.Conn
+	PhysicalRootConn net.Conn
 	// InitialActiveSessions is the number of sessions the caller already holds
 	// on the new master. A connector passes 1 for its own transport: the master
 	// exists to serve it, so an idle timer must not tear it down while the
@@ -361,6 +367,7 @@ func StartMuxServer(ctx context.Context, sshClient *cryptoSSH.Client, opts MuxMa
 		PersistIndefinite:      persistIndefinite,
 		SSHClient:              sshClient,
 		RootConn:               opts.RootConn,
+		PhysicalRootConn:       opts.PhysicalRootConn,
 		InitialActiveSessions:  opts.InitialActiveSessions,
 		AskConfirmation:        askConfirmation,
 		ConfirmSession:         opts.ConfirmSession,
@@ -1291,8 +1298,90 @@ func closeShutdownForwardItem(item shutdownForwardItem) {
 	}
 }
 
+// beginShutdown stops accepting new mux connections, unlinks the control
+// socket, cancels serverCtx, and removes the server from activeMuxServers
+// without performing any blocking SSH transport I/O. Safe to call before
+// Shutdown() so Connector.CloseAll can abort physical root transports first.
+func (s *MuxServer) beginShutdown() {
+	if s == nil {
+		return
+	}
+	if s.serverCancel != nil {
+		s.serverCancel()
+	}
+	s.idleMu.Lock()
+	if s.phase != muxPhaseClosed {
+		s.phase = muxPhaseShuttingDown
+	}
+	s.disarmIdleTimerLocked()
+	s.notifyIdleLocked()
+	s.idleMu.Unlock()
+
+	s.releaseControlSocketSlot()
+	activeMuxServers.CompareAndDelete(s.controlPath, s)
+}
+
+// closeTransportBounded closes this master's SSH transport exactly once:
+// closing s.rootConn before s.sshClient and bounding any multiplexed jump hop
+// behind a grace timeout that escalates to s.physicalRoot if the upstream
+// bastion is write-wedged or blackholed (while preserving healthy bastions).
+func (s *MuxServer) closeTransportBounded() error {
+	if s == nil {
+		return nil
+	}
+	s.transportCloseOnce.Do(func() {
+		var sshCli *cryptoSSH.Client
+		if s.sshClient != nil && s.sshClient.Conn != nil {
+			sshCli = s.sshClient
+		}
+		if s.rootConn == nil && sshCli == nil {
+			return
+		}
+
+		hasFallback := s.physicalRoot != nil && s.physicalRoot != s.rootConn
+		_, isProxyChan := s.rootConn.(*proxyChanConn)
+		if !hasFallback && !isProxyChan {
+			s.transportCloseErr = interruptSSHTransport(s.rootConn, sshCli)
+			return
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- interruptSSHTransport(s.rootConn, sshCli)
+		}()
+
+		grace := proxyChanCloseGrace
+		if grace <= 0 {
+			grace = 90 * time.Millisecond
+		}
+		if isProxyChan {
+			// Let proxyChanConn's own grace timer fire first so its upstream
+			// abort hook can cleanly detach/evict a dead pooled bastion before
+			// falling back to raw physicalRoot.Close().
+			grace *= 2
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+
+		select {
+		case err := <-done:
+			s.transportCloseErr = err
+		case <-timer.C:
+			var fallbackErr error
+			if hasFallback {
+				fallbackErr = closeResource(s.physicalRoot, "physical root SSH transport")
+			}
+			s.transportCloseErr = errors.Join(fallbackErr, <-done)
+		}
+	})
+	return s.transportCloseErr
+}
+
 // Shutdown gracefully closes the server, listeners, active forwards, and SSH connections.
 func (s *MuxServer) Shutdown() error {
+	if s == nil {
+		return nil
+	}
 	s.shutdownOnce.Do(func() {
 		if s.serverCancel != nil {
 			s.serverCancel()
@@ -1318,12 +1407,7 @@ func (s *MuxServer) Shutdown() error {
 			return true
 		})
 
-		if s.sshClient != nil && s.sshClient.Conn != nil {
-			_ = s.sshClient.Close()
-		}
-		if s.rootConn != nil {
-			_ = s.rootConn.Close()
-		}
+		_ = s.closeTransportBounded()
 		for _, item := range remoteItems {
 			closeShutdownForwardItem(item)
 		}
@@ -1364,11 +1448,7 @@ func (s *MuxServer) interruptTransportAndShutdown() error {
 	if s == nil {
 		return nil
 	}
-	var sshCli *cryptoSSH.Client
-	if s.sshClient != nil && s.sshClient.Conn != nil {
-		sshCli = s.sshClient
-	}
-	interruptErr := interruptSSHTransport(s.rootConn, sshCli)
+	interruptErr := s.closeTransportBounded()
 	_ = s.Shutdown()
 	return interruptErr
 }

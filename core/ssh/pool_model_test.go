@@ -775,5 +775,118 @@ func TestModel_ConnectorPool_InFlightKeepAliveCancelAndChildTimeout(t *testing.T
 	}
 }
 
+// TestModel_ConnectorPool_MuxProxyCascadeReindexAndClosingTracking verifies
+// under -race that concurrent bastion Reindex cascades atomically to active
+// MUX_C_PROXY jump children (C6-L1), stale-parent Publish rejections remain
+// tracked in closing and release cleanly (C6-H3), and CheckInvariants holds
+// throughout every interleaving.
+func TestModel_ConnectorPool_MuxProxyCascadeReindexAndClosingTracking(t *testing.T) {
+	pool := newConnPool()
+	rootConn := &physicalSSHConn{Conn: &stubCloseConn{}}
+	muxRoot := &physicalSSHConn{Conn: &stubCloseConn{}}
+
+	bCfg := NewClientConfig(ClientConfig{NodeID: "bastion", AuthUpdateToken: "v0"})
+	tCfg := NewClientConfig(ClientConfig{NodeID: "target", ProxyJump: "bastion"})
+	bKey := DigestClientConfig(bCfg, ZeroHopDigest)
+	tKey := DigestClientConfig(tCfg, bKey)
+
+	bastion := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: rootConn, hopConn: rootConn, publishedCfg: bCfg}
+	targetMux := &PooledClient{
+		SSHClient:         &cryptoSSH.Client{},
+		RootConn:          muxRoot,
+		hopConn:           muxRoot,
+		parentKey:         bKey,
+		publishedCfg:      tCfg,
+		ControlSocketPath: "/tmp/model-c6-mux.sock",
+	}
+	if _, err := pool.Publish(bKey, bastion, nil, nil); err != nil {
+		t.Fatalf("Publish(bastion): %v", err)
+	}
+	if _, err := pool.Publish(tKey, targetMux, nil, nil); err != nil {
+		t.Fatalf("Publish(targetMux): %v", err)
+	}
+
+	stop := make(chan struct{})
+	var invErrMu sync.Mutex
+	var invErr error
+	recordErr := func(err error) {
+		if err == nil {
+			return
+		}
+		invErrMu.Lock()
+		if invErr == nil {
+			invErr = err
+		}
+		invErrMu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if err := pool.CheckInvariants(false); err != nil {
+				recordErr(err)
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	})
+	wg.Go(func() {
+		tokens := []string{"v1", "v2", "v3", "v4", "v5", "v6"}
+		for _, tok := range tokens {
+			if ok := pool.Reindex(bastion, func(cfg *ClientConfig) { cfg.AuthUpdateToken = tok }); !ok {
+				recordErr(errors.New("bastion Reindex unexpectedly returned false"))
+				return
+			}
+			bDigest := pool.DigestOf(bastion)
+			tDigest := pool.DigestOf(targetMux)
+			wantTDigest := DigestClientConfig(tCfg, bDigest)
+			if tDigest != wantTDigest {
+				recordErr(errors.New("MUX_C_PROXY child digest diverged from reindexed bastion"))
+				return
+			}
+		}
+	})
+	wg.Go(func() {
+		staleParent := &PooledClient{SSHClient: &cryptoSSH.Client{}, RootConn: &physicalSSHConn{Conn: &stubCloseConn{}}}
+		for range 12 {
+			hop := &stubCloseConn{}
+			staleChild := &PooledClient{
+				SSHClient: &cryptoSSH.Client{},
+				RootConn:  staleParent.RootConn,
+				hopConn:   hop,
+				parentKey: bKey,
+			}
+			if _, err := pool.Publish(tKey, staleChild, staleParent, nil); !errors.Is(err, errStaleParentGeneration) {
+				recordErr(errors.New("expected errStaleParentGeneration on stale-parent Publish"))
+				return
+			}
+			if !hop.closed.Load() {
+				recordErr(errors.New("stale-parent Publish did not close rejected hopConn"))
+				return
+			}
+		}
+	})
+
+	time.Sleep(25 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	if invErr != nil {
+		t.Fatalf("model invariant violated: %v", invErr)
+	}
+	if pool.ClosingCount() != 0 {
+		t.Fatalf("pool.ClosingCount() = %d, want 0", pool.ClosingCount())
+	}
+	if err := pool.CheckInvariants(false); err != nil {
+		t.Fatalf("final CheckInvariants: %v", err)
+	}
+	_ = pool.Close()
+}
+
 // Keep stubCloseConn compile-checked against net.Conn.
 var _ net.Conn = (*stubCloseConn)(nil)
