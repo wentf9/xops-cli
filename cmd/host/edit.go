@@ -54,7 +54,10 @@ func NewCmdInventoryEdit() *cobra.Command {
 	return cmd
 }
 
-func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secretInput *utils.InventorySecretInput) error {
+func prepareEditInputs(cmd *cobra.Command, args []string, flags *editFlags, secretInput *utils.InventorySecretInput) error {
+	if err := validateIdentityAliasFlag(cmd, &flags.identityAlias); err != nil {
+		return err
+	}
 	var err error
 	flags.password, flags.keyPass, err = secretInput.Read(cmd)
 	if err != nil {
@@ -75,6 +78,13 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secretInput *utils.InventorySecretInput) error {
+	if err := prepareEditInputs(cmd, args, flags, secretInput); err != nil {
+		return err
 	}
 
 	_, repository, _, err := utils.GetConfigStore()
@@ -135,6 +145,9 @@ func validateEditedNodeJumpCycles(
 }
 
 func validateEditPreFlags(cmd *cobra.Command, flags *editFlags, portChanged bool) error {
+	if err := validateIdentityAliasFlag(cmd, &flags.identityAlias); err != nil {
+		return err
+	}
 	if portChanged && flags.port == 0 {
 		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
 	}

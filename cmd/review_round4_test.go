@@ -468,17 +468,46 @@ func TestRound4_P2_23_ExecScpCanonicalizedDaemonHandoffAndResolveMasterNodeID(t 
 			t.Fatalf("exec/scp MuxDaemonSpec dropped canonical metadata: %+v", spec)
 		}
 
-		// Confirmed saved node still resolves user-pending fallback metadata.
-		if err := lease.Confirm(ctx); err != nil {
-			t.Fatalf("lease.Confirm: %v", err)
-		}
-		if got := resolveMasterNodeIDViaUserPending(repo, "short", fixHost, "fixture", uint16(portNum)); got != wantCanonID {
-			t.Fatalf("resolveMasterNodeIDViaUserPending after lease.Confirm = %q, want %q", got, wantCanonID)
-		}
-		return nil
+		return assertRound4P223ConfirmSavedTransition(t, ctx, repo, connector, m, batchOpts, lease, nodeID, rawOwnedID, wantCanonID, sockPath, fixHost, portNum)
 	}); err != nil {
 		t.Fatalf("WithPendingNode: %v", err)
 	}
+}
+
+func assertRound4P223ConfirmSavedTransition(
+	t *testing.T,
+	ctx context.Context,
+	repo *config.Repository,
+	connector *xssh.Connector,
+	m *xssh.MuxServer,
+	batchOpts *SshOptions,
+	lease config.PendingLease,
+	nodeID, rawOwnedID, wantCanonID, sockPath, fixHost string,
+	portNum int,
+) error {
+	t.Helper()
+	// Before lease.Confirm (ProvenanceOpenSSHDerived), user-pending fallback resolves to openssh:<canon>.
+	if got := resolveMasterNodeIDViaUserPending(repo, "short", fixHost, "fixture", uint16(portNum)); got != wantCanonID {
+		t.Fatalf("resolveMasterNodeIDViaUserPending before lease.Confirm = %q, want %q", got, wantCanonID)
+	}
+	// After lease.Confirm (ProvenanceSavedManaged), confirmed saved nodes must never rewrite to openssh:.
+	if err := lease.Confirm(ctx); err != nil {
+		t.Fatalf("lease.Confirm: %v", err)
+	}
+	if got := resolveMasterNodeIDViaUserPending(repo, "short", fixHost, "fixture", uint16(portNum)); got != "" {
+		t.Fatalf("resolveMasterNodeIDViaUserPending after lease.Confirm = %q, want empty", got)
+	}
+	if got := resolveOwnedMasterNodeID(repo, connector, m); got != nodeID || config.IsOpenSSHNodeID(got) {
+		t.Fatalf("resolveOwnedMasterNodeID after lease.Confirm = %q, want saved node %q", got, nodeID)
+	}
+	if got := resolveMasterNodeID(repo, m); got != nodeID || config.IsOpenSSHNodeID(got) {
+		t.Fatalf("resolveMasterNodeID after lease.Confirm = %q, want saved node %q", got, nodeID)
+	}
+	savedSpec := batchOpts.buildMuxDaemonSpecWithRawNode(repo, nodeID, rawOwnedID, sockPath, m)
+	if savedSpec.OpenSSHNamespace || !savedSpec.Canonicalized || savedSpec.OriginalHost != "short" {
+		t.Fatalf("confirmed saved MuxDaemonSpec = %+v, want OpenSSHNamespace=false Canonicalized=true OriginalHost=short", savedSpec)
+	}
+	return nil
 }
 
 func TestRound4_P2_24_CompleteRejectsInvalidArgsBeforeReadingStdin(t *testing.T) {

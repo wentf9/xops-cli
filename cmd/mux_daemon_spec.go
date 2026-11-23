@@ -238,8 +238,8 @@ func (o *SshOptions) buildMuxDaemonSpecWithProvider(provider config.ConfigProvid
 }
 
 func (o *SshOptions) buildMuxDaemonSpecWithRawNode(provider config.ConfigProvider, nodeID, rawNodeID, expandedPath string, master *ssh.MuxServer) MuxDaemonSpec {
-	targetHost, port, user, preserveSelector := o.resolveMuxDaemonTargetWithProvider(provider, nodeID, master)
 	forTarget := o.shouldPassIdentityFile(nodeID, master)
+	targetHost, port, user, preserveSelector := o.resolveMuxDaemonTargetForSpec(provider, nodeID, master, forTarget)
 	masterMode, persist := o.resolveMuxDaemonControl(master)
 
 	spec := MuxDaemonSpec{
@@ -690,6 +690,10 @@ func (o *SshOptions) resolveMuxDaemonTarget(nodeID string, master *ssh.MuxServer
 }
 
 func (o *SshOptions) resolveMuxDaemonTargetWithProvider(provider config.ConfigProvider, nodeID string, master *ssh.MuxServer) (host string, port int, user string, preserveSelector bool) {
+	return o.resolveMuxDaemonTargetForSpec(provider, nodeID, master, o.shouldPassIdentityFile(nodeID, master))
+}
+
+func (o *SshOptions) resolveMuxDaemonTargetForSpec(provider config.ConfigProvider, nodeID string, master *ssh.MuxServer, forTarget bool) (host string, port int, user string, preserveSelector bool) {
 	rawSelector := strings.TrimSpace(nodeID)
 	if rawSelector == "" && master != nil {
 		rawSelector = strings.TrimSpace(master.Target().OriginalHost)
@@ -698,6 +702,12 @@ func (o *SshOptions) resolveMuxDaemonTargetWithProvider(provider config.ConfigPr
 		rawSelector = strings.TrimSpace(o.Host)
 	}
 	host, parsedUser, parsedPort, preserveSelector := extractMuxDaemonTargetComponents(provider, rawSelector)
+	if !preserveSelector {
+		if baseSavedID := o.resolveAdHocPendingBaseSavedNode(provider, rawSelector, master, forTarget); baseSavedID != "" {
+			host = baseSavedID
+			preserveSelector = true
+		}
+	}
 	if host == "" && master != nil {
 		host = master.Target().Host
 	}
@@ -716,6 +726,91 @@ func (o *SshOptions) resolveMuxDaemonTargetWithProvider(provider config.ConfigPr
 		user = parsedUser
 	}
 	return host, port, user, preserveSelector
+}
+
+func isMatchingAdHocBaseSavedNode(provider config.ConfigProvider, candID, expectedHost string) (bool, error) {
+	candID = strings.TrimSpace(candID)
+	if candID == "" || config.IsOpenSSHNodeID(candID) {
+		return false, nil
+	}
+	if _, ok := provider.GetNode(candID); !ok {
+		return false, nil
+	}
+	baseSnap, err := provider.ResolveConnection(candID)
+	if err != nil {
+		return false, err
+	}
+	if baseSnap.Provenance != config.ProvenanceSavedManaged {
+		return false, nil
+	}
+	return sameMasterHostEndpoint(baseSnap.Host.Address, 0, expectedHost, 0), nil
+}
+
+func collectAdHocPendingBaseCandidates(snap config.ConnectionSnapshot, master *ssh.MuxServer) []string {
+	var candidates []string
+	addCand := func(s string) {
+		s = strings.TrimSpace(s)
+		if s != "" && !config.IsOpenSSHNodeID(s) && !slices.Contains(candidates, s) {
+			candidates = append(candidates, s)
+		}
+	}
+	addCand(snap.Node.CanonicalHost)
+	if master != nil {
+		addCand(master.Target().CanonicalHost)
+	}
+	addCand(snap.Node.OpenSSHAlias)
+	if master != nil {
+		addCand(master.Target().OriginalHost)
+	}
+	return candidates
+}
+
+func resolveSavedNodeCandidateID(provider config.ConfigProvider, cand, expectedHost string) string {
+	if ok, err := isMatchingAdHocBaseSavedNode(provider, cand, expectedHost); err == nil && ok {
+		return cand
+	}
+	if aliasID := provider.FindAlias(cand); aliasID != "" {
+		if ok, err := isMatchingAdHocBaseSavedNode(provider, aliasID, expectedHost); err == nil && ok {
+			return aliasID
+		}
+	}
+	if selID, err := provider.ResolveSelector(cand); err == nil && selID != "" {
+		if ok, mErr := isMatchingAdHocBaseSavedNode(provider, selID, expectedHost); mErr == nil && ok {
+			return selID
+		}
+	}
+	return ""
+}
+
+func (o *SshOptions) resolveAdHocPendingBaseSavedNode(
+	provider config.ConfigProvider,
+	rawSelector string,
+	master *ssh.MuxServer,
+	forTarget bool,
+) string {
+	if provider == nil || rawSelector == "" || config.IsOpenSSHNodeID(rawSelector) {
+		return ""
+	}
+	snap, err := provider.ResolveConnection(rawSelector)
+	if err != nil || snap.Provenance != config.ProvenanceAdHocPending {
+		return ""
+	}
+	if forTarget && o != nil {
+		connTarget := effectiveConnectionTarget(o, "")
+		if sel := strings.TrimSpace(connTarget.Selector); sel != "" && !config.IsOpenSSHNodeID(sel) {
+			if res, rErr := config.ResolveTarget(provider, connTarget); rErr == nil {
+				if ok, mErr := isMatchingAdHocBaseSavedNode(provider, res.BaseNodeID, snap.Host.Address); mErr == nil && ok {
+					return res.BaseNodeID
+				}
+			}
+		}
+	}
+	for _, cand := range collectAdHocPendingBaseCandidates(snap, master) {
+		if matched := resolveSavedNodeCandidateID(provider, cand, snap.Host.Address); matched != "" {
+			return matched
+		}
+	}
+	return ""
 }
 
 func extractMuxDaemonTargetComponents(provider config.ConfigProvider, rawSelector string) (host, parsedUser string, parsedPort int, preserveSelector bool) {

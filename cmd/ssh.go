@@ -767,6 +767,10 @@ func (o *SshOptions) probeTargetBackgroundSession(
 		candProbe.Host = fqdn
 		candProbe.Target.Selector = fqdn
 		candProbe.Target.OriginalHost = rawHost
+		if hasActiveCLIHostName(candProbe.cliHostName, candProbe.HostName) {
+			candProbe.cliHostName = fqdn
+			candProbe.HostName = fqdn
+		}
 		candTarget := effectiveConnectionTarget(&candProbe, "")
 		candNodeID := config.OpenSSHNodePrefix + fqdn
 		resolved, err := config.ResolveTarget(provider, candTarget)
@@ -1313,11 +1317,16 @@ func (o *SshOptions) buildProxyCommandPathChecker(
 			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, auth))
 		}
 	}
+	targetNodeID := ""
+	if isTarget {
+		targetNodeID = strings.TrimSpace(nodeID)
+	}
 	return &proxyCommandPathChecker{
 		opts:            o,
 		provider:        provider,
 		adp:             adapter.NewSSHAdapter(provider, adpOpts...),
 		sessionCtrlOpts: sessionCtrlOpts,
+		targetNodeID:    targetNodeID,
 		visited:         make(map[string]struct{}),
 	}, nil
 }
@@ -1327,6 +1336,7 @@ type proxyCommandPathChecker struct {
 	provider        config.ConfigProvider
 	adp             *adapter.SSHAdapter
 	sessionCtrlOpts adapter.SessionControlOptions
+	targetNodeID    string
 	visited         map[string]struct{}
 }
 
@@ -1384,13 +1394,19 @@ func (c *proxyCommandPathChecker) checkConnectorMasters(connector *ssh.Connector
 
 func (c *proxyCommandPathChecker) checkOwnedMaster(connector *ssh.Connector, m *ssh.MuxServer) (bool, error) {
 	if ownedID := strings.TrimSpace(connector.MasterNodeID(m)); ownedID != "" {
-		if hasProxy, err := c.checkNode(ownedID, false); err != nil || hasProxy {
+		effectiveOwnedID := normalizeOwnedMasterNodeID(c.provider, ownedID, m)
+		isTarget := c.targetNodeID != "" && (ownedID == c.targetNodeID || effectiveOwnedID == c.targetNodeID)
+		return c.checkNode(effectiveOwnedID, isTarget)
+	}
+	if resolvedID := resolveMasterNodeID(c.provider, m); resolvedID != "" {
+		isTarget := c.targetNodeID != "" && resolvedID == c.targetNodeID
+		if hasProxy, err := c.checkNode(resolvedID, isTarget); err != nil || hasProxy {
 			return true, err
 		}
-	}
-	if resolvedID := resolveOwnedMasterNodeID(c.provider, connector, m); resolvedID != "" {
-		if hasProxy, err := c.checkNode(resolvedID, false); err != nil || hasProxy {
-			return true, err
+		if c.provider != nil {
+			if snap, err := c.provider.ResolveConnection(resolvedID); err == nil && !isOpenSSHProvenance(snap.Provenance) {
+				return false, nil
+			}
 		}
 	}
 	targetHost := strings.TrimSpace(m.Target().OriginalHost)
@@ -1534,7 +1550,15 @@ func resolvePersistentHandoffNodeID(provider config.ConfigProvider, connector *s
 	if connector != nil && strings.TrimSpace(connector.MasterNodeID(master)) != "" {
 		return resolvedID
 	}
-	if handoffNodeID == "" || (!config.IsOpenSSHNodeID(handoffNodeID) && config.IsOpenSSHNodeID(resolvedID)) {
+	if handoffNodeID == "" {
+		return resolvedID
+	}
+	if !config.IsOpenSSHNodeID(handoffNodeID) && config.IsOpenSSHNodeID(resolvedID) {
+		if provider != nil {
+			if snap, err := provider.ResolveConnection(handoffNodeID); err == nil && !isOpenSSHProvenance(snap.Provenance) {
+				return handoffNodeID
+			}
+		}
 		return resolvedID
 	}
 	return handoffNodeID
@@ -1708,6 +1732,33 @@ func resolveOwnedMasterNodeID(provider config.ConfigProvider, connector *ssh.Con
 	return resolveMasterNodeID(provider, m)
 }
 
+func isOpenSSHProvenance(prov config.NodeProvenance) bool {
+	return prov == config.ProvenanceOpenSSHVirtual || prov == config.ProvenanceOpenSSHDerived
+}
+
+func resolveOpenSSHProvenanceMetadata(provider config.ConfigProvider, candidateID string) (alias, canon string, isOpenSSH bool) {
+	if provider == nil || candidateID == "" {
+		return "", "", false
+	}
+	snap, err := provider.ResolveConnection(candidateID)
+	if err != nil || !isOpenSSHProvenance(snap.Provenance) {
+		return "", "", false
+	}
+	alias = strings.TrimSpace(snap.Node.OpenSSHAlias)
+	canon = strings.TrimSpace(snap.Node.CanonicalHost)
+	if alias == "" {
+		if src, ok := provider.(interface{ NodeOpenSSHAlias(string) string }); ok {
+			alias = strings.TrimSpace(src.NodeOpenSSHAlias(candidateID))
+		}
+	}
+	if canon == "" {
+		if src, ok := provider.(interface{ NodeCanonicalHost(string) string }); ok {
+			canon = strings.TrimSpace(src.NodeCanonicalHost(candidateID))
+		}
+	}
+	return alias, canon, true
+}
+
 func normalizeOwnedMasterNodeID(provider config.ConfigProvider, ownedID string, m *ssh.MuxServer) string {
 	if config.IsOpenSSHNodeID(ownedID) {
 		return normalizeOwnedOpenSSHMasterNodeID(provider, ownedID, m)
@@ -1723,23 +1774,20 @@ func normalizeOwnedMasterNodeID(provider config.ConfigProvider, ownedID string, 
 		}
 		return ownedID
 	}
-	_, isSaved := provider.GetNode(ownedID)
-	alias := resolveNodeOpenSSHAlias(provider, ownedID)
-	canon := resolveNodeCanonicalHost(provider, ownedID)
+	alias, canon, isOpenSSH := resolveOpenSSHProvenanceMetadata(provider, ownedID)
+	if !isOpenSSH {
+		return ownedID
+	}
 	if canon == "" && m != nil {
 		canon = strings.TrimSpace(m.Target().CanonicalHost)
 	}
-	orig := ""
-	if m != nil {
-		orig = strings.TrimSpace(m.Target().OriginalHost)
-	}
-	if alias != "" && (!isSaved || (orig != "" && orig != ownedID)) {
+	if alias != "" {
 		if canon != "" && !strings.EqualFold(alias, canon) {
 			return config.OpenSSHNodePrefix + canon
 		}
 		return config.OpenSSHNodePrefix + alias
 	}
-	if !isSaved && canon != "" {
+	if canon != "" {
 		return config.OpenSSHNodePrefix + canon
 	}
 	return ownedID
@@ -1783,13 +1831,11 @@ func resolveNodeOpenSSHAlias(provider config.ConfigProvider, nodeID string) stri
 }
 
 func resolvePendingOpenSSHAlias(provider config.ConfigProvider, candidateID string) string {
-	if provider == nil || candidateID == "" {
+	alias, _, ok := resolveOpenSSHProvenanceMetadata(provider, candidateID)
+	if !ok {
 		return ""
 	}
-	if _, isSaved := provider.GetNode(candidateID); isSaved {
-		return ""
-	}
-	return resolveNodeOpenSSHAlias(provider, candidateID)
+	return alias
 }
 
 func resolveNodeCanonicalHost(provider config.ConfigProvider, nodeID string) string {
@@ -1808,13 +1854,41 @@ func resolveNodeCanonicalHost(provider config.ConfigProvider, nodeID string) str
 }
 
 func resolvePendingCanonicalHost(provider config.ConfigProvider, candidateID string) string {
-	if provider == nil || candidateID == "" {
+	_, canon, ok := resolveOpenSSHProvenanceMetadata(provider, candidateID)
+	if !ok {
 		return ""
 	}
-	if _, isSaved := provider.GetNode(candidateID); isSaved {
+	return canon
+}
+
+func resolveNonOpenSSHMasterNodeID(provider config.ConfigProvider, orig, canonical, targetHost, user string, port uint16) string {
+	if provider == nil {
 		return ""
 	}
-	return resolveNodeCanonicalHost(provider, candidateID)
+	if savedID := resolveSavedMasterNodeID(provider, orig, targetHost, user, port); savedID != "" {
+		return savedID
+	}
+	if canonical != "" && !strings.EqualFold(canonical, orig) {
+		if savedID := resolveSavedMasterNodeID(provider, canonical, targetHost, user, port); savedID != "" {
+			return savedID
+		}
+	}
+	if targetHost != "" && user != "" {
+		compositeID := config.FormatNodeID(user, targetHost, port)
+		if snap, err := provider.ResolveConnection(compositeID); err == nil {
+			if isOpenSSHProvenance(snap.Provenance) {
+				return ""
+			}
+			if savedMasterNodeMatches(snap, targetHost, user, port) {
+				return compositeID
+			}
+			return ""
+		}
+		if savedID := resolveSavedMasterNodeID(provider, targetHost, targetHost, user, port); savedID != "" {
+			return savedID
+		}
+	}
+	return ""
 }
 
 func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) string {
@@ -1828,10 +1902,12 @@ func resolveMasterNodeID(provider config.ConfigProvider, m *ssh.MuxServer) strin
 	if port <= 0 {
 		port = 22
 	}
-	if canonical := strings.TrimSpace(t.CanonicalHost); canonical != "" && (orig == "" || !strings.EqualFold(orig, canonical)) {
-		if resolveSavedMasterNodeID(provider, orig, targetHost, t.User, uint16(port)) == "" {
-			return config.OpenSSHNodePrefix + canonical
-		}
+	canonical := strings.TrimSpace(t.CanonicalHost)
+	if nonOpenSSHID := resolveNonOpenSSHMasterNodeID(provider, orig, canonical, targetHost, t.User, uint16(port)); nonOpenSSHID != "" {
+		return nonOpenSSHID
+	}
+	if canonical != "" && (orig == "" || !strings.EqualFold(orig, canonical)) {
+		return config.OpenSSHNodePrefix + canonical
 	}
 	if provider != nil && orig != "" {
 		if id := resolveMasterNodeIDFromOriginalHost(provider, orig, targetHost, t.User, uint16(port)); id != "" {
@@ -1967,16 +2043,13 @@ func resolveMasterNodeIDViaUserPending(provider config.ConfigProvider, cleanOrig
 	}
 	if targetHost != "" {
 		targetPendingID := config.FormatNodeID(user, targetHost, port)
-		canon := resolvePendingCanonicalHost(provider, targetPendingID)
-		alias := resolvePendingOpenSSHAlias(provider, targetPendingID)
-		if canon == "" {
-			canon = resolveNodeCanonicalHost(provider, targetPendingID)
-		}
-		if alias == "" {
-			alias = resolveNodeOpenSSHAlias(provider, targetPendingID)
-		}
-		if canon != "" && strings.EqualFold(alias, cleanOrig) {
-			return config.OpenSSHNodePrefix + canon
+		if alias, canon, ok := resolveOpenSSHProvenanceMetadata(provider, targetPendingID); ok {
+			if canon != "" && strings.EqualFold(alias, cleanOrig) {
+				return config.OpenSSHNodePrefix + canon
+			}
+			if alias != "" && strings.EqualFold(alias, cleanOrig) {
+				return config.OpenSSHNodePrefix + alias
+			}
 		}
 	}
 	return ""
@@ -2015,6 +2088,15 @@ func resolveMasterConcreteCanonicalNodeID(provider config.ConfigProvider, cleanO
 }
 
 func resolveMasterVirtualOpenSSHNodeID(provider config.ConfigProvider, cleanOrig, targetHost, user string, port uint16) string {
+	if provider == nil || cleanOrig == "" {
+		return ""
+	}
+	if targetHost != "" && user != "" {
+		compositeID := config.FormatNodeID(user, targetHost, port)
+		if snap, err := provider.ResolveConnection(compositeID); err == nil && !isOpenSSHProvenance(snap.Provenance) {
+			return ""
+		}
+	}
 	parser := providerOpenSSHParser(provider)
 	if parser == nil || !parser.HasHost(cleanOrig) {
 		return ""
@@ -3061,6 +3143,16 @@ func parseForwardArg(arg string) (bindAddr, destAddr string, err error) {
 	return spec.BindAddr, spec.DestAddr, nil
 }
 
+func hasActiveCLIHostName(cliHostName, hostName string) bool {
+	if h := strings.TrimSpace(cliHostName); h != "" && !ssh.IsNoneValue(h) {
+		return true
+	}
+	if h := strings.TrimSpace(hostName); h != "" && !ssh.IsNoneValue(h) {
+		return true
+	}
+	return false
+}
+
 func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider config.ConfigProvider, resolver config.CanonicalResolver) error {
 	if o == nil || provider == nil || o.isMuxDaemon() || o.canonicalized {
 		return nil
@@ -3105,6 +3197,10 @@ func (o *SshOptions) applyHostnameCanonicalization(ctx context.Context, provider
 	o.Host = res.CanonicalHost
 	o.Target.Selector = res.CanonicalHost
 	o.Target.OriginalHost = res.OriginalHost
+	if hasActiveCLIHostName(o.cliHostName, o.HostName) {
+		o.cliHostName = res.CanonicalHost
+		o.HostName = res.CanonicalHost
+	}
 	return nil
 }
 

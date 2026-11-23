@@ -66,6 +66,9 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 }
 
 func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretInput *utils.InventorySecretInput, verify inventoryVerifier) error {
+	if err := validateIdentityAliasFlag(cmd, &flags.identityAlias); err != nil {
+		return err
+	}
 	probe, execution, err := enrollmentProbeOptions(cmd)
 	if err != nil {
 		return err
@@ -148,7 +151,22 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	return commitAddedNode(cmd, repository, name, node, hostObj, identity, password, keyPass, flags.keyPath, flags.identityAlias != "")
 }
 
+func validateIdentityAliasFlag(cmd *cobra.Command, identityAlias *string) error {
+	if identityAlias == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*identityAlias)
+	if cmd != nil && cmd.Flags().Changed("identity") && trimmed == "" {
+		return fmt.Errorf("flag --identity (-I) must not be empty")
+	}
+	*identityAlias = trimmed
+	return nil
+}
+
 func validateAddPreFlags(cmd *cobra.Command, flags *addFlags, portChanged bool) error {
+	if err := validateIdentityAliasFlag(cmd, &flags.identityAlias); err != nil {
+		return err
+	}
 	if portChanged && flags.port == 0 {
 		return fmt.Errorf("%s", i18n.T("scp_err_port_zero"))
 	}

@@ -416,13 +416,19 @@ func prepareImportWithAllocator(repo *config.Repository, addr utils.HostInfo, ta
 func (d *importDraft) verificationBundle() config.ConnectionSnapshot {
 	bundle := d.bundle
 	if d.addr.Password != "" {
-		bundle.Identity.Password, bundle.Identity.AuthType = d.addr.Password, "password"
+		bundle.Identity.Password = d.addr.Password
+		if !config.IsHybridAuthType(bundle.Identity.AuthType) {
+			bundle.Identity.AuthType = "password"
+		}
 		bundle.Identity.LoginPasswordRef = nil
 	} else if d.addr.KeyPath != "" || d.addr.Passphrase != "" {
 		if d.addr.KeyPath != "" {
 			bundle.Identity.KeyPath = utils.NormalizeIdentityKeyPath(d.addr.KeyPath)
 		}
-		bundle.Identity.Passphrase, bundle.Identity.AuthType = d.addr.Passphrase, "key"
+		bundle.Identity.Passphrase = d.addr.Passphrase
+		if !config.IsHybridAuthType(bundle.Identity.AuthType) {
+			bundle.Identity.AuthType = "key"
+		}
 		bundle.Identity.PassphraseRef = nil
 	}
 	return bundle
