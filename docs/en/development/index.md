@@ -25,6 +25,8 @@ Historical implementation records describe validation at the time; they do not i
 
 Each document states its implementation status and validation scope.
 
+- [XOps v2 Clean-Slate Architecture Specification (Architecture RFC)](./v2-architecture-rfc.md)
+- [XOps v2 Clean-Slate Phased Implementation Plan](./v2-implementation-plan.md)
 - [Architecture and governance map](./governance/architecture-map.md)
 - [Architectural invariants, explicit contracts & anti-drift baseline](./governance/invariants.md)
 - [OpenSSH connection multiplexing design](./openssh-multiplexing-design.md)

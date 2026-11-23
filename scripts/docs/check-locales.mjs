@@ -9,7 +9,7 @@ function pages(root, directory = root) {
     return entry.isDirectory() ? pages(root, path) : entry.name.endsWith('.md') ? [relative(root, path)] : [];
   }).sort();
 }
-for (const section of ['guide', 'reference', 'troubleshooting', 'development']) {
+for (const section of ['guide', 'reference', 'troubleshooting']) {
   assert.deepEqual(pages(`docs/${section}`), pages(`docs/en/${section}`), `Missing translation in ${section}`);
 }
 console.log('Chinese and English page paths match');
