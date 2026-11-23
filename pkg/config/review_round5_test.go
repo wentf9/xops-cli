@@ -261,7 +261,7 @@ func TestRound5_P2_6_And_P2_8_PendingEvictionAndAtomicMetadataReplacement(t *tes
 	}
 
 	// CheckRefUnreferenced disk reload evicts stale pending when stale memory snapshot refreshes from disk.
-	staleRef := credential.Ref{StoreID: "system", ItemID: "disk-evicted-ref"}
+	staleRef := credential.Ref{StoreID: "file", ItemID: "disk-evicted-ref"}
 	diskStore := &memoryPersistStore{cfg: cloneConfiguration(nil)}
 	repoDisk, err := NewRepositoryWithoutOpenSSH(nil, diskStore)
 	if err != nil {

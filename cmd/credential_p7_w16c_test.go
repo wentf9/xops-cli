@@ -120,8 +120,8 @@ func testW16cCredSetPasswordOnSharedEncryptedKey(t *testing.T) {
 	store, vaultFile := setupW16cHelperStore(t)
 	encKey := inventoryTestPrivateKey(t, true)
 	mustExecRoot(t, "key-password\n", "identity", "add", "shared-key", "ops", "--key", encKey, "--passphrase-stdin")
-	mustExecRoot(t, "", "host", "add", "ops@10.40.0.2:22", "-I", "shared-key", "--skip-verify")
-	mustExecRoot(t, "", "host", "add", "ops@10.40.0.3:22", "-I", "shared-key", "--skip-verify")
+	mustExecRoot(t, "", "host", "add", "10.40.0.2:22", "-I", "shared-key", "--skip-verify")
+	mustExecRoot(t, "", "host", "add", "10.40.0.3:22", "-I", "shared-key", "--skip-verify")
 
 	cfgBefore, _ := store.Load()
 	sharedBefore, _ := cfgBefore.Identities.Get("shared-key")

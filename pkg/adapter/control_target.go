@@ -391,7 +391,10 @@ func effectiveControlConfigJumpOverride(sessionAuth SessionAuth, sessionOpts Ses
 }
 
 func isDerivedOpenSSHResolvedTarget(resolved config.ResolvedTarget) bool {
-	return resolved.Provenance == config.ProvenanceOpenSSHDerived || config.IsOpenSSHNodeID(resolved.BaseNodeID)
+	if resolved.Provenance == config.ProvenanceOpenSSHDerived {
+		return true
+	}
+	return resolved.Provenance == config.ProvenanceUnknown && config.IsOpenSSHNodeID(resolved.BaseNodeID)
 }
 
 func derivedOpenSSHLookupKey(resolved config.ResolvedTarget) string {
@@ -1033,7 +1036,7 @@ func buildControlProxyJumpTarget(
 			Host:          strings.TrimSpace(resolved.Host),
 			Port:          port,
 			User:          user,
-			IsAdHoc:       resolved.Created && resolved.OpenSSHAlias == "",
+			IsAdHoc:       resolved.Provenance == config.ProvenanceAdHocPending || (resolved.Provenance == config.ProvenanceUnknown && resolved.Created && resolved.OpenSSHAlias == ""),
 		}
 	} else {
 		user := strings.TrimSpace(req.FallbackUser)
@@ -1231,6 +1234,21 @@ func resolveSavedControlLookupByKey(
 	return auth, true, false
 }
 
+func applyResolvedControlSessionOrigin(
+	auth SessionAuth,
+	origHost, canonHost, resolvedAlias, resolvedCanon string,
+	fallbackOrigs ...string,
+) SessionAuth {
+	candidates := append([]string{origHost, resolvedAlias}, fallbackOrigs...)
+	auth.OriginalHost = firstNonEmptySessionValue(candidates...)
+	if origHost == "" && canonHost == "" {
+		auth.CanonicalHost = resolvedCanon
+	} else {
+		auth.CanonicalHost = canonHost
+	}
+	return auth
+}
+
 func resolveTargetControlSessionLookup(
 	provider config.ConfigProvider,
 	lookupKey, nodeID string,
@@ -1241,38 +1259,24 @@ func resolveTargetControlSessionLookup(
 ) (string, SessionAuth, bool, bool) {
 	if resolved.MatchedNodeID != "" {
 		if !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
-			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, extractOpenSSHHost(nodeID), targetOrig)
-			if origHost == "" && canonHost == "" {
-				auth.CanonicalHost = resolved.CanonicalHost
-			} else {
-				auth.CanonicalHost = canonHost
-			}
+			auth = applyResolvedControlSessionOrigin(auth, origHost, canonHost, resolved.OpenSSHAlias, resolved.CanonicalHost, extractOpenSSHHost(nodeID), targetOrig)
 			return resolved.MatchedNodeID, auth, true, resolvedVirtual
 		}
-		if lookupKey == "" {
-			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, targetOrig)
-			if origHost == "" && canonHost == "" {
-				auth.CanonicalHost = resolved.CanonicalHost
-			} else {
-				auth.CanonicalHost = canonHost
-			}
+		if lookupKey == "" || (!config.IsOpenSSHNodeID(lookupKey) && !isSavedControlNodeID(provider, lookupKey)) {
+			auth = applyResolvedControlSessionOrigin(auth, origHost, canonHost, resolved.OpenSSHAlias, resolved.CanonicalHost, targetOrig)
 			return resolved.MatchedNodeID, auth, false, config.HasOpenSSHConfig(provider)
 		}
 		return "", auth, false, resolvedVirtual
 	}
 	if isDerivedOpenSSHResolvedTarget(resolved) {
-		if lookupKey == "" || lookupKey == resolved.NodeID {
-			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, targetOrig)
-			if origHost == "" && canonHost == "" {
-				auth.CanonicalHost = resolved.CanonicalHost
-			} else {
-				auth.CanonicalHost = canonHost
-			}
+		if lookupKey == "" || lookupKey == resolved.NodeID || (!config.IsOpenSSHNodeID(lookupKey) && !isSavedControlNodeID(provider, lookupKey)) {
+			auth = applyResolvedControlSessionOrigin(auth, origHost, canonHost, resolved.OpenSSHAlias, resolved.CanonicalHost, targetOrig)
 			return derivedOpenSSHLookupKey(resolved), auth, false, config.HasOpenSSHConfig(provider)
 		}
 		return "", auth, false, resolvedVirtual
 	}
 	if resolved.NodeID != "" && lookupKey == "" {
+		auth = applyResolvedControlSessionOrigin(auth, origHost, canonHost, resolved.OpenSSHAlias, resolved.CanonicalHost, targetOrig)
 		return resolved.NodeID, auth, false, resolvedVirtual
 	}
 	return "", auth, false, resolvedVirtual
@@ -1387,10 +1391,12 @@ func finalizeControlSessionLookup(
 	auth SessionAuth,
 ) (string, SessionAuth) {
 	if canonHost != "" {
-		if lookupKey == "" || !config.IsOpenSSHNodeID(lookupKey) {
+		if lookupKey == "" {
 			lookupKey = config.OpenSSHNodePrefix + canonHost
-		} else if unwrapped := extractOpenSSHHost(lookupKey); unwrapped != "" && !strings.EqualFold(unwrapped, canonHost) {
-			lookupKey = rewriteOpenSSHLookupKeyHost(lookupKey, canonHost)
+		} else if config.IsOpenSSHNodeID(lookupKey) {
+			if unwrapped := extractOpenSSHHost(lookupKey); unwrapped != "" && !strings.EqualFold(unwrapped, canonHost) {
+				lookupKey = rewriteOpenSSHLookupKeyHost(lookupKey, canonHost)
+			}
 		}
 		auth.OriginalHost = firstNonEmptySessionValue(origHost, targetOrig)
 		auth.CanonicalHost = canonHost

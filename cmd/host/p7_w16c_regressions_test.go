@@ -129,7 +129,7 @@ func assertW16cHostAddPrivateIdentityRef(t *testing.T, store config.Store) {
 
 func assertW16cHostAddExplicitIdentityTemplate(t *testing.T, store config.Store) {
 	t.Helper()
-	if err := runHostAddCLI("ops@10.0.0.1:2223", "-I", "shared-tpl", "--skip-verify"); err != nil {
+	if err := runHostAddCLI("10.0.0.1:2223", "-I", "shared-tpl", "--skip-verify"); err != nil {
 		t.Fatalf("host add -I shared-tpl failed: %v", err)
 	}
 	loaded, err := store.Load()

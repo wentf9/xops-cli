@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"slices"
@@ -1230,7 +1231,10 @@ func (o *SshOptions) hasActiveProxyCommandInPathForTarget(
 	if provider == nil {
 		return false, nil
 	}
-	checker := o.buildProxyCommandPathChecker(provider, nodeID, isTarget, sessionCtrlOpts)
+	checker, err := o.buildProxyCommandPathChecker(provider, nodeID, isTarget, sessionCtrlOpts)
+	if err != nil {
+		return true, err
+	}
 	if hasProxy, err := checker.checkNode(nodeID, isTarget); err != nil || hasProxy {
 		return true, err
 	}
@@ -1270,20 +1274,43 @@ func (o *SshOptions) buildProxyCommandPathChecker(
 	nodeID string,
 	isTarget bool,
 	sessionCtrlOpts adapter.SessionControlOptions,
-) *proxyCommandPathChecker {
+) (*proxyCommandPathChecker, error) {
 	adpOpts := []adapter.Option{adapter.WithLocalExecution(true)}
 	if o != nil && isTarget && nodeID != "" {
+		o.syncResolvedTargetHosts(provider)
+		hostNameOverride, hostErr := o.effectiveHostName()
+		if hostErr != nil {
+			return nil, hostErr
+		}
 		origHost, canonHost := canonicalControlOriginAndHost(o)
 		if origHost == "" {
 			origHost = strings.TrimSpace(o.originalHost)
 		}
-		jump := o.JumpHost
-		if jump != "" || origHost != "" || canonHost != "" {
-			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, adapter.SessionAuth{
-				ProxyJump:     jump,
-				OriginalHost:  origHost,
-				CanonicalHost: canonHost,
-			}))
+		sessUser := firstNonEmptyControlValue(o.User, o.Target.User)
+		var sessPort uint16
+		if o.Port > 0 {
+			sessPort = o.Port
+		} else if o.Target.HasPort && o.Target.Port > 0 {
+			sessPort = o.Target.Port
+		}
+		if o.resolvedTarget != nil {
+			if sessUser == "" && strings.TrimSpace(o.resolvedTarget.User) != "" {
+				sessUser = strings.TrimSpace(o.resolvedTarget.User)
+			}
+			if sessPort == 0 && o.resolvedTarget.Port > 0 && o.resolvedTarget.Port <= math.MaxUint16 {
+				sessPort = uint16(o.resolvedTarget.Port)
+			}
+		}
+		auth := adapter.SessionAuth{
+			HostName:      strings.TrimSpace(hostNameOverride),
+			User:          strings.TrimSpace(sessUser),
+			Port:          sessPort,
+			ProxyJump:     o.JumpHost,
+			OriginalHost:  origHost,
+			CanonicalHost: canonHost,
+		}
+		if hasControlProbeSessionAuth(auth) {
+			adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(nodeID, auth))
 		}
 	}
 	return &proxyCommandPathChecker{
@@ -1292,7 +1319,7 @@ func (o *SshOptions) buildProxyCommandPathChecker(
 		adp:             adapter.NewSSHAdapter(provider, adpOpts...),
 		sessionCtrlOpts: sessionCtrlOpts,
 		visited:         make(map[string]struct{}),
-	}
+	}, nil
 }
 
 type proxyCommandPathChecker struct {

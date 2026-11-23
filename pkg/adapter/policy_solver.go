@@ -1475,9 +1475,19 @@ func (a *SSHAdapter) resolveScopedTier4Alias(
 	tier1Auth SessionAuth,
 ) (string, string) {
 	openSSHAlias, canonicalHost := a.resolveSessionOpenSSHMetadata(parser, nodeName, snapErr, snapshot, hasTier1Auth, tier1Auth)
-	if snapErr != nil && openSSHAlias != "" {
+	if openSSHAlias == "" {
+		return "", ""
+	}
+	if snapErr != nil {
 		fb := a.resolveFallbackTier4Target(nodeName, hasTier1Auth, tier1Auth)
 		if fb.scopeByEndpoint && fb.hasEP && !endpointMatchesOpenSSHAlias(parser, fb.ep, openSSHAlias, canonicalHost) {
+			return "", ""
+		}
+		return openSSHAlias, canonicalHost
+	}
+	if !snapshot.Provenance.IsUnpersistedOpenSSH() && snapshot.Provenance != config.ProvenanceSavedManaged {
+		ep, _, err := effectiveSnapshotEndpoint(snapshot, hasTier1Auth, tier1Auth)
+		if err != nil || !endpointMatchesOpenSSHAlias(parser, ep, openSSHAlias, canonicalHost) {
 			return "", ""
 		}
 	}
@@ -1658,7 +1668,7 @@ func resolveScopedSavedOpenSSHAlias(
 	tier1OriginalHost string,
 	tier1CanonicalHost string,
 ) (string, string, bool) {
-	if parser == nil || snapshot.Provenance != config.ProvenanceSavedManaged {
+	if parser == nil || snapshot.Provenance.IsUnpersistedOpenSSH() {
 		return "", "", false
 	}
 	orig := strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1OriginalHost))
@@ -1672,7 +1682,17 @@ func resolveScopedSavedOpenSSHAlias(
 			return "", "", false
 		}
 		vhostEp, err := ssh.NewEndpoint(vhost.Address, effectiveSnapshotPort(vhost.Port))
-		if err != nil || !savedNodeMatchesVirtualEndpoint(snapshot, hasTier1Auth, tier1Auth, vhostEp, canon) {
+		if err != nil {
+			return "", "", false
+		}
+		if snapshot.Provenance != config.ProvenanceSavedManaged {
+			nodeEp, _, nodeErr := effectiveSnapshotEndpoint(snapshot, hasTier1Auth, tier1Auth)
+			if nodeErr != nil || !nodeEp.Equal(vhostEp) {
+				return "", "", false
+			}
+			return orig, canon, true
+		}
+		if !savedNodeMatchesVirtualEndpoint(snapshot, hasTier1Auth, tier1Auth, vhostEp, canon) {
 			return "", "", false
 		}
 		return orig, canon, true
@@ -1706,7 +1726,7 @@ func (a *SSHAdapter) resolveSessionOpenSSHMetadata(
 		t1Canon = strings.TrimSpace(config.UnwrapOpenSSHSelector(tier1Auth.CanonicalHost))
 	}
 	if snapErr == nil {
-		if snapshot.Provenance != config.ProvenanceSavedManaged {
+		if snapshot.Provenance.IsUnpersistedOpenSSH() {
 			return strings.TrimSpace(snapshot.Node.OpenSSHAlias), strings.TrimSpace(snapshot.Node.CanonicalHost)
 		}
 		snapOrigin := config.OpenSSHOrigin{
@@ -1850,14 +1870,6 @@ func savedNodeAllowsTier4Key(
 	}).Allowed()
 }
 
-func concreteHostMatchesEndpoint(parser *config.OpenSSHParser, nodeEp ssh.Endpoint, key string) bool {
-	if parser == nil || !parser.HasHost(key) {
-		return true
-	}
-	stanzaEp, err := parser.ResolveEndpoint(key)
-	return err == nil && stanzaEp.Equal(nodeEp)
-}
-
 type fallbackTier4Target struct {
 	host            string
 	port            int
@@ -1935,11 +1947,7 @@ func (a *SSHAdapter) buildTier4FallbackLookupKeys(
 				continue
 			}
 			if checkScope && fb.scopeByEndpoint && fb.hasEP {
-				if fb.isSaved {
-					if !endpointAllowsTier4Key(parser, fb.ep, k) {
-						continue
-					}
-				} else if !concreteHostMatchesEndpoint(parser, fb.ep, k) {
+				if !endpointAllowsTier4Key(parser, fb.ep, k) {
 					continue
 				}
 			}
@@ -1974,21 +1982,12 @@ func snapshotAllowsTier4Key(
 	snapshot config.ConnectionSnapshot,
 	hasTier1Auth bool,
 	tier1Auth SessionAuth,
-	adHocEp ssh.Endpoint,
-	adHocEpErr error,
 	key string,
 ) bool {
-	if snapErr != nil {
+	if snapErr != nil || snapshot.Provenance.IsUnpersistedOpenSSH() {
 		return true
 	}
-	switch snapshot.Provenance {
-	case config.ProvenanceSavedManaged:
-		return savedNodeAllowsTier4Key(parser, snapshot, hasTier1Auth, tier1Auth, key)
-	case config.ProvenanceAdHocPending:
-		return adHocEpErr != nil || concreteHostMatchesEndpoint(parser, adHocEp, key)
-	default:
-		return true
-	}
+	return savedNodeAllowsTier4Key(parser, snapshot, hasTier1Auth, tier1Auth, key)
 }
 
 func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(
@@ -2001,14 +2000,14 @@ func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(
 	openSSHAlias, canonicalHost string,
 ) []string {
 	var lookupKeys []string
-	adHocEp, hostOverridden, adHocEpErr := effectiveSnapshotEndpoint(snapshot, hasTier1Auth, tier1Auth)
+	_, hostOverridden, _ := effectiveSnapshotEndpoint(snapshot, hasTier1Auth, tier1Auth)
 	appendKeys := func(checkScope bool, keys ...string) {
 		for _, k := range keys {
 			k = strings.TrimSpace(k)
 			if k == "" || slices.Contains(lookupKeys, k) {
 				continue
 			}
-			if checkScope && !snapshotAllowsTier4Key(parser, snapErr, snapshot, hasTier1Auth, tier1Auth, adHocEp, adHocEpErr, k) {
+			if checkScope && !snapshotAllowsTier4Key(parser, snapErr, snapshot, hasTier1Auth, tier1Auth, k) {
 				continue
 			}
 			lookupKeys = append(lookupKeys, k)
@@ -2019,7 +2018,7 @@ func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(
 		appendKeys(canonicalHost == "", openSSHAlias)
 	}
 	if canonicalHost != "" {
-		appendKeys(false, canonicalHost)
+		appendKeys(openSSHAlias == "", canonicalHost)
 	}
 	if snapErr != nil {
 		return a.buildTier4FallbackLookupKeys(parser, nodeName, openSSHAlias, hasTier1Auth, tier1Auth, lookupKeys)
@@ -2035,7 +2034,7 @@ func (a *SSHAdapter) buildTier4OpenSSHLookupKeys(
 		}
 	}
 	if effectiveHost != "" {
-		if openSSHAlias == "" {
+		if openSSHAlias == "" || !parser.HasHost(openSSHAlias) {
 			if ep, err := ssh.NewEndpoint(effectiveHost, effectivePort); err == nil {
 				appendKeys(false, parser.FindConcreteHostsByAddress(ep)...)
 			}

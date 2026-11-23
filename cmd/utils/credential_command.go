@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	coreauth "github.com/wentf9/xops-cli/core/auth"
+	coreSSH "github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	"github.com/wentf9/xops-cli/pkg/i18n"
@@ -291,8 +292,10 @@ func (o *CredentialCommandOptions) RunSet(cmd *cobra.Command, query string) erro
 		return err
 	}
 
-	if kind == credential.KindPassphrase && resolved.identity.KeyPath == "" {
-		return fmt.Errorf("private-key path is required before setting a passphrase")
+	if kind == credential.KindPassphrase {
+		if err := validatePassphraseKeyPath(resolved.identity.KeyPath); err != nil {
+			return err
+		}
 	}
 
 	secretStr, err := resolveSecretInput(cmd.InOrStdin(), o.PasswordStdin || o.PassphraseStdin, string(kind))
@@ -345,6 +348,23 @@ func (o *CredentialCommandOptions) RunSet(cmd *cobra.Command, query string) erro
 		logger.PrintSuccessf("Set credential for node %q (kind: %s, store: %s, itemID: %s)", resolved.nodeID, kind, targetStore, newRef.ItemID)
 	} else {
 		logger.PrintSuccessf("Set credential for identity %q (kind: %s, store: %s, itemID: %s)", resolved.identityID, kind, targetStore, newRef.ItemID)
+	}
+	return nil
+}
+
+func validatePassphraseKeyPath(keyPath string) error {
+	if strings.TrimSpace(keyPath) == "" {
+		return fmt.Errorf("private-key path is required before setting a passphrase")
+	}
+	setting, err := coreSSH.ParseIdentityPathSetting(keyPath, true)
+	if err != nil {
+		return fmt.Errorf("invalid private-key path: %w", err)
+	}
+	if setting.Unset() || setting.Disabled() || setting.IsTemplate() {
+		return fmt.Errorf("private-key passphrase cannot be bound to non-concrete key path %q", keyPath)
+	}
+	if config.NormalizePersistableIdentityPath(setting.Raw) == "" {
+		return fmt.Errorf("private-key path %q cannot be resolved to a local file", keyPath)
 	}
 	return nil
 }

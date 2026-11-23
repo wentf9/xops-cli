@@ -67,6 +67,9 @@ func runInventoryEdit(cmd *cobra.Command, args []string, flags *editFlags, secre
 	if err := applyEditTargetArgs(args[1:], flags, portChanged); err != nil {
 		return err
 	}
+	if err := validateEditIdentityTargetUser(cmd, flags); err != nil {
+		return err
+	}
 	if flags.keyPath != "" && flags.keyPass == "" && flags.password == "" && !secretInput.UsesStdin() {
 		flags.keyPass, err = utils.PromptPassphraseIfEncryptedKey(flags.keyPath, flags.keyPass)
 		if err != nil {
@@ -303,6 +306,13 @@ func commitEditedNode(cmd *cobra.Command, repository *config.Repository, ref con
 		return fmt.Errorf("update node %q failed: %w", oldName, err)
 	}
 	logger.PrintSuccess(i18n.Tf("node_update_success", map[string]any{"Name": newName}))
+	return nil
+}
+
+func validateEditIdentityTargetUser(cmd *cobra.Command, flags *editFlags) error {
+	if (cmd.Flags().Changed("identity") || flags.identityAlias != "") && flags.user != "" {
+		return fmt.Errorf("cannot specify user %q in target address when --identity (-I) is set", flags.user)
+	}
 	return nil
 }
 

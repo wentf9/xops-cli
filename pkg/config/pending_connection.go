@@ -128,7 +128,7 @@ func validateReadOnlyPendingUpdateJump(provider ConfigProvider, req EnsureNodeOp
 		Host:          strings.TrimSpace(resolved.Host),
 		Port:          resolved.Port,
 		User:          strings.TrimSpace(resolved.User),
-		IsAdHoc:       resolved.Created && resolved.OpenSSHAlias == "",
+		IsAdHoc:       resolved.Provenance == ProvenanceAdHocPending || (resolved.Provenance == ProvenanceUnknown && resolved.Created && resolved.OpenSSHAlias == ""),
 	}
 	return ValidateProxyJumpChainCycle(provider, dest, resolvedJump, req.ExistingUpdate.JumpHost)
 }
@@ -287,7 +287,7 @@ func (r *Repository) prepareNodeContext(ctx context.Context, opts EnsureNodeOpti
 	nodeID := outcome.nodeID
 	created := outcome.created
 	if created {
-		effectiveID, entry, err := r.registerPendingConnection(cfg, nodeID, outcome.openSSHAlias, outcome.canonicalHost)
+		effectiveID, entry, err := r.registerPendingConnection(cfg, nodeID, outcome.openSSHAlias, outcome.canonicalHost, outcome.provenance)
 		if err != nil {
 			return EnsureNodeResult{}, nil, err
 		}
@@ -600,7 +600,7 @@ func (r *Repository) registerPendingUpdateLocked(
 	return entry, nil
 }
 
-func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openSSHAlias, canonicalHost string) (string, *pendingConnection, error) {
+func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openSSHAlias, canonicalHost string, requestedProv NodeProvenance) (string, *pendingConnection, error) {
 	// Retain only this connection's entities, never a stale copy of the
 	// whole configuration that could overwrite concurrent changes.
 	node, _ := cfg.Nodes.Get(nodeID)
@@ -608,11 +608,19 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openS
 	node.CanonicalHost = canonicalHost
 	host, _ := cfg.Hosts.Get(node.HostRef)
 	identity, _ := cfg.Identities.Get(node.IdentityRef)
+	origin := normalizeOpenSSHOrigin(OpenSSHOrigin{
+		Alias:         node.OpenSSHAlias,
+		CanonicalHost: node.CanonicalHost,
+	})
+	prov := ProvenanceAdHocPending
+	if requestedProv == ProvenanceOpenSSHDerived && origin.Alias != "" && node.SSHOptions == nil {
+		prov = ProvenanceOpenSSHDerived
+	}
 	if r.pending == nil {
 		r.pending = make(map[string]*pendingConnection)
 	}
 	if previous := r.pending[nodeID]; previous != nil {
-		if existingID, entry, handled, err := r.tryReuseOrDisambiguatePending(cfg, previous, nodeID, node, host, identity); handled || err != nil {
+		if existingID, entry, handled, err := r.tryReuseOrDisambiguatePendingWithProvenance(cfg, previous, nodeID, node, host, identity, prov); handled || err != nil {
 			return existingID, entry, err
 		}
 		nodeID = OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
@@ -625,16 +633,8 @@ func (r *Repository) registerPendingConnection(cfg *Configuration, nodeID, openS
 	pending.Hosts.Set(node.HostRef, host)
 	pending.Identities.Set(node.IdentityRef, identity)
 	pendingProvider := NewProviderWithoutOpenSSH(pending)
-	prov := ProvenanceAdHocPending
-	origin := normalizeOpenSSHOrigin(OpenSSHOrigin{
-		Alias:         node.OpenSSHAlias,
-		CanonicalHost: node.CanonicalHost,
-	})
 	if !origin.IsZero() {
 		pendingProvider.SetNodeOpenSSHOrigin(nodeID, origin)
-		if origin.Alias != "" && node.SSHOptions == nil {
-			prov = ProvenanceOpenSSHDerived
-		}
 	}
 	entry := &pendingConnection{provider: pendingProvider, provenance: prov, gate: &contextGate{}, refs: 1}
 	r.pending[nodeID] = entry
@@ -649,6 +649,43 @@ func (r *Repository) tryReuseOrDisambiguatePending(
 	host models.Host,
 	identity models.Identity,
 ) (string, *pendingConnection, bool, error) {
+	desiredProv := ProvenanceAdHocPending
+	if strings.TrimSpace(node.OpenSSHAlias) != "" && node.SSHOptions == nil {
+		desiredProv = ProvenanceOpenSSHDerived
+	}
+	return r.tryReuseOrDisambiguatePendingWithProvenance(cfg, previous, nodeID, node, host, identity, desiredProv)
+}
+
+func (r *Repository) tryReusePendingCandidate(
+	previous *pendingConnection,
+	nodeID string,
+	oldNode, normalizedNode models.Node,
+	host models.Host,
+	identity models.Identity,
+	desiredProv NodeProvenance,
+) (string, *pendingConnection, bool, error) {
+	if oldNode.OpenSSHAlias == normalizedNode.OpenSSHAlias && oldNode.CanonicalHost == normalizedNode.CanonicalHost {
+		if previous.provenance == desiredProv {
+			previous.refs++
+			return nodeID, previous, true, nil
+		}
+		return "", nil, false, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
+	}
+	if upgradedID, entry, ok := r.upgradePendingAliasAndCanonicalWithProvenance(previous, nodeID, oldNode, normalizedNode, host, identity, desiredProv); ok {
+		return upgradedID, entry, true, nil
+	}
+	return "", nil, false, nil
+}
+
+func (r *Repository) tryReuseOrDisambiguatePendingWithProvenance(
+	cfg *Configuration,
+	previous *pendingConnection,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	desiredProv NodeProvenance,
+) (string, *pendingConnection, bool, error) {
 	if previous.isUpdate {
 		return "", nil, false, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
 	}
@@ -659,15 +696,11 @@ func (r *Repository) tryReuseOrDisambiguatePending(
 	normalizedNode := node
 	normalizedNode.IdentityRef = privateIdentityReference(cfg, nodeID)
 	if equalPersistedNode(oldNode, normalizedNode) && reflect.DeepEqual(oldHost, host) && reflect.DeepEqual(oldIdentity, identity) {
-		if oldNode.OpenSSHAlias == node.OpenSSHAlias && oldNode.CanonicalHost == node.CanonicalHost {
-			previous.refs++
-			return nodeID, previous, true, nil
-		}
-		if upgradedID, entry, ok := r.upgradePendingAliasAndCanonical(previous, nodeID, oldNode, normalizedNode, host, identity); ok {
-			return upgradedID, entry, true, nil
+		if reusedID, entry, ok, rErr := r.tryReusePendingCandidate(previous, nodeID, oldNode, normalizedNode, host, identity, desiredProv); ok || rErr != nil {
+			return reusedID, entry, ok, rErr
 		}
 	}
-	if node.OpenSSHAlias == "" || oldNode.OpenSSHAlias == node.OpenSSHAlias {
+	if desiredProv != ProvenanceOpenSSHDerived || node.OpenSSHAlias == "" || oldNode.OpenSSHAlias == node.OpenSSHAlias {
 		return "", nil, false, fmt.Errorf("pending connection %q changed: %w", nodeID, ErrConfigConflict)
 	}
 	altID := OpenSSHNodePrefix + FormatNodeID(identity.User, node.OpenSSHAlias, host.Port)
@@ -684,12 +717,8 @@ func (r *Repository) tryReuseOrDisambiguatePending(
 	if !equalPersistedNode(altOldNode, altNormalized) || !reflect.DeepEqual(altOldHost, host) || !reflect.DeepEqual(altOldIdentity, identity) {
 		return "", nil, false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
 	}
-	if altOldNode.OpenSSHAlias == node.OpenSSHAlias && altOldNode.CanonicalHost == node.CanonicalHost {
-		altPrev.refs++
-		return altID, altPrev, true, nil
-	}
-	if upgradedID, entry, ok := r.upgradePendingAliasAndCanonical(altPrev, altID, altOldNode, altNormalized, host, identity); ok {
-		return upgradedID, entry, true, nil
+	if reusedID, entry, ok, rErr := r.tryReusePendingCandidate(altPrev, altID, altOldNode, altNormalized, host, identity, desiredProv); ok || rErr != nil {
+		return reusedID, entry, ok, rErr
 	}
 	return "", nil, false, fmt.Errorf("pending connection %q changed: %w", altID, ErrConfigConflict)
 }
@@ -701,9 +730,23 @@ func (r *Repository) upgradePendingAliasAndCanonical(
 	host models.Host,
 	identity models.Identity,
 ) (string, *pendingConnection, bool) {
+	return r.upgradePendingAliasAndCanonicalWithProvenance(previous, nodeID, oldNode, normalizedNode, host, identity, previous.provenance)
+}
+
+func (r *Repository) upgradePendingAliasAndCanonicalWithProvenance(
+	previous *pendingConnection,
+	nodeID string,
+	oldNode, normalizedNode models.Node,
+	host models.Host,
+	identity models.Identity,
+	desiredProv NodeProvenance,
+) (string, *pendingConnection, bool) {
 	aliasUpgradable := oldNode.OpenSSHAlias == normalizedNode.OpenSSHAlias || (oldNode.OpenSSHAlias == "" && normalizedNode.OpenSSHAlias != "")
 	canonUpgradable := oldNode.CanonicalHost == normalizedNode.CanonicalHost || (oldNode.CanonicalHost == "" && normalizedNode.CanonicalHost != "")
 	if !aliasUpgradable || !canonUpgradable {
+		return "", nil, false
+	}
+	if previous.provenance == ProvenanceOpenSSHDerived && desiredProv != ProvenanceOpenSSHDerived {
 		return "", nil, false
 	}
 	pending := cloneConfiguration(nil)
@@ -719,7 +762,7 @@ func (r *Repository) upgradePendingAliasAndCanonical(
 		upgradedProvider.SetNodeOpenSSHOrigin(nodeID, upgradedOrigin)
 	}
 	prov := previous.provenance
-	if normalizedNode.SSHOptions == nil && upgradedOrigin.Alias != "" {
+	if desiredProv == ProvenanceOpenSSHDerived && normalizedNode.SSHOptions == nil && upgradedOrigin.Alias != "" {
 		prov = ProvenanceOpenSSHDerived
 	}
 	gate := previous.gate
@@ -744,21 +787,29 @@ func (r *Repository) connectionProviderWithProvenance(nodeID string) (*Provider,
 	return r.provider, ProvenanceUnknown
 }
 
-func (r *Repository) resolvePendingNode(nodeID string) (models.Node, models.Host, models.Identity, bool) {
+func (r *Repository) resolvePendingNodeWithProvenance(nodeID string) (models.Node, models.Host, models.Identity, NodeProvenance, bool) {
 	if r == nil || nodeID == "" {
-		return models.Node{}, models.Host{}, models.Identity{}, false
+		return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, false
 	}
 	r.pendingMu.RLock()
 	pending := r.pending[nodeID]
+	var (
+		provider *Provider
+		prov     NodeProvenance
+	)
+	if pending != nil {
+		provider = pending.provider
+		prov = pending.provenance
+	}
 	r.pendingMu.RUnlock()
-	if pending == nil || pending.provider == nil {
-		return models.Node{}, models.Host{}, models.Identity{}, false
+	if provider == nil {
+		return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, false
 	}
-	node, host, ident, err := pending.provider.Resolve(nodeID)
+	node, host, ident, err := provider.Resolve(nodeID)
 	if err != nil {
-		return models.Node{}, models.Host{}, models.Identity{}, false
+		return models.Node{}, models.Host{}, models.Identity{}, ProvenanceUnknown, false
 	}
-	return node, host, ident, true
+	return node, host, ident, prov, true
 }
 
 func (r *Repository) pendingConnectionSnapshot(nodeID string) (ConnectionSnapshot, bool) {

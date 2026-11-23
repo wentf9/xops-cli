@@ -3,11 +3,9 @@ package config
 import (
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/wentf9/xops-cli/core/fsx"
+	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/credential"
 	sshcrypto "golang.org/x/crypto/ssh"
 )
@@ -15,14 +13,21 @@ import (
 // PrivateKeyFingerprint verifies a private key and returns its public fingerprint.
 // Key material is transient and never included in a returned configuration.
 func PrivateKeyFingerprint(path string, passphrase []byte) (string, error) {
-	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		path = filepath.Join(home, path[2:])
+	setting, err := ssh.ParseIdentityPathSetting(path, true)
+	if err != nil {
+		return "", fmt.Errorf("invalid private key path: %w", err)
 	}
-	data, err := readPrivateKeyFile(path)
+	if setting.Unset() {
+		return "", fmt.Errorf("private key path cannot be empty")
+	}
+	if setting.Disabled() || setting.IsTemplate() {
+		return "", fmt.Errorf("private key path %q is not a concrete local file", setting.Raw)
+	}
+	resolved := NormalizePersistableIdentityPath(setting.Raw)
+	if resolved == "" {
+		return "", fmt.Errorf("private key path %q cannot be resolved to a local file", setting.Raw)
+	}
+	data, err := readPrivateKeyFile(resolved)
 	if err != nil {
 		return "", fmt.Errorf("read private key: %w", err)
 	}
@@ -32,7 +37,7 @@ func PrivateKeyFingerprint(path string, passphrase []byte) (string, error) {
 		signer, err = sshcrypto.ParsePrivateKeyWithPassphrase(data, passphrase)
 	}
 	if err != nil {
-		return "", fmt.Errorf("cannot unlock private key %q with supplied passphrase", path)
+		return "", fmt.Errorf("cannot unlock private key %q with supplied passphrase", resolved)
 	}
 	return sshcrypto.FingerprintSHA256(signer.PublicKey()), nil
 }

@@ -2362,7 +2362,7 @@ func TestSSHAdapter_BatchModeDisablesInteractionAndWriteback(t *testing.T) {
 	cfg.Identities.Set("id-batch", models.Identity{
 		User:             "root",
 		AuthType:         "password",
-		LoginPasswordRef: &credential.Ref{StoreID: "encrypted_file", ItemID: "item-1"},
+		LoginPasswordRef: &credential.Ref{StoreID: "file", ItemID: "item-1"},
 	})
 	cfg.Nodes.Set("node-batch", models.Node{
 		HostRef:     "h-batch",

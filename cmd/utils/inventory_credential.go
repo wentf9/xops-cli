@@ -146,7 +146,7 @@ func preparePassphraseTarget(target credential.Target, identity models.Identity,
 	}
 	target.KeyPath = NormalizeIdentityKeyPath(keyPath)
 	target.ClearKeyPath = false
-	if passphrase != "" && (setting.Disabled() || setting.IsTemplate()) {
+	if passphrase != "" && (setting.Disabled() || setting.IsTemplate() || config.NormalizePersistableIdentityPath(setting.Raw) == "") {
 		return target, fmt.Errorf("private-key passphrase cannot be bound to non-concrete key path %q", target.KeyPath)
 	}
 	return target, nil

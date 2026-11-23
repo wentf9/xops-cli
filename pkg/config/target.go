@@ -1206,19 +1206,26 @@ func (r *Repository) resolveCreatedTargetJump(
 	return joined, nil
 }
 
+func createdTargetProvenance(baseNodeID, openSSHAlias string, nodeOpts *ssh.Options) NodeProvenance {
+	if IsOpenSSHNodeID(baseNodeID) && strings.TrimSpace(openSSHAlias) != "" && nodeOpts == nil {
+		return ProvenanceOpenSSHDerived
+	}
+	return ProvenanceAdHocPending
+}
+
 func (r *Repository) applyPendingCreatedTargetMetadata(
 	targetNodeID string,
 	target ConnectionTarget,
 	jump, keyPath, openSSHAlias, canonHost *string,
-) error {
-	pNode, _, pIdent, ok := r.resolvePendingNode(targetNodeID)
+) (NodeProvenance, error) {
+	pNode, _, pIdent, pProv, ok := r.resolvePendingNodeWithProvenance(targetNodeID)
 	if !ok {
-		return nil
+		return ProvenanceUnknown, nil
 	}
 	if !target.HasProxyJump && target.ProxyJump == "" && *jump == "" && pNode.ProxyJump != "" {
 		ps, pErr := parseOptionalNodeProxyJump(pNode.ProxyJump)
 		if pErr != nil {
-			return pErr
+			return ProvenanceUnknown, pErr
 		}
 		if targets, ok := ps.JumpTargets(); ok {
 			*jump = strings.Join(targets, ",")
@@ -1231,7 +1238,7 @@ func (r *Repository) applyPendingCreatedTargetMetadata(
 		*openSSHAlias = pNode.OpenSSHAlias
 		*canonHost = pNode.CanonicalHost
 	}
-	return nil
+	return pProv, nil
 }
 
 func (r *Repository) buildCreatedResolvedTargetWithUserPort(
@@ -1264,7 +1271,8 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 	canonHost := canonicalInfo.CanonicalHost
 	keyPath := NormalizePersistableIdentityPath(canonicalInfo.IdentityFile)
 	prevJump := jump
-	if err := r.applyPendingCreatedTargetMetadata(targetNodeID, target, &jump, &keyPath, &openSSHAlias, &canonHost); err != nil {
+	pendingProv, err := r.applyPendingCreatedTargetMetadata(targetNodeID, target, &jump, &keyPath, &openSSHAlias, &canonHost)
+	if err != nil {
 		return ResolvedTarget{}, err
 	}
 	if jump != "" && jump != prevJump {
@@ -1282,8 +1290,8 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 			return ResolvedTarget{}, cErr
 		}
 	}
-	prov := ProvenanceAdHocPending
-	if openSSHAlias != "" {
+	prov := createdTargetProvenance(canonicalInfo.BaseNodeID, openSSHAlias, nil)
+	if canonicalInfo.BaseNodeID == "" && pendingProv == ProvenanceOpenSSHDerived && strings.TrimSpace(openSSHAlias) != "" {
 		prov = ProvenanceOpenSSHDerived
 	}
 	return ResolvedTarget{
@@ -1305,8 +1313,10 @@ func (r *Repository) buildCreatedResolvedTargetWithUserPort(
 type ensureTransactionOutcome struct {
 	nodeID        string
 	created       bool
+	baseNodeID    string
 	openSSHAlias  string
 	canonicalHost string
+	provenance    NodeProvenance
 }
 
 // EnsureNodeContext ensures a node matching the target intent exists. If not, it
@@ -2239,8 +2249,10 @@ func (r *Repository) createNodeInTransaction(
 	*outcome = ensureTransactionOutcome{
 		nodeID:        targetNodeID,
 		created:       true,
+		baseNodeID:    canonicalInfo.BaseNodeID,
 		openSSHAlias:  canonicalInfo.OpenSSHAlias,
 		canonicalHost: canonicalInfo.CanonicalHost,
+		provenance:    createdTargetProvenance(canonicalInfo.BaseNodeID, canonicalInfo.OpenSSHAlias, newNode.SSHOptions),
 	}
 	return nil
 }

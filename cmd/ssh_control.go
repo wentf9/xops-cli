@@ -850,7 +850,8 @@ func resolvedControlLookupNodeID(resolved config.ResolvedTarget) string {
 	if resolved.MatchedNodeID != "" {
 		return resolved.MatchedNodeID
 	}
-	if resolved.Provenance == config.ProvenanceOpenSSHDerived || config.IsOpenSSHNodeID(resolved.BaseNodeID) {
+	if resolved.Provenance == config.ProvenanceOpenSSHDerived ||
+		(resolved.Provenance == config.ProvenanceUnknown && config.IsOpenSSHNodeID(resolved.BaseNodeID)) {
 		if canon := strings.TrimSpace(resolved.CanonicalHost); canon != "" {
 			return config.OpenSSHNodePrefix + canon
 		}

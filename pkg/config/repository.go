@@ -1850,20 +1850,21 @@ func validateConfiguration(cfg *Configuration) error {
 	if err != nil {
 		return err
 	}
+	requireConfiguredStore := cfg.SchemaVersion >= 2 || (cfg.Credential != nil && len(cfg.Credential.Stores) > 0)
 	if err := validateConfigurationHosts(cfg); err != nil {
 		return err
 	}
-	if err := validateConfigurationIdentities(cfg, stores); err != nil {
+	if err := validateConfigurationIdentities(cfg, stores, requireConfiguredStore); err != nil {
 		return err
 	}
-	return validateConfigurationNodes(cfg, stores)
+	return validateConfigurationNodes(cfg, stores, requireConfiguredStore)
 }
 
 func validateRepositoryCredentialConfig(cfg *Configuration) (map[string]StoreConfig, error) {
 	if cfg.Credential == nil {
 		return nil, nil
 	}
-	if cfg.SchemaVersion == 2 {
+	if cfg.SchemaVersion >= 2 {
 		if err := validateCredentialConfig(cfg.Credential); err != nil {
 			return nil, err
 		}
@@ -1924,7 +1925,7 @@ func validateConfigurationHosts(cfg *Configuration) error {
 	return nil
 }
 
-func validateConfigurationIdentities(cfg *Configuration, stores map[string]StoreConfig) error {
+func validateConfigurationIdentities(cfg *Configuration, stores map[string]StoreConfig, requireConfiguredStore bool) error {
 	if cfg.Identities == nil {
 		return nil
 	}
@@ -1935,37 +1936,56 @@ func validateConfigurationIdentities(cfg *Configuration, stores map[string]Store
 		if !ok {
 			continue
 		}
-		if id.LoginPasswordRef != nil {
-			if err := validateConfiguredRef(*id.LoginPasswordRef, stores); err != nil {
-				return fmt.Errorf("%w: identity %q login_password_ref invalid: %w", ErrSchemaValidation, idName, err)
-			}
-		}
-		if id.PassphraseRef != nil {
-			if err := validateConfiguredRef(*id.PassphraseRef, stores); err != nil {
-				return fmt.Errorf("%w: identity %q passphrase_ref invalid: %w", ErrSchemaValidation, idName, err)
-			}
-			if !id.PassphraseRef.IsEmpty() && cfg.SchemaVersion == 2 && strings.TrimSpace(id.KeyFingerprint) == "" {
-				return fmt.Errorf("%w: identity %q with passphrase_ref must specify key_fingerprint", ErrSchemaValidation, idName)
-			}
-		}
-		if id.KeyFingerprint != "" && hasInvalidKeyFingerprintChars(id.KeyFingerprint) {
-			return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q", ErrSchemaValidation, idName, id.KeyFingerprint)
-		}
-		if id.OTP != nil {
-			if err := validateConfigurationOTP(idName, id.OTP, stores); err != nil {
-				return err
-			}
-		}
-		if id.KeyboardInteractive != nil {
-			if err := validateConfigurationKeyboardInteractive(idName, id.KeyboardInteractive, stores); err != nil {
-				return err
-			}
+		if err := validateConfigurationIdentity(cfg.SchemaVersion, idName, id, stores, requireConfiguredStore); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func validateConfigurationOTP(idName string, otp *models.OTPConfig, stores map[string]StoreConfig) error {
+func validateConfigurationIdentity(schemaVersion int, idName string, id models.Identity, stores map[string]StoreConfig, requireConfiguredStore bool) error {
+	if id.LoginPasswordRef != nil {
+		if err := validateConfiguredRef(*id.LoginPasswordRef, stores); err != nil {
+			return fmt.Errorf("%w: identity %q login_password_ref invalid: %w", ErrSchemaValidation, idName, err)
+		}
+		if requireConfiguredStore && !id.LoginPasswordRef.IsEmpty() {
+			if _, ok := stores[id.LoginPasswordRef.StoreID]; !ok {
+				return fmt.Errorf("%w: identity %q login_password_ref store %q not configured", ErrSchemaValidation, idName, id.LoginPasswordRef.StoreID)
+			}
+		}
+	}
+	if id.PassphraseRef != nil {
+		if err := validateConfiguredRef(*id.PassphraseRef, stores); err != nil {
+			return fmt.Errorf("%w: identity %q passphrase_ref invalid: %w", ErrSchemaValidation, idName, err)
+		}
+		if !id.PassphraseRef.IsEmpty() {
+			if requireConfiguredStore {
+				if _, ok := stores[id.PassphraseRef.StoreID]; !ok {
+					return fmt.Errorf("%w: identity %q passphrase_ref store %q not configured", ErrSchemaValidation, idName, id.PassphraseRef.StoreID)
+				}
+			}
+			if schemaVersion >= 2 && strings.TrimSpace(id.KeyFingerprint) == "" {
+				return fmt.Errorf("%w: identity %q with passphrase_ref must specify key_fingerprint", ErrSchemaValidation, idName)
+			}
+		}
+	}
+	if id.KeyFingerprint != "" && hasInvalidKeyFingerprintChars(id.KeyFingerprint) {
+		return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q", ErrSchemaValidation, idName, id.KeyFingerprint)
+	}
+	if id.OTP != nil {
+		if err := validateConfigurationOTP(idName, id.OTP, stores, requireConfiguredStore); err != nil {
+			return err
+		}
+	}
+	if id.KeyboardInteractive != nil {
+		if err := validateConfigurationKeyboardInteractive(idName, id.KeyboardInteractive, stores, requireConfiguredStore); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateConfigurationOTP(idName string, otp *models.OTPConfig, stores map[string]StoreConfig, requireConfiguredStore bool) error {
 	hasRef := otp.TOTPSecretRef != nil && !otp.TOTPSecretRef.IsEmpty()
 	hasCmd := strings.TrimSpace(otp.Command) != ""
 	if hasRef && hasCmd {
@@ -1977,6 +1997,11 @@ func validateConfigurationOTP(idName string, otp *models.OTPConfig, stores map[s
 	if hasRef {
 		if err := validateConfiguredRef(*otp.TOTPSecretRef, stores); err != nil {
 			return fmt.Errorf("%w: identity %q otp totp_secret_ref invalid: %w", ErrSchemaValidation, idName, err)
+		}
+		if requireConfiguredStore {
+			if _, ok := stores[otp.TOTPSecretRef.StoreID]; !ok {
+				return fmt.Errorf("%w: identity %q otp totp_secret_ref store %q not configured", ErrSchemaValidation, idName, otp.TOTPSecretRef.StoreID)
+			}
 		}
 	}
 	if hasCmd && strings.ContainsAny(otp.Command, ";|&`$\n") {
@@ -1993,7 +2018,7 @@ func validateConfigurationOTP(idName string, otp *models.OTPConfig, stores map[s
 	return nil
 }
 
-func validateConfigurationKeyboardInteractive(idName string, ki *models.KeyboardInteractiveConfig, stores map[string]StoreConfig) error {
+func validateConfigurationKeyboardInteractive(idName string, ki *models.KeyboardInteractiveConfig, stores map[string]StoreConfig, requireConfiguredStore bool) error {
 	seenNames := make(map[string]int)
 	for idx, rule := range ki.Rules {
 		ruleDesc := fmt.Sprintf("rule %d", idx+1)
@@ -2018,14 +2043,14 @@ func validateConfigurationKeyboardInteractive(idName string, ki *models.Keyboard
 		if rule.Timeout < 0 {
 			return fmt.Errorf("%w: identity %q keyboard_interactive %s timeout cannot be negative", ErrSchemaValidation, idName, ruleDesc)
 		}
-		if err := validateConfigurationChallengeRuleSource(idName, ruleDesc, rule, stores); err != nil {
+		if err := validateConfigurationChallengeRuleSource(idName, ruleDesc, rule, stores, requireConfiguredStore); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateConfigurationChallengeRuleSource(idName, ruleDesc string, rule models.ChallengeRule, stores map[string]StoreConfig) error {
+func validateConfigurationChallengeRuleSource(idName, ruleDesc string, rule models.ChallengeRule, stores map[string]StoreConfig, requireConfiguredStore bool) error {
 	switch rule.Source {
 	case models.ChallengeSourceOTP, models.ChallengeSourceLoginPassword:
 		return validateNoSecretRefOrCommand(idName, ruleDesc, string(rule.Source), rule)
@@ -2041,6 +2066,11 @@ func validateConfigurationChallengeRuleSource(idName, ruleDesc string, rule mode
 		}
 		if err := validateConfiguredRef(*rule.SecretRef, stores); err != nil {
 			return fmt.Errorf("%w: identity %q keyboard_interactive %s secret_ref invalid: %w", ErrSchemaValidation, idName, ruleDesc, err)
+		}
+		if requireConfiguredStore {
+			if _, ok := stores[rule.SecretRef.StoreID]; !ok {
+				return fmt.Errorf("%w: identity %q keyboard_interactive %s secret_ref store %q not configured", ErrSchemaValidation, idName, ruleDesc, rule.SecretRef.StoreID)
+			}
 		}
 	case models.ChallengeSourceCommand:
 		if rule.SecretRef != nil && !rule.SecretRef.IsEmpty() {
@@ -2058,7 +2088,7 @@ func validateConfigurationChallengeRuleSource(idName, ruleDesc string, rule mode
 	return nil
 }
 
-func validateConfigurationNodes(cfg *Configuration, stores map[string]StoreConfig) error {
+func validateConfigurationNodes(cfg *Configuration, stores map[string]StoreConfig, requireConfiguredStore bool) error {
 	if cfg.Nodes == nil {
 		return nil
 	}
@@ -2069,27 +2099,27 @@ func validateConfigurationNodes(cfg *Configuration, stores map[string]StoreConfi
 		if !ok {
 			continue
 		}
-		if err := validateConfigurationNode(cfg, stores, nodeID, node); err != nil {
+		if err := validateConfigurationNode(cfg, stores, requireConfiguredStore, nodeID, node); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func validateConfigurationNode(cfg *Configuration, stores map[string]StoreConfig, nodeID string, node models.Node) error {
+func validateConfigurationNode(cfg *Configuration, stores map[string]StoreConfig, requireConfiguredStore bool, nodeID string, node models.Node) error {
 	if err := ValidateNodeID(nodeID); err != nil {
 		return fmt.Errorf("%w: node %q name invalid: %w", ErrSchemaValidation, nodeID, err)
 	}
 	if err := ValidateNodeAliases(node.Alias); err != nil {
 		return fmt.Errorf("%w: node %q alias invalid: %w", ErrSchemaValidation, nodeID, err)
 	}
-	if err := validateConfigurationNodeRefs(cfg, stores, nodeID, node); err != nil {
+	if err := validateConfigurationNodeRefs(cfg, stores, requireConfiguredStore, nodeID, node); err != nil {
 		return err
 	}
 	return validateConfigurationNodeOptions(cfg, nodeID, node)
 }
 
-func validateConfigurationNodeRefs(cfg *Configuration, stores map[string]StoreConfig, nodeID string, node models.Node) error {
+func validateConfigurationNodeRefs(cfg *Configuration, stores map[string]StoreConfig, requireConfiguredStore bool, nodeID string, node models.Node) error {
 	if strings.TrimSpace(node.HostRef) == "" {
 		return fmt.Errorf("%w: node %q host_ref cannot be empty: %w", ErrSchemaValidation, nodeID, ErrHostNotFound)
 	}
@@ -2111,6 +2141,11 @@ func validateConfigurationNodeRefs(cfg *Configuration, stores map[string]StoreCo
 	if node.PrivilegePasswordRef != nil {
 		if err := validateConfiguredRef(*node.PrivilegePasswordRef, stores); err != nil {
 			return fmt.Errorf("%w: node %q privilege_password_ref invalid: %w", ErrSchemaValidation, nodeID, err)
+		}
+		if requireConfiguredStore && !node.PrivilegePasswordRef.IsEmpty() {
+			if _, ok := stores[node.PrivilegePasswordRef.StoreID]; !ok {
+				return fmt.Errorf("%w: node %q privilege_password_ref store %q not configured", ErrSchemaValidation, nodeID, node.PrivilegePasswordRef.StoreID)
+			}
 		}
 	}
 	return nil

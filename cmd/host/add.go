@@ -59,6 +59,8 @@ func newCmdInventoryAdd(verify inventoryVerifier) *cobra.Command {
 	registerEnrollmentProbeFlags(cmd)
 
 	secretInput.RegisterFlags(cmd)
+	cmd.MarkFlagsMutuallyExclusive("identity", "user")
+	cmd.MarkFlagsMutuallyExclusive("identity", "key")
 	cmd.MarkFlagsMutuallyExclusive("identity", "password-stdin", "passphrase-stdin", "ask-pass", "ask-passphrase")
 	return cmd
 }
@@ -79,6 +81,14 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 	}
 	if err := resolveAddTargetAndAlias(args, flags, secretInput.UsesStdin(), portChanged); err != nil {
 		return err
+	}
+	if cmd.Flags().Changed("identity") || flags.identityAlias != "" {
+		if flags.user != "" {
+			return fmt.Errorf("cannot specify user %q in target address when --identity (-I) is set", flags.user)
+		}
+		if flags.keyPath != "" {
+			return fmt.Errorf("cannot specify --key when --identity (-I) is set")
+		}
 	}
 
 	_, repository, cfg, err := utils.GetConfigStore()
@@ -135,7 +145,7 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 			return err
 		}
 	}
-	return commitAddedNode(cmd, repository, name, node, hostObj, identity, password, keyPass, flags.keyPath)
+	return commitAddedNode(cmd, repository, name, node, hostObj, identity, password, keyPass, flags.keyPath, flags.identityAlias != "")
 }
 
 func validateAddPreFlags(cmd *cobra.Command, flags *addFlags, portChanged bool) error {
@@ -198,7 +208,14 @@ func resolveValidatedAddedIdentity(cfg *config.Configuration, flags *addFlags, p
 	return identity, identityRef, password, keyPass, nil
 }
 
-func commitAddedNode(cmd *cobra.Command, repository *config.Repository, name string, node models.Node, hostObj models.Host, identity models.Identity, password, keyPass, keyPath string) error {
+func commitAddedNode(cmd *cobra.Command, repository *config.Repository, name string, node models.Node, hostObj models.Host, identity models.Identity, password, keyPass, keyPath string, reuseIdentityTemplate bool) error {
+	if reuseIdentityTemplate {
+		if _, err := repository.CreateNodeContext(cmd.Context(), name, node, hostObj, identity); err != nil {
+			return fmt.Errorf("create node %q failed: %w", name, err)
+		}
+		logger.PrintSuccess(i18n.Tf("node_add_success", map[string]any{"Name": name}))
+		return nil
+	}
 	if password != "" || keyPass != "" {
 		updater := repository.NodeCredentialCreate(name, node, hostObj, identity)
 		write, err := utils.PrepareInventoryCredential(repository, credential.Target{NodeID: name}, identity, password, keyPass, keyPath, updater)
