@@ -1,6 +1,6 @@
 # XOps CLI Architecture Map (for Developers and Coding Agents)
 
-Baseline: `master` @ `a12d52f` (2026-10-13). This map summarizes the architecture verified from source code and design documents; it is a navigation aid rather than an exhaustive function-level call graph.
+Baseline: `feat/openssh-compatibility` @ `e957386` (2026-11-23). This map summarizes the architecture verified from source code and design documents; it is a navigation aid rather than an exhaustive function-level call graph. For all non-negotiable architectural invariants, explicitized implicit contracts, and anti-drift guards, see [invariants.md](./invariants.md).
 
 ## System Capabilities
 
@@ -34,9 +34,15 @@ flowchart TD
   CFG --> CR[pkg/credential + internal/credentialfile]
   SFTP --> SSH
   ENV[internal/sshenv] --> SSH
+  SSH --> FSX[core/fsx + core/verdict]
+  SFTP --> FSX
+  CFG --> FSX
+  SSH --> WINSEC[core/winsec]
+  FSX --> WINSEC
+  ENV --> WINSEC
 ```
 
-**Note**: The diagram shows both composition and Go dependency directions (for example, `core/mcp/runtime`, `core/mcp/sshexec`, and `internal/mcphost` all depend one-way on `core/mcp/ports`; `core/sftp` depends on `core/ssh`; `core/ssh` preserves strict unidirectional decoupling, receiving host context from `internal/sshenv`). Use `go list -json ./...` to inspect the exact Go import graph.
+**Note**: The diagram shows both composition and Go dependency directions (for example, `core/mcp/runtime`, `core/mcp/sshexec`, and `internal/mcphost` all depend one-way on `core/mcp/ports`; `core/sftp` depends on `core/ssh` and `core/fsx`; `core/ssh`, `core/fsx`, and `internal/sshenv` depend one-way on `core/winsec` for handle-based Windows DACLs and AF_UNIX peer checks; `core/**` preserves strict unidirectional decoupling, receiving host context from `internal/sshenv`). Use `go list -json ./...` to inspect the exact Go import graph.
 
 ## Recommended Reading Order
 
@@ -50,6 +56,7 @@ flowchart TD
 
 ## "Read the Index First, Then Inspect Source"
 
+- Architectural invariants & anti-drift baseline: `docs/en/development/governance/invariants.md` (P0–P7 seven pillars, all invariants, corrected implicit contracts, residual risks, and anti-drift checklist).
 - Authoritative boundary specs: `core/README.md`, `docs/en/development/shared-core-decoupling.md`.
 - OpenSSH Connection Multiplexing: `docs/en/development/openssh-multiplexing-design.md`.
 - SSH OTP & Multi-Factor Authentication: `docs/en/development/ssh-otp-keyboard-interactive-design.md`.

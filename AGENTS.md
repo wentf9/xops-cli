@@ -6,7 +6,7 @@
 - **调查 / 文档生成**：默认只读，不修改源码/配置，不运行可能创建凭据、执行远程命令或修改主机的操作。
 - **开发**：先提交简短影响分析；跨越两个以上子系统（`core/ssh`, `core/mcp`, `pkg/config`, `pkg/credential`, `internal/mcphost`, `pkg/playbook`, `cmd`）或触及持久化/授权/协议/兼容性时，先给方案并明确验收门槛。
 - 禁止凭名称猜测模块职责、编造函数、编造测试结果；重要事实附 `路径:符号`，必要时附准确行号。无法确认时写「待验证」。
-- 先阅读 `docs/development/governance/architecture-map.md` 的导航与与任务有关的已有设计，再精确阅读被修改代码；不强制每次通读全部文档。
+- 先阅读 `docs/development/governance/architecture-map.md` 的导航、相关架构不变量 `docs/development/governance/invariants.md` 与任务有关的已有设计，再精确阅读被修改代码；不强制每次通读全部文档。
 
 ## 1. 不可破坏的包边界
 

@@ -26,6 +26,7 @@ golangci-lint run ./...
 实现状态与验证范围以各文档说明为准。
 
 - [代码架构与治理地图](./governance/architecture-map.md)
+- [架构不变量、隐式契约与防漂移基线](./governance/invariants.md)
 - [OpenSSH 连接多路复用设计方案](./openssh-multiplexing-design.md)
 - [SSH 多解释器执行与兼容性设计](./ssh-execution-compatibility.md)
 - [SSH 执行兼容性实施计划](./ssh-execution-implementation.md)

@@ -1,6 +1,6 @@
 # XOps CLI 代码地图（供人和 Codex 快速进入代码）
 
-基线：`feat/openssh-compatibility` @ `58a3974`（2026-11-21）。以下是**按阅读到的源码和已有设计文档绘制的工作地图**，不是完整的函数级调用图。
+基线：`feat/openssh-compatibility` @ `e957386`（2026-11-23）。以下是**按阅读到的源码和已有设计文档绘制的工作地图**，不是完整的函数级调用图。全量架构不变量、已修正的隐式契约与防漂移护栏详见 [invariants.md](./invariants.md)。
 
 ## 系统功能
 
@@ -34,11 +34,15 @@ flowchart TD
   CFG --> CR[pkg/credential + internal/credentialfile]
   SFTP --> SSH
   ENV[internal/sshenv] --> SSH
+  SSH --> FSX[core/fsx + core/verdict]
+  SFTP --> FSX
+  CFG --> FSX
   SSH --> WINSEC[core/winsec]
+  FSX --> WINSEC
   ENV --> WINSEC
 ```
 
-**注意**：上图同时展示组合关系与包依赖方向（如 `core/mcp/runtime`、`core/mcp/sshexec`、`internal/mcphost` 均单向依赖契约包 `core/mcp/ports`；`core/sftp` 依赖 `core/ssh`；`core/ssh` 与 `internal/sshenv` 单向依赖 `core/winsec` 完成 Windows DACL/ACE 与 AF_UNIX 对端令牌校验，且 `core/**` 保持无 CLI 依赖的纯净解耦，由 `internal/sshenv` 注入宿主环境）。要生成精确 Go import 图可使用 `go list -json ./...` 核对。
+**注意**：上图同时展示组合关系与包依赖方向（如 `core/mcp/runtime`、`core/mcp/sshexec`、`internal/mcphost` 均单向依赖契约包 `core/mcp/ports`；`core/sftp` 依赖 `core/ssh` 与 `core/fsx`；`core/ssh`、`core/fsx` 与 `internal/sshenv` 单向依赖 `core/winsec` 完成 Windows 句柄级 DACL/ACE 与 AF_UNIX 对端令牌校验，且 `core/**` 保持无 CLI 依赖的纯净解耦，由 `internal/sshenv` 注入宿主环境）。要生成精确 Go import 图可使用 `go list -json ./...` 核对。
 
 ## 推荐按以下次序理解
 
@@ -52,6 +56,7 @@ flowchart TD
 
 ## “先读索引，再查源码”
 
+- 架构不变量与防漂移基线：`docs/development/governance/invariants.md`（P0–P7 七大支柱、全部不变量、已修正隐式契约、剩余风险与防漂移清单）。
 - 源码边界最权威：`core/README.md`、`docs/development/shared-core-decoupling.md`。
 - OpenSSH 连接多路复用：`docs/development/openssh-multiplexing-design.md`。
 - SSH OTP 与多因素认证：`docs/development/ssh-otp-keyboard-interactive-design.md`。
