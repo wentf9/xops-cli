@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/spf13/cobra"
 	"github.com/wentf9/xops-cli/cmd/utils"
@@ -160,16 +161,90 @@ func groupImportRows(repo *config.Repository, hosts []utils.HostInfo, results []
 	return groups
 }
 
+type allocatedImportHost struct {
+	ref  string
+	host models.Host
+}
+
+// importRefAllocator coordinates host and identity ref allocation across
+// concurrent CSV import groups so rows targeting the same (host, port) cleanly
+// share an unaliased Host record and rows sharing (user, host) on different
+// ports never collide on a canonical IdentityRef.
+type importRefAllocator struct {
+	mu                 sync.Mutex
+	allocatedHosts     map[string]allocatedImportHost
+	reservedIdentities map[string]string
+}
+
+func newImportRefAllocator() *importRefAllocator {
+	return &importRefAllocator{
+		allocatedHosts:     make(map[string]allocatedImportHost),
+		reservedIdentities: make(map[string]string),
+	}
+}
+
+func (a *importRefAllocator) allocateHostRef(cfg *config.Configuration, nodeID, address string, port uint16) (string, models.Host) {
+	if a == nil {
+		return config.AllocateNodeHostRef(cfg, nodeID, address, port)
+	}
+	effectivePort := port
+	if effectivePort == 0 {
+		effectivePort = 22
+	}
+	epKey := config.FormatHostPort(address, effectivePort)
+	if ep, err := ssh.NewEndpoint(address, int(effectivePort)); err == nil {
+		epKey = ep.String()
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if prev, ok := a.allocatedHosts[epKey]; ok {
+		return prev.ref, prev.host
+	}
+	hostRef, hostObj := config.AllocateNodeHostRef(cfg, nodeID, address, effectivePort)
+	a.allocatedHosts[epKey] = allocatedImportHost{ref: hostRef, host: hostObj}
+	return hostRef, hostObj
+}
+
+func (a *importRefAllocator) allocateIdentityRef(cfg *config.Configuration, nodeID, user, address string) string {
+	if a == nil {
+		return config.AllocateNodeIdentityRef(cfg, nodeID, user, address)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	inUse := func(ref string) bool {
+		if owner, ok := a.reservedIdentities[ref]; ok && owner != nodeID {
+			return true
+		}
+		if cfg != nil && cfg.Identities != nil {
+			if _, exists := cfg.Identities.Get(ref); exists {
+				return true
+			}
+		}
+		return false
+	}
+	candidate := config.AllocateNodeIdentityRef(cfg, nodeID, user, address)
+	if inUse(candidate) {
+		base := fmt.Sprintf("node:%s:identity", nodeID)
+		candidate = base
+		for suffix := 2; inUse(candidate); suffix++ {
+			candidate = fmt.Sprintf("%s:%d", base, suffix)
+		}
+	}
+	a.reservedIdentities[candidate] = nodeID
+	return candidate
+}
+
 func executeImport(ctx context.Context, repo *config.Repository, hosts []utils.HostInfo, opts ImportOptions, verify inventoryVerifier) error {
 	results := make([]importResult, len(hosts))
 	groups := groupImportRows(repo, hosts, results)
+	alloc := newImportRefAllocator()
 	wp := pkgutils.NewWorkerPool(uint(min(len(groups), 16)))
 	for _, rows := range groups {
 		wp.Execute(func() {
 			for _, row := range rows {
 				// Prepare only after the preceding row has finished verifying
 				// and saving, so its aliases and current version are visible.
-				results[row.index] = importOne(ctx, repo, row.addr, opts, verify)
+				results[row.index] = importOne(ctx, repo, row.addr, opts, verify, alloc)
 			}
 		})
 	}
@@ -196,9 +271,9 @@ func executeImport(ctx context.Context, repo *config.Repository, hosts []utils.H
 	return errors.Join(errs...)
 }
 
-func importOne(ctx context.Context, repo *config.Repository, addr utils.HostInfo, opts ImportOptions, verify inventoryVerifier) importResult {
+func importOne(ctx context.Context, repo *config.Repository, addr utils.HostInfo, opts ImportOptions, verify inventoryVerifier, alloc *importRefAllocator) importResult {
 	result := importResult{nodeID: addr.Host, status: "inventory_not_saved"}
-	draft, err := prepareImport(repo, addr, opts.Tag)
+	draft, err := prepareImportWithAllocator(repo, addr, opts.Tag, alloc)
 	if err != nil {
 		result.err = err
 		return result
@@ -287,6 +362,10 @@ func resolveImportNode(repo *config.Repository, addr utils.HostInfo) (string, er
 }
 
 func prepareImport(repo *config.Repository, addr utils.HostInfo, tag string) (*importDraft, error) {
+	return prepareImportWithAllocator(repo, addr, tag, nil)
+}
+
+func prepareImportWithAllocator(repo *config.Repository, addr utils.HostInfo, tag string, alloc *importRefAllocator) (*importDraft, error) {
 	addr, err := normalizeImportAddress(addr)
 	if err != nil {
 		return nil, err
@@ -297,8 +376,8 @@ func prepareImport(repo *config.Repository, addr utils.HostInfo, tag string) (*i
 		return nil, fmt.Errorf("resolve imported endpoint: %w", err)
 	}
 	draft := &importDraft{nodeID: nodeID, addr: addr}
+	view := repo.View()
 	if nodeID != "" {
-		view := repo.View()
 		draft.ref = view.NodeRefs[nodeID]
 		if draft.ref.ID == "" {
 			return nil, fmt.Errorf("import target %q is not a saved node", nodeID)
@@ -309,9 +388,19 @@ func prepareImport(repo *config.Repository, addr utils.HostInfo, tag string) (*i
 		draft.bundle = config.ConnectionSnapshot{Node: node, Host: host, Identity: identity}
 	} else {
 		draft.nodeID = canonicalID
+		hostRef, hostObj := alloc.allocateHostRef(view.Configuration, canonicalID, addr.Host, addr.Port)
+		identityRef := alloc.allocateIdentityRef(view.Configuration, canonicalID, addr.User, addr.Host)
+		authType := "auto"
+		switch {
+		case addr.Password != "" && addr.KeyPath == "" && addr.Passphrase == "":
+			authType = "password"
+		case addr.KeyPath != "" && addr.Password == "":
+			authType = "key"
+		}
 		draft.bundle = config.ConnectionSnapshot{
-			Node: models.Node{HostRef: config.FormatHostPort(addr.Host, addr.Port), IdentityRef: "node:" + canonicalID + ":identity", SudoMode: models.SudoModeAuto},
-			Host: models.Host{Address: addr.Host, Port: addr.Port}, Identity: models.Identity{User: addr.User, AuthType: "auto"},
+			Node:     models.Node{HostRef: hostRef, IdentityRef: identityRef, SudoMode: models.SudoModeAuto},
+			Host:     hostObj,
+			Identity: models.Identity{User: addr.User, AuthType: authType},
 		}
 	}
 	if addr.Alias != "" {

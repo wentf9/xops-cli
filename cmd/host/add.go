@@ -199,7 +199,20 @@ func resolveValidatedAddedIdentity(cfg *config.Configuration, flags *addFlags, p
 }
 
 func commitAddedNode(cmd *cobra.Command, repository *config.Repository, name string, node models.Node, hostObj models.Host, identity models.Identity, password, keyPass, keyPath string) error {
-	write, err := utils.PrepareInventoryCredential(repository, credential.Target{NodeID: name}, identity, password, keyPass, keyPath, nil)
+	if password != "" || keyPass != "" {
+		updater := repository.NodeCredentialCreate(name, node, hostObj, identity)
+		write, err := utils.PrepareInventoryCredential(repository, credential.Target{NodeID: name}, identity, password, keyPass, keyPath, updater)
+		if err != nil {
+			return err
+		}
+		defer write.Clear()
+		if err := write.Save(cmd.Context(), ""); err != nil {
+			return err
+		}
+		logger.PrintSuccess(i18n.Tf("node_add_success", map[string]any{"Name": name}))
+		return nil
+	}
+	write, err := utils.PrepareInventoryCredential(repository, credential.Target{NodeID: name}, identity, "", "", keyPath, nil)
 	if err != nil {
 		return err
 	}

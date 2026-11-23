@@ -253,12 +253,41 @@ func runIdentityAdd(cmd *cobra.Command, args []string, name, user, keyPath strin
 		}
 	}
 
+	if _, exists := repository.View().Configuration.Identities.Get(name); exists {
+		return fmt.Errorf("%s", i18n.Tf("identity_err_exists", map[string]any{"Name": name}))
+	}
+
 	identity, password, err := buildNewIdentityModel(user, keyPath, password)
 	if err != nil {
 		return err
 	}
 
-	write, err := utils.PrepareInventoryCredential(repository, credential.Target{IdentityID: name}, identity, password, keyPass, keyPath, nil)
+	if err := commitAddedIdentity(cmd, repository, name, identity, password, keyPass, keyPath); err != nil {
+		return err
+	}
+
+	logger.PrintSuccess(i18n.Tf("identity_add_success", map[string]any{"Name": name}))
+	return nil
+}
+
+func commitAddedIdentity(cmd *cobra.Command, repository *config.Repository, name string, identity models.Identity, password, keyPass, keyPath string) error {
+	if password != "" || keyPass != "" {
+		updater := repository.IdentityCredentialCreate(name, identity)
+		write, err := utils.PrepareInventoryCredential(repository, credential.Target{IdentityID: name}, identity, password, keyPass, keyPath, updater)
+		if err != nil {
+			return err
+		}
+		defer write.Clear()
+		if err := write.Save(cmd.Context(), ""); err != nil {
+			if errors.Is(err, config.ErrConfigConflict) {
+				return fmt.Errorf("%s", i18n.Tf("identity_err_exists", map[string]any{"Name": name}))
+			}
+			return err
+		}
+		return nil
+	}
+
+	write, err := utils.PrepareInventoryCredential(repository, credential.Target{IdentityID: name}, identity, "", "", keyPath, nil)
 	if err != nil {
 		return err
 	}
@@ -270,13 +299,6 @@ func runIdentityAdd(cmd *cobra.Command, args []string, name, user, keyPath strin
 		}
 		return fmt.Errorf("add identity %q failed: %w", name, err)
 	}
-
-	ref := repository.View().IdentityRefs[name]
-	if err := write.Save(cmd.Context(), string(ref.Version[:])); err != nil {
-		return err
-	}
-
-	logger.PrintSuccess(i18n.Tf("identity_add_success", map[string]any{"Name": name}))
 	return nil
 }
 

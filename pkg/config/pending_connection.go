@@ -510,15 +510,37 @@ func applyPendingNodeUpdate(
 func applyPendingNodeAuthUpdate(node *models.Node, identity *models.Identity, upd PendingNodeUpdate) bool {
 	changed := false
 	if upd.HasPassword {
-		if identity.AuthType != "password" {
-			identity.AuthType = "password"
-			changed = true
+		if !IsHybridAuthType(identity.AuthType) {
+			if identity.AuthType != "password" ||
+				identity.KeyPath != "" ||
+				identity.KeyFingerprint != "" ||
+				identity.Passphrase != "" ||
+				identity.PassphraseRef != nil ||
+				identity.Password != "" {
+				identity.AuthType = "password"
+				identity.KeyPath = ""
+				identity.KeyFingerprint = ""
+				identity.Passphrase = ""
+				identity.PassphraseRef = nil
+				identity.Password = ""
+				changed = true
+			}
 		}
 	} else if absKey := NormalizePersistableIdentityPath(upd.IdentityFile); absKey != "" {
-		if identity.KeyPath != absKey || identity.AuthType != "key" {
+		if identity.KeyPath != absKey {
 			identity.KeyPath = absKey
-			identity.AuthType = "key"
+			identity.KeyFingerprint = ""
+			identity.Passphrase = ""
+			identity.PassphraseRef = nil
 			changed = true
+		}
+		if !IsHybridAuthType(identity.AuthType) {
+			if identity.AuthType != "key" || identity.Password != "" || identity.LoginPasswordRef != nil {
+				identity.AuthType = "key"
+				identity.Password = ""
+				identity.LoginPasswordRef = nil
+				changed = true
+			}
 		}
 	}
 	if upd.SudoMode != "" && upd.SudoMode != models.SudoModeNone && upd.SudoMode != models.SudoModeAuto && node.SudoMode != upd.SudoMode {

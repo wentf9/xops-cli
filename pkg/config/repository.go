@@ -1947,9 +1947,9 @@ func validateConfigurationIdentities(cfg *Configuration, stores map[string]Store
 			if !id.PassphraseRef.IsEmpty() && cfg.SchemaVersion == 2 && strings.TrimSpace(id.KeyFingerprint) == "" {
 				return fmt.Errorf("%w: identity %q with passphrase_ref must specify key_fingerprint", ErrSchemaValidation, idName)
 			}
-			if id.KeyFingerprint != "" && strings.ContainsAny(id.KeyFingerprint, " \t\r\n\x00") {
-				return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q", ErrSchemaValidation, idName, id.KeyFingerprint)
-			}
+		}
+		if id.KeyFingerprint != "" && hasInvalidKeyFingerprintChars(id.KeyFingerprint) {
+			return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q", ErrSchemaValidation, idName, id.KeyFingerprint)
 		}
 		if id.OTP != nil {
 			if err := validateConfigurationOTP(idName, id.OTP, stores); err != nil {

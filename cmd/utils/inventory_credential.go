@@ -71,11 +71,6 @@ func PrepareInventoryCredential(repo *config.Repository, target credential.Targe
 	}
 	oldRef := identity.LoginPasswordRef
 	value := password
-	target.ClearLegacyLoginPassword = true
-	target.ClearLegacyPassphrase = true
-	target.Kind = credential.KindLoginPassword
-	target.AuthType = "password"
-	target.ClearKeyPath = true
 	if passphrase != "" || keyPath != "" {
 		var err error
 		target, err = preparePassphraseTarget(target, identity, keyPath, passphrase)
@@ -84,6 +79,8 @@ func PrepareInventoryCredential(repo *config.Repository, target credential.Targe
 		}
 		oldRef = identity.PassphraseRef
 		value = passphrase
+	} else {
+		target = preparePasswordTarget(target, identity)
 	}
 	if password == "" && passphrase == "" {
 		if err := validateUnencryptedKey(target.KeyPath); err != nil {
@@ -114,6 +111,20 @@ func PrepareInventoryCredential(repo *config.Repository, target credential.Targe
 	}, nil
 }
 
+func preparePasswordTarget(target credential.Target, identity models.Identity) credential.Target {
+	target.Kind = credential.KindLoginPassword
+	target.ClearLegacyLoginPassword = true
+	if config.IsHybridAuthType(identity.AuthType) {
+		target.AuthType = identity.AuthType
+		target.ClearKeyPath = false
+	} else {
+		target.AuthType = "password"
+		target.ClearKeyPath = true
+		target.ClearLegacyPassphrase = true
+	}
+	return target
+}
+
 func preparePassphraseTarget(target credential.Target, identity models.Identity, keyPath, passphrase string) (credential.Target, error) {
 	if keyPath == "" {
 		keyPath = identity.KeyPath
@@ -126,10 +137,12 @@ func preparePassphraseTarget(target credential.Target, identity models.Identity,
 		return target, fmt.Errorf("invalid private-key path: %w", err)
 	}
 	target.Kind = credential.KindPassphrase
+	target.ClearLegacyPassphrase = true
 	if config.IsHybridAuthType(identity.AuthType) {
 		target.AuthType = identity.AuthType
 	} else {
 		target.AuthType = "key"
+		target.ClearLegacyLoginPassword = true
 	}
 	target.KeyPath = NormalizeIdentityKeyPath(keyPath)
 	target.ClearKeyPath = false

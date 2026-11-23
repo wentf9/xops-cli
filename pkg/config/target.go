@@ -2246,21 +2246,19 @@ func (r *Repository) createNodeInTransaction(
 }
 
 func ensureMatchingHost(cfg *Configuration, canonicalAddr string, port uint16, targetNodeID string) (string, error) {
-	var matchingHostRefs []string
-	var unaliasedHostRef string
+	var unaliasedHostRefs []string
 	targetPort := normalizedHostPort(port)
 	targetEp, tErr := ssh.NewEndpoint(canonicalAddr, int(targetPort))
-	for _, href := range cfg.Hosts.Keys() {
+	keys := cfg.Hosts.Keys()
+	slices.Sort(keys)
+	for _, href := range keys {
 		h, ok := cfg.Hosts.Get(href)
-		if !ok {
+		if !ok || len(h.Alias) > 0 {
 			continue
 		}
-		hostEp, hErr := ssh.NewEndpoint(h.Address, int(h.Port))
+		hostEp, hErr := ssh.NewEndpoint(h.Address, int(normalizedHostPort(h.Port)))
 		if tErr == nil && hErr == nil && hostEp.Equal(targetEp) {
-			matchingHostRefs = append(matchingHostRefs, href)
-			if len(h.Alias) == 0 && unaliasedHostRef == "" {
-				unaliasedHostRef = href
-			}
+			unaliasedHostRefs = append(unaliasedHostRefs, href)
 		}
 	}
 
@@ -2268,7 +2266,7 @@ func ensureMatchingHost(cfg *Configuration, canonicalAddr string, port uint16, t
 		candidateRef := FormatHostPort(canonicalAddr, targetPort)
 		hostRef := candidateRef
 		if existing, exists := cfg.Hosts.Get(candidateRef); exists {
-			existEp, eErr := ssh.NewEndpoint(existing.Address, int(existing.Port))
+			existEp, eErr := ssh.NewEndpoint(existing.Address, int(normalizedHostPort(existing.Port)))
 			if tErr != nil || eErr != nil || !existEp.Equal(targetEp) || len(existing.Alias) > 0 {
 				hostRef = privateHostReference(cfg, targetNodeID)
 			}
@@ -2280,24 +2278,14 @@ func ensureMatchingHost(cfg *Configuration, canonicalAddr string, port uint16, t
 		return hostRef
 	}
 
-	switch len(matchingHostRefs) {
+	switch len(unaliasedHostRefs) {
 	case 0:
 		return createHost(), nil
 	case 1:
-		if existing, ok := cfg.Hosts.Get(matchingHostRefs[0]); ok && len(existing.Alias) > 0 {
-			if countNodeReferences(cfg, func(candidate models.Node) bool {
-				return candidate.HostRef == matchingHostRefs[0] && candidate.HostRef != ""
-			}) > 0 {
-				return createHost(), nil
-			}
-		}
-		return matchingHostRefs[0], nil
+		return unaliasedHostRefs[0], nil
 	default:
-		if unaliasedHostRef != "" {
-			return unaliasedHostRef, nil
-		}
 		return "", fmt.Errorf("ambiguous host configuration: multiple host references found for %s: %v",
-			FormatHostPort(canonicalAddr, targetPort), matchingHostRefs)
+			FormatHostPort(canonicalAddr, targetPort), unaliasedHostRefs)
 	}
 }
 

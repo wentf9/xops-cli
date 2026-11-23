@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/wentf9/xops-cli/core/concurrent"
 	corepolicy "github.com/wentf9/xops-cli/core/mcp/policy"
@@ -367,6 +368,15 @@ func validateStoreConfig(storeID string, storeCfg StoreConfig) error {
 	return nil
 }
 
+func hasInvalidKeyFingerprintChars(fp string) bool {
+	for _, r := range fp {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
+			return true
+		}
+	}
+	return false
+}
+
 func validateIdentityRefs(idName string, id IdentityV2, stores map[string]StoreConfig) error {
 	if id.LoginPasswordRef != nil {
 		if err := validateConfiguredRef(*id.LoginPasswordRef, stores); err != nil {
@@ -393,11 +403,11 @@ func validateIdentityRefs(idName string, id IdentityV2, stores map[string]StoreC
 				return fmt.Errorf("%w: identity %q with passphrase_ref must specify key_fingerprint",
 					ErrSchemaValidation, idName)
 			}
-			if strings.ContainsAny(id.KeyFingerprint, " \t\r\n\x00") {
-				return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q",
-					ErrSchemaValidation, idName, id.KeyFingerprint)
-			}
 		}
+	}
+	if id.KeyFingerprint != "" && hasInvalidKeyFingerprintChars(id.KeyFingerprint) {
+		return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q",
+			ErrSchemaValidation, idName, id.KeyFingerprint)
 	}
 
 	if id.OTP != nil {

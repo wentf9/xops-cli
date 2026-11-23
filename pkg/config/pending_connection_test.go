@@ -711,7 +711,7 @@ func TestWithPendingNode_EFG_M1_SharedIdentityRefForkPreservesAuthVersionOnConfi
 		if resolveErr != nil {
 			t.Fatalf("ResolveConnection(node-a) before Confirm: %v", resolveErr)
 		}
-		if snapBefore.Node.IdentityRef == "id-shared" || snapBefore.Identity.KeyPath != keyPath || snapBefore.Identity.AuthType != "key" || snapBefore.UpdateRef == nil {
+		if snapBefore.Node.IdentityRef == "id-shared" || snapBefore.Identity.KeyPath != keyPath || snapBefore.Identity.AuthType != "auto" || snapBefore.UpdateRef == nil {
 			t.Fatalf("unexpected staged snapshot before Confirm: node=%+v ident=%+v updateRef=%v", snapBefore.Node, snapBefore.Identity, snapBefore.UpdateRef)
 		}
 		stagedIdentityRef = snapBefore.Node.IdentityRef

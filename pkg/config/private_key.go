@@ -15,7 +15,7 @@ import (
 // PrivateKeyFingerprint verifies a private key and returns its public fingerprint.
 // Key material is transient and never included in a returned configuration.
 func PrivateKeyFingerprint(path string, passphrase []byte) (string, error) {
-	if strings.HasPrefix(path, "~/") {
+	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
