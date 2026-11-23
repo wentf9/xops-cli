@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"strings"
@@ -732,6 +733,16 @@ func (o *SshOptions) runControlProxySession(ctx context.Context, client *ssh.Cli
 	return client.ShellWithIO(ctx, ioStreams)
 }
 
+func enrichControlProxyLookupAuth(lookupAuth adapter.SessionAuth, target ssh.TargetContext) adapter.SessionAuth {
+	if strings.TrimSpace(lookupAuth.User) == "" && strings.TrimSpace(target.User) != "" {
+		lookupAuth.User = strings.TrimSpace(target.User)
+	}
+	if lookupAuth.Port == 0 && target.Port > 0 && target.Port <= math.MaxUint16 {
+		lookupAuth.Port = uint16(target.Port)
+	}
+	return lookupAuth
+}
+
 func buildControlProxyClientConfig(
 	target ssh.TargetContext,
 	provider config.ConfigProvider,
@@ -749,13 +760,8 @@ func buildControlProxyClientConfig(
 			o.syncResolvedTargetHosts(provider)
 		}
 		snapshot = provider.Snapshot()
-		var (
-			lookupKey  string
-			lookupAuth adapter.SessionAuth
-		)
-		if nodeID != "" {
-			lookupKey, lookupAuth = resolveControlSessionLookup(o, provider, nodeID, effectiveConnectionTarget(o, nodeID), target)
-		}
+		lookupKey, lookupAuth := resolveControlSessionLookup(o, provider, nodeID, effectiveConnectionTarget(o, nodeID), target)
+		lookupAuth = enrichControlProxyLookupAuth(lookupAuth, target)
 		adp = adapter.NewSSHAdapter(provider, buildControlProxyAdapterOptionsWithLookup(snapshot, nodeID, lookupKey, lookupAuth, o)...)
 		if nodeID != "" {
 			resolvedCfg, err := adp.GetConfig(firstNonEmptyControlValue(lookupKey, nodeID))
@@ -878,13 +884,8 @@ func resolveControlProxyExplicitOrTargetLookup(provider config.ConfigProvider, o
 	if err != nil {
 		return ""
 	}
-	if resolved.MatchedNodeID != "" {
-		return resolved.MatchedNodeID
-	}
-	if resolved.Provenance == config.ProvenanceOpenSSHDerived || config.IsOpenSSHNodeID(resolved.BaseNodeID) {
-		if id := resolvedControlLookupNodeID(resolved); id != "" {
-			return id
-		}
+	if id := resolvedControlLookupNodeID(resolved); id != "" {
+		return id
 	}
 	return resolved.BaseNodeID
 }
@@ -967,52 +968,85 @@ func buildControlProxyAdapterOptions(snapshot *config.Configuration, nodeID stri
 	return buildControlProxyAdapterOptionsWithLookup(snapshot, nodeID, "", adapter.SessionAuth{}, o)
 }
 
+func resolveControlProxySessionUserPort(lookupAuth adapter.SessionAuth, o *SshOptions) (string, uint16) {
+	sessUser := strings.TrimSpace(lookupAuth.User)
+	sessPort := lookupAuth.Port
+	if o == nil {
+		return sessUser, sessPort
+	}
+	if u := firstNonEmptyControlValue(o.User, o.Target.User); u != "" {
+		sessUser = strings.TrimSpace(u)
+	}
+	if o.Port > 0 {
+		sessPort = o.Port
+	} else if o.Target.HasPort && o.Target.Port > 0 {
+		sessPort = o.Target.Port
+	}
+	return sessUser, sessPort
+}
+
+func resolveControlProxySessionOrigin(lookupAuth adapter.SessionAuth, o *SshOptions) (origHost, canonHost string) {
+	origHost = o.originalHost
+	if stripped, ok := config.OpenSSHOriginalHost(origHost); ok {
+		origHost = stripped
+	}
+	canonOrig, canon := canonicalControlOriginAndHost(o)
+	canonHost = canon
+	if origHost == "" {
+		if lookupAuth.OriginalHost != "" {
+			return lookupAuth.OriginalHost, lookupAuth.CanonicalHost
+		}
+		return canonOrig, canonHost
+	}
+	if origHost == lookupAuth.OriginalHost && canonHost == "" {
+		canonHost = lookupAuth.CanonicalHost
+	}
+	return origHost, canonHost
+}
+
+func buildControlProxySessionAuth(lookupAuth adapter.SessionAuth, o *SshOptions) (adapter.SessionAuth, adapter.SessionControlOptions) {
+	sessUser, sessPort := resolveControlProxySessionUserPort(lookupAuth, o)
+	if o == nil {
+		if sessUser == "" && sessPort == 0 {
+			return adapter.SessionAuth{}, adapter.SessionControlOptions{}
+		}
+		return adapter.SessionAuth{User: sessUser, Port: sessPort}, adapter.SessionControlOptions{}
+	}
+	origHost, canonHost := resolveControlProxySessionOrigin(lookupAuth, o)
+	absKeys := o.absIdentityFiles()
+	firstKey := normalizeCLIIdentityPath(o.IdentityFile)
+	if firstKey == "" && len(absKeys) > 0 {
+		firstKey = absKeys[0]
+	}
+	hostNameOverride, _ := o.effectiveHostName()
+	sessionAuth := adapter.SessionAuth{
+		Password:      o.Password,
+		Passphrase:    o.Passphrase,
+		KeyPath:       firstKey,
+		KeyPaths:      absKeys,
+		HostName:      hostNameOverride,
+		User:          sessUser,
+		Port:          sessPort,
+		OriginalHost:  origHost,
+		CanonicalHost: canonHost,
+		Remember:      false,
+		OTP:           o.OTP,
+		ProxyJump:     firstNonEmptyControlValue(o.JumpHost, lookupAuth.ProxyJump),
+	}
+	var sessionCtrlOpts adapter.SessionControlOptions
+	if parsed, ctrlErr := o.toSessionControlOptions(); ctrlErr == nil {
+		sessionCtrlOpts = parsed
+	}
+	return sessionAuth, sessionCtrlOpts
+}
+
 func buildControlProxyAdapterOptionsWithLookup(
 	snapshot *config.Configuration,
 	nodeID, lookupKey string,
 	lookupAuth adapter.SessionAuth,
 	o *SshOptions,
 ) []adapter.Option {
-	var sessionAuth adapter.SessionAuth
-	var sessionCtrlOpts adapter.SessionControlOptions
-	if o != nil {
-		origHost := o.originalHost
-		if stripped, ok := config.OpenSSHOriginalHost(origHost); ok {
-			origHost = stripped
-		}
-		canonOrig, canonHost := canonicalControlOriginAndHost(o)
-		if origHost == "" {
-			if lookupAuth.OriginalHost != "" {
-				origHost = lookupAuth.OriginalHost
-				canonHost = lookupAuth.CanonicalHost
-			} else {
-				origHost = canonOrig
-			}
-		} else if origHost == lookupAuth.OriginalHost && canonHost == "" {
-			canonHost = lookupAuth.CanonicalHost
-		}
-		absKeys := o.absIdentityFiles()
-		firstKey := normalizeCLIIdentityPath(o.IdentityFile)
-		if firstKey == "" && len(absKeys) > 0 {
-			firstKey = absKeys[0]
-		}
-		hostNameOverride, _ := o.effectiveHostName()
-		sessionAuth = adapter.SessionAuth{
-			Password:      o.Password,
-			Passphrase:    o.Passphrase,
-			KeyPath:       firstKey,
-			KeyPaths:      absKeys,
-			HostName:      hostNameOverride,
-			OriginalHost:  origHost,
-			CanonicalHost: canonHost,
-			Remember:      false,
-			OTP:           o.OTP,
-			ProxyJump:     firstNonEmptyControlValue(o.JumpHost, lookupAuth.ProxyJump),
-		}
-		if parsed, ctrlErr := o.toSessionControlOptions(); ctrlErr == nil {
-			sessionCtrlOpts = parsed
-		}
-	}
+	sessionAuth, sessionCtrlOpts := buildControlProxySessionAuth(lookupAuth, o)
 	adpOpts := []adapter.Option{
 		adapter.WithCredentialRecording(false),
 		adapter.WithControlProxyMode(true),

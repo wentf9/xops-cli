@@ -1388,14 +1388,15 @@ func TestBuildControlProxyClientConfigStripsProxyCommandPreservesRemoteCommandAn
 		}
 	})
 
-	t.Run("ad-hoc target with -l override strips ProxyCommand and keeps RemoteCommand and SetEnv", func(t *testing.T) {
+	t.Run("ad-hoc target with -l override strips Tier 3 ProxyCommand, keeps Tier 3 RemoteCommand/SetEnv, and blocks Tier 2 leak", func(t *testing.T) {
 		cfgTier3 := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+		cfgTier3.SSHOptions = ssh.MustOptions("ProxyCommand", "nc %h %p", "RemoteCommand", "whoami", "SetEnv", "BAZ=qux")
 		cfgTier3.Hosts.Set("h-1", models.Host{Address: "10.55.66.77", Port: 22})
 		cfgTier3.Identities.Set("id-1", models.Identity{User: "cfguser", AuthType: "password", Password: "pw"})
 		cfgTier3.Nodes.Set("node-1", models.Node{
 			HostRef:     "h-1",
 			IdentityRef: "id-1",
-			SSHOptions:  ssh.MustOptions("ProxyCommand", "nc %h %p", "RemoteCommand", "whoami", "SetEnv", "BAZ=qux"),
+			SSHOptions:  ssh.MustOptions("RemoteCommand", "node1-only", "SessionType", "none", "ForwardAgent", "yes"),
 		})
 		provTier3 := config.NewProviderWithoutOpenSSH(cfgTier3)
 
@@ -1425,10 +1426,16 @@ func TestBuildControlProxyClientConfigStripsProxyCommandPreservesRemoteCommandAn
 			t.Fatalf("expected Tier 3 ProxyCommand stripped for ad-hoc proxy mode, got ActiveProxyCommand=%q", active)
 		}
 		if gotRC := clientCfg.Options.RemoteCommand(); gotRC != "whoami" {
-			t.Fatalf("expected RemoteCommand=%q, got %q", "whoami", gotRC)
+			t.Fatalf("expected Tier 3 RemoteCommand=%q (no node-1 Tier 2 leak), got %q", "whoami", gotRC)
 		}
 		if gotEnv := clientCfg.Options.SetEnvDirectives(); !slices.Equal(gotEnv, []string{"BAZ=qux"}) {
 			t.Fatalf("expected SetEnvDirectives=[BAZ=qux], got %v", gotEnv)
+		}
+		if clientCfg.Options.SessionType() == ssh.SessionTypeNone {
+			t.Fatal("leaked node-1 Tier 2 SessionType=none onto -l overrideuser target")
+		}
+		if fa := clientCfg.Options.ForwardAgent(); fa != "" {
+			t.Fatalf("leaked node-1 Tier 2 ForwardAgent=%q onto -l overrideuser target", fa)
 		}
 	})
 }
@@ -1632,7 +1639,7 @@ func TestControlContextCanceledExits255_AndProxyFallbackLookupViaRealControlTarg
 		}
 	})
 
-	t.Run("resolveControlProxyFallbackLookup preserves saved node under -l override and openssh namespace", func(t *testing.T) {
+	t.Run("resolveControlProxyFallbackLookup isolates overridden saved node and preserves openssh namespace", func(t *testing.T) {
 		home := t.TempDir()
 		t.Setenv("HOME", home)
 		t.Setenv("USERPROFILE", home)
@@ -1656,7 +1663,9 @@ func TestControlContextCanceledExits255_AndProxyFallbackLookupViaRealControlTarg
 		cfg.Nodes.Set("node-1", models.Node{HostRef: "10.55.66.77:22", IdentityRef: "ops@10.55.66.77"})
 		provider := config.NewProviderWithOpenSSHParser(cfg, parser)
 
-		// 1. Saved node with -l overrideuser driven through real controlTarget (which synthesizes TargetContext.OriginalHost).
+		// 1. Saved node with -l overrideuser uses its ad-hoc derived NodeID (matching dial-plane
+		// WithPendingNode) instead of collapsing back to saved node-1 (which would leak Tier-2 options)
+		// or into the openssh: virtual namespace.
 		oSaved := NewSshOptions()
 		oSaved.User = "overrideuser"
 		oSaved.Host = "node-1"
@@ -1669,8 +1678,20 @@ func TestControlContextCanceledExits255_AndProxyFallbackLookupViaRealControlTarg
 		if err != nil {
 			t.Fatalf("controlTarget(saved): %v", err)
 		}
-		if got := resolveControlProxyFallbackLookup(tSaved, provider, oSaved); got != "node-1" {
-			t.Fatalf("saved node -l override fallbackLookup = %q, want %q (target=%+v)", got, "node-1", tSaved)
+		if got := resolveControlProxyFallbackLookup(tSaved, provider, oSaved); got != "overrideuser@10.55.66.77:22" {
+			t.Fatalf("saved node -l override fallbackLookup = %q, want %q (target=%+v)", got, "overrideuser@10.55.66.77:22", tSaved)
+		}
+
+		// 1b. Un-overridden saved node still resolves to its saved node ID.
+		oExact := NewSshOptions()
+		oExact.Host = "node-1"
+		oExact.Target = config.ConnectionTarget{Selector: "node-1"}
+		tExact, err := controlTarget(oExact, provider, "node-1")
+		if err != nil {
+			t.Fatalf("controlTarget(exact): %v", err)
+		}
+		if got := resolveControlProxyFallbackLookup(tExact, provider, oExact); got != "node-1" {
+			t.Fatalf("un-overridden saved node fallbackLookup = %q, want %q", got, "node-1")
 		}
 
 		// 2. Explicit openssh:other@web sharing the same IP must remain in openssh: namespace.

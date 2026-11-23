@@ -442,7 +442,9 @@ func resolveControlConfigLookupKey(
 	if lookupKey == "" {
 		if provider != nil && strings.TrimSpace(selector) != "" {
 			jump, hasJump := effectiveControlConfigJumpOverride(sessionAuth, sessionOpts)
-			if strings.TrimSpace(sessionAuth.HostName) != "" {
+			hadTier1Jump := hasJump
+			overrideHost := strings.TrimSpace(sessionAuth.HostName)
+			if overrideHost != "" {
 				jump = "none"
 				hasJump = true
 			}
@@ -468,8 +470,25 @@ func resolveControlConfigLookupKey(
 				if !isTargetMissingError(err) {
 					return "", sessionAuth, err
 				}
-			} else if resolvedKey, updatedAuth, ok := resolveControlConfigLookupFromResolvedTarget(resolved, sessionAuth); ok {
-				return resolvedKey, updatedAuth, nil
+			} else {
+				if overrideHost != "" && !hadTier1Jump && resolved.MatchedNodeID == "" {
+					baseTarget := connTarget
+					baseTarget.ProxyJump = ""
+					baseTarget.HasProxyJump = false
+					syntheticReq := ControlTargetRequest{
+						Provider:                 provider,
+						Target:                   baseTarget,
+						OverrideExpandedHost:     overrideHost,
+						ApplyTargetNodeOverrides: true,
+						SessionControl:           sessionOpts,
+					}
+					if _, jumpErr := resolveControlEffectiveJumpHost(syntheticReq, baseTarget, true, resolved); jumpErr != nil {
+						return "", sessionAuth, jumpErr
+					}
+				}
+				if resolvedKey, updatedAuth, ok := resolveControlConfigLookupFromResolvedTarget(resolved, sessionAuth); ok {
+					return resolvedKey, updatedAuth, nil
+				}
 			}
 		}
 		// Resolve treats an unknown selector as "no node layer" and falls
@@ -740,11 +759,105 @@ func resolveControlTier1ProxySetting(connTarget config.ConnectionTarget, session
 	), nil
 }
 
+func collectMatchingHostProxyJumps(snap *config.Configuration, targetEp ssh.Endpoint) (map[string]struct{}, error) {
+	jumpSet := make(map[string]struct{})
+	for _, nid := range snap.Nodes.Keys() {
+		n, ok := snap.Nodes.Get(nid)
+		if !ok {
+			continue
+		}
+		h, hOK := snap.Hosts.Get(n.HostRef)
+		if !hOK {
+			continue
+		}
+		hostPort := h.Port
+		if hostPort == 0 {
+			hostPort = 22
+		}
+		hostEp, hErr := ssh.NewEndpoint(h.Address, int(hostPort))
+		if hErr != nil || !hostEp.Equal(targetEp) {
+			continue
+		}
+		ps, pErr := proxySettingFromJumpString(n.ProxyJump)
+		if pErr != nil {
+			return nil, fmt.Errorf("invalid node ProxyJump %q: %w", n.ProxyJump, pErr)
+		}
+		var trimmedJump string
+		if targets, ok := ps.JumpTargets(); ok {
+			validated, vErr := validateNoProviderJumpChain(targets)
+			if vErr != nil {
+				return nil, vErr
+			}
+			trimmedJump = validated
+		}
+		jumpSet[trimmedJump] = struct{}{}
+	}
+	return jumpSet, nil
+}
+
+// resolveInheritedHostProxyJump mirrors pkg/config/target.go:resolveJumpForNode's
+// saved-node host scan when ResolveTarget had ProxyJump="none" injected to defer
+// cycle validation until after -o HostName overrides are applied.
+func resolveInheritedHostProxyJump(provider config.ConfigProvider, host string, port uint16) (ssh.ProxySetting, bool, error) {
+	if provider == nil {
+		return ssh.UnsetProxySetting(), false, nil
+	}
+	snap := provider.Snapshot()
+	if snap == nil || snap.Nodes == nil || snap.Hosts == nil {
+		return ssh.UnsetProxySetting(), false, nil
+	}
+	cleanHost := config.NormalizeHostAddress(host)
+	if cleanHost == "" {
+		return ssh.UnsetProxySetting(), false, nil
+	}
+	targetPort := port
+	if targetPort == 0 {
+		targetPort = 22
+	}
+	targetEp, tErr := ssh.NewEndpoint(cleanHost, int(targetPort))
+	if tErr != nil {
+		return ssh.UnsetProxySetting(), false, nil
+	}
+	jumpSet, err := collectMatchingHostProxyJumps(snap, targetEp)
+	if err != nil {
+		return ssh.UnsetProxySetting(), false, err
+	}
+	switch len(jumpSet) {
+	case 0:
+		return ssh.UnsetProxySetting(), false, nil
+	case 1:
+		for j := range jumpSet {
+			if j == "" {
+				return ssh.UnsetProxySetting(), true, nil
+			}
+			ps, err := proxySettingFromJumpString(j)
+			if err != nil {
+				return ssh.UnsetProxySetting(), false, fmt.Errorf("invalid node ProxyJump %q: %w", j, err)
+			}
+			return ps, true, nil
+		}
+		return ssh.UnsetProxySetting(), true, nil
+	default:
+		return ssh.UnsetProxySetting(), false, fmt.Errorf("ambiguous proxy jump: multiple nodes for host %s have conflicting proxy jumps",
+			config.FormatHostPort(cleanHost, targetPort))
+	}
+}
+
 func resolveControlTier2ProxySetting(
 	provider config.ConfigProvider,
 	connTarget config.ConnectionTarget,
 	hasResolved bool,
 	resolved config.ResolvedTarget,
+) (ssh.ProxySetting, error) {
+	return resolveControlTier2ProxySettingWithHostOverride(provider, connTarget, hasResolved, resolved, false)
+}
+
+func resolveControlTier2ProxySettingWithHostOverride(
+	provider config.ConfigProvider,
+	connTarget config.ConnectionTarget,
+	hasResolved bool,
+	resolved config.ResolvedTarget,
+	hostNameSuppressedJump bool,
 ) (ssh.ProxySetting, error) {
 	if !hasResolved || resolved.Provenance.IsUnpersistedOpenSSH() {
 		return ssh.UnsetProxySetting(), nil
@@ -761,12 +874,20 @@ func resolveControlTier2ProxySetting(
 			return t2Jump.Merge(t2Cmd), nil
 		}
 	}
-	if !connTarget.HasProxyJump && resolved.ProxyJump != "" {
-		ps, err := proxySettingFromJumpString(resolved.ProxyJump)
-		if err != nil {
-			return ssh.UnsetProxySetting(), fmt.Errorf("invalid node ProxyJump %q: %w", resolved.ProxyJump, err)
+	if !connTarget.HasProxyJump && connTarget.ProxyJump == "" {
+		if resolved.ProxyJump != "" {
+			ps, err := proxySettingFromJumpString(resolved.ProxyJump)
+			if err != nil {
+				return ssh.UnsetProxySetting(), fmt.Errorf("invalid node ProxyJump %q: %w", resolved.ProxyJump, err)
+			}
+			t2Jump = ps
+		} else if hostNameSuppressedJump {
+			ps, _, err := resolveInheritedHostProxyJump(provider, resolved.Host, resolved.Port)
+			if err != nil {
+				return ssh.UnsetProxySetting(), err
+			}
+			t2Jump = ps
 		}
-		t2Jump = ps
 	}
 	return t2Jump, nil
 }
@@ -787,16 +908,34 @@ func resolveControlTier4ProxySetting(
 	hasResolved bool,
 	resolved config.ResolvedTarget,
 ) (ssh.ProxySetting, error) {
+	return resolveControlTier4ProxySettingWithHostOverride(provider, connTarget, hasResolved, resolved, false)
+}
+
+func resolveControlTier4ProxySettingWithHostOverride(
+	provider config.ConfigProvider,
+	connTarget config.ConnectionTarget,
+	hasResolved bool,
+	resolved config.ResolvedTarget,
+	hostNameSuppressedJump bool,
+) (ssh.ProxySetting, error) {
 	if !hasResolved || !resolved.Provenance.IsUnpersistedOpenSSH() {
 		return ssh.UnsetProxySetting(), nil
 	}
 	var t4Jump, t4Parser ssh.ProxySetting
-	if !connTarget.HasProxyJump && connTarget.ProxyJump == "" && resolved.ProxyJump != "" {
-		ps, err := proxySettingFromJumpString(resolved.ProxyJump)
-		if err != nil {
-			return ssh.UnsetProxySetting(), fmt.Errorf("invalid OpenSSH ProxyJump %q: %w", resolved.ProxyJump, err)
+	if !connTarget.HasProxyJump && connTarget.ProxyJump == "" {
+		if resolved.ProxyJump != "" {
+			ps, err := proxySettingFromJumpString(resolved.ProxyJump)
+			if err != nil {
+				return ssh.UnsetProxySetting(), fmt.Errorf("invalid OpenSSH ProxyJump %q: %w", resolved.ProxyJump, err)
+			}
+			t4Jump = ps
+		} else if hostNameSuppressedJump && resolved.MatchedNodeID == "" {
+			ps, _, err := resolveInheritedHostProxyJump(provider, resolved.Host, resolved.Port)
+			if err != nil {
+				return ssh.UnsetProxySetting(), err
+			}
+			t4Jump = ps
 		}
-		t4Jump = ps
 	}
 	if parserSrc, ok := provider.(interface{ GetOpenSSHParser() *config.OpenSSHParser }); ok && parserSrc != nil {
 		if parser := parserSrc.GetOpenSSHParser(); parser != nil {
@@ -946,12 +1085,17 @@ func resolveControlEffectiveJumpHost(
 	if err != nil {
 		return "", err
 	}
-	t2Proxy, err := resolveControlTier2ProxySetting(req.Provider, req.Target, hasResolved, resolved)
+	tier1HasProxy := connTarget.HasProxyJump || connTarget.ProxyJump != "" || !t1Proxy.IsUnset()
+	hostNameSuppressedJump := req.Provider != nil &&
+		req.ApplyTargetNodeOverrides &&
+		strings.TrimSpace(req.OverrideExpandedHost) != "" &&
+		!tier1HasProxy
+	t2Proxy, err := resolveControlTier2ProxySettingWithHostOverride(req.Provider, connTarget, hasResolved, resolved, hostNameSuppressedJump)
 	if err != nil {
 		return "", err
 	}
 	t3Proxy := resolveControlTier3ProxySetting(req.Provider)
-	t4Proxy, err := resolveControlTier4ProxySetting(req.Provider, req.Target, hasResolved, resolved)
+	t4Proxy, err := resolveControlTier4ProxySettingWithHostOverride(req.Provider, connTarget, hasResolved, resolved, hostNameSuppressedJump)
 	if err != nil {
 		return "", err
 	}

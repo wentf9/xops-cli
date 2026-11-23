@@ -97,6 +97,14 @@ func (p EffectivePolicy) EffectiveJump() string {
 
 // OriginalHost returns the original OpenSSH selector host for token expansion (%n).
 func (p EffectivePolicy) OriginalHost() string {
+	if p.hasTier1Auth && validateOpenSSHControlSelector("session original host", p.tier1Auth.OriginalHost) == nil {
+		if orig := strings.TrimSpace(p.tier1Auth.OriginalHost); orig != "" {
+			if cleanOrig, ok := config.OpenSSHOriginalHost(orig); ok {
+				return cleanOrig
+			}
+			return orig
+		}
+	}
 	return p.originalHost
 }
 
@@ -173,6 +181,28 @@ func (a *SSHAdapter) resolveConnectionSnapshot(nodeID string) (config.Connection
 	return snap, tier1Auth, hasTier1Auth, err
 }
 
+func resolveInitialPolicyOriginalHost(resolvedNodeID string, snapshot config.ConnectionSnapshot, snapErr error, openSSHAlias string) string {
+	if snapErr != nil && openSSHAlias != "" {
+		return openSSHAlias
+	}
+	return openSSHSnapshotOriginalHost(resolvedNodeID, snapshot)
+}
+
+func (a *SSHAdapter) resolveNoSnapshotPolicyDefaults(
+	parser *config.OpenSSHParser,
+	resolvedNodeID, openSSHAlias, canonHost string,
+	snapErr error,
+) (string, uint16, string) {
+	if snapErr == nil {
+		return "", 0, ""
+	}
+	var noSnapParser *config.OpenSSHParser
+	if a.openSSHParser != nil || config.HasOpenSSHConfig(a.cfgProvider) {
+		noSnapParser = parser
+	}
+	return resolveNoSnapshotTargetDefaults(a.cfgProvider, noSnapParser, resolvedNodeID, openSSHAlias, canonHost)
+}
+
 // Resolve is the single canonical policy resolver for SSHAdapter. It merges the
 // 4-tier hierarchy (Tier 1 CLI > Tier 2 Node > Tier 3 Global > Tier 4 ~/.ssh/config),
 // resolves ProxyJump/ProxyCommand precedence via ssh.ProxySetting, enforces all
@@ -214,15 +244,7 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 
 	parser := a.getOpenSSHParser()
 	openSSHAlias, canonHost := a.resolveSessionOpenSSHMetadata(parser, resolvedNodeID, snapErr, snapshot, hasTier1Auth, tier1Auth)
-	var fallbackHost, fallbackUser string
-	var fallbackPort uint16
-	if snapErr != nil {
-		var noSnapParser *config.OpenSSHParser
-		if a.openSSHParser != nil || config.HasOpenSSHConfig(a.cfgProvider) {
-			noSnapParser = parser
-		}
-		fallbackHost, fallbackPort, fallbackUser = resolveNoSnapshotTargetDefaults(a.cfgProvider, noSnapParser, resolvedNodeID, openSSHAlias, canonHost)
-	}
+	fallbackHost, fallbackPort, fallbackUser := a.resolveNoSnapshotPolicyDefaults(parser, resolvedNodeID, openSSHAlias, canonHost, snapErr)
 	pol := EffectivePolicy{
 		nodeID:          resolvedNodeID,
 		snapshot:        snapshot,
@@ -234,7 +256,7 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 		tier1Auth:       tier1Auth,
 		hasTier1Auth:    hasTier1Auth,
 		sessionCtrlOpts: sessionOpts,
-		originalHost:    openSSHSnapshotOriginalHost(resolvedNodeID, snapshot),
+		originalHost:    resolveInitialPolicyOriginalHost(resolvedNodeID, snapshot, snapErr, openSSHAlias),
 		canonicalHost:   canonHost,
 	}
 
@@ -1218,16 +1240,9 @@ func (p EffectivePolicy) controlTargetContext(nodeID string) ssh.TargetContext {
 }
 
 func (p EffectivePolicy) controlTargetContextWithEnv(nodeID string, env ssh.Environment) ssh.TargetContext {
-	origHost := nodeID
-	if p.originalHost != "" {
-		origHost = p.originalHost
-	}
-	if p.hasTier1Auth && validateOpenSSHControlSelector("session original host", p.tier1Auth.OriginalHost) == nil &&
-		strings.TrimSpace(p.tier1Auth.OriginalHost) != "" {
-		origHost = strings.TrimSpace(p.tier1Auth.OriginalHost)
-		if cleanOrig, ok := config.OpenSSHOriginalHost(origHost); ok {
-			origHost = cleanOrig
-		}
+	origHost := p.OriginalHost()
+	if origHost == "" {
+		origHost = nodeID
 	}
 	var (
 		host string
@@ -1783,7 +1798,7 @@ func endpointMatchesOpenSSHAlias(parser *config.OpenSSHParser, nodeEp ssh.Endpoi
 		return true
 	}
 	orig := strings.TrimSpace(config.UnwrapOpenSSHSelector(alias))
-	if orig == "" {
+	if !config.IsPlainOpenSSHHostSelector(orig) {
 		return false
 	}
 	canon = strings.TrimSpace(config.UnwrapOpenSSHSelector(canon))
@@ -1935,7 +1950,7 @@ func (a *SSHAdapter) buildTier4FallbackLookupKeys(
 		appendUnique(true, nodeName)
 	}
 	if fb.hasEP {
-		if openSSHAlias == "" {
+		if openSSHAlias == "" || !parser.HasHost(openSSHAlias) {
 			appendUnique(false, parser.FindConcreteHostsByAddress(fb.ep)...)
 		}
 		if fb.host != "" {

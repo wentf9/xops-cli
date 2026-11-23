@@ -2,10 +2,12 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/wentf9/xops-cli/core/ssh"
 	"github.com/wentf9/xops-cli/pkg/config"
+	"github.com/wentf9/xops-cli/pkg/credential"
 )
 
 // WithEnrollmentProbing enables read-only probing before a new authenticated
@@ -107,16 +109,75 @@ func (a *SSHAdapter) FinalizePendingConnection(ctx context.Context, lease config
 		})
 	}
 
-	confirmed, err := a.confirmWithOptionalProbe(ctx, lease, nodeID, auth, hasOverride, client)
-	if err != nil {
-		return err
-	}
-	if !confirmed {
-		if err := lease.Confirm(ctx); err != nil {
-			return err
+	confirmed, confirmErr := a.confirmWithOptionalProbe(ctx, lease, nodeID, auth, hasOverride, client)
+	if confirmErr != nil {
+		var cleanupErr *credential.CleanupError
+		if !errors.As(confirmErr, &cleanupErr) {
+			return confirmErr
 		}
 	}
-	return a.flushDeferredAuth(ctx, nodeID, client)
+	if !confirmed {
+		if err := a.confirmLeaseWithDisplacedRefCleanup(ctx, lease, nodeID, nil); err != nil {
+			var cleanupErr *credential.CleanupError
+			if !errors.As(err, &cleanupErr) {
+				return err
+			}
+			confirmErr = errors.Join(confirmErr, err)
+		}
+	}
+	if flushErr := a.flushDeferredAuth(ctx, nodeID, client); flushErr != nil {
+		return errors.Join(confirmErr, flushErr)
+	}
+	return confirmErr
+}
+
+func (a *SSHAdapter) preConfirmIdentityRefs(nodeID string) []credential.Ref {
+	if a == nil || a.credentialService == nil || a.cfgProvider == nil || nodeID == "" || !a.isPendingNode(nodeID) {
+		return nil
+	}
+	snap := a.cfgProvider.Snapshot()
+	if snap == nil || snap.Nodes == nil || snap.Identities == nil {
+		return nil
+	}
+	node, ok := snap.Nodes.Get(nodeID)
+	if !ok {
+		return nil
+	}
+	ident, ok := snap.Identities.Get(node.IdentityRef)
+	if !ok {
+		return nil
+	}
+	var refs []credential.Ref
+	if ident.LoginPasswordRef != nil && !ident.LoginPasswordRef.IsEmpty() {
+		refs = append(refs, *ident.LoginPasswordRef)
+	}
+	if ident.PassphraseRef != nil && !ident.PassphraseRef.IsEmpty() {
+		refs = append(refs, *ident.PassphraseRef)
+	}
+	return refs
+}
+
+func (a *SSHAdapter) confirmLeaseWithDisplacedRefCleanup(
+	ctx context.Context,
+	lease config.PendingLease,
+	nodeID string,
+	execCfg *ssh.ExecutionConfig,
+) error {
+	commitConfirm := func(commitCtx context.Context) error {
+		if execCfg != nil {
+			return confirmLeaseWithExecution(commitCtx, lease, execCfg)
+		}
+		return lease.Confirm(commitCtx)
+	}
+	candidateRefs := a.preConfirmIdentityRefs(nodeID)
+	if len(candidateRefs) == 0 {
+		return commitConfirm(ctx)
+	}
+	_, err := a.credentialService.DeleteAssets(ctx, candidateRefs, func(commitCtx context.Context) (credential.MutationOutcome, error) {
+		confirmErr := commitConfirm(commitCtx)
+		return mutationOutcomeFromServiceError(confirmErr), confirmErr
+	})
+	return err
 }
 
 func (a *SSHAdapter) needsEnrollmentProbe(nodeID string, auth SessionAuth, hasOverride bool, client *ssh.Client) (bool, error) {
@@ -160,19 +221,29 @@ func (a *SSHAdapter) confirmWithOptionalProbe(
 		if a.enrollmentProbeWarning != nil {
 			a.enrollmentProbeWarning(nodeID, probeErr)
 		}
-		if err := lease.Confirm(ctx); err != nil {
-			return false, err
+		var confirmCleanupErr error
+		if err := a.confirmLeaseWithDisplacedRefCleanup(ctx, lease, nodeID, nil); err != nil {
+			var cleanupErr *credential.CleanupError
+			if !errors.As(err, &cleanupErr) {
+				return false, err
+			}
+			confirmCleanupErr = err
 		}
 		if tErr := client.TransportError(); tErr != nil {
-			return true, transportInitConnectionError(nodeID, client, tErr)
+			return true, errors.Join(confirmCleanupErr, transportInitConnectionError(nodeID, client, tErr))
 		}
-		return true, nil
+		return true, confirmCleanupErr
 	}
-	if err := confirmLeaseWithExecution(ctx, lease, &result.SuggestedConfig); err != nil {
-		return false, err
+	var confirmCleanupErr error
+	if err := a.confirmLeaseWithDisplacedRefCleanup(ctx, lease, nodeID, &result.SuggestedConfig); err != nil {
+		var cleanupErr *credential.CleanupError
+		if !errors.As(err, &cleanupErr) {
+			return false, err
+		}
+		confirmCleanupErr = err
 	}
 	if tErr := client.TransportError(); tErr != nil {
-		return true, transportInitConnectionError(nodeID, client, tErr)
+		return true, errors.Join(confirmCleanupErr, transportInitConnectionError(nodeID, client, tErr))
 	}
 	// Another connection may have confirmed the pending node while this probe
 	// was running. Adopt only settings actually published by the repository.
@@ -183,7 +254,7 @@ func (a *SSHAdapter) confirmWithOptionalProbe(
 		}
 		client.SetExecution(effectiveExec)
 	}
-	return true, nil
+	return true, confirmCleanupErr
 }
 
 func confirmLeaseWithExecution(ctx context.Context, lease config.PendingLease, execCfg *ssh.ExecutionConfig) error {

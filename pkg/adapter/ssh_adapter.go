@@ -1365,6 +1365,51 @@ func (a *SSHAdapter) UpdateAuth(ctx context.Context, nodeID, authUpdateToken, pa
 	return a.persistAuthentication(ctx, resolvedNodeID, authUpdateToken, password, keyPath, passphrase)
 }
 
+func equalOptionalCredentialRef(a, b *credential.Ref) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func mutationOutcomeFromServiceError(err error) credential.MutationOutcome {
+	if err == nil {
+		return credential.MutationOutcome{Applied: true, Durable: true}
+	}
+	var cleanupErr *credential.CleanupError
+	if errors.As(err, &cleanupErr) {
+		return credential.MutationOutcome{Applied: true, Durable: true}
+	}
+	var durabilityErr *config.DurabilityError
+	if errors.As(err, &durabilityErr) {
+		return credential.MutationOutcome{Applied: true, Durable: false}
+	}
+	return credential.MutationOutcome{}
+}
+
+func (a *SSHAdapter) rotateAuthWithDisplacedCleanup(
+	ctx context.Context,
+	target credential.Target,
+	expectedVersion string,
+	oldRef *credential.Ref,
+	displacedRef *credential.Ref,
+	secret credential.Secret,
+) (string, error) {
+	var nextVersion string
+	commit := func(ctx context.Context) (credential.MutationOutcome, error) {
+		_, nv, rotateErr := a.credentialService.Rotate(ctx, target, expectedVersion, oldRef, a.defaultStoreID(), secret)
+		nextVersion = nv
+		return mutationOutcomeFromServiceError(rotateErr), rotateErr
+	}
+	var err error
+	if displacedRef != nil && !displacedRef.IsEmpty() && !equalOptionalCredentialRef(displacedRef, oldRef) {
+		_, err = a.credentialService.DeleteAssets(ctx, []credential.Ref{*displacedRef}, commit)
+	} else {
+		_, err = commit(ctx)
+	}
+	return nextVersion, err
+}
+
 func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpdateToken, password, keyPath, passphrase string) (string, error) {
 	snapshot, resolvedNodeID, _, _, err := a.resolveConnectionSnapshotResolved(nodeID)
 	if err != nil {
@@ -1372,13 +1417,24 @@ func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpda
 	}
 	version := authUpdateToken
 	if password != "" {
-		ref, nextVersion, rotateErr := a.credentialService.Rotate(ctx,
-			credential.Target{NodeID: resolvedNodeID, Kind: credential.KindLoginPassword},
-			version, snapshot.Identity.LoginPasswordRef, a.defaultStoreID(), credential.Secret{Value: []byte(password)})
-		if rotateErr != nil {
-			return "", fmt.Errorf("persist remembered login password: %w", rotateErr)
+		var displacedRef *credential.Ref
+		if !config.IsHybridAuthType(snapshot.Identity.AuthType) &&
+			snapshot.Identity.PassphraseRef != nil && !snapshot.Identity.PassphraseRef.IsEmpty() {
+			displacedRef = snapshot.Identity.PassphraseRef.Clone()
 		}
-		_ = ref
+		secret := credential.NewSecret([]byte(password))
+		nextVersion, rotateErr := a.rotateAuthWithDisplacedCleanup(
+			ctx,
+			credential.Target{NodeID: resolvedNodeID, Kind: credential.KindLoginPassword},
+			version,
+			snapshot.Identity.LoginPasswordRef,
+			displacedRef,
+			secret,
+		)
+		secret.Zero()
+		if rotateErr != nil {
+			return nextVersion, fmt.Errorf("persist remembered login password: %w", rotateErr)
+		}
 		version = nextVersion
 	}
 	if passphrase != "" {
@@ -1392,11 +1448,23 @@ func (a *SSHAdapter) persistAuthentication(ctx context.Context, nodeID, authUpda
 		if err != nil {
 			return "", err
 		}
-		_, nextVersion, rotateErr := a.credentialService.Rotate(ctx,
+		var displacedRef *credential.Ref
+		if !config.IsHybridAuthType(snapshot.Identity.AuthType) &&
+			snapshot.Identity.LoginPasswordRef != nil && !snapshot.Identity.LoginPasswordRef.IsEmpty() {
+			displacedRef = snapshot.Identity.LoginPasswordRef.Clone()
+		}
+		secret := credential.NewSecret([]byte(passphrase))
+		nextVersion, rotateErr := a.rotateAuthWithDisplacedCleanup(
+			ctx,
 			target,
-			version, snapshot.Identity.PassphraseRef, a.defaultStoreID(), credential.Secret{Value: []byte(passphrase)})
+			version,
+			snapshot.Identity.PassphraseRef,
+			displacedRef,
+			secret,
+		)
+		secret.Zero()
 		if rotateErr != nil {
-			return "", fmt.Errorf("persist remembered private-key passphrase: %w", rotateErr)
+			return nextVersion, fmt.Errorf("persist remembered private-key passphrase: %w", rotateErr)
 		}
 		version = nextVersion
 	}
