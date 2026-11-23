@@ -100,7 +100,7 @@ func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
 		}
 	}
 
-	if p.isPathProtected(input.Paths) && risk < Dangerous {
+	if p.isPathProtected(input.Paths, input.RecursivePaths) && risk < Dangerous {
 		risk = Moderate
 	}
 
@@ -149,7 +149,7 @@ func (p *Policy) thresholdForNode(nodeID string) RiskLevel {
 	return ParseRiskLevel(p.cfg.ApprovalThreshold)
 }
 
-func (p *Policy) isPathProtected(paths []string) bool {
+func (p *Policy) isPathProtected(paths, recursivePaths []string) bool {
 	allProtected := make([]string, 0, len(sensitivePaths)+len(p.cfg.ProtectedPaths))
 	allProtected = append(allProtected, sensitivePaths...)
 	allProtected = append(allProtected, p.cfg.ProtectedPaths...)
@@ -158,6 +158,16 @@ func (p *Policy) isPathProtected(paths []string) bool {
 			if matchesUnder(target, protected) {
 				return true
 			}
+		}
+	}
+	for _, dir := range recursivePaths {
+		for _, protected := range allProtected {
+			if matchesUnder(dir, protected) || matchesUnder(protected, dir) {
+				return true
+			}
+		}
+		if containsSensitiveWindowsPath(dir) {
+			return true
 		}
 	}
 	return false

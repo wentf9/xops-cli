@@ -37,6 +37,7 @@ type Backend struct {
 
 var _ ports.Backend = (*Backend)(nil)
 var _ ports.ExecutionProber = (*Backend)(nil)
+var _ ports.PathInspector = (*Backend)(nil)
 var _ ports.PTYBackend = (*Backend)(nil)
 
 func New(ctx context.Context, options Options) (*Backend, error) {
@@ -143,15 +144,13 @@ func (b *Backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 		}
 	}
 	if command.RequirePOSIX {
-		if plan.LaunchDialect() != ssh.LaunchPOSIX {
-			err = fmt.Errorf("%w: non-POSIX execution dialect %q is not supported; POSIX shell target (X11/Wayland) is required", ssh.ErrExecutionValidation, plan.LaunchDialect())
+		if err := ports.ValidatePOSIXBournePlan(plan, "POSIX shell target (X11/Wayland) is required"); err != nil {
 			result.Outcome = ssh.ExecutionNotStarted
 			result.ExecutionErr = err
 			return result, err
 		}
 	} else if command.Filesystem {
-		if plan.LaunchDialect() != ssh.LaunchPOSIX {
-			err = fmt.Errorf("%w: non-POSIX execution dialect %q is not supported for generated filesystem commands", ssh.ErrExecutionValidation, plan.LaunchDialect())
+		if err := ports.ValidatePOSIXBournePlan(plan, "generated filesystem commands"); err != nil {
 			result.Outcome = ssh.ExecutionNotStarted
 			result.ExecutionErr = err
 			return result, err
@@ -229,6 +228,15 @@ func (b *Backend) Inspect(ctx context.Context, permit ports.Permit, nodeID strin
 	remote := remotefile.New(files)
 	defer func() { retErr = errors.Join(retErr, remote.Close()) }()
 	return remote.Inspect(ctx, request.Path, request.Upload, request.Overwrite)
+}
+
+func (b *Backend) InspectPath(ctx context.Context, permit ports.Permit, nodeID string, request ports.PathInspectRequest) (_ remotefile.PathInspection, retErr error) {
+	files, err := b.openFiles(ctx, permit, nodeID, ports.Inspect, ports.Execute)
+	if err != nil {
+		return remotefile.PathInspection{}, err
+	}
+	defer func() { retErr = errors.Join(retErr, files.Close()) }()
+	return remotefile.InspectPath(ctx, files, request.Path)
 }
 
 func (b *Backend) OpenTransfer(ctx context.Context, permit ports.Permit, nodeID string) (ports.TransferSession, error) {

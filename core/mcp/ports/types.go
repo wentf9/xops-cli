@@ -192,6 +192,18 @@ type InspectRequest struct {
 	Overwrite bool
 }
 
+// PathInspectRequest describes a read-only SFTP path canonicalization query.
+type PathInspectRequest struct {
+	Path string
+}
+
+// PathInspector is an optional read-only SFTP metadata capability. It accepts
+// an Inspect (or Execute) permit and performs only RealPath/Lstat/Stat/ReadLink
+// queries without reading or mutating remote file data.
+type PathInspector interface {
+	InspectPath(context.Context, Permit, string, PathInspectRequest) (remotefile.PathInspection, error)
+}
+
 // FileSession uses the existing SFTP API while carrying a connection lease and
 // permit lifetime. It deliberately does not expose the shared SSH transport.
 type FileSession interface {

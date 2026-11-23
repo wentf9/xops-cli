@@ -38,7 +38,8 @@ func OpenObjectHandleNoFollow(path string, desiredAccess uint32) (windows.Handle
 	if strings.TrimSpace(path) == "" {
 		return windows.InvalidHandle, InvalidFileAttributes, errors.New("path is empty")
 	}
-	pathPtr, err := windows.UTF16PtrFromString(path)
+	safePath := normalizeWin32LongPath(path)
+	pathPtr, err := windows.UTF16PtrFromString(safePath)
 	if err != nil {
 		return windows.InvalidHandle, InvalidFileAttributes, fmt.Errorf("encode Windows path %q: %w", path, err)
 	}

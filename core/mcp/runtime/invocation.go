@@ -161,46 +161,46 @@ func resolveExecutionRisk(input guardrail.RiskInput, target ports.Target) (guard
 	return input, nil
 }
 
-func (r *Runtime) prepareExecution(ctx context.Context, g *guardrail.Guardrail, view ports.OperationSnapshot, tool string, input any, risk guardrail.RiskInput, target ports.Target) (_ guardrail.RiskInput, _ ports.Target, probed bool, retErr error) {
+func (r *Runtime) prepareExecution(ctx context.Context, g *guardrail.Guardrail, view ports.OperationSnapshot, tool string, input any, risk guardrail.RiskInput, target ports.Target) (_ guardrail.RiskInput, _ ports.Target, _ *ssh.ProbeResult, probed bool, preflightDenied bool, retErr error) {
 	effective, err := resolveTargetExecution(risk.Execution, target.Execution)
 	if err != nil {
-		return risk, target, false, err
+		return risk, target, nil, false, false, err
 	}
 	prober, supported := r.backend.(ports.ExecutionProber)
 	if !supported || !ssh.NeedsExecutionProbe(effective) {
-		return risk, target, false, nil
+		return risk, target, nil, false, false, nil
 	}
 	work, op, err := r.operationContext(ctx, view, tool, input)
 	if err != nil {
-		return risk, target, false, err
+		return risk, target, nil, false, false, err
 	}
 	// Hard policy denials must not cause even discovery traffic. Unknown shell
 	// syntax stays conservative until the fixed probe supplies trusted metadata.
 	preflight := risk
 	preflight.Dialect = string(ssh.LaunchUnknown)
 	if g != nil && g.EvaluateContext(work, preflight) == guardrail.Deny {
-		return risk, target, false, nil
+		return risk, target, nil, false, true, nil
 	}
 	permission, err := r.enter(work, view, op.binding, ports.Inspect, "")
 	if err != nil {
-		return risk, target, false, err
+		return risk, target, nil, false, false, err
 	}
 	defer func() { retErr = errors.Join(retErr, permission.Close()) }()
 	result, err := prober.ProbeExecution(work, permission, risk.NodeID)
 	if err != nil {
-		return risk, target, false, fmt.Errorf("prepare MCP execution: %w", err)
+		return risk, target, nil, false, false, fmt.Errorf("prepare MCP execution: %w", err)
 	}
 	if !isValidProbeResult(result) {
-		return risk, target, false, fmt.Errorf("%w: incomplete MCP execution probe", ssh.ErrExecutionProbe)
+		return risk, target, nil, false, false, fmt.Errorf("%w: incomplete MCP execution probe", ssh.ErrExecutionProbe)
 	}
 	if err := result.SuggestedConfig.Validate(); err != nil {
-		return risk, target, false, err
+		return risk, target, nil, false, false, err
 	}
 	risk.Execution = result.SuggestedConfig.Clone()
 	// Use discovered metadata only for this operation's risk evaluation. Keep
 	// the source snapshot/version intact so admission can still detect edits.
 	target.Execution = risk.Execution.Clone()
-	return risk, target, true, nil
+	return risk, target, result, true, false, nil
 }
 
 func validateOperationInput[In any](input In, ri guardrail.RiskInput) error {
@@ -215,24 +215,57 @@ func validateOperationInput[In any](input In, ri guardrail.RiskInput) error {
 	return nil
 }
 
-func (r *Runtime) prepareAndResolveExecution(ctx context.Context, g *guardrail.Guardrail, view ports.OperationSnapshot, tool string, input any, ri guardrail.RiskInput, target ports.Target) (guardrail.RiskInput, bool, error) {
-	hasPersistentCwd := false
-	if ri.ToolName == "terminal" {
-		if in, ok := input.(TerminalInput); ok {
-			hasPersistentCwd = isPersistentSession(in.Session) && in.Cwd != ""
-		} else if in, ok := input.(*TerminalInput); ok && in != nil {
-			hasPersistentCwd = in.Cwd != "" && isPersistentSession(in.Session)
-		} else if ri.Action == riskActionShell && len(ri.Paths) > 0 {
-			hasPersistentCwd = true
+func resolveGUIExecution(ri guardrail.RiskInput, target ports.Target, probeResult *ssh.ProbeResult, probed bool) (guardrail.RiskInput, ports.Target, error) {
+	var (
+		posixExec *ssh.ExecutionConfig
+		err       error
+	)
+	if probed {
+		posixExec, err = ports.ResolvePOSIXBourneExecutionFromProbe(probeResult)
+	} else {
+		effective, execErr := resolveTargetExecution(ri.Execution, target.Execution)
+		if execErr != nil {
+			return ri, target, execErr
 		}
+		posixExec, err = ports.ResolvePOSIXBourneExecution(effective)
 	}
+	if err != nil {
+		return ri, target, err
+	}
+	ri.Execution = posixExec.Clone()
+	target.Execution = posixExec.Clone()
+	return ri, target, nil
+}
+
+func hasPersistentTerminalCwd(input any, ri guardrail.RiskInput) bool {
+	if ri.ToolName != "terminal" {
+		return false
+	}
+	if in, ok := input.(TerminalInput); ok {
+		return isPersistentSession(in.Session) && in.Cwd != ""
+	}
+	if in, ok := input.(*TerminalInput); ok && in != nil {
+		return in.Cwd != "" && isPersistentSession(in.Session)
+	}
+	return ri.Action == riskActionShell && len(ri.Paths) > 0
+}
+
+func (r *Runtime) prepareAndResolveExecution(ctx context.Context, g *guardrail.Guardrail, view ports.OperationSnapshot, tool string, input any, ri guardrail.RiskInput, target ports.Target) (guardrail.RiskInput, bool, error) {
+	hasPersistentCwd := hasPersistentTerminalCwd(input, ri)
 	isSignal := ri.ToolName == "terminal" && ri.Action == riskActionShell && session.IsSignalCommand(ri.Command)
-	if isSignal || ri.Action == riskActionPoll || (strings.TrimSpace(ri.Command) == "" && !hasPersistentCwd) {
+	isGUI := ri.ToolName == "gui"
+	if isSignal || ri.Action == riskActionPoll || (strings.TrimSpace(ri.Command) == "" && !hasPersistentCwd && !isGUI) {
 		return ri, false, nil
 	}
-	ri, target, probed, err := r.prepareExecution(ctx, g, view, tool, input, ri, target)
+	ri, target, probeResult, probed, preflightDenied, err := r.prepareExecution(ctx, g, view, tool, input, ri, target)
 	if err != nil {
 		return ri, false, err
+	}
+	if isGUI && !preflightDenied {
+		ri, target, err = resolveGUIExecution(ri, target, probeResult, probed)
+		if err != nil {
+			return ri, false, err
+		}
 	}
 	ri, err = resolveExecutionRisk(ri, target)
 	if err != nil {

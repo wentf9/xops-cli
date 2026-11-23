@@ -54,6 +54,32 @@ func (g *Guardrail) consumeApprovalResponse(ctx context.Context, req *mcp.CallTo
 	return err
 }
 
+func supportsFormElicitation(init *mcp.InitializeParams) bool {
+	return init != nil &&
+		init.Capabilities != nil &&
+		init.Capabilities.Elicitation != nil &&
+		(init.Capabilities.Elicitation.Form != nil || init.Capabilities.Elicitation.URL == nil)
+}
+
+// HasMatchingPendingApproval reports whether req carries a non-expired
+// two-step approval challenge bound to the exact session, risk, context,
+// complete input, and policy binding. It does not mutate pending state.
+func (g *Guardrail) HasMatchingPendingApproval(ctx context.Context, req *mcp.CallToolRequest, ri RiskInput, input any) (bool, error) {
+	if g == nil || req == nil || req.Session == nil || req.Params == nil || req.Params.RequestState == "" {
+		return false, nil
+	}
+	_, _, binding := g.invocation(ctx)
+	digest, err := approvalBindingDigest(Classify(ri), ri, input, binding)
+	if err != nil {
+		return false, err
+	}
+	now := time.Now()
+	g.approvalMu.Lock()
+	defer g.approvalMu.Unlock()
+	pending, ok := g.pendingApprovals[req.Params.RequestState]
+	return ok && now.Before(pending.expires) && pending.session == req.Session && pending.digest == digest, nil
+}
+
 // requestToolApproval binds a single-use challenge to the full typed input,
 // tool, risk and session. No remote effect happens before it is consumed.
 func (g *Guardrail) requestToolApproval(ctx context.Context, req *mcp.CallToolRequest, risk RiskLevel, ri RiskInput, input any) (*mcp.CallToolResult, error) {
@@ -66,9 +92,15 @@ func (g *Guardrail) requestToolApproval(ctx context.Context, req *mcp.CallToolRe
 	_, fallback, binding := g.invocation(ctx)
 	init := req.Session.InitializeParams()
 	if init == nil || init.ProtocolVersion < "2026-07-28" {
+		if hasApprovalRoundTripParams(req) {
+			return nil, g.consumeApprovalResponse(ctx, req, risk, ri, input)
+		}
 		return nil, RequestApproval(ctx, req.Session, risk, ri, fallback)
 	}
-	if init.Capabilities == nil || init.Capabilities.Elicitation == nil || (init.Capabilities.Elicitation.Form == nil && init.Capabilities.Elicitation.URL != nil) {
+	if !supportsFormElicitation(init) {
+		if hasApprovalRoundTripParams(req) {
+			return nil, g.consumeApprovalResponse(ctx, req, risk, ri, input)
+		}
 		return nil, applyFallback(fmt.Errorf("client does not support form approval"), risk, fallback)
 	}
 	if req.Params == nil {

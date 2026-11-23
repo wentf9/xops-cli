@@ -118,7 +118,7 @@ func IsTrustedPrincipalSID(sid, currentUserSID *windows.SID) bool {
 
 // GetFileAttributesNoFollow queries Win32 file attributes without traversing reparse points.
 func GetFileAttributesNoFollow(path string) (uint32, bool) {
-	pathPtr, err := windows.UTF16PtrFromString(path)
+	pathPtr, err := windows.UTF16PtrFromString(normalizeWin32LongPath(path))
 	if err != nil {
 		return windows.INVALID_FILE_ATTRIBUTES, false
 	}
@@ -410,7 +410,7 @@ func EnsureOwnerOnlyDirectory(dirPath string) error {
 		}
 		for i := len(toCreate) - 1; i >= 0; i-- {
 			dir := toCreate[i]
-			dirPtr, ptrErr := windows.UTF16PtrFromString(dir)
+			dirPtr, ptrErr := windows.UTF16PtrFromString(normalizeWin32LongPath(dir))
 			if ptrErr != nil {
 				return fmt.Errorf("encode control socket directory %q failed: %w", dir, ptrErr)
 			}

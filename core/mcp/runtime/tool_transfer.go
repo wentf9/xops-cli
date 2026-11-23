@@ -115,54 +115,292 @@ func validateStdioLocalPath(raw string) (string, error) {
 	return cleaned, nil
 }
 
-func (r *Runtime) stdioTransferHandler(ctx context.Context, _ *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
-	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" || input.Direction == "" {
-		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, direction, localPath, and remotePath are required")
+type boundStdioTransferInput struct {
+	Input          TransferFileInput
+	ResolvedPaths  []string
+	RecursivePaths []string
+}
+
+func stdioTransferLexicalPaths(in TransferFileInput) []string {
+	normRemote := riskRemotePath(in.RemotePath)
+	if in.LocalPath != "" {
+		return []string{riskLocalPath(in.LocalPath), normRemote}
 	}
+	return []string{normRemote}
+}
+
+func (r *Runtime) expandPushPaths(
+	ctx context.Context,
+	view ports.OperationSnapshot,
+	binding ports.Binding,
+	canonicalNodeID string,
+	validLocal, validRemote string,
+	localInfo localPathInspection,
+	remoteInfo remotefile.PathInspection,
+) ([]string, []string, error) {
+	if localInfo.isDir {
+		recursive := []string{localInfo.canonicalPath, validLocal, remoteInfo.CanonicalPath, validRemote}
+		nestedTargets, err := collectLocalPushSymlinkTargets(localInfo.canonicalPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nestedTargets, recursive, nil
+	}
+	if !remoteInfo.IsDir {
+		return nil, nil, nil
+	}
+	var extra []string
+	for _, base := range mergeUniquePaths([]string{filepath.Base(validLocal), filepath.Base(localInfo.canonicalPath)}) {
+		expandedRemote := path.Join(remoteInfo.CanonicalPath, base)
+		extra = append(extra, expandedRemote)
+		expInfo, expErr := r.inspectRemotePath(ctx, view, binding, canonicalNodeID, expandedRemote)
+		if expErr != nil {
+			return nil, nil, expErr
+		}
+		extra = append(extra, expInfo.CanonicalPath)
+		extra = append(extra, expInfo.ExtraPaths...)
+	}
+	return extra, nil, nil
+}
+
+func expandPullPaths(
+	validLocal, validRemote string,
+	localInfo localPathInspection,
+	remoteInfo remotefile.PathInspection,
+) ([]string, []string, error) {
+	if remoteInfo.IsDir {
+		return nil, []string{remoteInfo.CanonicalPath, validRemote, localInfo.canonicalPath, validLocal}, nil
+	}
+	if !localInfo.isDir {
+		return nil, nil, nil
+	}
+	var extra []string
+	for _, base := range mergeUniquePaths([]string{path.Base(validRemote), path.Base(remoteInfo.CanonicalPath)}) {
+		if base == "" || base == "." || base == "/" {
+			continue
+		}
+		expandedLocal := filepath.Clean(filepath.Join(localInfo.canonicalPath, base))
+		extra = append(extra, expandedLocal)
+		expLocal, expErr := canonicalizeLocalPath(expandedLocal)
+		if expErr != nil {
+			return nil, nil, expErr
+		}
+		extra = append(extra, expLocal.canonicalPath)
+		extra = append(extra, expLocal.extraPaths...)
+	}
+	return extra, nil, nil
+}
+
+func (r *Runtime) inspectStdioTransferScope(
+	ctx context.Context,
+	view ports.OperationSnapshot,
+	binding ports.Binding,
+	canonicalNodeID string,
+	input TransferFileInput,
+	lexicalPaths []string,
+	validLocal, validRemote string,
+) (localPathInspection, remotefile.PathInspection, guardrail.RiskInput, boundStdioTransferInput, error) {
+	localInfo, err := canonicalizeLocalPath(validLocal)
+	if err != nil {
+		return localPathInspection{}, remotefile.PathInspection{}, guardrail.RiskInput{}, boundStdioTransferInput{}, err
+	}
+	remoteInfo, err := r.inspectRemotePath(ctx, view, binding, canonicalNodeID, validRemote)
+	if err != nil {
+		return localPathInspection{}, remotefile.PathInspection{}, guardrail.RiskInput{}, boundStdioTransferInput{}, err
+	}
+
+	var extraPaths, recursivePaths []string
+	if remoteInfo.ParentPath != "" && !remotefile.IsRootPath(validRemote) {
+		extraPaths = append(extraPaths, path.Join(remoteInfo.ParentPath, path.Base(validRemote)))
+	}
+	var dirExtra, dirRecursive []string
+	if input.Direction == "push" {
+		dirExtra, dirRecursive, err = r.expandPushPaths(ctx, view, binding, canonicalNodeID, validLocal, validRemote, localInfo, remoteInfo)
+	} else {
+		dirExtra, dirRecursive, err = expandPullPaths(validLocal, validRemote, localInfo, remoteInfo)
+	}
+	if err != nil {
+		return localPathInspection{}, remotefile.PathInspection{}, guardrail.RiskInput{}, boundStdioTransferInput{}, err
+	}
+	extraPaths = append(extraPaths, dirExtra...)
+	recursivePaths = mergeUniquePaths(dirRecursive)
+
+	resolvedPaths := mergeUniquePaths(
+		lexicalPaths,
+		[]string{validLocal, localInfo.canonicalPath},
+		localInfo.extraPaths,
+		[]string{validRemote, remoteInfo.CanonicalPath},
+		remoteInfo.ExtraPaths,
+		extraPaths,
+	)
+	effectiveRI := guardrail.RiskInput{
+		ToolName:       "transfer",
+		Action:         input.Direction,
+		NodeID:         canonicalNodeID,
+		Paths:          resolvedPaths,
+		RecursivePaths: recursivePaths,
+	}
+	boundEff := boundStdioTransferInput{
+		Input:          input,
+		ResolvedPaths:  resolvedPaths,
+		RecursivePaths: recursivePaths,
+	}
+	return localInfo, remoteInfo, effectiveRI, boundEff, nil
+}
+
+func validateStdioTransferPaths(input TransferFileInput) (string, string, error) {
 	if input.Direction != "push" && input.Direction != "pull" {
-		return nil, TransferFileOutput{}, fmt.Errorf("unsupported transfer direction %q (expected push or pull)", input.Direction)
+		return "", "", fmt.Errorf("unsupported transfer direction %q (expected push or pull)", input.Direction)
 	}
 	validLocal, err := validateStdioLocalPath(input.LocalPath)
 	if err != nil {
-		return nil, TransferFileOutput{}, err
+		return "", "", err
 	}
-	input.LocalPath = validLocal
-
 	validRemote, err := validateRemoteFilePath(input.RemotePath)
 	if err != nil || remotefile.IsRootPath(validRemote) {
-		return nil, TransferFileOutput{}, errors.New("remotePath must be an absolute non-root file path")
+		return "", "", errors.New("remotePath must be an absolute non-root file path")
 	}
-	input.RemotePath = validRemote
+	return validLocal, validRemote, nil
+}
 
-	sftpClient, err := r.getMCPSFTPClient(ctx, input.NodeID)
+func (r *Runtime) stdioTransferHandler(parent context.Context, req *mcp.CallToolRequest, input TransferFileInput) (_ *mcp.CallToolResult, _ TransferFileOutput, handlerErr error) {
+	ctx, cancel := r.toolContext(parent)
+	defer cancel()
+	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" || input.Direction == "" {
+		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, direction, localPath, and remotePath are required")
+	}
+	view, err := r.resolve(ctx, []string{input.NodeID})
 	if err != nil {
 		return nil, TransferFileOutput{}, err
 	}
-	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
-
-	switch input.Direction {
-	case "push":
-		if err := sftpClient.Upload(ctx, input.LocalPath, input.RemotePath, nil); err != nil {
-			return nil, TransferFileOutput{}, fmt.Errorf("push failed: %w", err)
-		}
-	case "pull":
-		remotePath, parseErr := sftp.ParseRemotePath(input.RemotePath)
-		if parseErr != nil {
-			return nil, TransferFileOutput{}, fmt.Errorf("pull failed: %w", parseErr)
-		}
-		localDest, destErr := sftp.LocalDestPath(input.LocalPath)
-		if destErr != nil {
-			return nil, TransferFileOutput{}, fmt.Errorf("pull failed: %w", destErr)
-		}
-		if err := sftpClient.Download(ctx, remotePath, localDest, sftp.DownloadOptions{}); err != nil {
-			return nil, TransferFileOutput{}, fmt.Errorf("pull failed: %w", err)
-		}
+	canonicalNodeID, _, err := view.Resolve(input.NodeID)
+	if err != nil {
+		return nil, TransferFileOutput{}, err
 	}
 
-	return nil, TransferFileOutput{
+	lexicalPaths := stdioTransferLexicalPaths(input)
+	lexicalRI := guardrail.RiskInput{
+		ToolName: "transfer",
+		Action:   input.Direction,
+		NodeID:   canonicalNodeID,
+		Paths:    lexicalPaths,
+	}
+	boundLex := boundStdioTransferInput{Input: input, ResolvedPaths: lexicalPaths}
+	_, lexOp, preAuth, pending, err := r.authorizeLexicalPrecheck(ctx, req, view, "transfer", lexicalRI, boundLex)
+	if err != nil || pending != nil {
+		return pending, TransferFileOutput{}, err
+	}
+
+	validLocal, validRemote, err := validateStdioTransferPaths(input)
+	if err != nil {
+		return nil, TransferFileOutput{}, err
+	}
+	localInfo, remoteInfo, effectiveRI, boundEff, err := r.inspectStdioTransferScope(
+		ctx, view, lexOp.binding, canonicalNodeID, input, lexicalPaths, validLocal, validRemote,
+	)
+	if err != nil {
+		return nil, TransferFileOutput{}, err
+	}
+
+	opCtx, op, opID, pending, err := r.authorizeCanonicalScope(
+		ctx, req, view, "transfer", lexicalRI, preAuth, effectiveRI, boundEff,
+	)
+	if err != nil || pending != nil {
+		return pending, TransferFileOutput{}, err
+	}
+
+	permission, err := r.enter(opCtx, op.snapshot, op.binding, ports.Execute, opID)
+	if err != nil {
+		return nil, TransferFileOutput{}, err
+	}
+	defer func() { handlerErr = errors.Join(handlerErr, permission.Close()) }()
+	admitted, stop, err := ports.WorkContext(opCtx, permission, ports.Execute)
+	if err != nil {
+		return nil, TransferFileOutput{}, err
+	}
+	defer stop()
+
+	sftpClient, err := r.backend.OpenFiles(admitted, permission, canonicalNodeID)
+	if err != nil {
+		res, outErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, err)
+		return res, TransferFileOutput{}, outErr
+	}
+	defer joinCloseError(&handlerErr, sftpClient, "sftp client")
+
+	execErr := executeStdioTransfer(admitted, sftpClient, input.Direction, validLocal, validRemote, localInfo, remoteInfo)
+	res, finalErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, execErr)
+	if finalErr != nil {
+		return res, TransferFileOutput{}, finalErr
+	}
+	return res, TransferFileOutput{
 		Direction: input.Direction,
 		Status:    "success",
 	}, nil
+}
+
+func executeStdioTransfer(
+	ctx context.Context,
+	sftpClient ports.FileSession,
+	direction string,
+	validLocal string,
+	validRemote string,
+	expectedLocal localPathInspection,
+	expectedRemote remotefile.PathInspection,
+) error {
+	curLocal, err := canonicalizeLocalPath(validLocal)
+	if err != nil {
+		return err
+	}
+	if curLocal.canonicalPath != expectedLocal.canonicalPath || curLocal.isDir != expectedLocal.isDir {
+		return errors.New("local transfer path resolution changed since authorization")
+	}
+	curRemote, err := remotefile.InspectPath(ctx, sftpClient, validRemote)
+	if err != nil {
+		return err
+	}
+	if curRemote.CanonicalPath != expectedRemote.CanonicalPath || curRemote.ParentPath != expectedRemote.ParentPath || curRemote.IsDir != expectedRemote.IsDir {
+		return errors.New("remote transfer path resolution changed since authorization")
+	}
+
+	switch direction {
+	case "push":
+		localSrc := validLocal
+		remoteDst := validRemote
+		if !curRemote.IsDir {
+			localSrc = curLocal.canonicalPath
+			if curRemote.CanonicalPath != "" {
+				remoteDst = curRemote.CanonicalPath
+			}
+		} else if curRemote.CanonicalPath != "" {
+			remoteDst = curRemote.CanonicalPath
+		}
+		if err := sftpClient.Upload(ctx, localSrc, remoteDst, nil); err != nil {
+			return fmt.Errorf("push failed: %w", err)
+		}
+	case "pull":
+		remoteSrc := validRemote
+		localDst := validLocal
+		if !curLocal.isDir {
+			if curRemote.CanonicalPath != "" {
+				remoteSrc = curRemote.CanonicalPath
+			}
+			localDst = curLocal.canonicalPath
+		} else if curLocal.canonicalPath != "" {
+			localDst = curLocal.canonicalPath
+		}
+		remotePath, parseErr := sftp.ParseRemotePath(remoteSrc)
+		if parseErr != nil {
+			return fmt.Errorf("pull failed: %w", parseErr)
+		}
+		localDest, destErr := sftp.LocalDestPath(localDst)
+		if destErr != nil {
+			return fmt.Errorf("pull failed: %w", destErr)
+		}
+		if err := sftpClient.Download(ctx, remotePath, localDest, sftp.DownloadOptions{}); err != nil {
+			return fmt.Errorf("pull failed: %w", err)
+		}
+	}
+	return nil
 }
 
 // HTTPTransferInput is the polymorphic HTTP out-of-band transfer tool input.
@@ -614,21 +852,7 @@ func (r *Runtime) registerTransfer(server *mcp.Server, g *guardrail.Guardrail) {
 			Description: "Transfer files or directories between the local MCP host and a managed remote SSH node via SFTP. Directions: 'push' (local to remote) or 'pull' (remote to local).",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &notDestructive},
 		},
-		withOperation(r, g, "transfer",
-			func(in TransferFileInput) guardrail.RiskInput {
-				normRemote := riskRemotePath(in.RemotePath)
-				paths := []string{normRemote}
-				if in.LocalPath != "" {
-					paths = []string{riskLocalPath(in.LocalPath), normRemote}
-				}
-				return guardrail.RiskInput{
-					Action: in.Direction,
-					NodeID: in.NodeID,
-					Paths:  paths,
-				}
-			},
-			r.stdioTransferHandler,
-		),
+		r.stdioTransferHandler,
 	)
 }
 

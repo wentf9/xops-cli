@@ -45,20 +45,21 @@ func ParseRiskLevel(s string) RiskLevel {
 // RiskInput carries contextual information about a single tool invocation
 // for risk assessment.
 type RiskInput struct {
-	ToolName   string
-	Action     string // polymorphic sub-action (e.g. read/write/patch/stat, push/pull, create/list/status/stop)
-	NodeID     string
-	NodeIDs    []string // additional canonical nodes covered by a batch operation
-	Command    string   // populated for terminal command execution
-	Text       string   // keystrokes typed into a remote GUI session (gui type)
-	Paths      []string // file/directory paths involved
-	Sudo       bool     // whether sudo is requested
-	Details    string   // deferred-operation size, digest and overwrite information
-	TunnelMode string   // local, remote, or dynamic SSH forwarding
-	ListenHost string   // normalized IP literal, never resolved through DNS
-	Execution  *ssh.ExecutionConfig
-	Dialect    string
-	PlanDigest string
+	ToolName       string
+	Action         string // polymorphic sub-action (e.g. read/write/patch/stat, push/pull, create/list/status/stop)
+	NodeID         string
+	NodeIDs        []string // additional canonical nodes covered by a batch operation
+	Command        string   // populated for terminal command execution
+	Text           string   // keystrokes typed into a remote GUI session (gui type)
+	Paths          []string // file/directory paths involved
+	RecursivePaths []string // directory paths accessed recursively (checked for protected descendants)
+	Sudo           bool     // whether sudo is requested
+	Details        string   // deferred-operation size, digest and overwrite information
+	TunnelMode     string   // local, remote, or dynamic SSH forwarding
+	ListenHost     string   // normalized IP literal, never resolved through DNS
+	Execution      *ssh.ExecutionConfig
+	Dialect        string
+	PlanDigest     string
 }
 
 // Classify returns the effective risk level for a tool invocation.
@@ -67,7 +68,13 @@ func Classify(input RiskInput) RiskLevel {
 
 	pathRisk := AnalyzePaths(input.Paths)
 	if pathRisk > base {
-		return pathRisk
+		base = pathRisk
+	}
+	if len(input.RecursivePaths) > 0 {
+		recRisk := AnalyzeRecursivePaths(input.RecursivePaths)
+		if recRisk > base {
+			base = recRisk
+		}
 	}
 	return base
 }

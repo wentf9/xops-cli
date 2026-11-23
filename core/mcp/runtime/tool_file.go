@@ -75,12 +75,20 @@ type fileSnapshot struct {
 }
 
 type replacePreset struct {
-	mode      os.FileMode
-	existed   bool
-	canAtomic bool
-	hasOwner  bool
-	uid       uint32
-	gid       uint32
+	mode         os.FileMode
+	existed      bool
+	canAtomic    bool
+	hasOwner     bool
+	uid          uint32
+	gid          uint32
+	resolvedName string
+	resolvedDir  string
+}
+
+type boundFileInput struct {
+	Input          FileInput
+	ResolvedPaths  []string
+	RecursivePaths []string
 }
 
 var errPreserveOwnerFallback = errors.New("cannot preserve original file ownership on temporary file")
@@ -115,48 +123,173 @@ func validateRemoteFilePath(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
-func (r *Runtime) fileHandler(ctx context.Context, _ *mcp.CallToolRequest, input FileInput) (_ *mcp.CallToolResult, _ FileOutput, handlerErr error) {
-	if input.NodeID == "" || input.Path == "" || input.Action == "" {
-		return nil, FileOutput{}, errors.New("nodeID, action, and path are required")
-	}
+func validateFileActionInput(input FileInput) (string, error) {
 	switch input.Action {
 	case "read", "write", "patch", "stat":
 	default:
-		return nil, FileOutput{}, fmt.Errorf("unsupported file action %q (expected read, write, patch, or stat)", input.Action)
+		return "", fmt.Errorf("unsupported file action %q (expected read, write, patch, or stat)", input.Action)
 	}
 	validPath, err := validateRemoteFilePath(input.Path)
 	if err != nil {
-		return nil, FileOutput{}, err
+		return "", err
 	}
-	input.Path = validPath
-	if input.Action != "stat" && remotefile.IsRootPath(input.Path) {
+	if input.Action != "stat" && remotefile.IsRootPath(validPath) {
 		if input.Action == "read" {
-			return nil, FileOutput{}, errors.New("cannot read root directory as a file")
+			return "", errors.New("cannot read root directory as a file")
 		}
-		return nil, FileOutput{}, errors.New("cannot replace root directory")
+		return "", errors.New("cannot replace root directory")
 	}
+	if input.Action == "read" {
+		if _, err := validateReadInput(FileInput{Path: validPath, Range: input.Range}); err != nil {
+			return "", err
+		}
+	}
+	if input.Action == "patch" && input.Content == "" {
+		return "", errors.New("patch action requires non-empty content with <<<< ==== >>>> blocks")
+	}
+	return validPath, nil
+}
 
-	files, err := r.getMCPSFTPClient(ctx, input.NodeID)
+func buildFileEffectiveScope(
+	canonicalNodeID string,
+	input FileInput,
+	lexicalPaths []string,
+	validPath string,
+	inspectRes remotefile.PathInspection,
+) (guardrail.RiskInput, boundFileInput, string) {
+	var parentJoined string
+	if inspectRes.ParentPath != "" && !remotefile.IsRootPath(validPath) {
+		parentJoined = path.Join(inspectRes.ParentPath, path.Base(validPath))
+	}
+	resolvedPaths := mergeUniquePaths(
+		lexicalPaths,
+		[]string{validPath, inspectRes.CanonicalPath, parentJoined},
+		inspectRes.ExtraPaths,
+	)
+	var recursivePaths []string
+	if input.Action == "stat" && inspectRes.IsDir {
+		recursivePaths = mergeUniquePaths([]string{inspectRes.CanonicalPath, validPath})
+	}
+	effectiveRI := guardrail.RiskInput{
+		ToolName:       "file",
+		Action:         input.Action,
+		NodeID:         canonicalNodeID,
+		Paths:          resolvedPaths,
+		RecursivePaths: recursivePaths,
+	}
+	boundEff := boundFileInput{
+		Input:          input,
+		ResolvedPaths:  resolvedPaths,
+		RecursivePaths: recursivePaths,
+	}
+	return effectiveRI, boundEff, parentJoined
+}
+
+func (r *Runtime) fileHandler(parent context.Context, req *mcp.CallToolRequest, input FileInput) (_ *mcp.CallToolResult, _ FileOutput, handlerErr error) {
+	ctx, cancel := r.toolContext(parent)
+	defer cancel()
+	if input.NodeID == "" || input.Path == "" || input.Action == "" {
+		return nil, FileOutput{}, errors.New("nodeID, action, and path are required")
+	}
+	view, err := r.resolve(ctx, []string{input.NodeID})
 	if err != nil {
 		return nil, FileOutput{}, err
+	}
+	canonicalNodeID, _, err := view.Resolve(input.NodeID)
+	if err != nil {
+		return nil, FileOutput{}, err
+	}
+
+	lexicalPaths := []string{riskRemotePath(input.Path)}
+	lexicalRI := guardrail.RiskInput{
+		ToolName: "file",
+		Action:   input.Action,
+		NodeID:   canonicalNodeID,
+		Paths:    lexicalPaths,
+	}
+	boundLex := boundFileInput{Input: input, ResolvedPaths: lexicalPaths}
+	_, lexOp, preAuth, pending, err := r.authorizeLexicalPrecheck(ctx, req, view, "file", lexicalRI, boundLex)
+	if err != nil || pending != nil {
+		return pending, FileOutput{}, err
+	}
+
+	validPath, err := validateFileActionInput(input)
+	if err != nil {
+		return nil, FileOutput{}, err
+	}
+	inspectRes, err := r.inspectRemotePath(ctx, view, lexOp.binding, canonicalNodeID, validPath)
+	if err != nil {
+		return nil, FileOutput{}, err
+	}
+	effectiveRI, boundEff, parentJoined := buildFileEffectiveScope(canonicalNodeID, input, lexicalPaths, validPath, inspectRes)
+
+	opCtx, op, opID, pending, err := r.authorizeCanonicalScope(
+		ctx, req, view, "file", lexicalRI, preAuth, effectiveRI, boundEff,
+	)
+	if err != nil || pending != nil {
+		return pending, FileOutput{}, err
+	}
+
+	permission, err := r.enter(opCtx, op.snapshot, op.binding, ports.Execute, opID)
+	if err != nil {
+		return nil, FileOutput{}, err
+	}
+	defer func() { handlerErr = errors.Join(handlerErr, permission.Close()) }()
+	admitted, stop, err := ports.WorkContext(opCtx, permission, ports.Execute)
+	if err != nil {
+		return nil, FileOutput{}, err
+	}
+	defer stop()
+
+	files, err := r.backend.OpenFiles(admitted, permission, canonicalNodeID)
+	if err != nil {
+		res, outErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, err)
+		return res, FileOutput{}, outErr
 	}
 	defer joinCloseError(&handlerErr, files, "sftp client")
 
-	var out FileOutput
+	execInput := input
+	execInput.NodeID = canonicalNodeID
+	execInput.Path = validPath
+
+	out, execErr := executeFileAction(admitted, files, execInput, inspectRes, parentJoined)
+	res, finalErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, execErr)
+	if finalErr != nil {
+		return res, FileOutput{}, finalErr
+	}
+	return res, out, nil
+}
+
+func executeFileAction(
+	ctx context.Context,
+	files ports.FileSession,
+	input FileInput,
+	expected remotefile.PathInspection,
+	expectedParentJoined string,
+) (FileOutput, error) {
+	current, err := remotefile.InspectPath(ctx, files, input.Path)
+	if err != nil {
+		return FileOutput{}, err
+	}
+	if current.CanonicalPath != expected.CanonicalPath || current.ParentPath != expected.ParentPath {
+		return FileOutput{}, errors.New("remote file path resolution changed since authorization")
+	}
+
 	switch input.Action {
 	case "read":
-		out, err = fileRead(ctx, files, input)
+		if current.CanonicalPath != "" {
+			input.Path = current.CanonicalPath
+		}
+		return fileRead(ctx, files, input)
 	case "write":
-		out, err = fileWrite(ctx, files, input)
+		return fileWriteResolved(ctx, files, input, expectedParentJoined)
 	case "patch":
-		out, err = filePatch(ctx, files, input)
+		return filePatchResolved(ctx, files, input, expectedParentJoined)
 	case "stat":
-		out, err = fileStat(ctx, files, input)
+		return fileStat(ctx, files, input)
+	default:
+		return FileOutput{}, fmt.Errorf("unsupported file action %q (expected read, write, patch, or stat)", input.Action)
 	}
-	if err != nil {
-		return nil, FileOutput{}, err
-	}
-	return nil, out, nil
 }
 
 // readBounded reads at most maxFileReadBytes from name and reports whether
@@ -277,8 +410,8 @@ func formatLineNumberedContent(raw string, lineRange []int) (string, int) {
 	return b.String(), total
 }
 
-func fileWrite(ctx context.Context, files ports.FileSession, input FileInput) (FileOutput, error) {
-	inPlace, err := replaceFile(ctx, files, input.Path, []byte(input.Content), nil)
+func fileWriteResolved(ctx context.Context, files ports.FileSession, input FileInput, expectedResolved string) (FileOutput, error) {
+	inPlace, err := replaceFileResolved(ctx, files, input.Path, expectedResolved, []byte(input.Content), nil)
 	if err != nil {
 		return FileOutput{}, err
 	}
@@ -291,6 +424,10 @@ func fileWrite(ctx context.Context, files ports.FileSession, input FileInput) (F
 }
 
 func filePatch(ctx context.Context, files ports.FileSession, input FileInput) (FileOutput, error) {
+	return filePatchResolved(ctx, files, input, "")
+}
+
+func filePatchResolved(ctx context.Context, files ports.FileSession, input FileInput, expectedResolved string) (FileOutput, error) {
 	validPath, err := validateRemoteFilePath(input.Path)
 	if err != nil {
 		return FileOutput{}, err
@@ -302,7 +439,11 @@ func filePatch(ctx context.Context, files ports.FileSession, input FileInput) (F
 	if input.Content == "" {
 		return FileOutput{}, errors.New("patch action requires non-empty content with <<<< ==== >>>> blocks")
 	}
-	data, info, truncated, err := readBounded(ctx, files, input.Path)
+	readPath := input.Path
+	if expectedResolved != "" {
+		readPath = expectedResolved
+	}
+	data, info, truncated, err := readBounded(ctx, files, readPath)
 	if err != nil {
 		return FileOutput{}, err
 	}
@@ -321,7 +462,7 @@ func filePatch(ctx context.Context, files ports.FileSession, input FileInput) (F
 		modTime: info.ModTime(),
 		sha256:  sha256.Sum256(data),
 	}
-	inPlace, err := replaceFile(ctx, files, input.Path, []byte(result.Content), snap)
+	inPlace, err := replaceFileResolved(ctx, files, input.Path, expectedResolved, []byte(result.Content), snap)
 	if err != nil {
 		return FileOutput{}, err
 	}
@@ -346,6 +487,10 @@ func filePatch(ctx context.Context, files ports.FileSession, input FileInput) (F
 // content hash must still match so concurrent edits are never overwritten.
 // Symbolic links and special files are always refused.
 func replaceFile(ctx context.Context, files ports.FileSession, name string, content []byte, expected *fileSnapshot) (bool, error) {
+	return replaceFileResolved(ctx, files, name, "", content, expected)
+}
+
+func replaceFileResolved(ctx context.Context, files ports.FileSession, name, expectedResolved string, content []byte, expected *fileSnapshot) (bool, error) {
 	validName, err := validateRemoteFilePath(name)
 	if err != nil {
 		return false, err
@@ -356,44 +501,94 @@ func replaceFile(ctx context.Context, files ports.FileSession, name string, cont
 	name = validName
 	dir := path.Dir(name)
 
-	preset, err := prepareReplace(ctx, files, name, dir, expected)
+	preset, err := prepareReplace(ctx, files, name, dir, expectedResolved, expected)
 	if err != nil {
 		return false, err
 	}
+	targetName := preset.resolvedName
+	targetDir := preset.resolvedDir
 	if preset.existed && !preset.canAtomic {
-		return true, writeInPlace(ctx, files, name, content, expected)
+		return true, writeInPlace(ctx, files, targetName, content, expected)
 	}
 
-	err = atomicCommit(ctx, files, name, dir, content, preset, expected)
+	err = atomicCommit(ctx, files, targetName, targetDir, content, preset, expected)
 	if err != nil && preset.existed && (remotefile.IsPermissionDenied(err) || errors.Is(err, errPreserveOwnerFallback)) {
-		return true, writeInPlace(ctx, files, name, content, expected)
+		return true, writeInPlace(ctx, files, targetName, content, expected)
 	}
 	return false, err
 }
 
-func prepareReplace(ctx context.Context, files ports.FileSession, name, dir string, expected *fileSnapshot) (preset replacePreset, err error) {
+func resolveAndPrepareReplaceTarget(c *pkgsftp.Client, name, dir, expectedResolved string, expected *fileSnapshot) (string, string, error) {
+	resolvedDir, dirErr := remotefile.ResolveCanonicalParent(c, dir)
+	if dirErr != nil {
+		return "", "", fmt.Errorf("resolve parent directory %s: %w", dir, dirErr)
+	}
+	validatedName, valErr := validateRemoteFilePath(path.Join(resolvedDir, path.Base(name)))
+	if valErr != nil {
+		return "", "", fmt.Errorf("resolve target path %s: %w", name, valErr)
+	}
+	if remotefile.IsRootPath(validatedName) {
+		return "", "", errors.New("cannot replace root directory")
+	}
+	resolvedName := validatedName
+	resolvedDir = path.Dir(resolvedName)
+	if expectedResolved != "" && resolvedName != expectedResolved {
+		return "", "", fmt.Errorf("%s resolution changed since authorization", name)
+	}
+	_, dirStatErr := c.Stat(resolvedDir)
+	if errors.Is(dirStatErr, os.ErrNotExist) || errors.Is(dirStatErr, pkgsftp.ErrSSHFxNoSuchFile) {
+		if expected != nil {
+			return "", "", fmt.Errorf("%s was removed since it was read", name)
+		}
+		if mkErr := c.MkdirAll(resolvedDir); mkErr != nil {
+			return "", "", fmt.Errorf("create parent directory %s: %w", resolvedDir, mkErr)
+		}
+		finalDirRaw, rpErr := c.RealPath(resolvedDir)
+		if rpErr != nil {
+			return "", "", fmt.Errorf("resolve parent directory %s: %w", resolvedDir, rpErr)
+		}
+		finalDir, rpValErr := remotefile.ValidateResolvedRealPath(finalDirRaw)
+		if rpValErr != nil {
+			return "", "", fmt.Errorf("resolve parent directory %s: %w", resolvedDir, rpValErr)
+		}
+		resolvedDir = finalDir
+		resolvedName = path.Join(resolvedDir, path.Base(name))
+		if expectedResolved != "" && resolvedName != expectedResolved {
+			return "", "", fmt.Errorf("%s resolution changed since authorization", name)
+		}
+	} else if dirStatErr != nil {
+		return "", "", fmt.Errorf("inspect parent directory %s: %w", resolvedDir, dirStatErr)
+	}
+	return resolvedName, resolvedDir, nil
+}
+
+func prepareReplace(ctx context.Context, files ports.FileSession, name, dir, expectedResolved string, expected *fileSnapshot) (preset replacePreset, err error) {
 	preset.mode = defaultNewFileMode
 	err = files.Do(ctx, func(c *pkgsftp.Client) error {
 		_, preset.canAtomic = c.HasExtension(posixRenameExt)
-		info, lstatErr := c.Lstat(name)
+		resolvedName, resolvedDir, resolveErr := resolveAndPrepareReplaceTarget(c, name, dir, expectedResolved, expected)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		preset.resolvedDir = resolvedDir
+		preset.resolvedName = resolvedName
+
+		info, lstatErr := c.Lstat(resolvedName)
 		switch {
 		case errors.Is(lstatErr, os.ErrNotExist):
 			if expected != nil {
-				return fmt.Errorf("%s was removed since it was read", name)
-			}
-			if mkErr := c.MkdirAll(dir); mkErr != nil {
-				return fmt.Errorf("create parent directory %s: %w", dir, mkErr)
+				return fmt.Errorf("%s was removed since it was read", resolvedName)
 			}
 			return nil
 		case lstatErr != nil:
-			return fmt.Errorf("inspect %s: %w", name, lstatErr)
+			return fmt.Errorf("inspect %s: %w", resolvedName, lstatErr)
 		case !info.Mode().IsRegular():
-			return fmt.Errorf("%s is not a regular file (symbolic links and special files are not replaced)", name)
+			return fmt.Errorf("%s is not a regular file (symbolic links and special files are not replaced)", resolvedName)
 		case info.Size() < 0:
-			return fmt.Errorf("%w: remote file %q has negative size %d", sftp.ErrInvalidRemoteSize, name, info.Size())
+			return fmt.Errorf("%w: remote file %q has negative size %d", sftp.ErrInvalidRemoteSize, resolvedName, info.Size())
 		}
 		if expected != nil && (info.Size() != expected.size || !info.ModTime().Equal(expected.modTime)) {
-			return fmt.Errorf("%s changed since it was read; re-read and retry", name)
+			return fmt.Errorf("%s changed since it was read; re-read and retry", resolvedName)
 		}
 		preset.existed = true
 		preset.mode = info.Mode().Perm()
@@ -683,7 +878,7 @@ func lintContent(remotePath, content string) string {
 	return ""
 }
 
-func (r *Runtime) registerFile(server *mcp.Server, g *guardrail.Guardrail) {
+func (r *Runtime) registerFile(server *mcp.Server, _ *guardrail.Guardrail) {
 	destructive := true
 	mcp.AddTool(server,
 		&mcp.Tool{
@@ -691,15 +886,6 @@ func (r *Runtime) registerFile(server *mcp.Server, g *guardrail.Guardrail) {
 			Description: "Unified remote file and directory operator over SFTP on a managed SSH node. Prefer this tool over terminal shell commands for reading, writing, patching, or listing remote files. Actions: 'read' (line-numbered with optional [start, end] range, first 512 KiB), 'write' (atomic replace; creates parent dirs), 'patch' (applies <<<< ==== >>>> search/replace blocks atomically; files up to 512 KiB), 'stat' (file metadata or noise-filtered 2-level directory tree). Atomic replacement creates a new inode (use terminal when hard links or extended ACLs must be preserved).",
 			Annotations: &mcp.ToolAnnotations{DestructiveHint: &destructive},
 		},
-		withOperation(r, g, "file",
-			func(in FileInput) guardrail.RiskInput {
-				return guardrail.RiskInput{
-					Action: in.Action,
-					NodeID: in.NodeID,
-					Paths:  []string{riskRemotePath(in.Path)},
-				}
-			},
-			r.fileHandler,
-		),
+		r.fileHandler,
 	)
 }

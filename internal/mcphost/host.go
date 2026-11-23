@@ -399,6 +399,7 @@ type backend struct {
 
 var _ ports.TunnelBackend = (*backend)(nil)
 var _ ports.ExecutionProber = (*backend)(nil)
+var _ ports.PathInspector = (*backend)(nil)
 var _ ports.PTYBackend = (*backend)(nil)
 
 func (b *backend) ProbeExecution(ctx context.Context, permit ports.Permit, nodeID string) (_ *ssh.ProbeResult, retErr error) {
@@ -462,16 +463,14 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 		}
 	}
 	if command.RequirePOSIX {
-		if plan.LaunchDialect() != ssh.LaunchPOSIX {
-			err = fmt.Errorf("%w: non-POSIX execution dialect %q is not supported; POSIX shell target (X11/Wayland) is required", ssh.ErrExecutionValidation, plan.LaunchDialect())
+		if err := ports.ValidatePOSIXBournePlan(plan, "POSIX shell target (X11/Wayland) is required"); err != nil {
 			return ports.CommandResult{
 				Outcome:      ssh.ExecutionNotStarted,
 				ExecutionErr: err,
 			}, err
 		}
 	} else if command.Filesystem {
-		if plan.LaunchDialect() != ssh.LaunchPOSIX {
-			err = fmt.Errorf("%w: non-POSIX execution dialect %q is not supported for generated filesystem commands", ssh.ErrExecutionValidation, plan.LaunchDialect())
+		if err := ports.ValidatePOSIXBournePlan(plan, "generated filesystem commands"); err != nil {
 			return ports.CommandResult{
 				Outcome:      ssh.ExecutionNotStarted,
 				ExecutionErr: err,
@@ -703,6 +702,20 @@ func (b *backend) Inspect(ctx context.Context, permit ports.Permit, nodeID strin
 	remote := remotefile.New(files)
 	defer func() { retErr = errors.Join(retErr, remote.Close()) }()
 	return remote.Inspect(work, request.Path, request.Upload, request.Overwrite)
+}
+
+func (b *backend) InspectPath(ctx context.Context, permit ports.Permit, nodeID string, request ports.PathInspectRequest) (_ remotefile.PathInspection, retErr error) {
+	work, cancel, err := ports.WorkContext(ctx, permit, ports.Inspect, ports.Execute)
+	if err != nil {
+		return remotefile.PathInspection{}, err
+	}
+	defer cancel()
+	files, err := b.openFilesWithWork(work, permit, nodeID, ports.Inspect, ports.Execute)
+	if err != nil {
+		return remotefile.PathInspection{}, err
+	}
+	defer func() { retErr = errors.Join(retErr, files.Close()) }()
+	return remotefile.InspectPath(work, files, request.Path)
 }
 
 func (b *backend) OpenTransfer(ctx context.Context, permit ports.Permit, nodeID string) (ports.TransferSession, error) {

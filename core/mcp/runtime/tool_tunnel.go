@@ -278,62 +278,93 @@ func (r *Runtime) listTunnels(ctx context.Context, req *mcp.CallToolRequest, inp
 		})(ctx, req, input)
 }
 
-func (r *Runtime) tunnelStatus(ctx context.Context, req *mcp.CallToolRequest, input TunnelInput) (*mcp.CallToolResult, TunnelOutput, error) {
+func (r *Runtime) authorizeTunnelTask(
+	ctx context.Context,
+	req *mcp.CallToolRequest,
+	action string,
+	input TunnelInput,
+	phase ports.Phase,
+) (context.Context, string, guardrail.RiskInput, ports.Permit, error, *mcp.CallToolResult, error) {
 	if r.tunnels == nil {
-		return nil, TunnelOutput{}, errors.New("SSH tunnel tools are available only over stdio")
+		return nil, "", guardrail.RiskInput{}, nil, nil, nil, errors.New("SSH tunnel tools are available only over stdio")
 	}
-	status, err := r.tunnels.Status(input.TunnelID)
+	input.Action = action
+	existing, lookupErr := r.tunnels.Inspect(input.TunnelID)
+	var nodeID string
+	risk := guardrail.RiskInput{
+		ToolName: "tunnel",
+		Action:   action,
+		Details:  "tunnelID=" + input.TunnelID,
+	}
+	if lookupErr == nil {
+		nodeID = existing.NodeID
+		if action == "stop" {
+			risk = tunnelRisk(existing.Spec)
+			risk.ToolName = "tunnel"
+			risk.Action = "stop"
+			risk.Details += "; tunnelID=" + input.TunnelID
+		} else {
+			risk.NodeID = nodeID
+		}
+	}
+	view, err := r.resolve(ctx, nil)
 	if err != nil {
-		return nil, TunnelOutput{}, err
+		return nil, "", guardrail.RiskInput{}, nil, nil, nil, err
 	}
-	return withMetadata(r, "tunnel",
-		func(in TunnelInput) guardrail.RiskInput {
-			return guardrail.RiskInput{Action: "status", NodeID: status.NodeID, Details: "tunnelID=" + in.TunnelID}
-		},
-		func(_ context.Context, _ *mcp.CallToolRequest, in TunnelInput) (*mcp.CallToolResult, TunnelOutput, error) {
-			latest, err := r.tunnels.Status(in.TunnelID)
-			return nil, TunnelOutput{Tunnel: latest}, err
-		})(ctx, req, input)
+	boundInput := struct {
+		Input  TunnelInput
+		NodeID string
+	}{input, nodeID}
+	opCtx, op, err := r.operationContext(ctx, view, "tunnel", boundInput)
+	if err != nil {
+		return nil, "", guardrail.RiskInput{}, nil, nil, nil, err
+	}
+	opID, pending, err := r.guardrail.Authorize(opCtx, req, risk, boundInput)
+	if err != nil || pending != nil {
+		return nil, "", guardrail.RiskInput{}, nil, nil, pending, err
+	}
+	permit, err := r.enter(opCtx, op.snapshot, op.binding, phase, opID)
+	if err != nil {
+		return nil, "", guardrail.RiskInput{}, nil, nil, nil, err
+	}
+	if err := permit.Context().Err(); err != nil {
+		return nil, "", guardrail.RiskInput{}, nil, nil, nil, errors.Join(err, permit.Close())
+	}
+	return opCtx, opID, risk, permit, lookupErr, nil, nil
+}
+
+func (r *Runtime) tunnelStatus(ctx context.Context, req *mcp.CallToolRequest, input TunnelInput) (_ *mcp.CallToolResult, _ TunnelOutput, retErr error) {
+	ctx, cancel := r.toolContext(ctx)
+	defer cancel()
+	_, _, _, permit, lookupErr, pending, err := r.authorizeTunnelTask(ctx, req, "status", input, ports.Inspect)
+	if err != nil || pending != nil {
+		return pending, TunnelOutput{}, err
+	}
+	defer func() { retErr = errors.Join(retErr, permit.Close()) }()
+	if lookupErr != nil {
+		return nil, TunnelOutput{}, lookupErr
+	}
+	latest, err := r.tunnels.Status(input.TunnelID)
+	return nil, TunnelOutput{Tunnel: latest}, err
 }
 
 func (r *Runtime) stopTunnel(ctx context.Context, req *mcp.CallToolRequest, input TunnelInput) (_ *mcp.CallToolResult, _ TunnelOutput, retErr error) {
 	ctx, cancel := r.toolContext(ctx)
 	defer cancel()
-	if r.tunnels == nil {
-		return nil, TunnelOutput{}, errors.New("SSH tunnel tools are available only over stdio")
-	}
-	status, err := r.tunnels.Status(input.TunnelID)
-	if err != nil {
-		return nil, TunnelOutput{}, err
-	}
-	risk := tunnelRisk(status.Spec)
-	risk.ToolName = "tunnel"
-	risk.Action = "stop"
-	risk.Details += "; tunnelID=" + input.TunnelID
-	view, err := r.resolve(ctx, nil)
-	if err != nil {
-		return nil, TunnelOutput{}, err
-	}
-	ctx, op, err := r.operationContext(ctx, view, "tunnel", struct {
-		Input  TunnelInput
-		NodeID string
-	}{input, status.NodeID})
-	if err != nil {
-		return nil, TunnelOutput{}, err
-	}
-	opID, pending, err := r.guardrail.Authorize(ctx, req, risk, input)
+	opCtx, opID, risk, permit, lookupErr, pending, err := r.authorizeTunnelTask(ctx, req, "stop", input, ports.Execute)
 	if err != nil || pending != nil {
 		return pending, TunnelOutput{}, err
 	}
-	permission, err := r.enter(ctx, op.snapshot, op.binding, ports.Execute, opID)
-	if err != nil {
-		return nil, TunnelOutput{}, err
+	defer func() { retErr = errors.Join(retErr, permit.Close()) }()
+	if lookupErr != nil {
+		return nil, TunnelOutput{}, lookupErr
 	}
-	defer func() { retErr = errors.Join(retErr, permission.Close()) }()
-	stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	status, err = r.tunnels.Stop(stopCtx, input.TunnelID)
-	if auditErr := r.guardrail.RecordAuthorized(opID, risk, "stop_requested", err); auditErr != nil {
+	stopCtx, stopCancel := context.WithTimeout(opCtx, 10*time.Second)
+	defer stopCancel()
+	status, err := r.tunnels.Stop(stopCtx, input.TunnelID)
+	auditCtx, auditCancel := context.WithTimeout(context.WithoutCancel(opCtx), 5*time.Second)
+	defer auditCancel()
+	if auditErr := r.guardrail.RecordAuthorizedContext(auditCtx, opID, risk, "stop_requested", err); auditErr != nil {
 		status.AuditError = auditErr.Error()
 	}
 	return nil, TunnelOutput{Tunnel: status}, err

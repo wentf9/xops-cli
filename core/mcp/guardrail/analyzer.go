@@ -560,6 +560,68 @@ func AnalyzePaths(paths []string) RiskLevel {
 	return level
 }
 
+// AnalyzeRecursivePaths returns the highest risk level implied by recursively
+// traversing the given directory paths, elevating risk whenever a directory
+// lies under OR contains a sensitive system path.
+func AnalyzeRecursivePaths(dirs []string) RiskLevel {
+	level := Safe
+	for _, dir := range dirs {
+		pathRisk := analyzeSinglePath(dir)
+		if pathRisk > level {
+			level = pathRisk
+		}
+		if level < Moderate && containsSensitiveDescendant(dir) {
+			level = Moderate
+		}
+		if level == Dangerous {
+			return Dangerous
+		}
+	}
+	return level
+}
+
+func containsSensitiveDescendant(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	for _, sensitive := range sensitivePaths {
+		if matchesUnder(sensitive, dir) {
+			return true
+		}
+	}
+	return containsSensitiveWindowsPath(dir)
+}
+
+func containsSensitiveWindowsPath(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	if _, cleanRest, _, isDrive := canonicalDrivePath(win32CollapseCandidate(dir)); isDrive {
+		lower := strings.TrimRight(strings.ToLower(cleanRest), "/")
+		if lower == "" {
+			lower = "/"
+		}
+		for _, sensitive := range sensitiveWindowsPaths {
+			if matchesCleanPath(sensitive, lower) || matchesCleanPath(lower, sensitive) {
+				return true
+			}
+		}
+		return false
+	}
+	if strings.HasPrefix(dir, "/") {
+		lower := strings.TrimRight(strings.ToLower(path.Clean(dir)), "/")
+		if lower == "" {
+			lower = "/"
+		}
+		for _, sensitive := range sensitiveWindowsPaths {
+			if matchesCleanPath(sensitive, lower) || matchesCleanPath(lower, sensitive) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isControlOrLineSep(r rune) bool {
 	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || unicode.IsControl(r) || r == '\u2028' || r == '\u2029'
 }

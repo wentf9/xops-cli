@@ -408,6 +408,21 @@ func (m *Manager) setAuditError(t *task, err error) {
 	t.status.AuditError = err.Error()
 }
 
+// Inspect returns the current task snapshot under a read lock without mutating
+// or pruning retained records.
+func (m *Manager) Inspect(id string) (Status, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	t := m.tasks[id]
+	if t == nil {
+		return Status{}, errors.New("tunnel_not_found")
+	}
+	if !t.status.FinishedAt.IsZero() && t.status.FinishedAt.Before(time.Now().Add(-Retention)) {
+		return Status{}, errors.New("tunnel_not_found")
+	}
+	return t.status, nil
+}
+
 func (m *Manager) Status(id string) (Status, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
