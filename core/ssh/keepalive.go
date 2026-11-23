@@ -40,6 +40,11 @@ const (
 // 或 Client.Wait，由连接所有者提供最外层传输的中断路径。
 // 接收进展由 Connector 创建的连接提供；外部构造的 client 保留固定探测超时。
 func StartKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout time.Duration, fallback func(err error)) <-chan struct{} {
+	if ctx == nil || client == nil || client.Conn == nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
 	return startKeepAlive(ctx, client, interval, timeout, fallback, func() error {
 		return closeResource(client, "SSH client after keepalive")
 	})
@@ -58,6 +63,10 @@ func startKeepAlive(ctx context.Context, client *ssh.Client, interval, timeout t
 // loop; startKeepAliveWithContexts releases that count on exit and tracks any
 // in-flight SendRequest (and async hop-scoped interrupt) goroutines on wg so
 // CloseAll joins them after closing pooled transports.
+func canStartKeepAlive(stopCtx, abortCtx context.Context, client *ssh.Client) bool {
+	return client != nil && client.Conn != nil && (stopCtx != nil || abortCtx != nil)
+}
+
 func startKeepAliveWithContexts(
 	stopCtx context.Context,
 	abortCtx context.Context,
@@ -70,6 +79,13 @@ func startKeepAliveWithContexts(
 	wg *sync.WaitGroup,
 ) <-chan struct{} {
 	done := make(chan struct{})
+	if !canStartKeepAlive(stopCtx, abortCtx, client) {
+		if wg != nil {
+			wg.Done()
+		}
+		close(done)
+		return done
+	}
 	if interval <= 0 {
 		interval = DefaultKeepAliveInterval
 	}
@@ -77,53 +93,60 @@ func startKeepAliveWithContexts(
 		timeout = DefaultKeepAliveTimeout
 	}
 
-	var stopDone <-chan struct{}
-	if stopCtx != nil {
-		stopDone = stopCtx.Done()
-	}
-	var abortDone <-chan struct{}
-	if abortCtx != nil {
-		abortDone = abortCtx.Done()
-	}
-
 	go func() {
 		defer close(done)
 		if wg != nil {
 			defer wg.Done()
 		}
-		timer := time.NewTimer(interval)
-		defer timer.Stop()
-
-		for {
-			select {
-			case <-abortDone:
-				return
-			case <-stopDone:
-				return
-			case <-timer.C:
-				if (abortCtx != nil && abortCtx.Err() != nil) || (stopCtx != nil && stopCtx.Err() != nil) {
-					return
-				}
-				if remaining := keepAliveReadTimeout(client, interval); remaining > 0 {
-					timer.Reset(remaining)
-					continue
-				}
-				// 发送心跳请求
-				if err := probeWithContexts(stopCtx, abortCtx, client, timeout, interrupt, nil, beforeClose, hopScopedClose, wg); err != nil {
-					if errors.Is(err, errKeepaliveStopped) || (abortCtx != nil && abortCtx.Err() != nil) {
-						return
-					}
-					// 请求失败，或等待期间持续没有远端数据
-					if fallback != nil {
-						fallback(err)
-					}
-					return
-				}
-				timer.Reset(interval)
-			}
-		}
+		runKeepAliveLoop(stopCtx, abortCtx, client, interval, timeout, fallback, interrupt, beforeClose, hopScopedClose, wg)
 	}()
 	return done
+}
+
+func runKeepAliveLoop(
+	stopCtx context.Context,
+	abortCtx context.Context,
+	client *ssh.Client,
+	interval, timeout time.Duration,
+	fallback func(error),
+	interrupt func() error,
+	beforeClose func() func(),
+	hopScopedClose bool,
+	wg *sync.WaitGroup,
+) {
+	stopDone := ctxDoneCh(stopCtx)
+	abortDone := ctxDoneCh(abortCtx)
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-abortDone:
+			return
+		case <-stopDone:
+			return
+		case <-timer.C:
+			if isCtxCanceled(abortCtx) || isCtxCanceled(stopCtx) {
+				return
+			}
+			if remaining := keepAliveReadTimeout(client, interval); remaining > 0 {
+				timer.Reset(remaining)
+				continue
+			}
+			// 发送心跳请求
+			if err := probeWithContexts(stopCtx, abortCtx, client, timeout, interrupt, nil, beforeClose, hopScopedClose, wg); err != nil {
+				if errors.Is(err, errKeepaliveStopped) || isCtxCanceled(abortCtx) {
+					return
+				}
+				// 请求失败，或等待期间持续没有远端数据
+				if fallback != nil {
+					fallback(err)
+				}
+				return
+			}
+			timer.Reset(interval)
+		}
+	}
 }
 
 // probeWithTimeout 发送一次心跳请求，等待期间连续 timeout 无接收进展才超时。
@@ -331,6 +354,9 @@ func probeWithContexts(
 	hopScopedClose bool,
 	probeWG *sync.WaitGroup,
 ) error {
+	if client == nil || client.Conn == nil {
+		return errors.New("ssh client is not connected")
+	}
 	if timeout <= 0 {
 		timeout = DefaultKeepAliveTimeout
 	}

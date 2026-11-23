@@ -235,7 +235,7 @@ func (c *PooledClient) startKeepAlive(
 	onDead func(error),
 	wg *sync.WaitGroup,
 ) {
-	if c == nil || c.SSHClient == nil || stopParentCtx == nil || stopParentCtx.Err() != nil || interval <= 0 {
+	if c == nil || c.SSHClient == nil || c.SSHClient.Conn == nil || stopParentCtx == nil || stopParentCtx.Err() != nil || interval <= 0 {
 		return
 	}
 	if abortCtx != nil && abortCtx.Err() != nil {
@@ -1370,7 +1370,7 @@ func (p *connPool) checkActiveClientLocked(key HopDigest, client *PooledClient, 
 			}
 		}
 	}
-	if requireKeepAlive && client.SSHClient != nil {
+	if requireKeepAlive && client.SSHClient != nil && client.SSHClient.Conn != nil {
 		if active, _ := client.keepAliveState(); !active {
 			return fmt.Errorf("pool invariant violated: active client %s missing live keepalive", key)
 		}

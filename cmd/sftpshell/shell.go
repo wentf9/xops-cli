@@ -3063,6 +3063,25 @@ func formatBytes(bytes int64) string {
 	return sftp.FormatByteSize(uint64(bytes))
 }
 
+func (s *Shell) columnWidth() int {
+	const defaultWidth = 80
+	out := s.stdout
+	if out == nil {
+		out = os.Stdout
+	}
+	if file, ok := out.(*os.File); ok && file == nil {
+		return defaultWidth
+	}
+	if file, ok := out.(interface{ Fd() uintptr }); ok {
+		if fd := int(file.Fd()); term.IsTerminal(fd) {
+			if w, _, err := term.GetSize(fd); err == nil && w > 0 {
+				return w
+			}
+		}
+	}
+	return defaultWidth
+}
+
 // printColumns 多列格式输出，类似 Linux ls 命令
 func (s *Shell) printColumns(names []string) {
 	if len(names) == 0 {
@@ -3080,12 +3099,7 @@ func (s *Shell) printColumns(names []string) {
 	}
 
 	// 获取终端宽度
-	width := 80 // 默认宽度
-	if fd := int(os.Stdout.Fd()); term.IsTerminal(fd) {
-		if w, _, err := term.GetSize(fd); err == nil && w > 0 {
-			width = w
-		}
-	}
+	width := s.columnWidth()
 
 	// 每列宽度 = 最大名称 + 2 (间距)
 	colWidth := maxLen + 2

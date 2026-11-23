@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,24 +34,47 @@ type host struct {
 	config Config
 	domain string
 	policy policy.Config
+	frozen bool
 }
 
 type providerKey struct{}
 
 func newHost(cfg Config) *host {
-	pol := cfg.Provider.Snapshot().Guardrail
+	frozen := false
+	if cfg.HTTP != nil || cfg.Recovery {
+		if f, ok := cfg.Provider.(interface{ Frozen() config.ConfigProvider }); ok {
+			cfg.Provider = f.Frozen()
+		}
+		frozen = true
+	}
+	h := &host{config: cfg, domain: "xops-cli", frozen: frozen}
+	h.policy = h.policyFor(h.config.Provider)
+	return h
+}
+
+func (h *host) policyFor(p config.ConfigProvider) policy.Config {
+	var pol *policy.Config
+	if p != nil {
+		if snap := p.Snapshot(); snap != nil {
+			pol = snap.Guardrail
+		}
+	}
 	defaultPolicy := pol == nil
 	if pol == nil {
 		pol = defaultPolicyConfig()
 	}
 	copy := policy.Clone(*pol)
-	if (cfg.HTTP != nil || cfg.Recovery) && (defaultPolicy || copy.NoElicitFallback == "") {
+	if (h.config.HTTP != nil || h.config.Recovery) && (defaultPolicy || copy.NoElicitFallback == "") {
 		copy.NoElicitFallback = guardrail.FallbackDeny
 	}
-	return &host{config: cfg, domain: "xops-cli", policy: copy}
+	return copy
 }
+
 func (h *host) DomainID() string { return h.domain }
 func (h *host) provider() config.ConfigProvider {
+	if h.frozen {
+		return h.config.Provider
+	}
 	if frozen, ok := h.config.Provider.(interface{ Frozen() config.ConfigProvider }); ok {
 		return frozen.Frozen()
 	}
@@ -58,7 +82,7 @@ func (h *host) provider() config.ConfigProvider {
 }
 func (h *host) dependencies() ports.Dependencies {
 	return ports.Dependencies{State: h, Gate: h, Audit: auditSink{newAuditLogger(h.policy.AuditLog)}, NewBackend: func(ctx context.Context) (ports.Backend, error) {
-		return &backend{connector: newMCPConnector(ctx, h.config.Provider, h.config.Logger, h.config.Registry), config: h.config}, nil
+		return &backend{connector: newMCPConnector(ctx, h.config.Provider, h.config.Logger, h.config.Registry), config: h.config, frozen: h.frozen}, nil
 	}}
 }
 
@@ -80,7 +104,7 @@ func (h *host) List(ctx context.Context, query ports.NodeQuery) (ports.Inventory
 	if query.Tag != "" {
 		nodes = p.GetNodesByTag(query.Tag)
 	}
-	view := ports.InventorySnapshot{DomainID: h.domain, Policy: h.policy}
+	view := ports.InventorySnapshot{DomainID: h.domain, Policy: h.policyFor(p)}
 	for id := range nodes {
 		info, err := nodeInfo(p, id)
 		if err != nil {
@@ -119,7 +143,7 @@ func (h *host) resolveSnapshot(ctx context.Context, request ports.ResolveRequest
 	if err := ctx.Err(); err != nil {
 		return ports.OperationSnapshot{}, err
 	}
-	view := ports.OperationSnapshot{DomainID: h.domain, Policy: h.policy, Targets: make(map[string]ports.Target), Selectors: make(map[string]string)}
+	view := ports.OperationSnapshot{DomainID: h.domain, Policy: h.policyFor(p), Targets: make(map[string]ports.Target), Selectors: make(map[string]string)}
 	adp := adapter.NewSSHAdapter(p, adapter.WithStrictIsolation(), adapter.WithCredentialSource(h.config.Registry), adapter.WithCredentialRecording(false))
 	for _, selector := range request.Selectors {
 		if selector == "" {
@@ -370,6 +394,7 @@ func (b *backend) RunTunnel(ctx context.Context, permit ports.Permit, spec tunne
 type backend struct {
 	connector *ssh.Connector
 	config    Config
+	frozen    bool
 }
 
 var _ ports.TunnelBackend = (*backend)(nil)
@@ -382,15 +407,19 @@ func (b *backend) ProbeExecution(ctx context.Context, permit ports.Permit, nodeI
 		return nil, err
 	}
 	defer cancel()
-	_, target, err := permit.Snapshot().Resolve(nodeID)
+	view := permit.Snapshot().Clone()
+	if err := permit.Binding().Validate(view); err != nil {
+		return nil, err
+	}
+	_, target, err := view.Resolve(nodeID)
 	if err != nil {
 		return nil, err
 	}
-	connection, err := b.connector.ConnectPlan(work, target.Plan)
+	connection, releaseConn, err := b.connectPlan(work, permit, target.Plan)
 	if err != nil {
 		return nil, fmt.Errorf("connect MCP execution probe: %w", err)
 	}
-	defer func() { retErr = errors.Join(retErr, connection.Close()) }()
+	defer func() { retErr = errors.Join(retErr, releaseConn()) }()
 	return connection.Client.ProbeExecutionConfig(work)
 }
 
@@ -400,7 +429,11 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 		return ports.CommandResult{}, err
 	}
 	defer cancel()
-	_, target, err := permit.Snapshot().Resolve(nodeID)
+	view := permit.Snapshot().Clone()
+	if err := permit.Binding().Validate(view); err != nil {
+		return ports.CommandResult{}, err
+	}
+	_, target, err := view.Resolve(nodeID)
 	if err != nil {
 		return ports.CommandResult{}, err
 	}
@@ -445,11 +478,11 @@ func (b *backend) Run(ctx context.Context, permit ports.Permit, nodeID string, c
 			}, err
 		}
 	}
-	connection, err := b.connector.ConnectPlan(work, target.Plan)
+	connection, releaseConn, err := b.connectPlan(work, permit, target.Plan)
 	if err != nil {
 		return ports.CommandResult{}, err
 	}
-	defer func() { retErr = errors.Join(retErr, connection.Close()) }()
+	defer func() { retErr = errors.Join(retErr, releaseConn()) }()
 	client := connection.Client
 	if command.Sudo {
 		output, err := client.RunWithSudoExecution(work, command.Text, effectiveExec)
@@ -579,8 +612,23 @@ type leasedTransferFiles struct {
 
 func (f *leasedTransferFiles) Close() error { return f.release() }
 
+func sameProviderInstance(a, b config.ConfigProvider) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	return ta == tb && ta.Comparable() && a == b
+}
+
 func (b *backend) connectPlan(work context.Context, permit ports.Permit, plan ssh.ConnectionPlan) (*ssh.PlanConnection, func() error, error) {
 	if provider, ok := permit.Context().Value(providerKey{}).(config.ConfigProvider); ok && !ports.Nil(provider) {
+		if b.frozen && b.connector != nil && sameProviderInstance(provider, b.config.Provider) {
+			connection, err := b.connector.ConnectPlan(work, plan)
+			if err != nil {
+				return nil, nil, err
+			}
+			return connection, connection.Close, nil
+		}
 		connector := newNonInteractiveMCPConnector(provider, b.config.Logger, b.config.Registry)
 		kaCtx, kaCancel := context.WithCancel(context.WithoutCancel(work))
 		connector.EnableKeepAlive(kaCtx, ssh.DefaultKeepAliveInterval, ssh.DefaultKeepAliveTimeout)
@@ -670,14 +718,18 @@ func (b *backend) OpenPTY(ctx context.Context, permit ports.Permit, nodeID strin
 		return nil, err
 	}
 	defer cancel()
-	_, target, err := permit.Snapshot().Resolve(nodeID)
+	view := permit.Snapshot().Clone()
+	if err := permit.Binding().Validate(view); err != nil {
+		return nil, err
+	}
+	_, target, err := view.Resolve(nodeID)
 	if err != nil {
 		return nil, err
 	}
-	connection, err := b.connector.ConnectPlan(work, target.Plan)
+	connection, releaseConn, err := b.connectPlan(work, permit, target.Plan)
 	if err != nil {
 		return nil, err
 	}
-	return sshexec.OpenClientPTY(work, connection.Client, connection.Close)
+	return sshexec.OpenClientPTY(work, connection.Client, releaseConn)
 }
 func (b *backend) Shutdown(context.Context) error { return b.connector.CloseAll() }

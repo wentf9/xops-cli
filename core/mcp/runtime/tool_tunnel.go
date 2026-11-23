@@ -197,8 +197,10 @@ func (r *Runtime) createTunnel(ctx context.Context, req *mcp.CallToolRequest, in
 	} else {
 		spec.RequestID = input.RequestID
 	}
-	if existing, found, err := r.tunnels.Retry(spec); found || err != nil {
-		return nil, TunnelOutput{Tunnel: existing}, err
+	if !hasApprovalRoundTripParams(req) {
+		if existing, found, err := r.tunnels.Retry(spec); found || err != nil {
+			return nil, TunnelOutput{Tunnel: existing}, err
+		}
 	}
 	ctx, op, err := r.operationContext(ctx, view, "tunnel", spec)
 	if err != nil {

@@ -254,10 +254,16 @@ func (r *Runtime) httpTransferHandler(ctx context.Context, req *mcp.CallToolRequ
 		})
 	case "status":
 		res, st, err := r.transferStatus(ctx, req, TransferTaskInput{TransferID: input.TransferID})
-		return res, PreparedTransferOutput{Task: st}, err
+		if err != nil || res != nil {
+			return res, PreparedTransferOutput{}, err
+		}
+		return nil, PreparedTransferOutput{Task: st}, nil
 	case "cancel":
 		res, st, err := r.transferCancel(ctx, req, TransferTaskInput{TransferID: input.TransferID})
-		return res, PreparedTransferOutput{Task: st}, err
+		if err != nil || res != nil {
+			return res, PreparedTransferOutput{}, err
+		}
+		return nil, PreparedTransferOutput{Task: st}, nil
 	default:
 		return nil, PreparedTransferOutput{}, fmt.Errorf("unsupported transfer action %q (expected prepare_push, prepare_pull, status, or cancel)", input.Action)
 	}
@@ -315,11 +321,8 @@ func (r *Runtime) prepareTransfer(ctx context.Context, req *mcp.CallToolRequest,
 		return nil, PreparedTransferOutput{}, err
 	}
 	spec.Scope, spec.RequestDigest = r.scope(ctx), requestDigest
-	if existing, found, err := r.retryTransfer(ctx, spec); err != nil || found {
-		if err != nil {
-			return nil, PreparedTransferOutput{}, err
-		}
-		return nil, r.preparedTransfer(existing), nil
+	if pending, out, handled, err := r.tryRetryTransfer(ctx, req, spec); handled {
+		return pending, out, err
 	}
 	view, err := r.resolve(ctx, []string{spec.NodeID})
 	if err != nil {
@@ -446,13 +449,126 @@ func transferRisk(spec transfer.Spec) guardrail.RiskInput {
 	return input
 }
 
-func (r *Runtime) transferStatus(ctx context.Context, _ *mcp.CallToolRequest, input TransferTaskInput) (*mcp.CallToolResult, transfer.Status, error) {
-	status, err := r.transfers.Lookup(r.scope(ctx), input.TransferID)
+func hasApprovalRoundTripParams(req *mcp.CallToolRequest) bool {
+	return req != nil && req.Params != nil && (req.Params.RequestState != "" || len(req.Params.InputResponses) > 0)
+}
+
+func (r *Runtime) tryRetryTransfer(ctx context.Context, req *mcp.CallToolRequest, spec transfer.Spec) (*mcp.CallToolResult, PreparedTransferOutput, bool, error) {
+	if hasApprovalRoundTripParams(req) {
+		record, found, err := r.transfers.FindRequest(spec.Scope, spec.RequestID, spec.RequestDigest)
+		if err != nil || !found {
+			return nil, PreparedTransferOutput{}, false, nil
+		}
+		res, out, authErr := r.retryTransferWithApprovalParams(ctx, req, spec, record)
+		return res, out, true, authErr
+	}
+	existing, found, err := r.retryTransfer(ctx, spec)
+	if err != nil {
+		return nil, PreparedTransferOutput{}, true, err
+	}
+	if !found {
+		return nil, PreparedTransferOutput{}, false, nil
+	}
+	return nil, r.preparedTransfer(existing), true, nil
+}
+
+func (r *Runtime) retryTransferWithApprovalParams(ctx context.Context, req *mcp.CallToolRequest, spec transfer.Spec, record transfer.Record) (*mcp.CallToolResult, PreparedTransferOutput, error) {
+	var selectors []string
+	if record.State == transfer.Ready {
+		selectors = []string{spec.NodeID}
+	}
+	view, err := r.resolve(ctx, selectors)
+	if err != nil {
+		return nil, PreparedTransferOutput{}, err
+	}
+	ctx, _, err = r.operationContext(ctx, view, "transfer", record.Spec)
+	if err != nil {
+		return nil, PreparedTransferOutput{}, err
+	}
+	_, pending, err := r.guardrail.Authorize(ctx, req, transferRisk(record.Spec), record.Spec)
+	if err != nil || pending != nil {
+		return pending, PreparedTransferOutput{}, err
+	}
+	existing, found, err := r.retryTransfer(ctx, spec)
+	if err != nil {
+		return nil, PreparedTransferOutput{}, err
+	}
+	if !found {
+		return nil, PreparedTransferOutput{}, transfer.ErrNotFound
+	}
+	return nil, r.preparedTransfer(existing), nil
+}
+
+func (r *Runtime) authorizeTransferTask(ctx context.Context, req *mcp.CallToolRequest, action string, input TransferTaskInput, phase ports.Phase) (string, ports.Permit, error, *mcp.CallToolResult, error) {
+	if r.transfers == nil {
+		return "", nil, nil, nil, errors.New("HTTP file transfer tools are available only over HTTP")
+	}
+	input.Action = action
+	scope := r.scope(ctx)
+	existing, lookupErr := r.transfers.Lookup(scope, input.TransferID)
+	var nodeID string
+	if lookupErr == nil {
+		nodeID = existing.NodeID
+	}
+	view, err := r.resolve(ctx, nil)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	risk := guardrail.RiskInput{
+		ToolName: "transfer",
+		Action:   action,
+		NodeID:   nodeID,
+		Details:  "transferID=" + input.TransferID,
+	}
+	boundInput := struct {
+		Input  TransferTaskInput
+		NodeID string
+	}{input, nodeID}
+	ctx, op, err := r.operationContext(ctx, view, "transfer", boundInput)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	opID, pending, err := r.guardrail.Authorize(ctx, req, risk, boundInput)
+	if err != nil || pending != nil {
+		return "", nil, nil, pending, err
+	}
+	permit, err := r.enter(ctx, op.snapshot, op.binding, phase, opID)
+	if err != nil {
+		return "", nil, nil, nil, err
+	}
+	if err := permit.Context().Err(); err != nil {
+		return "", nil, nil, nil, errors.Join(err, permit.Close())
+	}
+	return scope, permit, lookupErr, nil, nil
+}
+
+func (r *Runtime) transferStatus(ctx context.Context, req *mcp.CallToolRequest, input TransferTaskInput) (_ *mcp.CallToolResult, _ transfer.Status, retErr error) {
+	ctx, cancel := r.toolContext(ctx)
+	defer cancel()
+	scope, permit, lookupErr, pending, err := r.authorizeTransferTask(ctx, req, "status", input, ports.Inspect)
+	if err != nil || pending != nil {
+		return pending, transfer.Status{}, err
+	}
+	defer func() { retErr = errors.Join(retErr, permit.Close()) }()
+	if lookupErr != nil {
+		return nil, transfer.Status{}, lookupErr
+	}
+	status, err := r.transfers.Lookup(scope, input.TransferID)
 	return nil, status, err
 }
 
-func (r *Runtime) transferCancel(ctx context.Context, _ *mcp.CallToolRequest, input TransferTaskInput) (*mcp.CallToolResult, transfer.Status, error) {
-	status, err := r.transfers.Cancel(r.scope(ctx), input.TransferID)
+func (r *Runtime) transferCancel(ctx context.Context, req *mcp.CallToolRequest, input TransferTaskInput) (_ *mcp.CallToolResult, _ transfer.Status, retErr error) {
+	ctx, cancel := r.toolContext(ctx)
+	defer cancel()
+	scope, permit, lookupErr, pending, err := r.authorizeTransferTask(ctx, req, "cancel", input, ports.Execute)
+	if err != nil || pending != nil {
+		return pending, transfer.Status{}, err
+	}
+	defer func() { retErr = errors.Join(retErr, permit.Close()) }()
+	if lookupErr != nil {
+		return nil, transfer.Status{}, lookupErr
+	}
+	status, err := r.transfers.Cancel(scope, input.TransferID)
 	if errors.Is(err, transfer.ErrInvalidState) {
 		status.Warning = "commit has started or its outcome is unknown; cancellation is not confirmed"
 		return nil, status, nil

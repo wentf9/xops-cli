@@ -52,7 +52,7 @@ func (c *Client) RunShellWithoutPTY(ctx context.Context, stdin io.Reader, stdout
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("shell execution canceled: %w", err)
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
 	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
@@ -78,7 +78,7 @@ func (c *Client) RunShellWithIO(ctx context.Context, stdin io.Reader, stdout, st
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("shell execution canceled: %w", err)
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
 	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
@@ -104,7 +104,7 @@ func (c *Client) RunShellWithRemotePTY(ctx context.Context, stdin io.Reader, std
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("shell execution canceled: %w", err)
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
 	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {
@@ -171,7 +171,7 @@ func (c *Client) RunCommandWithRemotePTY(ctx context.Context, command string, st
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("command execution canceled: %w", err)
 	}
-	if c.sshClient == nil {
+	if c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
 	if err := validateCommandStdin(stdin, c.environment.InputBridge); err != nil {

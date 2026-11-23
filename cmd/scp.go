@@ -705,9 +705,9 @@ func (o *ScpOptions) runUploadWithLease(ctx context.Context, localPath string, d
 	}
 	remotePath = remoteTarget.String()
 
-	// 检查是否已存在
+	// 检查是否已存在（使用 Lstat 以识别悬空符号链接）
 	err = sftpCli.Do(ctx, func(c *pkgsftp.Client) error {
-		_, statErr := c.Stat(remotePath)
+		_, statErr := c.Lstat(remotePath)
 		return statErr
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -930,7 +930,7 @@ func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst P
 func (o *ScpOptions) confirmRemoteToRemoteOverwrite(ctx context.Context, dstSftp *sftp.Client, dstPath string) (bool, error) {
 	if !o.Force {
 		statErr := dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
-			_, err := c.Stat(dstPath)
+			_, err := c.Lstat(dstPath)
 			return err
 		})
 		switch {
@@ -1346,7 +1346,7 @@ func (o *ScpOptions) executeTransferWithLease(ctx context.Context, label string,
 	var destStat os.FileInfo
 	if statErr := sftpCli.Do(ctx, func(c *pkgsftp.Client) error {
 		var err error
-		destStat, err = c.Stat(remotePath)
+		destStat, err = c.Lstat(remotePath)
 		return err
 	}); statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
 		return fmt.Errorf("stat upload target %q failed: %w", remotePath, statErr)

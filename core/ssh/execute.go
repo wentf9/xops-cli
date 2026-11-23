@@ -885,7 +885,7 @@ func resolveSessionErrors(workErr, waitErr, outputFailedErr, closeErr, inputErr,
 // cancelOutput registers cancellation callbacks for the output-binding contexts
 // so drain timeouts and session aborts interrupt blocked output writes.
 func (c *Client) runSessionWithInput(ctx context.Context, request string, start func(*ssh.Session) error, initialPayload string, stdin io.Reader, stdout, stderr io.Writer, cancelOutput ...context.CancelFunc) (retErr error) {
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("ssh client is not connected")
 	}
 	session, err := c.newSessionContext(ctx)
@@ -1060,7 +1060,7 @@ func (c *Client) newSessionContext(ctx context.Context) (_ *ssh.Session, retErr 
 	if ctx == nil {
 		return nil, fmt.Errorf("create SSH session context is nil")
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return nil, fmt.Errorf("ssh client is not connected")
 	}
 	c.observeSession(logger.SessionRequest, 2, "open", "sending")

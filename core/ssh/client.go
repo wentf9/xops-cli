@@ -1074,7 +1074,7 @@ func (c *Client) maybeDetectSudoMode(ctx context.Context, configs ...*RunConfig)
 		c.observePrivilege(SudoModeAuto, "detection_unsupported", 1, 0)
 		return nil
 	}
-	if c.sshClient == nil {
+	if c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("ssh client is not connected")
 	}
 
@@ -1365,7 +1365,7 @@ func (c *Client) SSHClient() *ssh.Client {
 }
 
 func (c *Client) watchTransport() <-chan struct{} {
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return nil
 	}
 	c.transportOnce.Do(func() {

@@ -105,7 +105,7 @@ func (c *Client) ProbeExecutionConfig(ctx context.Context) (*ProbeResult, error)
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrExecutionProbe, err)
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return nil, fmt.Errorf("%w: SSH client is not connected", ErrExecutionProbe)
 	}
 	cache := c.executionProbeCache()

@@ -143,7 +143,7 @@ func validateCommandExecution(ctx context.Context, c *Client, plan CommandPlan) 
 	if plan.digest == "" {
 		return fmt.Errorf("command execution plan is invalid")
 	}
-	if c == nil || c.sshClient == nil {
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("SSH client is not connected")
 	}
 	return nil

@@ -183,7 +183,7 @@ func (c *Client) RunSubsystemWithIO(ctx context.Context, subsystem string, stdin
 }
 
 func validateSubsystemArgs(ctx context.Context, c *Client, subsystem string, stdin io.Reader) error {
-	if _, ok := c.configSnapshot(); !ok || c.sshClient == nil {
+	if _, ok := c.configSnapshot(); !ok || c.sshClient == nil || c.sshClient.Conn == nil {
 		return fmt.Errorf("ssh client is not connected")
 	}
 	if ctx == nil {
