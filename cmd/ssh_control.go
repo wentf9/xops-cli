@@ -836,26 +836,62 @@ func newControlProxyFallbackConfig(
 	})
 }
 
+// resolvedControlLookupNodeID selects the read-only adapter lookup key for a
+// config.ResolvedTarget so overridden OpenSSH aliases retain their OpenSSH
+// virtual identity (Tier-4 options) while overridden saved managed nodes use
+// their ad-hoc derived NodeID without leaking the base node's Tier-2 options.
+func resolvedControlLookupNodeID(resolved config.ResolvedTarget) string {
+	if resolved.MatchedNodeID != "" {
+		return resolved.MatchedNodeID
+	}
+	if resolved.Provenance == config.ProvenanceOpenSSHDerived || config.IsOpenSSHNodeID(resolved.BaseNodeID) {
+		if canon := strings.TrimSpace(resolved.CanonicalHost); canon != "" {
+			return config.OpenSSHNodePrefix + canon
+		}
+		if config.IsOpenSSHNodeID(resolved.BaseNodeID) {
+			return resolved.BaseNodeID
+		}
+		if alias := strings.TrimSpace(resolved.OpenSSHAlias); alias != "" {
+			return config.OpenSSHNodePrefix + alias
+		}
+	}
+	return resolved.NodeID
+}
+
+func resolveControlProxyExplicitOrTargetLookup(provider config.ConfigProvider, o *SshOptions) string {
+	if provider == nil || o == nil {
+		return ""
+	}
+	explicit := firstNonEmptyControlValue(o.Target.Selector, o.Host)
+	if config.IsOpenSSHNodeID(explicit) {
+		if resolvedID, err := provider.ResolveSelector(explicit); err == nil && resolvedID != "" {
+			return resolvedID
+		}
+		return explicit
+	}
+	connTarget := effectiveConnectionTarget(o, "")
+	if expandedHost, hostErr := o.effectiveHostName(); hostErr == nil && strings.TrimSpace(expandedHost) != "" {
+		connTarget.ProxyJump = "none"
+		connTarget.HasProxyJump = true
+	}
+	resolved, err := config.ResolveTarget(provider, connTarget)
+	if err != nil {
+		return ""
+	}
+	if resolved.MatchedNodeID != "" {
+		return resolved.MatchedNodeID
+	}
+	if resolved.Provenance == config.ProvenanceOpenSSHDerived || config.IsOpenSSHNodeID(resolved.BaseNodeID) {
+		if id := resolvedControlLookupNodeID(resolved); id != "" {
+			return id
+		}
+	}
+	return resolved.BaseNodeID
+}
+
 func resolveControlProxyFallbackLookup(target ssh.TargetContext, provider config.ConfigProvider, o *SshOptions) string {
-	if provider != nil && o != nil {
-		explicit := strings.TrimSpace(o.Target.Selector)
-		if explicit == "" {
-			explicit = strings.TrimSpace(o.Host)
-		}
-		if config.IsOpenSSHNodeID(explicit) {
-			if resolvedID, err := provider.ResolveSelector(explicit); err == nil && resolvedID != "" {
-				return resolvedID
-			}
-			return explicit
-		}
-		if resolved, err := config.ResolveTarget(provider, effectiveConnectionTarget(o, "")); err == nil {
-			if resolved.MatchedNodeID != "" {
-				return resolved.MatchedNodeID
-			}
-			if resolved.BaseNodeID != "" {
-				return resolved.BaseNodeID
-			}
-		}
+	if id := resolveControlProxyExplicitOrTargetLookup(provider, o); id != "" {
+		return id
 	}
 
 	candidates := make([]string, 0, 6)

@@ -132,7 +132,11 @@ func (a *SSHAdapter) resolveConnectionSnapshotResolved(nodeID string) (config.Co
 	}
 	snap, err := a.cfgProvider.ResolveConnection(nodeID)
 	if err == nil {
-		resolvedAuth, hasResolvedAuth := a.getSessionOverrideForResolved(nodeID, nodeID, snap.Node.Alias)
+		resolvedAuth, hasResolvedAuth := a.getSessionOverrideForResolved(
+			nodeID,
+			nodeID,
+			collectUniqueNodeAndHostAliases(snap.Node.Alias, snap.Host.Alias),
+		)
 		if hasResolvedAuth {
 			if vErr := validateSessionAuthOpenSSHSelectors(resolvedAuth); vErr != nil {
 				return config.ConnectionSnapshot{}, nodeID, SessionAuth{}, false, vErr
@@ -144,7 +148,11 @@ func (a *SSHAdapter) resolveConnectionSnapshotResolved(nodeID string) (config.Co
 		if aliasTarget := a.cfgProvider.FindAlias(strings.TrimSpace(nodeID)); aliasTarget != "" && aliasTarget != nodeID {
 			aliasSnap, aliasErr := a.cfgProvider.ResolveConnection(aliasTarget)
 			if aliasErr == nil {
-				aliasAuth, hasAliasAuth := a.getSessionOverrideForResolved(nodeID, aliasTarget, aliasSnap.Node.Alias)
+				aliasAuth, hasAliasAuth := a.getSessionOverrideForResolved(
+					nodeID,
+					aliasTarget,
+					collectUniqueNodeAndHostAliases(aliasSnap.Node.Alias, aliasSnap.Host.Alias),
+				)
 				if hasAliasAuth {
 					if vErr := validateSessionAuthOpenSSHSelectors(aliasAuth); vErr != nil {
 						return config.ConnectionSnapshot{}, aliasTarget, SessionAuth{}, false, vErr
@@ -191,12 +199,11 @@ func (a *SSHAdapter) Resolve(ctx context.Context, req ResolveRequest) (Effective
 	var sessionOpts SessionControlOptions
 	if req.SessionControl != nil {
 		sessionOpts = cloneSessionControlOptions(*req.SessionControl)
-	} else {
-		var aliases []string
-		if snapErr == nil {
-			aliases = snapshot.Node.Alias
-		}
+	} else if snapErr == nil {
+		aliases := collectUniqueNodeAndHostAliases(snapshot.Node.Alias, snapshot.Host.Alias)
 		sessionOpts, _ = a.getSessionControlOverrideForResolved(req.NodeID, resolvedNodeID, aliases)
+	} else {
+		sessionOpts, _ = a.getSessionControlOverride(req.NodeID)
 	}
 
 	globalCfg := a.cfgProvider.Snapshot()
@@ -399,7 +406,7 @@ func (a *SSHAdapter) resolveEffectiveJumpChain(
 		resolved string
 		err      error
 	)
-	if !tier1JumpWon && hasSnapshot && snapshot.Provenance.IsUnpersistedOpenSSH() {
+	if !tier1JumpWon && ((hasSnapshot && snapshot.Provenance.IsUnpersistedOpenSSH()) || (!hasSnapshot && config.IsOpenSSHNodeID(nodeID))) {
 		resolved, err = resolveUnpersistedOpenSSHJumpChain(a.cfgProvider, rawJump)
 	} else {
 		resolved, err = a.cfgProvider.ResolveProxyJumpChain(rawJump)
@@ -1293,7 +1300,12 @@ func (a *SSHAdapter) resolvePolicyTiers(
 			}
 			tier4OpenSSH = filterNonVirtualTier4Options(rawT4)
 		}
-	} else if !config.IsOpenSSHNodeID(nodeName) {
+	} else if config.IsOpenSSHNodeID(nodeName) {
+		tier4OpenSSH, tier4Proxy, err = a.resolveNoSnapshotOpenSSHTier4(nodeName, hasTier1Auth, tier1Auth)
+		if err != nil {
+			return nil, nil, nil, ssh.UnsetProxySetting(), err
+		}
+	} else {
 		var rawT4 *ssh.Options
 		rawT4, err = a.resolveTier4OpenSSHOptions(nodeName, snapErr, snapshot, hasTier1Auth, tier1Auth)
 		if err != nil {
@@ -1306,6 +1318,68 @@ func (a *SSHAdapter) resolvePolicyTiers(
 		tier4OpenSSH.ImplicitTier4 = true
 	}
 	return tier2Node, tier3Out, tier4OpenSSH, tier4Proxy, nil
+}
+
+func (a *SSHAdapter) resolveNoSnapshotOpenSSHAliasAndCanonical(
+	parser *config.OpenSSHParser,
+	nodeName string,
+	hasTier1Auth bool,
+	tier1Auth SessionAuth,
+) (alias, canon string) {
+	openSSHAlias, canonHost := a.resolveSessionOpenSSHMetadata(parser, nodeName, config.ErrNodeNotFound, config.ConnectionSnapshot{}, hasTier1Auth, tier1Auth)
+	_, _, lookupHost := extractNoSnapshotTargetRefDefaults(nodeName, "")
+	if lookupHost == "" {
+		lookupHost = strings.TrimSpace(config.UnwrapOpenSSHSelector(nodeName))
+	}
+	lookupHost = config.StripHostBrackets(lookupHost)
+	if openSSHAlias != "" {
+		if canonHost == "" && lookupHost != "" && !strings.EqualFold(openSSHAlias, lookupHost) {
+			canonHost = lookupHost
+		}
+		return openSSHAlias, canonHost
+	}
+	if canonHost != "" {
+		return canonHost, ""
+	}
+	return lookupHost, ""
+}
+
+func (a *SSHAdapter) resolveNoSnapshotOpenSSHTier4(
+	nodeName string,
+	hasTier1Auth bool,
+	tier1Auth SessionAuth,
+) (*ssh.Options, ssh.ProxySetting, error) {
+	var noSnapParser *config.OpenSSHParser
+	if a.openSSHParser != nil || config.HasOpenSSHConfig(a.cfgProvider) {
+		noSnapParser = a.getOpenSSHParser()
+	}
+	if noSnapParser == nil {
+		return nil, ssh.UnsetProxySetting(), nil
+	}
+	if err := noSnapParser.Err(); err != nil {
+		return nil, ssh.UnsetProxySetting(), err
+	}
+	alias, canon := a.resolveNoSnapshotOpenSSHAliasAndCanonical(noSnapParser, nodeName, hasTier1Auth, tier1Auth)
+	if alias == "" {
+		return nil, ssh.UnsetProxySetting(), nil
+	}
+	var (
+		rawT4 *ssh.Options
+		err   error
+	)
+	if canon != "" && !strings.EqualFold(alias, canon) {
+		rawT4, err = noSnapParser.GetSSHOptionsWithCanonical(alias, canon)
+	} else {
+		rawT4, err = noSnapParser.GetSSHOptions(alias)
+	}
+	if err != nil {
+		return nil, ssh.UnsetProxySetting(), err
+	}
+	tier4Proxy, err := resolvePrefixedTier4OpenSSHProxySetting(noSnapParser, alias, canon)
+	if err != nil {
+		return nil, ssh.UnsetProxySetting(), err
+	}
+	return rawT4.Clone(), tier4Proxy, nil
 }
 
 func (a *SSHAdapter) resolveTier4OpenSSHProxySetting(
@@ -1866,6 +1940,9 @@ func (a *SSHAdapter) buildTier4FallbackLookupKeys(
 		}
 		if fb.host != "" {
 			appendUnique(true, fb.host)
+		}
+		if !fb.hostOverridden {
+			appendUnique(true, nodeName)
 		}
 	} else if !fb.hostOverridden {
 		appendUnique(true, nodeName)

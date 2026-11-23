@@ -748,11 +748,7 @@ func (o *SshOptions) probeTargetBackgroundSession(
 			}
 		} else {
 			matchedSavedNode = isResolvedSavedNode(resolved)
-			if resolved.MatchedNodeID != "" {
-				nodeID = resolved.MatchedNodeID
-			} else {
-				nodeID = resolved.NodeID
-			}
+			nodeID = resolvedControlLookupNodeID(resolved)
 		}
 	}
 	if probe.probeCandidateBackgroundSession(provider, nodeID, connTarget, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
@@ -777,18 +773,19 @@ func (o *SshOptions) probeTargetBackgroundSession(
 			if !errors.Is(err, config.ErrNodeNotFound) {
 				return false, err
 			}
-		} else {
-			if resolved.MatchedNodeID != "" {
-				candNodeID = resolved.MatchedNodeID
-			} else if resolved.NodeID != "" {
-				candNodeID = resolved.NodeID
-			}
+		} else if id := resolvedControlLookupNodeID(resolved); id != "" {
+			candNodeID = id
 		}
 		if candProbe.probeCandidateBackgroundSession(provider, candNodeID, candTarget, sessionOpts, cliSessionTypeLocked, cliRemoteCmdLocked) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func hasControlProbeSessionAuth(auth adapter.SessionAuth) bool {
+	return auth.ProxyJump != "" || auth.OriginalHost != "" || auth.CanonicalHost != "" ||
+		auth.HostName != "" || auth.User != "" || auth.Port > 0
 }
 
 func (o *SshOptions) probeCandidateBackgroundSession(
@@ -804,7 +801,7 @@ func (o *SshOptions) probeCandidateBackgroundSession(
 	}
 	lookupKey, sessionAuth := resolveControlSessionLookup(o, provider, nodeID, connTarget, target)
 	var adpOpts []adapter.Option
-	if lookupKey != "" && (sessionAuth.ProxyJump != "" || sessionAuth.OriginalHost != "" || sessionAuth.CanonicalHost != "") {
+	if lookupKey != "" && hasControlProbeSessionAuth(sessionAuth) {
 		adpOpts = append(adpOpts, adapter.WithSessionAuthOverride(lookupKey, sessionAuth))
 	}
 	pol, err := adapter.NewSSHAdapter(provider, adpOpts...).Resolve(context.Background(), adapter.ResolveRequest{

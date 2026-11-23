@@ -390,12 +390,55 @@ func effectiveControlConfigJumpOverride(sessionAuth SessionAuth, sessionOpts Ses
 	return "", false
 }
 
+func isDerivedOpenSSHResolvedTarget(resolved config.ResolvedTarget) bool {
+	return resolved.Provenance == config.ProvenanceOpenSSHDerived || config.IsOpenSSHNodeID(resolved.BaseNodeID)
+}
+
+func derivedOpenSSHLookupKey(resolved config.ResolvedTarget) string {
+	if canon := strings.TrimSpace(resolved.CanonicalHost); canon != "" {
+		return config.OpenSSHNodePrefix + canon
+	}
+	if config.IsOpenSSHNodeID(resolved.BaseNodeID) {
+		return resolved.BaseNodeID
+	}
+	if alias := strings.TrimSpace(resolved.OpenSSHAlias); alias != "" {
+		return config.OpenSSHNodePrefix + alias
+	}
+	return resolved.NodeID
+}
+
+func applyResolvedOpenSSHOriginToSessionAuth(resolved config.ResolvedTarget, auth SessionAuth) SessionAuth {
+	if strings.TrimSpace(auth.OriginalHost) == "" && strings.TrimSpace(resolved.OpenSSHAlias) != "" {
+		auth.OriginalHost = strings.TrimSpace(resolved.OpenSSHAlias)
+	}
+	if strings.TrimSpace(auth.CanonicalHost) == "" && strings.TrimSpace(resolved.CanonicalHost) != "" {
+		auth.CanonicalHost = strings.TrimSpace(resolved.CanonicalHost)
+	}
+	return auth
+}
+
+func resolveControlConfigLookupFromResolvedTarget(resolved config.ResolvedTarget, sessionAuth SessionAuth) (string, SessionAuth, bool) {
+	if resolved.MatchedNodeID != "" {
+		if config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
+			sessionAuth = applyResolvedOpenSSHOriginToSessionAuth(resolved, sessionAuth)
+		}
+		return resolved.MatchedNodeID, sessionAuth, true
+	}
+	if isDerivedOpenSSHResolvedTarget(resolved) {
+		return derivedOpenSSHLookupKey(resolved), applyResolvedOpenSSHOriginToSessionAuth(resolved, sessionAuth), true
+	}
+	if resolved.NodeID != "" {
+		return resolved.NodeID, sessionAuth, true
+	}
+	return "", sessionAuth, false
+}
+
 func resolveControlConfigLookupKey(
 	provider config.ConfigProvider,
 	lookupKey, selector string,
 	sessionAuth SessionAuth,
 	sessionOpts SessionControlOptions,
-) (string, error) {
+) (string, SessionAuth, error) {
 	if lookupKey == "" {
 		if provider != nil && strings.TrimSpace(selector) != "" {
 			jump, hasJump := effectiveControlConfigJumpOverride(sessionAuth, sessionOpts)
@@ -404,22 +447,29 @@ func resolveControlConfigLookupKey(
 				hasJump = true
 			}
 			sessUser := strings.TrimSpace(sessionAuth.User)
-			resolved, err := config.ResolveTarget(provider, config.ConnectionTarget{
+			origHost := strings.TrimSpace(sessionAuth.OriginalHost)
+			canonHost := strings.TrimSpace(sessionAuth.CanonicalHost)
+			connTarget := config.ConnectionTarget{
 				Selector:     selector,
-				OriginalHost: strings.TrimSpace(sessionAuth.OriginalHost),
+				OriginalHost: origHost,
 				User:         sessUser,
 				HasUser:      sessUser != "",
 				Port:         sessionAuth.Port,
 				HasPort:      sessionAuth.Port > 0,
 				ProxyJump:    jump,
 				HasProxyJump: hasJump,
-			})
+			}
+			trimmedSel := trimNonPaddedOpenSSH(selector)
+			if canonHost != "" && shouldPropagateControlCanonicalOrigin(provider, trimmedSel, origHost, canonHost) {
+				applyCanonicalHostToControlSelector(provider, &connTarget, trimmedSel, origHost, canonHost)
+			}
+			resolved, err := config.ResolveTarget(provider, connTarget)
 			if err != nil {
 				if !isTargetMissingError(err) {
-					return "", err
+					return "", sessionAuth, err
 				}
-			} else if resolved.MatchedNodeID != "" {
-				return resolved.MatchedNodeID, nil
+			} else if resolvedKey, updatedAuth, ok := resolveControlConfigLookupFromResolvedTarget(resolved, sessionAuth); ok {
+				return resolvedKey, updatedAuth, nil
 			}
 		}
 		// Resolve treats an unknown selector as "no node layer" and falls
@@ -429,11 +479,11 @@ func resolveControlConfigLookupKey(
 	if provider != nil && lookupKey != "" && !config.IsOpenSSHNodeID(lookupKey) {
 		if _, ok := provider.GetNode(lookupKey); !ok {
 			if aliasID := provider.FindAlias(lookupKey); aliasID != "" {
-				return aliasID, nil
+				return aliasID, sessionAuth, nil
 			}
 		}
 	}
-	return lookupKey, nil
+	return lookupKey, sessionAuth, nil
 }
 
 // ResolveControlConfig resolves the effective multiplexing ControlConfig for
@@ -459,7 +509,7 @@ func ResolveControlConfig(
 		sessionJumpPS = ps
 	}
 	var err error
-	lookupKey, err = resolveControlConfigLookupKey(provider, lookupKey, selector, sessionAuth, sessionOpts)
+	lookupKey, sessionAuth, err = resolveControlConfigLookupKey(provider, lookupKey, selector, sessionAuth, sessionOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -1037,6 +1087,53 @@ func resolveSavedControlLookupByKey(
 	return auth, true, false
 }
 
+func resolveTargetControlSessionLookup(
+	provider config.ConfigProvider,
+	lookupKey, nodeID string,
+	resolved config.ResolvedTarget,
+	origHost, canonHost, targetOrig string,
+	auth SessionAuth,
+	resolvedVirtual bool,
+) (string, SessionAuth, bool, bool) {
+	if resolved.MatchedNodeID != "" {
+		if !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
+			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, extractOpenSSHHost(nodeID), targetOrig)
+			if origHost == "" && canonHost == "" {
+				auth.CanonicalHost = resolved.CanonicalHost
+			} else {
+				auth.CanonicalHost = canonHost
+			}
+			return resolved.MatchedNodeID, auth, true, resolvedVirtual
+		}
+		if lookupKey == "" {
+			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, targetOrig)
+			if origHost == "" && canonHost == "" {
+				auth.CanonicalHost = resolved.CanonicalHost
+			} else {
+				auth.CanonicalHost = canonHost
+			}
+			return resolved.MatchedNodeID, auth, false, config.HasOpenSSHConfig(provider)
+		}
+		return "", auth, false, resolvedVirtual
+	}
+	if isDerivedOpenSSHResolvedTarget(resolved) {
+		if lookupKey == "" || lookupKey == resolved.NodeID {
+			auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, targetOrig)
+			if origHost == "" && canonHost == "" {
+				auth.CanonicalHost = resolved.CanonicalHost
+			} else {
+				auth.CanonicalHost = canonHost
+			}
+			return derivedOpenSSHLookupKey(resolved), auth, false, config.HasOpenSSHConfig(provider)
+		}
+		return "", auth, false, resolvedVirtual
+	}
+	if resolved.NodeID != "" && lookupKey == "" {
+		return resolved.NodeID, auth, false, resolvedVirtual
+	}
+	return "", auth, false, resolvedVirtual
+}
+
 func resolveSavedControlSessionLookup(
 	provider config.ConfigProvider,
 	lookupKey, nodeID string,
@@ -1053,19 +1150,10 @@ func resolveSavedControlSessionLookup(
 		resolvedVirtual = isVirtual
 	}
 	if strings.TrimSpace(connTarget.Selector) != "" {
-		if resolved, err := config.ResolveTarget(provider, connTarget); err == nil && resolved.MatchedNodeID != "" {
-			if !config.IsOpenSSHNodeID(resolved.MatchedNodeID) {
-				auth.OriginalHost = firstNonEmptySessionValue(origHost, resolved.OpenSSHAlias, extractOpenSSHHost(nodeID), targetOrig)
-				if origHost == "" && canonHost == "" {
-					auth.CanonicalHost = resolved.CanonicalHost
-				} else {
-					auth.CanonicalHost = canonHost
-				}
-				return resolved.MatchedNodeID, auth, true, resolvedVirtual
-			}
-			if lookupKey == "" {
-				return resolved.MatchedNodeID, auth, false, config.HasOpenSSHConfig(provider)
-			}
+		if resolved, err := config.ResolveTarget(provider, connTarget); err == nil {
+			return resolveTargetControlSessionLookup(
+				provider, lookupKey, nodeID, resolved, origHost, canonHost, targetOrig, auth, resolvedVirtual,
+			)
 		}
 	}
 	return "", auth, false, resolvedVirtual
@@ -1213,11 +1301,14 @@ func resolveControlSessionLookup(
 		savedAuth.HostName = overrideHostName
 		return key, savedAuth
 	}
-	if lookupKey == "" && key != "" {
+	if key != "" && (lookupKey == "" || (config.IsOpenSSHNodeID(key) && !config.IsOpenSSHNodeID(lookupKey))) {
 		lookupKey = key
 	}
+	if origHost == "" && savedAuth.OriginalHost != "" {
+		origHost = savedAuth.OriginalHost
+	}
 	if canonHost == "" {
-		canonHost = strings.TrimSpace(target.CanonicalHost)
+		canonHost = firstNonEmptySessionValue(savedAuth.CanonicalHost, target.CanonicalHost)
 	}
 	auth := SessionAuth{
 		User:      sessUser,

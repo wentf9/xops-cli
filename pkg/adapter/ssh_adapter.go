@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -714,18 +715,46 @@ func NewNonInteractiveConnector(cfgProvider config.ConfigProvider, opts ...ssh.O
 	return newConnector(adp, opts...)
 }
 
+func collectUniqueNodeAndHostAliases(nodeAliases, hostAliases []string) []string {
+	if len(nodeAliases) == 0 && len(hostAliases) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(nodeAliases)+len(hostAliases))
+	for _, al := range nodeAliases {
+		if al != "" && !slices.Contains(out, al) {
+			out = append(out, al)
+		}
+	}
+	for _, al := range hostAliases {
+		if al != "" && !slices.Contains(out, al) {
+			out = append(out, al)
+		}
+	}
+	return out
+}
+
+func (a *SSHAdapter) nodeAndHostAliases(resolvedNodeID string, nodeAliases []string) []string {
+	var hostAliases []string
+	if a != nil && a.cfgProvider != nil && resolvedNodeID != "" {
+		if host, ok := a.cfgProvider.GetHost(resolvedNodeID); ok {
+			hostAliases = host.Alias
+		}
+	}
+	return collectUniqueNodeAndHostAliases(nodeAliases, hostAliases)
+}
+
 func (a *SSHAdapter) resolveNodeIDAndAliases(nodeID string) (string, []string) {
 	if a == nil || a.cfgProvider == nil || nodeID == "" || config.IsOpenSSHNodeID(nodeID) {
 		return nodeID, nil
 	}
 	if node, ok := a.cfgProvider.GetNode(nodeID); ok {
-		return nodeID, node.Alias
+		return nodeID, a.nodeAndHostAliases(nodeID, node.Alias)
 	}
 	if target := a.cfgProvider.FindAlias(strings.TrimSpace(nodeID)); target != "" && target != nodeID {
 		if node, ok := a.cfgProvider.GetNode(target); ok {
-			return target, node.Alias
+			return target, a.nodeAndHostAliases(target, node.Alias)
 		}
-		return target, nil
+		return target, a.nodeAndHostAliases(target, nil)
 	}
 	return nodeID, nil
 }
