@@ -27,6 +27,7 @@ golangci-lint run ./...
 
 - [XOps v2 全新架构定稿规范（Architecture RFC）](./v2-architecture-rfc.md)
 - [XOps v2 全新架构分阶段实施计划（Implementation Plan）](./v2-implementation-plan.md)
+- [XOps v2 本地多平台测试与私有 CI 环境搭建方案](./v2-local-multiplatform-ci.md)
 - [代码架构与治理地图](./governance/architecture-map.md)
 - [架构不变量、隐式契约与防漂移基线](./governance/invariants.md)
 - [OpenSSH 连接多路复用设计方案](./openssh-multiplexing-design.md)

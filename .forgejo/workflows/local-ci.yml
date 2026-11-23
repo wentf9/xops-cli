@@ -1,0 +1,225 @@
+name: XOps v2 Local Multi-Platform CI
+
+on:
+  push:
+    branches: ['refactor/v2-architecture', 'master']
+  workflow_dispatch:
+    inputs:
+      dst_seeds:
+        description: 'DST seed count (default 2000 for push, 10000 for Gate)'
+        default: '2000'
+      run_bsd:
+        description: 'Run FreeBSD native verification'
+        type: boolean
+        default: true
+      run_ubuntu:
+        description: 'Run Ubuntu native verification'
+        type: boolean
+        default: true
+
+env:
+  GORACE: atexit_sleep_ms=0
+
+jobs:
+  linux-fast:
+    runs-on: linux-fast
+    steps:
+      - name: Checkout repository (pure git via Forgejo server URL)
+        run: |
+          set -eu
+          SERVER_URL="${GITHUB_SERVER_URL%/}"
+          AUTH_URL="$(printf '%s' "$SERVER_URL" | sed -E "s#(https?://)#\\1x-access-token:${GITHUB_TOKEN}@#")"
+          rm -rf .git
+          git init -q .
+          git remote add origin "${AUTH_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout -qf FETCH_HEAD
+          git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+      - name: Verify toolchain & docs
+        run: |
+          go version
+          golangci-lint --version
+          if [ -f package.json ] && command -v npm >/dev/null 2>&1; then
+            npm run docs:check
+          fi
+      - name: Build & self-test xopsvet (GOWORK=off)
+        run: |
+          if [ -f tools/xopsvet/go.mod ]; then
+            VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+            mkdir -p bin
+            (cd tools/xopsvet && GOWORK=off go test -race -count=1 ./... && GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet)
+          else
+            echo "Pre-Phase 0: tools/xopsvet/go.mod not created yet, skipping."
+          fi
+      - name: Verify core/ independently (GOWORK=off)
+        run: |
+          if [ -f core/go.mod ]; then
+            VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+            (cd core && GOWORK=off go build ./... && GOWORK=off go vet -vettool="$VETTOOL" ./... && GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./... && GOWORK=off go test -race -shuffle=on -count=1 ./...)
+          else
+            echo "Pre-Phase 0: core/go.mod not created yet, skipping."
+          fi
+      - name: Cross-compile & cross-lint core/ (Windows & macOS)
+        run: |
+          if [ -f core/go.mod ]; then
+            (cd core && GOOS=windows GOARCH=amd64 GOWORK=off go build ./... && GOOS=darwin GOARCH=amd64 GOWORK=off go build ./...)
+            (cd core && GOOS=windows GOARCH=amd64 GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...)
+            (cd core && GOOS=darwin  GOARCH=amd64 GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...)
+          fi
+      - name: Verify root CLI module (via go.work on branch dev)
+        run: |
+          if [ -f tools/xopsvet/go.mod ] && { [ -d cmd/xops ] || [ -d internal ]; }; then
+            VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+            go build ./... && go vet -vettool="$VETTOOL" ./... && golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./... && go test -race -shuffle=on -count=1 ./...
+          fi
+      - name: Run Deterministic Simulation Tests (DST)
+        run: |
+          if [ -d core/internal/pool ]; then
+            (cd core && GOWORK=off XOPS_DST_SEEDS="${{ inputs.dst_seeds || '2000' }}" go test -race -count=1 -run '^TestDST_' ./...)
+          fi
+
+  windows-native:
+    needs: linux-fast
+    runs-on: windows-native
+    steps:
+      - name: Checkout repository (pure git via Forgejo server URL)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $serverUrl = $env:GITHUB_SERVER_URL.TrimEnd('/')
+          $authUrl = $serverUrl -replace '^(https?://)', "`$1x-access-token:$($env:GITHUB_TOKEN)@"
+          if (Test-Path .git) { Remove-Item -Recurse -Force .git }
+          git init -q .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git remote add origin "$authUrl/$($env:GITHUB_REPOSITORY).git"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git fetch --depth 1 origin $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git checkout -qf FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git remote set-url origin "$serverUrl/$($env:GITHUB_REPOSITORY).git"
+      - name: Native Windows toolchain, xopsvet & core/ verification (GOWORK=off)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go version
+          golangci-lint --version
+          gcc --version | Select-Object -First 1
+          make --version | Select-Object -First 1
+          if (!(Test-Path 'tools\xopsvet\go.mod') -and !(Test-Path 'core\go.mod')) {
+            Write-Output 'Pre-Phase 0: running native Windows -race smoke verification.'
+            $baseTmp = if ($env:GOTMPDIR) { $env:GOTMPDIR } else { $env:TEMP }
+            $smoke = Join-Path $baseTmp ('xops-ci-smoke-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $smoke | Out-Null
+            try {
+              Set-Content -Path (Join-Path $smoke 'go.mod') -Encoding utf8NoBOM -Value "module xops.local/smoke`n`ngo 1.27`n"
+              Set-Content -Path (Join-Path $smoke 'smoke_test.go') -Encoding utf8NoBOM -Value 'package smoke; import ("sync/atomic"; "testing"); func TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }'
+              Push-Location $smoke
+              $env:GOWORK = 'off'
+              go test -v -race -count=1 ./...
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              Pop-Location
+            } finally {
+              Set-Location $env:GITHUB_WORKSPACE
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $smoke
+            }
+            exit 0
+          }
+          New-Item -ItemType Directory -Force -Path bin | Out-Null
+          $vettool = Join-Path (Get-Location) ('bin\xopsvet' + (go env GOEXE))
+          Push-Location tools/xopsvet
+          $env:GOWORK = 'off'
+          go test -race -count=1 ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go build -o $vettool ./cmd/xopsvet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+          Push-Location core
+          $env:GOWORK = 'off'
+          go build ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go vet "-vettool=$vettool" ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test -race -shuffle=on -count=1 ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+      - name: Native Windows root CLI & ConPTY/Vault tests (via go.work)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item Env:GOWORK -ErrorAction SilentlyContinue
+          if ((Test-Path 'tools\xopsvet\go.mod') -and ((Test-Path 'cmd\xops') -or (Test-Path 'internal'))) {
+            $vettool = Join-Path (Get-Location) ('bin\xopsvet' + (go env GOEXE))
+            go build ./...
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            go vet "-vettool=$vettool" ./...
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            go test -race -shuffle=on -count=1 ./...
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+  ubuntu-native:
+    needs: linux-fast
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_ubuntu }}
+    runs-on: ubuntu-native
+    steps:
+      - name: Checkout repository (pure git via Forgejo server URL)
+        run: |
+          set -eu
+          SERVER_URL="${GITHUB_SERVER_URL%/}"
+          AUTH_URL="$(printf '%s' "$SERVER_URL" | sed -E "s#(https?://)#\\1x-access-token:${GITHUB_TOKEN}@#")"
+          rm -rf .git
+          git init -q .
+          git remote add origin "${AUTH_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout -qf FETCH_HEAD
+          git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+      - name: Native Ubuntu toolchain & host integration verification
+        run: |
+          uname -a
+          go version
+          which fish zsh make git
+          if [ -f tools/xopsvet/go.mod ] && [ -d internal/host ]; then
+            go test -tags=integration -race -shuffle=on -count=1 ./internal/host/...
+          else
+            TMP_SMOKE="$(mktemp -d /tmp/xops-ci/smoke.XXXXXX)"
+            trap 'rm -rf "$TMP_SMOKE"' EXIT
+            printf 'module xops.local/smoke\n\ngo 1.27\n' > "$TMP_SMOKE/go.mod"
+            printf 'package smoke\nimport ("sync/atomic"; "testing")\nfunc TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }\n' > "$TMP_SMOKE/smoke_test.go"
+            (cd "$TMP_SMOKE" && GOWORK=off go test -v -race -count=1 ./...)
+          fi
+
+  freebsd-native:
+    needs: linux-fast
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_bsd }}
+    runs-on: freebsd-native
+    steps:
+      - name: Checkout repository (pure git via Forgejo server URL)
+        run: |
+          set -eu
+          SERVER_URL="${GITHUB_SERVER_URL%/}"
+          AUTH_URL="$(printf '%s' "$SERVER_URL" | sed -E "s#(https?://)#\\1x-access-token:${GITHUB_TOKEN}@#")"
+          rm -rf .git
+          git init -q .
+          git remote add origin "${AUTH_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout -qf FETCH_HEAD
+          git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+      - name: Native FreeBSD toolchain & core/ verification (GOWORK=off)
+        run: |
+          uname -a
+          go version
+          golangci-lint --version
+          if [ ! -f tools/xopsvet/go.mod ] && [ ! -f core/go.mod ]; then
+            TMP_SMOKE="$(mktemp -d /tmp/xops-ci/smoke.XXXXXX)"
+            trap 'rm -rf "$TMP_SMOKE"' EXIT
+            printf 'module xops.local/smoke\n\ngo 1.27\n' > "$TMP_SMOKE/go.mod"
+            printf 'package smoke\nimport ("sync/atomic"; "testing")\nfunc TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }\n' > "$TMP_SMOKE/smoke_test.go"
+            (cd "$TMP_SMOKE" && GOWORK=off go test -v -race -count=1 ./...)
+            exit 0
+          fi
+          mkdir -p bin
+          VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+          (cd tools/xopsvet && GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet)
+          (cd core && GOWORK=off go build ./... && GOWORK=off go vet -vettool="$VETTOOL" ./... && GOWORK=off go test -race -shuffle=on -count=1 ./...)
