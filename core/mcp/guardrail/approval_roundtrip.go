@@ -61,6 +61,20 @@ func supportsFormElicitation(init *mcp.InitializeParams) bool {
 		(init.Capabilities.Elicitation.Form != nil || init.Capabilities.Elicitation.URL == nil)
 }
 
+// HasActivePendingApproval reports whether req carries a non-expired pending
+// two-step approval challenge belonging to req.Session. It does not mutate
+// pending state or check the operation digest.
+func (g *Guardrail) HasActivePendingApproval(req *mcp.CallToolRequest) bool {
+	if g == nil || req == nil || req.Session == nil || req.Params == nil || req.Params.RequestState == "" {
+		return false
+	}
+	now := time.Now()
+	g.approvalMu.Lock()
+	defer g.approvalMu.Unlock()
+	pending, ok := g.pendingApprovals[req.Params.RequestState]
+	return ok && now.Before(pending.expires) && pending.session == req.Session
+}
+
 // HasMatchingPendingApproval reports whether req carries a non-expired
 // two-step approval challenge bound to the exact session, risk, context,
 // complete input, and policy binding. It does not mutate pending state.

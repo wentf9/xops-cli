@@ -271,7 +271,7 @@ func executeFileAction(
 	if err != nil {
 		return FileOutput{}, err
 	}
-	if current.CanonicalPath != expected.CanonicalPath || current.ParentPath != expected.ParentPath {
+	if current.CanonicalPath != expected.CanonicalPath || current.ParentPath != expected.ParentPath || current.IsDir != expected.IsDir {
 		return FileOutput{}, errors.New("remote file path resolution changed since authorization")
 	}
 
@@ -286,6 +286,9 @@ func executeFileAction(
 	case "patch":
 		return filePatchResolved(ctx, files, input, expectedParentJoined)
 	case "stat":
+		if current.CanonicalPath != "" {
+			input.Path = current.CanonicalPath
+		}
 		return fileStat(ctx, files, input)
 	default:
 		return FileOutput{}, fmt.Errorf("unsupported file action %q (expected read, write, patch, or stat)", input.Action)

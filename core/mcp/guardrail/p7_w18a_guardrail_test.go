@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/wentf9/xops-cli/core/mcp/policy"
@@ -195,5 +196,44 @@ func TestP7W18a_AB18L1_RequestToolApprovalRejectsRoundTripBeforeFallback(t *test
 				}
 			})
 		}
+	}
+}
+
+func TestP7W18a_AB18M1_HasActivePendingApproval(t *testing.T) {
+	acceptOpts := &mcp.ClientOptions{
+		ElicitationHandler: func(context.Context, *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approved": true}}, nil
+		},
+	}
+	ss1 := connectW18aApprovalServerSession(t, "2026-07-28", acceptOpts)
+	ss2 := connectW18aApprovalServerSession(t, "2026-07-28", acceptOpts)
+	cfg := &policy.Config{ApprovalThreshold: "moderate", NoElicitFallback: FallbackDeny}
+	g := New(cfg)
+	ctx := WithPolicy(t.Context(), *cfg, "w18a-active-pending")
+	ri := RiskInput{ToolName: "file", Action: "write", NodeID: "node-1", Paths: []string{"/tmp/x"}}
+	_, pending, err := g.Authorize(ctx, &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{}}, ri, dummyInput{Command: "write"})
+	if err != nil || pending == nil || pending.RequestState == "" {
+		t.Fatalf("mint pending challenge: pending=%+v err=%v", pending, err)
+	}
+	if !g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}) {
+		t.Fatal("HasActivePendingApproval(live own session) = false, want true")
+	}
+	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss2, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}) {
+		t.Fatal("HasActivePendingApproval(cross session) = true, want false")
+	}
+	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: "forged"}}) {
+		t.Fatal("HasActivePendingApproval(forged) = true, want false")
+	}
+	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{}}) {
+		t.Fatal("HasActivePendingApproval(empty) = true, want false")
+	}
+
+	g.approvalMu.Lock()
+	entry := g.pendingApprovals[pending.RequestState]
+	entry.expires = time.Now().Add(-time.Second)
+	g.pendingApprovals[pending.RequestState] = entry
+	g.approvalMu.Unlock()
+	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}) {
+		t.Fatal("HasActivePendingApproval(expired) = true, want false")
 	}
 }

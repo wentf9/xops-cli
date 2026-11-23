@@ -278,7 +278,7 @@ func (r *Runtime) authorizeLexicalPrecheck(
 		if matchErr != nil {
 			return lexCtx, lexOp, nil, nil, matchErr
 		}
-		if matchedLex {
+		if matchedLex || !r.guardrail.HasActivePendingApproval(req) {
 			opID, pending, authErr := r.guardrail.Authorize(lexCtx, req, lexicalRI, boundLex)
 			if authErr != nil || pending != nil {
 				return lexCtx, lexOp, nil, pending, authErr

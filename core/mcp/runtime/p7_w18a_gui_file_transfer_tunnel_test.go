@@ -252,12 +252,23 @@ func TestP7W18a_AB18H1_GUIExecutionProbeAndPOSIXCoercion(t *testing.T) {
 // w18aSymlinkSFTPHandler is a small in-memory SFTP request handler with mutable
 // symlink resolution for testing AB18-M1 canonicalization and TOCTOU defense.
 type w18aSymlinkSFTPHandler struct {
-	mu       sync.Mutex
-	files    map[string][]byte
-	dirs     map[string]bool
-	symlinks map[string]string // link path -> target path
-	reads    atomic.Int32
-	writes   atomic.Int32
+	mu          sync.Mutex
+	files       map[string][]byte
+	dirs        map[string]bool
+	symlinks    map[string]string // link path -> target path
+	reads       atomic.Int32
+	writes      atomic.Int32
+	inspections atomic.Int32
+	lists       atomic.Int32
+	onAfterStat func(resolved string)
+}
+
+func (h *w18aSymlinkSFTPHandler) swapFileToDir(p string) {
+	clean := path.Clean(p)
+	h.mu.Lock()
+	delete(h.files, clean)
+	h.dirs[clean] = true
+	h.mu.Unlock()
 }
 
 func newW18aSymlinkSFTPHandler() *w18aSymlinkSFTPHandler {
@@ -361,6 +372,7 @@ func (h *w18aSymlinkSFTPHandler) existsLocked(p string) bool {
 }
 
 func (h *w18aSymlinkSFTPHandler) RealPath(p string) (string, error) {
+	h.inspections.Add(1)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	resolved, err := h.resolveLocked(p, true)
@@ -374,6 +386,7 @@ func (h *w18aSymlinkSFTPHandler) RealPath(p string) (string, error) {
 }
 
 func (h *w18aSymlinkSFTPHandler) Readlink(p string) (string, error) {
+	h.inspections.Add(1)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	resolved, err := h.resolveLocked(p, false)
@@ -387,6 +400,7 @@ func (h *w18aSymlinkSFTPHandler) Readlink(p string) (string, error) {
 }
 
 func (h *w18aSymlinkSFTPHandler) Lstat(r *pkgsftp.Request) (pkgsftp.ListerAt, error) {
+	h.inspections.Add(1)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	resolved, err := h.resolveLocked(r.Filepath, false)
@@ -406,6 +420,12 @@ func (h *w18aSymlinkSFTPHandler) Lstat(r *pkgsftp.Request) (pkgsftp.ListerAt, er
 }
 
 func (h *w18aSymlinkSFTPHandler) Filelist(r *pkgsftp.Request) (pkgsftp.ListerAt, error) {
+	var postStat func()
+	defer func() {
+		if postStat != nil {
+			postStat()
+		}
+	}()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	resolved, err := h.resolveLocked(r.Filepath, true)
@@ -414,6 +434,12 @@ func (h *w18aSymlinkSFTPHandler) Filelist(r *pkgsftp.Request) (pkgsftp.ListerAt,
 	}
 	switch r.Method {
 	case "Stat":
+		h.inspections.Add(1)
+		if h.onAfterStat != nil {
+			cb := h.onAfterStat
+			target := resolved
+			postStat = func() { cb(target) }
+		}
 		if h.dirs[resolved] {
 			return w10aListerAt{w10aSynthFileInfo{name: path.Base(resolved), mode: os.ModeDir | 0o755}}, nil
 		}
@@ -422,6 +448,7 @@ func (h *w18aSymlinkSFTPHandler) Filelist(r *pkgsftp.Request) (pkgsftp.ListerAt,
 		}
 		return nil, os.ErrNotExist
 	case "List":
+		h.lists.Add(1)
 		if !h.dirs[resolved] {
 			return nil, os.ErrNotExist
 		}
@@ -445,6 +472,7 @@ func (h *w18aSymlinkSFTPHandler) Filelist(r *pkgsftp.Request) (pkgsftp.ListerAt,
 		}
 		return w10aListerAt(out), nil
 	case "Readlink":
+		h.inspections.Add(1)
 		resolvedNoFollow, err := h.resolveLocked(r.Filepath, false)
 		if err != nil {
 			return nil, err
@@ -588,6 +616,8 @@ func TestP7W18a_AB18M1_FileCanonicalProtectedPathsAndTOCTOU(t *testing.T) {
 	t.Run("read_and_stat_symlinks_disclose_canonical_protected_paths", testP7W18aFileReadStatSymlinks)
 	t.Run("write_parent_symlink_and_final_symlink_rejection", testP7W18aFileWriteParentSymlink)
 	t.Run("two_step_toctou_symlink_retargeting_rejected", testP7W18aFileTwoStepTOCTOU)
+	t.Run("forged_roundtrip_rejected_before_ssh_on_lexical_need_approval", testP7W18aForgedRoundTripPreSSH)
+	t.Run("stat_isdir_toctou_and_canonical_path_pinning", testP7W18aFileStatIsDirTOCTOUAndPinning)
 }
 
 func newW18aFileSymlinkFixture() *w18aSymlinkSFTPHandler {
@@ -715,6 +745,154 @@ func testP7W18aFileTwoStepTOCTOU(t *testing.T) {
 	}
 	if h.reads.Load() != readsBefore {
 		t.Fatalf("TOCTOU retargeted file was read (%d -> %d)", readsBefore, h.reads.Load())
+	}
+}
+
+func testP7W18aForgedRoundTripPreSSH(t *testing.T) {
+	h := newW18aFileSymlinkFixture()
+	r, ss1, _, audit := startW18aStdioSFTPRuntime(t, &policy.Config{
+		ApprovalThreshold: "moderate",
+		NoElicitFallback:  guardrail.FallbackDeny,
+		ProtectedPaths:    []string{"/etc"},
+	}, h.handlers(), "2026-07-28", func(_ context.Context, _ *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approved": true}}, nil
+	})
+	ss2, _ := connectW17aInMemorySession(t, r, "2026-07-28", &mcp.ClientOptions{
+		ElicitationHandler: func(_ context.Context, _ *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approved": true}}, nil
+		},
+	})
+
+	// Mint a live pending token on ss2 so we can test cross-session replay too.
+	fileIn := FileInput{NodeID: "files", Action: "read", Path: "/etc/shadow"}
+	otherPending, _, err := r.fileHandler(t.Context(), &mcp.CallToolRequest{Session: ss2, Params: &mcp.CallToolParamsRaw{}}, fileIn)
+	if err != nil || otherPending == nil || otherPending.RequestState == "" {
+		t.Fatalf("mint ss2 pending token: pending=%+v err=%v", otherPending, err)
+	}
+	if h.inspections.Load() != 0 {
+		t.Fatalf("lexical Round 1 opened SFTP (%d inspections)", h.inspections.Load())
+	}
+
+	acceptMap := mcp.InputResponseMap{"approval": &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approved": true}}}
+	invalidParams := []*mcp.CallToolParamsRaw{
+		{RequestState: "forged-state", InputResponses: acceptMap},
+		{InputResponses: acceptMap},
+		{RequestState: otherPending.RequestState, InputResponses: acceptMap},
+	}
+	transferIn := TransferFileInput{
+		NodeID:     "files",
+		Direction:  "pull",
+		LocalPath:  filepath.Join(t.TempDir(), "shadow.out"),
+		RemotePath: "/etc/shadow",
+	}
+
+	for _, params := range invalidParams {
+		assertW18aInvalidRoundTripPreSSH(t, r, ss1, h, audit, params, fileIn, transferIn)
+	}
+
+	// Legitimate canonical Round 2 on ss1 still succeeds end-to-end.
+	canonIn := FileInput{NodeID: "files", Action: "read", Path: "/tmp/shadow_link"}
+	pending, _, err := r.fileHandler(t.Context(), &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{}}, canonIn)
+	if err != nil || pending == nil || pending.RequestState == "" {
+		t.Fatalf("canonical round 1: pending=%+v err=%v", pending, err)
+	}
+	_, out, err := r.fileHandler(t.Context(), &mcp.CallToolRequest{
+		Session: ss1,
+		Params:  &mcp.CallToolParamsRaw{RequestState: pending.RequestState, InputResponses: acceptMap},
+	}, canonIn)
+	if err != nil || !strings.Contains(out.Content, "root:secret") {
+		t.Fatalf("legitimate canonical round 2 failed: out=%+v err=%v", out, err)
+	}
+}
+
+func assertW18aInvalidRoundTripPreSSH(
+	t *testing.T,
+	r *Runtime,
+	ss *mcp.ServerSession,
+	h *w18aSymlinkSFTPHandler,
+	audit *w11aAuditRecorder,
+	params *mcp.CallToolParamsRaw,
+	fileIn FileInput,
+	transferIn TransferFileInput,
+) {
+	t.Helper()
+	audit.reset()
+	h.inspections.Store(0)
+	if pending, _, err := r.fileHandler(t.Context(), &mcp.CallToolRequest{Session: ss, Params: params}, fileIn); err == nil || pending != nil {
+		t.Fatalf("fileHandler accepted invalid round-trip %+v: pending=%+v err=%v", params, pending, err)
+	}
+	if h.inspections.Load() != 0 {
+		t.Fatalf("fileHandler dialed SFTP (%d inspections) on invalid round-trip %+v", h.inspections.Load(), params)
+	}
+	if entries := audit.snapshot(); len(entries) == 0 || entries[len(entries)-1].Outcome != "denied" {
+		t.Fatalf("fileHandler invalid round-trip %+v missing denied audit: %+v", params, entries)
+	}
+
+	audit.reset()
+	h.inspections.Store(0)
+	if pending, _, err := r.stdioTransferHandler(t.Context(), &mcp.CallToolRequest{Session: ss, Params: params}, transferIn); err == nil || pending != nil {
+		t.Fatalf("stdioTransferHandler accepted invalid round-trip %+v: pending=%+v err=%v", params, pending, err)
+	}
+	if h.inspections.Load() != 0 {
+		t.Fatalf("stdioTransferHandler dialed SFTP (%d inspections) on invalid round-trip %+v", h.inspections.Load(), params)
+	}
+	if entries := audit.snapshot(); len(entries) == 0 || entries[len(entries)-1].Outcome != "denied" {
+		t.Fatalf("stdioTransferHandler invalid round-trip %+v missing denied audit: %+v", params, entries)
+	}
+}
+
+func testP7W18aFileStatIsDirTOCTOUAndPinning(t *testing.T) {
+	// Part A: IsDir flip between Inspect (regular file -> Allow) and Execute
+	// (directory containing protected /opt/app/secrets) MUST fail closed.
+	h := newW18aSymlinkSFTPHandler()
+	h.setFile("/opt/app", []byte("plain-file"))
+	var flipped atomic.Bool
+	h.onAfterStat = func(resolved string) {
+		if resolved == "/opt/app" && flipped.CompareAndSwap(false, true) {
+			h.swapFileToDir("/opt/app")
+			h.setFile("/opt/app/secrets/db.env", []byte("SECRET=1"))
+		}
+	}
+	_, _, client, _ := startW18aStdioSFTPRuntime(t, &policy.Config{
+		ApprovalThreshold: "moderate",
+		NoElicitFallback:  guardrail.FallbackDeny,
+		ProtectedPaths:    []string{"/opt/app/secrets"},
+	}, h.handlers(), "2026-07-28", func(_ context.Context, _ *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		return &mcp.ElicitResult{Action: "decline"}, nil
+	})
+	res, err := client.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "file",
+		Arguments: FileInput{NodeID: "files", Action: "stat", Path: "/opt/app"},
+	})
+	if err != nil || !res.IsError {
+		t.Fatalf("stat IsDir flip TOCTOU succeeded: res=%+v err=%v", res, err)
+	}
+	if !strings.Contains(res.Content[0].(*mcp.TextContent).Text, "remote file path resolution changed since authorization") {
+		t.Fatalf("stat IsDir flip error = %q, want path resolution changed", res.Content[0].(*mcp.TextContent).Text)
+	}
+	if h.lists.Load() != 0 {
+		t.Fatalf("stat IsDir flip listed directory %d times", h.lists.Load())
+	}
+
+	// Part B: file(action=stat) executes against pinned canonical path.
+	h2 := newW18aFileSymlinkFixture()
+	_, _, client2, _ := startW18aStdioSFTPRuntime(t, &policy.Config{
+		ApprovalThreshold: "moderate",
+		NoElicitFallback:  guardrail.FallbackDeny,
+		ProtectedPaths:    []string{"/etc"},
+	}, h2.handlers(), "2026-07-28", func(_ context.Context, _ *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approved": true}}, nil
+	})
+	res2, err := client2.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "file",
+		Arguments: FileInput{NodeID: "files", Action: "stat", Path: "/tmp/etc_dir_link"},
+	})
+	if err != nil || res2.IsError {
+		t.Fatalf("approved stat on symlink failed: res=%+v err=%v", res2, err)
+	}
+	out := decodeFileOutput(t, res2)
+	if !out.IsDir || !strings.HasPrefix(out.Content, "/etc/\n") {
+		t.Fatalf("stat output did not execute against pinned canonical path /etc: %+v", out)
 	}
 }
 
