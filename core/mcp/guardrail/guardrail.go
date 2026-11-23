@@ -68,6 +68,15 @@ func (g *Guardrail) evaluateDecision(ctx context.Context, input RiskInput) Decis
 	return g.EvaluateContext(ctx, input)
 }
 
+func (g *Guardrail) logDenied(ctx context.Context, entry AuditEntry, cause error) error {
+	entry.Outcome = "denied"
+	entry.Error = cause.Error()
+	if auditErr := g.log(ctx, entry); auditErr != nil {
+		return errors.Join(cause, fmt.Errorf("audit log failed: %w", auditErr))
+	}
+	return cause
+}
+
 // WithGuardrail wraps any typed tool handler with the full guardrail pipeline:
 // classify -> policy -> approval -> pre-audit intent -> execute -> post-audit result.
 //
@@ -110,17 +119,18 @@ func WithGuardrail[In, Out any](
 
 		switch decision {
 		case Allow:
+			if hasApprovalRoundTripParams(req) {
+				if err := g.consumeApprovalResponse(ctx, req, risk, ri, input); err != nil {
+					return nil, zero, g.logDenied(ctx, entry, err)
+				}
+				entry.Decision = "approved"
+			}
 			// Explicitly permitted by policy; proceed to intent audit and execution.
 
 		case NeedApproval:
 			pending, err := g.requestToolApproval(ctx, req, risk, ri, input)
 			if err != nil {
-				entry.Outcome = "denied"
-				entry.Error = err.Error()
-				if auditErr := g.log(ctx, entry); auditErr != nil {
-					return nil, zero, errors.Join(err, fmt.Errorf("audit log failed: %w", auditErr))
-				}
-				return nil, zero, err
+				return nil, zero, g.logDenied(ctx, entry, err)
 			}
 			if pending != nil {
 				entry.Outcome = "approval_requested"

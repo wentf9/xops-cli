@@ -34,6 +34,9 @@ const (
 	// remote script. It covers an uncompressed-ish 4K PNG (~25 MiB encoded).
 	CaptureOutputLimit = 48 << 20
 
+	maxDecodeImageDimension = 16384
+	maxDecodeImagePixels    = 64_000_000
+
 	imageBeginMarker = "___MCP_GUI_IMG_BEGIN___"
 	imageEndMarker   = "___MCP_GUI_IMG_END___"
 )
@@ -339,6 +342,17 @@ func ExtractAndProcessImage(output string) ([]byte, string, error) {
 func ProcessImage(raw []byte) ([]byte, string, error) {
 	if isWebP(raw) {
 		return raw, "image/webp", nil
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		return nil, "", fmt.Errorf("decode image config: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return nil, "", errors.New("decoded image has empty dimensions")
+	}
+	if cfg.Width > maxDecodeImageDimension || cfg.Height > maxDecodeImageDimension ||
+		int64(cfg.Width)*int64(cfg.Height) > maxDecodeImagePixels {
+		return nil, "", fmt.Errorf("image dimensions %dx%d exceed maximum allowed limits", cfg.Width, cfg.Height)
 	}
 	src, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {

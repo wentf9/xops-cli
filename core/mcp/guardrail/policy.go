@@ -3,7 +3,6 @@ package guardrail
 import (
 	"fmt"
 	"path"
-	"path/filepath"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/mcp/policy"
@@ -46,12 +45,12 @@ func ValidateConfig(cfg *policy.Config) error {
 		return nil
 	}
 	for _, pattern := range cfg.BlockedPatterns {
-		if _, err := filepath.Match(pattern, ""); err != nil {
+		if err := validateGuardrailGlob(pattern); err != nil {
 			return fmt.Errorf("invalid blocked pattern %q: %w", pattern, err)
 		}
 	}
 	for pattern := range cfg.NodeOverrides {
-		if _, err := filepath.Match(pattern, ""); err != nil {
+		if err := validateGuardrailGlob(pattern); err != nil {
 			return fmt.Errorf("invalid node override pattern %q: %w", pattern, err)
 		}
 	}
@@ -93,7 +92,7 @@ func (p *Policy) Evaluate(risk RiskLevel, input RiskInput) Decision {
 	}
 	for _, pattern := range p.cfg.BlockedPatterns {
 		for _, candidate := range candidates {
-			matched, err := filepath.Match(pattern, candidate)
+			matched, err := matchGuardrailGlob(pattern, candidate)
 			if err != nil || matched {
 				// Fail-closed: deny if pattern matches or if pattern matching produces an error
 				return Deny
@@ -125,15 +124,27 @@ func (p *Policy) thresholdForNode(nodeID string) RiskLevel {
 	if nodeID == "" {
 		return ParseRiskLevel(p.cfg.ApprovalThreshold)
 	}
+	var (
+		matchedAny bool
+		strictest  RiskLevel
+	)
 	for pattern, override := range p.cfg.NodeOverrides {
-		matched, err := filepath.Match(pattern, nodeID)
+		matched, err := matchGuardrailGlob(pattern, nodeID)
 		if err != nil {
-			// Fail-closed: use lowest threshold (strictest approval) on pattern error
+			// Fail-closed: any malformed override pattern enforces the strictest
+			// approval threshold regardless of map iteration order.
 			return Safe
 		}
 		if matched {
-			return ParseRiskLevel(override.ApprovalThreshold)
+			level := ParseRiskLevel(override.ApprovalThreshold)
+			if !matchedAny || level < strictest {
+				strictest = level
+				matchedAny = true
+			}
 		}
+	}
+	if matchedAny {
+		return strictest
 	}
 	return ParseRiskLevel(p.cfg.ApprovalThreshold)
 }

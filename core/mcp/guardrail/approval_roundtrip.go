@@ -16,6 +16,44 @@ type pendingApproval struct {
 	expires time.Time
 }
 
+func hasApprovalRoundTripParams(req *mcp.CallToolRequest) bool {
+	return req != nil && req.Params != nil && (req.Params.RequestState != "" || len(req.Params.InputResponses) > 0)
+}
+
+func approvalBindingDigest(risk RiskLevel, ri RiskInput, input any, binding string) ([32]byte, error) {
+	data, err := json.Marshal(struct {
+		Risk    RiskLevel
+		Context RiskInput
+		Input   any
+		Binding string
+	}{risk, ri, input, binding})
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("bind approval input: %w", err)
+	}
+	return sha256.Sum256(data), nil
+}
+
+// consumeApprovalResponse validates and consumes two-step approval round-trip
+// state carried on a request even when policy currently evaluates to Allow.
+func (g *Guardrail) consumeApprovalResponse(ctx context.Context, req *mcp.CallToolRequest, risk RiskLevel, ri RiskInput, input any) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("approval cancelled: %w", err)
+	}
+	if req == nil || req.Session == nil {
+		return fmt.Errorf("approval session unavailable")
+	}
+	if req.Params == nil {
+		return fmt.Errorf("approval tool parameters unavailable")
+	}
+	_, _, binding := g.invocation(ctx)
+	digest, err := approvalBindingDigest(risk, ri, input, binding)
+	if err != nil {
+		return err
+	}
+	_, err = g.advanceApproval(ctx, req, risk, ri, digest)
+	return err
+}
+
 // requestToolApproval binds a single-use challenge to the full typed input,
 // tool, risk and session. No remote effect happens before it is consumed.
 func (g *Guardrail) requestToolApproval(ctx context.Context, req *mcp.CallToolRequest, risk RiskLevel, ri RiskInput, input any) (*mcp.CallToolResult, error) {
@@ -36,16 +74,10 @@ func (g *Guardrail) requestToolApproval(ctx context.Context, req *mcp.CallToolRe
 	if req.Params == nil {
 		return nil, fmt.Errorf("approval tool parameters unavailable")
 	}
-	data, err := json.Marshal(struct {
-		Risk    RiskLevel
-		Context RiskInput
-		Input   any
-		Binding string
-	}{risk, ri, input, binding})
+	digest, err := approvalBindingDigest(risk, ri, input, binding)
 	if err != nil {
-		return nil, fmt.Errorf("bind approval input: %w", err)
+		return nil, err
 	}
-	digest := sha256.Sum256(data)
 	return g.advanceApproval(ctx, req, risk, ri, digest)
 }
 

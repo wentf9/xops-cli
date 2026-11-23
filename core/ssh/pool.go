@@ -8,6 +8,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -54,6 +55,12 @@ type PooledClient struct {
 	evictMu sync.Mutex
 	evicted bool
 	onEvict func()
+
+	// retiredAborted claims single-winner teardown ownership when a retired
+	// PooledClient is collected by concurrent detachForEvict /
+	// detachActiveForEvict / detachActiveForInterrupt calls while remaining in
+	// connPool.retired for RetiredCount() and CloseAll().
+	retiredAborted atomic.Bool
 }
 
 // setEvictHook registers a reverse teardown callback invoked synchronously upon
@@ -459,6 +466,15 @@ func closeBatchDescendantsSkipping(children []*PooledClient, skipClient *PooledC
 		if child == nil || (skipClient != nil && child == skipClient) || (skipHop != nil && child.hopConn == skipHop) {
 			continue
 		}
+		// rootConn has already been aborted by detachAndAbortRoot before this
+		// pass, so any sibling proxyChanConn that has already entered
+		// closeOnceBody() is guaranteed to drain on its own goroutine; skipping
+		// closeSelf() prevents mutual proxyChanConn.closeOnce.Do AB-BA cycles.
+		if pc, ok := child.hopConn.(*proxyChanConn); ok && pc.isClosing() {
+			child.stopKeepAlive()
+			child.triggerEvictHook()
+			continue
+		}
 		_ = child.closeSelf()
 	}
 }
@@ -625,12 +641,20 @@ func (p *connPool) collectDescendantsLocked(ancestor *PooledClient) ([]HopDigest
 	return keys, clients
 }
 
-func (p *connPool) collectRetiredDescendantsLocked(ancestor *PooledClient) []*PooledClient {
+func (p *connPool) collectRetiredDescendantsLocked(ancestor *PooledClient, claimForClose bool) []*PooledClient {
 	var clients []*PooledClient
 	for _, child := range p.retired {
-		if p.isDescendantLocked(child, ancestor) {
-			clients = append(clients, child)
+		if !p.isDescendantLocked(child, ancestor) {
+			continue
 		}
+		if claimForClose {
+			if !child.retiredAborted.CompareAndSwap(false, true) {
+				continue
+			}
+		} else if child.retiredAborted.Load() {
+			continue
+		}
+		clients = append(clients, child)
 	}
 	return clients
 }
@@ -646,6 +670,9 @@ func (p *connPool) collectRetiredForInterruptLocked(
 			continue
 		}
 		if entry == root || p.matchesInterruptedEntryLocked(entry, root, target, rootConn, comparableRoot) {
+			if !entry.retiredAborted.CompareAndSwap(false, true) {
+				continue
+			}
 			clients = append(clients, entry)
 		}
 	}
@@ -835,7 +862,7 @@ func (p *connPool) detachForEvict(key HopDigest, dead *PooledClient, trackDead b
 	activeKey, removedSelf := p.activeKeyLocked(key, dead)
 	if removedSelf || trackDead || dead.RootConn != nil {
 		descKeys, descendants = p.collectDescendantsLocked(dead)
-		retiredDescendants = p.collectRetiredDescendantsLocked(dead)
+		retiredDescendants = p.collectRetiredDescendantsLocked(dead, trackDead)
 	}
 	if removedSelf {
 		delete(p.active, activeKey)
@@ -883,7 +910,7 @@ func (p *connPool) detachActiveForEvict(target *PooledClient) *evictionBatch {
 		target.triggerEvictHook()
 		return nil
 	}
-	retiredDescendants := p.collectRetiredDescendantsLocked(target)
+	retiredDescendants := p.collectRetiredDescendantsLocked(target, true)
 	activeKey, isActive := p.activeKeyLocked(ZeroHopDigest, target)
 	if !isActive {
 		p.mu.Unlock()

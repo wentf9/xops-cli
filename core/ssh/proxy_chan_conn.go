@@ -394,6 +394,10 @@ func (c *proxyChanConn) Write(p []byte) (int, error) {
 	return res.n, res.err
 }
 
+func (c *proxyChanConn) isClosing() bool {
+	return c != nil && c.closed.Load()
+}
+
 func (c *proxyChanConn) Close() error {
 	if c == nil {
 		return nil

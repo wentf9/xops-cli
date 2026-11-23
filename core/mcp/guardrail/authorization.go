@@ -38,6 +38,13 @@ func (g *Guardrail) Authorize(ctx context.Context, req *mcp.CallToolRequest, inp
 		Command: input.Command, Details: input.Details, RiskLevel: risk.String(), Decision: decision.String()}
 	switch decision {
 	case Allow:
+		if hasApprovalRoundTripParams(req) {
+			if approveErr := g.consumeApprovalResponse(ctx, req, risk, input, completeInput); approveErr != nil {
+				entry.Outcome, entry.Error = "denied", approveErr.Error()
+				return "", nil, errors.Join(approveErr, g.log(ctx, entry))
+			}
+			entry.Decision = "approved"
+		}
 		// Explicitly permitted by policy; proceed to authorization audit.
 	case NeedApproval:
 		pending, approveErr := g.requestToolApproval(ctx, req, risk, input, completeInput)

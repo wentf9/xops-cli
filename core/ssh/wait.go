@@ -18,6 +18,12 @@ func (c *Client) Wait(ctx context.Context) error {
 }
 
 func (c *Client) wait(ctx context.Context, interval, timeout time.Duration) (retErr error) {
+	if ctx == nil {
+		return errors.New("SSH wait context is nil")
+	}
+	if c == nil || c.sshClient == nil || c.sshClient.Conn == nil {
+		return errors.New("SSH client is not connected")
+	}
 	done := make(chan struct{})
 	var waitErr error
 	go func() {
