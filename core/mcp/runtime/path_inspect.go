@@ -354,6 +354,20 @@ func (r *Runtime) abortPreInspection(
 	return cause
 }
 
+func diffScopePaths(lexical, effective guardrail.RiskInput) (addedPaths, addedRecursive []string) {
+	for _, p := range effective.Paths {
+		if !slices.Contains(lexical.Paths, p) {
+			addedPaths = append(addedPaths, p)
+		}
+	}
+	for _, p := range effective.RecursivePaths {
+		if !slices.Contains(lexical.RecursivePaths, p) && !slices.Contains(lexical.Paths, p) {
+			addedRecursive = append(addedRecursive, p)
+		}
+	}
+	return addedPaths, addedRecursive
+}
+
 func (r *Runtime) canonicalScopeEscalated(
 	lexCtx context.Context,
 	effCtx context.Context,
@@ -363,7 +377,21 @@ func (r *Runtime) canonicalScopeEscalated(
 	if guardrail.Classify(effectiveRI) > guardrail.Classify(lexicalRI) {
 		return true
 	}
-	return r.guardrail.HasProtectedPath(effCtx, effectiveRI) && !r.guardrail.HasProtectedPath(lexCtx, lexicalRI)
+	// Decision ordering is Deny(0) < NeedApproval(1) < Allow(2); smaller is stricter.
+	if r.guardrail.EvaluateContext(effCtx, effectiveRI) < r.guardrail.EvaluateContext(lexCtx, lexicalRI) {
+		return true
+	}
+	if r.guardrail.HasProtectedPath(effCtx, effectiveRI) && !r.guardrail.HasProtectedPath(lexCtx, lexicalRI) {
+		return true
+	}
+	addedPaths, addedRecursive := diffScopePaths(lexicalRI, effectiveRI)
+	if len(addedPaths) == 0 && len(addedRecursive) == 0 {
+		return false
+	}
+	return r.guardrail.HasProtectedPath(effCtx, guardrail.RiskInput{
+		Paths:          addedPaths,
+		RecursivePaths: addedRecursive,
+	})
 }
 
 func (r *Runtime) closePreAuthorized(preAuth *preAuthorizedOp, effectiveRI guardrail.RiskInput, cause error) error {

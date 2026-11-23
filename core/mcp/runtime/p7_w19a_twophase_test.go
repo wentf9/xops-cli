@@ -715,7 +715,9 @@ func (g *w19aFailExecuteGate) Enter(ctx context.Context, a ports.Admission) (por
 func TestP7W19a_AB19L1_SinglePromptAndZeroOrphanedAuthorizedAudits(t *testing.T) {
 	t.Run("structural_validation_fails_before_precheck_without_prompts_or_audit", testP7W19aStructuralValidationBeforePrecheck)
 	t.Run("benign_canonical_and_dir_expansion_single_prompt_and_single_op", testP7W19aSinglePromptBenignCanonicalAndDirExpansion)
+	t.Run("direct_protected_file_read_and_stat_single_prompt_and_single_op", testP7W19aDirectProtectedOpsSinglePrompt)
 	t.Run("canonical_escalation_prompts_protected_target_with_zero_orphans", testP7W19aEscalationZeroOrphans)
+	t.Run("protected_to_protected_symlink_redirect_reprompts_canonical_target", testP7W19aProtectedToProtectedSymlinkEscalates)
 	t.Run("enter_and_preauth_inspect_failures_record_terminal_error_audit", testP7W19aEnterAndInspectFailuresCloseAudit)
 }
 
@@ -891,6 +893,234 @@ func testP7W19aEscalationZeroOrphans(t *testing.T) {
 					t.Fatalf("declined escalation wrote %d times", h.writes.Load())
 				}
 			})
+		}
+	}
+}
+
+func testP7W19aDirectProtectedOpsSinglePrompt(t *testing.T) {
+	for _, protocol := range []string{"2026-07-28", "2025-11-25"} {
+		t.Run(protocol, func(t *testing.T) {
+			h := newW18aSymlinkSFTPHandler()
+			h.setFile("/etc/passwd", []byte("root:x:0:0\n"))
+
+			var prompts atomic.Int32
+			_, _, client, _, audit := startW19aMultiNodeRuntime(t, &policy.Config{
+				ApprovalThreshold: "moderate",
+				NoElicitFallback:  guardrail.FallbackDeny,
+				ProtectedPaths:    []string{"/etc"},
+			}, h.handlers(), protocol, func(_ context.Context, _ *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+				prompts.Add(1)
+				return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approved": true}}, nil
+			}, nil)
+
+			for _, in := range []FileInput{
+				{NodeID: "node-a", Action: "read", Path: "/etc/passwd"},
+				{NodeID: "node-a", Action: "stat", Path: "/etc"},
+			} {
+				audit.reset()
+				prompts.Store(0)
+				res, err := client.CallTool(t.Context(), &mcp.CallToolParams{Name: "file", Arguments: in})
+				if err != nil || res.IsError {
+					t.Fatalf("%s(%s) failed: res=%+v err=%v", in.Action, in.Path, res, err)
+				}
+				if prompts.Load() != 1 {
+					t.Fatalf("%s(%s) prompted %d times, want 1", in.Action, in.Path, prompts.Load())
+				}
+				entries := audit.snapshot()
+				if got := countW19aAuthorizedAudits(entries); got != 1 {
+					t.Fatalf("%s(%s) authorized audit count = %d, want 1: %+v", in.Action, in.Path, got, entries)
+				}
+				assertW19aNoOrphanedAuthorizedAudits(t, entries)
+			}
+		})
+	}
+}
+
+type w19aSymlinkUploadHandler struct {
+	*w18aSymlinkSFTPHandler
+}
+
+func (h *w19aSymlinkUploadHandler) Filecmd(r *pkgsftp.Request) error {
+	switch r.Method {
+	case "Symlink":
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		linkPath, err := h.resolveLocked(r.Target, false)
+		if err != nil {
+			return err
+		}
+		h.symlinks[linkPath] = r.Filepath
+		h.writes.Add(1)
+		return nil
+	case "Rename", "PosixRename":
+		h.mu.Lock()
+		src, err := h.resolveLocked(r.Filepath, false)
+		if err == nil {
+			if linkTarget, isLink := h.symlinks[src]; isLink {
+				dst, dstErr := h.resolveLocked(r.Target, false)
+				if dstErr != nil {
+					h.mu.Unlock()
+					return dstErr
+				}
+				h.symlinks[dst] = linkTarget
+				delete(h.symlinks, src)
+				h.mu.Unlock()
+				return nil
+			}
+		}
+		h.mu.Unlock()
+	}
+	return h.w18aSymlinkSFTPHandler.Filecmd(r)
+}
+
+func (h *w19aSymlinkUploadHandler) handlers() pkgsftp.Handlers {
+	return pkgsftp.Handlers{
+		FileGet:  h.w18aSymlinkSFTPHandler,
+		FilePut:  h.w18aSymlinkSFTPHandler,
+		FileCmd:  h,
+		FileList: h.w18aSymlinkSFTPHandler,
+	}
+}
+
+func assertW19aProtectedRedirectCase(
+	t *testing.T,
+	protocol string,
+	acceptCanonical bool,
+	protectedPaths []string,
+	handlers pkgsftp.Handlers,
+	params *mcp.CallToolParams,
+	wantDisclosed string,
+	verifyIO func(t *testing.T),
+) {
+	t.Helper()
+	var mu sync.Mutex
+	var messages []string
+	_, _, client, _, audit := startW19aMultiNodeRuntime(t, &policy.Config{
+		ApprovalThreshold: "moderate",
+		NoElicitFallback:  guardrail.FallbackDeny,
+		ProtectedPaths:    protectedPaths,
+	}, handlers, protocol, func(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+		mu.Lock()
+		messages = append(messages, req.Params.Message)
+		mu.Unlock()
+		if strings.Contains(req.Params.Message, wantDisclosed) && !acceptCanonical {
+			return &mcp.ElicitResult{Action: "decline"}, nil
+		}
+		return &mcp.ElicitResult{Action: "accept", Content: map[string]any{"approved": true}}, nil
+	}, nil)
+
+	res, err := client.CallTool(t.Context(), params)
+	if err != nil {
+		t.Fatalf("CallTool transport error: %v", err)
+	}
+	if res.IsError == acceptCanonical {
+		t.Fatalf("acceptCanonical=%v IsError=%v content=%+v", acceptCanonical, res.IsError, res.Content)
+	}
+	mu.Lock()
+	gotMsgs := slices.Clone(messages)
+	mu.Unlock()
+	if len(gotMsgs) != 2 || !strings.Contains(gotMsgs[1], wantDisclosed) {
+		t.Fatalf("prompts = %v, want 2 prompts disclosing %q in second", gotMsgs, wantDisclosed)
+	}
+	entries := audit.snapshot()
+	assertW19aNoOrphanedAuthorizedAudits(t, entries)
+	if protocol == "2026-07-28" {
+		wantAuth := 0
+		if acceptCanonical {
+			wantAuth = 1
+		}
+		if got := countW19aAuthorizedAudits(entries); got != wantAuth {
+			t.Fatalf("2026-07-28 authorized count = %d, want %d: %+v", got, wantAuth, entries)
+		}
+	}
+	if verifyIO != nil {
+		verifyIO(t)
+	}
+}
+
+func testP7W19aProtectedToProtectedSymlinkEscalates(t *testing.T) {
+	for _, protocol := range []string{"2026-07-28", "2025-11-25"} {
+		for _, acceptCanonical := range []bool{false, true} {
+			suffix := protocol + "/decline"
+			if acceptCanonical {
+				suffix = protocol + "/accept"
+			}
+
+			t.Run("read_etc_link_to_root_key/"+suffix, func(t *testing.T) {
+				h := newW18aSymlinkSFTPHandler()
+				h.setFile("/root/.ssh/id_rsa", []byte("PRIVATE-KEY\n"))
+				h.setDir("/etc")
+				h.setSymlink("/etc/motd_link", "/root/.ssh/id_rsa")
+				assertW19aProtectedRedirectCase(t, protocol, acceptCanonical,
+					[]string{"/etc", "/root"}, h.handlers(),
+					&mcp.CallToolParams{Name: "file", Arguments: FileInput{NodeID: "node-a", Action: "read", Path: "/etc/motd_link"}},
+					"/root/.ssh/id_rsa",
+					func(t *testing.T) {
+						if !acceptCanonical && h.reads.Load() != 0 {
+							t.Fatalf("declined read accessed /root/.ssh/id_rsa (%d reads)", h.reads.Load())
+						}
+					},
+				)
+			})
+
+			t.Run("write_custom_protected_dir_link_to_etc/"+suffix, func(t *testing.T) {
+				h := newW18aSymlinkSFTPHandler()
+				h.setDir("/etc")
+				h.setDir("/opt/app")
+				h.setSymlink("/opt/app/secrets", "/etc")
+				assertW19aProtectedRedirectCase(t, protocol, acceptCanonical,
+					[]string{"/etc", "/opt/app/secrets"}, h.handlers(),
+					&mcp.CallToolParams{Name: "file", Arguments: FileInput{NodeID: "node-a", Action: "write", Path: "/opt/app/secrets/app.conf", Content: "k=v\n"}},
+					"/etc/app.conf",
+					func(t *testing.T) {
+						if !acceptCanonical && h.writes.Load() != 0 {
+							t.Fatalf("declined write mutated /etc/app.conf (%d writes)", h.writes.Load())
+						}
+					},
+				)
+			})
+
+			if goruntime.GOOS != "windows" {
+				t.Run("push_dir_with_nested_protected_symlink_into_etc_drop/"+suffix, func(t *testing.T) {
+					localRoot := t.TempDir()
+					localProtected := filepath.Join(localRoot, "local_secret_dir")
+					if err := os.MkdirAll(localProtected, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					secretFile := filepath.Join(localProtected, "id_rsa")
+					if err := os.WriteFile(secretFile, []byte("LOCAL-KEY"), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					canonSecret, err := filepath.EvalSymlinks(secretFile)
+					if err != nil {
+						t.Fatal(err)
+					}
+					pushDir := filepath.Join(localRoot, "push_dir")
+					if err := os.MkdirAll(pushDir, 0o700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.Symlink(secretFile, filepath.Join(pushDir, "escape")); err != nil {
+						t.Fatal(err)
+					}
+					h := &w19aSymlinkUploadHandler{w18aSymlinkSFTPHandler: newW18aSymlinkSFTPHandler()}
+					h.setDir("/etc/drop")
+					assertW19aProtectedRedirectCase(t, protocol, acceptCanonical,
+						[]string{"/etc", localProtected}, h.handlers(),
+						&mcp.CallToolParams{Name: "transfer", Arguments: TransferFileInput{
+							NodeID:     "node-a",
+							Direction:  "push",
+							LocalPath:  pushDir,
+							RemotePath: "/etc/drop",
+						}},
+						canonSecret,
+						func(t *testing.T) {
+							if !acceptCanonical && h.writes.Load() != 0 {
+								t.Fatalf("declined push wrote %d times", h.writes.Load())
+							}
+						},
+					)
+				})
+			}
 		}
 	}
 }
