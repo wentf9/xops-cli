@@ -713,6 +713,9 @@ func getOrCreateAgentRouter(sshClient *cryptoSSH.Client) (*sshAgentChannelRouter
 	if sshClient == nil {
 		return nil, errors.New("ssh client is nil")
 	}
+	if sshClient.Conn == nil {
+		return nil, errors.New("ssh client connection is nil")
+	}
 	if existing, ok := sshAgentRouters.Load(sshClient); ok {
 		return existing.(*sshAgentChannelRouter), nil
 	}

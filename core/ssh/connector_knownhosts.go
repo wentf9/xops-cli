@@ -37,15 +37,27 @@ func (c *Connector) getHostKeyCallbackWithState(
 	hostKeyChanged *atomic.Bool,
 	initialHandshakeDone *atomic.Bool,
 ) (ssh.HostKeyCallback, error) {
+	callback, _, err := c.getHostKeyCallbackWithDB(ctx, coordinator, cfg, hostKeyChanged, initialHandshakeDone)
+	return callback, err
+}
+
+func (c *Connector) getHostKeyCallbackWithDB(
+	ctx context.Context,
+	coordinator *handshakeCoordinator,
+	cfg *ClientConfig,
+	hostKeyChanged *atomic.Bool,
+	initialHandshakeDone *atomic.Bool,
+) (ssh.HostKeyCallback, *knownHostsDB, error) {
 	if c.hostKeyVerifier != nil {
-		return c.verifierHostKeyCallback(ctx, coordinator, cfg, initialHandshakeDone), nil
+		return c.verifierHostKeyCallback(ctx, coordinator, cfg, initialHandshakeDone), nil, nil
 	}
 
 	strictMode, userKH, batchMode := extractHostKeyPolicy(cfg)
-	knownHostsFile, noKnownHostsFile, hostKeyCallback, err := c.openKnownHostsCallback(userKH, cfg)
+	knownHostsFile, noKnownHostsFile, db, err := c.openKnownHostsDB(userKH, cfg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	hostKeyCallback := db.hostKeyCallback()
 
 	var acceptedMu sync.Mutex
 	var acceptedHost string
@@ -108,7 +120,7 @@ func (c *Connector) getHostKeyCallbackWithState(
 			return nil
 		}
 		return err
-	}, nil
+	}, db, nil
 }
 
 func (c *Connector) verifierHostKeyCallback(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig, initialHandshakeDone ...*atomic.Bool) ssh.HostKeyCallback {
@@ -152,6 +164,17 @@ func extractHostKeyPolicy(cfg *ClientConfig) (strictMode string, userKH string, 
 // ever derived from UserKnownHostsFile), whether writes are disabled, and a
 // callback that verifies against user files followed by read-only global files.
 func (c *Connector) openKnownHostsCallback(userKH string, cfg *ClientConfig) (string, bool, ssh.HostKeyCallback, error) {
+	primaryWriteFile, noWrite, db, err := c.openKnownHostsDB(userKH, cfg)
+	if err != nil {
+		return "", false, nil, err
+	}
+	return primaryWriteFile, noWrite, db.hostKeyCallback(), nil
+}
+
+// openKnownHostsDB loads the locked, handle-verified user known_hosts files
+// followed by read-only global known_hosts files into a single immutable
+// snapshot shared by HostKeyCallback and HostKeyAlgorithms ordering.
+func (c *Connector) openKnownHostsDB(userKH string, cfg *ClientConfig) (string, bool, *knownHostsDB, error) {
 	target := knownHostsTarget(cfg)
 
 	db := newKnownHostsDB()
@@ -168,7 +191,7 @@ func (c *Connector) openKnownHostsCallback(userKH string, cfg *ClientConfig) (st
 	for _, gf := range globalFiles {
 		db.parseFileLenient(gf, c.getLogger())
 	}
-	return primaryWriteFile, noWrite, db.hostKeyCallback(), nil
+	return primaryWriteFile, noWrite, db, nil
 }
 
 func (c *Connector) loadUserKnownHosts(userKH string, target TargetContext, db *knownHostsDB) (string, []string, error) {
@@ -177,6 +200,7 @@ func (c *Connector) loadUserKnownHosts(userKH string, target TargetContext, db *
 
 	var primaryWriteFile string
 	var userFiles []string
+	allowMissing := false
 	switch {
 	case strings.EqualFold(userKH, "none") || isKnownHostsDevNull(userKH):
 	case userKH != "":
@@ -185,6 +209,7 @@ func (c *Connector) loadUserKnownHosts(userKH string, target TargetContext, db *
 		if err != nil {
 			return "", nil, err
 		}
+		allowMissing = true
 	default:
 		if err := validateEnvironment(c.environment); err != nil {
 			return "", nil, err
@@ -209,10 +234,25 @@ func (c *Connector) loadUserKnownHosts(userKH string, target TargetContext, db *
 
 	for _, uf := range userFiles {
 		if parseErr := db.parseFileStrict(uf); parseErr != nil {
+			if allowMissing && errors.Is(parseErr, os.ErrNotExist) {
+				continue
+			}
+			if allowMissing {
+				return "", nil, wrapCustomKnownHostsParseError(uf, parseErr)
+			}
 			return "", nil, fmt.Errorf("parse known_hosts file failed: %w", parseErr)
 		}
 	}
 	return primaryWriteFile, userFiles, nil
+}
+
+func wrapCustomKnownHostsParseError(path string, err error) error {
+	if errors.Is(err, fsx.ErrNonRegular) {
+		if st, statErr := os.Lstat(path); statErr == nil && st.IsDir() {
+			return fmt.Errorf("UserKnownHostsFile %q is a directory: %w", path, err)
+		}
+	}
+	return fmt.Errorf("parse known_hosts file failed: %w", err)
 }
 
 func knownHostsTarget(cfg *ClientConfig) TargetContext {
@@ -229,7 +269,7 @@ func knownHostsTarget(cfg *ClientConfig) TargetContext {
 }
 
 func (c *Connector) resolveCustomKnownHostsFiles(userKH string, target TargetContext) (string, []string, error) {
-	var existingFiles []string
+	var candidateFiles []string
 	var primaryWriteFile string
 	for idx, tokenPath := range strings.Fields(userKH) {
 		if strings.EqualFold(tokenPath, "none") || isKnownHostsDevNull(tokenPath) {
@@ -245,22 +285,11 @@ func (c *Connector) resolveCustomKnownHostsFiles(userKH string, target TargetCon
 		if idx == 0 {
 			primaryWriteFile = expanded
 		}
-		st, err := os.Lstat(expanded)
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) {
-				return "", nil, fmt.Errorf("stat UserKnownHostsFile %q failed: %w", expanded, err)
-			}
-			continue
+		if !slices.Contains(candidateFiles, expanded) {
+			candidateFiles = append(candidateFiles, expanded)
 		}
-		if st.IsDir() {
-			return "", nil, fmt.Errorf("UserKnownHostsFile %q is a directory", expanded)
-		}
-		if !st.Mode().IsRegular() {
-			return "", nil, fmt.Errorf("UserKnownHostsFile %q is not a regular file (mode %s)", expanded, st.Mode().Type())
-		}
-		existingFiles = append(existingFiles, expanded)
 	}
-	return primaryWriteFile, existingFiles, nil
+	return primaryWriteFile, candidateFiles, nil
 }
 
 // resolveGlobalKnownHostsFiles returns existing, readable, regular global

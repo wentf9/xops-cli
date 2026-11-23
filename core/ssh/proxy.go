@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -36,6 +37,9 @@ type SSHProxyDialer struct {
 }
 
 func (s *SSHProxyDialer) transportClosed() bool {
+	if s == nil {
+		return false
+	}
 	root, ok := s.RootConn.(*physicalSSHConn)
 	return ok && root.closed.Load()
 }
@@ -44,11 +48,21 @@ func (s *SSHProxyDialer) abortedBySelf() bool {
 	return s != nil && s.selfAborted.Load()
 }
 
+func (s *SSHProxyDialer) validateClient() error {
+	if s == nil || s.Client == nil || s.Client.Conn == nil {
+		return errors.New("proxy dial failed: upstream SSH client is not connected")
+	}
+	return nil
+}
+
 func (s *SSHProxyDialer) wrapChanConn(conn net.Conn) net.Conn {
 	if conn == nil {
 		return nil
 	}
 	return newProxyChanConn(conn, func(self net.Conn) error {
+		if s == nil {
+			return nil
+		}
 		s.selfAborted.Store(true)
 		if s.abortUpstream != nil {
 			return s.abortUpstream(self)
@@ -56,7 +70,7 @@ func (s *SSHProxyDialer) wrapChanConn(conn net.Conn) net.Conn {
 		if s.RootConn != nil {
 			return closeResource(s.RootConn, "upstream root SSH transport")
 		}
-		if s.Client != nil {
+		if s.Client != nil && s.Client.Conn != nil {
 			return closeResource(s.Client, "upstream SSH client")
 		}
 		return nil
@@ -64,6 +78,9 @@ func (s *SSHProxyDialer) wrapChanConn(conn net.Conn) net.Conn {
 }
 
 func (s *SSHProxyDialer) Dial(network, addr string) (net.Conn, error) {
+	if err := s.validateClient(); err != nil {
+		return nil, err
+	}
 	conn, err := s.Client.Dial(network, addr)
 	if err != nil {
 		return nil, err
@@ -72,6 +89,12 @@ func (s *SSHProxyDialer) Dial(network, addr string) (net.Conn, error) {
 }
 
 func (s *SSHProxyDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if ctx == nil {
+		return nil, errors.New("proxy dial context is nil")
+	}
+	if err := s.validateClient(); err != nil {
+		return nil, err
+	}
 	conn, err := s.Client.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, fmt.Errorf("proxy dial failed: %w", err)

@@ -52,7 +52,7 @@ func testP7W11aPutSingleSanitization(t *testing.T) {
 	sh.batch = false
 
 	hostileLocal := filepath.Join(localDir, "evil"+w11aHostileSeq+"file.txt")
-	err := sh.putSingle(t.Context(), hostileLocal, "/remote/clean.txt")
+	err := sh.putSingle(t.Context(), hostileLocal, "/remote/clean.txt", false)
 	if stdout.Len() == 0 {
 		t.Fatal("putSingle emitted empty stdout; expected sanitized uploading banner")
 	}
@@ -73,7 +73,7 @@ func testP7W11aPutSingleSanitization(t *testing.T) {
 	stdout.Reset()
 	realHostile := filepath.Join(localDir, "real\x1b[31m\x07ok.txt")
 	if writeErr := os.WriteFile(realHostile, []byte("ok"), 0o600); writeErr == nil {
-		_ = sh.putSingle(t.Context(), realHostile, "/remote/real.txt")
+		_ = sh.putSingle(t.Context(), realHostile, "/remote/real.txt", false)
 		bannerLine, _, _ := strings.Cut(stdout.String(), "\n")
 		assertW11aNoRawControls(t, "putSingle real file banner", bannerLine)
 		if !strings.Contains(bannerLine, "real") || !strings.Contains(bannerLine, "ok.txt") {

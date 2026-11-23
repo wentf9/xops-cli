@@ -706,14 +706,19 @@ func (o *ScpOptions) runUploadWithLease(ctx context.Context, localPath string, d
 	remotePath = remoteTarget.String()
 
 	// 检查是否已存在（使用 Lstat 以识别悬空符号链接）
+	var destLstat os.FileInfo
 	err = sftpCli.Do(ctx, func(c *pkgsftp.Client) error {
-		_, statErr := c.Lstat(remotePath)
+		var statErr error
+		destLstat, statErr = c.Lstat(remotePath)
 		return statErr
 	})
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat destination file failed: %w", err)
 	}
 	if err == nil {
+		if dirErr := checkUploadTargetNotFileOverDir(ctx, sftpCli, localPath, remotePath, destLstat); dirErr != nil {
+			return dirErr
+		}
 		if o.NoOverwrite {
 			return nil
 		}
@@ -746,8 +751,51 @@ func (o *ScpOptions) runUploadWithLease(ctx context.Context, localPath string, d
 		}
 		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading "+uploadName, 0)
 	}
-	uploadErr := sftpCli.WithForce(o.Force).Upload(ctx, localPath, remotePath, progress)
+	uploadErr := sftpCli.WithForce(o.Force).UploadExact(ctx, localPath, remotePath, progress)
 	return errors.Join(uploadErr, finishProgress())
+}
+
+func checkUploadTargetNotFileOverDir(ctx context.Context, sftpCli *sftp.Client, localPath, remotePath string, destLstat os.FileInfo) error {
+	destIsDir, err := isRemotePathDirOrDirSymlink(ctx, sftpCli, remotePath, destLstat)
+	if err != nil {
+		return fmt.Errorf("stat destination %q failed: %w", remotePath, err)
+	}
+	if !destIsDir {
+		return nil
+	}
+	localInfo, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("stat local source failed: %w", err)
+	}
+	if !localInfo.IsDir() {
+		return fmt.Errorf("cannot overwrite remote directory %q with non-directory %q", remotePath, localPath)
+	}
+	return nil
+}
+
+func isRemotePathDirOrDirSymlink(ctx context.Context, sftpCli *sftp.Client, remotePath string, lstatInfo os.FileInfo) (bool, error) {
+	if lstatInfo == nil {
+		return false, nil
+	}
+	if lstatInfo.IsDir() {
+		return true, nil
+	}
+	if lstatInfo.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	var followStat os.FileInfo
+	err := sftpCli.Do(ctx, func(c *pkgsftp.Client) error {
+		var statErr error
+		followStat, statErr = c.Stat(remotePath)
+		return statErr
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return followStat != nil && followStat.IsDir(), nil
 }
 
 func (o *ScpOptions) runDownload(ctx context.Context, src PathInfo, localPath string, provider config.ConfigProvider, connector *ssh.Connector) error {
@@ -928,31 +976,41 @@ func (o *ScpOptions) runRemoteToRemoteWithLeases(ctx context.Context, src, dst P
 }
 
 func (o *ScpOptions) confirmRemoteToRemoteOverwrite(ctx context.Context, dstSftp *sftp.Client, dstPath string) (bool, error) {
-	if !o.Force {
-		statErr := dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
-			_, err := c.Lstat(dstPath)
-			return err
-		})
-		switch {
-		case statErr == nil:
-			// Destination exists.
-			if o.NoOverwrite {
-				return true, nil
-			}
-			confirmed, confirmErr := cmdutils.AskConfirmation(i18n.Tf("prompt_overwrite", map[string]any{"Path": dstPath}))
-			if confirmErr != nil {
-				return false, confirmErr
-			}
-			if !confirmed {
-				return true, nil
-			}
-			o.Force = true
-		case errors.Is(statErr, os.ErrNotExist):
-			// Destination does not exist — no overwrite confirmation needed.
-		default:
-			// Unexpected Stat error: propagate so the caller can decide.
-			return false, fmt.Errorf("stat destination %q failed: %w", dstPath, statErr)
+	var destLstat os.FileInfo
+	statErr := dstSftp.Do(ctx, func(c *pkgsftp.Client) error {
+		var err error
+		destLstat, err = c.Lstat(dstPath)
+		return err
+	})
+	switch {
+	case statErr == nil:
+		destIsDir, dirErr := isRemotePathDirOrDirSymlink(ctx, dstSftp, dstPath, destLstat)
+		if dirErr != nil {
+			return false, fmt.Errorf("stat destination %q failed: %w", dstPath, dirErr)
 		}
+		if destIsDir {
+			return false, fmt.Errorf("cannot overwrite remote directory %q with non-directory", dstPath)
+		}
+		if o.Force {
+			return false, nil
+		}
+		// Destination exists.
+		if o.NoOverwrite {
+			return true, nil
+		}
+		confirmed, confirmErr := cmdutils.AskConfirmation(i18n.Tf("prompt_overwrite", map[string]any{"Path": dstPath}))
+		if confirmErr != nil {
+			return false, confirmErr
+		}
+		if !confirmed {
+			return true, nil
+		}
+		o.Force = true
+	case errors.Is(statErr, os.ErrNotExist):
+		// Destination does not exist — no overwrite confirmation needed.
+	default:
+		// Unexpected Lstat error: propagate so the caller can decide.
+		return false, fmt.Errorf("stat destination %q failed: %w", dstPath, statErr)
 	}
 	return false, nil
 }
@@ -1352,6 +1410,9 @@ func (o *ScpOptions) executeTransferWithLease(ctx context.Context, label string,
 		return fmt.Errorf("stat upload target %q failed: %w", remotePath, statErr)
 	}
 	if destStat != nil {
+		if dirErr := checkUploadTargetNotFileOverDir(ctx, sftpCli, o.Source, remotePath, destStat); dirErr != nil {
+			return dirErr
+		}
 		// Destination exists: skip if NoOverwrite, skip if not Force (user did
 		// not explicitly request overwrite in batch mode).
 		if o.NoOverwrite || !o.Force {
@@ -1376,7 +1437,7 @@ func (o *ScpOptions) executeTransferWithLease(ctx context.Context, label string,
 		}
 		progress, finishProgress = o.createTransferProgress(ctx, size, "Uploading ["+label+"] "+uploadName, 0)
 	}
-	err = errors.Join(sftpCli.Upload(ctx, o.Source, remotePath, progress), finishProgress())
+	err = errors.Join(sftpCli.UploadExact(ctx, o.Source, remotePath, progress), finishProgress())
 	if err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}

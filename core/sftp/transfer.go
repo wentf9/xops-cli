@@ -41,14 +41,50 @@ func sanitizeTransferDirPerm(mode os.FileMode) os.FileMode {
 }
 
 // Upload 上传入口：支持文件或目录（顶层路径使用 os.Stat 解引用符号链接，与 OpenSSH scp 单路径行为一致；
-// 目录递归遍历内部则通过 UploadLink 保留子项符号链接）。
+// 目录递归遍历内部则通过 UploadLink 保留子项符号链接）。单文件上传在远程目标为已有目录时会按 Auto
+// 模式拼接 LocalBaseName(localPath)。
 func (c *Client) Upload(ctx context.Context, localPath, remotePath string, progress ProgressCallback) error {
 	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
-		return c.upload(ctx, localPath, remotePath, progress)
+		return c.upload(ctx, localPath, remotePath, progress, false)
 	})
 }
 
-func (c *Client) upload(ctx context.Context, localPath, remotePath string, progress ProgressCallback) error {
+// UploadExact uploads a local file or directory directly to exactRemotePath
+// without performing container directory expansion (never appending
+// LocalBaseName(localPath) when exactRemotePath is an existing remote
+// directory). When localPath is a non-directory and exactRemotePath already
+// exists as a directory (or symbolic link resolving to a directory),
+// UploadExact fails closed before writing any temporary staging file.
+func (c *Client) UploadExact(ctx context.Context, localPath, exactRemotePath string, progress ProgressCallback) error {
+	return runInterruptibleOperation(ctx, c.interruptTransfers, func() error {
+		return c.upload(ctx, localPath, exactRemotePath, progress, true)
+	})
+}
+
+func (c *Client) ensureRemoteFileTargetNotDir(remotePath string) error {
+	dstLstat, err := c.SFTPClient().Lstat(remotePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lstat remote destination %q failed: %w", remotePath, err)
+	}
+	if dstLstat.IsDir() {
+		return fmt.Errorf("cannot overwrite remote directory %q with non-directory", remotePath)
+	}
+	if dstLstat.Mode()&os.ModeSymlink != 0 {
+		dstStat, statErr := c.SFTPClient().Stat(remotePath)
+		if statErr == nil && dstStat.IsDir() {
+			return fmt.Errorf("cannot overwrite remote directory symbolic link %q with non-directory", remotePath)
+		}
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("stat remote destination %q failed: %w", remotePath, statErr)
+		}
+	}
+	return nil
+}
+
+func (c *Client) upload(ctx context.Context, localPath, remotePath string, progress ProgressCallback, exactTarget bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -64,16 +100,27 @@ func (c *Client) upload(ctx context.Context, localPath, remotePath string, progr
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// 检查远程路径是否是目录
-	remoteStat, err := c.SFTPClient().Stat(remotePath)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat remote destination failed: %w", err)
+	if exactTarget {
+		parsedRemote, parseErr := ParseRemotePath(remotePath)
+		if parseErr != nil {
+			return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, parseErr)
+		}
+		remotePath = parsedRemote.String()
+	} else {
+		// 检查远程路径是否是目录
+		remoteStat, statErr := c.SFTPClient().Stat(remotePath)
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("stat remote destination failed: %w", statErr)
+		}
+		remoteTarget, parseErr := ParseRemoteUploadTarget(remotePath, localPath, statErr == nil && remoteStat.IsDir())
+		if parseErr != nil {
+			return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, parseErr)
+		}
+		remotePath = remoteTarget.String()
 	}
-	remoteTarget, parseErr := ParseRemoteUploadTarget(remotePath, localPath, err == nil && remoteStat.IsDir())
-	if parseErr != nil {
-		return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, parseErr)
+	if err := c.ensureRemoteFileTargetNotDir(remotePath); err != nil {
+		return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, err)
 	}
-	remotePath = remoteTarget.String()
 
 	if err := c.uploadFile(ctx, localPath, remotePath, info.Size(), info.Mode(), progress, fsx.FollowSymlinks()); err != nil {
 		return fmt.Errorf("upload %q to %q: %w", localPath, remotePath, err)
@@ -996,6 +1043,9 @@ func (c *Client) relayFileFrom(
 	tempPath := dstPath.String() + c.config.TempSuffix
 	if srcClient.state == c.state && tempPath == srcPath.String() {
 		return fmt.Errorf("remote relay temporary path conflicts with source: %q", tempPath)
+	}
+	if err := c.ensureRemoteFileTargetNotDir(dstPath.String()); err != nil {
+		return fmt.Errorf("relay %q to %q: %w", srcPath.String(), dstPath.String(), err)
 	}
 
 	if err := c.stageRelayFile(ctx, srcPath.String(), tempPath, srcFile, size, progress); err != nil {

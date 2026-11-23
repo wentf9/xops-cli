@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	pathpkg "path"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -31,11 +32,11 @@ func (c *Connector) getHostKeyOptionsWithState(
 	hostKeyChanged *atomic.Bool,
 	initialHandshakeDone *atomic.Bool,
 ) (cryptoSSH.HostKeyCallback, []string, error) {
-	callback, err := c.getHostKeyCallbackWithState(ctx, coordinator, cfg, hostKeyChanged, initialHandshakeDone)
+	callback, db, err := c.getHostKeyCallbackWithDB(ctx, coordinator, cfg, hostKeyChanged, initialHandshakeDone)
 	if err != nil {
 		return nil, nil, fmt.Errorf("get host key callback failed: %w", err)
 	}
-	algorithms, err := c.getHostKeyAlgorithms(ctx, coordinator, cfg)
+	algorithms, err := c.getHostKeyAlgorithmsWithDB(ctx, coordinator, cfg, db)
 	if err != nil {
 		return nil, nil, fmt.Errorf("select host key algorithms failed: %w", err)
 	}
@@ -47,6 +48,15 @@ func isRelativeAlgorithmSpec(spec string) bool {
 }
 
 func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *handshakeCoordinator, cfg *ClientConfig) ([]string, error) {
+	return c.getHostKeyAlgorithmsWithDB(ctx, coordinator, cfg, nil)
+}
+
+func (c *Connector) getHostKeyAlgorithmsWithDB(
+	ctx context.Context,
+	coordinator *handshakeCoordinator,
+	cfg *ClientConfig,
+	db *knownHostsDB,
+) ([]string, error) {
 	rawSpec := ""
 	if cfg != nil && cfg.Options != nil {
 		rawSpec = strings.TrimSpace(cfg.Options.HostKeyAlgorithms())
@@ -55,14 +65,17 @@ func (c *Connector) getHostKeyAlgorithms(ctx context.Context, coordinator *hands
 		return c.getVerifierHostKeyAlgorithms(ctx, coordinator, cfg, rawSpec)
 	}
 	if rawSpec == "" {
-		return c.defaultKnownHostsHostKeyAlgorithms(cfg), nil
+		if db == nil {
+			return c.defaultKnownHostsHostKeyAlgorithms(cfg), nil
+		}
+		return c.orderKnownHostsHostKeyAlgorithmsWithDB(cfg, cryptoSSH.SupportedAlgorithms().HostKeys, db), nil
 	}
 	if isRelativeAlgorithmSpec(rawSpec) {
 		pool, err := ResolveAlgorithmList(rawSpec, cryptoSSH.SupportedAlgorithms().HostKeys)
 		if err != nil {
 			return nil, fmt.Errorf("resolve HostKeyAlgorithms option: %w", err)
 		}
-		ordered := c.orderKnownHostsHostKeyAlgorithms(cfg, pool)
+		ordered := c.orderKnownHostsHostKeyAlgorithmsWithDB(cfg, pool, db)
 		if strings.HasPrefix(rawSpec, "^") {
 			algos, err := ResolveAlgorithmList(rawSpec, ordered)
 			if err != nil {
@@ -161,10 +174,16 @@ func (c *Connector) defaultKnownHostsHostKeyAlgorithms(cfg *ClientConfig) []stri
 // pool; otherwise plain algorithms in pool (with pinned types first) precede
 // certificate algorithms.
 func (c *Connector) orderKnownHostsHostKeyAlgorithms(cfg *ClientConfig, pool []string) []string {
+	return c.orderKnownHostsHostKeyAlgorithmsWithDB(cfg, pool, nil)
+}
+
+func (c *Connector) orderKnownHostsHostKeyAlgorithmsWithDB(cfg *ClientConfig, pool []string, db *knownHostsDB) []string {
 	if cfg == nil || cleanHostLiteral(cfg.Address) == "" {
 		return slices.Clone(pool)
 	}
-	db := c.loadReadOnlyKnownHostsDB(cfg)
+	if db == nil {
+		db = c.loadReadOnlyKnownHostsDB(cfg)
+	}
 	port := cfg.Port
 	if port <= 0 {
 		port = 22
@@ -222,7 +241,7 @@ func (c *Connector) loadReadOnlyKnownHostsDB(cfg *ClientConfig) *knownHostsDB {
 	target := knownHostsTarget(cfg)
 	_, userKH, _ := extractHostKeyPolicy(cfg)
 
-	var userFiles []string
+	var userCandidates []string
 	switch {
 	case strings.EqualFold(userKH, "none") || isKnownHostsDevNull(userKH):
 	case userKH != "":
@@ -234,24 +253,27 @@ func (c *Connector) loadReadOnlyKnownHostsDB(cfg *ClientConfig) *knownHostsDB {
 			if err != nil || expanded == "" || strings.EqualFold(expanded, "none") || isKnownHostsDevNull(expanded) {
 				continue
 			}
-			if v, err := isReadableRegularFile(expanded); err == nil && v.Allowed() && !slices.Contains(userFiles, expanded) {
-				userFiles = append(userFiles, expanded)
+			if !slices.Contains(userCandidates, expanded) {
+				userCandidates = append(userCandidates, expanded)
 			}
 		}
 	default:
 		if p := strings.TrimSpace(c.environment.KnownHostsFile); p != "" {
-			if v, err := isReadableRegularFile(p); err == nil && v.Allowed() {
-				userFiles = append(userFiles, p)
-			}
+			userCandidates = append(userCandidates, filepath.Clean(p))
 		}
 	}
 
-	globalFiles, err := c.resolveGlobalKnownHostsFiles(cfg, target, userFiles)
+	if len(userCandidates) > 0 {
+		knownHostsFileMutex.Lock()
+		for _, f := range userCandidates {
+			_ = db.parseLockedFileBounded(f, logger.NopLogger, maxKnownHostsFileBytes)
+		}
+		knownHostsFileMutex.Unlock()
+	}
+
+	globalFiles, err := c.resolveGlobalKnownHostsFiles(cfg, target, userCandidates)
 	if err != nil {
 		globalFiles = nil
-	}
-	for _, f := range userFiles {
-		db.parseFileLenient(f, logger.NopLogger)
 	}
 	for _, f := range globalFiles {
 		db.parseFileLenient(f, logger.NopLogger)
@@ -588,6 +610,10 @@ func (db *knownHostsDB) parseFileStrict(filename string) error {
 }
 
 func (db *knownHostsDB) parseFileStrictBounded(filename string, limit int64) error {
+	return db.parseLockedFileBounded(filename, nil, limit)
+}
+
+func (db *knownHostsDB) parseLockedFileBounded(filename string, lenientLogger logger.DebugLogger, limit int64) error {
 	if isKnownHostsDevNull(filename) {
 		return nil
 	}
@@ -609,7 +635,7 @@ func (db *knownHostsDB) parseFileStrictBounded(filename string, limit int64) err
 	}
 
 	bounded := newBoundedKnownHostsReader(lf, limit)
-	if err := db.readLines(bounded, filename, nil); err != nil {
+	if err := db.readLines(bounded, filename, lenientLogger); err != nil {
 		if bounded.exceeded() {
 			return fmt.Errorf("knownhosts: %q exceeds maximum size of %d bytes", filename, limit)
 		}

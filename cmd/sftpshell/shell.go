@@ -1563,22 +1563,24 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 			if targetErr != nil {
 				return fmt.Errorf("put: %w", targetErr)
 			}
-			if err := s.putSingle(ctx, local, remoteTarget.String()); err != nil {
+			if err := s.putSingle(ctx, local, remoteTarget.String(), false); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 
-	// 单源：保持原行为
+	// 单源：仅 2 参数 put（put local remoteArg）在 putSingle 中做一次容器目录展开
 	local := locals[0]
 	var remote string
+	expandContainer := false
 	if len(args) > 1 {
 		resolvedRemote, resolveErr := s.resolveValidatedRemotePath(args[1])
 		if resolveErr != nil {
 			return fmt.Errorf("put: %w", resolveErr)
 		}
 		remote = resolvedRemote.String()
+		expandContainer = true
 	} else {
 		remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(s.cwd, local, true)
 		if targetErr != nil {
@@ -1586,16 +1588,33 @@ func (s *Shell) handlePut(ctx context.Context, args []string) error {
 		}
 		remote = remoteTarget.String()
 	}
-	if err := s.putSingle(ctx, local, remote); err != nil {
+	if err := s.putSingle(ctx, local, remote, expandContainer); err != nil {
 		return err
 	}
 	return nil
 }
 
+func (s *Shell) isRemoteDirOrDirSymlink(ctx context.Context, remote string, lstatInfo os.FileInfo) (bool, error) {
+	if lstatInfo == nil {
+		return false, nil
+	}
+	if lstatInfo.IsDir() {
+		return true, nil
+	}
+	if lstatInfo.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	followInfo, followExists, followErr := s.remoteStat(ctx, remote, true)
+	if followErr != nil {
+		return false, followErr
+	}
+	return followExists && followInfo.IsDir(), nil
+}
+
 // putSingle 上传单个本地文件/目录到远程，含覆盖确认与进度条
 //
 //nolint:gocyclo
-func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
+func (s *Shell) putSingle(ctx context.Context, local, remote string, expandContainer bool) error {
 	cli, release, err := s.acquireClient(ctx)
 	if err != nil {
 		return fmt.Errorf("put: %w", err)
@@ -1603,21 +1622,42 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 	defer release()
 
 	clientToUse := cli
-	// 检查目标文件是否已存在
-	remoteStat, remoteExists, statErr := s.remoteStat(ctx, remote, true)
-	if statErr != nil {
-		return fmt.Errorf("put: %w", statErr)
+	if expandContainer {
+		// 仅对尚未展开容器目录的 2 参数 put 执行一次远程目录展开
+		remoteStat, remoteExists, statErr := s.remoteStat(ctx, remote, true)
+		if statErr != nil {
+			return fmt.Errorf("put: %w", statErr)
+		}
+		remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remote, local, remoteExists && remoteStat.IsDir())
+		if targetErr != nil {
+			return fmt.Errorf("put: %w", targetErr)
+		}
+		remote = remoteTarget.String()
+	} else {
+		parsedRemote, parseErr := sftp.ParseRemotePath(remote)
+		if parseErr != nil {
+			return fmt.Errorf("put: %w", parseErr)
+		}
+		remote = parsedRemote.String()
 	}
-	remoteTarget, targetErr := sftp.ParseRemoteUploadTarget(remote, local, remoteExists && remoteStat.IsDir())
-	if targetErr != nil {
-		return fmt.Errorf("put: %w", targetErr)
-	}
-	remote = remoteTarget.String()
-	_, destinationExists, statErr := s.remoteStat(ctx, remote, false)
+	destLstat, destinationExists, statErr := s.remoteStat(ctx, remote, false)
 	if statErr != nil {
 		return fmt.Errorf("put: %w", statErr)
 	}
 	if destinationExists {
+		destIsDir, dirErr := s.isRemoteDirOrDirSymlink(ctx, remote, destLstat)
+		if dirErr != nil {
+			return fmt.Errorf("put: %w", dirErr)
+		}
+		if destIsDir {
+			localInfo, localErr := os.Stat(local)
+			if localErr != nil {
+				return fmt.Errorf("upload failed: %w", localErr)
+			}
+			if !localInfo.IsDir() {
+				return fmt.Errorf("put: cannot overwrite remote directory %q with non-directory %q", remote, local)
+			}
+		}
 		if s.noOverwrite {
 			return nil
 		}
@@ -1668,7 +1708,7 @@ func (s *Shell) putSingle(ctx context.Context, local, remote string) error {
 		clientToUse = clientToUse.WithFileProgress(tracker.onFileProgress)
 	}
 
-	uploadErr := clientToUse.Upload(ctx, local, remote, callback)
+	uploadErr := clientToUse.UploadExact(ctx, local, remote, callback)
 	if uploadErr != nil {
 		if totalSize > 0 {
 			_ = bar.Exit()
