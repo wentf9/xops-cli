@@ -948,6 +948,75 @@ func privateIdentityReference(cfg *Configuration, nodeID string) string {
 	}, nodeID, "identity")
 }
 
+// IsHybridAuthType reports whether authType can combine multiple authentication
+// mechanisms (e.g. login password and private key with optional MFA) and should
+// be preserved rather than coerced to pure "password" or "key".
+func IsHybridAuthType(authType string) bool {
+	switch authType {
+	case "auto", "otp", "keyboard-interactive":
+		return true
+	default:
+		return false
+	}
+}
+
+func formatCanonicalIdentityID(user, address string) string {
+	cleanAddr := StripHostBrackets(address)
+	if strings.Contains(cleanAddr, ":") {
+		return fmt.Sprintf("%s@[%s]", user, cleanAddr)
+	}
+	return fmt.Sprintf("%s@%s", user, cleanAddr)
+}
+
+// AllocateNodeIdentityRef returns the canonical "<user>@<address>" identity ref
+// when unused, or a fresh private identity ref for nodeID so creating a second
+// node for the same user/address (e.g. on a different port) never collides with
+// or overwrites an existing identity.
+func AllocateNodeIdentityRef(cfg *Configuration, nodeID, user, address string) string {
+	canonicalIdentityID := formatCanonicalIdentityID(user, address)
+	if cfg == nil || cfg.Identities == nil {
+		return canonicalIdentityID
+	}
+	if _, exists := cfg.Identities.Get(canonicalIdentityID); !exists {
+		return canonicalIdentityID
+	}
+	return privateIdentityReference(cfg, nodeID)
+}
+
+// AllocateNodeHostRef reuses an existing unaliased Host matching (address, port)
+// when available, or allocates a fresh non-colliding HostRef so aliased hosts
+// retain unique alias ownership.
+func AllocateNodeHostRef(cfg *Configuration, nodeID, address string, port uint16) (string, models.Host) {
+	port = normalizedHostPort(port)
+	canonicalHostID := FormatHostPort(address, port)
+	fresh := models.Host{Address: address, Port: port}
+	if cfg == nil || cfg.Hosts == nil {
+		return canonicalHostID, fresh
+	}
+	targetEp, tErr := ssh.NewEndpoint(address, int(port))
+	matchesUnaliased := func(h models.Host) bool {
+		if len(h.Alias) > 0 {
+			return false
+		}
+		hostEp, hErr := ssh.NewEndpoint(h.Address, int(normalizedHostPort(h.Port)))
+		return tErr == nil && hErr == nil && hostEp.Equal(targetEp)
+	}
+	if existing, exists := cfg.Hosts.Get(canonicalHostID); exists && matchesUnaliased(existing) {
+		return canonicalHostID, cloneHost(existing)
+	}
+	keys := cfg.Hosts.Keys()
+	slices.Sort(keys)
+	for _, href := range keys {
+		if existing, exists := cfg.Hosts.Get(href); exists && matchesUnaliased(existing) {
+			return href, cloneHost(existing)
+		}
+	}
+	if _, exists := cfg.Hosts.Get(canonicalHostID); !exists {
+		return canonicalHostID, fresh
+	}
+	return privateHostReference(cfg, nodeID), fresh
+}
+
 // ReplaceNodeAtRefContext replaces a node bundle only if the original bundle
 // still equals the one the caller displayed.
 func (r *Repository) ReplaceNodeAtRefContext(ctx context.Context, ref NodeRef, nodeID string, node models.Node, host models.Host, identity models.Identity) error {
@@ -1022,7 +1091,7 @@ func replaceNodeAtRefWithRoutingCheck(cfg *Configuration, ref NodeRef, nodeID st
 			return false, err
 		}
 		var err error
-		oldNode, err = detachSharedNodeRefs(cfg, ref, nodeID, &node, host, identity)
+		oldNode, err = detachSharedNodeRefs(cfg, ref, nodeID, &node, &host, identity)
 		if err != nil {
 			return false, err
 		}
@@ -1044,13 +1113,13 @@ func replaceNodeAtRefWithRoutingCheck(cfg *Configuration, ref NodeRef, nodeID st
 	return NodeJumpRoutingChanged(oldNodeID, oldNode, oldHost, oldIdentity, nodeID, node, host, identity), nil
 }
 
-func detachSharedNodeRefs(cfg *Configuration, ref NodeRef, nodeID string, node *models.Node, host models.Host, identity models.Identity) (models.Node, error) {
+func detachSharedNodeRefs(cfg *Configuration, ref NodeRef, nodeID string, node *models.Node, host *models.Host, identity models.Identity) (models.Node, error) {
 	oldNodeID := ref.ID
 	oldNode, exists := cfg.Nodes.Get(oldNodeID)
 	if !exists {
 		return models.Node{}, fmt.Errorf("resolve node %q for replacement: %w", oldNodeID, ErrNodeNotFound)
 	}
-	if existingHost, ok := cfg.Hosts.Get(node.HostRef); ok && !reflect.DeepEqual(existingHost, host) {
+	if existingHost, ok := cfg.Hosts.Get(node.HostRef); ok && !reflect.DeepEqual(existingHost, *host) {
 		hostRefs := countNodeReferences(cfg, func(candidate models.Node) bool {
 			return candidate.HostRef == node.HostRef
 		})
@@ -1059,6 +1128,7 @@ func detachSharedNodeRefs(cfg *Configuration, ref NodeRef, nodeID string, node *
 		}
 		if hostRefs > 0 {
 			node.HostRef = privateHostReference(cfg, nodeID)
+			host.Alias = nil
 		}
 	}
 	if existingIdentity, ok := cfg.Identities.Get(node.IdentityRef); ok && !reflect.DeepEqual(existingIdentity, identity) {
@@ -1851,6 +1921,9 @@ func validateConfigurationIdentities(cfg *Configuration, stores map[string]Store
 			if err := validateConfiguredRef(*id.PassphraseRef, stores); err != nil {
 				return fmt.Errorf("%w: identity %q passphrase_ref invalid: %w", ErrSchemaValidation, idName, err)
 			}
+			if !id.PassphraseRef.IsEmpty() && cfg.SchemaVersion == 2 && strings.TrimSpace(id.KeyFingerprint) == "" {
+				return fmt.Errorf("%w: identity %q with passphrase_ref must specify key_fingerprint", ErrSchemaValidation, idName)
+			}
 			if id.KeyFingerprint != "" && strings.ContainsAny(id.KeyFingerprint, " \t\r\n\x00") {
 				return fmt.Errorf("%w: identity %q has invalid key_fingerprint %q", ErrSchemaValidation, idName, id.KeyFingerprint)
 			}
@@ -2485,14 +2558,22 @@ func applyIdentityCredentialRefKind(identity *models.Identity, kind credential.K
 	case credential.KindLoginPassword:
 		identity.LoginPasswordRef = newRef.Clone()
 		identity.Password = ""
-		if newRef != nil && !newRef.IsEmpty() && identity.AuthType != "keyboard-interactive" && identity.AuthType != "otp" {
+		if newRef != nil && !newRef.IsEmpty() && !IsHybridAuthType(identity.AuthType) {
 			identity.AuthType = "password"
+			identity.KeyPath = ""
+			identity.KeyFingerprint = ""
+			identity.Passphrase = ""
+			identity.PassphraseRef = nil
 		}
 	case credential.KindPassphrase:
 		identity.PassphraseRef = newRef.Clone()
 		identity.Passphrase = ""
-		if newRef != nil && !newRef.IsEmpty() && identity.AuthType != "keyboard-interactive" && identity.AuthType != "otp" {
+		if newRef == nil || newRef.IsEmpty() {
+			identity.KeyFingerprint = ""
+		} else if !IsHybridAuthType(identity.AuthType) {
 			identity.AuthType = "key"
+			identity.Password = ""
+			identity.LoginPasswordRef = nil
 		}
 	case credential.KindTOTPSecret:
 		return applyIdentityTOTPSecretRef(identity, newRef)
@@ -2555,9 +2636,15 @@ func applyIdentityAuthModifications(identity *models.Identity, keyPath, authType
 	if authType != "" {
 		identity.AuthType = authType
 	}
-	if clearKeyPath {
+	if clearKeyPath || authType == "password" {
 		identity.KeyPath = ""
 		identity.KeyFingerprint = ""
+		identity.Passphrase = ""
+		identity.PassphraseRef = nil
+	}
+	if authType == "key" {
+		identity.Password = ""
+		identity.LoginPasswordRef = nil
 	}
 	if clearLegacyLoginPassword {
 		identity.Password = ""
@@ -2755,8 +2842,15 @@ func applyIdentityCredentialMetadata(identity *models.Identity, target credentia
 	if target.AuthType != "" {
 		identity.AuthType = target.AuthType
 	}
-	if target.ClearKeyPath {
+	if target.ClearKeyPath || target.AuthType == "password" {
 		identity.KeyPath = ""
+		identity.KeyFingerprint = ""
+		identity.Passphrase = ""
+		identity.PassphraseRef = nil
+	}
+	if target.AuthType == "key" {
+		identity.Password = ""
+		identity.LoginPasswordRef = nil
 	}
 	if target.ClearLegacyLoginPassword {
 		identity.Password = ""
@@ -2768,7 +2862,7 @@ func applyIdentityCredentialMetadata(identity *models.Identity, target credentia
 
 func updateNodeAuthCredentialTarget(cfg *Configuration, target credential.Target, expectedVersion string, newRef *credential.Ref) (string, error) {
 	version, err := updateNodeAuthCredentialRef(cfg, target.NodeID, expectedVersion, target.Kind, newRef, target.KeyPath, target.AuthType, target.ClearKeyPath, target.ClearLegacyLoginPassword, target.ClearLegacyPassphrase, target.RuleName)
-	if err != nil || target.KeyFingerprint == "" {
+	if err != nil || target.KeyFingerprint == "" || target.ClearKeyPath || target.AuthType == "password" {
 		return version, err
 	}
 	node, _ := cfg.Nodes.Get(target.NodeID)

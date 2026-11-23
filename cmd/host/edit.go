@@ -170,17 +170,19 @@ func buildEditedNodeDraft(
 ) *config.Configuration {
 	draft := repository.Snapshot()
 	draftNode := node
+	draftHost := host
 	hostRef := draftNode.HostRef
 	if hostRef == "" || isEditedRefSharedWithOtherNode(draft, oldName, func(n models.Node) string { return n.HostRef }, hostRef) {
 		hostRef = "__edit_host__" + newName
 		draftNode.HostRef = hostRef
+		draftHost.Alias = nil
 	}
 	identRef := draftNode.IdentityRef
 	if identRef == "" || isEditedRefSharedWithOtherNode(draft, oldName, func(n models.Node) string { return n.IdentityRef }, identRef) {
 		identRef = "__edit_ident__" + newName
 		draftNode.IdentityRef = identRef
 	}
-	draft.Hosts.Set(hostRef, host)
+	draft.Hosts.Set(hostRef, draftHost)
 	draft.Identities.Set(identRef, identity)
 	if oldName != newName {
 		draft.Nodes.Remove(oldName)
@@ -346,7 +348,11 @@ func applyNodeUpdates(cmd *cobra.Command, host *models.Host, identity *models.Id
 	}
 	// Secret replacements commit authentication metadata with the new ref.
 	if flags.keyPath != "" && flags.keyPass == "" && flags.password == "" {
-		identity.KeyPath, identity.AuthType, updated = utils.NormalizeIdentityKeyPath(flags.keyPath), "key", true
+		identity.KeyPath = utils.NormalizeIdentityKeyPath(flags.keyPath)
+		if !config.IsHybridAuthType(identity.AuthType) {
+			identity.AuthType = "key"
+		}
+		updated = true
 	}
 
 	if cmd.Flags().Changed("alias") {

@@ -101,9 +101,9 @@ func runInventoryAdd(cmd *cobra.Command, args []string, flags *addFlags, secretI
 		return err
 	}
 
-	hostObj := models.Host{Address: flags.address, Port: flags.port}
+	hostRef, hostObj := config.AllocateNodeHostRef(cfg, name, flags.address, flags.port)
 	node := models.Node{
-		HostRef:     config.FormatHostPort(flags.address, flags.port),
+		HostRef:     hostRef,
 		IdentityRef: identityRef,
 		Alias:       flags.alias,
 		Tags:        normalizeTagList(flags.tags),
@@ -264,7 +264,8 @@ func resolveAddedIdentity(cfg *config.Configuration, flags *addFlags, password s
 	if err != nil {
 		return models.Identity{}, "", "", err
 	}
-	return identity, fmt.Sprintf("%s@%s", identity.User, flags.address), newPassword, nil
+	nodeID := config.FormatNodeID(identity.User, flags.address, flags.port)
+	return identity, config.AllocateNodeIdentityRef(cfg, nodeID, identity.User, flags.address), newPassword, nil
 }
 
 func applyAddTargetArgs(args []string, alias *[]string, address, user *string, port *uint16, portChanged bool) error {

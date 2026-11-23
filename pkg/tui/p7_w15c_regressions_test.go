@@ -397,12 +397,18 @@ func assertW15cHybridSwitchedToPassword(t *testing.T, ident models.Identity, mem
 }
 
 func TestP7W15c_L4_15_H1_CreateVerifyPreviewIncludesHybridMFAKeyAndPassword(t *testing.T) {
-	repo := newTestRepository(t, nil)
+	keyFile := writeW15cEncryptedTestKey(t, "mfa-key-pass")
+	cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+	cfg.Credential.DefaultStore = "mem"
+	cfg.Credential.Stores["mem"] = config.StoreConfig{Type: config.StoreTypeHelper, Command: "/unused"}
+	repo := newTestRepository(t, cfg)
+	svc := newFormCredentialTestService(t, repo, newMemoryCredentialStore())
 	var seenIdentity models.Identity
 	m := &Model{
-		repository: repo,
-		ctx:        t.Context(),
-		state:      viewForm,
+		repository:        repo,
+		credentialService: svc,
+		ctx:               t.Context(),
+		state:             viewForm,
 		formState: &nodeFormState{
 			isEdit:     false,
 			skipVerify: false,
@@ -411,7 +417,7 @@ func TestP7W15c_L4_15_H1_CreateVerifyPreviewIncludesHybridMFAKeyAndPassword(t *t
 			port:       "22",
 			authType:   "otp",
 			password:   "mfa-pw",
-			keyPath:    "%d/.ssh/id_mfa",
+			keyPath:    keyFile,
 			passphrase: "mfa-key-pass",
 			sudoMode:   string(models.SudoModeAuto),
 		},
@@ -435,14 +441,14 @@ func TestP7W15c_L4_15_H1_CreateVerifyPreviewIncludesHybridMFAKeyAndPassword(t *t
 	}
 	m.Update(next())
 
-	if seenIdentity.AuthType != "otp" || seenIdentity.Password != "mfa-pw" || seenIdentity.KeyPath != "%d/.ssh/id_mfa" || seenIdentity.Passphrase != "mfa-key-pass" {
+	if seenIdentity.AuthType != "otp" || seenIdentity.Password != "mfa-pw" || seenIdentity.KeyPath != keyFile || seenIdentity.Passphrase != "mfa-key-pass" {
 		t.Fatalf("preview checkIdentity lost hybrid MFA fields: %+v", seenIdentity)
 	}
 	snap, err := repo.ResolveConnection("mfa@192.0.2.88:22")
 	if err != nil {
 		t.Fatalf("ResolveConnection: %v", err)
 	}
-	if snap.Identity.AuthType != "otp" || snap.Identity.KeyPath != "%d/.ssh/id_mfa" {
-		t.Fatalf("saved hybrid MFA node lost KeyPath: %+v", snap.Identity)
+	if snap.Identity.AuthType != "otp" || snap.Identity.KeyPath != keyFile || snap.Identity.LoginPasswordRef == nil || snap.Identity.PassphraseRef == nil || snap.Identity.KeyFingerprint == "" {
+		t.Fatalf("saved hybrid MFA node lost fields: %+v", snap.Identity)
 	}
 }

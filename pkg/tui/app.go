@@ -335,7 +335,7 @@ func (m *Model) handleConfigurationMutation(msg configurationMutationMsg) (tea.M
 			m.state = viewList
 			m.status = errorStyle.Render(i18n.Tf("tui_status_cleanup_pending", map[string]any{"Error": msg.err}))
 		case errors.Is(msg.err, config.ErrConfigConflict):
-			m.formConflict = msg.kind == configurationMutationForm
+			m.formConflict = msg.kind == configurationMutationForm && (m.formState == nil || m.formState.isEdit)
 			m.status = errorStyle.Render(i18n.Tf("tui_status_conflict", map[string]any{"Error": msg.err}))
 		case errors.Is(msg.err, context.Canceled), errors.Is(msg.err, context.DeadlineExceeded):
 			m.status = errorStyle.Render(i18n.Tf("tui_status_update_canceled", map[string]any{"Error": msg.err}))

@@ -14,7 +14,7 @@ xops tui
 | `/` | Filter / search the node list |
 | `Space` | Check or uncheck a node (for batch tag operations) |
 | `n` / `e` | Add a new node / edit the selected node |
-| `g` | Manage tags for checked nodes (or the current node) |
+| `g` | Manage tags for checked nodes |
 | `m` / `l` | Open live monitoring / open remote log selection |
 | `Ctrl+S` / `Esc` (in forms) | Save form / cancel and return to the list |
 | `Ctrl+U` / `Ctrl+L` | Unlock the default offline credential store / lock stores opened by this process |

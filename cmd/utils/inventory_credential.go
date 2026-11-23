@@ -44,12 +44,13 @@ func NormalizeIdentityKeyPath(raw string) string {
 // InventoryCredentialWrite keeps secret material outside inventory models.
 // Metadata creation may precede Save; a failed Save never falls back to YAML.
 type InventoryCredentialWrite struct {
-	service *credential.Service
-	updater credential.ConfigUpdater
-	target  credential.Target
-	oldRef  *credential.Ref
-	storeID string
-	secret  credential.Secret
+	service       *credential.Service
+	updater       credential.ConfigUpdater
+	target        credential.Target
+	oldRef        *credential.Ref
+	displacedRefs []credential.Ref
+	storeID       string
+	secret        credential.Secret
 }
 
 // PrepareInventoryCredential validates the destination before metadata changes.
@@ -101,7 +102,16 @@ func PrepareInventoryCredential(repo *config.Repository, target credential.Targe
 	if err != nil {
 		return nil, err
 	}
-	return &InventoryCredentialWrite{service: service, updater: updater, target: target, oldRef: oldRef.Clone(), storeID: credCfg.DefaultStore, secret: credential.NewSecret([]byte(value))}, nil
+	displacedRefs := collectDisplacedCrossKindRefs(target, identity, oldRef)
+	return &InventoryCredentialWrite{
+		service:       service,
+		updater:       updater,
+		target:        target,
+		oldRef:        oldRef.Clone(),
+		displacedRefs: displacedRefs,
+		storeID:       credCfg.DefaultStore,
+		secret:        credential.NewSecret([]byte(value)),
+	}, nil
 }
 
 func preparePassphraseTarget(target credential.Target, identity models.Identity, keyPath, passphrase string) (credential.Target, error) {
@@ -116,13 +126,54 @@ func preparePassphraseTarget(target credential.Target, identity models.Identity,
 		return target, fmt.Errorf("invalid private-key path: %w", err)
 	}
 	target.Kind = credential.KindPassphrase
-	target.AuthType = "key"
+	if config.IsHybridAuthType(identity.AuthType) {
+		target.AuthType = identity.AuthType
+	} else {
+		target.AuthType = "key"
+	}
 	target.KeyPath = NormalizeIdentityKeyPath(keyPath)
 	target.ClearKeyPath = false
 	if passphrase != "" && (setting.Disabled() || setting.IsTemplate()) {
 		return target, fmt.Errorf("private-key passphrase cannot be bound to non-concrete key path %q", target.KeyPath)
 	}
 	return target, nil
+}
+
+func equalOptionalRef(a, b *credential.Ref) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func collectDisplacedCrossKindRefs(target credential.Target, identity models.Identity, oldRef *credential.Ref) []credential.Ref {
+	var refs []credential.Ref
+	if target.ClearKeyPath || target.AuthType == "password" {
+		if identity.PassphraseRef != nil && !identity.PassphraseRef.IsEmpty() && !equalOptionalRef(identity.PassphraseRef, oldRef) {
+			refs = append(refs, *identity.PassphraseRef)
+		}
+	}
+	if target.AuthType == "key" {
+		if identity.LoginPasswordRef != nil && !identity.LoginPasswordRef.IsEmpty() && !equalOptionalRef(identity.LoginPasswordRef, oldRef) {
+			refs = append(refs, *identity.LoginPasswordRef)
+		}
+	}
+	return refs
+}
+
+func mutationOutcomeFromServiceError(err error) credential.MutationOutcome {
+	if err == nil {
+		return credential.MutationOutcome{Applied: true, Durable: true}
+	}
+	var cleanupErr *credential.CleanupError
+	if errors.As(err, &cleanupErr) {
+		return credential.MutationOutcome{Applied: true, Durable: true}
+	}
+	var durabilityErr *config.DurabilityError
+	if errors.As(err, &durabilityErr) {
+		return credential.MutationOutcome{Applied: true, Durable: false}
+	}
+	return credential.MutationOutcome{}
 }
 
 // Clear releases the write's temporary secret on every caller return path.
@@ -139,13 +190,23 @@ func (w *InventoryCredentialWrite) Save(ctx context.Context, version string) err
 	if w == nil {
 		return nil
 	}
+	commit := func(ctx context.Context) (credential.MutationOutcome, error) {
+		var err error
+		if len(w.secret.Value) != 0 {
+			_, _, err = w.service.Rotate(ctx, w.target, version, w.oldRef, w.storeID, w.secret)
+		} else if w.oldRef != nil && !w.oldRef.IsEmpty() {
+			_, err = w.service.Delete(ctx, w.target, version, *w.oldRef)
+		} else {
+			outcome, _, applyErr := w.updater.ApplyCredentialRefAtVersion(ctx, w.target, version, nil)
+			return outcome, applyErr
+		}
+		return mutationOutcomeFromServiceError(err), err
+	}
 	var err error
-	if len(w.secret.Value) != 0 {
-		_, _, err = w.service.Rotate(ctx, w.target, version, w.oldRef, w.storeID, w.secret)
-	} else if w.oldRef != nil && !w.oldRef.IsEmpty() {
-		_, err = w.service.Delete(ctx, w.target, version, *w.oldRef)
+	if len(w.displacedRefs) > 0 {
+		_, err = w.service.DeleteAssets(ctx, w.displacedRefs, commit)
 	} else {
-		_, _, err = w.updater.ApplyCredentialRefAtVersion(ctx, w.target, version, nil)
+		_, err = commit(ctx)
 	}
 	if err != nil {
 		return fmt.Errorf("save inventory credential: %w", err)

@@ -105,6 +105,9 @@ func applyTargetRefToIdentity(identity *models.Identity, target credential.Targe
 	case credential.KindPassphrase:
 		identity.PassphraseRef = newRef.Clone()
 		identity.Passphrase = ""
+		if newRef == nil || newRef.IsEmpty() {
+			identity.KeyFingerprint = ""
+		}
 	case credential.KindTOTPSecret:
 		return applyIdentityTOTPSecretRef(identity, newRef)
 	case credential.KindChallengeAnswer:

@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -148,18 +149,18 @@ func (o *CredentialCommandOptions) shouldUseNodeTarget(repo *config.Repository, 
 	return false, fmt.Errorf("target %q not found in nodes or identities", query)
 }
 
-func (o *CredentialCommandOptions) resolveTarget(repo *config.Repository, view config.ConfigView, query string, kind credential.Kind, ruleName string) (resolvedCredentialTarget, error) {
+func (o *CredentialCommandOptions) resolveTarget(repo *config.Repository, view config.ConfigView, query string, kind credential.Kind, ruleName string, forSet bool) (resolvedCredentialTarget, error) {
 	useNode, err := o.shouldUseNodeTarget(repo, view, query, kind)
 	if err != nil {
 		return resolvedCredentialTarget{}, err
 	}
 	if !useNode {
-		return resolveIdentityCredentialTarget(view, query, kind, ruleName)
+		return resolveIdentityCredentialTarget(view, query, kind, ruleName, forSet)
 	}
-	return resolveNodeCredentialTarget(repo, view, query, kind, ruleName)
+	return resolveNodeCredentialTarget(repo, view, query, kind, ruleName, forSet)
 }
 
-func resolveIdentityCredentialTarget(view config.ConfigView, query string, kind credential.Kind, ruleName string) (resolvedCredentialTarget, error) {
+func resolveIdentityCredentialTarget(view config.ConfigView, query string, kind credential.Kind, ruleName string, forSet bool) (resolvedCredentialTarget, error) {
 	ident, ok := view.Configuration.Identities.Get(query)
 	if !ok {
 		return resolvedCredentialTarget{}, fmt.Errorf("%s", i18n.Tf("identity_err_not_found", map[string]any{"Name": query}))
@@ -173,21 +174,25 @@ func resolveIdentityCredentialTarget(view config.ConfigView, query string, kind 
 			return resolvedCredentialTarget{}, err
 		}
 	}
+	target := credential.Target{
+		IdentityID: query,
+		Kind:       kind,
+		RuleName:   ruleName,
+	}
+	if forSet {
+		target = buildAuthCredentialTarget("", query, kind, ruleName, ident.AuthType)
+	}
 	return resolvedCredentialTarget{
 		isNode:          false,
 		identityID:      query,
 		identity:        ident,
 		oldRef:          findIdentityOldRef(kind, ident, ruleName),
 		expectedVersion: string(ref.Version[:]),
-		target: credential.Target{
-			IdentityID: query,
-			Kind:       kind,
-			RuleName:   ruleName,
-		},
+		target:          target,
 	}, nil
 }
 
-func resolveNodeCredentialTarget(repo *config.Repository, view config.ConfigView, query string, kind credential.Kind, ruleName string) (resolvedCredentialTarget, error) {
+func resolveNodeCredentialTarget(repo *config.Repository, view config.ConfigView, query string, kind credential.Kind, ruleName string, forSet bool) (resolvedCredentialTarget, error) {
 	nodeID, err := repo.ResolveSelector(query)
 	if err != nil {
 		return resolvedCredentialTarget{}, fmt.Errorf("resolve node %q: %w", query, err)
@@ -223,7 +228,14 @@ func resolveNodeCredentialTarget(repo *config.Repository, view config.ConfigView
 		}
 	}
 
-	target := buildNodeAuthTarget(nodeID, kind, ruleName, snap.Identity.AuthType)
+	target := credential.Target{
+		NodeID:   nodeID,
+		Kind:     kind,
+		RuleName: ruleName,
+	}
+	if forSet {
+		target = buildNodeAuthTarget(nodeID, kind, ruleName, snap.Identity.AuthType)
+	}
 	return resolvedCredentialTarget{
 		isNode:          true,
 		nodeID:          nodeID,
@@ -235,23 +247,28 @@ func resolveNodeCredentialTarget(repo *config.Repository, view config.ConfigView
 }
 
 func buildNodeAuthTarget(nodeID string, kind credential.Kind, ruleName, currentAuthType string) credential.Target {
+	return buildAuthCredentialTarget(nodeID, "", kind, ruleName, currentAuthType)
+}
+
+func buildAuthCredentialTarget(nodeID, identityID string, kind credential.Kind, ruleName, currentAuthType string) credential.Target {
 	target := credential.Target{
-		NodeID:   nodeID,
-		Kind:     kind,
-		RuleName: ruleName,
+		NodeID:     nodeID,
+		IdentityID: identityID,
+		Kind:       kind,
+		RuleName:   ruleName,
 	}
-	isMFA := currentAuthType == "keyboard-interactive" || currentAuthType == "otp"
+	isHybridOrAuto := config.IsHybridAuthType(currentAuthType)
 	switch kind {
 	case credential.KindLoginPassword:
 		target.ClearLegacyLoginPassword = true
-		if !isMFA {
+		if !isHybridOrAuto {
 			target.AuthType = "password"
 			target.ClearKeyPath = true
 			target.ClearLegacyPassphrase = true
 		}
 	case credential.KindPassphrase:
 		target.ClearLegacyPassphrase = true
-		if !isMFA {
+		if !isHybridOrAuto {
 			target.AuthType = "key"
 		}
 	}
@@ -269,7 +286,7 @@ func (o *CredentialCommandOptions) RunSet(cmd *cobra.Command, query string) erro
 	if err != nil {
 		return err
 	}
-	resolved, err := o.resolveTarget(repo, repo.View(), query, kind, ruleName)
+	resolved, err := o.resolveTarget(repo, repo.View(), query, kind, ruleName, true)
 	if err != nil {
 		return err
 	}
@@ -308,7 +325,18 @@ func (o *CredentialCommandOptions) RunSet(cmd *cobra.Command, query string) erro
 
 	secret := credential.NewSecret([]byte(secretStr))
 	defer secret.Zero()
-	newRef, _, err := svc.Rotate(cmd.Context(), target, resolved.expectedVersion, resolved.oldRef, targetStore, secret)
+	displacedRefs := collectDisplacedCrossKindRefs(target, resolved.identity, resolved.oldRef)
+	var newRef *credential.Ref
+	commit := func(ctx context.Context) (credential.MutationOutcome, error) {
+		var rotateErr error
+		newRef, _, rotateErr = svc.Rotate(ctx, target, resolved.expectedVersion, resolved.oldRef, targetStore, secret)
+		return mutationOutcomeFromServiceError(rotateErr), rotateErr
+	}
+	if len(displacedRefs) > 0 {
+		_, err = svc.DeleteAssets(cmd.Context(), displacedRefs, commit)
+	} else {
+		_, err = commit(cmd.Context())
+	}
 	if err != nil {
 		return fmt.Errorf("rotate credential in store failed: %w", err)
 	}
@@ -342,7 +370,7 @@ func (o *CredentialCommandOptions) RunDelete(cmd *cobra.Command, query string) e
 	if err != nil {
 		return err
 	}
-	resolved, err := o.resolveTarget(repo, repo.View(), query, kind, ruleName)
+	resolved, err := o.resolveTarget(repo, repo.View(), query, kind, ruleName, false)
 	if err != nil {
 		return err
 	}

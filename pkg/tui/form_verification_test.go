@@ -124,8 +124,12 @@ func TestNewNodeFormVerificationPolicy(t *testing.T) {
 		{name: "canceled", verifyErr: context.Canceled},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			repo := newTestRepository(t, nil)
-			m := &Model{repository: repo, ctx: t.Context(), state: viewForm,
+			cfg := config.NewProviderWithoutOpenSSH(nil).Snapshot()
+			cfg.Credential.DefaultStore = "mem"
+			cfg.Credential.Stores["mem"] = config.StoreConfig{Type: config.StoreTypeHelper, Command: "/unused"}
+			repo := newTestRepository(t, cfg)
+			service := newFormCredentialTestService(t, repo, newMemoryCredentialStore())
+			m := &Model{repository: repo, credentialService: service, ctx: t.Context(), state: viewForm,
 				lastSize:  tea.WindowSizeMsg{Width: 100, Height: 30},
 				formState: &nodeFormState{user: "root", address: "192.0.2.1", port: "2222", authType: "password", password: "draft-secret", skipVerify: tc.skip},
 			}
