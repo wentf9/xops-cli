@@ -211,21 +211,22 @@ func TestP7W18a_AB18M1_HasActivePendingApproval(t *testing.T) {
 	g := New(cfg)
 	ctx := WithPolicy(t.Context(), *cfg, "w18a-active-pending")
 	ri := RiskInput{ToolName: "file", Action: "write", NodeID: "node-1", Paths: []string{"/tmp/x"}}
-	_, pending, err := g.Authorize(ctx, &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{}}, ri, dummyInput{Command: "write"})
+	in := dummyInput{Command: "write"}
+	_, pending, err := g.Authorize(ctx, &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{}}, ri, in)
 	if err != nil || pending == nil || pending.RequestState == "" {
 		t.Fatalf("mint pending challenge: pending=%+v err=%v", pending, err)
 	}
-	if !g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}) {
-		t.Fatal("HasActivePendingApproval(live own session) = false, want true")
+	if ok, err := g.HasActivePendingApprovalForEnvelope(ctx, &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}, ri, in); err != nil || !ok {
+		t.Fatalf("HasActivePendingApprovalForEnvelope(live own session) = (%v, %v), want (true, nil)", ok, err)
 	}
-	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss2, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}) {
-		t.Fatal("HasActivePendingApproval(cross session) = true, want false")
+	if ok, err := g.HasActivePendingApprovalForEnvelope(ctx, &mcp.CallToolRequest{Session: ss2, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}, ri, in); err != nil || ok {
+		t.Fatalf("HasActivePendingApprovalForEnvelope(cross session) = (%v, %v), want (false, nil)", ok, err)
 	}
-	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: "forged"}}) {
-		t.Fatal("HasActivePendingApproval(forged) = true, want false")
+	if ok, err := g.HasActivePendingApprovalForEnvelope(ctx, &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: "forged"}}, ri, in); err != nil || ok {
+		t.Fatalf("HasActivePendingApprovalForEnvelope(forged) = (%v, %v), want (false, nil)", ok, err)
 	}
-	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{}}) {
-		t.Fatal("HasActivePendingApproval(empty) = true, want false")
+	if ok, err := g.HasActivePendingApprovalForEnvelope(ctx, &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{}}, ri, in); err != nil || ok {
+		t.Fatalf("HasActivePendingApprovalForEnvelope(empty) = (%v, %v), want (false, nil)", ok, err)
 	}
 
 	g.approvalMu.Lock()
@@ -233,7 +234,7 @@ func TestP7W18a_AB18M1_HasActivePendingApproval(t *testing.T) {
 	entry.expires = time.Now().Add(-time.Second)
 	g.pendingApprovals[pending.RequestState] = entry
 	g.approvalMu.Unlock()
-	if g.HasActivePendingApproval(&mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}) {
-		t.Fatal("HasActivePendingApproval(expired) = true, want false")
+	if ok, err := g.HasActivePendingApprovalForEnvelope(ctx, &mcp.CallToolRequest{Session: ss1, Params: &mcp.CallToolParamsRaw{RequestState: pending.RequestState}}, ri, in); err != nil || ok {
+		t.Fatalf("HasActivePendingApprovalForEnvelope(expired) = (%v, %v), want (false, nil)", ok, err)
 	}
 }

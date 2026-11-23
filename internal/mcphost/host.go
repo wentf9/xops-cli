@@ -547,6 +547,14 @@ func (s *leasedFileSession) Upload(ctx context.Context, local, remote string, pr
 	defer cancel()
 	return s.Client.Upload(work, local, remote, progress)
 }
+func (s *leasedFileSession) UploadExact(ctx context.Context, local, remote string, progress sftp.ProgressCallback) error {
+	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.UploadExact(work, local, remote, progress)
+}
 func (s *leasedFileSession) Download(ctx context.Context, remote sftp.RemotePath, dest sftp.LocalDest, opts sftp.DownloadOptions) error {
 	work, cancel, err := ports.WorkContext(ctx, s.permit, s.phases...)
 	if err != nil {

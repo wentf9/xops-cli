@@ -20,10 +20,31 @@ type invocationPolicy struct {
 }
 type invocationPolicyKey struct{}
 
+type requestEnvelopeBox struct {
+	envelope any
+}
+type requestEnvelopeKey struct{}
+
 // WithPolicy binds a defensive policy and operation identity to one invocation.
 // Approval state stays owned by the original Guardrail across round trips.
 func WithPolicy(ctx context.Context, cfg policy.Config, binding string) context.Context {
 	return context.WithValue(ctx, invocationPolicyKey{}, invocationPolicy{policy.Clone(cfg), binding})
+}
+
+// WithRequestEnvelope attaches a pre-inspection canonical request identity to
+// ctx so two-phase tools bind pending approval challenges to the exact request
+// envelope invariant across Round 1 and Round 2 (tool, action, node, raw input,
+// and snapshot/policy identity).
+func WithRequestEnvelope(ctx context.Context, envelope any) context.Context {
+	return context.WithValue(ctx, requestEnvelopeKey{}, requestEnvelopeBox{envelope: envelope})
+}
+
+func requestEnvelopeFromContext(ctx context.Context) (any, bool) {
+	if ctx == nil {
+		return nil, false
+	}
+	box, ok := ctx.Value(requestEnvelopeKey{}).(requestEnvelopeBox)
+	return box.envelope, ok
 }
 
 // NewWithAuditSink borrows a host-owned audit sink; it does not close it or
@@ -48,6 +69,26 @@ func (g *Guardrail) invocation(ctx context.Context) (*Policy, string, string) {
 func (g *Guardrail) EvaluateContext(ctx context.Context, input RiskInput) Decision {
 	policy, _, _ := g.invocation(ctx)
 	return policy.Evaluate(Classify(input), input)
+}
+
+// HasProtectedPath reports whether input.Paths or input.RecursivePaths matches
+// any built-in sensitive path or configured ProtectedPaths under the policy
+// active in ctx. When policy is disabled it returns false; when policy is nil
+// it fails closed and returns true.
+func (g *Guardrail) HasProtectedPath(ctx context.Context, input RiskInput) bool {
+	if g == nil {
+		return true
+	}
+	pol, _, _ := g.invocation(ctx)
+	if pol == nil || pol.cfg == nil {
+		return true
+	}
+	if pol.cfg.Disabled {
+		return false
+	}
+	return pol.isPathProtected(input.Paths, input.RecursivePaths) ||
+		AnalyzePaths(input.Paths) >= Moderate ||
+		AnalyzeRecursivePaths(input.RecursivePaths) >= Moderate
 }
 
 func (g *Guardrail) log(ctx context.Context, entry AuditEntry) error {

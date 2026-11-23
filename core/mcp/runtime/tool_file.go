@@ -123,12 +123,27 @@ func validateRemoteFilePath(raw string) (string, error) {
 	return parsed.String(), nil
 }
 
-func validateFileActionInput(input FileInput) (string, error) {
+func validateFileActionStructure(input FileInput) error {
 	switch input.Action {
 	case "read", "write", "patch", "stat":
 	default:
-		return "", fmt.Errorf("unsupported file action %q (expected read, write, patch, or stat)", input.Action)
+		return fmt.Errorf("unsupported file action %q (expected read, write, patch, or stat)", input.Action)
 	}
+	if input.Action == "read" {
+		if len(input.Range) != 0 && len(input.Range) != 2 {
+			return errors.New("range must be [start_line, end_line]")
+		}
+		if len(input.Range) == 2 && (input.Range[0] < 1 || input.Range[1] < input.Range[0]) {
+			return fmt.Errorf("invalid line range [%d, %d]: lines are 1-based and end_line >= start_line", input.Range[0], input.Range[1])
+		}
+	}
+	if input.Action == "patch" && input.Content == "" {
+		return errors.New("patch action requires non-empty content with <<<< ==== >>>> blocks")
+	}
+	return nil
+}
+
+func validateFileActionPath(input FileInput) (string, error) {
 	validPath, err := validateRemoteFilePath(input.Path)
 	if err != nil {
 		return "", err
@@ -138,14 +153,6 @@ func validateFileActionInput(input FileInput) (string, error) {
 			return "", errors.New("cannot read root directory as a file")
 		}
 		return "", errors.New("cannot replace root directory")
-	}
-	if input.Action == "read" {
-		if _, err := validateReadInput(FileInput{Path: validPath, Range: input.Range}); err != nil {
-			return "", err
-		}
-	}
-	if input.Action == "patch" && input.Content == "" {
-		return "", errors.New("patch action requires non-empty content with <<<< ==== >>>> blocks")
 	}
 	return validPath, nil
 }
@@ -191,6 +198,9 @@ func (r *Runtime) fileHandler(parent context.Context, req *mcp.CallToolRequest, 
 	if input.NodeID == "" || input.Path == "" || input.Action == "" {
 		return nil, FileOutput{}, errors.New("nodeID, action, and path are required")
 	}
+	if err := validateFileActionStructure(input); err != nil {
+		return nil, FileOutput{}, err
+	}
 	view, err := r.resolve(ctx, []string{input.NodeID})
 	if err != nil {
 		return nil, FileOutput{}, err
@@ -208,23 +218,27 @@ func (r *Runtime) fileHandler(parent context.Context, req *mcp.CallToolRequest, 
 		Paths:    lexicalPaths,
 	}
 	boundLex := boundFileInput{Input: input, ResolvedPaths: lexicalPaths}
-	_, lexOp, preAuth, pending, err := r.authorizeLexicalPrecheck(ctx, req, view, "file", lexicalRI, boundLex)
+	env, err := r.twoPhaseEnvelope(ctx, view, input)
+	if err != nil {
+		return nil, FileOutput{}, err
+	}
+	pre, pending, err := r.authorizeLexicalPrecheck(ctx, req, view, "file", env, lexicalRI, boundLex)
 	if err != nil || pending != nil {
 		return pending, FileOutput{}, err
 	}
 
-	validPath, err := validateFileActionInput(input)
+	validPath, err := validateFileActionPath(input)
 	if err != nil {
-		return nil, FileOutput{}, err
+		return nil, FileOutput{}, r.abortPreInspection(pre, req, lexicalRI, err)
 	}
-	inspectRes, err := r.inspectRemotePath(ctx, view, lexOp.binding, canonicalNodeID, validPath)
+	inspectRes, err := r.inspectRemotePath(ctx, view, pre.op.binding, canonicalNodeID, validPath)
 	if err != nil {
-		return nil, FileOutput{}, err
+		return nil, FileOutput{}, r.abortPreInspection(pre, req, lexicalRI, err)
 	}
 	effectiveRI, boundEff, parentJoined := buildFileEffectiveScope(canonicalNodeID, input, lexicalPaths, validPath, inspectRes)
 
 	opCtx, op, opID, pending, err := r.authorizeCanonicalScope(
-		ctx, req, view, "file", lexicalRI, preAuth, effectiveRI, boundEff,
+		ctx, req, view, "file", env, lexicalRI, boundLex, pre, effectiveRI, boundEff,
 	)
 	if err != nil || pending != nil {
 		return pending, FileOutput{}, err
@@ -232,12 +246,14 @@ func (r *Runtime) fileHandler(parent context.Context, req *mcp.CallToolRequest, 
 
 	permission, err := r.enter(opCtx, op.snapshot, op.binding, ports.Execute, opID)
 	if err != nil {
-		return nil, FileOutput{}, err
+		res, outErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, err)
+		return res, FileOutput{}, outErr
 	}
 	defer func() { handlerErr = errors.Join(handlerErr, permission.Close()) }()
 	admitted, stop, err := ports.WorkContext(opCtx, permission, ports.Execute)
 	if err != nil {
-		return nil, FileOutput{}, err
+		res, outErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, err)
+		return res, FileOutput{}, outErr
 	}
 	defer stop()
 

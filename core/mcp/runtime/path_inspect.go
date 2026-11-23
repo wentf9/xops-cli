@@ -24,6 +24,19 @@ type preAuthorizedOp struct {
 	opID string
 }
 
+type twoPhaseRequestEnvelope struct {
+	Scope          string
+	SnapshotDigest string
+	Input          any
+}
+
+type lexicalPrecheckState struct {
+	ctx         context.Context
+	op          *operation
+	preAuth     *preAuthorizedOp
+	deferredLex bool
+}
+
 type localPathInspection struct {
 	canonicalPath string
 	extraPaths    []string
@@ -49,9 +62,30 @@ func mergeUniquePaths(groups ...[]string) []string {
 	return out
 }
 
-func sameResolvedRisk(lexical, effective guardrail.RiskInput) bool {
-	return slices.Equal(lexical.Paths, effective.Paths) &&
-		slices.Equal(lexical.RecursivePaths, effective.RecursivePaths)
+func (r *Runtime) twoPhaseEnvelope(ctx context.Context, view ports.OperationSnapshot, rawInput any) (twoPhaseRequestEnvelope, error) {
+	snapDigest, err := view.Digest()
+	if err != nil {
+		return twoPhaseRequestEnvelope{}, err
+	}
+	return twoPhaseRequestEnvelope{
+		Scope:          r.scope(ctx),
+		SnapshotDigest: snapDigest,
+		Input:          rawInput,
+	}, nil
+}
+
+func (r *Runtime) operationContextWithEnvelope(
+	ctx context.Context,
+	view ports.OperationSnapshot,
+	tool string,
+	boundInput any,
+	env twoPhaseRequestEnvelope,
+) (context.Context, *operation, error) {
+	opCtx, op, err := r.operationContext(ctx, view, tool, boundInput)
+	if err != nil {
+		return nil, nil, err
+	}
+	return guardrail.WithRequestEnvelope(opCtx, env), op, nil
 }
 
 func stripApprovalRoundTripParams(req *mcp.CallToolRequest) *mcp.CallToolRequest {
@@ -258,35 +292,144 @@ func (r *Runtime) authorizeLexicalPrecheck(
 	req *mcp.CallToolRequest,
 	view ports.OperationSnapshot,
 	tool string,
+	env twoPhaseRequestEnvelope,
 	lexicalRI guardrail.RiskInput,
 	boundLex any,
-) (context.Context, *operation, *preAuthorizedOp, *mcp.CallToolResult, error) {
-	lexCtx, lexOp, err := r.operationContext(ctx, view, tool, boundLex)
+) (lexicalPrecheckState, *mcp.CallToolResult, error) {
+	lexCtx, lexOp, err := r.operationContextWithEnvelope(ctx, view, tool, boundLex, env)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return lexicalPrecheckState{}, nil, err
 	}
+	state := lexicalPrecheckState{ctx: lexCtx, op: lexOp}
 	decision := r.guardrail.EvaluateContext(lexCtx, lexicalRI)
 	if decision == guardrail.Deny || (decision == guardrail.NeedApproval && !hasApprovalRoundTripParams(req)) {
 		opID, pending, authErr := r.guardrail.Authorize(lexCtx, req, lexicalRI, boundLex)
 		if authErr != nil || pending != nil {
-			return lexCtx, lexOp, nil, pending, authErr
+			return state, pending, authErr
 		}
-		return lexCtx, lexOp, &preAuthorizedOp{ctx: lexCtx, op: lexOp, opID: opID}, nil, nil
+		state.preAuth = &preAuthorizedOp{ctx: lexCtx, op: lexOp, opID: opID}
+		return state, nil, nil
 	}
 	if hasApprovalRoundTripParams(req) {
 		matchedLex, matchErr := r.guardrail.HasMatchingPendingApproval(lexCtx, req, lexicalRI, boundLex)
 		if matchErr != nil {
-			return lexCtx, lexOp, nil, nil, matchErr
+			return state, nil, matchErr
 		}
-		if matchedLex || !r.guardrail.HasActivePendingApproval(req) {
-			opID, pending, authErr := r.guardrail.Authorize(lexCtx, req, lexicalRI, boundLex)
-			if authErr != nil || pending != nil {
-				return lexCtx, lexOp, nil, pending, authErr
+		if matchedLex {
+			if !r.guardrail.IsApprovedRoundTripResponse(req) {
+				_, pending, authErr := r.guardrail.Authorize(lexCtx, req, lexicalRI, boundLex)
+				return state, pending, authErr
 			}
-			return lexCtx, lexOp, &preAuthorizedOp{ctx: lexCtx, op: lexOp, opID: opID}, nil, nil
+			state.deferredLex = true
+			return state, nil, nil
+		}
+		activeEnv, envErr := r.guardrail.HasActivePendingApprovalForEnvelope(lexCtx, req, lexicalRI, boundLex)
+		if envErr != nil {
+			return state, nil, envErr
+		}
+		if !activeEnv {
+			_, pending, authErr := r.guardrail.Authorize(lexCtx, req, lexicalRI, boundLex)
+			return state, pending, authErr
+		}
+		if !r.guardrail.IsApprovedRoundTripResponse(req) {
+			return state, nil, r.guardrail.ConsumeDeclinedPendingApproval(lexCtx, req, lexicalRI, boundLex)
 		}
 	}
-	return lexCtx, lexOp, nil, nil, nil
+	return state, nil, nil
+}
+
+func (r *Runtime) abortPreInspection(
+	pre lexicalPrecheckState,
+	req *mcp.CallToolRequest,
+	lexicalRI guardrail.RiskInput,
+	cause error,
+) error {
+	if pre.preAuth != nil {
+		_, outErr := r.recordTwoPhaseOutcome(pre.preAuth.ctx, pre.preAuth.opID, lexicalRI, nil, cause)
+		return outErr
+	}
+	if hasApprovalRoundTripParams(req) {
+		return r.guardrail.InvalidatePendingApproval(pre.ctx, req, lexicalRI, "error", cause)
+	}
+	return cause
+}
+
+func (r *Runtime) canonicalScopeEscalated(
+	lexCtx context.Context,
+	effCtx context.Context,
+	lexicalRI guardrail.RiskInput,
+	effectiveRI guardrail.RiskInput,
+) bool {
+	if guardrail.Classify(effectiveRI) > guardrail.Classify(lexicalRI) {
+		return true
+	}
+	return r.guardrail.HasProtectedPath(effCtx, effectiveRI) && !r.guardrail.HasProtectedPath(lexCtx, lexicalRI)
+}
+
+func (r *Runtime) closePreAuthorized(preAuth *preAuthorizedOp, effectiveRI guardrail.RiskInput, cause error) error {
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(preAuth.ctx), 5*time.Second)
+	defer cancel()
+	return r.guardrail.RecordAuthorizedContext(auditCtx, preAuth.opID, effectiveRI, "error", cause)
+}
+
+func (r *Runtime) authorizeCanonicalWithPreAuth(
+	req *mcp.CallToolRequest,
+	preAuth *preAuthorizedOp,
+	effCtx context.Context,
+	effOp *operation,
+	effDecision guardrail.Decision,
+	escalated bool,
+	effectiveRI guardrail.RiskInput,
+	boundEff any,
+) (context.Context, *operation, string, *mcp.CallToolResult, error) {
+	if effDecision != guardrail.Deny && !escalated {
+		return preAuth.ctx, preAuth.op, preAuth.opID, nil, nil
+	}
+	superseded := errors.New("pre-inspection authorization superseded by canonical path resolution")
+	if effDecision == guardrail.Deny {
+		superseded = errors.New("pre-inspection authorization denied by canonical policy")
+	}
+	if auditErr := r.closePreAuthorized(preAuth, effectiveRI, superseded); auditErr != nil {
+		return nil, nil, "", nil, fmt.Errorf("close pre-inspection authorization audit: %w", auditErr)
+	}
+	opID, pending, effErr := r.guardrail.Authorize(effCtx, stripApprovalRoundTripParams(req), effectiveRI, boundEff)
+	if effErr != nil || pending != nil {
+		return nil, nil, "", pending, effErr
+	}
+	return effCtx, effOp, opID, nil, nil
+}
+
+func (r *Runtime) authorizeCanonicalDeferredLex(
+	req *mcp.CallToolRequest,
+	preCtx context.Context,
+	effCtx context.Context,
+	effOp *operation,
+	effDecision guardrail.Decision,
+	escalated bool,
+	lexicalRI guardrail.RiskInput,
+	boundLex any,
+	effectiveRI guardrail.RiskInput,
+	boundEff any,
+) (context.Context, *operation, string, *mcp.CallToolResult, error) {
+	if effDecision == guardrail.Deny || escalated {
+		if retireErr := r.guardrail.RetirePendingApproval(preCtx, req, lexicalRI, boundLex); retireErr != nil {
+			_, _, authErr := r.guardrail.Authorize(effCtx, req, effectiveRI, boundEff)
+			if authErr != nil {
+				return nil, nil, "", nil, authErr
+			}
+			return nil, nil, "", nil, retireErr
+		}
+		opID, pending, effErr := r.guardrail.Authorize(effCtx, stripApprovalRoundTripParams(req), effectiveRI, boundEff)
+		if effErr != nil || pending != nil {
+			return nil, nil, "", pending, effErr
+		}
+		return effCtx, effOp, opID, nil, nil
+	}
+	opID, consumeErr := r.guardrail.ConsumePendingApprovalForScope(preCtx, req, lexicalRI, boundLex, effCtx, effectiveRI)
+	if consumeErr != nil {
+		return nil, nil, "", nil, consumeErr
+	}
+	return effCtx, effOp, opID, nil, nil
 }
 
 func (r *Runtime) authorizeCanonicalScope(
@@ -294,23 +437,33 @@ func (r *Runtime) authorizeCanonicalScope(
 	req *mcp.CallToolRequest,
 	view ports.OperationSnapshot,
 	tool string,
+	env twoPhaseRequestEnvelope,
 	lexicalRI guardrail.RiskInput,
-	preAuth *preAuthorizedOp,
+	boundLex any,
+	pre lexicalPrecheckState,
 	effectiveRI guardrail.RiskInput,
 	boundEff any,
 ) (context.Context, *operation, string, *mcp.CallToolResult, error) {
-	if preAuth != nil && sameResolvedRisk(lexicalRI, effectiveRI) {
-		return preAuth.ctx, preAuth.op, preAuth.opID, nil, nil
-	}
-	effCtx, effOp, err := r.operationContext(ctx, view, tool, boundEff)
+	effCtx, effOp, err := r.operationContextWithEnvelope(ctx, view, tool, boundEff, env)
 	if err != nil {
+		if pre.preAuth != nil {
+			err = errors.Join(err, r.closePreAuthorized(pre.preAuth, effectiveRI, err))
+		} else if hasApprovalRoundTripParams(req) {
+			err = r.guardrail.InvalidatePendingApproval(pre.ctx, req, effectiveRI, "error", err)
+		}
 		return nil, nil, "", nil, err
 	}
-	authReq := req
-	if preAuth != nil {
-		authReq = stripApprovalRoundTripParams(req)
+
+	effDecision := r.guardrail.EvaluateContext(effCtx, effectiveRI)
+	escalated := r.canonicalScopeEscalated(pre.ctx, effCtx, lexicalRI, effectiveRI)
+
+	if pre.preAuth != nil {
+		return r.authorizeCanonicalWithPreAuth(req, pre.preAuth, effCtx, effOp, effDecision, escalated, effectiveRI, boundEff)
 	}
-	opID, pending, effErr := r.guardrail.Authorize(effCtx, authReq, effectiveRI, boundEff)
+	if pre.deferredLex {
+		return r.authorizeCanonicalDeferredLex(req, pre.ctx, effCtx, effOp, effDecision, escalated, lexicalRI, boundLex, effectiveRI, boundEff)
+	}
+	opID, pending, effErr := r.guardrail.Authorize(effCtx, req, effectiveRI, boundEff)
 	if effErr != nil || pending != nil {
 		return nil, nil, "", pending, effErr
 	}

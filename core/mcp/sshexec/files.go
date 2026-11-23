@@ -38,6 +38,14 @@ func (s *fileSession) Upload(ctx context.Context, local, remote string, progress
 	defer cancel()
 	return s.Client.Upload(work, local, remote, progress)
 }
+func (s *fileSession) UploadExact(ctx context.Context, local, remote string, progress sftp.ProgressCallback) error {
+	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	return s.Client.UploadExact(work, local, remote, progress)
+}
 func (s *fileSession) Download(ctx context.Context, remote sftp.RemotePath, dest sftp.LocalDest, opts sftp.DownloadOptions) error {
 	work, cancel, err := s.backend.work(ctx, s.permit, s.phases...)
 	if err != nil {

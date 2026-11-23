@@ -248,9 +248,16 @@ func (r *Runtime) inspectStdioTransferScope(
 	return localInfo, remoteInfo, effectiveRI, boundEff, nil
 }
 
+func validateStdioTransferDirection(direction string) error {
+	if direction != "push" && direction != "pull" {
+		return fmt.Errorf("unsupported transfer direction %q (expected push or pull)", direction)
+	}
+	return nil
+}
+
 func validateStdioTransferPaths(input TransferFileInput) (string, string, error) {
-	if input.Direction != "push" && input.Direction != "pull" {
-		return "", "", fmt.Errorf("unsupported transfer direction %q (expected push or pull)", input.Direction)
+	if err := validateStdioTransferDirection(input.Direction); err != nil {
+		return "", "", err
 	}
 	validLocal, err := validateStdioLocalPath(input.LocalPath)
 	if err != nil {
@@ -269,6 +276,9 @@ func (r *Runtime) stdioTransferHandler(parent context.Context, req *mcp.CallTool
 	if input.NodeID == "" || input.LocalPath == "" || input.RemotePath == "" || input.Direction == "" {
 		return nil, TransferFileOutput{}, fmt.Errorf("nodeID, direction, localPath, and remotePath are required")
 	}
+	if err := validateStdioTransferDirection(input.Direction); err != nil {
+		return nil, TransferFileOutput{}, err
+	}
 	view, err := r.resolve(ctx, []string{input.NodeID})
 	if err != nil {
 		return nil, TransferFileOutput{}, err
@@ -286,24 +296,28 @@ func (r *Runtime) stdioTransferHandler(parent context.Context, req *mcp.CallTool
 		Paths:    lexicalPaths,
 	}
 	boundLex := boundStdioTransferInput{Input: input, ResolvedPaths: lexicalPaths}
-	_, lexOp, preAuth, pending, err := r.authorizeLexicalPrecheck(ctx, req, view, "transfer", lexicalRI, boundLex)
+	env, err := r.twoPhaseEnvelope(ctx, view, input)
+	if err != nil {
+		return nil, TransferFileOutput{}, err
+	}
+	pre, pending, err := r.authorizeLexicalPrecheck(ctx, req, view, "transfer", env, lexicalRI, boundLex)
 	if err != nil || pending != nil {
 		return pending, TransferFileOutput{}, err
 	}
 
 	validLocal, validRemote, err := validateStdioTransferPaths(input)
 	if err != nil {
-		return nil, TransferFileOutput{}, err
+		return nil, TransferFileOutput{}, r.abortPreInspection(pre, req, lexicalRI, err)
 	}
 	localInfo, remoteInfo, effectiveRI, boundEff, err := r.inspectStdioTransferScope(
-		ctx, view, lexOp.binding, canonicalNodeID, input, lexicalPaths, validLocal, validRemote,
+		ctx, view, pre.op.binding, canonicalNodeID, input, lexicalPaths, validLocal, validRemote,
 	)
 	if err != nil {
-		return nil, TransferFileOutput{}, err
+		return nil, TransferFileOutput{}, r.abortPreInspection(pre, req, lexicalRI, err)
 	}
 
 	opCtx, op, opID, pending, err := r.authorizeCanonicalScope(
-		ctx, req, view, "transfer", lexicalRI, preAuth, effectiveRI, boundEff,
+		ctx, req, view, "transfer", env, lexicalRI, boundLex, pre, effectiveRI, boundEff,
 	)
 	if err != nil || pending != nil {
 		return pending, TransferFileOutput{}, err
@@ -311,12 +325,14 @@ func (r *Runtime) stdioTransferHandler(parent context.Context, req *mcp.CallTool
 
 	permission, err := r.enter(opCtx, op.snapshot, op.binding, ports.Execute, opID)
 	if err != nil {
-		return nil, TransferFileOutput{}, err
+		res, outErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, err)
+		return res, TransferFileOutput{}, outErr
 	}
 	defer func() { handlerErr = errors.Join(handlerErr, permission.Close()) }()
 	admitted, stop, err := ports.WorkContext(opCtx, permission, ports.Execute)
 	if err != nil {
-		return nil, TransferFileOutput{}, err
+		res, outErr := r.recordTwoPhaseOutcome(opCtx, opID, effectiveRI, nil, err)
+		return res, TransferFileOutput{}, outErr
 	}
 	defer stop()
 
@@ -336,6 +352,48 @@ func (r *Runtime) stdioTransferHandler(parent context.Context, req *mcp.CallTool
 		Direction: input.Direction,
 		Status:    "success",
 	}, nil
+}
+
+func resolveExactPushTarget(validLocal, validRemote string, curLocal localPathInspection, curRemote remotefile.PathInspection) (string, error) {
+	remoteTarget := curRemote.CanonicalPath
+	if remoteTarget == "" {
+		if curRemote.ParentPath != "" && !remotefile.IsRootPath(validRemote) {
+			remoteTarget = path.Join(curRemote.ParentPath, path.Base(validRemote))
+		} else {
+			remoteTarget = validRemote
+		}
+	}
+	if !curLocal.isDir && curRemote.IsDir {
+		parsedDst, err := sftp.ParseRemoteUploadTarget(remoteTarget, validLocal, true)
+		if err != nil {
+			return "", err
+		}
+		return parsedDst.String(), nil
+	}
+	return remoteTarget, nil
+}
+
+func resolveExactPullLocalDest(validRemote string, curLocal localPathInspection, curRemote remotefile.PathInspection) (sftp.LocalDest, error) {
+	if !curRemote.IsDir && curLocal.isDir {
+		reqRemote, err := sftp.ParseRemotePath(validRemote)
+		if err != nil {
+			return sftp.LocalDest{}, err
+		}
+		baseName := reqRemote.Base()
+		if !baseName.IsValid() {
+			return sftp.LocalDest{}, fmt.Errorf("%w: remote path %q has no valid entry name", sftp.ErrInvalidRemoteName, validRemote)
+		}
+		target, err := sftp.ResolveLocalTarget(curLocal.canonicalPath, baseName)
+		if err != nil {
+			return sftp.LocalDest{}, err
+		}
+		return sftp.LocalDestFromTarget(target)
+	}
+	target, err := sftp.ResolveLocalTarget(curLocal.canonicalPath)
+	if err != nil {
+		return sftp.LocalDest{}, err
+	}
+	return sftp.LocalDestFromTarget(target)
 }
 
 func executeStdioTransfer(
@@ -364,35 +422,24 @@ func executeStdioTransfer(
 
 	switch direction {
 	case "push":
-		localSrc := validLocal
-		remoteDst := validRemote
-		if !curRemote.IsDir {
-			localSrc = curLocal.canonicalPath
-			if curRemote.CanonicalPath != "" {
-				remoteDst = curRemote.CanonicalPath
-			}
-		} else if curRemote.CanonicalPath != "" {
-			remoteDst = curRemote.CanonicalPath
+		localSrc := curLocal.canonicalPath
+		exactRemoteDst, dstErr := resolveExactPushTarget(validLocal, validRemote, curLocal, curRemote)
+		if dstErr != nil {
+			return fmt.Errorf("push failed: %w", dstErr)
 		}
-		if err := sftpClient.Upload(ctx, localSrc, remoteDst, nil); err != nil {
+		if err := sftpClient.UploadExact(ctx, localSrc, exactRemoteDst, nil); err != nil {
 			return fmt.Errorf("push failed: %w", err)
 		}
 	case "pull":
-		remoteSrc := validRemote
-		localDst := validLocal
-		if !curLocal.isDir {
-			if curRemote.CanonicalPath != "" {
-				remoteSrc = curRemote.CanonicalPath
-			}
-			localDst = curLocal.canonicalPath
-		} else if curLocal.canonicalPath != "" {
-			localDst = curLocal.canonicalPath
+		remoteSrc := curRemote.CanonicalPath
+		if remoteSrc == "" {
+			remoteSrc = validRemote
 		}
 		remotePath, parseErr := sftp.ParseRemotePath(remoteSrc)
 		if parseErr != nil {
 			return fmt.Errorf("pull failed: %w", parseErr)
 		}
-		localDest, destErr := sftp.LocalDestPath(localDst)
+		localDest, destErr := resolveExactPullLocalDest(validRemote, curLocal, curRemote)
 		if destErr != nil {
 			return fmt.Errorf("pull failed: %w", destErr)
 		}
