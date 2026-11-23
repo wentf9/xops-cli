@@ -536,6 +536,29 @@ func nodeEntityVersion(cfg *Configuration, nodeID string) (Version, error) {
 	return sha256.Sum256(data), nil
 }
 
+// ComputeNodeRef computes the exact CAS NodeRef for a persisted (nodeID, node, host, identity)
+// bundle without reading live repository state, preventing TOCTOU windows when building
+// follow-up CAS preconditions after a known local mutation.
+func ComputeNodeRef(nodeID string, node models.Node, host models.Host, identity models.Identity) (NodeRef, error) {
+	if nodeID == "" {
+		return NodeRef{}, fmt.Errorf("node ID is empty")
+	}
+	storedNode := cloneNode(node)
+	storedNode.OpenSSHAlias = ""
+	storedNode.CanonicalHost = ""
+	clonedHost := cloneHost(host)
+	clonedIdentity := cloneIdentity(identity)
+	data, err := yaml.Marshal(struct {
+		Node     models.Node      `yaml:"node"`
+		Host     *models.Host     `yaml:"host"`
+		Identity *models.Identity `yaml:"identity"`
+	}{Node: storedNode, Host: &clonedHost, Identity: &clonedIdentity})
+	if err != nil {
+		return NodeRef{}, fmt.Errorf("serialize node %q version: %w", nodeID, err)
+	}
+	return NodeRef{ID: nodeID, Version: sha256.Sum256(data)}, nil
+}
+
 func ensureNodeRefs(cfg *Configuration, refs []NodeRef) error {
 	seen := make(map[string]Version, len(refs))
 	for _, ref := range refs {

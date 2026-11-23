@@ -652,29 +652,50 @@ func (m *Model) buildFormSaveRunner(
 		if err != nil {
 			return err
 		}
-		committedAny, syncErr := syncCredentialsToStoreWithFingerprint(ctx, repository, credentialService, nodeID, mutation.AuthVersion, keyFingerprint, s, actions)
+		committedLoginRef, syncErr := syncCredentialsToStoreWithFingerprint(ctx, repository, credentialService, nodeID, mutation.AuthVersion, keyFingerprint, s, actions)
 		if syncErr != nil {
-			rollbackFailedCreateNode(ctx, repository, credentialService, nodeID, mutation.Ref, committedAny, syncErr)
+			rollbackFailedCreateNode(ctx, repository, credentialService, nodeID, node, host, identity, mutation.Ref, committedLoginRef, s.authType, syncErr)
 			return syncErr
 		}
 		return nil
 	}
 }
 
-func rollbackFailedCreateNode(ctx context.Context, repository *config.Repository, credSvc *credential.Service, nodeID string, createdRef config.NodeRef, committedAny bool, syncErr error) {
+func rollbackFailedCreateNode(
+	ctx context.Context,
+	repository *config.Repository,
+	credSvc *credential.Service,
+	nodeID string,
+	node models.Node,
+	host models.Host,
+	identity models.Identity,
+	createdRef config.NodeRef,
+	committedLoginRef *credential.Ref,
+	authType string,
+	syncErr error,
+) {
 	var durabilityErr *config.DurabilityError
 	var cleanupErr *credential.CleanupError
-	if errors.As(syncErr, &durabilityErr) || errors.As(syncErr, &cleanupErr) {
+	if errors.As(syncErr, &durabilityErr) || errors.As(syncErr, &cleanupErr) ||
+		errors.Is(syncErr, coreauth.ErrConfigConflict) || errors.Is(syncErr, config.ErrConfigConflict) {
 		return
 	}
 	cleanupCtx := context.WithoutCancel(ctx)
-	if !committedAny {
+	if committedLoginRef == nil || committedLoginRef.IsEmpty() {
 		_, _ = repository.DeleteNodeAtRefContext(cleanupCtx, createdRef)
 		return
 	}
-	if currentRef := repository.View().NodeRefs[nodeID]; currentRef.ID != "" {
-		_ = repository.DeleteNodesWithCredentialsContext(cleanupCtx, []config.NodeRef{currentRef}, credSvc)
+	expectedIdentity := identity
+	expectedIdentity.LoginPasswordRef = committedLoginRef.Clone()
+	expectedIdentity.Password = ""
+	if authType != "" {
+		expectedIdentity.AuthType = authType
 	}
+	expectedRef, err := config.ComputeNodeRef(nodeID, node, host, expectedIdentity)
+	if err != nil {
+		return
+	}
+	_ = repository.DeleteNodesWithCredentialsContext(cleanupCtx, []config.NodeRef{expectedRef}, credSvc)
 }
 
 func validateFormSecretsBeforeCommit(cfg *config.Configuration, credSvc *credential.Service, s nodeFormState, actions formCredentialActions) (string, error) {
@@ -1005,38 +1026,36 @@ func needsFormCredentialAction(supported bool, action, secret string, existingRe
 	return (action == "replace" && secret != "") || (action == "delete" && existingRef != nil)
 }
 
-func syncCredentialsToStoreWithFingerprint(ctx context.Context, repository *config.Repository, credSvc *credential.Service, nodeID, authVersion, preboundFingerprint string, s nodeFormState, actions formCredentialActions) (bool, error) {
+func syncCredentialsToStoreWithFingerprint(ctx context.Context, repository *config.Repository, credSvc *credential.Service, nodeID, authVersion, preboundFingerprint string, s nodeFormState, actions formCredentialActions) (*credential.Ref, error) {
 	needsPasswordSync := needsFormCredentialAction(authTypeSupportsPassword(s.authType), actions.password, s.password, s.existingPasswordRef)
 	needsPassphraseSync := needsFormCredentialAction(authTypeSupportsKey(s.authType), actions.passphrase, s.passphrase, s.existingPassphraseRef)
 
 	if credSvc == nil {
 		if repository.Snapshot().Credential != nil && (needsPasswordSync || needsPassphraseSync || actions.cleanupRef != nil) {
-			return false, errors.New("credential service is unavailable")
+			return nil, errors.New("credential service is unavailable")
 		}
-		return false, nil
+		return nil, nil
 	}
 	cfg := repository.Snapshot()
 	targetStore := defaultFormTargetStore(cfg)
 
 	version := authVersion
-	committedAny := false
+	var committedLoginRef *credential.Ref
 	if needsPasswordSync {
 		var err error
-		version, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, version, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, "", actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+		version, committedLoginRef, err = syncFormCredential(ctx, credSvc, nodeID, credential.KindLoginPassword, version, actions.password, s.existingPasswordRef, targetStore, s.password, "", s.authType, "", actions.clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
 		if err != nil {
-			return committedAny, err
+			return nil, err
 		}
-		committedAny = true
 	}
 	if needsPassphraseSync {
 		var err error
 		version, err = syncFormPassphraseCredential(ctx, cfg, credSvc, nodeID, version, targetStore, preboundFingerprint, s, actions)
 		if err != nil {
-			return committedAny, err
+			return committedLoginRef, err
 		}
-		committedAny = true
 	}
-	return committedAny, cleanupReplacedFormCredential(ctx, credSvc, nodeID, version, s, actions)
+	return committedLoginRef, cleanupReplacedFormCredential(ctx, credSvc, nodeID, version, s, actions)
 }
 
 func defaultFormTargetStore(cfg *config.Configuration) string {
@@ -1056,7 +1075,8 @@ func syncFormPassphraseCredential(ctx context.Context, cfg *config.Configuration
 		keyFingerprint = target.KeyFingerprint
 	}
 	clearKeyPath := actions.passphrase == "delete" && actions.clearKeyPath
-	return syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, version, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, keyFingerprint, clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+	nextVersion, _, err := syncFormCredential(ctx, credSvc, nodeID, credential.KindPassphrase, version, actions.passphrase, s.existingPassphraseRef, targetStore, s.passphrase, actions.keyPath, s.authType, keyFingerprint, clearKeyPath, actions.clearLegacyLoginPassword, actions.clearLegacyPassphrase)
+	return nextVersion, err
 }
 
 func cleanupReplacedFormCredential(ctx context.Context, credSvc *credential.Service, nodeID, version string, s nodeFormState, actions formCredentialActions) error {
@@ -1082,23 +1102,23 @@ func cleanupReplacedFormCredential(ctx context.Context, credSvc *credential.Serv
 	return nil
 }
 
-func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value, keyPath, authType, keyFingerprint string, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase bool) (string, error) {
+func syncFormCredential(ctx context.Context, service *credential.Service, nodeID string, kind credential.Kind, version, action string, oldRef *credential.Ref, storeID, value, keyPath, authType, keyFingerprint string, clearKeyPath, clearLegacyLoginPassword, clearLegacyPassphrase bool) (string, *credential.Ref, error) {
 	target := credential.Target{NodeID: nodeID, Kind: kind, KeyPath: keyPath, KeyFingerprint: keyFingerprint, AuthType: authType, ClearKeyPath: clearKeyPath, ClearLegacyLoginPassword: clearLegacyLoginPassword, ClearLegacyPassphrase: clearLegacyPassphrase}
 	if action == "replace" && value != "" {
-		_, nextVersion, err := service.Rotate(ctx, target, version, oldRef, storeID, credential.Secret{Value: []byte(value)})
+		newRef, nextVersion, err := service.Rotate(ctx, target, version, oldRef, storeID, credential.Secret{Value: []byte(value)})
 		if err != nil {
-			return "", fmt.Errorf("save %s to credential store: %w", kind, err)
+			return "", nil, fmt.Errorf("save %s to credential store: %w", kind, err)
 		}
-		return nextVersion, nil
+		return nextVersion, newRef.Clone(), nil
 	}
 	if action == "delete" && oldRef != nil {
 		nextVersion, err := service.Delete(ctx, target, version, *oldRef)
 		if err != nil {
-			return "", fmt.Errorf("delete %s from credential store: %w", kind, err)
+			return "", nil, fmt.Errorf("delete %s from credential store: %w", kind, err)
 		}
-		return nextVersion, nil
+		return nextVersion, nil, nil
 	}
-	return version, nil
+	return version, nil, nil
 }
 
 // splitComma parses a comma-separated string into a slice of trimmed strings

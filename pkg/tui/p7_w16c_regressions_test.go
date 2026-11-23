@@ -285,6 +285,8 @@ func TestP7W16c_L4_16_M1_TUICreateAtomicValidationAndRetryPreservesInput(t *test
 	t.Run("none_default_store_and_nil_service_rejected_before_create", testW16cTUICreateStoreRejected)
 	t.Run("locked_store_put_failure_rolls_back_node_and_retry_succeeds", testW16cTUICreateLockedStoreRollback)
 	t.Run("dual_secret_second_put_failure_rolls_back_node_and_first_secret", testW16cTUICreateDualSecretRollback)
+	t.Run("dual_secret_concurrent_edit_config_conflict_preserves_node_and_vault", testW16cTUICreateDualSecretConcurrentEditConflictPreservesNode)
+	t.Run("dual_secret_concurrent_non_auth_edit_and_locked_put_preserves_node_and_vault", testW16cTUICreateDualSecretConcurrentEditLockedPutPreservesNode)
 }
 
 func testW16cTUICreateWrongPassphraseRetry(t *testing.T) {
@@ -502,6 +504,149 @@ func testW16cTUICreateDualSecretRollback(t *testing.T) {
 	}
 	if len(mem.data) != 0 {
 		t.Fatalf("dual-secret rollback leaked first secret in vault: %d entries", len(mem.data))
+	}
+}
+
+func testW16cTUICreateDualSecretConcurrentEditConflictPreservesNode(t *testing.T) {
+	const nodeID = "ops@10.20.0.7:22"
+	repo, diskStore, _, _ := newW16cDiskTUIEnv(t, "mem")
+	keyPath, _ := writeW16cTestKey(t, "dual-pass")
+	putCalls := 0
+	mem := newMemoryCredentialStore()
+	concurrentRef := credential.Ref{StoreID: "mem", ItemID: "concurrent-pw"}
+	_ = mem.Put(t.Context(), concurrentRef, credential.NewSecret([]byte("concurrent-secret")))
+
+	flakyStore := &failingCredentialStore{
+		memoryCredentialStore: mem,
+		onPut: func() error {
+			putCalls++
+			if putCalls == 2 {
+				// Simulate a concurrent auth update after Step 2 (login password) committed,
+				// causing Step 3 (passphrase) to fail with ErrConfigConflict during CAS.
+				_, _, err := repo.UpdateNodeCredentialRefAtVersionContext(t.Context(), nodeID, "", credential.KindLoginPassword, &concurrentRef)
+				if err != nil {
+					t.Errorf("inject concurrent auth update: %v", err)
+				}
+			}
+			return nil
+		},
+	}
+	svc := newFormCredentialTestService(t, repo, flakyStore)
+	m := &Model{
+		repository:        repo,
+		credentialService: svc,
+		state:             viewForm,
+		formState: &nodeFormState{
+			isEdit:           false,
+			skipVerify:       true,
+			user:             "ops",
+			address:          "10.20.0.7",
+			port:             "22",
+			authType:         "auto",
+			password:         "first-pw",
+			passwordAction:   "replace",
+			keyPath:          keyPath,
+			passphrase:       "dual-pass",
+			passphraseAction: "replace",
+			sudoMode:         string(models.SudoModeAuto),
+		},
+	}
+
+	err := runFormMutationExpectError(t, m)
+	if !errors.Is(err, coreauth.ErrConfigConflict) && !errors.Is(err, config.ErrConfigConflict) {
+		t.Fatalf("Step 3 error = %v, want ErrConfigConflict", err)
+	}
+	diskCfg, loadErr := diskStore.Load()
+	if loadErr != nil {
+		t.Fatalf("diskStore.Load: %v", loadErr)
+	}
+	node, ok := diskCfg.Nodes.Get(nodeID)
+	if !ok {
+		t.Fatalf("rollback deleted concurrently modified node %q on ErrConfigConflict", nodeID)
+	}
+	ident, _ := diskCfg.Identities.Get(node.IdentityRef)
+	if ident.LoginPasswordRef == nil || *ident.LoginPasswordRef != concurrentRef {
+		t.Fatalf("concurrent writer's LoginPasswordRef lost: got %v, want %v", ident.LoginPasswordRef, concurrentRef)
+	}
+	sec, getErr := mem.Get(t.Context(), concurrentRef)
+	if getErr != nil || string(sec.Value) != "concurrent-secret" {
+		t.Fatalf("concurrent writer's vault credential deleted or corrupted: (%q, %v)", string(sec.Value), getErr)
+	}
+}
+
+func testW16cTUICreateDualSecretConcurrentEditLockedPutPreservesNode(t *testing.T) {
+	const nodeID = "ops@10.20.0.8:22"
+	repo, diskStore, _, _ := newW16cDiskTUIEnv(t, "mem")
+	keyPath, _ := writeW16cTestKey(t, "dual-pass")
+	putCalls := 0
+	mem := newMemoryCredentialStore()
+
+	flakyStore := &failingCredentialStore{
+		memoryCredentialStore: mem,
+		onPut: func() error {
+			putCalls++
+			if putCalls == 2 {
+				// Simulate a concurrent non-auth edit (adding tag + alias) after Step 2 committed,
+				// followed by Step 3 failing at store.Put with ErrCredentialStoreLocked.
+				view := repo.View()
+				n, h, id, rErr := repo.Resolve(nodeID)
+				if rErr != nil {
+					t.Errorf("resolve before concurrent edit: %v", rErr)
+					return coreauth.ErrCredentialStoreLocked
+				}
+				n.Tags = []string{"concurrent-tag"}
+				n.Alias = []string{"concurrent-alias"}
+				if eErr := repo.ReplaceNodeAtRefContext(t.Context(), view.NodeRefs[nodeID], nodeID, n, h, id); eErr != nil {
+					t.Errorf("inject concurrent non-auth edit: %v", eErr)
+				}
+				return coreauth.ErrCredentialStoreLocked
+			}
+			return nil
+		},
+	}
+	svc := newFormCredentialTestService(t, repo, flakyStore)
+	m := &Model{
+		repository:        repo,
+		credentialService: svc,
+		state:             viewForm,
+		formState: &nodeFormState{
+			isEdit:           false,
+			skipVerify:       true,
+			user:             "ops",
+			address:          "10.20.0.8",
+			port:             "22",
+			authType:         "auto",
+			password:         "first-pw",
+			passwordAction:   "replace",
+			keyPath:          keyPath,
+			passphrase:       "dual-pass",
+			passphraseAction: "replace",
+			sudoMode:         string(models.SudoModeAuto),
+		},
+	}
+
+	err := runFormMutationExpectError(t, m)
+	if !errors.Is(err, coreauth.ErrCredentialStoreLocked) {
+		t.Fatalf("Step 3 error = %v, want ErrCredentialStoreLocked", err)
+	}
+	diskCfg, loadErr := diskStore.Load()
+	if loadErr != nil {
+		t.Fatalf("diskStore.Load: %v", loadErr)
+	}
+	node, ok := diskCfg.Nodes.Get(nodeID)
+	if !ok {
+		t.Fatalf("rollback deleted concurrently modified node %q despite stale pinned NodeRef", nodeID)
+	}
+	if len(node.Tags) != 1 || node.Tags[0] != "concurrent-tag" || len(node.Alias) != 1 || node.Alias[0] != "concurrent-alias" {
+		t.Fatalf("concurrent non-auth edit lost: %+v", node)
+	}
+	ident, _ := diskCfg.Identities.Get(node.IdentityRef)
+	if ident.LoginPasswordRef == nil {
+		t.Fatalf("node LoginPasswordRef missing after preserved concurrent edit")
+	}
+	sec, getErr := mem.Get(t.Context(), *ident.LoginPasswordRef)
+	if getErr != nil || string(sec.Value) != "first-pw" {
+		t.Fatalf("vault credential for preserved node deleted or corrupted: (%q, %v)", string(sec.Value), getErr)
 	}
 }
 
