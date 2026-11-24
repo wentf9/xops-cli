@@ -372,7 +372,16 @@ type OperatorReadFS interface {
    - `playbook.StepAction`：`StepShell | StepScript | StepCopy | StepTemplate | StepEnsure(Check, Action)`；
    - `fsm.TransferState`、`fsm.VaultSagaState`、`events.Event`。
 2. **代数结构求解**：
-   - **OpenSSH 四层选项幺半群 `(OptionLayer, ⊕, Unset)`**：由 `FirstWins[T]`、`PathList`（三态 + 右吸收 `Disabled`）、`AlgoPolicy`（自同态复合 $\text{End}(L)$）、`ProxyRoute`（双槽遮蔽）、`ControlPolicy`、`EnvFilter`（`SendEnv -PATTERN` 减法）组成；全平面（拨号、`-f`、`-O`、`ControlPersist`、`exec`、`scp`、`play`、`mcp`）共用唯一纯函数 `option.ResolveEffectivePolicy(origin, endpoint, t1, t2, t3, t4) (EffectivePolicy, error)`（其中 `%C` 协议哈希由 `core/domain/option` 独占使用 `"crypto/sha1"` 计算）。
+   - **OpenSSH 四层选项幺半群 `(OptionLayer, ⊕, Unset)`**：由以下正交子幺半群直积构成，并通过唯一纯入口求解：
+     - `FirstWins[T]`：标量选项与多路复用各槽；
+     - `AlgoPolicy`：单指令表达列表算子 `Unset | Exact | Append(+) | Remove(-, 独占支持 */? 通配) | Prepend(^)`，跨指令与跨层合并严格走 **`FirstWins` 幺半群**——非 `Unset` 左吸收低层以保证 `ssh -G` 差分等价并阻断 `t4` 算法向高层泄漏，仅在最终求解边界对内置默认集 $L_0$ 单次执行 `Apply(L_0)`，结果为空失败关闭；
+     - `PathList`：专用于 `IdentityFile`/`CertificateFile` 单指令单路径多行累积——三态 `Unset | Disabled | Set` + `terminated` 封口位，左零元 `Disabled ⊕ x = Disabled` 吸收低优先级层，且 `Set(A, false) ⊕ Disabled = Set(A, true)` 右封口保结合律；
+     - `KnownHostsList`：专用于 `UserKnownHostsFile`——单指令支持空白分隔多路径或独立 `none` 且禁止混用，跨指令与跨层严格走 **`FirstWins` 幺半群**，杜绝 HostKey 信任锚点跨层污染；
+     - `ProxyRoute`：忠实嵌入 `FirstWins[JumpSlot] × FirstWins[CmdSlot]` 子幺半群的双槽遮蔽封闭和类型，`ProxyCommand=none` 全禁用、`ProxyJump=none` 仅消低层跳板并显露低层命令；
+     - `ControlPolicy`：三槽 `FirstWins` 直积保结合律与 `ssh -G` 原始槽位对齐，当 `!Path().IsEnabled()` 时运行期投影 `EffectiveMaster()`/`EffectivePersist()` 一律失败关闭归零；
+     - `EnvFilter`：正规形式 `(clear, added)` `SendEnv -PATTERN` 减法幺半群——同层及单份 `~/.ssh/config` 内按遭遇序自上而下 `next ⊕ acc` 折叠以对齐 `ssh -G`，跨四层按 `higher ⊕ lower` 折叠以保证高层覆盖低层；
+     - **唯一纯入口与四层求解序**：全平面（拨号、`-f`、`-O`、`ControlPersist`、`exec`、`scp`、`play`、`mcp`）共用唯一纯函数 `option.ResolveEffectivePolicy(origin, endpoint, t1, t2, t3, t4) (EffectivePolicy, error)`，四层严格固定为 **`t1(CLI) > t2(SavedNode) > t3(XOpsGlobal) > t4(OpenSSHConfig)` + 内置兜底 `DefaultOptionLayer()`**；非 OpenSSH 来源（`OriginManaged`/`OriginAdHoc`）按 `INV-D2` **仅对 `t4` 执行安全裁剪**（严格仅保留 `OptionClassMux ∪ OptionClassTransport`，保持 `t3` 完整不裁剪）；
+     - **OpenSSH `%C` 协议哈希**：由 `core/domain/option` 独占使用 `"crypto/sha1"` 按 `SHA1(%l%h%p%r%j)` 计算，其中 `%j` 在 `ProxyJumpChain` 激活时严格取**末跳无方括号规范主机名**（其余路由为空串）。
    - **安全有界格**：`Verdict` 交半格（`Deny=0` 零值吸收集）、`RiskLevel` / `Decision` 并半格（`max` 折叠 `NodeOverrides`、多路径、祖先目录与软链解析前后路径），交换/结合/幂等律彻底消除 Go `map` 序依赖。
 3. **五大纯 Mealy 状态机**（`Transition(S, I) -> (S', []Effect, []Event)`）：
    - `VaultSagaFSM`：Vault 先写常量时间回读 → 配置 CAS 提交 → 旧引用 5 处无引用确认后 GC；`Applied && !Durable` 进 `UncertainDurability` 停机禁重试禁删凭据；
@@ -478,7 +487,7 @@ inventory:
 
 5. **`P4-T1` / `P4-T4` 外部协议结构化受限窄模式钩子契约（A8，0 `//nolint:`）**：
    - `P4-T1`（`core/internal/sshnet/dial`）对接 `golang.org/x/crypto/ssh.KeyboardInteractiveChallenge`（回调内同步 `box.Use` 写入局部 `answers []string` 返回槽位模式，由外层 challenge 闭包返回前审计防泄漏）与 `P4-T4`（`internal/host/vault`）对接 Windows Credential Manager `CREDENTIALW`（单函数零逃逸局部结构体指针 + `LazyProc.Call`），禁止引入行内 `//nolint:` 或放宽全局规则，统一经 `tools/xopsvet/analyzers/secrettaint/sinks_narrow.go` 的按包层受控结构化窄模式钩子完成适配，并在消费完成后立即零化中间缓冲。其中 `P4-T1` 与 Windows `CREDENTIALW` 窄钩子已在 Phase 0 落地并经对抗测试验证；OS Keychain（macOS Security Framework / Linux Secret Service）与 ExternalHelper 子进程管道的窄模式钩子待 Phase 4 `P4-T4` 引入实际依赖时同步实现并纳入 `sinks_narrow.go` 审计。
-6. **契约、早验与确定性测试**：`core/ports/tck`（含 `ScopedRootFS`/`OperatorReadFS`）、代数律/Fuzz、10,000 种子 DST（覆盖 `O(1)` 崩溃对账、`Halted` 熔断、两段式 `actor.DualActor` 满邮箱压测、重入拒绝、5 大全局不变量）、`ssh -G` 差分，以及 **`Phase 2.5 Walking Skeleton`** 起即跑通三平台原生 CI。
+6. **契约、早验与确定性测试**：`core/ports/tck`（含 `ScopedRootFS`/`OperatorReadFS`）、代数律/Fuzz、10,000 种子 DST（覆盖 `O(1)` 崩溃对账、`Halted` 熔断、两段式 `actor.DualActor` 满邮箱压测、重入拒绝、5 大全局不变量）、`ssh -G` 差分（保证单份配置文件 `ssh -F <cfg> -G` 语义等价，并显式界定两项跨层安全精化：`IdentityFile=none` 对低层吸收，以及 4 层 `SendEnv` 坚持高层覆盖低层而非 OpenSSH `-o` 先于配置文件的解析序），以及 **`Phase 2.5 Walking Skeleton`** 起即跑通三平台原生 CI。
 
 ---
 
