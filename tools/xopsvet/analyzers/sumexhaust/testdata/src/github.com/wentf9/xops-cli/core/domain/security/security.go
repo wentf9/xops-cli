@@ -350,3 +350,158 @@ func validClosureVarFailClosedDefault(d GuardrailDecision) bool {
 		return fn()
 	}
 }
+
+// Reviewer 3 Finding 2 / Challenger 3 Challenge 1: if Init、带标签语句、defer/go 闭包及命名返回值裸 return。
+func invalidIfInitPermissiveDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		if ok := true; cond { // want "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）"
+			return ok // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		} else {
+			return false
+		}
+	}
+}
+
+func invalidIfInitClosureDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		if fn := func() bool { return true }; cond {
+			return fn() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		} else {
+			return false
+		}
+	}
+}
+
+func validIfInitFailClosedDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		if ok := false; cond {
+			return ok
+		} else {
+			return false
+		}
+	}
+}
+
+func invalidLabeledIfDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+	retry:
+		if cond {
+			return true // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		}
+		if false {
+			goto retry
+		}
+		return false
+	}
+}
+
+func invalidFuncLitNamedReturnDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) { // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+			ok = true
+			return
+		}()
+	}
+}
+
+func invalidFuncLitNamedReturnBranchDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) { // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+			if cond {
+				ok = true
+			} else {
+				ok = false
+			}
+			return
+		}()
+	}
+}
+
+func validFuncLitNamedReturnDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) {
+			ok = false
+			return
+		}()
+	}
+}
+
+func invalidDeferNamedReturnDefault(d GuardrailDecision) (allow bool) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		defer func() {
+			allow = true // want "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）"
+		}()
+		return false
+	}
+}
+
+func invalidGoClosureDefault(d GuardrailDecision) bool {
+	var allow bool
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		go func() {
+			allow = true // want "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）"
+		}()
+		return false
+	}
+	_ = allow
+	return false
+}
+
+func validDeferCleanupDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		defer func() {
+			_ = "cleanup"
+		}()
+		return false
+	}
+}

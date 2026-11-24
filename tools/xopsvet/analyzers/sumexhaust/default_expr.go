@@ -152,8 +152,6 @@ func trackPairBindingsSilent(
 		delete(st.funcLitVars, lhsVar)
 		if isPermissiveExprSeen(info, expr, st, visited) {
 			st.permissiveVars[lhsVar] = true
-		} else {
-			delete(st.permissiveVars, lhsVar)
 		}
 	}
 }
@@ -166,7 +164,8 @@ func funcLitReturnIsFailOpen(
 	visited map[*ast.FuncLit]bool,
 ) bool {
 	if len(ret.Results) == 0 {
-		return false
+		// 闭包采用命名返回值并裸 return 时，检查是否有任意命名返回值已被赋值为放行值。
+		return hasPermissiveNamedResult(litSig, st.permissiveVars)
 	}
 	for _, expr := range ret.Results {
 		if isPermissiveExprSeen(info, expr, st, visited) {
@@ -174,6 +173,50 @@ func funcLitReturnIsFailOpen(
 		}
 	}
 	return returnsBareNilError(info, litSig, ret.Results)
+}
+
+func hasPermissiveNamedResult(sig *types.Signature, permissiveVars map[*types.Var]bool) bool {
+	if sig == nil || sig.Results() == nil || len(permissiveVars) == 0 {
+		return false
+	}
+	results := sig.Results()
+	for i := 0; i < results.Len(); i++ {
+		rv := results.At(i)
+		if rv != nil && rv.Name() != "" && permissiveVars[rv] {
+			return true
+		}
+	}
+	return false
+}
+
+// inspectCalledFuncLitStmt 检查 defer/go 或独立表达式调用的闭包体内是否存在放行赋值或放行返回。
+func inspectCalledFuncLitStmt(expr ast.Expr, st defaultScanState) bool {
+	if st.pass == nil || st.pass.TypesInfo == nil {
+		return false
+	}
+	lit := resolveCalledFuncLit(st.pass.TypesInfo, expr, st.funcLitVars)
+	if lit == nil || lit.Body == nil || st.visitedLits[lit] {
+		return false
+	}
+	if st.visitedLits != nil {
+		st.visitedLits[lit] = true
+	}
+	litSig, _ := st.pass.TypesInfo.TypeOf(lit).(*types.Signature)
+	subState := defaultScanState{
+		pass:           st.pass,
+		sig:            litSig,
+		inTest:         st.inTest,
+		permissiveVars: maps.Clone(st.permissiveVars),
+		funcLitVars:    maps.Clone(st.funcLitVars),
+		visitedLits:    st.visitedLits,
+	}
+	if subState.permissiveVars == nil {
+		subState.permissiveVars = make(map[*types.Var]bool)
+	}
+	if subState.funcLitVars == nil {
+		subState.funcLitVars = make(map[*types.Var]*ast.FuncLit)
+	}
+	return inspectDefaultBlock(nonEmptyStmts(lit.Body.List), subState).reportedFailOpen
 }
 
 func isFailClosedValueExpr(info *types.Info, expr ast.Expr) bool {

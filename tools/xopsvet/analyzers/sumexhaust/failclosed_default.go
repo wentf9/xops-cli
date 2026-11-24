@@ -77,6 +77,7 @@ func checkFailClosedDefault(
 		inTest:         inTest,
 		permissiveVars: make(map[*types.Var]bool),
 		funcLitVars:    collectOuterFuncLitVars(pass.TypesInfo, enclosing, ts.Pos()),
+		visitedLits:    make(map[*ast.FuncLit]bool),
 	}
 	res := inspectDefaultBlock(stmts, state)
 	if res.reportedFailOpen {
@@ -178,6 +179,7 @@ type defaultScanState struct {
 	inTest         bool
 	permissiveVars map[*types.Var]bool
 	funcLitVars    map[*types.Var]*ast.FuncLit
+	visitedLits    map[*ast.FuncLit]bool
 }
 
 type defaultScanResult struct {
@@ -206,6 +208,13 @@ func inspectDefaultStmt(s ast.Stmt, st defaultScanState) defaultScanResult {
 		res.reportedFailOpen = checkDeclStmt(node, st)
 	case *ast.ExprStmt:
 		res.hasFailClosedAction = isFailClosedCall(st, node.X)
+		res.reportedFailOpen = inspectCalledFuncLitStmt(node.X, st)
+	case *ast.DeferStmt:
+		res.reportedFailOpen = inspectCalledFuncLitStmt(node.Call, st)
+	case *ast.GoStmt:
+		res.reportedFailOpen = inspectCalledFuncLitStmt(node.Call, st)
+	case *ast.LabeledStmt:
+		return inspectDefaultStmt(node.Stmt, st)
 	case *ast.BlockStmt:
 		return inspectDefaultBlock(nonEmptyStmts(node.List), st)
 	case *ast.IfStmt:
@@ -278,10 +287,15 @@ func inspectSelectStmt(sel *ast.SelectStmt, st defaultScanState) defaultScanResu
 }
 
 func inspectIfStmt(ifNode *ast.IfStmt, st defaultScanState) defaultScanResult {
+	initReported := false
+	if ifNode.Init != nil {
+		// 先检查 if 初始化语句（如 ok := true 或闭包绑定），确保赋值违规与变量追踪生效。
+		initReported = inspectDefaultStmt(ifNode.Init, st).reportedFailOpen
+	}
 	thenRes := inspectDefaultBlock(nonEmptyStmts(ifNode.Body.List), st)
 	if ifNode.Else == nil {
 		// 缺少 else 分支的 if 无法保证假分支同样 fail-closed 终止，仅透传 fail-open 违规。
-		return defaultScanResult{reportedFailOpen: thenRes.reportedFailOpen}
+		return defaultScanResult{reportedFailOpen: initReported || thenRes.reportedFailOpen}
 	}
 	var elseRes defaultScanResult
 	switch el := ifNode.Else.(type) {
@@ -292,7 +306,7 @@ func inspectIfStmt(ifNode *ast.IfStmt, st defaultScanState) defaultScanResult {
 	}
 	return defaultScanResult{
 		hasFailClosedAction: thenRes.hasFailClosedAction && elseRes.hasFailClosedAction,
-		reportedFailOpen:    thenRes.reportedFailOpen || elseRes.reportedFailOpen,
+		reportedFailOpen:    initReported || thenRes.reportedFailOpen || elseRes.reportedFailOpen,
 	}
 }
 

@@ -2,6 +2,7 @@ package digestcover
 
 import (
 	"go/ast"
+	"go/token"
 	"go/types"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
@@ -111,11 +112,18 @@ func collectFieldPathPrefixes(info *types.Info, body *ast.BlockStmt) map[*ast.Se
 	return prefixes
 }
 
+// unwrapBaseSelector 解包指针解引用（*）与取址（&）及括号包裹，提取嵌入体选择器，
+// 防止通过 (&o.Middle).LeafA 或 (*(&o.MiddlePtr)).LeafA 绕过子字段前缀识别。
 func unwrapBaseSelector(expr ast.Expr) *ast.SelectorExpr {
 	cur := ast.Unparen(expr)
 	for cur != nil {
 		switch e := cur.(type) {
 		case *ast.StarExpr:
+			cur = ast.Unparen(e.X)
+		case *ast.UnaryExpr:
+			if e.Op != token.AND {
+				return nil
+			}
 			cur = ast.Unparen(e.X)
 		case *ast.SelectorExpr:
 			return e

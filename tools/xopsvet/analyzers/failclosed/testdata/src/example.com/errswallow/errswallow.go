@@ -160,3 +160,37 @@ func validLocalVoidClosureVarPureIs(err error) bool {
 	fn()
 	return err != nil
 }
+
+// Challenger 3 - Challenge 4: 外层作用域定义的无返回闭包在嵌套 func() bool 中被调用时仍应检测吞噬 error。
+func swallowInOuterVoidClosureCalledInNestedBool() {
+	fn := func() {
+		_ = produceErr() // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	}
+	check := func() bool {
+		fn()
+		return true
+	}
+	_ = check()
+}
+
+func validUncalledOuterVoidClosureInBool() {
+	fn := func() {
+		_ = produceErr()
+	}
+	check := func() bool {
+		_ = fn
+		return true
+	}
+	_ = check()
+}
+
+func validOuterVoidClosurePureIsInNestedBool(err error) {
+	fn := func() {
+		_ = errors.Is(err, errSentinel)
+	}
+	check := func() bool {
+		fn()
+		return err != nil
+	}
+	_ = check()
+}

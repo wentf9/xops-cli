@@ -370,3 +370,75 @@ func (o *OuterExtDirectFieldBypass) WriteCanonical(w io.Writer) { // want "diges
 	_, _ = io.WriteString(w, o.MiddleWithExt.MidField)
 	_, _ = io.WriteString(w, o.OwnField)
 }
+
+// Challenger 3 - Challenge 3: (&o.Middle).LeafA / (*(&o.MiddlePtr)).LeafA 等取址后缀不得标记整个嵌入体已覆盖。
+//xops:canonicalhash
+type OuterAddrOfBaseBypass struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterAddrOfBaseBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterAddrOfBaseBypass 的 WriteCanonical 未覆盖字段 MiddleLayer"
+	_, _ = io.WriteString(w, (&o.MiddleLayer).LeafA)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterPtrAddrOfBaseBypass struct {
+	*MiddleLayer
+	OwnField string
+}
+
+func (o *OuterPtrAddrOfBaseBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterPtrAddrOfBaseBypass 的 WriteCanonical 未覆盖字段 MiddleLayer"
+	_, _ = io.WriteString(w, (*(&o.MiddleLayer)).LeafA)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterExtAddrOfBypass struct {
+	extbase.ExtBase
+	OwnField string
+}
+
+func (o *OuterExtAddrOfBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterExtAddrOfBypass 的 WriteCanonical 未覆盖字段 ExtBase"
+	_, _ = io.WriteString(w, (&o.ExtBase).Public)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterDiscardAddrOfBypass struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterDiscardAddrOfBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterDiscardAddrOfBypass 的 WriteCanonical 未覆盖字段 MiddleLayer"
+	_ = (&o.MiddleLayer).LeafA
+	(&o.MiddleLayer).LeafB = 1
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterAddrOfWholeMethodValid struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterAddrOfWholeMethodValid) WriteCanonical(w io.Writer) {
+	(&o.MiddleLayer).WriteCanonical(w)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+func encodeMiddlePtr(w io.Writer, m *MiddleLayer) {
+	m.WriteCanonical(w)
+}
+
+//xops:canonicalhash
+type OuterAddrOfWholeValueValid struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterAddrOfWholeValueValid) WriteCanonical(w io.Writer) {
+	encodeMiddlePtr(w, &o.MiddleLayer)
+	_, _ = io.WriteString(w, o.OwnField)
+}

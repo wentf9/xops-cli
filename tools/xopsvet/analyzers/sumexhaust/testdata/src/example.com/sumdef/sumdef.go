@@ -313,3 +313,77 @@ func checkSingleSealedValid(s SingleSealed) string {
 		return "none"
 	}
 }
+
+// Reviewer 3 Finding 1 / Challenger 3 Challenge 2: 函数类型签名含类型参数的多参泛型变体不得被漏检或误报。
+type GenFnIface[T any] interface {
+	sealedFn()
+	Apply(func(T))
+}
+
+type ConcreteFn struct{}
+
+func (ConcreteFn) sealedFn()         {}
+func (ConcreteFn) Apply(func(int)) {}
+
+type GenericFn[A, B any] struct{}
+
+func (GenericFn[A, B]) sealedFn()       {}
+func (GenericFn[A, B]) Apply(func(A)) {}
+
+type BadFnSlice[A, B any] struct{}
+
+func (BadFnSlice[A, B]) sealedFn()         {}
+func (BadFnSlice[A, B]) Apply(func([]A)) {}
+
+func checkGenFnValid(g GenFnIface[int]) int {
+	switch g.(type) {
+	case ConcreteFn, *ConcreteFn, GenericFn[int, string], *GenericFn[int, string]:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func checkGenFnMissing(g GenFnIface[int]) int {
+	switch g.(type) { // want "sumexhaust: 对封闭接口 GenFnIface\\[int\\] 的 type switch 缺少变体: GenericFn\\[A, B any\\], \\*GenericFn\\[A, B any\\]"
+	case ConcreteFn, *ConcreteFn:
+		return 1
+	default:
+		return 0
+	}
+}
+
+type GenWithFn[T any] interface {
+	sealedGenFn()
+	Get() func() T
+}
+
+type FnMulti[A, B any] struct{ V A }
+
+func (*FnMulti[A, B]) sealedGenFn() {}
+func (f *FnMulti[A, B]) Get() func() A {
+	return func() A { return f.V }
+}
+
+type BadFnSliceRet[A, B any] struct{ V []A }
+
+func (*BadFnSliceRet[A, B]) sealedGenFn() {}
+func (b *BadFnSliceRet[A, B]) Get() func() []A {
+	return func() []A { return b.V }
+}
+
+func checkGenWithFnValid(g GenWithFn[int]) int {
+	switch v := g.(type) {
+	case *FnMulti[int, string]:
+		return v.Get()()
+	default:
+		return 0
+	}
+}
+
+func checkGenWithFnMissing(g GenWithFn[int]) int {
+	switch g.(type) { // want "sumexhaust: 对封闭接口 GenWithFn\\[int\\] 的 type switch 缺少变体: \\*FnMulti\\[A, B any\\]"
+	default:
+		return 0
+	}
+}

@@ -368,9 +368,28 @@ func compatibleCompoundType(fnU, imU types.Type, seen map[typePair]bool) bool {
 	case *types.Signature:
 		iv, ok := imU.(*types.Signature)
 		return ok && compatibleSignatureTypes(fv, iv, seen)
+	case *types.Struct:
+		iv, ok := imU.(*types.Struct)
+		return ok && compatibleStructTypes(fv, iv, seen)
 	default:
 		return false
 	}
+}
+
+func compatibleStructTypes(fnSt, imSt *types.Struct, seen map[typePair]bool) bool {
+	if fnSt == nil || imSt == nil || fnSt.NumFields() != imSt.NumFields() {
+		return false
+	}
+	for i := 0; i < fnSt.NumFields(); i++ {
+		ff, imf := fnSt.Field(i), imSt.Field(i)
+		if ff.Name() != imf.Name() || ff.Embedded() != imf.Embedded() || fnSt.Tag(i) != imSt.Tag(i) {
+			return false
+		}
+		if !compatibleSingleTypeSeen(ff.Type(), imf.Type(), seen) {
+			return false
+		}
+	}
+	return true
 }
 
 func compatibleNamedTypeArgs(fnNamed, imNamed *types.Named, seen map[typePair]bool) bool {
@@ -421,9 +440,40 @@ func hasTypeParamSeen(t types.Type, seen map[types.Type]bool) bool {
 		return hasTypeParamSeen(v.Key(), seen) || hasTypeParamSeen(v.Elem(), seen)
 	case *types.Named:
 		return typeArgsHaveParam(v.TypeArgs(), seen)
+	case *types.Signature:
+		// 函数类型参数或返回值若包含类型参数，须进入结构化签名兼容比对而非直接 Identical 判定。
+		return tupleHasTypeParamSeen(v.Params(), seen) || tupleHasTypeParamSeen(v.Results(), seen)
+	case *types.Tuple:
+		return tupleHasTypeParamSeen(v, seen)
+	case *types.Struct:
+		return structHasTypeParamSeen(v, seen)
 	default:
 		return false
 	}
+}
+
+func tupleHasTypeParamSeen(tup *types.Tuple, seen map[types.Type]bool) bool {
+	if tup == nil {
+		return false
+	}
+	for i := 0; i < tup.Len(); i++ {
+		if hasTypeParamSeen(tup.At(i).Type(), seen) {
+			return true
+		}
+	}
+	return false
+}
+
+func structHasTypeParamSeen(st *types.Struct, seen map[types.Type]bool) bool {
+	if st == nil {
+		return false
+	}
+	for i := 0; i < st.NumFields(); i++ {
+		if hasTypeParamSeen(st.Field(i).Type(), seen) {
+			return true
+		}
+	}
+	return false
 }
 
 func typeArgsHaveParam(ta *types.TypeList, seen map[types.Type]bool) bool {

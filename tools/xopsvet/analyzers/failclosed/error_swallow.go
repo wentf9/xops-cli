@@ -10,6 +10,9 @@ import (
 )
 
 func checkErrorSwallowing(pass *analysis.Pass) {
+	// 预先收集全包局部无返回/非 error-bool 闭包变量绑定，使嵌套 func() bool 调用外层局部闭包时同样受检。
+	voidFuncVars := collectLocalVoidFuncVars(pass)
+	visitedLits := make(map[*ast.FuncLit]bool)
 	ins := vetutil.InspectorOf(pass)
 	nodeFilter := []ast.Node{
 		(*ast.FuncDecl)(nil),
@@ -26,15 +29,37 @@ func checkErrorSwallowing(pass *analysis.Pass) {
 				return
 			}
 			sig, _ := obj.Type().(*types.Signature)
-			inspectBoolFuncBody(pass, fn, fn.Body, sig)
+			inspectBoolFuncBody(pass, fn, fn.Body, sig, voidFuncVars, visitedLits)
 		case *ast.FuncLit:
 			if fn.Body == nil {
 				return
 			}
 			sig, _ := pass.TypesInfo.TypeOf(fn).(*types.Signature)
-			inspectBoolFuncBody(pass, fn, fn.Body, sig)
+			inspectBoolFuncBody(pass, fn, fn.Body, sig, voidFuncVars, visitedLits)
 		}
 	})
+}
+
+func collectLocalVoidFuncVars(pass *analysis.Pass) map[*types.Var][]*ast.FuncLit {
+	out := make(map[*types.Var][]*ast.FuncLit)
+	if pass == nil || pass.TypesInfo == nil || pass.Pkg == nil {
+		return out
+	}
+	pkgScope := pass.Pkg.Scope()
+	ins := vetutil.InspectorOf(pass)
+	nodeFilter := []ast.Node{
+		(*ast.AssignStmt)(nil),
+		(*ast.ValueSpec)(nil),
+	}
+	ins.Preorder(nodeFilter, func(n ast.Node) {
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			recordVoidFuncLitPair(pass.TypesInfo, pkgScope, node.Lhs, node.Rhs, node.Tok == token.DEFINE, out)
+		case *ast.ValueSpec:
+			recordVoidFuncLitValueSpec(pass.TypesInfo, pkgScope, node, out)
+		}
+	})
+	return out
 }
 
 func hasBoolWithoutError(sig *types.Signature) bool {
@@ -75,11 +100,18 @@ func sigReturnsError(sig *types.Signature) bool {
 	return false
 }
 
-func inspectBoolFuncBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockStmt, sig *types.Signature) {
+func inspectBoolFuncBody(
+	pass *analysis.Pass,
+	fnNode ast.Node,
+	body *ast.BlockStmt,
+	sig *types.Signature,
+	voidFuncVars map[*types.Var][]*ast.FuncLit,
+	visitedLits map[*ast.FuncLit]bool,
+) {
 	if !hasBoolWithoutError(sig) {
 		return
 	}
-	inspectBoolScopeBody(pass, fnNode, body, make(map[*types.Var][]*ast.FuncLit), make(map[*ast.FuncLit]bool))
+	inspectBoolScopeBody(pass, fnNode, body, voidFuncVars, visitedLits)
 }
 
 func inspectBoolScopeBody(
@@ -99,10 +131,6 @@ func inspectBoolScopeBody(
 			return false
 		}
 		switch node := n.(type) {
-		case *ast.AssignStmt:
-			recordVoidFuncLitPair(pass.TypesInfo, node.Lhs, node.Rhs, node.Tok == token.DEFINE, voidFuncVars)
-		case *ast.ValueSpec:
-			recordVoidFuncLitValueSpec(pass.TypesInfo, node, voidFuncVars)
 		case *ast.CallExpr:
 			checkSwallowedCallError(pass, node)
 			inspectCalledVoidFuncLit(pass, node, voidFuncVars, visitedLits)
@@ -119,6 +147,7 @@ func inspectBoolScopeBody(
 
 func recordVoidFuncLitValueSpec(
 	info *types.Info,
+	pkgScope *types.Scope,
 	spec *ast.ValueSpec,
 	voidFuncVars map[*types.Var][]*ast.FuncLit,
 ) {
@@ -129,11 +158,12 @@ func recordVoidFuncLitValueSpec(
 	for i, id := range spec.Names {
 		lhs[i] = id
 	}
-	recordVoidFuncLitPair(info, lhs, spec.Values, true, voidFuncVars)
+	recordVoidFuncLitPair(info, pkgScope, lhs, spec.Values, true, voidFuncVars)
 }
 
 func recordVoidFuncLitPair(
 	info *types.Info,
+	pkgScope *types.Scope,
 	lhs []ast.Expr,
 	rhs []ast.Expr,
 	isDef bool,
@@ -155,10 +185,14 @@ func recordVoidFuncLitPair(
 			continue
 		}
 		v := resolveVarObj(info, id, isDef)
-		if v != nil {
+		if isLocalVar(v, pkgScope) {
 			voidFuncVars[v] = append(voidFuncVars[v], lit)
 		}
 	}
+}
+
+func isLocalVar(v *types.Var, pkgScope *types.Scope) bool {
+	return v != nil && v.Parent() != nil && v.Parent() != pkgScope
 }
 
 func resolveVarObj(info *types.Info, id *ast.Ident, isDef bool) *types.Var {
