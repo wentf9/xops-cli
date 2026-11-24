@@ -14,7 +14,9 @@ func TestSumExhaust(t *testing.T) {
 		testdata,
 		sumexhaust.NewAnalyzer(),
 		"example.com/sumdef",
+		"example.com/sumalias",
 		"example.com/sumuse",
+		"example.com/sumusealias",
 		"github.com/wentf9/xops-cli/core/domain/security",
 		"github.com/wentf9/xops-cli/core/internal/gate",
 	)

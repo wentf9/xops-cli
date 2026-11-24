@@ -13,6 +13,11 @@ type Box[T any] struct { // want Box:"opaque"
 //xops:opaque
 type OpID string // want OpID:"opaque"
 
+//xops:opaque
+type Wrap struct { // want Wrap:"opaque"
+	V int
+}
+
 func NewToken() Token {
 	return Token{id: "ok"}
 }

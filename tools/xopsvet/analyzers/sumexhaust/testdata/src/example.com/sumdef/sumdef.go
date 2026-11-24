@@ -107,3 +107,95 @@ func checkGenericMissing(g GenSealed[int]) int {
 		return -1
 	}
 }
+
+// Challenge 1: 非空超集/等价接口不可绕过穷尽检查，但严格子集子接口仍允许。
+type RichSealed interface {
+	sealedRich()
+	Tag() string
+}
+
+type RichA struct{}
+
+func (RichA) sealedRich() {}
+func (RichA) Tag() string { return "A" }
+
+type RichB struct{}
+
+func (RichB) sealedRich() {}
+func (RichB) Tag() string { return "B" }
+
+func checkSamePkgSealedSubIfaceBypass(r RichSealed) string {
+	switch r.(type) { // want "sumexhaust: 对封闭接口 RichSealed 的 type switch 缺少变体: RichA, \\*RichA, RichB, \\*RichB"
+	case interface{ sealedRich() }:
+		return "bypass"
+	default:
+		return "none"
+	}
+}
+
+type Outcome interface {
+	sealedOutcome()
+}
+
+type RetryableOutcome interface {
+	isRetryable()
+}
+
+type OutcomeTimeout struct{}
+
+func (*OutcomeTimeout) sealedOutcome() {}
+func (*OutcomeTimeout) isRetryable()   {}
+
+type OutcomeOK struct{}
+
+func (*OutcomeOK) sealedOutcome() {}
+
+func checkStrictSubsetSubInterfaceAllowed(o Outcome) string {
+	switch o.(type) {
+	case RetryableOutcome, *OutcomeOK:
+		return "ok"
+	default:
+		return "none"
+	}
+}
+
+// Challenge 6: 多类型参数泛型变体实现单类型参数泛型封闭接口。
+type GenMultiBox[T any] interface {
+	sealedGenMulti()
+}
+
+type SingleParam[T any] struct{ V T }
+
+func (*SingleParam[T]) sealedGenMulti() {}
+
+type MultiParam[A, B any] struct {
+	First  A
+	Second B
+}
+
+func (*MultiParam[A, B]) sealedGenMulti() {}
+
+type MultiVal[A, B any] struct {
+	First  A
+	Second B
+}
+
+func (MultiVal[A, B]) sealedGenMulti() {}
+
+func checkMultiArityValid(g GenMultiBox[int]) int {
+	switch g.(type) {
+	case *SingleParam[int], *MultiParam[int, string], MultiVal[int, bool], *MultiVal[int, bool]:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func checkMultiArityMissing(g GenMultiBox[int]) int {
+	switch g.(type) { // want "sumexhaust: 对封闭接口 GenMultiBox\\[int\\] 的 type switch 缺少变体: \\*MultiParam\\[A, B any\\], \\*MultiVal\\[A, B any\\]"
+	case *SingleParam[int], MultiVal[int, bool]:
+		return 1
+	default:
+		return 0
+	}
+}

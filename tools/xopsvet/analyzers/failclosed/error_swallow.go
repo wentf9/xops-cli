@@ -42,38 +42,98 @@ func hasBoolWithoutError(sig *types.Signature) bool {
 		return false
 	}
 	results := sig.Results()
+	hasBool := false
 	for i := 0; i < results.Len(); i++ {
-		if vetutil.IsErrorInterfaceType(results.At(i).Type()) {
+		rt := results.At(i).Type()
+		if vetutil.IsErrorInterfaceType(rt) {
 			return false
 		}
+		if isBoolType(rt) {
+			hasBool = true
+		}
 	}
-	last := types.Unalias(results.At(results.Len() - 1).Type())
-	basic, ok := last.(*types.Basic)
+	return hasBool
+}
+
+func isBoolType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	basic, ok := types.Unalias(t).Underlying().(*types.Basic)
 	return ok && basic.Kind() == types.Bool
+}
+
+func sigReturnsError(sig *types.Signature) bool {
+	if sig == nil || sig.Results() == nil {
+		return false
+	}
+	for i := 0; i < sig.Results().Len(); i++ {
+		if vetutil.IsErrorInterfaceType(sig.Results().At(i).Type()) {
+			return true
+		}
+	}
+	return false
 }
 
 func inspectBoolFuncBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockStmt, sig *types.Signature) {
 	if !hasBoolWithoutError(sig) {
 		return
 	}
+	inspectBoolScopeBody(pass, fnNode, body)
+}
+
+func inspectBoolScopeBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockStmt) {
 	ast.Inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			return false
 		}
-		// 嵌套 FuncLit 拥有独立签名并由顶层 Inspector 单独检查，此处禁止跨闭包误归因。
+		// 嵌套 FuncLit 默认保持隔离，避免回调（如 slices.SortFunc）误归因到外层 bool 函数；
+		// 立即调用/defer/go 的无 bool/error 返回 FuncLit 由下方 CallExpr 分支显式递归进入。
 		if lit, ok := n.(*ast.FuncLit); ok && lit != fnNode {
 			return false
 		}
 		switch node := n.(type) {
 		case *ast.CallExpr:
 			checkSwallowedCallError(pass, node)
+			inspectInlineVoidFuncLit(pass, node)
 		case *ast.UnaryExpr:
 			if node.Op == token.ARROW {
 				checkSwallowedChanError(pass, node)
 			}
+		case *ast.RangeStmt:
+			checkSwallowedRangeChanError(pass, node)
 		}
 		return true
 	})
+}
+
+func inspectInlineVoidFuncLit(pass *analysis.Pass, call *ast.CallExpr) {
+	lit, ok := ast.Unparen(call.Fun).(*ast.FuncLit)
+	if !ok || lit.Body == nil {
+		return
+	}
+	litSig, _ := pass.TypesInfo.TypeOf(lit).(*types.Signature)
+	if hasBoolWithoutError(litSig) || sigReturnsError(litSig) {
+		return
+	}
+	inspectBoolScopeBody(pass, lit, lit.Body)
+}
+
+func checkSwallowedRangeChanError(pass *analysis.Pass, rng *ast.RangeStmt) {
+	if rng == nil || rng.X == nil {
+		return
+	}
+	tv, ok := pass.TypesInfo.Types[rng.X]
+	if !ok || tv.Type == nil {
+		return
+	}
+	ch, ok := types.Unalias(tv.Type).Underlying().(*types.Chan)
+	if !ok || ch == nil {
+		return
+	}
+	if typeIsOrContainsError(ch.Elem()) {
+		pass.ReportRangef(rng, "failclosed: 返回 bool 的函数禁止在 range chan error 中吞噬局部 error")
+	}
 }
 
 func checkSwallowedCallError(pass *analysis.Pass, call *ast.CallExpr) {

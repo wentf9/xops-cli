@@ -41,8 +41,9 @@ func checkTargetCoverage(
 	}
 	recvVar := extractRecvVar(pass.TypesInfo, writeFn)
 	if fnObj, ok := pass.TypesInfo.Defs[writeFn.Name].(*types.Func); ok && fnObj != nil {
-		state.visited[visitKey{fn: fnObj, paramIdx: -1}] = true
+		state.visited[visitKey{fn: fnObj.Origin(), paramIdx: -1}] = true
 	}
+	checkNoReflectReachable(pass, writeFn, funcDecls)
 	analyzeFuncBody(pass, writeFn.Body, recvVar, state)
 
 	for _, f := range target.fields {
@@ -84,7 +85,7 @@ func isFieldCovered(passPkg *types.Package, f *types.Var, state *coverageState) 
 	if embSt == nil || embSt.NumFields() == 0 {
 		return false
 	}
-	return allEmbeddedFieldsPromoted(passPkg, embSt, state.promoted[f])
+	return allEmbeddedFieldsPromoted(passPkg, embSt, state.promoted[f], make(map[*types.Struct]bool))
 }
 
 func unwrapEmbeddedStruct(t types.Type) *types.Struct {
@@ -100,28 +101,52 @@ func unwrapEmbeddedStruct(t types.Type) *types.Struct {
 	return embSt
 }
 
-func allEmbeddedFieldsPromoted(passPkg *types.Package, embSt *types.Struct, hits map[*types.Var]bool) bool {
-	if hits == nil {
+func allEmbeddedFieldsPromoted(
+	passPkg *types.Package,
+	embSt *types.Struct,
+	hits map[*types.Var]bool,
+	seen map[*types.Struct]bool,
+) bool {
+	if hits == nil || embSt == nil || seen[embSt] {
 		return false
 	}
+	seen[embSt] = true
 	for i := 0; i < embSt.NumFields(); i++ {
-		ef := embSt.Field(i)
-		if ef.Name() == "_" {
-			continue
-		}
-		// 嵌入体含本包不可见的未导出字段时，仅靠提升字段无法覆盖全貌，必须显式访问嵌入体自身。
-		if !ef.Exported() && ef.Pkg() != passPkg {
-			return false
-		}
-		if !hits[ef] {
+		if !isEmbeddedSubFieldCovered(passPkg, embSt.Field(i), hits, seen) {
 			return false
 		}
 	}
 	return true
 }
 
+func isEmbeddedSubFieldCovered(
+	passPkg *types.Package,
+	ef *types.Var,
+	hits map[*types.Var]bool,
+	seen map[*types.Struct]bool,
+) bool {
+	if ef.Name() == "_" {
+		return true
+	}
+	// 嵌入体含本包不可见的未导出字段时，仅靠提升字段无法覆盖全貌，必须显式访问嵌入体自身。
+	if !ef.Exported() && ef.Pkg() != passPkg {
+		return false
+	}
+	// 使用 Origin() 归一化泛型嵌入体字段对象，避免实例化字段指针差异引发误报。
+	if hits[ef.Origin()] {
+		return true
+	}
+	if !ef.Embedded() {
+		return false
+	}
+	nested := unwrapEmbeddedStruct(ef.Type())
+	if nested == nil || nested.NumFields() == 0 {
+		return false
+	}
+	return allEmbeddedFieldsPromoted(passPkg, nested, hits, seen)
+}
+
 func analyzeFuncBody(pass *analysis.Pass, body *ast.BlockStmt, targetVar *types.Var, state *coverageState) {
-	checkNoReflect(pass, body)
 	if targetVar == nil {
 		return
 	}
@@ -136,19 +161,6 @@ func analyzeFuncBody(pass *analysis.Pass, body *ast.BlockStmt, targetVar *types.
 			}
 		case *ast.CallExpr:
 			recurseIntoHelperCalls(pass, node, aliases, state)
-		}
-		return true
-	})
-}
-
-func checkNoReflect(pass *analysis.Pass, body *ast.BlockStmt) {
-	ast.Inspect(body, func(n ast.Node) bool {
-		id, ok := n.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		if vetutil.ObjectPkgPath(pass.TypesInfo.Uses[id]) == "reflect" {
-			pass.ReportRangef(id, "digestcover: WriteCanonical 禁止使用 reflect")
 		}
 		return true
 	})
@@ -251,8 +263,15 @@ func resolveAliasLHSVar(info *types.Info, id *ast.Ident, isDef bool, writes map[
 func collectIgnoredSelectors(body *ast.BlockStmt) map[*ast.SelectorExpr]bool {
 	ignored := make(map[*ast.SelectorExpr]bool)
 	ast.Inspect(body, func(n ast.Node) bool {
-		if assign, ok := n.(*ast.AssignStmt); ok {
-			markAssignIgnoredSelectors(assign, ignored)
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			markAssignIgnoredSelectors(node, ignored)
+		case *ast.ValueSpec:
+			markValueSpecIgnoredSelectors(node, ignored)
+		case *ast.IncDecStmt:
+			if sel := unwrapStarParenSelector(node.X); sel != nil {
+				ignored[sel] = true
+			}
 		}
 		return true
 	})
@@ -260,7 +279,7 @@ func collectIgnoredSelectors(body *ast.BlockStmt) map[*ast.SelectorExpr]bool {
 }
 
 func markAssignIgnoredSelectors(assign *ast.AssignStmt, ignored map[*ast.SelectorExpr]bool) {
-	if assign.Tok == token.ASSIGN {
+	if assign.Tok != token.DEFINE {
 		for _, lhs := range assign.Lhs {
 			if sel := unwrapStarParenSelector(lhs); sel != nil {
 				ignored[sel] = true
@@ -279,17 +298,36 @@ func markAssignIgnoredSelectors(assign *ast.AssignStmt, ignored map[*ast.Selecto
 	}
 }
 
-func unwrapStarParenSelector(expr ast.Expr) *ast.SelectorExpr {
-	cur := ast.Unparen(expr)
-	for {
-		star, ok := cur.(*ast.StarExpr)
-		if !ok {
+func markValueSpecIgnoredSelectors(spec *ast.ValueSpec, ignored map[*ast.SelectorExpr]bool) {
+	for i, id := range spec.Names {
+		if i >= len(spec.Values) {
 			break
 		}
-		cur = ast.Unparen(star.X)
+		if id != nil && id.Name == "_" {
+			if sel := unwrapStarParenSelector(spec.Values[i]); sel != nil {
+				ignored[sel] = true
+			}
+		}
 	}
-	sel, _ := cur.(*ast.SelectorExpr)
-	return sel
+}
+
+func unwrapStarParenSelector(expr ast.Expr) *ast.SelectorExpr {
+	cur := ast.Unparen(expr)
+	for cur != nil {
+		switch e := cur.(type) {
+		case *ast.StarExpr:
+			cur = ast.Unparen(e.X)
+		case *ast.UnaryExpr:
+			if e.Op != token.AND {
+				return nil
+			}
+			cur = ast.Unparen(e.X)
+		default:
+			sel, _ := cur.(*ast.SelectorExpr)
+			return sel
+		}
+	}
+	return nil
 }
 
 func isAliasExpr(info *types.Info, expr ast.Expr, aliases map[*types.Var]bool) bool {

@@ -73,7 +73,12 @@ func checkFailClosedDefault(
 	}
 	sig := enclosingFuncSig(pass, ts)
 	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos())
-	state := defaultScanState{pass: pass, sig: sig, inTest: inTest}
+	state := defaultScanState{
+		pass:           pass,
+		sig:            sig,
+		inTest:         inTest,
+		permissiveVars: make(map[*types.Var]bool),
+	}
 	res := inspectDefaultBlock(stmts, state)
 	if res.reportedFailOpen {
 		return
@@ -124,9 +129,10 @@ func enclosingFuncSig(pass *analysis.Pass, target ast.Node) *types.Signature {
 }
 
 type defaultScanState struct {
-	pass   *analysis.Pass
-	sig    *types.Signature
-	inTest bool
+	pass           *analysis.Pass
+	sig            *types.Signature
+	inTest         bool
+	permissiveVars map[*types.Var]bool
 }
 
 type defaultScanResult struct {
@@ -150,7 +156,9 @@ func inspectDefaultStmt(s ast.Stmt, st defaultScanState) defaultScanResult {
 	case *ast.ReturnStmt:
 		res.reportedFailOpen = checkReturnStmt(node, st, &res)
 	case *ast.AssignStmt:
-		res.reportedFailOpen = checkAssignStmt(node, st, &res)
+		res.reportedFailOpen = checkAssignStmt(node, st)
+	case *ast.DeclStmt:
+		res.reportedFailOpen = checkDeclStmt(node, st)
 	case *ast.ExprStmt:
 		res.hasFailClosedAction = isFailClosedCall(st, node.X)
 	case *ast.BlockStmt:
@@ -162,30 +170,31 @@ func inspectDefaultStmt(s ast.Stmt, st defaultScanState) defaultScanResult {
 }
 
 func inspectIfStmt(ifNode *ast.IfStmt, st defaultScanState) defaultScanResult {
-	res := inspectDefaultBlock(nonEmptyStmts(ifNode.Body.List), st)
+	thenRes := inspectDefaultBlock(nonEmptyStmts(ifNode.Body.List), st)
 	if ifNode.Else == nil {
-		return res
+		// 缺少 else 分支的 if 无法保证假分支同样 fail-closed 终止，仅透传 fail-open 违规。
+		return defaultScanResult{reportedFailOpen: thenRes.reportedFailOpen}
 	}
+	var elseRes defaultScanResult
 	switch el := ifNode.Else.(type) {
 	case *ast.BlockStmt:
-		sub := inspectDefaultBlock(nonEmptyStmts(el.List), st)
-		res.hasFailClosedAction = res.hasFailClosedAction || sub.hasFailClosedAction
-		res.reportedFailOpen = res.reportedFailOpen || sub.reportedFailOpen
+		elseRes = inspectDefaultBlock(nonEmptyStmts(el.List), st)
 	case *ast.IfStmt:
-		sub := inspectIfStmt(el, st)
-		res.hasFailClosedAction = res.hasFailClosedAction || sub.hasFailClosedAction
-		res.reportedFailOpen = res.reportedFailOpen || sub.reportedFailOpen
+		elseRes = inspectIfStmt(el, st)
 	}
-	return res
+	return defaultScanResult{
+		hasFailClosedAction: thenRes.hasFailClosedAction && elseRes.hasFailClosedAction,
+		reportedFailOpen:    thenRes.reportedFailOpen || elseRes.reportedFailOpen,
+	}
 }
 
 func checkReturnStmt(ret *ast.ReturnStmt, st defaultScanState, res *defaultScanResult) bool {
 	if len(ret.Results) == 0 {
-		// 命名返回值裸 return 必须依赖先前的 fail-closed 赋值，单独裸 return 不视为处置。
+		// 命名返回值裸 return 无法在局部静态保证已被拒绝值覆盖，单独裸 return 不视为处置。
 		return false
 	}
 	for _, expr := range ret.Results {
-		if isPermissiveExpr(st.pass.TypesInfo, expr) {
+		if isPermissiveExpr(st.pass.TypesInfo, expr, st.permissiveVars) {
 			st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）")
 			return true
 		}
@@ -218,17 +227,74 @@ func returnsBareNilError(info *types.Info, sig *types.Signature, results []ast.E
 	return hasNilErr && !hasRejectNonErr
 }
 
-func checkAssignStmt(assign *ast.AssignStmt, st defaultScanState, res *defaultScanResult) bool {
-	for _, rhs := range assign.Rhs {
-		if isPermissiveExpr(st.pass.TypesInfo, rhs) {
-			st.pass.ReportRangef(assign, "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）")
-			return true
+func checkAssignStmt(assign *ast.AssignStmt, st defaultScanState) bool {
+	// 仅赋值不能保证 default 分支未滑落（fallthrough），故不置 hasFailClosedAction；仅检查是否赋值放行值并追踪局部变量。
+	return checkExprPairPermissive(assign, assign.Lhs, assign.Rhs, assign.Tok == token.DEFINE, st)
+}
+
+func checkDeclStmt(decl *ast.DeclStmt, st defaultScanState) bool {
+	gen, ok := decl.Decl.(*ast.GenDecl)
+	if !ok || gen.Tok != token.VAR {
+		return false
+	}
+	reported := false
+	for _, spec := range gen.Specs {
+		vs, ok := spec.(*ast.ValueSpec)
+		if !ok || len(vs.Values) == 0 {
+			continue
 		}
-		if isFailClosedValueExpr(st.pass.TypesInfo, rhs) {
-			res.hasFailClosedAction = true
+		lhs := make([]ast.Expr, len(vs.Names))
+		for i, id := range vs.Names {
+			lhs[i] = id
+		}
+		if checkExprPairPermissive(vs, lhs, vs.Values, true, st) {
+			reported = true
 		}
 	}
-	return false
+	return reported
+}
+
+func checkExprPairPermissive(
+	reportNode ast.Node,
+	lhs []ast.Expr,
+	rhs []ast.Expr,
+	isDef bool,
+	st defaultScanState,
+) bool {
+	reported := false
+	for i, expr := range rhs {
+		lhsVar := resolveLHSVar(st.pass.TypesInfo, lhs, i, isDef)
+		if isPermissiveExpr(st.pass.TypesInfo, expr, st.permissiveVars) {
+			if lhsVar != nil {
+				st.permissiveVars[lhsVar] = true
+			}
+			if !reported {
+				st.pass.ReportRangef(reportNode, "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）")
+				reported = true
+			}
+			continue
+		}
+		if lhsVar != nil {
+			delete(st.permissiveVars, lhsVar)
+		}
+	}
+	return reported
+}
+
+func resolveLHSVar(info *types.Info, lhs []ast.Expr, idx int, isDef bool) *types.Var {
+	if info == nil || idx >= len(lhs) {
+		return nil
+	}
+	id, ok := ast.Unparen(lhs[idx]).(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return nil
+	}
+	if isDef {
+		v, _ := info.Defs[id].(*types.Var)
+		return v
+	}
+	v, _ := info.Uses[id].(*types.Var)
+	return v
 }
 
 func isFailClosedCall(st defaultScanState, expr ast.Expr) bool {
@@ -256,9 +322,16 @@ func isFailClosedCall(st defaultScanState, expr ast.Expr) bool {
 	}
 }
 
-func isPermissiveExpr(info *types.Info, expr ast.Expr) bool {
+func isPermissiveExpr(info *types.Info, expr ast.Expr, permissiveVars map[*types.Var]bool) bool {
 	if isBoolConstExpr(info, expr, true) {
 		return true
+	}
+	if info != nil && len(permissiveVars) > 0 {
+		if id, ok := ast.Unparen(expr).(*ast.Ident); ok {
+			if v, ok := info.Uses[id].(*types.Var); ok && permissiveVars[v] {
+				return true
+			}
+		}
 	}
 	id := rightmostIdent(expr)
 	if id == nil {
@@ -275,29 +348,13 @@ func isFailClosedValueExpr(info *types.Info, expr ast.Expr) bool {
 		if tv, ok := info.Types[call]; ok && vetutil.IsErrorInterfaceType(tv.Type) {
 			return true
 		}
-		if id := rightmostIdent(call.Fun); id != nil && hasAnyToken(id.Name, isFailClosedToken) {
-			return true
-		}
-		return false
-	}
-	if lit, ok := ast.Unparen(expr).(*ast.CompositeLit); ok {
-		if id := rightmostIdent(lit.Type); id != nil && hasAnyToken(id.Name, isFailClosedToken) {
-			return true
-		}
-		return false
 	}
 	id := rightmostIdent(expr)
 	return id != nil && hasAnyToken(id.Name, isFailClosedToken)
 }
 
 func rightmostIdent(expr ast.Expr) *ast.Ident {
-	cur := ast.Unparen(expr)
-	if un, ok := cur.(*ast.UnaryExpr); ok && un.Op == token.AND {
-		cur = ast.Unparen(un.X)
-	}
-	if lit, ok := cur.(*ast.CompositeLit); ok && lit.Type != nil {
-		cur = ast.Unparen(lit.Type)
-	}
+	cur := unwrapExprChain(expr)
 	switch e := cur.(type) {
 	case *ast.Ident:
 		return e
@@ -306,6 +363,33 @@ func rightmostIdent(expr ast.Expr) *ast.Ident {
 	default:
 		return nil
 	}
+}
+
+func unwrapExprChain(expr ast.Expr) ast.Expr {
+	cur := ast.Unparen(expr)
+	for cur != nil {
+		switch e := cur.(type) {
+		case *ast.UnaryExpr:
+			if e.Op != token.AND {
+				return cur
+			}
+			cur = ast.Unparen(e.X)
+		case *ast.CompositeLit:
+			if e.Type == nil {
+				return cur
+			}
+			cur = ast.Unparen(e.Type)
+		case *ast.CallExpr:
+			cur = ast.Unparen(e.Fun)
+		case *ast.IndexExpr:
+			cur = ast.Unparen(e.X)
+		case *ast.IndexListExpr:
+			cur = ast.Unparen(e.X)
+		default:
+			return cur
+		}
+	}
+	return nil
 }
 
 func isBoolConstExpr(info *types.Info, expr ast.Expr, want bool) bool {

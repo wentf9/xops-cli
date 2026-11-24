@@ -100,7 +100,8 @@ func checkOpaqueTypeConversion(pass *analysis.Pass, call *ast.CallExpr) {
 		return
 	}
 	targetType := types.Unalias(tv.Type)
-	named, ok := targetType.(*types.Named)
+	unwrapped, isPtr := unwrapPointerTarget(targetType)
+	named, ok := unwrapped.(*types.Named)
 	if !ok {
 		return
 	}
@@ -108,10 +109,40 @@ func checkOpaqueTypeConversion(pass *analysis.Pass, call *ast.CallExpr) {
 	if orig == nil {
 		return
 	}
+	// 允许 (*pkg.T)(nil) 空指针转换，避免误伤正常的 nil 初始化或接口适配。
+	if isPtr && isNilExpr(pass.TypesInfo, call.Args[0]) {
+		return
+	}
 	if isSameNamedTypeArg(pass.TypesInfo, call.Args[0], targetType) {
 		return
 	}
 	pass.ReportRangef(call, "failclosed: 禁止在包外通过类型转换构造 //xops:opaque 类型 %s，请调用导出构造器", orig.Name())
+}
+
+func unwrapPointerTarget(t types.Type) (types.Type, bool) {
+	cur := types.Unalias(t)
+	isPtr := false
+	for {
+		ptr, ok := cur.(*types.Pointer)
+		if !ok {
+			return cur, isPtr
+		}
+		isPtr = true
+		cur = types.Unalias(ptr.Elem())
+	}
+}
+
+func isNilExpr(info *types.Info, expr ast.Expr) bool {
+	id, ok := ast.Unparen(expr).(*ast.Ident)
+	if !ok {
+		return false
+	}
+	if info != nil {
+		if _, isNil := info.Uses[id].(*types.Nil); isNil {
+			return true
+		}
+	}
+	return id.Name == "nil"
 }
 
 func isSameNamedTypeArg(info *types.Info, expr ast.Expr, targetType types.Type) bool {

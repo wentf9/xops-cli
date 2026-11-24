@@ -78,3 +78,19 @@ type SealedStep interface {
 type PlainIface interface { // want "failclosed: //xops:failclosed 不支持非封闭接口类型 PlainIface"
 	Do()
 }
+
+// 非法 //xops:failclosed 结构体（bypass / insecure / unverified 否定语义 bool 无正向门控）
+//xops:failclosed
+type BadBypassBool struct {
+	bypassAuth bool // want "failclosed: //xops:failclosed 结构体 BadBypassBool 含否定语义 bool 字段 bypassAuth"
+}
+
+//xops:failclosed
+type BadInsecureBool struct {
+	insecureMode bool // want "failclosed: //xops:failclosed 结构体 BadInsecureBool 含否定语义 bool 字段 insecureMode"
+}
+
+//xops:failclosed
+type BadUnverifiedBool struct {
+	unverified bool // want "failclosed: //xops:failclosed 结构体 BadUnverifiedBool 含否定语义 bool 字段 unverified"
+}

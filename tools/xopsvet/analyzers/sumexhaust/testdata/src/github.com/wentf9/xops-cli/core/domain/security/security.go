@@ -103,3 +103,102 @@ func invalidAssignAllowDefault(d GuardrailDecision) bool {
 	}
 	return allowed
 }
+
+func grantHelper() bool {
+	return true
+}
+
+func invalidIfNoElseDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default: // want "sumexhaust: 安全决策 default 分支必须包含显式 fail-closed 处置（返回拒绝/错误或 panic），禁止静默 break 或放行"
+		if cond {
+			return false
+		}
+	}
+	return true
+}
+
+func invalidIfIncompleteElseDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default: // want "sumexhaust: 安全决策 default 分支必须包含显式 fail-closed 处置（返回拒绝/错误或 panic），禁止静默 break 或放行"
+		if cond {
+			return false
+		} else {
+			_ = "log only"
+		}
+	}
+	return true
+}
+
+func validIfBothBranchesFailClosed(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		if cond {
+			return false
+		} else {
+			panic("denied")
+		}
+	}
+}
+
+func invalidVarDeclPermissiveDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		var ok = true // want "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）"
+		return ok     // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidCallPermissiveDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return grantHelper() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidAssignErrFallthroughDefault(d GuardrailDecision) error {
+	var err error
+	switch d.(type) {
+	case *DecisionDeny:
+		return errors.New("denied")
+	case *DecisionAllow:
+		return nil
+	default: // want "sumexhaust: 安全决策 default 分支必须包含显式 fail-closed 处置（返回拒绝/错误或 panic），禁止静默 break 或放行"
+		err = errors.New("denied")
+	}
+	_ = err
+	return nil
+}
+
+func validAssignAndReturnErrDefault(d GuardrailDecision) error {
+	var err error
+	switch d.(type) {
+	case *DecisionDeny:
+		return errors.New("denied")
+	case *DecisionAllow:
+		return nil
+	default:
+		err = errors.New("denied")
+		return err
+	}
+}

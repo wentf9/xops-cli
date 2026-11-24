@@ -243,7 +243,8 @@ func isNegativeBoolToken(tok string) bool {
 	switch tok {
 	case "disabled", "disable", "denied", "deny", "revoked", "revoke",
 		"blocked", "block", "halted", "halt", "closed", "close",
-		"wiped", "wipe", "invalid", "rejected", "reject", "forbidden", "forbid":
+		"wiped", "wipe", "invalid", "rejected", "reject", "forbidden", "forbid",
+		"bypass", "bypassed", "insecure", "unverified":
 		return true
 	default:
 		return false

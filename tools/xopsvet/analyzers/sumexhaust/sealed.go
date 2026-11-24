@@ -149,18 +149,17 @@ func instantiateVariant(candNamed, ifaceNamed *types.Named) types.Type {
 	if tp == nil || tp.Len() == 0 {
 		return candNamed
 	}
-	if ifaceNamed == nil || ifaceNamed.TypeArgs() == nil || ifaceNamed.TypeArgs().Len() != tp.Len() {
-		return nil
+	if ifaceNamed != nil && ifaceNamed.TypeArgs() != nil && ifaceNamed.TypeArgs().Len() == tp.Len() {
+		args := make([]types.Type, ifaceNamed.TypeArgs().Len())
+		for i := 0; i < len(args); i++ {
+			args[i] = ifaceNamed.TypeArgs().At(i)
+		}
+		if inst, err := types.Instantiate(nil, candNamed, args, true); err == nil {
+			return inst
+		}
 	}
-	args := make([]types.Type, ifaceNamed.TypeArgs().Len())
-	for i := 0; i < len(args); i++ {
-		args[i] = ifaceNamed.TypeArgs().At(i)
-	}
-	inst, err := types.Instantiate(nil, candNamed, args, true)
-	if err != nil {
-		return nil
-	}
-	return inst
+	// 当泛型参数目与接口类型实参不一致或存在未命名接口包装时，保留未实例化原型以供方法集兼容判定。
+	return candNamed
 }
 
 // isSealMixin 识别用于组合嵌入的未导出 sealed* 标记结构体（如 type sealedCapability struct{}），
@@ -194,7 +193,7 @@ func isEmbeddedByImplementer(cand types.Type, allCandidates []types.Type, iface 
 		if types.Identical(other, cand) {
 			continue
 		}
-		if !types.Implements(other, iface) && !types.Implements(types.NewPointer(other), iface) {
+		if len(requiredVariantForms(other, iface)) == 0 {
 			continue
 		}
 		if structEmbedsType(other, cand) {
@@ -226,8 +225,7 @@ func structEmbedsType(container, target types.Type) bool {
 }
 
 func requiredVariantForms(cand types.Type, iface *types.Interface) []types.Type {
-	valImpl := types.Implements(cand, iface)
-	ptrImpl := types.Implements(types.NewPointer(cand), iface)
+	valImpl, ptrImpl := checkVariantImplements(cand, iface)
 	switch {
 	case valImpl && ptrImpl:
 		// 值接收者同时满足 T 与 *T 两种动态类型，type switch 须同时覆盖两者以免漏判指针实例。
@@ -237,4 +235,130 @@ func requiredVariantForms(cand types.Type, iface *types.Interface) []types.Type 
 	default:
 		return nil
 	}
+}
+
+func checkVariantImplements(cand types.Type, iface *types.Interface) (bool, bool) {
+	if candNamed, isUninst := isUninstantiatedGenericNamed(cand); isUninst {
+		return uninstantiatedMethodMatch(candNamed, iface)
+	}
+	valImpl := types.Implements(cand, iface)
+	ptrImpl := types.Implements(types.NewPointer(cand), iface)
+	return valImpl, ptrImpl
+}
+
+func isUninstantiatedGenericNamed(t types.Type) (*types.Named, bool) {
+	named, ok := t.(*types.Named)
+	if !ok || named == nil {
+		return nil, false
+	}
+	tp := named.TypeParams()
+	ta := named.TypeArgs()
+	return named, tp != nil && tp.Len() > 0 && (ta == nil || ta.Len() == 0)
+}
+
+func uninstantiatedMethodMatch(candNamed *types.Named, iface *types.Interface) (bool, bool) {
+	if methodSetImplementsGeneric(types.NewMethodSet(candNamed), iface) {
+		return true, true
+	}
+	if methodSetImplementsGeneric(types.NewMethodSet(types.NewPointer(candNamed)), iface) {
+		return false, true
+	}
+	return false, false
+}
+
+func methodSetImplementsGeneric(ms *types.MethodSet, iface *types.Interface) bool {
+	if ms == nil || iface == nil {
+		return false
+	}
+	for i := 0; i < iface.NumMethods(); i++ {
+		im := iface.Method(i)
+		sel := ms.Lookup(im.Pkg(), im.Name())
+		if sel == nil {
+			return false
+		}
+		fn, ok := sel.Obj().(*types.Func)
+		if !ok || !compatibleUninstantiatedMethodSig(fn.Signature(), im.Signature()) {
+			return false
+		}
+	}
+	return true
+}
+
+func compatibleUninstantiatedMethodSig(fnSig, imSig *types.Signature) bool {
+	if fnSig == nil || imSig == nil || fnSig.Variadic() != imSig.Variadic() {
+		return false
+	}
+	return compatibleTupleTypes(fnSig.Params(), imSig.Params()) &&
+		compatibleTupleTypes(fnSig.Results(), imSig.Results())
+}
+
+func compatibleTupleTypes(fnTup, imTup *types.Tuple) bool {
+	if fnTup.Len() != imTup.Len() {
+		return false
+	}
+	for i := 0; i < fnTup.Len(); i++ {
+		if !compatibleSingleType(fnTup.At(i).Type(), imTup.At(i).Type()) {
+			return false
+		}
+	}
+	return true
+}
+
+func compatibleSingleType(fnType, imType types.Type) bool {
+	fnHasTP := hasTypeParam(fnType)
+	imHasTP := hasTypeParam(imType)
+	if !fnHasTP && !imHasTP {
+		return types.Identical(fnType, imType)
+	}
+	if tp, ok := types.Unalias(fnType).(*types.TypeParam); ok && !imHasTP && imType != types.Typ[types.Invalid] {
+		if constraint, ok := tp.Constraint().Underlying().(*types.Interface); ok {
+			return types.Satisfies(imType, constraint)
+		}
+	}
+	return true
+}
+
+func hasTypeParam(t types.Type) bool {
+	return hasTypeParamSeen(t, make(map[types.Type]bool))
+}
+
+func hasTypeParamSeen(t types.Type, seen map[types.Type]bool) bool {
+	if t == nil {
+		return false
+	}
+	u := types.Unalias(t)
+	if seen[u] {
+		return false
+	}
+	seen[u] = true
+	switch v := u.(type) {
+	case *types.TypeParam:
+		return true
+	case *types.Pointer:
+		return hasTypeParamSeen(v.Elem(), seen)
+	case *types.Slice:
+		return hasTypeParamSeen(v.Elem(), seen)
+	case *types.Array:
+		return hasTypeParamSeen(v.Elem(), seen)
+	case *types.Chan:
+		return hasTypeParamSeen(v.Elem(), seen)
+	case *types.Map:
+		return hasTypeParamSeen(v.Key(), seen) || hasTypeParamSeen(v.Elem(), seen)
+	case *types.Named:
+		return typeArgsHaveParam(v.TypeArgs(), seen)
+	default:
+		return false
+	}
+}
+
+func typeArgsHaveParam(ta *types.TypeList, seen map[types.Type]bool) bool {
+	if ta == nil {
+		return false
+	}
+	for i := 0; i < ta.Len(); i++ {
+		if hasTypeParamSeen(ta.At(i), seen) {
+			return true
+		}
+	}
+	return false
 }

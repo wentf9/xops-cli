@@ -70,3 +70,68 @@ func swallowInNestedBoolFuncLit() {
 	}
 	_ = fn("1")
 }
+
+// Challenge 7 & 8: defer/go/IIFE 匿名闭包、range <-chan error、具名 MyBool 及非末尾 (bool, string) 返回值。
+type MyBool bool
+
+func sortLike(items []string, cmp func(a, b string) int) {
+	if len(items) > 1 {
+		_ = cmp(items[0], items[1])
+	}
+}
+
+func validOuterCallbackIsolated(items []string) bool {
+	sortLike(items, func(a, b string) int {
+		_, err := strconv.Atoi(a)
+		_ = err
+		return 0
+	})
+	return len(items) > 0
+}
+
+func validDeferPureIs(err error) bool {
+	defer func() {
+		_ = errors.Is(err, errSentinel)
+	}()
+	return err != nil
+}
+
+func swallowInDeferVoidFuncLit() bool {
+	defer func() {
+		_ = produceErr() // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	}()
+	return true
+}
+
+func swallowInImmediateVoidFuncLit() bool {
+	func() {
+		_ = produceErr() // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	}()
+	return true
+}
+
+func swallowInGoVoidFuncLit() bool {
+	go func() {
+		_ = produceErr() // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	}()
+	return true
+}
+
+func swallowRangeChanError(ch <-chan error) bool {
+	for err := range ch { // want "failclosed: 返回 bool 的函数禁止在 range chan error 中吞噬局部 error"
+		if err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+func swallowNamedBool(s string) MyBool {
+	_, err := strconv.Atoi(s) // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	return err == nil
+}
+
+func swallowBoolNotLast(s string) (bool, string) {
+	_, err := strconv.Atoi(s) // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	return err == nil, s
+}

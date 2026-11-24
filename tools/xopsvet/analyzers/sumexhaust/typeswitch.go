@@ -81,23 +81,75 @@ func matchCaseClause(pass *analysis.Pass, cc *ast.CaseClause, info *sealedInfo, 
 }
 
 func markCaseTypeCovered(ct types.Type, info *sealedInfo, covered []bool) {
-	if subIface, ok := ct.(*types.Interface); ok {
-		// 禁止 case any / case interface{} / case 自身接口 绕过变体穷尽检查。
-		if subIface.NumMethods() == 0 || types.Identical(subIface, info.iface) {
-			return
-		}
-		for i, v := range info.variants {
-			if types.Implements(v, subIface) {
-				covered[i] = true
-			}
-		}
+	if subIface, ok := asInterfaceType(ct); ok {
+		markSubInterfaceCovered(subIface, info, covered)
 		return
 	}
 	for i, v := range info.variants {
-		if types.Identical(ct, v) {
+		if variantMatchesCaseType(ct, v) {
 			covered[i] = true
 		}
 	}
+}
+
+func asInterfaceType(t types.Type) (*types.Interface, bool) {
+	u := types.Unalias(t)
+	if iface, ok := u.(*types.Interface); ok {
+		return iface, true
+	}
+	if named, ok := u.(*types.Named); ok {
+		iface, isIface := named.Underlying().(*types.Interface)
+		return iface, isIface
+	}
+	return nil, false
+}
+
+func markSubInterfaceCovered(subIface *types.Interface, info *sealedInfo, covered []bool) {
+	// 禁止 case any / case interface{} / 任意超集或等价接口（如 interface{ Tag() } 或 interface{ sealed*() }）绕过变体穷尽检查。
+	if subIface.NumMethods() == 0 || types.Implements(info.iface, subIface) {
+		return
+	}
+	var matched []int
+	for i, v := range info.variants {
+		if types.Implements(v, subIface) {
+			matched = append(matched, i)
+		}
+	}
+	// 当存在多个必填变体且子接口恰好覆盖全部变体时，视为等价全覆盖逃生口并拒绝计入覆盖。
+	if len(info.variants) > 1 && len(matched) == len(info.variants) {
+		return
+	}
+	for _, idx := range matched {
+		covered[idx] = true
+	}
+}
+
+func variantMatchesCaseType(ct, v types.Type) bool {
+	if types.Identical(ct, v) {
+		return true
+	}
+	ctElem, ctIsPtr := unwrapPointerElem(ct)
+	vElem, vIsPtr := unwrapPointerElem(v)
+	if ctIsPtr != vIsPtr {
+		return false
+	}
+	vNamed, ok := isUninstantiatedGenericNamed(vElem)
+	if !ok {
+		return false
+	}
+	ctNamed, ok := ctElem.(*types.Named)
+	if !ok || ctNamed == nil {
+		return false
+	}
+	return vNamed.Origin() != nil && ctNamed.Origin() == vNamed.Origin()
+}
+
+func unwrapPointerElem(t types.Type) (types.Type, bool) {
+	u := types.Unalias(t)
+	if ptr, ok := u.(*types.Pointer); ok {
+		return types.Unalias(ptr.Elem()), true
+	}
+	return u, false
 }
 
 func shortQualifier(passPkg *types.Package) types.Qualifier {

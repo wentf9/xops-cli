@@ -139,3 +139,140 @@ type ExtDirectValid struct {
 func (e ExtDirectValid) WriteCanonical(w io.Writer) {
 	e.ExtBase.WriteCanonical(w)
 }
+
+// Challenge 4: var _ = h.A、_ = &h.B、var _ = &h.C、h.D++、h.E--、h.F += 1 均不得计入覆盖
+//xops:canonicalhash
+type BypassDiscardForms struct {
+	A string
+	B string
+	C string
+	D int
+	E int
+	F int
+}
+
+func (h *BypassDiscardForms) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 BypassDiscardForms 的 WriteCanonical 未覆盖字段 A" "digestcover: 结构体 BypassDiscardForms 的 WriteCanonical 未覆盖字段 B" "digestcover: 结构体 BypassDiscardForms 的 WriteCanonical 未覆盖字段 C" "digestcover: 结构体 BypassDiscardForms 的 WriteCanonical 未覆盖字段 D" "digestcover: 结构体 BypassDiscardForms 的 WriteCanonical 未覆盖字段 E" "digestcover: 结构体 BypassDiscardForms 的 WriteCanonical 未覆盖字段 F"
+	var _ = h.A
+	_ = &h.B
+	var _ = &h.C
+	h.D++
+	h.E--
+	h.F += 1
+}
+
+// Challenge 5: 泛型结构体嵌入泛型结构体并通过提升字段全部编码
+type GenBase[T any] struct {
+	SubVal T
+}
+
+//xops:canonicalhash
+type GenEmbedPromoted[T any] struct {
+	GenBase[T]
+	Own string
+}
+
+func (g *GenEmbedPromoted[T]) WriteCanonical(w io.Writer) {
+	_, _ = io.WriteString(w, g.Own)
+	_ = []any{g.SubVal}
+}
+
+// Challenge 9: 非接收者值传递辅助函数中调用 reflect 同样拦截
+func reflectHelperVal(v string) {
+	_ = reflect.TypeOf(v) // want "digestcover: WriteCanonical 禁止使用 reflect"
+}
+
+//xops:canonicalhash
+type UsesReflectViaValHelper struct {
+	A string
+}
+
+func (h *UsesReflectViaValHelper) WriteCanonical(w io.Writer) {
+	reflectHelperVal(h.A)
+	_, _ = io.WriteString(w, h.A)
+}
+
+// Unchallenged: >=2 跳多层结构体嵌入（Outer -> Middle -> Inner）
+type InnerLeaf struct {
+	LeafA string
+	LeafB int
+}
+
+type MiddleLayer struct {
+	InnerLeaf
+	MidField string
+}
+
+//xops:canonicalhash
+type OuterPromotedValid struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterPromotedValid) WriteCanonical(w io.Writer) {
+	_, _ = io.WriteString(w, o.LeafA)
+	if o.LeafB > 0 {
+		_, _ = io.WriteString(w, "b")
+	}
+	_, _ = io.WriteString(w, o.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterPromotedMissingLeaf struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterPromotedMissingLeaf) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterPromotedMissingLeaf 的 WriteCanonical 未覆盖字段 MiddleLayer"
+	_, _ = io.WriteString(w, o.LeafA)
+	_, _ = io.WriteString(w, o.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+type MiddleWithExt struct {
+	extbase.ExtBase
+	MidField string
+}
+
+//xops:canonicalhash
+type OuterWithExtInvalid struct {
+	MiddleWithExt
+	OwnField string
+}
+
+func (o *OuterWithExtInvalid) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterWithExtInvalid 的 WriteCanonical 未覆盖字段 MiddleWithExt"
+	_, _ = io.WriteString(w, o.Public)
+	_, _ = io.WriteString(w, o.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterWithExtValid struct {
+	MiddleWithExt
+	OwnField string
+}
+
+func (o *OuterWithExtValid) WriteCanonical(w io.Writer) {
+	o.ExtBase.WriteCanonical(w)
+	_, _ = io.WriteString(w, o.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+func (i InnerLeaf) WriteCanonical(w io.Writer) {
+	_, _ = io.WriteString(w, i.LeafA)
+	if i.LeafB > 0 {
+		_, _ = io.WriteString(w, "b")
+	}
+}
+
+//xops:canonicalhash
+type OuterDirectInnerValid struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterDirectInnerValid) WriteCanonical(w io.Writer) {
+	o.InnerLeaf.WriteCanonical(w)
+	_, _ = io.WriteString(w, o.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}
