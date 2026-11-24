@@ -210,7 +210,7 @@ GOOS=darwin  GOARCH=amd64 sh -c 'cd core && GOWORK=off go build ./...'
 
 ## 5. 持久化进度跟踪清单（Execution Checklist）
 
-- **Phase 0**：`[ ] P0-T1` · `[ ] P0-T2` · `[ ] P0-T3` · `[ ] P0-T4` · **`[ ] Gate G0`**
+- **Phase 0**：`[x] P0-T1` · `[x] P0-T2` · `[x] P0-T3` · `[x] P0-T4` · **`[x] Gate G0`**
 - **Phase 1**：`[ ] P1-T1` · `[ ] P1-T2` · `[ ] P1-T3` · `[ ] P1-T4` · `[ ] P1-T5` · `[ ] P1-T6` · **`[ ] Gate G1`**
 - **Phase 2**：`[ ] P2-T1` · `[ ] P2-T2` · `[ ] P2-T3` · `[ ] P2-T4` · `[ ] P2-T5` · `[ ] P2-T6` · **`[ ] Gate G2`**
 - **Phase 2.5（Walking Skeleton）**：`[ ] P2.5-T1` · `[ ] P2.5-T2` · **`[ ] Gate G2.5`**
