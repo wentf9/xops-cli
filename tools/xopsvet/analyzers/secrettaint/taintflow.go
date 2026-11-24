@@ -373,18 +373,28 @@ func (s *taintState) propagateCallMutation(call *ast.CallExpr) bool {
 	if isAppendBuiltin(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.argsContainTaint(call.Args[1:]) {
 		return s.taintLocalTarget(call.Args[0])
 	}
-	if isBufferOrBuilderWriteMethod(s.pass.TypesInfo, call) && s.argsContainTaint(call.Args) {
-		if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-			return s.taintLocalTarget(sel.X)
-		}
-	}
-	if isBufferOrReaderReadIntoMethod(s.pass.TypesInfo, call) && len(call.Args) >= 1 {
-		if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok && s.exprIsTainted(sel.X) {
-			return s.taintLocalTarget(call.Args[0])
-		}
-	}
 	if isFmtAppendCall(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.argsContainTaint(call.Args[1:]) {
 		return s.taintLocalTarget(call.Args[0])
+	}
+	if isIOCopyCall(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.exprIsTainted(call.Args[1]) {
+		return s.taintLocalTarget(call.Args[0])
+	}
+	return s.propagateBufferCallMutation(call)
+}
+
+func (s *taintState) propagateBufferCallMutation(call *ast.CallExpr) bool {
+	sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	if isBufferOrBuilderWriteMethod(s.pass.TypesInfo, call) && s.argsContainTaint(call.Args) {
+		return s.taintLocalTarget(sel.X)
+	}
+	if isBufferOrReaderReadIntoMethod(s.pass.TypesInfo, call) && len(call.Args) >= 1 && s.exprIsTainted(sel.X) {
+		return s.taintLocalTarget(call.Args[0])
+	}
+	if isBufferReadFromMethod(s.pass.TypesInfo, call) && len(call.Args) >= 1 && s.exprIsTainted(call.Args[0]) {
+		return s.taintLocalTarget(sel.X)
 	}
 	return false
 }
@@ -402,11 +412,16 @@ func (s *taintState) taintLocalTarget(expr ast.Expr) bool {
 	return true
 }
 
-// unwrapSliceBaseExpr 剥离切片表达式与非 map 索引表达式，保留对底层切片/数组目标变量的追踪，
+// unwrapSliceBaseExpr 剥离取址（&）、切片表达式与非 map 索引表达式，保留对底层目标变量的追踪，
 // 同时拦截对 map 元素（如 localMap["k"]）的非法绕过写入。
 func unwrapSliceBaseExpr(info *types.Info, expr ast.Expr) ast.Expr {
 	for expr != nil {
 		switch e := ast.Unparen(expr).(type) {
+		case *ast.UnaryExpr:
+			if e.Op != token.AND {
+				return e
+			}
+			expr = e.X
 		case *ast.SliceExpr:
 			expr = e.X
 		case *ast.IndexExpr:

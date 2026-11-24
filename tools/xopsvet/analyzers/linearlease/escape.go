@@ -4,6 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 	"golang.org/x/tools/go/analysis"
@@ -263,9 +264,6 @@ func (s *closureState) discoverSyncCallLits(call *ast.CallExpr) []*ast.FuncLit {
 		s.seedCallArgsToFuncLit(funLit, call.Args)
 		lits = append(lits, funLit)
 	}
-	if _, isDirectIIFE := ast.Unparen(call.Fun).(*ast.FuncLit); isDirectIIFE {
-		return lits
-	}
 	if len(funLits) > 0 {
 		spec.syncClosure = true
 	}
@@ -288,7 +286,7 @@ func (s *closureState) collectSyncArgLits(arg ast.Expr, indices []int, dst []*as
 	return dst
 }
 
-// seedCallArgsToFuncLit 将直接调用（IIFE 或本地闭包变量）传入的借用实参约束绑定到对应形参。
+// seedCallArgsToFuncLit 将直接调用（IIFE 或本地闭包变量）传入的借用实参及污点闭包实参绑定到对应形参。
 func (s *closureState) seedCallArgsToFuncLit(lit *ast.FuncLit, args []ast.Expr) {
 	if lit == nil || lit.Type == nil || lit.Type.Params == nil || len(args) == 0 {
 		return
@@ -302,19 +300,37 @@ func (s *closureState) seedCallArgsToFuncLit(lit *ast.FuncLit, args []ast.Expr) 
 		return
 	}
 	for i, arg := range args {
-		argScope, ok := s.exprBorrowedScope(arg)
-		if !ok {
-			continue
-		}
 		pVar := paramVarAt(paramVars, isVariadic, i)
 		if pVar == nil {
 			continue
 		}
-		targetScope := argScope
-		if !isDeclaredWithinScope(pVar, argScope) {
+		if argScope, ok := s.exprBorrowedScope(arg); ok {
+			targetScope := argScope
+			if !isDeclaredWithinScope(pVar, argScope) {
+				targetScope = litScope
+			}
+			s.borrowed[pVar] = targetScope
+		}
+		s.seedParamClosureArg(pVar, litScope, arg)
+	}
+}
+
+func (s *closureState) seedParamClosureArg(pVar *types.Var, litScope *types.Scope, arg ast.Expr) {
+	if isLocalFunctionVar(pVar, s.pass.Pkg) {
+		for _, argLit := range s.resolveArgFuncLits(arg) {
+			if argLit != nil && !slices.Contains(s.localFuncLits[pVar], argLit) {
+				s.localFuncLits[pVar] = append(s.localFuncLits[pVar], argLit)
+			}
+		}
+	}
+	if info, ok := s.exprTaintedClosure(arg); ok {
+		targetScope := info.ownerScope
+		if !isDeclaredWithinScope(pVar, targetScope) {
 			targetScope = litScope
 		}
-		s.borrowed[pVar] = targetScope
+		if _, exists := s.taintedClosures[pVar]; !exists {
+			s.taintedClosures[pVar] = taintedClosureInfo{lit: info.lit, ownerScope: targetScope}
+		}
 	}
 }
 

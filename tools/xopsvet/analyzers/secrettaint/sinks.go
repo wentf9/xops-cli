@@ -227,6 +227,8 @@ func isTaintPropagatingCall(info *types.Info, call *ast.CallExpr) bool {
 	case "fmt":
 		return name == "Sprint" || name == "Sprintf" || name == "Sprintln" ||
 			name == "Append" || name == "Appendf" || name == "Appendln"
+	case "io":
+		return name == "ReadAll"
 	case "strconv", "encoding/base64", "encoding/hex":
 		return true
 	default:
@@ -264,6 +266,15 @@ func isBufferOrReaderWriteToMethod(info *types.Info, call *ast.CallExpr) bool {
 
 func isBufferOrReaderReadIntoMethod(info *types.Info, call *ast.CallExpr) bool {
 	return isBytesOrStringsMethod(info, call, []string{"Buffer", "Reader"}, "Read", "ReadAt")
+}
+
+func isBufferReadFromMethod(info *types.Info, call *ast.CallExpr) bool {
+	return isBytesOrStringsMethod(info, call, []string{"Buffer"}, "ReadFrom")
+}
+
+func isIOCopyCall(info *types.Info, call *ast.CallExpr) bool {
+	obj := vetutil.ResolveCalledObject(info, call)
+	return vetutil.IsPkgSymbol(obj, "io", "Copy", "CopyN", "CopyBuffer")
 }
 
 func isBytesOrStringsMethod(info *types.Info, call *ast.CallExpr, recvTypes []string, methodNames ...string) bool {

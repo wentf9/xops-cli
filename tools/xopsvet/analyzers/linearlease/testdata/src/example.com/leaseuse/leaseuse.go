@@ -338,3 +338,44 @@ func badVariadicCallbacks() {
 		func(s leasedef.Session) { leakedSess = s }, // want "禁止将 //xops:borrowed 借用变量逃逸"
 	)
 }
+
+func badBypassNBL1IIFECallbacks(ctx context.Context, p leasedef.Pool, n Nursery) {
+	_ = p.WithLease(ctx, func(ctx context.Context, sess leasedef.Session) error {
+		func(cb func()) {
+			cb()
+		}(func() {
+			leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
+		})
+
+		func(cb func()) {
+			n.Go(cb) // want "禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用"
+		}(func() {
+			_ = sess.Exec(ctx, "bypass-iife-ngo")
+		})
+
+		func(cb func()) {
+			leakedFnZero = cb // want "禁止将 //xops:borrowed 借用变量逃逸"
+		}(func() {
+			_ = sess.Exec(ctx, "bypass-iife-leakfn")
+		})
+
+		runCB := func(cb func()) { cb() }
+		runCB(func() {
+			leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
+		})
+
+		spawnCB := func(cb func()) {
+			n.Go(cb) // want "禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用"
+		}
+		spawnCB(func() {
+			_ = sess.Exec(ctx, "bypass-localcb-ngo")
+		})
+
+		func(cb func()) {
+			cb()
+		}(func() {
+			_ = sess.Exec(ctx, "clean-iife-cb")
+		})
+		return nil
+	})
+}

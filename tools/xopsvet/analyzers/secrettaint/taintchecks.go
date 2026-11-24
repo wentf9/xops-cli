@@ -65,6 +65,10 @@ func (s *taintState) checkSpecialCallLeak(call *ast.CallExpr) bool {
 		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 fmt.Append 将明文机密写入外层变量或字段")
 		return true
 	}
+	if isIOCopyCall(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.exprIsTainted(call.Args[1]) {
+		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 io.Copy 将明文机密写入外层缓冲或写入器")
+		return true
+	}
 	return s.checkBufferMethodLeak(call)
 }
 
@@ -88,6 +92,16 @@ func (s *taintState) checkBufferMethodLeak(call *ast.CallExpr) bool {
 	if isBufferOrReaderReadIntoMethod(s.pass.TypesInfo, call) && len(call.Args) >= 1 {
 		if s.exprIsTainted(sel.X) {
 			s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 Read 将明文机密写入外层变量或字段")
+		}
+		return true
+	}
+	return s.checkBufferReadFromLeak(call, sel)
+}
+
+func (s *taintState) checkBufferReadFromLeak(call *ast.CallExpr, sel *ast.SelectorExpr) bool {
+	if isBufferReadFromMethod(s.pass.TypesInfo, call) && len(call.Args) >= 1 {
+		if s.exprIsTainted(call.Args[0]) {
+			s.checkMutationDestEscape(sel.X, "secrettaint: 禁止通过 ReadFrom 将明文机密写入外层缓冲")
 		}
 		return true
 	}

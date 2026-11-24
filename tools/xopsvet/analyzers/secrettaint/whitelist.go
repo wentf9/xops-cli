@@ -37,7 +37,7 @@ func collectFileSecretFacts(pass *analysis.Pass, file *ast.File, idx *secretFact
 			collectFuncDeclSecretFact(pass, file.Comments, d, idx)
 		case *ast.GenDecl:
 			if d.Tok == token.TYPE {
-				collectTypeDeclSecretFacts(pass, d, idx)
+				collectTypeDeclSecretFacts(pass, file.Comments, d, idx)
 			}
 		}
 	}
@@ -60,7 +60,7 @@ func collectFuncDeclSecretFact(pass *analysis.Pass, comments []*ast.CommentGroup
 	pass.ExportObjectFact(fnObj, &secretUseFact{})
 }
 
-func collectTypeDeclSecretFacts(pass *analysis.Pass, gen *ast.GenDecl, idx *secretFactIndex) {
+func collectTypeDeclSecretFacts(pass *analysis.Pass, comments []*ast.CommentGroup, gen *ast.GenDecl, idx *secretFactIndex) {
 	for _, spec := range gen.Specs {
 		ts, ok := spec.(*ast.TypeSpec)
 		if !ok {
@@ -68,7 +68,7 @@ func collectTypeDeclSecretFacts(pass *analysis.Pass, gen *ast.GenDecl, idx *secr
 		}
 		switch t := ts.Type.(type) {
 		case *ast.InterfaceType:
-			collectInterfaceSecretFacts(pass, t, idx)
+			collectInterfaceSecretFacts(pass, comments, t, idx)
 		case *ast.FuncType:
 			if vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveSecretUse) {
 				if tn, ok := pass.TypesInfo.Defs[ts.Name].(*types.TypeName); ok && tn != nil {
@@ -80,12 +80,19 @@ func collectTypeDeclSecretFacts(pass *analysis.Pass, gen *ast.GenDecl, idx *secr
 	}
 }
 
-func collectInterfaceSecretFacts(pass *analysis.Pass, iface *ast.InterfaceType, idx *secretFactIndex) {
+func collectInterfaceSecretFacts(pass *analysis.Pass, comments []*ast.CommentGroup, iface *ast.InterfaceType, idx *secretFactIndex) {
 	if iface.Methods == nil {
 		return
 	}
 	for _, m := range iface.Methods.List {
-		if len(m.Names) == 0 || !vetutil.FieldHasDirective(m, vetutil.DirectiveSecretUse) {
+		if len(m.Names) == 0 {
+			continue
+		}
+		hasDir := vetutil.FieldHasDirective(m, vetutil.DirectiveSecretUse)
+		if ft, ok := ast.Unparen(m.Type).(*ast.FuncType); ok {
+			hasDir = hasDir || hasAnyParamDirective(pass.Fset, comments, ft.Params, vetutil.DirectiveSecretUse)
+		}
+		if !hasDir {
 			continue
 		}
 		if fnObj, ok := pass.TypesInfo.Defs[m.Names[0]].(*types.Func); ok && fnObj != nil {

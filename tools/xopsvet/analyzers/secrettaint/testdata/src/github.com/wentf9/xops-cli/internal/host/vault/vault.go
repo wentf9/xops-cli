@@ -246,3 +246,90 @@ func badUseHelperAndDeepChain(box *secret.SecretBox) {
 		return nil
 	})
 }
+
+var (
+	outerBuf    bytes.Buffer
+	outerBufPtr = &bytes.Buffer{}
+)
+
+type localConsumer interface {
+	Consume(plain []byte) error
+}
+
+type annotatedConsumer interface {
+	//xops:secretuse
+	Consume(plain []byte) error // want Consume:"secretuse"
+}
+
+type badConsumerImpl struct{}
+
+func (badConsumerImpl) Consume(plain []byte) error {
+	slog.Info("iface-leak", "v", string(plain))
+	return nil
+}
+
+func badHelperTypeAssert(plain []byte) error {
+	slog.Info("type-assert-helper", "v", string(plain)) // want "禁止将明文机密.*传入日志汇点"
+	return nil
+}
+
+func badHelper10Hops(plain []byte) error {
+	slog.Info("10hops-helper", "v", string(plain)) // want "禁止将明文机密.*传入日志汇点"
+	return nil
+}
+
+func badNewBypassesNB(box *secret.SecretBox) {
+	// NB-S1: Buffer.ReadFrom 与 io.Copy
+	_ = box.Use(func(plain []byte) error {
+		var rfBuf bytes.Buffer
+		_, _ = rfBuf.ReadFrom(bytes.NewReader(plain))
+		slog.Info("readfrom", "v", rfBuf.String()) // want "禁止将明文机密.*传入日志汇点"
+
+		_, _ = outerBuf.ReadFrom(bytes.NewReader(plain)) // want "禁止通过 ReadFrom 将明文机密写入外层缓冲"
+
+		var copyBuf bytes.Buffer
+		_, _ = io.Copy(&copyBuf, bytes.NewReader(plain))
+		slog.Info("iocopy", "v", copyBuf.String()) // want "禁止将明文机密.*传入日志汇点"
+
+		_, _ = io.Copy(outerBufPtr, bytes.NewReader(plain)) // want "禁止通过 io.Copy 将明文机密写入外层缓冲或写入器"
+		_, _ = io.Copy(&outerBuf, bytes.NewReader(plain))   // want "禁止通过 io.Copy 将明文机密写入外层缓冲或写入器"
+
+		var safeBuf bytes.Buffer
+		_, _ = safeBuf.ReadFrom(strings.NewReader("ok"))
+		_, _ = io.Copy(&safeBuf, strings.NewReader("ok"))
+
+		// NB-S2a: 类型断言包裹的 IIFE 回调与干净对照
+		any(func(b []byte) {
+			slog.Info("any-iife", "v", string(b)) // want "禁止将明文机密.*传入日志汇点"
+		}).(func([]byte))(plain)
+
+		any(func(b []byte) {
+			clear(b)
+		}).(func([]byte))(plain)
+		return nil
+	})
+
+	// NB-S3b: 类型断言包裹的 SecretBox.Use 具名辅助函数
+	_ = box.Use(any(badHelperTypeAssert).(func([]byte) error))
+
+	// NB-S3a: 同包未标注接口方法 vs 已标注 //xops:secretuse 接口方法
+	var ic localConsumer = badConsumerImpl{}
+	_ = box.Use(ic.Consume) // want "禁止将未标注 //xops:secretuse 的接口方法或无体函数传入 SecretBox.Use"
+
+	var okIC annotatedConsumer = badConsumerImpl{}
+	_ = box.Use(okIC.Consume)
+
+	// NB-S3c: 10 跳逆序回调别名链
+	var c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 func([]byte) error
+	c10 = c9
+	c9 = c8
+	c8 = c7
+	c7 = c6
+	c6 = c5
+	c5 = c4
+	c4 = c3
+	c3 = c2
+	c2 = c1
+	c1 = badHelper10Hops
+	_ = box.Use(c10)
+}

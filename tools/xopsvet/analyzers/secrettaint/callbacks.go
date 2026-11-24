@@ -9,7 +9,8 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-const maxCallbackAliasIters = 8
+// maxCallbackAliasIters 与 maxTaintFixpointIters 保持一致，覆盖深层回调别名链。
+const maxCallbackAliasIters = maxTaintFixpointIters
 
 // packageCallbackIndex 索引本包全部函数声明及包级闭包/函数变量，支持 SecretBox.Use 追踪具名辅助函数与方法。
 type packageCallbackIndex struct {
@@ -124,6 +125,18 @@ func analyzeSecretUseCallbackArg(
 	if fn == nil {
 		return
 	}
+	analyzeResolvedCallbackFunc(pass, facts, pkgIdx, arg, fn, checkedDecls, reported)
+}
+
+func analyzeResolvedCallbackFunc(
+	pass *analysis.Pass,
+	facts *secretFactIndex,
+	pkgIdx *packageCallbackIndex,
+	arg ast.Expr,
+	fn *types.Func,
+	checkedDecls map[*ast.FuncDecl]bool,
+	reported map[token.Pos]bool,
+) {
 	if pkgIdx != nil {
 		if decl := pkgIdx.funcDecls[fn.Origin()]; decl != nil && decl.Type != nil {
 			if checkedDecls[decl] {
@@ -135,9 +148,14 @@ func analyzeSecretUseCallbackArg(
 			return
 		}
 	}
-	if fn.Pkg() != nil && fn.Pkg() != pass.Pkg && !facts.hasFuncSecretUseFact(pass, fn) {
-		reportLeakOnce(pass, reported, arg, "secrettaint: 禁止将未标注 //xops:secretuse 的跨包函数传入 SecretBox.Use")
+	if facts.hasFuncSecretUseFact(pass, fn) {
+		return
 	}
+	if fn.Pkg() != nil && fn.Pkg() != pass.Pkg {
+		reportLeakOnce(pass, reported, arg, "secrettaint: 禁止将未标注 //xops:secretuse 的跨包函数传入 SecretBox.Use")
+		return
+	}
+	reportLeakOnce(pass, reported, arg, "secrettaint: 禁止将未标注 //xops:secretuse 的接口方法或无体函数传入 SecretBox.Use")
 }
 
 func collectLocalCallbackMaps(
@@ -246,21 +264,46 @@ func recordCallbackPair(
 	return false
 }
 
-func resolveCallbackLit(info *types.Info, arg ast.Expr, localLits map[*types.Var]*ast.FuncLit) *ast.FuncLit {
-	e := ast.Unparen(arg)
-	if lit, ok := e.(*ast.FuncLit); ok {
-		return lit
+// unwrapCallbackExpr 剥离括号、类型断言与单参类型转换，还原底层回调字面量或函数引用表达式。
+func unwrapCallbackExpr(info *types.Info, expr ast.Expr) ast.Expr {
+	for expr != nil {
+		switch e := ast.Unparen(expr).(type) {
+		case *ast.TypeAssertExpr:
+			expr = e.X
+		case *ast.CallExpr:
+			if info != nil && len(e.Args) == 1 {
+				if tv, ok := info.Types[e.Fun]; ok && tv.IsType() {
+					expr = e.Args[0]
+					continue
+				}
+			}
+			return e
+		default:
+			return e
+		}
 	}
-	if id, ok := e.(*ast.Ident); ok && localLits != nil {
-		if v, ok := info.Uses[id].(*types.Var); ok && v != nil {
-			return localLits[v]
+	return nil
+}
+
+func resolveCallbackLit(info *types.Info, arg ast.Expr, localLits map[*types.Var]*ast.FuncLit) *ast.FuncLit {
+	switch e := unwrapCallbackExpr(info, arg).(type) {
+	case *ast.FuncLit:
+		return e
+	case *ast.Ident:
+		if info != nil && localLits != nil {
+			if v, ok := info.Uses[e].(*types.Var); ok && v != nil {
+				return localLits[v]
+			}
 		}
 	}
 	return nil
 }
 
 func resolveCallbackFunc(info *types.Info, arg ast.Expr, localFuncs map[*types.Var]*types.Func) *types.Func {
-	switch e := ast.Unparen(arg).(type) {
+	if info == nil {
+		return nil
+	}
+	switch e := unwrapCallbackExpr(info, arg).(type) {
 	case *ast.Ident:
 		if fn, ok := info.Uses[e].(*types.Func); ok && fn != nil {
 			return fn
