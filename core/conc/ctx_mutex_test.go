@@ -22,6 +22,9 @@ func TestCtxMutexNilAndUninitializedFailClosed(t *testing.T) {
 	if err := mu.WithLock(nilCtx, func() error { return nil }); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("WithLock(nil) error = %v, want ErrNilContext", err)
 	}
+	if err := mu.WithLock(nilCtx, nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("WithLock(nil, nil) error = %v, want ErrNilContext", err)
+	}
 	if err := mu.WithLock(context.Background(), nil); !errors.Is(err, ErrNilTask) {
 		t.Fatalf("WithLock(ctx, nil) error = %v, want ErrNilTask", err)
 	}

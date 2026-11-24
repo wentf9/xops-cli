@@ -198,12 +198,12 @@ func (a *DualActor[Req, Ctrl]) Run(ctx context.Context) error {
 	}
 	defer close(a.actorDone)
 	// LIFO 异常防护：若回调发生 panic 跳过 drainAndStop，仍在关闭 actorDone 之前封锁新入站、
-	// 关闭控制队列并清空未消费槽位指针（不调用 acqSenders.Wait 以防异常路径挂起）。
+	// 关闭控制队列并调用零分配 reset() 清空未消费槽位指针（不调用 acqSenders.Wait 以防异常路径挂起）。
 	defer func() {
 		a.beginStop()
 		a.ctrlMu.Lock()
 		a.ctrlClosed = true
-		a.ctrlQueue.popAll(nil)
+		a.ctrlQueue.reset()
 		a.ctrlMu.Unlock()
 	}()
 
@@ -216,7 +216,9 @@ func (a *DualActor[Req, Ctrl]) Run(ctx context.Context) error {
 }
 
 // step 执行一次完整的两段式调度：
-// 阶段 1 先无条件排空控制队列并优先响应停机/取消，阶段 2 再阻塞监听控制唤醒与请求通道。
+// 阶段 1 先无条件排空控制队列并按确定性优先级响应停机/取消（stopCh 优先于 ctx.Done()）；
+// 阶段 2 再阻塞监听控制唤醒、请求通道与停机信号；在 acquireCh 支路排空控制队列后立即复核停机状态，
+// 防止 OnControl 期间触发 Stop()（例如 GateHalted 熔断）后仍误执行普通 onRequest。
 func (a *DualActor[Req, Ctrl]) step(ctx context.Context) (bool, error) {
 	a.drainControls()
 
@@ -229,30 +231,54 @@ func (a *DualActor[Req, Ctrl]) step(ctx context.Context) (bool, error) {
 		a.drainControls()
 		return false, nil
 	case req := <-a.acquireCh:
-		// 在真正处理请求前再排空一次控制队列，避免 controlReady 与 acquireCh 同时就绪时的优先级反转。
+		// 在真正处理请求前再排空一次控制队列，避免 controlReady 与 acquireCh 同时就绪时的优先级反转；
+		// 排空后立即复核停机信号，若控制消息已触发停机则严格按 FIFO 经 onDrainRequest 排空 req 及剩余请求。
 		a.drainControls()
+		if stopped, err := a.isShutdown(ctx); stopped {
+			a.drainAndStopWithPending(req)
+			return true, err
+		}
 		a.onRequest(req)
 		return false, nil
 	case <-a.stopCh:
 		a.drainAndStop()
 		return true, nil
 	case <-ctx.Done():
+		// 在 beginStop 关闭 stopCh 之前先检测 stopCh 是否已由 Stop() 主动关闭，
+		// 保证 Stop() 与 ctx 取消并发就绪时全路径确定性优先返回 nil，消除 select 随机抖动。
+		var exitErr error
+		select {
+		case <-a.stopCh:
+		default:
+			exitErr = ctx.Err()
+		}
 		a.drainAndStop()
-		return true, ctx.Err()
+		return true, exitErr
 	}
 }
 
-func (a *DualActor[Req, Ctrl]) checkShutdown(ctx context.Context) (bool, error) {
+// isShutdown 以确定性优先级检查停机信号：始终优先判定 stopCh（返回 nil），其次判定 ctx.Done()（返回 ctx.Err()）。
+func (a *DualActor[Req, Ctrl]) isShutdown(ctx context.Context) (bool, error) {
 	select {
 	case <-a.stopCh:
-		a.drainAndStop()
 		return true, nil
+	default:
+	}
+	select {
 	case <-ctx.Done():
-		a.drainAndStop()
 		return true, ctx.Err()
 	default:
 		return false, nil
 	}
+}
+
+func (a *DualActor[Req, Ctrl]) checkShutdown(ctx context.Context) (bool, error) {
+	stopped, err := a.isShutdown(ctx)
+	if !stopped {
+		return false, nil
+	}
+	a.drainAndStop()
+	return true, err
 }
 
 func (a *DualActor[Req, Ctrl]) drainControls() {
@@ -285,6 +311,17 @@ func (a *DualActor[Req, Ctrl]) drainAndStop() {
 	a.beginStop()
 	a.acqSenders.Wait()
 	a.drainControls()
+	a.drainAcquireCh()
+	a.closeAndDrainControls()
+}
+
+// drainAndStopWithPending 用于 acquireCh 已出队一条 pending 请求、但在前置 drainControls 期间触发停机的场景：
+// 严格遵循相同 5 步屏障，并在排空 acquireCh 之前先交由 onDrainRequest 处理 pending，保证零丢弃且严格 FIFO。
+func (a *DualActor[Req, Ctrl]) drainAndStopWithPending(pending Req) {
+	a.beginStop()
+	a.acqSenders.Wait()
+	a.drainControls()
+	a.onDrainRequest(pending)
 	a.drainAcquireCh()
 	a.closeAndDrainControls()
 }

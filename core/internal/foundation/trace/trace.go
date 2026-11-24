@@ -1,15 +1,16 @@
 // Package trace 提供 XOps v2 只读请求追踪标识（TraceID/OpID）与连接租约防重入上下文标记（LeaseScope）。
 //
-// 本包是全仓唯一允许调用 context.WithValue 与 ctx.Value 的特权白名单包，
+// 本包是全仓唯一允许调用 context.WithValue 与 ctx.Value 的特权白名单包，同时严守 100% 纯内存非 I/O 约束
+// （零 crypto/rand 隐式系统调用，通过显式字节或 io.Reader 注入熵源以保障单种子 DST 确定性），
 // 所有上下文键均为未导出零大小结构体，所有导出值对象均采用私有字段与零值无效（fail-closed）设计。
 package trace
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 )
 
 const (
@@ -28,6 +29,9 @@ var ErrInvalidLeaseScope = errors.New("trace: LeaseScope 无效")
 
 // ErrNilContext 表示传入的 context.Context 为 nil（拒绝隐式回退到 Background）。
 var ErrNilContext = errors.New("trace: context 不能为 nil")
+
+// ErrNilEntropy 表示传入的熵源 io.Reader 为 nil（拒绝隐式读取操作系统随机源）。
+var ErrNilEntropy = errors.New("trace: 熵源 io.Reader 不能为 nil")
 
 // ErrReentrantLease 表示当前上下文已处于全局活跃连接租约作用域内，禁止任何同池或跨池嵌套重入申请租约。
 var ErrReentrantLease = errors.New("trace: 当前上下文已处于活跃连接租约作用域，禁止重入申请租约")
@@ -57,13 +61,20 @@ type OpID struct {
 	value string
 }
 
-// NewTraceID 使用密码学安全随机数生成 128-bit（32 位十六进制字符）的 TraceID。
-func NewTraceID() (TraceID, error) {
-	raw, err := newRandomHexID()
+// TraceIDFromBytes 以纯函数方式将 16 字节原始熵编码为 32 位小写十六进制 TraceID。
+func TraceIDFromBytes(raw [16]byte) TraceID {
+	return TraceID{value: hex.EncodeToString(raw[:])}
+}
+
+// NewTraceIDFrom 从调用方显式注入的熵源 entropy 读取 16 字节并生成 32 位十六进制 TraceID。
+// 生产路径由组合根注入基于 crypto/rand.Reader 的 ports.Entropy，DST 仿真路径注入确定性 SeededRand；
+// 若 entropy 为 nil 或读取不足 16 字节，则严格失败关闭。
+func NewTraceIDFrom(entropy io.Reader) (TraceID, error) {
+	raw, err := readEntropyBytes(entropy)
 	if err != nil {
 		return TraceID{}, fmt.Errorf("trace: 生成 TraceID 失败: %w", err)
 	}
-	return TraceID{value: raw}, nil
+	return TraceIDFromBytes(raw), nil
 }
 
 // ParseTraceID 校验并构造 TraceID；仅允许长度 1..128 的可打印非空白 ASCII（0x21..0x7E）。
@@ -105,13 +116,19 @@ func (id TraceID) MarshalText() ([]byte, error) {
 	return []byte(id.value), nil
 }
 
-// NewOpID 使用密码学安全随机数生成 128-bit（32 位十六进制字符）的 OpID。
-func NewOpID() (OpID, error) {
-	raw, err := newRandomHexID()
+// OpIDFromBytes 以纯函数方式将 16 字节原始熵编码为 32 位小写十六进制 OpID。
+func OpIDFromBytes(raw [16]byte) OpID {
+	return OpID{value: hex.EncodeToString(raw[:])}
+}
+
+// NewOpIDFrom 从调用方显式注入的熵源 entropy 读取 16 字节并生成 32 位十六进制 OpID。
+// 若 entropy 为 nil 或读取不足 16 字节，则严格失败关闭。
+func NewOpIDFrom(entropy io.Reader) (OpID, error) {
+	raw, err := readEntropyBytes(entropy)
 	if err != nil {
 		return OpID{}, fmt.Errorf("trace: 生成 OpID 失败: %w", err)
 	}
-	return OpID{value: raw}, nil
+	return OpIDFromBytes(raw), nil
 }
 
 // ParseOpID 校验并构造 OpID；仅允许长度 1..128 的可打印非空白 ASCII（0x21..0x7E）。
@@ -206,12 +223,15 @@ func OpIDFromContext(ctx context.Context) (OpID, bool) {
 	return oid, true
 }
 
-func newRandomHexID() (string, error) {
+func readEntropyBytes(entropy io.Reader) ([randomIDBytes]byte, error) {
 	var buf [randomIDBytes]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		return "", err
+	if entropy == nil {
+		return buf, ErrNilEntropy
 	}
-	return hex.EncodeToString(buf[:]), nil
+	if _, err := io.ReadFull(entropy, buf[:]); err != nil {
+		return [randomIDBytes]byte{}, err
+	}
+	return buf, nil
 }
 
 func isValidToken(raw string) bool {

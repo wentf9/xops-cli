@@ -1,9 +1,11 @@
 package trace
 
 import (
+	"bytes"
 	"context"
 	"encoding"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -15,34 +17,102 @@ var (
 	_ encoding.TextMarshaler = OpID{}
 )
 
-func TestTraceIDAndOpIDGenerationUniqueness(t *testing.T) {
-	seenTraces := make(map[string]struct{}, 64)
-	seenOps := make(map[string]struct{}, 64)
+type failingReader struct {
+	err error
+}
 
-	for range 64 {
-		tid, err := NewTraceID()
-		if err != nil {
-			t.Fatalf("NewTraceID failed: %v", err)
-		}
-		if !tid.IsValid() || len(tid.String()) != 32 {
-			t.Fatalf("unexpected TraceID: %q", tid.String())
-		}
-		if _, dup := seenTraces[tid.String()]; dup {
-			t.Fatalf("duplicate TraceID generated: %s", tid.String())
-		}
-		seenTraces[tid.String()] = struct{}{}
+func (r failingReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
 
-		oid, err := NewOpID()
-		if err != nil {
-			t.Fatalf("NewOpID failed: %v", err)
+func deterministicEntropy(seed byte, count int) io.Reader {
+	buf := make([]byte, count*randomIDBytes)
+	for i := range count {
+		for j := range randomIDBytes {
+			buf[i*randomIDBytes+j] = seed + byte(i) + byte(j)
 		}
-		if !oid.IsValid() || len(oid.String()) != 32 {
-			t.Fatalf("unexpected OpID: %q", oid.String())
+	}
+	return bytes.NewReader(buf)
+}
+
+func TestTraceIDAndOpIDFromBytesAndEntropyDeterministic(t *testing.T) {
+	var raw [16]byte
+	for i := range raw {
+		raw[i] = byte(i + 1)
+	}
+	const wantHex = "0102030405060708090a0b0c0d0e0f10"
+
+	tid := TraceIDFromBytes(raw)
+	if !tid.IsValid() || tid.String() != wantHex {
+		t.Fatalf("TraceIDFromBytes = (%q, valid=%v), want %q", tid.String(), tid.IsValid(), wantHex)
+	}
+	oid := OpIDFromBytes(raw)
+	if !oid.IsValid() || oid.String() != wantHex {
+		t.Fatalf("OpIDFromBytes = (%q, valid=%v), want %q", oid.String(), oid.IsValid(), wantHex)
+	}
+
+	// 同源字节流在两次调用间必须 100% 确定性复现（保障 P2-T6 单种子 DST）。
+	tidA, err := NewTraceIDFrom(bytes.NewReader(raw[:]))
+	if err != nil || !tidA.Equal(tid) {
+		t.Fatalf("NewTraceIDFrom = (%v, %v), want %v", tidA, err, tid)
+	}
+	oidA, err := NewOpIDFrom(bytes.NewReader(raw[:]))
+	if err != nil || !oidA.Equal(oid) {
+		t.Fatalf("NewOpIDFrom = (%v, %v), want %v", oidA, err, oid)
+	}
+
+	assertUniqueEntropyIDs(t, deterministicEntropy(1, 64), 32)
+}
+
+func assertUniqueEntropyIDs(t *testing.T, entropy io.Reader, count int) {
+	t.Helper()
+	seenTraces := make(map[string]struct{}, count)
+	seenOps := make(map[string]struct{}, count)
+	for range count {
+		gTID, gErr := NewTraceIDFrom(entropy)
+		if gErr != nil || !gTID.IsValid() || len(gTID.String()) != 32 {
+			t.Fatalf("NewTraceIDFrom failed: (%q, %v)", gTID.String(), gErr)
 		}
-		if _, dup := seenOps[oid.String()]; dup {
-			t.Fatalf("duplicate OpID generated: %s", oid.String())
+		assertNoDupID(t, "TraceID", seenTraces, gTID.String())
+
+		gOID, gErr := NewOpIDFrom(entropy)
+		if gErr != nil || !gOID.IsValid() || len(gOID.String()) != 32 {
+			t.Fatalf("NewOpIDFrom failed: (%q, %v)", gOID.String(), gErr)
 		}
-		seenOps[oid.String()] = struct{}{}
+		assertNoDupID(t, "OpID", seenOps, gOID.String())
+	}
+}
+
+func assertNoDupID(t *testing.T, label string, seen map[string]struct{}, id string) {
+	t.Helper()
+	if _, dup := seen[id]; dup {
+		t.Fatalf("duplicate %s: %s", label, id)
+	}
+	seen[id] = struct{}{}
+}
+
+func TestNewIDFromEntropyFailClosed(t *testing.T) {
+	if _, err := NewTraceIDFrom(nil); !errors.Is(err, ErrNilEntropy) {
+		t.Fatalf("NewTraceIDFrom(nil) error = %v, want ErrNilEntropy", err)
+	}
+	if _, err := NewOpIDFrom(nil); !errors.Is(err, ErrNilEntropy) {
+		t.Fatalf("NewOpIDFrom(nil) error = %v, want ErrNilEntropy", err)
+	}
+
+	short := bytes.NewReader([]byte{1, 2, 3})
+	if _, err := NewTraceIDFrom(short); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("NewTraceIDFrom(short) error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if _, err := NewOpIDFrom(bytes.NewReader([]byte{1, 2, 3})); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("NewOpIDFrom(short) error = %v, want io.ErrUnexpectedEOF", err)
+	}
+
+	readBoom := errors.New("entropy device failed")
+	if _, err := NewTraceIDFrom(failingReader{err: readBoom}); !errors.Is(err, readBoom) {
+		t.Fatalf("NewTraceIDFrom(fail) error = %v, want readBoom", err)
+	}
+	if _, err := NewOpIDFrom(failingReader{err: readBoom}); !errors.Is(err, readBoom) {
+		t.Fatalf("NewOpIDFrom(fail) error = %v, want readBoom", err)
 	}
 }
 
@@ -135,13 +205,14 @@ func TestValidTraceIDAndOpIDTextEncoding(t *testing.T) {
 
 func TestWithTraceFailClosed(t *testing.T) {
 	var nilCtx context.Context
-	tid, err := NewTraceID()
+	entropy := deterministicEntropy(10, 2)
+	tid, err := NewTraceIDFrom(entropy)
 	if err != nil {
-		t.Fatalf("NewTraceID failed: %v", err)
+		t.Fatalf("NewTraceIDFrom failed: %v", err)
 	}
-	oid, err := NewOpID()
+	oid, err := NewOpIDFrom(entropy)
 	if err != nil {
-		t.Fatalf("NewOpID failed: %v", err)
+		t.Fatalf("NewOpIDFrom failed: %v", err)
 	}
 
 	if _, err := WithTrace(nilCtx, tid, oid); !errors.Is(err, ErrNilContext) {
@@ -162,17 +233,18 @@ func TestWithTraceFailClosed(t *testing.T) {
 }
 
 func TestWithTraceAndInheritance(t *testing.T) {
-	tid, err := NewTraceID()
+	entropy := deterministicEntropy(30, 3)
+	tid, err := NewTraceIDFrom(entropy)
 	if err != nil {
-		t.Fatalf("NewTraceID failed: %v", err)
+		t.Fatalf("NewTraceIDFrom failed: %v", err)
 	}
-	oid1, err := NewOpID()
+	oid1, err := NewOpIDFrom(entropy)
 	if err != nil {
-		t.Fatalf("NewOpID failed: %v", err)
+		t.Fatalf("NewOpIDFrom failed: %v", err)
 	}
-	oid2, err := NewOpID()
+	oid2, err := NewOpIDFrom(entropy)
 	if err != nil {
-		t.Fatalf("NewOpID failed: %v", err)
+		t.Fatalf("NewOpIDFrom failed: %v", err)
 	}
 
 	parentCtx, err := WithTrace(context.Background(), tid, oid1)

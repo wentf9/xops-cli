@@ -71,6 +71,15 @@ func (q *ringQueue[T]) len() int {
 	return q.count
 }
 
+// reset 以严格零堆分配方式清零所有槽位并释放底层缓冲区，
+// 专供 DualActor panic 恢复路径清理滞留指针，避免异常或 OOM 场景下的二次切片分配。
+func (q *ringQueue[T]) reset() {
+	clear(q.buf)
+	q.buf = nil
+	q.head = 0
+	q.count = 0
+}
+
 func (q *ringQueue[T]) grow() {
 	newCap := max(ringInitCap, len(q.buf)*2)
 	q.resize(newCap)

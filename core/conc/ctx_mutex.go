@@ -67,11 +67,15 @@ func (m *CtxMutex) Unlock() {
 }
 
 // WithLock 在获取互斥锁后同步执行 fn，并保证无论 fn 正常返回、返回错误还是 panic 都会释放锁。
+// 参数校验顺序与 RunWait/RunScoped 统一：接收者/初始化 -> ctx == nil -> fn == nil -> 加锁。
 //
 //xops:syncclosure
 func (m *CtxMutex) WithLock(ctx context.Context, fn func() error) error {
 	if m == nil || !m.initialized || m.ch == nil {
 		return ErrMutexNotInitialized
+	}
+	if ctx == nil {
+		return ErrNilContext
 	}
 	if fn == nil {
 		return ErrNilTask

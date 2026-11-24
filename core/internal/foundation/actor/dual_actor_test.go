@@ -667,3 +667,144 @@ func TestRingQueueWrapGrowAndShrink(t *testing.T) {
 		t.Fatalf("q.len() after drain = %d, want 0", q.len())
 	}
 }
+
+func TestRingQueueResetZeroAllocsAndClearsPointers(t *testing.T) {
+	var q ringQueue[*panicCtrlPayload]
+	for range 128 {
+		q.push(&panicCtrlPayload{tag: "live"})
+	}
+	backing := q.buf
+	allocs := testing.AllocsPerRun(20, func() {
+		q.reset()
+	})
+	if allocs != 0 {
+		t.Fatalf("ringQueue.reset() allocs = %v, want 0", allocs)
+	}
+	if q.buf != nil || q.head != 0 || q.count != 0 {
+		t.Fatalf("reset state invalid: buf=%v head=%d count=%d", q.buf, q.head, q.count)
+	}
+	if hasNonNilCtrlSlot(backing) {
+		t.Fatal("reset did not zero retained pointers in backing array")
+	}
+}
+
+func TestDualActorControlStopDuringAcquireDrainsPendingFIFO(t *testing.T) {
+	var mu sync.Mutex
+	var normalReqs, drainedReqs []string
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+
+	a := mustNewControlStopActor(t, &mu, &normalReqs, &drainedReqs, firstStarted, releaseFirst)
+
+	err := conc.RunWait(context.Background(), func(ctx context.Context, n *conc.Nursery) error {
+		return driveControlStopDuringAcquire(t, ctx, n, a, firstStarted, releaseFirst)
+	})
+	if err != nil {
+		t.Fatalf("RunWait failed: %v", err)
+	}
+
+	assertStringSliceEqual(t, "normalReqs", normalReqs, []string{"req-0"})
+	assertStringSliceEqual(t, "drainedReqs", drainedReqs, []string{"req-1", "req-2"})
+}
+
+func mustNewControlStopActor(
+	t *testing.T,
+	mu *sync.Mutex,
+	normalReqs *[]string,
+	drainedReqs *[]string,
+	firstStarted chan struct{},
+	releaseFirst <-chan struct{},
+) *DualActor[string, string] {
+	t.Helper()
+	var a *DualActor[string, string]
+	var err error
+	a, err = NewDualActor(DualActorConfig[string, string]{
+		AcquireBuffer: 8,
+		OnRequest: func(req string) {
+			if req == "req-0" {
+				close(firstStarted)
+				<-releaseFirst
+			}
+			mu.Lock()
+			*normalReqs = append(*normalReqs, req)
+			mu.Unlock()
+		},
+		OnDrainRequest: func(req string) {
+			mu.Lock()
+			*drainedReqs = append(*drainedReqs, req)
+			mu.Unlock()
+		},
+		OnControl: func(ctrl string) {
+			if ctrl == "halt-stop" {
+				a.Stop()
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDualActor failed: %v", err)
+	}
+	return a
+}
+
+func driveControlStopDuringAcquire(
+	t *testing.T,
+	ctx context.Context,
+	n *conc.Nursery,
+	a *DualActor[string, string],
+	firstStarted <-chan struct{},
+	releaseFirst chan struct{},
+) error {
+	t.Helper()
+	if goErr := n.Go(a.Run); goErr != nil {
+		return goErr
+	}
+	if sendErr := a.SendAcquire(ctx, "req-0"); sendErr != nil {
+		return sendErr
+	}
+	<-firstStarted
+
+	// 先入队 req-1/req-2，再在控制队列放入 halt-stop；放行后无论 step 先选中 acquireCh 还是 controlReady，
+	// req-1 与 req-2 均绝不可进入普通 OnRequest，且必须在 OnDrainRequest 中保持严格 FIFO 顺序。
+	for _, r := range []string{"req-1", "req-2"} {
+		if sendErr := a.SendAcquire(ctx, r); sendErr != nil {
+			return sendErr
+		}
+	}
+	if !a.SendControl("halt-stop") {
+		t.Fatal("SendControl(halt-stop) returned false")
+	}
+	close(releaseFirst)
+	<-a.Done()
+	return nil
+}
+
+func TestDualActorStopPriorityOverConcurrentContextCancel(t *testing.T) {
+	for range 32 {
+		a, err := NewDualActor(DualActorConfig[int, int]{
+			AcquireBuffer: 2,
+			OnRequest:     func(int) {},
+			OnControl:     func(int) {},
+		})
+		if err != nil {
+			t.Fatalf("NewDualActor failed: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		a.Stop()
+		cancel()
+		if runErr := a.Run(ctx); runErr != nil {
+			t.Fatalf("Run with both Stop and canceled ctx = %v, want nil (stopCh priority)", runErr)
+		}
+	}
+}
+
+func assertStringSliceEqual(t *testing.T, label string, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s = %v, want %v", label, got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("%s[%d] = %q, want %q (full=%v)", label, i, got[i], want[i], got)
+		}
+	}
+}

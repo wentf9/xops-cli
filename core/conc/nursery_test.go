@@ -39,11 +39,17 @@ func TestNurseryNilAndUninitializedFailClosed(t *testing.T) {
 	if err := RunWait(nilCtx, func(context.Context, *Nursery) error { return nil }); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("RunWait(nil) error = %v, want ErrNilContext", err)
 	}
+	if err := RunWait(nilCtx, nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("RunWait(nil, nil) error = %v, want ErrNilContext", err)
+	}
 	if err := RunWait(context.Background(), nil); !errors.Is(err, ErrNilTask) {
 		t.Fatalf("RunWait(ctx, nil) error = %v, want ErrNilTask", err)
 	}
 	if err := RunScoped(nilCtx, func(context.Context, *Nursery) error { return nil }); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("RunScoped(nil) error = %v, want ErrNilContext", err)
+	}
+	if err := RunScoped(nilCtx, nil); !errors.Is(err, ErrNilContext) {
+		t.Fatalf("RunScoped(nil, nil) error = %v, want ErrNilContext", err)
 	}
 	if err := RunScoped(context.Background(), nil); !errors.Is(err, ErrNilTask) {
 		t.Fatalf("RunScoped(ctx, nil) error = %v, want ErrNilTask", err)
@@ -519,8 +525,159 @@ func TestPanicErrorNilSafe(t *testing.T) {
 	if nilPErr.Value() != nil || nilPErr.Stack() != nil {
 		t.Fatal("nil PanicError Value/Stack must be nil")
 	}
-	noStack := newPanicError(42, nil)
-	if !errors.Is(noStack, ErrTaskPanicked) || !strings.Contains(noStack.Error(), "42") {
+	if noStack := newPanicError(42, nil); !errors.Is(noStack, ErrTaskPanicked) || !strings.Contains(noStack.Error(), "42") {
 		t.Fatalf("noStack = %v", noStack)
+	}
+}
+
+// reentrantCheckCtx 用于验证 closeCompleted 严格遵守锁纪律：在 Err() 中反向调用 Nursery.Cancel/Go 绝不产生 AB-BA 死锁。
+type reentrantCheckCtx struct {
+	context.Context
+	onErr func()
+}
+
+func (c *reentrantCheckCtx) Err() error {
+	if c.onErr != nil {
+		c.onErr()
+	}
+	return c.Context.Err()
+}
+
+func TestNurseryRunScopedNeverLeaksPrivateSentinelOnConcurrentParentCancel(t *testing.T) {
+	for range 64 {
+		parentCtx, cancelParent := context.WithCancel(context.Background())
+		started := make(chan struct{})
+		err := RunScoped(parentCtx, func(_ context.Context, n *Nursery) error {
+			if goErr := n.Go(func(childCtx context.Context) error {
+				close(started)
+				<-childCtx.Done()
+				return context.Cause(childCtx)
+			}); goErr != nil {
+				return goErr
+			}
+			<-started
+			// 并发取消父上下文与主回调正常退出，验证绝不会外泄任何私有哨兵，且非 nil 错误必为 context.Canceled。
+			go cancelParent()
+			return nil
+		})
+		cancelParent()
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunScoped leaked non-context.Canceled error = %v", err)
+		}
+		if err != nil && strings.Contains(err.Error(), "scope completed") {
+			t.Fatalf("RunScoped leaked private sentinel string: %v", err)
+		}
+	}
+}
+
+func TestNurseryRunScopedWrappedCauseIsStandardContextCanceled(t *testing.T) {
+	err := runScopedWithDaemonError(t, func(childCtx context.Context) error {
+		return fmt.Errorf("flush cause: %w", context.Cause(childCtx))
+	})
+	if err == nil {
+		t.Fatal("expected preserved wrapped cause error, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("wrapped cause error = %v, want errors.Is(context.Canceled)", err)
+	}
+	if strings.Contains(err.Error(), "scope completed") {
+		t.Fatalf("wrapped cause error leaked private sentinel: %v", err)
+	}
+}
+
+func TestNurseryRunScopedAbsorbingStatePreventsSiblingCancelPollution(t *testing.T) {
+	errFlush := errors.New("flush failed")
+	s1 := make(chan struct{})
+	s2 := make(chan struct{})
+	c1Done := make(chan struct{})
+
+	err := RunScoped(context.Background(), func(_ context.Context, n *Nursery) error {
+		if goErr := n.Go(func(childCtx context.Context) error {
+			close(s1)
+			<-childCtx.Done()
+			// 模拟清理中触发 n.Cancel(nil) 并返回真实故障 errFlush：不可逆吸收态绝不可被降级，
+			// 从而避免污染仍在退场的兄弟协程 c2。
+			n.Cancel(nil)
+			defer close(c1Done)
+			return errFlush
+		}); goErr != nil {
+			return goErr
+		}
+		if goErr := n.Go(func(childCtx context.Context) error {
+			close(s2)
+			<-childCtx.Done()
+			<-c1Done
+			return childCtx.Err()
+		}); goErr != nil {
+			return goErr
+		}
+		<-s1
+		<-s2
+		return nil
+	})
+
+	if !errors.Is(err, errFlush) {
+		t.Fatalf("RunScoped error = %v, want errFlush", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("RunScoped error = %v, must not be polluted by sibling context.Canceled", err)
+	}
+}
+
+func TestNurseryCloseCompletedDoesNotHoldMutexAcrossParentErr(t *testing.T) {
+	var target *Nursery
+	var called atomic.Bool
+	rCtx := &reentrantCheckCtx{
+		Context: context.Background(),
+		onErr: func() {
+			if target != nil && called.CompareAndSwap(false, true) {
+				target.Cancel(nil)
+				_ = target.Go(func(context.Context) error { return nil })
+			}
+		},
+	}
+
+	err := RunScoped(rCtx, func(_ context.Context, n *Nursery) error {
+		target = n
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunScoped with reentrant parentCtx.Err failed: %v", err)
+	}
+	if !called.Load() {
+		t.Fatal("reentrant parentCtx.Err hook was not invoked")
+	}
+}
+
+func TestNurseryExplicitCloseInRunScopedPreservesChildCancelAndPreCancelNotSwallowed(t *testing.T) {
+	// 场景 1：主回调内显式调用 n.Close() 再返回 nil，子协程因显式 Close 返回的 context.Canceled 不可被误吞。
+	started := make(chan struct{})
+	err := RunScoped(context.Background(), func(_ context.Context, n *Nursery) error {
+		if goErr := n.Go(func(childCtx context.Context) error {
+			close(started)
+			<-childCtx.Done()
+			return childCtx.Err()
+		}); goErr != nil {
+			return goErr
+		}
+		<-started
+		_ = n.Close()
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("explicit Close inside RunScoped error = %v, want context.Canceled", err)
+	}
+
+	// 场景 2：在 n.ctx 尚未取消前（模拟解锁与 n.cancel(nil) 之间的抢占窗口），filterExpectedScopeCancel 绝不可误吞裸 context.Canceled。
+	n, newErr := NewNursery(context.Background())
+	if newErr != nil {
+		t.Fatalf("NewNursery failed: %v", newErr)
+	}
+	defer func() { _ = n.Close() }()
+	n.mu.Lock()
+	n.state = nurseryScopedCompleting
+	n.mu.Unlock()
+	if got := n.filterExpectedScopeCancel(context.Canceled); !errors.Is(got, context.Canceled) {
+		t.Fatalf("filterExpectedScopeCancel before n.ctx cancel = %v, want context.Canceled", got)
 	}
 }
