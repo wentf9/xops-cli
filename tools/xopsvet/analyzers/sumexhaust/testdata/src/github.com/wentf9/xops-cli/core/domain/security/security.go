@@ -505,3 +505,136 @@ func validDeferCleanupDefault(d GuardrailDecision) bool {
 		return false
 	}
 }
+
+// Challenger 4 - Challenge 2: 返回闭包体内嵌套 defer/go/IIFE 与局部函数变量调用的放行篡改。
+func invalidDeferInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) { // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+			defer func() {
+				ok = true
+			}()
+			return false
+		}()
+	}
+}
+
+func invalidGoInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) { // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+			go func() {
+				ok = true
+			}()
+			return false
+		}()
+	}
+}
+
+func invalidNestedIIFEInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) { // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+			func() {
+				ok = true
+			}()
+			return
+		}()
+	}
+}
+
+func invalidDeferVarInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) { // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+			fn := func() {
+				ok = true
+			}
+			defer fn()
+			return false
+		}()
+	}
+}
+
+func invalidDeferNestedIIFEInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) { // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+			defer func() {
+				func() {
+					ok = true
+				}()
+			}()
+			return false
+		}()
+	}
+}
+
+func validDeferCleanupInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) {
+			defer func() {
+				_ = "cleanup"
+			}()
+			return false
+		}()
+	}
+}
+
+func validDeferShadowedOkInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) {
+			defer func() {
+				ok := true
+				_ = ok
+			}()
+			return false
+		}()
+	}
+}
+
+func validNestedIIFEFailClosedInsideFuncLitDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() (ok bool) {
+			func() {
+				ok = false
+			}()
+			return
+		}()
+	}
+}

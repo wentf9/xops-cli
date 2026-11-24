@@ -387,3 +387,61 @@ func checkGenWithFnMissing(g GenWithFn[int]) int {
 		return 0
 	}
 }
+
+// Challenger 4 - Challenge 1: 匿名接口签名含类型参数的多参泛型变体（含嵌入接口方法集）不得被漏检或误报。
+type InnerVal[T any] interface {
+	Val() T
+}
+
+type GenIfaceIface[T any] interface {
+	sealedGenIface()
+	Get() interface{ Val() T }
+}
+
+type ConcreteIfaceImpl struct{}
+
+func (ConcreteIfaceImpl) sealedGenIface() {}
+func (ConcreteIfaceImpl) Get() interface{ Val() int } {
+	return nil
+}
+
+type IfaceMulti[A, B any] struct{}
+
+func (IfaceMulti[A, B]) sealedGenIface() {}
+func (IfaceMulti[A, B]) Get() interface{ Val() A } {
+	return nil
+}
+
+type IfaceEmbeddedMulti[A, B any] struct{}
+
+func (IfaceEmbeddedMulti[A, B]) sealedGenIface() {}
+func (IfaceEmbeddedMulti[A, B]) Get() interface{ InnerVal[A] } {
+	return nil
+}
+
+type BadIfaceSlice[A, B any] struct{}
+
+func (BadIfaceSlice[A, B]) sealedGenIface() {}
+func (BadIfaceSlice[A, B]) Get() interface{ Val() []A } {
+	return nil
+}
+
+func checkGenIfaceIfaceValid(g GenIfaceIface[int]) int {
+	switch g.(type) {
+	case ConcreteIfaceImpl, *ConcreteIfaceImpl,
+		IfaceMulti[int, string], *IfaceMulti[int, string],
+		IfaceEmbeddedMulti[int, bool], *IfaceEmbeddedMulti[int, bool]:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func checkGenIfaceIfaceMissing(g GenIfaceIface[int]) int {
+	switch g.(type) { // want "sumexhaust: 对封闭接口 GenIfaceIface\\[int\\] 的 type switch 缺少变体: IfaceEmbeddedMulti\\[A, B any\\], \\*IfaceEmbeddedMulti\\[A, B any\\], IfaceMulti\\[A, B any\\], \\*IfaceMulti\\[A, B any\\]"
+	case ConcreteIfaceImpl, *ConcreteIfaceImpl:
+		return 1
+	default:
+		return 0
+	}
+}

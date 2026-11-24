@@ -81,24 +81,23 @@ func funcLitHasFailOpenReturn(
 	st defaultScanState,
 	visited map[*ast.FuncLit]bool,
 ) bool {
+	return inspectFuncLitBody(info, lit, st, visited, false)
+}
+
+func inspectFuncLitBody(
+	info *types.Info,
+	lit *ast.FuncLit,
+	st defaultScanState,
+	visited map[*ast.FuncLit]bool,
+	sharePermissive bool,
+) bool {
 	if info == nil || lit == nil || lit.Body == nil || visited[lit] {
 		return false
 	}
 	visited[lit] = true
+	defer delete(visited, lit)
 	litSig, _ := info.TypeOf(lit).(*types.Signature)
-	subState := defaultScanState{
-		pass:           st.pass,
-		sig:            litSig,
-		inTest:         st.inTest,
-		permissiveVars: maps.Clone(st.permissiveVars),
-		funcLitVars:    maps.Clone(st.funcLitVars),
-	}
-	if subState.permissiveVars == nil {
-		subState.permissiveVars = make(map[*types.Var]bool)
-	}
-	if subState.funcLitVars == nil {
-		subState.funcLitVars = make(map[*types.Var]*ast.FuncLit)
-	}
+	subState := buildFuncLitSubState(litSig, st, visited, sharePermissive)
 	failOpen := false
 	ast.Inspect(lit.Body, func(n ast.Node) bool {
 		if n == nil || failOpen {
@@ -113,6 +112,33 @@ func funcLitHasFailOpenReturn(
 	return failOpen
 }
 
+func buildFuncLitSubState(
+	litSig *types.Signature,
+	st defaultScanState,
+	visited map[*ast.FuncLit]bool,
+	sharePermissive bool,
+) defaultScanState {
+	permVars := st.permissiveVars
+	if !sharePermissive {
+		permVars = maps.Clone(st.permissiveVars)
+	}
+	if permVars == nil {
+		permVars = make(map[*types.Var]bool)
+	}
+	fnVars := maps.Clone(st.funcLitVars)
+	if fnVars == nil {
+		fnVars = make(map[*types.Var]*ast.FuncLit)
+	}
+	return defaultScanState{
+		pass:           st.pass,
+		sig:            litSig,
+		inTest:         st.inTest,
+		permissiveVars: permVars,
+		funcLitVars:    fnVars,
+		visitedLits:    visited,
+	}
+}
+
 func inspectFuncLitNode(
 	info *types.Info,
 	n ast.Node,
@@ -125,8 +151,36 @@ func inspectFuncLitNode(
 		trackPairBindingsSilent(info, node.Lhs, node.Rhs, node.Tok == token.DEFINE, st, visited)
 	case *ast.ValueSpec:
 		trackPairBindingsSilent(info, identSliceToExprs(node.Names), node.Values, true, st, visited)
+	case *ast.ExprStmt:
+		return inspectNestedFuncLitStmt(info, node.X, nil, st, visited)
+	case *ast.DeferStmt:
+		return inspectNestedFuncLitStmt(info, node.Call, litSig, st, visited)
+	case *ast.GoStmt:
+		return inspectNestedFuncLitStmt(info, node.Call, litSig, st, visited)
 	case *ast.ReturnStmt:
 		return funcLitReturnIsFailOpen(info, litSig, node, st, visited)
+	}
+	return false
+}
+
+// inspectNestedFuncLitStmt 追踪闭包体内部嵌套调用的匿名/局部函数变量（ExprStmt/DeferStmt/GoStmt），
+// 共享外层 permissiveVars 以捕获对命名返回值的放行覆写。
+func inspectNestedFuncLitStmt(
+	info *types.Info,
+	callExpr ast.Expr,
+	deferGoOuterSig *types.Signature,
+	st defaultScanState,
+	visited map[*ast.FuncLit]bool,
+) bool {
+	lit := resolveCalledFuncLit(info, callExpr, st.funcLitVars)
+	if lit == nil {
+		return false
+	}
+	if inspectFuncLitBody(info, lit, st, visited, true) {
+		return true
+	}
+	if deferGoOuterSig != nil {
+		return hasPermissiveNamedResult(deferGoOuterSig, st.permissiveVars)
 	}
 	return false
 }
