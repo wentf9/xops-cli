@@ -219,6 +219,27 @@ func AllowSysExecEnv(info PkgInfo) bool {
 	return !info.IsExternalTest && info.Layer == LayerHostSys
 }
 
+// AllowBareGo 判断包是否位于裸 go 语句白名单内（仅限 core/internal/foundation/conc）。
+func AllowBareGo(info PkgInfo) bool {
+	return !info.IsExternalTest && info.Layer == LayerCoreFoundationConc
+}
+
+// AllowSecretPlaintext 判断包是否位于明文机密 []byte 消费白名单内
+// （仅限 core/domain/secret、internal/host/vault 与 core/internal/sshnet/dial）。
+func AllowSecretPlaintext(info PkgInfo) bool {
+	if info.IsExternalTest {
+		return false
+	}
+	switch info.Layer {
+	case LayerHostVault, LayerCoreSSHNetDial:
+		return true
+	case LayerCoreDomain:
+		return matchBaseSubpkg(info.BasePath, ModulePrefix+"/core/domain/secret")
+	default:
+		return false
+	}
+}
+
 // AllowNolint 判断包是否位于 AGENTS.md §3 规定的行内 //nolint: 特权白名单包集合内。
 func AllowNolint(info PkgInfo) bool {
 	if info.IsExternalTest {

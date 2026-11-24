@@ -13,16 +13,18 @@ import (
 )
 
 type pkgCase struct {
-	name          string
-	pkgPath       string
-	wantLayer     vetutil.Layer
-	wantExtTest   bool
-	wantXops      bool
-	wantAllowCtx  bool
-	wantAllowOSFS bool
-	wantAllowSys  bool
-	wantAllowNol  bool
-	wantIsCore    bool
+	name            string
+	pkgPath         string
+	wantLayer       vetutil.Layer
+	wantExtTest     bool
+	wantXops        bool
+	wantAllowCtx    bool
+	wantAllowOSFS   bool
+	wantAllowSys    bool
+	wantAllowNol    bool
+	wantAllowBareGo bool
+	wantAllowSecret bool
+	wantIsCore      bool
 }
 
 func TestClassifyPackageAndWhitelists(t *testing.T) {
@@ -35,12 +37,21 @@ func TestClassifyPackageAndWhitelists(t *testing.T) {
 			wantIsCore: true,
 		},
 		{
-			name:         "domain_secret_nolint_whitelist",
-			pkgPath:      "github.com/wentf9/xops-cli/core/domain/secret",
-			wantLayer:    vetutil.LayerCoreDomain,
-			wantXops:     true,
-			wantAllowNol: true,
-			wantIsCore:   true,
+			name:            "domain_secret_nolint_whitelist",
+			pkgPath:         "github.com/wentf9/xops-cli/core/domain/secret",
+			wantLayer:       vetutil.LayerCoreDomain,
+			wantXops:        true,
+			wantAllowNol:    true,
+			wantAllowSecret: true,
+			wantIsCore:      true,
+		},
+		{
+			name:        "domain_secret_external_test_denied",
+			pkgPath:     "github.com/wentf9/xops-cli/core/domain/secret_test",
+			wantLayer:   vetutil.LayerCoreDomain,
+			wantExtTest: true,
+			wantXops:    true,
+			wantIsCore:  true,
 		},
 		{
 			name:       "ports_tck",
@@ -66,6 +77,23 @@ func TestClassifyPackageAndWhitelists(t *testing.T) {
 			wantIsCore:    true,
 		},
 		{
+			name:            "conc",
+			pkgPath:         "github.com/wentf9/xops-cli/core/internal/foundation/conc",
+			wantLayer:       vetutil.LayerCoreFoundationConc,
+			wantXops:        true,
+			wantAllowNol:    true,
+			wantAllowBareGo: true,
+			wantIsCore:      true,
+		},
+		{
+			name:        "conc_external_test_denied",
+			pkgPath:     "github.com/wentf9/xops-cli/core/internal/foundation/conc_test",
+			wantLayer:   vetutil.LayerCoreFoundationConc,
+			wantExtTest: true,
+			wantXops:    true,
+			wantIsCore:  true,
+		},
+		{
 			name:         "trace",
 			pkgPath:      "github.com/wentf9/xops-cli/core/internal/foundation/trace",
 			wantLayer:    vetutil.LayerCoreFoundationTrace,
@@ -89,6 +117,23 @@ func TestClassifyPackageAndWhitelists(t *testing.T) {
 			wantXops:     true,
 			wantAllowSys: true,
 			wantAllowNol: true,
+		},
+		{
+			name:            "vault",
+			pkgPath:         "github.com/wentf9/xops-cli/internal/host/vault",
+			wantLayer:       vetutil.LayerHostVault,
+			wantXops:        true,
+			wantAllowNol:    true,
+			wantAllowSecret: true,
+		},
+		{
+			name:            "sshnet_dial",
+			pkgPath:         "github.com/wentf9/xops-cli/core/internal/sshnet/dial",
+			wantLayer:       vetutil.LayerCoreSSHNetDial,
+			wantXops:        true,
+			wantAllowNol:    true,
+			wantAllowSecret: true,
+			wantIsCore:      true,
 		},
 		{
 			name:       "mcpruntime",
@@ -135,6 +180,12 @@ func assertPkgCase(t *testing.T, tc pkgCase) {
 	}
 	if vetutil.AllowNolint(info) != tc.wantAllowNol {
 		t.Fatalf("AllowNolint=%v, want %v", !tc.wantAllowNol, tc.wantAllowNol)
+	}
+	if vetutil.AllowBareGo(info) != tc.wantAllowBareGo {
+		t.Fatalf("AllowBareGo=%v, want %v", !tc.wantAllowBareGo, tc.wantAllowBareGo)
+	}
+	if vetutil.AllowSecretPlaintext(info) != tc.wantAllowSecret {
+		t.Fatalf("AllowSecretPlaintext=%v, want %v", !tc.wantAllowSecret, tc.wantAllowSecret)
 	}
 	if vetutil.IsCoreLayer(info.Layer) != tc.wantIsCore {
 		t.Fatalf("IsCoreLayer=%v, want %v", !tc.wantIsCore, tc.wantIsCore)

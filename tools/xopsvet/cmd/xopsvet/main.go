@@ -7,8 +7,10 @@ import (
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/archbound"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/digestcover"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/failclosed"
+	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/linearlease"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/noimplicit"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/osboundary"
+	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/secrettaint"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/sumexhaust"
 )
 
@@ -20,5 +22,7 @@ func main() {
 		sumexhaust.NewAnalyzer(),
 		failclosed.NewAnalyzer(),
 		digestcover.NewAnalyzer(),
+		linearlease.NewAnalyzer(),
+		secrettaint.NewAnalyzer(),
 	)
 }

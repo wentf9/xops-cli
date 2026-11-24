@@ -159,6 +159,98 @@ func TypeSpecHasDirective(gen *ast.GenDecl, ts *ast.TypeSpec, kind DirectiveKind
 	return gen != nil && len(gen.Specs) == 1 && HasDirective(gen.Doc, kind)
 }
 
+// FieldHasDirective 判断字段或形参声明 f（含文档注释与行尾注释）是否包含指定类型的 //xops:* 指令。
+func FieldHasDirective(f *ast.Field, kind DirectiveKind) bool {
+	if f == nil {
+		return false
+	}
+	return HasDirective(f.Doc, kind) || HasDirective(f.Comment, kind)
+}
+
+// FuncDeclHasDirective 判断函数或方法声明 fn 的文档注释中是否包含指定类型的 //xops:* 指令。
+func FuncDeclHasDirective(fn *ast.FuncDecl, kind DirectiveKind) bool {
+	if fn == nil {
+		return false
+	}
+	return HasDirective(fn.Doc, kind)
+}
+
+// ParamFieldHasDirective 判断函数形参列表 fl 中第 idx 个字段是否带有指定 //xops:* 指令。
+// 由于 go/parser 不会将函数参数列表内的注释挂载到 ast.Field.Doc/Comment，
+// 本函数结合文件注释列表 comments 与源码行号，支持参数上方独立行注释、行尾注释及前置块注释。
+func ParamFieldHasDirective(
+	fset *token.FileSet,
+	comments []*ast.CommentGroup,
+	fl *ast.FieldList,
+	idx int,
+	kind DirectiveKind,
+) bool {
+	if fl == nil || idx < 0 || idx >= len(fl.List) {
+		return false
+	}
+	f := fl.List[idx]
+	if FieldHasDirective(f, kind) {
+		return true
+	}
+	if fset == nil || len(comments) == 0 {
+		return false
+	}
+	return paramCommentsHaveDirective(fset, comments, fl, idx, kind)
+}
+
+func paramCommentsHaveDirective(
+	fset *token.FileSet,
+	comments []*ast.CommentGroup,
+	fl *ast.FieldList,
+	idx int,
+	kind DirectiveKind,
+) bool {
+	f := fl.List[idx]
+	prevEnd := fl.Opening
+	if idx > 0 {
+		prevEnd = fl.List[idx-1].End()
+	}
+	nextPos := fl.Closing
+	hasNextField := idx+1 < len(fl.List)
+	if hasNextField {
+		nextPos = fl.List[idx+1].Pos()
+	}
+	prevEndLine := fset.Position(prevEnd).Line
+	startLine := fset.Position(f.Pos()).Line
+	endLine := fset.Position(f.End()).Line
+	sameLineNext := hasNextField && fset.Position(nextPos).Line == endLine
+
+	for _, cg := range comments {
+		if !HasDirective(cg, kind) {
+			continue
+		}
+		if matchesParamComment(fset, cg, f, prevEnd, nextPos, prevEndLine, startLine, endLine, sameLineNext) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesParamComment(
+	fset *token.FileSet,
+	cg *ast.CommentGroup,
+	f *ast.Field,
+	prevEnd, nextPos token.Pos,
+	prevEndLine, startLine, endLine int,
+	sameLineNext bool,
+) bool {
+	if cg.End() < f.Pos() && cg.Pos() > prevEnd && fset.Position(cg.Pos()).Line > prevEndLine {
+		return true
+	}
+	if cg.End() <= f.Pos() && cg.Pos() > prevEnd && fset.Position(cg.End()).Line == startLine {
+		return len(cg.List) > 0 && strings.HasPrefix(cg.List[0].Text, "/*")
+	}
+	if cg.Pos() > f.End() && cg.End() <= nextPos && fset.Position(cg.Pos()).Line == endLine {
+		return !sameLineNext
+	}
+	return false
+}
+
 // HasNolintComment 判断单条 AST 注释是否为 golangci-lint 的 //nolint 指令。
 // 仅在去除注释定界符后的行首满足 "nolint" 且后续为行尾、冒号或空白时返回 true，
 // 以避免对说明性中文注释中的 "//nolint:" 字样产生自检误报。

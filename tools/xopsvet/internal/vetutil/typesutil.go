@@ -50,6 +50,31 @@ func IsErrorInterfaceType(t types.Type) bool {
 	return errObj != nil && types.Identical(t, errObj.Type())
 }
 
+// ImplementsError 判断类型 t 或其指针类型 *t 是否实现 Go 内置 error 接口。
+func ImplementsError(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	errObj := types.Universe.Lookup("error")
+	if errObj == nil {
+		return false
+	}
+	errIface, ok := errObj.Type().Underlying().(*types.Interface)
+	if !ok {
+		return false
+	}
+	u := types.Unalias(t)
+	if types.Implements(u, errIface) {
+		return true
+	}
+	if _, isPtr := u.(*types.Pointer); !isPtr {
+		if _, isIface := u.(*types.Interface); !isIface {
+			return types.Implements(types.NewPointer(u), errIface)
+		}
+	}
+	return false
+}
+
 // UnwrapNamedType 解引用类型别名及单层指针，提取命名类型 *types.Named。
 func UnwrapNamedType(t types.Type) (*types.Named, bool) {
 	if t == nil {
