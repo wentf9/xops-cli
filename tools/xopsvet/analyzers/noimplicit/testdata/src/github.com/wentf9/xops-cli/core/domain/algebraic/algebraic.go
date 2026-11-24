@@ -2,10 +2,12 @@ package algebraic
 
 import "time"
 
-type Duration int64
+type Duration struct {
+	d time.Duration
+}
 
 func FromStdDuration(d time.Duration) Duration {
-	return Duration(d)
+	return Duration{d: d}
 }
 
 type Config struct {

@@ -46,6 +46,9 @@ func checkFuncRemotePath(pass *analysis.Pass, ftype *ast.FuncType, body *ast.Blo
 	})
 }
 
+// collectRemoteDerivedVars 在函数作用域内执行 4 轮不动点数据流传播，
+// 追踪由 RemotePath 参数/返回值/字面量派生出的局部变量（如 s1 := rp.String(); s2 := s1 + "/a"），
+// 以拦截经过多步变量传递或 range 循环后才传入 path/filepath.* 的调用。
 func collectRemoteDerivedVars(info *types.Info, ftype *ast.FuncType, body *ast.BlockStmt) map[types.Object]bool {
 	remoteVars := make(map[types.Object]bool)
 	seedFieldListRemoteVars(info, ftype, remoteVars)
@@ -93,6 +96,8 @@ func scanStmtRemoteVars(info *types.Info, n ast.Node, remoteVars map[types.Objec
 		return scanAssignRemoteVars(info, stmt.Lhs, stmt.Rhs, remoteVars)
 	case *ast.ValueSpec:
 		return scanValueSpecRemoteVars(info, stmt, remoteVars)
+	case *ast.RangeStmt:
+		return scanRangeRemoteVars(info, stmt, remoteVars)
 	default:
 		return false
 	}
@@ -104,23 +109,44 @@ func scanAssignRemoteVars(info *types.Info, lhs, rhs []ast.Expr, remoteVars map[
 	}
 	changed := false
 	for i := range lhs {
-		if !exprHasRemotePath(info, rhs[i], remoteVars) {
-			continue
-		}
-		id, ok := ast.Unparen(lhs[i]).(*ast.Ident)
-		if !ok {
-			continue
-		}
-		obj := info.Defs[id]
-		if obj == nil {
-			obj = info.Uses[id]
-		}
-		if obj != nil && !remoteVars[obj] {
-			remoteVars[obj] = true
+		if exprHasRemotePath(info, rhs[i], remoteVars) && markExprRemoteVar(info, lhs[i], remoteVars) {
 			changed = true
 		}
 	}
 	return changed
+}
+
+func scanRangeRemoteVars(info *types.Info, stmt *ast.RangeStmt, remoteVars map[types.Object]bool) bool {
+	if stmt.Tok != token.ASSIGN && stmt.Tok != token.DEFINE {
+		return false
+	}
+	if !exprHasRemotePath(info, stmt.X, remoteVars) {
+		return false
+	}
+	changed := markExprRemoteVar(info, stmt.Key, remoteVars)
+	if markExprRemoteVar(info, stmt.Value, remoteVars) {
+		changed = true
+	}
+	return changed
+}
+
+func markExprRemoteVar(info *types.Info, expr ast.Expr, remoteVars map[types.Object]bool) bool {
+	if expr == nil {
+		return false
+	}
+	id, ok := ast.Unparen(expr).(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return false
+	}
+	obj := info.Defs[id]
+	if obj == nil {
+		obj = info.Uses[id]
+	}
+	if obj == nil || remoteVars[obj] {
+		return false
+	}
+	remoteVars[obj] = true
+	return true
 }
 
 func scanValueSpecRemoteVars(info *types.Info, vs *ast.ValueSpec, remoteVars map[types.Object]bool) bool {
@@ -140,10 +166,57 @@ func scanValueSpecRemoteVars(info *types.Info, vs *ast.ValueSpec, remoteVars map
 	return changed
 }
 
+// isRemotePathType 判断类型 t 本身或其容器元素/泛型实参是否为 RemotePath。
+// 刻意不递归穿透普通结构体字段，防止含 RemotePath 字段的结构体（如 CopyTask{LocalDir, RemoteDest}）
+// 污染同结构体内完全合法的本地路径字段与方法（如 task.LocalDir / task.LocalFile()）。
 func isRemotePathType(t types.Type) bool {
-	return vetutil.TypeContains(t, func(n *types.Named) bool {
-		return n.Obj() != nil && n.Obj().Name() == "RemotePath"
-	})
+	return hasRemotePathType(t, make(map[types.Type]bool))
+}
+
+func hasRemotePathType(t types.Type, seen map[types.Type]bool) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	if named, ok := t.(*types.Named); ok {
+		return namedIsRemotePath(named, seen)
+	}
+	switch v := t.(type) {
+	case *types.Pointer:
+		return hasRemotePathType(v.Elem(), seen)
+	case *types.Slice:
+		return hasRemotePathType(v.Elem(), seen)
+	case *types.Array:
+		return hasRemotePathType(v.Elem(), seen)
+	case *types.Chan:
+		return hasRemotePathType(v.Elem(), seen)
+	case *types.Map:
+		return hasRemotePathType(v.Key(), seen) || hasRemotePathType(v.Elem(), seen)
+	default:
+		return false
+	}
+}
+
+func namedIsRemotePath(named *types.Named, seen map[types.Type]bool) bool {
+	if named.Obj() != nil && named.Obj().Name() == "RemotePath" {
+		return true
+	}
+	if seen[named] {
+		return false
+	}
+	seen[named] = true
+	if typeArgs := named.TypeArgs(); typeArgs != nil {
+		for i := 0; i < typeArgs.Len(); i++ {
+			if hasRemotePathType(typeArgs.At(i), seen) {
+				return true
+			}
+		}
+	}
+	// 仅展开非结构体底层类型（如自定义切片别名），绝不展开结构体字段。
+	if _, isStruct := named.Underlying().(*types.Struct); isStruct {
+		return false
+	}
+	return hasRemotePathType(named.Underlying(), seen)
 }
 
 func isFilepathCall(info *types.Info, call *ast.CallExpr) bool {
@@ -196,8 +269,21 @@ func callExprHasRemotePath(info *types.Info, call *ast.CallExpr, remoteVars map[
 	return callArgsHaveRemotePath(info, call, remoteVars)
 }
 
+// compositeHasRemotePath 仅追踪切片、数组与 Map 字面量（如 []string{rp.String()}）中的远端路径，
+// 跳过结构体复合字面量（如 CopyTask{"/local", rp}），防止整值结构体变量被误标为污染。
 func compositeHasRemotePath(info *types.Info, lit *ast.CompositeLit, remoteVars map[types.Object]bool) bool {
+	if t := info.TypeOf(lit); t != nil {
+		if _, isStruct := types.Unalias(t).Underlying().(*types.Struct); isStruct {
+			return false
+		}
+	}
 	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			if exprHasRemotePath(info, kv.Key, remoteVars) || exprHasRemotePath(info, kv.Value, remoteVars) {
+				return true
+			}
+			continue
+		}
 		if exprHasRemotePath(info, elt, remoteVars) {
 			return true
 		}

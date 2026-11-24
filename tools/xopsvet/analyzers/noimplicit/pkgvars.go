@@ -10,6 +10,8 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
+// collectSentinelVars 预收集本包中所有具备哨兵错误签名（Err*/err*）的包级变量，
+// 供后续判断 fmt.Errorf("%w", ...) 包装合法性与运行期不可变性检查。
 func collectSentinelVars(pass *analysis.Pass) map[*types.Var]bool {
 	sentinels := make(map[*types.Var]bool)
 	if pass.TypesInfo == nil {
@@ -62,6 +64,8 @@ func checkPkgVarDecl(pass *analysis.Pass, gen *ast.GenDecl, sentinels map[*types
 	}
 }
 
+// isInterfaceAssertionSpec 仅豁免形如 `var _ I = (*T)(nil)` 的编译期零副作用接口断言，
+// 右值必须为纯常量、字面量零值或无副作用类型转换/new(T)。
 func isInterfaceAssertionSpec(info *types.Info, vs *ast.ValueSpec) bool {
 	if info == nil || vs.Type == nil || len(vs.Names) == 0 || len(vs.Names) != len(vs.Values) {
 		return false
@@ -150,6 +154,8 @@ func isPureTypeConvOrNew(info *types.Info, call *ast.CallExpr) bool {
 	return false
 }
 
+// isImmutableSentinelSpec 仅豁免单变量不可变哨兵错误声明，
+// 要求右值为常量参数 errors.New(...) 或仅引用常量与已知哨兵的 fmt.Errorf(...)。
 func isImmutableSentinelSpec(info *types.Info, vs *ast.ValueSpec, sentinels map[*types.Var]bool) bool {
 	if info == nil || len(vs.Names) != 1 || len(vs.Values) != 1 {
 		return false
@@ -233,13 +239,16 @@ func isErrorInterfaceType(t types.Type) bool {
 	return errObj != nil && types.Identical(t, errObj.Type())
 }
 
+// checkSentinelMutations 扫描包内所有赋值、for-range 赋值、自增减与取地址表达式，
+// 防止在运行期篡改本包或外部包的包级哨兵错误变量（保证哨兵错误只读不变量）。
 func checkSentinelMutations(pass *analysis.Pass, sentinels map[*types.Var]bool) {
-	if len(sentinels) == 0 || pass.TypesInfo == nil {
+	if pass.TypesInfo == nil {
 		return
 	}
 	ins := vetutil.InspectorOf(pass)
 	nodeFilter := []ast.Node{
 		(*ast.AssignStmt)(nil),
+		(*ast.RangeStmt)(nil),
 		(*ast.IncDecStmt)(nil),
 		(*ast.UnaryExpr)(nil),
 	}
@@ -252,24 +261,54 @@ func checkSentinelMutationNode(pass *analysis.Pass, n ast.Node, sentinels map[*t
 	switch node := n.(type) {
 	case *ast.AssignStmt:
 		for _, lhs := range node.Lhs {
-			reportIfSentinelIdent(pass, lhs, sentinels, "noimplicit: 禁止在运行期修改哨兵错误 %s")
+			reportIfSentinelExpr(pass, lhs, sentinels, "noimplicit: 禁止在运行期修改哨兵错误 %s")
+		}
+	case *ast.RangeStmt:
+		// 仅拦截使用 "=" 覆盖已有哨兵变量的 range 赋值；":=" 为循环块内新局部变量遮蔽。
+		if node.Tok == token.ASSIGN {
+			reportIfSentinelExpr(pass, node.Key, sentinels, "noimplicit: 禁止在运行期修改哨兵错误 %s")
+			reportIfSentinelExpr(pass, node.Value, sentinels, "noimplicit: 禁止在运行期修改哨兵错误 %s")
 		}
 	case *ast.IncDecStmt:
-		reportIfSentinelIdent(pass, node.X, sentinels, "noimplicit: 禁止修改哨兵错误 %s")
+		reportIfSentinelExpr(pass, node.X, sentinels, "noimplicit: 禁止修改哨兵错误 %s")
 	case *ast.UnaryExpr:
 		if node.Op == token.AND {
-			reportIfSentinelIdent(pass, node.X, sentinels, "noimplicit: 禁止对哨兵错误 %s 取地址")
+			reportIfSentinelExpr(pass, node.X, sentinels, "noimplicit: 禁止对哨兵错误 %s 取地址")
 		}
 	}
 }
 
-func reportIfSentinelIdent(pass *analysis.Pass, expr ast.Expr, sentinels map[*types.Var]bool, format string) {
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok {
-		return
+// reportIfSentinelExpr 同时识别同包标识符（ErrFoo）与跨包选择器（otherpkg.ErrShared），
+// 并排除结构体字段选择器（Selection != nil），确保不误报 obj.ErrField 赋值。
+func reportIfSentinelExpr(pass *analysis.Pass, expr ast.Expr, sentinels map[*types.Var]bool, format string) {
+	switch target := ast.Unparen(expr).(type) {
+	case *ast.Ident:
+		v, ok := pass.TypesInfo.Uses[target].(*types.Var)
+		if ok && isTrackedSentinelVar(v, sentinels) {
+			pass.ReportRangef(target, format, target.Name)
+		}
+	case *ast.SelectorExpr:
+		if pass.TypesInfo.Selections[target] != nil {
+			return
+		}
+		v, ok := pass.TypesInfo.Uses[target.Sel].(*types.Var)
+		if ok && isTrackedSentinelVar(v, sentinels) {
+			pass.ReportRangef(target, format, target.Sel.Name)
+		}
 	}
-	v, ok := pass.TypesInfo.Uses[id].(*types.Var)
-	if ok && sentinels[v] {
-		pass.ReportRangef(id, format, id.Name)
+}
+
+func isTrackedSentinelVar(v *types.Var, sentinels map[*types.Var]bool) bool {
+	if v == nil {
+		return false
 	}
+	if sentinels[v] {
+		return true
+	}
+	// 跨包（或点导入）的包级 error 哨兵变量同样受不可变约束保护。
+	return v.Pkg() != nil &&
+		!v.IsField() &&
+		v.Parent() == v.Pkg().Scope() &&
+		isSentinelName(v.Name()) &&
+		isErrorInterfaceType(v.Type())
 }

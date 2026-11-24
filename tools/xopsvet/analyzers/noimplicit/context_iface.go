@@ -52,6 +52,8 @@ func checkContextIdentUse(pass *analysis.Pass, id *ast.Ident) {
 	}
 }
 
+// checkContextSelection 拦截所有针对 context.Context（含嵌入并重写了 Value 的自定义包装类型）
+// 的 .Value(...) 调用或方法值引用，同时放行与 context.Context 无关的自有 Value 方法（如 cache.Value）。
 func checkContextSelection(pass *analysis.Pass, sel *ast.SelectorExpr, ctxIface *types.Interface) {
 	if pass.TypesInfo == nil || sel.Sel == nil || sel.Sel.Name != "Value" {
 		return
@@ -74,22 +76,37 @@ func implementsContextIface(t types.Type, ctxIface *types.Interface) bool {
 	return types.Implements(t, ctxIface) || types.Implements(types.NewPointer(t), ctxIface)
 }
 
+// findContextInterface 沿当前包依赖图的传递闭包（BFS）查找标准库 context.Context 接口。
+// 这样即使调用包自身未直接导入 "context"，只要经由中间包使用了嵌入或实现 context.Context 的类型，
+// 也能准确解析接口定义以拦截对重写 Value 方法的调用。
 func findContextInterface(pass *analysis.Pass) *types.Interface {
 	if pass.Pkg == nil {
 		return nil
 	}
-	for _, imp := range pass.Pkg.Imports() {
-		if imp.Path() != "context" {
+	visited := make(map[*types.Package]bool)
+	queue := append([]*types.Package(nil), pass.Pkg.Imports()...)
+	for len(queue) > 0 {
+		pkg := queue[0]
+		queue = queue[1:]
+		if pkg == nil || visited[pkg] {
 			continue
 		}
-		obj := imp.Scope().Lookup("Context")
-		if obj == nil {
-			return nil
+		visited[pkg] = true
+		if pkg.Path() == "context" {
+			return lookupContextIface(pkg)
 		}
-		iface, _ := obj.Type().Underlying().(*types.Interface)
-		return iface
+		queue = append(queue, pkg.Imports()...)
 	}
 	return nil
+}
+
+func lookupContextIface(pkg *types.Package) *types.Interface {
+	obj := pkg.Scope().Lookup("Context")
+	if obj == nil {
+		return nil
+	}
+	iface, _ := obj.Type().Underlying().(*types.Interface)
+	return iface
 }
 
 func checkTypeSwitchCases(pass *analysis.Pass, ts *ast.TypeSwitchStmt) {
@@ -109,6 +126,8 @@ func checkTypeSwitchCases(pass *analysis.Pass, ts *ast.TypeSwitchStmt) {
 	}
 }
 
+// containsAnonIface 递归检查类型断言或 type switch 的目标类型表达式中是否内嵌匿名接口，
+// 覆盖指针、切片、数组、Chan、Map、FuncType（参数与返回值）及 StructType 字段。
 func containsAnonIface(expr ast.Expr) bool {
 	switch e := expr.(type) {
 	case *ast.InterfaceType:
@@ -125,7 +144,23 @@ func containsAnonIface(expr ast.Expr) bool {
 		return containsAnonIface(e.Value)
 	case *ast.MapType:
 		return containsAnonIface(e.Key) || containsAnonIface(e.Value)
+	case *ast.FuncType:
+		return fieldListHasAnonIface(e.Params) || fieldListHasAnonIface(e.Results)
+	case *ast.StructType:
+		return fieldListHasAnonIface(e.Fields)
 	default:
 		return false
 	}
+}
+
+func fieldListHasAnonIface(fl *ast.FieldList) bool {
+	if fl == nil {
+		return false
+	}
+	for _, f := range fl.List {
+		if containsAnonIface(f.Type) {
+			return true
+		}
+	}
+	return false
 }

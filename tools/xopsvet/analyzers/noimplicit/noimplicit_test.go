@@ -19,6 +19,8 @@ func TestNoImplicit(t *testing.T) {
 		"github.com/wentf9/xops-cli/core/events",
 		"github.com/wentf9/xops-cli/core/internal/mcpruntime",
 		"github.com/wentf9/xops-cli/internal/host/audit",
+		"example.com/sentinelpkg",
+		"example.com/crosspkg",
 		"example.com/violations",
 	)
 }

@@ -39,6 +39,10 @@ func mutateSentinel() {
 	ErrMut = nil // want "禁止在运行期修改哨兵错误 ErrMut"
 	p := &ErrMut // want "禁止对哨兵错误 ErrMut 取地址"
 	_ = p
+	for _, ErrMut = range []error{nil} { // want "禁止在运行期修改哨兵错误 ErrMut"
+	}
+	for ErrMut = range map[error]int{} { // want "禁止在运行期修改哨兵错误 ErrMut"
+	}
 }
 
 type myCtx struct{ context.Context }
@@ -56,10 +60,15 @@ func checkCtxAndIfaces(ctx context.Context, x any) {
 
 	_ = x.(any)
 	_ = x.(fmt.Stringer)
-	_ = x.(interface{})        // want "禁止匿名接口断言"
-	_ = x.(interface{ M() })   // want "禁止匿名接口断言"
-	_ = x.(*interface{ M() })  // want "禁止匿名接口断言"
-	_ = x.([]interface{ M() }) // want "禁止匿名接口断言"
+	_ = x.(interface{})                  // want "禁止匿名接口断言"
+	_ = x.(interface{ M() })             // want "禁止匿名接口断言"
+	_ = x.(*interface{ M() })            // want "禁止匿名接口断言"
+	_ = x.([]interface{ M() })           // want "禁止匿名接口断言"
+	_ = x.(func(interface{ M() }))       // want "禁止匿名接口断言"
+	_ = x.(func() interface{ M() })      // want "禁止匿名接口断言"
+	_ = x.(struct{ F interface{ M() } }) // want "禁止匿名接口断言"
+	_ = x.(map[string]interface{ M() })  // want "禁止匿名接口断言"
+	_ = x.(chan interface{ M() })        // want "禁止匿名接口断言"
 
 	switch x.(type) {
 	case interface{ M() }: // want "禁止在 type switch 中使用匿名接口"

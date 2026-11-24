@@ -12,6 +12,10 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
+const algebraicPkgPath = vetutil.ModulePrefix + "/core/domain/algebraic"
+
+// checkDTOs 扫描 DTO 结构体字段，拦截除 algebraic.Duration 之外的裸 time.Duration 用法。
+// core/domain/algebraic 自身负责定义 Duration 包装类型，因此在此豁免。
 func checkDTOs(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	if pass.TypesInfo == nil {
 		return
@@ -48,6 +52,10 @@ func checkTypeDeclDTOs(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.Ge
 	}
 }
 
+// isDTOStruct 采用三层启发式判定结构体是否属于序列化/配置 DTO：
+// 1. 显式标记 //xops:dto 或含非 "-" 的 json/yaml 字段标签；
+// 2. 位于事件/MCP/审计/存储等 DTO 专属包内的导出类型或常见载荷命名；
+// 3. 仓库内其余包中以严格 DTO/Event/AuditEntry/Config 后缀结尾的导出类型。
 func isDTOStruct(pkgInfo vetutil.PkgInfo, ts *ast.TypeSpec, st *ast.StructType, isExplicitDTO bool) bool {
 	if isExplicitDTO || hasSerializationTags(st) {
 		return true
@@ -146,12 +154,14 @@ func checkDTOStructFields(pass *analysis.Pass, st *ast.StructType) {
 			continue
 		}
 		fieldType := pass.TypesInfo.TypeOf(f.Type)
-		if vetutil.TypeContains(fieldType, isBareTimeDuration) {
+		if hasBareTimeDuration(fieldType, make(map[types.Type]bool)) {
 			pass.ReportRangef(f.Type, "noimplicit: Event/Audit/MCP/Config DTO 禁止裸用 time.Duration，请使用 algebraic.Duration")
 		}
 	}
 }
 
+// isFieldSerializationSkipped 判断字段是否被序列化标签显式忽略（"-"）。
+// 仅当未同时被另一常见序列化格式保留（如 json:"-" yaml:"dur"）时才予豁免。
 func isFieldSerializationSkipped(f *ast.Field) bool {
 	if f.Tag == nil {
 		return false
@@ -169,6 +179,70 @@ func isFieldSerializationSkipped(f *ast.Field) bool {
 	return hasYAML && yamlVal == "-" && !hasJSON
 }
 
-func isBareTimeDuration(n *types.Named) bool {
-	return vetutil.IsPkgSymbol(n.Obj(), "time", "Duration")
+// hasBareTimeDuration 递归检查 DTO 字段类型是否包含裸 time.Duration。
+// 遇到 algebraic.Duration 时视为终止安全类型停止下钻（允许其内部私有封装 d time.Duration），
+// 同时继续向下穿透指针、切片、数组、Map、泛型实参（如 Option[time.Duration]）及普通包装结构体。
+func hasBareTimeDuration(t types.Type, seen map[types.Type]bool) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	if named, ok := t.(*types.Named); ok {
+		return namedHasBareTimeDuration(named, seen)
+	}
+	return compositeHasBareTimeDuration(t, seen)
+}
+
+func namedHasBareTimeDuration(named *types.Named, seen map[types.Type]bool) bool {
+	obj := named.Obj()
+	if vetutil.IsPkgSymbol(obj, algebraicPkgPath, "Duration") {
+		return false
+	}
+	if vetutil.IsPkgSymbol(obj, "time", "Duration") {
+		return true
+	}
+	if seen[named] {
+		return false
+	}
+	seen[named] = true
+	if typeArgs := named.TypeArgs(); typeArgs != nil {
+		for i := 0; i < typeArgs.Len(); i++ {
+			if hasBareTimeDuration(typeArgs.At(i), seen) {
+				return true
+			}
+		}
+	}
+	return hasBareTimeDuration(named.Underlying(), seen)
+}
+
+func compositeHasBareTimeDuration(t types.Type, seen map[types.Type]bool) bool {
+	switch v := t.(type) {
+	case *types.Pointer:
+		return hasBareTimeDuration(v.Elem(), seen)
+	case *types.Slice:
+		return hasBareTimeDuration(v.Elem(), seen)
+	case *types.Array:
+		return hasBareTimeDuration(v.Elem(), seen)
+	case *types.Chan:
+		return hasBareTimeDuration(v.Elem(), seen)
+	case *types.Map:
+		return hasBareTimeDuration(v.Key(), seen) || hasBareTimeDuration(v.Elem(), seen)
+	case *types.Struct:
+		return structHasBareTimeDuration(v, seen)
+	default:
+		return false
+	}
+}
+
+func structHasBareTimeDuration(st *types.Struct, seen map[types.Type]bool) bool {
+	if seen[st] {
+		return false
+	}
+	seen[st] = true
+	for i := 0; i < st.NumFields(); i++ {
+		if hasBareTimeDuration(st.Field(i).Type(), seen) {
+			return true
+		}
+	}
+	return false
 }

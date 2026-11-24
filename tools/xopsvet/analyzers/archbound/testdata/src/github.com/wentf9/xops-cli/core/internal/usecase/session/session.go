@@ -11,3 +11,7 @@ type Service struct {
 	P *pool.Pool
 	F ports.OperatorReadFS
 }
+
+func LeakOpFS() ports.OperatorReadFS {
+	return nil
+}

@@ -11,3 +11,7 @@ type Server struct {
 	G  *gate.Gate
 	S  *session.Service
 }
+
+func NewServer(s *session.Service) *Server {
+	return &Server{S: s}
+}

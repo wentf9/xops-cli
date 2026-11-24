@@ -67,19 +67,17 @@ func isBannedDomainTimeSymbol(obj types.Object) bool {
 	)
 }
 
+// checkMCPOperatorReadFS 物理封禁 core/internal/mcpruntime 对 ports.OperatorReadFS 的一切直接与间接使用：
+// 覆盖 Uses（显式引用/类型别名）、Defs（局部变量/字段/参数类型）、Selections（方法/字段选择）及
+// TypesInfo.Types（匿名表达式返回值直传/返回，如 consumeAny(session.LeakOpFS())）；
+// 后三者均采用 vetutil.TypeContainsLocalNamed，确保合法持有 *session.Service（内部字段含 OperatorReadFS）零误报。
+// 所有命中项先按 (Pos, End) 确定性排序再按源码行去重输出，消除 Go map 随机遍历导致的诊断抖动。
 func checkMCPOperatorReadFS(pass *analysis.Pass) {
-	seenLines := make(map[lineKey]bool)
 	var diags []symDiag
 	addDiag := func(pos, end token.Pos) {
 		if !pos.IsValid() {
 			return
 		}
-		p := pass.Fset.Position(pos)
-		lk := lineKey{file: p.Filename, line: p.Line}
-		if seenLines[lk] {
-			return
-		}
-		seenLines[lk] = true
 		diags = append(diags, symDiag{
 			pos: pos,
 			end: end,
@@ -90,7 +88,8 @@ func checkMCPOperatorReadFS(pass *analysis.Pass) {
 	collectMCPUses(pass.TypesInfo, addDiag)
 	collectMCPDefs(pass.Pkg, pass.TypesInfo, addDiag)
 	collectMCPSelections(pass.Pkg, pass.TypesInfo, addDiag)
-	reportSortedDiags(pass, diags)
+	collectMCPExprTypes(pass.Pkg, pass.TypesInfo, addDiag)
+	reportDedupedLineDiags(pass, diags)
 }
 
 func collectMCPUses(info *types.Info, addDiag func(pos, end token.Pos)) {
@@ -129,6 +128,23 @@ func collectMCPSelections(pkg *types.Package, info *types.Info, addDiag func(pos
 	}
 }
 
+func collectMCPExprTypes(pkg *types.Package, info *types.Info, addDiag func(pos, end token.Pos)) {
+	var hits []symDiag
+	for expr, tv := range info.Types {
+		if expr == nil || !expr.Pos().IsValid() || tv.Type == nil || tv.IsType() {
+			continue
+		}
+		if vetutil.TypeContainsLocalNamed(tv.Type, pkg, portsPkgPath, "OperatorReadFS") {
+			hits = append(hits, symDiag{pos: expr.Pos(), end: expr.End()})
+		}
+	}
+	// 对 Types map 收集结果先做位置排序，再交给上层统一行去重，保证报告位置完全确定。
+	slices.SortFunc(hits, compareSymDiag)
+	for _, h := range hits {
+		addDiag(h.pos, h.end)
+	}
+}
+
 func isOperatorReadFSSelection(pkg *types.Package, sel *types.Selection) bool {
 	if vetutil.TypeContainsLocalNamed(sel.Recv(), pkg, portsPkgPath, "OperatorReadFS") {
 		return true
@@ -140,16 +156,42 @@ func isOperatorReadFSSelection(pkg *types.Package, sel *types.Selection) bool {
 	return vetutil.TypeContainsLocalNamed(obj.Type(), pkg, portsPkgPath, "OperatorReadFS")
 }
 
-func reportSortedDiags(pass *analysis.Pass, diags []symDiag) {
-	slices.SortFunc(diags, func(a, b symDiag) int {
+func reportDedupedLineDiags(pass *analysis.Pass, diags []symDiag) {
+	slices.SortFunc(diags, compareSymDiag)
+	seenLines := make(map[lineKey]bool)
+	for _, d := range diags {
+		p := pass.Fset.Position(d.pos)
+		lk := lineKey{file: p.Filename, line: p.Line}
+		if seenLines[lk] {
+			continue
+		}
+		seenLines[lk] = true
+		pass.Report(analysis.Diagnostic{
+			Pos:     d.pos,
+			End:     d.end,
+			Message: d.msg,
+		})
+	}
+}
+
+func compareSymDiag(a, b symDiag) int {
+	if a.pos != b.pos {
 		if a.pos < b.pos {
 			return -1
 		}
-		if a.pos > b.pos {
-			return 1
-		}
-		return 0
-	})
+		return 1
+	}
+	if a.end < b.end {
+		return -1
+	}
+	if a.end > b.end {
+		return 1
+	}
+	return 0
+}
+
+func reportSortedDiags(pass *analysis.Pass, diags []symDiag) {
+	slices.SortFunc(diags, compareSymDiag)
 	for _, d := range diags {
 		pass.Report(analysis.Diagnostic{
 			Pos:     d.pos,

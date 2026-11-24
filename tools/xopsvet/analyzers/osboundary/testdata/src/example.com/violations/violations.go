@@ -37,6 +37,29 @@ func bannedEnvAndExec(ctx context.Context) {
 	_ = exec.Command("sh", "-c", "id")  // want "internal/host/sys 之外禁止直接调用环境变量或进程执行 API"
 	_ = exec.CommandContext(ctx, "sh")  // want "internal/host/sys 之外禁止直接调用环境变量或进程执行 API"
 	_, _ = syscall.Getenv("SECRET")     // want "internal/host/sys 之外禁止直接调用环境变量或进程执行 API"
+
+	var lc net.ListenConfig
+	_, _ = lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	_, _ = lc.Listen(ctx, "unix", "/tmp/lc.sock")          // want "core/osfs 之外禁止直接创建 Unix Domain Socket 监听"
+	_, _ = lc.ListenPacket(ctx, "unixgram", "/tmp/l.sock") // want "core/osfs 之外禁止直接创建 Unix Domain Socket 监听"
+}
+
+type CopyTask struct {
+	LocalDir   string
+	RemoteDest pathalg.RemotePath
+}
+
+func (CopyTask) LocalFile() string { return "a.txt" }
+
+func copyTaskBoundary(task CopyTask) {
+	_ = filepath.Join(task.LocalDir, "b")
+	_ = filepath.Clean(task.LocalFile())
+
+	positional := CopyTask{"/tmp/local", task.RemoteDest}
+	_ = filepath.Join(positional.LocalDir, "c")
+
+	_ = filepath.Join(task.RemoteDest.String(), "b") // want "禁止对 RemotePath 调用 path/filepath"
+	_ = filepath.Join(fmt.Sprint(task.RemoteDest), "b") // want "禁止对 RemotePath 调用 path/filepath"
 }
 
 func remotePathBoundary(rp pathalg.RemotePath) string {
@@ -48,5 +71,9 @@ func remotePathBoundary(rp pathalg.RemotePath) string {
 	s2 := s1 + "/conf"
 	s3 := fmt.Sprintf("%s/app", s2)
 	_ = filepath.Clean(s3) // want "禁止对 RemotePath 调用 path/filepath"
+
+	for _, item := range []string{rp.String()} {
+		_ = filepath.Join(item, "range") // want "禁止对 RemotePath 调用 path/filepath"
+	}
 	return s3
 }

@@ -10,6 +10,8 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
+// checkOSSymbols 检查物理封锁于 core/osfs 与 internal/host/sys 的底层系统原语，
+// 覆盖直接符号引用、os.Root 方法选择及 Unix Domain Socket 常量网络监听调用。
 func checkOSSymbols(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	if pass.TypesInfo == nil {
 		return
@@ -73,6 +75,7 @@ func reportBannedObject(pass *analysis.Pass, node ast.Node, obj types.Object, al
 	}
 }
 
+// reportPos 按 AST 节点起始位置去重，避免同一符号在 Ident 与 SelectorExpr 阶段重复告警。
 func reportPos(pass *analysis.Pass, node ast.Node, reported map[token.Pos]bool, msg string) {
 	pos := node.Pos()
 	if !pos.IsValid() || reported[pos] {
@@ -192,18 +195,36 @@ func isOSRootType(t types.Type) bool {
 	return vetutil.TypeContainsNamed(t, "os", "Root")
 }
 
+// isUnixNetListenCall 拦截直接针对 unix/unixpacket/unixgram 的 net.Listen/ListenPacket
+// 以及 (*net.ListenConfig).Listen/ListenPacket 调用（network 位于第 2 个参数）。
 func isUnixNetListenCall(info *types.Info, call *ast.CallExpr) bool {
 	obj := vetutil.ResolveCalledObject(info, call)
 	if !vetutil.IsPkgSymbol(obj, "net", "Listen", "ListenPacket") {
 		return false
 	}
-	if len(call.Args) == 0 {
+	argIdx := 0
+	if isListenConfigMethod(obj) {
+		argIdx = 1
+	}
+	if len(call.Args) <= argIdx {
 		return false
 	}
-	tv, ok := info.Types[call.Args[0]]
+	tv, ok := info.Types[call.Args[argIdx]]
 	if !ok || tv.Value == nil || tv.Value.Kind() != constant.String {
 		return false
 	}
 	netw := constant.StringVal(tv.Value)
 	return netw == "unix" || netw == "unixpacket" || netw == "unixgram"
+}
+
+func isListenConfigMethod(obj types.Object) bool {
+	fn, ok := obj.(*types.Func)
+	if !ok || fn == nil {
+		return false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return false
+	}
+	return vetutil.TypeContainsNamed(sig.Recv().Type(), "net", "ListenConfig")
 }
