@@ -49,7 +49,6 @@ ifeq ($(OS),Windows_NT)
         COMMIT  ?= $(shell git rev-parse --short HEAD 2>$(DEVNULL) || echo unknown)
         DATE    ?= $(shell date +%Y-%m-%dT%H:%M:%S%z 2>$(DEVNULL) || git log -1 --format=%cI 2>$(DEVNULL) || echo unknown)
         RM_CMD  := rm -rf $(BIN_DIR) coverage.out
-        GOWORK_OFF := env GOWORK=off
         SKILL_DEST := $(HOME)/.gemini/skills/xops-agent
         INSTALL_SKILL_CMD := mkdir -p "$(SKILL_DEST)" && cp -r skills/xops-agent/* "$(SKILL_DEST)/"
         ECHO_BLANK := echo ""
@@ -66,7 +65,6 @@ ifeq ($(OS),Windows_NT)
         COMMIT  ?= $(shell git rev-parse --short HEAD 2>$(DEVNULL) || echo unknown)
         DATE    ?= $(shell powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-ddTHH:mm:sszzz'" 2>$(DEVNULL) || git log -1 --format=%cI 2>$(DEVNULL) || echo unknown)
         RM_CMD  := if exist $(subst /,\,$(BIN_DIR)) ( rmdir /s /q $(subst /,\,$(BIN_DIR)) ) & if exist coverage.out ( del /f /q coverage.out )
-        GOWORK_OFF := set "GOWORK=off" &&
         INSTALL_SKILL_CMD := powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path (Join-Path $$HOME '.gemini/skills/xops-agent') | Out-Null; Copy-Item -Recurse -Force 'skills/xops-agent/*' (Join-Path $$HOME '.gemini/skills/xops-agent')"
         ECHO_BLANK := echo.
     endif
@@ -85,7 +83,6 @@ else
     COMMIT  ?= $(shell git rev-parse --short HEAD 2>$(DEVNULL) || echo unknown)
     DATE    ?= $(shell date +%Y-%m-%dT%H:%M:%S%z 2>$(DEVNULL) || git log -1 --format=%cI 2>$(DEVNULL) || echo unknown)
     RM_CMD  := rm -rf $(BIN_DIR) coverage.out
-    GOWORK_OFF := env GOWORK=off
     SKILL_DEST := $(HOME)/.gemini/skills/xops-agent
     INSTALL_SKILL_CMD := mkdir -p "$(SKILL_DEST)" && cp -r skills/xops-agent/* "$(SKILL_DEST)/"
     ECHO_BLANK := echo ""
@@ -96,16 +93,12 @@ VERSION := $(strip $(VERSION))
 COMMIT  := $(strip $(COMMIT))
 DATE    := $(strip $(DATE))
 
-# 编译器护栏绝对路径（兼容 POSIX / Windows GOEXE）
-VETTOOL := $(abspath $(CURDIR)/$(BIN_DIR))/xopsvet$(shell go env GOEXE)
-LINT_FLAGS := --max-issues-per-linter=0 --max-same-issues=0
+# 四端统一验证单一事实源入口（外层不设 GOWORK=off，兼容无 sh.exe 的 Windows 原生 Make）
+VERIFY_CMD := $(RUN_TOOL) go run ./scripts/ci/verify.go
 
-# 渐进式模块探测（支持 Phase 0 空骨架阶段安全跳过尚未创建的模块）
-HAS_XOPSVET := $(strip $(wildcard tools/xopsvet/cmd/xopsvet/*.go))
+# 渐进式模块探测（仅用于 build-cli 与 test-cover 跳过空模块）
 HAS_CORE_GO := $(strip $(wildcard core/*.go core/*/*.go core/*/*/*.go core/*/*/*/*.go core/*/*/*/*/*.go))
-HAS_CORE_DST := $(strip $(wildcard core/internal/pool/*_test.go))
 HAS_CLI_GO  := $(strip $(wildcard cmd/xops/*.go))
-HAS_ROOT_GO := $(strip $(wildcard cmd/xops/*.go internal/*.go internal/*/*.go internal/*/*/*.go internal/*/*/*/*.go internal/*/*/*/*/*.go))
 
 # 注入 LDFLAGS（Go 1.27 对 package main 使用 -p main，须绑定 main.<var> 并配合 cmd/xops //xops:buildvar）
 LDFLAGS := -s -w \
@@ -117,7 +110,7 @@ LDFLAGS := -s -w \
 # 编译命令
 # ==============================================================================
 
-.PHONY: all clean help build build-cli xopsvet core dst vet lint test test-race test-cover verify ci release
+.PHONY: all clean help build build-cli xopsvet core cross dst vet lint test test-race test-cover verify ci release
 .PHONY: windows windows-arm64 linux linux-arm64 darwin darwin-amd64 darwin-arm64
 
 default: all
@@ -201,129 +194,51 @@ clean:
 	@$(RUN_TOOL) go clean
 
 # ==============================================================================
-# 三模块渐进式护栏与测试 (Testing & Verification)
+# 三模块护栏与测试（统一委托 scripts/ci/verify.go 单一事实源）
 # ==============================================================================
 
-xopsvet: export GOWORK := off
-xopsvet:
-ifneq ($(HAS_XOPSVET),)
-	@echo "Testing and building xopsvet -> $(VETTOOL)..."
-	$(RUN_TOOL) go -C tools/xopsvet test -race -count=1 ./...
-	$(RUN_TOOL) go -C tools/xopsvet build -o "$(VETTOOL)" ./cmd/xopsvet
-	$(RUN_TOOL) go -C tools/xopsvet vet -vettool="$(VETTOOL)" ./...
-	cd tools/xopsvet && $(RUN_TOOL) golangci-lint run $(LINT_FLAGS) ./...
-else
-	@echo "Skipping xopsvet: tools/xopsvet/cmd/xopsvet has no Go files yet (VETTOOL=$(VETTOOL))."
-endif
-
-core: export GOWORK := off
-core: xopsvet
-ifneq ($(HAS_CORE_GO),)
-	@echo "Verifying core/ independently (GOWORK=off)..."
-	$(RUN_TOOL) go -C core build ./...
-ifneq ($(HAS_XOPSVET),)
-	$(RUN_TOOL) go -C core vet -vettool="$(VETTOOL)" ./...
-endif
-	cd core && $(RUN_TOOL) golangci-lint run $(LINT_FLAGS) ./...
-	$(RUN_TOOL) go -C core test -race -shuffle=on -count=1 ./...
-else
-	@echo "Skipping core: core/ has no Go files yet."
-endif
-
 XOPS_DST_SEEDS ?= 10000
-dst: export GOWORK := off
-dst: export XOPS_DST_SEEDS := $(XOPS_DST_SEEDS)
-dst:
-ifneq ($(HAS_CORE_DST),)
-	@echo "Running Deterministic Simulation Tests (DST, seeds=$(XOPS_DST_SEEDS))..."
-	$(RUN_TOOL) go -C core test -race -count=1 -run "^TestDST_" ./...
-else
-	@echo "Skipping dst: core/internal/pool DST tests not present yet."
-endif
 
-vet: xopsvet
-ifneq ($(HAS_XOPSVET),)
-	@echo "Running xopsvet across available modules (VETTOOL=$(VETTOOL))..."
-	$(RUN_TOOL) $(GOWORK_OFF) go -C tools/xopsvet vet -vettool="$(VETTOOL)" ./...
-ifneq ($(HAS_CORE_GO),)
-	$(RUN_TOOL) $(GOWORK_OFF) go -C core vet -vettool="$(VETTOOL)" ./...
-endif
-ifneq ($(HAS_ROOT_GO),)
-	$(RUN_TOOL) go vet -vettool="$(VETTOOL)" ./...
-endif
-else
-	@echo "Skipping vet: VETTOOL=$(VETTOOL) is not built yet."
-endif
+xopsvet:
+	$(VERIFY_CMD) --stage=xopsvet
+
+core:
+	$(VERIFY_CMD) --stage=core
+
+cross:
+	$(VERIFY_CMD) --stage=cross
+
+dst:
+	$(VERIFY_CMD) --stage=dst --dst-seeds=$(XOPS_DST_SEEDS)
+
+vet:
+	$(VERIFY_CMD) --stage=all --skip-lint
 
 lint:
-	@echo "Running golangci-lint..."
-ifneq ($(HAS_XOPSVET),)
-	cd tools/xopsvet && $(RUN_TOOL) $(GOWORK_OFF) golangci-lint run $(LINT_FLAGS) ./...
-endif
-ifneq ($(HAS_CORE_GO),)
-	cd core && $(RUN_TOOL) $(GOWORK_OFF) golangci-lint run $(LINT_FLAGS) ./...
-endif
-ifneq ($(HAS_ROOT_GO),)
-	$(RUN_TOOL) golangci-lint run $(LINT_FLAGS) ./...
-endif
-ifeq ($(HAS_XOPSVET)$(HAS_CORE_GO)$(HAS_ROOT_GO),)
-	@echo "Skipping lint: no Go modules contain Go source files yet."
-endif
+	$(VERIFY_CMD) --stage=all
 
 test:
-	@echo "Running tests..."
-ifneq ($(HAS_XOPSVET),)
-	$(RUN_TOOL) $(GOWORK_OFF) go -C tools/xopsvet test ./... -count=1
-endif
-ifneq ($(HAS_CORE_GO),)
-	$(RUN_TOOL) $(GOWORK_OFF) go -C core test ./... -count=1
-endif
-ifneq ($(HAS_ROOT_GO),)
-	$(RUN_TOOL) go test ./... -count=1
-endif
-ifeq ($(HAS_XOPSVET)$(HAS_CORE_GO)$(HAS_ROOT_GO),)
-	@echo "Skipping test: no Go modules contain Go source files yet."
-endif
+	$(VERIFY_CMD) --stage=all --skip-lint
 
 test-race:
-	@echo "Running tests with race detector..."
-ifneq ($(HAS_XOPSVET),)
-	$(RUN_TOOL) $(GOWORK_OFF) go -C tools/xopsvet test ./... -race -shuffle=on -count=1
-endif
-ifneq ($(HAS_CORE_GO),)
-	$(RUN_TOOL) $(GOWORK_OFF) go -C core test ./... -race -shuffle=on -count=1
-endif
-ifneq ($(HAS_ROOT_GO),)
-	$(RUN_TOOL) go test ./... -race -shuffle=on -count=1
-endif
-ifeq ($(HAS_XOPSVET)$(HAS_CORE_GO)$(HAS_ROOT_GO),)
-	@echo "Skipping test-race: no Go modules contain Go source files yet."
-endif
+	$(VERIFY_CMD) --stage=all --skip-lint
 
+test-cover: export GOWORK := off
 test-cover:
 	@echo "Running tests with coverage..."
 ifneq ($(HAS_CORE_GO),)
-	$(RUN_TOOL) $(GOWORK_OFF) go -C core test ./... -covermode=atomic -coverprofile=../coverage.out
+	$(RUN_TOOL) go -C core test ./... -covermode=atomic -coverprofile=../coverage.out
 	$(RUN_TOOL) go tool cover -func=coverage.out
 else
 	@echo "Skipping test-cover: core/ has no Go files yet."
 endif
 
-verify: core
-ifneq ($(HAS_ROOT_GO),)
-	@echo "Verifying root CLI module..."
-	$(RUN_TOOL) go build ./...
-ifneq ($(HAS_XOPSVET),)
-	$(RUN_TOOL) go vet -vettool="$(VETTOOL)" ./...
-endif
-	$(RUN_TOOL) golangci-lint run $(LINT_FLAGS) ./...
-	$(RUN_TOOL) go test ./... -count=1
-else
-	@echo "Root CLI module has no Go files yet; core/ & xopsvet checks completed."
-endif
+verify:
+	$(VERIFY_CMD) --stage=all
 
-ci: verify test-race
-	@echo "Running docs check..."
+ci: verify cross
+	@echo "Running CI script tests and docs check..."
+	python3 -m unittest discover -s scripts -p test_ci_changes.py -v
 	npm run docs:check
 
 # 显示帮助
@@ -344,17 +259,18 @@ help:
 	@echo "  install-skill   安装 Gemini CLI 技能"
 	@echo "  clean           清理构建文件"
 	@$(ECHO_BLANK)
-	@echo "Testing & Guardrails:"
-	@echo "  xopsvet         测试并构建编译器护栏 $(VETTOOL) (GOWORK=off)"
+	@echo "Testing & Guardrails (via scripts/ci/verify.go):"
+	@echo "  xopsvet         测试、构建、自检并 lint 编译器护栏 (GOWORK=off)"
 	@echo "  core            独立验证 core/ 模块 (GOWORK=off + xopsvet + lint + race)"
+	@echo "  cross           Windows & macOS 交叉编译与跨平台 golangci-lint"
 	@echo "  dst             运行确定性仿真测试 (DST)"
-	@echo "  vet             运行 xopsvet 静态检查"
-	@echo "  lint            运行 golangci-lint"
-	@echo "  test            运行单元测试"
-	@echo "  test-race       运行单元测试 (带 -race -shuffle=on)"
-	@echo "  test-cover      运行测试并生成覆盖率报告"
-	@echo "  verify          运行提交前构建、测试和 Lint 检查"
-	@echo "  ci              在本地复现三模块 CI 与文档检查"
+	@echo "  vet             通过 verify.go 运行三模块 xopsvet 与测试"
+	@echo "  lint            通过 verify.go 运行三模块全量验证含 golangci-lint"
+	@echo "  test            通过 verify.go 运行三模块 -race -shuffle=on 测试"
+	@echo "  test-race       同 test（全模块强制 -race -shuffle=on）"
+	@echo "  test-cover      运行 core/ 覆盖率测试并生成报告"
+	@echo "  verify          运行提交前全量三模块构建、护栏、Lint 与测试"
+	@echo "  ci              在本地复现完整三模块 CI、跨平台检查与文档校验"
 	@$(ECHO_BLANK)
 	@echo "macOS Virtualization (Docker-OSX):"
 	@echo "  macos-vm-check  检查本地 KVM 与虚拟化环境"

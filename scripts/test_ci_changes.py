@@ -101,6 +101,19 @@ class TestCIChangesClassification(unittest.TestCase):
             {"code": True, "core": True, "cross_platform": False},
         )
 
+        # 3c: [.forgejo/workflows/local-ci.yml] -> code=true, core=false, cross_platform=false
+        # Forgejo-only workflow changes must NOT consume GitHub Actions macOS/Windows quota.
+        res_3c = ci_changes.classify_changes(
+            changed_files=[".forgejo/workflows/local-ci.yml"],
+            fallback=False,
+            event_name="pull_request",
+            is_draft=False,
+        )
+        self.assertEqual(
+            res_3c,
+            {"code": True, "core": False, "cross_platform": False},
+        )
+
     def test_ready_pr_cross_platform_paths(self):
         """Case 4: Ready PR changing cross-platform paths -> cross_platform=true."""
         paths_to_verify = [
@@ -134,9 +147,14 @@ class TestCIChangesClassification(unittest.TestCase):
             ("tools/xopsvet/cmd/xopsvet/main.go", True, True, True),
             ("cmd/xops/main.go", True, False, True),
             ("go.work", True, True, True),
+            ("go.work.sum", True, True, True),
+            ("go.sum", True, True, True),
             ("core/go.mod", True, True, True),
+            ("core/go.sum", True, True, True),
             ("tools/xopsvet/go.mod", True, True, True),
+            ("tools/xopsvet/go.sum", True, True, True),
             (".golangci.yml", True, True, True),
+            ("scripts/ci/verify.go", True, True, True),
             ("scripts/verify_native_platform.sh", True, False, True),
             (".github/workflows/ci.yml", True, True, True),
             ("scripts/ci_changes.py", True, True, True),

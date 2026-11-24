@@ -247,41 +247,12 @@ EOF
       exit 0
     fi
 
-    local vettool="${work}/bin/xopsvet$(go env GOEXE)"
-    mkdir -p "${work}/bin"
-    if [[ -f tools/xopsvet/go.mod ]]; then
-      (cd tools/xopsvet && GOWORK=off go test -v -race -count=1 ./... && GOWORK=off go build -o "$vettool" ./cmd/xopsvet)
+    local target_pkg="${PKG_FILTER:-./...}"
+    go run ./scripts/ci/verify.go --stage=all --verbose --pkg="$target_pkg"
+    if [[ "$GATE" == "g2" || "$GATE" == "g2.5" || "$GATE" == "g3" || "$GATE" == "g4" || "$GATE" == "g5" ]]; then
+      go run ./scripts/ci/verify.go --stage=dst --verbose --dst-seeds="$DST_SEEDS"
     fi
-
-    if [[ -f core/go.mod ]]; then
-      local target_pkg="${PKG_FILTER:-./...}"
-      (
-        cd core
-        GOWORK=off go build ./...
-        if [[ -x "$vettool" ]]; then
-          GOWORK=off go vet -vettool="$vettool" ./...
-        fi
-        GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...
-        GOWORK=off go test -v -race -shuffle=on -count=1 "$target_pkg"
-        if [[ -d internal/pool && ( "$GATE" == "g2" || "$GATE" == "g2.5" || "$GATE" == "g3" || "$GATE" == "g4" || "$GATE" == "g5" ) ]]; then
-          GOWORK=off XOPS_DST_SEEDS="$DST_SEEDS" go test -v -race -count=1 -run '^TestDST_' ./...
-        fi
-        # 交叉编译与交叉 lint 覆盖 Windows 与 macOS
-        GOOS=windows GOARCH=amd64 GOWORK=off go build ./...
-        GOOS=darwin  GOARCH=amd64 GOWORK=off go build ./...
-        GOOS=windows GOARCH=amd64 GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...
-        GOOS=darwin  GOARCH=amd64 GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...
-      )
-    fi
-
-    if [[ -f go.mod && ( -d cmd/xops || -d internal ) ]]; then
-      go build ./...
-      if [[ -x "$vettool" ]]; then
-        go vet -vettool="$vettool" ./...
-      fi
-      golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...
-      go test -v -race -shuffle=on -count=1 "${PKG_FILTER:-./...}"
-    fi
+    go run ./scripts/ci/verify.go --stage=cross
   } >"$log" 2>&1
 }
 
@@ -367,28 +338,7 @@ if [ ! -f tools/xopsvet/go.mod ] && [ ! -f core/go.mod ]; then
   exit 0
 fi
 
-VETTOOL="${WORK}/bin/xopsvet$(go env GOEXE)"
-mkdir -p "${WORK}/bin"
-if [ -f tools/xopsvet/go.mod ]; then
-  (cd tools/xopsvet && GOWORK=off go test -v -race -count=1 ./... && GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet)
-fi
-if [ -f core/go.mod ]; then
-  (
-    cd core
-    GOWORK=off go build ./...
-    if [ -x "$VETTOOL" ]; then
-      GOWORK=off go vet -vettool="$VETTOOL" ./...
-    fi
-    GOWORK=off go test -v -race -shuffle=on -count=1 "$TARGET_PKG"
-  )
-fi
-if [ -f go.mod ] && { [ -d cmd/xops ] || [ -d internal ]; }; then
-  go build ./...
-  if [ -x "$VETTOOL" ]; then
-    go vet -vettool="$VETTOOL" ./...
-  fi
-  go test -v -race -shuffle=on -count=1 "$TARGET_PKG"
-fi
+go run ./scripts/ci/verify.go --stage=all --verbose --pkg="$TARGET_PKG"
 REMOTE_GATE
 }
 
@@ -491,41 +441,8 @@ try {
         Write-Output 'SKIP: 尚未进入 Phase 0（未发现 v2 Go 模块）'
         exit 0
     }
-    New-Item -ItemType Directory -Force -Path (Join-Path $work 'bin') | Out-Null
-    $vettool = Join-Path $work ('bin\xopsvet' + (go env GOEXE))
-    if (Test-Path 'tools\xopsvet\go.mod') {
-        Push-Location 'tools\xopsvet'
-        $env:GOWORK = 'off'
-        go test -v -race -count=1 ./...
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        go build -o $vettool ./cmd/xopsvet
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        Pop-Location
-    }
-    if (Test-Path 'core\go.mod') {
-        Push-Location 'core'
-        $env:GOWORK = 'off'
-        go build ./...
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        if (Test-Path $vettool) {
-            go vet "-vettool=$vettool" ./...
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        }
-        go test -v -race -shuffle=on -count=1 $TargetPkg
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        Pop-Location
-    }
-    Remove-Item Env:GOWORK -ErrorAction SilentlyContinue
-    if ((Test-Path 'go.mod') -and ((Test-Path 'cmd\xops') -or (Test-Path 'internal'))) {
-        go build ./...
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        if (Test-Path $vettool) {
-            go vet "-vettool=$vettool" ./...
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-        }
-        go test -v -race -shuffle=on -count=1 $TargetPkg
-        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    }
+    go run ./scripts/ci/verify.go --stage=all --verbose "--pkg=$TargetPkg"
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } finally {
     Set-Location C:\xops-ci
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $work, $tarFile

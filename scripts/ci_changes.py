@@ -20,11 +20,16 @@ DOCS_EXACT = {
 
 CORE_EXACT = {
     "go.work",
+    "go.work.sum",
     "go.mod",
+    "go.sum",
     "core/go.mod",
+    "core/go.sum",
     "tools/xopsvet/go.mod",
+    "tools/xopsvet/go.sum",
     ".golangci.yml",
     ".github/workflows/ci.yml",
+    "scripts/ci/verify.go",
     "scripts/ci_changes.py",
     "scripts/test_ci_changes.py",
 }
@@ -46,10 +51,15 @@ CROSS_PLATFORM_PREFIXES = (
 CROSS_PLATFORM_EXACT = {
     "Makefile",
     "go.work",
+    "go.work.sum",
     "go.mod",
+    "go.sum",
     "core/go.mod",
+    "core/go.sum",
     "tools/xopsvet/go.mod",
+    "tools/xopsvet/go.sum",
     ".golangci.yml",
+    "scripts/ci/verify.go",
     "scripts/verify_native_platform.sh",
     ".github/workflows/ci.yml",
     "scripts/ci_changes.py",

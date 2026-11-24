@@ -35,60 +35,29 @@ jobs:
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout -qf FETCH_HEAD
           git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
-      - name: Verify toolchain & docs
+      - name: Verify toolchain, CI scripts & docs
         run: |
+          set -eu
           go version
           golangci-lint --version
+          if command -v python3 >/dev/null 2>&1; then
+            python3 -m unittest discover -s scripts -p test_ci_changes.py -v
+          fi
           if [ -f package.json ] && command -v npm >/dev/null 2>&1; then
             npm run docs:check
           fi
-      - name: Build & self-test xopsvet (GOWORK=off)
+      - name: Verify xopsvet, core/, and root CLI (verify.go)
         run: |
           set -eu
-          if [ -f tools/xopsvet/go.mod ]; then
-            if grep -rnE '^[[:space:]]*replace([[:space:]]|\()' go.mod core/go.mod tools/xopsvet/go.mod; then
-              echo "ERROR: replace directives are forbidden in go.mod files" >&2
-              exit 1
-            fi
-            VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
-            mkdir -p bin
-            (
-              cd tools/xopsvet
-              GOWORK=off go test -race -count=1 ./...
-              GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet
-              GOWORK=off go vet -vettool="$VETTOOL" ./...
-              GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...
-            )
-          else
-            echo "Pre-Phase 0: tools/xopsvet/go.mod not created yet, skipping."
-          fi
-      - name: Verify core/ independently (GOWORK=off)
-        run: |
-          if [ -f core/go.mod ]; then
-            VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
-            (cd core && GOWORK=off go build ./... && GOWORK=off go vet -vettool="$VETTOOL" ./... && GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./... && GOWORK=off go test -race -shuffle=on -count=1 ./...)
-          else
-            echo "Pre-Phase 0: core/go.mod not created yet, skipping."
-          fi
-      - name: Cross-compile & cross-lint core/ (Windows & macOS)
-        run: |
-          if [ -f core/go.mod ]; then
-            (cd core && GOOS=windows GOARCH=amd64 GOWORK=off go build ./... && GOOS=darwin GOARCH=amd64 GOWORK=off go build ./...)
-            (cd core && GOOS=windows GOARCH=amd64 GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...)
-            (cd core && GOOS=darwin  GOARCH=amd64 GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...)
-          fi
-      - name: Verify root CLI module (via go.work on branch dev)
+          go run ./scripts/ci/verify.go --stage=all
+      - name: Cross-compile & cross-lint (Windows & macOS)
         run: |
           set -eu
-          if [ -f tools/xopsvet/go.mod ] && { { [ -d cmd/xops ] && [ -n "$(find cmd/xops -name '*.go' -print -quit)" ]; } || { [ -d internal ] && [ -n "$(find internal -name '*.go' -print -quit)" ]; }; }; then
-            VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
-            go build ./... && go vet -vettool="$VETTOOL" ./... && golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./... && go test -race -shuffle=on -count=1 ./...
-          fi
+          go run ./scripts/ci/verify.go --stage=cross
       - name: Run Deterministic Simulation Tests (DST)
         run: |
-          if [ -d core/internal/pool ]; then
-            (cd core && GOWORK=off XOPS_DST_SEEDS="${{ inputs.dst_seeds || '2000' }}" go test -race -count=1 -run '^TestDST_' ./...)
-          fi
+          set -eu
+          go run ./scripts/ci/verify.go --stage=dst --dst-seeds="${{ inputs.dst_seeds || '2000' }}"
 
   windows-native:
     needs: linux-fast
@@ -110,7 +79,7 @@ jobs:
           git checkout -qf FETCH_HEAD
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git remote set-url origin "$serverUrl/$($env:GITHUB_REPOSITORY).git"
-      - name: Native Windows toolchain, xopsvet & core/ verification (GOWORK=off)
+      - name: Native Windows verification (verify.go)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -118,61 +87,8 @@ jobs:
           golangci-lint --version
           gcc --version | Select-Object -First 1
           make --version | Select-Object -First 1
-          if (!(Test-Path 'tools\xopsvet\go.mod') -and !(Test-Path 'core\go.mod')) {
-            Write-Output 'Pre-Phase 0: running native Windows -race smoke verification.'
-            $baseTmp = if ($env:GOTMPDIR) { $env:GOTMPDIR } else { $env:TEMP }
-            $smoke = Join-Path $baseTmp ('xops-ci-smoke-' + [guid]::NewGuid().ToString('N'))
-            New-Item -ItemType Directory -Force -Path $smoke | Out-Null
-            try {
-              Set-Content -Path (Join-Path $smoke 'go.mod') -Encoding utf8NoBOM -Value "module xops.local/smoke`n`ngo 1.27`n"
-              Set-Content -Path (Join-Path $smoke 'smoke_test.go') -Encoding utf8NoBOM -Value 'package smoke; import ("sync/atomic"; "testing"); func TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }'
-              Push-Location $smoke
-              $env:GOWORK = 'off'
-              go test -v -race -count=1 ./...
-              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-              Pop-Location
-            } finally {
-              Set-Location $env:GITHUB_WORKSPACE
-              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $smoke
-            }
-            exit 0
-          }
-          New-Item -ItemType Directory -Force -Path bin | Out-Null
-          $vettool = Join-Path (Get-Location) ('bin\xopsvet' + (go env GOEXE))
-          Push-Location tools/xopsvet
-          $env:GOWORK = 'off'
-          go test -race -count=1 ./...
+          go run ./scripts/ci/verify.go --stage=all
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go build -o $vettool ./cmd/xopsvet
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go vet "-vettool=$vettool" ./...
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Pop-Location
-
-          Push-Location core
-          $env:GOWORK = 'off'
-          go build ./...
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go vet "-vettool=$vettool" ./...
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go test -race -shuffle=on -count=1 ./...
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Pop-Location
-      - name: Native Windows root CLI & ConPTY/Vault tests (via go.work)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Remove-Item Env:GOWORK -ErrorAction SilentlyContinue
-          $hasRoot = (((Test-Path 'cmd\xops') -and ($null -ne (Get-ChildItem -Path 'cmd\xops' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1))) -or ((Test-Path 'internal') -and ($null -ne (Get-ChildItem -Path 'internal' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1))))
-          if ((Test-Path 'tools\xopsvet\go.mod') -and $hasRoot) {
-            $vettool = Join-Path (Get-Location) ('bin\xopsvet' + (go env GOEXE))
-            go build ./...
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            go vet "-vettool=$vettool" ./...
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            go test -race -shuffle=on -count=1 ./...
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
 
   ubuntu-native:
     needs: linux-fast
@@ -190,19 +106,15 @@ jobs:
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout -qf FETCH_HEAD
           git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
-      - name: Native Ubuntu toolchain & host integration verification
+      - name: Native Ubuntu verification & host integration
         run: |
+          set -eu
           uname -a
           go version
           which fish zsh make git
-          if [ -f tools/xopsvet/go.mod ] && [ -d internal/host ]; then
+          go run ./scripts/ci/verify.go --stage=all
+          if [ -d internal/host ] && [ -n "$(find internal/host -name '*.go' -print -quit)" ]; then
             go test -tags=integration -race -shuffle=on -count=1 ./internal/host/...
-          else
-            TMP_SMOKE="$(mktemp -d /tmp/xops-ci/smoke.XXXXXX)"
-            trap 'rm -rf "$TMP_SMOKE"' EXIT
-            printf 'module xops.local/smoke\n\ngo 1.27\n' > "$TMP_SMOKE/go.mod"
-            printf 'package smoke\nimport ("sync/atomic"; "testing")\nfunc TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }\n' > "$TMP_SMOKE/smoke_test.go"
-            (cd "$TMP_SMOKE" && GOWORK=off go test -v -race -count=1 ./...)
           fi
 
   freebsd-native:
@@ -221,20 +133,10 @@ jobs:
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout -qf FETCH_HEAD
           git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
-      - name: Native FreeBSD toolchain & core/ verification (GOWORK=off)
+      - name: Native FreeBSD verification (verify.go)
         run: |
+          set -eu
           uname -a
           go version
           golangci-lint --version
-          if [ ! -f tools/xopsvet/go.mod ] && [ ! -f core/go.mod ]; then
-            TMP_SMOKE="$(mktemp -d /tmp/xops-ci/smoke.XXXXXX)"
-            trap 'rm -rf "$TMP_SMOKE"' EXIT
-            printf 'module xops.local/smoke\n\ngo 1.27\n' > "$TMP_SMOKE/go.mod"
-            printf 'package smoke\nimport ("sync/atomic"; "testing")\nfunc TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }\n' > "$TMP_SMOKE/smoke_test.go"
-            (cd "$TMP_SMOKE" && GOWORK=off go test -v -race -count=1 ./...)
-            exit 0
-          fi
-          mkdir -p bin
-          VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
-          (cd tools/xopsvet && GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet)
-          (cd core && GOWORK=off go build ./... && GOWORK=off go vet -vettool="$VETTOOL" ./... && GOWORK=off go test -race -shuffle=on -count=1 ./...)
+          go run ./scripts/ci/verify.go --stage=all
