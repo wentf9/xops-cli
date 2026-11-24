@@ -27,7 +27,7 @@ func bannedFileAndSocket(r *os.Root) { // want "core/osfs 之外禁止直接调�
 	_ = os.WriteFile("a", nil, 0o600)              // want "core/osfs 之外禁止直接调用裸 OS"
 	_, _ = os.OpenRoot("/tmp")                     // want "core/osfs 之外禁止直接调用裸 OS"
 	_, _ = r.Open("b")                             // want "core/osfs 之外禁止调用 os.Root 方法"
-	_ = syscall.Flock(0, syscall.LOCK_EX)          // want "core/osfs 之外禁止直接调用裸 OS"
+	_, _ = syscall.Open("a", 0, 0)                 // want "core/osfs 之外禁止直接调用裸 OS"
 	_, _ = net.ListenUnix("unix", &net.UnixAddr{}) // want "core/osfs 之外禁止直接调用裸 OS"
 	_, _ = net.Listen("unix", "/tmp/x.sock")       // want "core/osfs 之外禁止直接创建 Unix Domain Socket 监听"
 }

@@ -522,8 +522,10 @@ if [[ "$OVERALL_RC" -ne 0 ]]; then
   echo "!!! 失败目标详细日志 !!!"
   for t in "${!RESULTS[@]}"; do
     if [[ "${RESULTS[$t]}" == "FAIL" ]]; then
-      echo "--- [$t] ---"
-      tail -n 80 "${LOG_DIR}/${t}.log" || true
+      echo "--- [$t] 失败摘要 ---"
+      grep -nE 'FAIL:|ERROR:|analysistest\.go' "${LOG_DIR}/${t}.log" | head -n 40 || true
+      echo "--- [$t] 末尾日志 ---"
+      tail -n 60 "${LOG_DIR}/${t}.log" || true
     fi
   done
 fi

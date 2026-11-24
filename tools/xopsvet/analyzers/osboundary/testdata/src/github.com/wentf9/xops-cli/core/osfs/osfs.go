@@ -16,7 +16,7 @@ func UseAllowedOSFS(r *os.Root, sock string) error {
 	if err == nil {
 		_ = f.Close()
 	}
-	_ = syscall.Flock(0, syscall.LOCK_EX)
+	_, _ = syscall.Open("data.txt", 0, 0)
 	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: sock, Net: "unix"})
 	if err == nil {
 		_ = ln.Close()
