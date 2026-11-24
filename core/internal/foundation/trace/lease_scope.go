@@ -7,9 +7,11 @@ import (
 
 type leaseScopeCtxKey struct{}
 
-// LeaseScope 表示连接租约作用域标记，用于在池租约用户回调入口处标记活跃租约，
-// 配合 CheckNonReentrant 防止用户回调内隐式重入再次向连接池申请租约导致通道自锁。
-// 零值代表无效作用域（IsValid() == false）。
+// LeaseScope 表示全局单层不可重入连接租约作用域标记。
+//
+// 本类型仅限连接池在进入用户租约回调（fn(scopedCtx, sess)）入口处注入，严禁 gate、vault、osfs 等其他层级借用；
+// 配合 CheckNonReentrant 阻止任何同池或跨池（跨 domain）嵌套二次申请连接租约，从根源消除多池 AB-BA 死锁与通道自锁。
+// 其中 domain 仅作为只读诊断归属标签，绝不用于豁免跨池重入。零值代表无效作用域（IsValid() == false）。
 //
 //xops:opaque
 //xops:failclosed
@@ -18,8 +20,8 @@ type LeaseScope struct {
 	leaseID string
 }
 
-// NewLeaseScope 校验并构造 LeaseScope。
-// domain 与 leaseID 均须为长度 1..128 的可打印非空白 ASCII 字符串，否则返回 ErrInvalidLeaseScope。
+// NewLeaseScope 校验并构造全局单层连接租约作用域 LeaseScope。
+// domain 仅作为只读诊断归属标签，与 leaseID 均须为长度 1..128 的可打印非空白 ASCII 字符串，否则返回 ErrInvalidLeaseScope。
 func NewLeaseScope(domain string, leaseID string) (LeaseScope, error) {
 	if !isValidToken(domain) || !isValidToken(leaseID) {
 		return LeaseScope{}, ErrInvalidLeaseScope
@@ -35,7 +37,7 @@ func (s LeaseScope) IsValid() bool {
 	return s.domain != "" && s.leaseID != ""
 }
 
-// Domain 返回租约作用域名称（零值返回空串）。
+// Domain 返回只读诊断归属标签（零值返回空串）；该标签仅用于追踪定位，不构成可重入隔离域。
 func (s LeaseScope) Domain() string {
 	return s.domain
 }
@@ -50,9 +52,9 @@ func (s LeaseScope) Equal(other LeaseScope) bool {
 	return s.domain == other.domain && s.leaseID == other.leaseID
 }
 
-// WithLeaseScope 将合法的 LeaseScope 标记注入派生上下文。
-// 若 ctx 为 nil（ErrNilContext）、scope 无效（ErrInvalidLeaseScope）或 ctx 已处于活跃租约作用域内（ErrReentrantLease），
-// 均采用失败关闭策略直接拒绝并返回错误。
+// WithLeaseScope 将合法的全局单层连接租约作用域标记注入派生上下文（仅限连接池租约回调入口调用）。
+// 若 ctx 为 nil（ErrNilContext）、scope 无效（ErrInvalidLeaseScope）或 ctx 已处于任意活跃连接租约作用域内
+// （无论 domain 相同与否，均返回 ErrReentrantLease），均采用失败关闭策略直接拒绝并返回错误。
 func WithLeaseScope(ctx context.Context, scope LeaseScope) (context.Context, error) {
 	if ctx == nil {
 		return nil, ErrNilContext
@@ -79,14 +81,14 @@ func LeaseScopeFromContext(ctx context.Context) (LeaseScope, bool) {
 	return scope, true
 }
 
-// InLeaseScope 报告 ctx 当前是否已处于活跃的 LeaseScope 中。
+// InLeaseScope 报告 ctx 当前是否已处于全局单层活跃连接租约作用域中。
 func InLeaseScope(ctx context.Context) bool {
 	_, ok := LeaseScopeFromContext(ctx)
 	return ok
 }
 
-// CheckNonReentrant 校验当前上下文未处于任何活跃租约作用域内。
-// 若 ctx 为 nil，失败关闭返回 ErrNilContext；若检测到活跃作用域，则返回包装了 ErrReentrantLease 的错误。
+// CheckNonReentrant 校验当前上下文未处于任何活跃连接租约作用域内（全局单层防重入，不按 domain 豁免）。
+// 若 ctx 为 nil，失败关闭返回 ErrNilContext；若检测到活跃作用域，则返回包装了 ErrReentrantLease 并附带诊断归属信息的错误。
 func CheckNonReentrant(ctx context.Context) error {
 	if ctx == nil {
 		return ErrNilContext

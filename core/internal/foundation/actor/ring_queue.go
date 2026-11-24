@@ -1,4 +1,4 @@
-package conc
+package actor
 
 // ringQueue 是一个非线程安全的无界泛型环形切片队列，
 // 专供 DualActor 在极薄互斥锁保护下承载零阻塞控制通道消息，避免定长通道满溢造成反压死锁。

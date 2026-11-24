@@ -29,8 +29,8 @@ var ErrInvalidLeaseScope = errors.New("trace: LeaseScope 无效")
 // ErrNilContext 表示传入的 context.Context 为 nil（拒绝隐式回退到 Background）。
 var ErrNilContext = errors.New("trace: context 不能为 nil")
 
-// ErrReentrantLease 表示当前上下文已处于某个活跃租约作用域内，禁止嵌套或重入申请租约。
-var ErrReentrantLease = errors.New("trace: 检测到同作用域重入申请连接租约")
+// ErrReentrantLease 表示当前上下文已处于全局活跃连接租约作用域内，禁止任何同池或跨池嵌套重入申请租约。
+var ErrReentrantLease = errors.New("trace: 当前上下文已处于活跃连接租约作用域，禁止重入申请租约")
 
 type traceCtxKey struct{}
 

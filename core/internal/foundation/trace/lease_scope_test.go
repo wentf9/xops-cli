@@ -101,7 +101,7 @@ func TestLeaseScopeAntiReentrancyAndIsolation(t *testing.T) {
 		t.Fatalf("LeaseScopeFromContext = (%+v, %v), want %+v", got, ok, scope1)
 	}
 
-	// 同作用域或嵌套二次进入均必须触发 ErrReentrantLease 失败关闭。
+	// 全局单层不可重入：任意二次进入均必须触发 ErrReentrantLease 失败关闭。
 	if reentrantErr := CheckNonReentrant(scopedCtx); !errors.Is(reentrantErr, ErrReentrantLease) {
 		t.Fatalf("CheckNonReentrant(scopedCtx) error = %v, want ErrReentrantLease", reentrantErr)
 	}
@@ -110,6 +110,34 @@ func TestLeaseScopeAntiReentrancyAndIsolation(t *testing.T) {
 	}
 	if err := CheckNonReentrant(baseCtx); err != nil {
 		t.Fatalf("baseCtx polluted: %v", err)
+	}
+}
+
+func TestLeaseScopeRejectsCrossDomainNestedReentrancy(t *testing.T) {
+	poolAScope, err := NewLeaseScope("ssh-pool-primary", "lease-a1")
+	if err != nil {
+		t.Fatalf("NewLeaseScope(poolA) failed: %v", err)
+	}
+	poolBScope, err := NewLeaseScope("sftp-pool-secondary", "lease-b2")
+	if err != nil {
+		t.Fatalf("NewLeaseScope(poolB) failed: %v", err)
+	}
+
+	scopedCtx, err := WithLeaseScope(context.Background(), poolAScope)
+	if err != nil {
+		t.Fatalf("WithLeaseScope(poolA) failed: %v", err)
+	}
+
+	// domain 仅作诊断归属标签，跨 domain 嵌套重入同样必须被全局单层约束拒绝，避免多池 AB-BA 死锁。
+	_, crossErr := WithLeaseScope(scopedCtx, poolBScope)
+	if !errors.Is(crossErr, ErrReentrantLease) {
+		t.Fatalf("cross-domain WithLeaseScope error = %v, want ErrReentrantLease", crossErr)
+	}
+	if !strings.Contains(crossErr.Error(), "domain=ssh-pool-primary") || !strings.Contains(crossErr.Error(), "lease=lease-a1") {
+		t.Fatalf("cross-domain error missing active scope attribution: %q", crossErr.Error())
+	}
+	if strings.Contains(crossErr.Error(), "同作用域") {
+		t.Fatalf("ErrReentrantLease text must not mislead with same-scope wording: %q", crossErr.Error())
 	}
 }
 

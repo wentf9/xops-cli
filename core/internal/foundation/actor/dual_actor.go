@@ -1,4 +1,4 @@
-package conc
+package actor
 
 import (
 	"context"
@@ -19,10 +19,11 @@ type DualActorConfig[Req any, Ctrl any] struct {
 	OnDrainRequest func(req Req)
 }
 
-// DualActor 是一个双通道纯内存并发 Actor：
+// DualActor 是一个双通道纯内存并发 Actor（零裸 go，由调用方在 core/conc.Nursery 中运行）：
 //   - 控制面（Ctrl）：通过极薄互斥锁保护的无界环形队列 ctrlQueue 与容量为 1 的非阻塞唤醒通道 controlReady 传递，
 //     确保高并发归还租约、熔断通知等控制消息永不阻塞发送方。
-//   - 请求面（Req）：通过有界通道 acquireCh 提供确定性背压。
+//   - 请求面（Req）：通过有界通道 acquireCh 提供确定性背压，并由 acqMu + acqClosed + acqSenders 组成入站发送者屏障，
+//     保证停机排空阶段零丢弃任何已返回 nil 的 SendAcquire 请求。
 //   - 调度循环采用两段式 select：阶段 1 排空全部控制消息后，阶段 2 才同时监听控制唤醒与请求通道，
 //     并在处理每条请求前再次排空控制队列以消除 select 随机选择带来的优先级竞态窗口。
 //
@@ -33,6 +34,10 @@ type DualActor[Req any, Ctrl any] struct {
 	controlReady chan struct{}
 	stopCh       chan struct{}
 	actorDone    chan struct{}
+
+	acqMu      sync.Mutex
+	acqClosed  bool
+	acqSenders sync.WaitGroup
 
 	ctrlMu     sync.Mutex
 	ctrlQueue  ringQueue[Ctrl]
@@ -99,8 +104,9 @@ func (a *DualActor[Req, Ctrl]) SendControl(ctrl Ctrl) bool {
 	return true
 }
 
-// SendAcquire 向有界请求通道 acquireCh 提交一条请求，受背压与 ctx 取消控制，
-// 并持续监听 stopCh 与 actorDone 以确保 Actor 停机时永不阻塞。
+// SendAcquire 向有界请求通道 acquireCh 提交一条请求，受背压与 ctx 取消控制。
+// 执行顺序严格遵循：未初始化/nil 校验 -> 无锁停机快检（优先于 ctx.Err()）-> 锁外 ctx.Err() 校验
+// -> acqMu 发送者屏障登记 -> 阻塞投递，确保绝不持锁调用外部 ctx.Err() 且停机零丢请求。
 func (a *DualActor[Req, Ctrl]) SendAcquire(ctx context.Context, req Req) error {
 	if a == nil || !a.initialized {
 		return ErrActorNotInitialized
@@ -114,6 +120,17 @@ func (a *DualActor[Req, Ctrl]) SendAcquire(ctx context.Context, req Req) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+
+	// 在 acqMu 临界区内原子核验 acqClosed 并登记在途发送者，保证与 drainAndStop 中 acqSenders.Wait 的严格先后关系。
+	a.acqMu.Lock()
+	if a.acqClosed {
+		a.acqMu.Unlock()
+		return ErrActorStopped
+	}
+	a.acqSenders.Add(1)
+	a.acqMu.Unlock()
+	defer a.acqSenders.Done()
+
 	select {
 	case a.acquireCh <- req:
 		return nil
@@ -137,14 +154,22 @@ func (a *DualActor[Req, Ctrl]) isStopping() bool {
 	}
 }
 
+// beginStop 原子关闭入站请求门闩并幂等关闭 stopCh，唤醒全部阻塞发送方并阻止新的在途发送者登记。
+func (a *DualActor[Req, Ctrl]) beginStop() {
+	a.acqMu.Lock()
+	a.acqClosed = true
+	a.acqMu.Unlock()
+	a.stopOnce.Do(func() {
+		close(a.stopCh)
+	})
+}
+
 // Stop 请求 DualActor 停止调度循环并进入停机排空阶段（幂等且非阻塞）。
 func (a *DualActor[Req, Ctrl]) Stop() {
 	if a == nil || !a.initialized {
 		return
 	}
-	a.stopOnce.Do(func() {
-		close(a.stopCh)
-	})
+	a.beginStop()
 }
 
 // Done 返回一个在 Actor 主循环完全排空并退出后关闭的只读信号通道。
@@ -159,7 +184,8 @@ func (a *DualActor[Req, Ctrl]) Done() <-chan struct{} {
 }
 
 // Run 启动 DualActor 的单线程串行事件循环，直至 Stop 被调用或 ctx 被取消。
-// 每个 DualActor 实例仅允许运行一次 Run；退出前会自动完成停机排空并关闭 Done() 通道。
+// 每个 DualActor 实例仅允许运行一次 Run；正常退出会完整排空请求与控制队列，
+// 回调发生 panic 时会通过 LIFO defer 封锁新入站并清空控制队列滞留指针，最后关闭 Done() 通道。
 func (a *DualActor[Req, Ctrl]) Run(ctx context.Context) error {
 	if a == nil || !a.initialized {
 		return ErrActorNotInitialized
@@ -171,6 +197,15 @@ func (a *DualActor[Req, Ctrl]) Run(ctx context.Context) error {
 		return ErrActorAlreadyStarted
 	}
 	defer close(a.actorDone)
+	// LIFO 异常防护：若回调发生 panic 跳过 drainAndStop，仍在关闭 actorDone 之前封锁新入站、
+	// 关闭控制队列并清空未消费槽位指针（不调用 acqSenders.Wait 以防异常路径挂起）。
+	defer func() {
+		a.beginStop()
+		a.ctrlMu.Lock()
+		a.ctrlClosed = true
+		a.ctrlQueue.popAll(nil)
+		a.ctrlMu.Unlock()
+	}()
 
 	for {
 		stopped, err := a.step(ctx)
@@ -240,9 +275,15 @@ func (a *DualActor[Req, Ctrl]) popControlBatch(dst []Ctrl) []Ctrl {
 	return batch
 }
 
-// drainAndStop 按序排空：先处理现有控制消息，再排空 acquireCh 中已缓冲的请求，
-// 最后在 ctrlMu 下原子置位 ctrlClosed=true 并排空剩余控制消息，确保不漏处理任何已返回 true 的 SendControl。
+// drainAndStop 严格按 5 步顺序执行停机排空：
+// 1) beginStop 关闭入站门闩与 stopCh；
+// 2) acqSenders.Wait 等待全部在途 SendAcquire 退出（此后零协程能再写入 acquireCh）；
+// 3) drainControls 优先排空当前已入队的控制消息；
+// 4) drainAcquireCh 排空 acquireCh 中全部残留请求；
+// 5) closeAndDrainControls 在 ctrlMu 下置位 ctrlClosed=true 并排空剩余控制消息。
 func (a *DualActor[Req, Ctrl]) drainAndStop() {
+	a.beginStop()
+	a.acqSenders.Wait()
 	a.drainControls()
 	a.drainAcquireCh()
 	a.closeAndDrainControls()

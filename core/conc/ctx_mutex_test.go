@@ -56,7 +56,7 @@ func TestCtxMutexMutualExclusionAndTryLock(t *testing.T) {
 	var inCritical atomic.Int32
 	var maxObserved atomic.Int32
 
-	err := Run(context.Background(), func(_ context.Context, n *Nursery) error {
+	err := RunWait(context.Background(), func(_ context.Context, n *Nursery) error {
 		for range 8 {
 			if goErr := n.Go(func(childCtx context.Context) error {
 				return hammerCtxMutex(childCtx, mu, &inCritical, &maxObserved)
@@ -67,7 +67,7 @@ func TestCtxMutexMutualExclusionAndTryLock(t *testing.T) {
 		return nil
 	})
 	if err != nil {
-		t.Fatalf("Run failed: %v", err)
+		t.Fatalf("RunWait failed: %v", err)
 	}
 	if maxObserved.Load() != 1 {
 		t.Fatalf("maxObserved in critical section = %d, want 1", maxObserved.Load())
