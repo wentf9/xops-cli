@@ -18,6 +18,7 @@ func (b EmbeddedBase) WriteCanonical(w io.Writer) {
 }
 
 // 合法：全字段覆盖（含跨文件 WriteCanonical、嵌入直接访问、合法 hash-exclude、空白字段 _）
+//
 //xops:canonicalhash
 type ValidPlan struct {
 	EmbeddedBase
@@ -27,6 +28,7 @@ type ValidPlan struct {
 }
 
 // 合法：通过提升字段全部覆盖嵌入体 + 同包辅助函数递归 + 接收者别名
+//
 //xops:canonicalhash
 type PromotedAndHelperPlan struct {
 	EmbeddedBase
@@ -51,6 +53,7 @@ func (p *PromotedAndHelperPlan) writeToken(w io.Writer) {
 }
 
 // 合法：泛型 //xops:canonicalhash 结构体 + 泛型辅助方法
+//
 //xops:canonicalhash
 type GenericBox[T any] struct {
 	Head string
@@ -68,10 +71,12 @@ func (g *GenericBox[T]) writeBody(w io.Writer) {
 }
 
 // 非法：标注在非结构体上
+//
 //xops:canonicalhash
 type NotAStruct int // want "digestcover: //xops:canonicalhash 仅适用于结构体类型"
 
 // 非法：缺少 WriteCanonical 方法
+//
 //xops:canonicalhash
 type MissingMethod struct { // want "digestcover: 标记 //xops:canonicalhash 的结构体 MissingMethod 缺少 WriteCanonical 方法"
 	Name string
@@ -83,6 +88,7 @@ type EmptyExcludeOnPlain struct {
 }
 
 // 非法：遗漏字段 + _ = h.Field 空弃反绕过 + 读取同名其他变量 other.Field + LHS 写入
+//
 //xops:canonicalhash
 type BypassAttempts struct {
 	Real    string
@@ -101,6 +107,7 @@ func (b *BypassAttempts) WriteCanonical(w io.Writer) { // want "digestcover: 结
 }
 
 // 非法：部分提升字段（覆盖 Host 但漏掉 Port）
+//
 //xops:canonicalhash
 type PartialPromoted struct {
 	EmbeddedBase
@@ -111,6 +118,7 @@ func (p PartialPromoted) WriteCanonical(w io.Writer) { // want "digestcover: 结
 }
 
 // 非法：WriteCanonical 内使用 reflect
+//
 //xops:canonicalhash
 type UsesReflect struct {
 	Name string
@@ -121,6 +129,7 @@ func (u UsesReflect) WriteCanonical(w io.Writer) {
 }
 
 // 非法：跨包嵌入含未导出字段时仅访问提升导出字段不够，必须直接访问嵌入体自身
+//
 //xops:canonicalhash
 type ExtPromotedInsufficient struct {
 	extbase.ExtBase
@@ -131,6 +140,7 @@ func (e ExtPromotedInsufficient) WriteCanonical(w io.Writer) { // want "digestco
 }
 
 // 合法：跨包嵌入直接调用嵌入体 WriteCanonical
+//
 //xops:canonicalhash
 type ExtDirectValid struct {
 	extbase.ExtBase
@@ -141,6 +151,7 @@ func (e ExtDirectValid) WriteCanonical(w io.Writer) {
 }
 
 // Challenge 4: var _ = h.A、_ = &h.B、var _ = &h.C、h.D++、h.E--、h.F += 1 均不得计入覆盖
+//
 //xops:canonicalhash
 type BypassDiscardForms struct {
 	A string
@@ -278,6 +289,7 @@ func (o *OuterDirectInnerValid) WriteCanonical(w io.Writer) {
 }
 
 // Challenger 2 - Challenge 3: o.Middle.LeafA 等显式子字段选择不得将整个嵌入体标记为已覆盖。
+//
 //xops:canonicalhash
 type OuterDirectMiddleBypass struct {
 	MiddleLayer
@@ -372,6 +384,7 @@ func (o *OuterExtDirectFieldBypass) WriteCanonical(w io.Writer) { // want "diges
 }
 
 // Challenger 3 - Challenge 3: (&o.Middle).LeafA / (*(&o.MiddlePtr)).LeafA 等取址后缀不得标记整个嵌入体已覆盖。
+//
 //xops:canonicalhash
 type OuterAddrOfBaseBypass struct {
 	MiddleLayer

@@ -30,9 +30,9 @@ func TestHasSerializationTagsMalformedTagTolerance(t *testing.T) {
 			},
 		},
 	}
-	hasTags, err := hasSerializationTags(stWithLaterValid)
-	if err != nil || !hasTags {
-		t.Fatalf("expected (true, nil) when later field has valid json tag, got (%v, %v)", hasTags, err)
+	tags, err := vetutil.StructSerialTags(stWithLaterValid)
+	if err != nil || !tags.Any() {
+		t.Fatalf("expected (true, nil) when later field has valid json tag, got (%+v, %v)", tags, err)
 	}
 
 	stOnlyMalformed := &ast.StructType{
@@ -46,9 +46,9 @@ func TestHasSerializationTagsMalformedTagTolerance(t *testing.T) {
 			},
 		},
 	}
-	hasTags, err = hasSerializationTags(stOnlyMalformed)
-	if err == nil || hasTags {
-		t.Fatalf("expected (false, non-nil err) when only malformed tag exists, got (%v, %v)", hasTags, err)
+	tags, err = vetutil.StructSerialTags(stOnlyMalformed)
+	if err == nil || tags.Any() {
+		t.Fatalf("expected (false, non-nil err) when only malformed tag exists, got (%+v, %v)", tags, err)
 	}
 }
 

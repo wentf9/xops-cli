@@ -4,365 +4,246 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
-	"slices"
 
+	"github.com/wentf9/xops-cli/tools/xopsvet/internal/secretfact"
+	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetssa"
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
+	"golang.org/x/tools/go/ssa"
 )
 
-// maxAliasIters 限制局部借用别名、闭包引用与 range 传播的最大不动点迭代轮次。
-const maxAliasIters = 32
+const maxLeaseAuditDepth = 8
 
-type taintedClosureInfo struct {
-	lit        *ast.FuncLit
-	ownerScope *types.Scope
+type leaseEngine struct {
+	pass        *analysis.Pass
+	ssaInfo     *buildssa.SSA
+	facts       *factIndex
+	secretFacts *secretfact.Result
+	tracker     *vetssa.AuditTracker
+	diags       []vetutil.Diag
 }
 
-type closureState struct {
-	pass            *analysis.Pass
-	facts           *factIndex
-	borrowed        map[*types.Var]*types.Scope
-	resultVars      map[*types.Var]bool
-	localFuncLits   map[*types.Var][]*ast.FuncLit
-	taintedClosures map[*types.Var]taintedClosureInfo
-	syncLits        map[*ast.FuncLit][]int
-	goCalls         map[*ast.CallExpr]bool
-	visitedLits     map[*ast.FuncLit]bool
-	reported        map[token.Pos]bool
+type leaseScope struct {
+	eng             *leaseEngine
+	fn              *ssa.Function
+	depth           int
+	ownScope        vetssa.ScopeRange
+	borrowed        map[ssa.Value]vetssa.ScopeRange
+	callerParams    map[ssa.Value]bool
+	outerShared     map[ssa.Value]vetssa.ScopeRange
+	closureVals     map[ssa.Value]*ssa.MakeClosure
+	reportedAppends map[*ssa.Call]bool
+	namedResAllocs  map[*ssa.Alloc]bool
 }
 
-func analyzePackageFunctions(pass *analysis.Pass, facts *factIndex) {
-	visitedLits := make(map[*ast.FuncLit]bool)
-	reported := make(map[token.Pos]bool)
-
-	for _, file := range pass.Files {
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			analyzeFuncDecl(pass, facts, fn, visitedLits, reported)
-		}
-	}
-	analyzeRemainingFuncLits(pass, facts, visitedLits, reported)
-}
-
-func analyzeFuncDecl(
-	pass *analysis.Pass,
-	facts *factIndex,
-	fn *ast.FuncDecl,
-	visitedLits map[*ast.FuncLit]bool,
-	reported map[token.Pos]bool,
-) {
-	st := newClosureState(pass, facts, visitedLits, reported)
-	fnObj, _ := pass.TypesInfo.Defs[fn.Name].(*types.Func)
-	if fnObj != nil {
-		if direct := facts.directParams[fnObj]; len(direct) > 0 {
-			st.seedParamsFromFuncType(fn.Type, direct)
-			st.collectResultVars(fn.Type)
-		}
-	}
-	st.analyzeSyncTree(fn.Body)
-}
-
-func analyzeRemainingFuncLits(
-	pass *analysis.Pass,
-	facts *factIndex,
-	visitedLits map[*ast.FuncLit]bool,
-	reported map[token.Pos]bool,
-) {
-	ins := vetutil.InspectorOf(pass)
-	ins.Preorder([]ast.Node{(*ast.FuncLit)(nil)}, func(n ast.Node) {
-		lit, ok := n.(*ast.FuncLit)
-		if !ok || lit.Body == nil || visitedLits[lit] {
-			return
-		}
-		st := newClosureState(pass, facts, visitedLits, reported)
-		comments := facts.commentsFor(pass.Fset, lit.Pos())
-		explicit := collectExplicitParamIndices(pass.Fset, comments, lit.Type.Params, vetutil.DirectiveBorrowed)
-		if len(explicit) > 0 {
-			st.seedParamsFromFuncType(lit.Type, explicit)
-			st.collectResultVars(lit.Type)
-		}
-		visitedLits[lit] = true
-		st.analyzeSyncTree(lit.Body)
-	})
-}
-
-func newClosureState(
-	pass *analysis.Pass,
-	facts *factIndex,
-	visitedLits map[*ast.FuncLit]bool,
-	reported map[token.Pos]bool,
-) *closureState {
-	return &closureState{
-		pass:            pass,
-		facts:           facts,
-		borrowed:        make(map[*types.Var]*types.Scope),
-		resultVars:      make(map[*types.Var]bool),
-		localFuncLits:   make(map[*types.Var][]*ast.FuncLit),
-		taintedClosures: make(map[*types.Var]taintedClosureInfo),
-		syncLits:        make(map[*ast.FuncLit][]int),
-		goCalls:         make(map[*ast.CallExpr]bool),
-		visitedLits:     visitedLits,
-		reported:        reported,
-	}
-}
-
-func (s *closureState) seedParamsFromFuncType(ft *ast.FuncType, indices []int) {
-	if ft == nil || ft.Params == nil || len(indices) == 0 {
+// analyzePackageLeases 在全包 SSA 上扫描全部 //xops:borrowed 入口并执行零逃逸分析。
+func analyzePackageLeases(pass *analysis.Pass, s *buildssa.SSA, facts *factIndex, secretFacts *secretfact.Result) {
+	if s == nil {
 		return
 	}
-	ownerScope := s.pass.TypesInfo.Scopes[ft]
-	if ownerScope == nil {
+	eng := &leaseEngine{pass: pass, ssaInfo: s, facts: facts, secretFacts: secretFacts, tracker: vetssa.NewAuditTracker()}
+	for _, fn := range vetssa.AllFuncs(s) {
+		eng.auditDirectEntryFunc(fn)
+		vetssa.ForEachInst(fn, eng.scanInstForBorrowedCall)
+	}
+	vetutil.ReportSortedDedup(pass, eng.diags, false)
+}
+
+func (e *leaseEngine) auditDirectEntryFunc(fn *ssa.Function) {
+	if len(fn.Blocks) == 0 {
 		return
 	}
-	vars := flattenFieldVars(s.pass.TypesInfo, ft.Params)
-	for _, idx := range indices {
-		if idx >= 0 && idx < len(vars) && vars[idx] != nil {
-			s.borrowed[vars[idx]] = ownerScope
+	if indices := e.facts.directParams[vetssa.OriginFuncObj(fn)]; len(indices) > 0 {
+		e.auditFunc(fn, indicesToMap(indices, vetssa.HasRecvParam(fn)), nil, vetssa.ScopeRangeOfFunc(fn), 0, nil)
+	}
+	if lit, ok := fn.Syntax().(*ast.FuncLit); ok && lit != nil && lit.Type != nil {
+		if indices := collectExplicitParamIndices(e.pass.Fset, e.facts.commentsFor(e.pass.Fset, lit.Pos()), lit.Type.Params, vetutil.DirectiveBorrowed); len(indices) > 0 {
+			e.auditFunc(fn, indicesToMap(indices, 0), nil, vetssa.ScopeRangeOfFunc(fn), 0, nil)
 		}
 	}
 }
 
-func (s *closureState) collectResultVars(ft *ast.FuncType) {
-	if ft == nil || ft.Results == nil {
-		return
-	}
-	for _, v := range flattenFieldVars(s.pass.TypesInfo, ft.Results) {
-		if v != nil {
-			s.resultVars[v] = true
+func (e *leaseEngine) scanInstForBorrowedCall(inst ssa.Instruction) {
+	switch ins := inst.(type) {
+	case ssa.CallInstruction:
+		e.scanCallBorrowedCallbacks(ins, nil, nil)
+	case *ssa.ChangeType:
+		if direct := e.namedFuncDirectBorrowed(ins.Type()); len(direct) > 0 {
+			e.auditCallbackTargets(ins.X, direct, nil, nil)
 		}
 	}
 }
 
-func flattenFieldVars(info *types.Info, fl *ast.FieldList) []*types.Var {
-	vars, _ := flattenFieldVarsWithVariadic(info, fl)
-	return vars
-}
-
-func flattenFieldVarsWithVariadic(info *types.Info, fl *ast.FieldList) ([]*types.Var, bool) {
-	if fl == nil {
-		return nil, false
-	}
-	var vars []*types.Var
-	isVariadic := false
-	for i, f := range fl.List {
-		if i == len(fl.List)-1 {
-			if _, ok := ast.Unparen(f.Type).(*ast.Ellipsis); ok {
-				isVariadic = true
-			}
-		}
-		if len(f.Names) == 0 {
-			vars = append(vars, nil)
+func (e *leaseEngine) scanCallBorrowedCallbacks(callInst ssa.CallInstruction, outerBorrowed, outerShared map[ssa.Value]vetssa.ScopeRange) {
+	rc := vetssa.ResolveCall(e.ssaInfo, callInst)
+	spec := resolveSSACallLeaseSpec(e.pass, e.facts, e.secretFacts, rc)
+	for argIdx, innerIndices := range spec.callbackBorrowed {
+		if argIdx >= len(rc.UserArgs) || len(innerIndices) == 0 {
 			continue
 		}
-		for _, id := range f.Names {
-			v, _ := info.Defs[id].(*types.Var)
-			vars = append(vars, v)
-		}
-	}
-	return vars, isVariadic
-}
-
-func (s *closureState) analyzeSyncTree(root *ast.BlockStmt) {
-	s.collectGoCalls(root)
-	// 最多执行 32 轮不动点迭代，覆盖深层变量别名链、本地闭包重赋值、类型断言与 range/copy 传播。
-	for range maxAliasIters {
-		prevBorrowed := len(s.borrowed)
-		prevTainted := len(s.taintedClosures)
-		changed := false
-		s.walkSyncBody(root, func(n ast.Node) {
-			if s.propagateNode(n) {
-				changed = true
+		arg := rc.UserArgs[argIdx]
+		if varElems := vetssa.ExtractVarargsElements(arg); len(varElems) > 0 {
+			for _, elem := range varElems {
+				e.auditCallbackTargets(elem, innerIndices, outerBorrowed, outerShared)
 			}
-		})
-		if !changed && len(s.borrowed) == prevBorrowed && len(s.taintedClosures) == prevTainted {
-			break
+		} else {
+			e.auditCallbackTargets(arg, innerIndices, outerBorrowed, outerShared)
 		}
-	}
-	if len(s.borrowed) == 0 && len(s.taintedClosures) == 0 {
-		return
-	}
-	s.walkSyncBody(root, func(n ast.Node) {
-		s.checkEscapeNode(n)
-	})
-}
-
-func (s *closureState) collectGoCalls(root *ast.BlockStmt) {
-	ast.Inspect(root, func(n ast.Node) bool {
-		if stmt, ok := n.(*ast.GoStmt); ok && stmt.Call != nil {
-			s.goCalls[stmt.Call] = true
-		}
-		return true
-	})
-}
-
-// walkSyncBody 遍历同步块内节点，不直接穿透非同步 FuncLit；
-// 仅当 FuncLit 作为同步调用实参/IIFE 或已标记同步的本地闭包变量被调用时才显式进入。
-// seenInWalk 防止局部递归闭包（如 fn = func() { fn() }）导致无限递归。
-func (s *closureState) walkSyncBody(body *ast.BlockStmt, visit func(ast.Node)) {
-	s.walkSyncBodySeen(body, make(map[*ast.BlockStmt]bool), visit)
-}
-
-func (s *closureState) walkSyncBodySeen(body *ast.BlockStmt, seenInWalk map[*ast.BlockStmt]bool, visit func(ast.Node)) {
-	if body == nil || seenInWalk[body] {
-		return
-	}
-	seenInWalk[body] = true
-	var enterQueue []*ast.FuncLit
-	ast.Inspect(body, func(n ast.Node) bool {
-		if n == nil {
-			return false
-		}
-		if _, ok := n.(*ast.FuncLit); ok {
-			return false
-		}
-		visit(n)
-		if call, ok := n.(*ast.CallExpr); ok {
-			enterQueue = append(enterQueue, s.discoverSyncCallLits(call)...)
-		}
-		return true
-	})
-	for _, lit := range enterQueue {
-		s.enterSyncFuncLit(lit, seenInWalk, visit)
 	}
 }
 
-func (s *closureState) enterSyncFuncLit(lit *ast.FuncLit, seenInWalk map[*ast.BlockStmt]bool, visit func(ast.Node)) {
-	s.visitedLits[lit] = true
-	if lit.Type != nil {
-		comments := s.facts.commentsFor(s.pass.Fset, lit.Pos())
-		if explicit := collectExplicitParamIndices(s.pass.Fset, comments, lit.Type.Params, vetutil.DirectiveBorrowed); len(explicit) > 0 {
-			s.seedParamsFromFuncType(lit.Type, explicit)
+func (e *leaseEngine) auditCallbackTargets(cbVal ssa.Value, innerIndices []int, outerBorrowed, outerShared map[ssa.Value]vetssa.ScopeRange) {
+	targets, _ := vetssa.ResolveFuncValues(cbVal)
+	for _, tgt := range targets {
+		switch t := tgt.(type) {
+		case *ssa.MakeClosure:
+			if fn, ok := t.Fn.(*ssa.Function); ok && fn != nil && len(fn.Blocks) > 0 {
+				e.auditFunc(fn, indicesToMap(innerIndices, 0), vetssa.CollectCaptured(t, fn, outerBorrowed), vetssa.ScopeRangeOfFunc(fn), 0, outerShared)
+			}
+		case *ssa.Function:
+			if origFn := vetssa.UnwrapOriginFunc(t); vetssa.IsSamePackageFunc(e.ssaInfo, origFn) && len(origFn.Blocks) > 0 {
+				e.auditFunc(origFn, indicesToMap(innerIndices, vetssa.HasRecvParam(origFn)), nil, vetssa.ScopeRangeOfFunc(origFn), 0, nil)
+			}
 		}
-		if indices := s.syncLits[lit]; len(indices) > 0 {
-			s.seedParamsFromFuncType(lit.Type, indices)
-		}
-		s.collectResultVars(lit.Type)
 	}
-	s.walkSyncBodySeen(lit.Body, seenInWalk, visit)
 }
 
-func (s *closureState) discoverSyncCallLits(call *ast.CallExpr) []*ast.FuncLit {
-	if s.goCalls[call] {
+func (e *leaseEngine) namedFuncDirectBorrowed(t types.Type) []int {
+	if t == nil {
 		return nil
 	}
-	spec := resolveCallLeaseSpec(s.pass, s.facts, call)
-	funLits := s.resolveArgFuncLits(call.Fun)
-	lits := make([]*ast.FuncLit, 0, len(funLits))
-	for _, funLit := range funLits {
-		s.seedCallArgsToFuncLit(funLit, call.Args)
-		lits = append(lits, funLit)
-	}
-	if len(funLits) > 0 {
-		spec.syncClosure = true
-	}
-	if !spec.syncClosure {
-		return lits
-	}
-	for i, arg := range call.Args {
-		lits = s.collectSyncArgLits(arg, spec.callbackBorrowed[i], lits)
-	}
-	return lits
-}
-
-func (s *closureState) collectSyncArgLits(arg ast.Expr, indices []int, dst []*ast.FuncLit) []*ast.FuncLit {
-	for _, lit := range s.resolveArgFuncLits(arg) {
-		if len(indices) > 0 {
-			s.syncLits[lit] = mergeIntSlices(s.syncLits[lit], indices)
-		}
-		dst = append(dst, lit)
-	}
-	return dst
-}
-
-// seedCallArgsToFuncLit 将直接调用（IIFE 或本地闭包变量）传入的借用实参及污点闭包实参绑定到对应形参。
-func (s *closureState) seedCallArgsToFuncLit(lit *ast.FuncLit, args []ast.Expr) {
-	if lit == nil || lit.Type == nil || lit.Type.Params == nil || len(args) == 0 {
-		return
-	}
-	litScope := s.pass.TypesInfo.Scopes[lit.Type]
-	if litScope == nil {
-		return
-	}
-	paramVars, isVariadic := flattenFieldVarsWithVariadic(s.pass.TypesInfo, lit.Type.Params)
-	if len(paramVars) == 0 {
-		return
-	}
-	for i, arg := range args {
-		pVar := paramVarAt(paramVars, isVariadic, i)
-		if pVar == nil {
-			continue
-		}
-		if argScope, ok := s.exprBorrowedScope(arg); ok {
-			targetScope := argScope
-			if !isDeclaredWithinScope(pVar, argScope) {
-				targetScope = litScope
-			}
-			s.borrowed[pVar] = targetScope
-		}
-		s.seedParamClosureArg(pVar, litScope, arg)
-	}
-}
-
-func (s *closureState) seedParamClosureArg(pVar *types.Var, litScope *types.Scope, arg ast.Expr) {
-	if isLocalFunctionVar(pVar, s.pass.Pkg) {
-		for _, argLit := range s.resolveArgFuncLits(arg) {
-			if argLit != nil && !slices.Contains(s.localFuncLits[pVar], argLit) {
-				s.localFuncLits[pVar] = append(s.localFuncLits[pVar], argLit)
-			}
-		}
-	}
-	if info, ok := s.exprTaintedClosure(arg); ok {
-		targetScope := info.ownerScope
-		if !isDeclaredWithinScope(pVar, targetScope) {
-			targetScope = litScope
-		}
-		if _, exists := s.taintedClosures[pVar]; !exists {
-			s.taintedClosures[pVar] = taintedClosureInfo{lit: info.lit, ownerScope: targetScope}
-		}
-	}
-}
-
-func paramVarAt(vars []*types.Var, isVariadic bool, idx int) *types.Var {
-	if idx < len(vars) {
-		return vars[idx]
-	}
-	if isVariadic && len(vars) > 0 {
-		return vars[len(vars)-1]
-	}
-	return nil
-}
-
-// resolveArgFuncLits 剥离括号、类型断言、索引/切片派生与单参类型转换，解析实参或被调表达式指向的局部 FuncLit 集合。
-func (s *closureState) resolveArgFuncLits(expr ast.Expr) []*ast.FuncLit {
-	for expr != nil {
-		switch e := ast.Unparen(expr).(type) {
-		case *ast.FuncLit:
-			return []*ast.FuncLit{e}
-		case *ast.Ident:
-			if v, ok := s.pass.TypesInfo.Uses[e].(*types.Var); ok && v != nil {
-				return s.localFuncLits[v]
-			}
-			return nil
-		case *ast.TypeAssertExpr:
-			expr = e.X
-		case *ast.IndexExpr:
-			expr = e.X
-		case *ast.SliceExpr:
-			expr = e.X
-		case *ast.CallExpr:
-			if len(e.Args) == 1 {
-				if tv, ok := s.pass.TypesInfo.Types[e.Fun]; ok && tv.IsType() {
-					expr = e.Args[0]
-					continue
-				}
-			}
-			return nil
-		default:
-			return nil
+	if named, ok := types.Unalias(t).(*types.Named); ok && named != nil && named.Origin() != nil && named.Origin().Obj() != nil {
+		if tf, found := lookupBorrowedFact(e.pass, e.facts.typeFacts, named.Origin().Obj()); found {
+			return tf.DirectBorrowed
 		}
 	}
 	return nil
+}
+
+func (e *leaseEngine) auditFunc(fn *ssa.Function, seedParams map[int]bool, captured map[ssa.Value]vetssa.ScopeRange, ownScope vetssa.ScopeRange, depth int, outerShared map[ssa.Value]vetssa.ScopeRange) {
+	leave, ok := e.tracker.Enter(fn, seedParams, captured, depth, maxLeaseAuditDepth)
+	if !ok {
+		return
+	}
+	defer leave()
+
+	borrowed, callerParams := vetssa.SeedScopeParams(fn, seedParams, captured, ownScope)
+	ls := &leaseScope{
+		eng: e, fn: fn, depth: depth, ownScope: ownScope,
+		borrowed: borrowed, callerParams: callerParams, outerShared: outerShared,
+		closureVals: make(map[ssa.Value]*ssa.MakeClosure), reportedAppends: make(map[*ssa.Call]bool),
+		namedResAllocs: collectNamedResultAllocs(fn),
+	}
+	vetssa.RunFixpoint(fn, ls.propagateInst)
+	before := len(ls.borrowed)
+	vetssa.ForEachInst(fn, ls.auditNestedInst)
+	if len(ls.borrowed) > before {
+		vetssa.RunFixpoint(fn, ls.propagateInst)
+	}
+	vetssa.ForEachInst(fn, ls.checkInst)
+}
+
+func collectNamedResultAllocs(fn *ssa.Function) map[*ssa.Alloc]bool {
+	out := make(map[*ssa.Alloc]bool)
+	if fn == nil || fn.Signature == nil || fn.Signature.Results() == nil {
+		return out
+	}
+	resPos := make(map[token.Pos]bool)
+	for i := range fn.Signature.Results().Len() {
+		if r := fn.Signature.Results().At(i); r.Name() != "" && r.Pos().IsValid() {
+			resPos[r.Pos()] = true
+		}
+	}
+	if len(resPos) > 0 {
+		vetssa.ForEachInst(fn, func(inst ssa.Instruction) {
+			if a, ok := inst.(*ssa.Alloc); ok && resPos[a.Pos()] {
+				out[a] = true
+			}
+		})
+	}
+	return out
+}
+
+func (ls *leaseScope) propagateInst(inst ssa.Instruction) bool {
+	if op, ok := vetssa.UnaryFlowOperand(inst, true); ok {
+		sc, borrowed := ls.borrowed[op]
+		val, isVal := inst.(ssa.Value)
+		if !borrowed || !isVal {
+			return false
+		}
+		if mc := ls.closureVals[op]; mc != nil {
+			ls.closureVals[val] = mc
+		}
+		return vetssa.MarkValueScope(ls.borrowed, val, sc)
+	}
+	switch ins := inst.(type) {
+	case *ssa.Phi:
+		return ls.propagatePhi(ins)
+	case *ssa.Store:
+		return ls.propagateStore(ins)
+	case *ssa.MapUpdate:
+		sc, ok := vetssa.CombinedScope(ls.borrowed, ins.Key, ins.Value)
+		return ok && vetssa.MarkRootsBackward(ins.Map, sc, ls.borrowed, ls.outerShared)
+	case *ssa.MakeClosure:
+		sc, ok := vetssa.CombinedScope(ls.borrowed, ins.Bindings...)
+		if !ok {
+			return false
+		}
+		ls.closureVals[ins] = ins
+		return vetssa.MarkValueScope(ls.borrowed, ins, sc)
+	case *ssa.Call:
+		return ls.propagateCall(ins)
+	}
+	return false
+}
+
+func (ls *leaseScope) propagateCall(call *ssa.Call) bool {
+	rc := vetssa.ResolveCall(ls.eng.ssaInfo, call)
+	if rc.Kind == vetssa.CallBuiltin && rc.Builtin != nil {
+		return vetssa.PropagateBuiltinCopyAppend(call, rc, ls.borrowed, ls.outerShared)
+	}
+	if vetssa.IsStdlibSyncIter(rc.FuncObj) {
+		sc, ok := vetssa.CombinedScope(ls.borrowed, rc.UserArgs...)
+		return ok && vetssa.MarkValueScope(ls.borrowed, call, sc)
+	}
+	return false
+}
+
+func (ls *leaseScope) propagatePhi(phi *ssa.Phi) bool {
+	sc, ok := vetssa.CombinedScope(ls.borrowed, phi.Edges...)
+	if !ok {
+		return false
+	}
+	for _, e := range phi.Edges {
+		if mc := ls.closureVals[e]; mc != nil {
+			ls.closureVals[phi] = mc
+		}
+	}
+	return vetssa.MarkValueScope(ls.borrowed, phi, sc)
+}
+
+func (ls *leaseScope) propagateStore(ins *ssa.Store) bool {
+	sc, ok := ls.borrowed[ins.Val]
+	if !ok {
+		return false
+	}
+	changed := vetssa.MarkRootsBackward(ins.Addr, sc, ls.borrowed, ls.outerShared)
+	if mc := ls.closureVals[ins.Val]; mc != nil {
+		for _, root := range vetssa.RootStorageValues(ins.Addr, true) {
+			if _, isGlobal := root.(*ssa.Global); !isGlobal {
+				ls.closureVals[root] = mc
+			}
+		}
+	}
+	return changed
+}
+
+func (ls *leaseScope) auditNestedInst(inst ssa.Instruction) {
+	switch ins := inst.(type) {
+	case *ssa.MakeClosure:
+		ls.checkMakeClosure(ins)
+	case ssa.CallInstruction:
+		ls.eng.scanCallBorrowedCallbacks(ins, ls.borrowed, ls.borrowed)
+	}
 }

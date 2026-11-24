@@ -2,10 +2,9 @@ package noimplicit
 
 import (
 	"go/ast"
-	"go/token"
 	"go/types"
 	"reflect"
-	"strconv"
+	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
@@ -14,205 +13,117 @@ import (
 
 const algebraicPkgPath = vetutil.ModulePrefix + "/core/domain/algebraic"
 
-// checkDTOs 扫描 DTO 结构体字段，拦截除 algebraic.Duration 之外的裸 time.Duration 用法。
-// core/domain/algebraic 自身负责定义 Duration 包装类型，因此在此豁免。
+type dtoFormat struct {
+	checkJSON, checkYAML, inMapValue bool
+}
+
+// checkDTOs 扫描持久化/序列化 DTO 结构体字段，拦截除 algebraic.Duration 之外的裸 time.Duration 用法。
+// 核心不变量：移除全局 *Config 泛化后缀、先查泛型 TypeArgs() 再遇自定义编码器停钻、严格区分 JSON/YAML 语义。
 func checkDTOs(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
-	if pass.TypesInfo == nil {
+	if pass.TypesInfo == nil || pkgInfo.BasePath == algebraicPkgPath {
 		return
 	}
-	if pkgInfo.BasePath == vetutil.ModulePrefix+"/core/domain/algebraic" {
-		return
-	}
-	ins := vetutil.InspectorOf(pass)
-	nodeFilter := []ast.Node{(*ast.GenDecl)(nil)}
-	ins.Preorder(nodeFilter, func(n ast.Node) {
-		gen, ok := n.(*ast.GenDecl)
-		if !ok || gen.Tok != token.TYPE {
-			return
-		}
-		checkTypeDeclDTOs(pass, pkgInfo, gen)
+	vetutil.ForEachTypeSpec(pass, func(_ *ast.File, gen *ast.GenDecl, ts *ast.TypeSpec) {
+		checkTypeSpecDTO(pass, pkgInfo, gen, ts)
 	})
 }
 
-func checkTypeDeclDTOs(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.GenDecl) {
-	for _, spec := range gen.Specs {
-		ts, ok := spec.(*ast.TypeSpec)
-		if !ok {
-			continue
-		}
-		st, ok := ts.Type.(*ast.StructType)
-		if !ok {
-			continue
-		}
-		isExplicitDTO := vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveDTO)
-		hasTags, tagErr := hasSerializationTags(st)
-		if tagErr != nil {
-			hasTags = false
-		}
-		if isDTOStruct(pkgInfo, ts, isExplicitDTO || hasTags) {
-			checkDTOStructFields(pass, st)
-		}
+func checkTypeSpecDTO(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.GenDecl, ts *ast.TypeSpec) {
+	st, ok := ts.Type.(*ast.StructType)
+	if !ok {
+		return
 	}
+	tags, err := vetutil.StructSerialTags(st)
+	if err != nil {
+		tags = vetutil.SerialTagFlags{}
+	}
+	if !isDTOStruct(pkgInfo, ts, vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveDTO) || tags.Any()) {
+		return
+	}
+	checkYAML := tags.HasYAML || pkgInfo.BasePath == vetutil.ModulePrefix+"/internal/host/store"
+	mode := dtoFormat{checkJSON: tags.HasJSON || !checkYAML, checkYAML: checkYAML}
+	if isTopLevelCustomMarshaler(pass, ts, mode) {
+		return
+	}
+	checkDTOStructFields(pass, st, mode)
 }
 
-// isDTOStruct 采用三层启发式判定结构体是否属于序列化/配置 DTO：
-// 1. 显式标记 //xops:dto 或含非 "-" 的 json/yaml 字段标签；
-// 2. 位于事件/MCP/审计/存储等 DTO 专属包内的导出类型或常见载荷命名；
-// 3. 仓库内其余包中以严格 DTO/Event/AuditEntry/Config 后缀结尾的导出类型。
+func isTopLevelCustomMarshaler(pass *analysis.Pass, ts *ast.TypeSpec, mode dtoFormat) bool {
+	topNamed, ok := pass.TypesInfo.Defs[ts.Name].(*types.TypeName)
+	if !ok || topNamed == nil {
+		return false
+	}
+	named, isNamed := types.Unalias(topNamed.Type()).(*types.Named)
+	return isNamed && canStopAtCustomMarshaler(named, mode)
+}
+
 func isDTOStruct(pkgInfo vetutil.PkgInfo, ts *ast.TypeSpec, hasExplicitOrTagged bool) bool {
 	if hasExplicitOrTagged {
 		return true
 	}
 	name := ts.Name.Name
-	if isDTOPackage(pkgInfo) {
-		if pkgInfo.Layer == vetutil.LayerCoreEvents && ts.Name.IsExported() {
-			return true
-		}
-		if isDTONameRole(name) {
-			return true
-		}
+	if isDTOPackage(pkgInfo) && ((pkgInfo.Layer == vetutil.LayerCoreEvents && ts.Name.IsExported()) || isDTONameRole(name)) {
+		return true
 	}
 	return ts.Name.IsExported() && hasStrictDTOSuffix(name)
 }
 
-// hasSerializationTags 检查结构体是否存在非 "-" 的 json/yaml 序列化标签。
-// 保留 (bool, error) 签名以满足 failclosed 自检；单字段 tag 解析失败仅记录首个错误并继续扫描，
-// 若后续字段命中有效序列化标签仍返回 (true, nil)，防止单个畸形 tag 导致整结构体漏检。
-func hasSerializationTags(st *ast.StructType) (bool, error) {
-	if st.Fields == nil {
-		return false, nil
-	}
-	var firstErr error
-	for _, f := range st.Fields.List {
-		tag, hasTag, err := parseStructTag(f)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if hasTag && hasNonIgnoredSerialTag(tag) {
-			return true, nil
-		}
-	}
-	return false, firstErr
-}
-
-func hasNonIgnoredSerialTag(tag reflect.StructTag) bool {
-	if v, ok := tag.Lookup("json"); ok && v != "-" {
-		return true
-	}
-	v, ok := tag.Lookup("yaml")
-	return ok && v != "-"
-}
-
-func parseStructTag(f *ast.Field) (reflect.StructTag, bool, error) {
-	if f == nil || f.Tag == nil {
-		return "", false, nil
-	}
-	raw, err := strconv.Unquote(f.Tag.Value)
-	if err != nil {
-		return "", false, err
-	}
-	return reflect.StructTag(raw), true, nil
-}
-
 func isDTOPackage(pkgInfo vetutil.PkgInfo) bool {
-	switch pkgInfo.Layer {
-	case vetutil.LayerCoreEvents, vetutil.LayerCoreMCPRuntime:
-		return true
-	default:
-		return pkgInfo.BasePath == vetutil.ModulePrefix+"/internal/host/audit" ||
-			pkgInfo.BasePath == vetutil.ModulePrefix+"/internal/host/store" ||
-			pkgInfo.BasePath == vetutil.ModulePrefix+"/internal/entry/mcpcmd"
-	}
+	return pkgInfo.Layer == vetutil.LayerCoreEvents || pkgInfo.Layer == vetutil.LayerCoreMCPRuntime ||
+		slices.Contains([]string{
+			vetutil.ModulePrefix + "/internal/host/audit",
+			vetutil.ModulePrefix + "/internal/host/store",
+			vetutil.ModulePrefix + "/internal/entry/mcpcmd",
+		}, pkgInfo.BasePath)
 }
 
 func isDTONameRole(name string) bool {
-	switch {
-	case strings.Contains(name, "Event"),
-		strings.Contains(name, "Audit"),
-		strings.Contains(name, "DTO"),
-		strings.Contains(name, "Dto"),
-		strings.Contains(name, "Config"),
-		strings.Contains(name, "Cfg"),
-		strings.Contains(name, "Request"),
-		strings.Contains(name, "Response"),
-		strings.Contains(name, "Input"),
-		strings.Contains(name, "Output"),
-		strings.Contains(name, "Params"),
-		strings.Contains(name, "Result"),
-		strings.Contains(name, "Payload"),
-		strings.Contains(name, "Entry"),
-		strings.Contains(name, "Record"),
-		strings.Contains(name, "Envelope"),
-		strings.Contains(name, "Manifest"),
-		strings.Contains(name, "Bundle"),
-		strings.Contains(name, "Schema"),
-		strings.Contains(name, "Message"),
-		strings.Contains(name, "Notification"),
-		strings.Contains(name, "Journal"):
-		return true
-	default:
-		return false
-	}
+	return slices.ContainsFunc([]string{
+		"Event", "Audit", "DTO", "Dto", "Config", "Cfg", "Request", "Response", "Input", "Output",
+		"Params", "Result", "Payload", "Entry", "Record", "Envelope", "Manifest", "Bundle",
+		"Schema", "Message", "Notification", "Journal",
+	}, func(kw string) bool { return strings.Contains(name, kw) })
 }
 
+// hasStrictDTOSuffix 仅匹配全局精确序列化载荷后缀（移除泛化 *Config 后缀以免误杀纯内存配置参数）。
 func hasStrictDTOSuffix(name string) bool {
-	return strings.HasSuffix(name, "DTO") ||
-		strings.HasSuffix(name, "Dto") ||
-		strings.HasSuffix(name, "Event") ||
-		strings.HasSuffix(name, "AuditEntry") ||
-		strings.HasSuffix(name, "AuditRecord") ||
-		strings.HasSuffix(name, "Config")
+	return slices.ContainsFunc([]string{"DTO", "Dto", "Event", "AuditEntry", "AuditRecord"},
+		func(suf string) bool { return strings.HasSuffix(name, suf) })
 }
 
-func checkDTOStructFields(pass *analysis.Pass, st *ast.StructType) {
+func checkDTOStructFields(pass *analysis.Pass, st *ast.StructType, mode dtoFormat) {
 	if st.Fields == nil {
 		return
 	}
 	for _, f := range st.Fields.List {
-		skipped, err := isFieldSerializationSkipped(f)
-		if err == nil && skipped {
+		if !isTopFieldSerializable(f) {
 			continue
 		}
-		fieldType := pass.TypesInfo.TypeOf(f.Type)
-		if hasBareTimeDuration(fieldType, make(map[types.Type]bool)) {
-			pass.ReportRangef(f.Type, "noimplicit: Event/Audit/MCP/Config DTO 禁止裸用 time.Duration，请使用 algebraic.Duration")
+		if tag, hasTag, err := vetutil.ParseStructFieldTag(f); err == nil && hasTag && vetutil.IsTagSkippedForFormat(tag, mode.checkJSON, mode.checkYAML) {
+			continue
+		}
+		if hasBareTimeDuration(pass.TypesInfo.TypeOf(f.Type), mode, make(map[types.Type]bool)) {
+			pass.ReportRangef(f.Type, "noimplicit: Event/Audit/MCP/持久化配置 DTO 禁止裸用 time.Duration，请使用 algebraic.Duration")
 		}
 	}
 }
 
-// isFieldSerializationSkipped 判断字段是否被序列化标签显式忽略（"-"）。
-// 仅当未同时被另一常见序列化格式保留（如 json:"-" yaml:"dur"）时才予豁免。
-func isFieldSerializationSkipped(f *ast.Field) (bool, error) {
-	tag, hasTag, err := parseStructTag(f)
-	if err != nil || !hasTag {
-		return false, err
-	}
-	jsonVal, hasJSON := tag.Lookup("json")
-	yamlVal, hasYAML := tag.Lookup("yaml")
-	if hasJSON && jsonVal == "-" && (!hasYAML || yamlVal == "-") {
-		return true, nil
-	}
-	return hasYAML && yamlVal == "-" && !hasJSON, nil
+func isTopFieldSerializable(f *ast.Field) bool {
+	return len(f.Names) == 0 || slices.ContainsFunc(f.Names, (*ast.Ident).IsExported)
 }
 
-// hasBareTimeDuration 递归检查 DTO 字段类型是否包含裸 time.Duration。
-// 遇到 algebraic.Duration 时视为终止安全类型停止下钻（允许其内部私有封装 d time.Duration），
-// 同时继续向下穿透指针、切片、数组、Map、泛型实参（如 Option[time.Duration]）及普通包装结构体。
-func hasBareTimeDuration(t types.Type, seen map[types.Type]bool) bool {
+func hasBareTimeDuration(t types.Type, mode dtoFormat, seen map[types.Type]bool) bool {
 	if t == nil {
 		return false
 	}
 	t = types.Unalias(t)
 	if named, ok := t.(*types.Named); ok {
-		return namedHasBareTimeDuration(named, seen)
+		return namedHasBareTimeDuration(named, mode, seen)
 	}
-	return compositeHasBareTimeDuration(t, seen)
+	return compositeHasBareTimeDuration(t, mode, seen)
 }
 
-func namedHasBareTimeDuration(named *types.Named, seen map[types.Type]bool) bool {
+func namedHasBareTimeDuration(named *types.Named, mode dtoFormat, seen map[types.Type]bool) bool {
 	obj := named.Obj()
 	if vetutil.IsPkgSymbol(obj, algebraicPkgPath, "Duration") {
 		return false
@@ -224,44 +135,67 @@ func namedHasBareTimeDuration(named *types.Named, seen map[types.Type]bool) bool
 		return false
 	}
 	seen[named] = true
+	// B3a 铁律：必须先递归检查泛型类型实参 TypeArgs()，再判定自定义编码器停钻。
 	if typeArgs := named.TypeArgs(); typeArgs != nil {
-		for i := 0; i < typeArgs.Len(); i++ {
-			if hasBareTimeDuration(typeArgs.At(i), seen) {
+		argMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML}
+		for i := range typeArgs.Len() {
+			if hasBareTimeDuration(typeArgs.At(i), argMode, seen) {
 				return true
 			}
 		}
 	}
-	return hasBareTimeDuration(named.Underlying(), seen)
+	return !canStopAtCustomMarshaler(named, mode) && hasBareTimeDuration(named.Underlying(), mode, seen)
 }
 
-func compositeHasBareTimeDuration(t types.Type, seen map[types.Type]bool) bool {
+type dtoElemCarrier interface{ Elem() types.Type }
+
+func compositeHasBareTimeDuration(t types.Type, mode dtoFormat, seen map[types.Type]bool) bool {
+	elemMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML}
 	switch v := t.(type) {
-	case *types.Pointer:
-		return hasBareTimeDuration(v.Elem(), seen)
-	case *types.Slice:
-		return hasBareTimeDuration(v.Elem(), seen)
-	case *types.Array:
-		return hasBareTimeDuration(v.Elem(), seen)
-	case *types.Chan:
-		return hasBareTimeDuration(v.Elem(), seen)
 	case *types.Map:
-		return hasBareTimeDuration(v.Key(), seen) || hasBareTimeDuration(v.Elem(), seen)
+		valMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML, inMapValue: true}
+		return hasBareTimeDuration(v.Key(), elemMode, seen) || hasBareTimeDuration(v.Elem(), valMode, seen)
+	case dtoElemCarrier:
+		return hasBareTimeDuration(v.Elem(), elemMode, seen)
 	case *types.Struct:
-		return structHasBareTimeDuration(v, seen)
+		return structHasBareTimeDuration(v, mode, seen)
 	default:
 		return false
 	}
 }
 
-func structHasBareTimeDuration(st *types.Struct, seen map[types.Type]bool) bool {
+func structHasBareTimeDuration(st *types.Struct, mode dtoFormat, seen map[types.Type]bool) bool {
 	if seen[st] {
 		return false
 	}
 	seen[st] = true
-	for i := 0; i < st.NumFields(); i++ {
-		if hasBareTimeDuration(st.Field(i).Type(), seen) {
+	fieldMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML}
+	for i := range st.NumFields() {
+		f := st.Field(i)
+		if (!f.Exported() && !f.Embedded()) || vetutil.IsTagSkippedForFormat(reflect.StructTag(st.Tag(i)), mode.checkJSON, mode.checkYAML) {
+			continue
+		}
+		if hasBareTimeDuration(f.Type(), fieldMode, seen) {
 			return true
 		}
 	}
 	return false
+}
+
+// canStopAtCustomMarshaler 按 JSON/v2 与 yaml.v3 真实编码语义判定命名类型是否安全接管了序列化。
+func canStopAtCustomMarshaler(named *types.Named, mode dtoFormat) bool {
+	ptr := types.NewPointer(named)
+	if hasMethodOnType(named, "AppendText", "MarshalText") ||
+		((!mode.checkYAML || !mode.inMapValue) && hasMethodOnType(ptr, "AppendText", "MarshalText")) {
+		return true
+	}
+	if mode.checkYAML {
+		return hasMethodOnType(named, "MarshalYAML") || (!mode.inMapValue && hasMethodOnType(ptr, "MarshalYAML"))
+	}
+	return hasMethodOnType(ptr, "MarshalJSON", "MarshalJSONTo")
+}
+
+func hasMethodOnType(t types.Type, names ...string) bool {
+	ms := types.NewMethodSet(t)
+	return slices.ContainsFunc(names, func(name string) bool { return ms.Lookup(nil, name) != nil })
 }

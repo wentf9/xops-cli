@@ -271,6 +271,44 @@ func TestCheckImportAllowedConcActorEngineAndLayers(t *testing.T) {
 			impPath: vetutil.ModulePrefix + "/core/conc",
 			wantOK:  true,
 		},
+		{
+			name:    "trace_prod_denies_crypto_rand",
+			pkgPath: vetutil.ModulePrefix + "/core/internal/foundation/trace",
+			impPath: "crypto/rand",
+			wantOK:  false,
+		},
+		{
+			name:    "trace_test_denies_crypto_rand",
+			pkgPath: vetutil.ModulePrefix + "/core/internal/foundation/trace",
+			isTest:  true,
+			impPath: "crypto/rand",
+			wantOK:  false,
+		},
+		{
+			name:    "trace_prod_denies_actor",
+			pkgPath: vetutil.ModulePrefix + "/core/internal/foundation/trace",
+			impPath: vetutil.ModulePrefix + "/core/internal/foundation/actor",
+			wantOK:  false,
+		},
+		{
+			name:    "foundation_other_src_denied",
+			pkgPath: vetutil.ModulePrefix + "/core/internal/foundation/rogue",
+			impPath: "errors",
+			wantOK:  false,
+		},
+		{
+			name:    "foundation_other_dst_denied_from_engine",
+			pkgPath: vetutil.ModulePrefix + "/core/engine",
+			impPath: vetutil.ModulePrefix + "/core/internal/foundation/rogue",
+			wantOK:  false,
+		},
+		{
+			name:    "foundation_other_test_denied_sim",
+			pkgPath: vetutil.ModulePrefix + "/core/internal/foundation/rogue",
+			isTest:  true,
+			impPath: vetutil.ModulePrefix + "/core/internal/sim",
+			wantOK:  false,
+		},
 	}
 
 	for _, tc := range tests {

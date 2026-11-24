@@ -11,6 +11,7 @@ package failclosed
 import (
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/inspect"
 )
 
 // opaqueTypeFact 用于跨包传递 //xops:opaque 类型标记，阻止外部包绕过构造器直接构造实例。
@@ -27,6 +28,7 @@ func NewAnalyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
 		Name:      "failclosed",
 		Doc:       "检查局部 error 吞噬转 bool、包外 //xops:opaque 构造及 //xops:failclosed 零值最严不变量",
+		Requires:  []*analysis.Analyzer{inspect.Analyzer},
 		FactTypes: []analysis.Fact{(*opaqueTypeFact)(nil)},
 		Run:       run,
 	}

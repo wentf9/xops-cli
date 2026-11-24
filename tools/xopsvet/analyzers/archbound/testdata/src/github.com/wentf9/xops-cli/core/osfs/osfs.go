@@ -12,21 +12,27 @@ import (
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
+// SocketSlot 合法持有 *net.UnixListener 与 net.Listener 字段（验证防线 3 仅禁同构克隆，绝不误杀）。
+type SocketSlot struct {
+	listener net.Listener
+	ln       *net.UnixListener
+}
+
 type LocalFS struct {
 	Root   *os.Root
 	dialer net.Dialer
 	lc     net.ListenConfig
+	slot   SocketSlot
 }
 
 func (LocalFS) WithRoot(_ algebraic.Duration) error { return nil }
-func (LocalFS) WithOperatorRead(_ string) error   { return nil }
+func (LocalFS) WithOperatorRead(_ string) error     { return nil }
 
 var _ ports.ScopedRootFS = LocalFS{}
 var _ ports.OperatorReadFS = LocalFS{}
 
-// ProbeStaleUnixSocket 演示 core/osfs 合法使用的全部本地 AF_UNIX net 原语与方法接收者。
+// ProbeStaleUnixSocket 演示 core/osfs 在 v2.3.3 18 符号 + 3 含 ctx 方法 + 3 包级直接绑定下的全部合法用法。
 func (fs *LocalFS) ProbeStaleUnixSocket(ctx context.Context, sockPath string) error {
-	const unixNet = "unix"
 	addr, err := net.ResolveUnixAddr("unix", sockPath)
 	if err != nil {
 		return err
@@ -47,6 +53,7 @@ func (fs *LocalFS) ProbeStaleUnixSocket(ctx context.Context, sockPath string) er
 	_ = ln.Addr()
 
 	if ul, ok := ln.(*net.UnixListener); ok {
+		fs.slot = SocketSlot{listener: ln, ln: ul}
 		ul.SetUnlinkOnClose(false)
 		_, _ = ul.SyscallConn()
 		_ = ul.SetDeadline(time.Time{})
@@ -67,12 +74,6 @@ func (fs *LocalFS) ProbeStaleUnixSocket(ctx context.Context, sockPath string) er
 	_ = fs.dialer.Timeout
 	_ = fs.lc.Control
 
-	if c, err := d.Dial(unixNet, sockPath); err == nil {
-		_ = c.Close()
-	}
-	if c, err := d.DialContext(ctx, "unixpacket", sockPath); err == nil {
-		_ = c.Close()
-	}
 	if uc, err := d.DialUnix(ctx, "unix", nil, addr); err == nil {
 		_, _ = uc.SyscallConn()
 		_, _ = uc.Read(nil)
@@ -81,15 +82,6 @@ func (fs *LocalFS) ProbeStaleUnixSocket(ctx context.Context, sockPath string) er
 		_ = uc.RemoteAddr()
 		_ = uc.SetDeadline(time.Time{})
 		_ = uc.Close()
-	}
-	if c, err := net.DialTimeout("unix", sockPath, time.Second); err == nil {
-		_ = c.Close()
-	}
-	if ln2, err := net.Listen("unix", sockPath); err == nil {
-		_ = ln2.Close()
-	}
-	if pc2, err := net.ListenPacket("unixgram", sockPath); err == nil {
-		_ = pc2.Close()
 	}
 	if ul2, err := net.ListenUnix("unix", addr); err == nil {
 		_ = ul2.Close()

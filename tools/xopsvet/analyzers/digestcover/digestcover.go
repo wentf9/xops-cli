@@ -11,14 +11,16 @@ package digestcover
 import (
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/inspect"
 )
 
 // NewAnalyzer 创建并返回 digestcover 规范摘要字段覆盖静态分析器实例。
 func NewAnalyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
-		Name: "digestcover",
-		Doc:  "检查 //xops:canonicalhash 结构体的 WriteCanonical 全字段覆盖及 //xops:hash-exclude:<reason> 合法性",
-		Run:  run,
+		Name:     "digestcover",
+		Doc:      "检查 //xops:canonicalhash 结构体的 WriteCanonical 全字段覆盖及 //xops:hash-exclude:<reason> 合法性",
+		Requires: []*analysis.Analyzer{inspect.Analyzer},
+		Run:      run,
 	}
 }
 

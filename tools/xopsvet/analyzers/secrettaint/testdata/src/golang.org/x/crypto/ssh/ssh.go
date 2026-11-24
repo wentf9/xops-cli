@@ -28,3 +28,11 @@ func ParsePrivateKey(pemBytes []byte) (Signer, error) {
 func ParsePrivateKeyWithPassphrase(pemBytes, passphrase []byte) (Signer, error) {
 	return nil, nil
 }
+
+func Marshal(msg any) []byte {
+	return nil
+}
+
+func ParseRawPrivateKey(pemBytes []byte) (any, error) {
+	return nil, nil
+}

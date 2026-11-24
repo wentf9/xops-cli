@@ -1,177 +1,213 @@
 package osboundary
 
 import (
-	"go/ast"
 	"go/token"
 	"go/types"
+	"slices"
 
+	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetssa"
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
+	"golang.org/x/tools/go/ssa"
 )
 
-func checkRemotePathFilepath(pass *analysis.Pass) {
-	if pass.TypesInfo == nil {
+type fieldKey struct {
+	base  ssa.Value
+	field int
+}
+
+type remoteTaintState struct {
+	ssaInfo *buildssa.SSA
+	tainted map[ssa.Value]bool
+	fields  map[fieldKey]bool
+}
+
+// checkRemotePathFilepath 基于 vetssa 在全包 SSA 函数上执行字段敏感（field-sensitive）的不动点传播，
+// 拦截对 RemotePath 及其派生值调用 path/filepath.*，同时保证含 RemotePath 字段的结构体其非远端字段零误报（B6c + M2）。
+func checkRemotePathFilepath(pass *analysis.Pass, s *buildssa.SSA) {
+	if s == nil {
 		return
 	}
-	ins := vetutil.InspectorOf(pass)
-	nodeFilter := []ast.Node{
-		(*ast.FuncDecl)(nil),
-		(*ast.FuncLit)(nil),
+	funcs := vetssa.AllFuncs(s)
+	st := &remoteTaintState{ssaInfo: s, tainted: make(map[ssa.Value]bool), fields: make(map[fieldKey]bool)}
+	vetssa.SeedTypedValues(funcs, isRemotePathType, st.mark)
+	st.propagateFixpoint(funcs)
+	var diags []vetutil.Diag
+	vetssa.ForEachFuncInst(funcs, func(fn *ssa.Function, inst ssa.Instruction) {
+		if callInst, ok := inst.(ssa.CallInstruction); ok {
+			rc := vetssa.ResolveCall(s, callInst)
+			if vetutil.ObjectPkgPath(rc.FuncObj) == "path/filepath" && slices.ContainsFunc(rc.UserArgs, st.isTainted) {
+				vetssa.AppendDiag(pass, &diags, fn, callInst, "osboundary: 禁止对 RemotePath 调用 path/filepath.*，远端 POSIX 路径请使用 path.* 或 RemotePath 方法")
+			}
+		}
+	})
+	vetutil.ReportSortedDedup(pass, diags, true)
+}
+
+func (st *remoteTaintState) isTainted(v ssa.Value) bool {
+	return v != nil && (st.tainted[v] || isRemotePathType(v.Type()))
+}
+
+func (st *remoteTaintState) mark(v ssa.Value) bool {
+	if v == nil || st.tainted[v] {
+		return false
 	}
-	ins.Preorder(nodeFilter, func(n ast.Node) {
-		switch fn := n.(type) {
-		case *ast.FuncDecl:
-			if fn.Body != nil {
-				checkFuncRemotePath(pass, fn.Type, fn.Body)
-			}
-		case *ast.FuncLit:
-			if fn.Body != nil {
-				checkFuncRemotePath(pass, fn.Type, fn.Body)
-			}
+	st.tainted[v] = true
+	return true
+}
+
+func (st *remoteTaintState) markField(base ssa.Value, field int) bool {
+	changed := false
+	for _, root := range vetssa.RootStorageValues(base, false) {
+		if k := (fieldKey{base: root, field: field}); !st.fields[k] {
+			st.fields[k], changed = true, true
 		}
+	}
+	return changed
+}
+
+func (st *remoteTaintState) isFieldTainted(base ssa.Value, field int) bool {
+	return slices.ContainsFunc(vetssa.RootStorageValues(base, false), func(root ssa.Value) bool {
+		return st.fields[fieldKey{base: root, field: field}]
 	})
 }
 
-func checkFuncRemotePath(pass *analysis.Pass, ftype *ast.FuncType, body *ast.BlockStmt) {
-	remoteVars := collectRemoteDerivedVars(pass.TypesInfo, ftype, body)
-	ast.Inspect(body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if isFilepathCall(pass.TypesInfo, call) && callArgsHaveRemotePath(pass.TypesInfo, call, remoteVars) {
-			pass.ReportRangef(call, "osboundary: 禁止对 RemotePath 调用 path/filepath.*，远端 POSIX 路径请使用 path.* 或 RemotePath 方法")
-		}
-		return true
-	})
-}
-
-// collectRemoteDerivedVars 在函数作用域内执行 4 轮不动点数据流传播，
-// 追踪由 RemotePath 参数/返回值/字面量派生出的局部变量（如 s1 := rp.String(); s2 := s1 + "/a"），
-// 以拦截经过多步变量传递或 range 循环后才传入 path/filepath.* 的调用。
-func collectRemoteDerivedVars(info *types.Info, ftype *ast.FuncType, body *ast.BlockStmt) map[types.Object]bool {
-	remoteVars := make(map[types.Object]bool)
-	seedFieldListRemoteVars(info, ftype, remoteVars)
-	for range 4 {
+func (st *remoteTaintState) propagateFixpoint(funcs []*ssa.Function) {
+	for {
 		changed := false
-		ast.Inspect(body, func(n ast.Node) bool {
-			if scanStmtRemoteVars(info, n, remoteVars) {
-				changed = true
-			}
-			return true
-		})
-		if !changed {
-			break
+		for _, fn := range funcs {
+			changed = st.propagateYieldParams(fn) || changed
+			vetssa.ForEachInst(fn, func(inst ssa.Instruction) { changed = st.propagateInst(inst) || changed })
 		}
-	}
-	return remoteVars
-}
-
-func seedFieldListRemoteVars(info *types.Info, ftype *ast.FuncType, remoteVars map[types.Object]bool) {
-	if ftype == nil {
-		return
-	}
-	seedGroup := func(fl *ast.FieldList) {
-		if fl == nil {
+		if !changed {
 			return
 		}
-		for _, field := range fl.List {
-			if !isRemotePathType(info.TypeOf(field.Type)) {
-				continue
-			}
-			for _, name := range field.Names {
-				if obj := info.Defs[name]; obj != nil {
-					remoteVars[obj] = true
-				}
-			}
-		}
 	}
-	seedGroup(ftype.Params)
-	seedGroup(ftype.Results)
 }
 
-func scanStmtRemoteVars(info *types.Info, n ast.Node, remoteVars map[types.Object]bool) bool {
-	switch stmt := n.(type) {
-	case *ast.AssignStmt:
-		return scanAssignRemoteVars(info, stmt.Lhs, stmt.Rhs, remoteVars)
-	case *ast.ValueSpec:
-		return scanValueSpecRemoteVars(info, stmt, remoteVars)
-	case *ast.RangeStmt:
-		return scanRangeRemoteVars(info, stmt, remoteVars)
+func (st *remoteTaintState) propagateYieldParams(fn *ssa.Function) bool {
+	if !vetssa.IsYieldFunc(fn) {
+		return false
+	}
+	_, _, rc := vetssa.FindYieldCall(st.ssaInfo, fn.Parent(), fn)
+	if rc.Common == nil || !st.isTainted(rc.Common.Value) {
+		return false
+	}
+	changed := false
+	for _, p := range fn.Params {
+		changed = st.mark(p) || changed
+	}
+	return changed
+}
+
+func (st *remoteTaintState) propagateInst(inst ssa.Instruction) bool {
+	if op, ok := vetssa.UnaryFlowOperand(inst, false); ok && !isFieldInst(inst) {
+		val, isVal := inst.(ssa.Value)
+		return isVal && st.isTainted(op) && st.mark(val)
+	}
+	switch ins := inst.(type) {
+	case *ssa.Store:
+		return st.propagateStore(ins)
+	case *ssa.MapUpdate:
+		return (st.isTainted(ins.Key) || st.isTainted(ins.Value)) && st.markRootsNonField(ins.Map)
+	case *ssa.MakeClosure:
+		return vetssa.PropagateClosureFreeVars(ins, st.tainted)
+	case *ssa.FieldAddr:
+		return st.isFieldTainted(ins.X, ins.Field) && st.mark(ins)
+	case *ssa.Field:
+		return (st.isTainted(ins.X) || st.isFieldTainted(ins.X, ins.Field)) && st.mark(ins)
+	case *ssa.Call:
+		return st.propagateCall(ins)
+	case *ssa.BinOp:
+		return ins.Op == token.ADD && (st.isTainted(ins.X) || st.isTainted(ins.Y)) && st.mark(ins)
+	case *ssa.Phi:
+		return slices.ContainsFunc(ins.Edges, st.isTainted) && st.mark(ins)
 	default:
 		return false
 	}
 }
 
-func scanAssignRemoteVars(info *types.Info, lhs, rhs []ast.Expr, remoteVars map[types.Object]bool) bool {
-	if len(lhs) != len(rhs) {
-		return false
+func isFieldInst(inst ssa.Instruction) bool {
+	_, isF := inst.(*ssa.Field)
+	_, isFA := inst.(*ssa.FieldAddr)
+	return isF || isFA
+}
+
+func (st *remoteTaintState) propagateStore(ins *ssa.Store) bool {
+	if fa, ok := ins.Addr.(*ssa.FieldAddr); ok {
+		return st.isTainted(ins.Val) && st.markField(fa.X, fa.Field)
 	}
-	changed := false
-	for i := range lhs {
-		if exprHasRemotePath(info, rhs[i], remoteVars) && markExprRemoteVar(info, lhs[i], remoteVars) {
-			changed = true
+	changed := st.copyStructFieldTaints(ins.Val, ins.Addr)
+	if !st.isTainted(ins.Val) {
+		return changed
+	}
+	for _, root := range vetssa.RootStorageValues(ins.Addr, false) {
+		if fa, ok := root.(*ssa.FieldAddr); ok {
+			changed = st.markField(fa.X, fa.Field) || changed
+		} else {
+			changed = st.mark(root) || changed
 		}
 	}
 	return changed
 }
 
-func scanRangeRemoteVars(info *types.Info, stmt *ast.RangeStmt, remoteVars map[types.Object]bool) bool {
-	if stmt.Tok != token.ASSIGN && stmt.Tok != token.DEFINE {
+// copyStructFieldTaints 在整结构体值拷贝时按字段索引精确复制单字段污点，不污染非远端字段。
+func (st *remoteTaintState) copyStructFieldTaints(src, dst ssa.Value) bool {
+	if len(st.fields) == 0 {
 		return false
 	}
-	if !exprHasRemotePath(info, stmt.X, remoteVars) {
-		return false
-	}
-	changed := markExprRemoteVar(info, stmt.Key, remoteVars)
-	if markExprRemoteVar(info, stmt.Value, remoteVars) {
-		changed = true
-	}
-	return changed
-}
-
-func markExprRemoteVar(info *types.Info, expr ast.Expr, remoteVars map[types.Object]bool) bool {
-	if expr == nil {
-		return false
-	}
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok || id.Name == "_" {
-		return false
-	}
-	obj := info.Defs[id]
-	if obj == nil {
-		obj = info.Uses[id]
-	}
-	if obj == nil || remoteVars[obj] {
-		return false
-	}
-	remoteVars[obj] = true
-	return true
-}
-
-func scanValueSpecRemoteVars(info *types.Info, vs *ast.ValueSpec, remoteVars map[types.Object]bool) bool {
-	if len(vs.Names) != len(vs.Values) {
-		return false
-	}
+	srcRoots := vetssa.RootStorageValues(src, false)
+	var dstRoots []ssa.Value
 	changed := false
-	for i, name := range vs.Names {
-		if !exprHasRemotePath(info, vs.Values[i], remoteVars) {
+	for fk := range st.fields {
+		if !slices.Contains(srcRoots, fk.base) {
 			continue
 		}
-		if obj := info.Defs[name]; obj != nil && !remoteVars[obj] {
-			remoteVars[obj] = true
+		if dstRoots == nil {
+			dstRoots = vetssa.RootStorageValues(dst, false)
+		}
+		for _, dr := range dstRoots {
+			if k := (fieldKey{base: dr, field: fk.field}); !st.fields[k] {
+				st.fields[k], changed = true, true
+			}
+		}
+	}
+	return changed
+}
+
+func (st *remoteTaintState) propagateCall(call *ssa.Call) bool {
+	rc := vetssa.ResolveCall(st.ssaInfo, call)
+	if rc.Kind == vetssa.CallBuiltin && rc.Builtin != nil {
+		switch rc.Builtin.Name() {
+		case "copy":
+			return len(rc.UserArgs) >= 2 && st.isTainted(rc.UserArgs[1]) && st.markRootsNonField(rc.UserArgs[0])
+		case "append":
+			if slices.ContainsFunc(rc.UserArgs, st.isTainted) {
+				c1 := st.mark(call)
+				c2 := len(rc.UserArgs) > 0 && st.markRootsNonField(rc.UserArgs[0])
+				return c1 || c2
+			}
+		}
+		return false
+	}
+	return ((rc.Recv != nil && st.isTainted(rc.Recv)) || slices.ContainsFunc(rc.UserArgs, st.isTainted)) && st.mark(call)
+}
+
+func (st *remoteTaintState) markRootsNonField(v ssa.Value) bool {
+	changed := false
+	for _, root := range vetssa.RootStorageValues(v, false) {
+		if _, isField := root.(*ssa.FieldAddr); !isField && st.mark(root) {
 			changed = true
 		}
 	}
 	return changed
 }
 
-// isRemotePathType 判断类型 t 本身或其容器元素/泛型实参是否为 RemotePath。
-// 刻意不递归穿透普通结构体字段，防止含 RemotePath 字段的结构体（如 CopyTask{LocalDir, RemoteDest}）
-// 污染同结构体内完全合法的本地路径字段与方法（如 task.LocalDir / task.LocalFile()）。
-func isRemotePathType(t types.Type) bool {
-	return hasRemotePathType(t, make(map[types.Type]bool))
-}
+// isRemotePathType 判断类型 t 本身或其容器元素/泛型实参是否为 RemotePath，绝不展开普通结构体字段（B6c）。
+func isRemotePathType(t types.Type) bool { return hasRemotePathType(t, make(map[types.Type]bool)) }
+
+type elemCarrier interface{ Elem() types.Type }
 
 func hasRemotePathType(t types.Type, seen map[types.Type]bool) bool {
 	if t == nil {
@@ -182,16 +218,10 @@ func hasRemotePathType(t types.Type, seen map[types.Type]bool) bool {
 		return namedIsRemotePath(named, seen)
 	}
 	switch v := t.(type) {
-	case *types.Pointer:
-		return hasRemotePathType(v.Elem(), seen)
-	case *types.Slice:
-		return hasRemotePathType(v.Elem(), seen)
-	case *types.Array:
-		return hasRemotePathType(v.Elem(), seen)
-	case *types.Chan:
-		return hasRemotePathType(v.Elem(), seen)
 	case *types.Map:
 		return hasRemotePathType(v.Key(), seen) || hasRemotePathType(v.Elem(), seen)
+	case elemCarrier:
+		return hasRemotePathType(v.Elem(), seen)
 	default:
 		return false
 	}
@@ -206,87 +236,12 @@ func namedIsRemotePath(named *types.Named, seen map[types.Type]bool) bool {
 	}
 	seen[named] = true
 	if typeArgs := named.TypeArgs(); typeArgs != nil {
-		for i := 0; i < typeArgs.Len(); i++ {
+		for i := range typeArgs.Len() {
 			if hasRemotePathType(typeArgs.At(i), seen) {
 				return true
 			}
 		}
 	}
-	// 仅展开非结构体底层类型（如自定义切片别名），绝不展开结构体字段。
-	if _, isStruct := named.Underlying().(*types.Struct); isStruct {
-		return false
-	}
-	return hasRemotePathType(named.Underlying(), seen)
-}
-
-func isFilepathCall(info *types.Info, call *ast.CallExpr) bool {
-	obj := vetutil.ResolveCalledObject(info, call)
-	return vetutil.ObjectPkgPath(obj) == "path/filepath"
-}
-
-func callArgsHaveRemotePath(info *types.Info, call *ast.CallExpr, remoteVars map[types.Object]bool) bool {
-	for _, arg := range call.Args {
-		if exprHasRemotePath(info, arg, remoteVars) {
-			return true
-		}
-	}
-	return false
-}
-
-func exprHasRemotePath(info *types.Info, expr ast.Expr, remoteVars map[types.Object]bool) bool {
-	if expr == nil {
-		return false
-	}
-	if isRemotePathType(info.TypeOf(expr)) {
-		return true
-	}
-	switch e := ast.Unparen(expr).(type) {
-	case *ast.Ident:
-		return remoteVars[info.Uses[e]]
-	case *ast.BinaryExpr:
-		return e.Op == token.ADD && (exprHasRemotePath(info, e.X, remoteVars) || exprHasRemotePath(info, e.Y, remoteVars))
-	case *ast.SliceExpr:
-		return exprHasRemotePath(info, e.X, remoteVars)
-	case *ast.IndexExpr:
-		return exprHasRemotePath(info, e.X, remoteVars)
-	case *ast.SelectorExpr:
-		return exprHasRemotePath(info, e.X, remoteVars)
-	case *ast.CallExpr:
-		return callExprHasRemotePath(info, e, remoteVars)
-	case *ast.CompositeLit:
-		return compositeHasRemotePath(info, e, remoteVars)
-	default:
-		return false
-	}
-}
-
-func callExprHasRemotePath(info *types.Info, call *ast.CallExpr, remoteVars map[types.Object]bool) bool {
-	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-		if exprHasRemotePath(info, sel.X, remoteVars) {
-			return true
-		}
-	}
-	return callArgsHaveRemotePath(info, call, remoteVars)
-}
-
-// compositeHasRemotePath 仅追踪切片、数组与 Map 字面量（如 []string{rp.String()}）中的远端路径，
-// 跳过结构体复合字面量（如 CopyTask{"/local", rp}），防止整值结构体变量被误标为污染。
-func compositeHasRemotePath(info *types.Info, lit *ast.CompositeLit, remoteVars map[types.Object]bool) bool {
-	if t := info.TypeOf(lit); t != nil {
-		if _, isStruct := types.Unalias(t).Underlying().(*types.Struct); isStruct {
-			return false
-		}
-	}
-	for _, elt := range lit.Elts {
-		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			if exprHasRemotePath(info, kv.Key, remoteVars) || exprHasRemotePath(info, kv.Value, remoteVars) {
-				return true
-			}
-			continue
-		}
-		if exprHasRemotePath(info, elt, remoteVars) {
-			return true
-		}
-	}
-	return false
+	_, isStruct := named.Underlying().(*types.Struct)
+	return !isStruct && hasRemotePathType(named.Underlying(), seen)
 }

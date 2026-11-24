@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/linearlease"
+	"github.com/wentf9/xops-cli/tools/xopsvet/internal/secretfact"
 	"golang.org/x/tools/go/analysis/analysistest"
 )
 
@@ -12,7 +13,7 @@ func TestLinearLease(t *testing.T) {
 	analysistest.Run(
 		t,
 		testdata,
-		linearlease.NewAnalyzer(),
+		linearlease.NewAnalyzer(secretfact.NewAnalyzer()),
 		"github.com/wentf9/xops-cli/core/conc",
 		"github.com/wentf9/xops-cli/core/conc_test",
 		"example.com/leasedef",

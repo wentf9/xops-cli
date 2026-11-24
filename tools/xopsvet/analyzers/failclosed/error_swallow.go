@@ -13,29 +13,20 @@ func checkErrorSwallowing(pass *analysis.Pass) {
 	// 预先收集全包局部无返回/非 error-bool 闭包变量绑定，使嵌套 func() bool 调用外层局部闭包时同样受检。
 	voidFuncVars := collectLocalVoidFuncVars(pass)
 	visitedLits := make(map[*ast.FuncLit]bool)
-	ins := vetutil.InspectorOf(pass)
-	nodeFilter := []ast.Node{
-		(*ast.FuncDecl)(nil),
-		(*ast.FuncLit)(nil),
-	}
-	ins.Preorder(nodeFilter, func(n ast.Node) {
+	vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)}, func(n ast.Node) {
 		switch fn := n.(type) {
 		case *ast.FuncDecl:
-			if fn.Body == nil || fn.Name == nil {
-				return
+			if fn.Body != nil && fn.Name != nil {
+				if obj := pass.TypesInfo.Defs[fn.Name]; obj != nil {
+					sig, _ := obj.Type().(*types.Signature)
+					inspectBoolFuncBody(pass, fn, fn.Body, sig, voidFuncVars, visitedLits)
+				}
 			}
-			obj := pass.TypesInfo.Defs[fn.Name]
-			if obj == nil {
-				return
-			}
-			sig, _ := obj.Type().(*types.Signature)
-			inspectBoolFuncBody(pass, fn, fn.Body, sig, voidFuncVars, visitedLits)
 		case *ast.FuncLit:
-			if fn.Body == nil {
-				return
+			if fn.Body != nil {
+				sig, _ := pass.TypesInfo.TypeOf(fn).(*types.Signature)
+				inspectBoolFuncBody(pass, fn, fn.Body, sig, voidFuncVars, visitedLits)
 			}
-			sig, _ := pass.TypesInfo.TypeOf(fn).(*types.Signature)
-			inspectBoolFuncBody(pass, fn, fn.Body, sig, voidFuncVars, visitedLits)
 		}
 	})
 }
@@ -46,17 +37,14 @@ func collectLocalVoidFuncVars(pass *analysis.Pass) map[*types.Var][]*ast.FuncLit
 		return out
 	}
 	pkgScope := pass.Pkg.Scope()
-	ins := vetutil.InspectorOf(pass)
-	nodeFilter := []ast.Node{
-		(*ast.AssignStmt)(nil),
-		(*ast.ValueSpec)(nil),
-	}
-	ins.Preorder(nodeFilter, func(n ast.Node) {
+	vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.AssignStmt)(nil), (*ast.ValueSpec)(nil)}, func(n ast.Node) {
 		switch node := n.(type) {
 		case *ast.AssignStmt:
 			recordVoidFuncLitPair(pass.TypesInfo, pkgScope, node.Lhs, node.Rhs, node.Tok == token.DEFINE, out)
 		case *ast.ValueSpec:
-			recordVoidFuncLitValueSpec(pass.TypesInfo, pkgScope, node, out)
+			if len(node.Values) > 0 {
+				recordVoidFuncLitPair(pass.TypesInfo, pkgScope, vetutil.IdentSliceToExprs(node.Names), node.Values, true, out)
+			}
 		}
 	})
 	return out
@@ -66,33 +54,24 @@ func hasBoolWithoutError(sig *types.Signature) bool {
 	if sig == nil || sig.Results() == nil || sig.Results().Len() == 0 {
 		return false
 	}
-	results := sig.Results()
 	hasBool := false
-	for i := 0; i < results.Len(); i++ {
-		rt := results.At(i).Type()
+	for i := range sig.Results().Len() {
+		rt := sig.Results().At(i).Type()
 		if vetutil.IsErrorInterfaceType(rt) {
 			return false
 		}
-		if isBoolType(rt) {
+		if b, ok := types.Unalias(rt).Underlying().(*types.Basic); ok && b.Kind() == types.Bool {
 			hasBool = true
 		}
 	}
 	return hasBool
 }
 
-func isBoolType(t types.Type) bool {
-	if t == nil {
-		return false
-	}
-	basic, ok := types.Unalias(t).Underlying().(*types.Basic)
-	return ok && basic.Kind() == types.Bool
-}
-
 func sigReturnsError(sig *types.Signature) bool {
 	if sig == nil || sig.Results() == nil {
 		return false
 	}
-	for i := 0; i < sig.Results().Len(); i++ {
+	for i := range sig.Results().Len() {
 		if vetutil.IsErrorInterfaceType(sig.Results().At(i).Type()) {
 			return true
 		}
@@ -100,83 +79,42 @@ func sigReturnsError(sig *types.Signature) bool {
 	return false
 }
 
-func inspectBoolFuncBody(
-	pass *analysis.Pass,
-	fnNode ast.Node,
-	body *ast.BlockStmt,
-	sig *types.Signature,
-	voidFuncVars map[*types.Var][]*ast.FuncLit,
-	visitedLits map[*ast.FuncLit]bool,
-) {
-	if !hasBoolWithoutError(sig) {
-		return
+func inspectBoolFuncBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockStmt, sig *types.Signature, voidFuncVars map[*types.Var][]*ast.FuncLit, visitedLits map[*ast.FuncLit]bool) {
+	if hasBoolWithoutError(sig) {
+		inspectBoolScopeBody(pass, fnNode, body, voidFuncVars, visitedLits)
 	}
-	inspectBoolScopeBody(pass, fnNode, body, voidFuncVars, visitedLits)
 }
 
-func inspectBoolScopeBody(
-	pass *analysis.Pass,
-	fnNode ast.Node,
-	body *ast.BlockStmt,
-	voidFuncVars map[*types.Var][]*ast.FuncLit,
-	visitedLits map[*ast.FuncLit]bool,
-) {
+func inspectBoolScopeBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockStmt, voidFuncVars map[*types.Var][]*ast.FuncLit, visitedLits map[*ast.FuncLit]bool) {
 	ast.Inspect(body, func(n ast.Node) bool {
-		if n == nil {
-			return false
-		}
-		// 嵌套 FuncLit 默认保持隔离，避免回调（如 slices.SortFunc）误归因到外层 bool 函数；
-		// 立即调用/defer/go 或局部调用的无 bool/error 返回 FuncLit 由下方 CallExpr 分支显式递归进入。
+		// 嵌套 FuncLit 默认保持隔离，避免回调误归因；局部调用的无 bool/error 返回 FuncLit 由下方显式进入。
 		if lit, ok := n.(*ast.FuncLit); ok && lit != fnNode {
 			return false
 		}
-		switch node := n.(type) {
-		case *ast.CallExpr:
-			checkSwallowedCallError(pass, node)
-			inspectCalledVoidFuncLit(pass, node, voidFuncVars, visitedLits)
-		case *ast.UnaryExpr:
-			if node.Op == token.ARROW {
-				checkSwallowedChanError(pass, node)
-			}
-		case *ast.RangeStmt:
-			checkSwallowedRangeChanError(pass, node)
-		}
-		return true
+		checkBoolScopeNode(pass, n, voidFuncVars, visitedLits)
+		return n != nil
 	})
 }
 
-func recordVoidFuncLitValueSpec(
-	info *types.Info,
-	pkgScope *types.Scope,
-	spec *ast.ValueSpec,
-	voidFuncVars map[*types.Var][]*ast.FuncLit,
-) {
-	if len(spec.Values) == 0 {
-		return
+func checkBoolScopeNode(pass *analysis.Pass, n ast.Node, voidFuncVars map[*types.Var][]*ast.FuncLit, visitedLits map[*ast.FuncLit]bool) {
+	switch node := n.(type) {
+	case *ast.CallExpr:
+		checkSwallowedCallError(pass, node)
+		inspectCalledVoidFuncLit(pass, node, voidFuncVars, visitedLits)
+	case *ast.UnaryExpr:
+		if node.Op == token.ARROW {
+			if tv, ok := pass.TypesInfo.Types[node]; ok && typeIsOrContainsError(tv.Type) {
+				pass.ReportRangef(node, "failclosed: 返回 bool 的函数禁止吞噬从 channel 接收的局部 error")
+			}
+		}
+	case *ast.RangeStmt:
+		checkSwallowedRangeChanError(pass, node)
 	}
-	lhs := make([]ast.Expr, len(spec.Names))
-	for i, id := range spec.Names {
-		lhs[i] = id
-	}
-	recordVoidFuncLitPair(info, pkgScope, lhs, spec.Values, true, voidFuncVars)
 }
 
-func recordVoidFuncLitPair(
-	info *types.Info,
-	pkgScope *types.Scope,
-	lhs []ast.Expr,
-	rhs []ast.Expr,
-	isDef bool,
-	voidFuncVars map[*types.Var][]*ast.FuncLit,
-) {
-	if info == nil {
-		return
-	}
-	for i, expr := range rhs {
-		if i >= len(lhs) {
-			break
-		}
-		lit, ok := ast.Unparen(expr).(*ast.FuncLit)
+func recordVoidFuncLitPair(info *types.Info, pkgScope *types.Scope, lhs, rhs []ast.Expr, isDef bool, voidFuncVars map[*types.Var][]*ast.FuncLit) {
+	for i := range min(len(lhs), len(rhs)) {
+		lit, ok := ast.Unparen(rhs[i]).(*ast.FuncLit)
 		if !ok || !isVoidInspectableFuncLit(info, lit) {
 			continue
 		}
@@ -185,14 +123,10 @@ func recordVoidFuncLitPair(
 			continue
 		}
 		v := resolveVarObj(info, id, isDef)
-		if isLocalVar(v, pkgScope) {
+		if v != nil && v.Parent() != nil && v.Parent() != pkgScope {
 			voidFuncVars[v] = append(voidFuncVars[v], lit)
 		}
 	}
-}
-
-func isLocalVar(v *types.Var, pkgScope *types.Scope) bool {
-	return v != nil && v.Parent() != nil && v.Parent() != pkgScope
 }
 
 func resolveVarObj(info *types.Info, id *ast.Ident, isDef bool) *types.Var {
@@ -212,12 +146,7 @@ func isVoidInspectableFuncLit(info *types.Info, lit *ast.FuncLit) bool {
 	return !hasBoolWithoutError(litSig) && !sigReturnsError(litSig)
 }
 
-func inspectCalledVoidFuncLit(
-	pass *analysis.Pass,
-	call *ast.CallExpr,
-	voidFuncVars map[*types.Var][]*ast.FuncLit,
-	visitedLits map[*ast.FuncLit]bool,
-) {
+func inspectCalledVoidFuncLit(pass *analysis.Pass, call *ast.CallExpr, voidFuncVars map[*types.Var][]*ast.FuncLit, visitedLits map[*ast.FuncLit]bool) {
 	switch fn := ast.Unparen(call.Fun).(type) {
 	case *ast.FuncLit:
 		if isVoidInspectableFuncLit(pass.TypesInfo, fn) && !visitedLits[fn] {
@@ -225,54 +154,34 @@ func inspectCalledVoidFuncLit(
 			inspectBoolScopeBody(pass, fn, fn.Body, voidFuncVars, visitedLits)
 		}
 	case *ast.Ident:
-		v, ok := pass.TypesInfo.Uses[fn].(*types.Var)
-		if !ok {
-			return
-		}
-		for _, lit := range voidFuncVars[v] {
-			if !visitedLits[lit] {
-				visitedLits[lit] = true
-				inspectBoolScopeBody(pass, lit, lit.Body, voidFuncVars, visitedLits)
+		if v, ok := pass.TypesInfo.Uses[fn].(*types.Var); ok {
+			for _, lit := range voidFuncVars[v] {
+				if !visitedLits[lit] {
+					visitedLits[lit] = true
+					inspectBoolScopeBody(pass, lit, lit.Body, voidFuncVars, visitedLits)
+				}
 			}
 		}
 	}
 }
 
 func checkSwallowedRangeChanError(pass *analysis.Pass, rng *ast.RangeStmt) {
-	if rng == nil || rng.X == nil {
-		return
-	}
-	tv, ok := pass.TypesInfo.Types[rng.X]
-	if !ok || tv.Type == nil {
-		return
-	}
-	ch, ok := types.Unalias(tv.Type).Underlying().(*types.Chan)
-	if !ok || ch == nil {
-		return
-	}
-	if typeIsOrContainsError(ch.Elem()) {
-		pass.ReportRangef(rng, "failclosed: 返回 bool 的函数禁止在 range chan error 中吞噬局部 error")
+	if rng != nil && rng.X != nil {
+		if tv, ok := pass.TypesInfo.Types[rng.X]; ok && tv.Type != nil {
+			if ch, ok := types.Unalias(tv.Type).Underlying().(*types.Chan); ok && ch != nil && typeIsOrContainsError(ch.Elem()) {
+				pass.ReportRangef(rng, "failclosed: 返回 bool 的函数禁止在 range chan error 中吞噬局部 error")
+			}
+		}
 	}
 }
 
 func checkSwallowedCallError(pass *analysis.Pass, call *ast.CallExpr) {
-	callee := vetutil.ResolveCalledObject(pass.TypesInfo, call)
-	if vetutil.IsPkgSymbol(callee, "errors", "Is", "As", "AsType") {
+	if vetutil.IsPkgSymbol(vetutil.ResolveCalledObject(pass.TypesInfo, call), "errors", "Is", "As", "AsType") {
 		return
 	}
-	tv, ok := pass.TypesInfo.Types[call]
-	if !ok || !typeIsOrContainsError(tv.Type) {
-		return
+	if tv, ok := pass.TypesInfo.Types[call]; ok && typeIsOrContainsError(tv.Type) {
+		pass.ReportRangef(call, "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error（请改为返回 error 或使用 errors.Is/As/AsType 纯分类谓词）")
 	}
-	pass.ReportRangef(call, "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error（请改为返回 error 或使用 errors.Is/As/AsType 纯分类谓词）")
-}
-
-func checkSwallowedChanError(pass *analysis.Pass, un *ast.UnaryExpr) {
-	tv, ok := pass.TypesInfo.Types[un]
-	if !ok || !typeIsOrContainsError(tv.Type) {
-		return
-	}
-	pass.ReportRangef(un, "failclosed: 返回 bool 的函数禁止吞噬从 channel 接收的局部 error")
 }
 
 func typeIsOrContainsError(t types.Type) bool {
@@ -282,13 +191,11 @@ func typeIsOrContainsError(t types.Type) bool {
 	if vetutil.IsErrorInterfaceType(t) {
 		return true
 	}
-	tup, ok := t.(*types.Tuple)
-	if !ok {
-		return false
-	}
-	for i := 0; i < tup.Len(); i++ {
-		if vetutil.IsErrorInterfaceType(tup.At(i).Type()) {
-			return true
+	if tup, ok := t.(*types.Tuple); ok {
+		for i := range tup.Len() {
+			if vetutil.IsErrorInterfaceType(tup.At(i).Type()) {
+				return true
+			}
 		}
 	}
 	return false

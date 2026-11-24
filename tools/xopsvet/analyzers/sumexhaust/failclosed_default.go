@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
@@ -12,24 +14,13 @@ import (
 
 func isSecurityDecisionSealed(pass *analysis.Pass, info *sealedInfo, localFailClosed map[types.Object]bool) bool {
 	if info.named != nil && info.named.Obj() != nil {
-		obj := info.named.Obj()
-		origObj := obj
-		if origin := info.named.Origin(); origin != nil && origin.Obj() != nil {
-			origObj = origin.Obj()
-		}
-		if localFailClosed[origObj] || pass.ImportObjectFact(origObj, new(failClosedSumFact)) {
-			return true
-		}
-		if isSecurityPkg(origObj.Pkg()) || isSecurityTypeName(origObj.Name()) {
+		origObj := info.named.Origin().Obj()
+		if localFailClosed[origObj] || pass.ImportObjectFact(origObj, new(failClosedSumFact)) ||
+			isSecurityPkg(origObj.Pkg()) || isSecurityTypeName(origObj.Name()) {
 			return true
 		}
 	}
-	for _, m := range info.sealedMethods {
-		if isSecurityPkg(m.Pkg()) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(info.sealedMethods, func(m *types.Func) bool { return isSecurityPkg(m.Pkg()) })
 }
 
 func isSecurityPkg(pkg *types.Package) bool {
@@ -37,31 +28,18 @@ func isSecurityPkg(pkg *types.Package) bool {
 		return false
 	}
 	pkgInfo := vetutil.ClassifyPackage(pkg.Path())
-	if pkgInfo.Layer == vetutil.LayerCoreGate {
-		return true
-	}
 	secPrefix := vetutil.ModulePrefix + "/core/domain/security"
-	return pkgInfo.BasePath == secPrefix || strings.HasPrefix(pkgInfo.BasePath, secPrefix+"/")
+	return pkgInfo.Layer == vetutil.LayerCoreGate || pkgInfo.BasePath == secPrefix || strings.HasPrefix(pkgInfo.BasePath, secPrefix+"/")
 }
 
 func isSecurityTypeName(name string) bool {
-	return strings.Contains(name, "Decision") ||
-		strings.Contains(name, "Verdict") ||
-		strings.Contains(name, "Guardrail") ||
-		strings.Contains(name, "Approval") ||
-		strings.Contains(name, "Capability")
+	return slices.ContainsFunc([]string{"Decision", "Verdict", "Guardrail", "Approval", "Capability"},
+		func(kw string) bool { return strings.Contains(name, kw) })
 }
 
-func checkFailClosedDefault(
-	pass *analysis.Pass,
-	ts *ast.TypeSwitchStmt,
-	info *sealedInfo,
-	switchedType types.Type,
-	defaultClause *ast.CaseClause,
-) {
-	typeLabel := formatInterfaceName(pass.Pkg, info.named, switchedType)
+func checkFailClosedDefault(pass *analysis.Pass, ts *ast.TypeSwitchStmt, info *sealedInfo, switchedType types.Type, defaultClause *ast.CaseClause) {
 	if defaultClause == nil {
-		pass.ReportRangef(ts, "sumexhaust: 安全决策封闭类型 %s 的 type switch 必须包含 fail-closed default 分支", typeLabel)
+		pass.ReportRangef(ts, "sumexhaust: 安全决策封闭类型 %s 的 type switch 必须包含 fail-closed default 分支", formatInterfaceName(pass.Pkg, info.named, switchedType))
 		return
 	}
 	stmts := nonEmptyStmts(defaultClause.Body)
@@ -71,33 +49,18 @@ func checkFailClosedDefault(
 	}
 	enclosing, sig := enclosingFuncInfo(pass, ts)
 	// 测试源码与 core/ports/tck 测试契约夹具层均允许以 t.Fatal/t.Error 作为 fail-closed default 处置。
-	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos()) ||
-		vetutil.ClassifyPackage(pass.Pkg.Path()).Layer == vetutil.LayerCorePortsTCK
+	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos()) || vetutil.ClassifyPackage(pass.Pkg.Path()).Layer == vetutil.LayerCorePortsTCK
 	state := defaultScanState{
-		pass:           pass,
-		sig:            sig,
-		inTest:         inTest,
-		permissiveVars: make(map[*types.Var]bool),
-		funcLitVars:    collectOuterFuncLitVars(pass.TypesInfo, enclosing, ts.Pos()),
-		visitedLits:    make(map[*ast.FuncLit]bool),
+		pass: pass, sig: sig, inTest: inTest, permissiveVars: make(map[*types.Var]bool),
+		funcLitVars: collectOuterFuncLitVars(pass.TypesInfo, enclosing, ts.Pos()), visitedLits: make(map[*ast.FuncLit]bool),
 	}
-	res := inspectDefaultBlock(stmts, state)
-	if res.reportedFailOpen {
-		return
-	}
-	if !res.hasFailClosedAction {
+	if res := inspectDefaultBlock(stmts, state); !res.reportedFailOpen && !res.hasFailClosedAction {
 		pass.ReportRangef(defaultClause, "sumexhaust: 安全决策 default 分支必须包含显式 fail-closed 处置（返回拒绝/错误或 panic），禁止静默 break 或放行")
 	}
 }
 
 func nonEmptyStmts(stmts []ast.Stmt) []ast.Stmt {
-	var out []ast.Stmt
-	for _, s := range stmts {
-		if _, isEmpty := s.(*ast.EmptyStmt); !isEmpty {
-			out = append(out, s)
-		}
-	}
-	return out
+	return slices.DeleteFunc(slices.Clone(stmts), func(s ast.Stmt) bool { _, ok := s.(*ast.EmptyStmt); return ok })
 }
 
 func enclosingFuncInfo(pass *analysis.Pass, target ast.Node) (ast.Node, *types.Signature) {
@@ -146,7 +109,7 @@ func collectOuterFuncLitVars(info *types.Info, enclosing ast.Node, beforePos tok
 		case *ast.AssignStmt:
 			recordFuncLitPair(info, node.Lhs, node.Rhs, node.Tok == token.DEFINE, out)
 		case *ast.ValueSpec:
-			recordFuncLitPair(info, identSliceToExprs(node.Names), node.Values, true, out)
+			recordFuncLitPair(info, vetutil.IdentSliceToExprs(node.Names), node.Values, true, out)
 		}
 		return true
 	})
@@ -167,14 +130,6 @@ func recordFuncLitPair(info *types.Info, lhs, rhs []ast.Expr, isDef bool, out ma
 	}
 }
 
-func identSliceToExprs(ids []*ast.Ident) []ast.Expr {
-	out := make([]ast.Expr, len(ids))
-	for i, id := range ids {
-		out[i] = id
-	}
-	return out
-}
-
 type defaultScanState struct {
 	pass           *analysis.Pass
 	sig            *types.Signature
@@ -184,10 +139,7 @@ type defaultScanState struct {
 	visitedLits    map[*ast.FuncLit]bool
 }
 
-type defaultScanResult struct {
-	hasFailClosedAction bool
-	reportedFailOpen    bool
-}
+type defaultScanResult struct{ hasFailClosedAction, reportedFailOpen bool }
 
 func inspectDefaultBlock(stmts []ast.Stmt, st defaultScanState) defaultScanResult {
 	var res defaultScanResult
@@ -205,12 +157,11 @@ func inspectDefaultStmt(s ast.Stmt, st defaultScanState) defaultScanResult {
 	case *ast.ReturnStmt:
 		res.reportedFailOpen = checkReturnStmt(node, st, &res)
 	case *ast.AssignStmt:
-		res.reportedFailOpen = checkAssignStmt(node, st)
+		res.reportedFailOpen = checkExprPairPermissive(node, node.Lhs, node.Rhs, node.Tok == token.DEFINE, st)
 	case *ast.DeclStmt:
 		res.reportedFailOpen = checkDeclStmt(node, st)
 	case *ast.ExprStmt:
-		res.hasFailClosedAction = isFailClosedCall(st, node.X)
-		res.reportedFailOpen = inspectCalledFuncLitStmt(node.X, st)
+		res.hasFailClosedAction, res.reportedFailOpen = isFailClosedCall(st, node.X), inspectCalledFuncLitStmt(node.X, st)
 	case *ast.DeferStmt:
 		res.reportedFailOpen = inspectCalledFuncLitStmt(node.Call, st)
 	case *ast.GoStmt:
@@ -235,36 +186,21 @@ func inspectDefaultStmt(s ast.Stmt, st defaultScanState) defaultScanResult {
 	return res
 }
 
-// inspectSwitchStmt 扫描嵌套 switch/type-switch 分支以透传 fail-open 违规，
-// 因无法保证所有运行时分支均终止，故不置位 hasFailClosedAction。
 func inspectSwitchStmt(initStmt ast.Stmt, body *ast.BlockStmt, st defaultScanState) defaultScanResult {
-	reported := false
-	if initStmt != nil {
-		reported = inspectDefaultStmt(initStmt, st).reportedFailOpen
-	}
-	if body == nil {
-		return defaultScanResult{reportedFailOpen: reported}
-	}
-	for _, s := range body.List {
-		cc, ok := s.(*ast.CaseClause)
-		if !ok {
-			continue
-		}
-		if inspectDefaultBlock(nonEmptyStmts(cc.Body), st).reportedFailOpen {
-			reported = true
+	reported := initStmt != nil && inspectDefaultStmt(initStmt, st).reportedFailOpen
+	if body != nil {
+		for _, s := range body.List {
+			if cc, ok := s.(*ast.CaseClause); ok {
+				reported = inspectDefaultBlock(nonEmptyStmts(cc.Body), st).reportedFailOpen || reported
+			}
 		}
 	}
 	return defaultScanResult{reportedFailOpen: reported}
 }
 
 func inspectLoopStmt(initStmt ast.Stmt, body *ast.BlockStmt, st defaultScanState) defaultScanResult {
-	reported := false
-	if initStmt != nil {
-		reported = inspectDefaultStmt(initStmt, st).reportedFailOpen
-	}
-	if body != nil && inspectDefaultBlock(nonEmptyStmts(body.List), st).reportedFailOpen {
-		reported = true
-	}
+	reported := (initStmt != nil && inspectDefaultStmt(initStmt, st).reportedFailOpen) ||
+		(body != nil && inspectDefaultBlock(nonEmptyStmts(body.List), st).reportedFailOpen)
 	return defaultScanResult{reportedFailOpen: reported}
 }
 
@@ -274,29 +210,18 @@ func inspectSelectStmt(sel *ast.SelectStmt, st defaultScanState) defaultScanResu
 	}
 	reported := false
 	for _, s := range sel.Body.List {
-		cc, ok := s.(*ast.CommClause)
-		if !ok {
-			continue
-		}
-		if cc.Comm != nil && inspectDefaultStmt(cc.Comm, st).reportedFailOpen {
-			reported = true
-		}
-		if inspectDefaultBlock(nonEmptyStmts(cc.Body), st).reportedFailOpen {
-			reported = true
+		if cc, ok := s.(*ast.CommClause); ok {
+			reported = (cc.Comm != nil && inspectDefaultStmt(cc.Comm, st).reportedFailOpen) ||
+				inspectDefaultBlock(nonEmptyStmts(cc.Body), st).reportedFailOpen || reported
 		}
 	}
 	return defaultScanResult{reportedFailOpen: reported}
 }
 
 func inspectIfStmt(ifNode *ast.IfStmt, st defaultScanState) defaultScanResult {
-	initReported := false
-	if ifNode.Init != nil {
-		// 先检查 if 初始化语句（如 ok := true 或闭包绑定），确保赋值违规与变量追踪生效。
-		initReported = inspectDefaultStmt(ifNode.Init, st).reportedFailOpen
-	}
+	initReported := ifNode.Init != nil && inspectDefaultStmt(ifNode.Init, st).reportedFailOpen
 	thenRes := inspectDefaultBlock(nonEmptyStmts(ifNode.Body.List), st)
 	if ifNode.Else == nil {
-		// 缺少 else 分支的 if 无法保证假分支同样 fail-closed 终止，仅透传 fail-open 违规。
 		return defaultScanResult{reportedFailOpen: initReported || thenRes.reportedFailOpen}
 	}
 	var elseRes defaultScanResult
@@ -314,14 +239,11 @@ func inspectIfStmt(ifNode *ast.IfStmt, st defaultScanState) defaultScanResult {
 
 func checkReturnStmt(ret *ast.ReturnStmt, st defaultScanState, res *defaultScanResult) bool {
 	if len(ret.Results) == 0 {
-		// 命名返回值裸 return 无法在局部静态保证已被拒绝值覆盖，单独裸 return 不视为处置。
 		return false
 	}
-	for _, expr := range ret.Results {
-		if isPermissiveExpr(st.pass.TypesInfo, expr, st) {
-			st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）")
-			return true
-		}
+	if slices.ContainsFunc(ret.Results, func(expr ast.Expr) bool { return isPermissiveExpr(st.pass.TypesInfo, expr, st) }) {
+		st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）")
+		return true
 	}
 	if returnsBareNilError(st.pass.TypesInfo, st.sig, ret.Results) {
 		st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回 nil error 且无显式拒绝值")
@@ -335,25 +257,15 @@ func returnsBareNilError(info *types.Info, sig *types.Signature, results []ast.E
 	if sig == nil || sig.Results() == nil || sig.Results().Len() != len(results) {
 		return false
 	}
-	hasNilErr := false
-	hasRejectNonErr := false
-	for i := 0; i < len(results); i++ {
+	hasNilErr, hasReject := false, false
+	for i := range results {
 		if vetutil.IsErrorInterfaceType(sig.Results().At(i).Type()) {
-			if isNilIdent(info, results[i]) {
-				hasNilErr = true
-			}
-			continue
-		}
-		if isFailClosedValueExpr(info, results[i]) {
-			hasRejectNonErr = true
+			hasNilErr = hasNilErr || isNilIdent(info, results[i])
+		} else if isFailClosedValueExpr(info, results[i]) {
+			hasReject = true
 		}
 	}
-	return hasNilErr && !hasRejectNonErr
-}
-
-func checkAssignStmt(assign *ast.AssignStmt, st defaultScanState) bool {
-	// 仅赋值不能保证 default 分支未滑落（fallthrough），故不置 hasFailClosedAction；仅检查是否赋值放行值并追踪局部变量。
-	return checkExprPairPermissive(assign, assign.Lhs, assign.Rhs, assign.Tok == token.DEFINE, st)
+	return hasNilErr && !hasReject
 }
 
 func checkDeclStmt(decl *ast.DeclStmt, st defaultScanState) bool {
@@ -363,28 +275,17 @@ func checkDeclStmt(decl *ast.DeclStmt, st defaultScanState) bool {
 	}
 	reported := false
 	for _, spec := range gen.Specs {
-		vs, ok := spec.(*ast.ValueSpec)
-		if !ok || len(vs.Values) == 0 {
-			continue
-		}
-		if checkExprPairPermissive(vs, identSliceToExprs(vs.Names), vs.Values, true, st) {
-			reported = true
+		if vs, ok := spec.(*ast.ValueSpec); ok && len(vs.Values) > 0 {
+			reported = checkExprPairPermissive(vs, vetutil.IdentSliceToExprs(vs.Names), vs.Values, true, st) || reported
 		}
 	}
 	return reported
 }
 
-func checkExprPairPermissive(
-	reportNode ast.Node,
-	lhs []ast.Expr,
-	rhs []ast.Expr,
-	isDef bool,
-	st defaultScanState,
-) bool {
+func checkExprPairPermissive(reportNode ast.Node, lhs, rhs []ast.Expr, isDef bool, st defaultScanState) bool {
 	reported := false
 	for i, expr := range rhs {
-		lhsVar := resolveLHSVar(st.pass.TypesInfo, lhs, i, isDef)
-		if checkSingleExprPermissive(lhsVar, expr, st) && !reported {
+		if checkSingleExprPermissive(resolveLHSVar(st.pass.TypesInfo, lhs, i, isDef), expr, st) && !reported {
 			st.pass.ReportRangef(reportNode, "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）")
 			reported = true
 		}
@@ -400,18 +301,14 @@ func checkSingleExprPermissive(lhsVar *types.Var, expr ast.Expr, st defaultScanS
 		}
 		return false
 	}
-	if lhsVar != nil {
-		delete(st.funcLitVars, lhsVar)
-	}
+	delete(st.funcLitVars, lhsVar)
 	if isPermissiveExpr(st.pass.TypesInfo, expr, st) {
 		if lhsVar != nil {
 			st.permissiveVars[lhsVar] = true
 		}
 		return true
 	}
-	if lhsVar != nil {
-		delete(st.permissiveVars, lhsVar)
-	}
+	delete(st.permissiveVars, lhsVar)
 	return false
 }
 
@@ -423,11 +320,11 @@ func resolveLHSVar(info *types.Info, lhs []ast.Expr, idx int, isDef bool) *types
 	if !ok || id.Name == "_" {
 		return nil
 	}
+	obj := info.Uses[id]
 	if isDef {
-		v, _ := info.Defs[id].(*types.Var)
-		return v
+		obj = info.Defs[id]
 	}
-	v, _ := info.Uses[id].(*types.Var)
+	v, _ := obj.(*types.Var)
 	return v
 }
 
@@ -437,21 +334,23 @@ func isFailClosedCall(st defaultScanState, expr ast.Expr) bool {
 		return false
 	}
 	if id, ok := ast.Unparen(call.Fun).(*ast.Ident); ok && id.Name == "panic" {
-		if _, isBuiltin := st.pass.TypesInfo.Uses[id].(*types.Builtin); isBuiltin {
-			return true
-		}
-	}
-	if !st.inTest {
-		return false
+		_, isB := st.pass.TypesInfo.Uses[id].(*types.Builtin)
+		return isB
 	}
 	sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
-	if !ok {
-		return false
+	return st.inTest && ok && slices.Contains([]string{"Fatal", "Fatalf", "Error", "Errorf", "Fail", "FailNow"}, sel.Sel.Name)
+}
+
+func cloneDefaultScanState(litSig *types.Signature, st defaultScanState, visited map[*ast.FuncLit]bool, sharePerm bool) defaultScanState {
+	perm, fns := st.permissiveVars, maps.Clone(st.funcLitVars)
+	if !sharePerm {
+		perm = maps.Clone(st.permissiveVars)
 	}
-	switch sel.Sel.Name {
-	case "Fatal", "Fatalf", "Error", "Errorf", "Fail", "FailNow":
-		return true
-	default:
-		return false
+	if perm == nil {
+		perm = make(map[*types.Var]bool)
 	}
+	if fns == nil {
+		fns = make(map[*types.Var]*ast.FuncLit)
+	}
+	return defaultScanState{pass: st.pass, sig: litSig, inTest: st.inTest, permissiveVars: perm, funcLitVars: fns, visitedLits: visited}
 }

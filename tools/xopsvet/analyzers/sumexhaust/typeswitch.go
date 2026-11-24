@@ -18,7 +18,6 @@ func checkTypeSwitch(pass *analysis.Pass, ts *ast.TypeSwitchStmt, localFailClose
 	if info == nil {
 		return
 	}
-
 	covered := make([]bool, len(info.variants))
 	var defaultClause *ast.CaseClause
 	for _, stmt := range ts.Body.List {
@@ -32,16 +31,9 @@ func checkTypeSwitch(pass *analysis.Pass, ts *ast.TypeSwitchStmt, localFailClose
 		}
 		matchCaseClause(pass, cc, info, covered)
 	}
-
 	if missing := formatMissingVariants(pass.Pkg, info.variants, covered); len(missing) > 0 {
-		pass.ReportRangef(
-			ts,
-			"sumexhaust: 对封闭接口 %s 的 type switch 缺少变体: %s",
-			formatInterfaceName(pass.Pkg, info.named, switchedType),
-			strings.Join(missing, ", "),
-		)
+		pass.ReportRangef(ts, "sumexhaust: 对封闭接口 %s 的 type switch 缺少变体: %s", formatInterfaceName(pass.Pkg, info.named, switchedType), strings.Join(missing, ", "))
 	}
-
 	if isSecurityDecisionSealed(pass, info, localFailClosed) {
 		checkFailClosedDefault(pass, ts, info, switchedType, defaultClause)
 	}
@@ -51,17 +43,17 @@ func extractSwitchedExpr(ts *ast.TypeSwitchStmt) ast.Expr {
 	if ts == nil || ts.Body == nil {
 		return nil
 	}
+	var rhs ast.Expr
 	switch assign := ts.Assign.(type) {
 	case *ast.ExprStmt:
-		if ta, ok := ast.Unparen(assign.X).(*ast.TypeAssertExpr); ok {
-			return ta.X
-		}
+		rhs = assign.X
 	case *ast.AssignStmt:
 		if len(assign.Rhs) == 1 {
-			if ta, ok := ast.Unparen(assign.Rhs[0]).(*ast.TypeAssertExpr); ok {
-				return ta.X
-			}
+			rhs = assign.Rhs[0]
 		}
+	}
+	if ta, ok := ast.Unparen(rhs).(*ast.TypeAssertExpr); ok {
+		return ta.X
 	}
 	return nil
 }
@@ -76,36 +68,20 @@ func matchCaseClause(pass *analysis.Pass, cc *ast.CaseClause, info *sealedInfo, 
 		if basic, ok := ct.(*types.Basic); ok && basic.Kind() == types.UntypedNil {
 			continue
 		}
-		markCaseTypeCovered(ct, info, covered)
-	}
-}
-
-func markCaseTypeCovered(ct types.Type, info *sealedInfo, covered []bool) {
-	if subIface, ok := asInterfaceType(ct); ok {
-		markSubInterfaceCovered(subIface, info, covered)
-		return
-	}
-	for i, v := range info.variants {
-		if variantMatchesCaseType(ct, v) {
-			covered[i] = true
+		if subIface, ok := ct.Underlying().(*types.Interface); ok {
+			markSubInterfaceCovered(subIface, info, covered)
+			continue
+		}
+		for i, v := range info.variants {
+			if variantMatchesCaseType(ct, v) {
+				covered[i] = true
+			}
 		}
 	}
 }
 
-func asInterfaceType(t types.Type) (*types.Interface, bool) {
-	u := types.Unalias(t)
-	if iface, ok := u.(*types.Interface); ok {
-		return iface, true
-	}
-	if named, ok := u.(*types.Named); ok {
-		iface, isIface := named.Underlying().(*types.Interface)
-		return iface, isIface
-	}
-	return nil, false
-}
-
 func markSubInterfaceCovered(subIface *types.Interface, info *sealedInfo, covered []bool) {
-	// 禁止 case any / case interface{} / 任意超集或等价接口（如 interface{ Tag() } 或 interface{ sealed*() }）绕过变体穷尽检查。
+	// 禁止 case any / case interface{} / 任意超集或等价全覆盖接口绕过变体穷尽检查。
 	if subIface.NumMethods() == 0 || types.Implements(info.iface, subIface) {
 		return
 	}
@@ -115,7 +91,6 @@ func markSubInterfaceCovered(subIface *types.Interface, info *sealedInfo, covere
 			matched = append(matched, i)
 		}
 	}
-	// 当子接口恰好覆盖全部必填变体（含单变体封闭接口）时，视为等价全覆盖逃生口并拒绝计入覆盖。
 	if len(info.variants) > 0 && len(matched) == len(info.variants) {
 		return
 	}
@@ -130,18 +105,9 @@ func variantMatchesCaseType(ct, v types.Type) bool {
 	}
 	ctElem, ctIsPtr := unwrapPointerElem(ct)
 	vElem, vIsPtr := unwrapPointerElem(v)
-	if ctIsPtr != vIsPtr {
-		return false
-	}
 	vNamed, ok := isUninstantiatedGenericNamed(vElem)
-	if !ok {
-		return false
-	}
-	ctNamed, ok := ctElem.(*types.Named)
-	if !ok || ctNamed == nil {
-		return false
-	}
-	return vNamed.Origin() != nil && ctNamed.Origin() == vNamed.Origin()
+	ctNamed, isNamed := ctElem.(*types.Named)
+	return ctIsPtr == vIsPtr && ok && isNamed && ctNamed != nil && vNamed.Origin() != nil && ctNamed.Origin() == vNamed.Origin()
 }
 
 func unwrapPointerElem(t types.Type) (types.Type, bool) {
@@ -173,9 +139,8 @@ func formatMissingVariants(passPkg *types.Package, variants []types.Type, covere
 }
 
 func formatInterfaceName(passPkg *types.Package, named *types.Named, switchedType types.Type) string {
-	qual := shortQualifier(passPkg)
 	if named != nil {
-		return types.TypeString(named, qual)
+		return types.TypeString(named, shortQualifier(passPkg))
 	}
-	return types.TypeString(switchedType, qual)
+	return types.TypeString(switchedType, shortQualifier(passPkg))
 }

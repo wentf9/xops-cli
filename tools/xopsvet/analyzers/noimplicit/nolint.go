@@ -5,17 +5,22 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-// checkNolintComments 在 RFC v2.3.2 §5 规定的 8 个生产特权白名单包之外拦截行内 //nolint 指令。
-// core/internal/sim、cmd/xops 及所有外置 *_test 包均由 vetutil.AllowNolint 剥离特权，不得绕过 lint。
+// checkNolintComments 按单个源码文件强制 RFC v2.3.3 §5 规定的行内 //nolint 禁令：
+// 仅 8 个特权包的生产源码文件允许 //nolint:；其余全部包及全仓所有测试文件
+// （含 8 个特权包的白盒 *_test.go、外置 *_test、cmd/xops、core/internal/sim）均 100% 禁止。
 func checkNolintComments(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
-	if vetutil.AllowNolint(pkgInfo) {
-		return
-	}
 	for _, file := range pass.Files {
+		if vetutil.AllowNolintInFile(pass, file, pkgInfo) {
+			continue
+		}
+		msg := "noimplicit: 白名单包外禁止使用行内 //nolint 注解"
+		if vetutil.AllowNolint(pkgInfo) {
+			msg = "noimplicit: 测试文件（含特权包白盒 *_test.go）禁止使用行内 //nolint 注解"
+		}
 		for _, cg := range file.Comments {
 			for _, c := range cg.List {
 				if vetutil.HasNolintComment(c) {
-					pass.ReportRangef(c, "noimplicit: 白名单包外禁止使用行内 //nolint 注解")
+					pass.ReportRangef(c, "%s", msg)
 				}
 			}
 		}

@@ -21,7 +21,7 @@ import (
 )
 
 //xops:secretuse
-func WithMasterKey(fn func(plain []byte) error) error { // want WithMasterKey:"secretuse"
+func WithMasterKey(fn func(plain []byte) error) error {
 	key := []byte("master-key")
 	defer clear(key)
 	return fn(key)
@@ -105,7 +105,7 @@ func badVaultLeaks(box *secret.SecretBox) {
 }
 
 //xops:secretuse
-func badDirectReturnPlain(plain []byte) string { // want badDirectReturnPlain:"secretuse"
+func badDirectReturnPlain(plain []byte) string {
 	return string(plain) // want "禁止通过 return 返回明文机密"
 }
 
@@ -259,7 +259,7 @@ type localConsumer interface {
 
 type annotatedConsumer interface {
 	//xops:secretuse
-	Consume(plain []byte) error // want Consume:"secretuse"
+	Consume(plain []byte) error
 }
 
 type badConsumerImpl struct{}
@@ -320,18 +320,20 @@ func badNewBypassesNB(box *secret.SecretBox) {
 	var okIC annotatedConsumer = badConsumerImpl{}
 	_ = box.Use(okIC.Consume)
 
-	// NB-S3c: 10 跳逆序回调别名链
+	// NB-S3c: 10 跳逆序回调别名链（循环确保 SSA 真实可达）
 	var c1, c2, c3, c4, c5, c6, c7, c8, c9, c10 func([]byte) error
-	c10 = c9
-	c9 = c8
-	c8 = c7
-	c7 = c6
-	c6 = c5
-	c5 = c4
-	c4 = c3
-	c3 = c2
-	c2 = c1
-	c1 = badHelper10Hops
+	for range 10 {
+		c10 = c9
+		c9 = c8
+		c8 = c7
+		c7 = c6
+		c6 = c5
+		c5 = c4
+		c4 = c3
+		c3 = c2
+		c2 = c1
+		c1 = badHelper10Hops
+	}
 	_ = box.Use(c10)
 }
 

@@ -213,8 +213,8 @@ func badReturnAndNamedResult(ctx context.Context, p leasedef.Pool) {
 
 	_ = p.WithLease(ctx, func(ctx context.Context, sess leasedef.Session) error {
 		f := func() (out leasedef.Session) {
-			out = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
-			return
+			out = sess
+			return // want "禁止通过 return 返回 //xops:borrowed 借用变量"
 		}
 		_ = f()
 		_ = func() any {
@@ -276,15 +276,17 @@ func badBypassL3ClosureAliasChain(ctx context.Context, p leasedef.Pool) {
 		fnAlias := fnOrig
 		leasedef.RunSync(fnAlias)
 
-		// 6 跳逆序局部闭包别名链测试（验证 >4 轮不动点收敛）
+		// 6 跳逆序局部闭包别名链测试（循环确保 SSA 真实可达）
 		var a1, a2, a3, a4, a5, a6 func()
-		a6 = a5
-		a5 = a4
-		a4 = a3
-		a3 = a2
-		a2 = a1
-		a1 = func() {
-			leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
+		for range 6 {
+			a6 = a5
+			a5 = a4
+			a4 = a3
+			a3 = a2
+			a2 = a1
+			a1 = func() {
+				leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
+			}
 		}
 		fnConv := myFunc(a6)
 		leasedef.RunSync(fnConv)

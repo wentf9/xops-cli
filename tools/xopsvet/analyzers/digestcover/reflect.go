@@ -8,13 +8,8 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-// checkNoReflectReachable 从 WriteCanonical 出发沿同包可解析调用图遍历全部可达函数与方法，
-// 禁止在 WriteCanonical 及其任意同包辅助调用（含非接收者值传递辅助函数）中使用 reflect。
-func checkNoReflectReachable(
-	pass *analysis.Pass,
-	writeFn *ast.FuncDecl,
-	funcDecls map[*types.Func]*ast.FuncDecl,
-) {
+// checkNoReflectReachable 从 WriteCanonical 出发沿同包可解析调用图遍历全部可达函数与方法，禁止使用 reflect。
+func checkNoReflectReachable(pass *analysis.Pass, writeFn *ast.FuncDecl, funcDecls map[*types.Func]*ast.FuncDecl) {
 	visited := make(map[*types.Func]bool)
 	if fnObj, ok := pass.TypesInfo.Defs[writeFn.Name].(*types.Func); ok && fnObj != nil {
 		visited[fnObj.Origin()] = true
@@ -22,12 +17,7 @@ func checkNoReflectReachable(
 	walkReflectInBody(pass, writeFn.Body, funcDecls, visited)
 }
 
-func walkReflectInBody(
-	pass *analysis.Pass,
-	body *ast.BlockStmt,
-	funcDecls map[*types.Func]*ast.FuncDecl,
-	visited map[*types.Func]bool,
-) {
+func walkReflectInBody(pass *analysis.Pass, body *ast.BlockStmt, funcDecls map[*types.Func]*ast.FuncDecl, visited map[*types.Func]bool) {
 	if body == nil {
 		return
 	}
@@ -44,12 +34,7 @@ func walkReflectInBody(
 	})
 }
 
-func visitReflectCallee(
-	pass *analysis.Pass,
-	call *ast.CallExpr,
-	funcDecls map[*types.Func]*ast.FuncDecl,
-	visited map[*types.Func]bool,
-) {
+func visitReflectCallee(pass *analysis.Pass, call *ast.CallExpr, funcDecls map[*types.Func]*ast.FuncDecl, visited map[*types.Func]bool) {
 	callee, ok := vetutil.ResolveCalledObject(pass.TypesInfo, call).(*types.Func)
 	if !ok || callee == nil {
 		return
@@ -58,10 +43,8 @@ func visitReflectCallee(
 	if orig == nil || orig.Pkg() != pass.Pkg || visited[orig] {
 		return
 	}
-	decl := funcDecls[orig]
-	if decl == nil || decl.Body == nil {
-		return
+	if decl := funcDecls[orig]; decl != nil && decl.Body != nil {
+		visited[orig] = true
+		walkReflectInBody(pass, decl.Body, funcDecls, visited)
 	}
-	visited[orig] = true
-	walkReflectInBody(pass, decl.Body, funcDecls, visited)
 }

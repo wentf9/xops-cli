@@ -22,55 +22,32 @@ type coverageState struct {
 	visited   map[visitKey]bool
 }
 
-func checkTargetCoverage(
-	pass *analysis.Pass,
-	target canonicalTarget,
-	writeFn *ast.FuncDecl,
-	funcDecls map[*types.Func]*ast.FuncDecl,
-) {
+func checkTargetCoverage(pass *analysis.Pass, target canonicalTarget, writeFn *ast.FuncDecl, funcDecls map[*types.Func]*ast.FuncDecl) {
 	if writeFn == nil || writeFn.Body == nil {
 		pass.ReportRangef(target.ts.Name, "digestcover: 标记 //xops:canonicalhash 的结构体 %s 缺少 WriteCanonical 方法", target.ts.Name.Name)
 		return
 	}
 	state := &coverageState{
-		target:    target,
-		funcDecls: funcDecls,
-		covered:   make(map[*types.Var]bool),
-		promoted:  make(map[*types.Var]map[*types.Var]bool),
-		visited:   make(map[visitKey]bool),
+		target: target, funcDecls: funcDecls,
+		covered: make(map[*types.Var]bool), promoted: make(map[*types.Var]map[*types.Var]bool), visited: make(map[visitKey]bool),
 	}
-	recvVar := extractRecvVar(pass.TypesInfo, writeFn)
 	if fnObj, ok := pass.TypesInfo.Defs[writeFn.Name].(*types.Func); ok && fnObj != nil {
 		state.visited[visitKey{fn: fnObj.Origin(), paramIdx: -1}] = true
 	}
 	checkNoReflectReachable(pass, writeFn, funcDecls)
-	analyzeFuncBody(pass, writeFn.Body, recvVar, state)
-
+	analyzeFuncBody(pass, writeFn.Body, extractRecvVar(pass.TypesInfo, writeFn), state)
 	for _, f := range target.fields {
-		if target.excluded[f] {
-			continue
+		if !target.excluded[f] && !isFieldCovered(pass.Pkg, f, state) {
+			pass.ReportRangef(writeFn.Name, "digestcover: 结构体 %s 的 WriteCanonical 未覆盖字段 %s（请显式编码或添加 //xops:hash-exclude:<reason>）", target.ts.Name.Name, f.Name())
 		}
-		if isFieldCovered(pass.Pkg, f, state) {
-			continue
-		}
-		pass.ReportRangef(
-			writeFn.Name,
-			"digestcover: 结构体 %s 的 WriteCanonical 未覆盖字段 %s（请显式编码或添加 //xops:hash-exclude:<reason>）",
-			target.ts.Name.Name,
-			f.Name(),
-		)
 	}
 }
 
 func extractRecvVar(info *types.Info, fn *ast.FuncDecl) *types.Var {
-	if fn.Recv == nil || len(fn.Recv.List) != 1 || len(fn.Recv.List[0].Names) == 0 {
+	if fn.Recv == nil || len(fn.Recv.List) != 1 || len(fn.Recv.List[0].Names) == 0 || fn.Recv.List[0].Names[0].Name == "_" {
 		return nil
 	}
-	name := fn.Recv.List[0].Names[0]
-	if name.Name == "_" {
-		return nil
-	}
-	v, _ := info.Defs[name].(*types.Var)
+	v, _ := info.Defs[fn.Recv.List[0].Names[0]].(*types.Var)
 	return v
 }
 
@@ -78,10 +55,7 @@ func analyzeFuncBody(pass *analysis.Pass, body *ast.BlockStmt, targetVar *types.
 	if targetVar == nil {
 		return
 	}
-	aliases := collectImmutableAliases(pass.TypesInfo, body, targetVar)
-	ignored := collectIgnoredSelectors(body)
-	fieldPrefixes := collectFieldPathPrefixes(pass.TypesInfo, body)
-
+	aliases, ignored, fieldPrefixes := collectImmutableAliases(pass.TypesInfo, body, targetVar), collectIgnoredSelectors(body), collectFieldPathPrefixes(pass.TypesInfo, body)
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.SelectorExpr:
@@ -96,34 +70,28 @@ func analyzeFuncBody(pass *analysis.Pass, body *ast.BlockStmt, targetVar *types.
 }
 
 func collectImmutableAliases(info *types.Info, body *ast.BlockStmt, rootVar *types.Var) map[*types.Var]bool {
-	aliases := map[*types.Var]bool{rootVar: true}
-	writes := countVarWrites(info, body)
+	aliases, writes := map[*types.Var]bool{rootVar: true}, countVarWrites(info, body)
 	for {
 		added := false
 		ast.Inspect(body, func(n ast.Node) bool {
-			if tryAddAliasFromNode(info, n, aliases, writes) {
-				added = true
-			}
+			added = tryAddAliasFromNode(info, n, aliases, writes) || added
 			return true
 		})
 		if !added {
-			break
+			return aliases
 		}
 	}
-	return aliases
 }
 
 func countVarWrites(info *types.Info, body *ast.BlockStmt) map[*types.Var]int {
 	writes := make(map[*types.Var]int)
 	ast.Inspect(body, func(n ast.Node) bool {
-		assign, ok := n.(*ast.AssignStmt)
-		if !ok {
-			return true
-		}
-		for _, lhs := range assign.Lhs {
-			if id, ok := ast.Unparen(lhs).(*ast.Ident); ok {
-				if v, ok := info.Uses[id].(*types.Var); ok && v != nil {
-					writes[v]++
+		if assign, ok := n.(*ast.AssignStmt); ok {
+			for _, lhs := range assign.Lhs {
+				if id, ok := ast.Unparen(lhs).(*ast.Ident); ok {
+					if v, ok := info.Uses[id].(*types.Var); ok && v != nil {
+						writes[v]++
+					}
 				}
 			}
 		}
@@ -137,24 +105,13 @@ func tryAddAliasFromNode(info *types.Info, n ast.Node, aliases map[*types.Var]bo
 	case *ast.AssignStmt:
 		return tryAddAliasFromPair(info, node.Lhs, node.Rhs, node.Tok == token.DEFINE, aliases, writes)
 	case *ast.ValueSpec:
-		lhs := make([]ast.Expr, len(node.Names))
-		for i, id := range node.Names {
-			lhs[i] = id
-		}
-		return tryAddAliasFromPair(info, lhs, node.Values, true, aliases, writes)
+		return tryAddAliasFromPair(info, vetutil.IdentSliceToExprs(node.Names), node.Values, true, aliases, writes)
 	default:
 		return false
 	}
 }
 
-func tryAddAliasFromPair(
-	info *types.Info,
-	lhs []ast.Expr,
-	rhs []ast.Expr,
-	isDef bool,
-	aliases map[*types.Var]bool,
-	writes map[*types.Var]int,
-) bool {
+func tryAddAliasFromPair(info *types.Info, lhs, rhs []ast.Expr, isDef bool, aliases map[*types.Var]bool, writes map[*types.Var]int) bool {
 	if len(lhs) != len(rhs) {
 		return false
 	}
@@ -165,12 +122,8 @@ func tryAddAliasFromPair(
 			continue
 		}
 		v := resolveAliasLHSVar(info, id, isDef, writes)
-		if v == nil || aliases[v] {
-			continue
-		}
-		if isAliasExpr(info, rhs[i], aliases) {
-			aliases[v] = true
-			added = true
+		if v != nil && !aliases[v] && isAliasExpr(info, rhs[i], aliases) {
+			aliases[v], added = true, true
 		}
 	}
 	return added
@@ -191,58 +144,45 @@ func resolveAliasLHSVar(info *types.Info, id *ast.Ident, isDef bool, writes map[
 
 func collectIgnoredSelectors(body *ast.BlockStmt) map[*ast.SelectorExpr]bool {
 	ignored := make(map[*ast.SelectorExpr]bool)
+	markSel := func(e ast.Expr) {
+		if sel := unwrapStarParenSelector(e); sel != nil {
+			ignored[sel] = true
+		}
+	}
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.AssignStmt:
-			markAssignIgnoredSelectors(node, ignored)
+			markAssignIgnoredSelectors(node, markSel)
 		case *ast.ValueSpec:
-			markValueSpecIgnoredSelectors(node, ignored)
-		case *ast.IncDecStmt:
-			if sel := unwrapStarParenSelector(node.X); sel != nil {
-				ignored[sel] = true
+			for i, id := range node.Names {
+				if i < len(node.Values) && id != nil && id.Name == "_" {
+					markSel(node.Values[i])
+				}
 			}
+		case *ast.IncDecStmt:
+			markSel(node.X)
 		}
 		return true
 	})
 	return ignored
 }
 
-func markAssignIgnoredSelectors(assign *ast.AssignStmt, ignored map[*ast.SelectorExpr]bool) {
-	if assign.Tok != token.DEFINE {
-		for _, lhs := range assign.Lhs {
-			if sel := unwrapStarParenSelector(lhs); sel != nil {
-				ignored[sel] = true
-			}
-		}
-	}
+func markAssignIgnoredSelectors(assign *ast.AssignStmt, markSel func(ast.Expr)) {
 	for i, lhs := range assign.Lhs {
-		if i >= len(assign.Rhs) {
-			break
+		if assign.Tok != token.DEFINE {
+			markSel(lhs)
 		}
-		if id, ok := ast.Unparen(lhs).(*ast.Ident); ok && id.Name == "_" {
-			if sel := unwrapStarParenSelector(assign.Rhs[i]); sel != nil {
-				ignored[sel] = true
+		if i < len(assign.Rhs) {
+			if id, ok := ast.Unparen(lhs).(*ast.Ident); ok && id.Name == "_" {
+				markSel(assign.Rhs[i])
 			}
 		}
 	}
 }
 
-func markValueSpecIgnoredSelectors(spec *ast.ValueSpec, ignored map[*ast.SelectorExpr]bool) {
-	for i, id := range spec.Names {
-		if i >= len(spec.Values) {
-			break
-		}
-		if id != nil && id.Name == "_" {
-			if sel := unwrapStarParenSelector(spec.Values[i]); sel != nil {
-				ignored[sel] = true
-			}
-		}
-	}
-}
-
+// unwrapStarParenSelector 解包外层括号、指针解引用（*）与取址（&），提取底层 SelectorExpr。
 func unwrapStarParenSelector(expr ast.Expr) *ast.SelectorExpr {
-	cur := ast.Unparen(expr)
-	for cur != nil {
+	for cur := ast.Unparen(expr); cur != nil; {
 		switch e := cur.(type) {
 		case *ast.StarExpr:
 			cur = ast.Unparen(e.X)
@@ -251,18 +191,17 @@ func unwrapStarParenSelector(expr ast.Expr) *ast.SelectorExpr {
 				return nil
 			}
 			cur = ast.Unparen(e.X)
+		case *ast.SelectorExpr:
+			return e
 		default:
-			sel, _ := cur.(*ast.SelectorExpr)
-			return sel
+			return nil
 		}
 	}
 	return nil
 }
 
 func isAliasExpr(info *types.Info, expr ast.Expr, aliases map[*types.Var]bool) bool {
-	cur := expr
-	for {
-		cur = ast.Unparen(cur)
+	for cur := ast.Unparen(expr); cur != nil; cur = ast.Unparen(cur) {
 		switch e := cur.(type) {
 		case *ast.StarExpr:
 			cur = e.X
@@ -278,14 +217,10 @@ func isAliasExpr(info *types.Info, expr ast.Expr, aliases map[*types.Var]bool) b
 			return false
 		}
 	}
+	return false
 }
 
-func recurseIntoHelperCalls(
-	pass *analysis.Pass,
-	call *ast.CallExpr,
-	aliases map[*types.Var]bool,
-	state *coverageState,
-) {
+func recurseIntoHelperCalls(pass *analysis.Pass, call *ast.CallExpr, aliases map[*types.Var]bool, state *coverageState) {
 	callee, ok := vetutil.ResolveCalledObject(pass.TypesInfo, call).(*types.Func)
 	if !ok || callee == nil {
 		return
@@ -311,20 +246,11 @@ func recurseIntoHelperCalls(
 	}
 }
 
-func visitHelper(
-	pass *analysis.Pass,
-	callee *types.Func,
-	paramIdx int,
-	body *ast.BlockStmt,
-	targetVar *types.Var,
-	state *coverageState,
-) {
-	key := visitKey{fn: callee, paramIdx: paramIdx}
-	if state.visited[key] {
-		return
+func visitHelper(pass *analysis.Pass, callee *types.Func, paramIdx int, body *ast.BlockStmt, targetVar *types.Var, state *coverageState) {
+	if key := (visitKey{fn: callee, paramIdx: paramIdx}); !state.visited[key] {
+		state.visited[key] = true
+		analyzeFuncBody(pass, body, targetVar, state)
 	}
-	state.visited[key] = true
-	analyzeFuncBody(pass, body, targetVar, state)
 }
 
 func extractParamVars(info *types.Info, fn *ast.FuncDecl) []*types.Var {
@@ -338,11 +264,10 @@ func extractParamVars(info *types.Info, fn *ast.FuncDecl) []*types.Var {
 			continue
 		}
 		for _, id := range field.Names {
-			if id.Name == "_" {
-				out = append(out, nil)
-				continue
+			var v *types.Var
+			if id.Name != "_" {
+				v, _ = info.Defs[id].(*types.Var)
 			}
-			v, _ := info.Defs[id].(*types.Var)
 			out = append(out, v)
 		}
 	}

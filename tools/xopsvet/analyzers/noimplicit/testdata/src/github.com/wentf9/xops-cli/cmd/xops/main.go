@@ -55,9 +55,9 @@ func main() {
 }
 
 func mutateBuildVars() {
-	buildVersion = "tampered"  // want "禁止在运行期修改只读构建变量 buildVersion"
-	buildVersion += "-dirty"   // want "禁止在运行期修改只读构建变量 buildVersion"
-	p := &buildCommit          // want "禁止对只读构建变量 buildCommit 取地址"
+	buildVersion = "tampered" // want "禁止在运行期修改只读构建变量 buildVersion"
+	buildVersion += "-dirty"  // want "禁止在运行期修改只读构建变量 buildVersion"
+	p := &buildCommit         // want "禁止对只读构建变量 buildCommit 取地址"
 	_ = p
 	for _, buildTime = range []string{"now"} { // want "禁止在运行期修改只读构建变量 buildTime"
 	}

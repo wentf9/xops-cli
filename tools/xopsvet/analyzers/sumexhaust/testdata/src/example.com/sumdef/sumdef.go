@@ -322,17 +322,17 @@ type GenFnIface[T any] interface {
 
 type ConcreteFn struct{}
 
-func (ConcreteFn) sealedFn()         {}
+func (ConcreteFn) sealedFn()       {}
 func (ConcreteFn) Apply(func(int)) {}
 
 type GenericFn[A, B any] struct{}
 
-func (GenericFn[A, B]) sealedFn()       {}
+func (GenericFn[A, B]) sealedFn()     {}
 func (GenericFn[A, B]) Apply(func(A)) {}
 
 type BadFnSlice[A, B any] struct{}
 
-func (BadFnSlice[A, B]) sealedFn()         {}
+func (BadFnSlice[A, B]) sealedFn()       {}
 func (BadFnSlice[A, B]) Apply(func([]A)) {}
 
 func checkGenFnValid(g GenFnIface[int]) int {
