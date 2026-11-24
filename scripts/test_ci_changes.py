@@ -25,7 +25,7 @@ class TestCIChangesClassification(unittest.TestCase):
         files = [
             "docs/guide/intro.md",
             "README.md",
-            "pkg/config/AGENTS.md",
+            "core/domain/AGENTS.md",
             "skills/foo/SKILL.md",
             ".github/workflows/docs.yml",
         ]
@@ -46,7 +46,7 @@ class TestCIChangesClassification(unittest.TestCase):
             "AGENTS.md",
             "LICENSE",
             ".github/dependabot.yml",
-            "docs/development/governance/architecture-map.md",
+            "docs/development/v2-architecture-rfc.md",
         ]
         res_more = ci_changes.classify_changes(
             changed_files=more_docs,
@@ -59,9 +59,9 @@ class TestCIChangesClassification(unittest.TestCase):
             {"code": False, "core": False, "cross_platform": False},
         )
 
-    def test_draft_pr_with_core_ssh(self):
-        """Case 2: Draft PR even with core/ssh/client.go -> code=true, core=true, cross_platform=false."""
-        files = ["core/ssh/client.go"]
+    def test_draft_pr_with_core_osfs(self):
+        """Case 2: Draft PR even with core/osfs/root.go -> code=true, core=true, cross_platform=false."""
+        files = ["core/osfs/root.go"]
         result = ci_changes.classify_changes(
             changed_files=files,
             fallback=False,
@@ -73,10 +73,10 @@ class TestCIChangesClassification(unittest.TestCase):
             {"code": True, "core": True, "cross_platform": False},
         )
 
-    def test_ready_pr_upper_layer_orchestration(self):
-        """Case 3: Ready PR changing upper-layer orchestration."""
-        # 3a: [cmd/exec.go, pkg/playbook/runner.go] -> code=true, core=false, cross_platform=false
-        files_3a = ["cmd/exec.go", "pkg/playbook/runner.go"]
+    def test_ready_pr_core_pure_math_and_scripts(self):
+        """Case 3: Ready PR changing non-cross-platform script or pure domain logic."""
+        # 3a: [scripts/local-ci/run.sh] -> code=true, core=false, cross_platform=false
+        files_3a = ["scripts/local-ci/run.sh"]
         result_3a = ci_changes.classify_changes(
             changed_files=files_3a,
             fallback=False,
@@ -88,8 +88,8 @@ class TestCIChangesClassification(unittest.TestCase):
             {"code": True, "core": False, "cross_platform": False},
         )
 
-        # 3b: [core/mcp/runtime/server.go] -> code=true, core=true, cross_platform=false
-        files_3b = ["core/mcp/runtime/server.go"]
+        # 3b: [core/domain/algebraic/duration.go] -> code=true, core=true, cross_platform=false
+        files_3b = ["core/domain/algebraic/duration.go"]
         result_3b = ci_changes.classify_changes(
             changed_files=files_3b,
             fallback=False,
@@ -104,9 +104,9 @@ class TestCIChangesClassification(unittest.TestCase):
     def test_ready_pr_cross_platform_paths(self):
         """Case 4: Ready PR changing cross-platform paths -> cross_platform=true."""
         paths_to_verify = [
-            ("core/ssh/client.go", True, True, True),
-            ("pkg/tui/app.go", True, False, True),
-            ("internal/terminal/conpty.go", True, False, True),
+            ("core/osfs/root.go", True, True, True),
+            ("internal/host/sys/pty.go", True, False, True),
+            ("internal/entry/cli/root.go", True, False, True),
             ("Makefile", True, False, True),
             ("go.mod", True, True, True),
         ]
@@ -125,22 +125,23 @@ class TestCIChangesClassification(unittest.TestCase):
 
         # Additional cross platform prefixes and exact matches
         additional_paths = [
-            ("core/sftp/client.go", True, True, True),
-            ("pkg/config/repository.go", True, False, True),
-            ("pkg/credential/service.go", True, False, True),
-            ("pkg/crypto/cipher.go", True, False, True),
-            ("pkg/adapter/adapter.go", True, False, True),
-            ("pkg/utils/file.go", True, False, True),
-            ("cmd/sftpshell/shell.go", True, False, True),
-            ("cmd/makefile_test.go", True, False, True),
-            ("go.sum", True, True, True),
+            ("core/ports/fs.go", True, True, True),
+            ("core/internal/foundation/conc/nursery.go", True, True, True),
+            ("core/internal/sshnet/dial/dialer.go", True, True, True),
+            ("core/internal/pool/actor.go", True, True, True),
+            ("core/internal/gate/gate.go", True, True, True),
+            ("tools/xopsvet/cmd/xopsvet/main.go", True, True, True),
+            ("cmd/xops/main.go", True, False, True),
+            ("go.work", True, True, True),
+            ("core/go.mod", True, True, True),
+            ("tools/xopsvet/go.mod", True, True, True),
+            (".golangci.yml", True, True, True),
             ("scripts/verify_native_platform.sh", True, False, True),
             (".github/workflows/ci.yml", True, True, True),
             ("scripts/ci_changes.py", True, True, True),
-            ("cmd/ssh_askpass.go", True, False, True),
-            ("cmd/ssh_windows.go", True, False, True),
-            ("core/mcp/transfer/journal_windows.go", True, True, True),
-            ("core/mcp/runtime/tunnel_fixture_windows_test.go", True, True, True),
+            ("scripts/test_ci_changes.py", True, True, True),
+            ("core/internal/mcpruntime/journal_windows.go", True, True, True),
+            ("core/internal/foundation/conc/nursery_windows_test.go", True, True, True),
         ]
         for path, exp_code, exp_core, exp_cross in additional_paths:
             with self.subTest(path=path):
@@ -157,9 +158,9 @@ class TestCIChangesClassification(unittest.TestCase):
 
     def test_push_to_master(self):
         """Case 5: push to master."""
-        # 5a: Upper code change -> code=true, core=false, cross_platform=true (mainline safe fallback)
+        # 5a: Upper script change -> code=true, core=false, cross_platform=true (mainline safe fallback)
         res_code = ci_changes.classify_changes(
-            changed_files=["cmd/exec.go"],
+            changed_files=["scripts/local-ci/run.sh"],
             fallback=False,
             event_name="push",
             is_draft=False,
@@ -286,21 +287,21 @@ class TestGitIntegrationAndFailSafe(unittest.TestCase):
             self._run_git(td, "commit", "-m", "C0: initial base commit")
             c0_sha = self._run_git(td, "rev-parse", "HEAD")
 
-            # 2. Branch feature from C0 and commit cmd/exec.go
+            # 2. Branch feature from C0 and commit scripts/local-ci/run.sh
             self._run_git(td, "checkout", "-b", "feature")
-            cmd_dir = Path(td) / "cmd"
-            cmd_dir.mkdir(parents=True, exist_ok=True)
-            (cmd_dir / "exec.go").write_text("package cmd\n")
-            self._run_git(td, "add", "cmd/exec.go")
+            script_dir = Path(td) / "scripts" / "local-ci"
+            script_dir.mkdir(parents=True, exist_ok=True)
+            (script_dir / "run.sh").write_text("#!/usr/bin/env bash\n")
+            self._run_git(td, "add", "scripts/local-ci/run.sh")
             self._run_git(td, "commit", "-m", "C1: feature change")
             c1_sha = self._run_git(td, "rev-parse", "HEAD")
 
-            # 3. Master advances with an unrelated commit C2 (e.g. core/ssh/client.go)
+            # 3. Master advances with an unrelated commit C2 (e.g. core/osfs/root.go)
             self._run_git(td, "checkout", "master")
-            core_dir = Path(td) / "core" / "ssh"
+            core_dir = Path(td) / "core" / "osfs"
             core_dir.mkdir(parents=True, exist_ok=True)
-            (core_dir / "client.go").write_text("package ssh\n")
-            self._run_git(td, "add", "core/ssh/client.go")
+            (core_dir / "root.go").write_text("package osfs\n")
+            self._run_git(td, "add", "core/osfs/root.go")
             self._run_git(td, "commit", "-m", "C2: master advanced")
 
             # 4. Create synthetic merge commit (merging feature into master)
@@ -317,8 +318,8 @@ class TestGitIntegrationAndFailSafe(unittest.TestCase):
                 cwd=td,
             )
             self.assertFalse(fallback)
-            # Only cmd/exec.go should be detected, NOT core/ssh/client.go from master
-            self.assertEqual(changed_files, ["cmd/exec.go"])
+            # Only scripts/local-ci/run.sh should be detected, NOT core/osfs/root.go from master
+            self.assertEqual(changed_files, ["scripts/local-ci/run.sh"])
 
             # Classification should be code=true, core=false, cross_platform=false
             res = ci_changes.classify_changes(

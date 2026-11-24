@@ -4,11 +4,19 @@ on:
   push:
     branches:
       - master
+      - refactor/v2-architecture
   pull_request:
-    branches: [master]
+    branches:
+      - master
+      - refactor/v2-architecture
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
+      dst_seeds:
+        type: string
+        description: 'DST seed count (default 2000 for CI, 10000 for Gate)'
+        required: false
+        default: '2000'
       debug_enabled:
         type: boolean
         description: 'Run with tmate SSH session on failure'
@@ -19,8 +27,6 @@ permissions:
   contents: read
 
 env:
-  # Credential/KDF helpers re-exec race binaries; retain race detection without
-  # the default one-second shutdown sleep on every helper invocation.
   GORACE: atexit_sleep_ms=0
 
 concurrency:
@@ -28,14 +34,18 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  lint:
-    name: Lint
+  linux:
+    name: Linux Build, Guardrails and Test
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       code: ${{ steps.changes.outputs.code }}
       core: ${{ steps.changes.outputs.core }}
       cross_platform: ${{ steps.changes.outputs.cross_platform }}
+      has_xopsvet: ${{ steps.modules.outputs.has_xopsvet }}
+      has_core: ${{ steps.modules.outputs.has_core }}
+      has_root: ${{ steps.modules.outputs.has_root }}
+      has_dst: ${{ steps.modules.outputs.has_dst }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -51,103 +61,149 @@ jobs:
           PR_DRAFT: ${{ github.event.pull_request.draft }}
         run: python3 scripts/ci_changes.py >> "$GITHUB_OUTPUT"
 
+      - name: Detect active v2 Go modules
+        id: modules
+        run: |
+          set -eu
+          has_xopsvet=false
+          has_core=false
+          has_root=false
+          has_dst=false
+          if [ -d tools/xopsvet/cmd/xopsvet ] && [ -n "$(find tools/xopsvet -name '*.go' -print -quit)" ]; then
+            has_xopsvet=true
+          fi
+          if [ -f core/go.mod ] && [ -n "$(find core -name '*.go' -print -quit)" ]; then
+            has_core=true
+          fi
+          if { [ -d cmd/xops ] && [ -n "$(find cmd/xops -name '*.go' -print -quit)" ]; } || { [ -d internal ] && [ -n "$(find internal -name '*.go' -print -quit)" ]; }; then
+            has_root=true
+          fi
+          if [ -d core/internal/pool ] && [ -n "$(find core/internal/pool -name '*_test.go' -print -quit)" ]; then
+            has_dst=true
+          fi
+          printf 'has_xopsvet=%s\nhas_core=%s\nhas_root=%s\nhas_dst=%s\n' \
+            "$has_xopsvet" "$has_core" "$has_root" "$has_dst" >> "$GITHUB_OUTPUT"
+
+      - name: Verify CI scripts and bilingual docs
+        run: |
+          python3 -m unittest discover -s scripts -p test_ci_changes.py -v
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Check bilingual docs consistency
+        run: |
+          npm ci
+          npm run docs:check
+
       - name: Set up Go
         if: steps.changes.outputs.code == 'true'
         uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
           cache: true
-          cache-dependency-path: go.sum
 
-      - name: golangci-lint
-        if: steps.changes.outputs.code == 'true'
-        uses: golangci/golangci-lint-action@v9
-        with:
-          version: v2.11
-          args: ./...
-
-  test:
-    name: Build and Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Detect relevant changes
-        id: changes
-        env:
-          GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          GITHUB_BEFORE_SHA: ${{ github.event.before }}
-          PR_DRAFT: ${{ github.event.pull_request.draft }}
-        run: python3 scripts/ci_changes.py >> "$GITHUB_OUTPUT"
-
-      - name: Set up Go
-        if: steps.changes.outputs.code == 'true'
-        uses: actions/setup-go@v7
-        with:
-          go-version-file: 'go.mod'
-          cache: true
-          cache-dependency-path: go.sum
-
-      - name: Verify dependencies
+      - name: Verify tri-module workspace invariants
         if: steps.changes.outputs.code == 'true'
         run: |
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-
-      - name: Install native Unix shell test dependencies
-        if: steps.changes.outputs.code == 'true'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fish zsh
-
-      - name: Build all packages
-        if: steps.changes.outputs.code == 'true'
-        run: go build ./...
-
-      - name: Verify shared core isolation
-        if: steps.changes.outputs.code == 'true'
-        run: |
-          python3 -m unittest discover -s scripts -p test_check_core.py
-          python3 -m unittest discover -s scripts -p test_ci_changes.py
-          if [ "${{ steps.changes.outputs.core }}" = "true" ]; then
-            python3 scripts/check_core.py
-          else
-            python3 scripts/check_core.py --graph-only
+          set -eu
+          go version
+          go env GOWORK
+          go list -m all
+          if grep -rn 'replace ' go.mod core/go.mod tools/xopsvet/go.mod; then
+            echo "ERROR: replace directives are forbidden in go.mod files" >&2
+            exit 1
           fi
 
-      - name: Run tests
-        if: steps.changes.outputs.code == 'true'
-        run: go test -race -shuffle=on -count=1 ./...
-
-      - name: Run native password sudo PTY regression
-        if: steps.changes.outputs.code == 'true'
-        env:
-          XOPS_TEST_NATIVE_SUDO_PASSWORD: public-ci-sudo-password
+      - name: Build and self-test xopsvet (GOWORK=off)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_xopsvet == 'true'
         run: |
-          go test -race -c -o /tmp/xops-sudo-ci.test ./core/ssh
-          sudo useradd --create-home --shell /bin/bash xops-sudo-ci
-          trap 'sudo rm -f /etc/sudoers.d/xops-sudo-ci /tmp/xops-sudo-ci.test; sudo userdel --remove xops-sudo-ci' EXIT
-          printf 'xops-sudo-ci:%s\n' "$XOPS_TEST_NATIVE_SUDO_PASSWORD" | sudo chpasswd
-          printf '%s\n' 'Defaults:xops-sudo-ci timestamp_timeout=0' 'xops-sudo-ci ALL=(root) PASSWD: ALL' | sudo tee /etc/sudoers.d/xops-sudo-ci >/dev/null
-          sudo chmod 440 /etc/sudoers.d/xops-sudo-ci
-          sudo -u xops-sudo-ci env XOPS_TEST_NATIVE_SUDO_PASSWORD="$XOPS_TEST_NATIVE_SUDO_PASSWORD" /tmp/xops-sudo-ci.test -test.run '^TestPrivilegeNativePasswordSudoPTY$' -test.count=1 -test.timeout=30s -test.v
+          set -eu
+          VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+          mkdir -p bin
+          (
+            cd tools/xopsvet
+            GOWORK=off go test -race -count=1 ./...
+            GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet
+            GOWORK=off go vet -vettool="$VETTOOL" ./...
+          )
 
-      - name: Run offline credential business integration tests
-        if: steps.changes.outputs.code == 'true'
+      - name: golangci-lint (tools/xopsvet)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_xopsvet == 'true'
+        uses: golangci/golangci-lint-action@v9
         env:
-          GORACE: atexit_sleep_ms=0
+          GOWORK: off
+        with:
+          version: v2.15
+          working-directory: tools/xopsvet
+          args: --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+      - name: Verify core/ independently (GOWORK=off)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_core == 'true'
         run: |
-          umask 077
-          go test -tags=integration -race -shuffle=on -count=1 -timeout=120s \
-            -run '^(TestEncrypted|TestOffline)' ./pkg/config ./cmd
+          set -eu
+          VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+          (
+            cd core
+            GOWORK=off go build ./...
+            if [ -x "$VETTOOL" ]; then
+              GOWORK=off go vet -vettool="$VETTOOL" ./...
+            fi
+            GOWORK=off go test -race -shuffle=on -count=1 ./...
+            GOOS=windows GOARCH=amd64 GOWORK=off go build ./...
+            GOOS=darwin  GOARCH=amd64 GOWORK=off go build ./...
+          )
+
+      - name: golangci-lint (core)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_core == 'true'
+        uses: golangci/golangci-lint-action@v9
+        env:
+          GOWORK: off
+        with:
+          version: v2.15
+          working-directory: core
+          args: --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+      - name: Run Deterministic Simulation Tests (DST)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_dst == 'true'
+        run: |
+          (cd core && GOWORK=off XOPS_DST_SEEDS="${{ inputs.dst_seeds || '2000' }}" go test -race -count=1 -run '^TestDST_' ./...)
+
+      - name: Verify root CLI module (via go.work)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_root == 'true'
+        run: |
+          set -eu
+          VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+          go build ./...
+          if [ -x "$VETTOOL" ]; then
+            go vet -vettool="$VETTOOL" ./...
+          fi
+          go test -race -shuffle=on -count=1 ./...
+
+      - name: golangci-lint (root CLI)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_root == 'true'
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15
+          args: --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+      - name: Pre-code Go 1.27 -race smoke check
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_xopsvet != 'true' && steps.modules.outputs.has_core != 'true' && steps.modules.outputs.has_root != 'true'
+        run: |
+          set -eu
+          SMOKE_DIR="$(mktemp -d "${RUNNER_TEMP}/xops-ci-smoke.XXXXXX")"
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          printf 'module xops.local/smoke\n\ngo 1.27.0\n' > "$SMOKE_DIR/go.mod"
+          printf 'package smoke\nimport ("sync/atomic"; "testing")\nfunc TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }\n' > "$SMOKE_DIR/smoke_test.go"
+          (cd "$SMOKE_DIR" && GOWORK=off go test -v -race -count=1 ./...)
 
   windows-test:
     name: Windows Build and Test
-    needs: lint
-    if: needs.lint.outputs.cross_platform == 'true'
+    needs: linux
+    if: needs.linux.outputs.cross_platform == 'true'
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -159,10 +215,18 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-          cache-dependency-path: go.sum
 
-      - name: Build all packages
-        run: go build ./...
+      - name: Detect active v2 Go modules
+        id: modules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hasXopsvet = ((Test-Path 'tools\xopsvet\cmd\xopsvet') -and ($null -ne (Get-ChildItem -Path 'tools\xopsvet' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1)))
+          $hasCore = ((Test-Path 'core\go.mod') -and ($null -ne (Get-ChildItem -Path 'core' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1)))
+          $hasRoot = (((Test-Path 'cmd\xops') -and ($null -ne (Get-ChildItem -Path 'cmd\xops' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1))) -or ((Test-Path 'internal') -and ($null -ne (Get-ChildItem -Path 'internal' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1))))
+          "has_xopsvet=$($hasXopsvet.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "has_core=$($hasCore.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "has_root=$($hasRoot.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Run native Windows Make without sh.exe
         shell: pwsh
@@ -180,29 +244,83 @@ jobs:
           & $makeExecutable clean
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run native Windows shell probe regressions
-        run: go test -race -parallel 1 -shuffle=on -count=1 ./core/ssh -run '^TestProbeShell'
+      - name: Native Windows xopsvet, core/, and CLI verification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go version
+          $hasXopsvet = '${{ steps.modules.outputs.has_xopsvet }}' -eq 'true'
+          $hasCore = '${{ steps.modules.outputs.has_core }}' -eq 'true'
+          $hasRoot = '${{ steps.modules.outputs.has_root }}' -eq 'true'
 
-      - name: Run Windows tests (PR fast path)
-        if: github.event_name == 'pull_request'
-        run: go test -shuffle=on -count=1 ./... -skip '^TestProbeShell'
+          if (-not $hasXopsvet -and -not $hasCore -and -not $hasRoot) {
+            Write-Output 'Pre-code P0-T1: running native Windows Go 1.27 -race smoke verification.'
+            $smoke = Join-Path $env:RUNNER_TEMP ('xops-ci-smoke-' + [guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Force -Path $smoke | Out-Null
+            try {
+              Set-Content -Path (Join-Path $smoke 'go.mod') -Encoding utf8NoBOM -Value "module xops.local/smoke`n`ngo 1.27.0`n"
+              Set-Content -Path (Join-Path $smoke 'smoke_test.go') -Encoding utf8NoBOM -Value 'package smoke; import ("sync/atomic"; "testing"); func TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }'
+              Push-Location $smoke
+              $env:GOWORK = 'off'
+              go test -v -race -count=1 ./...
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } finally {
+              Pop-Location -ErrorAction SilentlyContinue
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $smoke
+            }
+            exit 0
+          }
 
-      - name: Run Windows race tests on platform-critical packages
-        if: github.event_name == 'pull_request'
-        run: go test -race -shuffle=on -count=1 ./internal/terminal ./internal/sshenv ./internal/credentialfile/... ./internal/vaultsys/... ./internal/credentialhelper ./cmd/sftpshell
+          $vettool = Join-Path (Get-Location) ('bin\xopsvet' + (go env GOEXE))
+          if ($hasXopsvet) {
+            New-Item -ItemType Directory -Force -Path bin | Out-Null
+            Push-Location tools/xopsvet
+            try {
+              $env:GOWORK = 'off'
+              go test -race -count=1 ./...
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              go build -o $vettool ./cmd/xopsvet
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              go vet "-vettool=$vettool" ./...
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } finally {
+              Pop-Location
+            }
+          }
 
-      - name: Run Windows tests (full race suite)
-        if: github.event_name != 'pull_request'
-        run: go test -race -shuffle=on -count=1 ./... -skip '^TestProbeShell'
+          if ($hasCore) {
+            Push-Location core
+            try {
+              $env:GOWORK = 'off'
+              go build ./...
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              if ($hasXopsvet) {
+                go vet "-vettool=$vettool" ./...
+                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              }
+              go test -race -shuffle=on -count=1 ./...
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } finally {
+              Pop-Location
+            }
+          }
 
-      - name: Run Windows ConPTY integration regressions
-        if: ${{ !cancelled() }}
-        run: go test -race -tags=integration -run '^TestWindows(LineEditorConPTY|InteractiveInputConPTY|ConPTYOutputClosedHandle|OutputConPTYFallback)$' -count=1 -timeout=120s ./cmd/sftpshell ./internal/terminal ./core/ssh
+          if ($hasRoot) {
+            Remove-Item Env:GOWORK -ErrorAction SilentlyContinue
+            go build ./...
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($hasXopsvet) {
+              go vet "-vettool=$vettool" ./...
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            go test -race -shuffle=on -count=1 ./...
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
   macos-test:
     name: macOS Build and Test
-    needs: lint
-    if: needs.lint.outputs.cross_platform == 'true'
+    needs: linux
+    if: needs.linux.outputs.cross_platform == 'true'
     runs-on: macos-latest
     timeout-minutes: 15
     steps:
@@ -214,12 +332,28 @@ jobs:
         with:
           go-version-file: 'go.mod'
           cache: true
-          cache-dependency-path: go.sum
 
-      - name: Build all packages
-        run: go build ./...
+      - name: Detect active v2 Go modules
+        id: modules
+        run: |
+          set -eu
+          has_xopsvet=false
+          has_core=false
+          has_root=false
+          if [ -d tools/xopsvet/cmd/xopsvet ] && [ -n "$(find tools/xopsvet -name '*.go' -print -quit)" ]; then
+            has_xopsvet=true
+          fi
+          if [ -f core/go.mod ] && [ -n "$(find core -name '*.go' -print -quit)" ]; then
+            has_core=true
+          fi
+          if { [ -d cmd/xops ] && [ -n "$(find cmd/xops -name '*.go' -print -quit)" ]; } || { [ -d internal ] && [ -n "$(find internal -name '*.go' -print -quit)" ]; }; then
+            has_root=true
+          fi
+          printf 'has_xopsvet=%s\nhas_core=%s\nhas_root=%s\n' \
+            "$has_xopsvet" "$has_core" "$has_root" >> "$GITHUB_OUTPUT"
 
       - name: Set up macOS Keychain
+        if: steps.modules.outputs.has_root == 'true'
         run: |
           KEYCHAIN_PATH="$HOME/Library/Keychains/ci.keychain-db"
           security create-keychain -p "" "$KEYCHAIN_PATH"
@@ -228,14 +362,52 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH"
 
-      - name: Run macOS tests
-        run: go test -race -shuffle=on -count=1 ./...
+      - name: Native macOS xopsvet, core/, and CLI verification
+        run: |
+          set -eu
+          go version
+          if [ "${{ steps.modules.outputs.has_xopsvet }}" != "true" ] && [ "${{ steps.modules.outputs.has_core }}" != "true" ] && [ "${{ steps.modules.outputs.has_root }}" != "true" ]; then
+            echo "Pre-code P0-T1: running native macOS Go 1.27 -race smoke verification."
+            SMOKE_DIR="$(mktemp -d "${RUNNER_TEMP}/xops-ci-smoke.XXXXXX")"
+            trap 'rm -rf "$SMOKE_DIR"' EXIT
+            printf 'module xops.local/smoke\n\ngo 1.27.0\n' > "$SMOKE_DIR/go.mod"
+            printf 'package smoke\nimport ("sync/atomic"; "testing")\nfunc TestSmoke(t *testing.T){ var n atomic.Int64; ch:=make(chan struct{}); go func(){ n.Add(1); close(ch) }(); <-ch; if n.Load()!=1 { t.Fatal(n.Load()) } }\n' > "$SMOKE_DIR/smoke_test.go"
+            (cd "$SMOKE_DIR" && GOWORK=off go test -v -race -count=1 ./...)
+            exit 0
+          fi
 
-      - name: Run Native Platform Verification Script
-        run: ./scripts/verify_native_platform.sh
+          VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
+          if [ "${{ steps.modules.outputs.has_xopsvet }}" = "true" ]; then
+            mkdir -p bin
+            (
+              cd tools/xopsvet
+              GOWORK=off go test -race -count=1 ./...
+              GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet
+              GOWORK=off go vet -vettool="$VETTOOL" ./...
+            )
+          fi
+
+          if [ "${{ steps.modules.outputs.has_core }}" = "true" ]; then
+            (
+              cd core
+              GOWORK=off go build ./...
+              if [ -x "$VETTOOL" ]; then
+                GOWORK=off go vet -vettool="$VETTOOL" ./...
+              fi
+              GOWORK=off go test -race -shuffle=on -count=1 ./...
+            )
+          fi
+
+          if [ "${{ steps.modules.outputs.has_root }}" = "true" ]; then
+            go build ./...
+            if [ -x "$VETTOOL" ]; then
+              go vet -vettool="$VETTOOL" ./...
+            fi
+            go test -race -shuffle=on -count=1 ./...
+          fi
 
       - name: Clean up macOS Keychain
-        if: always()
+        if: always() && steps.modules.outputs.has_root == 'true'
         run: |
           security delete-keychain "$HOME/Library/Keychains/ci.keychain-db" || true
 

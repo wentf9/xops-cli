@@ -15,27 +15,11 @@ linters:
     - govet
     - staticcheck
     - unused
-    - gocyclo
-    - forbidigo
+    - gocognit
     - depguard
   settings:
-    gocyclo:
-      min-complexity: 20
-    forbidigo:
-      analyze-types: true
-      forbid:
-        - pattern: '^os\.(Open|OpenFile|ReadFile|Remove|RemoveAll)$'
-          pkg: '^os$'
-          msg: 'use core/fsx handle-based primitives (OpenRegular/ReadAllBounded/CreateExclusive/OpenLocked/AtomicReplace) outside core/fsx, or justify with //nolint:forbidigo // <reason>'
-        - pattern: '^(syscall|unix)\.Flock$'
-          pkg: '^(syscall|golang\.org/x/sys/unix)$'
-          msg: 'use core/fsx.OpenLocked/TryOpenLocked/OpenLockedContext/TryLockFile instead of raw Flock'
-        - pattern: '^windows\.(GetNamedSecurityInfo|SetNamedSecurityInfo)$'
-          pkg: '^golang\.org/x/sys/windows$'
-          msg: 'use handle-based windows.GetSecurityInfo/SetSecurityInfo via core/winsec instead of path-based GetNamedSecurityInfo/SetNamedSecurityInfo'
-        - pattern: '^filepath\.Base$'
-          pkg: '^path/filepath$'
-          msg: 'in transfer code use core/sftp.RemotePath.Base() for remote paths or core/sftp.LocalBaseName() for local OS paths'
+    gocognit:
+      min-complexity: 15
     depguard:
       rules:
         core-decoupling:
@@ -44,29 +28,31 @@ linters:
           deny:
             - pkg: "github.com/wentf9/xops-cli/cmd"
               desc: "core/** must not depend on cmd/**"
-            - pkg: "github.com/wentf9/xops-cli/pkg"
-              desc: "core/** must not depend on pkg/**"
             - pkg: "github.com/wentf9/xops-cli/internal"
               desc: "core/** must not depend on internal/**"
+        entry-decoupling:
+          files:
+            - "**/internal/entry/**/*.go"
+          deny:
+            - pkg: "github.com/wentf9/xops-cli/internal/host"
+              desc: "internal/entry/** must not depend on internal/host/**"
+            - pkg: "github.com/wentf9/xops-cli/core/osfs"
+              desc: "internal/entry/** must not depend on core/osfs"
+        host-decoupling:
+          files:
+            - "**/internal/host/**/*.go"
+          deny:
+            - pkg: "github.com/wentf9/xops-cli/core/engine"
+              desc: "internal/host/** must not depend on core/engine"
+            - pkg: "github.com/wentf9/xops-cli/internal/entry"
+              desc: "internal/host/** must not depend on internal/entry/**"
   exclusions:
     rules:
       - path: "_test\\.go"
         linters:
           - errcheck
         source: "<-"
-      - path: "_test\\.go$"
-        linters:
-          - forbidigo
-      - path: "^core/fsx/"
-        linters:
-          - forbidigo
-      - path-except: "^(core/sftp/|cmd/sftpshell/|cmd/scp[^/]*\\.go$)"
-        linters:
-          - forbidigo
-        text: "filepath\\.Base"
 
 formatters:
-  # Enable specific formatter.
-  # Default: [] (uses standard Go formatting)
   enable:
     - gofmt

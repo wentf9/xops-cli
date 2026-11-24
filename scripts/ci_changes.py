@@ -19,38 +19,40 @@ DOCS_EXACT = {
 }
 
 CORE_EXACT = {
+    "go.work",
     "go.mod",
-    "go.sum",
-    "scripts/check_core.py",
-    "scripts/test_check_core.py",
+    "core/go.mod",
+    "tools/xopsvet/go.mod",
+    ".golangci.yml",
     ".github/workflows/ci.yml",
     "scripts/ci_changes.py",
+    "scripts/test_ci_changes.py",
 }
 
 CROSS_PLATFORM_PREFIXES = (
-    "core/ssh/",
-    "core/sftp/",
-    "core/mcp/transfer/",
-    "core/testutil/",
-    "internal/",
-    "pkg/config/",
-    "pkg/credential/",
-    "pkg/crypto/",
-    "pkg/adapter/",
-    "pkg/tui/",
-    "pkg/utils/",
-    "cmd/sftpshell/",
-    "cmd/ssh",
+    "core/osfs/",
+    "core/ports/",
+    "core/internal/foundation/",
+    "core/internal/sshnet/",
+    "core/internal/pool/",
+    "core/internal/gate/",
+    "tools/xopsvet/",
+    "internal/host/",
+    "internal/entry/",
+    "cmd/xops/",
 )
 
 CROSS_PLATFORM_EXACT = {
     "Makefile",
-    "cmd/makefile_test.go",
+    "go.work",
     "go.mod",
-    "go.sum",
+    "core/go.mod",
+    "tools/xopsvet/go.mod",
+    ".golangci.yml",
     "scripts/verify_native_platform.sh",
     ".github/workflows/ci.yml",
     "scripts/ci_changes.py",
+    "scripts/test_ci_changes.py",
 }
 
 PLATFORM_GO_RE = re.compile(
@@ -81,7 +83,7 @@ def is_docs_only_file(path: str) -> bool:
 def is_core_file(path: str) -> bool:
     if is_docs_only_file(path):
         return False
-    if path.startswith("core/"):
+    if path.startswith("core/") or path.startswith("tools/xopsvet/"):
         return True
     if path in CORE_EXACT:
         return True
