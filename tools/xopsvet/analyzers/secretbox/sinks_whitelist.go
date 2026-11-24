@@ -214,7 +214,7 @@ func checkWhitelistNode(pass *analysis.Pass, facts *secretfact.Result, n ast.Nod
 	switch node := n.(type) {
 	case *ast.CallExpr:
 		obj := vetutil.ResolveCalledObject(pass.TypesInfo, node)
-		if facts.IsSecretUseObject(obj) || facts.HasSecretUseCallbackParam(obj) {
+		if isWhitelistRestrictedObj(facts, obj) {
 			*diags = append(*diags, vetutil.Diag{Pos: node.Fun.Pos(), End: node.Fun.End(), Msg: whitelistViolationMsg})
 		}
 	case *ast.SelectorExpr:
@@ -223,12 +223,16 @@ func checkWhitelistNode(pass *analysis.Pass, facts *secretfact.Result, n ast.Nod
 		if sel := pass.TypesInfo.Selections[node]; sel != nil {
 			obj = sel.Obj()
 		}
-		if facts.IsSecretUseObject(obj) {
+		if isWhitelistRestrictedObj(facts, obj) {
 			*diags = append(*diags, vetutil.Diag{Pos: node.Pos(), End: node.End(), Msg: whitelistViolationMsg})
 		}
 	case *ast.Ident:
-		if !selIdents[node] && facts.IsSecretUseObject(pass.TypesInfo.Uses[node]) {
+		if !selIdents[node] && isWhitelistRestrictedObj(facts, pass.TypesInfo.Uses[node]) {
 			*diags = append(*diags, vetutil.Diag{Pos: node.Pos(), End: node.End(), Msg: whitelistViolationMsg})
 		}
 	}
+}
+
+func isWhitelistRestrictedObj(facts *secretfact.Result, obj types.Object) bool {
+	return facts.IsSecretUseObject(obj) || facts.HasSecretUseCallbackParam(obj)
 }

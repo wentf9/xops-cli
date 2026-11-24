@@ -1,4 +1,4 @@
-// Package secretfact 提供 //xops:secretuse 跨包分析事实（analysis.Fact）的唯一前置分析器与公共高危汇点分类表。
+// Package secretfact 提供 //xops:secretuse 与 //xops:syncclosure 跨包分析事实（analysis.Fact）前置分析器及公共汇点表。
 package secretfact
 
 import (
@@ -16,40 +16,51 @@ const (
 	secretBoxName = "SecretBox"
 )
 
-// Fact 用于在 go/analysis 编译单元间跨包传播 //xops:secretuse 契约。
-type Fact struct{}
+// Fact 跨包传播 //xops:secretuse 契约；SyncFact 跨包传播非 secretuse 的 //xops:syncclosure/borrowed 契约（B-3）。
+type (
+	Fact     struct{}
+	SyncFact struct{}
+)
 
-// AFact 标记 Fact 为 go/analysis 跨包分析事实。
-func (*Fact) AFact() {}
+// AFact 标记为 go/analysis 跨包事实；String 返回确定性简短标识。
+func (*Fact) AFact()             {}
+func (*Fact) String() string     { return "secretuse" }
+func (*SyncFact) AFact()         {}
+func (*SyncFact) String() string { return "syncclosure" }
 
-// String 返回事实的可读简短标识（供 analysistest 核验）。
-func (*Fact) String() string { return "secretuse" }
-
-// Result 保存当前包及其直接依赖中带有 //xops:secretuse 契约的函数与命名函数类型集合。
+// Result 保存当前包及依赖中带有 //xops:secretuse 与 //xops:syncclosure 契约的函数与命名函数类型集合。
 type Result struct {
 	pass      *analysis.Pass
 	funcFacts map[*types.Func]bool
 	typeFacts map[*types.TypeName]bool
+	syncFuncs map[*types.Func]bool
 }
 
-// NewAnalyzer 构造 secretfact 前置分析器实例（cmd/xopsvet 应构造单一实例注入 3 个消费分析器）。
+// NewAnalyzer 构造 secretfact 前置分析器实例（cmd/xopsvet 构造单一实例注入 3 个消费分析器）。
 func NewAnalyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
 		Name:       "secretfact",
-		Doc:        "收集并跨包导出 //xops:secretuse 明文机密消费契约，供 secretbox/secrettaint/linearlease 共享",
-		FactTypes:  []analysis.Fact{(*Fact)(nil)},
+		Doc:        "收集并跨包导出 //xops:secretuse 与 //xops:syncclosure 契约，供 secretbox/secrettaint/linearlease 共享",
+		FactTypes:  []analysis.Fact{(*Fact)(nil), (*SyncFact)(nil)},
 		ResultType: reflect.TypeOf((*Result)(nil)),
 		Run:        run,
 	}
 }
 
 func run(pass *analysis.Pass) (any, error) {
-	res := &Result{pass: pass, funcFacts: make(map[*types.Func]bool), typeFacts: make(map[*types.TypeName]bool)}
+	res := &Result{pass: pass, funcFacts: map[*types.Func]bool{}, typeFacts: map[*types.TypeName]bool{}, syncFuncs: map[*types.Func]bool{}}
 	if vetutil.IsSyntheticTestMain(pass) || pass.TypesInfo == nil {
 		return res, nil
 	}
 	for _, file := range pass.Files {
-		collectFileFuncFacts(pass, file, res)
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name != nil && fn.Type != nil {
+				isSecret := vetutil.FuncDeclHasDirective(fn, vetutil.DirectiveSecretUse) || hasParamDir(pass.Fset, file.Comments, fn.Type.Params, vetutil.DirectiveSecretUse)
+				isSync := isSecret || vetutil.FuncDeclHasDirective(fn, vetutil.DirectiveSyncClosure) ||
+					vetutil.FuncDeclHasDirective(fn, vetutil.DirectiveBorrowed) || hasParamDir(pass.Fset, file.Comments, fn.Type.Params, vetutil.DirectiveBorrowed)
+				exportDeclFacts(pass, fn.Name, isSecret, isSync, res)
+			}
+		}
 	}
 	vetutil.ForEachTypeSpec(pass, func(file *ast.File, gen *ast.GenDecl, ts *ast.TypeSpec) {
 		collectTypeSpecFact(pass, file.Comments, gen, ts, res)
@@ -57,27 +68,25 @@ func run(pass *analysis.Pass) (any, error) {
 	return res, nil
 }
 
-func collectFileFuncFacts(pass *analysis.Pass, file *ast.File, res *Result) {
-	for _, decl := range file.Decls {
-		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name != nil && fn.Type != nil {
-			if vetutil.FuncDeclHasDirective(fn, vetutil.DirectiveSecretUse) || hasAnyParamDirective(pass.Fset, file.Comments, fn.Type.Params) {
-				exportFuncFact(pass, fn.Name, res)
-			}
-		}
-	}
-}
-
 func collectTypeSpecFact(pass *analysis.Pass, comments []*ast.CommentGroup, gen *ast.GenDecl, ts *ast.TypeSpec, res *Result) {
-	switch t := ts.Type.(type) {
-	case *ast.InterfaceType:
-		collectInterfaceFacts(pass, comments, t, res)
-	case *ast.FuncType:
-		if vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveSecretUse) {
-			if tn, ok := pass.TypesInfo.Defs[ts.Name].(*types.TypeName); ok && tn != nil {
-				res.typeFacts[tn] = true
-				pass.ExportObjectFact(tn, &Fact{})
-			}
-		}
+	if iface, ok := ast.Unparen(ts.Type).(*ast.InterfaceType); ok {
+		collectInterfaceFacts(pass, comments, iface, res)
+		return
+	}
+	tn, ok := pass.TypesInfo.Defs[ts.Name].(*types.TypeName)
+	if !ok || tn == nil {
+		return
+	}
+	if _, isSig := types.Unalias(tn.Type()).Underlying().(*types.Signature); !isSig {
+		return
+	}
+	hasSecret := vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveSecretUse)
+	if ft, ok := ast.Unparen(ts.Type).(*ast.FuncType); ok {
+		hasSecret = hasSecret || hasParamDir(pass.Fset, comments, ft.Params, vetutil.DirectiveSecretUse)
+	}
+	if hasSecret {
+		res.typeFacts[tn] = true
+		pass.ExportObjectFact(tn, &Fact{})
 	}
 }
 
@@ -89,53 +98,68 @@ func collectInterfaceFacts(pass *analysis.Pass, comments []*ast.CommentGroup, if
 		if len(m.Names) == 0 {
 			continue
 		}
-		hasDir := vetutil.FieldHasDirective(m, vetutil.DirectiveSecretUse)
+		isSecret := vetutil.FieldHasDirective(m, vetutil.DirectiveSecretUse)
+		isSync := vetutil.FieldHasDirective(m, vetutil.DirectiveSyncClosure) || vetutil.FieldHasDirective(m, vetutil.DirectiveBorrowed)
 		if ft, ok := ast.Unparen(m.Type).(*ast.FuncType); ok {
-			hasDir = hasDir || hasAnyParamDirective(pass.Fset, comments, ft.Params)
+			isSecret = isSecret || hasParamDir(pass.Fset, comments, ft.Params, vetutil.DirectiveSecretUse)
+			isSync = isSync || hasParamDir(pass.Fset, comments, ft.Params, vetutil.DirectiveBorrowed)
 		}
-		if hasDir {
-			exportFuncFact(pass, m.Names[0], res)
-		}
+		exportDeclFacts(pass, m.Names[0], isSecret, isSync || isSecret, res)
 	}
 }
 
-func exportFuncFact(pass *analysis.Pass, ident *ast.Ident, res *Result) {
-	if fnObj, ok := pass.TypesInfo.Defs[ident].(*types.Func); ok && fnObj != nil {
-		orig := fnObj.Origin()
+func exportDeclFacts(pass *analysis.Pass, ident *ast.Ident, isSecret, isSync bool, res *Result) {
+	fnObj, ok := pass.TypesInfo.Defs[ident].(*types.Func)
+	if (!isSecret && !isSync) || !ok || fnObj == nil {
+		return
+	}
+	orig := fnObj.Origin()
+	if isSecret {
 		res.funcFacts[orig] = true
 		pass.ExportObjectFact(orig, &Fact{})
+		return
 	}
+	res.syncFuncs[orig] = true
+	pass.ExportObjectFact(orig, &SyncFact{})
 }
 
-func hasAnyParamDirective(fset *token.FileSet, comments []*ast.CommentGroup, fl *ast.FieldList) bool {
+func hasParamDir(fset *token.FileSet, comments []*ast.CommentGroup, fl *ast.FieldList, kind vetutil.DirectiveKind) bool {
 	if fl == nil {
 		return false
 	}
 	for i := range fl.List {
-		if vetutil.ParamFieldHasDirective(fset, comments, fl, i, vetutil.DirectiveSecretUse) {
+		if vetutil.ParamFieldHasDirective(fset, comments, fl, i, kind) {
 			return true
 		}
 	}
 	return false
 }
 
-// HasFuncFact 判断函数或方法 fn（自动取 Origin() 兼容泛型实例化）是否带有 //xops:secretuse 契约。
+// HasFuncFact 判断函数或方法 fn（自动取 Origin() 兼容泛型）是否带有 //xops:secretuse 契约。
 func (r *Result) HasFuncFact(fn *types.Func) bool {
 	if r == nil || fn == nil {
 		return false
 	}
 	orig := fn.Origin()
-	var f Fact
-	return r.funcFacts[orig] || (r.pass != nil && r.pass.ImportObjectFact(orig, &f))
+	return r.funcFacts[orig] || (r.pass != nil && r.pass.ImportObjectFact(orig, new(Fact)))
+}
+
+// IsSyncClosureObject 判断对象是否为跨包/同包 //xops:syncclosure、//xops:borrowed、//xops:secretuse 或 SecretBox.Use。
+func (r *Result) IsSyncClosureObject(obj types.Object) bool {
+	if r.IsSecretUseObject(obj) {
+		return true
+	}
+	fn, ok := obj.(*types.Func)
+	if r == nil || !ok || fn == nil {
+		return false
+	}
+	orig := fn.Origin()
+	return r.syncFuncs[orig] || (r.pass != nil && r.pass.ImportObjectFact(orig, new(SyncFact)))
 }
 
 // HasTypeFact 判断命名函数类型 tn 是否带有 //xops:secretuse 契约。
 func (r *Result) HasTypeFact(tn *types.TypeName) bool {
-	if r == nil || tn == nil {
-		return false
-	}
-	var f Fact
-	return r.typeFacts[tn] || (r.pass != nil && r.pass.ImportObjectFact(tn, &f))
+	return r != nil && tn != nil && (r.typeFacts[tn] || (r.pass != nil && r.pass.ImportObjectFact(tn, new(Fact))))
 }
 
 // RecvNamedType 提取方法声明的接收者具名类型（自动解指针与别名）。
@@ -169,7 +193,7 @@ func (r *Result) IsSecretUseObject(obj types.Object) bool {
 	return ok && fn != nil && r.HasFuncFact(fn)
 }
 
-// HasSecretUseCallbackParam 判断函数或方法的形参列表中是否存在标有 //xops:secretuse 的命名函数类型参数。
+// HasSecretUseCallbackParam 判断函数或方法的形参列表中是否存在标有 //xops:secretuse 的命名函数类型参数（含可变参）。
 func (r *Result) HasSecretUseCallbackParam(obj types.Object) bool {
 	fn, ok := obj.(*types.Func)
 	if !ok || fn == nil {
@@ -180,17 +204,20 @@ func (r *Result) HasSecretUseCallbackParam(obj types.Object) bool {
 		return false
 	}
 	for i := range sig.Params().Len() {
-		if r.IsSecretUseNamedFuncType(sig.Params().At(i).Type()) {
+		if r.IsSecretUseNamedFuncType(vetutil.ParamTypeAt(sig.Params(), sig.Variadic(), i)) {
 			return true
 		}
 	}
 	return false
 }
 
-// IsSecretUseNamedFuncType 判断类型 t（解别名后）是否为标有 //xops:secretuse 的命名函数类型。
+// IsSecretUseNamedFuncType 判断类型 t（兼容泛型/别名）是否为标有 //xops:secretuse 的命名函数类型。
 func (r *Result) IsSecretUseNamedFuncType(t types.Type) bool {
 	if r == nil || t == nil {
 		return false
+	}
+	if al, ok := t.(*types.Alias); ok && al != nil && al.Origin() != nil && r.HasTypeFact(al.Origin().Obj()) {
+		return true
 	}
 	named, ok := types.Unalias(t).(*types.Named)
 	return ok && named != nil && named.Origin() != nil && r.HasTypeFact(named.Origin().Obj())

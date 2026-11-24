@@ -42,6 +42,7 @@ func TestArchBound(t *testing.T) {
 		"github.com/wentf9/xops-cli/core/internal/mcpruntime",
 		"github.com/wentf9/xops-cli/core/internal/mcpruntime/badmcp",
 		"github.com/wentf9/xops-cli/core/mystery",
+		"github.com/wentf9/xops-cli/core/unreg",
 		"github.com/wentf9/xops-cli/core/engine",
 		"github.com/wentf9/xops-cli/core/engine/badengine",
 		"github.com/wentf9/xops-cli/internal/host/sys",

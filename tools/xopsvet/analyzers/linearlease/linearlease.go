@@ -65,7 +65,7 @@ func run(pass *analysis.Pass, sf *analysis.Analyzer) (any, error) {
 	if vetutil.IsSyntheticTestMain(pass) || pass.TypesInfo == nil {
 		return nil, nil
 	}
-	if !vetutil.AllowBareGo(vetutil.ClassifyPackage(pass.Pkg.Path())) {
+	if !vetutil.AllowBareGo(vetutil.ClassifyPass(pass)) {
 		vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.GoStmt)(nil)}, func(n ast.Node) {
 			pass.ReportRangef(n, "linearlease: 白名单包 core/conc 之外禁止使用裸 go 语句，请使用 core/conc.Nursery")
 		})

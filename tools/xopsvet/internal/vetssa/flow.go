@@ -10,14 +10,15 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// IsFreshLocalSlice 判断 SSA 值是否必为当前函数体内全新分配的局部切片（HIGH-1 陷阱 4）。
+// IsFreshLocalSlice 判断 SSA 值是否必为当前函数体内全新分配的局部切片（防菱形 DAG 误杀，L4）。
 func IsFreshLocalSlice(v ssa.Value) bool { return isFreshLocalSlice(v, make(map[ssa.Value]bool)) }
 
-func isFreshLocalSlice(v ssa.Value, seen map[ssa.Value]bool) bool {
-	if v == nil || seen[v] {
+func isFreshLocalSlice(v ssa.Value, visiting map[ssa.Value]bool) bool {
+	if v == nil || visiting[v] {
 		return false
 	}
-	seen[v] = true
+	visiting[v] = true
+	defer delete(visiting, v)
 	switch val := v.(type) {
 	case *ssa.MakeSlice:
 		return true
@@ -27,7 +28,7 @@ func isFreshLocalSlice(v ssa.Value, seen map[ssa.Value]bool) bool {
 		if alloc, ok := val.X.(*ssa.Alloc); ok {
 			return isLocalArrayAlloc(alloc)
 		}
-		return isFreshLocalSlice(val.X, seen)
+		return isFreshLocalSlice(val.X, visiting)
 	case *ssa.Convert:
 		if _, ok := types.Unalias(val.Type()).Underlying().(*types.Slice); !ok {
 			return false
@@ -35,9 +36,9 @@ func isFreshLocalSlice(v ssa.Value, seen map[ssa.Value]bool) bool {
 		b, ok := types.Unalias(val.X.Type()).Underlying().(*types.Basic)
 		return ok && (b.Kind() == types.UntypedNil || b.Info()&types.IsString != 0)
 	case *ssa.ChangeType:
-		return isFreshLocalSlice(val.X, seen)
+		return isFreshLocalSlice(val.X, visiting)
 	case *ssa.Phi:
-		return len(val.Edges) > 0 && !slices.ContainsFunc(val.Edges, func(e ssa.Value) bool { return !isFreshLocalSlice(e, seen) })
+		return len(val.Edges) > 0 && !slices.ContainsFunc(val.Edges, func(e ssa.Value) bool { return !isFreshLocalSlice(e, visiting) })
 	default:
 		return false
 	}
@@ -58,35 +59,11 @@ func isLocalArrayAlloc(alloc *ssa.Alloc) bool {
 	return isArr
 }
 
-// RootStorageValues 沿切片、索引、字段地址、接口/类型转换与 Phi 反向追溯底层存储根对象（HIGH-1 陷阱 4）。
-// traverseFields 为 false 时在 *ssa.FieldAddr 停止；UnOp(*) 仅透传直接变量地址。
-func RootStorageValues(v ssa.Value, traverseFields bool) []ssa.Value {
-	var roots []ssa.Value
-	collectRootStorage(v, traverseFields, make(map[ssa.Value]bool), &roots)
-	return roots
-}
-
-func collectRootStorage(v ssa.Value, traverseFields bool, seen map[ssa.Value]bool, roots *[]ssa.Value) {
-	if v == nil || seen[v] {
-		return
-	}
-	seen[v] = true
-	if next, ok := rootStorageStep(v, traverseFields); ok {
-		collectRootStorage(next, traverseFields, seen, roots)
-		return
-	}
-	if phi, ok := v.(*ssa.Phi); ok {
-		for _, e := range phi.Edges {
-			collectRootStorage(e, traverseFields, seen, roots)
-		}
-		return
-	}
-	*roots = append(*roots, v)
-}
-
 func rootStorageStep(v ssa.Value, traverseFields bool) (ssa.Value, bool) {
 	switch val := v.(type) {
 	case *ssa.Slice:
+		return val.X, true
+	case *ssa.SliceToArrayPointer:
 		return val.X, true
 	case *ssa.IndexAddr:
 		return val.X, true
@@ -102,16 +79,11 @@ func rootStorageStep(v ssa.Value, traverseFields bool) (ssa.Value, bool) {
 		return val.X, true
 	case *ssa.ChangeInterface:
 		return val.X, true
-	case *ssa.UnOp:
-		switch val.X.(type) {
-		case *ssa.Alloc, *ssa.Global, *ssa.FreeVar, *ssa.Parameter:
-			return val.X, val.Op == token.MUL
-		}
 	}
 	return nil, false
 }
 
-// TraceFreeVarOrigins 将 *ssa.FreeVar 沿外层 MakeClosure.Bindings 递归回溯至根对象（穿透嵌套闭包与循环 Phi）。
+// TraceFreeVarOrigins 将 *ssa.FreeVar 沿外层 MakeClosure.Bindings 递归回溯至根对象（含常量容量 Slice/FieldAddr，B-5）。
 func TraceFreeVarOrigins(fv *ssa.FreeVar) []ssa.Value {
 	var origins []ssa.Value
 	traceFreeVar(fv, make(map[ssa.Value]bool), &origins)
@@ -123,6 +95,10 @@ func traceFreeVar(v ssa.Value, seen map[ssa.Value]bool, origins *[]ssa.Value) {
 		return
 	}
 	seen[v] = true
+	if next, ok := rootStorageStep(v, true); ok {
+		traceFreeVar(next, seen, origins)
+		return
+	}
 	switch val := v.(type) {
 	case *ssa.FreeVar:
 		traceFreeVarFromParent(val, seen, origins)
@@ -130,8 +106,6 @@ func traceFreeVar(v ssa.Value, seen map[ssa.Value]bool, origins *[]ssa.Value) {
 		for _, e := range val.Edges {
 			traceFreeVar(e, seen, origins)
 		}
-	case *ssa.ChangeType:
-		traceFreeVar(val.X, seen, origins)
 	default:
 		*origins = append(*origins, val)
 	}
@@ -171,7 +145,7 @@ func IsValueOwnedInScope(root ssa.Value, scopeStart, scopeEnd token.Pos) bool {
 	}
 }
 
-// IsStdlibSyncIter 判断函数是否为 Go 标准库同步 range-over-func 迭代器构造器。
+// IsStdlibSyncIter 判断函数是否为 Go 标准库纯数据同步 range-over-func 迭代器构造器（剔除带用户回调的 FieldsFuncSeq）。
 func IsStdlibSyncIter(obj *types.Func) bool {
 	if obj == nil {
 		return false
@@ -182,7 +156,7 @@ func IsStdlibSyncIter(obj *types.Func) bool {
 	case "maps":
 		return slices.Contains([]string{"All", "Keys", "Values"}, obj.Name())
 	case "bytes", "strings":
-		return slices.Contains([]string{"Lines", "SplitSeq", "SplitAfterSeq", "FieldsSeq", "FieldsFuncSeq"}, obj.Name())
+		return slices.Contains([]string{"Lines", "SplitSeq", "SplitAfterSeq", "FieldsSeq"}, obj.Name())
 	default:
 		return false
 	}
@@ -196,12 +170,11 @@ func FindYieldCall(s *buildssa.SSA, parentFn, yieldFn *ssa.Function) (ssa.CallIn
 	var foundCall ssa.CallInstruction
 	var foundMC *ssa.MakeClosure
 	ForEachInst(parentFn, func(inst ssa.Instruction) {
-		if foundCall != nil {
-			return
-		}
-		if mc, ok := inst.(*ssa.MakeClosure); ok && mc.Fn == yieldFn {
-			if callInst := firstCallReferrer(mc); callInst != nil {
-				foundCall, foundMC = callInst, mc
+		if foundCall == nil {
+			if mc, ok := inst.(*ssa.MakeClosure); ok && mc.Fn == yieldFn {
+				if callInst := firstCallReferrer(mc); callInst != nil {
+					foundCall, foundMC = callInst, mc
+				}
 			}
 		}
 	})
@@ -224,6 +197,4 @@ func firstCallReferrer(v ssa.Value) ssa.CallInstruction {
 }
 
 // IsRuntimeSecretDo 判断调用目标是否为 Go 1.27 标准库 runtime/secret.Do（唯一标准库同步闭包白名单）。
-func IsRuntimeSecretDo(obj *types.Func) bool {
-	return vetutil.IsPkgSymbol(obj, "runtime/secret", "Do")
-}
+func IsRuntimeSecretDo(obj *types.Func) bool { return vetutil.IsPkgSymbol(obj, "runtime/secret", "Do") }

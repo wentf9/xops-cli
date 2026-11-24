@@ -74,13 +74,13 @@ func reportPos(pass *analysis.Pass, node ast.Node, reported map[token.Pos]bool, 
 	}
 }
 
-// checkSSAUnixNetListen 基于 vetssa.ResolveCall 拦截针对 unix* 的 net.Listen/ListenPacket
-// 与 (*net.ListenConfig).Listen/ListenPacket（统一覆盖方法值 $bound 与方法表达式 $thunk）。
+// checkSSAUnixNetListen 基于 vetssa 拦截针对 unix* 的 net.Listen/ListenPacket 与 (*net.ListenConfig).Listen/ListenPacket，
+// 统一覆盖 $bound/$thunk、Phi 函数值、Phi 网络常量与窄接口擦除调用（H5）。
 func checkSSAUnixNetListen(pass *analysis.Pass, s *buildssa.SSA, reported map[token.Pos]bool) {
 	var diags []vetutil.Diag
 	vetssa.ForEachFuncInst(vetssa.AllFuncs(s), func(fn *ssa.Function, inst ssa.Instruction) {
 		callInst, ok := inst.(ssa.CallInstruction)
-		if !ok || vetssa.IsInstInTestFile(pass, fn, callInst) || !isUnixNetListenResolved(vetssa.ResolveCall(s, callInst)) {
+		if !ok || vetssa.IsInstInTestFile(pass, fn, callInst) || !isUnixNetListenCall(s, callInst) {
 			return
 		}
 		if pos := vetssa.ResolvePos(pass, fn, callInst); pos.IsValid() && !reported[pos] {
@@ -91,36 +91,91 @@ func checkSSAUnixNetListen(pass *analysis.Pass, s *buildssa.SSA, reported map[to
 	vetutil.ReportSortedDedup(pass, diags, true)
 }
 
-func isUnixNetListenResolved(rc vetssa.ResolvedCall) bool {
-	if !vetutil.IsPkgSymbol(rc.FuncObj, "net", "Listen", "ListenPacket") {
+func isUnixNetListenCall(s *buildssa.SSA, callInst ssa.CallInstruction) bool {
+	rc := vetssa.ResolveCall(s, callInst)
+	if isUnixNetListenResolved(rc) {
+		return true
+	}
+	cc := callInst.Common()
+	if cc == nil {
 		return false
 	}
-	argIdx := 0
-	if sig, ok := rc.FuncObj.Type().(*types.Signature); ok && sig.Recv() != nil && vetutil.ContainsValueNamed(sig.Recv().Type(), "net", "ListenConfig") {
-		argIdx = 1
+	if cc.IsInvoke() {
+		return isUnixNetListenInvoke(cc)
 	}
-	if len(rc.UserArgs) <= argIdx {
-		return false
+	targets, _ := vetssa.ResolveFuncValues(cc.Value)
+	for _, tgt := range targets {
+		fnObj := targetFuncObj(tgt)
+		if fnObj == nil {
+			continue
+		}
+		if argIdx, ok := unixListenNetworkArgIdx(fnObj, cc.Args); ok && hasUnixNetworkConst(cc.Args[argIdx]) {
+			return true
+		}
 	}
-	netw, ok := extractConstString(rc.UserArgs[argIdx])
-	return ok && (netw == "unix" || netw == "unixpacket" || netw == "unixgram")
+	return false
 }
 
-func extractConstString(v ssa.Value) (string, bool) {
-	for {
-		switch val := v.(type) {
-		case *ssa.Const:
-			if val.Value == nil || val.Value.Kind() != constant.String {
-				return "", false
-			}
-			return constant.StringVal(val.Value), true
-		case *ssa.ChangeType:
-			v = val.X
-		case *ssa.Convert:
-			v = val.X
-		default:
-			return "", false
+func isUnixNetListenInvoke(cc *ssa.CallCommon) bool {
+	if cc.Method == nil || (cc.Method.Name() != "Listen" && cc.Method.Name() != "ListenPacket") || len(cc.Args) < 2 {
+		return false
+	}
+	unwrapped := vetssa.UnwrapInterface(cc.Value)
+	return vetutil.ContainsValueNamed(unwrapped.Type(), "net", "ListenConfig") && hasUnixNetworkConst(cc.Args[1])
+}
+
+func targetFuncObj(tgt ssa.Value) *types.Func {
+	switch v := tgt.(type) {
+	case *ssa.Function:
+		return vetssa.OriginFuncObj(v)
+	case *ssa.MakeClosure:
+		if fn, ok := v.Fn.(*ssa.Function); ok {
+			return vetssa.OriginFuncObj(fn)
 		}
+	}
+	return nil
+}
+
+func isUnixNetListenResolved(rc vetssa.ResolvedCall) bool {
+	argIdx, ok := unixListenNetworkArgIdx(rc.FuncObj, rc.UserArgs)
+	return ok && hasUnixNetworkConst(rc.UserArgs[argIdx])
+}
+
+func unixListenNetworkArgIdx(fnObj *types.Func, args []ssa.Value) (int, bool) {
+	if !vetutil.IsPkgSymbol(fnObj, "net", "Listen", "ListenPacket") {
+		return 0, false
+	}
+	argIdx := 0
+	if sig, ok := fnObj.Type().(*types.Signature); ok && sig.Recv() != nil && vetutil.ContainsValueNamed(sig.Recv().Type(), "net", "ListenConfig") {
+		argIdx = 1
+	}
+	return argIdx, len(args) > argIdx
+}
+
+func hasUnixNetworkConst(v ssa.Value) bool {
+	return hasUnixNetworkConstSeen(v, make(map[ssa.Value]bool))
+}
+
+func hasUnixNetworkConstSeen(v ssa.Value, seen map[ssa.Value]bool) bool {
+	if v == nil || seen[v] {
+		return false
+	}
+	seen[v] = true
+	switch val := v.(type) {
+	case *ssa.Const:
+		if val.Value == nil || val.Value.Kind() != constant.String {
+			return false
+		}
+		netw := constant.StringVal(val.Value)
+		return netw == "unix" || netw == "unixpacket" || netw == "unixgram"
+	case *ssa.ChangeType:
+		return hasUnixNetworkConstSeen(val.X, seen)
+	case *ssa.Convert:
+		return hasUnixNetworkConstSeen(val.X, seen)
+	case *ssa.Phi:
+		return slices.ContainsFunc(val.Edges, func(e ssa.Value) bool { return hasUnixNetworkConstSeen(e, seen) })
+	default:
+		return false
 	}
 }
 
@@ -172,7 +227,12 @@ func isSysBannedSymbol(pkgPath, name string) bool {
 	case "syscall":
 		return slices.Contains([]string{"Getenv", "Setenv", "Unsetenv", "Clearenv", "Environ", "ForkExec", "StartProcess", "Exec", "CreateProcess"}, name)
 	case "golang.org/x/sys/unix":
-		return name == "Exec"
+		return slices.Contains([]string{"Exec", "Getenv", "Setenv", "Unsetenv", "Clearenv", "Environ"}, name)
+	case "golang.org/x/sys/windows":
+		return slices.Contains([]string{
+			"CreateProcess", "CreateProcessAsUser", "GetEnvironmentVariable",
+			"SetEnvironmentVariable", "GetEnvironmentStrings", "ExpandEnvironmentStrings",
+		}, name)
 	default:
 		return false
 	}

@@ -27,6 +27,10 @@ func (ls *leaseScope) checkInst(inst ssa.Instruction) {
 		if _, ok := ls.borrowed[ins.X]; ok {
 			ls.report(ins, "linearlease: 禁止将 //xops:borrowed 借用变量发送至 channel")
 		}
+	case *ssa.Panic:
+		if _, ok := ls.borrowed[ins.X]; ok {
+			ls.report(ins, "linearlease: 禁止将 //xops:borrowed 借用变量传入 panic")
+		}
 	case *ssa.Return:
 		for _, r := range ins.Results {
 			if _, ok := ls.borrowed[r]; ok && !ls.isNamedResultLoad(r) {
@@ -48,7 +52,7 @@ func (ls *leaseScope) isNamedResultLoad(v ssa.Value) bool {
 
 func (ls *leaseScope) checkStore(ins *ssa.Store) {
 	sc, ok := ls.borrowed[ins.Val]
-	if !ok || vetssa.IsVarargsSliceStore(ins.Addr) || vetssa.IsBoundMethodVal(ls.closureVals[ins.Val]) {
+	if !ok || vetssa.IsVarargsSliceStore(ins.Addr) || isBoundMethodValue(ins.Val) {
 		return
 	}
 	if call, isCall := ins.Val.(*ssa.Call); isCall && ls.reportedAppends[call] {
@@ -69,10 +73,19 @@ func (ls *leaseScope) checkStore(ins *ssa.Store) {
 	}
 }
 
+// storesToNamedResult 检查写入地址是否命中本层或任意外层祖先函数的具名返回值槽位（LL-2）。
 func (ls *leaseScope) storesToNamedResult(addr ssa.Value) bool {
 	return slices.ContainsFunc(vetssa.RootStorageValues(addr, true), func(root ssa.Value) bool {
-		a, ok := root.(*ssa.Alloc)
-		return ok && ls.namedResAllocs[a]
+		if a, ok := root.(*ssa.Alloc); ok && ls.namedResAllocs[a] {
+			return true
+		}
+		if fv, ok := root.(*ssa.FreeVar); ok {
+			return slices.ContainsFunc(vetssa.TraceFreeVarOrigins(fv), func(orig ssa.Value) bool {
+				a, isAlloc := orig.(*ssa.Alloc)
+				return isAlloc && ls.namedResAllocs[a]
+			})
+		}
+		return false
 	})
 }
 
@@ -87,17 +100,27 @@ func (ls *leaseScope) checkMakeClosure(mc *ssa.MakeClosure) {
 		}
 		return
 	}
-	if !vetssa.IsYieldFunc(target) {
-		return
+	if vetssa.IsYieldFunc(target) {
+		ls.checkYieldClosure(mc, target)
 	}
+}
+
+func (ls *leaseScope) checkYieldClosure(mc *ssa.MakeClosure, target *ssa.Function) {
 	captured := vetssa.CollectCaptured(mc, target, ls.borrowed)
 	callInst, seeds, yScope, isStd := vetssa.CheckStdlibYieldClosure(ls.eng.ssaInfo, ls.fn, target, ls.ownScope, ls.borrowed)
 	if !isStd {
-		if len(captured) > 0 {
-			ls.report(callInst, "linearlease: 禁止在非标准库自定义迭代器中捕获 //xops:borrowed 借用变量")
+		iterBorrowed := callInst != nil && callInst.Common() != nil && ls.borrowed[callInst.Common().Value].Valid()
+		if len(captured) > 0 || iterBorrowed {
+			reportInst := ssa.Instruction(mc)
+			if callInst != nil {
+				reportInst = callInst
+			}
+			ls.report(reportInst, "linearlease: 禁止在非标准库自定义迭代器中捕获 //xops:borrowed 借用变量")
 		}
-	} else if len(seeds) > 0 || len(captured) > 0 {
-		ls.eng.auditFunc(target, seeds, captured, yScope, ls.depth+1, ls.borrowed)
+		return
+	}
+	if len(seeds) > 0 || len(captured) > 0 {
+		ls.eng.auditFunc(target, seeds, captured, yScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 	}
 }
 
@@ -105,7 +128,8 @@ func (ls *leaseScope) checkCallInst(callInst ssa.CallInstruction) {
 	if goInst, isGo := callInst.(*ssa.Go); isGo {
 		rc := vetssa.ResolveCall(ls.eng.ssaInfo, goInst)
 		_, argBorrowed := vetssa.CombinedScope(ls.borrowed, rc.UserArgs...)
-		if _, fnBorrowed := ls.borrowed[goInst.Call.Value]; fnBorrowed || argBorrowed {
+		_, recvBorrowed := ls.borrowed[rc.Recv]
+		if _, fnBorrowed := ls.borrowed[goInst.Call.Value]; fnBorrowed || argBorrowed || recvBorrowed {
 			ls.report(goInst, "linearlease: 禁止在 go 语句中调用捕获了 //xops:borrowed 变量的闭包")
 		}
 		return
@@ -115,15 +139,16 @@ func (ls *leaseScope) checkCallInst(callInst ssa.CallInstruction) {
 		ls.checkBuiltinCall(callInst, rc)
 		return
 	}
-	if rc.Common != nil && !rc.Common.IsInvoke() {
-		ls.auditInvokedLocalClosure(rc)
+	if rc.Common != nil && !rc.Common.IsInvoke() && !ls.auditedIterCalls[callInst] &&
+		ls.borrowed[rc.Common.Value].Valid() && vetssa.IsIterSeqSignature(rc.Common.Value.Type()) {
+		ls.report(callInst, "linearlease: 禁止对非标准库或未知来源的借用迭代器执行回调调用")
+		return
 	}
 	spec := resolveSSACallLeaseSpec(ls.eng.pass, ls.eng.facts, ls.eng.secretFacts, rc)
 	isLocalCallee := ls.isAuditableLocalClosureCallee(rc)
 	for _, arg := range rc.UserArgs {
 		ls.checkSingleClosureArg(callInst, arg, spec.syncClosure, isLocalCallee)
 	}
-	ls.auditSamePkgBorrowedHelperCall(rc)
 }
 
 func (ls *leaseScope) checkBuiltinCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall) {
@@ -162,14 +187,25 @@ func (ls *leaseScope) checkAppendBuiltin(callInst ssa.CallInstruction, rc vetssa
 	}
 }
 
-func (ls *leaseScope) auditInvokedLocalClosure(rc vetssa.ResolvedCall) {
+func (ls *leaseScope) auditDirectIterCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall) bool {
+	targets, iterSc, ok := vetssa.ResolveDirectStdlibIterCallback(ls.eng.ssaInfo, rc, ls.borrowed)
+	if !ok {
+		return false
+	}
+	for _, tgt := range targets {
+		ls.eng.auditFunc(tgt.Fn, vetssa.SeedAllParamIndices(tgt.Fn), vetssa.CollectCaptured(tgt.MC, tgt.Fn, ls.borrowed), iterSc, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
+	}
+	return true
+}
+
+func (ls *leaseScope) auditInvokedLocalClosure(callInst ssa.CallInstruction, rc vetssa.ResolvedCall) {
 	targets, _ := vetssa.ResolveFuncValues(rc.Common.Value)
 	for _, tgt := range targets {
-		ls.auditInvokedTarget(rc, tgt)
+		ls.auditInvokedTarget(callInst, rc, tgt)
 	}
 }
 
-func (ls *leaseScope) auditInvokedTarget(rc vetssa.ResolvedCall, tgt ssa.Value) {
+func (ls *leaseScope) auditInvokedTarget(callInst ssa.CallInstruction, rc vetssa.ResolvedCall, tgt ssa.Value) {
 	switch t := tgt.(type) {
 	case *ssa.MakeClosure:
 		fn, ok := t.Fn.(*ssa.Function)
@@ -178,13 +214,42 @@ func (ls *leaseScope) auditInvokedTarget(rc vetssa.ResolvedCall, tgt ssa.Value) 
 		}
 		seeds, captured := vetssa.CollectCallSeeds(rc, ls.borrowed, len(fn.Params), nil), vetssa.CollectCaptured(t, fn, ls.borrowed)
 		if len(seeds) > 0 || len(captured) > 0 {
-			ls.eng.auditFunc(fn, seeds, captured, ls.ownScope, ls.depth+1, ls.borrowed)
+			ls.eng.auditFunc(fn, seeds, captured, ls.ownScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 		}
 	case *ssa.Function:
 		if t.Parent() != nil && !vetssa.IsBoundWrapper(t) && !vetssa.IsYieldFunc(t) {
 			if seeds := vetssa.CollectCallSeeds(rc, ls.borrowed, len(t.Params), nil); len(seeds) > 0 {
-				ls.eng.auditFunc(t, seeds, nil, ls.ownScope, ls.depth+1, ls.borrowed)
+				ls.eng.auditFunc(t, seeds, nil, ls.ownScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 			}
+		}
+	}
+}
+
+func (ls *leaseScope) auditSyncClosureArgRec(callInst ssa.CallInstruction, arg ssa.Value) {
+	if varElems := vetssa.ExtractVarargsElements(arg); len(varElems) > 0 {
+		for _, elem := range varElems {
+			ls.auditSyncClosureArgRec(callInst, elem)
+		}
+		return
+	}
+	if !ls.isBorrowedFuncValue(arg) || isSpecialClosureArg(arg) {
+		return
+	}
+	targets, _ := vetssa.ResolveFuncValues(arg)
+	for _, tgt := range targets {
+		ls.auditSingleSyncClosureTarget(callInst, tgt)
+	}
+}
+
+func (ls *leaseScope) auditSingleSyncClosureTarget(callInst ssa.CallInstruction, tgt ssa.Value) {
+	mc, ok := tgt.(*ssa.MakeClosure)
+	if !ok {
+		return
+	}
+	fn, ok := mc.Fn.(*ssa.Function)
+	if ok && fn != nil && !vetssa.IsYieldFunc(fn) && !vetssa.IsBoundWrapper(fn) {
+		if captured := vetssa.CollectCaptured(mc, fn, ls.borrowed); len(captured) > 0 {
+			ls.eng.auditFunc(fn, nil, captured, ls.ownScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 		}
 	}
 }
@@ -196,45 +261,28 @@ func (ls *leaseScope) checkSingleClosureArg(callInst ssa.CallInstruction, arg ss
 		}
 		return
 	}
-	if !ls.isBorrowedFuncValue(arg) || ls.isSpecialClosureArg(arg) {
+	if !ls.isBorrowedFuncValue(arg) || isSpecialClosureArg(arg) {
 		return
 	}
 	if isSync || isLocalCallee {
-		ls.auditSyncClosureArg(arg)
-	} else if _, isDirectMC := arg.(*ssa.MakeClosure); isDirectMC {
+		if _, allKnown := vetssa.ResolveFuncValues(arg); !allKnown {
+			ls.report(callInst, "linearlease: 禁止将捕获了 //xops:borrowed 变量的无法解析闭包传入同步调用")
+		}
+		return
+	}
+	if _, isDirectMC := arg.(*ssa.MakeClosure); isDirectMC {
 		ls.report(callInst, "linearlease: 禁止在非同步子闭包中捕获 //xops:borrowed 借用变量")
 	} else {
 		ls.report(callInst, "linearlease: 禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用")
 	}
 }
 
-func (ls *leaseScope) isSpecialClosureArg(arg ssa.Value) bool {
-	mc := ls.closureVals[arg]
-	if mc == nil {
-		return false
-	}
-	fn, ok := mc.Fn.(*ssa.Function)
-	return vetssa.IsBoundMethodVal(mc) || (ok && vetssa.IsYieldFunc(fn))
-}
-
-func (ls *leaseScope) auditSyncClosureArg(arg ssa.Value) {
-	mc := ls.closureVals[arg]
-	if mc == nil {
-		return
-	}
-	if fn, ok := mc.Fn.(*ssa.Function); ok && fn != nil && !vetssa.IsYieldFunc(fn) {
-		if captured := vetssa.CollectCaptured(mc, fn, ls.borrowed); len(captured) > 0 {
-			ls.eng.auditFunc(fn, nil, captured, ls.ownScope, ls.depth+1, ls.borrowed)
-		}
-	}
-}
-
-func (ls *leaseScope) auditSamePkgBorrowedHelperCall(rc vetssa.ResolvedCall) {
+func (ls *leaseScope) auditSamePkgBorrowedHelperCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall) {
 	if rc.TargetFn == nil || len(rc.TargetFn.Blocks) == 0 || vetssa.IsBoundWrapper(rc.TargetFn) {
 		return
 	}
 	if seeds := vetssa.CollectCallSeeds(rc, ls.borrowed, len(rc.TargetFn.Params), func(v ssa.Value) bool { return !ls.isBorrowedFuncValue(v) }); len(seeds) > 0 {
-		ls.eng.auditFunc(rc.TargetFn, seeds, nil, vetssa.ScopeRangeOfFunc(rc.TargetFn), ls.depth+1, nil)
+		ls.eng.auditFunc(rc.TargetFn, seeds, nil, vetssa.ScopeRangeOfFunc(rc.TargetFn), ls.depth+1, nil, nil, callInst)
 	}
 }
 
@@ -258,12 +306,32 @@ func isLocalAnonClosureTarget(t ssa.Value) bool {
 	}
 }
 
+func isBoundMethodValue(v ssa.Value) bool {
+	targets, allKnown := vetssa.ResolveFuncValues(v)
+	return allKnown && len(targets) > 0 && !slices.ContainsFunc(targets, func(t ssa.Value) bool {
+		mc, ok := t.(*ssa.MakeClosure)
+		return !ok || !vetssa.IsBoundMethodVal(mc)
+	})
+}
+
+func isSpecialClosureArg(arg ssa.Value) bool {
+	targets, allKnown := vetssa.ResolveFuncValues(arg)
+	return allKnown && len(targets) > 0 && !slices.ContainsFunc(targets, func(t ssa.Value) bool {
+		mc, ok := t.(*ssa.MakeClosure)
+		if !ok {
+			return true
+		}
+		fn, isFn := mc.Fn.(*ssa.Function)
+		return !vetssa.IsBoundMethodVal(mc) && (!isFn || !vetssa.IsYieldFunc(fn))
+	})
+}
+
 func (ls *leaseScope) isBorrowedFuncValue(v ssa.Value) bool {
 	if _, ok := ls.borrowed[v]; !ok {
 		return false
 	}
 	_, isSig := types.Unalias(v.Type()).Underlying().(*types.Signature)
-	return ls.closureVals[v] != nil || isSig
+	return isSig
 }
 
 func isDirectOuterSliceLoad(dst ssa.Value) bool {

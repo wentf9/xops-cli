@@ -2,6 +2,7 @@ package vault
 
 import (
 	"bytes"
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/subtle"
 	"encoding/base64"
@@ -27,9 +28,17 @@ func WithMasterKey(fn func(plain []byte) error) error {
 	return fn(key)
 }
 
-func okVaultUse(box *secret.SecretBox, aead cipher.AEAD, nonce, expected []byte) ([]byte, error) {
+func okVaultUse(box *secret.SecretBox, key, nonce, expected []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
 	var ct []byte
-	err := box.Use(func(plain []byte) error {
+	err = box.Use(func(plain []byte) error {
 		defer func() {
 			clear(plain)
 		}()
@@ -46,6 +55,13 @@ func okVaultUse(box *secret.SecretBox, aead cipher.AEAD, nonce, expected []byte)
 		return nil
 	})
 	return ct, err
+}
+
+func badUntrustedAEADParam(box *secret.SecretBox, aead cipher.AEAD, nonce []byte) {
+	_ = box.Use(func(plain []byte) error {
+		_ = aead.Seal(nil, nonce, plain, nil) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		return nil
+	})
 }
 
 var (

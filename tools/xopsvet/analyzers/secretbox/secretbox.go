@@ -40,7 +40,7 @@ func run(pass *analysis.Pass, sf *analysis.Analyzer) (any, error) {
 	if vetutil.IsSyntheticTestMain(pass) || pass.TypesInfo == nil {
 		return nil, nil
 	}
-	pkgInfo := vetutil.ClassifyPackage(pass.Pkg.Path())
+	pkgInfo := vetutil.ClassifyPass(pass)
 	s := vetssa.PackageSSA(pass)
 	facts, _ := pass.ResultOf[sf].(*secretfact.Result)
 

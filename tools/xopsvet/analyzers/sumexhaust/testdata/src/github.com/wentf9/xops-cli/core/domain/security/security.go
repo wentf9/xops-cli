@@ -825,7 +825,7 @@ func invalidCompositeDeniedFalse(d GuardrailDecision) (Decision, error) {
 	case *DecisionAllow:
 		return Decision{Allowed: true}, nil
 	default:
-		return Decision{Denied: false}, nil // want "sumexhaust: 安全决策 default 分支禁止返回 nil error 且无显式拒绝值"
+		return Decision{Denied: false}, nil // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
 	}
 }
 

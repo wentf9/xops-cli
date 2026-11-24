@@ -52,7 +52,7 @@ func isDuplicateDiagLine(fset *token.FileSet, pos token.Pos, seen map[diagLineKe
 	if fset == nil {
 		return false
 	}
-	p := fset.Position(pos)
+	p := fset.PositionFor(pos, false)
 	lk := diagLineKey{file: p.Filename, line: p.Line}
 	if seen[lk] {
 		return true
@@ -209,6 +209,9 @@ func addSerialTag(tag reflect.StructTag, flags *SerialTagFlags) {
 
 // IsTagSkippedForFormat 按 JSON / YAML 真实编码语义判定字段是否被 "-" 忽略（YAML 绝不认 json:"-"）。
 func IsTagSkippedForFormat(tag reflect.StructTag, checkJSON, checkYAML bool) bool {
+	if !checkJSON && !checkYAML {
+		return false
+	}
 	jv, hasJ := tag.Lookup("json")
 	yv, hasY := tag.Lookup("yaml")
 	jSkip, ySkip := hasJ && jv == "-", hasY && yv == "-"
@@ -218,7 +221,7 @@ func IsTagSkippedForFormat(tag reflect.StructTag, checkJSON, checkYAML bool) boo
 	case checkYAML:
 		return ySkip
 	default:
-		return jSkip && (!hasY || ySkip)
+		return jSkip
 	}
 }
 
@@ -227,30 +230,31 @@ func IsCompileTimePureExpr(info *types.Info, expr ast.Expr) bool {
 	if info == nil || expr == nil {
 		return false
 	}
-	switch e := ast.Unparen(expr).(type) {
+	e := ast.Unparen(expr)
+	if tv, ok := info.Types[e]; ok && tv.Value != nil {
+		return true
+	}
+	switch node := e.(type) {
 	case *ast.BasicLit:
 		return true
 	case *ast.Ident:
-		return isPureConstOrNilIdent(info, e)
+		return isPureConstOrNilIdent(info, node)
 	case *ast.CompositeLit:
-		return isPureCompositeLit(info, e)
+		return isPureCompositeLit(info, node)
 	case *ast.UnaryExpr:
-		if e.Op == token.AND {
-			lit, ok := ast.Unparen(e.X).(*ast.CompositeLit)
+		if node.Op == token.AND {
+			lit, ok := ast.Unparen(node.X).(*ast.CompositeLit)
 			return ok && isPureCompositeLit(info, lit)
 		}
-		return (e.Op == token.ADD || e.Op == token.SUB || e.Op == token.NOT || e.Op == token.XOR) && IsCompileTimePureExpr(info, e.X)
+		return (node.Op == token.ADD || node.Op == token.SUB || node.Op == token.NOT || node.Op == token.XOR) && IsCompileTimePureExpr(info, node.X)
 	case *ast.CallExpr:
-		return isPureConvOrNewExpr(info, e)
+		return isPureConvOrNewExpr(info, node)
 	default:
 		return false
 	}
 }
 
 func isPureConstOrNilIdent(info *types.Info, id *ast.Ident) bool {
-	if id.Name == "nil" {
-		return true
-	}
 	if tv, ok := info.Types[id]; ok && tv.Value != nil {
 		return true
 	}

@@ -151,8 +151,13 @@ func checkContextGenericInstances(pass *analysis.Pass, ctxIface *types.Interface
 		if ident == nil || !ident.Pos().IsValid() || inst.TypeArgs == nil || tparams == nil {
 			continue
 		}
-		for i := range min(tparams.Len(), inst.TypeArgs.Len()) {
-			if typeIsNarrowValueAnyIface(tparams.At(i).Constraint()) && implementsContextIface(inst.TypeArgs.At(i), ctxIface) {
+		n := min(tparams.Len(), inst.TypeArgs.Len())
+		subst := make(map[*types.TypeParam]types.Type, n)
+		for i := range n {
+			subst[tparams.At(i)] = inst.TypeArgs.At(i)
+		}
+		for i := range n {
+			if isInstantiatedNarrowValueAnyIface(tparams.At(i).Constraint(), subst) && implementsContextIface(inst.TypeArgs.At(i), ctxIface) {
 				*diags = append(*diags, vetutil.Diag{
 					Pos: ident.Pos(), End: ident.End(),
 					Msg: "noimplicit: 白名单包 core/internal/foundation/trace 之外禁止以 context.Context 实例化含 Value(any) any 约束的泛型",
@@ -170,6 +175,11 @@ func genericTypeParamsOf(obj types.Object) *types.TypeParamList {
 			return sig.TypeParams()
 		}
 	case *types.TypeName:
+		if alias, ok := o.Type().(*types.Alias); ok {
+			if tp := alias.TypeParams(); tp != nil && tp.Len() > 0 {
+				return tp
+			}
+		}
 		if named, ok := types.Unalias(o.Type()).(*types.Named); ok {
 			return named.TypeParams()
 		}
@@ -177,29 +187,78 @@ func genericTypeParamsOf(obj types.Object) *types.TypeParamList {
 	return nil
 }
 
-func typeIsNarrowValueAnyIface(t types.Type) bool {
+// isInstantiatedNarrowValueAnyIface 在将泛型类型实参代入约束接口后，判断是否暴露 Value(any) any 窄接口（H1）。
+func isInstantiatedNarrowValueAnyIface(t types.Type, subst map[*types.TypeParam]types.Type) bool {
 	if t == nil {
 		return false
 	}
 	u := types.Unalias(t)
-	// 标准库 context.Context 自身合法，严禁误杀实现 context.Context 的结构体转为 context.Context。
-	if named, ok := u.(*types.Named); ok && vetutil.IsPkgSymbol(named.Obj(), "context", "Context") {
-		return false
+	if named, ok := u.(*types.Named); ok {
+		if vetutil.IsPkgSymbol(named.Obj(), "context", "Context") {
+			return false
+		}
+		u = resolveInstantiatedConstraint(named, subst)
 	}
 	iface, ok := u.Underlying().(*types.Interface)
-	return ok && isNarrowValueAnyIface(iface)
+	return ok && isNarrowValueAnyIfaceSubst(iface, subst)
 }
 
-func isNarrowValueAnyIface(iface *types.Interface) bool {
+func resolveInstantiatedConstraint(named *types.Named, subst map[*types.TypeParam]types.Type) types.Type {
+	ta := named.TypeArgs()
+	if ta == nil || ta.Len() == 0 || len(subst) == 0 {
+		return named
+	}
+	args := make([]types.Type, ta.Len())
+	for i := range ta.Len() {
+		args[i] = substituteTypeParam(ta.At(i), subst)
+	}
+	if inst, err := types.Instantiate(nil, named.Origin(), args, false); err == nil {
+		return types.Unalias(inst)
+	}
+	return named
+}
+
+func substituteTypeParam(t types.Type, subst map[*types.TypeParam]types.Type) types.Type {
+	if tp, ok := types.Unalias(t).(*types.TypeParam); ok {
+		if rep, found := subst[tp]; found {
+			return rep
+		}
+	}
+	return t
+}
+
+func isNarrowValueAnyIfaceSubst(iface *types.Interface, subst map[*types.TypeParam]types.Type) bool {
 	if iface == nil || embedsContextContext(iface, make(map[*types.Interface]bool)) {
 		return false
 	}
 	for i := range iface.NumMethods() {
-		if isValueAnyAnyMethod(iface.Method(i)) {
+		if isValueAnyAnyMethodSubst(iface.Method(i), subst) {
 			return true
 		}
 	}
 	return false
+}
+
+func isValueAnyAnyMethodSubst(fn *types.Func, subst map[*types.TypeParam]types.Type) bool {
+	if fn == nil || fn.Name() != "Value" {
+		return false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	return ok && !sig.Variadic() && sig.Params().Len() == 1 && sig.Results().Len() == 1 &&
+		isEmptyIfaceType(substituteTypeParam(sig.Params().At(0).Type(), subst)) &&
+		isEmptyIfaceType(substituteTypeParam(sig.Results().At(0).Type(), subst))
+}
+
+func typeIsNarrowValueAnyIface(t types.Type) bool {
+	return isInstantiatedNarrowValueAnyIface(t, nil)
+}
+
+func isNarrowValueAnyIface(iface *types.Interface) bool {
+	return isNarrowValueAnyIfaceSubst(iface, nil)
+}
+
+func isValueAnyAnyMethod(fn *types.Func) bool {
+	return isValueAnyAnyMethodSubst(fn, nil)
 }
 
 func embedsContextContext(iface *types.Interface, seen map[*types.Interface]bool) bool {
@@ -217,16 +276,6 @@ func embedsContextContext(iface *types.Interface, seen map[*types.Interface]bool
 		}
 	}
 	return false
-}
-
-// isValueAnyAnyMethod 精确匹配 1 空接口入参 + 1 空接口返回值的 Value(any) any 签名，不误伤 0 参方法。
-func isValueAnyAnyMethod(fn *types.Func) bool {
-	if fn == nil || fn.Name() != "Value" {
-		return false
-	}
-	sig, ok := fn.Type().(*types.Signature)
-	return ok && !sig.Variadic() && sig.Params().Len() == 1 && sig.Results().Len() == 1 &&
-		isEmptyIfaceType(sig.Params().At(0).Type()) && isEmptyIfaceType(sig.Results().At(0).Type())
 }
 
 func isEmptyIfaceType(t types.Type) bool {

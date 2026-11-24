@@ -38,7 +38,7 @@ func run(pass *analysis.Pass) (any, error) {
 	if vetutil.IsSyntheticTestMain(pass) || pass.TypesInfo == nil {
 		return nil, nil
 	}
-	pkgInfo := vetutil.ClassifyPackage(pass.Pkg.Path())
+	pkgInfo := vetutil.ClassifyPass(pass)
 	s := vetssa.PackageSSA(pass)
 	checkOSSymbols(pass, s, pkgInfo)
 	checkRemotePathFilepath(pass, s)

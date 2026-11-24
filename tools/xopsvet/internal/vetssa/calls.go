@@ -2,6 +2,7 @@ package vetssa
 
 import (
 	"go/types"
+	"strings"
 
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
@@ -80,7 +81,9 @@ func resolveStaticCallee(s *buildssa.SSA, rc ResolvedCall, cc *ssa.CallCommon, c
 	}
 	origFn := UnwrapOriginFunc(callee)
 	rc.FuncObj = OriginFuncObj(origFn)
-	if IsSamePackageFunc(s, origFn) {
+	if strings.HasPrefix(origFn.Synthetic, "wrapper for ") {
+		rc.TargetFn = LookupPackageFunc(s, rc.FuncObj)
+	} else if IsSamePackageFunc(s, origFn) {
 		rc.TargetFn = origFn
 	}
 	if callee.Signature != nil && callee.Signature.Recv() != nil {
@@ -134,6 +137,8 @@ func unwrapFuncWrapper(v ssa.Value) (ssa.Value, bool) {
 		return val.X, true
 	case *ssa.Convert:
 		return val.X, true
+	case *ssa.MultiConvert:
+		return val.X, true
 	case *ssa.MakeInterface:
 		return val.X, true
 	case *ssa.ChangeInterface:
@@ -162,19 +167,20 @@ func collectPhiFuncValues(phi *ssa.Phi, seen map[ssa.Value]bool, out *[]ssa.Valu
 	return found
 }
 
+// collectLoadedFuncValues 解析栈槽 Alloc 中的函数值，若存在任何非直接 Store/读/DebugRef 引用者则 fail-closed（修复 C4）。
 func collectLoadedFuncValues(addr ssa.Value, seen map[ssa.Value]bool, out *[]ssa.Value) bool {
 	alloc, ok := addr.(*ssa.Alloc)
-	if !ok || alloc.Referrers() == nil {
+	if !ok {
 		return false
 	}
-	found := false
-	for _, ref := range *alloc.Referrers() {
-		if st, ok := ref.(*ssa.Store); ok && st.Addr == alloc {
-			found = true
-			if !collectFuncValues(st.Val, seen, out) {
-				return false
-			}
+	vals, found, safe := scanCellStores(alloc, nil)
+	if !safe || !found {
+		return false
+	}
+	for _, v := range vals {
+		if !collectFuncValues(v, seen, out) {
+			return false
 		}
 	}
-	return found
+	return true
 }

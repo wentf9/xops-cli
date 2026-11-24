@@ -29,6 +29,9 @@ func checkImportAllowed(src vetutil.PkgInfo, isTest bool, impPath string) (strin
 }
 
 func isCommonTestImportAllowed(src vetutil.PkgInfo, impPath string) bool {
+	if isUnregisteredCoreLayer(src.Layer) {
+		return false
+	}
 	if impPath == "testing" || strings.HasPrefix(impPath, "testing/") || (src.IsExternalTest && impPath == src.BasePath) {
 		return true
 	}
@@ -64,6 +67,9 @@ func checkStdlibImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 		if strings.HasPrefix(impPath, "net/") || impPath == "os/exec" {
 			return fmt.Sprintf("core/osfs 禁止导入网络子包或进程执行标准库 %q", impPath), false
 		}
+		if slices.Contains([]string{"crypto/tls", "log/syslog", "reflect"}, impPath) {
+			return fmt.Sprintf("core/osfs 禁止导入 TLS、系统日志或反射标准库 %q", impPath), false
+		}
 	case vetutil.LayerCoreConc, vetutil.LayerCoreFoundationActor, vetutil.LayerCoreFoundationTrace:
 		if isPureMemoryStdlibBanned(impPath) {
 			return fmt.Sprintf("core/conc 与 core/internal/foundation/{actor,trace} 禁止导入非纯内存 I/O、反射或随机标准库 %q", impPath), false
@@ -88,13 +94,14 @@ func checkPortsStdlibImport(layer vetutil.Layer, impPath string) (string, bool) 
 
 func isEventsBannedStdlib(impPath string) bool {
 	return impPath == "os" || strings.HasPrefix(impPath, "os/") ||
-		impPath == "net" || strings.HasPrefix(impPath, "net/") || impPath == "syscall" || impPath == "unsafe"
+		impPath == "net" || strings.HasPrefix(impPath, "net/") ||
+		impPath == "crypto/tls" || impPath == "syscall" || impPath == "unsafe"
 }
 
 // isPureMemoryStdlibBanned 强制 core/conc、foundation/actor 与 foundation/trace 维持纯内存非 I/O 不变量。
 func isPureMemoryStdlibBanned(impPath string) bool {
 	return isEventsBannedStdlib(impPath) || strings.HasPrefix(impPath, "math/rand/") ||
-		slices.Contains([]string{"reflect", "math/rand", "crypto/rand", "path/filepath", "io/ioutil", "log/syslog", "plugin", "embed"}, impPath)
+		slices.Contains([]string{"reflect", "math/rand", "crypto/rand", "path/filepath", "io/ioutil", "log", "log/syslog", "flag", "mime", "plugin", "embed"}, impPath)
 }
 
 // isDomainAllowedStdlib 精确匹配 RFC v2.3.3 §2.3 的 29 个纯函数标准库白名单及 option/secret 子包独占例外。
@@ -125,6 +132,10 @@ func checkExternalImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 		}
 	case vetutil.LayerCorePortsTCK:
 		if impPath == "go.uber.org/goleak" {
+			return "", true
+		}
+	case vetutil.LayerCoreOSFS:
+		if impPath == "golang.org/x/sys/unix" || impPath == "golang.org/x/sys/windows" {
 			return "", true
 		}
 	case vetutil.LayerCorePorts, vetutil.LayerCoreEvents, vetutil.LayerCoreConc,

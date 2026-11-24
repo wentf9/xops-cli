@@ -253,7 +253,7 @@ func resolveSSACallLeaseSpec(pass *analysis.Pass, idx *factIndex, secretFacts *s
 		applyFuncFactToSpec(fn, f, len(rc.UserArgs), &spec)
 	}
 	if vetssa.IsRuntimeSecretDo(fn) || vetssa.IsStdlibSyncIter(fn) || secretfact.IsSecretBoxUseMethod(fn) ||
-		(secretFacts != nil && (secretFacts.IsSecretUseObject(fn) || secretFacts.HasSecretUseCallbackParam(fn))) {
+		(secretFacts != nil && (secretFacts.IsSyncClosureObject(fn) || secretFacts.HasSecretUseCallbackParam(fn))) {
 		spec.syncClosure = true
 	}
 	mergeParamTypeFacts(pass, idx, fn, len(rc.UserArgs), &spec)
@@ -283,7 +283,7 @@ func mergeParamTypeFacts(pass *analysis.Pass, idx *factIndex, fn *types.Func, ar
 		return
 	}
 	for i := range argCount {
-		mergeSingleParamTypeFact(pass, idx, paramTypeAt(sig.Params(), sig.Variadic(), i), i, spec)
+		mergeSingleParamTypeFact(pass, idx, vetutil.ParamTypeAt(sig.Params(), sig.Variadic(), i), i, spec)
 	}
 }
 
@@ -301,20 +301,6 @@ func mergeSingleParamTypeFact(pass *analysis.Pass, idx *factIndex, pt types.Type
 			spec.callbackBorrowed[argIdx] = mergeIntSlices(spec.callbackBorrowed[argIdx], tf.DirectBorrowed)
 		}
 	}
-}
-
-func paramTypeAt(params *types.Tuple, variadic bool, i int) types.Type {
-	n := params.Len()
-	if n == 0 || (!variadic && i >= n) {
-		return nil
-	}
-	if i < n-1 || !variadic {
-		return params.At(i).Type()
-	}
-	if sl, ok := types.Unalias(params.At(n - 1).Type()).(*types.Slice); ok {
-		return sl.Elem()
-	}
-	return nil
 }
 
 func mergeIntSlices(a, b []int) []int {

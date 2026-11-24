@@ -8,7 +8,7 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-// checkNoReflectReachable 从 WriteCanonical 出发沿同包可解析调用图遍历全部可达函数与方法，禁止使用 reflect。
+// checkNoReflectReachable 从 WriteCanonical 出发沿同包全部直接/间接函数与方法引用遍历，禁止使用 reflect（M8）。
 func checkNoReflectReachable(pass *analysis.Pass, writeFn *ast.FuncDecl, funcDecls map[*types.Func]*ast.FuncDecl) {
 	visited := make(map[*types.Func]bool)
 	if fnObj, ok := pass.TypesInfo.Defs[writeFn.Name].(*types.Func); ok && fnObj != nil {
@@ -22,24 +22,36 @@ func walkReflectInBody(pass *analysis.Pass, body *ast.BlockStmt, funcDecls map[*
 		return
 	}
 	ast.Inspect(body, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.Ident:
-			if vetutil.ObjectPkgPath(pass.TypesInfo.Uses[node]) == "reflect" {
-				pass.ReportRangef(node, "digestcover: WriteCanonical 禁止使用 reflect")
-			}
-		case *ast.CallExpr:
-			visitReflectCallee(pass, node, funcDecls, visited)
-		}
+		checkReflectNode(pass, n, funcDecls, visited)
 		return true
 	})
 }
 
-func visitReflectCallee(pass *analysis.Pass, call *ast.CallExpr, funcDecls map[*types.Func]*ast.FuncDecl, visited map[*types.Func]bool) {
-	callee, ok := vetutil.ResolveCalledObject(pass.TypesInfo, call).(*types.Func)
-	if !ok || callee == nil {
+func checkReflectNode(pass *analysis.Pass, n ast.Node, funcDecls map[*types.Func]*ast.FuncDecl, visited map[*types.Func]bool) {
+	var fn *types.Func
+	switch node := n.(type) {
+	case *ast.Ident:
+		obj := pass.TypesInfo.Uses[node]
+		if vetutil.ObjectPkgPath(obj) == "reflect" {
+			pass.ReportRangef(node, "digestcover: WriteCanonical 禁止使用 reflect")
+			return
+		}
+		fn, _ = obj.(*types.Func)
+	case *ast.SelectorExpr:
+		if sel := pass.TypesInfo.Selections[node]; sel != nil {
+			fn, _ = sel.Obj().(*types.Func)
+		}
+	case *ast.CallExpr:
+		fn, _ = vetutil.ResolveCalledObject(pass.TypesInfo, node).(*types.Func)
+	}
+	visitReflectFunc(pass, fn, funcDecls, visited)
+}
+
+func visitReflectFunc(pass *analysis.Pass, fn *types.Func, funcDecls map[*types.Func]*ast.FuncDecl, visited map[*types.Func]bool) {
+	if fn == nil {
 		return
 	}
-	orig := callee.Origin()
+	orig := fn.Origin()
 	if orig == nil || orig.Pkg() != pass.Pkg || visited[orig] {
 		return
 	}

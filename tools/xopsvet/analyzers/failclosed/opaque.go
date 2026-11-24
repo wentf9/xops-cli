@@ -20,31 +20,83 @@ func exportOpaqueFacts(pass *analysis.Pass) {
 }
 
 func checkExternalOpaqueConstructions(pass *analysis.Pass) {
-	vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.CompositeLit)(nil), (*ast.CallExpr)(nil)}, func(n ast.Node) {
-		switch node := n.(type) {
-		case *ast.CompositeLit:
-			if named, ok := vetutil.UnwrapNamedType(pass.TypesInfo.TypeOf(node)); ok {
-				if orig := externalOpaqueOrigin(pass, named); orig != nil {
-					pass.ReportRangef(node, "failclosed: 禁止在包外通过字面量构造 //xops:opaque 类型 %s，请调用导出构造器", orig.Name())
-				}
-			}
-		case *ast.CallExpr:
-			checkOpaqueCall(pass, node)
-		}
-	})
+	vetutil.InspectorOf(pass).Preorder([]ast.Node{
+		(*ast.CompositeLit)(nil), (*ast.CallExpr)(nil),
+		(*ast.ValueSpec)(nil), (*ast.AssignStmt)(nil), (*ast.ReturnStmt)(nil),
+	}, func(n ast.Node) { checkOpaqueNode(pass, n) })
 }
 
-func checkOpaqueCall(pass *analysis.Pass, call *ast.CallExpr) {
-	if len(call.Args) != 1 {
+func checkOpaqueNode(pass *analysis.Pass, n ast.Node) {
+	switch node := n.(type) {
+	case *ast.CompositeLit:
+		checkOpaqueCompositeLit(pass, node)
+	case *ast.CallExpr:
+		if !checkOpaqueCall(pass, node) {
+			checkImplicitOpaqueExprs(pass, node.Args)
+		}
+	case *ast.ValueSpec:
+		checkImplicitOpaqueExprs(pass, node.Values)
+	case *ast.AssignStmt:
+		checkImplicitOpaqueExprs(pass, node.Rhs)
+	case *ast.ReturnStmt:
+		checkImplicitOpaqueExprs(pass, node.Results)
+	}
+}
+
+func checkOpaqueCompositeLit(pass *analysis.Pass, lit *ast.CompositeLit) {
+	if named, ok := vetutil.UnwrapNamedType(pass.TypesInfo.TypeOf(lit)); ok {
+		if orig := externalOpaqueOrigin(pass, named); orig != nil {
+			pass.ReportRangef(lit, "failclosed: 禁止在包外通过字面量构造 //xops:opaque 类型 %s，请调用导出构造器", orig.Name())
+		}
+	}
+	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			checkImplicitOpaqueConstExpr(pass, kv.Value)
+		} else {
+			checkImplicitOpaqueConstExpr(pass, elt)
+		}
+	}
+}
+
+func checkImplicitOpaqueExprs(pass *analysis.Pass, exprs []ast.Expr) {
+	for _, e := range exprs {
+		checkImplicitOpaqueConstExpr(pass, e)
+	}
+}
+
+// checkImplicitOpaqueConstExpr 拦截将无类型常量隐式赋给包外标量 //xops:opaque 类型（跳过显式类型转换以免重复报错，M7）。
+func checkImplicitOpaqueConstExpr(pass *analysis.Pass, expr ast.Expr) {
+	if call, isCall := ast.Unparen(expr).(*ast.CallExpr); isCall {
+		if ctv, ok := pass.TypesInfo.Types[call.Fun]; ok && ctv.IsType() {
+			return
+		}
+	}
+	tv, ok := pass.TypesInfo.Types[expr]
+	if !ok || tv.Value == nil || tv.Type == nil {
 		return
+	}
+	named, ok := types.Unalias(tv.Type).(*types.Named)
+	if !ok {
+		return
+	}
+	orig := externalOpaqueOrigin(pass, named)
+	if orig == nil || isSameNamedTypeArg(pass.TypesInfo, expr, named) {
+		return
+	}
+	pass.ReportRangef(expr, "failclosed: 禁止在包外通过无类型常量隐式构造 //xops:opaque 类型 %s，请调用导出构造器", orig.Name())
+}
+
+func checkOpaqueCall(pass *analysis.Pass, call *ast.CallExpr) bool {
+	if len(call.Args) != 1 {
+		return false
 	}
 	if id, ok := ast.Unparen(call.Fun).(*ast.Ident); ok && id.Name == "new" {
 		if b, isB := pass.TypesInfo.Uses[id].(*types.Builtin); isB && b.Name() == "new" {
 			checkOpaqueNewArg(pass, call)
-			return
+			return true
 		}
 	}
-	checkOpaqueTypeConversion(pass, call)
+	return checkOpaqueTypeConversion(pass, call)
 }
 
 func checkOpaqueNewArg(pass *analysis.Pass, call *ast.CallExpr) {
@@ -60,10 +112,10 @@ func checkOpaqueNewArg(pass *analysis.Pass, call *ast.CallExpr) {
 	}
 }
 
-func checkOpaqueTypeConversion(pass *analysis.Pass, call *ast.CallExpr) {
+func checkOpaqueTypeConversion(pass *analysis.Pass, call *ast.CallExpr) bool {
 	tv, ok := pass.TypesInfo.Types[call.Fun]
 	if !ok || !tv.IsType() || tv.Type == nil {
-		return
+		return false
 	}
 	targetType := types.Unalias(tv.Type)
 	cur, isPtr := targetType, false
@@ -72,13 +124,14 @@ func checkOpaqueTypeConversion(pass *analysis.Pass, call *ast.CallExpr) {
 	}
 	named, ok := cur.(*types.Named)
 	if !ok {
-		return
+		return true
 	}
 	orig := externalOpaqueOrigin(pass, named)
 	if orig == nil || (isPtr && isNilExpr(pass.TypesInfo, call.Args[0])) || isSameNamedTypeArg(pass.TypesInfo, call.Args[0], targetType) {
-		return
+		return true
 	}
 	pass.ReportRangef(call, "failclosed: 禁止在包外通过类型转换构造 //xops:opaque 类型 %s，请调用导出构造器", orig.Name())
+	return true
 }
 
 func isNilExpr(info *types.Info, expr ast.Expr) bool {

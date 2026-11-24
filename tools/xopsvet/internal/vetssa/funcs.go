@@ -91,27 +91,52 @@ func IsSamePackageFunc(s *buildssa.SSA, fn *ssa.Function) bool {
 
 // LookupPackageFunc 在当前包的 SSA 符号表中查找给定 *types.Func 对应的源 *ssa.Function。
 func LookupPackageFunc(s *buildssa.SSA, fnObj *types.Func) *ssa.Function {
-	if s == nil || s.Pkg == nil || fnObj == nil || fnObj.Origin().Pkg() != s.Pkg.Pkg {
+	if s == nil || s.Pkg == nil || s.Pkg.Prog == nil || fnObj == nil || fnObj.Origin().Pkg() != s.Pkg.Pkg {
 		return nil
 	}
 	return UnwrapOriginFunc(s.Pkg.Prog.FuncValue(fnObj.Origin()))
 }
 
-// ResolvePos 为可能缺失源码位置（Pos() == token.NoPos）的 SSA 指令确定性解析有效源码位置。
+// ResolvePos 为可能缺失源码位置（Pos() == token.NoPos）的 SSA 指令确定性解析有效源码位置（修复 C8）。
+// 仅当接口包装操作数是单引用局部加载/字面量分配时优先取其位置，否则优先采用直接 Referrers 位置
+// （防多次 MakeInterface 挤占声明行）；pkg.init 严禁跨文件借位。
 func ResolvePos(pass *analysis.Pass, fn *ssa.Function, inst ssa.Instruction) token.Pos {
 	if pos := resolveInstOwnPos(inst); pos.IsValid() {
 		return pos
 	}
-	if pos := resolveInstNeighborPos(inst); pos.IsValid() {
+	if pos := resolveExclusiveOperandPos(inst); pos.IsValid() {
 		return pos
+	}
+	if pos := resolveInstReferrerPos(inst); pos.IsValid() {
+		return pos
+	}
+	if pos := resolveInstOperandPos(inst); pos.IsValid() {
+		return pos
+	}
+	if IsPkgInitFunc(fn) {
+		return token.NoPos
+	}
+	if inst != nil && inst.Block() != nil {
+		if pos := resolveBlockNearbyPos(inst.Block().Instrs, inst); pos.IsValid() {
+			return pos
+		}
 	}
 	if fn != nil && fn.Pos().IsValid() {
 		return fn.Pos()
 	}
-	if pass != nil && len(pass.Files) > 0 {
-		return pass.Files[0].Package
+	return firstProdFilePos(pass)
+}
+
+func firstProdFilePos(pass *analysis.Pass) token.Pos {
+	if pass == nil || len(pass.Files) == 0 {
+		return token.NoPos
 	}
-	return token.NoPos
+	for _, f := range pass.Files {
+		if !vetutil.IsTestFile(pass, f) {
+			return f.Package
+		}
+	}
+	return pass.Files[0].Package
 }
 
 func resolveInstOwnPos(inst ssa.Instruction) token.Pos {
@@ -124,6 +149,39 @@ func resolveInstOwnPos(inst ssa.Instruction) token.Pos {
 	if mc, ok := inst.(*ssa.MakeClosure); ok && mc.Fn != nil && mc.Fn.Pos().IsValid() {
 		return mc.Fn.Pos()
 	}
+	return token.NoPos
+}
+
+func resolveInstReferrerPos(inst ssa.Instruction) token.Pos {
+	if val, ok := inst.(ssa.Value); ok && val.Referrers() != nil {
+		for _, ref := range *val.Referrers() {
+			if ref != nil && ref.Pos().IsValid() {
+				return ref.Pos()
+			}
+		}
+	}
+	return token.NoPos
+}
+
+func resolveExclusiveOperandPos(inst ssa.Instruction) token.Pos {
+	val, ok := inst.(ssa.Value)
+	if !ok {
+		return token.NoPos
+	}
+	unwrapped := UnwrapInterface(val)
+	if unwrapped == val || unwrapped.Referrers() == nil || len(*unwrapped.Referrers()) != 1 {
+		return token.NoPos
+	}
+	switch op := unwrapped.(type) {
+	case *ssa.Alloc, *ssa.UnOp:
+		if opInst, isInst := op.(ssa.Instruction); isInst && opInst.Block() == inst.Block() && opInst.Pos().IsValid() {
+			return opInst.Pos()
+		}
+	}
+	return token.NoPos
+}
+
+func resolveInstOperandPos(inst ssa.Instruction) token.Pos {
 	if val, ok := inst.(ssa.Value); ok {
 		if unwrapped := UnwrapInterface(val); unwrapped != val {
 			if opInst, isInst := unwrapped.(ssa.Instruction); isInst && opInst.Block() == inst.Block() && opInst.Pos().IsValid() {
@@ -132,20 +190,6 @@ func resolveInstOwnPos(inst ssa.Instruction) token.Pos {
 		}
 	}
 	return token.NoPos
-}
-
-func resolveInstNeighborPos(inst ssa.Instruction) token.Pos {
-	if val, ok := inst.(ssa.Value); ok && val.Referrers() != nil {
-		for _, ref := range *val.Referrers() {
-			if ref != nil && ref.Pos().IsValid() {
-				return ref.Pos()
-			}
-		}
-	}
-	if inst == nil || inst.Block() == nil {
-		return token.NoPos
-	}
-	return resolveBlockNearbyPos(inst.Block().Instrs, inst)
 }
 
 func resolveBlockNearbyPos(instrs []ssa.Instruction, target ssa.Instruction) token.Pos {

@@ -2,6 +2,7 @@ package secretbox
 
 import (
 	"go/ast"
+	"go/token"
 	"go/types"
 	"slices"
 	"strings"
@@ -13,22 +14,52 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// checkTypeAndEmbeddingBan 禁止 SecretBox 进入受限/序列化/error 类型，并在全包所有结构体禁止匿名嵌入 SecretBox（CRIT-2）。
+// checkTypeAndEmbeddingBan 禁止 SecretBox 进入受限/序列化/error 类型（含函数局部 type 与带 tag 匿名结构体），
+// 并在全包所有结构体禁止匿名嵌入 SecretBox（CRIT-2 + SB-2）。
 func checkTypeAndEmbeddingBan(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) map[*types.TypeName]bool {
 	restricted := make(map[*types.TypeName]bool)
-	vetutil.ForEachTypeSpec(pass, func(_ *ast.File, gen *ast.GenDecl, ts *ast.TypeSpec) {
-		checkTypeSpecSecretBox(pass, pkgInfo, gen, ts, restricted)
-	})
-	vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.StructType)(nil)}, func(n ast.Node) {
-		if st, ok := n.(*ast.StructType); ok && st.Fields != nil {
-			for _, f := range st.Fields.List {
-				if len(f.Names) == 0 && isSecretBoxValueType(pass.TypesInfo.TypeOf(f.Type)) {
-					pass.ReportRangef(f.Type, "secretbox: 禁止在命名或匿名结构体中嵌入 secret.SecretBox")
-				}
+	namedStructs := make(map[*ast.StructType]bool)
+	vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.GenDecl)(nil), (*ast.StructType)(nil)}, func(n ast.Node) {
+		switch node := n.(type) {
+		case *ast.GenDecl:
+			if node.Tok == token.TYPE {
+				checkTypeGenDeclSecretBox(pass, pkgInfo, node, namedStructs, restricted)
 			}
+		case *ast.StructType:
+			checkStructEmbeddingAndAnonTags(pass, node, namedStructs[node])
 		}
 	})
 	return restricted
+}
+
+func checkTypeGenDeclSecretBox(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.GenDecl, namedStructs map[*ast.StructType]bool, restricted map[*types.TypeName]bool) {
+	for _, sp := range gen.Specs {
+		if ts, ok := sp.(*ast.TypeSpec); ok {
+			if st, isSt := ts.Type.(*ast.StructType); isSt {
+				namedStructs[st] = true
+			}
+			checkTypeSpecSecretBox(pass, pkgInfo, gen, ts, restricted)
+		}
+	}
+}
+
+func checkStructEmbeddingAndAnonTags(pass *analysis.Pass, st *ast.StructType, isNamed bool) {
+	if st == nil || st.Fields == nil {
+		return
+	}
+	hasAnonTags := false
+	if !isNamed {
+		if tags, err := vetutil.StructSerialTags(st); err == nil {
+			hasAnonTags = tags.Any()
+		}
+	}
+	for _, f := range st.Fields.List {
+		if len(f.Names) == 0 && isSecretBoxValueType(pass.TypesInfo.TypeOf(f.Type)) {
+			pass.ReportRangef(f.Type, "secretbox: 禁止在命名或匿名结构体中嵌入 secret.SecretBox")
+		} else if hasAnonTags && len(f.Names) > 0 && isSecretBoxValueType(pass.TypesInfo.TypeOf(f.Type)) {
+			pass.ReportRangef(f.Type, "secretbox: 禁止 secret.SecretBox 进入带序列化标签的匿名结构体字段")
+		}
+	}
 }
 
 func checkTypeSpecSecretBox(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.GenDecl, ts *ast.TypeSpec, restricted map[*types.TypeName]bool) {

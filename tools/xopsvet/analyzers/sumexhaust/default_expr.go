@@ -48,19 +48,28 @@ func isPermissiveVarRef(info *types.Info, expr ast.Expr, permissiveVars map[*typ
 // isCompositeLitPermissive 递归检查复合字面量是否携带放行字段或放行类型名；fail-closed 键为 true 不误报。
 func isCompositeLitPermissive(info *types.Info, lit *ast.CompositeLit, st defaultScanState, visited map[*ast.FuncLit]bool) bool {
 	for _, elt := range lit.Elts {
-		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			if keyID, ok := ast.Unparen(kv.Key).(*ast.Ident); ok && isFailClosedIdentName(keyID.Name) && isBoolConstExpr(info, kv.Value, true) {
-				continue
-			}
-			if isPermissiveExprSeen(info, kv.Value, st, visited) {
-				return true
-			}
-		} else if isPermissiveExprSeen(info, elt, st, visited) {
+		if isCompositeEltPermissive(info, elt, st, visited) {
 			return true
 		}
 	}
 	id := rightmostIdent(lit.Type)
 	return lit.Type != nil && id != nil && isPermissiveIdentName(id.Name)
+}
+
+func isCompositeEltPermissive(info *types.Info, elt ast.Expr, st defaultScanState, visited map[*ast.FuncLit]bool) bool {
+	kv, ok := elt.(*ast.KeyValueExpr)
+	if !ok {
+		return isPermissiveExprSeen(info, elt, st, visited)
+	}
+	if keyID, ok := ast.Unparen(kv.Key).(*ast.Ident); ok && isFailClosedIdentName(keyID.Name) {
+		if isBoolConstExpr(info, kv.Value, true) {
+			return false
+		}
+		if isBoolConstExpr(info, kv.Value, false) {
+			return true
+		}
+	}
+	return isPermissiveExprSeen(info, kv.Value, st, visited)
 }
 
 // isFailClosedValueExpr 判断非 error 槽位的返回值表达式是否表达显式拒绝（fail-closed）语义，首行即拦截所有 nil。

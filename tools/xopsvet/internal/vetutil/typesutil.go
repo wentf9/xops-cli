@@ -38,8 +38,11 @@ func IsPosInTestFile(pass *analysis.Pass, pos token.Pos) bool {
 	return tf != nil && strings.HasSuffix(tf.Name(), "_test.go")
 }
 
-// AllowNolintInFile 按单个源码文件判定是否允许 //nolint：仅限 8 个特权包的生产源码文件（白盒/外置测试 0 例外）。
+// AllowNolintInFile 按单个源码文件判定是否允许 //nolint：仅限 8 个特权包的生产源码文件（白盒/外置测试与非法参数均 fail-closed）。
 func AllowNolintInFile(pass *analysis.Pass, file *ast.File, info PkgInfo) bool {
+	if pass == nil || pass.Fset == nil || file == nil || !file.Package.IsValid() {
+		return false
+	}
 	return AllowNolint(info) && !IsTestFile(pass, file)
 }
 
@@ -81,7 +84,37 @@ func UnwrapNamedType(t types.Type) (*types.Named, bool) {
 	return named, ok && named != nil
 }
 
-// isNilObject 安全识别 nil 及携带 nil 具体指针的 typed-nil types.Object 接口值。
+// UnwrapStructType 解引用别名与任意层指针，提取底层 *types.Struct（供 failclosed/digestcover/archbound 共享）。
+func UnwrapStructType(t types.Type) *types.Struct {
+	if t == nil {
+		return nil
+	}
+	u := types.Unalias(t)
+	for ptr, ok := u.(*types.Pointer); ok; ptr, ok = u.(*types.Pointer) {
+		u = types.Unalias(ptr.Elem())
+	}
+	st, _ := u.Underlying().(*types.Struct)
+	return st
+}
+
+// ParamTypeAt 返回参数列表第 i 个形参的类型（自动解包可变参末位的切片元素类型）。
+func ParamTypeAt(params *types.Tuple, variadic bool, i int) types.Type {
+	if params == nil || i < 0 {
+		return nil
+	}
+	n := params.Len()
+	if n == 0 || (!variadic && i >= n) {
+		return nil
+	}
+	if i < n-1 || !variadic {
+		return params.At(i).Type()
+	}
+	if sl, ok := types.Unalias(params.At(n - 1).Type()).(*types.Slice); ok {
+		return sl.Elem()
+	}
+	return nil
+}
+
 func isNilObject(obj types.Object) bool {
 	if obj == nil {
 		return true
@@ -90,13 +123,13 @@ func isNilObject(obj types.Object) bool {
 	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }
 
-// ObjectPkgPath 返回 types.Object 所属包的规范路径（已剥离 _test 后缀；内置/nil 返回空串）。
+// ObjectPkgPath 返回 types.Object 所属包的真实路径（仅剥离驱动 " [...]" 后缀，不剥离 _test 以防外置测试包伪造符号）。
 func ObjectPkgPath(obj types.Object) string {
 	if isNilObject(obj) || obj.Pkg() == nil {
 		return ""
 	}
-	base, _ := NormalizePkgPath(obj.Pkg().Path())
-	return base
+	p, _, _ := strings.Cut(obj.Pkg().Path(), " [")
+	return p
 }
 
 // IsPkgSymbol 判断 types.Object 是否为指定规范包路径下的目标符号之一。
@@ -104,12 +137,12 @@ func IsPkgSymbol(obj types.Object, pkgPath string, names ...string) bool {
 	return !isNilObject(obj) && ObjectPkgPath(obj) == pkgPath && slices.Contains(names, obj.Name())
 }
 
-// ResolveCalledObject 解析调用表达式指向的被调 types.Object（自动剥离括号与泛型实参索引）。
+// ResolveCalledObject 解析调用表达式指向的被调 types.Object（自动剥离括号与泛型实参索引，不误剥普通切片/Map 索引）。
 func ResolveCalledObject(info *types.Info, call *ast.CallExpr) types.Object {
 	if info == nil || call == nil {
 		return nil
 	}
-	switch e := unwrapCallFun(call.Fun).(type) {
+	switch e := unwrapCallFun(info, call.Fun).(type) {
 	case *ast.Ident:
 		return info.Uses[e]
 	case *ast.SelectorExpr:
@@ -122,19 +155,45 @@ func ResolveCalledObject(info *types.Info, call *ast.CallExpr) types.Object {
 	}
 }
 
-func unwrapCallFun(expr ast.Expr) ast.Expr {
+func unwrapCallFun(info *types.Info, expr ast.Expr) ast.Expr {
 	for {
 		switch e := expr.(type) {
 		case *ast.ParenExpr:
 			expr = e.X
 		case *ast.IndexExpr:
+			if !isGenericIndexTarget(info, e.X) {
+				return expr
+			}
 			expr = e.X
 		case *ast.IndexListExpr:
+			if !isGenericIndexTarget(info, e.X) {
+				return expr
+			}
 			expr = e.X
 		default:
 			return expr
 		}
 	}
+}
+
+func isGenericIndexTarget(info *types.Info, x ast.Expr) bool {
+	if info == nil || x == nil {
+		return false
+	}
+	var id *ast.Ident
+	switch e := ast.Unparen(x).(type) {
+	case *ast.Ident:
+		id = e
+	case *ast.SelectorExpr:
+		id = e.Sel
+	}
+	if id != nil {
+		if _, ok := info.Instances[id]; ok {
+			return true
+		}
+	}
+	tv, ok := info.Types[x]
+	return ok && tv.IsType()
 }
 
 // IsFreshLocalSliceAlloc 判断 AST 调用表达式是否必为全新分配的局部切片。
@@ -170,146 +229,6 @@ func isFreshSliceConvArg(info *types.Info, arg ast.Expr) bool {
 	if argType := info.TypeOf(arg); argType != nil {
 		b, ok := types.Unalias(argType).Underlying().(*types.Basic)
 		return ok && (b.Kind() == types.UntypedNil || b.Info()&types.IsString != 0)
-	}
-	return false
-}
-
-type elemType interface{ Elem() types.Type }
-
-type typeWalkOpt struct {
-	localPkg        *types.Package
-	localOnly       bool
-	valueLayoutOnly bool // true 时绝不进入 Interface.Methods 与 Signature（CRIT-3）
-}
-
-// ContainsValueType 递归检查类型 t 的「值持有布局」中是否包含满足 pred 的命名类型，
-// 绝不穿透 *types.Interface.Methods 与 *types.Signature（避免误杀 ports.SecretVault 等接口）。
-func ContainsValueType(t types.Type, pred func(*types.Named) bool) bool {
-	return t != nil && pred != nil && walkType(t, typeWalkOpt{valueLayoutOnly: true}, pred, make(map[types.Type]bool))
-}
-
-// ContainsValueNamed 判断类型 t 的值持有布局中是否包含指定包路径与名称的命名类型。
-func ContainsValueNamed(t types.Type, pkgPath, typeName string) bool {
-	return ContainsValueType(t, func(n *types.Named) bool { return IsPkgSymbol(n.Obj(), pkgPath, typeName) })
-}
-
-// TypeContains 递归检查类型 t 的全部引用类型树（含签名、接口方法、泛型实参与 *types.Union）。
-func TypeContains(t types.Type, pred func(*types.Named) bool) bool {
-	return t != nil && pred != nil && walkType(t, typeWalkOpt{}, pred, make(map[types.Type]bool))
-}
-
-// TypeContainsNamed 判断类型 t 是否直接或间接引用指定包路径与名称的命名类型。
-func TypeContainsNamed(t types.Type, pkgPath, typeName string) bool {
-	return TypeContains(t, func(n *types.Named) bool { return IsPkgSymbol(n.Obj(), pkgPath, typeName) })
-}
-
-// TypeContainsLocalNamed 仅展开当前包 pkg 内定义的命名类型底层结构，不穿透外部包结构体字段。
-func TypeContainsLocalNamed(t types.Type, pkg *types.Package, pkgPath, typeName string) bool {
-	return TypeContainsLocalPred(t, pkg, func(n *types.Named) bool { return IsPkgSymbol(n.Obj(), pkgPath, typeName) })
-}
-
-// TypeContainsLocalPred 对本地定义类型展开执行谓词检查，覆盖全引用类型树含 Union。
-func TypeContainsLocalPred(t types.Type, pkg *types.Package, pred func(*types.Named) bool) bool {
-	return t != nil && pred != nil && walkType(t, typeWalkOpt{localPkg: pkg, localOnly: true}, pred, make(map[types.Type]bool))
-}
-
-func walkType(t types.Type, opt typeWalkOpt, pred func(*types.Named) bool, seen map[types.Type]bool) bool {
-	if t == nil {
-		return false
-	}
-	t = types.Unalias(t)
-	if named, ok := t.(*types.Named); ok {
-		return walkNamedType(named, opt, pred, seen)
-	}
-	return walkCompositeType(t, opt, pred, seen)
-}
-
-func walkNamedType(named *types.Named, opt typeWalkOpt, pred func(*types.Named) bool, seen map[types.Type]bool) bool {
-	if pred(named) {
-		return true
-	}
-	if seen[named] {
-		return false
-	}
-	seen[named] = true
-	if ta := named.TypeArgs(); ta != nil && walkIndexedTypes(ta.Len(), ta.At, opt, pred, seen) {
-		return true
-	}
-	if opt.localOnly && named.Obj() != nil && named.Obj().Pkg() != opt.localPkg {
-		return false
-	}
-	u := types.Unalias(named.Underlying())
-	_, isI := u.(*types.Interface)
-	_, isS := u.(*types.Signature)
-	return (!opt.valueLayoutOnly || (!isI && !isS)) && walkType(u, opt, pred, seen)
-}
-
-func walkIndexedTypes(n int, at func(int) types.Type, opt typeWalkOpt, pred func(*types.Named) bool, seen map[types.Type]bool) bool {
-	for i := range n {
-		if walkType(at(i), opt, pred, seen) {
-			return true
-		}
-	}
-	return false
-}
-
-func walkCompositeType(t types.Type, opt typeWalkOpt, pred func(*types.Named) bool, seen map[types.Type]bool) bool {
-	switch v := t.(type) {
-	case *types.Map:
-		return walkType(v.Key(), opt, pred, seen) || walkType(v.Elem(), opt, pred, seen)
-	case elemType:
-		return walkType(v.Elem(), opt, pred, seen)
-	case *types.Struct:
-		return markFirstSeen(seen, v) && walkIndexedTypes(v.NumFields(), func(i int) types.Type { return v.Field(i).Type() }, opt, pred, seen)
-	case *types.Tuple:
-		return v != nil && walkIndexedTypes(v.Len(), func(i int) types.Type { return v.At(i).Type() }, opt, pred, seen)
-	case *types.Union:
-		return markFirstSeen(seen, v) && walkIndexedTypes(v.Len(), func(i int) types.Type { return v.Term(i).Type() }, opt, pred, seen)
-	case *types.TypeParam:
-		return walkTypeParam(v, opt, pred, seen)
-	case *types.Signature:
-		return !opt.valueLayoutOnly && (walkCompositeType(v.Params(), opt, pred, seen) || walkCompositeType(v.Results(), opt, pred, seen))
-	case *types.Interface:
-		return !opt.valueLayoutOnly && markFirstSeen(seen, v) &&
-			(walkIndexedTypes(v.NumEmbeddeds(), v.EmbeddedType, opt, pred, seen) ||
-				walkIndexedTypes(v.NumMethods(), func(i int) types.Type { return v.Method(i).Type() }, opt, pred, seen))
-	default:
-		return false
-	}
-}
-
-func markFirstSeen(seen map[types.Type]bool, t types.Type) bool {
-	if seen[t] {
-		return false
-	}
-	seen[t] = true
-	return true
-}
-
-func walkTypeParam(tp *types.TypeParam, opt typeWalkOpt, pred func(*types.Named) bool, seen map[types.Type]bool) bool {
-	if !markFirstSeen(seen, tp) {
-		return false
-	}
-	if !opt.valueLayoutOnly {
-		return walkType(tp.Constraint(), opt, pred, seen)
-	}
-	iface, ok := types.Unalias(tp.Constraint()).Underlying().(*types.Interface)
-	return ok && walkValueIfaceTerms(iface, opt, pred, seen)
-}
-
-func walkValueIfaceTerms(iface *types.Interface, opt typeWalkOpt, pred func(*types.Named) bool, seen map[types.Type]bool) bool {
-	if !markFirstSeen(seen, iface) {
-		return false
-	}
-	for i := range iface.NumEmbeddeds() {
-		emb := types.Unalias(iface.EmbeddedType(i))
-		if sub, ok := emb.Underlying().(*types.Interface); ok {
-			if walkValueIfaceTerms(sub, opt, pred, seen) {
-				return true
-			}
-		} else if walkType(emb, opt, pred, seen) {
-			return true
-		}
 	}
 	return false
 }

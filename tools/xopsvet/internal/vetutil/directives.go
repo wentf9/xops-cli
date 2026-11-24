@@ -30,7 +30,7 @@ type Directive struct {
 	Raw  string
 }
 
-// ParseCommentLines 将单条 AST 注释拆分为去除注释定界符与前导空白的文本行。
+// ParseCommentLines 将单条 AST 注释拆分为去除注释定界符与前导星号/斜杠的文本行。
 func ParseCommentLines(c *ast.Comment) []string {
 	if c == nil {
 		return nil
@@ -41,12 +41,9 @@ func ParseCommentLines(c *ast.Comment) []string {
 	body := strings.TrimSuffix(strings.TrimPrefix(c.Text, "/*"), "*/")
 	var lines []string
 	for raw := range strings.SplitSeq(body, "\n") {
-		t := strings.TrimSpace(raw)
-		if after, ok := strings.CutPrefix(t, "*"); ok {
+		t := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(raw), "*"))
+		if after, ok := strings.CutPrefix(t, "//"); ok {
 			t = strings.TrimSpace(after)
-		}
-		if strings.HasPrefix(t, "//xops:") {
-			t = strings.TrimPrefix(t, "//")
 		}
 		lines = append(lines, t)
 	}
@@ -67,6 +64,9 @@ func ParseLineDirective(line string, pos token.Pos) (Directive, bool) {
 		return Directive{}, false
 	}
 	kind := matchDirectiveToken(fields[0])
+	if kind == DirectiveHashExclude {
+		return Directive{Kind: kind, Arg: strings.TrimSpace(strings.TrimPrefix(rest, fields[0])), Pos: pos, Raw: line}, true
+	}
 	return Directive{Kind: kind, Pos: pos, Raw: line}, kind != DirectiveUnknown
 }
 
@@ -84,13 +84,16 @@ func matchDirectiveToken(tok string) DirectiveKind {
 	}[tok]
 }
 
-// ParseCommentGroup 从注释组中解析出全部 //xops:* 指令。
+// ParseCommentGroup 从注释组中解析出全部 //xops:* 指令（行注释严格要求无空格前缀 //xops:，防止普通散文误触发）。
 func ParseCommentGroup(cg *ast.CommentGroup) []Directive {
 	if cg == nil {
 		return nil
 	}
 	var out []Directive
 	for _, c := range cg.List {
+		if strings.HasPrefix(c.Text, "//") && !strings.HasPrefix(c.Text, "//xops:") {
+			continue
+		}
 		for _, line := range ParseCommentLines(c) {
 			if dir, ok := ParseLineDirective(line, c.Pos()); ok {
 				out = append(out, dir)
@@ -175,22 +178,23 @@ func paramCommentsHaveDirective(fset *token.FileSet, comments []*ast.CommentGrou
 }
 
 func matchesParamComment(fset *token.FileSet, cg *ast.CommentGroup, f *ast.Field, w paramCommentWindow) bool {
-	if cg.Pos() > w.prevEnd && cg.End() < f.Pos() && fset.Position(cg.Pos()).Line > w.prevEndLine {
+	startLine, endLine := fset.Position(cg.Pos()).Line, fset.Position(cg.End()).Line
+	if cg.Pos() > w.prevEnd && cg.End() < f.Pos() && startLine > w.prevEndLine {
 		return true
 	}
 	isBlock := len(cg.List) > 0 && strings.HasPrefix(cg.List[0].Text, "/*")
-	if isBlock && cg.Pos() >= w.prevEnd && cg.End() <= f.Pos() && fset.Position(cg.End()).Line == w.startLine {
-		return !w.sameLinePrev || (f.Pos()-cg.End()) < (cg.Pos()-w.prevEnd)
+	if isBlock && cg.Pos() >= w.prevEnd && cg.End() <= f.Pos() && endLine == w.startLine {
+		return !w.sameLinePrev || (f.Pos()-cg.End()) <= (cg.Pos()-w.prevEnd)
 	}
-	return cg.Pos() >= f.End() && cg.End() <= w.nextPos && fset.Position(cg.Pos()).Line == w.endLine &&
+	return cg.Pos() >= f.End() && cg.End() <= w.nextPos && startLine == w.endLine && endLine == w.endLine &&
 		(!w.sameLineNext || (isBlock && (cg.Pos()-f.End()) < (w.nextPos-cg.End())))
 }
 
-// HasNolintComment 精确判断单条 AST 注释是否为 golangci-lint 的 //nolint 指令（不误伤中文说明）。
+// HasNolintComment 精确判断单条 AST 注释是否为 golangci-lint 的 //nolint 指令（覆盖 //nolint//reason 与块注释）。
 func HasNolintComment(c *ast.Comment) bool {
 	for _, line := range ParseCommentLines(c) {
 		if rest, ok := strings.CutPrefix(line, "nolint"); ok &&
-			(rest == "" || rest[0] == ':' || rest[0] == ' ' || rest[0] == '\t') {
+			(rest == "" || rest[0] == ':' || rest[0] == ' ' || rest[0] == '\t' || rest[0] == '/') {
 			return true
 		}
 	}

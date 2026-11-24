@@ -18,18 +18,7 @@ func isFieldCovered(passPkg *types.Package, f *types.Var, state *coverageState) 
 	return embSt != nil && embSt.NumFields() > 0 && allEmbeddedFieldsPromoted(passPkg, embSt, state.promoted[f], make(map[*types.Struct]bool))
 }
 
-func unwrapEmbeddedStruct(t types.Type) *types.Struct {
-	if embNamed, ok := vetutil.UnwrapNamedType(t); ok {
-		embSt, _ := embNamed.Underlying().(*types.Struct)
-		return embSt
-	}
-	u := types.Unalias(t)
-	if ptr, isPtr := u.(*types.Pointer); isPtr {
-		u = types.Unalias(ptr.Elem())
-	}
-	embSt, _ := u.(*types.Struct)
-	return embSt
-}
+func unwrapEmbeddedStruct(t types.Type) *types.Struct { return vetutil.UnwrapStructType(t) }
 
 func allEmbeddedFieldsPromoted(passPkg *types.Package, embSt *types.Struct, hits map[*types.Var]bool, seen map[*types.Struct]bool) bool {
 	if hits == nil || embSt == nil || seen[embSt] {

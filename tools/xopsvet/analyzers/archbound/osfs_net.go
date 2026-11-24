@@ -29,7 +29,7 @@ func checkOSFSNetSymbols(pass *analysis.Pass) {
 	checkOSFSNetASTNodes(pass, addDiag)
 	checkOSFSNetSelections(pass, addDiag)
 	diags = append(diags, vetssa.CheckNoErasure(pass, vetssa.PackageSSA(pass), vetssa.ErasureConfig{
-		MatchType:      containsRestrictedNetStruct,
+		MatchType:      containsErasableRestrictedNet,
 		CheckInstances: true,
 		Message:        "archbound: core/osfs 禁止将 net.Dialer/net.ListenConfig 经接口或泛型实参擦除",
 	})...)
@@ -151,7 +151,7 @@ func checkOSFSNetSelections(pass *analysis.Pass, addDiag diagAdder) {
 		if selExpr == nil || sel == nil || sel.Obj() == nil {
 			continue
 		}
-		if checkOSFSNetSelectionMember(selExpr, sel, addDiag) && vetutil.TypeContainsLocalPred(sel.Obj().Type(), pass.Pkg, isBannedNetNamedType) {
+		if checkOSFSNetSelectionMember(selExpr, sel, addDiag) && vetutil.TypeContainsLocalPred(sel.Type(), pass.Pkg, isBannedNetNamedType) {
 			addDiag(selExpr.Sel.Pos(), selExpr.Sel.End(), "archbound: core/osfs 禁止引用包含受禁 net 类型的成员 "+sel.Obj().Name())
 		}
 	}

@@ -1,8 +1,13 @@
 package sumexhaust
 
-import "go/types"
+import (
+	"go/types"
 
-// instantiateVariant 尝试按封闭接口的类型实参实例化候选泛型变体；参数不匹配时保留未实例化原型以供兼容匹配。
+	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
+)
+
+// instantiateVariant 尝试按封闭接口的类型实参实例化候选泛型变体；
+// 同元数但类型约束不满足时返回 nil 跳过不可编译变体（修复 B-9 / M3），仅在元数不匹配时保留原型供兼容匹配。
 func instantiateVariant(candNamed, ifaceNamed *types.Named) types.Type {
 	tp := candNamed.TypeParams()
 	if tp == nil || tp.Len() == 0 || ifaceNamed == nil || ifaceNamed.TypeArgs() == nil || ifaceNamed.TypeArgs().Len() != tp.Len() {
@@ -15,7 +20,7 @@ func instantiateVariant(candNamed, ifaceNamed *types.Named) types.Type {
 	if inst, err := types.Instantiate(nil, candNamed, args, true); err == nil {
 		return inst
 	}
-	return candNamed
+	return nil
 }
 
 // checkVariantImplements 检查候选具体类型的值接收者与指针接收者是否实现目标封闭接口。
@@ -82,11 +87,11 @@ func compatibleSingleTypeSeen(fnType, imType types.Type, seen map[typePair]bool)
 	} else {
 		seen[pair] = true
 	}
-	if !hasTypeParam(fnU) && !hasTypeParam(imU) {
+	if !vetutil.HasTypeParam(fnU) && !vetutil.HasTypeParam(imU) {
 		return types.Identical(fnU, imU)
 	}
 	if tp, ok := fnU.(*types.TypeParam); ok {
-		if hasTypeParam(imU) || imU == types.Typ[types.Invalid] {
+		if vetutil.HasTypeParam(imU) || imU == types.Typ[types.Invalid] {
 			return true
 		}
 		constraint, isIface := tp.Constraint().Underlying().(*types.Interface)
@@ -177,52 +182,4 @@ func compatibleNamedTypeArgs(fnNamed, imNamed *types.Named, seen map[typePair]bo
 		}
 	}
 	return true
-}
-
-type elemCarrier interface{ Elem() types.Type }
-
-func hasTypeParam(t types.Type) bool { return hasTypeParamSeen(t, make(map[types.Type]bool)) }
-
-func hasTypeParamSeen(t types.Type, seen map[types.Type]bool) bool {
-	if t == nil {
-		return false
-	}
-	u := types.Unalias(t)
-	if seen[u] {
-		return false
-	}
-	seen[u] = true
-	switch v := u.(type) {
-	case *types.TypeParam:
-		return true
-	case *types.Map:
-		return hasTypeParamSeen(v.Key(), seen) || hasTypeParamSeen(v.Elem(), seen)
-	case elemCarrier:
-		return hasTypeParamSeen(v.Elem(), seen)
-	case *types.Named:
-		return v.TypeArgs() != nil && anyTypeIndex(v.TypeArgs().Len(), v.TypeArgs().At, seen)
-	case *types.Signature:
-		return v != nil && (tupleHasParam(v.Params(), seen) || tupleHasParam(v.Results(), seen))
-	case *types.Tuple:
-		return tupleHasParam(v, seen)
-	case *types.Struct:
-		return v != nil && anyTypeIndex(v.NumFields(), func(i int) types.Type { return v.Field(i).Type() }, seen)
-	case *types.Interface:
-		return v != nil && anyTypeIndex(v.NumMethods(), func(i int) types.Type { return v.Method(i).Type() }, seen)
-	default:
-		return false
-	}
-}
-
-func tupleHasParam(tup *types.Tuple, seen map[types.Type]bool) bool {
-	return tup != nil && anyTypeIndex(tup.Len(), func(i int) types.Type { return tup.At(i).Type() }, seen)
-}
-
-func anyTypeIndex(n int, at func(int) types.Type, seen map[types.Type]bool) bool {
-	for i := range n {
-		if hasTypeParamSeen(at(i), seen) {
-			return true
-		}
-	}
-	return false
 }

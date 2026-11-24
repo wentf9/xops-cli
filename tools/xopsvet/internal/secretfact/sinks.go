@@ -69,7 +69,7 @@ func classifyLogOrErrorSink(pkgPath, name string) SinkKind {
 			return SinkError
 		}
 	case "fmt":
-		if name == "Errorf" || hasAnyPrefix(name, "Print", "Fprint") {
+		if name == "Errorf" || hasAnyPrefix(name, "Print", "Fprint", "Sprint", "Append") {
 			return SinkError
 		}
 	}
@@ -98,7 +98,8 @@ func classifySerializeSink(pkgPath, name string) SinkKind {
 }
 
 func classifyEventAuditSink(pkgPath string, obj types.Object) SinkKind {
-	if pkgPath == eventsPkgPath || pkgPath == auditPkgPath {
+	if pkgPath == eventsPkgPath || strings.HasPrefix(pkgPath, eventsPkgPath+"/") ||
+		pkgPath == auditPkgPath || strings.HasPrefix(pkgPath, auditPkgPath+"/") {
 		return SinkEventAudit
 	}
 	if pkgPath != portsPkgPath {
@@ -121,7 +122,9 @@ func isMarshalOrEncodeSymbol(name string) bool {
 
 func isYAMLPackage(pkgPath string) bool {
 	return pkgPath == "yaml" || strings.HasSuffix(pkgPath, "/yaml") ||
-		strings.HasSuffix(pkgPath, "/yaml.v2") || strings.HasSuffix(pkgPath, "/yaml.v3")
+		strings.HasSuffix(pkgPath, "/yaml.v2") || strings.HasSuffix(pkgPath, "/yaml.v3") ||
+		strings.HasSuffix(pkgPath, "/yaml/v3") || strings.HasSuffix(pkgPath, "/yaml/v4") ||
+		strings.HasSuffix(pkgPath, "/go-yaml")
 }
 
 func hasAnyPrefix(s string, prefixes ...string) bool {

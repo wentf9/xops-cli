@@ -492,3 +492,90 @@ func assertNodeCycle(t *testing.T) {
 		t.Fatal("struct containing time.Duration should return true")
 	}
 }
+
+func TestHardeningV233Regressions(t *testing.T) {
+	fset := token.NewFileSet()
+	src := `package sample
+type SecretBox struct{}
+type Pair[A, B any] struct { Rev *Pair[B, A] }
+type Holder struct { P Pair[int, string] }
+type LeasePort[T any] interface { With(func(T) error) error }
+type Svc struct { Vault LeasePort[*SecretBox] }
+type GenericFn[T any] func(T)
+type FnHolder struct { F GenericFn[*SecretBox] }
+func indexCall(fns []func()) { fns[0]() }
+`
+	f, err := parser.ParseFile(fset, "sample.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+		Instances:  make(map[*ast.Ident]types.Instance),
+	}
+	pkg, err := (&types.Config{}).Check("example.com/sample", fset, []*ast.File{f}, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPolyAndValueLayout(t, pkg)
+	assertDirectivesAndIndexCall(t, f, info)
+}
+
+func assertPolyAndValueLayout(t *testing.T, pkg *types.Package) {
+	t.Helper()
+	if vetutil.TypeContainsNamed(pkg.Scope().Lookup("Holder").Type(), "example.com/sample", "SecretBox") ||
+		vetutil.ContainsValueNamed(pkg.Scope().Lookup("Holder").Type(), "example.com/sample", "SecretBox") {
+		t.Fatal("Holder(Pair[int,string]) must not match SecretBox")
+	}
+	polyPkg := types.NewPackage("example.com/poly", "poly")
+	tParam := types.NewTypeParam(types.NewTypeName(token.NoPos, polyPkg, "T", nil), types.Universe.Lookup("any").Type())
+	polyNamed := types.NewNamed(types.NewTypeName(token.NoPos, polyPkg, "Poly", nil), nil, nil)
+	polyNamed.SetTypeParams([]*types.TypeParam{tParam})
+	polySliceT, err := types.Instantiate(nil, polyNamed, []types.Type{types.NewSlice(tParam)}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	polyNamed.SetUnderlying(types.NewStruct([]*types.Var{
+		types.NewField(token.NoPos, polyPkg, "Next", types.NewPointer(polySliceT), false),
+	}, nil))
+	polyInt, err := types.Instantiate(nil, polyNamed, []types.Type{types.Typ[types.Int]}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vetutil.TypeContainsNamed(polyInt, "example.com/sample", "SecretBox") ||
+		vetutil.ContainsValueNamed(polyInt, "example.com/sample", "SecretBox") {
+		t.Fatal("polymorphic recursive Poly[int] must terminate cleanly")
+	}
+	if vetutil.ContainsValueNamed(pkg.Scope().Lookup("Svc").Type(), "example.com/sample", "SecretBox") ||
+		vetutil.ContainsValueNamed(pkg.Scope().Lookup("FnHolder").Type(), "example.com/sample", "SecretBox") {
+		t.Fatal("ContainsValueType must not match generic interface/func type arg")
+	}
+}
+
+func assertDirectivesAndIndexCall(t *testing.T, f *ast.File, info *types.Info) {
+	t.Helper()
+	extTestPkg := types.NewPackage("github.com/wentf9/xops-cli/core/domain/secret_test", "secret_test")
+	fakeObj := types.NewTypeName(token.NoPos, extTestPkg, "SecretBox", nil)
+	if vetutil.ObjectPkgPath(fakeObj) != "github.com/wentf9/xops-cli/core/domain/secret_test" {
+		t.Fatalf("ObjectPkgPath stripped _test suffix: %q", vetutil.ObjectPkgPath(fakeObj))
+	}
+	for _, txt := range []string{"//nolint//reason", "/* //nolint:errcheck */", "/** nolint */"} {
+		if !vetutil.HasNolintComment(&ast.Comment{Text: txt}) {
+			t.Fatalf("expected HasNolintComment=true for %q", txt)
+		}
+	}
+	if vetutil.HasDirective(&ast.CommentGroup{List: []*ast.Comment{{Text: "// xops:syncclosure is NOT safe"}}}, vetutil.DirectiveSyncClosure) {
+		t.Fatal("prose comment with space after // must not activate //xops:syncclosure")
+	}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			if obj := vetutil.ResolveCalledObject(info, call); obj != nil {
+				t.Fatalf("expected nil called object for fns[0](), got %v", obj)
+			}
+		}
+		return true
+	})
+}

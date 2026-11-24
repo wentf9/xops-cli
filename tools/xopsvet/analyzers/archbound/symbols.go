@@ -27,9 +27,20 @@ func checkSymbolBoundaries(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 func checkDomainTimeSymbols(pass *analysis.Pass) {
 	var diags []vetutil.Diag
 	for ident, obj := range pass.TypesInfo.Uses {
+		if fn, isFn := obj.(*types.Func); isFn {
+			if sig, ok := fn.Type().(*types.Signature); ok && sig.Recv() != nil {
+				continue
+			}
+		}
 		if ident != nil && ident.Pos().IsValid() &&
-			vetutil.IsPkgSymbol(obj, "time", "Now", "Since", "Until", "NewTimer", "NewTicker", "After", "Sleep", "AfterFunc", "Tick") {
+			vetutil.IsPkgSymbol(obj, "time", "Now", "Since", "Until", "NewTimer", "NewTicker", "After", "Sleep", "AfterFunc", "Tick", "LoadLocation", "Local") {
 			diags = append(diags, vetutil.Diag{Pos: ident.Pos(), End: ident.End(), Msg: "archbound: core/domain/** 禁止使用非确定性时钟或定时符号 time." + obj.Name()})
+		}
+	}
+	for selExpr, sel := range pass.TypesInfo.Selections {
+		if selExpr != nil && sel != nil && sel.Obj() != nil && sel.Obj().Name() == "Local" &&
+			vetutil.ContainsValueNamed(sel.Recv(), "time", "Time") {
+			diags = append(diags, vetutil.Diag{Pos: selExpr.Sel.Pos(), End: selExpr.Sel.End(), Msg: "archbound: core/domain/** 禁止使用非确定性本地时区方法 (time.Time).Local"})
 		}
 	}
 	vetutil.ReportSortedDedup(pass, diags, false)
@@ -67,7 +78,10 @@ func collectMCPOpFSUsesDefs(info *types.Info, hasOpFS func(types.Type) bool, add
 
 func collectMCPOpFSSelectionsTypes(info *types.Info, hasOpFS func(types.Type) bool, addDiag func(token.Pos, token.Pos)) {
 	for selExpr, sel := range info.Selections {
-		if selExpr != nil && sel != nil && (hasOpFS(sel.Recv()) || (sel.Obj() != nil && hasOpFS(sel.Obj().Type()))) {
+		if selExpr == nil || sel == nil {
+			continue
+		}
+		if hasOpFS(sel.Recv()) || (sel.Obj() != nil && (hasOpFS(sel.Obj().Type()) || funcRecvHasOpFS(sel.Obj(), hasOpFS))) {
 			addDiag(selExpr.Sel.Pos(), selExpr.Sel.End())
 		}
 	}
@@ -76,4 +90,13 @@ func collectMCPOpFSSelectionsTypes(info *types.Info, hasOpFS func(types.Type) bo
 			addDiag(expr.Pos(), expr.End())
 		}
 	}
+}
+
+func funcRecvHasOpFS(obj types.Object, hasOpFS func(types.Type) bool) bool {
+	fn, ok := obj.(*types.Func)
+	if !ok || fn == nil {
+		return false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	return ok && sig.Recv() != nil && hasOpFS(sig.Recv().Type())
 }

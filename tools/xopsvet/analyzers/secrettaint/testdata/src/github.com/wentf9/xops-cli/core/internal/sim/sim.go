@@ -1,15 +1,24 @@
 package sim
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"log/slog"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
 
-func okSimSeal(box *secret.SecretBox, aead cipher.AEAD, nonce []byte) ([]byte, error) {
+func okSimSeal(box *secret.SecretBox, key, nonce []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
 	var ct []byte
-	err := box.Use(func(plain []byte) error {
+	err = box.Use(func(plain []byte) error {
 		ct = aead.Seal(nil, nonce, plain, nil)
 		return nil
 	})

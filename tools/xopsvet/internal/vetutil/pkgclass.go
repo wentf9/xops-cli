@@ -72,11 +72,34 @@ func NormalizePkgPath(pkgPath string) (base string, isExtTest bool) {
 // ClassifyPackage 将任意 Go 导入路径或包路径分类为 XOps v2 架构层级。
 func ClassifyPackage(pkgPath string) PkgInfo {
 	base, isExtTest := NormalizePkgPath(pkgPath)
+	return classifyWithExt(pkgPath, base, isExtTest)
+}
+
+// ClassifyPass 结合编译单元文件集合分类当前分析包：仅当所有源码均为 *_test.go 时才认定为外置 _test 包，
+// 防止名为 *_test 的普通生产子目录绕过架构与安全护栏（H5）。
+func ClassifyPass(pass *analysis.Pass) PkgInfo {
+	if pass == nil || pass.Pkg == nil {
+		return PkgInfo{}
+	}
+	info := ClassifyPackage(pass.Pkg.Path())
+	if !info.IsExternalTest || len(pass.Files) == 0 {
+		return info
+	}
+	for _, f := range pass.Files {
+		if !IsTestFile(pass, f) {
+			raw, _, _ := strings.Cut(pass.Pkg.Path(), " [")
+			return classifyWithExt(pass.Pkg.Path(), raw, false)
+		}
+	}
+	return info
+}
+
+func classifyWithExt(rawPath, base string, isExtTest bool) PkgInfo {
 	if base != ModulePrefix && !strings.HasPrefix(base, ModulePrefix+"/") {
-		return PkgInfo{RawPath: pkgPath, BasePath: base, Layer: LayerUnknown, IsExternalTest: isExtTest}
+		return PkgInfo{RawPath: rawPath, BasePath: base, Layer: LayerUnknown, IsExternalTest: isExtTest}
 	}
 	rel := strings.TrimPrefix(strings.TrimPrefix(base, ModulePrefix), "/")
-	return PkgInfo{RawPath: pkgPath, BasePath: base, Layer: classifyRelPath(rel), IsExternalTest: isExtTest, IsXops: true}
+	return PkgInfo{RawPath: rawPath, BasePath: base, Layer: classifyRelPath(rel), IsExternalTest: isExtTest, IsXops: true}
 }
 
 func classifyRelPath(rel string) Layer {
@@ -156,7 +179,7 @@ func AllowSecretPlaintext(info PkgInfo) bool {
 		info.Layer == LayerCoreSim || (info.Layer == LayerCoreDomain && matchPkgPrefix(info.BasePath, ModulePrefix+"/core/domain/secret"))
 }
 
-// AllowNolint 判断包是否位于 RFC v2.3.3 §5 规定的 8 个生产特权白名单包集合内（sim/cmd/actor 及所有测试均禁止）。
+// AllowNolint 判断包层级是否位于 8 个生产特权白名单包集合内（外置 _test 禁止；单文件白盒测试由 AllowNolintInFile 进一步封禁）。
 func AllowNolint(info PkgInfo) bool {
 	if info.IsExternalTest {
 		return false

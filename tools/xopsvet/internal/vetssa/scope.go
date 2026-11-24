@@ -2,6 +2,8 @@ package vetssa
 
 import (
 	"go/token"
+	"go/types"
+	"slices"
 
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
@@ -10,8 +12,8 @@ import (
 // ScopeRange 表示借用/明文污点值的合法生存期源码区间 [Start, End]，多来源合并始终收紧至交集。
 type ScopeRange struct{ Start, End token.Pos }
 
-// Valid 判断作用域区间是否有效。
-func (s ScopeRange) Valid() bool { return s.Start.IsValid() && s.End.IsValid() }
+// Valid 判断作用域区间是否有效且非空。
+func (s ScopeRange) Valid() bool { return s.Start.IsValid() && s.End.IsValid() && s.Start <= s.End }
 
 // TightenScope 返回两个作用域区间的最紧交集区间。
 func TightenScope(a, b ScopeRange) ScopeRange {
@@ -33,12 +35,14 @@ func ScopeRangeOfFunc(fn *ssa.Function) ScopeRange {
 	return ScopeRange{Start: s, End: e}
 }
 
-// UnaryFlowOperand 提取单操作数流传播指令的源 SSA 值（统一服务 osboundary / secretbox / secrettaint / linearlease）。
+// UnaryFlowOperand 提取单操作数流传播指令的源 SSA 值（含 SliceToArrayPointer 与一元位/算术运算，C3）。
 func UnaryFlowOperand(inst ssa.Instruction, includeRecvArrow bool) (ssa.Value, bool) {
 	switch ins := inst.(type) {
 	case *ssa.UnOp:
-		return ins.X, ins.Op == token.MUL || (includeRecvArrow && ins.Op == token.ARROW)
+		return ins.X, ins.Op == token.MUL || ins.Op == token.XOR || ins.Op == token.SUB || ins.Op == token.NOT || (includeRecvArrow && ins.Op == token.ARROW)
 	case *ssa.Slice:
+		return ins.X, true
+	case *ssa.SliceToArrayPointer:
 		return ins.X, true
 	case *ssa.Index:
 		return ins.X, true
@@ -117,7 +121,7 @@ func CollectCaptured(mc *ssa.MakeClosure, target *ssa.Function, outer map[ssa.Va
 	return out
 }
 
-// MarkRootsBackward 沿底层存储链反向标记局部根分配对象（HIGH-1 陷阱 4），不反染 *ssa.Global。
+// MarkRootsBackward 沿底层存储链反向标记局部根分配对象，并回传至直接父闭包的绑定槽位（C5）。
 func MarkRootsBackward(dst ssa.Value, sc ScopeRange, local, outerShared map[ssa.Value]ScopeRange) bool {
 	changed := false
 	for _, root := range RootStorageValues(dst, true) {
@@ -126,18 +130,43 @@ func MarkRootsBackward(dst ssa.Value, sc ScopeRange, local, outerShared map[ssa.
 		}
 		changed = MarkValueScope(local, root, sc) || changed
 		if fv, ok := root.(*ssa.FreeVar); ok && outerShared != nil {
-			for _, orig := range TraceFreeVarOrigins(fv) {
-				if _, isGlobal := orig.(*ssa.Global); !isGlobal {
-					MarkValueScope(outerShared, orig, sc)
-				}
-			}
+			markImmediateFreeVarBindings(fv, sc, outerShared)
 		}
 	}
 	return changed
 }
 
-// PropagateBuiltinCopyAppend 统一处理内置 copy 与 append 的 SSA 前向/后向污点与借用传播。
+// FlushFreeVarsToOuter 将当前闭包中已标记的 FreeVar 逐层回冲至直接父闭包，闭合 2 层以上嵌套同步闭包回写（C5）。
+func FlushFreeVarsToOuter(fn *ssa.Function, local, outerShared map[ssa.Value]ScopeRange) {
+	if fn == nil || outerShared == nil {
+		return
+	}
+	for _, fv := range fn.FreeVars {
+		if sc, ok := local[fv]; ok {
+			markImmediateFreeVarBindings(fv, sc, outerShared)
+		}
+	}
+}
+
+func markImmediateFreeVarBindings(fv *ssa.FreeVar, sc ScopeRange, outerShared map[ssa.Value]ScopeRange) {
+	fn := fv.Parent()
+	if fn == nil || fn.Parent() == nil {
+		return
+	}
+	if fvIdx := slices.Index(fn.FreeVars, fv); fvIdx >= 0 {
+		ForEachInst(fn.Parent(), func(inst ssa.Instruction) {
+			if mc, ok := inst.(*ssa.MakeClosure); ok && mc.Fn == fn && fvIdx < len(mc.Bindings) {
+				MarkRootsBackward(mc.Bindings[fvIdx], sc, outerShared, nil)
+			}
+		})
+	}
+}
+
+// PropagateBuiltinCopyAppend 统一处理内置 copy 与 append 的 SSA 传播（修复 C2 必反染非 nil 切片）。
 func PropagateBuiltinCopyAppend(call *ssa.Call, rc ResolvedCall, local, outerShared map[ssa.Value]ScopeRange) bool {
+	if rc.Builtin == nil {
+		return false
+	}
 	switch rc.Builtin.Name() {
 	case "copy":
 		if len(rc.UserArgs) >= 2 {
@@ -148,7 +177,7 @@ func PropagateBuiltinCopyAppend(call *ssa.Call, rc ResolvedCall, local, outerSha
 	case "append":
 		if sc, ok := CombinedScope(local, rc.UserArgs...); ok {
 			changed := MarkValueScope(local, call, sc)
-			if len(rc.UserArgs) > 0 && !IsFreshLocalSlice(rc.UserArgs[0]) && !IsNilConst(rc.UserArgs[0]) {
+			if len(rc.UserArgs) > 0 && !IsNilConst(rc.UserArgs[0]) {
 				changed = MarkRootsBackward(rc.UserArgs[0], sc, local, outerShared) || changed
 			}
 			return changed
@@ -157,56 +186,153 @@ func PropagateBuiltinCopyAppend(call *ssa.Call, rc ResolvedCall, local, outerSha
 	return false
 }
 
-// CheckStdlibYieldClosure 统一判定 range-over-func yield 闭包是否来自标准库同步迭代器（HIGH-1 陷阱 3）。
-func CheckStdlibYieldClosure(
-	s *buildssa.SSA, parentFn, yieldFn *ssa.Function, parentScope ScopeRange, parentTaint map[ssa.Value]ScopeRange,
-) (ssa.CallInstruction, map[int]bool, ScopeRange, bool) {
-	callInst, _, rc := FindYieldCall(s, parentFn, yieldFn)
-	if callInst == nil || rc.Common == nil {
-		return nil, nil, ScopeRange{}, true
+// SeedAllParamIndices 返回函数全部形参索引集合，供同步迭代器回调参数入种使用。
+func SeedAllParamIndices(fn *ssa.Function) map[int]bool {
+	seeds := make(map[int]bool, len(fn.Params))
+	for i := range fn.Params {
+		seeds[i] = true
 	}
-	iterCall, isCall := rc.Common.Value.(*ssa.Call)
-	if !isCall || !IsStdlibSyncIter(ResolveCall(s, iterCall).FuncObj) {
-		return callInst, nil, ScopeRange{}, false
-	}
-	yieldScope := parentScope
-	var seeds map[int]bool
-	if iterSc, ok := parentTaint[iterCall]; ok {
-		yieldScope = TightenScope(yieldScope, iterSc)
-		seeds = make(map[int]bool, len(yieldFn.Params))
-		for i := range yieldFn.Params {
-			seeds[i] = true
-		}
-	}
-	return callInst, seeds, yieldScope, true
+	return seeds
 }
 
-// AllRootsOwnedInScope 校验写入目标 addr 对应的全部根存储对象均属于合法作用域 sc 且不含 callerParams（C4）。
-func AllRootsOwnedInScope(addr ssa.Value, sc ScopeRange, callerParams map[ssa.Value]bool) bool {
-	roots := RootStorageValues(addr, true)
-	if len(roots) == 0 {
-		return false
+// CheckStdlibYieldClosure 统一判定 range-over-func yield 闭包是否来自标准库同步迭代器（H8/ST-6/LL-4）。
+func CheckStdlibYieldClosure(s *buildssa.SSA, parentFn, yieldFn *ssa.Function, parentScope ScopeRange, parentTaint map[ssa.Value]ScopeRange) (ssa.CallInstruction, map[int]bool, ScopeRange, bool) {
+	callInst, _, rc := FindYieldCall(s, parentFn, yieldFn)
+	if callInst == nil || rc.Common == nil {
+		return nil, nil, ScopeRange{}, false
 	}
-	for _, root := range roots {
-		if root == nil || callerParams[root] || !isRootOwned(root, sc) {
-			return false
+	iterCalls, allStd := ResolveStdlibIterCalls(s, rc.Common.Value)
+	if !allStd {
+		return callInst, nil, ScopeRange{}, false
+	}
+	yieldScope, hasSeed := parentScope, false
+	for _, ic := range iterCalls {
+		if iterSc, ok := parentTaint[ic]; ok {
+			yieldScope, hasSeed = TightenScope(yieldScope, iterSc), true
+		} else if argSc, ok := CombinedScope(parentTaint, ResolveCall(s, ic).UserArgs...); ok {
+			yieldScope, hasSeed = TightenScope(yieldScope, argSc), true
 		}
 	}
-	return true
+	if hasSeed {
+		return callInst, SeedAllParamIndices(yieldFn), yieldScope, true
+	}
+	return callInst, nil, yieldScope, true
+}
+
+// IsIterSeqSignature 判断类型是否为 iter.Seq / iter.Seq2 形态（func(yield func(...) bool)）。
+func IsIterSeqSignature(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	sig, ok := types.Unalias(t).Underlying().(*types.Signature)
+	if !ok || sig.Params() == nil || sig.Params().Len() != 1 || (sig.Results() != nil && sig.Results().Len() != 0) {
+		return false
+	}
+	ySig, ok := types.Unalias(sig.Params().At(0).Type()).Underlying().(*types.Signature)
+	if !ok || ySig.Results() == nil || ySig.Results().Len() != 1 {
+		return false
+	}
+	b, ok := types.Unalias(ySig.Results().At(0).Type()).Underlying().(*types.Basic)
+	return ok && b.Kind() == types.Bool
+}
+
+// IterCallbackTarget 描述直接调用 iter.Seq(cb) 解析出的单个回调函数目标（支持捕获闭包与零捕获函数）。
+type IterCallbackTarget struct {
+	Fn *ssa.Function
+	MC *ssa.MakeClosure
+}
+
+// ResolveDirectStdlibIterCallback 统一解析直接调用标准库 iter.Seq(cb) 的所有回调目标（供 secrettaint/linearlease 共享）。
+func ResolveDirectStdlibIterCallback(s *buildssa.SSA, rc ResolvedCall, scoped map[ssa.Value]ScopeRange) ([]IterCallbackTarget, ScopeRange, bool) {
+	if rc.Common == nil || rc.Common.IsInvoke() || len(rc.UserArgs) != 1 || !scoped[rc.Common.Value].Valid() || !IsIterSeqSignature(rc.Common.Value.Type()) {
+		return nil, ScopeRange{}, false
+	}
+	if _, allStd := ResolveStdlibIterCalls(s, rc.Common.Value); !allStd {
+		return nil, ScopeRange{}, false
+	}
+	targets, allKnown := ResolveFuncValues(rc.UserArgs[0])
+	if !allKnown || len(targets) == 0 {
+		return nil, ScopeRange{}, false
+	}
+	out := make([]IterCallbackTarget, 0, len(targets))
+	for _, tgt := range targets {
+		item, ok := iterCallbackTargetFromValue(tgt)
+		if !ok {
+			return nil, ScopeRange{}, false
+		}
+		out = append(out, item)
+	}
+	return out, scoped[rc.Common.Value], true
+}
+
+func iterCallbackTargetFromValue(tgt ssa.Value) (IterCallbackTarget, bool) {
+	switch t := tgt.(type) {
+	case *ssa.MakeClosure:
+		fn, ok := t.Fn.(*ssa.Function)
+		return IterCallbackTarget{Fn: fn, MC: t}, ok && fn != nil && len(fn.Blocks) > 0 && !IsBoundWrapper(fn)
+	case *ssa.Function:
+		return IterCallbackTarget{Fn: t}, len(t.Blocks) > 0 && !IsBoundWrapper(t)
+	default:
+		return IterCallbackTarget{}, false
+	}
+}
+
+// ResolveStdlibIterCalls 追溯 iter.Seq 值的全部来源调用，全分支皆标准库同步迭代器时返回 true。
+func ResolveStdlibIterCalls(s *buildssa.SSA, v ssa.Value) ([]*ssa.Call, bool) {
+	var calls []*ssa.Call
+	ok := collectStdlibIterCalls(s, v, make(map[ssa.Value]bool), &calls)
+	return calls, ok && len(calls) > 0
+}
+
+func collectStdlibIterCalls(s *buildssa.SSA, v ssa.Value, seen map[ssa.Value]bool, out *[]*ssa.Call) bool {
+	if v == nil {
+		return false
+	}
+	if seen[v] {
+		return true
+	}
+	seen[v] = true
+	if inner, ok := unwrapFuncWrapper(v); ok {
+		return collectStdlibIterCalls(s, inner, seen, out)
+	}
+	switch val := v.(type) {
+	case *ssa.Call:
+		if !IsStdlibSyncIter(ResolveCall(s, val).FuncObj) {
+			return false
+		}
+		*out = append(*out, val)
+		return true
+	case *ssa.Phi:
+		return len(val.Edges) > 0 && !slices.ContainsFunc(val.Edges, func(e ssa.Value) bool {
+			return !IsNilConst(e) && !collectStdlibIterCalls(s, e, seen, out)
+		})
+	case *ssa.UnOp:
+		alloc, ok := val.X.(*ssa.Alloc)
+		if val.Op != token.MUL || !ok {
+			return false
+		}
+		vals, found, safe := scanCellStores(alloc, nil)
+		return safe && found && !slices.ContainsFunc(vals, func(sv ssa.Value) bool { return !collectStdlibIterCalls(s, sv, seen, out) })
+	default:
+		return false
+	}
+}
+
+// AllRootsOwnedInScope 校验写入目标 addr 对应的全部真实底层存储根均属于合法作用域 sc 且不含 callerParams（C1/M5）。
+func AllRootsOwnedInScope(addr ssa.Value, sc ScopeRange, callerParams map[ssa.Value]bool) bool {
+	roots, allKnown := WriteTargetRoots(addr, true)
+	if !allKnown || len(roots) == 0 {
+		return false
+	}
+	return !slices.ContainsFunc(roots, func(root ssa.Value) bool {
+		return root == nil || callerParams[root] || !isRootOwned(root, sc)
+	})
 }
 
 func isRootOwned(root ssa.Value, sc ScopeRange) bool {
 	if fv, ok := root.(*ssa.FreeVar); ok {
 		origins := TraceFreeVarOrigins(fv)
-		if len(origins) == 0 {
-			return false
-		}
-		for _, orig := range origins {
-			if !IsValueOwnedInScope(orig, sc.Start, sc.End) {
-				return false
-			}
-		}
-		return true
+		return len(origins) > 0 && !slices.ContainsFunc(origins, func(o ssa.Value) bool { return !IsValueOwnedInScope(o, sc.Start, sc.End) })
 	}
 	return IsValueOwnedInScope(root, sc.Start, sc.End)
 }
@@ -259,9 +385,22 @@ func IsBoundMethodVal(mc *ssa.MakeClosure) bool {
 }
 
 // IsNilConst 判断 SSA 值是否为类型化 nil 常量。
-func IsNilConst(v ssa.Value) bool {
-	c, ok := v.(*ssa.Const)
-	return ok && c.IsNil()
+func IsNilConst(v ssa.Value) bool { c, ok := v.(*ssa.Const); return ok && c.IsNil() }
+
+// UnwrapDirectParam 剥离同构/类型转换并提取底层 *ssa.Parameter（供回调透传豁免复用）。
+func UnwrapDirectParam(v ssa.Value) *ssa.Parameter {
+	for {
+		switch val := v.(type) {
+		case *ssa.Parameter:
+			return val
+		case *ssa.ChangeType:
+			v = val.X
+		case *ssa.Convert:
+			v = val.X
+		default:
+			return nil
+		}
+	}
 }
 
 // UnwrapInterface 剥离 SSA 值外层的接口装箱与同构类型转换指令。

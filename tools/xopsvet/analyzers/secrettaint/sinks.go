@@ -1,6 +1,7 @@
 package secrettaint
 
 import (
+	"go/token"
 	"go/types"
 	"slices"
 	"strings"
@@ -16,7 +17,6 @@ const (
 	slotAllArgs = -2
 )
 
-// writeToDstSpec 统一描述「将源操作数明文写入显式目标操作数」的受控操作槽位映射（消除重复规则表）。
 func writeToDstSpec(fn *types.Func) (srcSlot, dstSlot int, ok bool) {
 	if fn == nil {
 		return 0, 0, false
@@ -36,27 +36,22 @@ func writeToDstSpec(fn *types.Func) (srcSlot, dstSlot int, ok bool) {
 	}
 }
 
-// writeToDstCallTaint 判定调用是否属于写入显式目标的受控操作并返回源操作数的最紧作用域。
 func (ts *taintScope) writeToDstCallTaint(rc vetssa.ResolvedCall) (vetssa.ScopeRange, bool) {
 	srcSlot, _, ok := writeToDstSpec(rc.FuncObj)
 	if !ok {
 		return vetssa.ScopeRange{}, false
 	}
-	switch srcSlot {
-	case slotAllArgs:
+	switch {
+	case srcSlot == slotAllArgs:
 		return vetssa.CombinedScope(ts.tainted, rc.UserArgs...)
-	case slotRecv:
-		if rc.Recv == nil {
-			return vetssa.ScopeRange{}, false
-		}
+	case srcSlot == slotRecv:
 		sc, hit := ts.tainted[rc.Recv]
-		return sc, hit
-	default:
-		if len(rc.UserArgs) <= srcSlot {
-			return vetssa.ScopeRange{}, false
-		}
+		return sc, rc.Recv != nil && hit
+	case len(rc.UserArgs) > srcSlot:
 		sc, hit := ts.tainted[rc.UserArgs[srcSlot]]
 		return sc, hit
+	default:
+		return vetssa.ScopeRange{}, false
 	}
 }
 
@@ -74,9 +69,9 @@ func writeToDstTargets(rc vetssa.ResolvedCall) []ssa.Value {
 	return nil
 }
 
-// isSafePredicate 放行仅返回布尔/整型且绝不泄密的纯谓词函数。
+// isSafePredicate 放行无用户回调的纯谓词与 runtime.KeepAlive（ST-9 / ST-12）。
 func isSafePredicate(fn *types.Func) bool {
-	if fn == nil {
+	if fn == nil || strings.HasSuffix(fn.Name(), "Func") || strings.HasSuffix(fn.Name(), "FuncSeq") {
 		return false
 	}
 	pkgPath, name := vetutil.ObjectPkgPath(fn), fn.Name()
@@ -89,14 +84,16 @@ func isSafePredicate(fn *types.Func) bool {
 		return slices.Contains([]string{"ConstantTimeCompare", "ConstantTimeByteEq", "ConstantTimeEq"}, name)
 	case "unicode/utf8":
 		return slices.Contains([]string{"Valid", "ValidString", "RuneCount", "RuneCountInString"}, name)
+	case "runtime":
+		return name == "KeepAlive"
 	default:
 		return false
 	}
 }
 
-// isTaintPreservingTransform 放行局部变换与 KDF/PEM 派生函数（返回值保持污点并受零逃逸约束）。
+// isTaintPreservingTransform 放行无用户回调的局部变换、UTF-16 转换及 KDF/PEM 派生函数（ST-4 / ST-9 / ST-12）。
 func isTaintPreservingTransform(fn *types.Func) bool {
-	if fn == nil {
+	if fn == nil || strings.HasSuffix(fn.Name(), "Func") || strings.HasSuffix(fn.Name(), "FuncSeq") {
 		return false
 	}
 	pkgPath, name := vetutil.ObjectPkgPath(fn), fn.Name()
@@ -109,31 +106,93 @@ func isTaintPreservingTransform(fn *types.Func) bool {
 			hasAnyPrefix(name, "Trim", "ToLower", "ToUpper", "Replace", "Split", "Cut", "Fields")
 	case "slices":
 		return slices.Contains([]string{"Clone", "Concat", "Repeat", "All", "Values", "Backward", "Chunk"}, name)
-	case "fmt":
-		return slices.Contains([]string{"Sprint", "Sprintf", "Sprintln"}, name)
+	case "maps":
+		return slices.Contains([]string{"All", "Keys", "Values"}, name)
 	case "io":
 		return name == "ReadAll"
 	case "strconv":
-		return true
+		return !strings.HasPrefix(name, "Append")
 	case "encoding/base64", "encoding/hex":
-		return slices.Contains([]string{"EncodeToString", "AppendEncode", "DecodeString", "AppendDecode"}, name)
-	case "golang.org/x/crypto/argon2":
-		return name == "IDKey" || name == "Key"
-	case "crypto/pbkdf2", "golang.org/x/crypto/scrypt":
-		return name == "Key"
-	case "crypto/hkdf":
-		return slices.Contains([]string{"Extract", "Expand", "Key"}, name)
-	case "encoding/pem":
-		return name == "Decode"
-	case "crypto/x509":
-		return name == "DecryptPEMBlock"
+		return name == "EncodeToString" || name == "DecodeString"
+	case "golang.org/x/sys/windows":
+		return name == "UTF16FromString" || name == "UTF16PtrFromString"
+	default:
+		return vetutil.IsPkgSymbol(fn, "unicode/utf16", "Encode") ||
+			vetutil.IsPkgSymbol(fn, "encoding/pem", "Decode") ||
+			vetutil.IsPkgSymbol(fn, "crypto/x509", "DecryptPEMBlock") ||
+			vetutil.IsPkgSymbol(fn, "golang.org/x/crypto/argon2", "IDKey", "Key") ||
+			vetutil.IsPkgSymbol(fn, "crypto/pbkdf2", "Key") ||
+			vetutil.IsPkgSymbol(fn, "golang.org/x/crypto/scrypt", "Key") ||
+			vetutil.IsPkgSymbol(fn, "crypto/hkdf", "Extract", "Expand", "Key")
+	}
+}
+
+func isAppendToDstFunc(fn *types.Func) bool {
+	if fn == nil {
+		return false
+	}
+	switch vetutil.ObjectPkgPath(fn) {
+	case "fmt":
+		return slices.Contains([]string{"Append", "Appendf", "Appendln"}, fn.Name())
+	case "strconv":
+		return strings.HasPrefix(fn.Name(), "Append")
+	case "encoding/base64", "encoding/hex":
+		return fn.Name() == "AppendEncode" || fn.Name() == "AppendDecode"
 	default:
 		return false
 	}
 }
 
-// isExactCryptoSanitizer 实施精确符号级密码学净化消费器白名单（CRIT-4B + 评审 #12）。
-func isExactCryptoSanitizer(rc vetssa.ResolvedCall) bool {
+func isFmtSprintFunc(fn *types.Func) bool {
+	return vetutil.IsPkgSymbol(fn, "fmt", "Sprint", "Sprintf", "Sprintln")
+}
+
+func (ts *taintScope) allFmtArgsSafe(args []ssa.Value) bool {
+	for _, arg := range args {
+		if varElems := vetssa.ExtractVarargsElements(arg); len(varElems) > 0 {
+			if !ts.allFmtArgsSafe(varElems) {
+				return false
+			}
+			continue
+		}
+		if _, tainted := ts.tainted[arg]; tainted && !isSafeFmtValueType(concreteFmtArgType(arg)) {
+			return false
+		}
+	}
+	return true
+}
+
+// concreteFmtArgType 仅剥离接口装箱（MakeInterface/ChangeInterface），保留 ChangeType 构造的命名类型（ST-13）。
+func concreteFmtArgType(v ssa.Value) types.Type {
+	for v != nil {
+		if mi, ok := v.(*ssa.MakeInterface); ok {
+			v = mi.X
+		} else if ci, ok := v.(*ssa.ChangeInterface); ok {
+			v = ci.X
+		} else {
+			return v.Type()
+		}
+	}
+	return nil
+}
+
+func isSafeFmtValueType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	switch u := types.Unalias(t).(type) {
+	case *types.Basic:
+		return true
+	case *types.Slice:
+		b, ok := types.Unalias(u.Elem()).(*types.Basic)
+		return ok && (b.Kind() == types.Byte || b.Kind() == types.Uint8 || b.Kind() == types.Rune)
+	default:
+		return false
+	}
+}
+
+// isExactCryptoSanitizer 实施精确符号级密码学净化消费器白名单（含 AEAD.Seal 与 hmac.New 源头验证，ST-5/ST-16）。
+func (ts *taintScope) isExactCryptoSanitizer(rc vetssa.ResolvedCall, inSc vetssa.ScopeRange) bool {
 	fn := rc.FuncObj
 	if fn == nil {
 		return false
@@ -145,7 +204,7 @@ func isExactCryptoSanitizer(rc vetssa.ResolvedCall) bool {
 	case "crypto/sha512":
 		return slices.Contains([]string{"Sum512", "Sum384", "Sum512_224", "Sum512_256", "New", "New384", "New512_224", "New512_256"}, name)
 	case "crypto/hmac":
-		return name == "New"
+		return name == "New" && len(rc.UserArgs) >= 1 && tracesOnlyToStdlibHashFuncVal(rc.UserArgs[0])
 	case "golang.org/x/crypto/chacha20poly1305":
 		return name == "New" || name == "NewX"
 	case "crypto/aes":
@@ -155,32 +214,68 @@ func isExactCryptoSanitizer(rc vetssa.ResolvedCall) bool {
 			return true
 		}
 		named, ok := secretfact.RecvNamedType(fn)
-		return name == "Seal" && ok && vetutil.IsPkgSymbol(named.Obj(), "crypto/cipher", "AEAD")
+		return name == "Seal" && ok && vetutil.IsPkgSymbol(named.Obj(), "crypto/cipher", "AEAD") && ts.isSafeAEADSeal(rc, inSc)
 	case sshCryptoPkgPath:
 		return slices.Contains([]string{"Password", "ParsePrivateKey", "ParsePrivateKeyWithPassphrase"}, name)
 	default:
-		return name == "Write" && rc.Recv != nil && tracesOnlyToStdlibHashCtor(rc.Recv, make(map[ssa.Value]bool))
+		return name == "Write" && rc.Recv != nil && tracesOnlyToStdlibCtor(rc.Recv, isStdlibHashCtor, map[ssa.Value]bool{})
 	}
 }
 
-// tracesOnlyToStdlibHashCtor 严格追溯 Write 接收者是否仅源自标准库 crypto/{sha256,sha512,hmac}.New*。
-func tracesOnlyToStdlibHashCtor(v ssa.Value, seen map[ssa.Value]bool) bool {
+func (ts *taintScope) isSafeAEADSeal(rc vetssa.ResolvedCall, inSc vetssa.ScopeRange) bool {
+	if rc.Recv == nil || len(rc.UserArgs) < 1 || !tracesOnlyToStdlibCtor(rc.Recv, isStdlibAEADCtor, map[ssa.Value]bool{}) {
+		return false
+	}
+	dst := rc.UserArgs[0]
+	_, dstTainted := ts.tainted[dst]
+	return !dstTainted && (vetssa.IsNilConst(dst) || vetssa.IsAllowedSliceWriteDst(dst, inSc, ts.callerParams))
+}
+
+func isStdlibAEADCtor(obj *types.Func) bool {
+	return vetutil.IsPkgSymbol(obj, "crypto/cipher", "NewGCM", "NewGCMWithNonceSize", "NewGCMWithTagSize") ||
+		vetutil.IsPkgSymbol(obj, "golang.org/x/crypto/chacha20poly1305", "New", "NewX")
+}
+
+func isStdlibHashCtor(obj *types.Func) bool {
+	return vetutil.IsPkgSymbol(obj, "crypto/sha256", "New", "New224") ||
+		vetutil.IsPkgSymbol(obj, "crypto/sha512", "New", "New384", "New512_224", "New512_256") ||
+		vetutil.IsPkgSymbol(obj, "crypto/hmac", "New")
+}
+
+// tracesOnlyToStdlibCtor 统一沿 Extract/Phi/FreeVar/Alloc/UnOp 追溯接收者是否全部源于标准库构造器。
+func tracesOnlyToStdlibCtor(v ssa.Value, match func(*types.Func) bool, seen map[ssa.Value]bool) bool {
 	v = vetssa.UnwrapInterface(v)
 	if v == nil || seen[v] {
 		return false
 	}
 	seen[v] = true
 	switch val := v.(type) {
+	case *ssa.Extract:
+		return val.Index == 0 && tracesOnlyToStdlibCtor(val.Tuple, match, seen)
 	case *ssa.Call:
-		obj := vetssa.OriginFuncObj(val.Call.StaticCallee())
-		return vetutil.IsPkgSymbol(obj, "crypto/sha256", "New", "New224") ||
-			vetutil.IsPkgSymbol(obj, "crypto/sha512", "New", "New384", "New512_224", "New512_256") ||
-			vetutil.IsPkgSymbol(obj, "crypto/hmac", "New")
+		return match(vetssa.OriginFuncObj(val.Call.StaticCallee()))
 	case *ssa.Phi:
-		return len(val.Edges) > 0 && !slices.ContainsFunc(val.Edges, func(e ssa.Value) bool { return !tracesOnlyToStdlibHashCtor(e, seen) })
+		return len(val.Edges) > 0 && !slices.ContainsFunc(val.Edges, func(e ssa.Value) bool { return !tracesOnlyToStdlibCtor(e, match, seen) })
+	case *ssa.FreeVar:
+		origins := vetssa.TraceFreeVarOrigins(val)
+		return len(origins) > 0 && !slices.ContainsFunc(origins, func(o ssa.Value) bool { return !tracesOnlyToStdlibCtor(o, match, seen) })
+	case *ssa.Alloc:
+		vals, ok := vetssa.LoadedCellValues(val)
+		return ok && !slices.ContainsFunc(vals, func(sv ssa.Value) bool { return !tracesOnlyToStdlibCtor(sv, match, seen) })
+	case *ssa.UnOp:
+		return val.Op == token.MUL && tracesOnlyToStdlibCtor(val.X, match, seen)
 	default:
 		return false
 	}
+}
+
+func tracesOnlyToStdlibHashFuncVal(v ssa.Value) bool {
+	targets, allKnown := vetssa.ResolveFuncValues(v)
+	return allKnown && len(targets) > 0 && !slices.ContainsFunc(targets, func(tgt ssa.Value) bool {
+		fn, ok := tgt.(*ssa.Function)
+		obj := vetssa.OriginFuncObj(fn)
+		return !ok || (!vetutil.IsPkgSymbol(obj, "crypto/sha256", "New", "New224") && !vetutil.IsPkgSymbol(obj, "crypto/sha512", "New", "New384", "New512_224", "New512_256"))
+	})
 }
 
 func isBufferOrReaderWriteToFunc(fn *types.Func) bool {
@@ -189,23 +284,17 @@ func isBufferOrReaderWriteToFunc(fn *types.Func) bool {
 
 func isBytesOrStringsRecvMethod(fn *types.Func, recvTypes []string, methodNames ...string) bool {
 	pkgPath := vetutil.ObjectPkgPath(fn)
-	if (pkgPath != "bytes" && pkgPath != "strings") || !slices.Contains(methodNames, fn.Name()) {
-		return false
-	}
 	named, ok := secretfact.RecvNamedType(fn)
-	return ok && slices.Contains(recvTypes, named.Obj().Name())
+	return (pkgPath == "bytes" || pkgPath == "strings") && slices.Contains(methodNames, fn.Name()) && ok && slices.Contains(recvTypes, named.Obj().Name())
 }
 
 func isIOCopyFunc(fn *types.Func) bool {
 	return vetutil.IsPkgSymbol(fn, "io", "Copy", "CopyN", "CopyBuffer")
 }
-
 func isIOCopyBufferFunc(fn *types.Func) bool { return vetutil.IsPkgSymbol(fn, "io", "CopyBuffer") }
-
 func isFmtAppendFunc(fn *types.Func) bool {
 	return vetutil.IsPkgSymbol(fn, "fmt", "Append", "Appendf", "Appendln")
 }
-
 func hasAnyPrefix(s string, prefixes ...string) bool {
 	return slices.ContainsFunc(prefixes, func(p string) bool { return strings.HasPrefix(s, p) })
 }

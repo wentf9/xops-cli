@@ -36,8 +36,14 @@ func run(pass *analysis.Pass) (any, error) {
 	if vetutil.IsSyntheticTestMain(pass) {
 		return nil, nil
 	}
-	pkgInfo := vetutil.ClassifyPackage(pass.Pkg.Path())
+	pkgInfo := vetutil.ClassifyPass(pass)
 	if pkgInfo.Layer == vetutil.LayerUnknown {
+		return nil, nil
+	}
+	if isUnregisteredCoreLayer(pkgInfo.Layer) {
+		if len(pass.Files) > 0 {
+			pass.ReportRangef(pass.Files[0].Name, "archbound: 未登记的 core/ 包路径 %q，未在 RFC §2.1/§2.3 授权包清单内", pkgInfo.BasePath)
+		}
 		return nil, nil
 	}
 	checkFileImports(pass, pkgInfo)

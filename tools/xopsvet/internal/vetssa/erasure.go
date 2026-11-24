@@ -1,6 +1,7 @@
 package vetssa
 
 import (
+	"go/ast"
 	"go/types"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
@@ -17,6 +18,7 @@ type ErasureConfig struct {
 	MatchInstance      func(arg types.Type) bool
 	AllowMakeInterface func(fn *ssa.Function, mi *ssa.MakeInterface) bool
 	SkipInst           func(fn *ssa.Function, inst ssa.Instruction) bool
+	SkipInstance       func(ident *ast.Ident) bool
 	Message            string
 }
 
@@ -41,7 +43,8 @@ func CheckNoErasure(pass *analysis.Pass, s *buildssa.SSA, cfg ErasureConfig) []v
 
 func appendInstanceErasures(pass *analysis.Pass, cfg ErasureConfig, diags *[]vetutil.Diag) {
 	for ident, inst := range pass.TypesInfo.Instances {
-		if ident != nil && ident.Pos().IsValid() && inst.TypeArgs != nil && instanceHasBlockedArg(inst.TypeArgs, cfg) {
+		if ident != nil && ident.Pos().IsValid() && inst.TypeArgs != nil &&
+			(cfg.SkipInstance == nil || !cfg.SkipInstance(ident)) && instanceHasBlockedArg(inst.TypeArgs, cfg) {
 			*diags = append(*diags, vetutil.Diag{Pos: ident.Pos(), End: ident.End(), Msg: cfg.Message})
 		}
 	}

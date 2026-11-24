@@ -77,8 +77,12 @@ func controlledNetCallRule(obj types.Object) (controlledNetRule, bool) {
 	return controlledNetRule{}, false
 }
 
-func containsRestrictedNetStruct(t types.Type) bool {
-	return vetutil.ContainsValueType(t, func(n *types.Named) bool { return vetutil.IsPkgSymbol(n.Obj(), "net", "Dialer", "ListenConfig") })
+// containsErasableRestrictedNet 封禁直接/容器/匿名结构体/导出或嵌入字段形式的 net.Dialer/ListenConfig 擦除，
+// 同时放行仅以未导出具名字段持有的具名结构体（如 LocalFS）实现 ports.ScopedRootFS（修复 B-2）。
+func containsErasableRestrictedNet(t types.Type) bool {
+	return vetutil.ContainsExportedValueType(t, func(n *types.Named) bool {
+		return vetutil.IsPkgSymbol(n.Obj(), "net", "Dialer", "ListenConfig")
+	})
 }
 
 func isBannedNetNamedType(n *types.Named) bool {
@@ -103,14 +107,4 @@ func netNamedTypeName(t types.Type) (string, bool) {
 	return name, isNet
 }
 
-func unwrapStructType(t types.Type) *types.Struct {
-	if t == nil {
-		return nil
-	}
-	t = types.Unalias(t)
-	if ptr, ok := t.(*types.Pointer); ok {
-		t = types.Unalias(ptr.Elem())
-	}
-	st, _ := t.Underlying().(*types.Struct)
-	return st
-}
+func unwrapStructType(t types.Type) *types.Struct { return vetutil.UnwrapStructType(t) }

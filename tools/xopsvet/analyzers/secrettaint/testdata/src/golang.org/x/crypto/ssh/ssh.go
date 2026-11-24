@@ -33,6 +33,12 @@ func Marshal(msg any) []byte {
 	return nil
 }
 
+type KeyboardInteractiveChallenge func(name, instruction string, questions []string, echos []bool) (answers []string, err error)
+
+func KeyboardInteractive(challenge KeyboardInteractiveChallenge) AuthMethod {
+	return passwordAuth{}
+}
+
 func ParseRawPrivateKey(pemBytes []byte) (any, error) {
 	return nil, nil
 }

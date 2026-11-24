@@ -70,7 +70,12 @@ func analyzeFuncBody(pass *analysis.Pass, body *ast.BlockStmt, targetVar *types.
 }
 
 func collectImmutableAliases(info *types.Info, body *ast.BlockStmt, rootVar *types.Var) map[*types.Var]bool {
-	aliases, writes := map[*types.Var]bool{rootVar: true}, countVarWrites(info, body)
+	writes := countVarWrites(info, body)
+	// H7: 若接收者或形参在函数体内被重赋值，拒绝将其作为不可变别名根（阻断重赋值后伪造覆盖）。
+	if writes[rootVar] > 0 {
+		return map[*types.Var]bool{}
+	}
+	aliases := map[*types.Var]bool{rootVar: true}
 	for {
 		added := false
 		ast.Inspect(body, func(n ast.Node) bool {
@@ -86,18 +91,33 @@ func collectImmutableAliases(info *types.Info, body *ast.BlockStmt, rootVar *typ
 func countVarWrites(info *types.Info, body *ast.BlockStmt) map[*types.Var]int {
 	writes := make(map[*types.Var]int)
 	ast.Inspect(body, func(n ast.Node) bool {
-		if assign, ok := n.(*ast.AssignStmt); ok {
-			for _, lhs := range assign.Lhs {
-				if id, ok := ast.Unparen(lhs).(*ast.Ident); ok {
-					if v, ok := info.Uses[id].(*types.Var); ok && v != nil {
-						writes[v]++
-					}
-				}
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			countExprWrites(info, node.Lhs, writes)
+		case *ast.ValueSpec:
+			if len(node.Values) > 0 {
+				countExprWrites(info, vetutil.IdentSliceToExprs(node.Names), writes)
 			}
+		case *ast.RangeStmt:
+			countExprWrites(info, []ast.Expr{node.Key, node.Value}, writes)
 		}
 		return true
 	})
 	return writes
+}
+
+func countExprWrites(info *types.Info, exprs []ast.Expr, writes map[*types.Var]int) {
+	for _, e := range exprs {
+		id, ok := ast.Unparen(e).(*ast.Ident)
+		if !ok || id.Name == "_" {
+			continue
+		}
+		if v, ok := info.Defs[id].(*types.Var); ok && v != nil {
+			writes[v]++
+		} else if v, ok := info.Uses[id].(*types.Var); ok && v != nil {
+			writes[v]++
+		}
+	}
 }
 
 func tryAddAliasFromNode(info *types.Info, n ast.Node, aliases map[*types.Var]bool, writes map[*types.Var]int) bool {
@@ -130,13 +150,13 @@ func tryAddAliasFromPair(info *types.Info, lhs, rhs []ast.Expr, isDef bool, alia
 }
 
 func resolveAliasLHSVar(info *types.Info, id *ast.Ident, isDef bool, writes map[*types.Var]int) *types.Var {
+	var v *types.Var
 	if isDef {
-		if v, ok := info.Defs[id].(*types.Var); ok && v != nil && writes[v] == 0 {
-			return v
-		}
-		return nil
+		v, _ = info.Defs[id].(*types.Var)
+	} else {
+		v, _ = info.Uses[id].(*types.Var)
 	}
-	if v, ok := info.Uses[id].(*types.Var); ok && v != nil && writes[v] == 1 {
+	if v != nil && writes[v] == 1 {
 		return v
 	}
 	return nil
@@ -233,17 +253,34 @@ func recurseIntoHelperCalls(pass *analysis.Pass, call *ast.CallExpr, aliases map
 	if helperDecl == nil || helperDecl.Body == nil {
 		return
 	}
-	if selExpr, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok && isAliasExpr(pass.TypesInfo, selExpr.X, aliases) {
+	argOffset := visitHelperReceiver(pass, call, origCallee, helperDecl, aliases, state)
+	params := extractParamVars(pass.TypesInfo, helperDecl)
+	for k := argOffset; k < len(call.Args); k++ {
+		if pIdx := k - argOffset; pIdx < len(params) && params[pIdx] != nil && isAliasExpr(pass.TypesInfo, call.Args[k], aliases) {
+			visitHelper(pass, origCallee, pIdx, helperDecl.Body, params[pIdx], state)
+		}
+	}
+}
+
+func visitHelperReceiver(pass *analysis.Pass, call *ast.CallExpr, origCallee *types.Func, helperDecl *ast.FuncDecl, aliases map[*types.Var]bool, state *coverageState) int {
+	selExpr, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return 0
+	}
+	recvExpr, argOffset := selExpr.X, 0
+	if sel := pass.TypesInfo.Selections[selExpr]; sel != nil && sel.Kind() == types.MethodExpr {
+		argOffset = 1
+		if len(call.Args) == 0 {
+			return argOffset
+		}
+		recvExpr = call.Args[0]
+	}
+	if isAliasExpr(pass.TypesInfo, recvExpr, aliases) {
 		if recvVar := extractRecvVar(pass.TypesInfo, helperDecl); recvVar != nil {
 			visitHelper(pass, origCallee, -1, helperDecl.Body, recvVar, state)
 		}
 	}
-	params := extractParamVars(pass.TypesInfo, helperDecl)
-	for k, arg := range call.Args {
-		if k < len(params) && params[k] != nil && isAliasExpr(pass.TypesInfo, arg, aliases) {
-			visitHelper(pass, origCallee, k, helperDecl.Body, params[k], state)
-		}
-	}
+	return argOffset
 }
 
 func visitHelper(pass *analysis.Pass, callee *types.Func, paramIdx int, body *ast.BlockStmt, targetVar *types.Var, state *coverageState) {

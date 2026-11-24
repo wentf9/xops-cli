@@ -1,9 +1,9 @@
-package mystery
+package mystery // want "未登记的 core/ 包路径"
 
 import (
 	"testing"
 
-	_ "github.com/wentf9/xops-cli/core/internal/sim" // want "未知 core/ 包路径"
+	_ "github.com/wentf9/xops-cli/core/internal/sim"
 )
 
 func TestMystery(t *testing.T) {}

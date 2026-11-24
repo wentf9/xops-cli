@@ -91,6 +91,11 @@ func hasStrictDTOSuffix(name string) bool {
 		func(suf string) bool { return strings.HasSuffix(name, suf) })
 }
 
+type dtoSeenKey struct {
+	t     types.Type
+	inMap bool
+}
+
 func checkDTOStructFields(pass *analysis.Pass, st *ast.StructType, mode dtoFormat) {
 	if st.Fields == nil {
 		return
@@ -102,7 +107,7 @@ func checkDTOStructFields(pass *analysis.Pass, st *ast.StructType, mode dtoForma
 		if tag, hasTag, err := vetutil.ParseStructFieldTag(f); err == nil && hasTag && vetutil.IsTagSkippedForFormat(tag, mode.checkJSON, mode.checkYAML) {
 			continue
 		}
-		if hasBareTimeDuration(pass.TypesInfo.TypeOf(f.Type), mode, make(map[types.Type]bool)) {
+		if hasBareTimeDuration(pass.TypesInfo.TypeOf(f.Type), mode, make(map[dtoSeenKey]bool)) {
 			pass.ReportRangef(f.Type, "noimplicit: Event/Audit/MCP/持久化配置 DTO 禁止裸用 time.Duration，请使用 algebraic.Duration")
 		}
 	}
@@ -112,7 +117,7 @@ func isTopFieldSerializable(f *ast.Field) bool {
 	return len(f.Names) == 0 || slices.ContainsFunc(f.Names, (*ast.Ident).IsExported)
 }
 
-func hasBareTimeDuration(t types.Type, mode dtoFormat, seen map[types.Type]bool) bool {
+func hasBareTimeDuration(t types.Type, mode dtoFormat, seen map[dtoSeenKey]bool) bool {
 	if t == nil {
 		return false
 	}
@@ -123,7 +128,7 @@ func hasBareTimeDuration(t types.Type, mode dtoFormat, seen map[types.Type]bool)
 	return compositeHasBareTimeDuration(t, mode, seen)
 }
 
-func namedHasBareTimeDuration(named *types.Named, mode dtoFormat, seen map[types.Type]bool) bool {
+func namedHasBareTimeDuration(named *types.Named, mode dtoFormat, seen map[dtoSeenKey]bool) bool {
 	obj := named.Obj()
 	if vetutil.IsPkgSymbol(obj, algebraicPkgPath, "Duration") {
 		return false
@@ -131,15 +136,15 @@ func namedHasBareTimeDuration(named *types.Named, mode dtoFormat, seen map[types
 	if vetutil.IsPkgSymbol(obj, "time", "Duration") {
 		return true
 	}
-	if seen[named] {
+	k := dtoSeenKey{t: named, inMap: mode.inMapValue}
+	if seen[k] {
 		return false
 	}
-	seen[named] = true
+	seen[k] = true
 	// B3a 铁律：必须先递归检查泛型类型实参 TypeArgs()，再判定自定义编码器停钻。
 	if typeArgs := named.TypeArgs(); typeArgs != nil {
-		argMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML}
 		for i := range typeArgs.Len() {
-			if hasBareTimeDuration(typeArgs.At(i), argMode, seen) {
+			if hasBareTimeDuration(typeArgs.At(i), mode, seen) {
 				return true
 			}
 		}
@@ -149,12 +154,15 @@ func namedHasBareTimeDuration(named *types.Named, mode dtoFormat, seen map[types
 
 type dtoElemCarrier interface{ Elem() types.Type }
 
-func compositeHasBareTimeDuration(t types.Type, mode dtoFormat, seen map[types.Type]bool) bool {
+func compositeHasBareTimeDuration(t types.Type, mode dtoFormat, seen map[dtoSeenKey]bool) bool {
 	elemMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML}
 	switch v := t.(type) {
 	case *types.Map:
 		valMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML, inMapValue: true}
 		return hasBareTimeDuration(v.Key(), elemMode, seen) || hasBareTimeDuration(v.Elem(), valMode, seen)
+	case *types.Array:
+		// 数组元素在 map value 内同样不可取址，必须继承 inMapValue（M1）。
+		return hasBareTimeDuration(v.Elem(), mode, seen)
 	case dtoElemCarrier:
 		return hasBareTimeDuration(v.Elem(), elemMode, seen)
 	case *types.Struct:
@@ -164,35 +172,33 @@ func compositeHasBareTimeDuration(t types.Type, mode dtoFormat, seen map[types.T
 	}
 }
 
-func structHasBareTimeDuration(st *types.Struct, mode dtoFormat, seen map[types.Type]bool) bool {
-	if seen[st] {
+func structHasBareTimeDuration(st *types.Struct, mode dtoFormat, seen map[dtoSeenKey]bool) bool {
+	k := dtoSeenKey{t: st, inMap: mode.inMapValue}
+	if seen[k] {
 		return false
 	}
-	seen[st] = true
-	fieldMode := dtoFormat{checkJSON: mode.checkJSON, checkYAML: mode.checkYAML}
+	seen[k] = true
 	for i := range st.NumFields() {
 		f := st.Field(i)
 		if (!f.Exported() && !f.Embedded()) || vetutil.IsTagSkippedForFormat(reflect.StructTag(st.Tag(i)), mode.checkJSON, mode.checkYAML) {
 			continue
 		}
-		if hasBareTimeDuration(f.Type(), fieldMode, seen) {
+		// 结构体字段继承外层 inMapValue（map[K]Struct 的字段在 yaml.v3 下不可取址，M1）。
+		if hasBareTimeDuration(f.Type(), mode, seen) {
 			return true
 		}
 	}
 	return false
 }
 
-// canStopAtCustomMarshaler 按 JSON/v2 与 yaml.v3 真实编码语义判定命名类型是否安全接管了序列化。
+// canStopAtCustomMarshaler 按 JSON/v2 与 yaml.v3 双协议合取语义判定命名类型是否安全接管了序列化（H2/M1）。
 func canStopAtCustomMarshaler(named *types.Named, mode dtoFormat) bool {
 	ptr := types.NewPointer(named)
-	if hasMethodOnType(named, "AppendText", "MarshalText") ||
-		((!mode.checkYAML || !mode.inMapValue) && hasMethodOnType(ptr, "AppendText", "MarshalText")) {
-		return true
-	}
-	if mode.checkYAML {
-		return hasMethodOnType(named, "MarshalYAML") || (!mode.inMapValue && hasMethodOnType(ptr, "MarshalYAML"))
-	}
-	return hasMethodOnType(ptr, "MarshalJSON", "MarshalJSONTo")
+	jsonOK := !mode.checkJSON || hasMethodOnType(named, "AppendText", "MarshalText", "MarshalJSON", "MarshalJSONTo") ||
+		(!mode.inMapValue && hasMethodOnType(ptr, "AppendText", "MarshalText", "MarshalJSON", "MarshalJSONTo"))
+	yamlOK := !mode.checkYAML || hasMethodOnType(named, "MarshalText", "MarshalYAML") ||
+		(!mode.inMapValue && hasMethodOnType(ptr, "MarshalText", "MarshalYAML"))
+	return jsonOK && yamlOK
 }
 
 func hasMethodOnType(t types.Type, names ...string) bool {

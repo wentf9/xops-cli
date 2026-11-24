@@ -25,10 +25,12 @@ func (ts *taintScope) checkInst(inst ssa.Instruction) {
 		if _, ok := ts.tainted[ins.X]; ok {
 			ts.report(ins, "secrettaint: 禁止将明文机密发送至 channel")
 		}
-	case *ssa.Return:
-		if _, ok := vetssa.CombinedScope(ts.tainted, ins.Results...); ok && ts.depth == 0 && !isDialKeyboardInteractiveAnswersReturn(ts.eng.pkgInfo, ts.fn, ins) {
-			ts.report(ins, "secrettaint: 禁止通过 return 返回明文机密")
+	case *ssa.Panic:
+		if _, ok := ts.tainted[ins.X]; ok {
+			ts.report(ins, "secrettaint: 禁止将明文机密传入 panic")
 		}
+	case *ssa.Return:
+		ts.checkReturn(ins)
 	case *ssa.Go:
 		rc := vetssa.ResolveCall(ts.eng.ssaInfo, ins)
 		_, argT := ts.callInputScope(rc)
@@ -45,15 +47,33 @@ func (ts *taintScope) checkInst(inst ssa.Instruction) {
 	}
 }
 
+func (ts *taintScope) checkReturn(ins *ssa.Return) {
+	if ts.depth != 0 {
+		return
+	}
+	if ts.kiFn == ts.fn && isDialKeyboardInteractiveAnswersReturn(ts.eng.pkgInfo, ts.fn, ins) {
+		if _, errT := ts.tainted[ins.Results[1]]; errT {
+			ts.report(ins, "secrettaint: 禁止通过 return 返回明文机密")
+		}
+		return
+	}
+	if _, ok := vetssa.CombinedScope(ts.tainted, ins.Results...); ok {
+		ts.report(ins, "secrettaint: 禁止通过 return 返回明文机密")
+	}
+}
+
 func (ts *taintScope) checkStore(ins *ssa.Store) {
 	sc, ok := ts.tainted[ins.Val]
 	if !ok || vetssa.IsVarargsSliceStore(ins.Addr) {
 		return
 	}
 	if fa, isField := ins.Addr.(*ssa.FieldAddr); isField {
-		if !isVaultNarrowCredentialFieldStore(ts.eng.pkgInfo, fa) {
+		if !isVaultNarrowCredentialFieldStore(ts.eng.pkgInfo, fa) || !vetssa.AllRootsOwnedInScope(fa, sc, ts.callerParams) {
 			ts.report(ins, "secrettaint: 禁止将明文机密存入结构体或非字节切片容器字面量")
 		}
+		return
+	}
+	if ts.checkDialKIAnswersStore(ins) {
 		return
 	}
 	if isNonByteContainerStore(ins.Addr) {
@@ -70,14 +90,7 @@ func (ts *taintScope) checkMakeClosure(mc *ssa.MakeClosure) {
 	}
 	captured := vetssa.CollectCaptured(mc, target, ts.tainted)
 	if vetssa.IsYieldFunc(target) {
-		callInst, seeds, yScope, isStd := vetssa.CheckStdlibYieldClosure(ts.eng.ssaInfo, ts.fn, target, ts.ownScope, ts.tainted)
-		if !isStd {
-			if len(captured) > 0 {
-				ts.report(callInst, "secrettaint: 禁止在非标准库自定义迭代器中捕获明文机密变量")
-			}
-		} else if len(seeds) > 0 || len(captured) > 0 {
-			ts.eng.auditFunc(target, seeds, captured, yScope, ts.depth+1, ts.tainted)
-		}
+		ts.checkYieldClosure(mc, target, captured)
 		return
 	}
 	if len(captured) == 0 {
@@ -85,11 +98,29 @@ func (ts *taintScope) checkMakeClosure(mc *ssa.MakeClosure) {
 	}
 	if ts.allClosureReferrersMatch(mc, ts.isSyncClosureCallSite) {
 		if !ts.allClosureReferrersMatch(mc, ts.isSecretUseCallSite) {
-			ts.eng.auditFunc(target, nil, captured, ts.ownScope, ts.depth+1, ts.tainted)
+			ts.eng.auditFunc(target, nil, captured, ts.ownScope, ts.depth+1, ts.tainted, mc, ts.kiFn)
 		}
 		return
 	}
 	ts.report(mc, "secrettaint: 禁止在内层闭包中捕获明文机密变量")
+}
+
+func (ts *taintScope) checkYieldClosure(mc *ssa.MakeClosure, target *ssa.Function, captured map[ssa.Value]vetssa.ScopeRange) {
+	callInst, seeds, yScope, isStd := vetssa.CheckStdlibYieldClosure(ts.eng.ssaInfo, ts.fn, target, ts.ownScope, ts.tainted)
+	if !isStd {
+		iterT := callInst != nil && callInst.Common() != nil && ts.tainted[callInst.Common().Value].Valid()
+		if len(captured) > 0 || iterT {
+			rep := ssa.Instruction(mc)
+			if callInst != nil {
+				rep = callInst
+			}
+			ts.report(rep, "secrettaint: 禁止在非标准库自定义迭代器中捕获明文机密变量")
+		}
+		return
+	}
+	if len(seeds) > 0 || len(captured) > 0 {
+		ts.eng.auditFunc(target, seeds, captured, yScope, ts.depth+1, ts.tainted, callInst, ts.kiFn)
+	}
 }
 
 func (ts *taintScope) allClosureReferrersMatch(mc *ssa.MakeClosure, pred func(ssa.CallInstruction, *ssa.MakeClosure) bool) bool {
@@ -109,14 +140,26 @@ func (ts *taintScope) isSyncClosureCallSite(callInst ssa.CallInstruction, mc *ss
 		return false
 	}
 	rc := vetssa.ResolveCall(ts.eng.ssaInfo, callInst)
-	return (rc.Common != nil && rc.Common.Value == mc) ||
-		(rc.FuncObj != nil && (vetssa.IsRuntimeSecretDo(rc.FuncObj) || ts.eng.syncFuncs[rc.FuncObj] ||
-			(ts.eng.facts != nil && (ts.eng.facts.IsSecretUseObject(rc.FuncObj) || ts.eng.facts.HasSecretUseCallbackParam(rc.FuncObj)))))
+	return (rc.Common != nil && rc.Common.Value == mc) || (rc.FuncObj != nil && (vetssa.IsRuntimeSecretDo(rc.FuncObj) ||
+		(ts.eng.facts != nil && (ts.eng.facts.IsSyncClosureObject(rc.FuncObj) || ts.eng.facts.HasSecretUseCallbackParam(rc.FuncObj)))))
 }
 
-func (ts *taintScope) isSecretUseCallSite(callInst ssa.CallInstruction, _ *ssa.MakeClosure) bool {
+func (ts *taintScope) isSecretUseCallSite(callInst ssa.CallInstruction, mc *ssa.MakeClosure) bool {
 	rc := vetssa.ResolveCall(ts.eng.ssaInfo, callInst)
-	return rc.FuncObj != nil && ts.eng.facts != nil && ts.eng.facts.IsSecretUseObject(rc.FuncObj)
+	if rc.FuncObj == nil || ts.eng.facts == nil {
+		return false
+	}
+	isSecretObj := ts.eng.facts.IsSecretUseObject(rc.FuncObj)
+	if !isSecretObj && !ts.eng.facts.HasSecretUseCallbackParam(rc.FuncObj) {
+		return false
+	}
+	sig, _ := rc.FuncObj.Type().Underlying().(*types.Signature)
+	for i, arg := range rc.UserArgs {
+		if arg == mc && isSecretCallbackArgSlot(ts.eng.facts, sig, isSecretObj, i, arg.Type()) {
+			return true
+		}
+	}
+	return false
 }
 
 func (ts *taintScope) checkCallInst(callInst ssa.CallInstruction) {
@@ -133,6 +176,11 @@ func (ts *taintScope) checkCallInst(callInst ssa.CallInstruction) {
 		return
 	}
 	if isIOCopyFunc(rc.FuncObj) {
+		if isIOCopyBufferFunc(rc.FuncObj) && len(rc.UserArgs) >= 3 {
+			if bufSc, ok := ts.tainted[rc.UserArgs[2]]; ok && !ts.isOwnedLocalBufferWriter(rc.UserArgs[0], bufSc) {
+				ts.report(callInst, "secrettaint: 禁止通过 io.CopyBuffer 将明文机密写入外层缓冲或写入器")
+			}
+		}
 		return
 	}
 	if inSc, ok := ts.callInputScope(rc); ok {
@@ -175,14 +223,21 @@ func (ts *taintScope) checkWriteToDstCall(callInst ssa.CallInstruction, rc vetss
 }
 
 func (ts *taintScope) checkTaintedNonWriteCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall, inSc vetssa.ScopeRange) {
-	if isFmtAppendFunc(rc.FuncObj) {
-		if len(rc.UserArgs) > 0 && !vetssa.IsAllowedSliceWriteDst(rc.UserArgs[0], inSc, ts.callerParams) && !vetssa.IsNilConst(rc.UserArgs[0]) {
-			ts.report(callInst, "secrettaint: 禁止通过 fmt.Append 将明文机密写入外层变量或字段")
+	if ts.auditedCalls[callInst] {
+		return
+	}
+	if isAppendToDstFunc(rc.FuncObj) {
+		ts.checkAppendToDstCall(callInst, rc, inSc)
+		return
+	}
+	if isFmtSprintFunc(rc.FuncObj) {
+		if !ts.allFmtArgsSafe(rc.UserArgs) {
+			ts.report(callInst, "secrettaint: 禁止将自定义 Stringer/GoStringer 明文值传入 fmt 格式化函数")
 		}
 		return
 	}
-	if isSafePredicate(rc.FuncObj) || isTaintPreservingTransform(rc.FuncObj) || isExactCryptoSanitizer(rc) ||
-		isAllowedNarrowConsumerCall(ts.eng.pkgInfo, rc) || ts.auditSamePackageCallee(rc) {
+	if isSafePredicate(rc.FuncObj) || isTaintPreservingTransform(rc.FuncObj) || vetssa.IsStdlibSyncIter(rc.FuncObj) ||
+		ts.isExactCryptoSanitizer(rc, inSc) || isAllowedNarrowConsumerCall(ts.eng.pkgInfo, rc) {
 		return
 	}
 	if isBufferOrReaderWriteToFunc(rc.FuncObj) {
@@ -190,59 +245,66 @@ func (ts *taintScope) checkTaintedNonWriteCall(callInst ssa.CallInstruction, rc 
 	} else if kind := secretfact.ClassifyCommonSink(rc.FuncObj); kind != secretfact.SinkNone {
 		ts.report(callInst, "secrettaint: 禁止将明文机密及其衍生值传入"+kind.Label()+"汇点")
 	} else {
-		// CRIT-4A 核心防线：默认 Fail-Closed 拦截一切未知外部调用、任意 io.Writer/接口方法与动态函数字段。
 		ts.report(callInst, "secrettaint: 禁止将明文机密传入未经授权的外部调用或未知汇点")
 	}
 }
 
-func (ts *taintScope) auditSamePackageCallee(rc vetssa.ResolvedCall) bool {
+func (ts *taintScope) checkAppendToDstCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall, inSc vetssa.ScopeRange) {
+	if isFmtAppendFunc(rc.FuncObj) && len(rc.UserArgs) > 1 && !ts.allFmtArgsSafe(rc.UserArgs[1:]) {
+		ts.report(callInst, "secrettaint: 禁止将自定义 Stringer/GoStringer 明文值传入 fmt 格式化函数")
+		return
+	}
+	if len(rc.UserArgs) > 0 && !vetssa.IsAllowedSliceWriteDst(rc.UserArgs[0], inSc, ts.callerParams) && !vetssa.IsNilConst(rc.UserArgs[0]) {
+		fnLabel := rc.FuncObj.Name()
+		if rc.FuncObj.Pkg() != nil {
+			fnLabel = rc.FuncObj.Pkg().Name() + "." + fnLabel
+		}
+		ts.report(callInst, "secrettaint: 禁止通过 "+fnLabel+" 将明文机密写入外层变量或字段")
+	}
+}
+
+func (ts *taintScope) auditSamePackageCallee(callInst ssa.CallInstruction, rc vetssa.ResolvedCall) (uint64, bool) {
 	if rc.TargetFn != nil && len(rc.TargetFn.Blocks) > 0 {
-		ts.eng.auditFunc(rc.TargetFn, vetssa.CollectCallSeeds(rc, ts.tainted, 0, nil), nil, vetssa.ScopeRangeOfFunc(rc.TargetFn), ts.depth+1, nil)
-		return true
+		return ts.eng.auditFunc(rc.TargetFn, vetssa.CollectCallSeeds(rc, ts.tainted, 0, nil), nil, vetssa.ScopeRangeOfFunc(rc.TargetFn), ts.depth+1, nil, callInst, ts.kiFn), true
 	}
 	if rc.Kind != vetssa.CallDynamic || rc.Common == nil {
-		return false
+		return 0, false
 	}
 	targets, allKnown := vetssa.ResolveFuncValues(rc.Common.Value)
 	if !allKnown || len(targets) == 0 {
-		return false
+		return 0, false
 	}
+	var merged uint64
+	seeds := vetssa.CollectCallSeeds(rc, ts.tainted, 0, nil)
 	for _, tgt := range targets {
-		if !ts.auditResolvedDynamicCallee(tgt, rc) {
-			return false
+		mask, ok := ts.auditDynamicTarget(callInst, tgt, seeds)
+		if !ok {
+			return 0, false
 		}
+		merged |= mask
 	}
-	return true
+	return merged, true
 }
 
-func (ts *taintScope) auditResolvedDynamicCallee(tgt ssa.Value, rc vetssa.ResolvedCall) bool {
-	seeds := vetssa.CollectCallSeeds(rc, ts.tainted, 0, nil)
+func (ts *taintScope) auditDynamicTarget(callInst ssa.CallInstruction, tgt ssa.Value, seeds map[int]bool) (uint64, bool) {
 	switch t := tgt.(type) {
 	case *ssa.MakeClosure:
-		fn, ok := t.Fn.(*ssa.Function)
-		if !ok || fn == nil || len(fn.Blocks) == 0 {
-			return false
+		if fn, ok := t.Fn.(*ssa.Function); ok && fn != nil && len(fn.Blocks) > 0 {
+			return ts.eng.auditFunc(fn, seeds, vetssa.CollectCaptured(t, fn, ts.tainted), ts.ownScope, ts.depth+1, ts.tainted, callInst, ts.kiFn), true
 		}
-		ts.eng.auditFunc(fn, seeds, vetssa.CollectCaptured(t, fn, ts.tainted), ts.ownScope, ts.depth+1, ts.tainted)
-		return true
 	case *ssa.Function:
-		origFn := vetssa.UnwrapOriginFunc(t)
-		if !vetssa.IsSamePackageFunc(ts.eng.ssaInfo, origFn) || len(origFn.Blocks) == 0 {
-			return false
+		if origFn := vetssa.UnwrapOriginFunc(t); vetssa.IsSamePackageFunc(ts.eng.ssaInfo, origFn) && len(origFn.Blocks) > 0 {
+			return ts.eng.auditFunc(origFn, seeds, nil, vetssa.ScopeRangeOfFunc(origFn), ts.depth+1, nil, callInst, ts.kiFn), true
 		}
-		ts.eng.auditFunc(origFn, seeds, nil, vetssa.ScopeRangeOfFunc(origFn), ts.depth+1, nil)
-		return true
-	default:
-		return false
 	}
+	return 0, false
 }
 
 func (ts *taintScope) isOwnedLocalBufferWriter(dst ssa.Value, sc vetssa.ScopeRange) bool {
-	unwrapped := vetssa.UnwrapInterface(dst)
-	named, ok := vetutil.UnwrapNamedType(unwrapped.Type())
-	return ok && named != nil &&
-		(vetutil.IsPkgSymbol(named.Obj(), "bytes", "Buffer") || vetutil.IsPkgSymbol(named.Obj(), "strings", "Builder")) &&
-		vetssa.AllRootsOwnedInScope(unwrapped, sc, ts.callerParams)
+	u := vetssa.UnwrapInterface(dst)
+	named, ok := vetutil.UnwrapNamedType(u.Type())
+	return ok && (vetutil.IsPkgSymbol(named.Obj(), "bytes", "Buffer") || vetutil.IsPkgSymbol(named.Obj(), "strings", "Builder")) &&
+		vetssa.AllRootsOwnedInScope(u, sc, ts.callerParams)
 }
 
 func isNonByteContainerStore(addr ssa.Value) bool {

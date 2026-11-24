@@ -49,9 +49,10 @@ func checkFailClosedDefault(pass *analysis.Pass, ts *ast.TypeSwitchStmt, info *s
 	}
 	enclosing, sig := enclosingFuncInfo(pass, ts)
 	// 测试源码与 core/ports/tck 测试契约夹具层均允许以 t.Fatal/t.Error 作为 fail-closed default 处置。
-	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos()) || vetutil.ClassifyPackage(pass.Pkg.Path()).Layer == vetutil.LayerCorePortsTCK
+	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos()) || vetutil.ClassifyPass(pass).Layer == vetutil.LayerCorePortsTCK
 	state := defaultScanState{
 		pass: pass, sig: sig, inTest: inTest, permissiveVars: make(map[*types.Var]bool),
+		failClosedNamedVars: make(map[*types.Var]bool), assignedNonNilErr: make(map[*types.Var]bool),
 		funcLitVars: collectOuterFuncLitVars(pass.TypesInfo, enclosing, ts.Pos()), visitedLits: make(map[*ast.FuncLit]bool),
 	}
 	if res := inspectDefaultBlock(stmts, state); !res.reportedFailOpen && !res.hasFailClosedAction {
@@ -131,12 +132,14 @@ func recordFuncLitPair(info *types.Info, lhs, rhs []ast.Expr, isDef bool, out ma
 }
 
 type defaultScanState struct {
-	pass           *analysis.Pass
-	sig            *types.Signature
-	inTest         bool
-	permissiveVars map[*types.Var]bool
-	funcLitVars    map[*types.Var]*ast.FuncLit
-	visitedLits    map[*ast.FuncLit]bool
+	pass                *analysis.Pass
+	sig                 *types.Signature
+	inTest              bool
+	permissiveVars      map[*types.Var]bool
+	failClosedNamedVars map[*types.Var]bool
+	assignedNonNilErr   map[*types.Var]bool
+	funcLitVars         map[*types.Var]*ast.FuncLit
+	visitedLits         map[*ast.FuncLit]bool
 }
 
 type defaultScanResult struct{ hasFailClosedAction, reportedFailOpen bool }
@@ -239,7 +242,7 @@ func inspectIfStmt(ifNode *ast.IfStmt, st defaultScanState) defaultScanResult {
 
 func checkReturnStmt(ret *ast.ReturnStmt, st defaultScanState, res *defaultScanResult) bool {
 	if len(ret.Results) == 0 {
-		return false
+		return checkBareReturnStmt(ret, st, res)
 	}
 	if slices.ContainsFunc(ret.Results, func(expr ast.Expr) bool { return isPermissiveExpr(st.pass.TypesInfo, expr, st) }) {
 		st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）")
@@ -251,6 +254,40 @@ func checkReturnStmt(ret *ast.ReturnStmt, st defaultScanState, res *defaultScanR
 	}
 	res.hasFailClosedAction = true
 	return false
+}
+
+// checkBareReturnStmt 审查具名返回值函数在 default 分支中的裸 return（H6）。
+func checkBareReturnStmt(ret *ast.ReturnStmt, st defaultScanState, res *defaultScanResult) bool {
+	if hasPermissiveNamedResult(st.sig, st.permissiveVars) {
+		st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）")
+		return true
+	}
+	hasUnassignedErr, hasReject := namedResultRejectStatus(st)
+	if hasUnassignedErr && !hasReject {
+		st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回 nil error 且无显式拒绝值")
+		return true
+	}
+	res.hasFailClosedAction = res.hasFailClosedAction || hasReject
+	return false
+}
+
+func namedResultRejectStatus(st defaultScanState) (hasUnassignedErr, hasReject bool) {
+	if st.sig == nil || st.sig.Results() == nil {
+		return false, false
+	}
+	for i := range st.sig.Results().Len() {
+		rv := st.sig.Results().At(i)
+		if rv == nil || rv.Name() == "" {
+			continue
+		}
+		if vetutil.IsErrorInterfaceType(rv.Type()) {
+			hasReject = hasReject || st.assignedNonNilErr[rv]
+			hasUnassignedErr = hasUnassignedErr || !st.assignedNonNilErr[rv]
+		} else if st.failClosedNamedVars[rv] {
+			hasReject = true
+		}
+	}
+	return hasUnassignedErr, hasReject
 }
 
 func returnsBareNilError(info *types.Info, sig *types.Signature, results []ast.Expr) bool {
@@ -305,10 +342,23 @@ func checkSingleExprPermissive(lhsVar *types.Var, expr ast.Expr, st defaultScanS
 	if isPermissiveExpr(st.pass.TypesInfo, expr, st) {
 		if lhsVar != nil {
 			st.permissiveVars[lhsVar] = true
+			delete(st.assignedNonNilErr, lhsVar)
+			delete(st.failClosedNamedVars, lhsVar)
 		}
 		return true
 	}
 	delete(st.permissiveVars, lhsVar)
+	if lhsVar != nil {
+		if vetutil.IsErrorInterfaceType(lhsVar.Type()) {
+			if isNilIdent(st.pass.TypesInfo, expr) {
+				delete(st.assignedNonNilErr, lhsVar)
+			} else if st.assignedNonNilErr != nil {
+				st.assignedNonNilErr[lhsVar] = true
+			}
+		} else if isFailClosedValueExpr(st.pass.TypesInfo, expr) && st.failClosedNamedVars != nil {
+			st.failClosedNamedVars[lhsVar] = true
+		}
+	}
 	return false
 }
 
@@ -338,7 +388,11 @@ func isFailClosedCall(st defaultScanState, expr ast.Expr) bool {
 		return isB
 	}
 	sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
-	return st.inTest && ok && slices.Contains([]string{"Fatal", "Fatalf", "Error", "Errorf", "Fail", "FailNow"}, sel.Sel.Name)
+	if !st.inTest || !ok || !slices.Contains([]string{"Fatal", "Fatalf", "Error", "Errorf", "Fail", "FailNow"}, sel.Sel.Name) {
+		return false
+	}
+	s := st.pass.TypesInfo.Selections[sel]
+	return s != nil && s.Obj() != nil && vetutil.ObjectPkgPath(s.Obj()) == "testing"
 }
 
 func cloneDefaultScanState(litSig *types.Signature, st defaultScanState, visited map[*ast.FuncLit]bool, sharePerm bool) defaultScanState {
@@ -352,5 +406,9 @@ func cloneDefaultScanState(litSig *types.Signature, st defaultScanState, visited
 	if fns == nil {
 		fns = make(map[*types.Var]*ast.FuncLit)
 	}
-	return defaultScanState{pass: st.pass, sig: litSig, inTest: st.inTest, permissiveVars: perm, funcLitVars: fns, visitedLits: visited}
+	return defaultScanState{
+		pass: st.pass, sig: litSig, inTest: st.inTest, permissiveVars: perm,
+		failClosedNamedVars: st.failClosedNamedVars, assignedNonNilErr: st.assignedNonNilErr,
+		funcLitVars: fns, visitedLits: visited,
+	}
 }
