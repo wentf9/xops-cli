@@ -94,3 +94,17 @@ type BadInsecureBool struct {
 type BadUnverifiedBool struct {
 	unverified bool // want "failclosed: //xops:failclosed 结构体 BadUnverifiedBool 含否定语义 bool 字段 unverified"
 }
+
+// Challenger 2 - Challenge 4: 底层类型为 bool 的具名布尔字段同样受否定语义零值检查约束。
+type MyBool bool
+
+//xops:failclosed
+type BadNamedBoolStruct struct {
+	bypassed MyBool // want "failclosed: //xops:failclosed 结构体 BadNamedBoolStruct 含否定语义 bool 字段 bypassed"
+}
+
+//xops:failclosed
+type GoodNamedBoolStruct struct {
+	valid MyBool
+	wiped MyBool
+}

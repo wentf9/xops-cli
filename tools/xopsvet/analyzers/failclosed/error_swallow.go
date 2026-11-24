@@ -79,23 +79,33 @@ func inspectBoolFuncBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockSt
 	if !hasBoolWithoutError(sig) {
 		return
 	}
-	inspectBoolScopeBody(pass, fnNode, body)
+	inspectBoolScopeBody(pass, fnNode, body, make(map[*types.Var][]*ast.FuncLit), make(map[*ast.FuncLit]bool))
 }
 
-func inspectBoolScopeBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockStmt) {
+func inspectBoolScopeBody(
+	pass *analysis.Pass,
+	fnNode ast.Node,
+	body *ast.BlockStmt,
+	voidFuncVars map[*types.Var][]*ast.FuncLit,
+	visitedLits map[*ast.FuncLit]bool,
+) {
 	ast.Inspect(body, func(n ast.Node) bool {
 		if n == nil {
 			return false
 		}
 		// 嵌套 FuncLit 默认保持隔离，避免回调（如 slices.SortFunc）误归因到外层 bool 函数；
-		// 立即调用/defer/go 的无 bool/error 返回 FuncLit 由下方 CallExpr 分支显式递归进入。
+		// 立即调用/defer/go 或局部调用的无 bool/error 返回 FuncLit 由下方 CallExpr 分支显式递归进入。
 		if lit, ok := n.(*ast.FuncLit); ok && lit != fnNode {
 			return false
 		}
 		switch node := n.(type) {
+		case *ast.AssignStmt:
+			recordVoidFuncLitPair(pass.TypesInfo, node.Lhs, node.Rhs, node.Tok == token.DEFINE, voidFuncVars)
+		case *ast.ValueSpec:
+			recordVoidFuncLitValueSpec(pass.TypesInfo, node, voidFuncVars)
 		case *ast.CallExpr:
 			checkSwallowedCallError(pass, node)
-			inspectInlineVoidFuncLit(pass, node)
+			inspectCalledVoidFuncLit(pass, node, voidFuncVars, visitedLits)
 		case *ast.UnaryExpr:
 			if node.Op == token.ARROW {
 				checkSwallowedChanError(pass, node)
@@ -107,16 +117,91 @@ func inspectBoolScopeBody(pass *analysis.Pass, fnNode ast.Node, body *ast.BlockS
 	})
 }
 
-func inspectInlineVoidFuncLit(pass *analysis.Pass, call *ast.CallExpr) {
-	lit, ok := ast.Unparen(call.Fun).(*ast.FuncLit)
-	if !ok || lit.Body == nil {
+func recordVoidFuncLitValueSpec(
+	info *types.Info,
+	spec *ast.ValueSpec,
+	voidFuncVars map[*types.Var][]*ast.FuncLit,
+) {
+	if len(spec.Values) == 0 {
 		return
 	}
-	litSig, _ := pass.TypesInfo.TypeOf(lit).(*types.Signature)
-	if hasBoolWithoutError(litSig) || sigReturnsError(litSig) {
+	lhs := make([]ast.Expr, len(spec.Names))
+	for i, id := range spec.Names {
+		lhs[i] = id
+	}
+	recordVoidFuncLitPair(info, lhs, spec.Values, true, voidFuncVars)
+}
+
+func recordVoidFuncLitPair(
+	info *types.Info,
+	lhs []ast.Expr,
+	rhs []ast.Expr,
+	isDef bool,
+	voidFuncVars map[*types.Var][]*ast.FuncLit,
+) {
+	if info == nil {
 		return
 	}
-	inspectBoolScopeBody(pass, lit, lit.Body)
+	for i, expr := range rhs {
+		if i >= len(lhs) {
+			break
+		}
+		lit, ok := ast.Unparen(expr).(*ast.FuncLit)
+		if !ok || !isVoidInspectableFuncLit(info, lit) {
+			continue
+		}
+		id, ok := ast.Unparen(lhs[i]).(*ast.Ident)
+		if !ok || id.Name == "_" {
+			continue
+		}
+		v := resolveVarObj(info, id, isDef)
+		if v != nil {
+			voidFuncVars[v] = append(voidFuncVars[v], lit)
+		}
+	}
+}
+
+func resolveVarObj(info *types.Info, id *ast.Ident, isDef bool) *types.Var {
+	if isDef {
+		v, _ := info.Defs[id].(*types.Var)
+		return v
+	}
+	v, _ := info.Uses[id].(*types.Var)
+	return v
+}
+
+func isVoidInspectableFuncLit(info *types.Info, lit *ast.FuncLit) bool {
+	if lit == nil || lit.Body == nil {
+		return false
+	}
+	litSig, _ := info.TypeOf(lit).(*types.Signature)
+	return !hasBoolWithoutError(litSig) && !sigReturnsError(litSig)
+}
+
+func inspectCalledVoidFuncLit(
+	pass *analysis.Pass,
+	call *ast.CallExpr,
+	voidFuncVars map[*types.Var][]*ast.FuncLit,
+	visitedLits map[*ast.FuncLit]bool,
+) {
+	switch fn := ast.Unparen(call.Fun).(type) {
+	case *ast.FuncLit:
+		if isVoidInspectableFuncLit(pass.TypesInfo, fn) && !visitedLits[fn] {
+			visitedLits[fn] = true
+			inspectBoolScopeBody(pass, fn, fn.Body, voidFuncVars, visitedLits)
+		}
+	case *ast.Ident:
+		v, ok := pass.TypesInfo.Uses[fn].(*types.Var)
+		if !ok {
+			return
+		}
+		for _, lit := range voidFuncVars[v] {
+			if !visitedLits[lit] {
+				visitedLits[lit] = true
+				inspectBoolScopeBody(pass, lit, lit.Body, voidFuncVars, visitedLits)
+			}
+		}
+	}
 }
 
 func checkSwallowedRangeChanError(pass *analysis.Pass, rng *ast.RangeStmt) {

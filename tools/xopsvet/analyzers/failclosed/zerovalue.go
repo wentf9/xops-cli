@@ -203,7 +203,10 @@ func fieldReportRange(ts *ast.TypeSpec, f *types.Var) analysis.Range {
 }
 
 func isBoolFieldType(t types.Type) bool {
-	basic, ok := types.Unalias(t).(*types.Basic)
+	if t == nil {
+		return false
+	}
+	basic, ok := types.Unalias(t).Underlying().(*types.Basic)
 	return ok && basic.Kind() == types.Bool
 }
 

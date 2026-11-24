@@ -2,11 +2,9 @@ package sumexhaust
 
 import (
 	"go/ast"
-	"go/constant"
 	"go/token"
 	"go/types"
 	"strings"
-	"unicode"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 	"golang.org/x/tools/go/analysis"
@@ -71,13 +69,14 @@ func checkFailClosedDefault(
 		pass.ReportRangef(defaultClause, "sumexhaust: 安全决策 default 分支禁止为空，必须显式返回拒绝/错误或 panic")
 		return
 	}
-	sig := enclosingFuncSig(pass, ts)
+	enclosing, sig := enclosingFuncInfo(pass, ts)
 	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos())
 	state := defaultScanState{
 		pass:           pass,
 		sig:            sig,
 		inTest:         inTest,
 		permissiveVars: make(map[*types.Var]bool),
+		funcLitVars:    collectOuterFuncLitVars(pass.TypesInfo, enclosing, ts.Pos()),
 	}
 	res := inspectDefaultBlock(stmts, state)
 	if res.reportedFailOpen {
@@ -98,7 +97,7 @@ func nonEmptyStmts(stmts []ast.Stmt) []ast.Stmt {
 	return out
 }
 
-func enclosingFuncSig(pass *analysis.Pass, target ast.Node) *types.Signature {
+func enclosingFuncInfo(pass *analysis.Pass, target ast.Node) (ast.Node, *types.Signature) {
 	var enclosing ast.Node
 	for _, file := range pass.Files {
 		if target.Pos() < file.Pos() || target.Pos() > file.End() {
@@ -119,13 +118,58 @@ func enclosingFuncSig(pass *analysis.Pass, target ast.Node) *types.Signature {
 	case *ast.FuncDecl:
 		if obj := pass.TypesInfo.Defs[fn.Name]; obj != nil {
 			sig, _ := obj.Type().(*types.Signature)
-			return sig
+			return enclosing, sig
 		}
 	case *ast.FuncLit:
 		sig, _ := pass.TypesInfo.TypeOf(fn).(*types.Signature)
-		return sig
+		return enclosing, sig
 	}
-	return nil
+	return enclosing, nil
+}
+
+func collectOuterFuncLitVars(info *types.Info, enclosing ast.Node, beforePos token.Pos) map[*types.Var]*ast.FuncLit {
+	out := make(map[*types.Var]*ast.FuncLit)
+	if info == nil || enclosing == nil {
+		return out
+	}
+	ast.Inspect(enclosing, func(n ast.Node) bool {
+		if n == nil || n.Pos() >= beforePos {
+			return false
+		}
+		if lit, ok := n.(*ast.FuncLit); ok && lit != enclosing {
+			return false
+		}
+		switch node := n.(type) {
+		case *ast.AssignStmt:
+			recordFuncLitPair(info, node.Lhs, node.Rhs, node.Tok == token.DEFINE, out)
+		case *ast.ValueSpec:
+			recordFuncLitPair(info, identSliceToExprs(node.Names), node.Values, true, out)
+		}
+		return true
+	})
+	return out
+}
+
+func recordFuncLitPair(info *types.Info, lhs, rhs []ast.Expr, isDef bool, out map[*types.Var]*ast.FuncLit) {
+	for i, expr := range rhs {
+		v := resolveLHSVar(info, lhs, i, isDef)
+		if v == nil {
+			continue
+		}
+		if lit, ok := ast.Unparen(expr).(*ast.FuncLit); ok {
+			out[v] = lit
+		} else {
+			delete(out, v)
+		}
+	}
+}
+
+func identSliceToExprs(ids []*ast.Ident) []ast.Expr {
+	out := make([]ast.Expr, len(ids))
+	for i, id := range ids {
+		out[i] = id
+	}
+	return out
 }
 
 type defaultScanState struct {
@@ -133,6 +177,7 @@ type defaultScanState struct {
 	sig            *types.Signature
 	inTest         bool
 	permissiveVars map[*types.Var]bool
+	funcLitVars    map[*types.Var]*ast.FuncLit
 }
 
 type defaultScanResult struct {
@@ -165,8 +210,71 @@ func inspectDefaultStmt(s ast.Stmt, st defaultScanState) defaultScanResult {
 		return inspectDefaultBlock(nonEmptyStmts(node.List), st)
 	case *ast.IfStmt:
 		return inspectIfStmt(node, st)
+	case *ast.SwitchStmt:
+		return inspectSwitchStmt(node.Init, node.Body, st)
+	case *ast.TypeSwitchStmt:
+		return inspectSwitchStmt(node.Init, node.Body, st)
+	case *ast.ForStmt:
+		return inspectLoopStmt(node.Init, node.Body, st)
+	case *ast.RangeStmt:
+		return inspectLoopStmt(nil, node.Body, st)
+	case *ast.SelectStmt:
+		return inspectSelectStmt(node, st)
 	}
 	return res
+}
+
+// inspectSwitchStmt 扫描嵌套 switch/type-switch 分支以透传 fail-open 违规，
+// 因无法保证所有运行时分支均终止，故不置位 hasFailClosedAction。
+func inspectSwitchStmt(initStmt ast.Stmt, body *ast.BlockStmt, st defaultScanState) defaultScanResult {
+	reported := false
+	if initStmt != nil {
+		reported = inspectDefaultStmt(initStmt, st).reportedFailOpen
+	}
+	if body == nil {
+		return defaultScanResult{reportedFailOpen: reported}
+	}
+	for _, s := range body.List {
+		cc, ok := s.(*ast.CaseClause)
+		if !ok {
+			continue
+		}
+		if inspectDefaultBlock(nonEmptyStmts(cc.Body), st).reportedFailOpen {
+			reported = true
+		}
+	}
+	return defaultScanResult{reportedFailOpen: reported}
+}
+
+func inspectLoopStmt(initStmt ast.Stmt, body *ast.BlockStmt, st defaultScanState) defaultScanResult {
+	reported := false
+	if initStmt != nil {
+		reported = inspectDefaultStmt(initStmt, st).reportedFailOpen
+	}
+	if body != nil && inspectDefaultBlock(nonEmptyStmts(body.List), st).reportedFailOpen {
+		reported = true
+	}
+	return defaultScanResult{reportedFailOpen: reported}
+}
+
+func inspectSelectStmt(sel *ast.SelectStmt, st defaultScanState) defaultScanResult {
+	if sel == nil || sel.Body == nil {
+		return defaultScanResult{}
+	}
+	reported := false
+	for _, s := range sel.Body.List {
+		cc, ok := s.(*ast.CommClause)
+		if !ok {
+			continue
+		}
+		if cc.Comm != nil && inspectDefaultStmt(cc.Comm, st).reportedFailOpen {
+			reported = true
+		}
+		if inspectDefaultBlock(nonEmptyStmts(cc.Body), st).reportedFailOpen {
+			reported = true
+		}
+	}
+	return defaultScanResult{reportedFailOpen: reported}
 }
 
 func inspectIfStmt(ifNode *ast.IfStmt, st defaultScanState) defaultScanResult {
@@ -194,7 +302,7 @@ func checkReturnStmt(ret *ast.ReturnStmt, st defaultScanState, res *defaultScanR
 		return false
 	}
 	for _, expr := range ret.Results {
-		if isPermissiveExpr(st.pass.TypesInfo, expr, st.permissiveVars) {
+		if isPermissiveExpr(st.pass.TypesInfo, expr, st) {
 			st.pass.ReportRangef(ret, "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）")
 			return true
 		}
@@ -243,11 +351,7 @@ func checkDeclStmt(decl *ast.DeclStmt, st defaultScanState) bool {
 		if !ok || len(vs.Values) == 0 {
 			continue
 		}
-		lhs := make([]ast.Expr, len(vs.Names))
-		for i, id := range vs.Names {
-			lhs[i] = id
-		}
-		if checkExprPairPermissive(vs, lhs, vs.Values, true, st) {
+		if checkExprPairPermissive(vs, identSliceToExprs(vs.Names), vs.Values, true, st) {
 			reported = true
 		}
 	}
@@ -264,21 +368,35 @@ func checkExprPairPermissive(
 	reported := false
 	for i, expr := range rhs {
 		lhsVar := resolveLHSVar(st.pass.TypesInfo, lhs, i, isDef)
-		if isPermissiveExpr(st.pass.TypesInfo, expr, st.permissiveVars) {
-			if lhsVar != nil {
-				st.permissiveVars[lhsVar] = true
-			}
-			if !reported {
-				st.pass.ReportRangef(reportNode, "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）")
-				reported = true
-			}
-			continue
-		}
-		if lhsVar != nil {
-			delete(st.permissiveVars, lhsVar)
+		if checkSingleExprPermissive(lhsVar, expr, st) && !reported {
+			st.pass.ReportRangef(reportNode, "sumexhaust: 安全决策 default 分支禁止赋值放行值（fail-open）")
+			reported = true
 		}
 	}
 	return reported
+}
+
+func checkSingleExprPermissive(lhsVar *types.Var, expr ast.Expr, st defaultScanState) bool {
+	if lit, ok := ast.Unparen(expr).(*ast.FuncLit); ok {
+		if lhsVar != nil {
+			st.funcLitVars[lhsVar] = lit
+			delete(st.permissiveVars, lhsVar)
+		}
+		return false
+	}
+	if lhsVar != nil {
+		delete(st.funcLitVars, lhsVar)
+	}
+	if isPermissiveExpr(st.pass.TypesInfo, expr, st) {
+		if lhsVar != nil {
+			st.permissiveVars[lhsVar] = true
+		}
+		return true
+	}
+	if lhsVar != nil {
+		delete(st.permissiveVars, lhsVar)
+	}
+	return false
 }
 
 func resolveLHSVar(info *types.Info, lhs []ast.Expr, idx int, isDef bool) *types.Var {
@@ -320,166 +438,4 @@ func isFailClosedCall(st defaultScanState, expr ast.Expr) bool {
 	default:
 		return false
 	}
-}
-
-func isPermissiveExpr(info *types.Info, expr ast.Expr, permissiveVars map[*types.Var]bool) bool {
-	if isBoolConstExpr(info, expr, true) {
-		return true
-	}
-	if info != nil && len(permissiveVars) > 0 {
-		if id, ok := ast.Unparen(expr).(*ast.Ident); ok {
-			if v, ok := info.Uses[id].(*types.Var); ok && permissiveVars[v] {
-				return true
-			}
-		}
-	}
-	id := rightmostIdent(expr)
-	if id == nil {
-		return false
-	}
-	return hasAnyToken(id.Name, isPermissiveToken)
-}
-
-func isFailClosedValueExpr(info *types.Info, expr ast.Expr) bool {
-	if isBoolConstExpr(info, expr, false) {
-		return true
-	}
-	if call, ok := ast.Unparen(expr).(*ast.CallExpr); ok {
-		if tv, ok := info.Types[call]; ok && vetutil.IsErrorInterfaceType(tv.Type) {
-			return true
-		}
-	}
-	id := rightmostIdent(expr)
-	return id != nil && hasAnyToken(id.Name, isFailClosedToken)
-}
-
-func rightmostIdent(expr ast.Expr) *ast.Ident {
-	cur := unwrapExprChain(expr)
-	switch e := cur.(type) {
-	case *ast.Ident:
-		return e
-	case *ast.SelectorExpr:
-		return e.Sel
-	default:
-		return nil
-	}
-}
-
-func unwrapExprChain(expr ast.Expr) ast.Expr {
-	cur := ast.Unparen(expr)
-	for cur != nil {
-		switch e := cur.(type) {
-		case *ast.UnaryExpr:
-			if e.Op != token.AND {
-				return cur
-			}
-			cur = ast.Unparen(e.X)
-		case *ast.CompositeLit:
-			if e.Type == nil {
-				return cur
-			}
-			cur = ast.Unparen(e.Type)
-		case *ast.CallExpr:
-			cur = ast.Unparen(e.Fun)
-		case *ast.IndexExpr:
-			cur = ast.Unparen(e.X)
-		case *ast.IndexListExpr:
-			cur = ast.Unparen(e.X)
-		default:
-			return cur
-		}
-	}
-	return nil
-}
-
-func isBoolConstExpr(info *types.Info, expr ast.Expr, want bool) bool {
-	if info == nil || expr == nil {
-		return false
-	}
-	if tv, ok := info.Types[expr]; ok && tv.Value != nil && tv.Value.Kind() == constant.Bool {
-		return constant.BoolVal(tv.Value) == want
-	}
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok {
-		return false
-	}
-	c, ok := info.Uses[id].(*types.Const)
-	if !ok || c.Val() == nil || c.Val().Kind() != constant.Bool {
-		return false
-	}
-	return constant.BoolVal(c.Val()) == want
-}
-
-func isNilIdent(info *types.Info, expr ast.Expr) bool {
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok {
-		return false
-	}
-	_, isNil := info.Uses[id].(*types.Nil)
-	return isNil || id.Name == "nil"
-}
-
-func hasAnyToken(name string, pred func(string) bool) bool {
-	for _, tok := range splitCamelTokens(name) {
-		if pred(tok) {
-			return true
-		}
-	}
-	return false
-}
-
-func isPermissiveToken(tok string) bool {
-	switch tok {
-	case "allow", "allowed", "permit", "permitted", "grant", "granted", "approve", "approved":
-		return true
-	default:
-		return false
-	}
-}
-
-func isFailClosedToken(tok string) bool {
-	switch tok {
-	case "deny", "denied", "reject", "rejected", "invalid", "unknown", "fail", "failed", "err", "error", "forbid", "forbidden", "closed", "disabled":
-		return true
-	default:
-		return false
-	}
-}
-
-func splitCamelTokens(name string) []string {
-	var tokens []string
-	for _, part := range strings.Split(name, "_") {
-		if part == "" {
-			continue
-		}
-		tokens = append(tokens, splitCamelWord(part)...)
-	}
-	return tokens
-}
-
-func splitCamelWord(word string) []string {
-	runes := []rune(word)
-	var out []string
-	start := 0
-	for i := 1; i < len(runes); i++ {
-		if isWordBoundary(runes, i) {
-			out = append(out, strings.ToLower(string(runes[start:i])))
-			start = i
-		}
-	}
-	if start < len(runes) {
-		out = append(out, strings.ToLower(string(runes[start:])))
-	}
-	return out
-}
-
-func isWordBoundary(runes []rune, i int) bool {
-	prev, cur := runes[i-1], runes[i]
-	if unicode.IsLower(prev) && unicode.IsUpper(cur) {
-		return true
-	}
-	if i+1 < len(runes) && unicode.IsUpper(prev) && unicode.IsUpper(cur) && unicode.IsLower(runes[i+1]) {
-		return true
-	}
-	return false
 }

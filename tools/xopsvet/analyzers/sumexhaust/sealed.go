@@ -284,35 +284,110 @@ func methodSetImplementsGeneric(ms *types.MethodSet, iface *types.Interface) boo
 	return true
 }
 
+type typePair struct {
+	a types.Type
+	b types.Type
+}
+
 func compatibleUninstantiatedMethodSig(fnSig, imSig *types.Signature) bool {
+	return compatibleSignatureTypes(fnSig, imSig, make(map[typePair]bool))
+}
+
+func compatibleSignatureTypes(fnSig, imSig *types.Signature, seen map[typePair]bool) bool {
 	if fnSig == nil || imSig == nil || fnSig.Variadic() != imSig.Variadic() {
 		return false
 	}
-	return compatibleTupleTypes(fnSig.Params(), imSig.Params()) &&
-		compatibleTupleTypes(fnSig.Results(), imSig.Results())
+	return compatibleTupleTypesSeen(fnSig.Params(), imSig.Params(), seen) &&
+		compatibleTupleTypesSeen(fnSig.Results(), imSig.Results(), seen)
 }
 
-func compatibleTupleTypes(fnTup, imTup *types.Tuple) bool {
+func compatibleTupleTypesSeen(fnTup, imTup *types.Tuple, seen map[typePair]bool) bool {
 	if fnTup.Len() != imTup.Len() {
 		return false
 	}
 	for i := 0; i < fnTup.Len(); i++ {
-		if !compatibleSingleType(fnTup.At(i).Type(), imTup.At(i).Type()) {
+		if !compatibleSingleTypeSeen(fnTup.At(i).Type(), imTup.At(i).Type(), seen) {
 			return false
 		}
 	}
 	return true
 }
 
-func compatibleSingleType(fnType, imType types.Type) bool {
-	fnHasTP := hasTypeParam(fnType)
-	imHasTP := hasTypeParam(imType)
-	if !fnHasTP && !imHasTP {
-		return types.Identical(fnType, imType)
+func compatibleSingleTypeSeen(fnType, imType types.Type, seen map[typePair]bool) bool {
+	fnU := types.Unalias(fnType)
+	imU := types.Unalias(imType)
+	pair := typePair{a: fnU, b: imU}
+	if seen[pair] {
+		return true
 	}
-	if tp, ok := types.Unalias(fnType).(*types.TypeParam); ok && !imHasTP && imType != types.Typ[types.Invalid] {
-		if constraint, ok := tp.Constraint().Underlying().(*types.Interface); ok {
-			return types.Satisfies(imType, constraint)
+	seen[pair] = true
+
+	if !hasTypeParam(fnU) && !hasTypeParam(imU) {
+		return types.Identical(fnU, imU)
+	}
+	if tp, ok := fnU.(*types.TypeParam); ok {
+		return compatibleTypeParamWithType(tp, imU)
+	}
+	// 接口侧本身仍为未实例化类型参数时（例如泛型函数内部对 Gen[T] 做 type switch），复合类型参数具备潜在匹配可能。
+	if _, ok := imU.(*types.TypeParam); ok {
+		return true
+	}
+	return compatibleCompoundType(fnU, imU, seen)
+}
+
+func compatibleTypeParamWithType(tp *types.TypeParam, imU types.Type) bool {
+	if hasTypeParam(imU) || imU == types.Typ[types.Invalid] {
+		return true
+	}
+	if constraint, ok := tp.Constraint().Underlying().(*types.Interface); ok {
+		return types.Satisfies(imU, constraint)
+	}
+	return true
+}
+
+func compatibleCompoundType(fnU, imU types.Type, seen map[typePair]bool) bool {
+	switch fv := fnU.(type) {
+	case *types.Slice:
+		iv, ok := imU.(*types.Slice)
+		return ok && compatibleSingleTypeSeen(fv.Elem(), iv.Elem(), seen)
+	case *types.Pointer:
+		iv, ok := imU.(*types.Pointer)
+		return ok && compatibleSingleTypeSeen(fv.Elem(), iv.Elem(), seen)
+	case *types.Array:
+		iv, ok := imU.(*types.Array)
+		return ok && fv.Len() == iv.Len() && compatibleSingleTypeSeen(fv.Elem(), iv.Elem(), seen)
+	case *types.Chan:
+		iv, ok := imU.(*types.Chan)
+		return ok && fv.Dir() == iv.Dir() && compatibleSingleTypeSeen(fv.Elem(), iv.Elem(), seen)
+	case *types.Map:
+		iv, ok := imU.(*types.Map)
+		return ok && compatibleSingleTypeSeen(fv.Key(), iv.Key(), seen) && compatibleSingleTypeSeen(fv.Elem(), iv.Elem(), seen)
+	case *types.Named:
+		iv, ok := imU.(*types.Named)
+		return ok && compatibleNamedTypeArgs(fv, iv, seen)
+	case *types.Signature:
+		iv, ok := imU.(*types.Signature)
+		return ok && compatibleSignatureTypes(fv, iv, seen)
+	default:
+		return false
+	}
+}
+
+func compatibleNamedTypeArgs(fnNamed, imNamed *types.Named, seen map[typePair]bool) bool {
+	if fnNamed.Origin() == nil || fnNamed.Origin() != imNamed.Origin() {
+		return false
+	}
+	fnArgs := fnNamed.TypeArgs()
+	imArgs := imNamed.TypeArgs()
+	if fnArgs == nil && imArgs == nil {
+		return true
+	}
+	if fnArgs == nil || imArgs == nil || fnArgs.Len() != imArgs.Len() {
+		return false
+	}
+	for i := 0; i < fnArgs.Len(); i++ {
+		if !compatibleSingleTypeSeen(fnArgs.At(i), imArgs.At(i), seen) {
+			return false
 		}
 	}
 	return true

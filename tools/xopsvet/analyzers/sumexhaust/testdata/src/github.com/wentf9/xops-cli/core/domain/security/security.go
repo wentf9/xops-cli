@@ -202,3 +202,151 @@ func validAssignAndReturnErrDefault(d GuardrailDecision) error {
 		return err
 	}
 }
+
+// Challenger 2 - Challenge 1: default 内嵌 switch/type-switch/for/range/select 及内联/局部闭包放行逃逸。
+func invalidSwitchInDefault(d GuardrailDecision, n int) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		switch n {
+		case 1:
+			return true // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		}
+		return false
+	}
+}
+
+func invalidTypeSwitchInDefault(d GuardrailDecision, x any) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		switch x.(type) {
+		case int:
+			return true // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		}
+		return false
+	}
+}
+
+func invalidForInDefault(d GuardrailDecision, cond bool) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		for cond {
+			return true // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		}
+		return false
+	}
+}
+
+func invalidRangeInDefault(d GuardrailDecision, xs []int) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		for range xs {
+			return true // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		}
+		return false
+	}
+}
+
+func invalidSelectInDefault(d GuardrailDecision, ch <-chan int) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		select {
+		case <-ch:
+			return true // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+		default:
+			return false
+		}
+	}
+}
+
+func invalidIIFEInDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() bool { return true }() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidClosureVarInDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		fn := func() bool {
+			ok := true
+			return ok
+		}
+		return fn() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidOuterClosureVarInDefault(d GuardrailDecision) bool {
+	fn := func() bool { return true }
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return fn() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidClosureVarNilErrInDefault(d GuardrailDecision) error {
+	switch d.(type) {
+	case *DecisionDeny:
+		return errors.New("denied")
+	case *DecisionAllow:
+		return nil
+	default:
+		fn := func() error { return nil }
+		return fn() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func validIIFEFailClosedDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return func() bool { return false }()
+	}
+}
+
+func validClosureVarFailClosedDefault(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		fn := func() bool { return false }
+		return fn()
+	}
+}

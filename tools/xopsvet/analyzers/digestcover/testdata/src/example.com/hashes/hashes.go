@@ -276,3 +276,97 @@ func (o *OuterDirectInnerValid) WriteCanonical(w io.Writer) {
 	_, _ = io.WriteString(w, o.MidField)
 	_, _ = io.WriteString(w, o.OwnField)
 }
+
+// Challenger 2 - Challenge 3: o.Middle.LeafA 等显式子字段选择不得将整个嵌入体标记为已覆盖。
+//xops:canonicalhash
+type OuterDirectMiddleBypass struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterDirectMiddleBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterDirectMiddleBypass 的 WriteCanonical 未覆盖字段 MiddleLayer"
+	_, _ = io.WriteString(w, o.MiddleLayer.LeafA)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterDirectInnerFieldBypass struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterDirectInnerFieldBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterDirectInnerFieldBypass 的 WriteCanonical 未覆盖字段 MiddleLayer"
+	_, _ = io.WriteString(w, o.MiddleLayer.InnerLeaf.LeafA)
+	_, _ = io.WriteString(w, o.MiddleLayer.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterPromotedInnerFieldBypass struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterPromotedInnerFieldBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterPromotedInnerFieldBypass 的 WriteCanonical 未覆盖字段 MiddleLayer"
+	_, _ = io.WriteString(w, o.InnerLeaf.LeafA)
+	_, _ = io.WriteString(w, o.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterDirectMiddleAllFieldsValid struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterDirectMiddleAllFieldsValid) WriteCanonical(w io.Writer) {
+	_, _ = io.WriteString(w, o.MiddleLayer.MidField)
+	_, _ = io.WriteString(w, o.MiddleLayer.LeafA)
+	if o.MiddleLayer.LeafB > 0 {
+		_, _ = io.WriteString(w, "b")
+	}
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+func (m MiddleLayer) WriteCanonical(w io.Writer) {
+	m.InnerLeaf.WriteCanonical(w)
+	_, _ = io.WriteString(w, m.MidField)
+}
+
+//xops:canonicalhash
+type OuterDirectMiddleMethodValid struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterDirectMiddleMethodValid) WriteCanonical(w io.Writer) {
+	o.MiddleLayer.WriteCanonical(w)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+func encodeMiddleLayer(w io.Writer, m MiddleLayer) {
+	m.WriteCanonical(w)
+}
+
+//xops:canonicalhash
+type OuterDirectMiddleValueValid struct {
+	MiddleLayer
+	OwnField string
+}
+
+func (o *OuterDirectMiddleValueValid) WriteCanonical(w io.Writer) {
+	encodeMiddleLayer(w, o.MiddleLayer)
+	_, _ = io.WriteString(w, o.OwnField)
+}
+
+//xops:canonicalhash
+type OuterExtDirectFieldBypass struct {
+	MiddleWithExt
+	OwnField string
+}
+
+func (o *OuterExtDirectFieldBypass) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 OuterExtDirectFieldBypass 的 WriteCanonical 未覆盖字段 MiddleWithExt"
+	_, _ = io.WriteString(w, o.MiddleWithExt.Public)
+	_, _ = io.WriteString(w, o.MiddleWithExt.MidField)
+	_, _ = io.WriteString(w, o.OwnField)
+}

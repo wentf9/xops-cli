@@ -135,3 +135,28 @@ func swallowBoolNotLast(s string) (bool, string) {
 	_, err := strconv.Atoi(s) // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
 	return err == nil, s
 }
+
+// Challenger 2 - Challenge 4: 局部闭包变量绑定无返回 FuncLit 并调用时仍应检测吞噬 error。
+func swallowInLocalVoidClosureVar() bool {
+	fn := func() {
+		_ = produceErr() // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	}
+	fn()
+	return true
+}
+
+func swallowInDeferLocalVoidClosureVar() bool {
+	var fn = func() {
+		_ = produceErr() // want "failclosed: 返回 bool 的函数禁止吞噬新产生的局部 error"
+	}
+	defer fn()
+	return true
+}
+
+func validLocalVoidClosureVarPureIs(err error) bool {
+	fn := func() {
+		_ = errors.Is(err, errSentinel)
+	}
+	fn()
+	return err != nil
+}

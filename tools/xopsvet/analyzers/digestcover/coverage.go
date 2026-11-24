@@ -74,90 +74,19 @@ func extractRecvVar(info *types.Info, fn *ast.FuncDecl) *types.Var {
 	return v
 }
 
-func isFieldCovered(passPkg *types.Package, f *types.Var, state *coverageState) bool {
-	if state.covered[f] {
-		return true
-	}
-	if !f.Embedded() {
-		return false
-	}
-	embSt := unwrapEmbeddedStruct(f.Type())
-	if embSt == nil || embSt.NumFields() == 0 {
-		return false
-	}
-	return allEmbeddedFieldsPromoted(passPkg, embSt, state.promoted[f], make(map[*types.Struct]bool))
-}
-
-func unwrapEmbeddedStruct(t types.Type) *types.Struct {
-	if embNamed, ok := vetutil.UnwrapNamedType(t); ok {
-		embSt, _ := embNamed.Underlying().(*types.Struct)
-		return embSt
-	}
-	u := types.Unalias(t)
-	if ptr, isPtr := u.(*types.Pointer); isPtr {
-		u = types.Unalias(ptr.Elem())
-	}
-	embSt, _ := u.(*types.Struct)
-	return embSt
-}
-
-func allEmbeddedFieldsPromoted(
-	passPkg *types.Package,
-	embSt *types.Struct,
-	hits map[*types.Var]bool,
-	seen map[*types.Struct]bool,
-) bool {
-	if hits == nil || embSt == nil || seen[embSt] {
-		return false
-	}
-	seen[embSt] = true
-	for i := 0; i < embSt.NumFields(); i++ {
-		if !isEmbeddedSubFieldCovered(passPkg, embSt.Field(i), hits, seen) {
-			return false
-		}
-	}
-	return true
-}
-
-func isEmbeddedSubFieldCovered(
-	passPkg *types.Package,
-	ef *types.Var,
-	hits map[*types.Var]bool,
-	seen map[*types.Struct]bool,
-) bool {
-	if ef.Name() == "_" {
-		return true
-	}
-	// 嵌入体含本包不可见的未导出字段时，仅靠提升字段无法覆盖全貌，必须显式访问嵌入体自身。
-	if !ef.Exported() && ef.Pkg() != passPkg {
-		return false
-	}
-	// 使用 Origin() 归一化泛型嵌入体字段对象，避免实例化字段指针差异引发误报。
-	if hits[ef.Origin()] {
-		return true
-	}
-	if !ef.Embedded() {
-		return false
-	}
-	nested := unwrapEmbeddedStruct(ef.Type())
-	if nested == nil || nested.NumFields() == 0 {
-		return false
-	}
-	return allEmbeddedFieldsPromoted(passPkg, nested, hits, seen)
-}
-
 func analyzeFuncBody(pass *analysis.Pass, body *ast.BlockStmt, targetVar *types.Var, state *coverageState) {
 	if targetVar == nil {
 		return
 	}
 	aliases := collectImmutableAliases(pass.TypesInfo, body, targetVar)
 	ignored := collectIgnoredSelectors(body)
+	fieldPrefixes := collectFieldPathPrefixes(pass.TypesInfo, body)
 
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch node := n.(type) {
 		case *ast.SelectorExpr:
 			if !ignored[node] {
-				recordSelectorCoverage(pass.TypesInfo, node, aliases, state)
+				recordSelectorCoverage(pass.TypesInfo, node, aliases, fieldPrefixes, state)
 			}
 		case *ast.CallExpr:
 			recurseIntoHelperCalls(pass, node, aliases, state)
@@ -349,55 +278,6 @@ func isAliasExpr(info *types.Info, expr ast.Expr, aliases map[*types.Var]bool) b
 			return false
 		}
 	}
-}
-
-func recordSelectorCoverage(
-	info *types.Info,
-	selExpr *ast.SelectorExpr,
-	aliases map[*types.Var]bool,
-	state *coverageState,
-) {
-	sel, ok := info.Selections[selExpr]
-	if !ok || sel == nil || !isAliasExpr(info, selExpr.X, aliases) {
-		return
-	}
-	idx := sel.Index()
-	if len(idx) == 1 {
-		recordDirectFieldHit(sel.Obj(), state)
-		return
-	}
-	if len(idx) > 1 {
-		recordPromotedFieldHit(idx[0], sel.Obj(), state)
-	}
-}
-
-func recordDirectFieldHit(obj types.Object, state *coverageState) {
-	v, ok := obj.(*types.Var)
-	if !ok {
-		return
-	}
-	orig := v.Origin()
-	if state.target.fieldSet[orig] {
-		state.covered[orig] = true
-	}
-}
-
-func recordPromotedFieldHit(topIdx int, obj types.Object, state *coverageState) {
-	if topIdx >= state.target.stType.NumFields() {
-		return
-	}
-	topField := state.target.stType.Field(topIdx)
-	if !state.target.fieldSet[topField] {
-		return
-	}
-	leafVar, ok := obj.(*types.Var)
-	if !ok {
-		return
-	}
-	if state.promoted[topField] == nil {
-		state.promoted[topField] = make(map[*types.Var]bool)
-	}
-	state.promoted[topField][leafVar.Origin()] = true
 }
 
 func recurseIntoHelperCalls(

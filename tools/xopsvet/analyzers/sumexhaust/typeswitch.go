@@ -115,8 +115,8 @@ func markSubInterfaceCovered(subIface *types.Interface, info *sealedInfo, covere
 			matched = append(matched, i)
 		}
 	}
-	// 当存在多个必填变体且子接口恰好覆盖全部变体时，视为等价全覆盖逃生口并拒绝计入覆盖。
-	if len(info.variants) > 1 && len(matched) == len(info.variants) {
+	// 当子接口恰好覆盖全部必填变体（含单变体封闭接口）时，视为等价全覆盖逃生口并拒绝计入覆盖。
+	if len(info.variants) > 0 && len(matched) == len(info.variants) {
 		return
 	}
 	for _, idx := range matched {

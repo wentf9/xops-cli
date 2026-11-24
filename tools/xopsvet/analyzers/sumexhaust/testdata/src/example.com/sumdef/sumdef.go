@@ -199,3 +199,117 @@ func checkMultiArityMissing(g GenMultiBox[int]) int {
 		return 0
 	}
 }
+
+// Challenger 2 - Challenge 2: 复合类型参数方法签名不兼容时不得产生误报。
+type GenWithRes[T any] interface {
+	sealedGenRes()
+	Get() T
+}
+
+type GoodMulti[A, B any] struct{ V A }
+
+func (*GoodMulti[A, B]) sealedGenRes() {}
+func (g *GoodMulti[A, B]) Get() A      { return g.V }
+
+type BadSlice[A, B any] struct{ V []A }
+
+func (*BadSlice[A, B]) sealedGenRes() {}
+func (b *BadSlice[A, B]) Get() []A    { return b.V }
+
+func checkGenWithResValid(g GenWithRes[int]) int {
+	switch v := g.(type) {
+	case *GoodMulti[int, string]:
+		return v.Get()
+	default:
+		return 0
+	}
+}
+
+func checkGenWithResMissing(g GenWithRes[int]) int {
+	switch g.(type) { // want "sumexhaust: 对封闭接口 GenWithRes\\[int\\] 的 type switch 缺少变体: \\*GoodMulti\\[A, B any\\]"
+	default:
+		return 0
+	}
+}
+
+type GenWithSlice[T any] interface {
+	sealedGenSlice()
+	Get() []T
+}
+
+type GoodSlice[A, B any] struct{ V []A }
+
+func (*GoodSlice[A, B]) sealedGenSlice() {}
+func (g *GoodSlice[A, B]) Get() []A      { return g.V }
+
+type BadConstrainedScalar[A ~int, B any] struct{ V A }
+
+func (*BadConstrainedScalar[A, B]) sealedGenSlice() {}
+func (b *BadConstrainedScalar[A, B]) Get() A        { return b.V }
+
+func checkGenWithSliceValid(g GenWithSlice[int]) int {
+	switch v := g.(type) {
+	case *GoodSlice[int, string]:
+		return len(v.Get())
+	default:
+		return 0
+	}
+}
+
+type Pair[K, V any] struct {
+	Key K
+	Val V
+}
+
+type GenWithPair[T any] interface {
+	sealedGenPair()
+	Get() Pair[T, string]
+}
+
+type GoodPair[A, B any] struct{ P Pair[A, B] }
+
+func (*GoodPair[A, B]) sealedGenPair()    {}
+func (g *GoodPair[A, B]) Get() Pair[A, B] { return g.P }
+
+type BadPairSlice[A, B any] struct{ P []Pair[A, B] }
+
+func (*BadPairSlice[A, B]) sealedGenPair()      {}
+func (b *BadPairSlice[A, B]) Get() []Pair[A, B] { return b.P }
+
+func checkGenWithPairValid(g GenWithPair[int]) int {
+	switch v := g.(type) {
+	case *GoodPair[int, string]:
+		return v.Get().Key
+	default:
+		return 0
+	}
+}
+
+// Challenger 2 - Challenge 5: 单变体封闭接口不得被全覆盖非空子接口绕过。
+type SingleSealed interface {
+	sealedSingle()
+	Extra() string
+}
+
+type SingleImpl struct{}
+
+func (*SingleImpl) sealedSingle() {}
+func (*SingleImpl) Extra() string { return "ok" }
+
+func checkSingleSealedExtraIfaceBypass(s SingleSealed) string {
+	switch s.(type) { // want "sumexhaust: 对封闭接口 SingleSealed 的 type switch 缺少变体: \\*SingleImpl"
+	case interface{ Extra() string }:
+		return "bypass"
+	default:
+		return "none"
+	}
+}
+
+func checkSingleSealedValid(s SingleSealed) string {
+	switch s.(type) {
+	case *SingleImpl:
+		return "ok"
+	default:
+		return "none"
+	}
+}
