@@ -38,6 +38,7 @@ CROSS_PLATFORM_PREFIXES = (
     "core/osfs/",
     "core/ports/",
     "core/conc/",
+    "core/engine/",
     "core/internal/foundation/",
     "core/internal/sshnet/",
     "core/internal/pool/",
@@ -50,6 +51,7 @@ CROSS_PLATFORM_PREFIXES = (
 
 CROSS_PLATFORM_EXACT = {
     "Makefile",
+    ".gitattributes",
     "go.work",
     "go.work.sum",
     "go.mod",
@@ -67,7 +69,7 @@ CROSS_PLATFORM_EXACT = {
 }
 
 PLATFORM_GO_RE = re.compile(
-    r"_(windows|darwin|unix|nonwindows|other|platform)(_test)?\.go$"
+    r"_(windows|darwin|unix|linux|freebsd|bsd|posix|nonwindows|other|platform|amd64|arm64)(_test)?\.go$"
 )
 
 
@@ -126,7 +128,7 @@ def is_zero_sha(sha: str) -> bool:
 def default_git_runner(args: list[str], cwd: str | None = None) -> tuple[int, str]:
     try:
         proc = subprocess.run(
-            ["git"] + args,
+            ["git", "-c", "core.quotePath=false"] + args,
             cwd=cwd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

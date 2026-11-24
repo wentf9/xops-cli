@@ -136,9 +136,57 @@ jobs:
           working-directory: core
           args: --max-issues-per-linter=0 --max-same-issues=0 ./...
 
+      - name: golangci-lint (core, GOOS=windows)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_core == 'true'
+        uses: golangci/golangci-lint-action@v9
+        env:
+          GOWORK: off
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        with:
+          version: v2.15
+          working-directory: core
+          args: --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+      - name: golangci-lint (core, GOOS=darwin)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_core == 'true'
+        uses: golangci/golangci-lint-action@v9
+        env:
+          GOWORK: off
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        with:
+          version: v2.15
+          working-directory: core
+          args: --max-issues-per-linter=0 --max-same-issues=0 ./...
+
       - name: golangci-lint (root CLI)
         if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_root == 'true'
         uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15
+          args: --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+      - name: golangci-lint (root CLI, GOOS=windows)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_root == 'true'
+        uses: golangci/golangci-lint-action@v9
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        with:
+          version: v2.15
+          args: --max-issues-per-linter=0 --max-same-issues=0 ./...
+
+      - name: golangci-lint (root CLI, GOOS=darwin)
+        if: steps.changes.outputs.code == 'true' && steps.modules.outputs.has_root == 'true'
+        uses: golangci/golangci-lint-action@v9
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: '0'
         with:
           version: v2.15
           args: --max-issues-per-linter=0 --max-same-issues=0 ./...

@@ -161,6 +161,11 @@ class TestCIChangesClassification(unittest.TestCase):
             ("scripts/test_ci_changes.py", True, True, True),
             ("core/internal/mcpruntime/journal_windows.go", True, True, True),
             ("core/conc/nursery_windows_test.go", True, True, True),
+            (".gitattributes", True, False, True),
+            ("core/engine/engine.go", True, True, True),
+            ("core/domain/secret/mem_linux.go", True, True, True),
+            ("core/domain/secret/mem_freebsd.go", True, True, True),
+            ("core/domain/secret/mem_arm64.go", True, True, True),
         ]
         for path, exp_code, exp_core, exp_cross in additional_paths:
             with self.subTest(path=path):

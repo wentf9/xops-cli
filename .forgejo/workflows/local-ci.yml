@@ -29,12 +29,13 @@ jobs:
           set -eu
           SERVER_URL="${GITHUB_SERVER_URL%/}"
           AUTH_URL="$(printf '%s' "$SERVER_URL" | sed -E "s#(https?://)#\\1x-access-token:${GITHUB_TOKEN}@#")"
+          trap 'git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git" 2>/dev/null || true' EXIT
           rm -rf .git
           git init -q .
           git remote add origin "${AUTH_URL}/${GITHUB_REPOSITORY}.git"
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout -qf FETCH_HEAD
-          git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git clean -ffdx
       - name: Verify toolchain, CI scripts & docs
         run: |
           set -eu
@@ -69,16 +70,36 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $serverUrl = $env:GITHUB_SERVER_URL.TrimEnd('/')
           $authUrl = $serverUrl -replace '^(https?://)', "`$1x-access-token:$($env:GITHUB_TOKEN)@"
-          if (Test-Path .git) { Remove-Item -Recurse -Force .git }
-          git init -q .
+          try {
+            if (Test-Path .git) { Remove-Item -Recurse -Force .git }
+            git init -q .
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git remote add origin "$authUrl/$($env:GITHUB_REPOSITORY).git"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git fetch --depth 1 origin $env:GITHUB_SHA
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git checkout -qf FETCH_HEAD
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git clean -ffdx
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          } finally {
+            git remote set-url origin "$serverUrl/$($env:GITHUB_REPOSITORY).git" 2>$null
+          }
+      - name: Run native Windows Make without sh.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $makeExecutable = (Get-Command make -ErrorAction Stop).Source
+          $env:PATH = (($env:PATH -split ';') | Where-Object {
+            $_ -and -not (Test-Path (Join-Path $_ 'sh.exe'))
+          }) -join ';'
+          Remove-Item Env:SHELL, Env:MAKESHELL -ErrorAction SilentlyContinue
+          & $makeExecutable help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git remote add origin "$authUrl/$($env:GITHUB_REPOSITORY).git"
+          & $makeExecutable 'DATE=2026-09-14 12:00:00'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git fetch --depth 1 origin $env:GITHUB_SHA
+          & $makeExecutable clean
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git checkout -qf FETCH_HEAD
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git remote set-url origin "$serverUrl/$($env:GITHUB_REPOSITORY).git"
       - name: Native Windows verification (verify.go)
         shell: pwsh
         run: |
@@ -100,12 +121,13 @@ jobs:
           set -eu
           SERVER_URL="${GITHUB_SERVER_URL%/}"
           AUTH_URL="$(printf '%s' "$SERVER_URL" | sed -E "s#(https?://)#\\1x-access-token:${GITHUB_TOKEN}@#")"
+          trap 'git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git" 2>/dev/null || true' EXIT
           rm -rf .git
           git init -q .
           git remote add origin "${AUTH_URL}/${GITHUB_REPOSITORY}.git"
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout -qf FETCH_HEAD
-          git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git clean -ffdx
       - name: Native Ubuntu verification & host integration
         run: |
           set -eu
@@ -127,12 +149,13 @@ jobs:
           set -eu
           SERVER_URL="${GITHUB_SERVER_URL%/}"
           AUTH_URL="$(printf '%s' "$SERVER_URL" | sed -E "s#(https?://)#\\1x-access-token:${GITHUB_TOKEN}@#")"
+          trap 'git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git" 2>/dev/null || true' EXIT
           rm -rf .git
           git init -q .
           git remote add origin "${AUTH_URL}/${GITHUB_REPOSITORY}.git"
           git fetch --depth 1 origin "${GITHUB_SHA}"
           git checkout -qf FETCH_HEAD
-          git remote set-url origin "${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git clean -ffdx
       - name: Native FreeBSD verification (verify.go)
         run: |
           set -eu

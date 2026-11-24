@@ -21,10 +21,8 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 WORK_TMP="$(mktemp -d "${TMPDIR:-/tmp}/xops-local-ci-${RUN_ID}.XXXXXX")"
 LOG_DIR="${WORK_TMP}/logs"
-mkdir -p "$LOG_DIR"
-
-# 记录本次脚本主动唤醒的 VM，退出时仅休眠这些 VM
-WOKEN_VMS=()
+WOKEN_DIR="${WORK_TMP}/woken_vms"
+mkdir -p "$LOG_DIR" "$WOKEN_DIR"
 
 usage() {
   cat <<'EOF'
@@ -114,12 +112,17 @@ SSH_BASE_OPTS=(
 # ----------------------------- 清理与休眠钩子 -----------------------------
 cleanup() {
   local rc=$?
-  if [[ "$AUTO_POWER" -eq 1 && ${#WOKEN_VMS[@]} -gt 0 ]]; then
-    echo ">>> [auto-power] 正在将本次唤醒的 VM 休眠回写内存 (virsh managedsave)..."
-    for vm in "${WOKEN_VMS[@]}"; do
-      echo "    managedsave $vm"
-      virsh --connect qemu:///system managedsave "$vm" >/dev/null 2>&1 || true
-    done
+  if [[ "$AUTO_POWER" -eq 1 && -d "$WOKEN_DIR" ]]; then
+    local woken_files=("${WOKEN_DIR}"/*)
+    if [[ -e "${woken_files[0]}" ]]; then
+      echo ">>> [auto-power] 正在将本次唤醒的 VM 休眠回写内存 (virsh managedsave)..."
+      for marker in "${woken_files[@]}"; do
+        local vm
+        vm="$(basename "$marker")"
+        echo "    managedsave $vm"
+        virsh --connect qemu:///system managedsave "$vm" >/dev/null 2>&1 || true
+      done
+    fi
   fi
   rm -rf "$WORK_TMP"
   exit "$rc"
@@ -140,7 +143,7 @@ ensure_vm_ready() {
     fi
     echo ">>> [auto-power] 正在唤醒 VM $vm ..."
     virsh --connect qemu:///system start "$vm" >/dev/null
-    WOKEN_VMS+=("$vm")
+    touch "${WOKEN_DIR}/${vm}"
   fi
 
   # 轮询 SSH 就绪（最多 90 秒）
@@ -162,11 +165,14 @@ pack_source() {
     return 0
   fi
   if [[ "$DIRTY" -eq 1 ]]; then
-    # 打包当前工作区已跟踪 + 未忽略文件，彻底排除 .git / bin / node_modules
+    # 打包当前工作区已跟踪 + 未忽略的现存文件，过滤已删除未暂存路径并排除 .git / bin / node_modules
     (
       cd "$REPO_ROOT"
       git ls-files -co --exclude-standard -z | \
         grep -zvE '^(bin/|node_modules/|\.git/)' | \
+        while IFS= read -r -d '' f; do
+          [[ -e "$f" ]] && printf '%s\0' "$f"
+        done | \
         tar --null -T - -czf "$ARCHIVE_TAR"
     )
   else
@@ -248,12 +254,17 @@ EOF
     fi
 
     local target_pkg="${PKG_FILTER:-./...}"
+    export GORACE="atexit_sleep_ms=0"
     go run ./scripts/ci/verify.go --stage=all --verbose --pkg="$target_pkg"
     if [[ "$GATE" == "g2" || "$GATE" == "g2.5" || "$GATE" == "g3" || "$GATE" == "g4" || "$GATE" == "g5" ]]; then
       go run ./scripts/ci/verify.go --stage=dst --verbose --dst-seeds="$DST_SEEDS"
     fi
     go run ./scripts/ci/verify.go --stage=cross
   } >"$log" 2>&1
+  if ! grep -q '^提示：尚未进入 Phase 0' "$log"; then
+    assert_go_test_evidence "$log"
+    return $?
+  fi
 }
 
 run_unix_vm() {
@@ -340,6 +351,10 @@ fi
 
 go run ./scripts/ci/verify.go --stage=all --verbose --pkg="$TARGET_PKG"
 REMOTE_GATE
+  if ! grep -q '^SKIP:' "$log"; then
+    assert_go_test_evidence "$log"
+    return $?
+  fi
 }
 
 run_win11_vm() {
@@ -450,12 +465,25 @@ try {
 EOF
   scp "${SSH_BASE_OPTS[@]}" "$ARCHIVE_TAR" "${XOPS_CI_WIN_USER}@${XOPS_CI_WIN_HOST}:${remote_tar}" >>"$log" 2>&1
   scp "${SSH_BASE_OPTS[@]}" "$ps_script" "${XOPS_CI_WIN_USER}@${XOPS_CI_WIN_HOST}:${remote_ps}" >>"$log" 2>&1
+  # Windows OpenSSH 默认经 cmd.exe 转发，仅双引号由 Win32 CommandLineToArgvW 剥离，单引号会原样传给 pwsh -File。
+  local win_pkg="${PKG_FILTER:-./...}"
+  if [[ "$win_pkg" =~ [\"\'\&\|\;\<\>\^\`\$] ]]; then
+    echo "错误：--pkg 包含 Windows 命令行非法字符: $win_pkg" >&2
+    return 2
+  fi
   local win_rc=0
   ssh "${SSH_BASE_OPTS[@]}" "${XOPS_CI_WIN_USER}@${XOPS_CI_WIN_HOST}" \
-    "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\xops-ci\\tmp\\gate-${RUN_ID}.ps1 -RunId ${RUN_ID} -Gate ${GATE} -TargetPkg ${PKG_FILTER:-./...}" >>"$log" 2>&1 || win_rc=$?
+    "pwsh -NoProfile -ExecutionPolicy Bypass -File C:\\xops-ci\\tmp\\gate-${RUN_ID}.ps1 -RunId \"${RUN_ID}\" -Gate \"${GATE}\" -TargetPkg \"${win_pkg}\"" >>"$log" 2>&1 || win_rc=$?
   ssh "${SSH_BASE_OPTS[@]}" "${XOPS_CI_WIN_USER}@${XOPS_CI_WIN_HOST}" \
     "del /q C:\\xops-ci\\tmp\\gate-${RUN_ID}.ps1" >/dev/null 2>&1 || true
-  return "$win_rc"
+  if [[ "$win_rc" -ne 0 ]]; then
+    return "$win_rc"
+  fi
+  if ! grep -q '^SKIP:' "$log"; then
+    assert_go_test_evidence "$log"
+    return $?
+  fi
+  return 0
 }
 
 # ----------------------------- 并发调度与汇总 -----------------------------
@@ -469,6 +497,8 @@ echo ">>> 启动本地多平台执行 [mode=${MODE} gate=${GATE} targets=${TARGE
 
 for t in "${TARGET_ARR[@]}"; do
   t="$(echo "$t" | xargs)"
+  [[ "$t" == "windows" ]] && t="win11"
+  [[ -n "${PIDS[$t]+x}" ]] && continue
   case "$t" in
     linux)
       run_linux_host &
@@ -482,7 +512,7 @@ for t in "${TARGET_ARR[@]}"; do
       run_unix_vm "freebsd" "$XOPS_CI_FREEBSD_VM" "$XOPS_CI_FREEBSD_USER" "$XOPS_CI_FREEBSD_HOST" &
       PIDS["$t"]=$!
       ;;
-    win11|windows)
+    win11)
       run_win11_vm &
       PIDS["win11"]=$!
       ;;

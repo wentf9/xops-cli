@@ -24,7 +24,7 @@ import (
 	"strings"
 )
 
-// replaceDirectiveRE 匹配 go.mod 中禁止出现的 replace 指令（单行或块形式），不误伤注释行。
+// replaceDirectiveRE 匹配 go.mod/go.work 中禁止出现的 replace 指令（单行或块形式），不误伤注释行。
 var replaceDirectiveRE = regexp.MustCompile(`(?m)^\s*replace(?:\s|\()`)
 
 type options struct {
@@ -32,14 +32,18 @@ type options struct {
 	verbose, skipLint, goworkOff, test bool
 }
 
+type verifyRunner struct {
+	repoRoot     string
+	opts         options
+	vettoolBuilt bool
+}
+
 type cmdStep struct {
 	name string
 	args []string
 }
 
-func lintArgs() []string {
-	return []string{"run", "--max-issues-per-linter=0", "--max-same-issues=0", "./..."}
-}
+var golangciLintArgs = []string{"run", "--max-issues-per-linter=0", "--max-same-issues=0", "./..."}
 
 func main() {
 	if err := runMain(os.Args[1:]); err != nil {
@@ -67,20 +71,16 @@ func runMain(args []string) error {
 		return err
 	}
 	if opts.test {
-		if err := runInternalSelfTest(); err != nil {
+		if err := runInternalSelfTest(repoRoot); err != nil {
 			return err
 		}
 		fmt.Println("[verify] self-test PASS")
 		return nil
 	}
-	return executeStage(repoRoot, opts)
+	return (&verifyRunner{repoRoot: repoRoot, opts: opts}).executeStage()
 }
 
 func parseOptions(args []string) (options, error) {
-	defaultSeeds := strings.TrimSpace(os.Getenv("XOPS_DST_SEEDS"))
-	if defaultSeeds == "" {
-		defaultSeeds = "10000"
-	}
 	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
 	var opts options
 	fs.StringVar(&opts.stage, "stage", "all", "执行阶段: xopsvet|core|root|cross|dst|all")
@@ -89,15 +89,21 @@ func parseOptions(args []string) (options, error) {
 	fs.BoolVar(&opts.skipLint, "skip-lint", false, "跳过 golangci-lint（适配外部 lint Action 或无 lint Runner）")
 	fs.BoolVar(&opts.goworkOff, "gowork-off", false, "对根 CLI 模块也强制 GOWORK=off（正式发版锁 core/v1.0.0 Tag 验收）")
 	fs.BoolVar(&opts.test, "self-test", false, "仅执行 verify.go 自检、replace 守卫与内部不变量测试")
-	fs.StringVar(&opts.dstSeeds, "dst-seeds", defaultSeeds, "传递给 --stage=dst 的 XOPS_DST_SEEDS 种子数")
+	fs.StringVar(&opts.dstSeeds, "dst-seeds", strings.TrimSpace(os.Getenv("XOPS_DST_SEEDS")), "传递给 --stage=dst 的 XOPS_DST_SEEDS 种子数")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
+	}
+	if fs.NArg() > 0 {
+		return options{}, fmt.Errorf("存在未识别的位置参数: %v", fs.Args())
 	}
 	if err := validateStage(opts.stage); err != nil {
 		return options{}, err
 	}
 	if strings.TrimSpace(opts.pkg) == "" {
 		opts.pkg = "./..."
+	}
+	if strings.TrimSpace(opts.dstSeeds) == "" {
+		opts.dstSeeds = "10000"
 	}
 	return opts, nil
 }
@@ -110,26 +116,23 @@ func validateStage(stage string) error {
 	return nil
 }
 
-// runSelfCheck 对 verify.go 自身执行 gofmt 与根默认环境 go vet 自检，防脚本自身腐化。
 func runSelfCheck(repoRoot string, goworkOff bool) error {
 	const scriptRel = "./scripts/ci/verify.go"
 	fmt.Printf("[verify] self-check: gofmt & go vet %s\n", scriptRel)
-	out, err := captureCmd(repoRoot, buildEnv(goworkOff), "gofmt", "-l", scriptRel)
+	env := buildEnv(goworkOff)
+	out, err := captureCmd(repoRoot, env, "gofmt", "-l", scriptRel)
 	if err != nil {
 		return fmt.Errorf("gofmt 自检失败: %w", err)
 	}
-	if unformatted := strings.TrimSpace(out); unformatted != "" {
-		return fmt.Errorf("scripts/ci/verify.go 未经 gofmt 格式化（请运行 gofmt -w scripts/ci/verify.go）: %s", unformatted)
+	if s := strings.TrimSpace(out); s != "" {
+		return fmt.Errorf("scripts/ci/verify.go 未经 gofmt 格式化: %s", s)
 	}
-	if err := runCmd(repoRoot, buildEnv(goworkOff), "go", "vet", scriptRel); err != nil {
-		return fmt.Errorf("go vet 自检 scripts/ci/verify.go 失败: %w", err)
-	}
-	return nil
+	return runCmd(repoRoot, env, "go", "vet", scriptRel)
 }
 
-// checkNoReplaceDirectives 强制全仓 3 个 go.mod 零 replace 指令（ADR-001）。
+// checkNoReplaceDirectives 强制全仓 3 个 go.mod 与 go.work 零 replace 指令（ADR-001）。
 func checkNoReplaceDirectives(repoRoot string) error {
-	for _, rel := range []string{"go.mod", filepath.Join("core", "go.mod"), filepath.Join("tools", "xopsvet", "go.mod")} {
+	for _, rel := range []string{"go.mod", "go.work", filepath.Join("core", "go.mod"), filepath.Join("tools", "xopsvet", "go.mod")} {
 		data, err := os.ReadFile(filepath.Join(repoRoot, rel))
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -144,162 +147,185 @@ func checkNoReplaceDirectives(repoRoot string) error {
 	return nil
 }
 
-func hasReplaceDirective(goModContent []byte) bool { return replaceDirectiveRE.Match(goModContent) }
+func hasReplaceDirective(content []byte) bool { return replaceDirectiveRE.Match(content) }
 
-func executeStage(repoRoot string, opts options) error {
-	switch opts.stage {
+func (r *verifyRunner) executeStage() error {
+	switch r.opts.stage {
 	case "xopsvet":
-		return runXopsvetStage(repoRoot, opts)
+		return r.runXopsvetStage()
 	case "core":
-		return runCoreStage(repoRoot, opts, opts.pkg)
+		return r.runCoreStage(r.opts.pkg)
 	case "root":
-		return runRootStage(repoRoot, opts, opts.pkg)
+		return r.runRootStage(r.opts.pkg)
 	case "cross":
-		return runCrossStage(repoRoot, opts)
+		return r.runCrossStage()
 	case "dst":
-		return runDSTStage(repoRoot, opts)
+		return r.runDSTStage()
 	case "all":
-		if err := runXopsvetStage(repoRoot, opts); err != nil {
+		if err := r.runXopsvetStage(); err != nil {
 			return err
 		}
-		corePkg, rootPkg, err := resolveAllStagePkgs(repoRoot, opts.pkg)
+		corePkg, rootPkg, err := resolveAllStagePkgs(r.repoRoot, r.opts.pkg)
 		if err != nil {
 			return err
 		}
 		if corePkg != "" {
-			if err := runCoreStage(repoRoot, opts, corePkg); err != nil {
+			if err := r.runCoreStage(corePkg); err != nil {
 				return err
 			}
 		}
 		if rootPkg != "" {
-			return runRootStage(repoRoot, opts, rootPkg)
+			return r.runRootStage(rootPkg)
 		}
 		return nil
 	default:
-		return validateStage(opts.stage)
+		return validateStage(r.opts.stage)
 	}
 }
 
-// resolveAllStagePkgs 在 --stage=all 配合定向 --pkg 时，仅对包含该包路径的活跃模块透传 --pkg。
+// resolveAllStagePkgs 在 --stage=all 配合定向 --pkg 时规范化并精确路由至含 .go 源码的模块（CI-2）。
 func resolveAllStagePkgs(repoRoot, pkg string) (corePkg, rootPkg string, err error) {
-	if pkg == "./..." {
+	norm := strings.TrimSpace(filepath.ToSlash(pkg))
+	if norm == "" || norm == "./..." || norm == "..." {
 		return "./...", "./...", nil
 	}
-	cleanDir := filepath.FromSlash(strings.TrimPrefix(strings.TrimSuffix(strings.TrimSuffix(pkg, "/..."), "..."), "./"))
-	if hasGoFiles(filepath.Join(repoRoot, "core")) && pathExists(filepath.Join(repoRoot, "core", cleanDir)) {
-		corePkg = pkg
+	if slices.Contains(strings.Split(norm, "/"), "..") {
+		return "", "", fmt.Errorf("--pkg=%q 禁止包含路径穿越段 '..'", pkg)
 	}
-	if hasRootGoFiles(repoRoot) && pathExists(filepath.Join(repoRoot, cleanDir)) {
-		rootPkg = pkg
+	if !strings.HasPrefix(norm, "./") && norm != "." {
+		norm = "./" + strings.TrimPrefix(norm, "/")
+	}
+	if norm == "./core" || norm == "./core/..." || strings.HasPrefix(norm, "./core/") {
+		sub := "." + strings.TrimPrefix(norm, "./core")
+		if hasGoFiles(filepath.Join(repoRoot, "core", pkgDirRel(sub))) {
+			return sub, "", nil
+		}
+		return "", "", fmt.Errorf("--pkg=%q 指向 core/ 但未找到 Go 源码目录", pkg)
+	}
+	rel := pkgDirRel(norm)
+	if hasGoFiles(filepath.Join(repoRoot, "core", rel)) {
+		corePkg = norm
+	}
+	if hasRootGoFiles(repoRoot) && hasGoFiles(filepath.Join(repoRoot, rel)) {
+		rootPkg = norm
 	}
 	if corePkg == "" && rootPkg == "" {
-		return "", "", fmt.Errorf("--stage=all 下的 --pkg=%q 在 core/ 与根模块中均未匹配到目录", pkg)
+		return "", "", fmt.Errorf("--stage=all 下的 --pkg=%q 在 core/ 与根模块中均未匹配到含 .go 文件的目录", pkg)
 	}
 	return corePkg, rootPkg, nil
 }
 
-func runXopsvetStage(repoRoot string, opts options) error {
-	xopsDir := filepath.Join(repoRoot, "tools", "xopsvet")
+func pkgDirRel(pkg string) string {
+	s := strings.TrimPrefix(strings.TrimSuffix(strings.TrimSuffix(pkg, "/..."), "..."), "./")
+	if s == "." {
+		return ""
+	}
+	return filepath.FromSlash(s)
+}
+
+func (r *verifyRunner) runXopsvetStage() error {
+	xopsDir := filepath.Join(r.repoRoot, "tools", "xopsvet")
 	if !hasGoFiles(filepath.Join(xopsDir, "cmd", "xopsvet")) {
 		fmt.Println("[verify] skip xopsvet: tools/xopsvet/cmd/xopsvet 尚无 Go 源码")
 		return nil
 	}
-	vettool := vettoolPath(repoRoot)
+	vettool := vettoolPath(r.repoRoot)
 	if err := os.MkdirAll(filepath.Dir(vettool), 0o755); err != nil {
-		return fmt.Errorf("创建 bin 目录失败: %w", err)
+		return err
 	}
 	fmt.Println("[verify] === Stage: xopsvet (GOWORK=off) ===")
 	steps := []cmdStep{
-		{name: "go", args: goTestArgs(opts.verbose, "./...")},
-		{name: "go", args: []string{"build", "-o", vettool, "./cmd/xopsvet"}},
-		{name: "go", args: []string{"vet", "-vettool=" + vettool, "./..."}},
+		{"go", goTestArgs(r.opts.verbose, "./...")},
+		{"go", []string{"build", "-o", vettool, "./cmd/xopsvet"}},
+		{"go", []string{"vet", "-vettool=" + vettool, "./..."}},
 	}
-	if !opts.skipLint {
-		steps = append(steps, cmdStep{name: "golangci-lint", args: lintArgs()})
+	if !r.opts.skipLint {
+		steps = append(steps, cmdStep{"golangci-lint", golangciLintArgs})
 	}
-	return runSteps(xopsDir, buildEnv(true), steps)
+	if err := runSteps(xopsDir, buildEnv(true), steps); err != nil {
+		return err
+	}
+	r.vettoolBuilt = true
+	return nil
 }
 
-func ensureVettool(repoRoot string) (string, bool, error) {
-	xopsDir := filepath.Join(repoRoot, "tools", "xopsvet")
+// ensureVettool 仅复用本次进程内新构建的 xopsvet 二进制，杜绝复用历史过期产物导致假绿（CI-1）。
+func (r *verifyRunner) ensureVettool() (string, bool, error) {
+	xopsDir := filepath.Join(r.repoRoot, "tools", "xopsvet")
 	if !hasGoFiles(filepath.Join(xopsDir, "cmd", "xopsvet")) {
 		return "", false, nil
 	}
-	vettool := vettoolPath(repoRoot)
-	if pathExists(vettool) {
+	vettool := vettoolPath(r.repoRoot)
+	if r.vettoolBuilt && pathExists(vettool) {
 		return vettool, true, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(vettool), 0o755); err != nil {
-		return "", false, fmt.Errorf("创建 bin 目录失败: %w", err)
+		return "", false, err
 	}
 	fmt.Printf("[verify] building xopsvet -> %s\n", vettool)
 	if err := runCmd(xopsDir, buildEnv(true), "go", "build", "-o", vettool, "./cmd/xopsvet"); err != nil {
 		return "", false, err
 	}
+	r.vettoolBuilt = true
 	return vettool, true, nil
 }
 
-func runCoreStage(repoRoot string, opts options, pkg string) error {
-	coreDir := filepath.Join(repoRoot, "core")
-	if !hasGoFiles(coreDir) {
-		fmt.Println("[verify] skip core: core/ 尚无 Go 源码")
-		return nil
-	}
-	return runModuleVerify(repoRoot, coreDir, "core (GOWORK=off)", pkg, true, opts)
+func (r *verifyRunner) runCoreStage(pkg string) error {
+	dir := filepath.Join(r.repoRoot, "core")
+	return r.runModuleStage(dir, "core (GOWORK=off)", pkg, true, hasGoFiles(dir), "core/ 尚无 Go 源码")
 }
 
-func runRootStage(repoRoot string, opts options, pkg string) error {
-	if !hasRootGoFiles(repoRoot) {
-		fmt.Println("[verify] skip root: 根 CLI 模块（cmd/xops 与 internal/）尚无 Go 源码")
-		return nil
-	}
+func (r *verifyRunner) runRootStage(pkg string) error {
 	label := "root (go.work)"
-	if opts.goworkOff {
+	if r.opts.goworkOff {
 		label = "root (GOWORK=off)"
 	}
-	return runModuleVerify(repoRoot, repoRoot, label, pkg, opts.goworkOff, opts)
+	return r.runModuleStage(r.repoRoot, label, pkg, r.opts.goworkOff, hasRootGoFiles(r.repoRoot), "根 CLI 模块（cmd/xops 与 internal/）尚无 Go 源码")
 }
 
-func runModuleVerify(repoRoot, modDir, label, pkg string, goworkOff bool, opts options) error {
-	vettool, hasVet, err := ensureVettool(repoRoot)
+func (r *verifyRunner) runModuleStage(modDir, label, pkg string, goworkOff, present bool, skipMsg string) error {
+	if !present {
+		fmt.Println("[verify] skip:", skipMsg)
+		return nil
+	}
+	vettool, hasVet, err := r.ensureVettool()
 	if err != nil {
 		return err
 	}
 	fmt.Printf("[verify] === Stage: %s, pkg=%s ===\n", label, pkg)
-	steps := []cmdStep{{name: "go", args: []string{"build", "./..."}}}
+	steps := []cmdStep{{"go", []string{"build", "./..."}}}
 	if hasVet {
-		steps = append(steps, cmdStep{name: "go", args: []string{"vet", "-vettool=" + vettool, "./..."}})
+		steps = append(steps, cmdStep{"go", []string{"vet", "-vettool=" + vettool, "./..."}})
 	}
-	if !opts.skipLint {
-		steps = append(steps, cmdStep{name: "golangci-lint", args: lintArgs()})
+	if !r.opts.skipLint {
+		steps = append(steps, cmdStep{"golangci-lint", golangciLintArgs})
 	}
-	steps = append(steps, cmdStep{name: "go", args: goTestArgs(opts.verbose, pkg)})
-	return runSteps(modDir, buildEnv(goworkOff), steps)
+	return runSteps(modDir, buildEnv(goworkOff), append(steps, cmdStep{"go", goTestArgs(r.opts.verbose, pkg)}))
 }
 
-func runCrossStage(repoRoot string, opts options) error {
-	xopsDir := filepath.Join(repoRoot, "tools", "xopsvet")
-	coreDir := filepath.Join(repoRoot, "core")
-	hasXops := hasGoFiles(filepath.Join(xopsDir, "cmd", "xopsvet"))
-	hasCore := hasGoFiles(coreDir)
-	hasRoot := hasRootGoFiles(repoRoot)
-
-	fmt.Println("[verify] === Stage: cross (Windows & macOS cross-build & cross-lint) ===")
+func (r *verifyRunner) runCrossStage() error {
+	xopsDir, coreDir := filepath.Join(r.repoRoot, "tools", "xopsvet"), filepath.Join(r.repoRoot, "core")
+	fmt.Println("[verify] === Stage: cross (Windows & macOS cross-build & cross-lint, CGO_ENABLED=0) ===")
 	for _, goos := range []string{"windows", "darwin"} {
-		extra := []string{"GOOS=" + goos, "GOARCH=amd64"}
+		extra := []string{"GOOS=" + goos, "GOARCH=amd64", "CGO_ENABLED=0"}
 		offEnv := buildEnv(true, extra...)
-		if hasXops {
-			if err := runCmd(xopsDir, offEnv, "go", "build", "./..."); err != nil {
-				return err
+		for _, t := range []struct {
+			on, lint bool
+			dir      string
+			env      []string
+		}{
+			{hasGoFiles(filepath.Join(xopsDir, "cmd", "xopsvet")), false, xopsDir, offEnv},
+			{hasGoFiles(coreDir), !r.opts.skipLint, coreDir, offEnv},
+			{hasRootGoFiles(r.repoRoot), !r.opts.skipLint, r.repoRoot, buildEnv(r.opts.goworkOff, extra...)},
+		} {
+			if !t.on {
+				continue
 			}
-		}
-		if hasCore {
-			if err := runCrossModule(coreDir, offEnv, opts.skipLint); err != nil {
-				return err
+			steps := []cmdStep{{"go", []string{"build", "./..."}}}
+			if t.lint {
+				steps = append(steps, cmdStep{"golangci-lint", golangciLintArgs})
 			}
-		}
-		if hasRoot {
-			if err := runCrossModule(repoRoot, buildEnv(opts.goworkOff, extra...), opts.skipLint); err != nil {
+			if err := runSteps(t.dir, t.env, steps); err != nil {
 				return err
 			}
 		}
@@ -307,31 +333,21 @@ func runCrossStage(repoRoot string, opts options) error {
 	return nil
 }
 
-func runCrossModule(dir string, env []string, skipLint bool) error {
-	steps := []cmdStep{{name: "go", args: []string{"build", "./..."}}}
-	if !skipLint {
-		steps = append(steps, cmdStep{name: "golangci-lint", args: lintArgs()})
-	}
-	return runSteps(dir, env, steps)
-}
-
-func runDSTStage(repoRoot string, opts options) error {
-	if !hasMatchingFiles(filepath.Join(repoRoot, "core", "internal", "pool"), "_test.go") {
+func (r *verifyRunner) runDSTStage() error {
+	if !hasMatchingFiles(filepath.Join(r.repoRoot, "core", "internal", "pool"), "_test.go") {
 		fmt.Println("[verify] skip dst: core/internal/pool 尚无 DST 测试")
 		return nil
 	}
-	args := goTestArgs(opts.verbose, "./...")
-	args = slices.Insert(args, len(args)-1, "-run", "^TestDST_")
-	fmt.Printf("[verify] === Stage: dst (GOWORK=off, XOPS_DST_SEEDS=%s) ===\n", opts.dstSeeds)
-	return runCmd(filepath.Join(repoRoot, "core"), buildEnv(true, "XOPS_DST_SEEDS="+opts.dstSeeds), "go", args...)
+	base := goTestArgs(r.opts.verbose, "./...")
+	fmt.Printf("[verify] === Stage: dst (GOWORK=off, XOPS_DST_SEEDS=%s) ===\n", r.opts.dstSeeds)
+	return runCmd(filepath.Join(r.repoRoot, "core"), buildEnv(true, "XOPS_DST_SEEDS="+r.opts.dstSeeds), "go", slices.Insert(base, len(base)-1, "-run", "^TestDST_")...)
 }
 
 func goTestArgs(verbose bool, pkg string) []string {
-	args := []string{"test"}
 	if verbose {
-		args = append(args, "-v")
+		return []string{"test", "-v", "-race", "-shuffle=on", "-count=1", pkg}
 	}
-	return append(args, "-race", "-shuffle=on", "-count=1", pkg)
+	return []string{"test", "-race", "-shuffle=on", "-count=1", pkg}
 }
 
 func vettoolPath(repoRoot string) string {
@@ -341,23 +357,15 @@ func vettoolPath(repoRoot string) string {
 	return filepath.Join(repoRoot, "bin", "xopsvet")
 }
 
-// buildEnv 基于当前进程环境构造子进程环境：按模块显式设置或剔除 GOWORK，并覆盖 extra 键值。
 func buildEnv(goworkOff bool, extra ...string) []string {
 	return buildEnvFrom(os.Environ(), goworkOff, extra...)
 }
 
 func buildEnvFrom(base []string, goworkOff bool, extra ...string) []string {
-	overrideKeys := make([]string, 0, len(extra)+1)
-	overrideKeys = append(overrideKeys, "GOWORK")
-	for _, kv := range extra {
-		if k, _, ok := strings.Cut(kv, "="); ok {
-			overrideKeys = append(overrideKeys, k)
-		}
-	}
 	out := make([]string, 0, len(base)+len(extra)+1)
 	for _, kv := range base {
 		k, _, ok := strings.Cut(kv, "=")
-		if !ok || slices.ContainsFunc(overrideKeys, func(key string) bool { return strings.EqualFold(key, k) }) {
+		if !ok || strings.EqualFold(k, "GOWORK") || slices.ContainsFunc(extra, func(e string) bool { ek, _, ok := strings.Cut(e, "="); return ok && strings.EqualFold(ek, k) }) {
 			continue
 		}
 		out = append(out, kv)
@@ -394,22 +402,19 @@ func captureCmd(dir string, env []string, name string, args ...string) (string, 
 	return stdout.String(), nil
 }
 
-func hasRootGoFiles(repoRoot string) bool {
-	return hasGoFiles(filepath.Join(repoRoot, "cmd", "xops")) || hasGoFiles(filepath.Join(repoRoot, "internal"))
+func hasRootGoFiles(root string) bool {
+	return hasGoFiles(filepath.Join(root, "cmd", "xops")) || hasGoFiles(filepath.Join(root, "internal"))
 }
-
 func hasGoFiles(dir string) bool { return hasMatchingFiles(dir, ".go") }
+func pathExists(p string) bool   { _, err := os.Stat(p); return err == nil }
 
 func hasMatchingFiles(dir, suffix string) bool {
 	found := false
 	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() && (d.Name() == "testdata" || d.Name() == ".git") {
+		if err == nil && d.IsDir() && (d.Name() == "testdata" || d.Name() == ".git") {
 			return filepath.SkipDir
 		}
-		if !d.IsDir() && strings.HasSuffix(d.Name(), suffix) {
+		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), suffix) {
 			found = true
 			return fs.SkipAll
 		}
@@ -418,27 +423,24 @@ func hasMatchingFiles(dir, suffix string) bool {
 	return found
 }
 
-func pathExists(p string) bool { _, err := os.Stat(p); return err == nil }
-
-// runInternalSelfTest 验证 verify.go 自身的核心环境隔离与正则守卫不变量。
-func runInternalSelfTest() error {
-	if hasReplaceDirective([]byte("module example.com/m\n\ngo 1.27.0\n// replace a => b\n")) {
-		return errors.New("replace 正则误报了注释行")
-	}
-	if !hasReplaceDirective([]byte("module example.com/m\nreplace a => ./a\n")) ||
-		!hasReplaceDirective([]byte("module example.com/m\n\treplace (\n\t\ta => ./a\n\t)\n")) {
-		return errors.New("replace 正则漏报了 replace 指令")
-	}
-	rootEnv := buildEnvFrom([]string{"PATH=/usr/bin", "GOWORK=off", "GOOS=linux"}, false)
-	if slices.ContainsFunc(rootEnv, func(kv string) bool { k, _, _ := strings.Cut(kv, "="); return strings.EqualFold(k, "GOWORK") }) {
-		return fmt.Errorf("goworkOff=false 未清除继承的 GOWORK: %v", rootEnv)
-	}
-	coreEnv := buildEnvFrom([]string{"PATH=/usr/bin", "gowork=/tmp/go.work"}, true, "GOOS=windows")
-	if !slices.Contains(coreEnv, "GOWORK=off") || !slices.Contains(coreEnv, "GOOS=windows") {
-		return fmt.Errorf("goworkOff=true 未正确注入 GOWORK/GOOS: %v", coreEnv)
-	}
-	if validateStage("invalid-stage") == nil {
-		return errors.New("validateStage 未拒绝非法阶段名")
+func runInternalSelfTest(repoRoot string) error {
+	rEnv := buildEnvFrom([]string{"PATH=/usr/bin", "GOWORK=off"}, false)
+	cEnv := buildEnvFrom([]string{"PATH=/usr/bin", "gowork=/tmp/go.work"}, true, "GOOS=windows", "CGO_ENABLED=0")
+	_, exErr := parseOptions([]string{"--stage=all", "extra-arg"})
+	emOpt, emErr := parseOptions([]string{"--dst-seeds="})
+	_, _, trErr := resolveAllStagePkgs(repoRoot, "../outside")
+	c1, r1, e1 := resolveAllStagePkgs(repoRoot, "./core/conc/...")
+	c2, r2, e2 := resolveAllStagePkgs(repoRoot, "conc")
+	for i, ok := range []bool{
+		!hasReplaceDirective([]byte("module m\n// replace a => b\n")) && hasReplaceDirective([]byte("module m\nreplace a => ./a\n")) && hasReplaceDirective([]byte("module m\n\treplace (\n\t\ta => ./a\n\t)\n")),
+		!slices.ContainsFunc(rEnv, func(kv string) bool { k, _, _ := strings.Cut(kv, "="); return strings.EqualFold(k, "GOWORK") }),
+		slices.Contains(cEnv, "GOWORK=off") && slices.Contains(cEnv, "CGO_ENABLED=0"),
+		exErr != nil, emErr == nil && emOpt.dstSeeds == "10000", trErr != nil,
+		e1 == nil && c1 == "./conc/..." && r1 == "", e2 == nil && c2 == "./conc" && r2 == "",
+	} {
+		if !ok {
+			return fmt.Errorf("内部自检 #%d 失败", i+1)
+		}
 	}
 	return nil
 }

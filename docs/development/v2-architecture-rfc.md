@@ -222,8 +222,8 @@ flowchart TD
 3. **防线 3（零同构克隆 + 零命名/匿名嵌入 + `vetssa` 零接口与泛型擦除）**：
    - 扫描全包 `*ast.TypeSpec`：禁止定义任何底层 `*types.Struct` 含有 `field.Pkg().Path() == "net"` 字段的非 `net` 命名类型（精确封死 `type myDialer net.Dialer` 类同构克隆，**绝不误杀** `type SocketSlot struct { ln *net.UnixListener }`）；
    - 扫描全包 `*ast.StructType`（含匿名结构体）：禁止任何嵌入字段（`len(f.Names) == 0`）类型为 `net.Dialer`/`net.ListenConfig`（值或指针），彻底封死 `&struct{ net.Dialer }{}`；
-   - 接入 `vetssa.CheckNoErasure`（使用不入接口方法与签名的 `vetutil.ContainsValueType` 匹配 `net.Dialer`/`net.ListenConfig`）：封死一切 `MakeInterface`/`ChangeInterface`/`ChangeType` 与 `TypesInfo.Instances` 全部类型实参（含 `any` 约束）。
-4. **防线 4（完整类型树 + 复合字面量字段白名单）**：复用 `vetutil.WalkAllReferencedTypes`（含 `Interface`/`Tuple`/`TypeParam`/`Union`）检查所有成员与表达式类型，对 `net.Dialer`（字段仅 `{Timeout, Deadline, LocalAddr, Control, ControlContext}`、方法仅 `{DialUnix}`）与 `net.ListenConfig`（字段仅 `{Control}`、方法仅 `{Listen, ListenPacket}`）的复合字面量及 `Uses` 实施严格字段白名单，禁止无键位置初始化与引入 `*net.Resolver`/`net.KeepAliveConfig`/`*net.TCPConn`/`*net.UDPConn`/`*net.IPConn`。
+   - 接入 `vetssa.CheckNoErasure`（使用 `vetutil.ContainsExportedValueType` 匹配 `net.Dialer`/`net.ListenConfig`）：封死直接、容器、匿名结构体与导出/嵌入字段形式的 `MakeInterface`/`ChangeInterface`/`ChangeType` 及 `TypesInfo.Instances` 全部类型实参（含 `any` 约束），同时放行仅以未导出非嵌入字段持有的具名结构体（如 `LocalFS`）实现 `ports.ScopedRootFS`（配合 `core/osfs` 物理禁导 `crypto/tls`/`log/syslog`/`reflect` 与非 `x/sys/{unix,windows}` 第三方包，零绕过）。
+4. **防线 4（完整类型树 + 复合字面量字段白名单）**：复用 `vetutil.TypeContains` / `vetutil.TypeContainsLocalPred`（含 `Interface`/`Tuple`/`TypeParam`/`Union`/`Signature`）检查所有成员与表达式类型，对 `net.Dialer`（字段仅 `{Timeout, Deadline, LocalAddr, Control, ControlContext}`、方法仅 `{DialUnix}`）与 `net.ListenConfig`（字段仅 `{Control}`、方法仅 `{Listen, ListenPacket}`）的复合字面量及 `Uses` 实施严格字段白名单，禁止无键位置初始化与引入 `*net.Resolver`/`net.KeepAliveConfig`/`*net.TCPConn`/`*net.UDPConn`/`*net.IPConn`。
 
 ---
 
@@ -333,9 +333,12 @@ type OperatorReadFS interface {
           a.drainAndStop()
           return nil
       case <-ctx.Done():
+          // 统一停机确定性：在 beginStop 关闭 stopCh 之前先检测 stopCh 是否已关闭，
+          // 确保 Stop() 与 ctx 取消并发就绪时优先返回 nil。
+          var exitErr error
+          select { case <-a.stopCh: default: exitErr = ctx.Err() }
           a.drainAndStop()
-          // 统一停机确定性：若 stopCh 同时已关闭则优先返回 nil
-          select { case <-a.stopCh: return nil; default: return ctx.Err() }
+          return exitErr
       }
   }
   ```
@@ -449,8 +452,8 @@ inventory:
 | 分析器 | 生产源码 (`!_test.go && !tck`) | 非 `domain` 测试与 `core/ports/tck` | `core/domain/**` 测试源码 (`*_test.go`) |
 | :--- | :--- | :--- | :--- |
 | **`archbound`** | 100% 严格 DAG（**`core/engine` 生产禁导 `tck` 与 `sim`**）+ `core/osfs` 四道 `net` 符号防线（18 符号 + 3 含 `ctx` 方法 + 3 包级直接绑定 + 零同构克隆/零匿名嵌入/`vetssa` 零擦除）+ `core/conc`/`foundation/{actor,trace}` 零例外纯内存非 I/O stdlib（禁 `crypto/rand`/`filepath`/`ioutil`/`syslog`/`plugin`/`embed`，封死 `FoundationOther`）+ `mcpruntime` 禁 `OperatorReadFS` + `domain` 纯白名单 | 严格 DAG + 放行 `testing*`、被测主包、`core/conc`、`go.uber.org/goleak`（`trace_test.go` 同样禁导 `crypto/rand`）；`core/` 非 `domain`/`conc`/`other` 层测试放行 `core/internal/sim`；适配器层测试放行 `core/ports/tck` | 严格 29 纯 stdlib + `x/text/unicode/norm`（及 `option`/`secret` 专属项）+ `testing*` + 被测主包（**物理禁止 `os`/`net`/`os/exec`/`sync`/`sync/atomic`/`reflect`/`time.Now`/`core/conc`/`sim`/`goleak`**） |
-| **`osboundary`（OS/env/exec）** | **100% 强制**（含 `syscall.CreateProcess`/`unix.Exec`；文件/锁/ACL/`os.Root`/`SocketSlot` 仅 `core/osfs`；env/exec 仅 `internal/host/sys`；`pkg.init` 按 `ResolvePos` 指令位置判测试） | 豁免（`tck` 已被 `archbound` 锁死 0 生产可达，测试与 `tck` 合法读 `XOPS_DST_SEEDS`、执行 `ssh -G`、构造 `t.TempDir()` 夹具） | 由 `archbound` 物理禁止导入 `os`/`os/exec`/`syscall`/`net` |
-| **`osboundary`（`RemotePath` & Unix Listen）** | 100% 强制：SSA `RemotePath` 保持 field-sensitive（不染宿主结构体），全槽位禁调 `path/filepath.*`；SSA Unix Listen 经 `CallSiteResolver` 统一消解 `$thunk`/`$bound` 偏移 | 100% 强制 | 100% 强制 |
+| **`osboundary`（OS/env/exec & Unix Listen）** | **100% 强制**（含 `syscall.CreateProcess`/`unix.Exec`、`x/sys/{unix,windows}` 进程与环境变量原语；文件/锁/ACL/`os.Root`/`SocketSlot` 与 SSA Unix Listen 仅 `core/osfs`，SSA Unix Listen 覆盖 `$thunk`/`$bound`/`Phi`/窄接口；env/exec 仅 `internal/host/sys`；`pkg.init` 按 `ResolvePos` 指令位置判测试） | 豁免（`tck` 已被 `archbound` 锁死 0 生产可达，测试与 `tck` 合法读 `XOPS_DST_SEEDS`、执行 `ssh -G`、构造 `t.TempDir()` 与本地 Unix 夹具） | 由 `archbound` 物理禁止导入 `os`/`os/exec`/`syscall`/`net` |
+| **`osboundary`（`RemotePath`）** | 100% 强制：SSA `RemotePath` 保持 field-sensitive（含嵌套结构体路径与闭包双向投影，不染值构造器非远端字段），全槽位禁调 `path/filepath.*` | 100% 强制 | 100% 强制 |
 | **`noimplicit`** | 100% 强制（禁 `init()`/可变包级 `var` 含 `new(expr)` 与 Map Key/保护全包级 `error` 哨兵/禁泛型与匿名接口断言/持久化 DTO 禁裸 `time.Duration` 且顶层嵌套一致、`TypeArgs()` 优先、JSON 与 YAML 语义分流；`//xops:buildvar` 仅限精确 `cmd/xops` `package main` 非测试未导出单内置 `string`；`context.WithValue` 与 `Value(any) any` 擦除/调用含 `ChangeType`/`IsInvoke` 仅限 `trace`，保留嵌入 `context.Context` 声明豁免；`//nolint:` 仅限 8 个特权包生产源码） | 100% 强制（禁止声明 `//xops:buildvar`；`cmd/xops/*_test.go` 禁止篡改 `buildvar`；**全仓所有白盒与外置测试 100% 禁 `//nolint:`**） | 100% 强制 |
 | **`sumexhaust`** | 100% 强制（类型优先 + 前置紧邻否定极性对偶复用数字边界分词 + `CompositeLit`/`new(T)`/`error(nil)` 闭环） | 100% 强制（`inTest` 同时包含 `IsPosInTestFile` 与 **`LayerCorePortsTCK`**，允许 `default: t.Fatal`/`t.Error`） | 100% 强制 |
 | **`failclosed`** | 100% 强制（零包白名单、零弱化；禁吞噬新产生局部 `error` 返裸 `bool`，精确豁免纯 `errors.Is`/`AsType`；`zerovalue` 覆盖 `sync/atomic.Bool` 并实施前导否定前缀检查，禁止指针类型充当正向门控） | 100% 强制 | 100% 强制 |
@@ -474,7 +477,7 @@ inventory:
 > **铁律**：全仓允许行内 `//nolint:` 的仅限上述 **8 个特权包的生产源码文件**（`core/osfs`、`core/conc`、`core/internal/foundation/trace`、`internal/host/sys`、`internal/host/vault`、`core/internal/sshnet/dial`、`core/internal/sshnet/priv`、`core/domain/secret`）；其余全部包及**全仓所有测试文件（含 8 特权包白盒 `*_test.go`、`cmd/xops`、`core/internal/sim`、`core/internal/foundation/actor`、`tools/xopsvet` 及所有外置 `*_test`）100% 禁止行内 `//nolint:`**。
 
 5. **`P4-T1` / `P4-T4` 外部协议结构化受限窄模式钩子契约（A8，0 `//nolint:`）**：
-   - `P4-T1`（`core/internal/sshnet/dial`）对接 `golang.org/x/crypto/ssh.KeyboardInteractiveChallenge`（局部 `answers []string` 返回槽位模式）与 `P4-T4`（`internal/host/vault`）对接 Windows Credential Manager `CREDENTIALW`（单函数零逃逸局部结构体指针 + `LazyProc.Call`）/ OS Keychain / ExternalHelper 窄写入时，禁止引入行内 `//nolint:` 或放宽全局规则，统一经 `tools/xopsvet/analyzers/secrettaint/sinks_narrow.go` 的按包层受控结构化窄模式钩子完成适配，并在消费完成后立即零化中间缓冲。
+   - `P4-T1`（`core/internal/sshnet/dial`）对接 `golang.org/x/crypto/ssh.KeyboardInteractiveChallenge`（回调内同步 `box.Use` 写入局部 `answers []string` 返回槽位模式，由外层 challenge 闭包返回前审计防泄漏）与 `P4-T4`（`internal/host/vault`）对接 Windows Credential Manager `CREDENTIALW`（单函数零逃逸局部结构体指针 + `LazyProc.Call`），禁止引入行内 `//nolint:` 或放宽全局规则，统一经 `tools/xopsvet/analyzers/secrettaint/sinks_narrow.go` 的按包层受控结构化窄模式钩子完成适配，并在消费完成后立即零化中间缓冲。其中 `P4-T1` 与 Windows `CREDENTIALW` 窄钩子已在 Phase 0 落地并经对抗测试验证；OS Keychain（macOS Security Framework / Linux Secret Service）与 ExternalHelper 子进程管道的窄模式钩子待 Phase 4 `P4-T4` 引入实际依赖时同步实现并纳入 `sinks_narrow.go` 审计。
 6. **契约、早验与确定性测试**：`core/ports/tck`（含 `ScopedRootFS`/`OperatorReadFS`）、代数律/Fuzz、10,000 种子 DST（覆盖 `O(1)` 崩溃对账、`Halted` 熔断、两段式 `actor.DualActor` 满邮箱压测、重入拒绝、5 大全局不变量）、`ssh -G` 差分，以及 **`Phase 2.5 Walking Skeleton`** 起即跑通三平台原生 CI。
 
 ---

@@ -110,7 +110,7 @@ LDFLAGS := -s -w \
 # 编译命令
 # ==============================================================================
 
-.PHONY: all clean help build build-cli xopsvet core cross dst vet lint test test-race test-cover verify ci release
+.PHONY: default all clean help build build-cli xopsvet core cross dst vet lint test test-race test-cover verify ci release install-skill
 .PHONY: windows windows-arm64 linux linux-arm64 darwin darwin-amd64 darwin-arm64
 
 default: all
