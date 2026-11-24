@@ -39,7 +39,7 @@ func collectDeclSentinels(info *types.Info, gen *ast.GenDecl, sentinels map[*typ
 		if !isSentinelName(id.Name) {
 			continue
 		}
-		if vs.Type != nil && !isErrorInterfaceType(info.TypeOf(vs.Type)) {
+		if vs.Type != nil && !vetutil.IsErrorInterfaceType(info.TypeOf(vs.Type)) {
 			continue
 		}
 		if v, ok := info.Defs[id].(*types.Var); ok && v != nil {
@@ -164,7 +164,7 @@ func isImmutableSentinelSpec(info *types.Info, vs *ast.ValueSpec, sentinels map[
 	if !isSentinelName(id.Name) {
 		return false
 	}
-	if vs.Type != nil && !isErrorInterfaceType(info.TypeOf(vs.Type)) {
+	if vs.Type != nil && !vetutil.IsErrorInterfaceType(info.TypeOf(vs.Type)) {
 		return false
 	}
 	call, ok := ast.Unparen(vs.Values[0]).(*ast.CallExpr)
@@ -216,7 +216,7 @@ func isAllowedSentinelObj(obj types.Object, sentinels map[*types.Var]bool) bool 
 		return true
 	}
 	// 允许包装外部包的导出哨兵错误（如 io.EOF、os.ErrNotExist）。
-	if v.Pkg() == nil || !isErrorInterfaceType(v.Type()) {
+	if v.Pkg() == nil || !vetutil.IsErrorInterfaceType(v.Type()) {
 		return false
 	}
 	return strings.HasPrefix(v.Name(), "Err") || (v.Pkg().Path() == "io" && v.Name() == "EOF")
@@ -229,14 +229,6 @@ func isConstExpr(info *types.Info, expr ast.Expr) bool {
 
 func isSentinelName(name string) bool {
 	return name != "_" && (strings.HasPrefix(name, "Err") || strings.HasPrefix(name, "err"))
-}
-
-func isErrorInterfaceType(t types.Type) bool {
-	if t == nil {
-		return false
-	}
-	errObj := types.Universe.Lookup("error")
-	return errObj != nil && types.Identical(t, errObj.Type())
 }
 
 // checkSentinelMutations 扫描包内所有赋值、for-range 赋值、自增减与取地址表达式，
@@ -310,5 +302,5 @@ func isTrackedSentinelVar(v *types.Var, sentinels map[*types.Var]bool) bool {
 		!v.IsField() &&
 		v.Parent() == v.Pkg().Scope() &&
 		isSentinelName(v.Name()) &&
-		isErrorInterfaceType(v.Type())
+		vetutil.IsErrorInterfaceType(v.Type())
 }

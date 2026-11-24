@@ -2,6 +2,7 @@ package vetutil
 
 import (
 	"go/ast"
+	"go/token"
 	"go/types"
 	"slices"
 	"strings"
@@ -21,14 +22,45 @@ func InspectorOf(pass *analysis.Pass) *inspector.Inspector {
 // IsTestFile 判断 AST 文件是否为 *_test.go 测试源码文件。
 // 优先使用 token.File.Name()，避免 //line 指令干扰真实文件名判定。
 func IsTestFile(pass *analysis.Pass, f *ast.File) bool {
-	if pass == nil || pass.Fset == nil || f == nil {
+	if f == nil {
 		return false
 	}
-	tokFile := pass.Fset.File(f.Package)
+	return IsPosInTestFile(pass, f.Package)
+}
+
+// IsPosInTestFile 判断给定源码位置 pos 是否位于 *_test.go 测试文件中。
+func IsPosInTestFile(pass *analysis.Pass, pos token.Pos) bool {
+	if pass == nil || pass.Fset == nil || !pos.IsValid() {
+		return false
+	}
+	tokFile := pass.Fset.File(pos)
 	if tokFile == nil {
 		return false
 	}
 	return strings.HasSuffix(tokFile.Name(), "_test.go")
+}
+
+// IsErrorInterfaceType 判断类型 t（经类型别名解引用后）是否为 Go 内置 error 接口类型。
+func IsErrorInterfaceType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	t = types.Unalias(t)
+	errObj := types.Universe.Lookup("error")
+	return errObj != nil && types.Identical(t, errObj.Type())
+}
+
+// UnwrapNamedType 解引用类型别名及单层指针，提取命名类型 *types.Named。
+func UnwrapNamedType(t types.Type) (*types.Named, bool) {
+	if t == nil {
+		return nil, false
+	}
+	t = types.Unalias(t)
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = types.Unalias(ptr.Elem())
+	}
+	named, ok := t.(*types.Named)
+	return named, ok && named != nil
 }
 
 // ObjectPkgPath 返回 types.Object 所属包的规范路径（已剥离 _test 后缀）。

@@ -1,0 +1,141 @@
+package hashes
+
+import (
+	"io"
+	"reflect"
+
+	"example.com/extbase"
+)
+
+type EmbeddedBase struct {
+	Host string
+	Port int
+}
+
+func (b EmbeddedBase) WriteCanonical(w io.Writer) {
+	_, _ = io.WriteString(w, b.Host)
+	_ = b.Port
+}
+
+// 合法：全字段覆盖（含跨文件 WriteCanonical、嵌入直接访问、合法 hash-exclude、空白字段 _）
+//xops:canonicalhash
+type ValidPlan struct {
+	EmbeddedBase
+	User  string
+	_     int
+	Cache string //xops:hash-exclude: ephemeral cache key
+}
+
+// 合法：通过提升字段全部覆盖嵌入体 + 同包辅助函数递归 + 接收者别名
+//xops:canonicalhash
+type PromotedAndHelperPlan struct {
+	EmbeddedBase
+	Token string
+}
+
+func (p *PromotedAndHelperPlan) WriteCanonical(w io.Writer) {
+	alias := p
+	writePromoted(w, alias)
+	alias.writeToken(w)
+}
+
+func writePromoted(w io.Writer, p *PromotedAndHelperPlan) {
+	_, _ = io.WriteString(w, p.Host)
+	if p.Port > 0 {
+		_, _ = io.WriteString(w, "port")
+	}
+}
+
+func (p *PromotedAndHelperPlan) writeToken(w io.Writer) {
+	_, _ = io.WriteString(w, p.Token)
+}
+
+// 合法：泛型 //xops:canonicalhash 结构体 + 泛型辅助方法
+//xops:canonicalhash
+type GenericBox[T any] struct {
+	Head string
+	Body T
+}
+
+func (g *GenericBox[T]) WriteCanonical(w io.Writer) {
+	_, _ = io.WriteString(w, g.Head)
+	g.writeBody(w)
+}
+
+func (g *GenericBox[T]) writeBody(w io.Writer) {
+	_, _ = w.Write(nil)
+	_ = []any{g.Body}
+}
+
+// 非法：标注在非结构体上
+//xops:canonicalhash
+type NotAStruct int // want "digestcover: //xops:canonicalhash 仅适用于结构体类型"
+
+// 非法：缺少 WriteCanonical 方法
+//xops:canonicalhash
+type MissingMethod struct { // want "digestcover: 标记 //xops:canonicalhash 的结构体 MissingMethod 缺少 WriteCanonical 方法"
+	Name string
+}
+
+// 非法：hash-exclude 理由为空（即使在非 canonicalhash 结构体上也拦截）
+type EmptyExcludeOnPlain struct {
+	Tmp string /* xops:hash-exclude: */ // want "digestcover: //xops:hash-exclude 必须提供非空排除理由"
+}
+
+// 非法：遗漏字段 + _ = h.Field 空弃反绕过 + 读取同名其他变量 other.Field + LHS 写入
+//xops:canonicalhash
+type BypassAttempts struct {
+	Real    string
+	Discard string
+	Other   string
+	Written string
+	EmptyEx string /* xops:hash-exclude */ // want "digestcover: //xops:hash-exclude 必须提供非空排除理由"
+}
+
+func (b *BypassAttempts) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 BypassAttempts 的 WriteCanonical 未覆盖字段 Discard" "digestcover: 结构体 BypassAttempts 的 WriteCanonical 未覆盖字段 Other" "digestcover: 结构体 BypassAttempts 的 WriteCanonical 未覆盖字段 Written" "digestcover: 结构体 BypassAttempts 的 WriteCanonical 未覆盖字段 EmptyEx"
+	_, _ = io.WriteString(w, b.Real)
+	_ = b.Discard
+	other := BypassAttempts{}
+	_, _ = io.WriteString(w, other.Other)
+	b.Written = "x"
+}
+
+// 非法：部分提升字段（覆盖 Host 但漏掉 Port）
+//xops:canonicalhash
+type PartialPromoted struct {
+	EmbeddedBase
+}
+
+func (p PartialPromoted) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 PartialPromoted 的 WriteCanonical 未覆盖字段 EmbeddedBase"
+	_, _ = io.WriteString(w, p.Host)
+}
+
+// 非法：WriteCanonical 内使用 reflect
+//xops:canonicalhash
+type UsesReflect struct {
+	Name string
+}
+
+func (u UsesReflect) WriteCanonical(w io.Writer) {
+	_ = reflect.ValueOf(u.Name) // want "digestcover: WriteCanonical 禁止使用 reflect"
+}
+
+// 非法：跨包嵌入含未导出字段时仅访问提升导出字段不够，必须直接访问嵌入体自身
+//xops:canonicalhash
+type ExtPromotedInsufficient struct {
+	extbase.ExtBase
+}
+
+func (e ExtPromotedInsufficient) WriteCanonical(w io.Writer) { // want "digestcover: 结构体 ExtPromotedInsufficient 的 WriteCanonical 未覆盖字段 ExtBase"
+	_, _ = io.WriteString(w, e.Public)
+}
+
+// 合法：跨包嵌入直接调用嵌入体 WriteCanonical
+//xops:canonicalhash
+type ExtDirectValid struct {
+	extbase.ExtBase
+}
+
+func (e ExtDirectValid) WriteCanonical(w io.Writer) {
+	e.ExtBase.WriteCanonical(w)
+}

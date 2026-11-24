@@ -130,14 +130,33 @@ func ParseCommentGroup(cg *ast.CommentGroup) []Directive {
 	return out
 }
 
-// HasDirective 判断注释组中是否包含指定类型的 //xops:* 指令。
-func HasDirective(cg *ast.CommentGroup, kind DirectiveKind) bool {
+// FindDirective 在注释组中查找首个指定类型的 //xops:* 指令并返回。
+func FindDirective(cg *ast.CommentGroup, kind DirectiveKind) (Directive, bool) {
 	for _, dir := range ParseCommentGroup(cg) {
 		if dir.Kind == kind {
-			return true
+			return dir, true
 		}
 	}
-	return false
+	return Directive{}, false
+}
+
+// HasDirective 判断注释组中是否包含指定类型的 //xops:* 指令。
+func HasDirective(cg *ast.CommentGroup, kind DirectiveKind) bool {
+	_, ok := FindDirective(cg, kind)
+	return ok
+}
+
+// TypeSpecHasDirective 判断类型声明 ts（含其所属单声明 GenDecl 文档注释与行尾注释）
+// 是否包含指定类型的 //xops:* 指令。当 GenDecl 包含多个 TypeSpec 时不继承 gen.Doc，
+// 避免块级 type (...) 头部注释误串扰到后续成员类型。
+func TypeSpecHasDirective(gen *ast.GenDecl, ts *ast.TypeSpec, kind DirectiveKind) bool {
+	if ts == nil {
+		return false
+	}
+	if HasDirective(ts.Doc, kind) || HasDirective(ts.Comment, kind) {
+		return true
+	}
+	return gen != nil && len(gen.Specs) == 1 && HasDirective(gen.Doc, kind)
 }
 
 // HasNolintComment 判断单条 AST 注释是否为 golangci-lint 的 //nolint 指令。

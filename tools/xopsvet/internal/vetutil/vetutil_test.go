@@ -203,6 +203,96 @@ func assertDirectivesPresent(t *testing.T, cg *ast.CommentGroup) {
 			t.Fatalf("HasDirective(%v) returned false", k)
 		}
 	}
+	dir, ok := vetutil.FindDirective(cg, vetutil.DirectiveHashExclude)
+	if !ok || dir.Arg != "ephemeral cache" {
+		t.Fatalf("FindDirective(hash-exclude) got (%+v, %v), want Arg='ephemeral cache'", dir, ok)
+	}
+	if _, ok := vetutil.FindDirective(cg, vetutil.DirectiveUnknown); ok {
+		t.Fatal("FindDirective(unknown) should return false")
+	}
+}
+
+func TestTypeSpecHasDirectiveAndTypeHelpers(t *testing.T) {
+	fset := token.NewFileSet()
+	src := `package sample
+type ErrAlias = error
+type Item struct{}
+//xops:opaque
+type SingleDoc struct{}
+type (
+	//xops:failclosed
+	First int
+	Second int
+)
+type Trailing int //xops:failclosed
+`
+	f, err := parser.ParseFile(fset, "sample.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Defs:  make(map[*ast.Ident]types.Object),
+	}
+	conf := types.Config{Importer: importer.Default()}
+	if _, err := conf.Check("example.com/sample", fset, []*ast.File{f}, info); err != nil {
+		t.Fatal(err)
+	}
+	pass := &analysis.Pass{Fset: fset, Files: []*ast.File{f}, TypesInfo: info}
+	if vetutil.IsPosInTestFile(pass, f.Package) {
+		t.Fatal("sample.go should not be treated as a test file")
+	}
+	assertTypeSpecDirectives(t, f)
+	assertUnwrapAndErrorHelpers(t, f, info)
+}
+
+func assertTypeSpecDirectives(t *testing.T, f *ast.File) {
+	t.Helper()
+	got := make(map[string]bool)
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			ts := spec.(*ast.TypeSpec)
+			got[ts.Name.Name+":opaque"] = vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveOpaque)
+			got[ts.Name.Name+":failclosed"] = vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveFailClosed)
+		}
+	}
+	if !got["SingleDoc:opaque"] || !got["First:failclosed"] || got["Second:failclosed"] || !got["Trailing:failclosed"] {
+		t.Fatalf("unexpected TypeSpecHasDirective results: %+v", got)
+	}
+}
+
+func assertUnwrapAndErrorHelpers(t *testing.T, f *ast.File, info *types.Info) {
+	t.Helper()
+	defs := collectTypeDefsByName(f, info)
+	if !vetutil.IsErrorInterfaceType(defs["ErrAlias"]) {
+		t.Fatal("ErrAlias should satisfy IsErrorInterfaceType")
+	}
+	named, ok := vetutil.UnwrapNamedType(types.NewPointer(defs["Item"]))
+	if !ok || named.Obj().Name() != "Item" {
+		t.Fatalf("UnwrapNamedType(*Item) got (%v, %v)", named, ok)
+	}
+	if vetutil.IsErrorInterfaceType(types.Typ[types.Int]) {
+		t.Fatal("int should not satisfy IsErrorInterfaceType")
+	}
+}
+
+func collectTypeDefsByName(f *ast.File, info *types.Info) map[string]types.Type {
+	out := make(map[string]types.Type)
+	for _, decl := range f.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			ts := spec.(*ast.TypeSpec)
+			out[ts.Name.Name] = info.Defs[ts.Name].Type()
+		}
+	}
+	return out
 }
 
 func assertNolintCases(t *testing.T) {

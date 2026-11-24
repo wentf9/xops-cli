@@ -44,9 +44,12 @@ func checkTypeDeclDTOs(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.Ge
 		if !ok {
 			continue
 		}
-		isExplicitDTO := vetutil.HasDirective(gen.Doc, vetutil.DirectiveDTO) ||
-			vetutil.HasDirective(ts.Doc, vetutil.DirectiveDTO)
-		if isDTOStruct(pkgInfo, ts, st, isExplicitDTO) {
+		isExplicitDTO := vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveDTO)
+		hasTags, err := hasSerializationTags(st)
+		if err != nil {
+			continue
+		}
+		if isDTOStruct(pkgInfo, ts, isExplicitDTO || hasTags) {
 			checkDTOStructFields(pass, st)
 		}
 	}
@@ -56,8 +59,8 @@ func checkTypeDeclDTOs(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.Ge
 // 1. 显式标记 //xops:dto 或含非 "-" 的 json/yaml 字段标签；
 // 2. 位于事件/MCP/审计/存储等 DTO 专属包内的导出类型或常见载荷命名；
 // 3. 仓库内其余包中以严格 DTO/Event/AuditEntry/Config 后缀结尾的导出类型。
-func isDTOStruct(pkgInfo vetutil.PkgInfo, ts *ast.TypeSpec, st *ast.StructType, isExplicitDTO bool) bool {
-	if isExplicitDTO || hasSerializationTags(st) {
+func isDTOStruct(pkgInfo vetutil.PkgInfo, ts *ast.TypeSpec, hasExplicitOrTagged bool) bool {
+	if hasExplicitOrTagged {
 		return true
 	}
 	name := ts.Name.Name
@@ -72,27 +75,37 @@ func isDTOStruct(pkgInfo vetutil.PkgInfo, ts *ast.TypeSpec, st *ast.StructType, 
 	return ts.Name.IsExported() && hasStrictDTOSuffix(name)
 }
 
-func hasSerializationTags(st *ast.StructType) bool {
+func hasSerializationTags(st *ast.StructType) (bool, error) {
 	if st.Fields == nil {
-		return false
+		return false, nil
 	}
 	for _, f := range st.Fields.List {
-		if f.Tag == nil {
-			continue
-		}
-		raw, err := strconv.Unquote(f.Tag.Value)
+		tag, hasTag, err := parseStructTag(f)
 		if err != nil {
+			return false, err
+		}
+		if !hasTag {
 			continue
 		}
-		tag := reflect.StructTag(raw)
 		if v, ok := tag.Lookup("json"); ok && v != "-" {
-			return true
+			return true, nil
 		}
 		if v, ok := tag.Lookup("yaml"); ok && v != "-" {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
+}
+
+func parseStructTag(f *ast.Field) (reflect.StructTag, bool, error) {
+	if f == nil || f.Tag == nil {
+		return "", false, nil
+	}
+	raw, err := strconv.Unquote(f.Tag.Value)
+	if err != nil {
+		return "", false, err
+	}
+	return reflect.StructTag(raw), true, nil
 }
 
 func isDTOPackage(pkgInfo vetutil.PkgInfo) bool {
@@ -150,7 +163,8 @@ func checkDTOStructFields(pass *analysis.Pass, st *ast.StructType) {
 		return
 	}
 	for _, f := range st.Fields.List {
-		if isFieldSerializationSkipped(f) {
+		skipped, err := isFieldSerializationSkipped(f)
+		if err == nil && skipped {
 			continue
 		}
 		fieldType := pass.TypesInfo.TypeOf(f.Type)
@@ -162,21 +176,17 @@ func checkDTOStructFields(pass *analysis.Pass, st *ast.StructType) {
 
 // isFieldSerializationSkipped 判断字段是否被序列化标签显式忽略（"-"）。
 // 仅当未同时被另一常见序列化格式保留（如 json:"-" yaml:"dur"）时才予豁免。
-func isFieldSerializationSkipped(f *ast.Field) bool {
-	if f.Tag == nil {
-		return false
+func isFieldSerializationSkipped(f *ast.Field) (bool, error) {
+	tag, hasTag, err := parseStructTag(f)
+	if err != nil || !hasTag {
+		return false, err
 	}
-	raw, err := strconv.Unquote(f.Tag.Value)
-	if err != nil {
-		return false
-	}
-	tag := reflect.StructTag(raw)
 	jsonVal, hasJSON := tag.Lookup("json")
 	yamlVal, hasYAML := tag.Lookup("yaml")
 	if hasJSON && jsonVal == "-" && (!hasYAML || yamlVal == "-") {
-		return true
+		return true, nil
 	}
-	return hasYAML && yamlVal == "-" && !hasJSON
+	return hasYAML && yamlVal == "-" && !hasJSON, nil
 }
 
 // hasBareTimeDuration 递归检查 DTO 字段类型是否包含裸 time.Duration。

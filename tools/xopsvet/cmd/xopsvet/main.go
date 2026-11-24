@@ -5,8 +5,11 @@ import (
 	"golang.org/x/tools/go/analysis/multichecker"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/archbound"
+	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/digestcover"
+	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/failclosed"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/noimplicit"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/osboundary"
+	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/sumexhaust"
 )
 
 func main() {
@@ -14,5 +17,8 @@ func main() {
 		archbound.NewAnalyzer(),
 		noimplicit.NewAnalyzer(),
 		osboundary.NewAnalyzer(),
+		sumexhaust.NewAnalyzer(),
+		failclosed.NewAnalyzer(),
+		digestcover.NewAnalyzer(),
 	)
 }
