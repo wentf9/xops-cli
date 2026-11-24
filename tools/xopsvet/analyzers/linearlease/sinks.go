@@ -3,6 +3,8 @@ package linearlease
 import (
 	"go/ast"
 	"go/types"
+
+	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 )
 
 func (s *closureState) checkEscapeNode(n ast.Node) {
@@ -151,7 +153,7 @@ func (s *closureState) checkCallEscape(call *ast.CallExpr) {
 	if s.checkBuiltinCallEscape(call) {
 		return
 	}
-	spec := resolveCallLeaseSpec(s.pass, s.facts, call, s.deferCalls[call])
+	spec := resolveCallLeaseSpec(s.pass, s.facts, call)
 	if len(s.resolveArgFuncLits(call.Fun)) > 0 {
 		spec.syncClosure = true
 	}
@@ -196,7 +198,10 @@ func (s *closureState) checkCopyEscape(call *ast.CallExpr) {
 	}
 	switch target := unwrapMutationBase(s.pass.TypesInfo, call.Args[0]).(type) {
 	case *ast.CallExpr:
-		return
+		if vetutil.IsFreshLocalSliceAlloc(s.pass.TypesInfo, target) {
+			return
+		}
+		s.reportEscape(call.Args[0], "linearlease: 禁止通过 copy 将 //xops:borrowed 借用变量写入非新建局部切片目标")
 	case *ast.Ident:
 		if target.Name == "_" {
 			return

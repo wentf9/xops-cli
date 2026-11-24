@@ -4,11 +4,11 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/domain/good"
-	"github.com/wentf9/xops-cli/core/internal/sim"
+	"golang.org/x/text/unicode/norm"
 )
 
 func TestGoodExternal(t *testing.T) {
-	_ = sim.SimFS{}
+	_ = norm.NFC.String("ok")
 	if good.UseAllAllowedStdlibs() == 0 {
 		t.Fatal("zero")
 	}

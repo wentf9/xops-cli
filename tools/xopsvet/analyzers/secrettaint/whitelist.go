@@ -250,6 +250,6 @@ func reportWhitelistViolation(pass *analysis.Pass, reported map[token.Pos]bool, 
 	reported[rng.Pos()] = true
 	pass.ReportRangef(
 		rng,
-		"secrettaint: 禁止在白名单（core/domain/secret、internal/host/vault、core/internal/sshnet/dial）外调用或引用 SecretBox.Use / //xops:secretuse",
+		"secrettaint: 禁止在白名单（core/domain/secret、internal/host/vault、core/internal/sshnet/dial、core/internal/sshnet/priv、core/internal/sim）外调用或引用 SecretBox.Use / //xops:secretuse",
 	)
 }

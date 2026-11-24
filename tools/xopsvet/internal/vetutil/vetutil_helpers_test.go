@@ -155,3 +155,95 @@ func CommentedOutLine(
 		}
 	}
 }
+
+func TestIsFreshLocalSliceAlloc(t *testing.T) {
+	if vetutil.IsFreshLocalSliceAlloc(nil, nil) {
+		t.Fatal("nil inputs should return false")
+	}
+	fset := token.NewFileSet()
+	src := `package slicealloc
+type MyBytes []byte
+type MyStr string
+var outer []byte
+func getSlice() []byte { return outer }
+func cases(s string, ms MyStr, mb MyBytes) {
+	cMakeSlice := make([]byte, 8)
+	cMakeNamed := make(MyBytes, 8)
+	cMakeMap := make(map[string]int)
+	cMakeChan := make(chan int, 1)
+	cNilSlice := []byte(nil)
+	cNilNamed := MyBytes(nil)
+	cStrLit := []byte("hello")
+	cStrParen := ([]byte)("world")
+	cStrVar := MyBytes(s)
+	cNamedStr := []byte(ms)
+	cSliceConv := MyBytes(outer)
+	cNamedToRaw := []byte(mb)
+	cFuncCall := getSlice()
+	cAppend := append([]byte(nil), 1)
+	_, _, _, _, _, _, _, _, _, _, _, _, _, _ = cMakeSlice, cMakeNamed, cMakeMap, cMakeChan, cNilSlice, cNilNamed, cStrLit, cStrParen, cStrVar, cNamedStr, cSliceConv, cNamedToRaw, cFuncCall, cAppend
+}
+func shadowedNilCase() {
+	var nil []byte
+	cShadowedNil := []byte(nil)
+	_ = cShadowedNil
+}
+`
+	f, err := parser.ParseFile(fset, "slicealloc.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{
+		Types: make(map[ast.Expr]types.TypeAndValue),
+		Uses:  make(map[*ast.Ident]types.Object),
+		Defs:  make(map[*ast.Ident]types.Object),
+	}
+	conf := types.Config{Importer: importer.Default()}
+	if _, err := conf.Check("example.com/slicealloc", fset, []*ast.File{f}, info); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{
+		"cMakeSlice":   true,
+		"cMakeNamed":   true,
+		"cMakeMap":     false,
+		"cMakeChan":    false,
+		"cNilSlice":    true,
+		"cNilNamed":    true,
+		"cStrLit":      true,
+		"cStrParen":    true,
+		"cStrVar":      true,
+		"cNamedStr":    true,
+		"cSliceConv":   false,
+		"cNamedToRaw":  false,
+		"cFuncCall":    false,
+		"cAppend":      false,
+		"cShadowedNil": false,
+	}
+	seen := make(map[string]bool, len(want))
+	ast.Inspect(f, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		id, ok := assign.Lhs[0].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		expected, tracked := want[id.Name]
+		if !tracked {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			t.Fatalf("%s rhs is not CallExpr", id.Name)
+		}
+		seen[id.Name] = true
+		if got := vetutil.IsFreshLocalSliceAlloc(info, call); got != expected {
+			t.Fatalf("IsFreshLocalSliceAlloc(%s) = %v, want %v", id.Name, got, expected)
+		}
+		return true
+	})
+	if len(seen) != len(want) {
+		t.Fatalf("checked %d cases, want %d", len(seen), len(want))
+	}
+}

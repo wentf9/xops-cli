@@ -2,10 +2,11 @@
 //
 // 本分析器在生产与测试文件中统一执行以下静态约束（仅跳过合成 .test 入口包）：
 //   - 禁止定义 func init()；
-//   - 禁止可变包级 var（仅豁免编译期接口断言 var _ I = (*T)(nil) 与不可变哨兵错误）；
+//   - 禁止可变包级 var（仅豁免编译期接口断言 var _ I = (*T)(nil)、不可变哨兵错误，
+//     以及 cmd/xops package main 的链接期只读 //xops:buildvar 字符串变量）；
 //   - 禁止 core/internal/foundation/trace 之外使用 context.WithValue / ctx.Value；
 //   - 禁止匿名接口断言 x.(interface{...})（含 type switch）；
-//   - 禁止 7 个特权白名单包之外使用行内 //nolint: 注解；
+//   - 禁止 8 个生产特权白名单包之外使用行内 //nolint: 注解；
 //   - 禁止 Event / Audit / MCP / Config DTO 结构体裸用 time.Duration（须用 algebraic.Duration）。
 package noimplicit
 
@@ -31,15 +32,16 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, nil
 	}
 	pkgInfo := vetutil.ClassifyPackage(pass.Pkg.Path())
-	checkPackageDecls(pass)
+	checkPackageDecls(pass, pkgInfo)
 	checkContextAndAnonIfaces(pass, pkgInfo)
 	checkNolintComments(pass, pkgInfo)
 	checkDTOs(pass, pkgInfo)
 	return nil, nil
 }
 
-func checkPackageDecls(pass *analysis.Pass) {
+func checkPackageDecls(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	sentinels := collectSentinelVars(pass)
+	buildVars := collectBuildVars(pass, pkgInfo)
 	for _, file := range pass.Files {
 		for _, decl := range file.Decls {
 			switch d := decl.(type) {
@@ -49,10 +51,10 @@ func checkPackageDecls(pass *analysis.Pass) {
 				}
 			case *ast.GenDecl:
 				if d.Tok == token.VAR {
-					checkPkgVarDecl(pass, d, sentinels)
+					checkPkgVarDecl(pass, d, sentinels, buildVars)
 				}
 			}
 		}
 	}
-	checkSentinelMutations(pass, sentinels)
+	checkImmutableVarMutations(pass, sentinels, buildVars)
 }

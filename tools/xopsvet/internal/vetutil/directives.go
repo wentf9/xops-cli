@@ -28,6 +28,8 @@ const (
 	DirectiveSecretUse
 	// DirectiveDTO 表示 //xops:dto（显式声明为序列化 DTO 的结构体，禁裸用 time.Duration）。
 	DirectiveDTO
+	// DirectiveBuildVar 表示 //xops:buildvar（仅限 cmd/xops package main 的链接期只读构建元信息变量）。
+	DirectiveBuildVar
 )
 
 // Directive 表示一条从注释中解析出的 //xops:* 指令。
@@ -113,6 +115,8 @@ func matchDirectiveToken(tok string) DirectiveKind {
 		return DirectiveSecretUse
 	case "dto":
 		return DirectiveDTO
+	case "buildvar":
+		return DirectiveBuildVar
 	default:
 		return DirectiveUnknown
 	}

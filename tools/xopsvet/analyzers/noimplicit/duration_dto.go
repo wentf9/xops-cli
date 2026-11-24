@@ -45,9 +45,9 @@ func checkTypeDeclDTOs(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, gen *ast.Ge
 			continue
 		}
 		isExplicitDTO := vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveDTO)
-		hasTags, err := hasSerializationTags(st)
-		if err != nil {
-			continue
+		hasTags, tagErr := hasSerializationTags(st)
+		if tagErr != nil {
+			hasTags = false
 		}
 		if isDTOStruct(pkgInfo, ts, isExplicitDTO || hasTags) {
 			checkDTOStructFields(pass, st)
@@ -75,26 +75,35 @@ func isDTOStruct(pkgInfo vetutil.PkgInfo, ts *ast.TypeSpec, hasExplicitOrTagged 
 	return ts.Name.IsExported() && hasStrictDTOSuffix(name)
 }
 
+// hasSerializationTags 检查结构体是否存在非 "-" 的 json/yaml 序列化标签。
+// 保留 (bool, error) 签名以满足 failclosed 自检；单字段 tag 解析失败仅记录首个错误并继续扫描，
+// 若后续字段命中有效序列化标签仍返回 (true, nil)，防止单个畸形 tag 导致整结构体漏检。
 func hasSerializationTags(st *ast.StructType) (bool, error) {
 	if st.Fields == nil {
 		return false, nil
 	}
+	var firstErr error
 	for _, f := range st.Fields.List {
 		tag, hasTag, err := parseStructTag(f)
 		if err != nil {
-			return false, err
-		}
-		if !hasTag {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
-		if v, ok := tag.Lookup("json"); ok && v != "-" {
-			return true, nil
-		}
-		if v, ok := tag.Lookup("yaml"); ok && v != "-" {
+		if hasTag && hasNonIgnoredSerialTag(tag) {
 			return true, nil
 		}
 	}
-	return false, nil
+	return false, firstErr
+}
+
+func hasNonIgnoredSerialTag(tag reflect.StructTag) bool {
+	if v, ok := tag.Lookup("json"); ok && v != "-" {
+		return true
+	}
+	v, ok := tag.Lookup("yaml")
+	return ok && v != "-"
 }
 
 func parseStructTag(f *ast.Field) (reflect.StructTag, bool, error) {

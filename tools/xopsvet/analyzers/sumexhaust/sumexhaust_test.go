@@ -19,5 +19,6 @@ func TestSumExhaust(t *testing.T) {
 		"example.com/sumusealias",
 		"github.com/wentf9/xops-cli/core/domain/security",
 		"github.com/wentf9/xops-cli/core/internal/gate",
+		"github.com/wentf9/xops-cli/core/ports/tck",
 	)
 }

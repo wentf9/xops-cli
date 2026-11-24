@@ -1,6 +1,9 @@
 package security
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 type GuardrailDecision interface {
 	sealedDecision()
@@ -636,5 +639,225 @@ func validNestedIIFEFailClosedInsideFuncLitDefault(d GuardrailDecision) bool {
 			}()
 			return
 		}()
+	}
+}
+
+// v2.3.2 B4 回归用例：前置否定极性对偶、error(nil)、new(T)/new(expr) 与 CompositeLit 对称校验。
+type Verdict int
+
+const (
+	VerdictDeny Verdict = iota
+	VerdictAllow
+	VerdictNotAllowed
+)
+
+type Decision struct {
+	Allowed    bool
+	Denied     bool
+	NotAllowed bool
+	Verdict    Verdict
+}
+
+var ErrNotAllowed = errors.New("not allowed")
+
+func newNotAllowedErr() error { return ErrNotAllowed }
+func allowRequest() error     { return nil }
+func allowOnError() error     { return nil }
+func allowIfInvalid() bool    { return true }
+
+func validNegatedPolarityAndComposites(d GuardrailDecision) (Decision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return Decision{Denied: true}, nil
+	case *DecisionAllow:
+		return Decision{Allowed: true}, nil
+	default:
+		return Decision{Denied: true}, nil
+	}
+}
+
+func validNotAllowedFieldAndNewExpr(d GuardrailDecision) (*Decision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return &Decision{NotAllowed: true}, nil
+	case *DecisionAllow:
+		return &Decision{Allowed: true}, nil
+	default:
+		return new(Decision{NotAllowed: true}), nil
+	}
+}
+
+func validAllowedFalseField(d GuardrailDecision) (Decision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return Decision{Allowed: false}, nil
+	case *DecisionAllow:
+		return Decision{Allowed: true}, nil
+	default:
+		return Decision{Allowed: false}, nil
+	}
+}
+
+func validVerdictNotAllowed(d GuardrailDecision) (Verdict, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return VerdictDeny, nil
+	case *DecisionAllow:
+		return VerdictAllow, nil
+	default:
+		return VerdictNotAllowed, nil
+	}
+}
+
+func validNewDecisionDeny(d GuardrailDecision) (GuardrailDecision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return &DecisionDeny{}, nil
+	case *DecisionAllow:
+		return &DecisionAllow{}, nil
+	default:
+		return new(DecisionDeny), nil
+	}
+}
+
+func validErrNotAllowedAndStdlibErrCalls(d GuardrailDecision, mode int) error {
+	switch d.(type) {
+	case *DecisionDeny:
+		return ErrNotAllowed
+	case *DecisionAllow:
+		return nil
+	default:
+		if mode == 0 {
+			return ErrNotAllowed
+		} else if mode == 1 {
+			return newNotAllowedErr()
+		} else if mode == 2 {
+			return errors.New("allow")
+		} else if mode == 3 {
+			return fmt.Errorf("allow: %T", d)
+		} else {
+			return errors.Join(ErrNotAllowed)
+		}
+	}
+}
+
+func invalidAllowRequestErrorCall(d GuardrailDecision) error {
+	switch d.(type) {
+	case *DecisionDeny:
+		return ErrNotAllowed
+	case *DecisionAllow:
+		return nil
+	default:
+		return allowRequest() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidAllowOnErrorCall(d GuardrailDecision) error {
+	switch d.(type) {
+	case *DecisionDeny:
+		return ErrNotAllowed
+	case *DecisionAllow:
+		return nil
+	default:
+		return allowOnError() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidAllowIfInvalidCall(d GuardrailDecision) bool {
+	switch d.(type) {
+	case *DecisionDeny:
+		return false
+	case *DecisionAllow:
+		return true
+	default:
+		return allowIfInvalid() // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidErrorNilCast(d GuardrailDecision) error {
+	switch d.(type) {
+	case *DecisionDeny:
+		return ErrNotAllowed
+	case *DecisionAllow:
+		return nil
+	default:
+		return error(nil) // want "sumexhaust: 安全决策 default 分支禁止返回 nil error 且无显式拒绝值"
+	}
+}
+
+func invalidErrorNilPairCast(d GuardrailDecision) (any, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return &DecisionDeny{}, nil
+	case *DecisionAllow:
+		return &DecisionAllow{}, nil
+	default:
+		return error(nil), nil // want "sumexhaust: 安全决策 default 分支禁止返回 nil error 且无显式拒绝值"
+	}
+}
+
+func invalidTypedNilDecisionDeny(d GuardrailDecision) (GuardrailDecision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return &DecisionDeny{}, nil
+	case *DecisionAllow:
+		return &DecisionAllow{}, nil
+	default:
+		return (*DecisionDeny)(nil), nil // want "sumexhaust: 安全决策 default 分支禁止返回 nil error 且无显式拒绝值"
+	}
+}
+
+func invalidCompositeAllowedTrue(d GuardrailDecision) (Decision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return Decision{Denied: true}, nil
+	case *DecisionAllow:
+		return Decision{Allowed: true}, nil
+	default:
+		return Decision{Allowed: true}, nil // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidCompositeDeniedFalse(d GuardrailDecision) (Decision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return Decision{Denied: true}, nil
+	case *DecisionAllow:
+		return Decision{Allowed: true}, nil
+	default:
+		return Decision{Denied: false}, nil // want "sumexhaust: 安全决策 default 分支禁止返回 nil error 且无显式拒绝值"
+	}
+}
+
+func invalidNewDecisionAllow(d GuardrailDecision) (GuardrailDecision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return &DecisionDeny{}, nil
+	case *DecisionAllow:
+		return &DecisionAllow{}, nil
+	default:
+		return new(DecisionAllow), nil // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidNewExprAllowedTrue(d GuardrailDecision) (*Decision, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return &Decision{Denied: true}, nil
+	case *DecisionAllow:
+		return &Decision{Allowed: true}, nil
+	default:
+		return new(Decision{Allowed: true}), nil // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
+	}
+}
+
+func invalidNewExprTrue(d GuardrailDecision) (*bool, error) {
+	switch d.(type) {
+	case *DecisionDeny:
+		return new(false), nil
+	case *DecisionAllow:
+		return new(true), nil
+	default:
+		return new(true), nil // want "sumexhaust: 安全决策 default 分支禁止返回放行值（fail-open）"
 	}
 }

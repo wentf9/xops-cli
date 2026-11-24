@@ -8,12 +8,15 @@ import (
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/ast/inspector"
 )
 
-// checkOSSymbols 检查物理封锁于 core/osfs 与 internal/host/sys 的底层系统原语，
+// checkOSSymbols 在生产源码中检查物理封锁于 core/osfs 与 internal/host/sys 的底层系统原语，
 // 覆盖直接符号引用、os.Root 方法选择及 Unix Domain Socket 常量网络监听调用。
+// 测试文件（*_test.go）与测试契约夹具层（core/ports/tck，已由 archbound 保证 0 生产可达）豁免此检查，
+// 以便合法构造临时目录、读取测试环境变量及调用外部对照工具（如 ssh -G）。
 func checkOSSymbols(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
-	if pass.TypesInfo == nil {
+	if pass.TypesInfo == nil || pkgInfo.IsExternalTest || pkgInfo.Layer == vetutil.LayerCorePortsTCK {
 		return
 	}
 	allowOSFS := vetutil.AllowOSFSPrimitives(pkgInfo)
@@ -21,8 +24,12 @@ func checkOSSymbols(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	if allowOSFS && allowSys {
 		return
 	}
+	prodFiles := collectProdFiles(pass)
+	if len(prodFiles) == 0 {
+		return
+	}
 	reported := make(map[token.Pos]bool)
-	ins := vetutil.InspectorOf(pass)
+	ins := inspector.New(prodFiles)
 	nodeFilter := []ast.Node{
 		(*ast.SelectorExpr)(nil),
 		(*ast.Ident)(nil),
@@ -31,6 +38,16 @@ func checkOSSymbols(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	ins.Preorder(nodeFilter, func(n ast.Node) {
 		checkOSSymbolNode(pass, n, allowOSFS, allowSys, reported)
 	})
+}
+
+func collectProdFiles(pass *analysis.Pass) []*ast.File {
+	prodFiles := make([]*ast.File, 0, len(pass.Files))
+	for _, f := range pass.Files {
+		if !vetutil.IsTestFile(pass, f) {
+			prodFiles = append(prodFiles, f)
+		}
+	}
+	return prodFiles
 }
 
 func checkOSSymbolNode(pass *analysis.Pass, n ast.Node, allowOSFS, allowSys bool, reported map[token.Pos]bool) {

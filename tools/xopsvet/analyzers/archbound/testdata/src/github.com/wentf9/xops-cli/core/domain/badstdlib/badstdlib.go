@@ -2,6 +2,7 @@ package badstdlib
 
 import (
 	"context"     // want "core/domain/\\*\\* 禁止导入非白名单标准库 \"context\""
+	"crypto/sha1" // want "core/domain/\\*\\* 禁止导入非白名单标准库 \"crypto/sha1\""
 	"math/rand"   // want "core/domain/\\*\\* 禁止导入非白名单标准库 \"math/rand\""
 	"net"         // want "core/domain/\\*\\* 禁止导入非白名单标准库 \"net\""
 	"os"          // want "core/domain/\\*\\* 禁止导入非白名单标准库 \"os\""
@@ -17,6 +18,7 @@ import (
 func Bad() {
 	var (
 		_ context.Context
+		_ = sha1.New
 		_ = rand.Int()
 		_ net.Conn
 		_ = os.ErrNotExist

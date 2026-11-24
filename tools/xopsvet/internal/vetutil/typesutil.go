@@ -144,6 +144,55 @@ func unwrapCallFun(expr ast.Expr) ast.Expr {
 	}
 }
 
+// IsFreshLocalSliceAlloc 判断调用表达式是否必为全新分配的局部切片（不与外部缓冲区共享底层数组）。
+// 仅精确放行两类调用：
+//  1. 内置 make(...) 且结果底层类型为 *types.Slice（排除 make(map/chan)）；
+//  2. 目标底层类型为 *types.Slice 的单参类型转换，且实参为内置 nil（含 UntypedNil）或底层类型为字符串
+//     （basic.Info()&types.IsString != 0，同时覆盖 string 与未类型化字符串常量）。
+//
+// 其余所有普通函数调用与切片互转（如 MyBytes(outer)）一律返回 false。
+func IsFreshLocalSliceAlloc(info *types.Info, call *ast.CallExpr) bool {
+	if info == nil || call == nil {
+		return false
+	}
+	fun := ast.Unparen(call.Fun)
+	if id, ok := fun.(*ast.Ident); ok {
+		if b, isBuiltin := info.Uses[id].(*types.Builtin); isBuiltin && b.Name() == "make" {
+			return isSliceUnderlying(info.TypeOf(call))
+		}
+	}
+	tv, ok := info.Types[fun]
+	if !ok || !tv.IsType() || len(call.Args) != 1 || call.Ellipsis.IsValid() {
+		return false
+	}
+	return isSliceUnderlying(tv.Type) && isFreshSliceConvArg(info, call.Args[0])
+}
+
+func isSliceUnderlying(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := types.Unalias(t).Underlying().(*types.Slice)
+	return ok
+}
+
+func isFreshSliceConvArg(info *types.Info, arg ast.Expr) bool {
+	if id, ok := ast.Unparen(arg).(*ast.Ident); ok {
+		if _, isNil := info.Uses[id].(*types.Nil); isNil {
+			return true
+		}
+	}
+	argType := info.TypeOf(arg)
+	if argType == nil {
+		return false
+	}
+	basic, ok := types.Unalias(argType).Underlying().(*types.Basic)
+	if !ok {
+		return false
+	}
+	return basic.Kind() == types.UntypedNil || basic.Info()&types.IsString != 0
+}
+
 // TypeContains 递归检查类型 t（含指针、切片、数组、Map、Chan、结构体字段、
 // 签名、泛型实参及接口嵌入）中是否包含满足谓词 pred 的命名类型。
 // 内置环路检测集合 seen，可安全处理自引用结构体或递归接口。

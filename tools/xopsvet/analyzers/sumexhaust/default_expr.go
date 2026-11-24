@@ -2,18 +2,14 @@ package sumexhaust
 
 import (
 	"go/ast"
-	"go/constant"
 	"go/token"
 	"go/types"
-	"maps"
-	"strings"
-	"unicode"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 )
 
 // isPermissiveExpr 判断安全决策 default 分支中的表达式是否代表放行（fail-open）值，
-// 覆盖布尔常量、已追踪的放行局部变量、放行语义命名调用，以及内联或局部闭包返回的放行路径。
+// 覆盖布尔常量、已追踪放行变量、内联/局部闭包、复合字面量、new(T)/new(expr) 及前置否定极性命名校验。
 func isPermissiveExpr(info *types.Info, expr ast.Expr, st defaultScanState) bool {
 	return isPermissiveExprSeen(info, expr, st, make(map[*ast.FuncLit]bool))
 }
@@ -24,20 +20,26 @@ func isPermissiveExprSeen(
 	st defaultScanState,
 	visited map[*ast.FuncLit]bool,
 ) bool {
-	if isBoolConstExpr(info, expr, true) {
-		return true
-	}
-	if isPermissiveVarRef(info, expr, st.permissiveVars) {
+	if isBoolConstExpr(info, expr, true) || isPermissiveVarRef(info, expr, st.permissiveVars) {
 		return true
 	}
 	if lit := resolveCalledFuncLit(info, expr, st.funcLitVars); lit != nil {
 		return funcLitHasFailOpenReturn(info, lit, st, visited)
 	}
-	id := rightmostIdent(expr)
-	if id == nil {
+	if lit := unwrapCompositeLit(expr); lit != nil {
+		return isCompositeLitPermissive(info, lit, st, visited)
+	}
+	if newArg, ok := unwrapNewBuiltinArg(info, expr); ok {
+		return isPermissiveExprSeen(info, newArg, st, visited)
+	}
+	if convArg, ok := unwrapSingleTypeConversion(info, expr); ok && isPermissiveExprSeen(info, convArg, st, visited) {
+		return true
+	}
+	if isNonCallErrorValueExpr(info, expr) || isAlwaysFailClosedErrorCall(info, expr) {
 		return false
 	}
-	return hasAnyToken(id.Name, isPermissiveToken)
+	id := rightmostIdent(expr)
+	return id != nil && isPermissiveIdentName(id.Name)
 }
 
 func isPermissiveVarRef(info *types.Info, expr ast.Expr, permissiveVars map[*types.Var]bool) bool {
@@ -52,364 +54,179 @@ func isPermissiveVarRef(info *types.Info, expr ast.Expr, permissiveVars map[*typ
 	return ok && permissiveVars[v]
 }
 
-func resolveCalledFuncLit(info *types.Info, expr ast.Expr, funcLitVars map[*types.Var]*ast.FuncLit) *ast.FuncLit {
-	call, ok := ast.Unparen(expr).(*ast.CallExpr)
-	if !ok {
-		return nil
-	}
-	switch fn := ast.Unparen(call.Fun).(type) {
-	case *ast.FuncLit:
-		return fn
-	case *ast.Ident:
-		if info == nil || len(funcLitVars) == 0 {
-			return nil
-		}
-		v, ok := info.Uses[fn].(*types.Var)
-		if !ok {
-			return nil
-		}
-		return funcLitVars[v]
-	default:
-		return nil
-	}
-}
-
-// funcLitHasFailOpenReturn 静态检查闭包体内是否存在返回放行值或返回 nil error 且无拒绝值的路径。
-func funcLitHasFailOpenReturn(
+// isCompositeLitPermissive 递归检查结构体/容器复合字面量是否携带放行字段或放行类型名。
+// 若键名本身为 fail-closed 语义（如 Denied: true / NotAllowed: true），放行其布尔 true 值以免误报。
+func isCompositeLitPermissive(
 	info *types.Info,
-	lit *ast.FuncLit,
+	lit *ast.CompositeLit,
 	st defaultScanState,
 	visited map[*ast.FuncLit]bool,
 ) bool {
-	return inspectFuncLitBody(info, lit, st, visited, false)
-}
-
-func inspectFuncLitBody(
-	info *types.Info,
-	lit *ast.FuncLit,
-	st defaultScanState,
-	visited map[*ast.FuncLit]bool,
-	sharePermissive bool,
-) bool {
-	if info == nil || lit == nil || lit.Body == nil || visited[lit] {
-		return false
-	}
-	visited[lit] = true
-	defer delete(visited, lit)
-	litSig, _ := info.TypeOf(lit).(*types.Signature)
-	subState := buildFuncLitSubState(litSig, st, visited, sharePermissive)
-	failOpen := false
-	ast.Inspect(lit.Body, func(n ast.Node) bool {
-		if n == nil || failOpen {
-			return false
-		}
-		if innerLit, ok := n.(*ast.FuncLit); ok && innerLit != lit {
-			return false
-		}
-		failOpen = inspectFuncLitNode(info, n, litSig, subState, visited)
-		return !failOpen
-	})
-	return failOpen
-}
-
-func buildFuncLitSubState(
-	litSig *types.Signature,
-	st defaultScanState,
-	visited map[*ast.FuncLit]bool,
-	sharePermissive bool,
-) defaultScanState {
-	permVars := st.permissiveVars
-	if !sharePermissive {
-		permVars = maps.Clone(st.permissiveVars)
-	}
-	if permVars == nil {
-		permVars = make(map[*types.Var]bool)
-	}
-	fnVars := maps.Clone(st.funcLitVars)
-	if fnVars == nil {
-		fnVars = make(map[*types.Var]*ast.FuncLit)
-	}
-	return defaultScanState{
-		pass:           st.pass,
-		sig:            litSig,
-		inTest:         st.inTest,
-		permissiveVars: permVars,
-		funcLitVars:    fnVars,
-		visitedLits:    visited,
-	}
-}
-
-func inspectFuncLitNode(
-	info *types.Info,
-	n ast.Node,
-	litSig *types.Signature,
-	st defaultScanState,
-	visited map[*ast.FuncLit]bool,
-) bool {
-	switch node := n.(type) {
-	case *ast.AssignStmt:
-		trackPairBindingsSilent(info, node.Lhs, node.Rhs, node.Tok == token.DEFINE, st, visited)
-	case *ast.ValueSpec:
-		trackPairBindingsSilent(info, identSliceToExprs(node.Names), node.Values, true, st, visited)
-	case *ast.ExprStmt:
-		return inspectNestedFuncLitStmt(info, node.X, nil, st, visited)
-	case *ast.DeferStmt:
-		return inspectNestedFuncLitStmt(info, node.Call, litSig, st, visited)
-	case *ast.GoStmt:
-		return inspectNestedFuncLitStmt(info, node.Call, litSig, st, visited)
-	case *ast.ReturnStmt:
-		return funcLitReturnIsFailOpen(info, litSig, node, st, visited)
-	}
-	return false
-}
-
-// inspectNestedFuncLitStmt 追踪闭包体内部嵌套调用的匿名/局部函数变量（ExprStmt/DeferStmt/GoStmt），
-// 共享外层 permissiveVars 以捕获对命名返回值的放行覆写。
-func inspectNestedFuncLitStmt(
-	info *types.Info,
-	callExpr ast.Expr,
-	deferGoOuterSig *types.Signature,
-	st defaultScanState,
-	visited map[*ast.FuncLit]bool,
-) bool {
-	lit := resolveCalledFuncLit(info, callExpr, st.funcLitVars)
-	if lit == nil {
-		return false
-	}
-	if inspectFuncLitBody(info, lit, st, visited, true) {
-		return true
-	}
-	if deferGoOuterSig != nil {
-		return hasPermissiveNamedResult(deferGoOuterSig, st.permissiveVars)
-	}
-	return false
-}
-
-func trackPairBindingsSilent(
-	info *types.Info,
-	lhs []ast.Expr,
-	rhs []ast.Expr,
-	isDef bool,
-	st defaultScanState,
-	visited map[*ast.FuncLit]bool,
-) {
-	for i, expr := range rhs {
-		lhsVar := resolveLHSVar(info, lhs, i, isDef)
-		if lhsVar == nil {
+	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			if isKeyValuePermissive(info, kv, st, visited) {
+				return true
+			}
 			continue
 		}
-		if lit, ok := ast.Unparen(expr).(*ast.FuncLit); ok {
-			st.funcLitVars[lhsVar] = lit
-			delete(st.permissiveVars, lhsVar)
-			continue
-		}
-		delete(st.funcLitVars, lhsVar)
-		if isPermissiveExprSeen(info, expr, st, visited) {
-			st.permissiveVars[lhsVar] = true
-		}
-	}
-}
-
-func funcLitReturnIsFailOpen(
-	info *types.Info,
-	litSig *types.Signature,
-	ret *ast.ReturnStmt,
-	st defaultScanState,
-	visited map[*ast.FuncLit]bool,
-) bool {
-	if len(ret.Results) == 0 {
-		// 闭包采用命名返回值并裸 return 时，检查是否有任意命名返回值已被赋值为放行值。
-		return hasPermissiveNamedResult(litSig, st.permissiveVars)
-	}
-	for _, expr := range ret.Results {
-		if isPermissiveExprSeen(info, expr, st, visited) {
+		if isPermissiveExprSeen(info, elt, st, visited) {
 			return true
 		}
 	}
-	return returnsBareNilError(info, litSig, ret.Results)
-}
-
-func hasPermissiveNamedResult(sig *types.Signature, permissiveVars map[*types.Var]bool) bool {
-	if sig == nil || sig.Results() == nil || len(permissiveVars) == 0 {
-		return false
-	}
-	results := sig.Results()
-	for i := 0; i < results.Len(); i++ {
-		rv := results.At(i)
-		if rv != nil && rv.Name() != "" && permissiveVars[rv] {
+	if lit.Type != nil {
+		if id := rightmostIdent(lit.Type); id != nil && isPermissiveIdentName(id.Name) {
 			return true
 		}
 	}
 	return false
 }
 
-// inspectCalledFuncLitStmt 检查 defer/go 或独立表达式调用的闭包体内是否存在放行赋值或放行返回。
-func inspectCalledFuncLitStmt(expr ast.Expr, st defaultScanState) bool {
-	if st.pass == nil || st.pass.TypesInfo == nil {
-		return false
+func isKeyValuePermissive(
+	info *types.Info,
+	kv *ast.KeyValueExpr,
+	st defaultScanState,
+	visited map[*ast.FuncLit]bool,
+) bool {
+	if keyID, ok := ast.Unparen(kv.Key).(*ast.Ident); ok {
+		if isFailClosedIdentName(keyID.Name) && isBoolConstExpr(info, kv.Value, true) {
+			return false
+		}
 	}
-	lit := resolveCalledFuncLit(st.pass.TypesInfo, expr, st.funcLitVars)
-	if lit == nil || lit.Body == nil || st.visitedLits[lit] {
-		return false
-	}
-	if st.visitedLits != nil {
-		st.visitedLits[lit] = true
-	}
-	litSig, _ := st.pass.TypesInfo.TypeOf(lit).(*types.Signature)
-	subState := defaultScanState{
-		pass:           st.pass,
-		sig:            litSig,
-		inTest:         st.inTest,
-		permissiveVars: maps.Clone(st.permissiveVars),
-		funcLitVars:    maps.Clone(st.funcLitVars),
-		visitedLits:    st.visitedLits,
-	}
-	if subState.permissiveVars == nil {
-		subState.permissiveVars = make(map[*types.Var]bool)
-	}
-	if subState.funcLitVars == nil {
-		subState.funcLitVars = make(map[*types.Var]*ast.FuncLit)
-	}
-	return inspectDefaultBlock(nonEmptyStmts(lit.Body.List), subState).reportedFailOpen
+	return isPermissiveExprSeen(info, kv.Value, st, visited)
 }
 
+// isFailClosedValueExpr 判断非 error 槽位的返回值表达式是否表达显式拒绝（fail-closed）语义。
+// 入口首行即拦截所有 nil（含 error(nil) 与 (*T)(nil) 类型强转），避免穿透落入右侧标识符匹配。
 func isFailClosedValueExpr(info *types.Info, expr ast.Expr) bool {
+	if isNilIdent(info, expr) {
+		return false
+	}
 	if isBoolConstExpr(info, expr, false) {
 		return true
 	}
-	if call, ok := ast.Unparen(expr).(*ast.CallExpr); ok {
-		if tv, ok := info.Types[call]; ok && vetutil.IsErrorInterfaceType(tv.Type) {
+	if newArg, ok := unwrapNewBuiltinArg(info, expr); ok {
+		return isFailClosedValueExpr(info, newArg)
+	}
+	if lit := unwrapCompositeLit(expr); lit != nil {
+		return isCompositeLitFailClosed(info, lit)
+	}
+	if convArg, ok := unwrapSingleTypeConversion(info, expr); ok && isFailClosedValueExpr(info, convArg) {
+		return true
+	}
+	if isFailClosedErrorCall(info, expr) {
+		return true
+	}
+	id := rightmostIdent(expr)
+	return id != nil && isFailClosedIdentName(id.Name)
+}
+
+// isCompositeLitFailClosed 对称检查复合字面量（含 &T{...}）是否显式表达拒绝语义：
+// 识别拒绝类型名、否定键 true（如 Denied: true / NotAllowed: true）、放行键 false（如 Allowed: false）
+// 以及递归子字段中的拒绝值（如 Verdict: VerdictDeny）。
+func isCompositeLitFailClosed(info *types.Info, lit *ast.CompositeLit) bool {
+	if lit.Type != nil {
+		if id := rightmostIdent(lit.Type); id != nil && isFailClosedIdentName(id.Name) {
 			return true
 		}
 	}
-	id := rightmostIdent(expr)
-	return id != nil && hasAnyToken(id.Name, isFailClosedToken)
-}
-
-func rightmostIdent(expr ast.Expr) *ast.Ident {
-	cur := unwrapExprChain(expr)
-	switch e := cur.(type) {
-	case *ast.Ident:
-		return e
-	case *ast.SelectorExpr:
-		return e.Sel
-	default:
-		return nil
-	}
-}
-
-func unwrapExprChain(expr ast.Expr) ast.Expr {
-	cur := ast.Unparen(expr)
-	for cur != nil {
-		switch e := cur.(type) {
-		case *ast.UnaryExpr:
-			if e.Op != token.AND {
-				return cur
+	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			if isKeyValueFailClosed(info, kv) {
+				return true
 			}
-			cur = ast.Unparen(e.X)
-		case *ast.CompositeLit:
-			if e.Type == nil {
-				return cur
-			}
-			cur = ast.Unparen(e.Type)
-		case *ast.CallExpr:
-			cur = ast.Unparen(e.Fun)
-		case *ast.IndexExpr:
-			cur = ast.Unparen(e.X)
-		case *ast.IndexListExpr:
-			cur = ast.Unparen(e.X)
-		default:
-			return cur
+			continue
 		}
-	}
-	return nil
-}
-
-func isBoolConstExpr(info *types.Info, expr ast.Expr, want bool) bool {
-	if info == nil || expr == nil {
-		return false
-	}
-	if tv, ok := info.Types[expr]; ok && tv.Value != nil && tv.Value.Kind() == constant.Bool {
-		return constant.BoolVal(tv.Value) == want
-	}
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok {
-		return false
-	}
-	c, ok := info.Uses[id].(*types.Const)
-	if !ok || c.Val() == nil || c.Val().Kind() != constant.Bool {
-		return false
-	}
-	return constant.BoolVal(c.Val()) == want
-}
-
-func isNilIdent(info *types.Info, expr ast.Expr) bool {
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok {
-		return false
-	}
-	_, isNil := info.Uses[id].(*types.Nil)
-	return isNil || id.Name == "nil"
-}
-
-func hasAnyToken(name string, pred func(string) bool) bool {
-	for _, tok := range splitCamelTokens(name) {
-		if pred(tok) {
+		if isFailClosedValueExpr(info, elt) {
 			return true
 		}
 	}
 	return false
 }
 
-func isPermissiveToken(tok string) bool {
-	switch tok {
-	case "allow", "allowed", "permit", "permitted", "grant", "granted", "approve", "approved":
-		return true
-	default:
+func isKeyValueFailClosed(info *types.Info, kv *ast.KeyValueExpr) bool {
+	keyID, _ := ast.Unparen(kv.Key).(*ast.Ident)
+	if isBoolConstExpr(info, kv.Value, true) {
+		return keyID != nil && isFailClosedIdentName(keyID.Name)
+	}
+	if isBoolConstExpr(info, kv.Value, false) {
+		return keyID != nil && isPermissiveIdentName(keyID.Name)
+	}
+	return isFailClosedValueExpr(info, kv.Value)
+}
+
+// isNonCallErrorValueExpr 判断表达式是否为非调用、非 nil 的 error 实现值（如 ErrNotAllowed 哨兵）。
+// 必须满足 tv.IsValue() 以排除 new(T) 中的类型实参。
+func isNonCallErrorValueExpr(info *types.Info, expr ast.Expr) bool {
+	if info == nil || expr == nil || isNilIdent(info, expr) {
 		return false
 	}
-}
-
-func isFailClosedToken(tok string) bool {
-	switch tok {
-	case "deny", "denied", "reject", "rejected", "invalid", "unknown", "fail", "failed", "err", "error", "forbid", "forbidden", "closed", "disabled":
-		return true
-	default:
+	unwrapped := ast.Unparen(expr)
+	if _, isCall := unwrapped.(*ast.CallExpr); isCall {
 		return false
 	}
+	tv, ok := info.Types[unwrapped]
+	return ok && tv.IsValue() && vetutil.ImplementsError(tv.Type)
 }
 
-func splitCamelTokens(name string) []string {
-	var tokens []string
-	for _, part := range strings.Split(name, "_") {
-		if part == "" {
-			continue
-		}
-		tokens = append(tokens, splitCamelWord(part)...)
+// isAlwaysFailClosedErrorCall 仅对标准错误构造原语（errors.New/errors.Join/fmt.Errorf）直接放行，
+// 其余返回 error 的调用仍须通过极性命名校验，阻断 allowRequest(ctx)/allowOnError() 绕过。
+func isAlwaysFailClosedErrorCall(info *types.Info, expr ast.Expr) bool {
+	if info == nil || expr == nil {
+		return false
 	}
-	return tokens
+	call, ok := ast.Unparen(expr).(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	obj := vetutil.ResolveCalledObject(info, call)
+	return vetutil.IsPkgSymbol(obj, "errors", "New", "Join") || vetutil.IsPkgSymbol(obj, "fmt", "Errorf")
 }
 
-func splitCamelWord(word string) []string {
-	runes := []rune(word)
-	var out []string
-	start := 0
-	for i := 1; i < len(runes); i++ {
-		if isWordBoundary(runes, i) {
-			out = append(out, strings.ToLower(string(runes[start:i])))
-			start = i
-		}
+func isFailClosedErrorCall(info *types.Info, expr ast.Expr) bool {
+	if info == nil || expr == nil {
+		return false
 	}
-	if start < len(runes) {
-		out = append(out, strings.ToLower(string(runes[start:])))
+	call, ok := ast.Unparen(expr).(*ast.CallExpr)
+	if !ok || isTypeExpr(info, call.Fun) {
+		return false
 	}
-	return out
-}
-
-func isWordBoundary(runes []rune, i int) bool {
-	prev, cur := runes[i-1], runes[i]
-	if unicode.IsLower(prev) && unicode.IsUpper(cur) {
+	tv, ok := info.Types[call]
+	if !ok || !vetutil.IsErrorInterfaceType(tv.Type) {
+		return false
+	}
+	if isAlwaysFailClosedErrorCall(info, call) {
 		return true
 	}
-	return i+1 < len(runes) && unicode.IsUpper(prev) && unicode.IsUpper(cur) && unicode.IsLower(runes[i+1])
+	id := rightmostIdent(call)
+	return id == nil || !isPermissiveIdentName(id.Name)
+}
+
+// unwrapCompositeLit 剥离外层括号与单层取址运算符 &，提取复合字面量节点。
+func unwrapCompositeLit(expr ast.Expr) *ast.CompositeLit {
+	cur := ast.Unparen(expr)
+	if u, ok := cur.(*ast.UnaryExpr); ok && u.Op == token.AND {
+		cur = ast.Unparen(u.X)
+	}
+	lit, _ := cur.(*ast.CompositeLit)
+	return lit
+}
+
+// unwrapNewBuiltinArg 识别内置 new(T) 或 Go 1.27 new(expr) 单参调用并提取其唯一实参。
+func unwrapNewBuiltinArg(info *types.Info, expr ast.Expr) (ast.Expr, bool) {
+	if info == nil || expr == nil {
+		return nil, false
+	}
+	call, ok := ast.Unparen(expr).(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 || call.Ellipsis.IsValid() {
+		return nil, false
+	}
+	id, ok := ast.Unparen(call.Fun).(*ast.Ident)
+	if !ok {
+		return nil, false
+	}
+	b, isBuiltin := info.Uses[id].(*types.Builtin)
+	if !isBuiltin || b == nil || b.Name() != "new" {
+		return nil, false
+	}
+	return call.Args[0], true
 }

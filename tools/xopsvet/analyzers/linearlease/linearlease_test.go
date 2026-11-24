@@ -13,8 +13,8 @@ func TestLinearLease(t *testing.T) {
 		t,
 		testdata,
 		linearlease.NewAnalyzer(),
-		"github.com/wentf9/xops-cli/core/internal/foundation/conc",
-		"github.com/wentf9/xops-cli/core/internal/foundation/conc_test",
+		"github.com/wentf9/xops-cli/core/conc",
+		"github.com/wentf9/xops-cli/core/conc_test",
 		"example.com/leasedef",
 		"example.com/leaseuse",
 	)

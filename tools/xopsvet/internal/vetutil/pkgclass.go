@@ -25,10 +25,12 @@ const (
 	LayerCoreEvents
 	// LayerCoreOSFS 表示 core/osfs 三平台句柄安全本地文件系统原语层。
 	LayerCoreOSFS
+	// LayerCoreConc 表示 core/conc 公开结构化并发白名单包（仅 Nursery + CtxMutex）。
+	LayerCoreConc
 	// LayerCoreEngine 表示 core/engine 核心门面与唯一内部装配点。
 	LayerCoreEngine
-	// LayerCoreFoundationConc 表示 core/internal/foundation/conc 结构化并发白名单包。
-	LayerCoreFoundationConc
+	// LayerCoreFoundationActor 表示 core/internal/foundation/actor 纯内存双通道 Actor 包。
+	LayerCoreFoundationActor
 	// LayerCoreFoundationTrace 表示 core/internal/foundation/trace 上下文追踪白名单包。
 	LayerCoreFoundationTrace
 	// LayerCoreFoundationOther 表示 core/internal/foundation 下其余基础子包。
@@ -43,6 +45,8 @@ const (
 	LayerCoreMCPRuntime
 	// LayerCoreSSHNetDial 表示 core/internal/sshnet/dial SSH 拨号白名单包。
 	LayerCoreSSHNetDial
+	// LayerCoreSSHNetPriv 表示 core/internal/sshnet/priv SSH 私钥与身份认证机密消费白名单包。
+	LayerCoreSSHNetPriv
 	// LayerCoreSSHNetOther 表示 core/internal/sshnet 下其余传输子包。
 	LayerCoreSSHNetOther
 	// LayerCoreSim 表示 core/internal/sim 确定性仿真器层。
@@ -151,6 +155,8 @@ func classifyCoreRel(rel string) Layer {
 		return LayerCoreEvents
 	case matchPkgPrefix(rel, "core/osfs"):
 		return LayerCoreOSFS
+	case matchPkgPrefix(rel, "core/conc"):
+		return LayerCoreConc
 	case matchPkgPrefix(rel, "core/engine"):
 		return LayerCoreEngine
 	default:
@@ -160,8 +166,8 @@ func classifyCoreRel(rel string) Layer {
 
 func classifyCoreInternalRel(rel string) Layer {
 	switch {
-	case matchPkgPrefix(rel, "core/internal/foundation/conc"):
-		return LayerCoreFoundationConc
+	case matchPkgPrefix(rel, "core/internal/foundation/actor"):
+		return LayerCoreFoundationActor
 	case matchPkgPrefix(rel, "core/internal/foundation/trace"):
 		return LayerCoreFoundationTrace
 	case matchPkgPrefix(rel, "core/internal/foundation"):
@@ -176,6 +182,8 @@ func classifyCoreInternalRel(rel string) Layer {
 		return LayerCoreMCPRuntime
 	case matchPkgPrefix(rel, "core/internal/sshnet/dial"):
 		return LayerCoreSSHNetDial
+	case matchPkgPrefix(rel, "core/internal/sshnet/priv"):
+		return LayerCoreSSHNetPriv
 	case matchPkgPrefix(rel, "core/internal/sshnet"):
 		return LayerCoreSSHNetOther
 	case matchPkgPrefix(rel, "core/internal/sim"):
@@ -219,19 +227,20 @@ func AllowSysExecEnv(info PkgInfo) bool {
 	return !info.IsExternalTest && info.Layer == LayerHostSys
 }
 
-// AllowBareGo 判断包是否位于裸 go 语句白名单内（仅限 core/internal/foundation/conc）。
+// AllowBareGo 判断包是否位于裸 go 语句白名单内（全仓唯一：core/conc，不含外置 _test）。
 func AllowBareGo(info PkgInfo) bool {
-	return !info.IsExternalTest && info.Layer == LayerCoreFoundationConc
+	return !info.IsExternalTest && info.Layer == LayerCoreConc
 }
 
 // AllowSecretPlaintext 判断包是否位于明文机密 []byte 消费白名单内
-// （仅限 core/domain/secret、internal/host/vault 与 core/internal/sshnet/dial）。
+// （仅限 core/domain/secret、internal/host/vault、core/internal/sshnet/dial、
+// core/internal/sshnet/priv 与 core/internal/sim，不含外置 _test）。
 func AllowSecretPlaintext(info PkgInfo) bool {
 	if info.IsExternalTest {
 		return false
 	}
 	switch info.Layer {
-	case LayerHostVault, LayerCoreSSHNetDial:
+	case LayerHostVault, LayerCoreSSHNetDial, LayerCoreSSHNetPriv, LayerCoreSim:
 		return true
 	case LayerCoreDomain:
 		return matchBaseSubpkg(info.BasePath, ModulePrefix+"/core/domain/secret")
@@ -240,18 +249,20 @@ func AllowSecretPlaintext(info PkgInfo) bool {
 	}
 }
 
-// AllowNolint 判断包是否位于 AGENTS.md §3 规定的行内 //nolint: 特权白名单包集合内。
+// AllowNolint 判断包是否位于 RFC v2.3.2 §5 规定的 8 个生产特权白名单包集合内。
+// core/internal/sim、cmd/xops、core/internal/foundation/actor 及所有外置 *_test 均不授予该特权。
 func AllowNolint(info PkgInfo) bool {
 	if info.IsExternalTest {
 		return false
 	}
 	switch info.Layer {
 	case LayerCoreOSFS,
-		LayerCoreFoundationConc,
+		LayerCoreConc,
 		LayerCoreFoundationTrace,
 		LayerHostSys,
 		LayerHostVault,
-		LayerCoreSSHNetDial:
+		LayerCoreSSHNetDial,
+		LayerCoreSSHNetPriv:
 		return true
 	case LayerCoreDomain:
 		return matchBaseSubpkg(info.BasePath, ModulePrefix+"/core/domain/secret")

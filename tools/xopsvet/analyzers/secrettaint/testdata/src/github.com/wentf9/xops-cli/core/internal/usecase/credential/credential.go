@@ -53,6 +53,22 @@ func badSinksAndWhitelist(
 		var erased any = box
 		_, _ = json.Marshal(erased) // want "禁止将 secret.SecretBox 传入序列化汇点"
 
+		if strBox, ok := erased.(fmt.Stringer); ok {
+			slog.Info("comma-ok-ta", "v", strBox) // want "禁止将 secret.SecretBox 传入日志汇点"
+		}
+		boxMap := map[string]any{"k": box}
+		if mv, ok := boxMap["k"]; ok {
+			slog.Info("comma-ok-map", "v", mv) // want "禁止将 secret.SecretBox 传入日志汇点"
+		}
+		var mv2, ok2 = boxMap["k"]
+		_ = ok2
+		_, _ = json.Marshal(mv2) // want "禁止将 secret.SecretBox 传入序列化汇点"
+
+		safeMap := map[string]any{"k": "ok"}
+		if sv, ok := safeMap["k"]; ok {
+			slog.Info("clean-map", "v", sv)
+		}
+
 		var iifeBox any = func() any { return box }()
 		_, _ = json.Marshal(iifeBox)                           // want "禁止将 secret.SecretBox 传入序列化汇点"
 		_, _ = json.Marshal(func(v any) any { return v }(box)) // want "禁止将 secret.SecretBox 传入序列化汇点"

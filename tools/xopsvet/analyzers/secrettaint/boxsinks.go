@@ -12,20 +12,25 @@ import (
 // maxBoxFixpointIters 限制规则 1 中携带 SecretBox 的 any/局部/包级变量传播最大迭代轮次。
 const maxBoxFixpointIters = 32
 
-func checkFuncSecretBoxSinks(pass *analysis.Pass) {
+func checkFuncSecretBoxSinks(pass *analysis.Pass, restricted map[*types.TypeName]bool) {
 	pkgBoxVars := collectPackageSecretBoxVars(pass)
 	for _, file := range pass.Files {
 		for _, decl := range file.Decls {
-			checkDeclSecretBoxSinks(pass, decl, pkgBoxVars)
+			checkDeclSecretBoxSinks(pass, decl, pkgBoxVars, restricted)
 		}
 	}
 }
 
-func checkDeclSecretBoxSinks(pass *analysis.Pass, decl ast.Decl, pkgBoxVars map[*types.Var]bool) {
+func checkDeclSecretBoxSinks(
+	pass *analysis.Pass,
+	decl ast.Decl,
+	pkgBoxVars map[*types.Var]bool,
+	restricted map[*types.TypeName]bool,
+) {
 	switch d := decl.(type) {
 	case *ast.FuncDecl:
 		if d.Body != nil {
-			checkSubtreeSecretBoxSinks(pass, d.Body, pkgBoxVars)
+			checkSubtreeSecretBoxSinks(pass, d.Body, pkgBoxVars, restricted)
 		}
 	case *ast.GenDecl:
 		if d.Tok != token.VAR {
@@ -33,34 +38,73 @@ func checkDeclSecretBoxSinks(pass *analysis.Pass, decl ast.Decl, pkgBoxVars map[
 		}
 		for _, spec := range d.Specs {
 			if vs, ok := spec.(*ast.ValueSpec); ok {
-				checkSubtreeSecretBoxSinks(pass, vs, pkgBoxVars)
+				checkSubtreeSecretBoxSinks(pass, vs, pkgBoxVars, restricted)
 			}
 		}
 	}
 }
 
-func checkSubtreeSecretBoxSinks(pass *analysis.Pass, root ast.Node, pkgBoxVars map[*types.Var]bool) {
+// checkSubtreeSecretBoxSinks 在单遍流中共享 boxVars，同时检查 Rule 1 汇点调用与受限复合字面量
+// （覆盖 any 擦除变量进入受限结构体/切片以及受限 Map 的键与值）。
+func checkSubtreeSecretBoxSinks(
+	pass *analysis.Pass,
+	root ast.Node,
+	pkgBoxVars map[*types.Var]bool,
+	restricted map[*types.TypeName]bool,
+) {
 	boxVars := maps.Clone(pkgBoxVars)
 	if boxVars == nil {
 		boxVars = make(map[*types.Var]bool)
 	}
 	collectSecretBoxVars(pass.TypesInfo, root, boxVars)
 	ast.Inspect(root, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		kind := classifyRule1SinkCall(pass.TypesInfo, call)
-		if kind == sinkNone {
-			return true
-		}
-		for _, arg := range call.Args {
-			if exprHasSecretBox(pass.TypesInfo, arg, boxVars) {
-				pass.ReportRangef(arg, "secrettaint: 禁止将 secret.SecretBox 传入%s汇点", kind.label())
-			}
+		switch node := n.(type) {
+		case *ast.CallExpr:
+			checkRule1CallSink(pass, node, boxVars)
+		case *ast.CompositeLit:
+			checkRestrictedCompositeLit(pass, node, boxVars, restricted)
 		}
 		return true
 	})
+}
+
+func checkRule1CallSink(pass *analysis.Pass, call *ast.CallExpr, boxVars map[*types.Var]bool) {
+	kind := classifyRule1SinkCall(pass.TypesInfo, call)
+	if kind == sinkNone {
+		return
+	}
+	for _, arg := range call.Args {
+		if exprHasSecretBox(pass.TypesInfo, arg, boxVars) {
+			pass.ReportRangef(arg, "secrettaint: 禁止将 secret.SecretBox 传入%s汇点", kind.label())
+		}
+	}
+}
+
+func checkRestrictedCompositeLit(
+	pass *analysis.Pass,
+	lit *ast.CompositeLit,
+	boxVars map[*types.Var]bool,
+	restricted map[*types.TypeName]bool,
+) {
+	litType := pass.TypesInfo.TypeOf(lit)
+	if !isRestrictedLitType(litType, restricted) {
+		return
+	}
+	isMap := isMapExprType(litType)
+	for _, elt := range lit.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			if isMap && exprHasSecretBox(pass.TypesInfo, kv.Key, boxVars) {
+				pass.ReportRangef(kv.Key, "secrettaint: 禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段")
+			}
+			if exprHasSecretBox(pass.TypesInfo, kv.Value, boxVars) {
+				pass.ReportRangef(kv.Value, "secrettaint: 禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段")
+			}
+			continue
+		}
+		if exprHasSecretBox(pass.TypesInfo, elt, boxVars) {
+			pass.ReportRangef(elt, "secrettaint: 禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段")
+		}
+	}
 }
 
 func collectPackageSecretBoxVars(pass *analysis.Pass) map[*types.Var]bool {
@@ -151,14 +195,18 @@ func propagateBoxFuncLitArgs(info *types.Info, call *ast.CallExpr, lit *ast.Func
 }
 
 func propagateBoxValueSpec(info *types.Info, vs *ast.ValueSpec, boxVars map[*types.Var]bool) bool {
+	if len(vs.Names) == 2 && len(vs.Values) == 1 {
+		if rhs, ok := unwrapBoxCommaOKRHS(vs.Values[0]); ok {
+			return propagateSingleBoxVar(info, vs.Names[0], rhs, boxVars)
+		}
+		return false
+	}
 	if len(vs.Names) != len(vs.Values) {
 		return false
 	}
 	changed := false
 	for i := range vs.Names {
-		v, ok := info.Defs[vs.Names[i]].(*types.Var)
-		if ok && v != nil && exprHasSecretBox(info, vs.Values[i], boxVars) && !boxVars[v] {
-			boxVars[v] = true
+		if propagateSingleBoxVar(info, vs.Names[i], vs.Values[i], boxVars) {
 			changed = true
 		}
 	}
@@ -166,22 +214,48 @@ func propagateBoxValueSpec(info *types.Info, vs *ast.ValueSpec, boxVars map[*typ
 }
 
 func propagateBoxPairs(info *types.Info, lhs, rhs []ast.Expr, boxVars map[*types.Var]bool) bool {
+	if len(lhs) == 2 && len(rhs) == 1 {
+		if unwrapped, ok := unwrapBoxCommaOKRHS(rhs[0]); ok {
+			return propagateSingleBoxVar(info, lhs[0], unwrapped, boxVars)
+		}
+		return false
+	}
 	if len(lhs) != len(rhs) {
 		return false
 	}
 	changed := false
 	for i := range lhs {
-		id, ok := ast.Unparen(lhs[i]).(*ast.Ident)
-		if !ok || id.Name == "_" {
-			continue
-		}
-		v := lookupAssignVar(info, id)
-		if v != nil && exprHasSecretBox(info, rhs[i], boxVars) && !boxVars[v] {
-			boxVars[v] = true
+		if propagateSingleBoxVar(info, lhs[i], rhs[i], boxVars) {
 			changed = true
 		}
 	}
 	return changed
+}
+
+func propagateSingleBoxVar(info *types.Info, lhs, rhs ast.Expr, boxVars map[*types.Var]bool) bool {
+	id, ok := ast.Unparen(lhs).(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return false
+	}
+	v := lookupAssignVar(info, id)
+	if v != nil && exprHasSecretBox(info, rhs, boxVars) && !boxVars[v] {
+		boxVars[v] = true
+		return true
+	}
+	return false
+}
+
+// unwrapBoxCommaOKRHS 提取 comma-ok 形式类型断言（v, ok := a.(T)）或 Map 索引（v, ok := m[k]）的底层容器表达式。
+func unwrapBoxCommaOKRHS(expr ast.Expr) (ast.Expr, bool) {
+	switch rhs := ast.Unparen(expr).(type) {
+	case *ast.TypeAssertExpr:
+		if rhs.Type != nil {
+			return rhs.X, true
+		}
+	case *ast.IndexExpr:
+		return rhs.X, true
+	}
+	return nil, false
 }
 
 func lookupAssignVar(info *types.Info, id *ast.Ident) *types.Var {
@@ -214,6 +288,10 @@ func exprHasSecretBoxDepth(info *types.Info, expr ast.Expr, boxVars map[*types.V
 	case *ast.StarExpr:
 		return exprHasSecretBoxDepth(info, e.X, boxVars, depth)
 	case *ast.TypeAssertExpr:
+		return exprHasSecretBoxDepth(info, e.X, boxVars, depth)
+	case *ast.IndexExpr:
+		return exprHasSecretBoxDepth(info, e.X, boxVars, depth)
+	case *ast.SliceExpr:
 		return exprHasSecretBoxDepth(info, e.X, boxVars, depth)
 	case *ast.CompositeLit:
 		return compositeLitHasSecretBox(info, e, boxVars, depth)

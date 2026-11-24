@@ -29,6 +29,8 @@ func checkSymbolBoundaries(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	switch pkgInfo.Layer {
 	case vetutil.LayerCoreDomain:
 		checkDomainTimeSymbols(pass)
+	case vetutil.LayerCoreOSFS:
+		checkOSFSNetSymbols(pass)
 	case vetutil.LayerCoreMCPRuntime:
 		checkMCPOperatorReadFS(pass)
 	}

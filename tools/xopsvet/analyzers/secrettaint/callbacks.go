@@ -4,7 +4,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
-	"maps"
+	"slices"
 
 	"golang.org/x/tools/go/analysis"
 )
@@ -12,20 +12,19 @@ import (
 // maxCallbackAliasIters 与 maxTaintFixpointIters 保持一致，覆盖深层回调别名链。
 const maxCallbackAliasIters = maxTaintFixpointIters
 
-// packageCallbackIndex 索引本包全部函数声明及包级闭包/函数变量，支持 SecretBox.Use 追踪具名辅助函数与方法。
+// packageCallbackIndex 索引本包全部函数声明及包级闭包/函数变量的单调并格集合，
+// 支持 SecretBox.Use 与明文污点调用递归追踪具名辅助函数、方法与分支覆写回调。
 type packageCallbackIndex struct {
 	funcDecls map[*types.Func]*ast.FuncDecl
-	funcFiles map[*ast.FuncDecl][]*ast.CommentGroup
-	pkgLits   map[*types.Var]*ast.FuncLit
-	pkgFuncs  map[*types.Var]*types.Func
+	pkgLits   map[*types.Var][]*ast.FuncLit
+	pkgFuncs  map[*types.Var][]*types.Func
 }
 
 func collectPackageCallbackIndex(pass *analysis.Pass) *packageCallbackIndex {
 	idx := &packageCallbackIndex{
 		funcDecls: make(map[*types.Func]*ast.FuncDecl),
-		funcFiles: make(map[*ast.FuncDecl][]*ast.CommentGroup),
-		pkgLits:   make(map[*types.Var]*ast.FuncLit),
-		pkgFuncs:  make(map[*types.Var]*types.Func),
+		pkgLits:   make(map[*types.Var][]*ast.FuncLit),
+		pkgFuncs:  make(map[*types.Var][]*types.Func),
 	}
 	indexPackageFuncDecls(pass, idx)
 	for range maxCallbackAliasIters {
@@ -51,7 +50,6 @@ func indexPackageFuncDecls(pass *analysis.Pass, idx *packageCallbackIndex) {
 			}
 			if fnObj, ok := pass.TypesInfo.Defs[fn.Name].(*types.Func); ok && fnObj != nil {
 				idx.funcDecls[fnObj.Origin()] = fn
-				idx.funcFiles[fn] = file.Comments
 			}
 		}
 	}
@@ -60,8 +58,8 @@ func indexPackageFuncDecls(pass *analysis.Pass, idx *packageCallbackIndex) {
 func recordFilePkgCallbacks(
 	info *types.Info,
 	file *ast.File,
-	lits map[*types.Var]*ast.FuncLit,
-	funcs map[*types.Var]*types.Func,
+	lits map[*types.Var][]*ast.FuncLit,
+	funcs map[*types.Var][]*types.Func,
 ) bool {
 	changed := false
 	for _, decl := range file.Decls {
@@ -101,31 +99,36 @@ func checkSecretUseCallsInBody(
 	})
 }
 
+// analyzeSecretUseCallbackArg 同时遍历实参可能指向的全部匿名闭包与具名函数集合，
+// 不因命中 lits 而提前返回，防止条件分支在 FuncLit 与具名函数之间切换时漏检任一路径。
 func analyzeSecretUseCallbackArg(
 	pass *analysis.Pass,
 	facts *secretFactIndex,
 	pkgIdx *packageCallbackIndex,
 	arg ast.Expr,
-	localLits map[*types.Var]*ast.FuncLit,
-	localFuncs map[*types.Var]*types.Func,
+	localLits map[*types.Var][]*ast.FuncLit,
+	localFuncs map[*types.Var][]*types.Func,
 	checkedLits map[*ast.FuncLit]bool,
 	checkedDecls map[*ast.FuncDecl]bool,
 	reported map[token.Pos]bool,
 ) {
-	if lit := resolveCallbackLit(pass.TypesInfo, arg, localLits); lit != nil {
-		if lit.Body == nil || lit.Type == nil || checkedLits[lit] {
-			return
+	for _, lit := range resolveCallbackLits(pass.TypesInfo, arg, localLits) {
+		if lit == nil || lit.Body == nil || lit.Type == nil || checkedLits[lit] {
+			continue
 		}
 		checkedLits[lit] = true
 		vars := collectCallbackSecretParamVars(pass.TypesInfo, lit.Type.Params)
-		runTaintAnalysis(pass, facts, pkgIdx, lit.Body, pass.TypesInfo.Scopes[lit.Type], vars, lit.Type.Results, reported)
-		return
+		runTaintAnalysisWithState(
+			pass, facts, pkgIdx, lit.Body, pass.TypesInfo.Scopes[lit.Type], vars, lit.Type.Results, reported,
+			map[*ast.FuncLit]bool{lit: true}, make(map[*ast.FuncDecl]bool),
+		)
 	}
-	fn := resolveCallbackFunc(pass.TypesInfo, arg, localFuncs)
-	if fn == nil {
-		return
+	for _, fn := range resolveCallbackFuncs(pass.TypesInfo, arg, localFuncs) {
+		if fn == nil {
+			continue
+		}
+		analyzeResolvedCallbackFunc(pass, facts, pkgIdx, arg, fn, checkedDecls, reported)
 	}
-	analyzeResolvedCallbackFunc(pass, facts, pkgIdx, arg, fn, checkedDecls, reported)
 }
 
 func analyzeResolvedCallbackFunc(
@@ -144,7 +147,10 @@ func analyzeResolvedCallbackFunc(
 			}
 			checkedDecls[decl] = true
 			vars := collectCallbackSecretParamVars(pass.TypesInfo, decl.Type.Params)
-			runTaintAnalysis(pass, facts, pkgIdx, decl.Body, pass.TypesInfo.Scopes[decl.Type], vars, decl.Type.Results, reported)
+			runTaintAnalysisWithState(
+				pass, facts, pkgIdx, decl.Body, pass.TypesInfo.Scopes[decl.Type], vars, decl.Type.Results, reported,
+				make(map[*ast.FuncLit]bool), map[*ast.FuncDecl]bool{decl: true},
+			)
 			return
 		}
 	}
@@ -158,16 +164,21 @@ func analyzeResolvedCallbackFunc(
 	reportLeakOnce(pass, reported, arg, "secrettaint: 禁止将未标注 //xops:secretuse 的接口方法或无体函数传入 SecretBox.Use")
 }
 
+// collectLocalCallbackMaps 按键深拷贝包级回调切片集并执行局部单调并格不动点传播，
+// 严禁使用浅拷贝 maps.Copy 以防污染 pkgIdx 中共享的底层切片数组。
 func collectLocalCallbackMaps(
 	info *types.Info,
 	body *ast.BlockStmt,
 	pkgIdx *packageCallbackIndex,
-) (map[*types.Var]*ast.FuncLit, map[*types.Var]*types.Func) {
-	lits := make(map[*types.Var]*ast.FuncLit)
-	funcs := make(map[*types.Var]*types.Func)
+) (map[*types.Var][]*ast.FuncLit, map[*types.Var][]*types.Func) {
+	var lits map[*types.Var][]*ast.FuncLit
+	var funcs map[*types.Var][]*types.Func
 	if pkgIdx != nil {
-		maps.Copy(lits, pkgIdx.pkgLits)
-		maps.Copy(funcs, pkgIdx.pkgFuncs)
+		lits = cloneLitMap(pkgIdx.pkgLits)
+		funcs = cloneFuncMap(pkgIdx.pkgFuncs)
+	} else {
+		lits = make(map[*types.Var][]*ast.FuncLit)
+		funcs = make(map[*types.Var][]*types.Func)
 	}
 	if body == nil {
 		return lits, funcs
@@ -180,11 +191,27 @@ func collectLocalCallbackMaps(
 	return lits, funcs
 }
 
+func cloneLitMap(src map[*types.Var][]*ast.FuncLit) map[*types.Var][]*ast.FuncLit {
+	dst := make(map[*types.Var][]*ast.FuncLit, len(src))
+	for k, v := range src {
+		dst[k] = slices.Clone(v)
+	}
+	return dst
+}
+
+func cloneFuncMap(src map[*types.Var][]*types.Func) map[*types.Var][]*types.Func {
+	dst := make(map[*types.Var][]*types.Func, len(src))
+	for k, v := range src {
+		dst[k] = slices.Clone(v)
+	}
+	return dst
+}
+
 func propagateLocalCallbackStep(
 	info *types.Info,
 	body *ast.BlockStmt,
-	lits map[*types.Var]*ast.FuncLit,
-	funcs map[*types.Var]*types.Func,
+	lits map[*types.Var][]*ast.FuncLit,
+	funcs map[*types.Var][]*types.Func,
 ) bool {
 	changed := false
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -206,8 +233,8 @@ func propagateLocalCallbackStep(
 func recordAssignCallbacks(
 	info *types.Info,
 	stmt *ast.AssignStmt,
-	lits map[*types.Var]*ast.FuncLit,
-	funcs map[*types.Var]*types.Func,
+	lits map[*types.Var][]*ast.FuncLit,
+	funcs map[*types.Var][]*types.Func,
 ) bool {
 	if len(stmt.Lhs) != len(stmt.Rhs) {
 		return false
@@ -224,8 +251,8 @@ func recordAssignCallbacks(
 func recordValueSpecCallbacks(
 	info *types.Info,
 	vs *ast.ValueSpec,
-	lits map[*types.Var]*ast.FuncLit,
-	funcs map[*types.Var]*types.Func,
+	lits map[*types.Var][]*ast.FuncLit,
+	funcs map[*types.Var][]*types.Func,
 ) bool {
 	if len(vs.Names) != len(vs.Values) {
 		return false
@@ -239,11 +266,13 @@ func recordValueSpecCallbacks(
 	return changed
 }
 
+// recordCallbackPair 按单调并格向变量追加全部可能指向的 FuncLit 与具名 *types.Func，
+// 不覆盖旧值、不在命中 lits 后提前返回，消除分支覆写导致的不动点震荡与漏检。
 func recordCallbackPair(
 	info *types.Info,
 	lhs, rhs ast.Expr,
-	lits map[*types.Var]*ast.FuncLit,
-	funcs map[*types.Var]*types.Func,
+	lits map[*types.Var][]*ast.FuncLit,
+	funcs map[*types.Var][]*types.Func,
 ) bool {
 	id, ok := ast.Unparen(lhs).(*ast.Ident)
 	if !ok || id.Name == "_" {
@@ -253,15 +282,34 @@ func recordCallbackPair(
 	if v == nil {
 		return false
 	}
-	if lit := resolveCallbackLit(info, rhs, lits); lit != nil && lits[v] != lit {
-		lits[v] = lit
-		return true
+	changed := false
+	for _, lit := range resolveCallbackLits(info, rhs, lits) {
+		if appendUniqueLit(lits, v, lit) {
+			changed = true
+		}
 	}
-	if fn := resolveCallbackFunc(info, rhs, funcs); fn != nil && funcs[v] != fn {
-		funcs[v] = fn
-		return true
+	for _, fn := range resolveCallbackFuncs(info, rhs, funcs) {
+		if appendUniqueFunc(funcs, v, fn) {
+			changed = true
+		}
 	}
-	return false
+	return changed
+}
+
+func appendUniqueLit(m map[*types.Var][]*ast.FuncLit, v *types.Var, lit *ast.FuncLit) bool {
+	if lit == nil || slices.Contains(m[v], lit) {
+		return false
+	}
+	m[v] = append(m[v], lit)
+	return true
+}
+
+func appendUniqueFunc(m map[*types.Var][]*types.Func, v *types.Var, fn *types.Func) bool {
+	if fn == nil || slices.Contains(m[v], fn) {
+		return false
+	}
+	m[v] = append(m[v], fn)
+	return true
 }
 
 // unwrapCallbackExpr 剥离括号、类型断言与单参类型转换，还原底层回调字面量或函数引用表达式。
@@ -285,10 +333,10 @@ func unwrapCallbackExpr(info *types.Info, expr ast.Expr) ast.Expr {
 	return nil
 }
 
-func resolveCallbackLit(info *types.Info, arg ast.Expr, localLits map[*types.Var]*ast.FuncLit) *ast.FuncLit {
+func resolveCallbackLits(info *types.Info, arg ast.Expr, localLits map[*types.Var][]*ast.FuncLit) []*ast.FuncLit {
 	switch e := unwrapCallbackExpr(info, arg).(type) {
 	case *ast.FuncLit:
-		return e
+		return []*ast.FuncLit{e}
 	case *ast.Ident:
 		if info != nil && localLits != nil {
 			if v, ok := info.Uses[e].(*types.Var); ok && v != nil {
@@ -299,20 +347,22 @@ func resolveCallbackLit(info *types.Info, arg ast.Expr, localLits map[*types.Var
 	return nil
 }
 
-func resolveCallbackFunc(info *types.Info, arg ast.Expr, localFuncs map[*types.Var]*types.Func) *types.Func {
+func resolveCallbackFuncs(info *types.Info, arg ast.Expr, localFuncs map[*types.Var][]*types.Func) []*types.Func {
 	if info == nil {
 		return nil
 	}
 	switch e := unwrapCallbackExpr(info, arg).(type) {
 	case *ast.Ident:
 		if fn, ok := info.Uses[e].(*types.Func); ok && fn != nil {
-			return fn
+			return []*types.Func{fn}
 		}
 		if v, ok := info.Uses[e].(*types.Var); ok && v != nil && localFuncs != nil {
 			return localFuncs[v]
 		}
 	case *ast.SelectorExpr:
-		return resolveSelectorCallbackFunc(info, e)
+		if fn := resolveSelectorCallbackFunc(info, e); fn != nil {
+			return []*types.Func{fn}
+		}
 	}
 	return nil
 }
@@ -325,47 +375,4 @@ func resolveSelectorCallbackFunc(info *types.Info, selExpr *ast.SelectorExpr) *t
 	}
 	fn, _ := info.Uses[selExpr.Sel].(*types.Func)
 	return fn
-}
-
-// flattenParamVars 按位置展开函数形参表为 *types.Var 切片（未命名形参以 nil 占位），并标记是否为可变参数。
-func flattenParamVars(info *types.Info, fl *ast.FieldList) ([]*types.Var, bool) {
-	if fl == nil {
-		return nil, false
-	}
-	var vars []*types.Var
-	isVariadic := false
-	for i, f := range fl.List {
-		if i == len(fl.List)-1 {
-			if _, ok := ast.Unparen(f.Type).(*ast.Ellipsis); ok {
-				isVariadic = true
-			}
-		}
-		if len(f.Names) == 0 {
-			vars = append(vars, nil)
-			continue
-		}
-		for _, id := range f.Names {
-			v, _ := info.Defs[id].(*types.Var)
-			vars = append(vars, v)
-		}
-	}
-	return vars, isVariadic
-}
-
-func paramVarAt(vars []*types.Var, isVariadic bool, idx int) *types.Var {
-	if idx < len(vars) {
-		return vars[idx]
-	}
-	if isVariadic && len(vars) > 0 {
-		return vars[len(vars)-1]
-	}
-	return nil
-}
-
-func reportLeakOnce(pass *analysis.Pass, reported map[token.Pos]bool, rng ast.Node, format string, args ...any) {
-	if rng == nil || reported[rng.Pos()] {
-		return
-	}
-	reported[rng.Pos()] = true
-	pass.ReportRangef(rng, format, args...)
 }

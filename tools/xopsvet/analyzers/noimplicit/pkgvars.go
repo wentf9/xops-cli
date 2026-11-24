@@ -2,6 +2,7 @@ package noimplicit
 
 import (
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"strings"
@@ -10,7 +11,9 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-// collectSentinelVars 预收集本包中所有具备哨兵错误签名（Err*/err*）的包级变量，
+const cmdXopsPkgPath = vetutil.ModulePrefix + "/cmd/xops"
+
+// collectSentinelVars 预收集本包中所有具备哨兵错误签名（Err*/err* 且类型为内置 error）的包级变量，
 // 供后续判断 fmt.Errorf("%w", ...) 包装合法性与运行期不可变性检查。
 func collectSentinelVars(pass *analysis.Pass) map[*types.Var]bool {
 	sentinels := make(map[*types.Var]bool)
@@ -42,26 +45,124 @@ func collectDeclSentinels(info *types.Info, gen *ast.GenDecl, sentinels map[*typ
 		if vs.Type != nil && !vetutil.IsErrorInterfaceType(info.TypeOf(vs.Type)) {
 			continue
 		}
-		if v, ok := info.Defs[id].(*types.Var); ok && v != nil {
+		if v, ok := info.Defs[id].(*types.Var); ok && v != nil && vetutil.IsErrorInterfaceType(v.Type()) {
 			sentinels[v] = true
 		}
 	}
 }
 
-func checkPkgVarDecl(pass *analysis.Pass, gen *ast.GenDecl, sentinels map[*types.Var]bool) {
+// collectBuildVars 独立收集 cmd/xops package main 非测试文件中满足 6 重硬约束的 //xops:buildvar 变量。
+// 该集合与 sentinels 严格隔离（绝不混入 isPureErrorfCall），但在运行期不可变性检查中与 sentinels 取并集，
+// 覆盖同包生产代码与 cmd/xops/*_test.go 全包禁止赋值、range 覆盖与取地址。
+func collectBuildVars(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) map[*types.Var]bool {
+	buildVars := make(map[*types.Var]bool)
+	if !isBuildVarEligiblePkg(pass, pkgInfo) {
+		return buildVars
+	}
+	for _, file := range pass.Files {
+		if vetutil.IsTestFile(pass, file) {
+			continue
+		}
+		collectFileBuildVars(pass.TypesInfo, file, buildVars)
+	}
+	return buildVars
+}
+
+func isBuildVarEligiblePkg(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) bool {
+	return pass != nil &&
+		pass.TypesInfo != nil &&
+		pass.Pkg != nil &&
+		!pkgInfo.IsExternalTest &&
+		pkgInfo.BasePath == cmdXopsPkgPath &&
+		pass.Pkg.Name() == "main"
+}
+
+func collectFileBuildVars(info *types.Info, file *ast.File, buildVars map[*types.Var]bool) {
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.VAR {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			if v := validBuildVar(info, gen, vs); v != nil {
+				buildVars[v] = true
+			}
+		}
+	}
+}
+
+// validBuildVar 强制校验 //xops:buildvar 的声明级约束：
+// 单 spec 才继承 gen.Doc（防 var (...) 块注释串扰）、未导出单变量、精确内置 string 类型、
+// 无初值或编译期字符串常量初值。
+func validBuildVar(info *types.Info, gen *ast.GenDecl, vs *ast.ValueSpec) *types.Var {
+	if !valueSpecHasDirective(gen, vs, vetutil.DirectiveBuildVar) || len(vs.Names) != 1 {
+		return nil
+	}
+	id := vs.Names[0]
+	if id.Name == "_" || id.IsExported() {
+		return nil
+	}
+	v, ok := info.Defs[id].(*types.Var)
+	if !ok || v == nil || !isBuiltinStringType(v.Type()) {
+		return nil
+	}
+	if !isValidBuildVarInit(info, vs.Values) {
+		return nil
+	}
+	return v
+}
+
+func valueSpecHasDirective(gen *ast.GenDecl, vs *ast.ValueSpec, kind vetutil.DirectiveKind) bool {
+	if vs == nil {
+		return false
+	}
+	if vetutil.HasDirective(vs.Doc, kind) || vetutil.HasDirective(vs.Comment, kind) {
+		return true
+	}
+	return gen != nil && len(gen.Specs) == 1 && vetutil.HasDirective(gen.Doc, kind)
+}
+
+func isBuiltinStringType(t types.Type) bool {
+	basic, ok := t.(*types.Basic)
+	return ok && basic.Kind() == types.String
+}
+
+func isValidBuildVarInit(info *types.Info, values []ast.Expr) bool {
+	if len(values) == 0 {
+		return true
+	}
+	if len(values) != 1 {
+		return false
+	}
+	tv, ok := info.Types[values[0]]
+	return ok && tv.Value != nil && tv.Value.Kind() == constant.String
+}
+
+func checkPkgVarDecl(pass *analysis.Pass, gen *ast.GenDecl, sentinels, buildVars map[*types.Var]bool) {
 	for _, spec := range gen.Specs {
 		vs, ok := spec.(*ast.ValueSpec)
 		if !ok {
 			continue
 		}
-		if isInterfaceAssertionSpec(pass.TypesInfo, vs) {
+		if isInterfaceAssertionSpec(pass.TypesInfo, vs) ||
+			isImmutableSentinelSpec(pass.TypesInfo, vs, sentinels) ||
+			isRecordedBuildVarSpec(pass.TypesInfo, vs, buildVars) {
 			continue
 		}
-		if isImmutableSentinelSpec(pass.TypesInfo, vs, sentinels) {
-			continue
-		}
-		pass.ReportRangef(vs, "noimplicit: 禁止声明可变包级 var（仅允许编译期接口断言 var _ I = (*T)(nil) 与不可变哨兵错误）")
+		pass.ReportRangef(vs, "noimplicit: 禁止声明可变包级 var（仅允许编译期接口断言 var _ I = (*T)(nil)、不可变哨兵错误及 cmd/xops 只读 //xops:buildvar）")
 	}
+}
+
+func isRecordedBuildVarSpec(info *types.Info, vs *ast.ValueSpec, buildVars map[*types.Var]bool) bool {
+	if info == nil || len(vs.Names) != 1 {
+		return false
+	}
+	v, ok := info.Defs[vs.Names[0]].(*types.Var)
+	return ok && buildVars[v]
 }
 
 // isInterfaceAssertionSpec 仅豁免形如 `var _ I = (*T)(nil)` 的编译期零副作用接口断言，
@@ -231,9 +332,9 @@ func isSentinelName(name string) bool {
 	return name != "_" && (strings.HasPrefix(name, "Err") || strings.HasPrefix(name, "err"))
 }
 
-// checkSentinelMutations 扫描包内所有赋值、for-range 赋值、自增减与取地址表达式，
-// 防止在运行期篡改本包或外部包的包级哨兵错误变量（保证哨兵错误只读不变量）。
-func checkSentinelMutations(pass *analysis.Pass, sentinels map[*types.Var]bool) {
+// checkImmutableVarMutations 扫描全包（含同包 *_test.go）所有赋值、for-range 赋值、自增减与取地址表达式，
+// 防止在运行期篡改包级哨兵错误或 cmd/xops 只读 //xops:buildvar 构建变量。
+func checkImmutableVarMutations(pass *analysis.Pass, sentinels, buildVars map[*types.Var]bool) {
 	if pass.TypesInfo == nil {
 		return
 	}
@@ -245,48 +346,76 @@ func checkSentinelMutations(pass *analysis.Pass, sentinels map[*types.Var]bool) 
 		(*ast.UnaryExpr)(nil),
 	}
 	ins.Preorder(nodeFilter, func(n ast.Node) {
-		checkSentinelMutationNode(pass, n, sentinels)
+		checkImmutableVarMutationNode(pass, n, sentinels, buildVars)
 	})
 }
 
-func checkSentinelMutationNode(pass *analysis.Pass, n ast.Node, sentinels map[*types.Var]bool) {
+func checkImmutableVarMutationNode(pass *analysis.Pass, n ast.Node, sentinels, buildVars map[*types.Var]bool) {
 	switch node := n.(type) {
 	case *ast.AssignStmt:
 		for _, lhs := range node.Lhs {
-			reportIfSentinelExpr(pass, lhs, sentinels, "noimplicit: 禁止在运行期修改哨兵错误 %s")
+			reportIfImmutableVarExpr(pass, lhs, sentinels, buildVars, false)
 		}
 	case *ast.RangeStmt:
-		// 仅拦截使用 "=" 覆盖已有哨兵变量的 range 赋值；":=" 为循环块内新局部变量遮蔽。
+		// 仅拦截使用 "=" 覆盖已有只读变量的 range 赋值；":=" 为循环块内新局部变量遮蔽。
 		if node.Tok == token.ASSIGN {
-			reportIfSentinelExpr(pass, node.Key, sentinels, "noimplicit: 禁止在运行期修改哨兵错误 %s")
-			reportIfSentinelExpr(pass, node.Value, sentinels, "noimplicit: 禁止在运行期修改哨兵错误 %s")
+			reportIfImmutableVarExpr(pass, node.Key, sentinels, buildVars, false)
+			reportIfImmutableVarExpr(pass, node.Value, sentinels, buildVars, false)
 		}
 	case *ast.IncDecStmt:
-		reportIfSentinelExpr(pass, node.X, sentinels, "noimplicit: 禁止修改哨兵错误 %s")
+		reportIfImmutableVarExpr(pass, node.X, sentinels, buildVars, false)
 	case *ast.UnaryExpr:
 		if node.Op == token.AND {
-			reportIfSentinelExpr(pass, node.X, sentinels, "noimplicit: 禁止对哨兵错误 %s 取地址")
+			reportIfImmutableVarExpr(pass, node.X, sentinels, buildVars, true)
 		}
 	}
 }
 
-// reportIfSentinelExpr 同时识别同包标识符（ErrFoo）与跨包选择器（otherpkg.ErrShared），
+// reportIfImmutableVarExpr 同时识别同包标识符（ErrFoo/buildVersion）与跨包选择器（otherpkg.ErrShared），
 // 并排除结构体字段选择器（Selection != nil），确保不误报 obj.ErrField 赋值。
-func reportIfSentinelExpr(pass *analysis.Pass, expr ast.Expr, sentinels map[*types.Var]bool, format string) {
-	switch target := ast.Unparen(expr).(type) {
-	case *ast.Ident:
-		v, ok := pass.TypesInfo.Uses[target].(*types.Var)
-		if ok && isTrackedSentinelVar(v, sentinels) {
-			pass.ReportRangef(target, format, target.Name)
-		}
-	case *ast.SelectorExpr:
-		if pass.TypesInfo.Selections[target] != nil {
+func reportIfImmutableVarExpr(
+	pass *analysis.Pass,
+	expr ast.Expr,
+	sentinels, buildVars map[*types.Var]bool,
+	isAddr bool,
+) {
+	target, v, name := resolvePkgVarExpr(pass.TypesInfo, expr)
+	if v == nil {
+		return
+	}
+	if buildVars[v] {
+		if isAddr {
+			pass.ReportRangef(target, "noimplicit: 禁止对只读构建变量 %s 取地址", name)
 			return
 		}
-		v, ok := pass.TypesInfo.Uses[target.Sel].(*types.Var)
-		if ok && isTrackedSentinelVar(v, sentinels) {
-			pass.ReportRangef(target, format, target.Sel.Name)
+		pass.ReportRangef(target, "noimplicit: 禁止在运行期修改只读构建变量 %s", name)
+		return
+	}
+	if isTrackedSentinelVar(v, sentinels) {
+		if isAddr {
+			pass.ReportRangef(target, "noimplicit: 禁止对哨兵错误 %s 取地址", name)
+			return
 		}
+		pass.ReportRangef(target, "noimplicit: 禁止在运行期修改哨兵错误 %s", name)
+	}
+}
+
+func resolvePkgVarExpr(info *types.Info, expr ast.Expr) (ast.Expr, *types.Var, string) {
+	if expr == nil {
+		return nil, nil, ""
+	}
+	switch target := ast.Unparen(expr).(type) {
+	case *ast.Ident:
+		v, _ := info.Uses[target].(*types.Var)
+		return target, v, target.Name
+	case *ast.SelectorExpr:
+		if info.Selections[target] != nil {
+			return nil, nil, ""
+		}
+		v, _ := info.Uses[target.Sel].(*types.Var)
+		return target, v, target.Sel.Name
+	default:
+		return nil, nil, ""
 	}
 }
 

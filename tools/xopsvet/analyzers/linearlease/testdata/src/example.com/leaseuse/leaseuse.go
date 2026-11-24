@@ -2,6 +2,7 @@ package leaseuse
 
 import (
 	"context"
+	"time"
 
 	"example.com/leasedef"
 )
@@ -22,6 +23,12 @@ type Holder struct {
 }
 
 type myFunc func()
+
+type mySessions []leasedef.Session
+
+func getOuterSlice() []leasedef.Session {
+	return leakedSlice
+}
 
 var (
 	leakedSess   leasedef.Session
@@ -433,4 +440,39 @@ func badBypassNBL3VariadicClosures(ctx context.Context, p leasedef.Pool, n Nurse
 		})
 		return nil
 	})
+}
+
+// v2.3.2 B2/B3 回归用例：移除 defer 同步误放行 + copy 目标 IsFreshLocalSliceAlloc 精准校验。
+func badDeferAsyncAndCopyCallTargets(
+	ctx context.Context,
+	p leasedef.Pool,
+	n Nursery,
+	//xops:borrowed
+	src []leasedef.Session,
+	//xops:borrowed
+	plain []byte,
+) {
+	_ = p.WithLease(ctx, func(ctx context.Context, sess leasedef.Session) error {
+		defer n.Go(func() { // want "禁止在非同步子闭包"
+			_ = sess.Close()
+		})
+		defer time.AfterFunc(time.Second, func() { // want "禁止在非同步子闭包"
+			_ = sess.Close()
+		})
+		defer registerAsync(func() { // want "禁止在非同步子闭包"
+			_ = sess
+		})
+		// 合法对照：defer IIFE 与 defer 同步方法调用仍放行
+		defer func() {
+			_ = sess.Exec(ctx, "ok-defer-iife")
+		}()
+		defer sess.Close()
+		return nil
+	})
+
+	copy(getOuterSlice(), src)         // want "禁止通过 copy 将 //xops:borrowed 借用变量写入非新建局部切片目标"
+	copy(mySessions(leakedSlice), src) // want "禁止通过 copy 将 //xops:borrowed 借用变量写入非新建局部切片目标"
+	copy(make([]leasedef.Session, 1), src)
+	copy([]byte("xxxx"), plain)
+	copy([]byte(nil), plain)
 }

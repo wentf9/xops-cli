@@ -70,7 +70,9 @@ func checkFailClosedDefault(
 		return
 	}
 	enclosing, sig := enclosingFuncInfo(pass, ts)
-	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos())
+	// 测试源码与 core/ports/tck 测试契约夹具层均允许以 t.Fatal/t.Error 作为 fail-closed default 处置。
+	inTest := vetutil.IsPosInTestFile(pass, defaultClause.Pos()) ||
+		vetutil.ClassifyPackage(pass.Pkg.Path()).Layer == vetutil.LayerCorePortsTCK
 	state := defaultScanState{
 		pass:           pass,
 		sig:            sig,

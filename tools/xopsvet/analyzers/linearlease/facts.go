@@ -339,7 +339,9 @@ func (idx *factIndex) lookupTypeFact(pass *analysis.Pass, tn *types.TypeName) (b
 	return borrowedFuncFact{}, false
 }
 
-func resolveCallLeaseSpec(pass *analysis.Pass, idx *factIndex, call *ast.CallExpr, inDefer bool) callLeaseSpec {
+// resolveCallLeaseSpec 仅依据被调方自身的同步/借用契约推导调用规格，
+// 不因调用位于 defer 语句而假定其为同步闭包。
+func resolveCallLeaseSpec(pass *analysis.Pass, idx *factIndex, call *ast.CallExpr) callLeaseSpec {
 	spec := callLeaseSpec{callbackBorrowed: make(map[int][]int)}
 	fun := ast.Unparen(call.Fun)
 	if _, isLit := fun.(*ast.FuncLit); isLit {
@@ -355,9 +357,6 @@ func resolveCallLeaseSpec(pass *analysis.Pass, idx *factIndex, call *ast.CallExp
 			spec.syncClosure = true
 		}
 		mergeParamTypeFacts(pass, idx, fn, len(call.Args), &spec)
-	}
-	if inDefer {
-		spec.syncClosure = true
 	}
 	mergeInlineFuncLitDirectives(pass, idx, call, &spec)
 	return spec

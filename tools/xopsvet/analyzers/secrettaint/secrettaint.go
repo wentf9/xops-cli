@@ -8,8 +8,9 @@
 //     （切片、bytes.Clone、slices.Clone、string/[]byte 强转、copy、append、fmt.Sprint*、
 //     编码与缓冲写入等）执行局部污点流追踪，拦截流入汇点或逃逸出局部借用作用域，
 //     同时对 len/cap/clear、字节谓词及合法加密/认证消费方零误报；
-//   - 规则 3：将 SecretBox.Use 与 //xops:secretuse 的调用与引用严格封锁于白名单包
-//     （core/domain/secret、internal/host/vault 与 core/internal/sshnet/dial，不含外置 _test）。
+//   - 规则 3：将 SecretBox.Use 与 //xops:secretuse 的调用与引用严格封锁于 5 个白名单包
+//     （core/domain/secret、internal/host/vault、core/internal/sshnet/dial、
+//     core/internal/sshnet/priv 与 core/internal/sim，不含外置 _test）。
 package secrettaint
 
 import (

@@ -78,8 +78,8 @@ func TestClassifyPackageAndWhitelists(t *testing.T) {
 		},
 		{
 			name:            "conc",
-			pkgPath:         "github.com/wentf9/xops-cli/core/internal/foundation/conc",
-			wantLayer:       vetutil.LayerCoreFoundationConc,
+			pkgPath:         "github.com/wentf9/xops-cli/core/conc",
+			wantLayer:       vetutil.LayerCoreConc,
 			wantXops:        true,
 			wantAllowNol:    true,
 			wantAllowBareGo: true,
@@ -87,11 +87,18 @@ func TestClassifyPackageAndWhitelists(t *testing.T) {
 		},
 		{
 			name:        "conc_external_test_denied",
-			pkgPath:     "github.com/wentf9/xops-cli/core/internal/foundation/conc_test",
-			wantLayer:   vetutil.LayerCoreFoundationConc,
+			pkgPath:     "github.com/wentf9/xops-cli/core/conc_test",
+			wantLayer:   vetutil.LayerCoreConc,
 			wantExtTest: true,
 			wantXops:    true,
 			wantIsCore:  true,
+		},
+		{
+			name:       "actor_no_privileges",
+			pkgPath:    "github.com/wentf9/xops-cli/core/internal/foundation/actor",
+			wantLayer:  vetutil.LayerCoreFoundationActor,
+			wantXops:   true,
+			wantIsCore: true,
 		},
 		{
 			name:         "trace",
@@ -134,6 +141,45 @@ func TestClassifyPackageAndWhitelists(t *testing.T) {
 			wantAllowNol:    true,
 			wantAllowSecret: true,
 			wantIsCore:      true,
+		},
+		{
+			name:            "sshnet_priv",
+			pkgPath:         "github.com/wentf9/xops-cli/core/internal/sshnet/priv",
+			wantLayer:       vetutil.LayerCoreSSHNetPriv,
+			wantXops:        true,
+			wantAllowNol:    true,
+			wantAllowSecret: true,
+			wantIsCore:      true,
+		},
+		{
+			name:        "sshnet_priv_external_test_denied",
+			pkgPath:     "github.com/wentf9/xops-cli/core/internal/sshnet/priv_test",
+			wantLayer:   vetutil.LayerCoreSSHNetPriv,
+			wantExtTest: true,
+			wantXops:    true,
+			wantIsCore:  true,
+		},
+		{
+			name:            "sim_plaintext_without_nolint",
+			pkgPath:         "github.com/wentf9/xops-cli/core/internal/sim",
+			wantLayer:       vetutil.LayerCoreSim,
+			wantXops:        true,
+			wantAllowSecret: true,
+			wantIsCore:      true,
+		},
+		{
+			name:        "sim_external_test_denied",
+			pkgPath:     "github.com/wentf9/xops-cli/core/internal/sim_test",
+			wantLayer:   vetutil.LayerCoreSim,
+			wantExtTest: true,
+			wantXops:    true,
+			wantIsCore:  true,
+		},
+		{
+			name:      "cmd_xops_no_nolint",
+			pkgPath:   "github.com/wentf9/xops-cli/cmd/xops",
+			wantLayer: vetutil.LayerCmdXops,
+			wantXops:  true,
 		},
 		{
 			name:       "mcpruntime",
@@ -224,11 +270,12 @@ func TestDirectivesAndNolintParsing(t *testing.T) {
 			{Slash: token.Pos(120), Text: "//xops:syncclosure"},
 			{Slash: token.Pos(140), Text: "//xops:secretuse"},
 			{Slash: token.Pos(160), Text: "//xops:dto"},
+			{Slash: token.Pos(180), Text: "//xops:buildvar"},
 		},
 	}
 	dirs := vetutil.ParseCommentGroup(cg)
-	if len(dirs) != 8 {
-		t.Fatalf("got %d directives, want 8", len(dirs))
+	if len(dirs) != 9 {
+		t.Fatalf("got %d directives, want 9", len(dirs))
 	}
 	if dirs[3].Kind != vetutil.DirectiveHashExclude || dirs[3].Arg != "ephemeral cache" {
 		t.Fatalf("unexpected hash-exclude directive: %+v", dirs[3])
@@ -248,6 +295,7 @@ func assertDirectivesPresent(t *testing.T, cg *ast.CommentGroup) {
 		vetutil.DirectiveSyncClosure,
 		vetutil.DirectiveSecretUse,
 		vetutil.DirectiveDTO,
+		vetutil.DirectiveBuildVar,
 	}
 	for _, k := range wantKinds {
 		if !vetutil.HasDirective(cg, k) {

@@ -17,6 +17,8 @@ type EventAlias = *secret.SecretBox // want "禁止 secret.SecretBox 进入 Even
 
 type EventAnySlice []any
 
+type EventAnyMap map[any]string
+
 type Envelope struct {
 	Payload any
 }
@@ -29,4 +31,9 @@ func badCompositeAny(box *secret.SecretBox) {
 	_ = Envelope{Payload: box}                         // want "禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段"
 	_ = EventAnySlice{box}                             // want "禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段"
 	_ = Envelope{Payload: func() any { return box }()} // want "禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段"
+
+	var erased any = box
+	_ = Envelope{Payload: erased} // want "禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段"
+	_ = EventAnyMap{box: "v"}     // want "禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段"
+	_ = EventAnyMap{erased: "v"}  // want "禁止将 secret.SecretBox 存入 Event/Audit/Plan/Error/序列化结构体字段"
 }

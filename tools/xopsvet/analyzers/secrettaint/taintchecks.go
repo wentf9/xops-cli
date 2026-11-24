@@ -4,6 +4,8 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+
+	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
 )
 
 func (s *taintState) checkNode(n ast.Node, exemptDeferLits map[*ast.FuncLit]bool) {
@@ -42,7 +44,7 @@ func (s *taintState) checkCall(call *ast.CallExpr) {
 	}
 	kind := classifyRule2SinkCall(s.pass.TypesInfo, call)
 	if kind == sinkNone {
-		s.checkFuncLitCallArgs(call)
+		s.checkCallArgTaintRecursion(call)
 		return
 	}
 	for _, arg := range call.Args {
@@ -111,47 +113,23 @@ func (s *taintState) checkBufferReadFromLeak(call *ast.CallExpr, sel *ast.Select
 	return false
 }
 
-// checkFuncLitCallArgs 对直接传入明文污点实参的局部闭包调用或 IIFE 进行参数到形参的递归污点追踪。
-func (s *taintState) checkFuncLitCallArgs(call *ast.CallExpr) {
-	lit := resolveCallbackLit(s.pass.TypesInfo, call.Fun, s.localLits)
-	if lit == nil || lit.Body == nil || lit.Type == nil || s.activeLits[lit] {
-		return
-	}
-	seeds := s.taintedCallArgParamVars(call, lit)
-	if len(seeds) == 0 {
-		return
-	}
-	s.activeLits[lit] = true
-	defer delete(s.activeLits, lit)
-	runTaintAnalysisWithState(
-		s.pass, s.facts, s.pkgIdx, lit.Body,
-		s.pass.TypesInfo.Scopes[lit.Type], seeds,
-		lit.Type.Results, s.reported, s.activeLits,
-	)
-}
-
-func (s *taintState) taintedCallArgParamVars(call *ast.CallExpr, lit *ast.FuncLit) []*types.Var {
-	paramVars, isVariadic := flattenParamVars(s.pass.TypesInfo, lit.Type.Params)
-	if len(paramVars) == 0 {
-		return nil
-	}
-	var seeds []*types.Var
-	for i, arg := range call.Args {
-		if !s.exprContainsTainted(arg) {
-			continue
-		}
-		if pVar := paramVarAt(paramVars, isVariadic, i); pVar != nil {
-			seeds = append(seeds, pVar)
-		}
-	}
-	return seeds
-}
-
+// checkMutationDestEscape 检查 copy/append/io.Copy/Buffer.Write 等写入目标是否逃逸出局部作用域。
+// 仅在剥离取址与索引之前放行干净的一维字节切片字面量，剥离后仅放行 vetutil.IsFreshLocalSliceAlloc
+// 认定的全新局部切片分配，堵死 &wrapWriter{...}、[][]byte{outer}[0]、getOuterSlice() 与 MyBytes(outer) 绕过。
 func (s *taintState) checkMutationDestEscape(dst ast.Expr, msg string) {
-	switch d := unwrapSliceBaseExpr(s.pass.TypesInfo, dst).(type) {
-	case *ast.CallExpr, *ast.CompositeLit:
-		// 诸如 append([]byte(nil), plain...) 或 append(make([]byte, 0), plain...) 属于新建局部切片，本身不逃逸。
+	if lit, ok := ast.Unparen(dst).(*ast.CompositeLit); ok {
+		if isByteSliceType(s.pass.TypesInfo.TypeOf(lit)) && !s.exprContainsTainted(lit) {
+			return
+		}
+		s.reportLeak(dst, "%s", msg)
 		return
+	}
+	switch d := unwrapSliceBaseExpr(s.pass.TypesInfo, dst).(type) {
+	case *ast.CallExpr:
+		if vetutil.IsFreshLocalSliceAlloc(s.pass.TypesInfo, d) {
+			return
+		}
+		s.reportLeak(dst, "%s", msg)
 	case *ast.Ident:
 		if d.Name == "_" || isNilIdent(s.pass.TypesInfo, d) {
 			return

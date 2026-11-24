@@ -375,3 +375,132 @@ func badBypassNBS4AndNBS5(box *secret.SecretBox) {
 		return nil
 	})
 }
+
+// v2.3.2 B3 回归用例：回调并格不覆盖、同包 FuncDecl/MethodExpr 递归追踪、copy/io.Copy 收紧。
+type myVaultBytes []byte
+
+type wrapVaultWriter struct {
+	w io.Writer
+}
+
+func (w *wrapVaultWriter) Write(p []byte) (int, error) {
+	return w.w.Write(p)
+}
+
+func getOuterVaultSlice() []byte     { return leakedBytes }
+func getOuterVaultWriter() io.Writer { return io.Discard }
+
+func badMixedBranchHelper(plain []byte) error {
+	slog.Info("mixed-branch-helper", "v", string(plain)) // want "禁止将明文机密.*传入日志汇点"
+	return nil
+}
+
+func leakViaDirectHelper(p []byte) {
+	slog.Info("direct-helper", "v", string(p)) // want "禁止将明文机密.*传入日志汇点"
+}
+
+func leakViaLocalFuncVar(p []byte) {
+	leakedString = string(p) // want "禁止将明文机密逃逸至外层变量"
+}
+
+type methodLeakHelper struct{}
+
+func (methodLeakHelper) leakMethodVal(p []byte) {
+	slog.Info("method-val", "v", string(p)) // want "禁止将明文机密.*传入日志汇点"
+}
+
+func (methodLeakHelper) leakMethodExpr(p []byte) {
+	slog.Info("method-expr", "v", string(p)) // want "禁止将明文机密.*传入日志汇点"
+}
+
+func (methodLeakHelper) leakMethodExprVar(p []byte) {
+	leakedBytes = p // want "禁止将明文机密逃逸至外层变量"
+}
+
+type secretBuf []byte
+
+func (b secretBuf) leakReceiver() {
+	slog.Info("tainted-recv", "v", string(b)) // want "禁止将明文机密.*传入日志汇点"
+}
+
+func (b secretBuf) leakReceiverExpr() {
+	leakedString = string(b) // want "禁止将明文机密逃逸至外层变量"
+}
+
+func leakGenericHelper[T ~[]byte](p T) {
+	slog.Info("generic-helper", "v", string(p)) // want "禁止将明文机密.*传入日志汇点"
+}
+
+func recLeakHelper(p []byte, n int) {
+	if n > 0 {
+		recLeakHelper(p, n-1)
+	}
+	slog.Info("rec-helper", "v", string(p)) // want "禁止将明文机密.*传入日志汇点"
+}
+
+func okCleanHelper(p []byte) bool {
+	_ = len(p)
+	return bytes.Equal(p, []byte("ok"))
+}
+
+func badV232B3Regressions(box *secret.SecretBox, cond bool) {
+	// 1. 回调单调并格：条件分支覆写 FuncLit 与具名函数均不丢失
+	var cb1 func([]byte) error
+	if cond {
+		cb1 = func(p []byte) error {
+			slog.Info("cb-overwrite-lit", "v", string(p)) // want "禁止将明文机密.*传入日志汇点"
+			return nil
+		}
+	} else {
+		cb1 = func(p []byte) error {
+			clear(p)
+			return nil
+		}
+	}
+	_ = box.Use(cb1)
+
+	var cb2 func([]byte) error
+	if cond {
+		cb2 = func(p []byte) error {
+			clear(p)
+			return nil
+		}
+	} else {
+		cb2 = badMixedBranchHelper
+	}
+	_ = box.Use(cb2)
+
+	// 2. 同包具名函数、localFuncs 变量转发、MethodVal、MethodExpr 与污点接收者递归追踪
+	_ = box.Use(func(plain []byte) error {
+		leakViaDirectHelper(plain)
+		h := leakViaLocalFuncVar
+		h(plain)
+
+		var mh methodLeakHelper
+		mh.leakMethodVal(plain)
+		(methodLeakHelper).leakMethodExpr(mh, plain)
+		me := (methodLeakHelper).leakMethodExprVar
+		me(mh, plain)
+
+		secretBuf(plain).leakReceiver()
+		secretBuf.leakReceiverExpr(secretBuf(plain))
+		leakGenericHelper[[]byte](plain)
+		recLeakHelper(plain, 2)
+		_ = okCleanHelper(plain)
+
+		// 3. 收紧 copy / io.Copy 写入目标检查
+		copy(getOuterVaultSlice(), plain)                                       // want "禁止通过 copy 将明文机密写入外层变量或字段"
+		copy(myVaultBytes(leakedBytes), plain)                                  // want "禁止通过 copy 将明文机密写入外层变量或字段"
+		copy([][]byte{leakedBytes}[0], plain)                                   // want "禁止通过 copy 将明文机密写入外层变量或字段"
+		_, _ = io.Copy(&wrapVaultWriter{w: io.Discard}, bytes.NewReader(plain)) // want "禁止通过 io.Copy 将明文机密写入外层缓冲或写入器"
+		_, _ = io.Copy(getOuterVaultWriter(), bytes.NewReader(plain))           // want "禁止通过 io.Copy 将明文机密写入外层缓冲或写入器"
+
+		// 合法新建局部切片对照
+		fresh1 := append([]byte{}, plain...)
+		clear(fresh1)
+		copy([]byte("xxxx"), plain)
+		copy([]byte(nil), plain)
+		copy(make([]byte, len(plain)), plain)
+		return nil
+	})
+}

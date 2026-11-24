@@ -26,7 +26,6 @@ type closureState struct {
 	localFuncLits   map[*types.Var][]*ast.FuncLit
 	taintedClosures map[*types.Var]taintedClosureInfo
 	syncLits        map[*ast.FuncLit][]int
-	deferCalls      map[*ast.CallExpr]bool
 	goCalls         map[*ast.CallExpr]bool
 	visitedLits     map[*ast.FuncLit]bool
 	reported        map[token.Pos]bool
@@ -104,7 +103,6 @@ func newClosureState(
 		localFuncLits:   make(map[*types.Var][]*ast.FuncLit),
 		taintedClosures: make(map[*types.Var]taintedClosureInfo),
 		syncLits:        make(map[*ast.FuncLit][]int),
-		deferCalls:      make(map[*ast.CallExpr]bool),
 		goCalls:         make(map[*ast.CallExpr]bool),
 		visitedLits:     visitedLits,
 		reported:        reported,
@@ -168,7 +166,7 @@ func flattenFieldVarsWithVariadic(info *types.Info, fl *ast.FieldList) ([]*types
 }
 
 func (s *closureState) analyzeSyncTree(root *ast.BlockStmt) {
-	s.collectSpecialCalls(root)
+	s.collectGoCalls(root)
 	// 最多执行 32 轮不动点迭代，覆盖深层变量别名链、本地闭包重赋值、类型断言与 range/copy 传播。
 	for range maxAliasIters {
 		prevBorrowed := len(s.borrowed)
@@ -191,24 +189,17 @@ func (s *closureState) analyzeSyncTree(root *ast.BlockStmt) {
 	})
 }
 
-func (s *closureState) collectSpecialCalls(root *ast.BlockStmt) {
+func (s *closureState) collectGoCalls(root *ast.BlockStmt) {
 	ast.Inspect(root, func(n ast.Node) bool {
-		switch stmt := n.(type) {
-		case *ast.DeferStmt:
-			if stmt.Call != nil {
-				s.deferCalls[stmt.Call] = true
-			}
-		case *ast.GoStmt:
-			if stmt.Call != nil {
-				s.goCalls[stmt.Call] = true
-			}
+		if stmt, ok := n.(*ast.GoStmt); ok && stmt.Call != nil {
+			s.goCalls[stmt.Call] = true
 		}
 		return true
 	})
 }
 
 // walkSyncBody 遍历同步块内节点，不直接穿透非同步 FuncLit；
-// 仅当 FuncLit 作为同步调用实参/IIFE/defer 或已标记同步的本地闭包变量被调用时才显式进入。
+// 仅当 FuncLit 作为同步调用实参/IIFE 或已标记同步的本地闭包变量被调用时才显式进入。
 // seenInWalk 防止局部递归闭包（如 fn = func() { fn() }）导致无限递归。
 func (s *closureState) walkSyncBody(body *ast.BlockStmt, visit func(ast.Node)) {
 	s.walkSyncBodySeen(body, make(map[*ast.BlockStmt]bool), visit)
@@ -257,7 +248,7 @@ func (s *closureState) discoverSyncCallLits(call *ast.CallExpr) []*ast.FuncLit {
 	if s.goCalls[call] {
 		return nil
 	}
-	spec := resolveCallLeaseSpec(s.pass, s.facts, call, s.deferCalls[call])
+	spec := resolveCallLeaseSpec(s.pass, s.facts, call)
 	funLits := s.resolveArgFuncLits(call.Fun)
 	lits := make([]*ast.FuncLit, 0, len(funLits))
 	for _, funLit := range funLits {

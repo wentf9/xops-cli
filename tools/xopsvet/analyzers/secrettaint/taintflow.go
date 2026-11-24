@@ -13,15 +13,17 @@ import (
 const maxTaintFixpointIters = 32
 
 type taintState struct {
-	pass       *analysis.Pass
-	facts      *secretFactIndex
-	pkgIdx     *packageCallbackIndex
-	localLits  map[*types.Var]*ast.FuncLit
-	tainted    map[*types.Var]bool
-	ownerScope *types.Scope
-	resultVars map[*types.Var]bool
-	reported   map[token.Pos]bool
-	activeLits map[*ast.FuncLit]bool
+	pass        *analysis.Pass
+	facts       *secretFactIndex
+	pkgIdx      *packageCallbackIndex
+	localLits   map[*types.Var][]*ast.FuncLit
+	localFuncs  map[*types.Var][]*types.Func
+	tainted     map[*types.Var]bool
+	ownerScope  *types.Scope
+	resultVars  map[*types.Var]bool
+	reported    map[token.Pos]bool
+	activeLits  map[*ast.FuncLit]bool
+	activeDecls map[*ast.FuncDecl]bool
 }
 
 func checkSecretTaintFlows(pass *analysis.Pass, facts *secretFactIndex) {
@@ -61,7 +63,10 @@ func checkDirectSecretUseFuncDecl(
 		return
 	}
 	ownerScope := pass.TypesInfo.Scopes[fn.Type]
-	runTaintAnalysis(pass, facts, pkgIdx, fn.Body, ownerScope, vars, fn.Type.Results, reported)
+	runTaintAnalysisWithState(
+		pass, facts, pkgIdx, fn.Body, ownerScope, vars, fn.Type.Results, reported,
+		make(map[*ast.FuncLit]bool), map[*ast.FuncDecl]bool{fn: true},
+	)
 }
 
 func checkRemainingSecretUseFuncLits(
@@ -83,7 +88,10 @@ func checkRemainingSecretUseFuncLits(
 			return
 		}
 		checkedLits[lit] = true
-		runTaintAnalysis(pass, facts, pkgIdx, lit.Body, pass.TypesInfo.Scopes[lit.Type], vars, lit.Type.Results, reported)
+		runTaintAnalysisWithState(
+			pass, facts, pkgIdx, lit.Body, pass.TypesInfo.Scopes[lit.Type], vars, lit.Type.Results, reported,
+			map[*ast.FuncLit]bool{lit: true}, make(map[*ast.FuncDecl]bool),
+		)
 	})
 }
 
@@ -159,22 +167,6 @@ func isSecretCarrierType(t types.Type) bool {
 	return false
 }
 
-func runTaintAnalysis(
-	pass *analysis.Pass,
-	facts *secretFactIndex,
-	pkgIdx *packageCallbackIndex,
-	body *ast.BlockStmt,
-	ownerScope *types.Scope,
-	seeds []*types.Var,
-	results *ast.FieldList,
-	reported map[token.Pos]bool,
-) {
-	runTaintAnalysisWithState(
-		pass, facts, pkgIdx, body, ownerScope, seeds, results, reported,
-		make(map[*ast.FuncLit]bool),
-	)
-}
-
 func runTaintAnalysisWithState(
 	pass *analysis.Pass,
 	facts *secretFactIndex,
@@ -185,21 +177,24 @@ func runTaintAnalysisWithState(
 	results *ast.FieldList,
 	reported map[token.Pos]bool,
 	activeLits map[*ast.FuncLit]bool,
+	activeDecls map[*ast.FuncDecl]bool,
 ) {
 	if body == nil || ownerScope == nil || len(seeds) == 0 {
 		return
 	}
-	localLits, _ := collectLocalCallbackMaps(pass.TypesInfo, body, pkgIdx)
+	localLits, localFuncs := collectLocalCallbackMaps(pass.TypesInfo, body, pkgIdx)
 	st := &taintState{
-		pass:       pass,
-		facts:      facts,
-		pkgIdx:     pkgIdx,
-		localLits:  localLits,
-		tainted:    make(map[*types.Var]bool),
-		ownerScope: ownerScope,
-		resultVars: collectResultVars(pass.TypesInfo, results),
-		reported:   reported,
-		activeLits: activeLits,
+		pass:        pass,
+		facts:       facts,
+		pkgIdx:      pkgIdx,
+		localLits:   localLits,
+		localFuncs:  localFuncs,
+		tainted:     make(map[*types.Var]bool),
+		ownerScope:  ownerScope,
+		resultVars:  collectResultVars(pass.TypesInfo, results),
+		reported:    reported,
+		activeLits:  activeLits,
+		activeDecls: activeDecls,
 	}
 	for _, v := range seeds {
 		if v != nil {
@@ -221,71 +216,6 @@ func runTaintAnalysisWithState(
 	walkOutsideClosures(body, func(n ast.Node) {
 		st.checkNode(n, exemptDeferLits)
 	})
-}
-
-func collectResultVars(info *types.Info, fl *ast.FieldList) map[*types.Var]bool {
-	out := make(map[*types.Var]bool)
-	if fl == nil {
-		return out
-	}
-	for _, f := range fl.List {
-		for _, id := range f.Names {
-			if v, ok := info.Defs[id].(*types.Var); ok && v != nil {
-				out[v] = true
-			}
-		}
-	}
-	return out
-}
-
-func walkOutsideClosures(body *ast.BlockStmt, visit func(ast.Node)) {
-	if body == nil {
-		return
-	}
-	ast.Inspect(body, func(n ast.Node) bool {
-		if n == nil {
-			return false
-		}
-		if _, isLit := n.(*ast.FuncLit); isLit {
-			visit(n)
-			return false
-		}
-		visit(n)
-		return true
-	})
-}
-
-func collectExemptClearDeferLits(info *types.Info, body *ast.BlockStmt) map[*ast.FuncLit]bool {
-	exempt := make(map[*ast.FuncLit]bool)
-	ast.Inspect(body, func(n ast.Node) bool {
-		ds, ok := n.(*ast.DeferStmt)
-		if !ok || ds.Call == nil {
-			return true
-		}
-		lit, ok := ast.Unparen(ds.Call.Fun).(*ast.FuncLit)
-		if ok && lit.Body != nil && isClearOnlyBody(info, lit.Body) {
-			exempt[lit] = true
-		}
-		return true
-	})
-	return exempt
-}
-
-func isClearOnlyBody(info *types.Info, body *ast.BlockStmt) bool {
-	if len(body.List) == 0 {
-		return true
-	}
-	for _, stmt := range body.List {
-		es, ok := stmt.(*ast.ExprStmt)
-		if !ok {
-			return false
-		}
-		call, ok := ast.Unparen(es.X).(*ast.CallExpr)
-		if !ok || !isExemptBuiltinCall(info, call) {
-			return false
-		}
-	}
-	return true
 }
 
 func (s *taintState) propagateNode(n ast.Node) bool {
