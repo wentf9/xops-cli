@@ -134,11 +134,26 @@ func (s *closureState) addTaintedClosureVar(v *types.Var, info taintedClosureInf
 	return true
 }
 
+// propagateRange 沿 range 语句传播借用集合元素、污点闭包集合以及局部 FuncLit 集合至循环变量。
 func (s *closureState) propagateRange(stmt *ast.RangeStmt) bool {
-	scope, ok := s.exprBorrowedScope(stmt.X)
-	if !ok {
-		return false
+	changed := false
+	if scope, ok := s.exprBorrowedScope(stmt.X); ok {
+		changed = s.propagateBorrowedRange(stmt, scope)
 	}
+	if info, ok := s.exprTaintedClosure(stmt.X); ok {
+		if s.propagateClosureRange(stmt, info) {
+			changed = true
+		}
+	}
+	if lits := s.resolveArgFuncLits(stmt.X); len(lits) > 0 {
+		if s.propagateFuncLitRange(stmt, lits) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+func (s *closureState) propagateBorrowedRange(stmt *ast.RangeStmt, scope *types.Scope) bool {
 	changed := false
 	xType := s.pass.TypesInfo.TypeOf(stmt.X)
 	if keyType := rangeKeyType(xType); keyType != nil && !isBasicScalarType(keyType) {
@@ -148,6 +163,35 @@ func (s *closureState) propagateRange(stmt *ast.RangeStmt) bool {
 	}
 	if elemType := rangeElemType(xType); elemType != nil && !isBasicScalarType(elemType) {
 		if s.addBorrowedVar(s.lhsIdentVar(stmt.Value), scope) {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// propagateClosureRange 将变参或切片闭包集合的捕获污点传播至 range 循环元素变量。
+func (s *closureState) propagateClosureRange(stmt *ast.RangeStmt, info taintedClosureInfo) bool {
+	elemType := rangeElemType(s.pass.TypesInfo.TypeOf(stmt.X))
+	if elemType == nil || isBasicScalarType(elemType) {
+		return false
+	}
+	return s.addTaintedClosureVar(s.lhsIdentVar(stmt.Value), info)
+}
+
+// propagateFuncLitRange 将变参或切片闭包集合指向的局部 FuncLit 列表传播至 range 循环元素变量，
+// 以便后续同步调用循环元素（如 `c()`）时能进入对应闭包体校验而不误报。
+func (s *closureState) propagateFuncLitRange(stmt *ast.RangeStmt, lits []*ast.FuncLit) bool {
+	elemType := rangeElemType(s.pass.TypesInfo.TypeOf(stmt.X))
+	if elemType == nil || isBasicScalarType(elemType) {
+		return false
+	}
+	valVar := s.lhsIdentVar(stmt.Value)
+	if valVar == nil {
+		return false
+	}
+	changed := false
+	for _, lit := range lits {
+		if s.recordLocalFuncLit(valVar, lit) {
 			changed = true
 		}
 	}

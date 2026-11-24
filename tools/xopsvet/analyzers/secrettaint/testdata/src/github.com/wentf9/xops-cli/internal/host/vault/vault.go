@@ -249,7 +249,8 @@ func badUseHelperAndDeepChain(box *secret.SecretBox) {
 
 var (
 	outerBuf    bytes.Buffer
-	outerBufPtr = &bytes.Buffer{}
+	outerBufPtr       = &bytes.Buffer{}
+	outerCopyN  int64 = 4
 )
 
 type localConsumer interface {
@@ -332,4 +333,45 @@ func badNewBypassesNB(box *secret.SecretBox) {
 	c2 = c1
 	c1 = badHelper10Hops
 	_ = box.Use(c10)
+}
+
+func badBypassNBS4AndNBS5(box *secret.SecretBox) {
+	_ = box.Use(func(plain []byte) error {
+		// NB-S4: 多返回值 io.ReadAll / ReadBytes / ReadString 在短变量声明、赋值与 var 声明中的污点传播与逃逸
+		out, _ := io.ReadAll(bytes.NewReader(plain))
+		slog.Info("readall", "v", string(out)) // want "禁止将明文机密.*传入日志汇点"
+
+		rb, _ := bytes.NewBuffer(plain).ReadBytes('\n')
+		slog.Info("readbytes", "v", string(rb)) // want "禁止将明文机密.*传入日志汇点"
+
+		rs, _ := bytes.NewBuffer(plain).ReadString('\n')
+		slog.Info("readstring", "v", rs) // want "禁止将明文机密.*传入日志汇点"
+
+		leakedBytes, _ = io.ReadAll(bytes.NewReader(plain))       // want "禁止将明文机密逃逸至外层变量"
+		leakedString, _ = bytes.NewBuffer(plain).ReadString('\n') // want "禁止将明文机密逃逸至外层变量"
+		var out2, err2 = io.ReadAll(bytes.NewReader(plain))
+		_ = err2
+		slog.Info("readall-var", "v", string(out2)) // want "禁止将明文机密.*传入日志汇点"
+
+		// NB-S4 干净对照：非污点输入与不传播污点值的 io.Copy / ReadFrom 不应误报
+		outClean, errClean := io.ReadAll(strings.NewReader("ok"))
+		_, _ = outClean, errClean
+		var safeBuf bytes.Buffer
+		nCopy, errCopy := io.Copy(&safeBuf, strings.NewReader("ok"))
+		_, _ = nCopy, errCopy
+		nRF, errRF := safeBuf.ReadFrom(strings.NewReader("ok"))
+		_, _ = nRF, errRF
+
+		// NB-S5: io.CopyBuffer 第三参数 scratch 缓冲污点与外层逃逸（nil 与 io.CopyN 不应误报）
+		var copyBufDst bytes.Buffer
+		localScratch := make([]byte, 32)
+		_, _ = io.CopyBuffer(&copyBufDst, bytes.NewReader(plain), localScratch)
+		slog.Info("copybuf-local-scratch", "v", string(localScratch))          // want "禁止将明文机密.*传入日志汇点"
+		_, _ = io.CopyBuffer(&copyBufDst, bytes.NewReader(plain), leakedBytes) // want "禁止通过 io.CopyBuffer 将明文机密写入外层缓冲或切片"
+
+		_, _ = io.CopyBuffer(&copyBufDst, bytes.NewReader(plain), nil)
+		_, _ = io.CopyBuffer(&copyBufDst, strings.NewReader("ok"), leakedBytes)
+		_, _ = io.CopyN(&copyBufDst, bytes.NewReader(plain), outerCopyN)
+		return nil
+	})
 }

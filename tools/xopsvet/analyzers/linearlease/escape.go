@@ -344,7 +344,7 @@ func paramVarAt(vars []*types.Var, isVariadic bool, idx int) *types.Var {
 	return nil
 }
 
-// resolveArgFuncLits 剥离括号、类型断言与单参类型转换，解析实参或被调表达式指向的局部 FuncLit 集合。
+// resolveArgFuncLits 剥离括号、类型断言、索引/切片派生与单参类型转换，解析实参或被调表达式指向的局部 FuncLit 集合。
 func (s *closureState) resolveArgFuncLits(expr ast.Expr) []*ast.FuncLit {
 	for expr != nil {
 		switch e := ast.Unparen(expr).(type) {
@@ -356,6 +356,10 @@ func (s *closureState) resolveArgFuncLits(expr ast.Expr) []*ast.FuncLit {
 			}
 			return nil
 		case *ast.TypeAssertExpr:
+			expr = e.X
+		case *ast.IndexExpr:
+			expr = e.X
+		case *ast.SliceExpr:
 			expr = e.X
 		case *ast.CallExpr:
 			if len(e.Args) == 1 {

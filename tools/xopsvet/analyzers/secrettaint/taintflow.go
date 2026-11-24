@@ -304,10 +304,11 @@ func (s *taintState) propagateNode(n ast.Node) bool {
 }
 
 func (s *taintState) propagateAssign(stmt *ast.AssignStmt) bool {
-	if len(stmt.Lhs) == 2 && len(stmt.Rhs) == 1 {
-		if ta, ok := ast.Unparen(stmt.Rhs[0]).(*ast.TypeAssertExpr); ok && ta.Type != nil {
-			return s.propagatePair(stmt.Lhs[0], ta)
+	if len(stmt.Lhs) >= 2 && len(stmt.Rhs) == 1 {
+		if rhs, ok := unwrapMultiReturnRHS(stmt.Rhs[0]); ok {
+			return s.propagatePair(stmt.Lhs[0], rhs)
 		}
+		return false
 	}
 	if len(stmt.Lhs) != len(stmt.Rhs) {
 		return false
@@ -322,6 +323,12 @@ func (s *taintState) propagateAssign(stmt *ast.AssignStmt) bool {
 }
 
 func (s *taintState) propagateValueSpec(vs *ast.ValueSpec) bool {
+	if len(vs.Names) >= 2 && len(vs.Values) == 1 {
+		if rhs, ok := unwrapMultiReturnRHS(vs.Values[0]); ok {
+			return s.propagatePair(vs.Names[0], rhs)
+		}
+		return false
+	}
 	if len(vs.Names) != len(vs.Values) {
 		return false
 	}
@@ -332,6 +339,20 @@ func (s *taintState) propagateValueSpec(vs *ast.ValueSpec) bool {
 		}
 	}
 	return changed
+}
+
+// unwrapMultiReturnRHS 提取多返回值赋值右端受支持的单表达式（非 type-switch 的类型断言或函数调用），
+// 使 `v, err := io.ReadAll(...)` 与 `v, ok := x.([]byte)` 等惯用多返回值写法能正确向首个左值传播污点。
+func unwrapMultiReturnRHS(expr ast.Expr) (ast.Expr, bool) {
+	switch rhs := ast.Unparen(expr).(type) {
+	case *ast.TypeAssertExpr:
+		if rhs.Type != nil {
+			return rhs, true
+		}
+	case *ast.CallExpr:
+		return rhs, true
+	}
+	return nil, false
 }
 
 func (s *taintState) propagatePair(lhs, rhs ast.Expr) bool {
@@ -377,7 +398,13 @@ func (s *taintState) propagateCallMutation(call *ast.CallExpr) bool {
 		return s.taintLocalTarget(call.Args[0])
 	}
 	if isIOCopyCall(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.exprIsTainted(call.Args[1]) {
-		return s.taintLocalTarget(call.Args[0])
+		changed := s.taintLocalTarget(call.Args[0])
+		if isIOCopyBufferCall(s.pass.TypesInfo, call) && len(call.Args) >= 3 {
+			if s.taintLocalTarget(call.Args[2]) {
+				changed = true
+			}
+		}
+		return changed
 	}
 	return s.propagateBufferCallMutation(call)
 }

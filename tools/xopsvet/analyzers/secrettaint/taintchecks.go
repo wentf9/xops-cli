@@ -67,6 +67,9 @@ func (s *taintState) checkSpecialCallLeak(call *ast.CallExpr) bool {
 	}
 	if isIOCopyCall(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.exprIsTainted(call.Args[1]) {
 		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 io.Copy 将明文机密写入外层缓冲或写入器")
+		if isIOCopyBufferCall(s.pass.TypesInfo, call) && len(call.Args) >= 3 {
+			s.checkMutationDestEscape(call.Args[2], "secrettaint: 禁止通过 io.CopyBuffer 将明文机密写入外层缓冲或切片")
+		}
 		return true
 	}
 	return s.checkBufferMethodLeak(call)
@@ -171,11 +174,11 @@ func isNilIdent(info *types.Info, id *ast.Ident) bool {
 }
 
 func (s *taintState) checkAssign(stmt *ast.AssignStmt) {
-	if len(stmt.Lhs) == 2 && len(stmt.Rhs) == 1 {
-		if ta, ok := ast.Unparen(stmt.Rhs[0]).(*ast.TypeAssertExpr); ok && ta.Type != nil {
-			s.checkAssignPair(stmt.Lhs[0], ta)
-			return
+	if len(stmt.Lhs) >= 2 && len(stmt.Rhs) == 1 {
+		if rhs, ok := unwrapMultiReturnRHS(stmt.Rhs[0]); ok {
+			s.checkAssignPair(stmt.Lhs[0], rhs)
 		}
+		return
 	}
 	if len(stmt.Lhs) != len(stmt.Rhs) {
 		return
@@ -186,6 +189,12 @@ func (s *taintState) checkAssign(stmt *ast.AssignStmt) {
 }
 
 func (s *taintState) checkValueSpec(vs *ast.ValueSpec) {
+	if len(vs.Names) >= 2 && len(vs.Values) == 1 {
+		if rhs, ok := unwrapMultiReturnRHS(vs.Values[0]); ok {
+			s.checkAssignPair(vs.Names[0], rhs)
+		}
+		return
+	}
 	if len(vs.Names) != len(vs.Values) {
 		return
 	}

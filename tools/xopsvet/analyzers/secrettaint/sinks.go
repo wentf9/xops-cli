@@ -277,6 +277,12 @@ func isIOCopyCall(info *types.Info, call *ast.CallExpr) bool {
 	return vetutil.IsPkgSymbol(obj, "io", "Copy", "CopyN", "CopyBuffer")
 }
 
+// isIOCopyBufferCall 判断调用是否为 io.CopyBuffer，用于额外追踪其第三参数临时缓冲切片的污点流与逃逸。
+func isIOCopyBufferCall(info *types.Info, call *ast.CallExpr) bool {
+	obj := vetutil.ResolveCalledObject(info, call)
+	return vetutil.IsPkgSymbol(obj, "io", "CopyBuffer")
+}
+
 func isBytesOrStringsMethod(info *types.Info, call *ast.CallExpr, recvTypes []string, methodNames ...string) bool {
 	obj := vetutil.ResolveCalledObject(info, call)
 	fn, ok := obj.(*types.Func)

@@ -379,3 +379,58 @@ func badBypassNBL1IIFECallbacks(ctx context.Context, p leasedef.Pool, n Nursery)
 		return nil
 	})
 }
+
+func badBypassNBL3VariadicClosures(ctx context.Context, p leasedef.Pool, n Nursery) {
+	_ = p.WithLease(ctx, func(ctx context.Context, sess leasedef.Session) error {
+		func(cbs ...func()) {
+			n.Go(cbs[0]) // want "禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用"
+		}(func() {
+			_ = sess.Exec(ctx, "nb-l3-index")
+		})
+
+		func(cbs ...func()) {
+			for _, c := range cbs {
+				n.Go(c) // want "禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用"
+			}
+		}(func() {
+			_ = sess.Exec(ctx, "nb-l3-range")
+		})
+
+		func(cbs ...func()) {
+			for _, leakedFnZero = range cbs { // want "禁止将 //xops:borrowed 借用变量逃逸至外层变量或具名返回值"
+			}
+		}(func() {
+			_ = sess.Exec(ctx, "nb-l3-range-outer")
+		})
+
+		func(cbs ...func()) {
+			cbs[0]()
+		}(func() {
+			leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸至外层变量或具名返回值"
+		})
+
+		func(cbs ...func()) {
+			for _, c := range cbs {
+				c()
+			}
+		}(func() {
+			leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸至外层变量或具名返回值"
+		})
+
+		// NB-L3 干净对照：同步索引/遍历变参闭包切片不应误报
+		func(cbs ...func()) {
+			cbs[0]()
+		}(func() {
+			_ = sess.Exec(ctx, "nb-l3-clean-index")
+		})
+
+		func(cbs ...func()) {
+			for _, c := range cbs {
+				c()
+			}
+		}(func() {
+			_ = sess.Exec(ctx, "nb-l3-clean-range")
+		})
+		return nil
+	})
+}
