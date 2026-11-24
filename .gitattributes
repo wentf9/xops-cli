@@ -1,3 +1,15 @@
-# Frozen vectors are hashed as bytes; preserve LF even with core.autocrlf=true.
-/internal/credentialfile/format/testdata/vectors.json text eol=lf
+# 统一跨平台换行符契约：源码与脚本在 Windows core.autocrlf=true 下仍保持 LF（保障 gofmt 与哈希确定性）
+* text=auto eol=lf
+*.go text eol=lf
+*.mod text eol=lf
+*.sum text eol=lf
+*.work text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.mjs text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+Makefile text eol=lf
 *.ps1 text eol=crlf
