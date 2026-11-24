@@ -44,10 +44,21 @@ jobs:
           fi
       - name: Build & self-test xopsvet (GOWORK=off)
         run: |
+          set -eu
           if [ -f tools/xopsvet/go.mod ]; then
+            if grep -rnE '^[[:space:]]*replace([[:space:]]|\()' go.mod core/go.mod tools/xopsvet/go.mod; then
+              echo "ERROR: replace directives are forbidden in go.mod files" >&2
+              exit 1
+            fi
             VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
             mkdir -p bin
-            (cd tools/xopsvet && GOWORK=off go test -race -count=1 ./... && GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet)
+            (
+              cd tools/xopsvet
+              GOWORK=off go test -race -count=1 ./...
+              GOWORK=off go build -o "$VETTOOL" ./cmd/xopsvet
+              GOWORK=off go vet -vettool="$VETTOOL" ./...
+              GOWORK=off golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./...
+            )
           else
             echo "Pre-Phase 0: tools/xopsvet/go.mod not created yet, skipping."
           fi
@@ -68,7 +79,8 @@ jobs:
           fi
       - name: Verify root CLI module (via go.work on branch dev)
         run: |
-          if [ -f tools/xopsvet/go.mod ] && { [ -d cmd/xops ] || [ -d internal ]; }; then
+          set -eu
+          if [ -f tools/xopsvet/go.mod ] && { { [ -d cmd/xops ] && [ -n "$(find cmd/xops -name '*.go' -print -quit)" ]; } || { [ -d internal ] && [ -n "$(find internal -name '*.go' -print -quit)" ]; }; }; then
             VETTOOL="$(pwd)/bin/xopsvet$(go env GOEXE)"
             go build ./... && go vet -vettool="$VETTOOL" ./... && golangci-lint run --max-issues-per-linter=0 --max-same-issues=0 ./... && go test -race -shuffle=on -count=1 ./...
           fi
@@ -133,6 +145,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           go build -o $vettool ./cmd/xopsvet
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go vet "-vettool=$vettool" ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
           Push-Location core
@@ -149,7 +163,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Remove-Item Env:GOWORK -ErrorAction SilentlyContinue
-          if ((Test-Path 'tools\xopsvet\go.mod') -and ((Test-Path 'cmd\xops') -or (Test-Path 'internal'))) {
+          $hasRoot = (((Test-Path 'cmd\xops') -and ($null -ne (Get-ChildItem -Path 'cmd\xops' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1))) -or ((Test-Path 'internal') -and ($null -ne (Get-ChildItem -Path 'internal' -Recurse -Filter '*.go' -ErrorAction SilentlyContinue | Select-Object -First 1))))
+          if ((Test-Path 'tools\xopsvet\go.mod') -and $hasRoot) {
             $vettool = Join-Path (Get-Location) ('bin\xopsvet' + (go env GOEXE))
             go build ./...
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

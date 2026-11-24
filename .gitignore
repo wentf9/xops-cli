@@ -20,3 +20,6 @@ docs/en/reference/commands/
 
 # Python helper/test bytecode
 __pycache__/
+
+# Go workspace checksums generated locally when go.work is active
+go.work.sum

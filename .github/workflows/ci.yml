@@ -113,7 +113,7 @@ jobs:
           go version
           go env GOWORK
           go list -m all
-          if grep -rn 'replace ' go.mod core/go.mod tools/xopsvet/go.mod; then
+          if grep -rnE '^[[:space:]]*replace([[:space:]]|\()' go.mod core/go.mod tools/xopsvet/go.mod; then
             echo "ERROR: replace directives are forbidden in go.mod files" >&2
             exit 1
           fi

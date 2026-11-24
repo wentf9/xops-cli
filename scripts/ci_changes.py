@@ -32,6 +32,7 @@ CORE_EXACT = {
 CROSS_PLATFORM_PREFIXES = (
     "core/osfs/",
     "core/ports/",
+    "core/conc/",
     "core/internal/foundation/",
     "core/internal/sshnet/",
     "core/internal/pool/",

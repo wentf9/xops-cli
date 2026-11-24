@@ -107,11 +107,11 @@ HAS_CORE_DST := $(strip $(wildcard core/internal/pool/*_test.go))
 HAS_CLI_GO  := $(strip $(wildcard cmd/xops/*.go))
 HAS_ROOT_GO := $(strip $(wildcard cmd/xops/*.go internal/*.go internal/*/*.go internal/*/*/*.go internal/*/*/*/*.go internal/*/*/*/*/*.go))
 
-# 注入 LDFLAGS
+# 注入 LDFLAGS（Go 1.27 对 package main 使用 -p main，须绑定 main.<var> 并配合 cmd/xops //xops:buildvar）
 LDFLAGS := -s -w \
-           -X '$(MODULE)/internal/entry/cli.Version=$(VERSION)' \
-           -X '$(MODULE)/internal/entry/cli.Commit=$(COMMIT)' \
-           -X '$(MODULE)/internal/entry/cli.BuildTime=$(DATE)'
+           -X 'main.buildVersion=$(VERSION)' \
+           -X 'main.buildCommit=$(COMMIT)' \
+           -X 'main.buildTime=$(DATE)'
 
 # ==============================================================================
 # 编译命令
@@ -230,11 +230,13 @@ else
 	@echo "Skipping core: core/ has no Go files yet."
 endif
 
+XOPS_DST_SEEDS ?= 10000
 dst: export GOWORK := off
+dst: export XOPS_DST_SEEDS := $(XOPS_DST_SEEDS)
 dst:
 ifneq ($(HAS_CORE_DST),)
-	@echo "Running Deterministic Simulation Tests (DST)..."
-	XOPS_DST_SEEDS=$${XOPS_DST_SEEDS:-10000} $(RUN_TOOL) go -C core test -race -count=1 -run "^TestDST_" ./...
+	@echo "Running Deterministic Simulation Tests (DST, seeds=$(XOPS_DST_SEEDS))..."
+	$(RUN_TOOL) go -C core test -race -count=1 -run "^TestDST_" ./...
 else
 	@echo "Skipping dst: core/internal/pool DST tests not present yet."
 endif

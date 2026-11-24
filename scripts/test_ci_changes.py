@@ -126,7 +126,8 @@ class TestCIChangesClassification(unittest.TestCase):
         # Additional cross platform prefixes and exact matches
         additional_paths = [
             ("core/ports/fs.go", True, True, True),
-            ("core/internal/foundation/conc/nursery.go", True, True, True),
+            ("core/conc/nursery.go", True, True, True),
+            ("core/internal/foundation/actor/dual_actor.go", True, True, True),
             ("core/internal/sshnet/dial/dialer.go", True, True, True),
             ("core/internal/pool/actor.go", True, True, True),
             ("core/internal/gate/gate.go", True, True, True),
@@ -141,7 +142,7 @@ class TestCIChangesClassification(unittest.TestCase):
             ("scripts/ci_changes.py", True, True, True),
             ("scripts/test_ci_changes.py", True, True, True),
             ("core/internal/mcpruntime/journal_windows.go", True, True, True),
-            ("core/internal/foundation/conc/nursery_windows_test.go", True, True, True),
+            ("core/conc/nursery_windows_test.go", True, True, True),
         ]
         for path, exp_code, exp_core, exp_cross in additional_paths:
             with self.subTest(path=path):
