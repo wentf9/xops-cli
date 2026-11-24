@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -275,7 +276,7 @@ func TestNurseryRunScopedIgnoresContextCauseSentinel(t *testing.T) {
 	})
 
 	if err != nil {
-		t.Fatalf("RunScoped error = %v, want nil (must filter errScopeCompleted sentinel)", err)
+		t.Fatalf("RunScoped error = %v, want nil (must filter bare context.Canceled on normal scope completion)", err)
 	}
 }
 
@@ -679,5 +680,92 @@ func TestNurseryExplicitCloseInRunScopedPreservesChildCancelAndPreCancelNotSwall
 	n.mu.Unlock()
 	if got := n.filterExpectedScopeCancel(context.Canceled); !errors.Is(got, context.Canceled) {
 		t.Fatalf("filterExpectedScopeCancel before n.ctx cancel = %v, want context.Canceled", got)
+	}
+}
+
+type customIsCanceledError struct {
+	msg string
+}
+
+func (e customIsCanceledError) Error() string      { return e.msg }
+func (customIsCanceledError) Is(target error) bool { return target == context.Canceled }
+
+func TestNurseryGoexitCleansUpChildren(t *testing.T) {
+	runCase := func(t *testing.T, useScoped bool) {
+		t.Helper()
+		started := make(chan struct{})
+		childExited := make(chan struct{})
+		callerDone := make(chan struct{})
+		go func() {
+			defer close(callerDone)
+			body := func(_ context.Context, n *Nursery) error {
+				if err := n.Go(func(childCtx context.Context) error {
+					close(started)
+					<-childCtx.Done()
+					close(childExited)
+					return childCtx.Err()
+				}); err != nil {
+					return err
+				}
+				<-started
+				runtime.Goexit()
+				return nil
+			}
+			if useScoped {
+				_ = RunScoped(context.Background(), body)
+			} else {
+				_ = RunWait(context.Background(), body)
+			}
+		}()
+		<-callerDone
+		select {
+		case <-childExited:
+		default:
+			t.Fatal("child goroutine leaked after caller exited via runtime.Goexit()")
+		}
+	}
+	t.Run("RunWait", func(t *testing.T) { runCase(t, false) })
+	t.Run("RunScoped", func(t *testing.T) { runCase(t, true) })
+}
+
+func TestNurseryRunScopedPreservesMultiWrapAndCustomIsCancel(t *testing.T) {
+	cases := []struct {
+		name      string
+		makeError func(childCtx context.Context) error
+		wantSub   string
+	}{
+		{
+			name: "fmt_errorf_multi_percent_w",
+			makeError: func(childCtx context.Context) error {
+				return fmt.Errorf("flush failed: %w and %w", childCtx.Err(), context.Cause(childCtx))
+			},
+			wantSub: "flush failed",
+		},
+		{
+			name: "custom_is_canceled_error",
+			makeError: func(context.Context) error {
+				return customIsCanceledError{msg: "custom rollback canceled"}
+			},
+			wantSub: "custom rollback canceled",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			started := make(chan struct{})
+			err := RunScoped(context.Background(), func(_ context.Context, n *Nursery) error {
+				if goErr := n.Go(func(childCtx context.Context) error {
+					close(started)
+					<-childCtx.Done()
+					return tc.makeError(childCtx)
+				}); goErr != nil {
+					return goErr
+				}
+				<-started
+				return nil
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("RunScoped error = %v, want substring %q", err, tc.wantSub)
+			}
+		})
 	}
 }

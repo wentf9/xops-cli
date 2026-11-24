@@ -257,7 +257,9 @@ func (a *DualActor[Req, Ctrl]) step(ctx context.Context) (bool, error) {
 	}
 }
 
-// isShutdown 以确定性优先级检查停机信号：始终优先判定 stopCh（返回 nil），其次判定 ctx.Done()（返回 ctx.Err()）。
+// isShutdown 以确定性优先级检查停机信号：始终优先判定 stopCh（返回 nil）；
+// 若观测到 ctx.Done() 就绪，必须在其后再次复核 stopCh，依托 Go 内存模型保证
+// Stop() happens-before cancel() 时绝无 TOCTOU 窗口误返 context.Canceled。
 func (a *DualActor[Req, Ctrl]) isShutdown(ctx context.Context) (bool, error) {
 	select {
 	case <-a.stopCh:
@@ -266,7 +268,12 @@ func (a *DualActor[Req, Ctrl]) isShutdown(ctx context.Context) (bool, error) {
 	}
 	select {
 	case <-ctx.Done():
-		return true, ctx.Err()
+		select {
+		case <-a.stopCh:
+			return true, nil
+		default:
+			return true, ctx.Err()
+		}
 	default:
 		return false, nil
 	}

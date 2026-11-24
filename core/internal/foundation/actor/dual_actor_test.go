@@ -763,8 +763,8 @@ func driveControlStopDuringAcquire(
 	}
 	<-firstStarted
 
-	// 先入队 req-1/req-2，再在控制队列放入 halt-stop；放行后无论 step 先选中 acquireCh 还是 controlReady，
-	// req-1 与 req-2 均绝不可进入普通 OnRequest，且必须在 OnDrainRequest 中保持严格 FIFO 顺序。
+	// 先入队 req-1/req-2，再在控制队列放入 halt-stop；放行后阶段 1 控制排空或阶段 2 acquireCh 复核
+	// 均保证 req-1 与 req-2 绝不进入普通 OnRequest，且在 OnDrainRequest 中保持严格 FIFO 顺序。
 	for _, r := range []string{"req-1", "req-2"} {
 		if sendErr := a.SendAcquire(ctx, r); sendErr != nil {
 			return sendErr
@@ -805,6 +805,69 @@ func assertStringSliceEqual(t *testing.T, label string, got, want []string) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("%s[%d] = %q, want %q (full=%v)", label, i, got[i], want[i], got)
+		}
+	}
+}
+
+func TestDualActorDrainAndStopWithPendingPreservesStrictFIFO(t *testing.T) {
+	var controls, drained []string
+	a, err := NewDualActor(DualActorConfig[string, string]{
+		AcquireBuffer: 4,
+		OnRequest:     func(string) { t.Error("unexpected OnRequest during drainAndStopWithPending") },
+		OnControl:     func(c string) { controls = append(controls, c) },
+		OnDrainRequest: func(r string) {
+			drained = append(drained, r)
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewDualActor failed: %v", err)
+	}
+	a.acquireCh <- "req-1"
+	a.acquireCh <- "req-2"
+	if !a.SendControl("ctrl-final") {
+		t.Fatal("SendControl failed")
+	}
+	a.drainAndStopWithPending("req-0")
+	assertStringSliceEqual(t, "controls", controls, []string{"ctrl-final"})
+	assertStringSliceEqual(t, "drained", drained, []string{"req-0", "req-1", "req-2"})
+}
+
+func TestDualActorStage2CtxDoneHonorsStopChPriority(t *testing.T) {
+	for range 32 {
+		processed := make(chan struct{})
+		a, err := NewDualActor(DualActorConfig[int, int]{
+			AcquireBuffer: 1,
+			OnRequest: func(int) {
+				close(processed)
+			},
+			OnControl: func(int) {},
+		})
+		if err != nil {
+			t.Fatalf("NewDualActor failed: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		runErr := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+			if goErr := n.Go(func(context.Context) error {
+				errCh <- a.Run(ctx)
+				return nil
+			}); goErr != nil {
+				return goErr
+			}
+			// 先同步等待一条请求被 OnRequest 处理完以确保 Actor 正在运行，再严格按 Stop() -> cancel() 序触发停机。
+			if sendErr := a.SendAcquire(ctx, 1); sendErr != nil {
+				return sendErr
+			}
+			<-processed
+			a.Stop()
+			cancel()
+			return nil
+		})
+		if runErr != nil {
+			t.Fatalf("RunWait failed: %v", runErr)
+		}
+		if got := <-errCh; got != nil {
+			t.Fatalf("Run error after Stop()+cancel() = %v, want nil", got)
 		}
 	}
 }

@@ -174,7 +174,14 @@ func RunScoped(ctx context.Context, fn func(ctx context.Context, n *Nursery) err
 }
 
 func (n *Nursery) runWaitScope(fn func(ctx context.Context, n *Nursery) error) error {
+	completed := false
+	defer func() {
+		if !completed {
+			_ = n.Close()
+		}
+	}()
 	fnErr, panicked := n.invokeScope(fn)
+	completed = true
 	if panicked {
 		return n.Close()
 	}
@@ -187,7 +194,14 @@ func (n *Nursery) runWaitScope(fn func(ctx context.Context, n *Nursery) error) e
 }
 
 func (n *Nursery) runScoped(fn func(ctx context.Context, n *Nursery) error) error {
+	completed := false
+	defer func() {
+		if !completed {
+			_ = n.Close()
+		}
+	}()
 	fnErr, panicked := n.invokeScope(fn)
+	completed = true
 	if panicked {
 		return n.Close()
 	}
@@ -309,15 +323,17 @@ func nonScopeCancelLeaf(err error) error {
 	if multi, ok := errors.AsType[multiUnwrapper](err); ok {
 		return checkMultiScopeCancel(err, multi.Unwrap())
 	}
-	// 裸叶子错误：使用 errors.Is 满足 errorlint，且因已废除私有哨兵，仅需匹配标准 context.Canceled。
-	if errors.Is(err, context.Canceled) {
+	// 裸叶子错误：既要求 errors.Is 匹配标准 context.Canceled，又要求错误文本完全一致，
+	// 防止携带自定义业务文案且实现 Is(context.Canceled) 的真实故障被静默吞噬（CORE-2）。
+	if errors.Is(err, context.Canceled) && err.Error() == context.Canceled.Error() {
 		return nil
 	}
 	return err
 }
 
 func checkMultiScopeCancel(orig error, errs []error) error {
-	if len(errs) == 0 {
+	// 仅放行与纯 errors.Join 文本完全一致的无附加语义组合，拒绝吞噬多 %w fmt.Errorf 或自定义多错误（CORE-2）。
+	if len(errs) == 0 || orig.Error() != errors.Join(errs...).Error() {
 		return orig
 	}
 	for _, sub := range errs {
