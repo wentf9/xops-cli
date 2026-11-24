@@ -179,7 +179,7 @@ func analyzeFuncParams(
 	for fieldIdx, f := range fl.List {
 		count := max(len(f.Names), 1)
 		fieldHasBorrowed := vetutil.ParamFieldHasDirective(pass.Fset, comments, fl, fieldIdx, vetutil.DirectiveBorrowed)
-		if ft, isFunc := ast.Unparen(f.Type).(*ast.FuncType); isFunc {
+		if ft, isFunc := unwrapParamFuncType(f.Type); isFunc {
 			inner := collectInnerBorrowedIndices(pass.Fset, pass.TypesInfo, comments, ft.Params, outerBorrowed || fieldHasBorrowed)
 			recordCallbackBorrowed(cbBorrowed, paramIdx, count, inner)
 		} else if fieldHasBorrowed {
@@ -191,6 +191,17 @@ func analyzeFuncParams(
 		return nil, directBorrowed
 	}
 	return cbBorrowed, directBorrowed
+}
+
+// unwrapParamFuncType 解引用形参类型外层的括号与可变参数省略号（...func(...)），
+// 返回底层的函数签名 AST 节点。
+func unwrapParamFuncType(expr ast.Expr) (*ast.FuncType, bool) {
+	e := ast.Unparen(expr)
+	if ell, ok := e.(*ast.Ellipsis); ok {
+		e = ast.Unparen(ell.Elt)
+	}
+	ft, ok := e.(*ast.FuncType)
+	return ft, ok && ft != nil
 }
 
 func recordCallbackBorrowed(cbBorrowed map[int][]int, start, count int, inner []int) {
@@ -338,10 +349,7 @@ func resolveCallLeaseSpec(pass *analysis.Pass, idx *factIndex, call *ast.CallExp
 	calleeObj := vetutil.ResolveCalledObject(pass.TypesInfo, call)
 	if fn, ok := calleeObj.(*types.Func); ok && fn != nil {
 		if f, found := idx.lookupFuncFact(pass, fn); found {
-			spec.syncClosure = f.SyncClosure
-			for k, v := range f.CallbackBorrowed {
-				spec.callbackBorrowed[k] = slices.Clone(v)
-			}
+			applyFuncFactToSpec(fn, f, len(call.Args), &spec)
 		}
 		if fn.Name() == "Use" || strings.HasPrefix(fn.Name(), "With") {
 			spec.syncClosure = true
@@ -353,6 +361,27 @@ func resolveCallLeaseSpec(pass *analysis.Pass, idx *factIndex, call *ast.CallExp
 	}
 	mergeInlineFuncLitDirectives(pass, idx, call, &spec)
 	return spec
+}
+
+// applyFuncFactToSpec 将导出事实中的回调借用契约写入调用规格；
+// 若目标函数为可变参数且末尾形参为回调函数，则将末尾回调契约展开至全部可变实参位。
+func applyFuncFactToSpec(fn *types.Func, f borrowedFuncFact, argCount int, spec *callLeaseSpec) {
+	spec.syncClosure = f.SyncClosure
+	for k, v := range f.CallbackBorrowed {
+		spec.callbackBorrowed[k] = slices.Clone(v)
+	}
+	sig, ok := fn.Type().Underlying().(*types.Signature)
+	if !ok || !sig.Variadic() || sig.Params() == nil || sig.Params().Len() == 0 {
+		return
+	}
+	varIdx := sig.Params().Len() - 1
+	varBorrowed := f.CallbackBorrowed[varIdx]
+	if len(varBorrowed) == 0 {
+		return
+	}
+	for i := varIdx; i < argCount; i++ {
+		spec.callbackBorrowed[i] = mergeIntSlices(spec.callbackBorrowed[i], varBorrowed)
+	}
 }
 
 func mergeParamTypeFacts(pass *analysis.Pass, idx *factIndex, fn *types.Func, argCount int, spec *callLeaseSpec) {

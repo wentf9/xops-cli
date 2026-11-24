@@ -56,6 +56,10 @@ func ParseCommentLines(c *ast.Comment) []string {
 		if after, ok := strings.CutPrefix(trimmed, "*"); ok {
 			trimmed = strings.TrimSpace(after)
 		}
+		// 块注释内的 /* //xops:... */ 与 /* xops:... */ 等价；// 行注释分支已提前返回，故 // //xops:... 仍视为普通注释。
+		if strings.HasPrefix(trimmed, "//xops:") {
+			trimmed = strings.TrimPrefix(trimmed, "//")
+		}
 		lines = append(lines, trimmed)
 	}
 	return lines
@@ -198,6 +202,16 @@ func ParamFieldHasDirective(
 	return paramCommentsHaveDirective(fset, comments, fl, idx, kind)
 }
 
+type paramCommentWindow struct {
+	prevEnd      token.Pos
+	nextPos      token.Pos
+	prevEndLine  int
+	startLine    int
+	endLine      int
+	sameLinePrev bool
+	sameLineNext bool
+}
+
 func paramCommentsHaveDirective(
 	fset *token.FileSet,
 	comments []*ast.CommentGroup,
@@ -218,37 +232,40 @@ func paramCommentsHaveDirective(
 	prevEndLine := fset.Position(prevEnd).Line
 	startLine := fset.Position(f.Pos()).Line
 	endLine := fset.Position(f.End()).Line
-	sameLineNext := hasNextField && fset.Position(nextPos).Line == endLine
-
+	win := paramCommentWindow{
+		prevEnd:      prevEnd,
+		nextPos:      nextPos,
+		prevEndLine:  prevEndLine,
+		startLine:    startLine,
+		endLine:      endLine,
+		sameLinePrev: idx > 0 && prevEndLine == startLine,
+		sameLineNext: hasNextField && fset.Position(nextPos).Line == endLine,
+	}
 	for _, cg := range comments {
-		if !HasDirective(cg, kind) {
-			continue
-		}
-		if matchesParamComment(fset, cg, f, prevEnd, nextPos, prevEndLine, startLine, endLine, sameLineNext) {
+		if HasDirective(cg, kind) && matchesParamComment(fset, cg, f, win) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchesParamComment(
-	fset *token.FileSet,
-	cg *ast.CommentGroup,
-	f *ast.Field,
-	prevEnd, nextPos token.Pos,
-	prevEndLine, startLine, endLine int,
-	sameLineNext bool,
-) bool {
-	if cg.End() < f.Pos() && cg.Pos() > prevEnd && fset.Position(cg.Pos()).Line > prevEndLine {
+func matchesParamComment(fset *token.FileSet, cg *ast.CommentGroup, f *ast.Field, w paramCommentWindow) bool {
+	if cg.Pos() > w.prevEnd && cg.End() < f.Pos() && fset.Position(cg.Pos()).Line > w.prevEndLine {
 		return true
 	}
-	if cg.End() <= f.Pos() && cg.Pos() > prevEnd && fset.Position(cg.End()).Line == startLine {
-		return len(cg.List) > 0 && strings.HasPrefix(cg.List[0].Text, "/*")
+	if isBlockCommentGroup(cg) && cg.Pos() >= w.prevEnd && cg.End() <= f.Pos() && fset.Position(cg.End()).Line == w.startLine {
+		// 同行前导块注释（如 s S, /* //xops:borrowed */ other）距当前形参更近，防止误归属于前参尾注释。
+		return !w.sameLinePrev || (f.Pos()-cg.End()) < (cg.Pos()-w.prevEnd)
 	}
-	if cg.Pos() > f.End() && cg.End() <= nextPos && fset.Position(cg.Pos()).Line == endLine {
-		return !sameLineNext
+	if cg.Pos() >= f.End() && cg.End() <= w.nextPos && fset.Position(cg.Pos()).Line == w.endLine {
+		// 同行尾随块注释（如 s S /* //xops:borrowed */, other）位于逗号前，距当前形参尾部更近。
+		return !w.sameLineNext || (isBlockCommentGroup(cg) && (cg.Pos()-f.End()) < (w.nextPos-cg.End()))
 	}
 	return false
+}
+
+func isBlockCommentGroup(cg *ast.CommentGroup) bool {
+	return len(cg.List) > 0 && strings.HasPrefix(cg.List[0].Text, "/*")
 }
 
 // HasNolintComment 判断单条 AST 注释是否为 golangci-lint 的 //nolint 指令。

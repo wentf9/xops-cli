@@ -12,6 +12,9 @@ func okDialAuth(box *secret.SecretBox, expected []byte) (*ssh.ClientConfig, ssh.
 	var signer ssh.Signer
 	err := box.Use(func(plain []byte) error {
 		_ = subtle.ConstantTimeCompare(plain, expected)
+		localBuf := make([]byte, len(plain)+4)
+		copy(localBuf[1:], plain)
+		clear(localBuf)
 		cfg = &ssh.ClientConfig{
 			User: "ops",
 			Auth: []ssh.AuthMethod{

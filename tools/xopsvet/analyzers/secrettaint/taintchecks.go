@@ -37,22 +37,12 @@ func (s *taintState) checkCall(call *ast.CallExpr) {
 	if isExemptBuiltinCall(s.pass.TypesInfo, call) || isExemptPredicateCall(s.pass.TypesInfo, call) {
 		return
 	}
-	if isCopyBuiltin(s.pass.TypesInfo, call) && len(call.Args) == 2 && s.exprIsTainted(call.Args[1]) {
-		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 copy 将明文机密写入外层变量或字段")
-		return
-	}
-	if isAppendBuiltin(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.argsContainTaint(call.Args[1:]) {
-		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 append 将明文机密写入外层变量或字段")
-		return
-	}
-	if isBufferOrBuilderWriteMethod(s.pass.TypesInfo, call) && s.argsContainTaint(call.Args) {
-		if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
-			s.checkMutationDestEscape(sel.X, "secrettaint: 禁止将明文机密写入外层缓冲")
-		}
+	if s.checkSpecialCallLeak(call) {
 		return
 	}
 	kind := classifyRule2SinkCall(s.pass.TypesInfo, call)
 	if kind == sinkNone {
+		s.checkFuncLitCallArgs(call)
 		return
 	}
 	for _, arg := range call.Args {
@@ -62,13 +52,91 @@ func (s *taintState) checkCall(call *ast.CallExpr) {
 	}
 }
 
+func (s *taintState) checkSpecialCallLeak(call *ast.CallExpr) bool {
+	if isCopyBuiltin(s.pass.TypesInfo, call) && len(call.Args) == 2 && s.exprIsTainted(call.Args[1]) {
+		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 copy 将明文机密写入外层变量或字段")
+		return true
+	}
+	if isAppendBuiltin(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.argsContainTaint(call.Args[1:]) {
+		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 append 将明文机密写入外层变量或字段")
+		return true
+	}
+	if isFmtAppendCall(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.argsContainTaint(call.Args[1:]) {
+		s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 fmt.Append 将明文机密写入外层变量或字段")
+		return true
+	}
+	return s.checkBufferMethodLeak(call)
+}
+
+func (s *taintState) checkBufferMethodLeak(call *ast.CallExpr) bool {
+	sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	if isBufferOrBuilderWriteMethod(s.pass.TypesInfo, call) {
+		if s.argsContainTaint(call.Args) {
+			s.checkMutationDestEscape(sel.X, "secrettaint: 禁止将明文机密写入外层缓冲")
+		}
+		return true
+	}
+	if isBufferOrReaderWriteToMethod(s.pass.TypesInfo, call) {
+		if s.exprIsTainted(sel.X) {
+			s.reportLeak(call, "secrettaint: 禁止通过 WriteTo 导出明文缓冲或读取器内容")
+		}
+		return true
+	}
+	if isBufferOrReaderReadIntoMethod(s.pass.TypesInfo, call) && len(call.Args) >= 1 {
+		if s.exprIsTainted(sel.X) {
+			s.checkMutationDestEscape(call.Args[0], "secrettaint: 禁止通过 Read 将明文机密写入外层变量或字段")
+		}
+		return true
+	}
+	return false
+}
+
+// checkFuncLitCallArgs 对直接传入明文污点实参的局部闭包调用或 IIFE 进行参数到形参的递归污点追踪。
+func (s *taintState) checkFuncLitCallArgs(call *ast.CallExpr) {
+	lit := resolveCallbackLit(s.pass.TypesInfo, call.Fun, s.localLits)
+	if lit == nil || lit.Body == nil || lit.Type == nil || s.activeLits[lit] {
+		return
+	}
+	seeds := s.taintedCallArgParamVars(call, lit)
+	if len(seeds) == 0 {
+		return
+	}
+	s.activeLits[lit] = true
+	defer delete(s.activeLits, lit)
+	runTaintAnalysisWithState(
+		s.pass, s.facts, s.pkgIdx, lit.Body,
+		s.pass.TypesInfo.Scopes[lit.Type], seeds,
+		lit.Type.Results, s.reported, s.activeLits,
+	)
+}
+
+func (s *taintState) taintedCallArgParamVars(call *ast.CallExpr, lit *ast.FuncLit) []*types.Var {
+	paramVars, isVariadic := flattenParamVars(s.pass.TypesInfo, lit.Type.Params)
+	if len(paramVars) == 0 {
+		return nil
+	}
+	var seeds []*types.Var
+	for i, arg := range call.Args {
+		if !s.exprContainsTainted(arg) {
+			continue
+		}
+		if pVar := paramVarAt(paramVars, isVariadic, i); pVar != nil {
+			seeds = append(seeds, pVar)
+		}
+	}
+	return seeds
+}
+
 func (s *taintState) checkMutationDestEscape(dst ast.Expr, msg string) {
-	switch d := ast.Unparen(dst).(type) {
+	switch d := unwrapSliceBaseExpr(s.pass.TypesInfo, dst).(type) {
 	case *ast.CallExpr, *ast.CompositeLit:
 		// 诸如 append([]byte(nil), plain...) 或 append(make([]byte, 0), plain...) 属于新建局部切片，本身不逃逸。
 		return
 	case *ast.Ident:
-		if d.Name == "_" {
+		if d.Name == "_" || isNilIdent(s.pass.TypesInfo, d) {
 			return
 		}
 		v := lookupVar(s.pass.TypesInfo, d)
@@ -80,7 +148,21 @@ func (s *taintState) checkMutationDestEscape(dst ast.Expr, msg string) {
 	}
 }
 
+func isNilIdent(info *types.Info, id *ast.Ident) bool {
+	if info == nil || id == nil || id.Name != "nil" {
+		return false
+	}
+	_, ok := info.Uses[id].(*types.Nil)
+	return ok
+}
+
 func (s *taintState) checkAssign(stmt *ast.AssignStmt) {
+	if len(stmt.Lhs) == 2 && len(stmt.Rhs) == 1 {
+		if ta, ok := ast.Unparen(stmt.Rhs[0]).(*ast.TypeAssertExpr); ok && ta.Type != nil {
+			s.checkAssignPair(stmt.Lhs[0], ta)
+			return
+		}
+	}
 	if len(stmt.Lhs) != len(stmt.Rhs) {
 		return
 	}

@@ -32,3 +32,5 @@ type TaggedStruct struct {
 type NonStructErr []*secret.SecretBox // want "禁止 secret.SecretBox 进入 error 实现或 //xops:dto 类型"
 
 func (NonStructErr) Error() string { return "slice-err" }
+
+type PlanBox *secret.SecretBox // want "禁止 secret.SecretBox 进入 Event/Audit/Plan/Error/受限类型"

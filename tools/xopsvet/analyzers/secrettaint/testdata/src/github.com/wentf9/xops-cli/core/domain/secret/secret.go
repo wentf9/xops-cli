@@ -5,6 +5,8 @@ type SecretBox struct {
 	wiped bool
 }
 
+type CleanBoxSlice []*SecretBox
+
 //xops:secretuse
 func (b *SecretBox) Use(fn func(plain []byte) error) error { // want Use:"secretuse"
 	if b.wiped {

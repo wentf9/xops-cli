@@ -21,12 +21,15 @@ type Holder struct {
 	S leasedef.Session
 }
 
+type myFunc func()
+
 var (
 	leakedSess   leasedef.Session
 	leakedCloser Closer
 	leakedBox    *leasedef.SecretBox
 	leakedReader leasedef.Reader
 	leakedFn     func() error
+	leakedFnZero func()
 	leakedAny    any
 	leakedSlice  []leasedef.Session
 	sessChan     chan leasedef.Session
@@ -72,6 +75,16 @@ func okNestedBracketAndShadowing(ctx context.Context, p leasedef.Pool, v leasede
 				return err
 			}
 			defer localFn()
+			fnOkOrig := func() error {
+				return sess.Exec(ctx, "ok-alias")
+			}
+			fnOkAlias := fnOkOrig
+			leasedef.RunSync(func() {
+				_ = fnOkAlias()
+			})
+			func(x leasedef.Session) {
+				_ = x.Exec(ctx, "iife-clean")
+			}(sess)
 
 			return v.WithSecret(ctx, "k", func(box *leasedef.SecretBox) error {
 				// 参数同名遮蔽不应引起误报
@@ -228,4 +241,100 @@ func badNamedCallbackBody(ctx context.Context) {
 		leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
 		return nil
 	})
+}
+
+func badBypassL1TypeAssertAndWrap(ctx context.Context, p leasedef.Pool, n Nursery) {
+	_ = p.WithLease(ctx, func(ctx context.Context, sess leasedef.Session) error {
+		var fAny any = func() {
+			_ = sess.Exec(ctx, "any")
+		}
+		n.Go(fAny.(func()))          // want "禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用"
+		leakedFnZero = fAny.(func()) // want "禁止将 //xops:borrowed 借用变量逃逸"
+		n.Go(myFunc(func() {         // want "禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用"
+			_ = sess.Close()
+		}))
+		n.Go(any(sess.Close).(func())) // want "禁止将 //xops:borrowed 接收者的未调用方法值转存或逃逸"
+		_ = func() func() {
+			return fAny.(func()) // want "禁止通过 return 返回 //xops:borrowed 借用变量"
+		}()
+		return nil
+	})
+}
+
+func badBypassL3ClosureAliasChain(ctx context.Context, p leasedef.Pool) {
+	_ = p.WithLease(ctx, func(ctx context.Context, sess leasedef.Session) error {
+		fnOrig := func() {
+			leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
+		}
+		fnAlias := fnOrig
+		leasedef.RunSync(fnAlias)
+
+		// 6 跳逆序局部闭包别名链测试（验证 >4 轮不动点收敛）
+		var a1, a2, a3, a4, a5, a6 func()
+		a6 = a5
+		a5 = a4
+		a4 = a3
+		a3 = a2
+		a2 = a1
+		a1 = func() {
+			leakedSess = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
+		}
+		fnConv := myFunc(a6)
+		leasedef.RunSync(fnConv)
+		return nil
+	})
+}
+
+func badBypassL5AndChallenge1IIFE(ctx context.Context, p leasedef.Pool) {
+	_ = p.WithLease(ctx, func(ctx context.Context, sess leasedef.Session) error {
+		inlineBorrowed := func(
+			//xops:borrowed
+			s leasedef.Session,
+		) {
+			leakedSess = s // want "禁止将 //xops:borrowed 借用变量逃逸"
+		}
+		inlineBorrowed(sess)
+
+		func(
+			//xops:borrowed
+			s leasedef.Session,
+		) {
+			leakedSess = s // want "禁止将 //xops:borrowed 借用变量逃逸"
+		}(sess)
+
+		func(x leasedef.Session) {
+			leakedSess = x // want "禁止将 //xops:borrowed 借用变量逃逸"
+		}(sess)
+		return nil
+	})
+}
+
+func badBypassL4SliceRange(ctx context.Context, p leasedef.Pool) {
+	_ = p.WithSliceLease(ctx, func(ctx context.Context, hs []leasedef.Session) error {
+		for _, h := range hs {
+			_ = h
+		}
+		for _, leakedSess = range hs { // want "禁止将 //xops:borrowed 借用变量逃逸"
+		}
+		return nil
+	})
+}
+
+func badBypassL7Copy(
+	//xops:borrowed
+	src []leasedef.Session,
+) {
+	copy(leakedSlice, src) // want "禁止通过 copy 将 //xops:borrowed 借用变量逃逸"
+	localBuf := make([]leasedef.Session, len(src))
+	copy(localBuf[0:], src)
+	localEscape := make([]leasedef.Session, len(src))
+	copy(localEscape, src)
+	leakedSlice = localEscape // want "禁止将 //xops:borrowed 借用变量逃逸"
+}
+
+func badVariadicCallbacks() {
+	leasedef.WithVariadic(
+		func(s leasedef.Session) { _ = s.Close() },
+		func(s leasedef.Session) { leakedSess = s }, // want "禁止将 //xops:borrowed 借用变量逃逸"
+	)
 }

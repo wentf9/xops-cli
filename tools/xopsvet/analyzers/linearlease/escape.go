@@ -9,6 +9,9 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
+// maxAliasIters 限制局部借用别名、闭包引用与 range 传播的最大不动点迭代轮次。
+const maxAliasIters = 32
+
 type taintedClosureInfo struct {
 	lit        *ast.FuncLit
 	ownerScope *types.Scope
@@ -19,7 +22,7 @@ type closureState struct {
 	facts           *factIndex
 	borrowed        map[*types.Var]*types.Scope
 	resultVars      map[*types.Var]bool
-	localFuncLits   map[*types.Var]*ast.FuncLit
+	localFuncLits   map[*types.Var][]*ast.FuncLit
 	taintedClosures map[*types.Var]taintedClosureInfo
 	syncLits        map[*ast.FuncLit][]int
 	deferCalls      map[*ast.CallExpr]bool
@@ -97,7 +100,7 @@ func newClosureState(
 		facts:           facts,
 		borrowed:        make(map[*types.Var]*types.Scope),
 		resultVars:      make(map[*types.Var]bool),
-		localFuncLits:   make(map[*types.Var]*ast.FuncLit),
+		localFuncLits:   make(map[*types.Var][]*ast.FuncLit),
 		taintedClosures: make(map[*types.Var]taintedClosureInfo),
 		syncLits:        make(map[*ast.FuncLit][]int),
 		deferCalls:      make(map[*ast.CallExpr]bool),
@@ -135,11 +138,22 @@ func (s *closureState) collectResultVars(ft *ast.FuncType) {
 }
 
 func flattenFieldVars(info *types.Info, fl *ast.FieldList) []*types.Var {
+	vars, _ := flattenFieldVarsWithVariadic(info, fl)
+	return vars
+}
+
+func flattenFieldVarsWithVariadic(info *types.Info, fl *ast.FieldList) ([]*types.Var, bool) {
 	if fl == nil {
-		return nil
+		return nil, false
 	}
 	var vars []*types.Var
-	for _, f := range fl.List {
+	isVariadic := false
+	for i, f := range fl.List {
+		if i == len(fl.List)-1 {
+			if _, ok := ast.Unparen(f.Type).(*ast.Ellipsis); ok {
+				isVariadic = true
+			}
+		}
 		if len(f.Names) == 0 {
 			vars = append(vars, nil)
 			continue
@@ -149,20 +163,22 @@ func flattenFieldVars(info *types.Info, fl *ast.FieldList) []*types.Var {
 			vars = append(vars, v)
 		}
 	}
-	return vars
+	return vars, isVariadic
 }
 
 func (s *closureState) analyzeSyncTree(root *ast.BlockStmt) {
 	s.collectSpecialCalls(root)
-	// 最多执行 4 轮不动点迭代，覆盖同步嵌套、局部变量别名、类型断言与本地闭包传播。
-	for range 4 {
+	// 最多执行 32 轮不动点迭代，覆盖深层变量别名链、本地闭包重赋值、类型断言与 range/copy 传播。
+	for range maxAliasIters {
+		prevBorrowed := len(s.borrowed)
+		prevTainted := len(s.taintedClosures)
 		changed := false
 		s.walkSyncBody(root, func(n ast.Node) {
 			if s.propagateNode(n) {
 				changed = true
 			}
 		})
-		if !changed {
+		if !changed && len(s.borrowed) == prevBorrowed && len(s.taintedClosures) == prevTainted {
 			break
 		}
 	}
@@ -217,13 +233,23 @@ func (s *closureState) walkSyncBodySeen(body *ast.BlockStmt, seenInWalk map[*ast
 		return true
 	})
 	for _, lit := range enterQueue {
-		s.visitedLits[lit] = true
+		s.enterSyncFuncLit(lit, seenInWalk, visit)
+	}
+}
+
+func (s *closureState) enterSyncFuncLit(lit *ast.FuncLit, seenInWalk map[*ast.BlockStmt]bool, visit func(ast.Node)) {
+	s.visitedLits[lit] = true
+	if lit.Type != nil {
+		comments := s.facts.commentsFor(s.pass.Fset, lit.Pos())
+		if explicit := collectExplicitParamIndices(s.pass.Fset, comments, lit.Type.Params, vetutil.DirectiveBorrowed); len(explicit) > 0 {
+			s.seedParamsFromFuncType(lit.Type, explicit)
+		}
 		if indices := s.syncLits[lit]; len(indices) > 0 {
 			s.seedParamsFromFuncType(lit.Type, indices)
 		}
 		s.collectResultVars(lit.Type)
-		s.walkSyncBodySeen(lit.Body, seenInWalk, visit)
 	}
+	s.walkSyncBodySeen(lit.Body, seenInWalk, visit)
 }
 
 func (s *closureState) discoverSyncCallLits(call *ast.CallExpr) []*ast.FuncLit {
@@ -231,262 +257,101 @@ func (s *closureState) discoverSyncCallLits(call *ast.CallExpr) []*ast.FuncLit {
 		return nil
 	}
 	spec := resolveCallLeaseSpec(s.pass, s.facts, call, s.deferCalls[call])
-	var lits []*ast.FuncLit
-	if funLit, ok := ast.Unparen(call.Fun).(*ast.FuncLit); ok {
+	funLits := s.resolveArgFuncLits(call.Fun)
+	lits := make([]*ast.FuncLit, 0, len(funLits))
+	for _, funLit := range funLits {
+		s.seedCallArgsToFuncLit(funLit, call.Args)
 		lits = append(lits, funLit)
+	}
+	if _, isDirectIIFE := ast.Unparen(call.Fun).(*ast.FuncLit); isDirectIIFE {
 		return lits
 	}
-	if id, ok := ast.Unparen(call.Fun).(*ast.Ident); ok {
-		if v, ok := s.pass.TypesInfo.Uses[id].(*types.Var); ok {
-			if lit := s.localFuncLits[v]; lit != nil {
-				lits = append(lits, lit)
-			}
-		}
+	if len(funLits) > 0 {
+		spec.syncClosure = true
 	}
 	if !spec.syncClosure {
 		return lits
 	}
 	for i, arg := range call.Args {
-		lit := s.resolveArgFuncLit(arg)
-		if lit == nil {
-			continue
-		}
-		if indices := spec.callbackBorrowed[i]; len(indices) > 0 {
-			s.syncLits[lit] = mergeIntSlices(s.syncLits[lit], indices)
-		}
-		lits = append(lits, lit)
+		lits = s.collectSyncArgLits(arg, spec.callbackBorrowed[i], lits)
 	}
 	return lits
 }
 
-func (s *closureState) resolveArgFuncLit(arg ast.Expr) *ast.FuncLit {
-	e := ast.Unparen(arg)
-	if lit, ok := e.(*ast.FuncLit); ok {
-		return lit
-	}
-	if id, ok := e.(*ast.Ident); ok {
-		if v, ok := s.pass.TypesInfo.Uses[id].(*types.Var); ok {
-			return s.localFuncLits[v]
+func (s *closureState) collectSyncArgLits(arg ast.Expr, indices []int, dst []*ast.FuncLit) []*ast.FuncLit {
+	for _, lit := range s.resolveArgFuncLits(arg) {
+		if len(indices) > 0 {
+			s.syncLits[lit] = mergeIntSlices(s.syncLits[lit], indices)
 		}
+		dst = append(dst, lit)
 	}
-	return nil
+	return dst
 }
 
-func (s *closureState) propagateNode(n ast.Node) bool {
-	switch stmt := n.(type) {
-	case *ast.AssignStmt:
-		return s.propagateAssign(stmt)
-	case *ast.ValueSpec:
-		return s.propagateValueSpec(stmt)
-	case *ast.RangeStmt:
-		return s.propagateRange(stmt)
-	case *ast.TypeSwitchStmt:
-		return s.propagateTypeSwitch(stmt)
-	default:
-		return false
+// seedCallArgsToFuncLit 将直接调用（IIFE 或本地闭包变量）传入的借用实参约束绑定到对应形参。
+func (s *closureState) seedCallArgsToFuncLit(lit *ast.FuncLit, args []ast.Expr) {
+	if lit == nil || lit.Type == nil || lit.Type.Params == nil || len(args) == 0 {
+		return
 	}
-}
-
-func (s *closureState) propagateAssign(stmt *ast.AssignStmt) bool {
-	if stmt.Tok != token.ASSIGN && stmt.Tok != token.DEFINE {
-		return false
+	litScope := s.pass.TypesInfo.Scopes[lit.Type]
+	if litScope == nil {
+		return
 	}
-	if len(stmt.Lhs) == 2 && len(stmt.Rhs) == 1 {
-		if ta, ok := ast.Unparen(stmt.Rhs[0]).(*ast.TypeAssertExpr); ok {
-			return s.propagateSinglePair(stmt.Lhs[0], ta.X)
-		}
+	paramVars, isVariadic := flattenFieldVarsWithVariadic(s.pass.TypesInfo, lit.Type.Params)
+	if len(paramVars) == 0 {
+		return
 	}
-	if len(stmt.Lhs) != len(stmt.Rhs) {
-		return false
-	}
-	changed := false
-	for i := range stmt.Lhs {
-		if s.propagateSinglePair(stmt.Lhs[i], stmt.Rhs[i]) {
-			changed = true
-		}
-	}
-	return changed
-}
-
-func (s *closureState) propagateValueSpec(vs *ast.ValueSpec) bool {
-	if len(vs.Names) != len(vs.Values) {
-		return false
-	}
-	changed := false
-	for i := range vs.Names {
-		if s.propagateSinglePair(vs.Names[i], vs.Values[i]) {
-			changed = true
-		}
-	}
-	return changed
-}
-
-func (s *closureState) propagateSinglePair(lhs, rhs ast.Expr) bool {
-	lhsVar := s.lhsIdentVar(lhs)
-	if lhsVar == nil {
-		return false
-	}
-	if lit, ok := ast.Unparen(rhs).(*ast.FuncLit); ok {
-		return s.recordLocalFuncLit(lhsVar, lit)
-	}
-	if rhsScope, ok := s.exprBorrowedScope(rhs); ok {
-		return s.addBorrowedVar(lhsVar, rhsScope)
-	}
-	if info, ok := s.exprTaintedClosure(rhs); ok {
-		return s.addTaintedClosureVar(lhsVar, info)
-	}
-	return false
-}
-
-func (s *closureState) recordLocalFuncLit(lhsVar *types.Var, lit *ast.FuncLit) bool {
-	changed := false
-	if s.localFuncLits[lhsVar] != lit {
-		s.localFuncLits[lhsVar] = lit
-		changed = true
-	}
-	capScope := s.capturedBorrowedScope(lit)
-	if capScope == nil {
-		return changed
-	}
-	if _, exists := s.taintedClosures[lhsVar]; !exists {
-		s.taintedClosures[lhsVar] = taintedClosureInfo{lit: lit, ownerScope: capScope}
-		changed = true
-	}
-	return changed
-}
-
-func (s *closureState) addBorrowedVar(v *types.Var, scope *types.Scope) bool {
-	if v == nil || !isDeclaredWithinScope(v, scope) || s.resultVars[v] {
-		return false
-	}
-	if _, exists := s.borrowed[v]; exists {
-		return false
-	}
-	s.borrowed[v] = scope
-	return true
-}
-
-func (s *closureState) addTaintedClosureVar(v *types.Var, info taintedClosureInfo) bool {
-	if v == nil || !isDeclaredWithinScope(v, info.ownerScope) || s.resultVars[v] {
-		return false
-	}
-	if _, exists := s.taintedClosures[v]; exists {
-		return false
-	}
-	s.taintedClosures[v] = info
-	return true
-}
-
-func (s *closureState) propagateRange(stmt *ast.RangeStmt) bool {
-	scope, ok := s.exprBorrowedScope(stmt.X)
-	if !ok {
-		return false
-	}
-	if elemType := rangeElemType(s.pass.TypesInfo.TypeOf(stmt.X)); isBasicScalarType(elemType) {
-		return false
-	}
-	valVar := s.lhsIdentVar(stmt.Value)
-	if valVar == nil || !isDeclaredWithinScope(valVar, scope) || s.resultVars[valVar] {
-		return false
-	}
-	if _, exists := s.borrowed[valVar]; exists {
-		return false
-	}
-	s.borrowed[valVar] = scope
-	return true
-}
-
-func (s *closureState) propagateTypeSwitch(ts *ast.TypeSwitchStmt) bool {
-	asgn, ok := ts.Assign.(*ast.AssignStmt)
-	if !ok || len(asgn.Rhs) != 1 {
-		return false
-	}
-	ta, ok := ast.Unparen(asgn.Rhs[0]).(*ast.TypeAssertExpr)
-	if !ok {
-		return false
-	}
-	scope, ok := s.exprBorrowedScope(ta.X)
-	if !ok {
-		return false
-	}
-	changed := len(asgn.Lhs) == 1 && s.addBorrowedVar(s.lhsIdentVar(asgn.Lhs[0]), scope)
-	return s.propagateTypeSwitchCases(ts.Body, scope) || changed
-}
-
-func (s *closureState) propagateTypeSwitchCases(body *ast.BlockStmt, scope *types.Scope) bool {
-	if body == nil {
-		return false
-	}
-	changed := false
-	for _, stmt := range body.List {
-		cc, ok := stmt.(*ast.CaseClause)
+	for i, arg := range args {
+		argScope, ok := s.exprBorrowedScope(arg)
 		if !ok {
 			continue
 		}
-		if v, ok := s.pass.TypesInfo.Implicits[cc].(*types.Var); ok && s.addBorrowedVar(v, scope) {
-			changed = true
+		pVar := paramVarAt(paramVars, isVariadic, i)
+		if pVar == nil {
+			continue
 		}
+		targetScope := argScope
+		if !isDeclaredWithinScope(pVar, argScope) {
+			targetScope = litScope
+		}
+		s.borrowed[pVar] = targetScope
 	}
-	return changed
 }
 
-func (s *closureState) lhsIdentVar(expr ast.Expr) *types.Var {
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok || id.Name == "_" {
-		return nil
+func paramVarAt(vars []*types.Var, isVariadic bool, idx int) *types.Var {
+	if idx < len(vars) {
+		return vars[idx]
 	}
-	if v, ok := s.pass.TypesInfo.Defs[id].(*types.Var); ok && v != nil {
-		return v
-	}
-	if v, ok := s.pass.TypesInfo.Uses[id].(*types.Var); ok && v != nil {
-		return v
+	if isVariadic && len(vars) > 0 {
+		return vars[len(vars)-1]
 	}
 	return nil
 }
 
-func (s *closureState) capturedBorrowedScope(lit *ast.FuncLit) *types.Scope {
-	if lit == nil || lit.Body == nil {
-		return nil
-	}
-	var deepest *types.Scope
-	ast.Inspect(lit.Body, func(n ast.Node) bool {
-		id, ok := n.(*ast.Ident)
-		if !ok {
-			return true
-		}
-		v, ok := s.pass.TypesInfo.Uses[id].(*types.Var)
-		if !ok || v == nil {
-			return true
-		}
-		if sc, exists := s.borrowed[v]; exists {
-			deepest = pickInnermostScope(deepest, sc)
-		}
-		if tc, exists := s.taintedClosures[v]; exists {
-			deepest = pickInnermostScope(deepest, tc.ownerScope)
-		}
-		return true
-	})
-	return deepest
-}
-
-func pickInnermostScope(a, b *types.Scope) *types.Scope {
-	if a == nil {
-		return b
-	}
-	if b == nil {
-		return a
-	}
-	if isChildScope(b, a) {
-		return b
-	}
-	return a
-}
-
-func isChildScope(child, ancestor *types.Scope) bool {
-	for cur := child; cur != nil; cur = cur.Parent() {
-		if cur == ancestor {
-			return true
+// resolveArgFuncLits 剥离括号、类型断言与单参类型转换，解析实参或被调表达式指向的局部 FuncLit 集合。
+func (s *closureState) resolveArgFuncLits(expr ast.Expr) []*ast.FuncLit {
+	for expr != nil {
+		switch e := ast.Unparen(expr).(type) {
+		case *ast.FuncLit:
+			return []*ast.FuncLit{e}
+		case *ast.Ident:
+			if v, ok := s.pass.TypesInfo.Uses[e].(*types.Var); ok && v != nil {
+				return s.localFuncLits[v]
+			}
+			return nil
+		case *ast.TypeAssertExpr:
+			expr = e.X
+		case *ast.CallExpr:
+			if len(e.Args) == 1 {
+				if tv, ok := s.pass.TypesInfo.Types[e.Fun]; ok && tv.IsType() {
+					expr = e.Args[0]
+					continue
+				}
+			}
+			return nil
+		default:
+			return nil
 		}
 	}
-	return false
+	return nil
 }

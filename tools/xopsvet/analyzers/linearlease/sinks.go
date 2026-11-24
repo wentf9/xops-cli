@@ -12,6 +12,8 @@ func (s *closureState) checkEscapeNode(n ast.Node) {
 		s.checkAssignEscape(node)
 	case *ast.ValueSpec:
 		s.checkValueSpecEscape(node)
+	case *ast.RangeStmt:
+		s.checkRangeEscape(node)
 	case *ast.CompositeLit:
 		s.checkCompositeLitEscape(node)
 	case *ast.CallExpr:
@@ -59,18 +61,22 @@ func (s *closureState) checkAssignPairEscape(lhs, rhs ast.Expr) {
 	if s.checkUncalledMethodValue(rhs) {
 		return
 	}
-	scope, isBorrowed := s.exprBorrowedScope(rhs)
-	tainted, isClosure := s.exprTaintedClosure(rhs)
-	if !isBorrowed && !isClosure {
+	targetScope, isBorrowed := s.exprBorrowedScope(rhs)
+	if !isBorrowed {
 		if lit, ok := ast.Unparen(rhs).(*ast.FuncLit); ok {
 			s.checkDirectClosureAssign(lhs, lit)
+			return
 		}
-		return
-	}
-	targetScope := scope
-	if !isBorrowed {
+		tainted, isClosure := s.exprTaintedClosure(rhs)
+		if !isClosure {
+			return
+		}
 		targetScope = tainted.ownerScope
 	}
+	s.checkTargetScopeEscape(lhs, rhs, targetScope)
+}
+
+func (s *closureState) checkTargetScopeEscape(lhs, rhs ast.Expr, targetScope *types.Scope) {
 	switch target := ast.Unparen(lhs).(type) {
 	case *ast.SelectorExpr, *ast.IndexExpr, *ast.StarExpr:
 		s.reportEscape(rhs, "linearlease: 禁止将 //xops:borrowed 借用变量写入结构体字段、容器元素或指针目标")
@@ -81,6 +87,24 @@ func (s *closureState) checkAssignPairEscape(lhs, rhs ast.Expr) {
 		lhsVar := s.lhsIdentVar(target)
 		if lhsVar == nil || !isDeclaredWithinScope(lhsVar, targetScope) || s.resultVars[lhsVar] {
 			s.reportEscape(rhs, "linearlease: 禁止将 //xops:borrowed 借用变量逃逸至外层变量或具名返回值")
+		}
+	}
+}
+
+func (s *closureState) checkRangeEscape(stmt *ast.RangeStmt) {
+	scope, ok := s.exprBorrowedScope(stmt.X)
+	if !ok {
+		return
+	}
+	xType := s.pass.TypesInfo.TypeOf(stmt.X)
+	if stmt.Key != nil {
+		if keyType := rangeKeyType(xType); keyType != nil && !isBasicScalarType(keyType) {
+			s.checkTargetScopeEscape(stmt.Key, stmt.X, scope)
+		}
+	}
+	if stmt.Value != nil {
+		if elemType := rangeElemType(xType); elemType != nil && !isBasicScalarType(elemType) {
+			s.checkTargetScopeEscape(stmt.Value, stmt.X, scope)
 		}
 	}
 }
@@ -116,29 +140,68 @@ func (s *closureState) checkCompositeLitEscape(lit *ast.CompositeLit) {
 }
 
 func (s *closureState) checkCallEscape(call *ast.CallExpr) {
-	if s.goCalls[call] {
+	if s.goCalls[call] || isTypeConversionCall(s.pass.TypesInfo, call) {
 		return
 	}
-	if s.isAppendCall(call) {
-		for _, arg := range call.Args[1:] {
-			s.checkNonEscapingValue(arg, "linearlease: 禁止通过 append 将 //xops:borrowed 借用变量存入切片")
-		}
+	if s.checkBuiltinCallEscape(call) {
 		return
 	}
 	spec := resolveCallLeaseSpec(s.pass, s.facts, call, s.deferCalls[call])
+	if len(s.resolveArgFuncLits(call.Fun)) > 0 {
+		spec.syncClosure = true
+	}
 	if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok {
 		if _, isBorrowedRecv := s.exprBorrowedScope(sel.X); !isBorrowedRecv {
 			s.checkUncalledMethodValue(sel.X)
 		}
 	}
+	s.checkCallArgsEscape(call, spec)
+}
+
+func (s *closureState) checkBuiltinCallEscape(call *ast.CallExpr) bool {
+	if s.isBuiltinCall(call, "append") {
+		for _, arg := range call.Args[1:] {
+			s.checkNonEscapingValue(arg, "linearlease: 禁止通过 append 将 //xops:borrowed 借用变量存入切片")
+		}
+		return true
+	}
+	if s.isBuiltinCall(call, "copy") && len(call.Args) == 2 {
+		s.checkCopyEscape(call)
+		return true
+	}
+	return false
+}
+
+func (s *closureState) checkCallArgsEscape(call *ast.CallExpr, spec callLeaseSpec) {
 	for _, arg := range call.Args {
 		if s.checkUncalledMethodValue(arg) && !spec.syncClosure {
 			continue
 		}
-		if spec.syncClosure && s.resolveArgFuncLit(arg) != nil {
+		if spec.syncClosure && len(s.resolveArgFuncLits(arg)) > 0 {
 			continue
 		}
 		s.checkCallArgCapture(arg, spec.syncClosure)
+	}
+}
+
+func (s *closureState) checkCopyEscape(call *ast.CallExpr) {
+	scope, ok := s.exprBorrowedScope(call.Args[1])
+	if !ok {
+		return
+	}
+	switch target := unwrapMutationBase(s.pass.TypesInfo, call.Args[0]).(type) {
+	case *ast.CallExpr:
+		return
+	case *ast.Ident:
+		if target.Name == "_" {
+			return
+		}
+		lhsVar := s.lhsIdentVar(target)
+		if lhsVar == nil || !isDeclaredWithinScope(lhsVar, scope) || s.resultVars[lhsVar] {
+			s.reportEscape(call.Args[0], "linearlease: 禁止通过 copy 将 //xops:borrowed 借用变量逃逸至外层位置")
+		}
+	default:
+		s.reportEscape(call.Args[0], "linearlease: 禁止通过 copy 将 //xops:borrowed 借用变量写入结构体字段、容器元素或指针目标")
 	}
 }
 
@@ -146,12 +209,14 @@ func (s *closureState) checkCallArgCapture(arg ast.Expr, isSync bool) {
 	if isSync {
 		return
 	}
-	if _, ok := s.exprTaintedClosure(arg); ok {
-		s.reportEscape(arg, "linearlease: 禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用")
+	if lit, ok := ast.Unparen(arg).(*ast.FuncLit); ok {
+		if s.capturedBorrowedScope(lit) != nil {
+			s.reportEscape(lit, "linearlease: 禁止在非同步子闭包（如 goroutine 或异步回调）中捕获 //xops:borrowed 变量")
+		}
 		return
 	}
-	if lit, ok := ast.Unparen(arg).(*ast.FuncLit); ok && s.capturedBorrowedScope(lit) != nil {
-		s.reportEscape(lit, "linearlease: 禁止在非同步子闭包（如 goroutine 或异步回调）中捕获 //xops:borrowed 变量")
+	if _, ok := s.exprTaintedClosure(arg); ok {
+		s.reportEscape(arg, "linearlease: 禁止将捕获了 //xops:borrowed 变量的闭包传入非同步调用")
 	}
 }
 
@@ -197,7 +262,7 @@ func (s *closureState) checkNonEscapingValue(expr ast.Expr, msg string) {
 }
 
 func (s *closureState) checkUncalledMethodValue(expr ast.Expr) bool {
-	sel, ok := ast.Unparen(expr).(*ast.SelectorExpr)
+	sel, ok := unwrapMethodValueExpr(s.pass.TypesInfo, expr)
 	if !ok {
 		return false
 	}
@@ -212,26 +277,84 @@ func (s *closureState) checkUncalledMethodValue(expr ast.Expr) bool {
 	return true
 }
 
-func (s *closureState) isAppendCall(call *ast.CallExpr) bool {
+func unwrapMethodValueExpr(info *types.Info, expr ast.Expr) (*ast.SelectorExpr, bool) {
+	for expr != nil {
+		switch e := ast.Unparen(expr).(type) {
+		case *ast.SelectorExpr:
+			return e, true
+		case *ast.TypeAssertExpr:
+			expr = e.X
+		case *ast.CallExpr:
+			if len(e.Args) == 1 {
+				if tv, ok := info.Types[e.Fun]; ok && tv.IsType() {
+					expr = e.Args[0]
+					continue
+				}
+			}
+			return nil, false
+		default:
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+func isTypeConversionCall(info *types.Info, call *ast.CallExpr) bool {
+	if info == nil || call == nil || len(call.Args) != 1 {
+		return false
+	}
+	tv, ok := info.Types[call.Fun]
+	return ok && tv.IsType()
+}
+
+func (s *closureState) isBuiltinCall(call *ast.CallExpr, name string) bool {
 	id, ok := ast.Unparen(call.Fun).(*ast.Ident)
-	if !ok || id.Name != "append" {
+	if !ok || id.Name != name {
 		return false
 	}
 	b, ok := s.pass.TypesInfo.Uses[id].(*types.Builtin)
-	return ok && b != nil && b.Name() == "append"
+	return ok && b != nil && b.Name() == name
 }
 
 func (s *closureState) exprTaintedClosure(expr ast.Expr) (taintedClosureInfo, bool) {
-	id, ok := ast.Unparen(expr).(*ast.Ident)
-	if !ok {
+	switch e := ast.Unparen(expr).(type) {
+	case *ast.Ident:
+		v, ok := s.pass.TypesInfo.Uses[e].(*types.Var)
+		if !ok || v == nil {
+			return taintedClosureInfo{}, false
+		}
+		info, exists := s.taintedClosures[v]
+		return info, exists
+	case *ast.FuncLit:
+		if capScope := s.capturedBorrowedScope(e); capScope != nil {
+			return taintedClosureInfo{lit: e, ownerScope: capScope}, true
+		}
+		return taintedClosureInfo{}, false
+	case *ast.TypeAssertExpr:
+		return s.exprTaintedClosure(e.X)
+	case *ast.StarExpr:
+		return s.exprTaintedClosure(e.X)
+	case *ast.UnaryExpr:
+		if e.Op == token.AND {
+			return s.exprTaintedClosure(e.X)
+		}
+		return taintedClosureInfo{}, false
+	case *ast.CallExpr:
+		return s.conversionTaintedClosure(e)
+	default:
 		return taintedClosureInfo{}, false
 	}
-	v, ok := s.pass.TypesInfo.Uses[id].(*types.Var)
-	if !ok || v == nil {
+}
+
+func (s *closureState) conversionTaintedClosure(call *ast.CallExpr) (taintedClosureInfo, bool) {
+	if len(call.Args) != 1 {
 		return taintedClosureInfo{}, false
 	}
-	info, exists := s.taintedClosures[v]
-	return info, exists
+	tv, ok := s.pass.TypesInfo.Types[call.Fun]
+	if !ok || !tv.IsType() {
+		return taintedClosureInfo{}, false
+	}
+	return s.exprTaintedClosure(call.Args[0])
 }
 
 func (s *closureState) exprBorrowedScope(expr ast.Expr) (*types.Scope, bool) {
@@ -275,6 +398,27 @@ func (s *closureState) conversionBorrowedScope(call *ast.CallExpr) (*types.Scope
 		return nil, false
 	}
 	return s.exprBorrowedScope(call.Args[0])
+}
+
+func rangeKeyType(t types.Type) types.Type {
+	if t == nil {
+		return nil
+	}
+	switch u := types.Unalias(t).Underlying().(type) {
+	case *types.Map:
+		return u.Key()
+	case *types.Chan:
+		return u.Elem()
+	case *types.Slice, *types.Array:
+		return types.Typ[types.Int]
+	case *types.Basic:
+		if u.Info()&types.IsString != 0 {
+			return types.Typ[types.Int]
+		}
+		return nil
+	default:
+		return nil
+	}
 }
 
 func rangeElemType(t types.Type) types.Type {

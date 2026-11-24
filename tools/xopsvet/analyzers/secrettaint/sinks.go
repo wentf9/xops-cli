@@ -3,6 +3,7 @@ package secrettaint
 import (
 	"go/ast"
 	"go/types"
+	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
@@ -218,15 +219,14 @@ func isTaintPropagatingCall(info *types.Info, call *ast.CallExpr) bool {
 	name := obj.Name()
 	switch pkgPath {
 	case "bytes":
-		return name == "Clone" || name == "String" || name == "Bytes" ||
-			hasAnyPrefix(name, "Trim", "ToLower", "ToUpper", "Replace")
+		return isBytesTaintPropagator(name)
 	case "strings":
-		return name == "Clone" || name == "String" ||
-			hasAnyPrefix(name, "Trim", "ToLower", "ToUpper", "Replace")
+		return isStringsTaintPropagator(name)
 	case "slices":
-		return name == "Clone" || name == "Concat"
+		return name == "Clone" || name == "Concat" || name == "Repeat"
 	case "fmt":
-		return name == "Sprint" || name == "Sprintf" || name == "Sprintln"
+		return name == "Sprint" || name == "Sprintf" || name == "Sprintln" ||
+			name == "Append" || name == "Appendf" || name == "Appendln"
 	case "strconv", "encoding/base64", "encoding/hex":
 		return true
 	default:
@@ -234,16 +234,59 @@ func isTaintPropagatingCall(info *types.Info, call *ast.CallExpr) bool {
 	}
 }
 
+func isBytesTaintPropagator(name string) bool {
+	switch name {
+	case "Clone", "String", "Bytes", "Repeat", "Join",
+		"NewBuffer", "NewBufferString", "NewReader",
+		"ReadBytes", "ReadString", "Next":
+		return true
+	default:
+		return hasAnyPrefix(name, "Trim", "ToLower", "ToUpper", "Replace")
+	}
+}
+
+func isStringsTaintPropagator(name string) bool {
+	switch name {
+	case "Clone", "String", "Repeat", "Join", "NewReader":
+		return true
+	default:
+		return hasAnyPrefix(name, "Trim", "ToLower", "ToUpper", "Replace")
+	}
+}
+
 func isBufferOrBuilderWriteMethod(info *types.Info, call *ast.CallExpr) bool {
+	return isBytesOrStringsMethod(info, call, []string{"Buffer", "Builder"}, "Write", "WriteString", "WriteByte", "WriteRune")
+}
+
+func isBufferOrReaderWriteToMethod(info *types.Info, call *ast.CallExpr) bool {
+	return isBytesOrStringsMethod(info, call, []string{"Buffer", "Reader"}, "WriteTo")
+}
+
+func isBufferOrReaderReadIntoMethod(info *types.Info, call *ast.CallExpr) bool {
+	return isBytesOrStringsMethod(info, call, []string{"Buffer", "Reader"}, "Read", "ReadAt")
+}
+
+func isBytesOrStringsMethod(info *types.Info, call *ast.CallExpr, recvTypes []string, methodNames ...string) bool {
 	obj := vetutil.ResolveCalledObject(info, call)
-	if obj == nil {
+	fn, ok := obj.(*types.Func)
+	if !ok || fn == nil {
 		return false
 	}
-	pkgPath := vetutil.ObjectPkgPath(obj)
-	if pkgPath != "bytes" && pkgPath != "strings" {
+	pkgPath := vetutil.ObjectPkgPath(fn)
+	if (pkgPath != "bytes" && pkgPath != "strings") || !slices.Contains(methodNames, fn.Name()) {
 		return false
 	}
-	return hasAnyPrefix(obj.Name(), "Write")
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Recv() == nil {
+		return false
+	}
+	named, ok := vetutil.UnwrapNamedType(sig.Recv().Type())
+	return ok && slices.Contains(recvTypes, named.Obj().Name())
+}
+
+func isFmtAppendCall(info *types.Info, call *ast.CallExpr) bool {
+	obj := vetutil.ResolveCalledObject(info, call)
+	return vetutil.IsPkgSymbol(obj, "fmt", "Append", "Appendf", "Appendln")
 }
 
 func isAllowedAuthOrCryptoConsumer(info *types.Info, call *ast.CallExpr) bool {

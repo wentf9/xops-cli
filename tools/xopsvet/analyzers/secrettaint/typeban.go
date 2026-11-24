@@ -62,9 +62,7 @@ func checkTypeSpecSecretBox(
 	isDTO := vetutil.TypeSpecHasDirective(gen, ts, vetutil.DirectiveDTO)
 	st, isStruct := ts.Type.(*ast.StructType)
 	if !isStruct {
-		if (isErr || isDTO) && isSecretBoxType(obj.Type()) {
-			pass.ReportRangef(ts.Type, "secrettaint: 禁止 secret.SecretBox 进入 error 实现或 //xops:dto 类型")
-		}
+		checkRestrictedNonStructType(pass, pkgInfo, ts, obj, isErr, isDTO, restricted)
 		return
 	}
 	hasTags, err := hasSerializationTags(st)
@@ -78,6 +76,32 @@ func checkTypeSpecSecretBox(
 		restricted[tn] = true
 	}
 	checkRestrictedStructFields(pass, st)
+}
+
+// checkRestrictedNonStructType 检查非结构体命名类型（如切片、指针、映射或别名）
+// 在受限包、受限角色名、error 实现或 //xops:dto 场景下是否包含 SecretBox。
+func checkRestrictedNonStructType(
+	pass *analysis.Pass,
+	pkgInfo vetutil.PkgInfo,
+	ts *ast.TypeSpec,
+	obj types.Object,
+	isErr, isDTO bool,
+	restricted map[*types.TypeName]bool,
+) {
+	if !isRestrictedContainerStruct(pkgInfo, ts.Name.Name, isErr, isDTO, false) {
+		return
+	}
+	if tn, ok := obj.(*types.TypeName); ok && tn != nil {
+		restricted[tn] = true
+	}
+	if !isSecretBoxType(obj.Type()) {
+		return
+	}
+	if isErr || isDTO {
+		pass.ReportRangef(ts.Type, "secrettaint: 禁止 secret.SecretBox 进入 error 实现或 //xops:dto 类型")
+		return
+	}
+	pass.ReportRangef(ts.Type, "secrettaint: 禁止 secret.SecretBox 进入 Event/Audit/Plan/Error/受限类型")
 }
 
 func isRestrictedContainerStruct(
@@ -221,156 +245,4 @@ func isRestrictedLitType(t types.Type, localRestricted map[*types.TypeName]bool)
 		return false
 	}
 	return isRestrictedContainerPkg(vetutil.ClassifyPackage(pkgPath))
-}
-
-func checkFuncSecretBoxSinks(pass *analysis.Pass) {
-	for _, file := range pass.Files {
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			checkBlockSecretBoxSinks(pass, fn.Body)
-		}
-	}
-}
-
-func checkBlockSecretBoxSinks(pass *analysis.Pass, body *ast.BlockStmt) {
-	boxVars := collectSecretBoxVars(pass.TypesInfo, body)
-	ast.Inspect(body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		kind := classifyRule1SinkCall(pass.TypesInfo, call)
-		if kind == sinkNone {
-			return true
-		}
-		for _, arg := range call.Args {
-			if exprHasSecretBox(pass.TypesInfo, arg, boxVars) {
-				pass.ReportRangef(arg, "secrettaint: 禁止将 secret.SecretBox 传入%s汇点", kind.label())
-			}
-		}
-		return true
-	})
-}
-
-func collectSecretBoxVars(info *types.Info, body *ast.BlockStmt) map[*types.Var]bool {
-	boxVars := make(map[*types.Var]bool)
-	for range 3 {
-		changed := false
-		ast.Inspect(body, func(n ast.Node) bool {
-			switch stmt := n.(type) {
-			case *ast.AssignStmt:
-				if propagateBoxPairs(info, stmt.Lhs, stmt.Rhs, boxVars) {
-					changed = true
-				}
-			case *ast.ValueSpec:
-				if propagateBoxValueSpec(info, stmt, boxVars) {
-					changed = true
-				}
-			}
-			return true
-		})
-		if !changed {
-			break
-		}
-	}
-	return boxVars
-}
-
-func propagateBoxValueSpec(info *types.Info, vs *ast.ValueSpec, boxVars map[*types.Var]bool) bool {
-	if len(vs.Names) != len(vs.Values) {
-		return false
-	}
-	changed := false
-	for i := range vs.Names {
-		v, ok := info.Defs[vs.Names[i]].(*types.Var)
-		if ok && v != nil && exprHasSecretBox(info, vs.Values[i], boxVars) && !boxVars[v] {
-			boxVars[v] = true
-			changed = true
-		}
-	}
-	return changed
-}
-
-func propagateBoxPairs(info *types.Info, lhs, rhs []ast.Expr, boxVars map[*types.Var]bool) bool {
-	if len(lhs) != len(rhs) {
-		return false
-	}
-	changed := false
-	for i := range lhs {
-		id, ok := ast.Unparen(lhs[i]).(*ast.Ident)
-		if !ok || id.Name == "_" {
-			continue
-		}
-		v := lookupAssignVar(info, id)
-		if v != nil && exprHasSecretBox(info, rhs[i], boxVars) && !boxVars[v] {
-			boxVars[v] = true
-			changed = true
-		}
-	}
-	return changed
-}
-
-func lookupAssignVar(info *types.Info, id *ast.Ident) *types.Var {
-	if v, ok := info.Defs[id].(*types.Var); ok && v != nil {
-		return v
-	}
-	if v, ok := info.Uses[id].(*types.Var); ok && v != nil {
-		return v
-	}
-	return nil
-}
-
-func exprHasSecretBox(info *types.Info, expr ast.Expr, boxVars map[*types.Var]bool) bool {
-	if expr == nil {
-		return false
-	}
-	if isSecretBoxType(info.TypeOf(expr)) {
-		return true
-	}
-	switch e := ast.Unparen(expr).(type) {
-	case *ast.Ident:
-		v, ok := info.Uses[e].(*types.Var)
-		return ok && v != nil && boxVars != nil && boxVars[v]
-	case *ast.UnaryExpr:
-		return exprHasSecretBox(info, e.X, boxVars)
-	case *ast.StarExpr:
-		return exprHasSecretBox(info, e.X, boxVars)
-	case *ast.TypeAssertExpr:
-		return exprHasSecretBox(info, e.X, boxVars)
-	case *ast.CompositeLit:
-		return compositeLitHasSecretBox(info, e, boxVars)
-	case *ast.CallExpr:
-		return conversionHasSecretBox(info, e, boxVars)
-	default:
-		return false
-	}
-}
-
-func compositeLitHasSecretBox(info *types.Info, lit *ast.CompositeLit, boxVars map[*types.Var]bool) bool {
-	for _, elt := range lit.Elts {
-		if kv, ok := elt.(*ast.KeyValueExpr); ok {
-			if exprHasSecretBox(info, kv.Key, boxVars) || exprHasSecretBox(info, kv.Value, boxVars) {
-				return true
-			}
-			continue
-		}
-		if exprHasSecretBox(info, elt, boxVars) {
-			return true
-		}
-	}
-	return false
-}
-
-func conversionHasSecretBox(info *types.Info, call *ast.CallExpr, boxVars map[*types.Var]bool) bool {
-	if len(call.Args) != 1 {
-		return false
-	}
-	tv, ok := info.Types[call.Fun]
-	if !ok || !tv.IsType() {
-		return false
-	}
-	return exprHasSecretBox(info, call.Args[0], boxVars)
 }

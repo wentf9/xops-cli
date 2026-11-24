@@ -9,18 +9,26 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
+// maxTaintFixpointIters 限制明文污点流分析的最大不动点迭代轮次。
+const maxTaintFixpointIters = 32
+
 type taintState struct {
 	pass       *analysis.Pass
 	facts      *secretFactIndex
+	pkgIdx     *packageCallbackIndex
+	localLits  map[*types.Var]*ast.FuncLit
 	tainted    map[*types.Var]bool
 	ownerScope *types.Scope
 	resultVars map[*types.Var]bool
 	reported   map[token.Pos]bool
+	activeLits map[*ast.FuncLit]bool
 }
 
 func checkSecretTaintFlows(pass *analysis.Pass, facts *secretFactIndex) {
 	reported := make(map[token.Pos]bool)
 	checkedLits := make(map[*ast.FuncLit]bool)
+	checkedDecls := make(map[*ast.FuncDecl]bool)
+	pkgIdx := collectPackageCallbackIndex(pass)
 
 	for _, file := range pass.Files {
 		for _, decl := range file.Decls {
@@ -28,16 +36,17 @@ func checkSecretTaintFlows(pass *analysis.Pass, facts *secretFactIndex) {
 			if !ok || fn.Body == nil {
 				continue
 			}
-			checkSecretUseCallsInBody(pass, facts, fn.Body, checkedLits, reported)
-			checkDirectSecretUseFuncDecl(pass, facts, file.Comments, fn, reported)
+			checkSecretUseCallsInBody(pass, facts, pkgIdx, fn.Body, checkedLits, checkedDecls, reported)
+			checkDirectSecretUseFuncDecl(pass, facts, pkgIdx, file.Comments, fn, reported)
 		}
 	}
-	checkRemainingSecretUseFuncLits(pass, facts, checkedLits, reported)
+	checkRemainingSecretUseFuncLits(pass, facts, pkgIdx, checkedLits, reported)
 }
 
 func checkDirectSecretUseFuncDecl(
 	pass *analysis.Pass,
 	facts *secretFactIndex,
+	pkgIdx *packageCallbackIndex,
 	comments []*ast.CommentGroup,
 	fn *ast.FuncDecl,
 	reported map[token.Pos]bool,
@@ -52,12 +61,13 @@ func checkDirectSecretUseFuncDecl(
 		return
 	}
 	ownerScope := pass.TypesInfo.Scopes[fn.Type]
-	runTaintAnalysis(pass, facts, fn.Body, ownerScope, vars, fn.Type.Results, reported)
+	runTaintAnalysis(pass, facts, pkgIdx, fn.Body, ownerScope, vars, fn.Type.Results, reported)
 }
 
 func checkRemainingSecretUseFuncLits(
 	pass *analysis.Pass,
 	facts *secretFactIndex,
+	pkgIdx *packageCallbackIndex,
 	checkedLits map[*ast.FuncLit]bool,
 	reported map[token.Pos]bool,
 ) {
@@ -73,95 +83,8 @@ func checkRemainingSecretUseFuncLits(
 			return
 		}
 		checkedLits[lit] = true
-		runTaintAnalysis(pass, facts, lit.Body, pass.TypesInfo.Scopes[lit.Type], vars, lit.Type.Results, reported)
+		runTaintAnalysis(pass, facts, pkgIdx, lit.Body, pass.TypesInfo.Scopes[lit.Type], vars, lit.Type.Results, reported)
 	})
-}
-
-func checkSecretUseCallsInBody(
-	pass *analysis.Pass,
-	facts *secretFactIndex,
-	body *ast.BlockStmt,
-	checkedLits map[*ast.FuncLit]bool,
-	reported map[token.Pos]bool,
-) {
-	localLits := collectLocalFuncLits(pass.TypesInfo, body)
-	ast.Inspect(body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || !facts.isSecretUseCall(pass, call) {
-			return true
-		}
-		for _, arg := range call.Args {
-			lit := resolveCallbackLit(pass.TypesInfo, arg, localLits)
-			if lit == nil || lit.Body == nil || lit.Type == nil || checkedLits[lit] {
-				continue
-			}
-			checkedLits[lit] = true
-			vars := collectCallbackSecretParamVars(pass.TypesInfo, lit.Type.Params)
-			runTaintAnalysis(pass, facts, lit.Body, pass.TypesInfo.Scopes[lit.Type], vars, lit.Type.Results, reported)
-		}
-		return true
-	})
-}
-
-func collectLocalFuncLits(info *types.Info, body *ast.BlockStmt) map[*types.Var]*ast.FuncLit {
-	lits := make(map[*types.Var]*ast.FuncLit)
-	ast.Inspect(body, func(n ast.Node) bool {
-		switch stmt := n.(type) {
-		case *ast.AssignStmt:
-			recordAssignFuncLits(info, stmt, lits)
-		case *ast.ValueSpec:
-			recordValueSpecFuncLits(info, stmt, lits)
-		}
-		return true
-	})
-	return lits
-}
-
-func recordAssignFuncLits(info *types.Info, stmt *ast.AssignStmt, lits map[*types.Var]*ast.FuncLit) {
-	if len(stmt.Lhs) != len(stmt.Rhs) {
-		return
-	}
-	for i := range stmt.Lhs {
-		lit, ok := ast.Unparen(stmt.Rhs[i]).(*ast.FuncLit)
-		if !ok {
-			continue
-		}
-		id, ok := ast.Unparen(stmt.Lhs[i]).(*ast.Ident)
-		if !ok {
-			continue
-		}
-		if v := lookupVar(info, id); v != nil {
-			lits[v] = lit
-		}
-	}
-}
-
-func recordValueSpecFuncLits(info *types.Info, stmt *ast.ValueSpec, lits map[*types.Var]*ast.FuncLit) {
-	if len(stmt.Names) != len(stmt.Values) {
-		return
-	}
-	for i := range stmt.Names {
-		lit, ok := ast.Unparen(stmt.Values[i]).(*ast.FuncLit)
-		if !ok {
-			continue
-		}
-		if v, ok := info.Defs[stmt.Names[i]].(*types.Var); ok && v != nil {
-			lits[v] = lit
-		}
-	}
-}
-
-func resolveCallbackLit(info *types.Info, arg ast.Expr, localLits map[*types.Var]*ast.FuncLit) *ast.FuncLit {
-	e := ast.Unparen(arg)
-	if lit, ok := e.(*ast.FuncLit); ok {
-		return lit
-	}
-	if id, ok := e.(*ast.Ident); ok {
-		if v, ok := info.Uses[id].(*types.Var); ok {
-			return localLits[v]
-		}
-	}
-	return nil
 }
 
 func hasFunctionTypedParam(fl *ast.FieldList) bool {
@@ -239,27 +162,51 @@ func isSecretCarrierType(t types.Type) bool {
 func runTaintAnalysis(
 	pass *analysis.Pass,
 	facts *secretFactIndex,
+	pkgIdx *packageCallbackIndex,
 	body *ast.BlockStmt,
 	ownerScope *types.Scope,
 	seeds []*types.Var,
 	results *ast.FieldList,
 	reported map[token.Pos]bool,
 ) {
+	runTaintAnalysisWithState(
+		pass, facts, pkgIdx, body, ownerScope, seeds, results, reported,
+		make(map[*ast.FuncLit]bool),
+	)
+}
+
+func runTaintAnalysisWithState(
+	pass *analysis.Pass,
+	facts *secretFactIndex,
+	pkgIdx *packageCallbackIndex,
+	body *ast.BlockStmt,
+	ownerScope *types.Scope,
+	seeds []*types.Var,
+	results *ast.FieldList,
+	reported map[token.Pos]bool,
+	activeLits map[*ast.FuncLit]bool,
+) {
 	if body == nil || ownerScope == nil || len(seeds) == 0 {
 		return
 	}
+	localLits, _ := collectLocalCallbackMaps(pass.TypesInfo, body, pkgIdx)
 	st := &taintState{
 		pass:       pass,
 		facts:      facts,
+		pkgIdx:     pkgIdx,
+		localLits:  localLits,
 		tainted:    make(map[*types.Var]bool),
 		ownerScope: ownerScope,
 		resultVars: collectResultVars(pass.TypesInfo, results),
 		reported:   reported,
+		activeLits: activeLits,
 	}
 	for _, v := range seeds {
-		st.tainted[v] = true
+		if v != nil {
+			st.tainted[v] = true
+		}
 	}
-	for range 6 {
+	for range maxTaintFixpointIters {
 		changed := false
 		walkOutsideClosures(body, func(n ast.Node) {
 			if st.propagateNode(n) {
@@ -357,6 +304,11 @@ func (s *taintState) propagateNode(n ast.Node) bool {
 }
 
 func (s *taintState) propagateAssign(stmt *ast.AssignStmt) bool {
+	if len(stmt.Lhs) == 2 && len(stmt.Rhs) == 1 {
+		if ta, ok := ast.Unparen(stmt.Rhs[0]).(*ast.TypeAssertExpr); ok && ta.Type != nil {
+			return s.propagatePair(stmt.Lhs[0], ta)
+		}
+	}
 	if len(stmt.Lhs) != len(stmt.Rhs) {
 		return false
 	}
@@ -426,11 +378,19 @@ func (s *taintState) propagateCallMutation(call *ast.CallExpr) bool {
 			return s.taintLocalTarget(sel.X)
 		}
 	}
+	if isBufferOrReaderReadIntoMethod(s.pass.TypesInfo, call) && len(call.Args) >= 1 {
+		if sel, ok := ast.Unparen(call.Fun).(*ast.SelectorExpr); ok && s.exprIsTainted(sel.X) {
+			return s.taintLocalTarget(call.Args[0])
+		}
+	}
+	if isFmtAppendCall(s.pass.TypesInfo, call) && len(call.Args) >= 2 && s.argsContainTaint(call.Args[1:]) {
+		return s.taintLocalTarget(call.Args[0])
+	}
 	return false
 }
 
 func (s *taintState) taintLocalTarget(expr ast.Expr) bool {
-	id, ok := ast.Unparen(expr).(*ast.Ident)
+	id, ok := unwrapSliceBaseExpr(s.pass.TypesInfo, expr).(*ast.Ident)
 	if !ok || id.Name == "_" {
 		return false
 	}
@@ -440,4 +400,31 @@ func (s *taintState) taintLocalTarget(expr ast.Expr) bool {
 	}
 	s.tainted[v] = true
 	return true
+}
+
+// unwrapSliceBaseExpr 剥离切片表达式与非 map 索引表达式，保留对底层切片/数组目标变量的追踪，
+// 同时拦截对 map 元素（如 localMap["k"]）的非法绕过写入。
+func unwrapSliceBaseExpr(info *types.Info, expr ast.Expr) ast.Expr {
+	for expr != nil {
+		switch e := ast.Unparen(expr).(type) {
+		case *ast.SliceExpr:
+			expr = e.X
+		case *ast.IndexExpr:
+			if info != nil && isMapExprType(info.TypeOf(e.X)) {
+				return e
+			}
+			expr = e.X
+		default:
+			return e
+		}
+	}
+	return nil
+}
+
+func isMapExprType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := types.Unalias(t).Underlying().(*types.Map)
+	return ok
 }

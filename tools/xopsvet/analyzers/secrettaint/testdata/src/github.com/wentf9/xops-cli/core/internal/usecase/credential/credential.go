@@ -29,6 +29,12 @@ func okUseCasePassThrough(
 	})
 }
 
+var (
+	_                = fmt.Sprint(&secret.SecretBox{}) // want "禁止将 secret.SecretBox 传入错误格式化汇点"
+	pkgErasedBox any = &secret.SecretBox{}
+	_, _             = json.Marshal(pkgErasedBox) // want "禁止将 secret.SecretBox 传入序列化汇点"
+)
+
 func badSinksAndWhitelist(
 	ctx context.Context,
 	v ports.SecretVault,
@@ -46,6 +52,15 @@ func badSinksAndWhitelist(
 
 		var erased any = box
 		_, _ = json.Marshal(erased) // want "禁止将 secret.SecretBox 传入序列化汇点"
+
+		var iifeBox any = func() any { return box }()
+		_, _ = json.Marshal(iifeBox)                           // want "禁止将 secret.SecretBox 传入序列化汇点"
+		_, _ = json.Marshal(func(v any) any { return v }(box)) // want "禁止将 secret.SecretBox 传入序列化汇点"
+		var safeIIFE any = func() any {
+			_ = func() any { return box }
+			return "safe"
+		}()
+		_, _ = json.Marshal(safeIIFE)
 
 		_ = box.Use(func(plain []byte) error { // want "禁止在白名单.*调用或引用 SecretBox.Use"
 			slog.Info("leak", "p", string(plain)) // want "禁止将明文机密.*传入日志汇点"

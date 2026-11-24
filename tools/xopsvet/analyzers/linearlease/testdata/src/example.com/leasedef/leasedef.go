@@ -31,6 +31,8 @@ func WithAuthorized[C any](ctx context.Context, run func(auth Authorized[C]) err
 type Pool interface {
 	//xops:borrowed
 	WithLease(ctx context.Context, fn func(ctx context.Context, sess Session) error) error // want WithLease:"syncclosure,borrowed"
+	//xops:borrowed
+	WithSliceLease(ctx context.Context, fn func(ctx context.Context, hs []Session) error) error // want WithSliceLease:"syncclosure,borrowed"
 }
 
 type Vault interface {
@@ -75,4 +77,20 @@ func HelperDirectBorrowedBad(
 ) error {
 	leakedFromHelper = sess // want "禁止将 //xops:borrowed 借用变量逃逸"
 	return nil
+}
+
+//xops:borrowed
+func WithVariadic(fns ...func(s Session)) { // want WithVariadic:"syncclosure,borrowed"
+	for _, fn := range fns {
+		if fn != nil {
+			fn(nil)
+		}
+	}
+}
+
+var leakedInt *int
+
+func paramSameLineTrailing(s Session /* //xops:borrowed */, other *int) {
+	leakedFromHelper = s // want "禁止将 //xops:borrowed 借用变量逃逸"
+	leakedInt = other
 }

@@ -107,3 +107,51 @@ type CustomErrIface interface { Error() string; Code() int }
 		t.Fatal("NotErr and int should not implement error")
 	}
 }
+
+func TestParamBlockAndSameLineDirectives(t *testing.T) {
+	fset := token.NewFileSet()
+	src := `package paramsample
+func SameLineTrailingA(s int /* //xops:borrowed */, other *int) {}
+func SameLineTrailingB(s int /* xops:borrowed */, other *int) {}
+func SameLineLeadingSecond(s int, /* //xops:borrowed */ other *int) {}
+func SameLineLeadingFirst(/* //xops:borrowed */ s int, other *int) {}
+func SingleTrailing(s int /* //xops:borrowed */) {}
+func CommentedOutLine(
+	// //xops:borrowed
+	s int,
+) {}
+`
+	f, err := parser.ParseFile(fset, "params.go", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		want []bool
+	}{
+		{name: "SameLineTrailingA", want: []bool{true, false}},
+		{name: "SameLineTrailingB", want: []bool{true, false}},
+		{name: "SameLineLeadingSecond", want: []bool{false, true}},
+		{name: "SameLineLeadingFirst", want: []bool{true, false}},
+		{name: "SingleTrailing", want: []bool{true}},
+		{name: "CommentedOutLine", want: []bool{false}},
+	}
+	decls := make(map[string]*ast.FuncDecl, len(f.Decls))
+	for _, decl := range f.Decls {
+		if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name != nil {
+			decls[fn.Name.Name] = fn
+		}
+	}
+	for _, tc := range cases {
+		fn := decls[tc.name]
+		if fn == nil {
+			t.Fatalf("missing func %s", tc.name)
+		}
+		for idx, want := range tc.want {
+			got := vetutil.ParamFieldHasDirective(fset, f.Comments, fn.Type.Params, idx, vetutil.DirectiveBorrowed)
+			if got != want {
+				t.Fatalf("%s param[%d] = %v, want %v", tc.name, idx, got, want)
+			}
+		}
+	}
+}
