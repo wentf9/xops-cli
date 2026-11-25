@@ -96,7 +96,10 @@ func badCrit4AndHigh1(
 
 		_, _ = aead.Open(nil, nonce, plain, nil) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 		_ = ssh.Marshal(plain)                   // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
-		_, _ = ssh.ParseRawPrivateKey(plain)     // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		rawKey, _ := ssh.ParseRawPrivateKey(plain)
+		_, _ = ssh.NewSignerFromKey(rawKey)
+		rawKey2, _ := ssh.ParseRawPrivateKeyWithPassphrase(plain, plain)
+		slog.Info("raw-key-leak", "v", rawKey2) // want "禁止将明文机密.*传入日志汇点"
 
 		// 标准库 sha256/hmac hash.Hash.Write 合法；本地伪造 fakeHash 严格拦截（评审 #12）
 		h := sha256.New()

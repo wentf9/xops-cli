@@ -9,6 +9,7 @@ import (
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/secretfact"
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetssa"
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
+	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
 )
 
@@ -27,7 +28,9 @@ func writeToDstSpec(fn *types.Func) (srcSlot, dstSlot int, ok bool) {
 		return slotAllArgs, slotRecv, true
 	case isBytesOrStringsRecvMethod(fn, []string{"Buffer", "Reader"}, "Read", "ReadAt"):
 		return slotRecv, 0, true
-	case isIOCopyFunc(fn), vetutil.IsPkgSymbol(fn, "encoding/hex", "Encode", "Decode"), vetutil.IsPkgSymbol(fn, "encoding/base64", "Encode", "Decode"):
+	case isIOCopyFunc(fn), vetutil.IsPkgSymbol(fn, "encoding/hex", "Encode", "Decode"),
+		vetutil.IsPkgSymbol(fn, "encoding/base32", "Encode", "Decode"),
+		vetutil.IsPkgSymbol(fn, "encoding/base64", "Encode", "Decode"):
 		return 1, 0, true
 	case vetutil.IsPkgSymbol(fn, "crypto/subtle", "ConstantTimeCopy"):
 		return 2, 1, true
@@ -112,7 +115,7 @@ func isTaintPreservingTransform(fn *types.Func) bool {
 		return name == "ReadAll"
 	case "strconv":
 		return !strings.HasPrefix(name, "Append")
-	case "encoding/base64", "encoding/hex":
+	case "encoding/base32", "encoding/base64", "encoding/hex":
 		return name == "EncodeToString" || name == "DecodeString"
 	case "golang.org/x/sys/windows":
 		return name == "UTF16FromString" || name == "UTF16PtrFromString"
@@ -120,6 +123,7 @@ func isTaintPreservingTransform(fn *types.Func) bool {
 		return vetutil.IsPkgSymbol(fn, "unicode/utf16", "Encode") ||
 			vetutil.IsPkgSymbol(fn, "encoding/pem", "Decode") ||
 			vetutil.IsPkgSymbol(fn, "crypto/x509", "DecryptPEMBlock") ||
+			vetutil.IsPkgSymbol(fn, sshCryptoPkgPath, "ParseRawPrivateKey", "ParseRawPrivateKeyWithPassphrase") ||
 			vetutil.IsPkgSymbol(fn, "golang.org/x/crypto/argon2", "IDKey", "Key") ||
 			vetutil.IsPkgSymbol(fn, "crypto/pbkdf2", "Key") ||
 			vetutil.IsPkgSymbol(fn, "golang.org/x/crypto/scrypt", "Key") ||
@@ -136,11 +140,20 @@ func isAppendToDstFunc(fn *types.Func) bool {
 		return slices.Contains([]string{"Append", "Appendf", "Appendln"}, fn.Name())
 	case "strconv":
 		return strings.HasPrefix(fn.Name(), "Append")
-	case "encoding/base64", "encoding/hex":
+	case "encoding/base32", "encoding/base64", "encoding/hex":
 		return fn.Name() == "AppendEncode" || fn.Name() == "AppendDecode"
 	default:
 		return false
 	}
+}
+
+// taintsOnlyFirstResult 识别仅在槽 0 返回明文或原始密钥且槽 1 error 绝不含明文字节的解码/解析函数
+// （base32/base64 的 CorruptInputError 仅含字节偏移，ssh.ParseRawPrivateKey* 仅返回结构/口令错误；
+// hex.InvalidByteError 与 strconv.NumError 仍保持全槽位染毒）。
+func taintsOnlyFirstResult(fn *types.Func) bool {
+	return vetutil.IsPkgSymbol(fn, "encoding/base32", "DecodeString", "AppendDecode") ||
+		vetutil.IsPkgSymbol(fn, "encoding/base64", "DecodeString", "AppendDecode") ||
+		vetutil.IsPkgSymbol(fn, sshCryptoPkgPath, "ParseRawPrivateKey", "ParseRawPrivateKeyWithPassphrase")
 }
 
 func isFmtSprintFunc(fn *types.Func) bool {
@@ -211,19 +224,22 @@ func (ts *taintScope) isExactCryptoSanitizer(rc vetssa.ResolvedCall, inSc vetssa
 		return name == "NewCipher"
 	case "crypto/cipher":
 		if slices.Contains([]string{"NewGCM", "NewGCMWithNonceSize", "NewGCMWithTagSize"}, name) {
-			return true
+			return len(rc.UserArgs) >= 1 && tracesOnlyToAESBlock(ts.eng.ssaInfo, rc.UserArgs[0], map[ssa.Value]bool{}, map[*ssa.Function]bool{})
 		}
 		named, ok := secretfact.RecvNamedType(fn)
 		return name == "Seal" && ok && vetutil.IsPkgSymbol(named.Obj(), "crypto/cipher", "AEAD") && ts.isSafeAEADSeal(rc, inSc)
 	case sshCryptoPkgPath:
-		return slices.Contains([]string{"Password", "ParsePrivateKey", "ParsePrivateKeyWithPassphrase"}, name)
+		return slices.Contains([]string{
+			"Password", "ParsePrivateKey", "ParsePrivateKeyWithPassphrase",
+			"NewSignerFromKey", "NewSignerFromSigner",
+		}, name)
 	default:
-		return name == "Write" && rc.Recv != nil && tracesOnlyToStdlibCtor(rc.Recv, isStdlibHashCtor, map[ssa.Value]bool{})
+		return name == "Write" && rc.Recv != nil && tracesOnlyToStdlibHashCtor(rc.Recv, map[ssa.Value]bool{})
 	}
 }
 
 func (ts *taintScope) isSafeAEADSeal(rc vetssa.ResolvedCall, inSc vetssa.ScopeRange) bool {
-	if rc.Recv == nil || len(rc.UserArgs) < 1 || !tracesOnlyToStdlibCtor(rc.Recv, isStdlibAEADCtor, map[ssa.Value]bool{}) {
+	if rc.Recv == nil || len(rc.UserArgs) < 1 || !ts.isSafeAEADRecv(rc.Recv) {
 		return false
 	}
 	dst := rc.UserArgs[0]
@@ -231,50 +247,112 @@ func (ts *taintScope) isSafeAEADSeal(rc vetssa.ResolvedCall, inSc vetssa.ScopeRa
 	return !dstTainted && (vetssa.IsNilConst(dst) || vetssa.IsAllowedSliceWriteDst(dst, inSc, ts.callerParams))
 }
 
-func isStdlibAEADCtor(obj *types.Func) bool {
-	return vetutil.IsPkgSymbol(obj, "crypto/cipher", "NewGCM", "NewGCMWithNonceSize", "NewGCMWithTagSize") ||
-		vetutil.IsPkgSymbol(obj, "golang.org/x/crypto/chacha20poly1305", "New", "NewX")
+// isStdlibAEADCtorCall 验证 AEAD 构造器调用属于标准库安全实现；
+// 对 crypto/cipher.NewGCM* 强制核验首参 cipher.Block 仅源于 crypto/aes.NewCipher，杜绝自定义 gcmAble 伪造。
+func isStdlibAEADCtorCall(s *buildssa.SSA, call *ssa.Call, seenFn map[*ssa.Function]bool) bool {
+	obj := vetssa.OriginFuncObj(call.Call.StaticCallee())
+	if vetutil.IsPkgSymbol(obj, "golang.org/x/crypto/chacha20poly1305", "New", "NewX") {
+		return true
+	}
+	return vetutil.IsPkgSymbol(obj, "crypto/cipher", "NewGCM", "NewGCMWithNonceSize", "NewGCMWithTagSize") &&
+		len(call.Call.Args) >= 1 && tracesOnlyToAESBlock(s, call.Call.Args[0], map[ssa.Value]bool{}, seenFn)
 }
 
-func isStdlibHashCtor(obj *types.Func) bool {
-	return vetutil.IsPkgSymbol(obj, "crypto/sha256", "New", "New224") ||
-		vetutil.IsPkgSymbol(obj, "crypto/sha512", "New", "New384", "New512_224", "New512_256") ||
-		vetutil.IsPkgSymbol(obj, "crypto/hmac", "New")
-}
-
-// tracesOnlyToStdlibCtor 统一沿 Extract/Phi/FreeVar/Alloc/UnOp 追溯接收者是否全部源于标准库构造器。
-func tracesOnlyToStdlibCtor(v ssa.Value, match func(*types.Func) bool, seen map[ssa.Value]bool) bool {
+// tracesOnlyToAESBlock 追溯传给 cipher.NewGCM* 的 cipher.Block 是否唯一源于标准库 crypto/aes.NewCipher。
+func tracesOnlyToAESBlock(s *buildssa.SSA, v ssa.Value, visiting map[ssa.Value]bool, seenFn map[*ssa.Function]bool) bool {
 	v = vetssa.UnwrapInterface(v)
-	if v == nil || seen[v] {
+	if v == nil || visiting[v] {
 		return false
 	}
-	seen[v] = true
+	visiting[v] = true
+	defer delete(visiting, v)
 	switch val := v.(type) {
 	case *ssa.Extract:
-		return val.Index == 0 && tracesOnlyToStdlibCtor(val.Tuple, match, seen)
+		return traceAESBlockCall(s, val.Tuple, val.Index, visiting, seenFn)
 	case *ssa.Call:
-		return match(vetssa.OriginFuncObj(val.Call.StaticCallee()))
+		return traceAESBlockCall(s, val, 0, visiting, seenFn)
 	case *ssa.Phi:
-		return len(val.Edges) > 0 && !slices.ContainsFunc(val.Edges, func(e ssa.Value) bool { return !tracesOnlyToStdlibCtor(e, match, seen) })
+		return allNonNilEdgesMatch(val.Edges, func(e ssa.Value) bool { return tracesOnlyToAESBlock(s, e, visiting, seenFn) })
 	case *ssa.FreeVar:
 		origins := vetssa.TraceFreeVarOrigins(val)
-		return len(origins) > 0 && !slices.ContainsFunc(origins, func(o ssa.Value) bool { return !tracesOnlyToStdlibCtor(o, match, seen) })
+		return len(origins) > 0 && !slices.ContainsFunc(origins, func(o ssa.Value) bool { return !tracesOnlyToAESBlock(s, o, visiting, seenFn) })
 	case *ssa.Alloc:
-		vals, ok := vetssa.LoadedCellValues(val)
-		return ok && !slices.ContainsFunc(vals, func(sv ssa.Value) bool { return !tracesOnlyToStdlibCtor(sv, match, seen) })
+		vals, ok := collectCellStoreValues(val, map[ssa.Value]bool{})
+		return ok && !slices.ContainsFunc(vals, func(sv ssa.Value) bool { return !tracesOnlyToAESBlock(s, sv, visiting, seenFn) })
 	case *ssa.UnOp:
-		return val.Op == token.MUL && tracesOnlyToStdlibCtor(val.X, match, seen)
+		return val.Op == token.MUL && tracesOnlyToAESBlock(s, val.X, visiting, seenFn)
 	default:
 		return false
 	}
 }
 
+func traceAESBlockCall(s *buildssa.SSA, callVal ssa.Value, retSlot int, visiting map[ssa.Value]bool, seenFn map[*ssa.Function]bool) bool {
+	call, ok := callVal.(*ssa.Call)
+	if !ok {
+		return false
+	}
+	callee := call.Call.StaticCallee()
+	if retSlot == 0 && vetutil.IsPkgSymbol(vetssa.OriginFuncObj(callee), "crypto/aes", "NewCipher") {
+		return true
+	}
+	origFn := vetssa.UnwrapOriginFunc(callee)
+	if origFn == nil || !vetssa.IsSamePackageFunc(s, origFn) || len(origFn.Blocks) == 0 {
+		return false
+	}
+	return samePkgReturnsMatch(origFn, retSlot, seenFn, func(rv ssa.Value) bool {
+		return tracesOnlyToAESBlock(s, rv, visiting, seenFn)
+	})
+}
+
+// isStdlibHashCtorCall 验证哈希构造器调用属于标准库安全哈希，并对 crypto/hmac.New 同步核验其首参哈希函数来源。
+// 未加密钥的 crypto/sha1.New 严格不在白名单内。
+func isStdlibHashCtorCall(call *ssa.Call) bool {
+	obj := vetssa.OriginFuncObj(call.Call.StaticCallee())
+	if vetutil.IsPkgSymbol(obj, "crypto/sha256", "New", "New224") ||
+		vetutil.IsPkgSymbol(obj, "crypto/sha512", "New", "New384", "New512_224", "New512_256") {
+		return true
+	}
+	return vetutil.IsPkgSymbol(obj, "crypto/hmac", "New") && len(call.Call.Args) >= 1 && tracesOnlyToStdlibHashFuncVal(call.Call.Args[0])
+}
+
+// tracesOnlyToStdlibHashCtor 沿 Extract/Phi/FreeVar/Alloc/UnOp 追溯 hash.Hash 接收者是否全部源于标准库安全哈希构造器。
+func tracesOnlyToStdlibHashCtor(v ssa.Value, visiting map[ssa.Value]bool) bool {
+	v = vetssa.UnwrapInterface(v)
+	if v == nil || visiting[v] {
+		return false
+	}
+	visiting[v] = true
+	defer delete(visiting, v)
+	switch val := v.(type) {
+	case *ssa.Extract:
+		return val.Index == 0 && tracesOnlyToStdlibHashCtor(val.Tuple, visiting)
+	case *ssa.Call:
+		return isStdlibHashCtorCall(val)
+	case *ssa.Phi:
+		return len(val.Edges) > 0 && !slices.ContainsFunc(val.Edges, func(e ssa.Value) bool { return !tracesOnlyToStdlibHashCtor(e, visiting) })
+	case *ssa.FreeVar:
+		origins := vetssa.TraceFreeVarOrigins(val)
+		return len(origins) > 0 && !slices.ContainsFunc(origins, func(o ssa.Value) bool { return !tracesOnlyToStdlibHashCtor(o, visiting) })
+	case *ssa.Alloc:
+		vals, ok := vetssa.LoadedCellValues(val)
+		return ok && !slices.ContainsFunc(vals, func(sv ssa.Value) bool { return !tracesOnlyToStdlibHashCtor(sv, visiting) })
+	case *ssa.UnOp:
+		return val.Op == token.MUL && tracesOnlyToStdlibHashCtor(val.X, visiting)
+	default:
+		return false
+	}
+}
+
+// tracesOnlyToStdlibHashFuncVal 验证传入 crypto/hmac.New 的哈希构造器函数值是否仅源于标准库 HMAC 允许集合
+// （含 RFC 6238 TOTP 必需的 crypto/sha1.New，仅限 hmac.New 内加密钥场景使用）。
 func tracesOnlyToStdlibHashFuncVal(v ssa.Value) bool {
 	targets, allKnown := vetssa.ResolveFuncValues(v)
 	return allKnown && len(targets) > 0 && !slices.ContainsFunc(targets, func(tgt ssa.Value) bool {
 		fn, ok := tgt.(*ssa.Function)
 		obj := vetssa.OriginFuncObj(fn)
-		return !ok || (!vetutil.IsPkgSymbol(obj, "crypto/sha256", "New", "New224") && !vetutil.IsPkgSymbol(obj, "crypto/sha512", "New", "New384", "New512_224", "New512_256"))
+		return !ok || (!vetutil.IsPkgSymbol(obj, "crypto/sha1", "New") &&
+			!vetutil.IsPkgSymbol(obj, "crypto/sha256", "New", "New224") &&
+			!vetutil.IsPkgSymbol(obj, "crypto/sha512", "New", "New384", "New512_224", "New512_256"))
 	})
 }
 

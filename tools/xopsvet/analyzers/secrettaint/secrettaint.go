@@ -43,6 +43,7 @@ func run(pass *analysis.Pass, sf *analysis.Analyzer) (any, error) {
 		pass: pass, ssaInfo: s, pkgInfo: pkgInfo, facts: facts,
 		tracker: vetssa.NewAuditTracker(), kiClosures: collectDialKIClosures(pkgInfo, s),
 		kiTaintedRoots: map[*ssa.Function][]ssa.Value{},
+		safeVaultAEAD:  collectSafeVaultAEADFields(pkgInfo, s),
 	}
 	for _, fn := range vetssa.AllFuncs(s) {
 		eng.auditDirectSecretUseFunc(fn)

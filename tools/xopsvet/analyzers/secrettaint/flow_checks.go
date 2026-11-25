@@ -237,7 +237,7 @@ func (ts *taintScope) checkTaintedNonWriteCall(callInst ssa.CallInstruction, rc 
 		return
 	}
 	if isSafePredicate(rc.FuncObj) || isTaintPreservingTransform(rc.FuncObj) || vetssa.IsStdlibSyncIter(rc.FuncObj) ||
-		ts.isExactCryptoSanitizer(rc, inSc) || isAllowedNarrowConsumerCall(ts.eng.pkgInfo, rc) {
+		ts.isExactCryptoSanitizer(rc, inSc) || ts.isAllowedNarrowConsumerCall(rc) {
 		return
 	}
 	if isBufferOrReaderWriteToFunc(rc.FuncObj) {

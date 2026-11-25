@@ -22,6 +22,7 @@ type taintEngine struct {
 	tracker        *vetssa.AuditTracker
 	kiClosures     map[*ssa.Function]bool
 	kiTaintedRoots map[*ssa.Function][]ssa.Value
+	safeVaultAEAD  map[structFieldKey]bool
 	diags          []vetutil.Diag
 }
 
@@ -125,16 +126,23 @@ func (ts *taintScope) propagateCall(call *ssa.Call) bool {
 		return false
 	}
 	if isAppendToDstFunc(rc.FuncObj) {
-		changed := vetssa.MarkValueScope(ts.tainted, call, inSc)
+		changed := ts.markTransformReturn(call, rc.FuncObj, inSc)
 		if len(rc.UserArgs) > 0 && !vetssa.IsNilConst(rc.UserArgs[0]) {
 			changed = vetssa.MarkRootsBackward(rc.UserArgs[0], inSc, ts.tainted, ts.outerShared) || changed
 		}
 		return changed
 	}
 	if isTaintPreservingTransform(rc.FuncObj) || isFmtSprintFunc(rc.FuncObj) || vetssa.IsStdlibSyncIter(rc.FuncObj) {
-		return vetssa.MarkValueScope(ts.tainted, call, inSc)
+		return ts.markTransformReturn(call, rc.FuncObj, inSc)
 	}
 	return false
+}
+
+func (ts *taintScope) markTransformReturn(call *ssa.Call, fn *types.Func, sc vetssa.ScopeRange) bool {
+	if taintsOnlyFirstResult(fn) {
+		return ts.markCallReturns(call, 1, sc)
+	}
+	return vetssa.MarkValueScope(ts.tainted, call, sc)
 }
 
 func (ts *taintScope) propagateWriteToDst(rc vetssa.ResolvedCall, sc vetssa.ScopeRange) bool {
@@ -217,22 +225,27 @@ func isHandledNonHelperCall(rc vetssa.ResolvedCall) bool {
 		isSafePredicate(rc.FuncObj) || isTaintPreservingTransform(rc.FuncObj) || isIOCopyFunc(rc.FuncObj)
 }
 
-func (ts *taintScope) markCallReturns(callInst ssa.CallInstruction, retMask uint64, sc vetssa.ScopeRange) {
+func (ts *taintScope) markCallReturns(callInst ssa.CallInstruction, retMask uint64, sc vetssa.ScopeRange) bool {
 	call, ok := callInst.(*ssa.Call)
 	if retMask == 0 || !ok {
-		return
+		return false
 	}
 	if tup, isTuple := call.Type().(*types.Tuple); isTuple && tup.Len() > 1 {
-		if call.Referrers() != nil {
-			for _, ref := range *call.Referrers() {
-				if ext, isExt := ref.(*ssa.Extract); isExt && ext.Index < 64 && (retMask&(1<<uint(ext.Index))) != 0 {
-					vetssa.MarkValueScope(ts.tainted, ext, sc)
-				}
-			}
+		return ts.markTupleReturns(call, retMask, sc)
+	}
+	return retMask&1 != 0 && vetssa.MarkValueScope(ts.tainted, call, sc)
+}
+
+func (ts *taintScope) markTupleReturns(call *ssa.Call, retMask uint64, sc vetssa.ScopeRange) bool {
+	if call.Referrers() == nil {
+		return false
+	}
+	changed := false
+	for _, ref := range *call.Referrers() {
+		ext, ok := ref.(*ssa.Extract)
+		if ok && ext.Index < 64 && (retMask&(1<<uint(ext.Index))) != 0 {
+			changed = vetssa.MarkValueScope(ts.tainted, ext, sc) || changed
 		}
-		return
 	}
-	if retMask&1 != 0 {
-		vetssa.MarkValueScope(ts.tainted, call, sc)
-	}
+	return changed
 }
