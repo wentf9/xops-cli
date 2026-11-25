@@ -1,7 +1,7 @@
 # XOps v2 全新架构分阶段实施计划（Implementation Plan）
 
 > **关联架构宪法**：[XOps v2 全新架构定稿规范（Architecture RFC v2.3.3 校准终稿）](./v2-architecture-rfc.md)（ADR-001 – ADR-016）  
-> **计划状态**：Phase 0（**v2.3.3 二轮对抗加固闭环 `Gate G0-R2`**）已完成，可进入 **Phase 1（`P1-T1`）**（按 Gate G0/G0-R/G0-R2 → G1 → G2 → G2.5 → G3 ∥ G4 → G5 顺序严格过闸推进）  
+> **计划状态**：Phase 0（`Gate G0-R2`）与 **Phase 1（`P1-T1`–`P1-T6` + `Gate G1`）** 已完成，可进入 **Phase 2（`P2-T1`）**（按 Gate G0/G0-R/G0-R2 → G1 → G2 → G2.5 → G3 ∥ G4 → G5 顺序严格过闸推进）  
 > **执行铁律**：**Go 1.27+** · 全仓 3 个 `go.mod` 零 `replace`（`core/` 与 `tools/xopsvet/` 全程 `GOWORK=off`，根 CLI 开发期经 `go.work`，打 **`core/v1.0.0`** Tag 发布时三模块全量 `GOWORK=off`）· **先筑 `xopsvet` 护栏与四端统一 `verify.go` CI 再写业务代码** · **Gate G2 后即交付 Walking Skeleton 纵向真机闭环** · 严禁新旧双轨补丁
 
 ---
@@ -224,7 +224,7 @@ go run ./scripts/ci/verify.go --stage=dst
 ## 5. 持久化进度跟踪清单（Execution Checklist）
 
 - **Phase 0（v2.3.3 二轮对抗加固闭环，`Gate G0-R2` 已通过）**：`[x] P0-T1` · `[x] P0-T2` · `[x] P0-T3` · `[x] P0-T4` · **`[x] Gate G0-R`** · **`[x] Gate G0-R2`**
-- **Phase 1**：`[ ] P1-T1` · `[ ] P1-T2` · `[ ] P1-T3` · `[ ] P1-T4` · `[ ] P1-T5` · `[ ] P1-T6` · **`[ ] Gate G1`**
+- **Phase 1（纯函数领域核闭环，`Gate G1` 已通过）**：`[x] P1-T1` · `[x] P1-T2` · `[x] P1-T3` · `[x] P1-T4` · `[x] P1-T5` · `[x] P1-T6` · **`[x] Gate G1`**
 - **Phase 2**：`[ ] P2-T1` · `[ ] P2-T2` · `[ ] P2-T3` · `[ ] P2-T4` · `[ ] P2-T5` · `[ ] P2-T6` · **`[ ] Gate G2`**
 - **Phase 2.5（Walking Skeleton）**：`[ ] P2.5-T1` · `[ ] P2.5-T2` · **`[ ] Gate G2.5`**
 - **Phase 3**：`[ ] P3-T1` · `[ ] P3-T2` · `[ ] P3-T3` · `[ ] P3-T4` · `[ ] P3-T5` · **`[ ] Gate G3`**
