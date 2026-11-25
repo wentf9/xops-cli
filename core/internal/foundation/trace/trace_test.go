@@ -8,13 +8,17 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
 var (
-	_ encoding.TextAppender  = TraceID{}
-	_ encoding.TextMarshaler = TraceID{}
-	_ encoding.TextAppender  = OpID{}
-	_ encoding.TextMarshaler = OpID{}
+	_ encoding.TextAppender    = (*TraceID)(nil)
+	_ encoding.TextMarshaler   = (*TraceID)(nil)
+	_ encoding.TextUnmarshaler = (*TraceID)(nil)
+	_ encoding.TextAppender    = (*OpID)(nil)
+	_ encoding.TextMarshaler   = (*OpID)(nil)
+	_ encoding.TextUnmarshaler = (*OpID)(nil)
 )
 
 type failingReader struct {
@@ -92,11 +96,11 @@ func assertNoDupID(t *testing.T, label string, seen map[string]struct{}, id stri
 }
 
 func TestNewIDFromEntropyFailClosed(t *testing.T) {
-	if _, err := NewTraceIDFrom(nil); !errors.Is(err, ErrNilEntropy) {
-		t.Fatalf("NewTraceIDFrom(nil) error = %v, want ErrNilEntropy", err)
+	if _, err := NewTraceIDFrom(nil); !errors.Is(err, security.ErrNilEntropy) || !errors.Is(err, security.ErrInvalidTraceID) {
+		t.Fatalf("NewTraceIDFrom(nil) error = %v, want ErrNilEntropy & ErrInvalidTraceID", err)
 	}
-	if _, err := NewOpIDFrom(nil); !errors.Is(err, ErrNilEntropy) {
-		t.Fatalf("NewOpIDFrom(nil) error = %v, want ErrNilEntropy", err)
+	if _, err := NewOpIDFrom(nil); !errors.Is(err, security.ErrNilEntropy) || !errors.Is(err, security.ErrInvalidOperationID) {
+		t.Fatalf("NewOpIDFrom(nil) error = %v, want ErrNilEntropy & ErrInvalidOperationID", err)
 	}
 
 	short := bytes.NewReader([]byte{1, 2, 3})
@@ -129,56 +133,74 @@ func TestParseTraceIDAndOpIDValidation(t *testing.T) {
 		strings.Repeat("a", maxTokenLen+1),
 	}
 	for _, raw := range invalidTokens {
-		if _, err := ParseTraceID(raw); !errors.Is(err, ErrInvalidTraceID) {
-			t.Fatalf("ParseTraceID(%q) error = %v, want ErrInvalidTraceID", raw, err)
+		if _, err := ParseTraceID(raw); !errors.Is(err, security.ErrInvalidTraceID) {
+			t.Fatalf("ParseTraceID(%q) error = %v, want security.ErrInvalidTraceID", raw, err)
 		}
-		if _, err := ParseOpID(raw); !errors.Is(err, ErrInvalidOpID) {
-			t.Fatalf("ParseOpID(%q) error = %v, want ErrInvalidOpID", raw, err)
+		if _, err := ParseOpID(raw); !errors.Is(err, security.ErrInvalidOperationID) {
+			t.Fatalf("ParseOpID(%q) error = %v, want security.ErrInvalidOperationID", raw, err)
 		}
 	}
 
 	validToken := strings.Repeat("x", maxTokenLen)
 	tid, err := ParseTraceID(validToken)
-	if err != nil || !tid.IsValid() || !tid.Equal(tid) {
+	if err != nil || !tid.IsValid() || tid.IsZero() || !tid.Equal(tid) {
 		t.Fatalf("ParseTraceID(maxLen) failed: (%v, %v)", tid, err)
 	}
 	oid, err := ParseOpID("op-01_ABC.9")
-	if err != nil || !oid.IsValid() || oid.String() != "op-01_ABC.9" {
+	if err != nil || !oid.IsValid() || oid.IsZero() || oid.String() != "op-01_ABC.9" {
 		t.Fatalf("ParseOpID failed: (%v, %v)", oid, err)
 	}
-	if oid.Equal(OpID{}) {
+	var zeroOID OpID
+	if oid.Equal(zeroOID) {
 		t.Fatal("valid OpID must not equal zero value")
 	}
 }
 
 func TestZeroValueTraceIDAndOpIDFailClosed(t *testing.T) {
-	var zeroTID TraceID
-	if zeroTID.IsValid() || zeroTID.String() != "" {
-		t.Fatal("zero TraceID must be invalid")
+	var (
+		zeroTID TraceID
+		zeroOID OpID
+		_       encoding.TextAppender  = zeroTID
+		_       encoding.TextMarshaler = zeroTID
+		_       encoding.TextAppender  = zeroOID
+		_       encoding.TextMarshaler = zeroOID
+	)
+	if zeroTID.IsValid() || !zeroTID.IsZero() || zeroTID.String() != "" || zeroTID.Equal(zeroTID) {
+		t.Fatal("zero TraceID must be invalid, IsZero, and fail-closed Equal")
 	}
-	if _, err := zeroTID.AppendText([]byte("p:")); !errors.Is(err, ErrInvalidTraceID) {
-		t.Fatalf("zero TraceID.AppendText error = %v, want ErrInvalidTraceID", err)
+	if _, err := zeroTID.AppendText([]byte("p:")); !errors.Is(err, security.ErrInvalidTraceID) {
+		t.Fatalf("zero TraceID.AppendText error = %v, want security.ErrInvalidTraceID", err)
 	}
-	if _, err := zeroTID.MarshalText(); !errors.Is(err, ErrInvalidTraceID) {
-		t.Fatalf("zero TraceID.MarshalText error = %v, want ErrInvalidTraceID", err)
+	if _, err := zeroTID.MarshalText(); !errors.Is(err, security.ErrInvalidTraceID) {
+		t.Fatalf("zero TraceID.MarshalText error = %v, want security.ErrInvalidTraceID", err)
 	}
 
-	var zeroOID OpID
-	if zeroOID.IsValid() || zeroOID.String() != "" {
-		t.Fatal("zero OpID must be invalid")
+	if zeroOID.IsValid() || !zeroOID.IsZero() || zeroOID.String() != "" || zeroOID.Equal(zeroOID) {
+		t.Fatal("zero OpID must be invalid, IsZero, and fail-closed Equal")
 	}
-	if _, err := zeroOID.AppendText([]byte("p:")); !errors.Is(err, ErrInvalidOpID) {
-		t.Fatalf("zero OpID.AppendText error = %v, want ErrInvalidOpID", err)
+	if _, err := zeroOID.AppendText([]byte("p:")); !errors.Is(err, security.ErrInvalidOperationID) {
+		t.Fatalf("zero OpID.AppendText error = %v, want security.ErrInvalidOperationID", err)
 	}
-	if _, err := zeroOID.MarshalText(); !errors.Is(err, ErrInvalidOpID) {
-		t.Fatalf("zero OpID.MarshalText error = %v, want ErrInvalidOpID", err)
+	if _, err := zeroOID.MarshalText(); !errors.Is(err, security.ErrInvalidOperationID) {
+		t.Fatalf("zero OpID.MarshalText error = %v, want security.ErrInvalidOperationID", err)
 	}
 }
 
 func TestValidTraceIDAndOpIDTextEncoding(t *testing.T) {
+	assertValidTraceIDTextCodec(t)
+	assertValidOpIDTextCodec(t)
+}
+
+func assertValidTraceIDTextCodec(t *testing.T) {
+	t.Helper()
 	tid, err := ParseTraceID("trace-1")
 	if err != nil {
 		t.Fatalf("ParseTraceID failed: %v", err)
+	}
+	// 验证与 core/domain/security 类型完全等价互通（零拷贝）。
+	checkSecTID := func(sec security.TraceID) bool { return sec.Equal(tid) }
+	if !checkSecTID(tid) {
+		t.Fatal("trace.TraceID must alias security.TraceID")
 	}
 	appended, err := tid.AppendText([]byte("id="))
 	if err != nil || string(appended) != "id=trace-1" {
@@ -188,10 +210,24 @@ func TestValidTraceIDAndOpIDTextEncoding(t *testing.T) {
 	if err != nil || string(marshaled) != "trace-1" {
 		t.Fatalf("MarshalText = (%q, %v)", marshaled, err)
 	}
+	var decodedTID TraceID
+	if err := decodedTID.UnmarshalText(marshaled); err != nil || !decodedTID.Equal(tid) {
+		t.Fatalf("UnmarshalText TraceID = (%v, %v)", decodedTID, err)
+	}
+	if err := decodedTID.UnmarshalText([]byte("bad id")); !errors.Is(err, security.ErrInvalidTraceID) || !decodedTID.IsZero() {
+		t.Fatalf("invalid TraceID UnmarshalText must fail closed and reset zero: (%v, %v)", decodedTID, err)
+	}
+}
 
+func assertValidOpIDTextCodec(t *testing.T) {
+	t.Helper()
 	oid, err := ParseOpID("op-1")
 	if err != nil {
 		t.Fatalf("ParseOpID failed: %v", err)
+	}
+	checkSecOID := func(sec security.OperationID) bool { return sec.Equal(oid) }
+	if !checkSecOID(oid) {
+		t.Fatal("trace.OpID must alias security.OperationID")
 	}
 	opAppended, err := oid.AppendText([]byte("op="))
 	if err != nil || string(opAppended) != "op=op-1" {
@@ -200,6 +236,13 @@ func TestValidTraceIDAndOpIDTextEncoding(t *testing.T) {
 	opMarshaled, err := oid.MarshalText()
 	if err != nil || string(opMarshaled) != "op-1" {
 		t.Fatalf("OpID.MarshalText = (%q, %v)", opMarshaled, err)
+	}
+	var decodedOID OpID
+	if err := decodedOID.UnmarshalText(opMarshaled); err != nil || !decodedOID.Equal(oid) {
+		t.Fatalf("UnmarshalText OpID = (%v, %v)", decodedOID, err)
+	}
+	if err := decodedOID.UnmarshalText([]byte("")); !errors.Is(err, security.ErrInvalidOperationID) || !decodedOID.IsZero() {
+		t.Fatalf("invalid OpID UnmarshalText must fail closed and reset zero: (%v, %v)", decodedOID, err)
 	}
 }
 
@@ -218,8 +261,12 @@ func TestWithTraceFailClosed(t *testing.T) {
 	if _, err := WithTrace(nilCtx, tid, oid); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("WithTrace(nil) error = %v, want ErrNilContext", err)
 	}
-	if _, err := WithTrace(context.Background(), TraceID{}, OpID{}); !errors.Is(err, ErrInvalidTraceID) {
-		t.Fatalf("WithTrace(zero, zero) error = %v, want ErrInvalidTraceID", err)
+	var (
+		zeroTID TraceID
+		zeroOID OpID
+	)
+	if _, err := WithTrace(context.Background(), zeroTID, zeroOID); !errors.Is(err, security.ErrInvalidTraceID) {
+		t.Fatalf("WithTrace(zero, zero) error = %v, want security.ErrInvalidTraceID", err)
 	}
 	if _, _, ok := TraceFromContext(nilCtx); ok {
 		t.Fatal("TraceFromContext(nil) must return false")
@@ -257,7 +304,8 @@ func TestWithTraceAndInheritance(t *testing.T) {
 	}
 
 	// 子上下文传入零值 TraceID 时，必须自动继承父级 TraceID，同时更新 OpID 且不污染父上下文。
-	childCtx, err := WithTrace(parentCtx, TraceID{}, oid2)
+	var zeroTID TraceID
+	childCtx, err := WithTrace(parentCtx, zeroTID, oid2)
 	if err != nil {
 		t.Fatalf("WithTrace child failed: %v", err)
 	}
@@ -281,7 +329,12 @@ func TestTraceFromContextIgnoresForeignKeysAndZeroRecord(t *testing.T) {
 	if _, _, ok := TraceFromContext(corrupted); ok {
 		t.Fatal("corrupted zero traceRecord must return false")
 	}
-	onlyOpCtx, err := WithTrace(context.Background(), TraceID{}, OpID{value: "op-only"})
+	onlyOpID, err := ParseOpID("op-only")
+	if err != nil {
+		t.Fatalf("ParseOpID failed: %v", err)
+	}
+	var zeroTID TraceID
+	onlyOpCtx, err := WithTrace(context.Background(), zeroTID, onlyOpID)
 	if err != nil {
 		t.Fatalf("WithTrace(onlyOp) failed: %v", err)
 	}

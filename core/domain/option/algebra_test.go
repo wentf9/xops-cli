@@ -304,8 +304,11 @@ func TestHopTargetCanonicalization(t *testing.T) {
 	if zonedHop.String() != "[fe80::1%eth0]:2200" || zonedHop.Host() != "fe80::1%eth0" {
 		t.Fatalf("带区 IPv6 HopTarget 规范化错误: str=%q host=%q", zonedHop.String(), zonedHop.Host())
 	}
-	// OpenSSH Host 别名大小写敏感（ProdBastion / Prod_Bastion）必须原样保留，IPv4 返回规范文本。
-	for _, tc := range [][2]string{{"ProdBastion", "ProdBastion"}, {"Prod_Bastion", "Prod_Bastion"}, {"192.0.2.1", "192.0.2.1"}} {
+	// OpenSSH Host 别名大小写敏感（ProdBastion / Prod_Bastion）及非 RFC1123 合法别名（bastion.01 / gw.1 / UTF-8 / hop-）必须原样保留，IPv4 返回规范文本。
+	for _, tc := range [][2]string{
+		{"ProdBastion", "ProdBastion"}, {"Prod_Bastion", "Prod_Bastion"}, {"192.0.2.1", "192.0.2.1"},
+		{"bastion.01", "bastion.01"}, {"gw.1", "gw.1"}, {"跳板机", "跳板机"}, {"hop-", "hop-"},
+	} {
 		h := mustHop(t, tc[0])
 		if h.Host() != tc[1] || h.String() != tc[1] {
 			t.Fatalf("HopTarget(%q) 大小写或规范化异常: host=%q str=%q", tc[0], h.Host(), h.String())
@@ -327,7 +330,7 @@ func TestProxyRouteFailClosedAndInjection(t *testing.T) {
 		"[2001:db8::1]:0", "h:022", "h:70000", "a@b@c",
 		"::1", "2001:db8::1", "fe80::1%eth0", "alice@2001:db8::1", "[example.com]",
 		"../evil@bastion.example.com", ".@bastion.example.com", "..@bastion.example.com", "a:b@bastion.example.com", "a[0]@bastion.example.com",
-		"127.1", "0177.0.0.1", "0x7f000001", "999.999.999.999", "example.com.", "bad-.example.com",
+		"127.1", "0177.0.0.1", "0x7f000001", "0x7f.0.0.1", "2130706433", "999.999.999.999", "example.com.", ".leading", "a..b",
 	}
 	for _, badHop := range badHops {
 		if _, err := ParseHopTarget(badHop); !errors.Is(err, ErrInvalidProxyRoute) {

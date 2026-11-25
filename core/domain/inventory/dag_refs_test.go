@@ -58,6 +58,7 @@ func TestTarjanProxyDAGCyclesMissingAndCrossNamespace(t *testing.T) {
 		t.Fatalf("合法跨命名空间 DAG 失败: err=%v depth=%d", err, rep.MaxObservedDepth)
 	}
 	startKey, _ := NewTargetKey(NamespaceManaged, "app-01")
+	assertTargetKeyCodecsAndNumericJump(t, startKey)
 	chain, err := ResolveJumpDAG([]Node{nApp, nJump}, []OpenSSHJumpNode{sshGW}, startKey, DefaultMaxJumpDepth)
 	if err != nil || len(chain) != 3 || chain[0].String() != "openssh:corp-gw" || chain[1].String() != "managed:jump-01" || chain[2].String() != "managed:app-01" {
 		t.Fatalf("ResolveJumpDAG 跳板序异常: err=%v chain=%v", err, chain)
@@ -273,7 +274,60 @@ func TestImportBundleAndPlanImport(t *testing.T) {
 	if !rep.HasConflicts() || rep.AddCount != 2 || rep.UnchangedCount != 2 || rep.ConflictCount != 1 {
 		t.Fatalf("PlanImport 统计不符合预期: %+v", rep)
 	}
+	assertImportAndLocationCodecs(t, rep)
 	assertHostAliasAndSecretStoreImportGuards(t)
+}
+
+func assertTargetKeyCodecsAndNumericJump(t *testing.T, startKey TargetKey) {
+	t.Helper()
+	noneRef := algebraic.None[secret.Ref]()
+	rawTK, err := jsonv2.Marshal(startKey, jsonv2.Deterministic(true))
+	if err != nil || string(rawTK) != `"managed:app-01"` {
+		t.Fatalf("TargetKey JSON 编码异常: raw=%s err=%v", rawTK, err)
+	}
+	var rtKey TargetKey
+	if err := jsonv2.Unmarshal(rawTK, &rtKey); err != nil || !rtKey.Equal(startKey) {
+		t.Fatalf("TargetKey JSON 往返失败: err=%v rt=%v", err, rtKey)
+	}
+	for _, badTK := range []string{"", "managed:none", "openssh:NONE", "badns:app", "managed:a&b"} {
+		if _, err := ParseTargetKey(badTK); err == nil {
+			t.Fatalf("ParseTargetKey(%q) 期望拒绝", badTK)
+		}
+	}
+	if _, err := NewOpenSSHJumpNode("none", option.NewProxyUnset()); err == nil {
+		t.Fatal("NewOpenSSHJumpNode(\"none\") 必须拒绝")
+	}
+	nNumJump := makeTestNode(t, "bastion.01", "h1", "i1", []string{"Prod_Jump"}, "", noneRef)
+	nNumApp := makeTestNode(t, "app-num", "h1", "i1", nil, "bastion.01", noneRef)
+	if numRep, err := ValidateProxyDAG([]Node{nNumApp, nNumJump}, nil, DefaultMaxJumpDepth); err != nil || numRep.MaxObservedDepth != 1 {
+		t.Fatalf("数字后缀跳板 bastion.01 DAG 校验失败: err=%v rep=%+v", err, numRep)
+	}
+}
+
+func assertImportAndLocationCodecs(t *testing.T, rep ImportReport) {
+	t.Helper()
+	rawRep, err := jsonv2.Marshal(rep, jsonv2.Deterministic(true))
+	if err != nil {
+		t.Fatalf("Marshal ImportReport 失败: %v", err)
+	}
+	var rtRep ImportReport
+	if err := jsonv2.Unmarshal(rawRep, &rtRep); err != nil || len(rtRep.Entries) != len(rep.Entries) || rtRep.ConflictCount != rep.ConflictCount {
+		t.Fatalf("ImportReport JSON 往返失败: err=%v rt=%+v", err, rtRep)
+	}
+	for _, loc := range []AssetRefLocation{AssetRefNodeHost, AssetRefNodeIdentity, AssetRefNodeProxyJump} {
+		raw, err := loc.MarshalText()
+		var dec AssetRefLocation
+		if err != nil || dec.UnmarshalText(raw) != nil || dec != loc {
+			t.Fatalf("AssetRefLocation(%v) 文本往返失败: raw=%q err=%v", loc, raw, err)
+		}
+	}
+	for _, loc := range []SecretRefLocation{SecretLocAuthPassword, SecretLocPrivateKeyPassphrase, SecretLocChallengeTOTP, SecretLocChallengeSecret, SecretLocNodePrivilege} {
+		raw, err := loc.MarshalText()
+		var dec SecretRefLocation
+		if err != nil || dec.UnmarshalText(raw) != nil || dec != loc {
+			t.Fatalf("SecretRefLocation(%v) 文本往返失败: raw=%q err=%v", loc, raw, err)
+		}
+	}
 }
 
 func assertHostAliasAndSecretStoreImportGuards(t *testing.T) {

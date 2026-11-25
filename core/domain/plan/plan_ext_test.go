@@ -67,8 +67,8 @@ func TestExternalPlanContract(t *testing.T) {
 	user, _ := option.ParseUsername("ops")
 	auth, _ := inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
 	hop, err := plan.NewHopSpecFromAuth(0, "prod-01", user, auth, pol)
-	if err != nil {
-		t.Fatalf("NewHopSpecFromAuth 失败: %v", err)
+	if err != nil || !inventory.EqualAuthMethod(hop.Auth(), auth) || hop.Transport().ServerAliveCountMax() != option.DefaultServerAliveCountMax {
+		t.Fatalf("NewHopSpecFromAuth 失败: err=%v aliveMax=%d", err, hop.Transport().ServerAliveCountMax())
 	}
 	sealed, err := plan.SealConnectionPlan(hop)
 	if err != nil || !sealed.IsValid() || sealed.Len() != 1 {

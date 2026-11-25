@@ -2,7 +2,6 @@ package playbook
 
 import (
 	"cmp"
-	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"slices"
@@ -346,60 +345,4 @@ func foldNodeReport(nodeID inventory.NodeID, recs []StepExecutionRecord, stepOrd
 		totalDur = nextDur
 	}
 	return NodeReport{nodeID, status, ordered, counts, totalDur, hasUnknown, true}, nil
-}
-
-type (
-	outcomeFieldWire struct{ outcome execution.ExecutionOutcome }
-	stepRecordWire   struct {
-		NodeID   inventory.NodeID                   `json:"node_id"`
-		StepID   StepID                             `json:"step_id"`
-		Status   StepStatus                         `json:"status"`
-		Outcome  algebraic.Option[outcomeFieldWire] `json:"outcome,omitzero"`
-		Duration algebraic.Duration                 `json:"duration"`
-		Message  string                             `json:"message,omitzero"`
-	}
-	nodeReportWire struct {
-		NodeID            inventory.NodeID      `json:"node_id"`
-		Status            NodeStatus            `json:"status"`
-		Steps             []StepExecutionRecord `json:"steps"`
-		Counts            StepCounts            `json:"counts"`
-		TotalDuration     algebraic.Duration    `json:"total_duration"`
-		HasUnknownOutcome bool                  `json:"has_unknown_outcome"`
-	}
-	playbookReportWire struct {
-		PlaybookID        PlaybookID      `json:"playbook_id"`
-		PlaybookDigest    security.Digest `json:"playbook_digest"`
-		Status            NodeStatus      `json:"status"`
-		Nodes             []NodeReport    `json:"nodes"`
-		StepCounts        StepCounts      `json:"step_counts"`
-		HasUnknownOutcome bool            `json:"has_unknown_outcome"`
-	}
-)
-
-func (o outcomeFieldWire) MarshalJSONTo(enc *jsontext.Encoder) error {
-	return execution.MarshalOutcomeTo(enc, o.outcome)
-}
-
-// MarshalJSONTo 为 StepExecutionRecord、NodeReport 与 PlaybookReport 提供值接收者确定性 json/v2 编码。
-func (r StepExecutionRecord) MarshalJSONTo(enc *jsontext.Encoder) error {
-	if !r.IsValid() {
-		return ErrInvalidStepRecord
-	}
-	var ow algebraic.Option[outcomeFieldWire]
-	if o, ok := r.outcome.Get(); ok {
-		ow = algebraic.Some(outcomeFieldWire{o})
-	}
-	return jsonv2.MarshalEncode(enc, stepRecordWire{r.nodeID, r.stepID, r.status, ow, r.duration, r.message})
-}
-func (r NodeReport) MarshalJSONTo(enc *jsontext.Encoder) error {
-	if !r.IsValid() {
-		return ErrEmptyReport
-	}
-	return jsonv2.MarshalEncode(enc, nodeReportWire{r.nodeID, r.status, r.steps, r.counts, r.totalDuration, r.hasUnknownOutcome})
-}
-func (r PlaybookReport) MarshalJSONTo(enc *jsontext.Encoder) error {
-	if !r.IsValid() {
-		return ErrEmptyReport
-	}
-	return jsonv2.MarshalEncode(enc, playbookReportWire{r.playbookID, r.playbookDigest, r.status, r.nodes, r.stepCounts, r.hasUnknownOutcome})
 }

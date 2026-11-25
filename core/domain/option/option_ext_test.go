@@ -35,6 +35,7 @@ var (
 	_ textFullCodec      = (*option.StrictHostKeyCheckingMode)(nil)
 	_ textFullCodec      = (*option.Username)(nil)
 	_ textFullCodec      = (*option.HostNameSpec)(nil)
+	_ textFullCodec      = (*option.OriginalHostSpec)(nil)
 	_ textFullCodec      = (*option.OriginKind)(nil)
 	_ jsonFullCodec      = (*option.PathList)(nil)
 	_ jsonFullCodec      = (*option.KnownHostsList)(nil)
@@ -67,6 +68,7 @@ func TestExternalValueReceiverCodecs(_ *testing.T) {
 	assertValueTextCodec[option.StrictHostKeyCheckingMode]()
 	assertValueTextCodec[option.Username]()
 	assertValueTextCodec[option.HostNameSpec]()
+	assertValueTextCodec[option.OriginalHostSpec]()
 	assertValueTextCodec[option.OriginKind]()
 
 	assertValueJSONCodec[option.PathList]()

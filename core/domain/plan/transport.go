@@ -37,6 +37,7 @@ type TransportPolicySpec struct {
 	forwardAgent          bool
 	connectTimeout        algebraic.Option[algebraic.Duration]
 	serverAliveInterval   algebraic.Duration
+	serverAliveCountMax   uint32
 	proxyRoute            option.ProxyRoute
 	controlPolicy         option.ControlPolicy
 	sendEnv               option.EnvFilter
@@ -68,6 +69,7 @@ func TransportPolicyFromEffective(ep option.EffectivePolicy) (TransportPolicySpe
 		forwardAgent:          ep.ForwardAgent(),
 		connectTimeout:        ep.ConnectTimeout(),
 		serverAliveInterval:   ep.ServerAliveInterval(),
+		serverAliveCountMax:   ep.ServerAliveCountMax(),
 		proxyRoute:            ep.Proxy(),
 		controlPolicy:         ep.Control(),
 		sendEnv:               ep.SendEnv(),
@@ -100,6 +102,9 @@ func (t TransportPolicySpec) ConnectTimeout() algebraic.Option[algebraic.Duratio
 	return t.connectTimeout
 }
 func (t TransportPolicySpec) ServerAliveInterval() algebraic.Duration { return t.serverAliveInterval }
+func (t TransportPolicySpec) ServerAliveCountMax() uint32 {
+	return pickIf(t.valid, t.serverAliveCountMax, 0)
+}
 func (t TransportPolicySpec) ProxyRoute() option.ProxyRoute {
 	return option.ComposeProxyRoute(t.proxyRoute, nil)
 }
@@ -130,6 +135,7 @@ func (t TransportPolicySpec) Equal(o TransportPolicySpec) bool {
 		t.identitiesOnly == o.identitiesOnly && t.batchMode == o.batchMode && t.forwardAgent == o.forwardAgent &&
 		okCA == okCB && (!okCA || ctA.Equal(ctB)) &&
 		t.serverAliveInterval.Equal(o.serverAliveInterval) &&
+		t.serverAliveCountMax == o.serverAliveCountMax &&
 		option.EqualProxyRoute(t.proxyRoute, o.proxyRoute) &&
 		t.controlPolicy.Equal(o.controlPolicy) && t.sendEnv.Equal(o.sendEnv) &&
 		t.permitLocalCommand == o.permitLocalCommand &&
@@ -159,6 +165,7 @@ func (t TransportPolicySpec) WriteCanonical(w io.Writer) error {
 	enc.writeBool(t.forwardAgent)
 	writeOptDurationCanonical(enc, t.connectTimeout)
 	enc.writeInt64(int64(t.serverAliveInterval.Std()))
+	enc.writeUint32(t.serverAliveCountMax)
 	enc.fail(writeProxyRouteCanonical(enc, t.proxyRoute))
 	writeControlPolicyCanonical(enc, t.controlPolicy)
 	writeEnvFilterCanonical(enc, t.sendEnv)
@@ -261,6 +268,7 @@ type transportPolicyWire struct {
 	ForwardAgent          bool                                               `json:"forward_agent,omitzero"`
 	ConnectTimeout        algebraic.Option[algebraic.Duration]               `json:"connect_timeout,omitzero"`
 	ServerAliveInterval   algebraic.Option[algebraic.Duration]               `json:"server_alive_interval"`
+	ServerAliveCountMax   algebraic.Option[uint32]                           `json:"server_alive_count_max"`
 	ProxyRoute            proxyRouteWire                                     `json:"proxy_route,omitzero"`
 	ControlPolicy         option.ControlPolicy                               `json:"control_policy,omitzero"`
 	SendEnv               option.EnvFilter                                   `json:"send_env,omitzero"`
@@ -279,7 +287,8 @@ func (t TransportPolicySpec) MarshalJSONTo(enc *jsontext.Encoder) error {
 		IdentityFiles: t.identityFiles, CertificateFiles: t.certificateFiles,
 		IdentitiesOnly: t.identitiesOnly, BatchMode: t.batchMode, ForwardAgent: t.forwardAgent,
 		ConnectTimeout: t.connectTimeout, ServerAliveInterval: algebraic.Some(t.serverAliveInterval),
-		ProxyRoute: proxyRouteWire{t.proxyRoute}, ControlPolicy: t.controlPolicy, SendEnv: t.sendEnv,
+		ServerAliveCountMax: algebraic.Some(t.serverAliveCountMax),
+		ProxyRoute:          proxyRouteWire{t.proxyRoute}, ControlPolicy: t.controlPolicy, SendEnv: t.sendEnv,
 		PermitLocalCommand: t.permitLocalCommand, LocalCommand: t.localCommand,
 	})
 }
@@ -292,7 +301,8 @@ func (t *TransportPolicySpec) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 func decodeTransportPolicyWire(w transportPolicyWire) (TransportPolicySpec, error) {
 	shkc, okS := w.StrictHostKeyChecking.Get()
 	sal, okA := w.ServerAliveInterval.Get()
-	if !okS || !okA || len(w.Ciphers) == 0 || len(w.MACs) == 0 || len(w.KexAlgorithms) == 0 || len(w.HostKeyAlgorithms) == 0 {
+	sacm, okC := w.ServerAliveCountMax.Get()
+	if !okS || !okA || !okC || len(w.Ciphers) == 0 || len(w.MACs) == 0 || len(w.KexAlgorithms) == 0 || len(w.HostKeyAlgorithms) == 0 {
 		return TransportPolicySpec{}, fmt.Errorf("%w: 缺少必需的算法、主机密钥校验或保活配置字段", ErrInvalidTransportPolicy)
 	}
 	if sal.IsNegative() {
@@ -319,7 +329,7 @@ func decodeTransportPolicyWire(w transportPolicyWire) (TransportPolicySpec, erro
 		strictHostKeyChecking: shkc, userKnownHostsFiles: w.UserKnownHostsFiles,
 		identityFiles: w.IdentityFiles, certificateFiles: w.CertificateFiles,
 		identitiesOnly: w.IdentitiesOnly, batchMode: w.BatchMode, forwardAgent: w.ForwardAgent,
-		connectTimeout: w.ConnectTimeout, serverAliveInterval: sal,
+		connectTimeout: w.ConnectTimeout, serverAliveInterval: sal, serverAliveCountMax: sacm,
 		proxyRoute:    option.ComposeProxyRoute(w.ProxyRoute.route, nil),
 		controlPolicy: w.ControlPolicy, sendEnv: w.SendEnv,
 		permitLocalCommand: w.PermitLocalCommand, localCommand: lc, valid: true,

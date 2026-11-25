@@ -19,6 +19,7 @@ type OptionLayer struct {
 	control               ControlPolicy
 	connectTimeout        algebraic.FirstWins[algebraic.Duration]
 	serverAliveInterval   algebraic.FirstWins[algebraic.Duration]
+	serverAliveCountMax   algebraic.FirstWins[uint32]
 	ciphers               AlgoPolicy
 	macs                  AlgoPolicy
 	kexAlgorithms         AlgoPolicy
@@ -91,6 +92,10 @@ func (l OptionLayer) WithServerAliveInterval(d algebraic.Duration) OptionLayer {
 	setFW(&l.serverAliveInterval, d, !d.IsNegative())
 	return l
 }
+func (l OptionLayer) WithServerAliveCountMax(n uint32) OptionLayer {
+	setFW(&l.serverAliveCountMax, n, true)
+	return l
+}
 func (l OptionLayer) WithStrictHostKeyChecking(m StrictHostKeyCheckingMode) OptionLayer {
 	setFW(&l.strictHostKeyChecking, m, m.String() != "")
 	return l
@@ -123,6 +128,9 @@ func (l OptionLayer) ConnectTimeout() algebraic.Option[algebraic.Duration] {
 }
 func (l OptionLayer) ServerAliveInterval() algebraic.Option[algebraic.Duration] {
 	return l.serverAliveInterval.ToOption()
+}
+func (l OptionLayer) ServerAliveCountMax() algebraic.Option[uint32] {
+	return l.serverAliveCountMax.ToOption()
 }
 func (l OptionLayer) Ciphers() AlgoPolicy                    { return l.ciphers.clone() }
 func (l OptionLayer) MACs() AlgoPolicy                       { return l.macs.clone() }
@@ -190,6 +198,7 @@ func (l OptionLayer) Compose(lower OptionLayer) OptionLayer {
 		l.hostName.Combine(lower.hostName), l.port.Combine(lower.port), l.user.Combine(lower.user),
 		ComposeProxyRoute(l.proxy, lower.proxy), l.control.Compose(lower.control),
 		l.connectTimeout.Combine(lower.connectTimeout), l.serverAliveInterval.Combine(lower.serverAliveInterval),
+		l.serverAliveCountMax.Combine(lower.serverAliveCountMax),
 		l.ciphers.Compose(lower.ciphers), l.macs.Compose(lower.macs),
 		l.kexAlgorithms.Compose(lower.kexAlgorithms), l.hostKeyAlgorithms.Compose(lower.hostKeyAlgorithms),
 		l.identityFiles.Compose(lower.identityFiles), l.certificateFiles.Compose(lower.certificateFiles),
@@ -211,7 +220,8 @@ func FoldOptionLayers(layers ...OptionLayer) OptionLayer {
 // 完整剥离 Target、Auth（含 BatchMode 与 IdentitiesOnly）、Trust、Forward、Session 与 LocalExec。
 func (l OptionLayer) FilterForNonOpenSSHOrigin() OptionLayer {
 	return OptionLayer{
-		control: l.control, connectTimeout: l.connectTimeout, serverAliveInterval: l.serverAliveInterval,
+		control: l.control, connectTimeout: l.connectTimeout,
+		serverAliveInterval: l.serverAliveInterval, serverAliveCountMax: l.serverAliveCountMax,
 		ciphers: l.ciphers.clone(), macs: l.macs.clone(),
 		kexAlgorithms: l.kexAlgorithms.clone(), hostKeyAlgorithms: l.hostKeyAlgorithms.clone(),
 	}
@@ -223,6 +233,7 @@ func (l OptionLayer) Equal(o OptionLayer) bool {
 		algebraic.EqualFirstWins(l.user, o.user) && EqualProxyRoute(l.proxy, o.proxy) &&
 		l.control.Equal(o.control) && algebraic.EqualFirstWins(l.connectTimeout, o.connectTimeout) &&
 		algebraic.EqualFirstWins(l.serverAliveInterval, o.serverAliveInterval) &&
+		algebraic.EqualFirstWins(l.serverAliveCountMax, o.serverAliveCountMax) &&
 		l.ciphers.Equal(o.ciphers) && l.macs.Equal(o.macs) &&
 		l.kexAlgorithms.Equal(o.kexAlgorithms) && l.hostKeyAlgorithms.Equal(o.hostKeyAlgorithms) &&
 		l.identityFiles.Equal(o.identityFiles) && l.certificateFiles.Equal(o.certificateFiles) &&

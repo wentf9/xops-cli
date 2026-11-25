@@ -15,13 +15,22 @@ import (
 )
 
 func FuzzTransferJournalJSON(f *testing.F) {
-	dest, _ := pathalg.ParseRemotePath("/var/tmp/f.bin")
-	rec, _ := NewTransferJournalRecord(TransferJournalRecordSpec{
+	upPath, _ := pathalg.ParseRemotePath("/var/tmp/f.bin")
+	upDest, _ := NewUploadDest(upPath)
+	recUp, _ := NewTransferJournalRecord(TransferJournalRecordSpec{
 		Version: JournalVersionV2, Generation: 1, Seq: 1, Kind: JournalRecordInit,
-		TransferID: testOpID(60), Dest: algebraic.Some(dest), TotalBytes: 1024, Digest: algebraic.Some(testDigest("f")),
+		TransferID: testOpID(60), Dest: algebraic.Some(upDest), TotalBytes: 1024, Digest: algebraic.Some(testDigest("f")),
 	})
-	seed, _ := jsonv2.Marshal(rec, jsonv2.Deterministic(true))
-	f.Add(seed)
+	dlPath, _ := pathalg.ParseLocalRootedDest("dl/f.bin")
+	dlDest, _ := NewDownloadDest(dlPath)
+	recDl, _ := NewTransferJournalRecord(TransferJournalRecordSpec{
+		Version: JournalVersionV2, Generation: 1, Seq: 1, Kind: JournalRecordInit,
+		TransferID: testOpID(60), Dest: algebraic.Some(dlDest), TotalBytes: 1024, Digest: algebraic.None[security.Digest](),
+	})
+	seedUp, _ := jsonv2.Marshal(recUp, jsonv2.Deterministic(true))
+	seedDl, _ := jsonv2.Marshal(recDl, jsonv2.Deterministic(true))
+	f.Add(seedUp)
+	f.Add(seedDl)
 	f.Add([]byte(`null`))
 	f.Add([]byte(`{}`))
 
@@ -59,17 +68,25 @@ func FuzzRecoverTransferFromJournal(f *testing.F) {
 	f.Add([]byte{1, 5, 6}, uint64(0), uint8(2))
 
 	f.Fuzz(func(t *testing.T, ops []byte, total uint64, verRaw uint8) {
-		runFuzzRecoverTransfer(t, ops, total%(MaxTransferBytes+1), pickIf(verRaw%2 == 0, JournalVersionV1, JournalVersionV2))
+		runFuzzRecoverTransfer(t, ops, total%(MaxTransferBytes+1), pickIf(verRaw%2 == 0, JournalVersionV1, JournalVersionV2), verRaw&2 != 0, verRaw&4 != 0)
 	})
 }
 
-func runFuzzRecoverTransfer(t *testing.T, ops []byte, total uint64, ver JournalVersion) {
+func runFuzzRecoverTransfer(t *testing.T, ops []byte, total uint64, ver JournalVersion, isDownload, omitExpected bool) {
 	t.Helper()
-	dest, _ := pathalg.ParseRemotePath("/tmp/fuzz.bin")
+	var dest TransferDest
+	if isDownload {
+		p, _ := pathalg.ParseLocalRootedDest("fuzz/out.bin")
+		dest, _ = NewDownloadDest(p)
+	} else {
+		p, _ := pathalg.ParseRemotePath("/tmp/fuzz.bin")
+		dest, _ = NewUploadDest(p)
+	}
 	dig := security.DigestFromSHA256(sha256.Sum256(ops))
+	initDig := pickIf(omitExpected, algebraic.None[security.Digest](), algebraic.Some(dig))
 	initRec, err := NewTransferJournalRecord(TransferJournalRecordSpec{
 		Version: ver, Generation: 1, Seq: 1, Kind: JournalRecordInit,
-		TransferID: testOpID(61), Dest: algebraic.Some(dest), TotalBytes: total, Digest: algebraic.Some(dig),
+		TransferID: testOpID(61), Dest: algebraic.Some(dest), TotalBytes: total, Digest: initDig,
 	})
 	if err != nil {
 		return
@@ -94,7 +111,7 @@ func runFuzzRecoverTransfer(t *testing.T, ops []byte, total uint64, ver JournalV
 }
 
 func buildFuzzJournalSpec(ver JournalVersion, seq uint64, b byte, off, total uint64, dig security.Digest, prev algebraic.Option[security.Digest]) (TransferJournalRecordSpec, uint64) {
-	noDest := algebraic.None[pathalg.RemotePath]()
+	noDest := algebraic.None[TransferDest]()
 	noDig := algebraic.None[security.Digest]()
 	switch b % 5 {
 	case 0:
@@ -128,9 +145,8 @@ func runFuzzVaultSaga(t *testing.T, script []byte) {
 	t.Helper()
 	newRef, _ := secret.NewRef("vault", "fuzz-new")
 	oldRef, _ := secret.NewRef("vault", "fuzz-old")
-	dig := testDigest("fuzz-secret")
 	ctx, err := NewVaultSagaContext(VaultSagaContextSpec{
-		SagaID: testOpID(62), NewRef: newRef, OldRef: algebraic.Some(oldRef), ExpectedCASVersion: 1, ExpectedDigest: dig,
+		SagaID: testOpID(62), NewRef: newRef, OldRef: algebraic.Some(oldRef), ExpectedCASVersion: 1,
 	})
 	if err != nil {
 		t.Fatalf("NewVaultSagaContext 失败: %v", err)
@@ -138,7 +154,7 @@ func runFuzzVaultSaga(t *testing.T, script []byte) {
 	var st VaultSagaState
 	st, _ = NewVaultSagaState(ctx)
 	for _, op := range script {
-		next, effs, _, err := TransitionVaultSaga(st, fuzzVaultInput(op, dig))
+		next, effs, _, err := TransitionVaultSaga(st, fuzzVaultInput(op))
 		if err != nil {
 			if next != st || len(effs) != 0 {
 				t.Fatalf("非法转移不得改变原状态或产生副作用")
@@ -152,15 +168,15 @@ func runFuzzVaultSaga(t *testing.T, script []byte) {
 	}
 }
 
-func fuzzVaultInput(op byte, dig security.Digest) VaultSagaInput {
-	switch op % 11 {
+func fuzzVaultInput(op byte) VaultSagaInput {
+	switch op % 12 {
 	case 0:
 		return VaultInputStart()
 	case 1:
 		in, _ := VaultInputWriteNewResult(SideEffectSucceeded, "ok")
 		return in
 	case 2:
-		in, _ := VaultInputReadbackResult(true, dig, "ok")
+		in, _ := VaultInputReadbackResult(SideEffectSucceeded, true, "ok")
 		return in
 	case 3:
 		in, _ := VaultInputCommitCASResult(DurabilityCommitted, "ok")
@@ -178,9 +194,12 @@ func fuzzVaultInput(op byte, dig security.Digest) VaultSagaInput {
 		in, _ := VaultInputWriteNewResult(SideEffectOutcomeUnknown, "unk")
 		return in
 	case 8:
-		in, _ := VaultInputReadbackResult(false, zeroVal[security.Digest](), "mismatch")
+		in, _ := VaultInputReadbackResult(SideEffectSucceeded, false, "mismatch")
 		return in
 	case 9:
+		in, _ := VaultInputReadbackResult(SideEffectOutcomeUnknown, false, "readback_unk")
+		return in
+	case 10:
 		in, _ := VaultInputCommitCASResult(DurabilityAppliedNotDurable, "fsync")
 		return in
 	default:

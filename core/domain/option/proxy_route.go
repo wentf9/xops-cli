@@ -72,16 +72,44 @@ func wrapProxyErr(err error) error {
 }
 
 func parseHopPlainHost(h, full string) (string, error) {
-	if h == "" || h[0] == '-' || isNoneKeyword(h) {
-		return "", fmt.Errorf("%w: 跳板目标 %q 主机名非法", ErrInvalidProxyRoute, full)
+	return parsePlainHostOrAlias(h, full, ErrInvalidProxyRoute)
+}
+
+// parsePlainHostOrAlias 校验非方括号主机或 OpenSSH/NodeID 别名：
+// 合法 IP 字面量经 netaddr.ParseCanonicalHost 规范化；严格拦截畸形数值/八进制/十六进制 inet_aton SSRF 形态、
+// 前导 '-'、首尾 '.'、".."、保留字 "none" 与非法元字符，同时放行合法非 IP 别名（如 bastion.01、gw.1、Prod_Bastion、UTF-8）。
+func parsePlainHostOrAlias(h, full string, baseErr error) (string, error) {
+	if h == "" || len(h) > maxTokenLen || hasAnySpaceOrControl(h) || h[0] == '-' ||
+		h[0] == '.' || h[len(h)-1] == '.' || strings.Contains(h, "..") || isNoneKeyword(h) ||
+		strings.ContainsAny(h, "@:/\\,[]"+forbiddenHopShellChars) {
+		return "", fmt.Errorf("%w: 主机或别名 %q 非法", baseErr, full)
 	}
 	if ch, err := netaddr.ParseCanonicalHost(h); err == nil && ch.IsIP() {
 		return ch.String(), nil
 	}
-	if ch, err := netaddr.ParseCanonicalHost(strings.ReplaceAll(h, "_", "a")); err == nil && ch.IsDNS() {
-		return h, nil
+	if isNumericIPLike(h) {
+		return "", fmt.Errorf("%w: 主机 %q 为畸形数值 IP 形态", baseErr, full)
 	}
-	return "", fmt.Errorf("%w: 跳板目标 %q 主机或别名非法", ErrInvalidProxyRoute, full)
+	return h, nil
+}
+func isNumericIPLike(h string) bool {
+	for seg := range strings.SplitSeq(h, ".") {
+		if !isNumericOrHexSeg(seg) {
+			return false
+		}
+	}
+	return true
+}
+func isNumericOrHexSeg(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	if len(seg) > 2 && seg[0] == '0' && (seg[1] == 'x' || seg[1] == 'X') {
+		return strings.IndexFunc(seg[2:], func(r rune) bool {
+			return (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F')
+		}) < 0
+	}
+	return isAllASCIIDigits(seg)
 }
 
 func parseBracketedHop(hostPart, full string) (string, uint16, error) {
@@ -137,10 +165,7 @@ func (h *HopTarget) UnmarshalText(text []byte) error {
 //
 //xops:opaque
 //xops:failclosed
-type SanitizedCmd struct {
-	raw   string
-	valid bool
-}
+type SanitizedCmd struct{ textToken }
 
 // NewSanitizedCmd、NewProxySanitizedCmd 与 NewLocalSanitizedCmd 构造并校验单行命令模板。
 // NewSanitizedCmd 默认强制 INV-D4 占位符白名单（%%/%C/%d/%h/%i/%j/%L/%l/%n/%p/%r/%u）；
@@ -153,7 +178,7 @@ func NewSanitizedCmd(raw string) (SanitizedCmd, error) {
 	if err := validateTemplateTokens(t, allowedPathPercentTokens, false); err != nil {
 		return SanitizedCmd{}, fmt.Errorf("%w: %w", ErrInvalidProxyRoute, err)
 	}
-	return SanitizedCmd{t, true}, nil
+	return SanitizedCmd{textToken{t, true}}, nil
 }
 func NewProxySanitizedCmd(raw string) (SanitizedCmd, error) {
 	cmd, err := NewSanitizedCmd(raw)
@@ -172,9 +197,6 @@ func NewLocalSanitizedCmd(raw string) (SanitizedCmd, error) {
 func (c SanitizedCmd) isValidProxyCmd() bool {
 	return c.valid && hasValidTemplateTokens(c.raw, allowedProxyCmdPercentTokens, false)
 }
-func (c SanitizedCmd) IsValid() bool             { return c.valid }
-func (c SanitizedCmd) IsZero() bool              { return !c.valid }
-func (c SanitizedCmd) String() string            { return c.raw }
 func (c SanitizedCmd) Equal(o SanitizedCmd) bool { return c.valid && o.valid && c.raw == o.raw }
 func (c SanitizedCmd) AppendText(b []byte) ([]byte, error) {
 	return appendValidText(b, c.raw, c.valid, ErrInvalidProxyRoute)

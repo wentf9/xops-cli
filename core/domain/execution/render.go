@@ -9,8 +9,9 @@ import (
 )
 
 // RenderCommand 按启动方言、解释器、登录模式、工作目录与环境变量确定性渲染远端执行命令行（零 OS 调用）。
-// 对于 PlanKindScript，RenderCommand 仅输出目标解释器标准输入消费命令（POSIX: "<interp> [-l] -s"；
-// PowerShell: "<exe> -NoProfile -NonInteractive -Command -"），完整前言与脚本正文经 StdinPayload() 投递。
+// 对于 PlanKindScript，RenderCommand 输出目标解释器标准输入消费命令：
+//   - POSIX：无位置参数时为 "<interp> [-l] -s"，携带位置参数 Argv 时为 "<interp> [-l] -s -- <QuotePOSIX(arg)...>"；
+//   - PowerShell：恒为 "<exe> -NoProfile -NonInteractive -Command -"，前言、脚本正文与位置参数均经 StdinPayload() 投递。
 func (p CommandPlan) RenderCommand() (string, error) {
 	if !p.IsValid() {
 		return "", ErrInvalidCommandPlan
@@ -29,7 +30,8 @@ func (p CommandPlan) RenderCommand() (string, error) {
 	}
 }
 
-// StdinPayload 返回需要经远端 stdin 投递的脚本完整载荷（含在目标解释器内执行的 WorkDir/Env 前言与脚本正文）。
+// StdinPayload 返回需要经远端 stdin 投递的脚本完整载荷（含在目标解释器内执行的 WorkDir/Env 前言与脚本正文；
+// PowerShell 携带位置参数 Argv 时以 "& {\n<script>\n} <QuotePowerShell(arg)...>" 形式安全传参）。
 // PlanKindCommand 或无效零值恒返回 ("", false)，实现 (RenderCommand, StdinPayload) 显式统一执行契约。
 func (p CommandPlan) StdinPayload() (string, bool) {
 	if !p.IsValid() || p.kind != PlanKindScript {
@@ -43,17 +45,21 @@ func (p CommandPlan) StdinPayload() (string, bool) {
 		}
 		return strings.TrimRight(prefix, " ") + "\n" + p.command, true
 	case InterpreterPowerShell, InterpreterPwsh:
+		body := p.command
+		if len(p.argv) > 0 {
+			body = "& {\n" + p.command + "\n} " + joinQuotedTrusted(p.argv, quotePowerShellTrusted)
+		}
 		prologue := buildPowerShellPrologueTrusted(p.workDir, p.env)
 		if len(prologue) == 0 {
-			return p.command, true
+			return body, true
 		}
-		return strings.Join(prologue, "; ") + "\n" + p.command, true
+		return strings.Join(prologue, "; ") + "\n" + body, true
 	default:
 		return "", false
 	}
 }
 
-// validateScriptStdin 在构造期校验脚本模式经 stdin 投递时涉及的 WorkDir/Env 前言均可被目标解释器安全引用。
+// validateScriptStdin 在构造期校验脚本模式经 stdin 投递时涉及的 WorkDir/Env 前言与 PowerShell 位置参数均可安全引用。
 func (p CommandPlan) validateScriptStdin() error {
 	if p.kind != PlanKindScript {
 		return nil
@@ -63,8 +69,15 @@ func (p CommandPlan) validateScriptStdin() error {
 		_, err := buildPOSIXPrefix(p.workDir, p.env)
 		return err
 	case InterpreterPowerShell, InterpreterPwsh:
-		_, err := buildPowerShellPrologue(p.workDir, p.env)
-		return err
+		if _, err := buildPowerShellPrologue(p.workDir, p.env); err != nil {
+			return err
+		}
+		if len(p.argv) > 0 {
+			if _, err := joinQuoted(p.argv, QuotePowerShell); err != nil {
+				return err
+			}
+		}
+		return nil
 	default:
 		return ErrUnsupportedExecutionCombination
 	}
@@ -111,7 +124,15 @@ func (p CommandPlan) renderPOSIXInterpreter() (string, error) {
 	interp := p.profile.Interpreter().String()
 	loginFlag := pickIf(p.profile.LoginMode() == LoginModeLogin, " -l", "")
 	if p.kind == PlanKindScript {
-		return interp + loginFlag + " -s", nil
+		base := interp + loginFlag + " -s"
+		if len(p.argv) == 0 {
+			return base, nil
+		}
+		quoted, err := joinQuoted(p.argv, QuotePOSIX)
+		if err != nil {
+			return "", err
+		}
+		return base + " -- " + quoted, nil
 	}
 	inner, err := p.renderPOSIXBody()
 	if err != nil {
@@ -269,4 +290,12 @@ func joinQuoted(args []string, quote func(string) (string, error)) (string, erro
 		out[i] = q
 	}
 	return strings.Join(out, " "), nil
+}
+
+func joinQuotedTrusted(args []string, quote func(string) string) string {
+	out := make([]string, len(args))
+	for i, arg := range args {
+		out[i] = quote(arg)
+	}
+	return strings.Join(out, " ")
 }

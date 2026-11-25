@@ -36,30 +36,55 @@ const (
 	SecretLocPending                                       // 扩展位置：待确认会话 / 运行期覆盖引用
 )
 
+// ParseAssetRefLocation 与 ParseSecretRefLocation 严格解析规范小写引用位置文本。
+func ParseAssetRefLocation(raw string) (AssetRefLocation, error) {
+	return parseEnumByName(raw, AssetRefNodeHost, AssetRefNodeProxyJump, AssetRefLocationInvalid, AssetRefLocation.String, ErrInvalidGraph)
+}
+func ParseSecretRefLocation(raw string) (SecretRefLocation, error) {
+	return parseEnumByName(raw, SecretLocAuthPassword, SecretLocPending, SecretLocInvalid, SecretRefLocation.String, ErrInvalidGraph)
+}
 func (l AssetRefLocation) IsValid() bool { return l >= AssetRefNodeHost && l <= AssetRefNodeProxyJump }
+func (l AssetRefLocation) IsZero() bool  { return l == AssetRefLocationInvalid }
 func (l AssetRefLocation) String() string {
 	return enumName(uint8(l), "invalid", "invalid", "node_host", "node_identity", "node_proxy_jump")
 }
+func (l AssetRefLocation) AppendText(b []byte) ([]byte, error) {
+	return appendValidText(b, l.IsValid(), l.String(), ErrInvalidGraph)
+}
+func (l AssetRefLocation) MarshalText() ([]byte, error) { return l.AppendText(nil) }
+func (l *AssetRefLocation) UnmarshalText(b []byte) error {
+	return unmarshalText(l, b, ParseAssetRefLocation)
+}
 func (l SecretRefLocation) IsValid() bool { return l >= SecretLocAuthPassword && l <= SecretLocPending }
+func (l SecretRefLocation) IsZero() bool  { return l == SecretLocInvalid }
 func (l SecretRefLocation) String() string {
 	return enumName(uint8(l), "invalid", "invalid", "auth_password", "private_key_passphrase", "challenge_totp", "challenge_secret", "node_privilege", "pending")
+}
+func (l SecretRefLocation) AppendText(b []byte) ([]byte, error) {
+	return appendValidText(b, l.IsValid(), l.String(), ErrInvalidGraph)
+}
+func (l SecretRefLocation) MarshalText() ([]byte, error) { return l.AppendText(nil) }
+func (l *SecretRefLocation) UnmarshalText(b []byte) error {
+	return unmarshalText(l, b, ParseSecretRefLocation)
 }
 
 // AssetReference、SecretReference、PendingSecretRef 与 GraphSpec 描述资产与凭据引用检查模型。
 type (
 	AssetReference struct {
-		Location         AssetRefLocation
-		FromNode         NodeID
-		Target, ViaAlias string
+		Location AssetRefLocation `json:"location"`
+		FromNode NodeID           `json:"from_node"`
+		Target   string           `json:"target"`
+		ViaAlias string           `json:"via_alias,omitzero"`
 	}
 	SecretReference struct {
-		Location          SecretRefLocation
-		OwnerID, RuleName string
-		Ref               secret.Ref
+		Location SecretRefLocation `json:"location"`
+		OwnerID  string            `json:"owner_id"`
+		RuleName string            `json:"rule_name,omitzero"`
+		Ref      secret.Ref        `json:"ref"`
 	}
 	PendingSecretRef struct {
-		OwnerID string
-		Ref     secret.Ref
+		OwnerID string     `json:"owner_id"`
+		Ref     secret.Ref `json:"ref"`
 	}
 	GraphSpec struct {
 		Hosts        []Host

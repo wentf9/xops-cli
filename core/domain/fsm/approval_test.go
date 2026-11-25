@@ -280,6 +280,25 @@ func TestApprovalRound2ProbeFailureAndTokenInvalidation(t *testing.T) {
 	assertApprovalPhase(t, approved, err, ApprovalPhaseApproved)
 	revoked, _, _, err := TransitionApproval(approved, ApprovalInputRound2ProbeFailed("race detected"))
 	assertApprovalPhase(t, revoked, err, ApprovalPhaseTokenInvalidated)
+
+	// 4. 回归测试：已绑定审批信封的受保护路径（/srv/config.yaml）经 Round-2 被重定向至任意非受保护路径（/var/data/prod.db，Allow/RiskSafe）
+	// 即使作用域风险看似降低，因违反信封绑定严禁良性钉住，必须立即作废令牌（ApprovalPhaseTokenInvalidated）！
+	issued4, bind4, dig4, _ := makeIssuedApproval(t, testOpID(16), "/srv/config.yaml", now)
+	inVerify4, _ := ApprovalInputVerifyToken(dig4, bind4, now.Add(time.Second), true)
+	approvedEnv, _, _, err := TransitionApproval(issued4, inVerify4)
+	assertApprovalPhase(t, approvedEnv, err, ApprovalPhaseApproved)
+	if !approvedEnv.Envelope().IsSome() {
+		t.Fatal("经挑战核准后的 Approved 状态必须持有已绑定信封")
+	}
+	unprotBind := mustApprovalBinding(t, "/var/data/prod.db")
+	unprotSnap := mustScopeSnap(t, "/var/data/prod.db", nil, security.RiskSafe, security.NewDecisionAllow("unprotected"))
+	inRedirect, _ := ApprovalInputCanonicalized(unprotSnap, unprotBind)
+	invRedirect, effsRedir, _, err := TransitionApproval(approvedEnv, inRedirect)
+	assertApprovalPhase(t, invRedirect, err, ApprovalPhaseTokenInvalidated)
+	assertApprovalSingleEffect(t, effsRedir, ApprovalEffectInvalidateToken)
+	if !invRedirect.InvalidatedDigest().IsSome() {
+		t.Fatal("信封路径重定向作废必须保留被吊销的 InvalidatedDigest")
+	}
 }
 
 func TestApprovalTokenExpiryTamperAndUserDeny(t *testing.T) {

@@ -145,7 +145,8 @@ func redactCommandSummary(p CommandPlan) string {
 func formatRedactedPayload(p CommandPlan) string {
 	raw := p.command
 	if len(p.argv) > 0 {
-		raw = strings.Join(p.argv, " ")
+		args := strings.Join(p.argv, " ")
+		raw = pickIf(raw == "", args, raw+" -- "+args)
 	}
 	masked := redactInlineSecrets(raw)
 	sanitized := security.SanitizePromptText(masked)

@@ -47,8 +47,24 @@ func TestExternalInterfaceContracts(t *testing.T) {
 		n   inventory.Node
 		iw  inventory.ImportWarning
 		ib  inventory.ImportBundle
+		tk  inventory.TargetKey
+		arl inventory.AssetRefLocation
+		srl inventory.SecretRefLocation
+		iak inventory.ImportActionKind
 	)
 	var (
+		_ encoding.TextAppender    = tk
+		_ encoding.TextMarshaler   = tk
+		_ encoding.TextUnmarshaler = &tk
+		_ encoding.TextAppender    = arl
+		_ encoding.TextMarshaler   = arl
+		_ encoding.TextUnmarshaler = &arl
+		_ encoding.TextAppender    = srl
+		_ encoding.TextMarshaler   = srl
+		_ encoding.TextUnmarshaler = &srl
+		_ encoding.TextAppender    = iak
+		_ encoding.TextMarshaler   = iak
+		_ encoding.TextUnmarshaler = &iak
 		_ encoding.TextAppender    = hid
 		_ encoding.TextMarshaler   = hid
 		_ encoding.TextUnmarshaler = &hid

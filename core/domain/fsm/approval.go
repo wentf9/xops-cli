@@ -35,7 +35,6 @@ const (
 	ApprovalPhaseTokenInvalidated
 	ApprovalPhaseDenied
 )
-
 const (
 	approvalInInvalid uint8 = iota
 	approvalInEvalLexical
@@ -45,7 +44,6 @@ const (
 	approvalInIssueChallenge
 	approvalInVerifyToken
 )
-
 const (
 	ApprovalEffectInvalid ApprovalEffectKind = iota
 	ApprovalEffectCanonicalize
@@ -53,7 +51,6 @@ const (
 	ApprovalEffectPresentChallenge
 	ApprovalEffectInvalidateToken
 )
-
 const (
 	ApprovalEventInvalid ApprovalEventKind = iota
 	ApprovalEventCanonicalizeRequested
@@ -66,35 +63,14 @@ const (
 	ApprovalEventTokenInvalidated
 )
 
-func (p ApprovalPhase) IsValid() bool {
-	return p >= ApprovalPhaseLexicalPrecheck && p <= ApprovalPhaseDenied
-}
-func (k ApprovalEffectKind) IsValid() bool {
-	return k >= ApprovalEffectCanonicalize && k <= ApprovalEffectInvalidateToken
-}
-func (k ApprovalEventKind) IsValid() bool {
-	return k >= ApprovalEventCanonicalizeRequested && k <= ApprovalEventTokenInvalidated
-}
-func (p ApprovalPhase) String() string {
-	return enumName(uint8(p), "invalid", "invalid", "lexical_precheck", "canonicalizing", "evaluating_escalation", "challenge_pending", "challenge_issued", "approved", "token_invalidated", "denied")
-}
-func (k ApprovalEffectKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "canonicalize", "request_challenge", "present_challenge", "invalidate_token")
-}
-func (k ApprovalEventKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "canonicalize_requested", "canonicalized", "escalation_detected", "challenge_requested", "challenge_issued", "approved", "denied", "token_invalidated")
-}
-
-// ApprovalContextSpec 承载构造 ApprovalContext 的显式入参。
-type ApprovalContextSpec struct {
-	OperationID     security.OperationID
-	LexicalBinding  security.OperationBinding
-	LexicalSnapshot security.ScopeSnapshot
-	PolicyDigest    algebraic.Option[security.Digest]
-}
-
-// ApprovalContext、ApprovalState、ApprovalInput 与 ApprovalEffect 为 ApprovalFSM 不可变失败关闭值对象。
+// ApprovalContextSpec 与 ApprovalContext/State/Input/Effect 为 ApprovalFSM 不可变失败关闭值对象。
 type (
+	ApprovalContextSpec struct {
+		OperationID     security.OperationID
+		LexicalBinding  security.OperationBinding
+		LexicalSnapshot security.ScopeSnapshot
+		PolicyDigest    algebraic.Option[security.Digest]
+	}
 	//xops:opaque
 	//xops:failclosed
 	ApprovalContext struct {
@@ -167,7 +143,6 @@ func NewApprovalState(ctx ApprovalContext) (ApprovalState, error) {
 	}
 	return approvalAt(ctx, ApprovalPhaseLexicalPrecheck, ctx.lexicalSnapshot, ctx.lexicalBinding), nil
 }
-
 func (c ApprovalContext) IsValid() bool {
 	return c.valid && c.operationID.IsValid() && c.lexicalBinding.IsValid() && c.lexicalSnapshot.IsValid()
 }
@@ -254,7 +229,7 @@ func TransitionApproval(state ApprovalState, input ApprovalInput) (ApprovalState
 	case ApprovalPhaseChallengeIssued:
 		return stepApprovalChallengeIssued(state, input)
 	case ApprovalPhaseApproved:
-		return stepApprovalApproved(state, input)
+		return stepApprovalReprobe(state, state.envelopeDigest, input, "approved 禁止重放校验或回退状态")
 	case ApprovalPhaseTokenInvalidated, ApprovalPhaseDenied:
 		return state, nil, nil, fmt.Errorf("%w: 终态 %s 不接受任何输入", ErrIllegalTransition, state.phase)
 	default:
@@ -272,14 +247,12 @@ func stepApprovalLexical(s ApprovalState, in ApprovalInput) (ApprovalState, []Ap
 	switch d := s.ctx.lexicalSnapshot.Decision().(type) {
 	case *security.DecisionDeny:
 		return approvalDeny(s, pickIf(d.Reason() != "", d.Reason(), "lexical guardrail denied"), nil)
-	case *security.DecisionNeedApproval:
+	case *security.DecisionNeedApproval, *security.DecisionAllow:
 		if in.requiresCanonicalization {
-			return approvalNext(approvalAt(s.ctx, ApprovalPhaseCanonicalizing, s.activeSnapshot, s.activeBinding), ApprovalEffectCanonicalize, ApprovalEventCanonicalizeRequested, "lexical_need_approval")
+			return approvalNext(approvalAt(s.ctx, ApprovalPhaseCanonicalizing, s.activeSnapshot, s.activeBinding), ApprovalEffectCanonicalize, ApprovalEventCanonicalizeRequested, "requires_canonicalize")
 		}
-		return approvalNext(approvalAt(s.ctx, ApprovalPhaseChallengePending, s.ctx.lexicalSnapshot, s.ctx.lexicalBinding), ApprovalEffectRequestChallenge, ApprovalEventChallengeRequested, d.Reason())
-	case *security.DecisionAllow:
-		if in.requiresCanonicalization {
-			return approvalNext(approvalAt(s.ctx, ApprovalPhaseCanonicalizing, s.activeSnapshot, s.activeBinding), ApprovalEffectCanonicalize, ApprovalEventCanonicalizeRequested, "lexical_allow_needs_canonicalize")
+		if na, ok := d.(*security.DecisionNeedApproval); ok {
+			return approvalNext(approvalAt(s.ctx, ApprovalPhaseChallengePending, s.ctx.lexicalSnapshot, s.ctx.lexicalBinding), ApprovalEffectRequestChallenge, ApprovalEventChallengeRequested, na.Reason())
 		}
 		return approvalAt(s.ctx, ApprovalPhaseApproved, s.ctx.lexicalSnapshot, s.ctx.lexicalBinding), nil, []ApprovalEvent{newEvent(ApprovalEventApproved, "lexical_direct_allow")}, nil
 	default:
@@ -293,8 +266,7 @@ func stepApprovalCanonicalizing(s ApprovalState, in ApprovalInput) (ApprovalStat
 	if in.kind != approvalInCanonicalized {
 		return s, nil, nil, fmt.Errorf("%w: canonicalizing 仅接受 Canonicalized 或 Round2ProbeFailed", ErrIllegalTransition)
 	}
-	res := security.InspectScopeEscalation(s.ctx.lexicalSnapshot, in.canonicalSnapshot)
-	if !sameNonPathBinding(s.ctx.lexicalBinding, in.canonicalBinding) || hasIdentityDrift(res) {
+	if res := security.InspectScopeEscalation(s.ctx.lexicalSnapshot, in.canonicalSnapshot); !sameNonPathBinding(s.ctx.lexicalBinding, in.canonicalBinding) || hasIdentityDrift(res) {
 		return approvalDeny(s, "canonical identity or non-path binding drifted", res.Reasons())
 	}
 	next := approvalAt(s.ctx, ApprovalPhaseEvaluatingEscalation, in.canonicalSnapshot, in.canonicalBinding)
@@ -313,8 +285,7 @@ func stepApprovalEvaluateEscalation(s ApprovalState, in ApprovalInput) (Approval
 	if !sameNonPathBinding(s.ctx.lexicalBinding, s.activeBinding) || hasIdentityDrift(res) {
 		return approvalDeny(s, "canonical identity or non-path binding drifted", reasons)
 	}
-	effVerdict := s.ctx.lexicalSnapshot.Verdict().Meet(s.activeSnapshot.Verdict())
-	effRisk := s.ctx.lexicalSnapshot.Risk().Join(s.activeSnapshot.Risk())
+	effVerdict, effRisk := s.ctx.lexicalSnapshot.Verdict().Meet(s.activeSnapshot.Verdict()), s.ctx.lexicalSnapshot.Risk().Join(s.activeSnapshot.Risk())
 	if effVerdict.Denied() || !effRisk.IsValid() {
 		return approvalDeny(s, "effective verdict denied", reasons)
 	}
@@ -340,11 +311,9 @@ func decideAfterEscalation(s ApprovalState, effDec security.GuardrailDecision, e
 func enterChallengePending(s ApprovalState, effRisk security.RiskLevel, escalated bool, reasons []security.EscalationReason, detail string) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	next := approvalAt(s.ctx, ApprovalPhaseChallengePending, s.activeSnapshot, s.activeBinding)
 	next.effectiveRisk, next.escalated, next.escalationReasons = effRisk, escalated, reasons
-	events := []ApprovalEvent{newEvent(ApprovalEventChallengeRequested, detail)}
-	if escalated {
-		events = append([]ApprovalEvent{newEvent(ApprovalEventEscalationDetected, detail)}, events...)
-	}
-	return next, []ApprovalEffect{approvalEffect(ApprovalEffectRequestChallenge, algebraic.None[security.ApprovalEnvelope](), algebraic.None[security.Digest]())}, events, nil
+	reqEv := newEvent(ApprovalEventChallengeRequested, detail)
+	events := pickIf(escalated, []ApprovalEvent{newEvent(ApprovalEventEscalationDetected, detail), reqEv}, []ApprovalEvent{reqEv})
+	return next, []ApprovalEffect{{kind: ApprovalEffectRequestChallenge, valid: true}}, events, nil
 }
 func stepApprovalChallengePending(s ApprovalState, in ApprovalInput) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	if in.kind == approvalInIssueChallenge {
@@ -361,9 +330,9 @@ func bindIssuedChallenge(s ApprovalState, env security.ApprovalEnvelope) (Approv
 	if err != nil {
 		return s, nil, nil, fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, err)
 	}
-	next := approvalAt(s.ctx, ApprovalPhaseChallengeIssued, s.activeSnapshot, s.activeBinding)
-	next.effectiveRisk, next.envelope, next.envelopeDigest, next.escalated, next.escalationReasons = s.effectiveRisk, algebraic.Some(env), algebraic.Some(dig), s.escalated, slices.Clone(s.escalationReasons)
-	return next, []ApprovalEffect{approvalEffect(ApprovalEffectPresentChallenge, algebraic.Some(env), algebraic.Some(dig))}, []ApprovalEvent{newEvent(ApprovalEventChallengeIssued, dig.String())}, nil
+	next := s
+	next.phase, next.envelope, next.envelopeDigest, next.escalationReasons = ApprovalPhaseChallengeIssued, algebraic.Some(env), algebraic.Some(dig), slices.Clone(s.escalationReasons)
+	return next, []ApprovalEffect{{ApprovalEffectPresentChallenge, next.envelope, next.envelopeDigest, true}}, []ApprovalEvent{newEvent(ApprovalEventChallengeIssued, dig.String())}, nil
 }
 func stepApprovalChallengeIssued(s ApprovalState, in ApprovalInput) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	if in.kind == approvalInVerifyToken {
@@ -378,8 +347,8 @@ func verifyIssuedToken(s ApprovalState, in ApprovalInput) (ApprovalState, []Appr
 		return s, nil, nil, ErrInvalidState
 	}
 	if !in.userApproved {
-		denied := ApprovalState{phase: ApprovalPhaseDenied, ctx: s.ctx, activeSnapshot: s.activeSnapshot, activeBinding: s.activeBinding, effectiveRisk: s.effectiveRisk, invalidatedDigest: s.envelopeDigest, escalated: s.escalated, escalationReasons: slices.Clone(s.escalationReasons), reason: "user rejected approval challenge", valid: true}
-		return denied, []ApprovalEffect{approvalEffect(ApprovalEffectInvalidateToken, algebraic.None[security.ApprovalEnvelope](), s.envelopeDigest)}, []ApprovalEvent{newEvent(ApprovalEventDenied, "user_rejected")}, nil
+		denied := approvalTerminal(s, ApprovalPhaseDenied, s.envelopeDigest, "user rejected approval challenge", nil)
+		return denied, []ApprovalEffect{{kind: ApprovalEffectInvalidateToken, envelopeDigest: s.envelopeDigest, valid: true}}, []ApprovalEvent{newEvent(ApprovalEventDenied, "user_rejected")}, nil
 	}
 	if !env.IsActiveAt(in.now) || !env.MatchesBinding(in.submittedBinding) {
 		return invalidateToken(s, s.envelopeDigest, "approval token expired or binding mismatch", nil)
@@ -387,30 +356,29 @@ func verifyIssuedToken(s ApprovalState, in ApprovalInput) (ApprovalState, []Appr
 	if matched, err := env.MatchesDigest(in.submittedDigest); err != nil || !matched || !dig.Equal(in.submittedDigest) {
 		return invalidateToken(s, s.envelopeDigest, "approval token digest mismatch", nil)
 	}
-	next := approvalAt(s.ctx, ApprovalPhaseApproved, s.activeSnapshot, s.activeBinding)
-	next.effectiveRisk, next.envelope, next.envelopeDigest, next.escalated, next.escalationReasons = s.effectiveRisk, s.envelope, s.envelopeDigest, s.escalated, slices.Clone(s.escalationReasons)
+	next := s
+	next.phase, next.escalationReasons = ApprovalPhaseApproved, slices.Clone(s.escalationReasons)
 	return next, nil, []ApprovalEvent{newEvent(ApprovalEventApproved, dig.String())}, nil
 }
-func stepApprovalApproved(s ApprovalState, in ApprovalInput) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
-	return stepApprovalReprobe(s, s.envelopeDigest, in, "approved 禁止重放校验或回退状态")
-}
 func stepApprovalReprobe(s ApprovalState, tokDig algebraic.Option[security.Digest], in ApprovalInput, illegalMsg string) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
-	switch in.kind {
-	case approvalInRound2Failed:
+	if in.kind == approvalInRound2Failed {
 		return invalidateToken(s, tokDig, pickIf(in.reason != "", in.reason, "round2 probe failed"), nil)
-	case approvalInCanonicalized:
-		return stepApprovalReprobeCanonical(s, tokDig, in)
-	default:
-		return s, nil, nil, fmt.Errorf("%w: %s", ErrIllegalTransition, illegalMsg)
 	}
+	if in.kind == approvalInCanonicalized {
+		return stepApprovalReprobeCanonical(s, tokDig, in)
+	}
+	return s, nil, nil, fmt.Errorf("%w: %s", ErrIllegalTransition, illegalMsg)
 }
 func stepApprovalReprobeCanonical(s ApprovalState, tokDig algebraic.Option[security.Digest], in ApprovalInput) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	res := security.InspectScopeEscalation(s.activeSnapshot, in.canonicalSnapshot)
-	bindingOK := pickIf(s.phase == ApprovalPhaseApproved, sameNonPathBinding(s.activeBinding, in.canonicalBinding), s.activeBinding.Equal(in.canonicalBinding))
+	// 良性 Round-2 路径钉住仅限于未经挑战信封的词法直接放行（s.envelope.IsNone()）；
+	// 一旦已签发并绑定挑战信封（s.envelope.IsSome()），规范绑定必须与 activeBinding 完全相等，阻断受保护路径被重定向至非受保护路径绕过信封。
+	allowBenignPathPin := s.phase == ApprovalPhaseApproved && s.envelope.IsNone()
+	bindingOK := pickIf(allowBenignPathPin, sameNonPathBinding(s.activeBinding, in.canonicalBinding), s.activeBinding.Equal(in.canonicalBinding))
 	if res.Escalated() || !bindingOK || in.canonicalSnapshot.Verdict().Denied() || in.canonicalSnapshot.Decision().Kind() == security.DecisionKindDeny {
 		return invalidateToken(s, tokDig, "post-challenge canonical scope escalated or binding drifted", res.Reasons())
 	}
-	if s.phase == ApprovalPhaseApproved {
+	if allowBenignPathPin {
 		next := s
 		next.activeSnapshot, next.activeBinding, next.escalationReasons = in.canonicalSnapshot, in.canonicalBinding, slices.Clone(s.escalationReasons)
 		return next, nil, []ApprovalEvent{newEvent(ApprovalEventCanonicalized, "reprobe_pinned")}, nil
@@ -446,16 +414,19 @@ func approvalAt(ctx ApprovalContext, phase ApprovalPhase, snap security.ScopeSna
 	return ApprovalState{phase: phase, ctx: ctx, activeSnapshot: snap, activeBinding: bind, effectiveRisk: snap.Risk(), valid: true}
 }
 func approvalNext(next ApprovalState, eff ApprovalEffectKind, ev ApprovalEventKind, detail string) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
-	return next, []ApprovalEffect{approvalEffect(eff, algebraic.None[security.ApprovalEnvelope](), algebraic.None[security.Digest]())}, []ApprovalEvent{newEvent(ev, detail)}, nil
+	return next, []ApprovalEffect{{kind: eff, valid: true}}, []ApprovalEvent{newEvent(ev, detail)}, nil
+}
+func approvalTerminal(s ApprovalState, phase ApprovalPhase, invDig algebraic.Option[security.Digest], reason string, extra []security.EscalationReason) ApprovalState {
+	next := s
+	next.phase, next.envelope, next.envelopeDigest, next.invalidatedDigest = phase, algebraic.None[security.ApprovalEnvelope](), algebraic.None[security.Digest](), invDig
+	next.escalated, next.escalationReasons, next.reason, next.valid = s.escalated || len(extra) > 0, mergeEscalationReasons(s.escalationReasons, extra), sanitizeReason(reason), true
+	return next
 }
 func approvalDeny(s ApprovalState, reason string, extra []security.EscalationReason) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
-	clean := sanitizeReason(reason)
-	return ApprovalState{phase: ApprovalPhaseDenied, ctx: s.ctx, activeSnapshot: s.activeSnapshot, activeBinding: s.activeBinding, effectiveRisk: s.effectiveRisk, escalated: s.escalated || len(extra) > 0, escalationReasons: mergeEscalationReasons(s.escalationReasons, extra), reason: clean, valid: true}, nil, []ApprovalEvent{newEvent(ApprovalEventDenied, clean)}, nil
+	st := approvalTerminal(s, ApprovalPhaseDenied, algebraic.None[security.Digest](), reason, extra)
+	return st, nil, []ApprovalEvent{newEvent(ApprovalEventDenied, st.reason)}, nil
 }
 func invalidateToken(s ApprovalState, dig algebraic.Option[security.Digest], reason string, extra []security.EscalationReason) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
-	clean := sanitizeReason(reason)
-	return ApprovalState{phase: ApprovalPhaseTokenInvalidated, ctx: s.ctx, activeSnapshot: s.activeSnapshot, activeBinding: s.activeBinding, effectiveRisk: s.effectiveRisk, invalidatedDigest: dig, escalated: s.escalated || len(extra) > 0, escalationReasons: mergeEscalationReasons(s.escalationReasons, extra), reason: clean, valid: true}, []ApprovalEffect{approvalEffect(ApprovalEffectInvalidateToken, algebraic.None[security.ApprovalEnvelope](), dig)}, []ApprovalEvent{newEvent(ApprovalEventTokenInvalidated, clean)}, nil
-}
-func approvalEffect(kind ApprovalEffectKind, env algebraic.Option[security.ApprovalEnvelope], dig algebraic.Option[security.Digest]) ApprovalEffect {
-	return ApprovalEffect{kind: kind, envelope: env, envelopeDigest: dig, valid: true}
+	st := approvalTerminal(s, ApprovalPhaseTokenInvalidated, dig, reason, extra)
+	return st, []ApprovalEffect{{kind: ApprovalEffectInvalidateToken, envelopeDigest: dig, valid: true}}, []ApprovalEvent{newEvent(ApprovalEventTokenInvalidated, st.reason)}, nil
 }

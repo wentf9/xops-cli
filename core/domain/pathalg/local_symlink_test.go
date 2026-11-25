@@ -122,6 +122,11 @@ func assertValidLocalSourceCases(t *testing.T) {
 		{`D:\archive.zip`, "D:/archive.zip", "D:/", "archive.zip"},
 		{`.\dist\app.bin`, "dist/app.bin", "dist", "app.bin"},
 		{"local.key", "local.key", ".", "local.key"},
+		{"/tmp/a:b", "/tmp/a:b", "/tmp", "a:b"},
+		{"./a:b", "./a:b", ".", "a:b"},
+		{"./a:b/file.txt", "./a:b/file.txt", "./a:b", "file.txt"},
+		{"sub/a:b", "sub/a:b", "sub", "a:b"},
+		{"foo:bar", "foo:bar", ".", "foo:bar"},
 	}
 	for _, tc := range srcCases {
 		s, err := ParseLocalSourcePath(tc.raw)
@@ -132,6 +137,58 @@ func assertValidLocalSourceCases(t *testing.T) {
 			t.Fatalf("ParseLocalSourcePath(%q) = (str=%q dir=%q base=%q)", tc.raw, s.String(), s.Dir().String(), s.Base())
 		}
 		assertTextAndJSONRoundTrip(t, s, tc.want)
+		assertTextAndJSONRoundTrip(t, s.Dir(), tc.wantDir)
+	}
+}
+
+func TestLocalDirJoinComponentAndJoinDest(t *testing.T) {
+	var zeroDir LocalDir
+	if _, err := zeroDir.JoinComponent("sub"); !errors.Is(err, ErrInvalidLocalDir) {
+		t.Fatalf("零值 JoinComponent = %v, 期望 ErrInvalidLocalDir", err)
+	}
+	if _, err := zeroDir.JoinDest(LocalRootedDest{}); !errors.Is(err, ErrInvalidLocalDir) {
+		t.Fatalf("零值 JoinDest = %v, 期望 ErrInvalidLocalDir", err)
+	}
+	rootPOSIX, _ := ParseLocalDir("/")
+	if _, err := rootPOSIX.JoinDest(LocalRootedDest{}); !errors.Is(err, ErrInvalidLocalDest) {
+		t.Fatalf("无效 dest JoinDest = %v, 期望包装 ErrInvalidLocalDest", err)
+	}
+	if _, err := rootPOSIX.JoinComponent("bad:ads"); !errors.Is(err, ErrInvalidComponent) {
+		t.Fatalf("非法分量 JoinComponent = %v, 期望包装 ErrInvalidComponent", err)
+	}
+
+	dest, err := ParseLocalRootedDest("run/transfers")
+	if err != nil {
+		t.Fatalf("ParseLocalRootedDest: %v", err)
+	}
+	cases := []struct {
+		base     string
+		compWant string
+		destWant string
+	}{
+		{"/", "/sub", "/run/transfers"},
+		{"/home/alice/.xops", "/home/alice/.xops/sub", "/home/alice/.xops/run/transfers"},
+		{`C:\`, "C:/sub", "C:/run/transfers"},
+		{`C:\Users\alice\.xops`, "C:/Users/alice/.xops/sub", "C:/Users/alice/.xops/run/transfers"},
+		{".", "sub", "run/transfers"},
+		{"workspace", "workspace/sub", "workspace/run/transfers"},
+	}
+	for _, tc := range cases {
+		base, err := ParseLocalDir(tc.base)
+		if err != nil {
+			t.Fatalf("ParseLocalDir(%q): %v", tc.base, err)
+		}
+		jc, err := base.JoinComponent("sub")
+		if err != nil || jc.String() != tc.compWant || strings.HasPrefix(jc.String(), "//") {
+			t.Fatalf("%q.JoinComponent(sub) = (%q, %v), want %q", tc.base, jc.String(), err, tc.compWant)
+		}
+		assertTextAndJSONRoundTrip(t, jc, tc.compWant)
+
+		jd, err := base.JoinDest(dest)
+		if err != nil || jd.String() != tc.destWant || strings.HasPrefix(jd.String(), "//") {
+			t.Fatalf("%q.JoinDest = (%q, %v), want %q", tc.base, jd.String(), err, tc.destWant)
+		}
+		assertTextAndJSONRoundTrip(t, jd, tc.destWant)
 	}
 }
 

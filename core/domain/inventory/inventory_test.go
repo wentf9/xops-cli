@@ -42,14 +42,21 @@ func TestIDsAndKeyPassphraseBinding(t *testing.T) {
 
 func assertForbiddenIDsAndKeyPaths(t *testing.T) {
 	t.Helper()
-	for _, bad := range []string{"", "a@b", "host:22", "openssh:prod", "OpenSSH:x", "bad\u202ename", "-flag", "a b", ".."} {
+	for _, bad := range []string{"", "none", "NONE", "None", "a&b", "a@b", "host:22", "openssh:prod", "OpenSSH:x", "bad\u202ename", "-flag", "a b", ".."} {
 		if _, err := ParseNodeID(bad); err == nil {
 			t.Fatalf("ParseNodeID(%q) 期望拒绝", bad)
 		}
 		if _, err := ParseAlias(bad); err == nil {
 			t.Fatalf("ParseAlias(%q) 期望拒绝", bad)
 		}
+		if _, err := ParseHostID(bad); err == nil {
+			t.Fatalf("ParseHostID(%q) 期望拒绝", bad)
+		}
+		if _, err := ParseIdentityID(bad); err == nil {
+			t.Fatalf("ParseIdentityID(%q) 期望拒绝", bad)
+		}
 	}
+	assertNodeIDHopTargetAlignment(t)
 	for _, bad := range []string{"", "none", "NONE", "~/.ssh/%h", "${HOME}/id_ed25519", "~alice/.ssh/id_ed25519", "a\u202eb"} {
 		if _, err := ParseKeyPathSpec(bad); err == nil {
 			t.Fatalf("ParseKeyPathSpec(%q) 期望拒绝", bad)
@@ -57,6 +64,21 @@ func assertForbiddenIDsAndKeyPaths(t *testing.T) {
 	}
 	if kp, err := ParseKeyPathSpec("~/.ssh/id_ed25519"); err != nil || kp.String() != "~/.ssh/id_ed25519" {
 		t.Fatalf("有效 KeyPathSpec 解析失败: err=%v", err)
+	}
+}
+
+func assertNodeIDHopTargetAlignment(t *testing.T) {
+	t.Helper()
+	// 验证 NodeID 集合与 option.ParseHopTarget 在合法别名/数字后缀/UTF-8 上完全对齐
+	for _, validID := range []string{"bastion.01", "gw.1", "ProdBastion", "Prod_Bastion", "跳板机", "hop-"} {
+		nid, err := ParseNodeID(validID)
+		if err != nil || !nid.IsValid() {
+			t.Fatalf("ParseNodeID(%q) 期望通过: err=%v", validID, err)
+		}
+		ht, err := option.ParseHopTarget(nid.String())
+		if err != nil || ht.Host() != nid.String() {
+			t.Fatalf("option.ParseHopTarget(%q) 与 NodeID 对齐失败: err=%v host=%q", validID, err, ht.Host())
+		}
 	}
 }
 

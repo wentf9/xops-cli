@@ -18,8 +18,51 @@ const (
 	sha256HexLen            = sha256.Size * 2
 )
 
+// TraceID 表示单次请求链路的不可变全局追踪唯一标识，
+// 由 core/internal/foundation/trace 别名复用（零拷贝互通），供 core/ports 与 core/events 公开使用；
+// 零值恒无效并严格失败关闭。
+//
+//xops:opaque
+//xops:failclosed
+type TraceID struct{ value string }
+
+// TraceIDFromBytes 将 16 字节原始熵确定性编码为 32 位小写十六进制 TraceID。
+func TraceIDFromBytes(raw [operationIDEntropyBytes]byte) TraceID {
+	return TraceID{value: hex.EncodeToString(raw[:])}
+}
+
+// NewTraceIDFrom 从调用方显式注入的熵源读取 16 字节并构造 TraceID（零隐式 crypto/rand）。
+func NewTraceIDFrom(entropy io.Reader) (TraceID, error) {
+	val, err := readHexID(entropy, ErrInvalidTraceID)
+	return TraceID{value: val}, err
+}
+
+// ParseTraceID 校验并构造 TraceID；仅接受长度 1..128 的可打印非空白 ASCII（0x21..0x7E）。
+func ParseTraceID(raw string) (TraceID, error) {
+	val, err := parseToken(raw, ErrInvalidTraceID)
+	return TraceID{value: val}, err
+}
+
+// IsValid、IsZero、String、Equal 与 Compare 实现 TraceID 的失败关闭语义与确定性全序（无效零值永不相等）。
+func (id TraceID) IsValid() bool  { return id.value != "" }
+func (id TraceID) IsZero() bool   { return id.value == "" }
+func (id TraceID) String() string { return id.value }
+func (id TraceID) Equal(other TraceID) bool {
+	return id.IsValid() && other.IsValid() && id.value == other.value
+}
+func (id TraceID) Compare(other TraceID) int { return compareToken(id.value, other.value) }
+
+// AppendText、MarshalText 与 UnmarshalText 实现 TraceID 的值接收者文本编解码（零值与非法输入失败关闭）。
+func (id TraceID) AppendText(b []byte) ([]byte, error) {
+	return appendValidToken(b, id.value, ErrInvalidTraceID)
+}
+func (id TraceID) MarshalText() ([]byte, error) { return id.AppendText(nil) }
+func (id *TraceID) UnmarshalText(text []byte) error {
+	return unmarshalTextWithReset(id, TraceID{}, text, ParseTraceID)
+}
+
 // OperationID 表示单次安全授权、审批挑战与审计闭环的不可变操作唯一标识，
-// 格式与 core/internal/foundation/trace.OpID 保持完全一致；零值恒无效并严格失败关闭。
+// 由 core/internal/foundation/trace.OpID 别名复用；零值恒无效并严格失败关闭。
 //
 //xops:opaque
 //xops:failclosed
@@ -32,55 +75,30 @@ func OperationIDFromBytes(raw [operationIDEntropyBytes]byte) OperationID {
 
 // NewOperationIDFrom 从调用方显式注入的熵源读取 16 字节并构造 OperationID（零隐式 crypto/rand）。
 func NewOperationIDFrom(entropy io.Reader) (OperationID, error) {
-	raw, err := readExact16Bytes(entropy)
-	if err != nil {
-		return OperationID{}, fmt.Errorf("%w: %w", ErrInvalidOperationID, err)
-	}
-	return OperationIDFromBytes(raw), nil
+	val, err := readHexID(entropy, ErrInvalidOperationID)
+	return OperationID{value: val}, err
 }
 
 // ParseOperationID 校验并构造 OperationID；仅接受长度 1..128 的可打印非空白 ASCII（0x21..0x7E）。
 func ParseOperationID(raw string) (OperationID, error) {
-	if !isValidASCIIToken(raw, maxOperationIDLen) {
-		return OperationID{}, fmt.Errorf("%w: %q", ErrInvalidOperationID, raw)
-	}
-	return OperationID{value: raw}, nil
+	val, err := parseToken(raw, ErrInvalidOperationID)
+	return OperationID{value: val}, err
 }
 
-// IsValid 报告 OperationID 是否为有效的非零标识。
-func (id OperationID) IsValid() bool { return id.value != "" }
-
-// IsZero 报告 OperationID 是否为无效零值。
-func (id OperationID) IsZero() bool { return id.value == "" }
-
-// String 返回 OperationID 规范文本；无效零值返回空串。
+// IsValid、IsZero、String、Equal 与 Compare 实现 OperationID 的失败关闭语义与确定性全序（无效零值永不相等）。
+func (id OperationID) IsValid() bool  { return id.value != "" }
+func (id OperationID) IsZero() bool   { return id.value == "" }
 func (id OperationID) String() string { return id.value }
-
-// Equal 严格比对两个 OperationID 是否均有效且相等（无效零值永不相等）。
 func (id OperationID) Equal(other OperationID) bool {
 	return id.IsValid() && other.IsValid() && id.value == other.value
 }
+func (id OperationID) Compare(other OperationID) int { return compareToken(id.value, other.value) }
 
-// Compare 定义 OperationID 上的确定性全序（无效零值排在有效值之前）。
-func (id OperationID) Compare(other OperationID) int {
-	if !id.IsValid() || !other.IsValid() {
-		return compareValidity(id.IsValid(), other.IsValid())
-	}
-	return cmp.Compare(id.value, other.value)
-}
-
-// AppendText 实现 encoding.TextAppender（值接收者）；对无效零值失败关闭。
+// AppendText、MarshalText 与 UnmarshalText 实现 OperationID 的值接收者文本编解码（零值与非法输入失败关闭）。
 func (id OperationID) AppendText(b []byte) ([]byte, error) {
-	if !id.IsValid() {
-		return nil, ErrInvalidOperationID
-	}
-	return append(b, id.value...), nil
+	return appendValidToken(b, id.value, ErrInvalidOperationID)
 }
-
-// MarshalText 实现 encoding.TextMarshaler（值接收者）。
 func (id OperationID) MarshalText() ([]byte, error) { return id.AppendText(nil) }
-
-// UnmarshalText 实现 encoding.TextUnmarshaler；失败时重置为零值并失败关闭。
 func (id *OperationID) UnmarshalText(text []byte) error {
 	return unmarshalTextWithReset(id, OperationID{}, text, ParseOperationID)
 }
@@ -114,39 +132,17 @@ func ParseDigest(raw string) (Digest, error) {
 	return Digest{sum: sum, valid: true}, nil
 }
 
-// IsValid 报告 Digest 是否为有效已初始化摘要。
+// IsValid、IsZero、Bytes、Hex、String、Equal 与 Compare 实现 Digest 的失败关闭语义、常量时间比对与确定性全序。
 func (d Digest) IsValid() bool { return d.valid }
-
-// IsZero 报告 Digest 是否为无效零值。
-func (d Digest) IsZero() bool { return !d.valid }
-
-// Bytes 返回 32 字节原始摘要副本与有效性标志；无效零值返回全零与 false。
+func (d Digest) IsZero() bool  { return !d.valid }
 func (d Digest) Bytes() ([sha256.Size]byte, bool) {
 	return pickIf(d.valid, d.sum, [sha256.Size]byte{}), d.valid
 }
-
-// Hex 返回 64 位小写十六进制摘要正文；无效零值返回空串。
-func (d Digest) Hex() string {
-	if !d.valid {
-		return ""
-	}
-	return hex.EncodeToString(d.sum[:])
-}
-
-// String 返回带算法前缀的规范文本 "sha256:<64hex>"；无效零值返回空串。
-func (d Digest) String() string {
-	if !d.valid {
-		return ""
-	}
-	return sha256DigestPrefix + d.Hex()
-}
-
-// Equal 以常量时间比对两个 Digest 是否均有效且字节完全一致（无效零值永不相等）。
+func (d Digest) Hex() string    { return pickIf(d.valid, hex.EncodeToString(d.sum[:]), "") }
+func (d Digest) String() string { return pickIf(d.valid, sha256DigestPrefix+d.Hex(), "") }
 func (d Digest) Equal(other Digest) bool {
 	return d.valid && other.valid && subtle.ConstantTimeCompare(d.sum[:], other.sum[:]) == 1
 }
-
-// Compare 定义 Digest 上的确定性全序（无效零值排在有效值之前）。
 func (d Digest) Compare(other Digest) int {
 	if !d.valid || !other.valid {
 		return compareValidity(d.valid, other.valid)
@@ -154,31 +150,51 @@ func (d Digest) Compare(other Digest) int {
 	return bytes.Compare(d.sum[:], other.sum[:])
 }
 
-// AppendText 实现 encoding.TextAppender（值接收者）；对无效零值失败关闭。
+// AppendText、MarshalText 与 UnmarshalText 实现 Digest 的值接收者文本编解码（零值与非法输入失败关闭）。
 func (d Digest) AppendText(b []byte) ([]byte, error) {
 	if !d.valid {
 		return nil, ErrInvalidDigest
 	}
 	return hex.AppendEncode(append(b, sha256DigestPrefix...), d.sum[:]), nil
 }
-
-// MarshalText 实现 encoding.TextMarshaler（值接收者）。
 func (d Digest) MarshalText() ([]byte, error) { return d.AppendText(nil) }
-
-// UnmarshalText 实现 encoding.TextUnmarshaler；失败时重置为零值并失败关闭。
 func (d *Digest) UnmarshalText(text []byte) error {
 	return unmarshalTextWithReset(d, Digest{}, text, ParseDigest)
 }
 
 func compareValidity(a, b bool) int { return pickIf(a == b, 0, pickIf(!a, -1, 1)) }
-
-func readExact16Bytes(entropy io.Reader) ([16]byte, error) {
-	var buf [16]byte
+func compareToken(a, b string) int {
+	if a == "" || b == "" {
+		return compareValidity(a != "", b != "")
+	}
+	return cmp.Compare(a, b)
+}
+func appendValidToken(b []byte, val string, baseErr error) ([]byte, error) {
+	if val == "" {
+		return nil, baseErr
+	}
+	return append(b, val...), nil
+}
+func parseToken(raw string, baseErr error) (string, error) {
+	if !isValidASCIIToken(raw, maxOperationIDLen) {
+		return "", fmt.Errorf("%w: %q", baseErr, raw)
+	}
+	return raw, nil
+}
+func readHexID(entropy io.Reader, baseErr error) (string, error) {
+	raw, err := readExact16Bytes(entropy)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", baseErr, err)
+	}
+	return hex.EncodeToString(raw[:]), nil
+}
+func readExact16Bytes(entropy io.Reader) ([operationIDEntropyBytes]byte, error) {
+	var buf [operationIDEntropyBytes]byte
 	if entropy == nil {
 		return buf, ErrNilEntropy
 	}
 	if _, err := io.ReadFull(entropy, buf[:]); err != nil {
-		return [16]byte{}, err
+		return [operationIDEntropyBytes]byte{}, err
 	}
 	return buf, nil
 }

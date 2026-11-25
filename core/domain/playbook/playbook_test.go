@@ -539,6 +539,104 @@ func TestJoinNodeStatusLatticeLawsAndInvalidFolds(t *testing.T) {
 	}
 }
 
+func TestStepScriptDelegationAndReportJSONRoundTrip(t *testing.T) {
+	psProf, err := execution.NewLaunchProfile(execution.LaunchProfileSpec{
+		Dialect: algebraic.Some(execution.DialectPowerShell), Interpreter: execution.InterpreterPwsh, Login: execution.LoginModeDisabled,
+	})
+	if err != nil {
+		t.Fatalf("NewLaunchProfile(pwsh) 失败: %v", err)
+	}
+	if _, err := NewStepScript(StepScriptSpec{
+		Source: mustLocalSource(t, "scripts/deploy.ps1"), SymlinkPolicy: pathalg.SymlinkReject,
+		Args: []string{"ok-arg", "v2"}, Profile: algebraic.Some(psProf),
+	}); err != nil {
+		t.Fatalf("合法 PowerShell 参数化脚本应通过校验: %v", err)
+	}
+	if _, err := NewStepScript(StepScriptSpec{
+		Source: mustLocalSource(t, "scripts/deploy.ps1"), SymlinkPolicy: pathalg.SymlinkReject,
+		Args: []string{"bad\u2019quote"}, Profile: algebraic.Some(psProf),
+	}); !errors.Is(err, ErrInvalidStepAction) {
+		t.Fatalf("含 PowerShell 弯引号的脚本参数期望 ErrInvalidStepAction，实际=%v", err)
+	}
+
+	pb := mustFullPlaybook(t)
+	s1, s2 := mustStepID(t, "s1-shell"), mustStepID(t, "s2-script")
+	nA, nB := mustNodeID(t, "node-a"), mustNodeID(t, "node-b")
+	outOK, _ := execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	outUnknown, _ := execution.NewOutcomeUnknown(execution.ExecPhaseTransportLost, "E_LOST", "eof")
+	rA1 := mustTestStepRec(t, nA, s1, StepStatusSucceeded, algebraic.Some[execution.ExecutionOutcome](outOK), 100)
+	rA2 := mustTestStepRec(t, nA, s2, StepStatusChanged, algebraic.Some[execution.ExecutionOutcome](outOK), 200)
+	rB1 := mustTestStepRec(t, nB, s1, StepStatusOutcomeUnknown, algebraic.Some[execution.ExecutionOutcome](outUnknown), 300)
+
+	rep, err := FoldPlaybookReport(pb, []StepExecutionRecord{rA1, rA2, rB1})
+	if err != nil {
+		t.Fatalf("FoldPlaybookReport 失败: %v", err)
+	}
+	// StepExecutionRecord / NodeReport / PlaybookReport 确定性 JSON 往返
+	rawRec, err := jsonv2.Marshal(rB1, jsonv2.Deterministic(true))
+	if err != nil {
+		t.Fatalf("Marshal StepExecutionRecord 失败: %v", err)
+	}
+	var rtRec StepExecutionRecord
+	if err := jsonv2.Unmarshal(rawRec, &rtRec); err != nil || !rtRec.Equal(rB1) {
+		t.Fatalf("StepExecutionRecord JSON 往返失败: err=%v", err)
+	}
+	rawNR, err := jsonv2.Marshal(rep.Nodes()[0], jsonv2.Deterministic(true))
+	if err != nil {
+		t.Fatalf("Marshal NodeReport 失败: %v", err)
+	}
+	var rtNR NodeReport
+	if err := jsonv2.Unmarshal(rawNR, &rtNR); err != nil || !rtNR.Equal(rep.Nodes()[0]) {
+		t.Fatalf("NodeReport JSON 往返失败: err=%v", err)
+	}
+	rawRep, err := rep.CanonicalJSON()
+	if err != nil {
+		t.Fatalf("PlaybookReport.CanonicalJSON 失败: %v", err)
+	}
+	var rtRep PlaybookReport
+	if err := jsonv2.Unmarshal(rawRep, &rtRep); err != nil || !rtRep.Equal(rep) {
+		t.Fatalf("PlaybookReport JSON 往返失败: err=%v", err)
+	}
+	assertReportUnmarshalRejectsTampering(t, string(rawRec), string(rawNR), string(rawRep))
+}
+
+func assertReportUnmarshalRejectsTampering(t *testing.T, rawRec, rawNR, rawRep string) {
+	t.Helper()
+	var rec StepExecutionRecord
+	for _, bad := range []string{
+		`null`,
+		strings.Replace(rawRec, `"outcome_unknown"`, `"succeeded"`, 1),
+		strings.TrimSuffix(rawRec, "}") + `,"extra":1}`,
+	} {
+		if err := jsonv2.Unmarshal([]byte(bad), &rec); err == nil || rec.IsValid() {
+			t.Fatalf("恶意 StepExecutionRecord JSON %s 必须拒绝", bad)
+		}
+	}
+	var nr NodeReport
+	for _, bad := range []string{
+		`null`,
+		strings.Replace(rawNR, `"status":"changed"`, `"status":"succeeded"`, 1),
+		strings.Replace(rawNR, `"total_duration":"300ms"`, `"total_duration":"100ms"`, 1),
+		strings.TrimSuffix(rawNR, "}") + `,"extra":1}`,
+	} {
+		if err := jsonv2.Unmarshal([]byte(bad), &nr); err == nil || nr.IsValid() {
+			t.Fatalf("恶意 NodeReport JSON %s 必须拒绝", bad)
+		}
+	}
+	var pr PlaybookReport
+	for _, bad := range []string{
+		`null`,
+		strings.Replace(rawRep, `"status":"outcome_unknown"`, `"status":"failed"`, 1),
+		strings.Replace(rawRep, `"step_counts":{"succeeded":1`, `"step_counts":{"succeeded":9`, 1),
+		strings.Replace(rawRep, `"has_unknown_outcome":true}`, `"has_unknown_outcome":false}`, 1),
+		strings.TrimSuffix(rawRep, "}") + `,"extra":1}`,
+	} {
+		if err := jsonv2.Unmarshal([]byte(bad), &pr); err == nil || pr.IsValid() {
+			t.Fatalf("恶意 PlaybookReport JSON %s 必须拒绝", bad)
+		}
+	}
+}
+
 func assertNodeStatusAssociative(t *testing.T, a, b NodeStatus, all []NodeStatus) {
 	t.Helper()
 	for _, c := range all {

@@ -9,19 +9,42 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/domain/security"
 )
+
+func mustUploadDest(t *testing.T, raw string) TransferDest {
+	t.Helper()
+	p, err := pathalg.ParseRemotePath(raw)
+	if err != nil {
+		t.Fatalf("ParseRemotePath(%q) 失败: %v", raw, err)
+	}
+	d, err := NewUploadDest(p)
+	if err != nil {
+		t.Fatalf("NewUploadDest(%q) 失败: %v", raw, err)
+	}
+	return d
+}
+
+func mustDownloadDest(t *testing.T, raw string) TransferDest {
+	t.Helper()
+	p, err := pathalg.ParseLocalRootedDest(raw)
+	if err != nil {
+		t.Fatalf("ParseLocalRootedDest(%q) 失败: %v", raw, err)
+	}
+	d, err := NewDownloadDest(p)
+	if err != nil {
+		t.Fatalf("NewDownloadDest(%q) 失败: %v", raw, err)
+	}
+	return d
+}
 
 func mustTransferMeta(t *testing.T, total uint64, ver JournalVersion, gen uint64) TransferMeta {
 	t.Helper()
-	dest, err := pathalg.ParseRemotePath("/var/data/archive.tar.zst")
-	if err != nil {
-		t.Fatalf("ParseRemotePath 失败: %v", err)
-	}
 	m, err := NewTransferMeta(TransferMetaSpec{
 		TransferID:     testOpID(20),
-		Dest:           dest,
+		Dest:           mustUploadDest(t, "/var/data/archive.tar.zst"),
 		TotalBytes:     total,
-		ExpectedDigest: testDigest("full-payload"),
+		ExpectedDigest: algebraic.Some(testDigest("full-payload")),
 		JournalVersion: ver,
 		Generation:     gen,
 	})
@@ -73,7 +96,8 @@ func driveTransferAndCollectJournal(t *testing.T, meta TransferMeta, chunks []ui
 		st, _ = mustStepTransfer(t, st, inC, &journal)
 		offset += n
 	}
-	inVer, _ := TransferInputVerifyResult(true, meta.ExpectedDigest(), "")
+	verifyDigest := meta.ExpectedDigest().OrElse(testDigest("computed-actual"))
+	inVer, _ := TransferInputVerifyResult(true, verifyDigest, "")
 	st, _ = mustStepTransfer(t, st, inVer, &journal)
 	inCom, _ := TransferInputCommitResult(commitDur, "commit_status")
 	st, effs := mustStepTransfer(t, st, inCom, &journal)
@@ -81,10 +105,9 @@ func driveTransferAndCollectJournal(t *testing.T, meta TransferMeta, chunks []ui
 }
 
 func TestTransfer10GiBAndZeroByteBoundaries(t *testing.T) {
-	dest, _ := pathalg.ParseRemotePath("/data/big.bin")
 	if _, err := NewTransferMeta(TransferMetaSpec{
-		TransferID: testOpID(21), Dest: dest, TotalBytes: MaxTransferBytes + 1,
-		ExpectedDigest: testDigest("over"), JournalVersion: JournalVersionV2, Generation: 1,
+		TransferID: testOpID(21), Dest: mustUploadDest(t, "/data/big.bin"), TotalBytes: MaxTransferBytes + 1,
+		ExpectedDigest: algebraic.Some(testDigest("over")), JournalVersion: JournalVersionV2, Generation: 1,
 	}); !errors.Is(err, ErrTransferSizeExceeded) {
 		t.Fatalf("超过 10 GiB 必须返回 ErrTransferSizeExceeded，实际 %v", err)
 	}
@@ -230,7 +253,7 @@ func TestTransferVerifiedResumeBisimulationAndCommitNotApplied(t *testing.T) {
 		t.Fatalf("Verified(4) 后崩溃应恢复为 Verifying: st=%v err=%v", recVer, err)
 	}
 	resumedLog := append([]TransferJournalRecord(nil), full[:4]...)
-	inVer, _ := TransferInputVerifyResult(true, meta.ExpectedDigest(), "")
+	inVer, _ := TransferInputVerifyResult(true, meta.ExpectedDigest().OrElse(testDigest("full-payload")), "")
 	commSt, _ := mustStepTransfer(t, recVer, inVer, &resumedLog)
 	if st, effs, _, err := RecoverTransferFromJournal(resumedLog); err != nil || st.Kind() != TransferKindUncertainCommit || len(effs) != 0 {
 		t.Fatalf("复验后于 CommitStarted 崩溃必须恢复为 UncertainCommit(0 副作用): st=%v effs=%v err=%v", st, effs, err)
@@ -284,7 +307,7 @@ func TestTransferJournalFieldBoundsAndTerminalFailClosed(t *testing.T) {
 	}
 	// 3. 回放时 totalBytes 漂移与双代异 Dest 即使单侧尾损坏均必须拒绝
 	meta1 := mustTransferMeta(t, 1000, JournalVersionV1, 1)
-	init1, _ := buildInitRecord(meta1)
+	init1, _ := testBuildInitRecord(meta1)
 	badTotalChunk, _ := NewTransferJournalRecord(TransferJournalRecordSpec{
 		Version: JournalVersionV1, Generation: 1, Seq: 2, Kind: JournalRecordChunk,
 		TransferID: meta1.TransferID(), Offset: 0, Length: 100, TotalBytes: 2000, Digest: algebraic.Some(testDigest("c")),
@@ -292,19 +315,25 @@ func TestTransferJournalFieldBoundsAndTerminalFailClosed(t *testing.T) {
 	if _, _, _, err := RecoverTransferFromJournal([]TransferJournalRecord{init1, badTotalChunk}); !errors.Is(err, ErrCorruptJournal) {
 		t.Fatalf("回放中 total_bytes 漂移必须返回 ErrCorruptJournal: %v", err)
 	}
-	otherDest, _ := pathalg.ParseRemotePath("/var/data/other.bin")
 	metaOther, _ := NewTransferMeta(TransferMetaSpec{
-		TransferID: meta1.TransferID(), Dest: otherDest, TotalBytes: 1000, ExpectedDigest: meta1.ExpectedDigest(), JournalVersion: JournalVersionV1, Generation: 2,
+		TransferID: meta1.TransferID(), Dest: mustUploadDest(t, "/var/data/other.bin"), TotalBytes: 1000, ExpectedDigest: meta1.ExpectedDigest(), JournalVersion: JournalVersionV1, Generation: 2,
 	})
-	initOther, _ := buildInitRecord(metaOther)
+	initOther, _ := testBuildInitRecord(metaOther)
 	if _, _, _, err := RecoverTransferFromDualJournal([]TransferJournalRecord{init1}, []TransferJournalRecord{initOther, badTotalChunk}); !errors.Is(err, ErrCorruptJournal) {
 		t.Fatalf("双代 Dest 不一致即使单侧尾损坏也必须拒绝: %v", err)
 	}
 }
 
+func testBuildInitRecord(m TransferMeta) (TransferJournalRecord, error) {
+	return NewTransferJournalRecord(TransferJournalRecordSpec{
+		Version: m.JournalVersion(), Generation: m.Generation(), Seq: 1, Kind: JournalRecordInit,
+		TransferID: m.TransferID(), Dest: algebraic.Some(m.Dest()), TotalBytes: m.TotalBytes(), Digest: m.ExpectedDigest(),
+	})
+}
+
 func TestTransferInvalidInputsAndTypedNil(t *testing.T) {
 	meta := mustTransferMeta(t, 100, JournalVersionV2, 1)
-	initSt := &TransferInitialized{sealedTransferMixin{meta, true}}
+	initSt := &TransferInitialized{tMix(meta, TransferKindInitialized, "")}
 	if _, _, _, err := TransitionTransfer(nil, TransferInputStart()); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("nil 状态应返回 ErrInvalidState: %v", err)
 	}
@@ -329,16 +358,16 @@ func TestTransferExhaustiveStateInputMatrix(t *testing.T) {
 	meta := mustTransferMeta(t, 100, JournalVersionV2, 1)
 	dig := testDigest("last")
 	states := []TransferState{
-		&TransferInitialized{sealedTransferMixin{meta, true}},
-		&TransferStreaming{sealedTransferMixin{meta, true}, 0, 0, 2, dig},
-		&TransferVerifying{sealedTransferMixin{meta, true}, 1, 3, dig},
-		&TransferCommitting{sealedTransferMixin{meta, true}, 5, dig},
-		&TransferCommitted{sealedTransferMixin{meta, true}},
-		&TransferAborted{sealedTransferMixin{meta, true}, "ab"},
-		&TransferUncertainCommit{sealedTransferMixin{meta, true}, "unc"},
+		&TransferInitialized{tMix(meta, TransferKindInitialized, "")},
+		&TransferStreaming{tProg(meta, TransferKindStreaming, 0, 0, 2, dig)},
+		&TransferVerifying{tProg(meta, TransferKindVerifying, 0, 1, 3, dig)},
+		&TransferCommitting{tProg(meta, TransferKindCommitting, 0, 1, 5, dig)},
+		&TransferCommitted{tMix(meta, TransferKindCommitted, "")},
+		&TransferAborted{tMix(meta, TransferKindAborted, "ab")},
+		&TransferUncertainCommit{tMix(meta, TransferKindUncertainCommit, "unc")},
 	}
 	inChunk, _ := TransferInputChunk(0, 50, testDigest("c"))
-	inVer, _ := TransferInputVerifyResult(true, meta.ExpectedDigest(), "")
+	inVer, _ := TransferInputVerifyResult(true, meta.ExpectedDigest().OrElse(testDigest("full-payload")), "")
 	inCom, _ := TransferInputCommitResult(DurabilityCommitted, "")
 	inputs := []TransferInput{TransferInputStart(), inChunk, inVer, inCom, TransferInputAbort("cancel")}
 	allowed := map[[2]int]bool{
@@ -356,6 +385,99 @@ func TestTransferExhaustiveStateInputMatrix(t *testing.T) {
 			if !allowed[[2]int{i, j}] && (!errors.Is(err, ErrIllegalTransition) || next != st || len(effs) != 0 || len(evs) != 0) {
 				t.Fatalf("Transfer 矩阵(%s, %d) 应失败关闭: next=%v err=%v", st.Kind(), j, next, err)
 			}
+		}
+	}
+}
+
+func TestTransferDownloadDestAndOptionalExpectedDigest(t *testing.T) {
+	// 1. 下载方向（LocalRootedDest）+ 预期摘要缺省（None）：V1/V2 全链路流转、JSON 往返与崩溃/双代恢复
+	dlDest := mustDownloadDest(t, "downloads/2026/report.tar.gz")
+	for _, ver := range []JournalVersion{JournalVersionV1, JournalVersionV2} {
+		metaNoExp, err := NewTransferMeta(TransferMetaSpec{
+			TransferID: testOpID(28), Dest: dlDest, TotalBytes: 768,
+			ExpectedDigest: algebraic.None[security.Digest](), JournalVersion: ver, Generation: 1,
+		})
+		if err != nil || metaNoExp.Direction() != TransferDirectionDownload || !metaNoExp.ExpectedDigest().IsNone() {
+			t.Fatalf("下载元数据构造异常(%v): err=%v dir=%v", ver, err, metaNoExp.Direction())
+		}
+		endSt, journal, _ := driveTransferAndCollectJournal(t, metaNoExp, []uint64{256, 512}, DurabilityCommitted)
+		if endSt.Kind() != TransferKindCommitted || len(journal) != 6 {
+			t.Fatalf("下载无预期摘要(%v)流转失败: kind=%v len=%d", ver, endSt.Kind(), len(journal))
+		}
+		assertJournalRoundTrip(t, journal[0])
+		assertJournalRoundTrip(t, journal[3])
+		if stRec, _, _, err := RecoverTransferFromJournal(journal[:4]); err != nil || stRec.Kind() != TransferKindVerifying {
+			t.Fatalf("下载无预期摘要(%v)崩溃恢复失败: st=%v err=%v", ver, stRec, err)
+		}
+		if stRec, _, _, err := RecoverTransferFromJournal(journal); err != nil || stRec.Kind() != TransferKindCommitted {
+			t.Fatalf("下载无预期摘要(%v)完整回放失败: st=%v err=%v", ver, stRec, err)
+		}
+	}
+
+	// 2. 双代恢复与 ExpectedDigest=Some/None 不变量
+	assertDownloadDualAndDigestGuards(t, dlDest)
+	// 4. TransferDest JSON 编解码与恶意负载拒收
+	assertTransferDestCodecs(t, mustUploadDest(t, "/var/data/a.bin"), dlDest)
+}
+
+func assertDownloadDualAndDigestGuards(t *testing.T, dlDest TransferDest) {
+	t.Helper()
+	metaG1, _ := NewTransferMeta(TransferMetaSpec{
+		TransferID: testOpID(29), Dest: dlDest, TotalBytes: 512,
+		ExpectedDigest: algebraic.None[security.Digest](), JournalVersion: JournalVersionV2, Generation: 1,
+	})
+	metaG2, _ := NewTransferMeta(TransferMetaSpec{
+		TransferID: testOpID(29), Dest: dlDest, TotalBytes: 512,
+		ExpectedDigest: algebraic.None[security.Digest](), JournalVersion: JournalVersionV2, Generation: 2,
+	})
+	_, logG1, _ := driveTransferAndCollectJournal(t, metaG1, []uint64{512}, DurabilityCommitted)
+	_, logG2, _ := driveTransferAndCollectJournal(t, metaG2, []uint64{512}, DurabilityCommitted)
+	if st, _, _, err := RecoverTransferFromDualJournal(logG1[:2], logG2[:2]); err != nil || TransferMetaOf(st).Generation() != 2 || !TransferMetaOf(st).Dest().Equal(dlDest) {
+		t.Fatalf("下载双代恢复异常: st=%v err=%v", st, err)
+	}
+	// 无预期摘要时重复 Verified 记录若摘要前后不一致必须拒收为 ErrCorruptJournal
+	verMismatch, err := buildFollowRecord(metaG1, 4, logG1[2].RecordDigest(), JournalRecordVerified, 0, 0, algebraic.Some(testDigest("divergent")))
+	if err != nil {
+		t.Fatalf("buildFollowRecord 失败: %v", err)
+	}
+	if _, _, _, err := RecoverTransferFromJournal([]TransferJournalRecord{logG1[0], logG1[1], logG1[2], verMismatch}); !errors.Is(err, ErrCorruptJournal) {
+		t.Fatalf("无预期摘要下重复 Verified 摘要不一致期望 ErrCorruptJournal，实际=%v", err)
+	}
+
+	// 3. 下载方向提供 ExpectedDigest=Some 时仍强制常量时间比对：不匹配立即中止并清理暂存
+	metaWithExp, _ := NewTransferMeta(TransferMetaSpec{
+		TransferID: testOpID(30), Dest: dlDest, TotalBytes: 0,
+		ExpectedDigest: algebraic.Some(testDigest("expected-dl")), JournalVersion: JournalVersionV2, Generation: 1,
+	})
+	initSt, _ := NewTransferState(metaWithExp)
+	verSt, _, _, _ := TransitionTransfer(initSt, TransferInputStart())
+	badVer, _ := TransferInputVerifyResult(true, testDigest("wrong-dl"), "")
+	abSt, effs, _, err := TransitionTransfer(verSt, badVer)
+	if err != nil || abSt.Kind() != TransferKindAborted || len(effs) != 2 {
+		t.Fatalf("ExpectedDigest=Some 摘要不匹配必须中止并清理暂存: st=%v effs=%v err=%v", abSt, effs, err)
+	}
+}
+
+func assertTransferDestCodecs(t *testing.T, up, dl TransferDest) {
+	t.Helper()
+	for _, d := range []TransferDest{up, dl} {
+		raw, err := jsonv2.Marshal(d, jsonv2.Deterministic(true))
+		if err != nil {
+			t.Fatalf("Marshal TransferDest 失败: %v", err)
+		}
+		var rt TransferDest
+		if err := jsonv2.Unmarshal(raw, &rt); err != nil || !rt.Equal(d) {
+			t.Fatalf("TransferDest JSON 往返失败: raw=%s err=%v", raw, err)
+		}
+	}
+	for _, bad := range []string{
+		`null`, `{}`, `{"direction":"upload"}`, `{"direction":"download"}`,
+		`{"direction":"upload","local":"a.bin"}`, `{"direction":"download","remote":"/a.bin"}`,
+		`{"direction":"upload","remote":"/a.bin","local":"a.bin"}`, `{"direction":"upload","remote":"/a.bin","extra":1}`,
+	} {
+		var dst TransferDest
+		if err := jsonv2.Unmarshal([]byte(bad), &dst); err == nil || dst.IsValid() {
+			t.Fatalf("非法 TransferDest JSON %s 必须拒绝", bad)
 		}
 	}
 }

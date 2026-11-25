@@ -55,6 +55,8 @@ func TestParseOptionValidDirectives(t *testing.T) {
 		{"ConnectTimeout=none", KeyConnectTimeout},
 		{"ServerAliveInterval 0", KeyServerAliveInterval},
 		{"ServerAliveInterval 2m", KeyServerAliveInterval},
+		{"ServerAliveCountMax 0", KeyServerAliveCountMax},
+		{"server_alive_count_max=5", KeyServerAliveCountMax},
 		{"cIpHeRs +aes128-ctr", KeyCiphers},
 		{"Ciphers -*-cbc,aes???-ctr", KeyCiphers},
 		{"MACs -hmac-sha2-256", KeyMACs},
@@ -126,6 +128,7 @@ func TestParseOptionLayerAndFailClosed(t *testing.T) {
 		{"User bad\"quote", ErrInvalidOption}, {"User -inject", ErrInvalidOption}, {"HostName -inject", ErrInvalidOption},
 		{"ConnectTimeout +5", ErrInvalidOption}, {"ConnectTimeout -5", ErrInvalidOption}, {"ConnectTimeout 10x", ErrInvalidOption},
 		{"ServerAliveInterval -1", ErrInvalidOption}, {"ServerAliveInterval none", ErrInvalidOption},
+		{"ServerAliveCountMax -1", ErrInvalidOption}, {"ServerAliveCountMax 03", ErrInvalidOption}, {"ServerAliveCountMax none", ErrInvalidOption},
 		{"BatchMode maybe", ErrInvalidOption}, {"User alice\nPort 22", ErrInvalidOption}, {"User alice\u202ebob", ErrInvalidOption},
 		{"IdentityFile /a /b", ErrInvalidOption}, {"CertificateFile /c1 /c2", ErrInvalidOption}, {"IdentityFile \"/a b\" /c", ErrInvalidOption},
 		{"UserKnownHostsFile none ~/.ssh/kh2", ErrInvalidPathList}, {"UserKnownHostsFile ~/.ssh/kh1 none", ErrInvalidPathList},
@@ -258,7 +261,7 @@ func buildTestRichOpenSSHT4(t *testing.T) OptionLayer {
 		"HostName %h.corp.example.com", "Port 2299", "User attacker",
 		"ProxyCommand ssh -W %h:%p evil-gw",
 		"ControlMaster auto", "ControlPath ~/.ssh/cm-%C", "ControlPersist 5m",
-		"ConnectTimeout 30s", "ServerAliveInterval 1m", "Ciphers -aes128-ctr",
+		"ConnectTimeout 30s", "ServerAliveInterval 1m", "ServerAliveCountMax 6", "Ciphers -aes128-ctr",
 		"IdentityFile ~/.ssh/id_openssh", "IdentitiesOnly yes", "BatchMode yes",
 		"StrictHostKeyChecking no", "UserKnownHostsFile ~/.ssh/openssh_kh",
 		"ForwardAgent yes", "SendEnv SECRET_*",
@@ -303,8 +306,8 @@ func assertNonOpenSSHPolicyTrimmed(t *testing.T, origin OriginKind, pol Effectiv
 	}
 	perDur, ok := pol.Control().EffectivePersist().Timeout()
 	if !pol.Control().IsEnabled() || pol.Control().EffectiveMaster() != ControlMasterAuto ||
-		!ok || perDur.Std() != 10*time.Minute || pol.ServerAliveInterval().Std() != 60*time.Second {
-		t.Fatalf("%s t3>t4 优先级或 t4 Mux/Transport 保留异常", origin)
+		!ok || perDur.Std() != 10*time.Minute || pol.ServerAliveInterval().Std() != 60*time.Second || pol.ServerAliveCountMax() != 6 {
+		t.Fatalf("%s t3>t4 优先级或 t4 Mux/Transport 保留异常: countMax=%d", origin, pol.ServerAliveCountMax())
 	}
 	ct, hasCT := pol.ConnectTimeout().Get()
 	if !hasCT || ct.Std() != 0 {
@@ -353,6 +356,23 @@ func TestResolveEffectivePolicyOpenSSHAndFailClosed(t *testing.T) {
 	wantLower, _ := ComputeConnectionHash("cachyos-x8664", "example.com", 2222, "alice", "prodbastion")
 	if gotCase, err2 := polCaseJump.PercentC("cachyos-x8664", "ignored"); err != nil || err2 != nil || gotCase != wantCase || gotCase == wantLower {
 		t.Fatalf("大小写敏感 ProxyJump 别名 %%C 错误: err=%v/%v got=%s want=%s", err, err2, gotCase, wantCase)
+	}
+	// 验证 ResolveEffectivePolicyWithOriginalHost 保留非 RFC1123 OpenSSH 别名（如 prod_db）供 %n 使用，同时严格校验拨号 Endpoint。
+	origAlias, err := ParseOriginalHost("prod_db")
+	if err != nil || !origAlias.IsValid() || origAlias.String() != "prod_db" {
+		t.Fatalf("ParseOriginalHost(prod_db) 失败: (%v, %v)", origAlias, err)
+	}
+	if _, isCanon := origAlias.CanonicalHost(); isCanon {
+		t.Fatal("prod_db 不应判定为 RFC1123 CanonicalHost")
+	}
+	polAlias, err := ResolveEffectivePolicyWithOriginalHost(OriginOpenSSHVirtual, origAlias, 22,
+		UnsetOptionLayer(), UnsetOptionLayer(), UnsetOptionLayer(), mustOptionLayer(t, "HostName 192.0.2.10", "Port 2222"))
+	if err != nil || polAlias.OriginalHost().String() != "prod_db" || polAlias.Endpoint().String() != "192.0.2.10:2222" || polAlias.ServerAliveCountMax() != DefaultServerAliveCountMax {
+		t.Fatalf("OpenSSH 别名求解异常: err=%v orig=%s ep=%s countMax=%d", err, polAlias.OriginalHost(), polAlias.Endpoint(), polAlias.ServerAliveCountMax())
+	}
+	// 无 HostName 覆盖时，非 RFC1123 别名无法解析为合法拨号 Endpoint，必须失败关闭。
+	if _, err := ResolveEffectivePolicyWithOriginalHost(OriginOpenSSHVirtual, origAlias, 22, UnsetOptionLayer(), UnsetOptionLayer(), UnsetOptionLayer(), UnsetOptionLayer()); !errors.Is(err, ErrInvalidEndpoint) {
+		t.Fatalf("无 HostName 的非 RFC1123 别名应失败关闭，实际 %v", err)
 	}
 	assertResolveFailClosed(t, baseEP)
 }
@@ -558,6 +578,11 @@ func TestTextCodecsRoundTripAndNilReceiver(t *testing.T) {
 	assertTextRoundTrip(t, StrictHostKeyCheckingAcceptNew, new(StrictHostKeyCheckingMode))
 	assertTextRoundTrip(t, u, new(Username))
 	assertTextRoundTrip(t, hn, new(HostNameSpec))
+	origHost, err := ParseOriginalHost("prod_db")
+	if err != nil {
+		t.Fatalf("ParseOriginalHost 失败: %v", err)
+	}
+	assertTextRoundTrip(t, origHost, new(OriginalHostSpec))
 	assertTextRoundTrip(t, OriginOpenSSHDerived, new(OriginKind))
 
 	if err := (*PathEntry)(nil).UnmarshalText([]byte("~/.ssh/a")); !errors.Is(err, ErrNilReceiver) {

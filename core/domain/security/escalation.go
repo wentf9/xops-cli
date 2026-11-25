@@ -71,8 +71,20 @@ type ScopeEscalationResult struct {
 	valid               bool
 }
 
+// IsValid 报告 ScopeEscalationResult 是否由有效判定或反序列化产生。
+func (r ScopeEscalationResult) IsValid() bool { return r.valid }
+
+// IsZero 报告 ScopeEscalationResult 是否为未初始化无效零值。
+func (r ScopeEscalationResult) IsZero() bool { return !r.valid }
+
 // Escalated 报告规范化后的作用域相较词法预检是否发生升级、受保护重定向或输入异常；零值失败关闭返回 true。
 func (r ScopeEscalationResult) Escalated() bool { return !r.valid || r.escalated }
+
+// Equal 严格比对两个 ScopeEscalationResult 是否均有效且全部结论字段一致（无效零值永不相等）。
+func (r ScopeEscalationResult) Equal(other ScopeEscalationResult) bool {
+	return r.valid && other.valid && r.escalated == other.escalated &&
+		slices.Equal(r.reasons, other.reasons) && slices.Equal(r.addedProtectedPaths, other.addedProtectedPaths)
+}
 
 // Reasons 返回按固定顺序排列的升级原因防御性拷贝；零值返回 EscalationInvalidInput。
 func (r ScopeEscalationResult) Reasons() []EscalationReason {

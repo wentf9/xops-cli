@@ -23,6 +23,7 @@ func TestExternalInterfaceContracts(t *testing.T) {
 		dk security.DecisionKind
 		er security.EscalationReason
 		id security.OperationID
+		ti security.TraceID
 		dg security.Digest
 		dd security.DecisionDeny
 		na security.DecisionNeedApproval
@@ -31,6 +32,9 @@ func TestExternalInterfaceContracts(t *testing.T) {
 		os security.NodeOverrides
 		ob security.OperationBinding
 		ae security.ApprovalEnvelope
+		sp security.ScopedPath
+		ss security.ScopeSnapshot
+		sr security.ScopeEscalationResult
 	)
 	var (
 		_ encoding.TextAppender      = v
@@ -51,6 +55,9 @@ func TestExternalInterfaceContracts(t *testing.T) {
 		_ encoding.TextAppender      = id
 		_ encoding.TextMarshaler     = id
 		_ encoding.TextUnmarshaler   = &id
+		_ encoding.TextAppender      = ti
+		_ encoding.TextMarshaler     = ti
+		_ encoding.TextUnmarshaler   = &ti
 		_ encoding.TextAppender      = dg
 		_ encoding.TextMarshaler     = dg
 		_ encoding.TextUnmarshaler   = &dg
@@ -75,6 +82,12 @@ func TestExternalInterfaceContracts(t *testing.T) {
 		_ jsonv2.UnmarshalerFrom     = &ob
 		_ jsonv2.MarshalerTo         = ae
 		_ jsonv2.UnmarshalerFrom     = &ae
+		_ jsonv2.MarshalerTo         = sp
+		_ jsonv2.UnmarshalerFrom     = &sp
+		_ jsonv2.MarshalerTo         = ss
+		_ jsonv2.UnmarshalerFrom     = &ss
+		_ jsonv2.MarshalerTo         = sr
+		_ jsonv2.UnmarshalerFrom     = &sr
 	)
 }
 
@@ -213,5 +226,72 @@ func assertExternalProtectedRedirect(t *testing.T, ep netaddr.Endpoint) {
 	}
 	if !security.CanonicalScopeEscalated(lexSnap, canSnap) {
 		t.Fatal("外部包验证 Protected-A -> Protected-B 必须判定为升级")
+	}
+	assertExternalTraceAndScopeJSONRoundTrip(t, pA, lexSnap, security.InspectScopeEscalation(lexSnap, canSnap), security.InspectScopeEscalation(lexSnap, lexSnap))
+}
+
+func assertExternalTraceAndScopeJSONRoundTrip(t *testing.T, sp security.ScopedPath, snap security.ScopeSnapshot, escRes, okRes security.ScopeEscalationResult) {
+	t.Helper()
+	tid, err := security.NewTraceIDFrom(bytes.NewReader([]byte("0123456789abcdef")))
+	if err != nil || !tid.IsValid() || tid.IsZero() {
+		t.Fatalf("NewTraceIDFrom 失败: (%v, %v)", tid, err)
+	}
+	var zTID security.TraceID
+	if zTID.Equal(zTID) {
+		t.Fatal("零值 TraceID.Equal 必须失败关闭")
+	}
+	rawTID, err := jsonv2.Marshal(tid, jsonv2.Deterministic(true))
+	var decTID security.TraceID
+	if err != nil || jsonv2.Unmarshal(rawTID, &decTID) != nil || !decTID.Equal(tid) {
+		t.Fatalf("TraceID JSON 往返失败: raw=%s err=%v", rawTID, err)
+	}
+
+	rawSP, err := jsonv2.Marshal(sp, jsonv2.Deterministic(true))
+	var decSP security.ScopedPath
+	if err != nil || jsonv2.Unmarshal(rawSP, &decSP) != nil || !decSP.Equal(sp) {
+		t.Fatalf("ScopedPath JSON 往返失败: raw=%s err=%v", rawSP, err)
+	}
+	rawSnap, err := jsonv2.Marshal(snap, jsonv2.Deterministic(true))
+	var decSnap security.ScopeSnapshot
+	if err != nil || jsonv2.Unmarshal(rawSnap, &decSnap) != nil || !decSnap.Equal(snap) {
+		t.Fatalf("ScopeSnapshot JSON 往返失败: raw=%s err=%v", rawSnap, err)
+	}
+	for _, res := range []security.ScopeEscalationResult{escRes, okRes} {
+		rawRes, err := jsonv2.Marshal(res, jsonv2.Deterministic(true))
+		var decRes security.ScopeEscalationResult
+		if err != nil || jsonv2.Unmarshal(rawRes, &decRes) != nil || !decRes.Equal(res) {
+			t.Fatalf("ScopeEscalationResult JSON 往返失败: raw=%s err=%v", rawRes, err)
+		}
+	}
+	assertExternalScopeJSONRejections(t, rawSnap)
+}
+
+func assertExternalScopeJSONRejections(t *testing.T, rawSnap []byte) {
+	t.Helper()
+	// 严格拒绝 null、缺失必填字段、未知额外字段及语义矛盾结果。
+	badScopedPaths := []string{`null`, `{}`, `{"path":"/etc/a","extra":1}`}
+	for _, raw := range badScopedPaths {
+		var dst security.ScopedPath
+		if err := jsonv2.Unmarshal([]byte(raw), &dst); err == nil || dst.IsValid() {
+			t.Fatalf("非法 ScopedPath %s 应失败关闭", raw)
+		}
+	}
+	badSnaps := []string{`null`, `{"capability":"file_read"}`, string(rawSnap[:len(rawSnap)-1]) + `,"extra":true}`}
+	for _, raw := range badSnaps {
+		var dst security.ScopeSnapshot
+		if err := jsonv2.Unmarshal([]byte(raw), &dst); err == nil || dst.IsValid() {
+			t.Fatalf("非法 ScopeSnapshot %s 应失败关闭", raw)
+		}
+	}
+	badResults := []string{
+		`null`, `{}`, `{"escalated":false,"reasons":["protected_redirect"]}`,
+		`{"escalated":true}`, `{"escalated":false,"added_protected_paths":["/etc/a"]}`,
+		`{"escalated":false,"extra":1}`,
+	}
+	for _, raw := range badResults {
+		var dst security.ScopeEscalationResult
+		if err := jsonv2.Unmarshal([]byte(raw), &dst); err == nil || dst.IsValid() {
+			t.Fatalf("非法 ScopeEscalationResult %s 应失败关闭", raw)
+		}
 	}
 }

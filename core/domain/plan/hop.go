@@ -16,20 +16,20 @@ import (
 
 const hopSpecDomainTag = "xops.plan.hop_spec.v1"
 
-// HopSpecInput 是构造不可变 HopSpec 的显式入参规格（仅携带非敏感 AuthDigest，绝不接收明文凭据）。
+// HopSpecInput 是构造不可变 HopSpec 的显式入参规格（仅携带零明文 inventory.AuthMethod，内部派生 AuthKind 与 AuthDigest 防止漂移）。
 type HopSpecInput struct {
 	HopIndex     uint32
 	NodeID       string
 	Origin       option.OriginKind
 	Endpoint     netaddr.Endpoint
-	OriginalHost netaddr.CanonicalHost
+	OriginalHost option.OriginalHostSpec
 	Username     option.Username
-	AuthKind     inventory.AuthMethodKind
-	AuthDigest   security.Digest
+	Auth         inventory.AuthMethod
 	Transport    TransportPolicySpec
 }
 
 // HopSpec 表示多跳 SSH 连接计划中单跳的不可变规范规格（零明文、零反射）；
+// 直接内嵌不可变 inventory.AuthMethod 并在构造期派生 authKind 与 authDigest 以杜绝三者漂移，
 // 经 //xops:canonicalhash 由 xopsvet/digestcover 校验 WriteCanonical 100% 全字段覆盖。
 //
 //xops:opaque
@@ -40,8 +40,9 @@ type HopSpec struct {
 	nodeID       string
 	origin       option.OriginKind
 	endpoint     netaddr.Endpoint
-	originalHost netaddr.CanonicalHost
+	originalHost option.OriginalHostSpec
 	username     option.Username
+	auth         inventory.AuthMethod
 	authKind     inventory.AuthMethodKind
 	authDigest   security.Digest
 	transport    TransportPolicySpec
@@ -60,15 +61,19 @@ func AuthMethodDigest(auth inventory.AuthMethod) (security.Digest, error) {
 	return security.DigestFromSHA256(sum), nil
 }
 
-// NewHopSpec 校验全部单跳规格字段并构造不可变 HopSpec。
+// NewHopSpec 校验全部单跳规格字段并在内部由 Auth 派生 AuthKind 与 AuthDigest，构造不可变 HopSpec。
 func NewHopSpec(in HopSpecInput) (HopSpec, error) {
 	if err := validateHopSpecInput(in); err != nil {
+		return HopSpec{}, err
+	}
+	digest, err := AuthMethodDigest(in.Auth)
+	if err != nil {
 		return HopSpec{}, err
 	}
 	return HopSpec{
 		hopIndex: in.HopIndex, nodeID: in.NodeID, origin: in.Origin,
 		endpoint: in.Endpoint, originalHost: in.OriginalHost, username: in.Username,
-		authKind: in.AuthKind, authDigest: in.AuthDigest, transport: in.Transport, valid: true,
+		auth: in.Auth, authKind: in.Auth.Kind(), authDigest: digest, transport: in.Transport, valid: true,
 	}, nil
 }
 
@@ -81,14 +86,10 @@ func NewHopSpecFromAuth(hopIndex uint32, nodeID string, user option.Username, au
 	if err != nil {
 		return HopSpec{}, fmt.Errorf("%w: %w", ErrInvalidHopSpec, err)
 	}
-	digest, err := AuthMethodDigest(auth)
-	if err != nil {
-		return HopSpec{}, err
-	}
 	return NewHopSpec(HopSpecInput{
 		HopIndex: hopIndex, NodeID: nodeID, Origin: policy.Origin(),
 		Endpoint: policy.Endpoint(), OriginalHost: policy.OriginalHost(),
-		Username: user, AuthKind: auth.Kind(), AuthDigest: digest, Transport: tp,
+		Username: user, Auth: auth, Transport: tp,
 	})
 }
 
@@ -102,8 +103,8 @@ func validateHopSpecInput(in HopSpecInput) error {
 		return fmt.Errorf("%w: Endpoint 与 OriginalHost 均须有效", ErrInvalidHopSpec)
 	case !in.Username.IsValid():
 		return fmt.Errorf("%w: 无效 Username", ErrInvalidHopSpec)
-	case !in.AuthKind.IsValid() || !in.AuthDigest.IsValid():
-		return fmt.Errorf("%w: AuthKind 与 AuthDigest 均须有效", ErrInvalidHopSpec)
+	case in.Auth == nil || !in.Auth.IsValid() || !in.Auth.Kind().IsValid():
+		return fmt.Errorf("%w: Auth 必须为有效的非 nil inventory.AuthMethod", ErrInvalidHopSpec)
 	case !in.Transport.IsValid():
 		return fmt.Errorf("%w: %w", ErrInvalidHopSpec, ErrInvalidTransportPolicy)
 	}
@@ -112,26 +113,27 @@ func validateHopSpecInput(in HopSpecInput) error {
 
 func (h HopSpec) IsValid() bool {
 	return h.valid && h.nodeID != "" && h.origin.IsValid() && h.endpoint.IsValid() &&
-		h.originalHost.IsValid() && h.username.IsValid() && h.authKind.IsValid() &&
-		h.authDigest.IsValid() && h.transport.IsValid()
+		h.originalHost.IsValid() && h.username.IsValid() && h.auth != nil && h.auth.IsValid() &&
+		h.authKind.IsValid() && h.auth.Kind() == h.authKind && h.authDigest.IsValid() && h.transport.IsValid()
 }
-func (h HopSpec) IsZero() bool                        { return !h.IsValid() }
-func (h HopSpec) HopIndex() uint32                    { return h.hopIndex }
-func (h HopSpec) NodeID() string                      { return h.nodeID }
-func (h HopSpec) Origin() option.OriginKind           { return h.origin }
-func (h HopSpec) Endpoint() netaddr.Endpoint          { return h.endpoint }
-func (h HopSpec) OriginalHost() netaddr.CanonicalHost { return h.originalHost }
-func (h HopSpec) Username() option.Username           { return h.username }
-func (h HopSpec) AuthKind() inventory.AuthMethodKind  { return h.authKind }
-func (h HopSpec) AuthDigest() security.Digest         { return h.authDigest }
-func (h HopSpec) Transport() TransportPolicySpec      { return h.transport }
+func (h HopSpec) IsZero() bool                          { return !h.IsValid() }
+func (h HopSpec) HopIndex() uint32                      { return h.hopIndex }
+func (h HopSpec) NodeID() string                        { return h.nodeID }
+func (h HopSpec) Origin() option.OriginKind             { return h.origin }
+func (h HopSpec) Endpoint() netaddr.Endpoint            { return h.endpoint }
+func (h HopSpec) OriginalHost() option.OriginalHostSpec { return h.originalHost }
+func (h HopSpec) Username() option.Username             { return h.username }
+func (h HopSpec) Auth() inventory.AuthMethod            { return pickIf(h.IsValid(), h.auth, nil) }
+func (h HopSpec) AuthKind() inventory.AuthMethodKind    { return h.authKind }
+func (h HopSpec) AuthDigest() security.Digest           { return h.authDigest }
+func (h HopSpec) Transport() TransportPolicySpec        { return h.transport }
 
 // Equal 严格比对两跳规格是否均有效且全部字段完全一致。
 func (h HopSpec) Equal(o HopSpec) bool {
 	return h.IsValid() && o.IsValid() && h.hopIndex == o.hopIndex && h.nodeID == o.nodeID &&
 		h.origin == o.origin && h.endpoint.Equal(o.endpoint) && h.originalHost.Equal(o.originalHost) &&
-		h.username.Equal(o.username) && h.authKind == o.authKind && h.authDigest.Equal(o.authDigest) &&
-		h.transport.Equal(o.transport)
+		h.username.Equal(o.username) && inventory.EqualAuthMethod(h.auth, o.auth) &&
+		h.authKind == o.authKind && h.authDigest.Equal(o.authDigest) && h.transport.Equal(o.transport)
 }
 
 // WriteCanonical 以零反射、长度前缀与域分离方式将 HopSpec 全部字段写入 w（受 digestcover 校验）。
@@ -150,6 +152,9 @@ func (h HopSpec) WriteCanonical(w io.Writer) error {
 	enc.writeString(h.endpoint.String())
 	enc.writeString(h.originalHost.String())
 	enc.writeString(h.username.String())
+	if enc.err == nil {
+		enc.fail(inventory.WriteAuthMethodCanonical(w, h.auth))
+	}
 	enc.writeUint8(uint8(h.authKind))
 	sum, ok := h.authDigest.Bytes()
 	if !ok {
@@ -162,13 +167,29 @@ func (h HopSpec) WriteCanonical(w io.Writer) error {
 	return enc.err
 }
 
+type authMethodWire struct{ auth inventory.AuthMethod }
+
+func (a authMethodWire) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return inventory.MarshalAuthMethodTo(enc, a.auth)
+}
+func (a *authMethodWire) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	m, err := inventory.UnmarshalAuthMethodFrom(dec)
+	if err != nil {
+		a.auth = nil
+		return err
+	}
+	a.auth = m
+	return nil
+}
+
 type hopSpecWire struct {
 	HopIndex     algebraic.Option[uint32]                   `json:"hop_index"`
 	NodeID       algebraic.Option[string]                   `json:"node_id"`
 	Origin       algebraic.Option[option.OriginKind]        `json:"origin"`
 	Endpoint     algebraic.Option[netaddr.Endpoint]         `json:"endpoint"`
-	OriginalHost algebraic.Option[netaddr.CanonicalHost]    `json:"original_host"`
+	OriginalHost algebraic.Option[option.OriginalHostSpec]  `json:"original_host"`
 	Username     algebraic.Option[option.Username]          `json:"username"`
+	Auth         algebraic.Option[authMethodWire]           `json:"auth"`
 	AuthKind     algebraic.Option[inventory.AuthMethodKind] `json:"auth_kind"`
 	AuthDigest   algebraic.Option[security.Digest]          `json:"auth_digest"`
 	Transport    algebraic.Option[TransportPolicySpec]      `json:"transport"`
@@ -183,12 +204,13 @@ func (h HopSpec) MarshalJSONTo(enc *jsontext.Encoder) error {
 		HopIndex: algebraic.Some(h.hopIndex), NodeID: algebraic.Some(h.nodeID),
 		Origin: algebraic.Some(h.origin), Endpoint: algebraic.Some(h.endpoint),
 		OriginalHost: algebraic.Some(h.originalHost), Username: algebraic.Some(h.username),
+		Auth:     algebraic.Some(authMethodWire{h.auth}),
 		AuthKind: algebraic.Some(h.authKind), AuthDigest: algebraic.Some(h.authDigest),
 		Transport: algebraic.Some(h.transport),
 	})
 }
 
-// UnmarshalJSONFrom 实现 HopSpec 的失败关闭 json/v2 解码。
+// UnmarshalJSONFrom 实现 HopSpec 的失败关闭 json/v2 解码，强制核验 auth 与派生 auth_kind/auth_digest 一致。
 func (h *HopSpec) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return unmarshalJSONWithNullReject(h, dec, ErrInvalidHopSpec, func(w hopSpecWire) (HopSpec, error) {
 		idx, okIdx := w.HopIndex.Get()
@@ -197,12 +219,20 @@ func (h *HopSpec) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		ep, okE := w.Endpoint.Get()
 		origHost, okH := w.OriginalHost.Get()
 		user, okU := w.Username.Get()
+		aw, okA := w.Auth.Get()
 		ak, okAK := w.AuthKind.Get()
 		ad, okAD := w.AuthDigest.Get()
 		tp, okT := w.Transport.Get()
-		if !okIdx || !okN || !okO || !okE || !okH || !okU || !okAK || !okAD || !okT {
+		if !okIdx || !okN || !okO || !okE || !okH || !okU || !okA || !okAK || !okAD || !okT {
 			return HopSpec{}, fmt.Errorf("%w: 缺少必需的 HopSpec 字段", ErrInvalidHopSpec)
 		}
-		return NewHopSpec(HopSpecInput{idx, nid, ori, ep, origHost, user, ak, ad, tp})
+		rebuilt, err := NewHopSpec(HopSpecInput{idx, nid, ori, ep, origHost, user, aw.auth, tp})
+		if err != nil {
+			return HopSpec{}, err
+		}
+		if rebuilt.authKind != ak || !rebuilt.authDigest.Equal(ad) {
+			return HopSpec{}, fmt.Errorf("%w: HopSpec auth_kind/auth_digest 与 auth 负载不匹配", ErrTamperedPlanDigest)
+		}
+		return rebuilt, nil
 	})
 }

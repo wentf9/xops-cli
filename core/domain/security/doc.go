@@ -4,7 +4,7 @@
 //   - 有界安全格：Verdict 交半格、RiskLevel 并半格（零值 RiskUnknown 失败关闭）、
 //     GuardrailDecision 封闭和类型及 NodeOverrides 顺序无关格折叠；
 //   - 幻影能力封闭类型集：Capability（CapInspect..CapMutate）及序列化枚举 CapabilityKind；
-//   - 操作身份、规范绑定与审批信封：OperationID、SHA-256 Digest、经 digestcover 静态校验的 OperationBinding 与
+//   - 操作与链路身份、规范绑定与审批信封：TraceID、OperationID、SHA-256 Digest、经 digestcover 静态校验的 OperationBinding 与
 //     ApprovalEnvelope，以及双阶段路径规范化升级判定 CanonicalScopeEscalated。
 //
 // 架构隔离铁律（ADR-008）：运行期能力证明 Authorized[C] 物理独占定义于 core/internal/gate，严禁在本包定义。
@@ -31,6 +31,7 @@ var (
 	ErrInvalidCapability       = errors.New("security: 无效的 Capability")
 	ErrInvalidGlob             = errors.New("security: 无效的通配符模式")
 	ErrInvalidNodeOverride     = errors.New("security: 无效的 NodeOverrides 规则")
+	ErrInvalidTraceID          = errors.New("security: 无效的 TraceID")
 	ErrInvalidOperationID      = errors.New("security: 无效的 OperationID")
 	ErrNilEntropy              = errors.New("security: 熵源 io.Reader 不能为 nil")
 	ErrInvalidDigest           = errors.New("security: 无效的 SHA-256 Digest")
@@ -100,7 +101,7 @@ func rejectJSONNull(dec *jsontext.Decoder, baseErr error) (bool, error) {
 	return true, fmt.Errorf("%w: JSON null 不是有效值", baseErr)
 }
 
-// unmarshalJSONWithNullReject 统一实现失败关闭的 JSON/v2 反序列化：重置零值、拦截顶层 null、解码 wire 并构造校验值。
+// unmarshalJSONWithNullReject 统一实现失败关闭的 JSON/v2 反序列化：重置零值、拦截顶层 null、拒绝未知字段、解码 wire 并构造校验值。
 func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseErr error, build func(W) (T, error)) error {
 	if dst == nil {
 		return ErrNilReceiver
@@ -111,7 +112,7 @@ func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseEr
 		return err
 	}
 	var wire W
-	if err := jsonv2.UnmarshalDecode(dec, &wire); err != nil {
+	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return err
 	}
 	parsed, err := build(wire)

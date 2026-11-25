@@ -32,20 +32,17 @@ const (
 	EnsurePhaseFailed
 	EnsurePhaseUncertainOutcome
 )
-
 const (
 	ensureInInvalid uint8 = iota
 	ensureInStart
 	ensureInOutcome
 )
-
 const (
 	EnsureEffectInvalid EnsureEffectKind = iota
 	EnsureEffectRunCheck
 	EnsureEffectRunApply
 	EnsureEffectRunPostCheck
 )
-
 const (
 	EnsureEventInvalid EnsureEventKind = iota
 	EnsureEventCheckStarted
@@ -57,25 +54,6 @@ const (
 	EnsureEventFailed
 	EnsureEventUncertainOutcome
 )
-
-func (p EnsurePhase) IsValid() bool {
-	return p >= EnsurePhasePending && p <= EnsurePhaseUncertainOutcome
-}
-func (k EnsureEffectKind) IsValid() bool {
-	return k >= EnsureEffectRunCheck && k <= EnsureEffectRunPostCheck
-}
-func (k EnsureEventKind) IsValid() bool {
-	return k >= EnsureEventCheckStarted && k <= EnsureEventUncertainOutcome
-}
-func (p EnsurePhase) String() string {
-	return enumName(uint8(p), "unknown", "unknown", "pending", "checking", "applying", "post_checking", "converged_unchanged", "converged_changed", "failed", "uncertain_outcome")
-}
-func (k EnsureEffectKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "run_check", "run_apply", "run_post_check")
-}
-func (k EnsureEventKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "check_started", "retrying_not_started", "apply_started", "post_check_started", "converged_unchanged", "converged_changed", "failed", "uncertain_outcome")
-}
 
 // EnsureContext、EnsureState、EnsureInput、EnsureEffect 与 EnsureEvent 为 EnsureFSM 不可变失败关闭值对象。
 type (
@@ -164,10 +142,14 @@ func (i EnsureInput) IsValid() bool {
 func (e EnsureEffect) IsValid() bool          { return e.valid && e.kind.IsValid() }
 func (e EnsureEffect) Kind() EnsureEffectKind { return e.kind }
 func (e EnsureEffect) Attempt() uint8         { return e.attempt }
-func (e EnsureEvent) IsValid() bool           { return e.valid && e.kind.IsValid() }
+func (e EnsureEvent) IsValid() bool           { return e.valid && e.kind.IsValid() && e.phase.IsValid() }
+func (e EnsureEvent) IsZero() bool            { return !e.IsValid() }
 func (e EnsureEvent) Kind() EnsureEventKind   { return e.kind }
 func (e EnsureEvent) Phase() EnsurePhase      { return e.phase }
 func (e EnsureEvent) Detail() string          { return e.detail }
+func (e EnsureEvent) Equal(o EnsureEvent) bool {
+	return e.IsValid() && o.IsValid() && e.kind == o.kind && e.phase == o.phase && e.detail == o.detail
+}
 
 // EnsureInputStart 与 EnsureInputOutcome 构造 EnsureFSM 校验输入。
 func EnsureInputStart() EnsureInput { return EnsureInput{kind: ensureInStart, valid: true} }
@@ -203,7 +185,6 @@ func TransitionEnsure(state EnsureState, input EnsureInput) (EnsureState, []Ensu
 		return state, nil, nil, ErrInvalidState
 	}
 }
-
 func stepEnsurePhaseOutcome(s EnsureState, in EnsureInput) (EnsureState, []EnsureEffect, []EnsureEvent, error) {
 	if in.kind != ensureInOutcome {
 		return s, nil, nil, fmt.Errorf("%w: %s 仅接受 Outcome", ErrIllegalTransition, s.phase)
@@ -262,6 +243,6 @@ func ensureRun(phase EnsurePhase, ctx EnsureContext, retries uint8, eff EnsureEf
 func ensureFailed(ctx EnsureContext, at EnsurePhase, reason, detail string) (EnsureState, []EnsureEffect, []EnsureEvent, error) {
 	return EnsureState{phase: EnsurePhaseFailed, ctx: ctx, at: at, reason: sanitizeReason(reason), valid: true}, nil, []EnsureEvent{ensureEvent(EnsureEventFailed, at, detail)}, nil
 }
-func ensureEvent(kind EnsureEventKind, phase EnsurePhase, detail string) EnsureEvent {
-	return EnsureEvent{kind: kind, phase: phase, detail: sanitizeReason(detail), valid: true}
+func ensureEvent(k EnsureEventKind, p EnsurePhase, d string) EnsureEvent {
+	return EnsureEvent{k, p, sanitizeReason(d), true}
 }

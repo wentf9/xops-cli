@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
-	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
 // NewVaultSagaState 校验上下文并构造 VaultSagaFSM 初始状态 *VaultSagaInit。
@@ -12,19 +11,31 @@ func NewVaultSagaState(ctx VaultSagaContext) (*VaultSagaInit, error) {
 	if !ctx.IsValid() {
 		return nil, ErrInvalidContext
 	}
-	return &VaultSagaInit{sealedVaultMixin{ctx: ctx, valid: true}}, nil
+	return &VaultSagaInit{vMix(ctx, VaultSagaKindInit, "")}, nil
 }
 
 // VaultSagaInput 的显式校验构造器集（零值输入恒无效并失败关闭）。
 func VaultInputStart() VaultSagaInput { return VaultSagaInput{kind: vaultInStart, valid: true} }
-func VaultInputWriteNewResult(outcome SideEffectOutcome, reason string) (VaultSagaInput, error) {
-	return vaultOutcomeInput(vaultInWriteNew, outcome, reason)
+func VaultInputWriteNewResult(o SideEffectOutcome, r string) (VaultSagaInput, error) {
+	return vOutIn(vaultInWriteNew, o, r)
 }
-func VaultInputReadbackResult(ok bool, actualDigest security.Digest, reason string) (VaultSagaInput, error) {
-	if ok && !actualDigest.IsValid() {
-		return VaultSagaInput{}, fmt.Errorf("%w: 回读成功必须携带有效摘要", ErrInvalidInput)
+func VaultInputDeleteOldResult(o SideEffectOutcome, r string) (VaultSagaInput, error) {
+	return vOutIn(vaultInDeleteOld, o, r)
+}
+func VaultInputCompensateResult(o SideEffectOutcome, r string) (VaultSagaInput, error) {
+	return vOutIn(vaultInCompensate, o, r)
+}
+
+// VaultInputReadbackResult 构造回读核验结果输入（严格对齐 ports.SecretVault.PutAndVerify + SecretBox.Equal）：
+// 仅当 outcome == SideEffectSucceeded 时允许 matched=true；遇 SideEffectOutcomeUnknown 进入 FailedUncertain 且 0 副作用。
+func VaultInputReadbackResult(outcome SideEffectOutcome, matched bool, reason string) (VaultSagaInput, error) {
+	if !outcome.IsValid() {
+		return VaultSagaInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidOutcome)
 	}
-	return VaultSagaInput{kind: vaultInReadback, ok: ok, actualDigest: actualDigest, reason: sanitizeReason(reason), valid: true}, nil
+	if outcome != SideEffectSucceeded && matched {
+		return VaultSagaInput{}, fmt.Errorf("%w: 非成功回读结果不得声称 matched=true", ErrInvalidInput)
+	}
+	return VaultSagaInput{kind: vaultInReadback, outcome: outcome, ok: matched, reason: sanitizeReason(reason), valid: true}, nil
 }
 func VaultInputCommitCASResult(durability DurabilityStatus, reason string) (VaultSagaInput, error) {
 	if !durability.IsValid() {
@@ -38,13 +49,7 @@ func VaultInputOldRefsResult(ok bool, refCount int, reason string) (VaultSagaInp
 	}
 	return VaultSagaInput{kind: vaultInOldRefs, ok: ok, refCount: refCount, reason: sanitizeReason(reason), valid: true}, nil
 }
-func VaultInputDeleteOldResult(outcome SideEffectOutcome, reason string) (VaultSagaInput, error) {
-	return vaultOutcomeInput(vaultInDeleteOld, outcome, reason)
-}
-func VaultInputCompensateResult(outcome SideEffectOutcome, reason string) (VaultSagaInput, error) {
-	return vaultOutcomeInput(vaultInCompensate, outcome, reason)
-}
-func vaultOutcomeInput(kind uint8, outcome SideEffectOutcome, reason string) (VaultSagaInput, error) {
+func vOutIn(kind uint8, outcome SideEffectOutcome, reason string) (VaultSagaInput, error) {
 	if !outcome.IsValid() {
 		return VaultSagaInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidOutcome)
 	}
@@ -88,7 +93,7 @@ func stepVaultInit(s *VaultSagaInit, in VaultSagaInput) (VaultSagaState, []Vault
 	if in.kind != vaultInStart {
 		return s, nil, nil, fmt.Errorf("%w: init 仅接受 Start", ErrIllegalTransition)
 	}
-	return vaultNext(&VaultSagaWritingNew{sealedVaultMixin{s.ctx, true}}, VaultEffectWriteNew, s.ctx.newRef, 0, VaultEventStarted, s.ctx.newRef.String())
+	return vaultNext(&VaultSagaWritingNew{vMix(s.ctx, VaultSagaKindWritingNew, "")}, VaultEffectWriteNew, s.ctx.newRef, 0, VaultEventStarted, s.ctx.newRef.String())
 }
 func stepVaultWritingNew(s *VaultSagaWritingNew, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInWriteNew {
@@ -96,9 +101,9 @@ func stepVaultWritingNew(s *VaultSagaWritingNew, in VaultSagaInput) (VaultSagaSt
 	}
 	switch in.outcome {
 	case SideEffectSucceeded:
-		return vaultNext(&VaultSagaVerifyingReadback{sealedVaultMixin{s.ctx, true}}, VaultEffectVerifyReadback, s.ctx.newRef, 0, VaultEventNewSecretWritten, s.ctx.newRef.String())
+		return vaultNext(&VaultSagaVerifyingReadback{vMix(s.ctx, VaultSagaKindVerifyingReadback, "")}, VaultEffectVerifyReadback, s.ctx.newRef, 0, VaultEventNewSecretWritten, s.ctx.newRef.String())
 	case SideEffectFailedNotApplied:
-		return &VaultSagaRolledBack{sealedVaultMixin{s.ctx, true}, false, in.reason}, nil, []VaultSagaEvent{newEvent(VaultEventRolledBack, in.reason)}, nil
+		return &VaultSagaRolledBack{vMix(s.ctx, VaultSagaKindRolledBack, in.reason), false}, nil, []VaultSagaEvent{newEvent(VaultEventRolledBack, in.reason)}, nil
 	case SideEffectOutcomeUnknown:
 		return vaultUncertain(s.ctx, VaultSagaKindWritingNew, in.reason)
 	default:
@@ -109,12 +114,20 @@ func stepVaultVerifyingReadback(s *VaultSagaVerifyingReadback, in VaultSagaInput
 	if in.kind != vaultInReadback {
 		return s, nil, nil, fmt.Errorf("%w: verifying_readback 仅接受 ReadbackResult", ErrIllegalTransition)
 	}
-	// 使用 security.Digest.Equal 执行常量时间摘要比对。
-	if in.ok && s.ctx.expectedDigest.Equal(in.actualDigest) {
-		return vaultNext(&VaultSagaCommittingConfig{sealedVaultMixin{s.ctx, true}}, VaultEffectCommitConfigCAS, s.ctx.newRef, s.ctx.expectedCASVersion, VaultEventReadbackVerified, s.ctx.newRef.String())
+	switch in.outcome {
+	case SideEffectSucceeded:
+		if in.ok {
+			return vaultNext(&VaultSagaCommittingConfig{vMix(s.ctx, VaultSagaKindCommittingConfig, "")}, VaultEffectCommitConfigCAS, s.ctx.newRef, s.ctx.expectedCASVersion, VaultEventReadbackVerified, s.ctx.newRef.String())
+		}
+		fallthrough
+	case SideEffectFailedNotApplied:
+		reason := pickIf(in.reason != "", in.reason, pickIf(in.outcome == SideEffectSucceeded, "readback secret mismatch", "readback failed"))
+		return vaultNext(&VaultSagaCompensating{vMix(s.ctx, VaultSagaKindCompensating, reason)}, VaultEffectCompensateDeleteNew, s.ctx.newRef, 0, VaultEventReadbackFailed, reason)
+	case SideEffectOutcomeUnknown:
+		return vaultUncertain(s.ctx, VaultSagaKindVerifyingReadback, pickIf(in.reason != "", in.reason, "readback outcome unknown"))
+	default:
+		return s, nil, nil, ErrInvalidOutcome
 	}
-	reason := pickIf(in.reason != "", in.reason, "readback digest mismatch")
-	return vaultNext(&VaultSagaCompensating{sealedVaultMixin{s.ctx, true}, reason}, VaultEffectCompensateDeleteNew, s.ctx.newRef, 0, VaultEventReadbackFailed, reason)
 }
 func stepVaultCommittingConfig(s *VaultSagaCommittingConfig, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInCommitCAS {
@@ -123,14 +136,14 @@ func stepVaultCommittingConfig(s *VaultSagaCommittingConfig, in VaultSagaInput) 
 	switch in.durability {
 	case DurabilityCommitted:
 		if oldRef, hasOld := s.ctx.oldRef.Get(); hasOld {
-			return vaultNext(&VaultSagaCheckingOldRefs{sealedVaultMixin{s.ctx, true}}, VaultEffectCheckOldRefs, oldRef, 0, VaultEventConfigCommitted, s.ctx.newRef.String())
+			return vaultNext(&VaultSagaCheckingOldRefs{vMix(s.ctx, VaultSagaKindCheckingOldRefs, "")}, VaultEffectCheckOldRefs, oldRef, 0, VaultEventConfigCommitted, s.ctx.newRef.String())
 		}
-		return &VaultSagaCompleted{sealedVaultMixin{s.ctx, true}, false, "no_old_ref"}, nil, []VaultSagaEvent{newEvent(VaultEventConfigCommitted, s.ctx.newRef.String()), newEvent(VaultEventCompleted, "no_old_ref")}, nil
+		return &VaultSagaCompleted{vMix(s.ctx, VaultSagaKindCompleted, "no_old_ref"), false}, nil, []VaultSagaEvent{newEvent(VaultEventConfigCommitted, s.ctx.newRef.String()), newEvent(VaultEventCompleted, "no_old_ref")}, nil
 	case DurabilityNotApplied:
-		return vaultNext(&VaultSagaCompensating{sealedVaultMixin{s.ctx, true}, in.reason}, VaultEffectCompensateDeleteNew, s.ctx.newRef, 0, VaultEventConfigRejected, in.reason)
+		return vaultNext(&VaultSagaCompensating{vMix(s.ctx, VaultSagaKindCompensating, in.reason)}, VaultEffectCompensateDeleteNew, s.ctx.newRef, 0, VaultEventConfigRejected, in.reason)
 	case DurabilityAppliedNotDurable:
 		// 核心安全不变量：Applied && !Durable 停机于 UncertainDurability，严格 0 重试且 0 删除凭据。
-		return &VaultSagaUncertainDurability{sealedVaultMixin{s.ctx, true}, in.reason}, nil, []VaultSagaEvent{newEvent(VaultEventUncertainDurability, in.reason)}, nil
+		return &VaultSagaUncertainDurability{vMix(s.ctx, VaultSagaKindUncertainDurability, in.reason)}, nil, []VaultSagaEvent{newEvent(VaultEventUncertainDurability, in.reason)}, nil
 	case DurabilityOutcomeUnknown:
 		return vaultUncertain(s.ctx, VaultSagaKindCommittingConfig, in.reason)
 	default:
@@ -147,9 +160,9 @@ func stepVaultCheckingOldRefs(s *VaultSagaCheckingOldRefs, in VaultSagaInput) (V
 	oldRef, hasOld := s.ctx.oldRef.Get()
 	if !hasOld || in.refCount > 0 {
 		note := fmt.Sprintf("old_ref_retained:refs=%d", in.refCount)
-		return &VaultSagaCompleted{sealedVaultMixin{s.ctx, true}, false, note}, nil, []VaultSagaEvent{newEvent(VaultEventOldSecretGCDeferred, note), newEvent(VaultEventCompleted, note)}, nil
+		return &VaultSagaCompleted{vMix(s.ctx, VaultSagaKindCompleted, note), false}, nil, []VaultSagaEvent{newEvent(VaultEventOldSecretGCDeferred, note), newEvent(VaultEventCompleted, note)}, nil
 	}
-	return vaultNext(&VaultSagaDeletingOld{sealedVaultMixin{s.ctx, true}}, VaultEffectDeleteOld, oldRef, 0, VaultEventOldRefsZero, oldRef.String())
+	return vaultNext(&VaultSagaDeletingOld{vMix(s.ctx, VaultSagaKindDeletingOld, "")}, VaultEffectDeleteOld, oldRef, 0, VaultEventOldRefsZero, oldRef.String())
 }
 func stepVaultDeletingOld(s *VaultSagaDeletingOld, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInDeleteOld {
@@ -157,7 +170,7 @@ func stepVaultDeletingOld(s *VaultSagaDeletingOld, in VaultSagaInput) (VaultSaga
 	}
 	if in.outcome == SideEffectSucceeded {
 		oldRef, _ := s.ctx.oldRef.Get()
-		return &VaultSagaCompleted{sealedVaultMixin{s.ctx, true}, true, "old_deleted"}, nil, []VaultSagaEvent{newEvent(VaultEventOldSecretDeleted, oldRef.String()), newEvent(VaultEventCompleted, "old_deleted")}, nil
+		return &VaultSagaCompleted{vMix(s.ctx, VaultSagaKindCompleted, "old_deleted"), true}, nil, []VaultSagaEvent{newEvent(VaultEventOldSecretDeleted, oldRef.String()), newEvent(VaultEventCompleted, "old_deleted")}, nil
 	}
 	return vaultUncertain(s.ctx, VaultSagaKindDeletingOld, in.reason)
 }
@@ -166,7 +179,7 @@ func stepVaultCompensating(s *VaultSagaCompensating, in VaultSagaInput) (VaultSa
 		return s, nil, nil, fmt.Errorf("%w: compensating 仅接受 CompensateResult", ErrIllegalTransition)
 	}
 	if in.outcome == SideEffectSucceeded {
-		return &VaultSagaRolledBack{sealedVaultMixin{s.ctx, true}, true, s.reason}, nil, []VaultSagaEvent{newEvent(VaultEventCompensated, s.ctx.newRef.String()), newEvent(VaultEventRolledBack, s.reason)}, nil
+		return &VaultSagaRolledBack{vMix(s.ctx, VaultSagaKindRolledBack, s.reason), true}, nil, []VaultSagaEvent{newEvent(VaultEventCompensated, s.ctx.newRef.String()), newEvent(VaultEventRolledBack, s.reason)}, nil
 	}
 	return vaultUncertain(s.ctx, VaultSagaKindCompensating, in.reason)
 }
@@ -175,5 +188,5 @@ func vaultNext(st VaultSagaState, eff VaultSagaEffectKind, ref secret.Ref, cas u
 	return st, []VaultSagaEffect{{eff, ref, cas, true}}, []VaultSagaEvent{newEvent(ev, detail)}, nil
 }
 func vaultUncertain(ctx VaultSagaContext, step VaultSagaStateKind, reason string) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
-	return &VaultSagaFailedUncertain{sealedVaultMixin{ctx, true}, step, reason}, nil, []VaultSagaEvent{newEvent(VaultEventHaltedUncertain, reason)}, nil
+	return &VaultSagaFailedUncertain{vMix(ctx, VaultSagaKindFailedUncertain, reason), step}, nil, []VaultSagaEvent{newEvent(VaultEventHaltedUncertain, reason)}, nil
 }

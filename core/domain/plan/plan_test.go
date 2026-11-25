@@ -108,6 +108,7 @@ func assertUpstreamMutationsCascade(t *testing.T, base SealedConnectionPlan, hop
 		{"known_hosts", mustHop(t, 0, "bastion-01", "192.0.2.1:22", "jump", authA, option.UnsetOptionLayer().WithUserKnownHostsFiles(kh))},
 		{"forward_agent", mustHop(t, 0, "bastion-01", "192.0.2.1:22", "jump", authA, option.UnsetOptionLayer().WithForwardAgent(true))},
 		{"timeout", mustHop(t, 0, "bastion-01", "192.0.2.1:22", "jump", authA, option.UnsetOptionLayer().WithConnectTimeout(algebraic.FromStdDuration(10*time.Second)))},
+		{"alive_count_max", mustHop(t, 0, "bastion-01", "192.0.2.1:22", "jump", authA, option.UnsetOptionLayer().WithServerAliveCountMax(7))},
 		{"control", mustHop(t, 0, "bastion-01", "192.0.2.1:22", "jump", authA, option.UnsetOptionLayer().WithControlPolicy(option.UnsetControlPolicy().WithMaster(option.ControlMasterAuto).WithPath(cpPath)))},
 		{"send_env", mustHop(t, 0, "bastion-01", "192.0.2.1:22", "jump", authA, option.UnsetOptionLayer().WithSendEnv(ef))},
 		{"local_cmd", mustHop(t, 0, "bastion-01", "192.0.2.1:22", "jump", authA, option.UnsetOptionLayer().WithPermitLocalCommand(true).WithLocalCommand(lc))},
@@ -191,12 +192,65 @@ func assertPlanCodecAndTamperRejection(t *testing.T, planA SealedConnectionPlan,
 	if err := jsonv2.Unmarshal([]byte(nullDigest), &decoded); !errors.Is(err, ErrTamperedPlanDigest) {
 		t.Fatalf("置空 plan_digest 期望 ErrTamperedPlanDigest，实际=%v", err)
 	}
+	// 验证 HopSpec 内嵌不可变 AuthMethod 访问、非 RFC1123 OpenSSH 别名 OriginalHost、ServerAliveCountMax 投影及 auth/auth_digest 篡改拒绝
+	assertHopSpecAuthAliasAndTamper(t, hop1A)
 	var can1, can2 bytes.Buffer
 	if err := planA.WriteCanonical(&can1); err != nil {
 		t.Fatalf("WriteCanonical(planA) 失败: %v", err)
 	}
 	if err := planA.WriteCanonical(&can2); err != nil || !bytes.Equal(can1.Bytes(), can2.Bytes()) {
 		t.Fatalf("WriteCanonical 不具备确定性: err=%v", err)
+	}
+}
+
+func assertHopSpecAuthAliasAndTamper(t *testing.T, hop HopSpec) {
+	t.Helper()
+	if hop.Auth() == nil || !hop.Auth().IsValid() || hop.Auth().Kind() != hop.AuthKind() {
+		t.Fatalf("HopSpec.Auth() 必须返回与 AuthKind 一致的有效不可变认证方式")
+	}
+	if hop.Transport().ServerAliveCountMax() != option.DefaultServerAliveCountMax {
+		t.Fatalf("默认 ServerAliveCountMax 期望 %d，实际 %d", option.DefaultServerAliveCountMax, hop.Transport().ServerAliveCountMax())
+	}
+	// OpenSSH 非 RFC1123 别名 OriginalHost（如 prod_db）经 HostName 192.0.2.10 解析后完整保真透传到 HopSpec
+	origAlias, err := option.ParseOriginalHost("prod_db")
+	if err != nil {
+		t.Fatalf("ParseOriginalHost(prod_db) 失败: %v", err)
+	}
+	hn, err := option.ParseHostNameSpec("192.0.2.10")
+	if err != nil {
+		t.Fatalf("ParseHostNameSpec 失败: %v", err)
+	}
+	pol, err := option.ResolveEffectivePolicyWithOriginalHost(
+		option.OriginOpenSSHVirtual, origAlias, 22,
+		option.UnsetOptionLayer().WithHostName(hn).WithServerAliveCountMax(5),
+		option.UnsetOptionLayer(), option.UnsetOptionLayer(), option.UnsetOptionLayer(),
+	)
+	if err != nil {
+		t.Fatalf("ResolveEffectivePolicyWithOriginalHost 失败: %v", err)
+	}
+	user, _ := option.ParseUsername("deploy")
+	hopAlias, err := NewHopSpecFromAuth(0, "prod_db", user, hop.Auth(), pol)
+	if err != nil || hopAlias.OriginalHost().String() != "prod_db" || hopAlias.Endpoint().String() != "192.0.2.10:22" || hopAlias.Transport().ServerAliveCountMax() != 5 {
+		t.Fatalf("别名 HopSpec 构造异常: err=%v orig=%q ep=%q aliveMax=%d", err, hopAlias.OriginalHost(), hopAlias.Endpoint(), hopAlias.Transport().ServerAliveCountMax())
+	}
+	rawHop, err := jsonv2.Marshal(hopAlias, jsonv2.Deterministic(true))
+	if err != nil {
+		t.Fatalf("Marshal HopSpec 失败: %v", err)
+	}
+	var rtHop HopSpec
+	if err := jsonv2.Unmarshal(rawHop, &rtHop); err != nil || !rtHop.Equal(hopAlias) || !inventory.EqualAuthMethod(rtHop.Auth(), hopAlias.Auth()) {
+		t.Fatalf("HopSpec JSON 往返失败: err=%v", err)
+	}
+	// 篡改 auth_digest 与真实 auth 派生产物不一致必须拒绝
+	fakeAuthDigest := security.DigestFromSHA256([32]byte{0xaa}).String()
+	tamperedAuth := strings.Replace(string(rawHop), hopAlias.AuthDigest().String(), fakeAuthDigest, 1)
+	if err := jsonv2.Unmarshal([]byte(tamperedAuth), &rtHop); !errors.Is(err, ErrTamperedPlanDigest) || rtHop.IsValid() {
+		t.Fatalf("篡改 HopSpec.auth_digest 期望 ErrTamperedPlanDigest，实际 err=%v valid=%v", err, rtHop.IsValid())
+	}
+	// 未知字段必须被 RejectUnknownMembers 拒绝
+	extraField := strings.TrimSuffix(string(rawHop), "}") + `,"unknown_extra":1}`
+	if err := jsonv2.Unmarshal([]byte(extraField), &rtHop); err == nil || rtHop.IsValid() {
+		t.Fatalf("HopSpec 含未知字段必须拒绝，实际 err=%v", err)
 	}
 }
 

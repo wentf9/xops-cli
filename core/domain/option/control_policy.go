@@ -11,15 +11,14 @@ import (
 )
 
 // ControlMasterMode、ControlPathKind 与 ControlPersistKind 为多路复用枚举；零值代表未设置。
-//
-//xops:failclosed
-type ControlMasterMode uint8
-
-//xops:failclosed
-type ControlPathKind uint8
-
-//xops:failclosed
-type ControlPersistKind uint8
+type (
+	//xops:failclosed
+	ControlMasterMode uint8
+	//xops:failclosed
+	ControlPathKind uint8
+	//xops:failclosed
+	ControlPersistKind uint8
+)
 
 const (
 	ControlMasterUnset ControlMasterMode = iota
@@ -62,8 +61,8 @@ func (m ControlMasterMode) AppendText(b []byte) ([]byte, error) {
 	return appendValidText(b, m.String(), m.IsSet(), ErrInvalidControlPolicy)
 }
 func (m ControlMasterMode) MarshalText() ([]byte, error) { return m.AppendText(nil) }
-func (m *ControlMasterMode) UnmarshalText(text []byte) error {
-	return unmarshalTextVia(m, text, ParseControlMasterMode)
+func (m *ControlMasterMode) UnmarshalText(t []byte) error {
+	return unmarshalTextVia(m, t, ParseControlMasterMode)
 }
 
 // ControlPathSpec 表示不可变的 ControlPath 规格值对象。
@@ -171,35 +170,35 @@ func parseOpenSSHDuration(raw string) (algebraic.Duration, error) {
 	const maxDur = time.Duration(math.MaxInt64)
 	var total time.Duration
 	for rem := s; len(rem) > 0; {
-		part, next, err := parseOpenSSHDurationSegment(rem, s, maxDur)
-		if err != nil || total > maxDur-part {
-			return algebraic.ZeroDuration(), fmt.Errorf("时长解析失败或溢出 %q", s)
+		n, unit, rest, err := parseOpenSSHDurationPart(rem, s)
+		if err != nil {
+			return algebraic.ZeroDuration(), err
 		}
-		total, rem = total+part, next
+		if n > int64(maxDur/unit) || total > maxDur-time.Duration(n)*unit {
+			return algebraic.ZeroDuration(), fmt.Errorf("时长溢出 %q", s)
+		}
+		total, rem = total+time.Duration(n)*unit, rest
 	}
 	return algebraic.FromStdDuration(total), nil
 }
-func parseOpenSSHDurationSegment(rem, full string, maxDur time.Duration) (time.Duration, string, error) {
+func parseOpenSSHDurationPart(rem, full string) (int64, time.Duration, string, error) {
 	i := strings.IndexFunc(rem, func(r rune) bool { return r < '0' || r > '9' })
 	if i < 0 {
 		i = len(rem)
 	}
 	n, err := strconv.ParseInt(rem[:i], 10, 64)
 	if i == 0 || err != nil || n < 0 {
-		return 0, "", fmt.Errorf("非法时长 %q", full)
+		return 0, 0, "", fmt.Errorf("非法时长 %q", full)
 	}
 	rest, unit := rem[i:], time.Second
-	if len(rest) > 0 {
-		idx := strings.IndexByte("smhdw", rest[0]|0x20)
-		if idx < 0 {
-			return 0, "", fmt.Errorf("未知单位 %q", rest[0])
-		}
-		unit, rest = [5]time.Duration{time.Second, time.Minute, time.Hour, 24 * time.Hour, 7 * 24 * time.Hour}[idx], rest[1:]
+	if len(rest) == 0 {
+		return n, unit, rest, nil
 	}
-	if n > int64(maxDur/unit) {
-		return 0, "", fmt.Errorf("时长溢出 %q", full)
+	idx := strings.IndexByte("smhdw", rest[0]|0x20)
+	if idx < 0 {
+		return 0, 0, "", fmt.Errorf("未知单位 %q", rest[0])
 	}
-	return time.Duration(n) * unit, rest, nil
+	return n, [5]time.Duration{time.Second, time.Minute, time.Hour, 24 * time.Hour, 7 * 24 * time.Hour}[idx], rest[1:], nil
 }
 
 // ControlPersistSpec 只读访问器与文本编解码方法。

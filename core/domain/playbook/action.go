@@ -283,27 +283,10 @@ func validateScriptPlan(spec StepScriptSpec, args []string) error {
 		return nil
 	}
 	if _, err := execution.NewCommandPlan(execution.CommandPlanSpec{
-		Kind: execution.PlanKindScript, Profile: p, Command: "true", WorkDir: spec.WorkDir, Env: spec.Env, Timeout: spec.Timeout,
+		Kind: execution.PlanKindScript, Profile: p, Command: "true", Argv: args,
+		WorkDir: spec.WorkDir, Env: spec.Env, Timeout: spec.Timeout,
 	}); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidStepAction, err)
-	}
-	return validateScriptArgsForProfile(p, args)
-}
-
-func validateScriptArgsForProfile(p execution.LaunchProfile, args []string) error {
-	var quote func(string) (string, error)
-	switch {
-	case p.Interpreter().IsPOSIXShell():
-		quote = execution.QuotePOSIX
-	case p.Interpreter().IsPowerShell():
-		quote = execution.QuotePowerShell
-	default:
-		return fmt.Errorf("%w: script 步骤仅支持 POSIX 或 PowerShell 显式解释器", ErrInvalidStepAction)
-	}
-	for i, arg := range args {
-		if _, err := quote(arg); err != nil {
-			return fmt.Errorf("%w: args[%d] 不符合解释器引用不变量: %w", ErrInvalidStepAction, i, err)
-		}
 	}
 	return nil
 }

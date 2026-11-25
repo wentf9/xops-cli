@@ -91,10 +91,10 @@ func validateTemplateTokens(raw, allowedPercent string, allowEnv bool) error {
 }
 
 func enumName(idx uint8, names ...string) string {
-	if idx == 0 || int(idx) > len(names) {
-		return ""
+	if idx > 0 && int(idx) <= len(names) {
+		return names[idx-1]
 	}
-	return names[idx-1]
+	return ""
 }
 func enumNameOr(idx uint8, fallback string, names ...string) string {
 	if s := enumName(idx, names...); s != "" {
@@ -103,15 +103,14 @@ func enumNameOr(idx uint8, fallback string, names ...string) string {
 	return fallback
 }
 func foldMonoid[T any](zero T, combine func(T, T) T, items []T) T {
-	acc := zero
 	for _, item := range items {
-		acc = combine(acc, item)
+		zero = combine(zero, item)
 	}
-	return acc
+	return zero
 }
-func appendValidText(b []byte, text string, valid bool, invalidErr error) ([]byte, error) {
+func appendValidText(b []byte, text string, valid bool, err error) ([]byte, error) {
 	if !valid {
-		return nil, invalidErr
+		return nil, err
 	}
 	return append(b, text...), nil
 }
@@ -132,9 +131,9 @@ func unmarshalNullableJSON[T, W any](dst *T, dec *jsontext.Decoder, unset func()
 	if dst == nil || dec == nil {
 		return ErrNilReceiver
 	}
+	*dst = unset()
 	if dec.PeekKind() == 'n' {
 		_, err := dec.ReadToken()
-		*dst = unset()
 		return err
 	}
 	var wire W

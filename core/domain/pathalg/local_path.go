@@ -96,6 +96,46 @@ func (d LocalDir) Drive() (byte, bool) {
 // String 返回规范化目录文本（以 '/' 分隔）；无效零值返回空串。
 func (d LocalDir) String() string { return d.canon }
 
+// JoinComponent 在当前本地目录根下安全追加单个经 ValidateLocalComponent 校验的子目录分量，
+// 正确处理 POSIX 根目录 "/"、Windows 盘符根目录 "C:/" 与当前目录 "."（绝不产生 "//sub"）。
+func (d LocalDir) JoinComponent(name string) (LocalDir, error) {
+	if !d.IsValid() {
+		return LocalDir{}, fmt.Errorf("%w: 无法在无效 LocalDir 上追加分量", ErrInvalidLocalDir)
+	}
+	if err := ValidateLocalComponent(name); err != nil {
+		return LocalDir{}, fmt.Errorf("%w: %w", ErrInvalidLocalDir, err)
+	}
+	return joinLocalDirRel(d, name)
+}
+
+// JoinDest 在当前本地目录根下安全拼接已校验的沙箱相对路径 LocalRootedDest，
+// 正确处理 POSIX 根目录 "/"、Windows 盘符根目录 "C:/" 与当前目录 "."（绝不产生 "//sub"）。
+func (d LocalDir) JoinDest(dest LocalRootedDest) (LocalDir, error) {
+	if !d.IsValid() {
+		return LocalDir{}, fmt.Errorf("%w: 无法在无效 LocalDir 上拼接沙箱路径", ErrInvalidLocalDir)
+	}
+	if !dest.IsValid() {
+		return LocalDir{}, fmt.Errorf("%w: %w", ErrInvalidLocalDir, ErrInvalidLocalDest)
+	}
+	return joinLocalDirRel(d, dest.rel)
+}
+
+func joinLocalDirRel(d LocalDir, rel string) (LocalDir, error) {
+	var joined string
+	switch {
+	case d.canon == ".":
+		joined = rel
+	case strings.HasSuffix(d.canon, "/"):
+		joined = d.canon + rel
+	default:
+		joined = d.canon + "/" + rel
+	}
+	if len(joined) > MaxLocalPathBytes {
+		return LocalDir{}, fmt.Errorf("%w: 拼接后路径长度 %d 超过上限 %d", ErrInvalidLocalDir, len(joined), MaxLocalPathBytes)
+	}
+	return LocalDir{canon: joined, kind: d.kind, drive: d.drive}, nil
+}
+
 // Equal 判断两个 LocalDir 是否均有效且完全相等；无效零值永不相等。
 func (d LocalDir) Equal(other LocalDir) bool {
 	return d.IsValid() && other.IsValid() && d.kind == other.kind && d.drive == other.drive && d.canon == other.canon
@@ -271,13 +311,17 @@ func parseLocalPath(raw string, allowRootOrDot bool) (canon string, kind LocalPa
 	if hasDisallowedLocalPrefix(raw) {
 		return "", LocalPathInvalid, 0, fmt.Errorf("路径 %q 使用了禁止的 UNC、设备命名空间或根相对反斜杠前缀", raw)
 	}
-	if len(raw) >= 2 && isASCIIAlpha(raw[0]) && raw[1] == ':' {
+	if hasWindowsDrivePrefix(raw) {
 		return parseWindowsDriveLocalPath(raw, allowRootOrDot)
 	}
 	if strings.HasPrefix(raw, "/") {
 		return parsePOSIXAbsLocalPath(raw, allowRootOrDot)
 	}
 	return parseRelativeLocalPath(raw, allowRootOrDot)
+}
+
+func hasWindowsDrivePrefix(raw string) bool {
+	return len(raw) >= 2 && isASCIIAlpha(raw[0]) && raw[1] == ':'
 }
 
 func hasDisallowedLocalPrefix(raw string) bool {
@@ -325,8 +369,11 @@ func parsePOSIXAbsLocalPath(raw string, allowRoot bool) (string, LocalPathKind, 
 }
 
 func parseRelativeLocalPath(raw string, allowDot bool) (string, LocalPathKind, byte, error) {
+	hasBackslash := strings.ContainsRune(raw, '\\')
 	normalized := strings.ReplaceAll(raw, "\\", "/")
-	segs, err := parseLocalSegments(normalized, true)
+	// 含反斜杠的 Windows 相对路径执行跨平台严格单分量校验；
+	// 不含反斜杠的 POSIX 相对路径与 parsePOSIXAbsLocalPath 对齐，保留合法 POSIX 文件名（如 "./a:b"）。
+	segs, err := parseLocalSegments(normalized, hasBackslash)
 	if err != nil {
 		return "", LocalPathInvalid, 0, err
 	}
@@ -336,12 +383,21 @@ func parseRelativeLocalPath(raw string, allowDot bool) (string, LocalPathKind, b
 		}
 		return ".", LocalPathRelative, 0, nil
 	}
-	return strings.Join(segs, "/"), LocalPathRelative, 0, nil
+	joined := strings.Join(segs, "/")
+	// 首段形如单字母加冒号（如 "./a:b" 去掉 "." 后为 "a:b"）时保留 "./" 前缀，
+	// 防止序列化往返时与被禁止的 Windows 盘符相对路径（"C:foo"）发生语法歧义。
+	if hasWindowsDrivePrefix(segs[0]) {
+		if len(joined)+2 > MaxLocalPathBytes {
+			return "", LocalPathInvalid, 0, fmt.Errorf("规范化路径长度超过上限 %d", MaxLocalPathBytes)
+		}
+		return "./" + joined, LocalPathRelative, 0, nil
+	}
+	return joined, LocalPathRelative, 0, nil
 }
 
 // parseLocalSegments 拆分并校验非根目录分量：一律禁止 ".." 穿越段，忽略冗余空段与 "."。
-// 当 strictComponent 为 true（Windows 盘符或相对路径）时，对每段执行完整 ValidateLocalComponent；
-// 否则（POSIX 绝对路径）校验单段长度上限并保留 POSIX 合法字符。
+// 当 strictComponent 为 true（Windows 盘符或含反斜杠的相对路径）时，对每段执行完整 ValidateLocalComponent；
+// 否则（POSIX 绝对或 POSIX 相对路径）校验单段长度上限并保留 POSIX 合法字符。
 func parseLocalSegments(rest string, strictComponent bool) ([]string, error) {
 	var out []string
 	for seg := range strings.SplitSeq(rest, "/") {

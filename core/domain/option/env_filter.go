@@ -64,9 +64,7 @@ func (f EnvFilter) ClearPatterns() []string { return slices.Clone(f.clear) }
 func (f EnvFilter) Equal(o EnvFilter) bool {
 	return slices.Equal(f.clear, o.clear) && slices.Equal(f.added, o.added)
 }
-func (f EnvFilter) clone() EnvFilter {
-	return EnvFilter{slices.Clone(f.clear), slices.Clone(f.added)}
-}
+func (f EnvFilter) clone() EnvFilter { return EnvFilter{slices.Clone(f.clear), slices.Clone(f.added)} }
 func FoldEnvFilters(layers ...EnvFilter) EnvFilter {
 	return foldMonoid(UnsetEnvFilter(), EnvFilter.Compose, layers)
 }

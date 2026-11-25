@@ -36,7 +36,6 @@ const (
 	PendingEnrollPhaseAborted
 	PendingEnrollPhaseUncertain
 )
-
 const (
 	enrollInInvalid uint8 = iota
 	enrollInStage
@@ -48,7 +47,6 @@ const (
 	enrollInCancel
 	enrollInExpire
 )
-
 const (
 	EnrollEffectInvalid PendingEnrollEffectKind = iota
 	EnrollEffectPinSecrets
@@ -57,7 +55,6 @@ const (
 	EnrollEffectCleanupPendingSecrets
 	EnrollEffectReleasePins
 )
-
 const (
 	EnrollEventInvalid PendingEnrollEventKind = iota
 	EnrollEventStaged
@@ -74,36 +71,15 @@ const (
 	EnrollEventUncertain
 )
 
-func (p PendingEnrollPhase) IsValid() bool {
-	return p >= PendingEnrollPhaseIdle && p <= PendingEnrollPhaseUncertain
-}
-func (k PendingEnrollEffectKind) IsValid() bool {
-	return k >= EnrollEffectPinSecrets && k <= EnrollEffectReleasePins
-}
-func (k PendingEnrollEventKind) IsValid() bool {
-	return k >= EnrollEventStaged && k <= EnrollEventUncertain
-}
-func (p PendingEnrollPhase) String() string {
-	return enumName(uint8(p), "invalid", "invalid", "idle", "staged", "probing", "verified", "committing", "cleaning_up", "enrolled", "aborted", "uncertain")
-}
-func (k PendingEnrollEffectKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "pin_secrets", "probe_connection", "commit_inventory_cas", "cleanup_pending_secrets", "release_pins")
-}
-func (k PendingEnrollEventKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "staged", "probe_started", "verified", "probe_failed", "commit_started", "enrolled", "commit_rejected", "expired", "cancelled", "cleaning_up", "aborted", "uncertain")
-}
-
-// PendingEnrollContextSpec 承载构造 PendingEnrollContext 的显式入参。
-type PendingEnrollContextSpec struct {
-	LeaseID    security.OperationID
-	TargetNode inventory.NodeID
-	PinnedRefs []secret.Ref
-	StagedAt   time.Time
-	TTL        algebraic.Duration
-}
-
-// PendingEnrollContext、PendingEnrollState、PendingEnrollInput 与 PendingEnrollEffect 为失败关闭不可变值对象。
+// PendingEnrollContextSpec 与 PendingEnrollContext/State/Input/Effect 为失败关闭不可变值对象。
 type (
+	PendingEnrollContextSpec struct {
+		LeaseID    security.OperationID
+		TargetNode inventory.NodeID
+		PinnedRefs []secret.Ref
+		StagedAt   time.Time
+		TTL        algebraic.Duration
+	}
 	//xops:opaque
 	//xops:failclosed
 	PendingEnrollContext struct {
@@ -165,7 +141,6 @@ func NewPendingEnrollContext(spec PendingEnrollContextSpec) (PendingEnrollContex
 func NewPendingEnrollState() PendingEnrollState {
 	return PendingEnrollState{phase: PendingEnrollPhaseIdle, valid: true}
 }
-
 func (c PendingEnrollContext) IsValid() bool {
 	return c.valid && c.leaseID.IsValid() && c.targetNode.IsValid() && isValidTimeWindow(c.stagedAt, c.ttl)
 }
@@ -182,11 +157,7 @@ func (c PendingEnrollContext) IsExpiredAt(now time.Time) bool {
 
 // IsActiveAt 报告租约在显式时刻 now 是否处于有效活动窗口 [stagedAt, stagedAt+ttl) 内。
 func (c PendingEnrollContext) IsActiveAt(now time.Time) bool {
-	if !c.IsValid() || now.IsZero() {
-		return false
-	}
-	t := now.UTC()
-	return !t.Before(c.stagedAt) && t.Before(c.stagedAt.Add(c.ttl.Std()))
+	return c.IsValid() && !now.IsZero() && !now.UTC().Before(c.stagedAt) && now.UTC().Before(c.stagedAt.Add(c.ttl.Std()))
 }
 func (c PendingEnrollContext) PendingSecretRefs() []inventory.PendingSecretRef {
 	if !c.IsValid() || len(c.pinnedRefs) == 0 {
@@ -231,18 +202,14 @@ func EnrollInputStage(ctx PendingEnrollContext) (PendingEnrollInput, error) {
 	}
 	return PendingEnrollInput{kind: enrollInStage, ctx: ctx, valid: true}, nil
 }
-func EnrollInputStartProbe(now time.Time) (PendingEnrollInput, error) {
-	return enrollTimeInput(enrollInStartProbe, now)
-}
+func EnrollInputStartProbe(t time.Time) (PendingEnrollInput, error) { return eT(enrollInStartProbe, t) }
 func EnrollInputProbeResult(ok bool, fp inventory.KeyFingerprint, now time.Time, reason string) (PendingEnrollInput, error) {
 	if !isValidRFC3339Time(now) || (ok && !fp.IsValid()) {
 		return PendingEnrollInput{}, ErrInvalidInput
 	}
 	return PendingEnrollInput{kind: enrollInProbeResult, ok: ok, hostKeyFingerprint: fp, now: now.UTC().Round(0), reason: sanitizeReason(reason), valid: true}, nil
 }
-func EnrollInputCommit(now time.Time) (PendingEnrollInput, error) {
-	return enrollTimeInput(enrollInCommit, now)
-}
+func EnrollInputCommit(t time.Time) (PendingEnrollInput, error) { return eT(enrollInCommit, t) }
 func EnrollInputCommitResult(durability DurabilityStatus, reason string) (PendingEnrollInput, error) {
 	if !durability.IsValid() {
 		return PendingEnrollInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidDurability)
@@ -258,10 +225,8 @@ func EnrollInputCleanupResult(outcome SideEffectOutcome, reason string) (Pending
 func EnrollInputCancel(reason string) PendingEnrollInput {
 	return PendingEnrollInput{kind: enrollInCancel, reason: sanitizeReason(reason), valid: true}
 }
-func EnrollInputExpire(now time.Time) (PendingEnrollInput, error) {
-	return enrollTimeInput(enrollInExpire, now)
-}
-func enrollTimeInput(kind uint8, now time.Time) (PendingEnrollInput, error) {
+func EnrollInputExpire(t time.Time) (PendingEnrollInput, error) { return eT(enrollInExpire, t) }
+func eT(kind uint8, now time.Time) (PendingEnrollInput, error) {
 	if !isValidRFC3339Time(now) {
 		return PendingEnrollInput{}, ErrInvalidInput
 	}
@@ -297,16 +262,12 @@ func TransitionPendingEnroll(state PendingEnrollState, input PendingEnrollInput)
 		return state, nil, nil, ErrInvalidState
 	}
 }
-
 func stepEnrollIdle(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
 	if in.kind != enrollInStage {
 		return s, nil, nil, fmt.Errorf("%w: idle 仅接受 Stage", ErrIllegalTransition)
 	}
-	var effects []PendingEnrollEffect
-	if len(in.ctx.pinnedRefs) > 0 {
-		effects = []PendingEnrollEffect{enrollEffect(EnrollEffectPinSecrets, in.ctx.targetNode, in.ctx.pinnedRefs)}
-	}
-	return PendingEnrollState{phase: PendingEnrollPhaseStaged, ctx: in.ctx, valid: true}, effects, []PendingEnrollEvent{newEvent(EnrollEventStaged, in.ctx.targetNode.String())}, nil
+	effs := pickIf(len(in.ctx.pinnedRefs) > 0, []PendingEnrollEffect{enrollEffect(EnrollEffectPinSecrets, in.ctx.targetNode, in.ctx.pinnedRefs)}, nil)
+	return PendingEnrollState{phase: PendingEnrollPhaseStaged, ctx: in.ctx, valid: true}, effs, []PendingEnrollEvent{newEvent(EnrollEventStaged, in.ctx.targetNode.String())}, nil
 }
 func stepEnrollStaged(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
 	if next, eff, ev, done, err := guardEnrollActive(s, in, enrollInStartProbe, "staged 严禁跳过探测直接入库", "lease expired before probe"); done {
@@ -335,11 +296,8 @@ func stepEnrollCommitting(s PendingEnrollState, in PendingEnrollInput) (PendingE
 	}
 	switch in.durability {
 	case DurabilityCommitted:
-		var effects []PendingEnrollEffect
-		if len(s.ctx.pinnedRefs) > 0 {
-			effects = []PendingEnrollEffect{enrollEffect(EnrollEffectReleasePins, s.ctx.targetNode, s.ctx.pinnedRefs)}
-		}
-		return PendingEnrollState{phase: PendingEnrollPhaseEnrolled, ctx: s.ctx, hostKeyFingerprint: s.hostKeyFingerprint, valid: true}, effects, []PendingEnrollEvent{newEvent(EnrollEventEnrolled, s.ctx.targetNode.String())}, nil
+		effs := pickIf(len(s.ctx.pinnedRefs) > 0, []PendingEnrollEffect{enrollEffect(EnrollEffectReleasePins, s.ctx.targetNode, s.ctx.pinnedRefs)}, nil)
+		return PendingEnrollState{phase: PendingEnrollPhaseEnrolled, ctx: s.ctx, hostKeyFingerprint: s.hostKeyFingerprint, valid: true}, effs, []PendingEnrollEvent{newEvent(EnrollEventEnrolled, s.ctx.targetNode.String())}, nil
 	case DurabilityNotApplied:
 		return beginEnrollCleanup(s.ctx, EnrollEventCommitRejected, pickIf(in.reason != "", in.reason, "cas commit not applied"))
 	case DurabilityAppliedNotDurable, DurabilityOutcomeUnknown:
@@ -358,31 +316,24 @@ func stepEnrollCleaningUp(s PendingEnrollState, in PendingEnrollInput) (PendingE
 	return enrollUncertain(s.ctx, pickIf(in.reason != "", in.reason, "cleanup failed or uncertain"))
 }
 func guardEnrollActive(s PendingEnrollState, in PendingEnrollInput, expect uint8, illegalMsg, expMsg string) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, bool, error) {
-	switch in.kind {
-	case enrollInCancel:
+	if in.kind == enrollInCancel {
 		next, eff, ev, err := beginEnrollCleanup(s.ctx, EnrollEventCancelled, pickIf(in.reason != "", in.reason, "cancelled"))
 		return next, eff, ev, true, err
-	case enrollInExpire:
-		if in.now.UTC().Before(s.ctx.stagedAt) {
-			return s, nil, nil, true, fmt.Errorf("%w: 到期判定时刻早于 staged_at", ErrInvalidInput)
-		}
-		if !s.ctx.IsExpiredAt(in.now) {
-			return s, nil, nil, true, fmt.Errorf("%w: 租约尚未到期", ErrIllegalTransition)
-		}
-		next, eff, ev, err := beginEnrollCleanup(s.ctx, EnrollEventExpired, "lease expired")
-		return next, eff, ev, true, err
-	case expect:
-		if in.now.UTC().Before(s.ctx.stagedAt) {
-			return s, nil, nil, true, fmt.Errorf("%w: 操作时刻早于 staged_at", ErrInvalidInput)
-		}
-		if s.ctx.IsExpiredAt(in.now) {
-			next, eff, ev, err := beginEnrollCleanup(s.ctx, EnrollEventExpired, expMsg)
-			return next, eff, ev, true, err
-		}
-		return PendingEnrollState{}, nil, nil, false, nil
-	default:
+	}
+	if in.kind != enrollInExpire && in.kind != expect {
 		return s, nil, nil, true, fmt.Errorf("%w: %s", ErrIllegalTransition, illegalMsg)
 	}
+	if in.now.UTC().Before(s.ctx.stagedAt) {
+		return s, nil, nil, true, fmt.Errorf("%w: 操作时刻早于 staged_at", ErrInvalidInput)
+	}
+	if s.ctx.IsExpiredAt(in.now) {
+		next, eff, ev, err := beginEnrollCleanup(s.ctx, EnrollEventExpired, pickIf(in.kind == enrollInExpire, "lease expired", expMsg))
+		return next, eff, ev, true, err
+	}
+	if in.kind == enrollInExpire {
+		return s, nil, nil, true, fmt.Errorf("%w: 租约尚未到期", ErrIllegalTransition)
+	}
+	return PendingEnrollState{}, nil, nil, false, nil
 }
 func enrollUncertain(ctx PendingEnrollContext, reason string) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
 	clean := sanitizeReason(reason)

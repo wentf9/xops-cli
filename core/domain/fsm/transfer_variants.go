@@ -8,11 +8,17 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
-// JournalVersion、TransferStateKind、TransferEffectKind 与 TransferEventKind 为失败关闭枚举。
+// TransferDirection、JournalVersion、JournalRecordKind、TransferStateKind、TransferEffectKind 与 TransferEventKind 为失败关闭枚举。
 type (
 	//xops:opaque
 	//xops:failclosed
+	TransferDirection uint8
+	//xops:opaque
+	//xops:failclosed
 	JournalVersion uint8
+	//xops:opaque
+	//xops:failclosed
+	JournalRecordKind uint8
 	//xops:opaque
 	//xops:failclosed
 	TransferStateKind uint8
@@ -25,11 +31,24 @@ type (
 )
 
 const (
+	TransferDirectionInvalid TransferDirection = iota
+	TransferDirectionUpload
+	TransferDirectionDownload
+)
+const (
 	JournalVersionInvalid JournalVersion = iota
 	JournalVersionV1
 	JournalVersionV2
 )
-
+const (
+	JournalRecordInvalid JournalRecordKind = iota
+	JournalRecordInit
+	JournalRecordChunk
+	JournalRecordVerified
+	JournalRecordCommitStarted
+	JournalRecordCommitted
+	JournalRecordAborted
+)
 const (
 	TransferKindInvalid TransferStateKind = iota
 	TransferKindInitialized
@@ -40,7 +59,6 @@ const (
 	TransferKindAborted
 	TransferKindUncertainCommit
 )
-
 const (
 	transferInInvalid uint8 = iota
 	transferInStart
@@ -49,7 +67,6 @@ const (
 	transferInCommitResult
 	transferInAbort
 )
-
 const (
 	TransferEffectInvalid TransferEffectKind = iota
 	TransferEffectWriteJournal
@@ -57,7 +74,6 @@ const (
 	TransferEffectAtomicCommit
 	TransferEffectCleanupStaging
 )
-
 const (
 	TransferEventInvalid TransferEventKind = iota
 	TransferEventStarted
@@ -71,83 +87,108 @@ const (
 	TransferEventRecovered
 )
 
-// ParseJournalVersion 严格解析规范小写 Journal 版本（"v1" 或 "v2"）。
-func ParseJournalVersion(raw string) (JournalVersion, error) {
-	return parseEnumByName(raw, JournalVersionV1, JournalVersionV2, JournalVersionInvalid, JournalVersion.String, ErrInvalidJournal)
-}
-func (v JournalVersion) IsValid() bool  { return v == JournalVersionV1 || v == JournalVersionV2 }
-func (v JournalVersion) IsZero() bool   { return v == JournalVersionInvalid }
-func (v JournalVersion) String() string { return enumName(uint8(v), "invalid", "invalid", "v1", "v2") }
-func (v JournalVersion) AppendText(b []byte) ([]byte, error) {
-	return appendValidText(b, v.IsValid(), v.String(), ErrInvalidJournal)
-}
-func (v JournalVersion) MarshalText() ([]byte, error) { return v.AppendText(nil) }
-func (v *JournalVersion) UnmarshalText(text []byte) error {
-	return unmarshalTextWithReset(v, JournalVersionInvalid, text, ParseJournalVersion)
-}
-
-func (k TransferStateKind) IsValid() bool {
-	return k >= TransferKindInitialized && k <= TransferKindUncertainCommit
-}
-func (k TransferEffectKind) IsValid() bool {
-	return k >= TransferEffectWriteJournal && k <= TransferEffectCleanupStaging
-}
-func (k TransferEventKind) IsValid() bool {
-	return k >= TransferEventStarted && k <= TransferEventRecovered
-}
-func (k TransferStateKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "initialized", "streaming", "verifying", "committing", "committed", "aborted", "uncertain_commit")
-}
-func (k TransferEffectKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "write_journal", "verify_full_digest", "atomic_commit", "cleanup_staging")
-}
-func (k TransferEventKind) String() string {
-	return enumName(uint8(k), "invalid", "invalid", "started", "chunk_accepted", "stream_completed", "digest_verified", "commit_started", "committed", "aborted", "uncertain_commit", "recovered")
-}
-
-// TransferMetaSpec 与 TransferMeta 保存单次 MCP HTTP 分片传输（最高 10 GiB）的不可变元数据；零值恒无效。
-type TransferMetaSpec struct {
-	TransferID     security.OperationID
-	Dest           pathalg.RemotePath
-	TotalBytes     uint64
-	ExpectedDigest security.Digest
-	JournalVersion JournalVersion
-	Generation     uint64
-}
-
+// TransferDest 表示方向感知的不可变传输目标：上传绑定远端 pathalg.RemotePath，下载绑定本机受限根目录目标 pathalg.LocalRootedDest；零值恒无效。
+//
 //xops:opaque
 //xops:failclosed
-type TransferMeta struct {
-	transferID     security.OperationID
-	dest           pathalg.RemotePath
-	totalBytes     uint64
-	expectedDigest security.Digest
-	journalVersion JournalVersion
-	generation     uint64
-	valid          bool
+type TransferDest struct {
+	direction TransferDirection
+	remote    pathalg.RemotePath
+	local     pathalg.LocalRootedDest
+	valid     bool
 }
 
-// NewTransferMeta 校验传输标识、远端路径、总大小（<= 10 GiB）、预期全量摘要、Journal 版本与世代号（>= 1）。
+// NewUploadDest 与 NewDownloadDest 分别校验远端绝对路径与本机受限根目录相对目标，构造不可变 TransferDest。
+func NewUploadDest(remote pathalg.RemotePath) (TransferDest, error) {
+	if !remote.IsValid() {
+		return TransferDest{}, fmt.Errorf("%w: 上传目标 RemotePath 无效", ErrInvalidContext)
+	}
+	return TransferDest{direction: TransferDirectionUpload, remote: remote, valid: true}, nil
+}
+func NewDownloadDest(local pathalg.LocalRootedDest) (TransferDest, error) {
+	if !local.IsValid() {
+		return TransferDest{}, fmt.Errorf("%w: 下载目标 LocalRootedDest 无效", ErrInvalidContext)
+	}
+	return TransferDest{direction: TransferDirectionDownload, local: local, valid: true}, nil
+}
+func (d TransferDest) IsValid() bool {
+	return d.valid && ((d.direction == TransferDirectionUpload && d.remote.IsValid() && d.local.IsZero()) ||
+		(d.direction == TransferDirectionDownload && d.local.IsValid() && d.remote.IsZero()))
+}
+func (d TransferDest) IsZero() bool { return !d.IsValid() }
+func (d TransferDest) Direction() TransferDirection {
+	return pickIf(d.IsValid(), d.direction, TransferDirectionInvalid)
+}
+func (d TransferDest) Remote() algebraic.Option[pathalg.RemotePath] {
+	return pickIf(d.IsValid() && d.direction == TransferDirectionUpload, algebraic.Some(d.remote), algebraic.None[pathalg.RemotePath]())
+}
+func (d TransferDest) Local() algebraic.Option[pathalg.LocalRootedDest] {
+	return pickIf(d.IsValid() && d.direction == TransferDirectionDownload, algebraic.Some(d.local), algebraic.None[pathalg.LocalRootedDest]())
+}
+func (d TransferDest) String() string {
+	return pickIf(d.IsValid(), d.direction.String()+":"+pickIf(d.direction == TransferDirectionUpload, d.remote.String(), d.local.String()), "")
+}
+func (d TransferDest) Equal(o TransferDest) bool {
+	return d.IsValid() && o.IsValid() && d.direction == o.direction &&
+		pickIf(d.direction == TransferDirectionUpload, d.remote.Equal(o.remote), d.local.Equal(o.local))
+}
+func (d TransferDest) writeCanonical(enc *canonicalEncoder) {
+	if !d.IsValid() {
+		enc.err = ErrInvalidJournal
+		return
+	}
+	enc.writeUint8(uint8(d.direction))
+	enc.writeString(pickIf(d.direction == TransferDirectionUpload, d.remote.String(), d.local.String()))
+}
+
+// TransferMetaSpec 与 TransferMeta 保存单次分片传输（上传或下载，最高 10 GiB，预期摘要可选）的不可变元数据；零值恒无效。
+type (
+	TransferMetaSpec struct {
+		TransferID     security.OperationID
+		Dest           TransferDest
+		TotalBytes     uint64
+		ExpectedDigest algebraic.Option[security.Digest]
+		JournalVersion JournalVersion
+		Generation     uint64
+	}
+	//xops:opaque
+	//xops:failclosed
+	TransferMeta struct {
+		transferID     security.OperationID
+		dest           TransferDest
+		totalBytes     uint64
+		expectedDigest algebraic.Option[security.Digest]
+		journalVersion JournalVersion
+		generation     uint64
+		valid          bool
+	}
+)
+
+// NewTransferMeta 校验传输标识、方向感知目标、总大小（<= 10 GiB）、可选预期摘要、Journal 版本与世代号（>= 1）。
 func NewTransferMeta(spec TransferMetaSpec) (TransferMeta, error) {
 	if spec.TotalBytes > MaxTransferBytes {
 		return TransferMeta{}, fmt.Errorf("%w: total_bytes=%d 超出 10 GiB 上限 %d", ErrTransferSizeExceeded, spec.TotalBytes, MaxTransferBytes)
 	}
-	if !spec.TransferID.IsValid() || !spec.Dest.IsValid() || !spec.ExpectedDigest.IsValid() || !spec.JournalVersion.IsValid() || spec.Generation == 0 {
-		return TransferMeta{}, fmt.Errorf("%w: transfer_id/dest/expected_digest/journal_version/generation(>=1) 均须有效", ErrInvalidContext)
+	if d, ok := spec.ExpectedDigest.Get(); ok && !d.IsValid() {
+		return TransferMeta{}, fmt.Errorf("%w: expected_digest 存在时必须有效", ErrInvalidContext)
+	}
+	if !spec.TransferID.IsValid() || !spec.Dest.IsValid() || !spec.JournalVersion.IsValid() || spec.Generation == 0 {
+		return TransferMeta{}, fmt.Errorf("%w: transfer_id/dest/journal_version/generation(>=1) 均须有效", ErrInvalidContext)
 	}
 	return TransferMeta{spec.TransferID, spec.Dest, spec.TotalBytes, spec.ExpectedDigest, spec.JournalVersion, spec.Generation, true}, nil
 }
-
 func (m TransferMeta) IsValid() bool {
+	d, hasD := m.expectedDigest.Get()
 	return m.valid && m.transferID.IsValid() && m.dest.IsValid() && m.totalBytes <= MaxTransferBytes &&
-		m.expectedDigest.IsValid() && m.journalVersion.IsValid() && m.generation > 0
+		(!hasD || d.IsValid()) && m.journalVersion.IsValid() && m.generation > 0
 }
-func (m TransferMeta) TransferID() security.OperationID { return m.transferID }
-func (m TransferMeta) Dest() pathalg.RemotePath         { return m.dest }
-func (m TransferMeta) TotalBytes() uint64               { return pickIf(m.IsValid(), m.totalBytes, 0) }
-func (m TransferMeta) ExpectedDigest() security.Digest  { return m.expectedDigest }
-func (m TransferMeta) JournalVersion() JournalVersion   { return m.journalVersion }
-func (m TransferMeta) Generation() uint64               { return pickIf(m.IsValid(), m.generation, 0) }
+func (m TransferMeta) TransferID() security.OperationID                  { return m.transferID }
+func (m TransferMeta) Dest() TransferDest                                { return m.dest }
+func (m TransferMeta) Direction() TransferDirection                      { return m.dest.Direction() }
+func (m TransferMeta) TotalBytes() uint64                                { return pickIf(m.IsValid(), m.totalBytes, 0) }
+func (m TransferMeta) ExpectedDigest() algebraic.Option[security.Digest] { return m.expectedDigest }
+func (m TransferMeta) JournalVersion() JournalVersion                    { return m.journalVersion }
+func (m TransferMeta) Generation() uint64                                { return pickIf(m.IsValid(), m.generation, 0) }
 
 // TransferState 是 TransferFSM 的封闭状态代数和类型（RFC §3.6），由 xopsvet/sumexhaust 穷尽检查。
 //
@@ -155,18 +196,38 @@ func (m TransferMeta) Generation() uint64               { return pickIf(m.IsVali
 type TransferState interface {
 	sealedTransferState()
 	rawMeta() TransferMeta
+	rawKind() TransferStateKind
+	rawReason() string
+	rawProgress() (offset, chunks, nextSeq uint64)
 	Kind() TransferStateKind
 	IsValid() bool
 	IsTerminal() bool
 }
 
 type sealedTransferMixin struct {
-	meta  TransferMeta
-	valid bool
+	meta       TransferMeta
+	kind       TransferStateKind
+	offset     uint64
+	chunkCount uint64
+	nextSeq    uint64
+	lastDigest security.Digest
+	reason     string
+	valid      bool
 }
 
-func (*sealedTransferMixin) sealedTransferState()    {}
-func (m *sealedTransferMixin) rawMeta() TransferMeta { return m.meta }
+func (*sealedTransferMixin) sealedTransferState()         {}
+func (m *sealedTransferMixin) rawMeta() TransferMeta      { return m.meta }
+func (m *sealedTransferMixin) rawKind() TransferStateKind { return m.kind }
+func (m *sealedTransferMixin) rawReason() string          { return m.reason }
+func (m *sealedTransferMixin) rawProgress() (uint64, uint64, uint64) {
+	return m.offset, m.chunkCount, m.nextSeq
+}
+func tMix(m TransferMeta, k TransferStateKind, r string) sealedTransferMixin {
+	return sealedTransferMixin{meta: m, kind: k, reason: r, valid: true}
+}
+func tProg(m TransferMeta, k TransferStateKind, off, chunks, seq uint64, dig security.Digest) sealedTransferMixin {
+	return sealedTransferMixin{meta: m, kind: k, offset: off, chunkCount: chunks, nextSeq: seq, lastDigest: dig, valid: true}
+}
 
 // TransferState 的 7 个不可变封闭指针变体（内置正向 valid 门控，零值恒无效）；
 // TransferUncertainCommit 表示原子交接遇 Applied && !Durable 或未知结果的零重试零删目标停机终态。
@@ -176,72 +237,74 @@ type (
 	TransferInitialized struct{ sealedTransferMixin }
 	//xops:opaque
 	//xops:failclosed
-	TransferStreaming struct {
-		sealedTransferMixin
-		offset     uint64
-		chunkCount uint64
-		nextSeq    uint64
-		lastDigest security.Digest
-	}
+	TransferStreaming struct{ sealedTransferMixin }
 	//xops:opaque
 	//xops:failclosed
-	TransferVerifying struct {
-		sealedTransferMixin
-		chunkCount uint64
-		nextSeq    uint64
-		lastDigest security.Digest
-	}
+	TransferVerifying struct{ sealedTransferMixin }
 	//xops:opaque
 	//xops:failclosed
-	TransferCommitting struct {
-		sealedTransferMixin
-		nextSeq    uint64
-		lastDigest security.Digest
-	}
+	TransferCommitting struct{ sealedTransferMixin }
 	//xops:opaque
 	//xops:failclosed
 	TransferCommitted struct{ sealedTransferMixin }
 	//xops:opaque
 	//xops:failclosed
-	TransferAborted struct {
-		sealedTransferMixin
-		reason string
-	}
+	TransferAborted struct{ sealedTransferMixin }
 	//xops:opaque
 	//xops:failclosed
-	TransferUncertainCommit struct {
-		sealedTransferMixin
-		reason string
-	}
+	TransferUncertainCommit struct{ sealedTransferMixin }
 )
 
-func (s *TransferInitialized) IsValid() bool { return s != nil && s.valid && s.meta.IsValid() }
-func (s *TransferStreaming) IsValid() bool {
-	return s != nil && s.valid && s.meta.IsValid() && s.offset <= s.meta.totalBytes && s.nextSeq >= 2 && s.lastDigest.IsValid()
+func (m *sealedTransferMixin) okProg(minSeq uint64, checkOff bool) bool {
+	return m.valid && m.meta.IsValid() && (!checkOff || m.offset <= m.meta.totalBytes) && m.nextSeq >= minSeq && m.lastDigest.IsValid()
 }
-func (s *TransferVerifying) IsValid() bool {
-	return s != nil && s.valid && s.meta.IsValid() && s.nextSeq >= 2 && s.lastDigest.IsValid()
+func (s *TransferInitialized) IsValid() bool               { return s != nil && s.valid && s.meta.IsValid() }
+func (s *TransferStreaming) IsValid() bool                 { return s != nil && s.okProg(2, true) }
+func (s *TransferVerifying) IsValid() bool                 { return s != nil && s.okProg(2, false) }
+func (s *TransferCommitting) IsValid() bool                { return s != nil && s.okProg(4, false) }
+func (s *TransferCommitted) IsValid() bool                 { return s != nil && s.valid && s.meta.IsValid() }
+func (s *TransferAborted) IsValid() bool                   { return s != nil && s.valid && s.meta.IsValid() }
+func (s *TransferUncertainCommit) IsValid() bool           { return s != nil && s.valid && s.meta.IsValid() }
+func (s *TransferInitialized) Kind() TransferStateKind     { return tKind(s) }
+func (s *TransferStreaming) Kind() TransferStateKind       { return tKind(s) }
+func (s *TransferVerifying) Kind() TransferStateKind       { return tKind(s) }
+func (s *TransferCommitting) Kind() TransferStateKind      { return tKind(s) }
+func (s *TransferCommitted) Kind() TransferStateKind       { return tKind(s) }
+func (s *TransferAborted) Kind() TransferStateKind         { return tKind(s) }
+func (s *TransferUncertainCommit) Kind() TransferStateKind { return tKind(s) }
+func (*TransferInitialized) IsTerminal() bool              { return false }
+func (*TransferStreaming) IsTerminal() bool                { return false }
+func (*TransferVerifying) IsTerminal() bool                { return false }
+func (*TransferCommitting) IsTerminal() bool               { return false }
+func (s *TransferCommitted) IsTerminal() bool              { return s.IsValid() }
+func (s *TransferAborted) IsTerminal() bool                { return s.IsValid() }
+func (s *TransferUncertainCommit) IsTerminal() bool        { return s.IsValid() }
+func (s *TransferStreaming) Offset() uint64                { return tNum(s, 0) }
+func (s *TransferStreaming) ChunkCount() uint64            { return tNum(s, 1) }
+func (s *TransferStreaming) NextSeq() uint64               { return tNum(s, 2) }
+func (s *TransferVerifying) ChunkCount() uint64            { return tNum(s, 1) }
+func (s *TransferVerifying) NextSeq() uint64               { return tNum(s, 2) }
+func (s *TransferAborted) Reason() string                  { return tText(s) }
+func (s *TransferUncertainCommit) Reason() string          { return tText(s) }
+func tKind(s TransferState) TransferStateKind {
+	if s != nil && s.IsValid() {
+		return s.rawKind()
+	}
+	return TransferKindInvalid
 }
-func (s *TransferCommitting) IsValid() bool {
-	return s != nil && s.valid && s.meta.IsValid() && s.nextSeq >= 4 && s.lastDigest.IsValid()
+func tText(s TransferState) string {
+	if s != nil && s.IsValid() {
+		return s.rawReason()
+	}
+	return ""
 }
-func (s *TransferCommitted) IsValid() bool       { return s != nil && s.valid && s.meta.IsValid() }
-func (s *TransferAborted) IsValid() bool         { return s != nil && s.valid && s.meta.IsValid() }
-func (s *TransferUncertainCommit) IsValid() bool { return s != nil && s.valid && s.meta.IsValid() }
-
-func (s *TransferInitialized) Kind() TransferStateKind {
-	return tk(s.IsValid(), TransferKindInitialized)
+func tNum(s TransferState, idx int) uint64 {
+	if s == nil || !s.IsValid() {
+		return 0
+	}
+	off, chunks, seq := s.rawProgress()
+	return [3]uint64{off, chunks, seq}[idx]
 }
-func (s *TransferStreaming) Kind() TransferStateKind  { return tk(s.IsValid(), TransferKindStreaming) }
-func (s *TransferVerifying) Kind() TransferStateKind  { return tk(s.IsValid(), TransferKindVerifying) }
-func (s *TransferCommitting) Kind() TransferStateKind { return tk(s.IsValid(), TransferKindCommitting) }
-func (s *TransferCommitted) Kind() TransferStateKind  { return tk(s.IsValid(), TransferKindCommitted) }
-func (s *TransferAborted) Kind() TransferStateKind    { return tk(s.IsValid(), TransferKindAborted) }
-func (s *TransferUncertainCommit) Kind() TransferStateKind {
-	return tk(s.IsValid(), TransferKindUncertainCommit)
-}
-
-func tk(ok bool, k TransferStateKind) TransferStateKind { return pickIf(ok, k, TransferKindInvalid) }
 
 // TransferMetaOf 提取任意 TransferState 携带的不可变传输元数据；nil 或无效零值失败关闭返回零值。
 func TransferMetaOf(state TransferState) TransferMeta {
@@ -249,36 +312,6 @@ func TransferMetaOf(state TransferState) TransferMeta {
 		return TransferMeta{}
 	}
 	return state.rawMeta()
-}
-
-func (*TransferInitialized) IsTerminal() bool       { return false }
-func (*TransferStreaming) IsTerminal() bool         { return false }
-func (*TransferVerifying) IsTerminal() bool         { return false }
-func (*TransferCommitting) IsTerminal() bool        { return false }
-func (s *TransferCommitted) IsTerminal() bool       { return s.IsValid() }
-func (s *TransferAborted) IsTerminal() bool         { return s.IsValid() }
-func (s *TransferUncertainCommit) IsTerminal() bool { return s.IsValid() }
-
-func (s *TransferStreaming) Offset() uint64 {
-	return pickLazy(s.IsValid(), func() uint64 { return s.offset })
-}
-func (s *TransferStreaming) ChunkCount() uint64 {
-	return pickLazy(s.IsValid(), func() uint64 { return s.chunkCount })
-}
-func (s *TransferStreaming) NextSeq() uint64 {
-	return pickLazy(s.IsValid(), func() uint64 { return s.nextSeq })
-}
-func (s *TransferVerifying) ChunkCount() uint64 {
-	return pickLazy(s.IsValid(), func() uint64 { return s.chunkCount })
-}
-func (s *TransferVerifying) NextSeq() uint64 {
-	return pickLazy(s.IsValid(), func() uint64 { return s.nextSeq })
-}
-func (s *TransferAborted) Reason() string {
-	return pickLazy(s.IsValid(), func() string { return s.reason })
-}
-func (s *TransferUncertainCommit) Reason() string {
-	return pickLazy(s.IsValid(), func() string { return s.reason })
 }
 
 // TransferInput、TransferEffect 与 TransferEvent 为 TransferFSM 的不透明值对象。
@@ -319,6 +352,10 @@ func (e TransferEffect) IsValid() bool                                   { retur
 func (e TransferEffect) Kind() TransferEffectKind                        { return e.kind }
 func (e TransferEffect) Record() algebraic.Option[TransferJournalRecord] { return e.record }
 func (e TransferEvent) IsValid() bool                                    { return e.valid && e.kind.IsValid() }
+func (e TransferEvent) IsZero() bool                                     { return !e.IsValid() }
 func (e TransferEvent) Kind() TransferEventKind                          { return e.kind }
 func (e TransferEvent) Offset() uint64                                   { return e.offset }
 func (e TransferEvent) Detail() string                                   { return e.detail }
+func (e TransferEvent) Equal(o TransferEvent) bool {
+	return e.IsValid() && o.IsValid() && e.kind == o.kind && e.offset == o.offset && e.detail == o.detail
+}

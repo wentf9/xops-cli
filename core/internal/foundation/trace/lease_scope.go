@@ -37,6 +37,11 @@ func (s LeaseScope) IsValid() bool {
 	return s.domain != "" && s.leaseID != ""
 }
 
+// IsZero 返回 LeaseScope 是否为无效零值。
+func (s LeaseScope) IsZero() bool {
+	return !s.IsValid()
+}
+
 // Domain 返回只读诊断归属标签（零值返回空串）；该标签仅用于追踪定位，不构成可重入隔离域。
 func (s LeaseScope) Domain() string {
 	return s.domain
@@ -47,9 +52,9 @@ func (s LeaseScope) LeaseID() string {
 	return s.leaseID
 }
 
-// Equal 比较两个 LeaseScope 是否完全相等。
+// Equal 严格比较两个 LeaseScope 是否均有效且完全相等（无效零值永不相等）。
 func (s LeaseScope) Equal(other LeaseScope) bool {
-	return s.domain == other.domain && s.leaseID == other.leaseID
+	return s.IsValid() && other.IsValid() && s.domain == other.domain && s.leaseID == other.leaseID
 }
 
 // WithLeaseScope 将合法的全局单层连接租约作用域标记注入派生上下文（仅限连接池租约回调入口调用）。

@@ -23,8 +23,8 @@ func TestNewLeaseScopeValidationAndAccessors(t *testing.T) {
 	}
 
 	var zero LeaseScope
-	if zero.IsValid() || zero.Domain() != "" || zero.LeaseID() != "" {
-		t.Fatal("zero LeaseScope must be invalid with empty accessors")
+	if zero.IsValid() || !zero.IsZero() || zero.Domain() != "" || zero.LeaseID() != "" || zero.Equal(LeaseScope{}) {
+		t.Fatal("zero LeaseScope must be invalid with empty accessors and fail-closed Equal")
 	}
 
 	s1, err := NewLeaseScope("ssh-pool", "lease-01")

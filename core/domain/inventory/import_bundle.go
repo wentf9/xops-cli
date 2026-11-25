@@ -145,23 +145,38 @@ const (
 	ImportActionConflict                          // 存在标识/别名/引用或合并环路冲突
 )
 
+// ParseImportActionKind 严格解析规范小写导入预检决策（"add"、"unchanged"、"conflict"）。
+func ParseImportActionKind(raw string) (ImportActionKind, error) {
+	return parseEnumByName(raw, ImportActionAdd, ImportActionConflict, ImportActionInvalid, ImportActionKind.String, ErrInvalidImportBundle)
+}
 func (k ImportActionKind) IsValid() bool { return k >= ImportActionAdd && k <= ImportActionConflict }
+func (k ImportActionKind) IsZero() bool  { return k == ImportActionInvalid }
 func (k ImportActionKind) String() string {
 	return enumName(uint8(k), "invalid", "invalid", "add", "unchanged", "conflict")
+}
+func (k ImportActionKind) AppendText(b []byte) ([]byte, error) {
+	return appendValidText(b, k.IsValid(), k.String(), ErrInvalidImportBundle)
+}
+func (k ImportActionKind) MarshalText() ([]byte, error) { return k.AppendText(nil) }
+func (k *ImportActionKind) UnmarshalText(b []byte) error {
+	return unmarshalText(k, b, ParseImportActionKind)
 }
 
 // ImportEntry 与 ImportReport 描述 PlanImport 产出的不可变确定性冲突与合并分析报告。
 type (
 	ImportEntry struct {
-		AssetKind, AssetID string
-		Action             ImportActionKind
-		Reason             string
+		AssetKind string           `json:"asset_kind"`
+		AssetID   string           `json:"asset_id"`
+		Action    ImportActionKind `json:"action"`
+		Reason    string           `json:"reason,omitzero"`
 	}
 	ImportReport struct {
-		SourceFormat                            string
-		AddCount, UnchangedCount, ConflictCount int
-		Entries                                 []ImportEntry
-		Warnings                                []ImportWarning
+		SourceFormat   string          `json:"source_format"`
+		AddCount       int             `json:"add_count"`
+		UnchangedCount int             `json:"unchanged_count"`
+		ConflictCount  int             `json:"conflict_count"`
+		Entries        []ImportEntry   `json:"entries,omitzero"`
+		Warnings       []ImportWarning `json:"warnings,omitzero"`
 	}
 )
 

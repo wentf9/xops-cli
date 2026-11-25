@@ -50,7 +50,7 @@ type TargetKey struct {
 // NewTargetKey 校验命名空间与目标名称并构造不可变 TargetKey。
 func NewTargetKey(ns NamespaceKind, name string) (TargetKey, error) {
 	t := strings.TrimSpace(name)
-	if !ns.IsValid() || t == "" || len(t) > maxIDLen || hasSpaceOrForbidden(t) {
+	if !ns.IsValid() || t == "" || len(t) > maxIDLen || hasSpaceOrForbidden(t) || strings.EqualFold(t, "none") {
 		return TargetKey{}, fmt.Errorf("%w: 目标键 (%s, %q) 非法", ErrInvalidID, ns, name)
 	}
 	if ns == NamespaceManaged {
@@ -59,6 +59,19 @@ func NewTargetKey(ns NamespaceKind, name string) (TargetKey, error) {
 		}
 	}
 	return TargetKey{ns, t}, nil
+}
+
+// ParseTargetKey 解析规范文本 "<namespace>:<name>"（如 "managed:web-01"、"openssh:prod_db"）为 TargetKey。
+func ParseTargetKey(raw string) (TargetKey, error) {
+	nsRaw, name, ok := strings.Cut(raw, ":")
+	if !ok {
+		return TargetKey{}, fmt.Errorf("%w: 目标键 %q 缺少命名空间分隔符 ':'", ErrInvalidID, raw)
+	}
+	ns, err := ParseNamespaceKind(nsRaw)
+	if err != nil {
+		return TargetKey{}, err
+	}
+	return NewTargetKey(ns, name)
 }
 func (k TargetKey) IsValid() bool            { return k.ns.IsValid() && k.name != "" }
 func (k TargetKey) IsZero() bool             { return !k.IsValid() }
@@ -70,6 +83,13 @@ func (k TargetKey) Equal(o TargetKey) bool {
 }
 func (k TargetKey) Compare(o TargetKey) int {
 	return cmp.Or(cmp.Compare(k.ns, o.ns), cmp.Compare(k.name, o.name))
+}
+func (k TargetKey) AppendText(b []byte) ([]byte, error) {
+	return appendValidText(b, k.IsValid(), k.String(), ErrInvalidID)
+}
+func (k TargetKey) MarshalText() ([]byte, error) { return k.AppendText(nil) }
+func (k *TargetKey) UnmarshalText(text []byte) error {
+	return unmarshalText(k, text, ParseTargetKey)
 }
 
 // OpenSSHJumpNode 表示来自 ~/.ssh/config 只读视图的代理跳板图顶点（供跨命名空间环路检测使用）。
@@ -85,7 +105,7 @@ type OpenSSHJumpNode struct {
 // NewOpenSSHJumpNode 校验 OpenSSH Host 别名与 ProxyRoute 并构造 OpenSSHJumpNode。
 func NewOpenSSHJumpNode(alias string, proxy option.ProxyRoute) (OpenSSHJumpNode, error) {
 	t := strings.TrimSpace(alias)
-	if t == "" || len(t) > maxIDLen || hasSpaceOrForbidden(t) {
+	if t == "" || len(t) > maxIDLen || hasSpaceOrForbidden(t) || strings.EqualFold(t, "none") {
 		return OpenSSHJumpNode{}, fmt.Errorf("%w: OpenSSH 别名 %q 非法", ErrInvalidID, alias)
 	}
 	if err := option.ValidateProxyRoute(proxy); err != nil {
@@ -100,11 +120,13 @@ func (n OpenSSHJumpNode) Proxy() option.ProxyRoute { return option.ComposeProxyR
 
 // DAGCycle 与 DAGReport 分别表示 Tarjan SCC 检测到的强连通环路与跨命名空间 ProxyJump 校验报告。
 type (
-	DAGCycle  struct{ Nodes []TargetKey }
+	DAGCycle struct {
+		Nodes []TargetKey `json:"nodes"`
+	}
 	DAGReport struct {
-		MaxObservedDepth int
-		TopoOrder        []TargetKey
-		Cycles           []DAGCycle
+		MaxObservedDepth int         `json:"max_observed_depth"`
+		TopoOrder        []TargetKey `json:"topo_order,omitzero"`
+		Cycles           []DAGCycle  `json:"cycles,omitzero"`
 	}
 	proxyGraph struct {
 		vertices                             []TargetKey

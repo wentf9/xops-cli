@@ -1,6 +1,7 @@
 package option
 
 import (
+	"cmp"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"fmt"
@@ -40,28 +41,20 @@ type (
 		ShadowedOff bool        `json:"shadowed_disabled,omitzero"`
 	}
 	effectivePolicyJSON struct {
-		Origin            OriginKind            `json:"origin"`
-		Endpoint          netaddr.Endpoint      `json:"endpoint"`
-		OriginalHost      netaddr.CanonicalHost `json:"original_host"`
-		Options           OptionLayer           `json:"options"`
-		Ciphers           []string              `json:"ciphers"`
-		MACs              []string              `json:"macs"`
-		KexAlgorithms     []string              `json:"kex_algorithms"`
-		HostKeyAlgorithms []string              `json:"host_key_algorithms"`
+		Origin            OriginKind       `json:"origin"`
+		Endpoint          netaddr.Endpoint `json:"endpoint"`
+		OriginalHost      OriginalHostSpec `json:"original_host"`
+		Options           OptionLayer      `json:"options"`
+		Ciphers           []string         `json:"ciphers"`
+		MACs              []string         `json:"macs"`
+		KexAlgorithms     []string         `json:"kex_algorithms"`
+		HostKeyAlgorithms []string         `json:"host_key_algorithms"`
 	}
 )
 
-func marshalPathStateJSON(enc *jsontext.Encoder, state PathListState, items []PathEntry, terminated bool) error {
-	switch state {
-	case PathListUnset:
-		return enc.WriteToken(jsontext.Null)
-	case PathListDisabled:
-		return jsonv2.MarshalEncode(enc, pathListJSON{State: "disabled", Terminated: terminated})
-	case PathListSet:
-		return jsonv2.MarshalEncode(enc, pathListJSON{"set", items, terminated})
-	default:
-		return ErrInvalidPathList
-	}
+func marshalPathStateJSON(enc *jsontext.Encoder, st PathListState, items []PathEntry, term bool) error {
+	return marshalNullOrWire(enc, st == PathListUnset, st == PathListDisabled || st == PathListSet, ErrInvalidPathList,
+		pathListJSON{map[bool]string{true: "disabled", false: "set"}[st == PathListDisabled], items, term})
 }
 func decodePathStateWire(w pathListJSON, allowTerminated bool) (PathListState, []PathEntry, error) {
 	if !allowTerminated && w.Terminated {
@@ -80,53 +73,52 @@ func decodePathStateWire(w pathListJSON, allowTerminated bool) (PathListState, [
 }
 
 // MarshalJSONTo 与 UnmarshalJSONFrom 实现 PathList、KnownHostsList、AlgoPolicy、EnvFilter 与 ControlPolicy 的 json/v2 确定性编解码。
-func (p PathList) MarshalJSONTo(enc *jsontext.Encoder) error {
-	return marshalPathStateJSON(enc, p.state, p.items, p.Terminated())
+func (p PathList) MarshalJSONTo(e *jsontext.Encoder) error {
+	return marshalPathStateJSON(e, p.state, p.items, p.Terminated())
 }
-func (p *PathList) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	return unmarshalNullableJSON(p, dec, UnsetPathList, func(w pathListJSON) (PathList, error) {
-		st, items, err := decodePathStateWire(w, true)
-		return PathList{st, items, st == PathListDisabled || w.Terminated}, err
-	})
+func (p *PathList) UnmarshalJSONFrom(d *jsontext.Decoder) error {
+	return unmarshalNullableJSON(p, d, UnsetPathList, decodePathListWire)
 }
-func (k KnownHostsList) MarshalJSONTo(enc *jsontext.Encoder) error {
-	return marshalPathStateJSON(enc, k.state, k.items, false)
+func decodePathListWire(w pathListJSON) (PathList, error) {
+	st, items, err := decodePathStateWire(w, true)
+	return PathList{pathSetBase{st, items}, st == PathListDisabled || w.Terminated}, err
 }
-func (k *KnownHostsList) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	return unmarshalNullableJSON(k, dec, UnsetKnownHostsList, func(w pathListJSON) (KnownHostsList, error) {
-		st, items, err := decodePathStateWire(w, false)
-		return KnownHostsList{st, items}, err
-	})
+func (k KnownHostsList) MarshalJSONTo(e *jsontext.Encoder) error {
+	return marshalPathStateJSON(e, k.state, k.items, false)
+}
+func (k *KnownHostsList) UnmarshalJSONFrom(d *jsontext.Decoder) error {
+	return unmarshalNullableJSON(k, d, UnsetKnownHostsList, decodeKnownHostsWire)
+}
+func decodeKnownHostsWire(w pathListJSON) (KnownHostsList, error) {
+	st, items, err := decodePathStateWire(w, false)
+	return KnownHostsList{pathSetBase{st, items}}, err
 }
 func (p AlgoPolicy) MarshalJSONTo(enc *jsontext.Encoder) error {
-	if p.op == AlgoOpUnset {
+	return marshalNullOrWire(enc, p.op == AlgoOpUnset, p.op.IsSet(), ErrInvalidAlgoPolicy, algoPolicyJSON{p.op.String(), p.tokens})
+}
+func (p *AlgoPolicy) UnmarshalJSONFrom(d *jsontext.Decoder) error {
+	return unmarshalNullableJSON(p, d, UnsetAlgoPolicy, decodeAlgoPolicyWire)
+}
+func (f EnvFilter) MarshalJSONTo(e *jsontext.Encoder) error {
+	return marshalNullOrWire(e, f.IsUnset(), true, ErrInvalidEnvFilter, envFilterJSON{f.clear, f.added})
+}
+func (f *EnvFilter) UnmarshalJSONFrom(d *jsontext.Decoder) error {
+	return unmarshalNullableJSON(f, d, UnsetEnvFilter, decodeEnvFilterWire)
+}
+func (c ControlPolicy) MarshalJSONTo(e *jsontext.Encoder) error {
+	return marshalNullOrWire(e, c.IsUnset(), true, ErrInvalidControlPolicy, controlPolicyJSON{c.Master().String(), c.path.String(), c.path.IsLiteral(), c.persist.String()})
+}
+func (c *ControlPolicy) UnmarshalJSONFrom(d *jsontext.Decoder) error {
+	return unmarshalNullableJSON(c, d, UnsetControlPolicy, decodeControlPolicyWire)
+}
+func marshalNullOrWire[W any](enc *jsontext.Encoder, isNull, valid bool, badErr error, wire W) error {
+	if isNull {
 		return enc.WriteToken(jsontext.Null)
 	}
-	if !p.op.IsSet() {
-		return ErrInvalidAlgoPolicy
+	if !valid {
+		return badErr
 	}
-	return jsonv2.MarshalEncode(enc, algoPolicyJSON{p.op.String(), p.tokens})
-}
-func (p *AlgoPolicy) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	return unmarshalNullableJSON(p, dec, UnsetAlgoPolicy, decodeAlgoPolicyWire)
-}
-func (f EnvFilter) MarshalJSONTo(enc *jsontext.Encoder) error {
-	if f.IsUnset() {
-		return enc.WriteToken(jsontext.Null)
-	}
-	return jsonv2.MarshalEncode(enc, envFilterJSON{f.clear, f.added})
-}
-func (f *EnvFilter) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	return unmarshalNullableJSON(f, dec, UnsetEnvFilter, decodeEnvFilterWire)
-}
-func (c ControlPolicy) MarshalJSONTo(enc *jsontext.Encoder) error {
-	if c.IsUnset() {
-		return enc.WriteToken(jsontext.Null)
-	}
-	return jsonv2.MarshalEncode(enc, controlPolicyJSON{c.Master().String(), c.path.String(), c.path.IsLiteral(), c.persist.String()})
-}
-func (c *ControlPolicy) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	return unmarshalNullableJSON(c, dec, UnsetControlPolicy, decodeControlPolicyWire)
+	return jsonv2.MarshalEncode(enc, wire)
 }
 
 func decodeAlgoPolicyWire(w algoPolicyJSON) (AlgoPolicy, error) {
@@ -160,19 +152,13 @@ func decodeControlPolicyWire(w controlPolicyJSON) (ControlPolicy, error) {
 	m, errM := decodeOpt(w.Master, ParseControlMasterMode)
 	p, errP := decodeOpt(w.Path, func(s string) (ControlPathSpec, error) { return parseControlPathInternal(s, w.LiteralPath) })
 	per, errPer := decodeOpt(w.Persist, ParseControlPersist)
-	for _, err := range [3]error{errM, errP, errPer} {
-		if err != nil {
-			return UnsetControlPolicy(), err
-		}
-	}
-	return UnsetControlPolicy().WithMaster(m).WithPath(p).WithPersist(per), nil
+	return UnsetControlPolicy().WithMaster(m).WithPath(p).WithPersist(per), cmp.Or(errM, errP, errPer)
 }
-func decodeOpt[T any](raw string, parse func(string) (T, error)) (T, error) {
+func decodeOpt[T any](raw string, parse func(string) (T, error)) (z T, err error) {
 	if raw != "" {
 		return parse(raw)
 	}
-	var zero T
-	return zero, nil
+	return z, nil
 }
 
 // MarshalProxyRouteTo 与 UnmarshalProxyRouteFrom 为封闭接口 ProxyRoute 提供多态 json/v2 确定性编解码（失败严格返回 (nil, err)）。
@@ -187,14 +173,11 @@ func MarshalProxyRouteTo(enc *jsontext.Encoder, route ProxyRoute) error {
 	if pair.jumpKind == proxyJumpSlotUnset {
 		return enc.WriteToken(jsontext.Null)
 	}
-	var w proxyRouteJSON
-	switch {
-	case pair.jumpKind == proxyJumpSlotActive:
+	w := proxyRouteJSON{Kind: "disabled", Scope: map[bool]string{true: "jump_only", false: "all"}[pair.cmdSlot == proxyCmdSlotUnset]}
+	if pair.jumpKind == proxyJumpSlotActive {
 		w = proxyRouteJSON{Kind: "jump", Hops: pair.hops.Slice(), ShadowedCmd: pair.cmdVal.String(), ShadowedOff: pair.cmdSlot == proxyCmdSlotDisabled}
-	case pair.cmdSlot == proxyCmdSlotActive:
+	} else if pair.cmdSlot == proxyCmdSlotActive {
 		w = proxyRouteJSON{Kind: "command", Command: pair.cmdVal.String()}
-	default:
-		w = proxyRouteJSON{Kind: "disabled", Scope: map[bool]string{true: "jump_only", false: "all"}[pair.cmdSlot == proxyCmdSlotUnset]}
 	}
 	return jsonv2.MarshalEncode(enc, w)
 }
@@ -202,33 +185,28 @@ func UnmarshalProxyRouteFrom(dec *jsontext.Decoder) (ProxyRoute, error) {
 	if dec == nil {
 		return nil, ErrNilReceiver
 	}
-	var field proxyRouteField
-	if err := field.UnmarshalJSONFrom(dec); err != nil {
+	var f proxyRouteField
+	if err := f.UnmarshalJSONFrom(dec); err != nil {
 		return nil, err
 	}
-	return field.route, nil
+	return f.route, nil
 }
 
 // MarshalJSONTo 为四个具体 ProxyRoute 变体提供值接收者 json/v2 编码（无效零值失败关闭）。
-func (u ProxyUnset) MarshalJSONTo(enc *jsontext.Encoder) error { return MarshalProxyRouteTo(enc, &u) }
-func (d ProxyDisabled) MarshalJSONTo(enc *jsontext.Encoder) error {
-	return MarshalProxyRouteTo(enc, &d)
-}
-func (j ProxyJumpChain) MarshalJSONTo(enc *jsontext.Encoder) error {
-	return MarshalProxyRouteTo(enc, &j)
-}
-func (c ProxyCommandSpec) MarshalJSONTo(enc *jsontext.Encoder) error {
-	return MarshalProxyRouteTo(enc, &c)
-}
+func (u ProxyUnset) MarshalJSONTo(e *jsontext.Encoder) error       { return MarshalProxyRouteTo(e, &u) }
+func (d ProxyDisabled) MarshalJSONTo(e *jsontext.Encoder) error    { return MarshalProxyRouteTo(e, &d) }
+func (j ProxyJumpChain) MarshalJSONTo(e *jsontext.Encoder) error   { return MarshalProxyRouteTo(e, &j) }
+func (c ProxyCommandSpec) MarshalJSONTo(e *jsontext.Encoder) error { return MarshalProxyRouteTo(e, &c) }
 
 type proxyRouteField struct{ route ProxyRoute }
 
+func unsetPRField() proxyRouteField    { return proxyRouteField{NewProxyUnset()} }
 func (p proxyRouteField) IsZero() bool { return EqualProxyRoute(p.route, NewProxyUnset()) }
 func (p proxyRouteField) MarshalJSONTo(e *jsontext.Encoder) error {
 	return MarshalProxyRouteTo(e, p.route)
 }
 func (p *proxyRouteField) UnmarshalJSONFrom(d *jsontext.Decoder) error {
-	return unmarshalNullableJSON(p, d, func() proxyRouteField { return proxyRouteField{NewProxyUnset()} }, decodeProxyRouteWire)
+	return unmarshalNullableJSON(p, d, unsetPRField, decodeProxyRouteWire)
 }
 func decodeProxyRouteWire(w proxyRouteJSON) (proxyRouteField, error) {
 	hasJump := len(w.Hops) > 0 || w.ShadowedCmd != "" || w.ShadowedOff
@@ -276,6 +254,7 @@ type optionLayerJSON struct {
 	Control               ControlPolicy                                  `json:"control,omitzero"`
 	ConnectTimeout        algebraic.FirstWins[algebraic.Duration]        `json:"connect_timeout,omitzero"`
 	ServerAliveInterval   algebraic.FirstWins[algebraic.Duration]        `json:"server_alive_interval,omitzero"`
+	ServerAliveCountMax   algebraic.FirstWins[uint32]                    `json:"server_alive_count_max,omitzero"`
 	Ciphers               AlgoPolicy                                     `json:"ciphers,omitzero"`
 	MACs                  AlgoPolicy                                     `json:"macs,omitzero"`
 	KexAlgorithms         AlgoPolicy                                     `json:"kex_algorithms,omitzero"`
@@ -299,7 +278,7 @@ func (l OptionLayer) MarshalJSONTo(enc *jsontext.Encoder) error {
 	}
 	return jsonv2.MarshalEncode(enc, optionLayerJSON{
 		l.hostName, l.port, l.user, proxyRouteField{l.proxy}, l.control, l.connectTimeout,
-		l.serverAliveInterval, l.ciphers, l.macs, l.kexAlgorithms, l.hostKeyAlgorithms,
+		l.serverAliveInterval, l.serverAliveCountMax, l.ciphers, l.macs, l.kexAlgorithms, l.hostKeyAlgorithms,
 		l.identityFiles, l.certificateFiles, l.identitiesOnly, l.batchMode,
 		l.strictHostKeyChecking, l.userKnownHostsFiles, l.forwardAgent, l.sendEnv,
 		l.permitLocalCommand, l.localCommand,
@@ -309,7 +288,7 @@ func (l *OptionLayer) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return unmarshalNullableJSON(l, dec, UnsetOptionLayer, func(w optionLayerJSON) (OptionLayer, error) {
 		out := OptionLayer{
 			w.HostName, w.Port, w.User, w.Proxy.route, w.Control, w.ConnectTimeout,
-			w.ServerAliveInterval, w.Ciphers, w.MACs, w.KexAlgorithms, w.HostKeyAlgorithms,
+			w.ServerAliveInterval, w.ServerAliveCountMax, w.Ciphers, w.MACs, w.KexAlgorithms, w.HostKeyAlgorithms,
 			w.IdentityFiles, w.CertificateFiles, w.IdentitiesOnly, w.BatchMode,
 			w.StrictHostKeyChecking, w.UserKnownHostsFiles, w.ForwardAgent, w.SendEnv,
 			w.PermitLocalCommand, w.LocalCommand,
@@ -324,35 +303,23 @@ func (p EffectivePolicy) MarshalJSONTo(enc *jsontext.Encoder) error {
 	return jsonv2.MarshalEncode(enc, effectivePolicyJSON{p.origin, p.endpoint, p.originalHost, p.opts, p.ciphers, p.macs, p.kexAlgorithms, p.hostKeyAlgos})
 }
 func (p *EffectivePolicy) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	if p == nil || dec == nil {
-		return ErrNilReceiver
-	}
-	*p = EffectivePolicy{}
-	if dec.PeekKind() == 'n' {
+	if p != nil && dec != nil && dec.PeekKind() == 'n' {
+		*p = EffectivePolicy{}
 		if _, err := dec.ReadToken(); err != nil {
 			return err
 		}
 		return ErrInvalidOrigin
 	}
-	var w effectivePolicyJSON
-	if err := jsonv2.UnmarshalDecode(dec, &w); err != nil {
-		return err
-	}
-	pol, err := decodeEffectivePolicyWire(w)
-	if err == nil {
-		*p = pol
-	}
-	return err
+	return unmarshalNullableJSON(p, dec, func() EffectivePolicy { return EffectivePolicy{} }, decodeEffectivePolicyWire)
 }
 func decodeEffectivePolicyWire(w effectivePolicyJSON) (EffectivePolicy, error) {
-	if !w.Origin.IsValid() {
+	switch {
+	case !w.Origin.IsValid():
 		return EffectivePolicy{}, ErrInvalidOrigin
-	}
-	if !w.Endpoint.IsValid() || !w.OriginalHost.IsValid() {
+	case !w.Endpoint.IsValid() || !w.OriginalHost.IsValid():
 		return EffectivePolicy{}, ErrInvalidEndpoint
-	}
-	if err := w.Options.Validate(); err != nil {
-		return EffectivePolicy{}, err
+	case w.Options.Validate() != nil:
+		return EffectivePolicy{}, w.Options.Validate()
 	}
 	var sets [4][]string
 	for i, s := range [4][]string{w.Ciphers, w.MACs, w.KexAlgorithms, w.HostKeyAlgorithms} {

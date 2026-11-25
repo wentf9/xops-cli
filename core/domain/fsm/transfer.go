@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -13,7 +12,7 @@ func NewTransferState(meta TransferMeta) (*TransferInitialized, error) {
 	if !meta.IsValid() {
 		return nil, ErrInvalidContext
 	}
-	return &TransferInitialized{sealedTransferMixin{meta: meta, valid: true}}, nil
+	return &TransferInitialized{tMix(meta, TransferKindInitialized, "")}, nil
 }
 
 // TransferInput 的显式校验构造器集（零值输入恒无效）。
@@ -73,16 +72,16 @@ func TransitionTransfer(state TransferState, input TransferInput) (TransferState
 func stepTransferInitialized(s *TransferInitialized, in TransferInput) (TransferState, []TransferEffect, []TransferEvent, error) {
 	switch in.kind {
 	case transferInStart:
-		initRec, err := buildInitRecord(s.meta)
+		initRec, err := NewTransferJournalRecord(TransferJournalRecordSpec{s.meta.journalVersion, s.meta.generation, 1, JournalRecordInit, s.meta.transferID, algebraic.Some(s.meta.dest), 0, 0, s.meta.totalBytes, s.meta.expectedDigest, algebraic.None[security.Digest]()})
 		if err != nil {
 			return s, nil, nil, err
 		}
 		if s.meta.totalBytes == 0 {
-			return &TransferVerifying{sealedTransferMixin{s.meta, true}, 0, 2, initRec.recordDigest}, []TransferEffect{journalEffect(initRec), simpleTransferEffect(TransferEffectVerifyFullDigest)}, []TransferEvent{transferEvent(TransferEventStarted, 0, "empty_stream_verifying")}, nil
+			return &TransferVerifying{tProg(s.meta, TransferKindVerifying, 0, 0, 2, initRec.recordDigest)}, []TransferEffect{journalEffect(initRec), simpleTransferEffect(TransferEffectVerifyFullDigest)}, []TransferEvent{transferEvent(TransferEventStarted, 0, "empty_stream_verifying")}, nil
 		}
-		return &TransferStreaming{sealedTransferMixin{s.meta, true}, 0, 0, 2, initRec.recordDigest}, []TransferEffect{journalEffect(initRec)}, []TransferEvent{transferEvent(TransferEventStarted, 0, "streaming")}, nil
+		return &TransferStreaming{tProg(s.meta, TransferKindStreaming, 0, 0, 2, initRec.recordDigest)}, []TransferEffect{journalEffect(initRec)}, []TransferEvent{transferEvent(TransferEventStarted, 0, "streaming")}, nil
 	case transferInAbort:
-		return &TransferAborted{sealedTransferMixin{s.meta, true}, in.reason}, []TransferEffect{simpleTransferEffect(TransferEffectCleanupStaging)}, []TransferEvent{transferEvent(TransferEventAborted, 0, in.reason)}, nil
+		return &TransferAborted{tMix(s.meta, TransferKindAborted, in.reason)}, []TransferEffect{simpleTransferEffect(TransferEffectCleanupStaging)}, []TransferEvent{transferEvent(TransferEventAborted, 0, in.reason)}, nil
 	default:
 		return s, nil, nil, fmt.Errorf("%w: initialized 仅接受 Start 或 Abort", ErrIllegalTransition)
 	}
@@ -110,14 +109,15 @@ func acceptTransferChunk(s *TransferStreaming, in TransferInput) (TransferState,
 	}
 	nextOffset := s.offset + in.length
 	if nextOffset == s.meta.totalBytes {
-		return &TransferVerifying{sealedTransferMixin{s.meta, true}, s.chunkCount + 1, s.nextSeq + 1, rec.recordDigest}, []TransferEffect{journalEffect(rec), simpleTransferEffect(TransferEffectVerifyFullDigest)}, []TransferEvent{transferEvent(TransferEventChunkAccepted, nextOffset, "final_chunk"), transferEvent(TransferEventStreamCompleted, nextOffset, "verifying")}, nil
+		return &TransferVerifying{tProg(s.meta, TransferKindVerifying, nextOffset, s.chunkCount+1, s.nextSeq+1, rec.recordDigest)}, []TransferEffect{journalEffect(rec), simpleTransferEffect(TransferEffectVerifyFullDigest)}, []TransferEvent{transferEvent(TransferEventChunkAccepted, nextOffset, "final_chunk"), transferEvent(TransferEventStreamCompleted, nextOffset, "verifying")}, nil
 	}
-	return &TransferStreaming{sealedTransferMixin{s.meta, true}, nextOffset, s.chunkCount + 1, s.nextSeq + 1, rec.recordDigest}, []TransferEffect{journalEffect(rec)}, []TransferEvent{transferEvent(TransferEventChunkAccepted, nextOffset, "chunk_ok")}, nil
+	return &TransferStreaming{tProg(s.meta, TransferKindStreaming, nextOffset, s.chunkCount+1, s.nextSeq+1, rec.recordDigest)}, []TransferEffect{journalEffect(rec)}, []TransferEvent{transferEvent(TransferEventChunkAccepted, nextOffset, "chunk_ok")}, nil
 }
 func stepTransferVerifying(s *TransferVerifying, in TransferInput) (TransferState, []TransferEffect, []TransferEvent, error) {
 	switch in.kind {
 	case transferInVerifyResult:
-		if !in.ok || !s.meta.expectedDigest.Equal(in.digest) {
+		exp, hasExp := s.meta.expectedDigest.Get()
+		if !in.ok || (hasExp && !exp.Equal(in.digest)) {
 			return abortTransferWithJournal(s, s.meta, s.meta.totalBytes, s.nextSeq, s.lastDigest, pickIf(in.reason != "", in.reason, "full stream digest mismatch"))
 		}
 		verRec, err := buildFollowRecord(s.meta, s.nextSeq, s.lastDigest, JournalRecordVerified, 0, 0, algebraic.Some(in.digest))
@@ -128,7 +128,7 @@ func stepTransferVerifying(s *TransferVerifying, in TransferInput) (TransferStat
 		if err != nil {
 			return s, nil, nil, err
 		}
-		return &TransferCommitting{sealedTransferMixin{s.meta, true}, s.nextSeq + 2, commitRec.recordDigest}, []TransferEffect{journalEffect(verRec), journalEffect(commitRec), simpleTransferEffect(TransferEffectAtomicCommit)}, []TransferEvent{transferEvent(TransferEventDigestVerified, s.meta.totalBytes, in.digest.String()), transferEvent(TransferEventCommitStarted, s.meta.totalBytes, s.meta.dest.String())}, nil
+		return &TransferCommitting{tProg(s.meta, TransferKindCommitting, s.meta.totalBytes, s.chunkCount, s.nextSeq+2, commitRec.recordDigest)}, []TransferEffect{journalEffect(verRec), journalEffect(commitRec), simpleTransferEffect(TransferEffectAtomicCommit)}, []TransferEvent{transferEvent(TransferEventDigestVerified, s.meta.totalBytes, in.digest.String()), transferEvent(TransferEventCommitStarted, s.meta.totalBytes, s.meta.dest.String())}, nil
 	case transferInAbort:
 		return abortTransferWithJournal(s, s.meta, s.meta.totalBytes, s.nextSeq, s.lastDigest, in.reason)
 	default:
@@ -145,23 +145,20 @@ func stepTransferCommitting(s *TransferCommitting, in TransferInput) (TransferSt
 		if err != nil {
 			return s, nil, nil, err
 		}
-		return &TransferCommitted{sealedTransferMixin{s.meta, true}}, []TransferEffect{journalEffect(rec)}, []TransferEvent{transferEvent(TransferEventCommitted, s.meta.totalBytes, s.meta.dest.String())}, nil
+		return &TransferCommitted{tMix(s.meta, TransferKindCommitted, "")}, []TransferEffect{journalEffect(rec)}, []TransferEvent{transferEvent(TransferEventCommitted, s.meta.totalBytes, s.meta.dest.String())}, nil
 	case DurabilityNotApplied:
 		return abortTransferWithJournal(s, s.meta, s.meta.totalBytes, s.nextSeq, s.lastDigest, pickIf(in.reason != "", in.reason, "commit_not_applied"))
 	case DurabilityAppliedNotDurable, DurabilityOutcomeUnknown:
 		// 原子提交处于 Applied && !Durable 或结果未知：严禁重试与删除，停机于 TransferUncertainCommit。
 		reason := pickIf(in.reason != "", in.reason, in.durability.String())
-		return &TransferUncertainCommit{sealedTransferMixin{s.meta, true}, reason}, nil, []TransferEvent{transferEvent(TransferEventUncertainCommit, s.meta.totalBytes, reason)}, nil
+		return &TransferUncertainCommit{tMix(s.meta, TransferKindUncertainCommit, reason)}, nil, []TransferEvent{transferEvent(TransferEventUncertainCommit, s.meta.totalBytes, reason)}, nil
 	default:
 		return s, nil, nil, ErrInvalidDurability
 	}
 }
-func buildInitRecord(m TransferMeta) (TransferJournalRecord, error) {
-	return NewTransferJournalRecord(TransferJournalRecordSpec{m.journalVersion, m.generation, 1, JournalRecordInit, m.transferID, algebraic.Some(m.dest), 0, 0, m.totalBytes, algebraic.Some(m.expectedDigest), algebraic.None[security.Digest]()})
-}
 func buildFollowRecord(m TransferMeta, seq uint64, lastDigest security.Digest, kind JournalRecordKind, offset, length uint64, dig algebraic.Option[security.Digest]) (TransferJournalRecord, error) {
 	prev := pickIf(m.journalVersion == JournalVersionV2, algebraic.Some(lastDigest), algebraic.None[security.Digest]())
-	return NewTransferJournalRecord(TransferJournalRecordSpec{m.journalVersion, m.generation, seq, kind, m.transferID, algebraic.None[pathalg.RemotePath](), offset, length, m.totalBytes, dig, prev})
+	return NewTransferJournalRecord(TransferJournalRecordSpec{m.journalVersion, m.generation, seq, kind, m.transferID, algebraic.None[TransferDest](), offset, length, m.totalBytes, dig, prev})
 }
 func abortTransferWithJournal(cur TransferState, meta TransferMeta, offset, nextSeq uint64, lastDigest security.Digest, reason string) (TransferState, []TransferEffect, []TransferEvent, error) {
 	rec, err := buildFollowRecord(meta, nextSeq, lastDigest, JournalRecordAborted, 0, 0, algebraic.None[security.Digest]())
@@ -169,7 +166,7 @@ func abortTransferWithJournal(cur TransferState, meta TransferMeta, offset, next
 		return cur, nil, nil, err
 	}
 	clean := sanitizeReason(reason)
-	return &TransferAborted{sealedTransferMixin{meta, true}, clean}, []TransferEffect{journalEffect(rec), simpleTransferEffect(TransferEffectCleanupStaging)}, []TransferEvent{transferEvent(TransferEventAborted, offset, clean)}, nil
+	return &TransferAborted{tMix(meta, TransferKindAborted, clean)}, []TransferEffect{journalEffect(rec), simpleTransferEffect(TransferEffectCleanupStaging)}, []TransferEvent{transferEvent(TransferEventAborted, offset, clean)}, nil
 }
 
 // RecoverTransferFromDualJournal 执行双代（active/staging）Journal 崩溃恢复：
@@ -201,9 +198,8 @@ func RecoverTransferFromDualJournal(active, staging []TransferJournalRecord) (Tr
 
 func sameTransferIdentity(a, b TransferMeta) bool {
 	return a.IsValid() && b.IsValid() && a.transferID.Equal(b.transferID) && a.dest.Equal(b.dest) &&
-		a.totalBytes == b.totalBytes && a.expectedDigest.Equal(b.expectedDigest)
+		a.totalBytes == b.totalBytes && equalOptionFunc(a.expectedDigest, b.expectedDigest, security.Digest.Equal)
 }
-
 func selectBothValidDualJournal(mA TransferMeta, stA TransferState, effA []TransferEffect, evA []TransferEvent, mS TransferMeta, stS TransferState, effS []TransferEffect, evS []TransferEvent) (TransferState, []TransferEffect, []TransferEvent, error) {
 	loSt, hiSt, hiEff, hiEv := stA, stS, effS, evS
 	if mA.generation > mS.generation {
@@ -214,7 +210,6 @@ func selectBothValidDualJournal(mA TransferMeta, stA TransferState, effA []Trans
 	}
 	return hiSt, hiEff, hiEv, nil
 }
-
 func selectSingleValidDualJournal(hasHeadA bool, mA TransferMeta, stA TransferState, effA []TransferEffect, evA []TransferEvent, errA error, mS TransferMeta, stS TransferState, effS []TransferEffect, evS []TransferEvent, errS error) (TransferState, []TransferEffect, []TransferEvent, error) {
 	if errA == nil {
 		return stA, effA, evA, nil
@@ -227,13 +222,12 @@ func selectSingleValidDualJournal(hasHeadA bool, mA TransferMeta, stA TransferSt
 	}
 	return stS, effS, evS, nil
 }
-
-func journalEffect(rec TransferJournalRecord) TransferEffect {
-	return TransferEffect{kind: TransferEffectWriteJournal, record: algebraic.Some(rec), valid: true}
+func journalEffect(r TransferJournalRecord) TransferEffect {
+	return TransferEffect{TransferEffectWriteJournal, algebraic.Some(r), true}
 }
-func simpleTransferEffect(kind TransferEffectKind) TransferEffect {
-	return TransferEffect{kind: kind, valid: true}
+func simpleTransferEffect(k TransferEffectKind) TransferEffect {
+	return TransferEffect{kind: k, valid: true}
 }
-func transferEvent(kind TransferEventKind, offset uint64, detail string) TransferEvent {
-	return TransferEvent{kind: kind, offset: offset, detail: sanitizeReason(detail), valid: true}
+func transferEvent(k TransferEventKind, off uint64, d string) TransferEvent {
+	return TransferEvent{k, off, sanitizeReason(d), true}
 }

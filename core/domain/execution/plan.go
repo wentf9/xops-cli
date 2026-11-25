@@ -69,7 +69,8 @@ func (k *PlanKind) UnmarshalText(text []byte) error {
 type envEntry struct{ key, value string }
 
 // CommandPlanSpec 是构造不可变 CommandPlan 的显式入参规格。
-// Command 与 Argv 二选一且互斥；MaxOutputBytes 未设置时取 DefaultMaxOutputBytes，显式 Some(0) 失败关闭。
+// PlanKindCommand 要求 Command 与 Argv 二选一且互斥；PlanKindScript 要求非空脚本文本 Command，并允许附带可选位置参数 Argv；
+// MaxOutputBytes 未设置时取 DefaultMaxOutputBytes，显式 Some(0) 失败关闭。
 type CommandPlanSpec struct {
 	Kind           PlanKind
 	Profile        LaunchProfile
@@ -153,21 +154,48 @@ func validateCommandPlanHeader(spec CommandPlanSpec) error {
 }
 
 func validateCommandPayload(kind PlanKind, cmd string, rawArgv []string) ([]string, error) {
+	if kind == PlanKindScript {
+		return validateScriptPayload(cmd, rawArgv)
+	}
 	hasCmd, hasArgv := cmd != "", len(rawArgv) > 0
 	if hasCmd == hasArgv {
 		return nil, fmt.Errorf("%w: command 与 argv 必须二选一且非空", ErrInvalidCommandPlan)
 	}
 	if hasCmd {
-		if len(cmd) > maxCommandBytes || hasForbiddenCommandText(cmd) {
-			return nil, fmt.Errorf("%w: command 超长或包含非法 UTF-8/NUL/控制/Cf 字符", ErrInvalidCommandPlan)
+		if err := validateCommandText(cmd); err != nil {
+			return nil, err
 		}
 		return nil, nil
 	}
-	if kind == PlanKindScript {
-		return nil, fmt.Errorf("%w: script 计划仅接受脚本文本 command，不接受 argv", ErrInvalidCommandPlan)
+	if rawArgv[0] == "" {
+		return nil, fmt.Errorf("%w: argv[0] 不能为空", ErrInvalidCommandPlan)
 	}
-	if len(rawArgv) > maxArgvCount || rawArgv[0] == "" {
-		return nil, fmt.Errorf("%w: argv 数量超限或 argv[0] 为空", ErrInvalidCommandPlan)
+	return cloneAndValidateArgv(rawArgv)
+}
+
+func validateScriptPayload(script string, rawArgv []string) ([]string, error) {
+	if script == "" {
+		return nil, fmt.Errorf("%w: script 计划必须提供非空脚本文本 command", ErrInvalidCommandPlan)
+	}
+	if err := validateCommandText(script); err != nil {
+		return nil, err
+	}
+	if len(rawArgv) == 0 {
+		return nil, nil
+	}
+	return cloneAndValidateArgv(rawArgv)
+}
+
+func validateCommandText(cmd string) error {
+	if len(cmd) > maxCommandBytes || hasForbiddenCommandText(cmd) {
+		return fmt.Errorf("%w: command 超长或包含非法 UTF-8/NUL/控制/Cf 字符", ErrInvalidCommandPlan)
+	}
+	return nil
+}
+
+func cloneAndValidateArgv(rawArgv []string) ([]string, error) {
+	if len(rawArgv) > maxArgvCount {
+		return nil, fmt.Errorf("%w: argv 数量 %d 超过上限 %d", ErrInvalidCommandPlan, len(rawArgv), maxArgvCount)
 	}
 	out := make([]string, len(rawArgv))
 	for i, arg := range rawArgv {
@@ -213,7 +241,8 @@ func resolveMaxOutputBytes(opt algebraic.Option[uint64]) (uint64, error) {
 
 // IsValid 报告 CommandPlan 是否经构造器合法初始化。
 func (p CommandPlan) IsValid() bool {
-	return p.valid && p.kind.IsValid() && p.profile.IsValid() && p.maxOutputBytes > 0 && (p.command != "" || len(p.argv) > 0)
+	payloadOK := pickIf(p.kind == PlanKindScript, p.command != "", (p.command != "") != (len(p.argv) > 0))
+	return p.valid && p.kind.IsValid() && p.profile.IsValid() && p.maxOutputBytes > 0 && payloadOK
 }
 
 // IsZero 报告 CommandPlan 是否为无效零值。
@@ -228,7 +257,7 @@ func (p CommandPlan) Profile() LaunchProfile { return p.profile }
 // Command 返回原始命令或脚本文本（argv 模式下为空串）。
 func (p CommandPlan) Command() string { return p.command }
 
-// Argv 返回参数向量的防御性拷贝（command 模式下返回 nil）。
+// Argv 返回参数向量的防御性拷贝（纯 command 模式或无位置参数脚本返回 nil）。
 func (p CommandPlan) Argv() []string { return slices.Clone(p.argv) }
 
 // WorkDir 返回可选远端 POSIX 工作目录。

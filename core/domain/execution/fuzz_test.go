@@ -57,15 +57,15 @@ func assertCmdQuoteAndPSBase64Invariants(t *testing.T, input string) {
 	}
 }
 
-// FuzzCommandPlan 对 CommandPlan 构造、渲染、摘要确定性、脱敏与 JSON/v2 往返执行模糊测试。
+// FuzzCommandPlan 对 CommandPlan 构造、渲染（含带位置参数脚本）、摘要确定性、脱敏与 JSON/v2 往返执行模糊测试。
 func FuzzCommandPlan(f *testing.F) {
-	f.Add("uname -a", "/tmp", "APP_ENV", "prod", uint8(1), uint8(2), uint8(1))
-	f.Add("echo 'hi' && pwd", "/var/log", "TOKEN", "secret123", uint8(1), uint8(3), uint8(2))
-	f.Add("Get-Process", "/srv", "KEY", "val", uint8(2), uint8(6), uint8(1))
-	f.Add("password=mysecretval echo ok", "", "DB_PASS", "p@ss", uint8(4), uint8(1), uint8(3))
+	f.Add("uname -a", "/tmp", "APP_ENV", "prod", "", uint8(1), uint8(2), uint8(1))
+	f.Add("echo 'hi' && pwd", "/var/log", "TOKEN", "secret123", "--flag", uint8(1|0x80), uint8(3), uint8(2))
+	f.Add("Get-Process", "/srv", "KEY", "val", "it's arg", uint8(2|0x80), uint8(6), uint8(1))
+	f.Add("password=mysecretval echo ok", "", "DB_PASS", "p@ss", "", uint8(4), uint8(1), uint8(3))
 
-	f.Fuzz(func(t *testing.T, cmd, wdRaw, envKey, envVal string, dRaw, iRaw, lRaw uint8) {
-		plan, err := buildFuzzCommandPlan(cmd, wdRaw, envKey, envVal, dRaw, iRaw, lRaw)
+	f.Fuzz(func(t *testing.T, cmd, wdRaw, envKey, envVal, scriptArg string, dRaw, iRaw, lRaw uint8) {
+		plan, err := buildFuzzCommandPlan(cmd, wdRaw, envKey, envVal, scriptArg, dRaw, iRaw, lRaw)
 		if err != nil {
 			return
 		}
@@ -73,7 +73,7 @@ func FuzzCommandPlan(f *testing.F) {
 	})
 }
 
-func buildFuzzCommandPlan(cmd, wdRaw, envKey, envVal string, dRaw, iRaw, lRaw uint8) (CommandPlan, error) {
+func buildFuzzCommandPlan(cmd, wdRaw, envKey, envVal, scriptArg string, dRaw, iRaw, lRaw uint8) (CommandPlan, error) {
 	dialect := LaunchDialect(dRaw % 5)
 	dOpt := algebraic.None[LaunchDialect]()
 	if dialect != DialectUnknown {
@@ -96,11 +96,15 @@ func buildFuzzCommandPlan(cmd, wdRaw, envKey, envVal string, dRaw, iRaw, lRaw ui
 		envMap = map[string]string{envKey: envVal}
 	}
 	kind := PlanKindCommand
+	var argv []string
 	if dRaw&0x80 != 0 {
 		kind = PlanKindScript
+		if scriptArg != "" {
+			argv = []string{scriptArg}
+		}
 	}
 	return NewCommandPlan(CommandPlanSpec{
-		Kind: kind, Profile: prof, Command: cmd, WorkDir: wdOpt, Env: envMap,
+		Kind: kind, Profile: prof, Command: cmd, Argv: argv, WorkDir: wdOpt, Env: envMap,
 	})
 }
 

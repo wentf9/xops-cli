@@ -49,10 +49,14 @@ func (o *OriginKind) UnmarshalText(text []byte) error {
 	return unmarshalTextVia(o, text, ParseOriginKind)
 }
 
+// DefaultServerAliveCountMax 是 OpenSSH 默认保活探测最大允许丢失次数。
+const DefaultServerAliveCountMax uint32 = 3
+
 // DefaultOptionLayer 返回内置安全默认兜底层（位于四层 t1..t4 之后）。
 func DefaultOptionLayer() OptionLayer {
 	return UnsetOptionLayer().WithControlPolicy(UnsetControlPolicy().WithMaster(ControlMasterNo)).
-		WithServerAliveInterval(algebraic.ZeroDuration()).WithIdentitiesOnly(false).WithBatchMode(false).
+		WithServerAliveInterval(algebraic.ZeroDuration()).WithServerAliveCountMax(DefaultServerAliveCountMax).
+		WithIdentitiesOnly(false).WithBatchMode(false).
 		WithStrictHostKeyChecking(StrictHostKeyCheckingAsk).WithForwardAgent(false).WithPermitLocalCommand(false)
 }
 
@@ -63,7 +67,7 @@ func DefaultOptionLayer() OptionLayer {
 type EffectivePolicy struct {
 	origin                                     OriginKind
 	endpoint                                   netaddr.Endpoint
-	originalHost                               netaddr.CanonicalHost
+	originalHost                               OriginalHostSpec
 	opts                                       OptionLayer
 	ciphers, macs, kexAlgorithms, hostKeyAlgos []string
 	valid                                      bool
@@ -80,6 +84,19 @@ func ResolveEffectivePolicy(origin OriginKind, endpoint netaddr.Endpoint, t1, t2
 	if !endpoint.IsValid() {
 		return EffectivePolicy{}, ErrInvalidEndpoint
 	}
+	origHost := OriginalHostSpec{textToken{endpoint.Host().String(), true}, algebraic.Some(endpoint.Host())}
+	return ResolveEffectivePolicyWithOriginalHost(origin, origHost, endpoint.Port(), t1, t2, t3, t4)
+}
+
+// ResolveEffectivePolicyWithOriginalHost 支持以经校验的 OpenSSH 别名（如 "prod_db"、"bastion.01"）
+// 作为 OriginalHost（保留 %n 语义）执行四层策略求解；最终拨号端点 Endpoint 仍严格校验为 netaddr.Endpoint。
+func ResolveEffectivePolicyWithOriginalHost(origin OriginKind, originalHost OriginalHostSpec, defaultPort uint16, t1, t2, t3, t4 OptionLayer) (EffectivePolicy, error) {
+	if !origin.IsValid() {
+		return EffectivePolicy{}, ErrInvalidOrigin
+	}
+	if !originalHost.IsValid() || defaultPort == 0 {
+		return EffectivePolicy{}, ErrInvalidEndpoint
+	}
 	for _, layer := range [4]OptionLayer{t1, t2, t3, t4} {
 		if err := layer.Validate(); err != nil {
 			return EffectivePolicy{}, err
@@ -92,7 +109,7 @@ func ResolveEffectivePolicy(origin OriginKind, endpoint netaddr.Endpoint, t1, t2
 	if !merged.permitLocalCommand.OrElse(false) {
 		merged.localCommand = algebraic.UnsetFirstWins[SanitizedCmd]()
 	}
-	resolvedEP, err := resolveEffectiveEndpoint(endpoint, merged)
+	resolvedEP, err := resolveEffectiveEndpoint(originalHost, defaultPort, merged)
 	if err != nil {
 		return EffectivePolicy{}, err
 	}
@@ -103,7 +120,7 @@ func ResolveEffectivePolicy(origin OriginKind, endpoint netaddr.Endpoint, t1, t2
 	if err != nil {
 		return EffectivePolicy{}, err
 	}
-	return EffectivePolicy{origin, resolvedEP, endpoint.Host(), merged, algos[0], algos[1], algos[2], algos[3], true}, nil
+	return EffectivePolicy{origin, resolvedEP, originalHost, merged, algos[0], algos[1], algos[2], algos[3], true}, nil
 }
 
 func applyAlgoPolicies(policies [4]AlgoPolicy, defaults [4][]string) ([4][]string, error) {
@@ -116,15 +133,19 @@ func applyAlgoPolicies(policies [4]AlgoPolicy, defaults [4][]string) ([4][]strin
 	}
 	return out, nil
 }
-func resolveEffectiveEndpoint(base netaddr.Endpoint, merged OptionLayer) (netaddr.Endpoint, error) {
+func resolveEffectiveEndpoint(origHost OriginalHostSpec, defaultPort uint16, merged OptionLayer) (netaddr.Endpoint, error) {
 	var zero netaddr.Endpoint
-	host, err := base.Host(), error(nil)
+	var host netaddr.CanonicalHost
+	var err error
 	if spec, ok := merged.hostName.Get(); ok {
-		if host, err = spec.ResolveHost(base.Host()); err != nil {
-			return zero, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
-		}
+		host, err = spec.ResolveHostFor(origHost)
+	} else {
+		host, err = netaddr.ParseCanonicalHost(origHost.String())
 	}
-	ep, err := netaddr.NewEndpoint(host, merged.port.OrElse(base.Port()))
+	if err != nil {
+		return zero, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+	}
+	ep, err := netaddr.NewEndpoint(host, merged.port.OrElse(defaultPort))
 	if err != nil {
 		return zero, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
 	}
@@ -132,19 +153,25 @@ func resolveEffectiveEndpoint(base netaddr.Endpoint, merged OptionLayer) (netadd
 }
 
 // EffectivePolicy 只读访问器（切片均返回防御性副本，未授权 LocalCommand 恒为 None）。
-func (p EffectivePolicy) IsValid() bool                       { return p.valid }
-func (p EffectivePolicy) Origin() OriginKind                  { return p.origin }
-func (p EffectivePolicy) Endpoint() netaddr.Endpoint          { return p.endpoint }
-func (p EffectivePolicy) OriginalHost() netaddr.CanonicalHost { return p.originalHost }
-func (p EffectivePolicy) Options() OptionLayer                { return p.opts.clone() }
-func (p EffectivePolicy) User() algebraic.Option[Username]    { return p.opts.user.ToOption() }
-func (p EffectivePolicy) Proxy() ProxyRoute                   { return p.opts.Proxy() }
-func (p EffectivePolicy) Control() ControlPolicy              { return p.opts.control }
+func (p EffectivePolicy) IsValid() bool                    { return p.valid }
+func (p EffectivePolicy) Origin() OriginKind               { return p.origin }
+func (p EffectivePolicy) Endpoint() netaddr.Endpoint       { return p.endpoint }
+func (p EffectivePolicy) OriginalHost() OriginalHostSpec   { return p.originalHost }
+func (p EffectivePolicy) Options() OptionLayer             { return p.opts.clone() }
+func (p EffectivePolicy) User() algebraic.Option[Username] { return p.opts.user.ToOption() }
+func (p EffectivePolicy) Proxy() ProxyRoute                { return p.opts.Proxy() }
+func (p EffectivePolicy) Control() ControlPolicy           { return p.opts.control }
 func (p EffectivePolicy) ConnectTimeout() algebraic.Option[algebraic.Duration] {
 	return p.opts.connectTimeout.ToOption()
 }
 func (p EffectivePolicy) ServerAliveInterval() algebraic.Duration {
 	return p.opts.serverAliveInterval.OrElse(algebraic.ZeroDuration())
+}
+func (p EffectivePolicy) ServerAliveCountMax() uint32 {
+	if !p.valid {
+		return 0
+	}
+	return p.opts.serverAliveCountMax.OrElse(DefaultServerAliveCountMax)
 }
 func (p EffectivePolicy) Ciphers() []string           { return slices.Clone(p.ciphers) }
 func (p EffectivePolicy) MACs() []string              { return slices.Clone(p.macs) }

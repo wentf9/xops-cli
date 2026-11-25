@@ -43,7 +43,6 @@ func mustVaultCtx(t *testing.T, withOld bool) VaultSagaContext {
 		NewRef:             mustSecretRef(t, "vault", "new-key"),
 		OldRef:             old,
 		ExpectedCASVersion: 7,
-		ExpectedDigest:     testDigest("expected-secret"),
 	})
 	if err != nil {
 		t.Fatalf("NewVaultSagaContext 失败: %v", err)
@@ -72,9 +71,15 @@ func TestClassifyDurabilityAndContextValidation(t *testing.T) {
 	// NewRef == OldRef 必须拒绝
 	ref := mustSecretRef(t, "vault", "same")
 	if _, err := NewVaultSagaContext(VaultSagaContextSpec{
-		SagaID: testOpID(2), NewRef: ref, OldRef: algebraic.Some(ref), ExpectedDigest: testDigest("x"),
+		SagaID: testOpID(2), NewRef: ref, OldRef: algebraic.Some(ref),
 	}); !errors.Is(err, ErrInvalidContext) {
 		t.Fatalf("old_ref == new_ref 必须返回 ErrInvalidContext，实际 %v", err)
+	}
+	// 矛盾的回读结果输入（非 Succeeded 却声称 matched=true 或无效 outcome）必须失败关闭拒绝
+	for _, badOut := range []SideEffectOutcome{SideEffectInvalid, SideEffectFailedNotApplied, SideEffectOutcomeUnknown} {
+		if _, err := VaultInputReadbackResult(badOut, true, "bad"); !errors.Is(err, ErrInvalidInput) {
+			t.Fatalf("VaultInputReadbackResult(%v, true) 期望 ErrInvalidInput，实际 %v", badOut, err)
+		}
 	}
 }
 
@@ -137,7 +142,7 @@ func TestVaultSagaHappyPathAndRefRetention(t *testing.T) {
 	}{
 		{VaultInputStart(), VaultSagaKindWritingNew, VaultEffectWriteNew},
 		{okIn(VaultInputWriteNewResult(SideEffectSucceeded, "")), VaultSagaKindVerifyingReadback, VaultEffectVerifyReadback},
-		{okIn(VaultInputReadbackResult(true, ctx.ExpectedDigest(), "")), VaultSagaKindCommittingConfig, VaultEffectCommitConfigCAS},
+		{okIn(VaultInputReadbackResult(SideEffectSucceeded, true, "")), VaultSagaKindCommittingConfig, VaultEffectCommitConfigCAS},
 		{okIn(VaultInputCommitCASResult(DurabilityCommitted, "")), VaultSagaKindCheckingOldRefs, VaultEffectCheckOldRefs},
 		{okIn(VaultInputOldRefsResult(true, 0, "")), VaultSagaKindDeletingOld, VaultEffectDeleteOld},
 		{okIn(VaultInputDeleteOldResult(SideEffectSucceeded, "")), VaultSagaKindCompleted, VaultEffectInvalid},
@@ -153,7 +158,7 @@ func TestVaultSagaHappyPathAndRefRetention(t *testing.T) {
 	}
 
 	// 旧凭据仍有引用（refCount > 0）时禁止删除旧凭据，直接 Completed(oldDeleted=false)
-	chk := &VaultSagaCheckingOldRefs{sealedVaultMixin{ctx, true}}
+	chk := &VaultSagaCheckingOldRefs{vMix(ctx, VaultSagaKindCheckingOldRefs, "")}
 	next, effs, evs, err := TransitionVaultSaga(chk, okIn(VaultInputOldRefsResult(true, 2, "")))
 	assertVaultStep(t, next, effs, evs, err, VaultSagaKindCompleted, VaultEffectInvalid)
 	if next.(*VaultSagaCompleted).OldDeleted() {
@@ -161,7 +166,7 @@ func TestVaultSagaHappyPathAndRefRetention(t *testing.T) {
 	}
 
 	// 无旧凭据时 CAS Committed 直接 Completed
-	commNoOld := &VaultSagaCommittingConfig{sealedVaultMixin{mustVaultCtx(t, false), true}}
+	commNoOld := &VaultSagaCommittingConfig{vMix(mustVaultCtx(t, false), VaultSagaKindCommittingConfig, "")}
 	next, effs, evs, err = TransitionVaultSaga(commNoOld, okIn(VaultInputCommitCASResult(DurabilityCommitted, "")))
 	assertVaultStep(t, next, effs, evs, err, VaultSagaKindCompleted, VaultEffectInvalid)
 }
@@ -170,7 +175,7 @@ func TestVaultSagaAppliedNotDurableInvariant(t *testing.T) {
 	// 核心安全不变量：Applied && !Durable 停机于 UncertainDurability，严格 ZERO 重试、ZERO 删新/旧凭据！
 	ctx := mustVaultCtx(t, true)
 	okIn := mustVaultIn(t)
-	comm := &VaultSagaCommittingConfig{sealedVaultMixin{ctx, true}}
+	comm := &VaultSagaCommittingConfig{vMix(ctx, VaultSagaKindCommittingConfig, "")}
 	inUncertain := okIn(VaultInputCommitCASResult(ClassifyDurability(true, false, true), "fsync failed"))
 	next, effs, evs, err := TransitionVaultSaga(comm, inUncertain)
 	assertVaultStep(t, next, effs, evs, err, VaultSagaKindUncertainDurability, VaultEffectInvalid)
@@ -182,11 +187,16 @@ func TestVaultSagaAppliedNotDurableInvariant(t *testing.T) {
 func TestVaultSagaCompensationAndOutcomeUnknownNoRetry(t *testing.T) {
 	ctx := mustVaultCtx(t, true)
 	okIn := mustVaultIn(t)
-	// Readback 不匹配 -> Compensating(CompensateDeleteNew) -> RolledBack(compensated=true)
-	rb := &VaultSagaVerifyingReadback{sealedVaultMixin{ctx, true}}
-	next, effs, _, err := TransitionVaultSaga(rb, okIn(VaultInputReadbackResult(true, testDigest("wrong"), "")))
+	// Readback 确认不匹配（SecretBox.Equal == false）-> Compensating(CompensateDeleteNew) -> RolledBack(compensated=true)
+	rb := &VaultSagaVerifyingReadback{vMix(ctx, VaultSagaKindVerifyingReadback, "")}
+	next, effs, _, err := TransitionVaultSaga(rb, okIn(VaultInputReadbackResult(SideEffectSucceeded, false, "box mismatch")))
 	if err != nil || next.Kind() != VaultSagaKindCompensating || len(effs) != 1 || effs[0].Kind() != VaultEffectCompensateDeleteNew {
-		t.Fatalf("回读摘要不匹配应触发补偿删除新凭据: next=%v effs=%v err=%v", next, effs, err)
+		t.Fatalf("回读明文不匹配应触发补偿删除新凭据: next=%v effs=%v err=%v", next, effs, err)
+	}
+	// Readback 确认未生效失败（SideEffectFailedNotApplied）-> 同样触发补偿删除新凭据
+	nextFail, effsFail, _, err := TransitionVaultSaga(rb, okIn(VaultInputReadbackResult(SideEffectFailedNotApplied, false, "not found")))
+	if err != nil || nextFail.Kind() != VaultSagaKindCompensating || len(effsFail) != 1 || effsFail[0].Kind() != VaultEffectCompensateDeleteNew {
+		t.Fatalf("回读确认失败应触发补偿删除新凭据: next=%v effs=%v err=%v", nextFail, effsFail, err)
 	}
 	next, effs, _, err = TransitionVaultSaga(next, okIn(VaultInputCompensateResult(SideEffectSucceeded, "")))
 	if err != nil || next.Kind() != VaultSagaKindRolledBack || len(effs) != 0 || !next.(*VaultSagaRolledBack).Compensated() {
@@ -194,22 +204,23 @@ func TestVaultSagaCompensationAndOutcomeUnknownNoRetry(t *testing.T) {
 	}
 
 	// CAS DurabilityNotApplied -> 同样补偿删除新凭据
-	comm := &VaultSagaCommittingConfig{sealedVaultMixin{ctx, true}}
+	comm := &VaultSagaCommittingConfig{vMix(ctx, VaultSagaKindCommittingConfig, "")}
 	next, effs, _, err = TransitionVaultSaga(comm, okIn(VaultInputCommitCASResult(DurabilityNotApplied, "cas conflict")))
 	if err != nil || next.Kind() != VaultSagaKindCompensating || len(effs) != 1 || effs[0].Kind() != VaultEffectCompensateDeleteNew {
 		t.Fatalf("CAS 未生效失败应补偿删除新凭据: next=%v effs=%v err=%v", next, effs, err)
 	}
 
-	// 任意副作用阶段遇 OutcomeUnknown 必须进入 FailedUncertain 且 0 副作用（严禁盲目重试）
+	// 任意副作用阶段（含 VerifyingReadback）遇 OutcomeUnknown 必须进入 FailedUncertain 且 0 副作用（严禁盲目补偿或重试）
 	unknownCases := []struct {
 		st VaultSagaState
 		in VaultSagaInput
 	}{
-		{&VaultSagaWritingNew{sealedVaultMixin{ctx, true}}, okIn(VaultInputWriteNewResult(SideEffectOutcomeUnknown, "timeout"))},
-		{&VaultSagaCommittingConfig{sealedVaultMixin{ctx, true}}, okIn(VaultInputCommitCASResult(DurabilityOutcomeUnknown, "io_err"))},
-		{&VaultSagaCheckingOldRefs{sealedVaultMixin{ctx, true}}, okIn(VaultInputOldRefsResult(false, 0, "scan_err"))},
-		{&VaultSagaDeletingOld{sealedVaultMixin{ctx, true}}, okIn(VaultInputDeleteOldResult(SideEffectOutcomeUnknown, "timeout"))},
-		{&VaultSagaCompensating{sealedVaultMixin{ctx, true}, "rb"}, okIn(VaultInputCompensateResult(SideEffectOutcomeUnknown, "timeout"))},
+		{&VaultSagaWritingNew{vMix(ctx, VaultSagaKindWritingNew, "")}, okIn(VaultInputWriteNewResult(SideEffectOutcomeUnknown, "timeout"))},
+		{&VaultSagaVerifyingReadback{vMix(ctx, VaultSagaKindVerifyingReadback, "")}, okIn(VaultInputReadbackResult(SideEffectOutcomeUnknown, false, "readback timeout"))},
+		{&VaultSagaCommittingConfig{vMix(ctx, VaultSagaKindCommittingConfig, "")}, okIn(VaultInputCommitCASResult(DurabilityOutcomeUnknown, "io_err"))},
+		{&VaultSagaCheckingOldRefs{vMix(ctx, VaultSagaKindCheckingOldRefs, "")}, okIn(VaultInputOldRefsResult(false, 0, "scan_err"))},
+		{&VaultSagaDeletingOld{vMix(ctx, VaultSagaKindDeletingOld, "")}, okIn(VaultInputDeleteOldResult(SideEffectOutcomeUnknown, "timeout"))},
+		{&VaultSagaCompensating{vMix(ctx, VaultSagaKindCompensating, "rb")}, okIn(VaultInputCompensateResult(SideEffectOutcomeUnknown, "timeout"))},
 	}
 	for i, tc := range unknownCases {
 		res, effs, _, err := TransitionVaultSaga(tc.st, tc.in)
@@ -221,7 +232,7 @@ func TestVaultSagaCompensationAndOutcomeUnknownNoRetry(t *testing.T) {
 
 func TestVaultSagaInvalidStateAndInput(t *testing.T) {
 	ctx := mustVaultCtx(t, true)
-	initSt := &VaultSagaInit{sealedVaultMixin{ctx, true}}
+	initSt := &VaultSagaInit{vMix(ctx, VaultSagaKindInit, "")}
 	if _, _, _, err := TransitionVaultSaga(nil, VaultInputStart()); !errors.Is(err, ErrInvalidState) {
 		t.Fatalf("nil 状态应返回 ErrInvalidState: %v", err)
 	}
@@ -237,22 +248,22 @@ func TestVaultSagaExhaustiveStateInputMatrix(t *testing.T) {
 	ctx := mustVaultCtx(t, true)
 	okIn := mustVaultIn(t)
 	allStates := []VaultSagaState{
-		&VaultSagaInit{sealedVaultMixin{ctx, true}},
-		&VaultSagaWritingNew{sealedVaultMixin{ctx, true}},
-		&VaultSagaVerifyingReadback{sealedVaultMixin{ctx, true}},
-		&VaultSagaCommittingConfig{sealedVaultMixin{ctx, true}},
-		&VaultSagaCheckingOldRefs{sealedVaultMixin{ctx, true}},
-		&VaultSagaDeletingOld{sealedVaultMixin{ctx, true}},
-		&VaultSagaCompensating{sealedVaultMixin{ctx, true}, "err"},
-		&VaultSagaCompleted{sealedVaultMixin{ctx, true}, true, "ok"},
-		&VaultSagaRolledBack{sealedVaultMixin{ctx, true}, true, "rb"},
-		&VaultSagaUncertainDurability{sealedVaultMixin{ctx, true}, "dur"},
-		&VaultSagaFailedUncertain{sealedVaultMixin{ctx, true}, VaultSagaKindWritingNew, "unk"},
+		&VaultSagaInit{vMix(ctx, VaultSagaKindInit, "")},
+		&VaultSagaWritingNew{vMix(ctx, VaultSagaKindWritingNew, "")},
+		&VaultSagaVerifyingReadback{vMix(ctx, VaultSagaKindVerifyingReadback, "")},
+		&VaultSagaCommittingConfig{vMix(ctx, VaultSagaKindCommittingConfig, "")},
+		&VaultSagaCheckingOldRefs{vMix(ctx, VaultSagaKindCheckingOldRefs, "")},
+		&VaultSagaDeletingOld{vMix(ctx, VaultSagaKindDeletingOld, "")},
+		&VaultSagaCompensating{vMix(ctx, VaultSagaKindCompensating, "err")},
+		&VaultSagaCompleted{vMix(ctx, VaultSagaKindCompleted, "ok"), true},
+		&VaultSagaRolledBack{vMix(ctx, VaultSagaKindRolledBack, "rb"), true},
+		&VaultSagaUncertainDurability{vMix(ctx, VaultSagaKindUncertainDurability, "dur")},
+		&VaultSagaFailedUncertain{vMix(ctx, VaultSagaKindFailedUncertain, "unk"), VaultSagaKindWritingNew},
 	}
 	allInputs := []VaultSagaInput{
 		VaultInputStart(),
 		okIn(VaultInputWriteNewResult(SideEffectSucceeded, "")),
-		okIn(VaultInputReadbackResult(true, ctx.ExpectedDigest(), "")),
+		okIn(VaultInputReadbackResult(SideEffectSucceeded, true, "")),
 		okIn(VaultInputCommitCASResult(DurabilityCommitted, "")),
 		okIn(VaultInputOldRefsResult(true, 0, "")),
 		okIn(VaultInputDeleteOldResult(SideEffectSucceeded, "")),

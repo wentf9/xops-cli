@@ -289,6 +289,59 @@ func assertScriptStdinAndLimits(t *testing.T, wd pathalg.RemotePath) {
 	if !ok || !strings.HasPrefix(psStdin, "Set-Location -LiteralPath '/tmp' -ErrorAction Stop; $env:X = '1'\n") {
 		t.Fatalf("pwsh script StdinPayload 异常: ok=%v", ok)
 	}
+
+	// 4. 带位置参数的 POSIX 与 PowerShell 脚本：Argv 进入 RenderCommand/StdinPayload、Digest 与 JSON 往返。
+	assertParameterizedScriptPlans(t, bashProf, pwshProf, wd)
+}
+
+func assertParameterizedScriptPlans(t *testing.T, bashProf, pwshProf LaunchProfile, wd pathalg.RemotePath) {
+	t.Helper()
+	pPOSIXArgs := mustCommandPlan(t, CommandPlanSpec{
+		Kind: PlanKindScript, Profile: bashProf, Command: `echo "$1" "$2"`,
+		Argv: []string{"--flag", "it's ok", ""}, WorkDir: algebraic.Some(wd),
+	})
+	if out, err := pPOSIXArgs.RenderCommand(); err != nil || out != `bash -l -s -- '--flag' 'it'\''s ok' ''` {
+		t.Fatalf("POSIX 带参脚本 RenderCommand 异常: out=%q err=%v", out, err)
+	}
+	pPOSIXNoArgs := mustCommandPlan(t, CommandPlanSpec{
+		Kind: PlanKindScript, Profile: bashProf, Command: `echo "$1" "$2"`, WorkDir: algebraic.Some(wd),
+	})
+	dWithArgs, _ := pPOSIXArgs.Digest()
+	dNoArgs, _ := pPOSIXNoArgs.Digest()
+	if dWithArgs.Equal(dNoArgs) {
+		t.Fatal("脚本位置参数变化必须改变 CommandPlan.Digest")
+	}
+	rawJSON, err := pPOSIXArgs.CanonicalJSON()
+	var rt CommandPlan
+	if err != nil || jsonv2.Unmarshal(rawJSON, &rt) != nil || !rt.Equal(pPOSIXArgs) {
+		t.Fatalf("POSIX 带参脚本 JSON 往返失败: err=%v", err)
+	}
+
+	pPSArgs := mustCommandPlan(t, CommandPlanSpec{
+		Kind: PlanKindScript, Profile: pwshProf, Command: "Write-Output $args[0] # comment",
+		Argv: []string{"it's ok", "hello world", ""}, WorkDir: algebraic.Some(wd), Env: map[string]string{"K": "v"},
+	})
+	if out, err := pPSArgs.RenderCommand(); err != nil || out != "pwsh -NoProfile -NonInteractive -Command -" {
+		t.Fatalf("PowerShell 带参脚本 RenderCommand 异常: out=%q err=%v", out, err)
+	}
+	psStdin, ok := pPSArgs.StdinPayload()
+	wantPS := "Set-Location -LiteralPath '/tmp' -ErrorAction Stop; $env:K = 'v'\n& {\nWrite-Output $args[0] # comment\n} 'it''s ok' 'hello world' ''"
+	if !ok || psStdin != wantPS {
+		t.Fatalf("PowerShell 带参脚本 StdinPayload 异常:\ngot:  %q\nwant: %q", psStdin, wantPS)
+	}
+	// PowerShell 脚本参数含弯单引号（U+2019）必须在构造期被 QuotePowerShell 失败关闭拦截。
+	if _, err := NewCommandPlan(CommandPlanSpec{
+		Kind: PlanKindScript, Profile: pwshProf, Command: "Write-Output $args[0]", Argv: []string{"bad\u2019quote"},
+	}); !errors.Is(err, ErrInvalidShellQuote) {
+		t.Fatalf("PowerShell 脚本参数含弯单引号应返回 ErrInvalidShellQuote，实际=%v", err)
+	}
+	// 脱敏摘要必须覆盖脚本文本与位置参数两侧的内联凭据。
+	pSecretArg := mustCommandPlan(t, CommandPlanSpec{
+		Kind: PlanKindScript, Profile: bashProf, Command: "echo ok", Argv: []string{"--token", "super-secret-arg"},
+	})
+	if sum := pSecretArg.RedactedSummary(); strings.Contains(sum, "super-secret-arg") || !strings.Contains(sum, "[REDACTED]") {
+		t.Fatalf("脚本位置参数未脱敏: %s", sum)
+	}
 }
 
 func assertCmdRenderingAndQuoting(t *testing.T, wd pathalg.RemotePath) {

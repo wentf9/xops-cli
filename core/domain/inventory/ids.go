@@ -13,15 +13,16 @@ import (
 )
 
 const (
-	forbiddenIDChars     = "@:/\\,;|$`<>(){}!'\"*?[]"
+	forbiddenIDChars     = "@:/\\,;|&$`<>(){}!'\"*?[]"
 	sha256FingerprintTag = "SHA256:"
 	sha256FingerprintB64 = 43
 	maxAgentSpecBytes    = 512
 )
 
 func validateAssetIdent(raw string, forbidOpenSSH bool) error {
-	if raw == "" || len(raw) > maxIDLen || hasSpaceOrForbidden(raw) || raw == "." || raw == ".." || raw[0] == '-' || strings.ContainsAny(raw, forbiddenIDChars) {
-		return fmt.Errorf("%w: %q 格式非法", ErrInvalidID, raw)
+	if raw == "" || len(raw) > maxIDLen || hasSpaceOrForbidden(raw) || raw == "." || raw == ".." ||
+		raw[0] == '-' || strings.EqualFold(raw, "none") || strings.ContainsAny(raw, forbiddenIDChars) {
+		return fmt.Errorf("%w: %q 格式非法或使用了保留字", ErrInvalidID, raw)
 	}
 	if forbidOpenSSH && len(raw) >= 8 && strings.EqualFold(raw[:8], "openssh:") {
 		return fmt.Errorf("%w: %q 禁止使用保留前缀 %q", ErrInvalidID, raw, "openssh:")

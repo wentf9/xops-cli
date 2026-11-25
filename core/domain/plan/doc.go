@@ -96,7 +96,7 @@ func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseEr
 		return err
 	}
 	var wire W
-	if err := jsonv2.UnmarshalDecode(dec, &wire); err != nil {
+	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return err
 	}
 	parsed, err := build(wire)

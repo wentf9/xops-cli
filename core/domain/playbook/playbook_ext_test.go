@@ -68,8 +68,11 @@ func TestExternalInterfaceContracts(t *testing.T) {
 		_ jsonv2.MarshalerTo     = tpl
 		_ jsonv2.MarshalerTo     = ens
 		_ jsonv2.MarshalerTo     = rec
+		_ jsonv2.UnmarshalerFrom = &rec
 		_ jsonv2.MarshalerTo     = nr
+		_ jsonv2.UnmarshalerFrom = &nr
 		_ jsonv2.MarshalerTo     = pr
+		_ jsonv2.UnmarshalerFrom = &pr
 
 		_ playbook.StepAction = (*playbook.StepShell)(nil)
 		_ playbook.StepAction = (*playbook.StepScript)(nil)
@@ -132,5 +135,10 @@ func TestExternalPlaybookContractAndExhaustiveSwitch(t *testing.T) {
 	rep, err := playbook.FoldPlaybookReport(rt, []playbook.StepExecutionRecord{rec})
 	if err != nil || rep.Status() != playbook.NodeStatusChanged {
 		t.Fatalf("外部包 FoldPlaybookReport 失败: err=%v status=%v", err, rep.Status())
+	}
+	rawRep := mustExt(rep.CanonicalJSON())(t)
+	var rtRep playbook.PlaybookReport
+	if err := jsonv2.Unmarshal(rawRep, &rtRep); err != nil || !rtRep.Equal(rep) {
+		t.Fatalf("外部包 PlaybookReport JSON 往返失败: err=%v", err)
 	}
 }

@@ -216,6 +216,8 @@ func applyOptionField(l *OptionLayer, key OptionKey, tokens []string, val string
 		allowNone := key == KeyConnectTimeout
 		set := map[OptionKey]func(OptionLayer, algebraic.Duration) OptionLayer{KeyConnectTimeout: OptionLayer.WithConnectTimeout, KeyServerAliveInterval: OptionLayer.WithServerAliveInterval}[key]
 		return applyWith(l, val, func(s string) (algebraic.Duration, error) { return parseNonNegativeOpenSSHDuration(s, allowNone) }, set)
+	case KeyServerAliveCountMax:
+		return applyWith(l, val, parseNonNegativeUint32, OptionLayer.WithServerAliveCountMax)
 	case KeyCiphers, KeyMACs, KeyKexAlgorithms, KeyHostKeyAlgorithms:
 		return applyWith(l, val, ParseAlgoPolicy, map[OptionKey]func(OptionLayer, AlgoPolicy) OptionLayer{
 			KeyCiphers: OptionLayer.WithCiphers, KeyMACs: OptionLayer.WithMACs,
