@@ -12,6 +12,8 @@ type RemoteSession interface {
 }
 
 type SecretVault interface {
+	//xops:syncclosure
+	//xops:borrowed
 	WithSecret(ctx context.Context, ref string, fn func(box *secret.SecretBox) error) error
 	PutAndVerify(ctx context.Context, ref string, box *secret.SecretBox) error
 }
@@ -21,6 +23,8 @@ type AuditSink interface {
 }
 
 type InteractionPort interface {
+	//xops:syncclosure
+	//xops:borrowed
 	PromptSecret(ctx context.Context, prompt string, fn func(box *secret.SecretBox) error) error
 	Notify(ctx context.Context, msg any) error
 }

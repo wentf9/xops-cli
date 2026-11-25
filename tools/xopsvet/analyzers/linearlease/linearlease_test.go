@@ -16,6 +16,9 @@ func TestLinearLease(t *testing.T) {
 		linearlease.NewAnalyzer(secretfact.NewAnalyzer()),
 		"github.com/wentf9/xops-cli/core/conc",
 		"github.com/wentf9/xops-cli/core/conc_test",
+		"github.com/wentf9/xops-cli/core/internal/sshnet/dial",
+		"github.com/wentf9/xops-cli/core/internal/sshnet/dial_test",
+		"github.com/wentf9/xops-cli/core/internal/sshnet/priv",
 		"example.com/leasedef",
 		"example.com/leaseuse",
 	)

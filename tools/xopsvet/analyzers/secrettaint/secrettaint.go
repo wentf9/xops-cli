@@ -7,6 +7,7 @@ package secrettaint
 
 import (
 	"go/types"
+	"slices"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/secretfact"
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetssa"
@@ -41,7 +42,7 @@ func run(pass *analysis.Pass, sf *analysis.Analyzer) (any, error) {
 	pkgInfo := vetutil.ClassifyPass(pass)
 	eng := &taintEngine{
 		pass: pass, ssaInfo: s, pkgInfo: pkgInfo, facts: facts,
-		tracker: vetssa.NewAuditTracker(), kiClosures: collectDialKIClosures(pkgInfo, s),
+		tracker: vetssa.NewAuditTracker(), kiClosures: vetssa.CollectDialKIClosures(pkgInfo, s),
 		kiTaintedRoots: map[*ssa.Function][]ssa.Value{},
 		safeVaultAEAD:  collectSafeVaultAEADFields(pkgInfo, s),
 	}
@@ -58,11 +59,15 @@ func run(pass *analysis.Pass, sf *analysis.Analyzer) (any, error) {
 
 func (e *taintEngine) auditDirectSecretUseFunc(fn *ssa.Function) {
 	obj := vetssa.OriginFuncObj(fn)
-	if len(fn.Blocks) == 0 || e.facts == nil || obj == nil || !e.facts.HasFuncFact(obj) || secretfact.IsSecretBoxUseMethod(obj) {
+	if len(fn.Blocks) == 0 || e.facts == nil || obj == nil || secretfact.IsSecretBoxUseMethod(obj) {
 		return
 	}
-	if seeds := secretPlainParamIndices(fn); len(seeds) > 0 {
-		e.auditFunc(fn, seeds, nil, vetssa.ScopeRangeOfFunc(fn), 0, nil, nil, e.enclosingKIFunc(fn))
+	explicit, ok := e.facts.DirectSecretParamIndices(obj)
+	if !ok {
+		return
+	}
+	if seeds := secretPlainParamIndices(fn, explicit); len(seeds) > 0 {
+		e.auditFunc(fn, seeds, nil, vetssa.ScopeRangeOfFunc(fn), 0, nil, nil, vetssa.EnclosingKIFunc(fn, e.kiClosures))
 	}
 }
 
@@ -71,21 +76,25 @@ func (e *taintEngine) scanInstForSecretEntry(fn *ssa.Function, inst ssa.Instruct
 	if e.facts == nil {
 		return
 	}
-	kiFn := e.enclosingKIFunc(fn)
+	kiFn := vetssa.EnclosingKIFunc(fn, e.kiClosures)
 	switch ins := inst.(type) {
 	case ssa.CallInstruction:
 		e.scanCallSecretEntry(fn, ins, kiFn)
 	case *ssa.ChangeType:
-		if e.facts.IsSecretUseNamedFuncType(ins.Type()) {
-			e.auditCallbackArg(fn, ins, ins.X, nil, nil, kiFn)
+		if explicit, ok := e.facts.SecretNamedFuncTypeParams(ins.Type()); ok {
+			e.auditCallbackArg(fn, ins, ins.X, explicit, nil, nil, kiFn)
 		}
 	case *ssa.Store:
-		if ptr, ok := types.Unalias(ins.Addr.Type()).(*types.Pointer); ok && e.facts.IsSecretUseNamedFuncType(ptr.Elem()) {
-			e.auditCallbackArg(fn, ins, ins.Val, nil, nil, kiFn)
+		if ptr, ok := types.Unalias(ins.Addr.Type()).(*types.Pointer); ok {
+			if explicit, ok := e.facts.SecretNamedFuncTypeParams(ptr.Elem()); ok {
+				e.auditCallbackArg(fn, ins, ins.Val, explicit, nil, nil, kiFn)
+			}
 		}
 	case *ssa.MapUpdate:
-		if m, ok := types.Unalias(ins.Map.Type()).Underlying().(*types.Map); ok && e.facts.IsSecretUseNamedFuncType(m.Elem()) {
-			e.auditCallbackArg(fn, ins, ins.Value, nil, nil, kiFn)
+		if m, ok := types.Unalias(ins.Map.Type()).Underlying().(*types.Map); ok {
+			if explicit, ok := e.facts.SecretNamedFuncTypeParams(m.Elem()); ok {
+				e.auditCallbackArg(fn, ins, ins.Value, explicit, nil, nil, kiFn)
+			}
 		}
 	case *ssa.Return:
 		e.scanReturnSecretCB(fn, ins, kiFn)
@@ -98,8 +107,10 @@ func (e *taintEngine) scanReturnSecretCB(fn *ssa.Function, ret *ssa.Return, kiFn
 	}
 	results := fn.Signature.Results()
 	for i, r := range ret.Results {
-		if i < results.Len() && !vetssa.IsNilConst(r) && e.facts.IsSecretUseNamedFuncType(results.At(i).Type()) {
-			e.auditCallbackArg(fn, ret, r, nil, nil, kiFn)
+		if i < results.Len() && !vetssa.IsNilConst(r) {
+			if explicit, ok := e.facts.SecretNamedFuncTypeParams(results.At(i).Type()); ok {
+				e.auditCallbackArg(fn, ret, r, explicit, nil, nil, kiFn)
+			}
 		}
 	}
 }
@@ -109,49 +120,52 @@ func (e *taintEngine) scanCallSecretEntry(fn *ssa.Function, callInst ssa.CallIns
 	if rc.FuncObj == nil {
 		return
 	}
-	isSecretObj := e.facts.IsSecretUseObject(rc.FuncObj)
-	if !isSecretObj && !e.facts.HasSecretUseCallbackParam(rc.FuncObj) {
-		return
-	}
 	sig, _ := rc.FuncObj.Type().Underlying().(*types.Signature)
 	for i, arg := range rc.UserArgs {
-		if isSecretCallbackArgSlot(e.facts, sig, isSecretObj, i, arg.Type()) {
-			e.auditCallbackArg(fn, callInst, arg, nil, nil, kiFn)
+		if explicit, ok := secretCallbackSlot(e.facts, rc.FuncObj, sig, i, arg.Type()); ok {
+			e.auditCallbackArg(fn, callInst, arg, explicit, nil, nil, kiFn)
 		}
 	}
 }
 
-func isSecretCallbackArgSlot(facts *secretfact.Result, sig *types.Signature, isSecretObj bool, argIdx int, argType types.Type) bool {
+func secretCallbackSlot(facts *secretfact.Result, fnObj *types.Func, sig *types.Signature, argIdx int, argType types.Type) ([]int, bool) {
+	if facts == nil || fnObj == nil {
+		return nil, false
+	}
+	explicit, ok := facts.CallbackSecretSlot(fnObj, sig, argIdx)
+	if !ok {
+		return nil, false
+	}
 	if sig != nil && facts.IsSecretUseNamedFuncType(vetutil.ParamTypeAt(sig.Params(), sig.Variadic(), argIdx)) {
-		return true
+		return explicit, true
 	}
 	cbSig, ok := types.Unalias(argType).Underlying().(*types.Signature)
-	if !isSecretObj || !ok || cbSig.Params() == nil {
-		return false
+	if !ok || cbSig.Params() == nil {
+		return nil, false
 	}
 	for i := range cbSig.Params().Len() {
-		if isPlainSecretParamType(cbSig.Params().At(i).Type()) {
-			return true
+		if (len(explicit) == 0 || slices.Contains(explicit, i)) && vetssa.IsPlainSecretParamType(cbSig.Params().At(i).Type()) {
+			return explicit, true
 		}
 	}
-	return false
+	return nil, false
 }
 
 // auditCallbackArg 执行回调准入门禁并透传外层污点与 P4-T1 KI 上下文。
-func (e *taintEngine) auditCallbackArg(callerFn *ssa.Function, siteInst ssa.Instruction, cbVal ssa.Value, outerTaint, outerShared map[ssa.Value]vetssa.ScopeRange, kiFn *ssa.Function) {
+func (e *taintEngine) auditCallbackArg(callerFn *ssa.Function, siteInst ssa.Instruction, cbVal ssa.Value, explicit []int, outerTaint, outerShared map[ssa.Value]vetssa.ScopeRange, kiFn *ssa.Function) {
 	if p := vetssa.UnwrapDirectParam(cbVal); p != nil && e.facts != nil && e.facts.IsSecretUseNamedFuncType(p.Type()) {
 		return
 	}
 	targets, allKnown := vetssa.ResolveFuncValues(cbVal)
 	for _, tgt := range targets {
-		e.auditResolvedCallbackTarget(callerFn, siteInst, tgt, outerTaint, outerShared, kiFn)
+		e.auditResolvedCallbackTarget(callerFn, siteInst, tgt, explicit, outerTaint, outerShared, kiFn)
 	}
 	if !allKnown {
 		vetssa.AppendDiag(e.pass, &e.diags, callerFn, siteInst, "secrettaint: 禁止将无法静态验证的未知函数或回调传入 SecretBox.Use / //xops:secretuse")
 	}
 }
 
-func (e *taintEngine) auditResolvedCallbackTarget(callerFn *ssa.Function, siteInst ssa.Instruction, target ssa.Value, outerTaint, outerShared map[ssa.Value]vetssa.ScopeRange, kiFn *ssa.Function) {
+func (e *taintEngine) auditResolvedCallbackTarget(callerFn *ssa.Function, siteInst ssa.Instruction, target ssa.Value, explicit []int, outerTaint, outerShared map[ssa.Value]vetssa.ScopeRange, kiFn *ssa.Function) {
 	switch t := target.(type) {
 	case *ssa.MakeClosure:
 		fn, ok := t.Fn.(*ssa.Function)
@@ -159,52 +173,40 @@ func (e *taintEngine) auditResolvedCallbackTarget(callerFn *ssa.Function, siteIn
 			return
 		}
 		if vetssa.IsBoundWrapper(fn) {
-			e.auditBoundMethodCallback(callerFn, siteInst, fn, kiFn)
+			e.auditBoundMethodCallback(callerFn, siteInst, fn, explicit, kiFn)
 		} else {
-			e.auditFunc(fn, secretPlainParamIndices(fn), vetssa.CollectCaptured(t, fn, outerTaint), vetssa.ScopeRangeOfFunc(fn), 0, outerShared, siteInst, kiFn)
+			e.auditFunc(fn, secretPlainParamIndices(fn, explicit), vetssa.CollectCaptured(t, fn, outerTaint), vetssa.ScopeRangeOfFunc(fn), 0, outerShared, siteInst, kiFn)
 		}
 	case *ssa.Function:
 		origFn := vetssa.UnwrapOriginFunc(t)
 		if vetssa.IsSamePackageFunc(e.ssaInfo, origFn) && len(origFn.Blocks) > 0 {
-			e.auditFunc(origFn, secretPlainParamIndices(origFn), nil, vetssa.ScopeRangeOfFunc(origFn), 0, nil, siteInst, kiFn)
-		} else if e.facts == nil || !e.facts.HasFuncFact(vetssa.OriginFuncObj(origFn)) {
+			e.auditFunc(origFn, secretPlainParamIndices(origFn, explicit), nil, vetssa.ScopeRangeOfFunc(origFn), 0, nil, siteInst, kiFn)
+		} else if e.facts == nil || !e.facts.CoversDirectSecretParams(vetssa.OriginFuncObj(origFn), explicit) {
 			vetssa.AppendDiag(e.pass, &e.diags, callerFn, siteInst, "secrettaint: 禁止将未标注 //xops:secretuse 的跨包函数传入 SecretBox.Use")
 		}
 	}
 }
 
-func (e *taintEngine) auditBoundMethodCallback(callerFn *ssa.Function, siteInst ssa.Instruction, boundFn, kiFn *ssa.Function) {
+func (e *taintEngine) auditBoundMethodCallback(callerFn *ssa.Function, siteInst ssa.Instruction, boundFn *ssa.Function, explicit []int, kiFn *ssa.Function) {
 	origObj := vetssa.OriginFuncObj(boundFn)
 	if origObj == nil {
 		vetssa.AppendDiag(e.pass, &e.diags, callerFn, siteInst, "secrettaint: 禁止将无法静态验证的未知函数或回调传入 SecretBox.Use / //xops:secretuse")
 		return
 	}
 	if mFn := vetssa.LookupPackageFunc(e.ssaInfo, origObj); mFn != nil && len(mFn.Blocks) > 0 {
-		e.auditFunc(mFn, secretPlainParamIndices(mFn), nil, vetssa.ScopeRangeOfFunc(mFn), 0, nil, siteInst, kiFn)
-	} else if e.facts == nil || !e.facts.HasFuncFact(origObj) {
+		e.auditFunc(mFn, secretPlainParamIndices(mFn, explicit), nil, vetssa.ScopeRangeOfFunc(mFn), 0, nil, siteInst, kiFn)
+	} else if e.facts == nil || !e.facts.CoversDirectSecretParams(origObj, explicit) {
 		vetssa.AppendDiag(e.pass, &e.diags, callerFn, siteInst, "secrettaint: 禁止将未标注 //xops:secretuse 的接口方法或无体函数传入 SecretBox.Use")
 	}
 }
 
-func secretPlainParamIndices(fn *ssa.Function) map[int]bool {
+func secretPlainParamIndices(fn *ssa.Function, explicit []int) map[int]bool {
 	seeds := make(map[int]bool)
-	for i := vetssa.HasRecvParam(fn); i < len(fn.Params); i++ {
-		if isPlainSecretParamType(fn.Params[i].Type()) {
+	recv := vetssa.HasRecvParam(fn)
+	for i := recv; i < len(fn.Params); i++ {
+		if (len(explicit) == 0 || slices.Contains(explicit, i-recv)) && vetssa.IsPlainSecretParamType(fn.Params[i].Type()) {
 			seeds[i] = true
 		}
 	}
 	return seeds
-}
-
-func isPlainSecretParamType(t types.Type) bool {
-	if t == nil {
-		return false
-	}
-	u := types.Unalias(t).Underlying()
-	if sl, ok := u.(*types.Slice); ok {
-		b, ok := types.Unalias(sl.Elem()).Underlying().(*types.Basic)
-		return ok && (b.Kind() == types.Byte || b.Kind() == types.Uint8)
-	}
-	b, ok := u.(*types.Basic)
-	return ok && b.Info()&types.IsString != 0
 }

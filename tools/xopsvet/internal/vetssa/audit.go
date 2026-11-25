@@ -2,6 +2,7 @@ package vetssa
 
 import (
 	"go/types"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -20,40 +21,57 @@ const (
 	EnterDepthExceeded
 )
 
-// AuditKey 为递归函数审计提供确定性防环与去重键（区分 depth==0 与 depth>0，兼容超 64 参数，C6/M8）。
+// AuditKey 为递归函数审计提供确定性防环与去重键（区分 depth==0、每形参 SecretOnly 掩码与超 64 参数，C6/M8）。
 type AuditKey struct {
-	Fn        *ssa.Function
-	ParamMask uint64
-	FreeMask  uint64
-	TopLevel  bool
-	ExtraSig  string
+	Fn         *ssa.Function
+	ParamMask  uint64
+	SecretMask uint64
+	FreeMask   uint64
+	TopLevel   bool
+	ExtraSig   string
 }
 
-// MakeAuditKey 构造给定函数与种子集合的唯一 AuditKey。
-func MakeAuditKey(fn *ssa.Function, seedParams map[int]bool, captured map[ssa.Value]ScopeRange, topLevel bool) AuditKey {
+// MakeAuditKey 构造给定函数与种子/机密来源掩码集合的唯一 AuditKey。
+func MakeAuditKey(fn *ssa.Function, seedParams, secretParams map[int]bool, captured map[ssa.Value]ScopeRange, topLevel bool) AuditKey {
 	if fn == nil {
 		return AuditKey{}
 	}
-	var pm, fm uint64
 	var extra []string
-	for idx := range seedParams {
-		if idx >= 0 && idx < 64 {
-			pm |= 1 << uint(idx)
-		} else if idx >= 64 {
-			extra = append(extra, "p"+strconv.Itoa(idx))
-		}
-	}
-	for i, fv := range fn.FreeVars {
-		if _, ok := captured[fv]; ok {
-			if i < 64 {
-				fm |= 1 << uint(i)
-			} else {
-				extra = append(extra, "f"+strconv.Itoa(i))
-			}
-		}
-	}
+	pm := packIndexMask(seedParams, false, "p", &extra)
+	sm := packIndexMask(secretParams, true, "s", &extra)
+	fm := packFreeVarMask(fn.FreeVars, captured, &extra)
 	slices.Sort(extra)
-	return AuditKey{Fn: fn, ParamMask: pm, FreeMask: fm, TopLevel: topLevel, ExtraSig: strings.Join(extra, ",")}
+	return AuditKey{Fn: fn, ParamMask: pm, SecretMask: sm, FreeMask: fm, TopLevel: topLevel, ExtraSig: strings.Join(extra, ",")}
+}
+
+func packIndexMask(m map[int]bool, requireTrue bool, prefix string, extra *[]string) uint64 {
+	var mask uint64
+	for idx, v := range m {
+		if requireTrue && !v {
+			continue
+		}
+		if idx >= 0 && idx < 64 {
+			mask |= 1 << uint(idx)
+		} else if idx >= 64 {
+			*extra = append(*extra, prefix+strconv.Itoa(idx))
+		}
+	}
+	return mask
+}
+
+func packFreeVarMask(fvs []*ssa.FreeVar, captured map[ssa.Value]ScopeRange, extra *[]string) uint64 {
+	var mask uint64
+	for i, fv := range fvs {
+		if _, ok := captured[fv]; !ok {
+			continue
+		}
+		if i < 64 {
+			mask |= 1 << uint(i)
+		} else {
+			*extra = append(*extra, "f"+strconv.Itoa(i))
+		}
+	}
+	return mask
 }
 
 // AuditTracker 统一管理跨函数递归审计的深度上限、环路防护、最小深度去重与返回值污点掩码缓存。
@@ -69,14 +87,14 @@ func NewAuditTracker() *AuditTracker {
 }
 
 // Enter 尝试进入目标函数审计；返回键、退出回调与三态结果。
-func (t *AuditTracker) Enter(fn *ssa.Function, seedParams map[int]bool, captured map[ssa.Value]ScopeRange, depth, maxDepth int) (AuditKey, func(), EnterStatus) {
+func (t *AuditTracker) Enter(fn *ssa.Function, seedParams, secretParams map[int]bool, captured map[ssa.Value]ScopeRange, depth, maxDepth int) (AuditKey, func(), EnterStatus) {
 	if fn == nil || len(fn.Blocks) == 0 {
 		return AuditKey{}, nil, EnterSkip
 	}
 	if depth > maxDepth {
 		return AuditKey{}, nil, EnterDepthExceeded
 	}
-	key := MakeAuditKey(fn, seedParams, captured, depth == 0)
+	key := MakeAuditKey(fn, seedParams, secretParams, captured, depth == 0)
 	if t.inProgress[key] {
 		return key, nil, EnterSkip
 	}
@@ -103,13 +121,14 @@ func (t *AuditTracker) ReturnMask(key AuditKey) uint64 {
 	return t.returnMask[key]
 }
 
-// RunScopedFixpoint 迭代执行单函数内传播与嵌套审计直至受控值集合收敛，并回冲 FreeVar 至外层（LL-1/C5）。
+// RunScopedFixpoint 迭代执行单函数内传播与嵌套审计直至受控值映射表（含 ScopeRange 原地格收紧）完全不动点收敛，
+// 并回冲 FreeVar 至外层（LL-1/C5）；ScopeRange 交半格高度有限，迭代必然在有限步内终止。
 func RunScopedFixpoint(fn *ssa.Function, scoped, outerShared map[ssa.Value]ScopeRange, prop func(ssa.Instruction) bool, nested func(ssa.Instruction)) {
 	for {
 		RunFixpoint(fn, prop)
-		before := len(scoped)
+		before := maps.Clone(scoped)
 		ForEachInst(fn, nested)
-		if len(scoped) == before {
+		if maps.Equal(scoped, before) {
 			break
 		}
 	}
@@ -125,15 +144,19 @@ func ReportDepthExceeded(pass *analysis.Pass, diags *[]vetutil.Diag, fn *ssa.Fun
 	AppendDiag(pass, diags, reportFn, siteInst, msg)
 }
 
-// SeedScopeParams 初始化函数体的受控值集合与不可写调用方形参集合（CallerParam 隔离）。
-func SeedScopeParams(fn *ssa.Function, seedParams map[int]bool, captured map[ssa.Value]ScopeRange, ownScope ScopeRange) (map[ssa.Value]ScopeRange, map[ssa.Value]bool) {
+// SeedScopeParams 初始化函数体的受控值集合与不可写调用方形参集合（CallerParam 隔离）；
+// 仅对命中 secretParams 的形参置 SecretOnly=true，其余种子形参强制 SecretOnly=false，
+// 杜绝混合参数回调中非明文借用句柄误获 P4-T1 窄豁免。
+func SeedScopeParams(fn *ssa.Function, seedParams, secretParams map[int]bool, captured map[ssa.Value]ScopeRange, ownScope ScopeRange) (map[ssa.Value]ScopeRange, map[ssa.Value]bool) {
 	scoped, callerParams := make(map[ssa.Value]ScopeRange, len(seedParams)+len(captured)), make(map[ssa.Value]bool)
 	if fn == nil {
 		return scoped, callerParams
 	}
 	for i, p := range fn.Params {
 		if seedParams[i] {
-			scoped[p] = ownScope
+			sc := ownScope
+			sc.SecretOnly = secretParams[i]
+			scoped[p] = sc
 		} else {
 			callerParams[p] = true
 		}

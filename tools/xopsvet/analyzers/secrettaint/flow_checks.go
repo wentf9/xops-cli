@@ -51,7 +51,7 @@ func (ts *taintScope) checkReturn(ins *ssa.Return) {
 	if ts.depth != 0 {
 		return
 	}
-	if ts.kiFn == ts.fn && isDialKeyboardInteractiveAnswersReturn(ts.eng.pkgInfo, ts.fn, ins) {
+	if ts.kiFn == ts.fn && vetssa.IsDialKIAnswersReturn(ts.eng.pkgInfo, ts.fn, ins) {
 		if _, errT := ts.tainted[ins.Results[1]]; errT {
 			ts.report(ins, "secrettaint: 禁止通过 return 返回明文机密")
 		}
@@ -108,7 +108,7 @@ func (ts *taintScope) checkMakeClosure(mc *ssa.MakeClosure) {
 func (ts *taintScope) checkYieldClosure(mc *ssa.MakeClosure, target *ssa.Function, captured map[ssa.Value]vetssa.ScopeRange) {
 	callInst, seeds, yScope, isStd := vetssa.CheckStdlibYieldClosure(ts.eng.ssaInfo, ts.fn, target, ts.ownScope, ts.tainted)
 	if !isStd {
-		iterT := callInst != nil && callInst.Common() != nil && ts.tainted[callInst.Common().Value].Valid()
+		iterT := callInst != nil && callInst.Common() != nil && ts.isTainted(callInst.Common().Value)
 		if len(captured) > 0 || iterT {
 			rep := ssa.Instruction(mc)
 			if callInst != nil {
@@ -149,14 +149,12 @@ func (ts *taintScope) isSecretUseCallSite(callInst ssa.CallInstruction, mc *ssa.
 	if rc.FuncObj == nil || ts.eng.facts == nil {
 		return false
 	}
-	isSecretObj := ts.eng.facts.IsSecretUseObject(rc.FuncObj)
-	if !isSecretObj && !ts.eng.facts.HasSecretUseCallbackParam(rc.FuncObj) {
-		return false
-	}
 	sig, _ := rc.FuncObj.Type().Underlying().(*types.Signature)
 	for i, arg := range rc.UserArgs {
-		if arg == mc && isSecretCallbackArgSlot(ts.eng.facts, sig, isSecretObj, i, arg.Type()) {
-			return true
+		if arg == mc {
+			if _, ok := secretCallbackSlot(ts.eng.facts, rc.FuncObj, sig, i, arg.Type()); ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -164,9 +162,6 @@ func (ts *taintScope) isSecretUseCallSite(callInst ssa.CallInstruction, mc *ssa.
 
 func (ts *taintScope) checkCallInst(callInst ssa.CallInstruction) {
 	rc := vetssa.ResolveCall(ts.eng.ssaInfo, callInst)
-	if ts.eng.facts != nil && rc.FuncObj != nil && ts.eng.facts.IsSecretUseObject(rc.FuncObj) {
-		return
-	}
 	if rc.Kind == vetssa.CallBuiltin && rc.Builtin != nil {
 		ts.checkBuiltinCall(callInst, rc)
 		return
@@ -184,6 +179,9 @@ func (ts *taintScope) checkCallInst(callInst ssa.CallInstruction) {
 		return
 	}
 	if inSc, ok := ts.callInputScope(rc); ok {
+		if ts.allTaintedArgsCoveredBySecretUse(rc) {
+			return
+		}
 		ts.checkTaintedNonWriteCall(callInst, rc, inSc)
 	}
 }

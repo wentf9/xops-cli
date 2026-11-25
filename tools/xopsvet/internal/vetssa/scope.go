@@ -9,21 +9,42 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-// ScopeRange 表示借用/明文污点值的合法生存期源码区间 [Start, End]，多来源合并始终收紧至交集。
-type ScopeRange struct{ Start, End token.Pos }
+// ScopeRange 表示借用/明文污点值的合法生存期源码区间 [Start, End]；
+// SecretOnly 仅当值严格源自 (*secret.SecretBox).Use 或 //xops:secretuse 回调形参时为 true，
+// 多来源合并时同时收紧区间并对 SecretOnly 取逻辑与交集，阻断非机密借用混入 P4-T1 窄钩子。
+type ScopeRange struct {
+	Start, End token.Pos
+	SecretOnly bool
+}
+
+const (
+	emptyScopeStart token.Pos = 2
+	emptyScopeEnd   token.Pos = 1
+)
 
 // Valid 判断作用域区间是否有效且非空。
 func (s ScopeRange) Valid() bool { return s.Start.IsValid() && s.End.IsValid() && s.Start <= s.End }
 
-// TightenScope 返回两个作用域区间的最紧交集区间。
+func isUnsetScope(s ScopeRange) bool { return !s.Start.IsValid() || !s.End.IsValid() }
+func isEmptyScope(s ScopeRange) bool { return s.Start.IsValid() && s.End.IsValid() && s.Start > s.End }
+
+// TightenScope 返回两个作用域区间的最紧交集（有限高交半格 meet 运算）：
+// 未设置零值为单位元，两区间无交集时归一化为吸收底元，杜绝不相交区间在不动点迭代中震荡，并对 SecretOnly 取逻辑与。
 func TightenScope(a, b ScopeRange) ScopeRange {
-	if !a.Valid() {
+	if isUnsetScope(a) {
 		return b
 	}
-	if !b.Valid() {
+	if isUnsetScope(b) {
 		return a
 	}
-	return ScopeRange{Start: max(a.Start, b.Start), End: min(a.End, b.End)}
+	if isEmptyScope(a) || isEmptyScope(b) {
+		return ScopeRange{Start: emptyScopeStart, End: emptyScopeEnd}
+	}
+	start, end := max(a.Start, b.Start), min(a.End, b.End)
+	if start > end {
+		return ScopeRange{Start: emptyScopeStart, End: emptyScopeEnd}
+	}
+	return ScopeRange{Start: start, End: end, SecretOnly: a.SecretOnly && b.SecretOnly}
 }
 
 // ScopeRangeOfFunc 安全提取 SSA 函数的合法生存期源码区间（兼容 FuncDecl / FuncLit / RangeStmt）。
@@ -244,7 +265,11 @@ type IterCallbackTarget struct {
 
 // ResolveDirectStdlibIterCallback 统一解析直接调用标准库 iter.Seq(cb) 的所有回调目标（供 secrettaint/linearlease 共享）。
 func ResolveDirectStdlibIterCallback(s *buildssa.SSA, rc ResolvedCall, scoped map[ssa.Value]ScopeRange) ([]IterCallbackTarget, ScopeRange, bool) {
-	if rc.Common == nil || rc.Common.IsInvoke() || len(rc.UserArgs) != 1 || !scoped[rc.Common.Value].Valid() || !IsIterSeqSignature(rc.Common.Value.Type()) {
+	if rc.Common == nil || rc.Common.IsInvoke() || len(rc.UserArgs) != 1 || !IsIterSeqSignature(rc.Common.Value.Type()) {
+		return nil, ScopeRange{}, false
+	}
+	iterSc, ok := scoped[rc.Common.Value]
+	if !ok {
 		return nil, ScopeRange{}, false
 	}
 	if _, allStd := ResolveStdlibIterCalls(s, rc.Common.Value); !allStd {
@@ -262,7 +287,7 @@ func ResolveDirectStdlibIterCallback(s *buildssa.SSA, rc ResolvedCall, scoped ma
 		}
 		out = append(out, item)
 	}
-	return out, scoped[rc.Common.Value], true
+	return out, iterSc, true
 }
 
 func iterCallbackTargetFromValue(tgt ssa.Value) (IterCallbackTarget, bool) {

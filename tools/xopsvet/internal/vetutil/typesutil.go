@@ -46,6 +46,21 @@ func AllowNolintInFile(pass *analysis.Pass, file *ast.File, info PkgInfo) bool {
 	return AllowNolint(info) && !IsTestFile(pass, file)
 }
 
+// IsPlainSecretParamType 判断参数类型底层是否为明文机密常见载体（[]byte / []uint8 / string），
+// 供 secretfact、vetssa、secrettaint 与 linearlease 共享单一事实源。
+func IsPlainSecretParamType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	u := types.Unalias(t).Underlying()
+	if sl, ok := u.(*types.Slice); ok {
+		b, ok := types.Unalias(sl.Elem()).Underlying().(*types.Basic)
+		return ok && (b.Kind() == types.Byte || b.Kind() == types.Uint8)
+	}
+	b, ok := u.(*types.Basic)
+	return ok && b.Info()&types.IsString != 0
+}
+
 // IsErrorInterfaceType 判断类型 t（解别名后）是否为 Go 内置 error 接口类型。
 func IsErrorInterfaceType(t types.Type) bool {
 	errObj := types.Universe.Lookup("error")

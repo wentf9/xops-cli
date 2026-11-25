@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"go/types"
 	"maps"
+	"slices"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/secretfact"
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetssa"
@@ -17,12 +18,15 @@ import (
 const maxLeaseAuditDepth = 8
 
 type leaseEngine struct {
-	pass        *analysis.Pass
-	ssaInfo     *buildssa.SSA
-	facts       *factIndex
-	secretFacts *secretfact.Result
-	tracker     *vetssa.AuditTracker
-	diags       []vetutil.Diag
+	pass            *analysis.Pass
+	ssaInfo         *buildssa.SSA
+	pkgInfo         vetutil.PkgInfo
+	facts           *factIndex
+	secretFacts     *secretfact.Result
+	tracker         *vetssa.AuditTracker
+	kiClosures      map[*ssa.Function]bool
+	kiBorrowedRoots map[*ssa.Function][]ssa.Value
+	diags           []vetutil.Diag
 }
 
 type leaseScope struct {
@@ -33,20 +37,29 @@ type leaseScope struct {
 	borrowed         map[ssa.Value]vetssa.ScopeRange
 	callerParams     map[ssa.Value]bool
 	outerShared      map[ssa.Value]vetssa.ScopeRange
+	kiFn             *ssa.Function
 	reportedAppends  map[*ssa.Call]bool
 	namedResAllocs   map[*ssa.Alloc]bool
 	auditedIterCalls map[ssa.CallInstruction]bool
 }
 
-// analyzePackageLeases 在全包 SSA 上扫描全部 //xops:borrowed 入口并执行零逃逸分析。
-func analyzePackageLeases(pass *analysis.Pass, s *buildssa.SSA, facts *factIndex, secretFacts *secretfact.Result) {
+// analyzePackageLeases 在全包 SSA 上扫描全部 //xops:borrowed 入口并执行零逃逸分析；
+// 若命中 core/internal/sshnet/dial 的 P4-T1 挑战闭包窄钩子，同步对登记的 kiFn 根切片执行对称复审。
+func analyzePackageLeases(pass *analysis.Pass, pkgInfo vetutil.PkgInfo, s *buildssa.SSA, facts *factIndex, secretFacts *secretfact.Result) {
 	if s == nil {
 		return
 	}
-	eng := &leaseEngine{pass: pass, ssaInfo: s, facts: facts, secretFacts: secretFacts, tracker: vetssa.NewAuditTracker()}
+	eng := &leaseEngine{
+		pass: pass, ssaInfo: s, pkgInfo: pkgInfo, facts: facts, secretFacts: secretFacts,
+		tracker: vetssa.NewAuditTracker(), kiClosures: vetssa.CollectDialKIClosures(pkgInfo, s),
+		kiBorrowedRoots: map[*ssa.Function][]ssa.Value{},
+	}
 	for _, fn := range vetssa.AllFuncs(s) {
 		eng.auditDirectEntryFunc(fn)
 		vetssa.ForEachInst(fn, func(inst ssa.Instruction) { eng.scanInstForBorrowedCall(fn, inst) })
+	}
+	for kiFn, roots := range eng.kiBorrowedRoots {
+		eng.auditDialKIFunc(kiFn, roots)
 	}
 	vetutil.ReportSortedDedup(pass, eng.diags, false)
 }
@@ -56,11 +69,11 @@ func (e *leaseEngine) auditDirectEntryFunc(fn *ssa.Function) {
 		return
 	}
 	if indices := e.facts.directParams[vetssa.OriginFuncObj(fn)]; len(indices) > 0 {
-		e.auditFunc(fn, indicesToMap(indices, vetssa.HasRecvParam(fn)), nil, vetssa.ScopeRangeOfFunc(fn), 0, nil, nil, nil)
+		e.auditFunc(fn, indicesToMap(indices, vetssa.HasRecvParam(fn)), nil, nil, vetssa.ScopeRangeOfFunc(fn), 0, nil, nil, nil)
 	}
 	if lit, ok := fn.Syntax().(*ast.FuncLit); ok && lit != nil && lit.Type != nil {
 		if indices := collectExplicitParamIndices(e.pass.Fset, e.facts.commentsFor(e.pass.Fset, lit.Pos()), lit.Type.Params, vetutil.DirectiveBorrowed); len(indices) > 0 {
-			e.auditFunc(fn, indicesToMap(indices, 0), nil, vetssa.ScopeRangeOfFunc(fn), 0, nil, nil, nil)
+			e.auditFunc(fn, indicesToMap(indices, 0), nil, nil, vetssa.ScopeRangeOfFunc(fn), 0, nil, nil, nil)
 		}
 	}
 }
@@ -71,7 +84,8 @@ func (e *leaseEngine) scanInstForBorrowedCall(callerFn *ssa.Function, inst ssa.I
 		e.scanCallBorrowedCallbacks(callerFn, ins, nil, nil, nil)
 	case *ssa.ChangeType:
 		if direct := e.namedFuncDirectBorrowed(ins.Type()); len(direct) > 0 {
-			e.auditCallbackTargets(callerFn, ins, ins.X, direct, nil, nil, nil)
+			explicitSecret, isSecret := e.secretNamedFuncParams(ins.Type())
+			e.auditCallbackTargets(callerFn, ins, ins.X, direct, isSecret, explicitSecret, nil, nil, nil)
 		}
 	}
 }
@@ -79,22 +93,43 @@ func (e *leaseEngine) scanInstForBorrowedCall(callerFn *ssa.Function, inst ssa.I
 func (e *leaseEngine) scanCallBorrowedCallbacks(callerFn *ssa.Function, callInst ssa.CallInstruction, outerBorrowed, outerShared map[ssa.Value]vetssa.ScopeRange, ancNamedRes map[*ssa.Alloc]bool) {
 	rc := vetssa.ResolveCall(e.ssaInfo, callInst)
 	spec := resolveSSACallLeaseSpec(e.pass, e.facts, e.secretFacts, rc)
+	var sig *types.Signature
+	if rc.FuncObj != nil {
+		sig, _ = rc.FuncObj.Type().Underlying().(*types.Signature)
+	}
 	for argIdx, innerIndices := range spec.callbackBorrowed {
 		if argIdx >= len(rc.UserArgs) || len(innerIndices) == 0 {
 			continue
 		}
 		arg := rc.UserArgs[argIdx]
+		explicitSecret, isSecret := e.secretCallbackSlot(rc.FuncObj, sig, argIdx)
 		if varElems := vetssa.ExtractVarargsElements(arg); len(varElems) > 0 {
 			for _, elem := range varElems {
-				e.auditCallbackTargets(callerFn, callInst, elem, innerIndices, outerBorrowed, outerShared, ancNamedRes)
+				e.auditCallbackTargets(callerFn, callInst, elem, innerIndices, isSecret, explicitSecret, outerBorrowed, outerShared, ancNamedRes)
 			}
 		} else {
-			e.auditCallbackTargets(callerFn, callInst, arg, innerIndices, outerBorrowed, outerShared, ancNamedRes)
+			e.auditCallbackTargets(callerFn, callInst, arg, innerIndices, isSecret, explicitSecret, outerBorrowed, outerShared, ancNamedRes)
 		}
 	}
 }
 
-func (e *leaseEngine) auditCallbackTargets(callerFn *ssa.Function, siteInst ssa.Instruction, cbVal ssa.Value, innerIndices []int, outerBorrowed, outerShared map[ssa.Value]vetssa.ScopeRange, ancNamedRes map[*ssa.Alloc]bool) {
+func (e *leaseEngine) secretNamedFuncParams(t types.Type) ([]int, bool) {
+	if e.secretFacts == nil {
+		return nil, false
+	}
+	return e.secretFacts.SecretNamedFuncTypeParams(t)
+}
+
+// secretCallbackSlot 按外层回调槽位精确判定该实参槽位是否源自 (*secret.SecretBox).Use 或 //xops:secretuse，
+// 返回显式内层 //xops:secretuse 形参索引（nil 表示该回调的全部明文类型形参）。
+func (e *leaseEngine) secretCallbackSlot(fn *types.Func, sig *types.Signature, argIdx int) ([]int, bool) {
+	if e.secretFacts == nil {
+		return nil, secretfact.IsSecretBoxUseMethod(fn) && argIdx == 0
+	}
+	return e.secretFacts.CallbackSecretSlot(fn, sig, argIdx)
+}
+
+func (e *leaseEngine) auditCallbackTargets(callerFn *ssa.Function, siteInst ssa.Instruction, cbVal ssa.Value, innerIndices []int, isSecretSlot bool, explicitSecret []int, outerBorrowed, outerShared map[ssa.Value]vetssa.ScopeRange, ancNamedRes map[*ssa.Alloc]bool) {
 	if vetssa.IsNilConst(cbVal) || e.isDirectBorrowedFuncParam(cbVal) {
 		return
 	}
@@ -103,17 +138,44 @@ func (e *leaseEngine) auditCallbackTargets(callerFn *ssa.Function, siteInst ssa.
 		switch t := tgt.(type) {
 		case *ssa.MakeClosure:
 			if fn, ok := t.Fn.(*ssa.Function); ok && fn != nil && len(fn.Blocks) > 0 {
-				e.auditFunc(fn, indicesToMap(innerIndices, 0), vetssa.CollectCaptured(t, fn, outerBorrowed), vetssa.ScopeRangeOfFunc(fn), 0, outerShared, ancNamedRes, siteInst)
+				seeds := indicesToMap(innerIndices, 0)
+				secretParams := secretSeedParamsForFunc(fn, 0, seeds, isSecretSlot, explicitSecret)
+				e.auditFunc(fn, seeds, secretParams, vetssa.CollectCaptured(t, fn, outerBorrowed), vetssa.ScopeRangeOfFunc(fn), 0, outerShared, ancNamedRes, siteInst)
 			}
 		case *ssa.Function:
 			if origFn := vetssa.UnwrapOriginFunc(t); vetssa.IsSamePackageFunc(e.ssaInfo, origFn) && len(origFn.Blocks) > 0 {
-				e.auditFunc(origFn, indicesToMap(innerIndices, vetssa.HasRecvParam(origFn)), nil, vetssa.ScopeRangeOfFunc(origFn), 0, nil, nil, siteInst)
+				recv := vetssa.HasRecvParam(origFn)
+				seeds := indicesToMap(innerIndices, recv)
+				secretParams := secretSeedParamsForFunc(origFn, recv, seeds, isSecretSlot, explicitSecret)
+				e.auditFunc(origFn, seeds, secretParams, nil, vetssa.ScopeRangeOfFunc(origFn), 0, nil, nil, siteInst)
 			}
 		}
 	}
 	if !allKnown {
 		vetssa.AppendDiag(e.pass, &e.diags, callerFn, siteInst, "linearlease: 禁止将无法静态验证的未知函数或回调传入 //xops:borrowed 高阶函数")
 	}
+}
+
+// secretSeedParamsForFunc 仅对同时属于 //xops:secretuse 回调槽位、命中显式内层标注（若有）
+// 且底层类型为 []byte/[]uint8/string 的种子形参赋予 SecretOnly=true，隔离混合参数回调中的非明文借用句柄。
+func secretSeedParamsForFunc(fn *ssa.Function, offset int, seeds map[int]bool, isSecretSlot bool, explicitSecret []int) map[int]bool {
+	if !isSecretSlot || fn == nil || len(seeds) == 0 {
+		return nil
+	}
+	var out map[int]bool
+	for idx := range seeds {
+		if idx < offset || idx >= len(fn.Params) {
+			continue
+		}
+		if (len(explicitSecret) == 0 || slices.Contains(explicitSecret, idx-offset)) &&
+			vetssa.IsPlainSecretParamType(fn.Params[idx].Type()) {
+			if out == nil {
+				out = make(map[int]bool)
+			}
+			out[idx] = true
+		}
+	}
+	return out
 }
 
 func (e *leaseEngine) isDirectBorrowedFuncParam(v ssa.Value) bool {
@@ -133,8 +195,8 @@ func (e *leaseEngine) namedFuncDirectBorrowed(t types.Type) []int {
 	return nil
 }
 
-func (e *leaseEngine) auditFunc(fn *ssa.Function, seedParams map[int]bool, captured map[ssa.Value]vetssa.ScopeRange, ownScope vetssa.ScopeRange, depth int, outerShared map[ssa.Value]vetssa.ScopeRange, ancNamedRes map[*ssa.Alloc]bool, siteInst ssa.Instruction) {
-	_, leave, status := e.tracker.Enter(fn, seedParams, captured, depth, maxLeaseAuditDepth)
+func (e *leaseEngine) auditFunc(fn *ssa.Function, seedParams, secretParams map[int]bool, captured map[ssa.Value]vetssa.ScopeRange, ownScope vetssa.ScopeRange, depth int, outerShared map[ssa.Value]vetssa.ScopeRange, ancNamedRes map[*ssa.Alloc]bool, siteInst ssa.Instruction) {
+	_, leave, status := e.tracker.Enter(fn, seedParams, secretParams, captured, depth, maxLeaseAuditDepth)
 	switch status {
 	case vetssa.EnterSkip:
 		return
@@ -144,25 +206,54 @@ func (e *leaseEngine) auditFunc(fn *ssa.Function, seedParams map[int]bool, captu
 	}
 	defer leave()
 
-	borrowed, callerParams := vetssa.SeedScopeParams(fn, seedParams, captured, ownScope)
-	namedRes := collectNamedResultAllocs(fn)
+	borrowed, callerParams := vetssa.SeedScopeParams(fn, seedParams, secretParams, captured, ownScope)
+	namedRes := collectNamedResultAllocs(fn, false)
 	maps.Copy(namedRes, ancNamedRes)
+	e.runScopeAudit(fn, borrowed, callerParams, ownScope, depth, outerShared, namedRes)
+}
+
+func (e *leaseEngine) runScopeAudit(fn *ssa.Function, borrowed map[ssa.Value]vetssa.ScopeRange, callerParams map[ssa.Value]bool, ownScope vetssa.ScopeRange, depth int, outerShared map[ssa.Value]vetssa.ScopeRange, namedRes map[*ssa.Alloc]bool) {
 	ls := &leaseScope{
 		eng: e, fn: fn, depth: depth, ownScope: ownScope,
 		borrowed: borrowed, callerParams: callerParams, outerShared: outerShared,
+		kiFn:            vetssa.EnclosingKIFunc(fn, e.kiClosures),
 		reportedAppends: map[*ssa.Call]bool{}, namedResAllocs: namedRes, auditedIterCalls: map[ssa.CallInstruction]bool{},
 	}
 	vetssa.RunScopedFixpoint(fn, ls.borrowed, outerShared, ls.propagateInst, ls.auditNestedInst)
 	vetssa.ForEachInst(fn, ls.checkInst)
 }
 
-func collectNamedResultAllocs(fn *ssa.Function) map[*ssa.Alloc]bool {
+// auditDialKIFunc 在主扫描结束后对登记了 P4-T1 窄写入的 kiFn 执行独立对称复审（SecretOnly=false），
+// 仅放行槽 0 返回 answers []string，严查外层变量/全局/channel/非同步闭包与槽 1 error 逃逸。
+func (e *leaseEngine) auditDialKIFunc(kiFn *ssa.Function, roots []ssa.Value) {
+	kiScope := vetssa.ScopeRangeOfFunc(kiFn)
+	borrowed := make(map[ssa.Value]vetssa.ScopeRange, len(roots))
+	for _, r := range roots {
+		borrowed[r] = kiScope
+	}
+	_, callerParams := vetssa.SeedScopeParams(kiFn, nil, nil, nil, kiScope)
+	e.runScopeAudit(kiFn, borrowed, callerParams, kiScope, 0, nil, collectNamedResultAllocs(kiFn, true))
+}
+
+func (e *leaseEngine) recordKIBorrowedRoots(kiFn *ssa.Function, roots []ssa.Value) {
+	for _, r := range roots {
+		if !slices.Contains(e.kiBorrowedRoots[kiFn], r) {
+			e.kiBorrowedRoots[kiFn] = append(e.kiBorrowedRoots[kiFn], r)
+		}
+	}
+}
+
+func collectNamedResultAllocs(fn *ssa.Function, skipFirst bool) map[*ssa.Alloc]bool {
 	out := make(map[*ssa.Alloc]bool)
 	if fn == nil || fn.Signature == nil || fn.Signature.Results() == nil {
 		return out
 	}
 	resPos := make(map[token.Pos]bool)
-	for i := range fn.Signature.Results().Len() {
+	start := 0
+	if skipFirst {
+		start = 1
+	}
+	for i := start; i < fn.Signature.Results().Len(); i++ {
 		if r := fn.Signature.Results().At(i); r.Name() != "" && r.Pos().IsValid() {
 			resPos[r.Pos()] = true
 		}
@@ -189,7 +280,13 @@ func (ls *leaseScope) propagateInst(inst ssa.Instruction) bool {
 		return ok && vetssa.MarkValueScope(ls.borrowed, ins, sc)
 	case *ssa.Store:
 		sc, ok := ls.borrowed[ins.Val]
-		return ok && vetssa.MarkRootsBackward(ins.Addr, sc, ls.borrowed, ls.outerShared)
+		if !ok {
+			return false
+		}
+		if _, allowed := ls.matchDialKIAnswersStore(ins, sc); allowed {
+			return false
+		}
+		return vetssa.MarkRootsBackward(ins.Addr, sc, ls.borrowed, ls.outerShared)
 	case *ssa.MapUpdate:
 		sc, ok := vetssa.CombinedScope(ls.borrowed, ins.Key, ins.Value)
 		return ok && vetssa.MarkRootsBackward(ins.Map, sc, ls.borrowed, ls.outerShared)

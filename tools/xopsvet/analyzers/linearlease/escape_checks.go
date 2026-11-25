@@ -32,11 +32,21 @@ func (ls *leaseScope) checkInst(inst ssa.Instruction) {
 			ls.report(ins, "linearlease: 禁止将 //xops:borrowed 借用变量传入 panic")
 		}
 	case *ssa.Return:
-		for _, r := range ins.Results {
-			if _, ok := ls.borrowed[r]; ok && !ls.isNamedResultLoad(r) {
-				ls.report(ins, "linearlease: 禁止通过 return 返回 //xops:borrowed 借用变量")
-				return
-			}
+		ls.checkReturn(ins)
+	}
+}
+
+func (ls *leaseScope) checkReturn(ins *ssa.Return) {
+	if ls.kiFn == ls.fn && vetssa.IsDialKIAnswersReturn(ls.eng.pkgInfo, ls.fn, ins) {
+		if _, ok := ls.borrowed[ins.Results[1]]; ok {
+			ls.report(ins, "linearlease: 禁止通过 return 返回 //xops:borrowed 借用变量")
+		}
+		return
+	}
+	for _, r := range ins.Results {
+		if _, ok := ls.borrowed[r]; ok && !ls.isNamedResultLoad(r) {
+			ls.report(ins, "linearlease: 禁止通过 return 返回 //xops:borrowed 借用变量")
+			return
 		}
 	}
 }
@@ -66,11 +76,35 @@ func (ls *leaseScope) checkStore(ins *ssa.Store) {
 		}
 		return
 	}
+	if auditRoots, allowed := ls.matchDialKIAnswersStore(ins, sc); allowed {
+		ls.eng.recordKIBorrowedRoots(ls.kiFn, auditRoots)
+		return
+	}
 	if isCompositeSliceStore(ins.Addr) {
 		ls.report(ins, "linearlease: 禁止将 //xops:borrowed 借用变量存入复合字面量")
 	} else if ls.storesToNamedResult(ins.Addr) || !vetssa.AllRootsOwnedInScope(ins.Addr, sc, ls.callerParams) {
 		ls.report(ins, "linearlease: 禁止将 //xops:borrowed 借用变量逃逸至外层变量或具名返回值")
 	}
+}
+
+// matchDialKIAnswersStore 在 core/internal/sshnet/dial（非外置 _test）中镜像 P4-T1 受控窄模式：
+// 仅放行严格源自 (*secret.SecretBox).Use / //xops:secretuse（sc.SecretOnly == true）且位于唯一流向
+// ssh.KeyboardInteractive 的挑战闭包内层回调，将本作用域派生的精确内置 string（不可变字符串拷贝）写入
+// 直接归属于 kiFn（Parent() == kiFn）的 []string 局部切片元素，并返回供 kiFn 对称复审的完整根集合；
+// 若切片本就归属当前内层作用域，则继续按常规路径反染以阻断局部别名外泄。
+func (ls *leaseScope) matchDialKIAnswersStore(ins *ssa.Store, sc vetssa.ScopeRange) ([]ssa.Value, bool) {
+	if ls.kiFn == nil || ls.fn == ls.kiFn || !sc.SecretOnly {
+		return nil, false
+	}
+	auditRoots, kiScope, ok := vetssa.IsDialKIAnswersStore(ls.eng.pkgInfo, ls.kiFn, ins)
+	if !ok || !sc.Valid() || sc.Start < kiScope.Start || sc.End > kiScope.End {
+		return nil, false
+	}
+	ia, isIA := ins.Addr.(*ssa.IndexAddr)
+	if !isIA || vetssa.AllRootsOwnedInScope(ia.X, sc, ls.callerParams) {
+		return nil, false
+	}
+	return auditRoots, true
 }
 
 // storesToNamedResult 检查写入地址是否命中本层或任意外层祖先函数的具名返回值槽位（LL-2）。
@@ -109,7 +143,10 @@ func (ls *leaseScope) checkYieldClosure(mc *ssa.MakeClosure, target *ssa.Functio
 	captured := vetssa.CollectCaptured(mc, target, ls.borrowed)
 	callInst, seeds, yScope, isStd := vetssa.CheckStdlibYieldClosure(ls.eng.ssaInfo, ls.fn, target, ls.ownScope, ls.borrowed)
 	if !isStd {
-		iterBorrowed := callInst != nil && callInst.Common() != nil && ls.borrowed[callInst.Common().Value].Valid()
+		iterBorrowed := false
+		if callInst != nil && callInst.Common() != nil {
+			_, iterBorrowed = ls.borrowed[callInst.Common().Value]
+		}
 		if len(captured) > 0 || iterBorrowed {
 			reportInst := ssa.Instruction(mc)
 			if callInst != nil {
@@ -120,7 +157,8 @@ func (ls *leaseScope) checkYieldClosure(mc *ssa.MakeClosure, target *ssa.Functio
 		return
 	}
 	if len(seeds) > 0 || len(captured) > 0 {
-		ls.eng.auditFunc(target, seeds, captured, yScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
+		secretParams := secretSeedParamsForFunc(target, 0, seeds, yScope.SecretOnly, nil)
+		ls.eng.auditFunc(target, seeds, secretParams, captured, yScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 	}
 }
 
@@ -139,10 +177,11 @@ func (ls *leaseScope) checkCallInst(callInst ssa.CallInstruction) {
 		ls.checkBuiltinCall(callInst, rc)
 		return
 	}
-	if rc.Common != nil && !rc.Common.IsInvoke() && !ls.auditedIterCalls[callInst] &&
-		ls.borrowed[rc.Common.Value].Valid() && vetssa.IsIterSeqSignature(rc.Common.Value.Type()) {
-		ls.report(callInst, "linearlease: 禁止对非标准库或未知来源的借用迭代器执行回调调用")
-		return
+	if rc.Common != nil && !rc.Common.IsInvoke() && !ls.auditedIterCalls[callInst] && vetssa.IsIterSeqSignature(rc.Common.Value.Type()) {
+		if _, iterBorrowed := ls.borrowed[rc.Common.Value]; iterBorrowed {
+			ls.report(callInst, "linearlease: 禁止对非标准库或未知来源的借用迭代器执行回调调用")
+			return
+		}
 	}
 	spec := resolveSSACallLeaseSpec(ls.eng.pass, ls.eng.facts, ls.eng.secretFacts, rc)
 	isLocalCallee := ls.isAuditableLocalClosureCallee(rc)
@@ -193,7 +232,9 @@ func (ls *leaseScope) auditDirectIterCall(callInst ssa.CallInstruction, rc vetss
 		return false
 	}
 	for _, tgt := range targets {
-		ls.eng.auditFunc(tgt.Fn, vetssa.SeedAllParamIndices(tgt.Fn), vetssa.CollectCaptured(tgt.MC, tgt.Fn, ls.borrowed), iterSc, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
+		seeds := vetssa.SeedAllParamIndices(tgt.Fn)
+		secretParams := secretSeedParamsForFunc(tgt.Fn, 0, seeds, iterSc.SecretOnly, nil)
+		ls.eng.auditFunc(tgt.Fn, seeds, secretParams, vetssa.CollectCaptured(tgt.MC, tgt.Fn, ls.borrowed), iterSc, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 	}
 	return true
 }
@@ -206,6 +247,10 @@ func (ls *leaseScope) auditInvokedLocalClosure(callInst ssa.CallInstruction, rc 
 }
 
 func (ls *leaseScope) auditInvokedTarget(callInst ssa.CallInstruction, rc vetssa.ResolvedCall, tgt ssa.Value) {
+	seedScope := ls.ownScope
+	if argSc, ok := vetssa.CombinedScope(ls.borrowed, rc.UserArgs...); ok {
+		seedScope = vetssa.TightenScope(seedScope, argSc)
+	}
 	switch t := tgt.(type) {
 	case *ssa.MakeClosure:
 		fn, ok := t.Fn.(*ssa.Function)
@@ -214,15 +259,32 @@ func (ls *leaseScope) auditInvokedTarget(callInst ssa.CallInstruction, rc vetssa
 		}
 		seeds, captured := vetssa.CollectCallSeeds(rc, ls.borrowed, len(fn.Params), nil), vetssa.CollectCaptured(t, fn, ls.borrowed)
 		if len(seeds) > 0 || len(captured) > 0 {
-			ls.eng.auditFunc(fn, seeds, captured, ls.ownScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
+			ls.eng.auditFunc(fn, seeds, collectCallSecretParams(rc, ls.borrowed, fn), captured, seedScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 		}
 	case *ssa.Function:
 		if t.Parent() != nil && !vetssa.IsBoundWrapper(t) && !vetssa.IsYieldFunc(t) {
 			if seeds := vetssa.CollectCallSeeds(rc, ls.borrowed, len(t.Params), nil); len(seeds) > 0 {
-				ls.eng.auditFunc(t, seeds, nil, ls.ownScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
+				ls.eng.auditFunc(t, seeds, collectCallSecretParams(rc, ls.borrowed, t), nil, seedScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 			}
 		}
 	}
+}
+
+// collectCallSecretParams 按调用实参槽位计算内联 IIFE 各形参是否同时具备 SecretOnly=true 与明文参数类型。
+func collectCallSecretParams(rc vetssa.ResolvedCall, scoped map[ssa.Value]vetssa.ScopeRange, target *ssa.Function) map[int]bool {
+	var out map[int]bool
+	for i, arg := range rc.UserArgs {
+		if target == nil || i >= len(target.Params) {
+			break
+		}
+		if sc, ok := scoped[arg]; ok && sc.SecretOnly && vetssa.IsPlainSecretParamType(target.Params[i].Type()) {
+			if out == nil {
+				out = make(map[int]bool)
+			}
+			out[i] = true
+		}
+	}
+	return out
 }
 
 func (ls *leaseScope) auditSyncClosureArgRec(callInst ssa.CallInstruction, arg ssa.Value) {
@@ -249,7 +311,7 @@ func (ls *leaseScope) auditSingleSyncClosureTarget(callInst ssa.CallInstruction,
 	fn, ok := mc.Fn.(*ssa.Function)
 	if ok && fn != nil && !vetssa.IsYieldFunc(fn) && !vetssa.IsBoundWrapper(fn) {
 		if captured := vetssa.CollectCaptured(mc, fn, ls.borrowed); len(captured) > 0 {
-			ls.eng.auditFunc(fn, nil, captured, ls.ownScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
+			ls.eng.auditFunc(fn, nil, nil, captured, ls.ownScope, ls.depth+1, ls.borrowed, ls.namedResAllocs, callInst)
 		}
 	}
 }
@@ -278,11 +340,11 @@ func (ls *leaseScope) checkSingleClosureArg(callInst ssa.CallInstruction, arg ss
 }
 
 func (ls *leaseScope) auditSamePkgBorrowedHelperCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall) {
-	if rc.TargetFn == nil || len(rc.TargetFn.Blocks) == 0 || vetssa.IsBoundWrapper(rc.TargetFn) {
+	if rc.TargetFn == nil || len(rc.TargetFn.Blocks) == 0 || vetssa.IsBoundWrapper(rc.TargetFn) || rc.TargetFn.Parent() != nil {
 		return
 	}
 	if seeds := vetssa.CollectCallSeeds(rc, ls.borrowed, len(rc.TargetFn.Params), func(v ssa.Value) bool { return !ls.isBorrowedFuncValue(v) }); len(seeds) > 0 {
-		ls.eng.auditFunc(rc.TargetFn, seeds, nil, vetssa.ScopeRangeOfFunc(rc.TargetFn), ls.depth+1, nil, nil, callInst)
+		ls.eng.auditFunc(rc.TargetFn, seeds, nil, nil, vetssa.ScopeRangeOfFunc(rc.TargetFn), ls.depth+1, nil, nil, callInst)
 	}
 }
 
