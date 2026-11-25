@@ -5,16 +5,15 @@ package osfs
 import (
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
+	"golang.org/x/sys/unix"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"syscall"
-
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
-	"golang.org/x/sys/unix"
 )
 
 func localPathToNativeOS(kind pathalg.LocalPathKind, raw string) (string, error) {
@@ -24,7 +23,6 @@ func localPathToNativeOS(kind pathalg.LocalPathKind, raw string) (string, error)
 	return raw, nil
 }
 func unlockFileOS(f *os.File) error { return flockFileUnix(f, unix.LOCK_UN) }
-
 func openLeafInRootOS(root *os.Root, dest pathalg.LocalRootedDest, op rootLeafOp, perm fs.FileMode) (*os.File, error) {
 	flags := [7]int{
 		unix.O_RDONLY | unix.O_NONBLOCK, unix.O_RDWR | unix.O_CREAT | unix.O_EXCL,
@@ -34,7 +32,6 @@ func openLeafInRootOS(root *os.Root, dest pathalg.LocalRootedDest, op rootLeafOp
 	}
 	return openLeafInRootUnix(root, dest, flags[op], perm)
 }
-
 func openatNoFollow(dirFD int, name string, flags int, mode uint32) (int, error) {
 	for {
 		fd, err := unix.Openat(dirFD, name, flags, mode)
@@ -76,7 +73,6 @@ func stepDirChainUnix(baseF *os.File, segs []string, createMode fs.FileMode, fn 
 	runtime.KeepAlive(baseF)
 	return err
 }
-
 func ensureDirOS(nativeDir string, mode fs.FileMode) error { return ensureDirRawUnix(nativeDir, mode) }
 
 // ensureDirRawUnix 在 Unix 上逐段以 Mkdirat + O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC 安全创建目录，
@@ -105,7 +101,6 @@ func ensureDirRawUnix(nativeDir string, mode fs.FileMode) error {
 	slices.Reverse(missing)
 	return stepDirChainUnix(baseF, missing, mode, nil)
 }
-
 func walkExistingAncestorUnix(target string) (string, []string, error) {
 	var missing []string
 	for cur := target; ; {
@@ -131,7 +126,6 @@ func withParentDirFDUnix(root *os.Root, parentSegs []string, fn func(parentFD in
 	defer func() { _ = rootF.Close() }()
 	return stepDirChainUnix(rootF, parentSegs, 0, fn)
 }
-
 func openLeafInRootUnix(root *os.Root, dest pathalg.LocalRootedDest, flags int, mode fs.FileMode) (*os.File, error) {
 	segs, fd := dest.Segments(), -1
 	if err := withParentDirFDUnix(root, segs[:len(segs)-1], func(parentFD int) (oErr error) {
@@ -146,7 +140,6 @@ func openLeafInRootUnix(root *os.Root, dest pathalg.LocalRootedDest, flags int, 
 	}
 	return os.NewFile(uintptr(fd), dest.String()), nil
 }
-
 func verifyRegularFDUnix(fd int, rel string, clearNonblock bool) error {
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
@@ -160,11 +153,9 @@ func verifyRegularFDUnix(fd int, rel string, clearNonblock bool) error {
 	}
 	return nil
 }
-
 func mkdirSegmentInRootOS(root *os.Root, parentSegs []string, leaf string, mode fs.FileMode) error {
 	return withParentDirFDUnix(root, parentSegs, func(parentFD int) error { return mapUnixOpenError(unix.Mkdirat(parentFD, leaf, uint32(mode.Perm()))) })
 }
-
 func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.File, int64, error) {
 	flags := os.O_RDONLY | unix.O_NONBLOCK
 	switch policy {
@@ -185,7 +176,6 @@ func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.Fi
 	}
 	return f, st.Size(), nil
 }
-
 func mapUnixDirOpenError(dirFD int, name string, err error) error {
 	var st unix.Stat_t
 	if errors.Is(err, unix.ENOTDIR) && unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
@@ -193,7 +183,6 @@ func mapUnixDirOpenError(dirFD int, name string, err error) error {
 	}
 	return mapUnixOpenError(err)
 }
-
 func mapUnixOpenError(err error) error {
 	switch {
 	case err == nil:
@@ -206,7 +195,6 @@ func mapUnixOpenError(err error) error {
 		return mapOSError(err)
 	}
 }
-
 func flockFileUnix(f *os.File, how int) error {
 	rawConn, err := f.SyscallConn()
 	if err != nil {
@@ -224,7 +212,6 @@ func flockFileUnix(f *os.File, how int) error {
 	}
 	return lockErr
 }
-
 func tryLockFileOS(f *os.File, exclusive bool) error {
 	err := flockFileUnix(f, pickIf(exclusive, unix.LOCK_EX|unix.LOCK_NB, unix.LOCK_SH|unix.LOCK_NB))
 	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
@@ -232,7 +219,6 @@ func tryLockFileOS(f *os.File, exclusive bool) error {
 	}
 	return mapOSError(err)
 }
-
 func syncRootParentDirOS(root *os.Root, dest pathalg.LocalRootedDest) error {
 	parentRel := "."
 	if parent, ok := dest.Parent(); ok {

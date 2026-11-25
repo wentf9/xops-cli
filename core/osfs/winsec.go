@@ -1,11 +1,10 @@
 package osfs
 
 import (
+	"github.com/wentf9/xops-cli/core/domain/security"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
 // Win32LongPathThreshold 是触发 Win32 扩展长路径前缀（\\?\ 与 \\?\UNC\）的 UTF-16 码元阈值（INV-A4）。
@@ -13,26 +12,14 @@ const Win32LongPathThreshold = 248
 
 // Win32 DACL 与文件属性位常量（跨平台纯数学副本）。
 const (
-	WinAttrDirectory      uint32 = 0x00000010
-	WinAttrDevice         uint32 = 0x00000040
-	WinAttrReparsePoint   uint32 = 0x00000400
-	WinACEFlagInheritOnly uint8  = 0x08
-	WinACETypeAllow       uint8  = 0x00
-	WinACETypeDeny        uint8  = 0x01
-	WinAccessWriteData    uint32 = 0x00000002
-	WinAccessAppendData   uint32 = 0x00000004
-	WinAccessWriteEA      uint32 = 0x00000010
-	WinAccessDeleteChild  uint32 = 0x00000040 // WinSDK winnt.h FILE_DELETE_CHILD（目录删除子项权限）
-	WinAccessWriteAttrs   uint32 = 0x00000100
-	WinAccessDelete       uint32 = 0x00010000
-	WinAccessWriteDAC     uint32 = 0x00040000
-	WinAccessWriteOwner   uint32 = 0x00080000
-	WinAccessGenericAll   uint32 = 0x10000000
-	WinAccessGenericWrite uint32 = 0x40000000
-
-	winMutatingMask uint32 = WinAccessWriteData | WinAccessAppendData | WinAccessWriteEA | WinAccessDeleteChild |
-		WinAccessWriteAttrs | WinAccessDelete | WinAccessWriteDAC | WinAccessWriteOwner |
-		WinAccessGenericAll | WinAccessGenericWrite
+	WinAttrDirectory, WinAttrDevice, WinAttrReparsePoint                         uint32 = 0x10, 0x40, 0x400
+	WinACEFlagInheritOnly, WinACETypeAllow, WinACETypeDeny                       uint8  = 0x08, 0x00, 0x01
+	WinAccessWriteData, WinAccessAppendData, WinAccessWriteEA                    uint32 = 0x02, 0x04, 0x10
+	WinAccessDeleteChild                                                         uint32 = 0x40 // WinSDK winnt.h FILE_DELETE_CHILD（目录删除子项权限）
+	WinAccessWriteAttrs, WinAccessDelete, WinAccessWriteDAC, WinAccessWriteOwner uint32 = 0x100, 0x10000, 0x40000, 0x80000
+	WinAccessGenericAll, WinAccessGenericWrite                                   uint32 = 0x10000000, 0x40000000
+	winMutatingMask                                                              uint32 = WinAccessWriteData | WinAccessAppendData | WinAccessWriteEA | WinAccessDeleteChild |
+		WinAccessWriteAttrs | WinAccessDelete | WinAccessWriteDAC | WinAccessWriteOwner | WinAccessGenericAll | WinAccessGenericWrite
 )
 
 // WindowsACLMode 区分 Windows DACL 安全评估策略；零值 WindowsACLInvalid 严格失败关闭。
@@ -75,7 +62,6 @@ func EvaluateWindowsObjectACL(in WindowsACLInput) security.Verdict {
 	}
 	return security.VerdictAllow
 }
-
 func isSafeWin32ObjectAttrs(attrs uint32, expectDir, allowReparse bool) bool {
 	return attrs&WinAttrDevice == 0 && (allowReparse || attrs&WinAttrReparsePoint == 0) && (attrs&WinAttrDirectory != 0) == expectDir
 }
@@ -112,8 +98,8 @@ func stripWin32LongPathPrefix(p string) string {
 }
 
 // NormalizeWin32LongPath 在有效路径长度 >= 248 UTF-16 码元时补齐 \\?\ 或 \\?\UNC\ 前缀（INV-A4）。
-func NormalizeWin32LongPath(path string) string {
-	return normalizeWin32LongPathWithResolver(path, filepath.Abs, os.Getwd)
+func NormalizeWin32LongPath(p string) string {
+	return normalizeWin32LongPathWithResolver(p, filepath.Abs, os.Getwd)
 }
 func normalizeWin32LongPathWithResolver(path string, fullPath func(string) (string, error), getwd func() (string, error)) string {
 	if path == "" || IsExtendedOrDeviceWindowsPath(path) {
@@ -136,11 +122,8 @@ func resolveWin32LongFullPath(path, pre string, fullPath func(string) (string, e
 	if err != nil || resolved == "" {
 		return ""
 	}
-	if isAbsWinPath(resolved) || IsExtendedOrDeviceWindowsPath(resolved) {
-		return resolved
-	}
 	// 非 Windows 宿主上 filepath.Abs 会拼 POSIX cwd，保留原 Windows 绝对路径。
-	return pickIf(isAbsWinPath(path), path, "")
+	return pickIf(isAbsWinPath(resolved) || IsExtendedOrDeviceWindowsPath(resolved), resolved, pickIf(isAbsWinPath(path), path, ""))
 }
 func measureEffectiveWin32PathLen(path string, fullPath func(string) (string, error), getwd func() (string, error)) (string, int, error) {
 	if isDriveRelativeWinPath(path) {

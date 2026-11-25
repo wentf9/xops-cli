@@ -8,18 +8,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
 	"io/fs"
 	"os"
 	"slices"
-
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
 )
 
-const (
-	defaultFilePerm fs.FileMode = 0o600
-	defaultDirPerm  fs.FileMode = 0o700
-)
+const defaultFilePerm, defaultDirPerm fs.FileMode = 0o600, 0o700
 
 // rootLeafOp 标识沙箱根内打开常规叶文件的跨平台操作意图（供各平台 openLeafInRootOS 统一分发）。
 type rootLeafOp uint8
@@ -48,6 +44,7 @@ func pickIf[T any](ok bool, yes, no T) T {
 	}
 	return no
 }
+func orZero[T any](ok bool, v T) T { return pickIf(ok, v, zeroVal[T]()) }
 
 // mapOSError 将标准库 OS 错误归一化包装为 ports 规范哨兵错误并保留底层错误链。
 func mapOSError(err error) error {
@@ -64,37 +61,32 @@ func mapOSError(err error) error {
 	}
 	return err
 }
-
 func isAlreadyNormalizedError(err error) bool {
-	norm := [...]error{
+	return slices.ContainsFunc([]error{
 		ports.ErrNotFound, ports.ErrAlreadyExists, ports.ErrPermissionDenied, ports.ErrNotRegularFile,
 		ports.ErrSymlinkRejected, ports.ErrLimitExceeded, ports.ErrLockBusy, ports.ErrHandleExpired,
 		ports.ErrInvalidArgument, ports.ErrUnsupported, context.Canceled, context.DeadlineExceeded,
-	}
-	return slices.ContainsFunc(norm[:], func(t error) bool { return errors.Is(err, t) })
+	}, func(t error) bool { return errors.Is(err, t) })
 }
-
-func sanitizeFilePerm(perm, fallback fs.FileMode) fs.FileMode {
-	return pickIf(perm.Perm() != 0, perm.Perm(), fallback)
-}
+func sanitizeFilePerm(p, fb fs.FileMode) fs.FileMode { return pickIf(p.Perm() != 0, p.Perm(), fb) }
 func fileInfoToLocalFileInfo(name string, fi os.FileInfo) (ports.LocalFileInfo, error) {
 	if fi == nil {
 		return zeroVal[ports.LocalFileInfo](), fmt.Errorf("%w: FileInfo 为空", ports.ErrInvalidArgument)
 	}
 	return ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: name, Size: fi.Size(), Mode: fi.Mode(), ModTime: fi.ModTime()})
 }
-func randomHexToken(nBytes int) (string, error) {
-	buf := make([]byte, nBytes)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("osfs: 生成随机后缀失败: %w", err)
-	}
-	return hex.EncodeToString(buf), nil
-}
 func siblingDest(dest pathalg.LocalRootedDest, name string) (pathalg.LocalRootedDest, error) {
 	if parent, ok := dest.Parent(); ok {
 		return parent.JoinComponent(name)
 	}
 	return pathalg.ParseLocalRootedDest(name)
+}
+func randomHexToken(n int) (string, error) {
+	buf := make([]byte, n)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("osfs: 生成随机后缀失败: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
 }
 func makeTempDestInSameDir(dest pathalg.LocalRootedDest) (pathalg.LocalRootedDest, error) {
 	tok, err := randomHexToken(8)

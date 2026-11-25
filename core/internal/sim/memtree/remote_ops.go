@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"io/fs"
 	"strings"
+	"time"
 
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -89,8 +89,11 @@ func (t *Tree) WriteRemoteChunkLocked(rawKey string, offset int64, chunk []byte)
 	return nil
 }
 
-// RenameRemoteLocked 执行远端 POSIX 原子重命名（支持可选锚点校验与目录子树迁移）。
-func (t *Tree) RenameRemoteLocked(rawOld, rawNew string, expectedAnchor algebraic.Option[ports.RemoteFileAnchor]) error {
+// RenameRemoteLocked 执行远端 POSIX 原子重命名（支持 RemoteRenameSpec 的互斥 NoClobber/ExpectedAnchor 校验与目录子树迁移）。
+func (t *Tree) RenameRemoteLocked(rawOld, rawNew string, spec ports.RemoteRenameSpec) error {
+	if !spec.IsValid() {
+		return ports.ErrInvalidArgument
+	}
 	oldKey, e1 := t.ResolveParentLocked(rawOld, true, false)
 	newKey, e2 := t.ResolveParentLocked(rawNew, true, false)
 	if err := FirstErr(e1, e2); err != nil {
@@ -103,7 +106,7 @@ func (t *Tree) RenameRemoteLocked(rawOld, rawNew string, expectedAnchor algebrai
 	if src == nil {
 		return ports.ErrNotFound
 	}
-	if err := t.validateRemoteRenameLocked(oldKey, newKey, src, expectedAnchor); err != nil {
+	if err := t.validateRemoteRenameLocked(oldKey, newKey, src, spec); err != nil {
 		return err
 	}
 	if oldKey != newKey {
@@ -112,16 +115,19 @@ func (t *Tree) RenameRemoteLocked(rawOld, rawNew string, expectedAnchor algebrai
 	return nil
 }
 
-func (t *Tree) validateRemoteRenameLocked(oldKey, newKey string, src *Node, expected algebraic.Option[ports.RemoteFileAnchor]) error {
+func (t *Tree) validateRemoteRenameLocked(oldKey, newKey string, src *Node, spec ports.RemoteRenameSpec) error {
 	if src.Kind == ports.RemoteFileDir && strings.HasPrefix(newKey, oldKey+"/") {
 		return ports.ErrInvalidArgument
 	}
-	if anc, ok := expected.Get(); ok {
+	dst := t.Nodes[newKey]
+	if spec.NoClobber() && dst != nil && oldKey != newKey {
+		return ports.ErrAlreadyExists
+	}
+	if anc, ok := spec.ExpectedAnchor().Get(); ok {
 		if err := t.VerifyAnchorLocked(newKey, anc); err != nil {
 			return err
 		}
 	}
-	dst := t.Nodes[newKey]
 	switch {
 	case dst == nil || oldKey == newKey:
 		return nil
@@ -142,5 +148,58 @@ func (t *Tree) ChmodRemoteLocked(key string, perm fs.FileMode) error {
 	}
 	node.Mode = (node.Mode &^ fs.ModePerm) | perm
 	node.ModTime = t.Now()
+	return nil
+}
+
+// ChtimesRemoteLocked 校验合法 RFC 3339 时间戳并更新远端对象修改时间（支撑 scp -p）。
+func (t *Tree) ChtimesRemoteLocked(key string, atime, mtime time.Time) error {
+	if !isValidRFC3339Time(atime) || !isValidRFC3339Time(mtime) {
+		return ports.ErrInvalidArgument
+	}
+	_, node, err := t.WalkPathLocked(key, true, true, false)
+	if err != nil {
+		return err
+	}
+	node.ModTime = mtime.UTC().Round(0)
+	return nil
+}
+
+// RemoveRemoteFileLocked 仅删除远端常规文件或符号链接；若目标为目录则返回 ports.ErrRemoteIsDir。
+func (t *Tree) RemoveRemoteFileLocked(abs string) error {
+	if abs == "/" {
+		return ports.ErrRemoteIsDir
+	}
+	key, err := t.ResolveParentLocked(abs, true, false)
+	if err != nil {
+		return err
+	}
+	node := t.Nodes[key]
+	if node == nil {
+		return ports.ErrNotFound
+	}
+	if node.Kind == ports.RemoteFileDir {
+		return ports.ErrRemoteIsDir
+	}
+	delete(t.Nodes, key)
+	return nil
+}
+
+// RemoveRemoteDirLocked 仅删除远端空目录（SFTP SSH_FXP_RMDIR）；非目录或非空目录返回 ports.ErrInvalidArgument。
+func (t *Tree) RemoveRemoteDirLocked(abs string) error {
+	if abs == "/" {
+		return ports.ErrPermissionDenied
+	}
+	key, err := t.ResolveParentLocked(abs, true, false)
+	if err != nil {
+		return err
+	}
+	node := t.Nodes[key]
+	if node == nil {
+		return ports.ErrNotFound
+	}
+	if node.Kind != ports.RemoteFileDir || t.HasChildrenLocked(key) {
+		return ports.ErrInvalidArgument
+	}
+	delete(t.Nodes, key)
 	return nil
 }

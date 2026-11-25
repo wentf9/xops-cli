@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/ports"
 	"net"
 	"os"
 	"sync/atomic"
 	"time"
-
-	"github.com/wentf9/xops-cli/core/ports"
 )
 
 const defaultSocketProbeTimeout = 2 * time.Second
@@ -58,11 +57,11 @@ func (c PeerCred) PID() (uint32, bool)            { return credUint32(c.valid &&
 func (c PeerCred) Equal(o PeerCred) bool          { return c.valid && o.valid && c == o }
 
 // QueryUnixPeerCred / VerifyUnixPeerCurrentUser 通过内核套接字选项查询或强校验对端身份（fail-closed）。
-func QueryUnixPeerCred(conn *net.UnixConn) (PeerCred, error) {
-	return runPeerCredControl(conn, queryPeerCredFD)
+func QueryUnixPeerCred(c *net.UnixConn) (PeerCred, error) {
+	return runPeerCredControl(c, queryPeerCredFD)
 }
-func VerifyUnixPeerCurrentUser(conn *net.UnixConn) (PeerCred, error) {
-	return runPeerCredControl(conn, verifyPeerCurrentUserFD)
+func VerifyUnixPeerCurrentUser(c *net.UnixConn) (PeerCred, error) {
+	return runPeerCredControl(c, verifyPeerCurrentUserFD)
 }
 
 //xops:syncclosure
@@ -131,13 +130,14 @@ func verifyUnixConnPeer(conn *net.UnixConn, err error) (*net.UnixConn, PeerCred,
 	return conn, cred, nil
 }
 func validateSocketCtxPath(ctx context.Context, path ControlSocketPath) error {
-	if ctx == nil {
+	switch {
+	case ctx == nil:
 		return ports.ErrNilContext
-	}
-	if !path.IsValid() {
+	case !path.IsValid():
 		return fmt.Errorf("%w: 无效控制套接字路径", ErrInvalidControlPath)
+	default:
+		return ctx.Err()
 	}
-	return ctx.Err()
 }
 
 // WithSocketSlot 在目录锁保护下独占绑定本地 AF_UNIX 套接字并在同步闭包内借出 SocketSlot；
@@ -172,7 +172,6 @@ func WithSocketSlot(ctx context.Context, path ControlSocketPath, opts SocketSlot
 	}()
 	return fn(slot)
 }
-
 func releaseSocketSlot(path ControlSocketPath, origID socketFileID, uln *net.UnixListener) error {
 	var unlinkErr, closeErr error
 	closed := false
@@ -209,14 +208,13 @@ func ProbeStaleUnixSocket(ctx context.Context, path ControlSocketPath) (SocketPr
 	defer cancel()
 	var dialer net.Dialer
 	conn, dialErr := dialer.DialUnix(probeCtx, "unix", nil, &net.UnixAddr{Net: "unix", Name: path.NativePath()})
-	if dialErr == nil {
+	switch {
+	case dialErr == nil:
 		_ = conn.Close()
 		return SocketProbeLive, nil
-	}
-	if errors.Is(dialErr, os.ErrNotExist) {
+	case errors.Is(dialErr, os.ErrNotExist):
 		return SocketProbeMissing, nil
-	}
-	if !isConnRefusedOS(dialErr) {
+	case !isConnRefusedOS(dialErr):
 		return SocketProbeUnknown, dialErr
 	}
 	currID, status, err := inspectSocketEntryOS(path.NativePath())
@@ -256,7 +254,6 @@ func DialUnixVerified(ctx context.Context, path ControlSocketPath) (*net.UnixCon
 	var dialer net.Dialer
 	return verifyUnixConnPeer(dialer.DialUnix(ctx, "unix", nil, &net.UnixAddr{Net: "unix", Name: path.NativePath()}))
 }
-
 func prepareSocketSlotLocked(ctx context.Context, path ControlSocketPath, replaceStale bool) error {
 	origID, status, err := inspectSocketEntryOS(path.NativePath())
 	if err != nil || status == SocketProbeMissing {
@@ -277,7 +274,6 @@ func prepareSocketSlotLocked(ctx context.Context, path ControlSocketPath, replac
 	}
 	return unlinkSameSocket(path.NativePath(), origID)
 }
-
 func listenUnixNoAutoUnlink(ctx context.Context, addr string) (*net.UnixListener, error) {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "unix", addr)
@@ -292,17 +288,13 @@ func listenUnixNoAutoUnlink(ctx context.Context, addr string) (*net.UnixListener
 	uln.SetUnlinkOnClose(false)
 	return uln, nil
 }
-
 func pruneLockedSocketEntry(ctx context.Context, path ControlSocketPath) (SocketProbeStatus, error) {
-	origID, preStatus, preErr := inspectSocketEntryOS(path.NativePath())
-	if preErr != nil || preStatus != SocketProbeUnknown {
-		return preStatus, preErr
-	}
-	if probed, err := ProbeStaleUnixSocket(ctx, path); err != nil || probed != SocketProbeStale {
-		return probed, err
-	}
-	if err := unlinkSameSocket(path.NativePath(), origID); err != nil {
-		return SocketProbeUnknown, err
+	if origID, st, err := inspectSocketEntryOS(path.NativePath()); err != nil || st != SocketProbeUnknown {
+		return st, err
+	} else if probed, pErr := ProbeStaleUnixSocket(ctx, path); pErr != nil || probed != SocketProbeStale {
+		return probed, pErr
+	} else if uErr := unlinkSameSocket(path.NativePath(), origID); uErr != nil {
+		return SocketProbeUnknown, uErr
 	}
 	return SocketProbeStale, nil
 }
@@ -310,14 +302,11 @@ func unlinkSameSocket(target string, origID socketFileID) error {
 	if target == "" {
 		return nil
 	}
-	currID, status, err := inspectSocketEntryOS(target)
-	if err != nil || status != SocketProbeUnknown || !sameSocketFileID(origID, currID) {
+	if currID, status, err := inspectSocketEntryOS(target); err != nil || status != SocketProbeUnknown || !sameSocketFileID(origID, currID) {
 		return err
 	}
-	if rmErr := os.Remove(target); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
-		return mapOSError(rmErr)
-	}
-	return nil
+	err := os.Remove(target)
+	return pickIf[error](err == nil || errors.Is(err, os.ErrNotExist), nil, mapOSError(err))
 }
 func cleanupSocketBind(uln *net.UnixListener, addr string, err error) error {
 	_ = uln.Close()
@@ -325,12 +314,11 @@ func cleanupSocketBind(uln *net.UnixListener, addr string, err error) error {
 	return err
 }
 func closeUnixListenerSafe(uln *net.UnixListener) error {
-	if uln != nil {
-		if err := uln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			return err
-		}
+	if uln == nil {
+		return nil
 	}
-	return nil
+	err := uln.Close()
+	return pickIf[error](errors.Is(err, net.ErrClosed), nil, err)
 }
 
 type borrowedUnixListener struct {

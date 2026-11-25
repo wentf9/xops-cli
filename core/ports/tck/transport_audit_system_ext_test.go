@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"slices"
 	"strings"
@@ -243,14 +244,34 @@ func (memMuxSocket) Control(ctx context.Context, req ports.MuxControlRequest) (p
 	}
 	return ports.NewMuxControlResponse(true, 1024, req.Action().String())
 }
-func (memMuxSocket) DialMux(ctx context.Context, p pathalg.LocalSourcePath) (ports.TransportConn, error) {
+func (memMuxSocket) DialMux(ctx context.Context, p pathalg.LocalSourcePath, dig plan.HopDigest, ep netaddr.Endpoint) (ports.TransportConn, error) {
+	if ctx == nil {
+		return nil, ports.ErrNilContext
+	}
+	if !p.IsValid() || !dig.IsValid() || !ep.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	c := &memTransportConn{digest: dig, endpoint: ep}
+	c.alive.Store(true)
+	return c, nil
+}
+func (memMuxSocket) OpenProxy(ctx context.Context, p pathalg.LocalSourcePath) (net.Conn, error) {
 	if ctx == nil {
 		return nil, ports.ErrNilContext
 	}
 	if !p.IsValid() {
 		return nil, ports.ErrInvalidArgument
 	}
-	return nil, ports.ErrUnsupported
+	return &memEchoConn{}, nil
+}
+func (memMuxSocket) Serve(ctx context.Context, ln net.Listener, up ports.TransportConn, _ ports.ForwarderPort) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	if ln == nil || up == nil {
+		return ports.ErrInvalidArgument
+	}
+	return ports.ErrUnsupported
 }
 func (memMuxSocket) WithListener(ctx context.Context, socketPath pathalg.LocalSourcePath, fn func(ln net.Listener) error) error {
 	if ctx == nil {
@@ -268,9 +289,10 @@ func (memMuxSocket) WithListener(ctx context.Context, socketPath pathalg.LocalSo
 }
 
 type memRemoteFile struct {
-	data []byte
-	mode fs.FileMode
-	ino  uint64
+	data    []byte
+	mode    fs.FileMode
+	ino     uint64
+	modTime time.Time
 }
 
 type memRemoteFS struct {
@@ -307,8 +329,12 @@ func (r *memRemoteFS) Stat(ctx context.Context, p pathalg.RemotePath) (ports.Rem
 		if err != nil {
 			return zero[ports.RemoteFileStat](), err
 		}
+		mt := f.modTime
+		if mt.IsZero() {
+			mt = tck.BaseTime()
+		}
 		return ports.NewRemoteFileStat(ports.RemoteFileStatSpec{
-			Path: p, Size: int64(len(f.data)), Mode: f.mode, ModTime: tck.BaseTime(), Anchor: anc,
+			Path: p, Size: int64(len(f.data)), Mode: f.mode, ModTime: mt, Anchor: anc,
 		})
 	}
 	return zero[ports.RemoteFileStat](), ports.ErrNotFound
@@ -482,9 +508,29 @@ func (r *memRemoteFS) WriteChunk(ctx context.Context, p pathalg.RemotePath, offs
 	r.files[p.String()] = f
 	return nil
 }
-func (r *memRemoteFS) RenameAtomic(ctx context.Context, oldP, newP pathalg.RemotePath, expected algebraic.Option[ports.RemoteFileAnchor]) error {
+func (r *memRemoteFS) Chtimes(ctx context.Context, p pathalg.RemotePath, atime, mtime time.Time) error {
 	if ctx == nil {
 		return ports.ErrNilContext
+	}
+	if !p.IsValid() || !isValidMemRFC3339(atime) || !isValidMemRFC3339(mtime) {
+		return ports.ErrInvalidArgument
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f, ok := r.files[p.String()]
+	if !ok {
+		return ports.ErrNotFound
+	}
+	f.modTime = mtime.UTC()
+	r.files[p.String()] = f
+	return nil
+}
+func (r *memRemoteFS) RenameAtomic(ctx context.Context, oldP, newP pathalg.RemotePath, spec ports.RemoteRenameSpec) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	if !oldP.IsValid() || !newP.IsValid() || !spec.IsValid() {
+		return ports.ErrInvalidArgument
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -492,8 +538,11 @@ func (r *memRemoteFS) RenameAtomic(ctx context.Context, oldP, newP pathalg.Remot
 	if !ok {
 		return ports.ErrNotFound
 	}
-	if want, hasWant := expected.Get(); hasWant {
-		existing, exists := r.files[newP.String()]
+	existing, exists := r.files[newP.String()]
+	if spec.NoClobber() && exists {
+		return ports.ErrAlreadyExists
+	}
+	if want, hasWant := spec.ExpectedAnchor().Get(); hasWant {
 		if !exists {
 			return ports.ErrRemoteAnchorMismatch
 		}
@@ -521,10 +570,43 @@ func (r *memRemoteFS) Remove(ctx context.Context, p pathalg.RemotePath) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.dirs[p.String()] {
+		return ports.ErrRemoteIsDir
+	}
 	if _, ok := r.files[p.String()]; !ok {
 		return ports.ErrNotFound
 	}
 	delete(r.files, p.String())
+	return nil
+}
+func (r *memRemoteFS) RemoveDir(ctx context.Context, dir pathalg.RemotePath) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	if !dir.IsValid() {
+		return ports.ErrInvalidArgument
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	k := dir.String()
+	if _, isFile := r.files[k]; isFile {
+		return ports.ErrInvalidArgument
+	}
+	if !r.dirs[k] {
+		return ports.ErrNotFound
+	}
+	prefix := strings.TrimRight(k, "/") + "/"
+	for fk := range r.files {
+		if strings.HasPrefix(fk, prefix) {
+			return ports.ErrInvalidArgument
+		}
+	}
+	for dk := range r.dirs {
+		if dk != k && strings.HasPrefix(dk, prefix) {
+			return ports.ErrInvalidArgument
+		}
+	}
+	delete(r.dirs, k)
 	return nil
 }
 func (r *memRemoteFS) Close() error { return nil }
@@ -597,6 +679,10 @@ func (a *memAuditSystem) Record(ctx context.Context, entry ports.AuditEntry) err
 func (a *memAuditSystem) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.live && len(a.staged) > 0 {
+		a.deadLock = true
+		a.deadOps = slices.Collect(maps.Keys(a.staged))
+	}
 	a.live = false
 	clear(a.staged)
 	return nil
@@ -909,7 +995,29 @@ func (m memInteractionPort) PromptSecret(ctx context.Context, req ports.SecretPr
 	})
 }
 
+type memTUNDevicePort struct{ allow bool }
+
+func (d memTUNDevicePort) OpenLocalTUN(ctx context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, string, error) {
+	if ctx == nil {
+		return nil, "", ports.ErrNilContext
+	}
+	if !spec.IsValid() {
+		return nil, "", ports.ErrInvalidArgument
+	}
+	if !d.allow {
+		return nil, "", ports.ErrPermissionDenied
+	}
+	if spec.Mode() == ports.TUNModeEthernet {
+		return &memEchoConn{}, "tap0", nil
+	}
+	return &memEchoConn{}, "tun0", nil
+}
+
 func TestTCKTransportAuditAndSystemSuites(t *testing.T) {
+	tck.RunTUNDeviceSuite(t, tck.TUNDeviceFixture{
+		NewDevice:            func(*testing.T) ports.TUNDevicePort { return memTUNDevicePort{allow: true} },
+		NewUnavailableDevice: func(*testing.T) ports.TUNDevicePort { return memTUNDevicePort{allow: false} },
+	})
 	tck.RunDialerSuite(t, tck.DialerFixture{
 		NewDialer:             func(*testing.T) ports.DialerPort { return memDialer{} },
 		CheckMultiHop:         true,

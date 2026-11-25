@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -48,6 +49,8 @@ func TestBorrowedHandleExpirySentinels(t *testing.T) {
 	assertHandleExpired(t, "rootHandle.ReadDir", err)
 	assertHandleExpired(t, "rootHandle.MkdirAll", r.MkdirAll(dest, 0o700))
 	assertHandleExpired(t, "rootHandle.CreateSymlink", r.CreateSymlink(dest, "target"))
+	ts := time.Unix(1700000000, 0).UTC()
+	assertHandleExpired(t, "rootHandle.Chtimes", r.Chtimes(dest, ts, ts))
 	assertHandleExpired(t, "rootHandle.Remove", r.Remove(dest))
 
 	var buf [4]byte

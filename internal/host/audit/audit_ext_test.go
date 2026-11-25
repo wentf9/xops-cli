@@ -450,3 +450,55 @@ func TestReconcileRejectsNonRegularLockEntry(t *testing.T) {
 		t.Fatalf("非常规 .lock 对象对账 = %v, 期望 ErrNotRegularFile", err)
 	}
 }
+
+// TestCloseWithUnclosedOpsPreservesLockAndReconciles 验证存在未闭合操作时 Close() 不得截断或删除 .lock，
+// 确保 Halted 熔断关闭后下次启动 FileReconciler 能够抢占该残留锁并补写 AbortedByCrash（ADR-008）。
+func TestCloseWithUnclosedOpsPreservesLockAndReconciles(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	dir, rootDir := newPrivateAuditRoot(t)
+	fsPort := osfs.NewScopedRootFS()
+	ent := tck.NewDeterministicEntropy(97)
+
+	sink, err := audit.NewFileSinkFromEntropy(fsPort, rootDir, ent)
+	if err != nil {
+		t.Fatalf("NewFileSinkFromEntropy 失败: %v", err)
+	}
+	procID := sink.ProcessInstanceID()
+	traceID, _ := security.NewTraceIDFrom(ent)
+	opID, _ := security.NewOperationIDFrom(ent)
+	if err := sink.StageOperation(ctx, opID); err != nil {
+		t.Fatalf("StageOperation 失败: %v", err)
+	}
+	if err := sink.Record(ctx, tck.MustAuditEntry(t, procID, traceID, opID, ports.AuditPhaseAuthorized, ports.AuditOutcomePending)); err != nil {
+		t.Fatalf("Record(Authorized) 失败: %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("存在未闭合操作时 Close 失败: %v", err)
+	}
+
+	lockPath := filepath.Join(dir, "run", procID.String()+".lock")
+	lockBytes, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatalf("未闭合操作 Close 后 .lock 必须保留在磁盘: %v", err)
+	}
+	if !strings.Contains(string(lockBytes), "+"+opID.String()) {
+		t.Fatalf("保留的 .lock 内容缺少未闭合 opID: %q", string(lockBytes))
+	}
+
+	rec, err := audit.NewFileReconciler(audit.ReconcilerSpec{ScopedFS: fsPort, RootDir: rootDir})
+	if err != nil {
+		t.Fatalf("NewFileReconciler 失败: %v", err)
+	}
+	rep, err := rec.ReconcileCrashedAudits(ctx, tck.BaseTime().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("ReconcileCrashedAudits 失败: %v", err)
+	}
+	if rep.DeadLocksClaimed() != 1 || len(rep.AbortedOperations()) != 1 || !rep.AbortedOperations()[0].Equal(opID) {
+		t.Fatalf("崩溃对账报告不符: dead=%d aborted=%v", rep.DeadLocksClaimed(), rep.AbortedOperations())
+	}
+	verifyAbortedLineCount(t, filepath.Join(dir, "audit.jsonl"), procID, opID, 1)
+	if _, statErr := os.Stat(lockPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("对账完成后残留 .lock 应已清理，实际 statErr=%v", statErr)
+	}
+}

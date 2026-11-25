@@ -126,12 +126,38 @@ func TestVaultTransportAndRemoteFSJSONCodecs(t *testing.T) {
 	assertJSONRoundTrip(t, "PTYRequest", pty, `{"term":"xterm"}`, `{"term":"xterm","size":{"cols":80,"rows":24},"extra":1}`)
 
 	fwd, _ := ports.NewForwardSpec(ports.ForwardLocal, "127.0.0.1:8080", "10.0.0.5:80")
-	assertJSONRoundTrip(t, "ForwardSpec(local)", fwd,
+	assertJSONRoundTrip(t, "ForwardSpec(local/tcp)", fwd,
 		`{"direction":"local","bind_addr":"127.0.0.1:8080"}`,
-		`{"direction":"dynamic","bind_addr":"127.0.0.1:1080","target_addr":"bad"}`,
+		`{"direction":"local","bind_addr":"127.0.0.1:8080","target_addr":"10.0.0.5:80"}`,
+		`{"direction":"dynamic","bind_kind":"tcp","bind_addr":"127.0.0.1:1080","target_addr":"bad"}`,
+		`{"direction":"dynamic","bind_kind":"unix","bind_addr":"/tmp/d.sock"}`,
 		`{"direction":"tun","bind_addr":"tun0","target_addr":"tun1"}`,
-		`{"direction":"local","bind_addr":"127.0.0.1:8080","target_addr":"10.0.0.5:80","tun":{"mode":"ethernet","local_unit":0,"remote_unit":0}}`,
+		`{"direction":"local","bind_kind":"tcp","bind_addr":"127.0.0.1:8080","target_kind":"tcp","target_addr":"10.0.0.5:80","tun":{"mode":"ethernet","local_unit":0,"remote_unit":0}}`,
 	)
+	for _, tc := range []struct {
+		name      string
+		dir       ports.ForwardDirection
+		bk, tk    ports.ForwardEndpointKind
+		bind, tgt string
+	}{
+		{"local/unix-unix", ports.ForwardLocal, ports.ForwardEndpointUnix, ports.ForwardEndpointUnix, "/tmp/local.sock", "/run/remote.sock"},
+		{"local/tcp-unix", ports.ForwardLocal, ports.ForwardEndpointTCP, ports.ForwardEndpointUnix, "127.0.0.1:8080", "/run/remote.sock"},
+		{"local/unix-tcp", ports.ForwardLocal, ports.ForwardEndpointUnix, ports.ForwardEndpointTCP, "/tmp/local.sock", "10.0.0.5:80"},
+		{"remote/unix-unix", ports.ForwardRemote, ports.ForwardEndpointUnix, ports.ForwardEndpointUnix, "/run/remote.sock", "/tmp/local.sock"},
+		{"remote/unix-tcp", ports.ForwardRemote, ports.ForwardEndpointUnix, ports.ForwardEndpointTCP, "/run/remote.sock", "127.0.0.1:3000"},
+		{"remote/tcp-unix", ports.ForwardRemote, ports.ForwardEndpointTCP, ports.ForwardEndpointUnix, "0.0.0.0:9090", "/tmp/local.sock"},
+	} {
+		sp, sErr := ports.NewTypedForwardSpec(tc.dir, tc.bk, tc.bind, tc.tk, tc.tgt)
+		if sErr != nil || sp.BindKind() != tc.bk || sp.TargetKind() != tc.tk {
+			t.Fatalf("NewTypedForwardSpec(%s) 失败: (%v, %v)", tc.name, sp, sErr)
+		}
+		assertJSONRoundTrip(t, "ForwardSpec("+tc.name+")", sp)
+	}
+	fwdDyn, err := ports.NewForwardSpec(ports.ForwardDynamic, "127.0.0.1:1080", "")
+	if err != nil || fwdDyn.BindKind() != ports.ForwardEndpointTCP || fwdDyn.TargetKind() != ports.ForwardEndpointInvalid {
+		t.Fatalf("NewForwardSpec(dynamic) 失败: (%v, %v)", fwdDyn, err)
+	}
+	assertJSONRoundTrip(t, "ForwardSpec(dynamic)", fwdDyn)
 	tunP2P, _ := ports.NewTUNSpec(ports.TUNModePointToPoint, 0, ports.TUNUnitAny)
 	fwdTUNP2P, err := ports.NewForwardTUNSpec(tunP2P)
 	if err != nil || !fwdTUNP2P.TUN().IsSome() {
@@ -139,6 +165,7 @@ func TestVaultTransportAndRemoteFSJSONCodecs(t *testing.T) {
 	}
 	assertJSONRoundTrip(t, "ForwardSpec(tun/p2p)", fwdTUNP2P,
 		`{"direction":"tun","bind_addr":"forged","tun":{"mode":"point_to_point","local_unit":0,"remote_unit":1}}`,
+		`{"direction":"tun","bind_kind":"tcp","tun":{"mode":"point_to_point","local_unit":0,"remote_unit":1}}`,
 	)
 	tunEth, _ := ports.NewTUNSpec(ports.TUNModeEthernet, 2, 3)
 	fwdTUNEth, err := ports.NewForwardTUNSpec(tunEth)
@@ -182,6 +209,20 @@ func TestVaultTransportAndRemoteFSJSONCodecs(t *testing.T) {
 		`{"perm":0}`,
 		`{"perm":384,"no_clobber":true,"expected_anchor":{"file_type":"regular"}}`,
 	)
+
+	rrsp, err := ports.NewRemoteRenameSpec(ports.RemoteRenameSpecInput{ExpectedAnchor: algebraic.Some(anc)})
+	if err != nil {
+		t.Fatalf("NewRemoteRenameSpec(anchor) 失败: %v", err)
+	}
+	assertJSONRoundTrip(t, "RemoteRenameSpec(anchor)", rrsp,
+		`{"no_clobber":true,"expected_anchor":{"file_type":"regular"}}`,
+		`{"extra":1}`,
+	)
+	rrNoClobber, err := ports.NewRemoteRenameSpec(ports.RemoteRenameSpecInput{NoClobber: true})
+	if err != nil || !rrNoClobber.NoClobber() {
+		t.Fatalf("NewRemoteRenameSpec(no_clobber) 失败: (%v, %v)", rrNoClobber, err)
+	}
+	assertJSONRoundTrip(t, "RemoteRenameSpec(no_clobber)", rrNoClobber)
 }
 
 func TestAuditAndSystemJSONCodecs(t *testing.T) {

@@ -4,10 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json/jsontext"
 	"fmt"
-	"io/fs"
-	"strings"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
@@ -15,13 +11,17 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"io/fs"
+	"strings"
+	"time"
 )
 
 // 本文件集中维护 core/ports 全部失败关闭枚举的名称表/TextCodec 与不透明值对象的严格 json/v2 编解码器。
 const (
 	nmLockMode   = "invalid,shared,exclusive"
 	nmHostTrust  = "invalid,trusted,unknown,mismatch,revoked"
-	nmFwdDir     = "invalid,local,remote,dynamic,streamlocal,tun"
+	nmFwdDir     = "invalid,local,remote,dynamic,tun"
+	nmFwdEnd     = "invalid,tcp,unix"
 	nmMuxAct     = "invalid,check,forward,cancel,exit,stop,proxy"
 	nmRemType    = "invalid,regular,dir,symlink,other"
 	nmAudPhase   = "invalid,denied,authorized,finalized"
@@ -31,11 +31,15 @@ const (
 	nmPrivMethod = "invalid,sudo,su,doas"
 )
 
-type portEnum interface {
-	~uint8
-	IsValid() bool
-	String() string
-}
+type (
+	jEnc     = *jsontext.Encoder
+	jDec     = *jsontext.Decoder
+	portEnum interface {
+		~uint8
+		IsValid() bool
+		String() string
+	}
+)
 
 func eOk(i uint8, csv string) bool { return i >= 1 && int(i) <= strings.Count(csv, ",") }
 func eStr(i uint8, csv string) string {
@@ -51,29 +55,27 @@ func epErr[T portEnum](raw string, err error) (T, error) {
 	return 0, fmt.Errorf("%w: %q", err, raw)
 }
 func eaErr[T portEnum](b []byte, v T, err error) ([]byte, error) {
-	if !v.IsValid() {
-		return nil, err
-	}
-	return append(b, v.String()...), nil
+	return appendValidText(b, v.IsValid(), v.String(), err)
 }
 func euErr[T portEnum](dst *T, t []byte, err error) error {
 	return unmarshalTextWithReset(dst, 0, t, func(s string) (T, error) { return epErr[T](s, err) })
 }
 func ep[T portEnum](s string) (T, error)           { return epErr[T](s, ErrInvalidArgument) }
+func epA[T portEnum](s string) (T, error)          { return epErr[T](s, ErrInvalidAuditEntry) }
 func ea[T portEnum](b []byte, v T) ([]byte, error) { return eaErr(b, v, ErrInvalidArgument) }
 func eu[T portEnum](dst *T, t []byte) error        { return euErr(dst, t, ErrInvalidArgument) }
-func missingField(baseErr error, f string) error {
-	return fmt.Errorf("%w: 缺少必需的 %s 字段", baseErr, f)
-}
-func optOrZero[T any](o algebraic.Option[T]) T { return o.OrElse(zeroVal[T]()) }
+func missingField(e error, f string) error         { return fmt.Errorf("%w: 缺少必需的 %s 字段", e, f) }
+func un[T any](o algebraic.Option[T]) T            { return o.OrElse(zeroVal[T]()) }
 func optModTime(t time.Time) algebraic.Option[time.Time] {
 	return pickIf(t.IsZero(), algebraic.None[time.Time](), algebraic.Some(t.UTC()))
 }
-func encArg[W any](e *jsontext.Encoder, ok bool, w W) error {
-	return marshalValidJSON(e, ok, ErrInvalidArgument, w)
+func enc[W any](e jEnc, ok bool, w W) error { return marshalValidJSON(e, ok, ErrInvalidArgument, w) }
+func dec[T, W any](d *T, c jDec, fn func(W) (T, error)) error {
+	return unmarshalJSONWithNullReject(d, c, ErrInvalidArgument, fn)
 }
-func decArg[T, W any](dst *T, d *jsontext.Decoder, fn func(W) (T, error)) error {
-	return unmarshalJSONWithNullReject(dst, d, ErrInvalidArgument, fn)
+func encE[W any](e jEnc, ok bool, err error, w W) error { return marshalValidJSON(e, ok, err, w) }
+func decE[T, W any](d *T, c jDec, err error, fn func(W) (T, error)) error {
+	return unmarshalJSONWithNullReject(d, c, err, fn)
 }
 func decodeB64Strict(s string) ([]byte, error) {
 	b, err := base64.StdEncoding.Strict().DecodeString(s)
@@ -83,7 +85,7 @@ func decodeB64Strict(s string) ([]byte, error) {
 	return b, nil
 }
 
-// 全部 10 个失败关闭端口枚举的 Parse / IsValid / IsZero / String 与 TextCodec 统一实现。
+// 全部 11 个失败关闭端口枚举的 Parse / IsValid / IsZero / String 与 TextCodec 统一实现。
 func ParseLockMode(s string) (LockMode, error)                 { return epErr[LockMode](s, ErrInvalidLockMode) }
 func (m LockMode) IsValid() bool                               { return eOk(uint8(m), nmLockMode) }
 func (m LockMode) IsZero() bool                                { return m == LockModeInvalid }
@@ -105,57 +107,64 @@ func (d ForwardDirection) String() string                      { return eStr(uin
 func (d ForwardDirection) AppendText(b []byte) ([]byte, error) { return ea(b, d) }
 func (d ForwardDirection) MarshalText() ([]byte, error)        { return d.AppendText(nil) }
 func (d *ForwardDirection) UnmarshalText(t []byte) error       { return eu(d, t) }
-func ParseMuxControlAction(s string) (MuxControlAction, error) { return ep[MuxControlAction](s) }
-func (a MuxControlAction) IsValid() bool                       { return eOk(uint8(a), nmMuxAct) }
-func (a MuxControlAction) IsZero() bool                        { return a == MuxActionInvalid }
-func (a MuxControlAction) String() string                      { return eStr(uint8(a), nmMuxAct) }
-func (a MuxControlAction) AppendText(b []byte) ([]byte, error) { return ea(b, a) }
-func (a MuxControlAction) MarshalText() ([]byte, error)        { return a.AppendText(nil) }
-func (a *MuxControlAction) UnmarshalText(t []byte) error       { return eu(a, t) }
-func ParseRemoteFileType(s string) (RemoteFileType, error)     { return ep[RemoteFileType](s) }
-func (t RemoteFileType) IsValid() bool                         { return eOk(uint8(t), nmRemType) }
-func (t RemoteFileType) IsZero() bool                          { return t == RemoteFileTypeInvalid }
-func (t RemoteFileType) String() string                        { return eStr(uint8(t), nmRemType) }
-func (t RemoteFileType) AppendText(b []byte) ([]byte, error)   { return ea(b, t) }
-func (t RemoteFileType) MarshalText() ([]byte, error)          { return t.AppendText(nil) }
-func (t *RemoteFileType) UnmarshalText(b []byte) error         { return eu(t, b) }
-func ParseAuditPhase(s string) (AuditPhase, error)             { return epErr[AuditPhase](s, ErrInvalidAuditEntry) }
-func (p AuditPhase) IsValid() bool                             { return eOk(uint8(p), nmAudPhase) }
-func (p AuditPhase) IsZero() bool                              { return p == AuditPhaseInvalid }
-func (p AuditPhase) String() string                            { return eStr(uint8(p), nmAudPhase) }
-func (p AuditPhase) AppendText(b []byte) ([]byte, error)       { return eaErr(b, p, ErrInvalidAuditEntry) }
-func (p AuditPhase) MarshalText() ([]byte, error)              { return p.AppendText(nil) }
-func (p *AuditPhase) UnmarshalText(t []byte) error             { return euErr(p, t, ErrInvalidAuditEntry) }
-func ParseAuditOutcome(s string) (AuditOutcome, error) {
-	return epErr[AuditOutcome](s, ErrInvalidAuditEntry)
+func ParseForwardEndpointKind(s string) (ForwardEndpointKind, error) {
+	return ep[ForwardEndpointKind](s)
 }
-func (o AuditOutcome) IsValid() bool                          { return eOk(uint8(o), nmAudOut) }
-func (o AuditOutcome) IsZero() bool                           { return o == AuditOutcomeInvalid }
-func (o AuditOutcome) String() string                         { return eStr(uint8(o), nmAudOut) }
-func (o AuditOutcome) AppendText(b []byte) ([]byte, error)    { return eaErr(b, o, ErrInvalidAuditEntry) }
-func (o AuditOutcome) MarshalText() ([]byte, error)           { return o.AppendText(nil) }
-func (o *AuditOutcome) UnmarshalText(t []byte) error          { return euErr(o, t, ErrInvalidAuditEntry) }
-func ParseVaultState(s string) (VaultState, error)            { return ep[VaultState](s) }
-func (s VaultState) IsValid() bool                            { return eOk(uint8(s), nmVaultState) }
-func (s VaultState) IsZero() bool                             { return s == VaultStateInvalid }
-func (s VaultState) String() string                           { return eStr(uint8(s), nmVaultState) }
-func (s VaultState) AppendText(b []byte) ([]byte, error)      { return ea(b, s) }
-func (s VaultState) MarshalText() ([]byte, error)             { return s.AppendText(nil) }
-func (s *VaultState) UnmarshalText(t []byte) error            { return eu(s, t) }
-func ParseTUNMode(s string) (TUNMode, error)                  { return ep[TUNMode](s) }
-func (m TUNMode) IsValid() bool                               { return eOk(uint8(m), nmTUNMode) }
-func (m TUNMode) IsZero() bool                                { return m == TUNModeInvalid }
-func (m TUNMode) String() string                              { return eStr(uint8(m), nmTUNMode) }
-func (m TUNMode) AppendText(b []byte) ([]byte, error)         { return ea(b, m) }
-func (m TUNMode) MarshalText() ([]byte, error)                { return m.AppendText(nil) }
-func (m *TUNMode) UnmarshalText(t []byte) error               { return eu(m, t) }
-func ParsePrivilegeMethod(s string) (PrivilegeMethod, error)  { return ep[PrivilegeMethod](s) }
-func (m PrivilegeMethod) IsValid() bool                       { return eOk(uint8(m), nmPrivMethod) }
-func (m PrivilegeMethod) IsZero() bool                        { return m == PrivilegeMethodInvalid }
-func (m PrivilegeMethod) String() string                      { return eStr(uint8(m), nmPrivMethod) }
-func (m PrivilegeMethod) AppendText(b []byte) ([]byte, error) { return ea(b, m) }
-func (m PrivilegeMethod) MarshalText() ([]byte, error)        { return m.AppendText(nil) }
-func (m *PrivilegeMethod) UnmarshalText(t []byte) error       { return eu(m, t) }
+func (k ForwardEndpointKind) IsValid() bool                       { return eOk(uint8(k), nmFwdEnd) }
+func (k ForwardEndpointKind) IsZero() bool                        { return k == ForwardEndpointInvalid }
+func (k ForwardEndpointKind) String() string                      { return eStr(uint8(k), nmFwdEnd) }
+func (k ForwardEndpointKind) AppendText(b []byte) ([]byte, error) { return ea(b, k) }
+func (k ForwardEndpointKind) MarshalText() ([]byte, error)        { return k.AppendText(nil) }
+func (k *ForwardEndpointKind) UnmarshalText(t []byte) error       { return eu(k, t) }
+func ParseMuxControlAction(s string) (MuxControlAction, error)    { return ep[MuxControlAction](s) }
+func (a MuxControlAction) IsValid() bool                          { return eOk(uint8(a), nmMuxAct) }
+func (a MuxControlAction) IsZero() bool                           { return a == MuxActionInvalid }
+func (a MuxControlAction) String() string                         { return eStr(uint8(a), nmMuxAct) }
+func (a MuxControlAction) AppendText(b []byte) ([]byte, error)    { return ea(b, a) }
+func (a MuxControlAction) MarshalText() ([]byte, error)           { return a.AppendText(nil) }
+func (a *MuxControlAction) UnmarshalText(t []byte) error          { return eu(a, t) }
+func ParseRemoteFileType(s string) (RemoteFileType, error)        { return ep[RemoteFileType](s) }
+func (t RemoteFileType) IsValid() bool                            { return eOk(uint8(t), nmRemType) }
+func (t RemoteFileType) IsZero() bool                             { return t == RemoteFileTypeInvalid }
+func (t RemoteFileType) String() string                           { return eStr(uint8(t), nmRemType) }
+func (t RemoteFileType) AppendText(b []byte) ([]byte, error)      { return ea(b, t) }
+func (t RemoteFileType) MarshalText() ([]byte, error)             { return t.AppendText(nil) }
+func (t *RemoteFileType) UnmarshalText(b []byte) error            { return eu(t, b) }
+func ParseAuditPhase(s string) (AuditPhase, error)                { return epA[AuditPhase](s) }
+func (p AuditPhase) IsValid() bool                                { return eOk(uint8(p), nmAudPhase) }
+func (p AuditPhase) IsZero() bool                                 { return p == AuditPhaseInvalid }
+func (p AuditPhase) String() string                               { return eStr(uint8(p), nmAudPhase) }
+func (p AuditPhase) AppendText(b []byte) ([]byte, error)          { return eaErr(b, p, ErrInvalidAuditEntry) }
+func (p AuditPhase) MarshalText() ([]byte, error)                 { return p.AppendText(nil) }
+func (p *AuditPhase) UnmarshalText(t []byte) error                { return euErr(p, t, ErrInvalidAuditEntry) }
+func ParseAuditOutcome(s string) (AuditOutcome, error)            { return epA[AuditOutcome](s) }
+func (o AuditOutcome) IsValid() bool                              { return eOk(uint8(o), nmAudOut) }
+func (o AuditOutcome) IsZero() bool                               { return o == AuditOutcomeInvalid }
+func (o AuditOutcome) String() string                             { return eStr(uint8(o), nmAudOut) }
+func (o AuditOutcome) AppendText(b []byte) ([]byte, error)        { return eaErr(b, o, ErrInvalidAuditEntry) }
+func (o AuditOutcome) MarshalText() ([]byte, error)               { return o.AppendText(nil) }
+func (o *AuditOutcome) UnmarshalText(t []byte) error              { return euErr(o, t, ErrInvalidAuditEntry) }
+func ParseVaultState(s string) (VaultState, error)                { return ep[VaultState](s) }
+func (s VaultState) IsValid() bool                                { return eOk(uint8(s), nmVaultState) }
+func (s VaultState) IsZero() bool                                 { return s == VaultStateInvalid }
+func (s VaultState) String() string                               { return eStr(uint8(s), nmVaultState) }
+func (s VaultState) AppendText(b []byte) ([]byte, error)          { return ea(b, s) }
+func (s VaultState) MarshalText() ([]byte, error)                 { return s.AppendText(nil) }
+func (s *VaultState) UnmarshalText(t []byte) error                { return eu(s, t) }
+func ParseTUNMode(s string) (TUNMode, error)                      { return ep[TUNMode](s) }
+func (m TUNMode) IsValid() bool                                   { return eOk(uint8(m), nmTUNMode) }
+func (m TUNMode) IsZero() bool                                    { return m == TUNModeInvalid }
+func (m TUNMode) String() string                                  { return eStr(uint8(m), nmTUNMode) }
+func (m TUNMode) AppendText(b []byte) ([]byte, error)             { return ea(b, m) }
+func (m TUNMode) MarshalText() ([]byte, error)                    { return m.AppendText(nil) }
+func (m *TUNMode) UnmarshalText(t []byte) error                   { return eu(m, t) }
+func ParsePrivilegeMethod(s string) (PrivilegeMethod, error)      { return ep[PrivilegeMethod](s) }
+func (m PrivilegeMethod) IsValid() bool                           { return eOk(uint8(m), nmPrivMethod) }
+func (m PrivilegeMethod) IsZero() bool                            { return m == PrivilegeMethodInvalid }
+func (m PrivilegeMethod) String() string                          { return eStr(uint8(m), nmPrivMethod) }
+func (m PrivilegeMethod) AppendText(b []byte) ([]byte, error)     { return ea(b, m) }
+func (m PrivilegeMethod) MarshalText() ([]byte, error)            { return m.AppendText(nil) }
+func (m *PrivilegeMethod) UnmarshalText(t []byte) error           { return eu(m, t) }
 
 type (
 	durWire struct {
@@ -163,7 +172,7 @@ type (
 		Revision algebraic.Option[Revision] `json:"revision,omitzero"`
 		Detail   string                     `json:"detail,omitzero"`
 	}
-	proxyRouteWire struct{ route option.ProxyRoute }
+	proxyRouteWire struct{ r option.ProxyRoute }
 	vhostWire      struct {
 		Alias      string                             `json:"alias"`
 		SourceFile string                             `json:"source_file,omitzero"`
@@ -193,7 +202,9 @@ type (
 	}
 	fwdWire struct {
 		Direction  ForwardDirection          `json:"direction"`
+		BindKind   ForwardEndpointKind       `json:"bind_kind,omitzero"`
 		BindAddr   string                    `json:"bind_addr,omitzero"`
+		TargetKind ForwardEndpointKind       `json:"target_kind,omitzero"`
 		TargetAddr string                    `json:"target_addr,omitzero"`
 		TUN        algebraic.Option[TUNSpec] `json:"tun,omitzero"`
 	}
@@ -227,11 +238,9 @@ type (
 		Mode     algebraic.Option[uint32]    `json:"mode"`
 		ModTime  algebraic.Option[time.Time] `json:"mod_time,omitzero"`
 	}
-	remoteWriteWire struct {
-		Perm           uint32                             `json:"perm"`
+	remoteRenameWire struct {
 		ExpectedAnchor algebraic.Option[RemoteFileAnchor] `json:"expected_anchor,omitzero"`
-		NoClobber      bool                               `json:"no_clobber,omitzero"`
-		AtomicRename   bool                               `json:"atomic_rename,omitzero"`
+		NoClobber      algebraic.Option[bool]             `json:"no_clobber"`
 	}
 	auditWire struct {
 		ProcessID   ProcessInstanceID                       `json:"process_id"`
@@ -265,14 +274,12 @@ type (
 )
 
 func (p proxyRouteWire) IsZero() bool {
-	return p.route == nil || option.EqualProxyRoute(p.route, option.NewProxyUnset())
+	return p.r == nil || option.EqualProxyRoute(p.r, option.NewProxyUnset())
 }
-func (p proxyRouteWire) MarshalJSONTo(e *jsontext.Encoder) error {
-	return option.MarshalProxyRouteTo(e, p.route)
-}
-func (p *proxyRouteWire) UnmarshalJSONFrom(d *jsontext.Decoder) error {
+func (p proxyRouteWire) MarshalJSONTo(e jEnc) error { return option.MarshalProxyRouteTo(e, p.r) }
+func (p *proxyRouteWire) UnmarshalJSONFrom(d jDec) error {
 	r, err := option.UnmarshalProxyRouteFrom(d)
-	p.route = pickIf[option.ProxyRoute](err == nil, r, nil)
+	p.r = pickIf[option.ProxyRoute](err == nil, r, nil)
 	return err
 }
 func decodeDurWire(w durWire) (DurabilityOutcome, error) {
@@ -293,47 +300,37 @@ func decodeDurWire(w durWire) (DurabilityOutcome, error) {
 		return DurabilityOutcome{}, missingField(ErrInvalidDurability, "status")
 	}
 }
-func decVHost(w vhostWire) (OpenSSHVirtualHost, error) {
-	return NewOpenSSHVirtualHost(OpenSSHVirtualHostSpec{w.Alias, w.SourceFile, w.Endpoint, w.User, w.Proxy.route, w.Layer})
-}
-func decLim(w limWire) (ReadLimits, error) { return NewReadLimits(w.MaxBytes) }
-func decPTY(w ptyWire) (PTYRequest, error) { return NewPTYRequest(w.Term, w.Size) }
 func decFwd(w fwdWire) (ForwardSpec, error) {
-	if w.Direction == ForwardTUN {
-		tun, ok := w.TUN.Get()
-		if !ok {
-			return ForwardSpec{}, missingField(ErrInvalidArgument, "tun")
-		}
-		spec, err := NewForwardTUNSpec(tun)
-		if err != nil {
-			return ForwardSpec{}, err
-		}
-		if (w.BindAddr != "" && w.BindAddr != spec.BindAddr()) || (w.TargetAddr != "" && w.TargetAddr != spec.TargetAddr()) {
-			return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN bind_addr/target_addr 与 tun 规格冲突", ErrInvalidArgument)
-		}
-		return spec, nil
+	if w.Direction != ForwardTUN {
+		return need(!w.TUN.IsSome(), ErrInvalidArgument, "direction", func() (ForwardSpec, error) {
+			return NewTypedForwardSpec(w.Direction, w.BindKind, w.BindAddr, w.TargetKind, w.TargetAddr)
+		})
 	}
-	if w.TUN.IsSome() {
-		return ForwardSpec{}, fmt.Errorf("%w: 非 ForwardTUN 方向不得携带 tun 字段", ErrInvalidArgument)
+	tun, ok := w.TUN.Get()
+	if !ok || w.BindKind != ForwardEndpointInvalid || w.TargetKind != ForwardEndpointInvalid {
+		return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN 缺少 tun 字段或携带非法端点类型", ErrInvalidArgument)
 	}
-	return NewForwardSpec(w.Direction, w.BindAddr, w.TargetAddr)
+	spec, err := NewForwardTUNSpec(tun)
+	if err == nil && ((w.BindAddr != "" && w.BindAddr != spec.BindAddr()) || (w.TargetAddr != "" && w.TargetAddr != spec.TargetAddr())) {
+		return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN bind_addr/target_addr 与 tun 规格冲突", ErrInvalidArgument)
+	}
+	return spec, err
 }
-func decAnc(w anchorWire) (RemoteFileAnchor, error) {
-	return NewRemoteFileAnchor(w.FileType, w.HasDevIno, w.Dev, w.Ino)
+func need[T any](ok bool, err error, field string, fn func() (T, error)) (T, error) {
+	if !ok {
+		return zeroVal[T](), missingField(err, field)
+	}
+	return fn()
 }
-func decWrite(w remoteWriteWire) (RemoteWriteSpec, error) {
-	return NewRemoteWriteSpec(RemoteWriteSpecInput{fs.FileMode(w.Perm), w.ExpectedAnchor, w.NoClobber, w.AtomicRename})
-}
-func decTermSz(w termSizeWire) (TerminalSize, error) { return NewTerminalSize(w.Cols, w.Rows) }
 func decSSHFP(w sshfpWire) (SSHFPRecord, error) {
-	if w.Authenticated.IsNone() {
+	if !w.Authenticated.IsSome() {
 		return SSHFPRecord{}, missingField(ErrInvalidArgument, "authenticated")
 	}
 	dig, err := decodeB64Strict(w.DigestB64)
 	if err != nil {
 		return SSHFPRecord{}, err
 	}
-	return NewSSHFPRecord(SSHFPRecordSpec{w.Algorithm, w.FingerprintType, dig, optOrZero(w.Authenticated)})
+	return NewSSHFPRecord(SSHFPRecordSpec{w.Algorithm, w.FingerprintType, dig, un(w.Authenticated)})
 }
 func decPubKey(w pubKeyWire) (PublicKeyInfo, error) {
 	blob, err := decodeB64Strict(w.WireBlobB64)
@@ -342,189 +339,155 @@ func decPubKey(w pubKeyWire) (PublicKeyInfo, error) {
 	}
 	return NewPublicKeyInfo(PublicKeyInfoSpec{w.Algorithm, w.Fingerprint, blob, w.Comment})
 }
-func decTUN(w tunWire) (TUNSpec, error) {
-	if w.LocalUnit.IsNone() || w.RemoteUnit.IsNone() {
-		return TUNSpec{}, missingField(ErrInvalidArgument, "local_unit/remote_unit")
-	}
-	return NewTUNSpec(w.Mode, optOrZero(w.LocalUnit), optOrZero(w.RemoteUnit))
+func decReq[T, W any](d *T, c jDec, err error, field string, ok func(W) bool, fn func(W) (T, error)) error {
+	return decE(d, c, err, func(w W) (T, error) { return need(ok(w), err, field, func() (T, error) { return fn(w) }) })
 }
-func decMux(w muxRespWire) (MuxControlResponse, error) {
-	if w.Alive.IsNone() {
-		return MuxControlResponse{}, missingField(ErrInvalidArgument, "alive")
-	}
-	return NewMuxControlResponse(optOrZero(w.Alive), w.MasterPID, w.Detail)
-}
-func decStat(w remoteStatWire) (RemoteFileStat, error) {
-	if w.Size.IsNone() || w.Mode.IsNone() {
-		return RemoteFileStat{}, missingField(ErrInvalidArgument, "size/mode")
-	}
-	return NewRemoteFileStat(RemoteFileStatSpec{w.Path, optOrZero(w.Size), fs.FileMode(optOrZero(w.Mode)), optOrZero(w.ModTime), w.Anchor})
-}
-func decDir(w remoteDirWire) (RemoteDirEntry, error) {
-	if w.Size.IsNone() || w.Mode.IsNone() {
-		return RemoteDirEntry{}, missingField(ErrInvalidArgument, "size/mode")
-	}
-	return NewRemoteDirEntry(RemoteDirEntrySpec{w.Name, w.FileType, optOrZero(w.Size), fs.FileMode(optOrZero(w.Mode)), optOrZero(w.ModTime)})
-}
-func decAudit(w auditWire) (AuditEntry, error) {
-	if w.Decision.IsNone() {
-		return AuditEntry{}, missingField(ErrInvalidAuditEntry, "decision")
-	}
-	return NewAuditEntry(AuditEntrySpec{w.ProcessID, w.TraceID, w.OperationID, w.Phase, w.Outcome, w.Risk, optOrZero(w.Decision), w.Binding, w.Timestamp, w.Duration, w.ErrorCode, w.Reason})
-}
-func decCrash(w crashRepWire) (CrashReconcileReport, error) {
-	if w.ScannedLocks.IsNone() || w.LiveLocksSkipped.IsNone() || w.DeadLocksClaimed.IsNone() {
-		return CrashReconcileReport{}, missingField(ErrInvalidArgument, "崩溃对账计数")
-	}
-	return NewCrashReconcileReport(CrashReconcileReportSpec{optOrZero(w.ScannedLocks), optOrZero(w.LiveLocksSkipped), optOrZero(w.DeadLocksClaimed), w.AbortedOperations})
-}
-func decProc(w ProcessSpecInput) (ProcessSpec, error) {
-	if w.MaxOutputBytes.IsNone() {
-		return ProcessSpec{}, missingField(ErrInvalidArgument, "max_output_bytes")
-	}
-	return NewProcessSpec(w)
-}
-func decAppr(w approvalRespWire) (ApprovalDecisionResponse, error) {
-	if w.Verdict.IsNone() {
-		return ApprovalDecisionResponse{}, missingField(ErrInvalidArgument, "verdict")
-	}
-	return NewApprovalDecisionResponse(optOrZero(w.Verdict), w.EnvelopeDigest, w.Comment)
-}
+func sOpt[T any](v T) algebraic.Option[T] { return algebraic.Some(v) }
 
 // MarshalJSONTo 与 UnmarshalJSONFrom 实现全包不可变值对象的严格 json/v2 编解码。
-func (d DurabilityOutcome) MarshalJSONTo(e *jsontext.Encoder) error {
-	return marshalValidJSON(e, d.IsValid(), ErrInvalidDurability, durWire{d.status, d.revision, d.detail})
+func (d DurabilityOutcome) MarshalJSONTo(e jEnc) error {
+	return encE(e, d.IsValid(), ErrInvalidDurability, durWire{d.status, d.revision, d.detail})
 }
-func (d *DurabilityOutcome) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return unmarshalJSONWithNullReject(d, c, ErrInvalidDurability, decodeDurWire)
+func (d *DurabilityOutcome) UnmarshalJSONFrom(c jDec) error {
+	return decE(d, c, ErrInvalidDurability, decodeDurWire)
 }
-func (h OpenSSHVirtualHost) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, h.IsValid(), vhostWire{h.alias, h.sourceFile, h.endpoint, h.user, proxyRouteWire{h.proxy}, h.layer})
+func (h OpenSSHVirtualHost) MarshalJSONTo(e jEnc) error {
+	return enc(e, h.IsValid(), vhostWire{h.s.Alias, h.s.SourceFile, h.s.Endpoint, h.s.User, proxyRouteWire{h.s.Proxy}, h.s.Layer})
 }
-func (h *OpenSSHVirtualHost) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(h, c, decVHost)
+func (h *OpenSSHVirtualHost) UnmarshalJSONFrom(c jDec) error {
+	return dec(h, c, func(w vhostWire) (OpenSSHVirtualHost, error) {
+		return NewOpenSSHVirtualHost(OpenSSHVirtualHostSpec{w.Alias, w.SourceFile, w.Endpoint, w.User, w.Proxy.r, w.Layer})
+	})
 }
-func (l ReadLimits) MarshalJSONTo(e *jsontext.Encoder) error {
-	return marshalValidJSON(e, l.IsValid(), ErrInvalidReadLimits, limWire{l.maxBytes})
+func (l ReadLimits) MarshalJSONTo(e jEnc) error {
+	return encE(e, l.IsValid(), ErrInvalidReadLimits, limWire{l.maxBytes})
 }
-func (l *ReadLimits) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return unmarshalJSONWithNullReject(l, c, ErrInvalidReadLimits, decLim)
+func (l *ReadLimits) UnmarshalJSONFrom(c jDec) error {
+	return decE(l, c, ErrInvalidReadLimits, func(w limWire) (ReadLimits, error) { return NewReadLimits(w.MaxBytes) })
 }
-func (s VaultStatus) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, s.IsValid(), VaultStatusSpec{s.state, s.knownStores, s.detail})
+func (s VaultStatus) MarshalJSONTo(e jEnc) error      { return enc(e, s.IsValid(), s.s) }
+func (s *VaultStatus) UnmarshalJSONFrom(c jDec) error { return dec(s, c, NewVaultStatus) }
+func (r SSHFPRecord) MarshalJSONTo(e jEnc) error {
+	return enc(e, r.IsValid(), sshfpWire{r.s.Algorithm, r.s.FingerprintType, base64.StdEncoding.EncodeToString(r.s.Digest), sOpt(r.s.Authenticated)})
 }
-func (s *VaultStatus) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(s, c, NewVaultStatus)
+func (r *SSHFPRecord) UnmarshalJSONFrom(c jDec) error { return dec(r, c, decSSHFP) }
+func (k PublicKeyInfo) MarshalJSONTo(e jEnc) error {
+	return enc(e, k.IsValid(), pubKeyWire{k.s.Algorithm, k.s.Fingerprint, base64.StdEncoding.EncodeToString(k.s.WireBlob), k.s.Comment})
 }
-func (r SSHFPRecord) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), sshfpWire{r.algorithm, r.fpType, base64.StdEncoding.EncodeToString(r.digest), algebraic.Some(r.authenticated)})
+func (k *PublicKeyInfo) UnmarshalJSONFrom(c jDec) error  { return dec(k, c, decPubKey) }
+func (c HostTrustCheck) MarshalJSONTo(e jEnc) error      { return enc(e, c.IsValid(), c.s) }
+func (c *HostTrustCheck) UnmarshalJSONFrom(d jDec) error { return dec(c, d, NewHostTrustCheck) }
+func (p PTYRequest) MarshalJSONTo(e jEnc) error          { return enc(e, p.IsValid(), ptyWire{p.term, p.size}) }
+func (p *PTYRequest) UnmarshalJSONFrom(c jDec) error {
+	return dec(p, c, func(w ptyWire) (PTYRequest, error) { return NewPTYRequest(w.Term, w.Size) })
 }
-func (r *SSHFPRecord) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(r, c, decSSHFP) }
-func (k PublicKeyInfo) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, k.IsValid(), pubKeyWire{k.algorithm, k.fingerprint, base64.StdEncoding.EncodeToString(k.wireBlob), k.comment})
+func (f ForwardSpec) MarshalJSONTo(e jEnc) error {
+	return enc(e, f.IsValid(), fwdWire{f.direction, f.bindKind, f.bindAddr, f.targetKind, f.targetAddr, f.tun})
 }
-func (k *PublicKeyInfo) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(k, c, decPubKey) }
-func (c HostTrustCheck) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, c.IsValid(), HostTrustCheckSpec{c.status, c.endpoint, c.presented, c.expectedFingerprints, c.reason})
+func (f *ForwardSpec) UnmarshalJSONFrom(c jDec) error { return dec(f, c, decFwd) }
+func (s TUNSpec) MarshalJSONTo(e jEnc) error {
+	return enc(e, s.IsValid(), tunWire{s.mode, sOpt(s.localUnit), sOpt(s.remoteUnit)})
 }
-func (c *HostTrustCheck) UnmarshalJSONFrom(d *jsontext.Decoder) error {
-	return decArg(c, d, NewHostTrustCheck)
+func (s *TUNSpec) UnmarshalJSONFrom(c jDec) error {
+	return decReq(s, c, ErrInvalidArgument, "local_unit/remote_unit", func(w tunWire) bool { return w.LocalUnit.IsSome() && w.RemoteUnit.IsSome() }, func(w tunWire) (TUNSpec, error) { return NewTUNSpec(w.Mode, un(w.LocalUnit), un(w.RemoteUnit)) })
 }
-func (p PTYRequest) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, p.IsValid(), ptyWire{p.term, p.size})
+func (r PrivilegeRequest) MarshalJSONTo(e jEnc) error      { return enc(e, r.IsValid(), r.s) }
+func (r *PrivilegeRequest) UnmarshalJSONFrom(c jDec) error { return dec(r, c, NewPrivilegeRequest) }
+func (r ShellProbeResult) MarshalJSONTo(e jEnc) error      { return enc(e, r.IsValid(), r.s) }
+func (r *ShellProbeResult) UnmarshalJSONFrom(c jDec) error { return dec(r, c, NewShellProbeResult) }
+func (r MuxControlResponse) MarshalJSONTo(e jEnc) error {
+	return enc(e, r.IsValid(), muxRespWire{sOpt(r.alive), r.masterPID, r.detail})
 }
-func (p *PTYRequest) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(p, c, decPTY) }
-func (f ForwardSpec) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, f.IsValid(), fwdWire{f.direction, f.bindAddr, f.targetAddr, f.tun})
+func (r *MuxControlResponse) UnmarshalJSONFrom(c jDec) error {
+	return decReq(r, c, ErrInvalidArgument, "alive", func(w muxRespWire) bool { return w.Alive.IsSome() }, func(w muxRespWire) (MuxControlResponse, error) {
+		return NewMuxControlResponse(un(w.Alive), w.MasterPID, w.Detail)
+	})
 }
-func (f *ForwardSpec) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(f, c, decFwd) }
-func (s TUNSpec) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, s.IsValid(), tunWire{s.mode, algebraic.Some(s.localUnit), algebraic.Some(s.remoteUnit)})
+func (a RemoteFileAnchor) MarshalJSONTo(e jEnc) error {
+	return enc(e, a.IsValid(), anchorWire{a.fileType, a.hasDevIno, a.dev, a.ino})
 }
-func (s *TUNSpec) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(s, c, decTUN) }
-func (r PrivilegeRequest) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), PrivilegeRequestSpec{r.method, r.command, r.targetUser, r.nonInteractive, r.timeout})
+func (a *RemoteFileAnchor) UnmarshalJSONFrom(c jDec) error {
+	return dec(a, c, func(w anchorWire) (RemoteFileAnchor, error) {
+		return NewRemoteFileAnchor(w.FileType, w.HasDevIno, w.Dev, w.Ino)
+	})
 }
-func (r *PrivilegeRequest) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, NewPrivilegeRequest)
+func (s RemoteFileStat) MarshalJSONTo(e jEnc) error {
+	return enc(e, s.IsValid(), remoteStatWire{s.s.Path, sOpt(s.s.Size), sOpt(uint32(s.s.Mode)), optModTime(s.s.ModTime), s.s.Anchor})
 }
-func (r ShellProbeResult) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), ShellProbeResultSpec{r.dialect, r.profile.Interpreter(), r.osFamily, r.probeStage, r.rawBanner})
+func (s *RemoteFileStat) UnmarshalJSONFrom(c jDec) error {
+	return decReq(s, c, ErrInvalidArgument, "size/mode", func(w remoteStatWire) bool { return w.Size.IsSome() && w.Mode.IsSome() }, func(w remoteStatWire) (RemoteFileStat, error) {
+		return NewRemoteFileStat(RemoteFileStatSpec{w.Path, un(w.Size), fs.FileMode(un(w.Mode)), un(w.ModTime), w.Anchor})
+	})
 }
-func (r *ShellProbeResult) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, NewShellProbeResult)
+func (e RemoteDirEntry) MarshalJSONTo(x jEnc) error {
+	return enc(x, e.IsValid(), remoteDirWire{e.s.Name, e.s.FileType, sOpt(e.s.Size), sOpt(uint32(e.s.Mode)), optModTime(e.s.ModTime)})
 }
-func (r MuxControlResponse) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), muxRespWire{algebraic.Some(r.alive), r.masterPID, r.detail})
+func (e *RemoteDirEntry) UnmarshalJSONFrom(c jDec) error {
+	return decReq(e, c, ErrInvalidArgument, "size/mode", func(w remoteDirWire) bool { return w.Size.IsSome() && w.Mode.IsSome() }, func(w remoteDirWire) (RemoteDirEntry, error) {
+		return NewRemoteDirEntry(RemoteDirEntrySpec{w.Name, w.FileType, un(w.Size), fs.FileMode(un(w.Mode)), un(w.ModTime)})
+	})
 }
-func (r *MuxControlResponse) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, decMux)
+func (s RemoteWriteSpec) MarshalJSONTo(e jEnc) error      { return enc(e, s.IsValid(), s.in) }
+func (s *RemoteWriteSpec) UnmarshalJSONFrom(c jDec) error { return dec(s, c, NewRemoteWriteSpec) }
+func (s RemoteRenameSpec) MarshalJSONTo(e jEnc) error {
+	return enc(e, s.IsValid(), remoteRenameWire{s.in.ExpectedAnchor, sOpt(s.in.NoClobber)})
 }
-func (a RemoteFileAnchor) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, a.IsValid(), anchorWire{a.fileType, a.hasDevIno, a.dev, a.ino})
+func (r *RemoteRenameSpec) UnmarshalJSONFrom(c jDec) error {
+	return decReq(r, c, ErrInvalidArgument, "no_clobber", func(w remoteRenameWire) bool { return w.NoClobber.IsSome() }, func(w remoteRenameWire) (RemoteRenameSpec, error) {
+		return NewRemoteRenameSpec(RemoteRenameSpecInput{w.ExpectedAnchor, un(w.NoClobber)})
+	})
 }
-func (a *RemoteFileAnchor) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(a, c, decAnc) }
-func (s RemoteFileStat) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, s.IsValid(), remoteStatWire{s.path, algebraic.Some(s.size), algebraic.Some(uint32(s.mode)), optModTime(s.modTime), s.anchor})
+func (e AuditEntry) MarshalJSONTo(x jEnc) error {
+	return encE(x, e.IsValid(), ErrInvalidAuditEntry, auditWire{e.s.ProcessID, e.s.TraceID, e.s.OperationID, e.s.Phase, e.s.Outcome, e.s.Risk, sOpt(e.s.Decision), e.s.Binding, e.s.Timestamp.UTC(), e.s.Duration, e.s.ErrorCode, e.s.Reason})
 }
-func (s *RemoteFileStat) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(s, c, decStat) }
-func (e RemoteDirEntry) MarshalJSONTo(x *jsontext.Encoder) error {
-	return encArg(x, e.IsValid(), remoteDirWire{e.name, e.fileType, algebraic.Some(e.size), algebraic.Some(uint32(e.mode)), optModTime(e.modTime)})
+func (e *AuditEntry) UnmarshalJSONFrom(c jDec) error {
+	return decReq(e, c, ErrInvalidAuditEntry, "decision", func(w auditWire) bool { return w.Decision.IsSome() }, func(w auditWire) (AuditEntry, error) {
+		return NewAuditEntry(AuditEntrySpec{w.ProcessID, w.TraceID, w.OperationID, w.Phase, w.Outcome, w.Risk, un(w.Decision), w.Binding, w.Timestamp, w.Duration, w.ErrorCode, w.Reason})
+	})
 }
-func (e *RemoteDirEntry) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(e, c, decDir) }
-func (s RemoteWriteSpec) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, s.IsValid(), remoteWriteWire{uint32(s.perm), s.expectedAnchor, s.noClobber, s.atomicRename})
+func (r CrashReconcileReport) MarshalJSONTo(e jEnc) error {
+	return enc(e, r.IsValid(), crashRepWire{sOpt(r.s.ScannedLocks), sOpt(r.s.LiveLocksSkipped), sOpt(r.s.DeadLocksClaimed), r.s.AbortedOperations})
 }
-func (s *RemoteWriteSpec) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(s, c, decWrite) }
-func (e AuditEntry) MarshalJSONTo(x *jsontext.Encoder) error {
-	return marshalValidJSON(x, e.IsValid(), ErrInvalidAuditEntry, auditWire{e.processID, e.traceID, e.operationID, e.phase, e.outcome, e.risk, algebraic.Some(e.decision), e.binding, e.timestamp.UTC(), e.duration, e.errorCode, e.reason})
+func (r *CrashReconcileReport) UnmarshalJSONFrom(c jDec) error {
+	return decReq(r, c, ErrInvalidArgument, "崩溃对账计数", func(w crashRepWire) bool {
+		return w.ScannedLocks.IsSome() && w.LiveLocksSkipped.IsSome() && w.DeadLocksClaimed.IsSome()
+	}, func(w crashRepWire) (CrashReconcileReport, error) {
+		return NewCrashReconcileReport(CrashReconcileReportSpec{un(w.ScannedLocks), un(w.LiveLocksSkipped), un(w.DeadLocksClaimed), w.AbortedOperations})
+	})
 }
-func (e *AuditEntry) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return unmarshalJSONWithNullReject(e, c, ErrInvalidAuditEntry, decAudit)
+func (i LocalIdentityInfo) MarshalJSONTo(e jEnc) error      { return enc(e, i.IsValid(), i.s) }
+func (i *LocalIdentityInfo) UnmarshalJSONFrom(c jDec) error { return dec(i, c, NewLocalIdentityInfo) }
+func (s TerminalSize) MarshalJSONTo(e jEnc) error {
+	return encE(e, s.IsValid(), ErrInvalidTTYSize, termSizeWire{s.cols, s.rows})
 }
-func (r CrashReconcileReport) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), crashRepWire{algebraic.Some(r.scannedLocks), algebraic.Some(r.liveLocksSkipped), algebraic.Some(r.deadLocksClaimed), r.abortedOperations})
+func (s *TerminalSize) UnmarshalJSONFrom(c jDec) error {
+	return decE(s, c, ErrInvalidTTYSize, func(w termSizeWire) (TerminalSize, error) { return NewTerminalSize(w.Cols, w.Rows) })
 }
-func (r *CrashReconcileReport) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, decCrash)
+func (p ProcessSpec) MarshalJSONTo(e jEnc) error {
+	return enc(e, p.IsValid(), ProcessSpecInput{p.command, p.args, p.workDir, p.Env(), p.timeout, sOpt(p.maxOutputBytes)})
 }
-func (i LocalIdentityInfo) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, i.IsValid(), LocalIdentityInfoSpec{i.localHost, i.localUser, i.localUID, i.homeDir})
+func (p *ProcessSpec) UnmarshalJSONFrom(c jDec) error {
+	return decReq(p, c, ErrInvalidArgument, "max_output_bytes", func(w ProcessSpecInput) bool { return w.MaxOutputBytes.IsSome() }, NewProcessSpec)
 }
-func (i *LocalIdentityInfo) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(i, c, NewLocalIdentityInfo)
+func (r SecretPromptRequest) MarshalJSONTo(e jEnc) error {
+	return enc(e, r.IsValid(), SecretPromptRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.core.allowEmpty})
 }
-func (s TerminalSize) MarshalJSONTo(e *jsontext.Encoder) error {
-	return marshalValidJSON(e, s.IsValid(), ErrInvalidTTYSize, termSizeWire{s.cols, s.rows})
+func (r *SecretPromptRequest) UnmarshalJSONFrom(c jDec) error {
+	return dec(r, c, NewSecretPromptRequest)
 }
-func (s *TerminalSize) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return unmarshalJSONWithNullReject(s, c, ErrInvalidTTYSize, decTermSz)
+func (r ConfirmRequest) MarshalJSONTo(e jEnc) error {
+	return enc(e, r.IsValid(), ConfirmRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.risk})
 }
-func (p ProcessSpec) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, p.IsValid(), ProcessSpecInput{p.command, p.args, p.workDir, p.Env(), p.timeout, algebraic.Some(p.maxOutputBytes)})
+func (r *ConfirmRequest) UnmarshalJSONFrom(c jDec) error { return dec(r, c, NewConfirmRequest) }
+func (r TextPromptRequest) MarshalJSONTo(e jEnc) error {
+	return enc(e, r.IsValid(), TextPromptRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.core.allowEmpty})
 }
-func (p *ProcessSpec) UnmarshalJSONFrom(c *jsontext.Decoder) error { return decArg(p, c, decProc) }
-func (r SecretPromptRequest) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), SecretPromptRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.core.allowEmpty})
+func (r *TextPromptRequest) UnmarshalJSONFrom(c jDec) error { return dec(r, c, NewTextPromptRequest) }
+func (r ApprovalDecisionResponse) MarshalJSONTo(e jEnc) error {
+	return enc(e, r.IsValid(), approvalRespWire{sOpt(r.verdict), r.envelopeDigest, r.comment})
 }
-func (r *SecretPromptRequest) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, NewSecretPromptRequest)
-}
-func (r ConfirmRequest) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), ConfirmRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.risk})
-}
-func (r *ConfirmRequest) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, NewConfirmRequest)
-}
-func (r TextPromptRequest) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), TextPromptRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.core.allowEmpty})
-}
-func (r *TextPromptRequest) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, NewTextPromptRequest)
-}
-func (r ApprovalDecisionResponse) MarshalJSONTo(e *jsontext.Encoder) error {
-	return encArg(e, r.IsValid(), approvalRespWire{algebraic.Some(r.verdict), r.envelopeDigest, r.comment})
-}
-func (r *ApprovalDecisionResponse) UnmarshalJSONFrom(c *jsontext.Decoder) error {
-	return decArg(r, c, decAppr)
+func (r *ApprovalDecisionResponse) UnmarshalJSONFrom(c jDec) error {
+	return decReq(r, c, ErrInvalidArgument, "verdict", func(w approvalRespWire) bool { return w.Verdict.IsSome() }, func(w approvalRespWire) (ApprovalDecisionResponse, error) {
+		return NewApprovalDecisionResponse(un(w.Verdict), w.EnvelopeDigest, w.Comment)
+	})
 }

@@ -57,12 +57,13 @@ func TestInterfaceCompliance(t *testing.T) {
 	_ = ports.EnvPort((*SimEnvPort)(nil))
 	_ = ports.ProcessPort((*SimProcessPort)(nil))
 	_ = ports.TerminalPort((*SimTerminalPort)(nil))
-	_ = ports.TerminalHandle((*simTerminalHandle)(nil))
+	_ = ports.TerminalHandle((*memtree.TerminalHandle)(nil))
 	_ = ports.InteractionPort((*SimInteractionPort)(nil))
 	_ = ports.PrivilegeEscalationPort((*SimPrivilegeEscalator)(nil))
 	_ = ports.ShellProbePort((*SimShellProbe)(nil))
 	_ = ports.ForwarderPort((*SimForwarder)(nil))
 	_ = ports.ForwardHandle((*SimForwardHandle)(nil))
+	_ = ports.TUNDevicePort((*SimTUNDevicePort)(nil))
 }
 
 // TestFaultInjectorModes 验证故障注入器的单次、常驻、概率、清除与计数契约。
@@ -332,13 +333,14 @@ func verifyRemoteFSMkdirAndRename(t *testing.T, ctx context.Context, rfs *SimRem
 	_ = rfs.MkdirAll(ctx, srcDir, 0o755)
 	_, _ = rfs.WriteFileAtomic(ctx, srcChild, ws, strings.NewReader("payload"))
 
-	if err := rfs.RenameAtomic(ctx, regFile, srcDir, algebraic.None[ports.RemoteFileAnchor]()); !errors.Is(err, ports.ErrRemoteIsDir) {
+	overSpec, _ := ports.NewRemoteRenameSpec(ports.RemoteRenameSpecInput{})
+	if err := rfs.RenameAtomic(ctx, regFile, srcDir, overSpec); !errors.Is(err, ports.ErrRemoteIsDir) {
 		t.Fatalf("file-over-dir rename got %v, want ErrRemoteIsDir", err)
 	}
-	if err := rfs.RenameAtomic(ctx, srcDir, selfDesc, algebraic.None[ports.RemoteFileAnchor]()); !errors.Is(err, ports.ErrInvalidArgument) {
+	if err := rfs.RenameAtomic(ctx, srcDir, selfDesc, overSpec); !errors.Is(err, ports.ErrInvalidArgument) {
 		t.Fatalf("self-descendant dir rename got %v, want ErrInvalidArgument", err)
 	}
-	if err := rfs.RenameAtomic(ctx, srcDir, dstDir, algebraic.None[ports.RemoteFileAnchor]()); err != nil {
+	if err := rfs.RenameAtomic(ctx, srcDir, dstDir, overSpec); err != nil {
 		t.Fatalf("directory subtree RenameAtomic failed: %v", err)
 	}
 	if _, err := rfs.Stat(ctx, srcChild); !errors.Is(err, ports.ErrNotFound) {
@@ -439,9 +441,12 @@ func verifySimMuxTransportMinors(t *testing.T, ctx context.Context, rng *SeededR
 	mux := NewSimMuxSocket(dialer)
 	sockPath, _ := pathalg.ParseLocalSourcePath("/sim/mux/m.sock")
 	mux.RegisterMaster(sockPath, 1234)
-	conn, err := mux.DialMux(ctx, sockPath)
-	if err != nil || dialer.OpenConns() != 1 {
-		t.Fatalf("DialMux must track connection in SimDialer: err=%v open=%d", err, dialer.OpenConns())
+	single, _ := tck.MustHopAndPlan(t)
+	hop0, _ := single.HopAt(0)
+	dig0, _ := single.HopDigestAt(0)
+	conn, err := mux.DialMux(ctx, sockPath, dig0, hop0.Endpoint())
+	if err != nil || dialer.OpenConns() != 1 || !conn.HopDigest().Equal(dig0) || !conn.Endpoint().Equal(hop0.Endpoint()) {
+		t.Fatalf("DialMux must track connection with exact hop identity: err=%v open=%d", err, dialer.OpenConns())
 	}
 	sess, err := conn.OpenSession(ctx)
 	if err != nil {
@@ -519,12 +524,9 @@ func verifySimRelayCancelPreservesCtxErr(t *testing.T) {
 		t.Fatalf("WithRawTerminal failed: %v", err)
 	}
 	// 验证已关闭 SimRemoteSession 在加锁复核中返回 ErrClosed。
-	sess := &SimRemoteSession{initialized: true}
+	sess := memtree.NewRemoteSession(func() bool { return true }, memtree.SessionFaultConfig{})
 	_ = sess.Close()
-	sess.mu.Lock()
-	startErr := sess.beginStartLocked(ports.ExecStreams{})
-	sess.mu.Unlock()
-	if !errors.Is(startErr, ports.ErrClosed) {
-		t.Fatalf("beginStartLocked on closed session must return ErrClosed, got %v", startErr)
+	if startErr := sess.BeginStartLocked(ports.ExecStreams{}); !errors.Is(startErr, ports.ErrClosed) {
+		t.Fatalf("BeginStartLocked on closed session must return ErrClosed, got %v", startErr)
 	}
 }

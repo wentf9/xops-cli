@@ -16,13 +16,6 @@ package tck
 import (
 	"crypto/sha256"
 	"errors"
-	"io"
-	"sync"
-	"testing"
-	"time"
-
-	"go.uber.org/goleak"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
@@ -34,6 +27,11 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
+	"go.uber.org/goleak"
+	"io"
+	"sync"
+	"testing"
+	"time"
 )
 
 // BaseTime 返回 TCK 确定性基准 UTC 时间（采用纯函数避免包级可变 var，满足 xopsvet/noimplicit）。
@@ -139,7 +137,6 @@ func MustGraph(t *testing.T, suffix string) inventory.Graph {
 	requireNoErr(t, err, "ParseUsername")
 	auth, err := inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
 	requireNoErr(t, err, "NewAuthAgent")
-
 	host, err := inventory.NewHost(inventory.HostSpec{ID: hid, Endpoint: MustEndpoint(t, "198.51.100.10", 22)})
 	requireNoErr(t, err, "NewHost")
 	ident, err := inventory.NewIdentity(inventory.IdentitySpec{ID: iid, User: user, Auth: auth})
@@ -167,7 +164,6 @@ func MustHopAndPlan(t *testing.T) (plan.SealedConnectionPlan, plan.SealedConnect
 	requireNoErr(t, err, "SealConnectionPlan(multi)")
 	return single, multi
 }
-
 func mustHopSpec(t *testing.T, idx uint32, nodeID, host string, port uint16) plan.HopSpec {
 	t.Helper()
 	ep := MustEndpoint(t, host, port)
@@ -251,38 +247,43 @@ func MustAuditEntry(t *testing.T, procID ports.ProcessInstanceID, traceID securi
 	return entry
 }
 
-// MustV2JournalChain 构造合法的 V2 哈希链式传输 Journal 记录序列（Init -> Chunk -> Verified -> CommitStarted -> Committed）。
+// MustV2JournalChain 构造第 1 世代合法 V2 哈希链式传输 Journal 记录序列（Init -> Chunk -> Verified -> CommitStarted -> Committed）。
 func MustV2JournalChain(t *testing.T, transferID security.OperationID) []fsm.TransferJournalRecord {
+	t.Helper()
+	return MustV2JournalChainGen(t, transferID, 1)
+}
+
+// MustV2JournalChainGen 构造指定世代号（>=1）的合法 V2 哈希链式传输 Journal 记录序列，供双代恢复测试复用。
+func MustV2JournalChainGen(t *testing.T, transferID security.OperationID, gen uint64) []fsm.TransferJournalRecord {
 	t.Helper()
 	remote, err := pathalg.ParseRemotePath("/var/tmp/tck-upload.bin")
 	requireNoErr(t, err, "ParseRemotePath")
 	dest, err := fsm.NewUploadDest(remote)
 	requireNoErr(t, err, "NewUploadDest")
 	chunkDig := security.DigestFromSHA256(sha256.Sum256([]byte("tck-chunk-payload")))
-
 	r1, err := fsm.NewTransferJournalRecord(fsm.TransferJournalRecordSpec{
-		Version: fsm.JournalVersionV2, Generation: 1, Seq: 1, Kind: fsm.JournalRecordInit,
+		Version: fsm.JournalVersionV2, Generation: gen, Seq: 1, Kind: fsm.JournalRecordInit,
 		TransferID: transferID, Dest: algebraic.Some(dest), TotalBytes: 17, Digest: algebraic.Some(chunkDig),
 	})
 	requireNoErr(t, err, "JournalInit")
 	r2, err := fsm.NewTransferJournalRecord(fsm.TransferJournalRecordSpec{
-		Version: fsm.JournalVersionV2, Generation: 1, Seq: 2, Kind: fsm.JournalRecordChunk,
+		Version: fsm.JournalVersionV2, Generation: gen, Seq: 2, Kind: fsm.JournalRecordChunk,
 		TransferID: transferID, Offset: 0, Length: 17, TotalBytes: 17,
 		Digest: algebraic.Some(chunkDig), PrevDigest: algebraic.Some(r1.RecordDigest()),
 	})
 	requireNoErr(t, err, "JournalChunk")
 	r3, err := fsm.NewTransferJournalRecord(fsm.TransferJournalRecordSpec{
-		Version: fsm.JournalVersionV2, Generation: 1, Seq: 3, Kind: fsm.JournalRecordVerified,
+		Version: fsm.JournalVersionV2, Generation: gen, Seq: 3, Kind: fsm.JournalRecordVerified,
 		TransferID: transferID, TotalBytes: 17, Digest: algebraic.Some(chunkDig), PrevDigest: algebraic.Some(r2.RecordDigest()),
 	})
 	requireNoErr(t, err, "JournalVerified")
 	r4, err := fsm.NewTransferJournalRecord(fsm.TransferJournalRecordSpec{
-		Version: fsm.JournalVersionV2, Generation: 1, Seq: 4, Kind: fsm.JournalRecordCommitStarted,
+		Version: fsm.JournalVersionV2, Generation: gen, Seq: 4, Kind: fsm.JournalRecordCommitStarted,
 		TransferID: transferID, TotalBytes: 17, PrevDigest: algebraic.Some(r3.RecordDigest()),
 	})
 	requireNoErr(t, err, "JournalCommitStarted")
 	r5, err := fsm.NewTransferJournalRecord(fsm.TransferJournalRecordSpec{
-		Version: fsm.JournalVersionV2, Generation: 1, Seq: 5, Kind: fsm.JournalRecordCommitted,
+		Version: fsm.JournalVersionV2, Generation: gen, Seq: 5, Kind: fsm.JournalRecordCommitted,
 		TransferID: transferID, TotalBytes: 17, PrevDigest: algebraic.Some(r4.RecordDigest()),
 	})
 	requireNoErr(t, err, "JournalCommitted")
@@ -296,21 +297,18 @@ func requireNoErr(t *testing.T, err error, label string) {
 		t.Fatalf("%s 返回非预期错误: %v", label, err)
 	}
 }
-
 func requireErr(t *testing.T, err error, label string) {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("%s 期望返回错误，但得到 nil", label)
 	}
 }
-
 func requireErrIs(t *testing.T, err, target error, label string) {
 	t.Helper()
 	if !errors.Is(err, target) {
 		t.Fatalf("%s 期望错误匹配 %v，实际得到 %v", label, target, err)
 	}
 }
-
 func requireTrue(t *testing.T, cond bool, msg string) {
 	t.Helper()
 	if !cond {

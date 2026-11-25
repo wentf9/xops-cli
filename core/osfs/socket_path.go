@@ -2,11 +2,10 @@ package osfs
 
 import (
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"strings"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
 )
 
 const percentCHexLen = 40
@@ -28,6 +27,13 @@ func MaxUnixSocketPathBytes() int { return maxUnixSocketPathBytesOS() }
 func ValidateControlSocketPath(raw string) (ControlSocketPath, error) {
 	return validateControlSocketPathOS(raw)
 }
+func nativeControlBase(kind pathalg.LocalPathKind, raw string) (string, error) {
+	native, err := localPathToNativeOS(kind, raw)
+	if err != nil {
+		return "", fmt.Errorf("%w: %w", ErrInvalidControlPath, err)
+	}
+	return stripWin32LongPathPrefix(native), nil
+}
 
 // ControlSocketPathFromSource 将经 pathalg 校验的本地源路径转换为当前平台安全控制套接字路径；
 // 兼容 Unix 下 OpenSSH %r@%h:%p 含 ':' 文件名，并在 Windows 上剥离 \\?\ 前缀后执行 sun_path 校验。
@@ -35,11 +41,11 @@ func ControlSocketPathFromSource(src pathalg.LocalSourcePath) (ControlSocketPath
 	if !src.IsValid() {
 		return ControlSocketPath{}, fmt.Errorf("%w: 控制套接字源路径无效", ErrInvalidControlPath)
 	}
-	native, err := localPathToNativeOS(src.Kind(), src.String())
+	native, err := nativeControlBase(src.Kind(), src.String())
 	if err != nil {
-		return ControlSocketPath{}, fmt.Errorf("%w: %w", ErrInvalidControlPath, err)
+		return ControlSocketPath{}, err
 	}
-	return ValidateControlSocketPath(stripWin32LongPathPrefix(native))
+	return ValidateControlSocketPath(native)
 }
 
 // BuildManagedMuxSocketPath 基于经校验的沙箱目录与 OpenSSH %C 40 位小写十六进制摘要构造自管套接字路径。
@@ -47,45 +53,32 @@ func BuildManagedMuxSocketPath(dir pathalg.LocalDir, percentC string) (ControlSo
 	if !dir.IsValid() || !isLowerHex40(percentC) {
 		return ControlSocketPath{}, fmt.Errorf("%w: 控制套接字目录或 %%C 摘要 %q 无效", ErrInvalidControlPath, percentC)
 	}
-	nativeDir, err := localPathToNativeOS(dir.Kind(), dir.String())
+	nativeDir, err := nativeControlBase(dir.Kind(), dir.String())
 	if err != nil {
-		return ControlSocketPath{}, fmt.Errorf("%w: %w", ErrInvalidControlPath, err)
+		return ControlSocketPath{}, err
 	}
-	nativeDir = stripWin32LongPathPrefix(nativeDir)
 	sep := pickIf(strings.ContainsRune(nativeDir, '\\'), `\`, "/")
 	return ValidateControlSocketPath(strings.TrimRight(nativeDir, `/\`) + sep + "cm-" + percentC + ".sock")
 }
-
 func (p ControlSocketPath) IsValid() bool {
 	return p.valid && p.native != "" && p.dir != "" && p.name != ""
 }
 func (p ControlSocketPath) IsZero() bool       { return !p.IsValid() }
-func (p ControlSocketPath) Dir() string        { return pickIf(p.IsValid(), p.dir, "") }
-func (p ControlSocketPath) Name() string       { return pickIf(p.IsValid(), p.name, "") }
-func (p ControlSocketPath) NativePath() string { return pickIf(p.IsValid(), p.native, "") }
-func (p ControlSocketPath) String() string     { return pickIf(p.IsValid(), p.native, "") }
+func (p ControlSocketPath) Dir() string        { return orZero(p.IsValid(), p.dir) }
+func (p ControlSocketPath) Name() string       { return orZero(p.IsValid(), p.name) }
+func (p ControlSocketPath) NativePath() string { return orZero(p.IsValid(), p.native) }
+func (p ControlSocketPath) String() string     { return orZero(p.IsValid(), p.native) }
 func (p ControlSocketPath) Equal(o ControlSocketPath) bool {
 	return p.IsValid() && o.IsValid() && p.native == o.native
 }
-
 func isLowerHex40(s string) bool {
-	if len(s) != percentCHexLen {
-		return false
-	}
-	for i := range len(s) {
-		if (s[i] < '0' || s[i] > '9') && (s[i] < 'a' || s[i] > 'f') {
-			return false
-		}
-	}
-	return true
+	return len(s) == percentCHexLen && !strings.ContainsFunc(s, func(r rune) bool { return (r < '0' || r > '9') && (r < 'a' || r > 'f') })
 }
-
 func hasForbiddenControlPathRune(s string) bool {
 	return !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool {
 		return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Cf, r)
 	})
 }
-
 func hasInvalidSocketTail(p string) bool {
 	return p == "" || p == "." || p == ".." || strings.HasSuffix(p, "/") || strings.HasSuffix(p, "/.") || strings.HasSuffix(p, "/..")
 }
@@ -125,7 +118,6 @@ func ValidateWindowsControlSocketPath(raw string, maxBytes int) (ControlSocketPa
 	}
 	return buildControlSocketPath(prefix, `\`, segs, maxBytes)
 }
-
 func splitWindowsSocketPrefix(raw string) (string, string, error) {
 	if len(raw) >= 2 && isASCIIAlphaByte(raw[0]) && raw[1] == ':' {
 		if len(raw) < 3 || !isWin32Sep(raw[2]) {
@@ -135,7 +127,6 @@ func splitWindowsSocketPrefix(raw string) (string, string, error) {
 	}
 	return "", raw, nil
 }
-
 func splitCheckedSegments(slashRest string, strictWin bool) ([]string, error) {
 	var segs []string
 	for seg := range strings.SplitSeq(slashRest, "/") {
@@ -156,7 +147,6 @@ func splitCheckedSegments(slashRest string, strictWin bool) ([]string, error) {
 	}
 	return segs, nil
 }
-
 func buildControlSocketPath(prefix, sep string, segs []string, maxBytes int) (ControlSocketPath, error) {
 	native := prefix + strings.Join(segs, sep)
 	if len(native) > maxBytes {

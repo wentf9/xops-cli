@@ -10,21 +10,15 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"slices"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
-
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
 )
 
-const (
-	maxPortTokenLen    = 128
-	maxPortDetailBytes = 512
-	maxPortEnvCount    = 256
-	maxPortEnvValBytes = 8192
-)
+const maxPortTokenLen, maxPortDetailBytes, maxPortEnvCount, maxPortEnvValBytes = 128, 512, 256, 8192
 
 // 本包导出的规范化哨兵错误，供用例、连接池、能力门控、宿主适配器、仿真器与 TCK 统一以 errors.Is 判定。
 var (
@@ -39,13 +33,11 @@ var (
 	ErrAlreadyExists    = errors.New("ports: 目标资源已存在")
 	ErrPermissionDenied = errors.New("ports: 权限不足或安全策略拒绝")
 	ErrLimitExceeded    = errors.New("ports: 数据超出安全大小或数量上限")
-
 	// 配置存储、CAS 与持久化结果错误。
 	ErrRevisionConflict  = errors.New("ports: 资产配置版本 CAS 冲突")
 	ErrCorruptData       = errors.New("ports: 持久化数据损坏或完整性校验失败")
 	ErrInvalidRevision   = errors.New("ports: 无效的配置版本 Revision")
 	ErrInvalidDurability = errors.New("ports: 无效的持久化提交结果 DurabilityOutcome")
-
 	// 本地双模态文件系统与文件锁错误。
 	ErrInvalidLockMode   = errors.New("ports: 无效的文件锁模式 LockMode")
 	ErrInvalidReadLimits = errors.New("ports: 无效的读取上限 ReadLimits")
@@ -53,7 +45,6 @@ var (
 	ErrNotRegularFile    = errors.New("ports: 目标路径不是常规文件")
 	ErrSymlinkRejected   = errors.New("ports: 符号链接被当前安全策略拒绝")
 	ErrHandleExpired     = errors.New("ports: 作用域借用句柄已超出生命周期并失效")
-
 	// 凭据库、签名器与主机密钥信任错误。
 	ErrVaultLocked        = errors.New("ports: 凭据库处于锁定状态")
 	ErrSecretNotFound     = errors.New("ports: 凭据条目不存在")
@@ -62,14 +53,12 @@ var (
 	ErrHostKeyUnknown     = errors.New("ports: 远端主机密钥未知且策略禁止自动信任")
 	ErrHostKeyRevoked     = errors.New("ports: 远端主机密钥已被吊销")
 	ErrSignerUnavailable  = errors.New("ports: 密钥签名器或 SSH Agent 不可用")
-
 	// 传输拨号、多路复用与远端 SFTP 错误。
 	ErrDialFailed           = errors.New("ports: 建立远端传输连接失败")
 	ErrAuthFailed           = errors.New("ports: 远端身份认证失败")
 	ErrMuxUnavailable       = errors.New("ports: 多路复用控制套接字不可用")
 	ErrRemoteAnchorMismatch = errors.New("ports: 远端文件 FSTAT 类型或 (dev,ino) 锚点不匹配")
 	ErrRemoteIsDir          = errors.New("ports: 远端目标为目录而非文件")
-
 	// 安全审计、崩溃对账、系统与交互错误。
 	ErrAuditWriteFailed         = errors.New("ports: 审计日志写入失败")
 	ErrAuditPostWrite           = errors.New("ports: 审计后置终态写入失败")
@@ -88,13 +77,9 @@ func pickIf[T any](ok bool, yes, no T) T {
 	}
 	return no
 }
-func zeroVal[T any]() (z T) { return z }
-func cloneSliceNilIfEmpty[S ~[]E, E any](s S) S {
-	if len(s) == 0 {
-		return nil
-	}
-	return slices.Clone(s)
-}
+func zeroVal[T any]() (z T)                     { return z }
+func orZero[T any](ok bool, v T) T              { return pickIf(ok, v, zeroVal[T]()) }
+func cloneSliceNilIfEmpty[S ~[]E, E any](s S) S { return pickIf(len(s) == 0, nil, slices.Clone(s)) }
 func firstErr(errs ...error) error {
 	for _, err := range errs {
 		if err != nil {
@@ -108,11 +93,8 @@ func optEqualFunc[T any](a, b algebraic.Option[T], eq func(T, T) bool) bool {
 	vb, okB := b.Get()
 	return okA == okB && (!okA || eq(va, vb))
 }
-func appendValidText(b []byte, valid bool, text string, baseErr error) ([]byte, error) {
-	if !valid {
-		return nil, baseErr
-	}
-	return append(b, text...), nil
+func appendValidText(b []byte, ok bool, text string, err error) ([]byte, error) {
+	return pickIf(ok, append(b, text...), nil), pickIf[error](ok, nil, err)
 }
 func unmarshalTextWithReset[T any](dst *T, zero T, text []byte, parse func(string) (T, error)) error {
 	if dst == nil {
@@ -130,19 +112,15 @@ func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseEr
 	}
 	*dst = zeroVal[T]()
 	if dec.PeekKind() == 'n' {
-		if _, err := dec.ReadToken(); err != nil {
-			return err
-		}
-		return fmt.Errorf("%w: JSON null 不是有效值", baseErr)
+		_, err := dec.ReadToken()
+		return firstErr(err, fmt.Errorf("%w: JSON null 不是有效值", baseErr))
 	}
 	var wire W
 	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return err
 	}
 	parsed, err := build(wire)
-	if err == nil {
-		*dst = parsed
-	}
+	*dst = pickIf(err == nil, parsed, zeroVal[T]())
 	return err
 }
 func marshalValidJSON[W any](enc *jsontext.Encoder, valid bool, badErr error, wire W) error {
@@ -155,15 +133,7 @@ func marshalValidJSON[W any](enc *jsontext.Encoder, valid bool, badErr error, wi
 	return jsonv2.MarshalEncode(enc, wire, jsonv2.Deterministic(true))
 }
 func isValidASCIIToken(raw string, maxLen int) bool {
-	if len(raw) == 0 || len(raw) > maxLen {
-		return false
-	}
-	for i := range len(raw) {
-		if raw[i] < 0x21 || raw[i] > 0x7E {
-			return false
-		}
-	}
-	return true
+	return len(raw) > 0 && len(raw) <= maxLen && !strings.ContainsFunc(raw, func(r rune) bool { return r < 0x21 || r > 0x7E })
 }
 func hasForbiddenControl(s string) bool {
 	return !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool {
@@ -176,12 +146,11 @@ func isValidRFC3339Time(t time.Time) bool {
 
 // sanitizeBoundedText 校验并规范化单行非敏感说明文本，拒绝非法 UTF-8、控制字符、Bidi/Cf 字符与超长输入。
 func sanitizeBoundedText(raw string, maxBytes int, allowEmpty bool, baseErr error) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
+	if trimmed := strings.TrimSpace(raw); trimmed == "" {
 		return "", pickIf[error](allowEmpty, nil, fmt.Errorf("%w: 文本不能为空", baseErr))
-	}
-	if len(trimmed) > maxBytes || hasForbiddenControl(trimmed) {
+	} else if len(trimmed) > maxBytes || hasForbiddenControl(trimmed) {
 		return "", fmt.Errorf("%w: 文本超长或包含非法 UTF-8/控制/Bidi 字符", baseErr)
+	} else {
+		return trimmed, nil
 	}
-	return trimmed, nil
 }

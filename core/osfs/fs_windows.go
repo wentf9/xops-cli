@@ -5,16 +5,15 @@ package osfs
 import (
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
+	"golang.org/x/sys/windows"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"unsafe"
-
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
-	"golang.org/x/sys/windows"
 )
 
 const winAppendAccess uint32 = (windows.FILE_GENERIC_WRITE &^ windows.FILE_WRITE_DATA) |
@@ -87,7 +86,6 @@ func withParentDirHandleWin(root *os.Root, parentSegs []string, fn func(parentH 
 	runtime.KeepAlive(rootF)
 	return err
 }
-
 func ntCreateInRootWin(root *os.Root, parentSegs []string, leaf string, access, disp, opts, attrs uint32, ownerOnly bool, inh uint32) (windows.Handle, error) {
 	var sd *windows.SECURITY_DESCRIPTOR
 	if ownerOnly {
@@ -103,7 +101,6 @@ func ntCreateInRootWin(root *os.Root, parentSegs []string, leaf string, access, 
 	})
 	return h, err
 }
-
 func openLeafInRootWin(root *os.Root, dest pathalg.LocalRootedDest, access, disposition uint32, ownerOnly bool) (*os.File, error) {
 	segs := dest.Segments()
 	h, err := ntCreateInRootWin(root, segs[:len(segs)-1], dest.Base(), access, disposition, windows.FILE_NON_DIRECTORY_FILE, windows.FILE_ATTRIBUTE_NORMAL, ownerOnly, windows.NO_INHERITANCE)
@@ -116,23 +113,16 @@ func openLeafInRootWin(root *os.Root, dest pathalg.LocalRootedDest, access, disp
 	}
 	return f, err
 }
-
 func openLeafInRootOS(r *os.Root, d pathalg.LocalRootedDest, op rootLeafOp, perm fs.FileMode) (*os.File, error) {
-	const rw = windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE
+	const ro, rw = windows.FILE_GENERIC_READ, windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE
 	specs := [7]struct {
 		acc, disp uint32
 		mayCreate bool
 	}{
-		{windows.FILE_GENERIC_READ, windows.FILE_OPEN, false},
-		{rw, windows.FILE_CREATE, true},
-		{winAppendAccess, windows.FILE_OPEN_IF, true},
-		{rw, windows.FILE_OPEN_IF, true},
-		{windows.FILE_GENERIC_READ, windows.FILE_OPEN, false},
-		{rw, windows.FILE_OPEN, false},
-		{rw, windows.FILE_OPEN_IF, true},
+		{ro, windows.FILE_OPEN, false}, {rw, windows.FILE_CREATE, true}, {winAppendAccess, windows.FILE_OPEN_IF, true},
+		{rw, windows.FILE_OPEN_IF, true}, {ro, windows.FILE_OPEN, false}, {rw, windows.FILE_OPEN, false}, {rw, windows.FILE_OPEN_IF, true},
 	}
-	sp := specs[op]
-	return openLeafInRootWin(r, d, sp.acc, sp.disp, sp.mayCreate && perm.Perm()&0o077 == 0)
+	return openLeafInRootWin(r, d, specs[op].acc, specs[op].disp, specs[op].mayCreate && perm.Perm()&0o077 == 0)
 }
 func mkdirSegmentInRootOS(root *os.Root, parentSegs []string, leaf string, mode fs.FileMode) error {
 	h, err := ntCreateInRootWin(root, parentSegs, leaf, windows.FILE_LIST_DIRECTORY|windows.SYNCHRONIZE|windows.FILE_READ_ATTRIBUTES, windows.FILE_CREATE, windows.FILE_DIRECTORY_FILE, windows.FILE_ATTRIBUTE_DIRECTORY, mode.Perm()&0o077 == 0, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
@@ -151,7 +141,6 @@ func ensureDirOS(nativeDir string, mode fs.FileMode) error {
 	}
 	return createMissingDirsWin(toCreate, nil, nil, nil)
 }
-
 func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.File, int64, error) {
 	flags, rejectReparse := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_ANONYMOUS), false
 	switch policy {
@@ -171,7 +160,6 @@ func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.Fi
 	}
 	return wrapValidatedWindowsFile(handle, nativePath, rejectReparse)
 }
-
 func wrapValidatedWindowsFile(handle windows.Handle, path string, rejectReparse bool) (*os.File, int64, error) {
 	info, err := validateWindowsHandle(handle, path, false, rejectReparse)
 	if err == nil {
@@ -183,7 +171,6 @@ func wrapValidatedWindowsFile(handle windows.Handle, path string, rejectReparse 
 	_ = windows.CloseHandle(handle)
 	return nil, 0, err
 }
-
 func validateWindowsHandle(handle windows.Handle, path string, expectDir, rejectReparse bool) (windows.ByHandleFileInformation, error) {
 	var info windows.ByHandleFileInformation
 	if ft, err := windows.GetFileType(handle); err != nil {
@@ -203,43 +190,47 @@ func validateWindowsHandle(handle windows.Handle, path string, expectDir, reject
 	return info, nil
 }
 
+type winErrMap struct{ src, out error }
+
+func mapWinErrTable(path string, err error, tbl []winErrMap) error {
+	for _, m := range tbl {
+		if errors.Is(err, m.src) {
+			return fmt.Errorf("%w: %s: %w", m.out, path, err)
+		}
+	}
+	return nil
+}
 func mapNTStatusError(path string, err error) error {
 	if err == nil {
 		return nil
 	}
-	for _, m := range [...]struct{ st, out error }{
+	if mapped := mapWinErrTable(path, err, []winErrMap{
 		{windows.STATUS_REPARSE_POINT_ENCOUNTERED, ports.ErrSymlinkRejected}, {windows.STATUS_STOPPED_ON_SYMLINK, ports.ErrSymlinkRejected},
 		{windows.STATUS_OBJECT_NAME_COLLISION, ports.ErrAlreadyExists}, {windows.STATUS_OBJECT_NAME_NOT_FOUND, ports.ErrNotFound},
 		{windows.STATUS_OBJECT_PATH_NOT_FOUND, ports.ErrNotFound}, {windows.STATUS_FILE_IS_A_DIRECTORY, ports.ErrNotRegularFile},
 		{windows.STATUS_NOT_A_DIRECTORY, ports.ErrNotRegularFile}, {windows.STATUS_OBJECT_TYPE_MISMATCH, ports.ErrNotRegularFile},
-	} {
-		if errors.Is(err, m.st) {
-			return fmt.Errorf("%w: %s: %w", m.out, path, err)
-		}
+	}); mapped != nil {
+		return mapped
 	}
 	if nt, ok := errors.AsType[windows.NTStatus](err); ok {
 		return mapWindowsOpenError(path, nt.Errno())
 	}
 	return mapWindowsOpenError(path, err)
 }
-
 func mapWindowsOpenError(path string, err error) error {
 	if err == nil {
 		return nil
 	}
-	for _, m := range [...]struct{ we, out error }{
+	if mapped := mapWinErrTable(path, err, []winErrMap{
 		{windows.ERROR_FILE_NOT_FOUND, ports.ErrNotFound}, {windows.ERROR_PATH_NOT_FOUND, ports.ErrNotFound},
 		{windows.ERROR_FILE_EXISTS, ports.ErrAlreadyExists}, {windows.ERROR_ALREADY_EXISTS, ports.ErrAlreadyExists},
 		{windows.ERROR_ACCESS_DENIED, ports.ErrPermissionDenied}, {windows.ERROR_PIPE_BUSY, ports.ErrNotRegularFile},
 		{windows.ERROR_CANT_ACCESS_FILE, ports.ErrNotRegularFile},
-	} {
-		if errors.Is(err, m.we) {
-			return fmt.Errorf("%w: %s: %w", m.out, path, err)
-		}
+	}); mapped != nil {
+		return mapped
 	}
 	return mapOSError(err)
 }
-
 func tryLockFileOS(f *os.File, exclusive bool) error {
 	flags := pickIf(exclusive, uint32(windows.LOCKFILE_FAIL_IMMEDIATELY|windows.LOCKFILE_EXCLUSIVE_LOCK), uint32(windows.LOCKFILE_FAIL_IMMEDIATELY))
 	var ol windows.Overlapped

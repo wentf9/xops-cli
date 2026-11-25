@@ -34,21 +34,44 @@ func NewClockCore(start time.Time) *ClockCore {
 	return &ClockCore{now: start.UTC().Round(0), notify: make(chan struct{})}
 }
 
-// Now / Since / PendingTimers / Advance / AdvanceToNext / NewTimer / WaitPending 驱动虚拟时钟。
-func (c *ClockCore) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+// Now / Since / PendingTimers / Advance / AdvanceToNext / NewTimer / Sleep / WaitPending 驱动虚拟时钟（nil 接收者安全失败关闭）。
+func (c *ClockCore) Now() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
 func (c *ClockCore) Since(t time.Time) time.Duration {
+	if c == nil {
+		return 0
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.now.Sub(t)
 }
-func (c *ClockCore) PendingTimers() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.timers) }
+func (c *ClockCore) PendingTimers() int {
+	if c == nil {
+		return 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.timers)
+}
 func (c *ClockCore) Advance(d time.Duration) {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
 	c.now = c.now.Add(max(d, 0))
 	c.fireDueLocked()
 	c.mu.Unlock()
 }
 func (c *ClockCore) AdvanceToNext() (delta time.Duration, ok bool) {
+	if c == nil {
+		return 0, false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, tm := range c.timers {
@@ -63,11 +86,27 @@ func (c *ClockCore) AdvanceToNext() (delta time.Duration, ok bool) {
 	return delta, ok
 }
 func (c *ClockCore) NewTimer(d time.Duration) ports.Timer {
+	if c == nil {
+		return &ClockTimer{}
+	}
 	tm := &ClockTimer{clk: c, ch: make(chan time.Time, 1)}
 	c.mu.Lock()
 	c.armTimerLocked(tm, d)
 	c.mu.Unlock()
 	return tm
+}
+func (c *ClockCore) Sleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	tm := c.NewTimer(d)
+	defer tm.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-tm.C():
+		return nil
+	}
 }
 func (c *ClockCore) WaitPending(ctx context.Context, n int) error {
 	for {
@@ -185,31 +224,16 @@ func AppendCSVAsset(spec *inventory.ImportBundleSpec, line string) error {
 	return nil
 }
 
-// OpenSimForwardChannel 按 ForwardSpec 方向演练 TunnelTransport 并返回绑定地址与待关闭通道。
+// OpenSimForwardChannel 按 ForwardSpec 方向与显式端点类型（TCP/Unix）演练 TunnelTransport，
+// 同时覆盖本地 StreamLocal 拨号（DialStreamLocal）与远端 StreamLocal 监听（ListenStreamLocal）。
 func OpenSimForwardChannel(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (string, io.Closer, error) {
 	switch spec.Direction() {
 	case ports.ForwardLocal:
-		hp, err := parseHostPort(spec.TargetAddr())
-		if err != nil {
-			return "", nil, err
-		}
-		c, err := transport.DialTCP(ctx, hp)
-		return spec.BindAddr(), c, err
+		return openSimLocalForward(ctx, transport, spec)
 	case ports.ForwardRemote:
-		ln, err := transport.ListenTCP(ctx, spec.BindAddr())
-		if err != nil {
-			return "", nil, err
-		}
-		return ln.Addr().String(), ln, nil
+		return openSimRemoteForward(ctx, transport, spec)
 	case ports.ForwardDynamic:
 		return spec.BindAddr(), nil, nil
-	case ports.ForwardStreamLocal:
-		rp, err := pathalg.ParseRemotePath(spec.TargetAddr())
-		if err != nil {
-			return "", nil, fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
-		}
-		c, err := transport.DialStreamLocal(ctx, rp)
-		return spec.BindAddr(), c, err
 	case ports.ForwardTUN:
 		ts, ok := spec.TUN().Get()
 		if !ok || !ts.IsValid() {
@@ -220,6 +244,39 @@ func OpenSimForwardChannel(ctx context.Context, transport ports.TunnelTransport,
 	default:
 		return "", nil, ports.ErrInvalidArgument
 	}
+}
+func openSimLocalForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (string, io.Closer, error) {
+	if spec.TargetKind() == ports.ForwardEndpointUnix {
+		rp, err := pathalg.ParseRemotePath(spec.TargetAddr())
+		if err != nil {
+			return "", nil, fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		}
+		c, err := transport.DialStreamLocal(ctx, rp)
+		return spec.BindAddr(), c, err
+	}
+	hp, err := parseHostPort(spec.TargetAddr())
+	if err != nil {
+		return "", nil, err
+	}
+	c, err := transport.DialTCP(ctx, hp)
+	return spec.BindAddr(), c, err
+}
+func openSimRemoteForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (string, io.Closer, error) {
+	var ln net.Listener
+	var err error
+	if spec.BindKind() == ports.ForwardEndpointUnix {
+		rp, pErr := pathalg.ParseRemotePath(spec.BindAddr())
+		if pErr != nil {
+			return "", nil, fmt.Errorf("%w: %w", ports.ErrInvalidArgument, pErr)
+		}
+		ln, err = transport.ListenStreamLocal(ctx, rp)
+	} else {
+		ln, err = transport.ListenTCP(ctx, spec.BindAddr())
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	return ln.Addr().String(), ln, nil
 }
 
 func parseHostPort(raw string) (netaddr.HostPort, error) {

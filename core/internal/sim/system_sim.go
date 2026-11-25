@@ -3,16 +3,13 @@ package sim
 import (
 	"bytes"
 	"context"
-	"io"
-	"net"
-	"slices"
-	"sync"
-	"sync/atomic"
-
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
+	"io"
+	"net"
+	"slices"
 )
 
 // ProcessHandler 定义 SimProcessPort 的可编程命令处理回调。
@@ -159,100 +156,11 @@ func (t *SimTerminalPort) WithRawTerminal(ctx context.Context, fn func(term port
 	var blockInput bool
 	var resizeSnap []ports.TerminalSize
 	t.withLock(func() {
-		inSnap = bytes.Clone(t.inData)
-		blockInput = t.blockInput
-		resizeSnap = slices.Clone(t.resizes)
-		t.resizes = nil
+		inSnap, blockInput, resizeSnap, t.resizes = bytes.Clone(t.inData), t.blockInput, slices.Clone(t.resizes), nil
 	})
-	resizeCh := make(chan ports.TerminalSize, max(4, len(resizeSnap)))
-	for _, rsz := range resizeSnap {
-		resizeCh <- rsz
-	}
-	h := &simTerminalHandle{owner: t, size: sz, inR: bytes.NewReader(inSnap), blockAfter: blockInput, resizeCh: resizeCh, valid: true}
-	defer func() { h.expired.Store(true); close(resizeCh) }()
+	h, expire := memtree.NewTerminalHandle(sz, inSnap, blockInput, resizeSnap, func(p []byte) {
+		t.withLock(func() { _, _ = t.outBuf.Write(p) })
+	})
+	defer expire()
 	return fn(h)
-}
-
-type simTerminalHandle struct {
-	owner      *SimTerminalPort
-	size       ports.TerminalSize
-	inMu       sync.Mutex
-	inR        *bytes.Reader
-	blockAfter bool
-	stopMu     sync.Mutex
-	stopCh     chan struct{}
-	resizeCh   chan ports.TerminalSize
-	valid      bool
-	expired    atomic.Bool
-}
-
-func (h *simTerminalHandle) alive() bool                             { return h != nil && h.valid && !h.expired.Load() }
-func (h *simTerminalHandle) ResizeEvents() <-chan ports.TerminalSize { return h.resizeCh }
-func (h *simTerminalHandle) setStopCh(ch chan struct{}) {
-	h.stopMu.Lock()
-	h.stopCh = ch
-	h.stopMu.Unlock()
-}
-func (h *simTerminalHandle) currentStopCh() chan struct{} {
-	h.stopMu.Lock()
-	ch := h.stopCh
-	h.stopMu.Unlock()
-	return ch
-}
-func (h *simTerminalHandle) Read(p []byte) (int, error) {
-	if !h.alive() {
-		return 0, ports.ErrHandleExpired
-	}
-	h.inMu.Lock()
-	var n int
-	var err error
-	if h.inR != nil {
-		n, err = h.inR.Read(p)
-	} else {
-		err = io.EOF
-	}
-	h.inMu.Unlock()
-	if n > 0 || err != io.EOF || !h.blockAfter {
-		return n, err
-	}
-	if ch := h.currentStopCh(); ch != nil {
-		<-ch
-	}
-	return 0, io.EOF
-}
-func (h *simTerminalHandle) Write(p []byte) (int, error) {
-	if !h.alive() {
-		return 0, ports.ErrHandleExpired
-	}
-	if h.owner != nil {
-		h.owner.withLock(func() { _, _ = h.owner.outBuf.Write(p) })
-	}
-	return len(p), nil
-}
-func (h *simTerminalHandle) Size() (out ports.TerminalSize, err error) {
-	if !h.alive() {
-		return out, ports.ErrHandleExpired
-	}
-	return h.size, nil
-}
-
-// Relay 在同步作用域内经 core/conc.RunWait 并发驱动终端输入、远端输出与窗口缩放回调（零裸 go、零泄漏）。
-//
-//xops:syncclosure
-func (h *simTerminalHandle) Relay(ctx context.Context, remoteIn io.Writer, remoteOut io.Reader, onResize func(ctx context.Context, size ports.TerminalSize) error) error {
-	if !h.alive() {
-		return ports.ErrHandleExpired
-	}
-	if err := checkCtx(ctx); err != nil {
-		return err
-	}
-	if remoteIn == nil || remoteOut == nil {
-		return ports.ErrInvalidArgument
-	}
-	stopCh := make(chan struct{})
-	var stopOnce sync.Once
-	triggerStop := func() { stopOnce.Do(func() { close(stopCh) }) }
-	h.setStopCh(stopCh)
-	defer func() { triggerStop(); h.setStopCh(nil) }()
-	return memtree.RelayTerminalStreams(ctx, h, h, remoteIn, remoteOut, h.resizeCh, onResize, triggerStop)
 }

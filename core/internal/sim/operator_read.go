@@ -3,12 +3,11 @@ package sim
 import (
 	"bytes"
 	"context"
-	"io/fs"
-	"path"
-
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
+	"io/fs"
+	"path"
 )
 
 // SimOperatorReadFS 实现 ports.OperatorReadFS 的人工只读源内存仿真器（复用 memtree.Tree）。

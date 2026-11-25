@@ -5,11 +5,6 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"io"
-	"maps"
-	"slices"
-	"strings"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
@@ -19,6 +14,9 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
+	"io"
+	"slices"
+	"strings"
 )
 
 // SimInventoryStore 实现 ports.InventoryStore，支持 CAS 并发冲突与不确定落盘结果注入。
@@ -93,56 +91,68 @@ func (s *SimInventoryStore) advanceLocked(next inventory.Graph, optRev algebraic
 	return rev, nil
 }
 
-// SimJournalStore 实现 ports.JournalStore 的纯内存确定性传输 WAL 仿真器。
+// SimJournalStore 实现 ports.JournalStore 的纯内存确定性双代传输 WAL 仿真器（支持按代隔离与单侧损坏注入）。
 //
 //xops:opaque
 //xops:failclosed
 type SimJournalStore struct {
 	simBase
-	data map[security.OperationID][]fsm.TransferJournalRecord
+	jm *memtree.JournalMap
 }
 
-// NewSimJournalStore 创建空白传输 Journal 仿真器。
+// NewSimJournalStore 创建空白双代传输 Journal 仿真器。
 func NewSimJournalStore() *SimJournalStore {
-	return &SimJournalStore{simBase: newSimBase(nil), data: make(map[security.OperationID][]fsm.TransferJournalRecord)}
+	return &SimJournalStore{simBase: newSimBase(nil), jm: memtree.NewJournalMap()}
+}
+
+// CorruptGeneration 将指定 (transferID, generation) 标记为损坏态以供双代损坏隔离崩溃恢复测试。
+func (s *SimJournalStore) CorruptGeneration(id security.OperationID, generation uint64, cause error) {
+	s.withLock(func() { s.jm.CorruptGenerationLocked(id, generation, cause) })
 }
 func (s *SimJournalStore) Append(ctx context.Context, rec fsm.TransferJournalRecord) error {
 	if err := s.check(ctx, "journal.append", rec.IsValid()); err != nil {
 		return err
 	}
-	s.withLock(func() { s.data[rec.TransferID()] = append(s.data[rec.TransferID()], rec) })
+	s.withLock(func() { s.jm.AppendLocked(rec) })
 	return nil
 }
-func (s *SimJournalStore) Load(ctx context.Context, id security.OperationID) ([]fsm.TransferJournalRecord, error) {
-	if err := s.check(ctx, "journal.load", id.IsValid()); err != nil {
+func (s *SimJournalStore) Load(ctx context.Context, id security.OperationID) (out []fsm.TransferJournalRecord, err error) {
+	if err = s.check(ctx, "journal.load", id.IsValid()); err != nil {
 		return nil, err
 	}
-	if recs := withLockRet(&s.simBase, nil, func() []fsm.TransferJournalRecord { return slices.Clone(s.data[id]) }); recs != nil {
-		return recs, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.jm.LoadLocked(id)
+}
+func (s *SimJournalStore) LoadGenerations(ctx context.Context, id security.OperationID) ([]ports.JournalGenerationSnapshot, error) {
+	if err := s.check(ctx, "journal.load_gens", id.IsValid()); err != nil {
+		return nil, err
 	}
-	return nil, ports.ErrNotFound
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.jm.LoadGenerationsLocked(id)
+}
+func (s *SimJournalStore) PruneGeneration(ctx context.Context, id security.OperationID, generation uint64) error {
+	if err := s.check(ctx, "journal.prune", id.IsValid(), generation > 0); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.jm.PruneGenerationLocked(id, generation)
 }
 func (s *SimJournalStore) ListActive(ctx context.Context) ([]security.OperationID, error) {
 	if err := s.check(ctx, "journal.list"); err != nil {
 		return nil, err
 	}
-	return withLockRet(&s.simBase, nil, func() []security.OperationID {
-		ids := slices.Collect(maps.Keys(s.data))
-		slices.SortFunc(ids, security.OperationID.Compare)
-		return ids
-	}), nil
+	return withLockRet(&s.simBase, nil, func() []security.OperationID { return s.jm.ListActiveLocked() }), nil
 }
 func (s *SimJournalStore) Delete(ctx context.Context, id security.OperationID) error {
 	if err := s.check(ctx, "journal.delete", id.IsValid()); err != nil {
 		return err
 	}
-	return withLockRet(&s.simBase, ErrSimNotInitialized, func() error {
-		if _, ok := s.data[id]; !ok {
-			return ports.ErrNotFound
-		}
-		delete(s.data, id)
-		return nil
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.jm.DeleteLocked(id)
 }
 
 // SimFormatImporter 实现 ports.FormatImporter，将 CSV 行（alias,addr,port,user）解析为 ImportBundle。

@@ -4,107 +4,34 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"io"
-	"maps"
 	"net"
 	"slices"
-	"sync"
-	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
-	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-// SimEnvPort 实现 ports.EnvPort 的纯内存环境变量与本机身份元信息仿真器（零 os.Getenv）。
-//
-//xops:opaque
-//xops:failclosed
-type SimEnvPort struct {
-	simBase
-	env  map[string]string
-	id   ports.LocalIdentityInfo
-	hasI bool
-}
+// SimEnvPort / SimSSHFPLookup / SimTUNDevicePort 为 memtree 纯内存仿真端口的公开别名。
+type (
+	SimEnvPort       = memtree.EnvPort
+	SimSSHFPLookup   = memtree.SSHFPLookup
+	SimTUNDevicePort = memtree.TUNDevicePort
+)
 
 // NewSimEnvPort 创建预置环境变量快照与可选本机身份信息的仿真环境端口。
 func NewSimEnvPort(env map[string]string, id ports.LocalIdentityInfo) *SimEnvPort {
-	p := &SimEnvPort{simBase: newSimBase(nil), env: maps.Clone(env)}
-	if p.env == nil {
-		p.env = make(map[string]string)
-	}
-	if id.IsValid() {
-		p.id, p.hasI = id, true
-	}
-	return p
-}
-
-// SetEnv / SetIdentity 更新测试夹具环境变量与本机身份快照。
-func (e *SimEnvPort) SetEnv(key, val string) {
-	if key != "" {
-		e.withLock(func() { e.env[key] = val })
-	}
-}
-func (e *SimEnvPort) SetIdentity(id ports.LocalIdentityInfo) {
-	e.withLock(func() { e.id, e.hasI = id, id.IsValid() })
-}
-func (e *SimEnvPort) LookupEnv(key string) (val string, ok bool) {
-	if !e.ok() || key == "" {
-		return "", false
-	}
-	e.withLock(func() { val, ok = e.env[key] })
-	return val, ok
-}
-func (e *SimEnvPort) Environ() map[string]string {
-	return withLockRet(&e.simBase, nil, func() map[string]string { return maps.Clone(e.env) })
-}
-func (e *SimEnvPort) LookupLocalIdentity() (out ports.LocalIdentityInfo, err error) {
-	if !e.ok() {
-		return out, ErrSimNotInitialized
-	}
-	if fErr := e.faults.Check("env.identity"); fErr != nil {
-		return out, fErr
-	}
-	return withLockRet(&e.simBase, out, func() ports.LocalIdentityInfo {
-		if !e.hasI {
-			err = ports.ErrNotFound
-			return out
-		}
-		return e.id
-	}), err
-}
-
-// SimSSHFPLookup 实现 ports.SSHFPLookupPort 的确定性内存 DNS SSHFP 查询仿真器。
-//
-//xops:opaque
-//xops:failclosed
-type SimSSHFPLookup struct {
-	simBase
-	records map[string][]ports.SSHFPRecord
+	return memtree.NewEnvPort(ErrSimNotInitialized, env, id)
 }
 
 // NewSimSSHFPLookup 创建空白的 SSHFP 查询仿真器。
-func NewSimSSHFPLookup() *SimSSHFPLookup {
-	return &SimSSHFPLookup{simBase: newSimBase(nil), records: make(map[string][]ports.SSHFPRecord)}
-}
+func NewSimSSHFPLookup() *SimSSHFPLookup { return memtree.NewSSHFPLookup(ErrSimNotInitialized) }
 
-// SetRecords 为指定规范化主机设置有效 SSHFP 记录集（过滤无效零值记录）。
-func (s *SimSSHFPLookup) SetRecords(host netaddr.CanonicalHost, recs ...ports.SSHFPRecord) {
-	if host.IsValid() {
-		valid := slices.DeleteFunc(slices.Clone(recs), func(r ports.SSHFPRecord) bool { return !r.IsValid() })
-		s.withLock(func() { s.records[host.String()] = valid })
-	}
-}
-func (s *SimSSHFPLookup) LookupSSHFP(ctx context.Context, host netaddr.CanonicalHost) ([]ports.SSHFPRecord, error) {
-	if err := s.check(ctx, "sshfp.lookup", host.IsValid()); err != nil {
-		return nil, err
-	}
-	return withLockRet(&s.simBase, nil, func() []ports.SSHFPRecord { return slices.Clone(s.records[host.String()]) }), nil
-}
+// NewSimTUNDevicePort 创建默认可用的纯内存本机 TUN/TAP 设备仿真器。
+func NewSimTUNDevicePort() *SimTUNDevicePort { return memtree.NewTUNDevicePort(ErrSimNotInitialized) }
 
 // SimSSHAgent 实现 ports.SSHAgentPort 的纯内存 SSH Agent 通道、公钥列举与签名仿真器。
 //
@@ -289,7 +216,7 @@ func (p *SimShellProbe) ProbeShell(
 	return res, nil
 }
 
-// SimForwarder 实现 ports.ForwarderPort，返回满足 pool.ManagedResource 契约的 *SimForwardHandle。
+// SimForwarder 实现 ports.ForwarderPort，返回持留池钉选传输的 *SimForwardHandle（满足 pool.ManagedResource）。
 //
 //xops:opaque
 //xops:failclosed
@@ -298,13 +225,8 @@ type SimForwarder struct{ simBase }
 // NewSimForwarder 创建纯内存 SSH 隧道转发仿真器。
 func NewSimForwarder() *SimForwarder { return &SimForwarder{simBase: newSimBase(nil)} }
 
-// StartForward 按 ForwardSpec 方向演练借用的底层 TunnelTransport 通道，返回可受管转发句柄（参数级 //xops:borrowed 零逃逸）。
-func (f *SimForwarder) StartForward(
-	ctx context.Context,
-	//xops:borrowed
-	transport ports.TunnelTransport,
-	spec ports.ForwardSpec,
-) (ports.ForwardHandle, error) {
+// StartForward 启动单条受管隧道转发并持留非借用 transport 直至 ForwardHandle.Close()（支持启动后持续打开新通道）。
+func (f *SimForwarder) StartForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (ports.ForwardHandle, error) {
 	if err := f.check(ctx, "forward.start", transport != nil, spec.IsValid()); err != nil {
 		return nil, err
 	}
@@ -312,39 +234,8 @@ func (f *SimForwarder) StartForward(
 	if err != nil {
 		return nil, err
 	}
-	return &SimForwardHandle{initialized: true, spec: spec, boundAddr: bound, closer: closer, doneCh: make(chan struct{})}, nil
+	return memtree.NewForwardHandle(spec, bound, transport, closer), nil
 }
 
-// SimForwardHandle 实现 ports.ForwardHandle 与 core/internal/pool.ManagedResource。
-//
-//xops:opaque
-//xops:failclosed
-type SimForwardHandle struct {
-	initialized bool
-	spec        ports.ForwardSpec
-	boundAddr   string
-	closer      io.Closer
-	doneCh      chan struct{}
-	closeOnce   sync.Once
-	closed      atomic.Bool
-	closeErr    error
-}
-
-func (h *SimForwardHandle) IsValid() bool           { return h != nil && h.initialized && !h.closed.Load() }
-func (h *SimForwardHandle) Spec() ports.ForwardSpec { return h.spec }
-func (h *SimForwardHandle) BoundAddr() string       { return h.boundAddr }
-func (h *SimForwardHandle) Done() <-chan struct{}   { return h.doneCh }
-func (h *SimForwardHandle) Err() error              { return h.closeErr }
-func (h *SimForwardHandle) Close() error {
-	if h == nil || !h.initialized {
-		return nil
-	}
-	h.closeOnce.Do(func() {
-		h.closed.Store(true)
-		if h.closer != nil {
-			h.closeErr = h.closer.Close()
-		}
-		close(h.doneCh)
-	})
-	return h.closeErr
-}
+// SimForwardHandle 是 memtree.ForwardHandle 的别名，实现 ports.ForwardHandle 与 pool.ManagedResource。
+type SimForwardHandle = memtree.ForwardHandle

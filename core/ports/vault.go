@@ -4,27 +4,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net"
-	"slices"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
+	"net"
+	"slices"
 )
 
-const (
-	maxKeyAlgoBytes  = 128
-	maxWireBlobBytes = 64 * 1024
-	sshfpSHA1Bytes   = 20
-	sshfpSHA256Bytes = 32
-)
+const maxKeyAlgoBytes, maxWireBlobBytes, sshfpSHA1Bytes, sshfpSHA256Bytes = 128, 64 * 1024, 20, 32
 
 // SecretVault 定义 100% 作用域闭包化的凭据存储出站端口（ADR-011 / RFC §3.2）。
 type SecretVault interface {
 	// WithSecret 按 ref 读取机密并在同步闭包内借出 *secret.SecretBox；退出前无条件清零。
-	//
 	//xops:syncclosure
 	//xops:borrowed
 	WithSecret(ctx context.Context, ref secret.Ref, fn func(box *secret.SecretBox) error) error
@@ -57,46 +50,36 @@ type VaultStatusSpec struct {
 //xops:opaque
 //xops:failclosed
 type VaultStatus struct {
-	state       VaultState
-	knownStores []string
-	detail      string
-	valid       bool
+	s     VaultStatusSpec
+	valid bool
 }
 
 // NewVaultStatus 校验状态与存储后端清单并构造规范排序去重的不可变 VaultStatus。
 func NewVaultStatus(spec VaultStatusSpec) (VaultStatus, error) {
-	if !spec.State.IsValid() || slices.ContainsFunc(spec.KnownStores, func(s string) bool { return !isValidASCIIToken(s, maxPortTokenLen) }) {
-		return VaultStatus{}, fmt.Errorf("%w: VaultStatus 状态或凭据存储名非法", ErrInvalidArgument)
-	}
 	detail, err := sanitizeBoundedText(spec.Detail, maxPortDetailBytes, true, ErrInvalidArgument)
-	if err != nil {
-		return VaultStatus{}, err
+	if !spec.State.IsValid() || slices.ContainsFunc(spec.KnownStores, func(s string) bool { return !isValidASCIIToken(s, maxPortTokenLen) }) || err != nil {
+		return VaultStatus{}, firstErr(err, fmt.Errorf("%w: VaultStatus 状态或凭据存储名非法", ErrInvalidArgument))
 	}
-	var stores []string
-	if len(spec.KnownStores) > 0 {
-		stores = slices.Clone(spec.KnownStores)
-		slices.Sort(stores)
-		stores = slices.Compact(stores)
-	}
-	return VaultStatus{state: spec.State, knownStores: stores, detail: detail, valid: true}, nil
+	stores := cloneSliceNilIfEmpty(spec.KnownStores)
+	slices.Sort(stores)
+	spec.KnownStores, spec.Detail = slices.Compact(stores), detail
+	return VaultStatus{s: spec, valid: true}, nil
 }
-func (s VaultStatus) IsValid() bool         { return s.valid && s.state.IsValid() }
+func (s VaultStatus) IsValid() bool         { return s.valid && s.s.State.IsValid() }
 func (s VaultStatus) IsZero() bool          { return !s.IsValid() }
-func (s VaultStatus) State() VaultState     { return pickIf(s.IsValid(), s.state, VaultStateInvalid) }
-func (s VaultStatus) IsUnlocked() bool      { return s.IsValid() && s.state == VaultStateUnlocked }
-func (s VaultStatus) KnownStores() []string { return slices.Clone(s.knownStores) }
-func (s VaultStatus) Detail() string        { return s.detail }
+func (s VaultStatus) State() VaultState     { return orZero(s.IsValid(), s.s.State) }
+func (s VaultStatus) IsUnlocked() bool      { return s.IsValid() && s.s.State == VaultStateUnlocked }
+func (s VaultStatus) KnownStores() []string { return slices.Clone(s.s.KnownStores) }
+func (s VaultStatus) Detail() string        { return s.s.Detail }
 func (s VaultStatus) Equal(o VaultStatus) bool {
-	return s.IsValid() && o.IsValid() && s.state == o.state && slices.Equal(s.knownStores, o.knownStores) && s.detail == o.detail
+	return s.IsValid() && o.IsValid() && s.s.State == o.s.State && slices.Equal(s.s.KnownStores, o.s.KnownStores) && s.s.Detail == o.s.Detail
 }
 
 // VaultControlPort 定义凭据库初始化、解锁、锁定与状态查询出站端口（P3-T1 <-> P4-T4）。
 // Init / Unlock 无回调参数，借用的主口令 *secret.SecretBox 由 secretbox Rule 1 与具体实现参数级 //xops:borrowed 共同保证零逃逸。
 type VaultControlPort interface {
-	// Init 使用借用的主口令 SecretBox 初始化新凭据库；已初始化返回 ErrAlreadyExists。
-	Init(ctx context.Context, pass *secret.SecretBox) error
-	// Unlock 使用借用的主口令 SecretBox 解锁凭据库；口令错误返回 ErrAuthFailed，未初始化返回 ErrNotFound。
-	Unlock(ctx context.Context, pass *secret.SecretBox) error
+	Init(ctx context.Context, pass *secret.SecretBox) error   // 使用借用主口令初始化；已初始化返回 ErrAlreadyExists
+	Unlock(ctx context.Context, pass *secret.SecretBox) error // 解锁凭据库；口令错返回 ErrAuthFailed，未初始化返回 ErrNotFound
 	Lock(ctx context.Context) error
 	Status(ctx context.Context) (VaultStatus, error)
 }
@@ -114,10 +97,8 @@ type PublicKeyInfoSpec struct {
 //xops:opaque
 //xops:failclosed
 type PublicKeyInfo struct {
-	algorithm, comment string
-	fingerprint        inventory.KeyFingerprint
-	wireBlob           []byte
-	valid              bool
+	s     PublicKeyInfoSpec
+	valid bool
 }
 
 // NewPublicKeyInfo 校验算法名、指纹与非空公钥线缆载荷并构造不可变 PublicKeyInfo。
@@ -126,21 +107,19 @@ func NewPublicKeyInfo(spec PublicKeyInfoSpec) (PublicKeyInfo, error) {
 		return PublicKeyInfo{}, fmt.Errorf("%w: 公钥算法、指纹或 wire 载荷非法", ErrInvalidArgument)
 	}
 	comment, err := sanitizeBoundedText(spec.Comment, maxPortDetailBytes, true, ErrInvalidArgument)
-	if err != nil {
-		return PublicKeyInfo{}, err
-	}
-	return PublicKeyInfo{algorithm: spec.Algorithm, fingerprint: spec.Fingerprint, wireBlob: bytes.Clone(spec.WireBlob), comment: comment, valid: true}, nil
+	spec.WireBlob, spec.Comment = bytes.Clone(spec.WireBlob), comment
+	return pickIf(err == nil, PublicKeyInfo{s: spec, valid: true}, PublicKeyInfo{}), err
 }
 func (k PublicKeyInfo) IsValid() bool {
-	return k.valid && k.algorithm != "" && k.fingerprint.IsValid() && len(k.wireBlob) > 0
+	return k.valid && k.s.Algorithm != "" && k.s.Fingerprint.IsValid() && len(k.s.WireBlob) > 0
 }
 func (k PublicKeyInfo) IsZero() bool                          { return !k.IsValid() }
-func (k PublicKeyInfo) Algorithm() string                     { return k.algorithm }
-func (k PublicKeyInfo) Fingerprint() inventory.KeyFingerprint { return k.fingerprint }
-func (k PublicKeyInfo) WireBlob() []byte                      { return bytes.Clone(k.wireBlob) }
-func (k PublicKeyInfo) Comment() string                       { return k.comment }
+func (k PublicKeyInfo) Algorithm() string                     { return k.s.Algorithm }
+func (k PublicKeyInfo) Fingerprint() inventory.KeyFingerprint { return k.s.Fingerprint }
+func (k PublicKeyInfo) WireBlob() []byte                      { return bytes.Clone(k.s.WireBlob) }
+func (k PublicKeyInfo) Comment() string                       { return k.s.Comment }
 func (k PublicKeyInfo) Equal(o PublicKeyInfo) bool {
-	return k.IsValid() && o.IsValid() && k.algorithm == o.algorithm && k.fingerprint.Equal(o.fingerprint) && bytes.Equal(k.wireBlob, o.wireBlob) && k.comment == o.comment
+	return k.IsValid() && o.IsValid() && k.s.Algorithm == o.s.Algorithm && k.s.Fingerprint.Equal(o.s.Fingerprint) && bytes.Equal(k.s.WireBlob, o.s.WireBlob) && k.s.Comment == o.s.Comment
 }
 
 // Signature 表示协议库无关的不可变 SSH 数字签名值对象；零值恒无效。
@@ -194,9 +173,8 @@ type SSHFPRecordSpec struct {
 //xops:opaque
 //xops:failclosed
 type SSHFPRecord struct {
-	algorithm, fpType    uint8
-	digest               []byte
-	authenticated, valid bool
+	s     SSHFPRecordSpec
+	valid bool
 }
 
 // NewSSHFPRecord 校验算法编号、摘要类型（1=SHA-1/20B, 2=SHA-256/32B）与长度并构造不可变记录。
@@ -205,16 +183,17 @@ func NewSSHFPRecord(spec SSHFPRecordSpec) (SSHFPRecord, error) {
 	if spec.Algorithm == 0 || wantLen == 0 || len(spec.Digest) != wantLen {
 		return SSHFPRecord{}, fmt.Errorf("%w: SSHFP 算法/摘要类型或长度非法", ErrInvalidArgument)
 	}
-	return SSHFPRecord{algorithm: spec.Algorithm, fpType: spec.FingerprintType, digest: bytes.Clone(spec.Digest), authenticated: spec.Authenticated, valid: true}, nil
+	spec.Digest = bytes.Clone(spec.Digest)
+	return SSHFPRecord{s: spec, valid: true}, nil
 }
-func (r SSHFPRecord) IsValid() bool          { return r.valid && r.algorithm != 0 && len(r.digest) > 0 }
+func (r SSHFPRecord) IsValid() bool          { return r.valid && r.s.Algorithm != 0 && len(r.s.Digest) > 0 }
 func (r SSHFPRecord) IsZero() bool           { return !r.IsValid() }
-func (r SSHFPRecord) Algorithm() uint8       { return pickIf(r.IsValid(), r.algorithm, 0) }
-func (r SSHFPRecord) FingerprintType() uint8 { return pickIf(r.IsValid(), r.fpType, 0) }
-func (r SSHFPRecord) Digest() []byte         { return bytes.Clone(r.digest) }
-func (r SSHFPRecord) Authenticated() bool    { return r.IsValid() && r.authenticated }
+func (r SSHFPRecord) Algorithm() uint8       { return orZero(r.IsValid(), r.s.Algorithm) }
+func (r SSHFPRecord) FingerprintType() uint8 { return orZero(r.IsValid(), r.s.FingerprintType) }
+func (r SSHFPRecord) Digest() []byte         { return bytes.Clone(r.s.Digest) }
+func (r SSHFPRecord) Authenticated() bool    { return r.IsValid() && r.s.Authenticated }
 func (r SSHFPRecord) Equal(o SSHFPRecord) bool {
-	return r.IsValid() && o.IsValid() && r.algorithm == o.algorithm && r.fpType == o.fpType && r.authenticated == o.authenticated && bytes.Equal(r.digest, o.digest)
+	return r.IsValid() && o.IsValid() && r.s.Algorithm == o.s.Algorithm && r.s.FingerprintType == o.s.FingerprintType && r.s.Authenticated == o.s.Authenticated && bytes.Equal(r.s.Digest, o.s.Digest)
 }
 
 // SSHFPLookupPort 定义 DNS SSHFP 记录只读查询出站端口（由 internal/host/sys 实现并注入 sshnet/hostkey）。
@@ -249,11 +228,8 @@ type HostTrustRequestSpec struct {
 //xops:opaque
 //xops:failclosed
 type HostTrustRequest struct {
-	endpoint   netaddr.Endpoint
-	presented  PublicKeyInfo
-	mode       option.StrictHostKeyCheckingMode
-	knownHosts option.KnownHostsList
-	valid      bool
+	s     HostTrustRequestSpec
+	valid bool
 }
 
 // NewHostTrustRequest 校验端点、远端公钥与校验模式并构造不可变 HostTrustRequest。
@@ -261,16 +237,16 @@ func NewHostTrustRequest(spec HostTrustRequestSpec) (HostTrustRequest, error) {
 	if !spec.Endpoint.IsValid() || !spec.Presented.IsValid() || spec.Mode.String() == "" {
 		return HostTrustRequest{}, fmt.Errorf("%w: Endpoint、Presented 公钥与模式均须有效", ErrInvalidArgument)
 	}
-	return HostTrustRequest{endpoint: spec.Endpoint, presented: spec.Presented, mode: spec.Mode, knownHosts: spec.KnownHosts, valid: true}, nil
+	return HostTrustRequest{s: spec, valid: true}, nil
 }
 func (r HostTrustRequest) IsValid() bool {
-	return r.valid && r.endpoint.IsValid() && r.presented.IsValid() && r.mode.String() != ""
+	return r.valid && r.s.Endpoint.IsValid() && r.s.Presented.IsValid() && r.s.Mode.String() != ""
 }
 func (r HostTrustRequest) IsZero() bool                           { return !r.IsValid() }
-func (r HostTrustRequest) Endpoint() netaddr.Endpoint             { return r.endpoint }
-func (r HostTrustRequest) Presented() PublicKeyInfo               { return r.presented }
-func (r HostTrustRequest) Mode() option.StrictHostKeyCheckingMode { return r.mode }
-func (r HostTrustRequest) KnownHosts() option.KnownHostsList      { return r.knownHosts }
+func (r HostTrustRequest) Endpoint() netaddr.Endpoint             { return r.s.Endpoint }
+func (r HostTrustRequest) Presented() PublicKeyInfo               { return r.s.Presented }
+func (r HostTrustRequest) Mode() option.StrictHostKeyCheckingMode { return r.s.Mode }
+func (r HostTrustRequest) KnownHosts() option.KnownHostsList      { return r.s.KnownHosts }
 
 // HostTrustCheckSpec 是构造不可变 HostTrustCheck 的显式入参规格。
 type HostTrustCheckSpec struct {
@@ -286,12 +262,8 @@ type HostTrustCheckSpec struct {
 //xops:opaque
 //xops:failclosed
 type HostTrustCheck struct {
-	status               HostTrustStatus
-	endpoint             netaddr.Endpoint
-	presented            PublicKeyInfo
-	expectedFingerprints []inventory.KeyFingerprint
-	reason               string
-	valid                bool
+	s     HostTrustCheckSpec
+	valid bool
 }
 
 // NewHostTrustCheck 校验核验状态、端点、呈递公钥与可选预期指纹列表并构造不可变 HostTrustCheck。
@@ -300,28 +272,23 @@ func NewHostTrustCheck(spec HostTrustCheckSpec) (HostTrustCheck, error) {
 		return HostTrustCheck{}, fmt.Errorf("%w: HostTrustCheck 缺少有效字段或含无效预期指纹", ErrInvalidArgument)
 	}
 	reason, err := sanitizeBoundedText(spec.Reason, maxPortDetailBytes, true, ErrInvalidArgument)
-	if err != nil {
-		return HostTrustCheck{}, err
-	}
-	return HostTrustCheck{status: spec.Status, endpoint: spec.Endpoint, presented: spec.Presented, expectedFingerprints: cloneSliceNilIfEmpty(spec.ExpectedFingerprints), reason: reason, valid: true}, nil
+	spec.ExpectedFingerprints, spec.Reason = cloneSliceNilIfEmpty(spec.ExpectedFingerprints), reason
+	return pickIf(err == nil, HostTrustCheck{s: spec, valid: true}, HostTrustCheck{}), err
 }
 func (c HostTrustCheck) IsValid() bool {
-	return c.valid && c.status.IsValid() && c.endpoint.IsValid() && c.presented.IsValid()
+	return c.valid && c.s.Status.IsValid() && c.s.Endpoint.IsValid() && c.s.Presented.IsValid()
 }
-func (c HostTrustCheck) IsZero() bool { return !c.IsValid() }
-func (c HostTrustCheck) Status() HostTrustStatus {
-	return pickIf(c.IsValid(), c.status, HostTrustStatusInvalid)
-}
-func (c HostTrustCheck) IsTrusted() bool            { return c.IsValid() && c.status == HostTrustTrusted }
-func (c HostTrustCheck) Endpoint() netaddr.Endpoint { return c.endpoint }
-func (c HostTrustCheck) Presented() PublicKeyInfo   { return c.presented }
-func (c HostTrustCheck) Reason() string             { return c.reason }
+func (c HostTrustCheck) IsZero() bool               { return !c.IsValid() }
+func (c HostTrustCheck) Status() HostTrustStatus    { return orZero(c.IsValid(), c.s.Status) }
+func (c HostTrustCheck) IsTrusted() bool            { return c.IsValid() && c.s.Status == HostTrustTrusted }
+func (c HostTrustCheck) Endpoint() netaddr.Endpoint { return c.s.Endpoint }
+func (c HostTrustCheck) Presented() PublicKeyInfo   { return c.s.Presented }
+func (c HostTrustCheck) Reason() string             { return c.s.Reason }
 func (c HostTrustCheck) ExpectedFingerprints() []inventory.KeyFingerprint {
-	return slices.Clone(c.expectedFingerprints)
+	return slices.Clone(c.s.ExpectedFingerprints)
 }
 func (c HostTrustCheck) Equal(o HostTrustCheck) bool {
-	return c.IsValid() && o.IsValid() && c.status == o.status && c.endpoint.Equal(o.endpoint) && c.presented.Equal(o.presented) &&
-		slices.EqualFunc(c.expectedFingerprints, o.expectedFingerprints, inventory.KeyFingerprint.Equal) && c.reason == o.reason
+	return c.IsValid() && o.IsValid() && c.s.Status == o.s.Status && c.s.Endpoint.Equal(o.s.Endpoint) && c.s.Presented.Equal(o.s.Presented) && slices.EqualFunc(c.s.ExpectedFingerprints, o.s.ExpectedFingerprints, inventory.KeyFingerprint.Equal) && c.s.Reason == o.s.Reason
 }
 
 // HostTrustPort 定义主机密钥信任库（known_hosts / SSHFP）查询、校验与记录出站端口（INV-C5 / INV-E2）。

@@ -2,15 +2,14 @@ package sim
 
 import (
 	"context"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
+	"github.com/wentf9/xops-cli/core/ports"
 	"io"
 	"io/fs"
 	"path"
 	"sync/atomic"
-
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
-	"github.com/wentf9/xops-cli/core/ports"
+	"time"
 )
 
 // SimRemoteFS 是纯内存远端 POSIX/SFTP 文件系统仿真器（ADR-016，仅使用 path 包，支持中间目录软链解析、(dev,ino) 锚点与原子子树重命名）。
@@ -165,7 +164,6 @@ func (r *SimRemoteFS) ReadChunk(ctx context.Context, p pathalg.RemotePath, offse
 	}
 	return int64(n), nil
 }
-
 func (r *SimRemoteFS) WriteFileAtomic(ctx context.Context, p pathalg.RemotePath, spec ports.RemoteWriteSpec, src io.Reader) (out ports.RemoteFileStat, err error) {
 	if err = r.check(ctx, "", p.IsValid(), spec.IsValid(), src != nil); err != nil {
 		return out, err
@@ -197,9 +195,9 @@ func (r *SimRemoteFS) WriteChunk(ctx context.Context, p pathalg.RemotePath, offs
 		return r.tree.WriteRemoteChunkLocked(rawKey, offset, chunk)
 	})
 }
-func (r *SimRemoteFS) RenameAtomic(ctx context.Context, oldPath, newPath pathalg.RemotePath, expectedAnchor algebraic.Option[ports.RemoteFileAnchor]) error {
-	return r.doTree(ctx, "rfs.rename", oldPath, newPath.IsValid(), func(rawOld string) error {
-		return r.tree.RenameRemoteLocked(rawOld, memtree.NormPath(newPath.String()), expectedAnchor)
+func (r *SimRemoteFS) RenameAtomic(ctx context.Context, oldPath, newPath pathalg.RemotePath, spec ports.RemoteRenameSpec) error {
+	return r.doTree(ctx, "rfs.rename", oldPath, newPath.IsValid() && spec.IsValid(), func(rawOld string) error {
+		return r.tree.RenameRemoteLocked(rawOld, memtree.NormPath(newPath.String()), spec)
 	})
 }
 
@@ -209,10 +207,20 @@ func (r *SimRemoteFS) Chmod(ctx context.Context, p pathalg.RemotePath, perm fs.F
 		return r.tree.ChmodRemoteLocked(key, perm)
 	})
 }
+
+// Chtimes 修改远端目标对象访问与修改时间（拒绝零值时间戳，支撑 scp -p）。
+func (r *SimRemoteFS) Chtimes(ctx context.Context, p pathalg.RemotePath, atime, mtime time.Time) error {
+	return r.doTree(ctx, "rfs.write", p, !atime.IsZero() && !mtime.IsZero(), func(key string) error {
+		return r.tree.ChtimesRemoteLocked(key, atime, mtime)
+	})
+}
 func (r *SimRemoteFS) MkdirAll(ctx context.Context, dir pathalg.RemotePath, perm fs.FileMode) error {
 	return r.doTree(ctx, "rfs.write", dir, true, func(key string) error { return r.tree.MkdirAllLocked(key, perm, true) })
 }
 func (r *SimRemoteFS) Remove(ctx context.Context, p pathalg.RemotePath) error {
-	return r.doTree(ctx, "rfs.remove", p, true, func(key string) error { return r.tree.RemoveLocked(key, true, false) })
+	return r.doTree(ctx, "rfs.remove", p, true, func(key string) error { return r.tree.RemoveRemoteFileLocked(key) })
+}
+func (r *SimRemoteFS) RemoveDir(ctx context.Context, dir pathalg.RemotePath) error {
+	return r.doTree(ctx, "rfs.remove", dir, true, func(key string) error { return r.tree.RemoveRemoteDirLocked(key) })
 }
 func (r *SimRemoteFS) Close() error { r.withLock(func() { r.closed = true }); return nil }

@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"math"
 	"sync/atomic"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -193,18 +193,8 @@ func (h *simRootHandle) WriteChunk(dest pathalg.LocalRootedDest, offset int64, r
 	if readErr != nil && !errors.Is(readErr, io.ErrUnexpectedEOF) {
 		return 0, readErr
 	}
-	abs := memtree.NormPath(dest.String())
 	if err := h.withTree("fs.write", true, func() error {
-		nd, err := h.tree.OpenOrCreateRegularLocked(abs, true, nil, perm)
-		if err != nil {
-			return err
-		}
-		if n > 0 {
-			nd.Data = memtree.GrowBytes(nd.Data, offset+int64(n))
-			copy(nd.Data[offset:], chunk[:n])
-		}
-		nd.ModTime = h.tree.Now()
-		return nil
+		return h.tree.WriteChunkLocalLocked(memtree.NormPath(dest.String()), offset, chunk[:n], perm)
 	}); err != nil {
 		return 0, err
 	}
@@ -292,15 +282,8 @@ func (h *simRootHandle) ReadDir(dir algebraic.Option[pathalg.LocalRootedDest]) (
 	if d, has := dir.Get(); has {
 		abs, ok = memtree.NormPath(d.String()), d.IsValid()
 	}
-	return out, h.withTree("", ok, func() error {
-		items, e := h.tree.ListDirLocked(abs, false, false, true)
-		for _, it := range items {
-			if e == nil {
-				var ent ports.LocalDirEntry
-				ent, e = ports.NewLocalDirEntry(it.Name, it.Node.Mode, int64(len(it.Node.Data)))
-				out = append(out, ent)
-			}
-		}
+	return out, h.withTree("", ok, func() (e error) {
+		out, e = h.tree.ListLocalDirLocked(abs)
 		return e
 	})
 }
@@ -308,19 +291,11 @@ func (h *simRootHandle) MkdirAll(dir pathalg.LocalRootedDest, perm fs.FileMode) 
 	return h.withTree("fs.write", dir.IsValid(), func() error { return h.tree.MkdirAllLocked(memtree.NormPath(dir.String()), perm, false) })
 }
 func (h *simRootHandle) CreateSymlink(link pathalg.LocalRootedDest, target string) error {
-	return h.withTree("fs.write", link.IsValid(), func() error {
-		abs := memtree.NormPath(link.String())
-		if _, err := h.tree.ResolveParentLocked(abs, false, true); err != nil {
-			return err
-		}
-		if h.tree.Nodes[abs] != nil {
-			return ports.ErrAlreadyExists
-		}
-		if err := pathalg.ValidateContainedSymlinkChain(link, target, h.tree.CollectSymlinksLocked()); err != nil {
-			return fmt.Errorf("%w: %w", ports.ErrSymlinkRejected, err)
-		}
-		h.tree.Nodes[abs] = &memtree.Node{Kind: ports.RemoteFileSymlink, Mode: fs.ModeSymlink | 0o777, Target: target, ModTime: h.tree.Now(), Ino: h.tree.AllocIno()}
-		return nil
+	return h.withTree("fs.write", link.IsValid(), func() error { return h.tree.CreateSymlinkLocalLocked(link, target) })
+}
+func (h *simRootHandle) Chtimes(dest pathalg.LocalRootedDest, atime, mtime time.Time) error {
+	return h.withTree("fs.write", dest.IsValid() && !atime.IsZero() && !mtime.IsZero(), func() error {
+		return h.tree.ChtimesLocalLocked(memtree.NormPath(dest.String()), atime, mtime)
 	})
 }
 func (h *simRootHandle) Remove(dest pathalg.LocalRootedDest) error {

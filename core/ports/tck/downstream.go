@@ -3,13 +3,12 @@ package tck
 import (
 	"bytes"
 	"context"
-	"testing"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"testing"
 )
 
 // EnvFixture 描述 EnvPort 契约测试夹具。
@@ -57,13 +56,21 @@ type ShellProbeFixture struct {
 type ForwarderFixture struct {
 	NewForwarder func(t *testing.T) (ports.ForwarderPort, ports.TunnelTransport)
 	Specs        []ports.ForwardSpec
+	// ExerciseHandle 在 StartForward 返回后通过持留的 transport 触发一次通道打开，
+	// 并在 Close() 后验证立即返回 ports.ErrClosed（可选）。
+	ExerciseHandle func(ctx context.Context, h ports.ForwardHandle) error
+}
+
+// TUNDeviceFixture 描述 TUNDevicePort 本机 TUN/TAP 虚拟网卡契约测试夹具。
+type TUNDeviceFixture struct {
+	NewDevice            func(t *testing.T) ports.TUNDevicePort
+	NewUnavailableDevice func(t *testing.T) ports.TUNDevicePort
 }
 
 // RunEnvSuite 验证 EnvPort 的只读键查询、Environ 防御性克隆与可选本机身份快照契约。
 func RunEnvSuite(t *testing.T, fx EnvFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewEnv != nil && fx.KnownKey != "", "EnvFixture 缺少必需字段")
-
 	t.Run("LookupEnvironAndIdentity", func(t *testing.T) {
 		env := fx.NewEnv(t)
 		val, ok := env.LookupEnv(fx.KnownKey)
@@ -77,7 +84,6 @@ func RunEnvSuite(t *testing.T, fx EnvFixture) {
 		snap[fx.KnownKey] = "mutated-outside"
 		valAfter, _ := env.LookupEnv(fx.KnownKey)
 		requireTrue(t, valAfter == fx.ExpectedValue, "修改 Environ 返回 map 不得污染内部状态")
-
 		if fx.ExpectIdentity {
 			id, err := env.LookupLocalIdentity()
 			requireNoErr(t, err, "LookupLocalIdentity")
@@ -90,18 +96,15 @@ func RunEnvSuite(t *testing.T, fx EnvFixture) {
 func RunSSHFPLookupSuite(t *testing.T, fx SSHFPLookupFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewLookup != nil && fx.KnownHost.IsValid(), "SSHFPLookupFixture 缺少必需字段")
-
 	t.Run("ValidationAndLookup", func(t *testing.T) {
 		ctx := context.Background()
 		lp := fx.NewLookup(t)
 		var nilCtx context.Context
 		var zeroHost netaddr.CanonicalHost
-
 		_, err := lp.LookupSSHFP(nilCtx, fx.KnownHost)
 		requireErrIs(t, err, ports.ErrNilContext, "LookupSSHFP(nil ctx)")
 		_, err = lp.LookupSSHFP(ctx, zeroHost)
 		requireErr(t, err, "LookupSSHFP(zero host)")
-
 		recs, err := lp.LookupSSHFP(ctx, fx.KnownHost)
 		requireNoErr(t, err, "LookupSSHFP(known)")
 		requireTrue(t, len(recs) >= fx.MinCount, "LookupSSHFP 返回记录数低于夹具预期")
@@ -115,7 +118,6 @@ func RunSSHFPLookupSuite(t *testing.T, fx SSHFPLookupFixture) {
 func RunSSHAgentSuite(t *testing.T, fx SSHAgentFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewAgent != nil, "SSHAgentFixture.NewAgent 不能为 nil")
-
 	t.Run("DialListSignAndUnavailable", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		ctx := context.Background()
@@ -123,26 +125,21 @@ func RunSSHAgentSuite(t *testing.T, fx SSHAgentFixture) {
 		var nilCtx context.Context
 		var zeroAgent inventory.AgentSpec
 		var zeroFP inventory.KeyFingerprint
-
 		_, err := ag.DialAgent(nilCtx, fx.Spec)
 		requireErrIs(t, err, ports.ErrNilContext, "DialAgent(nil ctx)")
 		_, err = ag.DialAgent(ctx, algebraic.Some(zeroAgent))
 		requireErr(t, err, "DialAgent(Some(zeroSpec))")
-
 		conn, err := ag.DialAgent(ctx, fx.Spec)
 		requireNoErr(t, err, "DialAgent")
 		requireNoErr(t, conn.Close(), "DialAgent.Close")
-
 		keys, err := ag.ListAgentKeys(ctx, fx.Spec)
 		requireNoErr(t, err, "ListAgentKeys")
 		requireTrue(t, len(keys) > 0 && keys[0].IsValid(), "ListAgentKeys 至少应返回 1 把有效公钥")
-
 		_, err = ag.SignWithAgent(ctx, fx.Spec, zeroFP, keys[0].Algorithm(), []byte("data"))
 		requireErr(t, err, "SignWithAgent(zero fp)")
 		sig, err := ag.SignWithAgent(ctx, fx.Spec, keys[0].Fingerprint(), keys[0].Algorithm(), []byte("agent-challenge"))
 		requireNoErr(t, err, "SignWithAgent")
 		requireTrue(t, sig.IsValid(), "SignWithAgent 必须产出有效 Signature")
-
 		if fx.NewUnavailableAgent != nil {
 			unavail := fx.NewUnavailableAgent(t)
 			_, err = unavail.DialAgent(ctx, fx.Spec)
@@ -155,20 +152,17 @@ func RunSSHAgentSuite(t *testing.T, fx SSHAgentFixture) {
 func RunVaultControlSuite(t *testing.T, fx VaultControlFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewUninitialized != nil, "VaultControlFixture.NewUninitialized 不能为 nil")
-
 	t.Run("InitLockUnlockLifecycle", func(t *testing.T) {
 		ctx := context.Background()
 		vc := fx.NewUninitialized(t)
 		var nilCtx context.Context
 		var zeroBox secret.SecretBox
-
 		st, err := vc.Status(ctx)
 		requireNoErr(t, err, "Status(initial)")
 		requireTrue(t, st.IsValid() && st.State() == ports.VaultStateUninitialized && !st.IsUnlocked(), "初始状态须为 Uninitialized")
 		requireErrIs(t, vc.Lock(ctx), ports.ErrNotFound, "未初始化 Lock 须返回 ErrNotFound")
 		requireErr(t, vc.Init(ctx, nil), "Init(nil box)")
 		requireErr(t, vc.Init(ctx, &zeroBox), "Init(zero box)")
-
 		requireNoErr(t, secret.WithBytes([]byte(TestSecretTokenA), func(pass *secret.SecretBox) error {
 			requireErrIs(t, vc.Init(nilCtx, pass), ports.ErrNilContext, "Init(nil ctx)")
 			requireErrIs(t, vc.Unlock(ctx, pass), ports.ErrNotFound, "未初始化 Unlock 须返回 ErrNotFound")
@@ -176,26 +170,21 @@ func RunVaultControlSuite(t *testing.T, fx VaultControlFixture) {
 			requireErrIs(t, vc.Init(ctx, pass), ports.ErrAlreadyExists, "重复 Init 须返回 ErrAlreadyExists")
 			return nil
 		}), "Init cycle")
-
 		st, err = vc.Status(ctx)
 		requireNoErr(t, err, "Status(after Init)")
 		requireTrue(t, st.State() == ports.VaultStateUnlocked && st.IsUnlocked(), "Init 后须处于 Unlocked")
-
 		requireNoErr(t, vc.Lock(ctx), "Lock")
 		st, err = vc.Status(ctx)
 		requireNoErr(t, err, "Status(after Lock)")
 		requireTrue(t, st.State() == ports.VaultStateLocked && !st.IsUnlocked(), "Lock 后须处于 Locked")
-
 		requireNoErr(t, secret.WithBytes([]byte(TestSecretTokenB), func(wrong *secret.SecretBox) error {
 			requireErrIs(t, vc.Unlock(ctx, wrong), ports.ErrAuthFailed, "错误主口令 Unlock 须返回 ErrAuthFailed")
 			return nil
 		}), "Unlock(wrong)")
-
 		requireNoErr(t, secret.WithBytes([]byte(TestSecretTokenA), func(pass *secret.SecretBox) error {
 			requireNoErr(t, vc.Unlock(ctx, pass), "Unlock(correct)")
 			return nil
 		}), "Unlock(correct)")
-
 		st, err = vc.Status(ctx)
 		requireNoErr(t, err, "Status(after Unlock)")
 		requireTrue(t, st.State() == ports.VaultStateUnlocked && st.IsUnlocked(), "正确解锁后须处于 Unlocked")
@@ -206,7 +195,6 @@ func RunVaultControlSuite(t *testing.T, fx VaultControlFixture) {
 func RunPrivilegeEscalationSuite(t *testing.T, fx PrivilegeEscalationFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewEscalator != nil, "PrivilegeEscalationFixture.NewEscalator 不能为 nil")
-
 	t.Run("ValidationAndRunPrivileged", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		ctx := context.Background()
@@ -216,7 +204,6 @@ func RunPrivilegeEscalationSuite(t *testing.T, fx PrivilegeEscalationFixture) {
 			Command: MustCommandPlan(t, "id"),
 		})
 		requireNoErr(t, err, "NewPrivilegeRequest")
-
 		var nilCtx context.Context
 		var zeroReq ports.PrivilegeRequest
 		var zeroBox secret.SecretBox
@@ -228,7 +215,6 @@ func RunPrivilegeEscalationSuite(t *testing.T, fx PrivilegeEscalationFixture) {
 		requireErr(t, err, "RunPrivileged(zero req)")
 		_, err = esc.RunPrivileged(ctx, opener, req, &zeroBox, ports.ExecStreams{})
 		requireErr(t, err, "RunPrivileged(zero box)")
-
 		if fx.RequirePassword {
 			_, err = esc.RunPrivileged(ctx, opener, req, nil, ports.ExecStreams{})
 			requireErrIs(t, err, ports.ErrAuthFailed, "需要口令时传 nil 须返回 ErrAuthFailed")
@@ -262,18 +248,15 @@ func RunPrivilegeEscalationSuite(t *testing.T, fx PrivilegeEscalationFixture) {
 func RunShellProbeSuite(t *testing.T, fx ShellProbeFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewProbe != nil, "ShellProbeFixture.NewProbe 不能为 nil")
-
 	t.Run("ValidationAndProbe", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		ctx := context.Background()
 		probe, opener := fx.NewProbe(t)
 		var nilCtx context.Context
-
 		_, err := probe.ProbeShell(nilCtx, opener)
 		requireErrIs(t, err, ports.ErrNilContext, "ProbeShell(nil ctx)")
 		_, err = probe.ProbeShell(ctx, nil)
 		requireErr(t, err, "ProbeShell(nil opener)")
-
 		res, err := probe.ProbeShell(ctx, opener)
 		requireNoErr(t, err, "ProbeShell")
 		requireTrue(t, res.IsValid() && res.LaunchProfile().IsValid() && (res.ProbeStage() == 1 || res.ProbeStage() == 2), "ShellProbeResult 必须有效")
@@ -284,14 +267,12 @@ func RunShellProbeSuite(t *testing.T, fx ShellProbeFixture) {
 func RunForwarderSuite(t *testing.T, fx ForwarderFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewForwarder != nil && len(fx.Specs) > 0, "ForwarderFixture 缺少必需字段")
-
 	t.Run("ValidationAndForwardLifecycle", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		ctx := context.Background()
 		fwd, tr := fx.NewForwarder(t)
 		var nilCtx context.Context
 		var zeroSpec ports.ForwardSpec
-
 		_, err := fwd.StartForward(nilCtx, tr, fx.Specs[0])
 		requireErrIs(t, err, ports.ErrNilContext, "StartForward(nil ctx)")
 		_, err = fwd.StartForward(ctx, nil, fx.Specs[0])
@@ -300,24 +281,65 @@ func RunForwarderSuite(t *testing.T, fx ForwarderFixture) {
 		requireErr(t, err, "StartForward(zero spec)")
 		_, err = ports.NewForwardSpec(ports.ForwardTUN, "tun0", "tun1")
 		requireErr(t, err, "NewForwardSpec(ForwardTUN) 必须拒绝，强制使用 NewForwardTUNSpec")
-
 		for _, sp := range fx.Specs {
-			h, sErr := fwd.StartForward(ctx, tr, sp)
-			requireNoErr(t, sErr, "StartForward("+sp.Direction().String()+")")
-			requireTrue(t, h != nil && h.IsValid() && h.Spec().Equal(sp) && h.BoundAddr() != "", "ForwardHandle 元信息须有效")
-			if sp.Direction() == ports.ForwardTUN {
-				wantTUN, okW := sp.TUN().Get()
-				gotTUN, okG := h.Spec().TUN().Get()
-				requireTrue(t, okW && okG && gotTUN.Equal(wantTUN), "ForwardTUN 句柄须完整保留强类型 TUNSpec")
-			}
-			requireNoErr(t, h.Close(), "ForwardHandle.Close(1)")
-			requireNoErr(t, h.Close(), "ForwardHandle.Close(2, idempotent)")
-			requireTrue(t, !h.IsValid(), "Close 后 ForwardHandle.IsValid 须为 false")
-			select {
-			case <-h.Done():
-			default:
-				t.Fatalf("Close 后 ForwardHandle.Done() 必须已关闭")
-			}
+			verifySingleForwardHandle(t, ctx, fwd, tr, sp, fx.ExerciseHandle)
+		}
+	})
+}
+func verifySingleForwardHandle(t *testing.T, ctx context.Context, fwd ports.ForwarderPort, tr ports.TunnelTransport, sp ports.ForwardSpec, exercise func(context.Context, ports.ForwardHandle) error) {
+	t.Helper()
+	h, sErr := fwd.StartForward(ctx, tr, sp)
+	requireNoErr(t, sErr, "StartForward("+sp.Direction().String()+")")
+	requireTrue(t, h != nil && h.IsValid() && h.Spec().Equal(sp) && h.BoundAddr() != "", "ForwardHandle 元信息须有效")
+	if sp.Direction() == ports.ForwardTUN {
+		wantTUN, okW := sp.TUN().Get()
+		gotTUN, okG := h.Spec().TUN().Get()
+		requireTrue(t, okW && okG && gotTUN.Equal(wantTUN), "ForwardTUN 句柄须完整保留强类型 TUNSpec")
+	}
+	if exercise != nil {
+		requireNoErr(t, exercise(ctx, h), "StartForward 返回后持留传输打开新通道须成功")
+	}
+	requireNoErr(t, h.Close(), "ForwardHandle.Close(1)")
+	requireNoErr(t, h.Close(), "ForwardHandle.Close(2, idempotent)")
+	requireTrue(t, !h.IsValid(), "Close 后 ForwardHandle.IsValid 须为 false")
+	if exercise != nil {
+		requireErrIs(t, exercise(ctx, h), ports.ErrClosed, "Close 后经句柄打开新通道须返回 ErrClosed")
+	}
+	select {
+	case <-h.Done():
+	default:
+		t.Fatalf("Close 后 ForwardHandle.Done() 必须已关闭")
+	}
+}
+
+// RunTUNDeviceSuite 验证 TUNDevicePort 的参数守卫、L3/L2 设备打开、接口名返回、关闭与无权限失败关闭契约。
+func RunTUNDeviceSuite(t *testing.T, fx TUNDeviceFixture) {
+	t.Helper()
+	requireTrue(t, fx.NewDevice != nil, "TUNDeviceFixture.NewDevice 不能为 nil")
+	t.Run("ValidationOpenAndUnavailable", func(t *testing.T) {
+		defer VerifyNoLeaks(t)
+		ctx := context.Background()
+		devPort := fx.NewDevice(t)
+		var nilCtx context.Context
+		var zeroSpec ports.TUNSpec
+		p2p, err := ports.NewTUNSpec(ports.TUNModePointToPoint, ports.TUNUnitAny, 0)
+		requireNoErr(t, err, "NewTUNSpec(p2p)")
+		eth, err := ports.NewTUNSpec(ports.TUNModeEthernet, 2, 3)
+		requireNoErr(t, err, "NewTUNSpec(eth)")
+		_, _, err = devPort.OpenLocalTUN(nilCtx, p2p)
+		requireErrIs(t, err, ports.ErrNilContext, "OpenLocalTUN(nil ctx)")
+		_, _, err = devPort.OpenLocalTUN(ctx, zeroSpec)
+		requireErr(t, err, "OpenLocalTUN(zero spec)")
+		for _, sp := range []ports.TUNSpec{p2p, eth} {
+			rwc, iface, oErr := devPort.OpenLocalTUN(ctx, sp)
+			requireNoErr(t, oErr, "OpenLocalTUN("+sp.Mode().String()+")")
+			requireTrue(t, rwc != nil && iface != "", "OpenLocalTUN 须返回非 nil 读写流与非空本机接口名")
+			requireNoErr(t, rwc.Close(), "OpenLocalTUN.Close")
+		}
+		if fx.NewUnavailableDevice != nil {
+			unavail := fx.NewUnavailableDevice(t)
+			_, _, err = unavail.OpenLocalTUN(ctx, p2p)
+			requireErrIs(t, err, ports.ErrPermissionDenied, "无权限环境 OpenLocalTUN 须返回 ErrPermissionDenied")
 		}
 	})
 }

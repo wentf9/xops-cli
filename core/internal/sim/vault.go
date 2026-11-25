@@ -8,11 +8,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
-	"io"
-
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
+	"io"
 )
 
 // SeededRand 是基于 SplitMix64 + xoshiro256++ 的并发安全确定性 PRNG，实现 ports.Entropy (io.Reader)。
@@ -310,7 +309,6 @@ func (v *SimVault) Delete(ctx context.Context, ref secret.Ref) error {
 		return nil
 	})
 }
-
 func hashSecretBox(box *secret.SecretBox) (sum [32]byte, err error) {
 	err = box.Use(func(plain []byte) error {
 		h := sha256.New()

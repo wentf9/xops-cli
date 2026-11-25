@@ -4,23 +4,21 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"maps"
-	"net"
-	"slices"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"io"
+	"maps"
+	"net"
+	"slices"
+	"time"
 )
 
 const (
-	defaultProcessMaxOutputBytes uint64 = 1 << 20  // 默认进程输出捕获上限（1 MiB）
-	maxProcessOutputBytes        uint64 = 64 << 20 // 允许的最大进程输出捕获上限（64 MiB）
-	maxProcessArgs                      = 256
+	defaultProcessMaxOutputBytes, maxProcessOutputBytes uint64 = 1 << 20, 64 << 20 // 默认 1 MiB / 上限 64 MiB
+	maxProcessArgs                                             = 256
 )
 
 // Timer 表示由 Clock 创建的可取消单次定时器，支撑确定性仿真时钟与真实系统时钟一致抽象。
@@ -54,8 +52,8 @@ type LocalIdentityInfoSpec struct {
 //xops:opaque
 //xops:failclosed
 type LocalIdentityInfo struct {
-	localHost, localUser, localUID, homeDir string
-	valid                                   bool
+	s     LocalIdentityInfoSpec
+	valid bool
 }
 
 // NewLocalIdentityInfo 校验本机主机名、用户名、可选数值 UID 与主目录并构造不可变 LocalIdentityInfo。
@@ -64,27 +62,25 @@ func NewLocalIdentityInfo(spec LocalIdentityInfoSpec) (LocalIdentityInfo, error)
 	user, e2 := sanitizeBoundedText(spec.LocalUser, maxPortTokenLen, false, ErrInvalidArgument)
 	uid, e3 := sanitizeBoundedText(spec.LocalUID, maxPortTokenLen, true, ErrInvalidArgument)
 	home, e4 := sanitizeBoundedText(spec.HomeDir, maxPortDetailBytes, false, ErrInvalidArgument)
-	if err := firstErr(e1, e2, e3, e4); err != nil {
-		return LocalIdentityInfo{}, err
-	}
-	return LocalIdentityInfo{localHost: host, localUser: user, localUID: uid, homeDir: home, valid: true}, nil
+	err := firstErr(e1, e2, e3, e4)
+	return pickIf(err == nil, LocalIdentityInfo{LocalIdentityInfoSpec{host, user, uid, home}, true}, LocalIdentityInfo{}), err
 }
 func (i LocalIdentityInfo) IsValid() bool {
-	return i.valid && i.localHost != "" && i.localUser != "" && i.homeDir != ""
+	return i.valid && i.s.LocalHost != "" && i.s.LocalUser != "" && i.s.HomeDir != ""
 }
 func (i LocalIdentityInfo) IsZero() bool      { return !i.IsValid() }
-func (i LocalIdentityInfo) LocalHost() string { return i.localHost }
-func (i LocalIdentityInfo) LocalUser() string { return i.localUser }
-func (i LocalIdentityInfo) LocalUID() string  { return i.localUID }
-func (i LocalIdentityInfo) HomeDir() string   { return i.homeDir }
+func (i LocalIdentityInfo) LocalHost() string { return i.s.LocalHost }
+func (i LocalIdentityInfo) LocalUser() string { return i.s.LocalUser }
+func (i LocalIdentityInfo) LocalUID() string  { return i.s.LocalUID }
+func (i LocalIdentityInfo) HomeDir() string   { return i.s.HomeDir }
 func (i LocalIdentityInfo) Equal(o LocalIdentityInfo) bool {
-	return i.IsValid() && o.IsValid() && i.localHost == o.localHost && i.localUser == o.localUser && i.localUID == o.localUID && i.homeDir == o.homeDir
+	return i.IsValid() && o.IsValid() && i.s == o.s
 }
 
 // ApplyToTokenContext 将本机主机/用户/UID/主目录写入基础 TokenContext 副本并返回（零值时原样返回）。
 func (i LocalIdentityInfo) ApplyToTokenContext(base option.TokenContext) option.TokenContext {
 	if i.IsValid() {
-		base.LocalHost, base.LocalUser, base.LocalUID, base.HomeDir = i.localHost, i.localUser, i.localUID, i.homeDir
+		base.LocalHost, base.LocalUser, base.LocalUID, base.HomeDir = i.s.LocalHost, i.s.LocalUser, i.s.LocalUID, i.s.HomeDir
 	}
 	return base
 }
@@ -133,49 +129,31 @@ func NewProcessSpec(in ProcessSpecInput) (ProcessSpec, error) {
 	}
 	return ProcessSpec{command: cmd, args: args, workDir: in.WorkDir, env: env, timeout: in.Timeout, maxOutputBytes: maxOut, valid: true}, nil
 }
-
 func validateProcessArgs(raw []string) ([]string, error) {
-	if len(raw) == 0 {
-		return nil, nil
+	if len(raw) > maxProcessArgs || slices.ContainsFunc(raw, func(a string) bool { return len(a) > maxPortEnvValBytes || hasForbiddenControl(a) }) {
+		return nil, fmt.Errorf("%w: 子进程参数数量超限或包含非法字符", ErrInvalidArgument)
 	}
-	if len(raw) > maxProcessArgs {
-		return nil, fmt.Errorf("%w: 参数数量超限", ErrInvalidArgument)
-	}
-	for i, a := range raw {
-		if len(a) > maxPortEnvValBytes || hasForbiddenControl(a) {
-			return nil, fmt.Errorf("%w: args[%d] 非法", ErrInvalidArgument, i)
-		}
-	}
-	return slices.Clone(raw), nil
+	return cloneSliceNilIfEmpty(raw), nil
 }
 func validateProcessOpts(wd algebraic.Option[pathalg.LocalDir], to algebraic.Option[algebraic.Duration], mo algebraic.Option[uint64]) (uint64, error) {
 	d, hasD := wd.Get()
 	t, hasT := to.Get()
-	if (hasD && !d.IsValid()) || (hasT && !t.IsPositive()) {
-		return 0, fmt.Errorf("%w: work_dir 或 timeout 无效", ErrInvalidArgument)
+	maxOut := mo.OrElse(defaultProcessMaxOutputBytes)
+	if (hasD && !d.IsValid()) || (hasT && !t.IsPositive()) || maxOut == 0 || maxOut > maxProcessOutputBytes {
+		return 0, fmt.Errorf("%w: work_dir、timeout 或 max_output_bytes 非法", ErrInvalidArgument)
 	}
-	v, ok := mo.Get()
-	if !ok {
-		return defaultProcessMaxOutputBytes, nil
-	}
-	if v == 0 || v > maxProcessOutputBytes {
-		return 0, fmt.Errorf("%w: max_output_bytes=%d 超出范围", ErrInvalidArgument, v)
-	}
-	return v, nil
+	return maxOut, nil
 }
 func canonicalizeProcessEnv(raw map[string]string) ([]processEnvEntry, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
 	if len(raw) > maxPortEnvCount {
 		return nil, fmt.Errorf("%w: 环境变量数量超限", ErrInvalidArgument)
 	}
-	out := make([]processEnvEntry, 0, len(raw))
+	var out []processEnvEntry
 	for _, k := range slices.Sorted(maps.Keys(raw)) {
 		if v := raw[k]; !isValidASCIIToken(k, maxPortTokenLen) || slices.Contains([]byte(k), '=') || len(v) > maxPortEnvValBytes || hasForbiddenControl(v) {
 			return nil, fmt.Errorf("%w: 环境变量 %q 非法", ErrInvalidArgument, k)
 		}
-		out = append(out, processEnvEntry{key: k, value: raw[k]})
+		out = append(out, processEnvEntry{k, raw[k]})
 	}
 	return out, nil
 }
@@ -197,9 +175,7 @@ func (p ProcessSpec) Env() map[string]string {
 	return out
 }
 func (p ProcessSpec) Equal(o ProcessSpec) bool {
-	return p.IsValid() && o.IsValid() && p.command == o.command && slices.Equal(p.args, o.args) &&
-		optEqualFunc(p.workDir, o.workDir, pathalg.LocalDir.Equal) && slices.Equal(p.env, o.env) &&
-		optEqualFunc(p.timeout, o.timeout, algebraic.Duration.Equal) && p.maxOutputBytes == o.maxOutputBytes
+	return p.IsValid() && o.IsValid() && p.command == o.command && slices.Equal(p.args, o.args) && optEqualFunc(p.workDir, o.workDir, pathalg.LocalDir.Equal) && slices.Equal(p.env, o.env) && optEqualFunc(p.timeout, o.timeout, algebraic.Duration.Equal) && p.maxOutputBytes == o.maxOutputBytes
 }
 
 // ProcessResultSpec 是构造不可变 ProcessResult 的显式入参规格。
@@ -214,9 +190,8 @@ type ProcessResultSpec struct {
 //xops:opaque
 //xops:failclosed
 type ProcessResult struct {
-	exitStatus       execution.ExitStatus
-	stdout, stderr   []byte
-	truncated, valid bool
+	s     ProcessResultSpec
+	valid bool
 }
 
 // NewProcessResult 校验 ExitStatus 非空有效并构造不可变 ProcessResult。
@@ -224,21 +199,20 @@ func NewProcessResult(spec ProcessResultSpec) (ProcessResult, error) {
 	if spec.ExitStatus == nil || !spec.ExitStatus.IsValid() {
 		return ProcessResult{}, fmt.Errorf("%w: ProcessResult 需要有效 ExitStatus", ErrInvalidArgument)
 	}
-	return ProcessResult{exitStatus: spec.ExitStatus, stdout: cloneSliceNilIfEmpty(spec.Stdout), stderr: cloneSliceNilIfEmpty(spec.Stderr), truncated: spec.Truncated, valid: true}, nil
+	spec.Stdout, spec.Stderr = cloneSliceNilIfEmpty(spec.Stdout), cloneSliceNilIfEmpty(spec.Stderr)
+	return ProcessResult{s: spec, valid: true}, nil
 }
 func (r ProcessResult) IsValid() bool {
-	return r.valid && r.exitStatus != nil && r.exitStatus.IsValid()
+	return r.valid && r.s.ExitStatus != nil && r.s.ExitStatus.IsValid()
 }
-func (r ProcessResult) IsZero() bool { return !r.IsValid() }
-func (r ProcessResult) ExitStatus() execution.ExitStatus {
-	return pickIf(r.IsValid(), r.exitStatus, nil)
-}
-func (r ProcessResult) Succeeded() bool { return r.IsValid() && r.exitStatus.IsSuccess() }
-func (r ProcessResult) Stdout() []byte  { return bytes.Clone(r.stdout) }
-func (r ProcessResult) Stderr() []byte  { return bytes.Clone(r.stderr) }
-func (r ProcessResult) Truncated() bool { return r.IsValid() && r.truncated }
+func (r ProcessResult) IsZero() bool                     { return !r.IsValid() }
+func (r ProcessResult) ExitStatus() execution.ExitStatus { return orZero(r.IsValid(), r.s.ExitStatus) }
+func (r ProcessResult) Succeeded() bool                  { return r.IsValid() && r.s.ExitStatus.IsSuccess() }
+func (r ProcessResult) Stdout() []byte                   { return bytes.Clone(r.s.Stdout) }
+func (r ProcessResult) Stderr() []byte                   { return bytes.Clone(r.s.Stderr) }
+func (r ProcessResult) Truncated() bool                  { return r.IsValid() && r.s.Truncated }
 func (r ProcessResult) Equal(o ProcessResult) bool {
-	return r.IsValid() && o.IsValid() && execution.EqualExitStatus(r.exitStatus, o.exitStatus) && bytes.Equal(r.stdout, o.stdout) && bytes.Equal(r.stderr, o.stderr) && r.truncated == o.truncated
+	return r.IsValid() && o.IsValid() && execution.EqualExitStatus(r.s.ExitStatus, o.s.ExitStatus) && bytes.Equal(r.s.Stdout, o.s.Stdout) && bytes.Equal(r.s.Stderr, o.s.Stderr) && r.s.Truncated == o.s.Truncated
 }
 
 // ProcessPort 定义本机外部进程执行与 stdio 管道连接出站端口（仅由 internal/host/sys 或 sim 实现）。
@@ -265,8 +239,8 @@ func NewTerminalSize(cols, rows uint16) (TerminalSize, error) {
 }
 func (s TerminalSize) IsValid() bool { return s.valid && s.cols > 0 && s.rows > 0 }
 func (s TerminalSize) IsZero() bool  { return !s.IsValid() }
-func (s TerminalSize) Cols() uint16  { return pickIf(s.IsValid(), s.cols, 0) }
-func (s TerminalSize) Rows() uint16  { return pickIf(s.IsValid(), s.rows, 0) }
+func (s TerminalSize) Cols() uint16  { return orZero(s.IsValid(), s.cols) }
+func (s TerminalSize) Rows() uint16  { return orZero(s.IsValid(), s.rows) }
 func (s TerminalSize) Equal(o TerminalSize) bool {
 	return s.IsValid() && o.IsValid() && s.cols == o.cols && s.rows == o.rows
 }
@@ -277,11 +251,8 @@ type TerminalHandle interface {
 	io.Writer
 	Size() (TerminalSize, error)
 	ResizeEvents() <-chan TerminalSize
-	// Relay 在同步作用域内将本机终端输入/输出与窗口尺寸变更并发中继至远端读写流（RFC §2.1 ConsoleRelay）：
-	//   - 本机输入先达 EOF 时若 remoteIn 实现 io.Closer 须执行半关闭并继续排空 remoteOut；
-	//   - remoteOut 先达 EOF 或 ctx 取消时须唤醒阻塞读端与缩放泵并在返回前收敛全部内部协程（零泄漏）；
-	//   - ctx == nil 返回 ErrNilContext，句柄已失效返回 ErrHandleExpired，remoteIn/remoteOut 为 nil 返回 ErrInvalidArgument，onResize 可为 nil。
-	//
+	// Relay 在同步作用域内将本机输入/输出与缩放事件并发中继至远端（本机 EOF 半关闭并排空 remoteOut，
+	// remoteOut EOF 或 ctx 取消时唤醒阻塞端并零泄漏收敛；nil ctx/流返回 ErrNilContext/ErrInvalidArgument，过期返回 ErrHandleExpired）。
 	//xops:syncclosure
 	Relay(ctx context.Context, remoteIn io.Writer, remoteOut io.Reader, onResize func(ctx context.Context, size TerminalSize) error) error
 }
@@ -291,7 +262,6 @@ type TerminalPort interface {
 	IsInteractive() bool
 	Size() (TerminalSize, error)
 	// WithRawTerminal 进入原始终端/ConPTY 模式并在同步闭包内借出 TerminalHandle，退出前无条件恢复。
-	//
 	//xops:syncclosure
 	//xops:borrowed
 	WithRawTerminal(ctx context.Context, fn func(term TerminalHandle) error) error

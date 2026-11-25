@@ -3,14 +3,13 @@ package ports
 import (
 	"context"
 	"fmt"
-	"io"
-	"net"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
+	"io"
+	"net"
 )
 
 // PTYRequest 描述远端伪终端分配请求（终端类型与窗口尺寸）；零值恒无效。
@@ -25,13 +24,14 @@ type PTYRequest struct {
 
 // NewPTYRequest 校验终端类型名称与窗口尺寸并构造不可变 PTYRequest。
 func NewPTYRequest(term string, size TerminalSize) (PTYRequest, error) {
-	if !isValidASCIIToken(term, maxPortTokenLen) {
+	switch {
+	case !isValidASCIIToken(term, maxPortTokenLen):
 		return PTYRequest{}, fmt.Errorf("%w: 非法 TERM 标识 %q", ErrInvalidArgument, term)
-	}
-	if !size.IsValid() {
+	case !size.IsValid():
 		return PTYRequest{}, fmt.Errorf("%w: %w", ErrInvalidArgument, ErrInvalidTTYSize)
+	default:
+		return PTYRequest{term: term, size: size, valid: true}, nil
 	}
-	return PTYRequest{term: term, size: size, valid: true}, nil
 }
 func (p PTYRequest) IsValid() bool      { return p.valid && p.term != "" && p.size.IsValid() }
 func (p PTYRequest) IsZero() bool       { return !p.IsValid() }
@@ -41,7 +41,7 @@ func (p PTYRequest) Equal(o PTYRequest) bool {
 	return p.IsValid() && o.IsValid() && p.term == o.term && p.size.Equal(o.size)
 }
 
-// ForwardDirection 标识 SSH 隧道转发方向类别（-L/-R/-D/StreamLocal/TUN）；零值 ForwardDirectionInvalid 失败关闭。
+// ForwardDirection 标识 SSH 隧道转发方向类别（-L/-R/-D/TUN）；零值 ForwardDirectionInvalid 失败关闭。
 //
 //xops:opaque
 //xops:failclosed
@@ -49,33 +49,52 @@ type ForwardDirection uint8
 
 const (
 	ForwardDirectionInvalid ForwardDirection = iota // 无效转发方向（零值失败关闭）
-	ForwardLocal                                    // 本地端口转发（-L）
-	ForwardRemote                                   // 远端端口转发（-R）
-	ForwardDynamic                                  // 动态 SOCKS5 转发（-D）
-	ForwardStreamLocal                              // Unix Domain Socket 转发
+	ForwardLocal                                    // 本地监听 -> 远端目标转发（-L，支持 TCP 与 StreamLocal 双向/混合）
+	ForwardRemote                                   // 远端监听 -> 本地目标转发（-R，支持 TCP 与 StreamLocal 双向/混合）
+	ForwardDynamic                                  // 本地动态 SOCKS5 转发（-D）
 	ForwardTUN                                      // L2/L3 隧道设备转发（-w）
 )
 
-// ForwardSpec 描述单条 SSH 隧道转发规则（含 ForwardTUN 强类型 TUNSpec）；零值恒无效。
+// ForwardEndpointKind 标识隧道转发监听端或目标端的端点协议类别（TCP / Unix Domain Socket）；零值失败关闭。
+//
+//xops:opaque
+//xops:failclosed
+type ForwardEndpointKind uint8
+
+const (
+	ForwardEndpointInvalid ForwardEndpointKind = iota // 无效端点类别（零值失败关闭）
+	ForwardEndpointTCP                                // TCP host:port 端点
+	ForwardEndpointUnix                               // Unix Domain Socket (StreamLocal) 端点
+)
+
+// ForwardSpec 描述单条 SSH 隧道转发规则（显式区分方向、监听/目标端点类型与强类型 TUNSpec）；零值恒无效。
 //
 //xops:opaque
 //xops:failclosed
 type ForwardSpec struct {
 	direction            ForwardDirection
+	bindKind, targetKind ForwardEndpointKind
 	bindAddr, targetAddr string
 	tun                  algebraic.Option[TUNSpec]
 	valid                bool
 }
 
-// NewForwardSpec 校验非 TUN 转发方向、监听地址与目标地址组合并构造不可变 ForwardSpec；
-// ForwardDynamic 要求 targetAddr 为空，ForwardTUN 须经 NewForwardTUNSpec 构造。
+// NewForwardSpec 构造默认 TCP 端点的非 TUN 转发规则（ForwardLocal/ForwardRemote 为 TCP->TCP，
+// ForwardDynamic 为 TCP 无目标）；涉及 StreamLocal（Unix 套接字）请使用 NewTypedForwardSpec，ForwardTUN 须经 NewForwardTUNSpec。
 func NewForwardSpec(direction ForwardDirection, bindAddr, targetAddr string) (ForwardSpec, error) {
+	return NewTypedForwardSpec(direction, ForwardEndpointTCP, bindAddr, pickIf(direction == ForwardDynamic, ForwardEndpointInvalid, ForwardEndpointTCP), targetAddr)
+}
+
+// NewTypedForwardSpec 校验非 TUN 转发方向、显式监听/目标端点类型与地址组合并构造不可变 ForwardSpec，
+// 完整支持 -L/-R 下的 TCP↔TCP、Unix↔Unix、TCP↔Unix 四类组合而零字符串嗅探。
+func NewTypedForwardSpec(direction ForwardDirection, bindKind ForwardEndpointKind, bindAddr string, targetKind ForwardEndpointKind, targetAddr string) (ForwardSpec, error) {
 	bind, e1 := sanitizeBoundedText(bindAddr, maxPortDetailBytes, false, ErrInvalidArgument)
 	target, e2 := sanitizeBoundedText(targetAddr, maxPortDetailBytes, direction == ForwardDynamic, ErrInvalidArgument)
-	if !direction.IsValid() || direction == ForwardTUN || firstErr(e1, e2) != nil || (direction == ForwardDynamic && target != "") {
-		return ForwardSpec{}, fmt.Errorf("%w: ForwardSpec 方向或地址组合非法（ForwardTUN 须使用 NewForwardTUNSpec）", ErrInvalidArgument)
+	validKinds := pickIf(direction == ForwardDynamic, bindKind == ForwardEndpointTCP && targetKind == ForwardEndpointInvalid && target == "", bindKind.IsValid() && targetKind.IsValid() && target != "")
+	if !direction.IsValid() || direction == ForwardTUN || firstErr(e1, e2) != nil || !validKinds {
+		return ForwardSpec{}, fmt.Errorf("%w: ForwardSpec 方向、端点类型或地址组合非法", ErrInvalidArgument)
 	}
-	return ForwardSpec{direction: direction, bindAddr: bind, targetAddr: target, valid: true}, nil
+	return ForwardSpec{direction: direction, bindKind: bindKind, targetKind: targetKind, bindAddr: bind, targetAddr: target, valid: true}, nil
 }
 
 // NewForwardTUNSpec 校验强类型 TUNSpec 并构造 ForwardTUN 方向的不可变 ForwardSpec。
@@ -83,48 +102,43 @@ func NewForwardTUNSpec(tun TUNSpec) (ForwardSpec, error) {
 	if !tun.IsValid() {
 		return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN 需要有效 TUNSpec", ErrInvalidArgument)
 	}
-	return ForwardSpec{
-		direction: ForwardTUN, bindAddr: formatTUNUnitAddr(tun.Mode(), tun.LocalUnit()),
-		targetAddr: formatTUNUnitAddr(tun.Mode(), tun.RemoteUnit()), tun: algebraic.Some(tun), valid: true,
-	}, nil
+	return ForwardSpec{direction: ForwardTUN, bindAddr: formatTUNUnitAddr(tun.Mode(), tun.LocalUnit()), targetAddr: formatTUNUnitAddr(tun.Mode(), tun.RemoteUnit()), tun: algebraic.Some(tun), valid: true}, nil
 }
-
 func formatTUNUnitAddr(mode TUNMode, unit uint32) string {
-	prefix := pickIf(mode == TUNModeEthernet, "tap", "tun")
-	if unit == TUNUnitAny {
-		return prefix + "any"
-	}
-	return fmt.Sprintf("%s%d", prefix, unit)
+	p := pickIf(mode == TUNModeEthernet, "tap", "tun")
+	return pickIf(unit == TUNUnitAny, p+"any", fmt.Sprintf("%s%d", p, unit))
 }
 func (f ForwardSpec) IsValid() bool {
 	if !f.valid || !f.direction.IsValid() || f.bindAddr == "" {
 		return false
 	}
-	if f.direction == ForwardTUN {
-		t, ok := f.tun.Get()
-		return ok && t.IsValid() && f.targetAddr != ""
+	t, hasT := f.tun.Get()
+	switch f.direction {
+	case ForwardTUN:
+		return hasT && t.IsValid() && f.targetAddr != "" && f.bindKind == ForwardEndpointInvalid && f.targetKind == ForwardEndpointInvalid
+	case ForwardDynamic:
+		return !hasT && f.bindKind == ForwardEndpointTCP && f.targetKind == ForwardEndpointInvalid && f.targetAddr == ""
+	default:
+		return !hasT && f.bindKind.IsValid() && f.targetKind.IsValid() && f.targetAddr != ""
 	}
-	return f.tun.IsNone() && (f.direction == ForwardDynamic || f.targetAddr != "")
 }
-func (f ForwardSpec) IsZero() bool { return !f.IsValid() }
-func (f ForwardSpec) Direction() ForwardDirection {
-	return pickIf(f.IsValid(), f.direction, ForwardDirectionInvalid)
-}
-func (f ForwardSpec) BindAddr() string               { return f.bindAddr }
-func (f ForwardSpec) TargetAddr() string             { return f.targetAddr }
-func (f ForwardSpec) TUN() algebraic.Option[TUNSpec] { return f.tun }
+func (f ForwardSpec) IsZero() bool                    { return !f.IsValid() }
+func (f ForwardSpec) Direction() ForwardDirection     { return orZero(f.IsValid(), f.direction) }
+func (f ForwardSpec) BindKind() ForwardEndpointKind   { return orZero(f.IsValid(), f.bindKind) }
+func (f ForwardSpec) TargetKind() ForwardEndpointKind { return orZero(f.IsValid(), f.targetKind) }
+func (f ForwardSpec) BindAddr() string                { return f.bindAddr }
+func (f ForwardSpec) TargetAddr() string              { return f.targetAddr }
+func (f ForwardSpec) TUN() algebraic.Option[TUNSpec]  { return f.tun }
 func (f ForwardSpec) Equal(o ForwardSpec) bool {
-	return f.IsValid() && o.IsValid() && f.direction == o.direction && f.bindAddr == o.bindAddr &&
-		f.targetAddr == o.targetAddr && optEqualFunc(f.tun, o.tun, TUNSpec.Equal)
+	return f.IsValid() && o.IsValid() && f.direction == o.direction && f.bindKind == o.bindKind && f.targetKind == o.targetKind && f.bindAddr == o.bindAddr && f.targetAddr == o.targetAddr && optEqualFunc(f.tun, o.tun, TUNSpec.Equal)
 }
 
 // ExecStreams 聚合单次远端会话执行的运行期数据面流、可选 PTY 与经 SendEnv 过滤后的环境变量（非持久化 DTO）。
 type ExecStreams struct {
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
-	PTY    algebraic.Option[PTYRequest]
-	Env    map[string]string
+	Stdin          io.Reader
+	Stdout, Stderr io.Writer
+	PTY            algebraic.Option[PTYRequest]
+	Env            map[string]string
 }
 
 // RemoteSession 表示单条 SSH 通道上建立的远端命令或交互式 Shell 会话（隔离 x/crypto/ssh.Session）。
@@ -203,23 +217,18 @@ type MuxControlRequest struct {
 
 // NewMuxControlRequest 校验控制动作、套接字路径与可选转发规格（forward/cancel 必填）并构造请求。
 func NewMuxControlRequest(action MuxControlAction, socketPath pathalg.LocalSourcePath, forward algebraic.Option[ForwardSpec]) (MuxControlRequest, error) {
-	if !action.IsValid() || !socketPath.IsValid() {
-		return MuxControlRequest{}, fmt.Errorf("%w: action 与 socketPath 均须有效", ErrInvalidArgument)
-	}
 	fwd, hasFwd := forward.Get()
 	needsFwd := action == MuxActionForward || action == MuxActionCancel
-	if (needsFwd && (!hasFwd || !fwd.IsValid())) || (!needsFwd && hasFwd) {
-		return MuxControlRequest{}, fmt.Errorf("%w: %s 控制动作与 ForwardSpec 组合非法", ErrInvalidArgument, action)
+	if !action.IsValid() || !socketPath.IsValid() || (needsFwd && (!hasFwd || !fwd.IsValid())) || (!needsFwd && hasFwd) {
+		return MuxControlRequest{}, fmt.Errorf("%w: MuxControlRequest 动作、路径或 ForwardSpec 组合非法", ErrInvalidArgument)
 	}
 	return MuxControlRequest{action: action, socketPath: socketPath, forward: forward, valid: true}, nil
 }
 func (r MuxControlRequest) IsValid() bool {
 	return r.valid && r.action.IsValid() && r.socketPath.IsValid()
 }
-func (r MuxControlRequest) IsZero() bool { return !r.IsValid() }
-func (r MuxControlRequest) Action() MuxControlAction {
-	return pickIf(r.IsValid(), r.action, MuxActionInvalid)
-}
+func (r MuxControlRequest) IsZero() bool                           { return !r.IsValid() }
+func (r MuxControlRequest) Action() MuxControlAction               { return orZero(r.IsValid(), r.action) }
 func (r MuxControlRequest) SocketPath() pathalg.LocalSourcePath    { return r.socketPath }
 func (r MuxControlRequest) Forward() algebraic.Option[ForwardSpec] { return r.forward }
 
@@ -235,14 +244,11 @@ type MuxControlResponse struct {
 
 // NewMuxControlResponse 校验主进程状态与诊断说明并构造不可变 MuxControlResponse。
 func NewMuxControlResponse(alive bool, masterPID uint32, detail string) (MuxControlResponse, error) {
-	clean, err := sanitizeBoundedText(detail, maxPortDetailBytes, true, ErrInvalidArgument)
-	if err != nil {
-		return MuxControlResponse{}, err
-	}
 	if !alive && masterPID != 0 {
 		return MuxControlResponse{}, fmt.Errorf("%w: 非存活响应不得携带非零 master_pid", ErrInvalidArgument)
 	}
-	return MuxControlResponse{alive: alive, masterPID: masterPID, detail: clean, valid: true}, nil
+	clean, err := sanitizeBoundedText(detail, maxPortDetailBytes, true, ErrInvalidArgument)
+	return pickIf(err == nil, MuxControlResponse{alive: alive, masterPID: masterPID, detail: clean, valid: true}, MuxControlResponse{}), err
 }
 func (r MuxControlResponse) IsValid() bool     { return r.valid }
 func (r MuxControlResponse) IsZero() bool      { return !r.IsValid() }
@@ -253,15 +259,17 @@ func (r MuxControlResponse) Equal(o MuxControlResponse) bool {
 	return r.IsValid() && o.IsValid() && r.alive == o.alive && r.masterPID == o.masterPID && r.detail == o.detail
 }
 
-// MuxSocketPort 定义本地 ControlMaster/ControlPersist AF_UNIX 套接字探测、控制与监听出站端口（INV-A3 / INV-C4）。
-// 全部四个方法统一接收经校验的 socketPath pathalg.LocalSourcePath（兼容 OpenSSH %r@%h:%p 含 ':' 路径）。
+// MuxSocketPort 定义本地 ControlMaster/ControlPersist AF_UNIX 套接字探测、控制、服务端与代理出站端口（INV-A3 / INV-C4）。
 type MuxSocketPort interface {
 	Probe(ctx context.Context, socketPath pathalg.LocalSourcePath) (MuxControlResponse, error)
 	Control(ctx context.Context, req MuxControlRequest) (MuxControlResponse, error)
-	DialMux(ctx context.Context, socketPath pathalg.LocalSourcePath) (TransportConn, error)
-	// WithListener 在 socketPath 对应独占目录锁下绑定 AF_UNIX 监听套接字（Accept 强制校验对端凭证），
-	// 同步闭包退出时按「加锁 -> SameFile 校验 -> unlink -> close -> 解锁」固定顺序释放。
-	//
+	// DialMux 连接至活跃 ControlMaster 并返回绑定精确 (hopDigest, endpoint) 身份的 TransportConn。
+	DialMux(ctx context.Context, socketPath pathalg.LocalSourcePath, hopDigest plan.HopDigest, endpoint netaddr.Endpoint) (TransportConn, error)
+	// OpenProxy 以 PROTOCOL.mux v4 `-O proxy`（MuxActionProxy）模式打开与 ControlMaster 的双向 stdio 透传流。
+	OpenProxy(ctx context.Context, socketPath pathalg.LocalSourcePath) (net.Conn, error)
+	// Serve 在 ln 上以 PROTOCOL.mux v4 服务端模式响应会话、转发、探活、退出与代理请求（upstream 为非借用池钉选连接，forwarder 可选；具体实现如 P4-T2 sshnet/mux 须在 ln 参数上标注参数级 //xops:borrowed 确保零逃逸）。
+	Serve(ctx context.Context, ln net.Listener, upstream TransportConn, forwarder ForwarderPort) error
+	// WithListener 在独占目录锁下绑定 AF_UNIX 套接字（Accept 校验对端凭证），退出时按锁->SameFile->unlink->close->解锁释放。
 	//xops:syncclosure
 	//xops:borrowed
 	WithListener(ctx context.Context, socketPath pathalg.LocalSourcePath, fn func(ln net.Listener) error) error

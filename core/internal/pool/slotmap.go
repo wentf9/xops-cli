@@ -4,14 +4,13 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"slices"
-	"sync"
-	"sync/atomic"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
+	"slices"
+	"sync"
+	"sync/atomic"
 )
 
 // ManagedResource 表示可托管于连接池世代 SlotMap 的跨请求长生命周期资源契约
@@ -28,17 +27,17 @@ type ComparableManagedResource interface {
 }
 
 type slotRecord struct {
-	occupied     bool
-	gen          uint64
-	id           plan.HandleID
-	kind         plan.HandleKindCode
-	planDigest   plan.PlanDigest
-	boundHop     plan.HopDigest // 钉选的底层跳板摘要（纯值类型，零 *hopInstance GC 滞留）
-	boundEpoch   uint64         // 钉选的底层跳板精确世代号（0 表示无跳板钉选）
-	binding      security.OperationBinding
-	resource     ManagedResource
-	revokeCtx    context.Context
-	revokeCancel context.CancelCauseFunc
+	occupied        bool
+	active          *atomic.Bool // 正向槽位活跃哨兵，供 pinnedTransportConn 无锁校验句柄未被吊销
+	gen, boundEpoch uint64
+	id              plan.HandleID
+	kind            plan.HandleKindCode
+	planDigest      plan.PlanDigest
+	boundHop        plan.HopDigest // 钉选的底层跳板摘要（纯值类型，零 *hopInstance GC 滞留）
+	binding         security.OperationBinding
+	resource        ManagedResource
+	revokeCtx       context.Context
+	revokeCancel    context.CancelCauseFunc
 }
 
 // slotMap 是固定槽位复用 + 单调世代防 ABA 的线程安全托管句柄表（严格作为 Pool 叶级锁，禁止持锁调用 Actor）。
@@ -63,41 +62,20 @@ func (m *slotMap) len() int {
 }
 
 // RegisterLeaseHandle 在当前有效租约 lease 锁定的底层跳板世代上登记托管句柄并严格钉选该跳板实例：
-//   - 租约无效/跨池/过期/底层跳板已退役或熔断时严格失败关闭；
-//   - 句柄存活期间底层跳板及其祖先链绝不会被空闲/LRU 驱逐；
-//   - 底层跳板因保活失败、RetireHop/RetirePlan、Lease.Retire 或父跳级联退役时，句柄被同步撤销并关闭资源。
-func RegisterLeaseHandle[K plan.HandleKind, R ComparableManagedResource](
-	p *Pool, lease *Lease, binding security.OperationBinding, resource R,
-) (plan.ManagedHandle[K], error) {
-	var zero plan.ManagedHandle[K]
-	if err := checkPoolAvailable(p); err != nil {
-		return zero, err
-	}
-	if lease == nil || !lease.valid || lease.pool != p || lease.inst == nil {
-		return zero, ErrLeaseInvalid
-	}
-	if !lease.active.Load() {
-		return zero, ErrLeaseExpired
-	}
-	hopDig, hopEpoch, planDig := lease.HopDigest(), lease.Epoch(), lease.PlanDigest()
-	if !hopDig.IsValid() || hopEpoch == 0 || !planDig.IsValid() {
-		return zero, ErrLeaseRevoked
+// 租约无效/过期/跳板已退役或熔断时失败关闭；存活期间底层跳板及其祖先绝不被空闲/LRU 驱逐，断连时同步撤销句柄。
+func RegisterLeaseHandle[K plan.HandleKind, R ComparableManagedResource](p *Pool, lease *Lease, binding security.OperationBinding, resource R) (plan.ManagedHandle[K], error) {
+	hopDig, hopEpoch, planDig, err := extractLeasePinMeta[K](p, lease, binding)
+	if err != nil {
+		return zeroVal[plan.ManagedHandle[K]](), err
 	}
 	return registerHandleCore[K, R](p, planDig, binding, resource, hopDig, hopEpoch, true)
 }
 
-// RegisterHandle 在连接池世代 SlotMap 中登记类别为 K 的托管资源；
-// 若当前 planDigest 已存在活跃连接实例，自动将其钉选到该跳板（防空闲/LRU 驱逐并支持断连联动撤销）。
-func RegisterHandle[K plan.HandleKind, R ComparableManagedResource](
-	p *Pool, planDigest plan.PlanDigest, binding security.OperationBinding, resource R,
-) (plan.ManagedHandle[K], error) {
+// RegisterHandle 在连接池世代 SlotMap 中登记类别为 K 的托管资源；若当前 planDigest 存在活跃实例则自动钉选。
+func RegisterHandle[K plan.HandleKind, R ComparableManagedResource](p *Pool, planDigest plan.PlanDigest, binding security.OperationBinding, resource R) (plan.ManagedHandle[K], error) {
 	return registerHandleCore[K, R](p, planDigest, binding, resource, zeroVal[plan.HopDigest](), 0, false)
 }
-
-func registerHandleCore[K plan.HandleKind, R ComparableManagedResource](
-	p *Pool, planDigest plan.PlanDigest, binding security.OperationBinding, resource R,
-	hopDigest plan.HopDigest, hopEpoch uint64, pinStrict bool,
-) (plan.ManagedHandle[K], error) {
+func registerHandleCore[K plan.HandleKind, R ComparableManagedResource](p *Pool, planDigest plan.PlanDigest, binding security.OperationBinding, resource R, hopDigest plan.HopDigest, hopEpoch uint64, pinStrict bool) (plan.ManagedHandle[K], error) {
 	var zero plan.ManagedHandle[K]
 	if err := validateRegisterInputs[K](p, planDigest, binding, resource); err != nil {
 		return zero, err
@@ -115,74 +93,55 @@ func registerHandleCore[K plan.HandleKind, R ComparableManagedResource](
 		p.rollbackSlot(meta.id)
 		return zero, err
 	}
-	if pinErr := p.pinHandleOnActor(meta.id, meta.gen, planDigest, hopDigest, hopEpoch, pinStrict); pinErr != nil {
+	if _, pinErr := p.pinHandleOnActor(meta.id, meta.gen, planDigest, hopDigest, hopEpoch, pinStrict); pinErr != nil {
 		p.rollbackSlot(meta.id)
 		return zero, pinErr
 	}
 	p.emitHandleEvent(events.PoolActionMuxHandover, typed.Kind(), typed.ID(), planDigest, typed.Generation(), "managed handle registered")
 	return typed, nil
 }
-
-func (p *Pool) pinHandleOnActor(id plan.HandleID, gen uint64, pd plan.PlanDigest, hopDig plan.HopDigest, hopEpoch uint64, strict bool) error {
-	pinErrCh := make(chan error, 1)
-	if !p.actor.SendControl(controlMsg{
-		kind: ctrlPinHandle, hopDigest: hopDig, hopEpoch: hopEpoch,
-		planDigest: pd, handleID: id, handleGen: gen, pinStrict: strict, pinErrCh: pinErrCh,
-	}) {
-		return p.terminalStateError()
+func (p *Pool) pinHandleOnActor(id plan.HandleID, gen uint64, pd plan.PlanDigest, hopDig plan.HopDigest, hopEpoch uint64, strict bool) (*hopInstance, error) {
+	pinResCh := make(chan pinHandleReply, 1)
+	if !p.actor.SendControl(controlMsg{kind: ctrlPinHandle, hopDigest: hopDig, hopEpoch: hopEpoch, planDigest: pd, handleID: id, handleGen: gen, pinStrict: strict, pinResCh: pinResCh}) {
+		return nil, p.terminalStateError()
 	}
 	select {
-	case err := <-pinErrCh:
-		return err
+	case rep := <-pinResCh:
+		return rep.inst, rep.err
 	case <-p.actor.Done():
-		return p.terminalStateError()
+		return nil, p.terminalStateError()
 	}
 }
-
-func validateRegisterInputs[K plan.HandleKind, R ComparableManagedResource](
-	p *Pool, planDigest plan.PlanDigest, binding security.OperationBinding, resource R,
-) error {
+func validateRegisterInputs[K plan.HandleKind, R ComparableManagedResource](p *Pool, planDigest plan.PlanDigest, binding security.OperationBinding, resource R) error {
 	if err := checkPoolAvailable(p); err != nil {
 		return err
 	}
-	if !plan.HandleKindOf[K]().IsValid() || !planDigest.IsValid() || !binding.IsValid() {
-		return ErrInvalidHandle
+	if err := validateHandleBinding[K](planDigest, binding); err != nil {
+		return err
 	}
-	var zeroRes R
-	if resource == zeroRes {
-		return ErrInvalidResource
-	}
-	var iface ManagedResource = resource
-	if iface == nil || !iface.IsValid() {
-		return ErrInvalidResource
-	}
-	if bpd, ok := binding.PlanDigest().Get(); !ok || !bpd.Equal(planDigest.SecurityDigest()) {
-		return ErrHandleBindingMismatch
-	}
-	return nil
+	return checkValidManagedResource(resource)
 }
-
 func checkPoolAvailable(p *Pool) error {
-	if p == nil || !p.initialized {
+	switch {
+	case p == nil || !p.initialized:
 		return ErrPoolNotInitialized
-	}
-	if p.halted.Load() {
+	case p.halted.Load():
 		return p.haltCause()
-	}
-	if p.closed.Load() {
+	case p.closed.Load():
 		return ErrPoolClosed
+	default:
+		return nil
 	}
-	return nil
 }
 
 type allocatedSlotMeta struct {
-	id  plan.HandleID
-	gen uint64
+	id        plan.HandleID
+	gen       uint64
+	revokeCtx context.Context
+	active    *atomic.Bool
 }
 
-func (m *slotMap) allocateHandle(
-	p *Pool, id plan.HandleID, planDigest plan.PlanDigest, binding security.OperationBinding, res ManagedResource, kind plan.HandleKindCode,
-) (allocatedSlotMeta, error) {
+func (m *slotMap) allocateHandle(p *Pool, id plan.HandleID, planDigest plan.PlanDigest, binding security.OperationBinding, res ManagedResource, kind plan.HandleKindCode) (allocatedSlotMeta, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := checkPoolAvailable(p); err != nil {
@@ -198,15 +157,29 @@ func (m *slotMap) allocateHandle(
 	m.nextGen++
 	gen := m.nextGen
 	revokeCtx, revokeCancel := context.WithCancelCause(p.haltCtx)
+	slotActive := new(atomic.Bool)
+	slotActive.Store(true)
 	m.slots[idx] = slotRecord{
-		occupied: true, gen: gen, id: id, kind: kind, planDigest: planDigest,
+		occupied: true, active: slotActive, gen: gen, id: id, kind: kind, planDigest: planDigest,
 		binding: binding, resource: res, revokeCtx: revokeCtx, revokeCancel: revokeCancel,
 	}
 	m.byID[id] = idx
 	m.activeCnt.Store(int64(len(m.byID)))
-	return allocatedSlotMeta{id: id, gen: gen}, nil
+	return allocatedSlotMeta{id: id, gen: gen, revokeCtx: revokeCtx, active: slotActive}, nil
 }
-
+func (m *slotMap) attachResource(p *Pool, id plan.HandleID, gen uint64, res ManagedResource) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := checkPoolAvailable(p); err != nil {
+		return err
+	}
+	idx, ok := m.byID[id]
+	if !ok || !m.slots[idx].occupied || m.slots[idx].gen != gen || m.slots[idx].active == nil || !m.slots[idx].active.Load() {
+		return ErrHandleRevoked
+	}
+	m.slots[idx].resource = res
+	return nil
+}
 func (m *slotMap) claimFreeSlotLocked() uint32 {
 	if n := len(m.freeList); n > 0 {
 		idx := m.freeList[n-1]
@@ -217,7 +190,6 @@ func (m *slotMap) claimFreeSlotLocked() uint32 {
 	m.slots = append(m.slots, slotRecord{})
 	return idx
 }
-
 func (m *slotMap) bindSlotToHop(id plan.HandleID, gen uint64, hopDig plan.HopDigest, hopEpoch uint64) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -225,22 +197,13 @@ func (m *slotMap) bindSlotToHop(id plan.HandleID, gen uint64, hopDig plan.HopDig
 	if !ok || !m.slots[idx].occupied || m.slots[idx].gen != gen {
 		return false
 	}
-	m.slots[idx].boundHop = hopDig
-	m.slots[idx].boundEpoch = hopEpoch
+	m.slots[idx].boundHop, m.slots[idx].boundEpoch = hopDig, hopEpoch
 	return true
 }
-
 func (p *Pool) rollbackSlot(id plan.HandleID) {
 	p.slots.mu.Lock()
 	if idx, ok := p.slots.byID[id]; ok {
-		rec := &p.slots.slots[idx]
-		if rec.revokeCancel != nil {
-			rec.revokeCancel(ErrHandleRevoked)
-		}
-		delete(p.slots.byID, id)
-		p.slots.slots[idx] = slotRecord{gen: rec.gen}
-		p.slots.freeList = append(p.slots.freeList, idx)
-		p.slots.activeCnt.Store(int64(len(p.slots.byID)))
+		_ = p.slots.evictIndexLocked(idx, ErrHandleRevoked)
 	}
 	p.slots.mu.Unlock()
 }
@@ -266,7 +229,6 @@ func WithManagedHandle[K plan.HandleKind, R ComparableManagedResource](
 	}
 	return fn(scopedCtx, typed)
 }
-
 func checkWithHandleArgs(ctx context.Context, p *Pool, nilFn, invalidHandle bool) error {
 	if err := checkPoolAvailable(p); err != nil {
 		return err
@@ -282,7 +244,6 @@ func checkWithHandleArgs(ctx context.Context, p *Pool, nilFn, invalidHandle bool
 		return ctx.Err()
 	}
 }
-
 func checkPreHandleCallback[R ComparableManagedResource](p *Pool, revokeCtx context.Context, typed R) error {
 	if err := checkPoolAvailable(p); err != nil {
 		return err
@@ -296,7 +257,6 @@ func checkPreHandleCallback[R ComparableManagedResource](p *Pool, revokeCtx cont
 	}
 	return nil
 }
-
 func lookupTypedHandle[K plan.HandleKind, R ComparableManagedResource](p *Pool, handle plan.ManagedHandle[K]) (R, context.Context, error) {
 	var zero R
 	p.slots.mu.Lock()
@@ -332,7 +292,6 @@ func ReleaseHandle[K plan.HandleKind](p *Pool, handle plan.ManagedHandle[K]) err
 	idx := p.slots.byID[handle.ID()]
 	res := p.slots.evictIndexLocked(idx, ErrHandleRevoked)
 	p.slots.mu.Unlock()
-
 	p.sendUnpinIfBound(rec.boundHop, rec.boundEpoch, rec.id, rec.gen)
 	p.emitHandleEvent(events.PoolActionRetired, rec.kind, rec.id, rec.planDigest, rec.gen, "managed handle released")
 	p.scheduleResourceClose(res)
@@ -376,16 +335,9 @@ func (p *Pool) RevokeHandlesByPlan(planDigest plan.PlanDigest) int {
 	if p == nil || !p.initialized || !planDigest.IsValid() {
 		return 0
 	}
-	var evicted []revokedSlot
-	p.slots.mu.Lock()
-	for id, idx := range p.slots.byID {
-		rec := p.slots.slots[idx]
-		if rec.occupied && rec.planDigest.Equal(planDigest) {
-			res := p.slots.evictIndexLocked(idx, ErrHandleRevoked)
-			evicted = append(evicted, revokedSlot{id: id, kind: rec.kind, gen: rec.gen, pd: rec.planDigest, boundHop: rec.boundHop, boundEpoch: rec.boundEpoch, res: res})
-		}
-	}
-	p.slots.mu.Unlock()
+	evicted := p.slots.evictMatching(ErrHandleRevoked, func(rec slotRecord) bool {
+		return rec.occupied && rec.planDigest.Equal(planDigest)
+	})
 	p.finalizeRevokedSlots(evicted, events.PoolActionEvicted, "revoked by plan digest", true)
 	return len(evicted)
 }
@@ -395,23 +347,11 @@ func (p *Pool) revokeSlotsForHop(pinned map[plan.HandleID]uint64, cause error) {
 	if p == nil || p.slots == nil || len(pinned) == 0 {
 		return
 	}
-	if cause == nil {
-		cause = ErrHandleRevoked
-	}
-	var evicted []revokedSlot
-	p.slots.mu.Lock()
-	for id, gen := range pinned {
-		idx, ok := p.slots.byID[id]
-		if !ok {
-			continue
-		}
-		rec := p.slots.slots[idx]
-		if rec.occupied && rec.gen == gen {
-			res := p.slots.evictIndexLocked(idx, cause)
-			evicted = append(evicted, revokedSlot{id: id, kind: rec.kind, gen: rec.gen, pd: rec.planDigest, res: res})
-		}
-	}
-	p.slots.mu.Unlock()
+	cause = pickIf[error](cause != nil, cause, ErrHandleRevoked)
+	evicted := p.slots.evictMatching(cause, func(rec slotRecord) bool {
+		gen, ok := pinned[rec.id]
+		return ok && rec.occupied && rec.gen == gen
+	})
 	p.finalizeRevokedSlots(evicted, events.PoolActionEvicted, "revoked by detached hop", false)
 }
 
@@ -420,17 +360,22 @@ func (p *Pool) revokeAllSlots(action events.PoolEventAction, cause error) {
 	if p == nil || p.slots == nil {
 		return
 	}
-	var evicted []revokedSlot
-	p.slots.mu.Lock()
-	for id, idx := range p.slots.byID {
-		rec := p.slots.slots[idx]
-		res := p.slots.evictIndexLocked(idx, cause)
-		evicted = append(evicted, revokedSlot{id: id, kind: rec.kind, gen: rec.gen, pd: rec.planDigest, res: res})
-	}
-	p.slots.mu.Unlock()
+	evicted := p.slots.evictMatching(cause, func(slotRecord) bool { return true })
 	p.finalizeRevokedSlots(evicted, action, cause.Error(), false)
 }
-
+func (m *slotMap) evictMatching(cause error, match func(slotRecord) bool) []revokedSlot {
+	var evicted []revokedSlot
+	m.mu.Lock()
+	for id, idx := range m.byID {
+		rec := m.slots[idx]
+		if match(rec) {
+			res := m.evictIndexLocked(idx, cause)
+			evicted = append(evicted, revokedSlot{id: id, kind: rec.kind, gen: rec.gen, pd: rec.planDigest, boundHop: rec.boundHop, boundEpoch: rec.boundEpoch, res: res})
+		}
+	}
+	m.mu.Unlock()
+	return evicted
+}
 func (p *Pool) finalizeRevokedSlots(evicted []revokedSlot, action events.PoolEventAction, detail string, sendUnpin bool) {
 	if len(evicted) == 0 {
 		return
@@ -444,17 +389,15 @@ func (p *Pool) finalizeRevokedSlots(evicted []revokedSlot, action events.PoolEve
 		p.scheduleResourceClose(ev.res)
 	}
 }
-
 func (p *Pool) sendUnpinIfBound(hopDig plan.HopDigest, hopEpoch uint64, id plan.HandleID, gen uint64) {
 	if hopEpoch == 0 || !hopDig.IsValid() || p.actor == nil {
 		return
 	}
 	p.actor.SendControl(controlMsg{kind: ctrlUnpinHandle, hopDigest: hopDig, hopEpoch: hopEpoch, handleID: id, handleGen: gen})
 }
-
 func (m *slotMap) matchLocked(id plan.HandleID, kind plan.HandleKindCode, gen uint64, pd plan.PlanDigest, binding security.OperationBinding) (slotRecord, error) {
 	idx, ok := m.byID[id]
-	if !ok {
+	if !ok || m.slots[idx].resource == nil {
 		return slotRecord{}, ErrHandleNotFound
 	}
 	rec := m.slots[idx]
@@ -466,10 +409,12 @@ func (m *slotMap) matchLocked(id plan.HandleID, kind plan.HandleKindCode, gen ui
 	}
 	return rec, nil
 }
-
 func (m *slotMap) evictIndexLocked(idx uint32, cause error) ManagedResource {
 	rec := &m.slots[idx]
 	res, id, gen := rec.resource, rec.id, rec.gen
+	if rec.active != nil {
+		rec.active.Store(false)
+	}
 	if rec.revokeCancel != nil {
 		rec.revokeCancel(cause)
 	}
@@ -479,7 +424,6 @@ func (m *slotMap) evictIndexLocked(idx uint32, cause error) ManagedResource {
 	m.activeCnt.Store(int64(len(m.byID)))
 	return res
 }
-
 func (p *Pool) emitHandleEvent(action events.PoolEventAction, kind plan.HandleKindCode, id plan.HandleID, pd plan.PlanDigest, gen uint64, detail string) {
 	p.emitPoolEvent(poolEventInput{
 		action: action, planDigest: algebraic.Some(pd), handleKind: algebraic.Some(kind),

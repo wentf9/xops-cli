@@ -4,11 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
-	"sync"
-	"sync/atomic"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -16,6 +11,10 @@ import (
 	"github.com/wentf9/xops-cli/core/internal/foundation/actor"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
 	"github.com/wentf9/xops-cli/core/ports"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // errFastPathMiss 为包内不可变哨兵，用于指示整链快路径未命中并回退至逐跳多跳解析。
@@ -30,15 +29,12 @@ var errFastPathMiss = errors.New("pool: 整链快路径未命中")
 //xops:opaque
 //xops:failclosed
 type Pool struct {
-	initialized bool // 非指针正向有效门控（满足 xopsvet/failclosed 零值最严约束）
-	halted      atomic.Bool
-	closed      atomic.Bool
-
-	haltMu     sync.Mutex
-	haltErr    error
-	haltCtx    context.Context
-	haltCancel context.CancelCauseFunc
-
+	initialized              bool // 非指针正向有效门控（满足 xopsvet/failclosed 零值最严约束）
+	halted, closed           atomic.Bool
+	haltMu                   sync.Mutex
+	haltErr                  error
+	haltCtx                  context.Context
+	haltCancel               context.CancelCauseFunc
 	dialer                   ports.DialerPort
 	clock                    ports.Clock
 	entropy                  ports.Entropy
@@ -49,38 +45,24 @@ type Pool struct {
 	teardownGrace            time.Duration
 	idleTTL                  time.Duration
 	defaultKeepaliveInterval time.Duration
-
-	workNursery     *conc.Nursery
-	teardownNursery *conc.Nursery
-	actor           *actor.DualActor[acquireMsg, controlMsg]
-	slots           *slotMap
-
+	workNursery              *conc.Nursery
+	teardownNursery          *conc.Nursery
+	actor                    *actor.DualActor[acquireMsg, controlMsg]
+	slots                    *slotMap
 	// 以下映射与世代计数器仅在 DualActor 单线程循环（及 actorDone 后的停机清理）内访问。
 	active    map[plan.HopDigest]*hopInstance
 	byPlan    map[plan.PlanDigest]plan.HopDigest
 	dialing   map[plan.HopDigest]*dialInflight
 	nextEpoch uint64
-
 	// 以下原子计数器供无锁 Stats() 与租约/事件序列使用。
-	activeConns       atomic.Int64
-	dialingConns      atomic.Int64
-	activeLeases      atomic.Int64
-	totalDials        atomic.Uint64
-	dialErrors        atomic.Uint64
-	cacheHits         atomic.Uint64
-	parentCASRejects  atomic.Uint64
-	teardownCompleted atomic.Uint64
-	teardownEscalated atomic.Uint64
-	nextLeaseSeq      atomic.Uint64
-	eventSeq          atomic.Uint64
-
-	tdMu      sync.Mutex
-	tdPending int64
-	tdIdleCh  chan struct{}
-
-	finalCleanupOnce sync.Once
-	closeOnce        sync.Once
-	closeErr         error
+	activeConns, dialingConns, activeLeases                      atomic.Int64
+	totalDials, dialErrors, cacheHits, parentCASRejects          atomic.Uint64
+	teardownCompleted, teardownEscalated, nextLeaseSeq, eventSeq atomic.Uint64
+	tdMu                                                         sync.Mutex
+	tdPending                                                    int64
+	tdIdleCh                                                     chan struct{}
+	finalCleanupOnce, closeOnce                                  sync.Once
+	closeErr                                                     error
 }
 
 // NewPool 校验配置与出站依赖端口，初始化 DualActor、双 Nursery 与世代 SlotMap，并启动 Actor 主循环。
@@ -102,7 +84,6 @@ func NewPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 	}
 	return buildAndStartPool(ctx, norm, poolTID)
 }
-
 func normalizePoolConfig(cfg PoolConfig) (PoolConfig, error) {
 	if err := validatePoolPorts(cfg); err != nil {
 		return PoolConfig{}, err
@@ -124,7 +105,6 @@ func normalizePoolConfig(cfg PoolConfig) (PoolConfig, error) {
 	}
 	return cfg, nil
 }
-
 func validatePoolPorts(cfg PoolConfig) error {
 	switch {
 	case cfg.Dialer == nil:
@@ -139,7 +119,6 @@ func validatePoolPorts(cfg PoolConfig) error {
 		return nil
 	}
 }
-
 func validatePoolLimits(cfg PoolConfig) error {
 	if cfg.AcquireBuffer < 0 || cfg.MaxConns < 0 || cfg.MaxHandles < 0 ||
 		cfg.TeardownGrace < 0 || cfg.IdleTTL < 0 || cfg.DefaultKeepaliveInterval < 0 {
@@ -147,7 +126,6 @@ func validatePoolLimits(cfg PoolConfig) error {
 	}
 	return nil
 }
-
 func buildAndStartPool(ctx context.Context, cfg PoolConfig, poolTID security.TraceID) (*Pool, error) {
 	workNursery, err := conc.NewNursery(ctx)
 	if err != nil {
@@ -161,7 +139,6 @@ func buildAndStartPool(ctx context.Context, cfg PoolConfig, poolTID security.Tra
 	haltCtx, haltCancel := context.WithCancelCause(workNursery.Context())
 	idleCh := make(chan struct{})
 	close(idleCh)
-
 	p := &Pool{
 		initialized: true, haltCtx: haltCtx, haltCancel: haltCancel,
 		dialer: cfg.Dialer, clock: cfg.Clock, entropy: cfg.Entropy, bus: cfg.Bus,
@@ -195,7 +172,6 @@ func buildAndStartPool(ctx context.Context, cfg PoolConfig, poolTID security.Tra
 	}
 	return p, nil
 }
-
 func (p *Pool) startBackgroundLoops() error {
 	if err := p.workNursery.Go(p.runActor); err != nil {
 		return err
@@ -208,11 +184,7 @@ func (p *Pool) startBackgroundLoops() error {
 	}
 	return nil
 }
-
-func (p *Pool) nextLeaseID() string {
-	return "lease-" + strconv.FormatUint(p.nextLeaseSeq.Add(1), 10)
-}
-
+func (p *Pool) nextLeaseID() string { return "lease-" + strconv.FormatUint(p.nextLeaseSeq.Add(1), 10) }
 func (p *Pool) terminalStateError() error {
 	if p.halted.Load() {
 		return p.haltCause()
@@ -220,12 +192,8 @@ func (p *Pool) terminalStateError() error {
 	return ErrPoolClosed
 }
 
-// GateHalted 响应能力门控触发的 Halted 熔断（可直接接线至 gate.OnHaltFunc，ADR-008 / ADR-009）。
-//
-// 执行语义（幂等且永不阻塞在有界邮箱或网络 I/O 上）：
-//  1. 原子置位 halted 标志并记录熔断原因，后续所有申请立即失败关闭返回 ErrGateHalted；
-//  2. 立即取消根 haltCtx 并同步吊销世代 SlotMap 中的全部活跃 ManagedHandle 与活跃租约上下文；
-//  3. 通过永不阻塞控制通道同步指令 Actor 立即摘除全部连接、拒绝全部在途等待者并在 90ms 宽限预算内后台拆断。
+// GateHalted 响应能力门控触发的 Halted 熔断（可直接接线至 gate.OnHaltFunc，ADR-008 / ADR-009）：
+// 原子置位熔断态、取消 haltCtx 并吊销全部活跃托管句柄、经控制通道同步摘除全部连接并有界拆断。
 func (p *Pool) GateHalted(reason error) {
 	if p == nil || !p.initialized {
 		return
@@ -233,20 +201,14 @@ func (p *Pool) GateHalted(reason error) {
 	cause := p.recordHaltReason(reason)
 	p.haltCancel(cause)
 	p.revokeAllSlots(events.PoolActionGateHalted, cause)
-
 	doneCh := make(chan struct{})
-	if p.actor.SendControl(controlMsg{
-		kind:   ctrlGateHalted,
-		err:    cause,
-		doneCh: doneCh,
-	}) {
+	if p.actor.SendControl(controlMsg{kind: ctrlGateHalted, err: cause, doneCh: doneCh}) {
 		select {
 		case <-doneCh:
 		case <-p.actor.Done():
 		}
 	}
 }
-
 func (p *Pool) recordHaltReason(reason error) error {
 	p.haltMu.Lock()
 	defer p.haltMu.Unlock()
@@ -264,15 +226,11 @@ func (p *Pool) recordHaltReason(reason error) error {
 	p.halted.Store(true)
 	return p.haltErr
 }
-
 func (p *Pool) haltCause() error {
 	p.haltMu.Lock()
 	err := p.haltErr
 	p.haltMu.Unlock()
-	if err != nil {
-		return err
-	}
-	return ErrGateHalted
+	return pickIf[error](err != nil, err, ErrGateHalted)
 }
 
 // RetireHop 主动退役指定 HopDigest 的当前活跃连接及其全部下游子跳，取消关联租约并在 90ms 宽限内拆断。
@@ -284,7 +242,6 @@ func (p *Pool) RetireHop(digest plan.HopDigest) error {
 func (p *Pool) RetirePlan(planDigest plan.PlanDigest) error {
 	return p.sendSyncControl(planDigest.IsValid(), controlMsg{kind: ctrlRetirePlan, planDigest: planDigest})
 }
-
 func (p *Pool) sendSyncControl(validArg bool, msg controlMsg) error {
 	if p == nil || !p.initialized {
 		return ErrPoolNotInitialized
@@ -310,12 +267,7 @@ func (p *Pool) EvictIdle() int {
 		return 0
 	}
 	countCh := make(chan int, 1)
-	if !p.actor.SendControl(controlMsg{
-		kind:      ctrlEvictIdle,
-		cutoff:    p.clock.Now(),
-		forceIdle: true,
-		countCh:   countCh,
-	}) {
+	if !p.actor.SendControl(controlMsg{kind: ctrlEvictIdle, cutoff: p.clock.Now(), forceIdle: true, countCh: countCh}) {
 		return 0
 	}
 	select {
@@ -326,8 +278,7 @@ func (p *Pool) EvictIdle() int {
 	}
 }
 
-// WaitPendingTeardowns 阻塞等待当前已派发的有界拆断协调任务全部结束（或 ctx 取消）。
-// 本方法供测试与确定性仿真零 time.Sleep 同步校验拆断与 90ms 升级结果。
+// WaitPendingTeardowns 阻塞等待当前已派发的有界拆断协调任务全部结束（或 ctx 取消），供测试零 time.Sleep 同步。
 func (p *Pool) WaitPendingTeardowns(ctx context.Context) error {
 	if p == nil || !p.initialized {
 		return ErrPoolNotInitialized
@@ -346,15 +297,9 @@ func (p *Pool) WaitPendingTeardowns(ctx context.Context) error {
 	}
 }
 
-// IsHalted 报告连接池是否已进入 GateHalted 熔断态（nil 或未初始化零值失败关闭返回 true）。
-func (p *Pool) IsHalted() bool {
-	return p == nil || !p.initialized || p.halted.Load()
-}
-
-// IsClosed 报告连接池是否已关闭（nil 或未初始化零值失败关闭返回 true）。
-func (p *Pool) IsClosed() bool {
-	return p == nil || !p.initialized || p.closed.Load()
-}
+// IsHalted / IsClosed 报告连接池熔断或关闭状态（nil 或未初始化零值失败关闭返回 true）。
+func (p *Pool) IsHalted() bool { return p == nil || !p.initialized || p.halted.Load() }
+func (p *Pool) IsClosed() bool { return p == nil || !p.initialized || p.closed.Load() }
 
 // Stats 返回连接池当前的无锁并发安全运行期统计快照。
 func (p *Pool) Stats() PoolStats {
@@ -362,18 +307,12 @@ func (p *Pool) Stats() PoolStats {
 		return PoolStats{Closed: true}
 	}
 	return PoolStats{
-		ActiveConns:         int(p.activeConns.Load()),
-		DialingConns:        int(p.dialingConns.Load()),
-		ActiveLeases:        p.activeLeases.Load(),
-		ActiveHandles:       p.slots.len(),
-		TotalDials:          p.totalDials.Load(),
-		DialErrors:          p.dialErrors.Load(),
-		CacheHits:           p.cacheHits.Load(),
-		ParentCASRejections: p.parentCASRejects.Load(),
-		TeardownCompleted:   p.teardownCompleted.Load(),
-		TeardownEscalations: p.teardownEscalated.Load(),
-		Halted:              p.halted.Load(),
-		Closed:              p.closed.Load(),
+		ActiveConns: int(p.activeConns.Load()), DialingConns: int(p.dialingConns.Load()),
+		ActiveLeases: p.activeLeases.Load(), ActiveHandles: p.slots.len(),
+		TotalDials: p.totalDials.Load(), DialErrors: p.dialErrors.Load(),
+		CacheHits: p.cacheHits.Load(), ParentCASRejections: p.parentCASRejects.Load(),
+		TeardownCompleted: p.teardownCompleted.Load(), TeardownEscalations: p.teardownEscalated.Load(),
+		Halted: p.halted.Load(), Closed: p.closed.Load(),
 	}
 }
 

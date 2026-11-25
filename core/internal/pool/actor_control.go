@@ -1,16 +1,16 @@
 package pool
 
 import (
+	"cmp"
 	"context"
 	"errors"
-	"slices"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
+	"slices"
+	"time"
 )
 
 func (p *Pool) handleControlMsg(msg controlMsg) {
@@ -41,20 +41,19 @@ func (p *Pool) handleControlMsg(msg controlMsg) {
 		p.onUnpinHandle(msg)
 	}
 }
-
 func (p *Pool) onPinHandle(msg controlMsg) {
 	if p.halted.Load() || p.closed.Load() {
-		msg.pinErrCh <- p.terminalStateError()
+		msg.pinResCh <- pinHandleReply{err: p.terminalStateError()}
 		return
 	}
 	target, err := p.resolvePinTarget(msg)
 	if err != nil {
-		msg.pinErrCh <- err
+		msg.pinResCh <- pinHandleReply{err: err}
 		return
 	}
 	if target != nil {
 		if !p.slots.bindSlotToHop(msg.handleID, msg.handleGen, target.digest, target.epoch) {
-			msg.pinErrCh <- ErrHandleRevoked
+			msg.pinResCh <- pinHandleReply{err: ErrHandleRevoked}
 			return
 		}
 		if target.pinnedHandles == nil {
@@ -62,9 +61,8 @@ func (p *Pool) onPinHandle(msg controlMsg) {
 		}
 		target.pinnedHandles[msg.handleID] = msg.handleGen
 	}
-	msg.pinErrCh <- nil
+	msg.pinResCh <- pinHandleReply{inst: target}
 }
-
 func (p *Pool) resolvePinTarget(msg controlMsg) (*hopInstance, error) {
 	if msg.pinStrict {
 		cand := p.active[msg.hopDigest]
@@ -80,7 +78,6 @@ func (p *Pool) resolvePinTarget(msg controlMsg) (*hopInstance, error) {
 	}
 	return nil, nil
 }
-
 func (p *Pool) onUnpinHandle(msg controlMsg) {
 	inst := p.active[msg.hopDigest]
 	if inst == nil || inst.epoch != msg.hopEpoch || inst.pinnedHandles[msg.handleID] != msg.handleGen {
@@ -89,7 +86,6 @@ func (p *Pool) onUnpinHandle(msg controlMsg) {
 	delete(inst.pinnedHandles, msg.handleID)
 	inst.lastUsed = p.clock.Now()
 }
-
 func (p *Pool) onReleaseLease(inst *hopInstance, doneCh chan struct{}) {
 	defer closeSignal(doneCh)
 	if inst == nil || inst.activeLeases <= 0 {
@@ -103,7 +99,6 @@ func (p *Pool) onReleaseLease(inst *hopInstance, doneCh chan struct{}) {
 		endpoint: algebraic.Some(inst.hopSpec.Endpoint()), generation: inst.epoch, activeLeases: inst.activeLeases,
 	})
 }
-
 func (p *Pool) onDialDone(inf *dialInflight, conn ports.TransportConn, dialErr error) {
 	if inf == nil {
 		p.scheduleOrphanConnClose(conn)
@@ -119,7 +114,6 @@ func (p *Pool) onDialDone(inf *dialInflight, conn ports.TransportConn, dialErr e
 	p.dialingConns.Store(int64(len(p.dialing)))
 	p.releaseInflightParentPin(inf)
 	inf.dialCancel(nil)
-
 	latency := p.clock.Since(inf.startedAt)
 	if failErr := p.validateDialPublish(inf, conn, dialErr); failErr != nil {
 		p.scheduleOrphanConnClose(conn)
@@ -129,7 +123,6 @@ func (p *Pool) onDialDone(inf *dialInflight, conn ports.TransportConn, dialErr e
 	}
 	p.publishDialedInstance(inf, conn, latency)
 }
-
 func (p *Pool) validateDialPublish(inf *dialInflight, conn ports.TransportConn, dialErr error) error {
 	if p.halted.Load() || p.closed.Load() {
 		return p.terminalStateError()
@@ -149,7 +142,6 @@ func (p *Pool) validateDialPublish(inf *dialInflight, conn ports.TransportConn, 
 	}
 	return nil
 }
-
 func (p *Pool) publishDialedInstance(inf *dialInflight, conn ports.TransportConn, latency time.Duration) {
 	if old, exists := p.active[inf.digest]; exists {
 		p.retireSubtree(old, ErrHopRetired, events.PoolActionRetired, "replaced by newer generation")
@@ -175,7 +167,6 @@ func (p *Pool) publishDialedInstance(inf *dialInflight, conn ports.TransportConn
 	p.emitDialResultEvent(inf, events.PoolActionDialSucceeded, inst.epoch, latency, "")
 	p.grantDialWaiters(inf, inst)
 }
-
 func (p *Pool) grantDialWaiters(inf *dialInflight, inst *hopInstance) {
 	for _, w := range inf.waiters {
 		if w.tryGrant(inst, nil) {
@@ -189,14 +180,12 @@ func (p *Pool) grantDialWaiters(inf *dialInflight, inst *hopInstance) {
 		}
 	}
 }
-
 func (p *Pool) recordPlanIndex(inst *hopInstance, pdOpt algebraic.Option[plan.PlanDigest]) {
 	if pd, ok := pdOpt.Get(); ok {
 		inst.planDigests[pd] = struct{}{}
 		p.byPlan[pd] = inst.digest
 	}
 }
-
 func (p *Pool) onCancelWaiter(digest plan.HopDigest, target *acquireWaiter) {
 	inf, ok := p.dialing[digest]
 	if !ok || target == nil {
@@ -209,7 +198,6 @@ func (p *Pool) onCancelWaiter(digest plan.HopDigest, target *acquireWaiter) {
 		p.cancelInflight(inf, context.Canceled)
 	}
 }
-
 func (p *Pool) onRetireHop(digest plan.HopDigest, doneCh chan struct{}) {
 	defer closeSignal(doneCh)
 	if inst, ok := p.active[digest]; ok {
@@ -219,7 +207,6 @@ func (p *Pool) onRetireHop(digest plan.HopDigest, doneCh chan struct{}) {
 		p.cancelInflight(inf, ErrHopRetired)
 	}
 }
-
 func (p *Pool) onRetirePlan(planDigest plan.PlanDigest, doneCh chan struct{}) {
 	defer closeSignal(doneCh)
 	if dig, ok := p.byPlan[planDigest]; ok {
@@ -240,13 +227,11 @@ func (p *Pool) onRetirePlan(planDigest plan.PlanDigest, doneCh chan struct{}) {
 		p.cancelInflight(inf, ErrHopRetired)
 	}
 }
-
 func (p *Pool) onRetireInstance(inst *hopInstance) {
 	if inst != nil && inst.inActiveMap && p.active[inst.digest] == inst {
 		p.retireSubtree(inst, ErrHopRetired, events.PoolActionRetired, "lease reported broken")
 	}
 }
-
 func (p *Pool) onKeepaliveFailed(inst *hopInstance, err error) {
 	if inst == nil || !inst.inActiveMap || p.active[inst.digest] != inst {
 		return
@@ -257,7 +242,6 @@ func (p *Pool) onKeepaliveFailed(inst *hopInstance, err error) {
 	}
 	p.retireSubtree(inst, ErrHopRetired, events.PoolActionEvicted, detail)
 }
-
 func (p *Pool) onEvictIdle(cutoff time.Time, forceAll bool, countCh chan int) {
 	evicted := 0
 	for {
@@ -275,7 +259,6 @@ func (p *Pool) onEvictIdle(cutoff time.Time, forceAll bool, countCh chan int) {
 		countCh <- evicted
 	}
 }
-
 func (p *Pool) collectIdleLeaves(cutoff time.Time, forceAll bool) []*hopInstance {
 	var batch []*hopInstance
 	for _, inst := range p.active {
@@ -285,7 +268,6 @@ func (p *Pool) collectIdleLeaves(cutoff time.Time, forceAll bool) []*hopInstance
 	}
 	return batch
 }
-
 func (p *Pool) onAbortRoot(root *hopInstance, doneCh chan struct{}) {
 	defer closeSignal(doneCh)
 	if root == nil || !root.abortClaimed.CompareAndSwap(false, true) {
@@ -308,7 +290,6 @@ func (p *Pool) onAbortRoot(root *hopInstance, doneCh chan struct{}) {
 	}
 	p.activeConns.Store(int64(len(p.active)))
 }
-
 func (p *Pool) onGateHalted(cause error, doneCh chan struct{}) {
 	defer closeSignal(doneCh)
 	if cause == nil {
@@ -321,7 +302,6 @@ func (p *Pool) onGateHalted(cause error, doneCh chan struct{}) {
 	}
 	clear(p.dialing)
 	p.dialingConns.Store(0)
-
 	batch := make([]*hopInstance, 0, len(p.active))
 	for _, inst := range p.active {
 		pinned := inst.pinnedHandles
@@ -332,7 +312,6 @@ func (p *Pool) onGateHalted(cause error, doneCh chan struct{}) {
 	}
 	clear(p.active)
 	clear(p.byPlan)
-
 	p.emitPoolEvent(poolEventInput{action: events.PoolActionGateHalted, detail: cause.Error()})
 	if len(batch) > 0 {
 		sortLeavesFirst(batch)
@@ -342,7 +321,6 @@ func (p *Pool) onGateHalted(cause error, doneCh chan struct{}) {
 	// 保证观测到 ActiveConns==0 的调用方调用 WaitPendingTeardowns 绝无提前返回窗口。
 	p.activeConns.Store(0)
 }
-
 func (p *Pool) retireSubtree(root *hopInstance, cause error, action events.PoolEventAction, detail string) {
 	batch := p.collectAndDetachSubtree(root, cause, action, detail)
 	if len(batch) > 0 {
@@ -351,7 +329,6 @@ func (p *Pool) retireSubtree(root *hopInstance, cause error, action events.PoolE
 	}
 	p.activeConns.Store(int64(len(p.active)))
 }
-
 func (p *Pool) collectAndDetachSubtree(root *hopInstance, cause error, action events.PoolEventAction, detail string) []*hopInstance {
 	if root == nil {
 		return nil
@@ -374,7 +351,6 @@ func (p *Pool) collectAndDetachSubtree(root *hopInstance, cause error, action ev
 	p.cancelInflightChildren(seen, cause)
 	return batch
 }
-
 func (p *Pool) detachInstance(inst *hopInstance, cause error, action events.PoolEventAction, detail string) {
 	if inst.inActiveMap && p.active[inst.digest] == inst {
 		delete(p.active, inst.digest)
@@ -400,13 +376,11 @@ func (p *Pool) detachInstance(inst *hopInstance, cause error, action events.Pool
 		generation: inst.epoch, activeLeases: inst.activeLeases, detail: detail,
 	})
 }
-
 func (p *Pool) deactivateInstance(inst *hopInstance, cause error) {
 	inst.active.Store(false)
 	inst.epochAtom.Store(0)
 	inst.revokeCancel(cause)
 }
-
 func (p *Pool) cancelInflightChildren(detached map[*hopInstance]bool, cause error) {
 	var victims []*dialInflight
 	for _, inf := range p.dialing {
@@ -423,11 +397,9 @@ func (p *Pool) cancelInflightChildren(detached map[*hopInstance]bool, cause erro
 		p.cancelInflight(inf, childErr)
 	}
 }
-
 func sortInflightByDigest(victims []*dialInflight) {
 	slices.SortFunc(victims, func(a, b *dialInflight) int { return a.digest.Compare(b.digest) })
 }
-
 func (p *Pool) cancelInflight(inf *dialInflight, err error) {
 	if p.dialing[inf.digest] == inf {
 		delete(p.dialing, inf.digest)
@@ -437,7 +409,6 @@ func (p *Pool) cancelInflight(inf *dialInflight, err error) {
 	inf.dialCancel(err)
 	p.failInflightWaiters(inf, err)
 }
-
 func (p *Pool) releaseInflightParentPin(inf *dialInflight) {
 	if inf == nil || inf.parent == nil || inf.parentPinReleased {
 		return
@@ -448,14 +419,12 @@ func (p *Pool) releaseInflightParentPin(inf *dialInflight) {
 		p.activeLeases.Add(-1)
 	}
 }
-
 func (p *Pool) failInflightWaiters(inf *dialInflight, err error) {
 	for _, w := range inf.waiters {
 		_ = w.tryGrant(nil, err)
 	}
 	inf.waiters = nil
 }
-
 func (p *Pool) emitDialResultEvent(inf *dialInflight, action events.PoolEventAction, epoch uint64, lat time.Duration, detail string) {
 	var tid security.TraceID
 	var oid algebraic.Option[security.OperationID]
@@ -468,19 +437,14 @@ func (p *Pool) emitDialResultEvent(inf *dialInflight, action events.PoolEventAct
 		generation: epoch, latency: lat, detail: detail,
 	})
 }
-
 func sortLeavesFirst(batch []*hopInstance) {
 	slices.SortFunc(batch, func(a, b *hopInstance) int {
-		if a.hopSpec.HopIndex() != b.hopSpec.HopIndex() {
-			if a.hopSpec.HopIndex() > b.hopSpec.HopIndex() {
-				return -1
-			}
-			return 1
+		if c := cmp.Compare(b.hopSpec.HopIndex(), a.hopSpec.HopIndex()); c != 0 {
+			return c
 		}
 		return a.digest.Compare(b.digest)
 	})
 }
-
 func closeSignal(ch chan struct{}) {
 	if ch != nil {
 		close(ch)

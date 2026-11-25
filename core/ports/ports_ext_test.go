@@ -41,6 +41,7 @@ func TestCompileTimeInterfaceContracts(t *testing.T) {
 		htc   ports.HostTrustCheck
 		pty   ports.PTYRequest
 		fdir  ports.ForwardDirection
+		fend  ports.ForwardEndpointKind
 		fspec ports.ForwardSpec
 		mact  ports.MuxControlAction
 		mresp ports.MuxControlResponse
@@ -49,6 +50,8 @@ func TestCompileTimeInterfaceContracts(t *testing.T) {
 		rstat ports.RemoteFileStat
 		rde   ports.RemoteDirEntry
 		rwsp  ports.RemoteWriteSpec
+		rrsp  ports.RemoteRenameSpec
+		jgs   ports.JournalGenerationSnapshot
 		pid   ports.ProcessInstanceID
 		aph   ports.AuditPhase
 		aout  ports.AuditOutcome
@@ -87,6 +90,9 @@ func TestCompileTimeInterfaceContracts(t *testing.T) {
 		_ encoding.TextAppender    = fdir
 		_ encoding.TextMarshaler   = fdir
 		_ encoding.TextUnmarshaler = &fdir
+		_ encoding.TextAppender    = fend
+		_ encoding.TextMarshaler   = fend
+		_ encoding.TextUnmarshaler = &fend
 		_ encoding.TextAppender    = mact
 		_ encoding.TextMarshaler   = mact
 		_ encoding.TextUnmarshaler = &mact
@@ -135,7 +141,10 @@ func TestCompileTimeInterfaceContracts(t *testing.T) {
 		_ jsonv2.UnmarshalerFrom   = &rde
 		_ jsonv2.MarshalerTo       = rwsp
 		_ jsonv2.UnmarshalerFrom   = &rwsp
+		_ jsonv2.MarshalerTo       = rrsp
+		_ jsonv2.UnmarshalerFrom   = &rrsp
 		_ jsonv2.MarshalerTo       = aent
+		_                          = jgs.IsValid()
 		_ jsonv2.UnmarshalerFrom   = &aent
 		_ jsonv2.MarshalerTo       = crep
 		_ jsonv2.UnmarshalerFrom   = &crep
@@ -200,6 +209,7 @@ func TestZeroValuesFailClosed(t *testing.T) {
 		htc   ports.HostTrustCheck
 		pty   ports.PTYRequest
 		fdir  ports.ForwardDirection
+		fend  ports.ForwardEndpointKind
 		fspec ports.ForwardSpec
 		mact  ports.MuxControlAction
 		mreq  ports.MuxControlRequest
@@ -209,6 +219,8 @@ func TestZeroValuesFailClosed(t *testing.T) {
 		rstat ports.RemoteFileStat
 		rde   ports.RemoteDirEntry
 		rwsp  ports.RemoteWriteSpec
+		rrsp  ports.RemoteRenameSpec
+		jgs   ports.JournalGenerationSnapshot
 		pid   ports.ProcessInstanceID
 		aph   ports.AuditPhase
 		aout  ports.AuditOutcome
@@ -246,6 +258,7 @@ func TestZeroValuesFailClosed(t *testing.T) {
 	assertZeroEqFalse(t, "HostTrustCheck", htc)
 	assertZeroEqFalse(t, "PTYRequest", pty)
 	assertZeroInvalid(t, "ForwardDirection", fdir)
+	assertZeroInvalid(t, "ForwardEndpointKind", fend)
 	assertZeroEqFalse(t, "ForwardSpec", fspec)
 	assertZeroInvalid(t, "MuxControlAction", mact)
 	assertZeroInvalid(t, "MuxControlRequest", mreq)
@@ -255,6 +268,8 @@ func TestZeroValuesFailClosed(t *testing.T) {
 	assertZeroEqFalse(t, "RemoteFileStat", rstat)
 	assertZeroEqFalse(t, "RemoteDirEntry", rde)
 	assertZeroEqFalse(t, "RemoteWriteSpec", rwsp)
+	assertZeroEqFalse(t, "RemoteRenameSpec", rrsp)
+	assertZeroEqFalse(t, "JournalGenerationSnapshot", jgs)
 	assertZeroEqFalse(t, "ProcessInstanceID", pid)
 	assertZeroInvalid(t, "AuditPhase", aph)
 	assertZeroInvalid(t, "AuditOutcome", aout)
@@ -280,7 +295,7 @@ func TestZeroValuesFailClosed(t *testing.T) {
 		ranc.Matches(ranc) || pres.Succeeded() || creq.Risk() != security.RiskUnknown ||
 		aresp.Approved() || aresp.Verdict() != security.VerdictDeny ||
 		vstat.IsUnlocked() || sshfp.Authenticated() || preq.NonInteractive() ||
-		sprob.LaunchProfile().IsValid() {
+		sprob.LaunchProfile().IsValid() || !jgs.Corrupt() || jgs.Err() == nil || jgs.Generation() != 0 {
 		t.Fatal("零值安全谓词必须严格失败关闭")
 	}
 }
@@ -498,5 +513,68 @@ func TestMiscConstructorsAndValidation(t *testing.T) {
 	var typedNilAuditErr *ports.AuditPostWriteError
 	if typedNilAuditErr.IsValid() || typedNilAuditErr.Is(ports.ErrAuditPostWrite) {
 		t.Fatal("typed-nil *AuditPostWriteError 必须失败关闭且不匹配 ErrAuditPostWrite")
+	}
+	verifyJournalSnapshotConstructors(t)
+}
+
+func verifyJournalSnapshotConstructors(t *testing.T) {
+	t.Helper()
+	opID, _ := security.ParseOperationID("op-journal-snap-1")
+	rp, _ := pathalg.ParseRemotePath("/tmp/a.bin")
+	dest, _ := fsm.NewUploadDest(rp)
+	rec1, err := fsm.NewTransferJournalRecord(fsm.TransferJournalRecordSpec{
+		Version: fsm.JournalVersionV2, Generation: 1, Seq: 1, Kind: fsm.JournalRecordInit,
+		TransferID: opID, Dest: algebraic.Some(dest), TotalBytes: 10,
+	})
+	if err != nil {
+		t.Fatalf("NewTransferJournalRecord: %v", err)
+	}
+	snap, err := ports.NewJournalGenerationSnapshot(1, []fsm.TransferJournalRecord{rec1})
+	if err != nil || !snap.IsValid() || snap.Corrupt() || snap.Err() != nil || snap.Generation() != 1 || len(snap.Records()) != 1 || snap.PartialRecords() != nil {
+		t.Fatalf("NewJournalGenerationSnapshot 异常: (%+v, %v)", snap, err)
+	}
+	if _, err := ports.NewJournalGenerationSnapshot(2, []fsm.TransferJournalRecord{rec1}); err == nil {
+		t.Fatal("跨世代记录构造 JournalGenerationSnapshot 必须失败关闭")
+	}
+	if _, err := ports.NewJournalGenerationSnapshot(1, nil); err == nil {
+		t.Fatal("空记录构造 JournalGenerationSnapshot 必须失败关闭")
+	}
+	corrupt, err := ports.NewCorruptJournalGenerationSnapshot(2, ports.ErrCorruptData)
+	if err != nil || !corrupt.IsValid() || !corrupt.Corrupt() || !errors.Is(corrupt.Err(), ports.ErrCorruptData) || corrupt.Generation() != 2 || corrupt.Records() != nil || corrupt.PartialRecords() != nil {
+		t.Fatalf("NewCorruptJournalGenerationSnapshot(header corrupt) 异常: (%+v, %v)", corrupt, err)
+	}
+	verifyCorruptJournalSnapshotPrefix(t, rec1)
+}
+
+func verifyCorruptJournalSnapshotPrefix(t *testing.T, rec1 fsm.TransferJournalRecord) {
+	t.Helper()
+	prefix := []fsm.TransferJournalRecord{rec1}
+	corruptWithPrefix, err := ports.NewCorruptJournalGenerationSnapshot(1, ports.ErrCorruptData, prefix...)
+	if err != nil || !corruptWithPrefix.IsValid() || !corruptWithPrefix.Corrupt() || corruptWithPrefix.Records() != nil || len(corruptWithPrefix.PartialRecords()) != 1 || !corruptWithPrefix.PartialRecords()[0].Equal(rec1) {
+		t.Fatalf("NewCorruptJournalGenerationSnapshot(partialPrefix) 异常: (%+v, %v)", corruptWithPrefix, err)
+	}
+	// 验证构造入参与 PartialRecords() 返回值均执行防御性克隆，且 Equal 区分不同前缀。
+	var zeroRec fsm.TransferJournalRecord
+	prefix[0] = zeroRec
+	gotPartial := corruptWithPrefix.PartialRecords()
+	gotPartial[0] = zeroRec
+	if gotAgain := corruptWithPrefix.PartialRecords(); len(gotAgain) != 1 || !gotAgain[0].Equal(rec1) {
+		t.Fatalf("PartialRecords() 必须返回独立防御性克隆副本: %+v", gotAgain)
+	}
+	corruptGen1Empty, err := ports.NewCorruptJournalGenerationSnapshot(1, ports.ErrCorruptData)
+	if err != nil || corruptWithPrefix.Equal(corruptGen1Empty) {
+		t.Fatal("含前缀与空前缀的同代损坏快照 Equal 不得相等")
+	}
+	if _, err := ports.NewCorruptJournalGenerationSnapshot(2, ports.ErrCorruptData, rec1); err == nil {
+		t.Fatal("跨世代 partialPrefix 构造损坏快照必须失败关闭")
+	}
+	if _, err := ports.NewCorruptJournalGenerationSnapshot(1, ports.ErrCorruptData, zeroRec); err == nil {
+		t.Fatal("无效 partialPrefix 记录构造损坏快照必须失败关闭")
+	}
+	if _, err := ports.NewCorruptJournalGenerationSnapshot(0, ports.ErrCorruptData); err == nil {
+		t.Fatal("零世代号构造损坏快照必须失败关闭")
+	}
+	if _, err := ports.NewCorruptJournalGenerationSnapshot(1, nil); err == nil {
+		t.Fatal("nil 错误构造损坏快照必须失败关闭")
 	}
 }

@@ -1,22 +1,20 @@
 package sim
 
 import (
-	"cmp"
 	"context"
 	"fmt"
-	"io"
-	"net"
-	"slices"
-	"sync"
-	"sync/atomic"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
+	"io"
+	"net"
+	"slices"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // HopFaultProfile 定义单跳拨号与连接层的延迟、失败、保活与卡死关闭故障参数。
@@ -194,7 +192,10 @@ func (c *SimTransportConn) OpenSession(ctx context.Context) (ports.RemoteSession
 	if err := c.checkAliveOp(ctx, "conn.session"); err != nil {
 		return nil, err
 	}
-	return &SimRemoteSession{conn: c, prof: c.prof, initialized: true}, nil
+	return memtree.NewRemoteSession(c.IsAlive, memtree.SessionFaultConfig{
+		Output: c.prof.SessionOutput, Outcome: c.prof.SessionOutcome,
+		StartErr: c.prof.SessionStartErr, WaitErr: c.prof.SessionWaitErr,
+	}), nil
 }
 func (c *SimTransportConn) DialTCP(ctx context.Context, target netaddr.HostPort) (net.Conn, error) {
 	if err := c.checkAliveOp(ctx, ""); err != nil || !target.IsValid() {
@@ -248,151 +249,40 @@ func (c *SimTransportConn) checkAliveOp(ctx context.Context, faultOp string) err
 	return nil
 }
 
-// SimRemoteSession 实现 ports.RemoteSession，支持前置管道获取及与 ExecStreams 互斥校验。
-//
-//xops:opaque
-//xops:failclosed
-type SimRemoteSession struct {
-	mu                                sync.Mutex
-	conn                              *SimTransportConn
-	prof                              HopFaultProfile
-	initialized                       bool
-	started, closed                   atomic.Bool
-	stdinPipe, stdoutPipe, stderrPipe *memtree.StreamPipe
-}
+// SimRemoteSession 是 memtree.RemoteSession 的别名，实现 ports.RemoteSession 及管道互斥校验。
+type SimRemoteSession = memtree.RemoteSession
 
-func (s *SimRemoteSession) checkOpen(ctx context.Context, needConn bool) error {
-	if err := checkCtx(ctx); err != nil {
-		return err
-	}
-	if !s.initialized || s.closed.Load() || (needConn && !s.conn.IsAlive()) {
-		return ports.ErrClosed
-	}
-	return nil
-}
-func (s *SimRemoteSession) allocPipe(slot **memtree.StreamPipe) (*memtree.StreamPipe, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.initialized || s.closed.Load() {
-		return nil, ports.ErrClosed
-	}
-	if s.started.Load() || *slot != nil {
-		return nil, ports.ErrInvalidArgument
-	}
-	*slot = memtree.NewStreamPipe()
-	return *slot, nil
-}
-func (s *SimRemoteSession) StdinPipe() (io.WriteCloser, error) { return s.allocPipe(&s.stdinPipe) }
-func (s *SimRemoteSession) StdoutPipe() (io.Reader, error)     { return s.allocPipe(&s.stdoutPipe) }
-func (s *SimRemoteSession) StderrPipe() (io.Reader, error)     { return s.allocPipe(&s.stderrPipe) }
-
-func (s *SimRemoteSession) beginStartLocked(streams ports.ExecStreams) error {
-	if !s.initialized || s.closed.Load() {
-		return ports.ErrClosed
-	}
-	if s.started.Load() || (s.stdinPipe != nil && streams.Stdin != nil) || (s.stdoutPipe != nil && streams.Stdout != nil) || (s.stderrPipe != nil && streams.Stderr != nil) {
-		return ports.ErrInvalidArgument
-	}
-	s.started.Store(true)
-	return nil
-}
-func (s *SimRemoteSession) Start(ctx context.Context, cmd execution.CommandPlan, streams ports.ExecStreams) error {
-	if err := firstErr(s.checkOpen(ctx, true), s.prof.SessionStartErr); err != nil || !cmd.IsValid() {
-		return firstErr(err, ports.ErrInvalidArgument)
-	}
-	s.mu.Lock()
-	err := s.beginStartLocked(streams)
-	outPipe, errPipe := s.stdoutPipe, s.stderrPipe
-	s.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	payload := cmp.Or(s.prof.SessionOutput, "tck-ok\n")
-	if outPipe != nil {
-		_, _ = io.WriteString(outPipe, payload)
-		_ = outPipe.Close()
-	} else if streams.Stdout != nil {
-		_, _ = io.WriteString(streams.Stdout, payload)
-	}
-	if errPipe != nil {
-		_ = errPipe.Close()
-	}
-	return nil
-}
-func (s *SimRemoteSession) StartShell(ctx context.Context, streams ports.ExecStreams) error {
-	if err := s.checkOpen(ctx, true); err != nil {
-		return err
-	}
-	if ptyReq, ok := streams.PTY.Get(); ok && !ptyReq.IsValid() {
-		return ports.ErrInvalidArgument
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.beginStartLocked(streams)
-}
-func (s *SimRemoteSession) ResizePTY(ctx context.Context, size ports.TerminalSize) error {
-	if err := s.checkOpen(ctx, false); err != nil || !size.IsValid() {
-		return firstErr(err, ports.ErrInvalidTTYSize)
-	}
-	return nil
-}
-func (s *SimRemoteSession) Signal(ctx context.Context, sig string) error {
-	if err := s.checkOpen(ctx, false); err != nil || sig == "" {
-		return firstErr(err, ports.ErrInvalidArgument)
-	}
-	return nil
-}
-func (s *SimRemoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome, error) {
-	if err := firstErr(s.checkOpen(ctx, false), s.prof.SessionWaitErr); err != nil {
-		return nil, err
-	}
-	if !s.started.Load() {
-		return nil, ports.ErrInvalidArgument
-	}
-	if s.prof.SessionOutcome != nil && s.prof.SessionOutcome.IsValid() {
-		return s.prof.SessionOutcome, nil
-	}
-	return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
-}
-func (s *SimRemoteSession) Close() error {
-	s.closed.Store(true)
-	s.mu.Lock()
-	pipes := [3]*memtree.StreamPipe{s.stdinPipe, s.stdoutPipe, s.stderrPipe}
-	s.mu.Unlock()
-	for _, p := range pipes {
-		if p != nil {
-			_ = p.Close()
-		}
-	}
-	return nil
-}
-
-// SimMuxSocket 实现 ports.MuxSocketPort 的零 OS 套接字纯内存仿真器。
+// SimMuxSocket 实现 ports.MuxSocketPort 的零 OS 套接字纯内存仿真器（含 Serve、OpenProxy 与精确身份 DialMux）。
 //
 //xops:opaque
 //xops:failclosed
 type SimMuxSocket struct {
 	simBase
-	dialer  *SimDialer
-	masters map[string]uint32
+	dialer *SimDialer
+	reg    *memtree.MuxRegistry
 }
 
 // NewSimMuxSocket 创建纯内存多路复用套接字仿真器（可选绑定 dialer 以纳入连接计数与虚拟时钟）。
 func NewSimMuxSocket(dialer *SimDialer) *SimMuxSocket {
-	return &SimMuxSocket{simBase: newSimBase(nil), dialer: dialer, masters: make(map[string]uint32)}
+	return &SimMuxSocket{simBase: newSimBase(nil), dialer: dialer, reg: memtree.NewMuxRegistry()}
 }
 
 // RegisterMaster 注册指定路径的仿真 ControlMaster 进程 PID。
 func (m *SimMuxSocket) RegisterMaster(sockPath pathalg.LocalSourcePath, pid uint32) {
 	if sockPath.IsValid() && pid > 0 {
-		m.withLock(func() { m.masters[sockPath.String()] = pid })
+		m.withLock(func() { m.reg.RegisterLocked(sockPath.String(), pid) })
 	}
 }
 func (m *SimMuxSocket) Probe(ctx context.Context, sockPath pathalg.LocalSourcePath) (out ports.MuxControlResponse, err error) {
 	if err = m.check(ctx, "mux.probe", sockPath.IsValid()); err != nil {
 		return out, err
 	}
-	if pid := withLockRet(&m.simBase, uint32(0), func() uint32 { return m.masters[sockPath.String()] }); pid != 0 {
+	if pid := withLockRet(&m.simBase, uint32(0), func() uint32 {
+		if e := m.reg.Masters[sockPath.String()]; e != nil {
+			return e.PID
+		}
+		return 0
+	}); pid != 0 {
 		return ports.NewMuxControlResponse(true, pid, "alive")
 	}
 	return ports.NewMuxControlResponse(false, 0, "not running")
@@ -401,28 +291,71 @@ func (m *SimMuxSocket) Control(ctx context.Context, req ports.MuxControlRequest)
 	if err = m.check(ctx, "mux.control", req.IsValid()); err != nil {
 		return out, err
 	}
-	if pid := withLockRet(&m.simBase, uint32(0), func() uint32 {
-		k := req.SocketPath().String()
-		p := m.masters[k]
-		if p != 0 && (req.Action() == ports.MuxActionExit || req.Action() == ports.MuxActionStop) {
-			delete(m.masters, k)
-		}
-		return p
-	}); pid != 0 {
-		return ports.NewMuxControlResponse(true, pid, req.Action().String())
+	var pid uint32
+	var up ports.TransportConn
+	var fwd ports.ForwarderPort
+	var cancelH ports.ForwardHandle
+	var ok bool
+	m.withLock(func() { pid, up, fwd, cancelH, ok = m.reg.ApplyControlLocked(req) })
+	if !ok {
+		return out, ports.ErrMuxUnavailable
 	}
-	return out, ports.ErrMuxUnavailable
+	if cancelH != nil {
+		_ = cancelH.Close()
+	}
+	if req.Action() == ports.MuxActionForward && up != nil && fwd != nil {
+		if fs, has := req.Forward().Get(); has {
+			h, fErr := fwd.StartForward(ctx, up, fs)
+			if fErr != nil {
+				return out, fErr
+			}
+			if !withLockRet(&m.simBase, false, func() bool { return m.reg.StoreForwardLocked(req.SocketPath().String(), fs, h) }) {
+				_ = h.Close()
+			}
+		}
+	}
+	return ports.NewMuxControlResponse(true, pid, req.Action().String())
 }
-func (m *SimMuxSocket) DialMux(ctx context.Context, sockPath pathalg.LocalSourcePath) (ports.TransportConn, error) {
-	if err := m.check(ctx, "mux.dial", sockPath.IsValid()); err != nil {
+func (m *SimMuxSocket) DialMux(ctx context.Context, sockPath pathalg.LocalSourcePath, hopDigest plan.HopDigest, endpoint netaddr.Endpoint) (ports.TransportConn, error) {
+	if err := m.check(ctx, "mux.dial", sockPath.IsValid(), hopDigest.IsValid(), endpoint.IsValid()); err != nil {
 		return nil, err
 	}
-	if withLockRet(&m.simBase, uint32(0), func() uint32 { return m.masters[sockPath.String()] }) == 0 {
+	if !withLockRet(&m.simBase, false, func() bool { return m.reg.Masters[sockPath.String()] != nil }) {
 		return nil, ports.ErrMuxUnavailable
 	}
-	ch, _ := netaddr.ParseCanonicalHost("127.0.0.1")
-	ep, _ := netaddr.NewEndpoint(ch, 22)
-	return m.dialer.newConn(plan.HopDigestFromSHA256([32]byte{1}), ep, nil, HopFaultProfile{}), nil
+	return m.dialer.newConn(hopDigest, endpoint, nil, HopFaultProfile{}), nil
+}
+func (m *SimMuxSocket) OpenProxy(ctx context.Context, sockPath pathalg.LocalSourcePath) (net.Conn, error) {
+	if err := m.check(ctx, "mux.proxy", sockPath.IsValid()); err != nil {
+		return nil, err
+	}
+	if !withLockRet(&m.simBase, false, func() bool { return m.reg.Masters[sockPath.String()] != nil }) {
+		return nil, ports.ErrMuxUnavailable
+	}
+	return memtree.NewEchoConn("mux-proxy:" + sockPath.String()), nil
+}
+
+// Serve 在 WithListener 借出的 ln 上以纯内存 PROTOCOL.mux v4 服务端模式响应控制面停止或动态转发请求。
+func (m *SimMuxSocket) Serve(
+	ctx context.Context,
+	//xops:borrowed
+	ln net.Listener,
+	upstream ports.TransportConn,
+	forwarder ports.ForwarderPort,
+) error {
+	if err := m.check(ctx, "mux.serve", ln != nil, upstream != nil); err != nil {
+		return err
+	}
+	if !upstream.IsAlive() {
+		return ports.ErrClosed
+	}
+	addr := ""
+	if ln.Addr() != nil {
+		addr = ln.Addr().String()
+	}
+	stopCh := withLockRet(&m.simBase, (<-chan struct{})(nil), func() <-chan struct{} { return m.reg.AttachServerLocked(addr, upstream, forwarder) })
+	defer m.withLock(func() { m.reg.DetachServerLocked(addr) })
+	return memtree.RunServeWait(ctx, stopCh)
 }
 
 // WithListener 在同步闭包内借出带失效哨兵的纯内存 net.Listener，退出时自动失效并注销（兼容含 ':' 路径）。
@@ -434,16 +367,10 @@ func (m *SimMuxSocket) WithListener(ctx context.Context, socketPath pathalg.Loca
 		return err
 	}
 	addr := socketPath.String()
-	if withLockRet(&m.simBase, true, func() bool {
-		if m.masters[addr] != 0 {
-			return true
-		}
-		m.masters[addr] = 4242
-		return false
-	}) {
+	if !withLockRet(&m.simBase, false, func() bool { return m.reg.AcquireListenLocked(addr, 4242) }) {
 		return ports.ErrAlreadyExists
 	}
 	var expired atomic.Bool
-	defer func() { expired.Store(true); m.withLock(func() { delete(m.masters, addr) }) }()
+	defer func() { expired.Store(true); m.withLock(func() { m.reg.ReleaseListenLocked(addr) }) }()
 	return fn(memtree.NewMemListener(addr, &expired))
 }

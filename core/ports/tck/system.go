@@ -4,17 +4,16 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
-	"strings"
-	"sync"
-	"testing"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
 )
 
 // ClockFixture 描述 Clock 契约测试夹具（同时兼容真实系统时钟与确定性仿真时钟 SimClock）。
@@ -71,21 +70,17 @@ func RunClockSuite(t *testing.T, fx ClockFixture) {
 	if step <= 0 {
 		step = 15 * time.Millisecond
 	}
-
 	t.Run("NowSinceTimerAndSleep", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		clk := fx.NewClock(t)
 		t0 := clk.Now()
 		requireTrue(t, !t0.IsZero(), "Clock.Now() 不能返回零时刻")
 		requireTrue(t, clk.Since(t0) >= 0, "Clock.Since(t0) 不能为负")
-
 		var nilCtx context.Context
 		requireErrIs(t, clk.Sleep(nilCtx, step), ports.ErrNilContext, "Sleep(nil ctx)")
-
 		canceled, cancel := context.WithCancel(context.Background())
 		cancel()
 		requireErrIs(t, clk.Sleep(canceled, time.Hour), context.Canceled, "已取消 ctx 的 Sleep 必须立即返回 context.Canceled")
-
 		// 验证 Sleep 正常推进与 Timer 到期触发（虚拟时钟以完成信号驱动迭代推进，杜绝抢跑死锁）。
 		sleepDone := make(chan struct{})
 		err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
@@ -103,11 +98,9 @@ func RunClockSuite(t *testing.T, fx ClockFixture) {
 			return nil
 		})
 		requireNoErr(t, err, "Sleep 正常等待")
-
 		verifyClockTimerReset(t, clk, fx.Advance, step)
 	})
 }
-
 func driveVirtualClockUntilDone(ctx context.Context, advance func(time.Duration), step time.Duration, done <-chan struct{}) error {
 	tk := time.NewTicker(time.Millisecond)
 	defer tk.Stop()
@@ -122,14 +115,12 @@ func driveVirtualClockUntilDone(ctx context.Context, advance func(time.Duration)
 		}
 	}
 }
-
 func verifyClockTimerReset(t *testing.T, clk ports.Clock, advance func(time.Duration), step time.Duration) {
 	t.Helper()
 	tm := clk.NewTimer(time.Hour)
 	requireTrue(t, tm != nil, "NewTimer 不能返回 nil")
 	_ = tm.Stop()
 	tm.Reset(step)
-
 	timerDone := make(chan struct{})
 	err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
 		if gErr := n.Go(func(c context.Context) error {
@@ -162,20 +153,17 @@ func verifyClockTimerReset(t *testing.T, clk ports.Clock, advance func(time.Dura
 func RunEntropySuite(t *testing.T, newEntropy func(t *testing.T) ports.Entropy) {
 	t.Helper()
 	requireTrue(t, newEntropy != nil, "newEntropy 工厂不能为 nil")
-
 	t.Run("DirectReaderCompatibility", func(t *testing.T) {
 		ent := newEntropy(t)
 		buf := make([]byte, 32)
 		n, err := io.ReadFull(ent, buf)
 		requireNoErr(t, err, "io.ReadFull(Entropy)")
 		requireTrue(t, n == 32, "Entropy 必须完整填满请求切片")
-
 		t1, err := security.NewTraceIDFrom(ent)
 		requireNoErr(t, err, "NewTraceIDFrom(1)")
 		t2, err := security.NewTraceIDFrom(ent)
 		requireNoErr(t, err, "NewTraceIDFrom(2)")
 		requireTrue(t, t1.IsValid() && t2.IsValid() && !t1.Equal(t2), "连续生成的 TraceID 必须有效且互不相同")
-
 		op1, err := security.NewOperationIDFrom(ent)
 		requireNoErr(t, err, "NewOperationIDFrom")
 		nonce, err := security.NewApprovalNonceFrom(ent)
@@ -184,15 +172,12 @@ func RunEntropySuite(t *testing.T, newEntropy func(t *testing.T) ports.Entropy) 
 		requireNoErr(t, err, "NewHandleIDFrom")
 		pid, err := ports.NewProcessInstanceIDFrom(ent)
 		requireNoErr(t, err, "NewProcessInstanceIDFrom")
-
 		requireTrue(t, op1.IsValid() && nonce != ([16]byte{}) && hid.IsValid() && pid.IsValid(), "全部领域/端口 ID 构造均须成功")
 	})
-
 	t.Run("ConcurrentIDGeneration", func(t *testing.T) {
 		verifyConcurrentEntropy(t, newEntropy)
 	})
 }
-
 func verifyConcurrentEntropy(t *testing.T, newEntropy func(t *testing.T) ports.Entropy) {
 	t.Helper()
 	defer VerifyNoLeaks(t)
@@ -200,7 +185,6 @@ func verifyConcurrentEntropy(t *testing.T, newEntropy func(t *testing.T) ports.E
 	var mu sync.Mutex
 	seenTrace := make(map[string]bool, 32)
 	seenProc := make(map[string]bool, 32)
-
 	err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
 		for range 8 {
 			if gErr := n.Go(func(context.Context) error {
@@ -214,7 +198,6 @@ func verifyConcurrentEntropy(t *testing.T, newEntropy func(t *testing.T) ports.E
 	requireNoErr(t, err, "并发 Entropy ID 生成")
 	requireTrue(t, len(seenTrace) == 32 && len(seenProc) == 32, "并发生成 32 组标识须全部互异")
 }
-
 func drawConcurrentIDs(ent ports.Entropy, mu *sync.Mutex, seenTrace, seenProc map[string]bool) error {
 	for range 4 {
 		tid, err := security.NewTraceIDFrom(ent)
@@ -240,23 +223,19 @@ func drawConcurrentIDs(ent ports.Entropy, mu *sync.Mutex, seenTrace, seenProc ma
 func RunProcessSuite(t *testing.T, fx ProcessFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewProcess != nil && fx.EchoSpec.IsValid(), "ProcessFixture 必须提供 NewProcess 与有效 EchoSpec")
-
 	t.Run("ValidationRunAndStdio", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		ctx := context.Background()
 		proc := fx.NewProcess(t)
 		var nilCtx context.Context
 		var zeroSpec ports.ProcessSpec
-
 		_, err := proc.Run(nilCtx, fx.EchoSpec, nil)
 		requireErrIs(t, err, ports.ErrNilContext, "Run(nil ctx)")
 		_, err = proc.Run(ctx, zeroSpec, nil)
 		requireErr(t, err, "Run(zero spec)")
-
 		res, err := proc.Run(ctx, fx.EchoSpec, strings.NewReader("tck-process-stdin"))
 		requireNoErr(t, err, "Run(EchoSpec)")
 		requireTrue(t, res.IsValid() && res.Succeeded() && bytes.Contains(res.Stdout(), []byte("tck-process-stdin")), "回显子进程须成功并包含预期输出")
-
 		if fx.FailSpec.IsValid() {
 			fRes, fErr := proc.Run(ctx, fx.FailSpec, nil)
 			requireNoErr(t, fErr, "Run(FailSpec)")
@@ -280,28 +259,23 @@ func RunProcessSuite(t *testing.T, fx ProcessFixture) {
 func RunTerminalSuite(t *testing.T, fx TerminalFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewTerminal != nil, "TerminalFixture.NewTerminal 不能为 nil")
-
 	t.Run("SuspendCheckSizeAndRawScope", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		term := fx.NewTerminal(t)
 		requireTrue(t, term.IsInteractive() == fx.ExpectInteractive, "IsInteractive 与夹具预期不符")
-
 		verdict, err := term.CanSuspendProcessGroup()
 		if err != nil {
 			requireTrue(t, verdict == security.VerdictDeny, "INV-E1: 判定出错时必须失败关闭返回 VerdictDeny")
 		} else {
 			requireTrue(t, verdict.IsValid(), "CanSuspendProcessGroup 须返回有效 Verdict")
 		}
-
 		var nilCtx context.Context
 		requireErrIs(t, term.WithRawTerminal(nilCtx, func(ports.TerminalHandle) error { return nil }), ports.ErrNilContext, "WithRawTerminal(nil ctx)")
 		requireErrIs(t, term.WithRawTerminal(context.Background(), nil), ports.ErrNilCallback, "WithRawTerminal(nil fn)")
-
 		if fx.ExpectInteractive {
 			sz, sErr := term.Size()
 			requireNoErr(t, sErr, "Terminal.Size")
 			requireTrue(t, sz.IsValid(), "交互终端 Size 必须有效")
-
 			err = term.WithRawTerminal(context.Background(), func(h ports.TerminalHandle) error {
 				requireTrue(t, h != nil, "TerminalHandle 不能为 nil")
 				hSize, hsErr := h.Size()
@@ -365,7 +339,6 @@ func verifyTerminalHalfCloseAndRemoteEOF(t *testing.T, fx TerminalFixture) {
 		requireNoErr(t, err, "Relay(remote EOF first with blocking localIn)")
 	}
 }
-
 func verifyTerminalRelay(t *testing.T, h ports.TerminalHandle, wantIn string, minResizes int) error {
 	t.Helper()
 	var nilCtx context.Context
@@ -373,11 +346,9 @@ func verifyTerminalRelay(t *testing.T, h ports.TerminalHandle, wantIn string, mi
 	requireErrIs(t, h.Relay(nilCtx, &sink, strings.NewReader(""), nil), ports.ErrNilContext, "Relay(nil ctx)")
 	requireErrIs(t, h.Relay(context.Background(), nil, strings.NewReader(""), nil), ports.ErrInvalidArgument, "Relay(nil remoteIn)")
 	requireErrIs(t, h.Relay(context.Background(), &sink, nil, nil), ports.ErrInvalidArgument, "Relay(nil remoteOut)")
-
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	requireErrIs(t, h.Relay(canceled, &sink, strings.NewReader("x"), nil), context.Canceled, "Relay(canceled ctx)")
-
 	var resizeCount int
 	var resizeMu sync.Mutex
 	err := h.Relay(context.Background(), &sink, strings.NewReader("remote-out-ok"), func(_ context.Context, sz ports.TerminalSize) error {
@@ -411,7 +382,6 @@ func RunInteractionSuite(t *testing.T, fx InteractionFixture) {
 	if expectedSecret == "" {
 		expectedSecret = TestSecretTokenA
 	}
-
 	t.Run("ConfirmApprovalAndText", func(t *testing.T) {
 		ctx := context.Background()
 		ui := fx.NewInteraction(t)
@@ -420,18 +390,15 @@ func RunInteractionSuite(t *testing.T, fx InteractionFixture) {
 		var zeroConfirm ports.ConfirmRequest
 		var zeroEnv security.ApprovalEnvelope
 		var zeroText ports.TextPromptRequest
-
 		_, err := ui.Confirm(nilCtx, zeroConfirm)
 		requireErrIs(t, err, ports.ErrNilContext, "Confirm(nil ctx)")
 		_, err = ui.Confirm(ctx, zeroConfirm)
 		requireErr(t, err, "Confirm(zero req)")
-
 		cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Message: "Proceed?", Risk: security.RiskModerate})
 		requireNoErr(t, err, "NewConfirmRequest")
 		verdict, err := ui.Confirm(ctx, cReq)
 		requireNoErr(t, err, "Confirm")
 		requireTrue(t, verdict.IsValid(), "Confirm 必须返回有效 Verdict")
-
 		_, err = ui.PromptApproval(ctx, zeroEnv)
 		requireErr(t, err, "PromptApproval(zero env)")
 		env := MustApprovalEnvelope(t, NewDeterministicEntropy(77))
@@ -440,7 +407,6 @@ func RunInteractionSuite(t *testing.T, fx InteractionFixture) {
 		resp, err := ui.PromptApproval(ctx, env)
 		requireNoErr(t, err, "PromptApproval")
 		requireTrue(t, resp.IsValid() && resp.EnvelopeDigest().Equal(wantDig), "审批响应必须回传匹配的 ApprovalEnvelope 规范摘要")
-
 		_, err = ui.PromptText(ctx, zeroText)
 		requireErr(t, err, "PromptText(zero req)")
 		tReq, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{Prompt: "Enter tag"})
@@ -451,19 +417,16 @@ func RunInteractionSuite(t *testing.T, fx InteractionFixture) {
 			requireTrue(t, txt == fx.ExpectedText, "PromptText 返回内容不匹配")
 		}
 	})
-
 	t.Run("PromptSecretScopedZeroPlaintext", func(t *testing.T) {
 		ctx := context.Background()
 		ui := fx.NewInteraction(t)
 		var nilCtx context.Context
 		var zeroSec ports.SecretPromptRequest
-
 		sReq, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "Password:"})
 		requireNoErr(t, err, "NewSecretPromptRequest")
 		requireErrIs(t, ui.PromptSecret(nilCtx, sReq, func(*secret.SecretBox) error { return nil }), ports.ErrNilContext, "PromptSecret(nil ctx)")
 		requireErrIs(t, ui.PromptSecret(ctx, sReq, nil), ports.ErrNilCallback, "PromptSecret(nil fn)")
 		requireErr(t, ui.PromptSecret(ctx, zeroSec, func(*secret.SecretBox) error { return nil }), "PromptSecret(zero req)")
-
 		var matched bool
 		err = secret.WithBytes([]byte(expectedSecret), func(expected *secret.SecretBox) error {
 			return ui.PromptSecret(ctx, sReq, func(got *secret.SecretBox) error {

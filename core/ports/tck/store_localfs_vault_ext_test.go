@@ -2,6 +2,7 @@ package tck_test
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
@@ -75,9 +77,22 @@ func (s *memInventoryStore) CommitCAS(ctx context.Context, expected ports.Revisi
 	return ports.NewDurabilityCommitted(nextRev)
 }
 
+type memGenEntry struct {
+	recs    []fsm.TransferJournalRecord
+	corrupt error
+}
+
 type memJournalStore struct {
 	mu   sync.Mutex
-	data map[security.OperationID][]fsm.TransferJournalRecord
+	data map[security.OperationID]map[uint64]*memGenEntry
+}
+
+func (s *memJournalStore) corruptGen(id security.OperationID, gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gens := s.data[id]; gens != nil && gens[gen] != nil {
+		gens[gen].corrupt = ports.ErrCorruptData
+	}
 }
 
 func (s *memJournalStore) Append(ctx context.Context, rec fsm.TransferJournalRecord) error {
@@ -89,7 +104,17 @@ func (s *memJournalStore) Append(ctx context.Context, rec fsm.TransferJournalRec
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[rec.TransferID()] = append(s.data[rec.TransferID()], rec)
+	gens := s.data[rec.TransferID()]
+	if gens == nil {
+		gens = make(map[uint64]*memGenEntry)
+		s.data[rec.TransferID()] = gens
+	}
+	e := gens[rec.Generation()]
+	if e == nil {
+		e = &memGenEntry{}
+		gens[rec.Generation()] = e
+	}
+	e.recs = append(e.recs, rec)
 	return nil
 }
 
@@ -102,11 +127,78 @@ func (s *memJournalStore) Load(ctx context.Context, id security.OperationID) ([]
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	recs, ok := s.data[id]
-	if !ok {
+	gens, ok := s.data[id]
+	if !ok || len(gens) == 0 {
 		return nil, ports.ErrNotFound
 	}
-	return slices.Clone(recs), nil
+	keys := slices.Sorted(maps.Keys(gens))
+	var out []fsm.TransferJournalRecord
+	for _, g := range keys {
+		e := gens[g]
+		if e.corrupt != nil {
+			return nil, fmt.Errorf("%w: %w", ports.ErrCorruptData, e.corrupt)
+		}
+		recs := slices.Clone(e.recs)
+		slices.SortFunc(recs, func(a, b fsm.TransferJournalRecord) int { return cmp.Compare(a.Seq(), b.Seq()) })
+		out = append(out, recs...)
+	}
+	return out, nil
+}
+
+func (s *memJournalStore) LoadGenerations(ctx context.Context, id security.OperationID) ([]ports.JournalGenerationSnapshot, error) {
+	if ctx == nil {
+		return nil, ports.ErrNilContext
+	}
+	if !id.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gens, ok := s.data[id]
+	if !ok || len(gens) == 0 {
+		return nil, ports.ErrNotFound
+	}
+	keys := slices.Sorted(maps.Keys(gens))
+	out := make([]ports.JournalGenerationSnapshot, 0, len(keys))
+	for _, g := range keys {
+		e := gens[g]
+		recs := slices.Clone(e.recs)
+		slices.SortFunc(recs, func(a, b fsm.TransferJournalRecord) int { return cmp.Compare(a.Seq(), b.Seq()) })
+		if e.corrupt != nil {
+			snap, err := ports.NewCorruptJournalGenerationSnapshot(g, e.corrupt, recs...)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, snap)
+			continue
+		}
+		snap, err := ports.NewJournalGenerationSnapshot(g, recs)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, snap)
+	}
+	return out, nil
+}
+
+func (s *memJournalStore) PruneGeneration(ctx context.Context, id security.OperationID, gen uint64) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	if !id.IsValid() || gen == 0 {
+		return ports.ErrInvalidArgument
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gens, ok := s.data[id]
+	if !ok || gens[gen] == nil {
+		return ports.ErrNotFound
+	}
+	delete(gens, gen)
+	if len(gens) == 0 {
+		delete(s.data, id)
+	}
+	return nil
 }
 
 func (s *memJournalStore) ListActive(ctx context.Context) ([]security.OperationID, error) {
@@ -186,6 +278,7 @@ type memLockState struct {
 type memScopedRootFS struct {
 	mu       sync.Mutex
 	files    map[string][]byte
+	modTimes map[string]time.Time
 	symlinks map[string]string
 	dirs     map[string]bool
 	locks    map[string]memLockState
@@ -194,6 +287,7 @@ type memScopedRootFS struct {
 func newMemScopedRootFS() *memScopedRootFS {
 	return &memScopedRootFS{
 		files:    make(map[string][]byte),
+		modTimes: make(map[string]time.Time),
 		symlinks: make(map[string]string),
 		dirs:     map[string]bool{".": true},
 		locks:    make(map[string]memLockState),
@@ -419,12 +513,42 @@ func (h *memRootHandle) Stat(rel pathalg.LocalRootedDest) (ports.LocalFileInfo, 
 	}
 	h.fs.mu.Lock()
 	defer h.fs.mu.Unlock()
-	if data, ok := h.fs.files[rel.String()]; ok {
+	key := rel.String()
+	mt := h.fs.modTimes[key]
+	if mt.IsZero() {
+		mt = tck.BaseTime()
+	}
+	if data, ok := h.fs.files[key]; ok {
 		return ports.NewLocalFileInfo(ports.LocalFileInfoSpec{
-			Name: baseNameSlash(rel.String()), Size: int64(len(data)), Mode: 0o600, ModTime: tck.BaseTime(),
+			Name: baseNameSlash(key), Size: int64(len(data)), Mode: 0o600, ModTime: mt,
+		})
+	}
+	if h.fs.dirs[key] {
+		return ports.NewLocalFileInfo(ports.LocalFileInfoSpec{
+			Name: baseNameSlash(key), Size: 0, Mode: fs.ModeDir | 0o700, ModTime: mt,
 		})
 	}
 	return zero[ports.LocalFileInfo](), ports.ErrNotFound
+}
+
+func (h *memRootHandle) Chtimes(rel pathalg.LocalRootedDest, atime, mtime time.Time) error {
+	if !rel.IsValid() || !isValidMemRFC3339(atime) || !isValidMemRFC3339(mtime) {
+		return ports.ErrInvalidArgument
+	}
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+	key := rel.String()
+	if _, isSym := h.fs.symlinks[key]; isSym {
+		return ports.ErrSymlinkRejected
+	}
+	if _, isFile := h.fs.files[key]; !isFile && !h.fs.dirs[key] {
+		return ports.ErrNotFound
+	}
+	h.fs.modTimes[key] = mtime.UTC()
+	return nil
+}
+func isValidMemRFC3339(t time.Time) bool {
+	return !t.IsZero() && t.UTC().Year() >= 1 && t.UTC().Year() <= 9999
 }
 
 func (h *memRootHandle) Lstat(rel pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
@@ -821,8 +945,13 @@ func (h *memHostTrust) RecordHostKey(ctx context.Context, ep netaddr.Endpoint, k
 
 func TestTCKStoreAndOpenSSHSuites(t *testing.T) {
 	tck.RunInventoryStoreSuite(t, newMemInventoryStore)
-	tck.RunJournalStoreSuite(t, func(*testing.T) ports.JournalStore {
-		return &memJournalStore{data: make(map[security.OperationID][]fsm.TransferJournalRecord)}
+	tck.RunJournalStoreSuite(t, tck.JournalStoreFixture{
+		NewStore: func(*testing.T) ports.JournalStore {
+			return &memJournalStore{data: make(map[security.OperationID]map[uint64]*memGenEntry)}
+		},
+		CorruptGeneration: func(_ *testing.T, s ports.JournalStore, id security.OperationID, gen uint64) {
+			s.(*memJournalStore).corruptGen(id, gen)
+		},
 	})
 	tck.RunFormatImporterSuite(t, tck.FormatImporterFixture{
 		NewImporter:  func(*testing.T) ports.FormatImporter { return memFormatImporter{} },

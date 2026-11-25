@@ -6,13 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/ports"
+	"golang.org/x/sys/windows"
 	"net"
 	"os"
 	"path/filepath"
 	"unsafe"
-
-	"github.com/wentf9/xops-cli/core/ports"
-	"golang.org/x/sys/windows"
 )
 
 const (
@@ -41,7 +40,6 @@ func isAddrInUseOS(err error) bool   { return errors.Is(err, windows.WSAEADDRINU
 func isSocketUnlinkRetryableOS(err error) bool {
 	return errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED)
 }
-
 func inspectSocketEntryOS(nativePath string) (socketFileID, SocketProbeStatus, error) {
 	handle, info, openErr := openObjectHandleInfoNoFollow(nativePath, windows.READ_CONTROL)
 	if openErr != nil {
@@ -76,7 +74,6 @@ func withSocketDirLockOS(ctx context.Context, dir string, createDir bool, fn fun
 	defer func() { _ = unlockFileOS(f) }()
 	return fn()
 }
-
 func listenSocketLockedOS(ctx context.Context, path ControlSocketPath) (*net.UnixListener, socketFileID, error) {
 	addr := path.NativePath()
 	uln, err := listenUnixNoAutoUnlink(ctx, addr)

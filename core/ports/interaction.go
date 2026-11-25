@@ -3,7 +3,6 @@ package ports
 import (
 	"context"
 	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -17,10 +16,8 @@ func buildPromptCore(rawTitle, rawBody, rawSubject string, allowEmpty bool) (pro
 	body, e1 := sanitizeBoundedText(security.SanitizePromptText(rawBody), maxPortDetailBytes, false, ErrInvalidArgument)
 	title, e2 := sanitizeBoundedText(security.SanitizePromptText(rawTitle), maxPortTokenLen, true, ErrInvalidArgument)
 	subj, e3 := sanitizeBoundedText(security.SanitizePromptText(rawSubject), maxPortTokenLen, true, ErrInvalidArgument)
-	if err := firstErr(e1, e2, e3); err != nil {
-		return promptCore{}, err
-	}
-	return promptCore{title: title, prompt: body, subject: subj, allowEmpty: allowEmpty, valid: true}, nil
+	err := firstErr(e1, e2, e3)
+	return pickIf(err == nil, promptCore{title, body, subj, allowEmpty, true}, promptCore{}), err
 }
 func (c promptCore) ok() bool             { return c.valid && c.prompt != "" }
 func (c promptCore) eq(o promptCore) bool { return c.ok() && o.ok() && c == o }
@@ -77,14 +74,12 @@ func NewConfirmRequest(spec ConfirmRequestSpec) (ConfirmRequest, error) {
 	c, err := buildPromptCore(spec.Title, spec.Message, spec.Subject, false)
 	return ConfirmRequest{core: c, risk: spec.Risk}, err
 }
-func (r ConfirmRequest) IsValid() bool   { return r.core.ok() && r.risk.IsValid() }
-func (r ConfirmRequest) IsZero() bool    { return !r.IsValid() }
-func (r ConfirmRequest) Title() string   { return r.core.title }
-func (r ConfirmRequest) Message() string { return r.core.prompt }
-func (r ConfirmRequest) Subject() string { return r.core.subject }
-func (r ConfirmRequest) Risk() security.RiskLevel {
-	return pickIf(r.IsValid(), r.risk, security.RiskUnknown)
-}
+func (r ConfirmRequest) IsValid() bool            { return r.core.ok() && r.risk.IsValid() }
+func (r ConfirmRequest) IsZero() bool             { return !r.IsValid() }
+func (r ConfirmRequest) Title() string            { return r.core.title }
+func (r ConfirmRequest) Message() string          { return r.core.prompt }
+func (r ConfirmRequest) Subject() string          { return r.core.subject }
+func (r ConfirmRequest) Risk() security.RiskLevel { return orZero(r.IsValid(), r.risk) }
 func (r ConfirmRequest) Equal(o ConfirmRequest) bool {
 	return r.IsValid() && o.IsValid() && r.core.eq(o.core) && r.risk == o.risk
 }
@@ -138,10 +133,8 @@ func NewApprovalDecisionResponse(verdict security.Verdict, envelopeDigest securi
 func (r ApprovalDecisionResponse) IsValid() bool {
 	return r.valid && r.verdict.IsValid() && r.envelopeDigest.IsValid()
 }
-func (r ApprovalDecisionResponse) IsZero() bool { return !r.IsValid() }
-func (r ApprovalDecisionResponse) Verdict() security.Verdict {
-	return pickIf(r.IsValid(), r.verdict, security.VerdictDeny)
-}
+func (r ApprovalDecisionResponse) IsZero() bool                    { return !r.IsValid() }
+func (r ApprovalDecisionResponse) Verdict() security.Verdict       { return orZero(r.IsValid(), r.verdict) }
 func (r ApprovalDecisionResponse) Approved() bool                  { return r.IsValid() && r.verdict.Allowed() }
 func (r ApprovalDecisionResponse) EnvelopeDigest() security.Digest { return r.envelopeDigest }
 func (r ApprovalDecisionResponse) Comment() string                 { return r.comment }
@@ -156,7 +149,6 @@ type InteractionPort interface {
 	PromptApproval(ctx context.Context, envelope security.ApprovalEnvelope) (ApprovalDecisionResponse, error)
 	PromptText(ctx context.Context, req TextPromptRequest) (string, error)
 	// PromptSecret 以无回显方式采集用户机密输入并在同步闭包内借出 *secret.SecretBox。
-	//
 	//xops:syncclosure
 	//xops:borrowed
 	PromptSecret(ctx context.Context, req SecretPromptRequest, fn func(box *secret.SecretBox) error) error

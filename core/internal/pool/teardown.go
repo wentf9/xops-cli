@@ -2,11 +2,10 @@ package pool
 
 import (
 	"context"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
+	"time"
 )
 
 // runDial 在 Actor 循环外部的 workNursery 中执行单跳拨号（零 I/O 阻塞 Actor），
@@ -40,7 +39,6 @@ func (p *Pool) startKeepalive(inst *hopInstance) {
 		return nil
 	})
 }
-
 func (p *Pool) runKeepalive(ctx context.Context, inst *hopInstance, interval time.Duration, maxMisses uint32) {
 	tm := p.clock.NewTimer(interval)
 	defer tm.Stop()
@@ -126,7 +124,6 @@ func (p *Pool) runIdleSweeper(ctx context.Context) error {
 		}
 	}
 }
-
 func (p *Pool) incTeardownPending() {
 	p.tdMu.Lock()
 	if p.tdPending == 0 {
@@ -135,7 +132,6 @@ func (p *Pool) incTeardownPending() {
 	p.tdPending++
 	p.tdMu.Unlock()
 }
-
 func (p *Pool) decTeardownPending() {
 	p.tdMu.Lock()
 	p.tdPending--
@@ -162,7 +158,6 @@ func (p *Pool) scheduleTeardownBatch(batch []*hopInstance) {
 		}
 	}
 }
-
 func (p *Pool) executeTeardownBatch(batch []*hopInstance) {
 	for _, inst := range batch {
 		p.teardownSingleInstance(inst)
@@ -194,7 +189,6 @@ func (p *Pool) teardownSingleInstance(inst *hopInstance) {
 		}
 	}
 }
-
 func (p *Pool) launchInstanceCloseWorker(inst *hopInstance) {
 	if err := p.teardownNursery.Go(func(_ context.Context) error {
 		p.closeInstanceDirect(inst)
@@ -203,7 +197,6 @@ func (p *Pool) launchInstanceCloseWorker(inst *hopInstance) {
 		p.closeInstanceDirect(inst)
 	}
 }
-
 func (p *Pool) closeInstanceDirect(inst *hopInstance) {
 	if inst == nil || inst.conn == nil {
 		return
@@ -239,7 +232,6 @@ func (p *Pool) escalateStuckTeardown(inst *hopInstance) {
 	}
 	p.fallbackAbortRootDirect(root)
 }
-
 func (p *Pool) fallbackAbortRootDirect(root *hopInstance) {
 	if root == nil || !root.abortClaimed.CompareAndSwap(false, true) {
 		return
@@ -250,35 +242,21 @@ func (p *Pool) fallbackAbortRootDirect(root *hopInstance) {
 	}
 }
 
-// scheduleOrphanConnClose 回收因父代 CAS 拒绝、取消竞态或停机竞态产生的孤儿 TransportConn。
-func (p *Pool) scheduleOrphanConnClose(conn ports.TransportConn) {
-	if conn == nil {
+// scheduleOrphanConnClose / scheduleResourceClose 在独立 teardownNursery 中以 90ms 有界宽限释放孤儿连接或托管资源。
+func (p *Pool) scheduleOrphanConnClose(conn ports.TransportConn) { p.scheduleCloserBounded(conn) }
+func (p *Pool) scheduleResourceClose(res ManagedResource)        { p.scheduleCloserBounded(res) }
+func (p *Pool) scheduleCloserBounded(c closeOnly) {
+	if c == nil {
 		return
 	}
 	p.incTeardownPending()
 	if err := p.teardownNursery.Go(func(_ context.Context) error {
 		defer p.decTeardownPending()
-		p.closeCloserBounded(conn)
+		p.closeCloserBounded(c)
 		return nil
 	}); err != nil {
 		p.decTeardownPending()
-		_ = conn.Close()
-	}
-}
-
-// scheduleResourceClose 在独立 teardownNursery 中以 90ms 有界宽限释放托管资源。
-func (p *Pool) scheduleResourceClose(res ManagedResource) {
-	if res == nil {
-		return
-	}
-	p.incTeardownPending()
-	if err := p.teardownNursery.Go(func(_ context.Context) error {
-		defer p.decTeardownPending()
-		p.closeCloserBounded(res)
-		return nil
-	}); err != nil {
-		p.decTeardownPending()
-		_ = res.Close()
+		_ = c.Close()
 	}
 }
 

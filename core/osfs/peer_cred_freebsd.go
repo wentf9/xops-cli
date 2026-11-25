@@ -5,7 +5,6 @@ package osfs
 import (
 	"errors"
 	"fmt"
-
 	"golang.org/x/sys/unix"
 )
 

@@ -5,6 +5,9 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
 	"io"
 	"io/fs"
 	"math"
@@ -12,10 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
-
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
+	"time"
 )
 
 // ScopedFS 是基于 Go *os.Root 的沙箱本地文件系统适配器，仅实现 ports.ScopedRootFS（零值失败关闭）。
@@ -100,12 +100,8 @@ func (h *rootHandle) ReadAllBounded(dest pathalg.LocalRootedDest, limits ports.R
 	})
 	return data, err
 }
-
-func (h *rootHandle) checkDestCB(dest pathalg.LocalRootedDest, fnNil bool) error {
-	if fnNil {
-		return ports.ErrNilCallback
-	}
-	return h.checkActiveDest(dest)
+func (h *rootHandle) checkDestCB(d pathalg.LocalRootedDest, fnNil bool) error {
+	return pickIf[error](fnNil, ports.ErrNilCallback, h.checkActiveDest(d))
 }
 
 // WithReadRegular 以有界随机只读句柄在同步回调内借出沙箱常规文件（支持顺序读与并发安全 ReadAt），退出即失效关闭。
@@ -224,8 +220,7 @@ func (h *rootHandle) Rename(oldDest, newDest pathalg.LocalRootedDest) error {
 	}
 	err = syncRootParentDirOS(h.root, newDest)
 	oldP, hasOld := oldDest.Parent()
-	newP, hasNew := newDest.Parent()
-	if hasOld != hasNew || (hasOld && !oldP.Equal(newP)) {
+	if newP, hasNew := newDest.Parent(); hasOld != hasNew || (hasOld && !oldP.Equal(newP)) {
 		err = errors.Join(err, syncRootParentDirOS(h.root, oldDest))
 	}
 	return err
@@ -278,21 +273,20 @@ func (h *rootHandle) AppendLine(dest pathalg.LocalRootedDest, perm fs.FileMode, 
 		return err
 	}
 	frame := append(bytes.Clone(line), '\n')
-	n, err := f.Write(frame)
-	if err == nil && n != len(frame) {
+	if n, wErr := f.Write(frame); wErr != nil {
+		err = wErr
+	} else if n != len(frame) {
 		err = io.ErrShortWrite
-	}
-	if err == nil {
+	} else {
 		err = f.Sync()
 	}
 	return mapOSError(errors.Join(err, f.Close()))
 }
-
-func (h *rootHandle) Stat(dest pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
-	return h.statDest(dest, false)
+func (h *rootHandle) Stat(d pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
+	return h.statDest(d, false)
 }
-func (h *rootHandle) Lstat(dest pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
-	return h.statDest(dest, true)
+func (h *rootHandle) Lstat(d pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
+	return h.statDest(d, true)
 }
 func (h *rootHandle) statDest(dest pathalg.LocalRootedDest, lstat bool) (ports.LocalFileInfo, error) {
 	if err := h.checkActiveDest(dest); err != nil {
@@ -331,7 +325,6 @@ func (h *rootHandle) ReadDir(dir algebraic.Option[pathalg.LocalRootedDest]) ([]p
 	}
 	return collectDirEntries(raw)
 }
-
 func collectDirEntries(raw []os.DirEntry) ([]ports.LocalDirEntry, error) {
 	out := make([]ports.LocalDirEntry, 0, len(raw))
 	for _, de := range raw {
@@ -382,6 +375,28 @@ func (h *rootHandle) CreateSymlink(link pathalg.LocalRootedDest, target string) 
 	return mapOSError(h.root.Symlink(target, link.String()))
 }
 
+func isValidRFC3339Time(t time.Time) bool {
+	return !t.IsZero() && t.UTC().Year() >= 1 && t.UTC().Year() <= 9999
+}
+
+// Chtimes 修改沙箱内常规文件或目录的访问与修改时间（拒绝零值、越界年份与符号链接，支撑 scp -p）。
+func (h *rootHandle) Chtimes(dest pathalg.LocalRootedDest, atime, mtime time.Time) error {
+	if err := h.prepareDest(dest); err != nil {
+		return err
+	}
+	if !isValidRFC3339Time(atime) || !isValidRFC3339Time(mtime) {
+		return fmt.Errorf("%w: Chtimes 时间戳为零值或超出 RFC 3339 年份范围 [1,9999]", ports.ErrInvalidArgument)
+	}
+	if lst, err := h.root.Lstat(dest.String()); err != nil {
+		return mapOSError(err)
+	} else if lst.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%w: 路径 %q 为符号链接", ports.ErrSymlinkRejected, dest.String())
+	} else if !lst.Mode().IsRegular() && !lst.IsDir() {
+		return fmt.Errorf("%w: 路径 %q 不是常规文件或目录", ports.ErrNotRegularFile, dest.String())
+	}
+	return mapOSError(h.root.Chtimes(dest.String(), atime, mtime))
+}
+
 // Remove 删除沙箱内单个文件或空目录；目标不存在时返回 ports.ErrNotFound。
 func (h *rootHandle) Remove(dest pathalg.LocalRootedDest) error {
 	if err := h.prepareDest(dest); err != nil {
@@ -389,7 +404,6 @@ func (h *rootHandle) Remove(dest pathalg.LocalRootedDest) error {
 	}
 	return mapOSError(h.root.Remove(dest.String()))
 }
-
 func checkLstatKind(root *os.Root, rel string, wantDir, allowMissing bool) (os.FileInfo, error) {
 	lst, err := root.Lstat(rel)
 	if err != nil {
@@ -403,7 +417,6 @@ func checkLstatKind(root *os.Root, rel string, wantDir, allowMissing bool) (os.F
 	}
 	return lst, nil
 }
-
 func verifyRegularSameFile(root *os.Root, rel string, f *os.File, allowMissing bool) (bool, error) {
 	openSt, err := f.Stat()
 	if err != nil {

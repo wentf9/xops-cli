@@ -2,9 +2,6 @@ package pool
 
 import (
 	"context"
-	"math"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
@@ -12,6 +9,8 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
+	"math"
+	"time"
 )
 
 type poolEventInput struct {
@@ -48,36 +47,19 @@ func (p *Pool) emitPoolEvent(in poolEventInput) {
 	if p == nil || p.bus == nil {
 		return
 	}
-	tid := in.traceID
-	if !tid.IsValid() {
-		tid = p.poolTraceID
-	}
+	tid := pickIf(in.traceID.IsValid(), in.traceID, p.poolTraceID)
 	meta, err := events.NewEventMeta(events.EventMetaSpec{
-		TraceID:     tid,
-		OperationID: in.opID,
-		OccurredAt:  p.clock.Now().UTC(),
-		Seq:         p.eventSeq.Add(1),
-		NodeID:      algebraic.None[inventory.NodeID](),
+		TraceID: tid, OperationID: in.opID, OccurredAt: p.clock.Now().UTC(),
+		Seq: p.eventSeq.Add(1), NodeID: algebraic.None[inventory.NodeID](),
 	})
 	if err != nil {
 		return
 	}
-	lat := in.latency
-	if lat < 0 {
-		lat = 0
-	}
 	ev, err := events.NewPoolStateEvent(events.PoolStateSpec{
-		Meta:         meta,
-		Action:       in.action,
-		PlanDigest:   in.planDigest,
-		HopDigest:    in.hopDigest,
-		Endpoint:     in.endpoint,
-		HandleKind:   in.handleKind,
-		HandleID:     in.handleID,
-		Generation:   in.generation,
-		ActiveLeases: clampUint32(in.activeLeases),
-		Latency:      algebraic.FromStdDuration(lat),
-		Detail:       in.detail,
+		Meta: meta, Action: in.action, PlanDigest: in.planDigest, HopDigest: in.hopDigest,
+		Endpoint: in.endpoint, HandleKind: in.handleKind, HandleID: in.handleID,
+		Generation: in.generation, ActiveLeases: clampUint32(in.activeLeases),
+		Latency: algebraic.FromStdDuration(max(in.latency, 0)), Detail: in.detail,
 	})
 	if err != nil {
 		return
@@ -85,32 +67,18 @@ func (p *Pool) emitPoolEvent(in poolEventInput) {
 	// SystemBus 属于 DropAndCount 非阻塞观测面，池运行期忽略关闭/丢弃状态而不阻断控制路径。
 	_ = p.bus.Publish(ev)
 }
-
 func (p *Pool) emitDiagnostic(sev events.Severity, code, msg string) {
 	if p == nil || p.bus == nil {
 		return
 	}
-	meta, err := events.NewEventMeta(events.EventMetaSpec{
-		TraceID:    p.poolTraceID,
-		OccurredAt: p.clock.Now().UTC(),
-		Seq:        p.eventSeq.Add(1),
-	})
+	meta, err := events.NewEventMeta(events.EventMetaSpec{TraceID: p.poolTraceID, OccurredAt: p.clock.Now().UTC(), Seq: p.eventSeq.Add(1)})
 	if err != nil {
 		return
 	}
-	ev, err := events.NewDiagnosticEvent(events.DiagnosticSpec{
-		Meta:     meta,
-		Scope:    events.DiagnosticScopePool,
-		Severity: sev,
-		Code:     code,
-		Message:  msg,
-	})
-	if err != nil {
-		return
+	if ev, err := events.NewDiagnosticEvent(events.DiagnosticSpec{Meta: meta, Scope: events.DiagnosticScopePool, Severity: sev, Code: code, Message: msg}); err == nil {
+		_ = p.bus.Publish(ev)
 	}
-	_ = p.bus.Publish(ev)
 }
-
 func clampUint32(n int) uint32 {
 	if n <= 0 {
 		return 0

@@ -29,13 +29,17 @@ func assertOutOfRangeEnum[T interface {
 }
 
 // TestOutOfRangeEnumsFailClosedWithoutPanic 通过白盒测试构造越界底层枚举值（99/255），
-// 验证全部 7 个端口枚举的 String/AppendText/MarshalText/JSON 编码零 panic 且严格失败关闭。
+// 验证全部 11 个端口枚举的 String/AppendText/MarshalText/JSON 编码零 panic 且严格失败关闭。
 func TestOutOfRangeEnumsFailClosedWithoutPanic(t *testing.T) {
 	assertOutOfRangeEnum(t, "LockMode", LockMode(99), LockMode(255))
 	assertOutOfRangeEnum(t, "HostTrustStatus", HostTrustStatus(99), HostTrustStatus(255))
 	assertOutOfRangeEnum(t, "ForwardDirection", ForwardDirection(99), ForwardDirection(255))
+	assertOutOfRangeEnum(t, "ForwardEndpointKind", ForwardEndpointKind(99), ForwardEndpointKind(255))
 	assertOutOfRangeEnum(t, "MuxControlAction", MuxControlAction(99), MuxControlAction(255))
 	assertOutOfRangeEnum(t, "RemoteFileType", RemoteFileType(99), RemoteFileType(255))
 	assertOutOfRangeEnum(t, "AuditPhase", AuditPhase(99), AuditPhase(255))
 	assertOutOfRangeEnum(t, "AuditOutcome", AuditOutcome(99), AuditOutcome(255))
+	assertOutOfRangeEnum(t, "VaultState", VaultState(99), VaultState(255))
+	assertOutOfRangeEnum(t, "TUNMode", TUNMode(99), TUNMode(255))
+	assertOutOfRangeEnum(t, "PrivilegeMethod", PrivilegeMethod(99), PrivilegeMethod(255))
 }

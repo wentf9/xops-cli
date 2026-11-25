@@ -5,12 +5,11 @@ package osfs
 import (
 	"context"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
 	"io/fs"
 	"net"
 	"os"
-
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
 )
 
 type socketFileID struct{}

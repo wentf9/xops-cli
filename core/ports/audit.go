@@ -7,20 +7,16 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
-	"slices"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"io"
+	"slices"
+	"strings"
+	"time"
 )
 
-const (
-	processInstanceEntropyBytes = 16
-	maxProcessInstanceIDLen     = 64
-	maxAuditErrorCodeLen        = 64
-)
+const processInstanceEntropyBytes, maxProcessInstanceIDLen, maxAuditErrorCodeLen = 16, 64, 64
 
 // ProcessInstanceID 唯一标识单个运行期 Engine 实例，映射 ~/.xops/run/<ProcessInstanceID>.lock（ADR-008）。
 //
@@ -36,7 +32,7 @@ func NewProcessInstanceIDFrom(entropy io.Reader) (ProcessInstanceID, error) {
 	var raw [processInstanceEntropyBytes]byte
 	if _, err := io.ReadFull(entropy, raw[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return ProcessInstanceID{}, fmt.Errorf("%w: %w: %w", ErrInvalidProcessInstanceID, ErrEntropyShortRead, err)
+			err = fmt.Errorf("%w: %w", ErrEntropyShortRead, err)
 		}
 		return ProcessInstanceID{}, fmt.Errorf("%w: %w", ErrInvalidProcessInstanceID, err)
 	}
@@ -56,16 +52,10 @@ func ParseProcessInstanceID(raw string) (ProcessInstanceID, error) {
 	}
 	return ProcessInstanceID{value: raw}, nil
 }
-
-func isSafeProcessIDChars(raw string) bool {
-	for i := range len(raw) {
-		b := raw[i]
-		alnum := (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
-		if !alnum && (i == 0 || (b != '-' && b != '.') || (i == len(raw)-1 && b == '.')) {
-			return false
-		}
-	}
-	return true
+func isSafeProcessIDChars(s string) bool {
+	return len(s) > 0 && s[0] != '-' && s[0] != '.' && s[len(s)-1] != '.' && !strings.ContainsFunc(s, func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') && r != '_' && r != '-' && r != '.'
+	})
 }
 func (id ProcessInstanceID) IsValid() bool  { return id.value != "" }
 func (id ProcessInstanceID) IsZero() bool   { return id.value == "" }
@@ -139,18 +129,8 @@ type AuditEntrySpec struct {
 //xops:opaque
 //xops:failclosed
 type AuditEntry struct {
-	processID         ProcessInstanceID
-	traceID           security.TraceID
-	operationID       security.OperationID
-	phase             AuditPhase
-	outcome           AuditOutcome
-	risk              security.RiskLevel
-	decision          security.DecisionKind
-	binding           security.OperationBinding
-	timestamp         time.Time
-	duration          algebraic.Option[algebraic.Duration]
-	errorCode, reason string
-	valid             bool
+	s     AuditEntrySpec
+	valid bool
 }
 
 // NewAuditEntry 校验标识、阶段/结果/决策配对、RFC 3339 时间戳与非负可选耗时并构造 AuditEntry。
@@ -159,60 +139,39 @@ func NewAuditEntry(spec AuditEntrySpec) (AuditEntry, error) {
 	if err := firstErr(validateAuditEntrySpec(spec), e2); err != nil {
 		return AuditEntry{}, err
 	}
-	return AuditEntry{
-		processID: spec.ProcessID, traceID: spec.TraceID, operationID: spec.OperationID,
-		phase: spec.Phase, outcome: spec.Outcome, risk: spec.Risk, decision: spec.Decision,
-		binding: spec.Binding, timestamp: spec.Timestamp.UTC().Round(0), duration: spec.Duration,
-		errorCode: spec.ErrorCode, reason: reason, valid: true,
-	}, nil
+	spec.Timestamp, spec.Reason = spec.Timestamp.UTC().Round(0), reason
+	return AuditEntry{s: spec, valid: true}, nil
 }
-
-func validateAuditEntrySpec(s AuditEntrySpec) error {
+func isValidAuditEntrySpec(s AuditEntrySpec) bool {
 	dur, hasDur := s.Duration.Get()
-	if !s.ProcessID.IsValid() || !s.TraceID.IsValid() || !s.OperationID.IsValid() || !s.Risk.IsValid() || !s.Binding.IsValid() ||
-		!isValidRFC3339Time(s.Timestamp) || !isValidAuditPhaseOutcome(s.Phase, s.Outcome) || !isValidAuditPhaseDecision(s.Phase, s.Decision) ||
-		(hasDur && dur.IsNegative()) || (s.ErrorCode != "" && !isValidASCIIToken(s.ErrorCode, maxAuditErrorCodeLen)) {
+	return s.ProcessID.IsValid() && s.TraceID.IsValid() && s.OperationID.IsValid() && s.Risk.IsValid() && s.Binding.IsValid() && isValidRFC3339Time(s.Timestamp) && isValidAuditPhaseOutcome(s.Phase, s.Outcome) && isValidAuditPhaseDecision(s.Phase, s.Decision) && (!hasDur || !dur.IsNegative()) && (s.ErrorCode == "" || isValidASCIIToken(s.ErrorCode, maxAuditErrorCodeLen))
+}
+func validateAuditEntrySpec(s AuditEntrySpec) error {
+	if !isValidAuditEntrySpec(s) {
 		return fmt.Errorf("%w: 审计记录字段或阶段/结果/决策组合非法", ErrInvalidAuditEntry)
 	}
 	return nil
 }
-
 func isValidAuditPhaseOutcome(p AuditPhase, o AuditOutcome) bool {
-	return (p == AuditPhaseAuthorized && o == AuditOutcomePending) ||
-		(p == AuditPhaseDenied && o == AuditOutcomeDenied) ||
-		(p == AuditPhaseFinalized && o >= AuditOutcomeSucceeded && o <= AuditOutcomeUnknown)
+	return (p == AuditPhaseAuthorized && o == AuditOutcomePending) || (p == AuditPhaseDenied && o == AuditOutcomeDenied) || (p == AuditPhaseFinalized && o >= AuditOutcomeSucceeded && o <= AuditOutcomeUnknown)
 }
-
 func isValidAuditPhaseDecision(p AuditPhase, d security.DecisionKind) bool {
-	return d.IsValid() && ((p == AuditPhaseDenied && d != security.DecisionKindAllow) ||
-		((p == AuditPhaseAuthorized || p == AuditPhaseFinalized) && d != security.DecisionKindDeny))
+	return d.IsValid() && ((p == AuditPhaseDenied && d != security.DecisionKindAllow) || ((p == AuditPhaseAuthorized || p == AuditPhaseFinalized) && d != security.DecisionKindDeny))
 }
-
-func (e AuditEntry) IsValid() bool {
-	dur, hasDur := e.duration.Get()
-	return e.valid && e.processID.IsValid() && e.traceID.IsValid() && e.operationID.IsValid() &&
-		isValidAuditPhaseOutcome(e.phase, e.outcome) && isValidAuditPhaseDecision(e.phase, e.decision) &&
-		e.risk.IsValid() && e.binding.IsValid() && isValidRFC3339Time(e.timestamp) && (!hasDur || !dur.IsNegative())
-}
-func (e AuditEntry) IsZero() bool                      { return !e.IsValid() }
-func (e AuditEntry) ProcessID() ProcessInstanceID      { return e.processID }
-func (e AuditEntry) TraceID() security.TraceID         { return e.traceID }
-func (e AuditEntry) OperationID() security.OperationID { return e.operationID }
-func (e AuditEntry) Phase() AuditPhase                 { return pickIf(e.IsValid(), e.phase, AuditPhaseInvalid) }
-func (e AuditEntry) Outcome() AuditOutcome {
-	return pickIf(e.IsValid(), e.outcome, AuditOutcomeInvalid)
-}
-func (e AuditEntry) Risk() security.RiskLevel {
-	return pickIf(e.IsValid(), e.risk, security.RiskUnknown)
-}
-func (e AuditEntry) Decision() security.DecisionKind {
-	return pickIf(e.IsValid(), e.decision, security.DecisionKindDeny)
-}
-func (e AuditEntry) Binding() security.OperationBinding             { return e.binding }
-func (e AuditEntry) Timestamp() time.Time                           { return e.timestamp }
-func (e AuditEntry) Duration() algebraic.Option[algebraic.Duration] { return e.duration }
-func (e AuditEntry) ErrorCode() string                              { return e.errorCode }
-func (e AuditEntry) Reason() string                                 { return e.reason }
+func (e AuditEntry) IsValid() bool                                  { return e.valid && isValidAuditEntrySpec(e.s) }
+func (e AuditEntry) IsZero() bool                                   { return !e.IsValid() }
+func (e AuditEntry) ProcessID() ProcessInstanceID                   { return e.s.ProcessID }
+func (e AuditEntry) TraceID() security.TraceID                      { return e.s.TraceID }
+func (e AuditEntry) OperationID() security.OperationID              { return e.s.OperationID }
+func (e AuditEntry) Phase() AuditPhase                              { return orZero(e.IsValid(), e.s.Phase) }
+func (e AuditEntry) Outcome() AuditOutcome                          { return orZero(e.IsValid(), e.s.Outcome) }
+func (e AuditEntry) Risk() security.RiskLevel                       { return orZero(e.IsValid(), e.s.Risk) }
+func (e AuditEntry) Decision() security.DecisionKind                { return orZero(e.IsValid(), e.s.Decision) }
+func (e AuditEntry) Binding() security.OperationBinding             { return e.s.Binding }
+func (e AuditEntry) Timestamp() time.Time                           { return e.s.Timestamp }
+func (e AuditEntry) Duration() algebraic.Option[algebraic.Duration] { return e.s.Duration }
+func (e AuditEntry) ErrorCode() string                              { return e.s.ErrorCode }
+func (e AuditEntry) Reason() string                                 { return e.s.Reason }
 func (e AuditEntry) CanonicalJSON() ([]byte, error) {
 	if !e.IsValid() {
 		return nil, ErrInvalidAuditEntry
@@ -220,11 +179,7 @@ func (e AuditEntry) CanonicalJSON() ([]byte, error) {
 	return jsonv2.Marshal(e, jsonv2.Deterministic(true))
 }
 func (e AuditEntry) Equal(o AuditEntry) bool {
-	return e.IsValid() && o.IsValid() && e.processID.Equal(o.processID) && e.traceID.Equal(o.traceID) &&
-		e.operationID.Equal(o.operationID) && e.phase == o.phase && e.outcome == o.outcome &&
-		e.risk == o.risk && e.decision == o.decision && e.binding.Equal(o.binding) &&
-		e.timestamp.Equal(o.timestamp) && optEqualFunc(e.duration, o.duration, algebraic.Duration.Equal) &&
-		e.errorCode == o.errorCode && e.reason == o.reason
+	return e.IsValid() && o.IsValid() && e.s.ProcessID.Equal(o.s.ProcessID) && e.s.TraceID.Equal(o.s.TraceID) && e.s.OperationID.Equal(o.s.OperationID) && e.s.Phase == o.s.Phase && e.s.Outcome == o.s.Outcome && e.s.Risk == o.s.Risk && e.s.Decision == o.s.Decision && e.s.Binding.Equal(o.s.Binding) && e.s.Timestamp.Equal(o.s.Timestamp) && optEqualFunc(e.s.Duration, o.s.Duration, algebraic.Duration.Equal) && e.s.ErrorCode == o.s.ErrorCode && e.s.Reason == o.s.Reason
 }
 
 // AuditPostWriteError 表示副作用完成后写入终态审计失败的致命故障（ADR-008）；实现单值 Unwrap 与 Is(ErrAuditPostWrite)。
@@ -278,43 +233,36 @@ type CrashReconcileReportSpec struct {
 //xops:opaque
 //xops:failclosed
 type CrashReconcileReport struct {
-	scannedLocks, liveLocksSkipped, deadLocksClaimed int
-	abortedOperations                                []security.OperationID
-	valid                                            bool
+	s     CrashReconcileReportSpec
+	valid bool
 }
 
 // NewCrashReconcileReport 校验计数非负、一致性及全部补写 OperationID 有效后构造不可变报告。
 func NewCrashReconcileReport(spec CrashReconcileReportSpec) (CrashReconcileReport, error) {
 	if spec.ScannedLocks < 0 || spec.LiveLocksSkipped < 0 || spec.DeadLocksClaimed < 0 ||
-		spec.LiveLocksSkipped+spec.DeadLocksClaimed > spec.ScannedLocks {
-		return CrashReconcileReport{}, fmt.Errorf("%w: 崩溃对账锁统计计数非法", ErrInvalidArgument)
+		spec.LiveLocksSkipped+spec.DeadLocksClaimed > spec.ScannedLocks ||
+		slices.ContainsFunc(spec.AbortedOperations, security.OperationID.IsZero) {
+		return CrashReconcileReport{}, fmt.Errorf("%w: 崩溃对账锁统计计数或 aborted_operations 非法", ErrInvalidArgument)
 	}
-	var ops []security.OperationID
-	if len(spec.AbortedOperations) > 0 {
-		ops = slices.Clone(spec.AbortedOperations)
-		if slices.ContainsFunc(ops, security.OperationID.IsZero) {
-			return CrashReconcileReport{}, fmt.Errorf("%w: aborted_operations 包含无效 OperationID", ErrInvalidArgument)
-		}
-		slices.SortFunc(ops, security.OperationID.Compare)
-		ops = slices.CompactFunc(ops, security.OperationID.Equal)
-	}
-	return CrashReconcileReport{scannedLocks: spec.ScannedLocks, liveLocksSkipped: spec.LiveLocksSkipped, deadLocksClaimed: spec.DeadLocksClaimed, abortedOperations: ops, valid: true}, nil
+	ops := cloneSliceNilIfEmpty(spec.AbortedOperations)
+	slices.SortFunc(ops, security.OperationID.Compare)
+	spec.AbortedOperations = slices.CompactFunc(ops, security.OperationID.Equal)
+	return CrashReconcileReport{s: spec, valid: true}, nil
 }
-func (r CrashReconcileReport) IsValid() bool     { return r.valid && r.scannedLocks >= 0 }
+func (r CrashReconcileReport) IsValid() bool     { return r.valid && r.s.ScannedLocks >= 0 }
 func (r CrashReconcileReport) IsZero() bool      { return !r.IsValid() }
-func (r CrashReconcileReport) ScannedLocks() int { return pickIf(r.IsValid(), r.scannedLocks, 0) }
+func (r CrashReconcileReport) ScannedLocks() int { return orZero(r.IsValid(), r.s.ScannedLocks) }
 func (r CrashReconcileReport) LiveLocksSkipped() int {
-	return pickIf(r.IsValid(), r.liveLocksSkipped, 0)
+	return orZero(r.IsValid(), r.s.LiveLocksSkipped)
 }
 func (r CrashReconcileReport) DeadLocksClaimed() int {
-	return pickIf(r.IsValid(), r.deadLocksClaimed, 0)
+	return orZero(r.IsValid(), r.s.DeadLocksClaimed)
 }
 func (r CrashReconcileReport) AbortedOperations() []security.OperationID {
-	return slices.Clone(r.abortedOperations)
+	return slices.Clone(r.s.AbortedOperations)
 }
 func (r CrashReconcileReport) Equal(o CrashReconcileReport) bool {
-	return r.IsValid() && o.IsValid() && r.scannedLocks == o.scannedLocks && r.liveLocksSkipped == o.liveLocksSkipped &&
-		r.deadLocksClaimed == o.deadLocksClaimed && slices.EqualFunc(r.abortedOperations, o.abortedOperations, security.OperationID.Equal)
+	return r.IsValid() && o.IsValid() && r.s.ScannedLocks == o.s.ScannedLocks && r.s.LiveLocksSkipped == o.s.LiveLocksSkipped && r.s.DeadLocksClaimed == o.s.DeadLocksClaimed && slices.EqualFunc(r.s.AbortedOperations, o.s.AbortedOperations, security.OperationID.Equal)
 }
 
 // AuditSink 定义同步 Fail-Closed 审计写入与只追加活跃操作登记出站端口（ADR-008）。

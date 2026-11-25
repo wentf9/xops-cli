@@ -2,15 +2,14 @@ package pool
 
 import (
 	"context"
-	"sync"
-	"sync/atomic"
-	"time"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // PoolConfig 定义连接池 Pool 的运行期初始化配置（纯内存构造参数，非持久化 DTO）。
@@ -31,18 +30,12 @@ type PoolConfig struct {
 
 // PoolStats 提供连接池当前的无锁并发安全运行期统计快照。
 type PoolStats struct {
-	ActiveConns         int
-	DialingConns        int
-	ActiveLeases        int64
-	ActiveHandles       int
-	TotalDials          uint64
-	DialErrors          uint64
-	CacheHits           uint64
-	ParentCASRejections uint64
-	TeardownCompleted   uint64
-	TeardownEscalations uint64
-	Halted              bool
-	Closed              bool
+	ActiveConns, DialingConns, ActiveHandles int
+	ActiveLeases                             int64
+	TotalDials, DialErrors, CacheHits        uint64
+	ParentCASRejections                      uint64
+	TeardownCompleted, TeardownEscalations   uint64
+	Halted, Closed                           bool
 }
 
 // HandleStatus 表示世代 SlotMap 中某个托管句柄的不可变只读状态快照；零值恒无效并失败关闭。
@@ -65,52 +58,41 @@ func pickIf[T any](ok bool, yes, no T) T {
 	}
 	return no
 }
+func orZero[T any](ok bool, v T) T { return pickIf(ok, v, zeroVal[T]()) }
 
 // HandleStatus 只读访问器（全字段失败关闭，无效零值返回零值或 false）。
 func (s HandleStatus) IsValid() bool {
 	return s.valid && s.kind.IsValid() && s.id.IsValid() && s.gen > 0 && s.planDigest.IsValid() && s.binding.IsValid()
 }
-func (s HandleStatus) IsZero() bool { return !s.IsValid() }
-func (s HandleStatus) Active() bool { return s.IsValid() && s.active }
-func (s HandleStatus) Kind() plan.HandleKindCode {
-	return pickIf(s.IsValid(), s.kind, plan.HandleKindInvalid)
-}
-func (s HandleStatus) ID() plan.HandleID  { return pickIf(s.IsValid(), s.id, zeroVal[plan.HandleID]()) }
-func (s HandleStatus) Generation() uint64 { return pickIf(s.IsValid(), s.gen, 0) }
-func (s HandleStatus) PlanDigest() plan.PlanDigest {
-	return pickIf(s.IsValid(), s.planDigest, zeroVal[plan.PlanDigest]())
-}
-func (s HandleStatus) Binding() security.OperationBinding {
-	return pickIf(s.IsValid(), s.binding, zeroVal[security.OperationBinding]())
-}
+func (s HandleStatus) IsZero() bool                       { return !s.IsValid() }
+func (s HandleStatus) Active() bool                       { return s.IsValid() && s.active }
+func (s HandleStatus) Kind() plan.HandleKindCode          { return orZero(s.IsValid(), s.kind) }
+func (s HandleStatus) ID() plan.HandleID                  { return orZero(s.IsValid(), s.id) }
+func (s HandleStatus) Generation() uint64                 { return orZero(s.IsValid(), s.gen) }
+func (s HandleStatus) PlanDigest() plan.PlanDigest        { return orZero(s.IsValid(), s.planDigest) }
+func (s HandleStatus) Binding() security.OperationBinding { return orZero(s.IsValid(), s.binding) }
 
 // hopInstance 表示池内某一特定世代（epoch >= 1）的已认证单跳传输连接实例。
 // 不可变字段与原子状态支持数据面/拆断面无锁并发读取；
 // activeLeases/pinnedHandles/children/planDigests/lastUsed/inActiveMap 归 DualActor 单线程独占管理。
 type hopInstance struct {
-	digest       plan.HopDigest
-	hopSpec      plan.HopSpec
-	epoch        uint64
-	parent       *hopInstance
-	parentEpoch  uint64
-	conn         ports.TransportConn
-	revokeCtx    context.Context
-	revokeCancel context.CancelCauseFunc
-
-	epochAtom    atomic.Uint64
-	active       atomic.Bool
-	closing      atomic.Bool
-	abortClaimed atomic.Bool
-	closeOnce    sync.Once
-	closeDone    chan struct{}
-
-	// 以下字段归 DualActor 单线程独占管理。
-	activeLeases  int
-	pinnedHandles map[plan.HandleID]uint64 // 绑定到本跳实例的活跃托管句柄（id -> gen），防空闲/LRU 驱逐并支持断连同步撤销
-	children      map[*hopInstance]struct{}
-	planDigests   map[plan.PlanDigest]struct{}
-	lastUsed      time.Time
-	inActiveMap   bool
+	digest                        plan.HopDigest
+	hopSpec                       plan.HopSpec
+	epoch, parentEpoch            uint64
+	parent                        *hopInstance
+	conn                          ports.TransportConn
+	revokeCtx                     context.Context
+	revokeCancel                  context.CancelCauseFunc
+	epochAtom                     atomic.Uint64
+	active, closing, abortClaimed atomic.Bool
+	closeOnce                     sync.Once
+	closeDone                     chan struct{}
+	activeLeases                  int
+	pinnedHandles                 map[plan.HandleID]uint64
+	children                      map[*hopInstance]struct{}
+	planDigests                   map[plan.PlanDigest]struct{}
+	lastUsed                      time.Time
+	inActiveMap                   bool
 }
 
 func (h *hopInstance) isValidEpoch(expect uint64) bool {
@@ -126,16 +108,15 @@ func (h *hopInstance) rootAncestor() *hopInstance {
 
 // waiterState 描述单次入站租约等待器的无锁 CAS 握手状态，消除 ctx 取消与 Actor 授权间的租约泄漏窗口。
 const (
-	waiterWaiting  int32 = 0
-	waiterGranted  int32 = 1
-	waiterCanceled int32 = 2
+	waiterWaiting int32 = iota
+	waiterGranted
+	waiterCanceled
 )
 
 type acquireReply struct {
 	inst *hopInstance
 	err  error
 }
-
 type acquireWaiter struct {
 	state   atomic.Int32
 	replyCh chan acquireReply
@@ -205,22 +186,24 @@ const (
 	ctrlUnpinHandle
 )
 
+type pinHandleReply struct {
+	inst *hopInstance
+	err  error
+}
 type controlMsg struct {
-	kind       controlKind
-	inst       *hopInstance
-	inflight   *dialInflight
-	waiter     *acquireWaiter
-	hopDigest  plan.HopDigest
-	hopEpoch   uint64
-	planDigest plan.PlanDigest
-	handleID   plan.HandleID
-	handleGen  uint64
-	pinStrict  bool
-	conn       ports.TransportConn
-	err        error
-	cutoff     time.Time
-	forceIdle  bool
-	doneCh     chan struct{}
-	countCh    chan int
-	pinErrCh   chan error
+	kind                 controlKind
+	inst                 *hopInstance
+	inflight             *dialInflight
+	waiter               *acquireWaiter
+	hopDigest            plan.HopDigest
+	hopEpoch, handleGen  uint64
+	planDigest           plan.PlanDigest
+	handleID             plan.HandleID
+	pinStrict, forceIdle bool
+	conn                 ports.TransportConn
+	err                  error
+	cutoff               time.Time
+	doneCh               chan struct{}
+	countCh              chan int
+	pinResCh             chan pinHandleReply
 }

@@ -2,12 +2,15 @@ package memtree
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"io/fs"
 	"path"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -48,6 +51,33 @@ func (t *Tree) OpenOrCreateRegularLocked(abs string, create bool, checkWrite fun
 	nd = &Node{Kind: ports.RemoteFileRegular, Mode: perm.Perm(), ModTime: t.Now(), Ino: t.AllocIno()}
 	t.Nodes[abs] = nd
 	return nd, nil
+}
+
+func isValidRFC3339Time(t time.Time) bool {
+	return !t.IsZero() && t.UTC().Year() >= 1 && t.UTC().Year() <= 9999
+}
+
+// ChtimesLocalLocked 校验合法 RFC 3339 时间戳与无软链路径并更新沙箱常规文件或目录的修改时间。
+func (t *Tree) ChtimesLocalLocked(abs string, atime, mtime time.Time) error {
+	if !isValidRFC3339Time(atime) || !isValidRFC3339Time(mtime) {
+		return ports.ErrInvalidArgument
+	}
+	key, err := t.ResolveParentLocked(abs, false, true)
+	if err != nil {
+		return err
+	}
+	nd := t.Nodes[key]
+	switch {
+	case nd == nil:
+		return ports.ErrNotFound
+	case nd.Kind == ports.RemoteFileSymlink:
+		return ports.ErrSymlinkRejected
+	case nd.Kind != ports.RemoteFileRegular && nd.Kind != ports.RemoteFileDir:
+		return ports.ErrNotRegularFile
+	default:
+		nd.ModTime = mtime.UTC().Round(0)
+		return nil
+	}
 }
 
 // RenameLocalLocked 在沙箱根内校验非符号链接与类型兼容性并原子重命名 oldAbs -> newAbs。
@@ -213,4 +243,51 @@ func (lf *LockedFile) Stat() (out ports.LocalFileInfo, err error) {
 		out, e = ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: path.Base(lf.abs), Size: int64(len(nd.Data)), Mode: nd.Mode, ModTime: nd.ModTime})
 		return e
 	})
+}
+
+// WriteChunkLocalLocked 在树锁保护下向常规暂存文件写入分片数据。
+func (t *Tree) WriteChunkLocalLocked(abs string, offset int64, chunk []byte, perm fs.FileMode) error {
+	nd, err := t.OpenOrCreateRegularLocked(abs, true, nil, perm)
+	if err != nil {
+		return err
+	}
+	if len(chunk) > 0 {
+		nd.Data = GrowBytes(nd.Data, offset+int64(len(chunk)))
+		copy(nd.Data[offset:], chunk)
+	}
+	nd.ModTime = t.Now()
+	return nil
+}
+
+// ListLocalDirLocked 在树锁保护下将目录项转换为已校验 LocalDirEntry 列表。
+func (t *Tree) ListLocalDirLocked(abs string) ([]ports.LocalDirEntry, error) {
+	items, err := t.ListDirLocked(abs, false, false, true)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ports.LocalDirEntry, 0, len(items))
+	for _, it := range items {
+		ent, e := ports.NewLocalDirEntry(it.Name, it.Node.Mode, int64(len(it.Node.Data)))
+		if e != nil {
+			return nil, e
+		}
+		out = append(out, ent)
+	}
+	return out, nil
+}
+
+// CreateSymlinkLocalLocked 在树锁保护下按策略 (b) 校验并创建沙箱内相对符号链接。
+func (t *Tree) CreateSymlinkLocalLocked(link pathalg.LocalRootedDest, target string) error {
+	abs := NormPath(link.String())
+	if _, err := t.ResolveParentLocked(abs, false, true); err != nil {
+		return err
+	}
+	if t.Nodes[abs] != nil {
+		return ports.ErrAlreadyExists
+	}
+	if err := pathalg.ValidateContainedSymlinkChain(link, target, t.CollectSymlinksLocked()); err != nil {
+		return fmt.Errorf("%w: %w", ports.ErrSymlinkRejected, err)
+	}
+	t.Nodes[abs] = &Node{Kind: ports.RemoteFileSymlink, Mode: fs.ModeSymlink | 0o777, Target: target, ModTime: t.Now(), Ino: t.AllocIno()}
+	return nil
 }

@@ -5,16 +5,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/conc"
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
 	"io"
 	"io/fs"
 	"strings"
 	"sync/atomic"
 	"testing"
-
-	"github.com/wentf9/xops-cli/core/conc"
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
+	"time"
 )
 
 // ScopedRootFSFixture 描述 ScopedRootFS 契约测试夹具。
@@ -43,7 +43,6 @@ type OperatorReadFSFixture struct {
 func RunScopedRootFSSuite(t *testing.T, fx ScopedRootFSFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewRoot != nil, "ScopedRootFSFixture.NewRoot 不能为 nil")
-
 	t.Run("ValidationAndNilGuards", func(t *testing.T) {
 		fsPort, dir := fx.NewRoot(t)
 		var zeroDir pathalg.LocalDir
@@ -53,7 +52,6 @@ func RunScopedRootFSSuite(t *testing.T, fx ScopedRootFSFixture) {
 		requireNoErr(t, err, "ParseLocalRootedDest(bootRel)")
 		bootDir, err := dir.JoinDest(bootRel)
 		requireNoErr(t, err, "dir.JoinDest(bootRel)")
-
 		requireErr(t, fsPort.EnsureRoot(zeroDir, 0o700), "EnsureRoot(zero dir)")
 		requireErr(t, fsPort.EnsureRoot(bootDir, 0), "EnsureRoot(zero perm)")
 		requireErr(t, fsPort.EnsureRoot(bootDir, fs.ModeSetuid|0o700), "EnsureRoot(special perm)")
@@ -65,11 +63,9 @@ func RunScopedRootFSSuite(t *testing.T, fx ScopedRootFSFixture) {
 			requireTrue(t, len(entries) == 0, "新引导的沙箱根目录应为空")
 			return nil
 		}), "WithRoot(bootDir)")
-
 		requireErrIs(t, fsPort.WithRoot(dir, nil), ports.ErrNilCallback, "WithRoot(nil fn)")
 		requireErr(t, fsPort.WithRoot(zeroDir, func(ports.RootHandle) error { return nil }), "WithRoot(zero dir)")
 	})
-
 	t.Run("CreateReadReplaceAppendAndSymlinkOps", func(t *testing.T) {
 		fsPort, dir := fx.NewRoot(t)
 		err := fsPort.WithRoot(dir, func(root ports.RootHandle) error {
@@ -78,20 +74,17 @@ func RunScopedRootFSSuite(t *testing.T, fx ScopedRootFSFixture) {
 		})
 		requireNoErr(t, err, "WithRoot(CreateReadReplaceAppendAndSymlinkOps)")
 	})
-
 	t.Run("LockedFileSharedExclusiveAndCancellation", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		fsPort, dir := fx.NewRoot(t)
 		verifyRootLockingContract(t, fsPort, dir)
 	})
 }
-
 func verifyRootFileLifecycle(t *testing.T, root ports.RootHandle, checkSymlink bool) {
 	t.Helper()
 	subDir, err := pathalg.ParseLocalRootedDest("nested/sub")
 	requireNoErr(t, err, "ParseLocalRootedDest(subDir)")
 	requireNoErr(t, root.MkdirAll(subDir, 0o700), "MkdirAll")
-
 	fileRel, err := pathalg.ParseLocalRootedDest("nested/sub/config.yaml")
 	requireNoErr(t, err, "ParseLocalRootedDest(fileRel)")
 	requireErrIs(t, root.CreateExclusive(fileRel, 0o600, nil), ports.ErrNilCallback, "CreateExclusive(nil fn)")
@@ -103,25 +96,21 @@ func verifyRootFileLifecycle(t *testing.T, root ports.RootHandle, checkSymlink b
 		_, wErr := w.Write([]byte("dup"))
 		return wErr
 	}), ports.ErrAlreadyExists, "重复 CreateExclusive")
-
 	lim, err := ports.NewReadLimits(1024)
 	requireNoErr(t, err, "NewReadLimits")
 	got, err := root.ReadAllBounded(fileRel, lim)
 	requireNoErr(t, err, "ReadAllBounded")
 	requireTrue(t, bytes.Equal(got, []byte("v1-payload")), "ReadAllBounded 内容不匹配")
-
 	smallLim, err := ports.NewReadLimits(4)
 	requireNoErr(t, err, "NewReadLimits(small)")
 	_, err = root.ReadAllBounded(fileRel, smallLim)
 	requireErrIs(t, err, ports.ErrLimitExceeded, "超出 ReadLimits 须返回 ErrLimitExceeded")
-
 	requireErrIs(t, root.WithReadRegular(fileRel, lim, nil), ports.ErrNilCallback, "WithReadRegular(nil fn)")
 	requireErrIs(t, root.AtomicReplace(fileRel, 0o600, nil), ports.ErrNilCallback, "AtomicReplace(nil fn)")
 	requireNoErr(t, root.AtomicReplace(fileRel, 0o600, func(w io.Writer) error {
 		_, wErr := w.Write([]byte("v2-replaced"))
 		return wErr
 	}), "AtomicReplace")
-
 	var streamed []byte
 	err = root.WithReadRegular(fileRel, lim, func(r ports.BoundedReadHandle, size int64) error {
 		requireTrue(t, size == int64(len("v2-replaced")), "WithReadRegular 报告大小不匹配")
@@ -137,27 +126,23 @@ func verifyRootFileLifecycle(t *testing.T, root ports.RootHandle, checkSymlink b
 	})
 	requireNoErr(t, err, "WithReadRegular")
 	requireTrue(t, bytes.Equal(streamed, []byte("v2-replaced")), "AtomicReplace 后读取内容不匹配")
-
 	verifyRootChunkAndRename(t, root, lim, checkSymlink)
 	verifyRootAppendAndLimits(t, root, fileRel, lim)
 	verifyRootRollbackAndSymlink(t, root, fileRel, lim, checkSymlink)
 	verifyRootMetadataAndRemove(t, root, subDir, fileRel)
 }
-
 func verifyRootChunkAndRename(t *testing.T, root ports.RootHandle, lim ports.ReadLimits, checkSymlink bool) {
 	t.Helper()
 	stageRel, err := pathalg.ParseLocalRootedDest("nested/sub/dl.part")
 	requireNoErr(t, err, "ParseLocalRootedDest(dl.part)")
 	finalRel, err := pathalg.ParseLocalRootedDest("nested/sub/dl.bin")
 	requireNoErr(t, err, "ParseLocalRootedDest(dl.bin)")
-
 	_, err = root.WriteChunk(stageRel, -1, strings.NewReader("x"), 1, 0o600)
 	requireErr(t, err, "WriteChunk(负偏移)")
 	_, err = root.WriteChunk(stageRel, 0, nil, 1, 0o600)
 	requireErr(t, err, "WriteChunk(nil reader)")
 	_, err = root.WriteChunk(stageRel, 0, strings.NewReader("x"), 1, 0)
 	requireErr(t, err, "WriteChunk(零权限)")
-
 	// 乱序非截断分片写入并校验短流 io.ErrUnexpectedEOF。
 	n2, err := root.WriteChunk(stageRel, 6, strings.NewReader("world!"), 6, 0o600)
 	requireNoErr(t, err, "WriteChunk(offset=6)")
@@ -168,7 +153,6 @@ func verifyRootChunkAndRename(t *testing.T, root ports.RootHandle, lim ports.Rea
 	shortN, shortErr := root.WriteChunk(stageRel, 12, strings.NewReader("ab"), 5, 0o600)
 	requireErrIs(t, shortErr, io.ErrUnexpectedEOF, "WriteChunk 短流须返回 io.ErrUnexpectedEOF")
 	requireTrue(t, shortN == 2, "WriteChunk 短流须返回实际写入字节数")
-
 	requireNoErr(t, root.Rename(stageRel, finalRel), "Rename(stage->final)")
 	_, err = root.Stat(stageRel)
 	requireErrIs(t, err, ports.ErrNotFound, "Rename 后源路径不应存在")
@@ -176,7 +160,6 @@ func verifyRootChunkAndRename(t *testing.T, root ports.RootHandle, lim ports.Rea
 	requireNoErr(t, err, "ReadAllBounded(renamed)")
 	requireTrue(t, string(got) == "hello-world!ab", "分片合并重命名内容不匹配")
 	requireErrIs(t, root.Rename(stageRel, finalRel), ports.ErrNotFound, "Rename 不存在源须返回 ErrNotFound")
-
 	if checkSymlink {
 		symRel, sErr := pathalg.ParseLocalRootedDest("nested/sub/rename.link")
 		requireNoErr(t, sErr, "ParseLocalRootedDest(rename.link)")
@@ -187,31 +170,26 @@ func verifyRootChunkAndRename(t *testing.T, root ports.RootHandle, lim ports.Rea
 	}
 	requireNoErr(t, root.Remove(finalRel), "Remove(dl.bin)")
 }
-
 func verifyRootAppendAndLimits(t *testing.T, root ports.RootHandle, fileRel pathalg.LocalRootedDest, lim ports.ReadLimits) {
 	t.Helper()
 	var zeroLim ports.ReadLimits
 	_, err := root.ReadAllBounded(fileRel, zeroLim)
 	requireErr(t, err, "ReadAllBounded(zero limits)")
 	requireErr(t, root.WithReadRegular(fileRel, zeroLim, func(ports.BoundedReadHandle, int64) error { return nil }), "WithReadRegular(zero limits)")
-
 	logRel, err := pathalg.ParseLocalRootedDest("audit.jsonl")
 	requireNoErr(t, err, "ParseLocalRootedDest(audit.jsonl)")
 	requireNoErr(t, root.AppendLine(logRel, 0o600, []byte(`{"seq":1}`)), "AppendLine(1)")
 	requireNoErr(t, root.AppendLine(logRel, 0o600, []byte(`{"seq":2}`)), "AppendLine(2)")
 	requireErrIs(t, root.AppendLine(logRel, 0o600, []byte("bad\nline")), ports.ErrInvalidArgument, "AppendLine 须拒绝内嵌 LF")
 	requireErrIs(t, root.AppendLine(logRel, 0o600, []byte("bad\rline")), ports.ErrInvalidArgument, "AppendLine 须拒绝内嵌 CR")
-
 	logBytes, err := root.ReadAllBounded(logRel, lim)
 	requireNoErr(t, err, "ReadAllBounded(audit.jsonl)")
 	wantLog := []byte("{\"seq\":1}\n{\"seq\":2}\n")
 	requireTrue(t, bytes.Equal(logBytes, wantLog), "AppendLine 精确换行帧内容不匹配")
 }
-
 func verifyRootRollbackAndSymlink(t *testing.T, root ports.RootHandle, fileRel pathalg.LocalRootedDest, lim ports.ReadLimits, checkSymlink bool) {
 	t.Helper()
 	abortErr := errors.New("tck callback abort")
-
 	abortedRel, err := pathalg.ParseLocalRootedDest("nested/sub/aborted.tmp")
 	requireNoErr(t, err, "ParseLocalRootedDest(aborted)")
 	err = root.CreateExclusive(abortedRel, 0o600, func(w io.Writer) error {
@@ -221,7 +199,6 @@ func verifyRootRollbackAndSymlink(t *testing.T, root ports.RootHandle, fileRel p
 	requireErrIs(t, err, abortErr, "CreateExclusive 回调失败须透传错误")
 	_, err = root.Stat(abortedRel)
 	requireErrIs(t, err, ports.ErrNotFound, "CreateExclusive 回调失败不得残留半成品文件")
-
 	err = root.AtomicReplace(fileRel, 0o600, func(w io.Writer) error {
 		_, _ = w.Write([]byte("corrupt-overwrite"))
 		return abortErr
@@ -230,13 +207,11 @@ func verifyRootRollbackAndSymlink(t *testing.T, root ports.RootHandle, fileRel p
 	preserved, err := root.ReadAllBounded(fileRel, lim)
 	requireNoErr(t, err, "AtomicReplace 失败后重读原文件")
 	requireTrue(t, bytes.Equal(preserved, []byte("v2-replaced")), "AtomicReplace 回调失败必须保留原有文件内容")
-
 	// 绝对路径与沙箱逃逸软链目标在全平台均须拒绝。
 	badLink, err := pathalg.ParseLocalRootedDest("nested/sub/bad.link")
 	requireNoErr(t, err, "ParseLocalRootedDest(bad.link)")
 	requireErr(t, root.CreateSymlink(badLink, "/etc/passwd"), "CreateSymlink 必须拒绝绝对目标路径")
 	requireErr(t, root.CreateSymlink(badLink, "../../../escape"), "CreateSymlink 必须拒绝逃逸沙箱根的相对路径")
-
 	if checkSymlink {
 		relLink, lErr := pathalg.ParseLocalRootedDest("nested/sub/cfg.link")
 		requireNoErr(t, lErr, "ParseLocalRootedDest(cfg.link)")
@@ -244,10 +219,10 @@ func verifyRootRollbackAndSymlink(t *testing.T, root ports.RootHandle, fileRel p
 		lst, sErr := root.Lstat(relLink)
 		requireNoErr(t, sErr, "Lstat(cfg.link)")
 		requireTrue(t, lst.IsValid() && lst.IsSymlink(), "Lstat 须准确报告 IsSymlink()")
+		requireErrIs(t, root.Chtimes(relLink, BaseTime(), BaseTime()), ports.ErrSymlinkRejected, "Chtimes 必须拒绝符号链接")
 		requireNoErr(t, root.Remove(relLink), "Remove(cfg.link)")
 	}
 }
-
 func verifyRootMetadataAndRemove(t *testing.T, root ports.RootHandle, subDir, fileRel pathalg.LocalRootedDest) {
 	t.Helper()
 	info, err := root.Stat(fileRel)
@@ -256,42 +231,52 @@ func verifyRootMetadataAndRemove(t *testing.T, root ports.RootHandle, subDir, fi
 	linfo, err := root.Lstat(fileRel)
 	requireNoErr(t, err, "Lstat")
 	requireTrue(t, linfo.IsValid() && linfo.IsRegular(), "Lstat 元信息无效")
-
+	// 验证 RootHandle.Chtimes 参数守卫（零值/越界年份）、缺失路径报错以及常规文件与目录修改时间更新（支撑 scp -p）。
+	requireErrIs(t, root.Chtimes(fileRel, time.Time{}, BaseTime()), ports.ErrInvalidArgument, "Chtimes(zero atime)")
+	requireErrIs(t, root.Chtimes(fileRel, BaseTime(), time.Time{}), ports.ErrInvalidArgument, "Chtimes(zero mtime)")
+	outOfRangeTS := time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	requireErrIs(t, root.Chtimes(fileRel, BaseTime(), outOfRangeTS), ports.ErrInvalidArgument, "Chtimes(year > 9999)")
+	missingRel, err := pathalg.ParseLocalRootedDest("nested/sub/no-such-file.txt")
+	requireNoErr(t, err, "ParseLocalRootedDest(missing)")
+	requireErrIs(t, root.Chtimes(missingRel, BaseTime(), BaseTime()), ports.ErrNotFound, "Chtimes(missing)")
+	wantTS := BaseTime().Add(2 * time.Hour)
+	requireNoErr(t, root.Chtimes(fileRel, wantTS, wantTS), "Chtimes(valid file)")
+	tsInfo, err := root.Stat(fileRel)
+	requireNoErr(t, err, "Stat(after file Chtimes)")
+	requireTrue(t, tsInfo.ModTime().Truncate(time.Second).Equal(wantTS.Truncate(time.Second)), "Chtimes 后文件 Stat.ModTime 须反映新时间戳")
+	dirTS := BaseTime().Add(3 * time.Hour)
+	requireNoErr(t, root.Chtimes(subDir, dirTS, dirTS), "Chtimes(valid dir)")
+	dirInfo, err := root.Stat(subDir)
+	requireNoErr(t, err, "Stat(after dir Chtimes)")
+	requireTrue(t, dirInfo.IsValid() && dirInfo.IsDir() && dirInfo.ModTime().Truncate(time.Second).Equal(dirTS.Truncate(time.Second)), "Chtimes 后目录 Stat.ModTime 须反映新时间戳")
 	entries, err := root.ReadDir(algebraic.Some(subDir))
 	requireNoErr(t, err, "ReadDir(subDir)")
 	requireTrue(t, len(entries) == 1 && entries[0].IsValid() && entries[0].Name() == "config.yaml", "ReadDir(subDir) 结果不匹配")
-
 	rootEntries, err := root.ReadDir(algebraic.None[pathalg.LocalRootedDest]())
 	requireNoErr(t, err, "ReadDir(root)")
 	requireTrue(t, len(rootEntries) >= 1, "ReadDir(None) 须列举沙箱根目录内容")
-
 	requireNoErr(t, root.Remove(fileRel), "Remove")
 	requireErrIs(t, root.Remove(fileRel), ports.ErrNotFound, "重复 Remove 须返回 ErrNotFound")
 }
-
 func verifyRootLockingContract(t *testing.T, fsPort ports.ScopedRootFS, dir pathalg.LocalDir) {
 	t.Helper()
 	lockRel, err := pathalg.ParseLocalRootedDest("proc-01.lock")
 	requireNoErr(t, err, "ParseLocalRootedDest(lock)")
 	missingLock, err := pathalg.ParseLocalRootedDest("missing-no-create.lock")
 	requireNoErr(t, err, "ParseLocalRootedDest(missingLock)")
-
 	ctx := context.Background()
 	err = fsPort.WithRoot(dir, func(root ports.RootHandle) error {
 		verifyLockGuardsAndWriteTruncate(t, ctx, root, lockRel, missingLock)
 		return nil
 	})
 	requireNoErr(t, err, "WithRoot(LockWriteTruncate)")
-
 	verifyExclusiveLockContention(t, ctx, fsPort, dir, lockRel)
 	verifySharedLockConcurrency(t, ctx, fsPort, dir, lockRel)
-
 	err = fsPort.WithRoot(dir, func(root ports.RootHandle) error {
 		return root.Remove(lockRel)
 	})
 	requireNoErr(t, err, "锁释放后 Remove")
 }
-
 func verifyLockGuardsAndWriteTruncate(t *testing.T, ctx context.Context, root ports.RootHandle, lockRel, missingLock pathalg.LocalRootedDest) {
 	t.Helper()
 	var nilCtx context.Context
@@ -304,7 +289,6 @@ func verifyLockGuardsAndWriteTruncate(t *testing.T, ctx context.Context, root po
 	requireErr(t, err, "TryWithLockedFile(invalid mode)")
 	_, err = root.TryWithLockedFile(missingLock, ports.LockExclusive, false, 0o600, func(ports.LockedFile) error { return nil })
 	requireErrIs(t, err, ports.ErrNotFound, "TryWithLockedFile(create=false, missing)")
-
 	err = root.WithLockedFile(ctx, lockRel, ports.LockExclusive, true, 0o600, func(lf ports.LockedFile) error {
 		_, wErr := lf.Write([]byte("+op-1\n-op-1\n"))
 		requireNoErr(t, wErr, "LockedFile.Write")
@@ -321,7 +305,6 @@ func verifyLockGuardsAndWriteTruncate(t *testing.T, ctx context.Context, root po
 	})
 	requireNoErr(t, err, "WithLockedFile(WriteTruncate)")
 }
-
 func verifyExclusiveLockContention(t *testing.T, ctx context.Context, fsPort ports.ScopedRootFS, dir pathalg.LocalDir, lockRel pathalg.LocalRootedDest) {
 	t.Helper()
 	err := fsPort.WithRoot(dir, func(root ports.RootHandle) error {
@@ -335,7 +318,6 @@ func verifyExclusiveLockContention(t *testing.T, ctx context.Context, fsPort por
 	})
 	requireNoErr(t, err, "独占锁非阻塞探活与取消契约")
 }
-
 func runLockContentionPeers(ctx context.Context, fsPort ports.ScopedRootFS, dir pathalg.LocalDir, lockRel pathalg.LocalRootedDest, skipped *atomic.Int32) error {
 	return conc.RunWait(ctx, func(_ context.Context, n *conc.Nursery) error {
 		if err := n.Go(func(context.Context) error {
@@ -348,7 +330,6 @@ func runLockContentionPeers(ctx context.Context, fsPort ports.ScopedRootFS, dir 
 		})
 	})
 }
-
 func probeCanceledLock(ctx context.Context, fsPort ports.ScopedRootFS, dir pathalg.LocalDir, lockRel pathalg.LocalRootedDest) error {
 	return fsPort.WithRoot(dir, func(peer ports.RootHandle) error {
 		cctx, cancel := context.WithCancel(ctx)
@@ -363,7 +344,6 @@ func probeCanceledLock(ctx context.Context, fsPort ports.ScopedRootFS, dir patha
 		return nil
 	})
 }
-
 func verifySharedLockConcurrency(t *testing.T, ctx context.Context, fsPort ports.ScopedRootFS, dir pathalg.LocalDir, lockRel pathalg.LocalRootedDest) {
 	t.Helper()
 	err := fsPort.WithRoot(dir, func(root ports.RootHandle) error {
@@ -377,7 +357,6 @@ func verifySharedLockConcurrency(t *testing.T, ctx context.Context, fsPort ports
 	})
 	requireNoErr(t, err, "共享锁并发契约")
 }
-
 func runSharedLockPeers(ctx context.Context, fsPort ports.ScopedRootFS, dir pathalg.LocalDir, lockRel pathalg.LocalRootedDest, sharedOK, exclBlocked *atomic.Int32) error {
 	return conc.RunWait(ctx, func(_ context.Context, n *conc.Nursery) error {
 		if err := n.Go(func(context.Context) error {
@@ -390,7 +369,6 @@ func runSharedLockPeers(ctx context.Context, fsPort ports.ScopedRootFS, dir path
 		})
 	})
 }
-
 func probePeerLock(fsPort ports.ScopedRootFS, dir pathalg.LocalDir, lockRel pathalg.LocalRootedDest, mode ports.LockMode, wantAcq bool, counter *atomic.Int32) error {
 	return fsPort.WithRoot(dir, func(peer ports.RootHandle) error {
 		acq, err := peer.TryWithLockedFile(lockRel, mode, false, 0o600, func(ports.LockedFile) error { return nil })
@@ -405,16 +383,13 @@ func probePeerLock(fsPort ports.ScopedRootFS, dir pathalg.LocalDir, lockRel path
 func RunOperatorReadFSSuite(t *testing.T, fx OperatorReadFSFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewReader != nil && fx.RegularFile.IsValid() && fx.MissingFile.IsValid(), "OperatorReadFSFixture 缺少必需夹具字段")
-
 	t.Run("ValidationAndRegularRead", func(t *testing.T) {
 		reader := fx.NewReader(t)
 		var nilCtx context.Context
 		var zeroPath pathalg.LocalSourcePath
-
 		requireErrIs(t, reader.WithOperatorRead(nilCtx, fx.RegularFile, pathalg.SymlinkReject, func(ports.BoundedReadHandle, int64) error { return nil }), ports.ErrNilContext, "nil ctx")
 		requireErrIs(t, reader.WithOperatorRead(context.Background(), fx.RegularFile, pathalg.SymlinkReject, nil), ports.ErrNilCallback, "nil fn")
 		requireErr(t, reader.WithOperatorRead(context.Background(), zeroPath, pathalg.SymlinkReject, func(ports.BoundedReadHandle, int64) error { return nil }), "zero path")
-
 		var got []byte
 		err := reader.WithOperatorRead(context.Background(), fx.RegularFile, pathalg.SymlinkReject, func(r ports.BoundedReadHandle, size int64) error {
 			requireTrue(t, size == int64(len(fx.ExpectedContent)), "文件大小与预期不符")
@@ -432,17 +407,14 @@ func RunOperatorReadFSSuite(t *testing.T, fx OperatorReadFSFixture) {
 		})
 		requireNoErr(t, err, "WithOperatorRead(regular)")
 		requireTrue(t, bytes.Equal(got, fx.ExpectedContent), "WithOperatorRead 内容与预期不符")
-
 		err = reader.WithOperatorRead(context.Background(), fx.MissingFile, pathalg.SymlinkReject, func(ports.BoundedReadHandle, int64) error { return nil })
 		requireErrIs(t, err, ports.ErrNotFound, "读取不存在文件须返回 ErrNotFound")
 	})
-
 	if fx.SymlinkFile.IsValid() {
 		t.Run("SymlinkPolicyEnforcement", func(t *testing.T) {
 			reader := fx.NewReader(t)
 			err := reader.WithOperatorRead(context.Background(), fx.SymlinkFile, pathalg.SymlinkReject, func(ports.BoundedReadHandle, int64) error { return nil })
 			requireErrIs(t, err, ports.ErrSymlinkRejected, "SymlinkReject 必须拒绝符号链接")
-
 			var got []byte
 			err = reader.WithOperatorRead(context.Background(), fx.SymlinkFile, pathalg.SymlinkFollowOperatorSource, func(r ports.BoundedReadHandle, _ int64) error {
 				var rErr error

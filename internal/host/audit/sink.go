@@ -48,6 +48,7 @@ type FileSink struct {
 	stageMu     sync.Mutex
 	active      map[security.OperationID]struct{}
 	truncations atomic.Uint64
+	cleanClose  atomic.Bool // Close 时仅当 active 为空才置 true，控制是否截断并删除 .lock（ADR-008）
 	valid       bool
 	closed      bool
 }
@@ -161,11 +162,11 @@ func (s *FileSink) holdProcessLockInRoot(root ports.RootHandle, signalReady func
 		signalReady(ports.ErrLockBusy)
 		return nil
 	}
-	if !cleanShutdown {
+	if !cleanShutdown || !s.cleanClose.Load() {
 		return nil
 	}
-	// 此时 TryWithLockedFile 已释放锁并关闭文件句柄，经 osfs.RemoveLockedFileSafely 按三平台安全协议删除锁文件，
-	// 若并发 FileReconciler 恰已接管该空锁文件则和平让出并忽略 ErrNotFound，彻底规避 Windows 共享冲突。
+	// 仅在活跃集合归零的正常关闭路径，经 osfs.RemoveLockedFileSafely 按三平台安全协议删除锁文件；
+	// 若仍有未闭合操作（cleanClose==false），故意保留已解锁且含活跃条目的 .lock 供下次启动崩溃对账补写 AbortedByCrash。
 	if _, rmErr := osfs.RemoveLockedFileSafely(root, s.lockDest); rmErr != nil {
 		return rmErr
 	}
@@ -178,8 +179,12 @@ func (s *FileSink) serveLockCommands(lf ports.LockedFile) error {
 		case cmd := <-s.cmdCh:
 			cmd.reply <- applyLockCommand(lf, cmd)
 		case <-s.closeCh:
-			// 正常关闭路径：仍在持独占锁态截断清空并归零偏移刷盘，随后退出闭包解锁关闭。
-			return truncateAndRewind(lf)
+			if s.cleanClose.Load() {
+				// 活跃集合为空的正常关闭：持独占锁态截断清空并归零偏移刷盘，随后退出闭包解锁删除。
+				return truncateAndRewind(lf)
+			}
+			// 仍有未闭合操作（如 Halted 熔断退出）：绝不截断 .lock，仅同步刷盘后退出闭包释放内核锁。
+			return lf.Sync()
 		}
 	}
 }
@@ -347,7 +352,9 @@ func wrapAuditRecordError(entry ports.AuditEntry, cause error) error {
 	return fmt.Errorf("%w: %w", ports.ErrAuditWriteFailed, cause)
 }
 
-// Close 幂等清空并释放进程级 .lock 内核锁、按三平台安全协议删除锁文件，并等待锁持有协程彻底退出。
+// Close 幂等释放进程级 .lock 内核锁并等待锁持有协程彻底退出：
+// 仅当活跃未闭合操作集合为空时截断清空并按三平台安全协议删除锁文件；
+// 若仍存在未闭合操作（如 AuditPostWriteError 触发 Halted 熔断），仅刷盘释放内核锁并保留 .lock 供启动期崩溃对账恢复。
 func (s *FileSink) Close() error {
 	if s == nil || !s.valid {
 		return fmt.Errorf("%w: FileSink 未初始化", ports.ErrInvalidArgument)
@@ -357,6 +364,9 @@ func (s *FileSink) Close() error {
 		s.rwMu.Unlock()
 		return nil
 	}
+	s.stageMu.Lock()
+	s.cleanClose.Store(len(s.active) == 0)
+	s.stageMu.Unlock()
 	s.closed = true
 	close(s.closeCh)
 	s.rwMu.Unlock()

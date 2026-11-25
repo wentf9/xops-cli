@@ -4,12 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
 	"io"
 	"io/fs"
 	"sync/atomic"
-
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
 )
 
 // EnsureDir 跨平台安全确保本地根目录 dir 存在且末段非符号链接：
@@ -60,7 +59,6 @@ func (o *OperatorFS) WithOperatorRead(ctx context.Context, path pathalg.LocalSou
 	defer func() { active.Store(false); _ = f.Close() }()
 	return fn(&borrowedReader{r: f, active: &active}, size)
 }
-
 func checkOperatorReadArgs(ctx context.Context, o *OperatorFS, path pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, fnNil bool) error {
 	switch {
 	case ctx == nil:
@@ -74,14 +72,9 @@ func checkOperatorReadArgs(ctx context.Context, o *OperatorFS, path pathalg.Loca
 	}
 }
 
-type boundedReaderAt interface {
-	io.Reader
-	io.ReaderAt
-}
-
 // borrowedReader / borrowedWriter 在作用域关闭后拒绝一切读写，并对读取施加溢出安全字节上限。
 type borrowedReader struct {
-	r                   boundedReaderAt
+	r                   ports.BoundedReadHandle
 	remaining, maxBytes int64
 	limited             bool
 	active              *atomic.Bool
@@ -99,12 +92,7 @@ func (b *borrowedReader) Read(p []byte) (int, error) {
 	}
 	if b.remaining <= 0 {
 		var probe [1]byte
-		if n, err := b.r.Read(probe[:]); n > 0 {
-			return 0, ports.ErrLimitExceeded
-		} else if err != nil {
-			return 0, err
-		}
-		return 0, io.EOF
+		return 0, mapProbeEOF(b.r.Read(probe[:]))
 	}
 	if int64(len(p)) > b.remaining {
 		p = p[:b.remaining]
@@ -122,33 +110,28 @@ func (b *borrowedReader) ReadAt(p []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, fmt.Errorf("%w: ReadAt 偏移不能为负", ports.ErrInvalidArgument)
 	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	if !b.limited {
-		return b.r.ReadAt(p, off)
+	if len(p) == 0 || !b.limited {
+		return pickIf(len(p) == 0, func() (int, error) { return 0, nil }, func() (int, error) { return b.r.ReadAt(p, off) })()
 	}
 	if off >= b.maxBytes {
-		return 0, b.probeLimitAt(off)
+		var probe [1]byte
+		return 0, mapProbeEOF(b.r.ReadAt(probe[:], off))
 	}
 	if avail := b.maxBytes - off; int64(len(p)) > avail {
 		n, err := b.r.ReadAt(p[:avail], off)
 		if err != nil || int64(n) < avail {
 			return n, err
 		}
-		return n, b.probeLimitAt(b.maxBytes)
+		var probe [1]byte
+		return n, mapProbeEOF(b.r.ReadAt(probe[:], b.maxBytes))
 	}
 	return b.r.ReadAt(p, off)
 }
-
-func (b *borrowedReader) probeLimitAt(off int64) error {
-	var probe [1]byte
-	if n, err := b.r.ReadAt(probe[:], off); n > 0 {
+func mapProbeEOF(n int, err error) error {
+	if n > 0 {
 		return ports.ErrLimitExceeded
-	} else if err != nil && !errors.Is(err, io.EOF) {
-		return err
 	}
-	return io.EOF
+	return pickIf[error](err != nil && !errors.Is(err, io.EOF), err, io.EOF)
 }
 
 type borrowedWriter struct {

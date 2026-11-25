@@ -5,12 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/internal/foundation/actor"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
+	"slices"
 )
 
 // WithLease 按不可变 Merkle 连接计划申请单条同步借用连接租约，在即将进入用户回调 fn 前注入
@@ -19,11 +18,7 @@ import (
 //
 //xops:syncclosure
 //xops:borrowed
-func (p *Pool) WithLease(
-	ctx context.Context,
-	connPlan plan.SealedConnectionPlan,
-	fn func(ctx context.Context, lease *Lease) error,
-) error {
+func (p *Pool) WithLease(ctx context.Context, connPlan plan.SealedConnectionPlan, fn func(ctx context.Context, lease *Lease) error) error {
 	if err := p.checkAcquirePreconditions(ctx, fn != nil); err != nil {
 		return err
 	}
@@ -36,13 +31,7 @@ func (p *Pool) WithLease(
 	}
 	return p.invokeSingleLease(ctx, connPlan, inst, fn)
 }
-
-func (p *Pool) invokeSingleLease(
-	ctx context.Context,
-	connPlan plan.SealedConnectionPlan,
-	inst *hopInstance,
-	fn func(ctx context.Context, lease *Lease) error,
-) error {
+func (p *Pool) invokeSingleLease(ctx context.Context, connPlan plan.SealedConnectionPlan, inst *hopInstance, fn func(ctx context.Context, lease *Lease) error) error {
 	leaseID := p.nextLeaseID()
 	scope, err := trace.NewLeaseScope(p.domain, leaseID)
 	if err != nil {
@@ -57,11 +46,7 @@ func (p *Pool) invokeSingleLease(
 		return err
 	}
 	lease := newLease(p, inst, connPlan.PlanDigest(), leaseID)
-	defer func() {
-		lease.invalidate()
-		cleanupCtx()
-		p.releaseHopLease(inst)
-	}()
+	defer func() { lease.invalidate(); cleanupCtx(); p.releaseHopLease(inst) }()
 	if err := p.checkPreCallbackAlive(inst); err != nil {
 		return err
 	}
@@ -74,11 +59,7 @@ func (p *Pool) invokeSingleLease(
 //
 //xops:syncclosure
 //xops:borrowed
-func (p *Pool) WithMultiLease(
-	ctx context.Context,
-	plans []plan.SealedConnectionPlan,
-	fn func(ctx context.Context, leases []*Lease) error,
-) error {
+func (p *Pool) WithMultiLease(ctx context.Context, plans []plan.SealedConnectionPlan, fn func(ctx context.Context, leases []*Lease) error) error {
 	if err := p.checkAcquirePreconditions(ctx, fn != nil); err != nil {
 		return err
 	}
@@ -127,7 +108,6 @@ func canonicalizePlanList(plans []plan.SealedConnectionPlan) ([]plan.SealedConne
 	}
 	return unique, origToUnique, nil
 }
-
 func (p *Pool) acquireCanonicalPlans(ctx context.Context, uniquePlans []plan.SealedConnectionPlan) ([]*hopInstance, error) {
 	acquired := make([]*hopInstance, 0, len(uniquePlans))
 	for _, pl := range uniquePlans {
@@ -140,14 +120,7 @@ func (p *Pool) acquireCanonicalPlans(ctx context.Context, uniquePlans []plan.Sea
 	}
 	return acquired, nil
 }
-
-func (p *Pool) invokeMultiLease(
-	ctx context.Context,
-	origPlans []plan.SealedConnectionPlan,
-	origToUnique []int,
-	acquired []*hopInstance,
-	fn func(ctx context.Context, leases []*Lease) error,
-) error {
+func (p *Pool) invokeMultiLease(ctx context.Context, origPlans []plan.SealedConnectionPlan, origToUnique []int, acquired []*hopInstance, fn func(ctx context.Context, leases []*Lease) error) error {
 	leaseID := p.nextLeaseID()
 	scope, err := trace.NewLeaseScope(p.domain, leaseID)
 	if err != nil {
@@ -177,13 +150,9 @@ func (p *Pool) invokeMultiLease(
 	}
 	return fn(scopedCtx, leases)
 }
-
 func (p *Pool) checkPreCallbackAlive(insts ...*hopInstance) error {
-	if p.halted.Load() {
-		return p.haltCause()
-	}
-	if p.closed.Load() {
-		return ErrPoolClosed
+	if err := checkPoolAvailable(p); err != nil {
+		return err
 	}
 	for _, inst := range insts {
 		if inst == nil || !inst.active.Load() {
@@ -192,74 +161,51 @@ func (p *Pool) checkPreCallbackAlive(insts ...*hopInstance) error {
 	}
 	return nil
 }
-
 func combineRevocableContexts(parent context.Context, insts []*hopInstance) (context.Context, []func()) {
-	cur := parent
-	cleanups := make([]func(), 0, len(insts))
+	cur, cleanups := parent, make([]func(), 0, len(insts))
 	for _, inst := range insts {
 		next, cleanup := deriveRevocableContext(cur, inst.revokeCtx)
-		cur = next
-		cleanups = append(cleanups, cleanup)
+		cur, cleanups = next, append(cleanups, cleanup)
 	}
 	return cur, cleanups
 }
-
 func runCleanupsReverse(cleanups []func()) {
 	for i := len(cleanups) - 1; i >= 0; i-- {
 		cleanups[i]()
 	}
 }
-
 func (p *Pool) releaseAllHops(insts []*hopInstance) {
 	for i := len(insts) - 1; i >= 0; i-- {
 		p.releaseHopLease(insts[i])
 	}
 }
-
 func (p *Pool) checkAcquirePreconditions(ctx context.Context, hasFn bool) error {
-	if p == nil || !p.initialized {
-		return ErrPoolNotInitialized
+	if err := checkPoolAvailable(p); err != nil {
+		return err
 	}
-	if ctx == nil {
+	switch {
+	case ctx == nil:
 		return ErrNilContext
-	}
-	if !hasFn {
+	case !hasFn:
 		return ErrNilCallback
-	}
-	if p.halted.Load() {
-		return p.haltCause()
-	}
-	if p.closed.Load() {
-		return ErrPoolClosed
 	}
 	if err := trace.CheckNonReentrant(ctx); err != nil {
 		return err
 	}
 	return ctx.Err()
 }
-
 func (p *Pool) acquirePlan(ctx context.Context, connPlan plan.SealedConnectionPlan) (*hopInstance, error) {
 	leafDig, ok := connPlan.HopDigestAt(connPlan.Len() - 1)
 	if !ok {
 		return nil, ErrInvalidPlan
 	}
 	tid, oid := traceFromContextOrDefault(ctx, p.poolTraceID)
-	w := newAcquireWaiter(tid, oid)
-	inst, err := p.submitAcquire(ctx, acquireMsg{
-		kind:      acqFastPlan,
-		connPlan:  connPlan,
-		hopDigest: leafDig,
-		waiter:    w,
-	})
-	if err == nil {
-		return inst, nil
-	}
-	if !errors.Is(err, errFastPathMiss) {
-		return nil, err
+	inst, err := p.submitAcquire(ctx, acquireMsg{kind: acqFastPlan, connPlan: connPlan, hopDigest: leafDig, waiter: newAcquireWaiter(tid, oid)})
+	if err == nil || !errors.Is(err, errFastPathMiss) {
+		return inst, err
 	}
 	return p.acquireMultiHopPlan(ctx, connPlan)
 }
-
 func (p *Pool) acquireMultiHopPlan(ctx context.Context, connPlan plan.SealedConnectionPlan) (*hopInstance, error) {
 	var parent *hopInstance
 	var parentEpoch uint64
@@ -286,31 +232,13 @@ func (p *Pool) acquireMultiHopPlan(ctx context.Context, connPlan plan.SealedConn
 	}
 	return parent, nil
 }
-
-func (p *Pool) acquireHop(
-	ctx context.Context,
-	hop plan.HopSpec,
-	dig plan.HopDigest,
-	pdOpt algebraic.Option[plan.PlanDigest],
-	parent *hopInstance,
-	parentEpoch uint64,
-) (*hopInstance, error) {
+func (p *Pool) acquireHop(ctx context.Context, hop plan.HopSpec, dig plan.HopDigest, pdOpt algebraic.Option[plan.PlanDigest], parent *hopInstance, parentEpoch uint64) (*hopInstance, error) {
 	tid, oid := traceFromContextOrDefault(ctx, p.poolTraceID)
-	w := newAcquireWaiter(tid, oid)
-	return p.submitAcquire(ctx, acquireMsg{
-		kind:        acqHop,
-		hopSpec:     hop,
-		hopDigest:   dig,
-		planDigest:  pdOpt,
-		parent:      parent,
-		parentEpoch: parentEpoch,
-		waiter:      w,
-	})
+	return p.submitAcquire(ctx, acquireMsg{kind: acqHop, hopSpec: hop, hopDigest: dig, planDigest: pdOpt, parent: parent, parentEpoch: parentEpoch, waiter: newAcquireWaiter(tid, oid)})
 }
-
 func (p *Pool) submitAcquire(ctx context.Context, msg acquireMsg) (*hopInstance, error) {
 	if err := p.actor.SendAcquire(ctx, msg); err != nil {
-		return nil, p.translateActorSendError(err)
+		return nil, pickIf(errors.Is(err, actor.ErrActorStopped), p.terminalStateError(), err)
 	}
 	select {
 	case rep := <-msg.waiter.replyCh:
@@ -321,29 +249,16 @@ func (p *Pool) submitAcquire(ctx context.Context, msg acquireMsg) (*hopInstance,
 		return p.cancelOrDrainWaiter(msg, p.terminalStateError())
 	}
 }
-
 func (p *Pool) cancelOrDrainWaiter(msg acquireMsg, fallbackErr error) (*hopInstance, error) {
 	if msg.waiter.tryCancel() {
-		p.actor.SendControl(controlMsg{
-			kind:      ctrlCancelWaiter,
-			hopDigest: msg.hopDigest,
-			waiter:    msg.waiter,
-		})
+		p.actor.SendControl(controlMsg{kind: ctrlCancelWaiter, hopDigest: msg.hopDigest, waiter: msg.waiter})
 		return nil, fallbackErr
 	}
 	// Actor 已先赢得 CAS 并将结果写入 replyCh，立即接收并在已授予租约时经控制通道归还防泄漏。
-	rep := <-msg.waiter.replyCh
-	if rep.err == nil && rep.inst != nil {
+	if rep := <-msg.waiter.replyCh; rep.err == nil && rep.inst != nil {
 		p.releaseHopLease(rep.inst)
 	}
 	return nil, fallbackErr
-}
-
-func (p *Pool) translateActorSendError(err error) error {
-	if errors.Is(err, actor.ErrActorStopped) {
-		return p.terminalStateError()
-	}
-	return err
 }
 
 // releaseHopLease 经 DualActor 永不阻塞控制通道归还单跳租约并等待 Actor 线性化完成；
@@ -354,11 +269,7 @@ func (p *Pool) releaseHopLease(inst *hopInstance) {
 		return
 	}
 	doneCh := make(chan struct{})
-	if !p.actor.SendControl(controlMsg{
-		kind:   ctrlReleaseLease,
-		inst:   inst,
-		doneCh: doneCh,
-	}) {
+	if !p.actor.SendControl(controlMsg{kind: ctrlReleaseLease, inst: inst, doneCh: doneCh}) {
 		p.activeLeases.Add(-1)
 		return
 	}

@@ -77,9 +77,7 @@ func TestSim_TCK_StoreAndConfig(t *testing.T) {
 		})
 	})
 
-	t.Run("JournalStore", func(t *testing.T) {
-		tck.RunJournalStoreSuite(t, func(*testing.T) ports.JournalStore { return sim.NewSimJournalStore() })
-	})
+	t.Run("JournalStore", runJournalStoreTCK)
 
 	t.Run("FormatImporter", func(t *testing.T) {
 		tck.RunFormatImporterSuite(t, tck.FormatImporterFixture{
@@ -91,6 +89,40 @@ func TestSim_TCK_StoreAndConfig(t *testing.T) {
 	})
 
 	t.Run("OpenSSHConfigSource", runOpenSSHConfigTCK)
+}
+
+func runJournalStoreTCK(t *testing.T) {
+	tck.RunJournalStoreSuite(t, tck.JournalStoreFixture{
+		NewStore: func(*testing.T) ports.JournalStore { return sim.NewSimJournalStore() },
+		CorruptGeneration: func(_ *testing.T, s ports.JournalStore, id security.OperationID, gen uint64) {
+			s.(*sim.SimJournalStore).CorruptGeneration(id, gen, ports.ErrCorruptData)
+		},
+	})
+	// 验证 SimJournalStore 模拟尾部撕裂损坏时保留有效前缀 PartialRecords()，头部空损坏时 PartialRecords()==nil。
+	js := sim.NewSimJournalStore()
+	ctx := context.Background()
+	id, err := security.NewOperationIDFrom(tck.NewDeterministicEntropy(91))
+	if err != nil {
+		t.Fatalf("NewOperationIDFrom: %v", err)
+	}
+	prefix := tck.MustV2JournalChainGen(t, id, 2)[:4]
+	for _, rec := range prefix {
+		if err := js.Append(ctx, rec); err != nil {
+			t.Fatalf("Append(prefix): %v", err)
+		}
+	}
+	js.CorruptGeneration(id, 2, ports.ErrCorruptData)
+	js.CorruptGeneration(id, 3, ports.ErrCorruptData)
+	snaps, err := js.LoadGenerations(ctx, id)
+	if err != nil || len(snaps) != 2 {
+		t.Fatalf("LoadGenerations: snaps=%d err=%v", len(snaps), err)
+	}
+	if !snaps[0].Corrupt() || snaps[0].Records() != nil || len(snaps[0].PartialRecords()) != len(prefix) {
+		t.Fatalf("Gen 2 撕裂损坏须保留全部 %d 条前缀且 Records()==nil: got=%d", len(prefix), len(snaps[0].PartialRecords()))
+	}
+	if !snaps[1].Corrupt() || snaps[1].Records() != nil || snaps[1].PartialRecords() != nil {
+		t.Fatalf("Gen 3 头部空损坏须返回 Records()==nil 且 PartialRecords()==nil")
+	}
 }
 
 func runOpenSSHConfigTCK(t *testing.T) {
@@ -221,11 +253,25 @@ func TestSim_TCK_VaultAndTransport(t *testing.T) {
 		listenPath := mustParseLocalSource(t, "/sim/mux/ops@10.0.0.2:2222.sock")
 		tck.RunMuxSocketSuite(t, tck.MuxSocketFixture{
 			NewMux: func(*testing.T) (ports.MuxSocketPort, pathalg.LocalSourcePath) {
-				mux := sim.NewSimMuxSocket(nil)
+				dialer := sim.NewSimDialer(sim.NewSimClock(tck.BaseTime()), sim.NewSeededRand(204))
+				mux := sim.NewSimMuxSocket(dialer)
 				mux.RegisterMaster(existing, 9001)
 				return mux, listenPath
 			},
 			ExistingSocket: algebraic.Some(existing),
+			NewUpstream: func(t *testing.T) ports.TransportConn {
+				dialer := sim.NewSimDialer(sim.NewSimClock(tck.BaseTime()), sim.NewSeededRand(205))
+				single, _ := tck.MustHopAndPlan(t)
+				hop0, _ := single.HopAt(0)
+				dig0, _ := single.HopDigestAt(0)
+				c, err := dialer.DialHop(context.Background(), hop0, dig0, nil)
+				if err != nil {
+					t.Fatalf("DialHop(mux upstream): %v", err)
+				}
+				t.Cleanup(func() { _ = c.Close() })
+				return c
+			},
+			NewForwarder: func(*testing.T) ports.ForwarderPort { return sim.NewSimForwarder() },
 		})
 	})
 }
@@ -488,7 +534,10 @@ func runDownstreamPortsTCK(t *testing.T) {
 	fLocal, _ := ports.NewForwardSpec(ports.ForwardLocal, "127.0.0.1:8080", "10.0.0.5:80")
 	fRemote, _ := ports.NewForwardSpec(ports.ForwardRemote, "0.0.0.0:9090", "127.0.0.1:3000")
 	fDyn, _ := ports.NewForwardSpec(ports.ForwardDynamic, "127.0.0.1:1080", "")
-	fSL, _ := ports.NewForwardSpec(ports.ForwardStreamLocal, "/tmp/local.sock", "/run/remote.sock")
+	fLocalUnix, _ := ports.NewTypedForwardSpec(ports.ForwardLocal, ports.ForwardEndpointUnix, "/tmp/local.sock", ports.ForwardEndpointUnix, "/run/remote.sock")
+	fLocalMix, _ := ports.NewTypedForwardSpec(ports.ForwardLocal, ports.ForwardEndpointTCP, "127.0.0.1:8081", ports.ForwardEndpointUnix, "/run/remote-mix.sock")
+	fRemoteUnix, _ := ports.NewTypedForwardSpec(ports.ForwardRemote, ports.ForwardEndpointUnix, "/run/remote-bind.sock", ports.ForwardEndpointUnix, "/tmp/local-target.sock")
+	fRemoteMix, _ := ports.NewTypedForwardSpec(ports.ForwardRemote, ports.ForwardEndpointUnix, "/run/remote-mix-bind.sock", ports.ForwardEndpointTCP, "127.0.0.1:3001")
 	tunP2P, _ := ports.NewTUNSpec(ports.TUNModePointToPoint, 0, ports.TUNUnitAny)
 	fTUNP2P, _ := ports.NewForwardTUNSpec(tunP2P)
 	tunEth, _ := ports.NewTUNSpec(ports.TUNModeEthernet, 2, 3)
@@ -497,7 +546,18 @@ func runDownstreamPortsTCK(t *testing.T) {
 		NewForwarder: func(t *testing.T) (ports.ForwarderPort, ports.TunnelTransport) {
 			return sim.NewSimForwarder(), openSimConn(t)
 		},
-		Specs: []ports.ForwardSpec{fLocal, fRemote, fDyn, fSL, fTUNP2P, fTUNEth},
+		Specs: []ports.ForwardSpec{fLocal, fRemote, fDyn, fLocalUnix, fLocalMix, fRemoteUnix, fRemoteMix, fTUNP2P, fTUNEth},
+		ExerciseHandle: func(ctx context.Context, h ports.ForwardHandle) error {
+			return h.(*sim.SimForwardHandle).OpenChannel(ctx)
+		},
+	})
+	tck.RunTUNDeviceSuite(t, tck.TUNDeviceFixture{
+		NewDevice: func(*testing.T) ports.TUNDevicePort { return sim.NewSimTUNDevicePort() },
+		NewUnavailableDevice: func(*testing.T) ports.TUNDevicePort {
+			d := sim.NewSimTUNDevicePort()
+			d.SetAvailable(false)
+			return d
+		},
 	})
 }
 

@@ -5,15 +5,14 @@ package osfs
 import (
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/ports"
+	"golang.org/x/sys/windows"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"unsafe"
-
-	"github.com/wentf9/xops-cli/core/domain/security"
-	"github.com/wentf9/xops-cli/core/ports"
-	"golang.org/x/sys/windows"
 )
 
 const (
@@ -44,7 +43,6 @@ func ProcessUserSID(pid uint32) (*windows.SID, error) {
 	defer func() { _ = windows.CloseHandle(h) }()
 	return tokenUserSIDForProcess(h)
 }
-
 func tokenUserSIDForProcess(procHandle windows.Handle) (*windows.SID, error) {
 	var tok windows.Token
 	if err := windows.OpenProcessToken(procHandle, windows.TOKEN_QUERY, &tok); err != nil {
@@ -64,7 +62,6 @@ func IsTrustedPrincipalSID(sid, currentUserSID *windows.SID) bool {
 		sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) ||
 		(currentUserSID != nil && currentUserSID.IsValid() && sid.Equals(currentUserSID)))
 }
-
 func sidAccessEntry(sid *windows.SID, t windows.TRUSTEE_TYPE, inh uint32) windows.EXPLICIT_ACCESS {
 	return windows.EXPLICIT_ACCESS{
 		AccessPermissions: windows.GENERIC_ALL, AccessMode: windows.SET_ACCESS, Inheritance: inh,
@@ -102,7 +99,6 @@ func NewOwnerOnlySecurityDescriptor(ownerSID *windows.SID, inheritance uint32) (
 	runtime.KeepAlive(sd)
 	return relSD, err
 }
-
 func currentOwnerOnlySD(inheritance uint32) (*windows.SECURITY_DESCRIPTOR, *windows.SID, error) {
 	currSID, err := CurrentProcessUserSID()
 	if err != nil {
@@ -114,7 +110,6 @@ func currentOwnerOnlySD(inheritance uint32) (*windows.SECURITY_DESCRIPTOR, *wind
 	}
 	return sd, currSID, nil
 }
-
 func createWindowsOwnerOnlyFile(fullPath string, disposition uint32) (*os.File, error) {
 	sd, _, err := currentOwnerOnlySD(windows.NO_INHERITANCE)
 	if err != nil {
@@ -140,7 +135,6 @@ func OpenObjectHandleNoFollow(path string, desiredAccess uint32) (windows.Handle
 	h, info, err := openObjectHandleInfoNoFollow(path, desiredAccess)
 	return h, info.FileAttributes, err
 }
-
 func openObjectHandleInfoNoFollow(path string, desiredAccess uint32) (windows.Handle, windows.ByHandleFileInformation, error) {
 	var info windows.ByHandleFileInformation
 	if strings.TrimSpace(path) == "" {
@@ -184,7 +178,6 @@ func EnsureOwnerOnlyDirectory(dir string) error {
 	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
 	return createMissingDirsWin(toCreate, sa, sd, currSID)
 }
-
 func checkDirAttrsNoFollowWin(p string) error {
 	h, attrs, err := OpenObjectHandleNoFollow(p, windows.READ_CONTROL)
 	if err != nil {
@@ -199,7 +192,6 @@ func checkDirAttrsNoFollowWin(p string) error {
 	}
 	return nil
 }
-
 func createMissingDirsWin(toCreate []string, sa *windows.SecurityAttributes, sd *windows.SECURITY_DESCRIPTOR, ownerSID *windows.SID) error {
 	for i := len(toCreate) - 1; i >= 0; i-- {
 		p := toCreate[i]
@@ -213,19 +205,12 @@ func createMissingDirsWin(toCreate []string, sa *windows.SecurityAttributes, sd 
 		if createErr != nil && !errors.Is(createErr, windows.ERROR_ALREADY_EXISTS) {
 			return mapWindowsOpenError(p, createErr)
 		}
-		var vErr error
-		if ownerSID != nil {
-			vErr = VerifyOwnerOnlyDirectoryByHandle(p, ownerSID)
-		} else {
-			vErr = checkDirAttrsNoFollowWin(p)
-		}
-		if vErr != nil {
-			return vErr
+		if err := pickIf(ownerSID != nil, func() error { return VerifyOwnerOnlyDirectoryByHandle(p, ownerSID) }, func() error { return checkDirAttrsNoFollowWin(p) })(); err != nil {
+			return err
 		}
 	}
 	return nil
 }
-
 func collectMissingDirs(dir string) (string, []string, error) {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
@@ -245,7 +230,6 @@ func collectMissingDirs(dir string) (string, []string, error) {
 		toCreate, cur = append(toCreate, cur), parent
 	}
 }
-
 func openWinSecHandleChecked(path string, access uint32, expectDir, expectSocket bool) (windows.Handle, uint32, error) {
 	handle, attrs, err := OpenObjectHandleNoFollow(path, access)
 	if err != nil {
@@ -264,13 +248,12 @@ func openWinSecHandleChecked(path string, access uint32, expectDir, expectSocket
 }
 
 // HardenDirectoryOwnerOnly / HardenSocketOwnerOnly 通过无跟随句柄应用受保护 Owner-Only DACL。
-func HardenDirectoryOwnerOnly(dir string) error {
-	return hardenObjectOwnerOnlyByHandle(dir, true, false, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+func HardenDirectoryOwnerOnly(d string) error {
+	return hardenObjectOwnerOnlyByHandle(d, true, false, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 }
 func HardenSocketOwnerOnly(p string) error {
 	return hardenObjectOwnerOnlyByHandle(p, false, true, windows.NO_INHERITANCE)
 }
-
 func hardenObjectOwnerOnlyByHandle(path string, expectDir, expectSocket bool, inheritance uint32) error {
 	sd, _, err := currentOwnerOnlySD(inheritance)
 	if err != nil {
@@ -300,7 +283,6 @@ func VerifyOwnerOnlyFileByHandle(f string, s *windows.SID) error {
 func VerifyOwnerOnlySocketByHandle(p string) error {
 	return verifyOwnerOnlyPathByHandle(p, false, true, nil)
 }
-
 func verifyOwnerOnlyPathByHandle(path string, expectDir, expectSocket bool, currSID *windows.SID) error {
 	if currSID == nil {
 		var err error
@@ -331,7 +313,6 @@ func verifyOwnerOnlyPathByHandle(path string, expectDir, expectSocket bool, curr
 	}
 	return nil
 }
-
 func verifyAFUnixReparseHandle(handle windows.Handle, path string) error {
 	var tag winFileAttributeTagInfo
 	if err := windows.GetFileInformationByHandleEx(handle, windows.FileAttributeTagInfo, (*byte)(unsafe.Pointer(&tag)), uint32(unsafe.Sizeof(tag))); err != nil {
@@ -342,7 +323,6 @@ func verifyAFUnixReparseHandle(handle windows.Handle, path string) error {
 	}
 	return nil
 }
-
 func parseWindowsACL(dacl *windows.ACL, currSID *windows.SID) ([]ParsedWindowsACE, error) {
 	aces := make([]ParsedWindowsACE, 0, dacl.AceCount)
 	for i := range uint32(dacl.AceCount) {
@@ -358,7 +338,6 @@ func parseWindowsACL(dacl *windows.ACL, currSID *windows.SID) ([]ParsedWindowsAC
 	}
 	return aces, nil
 }
-
 func decodeSingleWindowsACE(ace *windows.ACCESS_ALLOWED_ACE, currSID *windows.SID) (ParsedWindowsACE, error) {
 	if uintptr(ace.Header.AceSize) < unsafe.Sizeof(windows.ACE_HEADER{}) {
 		return ParsedWindowsACE{}, fmt.Errorf("%w: ACE 头部畸形", ErrInsecurePermissions)

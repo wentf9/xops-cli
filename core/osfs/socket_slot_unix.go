@@ -6,12 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"io/fs"
 	"net"
 	"os"
 	"syscall"
-
-	"golang.org/x/sys/unix"
 )
 
 type socketFileID = os.FileInfo
@@ -23,7 +22,6 @@ func validateControlSocketPathOS(raw string) (ControlSocketPath, error) {
 func isConnRefusedOS(err error) bool       { return errors.Is(err, syscall.ECONNREFUSED) }
 func isAddrInUseOS(err error) bool         { return errors.Is(err, syscall.EADDRINUSE) }
 func isSocketUnlinkRetryableOS(error) bool { return false }
-
 func inspectSocketEntryOS(nativePath string) (socketFileID, SocketProbeStatus, error) {
 	fi, err := os.Lstat(nativePath)
 	if err != nil {
@@ -34,7 +32,6 @@ func inspectSocketEntryOS(nativePath string) (socketFileID, SocketProbeStatus, e
 	}
 	return fi, pickIf(fi.Mode()&fs.ModeSocket == 0, SocketProbeNotSocket, SocketProbeUnknown), nil
 }
-
 func verifySocketTargetBeforeDialOS(nativePath string) error {
 	_, status, err := inspectSocketEntryOS(nativePath)
 	switch {
@@ -66,7 +63,6 @@ func withSocketDirLockOS(ctx context.Context, dir string, createDir bool, fn fun
 	defer func() { _ = unlockFileOS(dirFile) }()
 	return fn()
 }
-
 func listenSocketLockedOS(ctx context.Context, path ControlSocketPath) (*net.UnixListener, socketFileID, error) {
 	target := path.NativePath()
 	tok, err := randomHexToken(4)
@@ -86,7 +82,6 @@ func listenSocketLockedOS(ctx context.Context, path ControlSocketPath) (*net.Uni
 	}
 	return bindUnixDirect(ctx, target)
 }
-
 func bindUnixDirect(ctx context.Context, addr string) (*net.UnixListener, socketFileID, error) {
 	uln, err := listenUnixNoAutoUnlink(ctx, addr)
 	if err != nil {

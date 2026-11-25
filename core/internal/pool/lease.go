@@ -2,15 +2,14 @@ package pool
 
 import (
 	"context"
-	"io"
-	"net"
-	"strings"
-	"sync/atomic"
-
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/ports"
+	"io"
+	"net"
+	"strings"
+	"sync/atomic"
 )
 
 // 编译期契约断言：*Lease 天然满足最小会话打开器与全量隧道数据面窄接口，且不暴露 Close/SendKeepalive。
@@ -39,7 +38,6 @@ func newLease(p *Pool, inst *hopInstance, pd plan.PlanDigest, leaseID string) *L
 	l.active.Store(true)
 	return l
 }
-
 func (l *Lease) invalidate() {
 	if l != nil {
 		l.active.Store(false)
@@ -116,46 +114,25 @@ func (l *Lease) LeaseID() string {
 
 // 以下方法在无锁数据面路径上直接委派底层 ports.TransportConn 执行会话、SFTP 与各类隧道转发。
 func (l *Lease) OpenSession(ctx context.Context) (ports.RemoteSession, error) {
-	if err := l.checkDataPlane(ctx); err != nil {
-		return nil, err
-	}
-	return l.inst.conn.OpenSession(ctx)
+	return dpCall(l.checkDataPlane(ctx), func() (ports.RemoteSession, error) { return l.inst.conn.OpenSession(ctx) })
 }
 func (l *Lease) DialTCP(ctx context.Context, target netaddr.HostPort) (net.Conn, error) {
-	if err := l.checkDataPlane(ctx); err != nil {
-		return nil, err
-	}
-	return l.inst.conn.DialTCP(ctx, target)
+	return dpCall(l.checkDataPlane(ctx), func() (net.Conn, error) { return l.inst.conn.DialTCP(ctx, target) })
 }
 func (l *Lease) ListenTCP(ctx context.Context, bindAddr string) (net.Listener, error) {
-	if err := l.checkDataPlane(ctx); err != nil {
-		return nil, err
-	}
-	return l.inst.conn.ListenTCP(ctx, bindAddr)
+	return dpCall(l.checkDataPlane(ctx), func() (net.Listener, error) { return l.inst.conn.ListenTCP(ctx, bindAddr) })
 }
 func (l *Lease) DialStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Conn, error) {
-	if err := l.checkDataPlane(ctx); err != nil {
-		return nil, err
-	}
-	return l.inst.conn.DialStreamLocal(ctx, remoteSocket)
+	return dpCall(l.checkDataPlane(ctx), func() (net.Conn, error) { return l.inst.conn.DialStreamLocal(ctx, remoteSocket) })
 }
 func (l *Lease) ListenStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Listener, error) {
-	if err := l.checkDataPlane(ctx); err != nil {
-		return nil, err
-	}
-	return l.inst.conn.ListenStreamLocal(ctx, remoteSocket)
+	return dpCall(l.checkDataPlane(ctx), func() (net.Listener, error) { return l.inst.conn.ListenStreamLocal(ctx, remoteSocket) })
 }
 func (l *Lease) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, error) {
-	if err := l.checkDataPlane(ctx); err != nil {
-		return nil, err
-	}
-	return l.inst.conn.OpenTUN(ctx, spec)
+	return dpCall(l.checkDataPlane(ctx), func() (io.ReadWriteCloser, error) { return l.inst.conn.OpenTUN(ctx, spec) })
 }
 func (l *Lease) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
-	if err := l.checkDataPlane(ctx); err != nil {
-		return nil, err
-	}
-	return l.inst.conn.OpenRemoteFS(ctx)
+	return dpCall(l.checkDataPlane(ctx), func() (ports.RemoteFSPort, error) { return l.inst.conn.OpenRemoteFS(ctx) })
 }
 
 // Retire 通知连接池退役本租约绑定的精确世代连接实例（带世代防 ABA，绝不误杀已重连的新世代）。

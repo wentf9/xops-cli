@@ -3,7 +3,6 @@ package pool
 import (
 	"context"
 	"errors"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/events"
@@ -38,7 +37,6 @@ func (p *Pool) cleanupAfterActorExit() {
 		}
 		clear(p.dialing)
 		p.dialingConns.Store(0)
-
 		batch := make([]*hopInstance, 0, len(p.active))
 		for _, inst := range p.active {
 			pinned := inst.pinnedHandles
@@ -56,7 +54,6 @@ func (p *Pool) cleanupAfterActorExit() {
 		p.activeConns.Store(0)
 	})
 }
-
 func (p *Pool) handleAcquireReq(req acquireMsg) {
 	if p.halted.Load() || p.closed.Load() {
 		_ = req.waiter.tryGrant(nil, p.terminalStateError())
@@ -71,11 +68,9 @@ func (p *Pool) handleAcquireReq(req acquireMsg) {
 		_ = req.waiter.tryGrant(nil, ErrInvalidPlan)
 	}
 }
-
 func (p *Pool) handleDrainAcquireReq(req acquireMsg) {
 	_ = req.waiter.tryGrant(nil, p.terminalStateError())
 }
-
 func (p *Pool) handleFastPlanAcquire(req acquireMsg) {
 	hopCount := req.connPlan.Len()
 	leafDig, okD := req.connPlan.HopDigestAt(hopCount - 1)
@@ -124,7 +119,6 @@ func (p *Pool) findDeadChainAncestor(leaf *hopInstance, connPlan plan.SealedConn
 	}
 	return topDead
 }
-
 func (p *Pool) isChainNodeAlive(cur *hopInstance, hopIdx int) bool {
 	if !cur.inActiveMap || p.active[cur.digest] != cur || !cur.active.Load() || !cur.conn.IsAlive() {
 		return false
@@ -134,7 +128,6 @@ func (p *Pool) isChainNodeAlive(cur *hopInstance, hopIdx int) bool {
 	}
 	return cur.parent != nil && cur.parentEpoch == cur.parent.epoch
 }
-
 func (p *Pool) handleHopAcquire(req acquireMsg) {
 	if req.parent != nil && !p.isCurrentParent(req.parent, req.parentEpoch) {
 		p.parentCASRejects.Add(1)
@@ -151,7 +144,6 @@ func (p *Pool) handleHopAcquire(req acquireMsg) {
 	}
 	p.joinOrStartDial(req)
 }
-
 func (p *Pool) isCurrentParent(parent *hopInstance, expectEpoch uint64) bool {
 	if parent == nil {
 		return true
@@ -159,7 +151,6 @@ func (p *Pool) isCurrentParent(parent *hopInstance, expectEpoch uint64) bool {
 	cur, ok := p.active[parent.digest]
 	return ok && cur == parent && parent.epoch == expectEpoch && parent.active.Load() && parent.conn.IsAlive()
 }
-
 func (p *Pool) isReusableInstance(inst *hopInstance, parent *hopInstance, parentEpoch uint64) bool {
 	if inst == nil || !inst.inActiveMap || !inst.active.Load() || !inst.conn.IsAlive() {
 		return false
@@ -169,7 +160,6 @@ func (p *Pool) isReusableInstance(inst *hopInstance, parent *hopInstance, parent
 	}
 	return inst.parent == parent && inst.parentEpoch == parentEpoch
 }
-
 func (p *Pool) grantCachedInstance(w *acquireWaiter, inst *hopInstance, pdOpt algebraic.Option[plan.PlanDigest]) {
 	if !w.tryGrant(inst, nil) {
 		return
@@ -184,7 +174,6 @@ func (p *Pool) grantCachedInstance(w *acquireWaiter, inst *hopInstance, pdOpt al
 		endpoint: algebraic.Some(inst.hopSpec.Endpoint()), generation: inst.epoch, activeLeases: inst.activeLeases,
 	})
 }
-
 func (p *Pool) joinOrStartDial(req acquireMsg) {
 	if inf, exists := p.dialing[req.hopDigest]; exists {
 		if inf.parent == req.parent && inf.parentEpoch == req.parentEpoch {
@@ -202,7 +191,6 @@ func (p *Pool) joinOrStartDial(req acquireMsg) {
 	}
 	p.startNewDial(req)
 }
-
 func (p *Pool) ensureCapacityForNewDial() bool {
 	if p.maxConns <= 0 {
 		return true
@@ -216,7 +204,6 @@ func (p *Pool) ensureCapacityForNewDial() bool {
 	}
 	return true
 }
-
 func (p *Pool) pickLRUIdleLeaf() *hopInstance {
 	var best *hopInstance
 	for _, inst := range p.active {
@@ -229,7 +216,6 @@ func (p *Pool) pickLRUIdleLeaf() *hopInstance {
 	}
 	return best
 }
-
 func isOlderIdleCandidate(cand, best *hopInstance) bool {
 	if best == nil {
 		return true
@@ -239,7 +225,6 @@ func isOlderIdleCandidate(cand, best *hopInstance) bool {
 	}
 	return cand.digest.Compare(best.digest) < 0
 }
-
 func (p *Pool) startNewDial(req acquireMsg) {
 	// 派生自 p.haltCtx（链式绑定 workNursery.Context），确保 GateHalted 触发瞬间即刻中断在途拨号。
 	dialCtx, dialCancel := context.WithCancelCause(p.haltCtx)
@@ -256,13 +241,11 @@ func (p *Pool) startNewDial(req acquireMsg) {
 	p.dialing[req.hopDigest] = inf
 	p.dialingConns.Store(int64(len(p.dialing)))
 	p.totalDials.Add(1)
-
 	p.emitPoolEvent(poolEventInput{
 		traceID: req.waiter.traceID, opID: req.waiter.opID, action: events.PoolActionDialStarted,
 		planDigest: req.planDigest, hopDigest: algebraic.Some(req.hopDigest),
 		endpoint: algebraic.Some(req.hopSpec.Endpoint()),
 	})
-
 	var parentConn ports.TransportConn
 	if req.parent != nil {
 		parentConn = req.parent.conn

@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/ports"
 	"io"
 	"io/fs"
 	"os"
 	"sync/atomic"
 	"time"
-
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/ports"
 )
 
 const (
@@ -29,23 +28,24 @@ type lockedFile struct {
 func (l *lockedFile) checkActive() error {
 	return pickIf[error](l != nil && l.active != nil && l.active.Load() && l.file != nil, nil, ports.ErrHandleExpired)
 }
-func (l *lockedFile) Read(p []byte) (int, error) {
+func lockedIO[T any](l *lockedFile, fn func(*os.File) (T, error)) (T, error) {
 	if err := l.checkActive(); err != nil {
-		return 0, err
+		return zeroVal[T](), err
 	}
-	return l.file.Read(p)
+	return fn(l.file)
+}
+func (l *lockedFile) Read(p []byte) (int, error) {
+	return lockedIO(l, func(f *os.File) (int, error) { return f.Read(p) })
 }
 func (l *lockedFile) Write(p []byte) (int, error) {
-	if err := l.checkActive(); err != nil {
-		return 0, err
-	}
-	return l.file.Write(p)
+	return lockedIO(l, func(f *os.File) (int, error) { return f.Write(p) })
 }
-func (l *lockedFile) Seek(off int64, whence int) (int64, error) {
-	if err := l.checkActive(); err != nil {
-		return 0, err
-	}
-	return l.file.Seek(off, whence)
+func (l *lockedFile) Seek(off int64, w int) (int64, error) {
+	return lockedIO(l, func(f *os.File) (int64, error) { return f.Seek(off, w) })
+}
+func (l *lockedFile) Sync() error {
+	_, err := lockedIO(l, func(f *os.File) (int, error) { return 0, mapOSError(f.Sync()) })
+	return err
 }
 func (l *lockedFile) Truncate(size int64) error {
 	if err := l.checkActive(); err != nil {
@@ -56,23 +56,15 @@ func (l *lockedFile) Truncate(size int64) error {
 	}
 	return mapOSError(l.file.Truncate(size))
 }
-func (l *lockedFile) Sync() error {
-	if err := l.checkActive(); err != nil {
-		return err
-	}
-	return mapOSError(l.file.Sync())
-}
 func (l *lockedFile) Stat() (ports.LocalFileInfo, error) {
-	if err := l.checkActive(); err != nil {
-		return zeroVal[ports.LocalFileInfo](), err
-	}
-	fi, err := l.file.Stat()
-	if err != nil {
-		return zeroVal[ports.LocalFileInfo](), mapOSError(err)
-	}
-	return fileInfoToLocalFileInfo(l.name, fi)
+	return lockedIO(l, func(f *os.File) (ports.LocalFileInfo, error) {
+		fi, err := f.Stat()
+		if err != nil {
+			return zeroVal[ports.LocalFileInfo](), mapOSError(err)
+		}
+		return fileInfoToLocalFileInfo(l.name, fi)
+	})
 }
-
 func (h *rootHandle) checkLockArgs(dest pathalg.LocalRootedDest, mode ports.LockMode, fnNil bool) error {
 	if err := h.checkActiveDest(dest); err != nil {
 		return err
@@ -145,7 +137,6 @@ func retryLockBackoff(ctx context.Context, tryFn func() (bool, error)) error {
 		}
 	}
 }
-
 func lockFileWithContext(ctx context.Context, f *os.File, exclusive bool) error {
 	return retryLockBackoff(ctx, func() (bool, error) {
 		err := tryLockFileOS(f, exclusive)
@@ -155,7 +146,6 @@ func lockFileWithContext(ctx context.Context, f *os.File, exclusive bool) error 
 		return false, mapOSError(err)
 	})
 }
-
 func (h *rootHandle) tryAcquireLockedHandle(dest pathalg.LocalRootedDest, mode ports.LockMode, create bool, perm fs.FileMode) (*os.File, bool, error) {
 	op := pickIf(create, leafOpLockCreate, pickIf(mode == ports.LockExclusive, leafOpLockRW, leafOpLockRO))
 	createPerm := pickIf(create, sanitizeFilePerm(perm, defaultFilePerm), 0)
@@ -231,38 +221,38 @@ func checkRootCB(root ports.RootHandle, fnNil bool) error {
 //
 //xops:syncclosure
 //xops:borrowed
-func OpenRegular(root ports.RootHandle, dest pathalg.LocalRootedDest, limits ports.ReadLimits, fn OpenRegularFunc) error {
-	if err := checkRootCB(root, fn == nil); err != nil {
+func OpenRegular(r ports.RootHandle, d pathalg.LocalRootedDest, l ports.ReadLimits, fn OpenRegularFunc) error {
+	if err := checkRootCB(r, fn == nil); err != nil {
 		return err
 	}
-	return root.WithReadRegular(dest, limits, fn)
+	return r.WithReadRegular(d, l, fn)
 }
 
 //xops:syncclosure
 //xops:borrowed
-func CreateExclusive(root ports.RootHandle, dest pathalg.LocalRootedDest, perm fs.FileMode, fn WriteFileFunc) error {
-	if err := checkRootCB(root, fn == nil); err != nil {
+func CreateExclusive(r ports.RootHandle, d pathalg.LocalRootedDest, p fs.FileMode, fn WriteFileFunc) error {
+	if err := checkRootCB(r, fn == nil); err != nil {
 		return err
 	}
-	return root.CreateExclusive(dest, perm, fn)
+	return r.CreateExclusive(d, p, fn)
 }
 
 //xops:syncclosure
 //xops:borrowed
-func OpenLockedContext(ctx context.Context, root ports.RootHandle, dest pathalg.LocalRootedDest, mode ports.LockMode, create bool, perm fs.FileMode, fn LockedFileFunc) error {
-	if err := checkRootCB(root, fn == nil); err != nil {
+func OpenLockedContext(ctx context.Context, r ports.RootHandle, d pathalg.LocalRootedDest, m ports.LockMode, c bool, p fs.FileMode, fn LockedFileFunc) error {
+	if err := checkRootCB(r, fn == nil); err != nil {
 		return err
 	}
-	return root.WithLockedFile(ctx, dest, mode, create, perm, fn)
+	return r.WithLockedFile(ctx, d, m, c, p, fn)
 }
 
 //xops:syncclosure
 //xops:borrowed
-func AtomicReplace(root ports.RootHandle, dest pathalg.LocalRootedDest, perm fs.FileMode, fn WriteFileFunc) error {
-	if err := checkRootCB(root, fn == nil); err != nil {
+func AtomicReplace(r ports.RootHandle, d pathalg.LocalRootedDest, p fs.FileMode, fn WriteFileFunc) error {
+	if err := checkRootCB(r, fn == nil); err != nil {
 		return err
 	}
-	return root.AtomicReplace(dest, perm, fn)
+	return r.AtomicReplace(d, p, fn)
 }
 
 // WithSidecarLock 锁定 target 同目录旁路锁文件 <target>.lock 并同步执行回调（ADR-007）。
