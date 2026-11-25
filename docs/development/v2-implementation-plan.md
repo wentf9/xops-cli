@@ -1,7 +1,7 @@
 # XOps v2 全新架构分阶段实施计划（Implementation Plan）
 
 > **关联架构宪法**：[XOps v2 全新架构定稿规范（Architecture RFC v2.3.3 校准终稿）](./v2-architecture-rfc.md)（ADR-001 – ADR-016）  
-> **计划状态**：Phase 0（`Gate G0-R2`）、Phase 1（`Gate G1`）与 **Phase 2（`P2-T1`–`P2-T6` + `Gate G2`）** 已完成，可进入 **Phase 2.5（`P2.5-T1` Walking Skeleton）**（按 Gate G0/G0-R/G0-R2 → G1 → G2 → G2.5 → G3 ∥ G4 → G5 顺序严格过闸推进）  
+> **计划状态**：Phase 0（`Gate G0-R2`）、Phase 1（`Gate G1`）、Phase 2（`P2-T1`–`P2-T6` + `Gate G2`）与 **Phase 2.5（`P2.5-T1`–`P2.5-T2` + `Gate G2.5` Walking Skeleton 及 Phase 3 ∥ Phase 4 端口冻结）** 已完成，可并行启动 **Phase 3（`P3-T1`–`P3-T5`）∥ Phase 4（`P4-T1`–`P4-T4`）**（按 Gate G0/G0-R/G0-R2 → G1 → G2 → G2.5 → G3 ∥ G4 → G5 顺序严格过闸推进）  
 > **执行铁律**：**Go 1.27+** · 全仓 3 个 `go.mod` 零 `replace`（`core/` 与 `tools/xopsvet/` 全程 `GOWORK=off`，根 CLI 开发期经 `go.work`，打 **`core/v1.0.0`** Tag 发布时三模块全量 `GOWORK=off`）· **先筑 `xopsvet` 护栏与四端统一 `verify.go` CI 再写业务代码** · **Gate G2 后即交付 Walking Skeleton 纵向真机闭环** · 严禁新旧双轨补丁
 
 ---
@@ -162,7 +162,7 @@ go run ./scripts/ci/verify.go --stage=dst
 
 ### Phase 3 & Phase 4（Gate G2.5 后完全独立的双轨并行）
 
-> **双轨并行契约纪律**：`Gate G3` 与 `Gate G4` 相互独立并汇入 Phase 5；并行期间若极个别场景确需微调 `Gate G2.5` 已锁定的 `core/ports` 签名，必须在**同一提交内**同步更新 `core/ports/tck` 与 `core/internal/sim` 并通过 `Gate G2`，确保双轨零摩擦。
+> **双轨并行契约纪律**：`Gate G3` 与 `Gate G4` 相互独立并汇入 Phase 5；`Gate G2.5` 已冻结 `core/ports` 与 `core/internal/pool` 跨轨契约（涵盖 `MuxSocketPort.{Serve,OpenProxy,DialMux}`、`ForwardEndpointKind`、`JournalGenerationSnapshot` / `LoadGenerations` / `PruneGeneration`、`TUNDevicePort`、`RemoteRenameSpec` / `RemoveDir` / `Chtimes`、`RootHandle.Chtimes` 及 `pool.RegisterLeaseHandleWith`）。并行期间若极个别场景确需微调已锁定签名，必须在**同一提交内**同步更新 `core/ports/tck` 与 `core/internal/sim` 并通过 `Gate G2`，确保双轨零摩擦。
 
 - **Phase 3（全量用例服务 + MCP 运行时 + `core/engine`）**：
   - `P3-T1`：`usecase/inventory`（CAS CRUD、DAG、5 处引用删除、`FormatImporter` 调度、`Doctor`、`WithPendingEnrollment`）& `usecase/credential`（`VaultSagaFSM` + 全作用域 `WithSecret`）。
@@ -175,7 +175,7 @@ go run ./scripts/ci/verify.go --stage=dst
   - `P4-T1`：`sshnet/{dial,hostkey,priv,probe}` 全量（OTP/Keyboard-Interactive、SSHFP、随机 `-p` 提权握手、2 阶段探针；`sshnet/priv` 纳入明文白名单并支持双层嵌套 `keyBox.Use -> passBox.Use`；`sshnet/dial` 适配 `ssh.KeyboardInteractiveChallenge` 经 `secrettaint/sinks_narrow.go` 结构化窄模式钩子落地，0 `//nolint:`）。
   - `P4-T2`：`sshnet/{sftp,forward,mux}` 全量（`sshnet/sftp` 非截断打开 + `SSH_FXP_FSTAT` 类型/`(dev,ino)` 锚定 + 原子 `posix-rename@openssh.com`；SOCKS5/TUN；`PROTOCOL.mux` v4）。
   - `P4-T3`：`internal/host/{store,openssh,audit}` 全量（YAML vNext `version: 2`、`openssh`/`csv` `FormatImporter`、旁路锁 CAS + CRC WAL、`host/openssh` 将全部匹配的 `Host`/`Match`/`Include` 指令自上而下经 `ApplyParsedOption` 折叠为单一 `t4` `OptionLayer` + 全量 `ssh -G` 差分、多终端并发安全的 `run/*.lock` 崩溃对账）。
-  - `P4-T4`：`internal/host/{vault,sys}` 全量（Argon2id KDF Helper + XChaCha20-Poly1305 AEAD dirfd 库、OS Keychain、外部 Helper，全走 `WithSecret` 与 0 v1 迁移代码；Windows `CREDENTIALW` 与 OS Keychain/Helper 窄写入经 `secrettaint/sinks_narrow.go` 结构化窄模式钩子落地，0 `//nolint:`；`ProcessStdioConn`、SSHFP DNS、POSIX 孤儿进程组 `suspend` 判定）。
+  - `P4-T4`：`internal/host/{vault,sys}` 全量（Argon2id KDF Helper + XChaCha20-Poly1305 AEAD dirfd 库、OS Keychain、外部 Helper，全走 `WithSecret` 与 0 v1 迁移代码；Windows `CREDENTIALW` 与 OS Keychain/Helper 窄写入经 `secrettaint/sinks_narrow.go` 结构化窄模式钩子落地，0 `//nolint:`；`internal/host/sys` 承接生产 `SSHAgentPort`（`tck.RunSSHAgentSuite`）、TTY `InteractionPort`（`tck.RunInteractionSuite`）、`TUNDevicePort`（`tck.RunTUNDeviceSuite`）以及 `ProcessStdioConn`、SSHFP DNS、POSIX 孤儿进程组 `suspend` 判定）。
   - **`Gate G4`**：全部真实适配器 100% 过 `core/ports/tck` + 全量 `ssh -G` 差分 + Linux/Windows/macOS 原生 CI 全绿。
 
 ---
@@ -226,7 +226,7 @@ go run ./scripts/ci/verify.go --stage=dst
 - **Phase 0（v2.3.3 二轮对抗加固闭环，`Gate G0-R2` 已通过）**：`[x] P0-T1` · `[x] P0-T2` · `[x] P0-T3` · `[x] P0-T4` · **`[x] Gate G0-R`** · **`[x] Gate G0-R2`**
 - **Phase 1（纯函数领域核闭环，`Gate G1` 已通过）**：`[x] P1-T1` · `[x] P1-T2` · `[x] P1-T3` · `[x] P1-T4` · `[x] P1-T5` · `[x] P1-T6` · **`[x] Gate G1`**
 - **Phase 2（出站端口、TCK、`core/osfs` 与零 `sshnet` 依赖运行时闭环，`Gate G2` 已通过）**：`[x] P2-T1` · `[x] P2-T2` · `[x] P2-T3` · `[x] P2-T4` · `[x] P2-T5` · `[x] P2-T6` · **`[x] Gate G2`**
-- **Phase 2.5（Walking Skeleton）**：`[ ] P2.5-T1` · `[ ] P2.5-T2` · **`[ ] Gate G2.5`**
+- **Phase 2.5（Walking Skeleton 闭环，`Gate G2.5` 已通过并完成 Phase 3 ∥ Phase 4 端口冻结）**：`[x] P2.5-T1` · `[x] P2.5-T2` · **`[x] Gate G2.5`**
 - **Phase 3**：`[ ] P3-T1` · `[ ] P3-T2` · `[ ] P3-T3` · `[ ] P3-T4` · `[ ] P3-T5` · **`[ ] Gate G3`**
 - **Phase 4**：`[ ] P4-T1` · `[ ] P4-T2` · `[ ] P4-T3` · `[ ] P4-T4` · **`[ ] Gate G4`**
 - **Phase 5**：`[ ] P5-T1` · `[ ] P5-T2` · `[ ] P5-T3` · `[ ] P5-T4` · **`[ ] Gate G5`**
