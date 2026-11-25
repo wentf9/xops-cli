@@ -17,9 +17,11 @@ import (
 	"go.uber.org/goleak"
 )
 
+// shortSocketTempDir 为 AF_UNIX 实测创建极短临时目录，避免 macOS 长 $TMPDIR（/var/folders/...）
+// 挤压 Darwin 103 字节 sun_path 预算与原子绑定临时后缀空间。
 func shortSocketTempDir(t *testing.T) string {
 	t.Helper()
-	base, err := os.MkdirTemp("", "xops-s-")
+	base, err := os.MkdirTemp(shortSocketTempParent(), "xs-")
 	if err != nil {
 		t.Fatalf("创建短套接字临时目录失败: %v", err)
 	}
@@ -72,14 +74,23 @@ func TestControlSocketPathCrossPlatformRules(t *testing.T) {
 		t.Fatalf("Unix 未拒绝超长 sun_path: %v", err)
 	}
 	verifyWindowsControlSocketRules(t, percentC)
+	verifyManagedMuxSocketPaths(t, percentC)
+}
 
-	shortDir := mustLocalDir(t, shortSocketTempDir(t))
+func verifyManagedMuxSocketPaths(t *testing.T, percentC string) {
+	t.Helper()
+	// 纯路径构造校验使用平台确定性短目录，避免受宿主 $TMPDIR/%TEMP% 长度波动影响。
+	shortDir := mustLocalDir(t, deterministicShortMuxDir())
 	managed, err := osfs.BuildManagedMuxSocketPath(shortDir, percentC)
 	if err != nil || !managed.IsValid() || !strings.HasSuffix(managed.Name(), percentC+".sock") {
 		t.Fatalf("BuildManagedMuxSocketPath = (%v, %v)", managed, err)
 	}
 	if _, err := osfs.BuildManagedMuxSocketPath(shortDir, "NOT-HEX"); !errors.Is(err, osfs.ErrInvalidControlPath) {
 		t.Fatalf("BuildManagedMuxSocketPath 必须拒绝非法 %%C: %v", err)
+	}
+	overlongDir := mustLocalDir(t, filepath.Join(deterministicShortMuxDir(), strings.Repeat("a", osfs.MaxUnixSocketPathBytes())))
+	if _, err := osfs.BuildManagedMuxSocketPath(overlongDir, percentC); !errors.Is(err, osfs.ErrControlPathTooLong) {
+		t.Fatalf("BuildManagedMuxSocketPath 必须拒绝超过平台 sun_path 上限的目录: %v", err)
 	}
 	srcSock := mustLocalSource(t, managed.NativePath())
 	fromSrc, err := osfs.ControlSocketPathFromSource(srcSock)

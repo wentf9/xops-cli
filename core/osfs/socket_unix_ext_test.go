@@ -15,6 +15,17 @@ import (
 	"go.uber.org/goleak"
 )
 
+// shortSocketTempParent 在 Unix 上优先选用 /tmp，避免 macOS 长 $TMPDIR（/var/folders/...）超出 Darwin 103 字节 sun_path 上限。
+func shortSocketTempParent() string {
+	if fi, err := os.Stat("/tmp"); err == nil && fi.IsDir() {
+		return "/tmp"
+	}
+	return ""
+}
+
+// deterministicShortMuxDir 返回 Unix 纯路径构造测试使用的确定性短目录。
+func deterministicShortMuxDir() string { return "/tmp/xops" }
+
 func ensureTestSocketDir(t *testing.T, dir string) {
 	t.Helper()
 	if err := os.Mkdir(dir, 0o700); err != nil {

@@ -50,6 +50,12 @@ const (
 	_ = uint(0x58000100 - uint32(windows.IOC_OUT|windows.IOC_VENDOR|256))
 )
 
+// shortSocketTempParent 在 Windows 上沿用系统默认临时目录。
+func shortSocketTempParent() string { return "" }
+
+// deterministicShortMuxDir 返回 Windows 纯路径构造测试使用的确定性短目录。
+func deterministicShortMuxDir() string { return `C:\xops` }
+
 func ensureTestSocketDir(t *testing.T, dir string) {
 	t.Helper()
 	if err := osfs.EnsureOwnerOnlyDirectory(dir); err != nil {
