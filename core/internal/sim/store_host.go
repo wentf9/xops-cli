@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"cmp"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"maps"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -19,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -168,44 +167,7 @@ func (i *SimFormatImporter) Import(ctx context.Context, _ string, r io.Reader) (
 	if err != nil {
 		return out, err
 	}
-	spec := inventory.ImportBundleSpec{SourceFormat: i.format}
-	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
-		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "#") {
-			if err = appendCSVAsset(&spec, line); err != nil {
-				return out, err
-			}
-		}
-	}
-	if len(spec.Nodes) == 0 {
-		return out, ports.ErrCorruptData
-	}
-	return inventory.NewImportBundle(spec)
-}
-func appendCSVAsset(spec *inventory.ImportBundleSpec, line string) error {
-	p := strings.Split(line, ",")
-	if len(p) != 4 {
-		return ports.ErrCorruptData
-	}
-	alias, addr, userStr := strings.TrimSpace(p[0]), strings.TrimSpace(p[1]), strings.TrimSpace(p[3])
-	portNum, pErr := strconv.ParseUint(strings.TrimSpace(p[2]), 10, 16)
-	if pErr != nil || portNum == 0 {
-		return ports.ErrCorruptData
-	}
-	ch, e0 := netaddr.ParseCanonicalHost(addr)
-	ep, e1 := netaddr.NewEndpoint(ch, uint16(portNum))
-	hid, e2 := inventory.ParseHostID("host-" + alias)
-	iid, e3 := inventory.ParseIdentityID("ident-" + alias)
-	nid, e4 := inventory.ParseNodeID(alias)
-	user, e5 := option.ParseUsername(userStr)
-	auth, e6 := inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
-	h, e7 := inventory.NewHost(inventory.HostSpec{ID: hid, Endpoint: ep})
-	id, e8 := inventory.NewIdentity(inventory.IdentitySpec{ID: iid, User: user, Auth: auth})
-	n, e9 := inventory.NewNode(inventory.NodeSpec{ID: nid, HostRef: hid, IdentityRef: iid, Proxy: option.NewProxyUnset(), Options: option.UnsetOptionLayer(), Origin: inventory.NewOriginManaged()})
-	if err := firstErr(e0, e1, e2, e3, e4, e5, e6, e7, e8, e9); err != nil {
-		return err
-	}
-	spec.Hosts, spec.Identities, spec.Nodes = append(spec.Hosts, h), append(spec.Identities, id), append(spec.Nodes, n)
-	return nil
+	return memtree.ParseCSVImportBundle(i.format, raw)
 }
 
 // SimOpenSSHConfigSource 实现 ports.OpenSSHConfigSource 的虚拟主机与 Tier-4 选项折叠仿真器。
@@ -227,18 +189,13 @@ func (s *SimOpenSSHConfigSource) ListVirtualHosts(ctx context.Context) ([]ports.
 	}
 	return withLockRet(&s.simBase, nil, func() []ports.OpenSSHVirtualHost { return slices.Clone(s.hosts) }), nil
 }
-func (s *SimOpenSSHConfigSource) ResolveTier4(ctx context.Context, target option.OriginalHostSpec, ep netaddr.Endpoint) (out option.OptionLayer, err error) {
-	if err = s.check(ctx, "openssh.resolve", target.IsValid(), ep.IsValid()); err != nil {
+func (s *SimOpenSSHConfigSource) ResolveTier4(ctx context.Context, target option.OriginalHostSpec, endpoint algebraic.Option[netaddr.Endpoint]) (out option.OptionLayer, err error) {
+	ep, hasReqEP := endpoint.Get()
+	if err = s.check(ctx, "openssh.resolve", target.IsValid(), !hasReqEP || ep.IsValid()); err != nil {
 		return out, err
 	}
 	return withLockRet(&s.simBase, option.UnsetOptionLayer(), func() option.OptionLayer {
-		acc := option.UnsetOptionLayer()
-		for _, h := range s.hosts {
-			if hEP, hasEP := h.Endpoint().Get(); h.Alias() == target.String() && (!hasEP || hEP.Equal(ep)) {
-				acc = acc.Compose(h.Layer())
-			}
-		}
-		return acc
+		return memtree.ResolveSimTier4(s.hosts, target, endpoint)
 	}), nil
 }
 
@@ -287,10 +244,7 @@ func (s *SimKeySigner) Sign(ctx context.Context, key inventory.KeyFingerprint, a
 	}) {
 		return out, ports.ErrSignerUnavailable
 	}
-	h := sha256.New()
-	_, _ = h.Write([]byte(key.String() + ":" + algorithm))
-	_, _ = h.Write(data)
-	return ports.NewSignature(algorithm, h.Sum(nil))
+	return memtree.SignSimKey("", key, algorithm, data)
 }
 func (s *SimKeySigner) InspectPrivateKeyFingerprint(ctx context.Context, keyPath inventory.KeyPathSpec, _ algebraic.Option[secret.Ref]) (out inventory.KeyFingerprint, err error) {
 	if err = s.check(ctx, "signer.inspect", keyPath.IsValid()); err != nil {
@@ -327,14 +281,7 @@ func (t *SimHostTrust) PreferredAlgorithms(ctx context.Context, ep netaddr.Endpo
 	if err := t.check(ctx, "trust.algos", ep.IsValid()); err != nil {
 		return nil, err
 	}
-	return withLockRet(&t.simBase, nil, func() (out []string) {
-		for _, k := range t.trusted[ep.String()] {
-			if !slices.Contains(out, k.Algorithm()) {
-				out = append(out, k.Algorithm())
-			}
-		}
-		return out
-	}), nil
+	return withLockRet(&t.simBase, nil, func() []string { return memtree.PreferredAlgosFromKeys(t.trusted[ep.String()]) }), nil
 }
 func (t *SimHostTrust) VerifyHostKey(ctx context.Context, req ports.HostTrustRequest) (out ports.HostTrustCheck, err error) {
 	if err = t.check(ctx, "trust.verify", req.IsValid()); err != nil {
@@ -342,20 +289,7 @@ func (t *SimHostTrust) VerifyHostKey(ctx context.Context, req ports.HostTrustReq
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	spec := ports.HostTrustCheckSpec{Endpoint: req.Endpoint(), Presented: req.Presented(), Status: ports.HostTrustMismatch, Reason: "fingerprint mismatch"}
-	if t.revoked[spec.Presented.Fingerprint()] {
-		spec.Status, spec.Reason = ports.HostTrustRevoked, "key revoked"
-	} else if known := t.trusted[spec.Endpoint.String()]; len(known) == 0 {
-		spec.Status, spec.Reason = ports.HostTrustUnknown, "unknown host key"
-	} else {
-		for _, k := range known {
-			spec.ExpectedFingerprints = append(spec.ExpectedFingerprints, k.Fingerprint())
-			if k.Fingerprint().Equal(spec.Presented.Fingerprint()) {
-				spec.Status, spec.Reason = ports.HostTrustTrusted, ""
-			}
-		}
-	}
-	return ports.NewHostTrustCheck(spec)
+	return memtree.BuildHostTrustCheck(req, t.trusted[req.Endpoint().String()], t.revoked[req.Presented().Fingerprint()])
 }
 func (t *SimHostTrust) RecordHostKey(ctx context.Context, ep netaddr.Endpoint, key ports.PublicKeyInfo, _ option.KnownHostsList) error {
 	if err := t.check(ctx, "trust.record", ep.IsValid(), key.IsValid()); err != nil {

@@ -77,48 +77,33 @@ func EvaluateWindowsObjectACL(in WindowsACLInput) security.Verdict {
 }
 
 func isSafeWin32ObjectAttrs(attrs uint32, expectDir, allowReparse bool) bool {
-	if attrs&WinAttrDevice != 0 || (!allowReparse && attrs&WinAttrReparsePoint != 0) {
-		return false
-	}
-	return (attrs&WinAttrDirectory != 0) == expectDir
+	return attrs&WinAttrDevice == 0 && (allowReparse || attrs&WinAttrReparsePoint == 0) && (attrs&WinAttrDirectory != 0) == expectDir
 }
-
 func evaluateSingleWindowsACE(mode WindowsACLMode, expectDir bool, ace ParsedWindowsACE) security.Verdict {
 	// 非目录对象上 INHERIT_ONLY_ACE 不生效；目录对象上的可继承 ACE 会传染给新建子对象，严禁跳过。
 	if (!expectDir && ace.ACEFlags&WinACEFlagInheritOnly != 0) || ace.ACEType == WinACETypeDeny {
 		return security.VerdictAllow
 	}
-	if ace.ACEType != WinACETypeAllow || !ace.SIDValid {
-		return security.VerdictDeny
-	}
-	if !ace.SIDTrusted && ((mode == WindowsACLOwnerOnly && ace.Mask != 0) || (mode == WindowsACLWriteRestricted && ace.Mask&winMutatingMask != 0)) {
+	if ace.ACEType != WinACETypeAllow || !ace.SIDValid ||
+		(!ace.SIDTrusted && ((mode == WindowsACLOwnerOnly && ace.Mask != 0) || (mode == WindowsACLWriteRestricted && ace.Mask&winMutatingMask != 0))) {
 		return security.VerdictDeny
 	}
 	return security.VerdictAllow
 }
 
 // UTF16CodeUnitLen 计算字符串在 UTF-16 编码下的精确码元数量（辅助平面码点计 2 码元）。
-func UTF16CodeUnitLen(s string) int {
-	n := 0
+func UTF16CodeUnitLen(s string) (n int) {
 	for _, r := range s {
-		n++
-		if r >= 0x10000 {
-			n++
-		}
+		n += pickIf(r >= 0x10000, 2, 1)
 	}
 	return n
 }
 
 // IsExtendedOrDeviceWindowsPath 报告路径是否已携带 \\?\、\\.\ 或 \??\ Win32 设备/扩展前缀。
 func IsExtendedOrDeviceWindowsPath(path string) bool {
-	if len(path) < 4 {
-		return false
-	}
-	p0, p1, p2, p3 := path[0], path[1], path[2], path[3]
-	return (p0 == '\\' && p1 == '?' && p2 == '?' && isWin32Sep(p3)) ||
-		(isWin32Sep(p0) && isWin32Sep(p1) && (p2 == '?' || p2 == '.') && isWin32Sep(p3))
+	return len(path) >= 4 && ((path[0] == '\\' && path[1] == '?' && path[2] == '?' && isWin32Sep(path[3])) ||
+		(isWin32Sep(path[0]) && isWin32Sep(path[1]) && (path[2] == '?' || path[2] == '.') && isWin32Sep(path[3])))
 }
-
 func stripWin32LongPathPrefix(p string) string {
 	if rest, ok := strings.CutPrefix(p, `\\?\UNC\`); ok {
 		return `\\` + rest
@@ -130,27 +115,22 @@ func stripWin32LongPathPrefix(p string) string {
 func NormalizeWin32LongPath(path string) string {
 	return normalizeWin32LongPathWithResolver(path, filepath.Abs, os.Getwd)
 }
-
 func normalizeWin32LongPathWithResolver(path string, fullPath func(string) (string, error), getwd func() (string, error)) string {
 	if path == "" || IsExtendedOrDeviceWindowsPath(path) {
 		return path
 	}
-	precomputed, effectiveLen, err := measureEffectiveWin32PathLen(path, fullPath, getwd)
-	if err != nil || effectiveLen < Win32LongPathThreshold {
+	pre, n, err := measureEffectiveWin32PathLen(path, fullPath, getwd)
+	if err != nil || n < Win32LongPathThreshold {
 		return path
 	}
-	if full := resolveWin32LongFullPath(path, precomputed, fullPath); full != "" {
+	if full := resolveWin32LongFullPath(path, pre, fullPath); full != "" {
 		return applyWin32LongPathPrefix(full)
 	}
 	return path
 }
-
-func resolveWin32LongFullPath(path, precomputed string, fullPath func(string) (string, error)) string {
-	if precomputed != "" {
-		return precomputed
-	}
-	if fullPath == nil {
-		return path
+func resolveWin32LongFullPath(path, pre string, fullPath func(string) (string, error)) string {
+	if pre != "" || fullPath == nil {
+		return pickIf(pre != "", pre, path)
 	}
 	resolved, err := fullPath(path)
 	if err != nil || resolved == "" {
@@ -159,22 +139,17 @@ func resolveWin32LongFullPath(path, precomputed string, fullPath func(string) (s
 	if isAbsWinPath(resolved) || IsExtendedOrDeviceWindowsPath(resolved) {
 		return resolved
 	}
-	if isAbsWinPath(path) {
-		return path // 非 Windows 宿主上 filepath.Abs 会拼 POSIX cwd，保留原 Windows 绝对路径。
-	}
-	return ""
+	// 非 Windows 宿主上 filepath.Abs 会拼 POSIX cwd，保留原 Windows 绝对路径。
+	return pickIf(isAbsWinPath(path), path, "")
 }
-
 func measureEffectiveWin32PathLen(path string, fullPath func(string) (string, error), getwd func() (string, error)) (string, int, error) {
 	if isDriveRelativeWinPath(path) {
-		if fullPath == nil {
-			return "", 0, os.ErrInvalid
+		if fullPath != nil {
+			if full, err := fullPath(path); err == nil && full != "" {
+				return full, UTF16CodeUnitLen(full), nil
+			}
 		}
-		full, err := fullPath(path)
-		if err != nil || full == "" {
-			return "", 0, os.ErrInvalid
-		}
-		return full, UTF16CodeUnitLen(full), nil
+		return "", 0, os.ErrInvalid
 	}
 	n := UTF16CodeUnitLen(path)
 	if !isAbsWinPath(path) && getwd != nil {
@@ -184,7 +159,6 @@ func measureEffectiveWin32PathLen(path string, fullPath func(string) (string, er
 	}
 	return "", n, nil
 }
-
 func applyWin32LongPathPrefix(full string) string {
 	if IsExtendedOrDeviceWindowsPath(full) {
 		return full
@@ -198,13 +172,11 @@ func applyWin32LongPathPrefix(full string) string {
 	}
 	return norm
 }
-
 func isASCIIAlphaByte(b byte) bool { return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') }
 func isWin32Sep(b byte) bool       { return b == '\\' || b == '/' }
 func isDriveRelativeWinPath(p string) bool {
 	return len(p) >= 2 && isASCIIAlphaByte(p[0]) && p[1] == ':' && (len(p) == 2 || !isWin32Sep(p[2]))
 }
 func isAbsWinPath(p string) bool {
-	return (len(p) >= 3 && isASCIIAlphaByte(p[0]) && p[1] == ':' && isWin32Sep(p[2])) ||
-		(len(p) >= 2 && isWin32Sep(p[0]) && isWin32Sep(p[1]))
+	return (len(p) >= 3 && isASCIIAlphaByte(p[0]) && p[1] == ':' && isWin32Sep(p[2])) || (len(p) >= 2 && isWin32Sep(p[0]) && isWin32Sep(p[1]))
 }

@@ -43,8 +43,14 @@ type ProcessFixture struct {
 type TerminalFixture struct {
 	// NewTerminal 返回待测 TerminalPort 实例。
 	NewTerminal func(t *testing.T) ports.TerminalPort
+	// NewBlockingInputTerminal 可选返回本机输入读端持续阻塞直至 Relay 终止的交互终端，用于验证远端先 EOF 不挂死与零泄漏。
+	NewBlockingInputTerminal func(t *testing.T) ports.TerminalPort
 	// ExpectInteractive 指示待测终端是否处于交互式 TTY 状态。
 	ExpectInteractive bool
+	// ExpectedRelayInput 指定终端预设输入（非空时验证 Relay 将其完整泵入 remoteIn）。
+	ExpectedRelayInput string
+	// ExpectResizeCount 指定预期在 Relay 中触发 onResize 的最少次数（0 表示不强制）。
+	ExpectResizeCount int
 }
 
 // InteractionFixture 描述 InteractionPort 契约测试夹具。
@@ -302,11 +308,98 @@ func RunTerminalSuite(t *testing.T, fx TerminalFixture) {
 				requireNoErr(t, hsErr, "TerminalHandle.Size")
 				requireTrue(t, hSize.IsValid(), "句柄 Size 必须有效")
 				_, wErr := h.Write([]byte("raw-ok"))
-				return wErr
+				if wErr != nil {
+					return wErr
+				}
+				return verifyTerminalRelay(t, h, fx.ExpectedRelayInput, fx.ExpectResizeCount)
 			})
 			requireNoErr(t, err, "WithRawTerminal")
+			verifyTerminalHalfCloseAndRemoteEOF(t, fx)
 		}
 	})
+}
+
+type halfCloseSink struct {
+	mu       sync.Mutex
+	buf      bytes.Buffer
+	closedCh chan struct{}
+	once     sync.Once
+}
+
+func (s *halfCloseSink) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+func (s *halfCloseSink) Close() error { s.once.Do(func() { close(s.closedCh) }); return nil }
+
+type waitHalfCloseReader struct {
+	gate <-chan struct{}
+	r    *strings.Reader
+}
+
+func (w *waitHalfCloseReader) Read(p []byte) (int, error) { <-w.gate; return w.r.Read(p) }
+
+func verifyTerminalHalfCloseAndRemoteEOF(t *testing.T, fx TerminalFixture) {
+	t.Helper()
+	// 1. 本地输入先达 EOF 时须关闭实现 io.Closer 的 remoteIn（半关闭），且继续排空 remoteOut。
+	termHC := fx.NewTerminal(t)
+	sink := &halfCloseSink{closedCh: make(chan struct{})}
+	tail := strings.NewReader("after-half-close")
+	err := termHC.WithRawTerminal(context.Background(), func(h ports.TerminalHandle) error {
+		return h.Relay(context.Background(), sink, &waitHalfCloseReader{gate: sink.closedCh, r: tail}, nil)
+	})
+	requireNoErr(t, err, "Relay(local EOF half-close)")
+	select {
+	case <-sink.closedCh:
+	default:
+		t.Fatal("localIn EOF 后 Relay 必须半关闭实现 io.Closer 的 remoteIn")
+	}
+	requireTrue(t, tail.Len() == 0, "localIn 半关闭后 Relay 必须将 remoteOut 剩余数据排空至 EOF")
+	// 2. 远端先达 EOF 且本机输入持续阻塞时，Relay 必须确定性退出且零协程泄漏。
+	if fx.NewBlockingInputTerminal != nil {
+		var blkSink bytes.Buffer
+		err = fx.NewBlockingInputTerminal(t).WithRawTerminal(context.Background(), func(h ports.TerminalHandle) error {
+			return h.Relay(context.Background(), &blkSink, strings.NewReader("remote-exit-first"), func(context.Context, ports.TerminalSize) error { return nil })
+		})
+		requireNoErr(t, err, "Relay(remote EOF first with blocking localIn)")
+	}
+}
+
+func verifyTerminalRelay(t *testing.T, h ports.TerminalHandle, wantIn string, minResizes int) error {
+	t.Helper()
+	var nilCtx context.Context
+	var sink bytes.Buffer
+	requireErrIs(t, h.Relay(nilCtx, &sink, strings.NewReader(""), nil), ports.ErrNilContext, "Relay(nil ctx)")
+	requireErrIs(t, h.Relay(context.Background(), nil, strings.NewReader(""), nil), ports.ErrInvalidArgument, "Relay(nil remoteIn)")
+	requireErrIs(t, h.Relay(context.Background(), &sink, nil, nil), ports.ErrInvalidArgument, "Relay(nil remoteOut)")
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	requireErrIs(t, h.Relay(canceled, &sink, strings.NewReader("x"), nil), context.Canceled, "Relay(canceled ctx)")
+
+	var resizeCount int
+	var resizeMu sync.Mutex
+	err := h.Relay(context.Background(), &sink, strings.NewReader("remote-out-ok"), func(_ context.Context, sz ports.TerminalSize) error {
+		if !sz.IsValid() {
+			return ports.ErrInvalidTTYSize
+		}
+		resizeMu.Lock()
+		resizeCount++
+		resizeMu.Unlock()
+		return nil
+	})
+	requireNoErr(t, err, "TerminalHandle.Relay")
+	if wantIn != "" {
+		requireTrue(t, sink.String() == wantIn, "Relay 未将预设终端输入完整泵送至 remoteIn")
+	}
+	if minResizes > 0 {
+		resizeMu.Lock()
+		got := resizeCount
+		resizeMu.Unlock()
+		requireTrue(t, got >= minResizes, "Relay 未按预期触发 onResize 回调")
+	}
+	return nil
 }
 
 // RunInteractionSuite 验证 InteractionPort 的确认、审批摘要绑定、文本输入与受管 SecretBox 机密采集契约。

@@ -3,6 +3,7 @@ package pool_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
@@ -77,8 +79,11 @@ func (e *extEntropy) Read(p []byte) (int, error) {
 
 type extSession struct{}
 
+func (extSession) StdinPipe() (io.WriteCloser, error)                                    { return nil, ports.ErrUnsupported }
+func (extSession) StdoutPipe() (io.Reader, error)                                        { return nil, ports.ErrUnsupported }
+func (extSession) StderrPipe() (io.Reader, error)                                        { return nil, ports.ErrUnsupported }
 func (extSession) Start(context.Context, execution.CommandPlan, ports.ExecStreams) error { return nil }
-func (extSession) StartShell(context.Context, algebraic.Option[ports.PTYRequest], ports.ExecStreams) error {
+func (extSession) StartShell(context.Context, ports.ExecStreams) error {
 	return nil
 }
 func (extSession) ResizePTY(context.Context, ports.TerminalSize) error { return nil }
@@ -103,6 +108,15 @@ func (c *extConn) DialTCP(context.Context, netaddr.HostPort) (net.Conn, error) {
 	return nil, ports.ErrUnsupported
 }
 func (c *extConn) ListenTCP(context.Context, string) (net.Listener, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *extConn) DialStreamLocal(context.Context, pathalg.RemotePath) (net.Conn, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *extConn) ListenStreamLocal(context.Context, pathalg.RemotePath) (net.Listener, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *extConn) OpenTUN(context.Context, ports.TUNSpec) (io.ReadWriteCloser, error) {
 	return nil, ports.ErrUnsupported
 }
 func (c *extConn) OpenRemoteFS(context.Context) (ports.RemoteFSPort, error) {
@@ -195,9 +209,17 @@ func assertFailClosedPool(t *testing.T, ctx context.Context, p *pool.Pool, pl pl
 
 func assertFailClosedLease(t *testing.T, ctx context.Context, l *pool.Lease) {
 	t.Helper()
+	var zeroRP pathalg.RemotePath
+	var zeroTUN ports.TUNSpec
 	extRequire(t, !l.IsValid() && l.IsZero() && !l.IsAlive() && l.Epoch() == 0 && l.LeaseID() == "", "nil 或零值 Lease 必须失败关闭")
 	_, err := l.OpenSession(ctx)
 	extErrIs(t, err, pool.ErrLeaseInvalid, "OpenSession")
+	_, err = l.DialStreamLocal(ctx, zeroRP)
+	extErrIs(t, err, pool.ErrLeaseInvalid, "DialStreamLocal")
+	_, err = l.ListenStreamLocal(ctx, zeroRP)
+	extErrIs(t, err, pool.ErrLeaseInvalid, "ListenStreamLocal")
+	_, err = l.OpenTUN(ctx, zeroTUN)
+	extErrIs(t, err, pool.ErrLeaseInvalid, "OpenTUN")
 	l.Retire()
 }
 

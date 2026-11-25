@@ -40,8 +40,12 @@ type AuditDispatcherStats struct {
 	Halted             bool
 }
 
-// AuditDispatcher 是面向安全审计记录的同步 Fail-Closed 分发器（ADR-008 / ADR-010）：
+// AuditDispatcher 是面向安全审计事件流（*AuditRecordEvent）的可选同步 Fail-Closed 分发器（ADR-008 / ADR-010）：
 // 零缓冲、零丢弃、零后台协程，绝不持锁调用外部 ctx.Err()/AuditWriter/OnHalt，熔断状态不可逆。
+//
+// 单一熔断所有权边界（ADR-008）：在 core/engine 生产装配中，core/internal/gate.Gate 是唯一权威的审计落盘与
+// Halted 熔断状态机所有者（直接写入 ports.AuditSink 并经 OnHaltFunc 驱动 pool.GateHalted）；
+// 本类型仅作事件投影旁路或独立测试组件使用，严禁与 gate.Gate 并行装配为第二套独立熔断状态机。
 //
 //xops:opaque
 //xops:failclosed

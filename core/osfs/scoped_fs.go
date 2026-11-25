@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -26,6 +27,14 @@ type ScopedFS struct{ valid bool }
 // NewScopedRootFS 构造可用的沙箱本地文件系统实例（ports.ScopedRootFS 生产实现）。
 func NewScopedRootFS() *ScopedFS { return &ScopedFS{valid: true} }
 
+// EnsureRoot 实现 ports.ScopedRootFS.EnsureRoot，在 WithRoot 前安全引导沙箱根目录存在。
+func (s *ScopedFS) EnsureRoot(dir pathalg.LocalDir, perm fs.FileMode) error {
+	if s == nil || !s.valid {
+		return fmt.Errorf("%w: ScopedFS 未初始化", ports.ErrInvalidArgument)
+	}
+	return EnsureDir(dir, perm)
+}
+
 // WithRoot 打开绑定至 dir 的 *os.Root 沙箱句柄并在同步闭包 fn 内借出；退出前无条件失效并关闭。
 //
 //xops:syncclosure
@@ -37,7 +46,7 @@ func (s *ScopedFS) WithRoot(dir pathalg.LocalDir, fn func(root ports.RootHandle)
 	if s == nil || !s.valid || !dir.IsValid() {
 		return fmt.Errorf("%w: ScopedFS 未初始化或根目录无效", ports.ErrInvalidArgument)
 	}
-	nativeDir, err := localDirToNativePath(dir)
+	nativeDir, err := localPathToNativeOS(dir.Kind(), dir.String())
 	if err != nil {
 		return err
 	}
@@ -62,22 +71,14 @@ type rootHandle struct {
 }
 
 func (h *rootHandle) checkActive() error {
-	if h == nil || !h.active.Load() || h.root == nil {
-		return ports.ErrHandleExpired
-	}
-	return nil
+	return pickIf[error](h != nil && h.active.Load() && h.root != nil, nil, ports.ErrHandleExpired)
 }
-
 func (h *rootHandle) checkActiveDest(dest pathalg.LocalRootedDest) error {
 	if err := h.checkActive(); err != nil {
 		return err
 	}
-	if !dest.IsValid() {
-		return fmt.Errorf("%w: 无效沙箱目标路径", ports.ErrInvalidArgument)
-	}
-	return nil
+	return pickIf[error](dest.IsValid(), nil, fmt.Errorf("%w: 无效沙箱目标路径", ports.ErrInvalidArgument))
 }
-
 func (h *rootHandle) prepareDest(dest pathalg.LocalRootedDest) error {
 	if err := h.checkActiveDest(dest); err != nil {
 		return err
@@ -91,32 +92,34 @@ func (h *rootHandle) prepareDest(dest pathalg.LocalRootedDest) error {
 	return nil
 }
 
-// ReadAllBounded 在 limits 上限内无跟随读取沙箱常规文件的全部字节（通过 WithReadRegular 复用溢出安全有界读取器）。
-func (h *rootHandle) ReadAllBounded(dest pathalg.LocalRootedDest, limits ports.ReadLimits) ([]byte, error) {
-	var data []byte
-	err := h.WithReadRegular(dest, limits, func(r io.Reader, _ int64) error {
-		var rErr error
+// ReadAllBounded 在 limits 上限内无跟随读取沙箱常规文件的全部字节。
+func (h *rootHandle) ReadAllBounded(dest pathalg.LocalRootedDest, limits ports.ReadLimits) (data []byte, err error) {
+	err = h.WithReadRegular(dest, limits, func(r ports.BoundedReadHandle, _ int64) (rErr error) {
 		data, rErr = io.ReadAll(r)
 		return mapOSError(rErr)
 	})
 	return data, err
 }
 
-// WithReadRegular 以有界只读流方式在同步回调内借出沙箱常规文件读取器，退出时立即失效并关闭。
+func (h *rootHandle) checkDestCB(dest pathalg.LocalRootedDest, fnNil bool) error {
+	if fnNil {
+		return ports.ErrNilCallback
+	}
+	return h.checkActiveDest(dest)
+}
+
+// WithReadRegular 以有界随机只读句柄在同步回调内借出沙箱常规文件（支持顺序读与并发安全 ReadAt），退出即失效关闭。
 //
 //xops:syncclosure
 //xops:borrowed
-func (h *rootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits ports.ReadLimits, fn func(r io.Reader, size int64) error) error {
-	if fn == nil {
-		return ports.ErrNilCallback
-	}
-	if err := h.checkActiveDest(dest); err != nil {
+func (h *rootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits ports.ReadLimits, fn func(r ports.BoundedReadHandle, size int64) error) error {
+	if err := h.checkDestCB(dest, fn == nil); err != nil {
 		return err
 	}
 	if !limits.IsValid() {
 		return ports.ErrInvalidReadLimits
 	}
-	f, err := openRegularFDInRootOS(h.root, dest)
+	f, err := openLeafInRootOS(h.root, dest, leafOpRead, 0)
 	if err != nil {
 		return err
 	}
@@ -130,7 +133,7 @@ func (h *rootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits ports.
 		return fmt.Errorf("%w: %q 大小超限", ports.ErrLimitExceeded, dest.String())
 	}
 	active.Store(true)
-	return fn(&borrowedReader{r: f, remaining: limits.MaxBytes(), limited: true, active: &active}, st.Size())
+	return fn(&borrowedReader{r: f, remaining: limits.MaxBytes(), maxBytes: limits.MaxBytes(), limited: true, active: &active}, st.Size())
 }
 
 // CreateExclusive 以 O_CREAT|O_EXCL|O_NOFOLLOW（Windows 含根锚定 Owner-Only DACL）独占创建新文件，失败自动回滚。
@@ -138,13 +141,10 @@ func (h *rootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits ports.
 //xops:syncclosure
 //xops:borrowed
 func (h *rootHandle) CreateExclusive(dest pathalg.LocalRootedDest, perm fs.FileMode, fn func(w io.Writer) error) error {
-	if fn == nil {
-		return ports.ErrNilCallback
-	}
-	if err := h.checkActiveDest(dest); err != nil {
+	if err := h.checkDestCB(dest, fn == nil); err != nil {
 		return err
 	}
-	f, err := createExclusiveInRootOS(h.root, dest, sanitizeFilePerm(perm, defaultFilePerm))
+	f, err := openLeafInRootOS(h.root, dest, leafOpCreateExcl, sanitizeFilePerm(perm, defaultFilePerm))
 	if err != nil {
 		return err
 	}
@@ -169,11 +169,66 @@ func (h *rootHandle) AtomicReplace(dest pathalg.LocalRootedDest, perm fs.FileMod
 	if err != nil {
 		return err
 	}
-	f, err := createExclusiveInRootOS(h.root, tmpDest, sanitizeFilePerm(perm, defaultFilePerm))
+	f, err := openLeafInRootOS(h.root, tmpDest, leafOpCreateExcl, sanitizeFilePerm(perm, defaultFilePerm))
 	if err != nil {
 		return err
 	}
 	return h.writeScopedFile(f, tmpDest, dest, fn)
+}
+
+// WriteChunk 向沙箱常规暂存文件 dest 的 offset 处非截断写入精确 length 字节并刷盘（不跟随软链）。
+func (h *rootHandle) WriteChunk(dest pathalg.LocalRootedDest, offset int64, r io.Reader, length int64, perm fs.FileMode) (int64, error) {
+	if err := h.checkActiveDest(dest); err != nil {
+		return 0, err
+	}
+	if r == nil || offset < 0 || length < 0 || offset > math.MaxInt64-length || perm == 0 || perm != perm.Perm() {
+		return 0, fmt.Errorf("%w: WriteChunk 参数无效、权限非法或偏移溢出", ports.ErrInvalidArgument)
+	}
+	f, err := openLeafInRootOS(h.root, dest, leafOpWriteChunk, perm)
+	if err != nil {
+		return 0, err
+	}
+	var written int64
+	if length > 0 {
+		if _, err = f.Seek(offset, io.SeekStart); err == nil {
+			written, err = io.CopyN(f, r, length)
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+		}
+	}
+	syncErr, closeErr := f.Sync(), f.Close()
+	if err != nil {
+		return written, mapOSError(err)
+	}
+	return written, mapOSError(errors.Join(syncErr, closeErr))
+}
+
+// Rename 在沙箱根内原子重命名 oldDest -> newDest（非软链校验 + os.Root.Rename + 父目录同步）。
+func (h *rootHandle) Rename(oldDest, newDest pathalg.LocalRootedDest) error {
+	if err := errors.Join(h.prepareDest(oldDest), h.prepareDest(newDest)); err != nil {
+		return err
+	}
+	srcInfo, err := h.root.Lstat(oldDest.String())
+	if err != nil {
+		return mapOSError(err)
+	}
+	if srcInfo.Mode()&fs.ModeSymlink != 0 {
+		return fmt.Errorf("%w: 源路径 %q 为符号链接", ports.ErrSymlinkRejected, oldDest.String())
+	}
+	if _, err := checkLstatKind(h.root, newDest.String(), srcInfo.IsDir(), true); err != nil {
+		return err
+	}
+	if err := h.root.Rename(oldDest.String(), newDest.String()); err != nil {
+		return mapOSError(err)
+	}
+	err = syncRootParentDirOS(h.root, newDest)
+	oldP, hasOld := oldDest.Parent()
+	newP, hasNew := newDest.Parent()
+	if hasOld != hasNew || (hasOld && !oldP.Equal(newP)) {
+		err = errors.Join(err, syncRootParentDirOS(h.root, oldDest))
+	}
+	return err
 }
 
 //xops:syncclosure
@@ -194,11 +249,9 @@ func (h *rootHandle) writeScopedFile(f *os.File, writeDest, renameTarget pathalg
 		return err
 	}
 	active.Store(false)
-	if err := f.Sync(); err != nil {
-		return mapOSError(err)
-	}
+	syncErr := f.Sync()
 	openFile = nil
-	if err := f.Close(); err != nil {
+	if err := errors.Join(syncErr, f.Close()); err != nil {
 		return mapOSError(err)
 	}
 	syncDest := writeDest
@@ -220,7 +273,7 @@ func (h *rootHandle) AppendLine(dest pathalg.LocalRootedDest, perm fs.FileMode, 
 	if err := h.checkActiveDest(dest); err != nil {
 		return err
 	}
-	f, err := openForAppendInRootOS(h.root, dest, sanitizeFilePerm(perm, defaultFilePerm))
+	f, err := openLeafInRootOS(h.root, dest, leafOpAppend, sanitizeFilePerm(perm, defaultFilePerm))
 	if err != nil {
 		return err
 	}
@@ -235,23 +288,17 @@ func (h *rootHandle) AppendLine(dest pathalg.LocalRootedDest, perm fs.FileMode, 
 	return mapOSError(errors.Join(err, f.Close()))
 }
 
-// Stat / Lstat 返回沙箱内目标路径元信息快照（Lstat 不跟随末段符号链接）。
 func (h *rootHandle) Stat(dest pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
 	return h.statDest(dest, false)
 }
 func (h *rootHandle) Lstat(dest pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
 	return h.statDest(dest, true)
 }
-
 func (h *rootHandle) statDest(dest pathalg.LocalRootedDest, lstat bool) (ports.LocalFileInfo, error) {
 	if err := h.checkActiveDest(dest); err != nil {
 		return zeroVal[ports.LocalFileInfo](), err
 	}
-	statFn := h.root.Stat
-	if lstat {
-		statFn = h.root.Lstat
-	}
-	fi, err := statFn(dest.String())
+	fi, err := pickIf(lstat, h.root.Lstat, h.root.Stat)(dest.String())
 	if err != nil {
 		return zeroVal[ports.LocalFileInfo](), mapOSError(err)
 	}
@@ -289,7 +336,6 @@ func collectDirEntries(raw []os.DirEntry) ([]ports.LocalDirEntry, error) {
 	out := make([]ports.LocalDirEntry, 0, len(raw))
 	for _, de := range raw {
 		info, iErr := de.Info()
-		// 多终端启动对账并发删除已退役 .lock 文件时跳过已消失条目，避免整次扫描中止。
 		if errors.Is(iErr, os.ErrNotExist) {
 			continue
 		}
@@ -313,13 +359,12 @@ func (h *rootHandle) MkdirAll(dir pathalg.LocalRootedDest, perm fs.FileMode) err
 	}
 	mode, segs := sanitizeFilePerm(perm, defaultDirPerm), dir.Segments()
 	for i := range segs {
-		prefix := strings.Join(segs[:i+1], "/")
 		if err := mkdirSegmentInRootOS(h.root, segs[:i], segs[i], mode); err == nil {
 			continue
 		} else if !errors.Is(err, os.ErrExist) && !errors.Is(err, ports.ErrAlreadyExists) {
 			return mapOSError(err)
 		}
-		if _, err := checkLstatKind(h.root, prefix, true, false); err != nil {
+		if _, err := checkLstatKind(h.root, strings.Join(segs[:i+1], "/"), true, false); err != nil {
 			return err
 		}
 	}
@@ -348,10 +393,7 @@ func (h *rootHandle) Remove(dest pathalg.LocalRootedDest) error {
 func checkLstatKind(root *os.Root, rel string, wantDir, allowMissing bool) (os.FileInfo, error) {
 	lst, err := root.Lstat(rel)
 	if err != nil {
-		if allowMissing && errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
-		return nil, mapOSError(err)
+		return nil, pickIf[error](allowMissing && errors.Is(err, os.ErrNotExist), nil, mapOSError(err))
 	}
 	if lst.Mode()&fs.ModeSymlink != 0 {
 		return nil, fmt.Errorf("%w: 路径 %q 为符号链接", ports.ErrSymlinkRejected, rel)
@@ -375,48 +417,4 @@ func verifyRegularSameFile(root *os.Root, rel string, f *os.File, allowMissing b
 		return false, err
 	}
 	return os.SameFile(openSt, pathSt), nil
-}
-
-// borrowedReader / borrowedWriter 在作用域关闭后拒绝一切读写，并对读取施加溢出安全字节上限。
-type borrowedReader struct {
-	r         io.Reader
-	remaining int64
-	limited   bool
-	active    *atomic.Bool
-}
-
-func (b *borrowedReader) Read(p []byte) (int, error) {
-	if b == nil || b.active == nil || !b.active.Load() {
-		return 0, ports.ErrHandleExpired
-	}
-	if !b.limited {
-		return b.r.Read(p)
-	}
-	if b.remaining <= 0 {
-		var probe [1]byte
-		if n, err := b.r.Read(probe[:]); n > 0 {
-			return 0, ports.ErrLimitExceeded
-		} else if err != nil {
-			return 0, err
-		}
-		return 0, io.EOF
-	}
-	if int64(len(p)) > b.remaining {
-		p = p[:b.remaining]
-	}
-	n, err := b.r.Read(p)
-	b.remaining -= int64(n)
-	return n, err
-}
-
-type borrowedWriter struct {
-	w      io.Writer
-	active *atomic.Bool
-}
-
-func (b *borrowedWriter) Write(p []byte) (int, error) {
-	if b == nil || b.active == nil || !b.active.Load() {
-		return 0, ports.ErrHandleExpired
-	}
-	return b.w.Write(p)
 }

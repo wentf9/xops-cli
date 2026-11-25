@@ -14,31 +14,19 @@ import (
 )
 
 // PoolConfig 定义连接池 Pool 的运行期初始化配置（纯内存构造参数，非持久化 DTO）。
-// 其中 Dialer、Clock 与 Entropy 为必需依赖；Clock 与 Entropy 经接口注入以确保 P2-T6 仿真完全确定性。
+// Dialer、Clock 与 Entropy 为必需依赖；Clock 与 Entropy 经接口注入确保确定性仿真。
 type PoolConfig struct {
-	// Dialer 为协议无关的 SSH 单跳/多跳拨号出站端口（必需）。
-	Dialer ports.DialerPort
-	// Clock 为时钟与定时器出站端口，驱动 90ms 有界拆断、保活与空闲回收（必需）。
-	Clock ports.Clock
-	// Entropy 为并发安全的显式熵源（满足 io.Reader），用于生成 HandleID 与池级 TraceID（必需）。
-	Entropy ports.Entropy
-	// Bus 为可选系统诊断事件总线（nil 表示不发布系统事件；非 nil 时必须处于已初始化未关闭状态）。
-	Bus *events.SystemBus
-	// Domain 为 trace.LeaseScope 诊断归属标签（为空时默认 "pool"；仅用于诊断，不豁免跨池重入）。
-	Domain string
-	// AcquireBuffer 为 DualActor 有界请求通道 acquireCh 容量（0 使用默认值 DefaultAcquireBuffer）。
-	AcquireBuffer int
-	// MaxConns 为池内活跃连接与在途拨号总数上限（0 表示不设额外上限，负值非法）。
-	MaxConns int
-	// MaxHandles 为世代 SlotMap 活跃托管句柄上限（0 表示不设额外上限，负值非法）。
-	MaxHandles int
-	// TeardownGrace 为连接拆断宽限时长（0 使用默认值 DefaultTeardownGrace=90ms，负值非法）。
-	TeardownGrace time.Duration
-	// IdleTTL 为空闲叶子连接过期回收时长（0 表示禁用后台定时空闲扫描，负值非法）。
-	IdleTTL time.Duration
-	// DefaultKeepaliveInterval 为 HopSpec 未指定 ServerAliveInterval 时的保活回退间隔（0 表示不启用，负值非法）。
-	// 连续保活失败阈值一律严格遵循 HopSpec.Transport().ServerAliveCountMax()（显式 0 按首次超时/失败即退役处理）。
-	DefaultKeepaliveInterval time.Duration
+	Dialer                   ports.DialerPort  // 协议无关 SSH 单跳/多跳拨号端口（必需）
+	Clock                    ports.Clock       // 时钟与定时器端口（驱动 90ms 拆断、保活与空闲回收，必需）
+	Entropy                  ports.Entropy     // 并发安全显式熵源（必需）
+	Bus                      *events.SystemBus // 可选系统诊断事件总线
+	Domain                   string            // trace.LeaseScope 诊断归属标签（默认 "pool"）
+	AcquireBuffer            int               // DualActor 有界请求通道容量（0 取 DefaultAcquireBuffer）
+	MaxConns                 int               // 活跃连接与在途拨号总数上限（0 不限，负值非法）
+	MaxHandles               int               // 世代 SlotMap 活跃托管句柄上限（0 不限，负值非法）
+	TeardownGrace            time.Duration     // 连接拆断宽限时长（0 取 DefaultTeardownGrace=90ms）
+	IdleTTL                  time.Duration     // 空闲叶子连接过期回收时长（0 禁用后台扫描）
+	DefaultKeepaliveInterval time.Duration     // HopSpec 未指定 ServerAliveInterval 时的保活回退间隔
 }
 
 // PoolStats 提供连接池当前的无锁并发安全运行期统计快照。
@@ -62,16 +50,21 @@ type PoolStats struct {
 //xops:opaque
 //xops:failclosed
 type HandleStatus struct {
-	kind       plan.HandleKindCode
-	id         plan.HandleID
-	gen        uint64
-	planDigest plan.PlanDigest
-	binding    security.OperationBinding
-	active     bool
-	valid      bool
+	kind          plan.HandleKindCode
+	id            plan.HandleID
+	gen           uint64
+	planDigest    plan.PlanDigest
+	binding       security.OperationBinding
+	active, valid bool
 }
 
 func zeroVal[T any]() (z T) { return z }
+func pickIf[T any](ok bool, yes, no T) T {
+	if ok {
+		return yes
+	}
+	return no
+}
 
 // HandleStatus 只读访问器（全字段失败关闭，无效零值返回零值或 false）。
 func (s HandleStatus) IsValid() bool {
@@ -80,56 +73,31 @@ func (s HandleStatus) IsValid() bool {
 func (s HandleStatus) IsZero() bool { return !s.IsValid() }
 func (s HandleStatus) Active() bool { return s.IsValid() && s.active }
 func (s HandleStatus) Kind() plan.HandleKindCode {
-	if !s.IsValid() {
-		return plan.HandleKindInvalid
-	}
-	return s.kind
+	return pickIf(s.IsValid(), s.kind, plan.HandleKindInvalid)
 }
-func (s HandleStatus) ID() plan.HandleID {
-	if !s.IsValid() {
-		return zeroVal[plan.HandleID]()
-	}
-	return s.id
-}
-func (s HandleStatus) Generation() uint64 {
-	if !s.IsValid() {
-		return 0
-	}
-	return s.gen
-}
+func (s HandleStatus) ID() plan.HandleID  { return pickIf(s.IsValid(), s.id, zeroVal[plan.HandleID]()) }
+func (s HandleStatus) Generation() uint64 { return pickIf(s.IsValid(), s.gen, 0) }
 func (s HandleStatus) PlanDigest() plan.PlanDigest {
-	if !s.IsValid() {
-		return zeroVal[plan.PlanDigest]()
-	}
-	return s.planDigest
+	return pickIf(s.IsValid(), s.planDigest, zeroVal[plan.PlanDigest]())
 }
 func (s HandleStatus) Binding() security.OperationBinding {
-	if !s.IsValid() {
-		return zeroVal[security.OperationBinding]()
-	}
-	return s.binding
+	return pickIf(s.IsValid(), s.binding, zeroVal[security.OperationBinding]())
 }
 
 // hopInstance 表示池内某一特定世代（epoch >= 1）的已认证单跳传输连接实例。
-//
-// 并发所有权切分：
-//   - 不可变字段（digest/hopSpec/epoch/parent/parentEpoch/conn/revokeCtx/revokeCancel/closeDone）在发布后只读，
-//     数据面、保活协程（直接绑定 revokeCtx）与拆断协程可完全无锁并发读取；
-//   - 原子字段（epochAtom/active/closing/abortClaimed）与 closeOnce 支持控制面与拆断面无锁并发协调；
-//   - Actor 独占字段（activeLeases/children/lastUsed/inActiveMap/planDigests）仅允许在
-//     DualActor 单线程循环（及停机收尾阶段）内读写，零互斥锁竞争。
+// 不可变字段与原子状态支持数据面/拆断面无锁并发读取；
+// activeLeases/pinnedHandles/children/planDigests/lastUsed/inActiveMap 归 DualActor 单线程独占管理。
 type hopInstance struct {
-	digest      plan.HopDigest
-	hopSpec     plan.HopSpec
-	epoch       uint64
-	parent      *hopInstance
-	parentEpoch uint64
-	conn        ports.TransportConn
-
+	digest       plan.HopDigest
+	hopSpec      plan.HopSpec
+	epoch        uint64
+	parent       *hopInstance
+	parentEpoch  uint64
+	conn         ports.TransportConn
 	revokeCtx    context.Context
 	revokeCancel context.CancelCauseFunc
 
-	epochAtom    atomic.Uint64 // 数据面无锁原子世代读视图（与 epoch 同步初始化，退役/吊销清零）
+	epochAtom    atomic.Uint64
 	active       atomic.Bool
 	closing      atomic.Bool
 	abortClaimed atomic.Bool
@@ -137,17 +105,17 @@ type hopInstance struct {
 	closeDone    chan struct{}
 
 	// 以下字段归 DualActor 单线程独占管理。
-	activeLeases int
-	children     map[*hopInstance]struct{}
-	planDigests  map[plan.PlanDigest]struct{}
-	lastUsed     time.Time
-	inActiveMap  bool
+	activeLeases  int
+	pinnedHandles map[plan.HandleID]uint64 // 绑定到本跳实例的活跃托管句柄（id -> gen），防空闲/LRU 驱逐并支持断连同步撤销
+	children      map[*hopInstance]struct{}
+	planDigests   map[plan.PlanDigest]struct{}
+	lastUsed      time.Time
+	inActiveMap   bool
 }
 
 func (h *hopInstance) isValidEpoch(expect uint64) bool {
 	return h != nil && expect > 0 && h.active.Load() && h.epochAtom.Load() == expect
 }
-
 func (h *hopInstance) rootAncestor() *hopInstance {
 	cur := h
 	for cur != nil && cur.parent != nil {
@@ -156,7 +124,7 @@ func (h *hopInstance) rootAncestor() *hopInstance {
 	return cur
 }
 
-// waiterState 描述单次入站租约等待器的无锁 CAS 握手状态，彻底消除 ctx 取消与 Actor 授权间的租约泄漏窗口。
+// waiterState 描述单次入站租约等待器的无锁 CAS 握手状态，消除 ctx 取消与 Actor 授权间的租约泄漏窗口。
 const (
 	waiterWaiting  int32 = 0
 	waiterGranted  int32 = 1
@@ -176,13 +144,8 @@ type acquireWaiter struct {
 }
 
 func newAcquireWaiter(tid security.TraceID, oid algebraic.Option[security.OperationID]) *acquireWaiter {
-	return &acquireWaiter{
-		replyCh: make(chan acquireReply, 1),
-		traceID: tid,
-		opID:    oid,
-	}
+	return &acquireWaiter{replyCh: make(chan acquireReply, 1), traceID: tid, opID: oid}
 }
-
 func (w *acquireWaiter) tryGrant(inst *hopInstance, err error) bool {
 	if !w.state.CompareAndSwap(waiterWaiting, waiterGranted) {
 		return false
@@ -190,12 +153,11 @@ func (w *acquireWaiter) tryGrant(inst *hopInstance, err error) bool {
 	w.replyCh <- acquireReply{inst: inst, err: err}
 	return true
 }
-
 func (w *acquireWaiter) tryCancel() bool {
 	return w.state.CompareAndSwap(waiterWaiting, waiterCanceled)
 }
 
-// dialInflight 记录某个 HopDigest 正在进行的单飞（single-flight）后台拨号状态（仅在 Actor 循环内读写）。
+// dialInflight 记录某个 HopDigest 正在进行的单飞后台拨号状态（仅在 Actor 循环内读写）。
 type dialInflight struct {
 	digest            plan.HopDigest
 	hopSpec           plan.HopSpec
@@ -208,15 +170,13 @@ type dialInflight struct {
 	parentPinReleased bool
 }
 
-// acquireKind 区分通过有界 acquireCh 投递的请求类别。
 type acquireKind uint8
 
 const (
-	acqFastPlan acquireKind = iota + 1 // 尝试单次命中整条已缓存且祖先链全存活的末跳计划
-	acqHop                             // 申请或拨号单个指定跳（可携带父代实例与世代）
+	acqFastPlan acquireKind = iota + 1 // 整链快路径命中缓存末跳
+	acqHop                             // 申请或拨号单个指定跳
 )
 
-// acquireMsg 为 DualActor 请求通道 acquireCh 的内部消息载体。
 type acquireMsg struct {
 	kind        acquireKind
 	connPlan    plan.SealedConnectionPlan
@@ -228,7 +188,6 @@ type acquireMsg struct {
 	waiter      *acquireWaiter
 }
 
-// controlKind 区分通过永不阻塞 controlCh 投递的高优先级控制消息类别。
 type controlKind uint8
 
 const (
@@ -242,20 +201,26 @@ const (
 	ctrlEvictIdle
 	ctrlAbortRoot
 	ctrlGateHalted
+	ctrlPinHandle
+	ctrlUnpinHandle
 )
 
-// controlMsg 为 DualActor 永不阻塞控制队列 controlCh 的内部消息载体。
 type controlMsg struct {
 	kind       controlKind
 	inst       *hopInstance
 	inflight   *dialInflight
 	waiter     *acquireWaiter
 	hopDigest  plan.HopDigest
+	hopEpoch   uint64
 	planDigest plan.PlanDigest
+	handleID   plan.HandleID
+	handleGen  uint64
+	pinStrict  bool
 	conn       ports.TransportConn
 	err        error
 	cutoff     time.Time
 	forceIdle  bool
 	doneCh     chan struct{}
 	countCh    chan int
+	pinErrCh   chan error
 }

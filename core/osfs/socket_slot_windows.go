@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"unsafe"
 
+	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/sys/windows"
 )
 
@@ -44,17 +45,15 @@ func isSocketUnlinkRetryableOS(err error) bool {
 func inspectSocketEntryOS(nativePath string) (socketFileID, SocketProbeStatus, error) {
 	handle, info, openErr := openObjectHandleInfoNoFollow(nativePath, windows.READ_CONTROL)
 	if openErr != nil {
-		if errors.Is(openErr, os.ErrNotExist) || errors.Is(openErr, windows.ERROR_FILE_NOT_FOUND) || errors.Is(openErr, windows.ERROR_PATH_NOT_FOUND) {
+		if mapped := mapWindowsOpenError(nativePath, openErr); errors.Is(mapped, ports.ErrNotFound) {
 			return socketFileID{}, SocketProbeMissing, nil
+		} else {
+			return socketFileID{}, SocketProbeUnknown, mapped
 		}
-		return socketFileID{}, SocketProbeUnknown, mapWindowsOpenError(nativePath, openErr)
 	}
 	defer func() { _ = windows.CloseHandle(handle) }()
 	id := socketFileID{vol: info.VolumeSerialNumber, idxHi: info.FileIndexHigh, idxLo: info.FileIndexLow, valid: true}
-	if verifyAFUnixReparseHandle(handle, nativePath) != nil {
-		return id, SocketProbeNotSocket, nil
-	}
-	return id, SocketProbeUnknown, nil
+	return id, pickIf(verifyAFUnixReparseHandle(handle, nativePath) != nil, SocketProbeNotSocket, SocketProbeUnknown), nil
 }
 
 //xops:syncclosure
@@ -63,14 +62,8 @@ func withSocketDirLockOS(ctx context.Context, dir string, createDir bool, fn fun
 		if err := EnsureOwnerOnlyDirectory(dir); err != nil {
 			return err
 		}
-	} else {
-		currSID, err := CurrentProcessUserSID()
-		if err != nil {
-			return fmt.Errorf("%w: 查询当前用户 SID 失败: %w", ErrInsecurePermissions, err)
-		}
-		if err := VerifyOwnerOnlyDirectoryByHandle(dir, currSID); err != nil {
-			return err
-		}
+	} else if err := verifyOwnerOnlyPathByHandle(dir, true, false, nil); err != nil {
+		return err
 	}
 	f, err := createWindowsOwnerOnlyFile(filepath.Join(dir, windowsSocketDirLockName), windows.OPEN_ALWAYS)
 	if err != nil {
@@ -95,10 +88,7 @@ func listenSocketLockedOS(ctx context.Context, path ControlSocketPath) (*net.Uni
 	}
 	origID, status, err := inspectSocketEntryOS(addr)
 	if err != nil || status != SocketProbeUnknown || !origID.valid {
-		if err == nil {
-			err = ErrNotSocket
-		}
-		return nil, socketFileID{}, cleanupSocketBind(uln, addr, err)
+		return nil, socketFileID{}, cleanupSocketBind(uln, addr, pickIf[error](err != nil, err, ErrNotSocket))
 	}
 	return uln, origID, nil
 }

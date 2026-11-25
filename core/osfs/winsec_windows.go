@@ -12,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/sys/windows"
 )
 
@@ -71,8 +72,7 @@ func sidAccessEntry(sid *windows.SID, t windows.TRUSTEE_TYPE, inh uint32) window
 	}
 }
 
-// NewOwnerOnlySecurityDescriptor 构造 GC 安全的自相对（self-relative）受保护 Owner-Only 安全描述符
-// （当前用户 + LocalSystem 全权，阻断继承），避免绝对 SD 指针逃逸 Go GC 写屏障。
+// NewOwnerOnlySecurityDescriptor 构造 GC 安全的自相对（self-relative）受保护 Owner-Only 安全描述符。
 func NewOwnerOnlySecurityDescriptor(ownerSID *windows.SID, inheritance uint32) (*windows.SECURITY_DESCRIPTOR, error) {
 	if ownerSID == nil || !ownerSID.IsValid() {
 		return nil, fmt.Errorf("%w: 无效所有者 SID", ErrInsecurePermissions)
@@ -92,11 +92,7 @@ func NewOwnerOnlySecurityDescriptor(ownerSID *windows.SID, inheritance uint32) (
 	if err != nil {
 		return nil, err
 	}
-	if err := errors.Join(
-		sd.SetOwner(ownerSID, false),
-		sd.SetDACL(dacl, true, false),
-		sd.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED),
-	); err != nil {
+	if err := errors.Join(sd.SetOwner(ownerSID, false), sd.SetDACL(dacl, true, false), sd.SetControl(windows.SE_DACL_PROTECTED, windows.SE_DACL_PROTECTED)); err != nil {
 		return nil, err
 	}
 	relSD, err := sd.ToSelfRelative()
@@ -104,10 +100,7 @@ func NewOwnerOnlySecurityDescriptor(ownerSID *windows.SID, inheritance uint32) (
 	runtime.KeepAlive(sysSID)
 	runtime.KeepAlive(dacl)
 	runtime.KeepAlive(sd)
-	if err != nil {
-		return nil, err
-	}
-	return relSD, nil
+	return relSD, err
 }
 
 func currentOwnerOnlySD(inheritance uint32) (*windows.SECURITY_DESCRIPTOR, *windows.SID, error) {
@@ -161,11 +154,11 @@ func openObjectHandleInfoNoFollow(path string, desiredAccess uint32) (windows.Ha
 	if err != nil {
 		return windows.InvalidHandle, info, err
 	}
-	ft, err := windows.GetFileType(handle)
-	if err == nil && ft != windows.FILE_TYPE_DISK {
+	if ft, fErr := windows.GetFileType(handle); fErr != nil {
+		err = fErr
+	} else if ft != windows.FILE_TYPE_DISK {
 		err = fmt.Errorf("%w: 非磁盘对象句柄类型 %d", ErrInsecurePermissions, ft)
-	}
-	if err == nil {
+	} else {
 		err = windows.GetFileInformationByHandle(handle, &info)
 	}
 	if err != nil {
@@ -189,18 +182,44 @@ func EnsureOwnerOnlyDirectory(dir string) error {
 		return VerifyOwnerOnlyDirectoryByHandle(absDir, currSID)
 	}
 	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+	return createMissingDirsWin(toCreate, sa, sd, currSID)
+}
+
+func checkDirAttrsNoFollowWin(p string) error {
+	h, attrs, err := OpenObjectHandleNoFollow(p, windows.READ_CONTROL)
+	if err != nil {
+		return mapWindowsOpenError(p, err)
+	}
+	_ = windows.CloseHandle(h)
+	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fmt.Errorf("%w: %w: %q 为重解析点", ErrInsecurePermissions, ports.ErrSymlinkRejected, p)
+	}
+	if attrs&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
+		return fmt.Errorf("%w: %w: %q 不是目录", ErrInsecurePermissions, ports.ErrNotRegularFile, p)
+	}
+	return nil
+}
+
+func createMissingDirsWin(toCreate []string, sa *windows.SecurityAttributes, sd *windows.SECURITY_DESCRIPTOR, ownerSID *windows.SID) error {
 	for i := len(toCreate) - 1; i >= 0; i-- {
-		dirPtr, ptrErr := windows.UTF16PtrFromString(NormalizeWin32LongPath(toCreate[i]))
+		p := toCreate[i]
+		dirPtr, ptrErr := windows.UTF16PtrFromString(NormalizeWin32LongPath(p))
 		if ptrErr != nil {
-			return ptrErr
+			return mapOSError(ptrErr)
 		}
 		createErr := windows.CreateDirectory(dirPtr, sa)
 		runtime.KeepAlive(sd)
 		runtime.KeepAlive(sa)
 		if createErr != nil && !errors.Is(createErr, windows.ERROR_ALREADY_EXISTS) {
-			return mapWindowsOpenError(toCreate[i], createErr)
+			return mapWindowsOpenError(p, createErr)
 		}
-		if vErr := VerifyOwnerOnlyDirectoryByHandle(toCreate[i], currSID); vErr != nil {
+		var vErr error
+		if ownerSID != nil {
+			vErr = VerifyOwnerOnlyDirectoryByHandle(p, ownerSID)
+		} else {
+			vErr = checkDirAttrsNoFollowWin(p)
+		}
+		if vErr != nil {
 			return vErr
 		}
 	}
@@ -214,16 +233,10 @@ func collectMissingDirs(dir string) (string, []string, error) {
 	}
 	var toCreate []string
 	for cur := absDir; ; {
-		handle, attrs, openErr := OpenObjectHandleNoFollow(cur, windows.READ_CONTROL)
-		if openErr == nil {
-			_ = windows.CloseHandle(handle)
-			if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 || attrs&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-				return "", nil, fmt.Errorf("%w: 祖先路径 %q 不是安全实体目录", ErrInsecurePermissions, cur)
-			}
+		if checkErr := checkDirAttrsNoFollowWin(cur); checkErr == nil {
 			return absDir, toCreate, nil
-		}
-		if !errors.Is(openErr, os.ErrNotExist) && !errors.Is(openErr, windows.ERROR_FILE_NOT_FOUND) && !errors.Is(openErr, windows.ERROR_PATH_NOT_FOUND) {
-			return "", nil, fmt.Errorf("%w: 检查祖先目录 %q 失败: %w", ErrInsecurePermissions, cur, openErr)
+		} else if !errors.Is(checkErr, ports.ErrNotFound) {
+			return "", nil, fmt.Errorf("%w: 检查祖先目录 %q 失败: %w", ErrInsecurePermissions, cur, checkErr)
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
@@ -239,13 +252,13 @@ func openWinSecHandleChecked(path string, access uint32, expectDir, expectSocket
 		return windows.InvalidHandle, 0, mapWindowsOpenError(path, err)
 	}
 	if expectSocket {
-		if err := verifyAFUnixReparseHandle(handle, path); err != nil {
-			_ = windows.CloseHandle(handle)
-			return windows.InvalidHandle, 0, err
-		}
+		err = verifyAFUnixReparseHandle(handle, path)
 	} else if !isSafeWin32ObjectAttrs(attrs, expectDir, false) {
+		err = fmt.Errorf("%w: 对象 %q 属性不满足预期", ErrInsecurePermissions, path)
+	}
+	if err != nil {
 		_ = windows.CloseHandle(handle)
-		return windows.InvalidHandle, 0, fmt.Errorf("%w: 对象 %q 属性不满足预期", ErrInsecurePermissions, path)
+		return windows.InvalidHandle, 0, err
 	}
 	return handle, attrs, nil
 }
@@ -254,8 +267,8 @@ func openWinSecHandleChecked(path string, access uint32, expectDir, expectSocket
 func HardenDirectoryOwnerOnly(dir string) error {
 	return hardenObjectOwnerOnlyByHandle(dir, true, false, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 }
-func HardenSocketOwnerOnly(socketPath string) error {
-	return hardenObjectOwnerOnlyByHandle(socketPath, false, true, windows.NO_INHERITANCE)
+func HardenSocketOwnerOnly(p string) error {
+	return hardenObjectOwnerOnlyByHandle(p, false, true, windows.NO_INHERITANCE)
 }
 
 func hardenObjectOwnerOnlyByHandle(path string, expectDir, expectSocket bool, inheritance uint32) error {
@@ -274,28 +287,27 @@ func hardenObjectOwnerOnlyByHandle(path string, expectDir, expectSocket bool, in
 	}
 	err = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
 	runtime.KeepAlive(sd)
-	if err != nil {
-		return fmt.Errorf("%w: SetSecurityInfo 失败: %w", ErrInsecurePermissions, err)
-	}
-	return nil
+	return pickIf[error](err == nil, nil, fmt.Errorf("%w: SetSecurityInfo 失败: %w", ErrInsecurePermissions, err))
 }
 
-// VerifyOwnerOnlyDirectoryByHandle / VerifyOwnerOnlyFileByHandle / VerifyOwnerOnlySocketByHandle 通过无跟随句柄校验 Owner-Only DACL（INV-A4）。
-func VerifyOwnerOnlyDirectoryByHandle(dir string, currSID *windows.SID) error {
-	return verifyOwnerOnlyPathByHandle(dir, true, false, currSID)
+// VerifyOwnerOnlyDirectoryByHandle / VerifyOwnerOnlyFileByHandle / VerifyOwnerOnlySocketByHandle 通过无跟随句柄校验 Owner-Only DACL。
+func VerifyOwnerOnlyDirectoryByHandle(d string, s *windows.SID) error {
+	return verifyOwnerOnlyPathByHandle(d, true, false, s)
 }
-func VerifyOwnerOnlyFileByHandle(filePath string, currSID *windows.SID) error {
-	return verifyOwnerOnlyPathByHandle(filePath, false, false, currSID)
+func VerifyOwnerOnlyFileByHandle(f string, s *windows.SID) error {
+	return verifyOwnerOnlyPathByHandle(f, false, false, s)
 }
-func VerifyOwnerOnlySocketByHandle(socketPath string) error {
-	currSID, err := CurrentProcessUserSID()
-	if err != nil {
-		return fmt.Errorf("%w: 查询当前用户 SID 失败: %w", ErrInsecurePermissions, err)
-	}
-	return verifyOwnerOnlyPathByHandle(socketPath, false, true, currSID)
+func VerifyOwnerOnlySocketByHandle(p string) error {
+	return verifyOwnerOnlyPathByHandle(p, false, true, nil)
 }
 
 func verifyOwnerOnlyPathByHandle(path string, expectDir, expectSocket bool, currSID *windows.SID) error {
+	if currSID == nil {
+		var err error
+		if currSID, err = CurrentProcessUserSID(); err != nil {
+			return fmt.Errorf("%w: 查询当前用户 SID 失败: %w", ErrInsecurePermissions, err)
+		}
+	}
 	handle, attrs, err := openWinSecHandleChecked(path, windows.READ_CONTROL, expectDir, expectSocket)
 	if err != nil {
 		return err
@@ -314,24 +326,19 @@ func verifyOwnerOnlyPathByHandle(path string, expectDir, expectSocket bool, curr
 	if err != nil {
 		return err
 	}
-	if EvaluateWindowsObjectACL(WindowsACLInput{
-		Mode: WindowsACLOwnerOnly, Attrs: attrs, ExpectDir: expectDir, AllowReparse: expectSocket,
-		OwnerTrusted: IsTrustedPrincipalSID(owner, currSID), HasDACL: true, ACEs: aces,
-	}) != security.VerdictAllow {
+	if EvaluateWindowsObjectACL(WindowsACLInput{Mode: WindowsACLOwnerOnly, Attrs: attrs, ExpectDir: expectDir, AllowReparse: expectSocket, OwnerTrusted: IsTrustedPrincipalSID(owner, currSID), HasDACL: true, ACEs: aces}) != security.VerdictAllow {
 		return fmt.Errorf("%w: %q 未通过 Owner-Only DACL 校验", ErrInsecurePermissions, path)
 	}
 	return nil
 }
 
 func verifyAFUnixReparseHandle(handle windows.Handle, path string) error {
-	var tagInfo winFileAttributeTagInfo
-	if err := windows.GetFileInformationByHandleEx(handle, windows.FileAttributeTagInfo, (*byte)(unsafe.Pointer(&tagInfo)), uint32(unsafe.Sizeof(tagInfo))); err != nil {
+	var tag winFileAttributeTagInfo
+	if err := windows.GetFileInformationByHandleEx(handle, windows.FileAttributeTagInfo, (*byte)(unsafe.Pointer(&tag)), uint32(unsafe.Sizeof(tag))); err != nil {
 		return fmt.Errorf("%w: 查询重解析标签失败: %w", ErrNotSocket, err)
 	}
-	if tagInfo.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 ||
-		tagInfo.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 ||
-		tagInfo.ReparseTag != ioReparseTagAFUnix {
-		return fmt.Errorf("%w: %q 不是 AF_UNIX 套接字 (tag=0x%x)", ErrNotSocket, path, tagInfo.ReparseTag)
+	if tag.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 || tag.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 || tag.ReparseTag != ioReparseTagAFUnix {
+		return fmt.Errorf("%w: %q 不是 AF_UNIX 套接字 (tag=0x%x)", ErrNotSocket, path, tag.ReparseTag)
 	}
 	return nil
 }

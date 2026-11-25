@@ -3,14 +3,16 @@ package sim
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"path"
+	"math"
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -22,7 +24,7 @@ type SimScopedRootFS struct {
 	simBase
 	clock  ports.Clock
 	enospc atomic.Bool
-	roots  map[string]*simMemTree
+	roots  map[string]*memtree.Tree
 }
 
 // NewSimScopedRootFS 创建纯内存 ScopedRootFS 仿真器。
@@ -30,7 +32,7 @@ func NewSimScopedRootFS(clk ports.Clock) *SimScopedRootFS {
 	if clk == nil {
 		clk = NewSimClock(DefaultBaseTime())
 	}
-	return &SimScopedRootFS{simBase: newSimBase(nil), clock: clk, roots: make(map[string]*simMemTree)}
+	return &SimScopedRootFS{simBase: newSimBase(nil), clock: clk, roots: make(map[string]*memtree.Tree)}
 }
 
 // SetENOSPC 开启或关闭模拟磁盘满（ENOSPC）故障。
@@ -49,6 +51,22 @@ func (f *SimScopedRootFS) checkOp(op string) error {
 	return nil
 }
 
+// EnsureRoot 幂等确保沙箱根目录 dir 存在，校验 perm 为非零标准权限位且受故障注入约束。
+func (f *SimScopedRootFS) EnsureRoot(dir pathalg.LocalDir, perm fs.FileMode) error {
+	if err := f.check(context.Background(), "fs.ensure_root", dir.IsValid(), perm != 0 && perm == perm.Perm()); err != nil {
+		return err
+	}
+	if f.enospc.Load() {
+		return ErrSimulatedENOSPC
+	}
+	f.withLock(func() {
+		if f.roots[dir.String()] == nil {
+			f.roots[dir.String()] = memtree.New(f.clock, true, perm)
+		}
+	})
+	return nil
+}
+
 // WithRoot 在同步作用域内借出绑定至 dir 的 RootHandle，退出即失效借用哨兵。
 //
 //xops:syncclosure
@@ -57,9 +75,9 @@ func (f *SimScopedRootFS) WithRoot(dir pathalg.LocalDir, fn func(root ports.Root
 	if err := f.checkFn(context.Background(), fn != nil, "fs.root", dir.IsValid()); err != nil {
 		return err
 	}
-	tree := withLockRet(&f.simBase, nil, func() *simMemTree {
+	tree := withLockRet(&f.simBase, nil, func() *memtree.Tree {
 		if f.roots[dir.String()] == nil {
-			f.roots[dir.String()] = newSimMemTree(f.clock, true, 0o700)
+			f.roots[dir.String()] = memtree.New(f.clock, true, 0o700)
 		}
 		return f.roots[dir.String()]
 	})
@@ -70,7 +88,7 @@ func (f *SimScopedRootFS) WithRoot(dir pathalg.LocalDir, fn func(root ports.Root
 
 type simRootHandle struct {
 	fs      *SimScopedRootFS
-	tree    *simMemTree
+	tree    *memtree.Tree
 	valid   bool
 	expired atomic.Bool
 }
@@ -91,60 +109,25 @@ func (h *simRootHandle) withTree(op string, valid bool, fn func() error) error {
 	if err := firstErr(h.checkHandleFn(true, valid), h.fs.checkOp(op)); err != nil {
 		return err
 	}
-	h.tree.mu.Lock()
-	defer h.tree.mu.Unlock()
+	h.tree.Mu.Lock()
+	defer h.tree.Mu.Unlock()
 	return fn()
-}
-func (h *simRootHandle) checkRegularSlotLocked(abs string, exclusive bool) (*simMemNode, error) {
-	if _, err := h.tree.resolveParentLocked(abs, false, true); err != nil {
-		return nil, err
-	}
-	nd := h.tree.nodes[abs]
-	switch {
-	case nd == nil:
-		return nil, nil
-	case nd.kind == ports.RemoteFileSymlink:
-		return nil, ports.ErrSymlinkRejected
-	case exclusive:
-		return nil, ports.ErrAlreadyExists
-	case nd.kind != ports.RemoteFileRegular:
-		return nil, ports.ErrNotRegularFile
-	default:
-		return nd, nil
-	}
-}
-func (h *simRootHandle) openOrCreateRegularLocked(abs string, create, checkWrite bool, perm fs.FileMode) (*simMemNode, error) {
-	nd, err := h.checkRegularSlotLocked(abs, false)
-	if err != nil || nd != nil {
-		return nd, err
-	}
-	if !create {
-		return nil, ports.ErrNotFound
-	}
-	if checkWrite {
-		if err := h.fs.checkOp("fs.write"); err != nil {
-			return nil, err
-		}
-	}
-	nd = &simMemNode{kind: ports.RemoteFileRegular, mode: perm.Perm(), modTime: h.tree.now(), ino: h.tree.allocIno()}
-	h.tree.nodes[abs] = nd
-	return nd, nil
 }
 func (h *simRootHandle) ReadAllBounded(dest pathalg.LocalRootedDest, limits ports.ReadLimits) (out []byte, err error) {
 	if !limits.IsValid() {
 		return nil, firstErr(h.checkHandleFn(true, dest.IsValid()), ports.ErrInvalidReadLimits)
 	}
 	return out, h.withTree("fs.read", dest.IsValid(), func() (e error) {
-		out, e = h.tree.readRegularLocked(normTreePath(dest.String()), false, false, true, limits, ports.ErrNotRegularFile)
+		out, e = h.tree.ReadRegularLocked(memtree.NormPath(dest.String()), false, false, true, limits, ports.ErrNotRegularFile)
 		return e
 	})
 }
 
-// WithReadRegular 以有界只读流借出常规文件读取器。
+// WithReadRegular 以有界随机只读句柄借出常规文件读取器（支持顺序 Read 与并发安全 ReadAt）。
 //
 //xops:syncclosure
 //xops:borrowed
-func (h *simRootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits ports.ReadLimits, fn func(r io.Reader, size int64) error) error {
+func (h *simRootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits ports.ReadLimits, fn func(r ports.BoundedReadHandle, size int64) error) error {
 	if err := h.checkHandleFn(fn != nil, true); err != nil {
 		return err
 	}
@@ -152,7 +135,9 @@ func (h *simRootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits por
 	if err != nil {
 		return err
 	}
-	return withScopedReader(data, fn)
+	r, expire := memtree.NewScopedReader(data, limits.MaxBytes())
+	defer expire()
+	return fn(r, int64(len(data)))
 }
 
 // CreateExclusive 独占创建常规文件；进入回调前先核验父目录与 O_EXCL/O_NOFOLLOW 约束，回调失败零残留。
@@ -174,23 +159,62 @@ func (h *simRootHandle) writeViaCallback(dest pathalg.LocalRootedDest, perm fs.F
 	if err := firstErr(h.checkHandleFn(fn != nil, dest.IsValid()), h.fs.checkOp("fs.write")); err != nil {
 		return err
 	}
-	abs := normTreePath(dest.String())
-	if err := h.withTree("", true, func() error { _, e := h.checkRegularSlotLocked(abs, exclusive); return e }); err != nil {
+	abs := memtree.NormPath(dest.String())
+	if err := h.withTree("", true, func() error { _, e := h.tree.CheckRegularSlotLocked(abs, exclusive); return e }); err != nil {
 		return err
 	}
 	var buf bytes.Buffer
 	var expired atomic.Bool
 	defer expired.Store(true)
-	if err := fn(&simScopedWriter{buf: &buf, expired: &expired, checkWrite: func() error { return h.fs.checkOp("fs.write") }}); err != nil {
+	if err := fn(memtree.NewScopedWriter(&buf, &expired, func() error { return h.fs.checkOp("fs.write") })); err != nil {
 		return err
 	}
 	expired.Store(true)
 	return h.withTree("fs.write", true, func() error {
-		if _, err := h.checkRegularSlotLocked(abs, exclusive); err != nil {
+		if _, err := h.tree.CheckRegularSlotLocked(abs, exclusive); err != nil {
 			return err
 		}
-		h.tree.nodes[abs] = &simMemNode{kind: ports.RemoteFileRegular, mode: perm.Perm(), data: bytes.Clone(buf.Bytes()), modTime: h.tree.now(), ino: h.tree.allocIno()}
+		h.tree.Nodes[abs] = &memtree.Node{Kind: ports.RemoteFileRegular, Mode: perm.Perm(), Data: bytes.Clone(buf.Bytes()), ModTime: h.tree.Now(), Ino: h.tree.AllocIno()}
 		return nil
+	})
+}
+
+// WriteChunk 向暂存文件 dest 的 offset 处非截断写入来自 r 的精确 length 字节；流提前结束返回 (已写字节, io.ErrUnexpectedEOF)。
+func (h *simRootHandle) WriteChunk(dest pathalg.LocalRootedDest, offset int64, r io.Reader, length int64, perm fs.FileMode) (int64, error) {
+	validArgs := dest.IsValid() && offset >= 0 && length >= 0 && offset <= math.MaxInt64-length && r != nil && perm != 0 && perm == perm.Perm()
+	if err := firstErr(h.checkHandleFn(true, validArgs), h.fs.checkOp("fs.write")); err != nil {
+		return 0, err
+	}
+	chunk := make([]byte, length)
+	n, readErr := io.ReadFull(r, chunk)
+	if errors.Is(readErr, io.EOF) && length > 0 {
+		readErr = io.ErrUnexpectedEOF
+	}
+	if readErr != nil && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return 0, readErr
+	}
+	abs := memtree.NormPath(dest.String())
+	if err := h.withTree("fs.write", true, func() error {
+		nd, err := h.tree.OpenOrCreateRegularLocked(abs, true, nil, perm)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			nd.Data = memtree.GrowBytes(nd.Data, offset+int64(n))
+			copy(nd.Data[offset:], chunk[:n])
+		}
+		nd.ModTime = h.tree.Now()
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	return int64(n), readErr
+}
+
+// Rename 在沙箱根内原子重命名 oldDest -> newDest（拒绝符号链接源/目标与跨类型非法覆盖）。
+func (h *simRootHandle) Rename(oldDest, newDest pathalg.LocalRootedDest) error {
+	return h.withTree("fs.write", oldDest.IsValid() && newDest.IsValid(), func() error {
+		return h.tree.RenameLocalLocked(memtree.NormPath(oldDest.String()), memtree.NormPath(newDest.String()))
 	})
 }
 
@@ -220,15 +244,16 @@ func (h *simRootHandle) acquireLockAndRun(ctx context.Context, dest pathalg.Loca
 	if err := h.fs.faults.Check("fs.lock"); err != nil {
 		return false, err
 	}
-	abs := normTreePath(dest.String())
+	abs := memtree.NormPath(dest.String())
+	checkWrite := func() error { return h.fs.checkOp("fs.write") }
 	for {
-		granted, waitCh, err := h.tryAcquireLock(abs, mode, create, perm)
-		if err != nil || !granted && !blocking {
+		granted, waitCh, err := h.tree.TryAcquireLock(abs, mode, create, perm, checkWrite)
+		if err != nil || (!granted && !blocking) {
 			return false, err
 		}
 		if granted {
-			lf := &simLockedFile{fs: h.fs, tree: h.tree, abs: abs, writable: mode == ports.LockExclusive, valid: true}
-			defer func() { lf.expired.Store(true); h.releaseLock(abs, mode) }()
+			lf := memtree.NewLockedFile(h.tree, abs, mode == ports.LockExclusive, checkWrite)
+			defer func() { lf.Expire(); h.tree.ReleaseLock(abs, mode) }()
 			return true, fn(lf)
 		}
 		select {
@@ -238,51 +263,11 @@ func (h *simRootHandle) acquireLockAndRun(ctx context.Context, dest pathalg.Loca
 		}
 	}
 }
-func (h *simRootHandle) tryAcquireLock(abs string, mode ports.LockMode, create bool, perm fs.FileMode) (bool, <-chan struct{}, error) {
-	h.tree.mu.Lock()
-	defer h.tree.mu.Unlock()
-	if _, err := h.openOrCreateRegularLocked(abs, create, true, perm); err != nil {
-		return false, nil, err
-	}
-	lk := h.tree.locks[abs]
-	if lk == nil {
-		lk = &simFileLock{changed: make(chan struct{})}
-		h.tree.locks[abs] = lk
-	}
-	switch {
-	case mode == ports.LockShared && !lk.exclusive:
-		lk.shared++
-		return true, nil, nil
-	case mode == ports.LockExclusive && !lk.exclusive && lk.shared == 0:
-		lk.exclusive = true
-		return true, nil, nil
-	default:
-		return false, lk.changed, nil
-	}
-}
-func (h *simRootHandle) releaseLock(abs string, mode ports.LockMode) {
-	h.tree.mu.Lock()
-	defer h.tree.mu.Unlock()
-	lk := h.tree.locks[abs]
-	if lk == nil {
-		return
-	}
-	if mode == ports.LockExclusive {
-		lk.exclusive = false
-	} else if lk.shared > 0 {
-		lk.shared--
-	}
-	close(lk.changed)
-	lk.changed = make(chan struct{})
-	if !lk.exclusive && lk.shared == 0 {
-		delete(h.tree.locks, abs)
-	}
-}
 func (h *simRootHandle) AppendLine(dest pathalg.LocalRootedDest, perm fs.FileMode, line []byte) error {
 	return h.withTree("fs.write", dest.IsValid() && !bytes.ContainsAny(line, "\r\n"), func() error {
-		nd, err := h.openOrCreateRegularLocked(normTreePath(dest.String()), true, false, perm)
+		nd, err := h.tree.OpenOrCreateRegularLocked(memtree.NormPath(dest.String()), true, nil, perm)
 		if err == nil {
-			nd.data, nd.modTime = append(append(nd.data, line...), '\n'), h.tree.now()
+			nd.Data, nd.ModTime = append(append(nd.Data, line...), '\n'), h.tree.Now()
 		}
 		return err
 	})
@@ -295,9 +280,9 @@ func (h *simRootHandle) Lstat(dest pathalg.LocalRootedDest) (ports.LocalFileInfo
 }
 func (h *simRootHandle) statPath(dest pathalg.LocalRootedDest, follow bool) (out ports.LocalFileInfo, err error) {
 	return out, h.withTree("", dest.IsValid(), func() error {
-		_, nd, e := h.tree.walkPathLocked(normTreePath(dest.String()), follow, follow, false)
+		_, nd, e := h.tree.WalkPathLocked(memtree.NormPath(dest.String()), follow, follow, false)
 		if e == nil {
-			out, e = ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: dest.Base(), Size: int64(len(nd.data)), Mode: nd.mode, ModTime: nd.modTime})
+			out, e = ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: dest.Base(), Size: int64(len(nd.Data)), Mode: nd.Mode, ModTime: nd.ModTime})
 		}
 		return e
 	})
@@ -305,14 +290,14 @@ func (h *simRootHandle) statPath(dest pathalg.LocalRootedDest, follow bool) (out
 func (h *simRootHandle) ReadDir(dir algebraic.Option[pathalg.LocalRootedDest]) (out []ports.LocalDirEntry, err error) {
 	abs, ok := "/", true
 	if d, has := dir.Get(); has {
-		abs, ok = normTreePath(d.String()), d.IsValid()
+		abs, ok = memtree.NormPath(d.String()), d.IsValid()
 	}
 	return out, h.withTree("", ok, func() error {
-		items, e := h.tree.listDirLocked(abs, false, false, true)
+		items, e := h.tree.ListDirLocked(abs, false, false, true)
 		for _, it := range items {
 			if e == nil {
 				var ent ports.LocalDirEntry
-				ent, e = ports.NewLocalDirEntry(it.name, it.node.mode, int64(len(it.node.data)))
+				ent, e = ports.NewLocalDirEntry(it.Name, it.Node.Mode, int64(len(it.Node.Data)))
 				out = append(out, ent)
 			}
 		}
@@ -320,100 +305,24 @@ func (h *simRootHandle) ReadDir(dir algebraic.Option[pathalg.LocalRootedDest]) (
 	})
 }
 func (h *simRootHandle) MkdirAll(dir pathalg.LocalRootedDest, perm fs.FileMode) error {
-	return h.withTree("fs.write", dir.IsValid(), func() error { return h.tree.mkdirAllLocked(normTreePath(dir.String()), perm, false) })
+	return h.withTree("fs.write", dir.IsValid(), func() error { return h.tree.MkdirAllLocked(memtree.NormPath(dir.String()), perm, false) })
 }
 func (h *simRootHandle) CreateSymlink(link pathalg.LocalRootedDest, target string) error {
 	return h.withTree("fs.write", link.IsValid(), func() error {
-		abs := normTreePath(link.String())
-		if _, err := h.tree.resolveParentLocked(abs, false, true); err != nil {
+		abs := memtree.NormPath(link.String())
+		if _, err := h.tree.ResolveParentLocked(abs, false, true); err != nil {
 			return err
 		}
-		if h.tree.nodes[abs] != nil {
+		if h.tree.Nodes[abs] != nil {
 			return ports.ErrAlreadyExists
 		}
-		if err := pathalg.ValidateContainedSymlinkChain(link, target, h.tree.collectSymlinksLocked()); err != nil {
+		if err := pathalg.ValidateContainedSymlinkChain(link, target, h.tree.CollectSymlinksLocked()); err != nil {
 			return fmt.Errorf("%w: %w", ports.ErrSymlinkRejected, err)
 		}
-		h.tree.nodes[abs] = &simMemNode{kind: ports.RemoteFileSymlink, mode: fs.ModeSymlink | 0o777, target: target, modTime: h.tree.now(), ino: h.tree.allocIno()}
+		h.tree.Nodes[abs] = &memtree.Node{Kind: ports.RemoteFileSymlink, Mode: fs.ModeSymlink | 0o777, Target: target, ModTime: h.tree.Now(), Ino: h.tree.AllocIno()}
 		return nil
 	})
 }
 func (h *simRootHandle) Remove(dest pathalg.LocalRootedDest) error {
-	return h.withTree("fs.remove", dest.IsValid(), func() error { return h.tree.removeLocked(normTreePath(dest.String()), false, true) })
-}
-
-type simLockedFile struct {
-	fs       *SimScopedRootFS
-	tree     *simMemTree
-	abs      string
-	offset   int64
-	writable bool
-	valid    bool
-	expired  atomic.Bool
-}
-
-func (lf *simLockedFile) doReg(needWrite, checkFault bool, fn func(*simMemNode) error) error {
-	if lf == nil || !lf.valid || lf.expired.Load() {
-		return ports.ErrHandleExpired
-	}
-	if needWrite && !lf.writable {
-		return ports.ErrPermissionDenied
-	}
-	if checkFault && lf.fs != nil {
-		if err := lf.fs.checkOp("fs.write"); err != nil {
-			return err
-		}
-	}
-	lf.tree.mu.Lock()
-	defer lf.tree.mu.Unlock()
-	if nd := lf.tree.nodes[lf.abs]; nd != nil && nd.kind == ports.RemoteFileRegular {
-		return fn(nd)
-	}
-	return ports.ErrNotFound
-}
-func (lf *simLockedFile) Read(p []byte) (n int, err error) {
-	return n, lf.doReg(false, false, func(nd *simMemNode) error {
-		if lf.offset >= int64(len(nd.data)) {
-			return io.EOF
-		}
-		n = copy(p, nd.data[lf.offset:])
-		lf.offset += int64(n)
-		return nil
-	})
-}
-func (lf *simLockedFile) Write(p []byte) (n int, err error) {
-	return n, lf.doReg(true, true, func(nd *simMemNode) error {
-		nd.data = growBytes(nd.data, lf.offset+int64(len(p)))
-		n = copy(nd.data[lf.offset:], p)
-		lf.offset += int64(n)
-		return nil
-	})
-}
-func (lf *simLockedFile) Seek(offset int64, whence int) (next int64, err error) {
-	return next, lf.doReg(false, false, func(nd *simMemNode) error {
-		bases := [3]int64{0, lf.offset, int64(len(nd.data))}
-		if whence < 0 || whence > 2 || bases[whence]+offset < 0 {
-			return ports.ErrInvalidArgument
-		}
-		next, lf.offset = bases[whence]+offset, bases[whence]+offset
-		return nil
-	})
-}
-func (lf *simLockedFile) Truncate(size int64) error {
-	if size < 0 {
-		return ports.ErrInvalidArgument
-	}
-	return lf.doReg(true, true, func(nd *simMemNode) error {
-		nd.data = bytes.Clone(growBytes(nd.data, size)[:size])
-		return nil
-	})
-}
-func (lf *simLockedFile) Sync() error {
-	return lf.doReg(false, true, func(*simMemNode) error { return nil })
-}
-func (lf *simLockedFile) Stat() (out ports.LocalFileInfo, err error) {
-	return out, lf.doReg(false, false, func(nd *simMemNode) (e error) {
-		out, e = ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: path.Base(lf.abs), Size: int64(len(nd.data)), Mode: nd.mode, ModTime: nd.modTime})
-		return e
-	})
+	return h.withTree("fs.remove", dest.IsValid(), func() error { return h.tree.RemoveLocked(memtree.NormPath(dest.String()), false, true) })
 }

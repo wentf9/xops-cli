@@ -32,27 +32,29 @@ func inspectSocketEntryOS(nativePath string) (socketFileID, SocketProbeStatus, e
 		}
 		return nil, SocketProbeUnknown, mapOSError(err)
 	}
-	if fi.Mode()&fs.ModeSocket == 0 {
-		return fi, SocketProbeNotSocket, nil
-	}
-	return fi, SocketProbeUnknown, nil
+	return fi, pickIf(fi.Mode()&fs.ModeSocket == 0, SocketProbeNotSocket, SocketProbeUnknown), nil
 }
 
 func verifySocketTargetBeforeDialOS(nativePath string) error {
-	switch _, status, err := inspectSocketEntryOS(nativePath); {
+	_, status, err := inspectSocketEntryOS(nativePath)
+	switch {
 	case err != nil:
 		return err
 	case status == SocketProbeMissing:
 		return mapOSError(os.ErrNotExist)
 	case status == SocketProbeNotSocket:
 		return fmt.Errorf("%w: %q 不是 Unix 套接字", ErrNotSocket, nativePath)
-	default:
-		return nil
 	}
+	return nil
 }
 
 //xops:syncclosure
-func withSocketDirLockOS(ctx context.Context, dir string, _ bool, fn func() error) error {
+func withSocketDirLockOS(ctx context.Context, dir string, createDir bool, fn func() error) error {
+	if createDir {
+		if err := ensureDirRawUnix(dir, defaultDirPerm); err != nil {
+			return err
+		}
+	}
 	dirFile, err := os.OpenFile(dir, os.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return mapOSError(err)
@@ -76,13 +78,8 @@ func listenSocketLockedOS(ctx context.Context, path ControlSocketPath) (*net.Uni
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := os.Link(tmpPath, target); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				err = fmt.Errorf("%w: %q", ErrSlotOccupied, target)
-			} else {
-				err = mapOSError(err)
-			}
-			return nil, nil, cleanupSocketBind(uln, tmpPath, err)
+		if lErr := os.Link(tmpPath, target); lErr != nil {
+			return nil, nil, cleanupSocketBind(uln, tmpPath, pickIf(errors.Is(lErr, os.ErrExist), fmt.Errorf("%w: %q", ErrSlotOccupied, target), mapOSError(lErr)))
 		}
 		_ = os.Remove(tmpPath)
 		return uln, origID, nil

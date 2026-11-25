@@ -33,9 +33,12 @@ func TestBorrowedHandleExpirySentinels(t *testing.T) {
 	r := &rootHandle{}
 	_, err = r.ReadAllBounded(dest, lim)
 	assertHandleExpired(t, "rootHandle.ReadAllBounded", err)
-	assertHandleExpired(t, "rootHandle.WithReadRegular", r.WithReadRegular(dest, lim, func(io.Reader, int64) error { return nil }))
+	assertHandleExpired(t, "rootHandle.WithReadRegular", r.WithReadRegular(dest, lim, func(ports.BoundedReadHandle, int64) error { return nil }))
 	assertHandleExpired(t, "rootHandle.CreateExclusive", r.CreateExclusive(dest, 0o600, func(io.Writer) error { return nil }))
 	assertHandleExpired(t, "rootHandle.AtomicReplace", r.AtomicReplace(dest, 0o600, func(io.Writer) error { return nil }))
+	_, err = r.WriteChunk(dest, 0, bytes.NewReader([]byte("x")), 1, 0o600)
+	assertHandleExpired(t, "rootHandle.WriteChunk", err)
+	assertHandleExpired(t, "rootHandle.Rename", r.Rename(dest, dest))
 	assertHandleExpired(t, "rootHandle.AppendLine", r.AppendLine(dest, 0o600, []byte("x")))
 	_, err = r.Stat(dest)
 	assertHandleExpired(t, "rootHandle.Stat", err)
@@ -63,6 +66,8 @@ func TestBorrowedHandleExpirySentinels(t *testing.T) {
 	var off atomic.Bool
 	_, err = (&borrowedReader{r: bytes.NewReader([]byte("hi")), active: &off}).Read(buf[:])
 	assertHandleExpired(t, "borrowedReader.Read", err)
+	_, err = (&borrowedReader{r: bytes.NewReader([]byte("hi")), active: &off}).ReadAt(buf[:], 0)
+	assertHandleExpired(t, "borrowedReader.ReadAt", err)
 	_, err = (&borrowedWriter{w: io.Discard, active: &off}).Write([]byte("hi"))
 	assertHandleExpired(t, "borrowedWriter.Write", err)
 
@@ -77,10 +82,21 @@ func TestBorrowedHandleExpirySentinels(t *testing.T) {
 func TestBorrowedReaderDetectsRuntimeGrowthPastLimit(t *testing.T) {
 	var on atomic.Bool
 	on.Store(true)
-	br := &borrowedReader{r: bytes.NewReader([]byte("12345")), remaining: 4, limited: true, active: &on}
+	br := &borrowedReader{r: bytes.NewReader([]byte("12345")), remaining: 4, maxBytes: 4, limited: true, active: &on}
 	_, err := io.ReadAll(br)
 	if !errors.Is(err, ports.ErrLimitExceeded) {
 		t.Fatalf("超限增长读取 = %v, 期望 ErrLimitExceeded", err)
+	}
+	var chunk [6]byte
+	if _, raErr := br.ReadAt(chunk[:], 0); !errors.Is(raErr, ports.ErrLimitExceeded) {
+		t.Fatalf("超限增长 ReadAt(0..6) = %v, 期望 ErrLimitExceeded", raErr)
+	}
+	if _, raErr := br.ReadAt(chunk[:2], 4); !errors.Is(raErr, ports.ErrLimitExceeded) {
+		t.Fatalf("超限增长 ReadAt(4..6) = %v, 期望 ErrLimitExceeded", raErr)
+	}
+	exact := &borrowedReader{r: bytes.NewReader([]byte("1234")), remaining: 4, maxBytes: 4, limited: true, active: &on}
+	if n, raErr := exact.ReadAt(chunk[:], 0); !errors.Is(raErr, io.EOF) || n != 4 || string(chunk[:4]) != "1234" {
+		t.Fatalf("边界内 ReadAt = (%d, %q, %v), 期望 (4, 1234, EOF)", n, string(chunk[:n]), raErr)
 	}
 }
 

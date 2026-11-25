@@ -244,8 +244,10 @@ func auditStageDecisionOK(stage AuditStage, dec security.GuardrailDecision) bool
 	}
 	switch stage {
 	case AuditStageAuthorized, AuditStageFinalized, AuditStageAbortedByCrash:
-		return dec.Kind() == security.DecisionKindAllow
-	case AuditStageDenied, AuditStageHalted:
+		return dec.Kind() != security.DecisionKindDeny
+	case AuditStageDenied:
+		return dec.Kind() != security.DecisionKindAllow
+	case AuditStageHalted:
 		return dec.Kind() == security.DecisionKindDeny
 	case AuditStageNeedApproval:
 		return dec.Kind() == security.DecisionKindNeedApproval

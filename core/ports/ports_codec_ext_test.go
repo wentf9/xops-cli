@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -125,10 +126,29 @@ func TestVaultTransportAndRemoteFSJSONCodecs(t *testing.T) {
 	assertJSONRoundTrip(t, "PTYRequest", pty, `{"term":"xterm"}`, `{"term":"xterm","size":{"cols":80,"rows":24},"extra":1}`)
 
 	fwd, _ := ports.NewForwardSpec(ports.ForwardLocal, "127.0.0.1:8080", "10.0.0.5:80")
-	assertJSONRoundTrip(t, "ForwardSpec", fwd,
+	assertJSONRoundTrip(t, "ForwardSpec(local)", fwd,
 		`{"direction":"local","bind_addr":"127.0.0.1:8080"}`,
 		`{"direction":"dynamic","bind_addr":"127.0.0.1:1080","target_addr":"bad"}`,
+		`{"direction":"tun","bind_addr":"tun0","target_addr":"tun1"}`,
+		`{"direction":"local","bind_addr":"127.0.0.1:8080","target_addr":"10.0.0.5:80","tun":{"mode":"ethernet","local_unit":0,"remote_unit":0}}`,
 	)
+	tunP2P, _ := ports.NewTUNSpec(ports.TUNModePointToPoint, 0, ports.TUNUnitAny)
+	fwdTUNP2P, err := ports.NewForwardTUNSpec(tunP2P)
+	if err != nil || !fwdTUNP2P.TUN().IsSome() {
+		t.Fatalf("NewForwardTUNSpec(p2p) 失败: (%v, %v)", fwdTUNP2P, err)
+	}
+	assertJSONRoundTrip(t, "ForwardSpec(tun/p2p)", fwdTUNP2P,
+		`{"direction":"tun","bind_addr":"forged","tun":{"mode":"point_to_point","local_unit":0,"remote_unit":1}}`,
+	)
+	tunEth, _ := ports.NewTUNSpec(ports.TUNModeEthernet, 2, 3)
+	fwdTUNEth, err := ports.NewForwardTUNSpec(tunEth)
+	if err != nil || fwdTUNEth.BindAddr() != "tap2" || fwdTUNEth.TargetAddr() != "tap3" {
+		t.Fatalf("NewForwardTUNSpec(ethernet) 失败: (%v, %v)", fwdTUNEth, err)
+	}
+	assertJSONRoundTrip(t, "ForwardSpec(tun/ethernet)", fwdTUNEth)
+	if _, err := ports.NewForwardSpec(ports.ForwardTUN, "tun0", "tun1"); err == nil {
+		t.Fatal("NewForwardSpec(ForwardTUN) 必须失败关闭，强制使用 NewForwardTUNSpec")
+	}
 
 	mresp, _ := ports.NewMuxControlResponse(true, 12345, "running")
 	assertJSONRoundTrip(t, "MuxControlResponse", mresp,
@@ -266,5 +286,70 @@ func TestAuditAndSystemJSONCodecs(t *testing.T) {
 		`{"envelope_digest":"`+dig.String()+`"}`,
 		`{"verdict":null,"envelope_digest":"`+dig.String()+`"}`,
 		`{"verdict":"allow","envelope_digest":"`+dig.String()+`","extra":1}`,
+	)
+}
+
+// TestDownstreamPortJSONCodecs 验证 Phase 2.5/3/4 新增端口值对象的 json/v2 编解码与不变量。
+func TestDownstreamPortJSONCodecs(t *testing.T) {
+	vstat, err := ports.NewVaultStatus(ports.VaultStatusSpec{State: ports.VaultStateUnlocked, KnownStores: []string{"file", "keychain", "file"}, Detail: "ready"})
+	if err != nil || !vstat.IsUnlocked() || len(vstat.KnownStores()) != 2 {
+		t.Fatalf("NewVaultStatus 失败: (%v, %v)", vstat, err)
+	}
+	assertJSONRoundTrip(t, "VaultStatus", vstat, `{"state":"invalid"}`, `{"state":"locked","extra":1}`)
+
+	sum256 := sha256.Sum256([]byte("sshfp-key"))
+	sshfp, err := ports.NewSSHFPRecord(ports.SSHFPRecordSpec{Algorithm: 4, FingerprintType: 2, Digest: sum256[:], Authenticated: true})
+	if err != nil || !sshfp.Authenticated() || sshfp.Algorithm() != 4 || sshfp.FingerprintType() != 2 {
+		t.Fatalf("NewSSHFPRecord 失败: (%v, %v)", sshfp, err)
+	}
+	assertJSONRoundTrip(t, "SSHFPRecord", sshfp,
+		`{"algorithm":4,"fingerprint_type":2,"digest_b64":"AQID"}`,
+		`{"algorithm":4,"fingerprint_type":2,"digest_b64":"!!!","authenticated":true}`,
+	)
+
+	lid, err := ports.NewLocalIdentityInfo(ports.LocalIdentityInfoSpec{LocalHost: "devbox.local", LocalUser: "ops", LocalUID: "1000", HomeDir: "/home/ops"})
+	if err != nil || !lid.IsValid() {
+		t.Fatalf("NewLocalIdentityInfo 失败: (%v, %v)", lid, err)
+	}
+	tctx := lid.ApplyToTokenContext(option.TokenContext{})
+	if tctx.LocalHost != "devbox.local" || tctx.LocalUser != "ops" || tctx.LocalUID != "1000" || tctx.HomeDir != "/home/ops" {
+		t.Fatalf("ApplyToTokenContext 未正确写入字段: %+v", tctx)
+	}
+	assertJSONRoundTrip(t, "LocalIdentityInfo", lid, `{"local_host":"devbox","local_user":"ops"}`, `{"local_host":"devbox","local_user":"ops","home_dir":"/home/ops","extra":1}`)
+
+	tspec, err := ports.NewTUNSpec(ports.TUNModePointToPoint, 0, ports.TUNUnitAny)
+	if err != nil || tspec.LocalUnit() != 0 || tspec.RemoteUnit() != ports.TUNUnitAny {
+		t.Fatalf("NewTUNSpec 失败: (%v, %v)", tspec, err)
+	}
+	assertJSONRoundTrip(t, "TUNSpec", tspec, `{"mode":"point_to_point","local_unit":0}`, `{"mode":"point_to_point","local_unit":9999,"remote_unit":0}`)
+
+	cmd, err := execution.NewCommandPlan(execution.CommandPlanSpec{
+		Kind:    execution.PlanKindCommand,
+		Profile: execution.DefaultServerLaunchProfile(),
+		Command: "systemctl reload nginx",
+	})
+	if err != nil {
+		t.Fatalf("NewCommandPlan 失败: %v", err)
+	}
+	u, _ := option.ParseUsername("root")
+	preq, err := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method: ports.PrivilegeMethodSudo, Command: cmd, TargetUser: algebraic.Some(u),
+		NonInteractive: true, Timeout: algebraic.Some(algebraic.FromStdDuration(10 * time.Second)),
+	})
+	if err != nil || !preq.NonInteractive() {
+		t.Fatalf("NewPrivilegeRequest 失败: (%v, %v)", preq, err)
+	}
+	assertJSONRoundTrip(t, "PrivilegeRequest", preq, `{"method":"invalid"}`, `{"method":"sudo","extra":1}`)
+
+	sprob, err := ports.NewShellProbeResult(ports.ShellProbeResultSpec{
+		Dialect: execution.DialectPOSIX, Interpreter: execution.InterpreterBash,
+		OSFamily: "linux", ProbeStage: 1, RawBanner: "GNU bash 5.2",
+	})
+	if err != nil || !sprob.LaunchProfile().IsValid() || sprob.ProbeStage() != 1 {
+		t.Fatalf("NewShellProbeResult 失败: (%v, %v)", sprob, err)
+	}
+	assertJSONRoundTrip(t, "ShellProbeResult", sprob,
+		`{"dialect":"posix","interpreter":"cmd","probe_stage":1}`,
+		`{"dialect":"posix","interpreter":"bash","probe_stage":3}`,
 	)
 }

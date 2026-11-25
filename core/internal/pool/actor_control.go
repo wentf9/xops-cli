@@ -35,7 +35,59 @@ func (p *Pool) handleControlMsg(msg controlMsg) {
 		p.onAbortRoot(msg.inst, msg.doneCh)
 	case ctrlGateHalted:
 		p.onGateHalted(msg.err, msg.doneCh)
+	case ctrlPinHandle:
+		p.onPinHandle(msg)
+	case ctrlUnpinHandle:
+		p.onUnpinHandle(msg)
 	}
+}
+
+func (p *Pool) onPinHandle(msg controlMsg) {
+	if p.halted.Load() || p.closed.Load() {
+		msg.pinErrCh <- p.terminalStateError()
+		return
+	}
+	target, err := p.resolvePinTarget(msg)
+	if err != nil {
+		msg.pinErrCh <- err
+		return
+	}
+	if target != nil {
+		if !p.slots.bindSlotToHop(msg.handleID, msg.handleGen, target.digest, target.epoch) {
+			msg.pinErrCh <- ErrHandleRevoked
+			return
+		}
+		if target.pinnedHandles == nil {
+			target.pinnedHandles = make(map[plan.HandleID]uint64)
+		}
+		target.pinnedHandles[msg.handleID] = msg.handleGen
+	}
+	msg.pinErrCh <- nil
+}
+
+func (p *Pool) resolvePinTarget(msg controlMsg) (*hopInstance, error) {
+	if msg.pinStrict {
+		cand := p.active[msg.hopDigest]
+		if cand == nil || !cand.inActiveMap || cand.epoch != msg.hopEpoch || !cand.active.Load() {
+			return nil, ErrLeaseRevoked
+		}
+		return cand, nil
+	}
+	if dig, ok := p.byPlan[msg.planDigest]; ok {
+		if cand := p.active[dig]; cand != nil && cand.inActiveMap && cand.active.Load() {
+			return cand, nil
+		}
+	}
+	return nil, nil
+}
+
+func (p *Pool) onUnpinHandle(msg controlMsg) {
+	inst := p.active[msg.hopDigest]
+	if inst == nil || inst.epoch != msg.hopEpoch || inst.pinnedHandles[msg.handleID] != msg.handleGen {
+		return
+	}
+	delete(inst.pinnedHandles, msg.handleID)
+	inst.lastUsed = p.clock.Now()
 }
 
 func (p *Pool) onReleaseLease(inst *hopInstance, doneCh chan struct{}) {
@@ -47,11 +99,8 @@ func (p *Pool) onReleaseLease(inst *hopInstance, doneCh chan struct{}) {
 	inst.lastUsed = p.clock.Now()
 	p.activeLeases.Add(-1)
 	p.emitPoolEvent(poolEventInput{
-		action:       events.PoolActionLeaseReleased,
-		hopDigest:    algebraic.Some(inst.digest),
-		endpoint:     algebraic.Some(inst.hopSpec.Endpoint()),
-		generation:   inst.epoch,
-		activeLeases: inst.activeLeases,
+		action: events.PoolActionLeaseReleased, hopDigest: algebraic.Some(inst.digest),
+		endpoint: algebraic.Some(inst.hopSpec.Endpoint()), generation: inst.epoch, activeLeases: inst.activeLeases,
 	})
 }
 
@@ -186,19 +235,16 @@ func (p *Pool) onRetirePlan(planDigest plan.PlanDigest, doneCh chan struct{}) {
 			victims = append(victims, inf)
 		}
 	}
-	slices.SortFunc(victims, func(a, b *dialInflight) int {
-		return a.digest.Compare(b.digest)
-	})
+	sortInflightByDigest(victims)
 	for _, inf := range victims {
 		p.cancelInflight(inf, ErrHopRetired)
 	}
 }
 
 func (p *Pool) onRetireInstance(inst *hopInstance) {
-	if inst == nil || !inst.inActiveMap || p.active[inst.digest] != inst {
-		return
+	if inst != nil && inst.inActiveMap && p.active[inst.digest] == inst {
+		p.retireSubtree(inst, ErrHopRetired, events.PoolActionRetired, "lease reported broken")
 	}
-	p.retireSubtree(inst, ErrHopRetired, events.PoolActionRetired, "lease reported broken")
 }
 
 func (p *Pool) onKeepaliveFailed(inst *hopInstance, err error) {
@@ -233,7 +279,7 @@ func (p *Pool) onEvictIdle(cutoff time.Time, forceAll bool, countCh chan int) {
 func (p *Pool) collectIdleLeaves(cutoff time.Time, forceAll bool) []*hopInstance {
 	var batch []*hopInstance
 	for _, inst := range p.active {
-		if inst.activeLeases == 0 && len(inst.children) == 0 && (forceAll || !inst.lastUsed.After(cutoff)) {
+		if inst.activeLeases == 0 && len(inst.pinnedHandles) == 0 && len(inst.children) == 0 && (forceAll || !inst.lastUsed.After(cutoff)) {
 			batch = append(batch, inst)
 		}
 	}
@@ -278,16 +324,16 @@ func (p *Pool) onGateHalted(cause error, doneCh chan struct{}) {
 
 	batch := make([]*hopInstance, 0, len(p.active))
 	for _, inst := range p.active {
+		pinned := inst.pinnedHandles
+		inst.pinnedHandles = nil
 		p.deactivateInstance(inst, cause)
+		p.revokeSlotsForHop(pinned, cause)
 		batch = append(batch, inst)
 	}
 	clear(p.active)
 	clear(p.byPlan)
 
-	p.emitPoolEvent(poolEventInput{
-		action: events.PoolActionGateHalted,
-		detail: cause.Error(),
-	})
+	p.emitPoolEvent(poolEventInput{action: events.PoolActionGateHalted, detail: cause.Error()})
 	if len(batch) > 0 {
 		sortLeavesFirst(batch)
 		p.scheduleTeardownBatch(batch)
@@ -344,7 +390,10 @@ func (p *Pool) detachInstance(inst *hopInstance, cause error, action events.Pool
 		delete(inst.parent.children, inst)
 	}
 	clear(inst.children)
+	pinned := inst.pinnedHandles
+	inst.pinnedHandles = nil
 	p.deactivateInstance(inst, cause)
+	p.revokeSlotsForHop(pinned, cause)
 	p.emitPoolEvent(poolEventInput{
 		action: action, hopDigest: algebraic.Some(inst.digest),
 		endpoint:   algebraic.Some(inst.hopSpec.Endpoint()),
@@ -365,19 +414,18 @@ func (p *Pool) cancelInflightChildren(detached map[*hopInstance]bool, cause erro
 			victims = append(victims, inf)
 		}
 	}
-	slices.SortFunc(victims, func(a, b *dialInflight) int {
-		return a.digest.Compare(b.digest)
-	})
-	childErr := ErrParentEpochChanged
-	if errors.Is(cause, ErrGateHalted) {
-		childErr = cause
-	}
+	sortInflightByDigest(victims)
+	childErr := pickIf(errors.Is(cause, ErrGateHalted), cause, ErrParentEpochChanged)
 	for _, inf := range victims {
 		if errors.Is(childErr, ErrParentEpochChanged) {
 			p.parentCASRejects.Add(1)
 		}
 		p.cancelInflight(inf, childErr)
 	}
+}
+
+func sortInflightByDigest(victims []*dialInflight) {
+	slices.SortFunc(victims, func(a, b *dialInflight) int { return a.digest.Compare(b.digest) })
 }
 
 func (p *Pool) cancelInflight(inf *dialInflight, err error) {

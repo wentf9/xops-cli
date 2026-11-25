@@ -11,11 +11,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
+	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -200,13 +200,31 @@ func (c *SimTransportConn) DialTCP(ctx context.Context, target netaddr.HostPort)
 	if err := c.checkAliveOp(ctx, ""); err != nil || !target.IsValid() {
 		return nil, firstErr(err, ports.ErrInvalidArgument)
 	}
-	return &simEchoConn{addr: simAddr(target.String())}, nil
+	return memtree.NewEchoConn(target.String()), nil
 }
 func (c *SimTransportConn) ListenTCP(ctx context.Context, bindAddr string) (net.Listener, error) {
 	if err := c.checkAliveOp(ctx, ""); err != nil || bindAddr == "" {
 		return nil, firstErr(err, ports.ErrInvalidArgument)
 	}
-	return &simMemListener{addr: simAddr(bindAddr)}, nil
+	return memtree.NewMemListener(bindAddr, nil), nil
+}
+func (c *SimTransportConn) DialStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Conn, error) {
+	if err := c.checkAliveOp(ctx, "conn.streamlocal"); err != nil || !remoteSocket.IsValid() {
+		return nil, firstErr(err, ports.ErrInvalidArgument)
+	}
+	return memtree.NewEchoConn("unix:" + remoteSocket.String()), nil
+}
+func (c *SimTransportConn) ListenStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Listener, error) {
+	if err := c.checkAliveOp(ctx, "conn.streamlocal"); err != nil || !remoteSocket.IsValid() {
+		return nil, firstErr(err, ports.ErrInvalidArgument)
+	}
+	return memtree.NewMemListener("unix:"+remoteSocket.String(), nil), nil
+}
+func (c *SimTransportConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, error) {
+	if err := c.checkAliveOp(ctx, "conn.tun"); err != nil || !spec.IsValid() {
+		return nil, firstErr(err, ports.ErrInvalidArgument)
+	}
+	return memtree.NewEchoConn(fmt.Sprintf("tun:%s:%d:%d", spec.Mode(), spec.LocalUnit(), spec.RemoteUnit())), nil
 }
 func (c *SimTransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	if err := c.checkAliveOp(ctx, "conn.remotefs"); err != nil {
@@ -230,15 +248,17 @@ func (c *SimTransportConn) checkAliveOp(ctx context.Context, faultOp string) err
 	return nil
 }
 
-// SimRemoteSession 实现 ports.RemoteSession。
+// SimRemoteSession 实现 ports.RemoteSession，支持前置管道获取及与 ExecStreams 互斥校验。
 //
 //xops:opaque
 //xops:failclosed
 type SimRemoteSession struct {
-	conn            *SimTransportConn
-	prof            HopFaultProfile
-	initialized     bool
-	started, closed atomic.Bool
+	mu                                sync.Mutex
+	conn                              *SimTransportConn
+	prof                              HopFaultProfile
+	initialized                       bool
+	started, closed                   atomic.Bool
+	stdinPipe, stdoutPipe, stderrPipe *memtree.StreamPipe
 }
 
 func (s *SimRemoteSession) checkOpen(ctx context.Context, needConn bool) error {
@@ -250,22 +270,62 @@ func (s *SimRemoteSession) checkOpen(ctx context.Context, needConn bool) error {
 	}
 	return nil
 }
+func (s *SimRemoteSession) allocPipe(slot **memtree.StreamPipe) (*memtree.StreamPipe, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.initialized || s.closed.Load() {
+		return nil, ports.ErrClosed
+	}
+	if s.started.Load() || *slot != nil {
+		return nil, ports.ErrInvalidArgument
+	}
+	*slot = memtree.NewStreamPipe()
+	return *slot, nil
+}
+func (s *SimRemoteSession) StdinPipe() (io.WriteCloser, error) { return s.allocPipe(&s.stdinPipe) }
+func (s *SimRemoteSession) StdoutPipe() (io.Reader, error)     { return s.allocPipe(&s.stdoutPipe) }
+func (s *SimRemoteSession) StderrPipe() (io.Reader, error)     { return s.allocPipe(&s.stderrPipe) }
+
+func (s *SimRemoteSession) beginStartLocked(streams ports.ExecStreams) error {
+	if s.started.Load() || (s.stdinPipe != nil && streams.Stdin != nil) || (s.stdoutPipe != nil && streams.Stdout != nil) || (s.stderrPipe != nil && streams.Stderr != nil) {
+		return ports.ErrInvalidArgument
+	}
+	s.started.Store(true)
+	return nil
+}
 func (s *SimRemoteSession) Start(ctx context.Context, cmd execution.CommandPlan, streams ports.ExecStreams) error {
 	if err := firstErr(s.checkOpen(ctx, true), s.prof.SessionStartErr); err != nil || !cmd.IsValid() {
 		return firstErr(err, ports.ErrInvalidArgument)
 	}
-	s.started.Store(true)
-	if streams.Stdout != nil {
-		_, _ = io.WriteString(streams.Stdout, cmp.Or(s.prof.SessionOutput, "tck-ok\n"))
+	s.mu.Lock()
+	err := s.beginStartLocked(streams)
+	outPipe, errPipe := s.stdoutPipe, s.stderrPipe
+	s.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	payload := cmp.Or(s.prof.SessionOutput, "tck-ok\n")
+	if outPipe != nil {
+		_, _ = io.WriteString(outPipe, payload)
+		_ = outPipe.Close()
+	} else if streams.Stdout != nil {
+		_, _ = io.WriteString(streams.Stdout, payload)
+	}
+	if errPipe != nil {
+		_ = errPipe.Close()
 	}
 	return nil
 }
-func (s *SimRemoteSession) StartShell(ctx context.Context, _ algebraic.Option[ports.PTYRequest], _ ports.ExecStreams) error {
+func (s *SimRemoteSession) StartShell(ctx context.Context, streams ports.ExecStreams) error {
 	if err := s.checkOpen(ctx, true); err != nil {
 		return err
 	}
-	s.started.Store(true)
-	return nil
+	if ptyReq, ok := streams.PTY.Get(); ok && !ptyReq.IsValid() {
+		return ports.ErrInvalidArgument
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.beginStartLocked(streams)
 }
 func (s *SimRemoteSession) ResizePTY(ctx context.Context, size ports.TerminalSize) error {
 	if err := s.checkOpen(ctx, false); err != nil || !size.IsValid() {
@@ -291,7 +351,18 @@ func (s *SimRemoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome
 	}
 	return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
 }
-func (s *SimRemoteSession) Close() error { s.closed.Store(true); return nil }
+func (s *SimRemoteSession) Close() error {
+	s.closed.Store(true)
+	s.mu.Lock()
+	pipes := [3]*memtree.StreamPipe{s.stdinPipe, s.stdoutPipe, s.stderrPipe}
+	s.mu.Unlock()
+	for _, p := range pipes {
+		if p != nil {
+			_ = p.Close()
+		}
+	}
+	return nil
+}
 
 // SimMuxSocket 实现 ports.MuxSocketPort 的零 OS 套接字纯内存仿真器。
 //
@@ -351,15 +422,15 @@ func (m *SimMuxSocket) DialMux(ctx context.Context, sockPath pathalg.LocalSource
 	return m.dialer.newConn(plan.HopDigestFromSHA256([32]byte{1}), ep, nil, HopFaultProfile{}), nil
 }
 
-// WithListener 在同步闭包内借出带失效哨兵的纯内存 net.Listener，退出时自动失效并注销。
+// WithListener 在同步闭包内借出带失效哨兵的纯内存 net.Listener，退出时自动失效并注销（兼容含 ':' 路径）。
 //
 //xops:syncclosure
 //xops:borrowed
-func (m *SimMuxSocket) WithListener(ctx context.Context, dir pathalg.LocalDir, name pathalg.LocalRootedDest, fn func(ln net.Listener) error) error {
-	if err := m.checkFn(ctx, fn != nil, "mux.listen", dir.IsValid(), name.IsValid()); err != nil {
+func (m *SimMuxSocket) WithListener(ctx context.Context, socketPath pathalg.LocalSourcePath, fn func(ln net.Listener) error) error {
+	if err := m.checkFn(ctx, fn != nil, "mux.listen", socketPath.IsValid()); err != nil {
 		return err
 	}
-	addr := dir.String() + "/" + name.String()
+	addr := socketPath.String()
 	if withLockRet(&m.simBase, true, func() bool {
 		if m.masters[addr] != 0 {
 			return true
@@ -371,5 +442,5 @@ func (m *SimMuxSocket) WithListener(ctx context.Context, dir pathalg.LocalDir, n
 	}
 	var expired atomic.Bool
 	defer func() { expired.Store(true); m.withLock(func() { delete(m.masters, addr) }) }()
-	return fn(&simMemListener{addr: simAddr(addr), expired: &expired})
+	return fn(memtree.NewMemListener(addr, &expired))
 }

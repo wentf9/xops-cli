@@ -3,6 +3,7 @@ package pool
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -202,10 +204,13 @@ type mockSession struct {
 	closed atomic.Bool
 }
 
+func (s *mockSession) StdinPipe() (io.WriteCloser, error) { return nil, ports.ErrUnsupported }
+func (s *mockSession) StdoutPipe() (io.Reader, error)     { return nil, ports.ErrUnsupported }
+func (s *mockSession) StderrPipe() (io.Reader, error)     { return nil, ports.ErrUnsupported }
 func (s *mockSession) Start(context.Context, execution.CommandPlan, ports.ExecStreams) error {
 	return nil
 }
-func (s *mockSession) StartShell(context.Context, algebraic.Option[ports.PTYRequest], ports.ExecStreams) error {
+func (s *mockSession) StartShell(context.Context, ports.ExecStreams) error {
 	return nil
 }
 func (s *mockSession) ResizePTY(context.Context, ports.TerminalSize) error { return nil }
@@ -269,6 +274,46 @@ func (c *mockConn) ListenTCP(ctx context.Context, _ string) (net.Listener, error
 		return nil, ports.ErrClosed
 	}
 	return nil, ports.ErrUnsupported
+}
+func (c *mockConn) DialStreamLocal(ctx context.Context, p pathalg.RemotePath) (net.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.alive.Load() {
+		return nil, ports.ErrClosed
+	}
+	if !p.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	a, b := net.Pipe()
+	_ = b.Close()
+	return a, nil
+}
+func (c *mockConn) ListenStreamLocal(ctx context.Context, p pathalg.RemotePath) (net.Listener, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.alive.Load() {
+		return nil, ports.ErrClosed
+	}
+	if !p.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	return nil, ports.ErrUnsupported
+}
+func (c *mockConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.alive.Load() {
+		return nil, ports.ErrClosed
+	}
+	if !spec.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	a, b := net.Pipe()
+	_ = b.Close()
+	return a, nil
 }
 func (c *mockConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	if err := ctx.Err(); err != nil {
@@ -595,6 +640,18 @@ func TestLeaseRuntimeInvalidationSentinelAndABASafeRetire(t *testing.T) {
 	requireNoErr(t, conn.Close(), "conn.Close")
 	_, err = l1.ListenTCP(ctx, "127.0.0.1:0")
 	requireErrIs(t, err, ports.ErrUnsupported, "ListenTCP 透传")
+	rp, err := pathalg.ParseRemotePath("/run/test.sock")
+	requireNoErr(t, err, "ParseRemotePath")
+	slConn, err := l1.DialStreamLocal(ctx, rp)
+	requireNoErr(t, err, "DialStreamLocal(active)")
+	requireNoErr(t, slConn.Close(), "slConn.Close")
+	_, err = l1.ListenStreamLocal(ctx, rp)
+	requireErrIs(t, err, ports.ErrUnsupported, "ListenStreamLocal 透传")
+	tunSpec, err := ports.NewTUNSpec(ports.TUNModePointToPoint, 0, 0)
+	requireNoErr(t, err, "NewTUNSpec")
+	tunCh, err := l1.OpenTUN(ctx, tunSpec)
+	requireNoErr(t, err, "OpenTUN(active)")
+	requireNoErr(t, tunCh.Close(), "tunCh.Close")
 	_, err = l1.OpenRemoteFS(ctx)
 	requireErrIs(t, err, ports.ErrUnsupported, "OpenRemoteFS 透传")
 
@@ -608,6 +665,12 @@ func TestLeaseRuntimeInvalidationSentinelAndABASafeRetire(t *testing.T) {
 	requireErrIs(t, err, ErrLeaseExpired, "失效后 DialTCP")
 	_, err = l1.ListenTCP(ctx, "127.0.0.1:0")
 	requireErrIs(t, err, ErrLeaseExpired, "失效后 ListenTCP")
+	_, err = l1.DialStreamLocal(ctx, rp)
+	requireErrIs(t, err, ErrLeaseExpired, "失效后 DialStreamLocal")
+	_, err = l1.ListenStreamLocal(ctx, rp)
+	requireErrIs(t, err, ErrLeaseExpired, "失效后 ListenStreamLocal")
+	_, err = l1.OpenTUN(ctx, tunSpec)
+	requireErrIs(t, err, ErrLeaseExpired, "失效后 OpenTUN")
 	_, err = l1.OpenRemoteFS(ctx)
 	requireErrIs(t, err, ErrLeaseExpired, "失效后 OpenRemoteFS")
 	p.releaseHopLease(inst1)

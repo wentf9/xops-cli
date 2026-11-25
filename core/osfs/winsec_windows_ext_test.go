@@ -90,7 +90,7 @@ func TestWindowsOwnerOnlyDirectoryAndLongPath(t *testing.T) {
 	opFS := osfs.NewOperatorReadFS()
 	src := mustLocalSource(t, filepath.Join(deep, "long.dat"))
 	var got []byte
-	if err := opFS.WithOperatorRead(context.Background(), src, pathalg.SymlinkReject, func(r io.Reader, _ int64) error {
+	if err := opFS.WithOperatorRead(context.Background(), src, pathalg.SymlinkReject, func(r ports.BoundedReadHandle, _ int64) error {
 		var rErr error
 		got, rErr = io.ReadAll(r)
 		return rErr

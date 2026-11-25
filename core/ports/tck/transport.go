@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"io/fs"
 	"net"
 	"strings"
 	"testing"
@@ -25,12 +26,14 @@ type DialerFixture struct {
 	CheckMultiHop bool
 	// CheckRemoteFS 为 true 时验证 TransportConn.OpenRemoteFS 可打开可用 RemoteFSPort。
 	CheckRemoteFS bool
+	// CheckTunnelExtensions 为 true 时验证 DialStreamLocal、ListenStreamLocal 与 OpenTUN 成功返回并可关闭。
+	CheckTunnelExtensions bool
 }
 
 // MuxSocketFixture 描述 MuxSocketPort 契约测试夹具。
 type MuxSocketFixture struct {
-	// NewMux 返回待测多路复用套接字端口、监听目录与套接字相对文件名。
-	NewMux func(t *testing.T) (ports.MuxSocketPort, pathalg.LocalDir, pathalg.LocalRootedDest)
+	// NewMux 返回待测多路复用套接字端口与用于 WithListener 的合法本机套接字路径（可含 OpenSSH ':'）。
+	NewMux func(t *testing.T) (ports.MuxSocketPort, pathalg.LocalSourcePath)
 	// ExistingSocket 指向活跃 ControlMaster 套接字路径（可选；提供时验证 Probe/Control/DialMux）。
 	ExistingSocket algebraic.Option[pathalg.LocalSourcePath]
 }
@@ -78,6 +81,7 @@ func RunDialerSuite(t *testing.T, fx DialerFixture) {
 		requireNoErr(t, conn.SendKeepalive(ctx), "SendKeepalive")
 
 		verifyRemoteSessionLifecycle(t, ctx, conn, cmdText)
+		verifyTransportTunnelExtensions(t, ctx, conn, fx.CheckTunnelExtensions)
 
 		if fx.CheckRemoteFS {
 			rfs, rErr := conn.OpenRemoteFS(ctx)
@@ -116,9 +120,94 @@ func verifyRemoteSessionLifecycle(t *testing.T, ctx context.Context, conn ports.
 	requireTrue(t, ok && completed.Succeeded(), "测试命令须以成功 ExitStatus 完成")
 	requireNoErr(t, sess.Close(), "RemoteSession.Close(1)")
 	requireNoErr(t, sess.Close(), "RemoteSession.Close(2, idempotent)")
+
+	// 验证统一 ExecStreams.PTY + Env 驱动的 StartShell 契约。
+	shellSess, err := conn.OpenSession(ctx)
+	requireNoErr(t, err, "OpenSession(shell)")
+	sz, err := ports.NewTerminalSize(80, 24)
+	requireNoErr(t, err, "NewTerminalSize")
+	ptyReq, err := ports.NewPTYRequest("xterm-256color", sz)
+	requireNoErr(t, err, "NewPTYRequest")
+	err = shellSess.StartShell(ctx, ports.ExecStreams{PTY: algebraic.Some(ptyReq), Env: map[string]string{"LANG": "C.UTF-8"}})
+	requireNoErr(t, err, "RemoteSession.StartShell")
+	_, pErr := shellSess.StdinPipe()
+	requireErr(t, pErr, "StartShell 后获取 StdinPipe 必须拒绝")
+	requireNoErr(t, shellSess.Close(), "RemoteSession(shell).Close")
+
+	verifyRemoteSessionPipes(t, ctx, conn, cmdText)
 }
 
-// RunMuxSocketSuite 验证 MuxSocketPort 的参数校验、作用域监听生命周期与控制面契约（INV-A3 / INV-C4）。
+func verifyRemoteSessionPipes(t *testing.T, ctx context.Context, conn ports.TransportConn, cmdText string) {
+	t.Helper()
+	sess, err := conn.OpenSession(ctx)
+	requireNoErr(t, err, "OpenSession(pipes)")
+	stdinW, err := sess.StdinPipe()
+	requireNoErr(t, err, "StdinPipe")
+	stdoutR, err := sess.StdoutPipe()
+	requireNoErr(t, err, "StdoutPipe")
+	stderrR, err := sess.StderrPipe()
+	requireNoErr(t, err, "StderrPipe")
+
+	// 重复获取与非空 ExecStreams 混用均须严格拒绝。
+	_, err = sess.StdinPipe()
+	requireErr(t, err, "重复 StdinPipe 必须拒绝")
+	_, err = sess.StdoutPipe()
+	requireErr(t, err, "重复 StdoutPipe 必须拒绝")
+	_, err = sess.StderrPipe()
+	requireErr(t, err, "重复 StderrPipe 必须拒绝")
+
+	cmd := MustCommandPlan(t, cmdText)
+	var clash bytes.Buffer
+	requireErr(t, sess.Start(ctx, cmd, ports.ExecStreams{Stdin: strings.NewReader("x")}), "StdinPipe 与 ExecStreams.Stdin 互斥")
+	requireErr(t, sess.Start(ctx, cmd, ports.ExecStreams{Stdout: &clash}), "StdoutPipe 与 ExecStreams.Stdout 互斥")
+	requireErr(t, sess.Start(ctx, cmd, ports.ExecStreams{Stderr: &clash}), "StderrPipe 与 ExecStreams.Stderr 互斥")
+
+	requireNoErr(t, sess.Start(ctx, cmd, ports.ExecStreams{}), "Start(pipes)")
+	_, err = sess.StdoutPipe()
+	requireErr(t, err, "Start 后 StdoutPipe 必须拒绝")
+	requireNoErr(t, stdinW.Close(), "StdinPipe.Close")
+	outBytes, err := io.ReadAll(stdoutR)
+	requireNoErr(t, err, "ReadAll(StdoutPipe)")
+	_, err = io.ReadAll(stderrR)
+	requireNoErr(t, err, "ReadAll(StderrPipe)")
+	requireTrue(t, len(outBytes) > 0, "StdoutPipe 应读到命令输出")
+	out, err := sess.Wait(ctx)
+	requireNoErr(t, err, "Wait(pipes)")
+	requireTrue(t, out != nil && out.IsValid(), "Wait(pipes) Outcome 必须有效")
+	requireNoErr(t, sess.Close(), "Close(pipes)")
+	_, err = sess.StdinPipe()
+	requireErr(t, err, "Close 后 StdinPipe 必须拒绝")
+}
+
+func verifyTransportTunnelExtensions(t *testing.T, ctx context.Context, conn ports.TransportConn, requireOK bool) {
+	t.Helper()
+	var zeroRP pathalg.RemotePath
+	var zeroTUN ports.TUNSpec
+	_, err := conn.DialStreamLocal(ctx, zeroRP)
+	requireErr(t, err, "DialStreamLocal(zero path)")
+	_, err = conn.ListenStreamLocal(ctx, zeroRP)
+	requireErr(t, err, "ListenStreamLocal(zero path)")
+	_, err = conn.OpenTUN(ctx, zeroTUN)
+	requireErr(t, err, "OpenTUN(zero spec)")
+	if !requireOK {
+		return
+	}
+	rp, err := pathalg.ParseRemotePath("/run/tck.sock")
+	requireNoErr(t, err, "ParseRemotePath")
+	c, err := conn.DialStreamLocal(ctx, rp)
+	requireNoErr(t, err, "DialStreamLocal")
+	requireNoErr(t, c.Close(), "DialStreamLocal.Close")
+	ln, err := conn.ListenStreamLocal(ctx, rp)
+	requireNoErr(t, err, "ListenStreamLocal")
+	requireNoErr(t, ln.Close(), "ListenStreamLocal.Close")
+	ts, err := ports.NewTUNSpec(ports.TUNModePointToPoint, 0, 0)
+	requireNoErr(t, err, "NewTUNSpec")
+	tun, err := conn.OpenTUN(ctx, ts)
+	requireNoErr(t, err, "OpenTUN")
+	requireNoErr(t, tun.Close(), "OpenTUN.Close")
+}
+
+// RunMuxSocketSuite 验证 MuxSocketPort 的参数校验、统一 socketPath 作用域监听生命周期与控制面契约（INV-A3 / INV-C4）。
 func RunMuxSocketSuite(t *testing.T, fx MuxSocketFixture) {
 	t.Helper()
 	requireTrue(t, fx.NewMux != nil, "MuxSocketFixture.NewMux 不能为 nil")
@@ -126,10 +215,8 @@ func RunMuxSocketSuite(t *testing.T, fx MuxSocketFixture) {
 	t.Run("ValidationAndScopedListener", func(t *testing.T) {
 		defer VerifyNoLeaks(t)
 		ctx := context.Background()
-		mux, dir, sockName := fx.NewMux(t)
+		mux, listenPath := fx.NewMux(t)
 		var nilCtx context.Context
-		var zeroDir pathalg.LocalDir
-		var zeroName pathalg.LocalRootedDest
 		var zeroSrc pathalg.LocalSourcePath
 		var zeroReq ports.MuxControlRequest
 
@@ -146,13 +233,12 @@ func RunMuxSocketSuite(t *testing.T, fx MuxSocketFixture) {
 		_, err = mux.DialMux(ctx, zeroSrc)
 		requireErr(t, err, "DialMux(zero path)")
 
-		requireErrIs(t, mux.WithListener(nilCtx, dir, sockName, func(net.Listener) error { return nil }), ports.ErrNilContext, "WithListener(nil ctx)")
-		requireErrIs(t, mux.WithListener(ctx, dir, sockName, nil), ports.ErrNilCallback, "WithListener(nil fn)")
-		requireErr(t, mux.WithListener(ctx, zeroDir, sockName, func(net.Listener) error { return nil }), "WithListener(zero dir)")
-		requireErr(t, mux.WithListener(ctx, dir, zeroName, func(net.Listener) error { return nil }), "WithListener(zero name)")
+		requireErrIs(t, mux.WithListener(nilCtx, listenPath, func(net.Listener) error { return nil }), ports.ErrNilContext, "WithListener(nil ctx)")
+		requireErrIs(t, mux.WithListener(ctx, listenPath, nil), ports.ErrNilCallback, "WithListener(nil fn)")
+		requireErr(t, mux.WithListener(ctx, zeroSrc, func(net.Listener) error { return nil }), "WithListener(zero path)")
 
 		var observedAddr string
-		err = mux.WithListener(ctx, dir, sockName, func(ln net.Listener) error {
+		err = mux.WithListener(ctx, listenPath, func(ln net.Listener) error {
 			requireTrue(t, ln != nil && ln.Addr() != nil, "WithListener 借出的 net.Listener 必须非 nil")
 			observedAddr = ln.Addr().String()
 			return nil
@@ -298,6 +384,8 @@ func verifyRemoteFSChunkAndRename(t *testing.T, ctx context.Context, rfs ports.R
 	requireNoErr(t, err, "Lstat(final)")
 	requireTrue(t, st.IsValid() && st.IsRegular() && st.Size() == 15, "分片合并重命名后大小应为 15")
 
+	verifyRemoteFSReadChunkAndChmod(t, ctx, rfs, finalPath)
+
 	// RenameAtomic 携带失配锚点覆盖既有目标时必须拒绝并返回 ErrRemoteAnchorMismatch（ADR-016）。
 	stage2Path, err := pathalg.ParseRemotePath(base + "/upload2.part")
 	requireNoErr(t, err, "ParseRemotePath(stage2)")
@@ -312,4 +400,32 @@ func verifyRemoteFSChunkAndRename(t *testing.T, ctx context.Context, rfs ports.R
 
 	requireNoErr(t, rfs.Remove(ctx, finalPath), "Remove(final)")
 	requireErrIs(t, rfs.Remove(ctx, finalPath), ports.ErrNotFound, "重复 Remove 须返回 ErrNotFound")
+}
+
+func verifyRemoteFSReadChunkAndChmod(t *testing.T, ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) {
+	t.Helper()
+	var buf bytes.Buffer
+	_, err := rfs.ReadChunk(ctx, p, -1, &buf, 4)
+	requireErr(t, err, "ReadChunk(负偏移)")
+	_, err = rfs.ReadChunk(ctx, p, 0, nil, 4)
+	requireErr(t, err, "ReadChunk(nil dst)")
+
+	n1, err := rfs.ReadChunk(ctx, p, 0, &buf, 8)
+	requireNoErr(t, err, "ReadChunk(0..8)")
+	requireTrue(t, n1 == 8 && buf.String() == "chunk-1-", "ReadChunk 首片内容不匹配")
+	buf.Reset()
+	n2, err := rfs.ReadChunk(ctx, p, 8, &buf, 16)
+	requireErrIs(t, err, io.EOF, "ReadChunk 越尾读取须返回 io.EOF")
+	requireTrue(t, n2 == 7 && buf.String() == "chunk-2", "ReadChunk 尾片内容不匹配")
+	buf.Reset()
+	n3, err := rfs.ReadChunk(ctx, p, 15, &buf, 4)
+	requireErrIs(t, err, io.EOF, "ReadChunk 精确在 EOF 处须返回 io.EOF")
+	requireTrue(t, n3 == 0, "EOF 处 ReadChunk 须返回 0 字节")
+
+	requireErr(t, rfs.Chmod(ctx, p, 0), "Chmod(0)")
+	requireErr(t, rfs.Chmod(ctx, p, fs.ModeSetuid|0o755), "Chmod(特殊权限位)")
+	requireNoErr(t, rfs.Chmod(ctx, p, 0o640), "Chmod(0640)")
+	st, err := rfs.Stat(ctx, p)
+	requireNoErr(t, err, "Stat(after Chmod)")
+	requireTrue(t, st.Perm() == 0o640, "Chmod 后 Stat.Perm 须为 0640")
 }

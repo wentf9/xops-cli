@@ -69,7 +69,9 @@ type GateConfig struct {
 
 // Gate 是 XOps v2 的核心安全能力门控运行时（ADR-008 / ADR-009 / Plan P2-T4），实现封闭接口 Authorizer。
 //
-// 并发与故障安全不变量：
+// 单一权威所有权与并发故障安全不变量：
+//   - Gate 是全引擎唯一的权威审计落盘与 Halted 熔断状态机所有者（直接驱动 ports.AuditSink 与 OnHaltFunc ->
+//     pool.GateHalted），严禁在 core/engine 中另行装配 events.AuditDispatcher 作为第二套独立熔断源；
 //   - 严禁持 g.mu 调用外部 AuditSink、InteractionPort、Canonicalize、Clock、OnHaltFunc 或 ctx.Err()；
 //   - StrictAgentProfile 下终态审计落盘失败（*ports.AuditPostWriteError）立即不可逆进入 Halted 态、
 //     吊销全部活跃 Authorized[C] 句柄、保持未闭合操作留在 .lock 供崩溃恢复，并在锁外线性化通知 OnHaltFunc；

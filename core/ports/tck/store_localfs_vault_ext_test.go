@@ -167,11 +167,11 @@ func (s memOpenSSHSource) ListVirtualHosts(ctx context.Context) ([]ports.OpenSSH
 	return slices.Clone(s.hosts), nil
 }
 
-func (s memOpenSSHSource) ResolveTier4(ctx context.Context, target option.OriginalHostSpec, ep netaddr.Endpoint) (option.OptionLayer, error) {
+func (s memOpenSSHSource) ResolveTier4(ctx context.Context, target option.OriginalHostSpec, endpoint algebraic.Option[netaddr.Endpoint]) (option.OptionLayer, error) {
 	if ctx == nil {
 		return option.UnsetOptionLayer(), ports.ErrNilContext
 	}
-	if !target.IsValid() || !ep.IsValid() {
+	if ep, ok := endpoint.Get(); !target.IsValid() || (ok && !ep.IsValid()) {
 		return option.UnsetOptionLayer(), ports.ErrInvalidArgument
 	}
 	return option.UnsetOptionLayer(), nil
@@ -198,6 +198,13 @@ func newMemScopedRootFS() *memScopedRootFS {
 		dirs:     map[string]bool{".": true},
 		locks:    make(map[string]memLockState),
 	}
+}
+
+func (m *memScopedRootFS) EnsureRoot(dir pathalg.LocalDir, perm fs.FileMode) error {
+	if !dir.IsValid() || perm == 0 || perm != perm.Perm() {
+		return ports.ErrInvalidArgument
+	}
+	return nil
 }
 
 func (m *memScopedRootFS) WithRoot(dir pathalg.LocalDir, fn func(root ports.RootHandle) error) error {
@@ -228,7 +235,7 @@ func (h *memRootHandle) ReadAllBounded(rel pathalg.LocalRootedDest, limits ports
 	return bytes.Clone(data), nil
 }
 
-func (h *memRootHandle) WithReadRegular(rel pathalg.LocalRootedDest, limits ports.ReadLimits, fn func(r io.Reader, size int64) error) error {
+func (h *memRootHandle) WithReadRegular(rel pathalg.LocalRootedDest, limits ports.ReadLimits, fn func(r ports.BoundedReadHandle, size int64) error) error {
 	if fn == nil {
 		return ports.ErrNilCallback
 	}
@@ -237,6 +244,55 @@ func (h *memRootHandle) WithReadRegular(rel pathalg.LocalRootedDest, limits port
 		return err
 	}
 	return fn(bytes.NewReader(data), int64(len(data)))
+}
+
+func (h *memRootHandle) WriteChunk(rel pathalg.LocalRootedDest, offset int64, r io.Reader, length int64, perm fs.FileMode) (int64, error) {
+	if !rel.IsValid() || offset < 0 || length < 0 || r == nil || perm == 0 || perm != perm.Perm() {
+		return 0, ports.ErrInvalidArgument
+	}
+	buf := make([]byte, length)
+	n, rErr := io.ReadFull(r, buf)
+	if errors.Is(rErr, io.EOF) && length > 0 {
+		rErr = io.ErrUnexpectedEOF
+	}
+	if rErr != nil && !errors.Is(rErr, io.ErrUnexpectedEOF) {
+		return 0, rErr
+	}
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+	key := rel.String()
+	data := h.fs.files[key]
+	end := int(offset) + n
+	if len(data) < end {
+		grown := make([]byte, end)
+		copy(grown, data)
+		data = grown
+	}
+	copy(data[offset:], buf[:n])
+	h.fs.files[key] = data
+	return int64(n), rErr
+}
+
+func (h *memRootHandle) Rename(oldRel, newRel pathalg.LocalRootedDest) error {
+	if !oldRel.IsValid() || !newRel.IsValid() {
+		return ports.ErrInvalidArgument
+	}
+	h.fs.mu.Lock()
+	defer h.fs.mu.Unlock()
+	oldKey, newKey := oldRel.String(), newRel.String()
+	if _, isSym := h.fs.symlinks[oldKey]; isSym {
+		return ports.ErrSymlinkRejected
+	}
+	if _, isSym := h.fs.symlinks[newKey]; isSym {
+		return ports.ErrSymlinkRejected
+	}
+	data, ok := h.fs.files[oldKey]
+	if !ok {
+		return ports.ErrNotFound
+	}
+	delete(h.fs.files, oldKey)
+	h.fs.files[newKey] = data
+	return nil
 }
 
 func (h *memRootHandle) AtomicReplace(rel pathalg.LocalRootedDest, _ fs.FileMode, fn func(w io.Writer) error) error {
@@ -567,7 +623,7 @@ type memOperatorReadFS struct {
 	content []byte
 }
 
-func (m memOperatorReadFS) WithOperatorRead(ctx context.Context, src pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, fn func(r io.Reader, size int64) error) error {
+func (m memOperatorReadFS) WithOperatorRead(ctx context.Context, src pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, fn func(r ports.BoundedReadHandle, size int64) error) error {
 	if ctx == nil {
 		return ports.ErrNilContext
 	}

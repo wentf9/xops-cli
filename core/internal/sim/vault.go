@@ -5,17 +5,13 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"encoding/binary"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"io"
-	"math/bits"
-	"net"
-	"slices"
-	"sync/atomic"
 
-	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/secret"
-	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -31,30 +27,9 @@ type SeededRand struct {
 
 // NewSeededRand 以 64 位种子构造跨平台逐字节一致的确定性随机与熵源。
 func NewSeededRand(seed uint64) *SeededRand {
-	sm := seed
-	var st [4]uint64
-	for i := range st {
-		sm += 0x9e3779b97f4a7c15
-		z := (sm ^ (sm >> 30)) * 0xbf58476d1ce4e5b9
-		z = (z ^ (z >> 27)) * 0x94d049bb133111eb
-		st[i] = z ^ (z >> 31)
-	}
-	if st == ([4]uint64{}) {
-		st[0] = 0x9e3779b97f4a7c15
-	}
-	return &SeededRand{simBase: newSimBase(nil), state: st}
+	return &SeededRand{simBase: newSimBase(nil), state: memtree.SeedXoshiro256(seed)}
 }
-func (r *SeededRand) nextLocked() uint64 {
-	s := &r.state
-	res, t := bits.RotateLeft64(s[0]+s[3], 23)+s[0], s[1]<<17
-	s[2] ^= s[0]
-	s[3] ^= s[1]
-	s[1] ^= s[2]
-	s[0] ^= s[3]
-	s[2] ^= t
-	s[3] = bits.RotateLeft64(s[3], 45)
-	return res
-}
+func (r *SeededRand) nextLocked() uint64 { return memtree.NextXoshiro256(&r.state) }
 
 // SetReadFault / Read / Uint64 / IntN / Bool / Chance / Fork / Perm 提供熵读取与随机调度。
 func (r *SeededRand) SetReadFault(err error) { r.withLock(func() { r.readErr = err }) }
@@ -90,14 +65,7 @@ func (r *SeededRand) Read(p []byte) (int, error) {
 	if r.readErr != nil {
 		return 0, r.readErr
 	}
-	var buf [8]byte
-	for off := 0; off < len(p); off += 8 {
-		binary.LittleEndian.PutUint64(buf[:], r.nextLocked())
-		copy(p[off:], buf[:])
-	}
-	if len(p) >= 16 && !slices.ContainsFunc(p, func(b byte) bool { return b != 0 }) {
-		p[0] = 1
-	}
+	memtree.FillXoshiro256Bytes(&r.state, p)
 	return len(p), nil
 }
 
@@ -107,35 +75,119 @@ func cloneVaultRecord(r vaultCipherRecord) vaultCipherRecord {
 	return vaultCipherRecord{bytes.Clone(r.nonce), bytes.Clone(r.ciphertext)}
 }
 
-// SimVault 是采用 AES-256-GCM 静态密文存储的确定性凭据库仿真器，实现 ports.SecretVault（ADR-011 / P2-T6）。
-// 仅保存 AES-GCM 密文与确定性随机 Nonce，0 行内 nolint，完整通过 secretbox/secrettaint/linearlease 审计。
+// SimVault 是采用 AES-256-GCM 静态密文存储的确定性凭据库仿真器，同时实现 ports.SecretVault 与 ports.VaultControlPort（ADR-011 / P2-T6）。
+// 仅保存 AES-GCM 密文、确定性随机 Nonce 与主口令 SHA-256 摘要，0 行内 nolint，完整通过 secretbox/secrettaint/linearlease 审计。
 //
 //xops:opaque
 //xops:failclosed
 type SimVault struct {
 	simBase
-	locked, verifyMismatch bool
-	key                    [32]byte
-	rng                    *SeededRand
-	entries                map[secret.Ref]vaultCipherRecord
+	vaultInited, locked, verifyMismatch bool
+	masterHash, key                     [32]byte
+	rng                                 *SeededRand
+	entries                             map[secret.Ref]vaultCipherRecord
 }
 
-// NewSimVault 使用确定性随机源派生 AES-256 主密钥并创建已解锁的 SimVault。
+// NewSimVault 使用确定性随机源派生 AES-256 主密钥并创建已初始化且已解锁的 SimVault。
 func NewSimVault(rng *SeededRand) *SimVault {
+	v := NewUninitializedSimVault(rng)
+	v.vaultInited, v.locked, v.masterHash = true, false, sha256.Sum256([]byte("sim-default-master"))
+	return v
+}
+
+// NewUninitializedSimVault 创建处于 VaultStateUninitialized 状态的空白 SimVault，用于验证 Init/Unlock/Lock 生命周期。
+func NewUninitializedSimVault(rng *SeededRand) *SimVault {
 	if rng == nil {
 		rng = NewSeededRand(1)
 	}
 	var key [32]byte
 	_, _ = io.ReadFull(rng, key[:])
-	return &SimVault{simBase: newSimBase(rng), key: key, rng: rng, entries: make(map[secret.Ref]vaultCipherRecord)}
+	return &SimVault{simBase: newSimBase(rng), locked: true, key: key, rng: rng, entries: make(map[secret.Ref]vaultCipherRecord)}
 }
 
-// Lock / Unlock / IsLocked / SetVerifyMismatch / CiphertextFor / TamperCiphertext 控制凭据库状态。
-func (v *SimVault) Lock()                     { v.withLock(func() { v.locked = true }) }
-func (v *SimVault) Unlock()                   { v.withLock(func() { v.locked = false }) }
+// Init 使用借用的主口令 SecretBox 初始化凭据库（参数级 //xops:borrowed 审计零逃逸）；已初始化返回 ErrAlreadyExists。
+func (v *SimVault) Init(
+	ctx context.Context,
+	//xops:borrowed
+	pass *secret.SecretBox,
+) error {
+	if err := v.check(ctx, "vault.init", pass != nil && pass.IsValid()); err != nil {
+		return err
+	}
+	sum, err := hashSecretBox(pass)
+	if err != nil {
+		return err
+	}
+	return withLockRet(&v.simBase, ErrSimNotInitialized, func() error {
+		if v.vaultInited {
+			return ports.ErrAlreadyExists
+		}
+		v.vaultInited, v.locked, v.masterHash = true, false, sum
+		return nil
+	})
+}
+
+// Unlock 使用借用的主口令 SecretBox 解锁凭据库（参数级 //xops:borrowed 审计零逃逸）；未初始化返回 ErrNotFound，口令失配返回 ErrAuthFailed。
+func (v *SimVault) Unlock(
+	ctx context.Context,
+	//xops:borrowed
+	pass *secret.SecretBox,
+) error {
+	if err := v.check(ctx, "vault.unlock", pass != nil && pass.IsValid()); err != nil {
+		return err
+	}
+	sum, err := hashSecretBox(pass)
+	if err != nil {
+		return err
+	}
+	return withLockRet(&v.simBase, ErrSimNotInitialized, func() error {
+		if !v.vaultInited {
+			return ports.ErrNotFound
+		}
+		if subtle.ConstantTimeCompare(v.masterHash[:], sum[:]) != 1 {
+			return ports.ErrAuthFailed
+		}
+		v.locked = false
+		return nil
+	})
+}
+
+// Lock 锁定凭据库（实现 ports.VaultControlPort）；未初始化返回 ErrNotFound。
+func (v *SimVault) Lock(ctx context.Context) error {
+	if err := v.check(ctx, "vault.lock"); err != nil {
+		return err
+	}
+	return withLockRet(&v.simBase, ErrSimNotInitialized, func() error {
+		if !v.vaultInited {
+			return ports.ErrNotFound
+		}
+		v.locked = true
+		return nil
+	})
+}
+
+// Status 返回当前凭据库生命周期状态快照（实现 ports.VaultControlPort）。
+func (v *SimVault) Status(ctx context.Context) (out ports.VaultStatus, err error) {
+	if err = v.check(ctx, "vault.status"); err != nil {
+		return out, err
+	}
+	state := withLockRet(&v.simBase, ports.VaultStateInvalid, func() ports.VaultState {
+		switch {
+		case !v.vaultInited:
+			return ports.VaultStateUninitialized
+		case v.locked:
+			return ports.VaultStateLocked
+		default:
+			return ports.VaultStateUnlocked
+		}
+	})
+	return ports.NewVaultStatus(ports.VaultStatusSpec{State: state, KnownStores: []string{"sim-aes256gcm"}, Detail: "sim-vault"})
+}
+
+// SetVerifyMismatch / IsLocked / CiphertextFor / TamperCiphertext 控制测试故障与密文观测。
 func (v *SimVault) SetVerifyMismatch(en bool) { v.withLock(func() { v.verifyMismatch = en }) }
 func (v *SimVault) IsLocked() bool {
-	return withLockRet(&v.simBase, true, func() bool { return v.locked })
+	return withLockRet(&v.simBase, true, func() bool { return !v.vaultInited || v.locked })
 }
 func (v *SimVault) CiphertextFor(ref secret.Ref) (ct []byte, ok bool) {
 	if ref.IsValid() {
@@ -164,7 +216,7 @@ func (v *SimVault) WithSecret(ctx context.Context, ref secret.Ref, fn func(box *
 	}
 	var stored vaultCipherRecord
 	if err := withLockRet(&v.simBase, ErrSimNotInitialized, func() error {
-		if v.locked {
+		if !v.vaultInited || v.locked {
 			return ports.ErrVaultLocked
 		}
 		r, ok := v.entries[ref]
@@ -185,7 +237,12 @@ func (v *SimVault) WithSecret(ctx context.Context, ref secret.Ref, fn func(box *
 }
 
 // PutAndVerify 以 AES-256-GCM 加密写入 ref，从存储读回密文解密并执行常量时间 Equal 校验；失败则原子回滚旧条目（INV-F3）。
-func (v *SimVault) PutAndVerify(ctx context.Context, ref secret.Ref, box *secret.SecretBox) error {
+func (v *SimVault) PutAndVerify(
+	ctx context.Context,
+	ref secret.Ref,
+	//xops:borrowed
+	box *secret.SecretBox,
+) error {
 	if err := v.check(ctx, "vault.put", ref.IsValid(), box.IsValid()); err != nil {
 		return err
 	}
@@ -194,7 +251,7 @@ func (v *SimVault) PutAndVerify(ctx context.Context, ref secret.Ref, box *secret
 		return err
 	}
 	v.mu.Lock()
-	locked, mismatch := v.locked, v.verifyMismatch
+	locked, mismatch := !v.vaultInited || v.locked, v.verifyMismatch
 	prev, hadPrev := v.entries[ref]
 	var stored vaultCipherRecord
 	if !locked {
@@ -243,7 +300,7 @@ func (v *SimVault) Delete(ctx context.Context, ref secret.Ref) error {
 		return err
 	}
 	return withLockRet(&v.simBase, ErrSimNotInitialized, func() error {
-		if v.locked {
+		if !v.vaultInited || v.locked {
 			return ports.ErrVaultLocked
 		}
 		if _, ok := v.entries[ref]; !ok {
@@ -252,6 +309,16 @@ func (v *SimVault) Delete(ctx context.Context, ref secret.Ref) error {
 		delete(v.entries, ref)
 		return nil
 	})
+}
+
+func hashSecretBox(box *secret.SecretBox) (sum [32]byte, err error) {
+	err = box.Use(func(plain []byte) error {
+		h := sha256.New()
+		_, _ = h.Write(plain)
+		h.Sum(sum[:0])
+		return nil
+	})
+	return sum, err
 }
 func sealSecretBox(key [32]byte, rng io.Reader, aad []byte, box *secret.SecretBox) (rec vaultCipherRecord, err error) {
 	err = box.Use(func(plain []byte) error {
@@ -285,156 +352,4 @@ func openAESGCM(key [32]byte, rec vaultCipherRecord, aad []byte) ([]byte, error)
 		return nil, ports.ErrCorruptData
 	}
 	return aead.Open(nil, rec.nonce, rec.ciphertext, aad)
-}
-
-// ProcessHandler 定义 SimProcessPort 的可编程命令处理回调。
-type ProcessHandler func(ctx context.Context, spec ports.ProcessSpec, stdin []byte) (ports.ProcessResult, error)
-
-// SimProcessPort 是零 os/exec 的纯内存子进程与 stdio 管道仿真器，实现 ports.ProcessPort。
-//
-//xops:opaque
-//xops:failclosed
-type SimProcessPort struct {
-	simBase
-	handlers map[string]ProcessHandler
-}
-
-// NewSimProcessPort 创建纯内存子进程仿真器（"fail"/"false" 返回退出码 1，其余默认回显 stdin）。
-func NewSimProcessPort() *SimProcessPort {
-	return &SimProcessPort{simBase: newSimBase(nil), handlers: make(map[string]ProcessHandler)}
-}
-
-// RegisterCommand 注册或注销指定命令名的自定义处理回调。
-func (p *SimProcessPort) RegisterCommand(cmd string, fn ProcessHandler) {
-	if cmd != "" {
-		p.withLock(func() {
-			if fn == nil {
-				delete(p.handlers, cmd)
-			} else {
-				p.handlers[cmd] = fn
-			}
-		})
-	}
-}
-func (p *SimProcessPort) Run(ctx context.Context, spec ports.ProcessSpec, stdin io.Reader) (out ports.ProcessResult, err error) {
-	if err = p.check(ctx, "proc.run", spec.IsValid()); err != nil {
-		return out, err
-	}
-	var inBytes []byte
-	if stdin != nil {
-		if inBytes, err = io.ReadAll(stdin); err != nil {
-			return out, err
-		}
-	}
-	if h := withLockRet(&p.simBase, nil, func() ProcessHandler { return p.handlers[spec.Command()] }); h != nil {
-		return h(ctx, spec, inBytes)
-	}
-	if spec.Command() == "fail" || spec.Command() == "false" {
-		return ports.NewProcessResult(ports.ProcessResultSpec{ExitStatus: execution.NewExitCode(1), Stderr: []byte("simulated non-zero exit")})
-	}
-	trunc := uint64(len(inBytes)) > spec.MaxOutputBytes()
-	if trunc {
-		inBytes = inBytes[:spec.MaxOutputBytes()]
-	}
-	return ports.NewProcessResult(ports.ProcessResultSpec{ExitStatus: execution.NewExitCode(0), Stdout: inBytes, Truncated: trunc})
-}
-func (p *SimProcessPort) DialStdio(ctx context.Context, spec ports.ProcessSpec) (net.Conn, error) {
-	if err := p.check(ctx, "proc.dialstdio", spec.IsValid()); err != nil {
-		return nil, err
-	}
-	return &simEchoConn{addr: simAddr(spec.Command())}, nil
-}
-
-// SimTerminalPort 实现 ports.TerminalPort 的纯内存 PTY/ConPTY 与孤儿进程组判定仿真器。
-//
-//xops:opaque
-//xops:failclosed
-type SimTerminalPort struct {
-	simBase
-	interactive bool
-	size        ports.TerminalSize
-	suspendErr  error
-	suspendV    security.Verdict
-}
-
-// NewSimTerminalPort 创建纯内存终端仿真器（cols/rows 为 0 时默认 80x24）。
-func NewSimTerminalPort(interactive bool, cols, rows uint16) *SimTerminalPort {
-	sz, err := ports.NewTerminalSize(cols, rows)
-	if err != nil {
-		sz, _ = ports.NewTerminalSize(80, 24)
-	}
-	return &SimTerminalPort{simBase: newSimBase(nil), interactive: interactive, size: sz, suspendV: security.VerdictAllow}
-}
-
-// SetSuspendResult 配置孤儿进程组暂停安全判定返回值与错误注入。
-func (t *SimTerminalPort) SetSuspendResult(v security.Verdict, err error) {
-	t.withLock(func() { t.suspendV, t.suspendErr = v, err })
-}
-func (t *SimTerminalPort) IsInteractive() bool {
-	return withLockRet(&t.simBase, false, func() bool { return t.interactive })
-}
-func (t *SimTerminalPort) Size() (out ports.TerminalSize, err error) {
-	return out, withLockRet(&t.simBase, ErrSimNotInitialized, func() error {
-		if !t.interactive {
-			return ports.ErrUnsupported
-		}
-		out = t.size
-		return nil
-	})
-}
-func (t *SimTerminalPort) CanSuspendProcessGroup() (v security.Verdict, err error) {
-	if !t.ok() {
-		return security.VerdictDeny, ErrSimNotInitialized
-	}
-	t.withLock(func() { v, err = t.suspendV, t.suspendErr })
-	if err != nil {
-		return security.VerdictDeny, err
-	}
-	return v.Normalize(), nil
-}
-
-// WithRawTerminal 在同步作用域内借出带失效哨兵的 TerminalHandle，退出时关闭 ResizeEvents。
-//
-//xops:syncclosure
-//xops:borrowed
-func (t *SimTerminalPort) WithRawTerminal(ctx context.Context, fn func(term ports.TerminalHandle) error) error {
-	if err := t.checkFn(ctx, fn != nil, "term.raw"); err != nil {
-		return err
-	}
-	sz, err := t.Size()
-	if err != nil {
-		return err
-	}
-	resizeCh := make(chan ports.TerminalSize, 4)
-	h := &simTerminalHandle{size: sz, resizeCh: resizeCh, valid: true}
-	defer func() { h.expired.Store(true); close(resizeCh) }()
-	return fn(h)
-}
-
-type simTerminalHandle struct {
-	size     ports.TerminalSize
-	resizeCh chan ports.TerminalSize
-	valid    bool
-	expired  atomic.Bool
-}
-
-func (h *simTerminalHandle) alive() bool                             { return h != nil && h.valid && !h.expired.Load() }
-func (h *simTerminalHandle) ResizeEvents() <-chan ports.TerminalSize { return h.resizeCh }
-func (h *simTerminalHandle) Read([]byte) (int, error) {
-	if !h.alive() {
-		return 0, ports.ErrHandleExpired
-	}
-	return 0, io.EOF
-}
-func (h *simTerminalHandle) Write(p []byte) (int, error) {
-	if !h.alive() {
-		return 0, ports.ErrHandleExpired
-	}
-	return len(p), nil
-}
-func (h *simTerminalHandle) Size() (out ports.TerminalSize, err error) {
-	if !h.alive() {
-		return out, ports.ErrHandleExpired
-	}
-	return h.size, nil
 }

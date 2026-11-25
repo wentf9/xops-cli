@@ -20,11 +20,12 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/core/ports/tck"
 )
 
-// TestInterfaceCompliance 在编译期断言本包实现 core/ports 全部 19 个出站端口及借用句柄接口。
+// TestInterfaceCompliance 在编译期断言本包实现 core/ports 全部出站端口及借用句柄接口。
 func TestInterfaceCompliance(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	_ = ports.InventoryStore((*SimInventoryStore)(nil))
@@ -33,10 +34,14 @@ func TestInterfaceCompliance(t *testing.T) {
 	_ = ports.OpenSSHConfigSource((*SimOpenSSHConfigSource)(nil))
 	_ = ports.ScopedRootFS((*SimScopedRootFS)(nil))
 	_ = ports.RootHandle((*simRootHandle)(nil))
-	_ = ports.LockedFile((*simLockedFile)(nil))
+	_ = ports.BoundedReadHandle((*memtree.ScopedReader)(nil))
+	_ = ports.LockedFile((*memtree.LockedFile)(nil))
 	_ = ports.OperatorReadFS((*SimOperatorReadFS)(nil))
 	_ = ports.SecretVault((*SimVault)(nil))
+	_ = ports.VaultControlPort((*SimVault)(nil))
 	_ = ports.KeySignerPort((*SimKeySigner)(nil))
+	_ = ports.SSHAgentPort((*SimSSHAgent)(nil))
+	_ = ports.SSHFPLookupPort((*SimSSHFPLookup)(nil))
 	_ = ports.HostTrustPort((*SimHostTrust)(nil))
 	_ = ports.DialerPort((*SimDialer)(nil))
 	_ = ports.TransportConn((*SimTransportConn)(nil))
@@ -46,12 +51,17 @@ func TestInterfaceCompliance(t *testing.T) {
 	_ = ports.AuditSink((*SimAuditSink)(nil))
 	_ = ports.AuditReconciler((*SimAuditCluster)(nil))
 	_ = ports.Clock((*SimClock)(nil))
-	_ = ports.Timer((*simTimer)(nil))
+	_ = ports.Timer((*memtree.ClockTimer)(nil))
 	_ = ports.Entropy((*SeededRand)(nil))
+	_ = ports.EnvPort((*SimEnvPort)(nil))
 	_ = ports.ProcessPort((*SimProcessPort)(nil))
 	_ = ports.TerminalPort((*SimTerminalPort)(nil))
 	_ = ports.TerminalHandle((*simTerminalHandle)(nil))
 	_ = ports.InteractionPort((*SimInteractionPort)(nil))
+	_ = ports.PrivilegeEscalationPort((*SimPrivilegeEscalator)(nil))
+	_ = ports.ShellProbePort((*SimShellProbe)(nil))
+	_ = ports.ForwarderPort((*SimForwarder)(nil))
+	_ = ports.ForwardHandle((*SimForwardHandle)(nil))
 }
 
 // TestFaultInjectorModes 验证故障注入器的单次、常驻、概率、清除与计数契约。
@@ -141,7 +151,7 @@ func TestScopedRootFSENOSPCAndRandFault(t *testing.T) {
 		t.Fatalf("expected ErrSimulatedENOSPC, got %v", wErr)
 	}
 
-	expiredHandle := &simRootHandle{fs: sfs, tree: newSimMemTree(clk, true, 0o700), valid: true}
+	expiredHandle := &simRootHandle{fs: sfs, tree: memtree.New(clk, true, 0o700), valid: true}
 	expiredHandle.expired.Store(true)
 	if _, rErr := expiredHandle.ReadAllBounded(dest, lim); !errors.Is(rErr, ports.ErrHandleExpired) {
 		t.Fatalf("expired RootHandle must fail closed with ErrHandleExpired, got %v", rErr)
@@ -197,8 +207,8 @@ func TestSim_ScopedFSAndLockedFileBoundaries(t *testing.T) {
 func verifyScopedWriteAndSymlink(t *testing.T, sfs *SimScopedRootFS, root ports.RootHandle, subDir, fDest, linkDest pathalg.LocalRootedDest, lim ports.ReadLimits) error {
 	t.Helper()
 	if err := root.AtomicReplace(fDest, 0o600, func(w io.Writer) error {
-		if _, ok := w.(*simScopedWriter); !ok {
-			t.Fatalf("AtomicReplace writer must be sentinel-guarded *simScopedWriter")
+		if _, ok := w.(*memtree.ScopedWriter); !ok {
+			t.Fatalf("AtomicReplace writer must be sentinel-guarded *memtree.ScopedWriter")
 		}
 		_, e := w.Write([]byte("hello"))
 		return e
@@ -207,9 +217,9 @@ func verifyScopedWriteAndSymlink(t *testing.T, sfs *SimScopedRootFS, root ports.
 	}
 	var exp atomic.Bool
 	exp.Store(true)
-	expiredW := &simScopedWriter{buf: &bytes.Buffer{}, expired: &exp}
+	expiredW := memtree.NewScopedWriter(&bytes.Buffer{}, &exp, nil)
 	if _, err := expiredW.Write([]byte("late")); !errors.Is(err, ports.ErrHandleExpired) {
-		t.Fatalf("expired simScopedWriter must fail with ErrHandleExpired, got %v", err)
+		t.Fatalf("expired memtree.ScopedWriter must fail with ErrHandleExpired, got %v", err)
 	}
 	called := false
 	if err := root.CreateExclusive(fDest, 0o600, func(io.Writer) error { called = true; return nil }); !errors.Is(err, ports.ErrAlreadyExists) || called {
@@ -348,10 +358,10 @@ func verifyOperatorIntermediateSymlink(t *testing.T, ctx context.Context) {
 	_ = opFS.PutFile(realFile, []byte("op-data"))
 	_ = opFS.PutSymlink(linkDir, realDir)
 
-	if err := opFS.WithOperatorRead(ctx, viaLink, pathalg.SymlinkReject, func(io.Reader, int64) error { return nil }); !errors.Is(err, ports.ErrSymlinkRejected) {
+	if err := opFS.WithOperatorRead(ctx, viaLink, pathalg.SymlinkReject, func(ports.BoundedReadHandle, int64) error { return nil }); !errors.Is(err, ports.ErrSymlinkRejected) {
 		t.Fatalf("SymlinkReject must reject intermediate dir symlink, got %v", err)
 	}
-	if err := opFS.WithOperatorRead(ctx, viaLink, pathalg.SymlinkFollowOperatorSource, func(r io.Reader, _ int64) error {
+	if err := opFS.WithOperatorRead(ctx, viaLink, pathalg.SymlinkFollowOperatorSource, func(r ports.BoundedReadHandle, _ int64) error {
 		raw, e := io.ReadAll(r)
 		if e != nil || string(raw) != "op-data" {
 			t.Fatalf("SymlinkFollowOperatorSource read %q (%v)", raw, e)
@@ -393,6 +403,12 @@ func TestSim_AuditMuxSignerAndSessionMinors(t *testing.T) {
 
 func verifyOpenSSHAndTransportMinors(t *testing.T, ctx context.Context, rng *SeededRand) {
 	t.Helper()
+	verifyOpenSSHResolveTier4Minors(t, ctx)
+	verifySimMuxTransportMinors(t, ctx, rng)
+}
+
+func verifyOpenSSHResolveTier4Minors(t *testing.T, ctx context.Context) {
+	t.Helper()
 	epA, epB := tck.MustEndpoint(t, "10.0.0.1", 22), tck.MustEndpoint(t, "10.0.0.2", 22)
 	target, _ := option.ParseOriginalHost("web")
 	layerA := option.UnsetOptionLayer().WithForwardAgent(true)
@@ -404,13 +420,19 @@ func verifyOpenSSHAndTransportMinors(t *testing.T, ctx context.Context, rng *See
 		Alias: "web", SourceFile: "/sim/cfg", Endpoint: algebraic.None[netaddr.Endpoint](), Proxy: option.NewProxyUnset(), Layer: layerB,
 	})
 	src := NewSimOpenSSHConfigSource(vhA, vhWild)
-	if got, err := src.ResolveTier4(ctx, target, epA); err != nil || !got.ForwardAgent().IsSome() || !got.BatchMode().IsSome() {
+	if got, err := src.ResolveTier4(ctx, target, algebraic.Some(epA)); err != nil || !got.ForwardAgent().IsSome() || !got.BatchMode().IsSome() {
 		t.Fatalf("matching endpoint ResolveTier4 must compose both layers: layer=%+v err=%v", got, err)
 	}
-	if got, err := src.ResolveTier4(ctx, target, epB); err != nil || got.ForwardAgent().IsSome() || !got.BatchMode().IsSome() {
+	if got, err := src.ResolveTier4(ctx, target, algebraic.Some(epB)); err != nil || got.ForwardAgent().IsSome() || !got.BatchMode().IsSome() {
 		t.Fatalf("non-matching endpoint must only apply endpoint-agnostic layer: layer=%+v err=%v", got, err)
 	}
+	if got, err := src.ResolveTier4(ctx, target, algebraic.None[netaddr.Endpoint]()); err != nil || !got.ForwardAgent().IsSome() || !got.BatchMode().IsSome() {
+		t.Fatalf("None endpoint ResolveTier4 must compose alias layers: layer=%+v err=%v", got, err)
+	}
+}
 
+func verifySimMuxTransportMinors(t *testing.T, ctx context.Context, rng *SeededRand) {
+	t.Helper()
 	clk := NewSimClock(DefaultBaseTime())
 	dialer := NewSimDialer(clk, rng)
 	mux := NewSimMuxSocket(dialer)
@@ -435,11 +457,10 @@ func verifyOpenSSHAndTransportMinors(t *testing.T, ctx context.Context, rng *See
 	if dialer.OpenConns() != 0 {
 		t.Fatalf("Close must release DialMux connection count, got %d", dialer.OpenConns())
 	}
-	dir, _ := pathalg.ParseLocalDir("/sim/mux")
-	name, _ := pathalg.ParseLocalRootedDest("s.sock")
-	if err := mux.WithListener(ctx, dir, name, func(ln net.Listener) error {
-		if _, ok := ln.(*simMemListener); !ok {
-			t.Fatalf("WithListener must pass sentinel-guarded *simMemListener")
+	listenPath, _ := pathalg.ParseLocalSourcePath("/sim/mux/ops@10.0.0.1:22.sock")
+	if err := mux.WithListener(ctx, listenPath, func(ln net.Listener) error {
+		if _, ok := ln.(*memtree.MemListener); !ok {
+			t.Fatalf("WithListener must pass sentinel-guarded *memtree.MemListener")
 		}
 		return nil
 	}); err != nil {
@@ -447,11 +468,11 @@ func verifyOpenSSHAndTransportMinors(t *testing.T, ctx context.Context, rng *See
 	}
 	var expLn atomic.Bool
 	expLn.Store(true)
-	expiredLn := &simMemListener{addr: "sim", expired: &expLn}
+	expiredLn := memtree.NewMemListener("sim", &expLn)
 	if _, err := expiredLn.Accept(); !errors.Is(err, ports.ErrHandleExpired) {
-		t.Fatalf("expired simMemListener Accept must fail with ErrHandleExpired, got %v", err)
+		t.Fatalf("expired memtree.MemListener Accept must fail with ErrHandleExpired, got %v", err)
 	}
 	if err := expiredLn.Close(); !errors.Is(err, ports.ErrHandleExpired) {
-		t.Fatalf("expired simMemListener Close must fail with ErrHandleExpired, got %v", err)
+		t.Fatalf("expired memtree.MemListener Close must fail with ErrHandleExpired, got %v", err)
 	}
 }

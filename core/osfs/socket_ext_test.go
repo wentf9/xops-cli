@@ -81,6 +81,11 @@ func TestControlSocketPathCrossPlatformRules(t *testing.T) {
 	if _, err := osfs.BuildManagedMuxSocketPath(shortDir, "NOT-HEX"); !errors.Is(err, osfs.ErrInvalidControlPath) {
 		t.Fatalf("BuildManagedMuxSocketPath 必须拒绝非法 %%C: %v", err)
 	}
+	srcSock := mustLocalSource(t, managed.NativePath())
+	fromSrc, err := osfs.ControlSocketPathFromSource(srcSock)
+	if err != nil || !fromSrc.Equal(managed) {
+		t.Fatalf("ControlSocketPathFromSource = (%v, %v), 期望 %v", fromSrc, err, managed)
+	}
 }
 
 func TestSocketSlotLifecyclePeerCredAndStaleRecovery(t *testing.T) {
@@ -145,11 +150,34 @@ func verifyActiveSocketSlot(t *testing.T, ctx context.Context, sockPath osfs.Con
 		}); err != nil {
 			return err
 		}
+		// 同时验证 Listener().Accept() 走对端凭据核验通道并正常完成双向通信。
+		if err := conc.RunWait(ctx, func(_ context.Context, n *conc.Nursery) error {
+			if err := n.Go(func(c context.Context) error { return dialEchoAndCheckPeer(c, sockPath) }); err != nil {
+				return err
+			}
+			return acceptListenerAndEchoOnce(slot)
+		}); err != nil {
+			return err
+		}
 		return verifyLiveSlotProtections(ctx, sockPath)
 	})
 	if err != nil {
 		t.Fatalf("活跃 SocketSlot 测试失败: %v", err)
 	}
+}
+
+func acceptListenerAndEchoOnce(slot *osfs.SocketSlot) error {
+	srvConn, err := slot.Listener().Accept()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = srvConn.Close() }()
+	var buf [4]byte
+	if _, err := srvConn.Read(buf[:]); err != nil {
+		return err
+	}
+	_, err = srvConn.Write(bytes.ToUpper(buf[:]))
+	return err
 }
 
 func dialEchoAndCheckPeer(ctx context.Context, sockPath osfs.ControlSocketPath) error {

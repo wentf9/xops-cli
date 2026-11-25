@@ -21,22 +21,20 @@ const defaultSocketProbeTimeout = 2 * time.Second
 type SocketProbeStatus uint8
 
 const (
-	SocketProbeUnknown   SocketProbeStatus = iota // 探测未完成/异常/无法证明状态（零值失败关闭）
+	SocketProbeUnknown   SocketProbeStatus = iota // 探测未完成或异常（零值失败关闭）
 	SocketProbeMissing                            // 目标路径不存在
-	SocketProbeNotSocket                          // 目标路径存在但不是本地 AF_UNIX 套接字
-	SocketProbeLive                               // 目标套接字存在且活跃监听进程响应连接
-	SocketProbeStale                              // 目标确认为套接字且连接被明确拒绝（可安全清理）
+	SocketProbeNotSocket                          // 存在但非本地 AF_UNIX 套接字
+	SocketProbeLive                               // 存在且活跃监听进程响应连接
+	SocketProbeStale                              // 确认为套接字且连接被明确拒绝（可安全清理）
 )
 
 // String 返回 SocketProbeStatus 的可读名称。
 func (s SocketProbeStatus) String() string {
-	if names := [5]string{"unknown", "missing", "not_socket", "live", "stale"}; int(s) < len(names) {
-		return names[s]
-	}
-	return "unknown"
+	names := [5]string{"unknown", "missing", "not_socket", "live", "stale"}
+	return pickIf(int(s) < len(names), names[min(int(s), len(names)-1)], "unknown")
 }
 
-// IsValid 报告 s 是否为已判明的有效探测状态（零值 SocketProbeUnknown 严格返回 false）。
+// IsValid 报告 s 是否为已判明的有效探测状态（零值 SocketProbeUnknown 返回 false）。
 func (s SocketProbeStatus) IsValid() bool { return s >= SocketProbeMissing && s <= SocketProbeStale }
 
 // PeerCred 表示经内核查询到的本地 AF_UNIX 连接对端身份凭据快照；零值恒无效。
@@ -48,23 +46,16 @@ type PeerCred struct {
 	hasUID, hasGID, hasPID, valid bool
 }
 
-func credUint32(ok bool, v uint32) (uint32, bool) {
-	if !ok {
-		return 0, false
-	}
-	return v, true
-}
-
-// PeerCred 只读访问器与等价比对。
-func (c PeerCred) IsValid() bool         { return c.valid }
-func (c PeerCred) IsZero() bool          { return !c.valid }
-func (c PeerCred) HasUID() bool          { return c.valid && c.hasUID }
-func (c PeerCred) HasGID() bool          { return c.valid && c.hasGID }
-func (c PeerCred) HasPID() bool          { return c.valid && c.hasPID }
-func (c PeerCred) UID() (uint32, bool)   { return credUint32(c.valid && c.hasUID, c.uid) }
-func (c PeerCred) GID() (uint32, bool)   { return credUint32(c.valid && c.hasGID, c.gid) }
-func (c PeerCred) PID() (uint32, bool)   { return credUint32(c.valid && c.hasPID, c.pid) }
-func (c PeerCred) Equal(o PeerCred) bool { return c.valid && o.valid && c == o }
+func credUint32(ok bool, v uint32) (uint32, bool) { return pickIf(ok, v, 0), ok }
+func (c PeerCred) IsValid() bool                  { return c.valid }
+func (c PeerCred) IsZero() bool                   { return !c.valid }
+func (c PeerCred) HasUID() bool                   { return c.valid && c.hasUID }
+func (c PeerCred) HasGID() bool                   { return c.valid && c.hasGID }
+func (c PeerCred) HasPID() bool                   { return c.valid && c.hasPID }
+func (c PeerCred) UID() (uint32, bool)            { return credUint32(c.valid && c.hasUID, c.uid) }
+func (c PeerCred) GID() (uint32, bool)            { return credUint32(c.valid && c.hasGID, c.gid) }
+func (c PeerCred) PID() (uint32, bool)            { return credUint32(c.valid && c.hasPID, c.pid) }
+func (c PeerCred) Equal(o PeerCred) bool          { return c.valid && o.valid && c == o }
 
 // QueryUnixPeerCred / VerifyUnixPeerCurrentUser 通过内核套接字选项查询或强校验对端身份（fail-closed）。
 func QueryUnixPeerCred(conn *net.UnixConn) (PeerCred, error) {
@@ -107,7 +98,6 @@ type SocketSlot struct {
 	active atomic.Bool
 }
 
-// IsActive / Path / Listener 为 SocketSlot 借用句柄的只读与受保护监听器访问器。
 func (s *SocketSlot) IsActive() bool { return s != nil && s.active.Load() && s.ln != nil }
 func (s *SocketSlot) Path() ControlSocketPath {
 	if s == nil {
@@ -129,7 +119,6 @@ func (s *SocketSlot) AcceptVerified() (*net.UnixConn, PeerCred, error) {
 	}
 	return verifyUnixConnPeer(s.ln.AcceptUnix())
 }
-
 func verifyUnixConnPeer(conn *net.UnixConn, err error) (*net.UnixConn, PeerCred, error) {
 	if err != nil {
 		return nil, PeerCred{}, mapOSError(err)
@@ -141,7 +130,6 @@ func verifyUnixConnPeer(conn *net.UnixConn, err error) (*net.UnixConn, PeerCred,
 	}
 	return conn, cred, nil
 }
-
 func validateSocketCtxPath(ctx context.Context, path ControlSocketPath) error {
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -191,7 +179,6 @@ func releaseSocketSlot(path ControlSocketPath, origID socketFileID, uln *net.Uni
 	lockErr := withSocketDirLockOS(context.Background(), path.Dir(), false, func() error {
 		unlinkErr = unlinkSameSocket(path.NativePath(), origID)
 		closeErr, closed = closeUnixListenerSafe(uln), true
-		// Windows 防御性回退：若监听句柄关闭前出现共享冲突，在持目录锁内关闭后复核身份再删。
 		if unlinkErr != nil && isSocketUnlinkRetryableOS(unlinkErr) {
 			unlinkErr = unlinkSameSocket(path.NativePath(), origID)
 		}
@@ -220,7 +207,6 @@ func ProbeStaleUnixSocket(ctx context.Context, path ControlSocketPath) (SocketPr
 		probeCtx, cancel = context.WithTimeout(ctx, defaultSocketProbeTimeout)
 	}
 	defer cancel()
-
 	var dialer net.Dialer
 	conn, dialErr := dialer.DialUnix(probeCtx, "unix", nil, &net.UnixAddr{Net: "unix", Name: path.NativePath()})
 	if dialErr == nil {
@@ -237,14 +223,10 @@ func ProbeStaleUnixSocket(ctx context.Context, path ControlSocketPath) (SocketPr
 	if err != nil || status != SocketProbeUnknown {
 		return status, err
 	}
-	if !sameSocketFileID(origID, currID) {
-		return SocketProbeUnknown, nil
-	}
-	return SocketProbeStale, nil
+	return pickIf(sameSocketFileID(origID, currID), SocketProbeStale, SocketProbeUnknown), nil
 }
 
-// PruneStaleUnixSocket 在目录锁内复核并安全清理已确证过期的本地 AF_UNIX 套接字；
-// 活套接字与非套接字绝不删除；父目录或目标缺失时零副作用返回 (SocketProbeMissing, nil)。
+// PruneStaleUnixSocket 在目录锁内复核并安全清理已确证过期的本地 AF_UNIX 套接字；父目录缺失时零副作用返回 Missing。
 func PruneStaleUnixSocket(ctx context.Context, path ControlSocketPath) (SocketProbeStatus, error) {
 	if err := validateSocketCtxPath(ctx, path); err != nil {
 		return SocketProbeUnknown, err
@@ -253,8 +235,7 @@ func PruneStaleUnixSocket(ctx context.Context, path ControlSocketPath) (SocketPr
 		return SocketProbeMissing, nil
 	}
 	status := SocketProbeUnknown
-	err := withSocketDirLockOS(ctx, path.Dir(), false, func() error {
-		var pErr error
+	err := withSocketDirLockOS(ctx, path.Dir(), false, func() (pErr error) {
 		status, pErr = pruneLockedSocketEntry(ctx, path)
 		return pErr
 	})
@@ -291,11 +272,8 @@ func prepareSocketSlotLocked(ctx context.Context, path ControlSocketPath, replac
 	if errors.Is(pErr, context.Canceled) || errors.Is(pErr, context.DeadlineExceeded) {
 		return pErr
 	}
-	if pErr != nil {
-		return fmt.Errorf("%w: 探测 %q 失败: %w", ErrSlotOccupied, path.NativePath(), pErr)
-	}
-	if probed != SocketProbeStale {
-		return fmt.Errorf("%w: 无法确认 %q 为过期套接字 (status=%s)", ErrSlotOccupied, path.NativePath(), probed)
+	if pErr != nil || probed != SocketProbeStale {
+		return fmt.Errorf("%w: 无法确认 %q 为过期套接字 (status=%s): %w", ErrSlotOccupied, path.NativePath(), probed, pErr)
 	}
 	return unlinkSameSocket(path.NativePath(), origID)
 }
@@ -304,10 +282,7 @@ func listenUnixNoAutoUnlink(ctx context.Context, addr string) (*net.UnixListener
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "unix", addr)
 	if err != nil {
-		if isAddrInUseOS(err) || errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("%w: %w", ErrSlotOccupied, err)
-		}
-		return nil, mapOSError(err)
+		return nil, pickIf(isAddrInUseOS(err) || errors.Is(err, os.ErrExist), fmt.Errorf("%w: %w", ErrSlotOccupied, err), mapOSError(err))
 	}
 	uln, ok := ln.(*net.UnixListener)
 	if !ok {
@@ -331,7 +306,6 @@ func pruneLockedSocketEntry(ctx context.Context, path ControlSocketPath) (Socket
 	}
 	return SocketProbeStale, nil
 }
-
 func unlinkSameSocket(target string, origID socketFileID) error {
 	if target == "" {
 		return nil
@@ -345,19 +319,16 @@ func unlinkSameSocket(target string, origID socketFileID) error {
 	}
 	return nil
 }
-
 func cleanupSocketBind(uln *net.UnixListener, addr string, err error) error {
 	_ = uln.Close()
 	_ = os.Remove(addr)
 	return err
 }
-
 func closeUnixListenerSafe(uln *net.UnixListener) error {
-	if uln == nil {
-		return nil
-	}
-	if err := uln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-		return err
+	if uln != nil {
+		if err := uln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			return err
+		}
 	}
 	return nil
 }
@@ -374,7 +345,12 @@ func (b *borrowedUnixListener) Accept() (net.Conn, error) {
 	if !b.isActive() {
 		return nil, ports.ErrHandleExpired
 	}
-	return b.ln.Accept()
+	// 与 AcceptVerified 同源 fail-closed 核验对端用户凭证，确保 net.Listener 视图绝无未授权接入旁路。
+	conn, _, err := verifyUnixConnPeer(b.ln.AcceptUnix())
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 func (b *borrowedUnixListener) Close() error {
 	if !b.isActive() {

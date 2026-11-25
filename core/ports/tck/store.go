@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
@@ -241,12 +242,12 @@ func RunOpenSSHConfigSourceSuite(t *testing.T, fx OpenSSHConfigFixture) {
 
 		_, err := src.ListVirtualHosts(nilCtx)
 		requireErrIs(t, err, ports.ErrNilContext, "ListVirtualHosts(nil)")
-		_, err = src.ResolveTier4(nilCtx, fx.TargetHost, fx.Endpoint)
+		_, err = src.ResolveTier4(nilCtx, fx.TargetHost, algebraic.Some(fx.Endpoint))
 		requireErrIs(t, err, ports.ErrNilContext, "ResolveTier4(nil)")
-		_, err = src.ResolveTier4(context.Background(), zeroTarget, fx.Endpoint)
+		_, err = src.ResolveTier4(context.Background(), zeroTarget, algebraic.Some(fx.Endpoint))
 		requireErr(t, err, "ResolveTier4(zeroTarget)")
-		_, err = src.ResolveTier4(context.Background(), fx.TargetHost, zeroEP)
-		requireErr(t, err, "ResolveTier4(zeroEndpoint)")
+		_, err = src.ResolveTier4(context.Background(), fx.TargetHost, algebraic.Some(zeroEP))
+		requireErr(t, err, "ResolveTier4(Some(zeroEndpoint))")
 
 		hosts, err := src.ListVirtualHosts(context.Background())
 		requireNoErr(t, err, "ListVirtualHosts")
@@ -258,9 +259,13 @@ func RunOpenSSHConfigSourceSuite(t *testing.T, fx OpenSSHConfigFixture) {
 			requireTrue(t, jn.IsValid(), "JumpNode 投影必须有效")
 		}
 
-		layer, err := src.ResolveTier4(context.Background(), fx.TargetHost, fx.Endpoint)
-		requireNoErr(t, err, "ResolveTier4")
-		requireNoErr(t, layer.Validate(), "ResolveTier4 产出的 OptionLayer 须通过 Validate")
+		layerNone, err := src.ResolveTier4(context.Background(), fx.TargetHost, algebraic.None[netaddr.Endpoint]())
+		requireNoErr(t, err, "ResolveTier4(None endpoint)")
+		requireNoErr(t, layerNone.Validate(), "ResolveTier4(None) 产出的 OptionLayer 须通过 Validate")
+
+		layer, err := src.ResolveTier4(context.Background(), fx.TargetHost, algebraic.Some(fx.Endpoint))
+		requireNoErr(t, err, "ResolveTier4(Some endpoint)")
+		requireNoErr(t, layer.Validate(), "ResolveTier4(Some) 产出的 OptionLayer 须通过 Validate")
 	})
 }
 

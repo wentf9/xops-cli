@@ -12,11 +12,7 @@ import (
 const percentCHexLen = 40
 
 // ControlSocketPath 表示经平台安全规则与 sun_path 上限校验的本地 AF_UNIX 套接字路径。
-//
-// 跨平台不变量：
-//   - XOps 自管多路复用路径经 BuildManagedMuxSocketPath 使用 40 位小写十六进制 %C 命名（零 ':'）；
-//   - Unix 允许用户指定 OpenSSH ControlPath 文件名含 ':'（如 cm-alice@host:22）；
-//   - Windows/NTFS 严禁除盘符前缀（C:\）外任意位置出现 ':'，阻断 NTFS ADS 与非法文件名。
+// Unix 允许 OpenSSH ControlPath 含 ':'（如 cm-alice@host:22），Windows 除盘符前缀外严禁 ':'。
 //
 //xops:opaque
 //xops:failclosed
@@ -33,40 +29,41 @@ func ValidateControlSocketPath(raw string) (ControlSocketPath, error) {
 	return validateControlSocketPathOS(raw)
 }
 
+// ControlSocketPathFromSource 将经 pathalg 校验的本地源路径转换为当前平台安全控制套接字路径；
+// 兼容 Unix 下 OpenSSH %r@%h:%p 含 ':' 文件名，并在 Windows 上剥离 \\?\ 前缀后执行 sun_path 校验。
+func ControlSocketPathFromSource(src pathalg.LocalSourcePath) (ControlSocketPath, error) {
+	if !src.IsValid() {
+		return ControlSocketPath{}, fmt.Errorf("%w: 控制套接字源路径无效", ErrInvalidControlPath)
+	}
+	native, err := localPathToNativeOS(src.Kind(), src.String())
+	if err != nil {
+		return ControlSocketPath{}, fmt.Errorf("%w: %w", ErrInvalidControlPath, err)
+	}
+	return ValidateControlSocketPath(stripWin32LongPathPrefix(native))
+}
+
 // BuildManagedMuxSocketPath 基于经校验的沙箱目录与 OpenSSH %C 40 位小写十六进制摘要构造自管套接字路径。
 func BuildManagedMuxSocketPath(dir pathalg.LocalDir, percentC string) (ControlSocketPath, error) {
 	if !dir.IsValid() || !isLowerHex40(percentC) {
 		return ControlSocketPath{}, fmt.Errorf("%w: 控制套接字目录或 %%C 摘要 %q 无效", ErrInvalidControlPath, percentC)
 	}
-	nativeDir, err := localDirToNativePath(dir)
+	nativeDir, err := localPathToNativeOS(dir.Kind(), dir.String())
 	if err != nil {
 		return ControlSocketPath{}, fmt.Errorf("%w: %w", ErrInvalidControlPath, err)
 	}
-	// 剥离 \\?\ 扩展前缀，确保超长 Windows 目录落入 sun_path 长度校验并返回 ErrControlPathTooLong。
 	nativeDir = stripWin32LongPathPrefix(nativeDir)
-	sep := "/"
-	if strings.ContainsRune(nativeDir, '\\') {
-		sep = `\`
-	}
-	trimmed := strings.TrimRight(nativeDir, `/\`)
-	return ValidateControlSocketPath(trimmed + sep + "cm-" + percentC + ".sock")
+	sep := pickIf(strings.ContainsRune(nativeDir, '\\'), `\`, "/")
+	return ValidateControlSocketPath(strings.TrimRight(nativeDir, `/\`) + sep + "cm-" + percentC + ".sock")
 }
 
-// ControlSocketPath 只读访问器与等价比对（无效值统一返回空字符串，严格失败关闭）。
 func (p ControlSocketPath) IsValid() bool {
 	return p.valid && p.native != "" && p.dir != "" && p.name != ""
 }
-func (p ControlSocketPath) IsZero() bool { return !p.IsValid() }
-func (p ControlSocketPath) validStr(s string) string {
-	if !p.IsValid() {
-		return ""
-	}
-	return s
-}
-func (p ControlSocketPath) Dir() string        { return p.validStr(p.dir) }
-func (p ControlSocketPath) Name() string       { return p.validStr(p.name) }
-func (p ControlSocketPath) NativePath() string { return p.validStr(p.native) }
-func (p ControlSocketPath) String() string     { return p.validStr(p.native) }
+func (p ControlSocketPath) IsZero() bool       { return !p.IsValid() }
+func (p ControlSocketPath) Dir() string        { return pickIf(p.IsValid(), p.dir, "") }
+func (p ControlSocketPath) Name() string       { return pickIf(p.IsValid(), p.name, "") }
+func (p ControlSocketPath) NativePath() string { return pickIf(p.IsValid(), p.native, "") }
+func (p ControlSocketPath) String() string     { return pickIf(p.IsValid(), p.native, "") }
 func (p ControlSocketPath) Equal(o ControlSocketPath) bool {
 	return p.IsValid() && o.IsValid() && p.native == o.native
 }
@@ -84,20 +81,13 @@ func isLowerHex40(s string) bool {
 }
 
 func hasForbiddenControlPathRune(s string) bool {
-	if !utf8.ValidString(s) {
-		return true
-	}
-	for _, r := range s {
-		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Cf, r) {
-			return true
-		}
-	}
-	return false
+	return !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool {
+		return unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || unicode.Is(unicode.Cf, r)
+	})
 }
 
-func hasInvalidSocketTail(slashPath string) bool {
-	return slashPath == "" || slashPath == "." || slashPath == ".." ||
-		strings.HasSuffix(slashPath, "/") || strings.HasSuffix(slashPath, "/.") || strings.HasSuffix(slashPath, "/..")
+func hasInvalidSocketTail(p string) bool {
+	return p == "" || p == "." || p == ".." || strings.HasSuffix(p, "/") || strings.HasSuffix(p, "/.") || strings.HasSuffix(p, "/..")
 }
 
 // ValidateUnixControlSocketPath 按 Unix 规则校验套接字路径：允许文件名含 ':'，拒绝 '..'、尾随分隔符/'.' 与超长 sun_path。
@@ -105,10 +95,7 @@ func ValidateUnixControlSocketPath(raw string, maxBytes int) (ControlSocketPath,
 	if maxBytes <= 0 || hasInvalidSocketTail(raw) || hasForbiddenControlPathRune(raw) {
 		return ControlSocketPath{}, fmt.Errorf("%w: Unix 套接字路径 %q 非法", ErrInvalidControlPath, raw)
 	}
-	prefix := ""
-	if strings.HasPrefix(raw, "/") {
-		prefix = "/"
-	}
+	prefix := pickIf(strings.HasPrefix(raw, "/"), "/", "")
 	segs, err := splitCheckedSegments(strings.TrimPrefix(raw, "/"), false)
 	if err != nil {
 		return ControlSocketPath{}, err
@@ -116,10 +103,9 @@ func ValidateUnixControlSocketPath(raw string, maxBytes int) (ControlSocketPath,
 	return buildControlSocketPath(prefix, "/", segs, maxBytes)
 }
 
-// ValidateWindowsControlSocketPath 按 Windows/NTFS 规则严格校验套接字路径：除盘符前缀外严禁 ':'、前导 '/' 或 '\\'、尾随分隔符/'.'。
+// ValidateWindowsControlSocketPath 按 Windows/NTFS 规则严格校验套接字路径：除盘符前缀外严禁 ':'、前导分隔符与尾随分隔符/'.'。
 func ValidateWindowsControlSocketPath(raw string, maxBytes int) (ControlSocketPath, error) {
-	if maxBytes <= 0 || raw == "" || hasForbiddenControlPathRune(raw) ||
-		strings.HasPrefix(raw, `\`) || strings.HasPrefix(raw, "/") {
+	if maxBytes <= 0 || raw == "" || hasForbiddenControlPathRune(raw) || strings.HasPrefix(raw, `\`) || strings.HasPrefix(raw, "/") {
 		return ControlSocketPath{}, fmt.Errorf("%w: Windows 套接字路径 %q 非法", ErrInvalidControlPath, raw)
 	}
 	prefix, rest, err := splitWindowsSocketPrefix(raw)
@@ -176,11 +162,9 @@ func buildControlSocketPath(prefix, sep string, segs []string, maxBytes int) (Co
 	if len(native) > maxBytes {
 		return ControlSocketPath{}, fmt.Errorf("%w: 套接字路径长度 %d 超过上限 %d", ErrControlPathTooLong, len(native), maxBytes)
 	}
-	dir := "."
+	dir := pickIf(prefix != "", prefix, ".")
 	if len(segs) > 1 {
 		dir = prefix + strings.Join(segs[:len(segs)-1], sep)
-	} else if prefix != "" {
-		dir = prefix
 	}
 	return ControlSocketPath{dir: dir, name: segs[len(segs)-1], native: native, valid: true}, nil
 }

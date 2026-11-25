@@ -27,13 +27,8 @@ type lockedFile struct {
 }
 
 func (l *lockedFile) checkActive() error {
-	if l == nil || l.active == nil || !l.active.Load() || l.file == nil {
-		return ports.ErrHandleExpired
-	}
-	return nil
+	return pickIf[error](l != nil && l.active != nil && l.active.Load() && l.file != nil, nil, ports.ErrHandleExpired)
 }
-
-// withLockedFD 对锁定文件句柄执行失效守卫后调用操作函数。
 func (l *lockedFile) Read(p []byte) (int, error) {
 	if err := l.checkActive(); err != nil {
 		return 0, err
@@ -82,13 +77,7 @@ func (h *rootHandle) checkLockArgs(dest pathalg.LocalRootedDest, mode ports.Lock
 	if err := h.checkActiveDest(dest); err != nil {
 		return err
 	}
-	if fnNil {
-		return ports.ErrNilCallback
-	}
-	if !mode.IsValid() {
-		return ports.ErrInvalidLockMode
-	}
-	return nil
+	return pickIf[error](fnNil, ports.ErrNilCallback, pickIf[error](!mode.IsValid(), ports.ErrInvalidLockMode, nil))
 }
 
 // WithLockedFile 在 ctx 取消控制下获取内核文件锁并校验 SameFile（INV-A2），零后台协程退避等待。
@@ -102,8 +91,11 @@ func (h *rootHandle) WithLockedFile(ctx context.Context, dest pathalg.LocalRoote
 	if err := h.checkLockArgs(dest, mode, fn == nil); err != nil {
 		return err
 	}
-	f, err := h.acquireLockWithContext(ctx, dest, mode, create, perm)
-	if err != nil {
+	var f *os.File
+	if err := retryLockBackoff(ctx, func() (ok bool, tErr error) {
+		f, ok, tErr = h.tryAcquireLockedHandle(dest, mode, create, perm)
+		return ok, tErr
+	}); err != nil {
 		return err
 	}
 	return runWithLockedFile(f, dest.Base(), fn)
@@ -154,17 +146,6 @@ func retryLockBackoff(ctx context.Context, tryFn func() (bool, error)) error {
 	}
 }
 
-func (h *rootHandle) acquireLockWithContext(ctx context.Context, dest pathalg.LocalRootedDest, mode ports.LockMode, create bool, perm fs.FileMode) (*os.File, error) {
-	var f *os.File
-	err := retryLockBackoff(ctx, func() (bool, error) {
-		var ok bool
-		var tErr error
-		f, ok, tErr = h.tryAcquireLockedHandle(dest, mode, create, perm)
-		return ok, tErr
-	})
-	return f, err
-}
-
 func lockFileWithContext(ctx context.Context, f *os.File, exclusive bool) error {
 	return retryLockBackoff(ctx, func() (bool, error) {
 		err := tryLockFileOS(f, exclusive)
@@ -176,17 +157,16 @@ func lockFileWithContext(ctx context.Context, f *os.File, exclusive bool) error 
 }
 
 func (h *rootHandle) tryAcquireLockedHandle(dest pathalg.LocalRootedDest, mode ports.LockMode, create bool, perm fs.FileMode) (*os.File, bool, error) {
+	op := pickIf(create, leafOpLockCreate, pickIf(mode == ports.LockExclusive, leafOpLockRW, leafOpLockRO))
+	createPerm := pickIf(create, sanitizeFilePerm(perm, defaultFilePerm), 0)
 	for range maxSameFileLockRetries {
-		f, err := openForLockInRootOS(h.root, dest, mode, create, perm)
+		f, err := openLeafInRootOS(h.root, dest, op, createPerm)
 		if err != nil {
 			return nil, false, err
 		}
 		if lockErr := tryLockFileOS(f, mode == ports.LockExclusive); lockErr != nil {
 			_ = f.Close()
-			if errors.Is(lockErr, ports.ErrLockBusy) {
-				return nil, false, nil
-			}
-			return nil, false, mapOSError(lockErr)
+			return nil, false, pickIf[error](errors.Is(lockErr, ports.ErrLockBusy), nil, mapOSError(lockErr))
 		}
 		same, vErr := verifyRegularSameFile(h.root, dest.String(), f, true)
 		if vErr == nil && same {
@@ -208,9 +188,8 @@ func SidecarLockDest(dest pathalg.LocalRootedDest) (pathalg.LocalRootedDest, err
 	return siblingDest(dest, dest.Base()+".lock")
 }
 
-// RemoveLockedFileSafely 按 Plan §4 #5 三平台安全删锁协议清理已退役的单进程实例锁文件
-// （如 run/<ProcessInstanceID>.lock）：持独占锁截断清空刷盘 -> 解锁关句柄 -> Remove（忽略 ErrNotFound），
-// 消除 Windows 共享冲突。严禁对活跃共享的 <target>.lock 旁路写锁调用本函数（避免删除后新 inode 破坏互斥）。
+// RemoveLockedFileSafely 按三平台安全删锁协议清理已退役的单进程实例锁文件：
+// 持独占锁截断清空刷盘 -> 解锁关句柄 -> Remove（忽略 ErrNotFound），消除 Windows 共享冲突。
 func RemoveLockedFileSafely(root ports.RootHandle, lockDest pathalg.LocalRootedDest) (bool, error) {
 	if root == nil || !lockDest.IsValid() {
 		return false, fmt.Errorf("%w: 无效 RootHandle 或锁文件路径", ports.ErrInvalidArgument)
@@ -234,7 +213,7 @@ func RemoveLockedFileSafely(root ports.RootHandle, lockDest pathalg.LocalRootedD
 //
 //xops:syncclosure
 //xops:borrowed
-type OpenRegularFunc func(r io.Reader, size int64) error
+type OpenRegularFunc func(r ports.BoundedReadHandle, size int64) error
 
 //xops:syncclosure
 //xops:borrowed
@@ -245,16 +224,10 @@ type WriteFileFunc func(w io.Writer) error
 type LockedFileFunc func(f ports.LockedFile) error
 
 func checkRootCB(root ports.RootHandle, fnNil bool) error {
-	if root == nil {
-		return fmt.Errorf("%w: RootHandle 不能为 nil", ports.ErrInvalidArgument)
-	}
-	if fnNil {
-		return ports.ErrNilCallback
-	}
-	return nil
+	return pickIf[error](root == nil, fmt.Errorf("%w: RootHandle 不能为 nil", ports.ErrInvalidArgument), pickIf[error](fnNil, ports.ErrNilCallback, nil))
 }
 
-// OpenRegular / CreateExclusive / OpenLockedContext / AtomicReplace 为 ports.RootHandle 提供包级显式作用域原语（ADR-007 / INV-A1..A5）。
+// OpenRegular / CreateExclusive / OpenLockedContext / AtomicReplace 为 ports.RootHandle 提供包级显式作用域原语（ADR-007）。
 //
 //xops:syncclosure
 //xops:borrowed
@@ -307,32 +280,23 @@ func WithSidecarLock(ctx context.Context, root ports.RootHandle, target pathalg.
 	return root.WithLockedFile(ctx, lockDest, mode, true, sanitizeFilePerm(perm, defaultFilePerm), fn)
 }
 
-// AtomicReplaceWithSidecarLock 持有同目录旁路独占锁 <dest>.lock（绝不锁目标文件）并原子替换 dest（ADR-007）。
+// AtomicReplaceWithSidecarLock 持有同目录旁路独占锁 <dest>.lock（绝不锁目标文件）并原子替换 dest（ADR-007）；
+// 完全通过 ports.RootHandle 接口委派，零具体类型断言，同时兼容真实 osfs、仿真器及包装适配器。
 //
 //xops:syncclosure
 //xops:borrowed
-func AtomicReplaceWithSidecarLock(ctx context.Context, root ports.RootHandle, dest pathalg.LocalRootedDest, perm fs.FileMode, fn WriteFileFunc) (retErr error) {
+func AtomicReplaceWithSidecarLock(ctx context.Context, root ports.RootHandle, dest pathalg.LocalRootedDest, perm fs.FileMode, fn WriteFileFunc) error {
 	if ctx == nil {
 		return ports.ErrNilContext
 	}
-	h, ok := root.(*rootHandle)
-	if !ok || h == nil {
-		return fmt.Errorf("%w: 需要 osfs.ScopedFS 借出的 RootHandle", ports.ErrUnsupported)
-	}
-	if err := h.checkLockArgs(dest, ports.LockExclusive, fn == nil); err != nil {
+	if err := checkRootCB(root, fn == nil); err != nil {
 		return err
 	}
-	lockDest, err := SidecarLockDest(dest)
-	if err != nil {
-		return err
+	if !dest.IsValid() {
+		return fmt.Errorf("%w: 无效沙箱目标路径", ports.ErrInvalidArgument)
 	}
 	mode := sanitizeFilePerm(perm, defaultFilePerm)
-	lockFile, err := h.acquireLockWithContext(ctx, lockDest, ports.LockExclusive, true, mode)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		retErr = errors.Join(retErr, mapOSError(errors.Join(unlockFileOS(lockFile), lockFile.Close())))
-	}()
-	return h.AtomicReplace(dest, mode, fn)
+	return WithSidecarLock(ctx, root, dest, ports.LockExclusive, mode, func(ports.LockedFile) error {
+		return root.AtomicReplace(dest, mode, func(w io.Writer) error { return fn(w) })
+	})
 }

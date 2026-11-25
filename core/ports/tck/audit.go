@@ -18,6 +18,9 @@ type AuditFixture struct {
 	// SimulateCrash 在不调用 Close/UnstageOperation 的前提下模拟另一已死亡进程残留 .lock 与未闭合操作，
 	// 返回遗留未闭合的 OperationID（可选；提供时验证死亡锁抢占、补写 AbortedByCrash 与幂等性）。
 	SimulateCrash func(t *testing.T) security.OperationID
+	// SimulatePostDrainCrash 模拟「首次登记->闭合排空（触发 Truncate(0)+Seek(0,SeekStart)）->再次登记->突发崩溃」
+	// 场景并返回第二次未闭合的 OperationID，用于专门回归验证锁文件截断归零偏移不变量（可选）。
+	SimulatePostDrainCrash func(t *testing.T) security.OperationID
 }
 
 // RunAuditSuite 验证 AuditSink 只追加登记/闭合、无效入参拦截、O(1) 崩溃对账与并发登记契约。
@@ -60,6 +63,15 @@ func RunAuditSuite(t *testing.T, fx AuditFixture) {
 
 		requireNoErr(t, sink.Record(ctx, MustAuditEntry(t, procID, traceID, opID, ports.AuditPhaseFinalized, ports.AuditOutcomeSucceeded)), "Record(Finalized)")
 		requireNoErr(t, sink.UnstageOperation(ctx, opID), "UnstageOperation")
+
+		// 验证排空归零（Truncate(0)+Seek(0)）后的二次登记与闭合不会受损。
+		opID2, err := security.NewOperationIDFrom(ent)
+		requireNoErr(t, err, "NewOperationIDFrom(op2)")
+		requireNoErr(t, sink.StageOperation(ctx, opID2), "StageOperation(post-drain)")
+		requireNoErr(t, sink.Record(ctx, MustAuditEntry(t, procID, traceID, opID2, ports.AuditPhaseAuthorized, ports.AuditOutcomePending)), "Record(post-drain Authorized)")
+		requireNoErr(t, sink.Record(ctx, MustAuditEntry(t, procID, traceID, opID2, ports.AuditPhaseFinalized, ports.AuditOutcomeSucceeded)), "Record(post-drain Finalized)")
+		requireNoErr(t, sink.UnstageOperation(ctx, opID2), "UnstageOperation(post-drain)")
+
 		requireNoErr(t, sink.Close(), "AuditSink.Close(1)")
 		requireNoErr(t, sink.Close(), "AuditSink.Close(2, idempotent)")
 
@@ -85,7 +97,12 @@ func RunAuditSuite(t *testing.T, fx AuditFixture) {
 
 	if fx.SimulateCrash != nil {
 		t.Run("CrashReconcileAndIdempotency", func(t *testing.T) {
-			verifyCrashReconcileIdempotent(t, fx)
+			verifyCrashReconcileIdempotent(t, fx.NewAudit, fx.SimulateCrash)
+		})
+	}
+	if fx.SimulatePostDrainCrash != nil {
+		t.Run("PostDrainRestageCrashReconcile", func(t *testing.T) {
+			verifyCrashReconcileIdempotent(t, fx.NewAudit, fx.SimulatePostDrainCrash)
 		})
 	}
 }
@@ -121,15 +138,15 @@ func verifyConcurrentAuditStage(t *testing.T, newAudit func(t *testing.T) (ports
 	requireNoErr(t, err, "并发 Stage/Unstage")
 }
 
-func verifyCrashReconcileIdempotent(t *testing.T, fx AuditFixture) {
+func verifyCrashReconcileIdempotent(t *testing.T, newAudit func(t *testing.T) (ports.AuditSink, ports.AuditReconciler), simulate func(t *testing.T) security.OperationID) {
 	t.Helper()
 	ctx := context.Background()
-	sink, rec := fx.NewAudit(t)
-	requireTrue(t, rec != nil, "提供 SimulateCrash 时 NewAudit 必须返回非 nil AuditReconciler")
+	sink, rec := newAudit(t)
+	requireTrue(t, rec != nil, "提供崩溃模拟钩子时 NewAudit 必须返回非 nil AuditReconciler")
 	defer func() { _ = sink.Close() }()
 
-	abortedOp := fx.SimulateCrash(t)
-	requireTrue(t, abortedOp.IsValid(), "SimulateCrash 必须返回有效 OperationID")
+	abortedOp := simulate(t)
+	requireTrue(t, abortedOp.IsValid(), "崩溃模拟必须返回有效 OperationID")
 
 	first, err := rec.ReconcileCrashedAudits(ctx, BaseTime().Add(2*time.Minute))
 	requireNoErr(t, err, "Reconcile(first)")

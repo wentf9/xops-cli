@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime"
+	"slices"
 	"syscall"
 
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -15,17 +17,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func unixNativePath(kind pathalg.LocalPathKind, raw string) (string, error) {
+func localPathToNativeOS(kind pathalg.LocalPathKind, raw string) (string, error) {
 	if kind == pathalg.LocalPathWindowsDrive {
 		return "", fmt.Errorf("%w: Unix 不支持 Windows 盘符路径 %q", ports.ErrInvalidArgument, raw)
 	}
 	return raw, nil
 }
-func localDirToNativePath(dir pathalg.LocalDir) (string, error) {
-	return unixNativePath(dir.Kind(), dir.String())
-}
-func localSourceToNativePath(src pathalg.LocalSourcePath) (string, error) {
-	return unixNativePath(src.Kind(), src.String())
+func unlockFileOS(f *os.File) error { return flockFileUnix(f, unix.LOCK_UN) }
+
+func openLeafInRootOS(root *os.Root, dest pathalg.LocalRootedDest, op rootLeafOp, perm fs.FileMode) (*os.File, error) {
+	flags := [7]int{
+		unix.O_RDONLY | unix.O_NONBLOCK, unix.O_RDWR | unix.O_CREAT | unix.O_EXCL,
+		unix.O_WRONLY | unix.O_CREAT | unix.O_APPEND | unix.O_NONBLOCK,
+		unix.O_RDWR | unix.O_CREAT | unix.O_NONBLOCK, unix.O_RDONLY | unix.O_NONBLOCK,
+		unix.O_RDWR | unix.O_NONBLOCK, unix.O_RDWR | unix.O_CREAT | unix.O_NONBLOCK,
+	}
+	return openLeafInRootUnix(root, dest, flags[op], perm)
 }
 
 func openatNoFollow(dirFD int, name string, flags int, mode uint32) (int, error) {
@@ -37,8 +44,84 @@ func openatNoFollow(dirFD int, name string, flags int, mode uint32) (int, error)
 	}
 }
 
-// withParentDirFDUnix 从 *os.Root 锚定根目录句柄逐段以 O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC 步进至父目录 FD 并执行同步回调。
+// stepDirChainUnix 从基准目录句柄逐段以 O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC 步进；createMode!=0 时按序 Mkdirat。
 //
+//xops:syncclosure
+func stepDirChainUnix(baseF *os.File, segs []string, createMode fs.FileMode, fn func(leafFD int) error) error {
+	curFD, ownedFD := int(baseF.Fd()), -1
+	defer func() {
+		if ownedFD >= 0 {
+			_ = unix.Close(ownedFD)
+		}
+	}()
+	for _, seg := range segs {
+		if createMode != 0 {
+			if mkErr := unix.Mkdirat(curFD, seg, uint32(createMode.Perm())); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
+				return mapUnixOpenError(mkErr)
+			}
+		}
+		nextFD, oErr := openatNoFollow(curFD, seg, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if oErr != nil {
+			return mapUnixDirOpenError(curFD, seg, oErr)
+		}
+		if ownedFD >= 0 {
+			_ = unix.Close(ownedFD)
+		}
+		curFD, ownedFD = nextFD, nextFD
+	}
+	var err error
+	if fn != nil {
+		err = fn(curFD)
+	}
+	runtime.KeepAlive(baseF)
+	return err
+}
+
+func ensureDirOS(nativeDir string, mode fs.FileMode) error { return ensureDirRawUnix(nativeDir, mode) }
+
+// ensureDirRawUnix 在 Unix 上逐段以 Mkdirat + O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC 安全创建目录，
+// 容忍 OS 级祖先软链（如 macOS /tmp -> /private/tmp），同时严格拒绝末段或新建路径中的符号链接。
+func ensureDirRawUnix(nativeDir string, mode fs.FileMode) error {
+	if nativeDir == "" {
+		return fmt.Errorf("%w: 目标目录路径为空", ports.ErrInvalidArgument)
+	}
+	target := filepath.Clean(nativeDir)
+	base, missing, err := walkExistingAncestorUnix(target)
+	if err != nil {
+		return err
+	}
+	if len(missing) == 0 {
+		fd, oErr := openatNoFollow(unix.AT_FDCWD, target, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if oErr != nil {
+			return mapUnixDirOpenError(unix.AT_FDCWD, target, oErr)
+		}
+		return mapOSError(unix.Close(fd))
+	}
+	baseF, err := os.OpenFile(base, os.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return mapUnixOpenError(err)
+	}
+	defer func() { _ = baseF.Close() }()
+	slices.Reverse(missing)
+	return stepDirChainUnix(baseF, missing, mode, nil)
+}
+
+func walkExistingAncestorUnix(target string) (string, []string, error) {
+	var missing []string
+	for cur := target; ; {
+		if st, err := os.Stat(cur); err == nil {
+			if !st.IsDir() {
+				return "", nil, fmt.Errorf("%w: 路径 %q 不是目录", ports.ErrNotRegularFile, cur)
+			}
+			return cur, missing, nil
+		} else if parent := filepath.Dir(cur); !errors.Is(err, os.ErrNotExist) || parent == cur {
+			return "", nil, mapOSError(err)
+		} else {
+			missing, cur = append(missing, filepath.Base(cur)), parent
+		}
+	}
+}
+
 //xops:syncclosure
 func withParentDirFDUnix(root *os.Root, parentSegs []string, fn func(parentFD int) error) error {
 	rootF, err := root.Open(".")
@@ -46,33 +129,14 @@ func withParentDirFDUnix(root *os.Root, parentSegs []string, fn func(parentFD in
 		return mapUnixOpenError(err)
 	}
 	defer func() { _ = rootF.Close() }()
-	curFD, ownedFD := int(rootF.Fd()), -1
-	defer func() {
-		if ownedFD >= 0 {
-			_ = unix.Close(ownedFD)
-		}
-	}()
-	for _, seg := range parentSegs {
-		nextFD, openErr := openatNoFollow(curFD, seg, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if openErr != nil {
-			return mapUnixOpenError(openErr)
-		}
-		if ownedFD >= 0 {
-			_ = unix.Close(ownedFD)
-		}
-		curFD, ownedFD = nextFD, nextFD
-	}
-	err = fn(curFD)
-	runtime.KeepAlive(rootF)
-	return err
+	return stepDirChainUnix(rootF, parentSegs, 0, fn)
 }
 
 func openLeafInRootUnix(root *os.Root, dest pathalg.LocalRootedDest, flags int, mode fs.FileMode) (*os.File, error) {
 	segs, fd := dest.Segments(), -1
-	if err := withParentDirFDUnix(root, segs[:len(segs)-1], func(parentFD int) error {
-		var openErr error
-		fd, openErr = openatNoFollow(parentFD, dest.Base(), flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode.Perm()))
-		return mapUnixOpenError(openErr)
+	if err := withParentDirFDUnix(root, segs[:len(segs)-1], func(parentFD int) (oErr error) {
+		fd, oErr = openatNoFollow(parentFD, dest.Base(), flags|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(mode.Perm()))
+		return mapUnixOpenError(oErr)
 	}); err != nil {
 		return nil, err
 	}
@@ -97,34 +161,10 @@ func verifyRegularFDUnix(fd int, rel string, clearNonblock bool) error {
 	return nil
 }
 
-func openRegularFDInRootOS(root *os.Root, dest pathalg.LocalRootedDest) (*os.File, error) {
-	return openLeafInRootUnix(root, dest, unix.O_RDONLY|unix.O_NONBLOCK, 0)
-}
-func createExclusiveInRootOS(root *os.Root, dest pathalg.LocalRootedDest, mode fs.FileMode) (*os.File, error) {
-	return openLeafInRootUnix(root, dest, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, mode)
-}
-func openForAppendInRootOS(root *os.Root, dest pathalg.LocalRootedDest, mode fs.FileMode) (*os.File, error) {
-	return openLeafInRootUnix(root, dest, unix.O_WRONLY|unix.O_CREAT|unix.O_APPEND|unix.O_NONBLOCK, mode)
-}
-
-func openForLockInRootOS(root *os.Root, dest pathalg.LocalRootedDest, mode ports.LockMode, create bool, perm fs.FileMode) (*os.File, error) {
-	flags, createPerm := unix.O_RDONLY|unix.O_NONBLOCK, fs.FileMode(0)
-	if mode == ports.LockExclusive || create {
-		flags = unix.O_RDWR | unix.O_NONBLOCK
-	}
-	if create {
-		flags, createPerm = flags|unix.O_CREAT, sanitizeFilePerm(perm, defaultFilePerm)
-	}
-	return openLeafInRootUnix(root, dest, flags, createPerm)
-}
-
 func mkdirSegmentInRootOS(root *os.Root, parentSegs []string, leaf string, mode fs.FileMode) error {
-	return withParentDirFDUnix(root, parentSegs, func(parentFD int) error {
-		return mapUnixOpenError(unix.Mkdirat(parentFD, leaf, uint32(mode.Perm())))
-	})
+	return withParentDirFDUnix(root, parentSegs, func(parentFD int) error { return mapUnixOpenError(unix.Mkdirat(parentFD, leaf, uint32(mode.Perm()))) })
 }
 
-// openOperatorReadOS 按 SymlinkPolicy 在 Unix 上打开人工指定的只读常规源文件。
 func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.File, int64, error) {
 	flags := os.O_RDONLY | unix.O_NONBLOCK
 	switch policy {
@@ -141,12 +181,17 @@ func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.Fi
 	st, err := f.Stat()
 	if err != nil || !st.Mode().IsRegular() {
 		_ = f.Close()
-		if err != nil {
-			return nil, 0, mapOSError(err)
-		}
-		return nil, 0, fmt.Errorf("%w: 源路径 %q 不是常规文件", ports.ErrNotRegularFile, nativePath)
+		return nil, 0, pickIf[error](err != nil, mapOSError(err), fmt.Errorf("%w: 源路径 %q 不是常规文件", ports.ErrNotRegularFile, nativePath))
 	}
 	return f, st.Size(), nil
+}
+
+func mapUnixDirOpenError(dirFD int, name string, err error) error {
+	var st unix.Stat_t
+	if errors.Is(err, unix.ENOTDIR) && unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return fmt.Errorf("%w: %w", ports.ErrSymlinkRejected, err)
+	}
+	return mapUnixOpenError(err)
 }
 
 func mapUnixOpenError(err error) error {
@@ -181,17 +226,12 @@ func flockFileUnix(f *os.File, how int) error {
 }
 
 func tryLockFileOS(f *os.File, exclusive bool) error {
-	how := unix.LOCK_SH | unix.LOCK_NB
-	if exclusive {
-		how = unix.LOCK_EX | unix.LOCK_NB
-	}
-	err := flockFileUnix(f, how)
+	err := flockFileUnix(f, pickIf(exclusive, unix.LOCK_EX|unix.LOCK_NB, unix.LOCK_SH|unix.LOCK_NB))
 	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
 		return fmt.Errorf("%w: %w", ports.ErrLockBusy, err)
 	}
 	return mapOSError(err)
 }
-func unlockFileOS(f *os.File) error { return flockFileUnix(f, unix.LOCK_UN) }
 
 func syncRootParentDirOS(root *os.Root, dest pathalg.LocalRootedDest) error {
 	parentRel := "."

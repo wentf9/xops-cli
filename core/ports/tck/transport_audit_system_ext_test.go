@@ -77,6 +77,33 @@ func (c *memTransportConn) DialTCP(context.Context, netaddr.HostPort) (net.Conn,
 func (c *memTransportConn) ListenTCP(context.Context, string) (net.Listener, error) {
 	return &memListener{addr: memAddr("tcp:127.0.0.1:0")}, nil
 }
+func (c *memTransportConn) DialStreamLocal(ctx context.Context, rp pathalg.RemotePath) (net.Conn, error) {
+	if ctx == nil {
+		return nil, ports.ErrNilContext
+	}
+	if !rp.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	return &memEchoConn{}, nil
+}
+func (c *memTransportConn) ListenStreamLocal(ctx context.Context, rp pathalg.RemotePath) (net.Listener, error) {
+	if ctx == nil {
+		return nil, ports.ErrNilContext
+	}
+	if !rp.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	return &memListener{addr: memAddr("unix:" + rp.String())}, nil
+}
+func (c *memTransportConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, error) {
+	if ctx == nil {
+		return nil, ports.ErrNilContext
+	}
+	if !spec.IsValid() {
+		return nil, ports.ErrInvalidArgument
+	}
+	return &memEchoConn{}, nil
+}
 func (c *memTransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	if ctx == nil {
 		return nil, ports.ErrNilContext
@@ -87,8 +114,61 @@ func (c *memTransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort
 	return newMemRemoteFS(), nil
 }
 
-type memRemoteSession struct{ closed atomic.Bool }
+type memNopWriteCloser struct{ bytes.Buffer }
 
+func (*memNopWriteCloser) Close() error { return nil }
+
+type memRemoteSession struct {
+	mu                       sync.Mutex
+	started, closed          atomic.Bool
+	stdinP, stdoutP, stderrP bool
+	outBuf, errBuf           bytes.Buffer
+}
+
+func (s *memRemoteSession) checkPipeSlot(flag *bool) error {
+	if s.closed.Load() {
+		return ports.ErrClosed
+	}
+	if s.started.Load() || *flag {
+		return ports.ErrInvalidArgument
+	}
+	*flag = true
+	return nil
+}
+func (s *memRemoteSession) StdinPipe() (io.WriteCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkPipeSlot(&s.stdinP); err != nil {
+		return nil, err
+	}
+	return &memNopWriteCloser{}, nil
+}
+func (s *memRemoteSession) StdoutPipe() (io.Reader, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkPipeSlot(&s.stdoutP); err != nil {
+		return nil, err
+	}
+	return &s.outBuf, nil
+}
+func (s *memRemoteSession) StderrPipe() (io.Reader, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkPipeSlot(&s.stderrP); err != nil {
+		return nil, err
+	}
+	return &s.errBuf, nil
+}
+func (s *memRemoteSession) checkStartStreams(streams ports.ExecStreams) error {
+	if s.closed.Load() {
+		return ports.ErrClosed
+	}
+	if s.started.Load() || (s.stdinP && streams.Stdin != nil) || (s.stdoutP && streams.Stdout != nil) || (s.stderrP && streams.Stderr != nil) {
+		return ports.ErrInvalidArgument
+	}
+	s.started.Store(true)
+	return nil
+}
 func (s *memRemoteSession) Start(ctx context.Context, cmd execution.CommandPlan, streams ports.ExecStreams) error {
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -96,13 +176,25 @@ func (s *memRemoteSession) Start(ctx context.Context, cmd execution.CommandPlan,
 	if !cmd.IsValid() {
 		return ports.ErrInvalidArgument
 	}
-	if streams.Stdout != nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkStartStreams(streams); err != nil {
+		return err
+	}
+	if s.stdoutP {
+		_, _ = io.WriteString(&s.outBuf, "tck-ok\n")
+	} else if streams.Stdout != nil {
 		_, _ = io.WriteString(streams.Stdout, "tck-ok\n")
 	}
 	return nil
 }
-func (s *memRemoteSession) StartShell(context.Context, algebraic.Option[ports.PTYRequest], ports.ExecStreams) error {
-	return nil
+func (s *memRemoteSession) StartShell(ctx context.Context, streams ports.ExecStreams) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checkStartStreams(streams)
 }
 func (s *memRemoteSession) ResizePTY(context.Context, ports.TerminalSize) error { return nil }
 func (s *memRemoteSession) Signal(context.Context, string) error                { return nil }
@@ -160,17 +252,17 @@ func (memMuxSocket) DialMux(ctx context.Context, p pathalg.LocalSourcePath) (por
 	}
 	return nil, ports.ErrUnsupported
 }
-func (memMuxSocket) WithListener(ctx context.Context, dir pathalg.LocalDir, name pathalg.LocalRootedDest, fn func(ln net.Listener) error) error {
+func (memMuxSocket) WithListener(ctx context.Context, socketPath pathalg.LocalSourcePath, fn func(ln net.Listener) error) error {
 	if ctx == nil {
 		return ports.ErrNilContext
 	}
 	if fn == nil {
 		return ports.ErrNilCallback
 	}
-	if !dir.IsValid() || !name.IsValid() {
+	if !socketPath.IsValid() {
 		return ports.ErrInvalidArgument
 	}
-	ln := &memListener{addr: memAddr(dir.String() + "/" + name.String())}
+	ln := &memListener{addr: memAddr(socketPath.String())}
 	defer func() { _ = ln.Close() }()
 	return fn(ln)
 }
@@ -272,6 +364,58 @@ func (r *memRemoteFS) WithReadFile(ctx context.Context, p pathalg.RemotePath, li
 		return ports.ErrLimitExceeded
 	}
 	return fn(bytes.NewReader(f.data), int64(len(f.data)))
+}
+func (r *memRemoteFS) ReadChunk(ctx context.Context, p pathalg.RemotePath, offset int64, dst io.Writer, length int64) (int64, error) {
+	if ctx == nil {
+		return 0, ports.ErrNilContext
+	}
+	if !p.IsValid() || offset < 0 || length < 0 || dst == nil {
+		return 0, ports.ErrInvalidArgument
+	}
+	r.mu.Lock()
+	f, ok := r.files[p.String()]
+	r.mu.Unlock()
+	if !ok {
+		return 0, ports.ErrNotFound
+	}
+	if length == 0 {
+		return 0, nil
+	}
+	if offset >= int64(len(f.data)) {
+		return 0, io.EOF
+	}
+	avail := f.data[offset:]
+	eof := false
+	if int64(len(avail)) > length {
+		avail = avail[:length]
+	} else if int64(len(avail)) < length {
+		eof = true
+	}
+	n, err := dst.Write(avail)
+	if err != nil {
+		return int64(n), err
+	}
+	if eof {
+		return int64(n), io.EOF
+	}
+	return int64(n), nil
+}
+func (r *memRemoteFS) Chmod(ctx context.Context, p pathalg.RemotePath, perm fs.FileMode) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	if !p.IsValid() || perm == 0 || perm != perm.Perm() {
+		return ports.ErrInvalidArgument
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f, ok := r.files[p.String()]
+	if !ok {
+		return ports.ErrNotFound
+	}
+	f.mode = perm
+	r.files[p.String()] = f
+	return nil
 }
 func (r *memRemoteFS) WriteFileAtomic(ctx context.Context, p pathalg.RemotePath, spec ports.RemoteWriteSpec, src io.Reader) (ports.RemoteFileStat, error) {
 	if ctx == nil {
@@ -669,6 +813,30 @@ func (h *memTerminalHandle) Read(p []byte) (int, error)              { return h.
 func (h *memTerminalHandle) Write(p []byte) (int, error)             { return h.buf.Write(p) }
 func (h *memTerminalHandle) Size() (ports.TerminalSize, error)       { return h.size, nil }
 func (h *memTerminalHandle) ResizeEvents() <-chan ports.TerminalSize { return h.resize }
+func (h *memTerminalHandle) Relay(ctx context.Context, remoteIn io.Writer, remoteOut io.Reader, onResize func(context.Context, ports.TerminalSize) error) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if remoteIn == nil || remoteOut == nil {
+		return ports.ErrInvalidArgument
+	}
+	if _, err := io.Copy(remoteIn, h); err != nil {
+		return err
+	}
+	if cl, ok := remoteIn.(io.Closer); ok {
+		_ = cl.Close()
+	}
+	if _, err := io.Copy(h, remoteOut); err != nil {
+		return err
+	}
+	if onResize != nil {
+		return onResize(ctx, h.size)
+	}
+	return nil
+}
 
 type memTerminalPort struct{ size ports.TerminalSize }
 
@@ -743,26 +911,19 @@ func (m memInteractionPort) PromptSecret(ctx context.Context, req ports.SecretPr
 
 func TestTCKTransportAuditAndSystemSuites(t *testing.T) {
 	tck.RunDialerSuite(t, tck.DialerFixture{
-		NewDialer:     func(*testing.T) ports.DialerPort { return memDialer{} },
-		CheckMultiHop: true,
-		CheckRemoteFS: true,
+		NewDialer:             func(*testing.T) ports.DialerPort { return memDialer{} },
+		CheckMultiHop:         true,
+		CheckRemoteFS:         true,
+		CheckTunnelExtensions: true,
 	})
 
-	dir, err := pathalg.ParseLocalDir("/tmp/xops-tck-mux")
-	if err != nil {
-		t.Fatal(err)
-	}
-	sockName, err := pathalg.ParseLocalRootedDest("ctl.sock")
-	if err != nil {
-		t.Fatal(err)
-	}
-	existingSock, err := pathalg.ParseLocalSourcePath("/tmp/xops-tck-mux/ctl.sock")
+	existingSock, err := pathalg.ParseLocalSourcePath("/tmp/xops-tck-mux/ops@10.0.0.1:22.sock")
 	if err != nil {
 		t.Fatal(err)
 	}
 	tck.RunMuxSocketSuite(t, tck.MuxSocketFixture{
-		NewMux: func(*testing.T) (ports.MuxSocketPort, pathalg.LocalDir, pathalg.LocalRootedDest) {
-			return memMuxSocket{}, dir, sockName
+		NewMux: func(*testing.T) (ports.MuxSocketPort, pathalg.LocalSourcePath) {
+			return memMuxSocket{}, existingSock
 		},
 		ExistingSocket: algebraic.Some(existingSock),
 	})

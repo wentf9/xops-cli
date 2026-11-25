@@ -41,7 +41,10 @@ func (p *Pool) cleanupAfterActorExit() {
 
 		batch := make([]*hopInstance, 0, len(p.active))
 		for _, inst := range p.active {
+			pinned := inst.pinnedHandles
+			inst.pinnedHandles = nil
 			p.deactivateInstance(inst, cause)
+			p.revokeSlotsForHop(pinned, cause)
 			batch = append(batch, inst)
 		}
 		clear(p.active)
@@ -217,7 +220,7 @@ func (p *Pool) ensureCapacityForNewDial() bool {
 func (p *Pool) pickLRUIdleLeaf() *hopInstance {
 	var best *hopInstance
 	for _, inst := range p.active {
-		if inst.activeLeases > 0 || len(inst.children) > 0 {
+		if inst.activeLeases > 0 || len(inst.pinnedHandles) > 0 || len(inst.children) > 0 {
 			continue
 		}
 		if isOlderIdleCandidate(inst, best) {

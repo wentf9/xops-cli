@@ -1,20 +1,8 @@
 // Package ports 定义 XOps v2 六边形核心的全部出站端口契约（公开契约 2，ADR-002 / ADR-003）。
 //
 // 本包仅允许依赖 core/domain/** 与受控标准库，严禁引入 core/internal/**、core/osfs、core/conc、
-// core/events、testing 或任何具体协议实现库（如 golang.org/x/crypto/ssh、github.com/pkg/sftp）。
-//
-// 核心架构不变量：
-//   - 全作用域闭包化（ADR-011）：机密借用（SecretVault.WithSecret、InteractionPort.PromptSecret）、
-//     本地沙箱（ScopedRootFS.WithRoot、RootHandle.With*）、操作员只读源（OperatorReadFS.WithOperatorRead）、
-//     远端文件读取（RemoteFSPort.WithReadFile）、多路复用监听（MuxSocketPort.WithListener）与
-//     本机原始终端（TerminalPort.WithRawTerminal）均显式标注 //xops:syncclosure 与 //xops:borrowed，
-//     由 xopsvet/linearlease 在编译期静态阻断资源逃逸；
-//   - 双模态本地文件系统物理隔离（ADR-007）：ScopedRootFS 与 OperatorReadFS 同驻 localfs.go，
-//     archbound 在符号级物理封禁 core/internal/mcpruntime 引用 ports.OperatorReadFS；
-//   - 失败关闭与严格 JSON/v2 编解码（ADR-001 / ADR-014）：全部导出值对象采用全私有字段、零值失败关闭、
-//     禁止在序列化 DTO 中裸用 time.Duration（统一使用 algebraic.Duration），并拒绝 JSON null、
-//     缺失必填字段与未知字段；SecretBox 严禁进入任何序列化结构或审计载荷；
-//   - 显式熵源注入（ADR-003）：Entropy 直接满足 io.Reader，零摩擦对接 security/trace/plan ID 构造器。
+// core/events、testing 或具体协议实现库；全作用域闭包（//xops:syncclosure + //xops:borrowed）、
+// 双模态本地 FS 隔离（ScopedRootFS vs OperatorReadFS）、失败关闭零值与严格 json/v2 编解码均由本包确立。
 package ports
 
 import (
@@ -37,7 +25,7 @@ const (
 	maxPortEnvValBytes = 8192
 )
 
-// 本包导出的规范化哨兵错误，供用例服务、连接池、能力门控、宿主适配器、仿真器与 TCK 统一以 errors.Is 判定。
+// 本包导出的规范化哨兵错误，供用例、连接池、能力门控、宿主适配器、仿真器与 TCK 统一以 errors.Is 判定。
 var (
 	// 通用契约与参数错误。
 	ErrNilContext       = errors.New("ports: context 不能为 nil")
@@ -100,6 +88,14 @@ func pickIf[T any](ok bool, yes, no T) T {
 	return no
 }
 func zeroVal[T any]() (z T) { return z }
+func firstErr(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func optEqualFunc[T any](a, b algebraic.Option[T], eq func(T, T) bool) bool {
 	va, okA := a.Get()
 	vb, okB := b.Get()
@@ -116,45 +112,31 @@ func unmarshalTextWithReset[T any](dst *T, zero T, text []byte, parse func(strin
 		return ErrNilReceiver
 	}
 	parsed, err := parse(string(text))
-	if err != nil {
-		*dst = zero
-		return err
-	}
-	*dst = parsed
-	return nil
+	*dst = pickIf(err == nil, parsed, zero)
+	return err
 }
 
-// rejectJSONNull 在自定义 UnmarshalJSONFrom 入口显式拒绝顶层 JSON null，并透传畸形语法错误。
-func rejectJSONNull(dec *jsontext.Decoder, baseErr error) (bool, error) {
-	if dec.PeekKind() != 'n' {
-		return false, nil
-	}
-	if _, err := dec.ReadToken(); err != nil {
-		return true, err
-	}
-	return true, fmt.Errorf("%w: JSON null 不是有效值", baseErr)
-}
-
-// unmarshalJSONWithNullReject 统一执行失败关闭的 JSON/v2 反序列化：
-// 先重置目标为零值，再拒绝顶层 null 与未知字段，解码 wire 后交由领域构造器核验全部不变量。
+// unmarshalJSONWithNullReject 统一执行失败关闭的 JSON/v2 反序列化：重置零值、拒绝 null 与未知字段并交由构造器核验。
 func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseErr error, build func(W) (T, error)) error {
 	if dst == nil || dec == nil {
 		return ErrNilReceiver
 	}
 	*dst = zeroVal[T]()
-	if isNull, err := rejectJSONNull(dec, baseErr); isNull {
-		return err
+	if dec.PeekKind() == 'n' {
+		if _, err := dec.ReadToken(); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: JSON null 不是有效值", baseErr)
 	}
 	var wire W
 	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return err
 	}
 	parsed, err := build(wire)
-	if err != nil {
-		return err
+	if err == nil {
+		*dst = parsed
 	}
-	*dst = parsed
-	return nil
+	return err
 }
 func marshalValidJSON[W any](enc *jsontext.Encoder, valid bool, badErr error, wire W) error {
 	if enc == nil {
@@ -189,10 +171,7 @@ func isValidRFC3339Time(t time.Time) bool {
 func sanitizeBoundedText(raw string, maxBytes int, allowEmpty bool, baseErr error) (string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		if allowEmpty {
-			return "", nil
-		}
-		return "", fmt.Errorf("%w: 文本不能为空", baseErr)
+		return "", pickIf[error](allowEmpty, nil, fmt.Errorf("%w: 文本不能为空", baseErr))
 	}
 	if len(trimmed) > maxBytes || hasForbiddenControl(trimmed) {
 		return "", fmt.Errorf("%w: 文本超长或包含非法 UTF-8/控制/Bidi 字符", baseErr)

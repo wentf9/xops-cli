@@ -60,6 +60,15 @@ func TestCompileTimeInterfaceContracts(t *testing.T) {
 		creq  ports.ConfirmRequest
 		treq  ports.TextPromptRequest
 		aresp ports.ApprovalDecisionResponse
+		vst   ports.VaultState
+		vstat ports.VaultStatus
+		sshfp ports.SSHFPRecord
+		lid   ports.LocalIdentityInfo
+		tmode ports.TUNMode
+		tspec ports.TUNSpec
+		pmeth ports.PrivilegeMethod
+		preq  ports.PrivilegeRequest
+		sprob ports.ShellProbeResult
 		ent   ports.Entropy
 		apwe  *ports.AuditPostWriteError
 	)
@@ -93,6 +102,15 @@ func TestCompileTimeInterfaceContracts(t *testing.T) {
 		_ encoding.TextAppender    = aout
 		_ encoding.TextMarshaler   = aout
 		_ encoding.TextUnmarshaler = &aout
+		_ encoding.TextAppender    = vst
+		_ encoding.TextMarshaler   = vst
+		_ encoding.TextUnmarshaler = &vst
+		_ encoding.TextAppender    = tmode
+		_ encoding.TextMarshaler   = tmode
+		_ encoding.TextUnmarshaler = &tmode
+		_ encoding.TextAppender    = pmeth
+		_ encoding.TextMarshaler   = pmeth
+		_ encoding.TextUnmarshaler = &pmeth
 		_ jsonv2.MarshalerTo       = dur
 		_ jsonv2.UnmarshalerFrom   = &dur
 		_ jsonv2.MarshalerTo       = vh
@@ -133,6 +151,18 @@ func TestCompileTimeInterfaceContracts(t *testing.T) {
 		_ jsonv2.UnmarshalerFrom   = &treq
 		_ jsonv2.MarshalerTo       = aresp
 		_ jsonv2.UnmarshalerFrom   = &aresp
+		_ jsonv2.MarshalerTo       = vstat
+		_ jsonv2.UnmarshalerFrom   = &vstat
+		_ jsonv2.MarshalerTo       = sshfp
+		_ jsonv2.UnmarshalerFrom   = &sshfp
+		_ jsonv2.MarshalerTo       = lid
+		_ jsonv2.UnmarshalerFrom   = &lid
+		_ jsonv2.MarshalerTo       = tspec
+		_ jsonv2.UnmarshalerFrom   = &tspec
+		_ jsonv2.MarshalerTo       = preq
+		_ jsonv2.UnmarshalerFrom   = &preq
+		_ jsonv2.MarshalerTo       = sprob
+		_ jsonv2.UnmarshalerFrom   = &sprob
 	)
 }
 
@@ -191,6 +221,15 @@ func TestZeroValuesFailClosed(t *testing.T) {
 		creq  ports.ConfirmRequest
 		treq  ports.TextPromptRequest
 		aresp ports.ApprovalDecisionResponse
+		vst   ports.VaultState
+		vstat ports.VaultStatus
+		sshfp ports.SSHFPRecord
+		lid   ports.LocalIdentityInfo
+		tmode ports.TUNMode
+		tspec ports.TUNSpec
+		pmeth ports.PrivilegeMethod
+		preq  ports.PrivilegeRequest
+		sprob ports.ShellProbeResult
 	)
 	assertZeroEqFalse(t, "Revision", rev)
 	assertZeroInvalid(t, "InventorySnapshot", snap)
@@ -228,9 +267,20 @@ func TestZeroValuesFailClosed(t *testing.T) {
 	assertZeroEqFalse(t, "ConfirmRequest", creq)
 	assertZeroEqFalse(t, "TextPromptRequest", treq)
 	assertZeroEqFalse(t, "ApprovalDecisionResponse", aresp)
+	assertZeroInvalid(t, "VaultState", vst)
+	assertZeroEqFalse(t, "VaultStatus", vstat)
+	assertZeroEqFalse(t, "SSHFPRecord", sshfp)
+	assertZeroEqFalse(t, "LocalIdentityInfo", lid)
+	assertZeroInvalid(t, "TUNMode", tmode)
+	assertZeroEqFalse(t, "TUNSpec", tspec)
+	assertZeroInvalid(t, "PrivilegeMethod", pmeth)
+	assertZeroEqFalse(t, "PrivilegeRequest", preq)
+	assertZeroEqFalse(t, "ShellProbeResult", sprob)
 	if dur.Applied() || dur.Durable() || htc.IsTrusted() || mresp.Alive() ||
 		ranc.Matches(ranc) || pres.Succeeded() || creq.Risk() != security.RiskUnknown ||
-		aresp.Approved() || aresp.Verdict() != security.VerdictDeny {
+		aresp.Approved() || aresp.Verdict() != security.VerdictDeny ||
+		vstat.IsUnlocked() || sshfp.Authenticated() || preq.NonInteractive() ||
+		sprob.LaunchProfile().IsValid() {
 		t.Fatal("零值安全谓词必须严格失败关闭")
 	}
 }

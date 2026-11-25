@@ -304,7 +304,7 @@ func (p *Pool) sendSyncControl(validArg bool, msg controlMsg) error {
 	}
 }
 
-// EvictIdle 立即驱逐池内所有无活跃租约且无活跃子跳的空闲连接（自底向上级联驱逐），返回驱逐数量。
+// EvictIdle 立即驱逐池内所有无活跃租约、无钉选托管句柄且无活跃子跳的空闲连接（自底向上级联驱逐），返回驱逐数量。
 func (p *Pool) EvictIdle() int {
 	if p == nil || !p.initialized {
 		return 0

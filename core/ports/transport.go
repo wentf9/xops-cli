@@ -33,8 +33,6 @@ func NewPTYRequest(term string, size TerminalSize) (PTYRequest, error) {
 	}
 	return PTYRequest{term: term, size: size, valid: true}, nil
 }
-
-// PTYRequest 只读访问器与等价比对。
 func (p PTYRequest) IsValid() bool      { return p.valid && p.term != "" && p.size.IsValid() }
 func (p PTYRequest) IsZero() bool       { return !p.IsValid() }
 func (p PTYRequest) Term() string       { return p.term }
@@ -58,109 +56,125 @@ const (
 	ForwardTUN                                      // L2/L3 隧道设备转发（-w）
 )
 
-// ForwardSpec 描述单条 SSH 隧道转发规则；零值恒无效。
+// ForwardSpec 描述单条 SSH 隧道转发规则（含 ForwardTUN 强类型 TUNSpec）；零值恒无效。
 //
 //xops:opaque
 //xops:failclosed
 type ForwardSpec struct {
-	direction  ForwardDirection
-	bindAddr   string
-	targetAddr string
-	valid      bool
+	direction            ForwardDirection
+	bindAddr, targetAddr string
+	tun                  algebraic.Option[TUNSpec]
+	valid                bool
 }
 
-// NewForwardSpec 校验转发方向、监听地址与目标地址组合并构造不可变 ForwardSpec；
-// ForwardDynamic 要求 targetAddr 为空，其余方向要求 bindAddr 与 targetAddr 均非空。
+// NewForwardSpec 校验非 TUN 转发方向、监听地址与目标地址组合并构造不可变 ForwardSpec；
+// ForwardDynamic 要求 targetAddr 为空，ForwardTUN 须经 NewForwardTUNSpec 构造。
 func NewForwardSpec(direction ForwardDirection, bindAddr, targetAddr string) (ForwardSpec, error) {
-	if !direction.IsValid() {
-		return ForwardSpec{}, fmt.Errorf("%w: 无效 ForwardDirection", ErrInvalidArgument)
-	}
-	bind, err := sanitizeBoundedText(bindAddr, maxPortDetailBytes, false, ErrInvalidArgument)
-	if err != nil {
-		return ForwardSpec{}, fmt.Errorf("%w: bind_addr 非法", err)
-	}
-	target, err := sanitizeBoundedText(targetAddr, maxPortDetailBytes, direction == ForwardDynamic, ErrInvalidArgument)
-	if err != nil {
-		return ForwardSpec{}, fmt.Errorf("%w: target_addr 非法", err)
-	}
-	if direction == ForwardDynamic && target != "" {
-		return ForwardSpec{}, fmt.Errorf("%w: dynamic 转发不得指定 target_addr", ErrInvalidArgument)
+	bind, e1 := sanitizeBoundedText(bindAddr, maxPortDetailBytes, false, ErrInvalidArgument)
+	target, e2 := sanitizeBoundedText(targetAddr, maxPortDetailBytes, direction == ForwardDynamic, ErrInvalidArgument)
+	if !direction.IsValid() || direction == ForwardTUN || firstErr(e1, e2) != nil || (direction == ForwardDynamic && target != "") {
+		return ForwardSpec{}, fmt.Errorf("%w: ForwardSpec 方向或地址组合非法（ForwardTUN 须使用 NewForwardTUNSpec）", ErrInvalidArgument)
 	}
 	return ForwardSpec{direction: direction, bindAddr: bind, targetAddr: target, valid: true}, nil
 }
 
-// ForwardSpec 只读访问器与等价比对。
+// NewForwardTUNSpec 校验强类型 TUNSpec 并构造 ForwardTUN 方向的不可变 ForwardSpec。
+func NewForwardTUNSpec(tun TUNSpec) (ForwardSpec, error) {
+	if !tun.IsValid() {
+		return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN 需要有效 TUNSpec", ErrInvalidArgument)
+	}
+	return ForwardSpec{
+		direction: ForwardTUN, bindAddr: formatTUNUnitAddr(tun.Mode(), tun.LocalUnit()),
+		targetAddr: formatTUNUnitAddr(tun.Mode(), tun.RemoteUnit()), tun: algebraic.Some(tun), valid: true,
+	}, nil
+}
+
+func formatTUNUnitAddr(mode TUNMode, unit uint32) string {
+	prefix := pickIf(mode == TUNModeEthernet, "tap", "tun")
+	if unit == TUNUnitAny {
+		return prefix + "any"
+	}
+	return fmt.Sprintf("%s%d", prefix, unit)
+}
 func (f ForwardSpec) IsValid() bool {
-	return f.valid && f.direction.IsValid() && f.bindAddr != "" && (f.direction == ForwardDynamic || f.targetAddr != "")
+	if !f.valid || !f.direction.IsValid() || f.bindAddr == "" {
+		return false
+	}
+	if f.direction == ForwardTUN {
+		t, ok := f.tun.Get()
+		return ok && t.IsValid() && f.targetAddr != ""
+	}
+	return f.tun.IsNone() && (f.direction == ForwardDynamic || f.targetAddr != "")
 }
 func (f ForwardSpec) IsZero() bool { return !f.IsValid() }
 func (f ForwardSpec) Direction() ForwardDirection {
 	return pickIf(f.IsValid(), f.direction, ForwardDirectionInvalid)
 }
-func (f ForwardSpec) BindAddr() string   { return f.bindAddr }
-func (f ForwardSpec) TargetAddr() string { return f.targetAddr }
+func (f ForwardSpec) BindAddr() string               { return f.bindAddr }
+func (f ForwardSpec) TargetAddr() string             { return f.targetAddr }
+func (f ForwardSpec) TUN() algebraic.Option[TUNSpec] { return f.tun }
 func (f ForwardSpec) Equal(o ForwardSpec) bool {
-	return f.IsValid() && o.IsValid() && f.direction == o.direction && f.bindAddr == o.bindAddr && f.targetAddr == o.targetAddr
+	return f.IsValid() && o.IsValid() && f.direction == o.direction && f.bindAddr == o.bindAddr &&
+		f.targetAddr == o.targetAddr && optEqualFunc(f.tun, o.tun, TUNSpec.Equal)
 }
 
-// ExecStreams 聚合单次远端会话执行的运行期数据面流（纯运行期管道，非持久化 DTO）。
+// ExecStreams 聚合单次远端会话执行的运行期数据面流、可选 PTY 与经 SendEnv 过滤后的环境变量（非持久化 DTO）。
 type ExecStreams struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 	PTY    algebraic.Option[PTYRequest]
+	Env    map[string]string
 }
 
-// RemoteSession 表示单条 SSH 通道上建立的远端命令或交互式 Shell 会话（完全隔离 x/crypto/ssh.Session）。
+// RemoteSession 表示单条 SSH 通道上建立的远端命令或交互式 Shell 会话（隔离 x/crypto/ssh.Session）。
+// StdinPipe / StdoutPipe / StderrPipe 须在 Start / StartShell 前获取且分别与非空 ExecStreams.{Stdin,Stdout,Stderr} 互斥，
+// 支撑 TerminalHandle.Relay 双向流中继与 sshnet/priv 随机 -p 提权握手（含 PROTOCOL.mux v4）。
 type RemoteSession interface {
-	// Start 按不可变 CommandPlan 启动单次远端命令或脚本执行（流向数据面 streams）。
+	StdinPipe() (io.WriteCloser, error)
+	StdoutPipe() (io.Reader, error)
+	StderrPipe() (io.Reader, error)
 	Start(ctx context.Context, cmd execution.CommandPlan, streams ExecStreams) error
-	// StartShell 启动远端交互式 Shell 会话（可选分配 PTY）。
-	StartShell(ctx context.Context, pty algebraic.Option[PTYRequest], streams ExecStreams) error
-	// ResizePTY 在已启用 PTY 的交互会话中调整远端窗口尺寸。
+	// StartShell 启动远端交互式 Shell 会话（可选 PTY 与环境变量统一由 streams.PTY / streams.Env 承载）。
+	StartShell(ctx context.Context, streams ExecStreams) error
 	ResizePTY(ctx context.Context, size TerminalSize) error
-	// Signal 向远端运行进程发送 POSIX 信号名（如 "INT"、"TERM"、"KILL"）。
 	Signal(ctx context.Context, signal string) error
-	// Wait 等待远端进程结束并返回不可变封闭 ExecutionOutcome（严分 NotStarted / Completed / Unknown）。
 	Wait(ctx context.Context) (execution.ExecutionOutcome, error)
-	// Close 关闭会话通道并释放关联传输资源（幂等）。
 	Close() error
 }
 
-// TransportConn 表示一条已认证的实时 SSH 传输连接（单跳或多跳末跳），由 core/internal/pool 独占托管（ADR-009）。
-// 本接口完全剥离 golang.org/x/crypto/ssh 具体类型，确保 core/internal/pool 与 usecase 100% 零 sshnet 依赖。
-type TransportConn interface {
-	// HopDigest 返回该连接建立时锁定的 Merkle 单跳摘要（含全部上游跳板）。
-	HopDigest() plan.HopDigest
-	// Endpoint 返回该连接指向的规范化目标端点。
-	Endpoint() netaddr.Endpoint
-	// OpenSession 在当前传输连接上打开一条隔离的远端命令/Shell 会话通道。
+// SessionOpener 是打开隔离远端会话通道的最小能力窄接口；*pool.Lease 与 TransportConn 均天然满足。
+type SessionOpener interface {
 	OpenSession(ctx context.Context) (RemoteSession, error)
-	// DialTCP 通过当前 SSH 传输向 target 发起 direct-tcpip 隧道连接（用于多跳拨号与 -L/-D 转发）；
-	// 多跳连接须由适配器封装 core/conc.Nursery 取消/超时看门狗（ADR-015）。
+}
+
+// TunnelTransport 是面向端口转发、StreamLocal 与 TUN 隧道的最小数据面窄接口；*pool.Lease 与 TransportConn 均满足。
+type TunnelTransport interface {
 	DialTCP(ctx context.Context, target netaddr.HostPort) (net.Conn, error)
-	// ListenTCP 在远端 SSH 服务端请求 tcpip-forward 监听（用于 -R 远端转发）。
 	ListenTCP(ctx context.Context, bindAddr string) (net.Listener, error)
-	// OpenRemoteFS 在当前传输连接上打开受保护的 SFTP 子系统出站端口（无裸客户端逃生口）。
+	DialStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Conn, error)
+	ListenStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Listener, error)
+	OpenTUN(ctx context.Context, spec TUNSpec) (io.ReadWriteCloser, error)
+}
+
+// TransportConn 表示一条已认证的实时 SSH 传输连接，由 core/internal/pool 独占托管（ADR-009）。
+type TransportConn interface {
+	SessionOpener
+	TunnelTransport
+	HopDigest() plan.HopDigest
+	Endpoint() netaddr.Endpoint
 	OpenRemoteFS(ctx context.Context) (RemoteFSPort, error)
-	// SendKeepalive 发送单次协议保活探针（归池内 PooledClient 独有，INV-C2）。
 	SendKeepalive(ctx context.Context) error
-	// IsAlive 报告底层传输连接当前是否仍处于活跃可用状态。
 	IsAlive() bool
-	// Close 关闭传输连接并释放底层通道与看门狗资源（幂等）。
 	Close() error
 }
 
 // DialerPort 定义协议无关的 SSH 单跳/多跳拨号出站端口（ADR-009 / ADR-015）。
-// core/internal/pool 仅依赖本端口，生产环境由 core/engine 注入 core/internal/sshnet/dial，DST 注入 sim。
 type DialerPort interface {
-	// DialHop 按不可变单跳规格 hop 与 Merkle 摘要 hopDigest 建立传输连接；
-	// parent == nil 表示直连或经 ProxyCommand 建立首跳，parent != nil 表示经上游跳板建立多跳隧道。
 	DialHop(ctx context.Context, hop plan.HopSpec, hopDigest plan.HopDigest, parent TransportConn) (TransportConn, error)
 }
 
-// MuxControlAction 标识 OpenSSH PROTOCOL.mux v4 控制面动作（-O check/forward/cancel/exit/stop/proxy）；
-// 零值 MuxActionInvalid 严格失败关闭。
+// MuxControlAction 标识 OpenSSH PROTOCOL.mux v4 控制面动作；零值 MuxActionInvalid 严格失败关闭。
 //
 //xops:opaque
 //xops:failclosed
@@ -168,12 +182,12 @@ type MuxControlAction uint8
 
 const (
 	MuxActionInvalid MuxControlAction = iota // 无效控制动作（零值失败关闭）
-	MuxActionCheck                           // 探测控制主进程存活并查询 PID
-	MuxActionForward                         // 请求主进程开启端口转发
-	MuxActionCancel                          // 请求主进程取消端口转发
-	MuxActionExit                            // 优雅退出（等待现有会话结束后停止）
-	MuxActionStop                            // 立即停止接收并终止主进程
-	MuxActionProxy                           // 启动 PROTOCOL.mux 代理透传模式
+	MuxActionCheck                           // 探测存活并查询 PID
+	MuxActionForward                         // 开启端口转发
+	MuxActionCancel                          // 取消端口转发
+	MuxActionExit                            // 优雅退出
+	MuxActionStop                            // 立即停止
+	MuxActionProxy                           // 代理透传模式
 )
 
 // MuxControlRequest 描述面向 MuxSocketPort.Control 的多路复用控制面请求；零值恒无效。
@@ -187,23 +201,18 @@ type MuxControlRequest struct {
 	valid      bool
 }
 
-// NewMuxControlRequest 校验控制动作、控制套接字路径与可选转发规格（forward/cancel 必填）并构造请求。
+// NewMuxControlRequest 校验控制动作、套接字路径与可选转发规格（forward/cancel 必填）并构造请求。
 func NewMuxControlRequest(action MuxControlAction, socketPath pathalg.LocalSourcePath, forward algebraic.Option[ForwardSpec]) (MuxControlRequest, error) {
 	if !action.IsValid() || !socketPath.IsValid() {
 		return MuxControlRequest{}, fmt.Errorf("%w: action 与 socketPath 均须有效", ErrInvalidArgument)
 	}
 	fwd, hasFwd := forward.Get()
 	needsFwd := action == MuxActionForward || action == MuxActionCancel
-	if needsFwd && (!hasFwd || !fwd.IsValid()) {
-		return MuxControlRequest{}, fmt.Errorf("%w: %s 控制动作必须提供有效 ForwardSpec", ErrInvalidArgument, action)
-	}
-	if !needsFwd && hasFwd {
-		return MuxControlRequest{}, fmt.Errorf("%w: %s 控制动作不得携带 ForwardSpec", ErrInvalidArgument, action)
+	if (needsFwd && (!hasFwd || !fwd.IsValid())) || (!needsFwd && hasFwd) {
+		return MuxControlRequest{}, fmt.Errorf("%w: %s 控制动作与 ForwardSpec 组合非法", ErrInvalidArgument, action)
 	}
 	return MuxControlRequest{action: action, socketPath: socketPath, forward: forward, valid: true}, nil
 }
-
-// MuxControlRequest 只读访问器。
 func (r MuxControlRequest) IsValid() bool {
 	return r.valid && r.action.IsValid() && r.socketPath.IsValid()
 }
@@ -219,10 +228,9 @@ func (r MuxControlRequest) Forward() algebraic.Option[ForwardSpec] { return r.fo
 //xops:opaque
 //xops:failclosed
 type MuxControlResponse struct {
-	alive     bool
-	masterPID uint32
-	detail    string
-	valid     bool
+	alive, valid bool
+	masterPID    uint32
+	detail       string
 }
 
 // NewMuxControlResponse 校验主进程状态与诊断说明并构造不可变 MuxControlResponse。
@@ -236,8 +244,6 @@ func NewMuxControlResponse(alive bool, masterPID uint32, detail string) (MuxCont
 	}
 	return MuxControlResponse{alive: alive, masterPID: masterPID, detail: clean, valid: true}, nil
 }
-
-// MuxControlResponse 只读访问器与等价比对。
 func (r MuxControlResponse) IsValid() bool     { return r.valid }
 func (r MuxControlResponse) IsZero() bool      { return !r.IsValid() }
 func (r MuxControlResponse) Alive() bool       { return r.IsValid() && r.alive }
@@ -248,17 +254,15 @@ func (r MuxControlResponse) Equal(o MuxControlResponse) bool {
 }
 
 // MuxSocketPort 定义本地 ControlMaster/ControlPersist AF_UNIX 套接字探测、控制与监听出站端口（INV-A3 / INV-C4）。
+// 全部四个方法统一接收经校验的 socketPath pathalg.LocalSourcePath（兼容 OpenSSH %r@%h:%p 含 ':' 路径）。
 type MuxSocketPort interface {
-	// Probe 对已存在控制套接字执行非侵入式存活探测（如对端 UID/令牌核验与 ping）。
 	Probe(ctx context.Context, socketPath pathalg.LocalSourcePath) (MuxControlResponse, error)
-	// Control 向运行中的 ControlMaster 发送 PROTOCOL.mux 控制指令并返回结果。
 	Control(ctx context.Context, req MuxControlRequest) (MuxControlResponse, error)
-	// DialMux 连接到已存在的 ControlMaster 并返回可复用的 TransportConn 视图。
 	DialMux(ctx context.Context, socketPath pathalg.LocalSourcePath) (TransportConn, error)
-	// WithListener 在沙箱目录 dir 下按 INV-A3 独占目录锁绑定本地 AF_UNIX 监听套接字，
-	// 并在同步作用域闭包 fn 退出时按「加目录锁 -> SameFile 校验 -> unlink -> close -> 解锁」固定顺序释放。
+	// WithListener 在 socketPath 对应独占目录锁下绑定 AF_UNIX 监听套接字（Accept 强制校验对端凭证），
+	// 同步闭包退出时按「加锁 -> SameFile 校验 -> unlink -> close -> 解锁」固定顺序释放。
 	//
 	//xops:syncclosure
 	//xops:borrowed
-	WithListener(ctx context.Context, dir pathalg.LocalDir, name pathalg.LocalRootedDest, fn func(ln net.Listener) error) error
+	WithListener(ctx context.Context, socketPath pathalg.LocalSourcePath, fn func(ln net.Listener) error) error
 }

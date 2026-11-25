@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
+	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -26,15 +28,6 @@ func mustParseLocalDir(t *testing.T, raw string) pathalg.LocalDir {
 	d, err := pathalg.ParseLocalDir(raw)
 	if err != nil {
 		t.Fatalf("ParseLocalDir(%q) failed: %v", raw, err)
-	}
-	return d
-}
-
-func mustParseLocalRootedDest(t *testing.T, raw string) pathalg.LocalRootedDest {
-	t.Helper()
-	d, err := pathalg.ParseLocalRootedDest(raw)
-	if err != nil {
-		t.Fatalf("ParseLocalRootedDest(%q) failed: %v", raw, err)
 	}
 	return d
 }
@@ -184,10 +177,20 @@ func TestSim_TCK_VaultAndTransport(t *testing.T) {
 	t.Run("SecretVault", func(t *testing.T) {
 		tck.RunSecretVaultSuite(t, tck.SecretVaultFixture{
 			NewVault: func(*testing.T) ports.SecretVault { return sim.NewSimVault(sim.NewSeededRand(101)) },
-			NewLockedVault: func(*testing.T) ports.SecretVault {
+			NewLockedVault: func(t *testing.T) ports.SecretVault {
 				v := sim.NewSimVault(sim.NewSeededRand(102))
-				v.Lock()
+				if err := v.Lock(context.Background()); err != nil {
+					t.Fatalf("Lock failed: %v", err)
+				}
 				return v
+			},
+		})
+	})
+
+	t.Run("VaultControl", func(t *testing.T) {
+		tck.RunVaultControlSuite(t, tck.VaultControlFixture{
+			NewUninitialized: func(*testing.T) ports.VaultControlPort {
+				return sim.NewUninitializedSimVault(sim.NewSeededRand(103))
 			},
 		})
 	})
@@ -206,19 +209,21 @@ func TestSim_TCK_VaultAndTransport(t *testing.T) {
 			NewDialer: func(*testing.T) ports.DialerPort {
 				return sim.NewSimDialer(sim.NewSimClock(tck.BaseTime()), sim.NewSeededRand(202))
 			},
-			TestCommand:   "echo tck-ok",
-			CheckMultiHop: true,
-			CheckRemoteFS: true,
+			TestCommand:           "echo tck-ok",
+			CheckMultiHop:         true,
+			CheckRemoteFS:         true,
+			CheckTunnelExtensions: true,
 		})
 	})
 
 	t.Run("MuxSocket", func(t *testing.T) {
-		existing := mustParseLocalSource(t, "/sim/mux/existing.sock")
+		existing := mustParseLocalSource(t, "/sim/mux/ops@10.0.0.1:22.sock")
+		listenPath := mustParseLocalSource(t, "/sim/mux/ops@10.0.0.2:2222.sock")
 		tck.RunMuxSocketSuite(t, tck.MuxSocketFixture{
-			NewMux: func(t *testing.T) (ports.MuxSocketPort, pathalg.LocalDir, pathalg.LocalRootedDest) {
+			NewMux: func(*testing.T) (ports.MuxSocketPort, pathalg.LocalSourcePath) {
 				mux := sim.NewSimMuxSocket(nil)
 				mux.RegisterMaster(existing, 9001)
-				return mux, mustParseLocalDir(t, "/sim/mux"), mustParseLocalRootedDest(t, "master.sock")
+				return mux, listenPath
 			},
 			ExistingSocket: algebraic.Some(existing),
 		})
@@ -274,20 +279,41 @@ func runAuditTCK(t *testing.T) {
 			mu.Lock()
 			c := cluster
 			mu.Unlock()
-			return stageAndSIGKILL(t, c, rng)
+			return stageAndSIGKILL(t, c, rng, false)
+		},
+		SimulatePostDrainCrash: func(t *testing.T) security.OperationID {
+			mu.Lock()
+			c := cluster
+			mu.Unlock()
+			return stageAndSIGKILL(t, c, rng, true)
 		},
 	})
 }
 
-func stageAndSIGKILL(t *testing.T, c *sim.SimAuditCluster, rng *sim.SeededRand) security.OperationID {
+func stageAndSIGKILL(t *testing.T, c *sim.SimAuditCluster, rng *sim.SeededRand, drainFirst bool) security.OperationID {
 	t.Helper()
 	deadSink, err := c.NewSinkFromEntropy(rng)
 	if err != nil {
 		t.Fatalf("deadSink NewSinkFromEntropy failed: %v", err)
 	}
 	traceID, _ := security.NewTraceIDFrom(rng)
-	opID, _ := security.NewOperationIDFrom(rng)
 	ctx := context.Background()
+	if drainFirst {
+		op1, _ := security.NewOperationIDFrom(rng)
+		if err := deadSink.StageOperation(ctx, op1); err != nil {
+			t.Fatalf("deadSink StageOperation(1) failed: %v", err)
+		}
+		if err := deadSink.Record(ctx, tck.MustAuditEntry(t, deadSink.ProcessInstanceID(), traceID, op1, ports.AuditPhaseAuthorized, ports.AuditOutcomePending)); err != nil {
+			t.Fatalf("deadSink Record(1 Auth) failed: %v", err)
+		}
+		if err := deadSink.Record(ctx, tck.MustAuditEntry(t, deadSink.ProcessInstanceID(), traceID, op1, ports.AuditPhaseFinalized, ports.AuditOutcomeSucceeded)); err != nil {
+			t.Fatalf("deadSink Record(1 Fin) failed: %v", err)
+		}
+		if err := deadSink.UnstageOperation(ctx, op1); err != nil {
+			t.Fatalf("deadSink UnstageOperation(1) failed: %v", err)
+		}
+	}
+	opID, _ := security.NewOperationIDFrom(rng)
 	if err := deadSink.StageOperation(ctx, opID); err != nil {
 		t.Fatalf("deadSink StageOperation failed: %v", err)
 	}
@@ -335,9 +361,25 @@ func TestSim_TCK_SystemPorts(t *testing.T) {
 	})
 
 	t.Run("TerminalInteractive", func(t *testing.T) {
+		sz2, err := ports.NewTerminalSize(120, 40)
+		if err != nil {
+			t.Fatalf("NewTerminalSize failed: %v", err)
+		}
 		tck.RunTerminalSuite(t, tck.TerminalFixture{
-			NewTerminal:       func(*testing.T) ports.TerminalPort { return sim.NewSimTerminalPort(true, 100, 32) },
-			ExpectInteractive: true,
+			NewTerminal: func(*testing.T) ports.TerminalPort {
+				tp := sim.NewSimTerminalPort(true, 100, 32)
+				tp.SetInput([]byte("local-input-ok"))
+				tp.QueueResize(sz2)
+				return tp
+			},
+			NewBlockingInputTerminal: func(*testing.T) ports.TerminalPort {
+				tp := sim.NewSimTerminalPort(true, 100, 32)
+				tp.SetBlockInputAfterData(true)
+				return tp
+			},
+			ExpectInteractive:  true,
+			ExpectedRelayInput: "local-input-ok",
+			ExpectResizeCount:  1,
 		})
 	})
 
@@ -358,6 +400,104 @@ func TestSim_TCK_SystemPorts(t *testing.T) {
 			ExpectedSecret: tck.TestSecretTokenA,
 			ExpectedText:   "sim-text",
 		})
+	})
+
+	t.Run("DownstreamPorts", runDownstreamPortsTCK)
+}
+
+func runDownstreamPortsTCK(t *testing.T) {
+	idInfo, err := ports.NewLocalIdentityInfo(ports.LocalIdentityInfoSpec{
+		LocalHost: "devbox.local", LocalUser: "ops", LocalUID: "1000", HomeDir: "/home/ops",
+	})
+	if err != nil {
+		t.Fatalf("NewLocalIdentityInfo: %v", err)
+	}
+	tck.RunEnvSuite(t, tck.EnvFixture{
+		NewEnv: func(*testing.T) ports.EnvPort {
+			return sim.NewSimEnvPort(map[string]string{"TERM": "xterm-256color"}, idInfo)
+		},
+		KnownKey: "TERM", ExpectedValue: "xterm-256color", MissingKey: "MISSING_VAR", ExpectIdentity: true,
+	})
+
+	host, err := netaddr.ParseCanonicalHost("sshfp.example.test")
+	if err != nil {
+		t.Fatalf("ParseCanonicalHost: %v", err)
+	}
+	rec, err := ports.NewSSHFPRecord(ports.SSHFPRecordSpec{
+		Algorithm: 4, FingerprintType: 2, Digest: bytes.Repeat([]byte{0xab}, 32), Authenticated: true,
+	})
+	if err != nil {
+		t.Fatalf("NewSSHFPRecord: %v", err)
+	}
+	tck.RunSSHFPLookupSuite(t, tck.SSHFPLookupFixture{
+		NewLookup: func(*testing.T) ports.SSHFPLookupPort {
+			lp := sim.NewSimSSHFPLookup()
+			lp.SetRecords(host, rec)
+			return lp
+		},
+		KnownHost: host, MinCount: 1,
+	})
+
+	tck.RunSSHAgentSuite(t, tck.SSHAgentFixture{
+		NewAgent: func(t *testing.T) ports.SSHAgentPort {
+			return sim.NewSimSSHAgent(tck.MustPublicKey(t, tck.TestFingerprintA, 7))
+		},
+		NewUnavailableAgent: func(*testing.T) ports.SSHAgentPort {
+			ag := sim.NewSimSSHAgent()
+			ag.SetAvailable(false)
+			return ag
+		},
+		Spec: algebraic.None[inventory.AgentSpec](),
+	})
+
+	openSimConn := func(t *testing.T) ports.TransportConn {
+		t.Helper()
+		dialer := sim.NewSimDialer(sim.NewSimClock(tck.BaseTime()), sim.NewSeededRand(606))
+		single, _ := tck.MustHopAndPlan(t)
+		hop0, _ := single.HopAt(0)
+		dig0, _ := single.HopDigestAt(0)
+		c, dErr := dialer.DialHop(context.Background(), hop0, dig0, nil)
+		if dErr != nil {
+			t.Fatalf("DialHop: %v", dErr)
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+
+	tck.RunPrivilegeEscalationSuite(t, tck.PrivilegeEscalationFixture{
+		NewEscalator: func(t *testing.T) (ports.PrivilegeEscalationPort, ports.SessionOpener) {
+			esc := sim.NewSimPrivilegeEscalator()
+			esc.SetRequiredPassword([]byte(tck.TestSecretTokenA))
+			return esc, openSimConn(t)
+		},
+		CorrectPassword: tck.TestSecretTokenA, WrongPassword: tck.TestSecretTokenB, RequirePassword: true,
+	})
+
+	probeRes, err := ports.NewShellProbeResult(ports.ShellProbeResultSpec{
+		Dialect: execution.DialectPOSIX, Interpreter: execution.InterpreterBash, OSFamily: "linux", ProbeStage: 2, RawBanner: "GNU bash",
+	})
+	if err != nil {
+		t.Fatalf("NewShellProbeResult: %v", err)
+	}
+	tck.RunShellProbeSuite(t, tck.ShellProbeFixture{
+		NewProbe: func(t *testing.T) (ports.ShellProbePort, ports.SessionOpener) {
+			return sim.NewSimShellProbe(probeRes), openSimConn(t)
+		},
+	})
+
+	fLocal, _ := ports.NewForwardSpec(ports.ForwardLocal, "127.0.0.1:8080", "10.0.0.5:80")
+	fRemote, _ := ports.NewForwardSpec(ports.ForwardRemote, "0.0.0.0:9090", "127.0.0.1:3000")
+	fDyn, _ := ports.NewForwardSpec(ports.ForwardDynamic, "127.0.0.1:1080", "")
+	fSL, _ := ports.NewForwardSpec(ports.ForwardStreamLocal, "/tmp/local.sock", "/run/remote.sock")
+	tunP2P, _ := ports.NewTUNSpec(ports.TUNModePointToPoint, 0, ports.TUNUnitAny)
+	fTUNP2P, _ := ports.NewForwardTUNSpec(tunP2P)
+	tunEth, _ := ports.NewTUNSpec(ports.TUNModeEthernet, 2, 3)
+	fTUNEth, _ := ports.NewForwardTUNSpec(tunEth)
+	tck.RunForwarderSuite(t, tck.ForwarderFixture{
+		NewForwarder: func(t *testing.T) (ports.ForwarderPort, ports.TunnelTransport) {
+			return sim.NewSimForwarder(), openSimConn(t)
+		},
+		Specs: []ports.ForwardSpec{fLocal, fRemote, fDyn, fSL, fTUNP2P, fTUNEth},
 	})
 }
 

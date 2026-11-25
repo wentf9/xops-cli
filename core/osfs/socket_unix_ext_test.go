@@ -76,6 +76,29 @@ func TestUnixSocketSlotAllowsOpenSSHColonFilename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unix 含冒号 ControlPath 绑定与验证失败: %v", err)
 	}
+	verifyUnixAutoCreateSocketDir(t, ctx, dir)
+}
+
+func verifyUnixAutoCreateSocketDir(t *testing.T, ctx context.Context, dir string) {
+	t.Helper()
+	// 验证 Unix WithSocketSlot 与 Windows 一致：父目录缺失时按 0700 自动创建目录并绑定套接字。
+	autoDir := filepath.Join(dir, "auto", "sub")
+	autoSock, err := osfs.ValidateControlSocketPath(filepath.Join(autoDir, "cm-auto:22"))
+	if err != nil {
+		t.Fatalf("ValidateControlSocketPath(autoDir) 失败: %v", err)
+	}
+	if err := osfs.WithSocketSlot(ctx, autoSock, osfs.SocketSlotOptions{}, func(slot *osfs.SocketSlot) error {
+		fi, sErr := os.Lstat(autoDir)
+		if sErr != nil || !fi.IsDir() || fi.Mode().Perm() != 0o700 {
+			t.Fatalf("自动创建目录权限异常: fi=%v err=%v", fi, sErr)
+		}
+		if !slot.IsActive() {
+			return errors.New("自动建目录后槽位未激活")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("Unix WithSocketSlot 自动建目录失败: %v", err)
+	}
 }
 
 // TestUnixDanglingSymlinkNeverCreatesTarget 验证 Unix openat+O_NOFOLLOW 下，

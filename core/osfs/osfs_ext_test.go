@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -106,12 +107,15 @@ func TestDualModalityIsolationAndZeroValues(t *testing.T) {
 	}
 
 	var zeroScoped osfs.ScopedFS
+	if err := zeroScoped.EnsureRoot(mustLocalDir(t, t.TempDir()), 0o700); !errors.Is(err, ports.ErrInvalidArgument) {
+		t.Fatalf("零值 ScopedFS.EnsureRoot = %v, 期望 ErrInvalidArgument", err)
+	}
 	if err := zeroScoped.WithRoot(mustLocalDir(t, t.TempDir()), func(ports.RootHandle) error { return nil }); !errors.Is(err, ports.ErrInvalidArgument) {
 		t.Fatalf("零值 ScopedFS.WithRoot = %v, 期望 ErrInvalidArgument", err)
 	}
 	var zeroOp osfs.OperatorFS
 	src := mustLocalSource(t, filepath.Join(t.TempDir(), "a.txt"))
-	if err := zeroOp.WithOperatorRead(context.Background(), src, pathalg.SymlinkReject, func(io.Reader, int64) error { return nil }); !errors.Is(err, ports.ErrInvalidArgument) {
+	if err := zeroOp.WithOperatorRead(context.Background(), src, pathalg.SymlinkReject, func(ports.BoundedReadHandle, int64) error { return nil }); !errors.Is(err, ports.ErrInvalidArgument) {
 		t.Fatalf("零值 OperatorFS.WithOperatorRead = %v, 期望 ErrInvalidArgument", err)
 	}
 	var zeroSock osfs.ControlSocketPath
@@ -130,7 +134,7 @@ func TestDualModalityIsolationAndZeroValues(t *testing.T) {
 
 func readRegularContent(root ports.RootHandle, dest pathalg.LocalRootedDest, lim ports.ReadLimits) ([]byte, error) {
 	var got []byte
-	err := osfs.OpenRegular(root, dest, lim, func(r io.Reader, size int64) error {
+	err := osfs.OpenRegular(root, dest, lim, func(r ports.BoundedReadHandle, size int64) error {
 		var rErr error
 		got, rErr = io.ReadAll(r)
 		if rErr == nil && int64(len(got)) != size {
@@ -441,4 +445,119 @@ func verifyScopedRootFullOps(ctx context.Context, root ports.RootHandle, subDir,
 		_, wErr := w.Write([]byte("replaced"))
 		return wErr
 	})
+}
+
+// delegatingRootHandle 是不持有任何借用句柄的独立 ports.RootHandle 实现，
+// 用于验证 osfs.AtomicReplaceWithSidecarLock 零 concrete *rootHandle 类型断言且严格按「旁路锁 -> 原子替换」顺序执行。
+type delegatingRootHandle struct {
+	ports.RootHandle // 仅用于补齐未调用接口方法
+	fs               *osfs.ScopedFS
+	dir              pathalg.LocalDir
+	lockedDest       string
+	replacedDest     string
+}
+
+func (d *delegatingRootHandle) WithLockedFile(ctx context.Context, dest pathalg.LocalRootedDest, mode ports.LockMode, create bool, perm fs.FileMode, fn func(f ports.LockedFile) error) error {
+	d.lockedDest = dest.String()
+	return d.fs.WithRoot(d.dir, func(r ports.RootHandle) error {
+		return r.WithLockedFile(ctx, dest, mode, create, perm, func(lf ports.LockedFile) error { return fn(lf) })
+	})
+}
+
+func (d *delegatingRootHandle) AtomicReplace(dest pathalg.LocalRootedDest, perm fs.FileMode, fn func(w io.Writer) error) error {
+	d.replacedDest = dest.String()
+	return d.fs.WithRoot(d.dir, func(r ports.RootHandle) error {
+		return r.AtomicReplace(dest, perm, func(w io.Writer) error { return fn(w) })
+	})
+}
+
+func TestEnsureDirWriteChunkRenameReadAtAndWrapperSidecar(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	base := t.TempDir()
+	fsPort := osfs.NewScopedRootFS()
+	nested := verifyEnsureDirBootstrap(t, base, fsPort)
+	finalDest := verifyWriteChunkRenameReadAt(t, fsPort, nested)
+
+	// 使用非 *rootHandle 适配器在作用域外验证 AtomicReplaceWithSidecarLock 零 concrete 类型断言。
+	wrapped := &delegatingRootHandle{fs: fsPort, dir: nested}
+	if err := osfs.AtomicReplaceWithSidecarLock(context.Background(), wrapped, finalDest, 0o600, func(w io.Writer) error {
+		_, wErr := w.Write([]byte("wrapped-ok"))
+		return wErr
+	}); err != nil {
+		t.Fatalf("AtomicReplaceWithSidecarLock(wrapper) 失败: %v", err)
+	}
+	if wrapped.lockedDest != "final/blob.bin.lock" || wrapped.replacedDest != "final/blob.bin" {
+		t.Fatalf("旁路锁或替换目标异常: locked=%q replaced=%q", wrapped.lockedDest, wrapped.replacedDest)
+	}
+}
+
+func verifyEnsureDirBootstrap(t *testing.T, base string, fsPort *osfs.ScopedFS) pathalg.LocalDir {
+	t.Helper()
+	nested := mustLocalDir(t, filepath.Join(base, "boot", "xops", "run"))
+	if err := fsPort.EnsureRoot(nested, 0o700); err != nil {
+		t.Fatalf("EnsureRoot 首次创建失败: %v", err)
+	}
+	if err := osfs.EnsureOwnerOnlyDir(nested); err != nil {
+		t.Fatalf("EnsureOwnerOnlyDir 幂等校验失败: %v", err)
+	}
+	regFile := filepath.Join(base, "not-a-dir")
+	if err := os.WriteFile(regFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := osfs.EnsureDir(mustLocalDir(t, regFile), 0o700); !errors.Is(err, ports.ErrNotRegularFile) {
+		t.Fatalf("EnsureDir(常规文件) = %v, 期望 ErrNotRegularFile", err)
+	}
+	if probeSymlinkErr(t) == nil {
+		symDir := filepath.Join(base, "sym-dir")
+		if err := os.Symlink(filepath.Join(base, "boot"), symDir); err != nil {
+			t.Fatal(err)
+		}
+		if err := osfs.EnsureOwnerOnlyDir(mustLocalDir(t, symDir)); !errors.Is(err, ports.ErrSymlinkRejected) {
+			t.Fatalf("EnsureOwnerOnlyDir(符号链接) = %v, 期望 ErrSymlinkRejected", err)
+		}
+	}
+	return nested
+}
+
+func verifyWriteChunkRenameReadAt(t *testing.T, fsPort *osfs.ScopedFS, nested pathalg.LocalDir) pathalg.LocalRootedDest {
+	t.Helper()
+	lim, _ := ports.NewReadLimits(4096)
+	stageDest, finalDest := mustLocalDest(t, "stage/blob.part"), mustLocalDest(t, "final/blob.bin")
+	err := fsPort.WithRoot(nested, func(root ports.RootHandle) error {
+		if err := errors.Join(root.MkdirAll(mustLocalDest(t, "stage"), 0o700), root.MkdirAll(mustLocalDest(t, "final"), 0o700)); err != nil {
+			return err
+		}
+		writeAndVerifyChunks(t, root, stageDest)
+		if err := root.Rename(stageDest, finalDest); err != nil {
+			return err
+		}
+		if _, sErr := root.Stat(stageDest); !errors.Is(sErr, ports.ErrNotFound) {
+			t.Fatalf("Rename 后旧路径仍存在: %v", sErr)
+		}
+		return root.WithReadRegular(finalDest, lim, func(r ports.BoundedReadHandle, size int64) error {
+			var slice [5]byte
+			n, raErr := r.ReadAt(slice[:], 5)
+			if size != 12 || raErr != nil || n != 5 || string(slice[:]) != "WORLD" {
+				t.Fatalf("ReadAt(5..10) = (size=%d, n=%d, %q, %v)", size, n, string(slice[:]), raErr)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("WriteChunk/Rename/ReadAt 校验失败: %v", err)
+	}
+	return finalDest
+}
+
+func writeAndVerifyChunks(t *testing.T, root ports.RootHandle, stageDest pathalg.LocalRootedDest) {
+	t.Helper()
+	if n, wErr := root.WriteChunk(stageDest, 5, bytes.NewReader([]byte("WORLD")), 5, 0o600); wErr != nil || n != 5 {
+		t.Fatalf("WriteChunk(offset=5) = (%d, %v)", n, wErr)
+	}
+	if n, wErr := root.WriteChunk(stageDest, 0, bytes.NewReader([]byte("HELLO")), 5, 0o600); wErr != nil || n != 5 {
+		t.Fatalf("WriteChunk(offset=0) = (%d, %v)", n, wErr)
+	}
+	if _, wErr := root.WriteChunk(stageDest, 10, bytes.NewReader([]byte("ab")), 4, 0o600); !errors.Is(wErr, io.ErrUnexpectedEOF) {
+		t.Fatalf("WriteChunk(短流) = %v, 期望 io.ErrUnexpectedEOF", wErr)
+	}
 }

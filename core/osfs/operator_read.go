@@ -2,13 +2,31 @@ package osfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
+
+// EnsureDir 跨平台安全确保本地根目录 dir 存在且末段非符号链接：
+// Unix 逐段使用 Mkdirat + O_DIRECTORY|O_NOFOLLOW 建目录（默认 0700）；Windows 当 perm&0o077==0 时附带 Owner-Only DACL。
+func EnsureDir(dir pathalg.LocalDir, perm fs.FileMode) error {
+	if !dir.IsValid() || perm == 0 || perm != perm.Perm() {
+		return fmt.Errorf("%w: 无效本地目录或权限 %#o", ports.ErrInvalidArgument, perm)
+	}
+	nativeDir, err := localPathToNativeOS(dir.Kind(), dir.String())
+	if err != nil {
+		return err
+	}
+	return ensureDirOS(nativeDir, perm)
+}
+
+// EnsureOwnerOnlyDir 跨平台确保目录 dir 存在且仅所有者可访问（Unix 0700 + 非软链；Windows Owner-Only DACL）。
+func EnsureOwnerOnlyDir(dir pathalg.LocalDir) error { return EnsureDir(dir, defaultDirPerm) }
 
 // OperatorFS 是面向 CLI/Playbook DirectOperatorProfile 的人工显式本地只读源适配器，
 // 仅实现 ports.OperatorReadFS（物理上绝不注入 mcpruntime，零值失败关闭）。
@@ -20,25 +38,16 @@ type OperatorFS struct{ valid bool }
 // NewOperatorReadFS 构造可用的操作员只读源文件适配器实例（ports.OperatorReadFS 生产实现）。
 func NewOperatorReadFS() *OperatorFS { return &OperatorFS{valid: true} }
 
-// WithOperatorRead 按 policy 管控符号链接行为打开只读常规文件，并在同步闭包内借出读取器与字节长度；
-// 回调退出后立即使借出读取器失效并关闭底层文件句柄。
+// WithOperatorRead 按 policy 管控符号链接行为打开只读常规文件，并在同步闭包内借出随机只读句柄与字节长度；
+// 回调退出后立即使借出句柄失效并关闭底层文件句柄。
 //
 //xops:syncclosure
 //xops:borrowed
-func (o *OperatorFS) WithOperatorRead(ctx context.Context, path pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, fn func(r io.Reader, size int64) error) error {
-	if ctx == nil {
-		return ports.ErrNilContext
-	}
-	if fn == nil {
-		return ports.ErrNilCallback
-	}
-	if o == nil || !o.valid || !path.IsValid() || !policy.IsValid() {
-		return fmt.Errorf("%w: OperatorFS 未初始化或本地只读源路径/软链策略无效", ports.ErrInvalidArgument)
-	}
-	if err := ctx.Err(); err != nil {
+func (o *OperatorFS) WithOperatorRead(ctx context.Context, path pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, fn func(r ports.BoundedReadHandle, size int64) error) error {
+	if err := checkOperatorReadArgs(ctx, o, path, policy, fn == nil); err != nil {
 		return err
 	}
-	nativePath, err := localSourceToNativePath(path)
+	nativePath, err := localPathToNativeOS(path.Kind(), path.String())
 	if err != nil {
 		return err
 	}
@@ -46,8 +55,110 @@ func (o *OperatorFS) WithOperatorRead(ctx context.Context, path pathalg.LocalSou
 	if err != nil {
 		return err
 	}
-	var readerActive atomic.Bool
-	readerActive.Store(true)
-	defer func() { readerActive.Store(false); _ = f.Close() }()
-	return fn(&borrowedReader{r: f, active: &readerActive}, size)
+	var active atomic.Bool
+	active.Store(true)
+	defer func() { active.Store(false); _ = f.Close() }()
+	return fn(&borrowedReader{r: f, active: &active}, size)
+}
+
+func checkOperatorReadArgs(ctx context.Context, o *OperatorFS, path pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, fnNil bool) error {
+	switch {
+	case ctx == nil:
+		return ports.ErrNilContext
+	case fnNil:
+		return ports.ErrNilCallback
+	case o == nil || !o.valid || !path.IsValid() || !policy.IsValid():
+		return fmt.Errorf("%w: OperatorFS 未初始化或本地只读源路径/软链策略无效", ports.ErrInvalidArgument)
+	default:
+		return ctx.Err()
+	}
+}
+
+type boundedReaderAt interface {
+	io.Reader
+	io.ReaderAt
+}
+
+// borrowedReader / borrowedWriter 在作用域关闭后拒绝一切读写，并对读取施加溢出安全字节上限。
+type borrowedReader struct {
+	r                   boundedReaderAt
+	remaining, maxBytes int64
+	limited             bool
+	active              *atomic.Bool
+}
+
+func (b *borrowedReader) isActive() bool {
+	return b != nil && b.active != nil && b.active.Load() && b.r != nil
+}
+func (b *borrowedReader) Read(p []byte) (int, error) {
+	if !b.isActive() {
+		return 0, ports.ErrHandleExpired
+	}
+	if !b.limited {
+		return b.r.Read(p)
+	}
+	if b.remaining <= 0 {
+		var probe [1]byte
+		if n, err := b.r.Read(probe[:]); n > 0 {
+			return 0, ports.ErrLimitExceeded
+		} else if err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+// ReadAt 在不修改顺序读游标的前提下执行并发安全随机偏移读，并强制执行句柄失效哨兵与 ReadLimits 上限。
+func (b *borrowedReader) ReadAt(p []byte, off int64) (int, error) {
+	if !b.isActive() {
+		return 0, ports.ErrHandleExpired
+	}
+	if off < 0 {
+		return 0, fmt.Errorf("%w: ReadAt 偏移不能为负", ports.ErrInvalidArgument)
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if !b.limited {
+		return b.r.ReadAt(p, off)
+	}
+	if off >= b.maxBytes {
+		return 0, b.probeLimitAt(off)
+	}
+	if avail := b.maxBytes - off; int64(len(p)) > avail {
+		n, err := b.r.ReadAt(p[:avail], off)
+		if err != nil || int64(n) < avail {
+			return n, err
+		}
+		return n, b.probeLimitAt(b.maxBytes)
+	}
+	return b.r.ReadAt(p, off)
+}
+
+func (b *borrowedReader) probeLimitAt(off int64) error {
+	var probe [1]byte
+	if n, err := b.r.ReadAt(probe[:], off); n > 0 {
+		return ports.ErrLimitExceeded
+	} else if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return io.EOF
+}
+
+type borrowedWriter struct {
+	w      io.Writer
+	active *atomic.Bool
+}
+
+func (b *borrowedWriter) Write(p []byte) (int, error) {
+	if b == nil || b.active == nil || !b.active.Load() {
+		return 0, ports.ErrHandleExpired
+	}
+	return b.w.Write(p)
 }

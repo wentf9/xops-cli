@@ -673,15 +673,37 @@ func assertAuditCrossFieldRejections(t *testing.T, f testFixture) {
 	t.Helper()
 	needAppr, err := security.NewDecisionNeedApproval(security.RiskDangerous, "need confirm")
 	mustNoErr(t, err)
+	// 验证与 core/ports.AuditEntry 一致的审批流合法组合：NeedApproval 允许出现在 Authorized/Finalized/AbortedByCrash/Denied。
+	for _, st := range []AuditStage{AuditStageAuthorized, AuditStageFinalized, AuditStageAbortedByCrash, AuditStageDenied} {
+		sp := AuditRecordSpec{
+			Meta: f.opMeta, Stage: st, ProcessInstanceID: "p1",
+			Capability: security.CapabilityExecute, Decision: needAppr,
+			Risk: security.RiskDangerous, Duration: algebraic.ZeroDuration(),
+		}
+		if st != AuditStageDenied {
+			sp.Binding = algebraic.Some(f.binding)
+		}
+		ev, cErr := NewAuditRecordEvent(sp)
+		mustNoErr(t, cErr)
+		raw, mErr := MarshalEvent(ev)
+		mustNoErr(t, mErr)
+		back, uErr := UnmarshalEvent(raw)
+		mustNoErr(t, uErr)
+		if !EqualEvent(ev, back) {
+			t.Fatalf("approval audit stage %s JSON roundtrip mismatch", st)
+		}
+	}
 	badSpecs := []AuditRecordSpec{
 		// Binding.Capability (Execute) != Spec.Capability (Transfer)
 		{Meta: f.opMeta, Stage: AuditStageAuthorized, ProcessInstanceID: "p1", Capability: security.CapabilityTransfer, Decision: security.NewDecisionAllow("ok"), Risk: security.RiskModerate, Binding: algebraic.Some(f.binding), Duration: algebraic.ZeroDuration()},
 		// Stage <-> Decision 矛盾组合
 		{Meta: f.opMeta, Stage: AuditStageAuthorized, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: security.NewDecisionDeny("no"), Risk: security.RiskModerate, Binding: algebraic.Some(f.binding), Duration: algebraic.ZeroDuration()},
-		{Meta: f.opMeta, Stage: AuditStageFinalized, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: needAppr, Risk: security.RiskDangerous, Binding: algebraic.Some(f.binding), Duration: algebraic.ZeroDuration()},
+		{Meta: f.opMeta, Stage: AuditStageFinalized, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: security.NewDecisionDeny("no"), Risk: security.RiskDangerous, Binding: algebraic.Some(f.binding), Duration: algebraic.ZeroDuration()},
+		{Meta: f.opMeta, Stage: AuditStageAbortedByCrash, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: security.NewDecisionDeny("no"), Risk: security.RiskDangerous, Binding: algebraic.Some(f.binding), Duration: algebraic.ZeroDuration()},
 		{Meta: f.opMeta, Stage: AuditStageDenied, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: security.NewDecisionAllow("ok"), Risk: security.RiskSafe, Duration: algebraic.ZeroDuration()},
 		{Meta: f.opMeta, Stage: AuditStageNeedApproval, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: security.NewDecisionAllow("ok"), Risk: security.RiskSafe, Duration: algebraic.ZeroDuration()},
 		{Meta: f.opMeta, Stage: AuditStageHalted, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: security.NewDecisionAllow("ok"), Risk: security.RiskDangerous, Duration: algebraic.ZeroDuration()},
+		{Meta: f.opMeta, Stage: AuditStageHalted, ProcessInstanceID: "p1", Capability: security.CapabilityExecute, Decision: needAppr, Risk: security.RiskDangerous, Duration: algebraic.ZeroDuration()},
 	}
 	for i, sp := range badSpecs {
 		if _, err := NewAuditRecordEvent(sp); !errors.Is(err, ErrInvalidEvent) {

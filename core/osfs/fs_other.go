@@ -15,23 +15,17 @@ import (
 
 type socketFileID struct{}
 
-func sameSocketFileID(_, _ socketFileID) bool               { return false }
-func localDirToNativePath(pathalg.LocalDir) (string, error) { return "", ports.ErrUnsupported }
-func localSourceToNativePath(pathalg.LocalSourcePath) (string, error) {
+func errUnsupportedPeer() (PeerCred, error) {
+	return PeerCred{}, fmt.Errorf("%w: %w", ErrUnauthorizedPeer, ErrUnsupportedPeerCred)
+}
+func sameSocketFileID(_, _ socketFileID) bool { return false }
+func localPathToNativeOS(pathalg.LocalPathKind, string) (string, error) {
 	return "", ports.ErrUnsupported
 }
-func openRegularFDInRootOS(*os.Root, pathalg.LocalRootedDest) (*os.File, error) {
+func openLeafInRootOS(*os.Root, pathalg.LocalRootedDest, rootLeafOp, fs.FileMode) (*os.File, error) {
 	return nil, ports.ErrUnsupported
 }
-func createExclusiveInRootOS(*os.Root, pathalg.LocalRootedDest, fs.FileMode) (*os.File, error) {
-	return nil, ports.ErrUnsupported
-}
-func openForLockInRootOS(*os.Root, pathalg.LocalRootedDest, ports.LockMode, bool, fs.FileMode) (*os.File, error) {
-	return nil, ports.ErrUnsupported
-}
-func openForAppendInRootOS(*os.Root, pathalg.LocalRootedDest, fs.FileMode) (*os.File, error) {
-	return nil, ports.ErrUnsupported
-}
+func ensureDirOS(string, fs.FileMode) error { return ports.ErrUnsupported }
 func openOperatorReadOS(string, pathalg.SymlinkPolicy) (*os.File, int64, error) {
 	return nil, 0, ports.ErrUnsupported
 }
@@ -56,9 +50,5 @@ func withSocketDirLockOS(context.Context, string, bool, func() error) error {
 func listenSocketLockedOS(context.Context, ControlSocketPath) (*net.UnixListener, socketFileID, error) {
 	return nil, socketFileID{}, ports.ErrUnsupported
 }
-func queryPeerCredFD(uintptr) (PeerCred, error) {
-	return PeerCred{}, fmt.Errorf("%w: %w", ErrUnauthorizedPeer, ErrUnsupportedPeerCred)
-}
-func verifyPeerCurrentUserFD(uintptr) (PeerCred, error) {
-	return PeerCred{}, fmt.Errorf("%w: %w", ErrUnauthorizedPeer, ErrUnsupportedPeerCred)
-}
+func queryPeerCredFD(uintptr) (PeerCred, error)         { return errUnsupportedPeer() }
+func verifyPeerCurrentUserFD(uintptr) (PeerCred, error) { return errUnsupportedPeer() }

@@ -20,22 +20,14 @@ import (
 const winAppendAccess uint32 = (windows.FILE_GENERIC_WRITE &^ windows.FILE_WRITE_DATA) |
 	windows.STANDARD_RIGHTS_READ | windows.FILE_READ_ATTRIBUTES | windows.FILE_READ_EA
 
-func winNativePath(kind pathalg.LocalPathKind, raw string) (string, error) {
+func localPathToNativeOS(kind pathalg.LocalPathKind, raw string) (string, error) {
 	if kind == pathalg.LocalPathPOSIXAbs {
 		return "", fmt.Errorf("%w: Windows 不支持裸 POSIX 绝对路径 %q", ports.ErrInvalidArgument, raw)
 	}
 	return NormalizeWin32LongPath(filepath.FromSlash(raw)), nil
 }
 
-func localDirToNativePath(dir pathalg.LocalDir) (string, error) {
-	return winNativePath(dir.Kind(), dir.String())
-}
-func localSourceToNativePath(src pathalg.LocalSourcePath) (string, error) {
-	return winNativePath(src.Kind(), src.String())
-}
-
-// ntCreateAtHandle 相对已打开目录句柄 dirHandle 原子打开/创建单个分量，主路径启用 OBJ_DONT_REPARSE
-// 阻断一切重解析点穿越；对不支持 OBJ_DONT_REPARSE 的旧版内核以单分量 FILE_OPEN_REPARSE_POINT 回退校验。
+// ntCreateAtHandle 相对已打开目录句柄原子打开/创建单个分量，主路径启用 OBJ_DONT_REPARSE，旧内核以 FILE_OPEN_REPARSE_POINT 回退。
 func ntCreateAtHandle(dirHandle windows.Handle, leaf string, access, disposition, options, fileAttrs uint32, sd *windows.SECURITY_DESCRIPTOR) (windows.Handle, error) {
 	if dirHandle == 0 || dirHandle == windows.InvalidHandle || leaf == "" || leaf == ".." || strings.ContainsAny(leaf, `\/:`) {
 		return windows.InvalidHandle, fmt.Errorf("%w: 非法相对目录分量 %q", ports.ErrInvalidArgument, leaf)
@@ -44,14 +36,8 @@ func ntCreateAtHandle(dirHandle windows.Handle, leaf string, access, disposition
 	if err != nil {
 		return windows.InvalidHandle, mapOSError(err)
 	}
-	sqos := windows.SECURITY_QUALITY_OF_SERVICE{
-		Length: uint32(unsafe.Sizeof(windows.SECURITY_QUALITY_OF_SERVICE{})), ImpersonationLevel: windows.SecurityAnonymous,
-		ContextTrackingMode: windows.SECURITY_STATIC_TRACKING,
-	}
-	oa := windows.OBJECT_ATTRIBUTES{
-		Length: uint32(unsafe.Sizeof(windows.OBJECT_ATTRIBUTES{})), RootDirectory: dirHandle, ObjectName: ntName,
-		Attributes: windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE, SecurityDescriptor: sd, SecurityQoS: &sqos,
-	}
+	sqos := windows.SECURITY_QUALITY_OF_SERVICE{Length: uint32(unsafe.Sizeof(windows.SECURITY_QUALITY_OF_SERVICE{})), ImpersonationLevel: windows.SecurityAnonymous, ContextTrackingMode: windows.SECURITY_STATIC_TRACKING}
+	oa := windows.OBJECT_ATTRIBUTES{Length: uint32(unsafe.Sizeof(windows.OBJECT_ATTRIBUTES{})), RootDirectory: dirHandle, ObjectName: ntName, Attributes: windows.OBJ_CASE_INSENSITIVE | windows.OBJ_DONT_REPARSE, SecurityDescriptor: sd, SecurityQoS: &sqos}
 	fullOpts := options | windows.FILE_SYNCHRONOUS_IO_NONALERT | windows.FILE_OPEN_FOR_BACKUP_INTENT
 	var h windows.Handle
 	var iosb windows.IO_STATUS_BLOCK
@@ -70,8 +56,6 @@ func ntCreateAtHandle(dirHandle windows.Handle, leaf string, access, disposition
 	return h, nil
 }
 
-// withParentDirHandleWin 从 *os.Root 锚定根目录句柄逐段无重解析步进至父目录句柄并执行同步回调。
-//
 //xops:syncclosure
 func withParentDirHandleWin(root *os.Root, parentSegs []string, fn func(parentH windows.Handle) error) error {
 	rootF, err := root.Open(".")
@@ -86,8 +70,7 @@ func withParentDirHandleWin(root *os.Root, parentSegs []string, fn func(parentH 
 		}
 	}()
 	for _, seg := range parentSegs {
-		nextH, openErr := ntCreateAtHandle(curH, seg, windows.FILE_LIST_DIRECTORY|windows.SYNCHRONIZE|windows.FILE_READ_ATTRIBUTES,
-			windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE, windows.FILE_ATTRIBUTE_NORMAL, nil)
+		nextH, openErr := ntCreateAtHandle(curH, seg, windows.FILE_LIST_DIRECTORY|windows.SYNCHRONIZE|windows.FILE_READ_ATTRIBUTES, windows.FILE_OPEN, windows.FILE_DIRECTORY_FILE, windows.FILE_ATTRIBUTE_NORMAL, nil)
 		if openErr != nil {
 			return openErr
 		}
@@ -114,8 +97,7 @@ func ntCreateInRootWin(root *os.Root, parentSegs []string, leaf string, access, 
 		}
 	}
 	h := windows.InvalidHandle
-	err := withParentDirHandleWin(root, parentSegs, func(parentH windows.Handle) error {
-		var cErr error
+	err := withParentDirHandleWin(root, parentSegs, func(parentH windows.Handle) (cErr error) {
 		h, cErr = ntCreateAtHandle(parentH, leaf, access, disp, opts, attrs, sd)
 		return cErr
 	})
@@ -135,36 +117,41 @@ func openLeafInRootWin(root *os.Root, dest pathalg.LocalRootedDest, access, disp
 	return f, err
 }
 
-func openRegularFDInRootOS(root *os.Root, dest pathalg.LocalRootedDest) (*os.File, error) {
-	return openLeafInRootWin(root, dest, windows.FILE_GENERIC_READ, windows.FILE_OPEN, false)
-}
-func createExclusiveInRootOS(root *os.Root, dest pathalg.LocalRootedDest, mode fs.FileMode) (*os.File, error) {
-	return openLeafInRootWin(root, dest, windows.FILE_GENERIC_READ|windows.FILE_GENERIC_WRITE, windows.FILE_CREATE, mode.Perm()&0o077 == 0)
-}
-func openForAppendInRootOS(root *os.Root, dest pathalg.LocalRootedDest, mode fs.FileMode) (*os.File, error) {
-	return openLeafInRootWin(root, dest, winAppendAccess, windows.FILE_OPEN_IF, mode.Perm()&0o077 == 0)
-}
-func openForLockInRootOS(root *os.Root, dest pathalg.LocalRootedDest, mode ports.LockMode, create bool, perm fs.FileMode) (*os.File, error) {
-	access, disp, ownerOnly := uint32(windows.FILE_GENERIC_READ), uint32(windows.FILE_OPEN), false
-	if mode == ports.LockExclusive || create {
-		access |= windows.FILE_GENERIC_WRITE
+func openLeafInRootOS(r *os.Root, d pathalg.LocalRootedDest, op rootLeafOp, perm fs.FileMode) (*os.File, error) {
+	const rw = windows.FILE_GENERIC_READ | windows.FILE_GENERIC_WRITE
+	specs := [7]struct {
+		acc, disp uint32
+		mayCreate bool
+	}{
+		{windows.FILE_GENERIC_READ, windows.FILE_OPEN, false},
+		{rw, windows.FILE_CREATE, true},
+		{winAppendAccess, windows.FILE_OPEN_IF, true},
+		{rw, windows.FILE_OPEN_IF, true},
+		{windows.FILE_GENERIC_READ, windows.FILE_OPEN, false},
+		{rw, windows.FILE_OPEN, false},
+		{rw, windows.FILE_OPEN_IF, true},
 	}
-	if create {
-		disp, ownerOnly = windows.FILE_OPEN_IF, sanitizeFilePerm(perm, defaultFilePerm)&0o077 == 0
-	}
-	return openLeafInRootWin(root, dest, access, disp, ownerOnly)
+	sp := specs[op]
+	return openLeafInRootWin(r, d, sp.acc, sp.disp, sp.mayCreate && perm.Perm()&0o077 == 0)
 }
-
 func mkdirSegmentInRootOS(root *os.Root, parentSegs []string, leaf string, mode fs.FileMode) error {
-	h, err := ntCreateInRootWin(root, parentSegs, leaf, windows.FILE_LIST_DIRECTORY|windows.SYNCHRONIZE|windows.FILE_READ_ATTRIBUTES,
-		windows.FILE_CREATE, windows.FILE_DIRECTORY_FILE, windows.FILE_ATTRIBUTE_DIRECTORY, mode.Perm()&0o077 == 0, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
+	h, err := ntCreateInRootWin(root, parentSegs, leaf, windows.FILE_LIST_DIRECTORY|windows.SYNCHRONIZE|windows.FILE_READ_ATTRIBUTES, windows.FILE_CREATE, windows.FILE_DIRECTORY_FILE, windows.FILE_ATTRIBUTE_DIRECTORY, mode.Perm()&0o077 == 0, windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT)
 	if err != nil {
 		return err
 	}
 	return mapOSError(windows.CloseHandle(h))
 }
+func ensureDirOS(nativeDir string, mode fs.FileMode) error {
+	if mode.Perm()&0o077 == 0 {
+		return EnsureOwnerOnlyDirectory(nativeDir)
+	}
+	_, toCreate, err := collectMissingDirs(nativeDir)
+	if err != nil {
+		return err
+	}
+	return createMissingDirsWin(toCreate, nil, nil, nil)
+}
 
-// openOperatorReadOS 按 SymlinkPolicy 在 Windows 上打开跨盘符/长路径操作员只读常规文件。
 func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.File, int64, error) {
 	flags, rejectReparse := uint32(windows.FILE_FLAG_BACKUP_SEMANTICS|windows.SECURITY_SQOS_PRESENT|windows.SECURITY_ANONYMOUS), false
 	switch policy {
@@ -217,17 +204,18 @@ func validateWindowsHandle(handle windows.Handle, path string, expectDir, reject
 }
 
 func mapNTStatusError(path string, err error) error {
-	switch {
-	case err == nil:
+	if err == nil {
 		return nil
-	case errors.Is(err, windows.STATUS_REPARSE_POINT_ENCOUNTERED), errors.Is(err, windows.STATUS_STOPPED_ON_SYMLINK):
-		return fmt.Errorf("%w: %s: %w", ports.ErrSymlinkRejected, path, err)
-	case errors.Is(err, windows.STATUS_OBJECT_NAME_COLLISION):
-		return fmt.Errorf("%w: %s: %w", ports.ErrAlreadyExists, path, err)
-	case errors.Is(err, windows.STATUS_OBJECT_NAME_NOT_FOUND), errors.Is(err, windows.STATUS_OBJECT_PATH_NOT_FOUND):
-		return fmt.Errorf("%w: %s: %w", ports.ErrNotFound, path, err)
-	case errors.Is(err, windows.STATUS_FILE_IS_A_DIRECTORY), errors.Is(err, windows.STATUS_NOT_A_DIRECTORY), errors.Is(err, windows.STATUS_OBJECT_TYPE_MISMATCH):
-		return fmt.Errorf("%w: %s: %w", ports.ErrNotRegularFile, path, err)
+	}
+	for _, m := range [...]struct{ st, out error }{
+		{windows.STATUS_REPARSE_POINT_ENCOUNTERED, ports.ErrSymlinkRejected}, {windows.STATUS_STOPPED_ON_SYMLINK, ports.ErrSymlinkRejected},
+		{windows.STATUS_OBJECT_NAME_COLLISION, ports.ErrAlreadyExists}, {windows.STATUS_OBJECT_NAME_NOT_FOUND, ports.ErrNotFound},
+		{windows.STATUS_OBJECT_PATH_NOT_FOUND, ports.ErrNotFound}, {windows.STATUS_FILE_IS_A_DIRECTORY, ports.ErrNotRegularFile},
+		{windows.STATUS_NOT_A_DIRECTORY, ports.ErrNotRegularFile}, {windows.STATUS_OBJECT_TYPE_MISMATCH, ports.ErrNotRegularFile},
+	} {
+		if errors.Is(err, m.st) {
+			return fmt.Errorf("%w: %s: %w", m.out, path, err)
+		}
 	}
 	if nt, ok := errors.AsType[windows.NTStatus](err); ok {
 		return mapWindowsOpenError(path, nt.Errno())
@@ -236,27 +224,24 @@ func mapNTStatusError(path string, err error) error {
 }
 
 func mapWindowsOpenError(path string, err error) error {
-	switch {
-	case err == nil:
+	if err == nil {
 		return nil
-	case errors.Is(err, windows.ERROR_FILE_NOT_FOUND), errors.Is(err, windows.ERROR_PATH_NOT_FOUND):
-		return fmt.Errorf("%w: %s: %w", ports.ErrNotFound, path, err)
-	case errors.Is(err, windows.ERROR_FILE_EXISTS), errors.Is(err, windows.ERROR_ALREADY_EXISTS):
-		return fmt.Errorf("%w: %s: %w", ports.ErrAlreadyExists, path, err)
-	case errors.Is(err, windows.ERROR_ACCESS_DENIED):
-		return fmt.Errorf("%w: %s: %w", ports.ErrPermissionDenied, path, err)
-	case errors.Is(err, windows.ERROR_PIPE_BUSY), errors.Is(err, windows.ERROR_CANT_ACCESS_FILE):
-		return fmt.Errorf("%w: %s: %w", ports.ErrNotRegularFile, path, err)
-	default:
-		return mapOSError(err)
 	}
+	for _, m := range [...]struct{ we, out error }{
+		{windows.ERROR_FILE_NOT_FOUND, ports.ErrNotFound}, {windows.ERROR_PATH_NOT_FOUND, ports.ErrNotFound},
+		{windows.ERROR_FILE_EXISTS, ports.ErrAlreadyExists}, {windows.ERROR_ALREADY_EXISTS, ports.ErrAlreadyExists},
+		{windows.ERROR_ACCESS_DENIED, ports.ErrPermissionDenied}, {windows.ERROR_PIPE_BUSY, ports.ErrNotRegularFile},
+		{windows.ERROR_CANT_ACCESS_FILE, ports.ErrNotRegularFile},
+	} {
+		if errors.Is(err, m.we) {
+			return fmt.Errorf("%w: %s: %w", m.out, path, err)
+		}
+	}
+	return mapOSError(err)
 }
 
 func tryLockFileOS(f *os.File, exclusive bool) error {
-	flags := uint32(windows.LOCKFILE_FAIL_IMMEDIATELY)
-	if exclusive {
-		flags |= windows.LOCKFILE_EXCLUSIVE_LOCK
-	}
+	flags := pickIf(exclusive, uint32(windows.LOCKFILE_FAIL_IMMEDIATELY|windows.LOCKFILE_EXCLUSIVE_LOCK), uint32(windows.LOCKFILE_FAIL_IMMEDIATELY))
 	var ol windows.Overlapped
 	err := windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, ^uint32(0), ^uint32(0), &ol)
 	runtime.KeepAlive(f)
@@ -265,12 +250,10 @@ func tryLockFileOS(f *os.File, exclusive bool) error {
 	}
 	return err
 }
-
 func unlockFileOS(f *os.File) error {
 	var ol windows.Overlapped
 	err := windows.UnlockFileEx(windows.Handle(f.Fd()), 0, ^uint32(0), ^uint32(0), &ol)
 	runtime.KeepAlive(f)
 	return err
 }
-
 func syncRootParentDirOS(_ *os.Root, _ pathalg.LocalRootedDest) error { return nil }

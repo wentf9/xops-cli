@@ -5,17 +5,14 @@
 package sim
 
 import (
-	"bytes"
-	"cmp"
 	"context"
 	"errors"
-	"io"
-	"net"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/internal/sim/memtree"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -42,14 +39,6 @@ func firstErr(errs ...error) error {
 		}
 	}
 	return nil
-}
-func growBytes(buf []byte, size int64) []byte {
-	if size <= int64(len(buf)) {
-		return buf
-	}
-	out := make([]byte, size)
-	copy(out, buf)
-	return out
 }
 
 // FaultInjector 是面向全部仿真端口的并发安全确定性故障注入器（常驻/单次/概率/自定义钩子）。
@@ -183,102 +172,13 @@ func (b *simBase) checkFn(ctx context.Context, hasFn bool, op string, valid ...b
 	return nil
 }
 
-type simScopedReader struct {
-	r       *bytes.Reader
-	expired *atomic.Bool
-}
-
-func (sr *simScopedReader) Read(p []byte) (int, error) {
-	if sr == nil || sr.expired == nil || sr.expired.Load() {
-		return 0, ports.ErrHandleExpired
-	}
-	return sr.r.Read(p)
-}
-func withScopedReader(data []byte, fn func(io.Reader, int64) error) error {
-	var expired atomic.Bool
-	defer expired.Store(true)
-	return fn(&simScopedReader{r: bytes.NewReader(data), expired: &expired}, int64(len(data)))
-}
-
-type simScopedWriter struct {
-	buf        *bytes.Buffer
-	expired    *atomic.Bool
-	checkWrite func() error
-}
-
-func (sw *simScopedWriter) Write(p []byte) (int, error) {
-	if sw == nil || sw.expired == nil || sw.expired.Load() {
-		return 0, ports.ErrHandleExpired
-	}
-	if sw.checkWrite != nil {
-		if err := sw.checkWrite(); err != nil {
-			return 0, err
-		}
-	}
-	return sw.buf.Write(p)
-}
-
-type simAddr string
-
-func (a simAddr) Network() string { return "sim" }
-func (a simAddr) String() string  { return string(a) }
-
-type simMemListener struct {
-	addr    simAddr
-	expired *atomic.Bool
-}
-
-func (l *simMemListener) Addr() net.Addr { return l.addr }
-func (l *simMemListener) Close() error {
-	if l != nil && l.expired != nil && l.expired.Load() {
-		return ports.ErrHandleExpired
-	}
-	return nil
-}
-func (l *simMemListener) Accept() (net.Conn, error) {
-	return nil, firstErr(l.Close(), ports.ErrClosed)
-}
-
-type simEchoConn struct {
-	mu     sync.Mutex
-	addr   simAddr
-	buf    bytes.Buffer
-	closed bool
-}
-
-func (c *simEchoConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return 0, io.EOF
-	}
-	return c.buf.Read(p)
-}
-func (c *simEchoConn) Write(p []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.closed {
-		return 0, ports.ErrClosed
-	}
-	return c.buf.Write(p)
-}
-func (c *simEchoConn) Close() error                     { c.mu.Lock(); c.closed = true; c.mu.Unlock(); return nil }
-func (c *simEchoConn) LocalAddr() net.Addr              { return c.addr }
-func (c *simEchoConn) RemoteAddr() net.Addr             { return c.addr }
-func (c *simEchoConn) SetDeadline(time.Time) error      { return nil }
-func (c *simEchoConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *simEchoConn) SetWriteDeadline(time.Time) error { return nil }
-
 // SimClock 提供 100% 确定性并发安全虚拟时钟与定时器调度器（实现 ports.Clock，零 time.Sleep）。
 //
 //xops:opaque
 //xops:failclosed
 type SimClock struct {
 	simBase
-	now     time.Time
-	nextSeq uint64
-	timers  []*simTimer
-	notify  chan struct{}
+	core *memtree.ClockCore
 }
 
 // NewSimClock 构造从 start（零值默认 DefaultBaseTime）起步的虚拟时钟。
@@ -286,46 +186,50 @@ func NewSimClock(start time.Time) *SimClock {
 	if start.IsZero() {
 		start = DefaultBaseTime()
 	}
-	return &SimClock{simBase: newSimBase(nil), now: start.UTC().Round(0), notify: make(chan struct{})}
+	return &SimClock{simBase: newSimBase(nil), core: memtree.NewClockCore(start)}
 }
 
 // Now / Since / PendingTimers / Advance / AdvanceToNext / NewTimer / Sleep / WaitPending 驱动虚拟时钟。
 func (c *SimClock) Now() time.Time {
-	return withLockRet(&c.simBase, time.Time{}, func() time.Time { return c.now })
+	if !c.ok() {
+		return time.Time{}
+	}
+	return c.core.Now()
 }
 func (c *SimClock) Since(t time.Time) time.Duration {
-	return withLockRet(&c.simBase, 0, func() time.Duration { return c.now.Sub(t) })
+	if !c.ok() {
+		return 0
+	}
+	return c.core.Since(t)
 }
 func (c *SimClock) PendingTimers() int {
-	return withLockRet(&c.simBase, 0, func() int { return len(c.timers) })
+	if !c.ok() {
+		return 0
+	}
+	return c.core.PendingTimers()
 }
 func (c *SimClock) Advance(d time.Duration) {
-	c.withLock(func() { c.now = c.now.Add(max(d, 0)); c.fireDueLocked() })
+	if c.ok() {
+		c.core.Advance(d)
+	}
 }
-func (c *SimClock) AdvanceToNext() (delta time.Duration, ok bool) {
-	c.withLock(func() {
-		for _, tm := range c.timers {
-			if tm.active && (!ok || tm.fireAt.Before(c.now.Add(delta))) {
-				delta, ok = max(tm.fireAt.Sub(c.now), 0), true
-			}
-		}
-		if ok {
-			c.now = c.now.Add(delta)
-			c.fireDueLocked()
-		}
-	})
-	return delta, ok
+func (c *SimClock) AdvanceToNext() (time.Duration, bool) {
+	if !c.ok() {
+		return 0, false
+	}
+	return c.core.AdvanceToNext()
 }
 func (c *SimClock) NewTimer(d time.Duration) ports.Timer {
-	tm := &simTimer{clk: c, ch: make(chan time.Time, 1)}
-	c.withLock(func() { c.armTimerLocked(tm, d) })
-	return tm
+	if !c.ok() {
+		return &memtree.ClockTimer{}
+	}
+	return c.core.NewTimer(d)
 }
 func (c *SimClock) Sleep(ctx context.Context, d time.Duration) error {
 	if err := c.check(ctx, ""); err != nil || d <= 0 {
 		return err
 	}
-	tm := c.NewTimer(d)
+	tm := c.core.NewTimer(d)
 	defer tm.Stop()
 	select {
 	case <-ctx.Done():
@@ -338,85 +242,5 @@ func (c *SimClock) WaitPending(ctx context.Context, n int) error {
 	if err := c.check(ctx, ""); err != nil {
 		return err
 	}
-	for {
-		c.mu.Lock()
-		done, ch := len(c.timers) >= n, c.notify
-		c.mu.Unlock()
-		if done {
-			return nil
-		}
-		select {
-		case <-ch:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-func (c *SimClock) armTimerLocked(tm *simTimer, d time.Duration) {
-	c.nextSeq++
-	tm.seq, tm.fireAt = c.nextSeq, c.now.Add(d)
-	if d <= 0 {
-		tm.active = false
-		c.removeTimerLocked(tm)
-		tm.ch <- c.now
-	} else if tm.active = true; !slices.Contains(c.timers, tm) {
-		c.timers = append(c.timers, tm)
-	}
-	close(c.notify)
-	c.notify = make(chan struct{})
-}
-func (c *SimClock) fireDueLocked() {
-	var due []*simTimer
-	kept := c.timers[:0]
-	for _, tm := range c.timers {
-		if tm.active && !c.now.Before(tm.fireAt) {
-			tm.active, due = false, append(due, tm)
-		} else if tm.active {
-			kept = append(kept, tm)
-		}
-	}
-	clear(c.timers[len(kept):])
-	c.timers = kept
-	slices.SortFunc(due, func(a, b *simTimer) int {
-		return cmp.Or(cmp.Compare(a.fireAt.UnixNano(), b.fireAt.UnixNano()), cmp.Compare(a.seq, b.seq))
-	})
-	for _, tm := range due {
-		select {
-		case tm.ch <- c.now:
-		default:
-		}
-	}
-}
-func (c *SimClock) removeTimerLocked(t *simTimer) {
-	if i := slices.Index(c.timers, t); i >= 0 {
-		c.timers = slices.Delete(c.timers, i, i+1)
-	}
-}
-
-type simTimer struct {
-	clk    *SimClock
-	seq    uint64
-	ch     chan time.Time
-	fireAt time.Time
-	active bool
-}
-
-func (t *simTimer) C() <-chan time.Time        { return t.ch }
-func (t *simTimer) Stop() bool                 { return t.mutate(false, 0) }
-func (t *simTimer) Reset(d time.Duration) bool { return t.mutate(true, d) }
-func (t *simTimer) mutate(reset bool, d time.Duration) bool {
-	return t != nil && t.clk != nil && withLockRet(&t.clk.simBase, false, func() bool {
-		was := t.active
-		if !reset {
-			t.active = false
-			t.clk.removeTimerLocked(t)
-			return was
-		}
-		select {
-		case <-t.ch:
-		default:
-		}
-		t.clk.armTimerLocked(t, d)
-		return was
-	})
+	return c.core.WaitPending(ctx, n)
 }
