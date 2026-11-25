@@ -1,0 +1,247 @@
+// Package fsm 提供 XOps v2 纯函数领域核的五大高风险多步协议纯 Mealy 状态机（RFC §3.6）：
+//   - VaultSagaFSM：凭据写入、常量时间回读校验、配置 CAS 提交、5 位置零引用核验与旧凭据 GC，
+//     对 Applied && !Durable 进入零重试零删凭据停机态 UncertainDurability；
+//   - ApprovalFSM：词法预检、远端规范化、作用域升级判定（含 Protected-A -> Protected-B）、挑战签发与
+//     显式时刻常量时间令牌核验，对 Round-2 探测失败或挑战后升级立即作废待决/已签发令牌；
+//   - TransferFSM：面向 MCP HTTP 最高 10 GiB 分片流、双版本（V1/V2）双代 Journal、原子交接与崩溃恢复；
+//   - EnsureFSM：Playbook ensure 幂等收敛状态机，在任意阶段遇 execution.OutcomeUnknown 严禁自动重试；
+//   - PendingEnrollFSM：首连「先验证后入库」作用域租约状态机，未验节点绝不入库且全程钉住暂存凭据防 GC。
+//
+// 本包恪守 100% 纯数学与零副作用铁律（零 time.Now、零 crypto/rand、零 I/O、零 sync/sync/atomic、零反射），
+// 全部状态转换遵循确定性 Mealy 签名 Transition(state, input) (nextState, []Effect, []Event, error)，
+// 对零值、nil 或非法 (state, input) 严格失败关闭且绝不破坏原状态。
+package fsm
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/security"
+)
+
+const (
+	// MaxTransferBytes 表示 TransferFSM 允许的最大单次流式传输总字节数（精确 10 GiB）。
+	MaxTransferBytes uint64 = 10 << 30
+	// MaxTransferChunkBytes 表示单次流式分片允许的最大字节数（64 MiB）。
+	MaxTransferChunkBytes uint64 = 64 << 20
+	// MaxJournalRecords 表示崩溃恢复单次扫描允许处理的最大 Journal 记录数。
+	MaxJournalRecords = 1 << 20
+	// MaxEnsureRetries 表示 EnsureFSM 对 OutcomeNotStarted 允许的最大重试次数上限。
+	MaxEnsureRetries uint8 = 10
+	// MaxPendingSecretRefs 表示单次首连暂存租约最多钉住的凭据引用数。
+	MaxPendingSecretRefs = 64
+
+	maxReasonBytes, maxLabelLen = 512, 128
+)
+
+// 本包导出的规范哨兵错误，所有零值状态、非法输入、越界转换与 Journal 损坏均严格失败关闭。
+var (
+	ErrInvalidState            = errors.New("fsm: 无效或未初始化的状态")
+	ErrInvalidInput            = errors.New("fsm: 无效或未初始化的输入")
+	ErrIllegalTransition       = errors.New("fsm: 当前状态不接受该输入（非法状态转换）")
+	ErrInvalidContext          = errors.New("fsm: 无效的状态机上下文参数")
+	ErrInvalidDurability       = errors.New("fsm: 无效的持久化提交状态 DurabilityStatus")
+	ErrInvalidOutcome          = errors.New("fsm: 无效的副作用执行结果 SideEffectOutcome")
+	ErrInvalidJournal          = errors.New("fsm: 无效的传输 Journal 记录")
+	ErrCorruptJournal          = errors.New("fsm: 检测到损坏、乱序或被篡改的传输 Journal")
+	ErrTransferSizeExceeded    = errors.New("fsm: 传输大小超过 10 GiB 上限或发生偏移溢出")
+	ErrInvalidChunkOffset      = errors.New("fsm: 分片偏移不连续或长度非法")
+	ErrInvalidApprovalEnvelope = errors.New("fsm: 审批挑战信封与当前上下文或绑定不匹配")
+	ErrInvalidEnsureStep       = errors.New("fsm: 无效的 Ensure 步骤参数")
+	ErrInvalidEnrollLease      = errors.New("fsm: 无效的首连暂存租约上下文")
+	ErrNilWriter               = errors.New("fsm: WriteCanonical 或编码目标不能为 nil")
+	ErrNilReceiver             = errors.New("fsm: 反序列化目标接收者不能为 nil")
+)
+
+// DurabilityStatus 与 SideEffectOutcome 为持久化提交与单步副作用的失败关闭结果枚举。
+type (
+	//xops:opaque
+	//xops:failclosed
+	DurabilityStatus uint8
+	//xops:opaque
+	//xops:failclosed
+	SideEffectOutcome uint8
+)
+
+const (
+	DurabilityUnknown           DurabilityStatus = iota // 未初始化零值（失败关闭）
+	DurabilityNotApplied                                // 确认未生效，可安全补偿
+	DurabilityCommitted                                 // Applied && Durable，已持久生效
+	DurabilityAppliedNotDurable                         // Applied && !Durable，零重试零删凭据停机
+	DurabilityOutcomeUnknown                            // 结果完全未知（禁自动重试）
+)
+
+const (
+	SideEffectInvalid          SideEffectOutcome = iota // 无效零值（失败关闭）
+	SideEffectSucceeded                                 // 副作用确认成功
+	SideEffectFailedNotApplied                          // 副作用确认未生效而失败
+	SideEffectOutcomeUnknown                            // 副作用结果未知（严禁自动重试）
+)
+
+// ClassifyDurability 根据 (applied, durable, outcomeKnown) 映射为 DurabilityStatus；矛盾组合 (!applied && durable) 失败关闭。
+func ClassifyDurability(applied, durable, outcomeKnown bool) DurabilityStatus {
+	if !outcomeKnown {
+		return DurabilityOutcomeUnknown
+	}
+	if applied {
+		return pickIf(durable, DurabilityCommitted, DurabilityAppliedNotDurable)
+	}
+	return pickIf(!durable, DurabilityNotApplied, DurabilityUnknown)
+}
+
+func (d DurabilityStatus) IsValid() bool {
+	return d >= DurabilityNotApplied && d <= DurabilityOutcomeUnknown
+}
+func (d DurabilityStatus) IsZero() bool { return d == DurabilityUnknown }
+func (d DurabilityStatus) Applied() bool {
+	return d == DurabilityCommitted || d == DurabilityAppliedNotDurable
+}
+func (d DurabilityStatus) Durable() bool { return d == DurabilityCommitted }
+func (d DurabilityStatus) String() string {
+	return enumName(uint8(d), "unknown", "unknown", "not_applied", "committed", "applied_not_durable", "outcome_unknown")
+}
+func (o SideEffectOutcome) IsValid() bool {
+	return o >= SideEffectSucceeded && o <= SideEffectOutcomeUnknown
+}
+func (o SideEffectOutcome) IsZero() bool { return o == SideEffectInvalid }
+func (o SideEffectOutcome) String() string {
+	return enumName(uint8(o), "invalid", "invalid", "succeeded", "failed_not_applied", "outcome_unknown")
+}
+
+type validKind interface {
+	~uint8
+	IsValid() bool
+}
+
+// Event 表示状态机发出的不可变脱敏领域事件；零值恒无效并失败关闭。
+//
+//xops:opaque
+//xops:failclosed
+type Event[K validKind] struct {
+	kind   K
+	detail string
+	valid  bool
+}
+
+func (e Event[K]) IsValid() bool                   { return e.valid && e.kind.IsValid() }
+func (e Event[K]) Kind() K                         { return e.kind }
+func (e Event[K]) Detail() string                  { return e.detail }
+func newEvent[K validKind](k K, d string) Event[K] { return Event[K]{k, sanitizeReason(d), true} }
+
+func zeroVal[T any]() (z T) { return z }
+func pickIf[T any](ok bool, yes, no T) T {
+	if ok {
+		return yes
+	}
+	return no
+}
+func pickLazy[T any](ok bool, get func() T) (z T) {
+	if ok {
+		return get()
+	}
+	return z
+}
+func enumName(idx uint8, fallback string, names ...string) string {
+	if int(idx) < len(names) {
+		return names[idx]
+	}
+	return fallback
+}
+func parseEnumByName[T ~uint8](raw string, lo, hi, zero T, nameFn func(T) string, baseErr error) (T, error) {
+	if !hasForbiddenStrictText(raw) {
+		for norm, v := strings.ToLower(strings.TrimSpace(raw)), lo; v <= hi; v++ {
+			if nameFn(v) == norm {
+				return v, nil
+			}
+		}
+	}
+	return zero, fmt.Errorf("%w: %q", baseErr, raw)
+}
+func appendValidText(b []byte, valid bool, text string, baseErr error) ([]byte, error) {
+	if !valid {
+		return nil, baseErr
+	}
+	return append(b, text...), nil
+}
+func unmarshalTextWithReset[T any](dst *T, zero T, text []byte, parse func(string) (T, error)) error {
+	if dst == nil {
+		return ErrNilReceiver
+	}
+	parsed, err := parse(string(text))
+	if err != nil {
+		*dst = zero
+		return err
+	}
+	*dst = parsed
+	return nil
+}
+func hasForbiddenStrictText(s string) bool {
+	return !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029'
+	})
+}
+func sanitizeReason(raw string) string {
+	return truncateUTF8(security.SanitizePromptText(raw), maxReasonBytes)
+}
+
+// truncateUTF8 在不超过 maxBytes 字节的前提下沿合法 UTF-8 字符边界截断字符串，避免切碎多字节符文。
+func truncateUTF8(s string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
+}
+func isValidRFC3339Time(t time.Time) bool {
+	return !t.IsZero() && t.UTC().Year() >= 1 && t.UTC().Year() <= 9999
+}
+func isValidTimeWindow(startUTC time.Time, ttl algebraic.Duration) bool {
+	return isValidRFC3339Time(startUTC) && ttl.IsPositive() && startUTC.Add(ttl.Std()).After(startUTC) && isValidRFC3339Time(startUTC.Add(ttl.Std()))
+}
+func equalOptionFunc[T any](a, b algebraic.Option[T], eq func(T, T) bool) bool {
+	va, oka := a.Get()
+	vb, okb := b.Get()
+	return oka == okb && (!oka || eq(va, vb))
+}
+
+type canonicalEncoder struct {
+	w   io.Writer
+	err error
+}
+
+func digestCanonical(writeFn func(io.Writer) error) (security.Digest, error) {
+	h := sha256.New()
+	if err := writeFn(h); err != nil {
+		return zeroVal[security.Digest](), err
+	}
+	var sum [sha256.Size]byte
+	h.Sum(sum[:0])
+	return security.DigestFromSHA256(sum), nil
+}
+func (e *canonicalEncoder) writeRaw(p []byte) {
+	if e.err == nil && len(p) > 0 {
+		_, e.err = e.w.Write(p)
+	}
+}
+func (e *canonicalEncoder) writeUint8(v uint8) { e.writeRaw([]byte{v}) }
+func (e *canonicalEncoder) writeUint64(v uint64) {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], v)
+	e.writeRaw(buf[:])
+}
+func (e *canonicalEncoder) writeBytes(p []byte)  { e.writeUint64(uint64(len(p))); e.writeRaw(p) }
+func (e *canonicalEncoder) writeString(s string) { e.writeBytes([]byte(s)) }
