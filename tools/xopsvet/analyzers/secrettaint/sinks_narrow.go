@@ -12,15 +12,18 @@ import (
 	"golang.org/x/tools/go/ssa"
 )
 
-const dialPkgPath = vetutil.ModulePrefix + "/core/internal/sshnet/dial"
+const (
+	dialPkgPath  = vetutil.ModulePrefix + "/core/internal/sshnet/dial"
+	portsPkgPath = vetutil.ModulePrefix + "/core/ports"
+)
 
 // 本文件实现 Phase 4 受控窄消费器模式钩子（B-4 / ST-7 / ST-10 / Phase2-Readiness）：
 //   1. P4-T1（core/internal/sshnet/dial）：仅放行唯一流向 ssh.KeyboardInteractive 的挑战闭包内，
 //      通过 box.Use 写入局部 answers []string 并在槽 0 返回（槽 1 error 禁染毒，闭包体全量复审）；
 //   2. P4-T1（core/internal/sshnet/priv）：仅在 LayerCoreSSHNetPriv 内按严格正向白名单放行向已验证的 SSH
-//      会话/通道写入器（(*ssh.Session).StdinPipe、(*ssh.Client).OpenChannel、(ssh.Conn).OpenChannel、
-//      (ssh.NewChannel).Accept 及显式 ssh.Channel 形参）写入提权明文字节（拒绝通用 io.Writer/io.WriteCloser
-//      形参、io.Pipe/*io.PipeWriter、结构体字段、全局变量与一切未授权外部写入器）；
+//      会话/通道写入器（(*ssh.Session).StdinPipe、(ports.RemoteSession).StdinPipe、(*ssh.Client).OpenChannel、
+//      (ssh.Conn).OpenChannel、(ssh.NewChannel).Accept 及显式 ssh.Channel 形参）写入提权明文字节（拒绝通用
+//      io.Writer/io.WriteCloser 形参、自定义接口 StdinPipe、io.Pipe/*io.PipeWriter、结构体字段、全局变量与一切未授权外部写入器）；
 //   3. P4-T4（LayerHostVault，含 internal/host/vault/wincred 子包隔离）：Windows CREDENTIALW 本作用域局部结构体写入 + LazyProc.Call。
 
 func collectDialKIClosures(pkgInfo vetutil.PkgInfo, s *buildssa.SSA) map[*ssa.Function]bool {
@@ -188,8 +191,9 @@ func isAllowedPrivWriteMethod(fn *types.Func) bool {
 }
 
 // tracesOnlyToSafePrivWriter 实施严格正向 Fail-Closed 溯源：仅放行 (*ssh.Session).StdinPipe、
-// (*ssh.Client).OpenChannel、(ssh.Conn).OpenChannel、(ssh.NewChannel).Accept 槽 0 及静态类型为 ssh.Channel 的形参，
-// 沿同包辅助返回、Phi、FreeVar、Alloc/UnOp(MUL) 闭环传播，拒绝通用 io.Writer/io.WriteCloser 形参、io.Pipe 与一切结构体字段/全局/未授权构造器。
+// (ports.RemoteSession).StdinPipe、(*ssh.Client).OpenChannel、(ssh.Conn).OpenChannel、(ssh.NewChannel).Accept
+// 槽 0 及静态类型为 ssh.Channel 的形参，沿同包辅助返回、Phi、FreeVar、Alloc/UnOp(MUL) 闭环传播，
+// 拒绝通用 io.Writer/io.WriteCloser 形参、自定义接口 StdinPipe、io.Pipe 与一切结构体字段/全局/未授权构造器。
 func tracesOnlyToSafePrivWriter(s *buildssa.SSA, v ssa.Value, visiting map[ssa.Value]bool, seenFn map[*ssa.Function]bool) bool {
 	v = vetssa.UnwrapInterface(v)
 	if v == nil || visiting[v] {
@@ -243,7 +247,8 @@ func isAllowedSSHPrivWriterCtor(fn *types.Func) bool {
 	}
 	switch fn.Name() {
 	case "StdinPipe":
-		return vetutil.IsPkgSymbol(named.Obj(), sshCryptoPkgPath, "Session")
+		return vetutil.IsPkgSymbol(named.Obj(), sshCryptoPkgPath, "Session") ||
+			vetutil.IsPkgSymbol(named.Obj(), portsPkgPath, "RemoteSession")
 	case "OpenChannel":
 		return vetutil.IsPkgSymbol(named.Obj(), sshCryptoPkgPath, "Client", "Conn")
 	case "Accept":

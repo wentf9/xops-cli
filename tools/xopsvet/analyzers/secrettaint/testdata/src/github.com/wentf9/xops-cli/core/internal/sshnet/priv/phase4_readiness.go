@@ -13,6 +13,7 @@ import (
 	"os"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
+	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -35,6 +36,74 @@ type privEscalator struct {
 
 func openPrivSessionStdin(sess *ssh.Session) (io.WriteCloser, error) {
 	return sess.StdinPipe()
+}
+
+func openPrivRemoteSessionStdin(sess ports.RemoteSession) (io.WriteCloser, error) {
+	return sess.StdinPipe()
+}
+
+type fakeRemoteSession interface {
+	StdinPipe() (io.WriteCloser, error)
+}
+
+type fakeRemoteSessionImpl struct{}
+
+func (*fakeRemoteSessionImpl) StdinPipe() (io.WriteCloser, error) {
+	return nil, nil
+}
+
+func openFakeRemoteSessionStdin(sess fakeRemoteSession) (io.WriteCloser, error) {
+	return sess.StdinPipe()
+}
+
+// okPrivRemoteSessionStdinPipe 验证 LayerCoreSSHNetPriv 放行 (ports.RemoteSession).StdinPipe
+// （接口 invoke、同包辅助转发、io.Writer 装箱、Phi 合并及闭包内直接获取），以支持 dial 与 mux 统一提权握手。
+func okPrivRemoteSessionStdinPipe(
+	sess ports.RemoteSession,
+	ch ssh.Channel,
+	useRemote bool,
+	passBox *secret.SecretBox,
+) error {
+	remoteStdin, err := sess.StdinPipe()
+	if err != nil {
+		return err
+	}
+	helperRemoteStdin, err := openPrivRemoteSessionStdin(sess)
+	if err != nil {
+		return err
+	}
+	var boxedRemote io.Writer = remoteStdin
+	var chosen io.Writer = ch
+	if useRemote {
+		chosen = remoteStdin
+	}
+
+	return passBox.Use(func(plain []byte) error {
+		line := make([]byte, len(plain)+1)
+		defer clear(line)
+		copy(line, plain)
+		line[len(plain)] = '\n'
+		if _, wErr := remoteStdin.Write(line); wErr != nil {
+			return wErr
+		}
+		if _, wErr := helperRemoteStdin.Write(line); wErr != nil {
+			return wErr
+		}
+		if _, wErr := boxedRemote.Write(line); wErr != nil {
+			return wErr
+		}
+		if _, wErr := chosen.Write(line); wErr != nil {
+			return wErr
+		}
+		inlineStdin, sErr := sess.StdinPipe()
+		if sErr != nil {
+			return sErr
+		}
+		if _, wErr := inlineStdin.Write(line); wErr != nil {
+			return wErr
+		}
+		return nil
+	})
 }
 
 // okPrivEscalationWriters 验证 LayerCoreSSHNetPriv 严格正向白名单：
@@ -235,6 +304,54 @@ func badPrivEscalationViolations(sess *ssh.Session, box *secret.SecretBox) error
 	// 6. 禁止通过自定义 error 类型直接 return 返回明文机密
 	return box.Use(func(plain []byte) error {
 		if _, err := stdin.Write(plain); err != nil {
+			return privSecretErr(plain) // want "禁止通过 return 返回明文机密"
+		}
+		return nil
+	})
+}
+
+// badPrivRemoteSessionViolations 验证针对 RemoteSession.StdinPipe 的对抗绕过：
+// 伪造本地接口/结构体、混合 Phi、结构体字段中转、MultiWriter、切片逃逸及 error 染毒均须严格 Fail-Closed 拦截。
+func badPrivRemoteSessionViolations(
+	sess ports.RemoteSession,
+	fake fakeRemoteSession,
+	impl *fakeRemoteSessionImpl,
+	useFake bool,
+	box *secret.SecretBox,
+) error {
+	remoteStdin, _ := sess.StdinPipe()
+	fakeStdin, _ := fake.StdinPipe()
+	helperFakeStdin, _ := openFakeRemoteSessionStdin(fake)
+	implStdin, _ := impl.StdinPipe()
+	var mixed io.Writer = remoteStdin
+	if useFake {
+		mixed = fakeStdin
+	}
+	var outerBuf bytes.Buffer
+	multiW := io.MultiWriter(remoteStdin, &outerBuf)
+	holder := &privEscalator{stdin: remoteStdin}
+
+	if err := box.Use(func(plain []byte) error {
+		_, _ = fakeStdin.Write(plain)       // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = helperFakeStdin.Write(plain) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = implStdin.Write(plain)       // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = mixed.Write(plain)           // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = multiW.Write(plain)          // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = holder.stdin.Write(plain)    // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+
+		outerPrivLeak = plain // want "禁止将明文机密逃逸至外层变量"
+
+		if _, err := remoteStdin.Write(plain); err != nil {
+			_ = fmt.Errorf("remote sudo failed %s: %w", plain, err) // want "禁止将明文机密.*传入错误格式化汇点"
+			return errors.New(string(plain))                        // want "禁止将明文机密.*传入错误格式化汇点"
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	return box.Use(func(plain []byte) error {
+		if _, err := remoteStdin.Write(plain); err != nil {
 			return privSecretErr(plain) // want "禁止通过 return 返回明文机密"
 		}
 		return nil

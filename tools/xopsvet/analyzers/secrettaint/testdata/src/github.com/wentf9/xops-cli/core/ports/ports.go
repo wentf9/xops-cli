@@ -2,9 +2,14 @@ package ports
 
 import (
 	"context"
+	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
+
+type RemoteSession interface {
+	StdinPipe() (io.WriteCloser, error)
+}
 
 type SecretVault interface {
 	WithSecret(ctx context.Context, ref string, fn func(box *secret.SecretBox) error) error

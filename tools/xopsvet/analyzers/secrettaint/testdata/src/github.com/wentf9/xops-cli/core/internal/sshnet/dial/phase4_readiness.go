@@ -11,10 +11,12 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash"
+	"io"
 	"log/slog"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
+	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/ssh"
 )
@@ -115,11 +117,17 @@ type nonVaultAEADHolder struct {
 	aead cipher.AEAD
 }
 
+func openDialRemoteSessionStdin(sess ports.RemoteSession) (io.WriteCloser, error) {
+	return sess.StdinPipe()
+}
+
 // badUnkeyedSHA1AndBase32Leaks 验证未加密钥 sha1、base32 泄漏、ParseRawPrivateKey 逃逸、非 priv 通道写入及非 vault 字段 Seal 均严格 Fail-Closed。
-func badUnkeyedSHA1AndBase32Leaks(box *secret.SecretBox, sess *ssh.Session, ch ssh.Channel, key, nonce []byte) {
+func badUnkeyedSHA1AndBase32Leaks(box *secret.SecretBox, sess *ssh.Session, remoteSess ports.RemoteSession, ch ssh.Channel, key, nonce []byte) {
 	var holder nonVaultAEADHolder
 	holder.aead, _ = chacha20poly1305.NewX(key)
 	stdin, _ := sess.StdinPipe()
+	remoteStdin, _ := remoteSess.StdinPipe()
+	helperRemoteStdin, _ := openDialRemoteSessionStdin(remoteSess)
 
 	_ = box.Use(func(plain []byte) error {
 		// 1. 未加密钥的 sha1.New().Write / sha1.Sum 必须继续禁止
@@ -142,9 +150,11 @@ func badUnkeyedSHA1AndBase32Leaks(box *secret.SecretBox, sess *ssh.Session, ch s
 		raw2, _ := ssh.ParseRawPrivateKeyWithPassphrase(plain, plain)
 		slog.Info("raw-leak-2", "k", raw2) // want "禁止将明文机密.*传入日志汇点"
 
-		// 4. 非 LayerCoreSSHNetPriv 禁止向 ssh.Channel 或 StdinPipe 写入明文
-		_, _ = ch.Write(plain)    // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
-		_, _ = stdin.Write(plain) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		// 4. 非 LayerCoreSSHNetPriv 禁止向 ssh.Channel、(*ssh.Session).StdinPipe 或 (ports.RemoteSession).StdinPipe 写入明文
+		_, _ = ch.Write(plain)                // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = stdin.Write(plain)             // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = remoteStdin.Write(plain)       // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_, _ = helperRemoteStdin.Write(plain) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 
 		// 5. 非 LayerHostVault 禁止通过结构体字段调用 cipher.AEAD.Seal
 		_ = holder.aead.Seal(nil, nonce, plain, nil) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
