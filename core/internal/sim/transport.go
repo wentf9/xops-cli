@@ -287,6 +287,9 @@ func (s *SimRemoteSession) StdoutPipe() (io.Reader, error)     { return s.allocP
 func (s *SimRemoteSession) StderrPipe() (io.Reader, error)     { return s.allocPipe(&s.stderrPipe) }
 
 func (s *SimRemoteSession) beginStartLocked(streams ports.ExecStreams) error {
+	if !s.initialized || s.closed.Load() {
+		return ports.ErrClosed
+	}
 	if s.started.Load() || (s.stdinPipe != nil && streams.Stdin != nil) || (s.stdoutPipe != nil && streams.Stdout != nil) || (s.stderrPipe != nil && streams.Stderr != nil) {
 		return ports.ErrInvalidArgument
 	}

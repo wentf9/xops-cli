@@ -72,9 +72,13 @@ func NewVaultStatus(spec VaultStatusSpec) (VaultStatus, error) {
 	if err != nil {
 		return VaultStatus{}, err
 	}
-	stores := slices.Clone(spec.KnownStores)
-	slices.Sort(stores)
-	return VaultStatus{state: spec.State, knownStores: slices.Compact(stores), detail: detail, valid: true}, nil
+	var stores []string
+	if len(spec.KnownStores) > 0 {
+		stores = slices.Clone(spec.KnownStores)
+		slices.Sort(stores)
+		stores = slices.Compact(stores)
+	}
+	return VaultStatus{state: spec.State, knownStores: stores, detail: detail, valid: true}, nil
 }
 func (s VaultStatus) IsValid() bool         { return s.valid && s.state.IsValid() }
 func (s VaultStatus) IsZero() bool          { return !s.IsValid() }
@@ -299,7 +303,7 @@ func NewHostTrustCheck(spec HostTrustCheckSpec) (HostTrustCheck, error) {
 	if err != nil {
 		return HostTrustCheck{}, err
 	}
-	return HostTrustCheck{status: spec.Status, endpoint: spec.Endpoint, presented: spec.Presented, expectedFingerprints: slices.Clone(spec.ExpectedFingerprints), reason: reason, valid: true}, nil
+	return HostTrustCheck{status: spec.Status, endpoint: spec.Endpoint, presented: spec.Presented, expectedFingerprints: cloneSliceNilIfEmpty(spec.ExpectedFingerprints), reason: reason, valid: true}, nil
 }
 func (c HostTrustCheck) IsValid() bool {
 	return c.valid && c.status.IsValid() && c.endpoint.IsValid() && c.presented.IsValid()

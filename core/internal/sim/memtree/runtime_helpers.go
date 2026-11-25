@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"math/bits"
 	"net"
@@ -259,8 +260,8 @@ func copyStreamWithCtx(ctx context.Context, dst io.Writer, src io.Reader) error 
 			}
 		}
 		if rErr != nil {
-			if rErr == io.EOF {
-				return nil
+			if errors.Is(rErr, io.EOF) {
+				return ctx.Err()
 			}
 			return rErr
 		}

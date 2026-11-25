@@ -353,3 +353,29 @@ func TestDownstreamPortJSONCodecs(t *testing.T) {
 		`{"dialect":"posix","interpreter":"bash","probe_stage":3}`,
 	)
 }
+
+func TestEmptySliceNilNormalization(t *testing.T) {
+	vs, err := ports.NewVaultStatus(ports.VaultStatusSpec{State: ports.VaultStateUnlocked, KnownStores: []string{}})
+	if err != nil || vs.KnownStores() != nil {
+		t.Fatalf("NewVaultStatus 空切片须归一化为 nil: err=%v got=%#v", err, vs.KnownStores())
+	}
+	ep, _ := netaddr.ParseEndpoint("192.0.2.10:22")
+	fp := inventory.KeyFingerprintFromSHA256(sha256.Sum256([]byte("empty-slice-norm")))
+	pk, _ := ports.NewPublicKeyInfo(ports.PublicKeyInfoSpec{Algorithm: "ssh-ed25519", Fingerprint: fp, WireBlob: []byte{1, 2, 3}})
+	htc, err := ports.NewHostTrustCheck(ports.HostTrustCheckSpec{
+		Status: ports.HostTrustTrusted, Endpoint: ep, Presented: pk, ExpectedFingerprints: []inventory.KeyFingerprint{},
+	})
+	if err != nil || htc.ExpectedFingerprints() != nil {
+		t.Fatalf("NewHostTrustCheck 空切片须归一化为 nil: err=%v got=%#v", err, htc.ExpectedFingerprints())
+	}
+	ps, err := ports.NewProcessSpec(ports.ProcessSpecInput{Command: "echo", Args: []string{}})
+	if err != nil || ps.Args() != nil {
+		t.Fatalf("NewProcessSpec 空 Args 须归一化为 nil: err=%v got=%#v", err, ps.Args())
+	}
+	pr, err := ports.NewProcessResult(ports.ProcessResultSpec{
+		ExitStatus: execution.NewExitCode(0), Stdout: []byte{}, Stderr: []byte{},
+	})
+	if err != nil || pr.Stdout() != nil || pr.Stderr() != nil {
+		t.Fatalf("NewProcessResult 空输出须归一化为 nil: err=%v stdout=%#v stderr=%#v", err, pr.Stdout(), pr.Stderr())
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -474,5 +475,56 @@ func verifySimMuxTransportMinors(t *testing.T, ctx context.Context, rng *SeededR
 	}
 	if err := expiredLn.Close(); !errors.Is(err, ports.ErrHandleExpired) {
 		t.Fatalf("expired memtree.MemListener Close must fail with ErrHandleExpired, got %v", err)
+	}
+	verifySimRelayCancelPreservesCtxErr(t)
+}
+
+type signalOnRead struct {
+	r    io.Reader
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (s *signalOnRead) Read(p []byte) (int, error) {
+	s.once.Do(func() { close(s.ch) })
+	return s.r.Read(p)
+}
+
+func verifySimRelayCancelPreservesCtxErr(t *testing.T) {
+	t.Helper()
+	term := NewSimTerminalPort(true, 80, 24)
+	term.SetBlockInputAfterData(true)
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	var sink bytes.Buffer
+	remoteOut := memtree.NewStreamPipe()
+	started := make(chan struct{})
+	err := term.WithRawTerminal(context.Background(), func(h ports.TerminalHandle) error {
+		return conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+			if gErr := n.Go(func(context.Context) error {
+				<-started
+				cancel()
+				_ = remoteOut.Close()
+				return nil
+			}); gErr != nil {
+				return gErr
+			}
+			rErr := h.Relay(cancelCtx, &sink, &signalOnRead{r: remoteOut, ch: started}, nil)
+			if !errors.Is(rErr, context.Canceled) {
+				t.Fatalf("Relay 取消后须保留 context.Canceled，实际得到 %v", rErr)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("WithRawTerminal failed: %v", err)
+	}
+	// 验证已关闭 SimRemoteSession 在加锁复核中返回 ErrClosed。
+	sess := &SimRemoteSession{initialized: true}
+	_ = sess.Close()
+	sess.mu.Lock()
+	startErr := sess.beginStartLocked(ports.ExecStreams{})
+	sess.mu.Unlock()
+	if !errors.Is(startErr, ports.ErrClosed) {
+		t.Fatalf("beginStartLocked on closed session must return ErrClosed, got %v", startErr)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -88,6 +89,12 @@ func pickIf[T any](ok bool, yes, no T) T {
 	return no
 }
 func zeroVal[T any]() (z T) { return z }
+func cloneSliceNilIfEmpty[S ~[]E, E any](s S) S {
+	if len(s) == 0 {
+		return nil
+	}
+	return slices.Clone(s)
+}
 func firstErr(errs ...error) error {
 	for _, err := range errs {
 		if err != nil {

@@ -135,6 +135,9 @@ func NewProcessSpec(in ProcessSpecInput) (ProcessSpec, error) {
 }
 
 func validateProcessArgs(raw []string) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
 	if len(raw) > maxProcessArgs {
 		return nil, fmt.Errorf("%w: 参数数量超限", ErrInvalidArgument)
 	}
@@ -221,7 +224,7 @@ func NewProcessResult(spec ProcessResultSpec) (ProcessResult, error) {
 	if spec.ExitStatus == nil || !spec.ExitStatus.IsValid() {
 		return ProcessResult{}, fmt.Errorf("%w: ProcessResult 需要有效 ExitStatus", ErrInvalidArgument)
 	}
-	return ProcessResult{exitStatus: spec.ExitStatus, stdout: bytes.Clone(spec.Stdout), stderr: bytes.Clone(spec.Stderr), truncated: spec.Truncated, valid: true}, nil
+	return ProcessResult{exitStatus: spec.ExitStatus, stdout: cloneSliceNilIfEmpty(spec.Stdout), stderr: cloneSliceNilIfEmpty(spec.Stderr), truncated: spec.Truncated, valid: true}, nil
 }
 func (r ProcessResult) IsValid() bool {
 	return r.valid && r.exitStatus != nil && r.exitStatus.IsValid()
@@ -274,8 +277,10 @@ type TerminalHandle interface {
 	io.Writer
 	Size() (TerminalSize, error)
 	ResizeEvents() <-chan TerminalSize
-	// Relay 在同步作用域内将本机终端输入/输出与窗口尺寸变更并发中继至远端读写流（RFC §2.1 ConsoleRelay）；
-	// 退出前须收敛全部内部泵协程，onResize 可为 nil，remoteIn/remoteOut 为 nil 返回 ErrInvalidArgument。
+	// Relay 在同步作用域内将本机终端输入/输出与窗口尺寸变更并发中继至远端读写流（RFC §2.1 ConsoleRelay）：
+	//   - 本机输入先达 EOF 时若 remoteIn 实现 io.Closer 须执行半关闭并继续排空 remoteOut；
+	//   - remoteOut 先达 EOF 或 ctx 取消时须唤醒阻塞读端与缩放泵并在返回前收敛全部内部协程（零泄漏）；
+	//   - ctx == nil 返回 ErrNilContext，句柄已失效返回 ErrHandleExpired，remoteIn/remoteOut 为 nil 返回 ErrInvalidArgument，onResize 可为 nil。
 	//
 	//xops:syncclosure
 	Relay(ctx context.Context, remoteIn io.Writer, remoteOut io.Reader, onResize func(ctx context.Context, size TerminalSize) error) error
