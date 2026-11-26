@@ -140,26 +140,95 @@ Host *
   ProxyCommand ssh -W %h:%p gateway.example
 `)
 	src := newDiffSource(t, cfgPath)
-	// 1. ProxyJump=none 仅消低层 ProxyJump，显露低层 ProxyCommand。
-	assertProxyRevealDiff(t, sshBin, cfgPath, src, "jump-revealed")
-	// 2. ProxyCommand=none 全禁用，低层 ProxyJump 亦不得生效。
+	// 1. 通用跨版本场景：ProxyJump=none 取消低层 ProxyJump（无低层 ProxyCommand），所有 OpenSSH 版本均归零直连。
+	assertProxyJumpNoneDirectDiff(t, sshBin, dir)
+	// 2. XOps RFC §3.6 双槽遮蔽语义（ProxyJump=none 仅消低层跳板并显露低层命令）+ 实测版本对齐的 ssh -G 差分：
+	//    OpenSSH 10.x（readconf.c 将 proxy_command="none" 收敛至非 none 分支）显露低层 ProxyCommand；
+	//    OpenSSH 9.x（含 FreeBSD / Win32-OpenSSH 9.x）在 oProxyJump 解析 "none" 时一并清空 proxy_command。
+	revealsLowerCmd := probeProxyJumpNoneRevealsLowerCmd(t, sshBin, dir)
+	assertProxyRevealDiff(t, sshBin, cfgPath, src, "jump-revealed", revealsLowerCmd)
+	// 3. ProxyCommand=none 全禁用，低层 ProxyJump 亦不得生效（跨所有 OpenSSH 版本一致）。
 	assertProxyFullDisableDiff(t, sshBin, cfgPath, src, "cmd-disabled")
-	// 3. 多跳 ProxyJump 下 %C（%j = bastion2.example）与 ControlPersist=0（永久驻留）对齐 ssh -G。
+	// 4. 多跳 ProxyJump 下 %C（%j = bastion2.example）与 ControlPersist=0（永久驻留）对齐 ssh -G。
 	assertMultiHopPercentCDiff(t, sshBin, cfgPath, src, "multi-hop")
 }
 
-func assertProxyRevealDiff(t *testing.T, sshBin, cfgPath string, src *openssh.ConfigSource, alias string) {
+func isSSHProxyFieldDisabled(val string) bool {
+	return val == "" || strings.EqualFold(val, "none")
+}
+
+// probeProxyJumpNoneRevealsLowerCmd 对本机真实 ssh -G 执行最小 4 行探针，实证检测该 OpenSSH 版本
+// 对 `ProxyJump none` 遇低层 `ProxyCommand` 的行为：
+//   - OpenSSH 10.x 解耦语义：ProxyJump none 不覆盖 proxy_command，返回 true；
+//   - OpenSSH 9.x 传统耦合语义：ProxyJump none 同时将 proxy_command 置为 none，返回 false；
+//   - 若出现第三种意外输出则立即失败关闭。
+func probeProxyJumpNoneRevealsLowerCmd(t *testing.T, sshBin, dir string) bool {
 	t.Helper()
+	probeCfg := filepath.Join(dir, "probe_pj_none.conf")
+	const probeCmd = "ssh -W %h:%p probe.example"
+	writeTestFile(t, probeCfg, "Host probe\n  ProxyJump none\n\nHost *\n  ProxyCommand "+probeCmd+"\n")
+	dump := runSSHGDump(t, sshBin, probeCfg, "probe")
+	pj, pc := dump.single["proxyjump"], dump.single["proxycommand"]
+	if !isSSHProxyFieldDisabled(pj) {
+		t.Fatalf("ssh -G 探针中 ProxyJump=none 未禁用 proxyjump: jump=%q cmd=%q", pj, pc)
+	}
+	if pc == probeCmd {
+		return true
+	}
+	if isSSHProxyFieldDisabled(pc) {
+		return false
+	}
+	t.Fatalf("ssh -G 探针返回意外 proxycommand=%q（期望 %q 或禁用态）", pc, probeCmd)
+	return false
+}
+
+func assertProxyJumpNoneDirectDiff(t *testing.T, sshBin, dir string) {
+	t.Helper()
+	directCfg := filepath.Join(dir, "proxy_direct.conf")
+	writeTestFile(t, directCfg, `
+Host jump-direct
+  HostName 192.0.2.10
+  User ops
+  ProxyJump none
+
+Host *
+  ProxyJump fallback-bastion.example
+`)
+	dump := runSSHGDump(t, sshBin, directCfg, "jump-direct")
+	layer, err := newDiffSource(t, directCfg).ResolveTier4(context.Background(), mustOrigHost(t, "jump-direct"), algebraic.None[netaddr.Endpoint]())
+	if err != nil {
+		t.Fatalf("ResolveTier4(jump-direct) 失败: %v", err)
+	}
+	pd, ok := layer.Proxy().(*option.ProxyDisabled)
+	pj, pc := dump.single["proxyjump"], dump.single["proxycommand"]
+	if !ok || !pd.IsJumpOnly() || !isSSHProxyFieldDisabled(pj) || !isSSHProxyFieldDisabled(pc) {
+		t.Fatalf("ProxyJump=none 取消低层 ProxyJump 失配: got=(%T,jumpOnly=%v) ssh-G=(jump=%q,cmd=%q)", layer.Proxy(), ok && pd.IsJumpOnly(), pj, pc)
+	}
+}
+
+func assertProxyRevealDiff(t *testing.T, sshBin, cfgPath string, src *openssh.ConfigSource, alias string, sshGRevealsCmd bool) {
+	t.Helper()
+	const wantCmd = "ssh -W %h:%p gateway.example"
 	dump := runSSHGDump(t, sshBin, cfgPath, alias)
 	layer, err := src.ResolveTier4(context.Background(), mustOrigHost(t, alias), algebraic.None[netaddr.Endpoint]())
 	if err != nil {
 		t.Fatalf("ResolveTier4(%s) 失败: %v", alias, err)
 	}
+	// 无条件校验 XOps RFC §3.6 锁定的双槽幺半群语义：ProxyJump=none 仅消低层跳板，必显露低层 ProxyCommand。
 	pc, ok := layer.Proxy().(*option.ProxyCommandSpec)
-	// 当 ProxyJump=none 取消低层 ProxyJump 并显露低层 ProxyCommand 时，ssh -G 输出 proxycommand 且省略或输出 proxyjump=none。
-	pj := dump.single["proxyjump"]
-	if !ok || pc.Command().String() != dump.single["proxycommand"] || (pj != "" && !strings.EqualFold(pj, "none")) {
-		t.Fatalf("ProxyJump=none 显露低层 ProxyCommand 失配: got=(%T,%v) ssh-G=(jump=%q,cmd=%q)", layer.Proxy(), layer.Proxy(), pj, dump.single["proxycommand"])
+	if !ok || pc.Command().String() != wantCmd {
+		t.Fatalf("XOps RFC §3.6 ProxyJump=none 显露低层 ProxyCommand 违例: got=(%T,%v) want=%q", layer.Proxy(), layer.Proxy(), wantCmd)
+	}
+	// 与实测版本对应的 ssh -G 输出严格比对：两代版本均必须取消低层 ProxyJump，并按探针结果精确校验 proxycommand。
+	pj, sshCmd := dump.single["proxyjump"], dump.single["proxycommand"]
+	if !isSSHProxyFieldDisabled(pj) {
+		t.Fatalf("ssh -G 未取消低层 ProxyJump: jump=%q cmd=%q", pj, sshCmd)
+	}
+	if sshGRevealsCmd && sshCmd != wantCmd {
+		t.Fatalf("OpenSSH 解耦模式下 ProxyJump=none 应显露低层 ProxyCommand: got=%q want=%q", sshCmd, wantCmd)
+	}
+	if !sshGRevealsCmd && !isSSHProxyFieldDisabled(sshCmd) {
+		t.Fatalf("OpenSSH 9.x 耦合模式下 ProxyJump=none 应同时禁用 ProxyCommand: got=%q", sshCmd)
 	}
 }
 
@@ -173,9 +242,7 @@ func assertProxyFullDisableDiff(t *testing.T, sshBin, cfgPath string, src *opens
 	pd, ok := layer.Proxy().(*option.ProxyDisabled)
 	// 当 ProxyCommand=none 全禁用时，ssh -G 对 proxycommand / proxyjump 均省略输出或输出 none。
 	pj, pc := dump.single["proxyjump"], dump.single["proxycommand"]
-	pjOff := pj == "" || strings.EqualFold(pj, "none")
-	pcOff := pc == "" || strings.EqualFold(pc, "none")
-	if !ok || !pd.IsFullDisable() || !pjOff || !pcOff {
+	if !ok || !pd.IsFullDisable() || !isSSHProxyFieldDisabled(pj) || !isSSHProxyFieldDisabled(pc) {
 		t.Fatalf("ProxyCommand=none 全禁用失配: got=(%T) ssh-G=(jump=%q,cmd=%q)", layer.Proxy(), pj, pc)
 	}
 }
