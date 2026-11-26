@@ -6,12 +6,14 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.uber.org/goleak"
 
+	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
@@ -971,4 +973,266 @@ func assertNoTransferDiagnostics(t *testing.T, sub *events.SystemSubscription) {
 			t.Fatalf("Gate 拒绝前不应向 SystemBus 发射 transfer 诊断事件: code=%s msg=%s", d.Code(), d.Message())
 		}
 	}
+}
+
+func TestStreamTransfer_TwoStepApprovalWithoutTransferIDAndConsistentAuditParams(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{
+		profile:          gate.PolicyProfileStrictAgent,
+		approvalThresh:   security.RiskDangerous,
+		fallback:         gate.NoElicitFallbackChallenge,
+		omitOperatorRead: true,
+	})
+	defer rig.close()
+	ctx := context.Background()
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/etc"), 0o755), "MkdirAll /etc")
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp"), 0o755), "MkdirAll /tmp")
+
+	// 1. TransferID=None 指向受保护 /etc/approved.bin -> 首轮发 Challenge，次轮携带 ApprovalSubmission 复验精确匹配通过
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/etc/approved.bin"))
+	requireNoErr(t, err, "NewUploadDest")
+	baseReq := transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest, TotalBytes: 4}
+	_, err = rig.svc.StartTransfer(ctx, baseReq)
+	var chErr *gate.ApprovalChallengeError
+	if !errors.As(err, &chErr) {
+		t.Fatalf("首轮 StartTransfer(TransferID=None) 应返回 ApprovalChallengeError，实际=%v", err)
+	}
+	resp, err := ports.NewApprovalDecisionResponse(security.VerdictAllow, chErr.EnvelopeDigest(), "approved")
+	requireNoErr(t, err, "NewApprovalDecisionResponse")
+	sub, err := gate.NewApprovalSubmission(gate.ApprovalSubmissionSpec{Envelope: algebraic.Some(chErr.Envelope()), Response: resp})
+	requireNoErr(t, err, "NewApprovalSubmission")
+
+	approvedReq := baseReq
+	approvedReq.Approval = algebraic.Some(sub)
+	info, err := rig.svc.StartTransfer(ctx, approvedReq)
+	requireNoErr(t, err, "携带 ApprovalSubmission 重试 StartTransfer(TransferID=None) 必须成功")
+	if !info.TransferID.IsValid() || !info.Handle.IsValid() {
+		t.Fatalf("受权后句柄与 TransferID 必须有效: %+v", info)
+	}
+	beforeWrite := len(rig.auditClust.Entries())
+	_, err = rig.svc.WriteTransferChunk(ctx, transfer.WriteTransferChunkRequest{CallBase: rig.callBase(nil), Handle: info.Handle, Offset: 0, Data: []byte("okay")})
+	requireNoErr(t, err, "WriteTransferChunk after 2-step approval")
+	_, err = rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(nil), Handle: info.Handle})
+	requireNoErr(t, err, "CommitTransfer after 2-step approval")
+	if string(mustReadRemote(t, rig.remoteFS, "/etc/approved.bin")) != "okay" {
+		t.Fatalf("两步审批后远端文件内容不符")
+	}
+	assertAuditParamsContainTransferMeta(t, rig.auditClust.Entries()[beforeWrite:], info.TransferID.String(), "upload", dest.String())
+
+	// 2. StrictAgent 下 ResumeTransfer 经 Round-2 发现持久化目标并触发两步审批，审批通过登记句柄后，
+	// 后续句柄操作审计参数同样携带一致的 transfer_id / direction / target。
+	resDest, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/res_params.bin"))
+	requireNoErr(t, err, "resDest")
+	resID := seedHealthyGen(t, rig, resDest, 1, 8, false, false)
+	resReq := transfer.ResumeTransferRequest{CallBase: rig.callBase(nil), TransferID: resID}
+	_, err = rig.svc.ResumeTransfer(ctx, resReq)
+	var resChErr *gate.ApprovalChallengeError
+	if !errors.As(err, &resChErr) {
+		t.Fatalf("StrictAgent 首轮 ResumeTransfer 应触发 Round-2 ApprovalChallengeError，实际=%v", err)
+	}
+	resResp, err := ports.NewApprovalDecisionResponse(security.VerdictAllow, resChErr.EnvelopeDigest(), "approved-resume")
+	requireNoErr(t, err, "NewApprovalDecisionResponse resume")
+	resSub, err := gate.NewApprovalSubmission(gate.ApprovalSubmissionSpec{Envelope: algebraic.Some(resChErr.Envelope()), Response: resResp})
+	requireNoErr(t, err, "NewApprovalSubmission resume")
+	resReq.Approval = algebraic.Some(resSub)
+	resInfo, err := rig.svc.ResumeTransfer(ctx, resReq)
+	requireNoErr(t, err, "携带 ApprovalSubmission 重试 ResumeTransfer 必须成功")
+	beforeResOp := len(rig.auditClust.Entries())
+	requireNoErr(t, rig.svc.AbortTransfer(ctx, transfer.AbortTransferRequest{CallBase: rig.callBase(nil), Handle: resInfo.Handle, Reason: "audit-check"}), "AbortTransfer")
+	assertAuditParamsContainTransferMeta(t, rig.auditClust.Entries()[beforeResOp:], resID.String(), "upload", resDest.String())
+}
+
+func assertAuditParamsContainTransferMeta(t *testing.T, entries []ports.AuditEntry, wantID, wantDir, wantTarget string) {
+	t.Helper()
+	for _, e := range entries {
+		p := e.Binding().Parameters()
+		if p["transfer_id"] == wantID && p["direction"] == wantDir && p["target"] == wantTarget {
+			return
+		}
+	}
+	t.Fatalf("审计记录缺少完整传输上下文: transfer_id=%s direction=%s target=%s", wantID, wantDir, wantTarget)
+}
+
+func TestStreamDownload_LstatSymlinkRejectAndCrossRequestDriftAndAnchorPinning(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	assertStreamDownloadSymlinkRejectAndDrift(t)
+	assertStreamDownloadAnchorMismatchPullAndCommit(t)
+}
+
+func assertStreamDownloadSymlinkRejectAndDrift(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+
+	// 1. DirectOperator 下 StartTransfer(Download) 经 Lstat 拒绝软链源（不跟随软链读取 /etc/shadow）
+	opRig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer opRig.close()
+	mustWriteRemote(t, opRig.remoteFS, "/etc/shadow", []byte("root:secret"))
+	requireNoErr(t, opRig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp"), 0o755), "MkdirAll /tmp")
+	requireNoErr(t, opRig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/sym_src"), "/etc/shadow"), "PutSymlink sym_src")
+	dlDest, err := fsm.NewDownloadDest(mustLocalDest(t, "stream/sym.bin"))
+	requireNoErr(t, err, "NewDownloadDest")
+	_, err = opRig.svc.StartTransfer(ctx, transfer.StartTransferRequest{
+		CallBase: opRig.callBase(nil), Dest: dlDest,
+		TransferSessionOptions: transfer.TransferSessionOptions{
+			LocalRoot: algebraic.Some(opRig.localRoot), RemoteSource: algebraic.Some(mustRemotePath(t, "/tmp/sym_src")),
+		},
+	})
+	requireErrIs(t, err, ports.ErrSymlinkRejected, "StartTransfer(Download) 必须经 Lstat 拒绝软链源")
+
+	// 2. StrictAgent 下 StartTransfer 后将远端文件替换为指向 /etc/shadow 的软链 -> PullTransferChunk 返回 ErrScopeEscalated 且 0 读分片
+	strictRig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous, omitOperatorRead: true})
+	defer strictRig.close()
+	srcPath := mustRemotePath(t, "/tmp/pub/a.bin")
+	mustWriteRemote(t, strictRig.remoteFS, srcPath.String(), []byte("12345678"))
+	mustWriteRemote(t, strictRig.remoteFS, "/etc/shadow", []byte("root:secret"))
+	dlDestA, err := fsm.NewDownloadDest(mustLocalDest(t, "stream/a.bin"))
+	requireNoErr(t, err, "dlDestA")
+	info, err := strictRig.svc.StartTransfer(ctx, transfer.StartTransferRequest{
+		CallBase: strictRig.callBase(nil), Dest: dlDestA,
+		TransferSessionOptions: transfer.TransferSessionOptions{
+			LocalRoot: algebraic.Some(strictRig.localRoot), RemoteSource: algebraic.Some(srcPath),
+		},
+	})
+	requireNoErr(t, err, "StartTransfer download a.bin")
+	requireNoErr(t, strictRig.remoteFS.Remove(ctx, srcPath), "remove a.bin")
+	requireNoErr(t, strictRig.remoteFS.PutSymlink(srcPath, "/etc/shadow"), "swap a.bin->/etc/shadow")
+	var readCalls atomic.Int64
+	strictRig.dialer.mu.Lock()
+	strictRig.dialer.onReadChunk = func(context.Context, pathalg.RemotePath, int64, int64) error { readCalls.Add(1); return nil }
+	strictRig.dialer.mu.Unlock()
+	_, err = strictRig.svc.PullTransferChunk(ctx, transfer.PullTransferChunkRequest{CallBase: strictRig.callBase(nil), Handle: info.Handle, MaxChunkBytes: 4})
+	strictRig.dialer.mu.Lock()
+	strictRig.dialer.onReadChunk = nil
+	strictRig.dialer.mu.Unlock()
+	requireErrIs(t, err, gate.ErrScopeEscalated, "PullTransferChunk 跨请求软链漂移必须返回 ErrScopeEscalated")
+	if readCalls.Load() != 0 {
+		t.Fatalf("漂移拦截后不得读取远端分片，实际=%d", readCalls.Load())
+	}
+	requireNoErr(t, strictRig.svc.AbortTransfer(ctx, transfer.AbortTransferRequest{CallBase: strictRig.callBase(nil), Handle: info.Handle, Reason: "cleanup"}), "abort drift")
+}
+
+func assertStreamDownloadAnchorMismatchPullAndCommit(t *testing.T) {
+	t.Helper()
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	// 1. 拉取首片后远端源文件被同大小覆写（新 inode/anchor）-> 下次 PullTransferChunk 必须返回 ErrRemoteAnchorMismatch
+	srcB := mustRemotePath(t, "/tmp/pub/b.bin")
+	mustWriteRemote(t, rig.remoteFS, srcB.String(), []byte("12345678"))
+	dlB, err := fsm.NewDownloadDest(mustLocalDest(t, "stream/b.bin"))
+	requireNoErr(t, err, "dlB")
+	infoB, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{
+		CallBase: rig.callBase(nil), Dest: dlB,
+		TransferSessionOptions: transfer.TransferSessionOptions{LocalRoot: algebraic.Some(rig.localRoot), RemoteSource: algebraic.Some(srcB)},
+	})
+	requireNoErr(t, err, "start b.bin")
+	_, err = rig.svc.PullTransferChunk(ctx, transfer.PullTransferChunkRequest{CallBase: rig.callBase(nil), Handle: infoB.Handle, MaxChunkBytes: 4})
+	requireNoErr(t, err, "pull b.bin first half")
+	mustWriteRemote(t, rig.remoteFS, srcB.String(), []byte("ABCD5678"))
+	_, err = rig.svc.PullTransferChunk(ctx, transfer.PullTransferChunkRequest{CallBase: rig.callBase(nil), Handle: infoB.Handle, MaxChunkBytes: 4})
+	requireErrIs(t, err, ports.ErrRemoteAnchorMismatch, "拉片间隙远端换源必须触发 ErrRemoteAnchorMismatch")
+	requireNoErr(t, rig.svc.AbortTransfer(ctx, transfer.AbortTransferRequest{CallBase: rig.callBase(nil), Handle: infoB.Handle, Reason: "anchor-drift"}), "abort b.bin")
+
+	// 2. 拉完全部分片进入 Verifying 后远端换源 -> CommitTransfer 必须在 root.Rename 前阻断并按 DurabilityNotApplied 转 Aborted
+	srcC := mustRemotePath(t, "/tmp/pub/c.bin")
+	mustWriteRemote(t, rig.remoteFS, srcC.String(), []byte("12345678"))
+	dlC, err := fsm.NewDownloadDest(mustLocalDest(t, "stream/c.bin"))
+	requireNoErr(t, err, "dlC")
+	infoC, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{
+		CallBase: rig.callBase(nil), Dest: dlC,
+		TransferSessionOptions: transfer.TransferSessionOptions{LocalRoot: algebraic.Some(rig.localRoot), RemoteSource: algebraic.Some(srcC)},
+	})
+	requireNoErr(t, err, "start c.bin")
+	pRes, err := rig.svc.PullTransferChunk(ctx, transfer.PullTransferChunkRequest{CallBase: rig.callBase(nil), Handle: infoC.Handle, MaxChunkBytes: 8})
+	requireNoErr(t, err, "pull c.bin all")
+	if pRes.StateKind != fsm.TransferKindVerifying {
+		t.Fatalf("应进入 Verifying，实际=%s", pRes.StateKind)
+	}
+	mustWriteRemote(t, rig.remoteFS, srcC.String(), []byte("ZZZZZZZZ"))
+	comC, err := rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(nil), Handle: infoC.Handle})
+	requireErrIs(t, err, ports.ErrRemoteAnchorMismatch, "CommitTransfer 前远端换源必须触发 ErrRemoteAnchorMismatch")
+	if comC.State == nil || comC.State.Kind() != fsm.TransferKindAborted || rig.pool.Stats().ActiveHandles != 0 {
+		t.Fatalf("CommitTransfer 锚点失配必须转 Aborted 并释放句柄: %+v active=%d", comC, rig.pool.Stats().ActiveHandles)
+	}
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		_, lErr := root.Lstat(mustLocalDest(t, "stream/c.bin"))
+		requireErrIs(t, lErr, ports.ErrNotFound, "提交阻断后本地目标文件不得存在")
+		return nil
+	}), "verify no local c.bin")
+}
+
+func TestResumeTransfer_CanonicalizerStoreErrorAndConcurrentSlotMutex(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	assertResumeCanonicalizerStoreError(t)
+	assertConcurrentResumeSlotMutex(t)
+}
+
+func assertResumeCanonicalizerStoreError(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	strictRig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous, omitOperatorRead: true})
+	defer strictRig.close()
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/ioerr.bin"))
+	requireNoErr(t, err, "dest")
+	tidErr := seedHealthyGen(t, strictRig, dest, 1, 8, false, false)
+	ioErr := errors.New("journal backend io timeout")
+	strictRig.journals.mu.Lock()
+	strictRig.journals.loadGenErr = ioErr
+	strictRig.journals.mu.Unlock()
+	_, err = strictRig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: strictRig.callBase(nil), TransferID: tidErr})
+	strictRig.journals.mu.Lock()
+	strictRig.journals.loadGenErr = nil
+	strictRig.journals.mu.Unlock()
+	requireErrIs(t, err, ioErr, "Round-2 LoadGenerations 非 ErrNotFound 存储故障必须 Fail-Closed")
+}
+
+func assertConcurrentResumeSlotMutex(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/race.bin"))
+	requireNoErr(t, err, "dest")
+	tidRace := seedHealthyGen(t, rig, dest, 1, 8, false, false)
+
+	var ready atomic.Int32
+	goCh := make(chan struct{})
+	var resMu sync.Mutex
+	var winners []transfer.TransferHandleInfo
+	var dupErrs int
+	runOne := func(c context.Context) error {
+		if ready.Add(1) == 2 {
+			close(goCh)
+		}
+		select {
+		case <-goCh:
+		case <-c.Done():
+			return c.Err()
+		}
+		info, rErr := rig.svc.ResumeTransfer(c, transfer.ResumeTransferRequest{CallBase: rig.callBase(nil), TransferID: tidRace, StartNextGen: false})
+		resMu.Lock()
+		defer resMu.Unlock()
+		if rErr == nil {
+			winners = append(winners, info)
+			return nil
+		}
+		if errors.Is(rErr, ports.ErrAlreadyExists) {
+			dupErrs++
+			return nil
+		}
+		return rErr
+	}
+	requireNoErr(t, conc.RunWait(ctx, func(_ context.Context, n *conc.Nursery) error {
+		for range 2 {
+			if gErr := n.Go(runOne); gErr != nil {
+				return gErr
+			}
+		}
+		return nil
+	}), "concurrent ResumeTransfer race")
+	if len(winners) != 1 || dupErrs != 1 || rig.pool.Stats().ActiveHandles != 1 {
+		t.Fatalf("并发同代 ResumeTransfer 互斥异常: winners=%d dupErrs=%d active=%d", len(winners), dupErrs, rig.pool.Stats().ActiveHandles)
+	}
+	requireNoErr(t, rig.svc.AbortTransfer(ctx, transfer.AbortTransferRequest{CallBase: rig.callBase(nil), Handle: winners[0].Handle, Reason: "cleanup"}), "cleanup winner")
 }

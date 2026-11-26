@@ -588,3 +588,94 @@ func assertLocalSymlinkOverwriteSemantics(t *testing.T, rig *transferTestRig) {
 		t.Fatalf("软链禁止覆写已有目录: got %v, want ErrRemoteIsDir", err)
 	}
 }
+
+func TestSCPDownload_MidTransferSourceSwapAndSymlinkDriftBeforeRename(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	assertSCPDownloadAnchorSwapRejected(t)
+	assertSCPDownloadSymlinkDriftRejected(t)
+}
+
+func assertSCPDownloadAnchorSwapRejected(t *testing.T) {
+	t.Helper()
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	const chunkSz = 4096
+	orig := makePatternPayload(2 * chunkSz)
+	swapped := bytes.Repeat([]byte{0xde, 0xad, 0xbe, 0xef}, 2*chunkSz/4)
+	srcPath := mustRemotePath(t, "/pub/swap.bin")
+	mustWriteRemote(t, rig.remoteFS, srcPath.String(), orig)
+
+	var injected atomic.Bool
+	rig.dialer.mu.Lock()
+	rig.dialer.onReadChunk = func(_ context.Context, p pathalg.RemotePath, offset, _ int64) error {
+		if p.Equal(srcPath) && offset == chunkSz && injected.CompareAndSwap(false, true) {
+			mustWriteRemote(t, rig.remoteFS, srcPath.String(), swapped)
+		}
+		return nil
+	}
+	rig.dialer.mu.Unlock()
+
+	_, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+		CallBase: rig.callBase(nil), RemoteSource: srcPath,
+		LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, "dl/swap.bin"),
+		SymlinkPolicy: pathalg.SymlinkReject, ChunkSize: chunkSz, Concurrency: 1, Resume: true,
+	})
+	requireErrIs(t, err, ports.ErrRemoteAnchorMismatch, "SCPDownload 传输窗口内远端换源必须在 Rename 前拒绝")
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		_, lErr := root.Lstat(mustLocalDest(t, "dl/swap.bin"))
+		requireErrIs(t, lErr, ports.ErrNotFound, "失配后本地目标文件不得提交落盘")
+		return nil
+	}), "check no local swap.bin")
+
+	rig.dialer.mu.Lock()
+	rig.dialer.onReadChunk = nil
+	rig.dialer.mu.Unlock()
+	res, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+		CallBase: rig.callBase(nil), RemoteSource: srcPath,
+		LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, "dl/swap.bin"),
+		SymlinkPolicy: pathalg.SymlinkReject, ChunkSize: chunkSz, Concurrency: 2, Resume: true,
+	})
+	requireNoErr(t, err, "清理暂存后重新下载应成功")
+	if res.ResumedBytes != 0 || !bytes.Equal(mustReadLocal(t, rig.scopedFS, rig.localRoot, "dl/swap.bin"), swapped) {
+		t.Fatalf("重下不得复用已清理的混合暂存: res=%+v", res)
+	}
+}
+
+func assertSCPDownloadSymlinkDriftRejected(t *testing.T) {
+	t.Helper()
+	rig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous, omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	const chunkSz = 4096
+	srcPath := mustRemotePath(t, "/tmp/pub/drift.bin")
+	mustWriteRemote(t, rig.remoteFS, srcPath.String(), makePatternPayload(2*chunkSz))
+	mustWriteRemote(t, rig.remoteFS, "/etc/shadow", bytes.Repeat([]byte("S"), 2*chunkSz))
+
+	var drifted atomic.Bool
+	rig.dialer.mu.Lock()
+	rig.dialer.onReadChunk = func(hCtx context.Context, p pathalg.RemotePath, offset, _ int64) error {
+		if p.Equal(srcPath) && offset == chunkSz && drifted.CompareAndSwap(false, true) {
+			if rErr := rig.remoteFS.Remove(hCtx, srcPath); rErr != nil {
+				return rErr
+			}
+			return rig.remoteFS.PutSymlink(srcPath, "/etc/shadow")
+		}
+		return nil
+	}
+	rig.dialer.mu.Unlock()
+
+	_, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+		CallBase: rig.callBase(nil), RemoteSource: srcPath,
+		LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, "dl/drift.bin"),
+		SymlinkPolicy: pathalg.SymlinkReject, ChunkSize: chunkSz, Concurrency: 1,
+	})
+	requireErrIs(t, err, gate.ErrScopeEscalated, "StrictAgent 下 SCPDownload 传输中软链漂移至 /etc/shadow 必须返回 ErrScopeEscalated")
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		_, lErr := root.Lstat(mustLocalDest(t, "dl/drift.bin"))
+		requireErrIs(t, lErr, ports.ErrNotFound, "漂移拦截后本地目标文件不得落盘")
+		return nil
+	}), "check no local drift.bin")
+}

@@ -38,6 +38,8 @@ type managedTransferSession struct {
 	remoteStagePath algebraic.Option[pathalg.RemotePath]
 	localStageDest  algebraic.Option[pathalg.LocalRootedDest]
 	renameSpec      ports.RemoteRenameSpec
+	sourceAnchor    ports.RemoteFileAnchor
+	sourceModTime   time.Time
 	effectivePerm   fs.FileMode
 	hasher          hash.Hash // 连续流式加速哈希；崩溃恢复后置 nil 强制全量回读校验
 	startedAt       time.Time
@@ -78,40 +80,39 @@ func (s *Service) buildManagedTransferSession(probeCtx, revokeCtx context.Contex
 			_ = rfs.Close()
 		}
 	}()
-	totalBytes, modTime, perm, err := inspectStreamDownloadSource(probeCtx, rfs, req, defaultPerm)
+	totalBytes, modTime, perm, srcAnchor, srcModTime, err := inspectStreamDownloadSource(probeCtx, rfs, req, defaultPerm)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	meta, st, effs, evs, err := initOrResumeTransferFSM(req, totalBytes, resumedState, freshStart)
-	var remoteStage algebraic.Option[pathalg.RemotePath]
-	var localStage algebraic.Option[pathalg.LocalRootedDest]
-	if err == nil {
-		remoteStage, localStage, err = computeStreamStagePaths(meta)
+	if err != nil {
+		return nil, nil, nil, err
 	}
+	remoteStage, localStage, err := computeStreamStagePaths(meta)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	opts := req.TransferSessionOptions
 	opts.ModTime = modTime
-	return &managedTransferSession{mu: conc.NewCtxMutex(), conn: conn, rfs: rfs, revokeCtx: revokeCtx, state: st, meta: meta, opts: opts, remoteStagePath: remoteStage, localStageDest: localStage, renameSpec: renameSpec, effectivePerm: perm, hasher: pickIf(freshStart, sha256.New(), nil), startedAt: startedAt, valid: true}, effs, evs, nil
+	return &managedTransferSession{mu: conc.NewCtxMutex(), conn: conn, rfs: rfs, revokeCtx: revokeCtx, state: st, meta: meta, opts: opts, remoteStagePath: remoteStage, localStageDest: localStage, renameSpec: renameSpec, sourceAnchor: srcAnchor, sourceModTime: srcModTime, effectivePerm: perm, hasher: pickIf(freshStart, sha256.New(), nil), startedAt: startedAt, valid: true}, effs, evs, nil
 }
-func inspectStreamDownloadSource(ctx context.Context, rfs ports.RemoteFSPort, req StartTransferRequest, defaultPerm fs.FileMode) (uint64, algebraic.Option[time.Time], fs.FileMode, error) {
+func inspectStreamDownloadSource(ctx context.Context, rfs ports.RemoteFSPort, req StartTransferRequest, defaultPerm fs.FileMode) (uint64, algebraic.Option[time.Time], fs.FileMode, ports.RemoteFileAnchor, time.Time, error) {
 	if req.Dest.Direction() != fsm.TransferDirectionDownload {
-		return req.TotalBytes, req.ModTime, defaultPerm, nil
+		return req.TotalBytes, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, nil
 	}
 	rs, ok := req.RemoteSource.Get()
 	if !ok {
-		return 0, req.ModTime, defaultPerm, fmt.Errorf("%w: 下载缺少 RemoteSource", ErrInvalidRequest)
+		return 0, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, fmt.Errorf("%w: 下载缺少 RemoteSource", ErrInvalidRequest)
 	}
-	st, err := rfs.Stat(ctx, rs)
+	st, err := rfs.Lstat(ctx, rs)
 	if err != nil || !st.IsRegular() {
-		return 0, req.ModTime, defaultPerm, pickIf[error](err != nil, err, pickIf(st.IsDir(), ports.ErrRemoteIsDir, ports.ErrNotRegularFile))
+		return 0, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, pickIf[error](err != nil, err, pickIf(st.IsSymlink(), ports.ErrSymlinkRejected, pickIf(st.IsDir(), ports.ErrRemoteIsDir, ports.ErrNotRegularFile)))
 	}
 	if size := uint64(st.Size()); size > fsm.MaxTransferBytes || (req.TotalBytes > 0 && req.TotalBytes != size) {
-		return 0, req.ModTime, defaultPerm, pickIf[error](size > fsm.MaxTransferBytes, fmt.Errorf("%w: 远端大小 %d 超限", fsm.ErrTransferSizeExceeded, size), fmt.Errorf("%w: 声明大小与远端不符", ErrInvalidRequest))
+		return 0, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, pickIf[error](size > fsm.MaxTransferBytes, fmt.Errorf("%w: 远端大小 %d 超限", fsm.ErrTransferSizeExceeded, size), fmt.Errorf("%w: 声明大小与远端不符", ErrInvalidRequest))
 	}
 	mt := pickIf(req.PreserveTimes && req.ModTime.IsNone() && isValidRFC3339Time(st.ModTime()), algebraic.Some(st.ModTime()), req.ModTime)
-	return uint64(st.Size()), mt, pickIf(req.Perm.IsNone() && st.Perm() != 0, sanitizeLocalDownloadPerm(st.Perm()), defaultPerm), nil
+	return uint64(st.Size()), mt, pickIf(req.Perm.IsNone() && st.Perm() != 0, sanitizeLocalDownloadPerm(st.Perm()), defaultPerm), st.Anchor(), st.ModTime(), nil
 }
 func initOrResumeTransferFSM(req StartTransferRequest, totalBytes uint64, resumedState fsm.TransferState, freshStart bool) (fsm.TransferMeta, fsm.TransferState, []fsm.TransferEffect, []fsm.TransferEvent, error) {
 	if !freshStart {
@@ -132,20 +133,15 @@ func initOrResumeTransferFSM(req StartTransferRequest, totalBytes uint64, resume
 func computeStreamStagePaths(meta fsm.TransferMeta) (rpOpt algebraic.Option[pathalg.RemotePath], lpOpt algebraic.Option[pathalg.LocalRootedDest], err error) {
 	sum := sha256.Sum256([]byte("xops.stream.transfer.v2\x00" + meta.Direction().String() + ":" + meta.TransferID().String() + ":g" + strconv.FormatUint(meta.Generation(), 10)))
 	token := fmt.Sprintf("%x", sum[:12])
-	if meta.Direction() == fsm.TransferDirectionUpload {
-		dst, ok := meta.Dest().Remote().Get()
-		if !ok {
-			return rpOpt, lpOpt, fmt.Errorf("%w: 缺少 RemotePath", ErrInvalidRequest)
-		}
-		rp, rErr := makeRemoteStagePath(dst, token)
+	if dst, ok := meta.Dest().Remote().Get(); meta.Direction() == fsm.TransferDirectionUpload && ok {
+		rp, rErr := joinRemoteBase(dst.Dir(), ".xops-stage-"+token+".part")
 		return algebraic.Some(rp), lpOpt, rErr
 	}
-	dst, ok := meta.Dest().Local().Get()
-	if !ok {
-		return rpOpt, lpOpt, fmt.Errorf("%w: 缺少 LocalRootedDest", ErrInvalidRequest)
+	if dst, ok := meta.Dest().Local().Get(); meta.Direction() == fsm.TransferDirectionDownload && ok {
+		lp, lErr := makeLocalStageDest(dst, token)
+		return rpOpt, algebraic.Some(lp), lErr
 	}
-	lp, lErr := makeLocalStageDest(dst, token)
-	return rpOpt, algebraic.Some(lp), lErr
+	return rpOpt, lpOpt, fmt.Errorf("%w: 缺少传输目标路径", ErrInvalidRequest)
 }
 
 // verifyStagedDigest 计算完整暂存文件 SHA-256（下载重读本机 ScopedRootFS，上传恢复后经 SFTP ReadChunk 回读）。
@@ -201,16 +197,20 @@ func (s *Service) applyPostCommitModTime(sess *managedTransferSession, fn func(t
 }
 func (s *Service) commitByDirection(ctx context.Context, sess *managedTransferSession, handleBinding security.OperationBinding) (fsm.DurabilityStatus, string, error) {
 	if sess.meta.Direction() == fsm.TransferDirectionDownload {
-		return s.commitLocalScopedTransfer(sess)
+		return s.commitLocalScopedTransfer(ctx, sess, handleBinding)
 	}
 	return s.commitRemoteSFTPTransfer(ctx, sess, handleBinding)
 }
-func (s *Service) commitLocalScopedTransfer(sess *managedTransferSession) (fsm.DurabilityStatus, string, error) {
+func (s *Service) commitLocalScopedTransfer(ctx context.Context, sess *managedTransferSession, handleBinding security.OperationBinding) (fsm.DurabilityStatus, string, error) {
 	lr, okR := sess.opts.LocalRoot.Get()
+	rs, okRS := sess.opts.RemoteSource.Get()
 	stageDest, okS := sess.localStageDest.Get()
 	finalDest, okF := sess.meta.Dest().Local().Get()
-	if s.scopedFS == nil || !okR || !okS || !okF {
+	if s.scopedFS == nil || !okR || !okRS || !okS || !okF {
 		return fsm.DurabilityNotApplied, "invalid_local_commit", pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, ErrInvalidRequest)
+	}
+	if err := verifyRemoteDownloadSource(ctx, s.enforceStrictPaths(), sess.rfs, handleBinding, rs, sess.sourceAnchor, int64(sess.meta.TotalBytes()), sess.sourceModTime); err != nil {
+		return fsm.DurabilityNotApplied, err.Error(), err
 	}
 	preRejected := false
 	if err := s.scopedFS.WithRoot(lr, func(root ports.RootHandle) error {

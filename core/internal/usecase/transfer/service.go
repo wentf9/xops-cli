@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash"
@@ -99,14 +98,10 @@ func (s *Service) checkReadyCtx(ctx context.Context) error {
 	return ctx.Err()
 }
 func (s *Service) validateBaseCall(ctx context.Context, base CallBase) (plan.HopSpec, error) {
-	if err := s.checkReadyCtx(ctx); err != nil {
-		return zeroVal[plan.HopSpec](), err
-	}
 	hop, ok := base.Plan.Target()
-	if r, hasR := base.Risk.Get(); !base.Plan.IsValid() || !ok || !hop.IsValid() || (hasR && !r.IsValid()) {
-		return zeroVal[plan.HopSpec](), fmt.Errorf("%w: SealedConnectionPlan 或 RiskLevel 无效", ErrInvalidRequest)
-	}
-	return hop, nil
+	r, hasR := base.Risk.Get()
+	err := firstErr(s.checkReadyCtx(ctx), pickIf[error](!base.Plan.IsValid() || !ok || !hop.IsValid() || (hasR && !r.IsValid()), fmt.Errorf("%w: SealedConnectionPlan 或 RiskLevel 无效", ErrInvalidRequest), nil))
+	return pickIf(err == nil, hop, zeroVal[plan.HopSpec]()), err
 }
 func (s *Service) validateRemotePathOp(ctx context.Context, base CallBase, p pathalg.RemotePath) (plan.HopSpec, error) {
 	hop, err := s.validateBaseCall(ctx, base)
@@ -117,6 +112,9 @@ func (s *Service) resolveChunkAndConcurrency(chunkSize int64, concurrency int) (
 	return cs, conc, pickIf[error](cs < minChunkSize || cs > int64(fsm.MaxTransferChunkBytes) || conc < 1 || conc > maxConcurrency, fmt.Errorf("%w: ChunkSize/Concurrency 越界", ErrInvalidRequest), nil)
 }
 func (s *Service) resolveReadLimits(maxBytes int64) (ports.ReadLimits, error) {
+	if s == nil || !s.valid {
+		return zeroVal[ports.ReadLimits](), ErrServiceNotInitialized
+	}
 	if lim := pickIf(maxBytes == 0, s.defaultMaxReadBytes, maxBytes); lim > 0 && lim <= maxAtomicReadBytes {
 		return ports.NewReadLimits(lim)
 	}
@@ -206,13 +204,10 @@ func runAuthorizedRemoteFS[C security.Capability, T any](ctx context.Context, s 
 // runRemotePathOp 统一承载单远端路径 SFTP/原子文件操作（预检 + 前置校验 + Round-2 规范化 + 门控 + 租约）。
 //
 //xops:syncclosure
-func runRemotePathOp[C security.Capability, T any](ctx context.Context, s *Service, base CallBase, tool, action string, p pathalg.RemotePath, defaultRisk security.RiskLevel, params map[string]string, preCheck func() error, fn func(context.Context, ports.RemoteFSPort) (T, error)) (T, error) {
+func runRemotePathOp[C security.Capability, T any](ctx context.Context, s *Service, base CallBase, tool, action string, p pathalg.RemotePath, defaultRisk security.RiskLevel, params map[string]string, preErr error, fn func(context.Context, ports.RemoteFSPort) (T, error)) (T, error) {
 	defer closeStreamIfNonNil(base.OperationStream)
 	hop, err := s.validateRemotePathOp(ctx, base, p)
-	if err == nil && preCheck != nil {
-		err = preCheck()
-	}
-	if err != nil {
+	if err = firstErr(err, preErr); err != nil {
 		return zeroVal[T](), err
 	}
 	spec := authOpSpec{base: base, targetHop: hop, tool: tool, action: action, paths: []pathalg.RemotePath{p}, params: params, defaultRisk: defaultRisk, summary: tool + " " + action + " " + p.String(), canonicalize: true}
@@ -251,21 +246,16 @@ func readRemoteChunkExact(ctx context.Context, rfs ports.RemoteFSPort, p pathalg
 	return buf.Bytes(), nil
 }
 func digestFromHash(h hash.Hash) security.Digest {
-	var sum [sha256.Size]byte
-	h.Sum(sum[:0])
-	return security.DigestFromSHA256(sum)
+	return security.DigestFromSHA256([sha256.Size]byte(h.Sum(nil)))
 }
 func (s *Service) stageToken(domainTag, key string, deterministic bool) (string, error) {
 	if deterministic {
 		sum := sha256.Sum256([]byte(domainTag + "\x00" + key))
-		return hex.EncodeToString(sum[:12]), nil
+		return fmt.Sprintf("%x", sum[:12]), nil
 	}
 	buf := make([]byte, 12)
 	_, err := io.ReadFull(s.entropy, buf)
-	return pickIf(err == nil, hex.EncodeToString(buf), ""), pickIf[error](err != nil, fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err), nil)
-}
-func makeRemoteStagePath(finalDest pathalg.RemotePath, token string) (pathalg.RemotePath, error) {
-	return joinRemoteBase(finalDest.Dir(), ".xops-stage-"+token+".part")
+	return pickIf(err == nil, fmt.Sprintf("%x", buf), ""), pickIf[error](err != nil, fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err), nil)
 }
 func makeLocalStageDest(finalDest pathalg.LocalRootedDest, token string) (pathalg.LocalRootedDest, error) {
 	if parent, ok := finalDest.Parent(); ok {
@@ -305,10 +295,12 @@ func (e *transferEmitter) emitBuilt(ctx context.Context, build func(events.Event
 	if e == nil || e.stream == nil || e.stream.IsClosed() {
 		return
 	}
-	if meta, err := events.NewEventMeta(events.EventMetaSpec{TraceID: e.traceID, OperationID: algebraic.Some(e.opID), OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID}); err == nil {
-		if ev, err := build(meta); err == nil && ev != nil {
-			_ = e.stream.Emit(ctx, ev)
-		}
+	meta, e1 := events.NewEventMeta(events.EventMetaSpec{TraceID: e.traceID, OperationID: algebraic.Some(e.opID), OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID})
+	if e1 != nil {
+		return
+	}
+	if ev, e2 := build(meta); e2 == nil && ev != nil {
+		_ = e.stream.Emit(ctx, ev)
 	}
 }
 func (e *transferEmitter) emitProgress(ctx context.Context, transferID security.OperationID, dir fsm.TransferDirection, transferred, total, chunks uint64, startedAt time.Time, stage string) {
@@ -375,9 +367,7 @@ func (s *Service) emitDiagnostic(opID algebraic.Option[security.OperationID], se
 	}
 	tid, e1 := security.ParseTraceID("transfer-service")
 	meta, e2 := events.NewEventMeta(events.EventMetaSpec{TraceID: tid, OperationID: opID, OccurredAt: s.clock.Now().UTC().Round(0)})
-	if e1 == nil && e2 == nil {
-		if ev, err := events.NewDiagnosticEvent(events.DiagnosticSpec{Meta: meta, Scope: events.DiagnosticScopeTransfer, Severity: sev, Code: code, Message: msg, Attrs: attrs}); err == nil {
-			_ = s.bus.Publish(ev)
-		}
+	if ev, e3 := events.NewDiagnosticEvent(events.DiagnosticSpec{Meta: meta, Scope: events.DiagnosticScopeTransfer, Severity: sev, Code: code, Message: msg, Attrs: attrs}); firstErr(e1, e2, e3) == nil {
+		_ = s.bus.Publish(ev)
 	}
 }

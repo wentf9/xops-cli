@@ -52,12 +52,11 @@ func (s *Service) SCPUpload(ctx context.Context, req SCPUploadRequest) (SCPUploa
 		if err == nil {
 			err = verifyRemotePathAuthorized(opCtx, s.enforceStrictPaths(), rfs, auth.Binding(), finalDest)
 		}
-		var token string
 		if err == nil {
-			token, err = s.stageToken("xops.scp.upload.v1", finalDest.String(), req.Resume)
-		}
-		if err == nil {
-			params.stagePath, err = makeRemoteStagePath(finalDest, token)
+			var token string
+			if token, err = s.stageToken("xops.scp.upload.v1", finalDest.String(), req.Resume); err == nil {
+				params.stagePath, err = joinRemoteBase(finalDest.Dir(), ".xops-stage-"+token+".part")
+			}
 		}
 		if err != nil {
 			return SCPUploadResult{}, err
@@ -88,21 +87,18 @@ func validateOptionalUploadAttrs(modTime algebraic.Option[time.Time], expDig alg
 // resolveRemoteUploadDest 严守 INV-B4：至多一次远端容器目录展开，经 Lstat 识别悬空软链与目录冲突。
 func resolveRemoteUploadDest(ctx context.Context, rfs ports.RemoteFSPort, dest pathalg.RemotePath, sourceBase string, expandIntoDir, noClobber bool) (pathalg.RemotePath, error) {
 	exists, isDir, err := inspectRemoteUploadTarget(ctx, rfs, dest)
-	if err != nil {
-		return zeroVal[pathalg.RemotePath](), err
-	}
-	if exists && isDir {
+	if err == nil && exists && isDir {
 		if !expandIntoDir {
 			return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 禁止覆写远端目录 %s", ports.ErrRemoteIsDir, dest)
 		}
-		if dest, err = joinRemoteBase(dest, sourceBase); err != nil {
-			return zeroVal[pathalg.RemotePath](), err
+		if dest, err = joinRemoteBase(dest, sourceBase); err == nil {
+			exists, isDir, err = inspectRemoteUploadTarget(ctx, rfs, dest)
 		}
-		if exists, isDir, err = inspectRemoteUploadTarget(ctx, rfs, dest); err != nil || (exists && isDir) {
-			return zeroVal[pathalg.RemotePath](), pickIf[error](err != nil, err, fmt.Errorf("%w: 展开目标 %s 为目录（禁止二次展开）", ports.ErrRemoteIsDir, dest))
+		if err == nil && exists && isDir {
+			return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 展开目标 %s 为目录（禁止二次展开）", ports.ErrRemoteIsDir, dest)
 		}
 	}
-	return dest, pickIf[error](exists && noClobber, fmt.Errorf("%w: 远端目标 %s 已存在（含悬空软链）", ports.ErrAlreadyExists, dest), nil)
+	return dest, firstErr(err, pickIf[error](exists && noClobber, fmt.Errorf("%w: 远端目标 %s 已存在（含悬空软链）", ports.ErrAlreadyExists, dest), nil))
 }
 func inspectRemoteUploadTarget(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (exists, isDir bool, err error) {
 	lstat, err := rfs.Lstat(ctx, p)
@@ -176,16 +172,18 @@ func uploadFromBoundedReader(ctx context.Context, rfs ports.RemoteFSPort, emitte
 	return pickIf(err == nil, SCPUploadResult{RemotePath: params.finalDest, BytesTransferred: size, ResumedBytes: verifiedResumed, ChunksTransferred: chunksUploaded, Digest: digest, ModTimePreserved: preserved}, SCPUploadResult{}), err
 }
 func commitUploadedStage(ctx context.Context, rfs ports.RemoteFSPort, params uploadExecParams) (bool, error) {
+	var err error
 	if params.applyPerm {
-		if err := rfs.Chmod(ctx, params.stagePath, params.perm); err != nil {
-			return false, err
-		}
+		err = rfs.Chmod(ctx, params.stagePath, params.perm)
 	}
-	if err := rfs.RenameAtomic(ctx, params.stagePath, params.finalDest, params.renameSpec); err != nil {
+	if err == nil {
+		err = rfs.RenameAtomic(ctx, params.stagePath, params.finalDest, params.renameSpec)
+	}
+	if err != nil {
 		return false, err
 	}
 	if mt, ok := params.req.ModTime.Get(); params.req.PreserveTimes && ok {
-		err := rfs.Chtimes(ctx, params.finalDest, mt, mt)
+		err = rfs.Chtimes(ctx, params.finalDest, mt, mt)
 		return err == nil, err
 	}
 	return false, nil
@@ -232,7 +230,7 @@ func streamUploadChunks(ctx context.Context, rfs ports.RemoteFSPort, emitter *tr
 // produceUploadJobs 按序读取本地源并计算全量摘要；对 resumeOffset 以内分片逐片回读比对远端暂存内容，
 // 发现稀疏零空洞或换源失配立即重传，彻底杜绝 Resume 静默数据损坏。
 func produceUploadJobs(ctx context.Context, rfs ports.RemoteFSPort, r ports.BoundedReadHandle, hasher io.Writer, size, resumeOffset int64, params uploadExecParams, jobsCh chan<- chunkBuf, writtenBytes, verifiedResumed *atomic.Int64) error {
-	for offset := int64(0); offset < size; {
+	for offset := int64(0); offset < size; offset += params.chunkSize {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -246,14 +244,12 @@ func produceUploadJobs(ctx context.Context, rfs ports.RemoteFSPort, r ports.Boun
 			if existing, err := readRemoteChunkExact(ctx, rfs, params.stagePath, offset, n); err == nil && bytes.Equal(existing, buf) {
 				writtenBytes.Add(n)
 				verifiedResumed.Add(n)
-				offset += n
 				continue
 			}
 		}
 		if err := sendOrDone(ctx, jobsCh, chunkBuf{offset: offset, data: buf}); err != nil {
 			return err
 		}
-		offset += n
 	}
 	return nil
 }

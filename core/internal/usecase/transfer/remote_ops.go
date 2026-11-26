@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -18,8 +18,8 @@ import (
 )
 
 //xops:syncclosure
-func runSFTPMut(ctx context.Context, s *Service, base CallBase, action string, p pathalg.RemotePath, params map[string]string, preCheck func() error, fn func(context.Context, ports.RemoteFSPort) error) error {
-	_, err := runRemotePathOp[security.CapFileMut](ctx, s, base, "sftp", action, p, security.RiskModerate, params, preCheck, func(opCtx context.Context, rfs ports.RemoteFSPort) (struct{}, error) {
+func runSFTPMut(ctx context.Context, s *Service, base CallBase, action string, p pathalg.RemotePath, params map[string]string, preErr error, fn func(context.Context, ports.RemoteFSPort) error) error {
+	_, err := runRemotePathOp[security.CapFileMut](ctx, s, base, "sftp", action, p, security.RiskModerate, params, preErr, func(opCtx context.Context, rfs ports.RemoteFSPort) (struct{}, error) {
 		return struct{}{}, fn(opCtx, rfs)
 	})
 	return err
@@ -57,8 +57,8 @@ func (s *Service) ReadLink(ctx context.Context, req ReadLinkRequest) (string, er
 
 // MkdirAll / Remove / RemoveDir / Chmod / Chtimes 执行远端工作区变更（严格隔离 Remove 与 RemoveDir）。
 func (s *Service) MkdirAll(ctx context.Context, req MkdirAllRequest) error {
-	var perm fs.FileMode
-	return runSFTPMut(ctx, s, req.CallBase, "mkdir_all", req.Path, nil, func() (err error) { perm, err = resolvePerm(req.Perm, defaultDirPerm); return err }, func(opCtx context.Context, rfs ports.RemoteFSPort) error { return rfs.MkdirAll(opCtx, req.Path, perm) })
+	perm, err := resolvePerm(req.Perm, defaultDirPerm)
+	return runSFTPMut(ctx, s, req.CallBase, "mkdir_all", req.Path, nil, err, func(opCtx context.Context, rfs ports.RemoteFSPort) error { return rfs.MkdirAll(opCtx, req.Path, perm) })
 }
 func (s *Service) Remove(ctx context.Context, req RemoveRequest) error {
 	return runSFTPMut(ctx, s, req.CallBase, "remove", req.Path, nil, nil, func(opCtx context.Context, rfs ports.RemoteFSPort) error { return rfs.Remove(opCtx, req.Path) })
@@ -67,22 +67,20 @@ func (s *Service) RemoveDir(ctx context.Context, req RemoveDirRequest) error {
 	return runSFTPMut(ctx, s, req.CallBase, "remove_dir", req.Path, nil, nil, func(opCtx context.Context, rfs ports.RemoteFSPort) error { return rfs.RemoveDir(opCtx, req.Path) })
 }
 func (s *Service) Chmod(ctx context.Context, req ChmodRequest) error {
-	return runSFTPMut(ctx, s, req.CallBase, "chmod", req.Path, map[string]string{"perm": fmt.Sprintf("%#o", req.Perm)}, func() error {
-		return pickIf[error](req.Perm != 0 && req.Perm == req.Perm.Perm(), nil, fmt.Errorf("%w: Chmod 权限位 %#o 非法", ErrInvalidRequest, req.Perm))
-	}, func(opCtx context.Context, rfs ports.RemoteFSPort) error { return rfs.Chmod(opCtx, req.Path, req.Perm) })
+	preErr := pickIf[error](req.Perm != 0 && req.Perm == req.Perm.Perm(), nil, fmt.Errorf("%w: Chmod 权限位 %#o 非法", ErrInvalidRequest, req.Perm))
+	return runSFTPMut(ctx, s, req.CallBase, "chmod", req.Path, map[string]string{"perm": fmt.Sprintf("%#o", req.Perm)}, preErr, func(opCtx context.Context, rfs ports.RemoteFSPort) error { return rfs.Chmod(opCtx, req.Path, req.Perm) })
 }
 func (s *Service) Chtimes(ctx context.Context, req ChtimesRequest) error {
-	return runSFTPMut(ctx, s, req.CallBase, "chtimes", req.Path, nil, func() error {
-		return pickIf[error](isValidRFC3339Time(req.Atime) && isValidRFC3339Time(req.Mtime), nil, fmt.Errorf("%w: Chtimes 时间戳非法", ErrInvalidRequest))
-	}, func(opCtx context.Context, rfs ports.RemoteFSPort) error {
+	preErr := pickIf[error](isValidRFC3339Time(req.Atime) && isValidRFC3339Time(req.Mtime), nil, fmt.Errorf("%w: Chtimes 时间戳非法", ErrInvalidRequest))
+	return runSFTPMut(ctx, s, req.CallBase, "chtimes", req.Path, nil, preErr, func(opCtx context.Context, rfs ports.RemoteFSPort) error {
 		return rfs.Chtimes(opCtx, req.Path, req.Atime, req.Mtime)
 	})
 }
 
 // ReadFile 在门控与租约保护下有界读取远端常规文件，返回内容、摘要与 RemoteFileAnchor 快照。
 func (s *Service) ReadFile(ctx context.Context, req ReadFileRequest) (ReadFileResult, error) {
-	var limits ports.ReadLimits
-	return runRemotePathOp[security.CapFileRead](ctx, s, req.CallBase, "file", "read", req.Path, security.RiskSafe, nil, func() (err error) { limits, err = s.resolveReadLimits(req.MaxBytes); return err }, func(opCtx context.Context, rfs ports.RemoteFSPort) (ReadFileResult, error) {
+	limits, preErr := s.resolveReadLimits(req.MaxBytes)
+	return runRemotePathOp[security.CapFileRead](ctx, s, req.CallBase, "file", "read", req.Path, security.RiskSafe, nil, preErr, func(opCtx context.Context, rfs ports.RemoteFSPort) (ReadFileResult, error) {
 		st, data, dig, rErr := readBoundedRemoteFile(opCtx, rfs, req.Path, limits)
 		return pickIf(rErr == nil, ReadFileResult{Stat: st, Content: data, Digest: dig}, ReadFileResult{}), rErr
 	})
@@ -90,15 +88,10 @@ func (s *Service) ReadFile(ctx context.Context, req ReadFileRequest) (ReadFileRe
 
 // WriteFile 消费冻结 RemoteWriteSpec（互斥 NoClobber/ExpectedAnchor）执行远端原子写入（ADR-016）。
 func (s *Service) WriteFile(ctx context.Context, req WriteFileRequest) (WriteFileResult, error) {
-	var writeSpec ports.RemoteWriteSpec
-	return runRemotePathOp[security.CapFileMut](ctx, s, req.CallBase, "file", "write", req.Path, security.RiskModerate, nil, func() error {
-		perm, err := resolvePerm(req.Perm, defaultRemoteFilePerm)
-		if err != nil || int64(len(req.Content)) > maxAtomicReadBytes {
-			return pickIf[error](err != nil, err, fmt.Errorf("%w: 载荷超限 %d", ports.ErrLimitExceeded, maxAtomicReadBytes))
-		}
-		writeSpec, err = ports.NewRemoteWriteSpec(ports.RemoteWriteSpecInput{Perm: perm, ExpectedAnchor: req.ExpectedAnchor, NoClobber: req.NoClobber, AtomicRename: true})
-		return err
-	}, func(opCtx context.Context, rfs ports.RemoteFSPort) (WriteFileResult, error) {
+	perm, e1 := resolvePerm(req.Perm, defaultRemoteFilePerm)
+	e2 := pickIf[error](int64(len(req.Content)) > maxAtomicReadBytes, fmt.Errorf("%w: 载荷超限 %d", ports.ErrLimitExceeded, maxAtomicReadBytes), nil)
+	writeSpec, e3 := ports.NewRemoteWriteSpec(ports.RemoteWriteSpecInput{Perm: perm, ExpectedAnchor: req.ExpectedAnchor, NoClobber: req.NoClobber, AtomicRename: true})
+	return runRemotePathOp[security.CapFileMut](ctx, s, req.CallBase, "file", "write", req.Path, security.RiskModerate, nil, firstErr(e1, e2, e3), func(opCtx context.Context, rfs ports.RemoteFSPort) (WriteFileResult, error) {
 		if dir := req.Path.Dir(); req.CreateParents && !dir.IsRoot() && dir.String() != "." {
 			if mErr := rfs.MkdirAll(opCtx, dir, defaultDirPerm); mErr != nil {
 				return WriteFileResult{}, mErr
@@ -111,16 +104,12 @@ func (s *Service) WriteFile(ctx context.Context, req WriteFileRequest) (WriteFil
 
 // PatchFile 执行 FSTAT 锚定防并发覆写（Lost Update）的远端原子文本补丁（ADR-016）。
 func (s *Service) PatchFile(ctx context.Context, req PatchFileRequest) (PatchFileResult, error) {
-	var limits ports.ReadLimits
-	return runRemotePathOp[security.CapFileMut](ctx, s, req.CallBase, "file", "patch", req.Path, security.RiskModerate, nil, func() (err error) {
-		anc, okA := req.ExpectedAnchor.Get()
-		dig, okD := req.ExpectedDigest.Get()
-		if len(req.Edits) == 0 || slices.ContainsFunc(req.Edits, func(ed TextEdit) bool { return !ed.IsValid() }) || (okA && !anc.IsValid()) || (okD && !dig.IsValid()) {
-			return fmt.Errorf("%w: PatchFile Edits/ExpectedAnchor/ExpectedDigest 无效", ErrInvalidRequest)
-		}
-		limits, err = s.resolveReadLimits(req.MaxBytes)
-		return err
-	}, func(opCtx context.Context, rfs ports.RemoteFSPort) (PatchFileResult, error) {
+	anc, okA := req.ExpectedAnchor.Get()
+	dig, okD := req.ExpectedDigest.Get()
+	bad := len(req.Edits) == 0 || slices.ContainsFunc(req.Edits, func(ed TextEdit) bool { return !ed.IsValid() }) || (okA && !anc.IsValid()) || (okD && !dig.IsValid())
+	limits, e2 := s.resolveReadLimits(req.MaxBytes)
+	preErr := firstErr(pickIf[error](bad, fmt.Errorf("%w: PatchFile Edits/ExpectedAnchor/ExpectedDigest 无效", ErrInvalidRequest), nil), e2)
+	return runRemotePathOp[security.CapFileMut](ctx, s, req.CallBase, "file", "patch", req.Path, security.RiskModerate, nil, preErr, func(opCtx context.Context, rfs ports.RemoteFSPort) (PatchFileResult, error) {
 		return executeAnchoredPatch(opCtx, rfs, req, limits)
 	})
 }
@@ -129,10 +118,9 @@ func executeAnchoredPatch(ctx context.Context, rfs ports.RemoteFSPort, req Patch
 	if err != nil {
 		return PatchFileResult{}, err
 	}
-	if expAnc, ok := req.ExpectedAnchor.Get(); ok && !expAnc.Matches(beforeStat.Anchor()) {
+	if expAnc, okA := req.ExpectedAnchor.Get(); okA && !expAnc.Matches(beforeStat.Anchor()) {
 		return PatchFileResult{}, fmt.Errorf("%w: 补丁前置锚点不匹配", ports.ErrRemoteAnchorMismatch)
-	}
-	if expDig, ok := req.ExpectedDigest.Get(); ok && !expDig.Equal(beforeDigest) {
+	} else if expDig, okD := req.ExpectedDigest.Get(); okD && !expDig.Equal(beforeDigest) {
 		return PatchFileResult{}, fmt.Errorf("%w: %w", ErrPatchConflict, ErrDigestMismatch)
 	}
 	patched, replacements, err := applyTextEdits(string(origBytes), req.Edits)
@@ -232,11 +220,9 @@ func resolveCanonicalList(ctx context.Context, rfs ports.RemoteFSPort, rpaths []
 			out = append(out, canon.String())
 		}
 		if expandBase != "" {
-			exp, ok, eErr := resolveExpandedUploadCandidate(ctx, rfs, p, expandBase)
-			if eErr != nil {
+			if exp, ok, eErr := resolveExpandedUploadCandidate(ctx, rfs, p, expandBase); eErr != nil {
 				return nil, eErr
-			}
-			if ok {
+			} else if ok {
 				out = append(out, exp)
 			}
 		}
@@ -249,15 +235,15 @@ func resolveExpandedUploadCandidate(ctx context.Context, rfs ports.RemoteFSPort,
 		return "", false, err
 	}
 	expanded, err := joinRemoteBase(dest, baseName)
-	if err != nil {
-		return "", false, err
+	var canon pathalg.RemotePath
+	if err == nil {
+		canon, err = resolveCanonicalRemotePath(ctx, rfs, expanded)
 	}
-	canon, err := resolveCanonicalRemotePath(ctx, rfs, expanded)
 	return canon.String(), err == nil, err
 }
 
 // resolveCanonicalRemotePath 在有界跳数预算（pathalg.MaxSymlinkHops）内解析远端真实 POSIX 路径：
-// 先经 RealPath(".") 锚定相对路径，再在统一祖先回溯循环中逐级展开末端及中间悬空软链（0 path/filepath）。
+// 先经 RealPath(".") 锚定相对路径，再在统一祖先回溯循环中逐级展开末端及中间悬空软链（零本地路径库依赖）。
 func resolveCanonicalRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (pathalg.RemotePath, error) {
 	cur, err := anchorRemotePath(ctx, rfs, p)
 	if err != nil {
@@ -295,6 +281,8 @@ func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.Rem
 	}
 	return cwd.Resolve(p)
 }
+
+// expandDanglingSymlinkStep 遵循 POSIX path_resolution(7)：相对软链目标先经 RealPath(cur.Dir()) 锚定真实物理父目录再解析。
 func expandDanglingSymlinkStep(ctx context.Context, rfs ports.RemoteFSPort, cur pathalg.RemotePath, suffix []pathalg.RemoteName, hops *int) (pathalg.RemotePath, bool, error) {
 	lst, err := rfs.Lstat(ctx, cur)
 	if errors.Is(err, ports.ErrNotFound) || (err == nil && !lst.IsSymlink()) {
@@ -309,8 +297,15 @@ func expandDanglingSymlinkStep(ctx context.Context, rfs ports.RemoteFSPort, cur 
 	if err == nil {
 		targetP, err = pathalg.ParseRemotePath(raw)
 	}
-	if err == nil {
-		nextBase, err = cur.Dir().Resolve(targetP)
+	if err == nil && targetP.IsAbs() {
+		nextBase = targetP
+	} else if err == nil {
+		var realParent pathalg.RemotePath
+		if realParent, err = rfs.RealPath(ctx, cur.Dir()); err == nil {
+			nextBase, err = pickIf(realParent.IsAbs(), realParent.Resolve, func(pathalg.RemotePath) (pathalg.RemotePath, error) {
+				return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端父目录非绝对路径", ErrInvalidRequest)
+			})(targetP)
+		}
 	}
 	if err != nil {
 		return zeroVal[pathalg.RemotePath](), false, err
@@ -327,11 +322,28 @@ func rejoinRemoteSuffix(base pathalg.RemotePath, revSuffix []pathalg.RemoteName)
 	return base.Join(ordered...)
 }
 
-// verifyRemotePathAuthorized 在非 DirectOperator 配置档下复核远端目标真实路径未漂移出授权 CanonicalPaths。
+// verifyRemotePathAuthorized 在非 DirectOperator 配置档下复核远端目标真实路径未漂移出授权 CanonicalPaths/RecursivePaths。
 func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.RemoteFSPort, binding security.OperationBinding, target pathalg.RemotePath) error {
 	if !enforce {
 		return nil
 	}
 	canon, err := resolveCanonicalRemotePath(ctx, rfs, target)
-	return firstErr(err, pickIf[error](slices.Contains(binding.CanonicalPaths(), canon.String()), nil, fmt.Errorf("%w: 远端路径 %s 规范化漂移至未授权目标 %s", gate.ErrScopeEscalated, target, canon)))
+	if err != nil {
+		return err
+	}
+	cs := canon.String()
+	ok := slices.Contains(binding.CanonicalPaths(), cs) || slices.ContainsFunc(binding.RecursivePaths(), func(root string) bool { return root == "/" || cs == root || strings.HasPrefix(cs, root+"/") })
+	return pickIf[error](ok, nil, fmt.Errorf("%w: 远端路径 %s 规范化漂移至未授权目标 %s", gate.ErrScopeEscalated, target, canon))
+}
+
+// verifyRemoteDownloadSource 复核远端下载源未发生软链漂移且 Lstat 锚点/大小/修改时间与起始快照完全一致。
+func verifyRemoteDownloadSource(ctx context.Context, enforce bool, rfs ports.RemoteFSPort, binding security.OperationBinding, rs pathalg.RemotePath, expAnchor ports.RemoteFileAnchor, expSize int64, expModTime time.Time) error {
+	if err := verifyRemotePathAuthorized(ctx, enforce, rfs, binding, rs); err != nil {
+		return err
+	}
+	st, err := rfs.Lstat(ctx, rs)
+	if err != nil || !st.IsRegular() {
+		return pickIf[error](err != nil, err, pickIf(st.IsSymlink(), ports.ErrSymlinkRejected, pickIf(st.IsDir(), ports.ErrRemoteIsDir, ports.ErrNotRegularFile)))
+	}
+	return pickIf[error](expAnchor.Equal(st.Anchor()) && st.Size() == expSize && expModTime.Equal(st.ModTime()), nil, ports.ErrRemoteAnchorMismatch)
 }

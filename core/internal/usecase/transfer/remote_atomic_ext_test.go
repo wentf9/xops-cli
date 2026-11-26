@@ -3,6 +3,7 @@ package transfer_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
@@ -265,5 +267,46 @@ func TestRemoteAtomic_ReadFileModTimeChangeAndRelativeSingleSegmentWrite(t *test
 	requireNoErr(t, err, "单段相对路径 WriteFile(CreateParents=true)")
 	if wRes.BytesWritten != 2 {
 		t.Fatalf("BytesWritten=%d, want 2", wRes.BytesWritten)
+	}
+}
+
+func TestRound2Canonicalization_POSIXRelativeDanglingSymlinkUnderSymlinkParent(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous, omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	// POSIX path_resolution(7) 逃逸对抗：/tmp/link -> /etc/sub，/etc/sub/rel -> ../pwn.conf，
+	// 词法拼接 /tmp/link/../pwn.conf 会误判为 /tmp/pwn.conf，真实物理目标为受保护的 /etc/pwn.conf。
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/etc/sub"), 0o755), "MkdirAll /etc/sub")
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp"), 0o755), "MkdirAll /tmp")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/link"), "/etc/sub"), "PutSymlink /tmp/link")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/etc/sub/rel"), "../pwn.conf"), "PutSymlink rel")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/etc/sub/rel_dir"), "../new_cron/pwn"), "PutSymlink rel_dir")
+
+	_, err := rig.svc.WriteFile(ctx, transfer.WriteFileRequest{
+		CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/link/rel"), Content: []byte("pwn"),
+	})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "相对悬空软链 WriteFile 必须经 RealPath(cur.Dir()) 解析至 /etc/pwn.conf 并拦截")
+
+	_, err = rig.svc.WriteFile(ctx, transfer.WriteFileRequest{
+		CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/link/rel_dir/x"), Content: []byte("pwn"), CreateParents: true,
+	})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "中间相对悬空目录软链 WriteFile(CreateParents) 必须在 Round-2 拦截")
+
+	err = rig.svc.MkdirAll(ctx, transfer.MkdirAllRequest{
+		CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/link/rel_dir/sub"),
+	})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "中间相对悬空目录软链 MkdirAll 必须在 Round-2 拦截")
+
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/link/rel"))
+	requireNoErr(t, err, "NewUploadDest")
+	_, err = rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest, TotalBytes: 4})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "StartTransfer 指向相对悬空软链必须在 Round-2 拦截")
+
+	for _, forbidden := range []string{"/etc/pwn.conf", "/etc/new_cron"} {
+		if _, sErr := rig.remoteFS.Lstat(ctx, mustRemotePath(t, forbidden)); !errors.Is(sErr, ports.ErrNotFound) {
+			t.Fatalf("受保护目标 %s 不得被创建，实际 Lstat err=%v", forbidden, sErr)
+		}
 	}
 }

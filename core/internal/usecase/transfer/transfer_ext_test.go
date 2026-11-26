@@ -316,6 +316,7 @@ type spyJournalStore struct {
 	pruneCalls       int
 	deleteCalls      int
 	loadGenCalls     atomic.Int64
+	loadGenErr       error
 	failOnAppendKind fsm.JournalRecordKind
 	appendErr        error
 }
@@ -334,6 +335,12 @@ func (s *spyJournalStore) Load(ctx context.Context, id security.OperationID) ([]
 }
 func (s *spyJournalStore) LoadGenerations(ctx context.Context, id security.OperationID) ([]ports.JournalGenerationSnapshot, error) {
 	s.loadGenCalls.Add(1)
+	s.mu.Lock()
+	le := s.loadGenErr
+	s.mu.Unlock()
+	if le != nil {
+		return nil, le
+	}
 	return s.inner.LoadGenerations(ctx, id)
 }
 func (s *spyJournalStore) PruneGeneration(ctx context.Context, id security.OperationID, gen uint64) error {
@@ -360,6 +367,7 @@ func (s *spyJournalStore) mutationCounts() (prunes, deletes int) {
 type rigOptions struct {
 	profile          gate.PolicyProfileKind
 	approvalThresh   security.RiskLevel
+	fallback         gate.NoElicitFallback
 	protectedPats    []string
 	nodeOverrides    algebraic.Option[security.NodeOverrides]
 	omitOperatorRead bool
@@ -416,8 +424,12 @@ func newTransferRig(t *testing.T, opts rigOptions) *transferTestRig {
 		requireNoErr(t, rErr, "ParseProtectedRule")
 		rules = append(rules, r)
 	}
+	fb := opts.fallback
+	if !fb.IsValid() {
+		fb = gate.NoElicitFallbackDeny
+	}
 	pol, err := gate.NewGuardrailPolicy(gate.GuardrailPolicySpec{
-		ApprovalThreshold: thresh, NoElicitFallback: gate.NoElicitFallbackDeny,
+		ApprovalThreshold: thresh, NoElicitFallback: fb,
 		NodeOverrides: opts.nodeOverrides, ProtectedRules: rules,
 	})
 	requireNoErr(t, err, "NewGuardrailPolicy")

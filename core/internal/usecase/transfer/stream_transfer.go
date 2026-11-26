@@ -20,18 +20,23 @@ import (
 )
 
 // StartTransfer 启动最高 10 GiB 可恢复流式传输（零 OperatorReadFS 依赖，适配物理隔离 MCP 路径）：
-// 严格锁定起始 Generation=1 并校验 TransferID 互斥准入（禁止覆写活跃句柄或绕过 UncertainCommit/Committed 护栏），
-// 经 gate.WithAuthorized -> pool.WithLease -> pool.RegisterLeaseHandleWith 登记托管句柄，审计后写失败自动回滚释放。
+// 门控前保持 OperationBinding 100% 由显式入参确定（不提前抽熵破坏两步审批），受权后确定 TransferID 锁定 Generation=1、
+// 原子校验互斥准入并登记托管句柄，审计后写失败自动回滚释放。
 func (s *Service) StartTransfer(ctx context.Context, req StartTransferRequest) (TransferHandleInfo, error) {
 	defer closeStreamIfNonNil(req.OperationStream)
 	hop, perm, renameSpec, err := s.normalizeStartRequest(ctx, &req)
 	if err != nil {
 		return TransferHandleInfo{}, err
 	}
-	tid, _ := req.TransferID.Get()
 	rpaths, extra := collectDestPaths(req.Dest, req.RemoteSource, nil, nil)
-	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "start", paths: rpaths, extraPaths: extra, params: map[string]string{"transfer_id": tid.String(), "direction": req.Dest.Direction().String(), "target": req.Dest.String()}, defaultRisk: pickIf(req.Dest.Direction() == fsm.TransferDirectionUpload, security.RiskModerate, security.RiskSafe), summary: "transfer start " + tid.String(), canonicalize: len(rpaths) > 0}
+	params, summary := map[string]string{"direction": req.Dest.Direction().String(), "target": req.Dest.String()}, "transfer start "+req.Dest.String()
+	if explicitID, ok := req.TransferID.Get(); ok {
+		params["transfer_id"], summary = explicitID.String(), "transfer start "+explicitID.String()
+	}
+	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "start", paths: rpaths, extraPaths: extra, params: params, defaultRisk: pickIf(req.Dest.Direction() == fsm.TransferDirectionUpload, security.RiskModerate, security.RiskSafe), summary: summary, canonicalize: len(rpaths) > 0}
 	return s.runAuthorizedTransferRegister(ctx, spec, func(authCtx context.Context, auth gate.Authorized[security.CapTransfer], emitter *transferEmitter) (TransferHandleInfo, error) {
+		tid := req.TransferID.OrElse(auth.OperationID())
+		req.TransferID = algebraic.Some(tid)
 		if _, live, lErr := s.lookupLiveHandle(authCtx, tid); lErr != nil || live {
 			return TransferHandleInfo{}, pickIf[error](lErr != nil, lErr, fmt.Errorf("%w: 传输 %s 已存在活跃受管句柄", ports.ErrAlreadyExists, tid))
 		}
@@ -66,34 +71,22 @@ func (s *Service) runAuthorizedTransferRegister(ctx context.Context, spec authOp
 		}
 		return res, rErr
 	})
-	if err != nil {
-		if registered.Handle.IsValid() {
-			s.dropActiveHandle(registered.TransferID, registered.Handle, true)
-		}
-		return TransferHandleInfo{}, err
+	if err != nil && registered.Handle.IsValid() {
+		s.dropActiveHandle(registered.TransferID, registered.Handle, true)
 	}
-	return info, nil
+	return pickIf(err == nil, info, TransferHandleInfo{}), err
 }
 func (s *Service) normalizeStartRequest(ctx context.Context, req *StartTransferRequest) (hop plan.HopSpec, perm fs.FileMode, renameSpec ports.RemoteRenameSpec, err error) {
 	if hop, err = s.validateBaseCall(ctx, req.CallBase); err != nil || s.journals == nil {
 		return hop, 0, renameSpec, pickIf[error](err != nil, err, ErrJournalStoreUnavailable)
 	}
-	if !req.Dest.IsValid() || req.TotalBytes > fsm.MaxTransferBytes || req.Generation > 1 {
-		return hop, 0, renameSpec, pickIf[error](req.TotalBytes > fsm.MaxTransferBytes, fmt.Errorf("%w: TotalBytes=%d 超限", fsm.ErrTransferSizeExceeded, req.TotalBytes), fmt.Errorf("%w: TransferDest 或起始 Generation 无效", ErrInvalidRequest))
+	if id, ok := req.TransferID.Get(); !req.Dest.IsValid() || req.TotalBytes > fsm.MaxTransferBytes || req.Generation > 1 || (ok && !id.IsValid()) {
+		return hop, 0, renameSpec, pickIf[error](req.TotalBytes > fsm.MaxTransferBytes, fmt.Errorf("%w: TotalBytes=%d 超限", fsm.ErrTransferSizeExceeded, req.TotalBytes), fmt.Errorf("%w: TransferDest/TransferID/Generation 无效", ErrInvalidRequest))
 	}
 	renameSpec, e1 := s.validateStartDirectionFields(*req)
 	perm, e2 := resolvePerm(req.Perm, pickIf(req.Dest.Direction() == fsm.TransferDirectionUpload, defaultRemoteFilePerm, defaultLocalStagePerm))
-	if err = firstErr(e1, e2); err != nil {
-		return hop, 0, renameSpec, err
-	}
-	if id, ok := req.TransferID.Get(); !ok {
-		genID, gErr := security.NewOperationIDFrom(s.entropy)
-		req.TransferID, err = algebraic.Some(genID), gErr
-	} else if !id.IsValid() {
-		err = fmt.Errorf("%w: TransferID 无效", ErrInvalidRequest)
-	}
 	req.JournalVersion, req.Generation = pickIf(req.JournalVersion == fsm.JournalVersionInvalid, fsm.JournalVersionV2, req.JournalVersion), 1
-	return hop, perm, renameSpec, firstErr(err, pickIf[error](req.JournalVersion.IsValid(), nil, fmt.Errorf("%w: JournalVersion 无效", ErrInvalidRequest)))
+	return hop, perm, renameSpec, firstErr(e1, e2, pickIf[error](req.JournalVersion.IsValid(), nil, fmt.Errorf("%w: JournalVersion 无效", ErrInvalidRequest)))
 }
 func (s *Service) validateStartDirectionFields(req StartTransferRequest) (renameSpec ports.RemoteRenameSpec, err error) {
 	if err = validateOptionalUploadAttrs(req.ModTime, req.ExpectedDigest); err != nil {
@@ -135,10 +128,15 @@ func (s *Service) lookupLiveHandle(ctx context.Context, tid security.OperationID
 	return pickIf(err == nil, h, zeroVal[plan.ManagedHandle[plan.KindTransfer]]()), err == nil, err
 }
 func (s *Service) registerStreamSession(ctx context.Context, binding security.OperationBinding, emitter *transferEmitter, req StartTransferRequest, perm fs.FileMode, renameSpec ports.RemoteRenameSpec, resumedState fsm.TransferState, freshStart bool) (info TransferHandleInfo, err error) {
+	tid, _ := req.TransferID.Get()
+	handleBinding, err := enrichHandleBinding(binding, tid, req.Dest)
+	if err != nil {
+		return TransferHandleInfo{}, err
+	}
 	var startEffs []fsm.TransferEffect
 	var startEvs []fsm.TransferEvent
 	if err = s.pool.WithLease(ctx, req.Plan, func(leaseCtx context.Context, lease *pool.Lease) (regErr error) {
-		info.Handle, regErr = pool.RegisterLeaseHandleWith[plan.KindTransfer](s.pool, lease, binding, func(revokeCtx context.Context, conn ports.TransportConn) (*managedTransferSession, error) {
+		info.Handle, regErr = pool.RegisterLeaseHandleWith[plan.KindTransfer](s.pool, lease, handleBinding, func(revokeCtx context.Context, conn ports.TransportConn) (*managedTransferSession, error) {
 			sess, effs, evs, bErr := s.buildManagedTransferSession(leaseCtx, revokeCtx, conn, req, perm, renameSpec, resumedState, freshStart, s.clock.Now().UTC().Round(0))
 			if bErr == nil {
 				info.TransferID, info.Meta, info.State, startEffs, startEvs = sess.meta.TransferID(), sess.meta, sess.state, effs, evs
@@ -149,15 +147,31 @@ func (s *Service) registerStreamSession(ctx context.Context, binding security.Op
 	}); err != nil {
 		return TransferHandleInfo{}, err
 	}
-	if err = s.persistJournalEffects(ctx, startEffs); err != nil {
+	// 在 s.handleMu 内原子占槽，杜绝并发 ResumeTransfer(StartNextGen=false) 覆盖活句柄造成孤儿钉选。
+	s.handleMu.Lock()
+	_, dup := s.activeHandles[info.TransferID]
+	if !dup {
+		s.activeHandles[info.TransferID] = info.Handle
+	}
+	s.handleMu.Unlock()
+	if dup {
 		_ = pool.ReleaseHandle[plan.KindTransfer](s.pool, info.Handle)
+		return TransferHandleInfo{}, fmt.Errorf("%w: 传输 %s 已存在并发活跃句柄", ports.ErrAlreadyExists, info.TransferID)
+	}
+	if err = s.persistJournalEffects(ctx, startEffs); err != nil {
+		s.dropActiveHandle(info.TransferID, info.Handle, true)
 		return TransferHandleInfo{}, err
 	}
 	emitter.emitFSMTransitions(ctx, fsm.TransferKindInitialized, info.State, startEvs)
-	s.handleMu.Lock()
-	s.activeHandles[info.TransferID] = info.Handle
-	s.handleMu.Unlock()
 	return info, nil
+}
+func enrichHandleBinding(b security.OperationBinding, tid security.OperationID, dest fsm.TransferDest) (security.OperationBinding, error) {
+	params := b.Parameters()
+	if params == nil {
+		params = map[string]string{}
+	}
+	params["transfer_id"], params["direction"], params["target"] = tid.String(), dest.Direction().String(), dest.String()
+	return security.NewOperationBinding(security.OperationBindingSpec{Capability: b.Capability(), Tool: b.Tool(), Action: b.Action(), NodeID: b.NodeID(), NodeIDs: b.NodeIDs(), Endpoint: b.Endpoint(), CanonicalPaths: b.CanonicalPaths(), RecursivePaths: b.RecursivePaths(), CommandDigest: b.CommandDigest(), PlanDigest: b.PlanDigest(), Parameters: params})
 }
 
 // WriteTransferChunk 向活跃上传会话写入单个严格连续分片（<= 64 MiB），写前复核远端路径未发生软链漂移并同步推进 Journal。
@@ -192,10 +206,10 @@ func (s *Service) PullTransferChunk(ctx context.Context, req PullTransferChunkRe
 		return PullTransferChunkResult{}, firstErr(err, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, fmt.Errorf("%w: MaxChunkBytes 越界", ErrInvalidRequest)))
 	}
 	return runAuthorizedHandleVal(ctx, s, req.CallBase, hop, req.Handle, "pull_chunk", security.RiskSafe, func(hCtx context.Context, _ gate.Authorized[security.CapTransfer], sess *managedTransferSession, emitter *transferEmitter) (PullTransferChunkResult, error) {
-		return s.pullOneDownloadChunk(hCtx, sess, emitter, maxChunk)
+		return s.pullOneDownloadChunk(hCtx, sess, emitter, maxChunk, req.Handle.Binding())
 	})
 }
-func (s *Service) pullOneDownloadChunk(ctx context.Context, sess *managedTransferSession, emitter *transferEmitter, maxChunk uint64) (PullTransferChunkResult, error) {
+func (s *Service) pullOneDownloadChunk(ctx context.Context, sess *managedTransferSession, emitter *transferEmitter, maxChunk uint64, handleBinding security.OperationBinding) (PullTransferChunkResult, error) {
 	streamSt, ok := sess.state.(*fsm.TransferStreaming)
 	if sess.meta.Direction() != fsm.TransferDirectionDownload || !ok {
 		return PullTransferChunkResult{}, pickIf(sess.meta.Direction() != fsm.TransferDirectionDownload, fmt.Errorf("%w: PullTransferChunk 仅适用于下载", ErrTransferHandleMismatch), fmt.Errorf("%w: 当前状态 %s 不能拉取分片", fsm.ErrIllegalTransition, sess.state.Kind()))
@@ -205,6 +219,9 @@ func (s *Service) pullOneDownloadChunk(ctx context.Context, sess *managedTransfe
 	stageDest, okS := sess.localStageDest.Get()
 	if !okR || !okL || !okS {
 		return PullTransferChunkResult{}, ErrInvalidRequest
+	}
+	if err := verifyRemoteDownloadSource(ctx, s.enforceStrictPaths(), sess.rfs, handleBinding, rs, sess.sourceAnchor, int64(sess.meta.TotalBytes()), sess.sourceModTime); err != nil {
+		return PullTransferChunkResult{}, err
 	}
 	offset, want := streamSt.Offset(), min(maxChunk, sess.meta.TotalBytes()-streamSt.Offset())
 	data, err := readRemoteChunkExact(ctx, sess.rfs, rs, int64(offset), int64(want))
@@ -225,12 +242,11 @@ func (s *Service) pullOneDownloadChunk(ctx context.Context, sess *managedTransfe
 
 //xops:syncclosure
 func (s *Service) applyChunkWithWriter(ctx context.Context, sess *managedTransferSession, emitter *transferEmitter, offset uint64, data []byte, stage string, writeData func() error) (uint64, security.Digest, fsm.TransferStateKind, error) {
-	chunkDig := security.DigestBytes(data)
+	chunkDig, prevKind := security.DigestBytes(data), sess.state.Kind()
 	chunkIn, err := fsm.TransferInputChunk(offset, uint64(len(data)), chunkDig)
 	var nextSt fsm.TransferState
 	var effs []fsm.TransferEffect
 	var evs []fsm.TransferEvent
-	prevKind := sess.state.Kind()
 	if err == nil {
 		nextSt, effs, evs, err = fsm.TransitionTransfer(sess.state, chunkIn)
 	}
@@ -433,15 +449,12 @@ func runAuthorizedHandleVal[T any](ctx context.Context, s *Service, base CallBas
 }
 func (s *Service) persistJournalEffects(ctx context.Context, effs []fsm.TransferEffect) error {
 	for _, eff := range effs {
-		if eff.Kind() != fsm.TransferEffectWriteJournal {
-			continue
-		}
-		rec, ok := eff.Record().Get()
-		if !ok || !rec.IsValid() {
-			return fsm.ErrInvalidJournal
-		}
-		if err := s.journals.Append(ctx, rec); err != nil {
-			return err
+		if eff.Kind() == fsm.TransferEffectWriteJournal {
+			if rec, ok := eff.Record().Get(); !ok || !rec.IsValid() {
+				return fsm.ErrInvalidJournal
+			} else if err := s.journals.Append(ctx, rec); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

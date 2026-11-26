@@ -22,14 +22,14 @@ import (
 
 type (
 	downloadFileSpec struct {
-		req         SCPDownloadRequest
-		remoteStat  ports.RemoteFileStat
-		chunkSize   int64
-		concurrency int
-		maxFiles    int
-		maxBytes    uint64
-		transferID  security.OperationID
-		startedAt   time.Time
+		req                   SCPDownloadRequest
+		authBinding           security.OperationBinding
+		remoteStat            ports.RemoteFileStat
+		chunkSize             int64
+		concurrency, maxFiles int
+		maxBytes              uint64
+		transferID            security.OperationID
+		startedAt             time.Time
 	}
 	fileDownloadOutcome struct {
 		bytes, resumed, chunks int64
@@ -71,7 +71,7 @@ func (s *Service) SCPDownload(ctx context.Context, req SCPDownloadRequest) (SCPD
 	}
 	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "scp", action: "download", paths: pickIf(req.Recursive, nil, []pathalg.RemotePath{req.RemoteSource}), recursivePaths: pickIf(req.Recursive, []pathalg.RemotePath{req.RemoteSource}, nil), defaultRisk: security.RiskSafe, summary: "scp download " + req.RemoteSource.String(), canonicalize: true}
 	return runAuthorizedRemoteFS[security.CapTransfer](ctx, s, spec, func(opCtx context.Context, auth gate.Authorized[security.CapTransfer], rfs ports.RemoteFSPort, emitter *transferEmitter) (SCPDownloadResult, error) {
-		baseSpec.transferID, baseSpec.startedAt = auth.OperationID(), s.clock.Now().UTC().Round(0)
+		baseSpec.authBinding, baseSpec.transferID, baseSpec.startedAt = auth.Binding(), auth.OperationID(), s.clock.Now().UTC().Round(0)
 		return s.executeSCPDownload(opCtx, rfs, emitter, baseSpec)
 	})
 }
@@ -129,19 +129,18 @@ func (s *Service) downloadSingleSymlink(ctx context.Context, rfs ports.RemoteFSP
 		return SCPDownloadResult{}, fmt.Errorf("%w: %w: 策略 %s 禁止下载软链", ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, req.SymlinkPolicy)
 	}
 	target, err := rfs.ReadLink(ctx, req.RemoteSource)
-	if err == nil {
-		if vErr := pathalg.ValidateContainedSymlink(target, req.LocalDest.Depth()-1); vErr != nil {
-			err = fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, vErr)
+	if err != nil {
+		return SCPDownloadResult{}, err
+	}
+	if vErr := pathalg.ValidateContainedSymlink(target, req.LocalDest.Depth()-1); vErr != nil {
+		return SCPDownloadResult{}, fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, vErr)
+	}
+	err = s.scopedFS.WithRoot(req.LocalRoot, func(root ports.RootHandle) error {
+		if e := ensureParentLocalDir(root, req.LocalDest); e != nil {
+			return e
 		}
-	}
-	if err == nil {
-		err = s.scopedFS.WithRoot(req.LocalRoot, func(root ports.RootHandle) error {
-			if e := ensureParentLocalDir(root, req.LocalDest); e != nil {
-				return e
-			}
-			return createLocalSymlink(root, req.LocalDest, target, req.NoClobber)
-		})
-	}
+		return createLocalSymlink(root, req.LocalDest, target, req.NoClobber)
+	})
 	return pickIf(err == nil, SCPDownloadResult{LocalDest: req.LocalDest, SymlinksCreated: 1}, SCPDownloadResult{}), err
 }
 
@@ -181,6 +180,10 @@ func (s *Service) downloadFileIntoRoot(ctx context.Context, rfs ports.RemoteFSPo
 		_ = root.Remove(stageDest)
 		return out, fmt.Errorf("%w: 下载摘要不匹配", ErrDigestMismatch)
 	}
+	if err = verifyRemoteDownloadSource(ctx, s.enforceStrictPaths(), rfs, spec.authBinding, req.RemoteSource, spec.remoteStat.Anchor(), fileSize, spec.remoteStat.ModTime()); err != nil {
+		_ = root.Remove(stageDest)
+		return out, err
+	}
 	if err = root.Rename(stageDest, req.LocalDest); err != nil {
 		return out, err
 	}
@@ -195,12 +198,12 @@ func (s *Service) downloadFileIntoRoot(ctx context.Context, rfs ports.RemoteFSPo
 // streamDownloadChunks 以有界滑动窗口（在途 <= workers）并行拉取远端分片，由消费者严格按连续偏移落盘，杜绝稀疏空洞与内存膨胀。
 func streamDownloadChunks(ctx context.Context, rfs ports.RemoteFSPort, root ports.RootHandle, emitter *transferEmitter, stageDest pathalg.LocalRootedDest, fileSize, resumeOffset int64, spec downloadFileSpec) (int64, error) {
 	stagePerm := sanitizeLocalDownloadPerm(spec.remoteStat.Perm())
-	if fileSize == 0 {
-		_ = root.Remove(stageDest)
-		_, err := root.WriteChunk(stageDest, 0, bytes.NewReader(nil), 0, stagePerm)
-		return 0, err
-	}
 	if fileSize <= resumeOffset {
+		if fileSize == 0 {
+			_ = root.Remove(stageDest)
+			_, err := root.WriteChunk(stageDest, 0, bytes.NewReader(nil), 0, stagePerm)
+			return 0, err
+		}
 		return 0, nil
 	}
 	totalChunks := (fileSize - resumeOffset + spec.chunkSize - 1) / spec.chunkSize
@@ -234,11 +237,12 @@ func dispatchDownloadJobs(ctx context.Context, totalChunks int64, slots chan<- s
 }
 func runDownloadWorker(ctx context.Context, rfs ports.RemoteFSPort, spec downloadFileSpec, resumeOffset, fileSize int64, jobsCh <-chan int64, resultsCh chan<- chunkBuf) error {
 	for idx := range jobsCh {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		offset := resumeOffset + idx*spec.chunkSize
-		data, err := readRemoteChunkExact(ctx, rfs, spec.req.RemoteSource, offset, min(spec.chunkSize, fileSize-offset))
+		err := ctx.Err()
+		var data []byte
+		if err == nil {
+			data, err = readRemoteChunkExact(ctx, rfs, spec.req.RemoteSource, offset, min(spec.chunkSize, fileSize-offset))
+		}
 		if err == nil {
 			err = sendOrDone(ctx, resultsCh, chunkBuf{offset: offset, data: data})
 		}
@@ -289,9 +293,7 @@ func (s *Service) downloadDirectoryTree(ctx context.Context, rfs ports.RemoteFSP
 			e = createPlannedDirsAndSymlinks(root, nil, pl.symlinks, req.NoClobber, &out)
 		}
 		if e == nil && req.PreserveTimes {
-			var preservedDir bool
-			preservedDir, e = applyDirTimesBottomUp(root, pl.dirs)
-			out.ModTimePreserved = out.ModTimePreserved || preservedDir
+			e = applyDirTimesBottomUp(root, pl.dirs, &out.ModTimePreserved)
 		}
 		return e
 	})
@@ -346,31 +348,30 @@ func walkRemoteEntry(ctx context.Context, rfs ports.RemoteFSPort, remoteDir path
 			return fmt.Errorf("%w: %w: 策略 %s 禁止软链 %s", ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, symPolicy, childRemote)
 		}
 		target, rErr := rfs.ReadLink(ctx, childRemote)
-		if rErr != nil {
-			return rErr
+		if rErr == nil {
+			pl.symlinks, pl.allDests = append(pl.symlinks, plannedSymlink{local: childLocal, target: target}), append(pl.allDests, childLocal)
 		}
-		pl.symlinks, pl.allDests = append(pl.symlinks, plannedSymlink{local: childLocal, target: target}), append(pl.allDests, childLocal)
-		return nil
+		return rErr
 	default:
 		return fmt.Errorf("%w: 远端路径 %s 为不受支持类型 %s", ErrRemoteObjectUnsupported, childRemote, childStat.FileType())
 	}
 }
 func validateRecursivePlan(pl *recursiveDownloadPlan) error {
-	if err := pathalg.CheckPathCollisions(pl.allDests); err != nil {
-		return fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, err)
-	}
-	if len(pl.symlinks) == 0 {
-		return nil
-	}
-	bindings := make([]pathalg.SymlinkBinding, 0, len(pl.symlinks))
-	for _, sl := range pl.symlinks {
-		b, err := pathalg.NewSymlinkBinding(sl.local, sl.target)
-		if err != nil {
-			return fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, err)
+	err := pathalg.CheckPathCollisions(pl.allDests)
+	if err == nil && len(pl.symlinks) > 0 {
+		bindings := make([]pathalg.SymlinkBinding, 0, len(pl.symlinks))
+		for _, sl := range pl.symlinks {
+			var b pathalg.SymlinkBinding
+			if b, err = pathalg.NewSymlinkBinding(sl.local, sl.target); err != nil {
+				break
+			}
+			bindings = append(bindings, b)
 		}
-		bindings = append(bindings, b)
+		if err == nil {
+			err = pathalg.ValidateContainedSymlinkSet(bindings)
+		}
 	}
-	if err := pathalg.ValidateContainedSymlinkSet(bindings); err != nil {
+	if err != nil {
 		return fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, err)
 	}
 	return nil
@@ -402,19 +403,18 @@ func (s *Service) downloadPlannedFiles(ctx context.Context, rfs ports.RemoteFSPo
 	}
 	return nil
 }
-func applyDirTimesBottomUp(root ports.RootHandle, dirs []plannedDir) (bool, error) {
+func applyDirTimesBottomUp(root ports.RootHandle, dirs []plannedDir, preserved *bool) error {
 	ordered := slices.Clone(dirs)
 	slices.SortFunc(ordered, func(a, b plannedDir) int {
 		return cmp.Or(cmp.Compare(b.local.Depth(), a.local.Depth()), a.local.Compare(b.local))
 	})
-	preserved := false
 	for _, d := range ordered {
 		if isValidRFC3339Time(d.modTime) {
 			if err := root.Chtimes(d.local, d.modTime, d.modTime); err != nil {
-				return false, err
+				return err
 			}
-			preserved = true
+			*preserved = true
 		}
 	}
-	return preserved, nil
+	return nil
 }

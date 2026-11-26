@@ -40,12 +40,11 @@ func (s *Service) RecoverTransfer(ctx context.Context, req RecoverTransferReques
 	})
 }
 func (s *Service) cleanAbortedDownloadStage(st fsm.TransferState, localRoot algebraic.Option[pathalg.LocalDir]) {
-	if st == nil || st.Kind() != fsm.TransferKindAborted {
-		return
-	}
-	if meta := fsm.TransferMetaOf(st); meta.Direction() == fsm.TransferDirectionDownload {
-		if _, localStageOpt, err := computeStreamStagePaths(meta); err == nil {
-			s.removeLocalBestEffort(localRoot, localStageOpt)
+	if st != nil && st.Kind() == fsm.TransferKindAborted {
+		if meta := fsm.TransferMetaOf(st); meta.Direction() == fsm.TransferDirectionDownload {
+			if _, localStageOpt, err := computeStreamStagePaths(meta); err == nil {
+				s.removeLocalBestEffort(localRoot, localStageOpt)
+			}
 		}
 	}
 }
@@ -73,17 +72,11 @@ func (s *Service) RecoverAllTransfers(ctx context.Context, req RecoverAllRequest
 func (s *Service) ResumeTransfer(ctx context.Context, req ResumeTransferRequest) (TransferHandleInfo, error) {
 	defer closeStreamIfNonNil(req.OperationStream)
 	hop, err := s.validateBaseCall(ctx, req.CallBase)
-	if err != nil || s.journals == nil || !req.TransferID.IsValid() {
-		return TransferHandleInfo{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, fmt.Errorf("%w: TransferID 无效", ErrInvalidRequest)))
+	rs, hasRS := req.RemoteSource.Get()
+	if err != nil || s.journals == nil || !req.TransferID.IsValid() || (hasRS && !rs.IsValid()) {
+		return TransferHandleInfo{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, fmt.Errorf("%w: TransferID 或 RemoteSource 无效", ErrInvalidRequest)))
 	}
-	var initPaths []pathalg.RemotePath
-	if rs, ok := req.RemoteSource.Get(); ok {
-		if !rs.IsValid() {
-			return TransferHandleInfo{}, fmt.Errorf("%w: RemoteSource 无效", ErrInvalidRequest)
-		}
-		initPaths = []pathalg.RemotePath{rs}
-	}
-	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "resume", paths: initPaths, params: map[string]string{"transfer_id": req.TransferID.String(), "start_next_gen": strconv.FormatBool(req.StartNextGen)}, defaultRisk: security.RiskModerate, summary: "transfer resume " + req.TransferID.String()}
+	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "resume", paths: pickIf(hasRS, []pathalg.RemotePath{rs}, nil), params: map[string]string{"transfer_id": req.TransferID.String(), "start_next_gen": strconv.FormatBool(req.StartNextGen)}, defaultRisk: security.RiskModerate, summary: "transfer resume " + req.TransferID.String()}
 	if s.enforceStrictPaths() {
 		spec.customCanon = s.makeResumeCanonicalizer(spec, pickIf(req.NodeID != "", req.NodeID, hop.NodeID()), req.TransferID)
 	}
@@ -94,10 +87,12 @@ func (s *Service) ResumeTransfer(ctx context.Context, req ResumeTransferRequest)
 func (s *Service) makeResumeCanonicalizer(spec authOpSpec, nodeID string, transferID security.OperationID) gate.CanonicalizeFunc {
 	return func(ctx context.Context) (gate.CanonicalizeResult, error) {
 		rpaths, extra := slices.Clone(spec.paths), slices.Clone(spec.extraPaths)
-		if snaps, err := s.journals.LoadGenerations(ctx, transferID); err == nil {
-			if dest, ok := extractLatestJournalDest(snaps); ok {
-				rpaths, extra = collectDestPaths(dest, algebraic.None[pathalg.RemotePath](), rpaths, extra)
-			}
+		snaps, err := s.journals.LoadGenerations(ctx, transferID)
+		if err != nil && !errors.Is(err, ports.ErrNotFound) {
+			return gate.CanonicalizeResult{}, err
+		}
+		if dest, ok := extractLatestJournalDest(snaps); ok {
+			rpaths, extra = collectDestPaths(dest, algebraic.None[pathalg.RemotePath](), rpaths, extra)
 		}
 		return s.canonicalizeRemoteTargets(ctx, security.CapabilityKindOf[security.CapTransfer](), spec, nodeID, rpaths, nil, extra)
 	}
@@ -149,11 +144,7 @@ func (s *Service) recoverFromStore(ctx context.Context, transferID security.Oper
 		return TransferRecoveryResult{TransferID: transferID}, err
 	}
 	res, pruneList, recErr := recoverFromGenerationSnapshots(transferID, snaps)
-	if recErr != nil || res.UncertainCommit {
-		s.emitRecoveryDiag(transferID, res, recErr)
-		return res, recErr
-	}
-	if pruneSuperseded {
+	if recErr == nil && !res.UncertainCommit && pruneSuperseded {
 		for _, g := range pruneList {
 			if pErr := s.journals.PruneGeneration(ctx, transferID, g); pErr != nil && !errors.Is(pErr, ports.ErrNotFound) {
 				return res, pErr
@@ -161,8 +152,8 @@ func (s *Service) recoverFromStore(ctx context.Context, transferID security.Oper
 			res.PrunedGenerations = append(res.PrunedGenerations, g)
 		}
 	}
-	s.emitRecoveryDiag(transferID, res, nil)
-	return res, nil
+	s.emitRecoveryDiag(transferID, res, recErr)
+	return res, recErr
 }
 func (s *Service) emitRecoveryDiag(id security.OperationID, res TransferRecoveryResult, err error) {
 	attrs := map[string]string{"selected_gen": strconv.FormatUint(res.SelectedGen, 10), "uncertain": strconv.FormatBool(res.UncertainCommit)}
@@ -235,14 +226,12 @@ func recoverHealthyHighestWithLowers(transferID security.OperationID, lowers []p
 	pruneList := make([]uint64, 0, len(lowers))
 	hiMeta := fsm.TransferMetaOf(hiSt)
 	for _, lo := range lowers {
-		var err error
 		if lo.Corrupt() {
-			err = verifyCorruptLowerIdentity(lo.PartialRecords(), hiMeta)
+			if err := verifyCorruptLowerIdentity(lo.PartialRecords(), hiMeta); err != nil {
+				return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, err
+			}
 		} else if _, _, _, dErr := fsm.RecoverTransferFromDualJournal(lo.Records(), hiRecs); dErr != nil {
-			err = fmt.Errorf("%w: %w", ErrCorruptJournal, dErr)
-		}
-		if err != nil {
-			return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, err
+			return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, fmt.Errorf("%w: %w", ErrCorruptJournal, dErr)
 		}
 		pruneList = append(pruneList, lo.Generation())
 	}
