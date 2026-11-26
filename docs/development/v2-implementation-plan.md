@@ -227,6 +227,6 @@ go run ./scripts/ci/verify.go --stage=dst
 - **Phase 1（纯函数领域核闭环，`Gate G1` 已通过）**：`[x] P1-T1` · `[x] P1-T2` · `[x] P1-T3` · `[x] P1-T4` · `[x] P1-T5` · `[x] P1-T6` · **`[x] Gate G1`**
 - **Phase 2（出站端口、TCK、`core/osfs` 与零 `sshnet` 依赖运行时闭环，`Gate G2` 已通过）**：`[x] P2-T1` · `[x] P2-T2` · `[x] P2-T3` · `[x] P2-T4` · `[x] P2-T5` · `[x] P2-T6` · **`[x] Gate G2`**
 - **Phase 2.5（Walking Skeleton 闭环，`Gate G2.5` 已通过并完成 Phase 3 ∥ Phase 4 端口冻结）**：`[x] P2.5-T1` · `[x] P2.5-T2` · **`[x] Gate G2.5`**
-- **Phase 3**：`[ ] P3-T1` · `[ ] P3-T2` · `[ ] P3-T3` · `[ ] P3-T4` · `[ ] P3-T5` · **`[ ] Gate G3`**
+- **Phase 3（全量用例服务、MCP 运行时与 `core/engine` 全量门面闭环，`Gate G3` 已通过且 `core/ports` 零漂移）**：`[x] P3-T1` · `[x] P3-T2` · `[x] P3-T3` · `[x] P3-T4` · `[x] P3-T5` · **`[x] Gate G3`**
 - **Phase 4**：`[ ] P4-T1` · `[ ] P4-T2` · `[ ] P4-T3` · `[ ] P4-T4` · **`[ ] Gate G4`**
 - **Phase 5**：`[ ] P5-T1` · `[ ] P5-T2` · `[ ] P5-T3` · `[ ] P5-T4` · **`[ ] Gate G5`**
