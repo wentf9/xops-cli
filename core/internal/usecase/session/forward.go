@@ -119,17 +119,18 @@ type forwardResource interface {
 //xops:opaque
 //xops:failclosed
 type managedForward struct {
-	valid                   bool
-	spec                    ports.ForwardSpec
-	boundAddr               string
-	handle                  ports.ForwardHandle
-	conn                    ports.TransportConn
-	localTUN, remoteTUN     io.ReadWriteCloser
-	nursery                 *conc.Nursery
-	doneCh                  chan struct{}
-	closed                  atomic.Bool
-	resCloseOnce, closeOnce sync.Once
-	err                     firstErr
+	valid                            bool
+	spec                             ports.ForwardSpec
+	boundAddr                        string
+	handle                           ports.ForwardHandle
+	conn                             ports.TransportConn
+	localTUN, remoteTUN              io.ReadWriteCloser
+	nursery                          *conc.Nursery
+	doneCh                           chan struct{}
+	closed                           atomic.Bool
+	remaining                        atomic.Int32
+	ioCloseOnce, doneOnce, closeOnce sync.Once
+	err                              firstErr
 }
 
 func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn ports.TransportConn, spec ports.ForwardSpec) (*managedForward, error) {
@@ -149,18 +150,27 @@ func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn 
 	}
 	mf := &managedForward{valid: true, spec: spec, boundAddr: fh.BoundAddr(), handle: fh, conn: conn, doneCh: make(chan struct{})}
 	return finishManagedForward(revokeCtx, mf, func(wCtx context.Context) error {
-		defer func() { _ = mf.closeResources() }()
-		select {
-		case <-wCtx.Done():
-		case <-fh.Done():
+		return mf.watchHandle(wCtx, fh)
+	})
+}
+func (f *managedForward) watchHandle(wCtx context.Context, fh ports.ForwardHandle) error {
+	defer func() { _ = f.closeIO() }()
+	if wCtx.Err() != nil {
+		return nil
+	}
+	select {
+	case <-wCtx.Done():
+	case <-fh.Done():
+		// 仅在非主动撤销/关闭路径下记录底层转发故障或上游断连，避免与 StopForward 竞争误报 ErrClosed。
+		if wCtx.Err() == nil && !f.closed.Load() {
 			if fErr := fh.Err(); fErr != nil {
-				mf.err.record(fErr)
-			} else if !mf.conn.IsAlive() {
-				mf.err.record(ports.ErrClosed)
+				f.err.record(fErr)
+			} else if !f.conn.IsAlive() {
+				f.err.record(ports.ErrClosed)
 			}
 		}
-		return nil
-	})
+	}
+	return nil
 }
 func startDirectTUNBridge(leaseCtx, revokeCtx context.Context, conn ports.TransportConn, tunPort ports.TUNDevicePort, spec ports.ForwardSpec) (*managedForward, error) {
 	tunSpec, ok := spec.TUN().Get()
@@ -184,26 +194,38 @@ func startDirectTUNBridge(leaseCtx, revokeCtx context.Context, conn ports.Transp
 	}
 	mf := &managedForward{valid: true, spec: spec, boundAddr: ifaceName, conn: conn, localTUN: localDev, remoteTUN: remoteTUN, doneCh: make(chan struct{})}
 	pump := func(dst io.Writer, src io.Reader) func(context.Context) error {
-		return func(context.Context) error {
+		return func(wCtx context.Context) error {
 			// 任一方向流终止（含正常 EOF 或关闭错）即代表隧道结束，立即关闭双端并取消看门狗避免僵尸隧道。
-			defer func() { _ = mf.closeResources(); mf.nursery.Cancel(ports.ErrClosed) }()
-			if _, err := io.Copy(dst, src); err != nil && !isRemotePipeClosedErr(err) {
+			defer func() { _ = mf.closeIO(); mf.nursery.Cancel(ports.ErrClosed) }()
+			if _, err := io.Copy(dst, src); err != nil && !isRemotePipeClosedErr(err) && wCtx.Err() == nil && !mf.closed.Load() {
 				mf.err.record(err)
 			}
 			return nil
 		}
 	}
-	return finishManagedForward(revokeCtx, mf, pump(remoteTUN, localDev), pump(localDev, remoteTUN), func(wCtx context.Context) error { <-wCtx.Done(); _ = mf.closeResources(); return nil })
+	return finishManagedForward(revokeCtx, mf, pump(remoteTUN, localDev), pump(localDev, remoteTUN), func(wCtx context.Context) error { <-wCtx.Done(); _ = mf.closeIO(); return nil })
 }
 func finishManagedForward(revokeCtx context.Context, mf *managedForward, workers ...func(context.Context) error) (*managedForward, error) {
 	n, err := conc.NewNursery(revokeCtx)
 	if err != nil {
-		_ = mf.closeResources()
+		_ = mf.closeIO()
+		mf.markDone()
 		return nil, err
 	}
 	mf.nursery = n
+	// 仅在全部受监督协程退出且 I/O 已关闭后关闭 doneCh，建立所有 mf.err.record -> <-info.Done() 的严格 happens-before 边。
+	mf.remaining.Store(int32(len(workers)))
 	for _, w := range workers {
-		if err := n.Go(w); err != nil {
+		worker := w
+		if err := n.Go(func(wCtx context.Context) error {
+			defer func() {
+				if mf.remaining.Add(-1) == 0 {
+					_ = mf.closeIO()
+					mf.markDone()
+				}
+			}()
+			return worker(wCtx)
+		}); err != nil {
 			_ = mf.Close()
 			return nil, err
 		}
@@ -249,23 +271,27 @@ func (h directTUNHandle) BoundAddr() string       { return h.f.boundAddr }
 func (h directTUNHandle) Done() <-chan struct{}   { return h.f.doneCh }
 func (h directTUNHandle) Err() error              { return h.f.Err() }
 func (h directTUNHandle) Close() error            { return h.f.Close() }
-func (f *managedForward) closeResources() error {
+func (f *managedForward) closeIO() error {
 	var err error
-	f.resCloseOnce.Do(func() {
+	f.ioCloseOnce.Do(func() {
 		f.closed.Store(true)
 		err = closeClosers(f.handle, f.localTUN, f.remoteTUN, f.conn)
 		f.err.record(err)
-		close(f.doneCh)
 	})
 	return err
+}
+func (f *managedForward) markDone() {
+	f.doneOnce.Do(func() { close(f.doneCh) })
 }
 func (f *managedForward) Close() error {
 	if f == nil || !f.valid {
 		return nil
 	}
 	f.closeOnce.Do(func() {
+		f.closed.Store(true)
 		f.nursery.Cancel(ports.ErrClosed)
-		f.err.record(errors.Join(f.closeResources(), f.nursery.Close()))
+		f.err.record(errors.Join(f.closeIO(), f.nursery.Close()))
+		f.markDone()
 	})
 	return f.Err()
 }
