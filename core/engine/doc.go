@@ -39,6 +39,14 @@ var (
 	ErrInvalidRequestTTY = errors.New("engine: 无效的 RequestTTY 模式")
 	// ErrReconcilerUnavailable 表示未注入 AuditReconciler 崩溃审计对账端口。
 	ErrReconcilerUnavailable = errors.New("engine: 未配置 AuditReconciler 崩溃对账端口")
+	// ErrVaultUnavailable 表示未注入 SecretVault 凭据库端口，无法执行凭据用例。
+	ErrVaultUnavailable = errors.New("engine: 未配置 SecretVault 凭据库端口")
+	// ErrMCPServerNotInitialized 表示在 nil 或零值未初始化 MCPServer 上调用方法。
+	ErrMCPServerNotInitialized = errors.New("engine: MCPServer 未初始化")
+	// ErrProjectionNotInitialized 表示在 nil 或零值未初始化 Projection 上调用方法。
+	ErrProjectionNotInitialized = errors.New("engine: Projection 未初始化")
+	// ErrApprovalRequired 表示操作被护栏拦截并签发了两步审批挑战信封。
+	ErrApprovalRequired = errors.New("engine: 操作需要两步审批确认")
 )
 
 func zeroVal[T any]() (z T) { return z }

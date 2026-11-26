@@ -259,6 +259,7 @@ func TestEngine_LoopbackInteractivePTYRelayAndResize(t *testing.T) {
 	rig := newLoopbackRigBase(t, true)
 	clientPub, keyPath := writeTestKeyInRoot(t, rig.rootFS, rig.sshDir, "id_interactive")
 	srv := newLoopbackSSHServer(t, clientPub)
+	srv.expectResize()
 
 	eng, err := engine.New(engine.Config{
 		Profile:        engine.PolicyProfileDirectOperator,

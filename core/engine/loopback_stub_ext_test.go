@@ -49,6 +49,12 @@ type loopbackSSHServer struct {
 	seenResizeCols uint32
 	seenResizeRows uint32
 	resizeCount    int
+	waitResizeCh   chan struct{}
+	resizeOnce     sync.Once
+}
+
+func (s *loopbackSSHServer) expectResize() {
+	s.waitResizeCh = make(chan struct{})
 }
 
 func newLoopbackSSHServer(t *testing.T, authorizedPubs ...ssh.PublicKey) *loopbackSSHServer {
@@ -317,6 +323,9 @@ func (s *loopbackSSHServer) dispatchSessionReq(n *conc.Nursery, ch ssh.Channel, 
 			s.seenResizeCols, s.seenResizeRows = p.Cols, p.Rows
 			s.resizeCount++
 			s.mu.Unlock()
+			if s.waitResizeCh != nil {
+				s.resizeOnce.Do(func() { close(s.waitResizeCh) })
+			}
 		}
 		replyReq(req, true)
 	case "exec":
@@ -329,8 +338,8 @@ func (s *loopbackSSHServer) dispatchSessionReq(n *conc.Nursery, ch ssh.Channel, 
 		})
 	case "shell":
 		replyReq(req, true)
-		_ = n.Go(func(context.Context) error {
-			s.runShell(ch)
+		_ = n.Go(func(shellCtx context.Context) error {
+			s.runShell(shellCtx, ch)
 			return nil
 		})
 	default:
@@ -352,12 +361,18 @@ func (s *loopbackSSHServer) runExec(ch ssh.Channel, cmd string) {
 	}
 }
 
-func (s *loopbackSSHServer) runShell(ch ssh.Channel) {
+func (s *loopbackSSHServer) runShell(ctx context.Context, ch ssh.Channel) {
 	defer func() { _ = ch.Close() }()
 	if s.shellGreeting != "" {
 		_, _ = io.WriteString(ch, s.shellGreeting)
 	}
 	_, _ = io.Copy(ch, ch)
+	if s.waitResizeCh != nil {
+		select {
+		case <-s.waitResizeCh:
+		case <-ctx.Done():
+		}
+	}
 	sendChannelExitStatus(ch, 0)
 }
 

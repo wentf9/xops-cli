@@ -6,64 +6,98 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/inventory"
+	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/pool"
+	ucauto "github.com/wentf9/xops-cli/core/internal/usecase/automation"
+	uccred "github.com/wentf9/xops-cli/core/internal/usecase/credential"
 	ucinv "github.com/wentf9/xops-cli/core/internal/usecase/inventory"
+	ucobs "github.com/wentf9/xops-cli/core/internal/usecase/observability"
 	ucsess "github.com/wentf9/xops-cli/core/internal/usecase/session"
+	uctrans "github.com/wentf9/xops-cli/core/internal/usecase/transfer"
 	"github.com/wentf9/xops-cli/core/ports"
+)
+
+const (
+	defaultSystemBusBuffer       = 64
+	defaultOperationStreamBuffer = 64
 )
 
 // Engine 是 XOps v2 六边形核心的唯一公开业务编排与运行期门面（ADR-001 / ADR-008 / ADR-009）；
 // 零值恒未初始化且所有方法均严格失败关闭。
-//
-// 生命周期与停机次序：
-//   - 由组合根（cmd/xops）通过 New(cfg) 显式装配，严禁全局单例或 init() 隐式构造；
-//   - Close(ctx) 按确定性逆序执行：拒绝新入站操作并取消在途 UseCase 上下文等待排空 ->
-//     关闭连接池 Pool（同步收敛全部 DualActor 与拆断协程）-> 关闭 Engine 自建的 SystemBus；
-//   - 外部注入的 AuditSink、ScopedRootFS、OperatorReadFS、Vault、SystemBus 由组合根在 Engine.Close 之后逆序关闭。
+// Close(ctx) 按确定性逆序关闭：派生 MCPServer -> 在途 UseCase 排空 -> 连接池 Pool -> 自建 SystemBus。
 //
 //xops:opaque
 //xops:failclosed
 type Engine struct {
 	initialized bool // 非指针正向有效门控（满足 xopsvet/failclosed 零值最严约束）
 
-	clock   ports.Clock
-	entropy ports.Entropy
-	bus     *events.SystemBus
-	ownsBus bool
+	clock    ports.Clock
+	entropy  ports.Entropy
+	scopedFS ports.ScopedRootFS
+	bus      *events.SystemBus
+	ownsBus  bool
 
-	pool      *pool.Pool
-	gate      *gate.Gate
-	inventory *ucinv.Service
-	session   *ucsess.Service
+	pool          *pool.Pool
+	gate          *gate.Gate
+	inventory     *ucinv.Service
+	credential    *uccred.Service
+	session       *ucsess.Service
+	transfer      *uctrans.Service
+	mcpTransfer   *uctrans.Service // 物理 0 OperatorReadFS，专供 MCP 运行时
+	automation    *ucauto.Service
+	mcpAutomation *ucauto.Service // 物理 0 OperatorReadFS，专供 MCP 运行时
+	observability *ucobs.Service
 
-	opCtx    context.Context
-	opCancel context.CancelCauseFunc
-
-	opMu     sync.Mutex
-	closing  bool
-	inflight int
-	drainCh  chan struct{}
-
-	closeOnce sync.Once
-	closeErr  error
+	opCtx      context.Context
+	opCancel   context.CancelCauseFunc
+	opMu       sync.Mutex
+	closing    bool
+	inflight   int
+	drainCh    chan struct{}
+	mcpServers map[*MCPServer]struct{}
+	closeOnce  sync.Once
+	closeErr   error
 }
 
-// New 校验配置与出站依赖，装配真实主机信任库（sshnet/hostkey）、真实 SSH 拨号器（sshnet/dial）、
-// 连接池（pool）、安全门控（gate，接线 OnHaltFunc -> pool.GateHalted）及目标解析/会话用例服务。
-// 任意装配步骤失败时均同步回滚已创建的后台资源，保证零 goroutine 泄漏。
+type engineServices struct {
+	inventory     *ucinv.Service
+	credential    *uccred.Service
+	session       *ucsess.Service
+	transfer      *uctrans.Service
+	mcpTransfer   *uctrans.Service
+	automation    *ucauto.Service
+	mcpAutomation *ucauto.Service
+	observability *ucobs.Service
+}
+
+type pendingRefBridge struct {
+	mu  sync.Mutex
+	inv *ucinv.Service
+}
+
+func (b *pendingRefBridge) ActivePendingSecretRefs() []inventory.PendingSecretRef {
+	b.mu.Lock()
+	inv := b.inv
+	b.mu.Unlock()
+	if inv == nil {
+		return nil
+	}
+	return inv.ActivePendingSecretRefs()
+}
+
+// New 校验配置与出站依赖，装配拨号器、连接池、安全门控（OnHalt -> pool.GateHalted）及全部 6 大用例服务与 MCP 沙箱服务。
+// 任意步骤失败均同步回滚已建后台资源，保证零 goroutine 泄漏。
 func New(cfg Config) (*Engine, error) {
 	profile, policy, err := validateBaseConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
-	hostTrust, err := buildHostTrustPort(cfg)
-	if err != nil {
-		return nil, err
-	}
-	realDialer, err := buildRealDialer(cfg, hostTrust)
+	dialer, err := buildDialerPort(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +110,7 @@ func New(cfg Config) (*Engine, error) {
 			bus.Close()
 		}
 	}
-	pCfg, err := buildPoolConfig(cfg, realDialer, bus)
+	pCfg, err := buildPoolConfig(cfg, dialer, bus)
 	if err != nil {
 		rollbackBus()
 		return nil, err
@@ -95,31 +129,21 @@ func New(cfg Config) (*Engine, error) {
 		rollbackAll()
 		return nil, err
 	}
-	invSvc, sessSvc, err := buildEngineServices(cfg, g, p)
+	svcs, err := buildEngineServices(cfg, g, p, bus)
 	if err != nil {
 		rollbackAll()
 		return nil, err
 	}
 	opCtx, opCancel := context.WithCancelCause(context.Background())
 	return &Engine{
-		initialized: true,
-		clock:       cfg.Clock,
-		entropy:     cfg.Entropy,
-		bus:         bus,
-		ownsBus:     ownsBus,
-		pool:        p,
-		gate:        g,
-		inventory:   invSvc,
-		session:     sessSvc,
-		opCtx:       opCtx,
-		opCancel:    opCancel,
+		initialized: true, clock: cfg.Clock, entropy: cfg.Entropy, scopedFS: cfg.ScopedFS,
+		bus: bus, ownsBus: ownsBus, pool: p, gate: g,
+		inventory: svcs.inventory, credential: svcs.credential, session: svcs.session,
+		transfer: svcs.transfer, mcpTransfer: svcs.mcpTransfer,
+		automation: svcs.automation, mcpAutomation: svcs.mcpAutomation, observability: svcs.observability,
+		opCtx: opCtx, opCancel: opCancel, mcpServers: make(map[*MCPServer]struct{}),
 	}, nil
 }
-
-const (
-	defaultSystemBusBuffer       = 64
-	defaultOperationStreamBuffer = 64
-)
 
 func resolveSystemBus(cfg Config) (*events.SystemBus, bool, error) {
 	if cfg.SystemBus != nil {
@@ -129,9 +153,7 @@ func resolveSystemBus(cfg Config) (*events.SystemBus, bool, error) {
 	if buf == 0 {
 		buf = defaultSystemBusBuffer
 	}
-	bus, err := events.NewSystemBus(events.SystemBusConfig{
-		DefaultSubscriberBuffer: buf,
-	})
+	bus, err := events.NewSystemBus(events.SystemBusConfig{DefaultSubscriberBuffer: buf})
 	if err != nil {
 		return nil, false, fmt.Errorf("%w: 创建默认 SystemBus 失败: %w", ErrInvalidConfig, err)
 	}
@@ -139,24 +161,13 @@ func resolveSystemBus(cfg Config) (*events.SystemBus, bool, error) {
 }
 
 func buildEngineGate(
-	cfg Config,
-	profile gate.PolicyProfileKind,
-	policy gate.GuardrailPolicy,
-	bus *events.SystemBus,
-	p *pool.Pool,
+	cfg Config, profile gate.PolicyProfileKind, policy gate.GuardrailPolicy, bus *events.SystemBus, p *pool.Pool,
 ) (*gate.Gate, error) {
 	userOnHalt := cfg.OnHalt
 	g, err := gate.NewGate(gate.GateConfig{
-		Profile:     profile,
-		Policy:      policy,
-		AuditSink:   cfg.AuditSink,
-		Reconciler:  cfg.Reconciler,
-		Interaction: cfg.Interaction,
-		Clock:       cfg.Clock,
-		Entropy:     cfg.Entropy,
-		SystemBus:   bus,
-		// 严格遵循 ADR-008/ADR-009：Gate 进入不可逆 Halted 后第一时间通知连接池吊销全部句柄，
-		// 再触发可选外部 OnHalt 通知。
+		Profile: profile, Policy: policy, AuditSink: cfg.AuditSink, Reconciler: cfg.Reconciler,
+		Interaction: cfg.Interaction, Clock: cfg.Clock, Entropy: cfg.Entropy, SystemBus: bus,
+		// ADR-008/ADR-009：Gate 进入不可逆 Halted 后第一时间通知连接池吊销全部句柄，再触发外部回调。
 		OnHalt: func(info gate.HaltInfo) {
 			p.GateHalted(info.Cause())
 			if userOnHalt != nil {
@@ -170,51 +181,104 @@ func buildEngineGate(
 	return g, nil
 }
 
-func buildEngineServices(
-	cfg Config,
-	g *gate.Gate,
-	p *pool.Pool,
-) (*ucinv.Service, *ucsess.Service, error) {
+func buildEngineServices(cfg Config, g *gate.Gate, p *pool.Pool, bus *events.SystemBus) (engineServices, error) {
+	var out engineServices
+	bridge := &pendingRefBridge{}
+	if cfg.Vault != nil {
+		credSvc, err := uccred.NewService(uccred.ServiceConfig{
+			Gate: g, Vault: cfg.Vault, VaultControl: cfg.VaultControl, Store: cfg.InventoryStore,
+			Interaction: cfg.Interaction, Clock: cfg.Clock, Entropy: cfg.Entropy, PendingRefs: bridge,
+		})
+		if err != nil {
+			return out, fmt.Errorf("%w: 初始化凭据服务失败: %w", ErrInvalidConfig, err)
+		}
+		out.credential = credSvc
+	}
 	invSvc, err := ucinv.NewService(ucinv.ServiceConfig{
-		OpenSSH:       cfg.OpenSSH,
-		Env:           cfg.Env,
-		GlobalOptions: cfg.GlobalOptions,
-		MaxJumpDepth:  cfg.MaxJumpDepth,
+		OpenSSH: cfg.OpenSSH, Env: cfg.Env, GlobalOptions: cfg.GlobalOptions, MaxJumpDepth: cfg.MaxJumpDepth,
+		Store: cfg.InventoryStore, Gate: g, Vault: cfg.Vault, VaultControl: cfg.VaultControl,
+		KeySigner: cfg.KeySigner, Interaction: cfg.Interaction, Credential: out.credential,
+		Clock: cfg.Clock, Entropy: cfg.Entropy, Importers: cfg.Importers, KnownStores: cfg.KnownStores,
+		DefaultEnrollTTL: cfg.DefaultEnrollTTL.OrElse(zeroVal[algebraic.Duration]()),
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: 初始化目标解析服务失败: %w", ErrInvalidConfig, err)
+		return out, fmt.Errorf("%w: 初始化资产服务失败: %w", ErrInvalidConfig, err)
 	}
-	sessSvc, err := ucsess.NewService(ucsess.ServiceConfig{
-		Gate:     g,
-		Pool:     p,
-		Clock:    cfg.Clock,
-		Env:      cfg.Env,
-		Terminal: cfg.Terminal,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: 初始化会话执行服务失败: %w", ErrInvalidConfig, err)
+	bridge.mu.Lock()
+	bridge.inv = invSvc
+	bridge.mu.Unlock()
+	out.inventory = invSvc
+
+	if out.session, err = ucsess.NewService(ucsess.ServiceConfig{
+		Gate: g, Pool: p, Clock: cfg.Clock, Env: cfg.Env, Terminal: cfg.Terminal,
+		Escalator: cfg.PrivilegeEscalation, Vault: cfg.Vault, Interaction: cfg.Interaction,
+		ShellProbe: cfg.ShellProbe, Forwarder: cfg.Forwarder, TUNDevice: cfg.TUNDevice, MuxSocket: cfg.MuxSocket,
+	}); err != nil {
+		return out, fmt.Errorf("%w: 初始化会话服务失败: %w", ErrInvalidConfig, err)
 	}
-	return invSvc, sessSvc, nil
+	if err = buildTransferAutoObsServices(cfg, g, p, bus, invSvc, &out); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
-// ReconcileCrashedAudits 执行启动期 O(1) 跨进程崩溃审计对账（ADR-008 / RFC §3.4），
-// 委托内部 gate.ReconcileCrashedAudits 扫描死亡锁并补写 AbortedByCrash，使 cmd/xops 无需导入 core/internal/gate。
+func buildTransferAutoObsServices(
+	cfg Config, g *gate.Gate, p *pool.Pool, bus *events.SystemBus, invSvc *ucinv.Service, out *engineServices,
+) error {
+	tCfg := uctrans.ServiceConfig{
+		Gate: g, Pool: p, Clock: cfg.Clock, Entropy: cfg.Entropy, ScopedFS: cfg.ScopedFS,
+		OperatorReadFS: cfg.OperatorReadFS, Journals: cfg.JournalStore, SystemBus: bus,
+		DefaultChunkSize: cfg.TransferDefaultChunkSize, DefaultMaxReadBytes: cfg.TransferDefaultMaxReadBytes,
+		DefaultConcurrency: cfg.TransferDefaultConcurrency,
+	}
+	var err error
+	if out.transfer, err = uctrans.NewService(tCfg); err != nil {
+		return fmt.Errorf("%w: 初始化传输服务失败: %w", ErrInvalidConfig, err)
+	}
+	out.mcpTransfer = out.transfer
+	if cfg.OperatorReadFS != nil {
+		tCfg.OperatorReadFS = nil
+		if out.mcpTransfer, err = uctrans.NewService(tCfg); err != nil {
+			return fmt.Errorf("%w: 初始化 MCP 沙箱传输服务失败: %w", ErrInvalidConfig, err)
+		}
+	}
+	aCfg := ucauto.ServiceConfig{
+		Gate: g, Pool: p, Clock: cfg.Clock, Entropy: cfg.Entropy, Env: cfg.Env, ScopedFS: cfg.ScopedFS,
+		OperatorReadFS: cfg.OperatorReadFS, Inventory: invSvc, SystemBus: bus,
+		DefaultConcurrency: cfg.AutomationDefaultConcurrency, MaxScriptBytes: cfg.AutomationMaxScriptBytes,
+		MaxTemplateBytes: cfg.AutomationMaxTemplateBytes, MaxCopyBytes: cfg.AutomationMaxCopyBytes,
+	}
+	if out.automation, err = ucauto.NewService(aCfg); err != nil {
+		return fmt.Errorf("%w: 初始化自动化服务失败: %w", ErrInvalidConfig, err)
+	}
+	out.mcpAutomation = out.automation
+	if cfg.OperatorReadFS != nil {
+		aCfg.OperatorReadFS = nil
+		if out.mcpAutomation, err = ucauto.NewService(aCfg); err != nil {
+			return fmt.Errorf("%w: 初始化 MCP 沙箱自动化服务失败: %w", ErrInvalidConfig, err)
+		}
+	}
+	if out.observability, err = ucobs.NewService(ucobs.ServiceConfig{
+		Gate: g, Pool: p, Clock: cfg.Clock, Entropy: cfg.Entropy, Env: cfg.Env,
+		ScopedFS: cfg.ScopedFS, Forwarder: cfg.Forwarder, ShellProbe: cfg.ShellProbe, SystemBus: bus,
+	}); err != nil {
+		return fmt.Errorf("%w: 初始化可观测性与 GUI 服务失败: %w", ErrInvalidConfig, err)
+	}
+	return nil
+}
+
+// ReconcileCrashedAudits 执行启动期 O(1) 跨进程崩溃审计对账（ADR-008 / RFC §3.4）。
 func (e *Engine) ReconcileCrashedAudits(ctx context.Context) (ReconcileReport, error) {
-	runCtx, cleanup, err := e.beginOp(ctx)
-	if err != nil {
-		return ReconcileReport{}, err
-	}
-	defer cleanup()
-
-	raw, err := e.gate.ReconcileCrashedAudits(runCtx)
-	if err != nil {
-		return ReconcileReport{}, mapGateError(err)
-	}
-	return ReconcileReport{raw: raw, valid: true}, nil
+	return runOp(e, ctx, func(runCtx context.Context) (ReconcileReport, error) {
+		raw, err := e.gate.ReconcileCrashedAudits(runCtx)
+		if err != nil {
+			return ReconcileReport{}, err
+		}
+		return ReconcileReport{raw: raw, valid: true}, nil
+	})
 }
 
-// NewOperationStream 从 Engine 显式熵源分配全局唯一 TraceID 与 OperationID，
-// 构造供单次操作绑定的隔离 events.OperationStream（确定性 EOF；buffer==0 取默认 64，负值失败关闭）。
+// NewOperationStream 从显式熵源分配唯一 TraceID/OperationID，构造单次操作隔离事件流（确定性 EOF）。
 func (e *Engine) NewOperationStream(ctx context.Context, buffer int) (*events.OperationStream, error) {
 	if e == nil || !e.initialized {
 		return nil, ErrEngineNotInitialized
@@ -242,42 +306,26 @@ func (e *Engine) NewOperationStream(ctx context.Context, buffer int) (*events.Op
 	if err != nil {
 		return nil, fmt.Errorf("engine: 分配 OperationID 失败: %w", err)
 	}
-	return events.NewOperationStream(events.OperationStreamConfig{
-		TraceID:         tid,
-		OperationID:     oid,
-		OperationBuffer: buffer,
-	})
+	return events.NewOperationStream(events.OperationStreamConfig{TraceID: tid, OperationID: oid, OperationBuffer: buffer})
 }
 
-// SystemBus 返回 Engine 绑定的只读诊断事件总线（未初始化零值返回 nil）。
+// SystemBus / IsHalted / HaltInfo / IsClosed 提供 Engine 运行态只读查询（未初始化零值严格失败关闭）。
 func (e *Engine) SystemBus() *events.SystemBus {
 	if e == nil || !e.initialized {
 		return nil
 	}
 	return e.bus
 }
-
-// IsHalted 报告安全门控是否已进入不可逆 Halted 熔断态；nil 或未初始化零值失败关闭返回 true。
-func (e *Engine) IsHalted() bool {
-	if e == nil || !e.initialized {
-		return true
-	}
-	return e.gate.IsHalted()
-}
-
-// HaltInfo 返回进入不可逆 Halted 熔断态时的只读诊断快照；尚未熔断或未初始化返回 (零值, false)。
+func (e *Engine) IsHalted() bool { return e == nil || !e.initialized || e.gate.IsHalted() }
 func (e *Engine) HaltInfo() (HaltInfo, bool) {
 	if e == nil || !e.initialized {
 		return HaltInfo{}, false
 	}
-	info, ok := e.gate.HaltInfo()
-	if !ok {
-		return HaltInfo{}, false
+	if info, ok := e.gate.HaltInfo(); ok {
+		return haltInfoFromGate(info), true
 	}
-	return haltInfoFromGate(info), true
+	return HaltInfo{}, false
 }
-
-// IsClosed 报告 Engine 是否已进入关闭或已完成关闭；nil 或未初始化零值失败关闭返回 true。
 func (e *Engine) IsClosed() bool {
 	if e == nil || !e.initialized {
 		return true
@@ -288,10 +336,7 @@ func (e *Engine) IsClosed() bool {
 	return closed
 }
 
-// Close 按确定性逆序优雅关闭 Engine（幂等且并发安全）：
-//  1. 拒绝新入站请求、取消在途 UseCase 上下文并等待在途操作排空（受 ctx.Done 有界约束）；
-//  2. 关闭连接池 Pool（同步回收全部 DualActor、保活及拆断协程）；
-//  3. 若 SystemBus 由 Engine 自建则关闭之（绝不关闭外部注入的 SystemBus 或 AuditSink/ScopedFS）。
+// Close 按确定性逆序优雅关闭 Engine（幂等并发安全）：MCPServer -> UseCases 排空 -> Pool -> 自建 SystemBus。
 func (e *Engine) Close(ctx context.Context) error {
 	if e == nil || !e.initialized {
 		return ErrEngineNotInitialized
@@ -299,16 +344,18 @@ func (e *Engine) Close(ctx context.Context) error {
 	if ctx == nil {
 		return ErrNilContext
 	}
-	e.closeOnce.Do(func() {
-		e.closeErr = e.shutdownReverseOrder(ctx)
-	})
+	e.closeOnce.Do(func() { e.closeErr = e.shutdownReverseOrder(ctx) })
 	return e.closeErr
 }
 
 func (e *Engine) shutdownReverseOrder(ctx context.Context) error {
-	// 阶段 1（UseCases）：进入关闭态并取消在途操作上下文，等待在途调用收敛。
 	e.opMu.Lock()
 	e.closing = true
+	var servers []*MCPServer
+	for srv := range e.mcpServers {
+		servers = append(servers, srv)
+	}
+	clear(e.mcpServers)
 	var waitCh chan struct{}
 	if e.inflight > 0 {
 		if e.drainCh == nil {
@@ -318,6 +365,10 @@ func (e *Engine) shutdownReverseOrder(ctx context.Context) error {
 	}
 	e.opMu.Unlock()
 
+	var mcpErrs []error
+	for _, srv := range servers {
+		mcpErrs = append(mcpErrs, srv.Close(ctx))
+	}
 	e.opCancel(ErrEngineClosed)
 
 	var drainErr error
@@ -328,15 +379,43 @@ func (e *Engine) shutdownReverseOrder(ctx context.Context) error {
 			drainErr = ctx.Err()
 		}
 	}
-
-	// 阶段 2（Pool）：即使排空超时也必须关闭连接池以消除后台协程与连接泄漏。
 	poolErr := e.pool.Close()
-
-	// 阶段 3（Events）：仅关闭 Engine 自有 SystemBus。
 	if e.ownsBus && e.bus != nil {
 		e.bus.Close()
 	}
-	return errors.Join(drainErr, poolErr)
+	return errors.Join(append(mcpErrs, drainErr, poolErr)...)
+}
+
+//xops:syncclosure
+func runOp[T any](e *Engine, ctx context.Context, fn func(context.Context) (T, error)) (T, error) {
+	runCtx, cleanup, err := e.beginOp(ctx)
+	if err != nil {
+		return zeroVal[T](), err
+	}
+	defer cleanup()
+	out, err := fn(runCtx)
+	return out, mapGateError(err)
+}
+
+//xops:syncclosure
+func runOpErr(e *Engine, ctx context.Context, fn func(context.Context) error) error {
+	runCtx, cleanup, err := e.beginOp(ctx)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	return mapGateError(fn(runCtx))
+}
+
+//xops:syncclosure
+func runTargetOp[T any](e *Engine, ctx context.Context, target TargetInput, fn func(context.Context, ResolvedTarget) (T, error)) (T, error) {
+	return runOp(e, ctx, func(c context.Context) (T, error) {
+		resolved, err := e.resolveTargetRef(c, target.Target, target.TargetSpec, target.CLIOptions)
+		if err != nil {
+			return zeroVal[T](), err
+		}
+		return fn(c, resolved)
+	})
 }
 
 func (e *Engine) beginOp(ctx context.Context) (context.Context, func(), error) {
@@ -368,19 +447,15 @@ func (e *Engine) beginOp(ctx context.Context) (context.Context, func(), error) {
 			<-bridgeDone
 		}
 		cancelRun(nil)
-		e.endOp()
+		e.opMu.Lock()
+		e.inflight--
+		if e.closing && e.inflight == 0 && e.drainCh != nil {
+			close(e.drainCh)
+			e.drainCh = nil
+		}
+		e.opMu.Unlock()
 	}
 	return runCtx, cleanup, nil
-}
-
-func (e *Engine) endOp() {
-	e.opMu.Lock()
-	e.inflight--
-	if e.closing && e.inflight == 0 && e.drainCh != nil {
-		close(e.drainCh)
-		e.drainCh = nil
-	}
-	e.opMu.Unlock()
 }
 
 func mapGateError(err error) error {
@@ -394,4 +469,8 @@ func mapGateError(err error) error {
 		return fmt.Errorf("%w: %w", ErrReconcilerUnavailable, err)
 	}
 	return err
+}
+
+func (e *Engine) resolveTargetRef(ctx context.Context, pre ResolvedTarget, spec string, cliOpts option.OptionLayer) (ResolvedTarget, error) {
+	return e.resolveTargetForSession(ctx, pre, spec, cliOpts, algebraic.None[option.OriginKind](), nil)
 }
