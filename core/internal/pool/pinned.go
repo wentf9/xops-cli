@@ -16,6 +16,15 @@ import (
 
 var _ ports.TransportConn = (*pinnedTransportConn)(nil)
 
+type (
+	subsystemStreamOpener interface {
+		OpenSubsystemStream(ctx context.Context, subsystem string) (io.ReadWriteCloser, error)
+	}
+	waitDoneProvider interface {
+		WaitDone() <-chan struct{}
+	}
+)
+
 func extractLeasePinMeta[K plan.HandleKind](p *Pool, lease *Lease, binding security.OperationBinding) (plan.HopDigest, uint64, plan.PlanDigest, error) {
 	var zeroHop plan.HopDigest
 	var zeroPlan plan.PlanDigest
@@ -151,6 +160,31 @@ func (t *pinnedTransportConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (
 }
 func (t *pinnedTransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	return dpCall(t.checkDataPlane(ctx), func() (ports.RemoteFSPort, error) { return t.inst.conn.OpenRemoteFS(ctx) })
+}
+
+// WaitDone 透传底层连接的断连通知通道（供 ForwardHandle 与 ControlMaster 在上游断连时即时收敛）；
+// 若视图已失效则立即返回已关闭通道，若底层实现未暴露 WaitDone 则返回 nil。
+func (t *pinnedTransportConn) WaitDone() <-chan struct{} {
+	if !t.IsAlive() {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	if wp, ok := t.inst.conn.(waitDoneProvider); ok {
+		return wp.WaitDone()
+	}
+	return nil
+}
+
+// OpenSubsystemStream 经池世代与熔断门控校验后透传底层连接的命名子系统原始流（支撑 ControlMaster 复用 SFTP）。
+func (t *pinnedTransportConn) OpenSubsystemStream(ctx context.Context, subsystem string) (io.ReadWriteCloser, error) {
+	return dpCall(t.checkDataPlane(ctx), func() (io.ReadWriteCloser, error) {
+		opener, ok := t.inst.conn.(subsystemStreamOpener)
+		if !ok {
+			return nil, ports.ErrUnsupported
+		}
+		return opener.OpenSubsystemStream(ctx, subsystem)
+	})
 }
 
 //xops:syncclosure

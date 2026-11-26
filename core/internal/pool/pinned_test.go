@@ -3,6 +3,8 @@ package pool
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"sync/atomic"
 	"testing"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
+	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -211,4 +214,88 @@ func TestRegisterLeaseHandleWithRollbackAndConcurrentRevocation(t *testing.T) {
 	requireNoErr(t, p.WaitPendingTeardowns(ctx), "WaitPendingTeardowns(concurrent)")
 	requireTrue(t, p.Stats().ActiveHandles == 0, "并发退役后绝不能泄漏槽位")
 	requireTrue(t, lateRes != nil && lateRes.closeCount.Load() == 1, "并发退役后延迟返回的资源须被有界关闭")
+}
+
+type subsystemWaitDoneConn struct {
+	*mockConn
+	waitDoneCh chan struct{}
+}
+
+func (c *subsystemWaitDoneConn) WaitDone() <-chan struct{} { return c.waitDoneCh }
+func (c *subsystemWaitDoneConn) OpenSubsystemStream(_ context.Context, subsystem string) (io.ReadWriteCloser, error) {
+	if subsystem != "sftp" {
+		return nil, ports.ErrUnsupported
+	}
+	a, b := net.Pipe()
+	_ = b.Close()
+	return a, nil
+}
+
+type extDialerFunc func(context.Context, plan.HopSpec, plan.HopDigest, ports.TransportConn) (ports.TransportConn, error)
+
+func (f extDialerFunc) DialHop(ctx context.Context, hop plan.HopSpec, dig plan.HopDigest, parent ports.TransportConn) (ports.TransportConn, error) {
+	return f(ctx, hop, dig, parent)
+}
+
+// TestPinnedTransportConn_SubsystemStreamAndWaitDoneFailClosed 验证 pinnedTransportConn
+// 透传 WaitDone / OpenSubsystemStream 并在句柄吊销与 GateHalted 后严格失败关闭。
+func TestPinnedTransportConn_SubsystemStreamAndWaitDoneFailClosed(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	pl := mustPlan(t, mustHop(t, 0, "sub-node", "198.51.100.191", 22, 0, 0))
+	binding := mustBindingForPlan(t, pl.PlanDigest(), "mux", "subsystem")
+
+	// 1. 底层不支持可选扩展的默认 mockConn：OpenSubsystemStream 返 ErrUnsupported，WaitDone 返 nil。
+	pPlain, _, _ := newTestPool(t, PoolConfig{})
+	defer func() { requireNoErr(t, pPlain.Close(), "pPlain.Close") }()
+	plainHandle, plainConn := mustPinMuxHandle(t, ctx, pPlain, pl, binding)
+	ssoPlain, ok := plainConn.(subsystemStreamOpener)
+	requireTrue(t, ok, "pinnedTransportConn 须实现 subsystemStreamOpener")
+	_, err := ssoPlain.OpenSubsystemStream(ctx, "sftp")
+	requireErrIs(t, err, ports.ErrUnsupported, "底层不支持时 OpenSubsystemStream 期望 ErrUnsupported")
+	wpPlain, ok := plainConn.(waitDoneProvider)
+	requireTrue(t, ok && wpPlain.WaitDone() == nil, "底层未提供 WaitDone 时期望返回 nil")
+	requireNoErr(t, ReleaseHandle[plan.KindMux](pPlain, plainHandle), "ReleaseHandle(plain)")
+	requireNoErr(t, pPlain.WaitPendingTeardowns(ctx), "WaitPendingTeardowns(plain)")
+
+	// 2. 底层支持 WaitDone + OpenSubsystemStream：活跃时透传，ReleaseHandle 后立即失败关闭且 WaitDone 返回已关闭通道。
+	doneCh := make(chan struct{})
+	d := extDialerFunc(func(_ context.Context, hop plan.HopSpec, dig plan.HopDigest, _ ports.TransportConn) (ports.TransportConn, error) {
+		return &subsystemWaitDoneConn{mockConn: newMockConn(dig, hop.Endpoint()), waitDoneCh: doneCh}, nil
+	})
+	p, _, _ := newTestPool(t, PoolConfig{Dialer: d})
+	defer func() { requireNoErr(t, p.Close(), "p.Close") }()
+	extHandle, extConn := mustPinMuxHandle(t, ctx, p, pl, binding)
+	sso, ok := extConn.(subsystemStreamOpener)
+	requireTrue(t, ok, "pinnedTransportConn 须实现 subsystemStreamOpener")
+	wp, ok := extConn.(waitDoneProvider)
+	requireTrue(t, ok && wp.WaitDone() == doneCh, "活跃 pinnedTransportConn 须透传底层 WaitDone 通道")
+	rw, err := sso.OpenSubsystemStream(ctx, "sftp")
+	requireNoErr(t, err, "活跃 OpenSubsystemStream(sftp)")
+	requireNoErr(t, rw.Close(), "close subsystem stream")
+
+	requireNoErr(t, ReleaseHandle[plan.KindMux](p, extHandle), "ReleaseHandle(ext)")
+	requireNoErr(t, p.WaitPendingTeardowns(ctx), "WaitPendingTeardowns(ext)")
+	_, err = sso.OpenSubsystemStream(ctx, "sftp")
+	requireErrIs(t, err, ports.ErrClosed, "关闭视图后 OpenSubsystemStream 须失败关闭")
+	select {
+	case <-wp.WaitDone():
+	default:
+		t.Fatal("失效 pinnedTransportConn.WaitDone() 须立即返回已关闭通道")
+	}
+}
+
+func mustPinMuxHandle(t *testing.T, ctx context.Context, p *Pool, pl plan.SealedConnectionPlan, binding security.OperationBinding) (plan.ManagedHandle[plan.KindMux], ports.TransportConn) {
+	t.Helper()
+	var pinned ports.TransportConn
+	var handle plan.ManagedHandle[plan.KindMux]
+	requireNoErr(t, p.WithLease(ctx, pl, func(_ context.Context, lease *Lease) error {
+		var err error
+		handle, err = RegisterLeaseHandleWith[plan.KindMux](p, lease, binding, func(rCtx context.Context, c ports.TransportConn) (*pinnedTransportRes, error) {
+			pinned = c
+			return &pinnedTransportRes{conn: c, revokeCtx: rCtx, valid: true}, nil
+		})
+		return err
+	}), "WithLease(pin)")
+	return handle, pinned
 }

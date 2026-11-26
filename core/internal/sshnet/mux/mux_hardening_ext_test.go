@@ -196,3 +196,99 @@ func runClientAliveAndListenTCPChecks(
 	_, cErr := m.Control(ctx, exitReq)
 	return cErr
 }
+
+type waitDoneUpstream struct {
+	ports.TransportConn
+	doneCh chan struct{}
+}
+
+func (u *waitDoneUpstream) WaitDone() <-chan struct{} { return u.doneCh }
+
+// TestMuxSocket_StopListeningDrainCancelsOnUpstreamDrop 验证 #144 Nit #1 / #147 Minor #2：
+// 发送 CStopListening (-O stop) 后，在途代理流排空期间若上游传输断开（WaitDone 关闭），
+// Serve 仍保持上游监听器存活并立即取消活跃代理处理器的上下文（0 悬挂、0 泄漏）。
+func TestMuxSocket_StopListeningDrainCancelsOnUpstreamDrop(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	dir := shortMuxTempDir(t)
+	sockPath := mustLocalSource(t, filepath.Join(dir, "drop-drain.sock"))
+
+	proxyEntered := make(chan struct{})
+	proxyCanceled := make(chan struct{})
+	m := mux.NewMuxSocket(mux.Config{
+		ProxyHandler: func(pCtx context.Context, _ net.Conn, _ ports.TransportConn) error {
+			close(proxyEntered)
+			<-pCtx.Done()
+			close(proxyCanceled)
+			return pCtx.Err()
+		},
+	})
+	simDialer := sim.NewSimDialer(nil, nil)
+	singlePlan, _ := tck.MustHopAndPlan(t)
+	hop0, _ := singlePlan.HopAt(0)
+	dig0, _ := singlePlan.HopDigestAt(0)
+	rawUp, err := simDialer.DialHop(ctx, hop0, dig0, nil)
+	if err != nil {
+		t.Fatalf("DialHop: %v", err)
+	}
+	defer func() { _ = rawUp.Close() }()
+	up := &waitDoneUpstream{TransportConn: rawUp, doneCh: make(chan struct{})}
+
+	ready := make(chan struct{})
+	err = conc.RunWait(ctx, func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(c context.Context) error {
+			return m.WithListener(c, sockPath, func(ln net.Listener) error {
+				close(ready)
+				return m.Serve(c, ln, up, nil)
+			})
+		}); gErr != nil {
+			return gErr
+		}
+		return n.Go(func(c context.Context) error {
+			return runUpstreamDropDuringDrainClient(c, m, sockPath, up.doneCh, ready, proxyEntered, proxyCanceled)
+		})
+	})
+	if err != nil {
+		t.Fatalf("排空期上游断连取消验证失败: %v", err)
+	}
+}
+
+func runUpstreamDropDuringDrainClient(
+	ctx context.Context,
+	m *mux.MuxSocket,
+	sockPath pathalg.LocalSourcePath,
+	upstreamDone chan struct{},
+	ready, proxyEntered, proxyCanceled <-chan struct{},
+) error {
+	if err := waitSignalOrCancel(ctx, ready); err != nil {
+		return err
+	}
+	pConn, err := m.OpenProxy(ctx, sockPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = pConn.Close() }()
+	if err := waitSignalOrCancel(ctx, proxyEntered); err != nil {
+		return err
+	}
+	stopReq, _ := ports.NewMuxControlRequest(ports.MuxActionStop, sockPath, algebraic.None[ports.ForwardSpec]())
+	if _, err := m.Control(ctx, stopReq); err != nil {
+		return err
+	}
+	// 触发上游断连：排空窗口内 watcherStop 尚未关闭，必须立即取消代理处理器 ctx。
+	close(upstreamDone)
+	if err := waitSignalOrCancel(ctx, proxyCanceled); err != nil {
+		return errors.New("CStopListening 排空期间上游断连未取消活跃 ProxyHandler")
+	}
+	return nil
+}
+
+func waitSignalOrCancel(ctx context.Context, ch <-chan struct{}) error {
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}

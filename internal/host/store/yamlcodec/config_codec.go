@@ -15,6 +15,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
+	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
 	"go.yaml.in/yaml/v3"
 )
@@ -28,6 +29,7 @@ type (
 		Revision  uint64             `yaml:"revision,omitempty"`
 		Vault     *VaultConfigDTO    `yaml:"vault,omitempty"`
 		Policy    *PolicyConfigDTO   `yaml:"policy,omitempty"`
+		Options   *OptionLayerDTO    `yaml:"options,omitempty"` // Tier-3 XOpsGlobal OpenSSH 选项层
 		Inventory InventoryConfigDTO `yaml:"inventory"`
 	}
 	//xops:dto
@@ -51,12 +53,19 @@ type (
 		Guardrail  *GuardrailConfigDTO `yaml:"guardrail,omitempty"`
 	}
 	//xops:dto
+	// NodeOverrideDTO 描述单条节点通配符护栏覆写配置（兼容标量简写 "safe" 与完整映射 {approval_threshold, decision_floor}）。
+	NodeOverrideDTO struct {
+		ApprovalThreshold string `yaml:"approval_threshold,omitempty"`
+		DecisionFloor     string `yaml:"decision_floor,omitempty"`
+	}
+	//xops:dto
 	GuardrailConfigDTO struct {
-		ApprovalThreshold string              `yaml:"approval_threshold,omitempty"`
-		NoElicitFallback  string              `yaml:"no_elicit_fallback,omitempty"`
-		AuditLog          string              `yaml:"audit_log,omitempty"`
-		ProtectedPaths    []string            `yaml:"protected_paths,omitempty"`
-		ApprovalTTL       *algebraic.Duration `yaml:"approval_ttl,omitempty"`
+		ApprovalThreshold string                     `yaml:"approval_threshold,omitempty"`
+		NoElicitFallback  string                     `yaml:"no_elicit_fallback,omitempty"`
+		AuditLog          string                     `yaml:"audit_log,omitempty"`
+		ProtectedPaths    []string                   `yaml:"protected_paths,omitempty"`
+		NodeOverrides     map[string]NodeOverrideDTO `yaml:"node_overrides,omitempty"`
+		ApprovalTTL       *algebraic.Duration        `yaml:"approval_ttl,omitempty"`
 	}
 	//xops:dto
 	InventoryConfigDTO struct {
@@ -124,7 +133,7 @@ func DecodeConfigDocumentYAML(raw []byte) (doc ConfigDocument, graph inventory.G
 	if doc.Version != SchemaVersionV2 {
 		return ConfigDocument{}, graph, fmt.Errorf("%w: %w (got=%d)", ports.ErrCorruptData, ErrUnsupportedSchemaVersion, doc.Version)
 	}
-	if err = validateTopSections(doc.Vault, doc.Policy); err != nil {
+	if err = validateTopSections(doc.Vault, doc.Policy, doc.Options); err != nil {
 		return ConfigDocument{}, graph, fmt.Errorf("%w: %w", ports.ErrCorruptData, err)
 	}
 	if graph, err = decodeInventoryGraph(doc.Inventory, doc.Vault); err != nil {
@@ -148,7 +157,7 @@ func EncodeConfigDocumentYAML(doc ConfigDocument) ([]byte, error) {
 	if doc.Version != SchemaVersionV2 {
 		return nil, fmt.Errorf("%w: 仅允许编码 version=%d", ErrUnsupportedSchemaVersion, SchemaVersionV2)
 	}
-	if err := validateTopSections(doc.Vault, doc.Policy); err != nil {
+	if err := validateTopSections(doc.Vault, doc.Policy, doc.Options); err != nil {
 		return nil, err
 	}
 	var buf bytes.Buffer
@@ -184,8 +193,108 @@ func EncodeInventoryGraphDTO(g inventory.Graph) (InventoryConfigDTO, error) {
 	return dto, nil
 }
 
-func validateTopSections(v *VaultConfigDTO, p *PolicyConfigDTO) error {
-	return errors.Join(validateVaultConfigDTO(v), validatePolicyConfigDTO(p))
+func validateTopSections(v *VaultConfigDTO, p *PolicyConfigDTO, opts *OptionLayerDTO) error {
+	var optErr error
+	if opts != nil {
+		_, optErr = DecodeOptionLayerDTO(opts)
+	}
+	return errors.Join(validateVaultConfigDTO(v), validatePolicyConfigDTO(p), optErr)
+}
+
+// UnmarshalYAML 解析节点护栏覆写项：支持标量阈值简写（如 "safe"）与完整映射（approval_threshold / decision_floor），
+// 对未知字段、重复键或空值严格失败关闭。
+func (d *NodeOverrideDTO) UnmarshalYAML(value *yaml.Node) error {
+	if value == nil || value.Tag == "!!null" {
+		return fmt.Errorf("policy.guardrail.node_overrides 规则值不能为空")
+	}
+	if value.Kind == yaml.ScalarNode {
+		*d = NodeOverrideDTO{ApprovalThreshold: value.Value}
+		return nil
+	}
+	if value.Kind != yaml.MappingNode || len(value.Content)%2 != 0 {
+		return fmt.Errorf("policy.guardrail.node_overrides 规则必须为阈值字符串或映射对象")
+	}
+	return decodeNodeOverrideMapping(d, value.Content)
+}
+
+func decodeNodeOverrideMapping(dst *NodeOverrideDTO, content []*yaml.Node) error {
+	var parsed NodeOverrideDTO
+	seenThreshold, seenFloor := false, false
+	for i := 0; i < len(content); i += 2 {
+		kNode, vNode := content[i], content[i+1]
+		if vNode.Kind != yaml.ScalarNode || vNode.Tag == "!!null" {
+			return fmt.Errorf("policy.guardrail.node_overrides.%s 必须为非空字符串", kNode.Value)
+		}
+		switch kNode.Value {
+		case "approval_threshold":
+			if seenThreshold {
+				return fmt.Errorf("policy.guardrail.node_overrides 重复字段 approval_threshold")
+			}
+			parsed.ApprovalThreshold, seenThreshold = vNode.Value, true
+		case "decision_floor":
+			if seenFloor {
+				return fmt.Errorf("policy.guardrail.node_overrides 重复字段 decision_floor")
+			}
+			parsed.DecisionFloor, seenFloor = vNode.Value, true
+		default:
+			return fmt.Errorf("policy.guardrail.node_overrides 包含未知字段 %q", kNode.Value)
+		}
+	}
+	*dst = parsed
+	return nil
+}
+
+// DecodeNodeOverridesDTO 校验并将 YAML node_overrides 映射确定性折叠为不可变 security.NodeOverrides 格集合。
+func DecodeNodeOverridesDTO(entries map[string]NodeOverrideDTO) (security.NodeOverrides, error) {
+	var zero security.NodeOverrides
+	if len(entries) == 0 {
+		return security.EmptyNodeOverrides(), nil
+	}
+	rules := make([]security.NodeOverrideRule, 0, len(entries))
+	for _, pat := range slices.Sorted(maps.Keys(entries)) {
+		rule, err := decodeSingleNodeOverride(pat, entries[pat])
+		if err != nil {
+			return zero, err
+		}
+		rules = append(rules, rule)
+	}
+	return security.NewNodeOverrides(rules...)
+}
+
+func decodeSingleNodeOverride(pattern string, dto NodeOverrideDTO) (security.NodeOverrideRule, error) {
+	var zero security.NodeOverrideRule
+	th, err := security.ParseRiskLevel(dto.ApprovalThreshold)
+	if err != nil {
+		return zero, fmt.Errorf("node_overrides[%q].approval_threshold 无效: %w", pattern, err)
+	}
+	if strings.TrimSpace(dto.DecisionFloor) == "" {
+		return security.NewNodeOverrideRule(pattern, th)
+	}
+	fl, err := security.ParseDecisionKind(dto.DecisionFloor)
+	if err != nil {
+		return zero, fmt.Errorf("node_overrides[%q].decision_floor 无效: %w", pattern, err)
+	}
+	return security.NewNodeOverrideRuleWithFloor(pattern, th, fl)
+}
+
+// EncodeNodeOverridesDTO 将不可变 security.NodeOverrides 无损编码为 YAML DTO 映射（空集合返回 nil）。
+func EncodeNodeOverridesDTO(ov security.NodeOverrides) (map[string]NodeOverrideDTO, error) {
+	if !ov.IsValid() {
+		return nil, security.ErrInvalidNodeOverride
+	}
+	rules := ov.Rules()
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]NodeOverrideDTO, len(rules))
+	for _, r := range rules {
+		dto := NodeOverrideDTO{ApprovalThreshold: r.ApprovalThreshold().String()}
+		if r.DecisionFloor() != security.DecisionKindAllow {
+			dto.DecisionFloor = r.DecisionFloor().String()
+		}
+		out[r.Pattern()] = dto
+	}
+	return out, nil
 }
 
 func validateVaultConfigDTO(v *VaultConfigDTO) error {
@@ -215,15 +324,20 @@ func validatePolicyConfigDTO(p *PolicyConfigDTO) error {
 	if p == nil {
 		return nil
 	}
-	if !isEmptyOrIn(p.CLIDefault, "direct_operator", "strict") || !isEmptyOrIn(p.MCPDefault, "strict_agent", "direct_operator") {
+	if !isEmptyOrIn(p.CLIDefault, "direct_operator", "strict", "strict_operator", "strict_agent") ||
+		!isEmptyOrIn(p.MCPDefault, "direct_operator", "strict", "strict_operator", "strict_agent") {
 		return fmt.Errorf("policy 默认策略配置非法")
 	}
 	if g := p.Guardrail; g != nil {
-		if !isEmptyOrIn(g.ApprovalThreshold, "safe", "moderate", "dangerous", "critical") || !isEmptyOrIn(g.NoElicitFallback, "deny", "ask") {
+		if !isEmptyOrIn(g.ApprovalThreshold, "safe", "moderate", "dangerous", "critical") ||
+			!isEmptyOrIn(g.NoElicitFallback, "deny", "challenge") {
 			return fmt.Errorf("policy.guardrail 阈值或降级策略非法")
 		}
 		if g.ApprovalTTL != nil && !g.ApprovalTTL.IsPositive() {
 			return fmt.Errorf("policy.guardrail.approval_ttl 必须为正时长")
+		}
+		if _, err := DecodeNodeOverridesDTO(g.NodeOverrides); err != nil {
+			return fmt.Errorf("policy.guardrail.node_overrides 非法: %w", err)
 		}
 	}
 	return nil
@@ -305,7 +419,7 @@ func encodeNodeDTO(n inventory.Node) (NodeDTO, error) {
 	if err != nil {
 		return NodeDTO{}, err
 	}
-	optDTO, err := encodeOptionLayerDTO(n.Options())
+	optDTO, err := EncodeOptionLayerDTO(n.Options())
 	if err != nil {
 		return NodeDTO{}, err
 	}
@@ -358,7 +472,7 @@ func buildDecodedNode(nid inventory.NodeID, hid inventory.HostID, iid inventory.
 	if err != nil {
 		return z, err
 	}
-	opts, err := decodeOptionLayerDTO(dto.Options)
+	opts, err := DecodeOptionLayerDTO(dto.Options)
 	if err != nil {
 		return z, err
 	}

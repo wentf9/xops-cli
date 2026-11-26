@@ -37,6 +37,7 @@ type muxServerState struct {
 	stopListenOnce   sync.Once
 	stopListenCh     chan struct{}
 	stoppedByControl atomic.Bool
+	upstreamDropped  atomic.Bool
 
 	fwdMu    sync.Mutex
 	forwards map[string]forwardEntry
@@ -77,23 +78,21 @@ func (m *MuxSocket) Serve(
 	}
 	defer st.closeAllForwards()
 
-	runErr := conc.RunWait(serveCtx, func(wCtx context.Context, n *conc.Nursery) error {
+	// 外层 RunScoped 持续运行上游断连监听器，直至内层 RunWait 将全部活跃客户端处理器（含 CStopListening 排空期间的代理流）
+	// 彻底排空退出后才关闭 watcherStop，确保排空窗口内上游断连仍能立即取消全部在途处理器。
+	runErr := conc.RunScoped(serveCtx, func(sCtx context.Context, watchN *conc.Nursery) error {
 		watcherStop := make(chan struct{})
 		defer close(watcherStop)
-		if err := spawnUpstreamWatcher(wCtx, n, upstream, watcherStop, cancelServe); err != nil {
+		if err := spawnUpstreamWatcher(sCtx, watchN, upstream, watcherStop, &st.upstreamDropped, cancelServe); err != nil {
 			return err
 		}
-		acceptCtx, cancelAccept := context.WithCancel(wCtx)
-		defer cancelAccept()
-		if err := spawnStopListenWatcher(n, st.stopListenCh, watcherStop, cancelAccept); err != nil {
-			return err
-		}
-		return chanconn.RunWithAbortWatchdog(acceptCtx, func() { _ = ln.Close() }, func() error {
-			return st.acceptLoop(acceptCtx, n, ln)
-		})
+		return st.serveClients(sCtx, ln)
 	})
 	if st.stoppedByControl.Load() && ctx.Err() == nil {
 		return nil
+	}
+	if st.upstreamDropped.Load() && ctx.Err() == nil {
+		return ports.ErrClosed
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -101,15 +100,40 @@ func (m *MuxSocket) Serve(
 	return runErr
 }
 
-func spawnUpstreamWatcher(ctx context.Context, n *conc.Nursery, upstream ports.TransportConn, watcherStop <-chan struct{}, cancelServe context.CancelFunc) error {
+func (st *muxServerState) serveClients(
+	ctx context.Context,
+	//xops:borrowed
+	ln net.Listener,
+) error {
+	return conc.RunWait(ctx, func(wCtx context.Context, n *conc.Nursery) error {
+		acceptCtx, cancelAccept := context.WithCancel(wCtx)
+		defer cancelAccept()
+		stopWatch := make(chan struct{})
+		defer close(stopWatch)
+		if err := spawnStopListenWatcher(n, st.stopListenCh, stopWatch, cancelAccept); err != nil {
+			return err
+		}
+		return chanconn.RunWithAbortWatchdog(acceptCtx, func() { _ = ln.Close() }, func() error {
+			return st.acceptLoop(acceptCtx, n, ln)
+		})
+	})
+}
+
+func spawnUpstreamWatcher(ctx context.Context, n *conc.Nursery, upstream ports.TransportConn, watcherStop <-chan struct{}, dropped *atomic.Bool, cancelServe context.CancelFunc) error {
 	wp, ok := upstream.(waitDoneProvider)
 	if !ok {
 		return nil
 	}
 	done := wp.WaitDone()
+	if done == nil {
+		return nil
+	}
 	return n.Go(func(wCtx context.Context) error {
 		select {
 		case <-done:
+			if dropped != nil {
+				dropped.Store(true)
+			}
 			cancelServe()
 		case <-watcherStop:
 		case <-wCtx.Done():

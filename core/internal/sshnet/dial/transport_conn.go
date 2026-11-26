@@ -254,6 +254,12 @@ type subsystemReqMsg struct {
 	Subsystem string
 }
 
+// OpenSubsystemStream 以纯标准库 io.ReadWriteCloser 签名暴露受看门狗保护的命名 SSH 子系统流，
+// 供 pool.pinnedTransportConn 与 sshnet/mux 在零额外跨包依赖下透明透传 SFTP 子系统。
+func (c *TransportConn) OpenSubsystemStream(ctx context.Context, subsystem string) (io.ReadWriteCloser, error) {
+	return c.OpenSubsystem(ctx, subsystem)
+}
+
 // OpenSubsystem 在 "session" 通道上请求启动命名 SSH 子系统（如 "sftp"），
 // 全程受 lifeNursery 取消看门狗监督并返回带截止看门狗与 CloseWrite() 的 *chanconn.WatchedConn（供 P4-T2 sshnet/sftp 复用）。
 func (c *TransportConn) OpenSubsystem(ctx context.Context, subsystem string) (*chanconn.WatchedConn, error) {

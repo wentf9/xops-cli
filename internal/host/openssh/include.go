@@ -175,7 +175,7 @@ func joinRelDest(parent algebraic.Option[pathalg.LocalRootedDest], name string) 
 func hasGlobMeta(s string) bool        { return strings.ContainsAny(s, "*?") }
 func hasIncludeGlobMeta(s string) bool { return strings.ContainsAny(s, "*?[") }
 
-// validateIncludeGlobSegment 校验单段 POSIX Include 通配符（*、? 与 [...] / [!...] / [^...] 字符类），
+// validateIncludeGlobSegment 校验单段 POSIX Include 通配符（*、? 与 [...] / [!...] 字符类），
 // 严格拒绝未闭合 '[' 或空/倒置字符范围（如 [z-a]）。
 func validateIncludeGlobSegment(pat string) error {
 	for i := 0; i < len(pat); i++ {
@@ -192,7 +192,7 @@ func validateIncludeGlobSegment(pat string) error {
 }
 
 // matchIncludeGlobSegment 以 O(|P|*|S|) 非回溯双指针实现 POSIX glob(3) 单路径段匹配
-// （支持 '*'、'?' 及 '[...]' / '[!...]' / '[^...]' 字符类，供 OpenSSH Include 使用）。
+// （支持 '*'、'?' 及 '[...]' / '[!...]' 字符类，供 OpenSSH Include 使用）。
 func matchIncludeGlobSegment(name, pat string) (bool, error) {
 	ti, pi, starPi, starTi := 0, 0, -1, 0
 	for ti < len(name) {

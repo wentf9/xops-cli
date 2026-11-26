@@ -43,9 +43,11 @@ type ControlMasterInfo struct {
 	masterPID             uint32
 	effectiveMaster       option.ControlMasterMode
 	effectivePersist      option.ControlPersistSpec
+	doneCh                <-chan struct{}
+	waitErr               func() error
 }
 
-// ControlMasterInfo 零值安全只读访问器。
+// ControlMasterInfo 零值安全只读访问器与响应式停机等待方法（供 entry/muxdaemon 零轮询阻塞等待）。
 func (i ControlMasterInfo) IsValid() bool {
 	if !i.valid || !i.socketPath.IsValid() || !i.effectiveMaster.IsSet() {
 		return false
@@ -65,6 +67,42 @@ func (i ControlMasterInfo) ReusedExisting() bool                        { return
 func (i ControlMasterInfo) MasterPID() uint32                           { return i.masterPID }
 func (i ControlMasterInfo) EffectiveMaster() option.ControlMasterMode   { return i.effectiveMaster }
 func (i ControlMasterInfo) EffectivePersist() option.ControlPersistSpec { return i.effectivePersist }
+
+// Done 返回只读完成信号通道：受管主进程退出并完成监听清理后关闭；复用外部主进程时返回已关闭通道；零值/无效返回 nil。
+func (i ControlMasterInfo) Done() <-chan struct{} {
+	if !i.IsValid() {
+		return nil
+	}
+	return i.doneCh
+}
+
+// Wait 阻塞等待 ControlMaster 退出或 ctx 取消：
+//   - 零值/无效时严格失败关闭返回 ErrInvalidRequest；ctx == nil 返回 ErrNilContext；
+//   - 复用已有外部主进程时直接按 ctx 状态返回 nil / ctx.Err()；
+//   - 正常 -O exit / -O stop 与 ControlPersist 空闲到期（ErrMuxPersistExpired）映射为 nil，其余传输故障原样透传（即使句柄已自动回收）。
+func (i ControlMasterInfo) Wait(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: %w", ErrNilContext, ports.ErrNilContext)
+	}
+	if !i.IsValid() {
+		return fmt.Errorf("%w: %w: ControlMasterInfo 无效", ErrInvalidRequest, ports.ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if i.reusedExisting || i.doneCh == nil {
+		return nil
+	}
+	select {
+	case <-i.doneCh:
+		if i.waitErr != nil {
+			return i.waitErr()
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // ControlMasterStatus 表示受管 ControlMaster 句柄的不可变只读状态快照；零值恒无效并失败关闭。
 //
@@ -264,6 +302,16 @@ func (m *managedMuxMaster) closeWork(cause error) {
 func (m *managedMuxMaster) IsValid() bool {
 	return m != nil && m.valid && !m.closed.Load() && m.conn != nil && m.conn.IsAlive()
 }
+func (m *managedMuxMaster) waitErr() error {
+	if m == nil || !m.valid {
+		return ports.ErrClosed
+	}
+	err := m.serveErr.get()
+	if err == nil || errors.Is(err, ErrMuxPersistExpired) {
+		return nil
+	}
+	return err
+}
 func (m *managedMuxMaster) snapshot(hs pool.HandleStatus) ControlMasterStatus {
 	return ControlMasterStatus{handleStatus: hs, socketPath: m.socketPath, effectiveMaster: m.effectiveMaster, effectivePersist: m.effectivePersist, active: hs.Active() && m.IsValid(), err: m.serveErr.get(), valid: true}
 }
@@ -338,10 +386,13 @@ func (s *Service) execStartControlMaster(authCtx context.Context, connPlan plan.
 		if err != nil {
 			return err
 		}
+		var doneCh <-chan struct{}
+		var waitErrFn func() error
 		if master != nil {
 			master.bindAutoRelease(func() { _ = pool.ReleaseHandle[plan.KindMux](s.cfg.Pool, h) })
+			doneCh, waitErrFn = master.doneCh, master.waitErr
 		}
-		*outInfo = ControlMasterInfo{handle: algebraic.Some(h), socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, valid: true}
+		*outInfo = ControlMasterInfo{handle: algebraic.Some(h), socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, doneCh: doneCh, waitErr: waitErrFn, valid: true}
 		return nil
 	})
 }
@@ -361,7 +412,9 @@ func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sock
 			return false, ControlMasterInfo{}, err
 		}
 	}
-	return true, ControlMasterInfo{socketPath: sockPath, reusedExisting: true, masterPID: resp.MasterPID(), effectiveMaster: effMaster, effectivePersist: effPersist, valid: true}, nil
+	closedCh := make(chan struct{})
+	close(closedCh)
+	return true, ControlMasterInfo{socketPath: sockPath, reusedExisting: true, masterPID: resp.MasterPID(), effectiveMaster: effMaster, effectivePersist: effPersist, doneCh: closedCh, valid: true}, nil
 }
 func confirmMuxMasterWith(ctx context.Context, interaction ports.InteractionPort, nodeID, message string) error {
 	if interaction == nil || !interaction.CanInteract() {

@@ -2,13 +2,21 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"slices"
+	"sync"
+	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
 )
+
+type vaultLocker interface {
+	Lock(ctx context.Context) error
+}
 
 // RouterSpec 是构造多后端按 Store 名称路由的 RouterVault 的显式入参规格。
 type RouterSpec struct {
@@ -25,6 +33,9 @@ type RouterSpec struct {
 type RouterVault struct {
 	stores       map[string]ports.SecretVault
 	defaultStore ports.SecretVault
+	closed       atomic.Bool
+	closeOnce    sync.Once
+	closeErr     error
 	valid        bool
 }
 
@@ -96,6 +107,48 @@ func (r *RouterVault) Delete(ctx context.Context, ref secret.Ref) error {
 	return backend.Delete(ctx, ref)
 }
 
+// Close 幂等关闭路由器并按确定性顺序对去重后的全部底层后端执行 Lock（清零主密钥）与 Close 释放；
+// 关闭后路由器拒绝一切新凭据请求（返回 ports.ErrClosed），供 cmd/xops 逆序停机使用。
+func (r *RouterVault) Close() error {
+	if r == nil || !r.valid {
+		return nil
+	}
+	r.closeOnce.Do(func() {
+		r.closed.Store(true)
+		seen := make(map[ports.SecretVault]struct{}, len(r.stores)+1)
+		var errs []error
+		for _, name := range slices.Sorted(maps.Keys(r.stores)) {
+			errs = appendCloseBackend(errs, seen, r.stores[name])
+		}
+		if r.defaultStore != nil {
+			errs = appendCloseBackend(errs, seen, r.defaultStore)
+		}
+		r.closeErr = errors.Join(errs...)
+	})
+	return r.closeErr
+}
+
+func appendCloseBackend(errs []error, seen map[ports.SecretVault]struct{}, b ports.SecretVault) []error {
+	if b == nil {
+		return errs
+	}
+	if _, dup := seen[b]; dup {
+		return errs
+	}
+	seen[b] = struct{}{}
+	if l, ok := b.(vaultLocker); ok {
+		if err := l.Lock(context.Background()); err != nil && !errors.Is(err, ports.ErrNotFound) && !errors.Is(err, ports.ErrVaultLocked) {
+			errs = append(errs, err)
+		}
+	}
+	if c, ok := b.(io.Closer); ok {
+		if err := c.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errs
+}
+
 func (r *RouterVault) resolve(ctx context.Context, ref secret.Ref) (ports.SecretVault, error) {
 	if ctx == nil {
 		return nil, ports.ErrNilContext
@@ -105,6 +158,9 @@ func (r *RouterVault) resolve(ctx context.Context, ref secret.Ref) (ports.Secret
 	}
 	if r == nil || !r.valid {
 		return nil, fmt.Errorf("%w: RouterVault 未初始化", ports.ErrInvalidArgument)
+	}
+	if r.closed.Load() {
+		return nil, ports.ErrClosed
 	}
 	if !ref.IsValid() {
 		return nil, fmt.Errorf("%w: 无效凭据引用", ports.ErrInvalidArgument)

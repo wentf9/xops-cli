@@ -171,19 +171,13 @@ func decodeVersionPacket(body []byte) (map[string]string, error) {
 }
 
 // negotiateServerLimits 尽力查询 OpenSSH limits@openssh.com 以对齐服务端单包读写上限；
-// 若协商期间上下文取消或底层流已关闭，立即失败关闭（绝不返回已死亡的 Client）；
-// 其余服务端不支持或格式异常场景静默保留安全默认值（32 KiB）。
+// 若协商期间发生传输/协议损坏或上下文取消（roundTrip 返回非 nil 错误），立即向上返回由调用方关闭 Client（绝不返回已死亡的 Client）；
+// 服务端明确以非 EXTENDED_REPLY 响应（如 SSH_FX_OP_UNSUPPORTED）或回复载荷畸形时静默保留安全默认值（32 KiB）。
 func (c *Client) negotiateServerLimits(ctx context.Context) error {
 	payload := appendString(nil, extLimits)
 	pktType, body, err := c.roundTrip(ctx, sshFXPExtended, payload)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		if c.closed.Load() || errors.Is(err, ports.ErrClosed) {
-			return ports.ErrClosed
-		}
-		return nil
+		return err
 	}
 	if pktType != sshFXPExtendedReply {
 		return nil

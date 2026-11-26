@@ -37,6 +37,51 @@ func TestSFTP_ReviewHardening_VersionWriteChunkFIFOAndFallbacks(t *testing.T) {
 	t.Run("ReadDirEmptyBatchHardlinkFallbackAndOversizedRead", func(t *testing.T) {
 		verifyReadDirHardlinkAndOversized(t, ctx)
 	})
+	t.Run("LimitsCorruptReplyClosesClient", func(t *testing.T) {
+		verifyLimitsCorruptReplyClosesClient(t, ctx)
+	})
+}
+
+// verifyLimitsCorruptReplyClosesClient 验证 #147 Minor #1：limits@openssh.com 协商期间若底层流返回损坏包
+// （非 ErrClosed），OpenStream 必须立即返回错误并关闭 Client，绝不吞噬错误返回已死亡的客户端。
+func verifyLimitsCorruptReplyClosesClient(t *testing.T, ctx context.Context) {
+	t.Helper()
+	cliConn, srvConn := net.Pipe()
+	err := conc.RunWait(ctx, func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error { return serveCorruptLimitsOnce(srvConn) }); gErr != nil {
+			return gErr
+		}
+		cli, oErr := sftp.OpenStream(ctx, cliConn, sftp.Config{})
+		_ = cliConn.Close()
+		if cli != nil {
+			_ = cli.Close()
+			return errors.New("limits 协商遭遇损坏包时不得返回非 nil Client")
+		}
+		if !errors.Is(oErr, ports.ErrCorruptData) {
+			return errors.Join(errors.New("limits 协商遭遇损坏包期望 ErrCorruptData"), oErr)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("limits 损坏帧回归校验失败: %v", err)
+	}
+}
+
+func serveCorruptLimitsOnce(srvConn net.Conn) error {
+	defer func() { _ = srvConn.Close() }()
+	if pt, _, rErr := readTestPkt(srvConn); rErr != nil || pt != fxpInit {
+		return rErr
+	}
+	ver := appendTestStr(appendTestStr([]byte{0, 0, 0, 3}, "limits@openssh.com"), "1")
+	if wErr := writeTestPkt(srvConn, fxpVersion, ver); wErr != nil {
+		return wErr
+	}
+	// 读取客户端 limits@openssh.com 扩展请求，随后回写零长度非法帧触发 ErrCorruptData。
+	if pt, _, rErr := readTestPkt(srvConn); rErr != nil || pt != fxpExtended {
+		return rErr
+	}
+	_, _ = srvConn.Write([]byte{0, 0, 0, 0})
+	return nil
 }
 
 func verifyRejectVersion4(t *testing.T, ctx context.Context) {

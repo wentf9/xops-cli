@@ -205,7 +205,8 @@ func decodeProxyJumpDTO(dto *ProxyRouteDTO) (option.ProxyRoute, error) {
 	return jc, nil
 }
 
-func encodeOptionLayerDTO(layer option.OptionLayer) (*OptionLayerDTO, error) {
+// EncodeOptionLayerDTO 将不可变 OpenSSH 选项层无损编码为 YAML vNext OptionLayerDTO（全未设置时返回 nil）。
+func EncodeOptionLayerDTO(layer option.OptionLayer) (*OptionLayerDTO, error) {
 	if err := layer.Validate(); err != nil {
 		return nil, err
 	}
@@ -242,7 +243,8 @@ func encodeOptionLayerDTO(layer option.OptionLayer) (*OptionLayerDTO, error) {
 	}, nil
 }
 
-func decodeOptionLayerDTO(dto *OptionLayerDTO) (option.OptionLayer, error) {
+// DecodeOptionLayerDTO 严格校验并将 YAML vNext OptionLayerDTO 解码为不可变 option.OptionLayer。
+func DecodeOptionLayerDTO(dto *OptionLayerDTO) (option.OptionLayer, error) {
 	if dto == nil {
 		return option.UnsetOptionLayer(), nil
 	}

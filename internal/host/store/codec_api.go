@@ -5,6 +5,8 @@ import (
 	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/inventory"
+	"github.com/wentf9/xops-cli/core/domain/option"
+	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/internal/host/store/yamlcodec"
 )
 
@@ -15,6 +17,7 @@ type (
 	VaultConfigDTO     = yamlcodec.VaultConfigDTO
 	VaultStoreDTO      = yamlcodec.VaultStoreDTO
 	PolicyConfigDTO    = yamlcodec.PolicyConfigDTO
+	NodeOverrideDTO    = yamlcodec.NodeOverrideDTO
 	GuardrailConfigDTO = yamlcodec.GuardrailConfigDTO
 	InventoryConfigDTO = yamlcodec.InventoryConfigDTO
 	SecretRefDTO       = yamlcodec.SecretRefDTO
@@ -55,4 +58,24 @@ func EncodeConfigDocumentYAML(doc ConfigDocument) ([]byte, error) {
 // EncodeInventoryGraphDTO 将不可变 inventory.Graph 无损编码为 YAML vNext InventoryConfigDTO。
 func EncodeInventoryGraphDTO(g inventory.Graph) (InventoryConfigDTO, error) {
 	return yamlcodec.EncodeInventoryGraphDTO(g)
+}
+
+// DecodeOptionLayerDTO 将 YAML vNext OptionLayerDTO 解码为不可变 option.OptionLayer（供 Tier-3 全局选项装配）。
+func DecodeOptionLayerDTO(dto *OptionLayerDTO) (option.OptionLayer, error) {
+	return yamlcodec.DecodeOptionLayerDTO(dto)
+}
+
+// EncodeOptionLayerDTO 将不可变 option.OptionLayer 无损编码为 YAML vNext OptionLayerDTO。
+func EncodeOptionLayerDTO(layer option.OptionLayer) (*OptionLayerDTO, error) {
+	return yamlcodec.EncodeOptionLayerDTO(layer)
+}
+
+// DecodeNodeOverridesDTO 将 YAML node_overrides 映射解码为不可变 security.NodeOverrides 格集合。
+func DecodeNodeOverridesDTO(entries map[string]NodeOverrideDTO) (security.NodeOverrides, error) {
+	return yamlcodec.DecodeNodeOverridesDTO(entries)
+}
+
+// EncodeNodeOverridesDTO 将不可变 security.NodeOverrides 无损编码为 YAML DTO 映射。
+func EncodeNodeOverridesDTO(ov security.NodeOverrides) (map[string]NodeOverrideDTO, error) {
+	return yamlcodec.EncodeNodeOverridesDTO(ov)
 }
