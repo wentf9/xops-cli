@@ -329,6 +329,28 @@ func verifyDanglingAndLiveSymlinksFailClosed(t *testing.T, ctx context.Context) 
 	if _, err := wal.ListActive(ctx); !errors.Is(err, ports.ErrSymlinkRejected) {
 		t.Fatalf("悬空 journals 符号链接 ListActive 返回 %v, 期望 ErrSymlinkRejected", err)
 	}
+	// 多段自定义 JournalDir（nested/journals）祖先目录为悬空符号链接时亦须失败关闭。
+	if err := os.Symlink("missing_nested", filepath.Join(dir, "nested")); err != nil {
+		t.Fatal(err)
+	}
+	nestedDir, err := pathalg.ParseLocalRootedDest("nested/journals")
+	if err != nil {
+		t.Fatal(err)
+	}
+	walNested, err := store.NewWALJournalStore(store.JournalStoreSpec{
+		ScopedFS:   fsPort,
+		RootDir:    rootDir,
+		JournalDir: algebraic.Some(nestedDir),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := walNested.LoadGenerations(ctx, id); !errors.Is(err, ports.ErrSymlinkRejected) {
+		t.Fatalf("多段 JournalDir 悬空祖先 LoadGenerations 返回 %v, 期望 ErrSymlinkRejected", err)
+	}
+	if _, err := walNested.ListActive(ctx); !errors.Is(err, ports.ErrSymlinkRejected) {
+		t.Fatalf("多段 JournalDir 悬空祖先 ListActive 返回 %v, 期望 ErrSymlinkRejected", err)
+	}
 }
 
 // TestImporterHardeningEdgeCases 验证 #34 Minor #2 / Nit #2 + #35 Minor #8：

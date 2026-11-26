@@ -239,7 +239,8 @@ func scanGlobCharClass(pat string, start int, target byte, eval bool) (bool, int
 	if i >= len(pat) {
 		return false, i, fmt.Errorf("通配符 %q 存在未闭合 '['", pat)
 	}
-	negated := pat[i] == '!' || pat[i] == '^'
+	// 严格遵循 POSIX glob(3) 与 OpenSSH readconf.c 语义：仅 '[!...]' 取反，前导 '^' 按字面字符匹配。
+	negated := pat[i] == '!'
 	if negated {
 		i++
 	}

@@ -119,13 +119,28 @@ func (r *FileReconciler) checkArgs(ctx context.Context, now time.Time) error {
 	return nil
 }
 
-func (r *FileReconciler) reconcileInRoot(ctx context.Context, root ports.RootHandle, now time.Time) (ports.CrashReconcileReport, error) {
+func (r *FileReconciler) readRunDirEntries(root ports.RootHandle) ([]ports.LocalDirEntry, bool, error) {
+	runExists, err := checkLstatDirChain(root, r.runDir)
+	if err != nil || !runExists {
+		return nil, false, err
+	}
 	entries, err := root.ReadDir(algebraic.Some(r.runDir))
 	if errors.Is(err, ports.ErrNotFound) {
-		return ports.NewCrashReconcileReport(ports.CrashReconcileReportSpec{})
+		return nil, false, nil
 	}
 	if err != nil {
+		return nil, false, err
+	}
+	return entries, true, nil
+}
+
+func (r *FileReconciler) reconcileInRoot(ctx context.Context, root ports.RootHandle, now time.Time) (ports.CrashReconcileReport, error) {
+	entries, exists, err := r.readRunDirEntries(root)
+	if err != nil {
 		return zeroVal[ports.CrashReconcileReport](), err
+	}
+	if !exists {
+		return ports.NewCrashReconcileReport(ports.CrashReconcileReportSpec{})
 	}
 	var scanned, liveSkipped, deadClaimed int
 	var abortedOps []security.OperationID
@@ -272,7 +287,34 @@ func checkAuditParentDir(root ports.RootHandle, auditFile pathalg.LocalRootedDes
 	if !ok {
 		return true, nil
 	}
-	info, err := root.Lstat(parent)
+	return checkLstatDirChain(root, parent)
+}
+
+// checkLstatDirChain 自顶向下逐级以 Lstat 校验目录链的每个分量，确保多段自定义 RunDir 或 AuditFile
+// 父路径中任一祖先为悬空/存活符号链接时严格失败关闭返回 ports.ErrSymlinkRejected。
+func checkLstatDirChain(root ports.RootHandle, dir pathalg.LocalRootedDest) (bool, error) {
+	parts := strings.Split(dir.String(), "/")
+	cur, err := pathalg.ParseLocalRootedDest(parts[0])
+	if err != nil {
+		return false, err
+	}
+	for i := range parts {
+		if i > 0 {
+			cur, err = cur.JoinComponent(parts[i])
+			if err != nil {
+				return false, err
+			}
+		}
+		exists, cErr := checkSingleLstatDir(root, cur)
+		if cErr != nil || !exists {
+			return false, cErr
+		}
+	}
+	return true, nil
+}
+
+func checkSingleLstatDir(root ports.RootHandle, dir pathalg.LocalRootedDest) (bool, error) {
+	info, err := root.Lstat(dir)
 	if errors.Is(err, ports.ErrNotFound) {
 		return false, nil
 	}
@@ -280,10 +322,10 @@ func checkAuditParentDir(root ports.RootHandle, auditFile pathalg.LocalRootedDes
 		return false, err
 	}
 	if info.IsSymlink() {
-		return false, fmt.Errorf("%w: 审计日志父目录 %q 为符号链接", ports.ErrSymlinkRejected, parent.String())
+		return false, fmt.Errorf("%w: 目录 %q 为符号链接", ports.ErrSymlinkRejected, dir.String())
 	}
 	if !info.IsDir() {
-		return false, fmt.Errorf("%w: 审计日志父路径 %q 不是目录", ports.ErrNotRegularFile, parent.String())
+		return false, fmt.Errorf("%w: 路径 %q 不是目录", ports.ErrNotRegularFile, dir.String())
 	}
 	return true, nil
 }

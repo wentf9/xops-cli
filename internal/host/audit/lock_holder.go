@@ -10,6 +10,7 @@ import (
 
 type lockLogWriterState struct {
 	confirmedOffset int64
+	offsetKnown     bool
 	needNewline     bool
 }
 
@@ -71,7 +72,8 @@ func (s *FileSink) holdProcessLockInRoot(root ports.RootHandle, signalReady func
 }
 
 func (s *FileSink) serveLockCommands(lf ports.LockedFile) error {
-	state := &lockLogWriterState{}
+	// holdProcessLockInRoot 已在进入主循环前完成 truncateAndRewind，因此初始已确认偏移精确锚定在 0。
+	state := &lockLogWriterState{confirmedOffset: 0, offsetKnown: true}
 	for {
 		select {
 		case cmd := <-s.cmdCh:
@@ -87,30 +89,69 @@ func (s *FileSink) serveLockCommands(lf ports.LockedFile) error {
 	}
 }
 
-// applyLockCommand 以严格行帧边界向进程 .lock 追加单条 +opID / -opID 记录；
-// 遇部分写入或刷盘失败时立即按 confirmedOffset 回滚 Truncate+Seek，若回滚本身也失败则置 needNewline，
-// 确保下一次写入始终位于独立行首，绝不把后续有效 +<opID> 拼接到残留半行尾部导致崩溃对账丢失。
+// applyLockCommand 以严格行帧边界向进程 .lock 追加单条 +opID / -opID 记录：
+//   - 若前次故障或排空截断导致偏移未知（!offsetKnown），先以 Seek(0, io.SeekEnd) 重新锚定真实 EOF
+//     并同步修正文件游标，杜绝 confirmedOffset 失步导致后续回滚误截断已确认记录；
+//   - 遇写入或刷盘失败时立即按 confirmedOffset 回滚 Truncate+Seek+Sync，若回滚自身失败则标记
+//     offsetKnown=false 且 needNewline=true，确保后续有效 +<opID> 始终从独立行首落盘。
 func applyLockCommand(lf ports.LockedFile, cmd lockCommand, st *lockLogWriterState) error {
+	if err := reanchorLockOffset(lf, st); err != nil {
+		return err
+	}
 	line := formatLockLogFrame(cmd, st.needNewline)
 	if err := writeAll(lf, line); err != nil {
 		rollbackLockFrame(lf, st)
 		return fmt.Errorf("%w: 写入进程锁日志失败: %w", ports.ErrAuditWriteFailed, err)
 	}
 	if cmd.kind == lockCmdUnstage && cmd.truncateAfter {
-		// 严格遵循 §4 #4：仅在活跃集合归零后执行 Truncate(0) 并紧跟 Seek(0, io.SeekStart)，防稀疏 NUL 空洞。
-		if err := truncateAndRewind(lf); err != nil {
-			rollbackLockFrame(lf, st)
-			return fmt.Errorf("%w: 排空后截断重置进程锁失败: %w", ports.ErrAuditWriteFailed, err)
-		}
-		st.confirmedOffset = 0
-		st.needNewline = false
-		return nil
+		return compactLockAfterDrain(lf, st)
 	}
 	if err := lf.Sync(); err != nil {
 		rollbackLockFrame(lf, st)
 		return fmt.Errorf("%w: 刷盘进程锁日志失败: %w", ports.ErrAuditWriteFailed, err)
 	}
 	st.confirmedOffset += int64(len(line))
+	st.offsetKnown = true
+	st.needNewline = false
+	return nil
+}
+
+func reanchorLockOffset(lf ports.LockedFile, st *lockLogWriterState) error {
+	if st.offsetKnown {
+		return nil
+	}
+	pos, err := lf.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("%w: 重新锚定进程锁文件偏移失败: %w", ports.ErrAuditWriteFailed, err)
+	}
+	st.confirmedOffset = pos
+	st.offsetKnown = true
+	if pos == 0 {
+		st.needNewline = false
+	}
+	return nil
+}
+
+// compactLockAfterDrain 严格遵循 §4 #4 在活跃集合归零后截断并归零偏移：
+// 将 Truncate(0) 与 Seek/Sync 明确拆离——仅当 Truncate(0) 自身失败时才按原 confirmedOffset 回滚；
+// 一旦 Truncate(0) 已成功，文件已归零，绝不可再 Truncate(oldOffset) 产生 NUL 稀疏零填充。
+func compactLockAfterDrain(lf ports.LockedFile, st *lockLogWriterState) error {
+	if err := lf.Truncate(0); err != nil {
+		rollbackLockFrame(lf, st)
+		return fmt.Errorf("%w: 排空后截断进程锁失败: %w", ports.ErrAuditWriteFailed, err)
+	}
+	st.confirmedOffset = 0
+	if _, err := lf.Seek(0, io.SeekStart); err != nil {
+		st.offsetKnown = false
+		st.needNewline = true
+		return fmt.Errorf("%w: 排空截断后重置进程锁偏移失败: %w", ports.ErrAuditWriteFailed, err)
+	}
+	if err := lf.Sync(); err != nil {
+		st.offsetKnown = false
+		st.needNewline = true
+		return fmt.Errorf("%w: 排空截断后刷盘进程锁失败: %w", ports.ErrAuditWriteFailed, err)
+	}
+	st.offsetKnown = true
 	st.needNewline = false
 	return nil
 }
@@ -132,17 +173,21 @@ func formatLockLogFrame(cmd lockCommand, leadingNewline bool) []byte {
 
 func rollbackLockFrame(lf ports.LockedFile, st *lockLogWriterState) {
 	if err := lf.Truncate(st.confirmedOffset); err != nil {
+		st.offsetKnown = false
 		st.needNewline = true
 		return
 	}
 	if _, err := lf.Seek(st.confirmedOffset, io.SeekStart); err != nil {
+		st.offsetKnown = false
 		st.needNewline = true
 		return
 	}
 	if err := lf.Sync(); err != nil {
+		st.offsetKnown = false
 		st.needNewline = true
 		return
 	}
+	st.offsetKnown = true
 	st.needNewline = false
 }
 

@@ -133,17 +133,6 @@ func (s *WALJournalStore) Load(ctx context.Context, transferID security.Operatio
 // LoadGenerations 按 Generation 升序返回逐代隔离的只读快照：
 // 健康世代返回完整排序记录；损坏世代返回 Corrupt()==true、Records()==nil，
 // 并在 PartialRecords() 中保留损坏点前已通过全部完整性校验的同代前缀记录。
-func (s *WALJournalStore) requireJournalDir(root ports.RootHandle) error {
-	exists, err := checkLstatDir(root, s.journalDir)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return ports.ErrNotFound
-	}
-	return nil
-}
-
 func (s *WALJournalStore) LoadGenerations(ctx context.Context, transferID security.OperationID) ([]ports.JournalGenerationSnapshot, error) {
 	lockTarget, err := s.prepareTransferOp(ctx, transferID)
 	if err != nil {
@@ -151,7 +140,7 @@ func (s *WALJournalStore) LoadGenerations(ctx context.Context, transferID securi
 	}
 	var snaps []ports.JournalGenerationSnapshot
 	err = s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
-		// 先经 Lstat 校验目录与预检目标世代存在性，拒绝悬空符号链接且绝不为不存在的传输创建条带锁文件。
+		// 先经 Lstat 逐级校验目录链与预检目标世代存在性，拒绝悬空符号链接且绝不为不存在的传输创建条带锁文件。
 		if dErr := s.requireJournalDir(root); dErr != nil {
 			return dErr
 		}
@@ -167,6 +156,17 @@ func (s *WALJournalStore) LoadGenerations(ctx context.Context, transferID securi
 		})
 	})
 	return snaps, err
+}
+
+func (s *WALJournalStore) requireJournalDir(root ports.RootHandle) error {
+	exists, err := checkLstatDirWithAncestors(root, s.journalDir)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ports.ErrNotFound
+	}
+	return nil
 }
 
 // PruneGeneration 仅移除指定 (transferID, generation) 对应的 WAL 文件；
@@ -210,7 +210,7 @@ func (s *WALJournalStore) ListActive(ctx context.Context) ([]security.OperationI
 	}
 	var ids []security.OperationID
 	err := s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
-		if exists, cErr := checkLstatDir(root, s.journalDir); cErr != nil || !exists {
+		if exists, cErr := checkLstatDirWithAncestors(root, s.journalDir); cErr != nil || !exists {
 			return cErr
 		}
 		entries, rErr := root.ReadDir(algebraic.Some(s.journalDir))

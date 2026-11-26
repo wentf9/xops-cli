@@ -130,9 +130,14 @@ func verifyDiffIncludeBracketGlob(t *testing.T, sshBin string) {
 	writeTestFile(t, filepath.Join(dotDir, "01-hardening.conf"), "Host sec-box\n  HostName 192.0.2.61\n  Port 2241\n")
 	writeTestFile(t, filepath.Join(dotDir, "ab-ignored.conf"), "Host sec-box\n  Port 2299\n")
 	writeTestFile(t, filepath.Join(dotDir, "b-extra.conf"), "Host sec-box\n  User secops\n")
+	// 验证严格 POSIX glob(3) 语义：[^a] 中前导 '^' 为字面字符（匹配 '^' 与 'a'，不匹配 'b'）。
+	writeTestFile(t, filepath.Join(dotDir, "^-caret.conf"), "Host sec-box\n  ServerAliveInterval 33\n")
+	writeTestFile(t, filepath.Join(dotDir, "a-caret.conf"), "Host sec-box\n  ServerAliveCountMax 7\n")
+	writeTestFile(t, filepath.Join(dotDir, "b-caret.conf"), "Host sec-box\n  ConnectTimeout 88\n")
 	cfg := filepath.Join(dir, "config")
 	writeTestFile(t, cfg, "Include \""+filepath.ToSlash(filepath.Join(dotDir, "[0-9][0-9]-*.conf"))+"\"\n"+
-		"Include \""+filepath.ToSlash(filepath.Join(dotDir, "[!a]-extra.conf"))+"\"\n")
+		"Include \""+filepath.ToSlash(filepath.Join(dotDir, "[!a]-extra.conf"))+"\"\n"+
+		"Include \""+filepath.ToSlash(filepath.Join(dotDir, "[^a]-caret.conf"))+"\"\n")
 
 	dump := runSSHGDump(t, sshBin, cfg, "sec-box")
 	layer, err := newDiffSource(t, cfg).ResolveTier4(context.Background(), mustOrigHost(t, "sec-box"), algebraic.None[netaddr.Endpoint]())
@@ -144,6 +149,15 @@ func verifyDiffIncludeBracketGlob(t *testing.T, sshBin string) {
 	}
 	if u, ok := layer.User().Get(); !ok || u.String() != dump.single["user"] || u.String() != "secops" {
 		t.Fatalf("Include [!a]-extra.conf user 失配: got=(%v,%v) ssh-G=%q", u, ok, dump.single["user"])
+	}
+	if iv, ok := layer.ServerAliveInterval().Get(); !ok || strconv.FormatInt(int64(iv.Std().Seconds()), 10) != dump.single["serveraliveinterval"] || iv.Std().Seconds() != 33 {
+		t.Fatalf("Include [^a]-caret.conf literal '^' interval 失配: got=(%v,%v) ssh-G=%q", iv, ok, dump.single["serveraliveinterval"])
+	}
+	if cm, ok := layer.ServerAliveCountMax().Get(); !ok || strconv.FormatUint(uint64(cm), 10) != dump.single["serveralivecountmax"] || cm != 7 {
+		t.Fatalf("Include [^a]-caret.conf literal 'a' countmax 失配: got=(%d,%v) ssh-G=%q", cm, ok, dump.single["serveralivecountmax"])
+	}
+	if layer.ConnectTimeout().IsSome() {
+		t.Fatalf("Include [^a]-caret.conf 不得误匹配 b-caret.conf: got ConnectTimeout=%v", layer.ConnectTimeout())
 	}
 }
 

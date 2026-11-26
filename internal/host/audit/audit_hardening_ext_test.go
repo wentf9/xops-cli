@@ -297,21 +297,31 @@ func runConcurrentReconcilers(t *testing.T, ctx context.Context, fsPort ports.Sc
 	return reps
 }
 
-// TestPartialLockWriteRollbackAndNestedAuditFile 验证 #35 Major #5 与 #34 Minor #4：
-//   - .lock 部分写入失败时按 confirmedOffset 回滚 Truncate+Seek，或回滚失败时前置 '\n' 兜底，
-//     确保下一条 +<op2>\n 仍位于独立行首并可被崩溃对账完整恢复；
-//   - 嵌套自定义 AuditFile（如 logs/nested/audit.jsonl）自动创建父目录并完成写入与崩溃对账。
+// TestPartialLockWriteRollbackAndNestedAuditFile 验证 #35 Major #5、#34 Minor #4 与 #51 Major #1 / Minor #1：
+//   - .lock 部分写入或刷盘失败时按 confirmedOffset 回滚，或回滚失败后以 Seek(0, io.SeekEnd) 重锚偏移；
+//   - 三步回归：op1 写/刷盘失败且回滚失败 -> op2 成功并 Authorized -> op3 失败且回滚成功 -> 脏关闭对账完整恢复 op2；
+//   - 排空压缩 Truncate(0) 成功后 Seek(0) 失败绝不将文件零扩展回旧偏移；
+//   - 嵌套自定义 AuditFile（logs/nested/audit.jsonl）自动建父目录，且多段 RunDir / AuditFile 悬空符号链接祖先失败关闭。
 func TestPartialLockWriteRollbackAndNestedAuditFile(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	ctx := context.Background()
 	t.Run("PartialWriteRollbackRestoresFrameBoundary", func(t *testing.T) {
 		verifyPartialLockWriteRecovery(t, ctx, false)
 	})
-	t.Run("PartialWriteFailedRollbackPrependsNewline", func(t *testing.T) {
-		verifyPartialLockWriteRecovery(t, ctx, true)
+	t.Run("ThreeStepReanchorAfterPartialWriteRollbackFailure", func(t *testing.T) {
+		verifyThreeStepLockReanchorRecovery(t, ctx, false)
+	})
+	t.Run("ThreeStepReanchorAfterSyncAndRollbackFailure", func(t *testing.T) {
+		verifyThreeStepLockReanchorRecovery(t, ctx, true)
+	})
+	t.Run("DrainCompactSeekFailureNeverZeroExtends", func(t *testing.T) {
+		verifyDrainCompactSeekFailureNeverZeroExtends(t, ctx)
 	})
 	t.Run("CustomNestedAuditFileCreatesParentDir", func(t *testing.T) {
 		verifyCustomNestedAuditFile(t, ctx)
+	})
+	t.Run("NestedAuditAndRunDirAncestorSymlinkFailsClosed", func(t *testing.T) {
+		verifyNestedAncestorSymlinkFailsClosed(t, ctx)
 	})
 }
 
@@ -329,11 +339,9 @@ func verifyPartialLockWriteRecovery(t *testing.T, ctx context.Context, failRollb
 	if err != nil {
 		t.Fatalf("NewFileSink 失败: %v", err)
 	}
-	// 1. op1 触发半行写入失败（仅落盘前 6 字节，无换行符）-> 须返回 ErrAuditWriteFailed。
 	if err := sink.StageOperation(ctx, op1); !errors.Is(err, ports.ErrAuditWriteFailed) {
 		t.Fatalf("半行写入故障期望 ErrAuditWriteFailed, 实际=%v", err)
 	}
-	// 2. 故障恢复后 op2 正常 Stage + Record(Authorized) + 脏 Close（模拟随后崩溃）。
 	if err := sink.StageOperation(ctx, op2); err != nil {
 		t.Fatalf("故障恢复后 op2 StageOperation 失败: %v", err)
 	}
@@ -343,8 +351,90 @@ func verifyPartialLockWriteRecovery(t *testing.T, ctx context.Context, failRollb
 	if err := sink.Close(); err != nil {
 		t.Fatalf("脏 Close 失败: %v", err)
 	}
-	// 3. 对账必须完整找回 op2 并补写唯一 AbortedByCrash，绝不因 op1 半行残留丢失 op2。
-	rec, err := audit.NewFileReconciler(audit.ReconcilerSpec{ScopedFS: memFS, RootDir: rootDir})
+	assertReconciledSingleOp(t, ctx, memFS, rootDir, op2)
+}
+
+func verifyThreeStepLockReanchorRecovery(t *testing.T, ctx context.Context, failViaSync bool) {
+	t.Helper()
+	_, rootDir := newPrivateAuditRoot(t)
+	ent := tck.NewDeterministicEntropy(205)
+	procID, _ := ports.NewProcessInstanceIDFrom(ent)
+	traceID, _ := security.NewTraceIDFrom(ent)
+	op1, _ := security.NewOperationIDFrom(ent)
+	op2, _ := security.NewOperationIDFrom(ent)
+	op3, _ := security.NewOperationIDFrom(ent)
+
+	memFS := newPartialFaultAuditFS(false)
+	memFS.armOp1Fault(failViaSync)
+	sink, err := audit.NewFileSink(audit.SinkSpec{ScopedFS: memFS, RootDir: rootDir, ProcessID: procID})
+	if err != nil {
+		t.Fatalf("NewFileSink 失败: %v", err)
+	}
+	// Step 1: op1 写入/刷盘失败且回滚 Truncate 失败（磁盘留有半行或未刷盘完整行，offsetKnown=false）。
+	if err := sink.StageOperation(ctx, op1); !errors.Is(err, ports.ErrAuditWriteFailed) {
+		t.Fatalf("Step 1 op1 期望 ErrAuditWriteFailed, 实际=%v", err)
+	}
+	// Step 2: op2 成功重锚真实 EOF 并落盘 +<op2>\n，随后写入 Authorized 审计记录。
+	if err := sink.StageOperation(ctx, op2); err != nil {
+		t.Fatalf("Step 2 op2 StageOperation 失败: %v", err)
+	}
+	if err := sink.Record(ctx, tck.MustAuditEntry(t, procID, traceID, op2, ports.AuditPhaseAuthorized, ports.AuditOutcomePending)); err != nil {
+		t.Fatalf("Step 2 op2 Record(Authorized) 失败: %v", err)
+	}
+	// Step 3: op3 半行写入失败且回滚 Truncate 成功——必须仅截断 op3 残留，绝不截断已确认的 op2！
+	memFS.armNextWriteFail()
+	if err := sink.StageOperation(ctx, op3); !errors.Is(err, ports.ErrAuditWriteFailed) {
+		t.Fatalf("Step 3 op3 期望 ErrAuditWriteFailed, 实际=%v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("脏 Close 失败: %v", err)
+	}
+	assertReconciledSingleOp(t, ctx, memFS, rootDir, op2)
+}
+
+func verifyDrainCompactSeekFailureNeverZeroExtends(t *testing.T, ctx context.Context) {
+	t.Helper()
+	_, rootDir := newPrivateAuditRoot(t)
+	ent := tck.NewDeterministicEntropy(207)
+	procID, _ := ports.NewProcessInstanceIDFrom(ent)
+	traceID, _ := security.NewTraceIDFrom(ent)
+	op1, _ := security.NewOperationIDFrom(ent)
+	op2, _ := security.NewOperationIDFrom(ent)
+
+	memFS := newPartialFaultAuditFS(false)
+	memFS.clearFaults()
+	sink, err := audit.NewFileSink(audit.SinkSpec{ScopedFS: memFS, RootDir: rootDir, ProcessID: procID})
+	if err != nil {
+		t.Fatalf("NewFileSink 失败: %v", err)
+	}
+	if err := sink.StageOperation(ctx, op1); err != nil {
+		t.Fatalf("op1 Stage 失败: %v", err)
+	}
+	// 在 Unstage 触发排空截断时，让 Truncate(0) 成功但随后的 Seek(0) 失败。
+	memFS.armNextSeekStartFail()
+	if err := sink.UnstageOperation(ctx, op1); !errors.Is(err, ports.ErrAuditWriteFailed) {
+		t.Fatalf("排空 Seek(0) 失败期望 ErrAuditWriteFailed, 实际=%v", err)
+	}
+	lockKey := "run/" + procID.String() + ".lock"
+	if gotLen := memFS.fileLen(lockKey); gotLen != 0 {
+		t.Fatalf("Truncate(0) 成功后 Seek(0) 失败不得零扩展锁文件: gotLen=%d", gotLen)
+	}
+	// 后续 op2 应通过 Seek(0, io.SeekEnd) 锚定到 0 并正常落盘 +<op2>\n。
+	if err := sink.StageOperation(ctx, op2); err != nil {
+		t.Fatalf("排空故障恢复后 op2 Stage 失败: %v", err)
+	}
+	if err := sink.Record(ctx, tck.MustAuditEntry(t, procID, traceID, op2, ports.AuditPhaseAuthorized, ports.AuditOutcomePending)); err != nil {
+		t.Fatalf("op2 Record(Authorized) 失败: %v", err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatalf("脏 Close 失败: %v", err)
+	}
+	assertReconciledSingleOp(t, ctx, memFS, rootDir, op2)
+}
+
+func assertReconciledSingleOp(t *testing.T, ctx context.Context, fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir, want security.OperationID) {
+	t.Helper()
+	rec, err := audit.NewFileReconciler(audit.ReconcilerSpec{ScopedFS: fsPort, RootDir: rootDir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,8 +442,64 @@ func verifyPartialLockWriteRecovery(t *testing.T, ctx context.Context, failRollb
 	if err != nil {
 		t.Fatalf("ReconcileCrashedAudits 失败: %v", err)
 	}
-	if rep.DeadLocksClaimed() != 1 || len(rep.AbortedOperations()) != 1 || !rep.AbortedOperations()[0].Equal(op2) {
-		t.Fatalf("半行写故障恢复后对账丢失 op2: dead=%d aborted=%v", rep.DeadLocksClaimed(), rep.AbortedOperations())
+	if rep.DeadLocksClaimed() != 1 || len(rep.AbortedOperations()) != 1 || !rep.AbortedOperations()[0].Equal(want) {
+		t.Fatalf("对账结果异常: dead=%d aborted=%v want=%s", rep.DeadLocksClaimed(), rep.AbortedOperations(), want)
+	}
+}
+
+func verifyNestedAncestorSymlinkFailsClosed(t *testing.T, ctx context.Context) {
+	t.Helper()
+	dir, rootDir := newPrivateAuditRoot(t)
+	fsPort := osfs.NewScopedRootFS()
+	if err := fsPort.EnsureRoot(rootDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing_logs_target", filepath.Join(dir, "logs")); err != nil {
+		t.Skipf("环境不支持创建符号链接: %v", err)
+	}
+	// 先写入一个死亡进程锁，触发慢路径检查 logs/nested/audit.jsonl 的祖先目录链。
+	ent := tck.NewDeterministicEntropy(223)
+	procID, _ := ports.NewProcessInstanceIDFrom(ent)
+	opID, _ := security.NewOperationIDFrom(ent)
+	if err := os.MkdirAll(filepath.Join(dir, "run"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "run", procID.String()+".lock"), []byte("+"+opID.String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nestedAudit, err := pathalg.ParseLocalRootedDest("logs/nested/audit.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := audit.NewFileReconciler(audit.ReconcilerSpec{
+		ScopedFS:  fsPort,
+		RootDir:   rootDir,
+		AuditFile: algebraic.Some(nestedAudit),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.ReconcileCrashedAudits(ctx, tck.BaseTime().Add(time.Minute)); !errors.Is(err, ports.ErrSymlinkRejected) {
+		t.Fatalf("多段 AuditFile 悬空符号链接祖先期望 ErrSymlinkRejected, 实际=%v", err)
+	}
+	// 同时校验多段 RunDir（var/run）的悬空符号链接祖先亦失败关闭。
+	if err := os.Symlink("missing_var_target", filepath.Join(dir, "var")); err != nil {
+		t.Fatal(err)
+	}
+	nestedRun, err := pathalg.ParseLocalRootedDest("var/run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recRun, err := audit.NewFileReconciler(audit.ReconcilerSpec{
+		ScopedFS: fsPort,
+		RootDir:  rootDir,
+		RunDir:   algebraic.Some(nestedRun),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recRun.ReconcileCrashedAudits(ctx, tck.BaseTime().Add(time.Minute)); !errors.Is(err, ports.ErrSymlinkRejected) {
+		t.Fatalf("多段 RunDir 悬空符号链接祖先期望 ErrSymlinkRejected, 实际=%v", err)
 	}
 }
 
@@ -402,16 +548,58 @@ func verifyCustomNestedAuditFile(t *testing.T, ctx context.Context) {
 	}
 }
 
-// partialFaultAuditFS 是测试专用的纯内存 ScopedRootFS，用于确定性注入 .lock 半行写故障与回滚失败。
+// partialFaultAuditFS 是测试专用的纯内存 ScopedRootFS，用于确定性注入 .lock 半行写/刷盘/回滚/Seek 故障。
 type partialFaultAuditFS struct {
-	mu           sync.Mutex
-	files        map[string][]byte
-	failNext     bool
-	failRollback bool
+	mu                sync.Mutex
+	files             map[string][]byte
+	failNextWrite     bool
+	failNextSync      bool
+	failNextTruncate  bool
+	failNextSeekStart bool
 }
 
 func newPartialFaultAuditFS(failRollback bool) *partialFaultAuditFS {
-	return &partialFaultAuditFS{files: make(map[string][]byte), failNext: true, failRollback: failRollback}
+	return &partialFaultAuditFS{
+		files:            make(map[string][]byte),
+		failNextWrite:    true,
+		failNextTruncate: failRollback,
+	}
+}
+
+func (f *partialFaultAuditFS) clearFaults() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNextWrite = false
+	f.failNextSync = false
+	f.failNextTruncate = false
+	f.failNextSeekStart = false
+}
+
+func (f *partialFaultAuditFS) armOp1Fault(failViaSync bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNextWrite = !failViaSync
+	f.failNextSync = failViaSync
+	f.failNextTruncate = true
+	f.failNextSeekStart = false
+}
+
+func (f *partialFaultAuditFS) armNextWriteFail() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNextWrite = true
+}
+
+func (f *partialFaultAuditFS) armNextSeekStartFail() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failNextSeekStart = true
+}
+
+func (f *partialFaultAuditFS) fileLen(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.files[key])
 }
 
 func (f *partialFaultAuditFS) EnsureRoot(pathalg.LocalDir, fs.FileMode) error { return nil }
@@ -506,12 +694,18 @@ func (r *partialFaultRoot) Stat(dest pathalg.LocalRootedDest) (ports.LocalFileIn
 func (r *partialFaultRoot) Lstat(dest pathalg.LocalRootedDest) (ports.LocalFileInfo, error) {
 	r.fs.mu.Lock()
 	defer r.fs.mu.Unlock()
-	b, ok := r.fs.files[dest.String()]
-	if !ok {
-		var zero ports.LocalFileInfo
-		return zero, ports.ErrNotFound
+	key := dest.String()
+	if b, ok := r.fs.files[key]; ok {
+		return ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: dest.Base(), Size: int64(len(b)), Mode: 0o600})
 	}
-	return ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: dest.Base(), Size: int64(len(b)), Mode: 0o600})
+	prefix := key + "/"
+	for k := range r.fs.files {
+		if strings.HasPrefix(k, prefix) {
+			return ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: dest.Base(), Mode: fs.ModeDir | 0o700})
+		}
+	}
+	var zero ports.LocalFileInfo
+	return zero, ports.ErrNotFound
 }
 
 func (r *partialFaultRoot) ReadDir(dir algebraic.Option[pathalg.LocalRootedDest]) ([]ports.LocalDirEntry, error) {
@@ -571,8 +765,8 @@ func (f *partialFaultLockedFile) Read(p []byte) (int, error) {
 func (f *partialFaultLockedFile) Write(p []byte) (int, error) {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
-	if f.fs.failNext && len(p) > 6 {
-		f.fs.failNext = false
+	if f.fs.failNextWrite && len(p) > 6 {
+		f.fs.failNextWrite = false
 		f.writeAtLocked(p[:6])
 		return 6, errors.New("simulated transient ENOSPC mid-line")
 	}
@@ -596,6 +790,10 @@ func (f *partialFaultLockedFile) writeAtLocked(p []byte) {
 func (f *partialFaultLockedFile) Seek(offset int64, whence int) (int64, error) {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
+	if whence == io.SeekStart && f.fs.failNextSeekStart {
+		f.fs.failNextSeekStart = false
+		return f.offset, errors.New("simulated seek failure after truncate")
+	}
 	var next int64
 	switch whence {
 	case io.SeekStart:
@@ -614,18 +812,33 @@ func (f *partialFaultLockedFile) Seek(offset int64, whence int) (int64, error) {
 func (f *partialFaultLockedFile) Truncate(size int64) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
-	if f.fs.failRollback && !f.fs.failNext {
-		f.fs.failRollback = false
+	// 仅对正在写入的锁回滚（非初始空文件打开阶段）注入截断故障。
+	if f.fs.failNextTruncate && !f.fs.failNextWrite && !f.fs.failNextSync && len(f.fs.files[f.key]) > 0 {
+		f.fs.failNextTruncate = false
 		return errors.New("simulated truncate failure during rollback")
 	}
 	b := f.fs.files[f.key]
-	if size < int64(len(b)) {
+	switch {
+	case size < int64(len(b)):
 		f.fs.files[f.key] = bytes.Clone(b[:size])
+	case size > int64(len(b)):
+		// 忠实模拟真实 OS ftruncate 零扩展语义，确保排空截断回归能被测试捕获。
+		grown := make([]byte, size)
+		copy(grown, b)
+		f.fs.files[f.key] = grown
 	}
 	return nil
 }
 
-func (f *partialFaultLockedFile) Sync() error { return nil }
+func (f *partialFaultLockedFile) Sync() error {
+	f.fs.mu.Lock()
+	defer f.fs.mu.Unlock()
+	if f.fs.failNextSync && len(f.fs.files[f.key]) > 0 {
+		f.fs.failNextSync = false
+		return errors.New("simulated EIO on fsync")
+	}
+	return nil
+}
 
 func (f *partialFaultLockedFile) Stat() (ports.LocalFileInfo, error) {
 	f.fs.mu.Lock()

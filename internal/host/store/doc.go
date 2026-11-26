@@ -218,6 +218,16 @@ func checkLstatRegular(root ports.RootHandle, dest pathalg.LocalRootedDest) (boo
 	return true, nil
 }
 
+// checkLstatDirWithAncestors 自顶向下逐级以 Lstat 校验目标目录及其全部祖先分量，
+// 确保自定义多段目录（如 nested/journals）任一祖先为悬空/存活符号链接时失败关闭返回 ports.ErrSymlinkRejected。
+func checkLstatDirWithAncestors(root ports.RootHandle, dest pathalg.LocalRootedDest) (bool, error) {
+	ancExists, err := checkLstatAncestors(root, dest)
+	if err != nil || !ancExists {
+		return false, err
+	}
+	return checkLstatDir(root, dest)
+}
+
 // checkLstatAncestors 自顶向下逐级以 Lstat 校验目标路径的全部父目录分量，确保任一级符号链接均失败关闭。
 func checkLstatAncestors(root ports.RootHandle, dest pathalg.LocalRootedDest) (bool, error) {
 	parts := strings.Split(dest.String(), "/")
