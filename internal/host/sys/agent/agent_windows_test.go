@@ -86,12 +86,22 @@ func createTestPipeInstance(namePtr *uint16, sa *windows.SecurityAttributes) (wi
 func serveWindowsPipeLoop(h windows.Handle, namePtr *uint16, sa *windows.SecurityAttributes, ring sshagent.Agent) {
 	for {
 		err := windows.ConnectNamedPipe(h, nil)
-		if err != nil && !errors.Is(err, windows.ERROR_PIPE_CONNECTED) {
+		earlyClose := errors.Is(err, windows.ERROR_NO_DATA) || errors.Is(err, windows.ERROR_BROKEN_PIPE)
+		if err != nil && !errors.Is(err, windows.ERROR_PIPE_CONNECTED) && !earlyClose {
 			_ = windows.CloseHandle(h)
 			return
 		}
-		// 立即预先创建下一个监听实例再处理并关闭当前连接，防止连续拨号之间出现 0 实例窗口触发 ERROR_FILE_NOT_FOUND。
+		// 始终在关闭/断开当前句柄前预创建下一个监听实例，杜绝连续拨号间出现 0 实例窗口触发 ERROR_FILE_NOT_FOUND。
 		next, cErr := createTestPipeInstance(namePtr, sa)
+		if earlyClose {
+			// 客户端在 ConnectNamedPipe 前已完成拨号并关闭属于良性早退，直接切换至新实例继续监听。
+			_ = windows.CloseHandle(h)
+			if cErr != nil {
+				return
+			}
+			h = next
+			continue
+		}
 		f := os.NewFile(uintptr(h), "agent-pipe")
 		_ = sshagent.ServeAgent(ring, f)
 		_ = f.Close()
