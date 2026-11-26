@@ -95,7 +95,8 @@ func TestMuxSocket_TCKSuite(t *testing.T) {
 
 func TestMuxSocket_ControlForwardCancelStopAndProxy(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	dir := shortMuxTempDir(t)
 	sockPath := mustLocalSource(t, filepath.Join(dir, "ctrl.sock"))
 
@@ -145,7 +146,11 @@ func TestMuxSocket_ControlForwardCancelStopAndProxy(t *testing.T) {
 			return gErr
 		}
 		return n.Go(func(c context.Context) error {
-			<-ready
+			select {
+			case <-ready:
+			case <-c.Done():
+				return c.Err()
+			}
 			return exerciseControlAndProxy(t, c, m, sockPath, dig0, hop0.Endpoint())
 		})
 	})
@@ -228,7 +233,8 @@ func exerciseMuxSession(t *testing.T, ctx context.Context, conn ports.TransportC
 // TestMuxSocket_RawOpenSSHProtocolV4Interop 验证客户端与纯 OpenSSH PROTOCOL.mux v4（不含 XOps 扩展）服务端互操作。
 func TestMuxSocket_RawOpenSSHProtocolV4Interop(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	dir := shortMuxTempDir(t)
 	sockPath := mustLocalSource(t, filepath.Join(dir, "openssh.sock"))
 	m := mux.NewMuxSocket(mux.Config{})
@@ -250,7 +256,17 @@ func TestMuxSocket_RawOpenSSHProtocolV4Interop(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Nursery.Go: %v", err)
 	}
-	<-ready
+	select {
+	case <-ready:
+	case <-srvDone:
+		_ = n.Close()
+		t.Fatal("OpenSSH v4 测试桩在就绪前提前退出")
+	case <-ctx.Done():
+		cancelSrv()
+		<-srvDone
+		_ = n.Close()
+		t.Fatalf("等待 OpenSSH v4 测试桩就绪超时: %v", ctx.Err())
+	}
 
 	resp, err := m.Probe(ctx, sockPath)
 	if err != nil || !resp.Alive() || resp.MasterPID() != 7788 {
@@ -389,7 +405,8 @@ func TestMuxSocket_ZeroValueFailClosed(t *testing.T) {
 // TestMuxSocket_IdleClientO1Shutdown 验证存在空闲已连接客户端时，Control(Exit) 触发 Serve 在 O(1) 时间内收敛退出。
 func TestMuxSocket_IdleClientO1Shutdown(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	dir := shortMuxTempDir(t)
 	sockPath := mustLocalSource(t, filepath.Join(dir, "idle.sock"))
 	m := mux.NewMuxSocket(mux.Config{HandshakeTimeout: 30 * time.Second})
@@ -416,7 +433,11 @@ func TestMuxSocket_IdleClientO1Shutdown(t *testing.T) {
 			return gErr
 		}
 		return n.Go(func(c context.Context) error {
-			<-ready
+			select {
+			case <-ready:
+			case <-c.Done():
+				return c.Err()
+			}
 			// 打开一条长连代理连接并故意保持空闲不发数据。
 			idleConn, oErr := m.OpenProxy(c, sockPath)
 			if oErr != nil {

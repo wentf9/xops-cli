@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/goleak"
 	"golang.org/x/crypto/ssh"
@@ -38,7 +39,8 @@ import (
 // forward.Forwarder + mux.DialMux 全链路（含会话管道/PTY/缩放/信号/退出码、DialTCP/StreamLocal/TUN/ListenTCP 与优雅停机）。
 func TestMuxSocket_RealSSHLoopbackEndToEnd(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	upConn, hop, dig := dialLoopbackRealSSH(t, ctx)
 	defer func() { _ = upConn.Close() }()
 
@@ -58,7 +60,11 @@ func TestMuxSocket_RealSSHLoopbackEndToEnd(t *testing.T) {
 			return gErr
 		}
 		return n.Go(func(c context.Context) error {
-			<-ready
+			select {
+			case <-ready:
+			case <-c.Done():
+				return c.Err()
+			}
 			return verifyFullMuxClientOverRealSSH(t, c, m, sockPath, dig, hop.Endpoint())
 		})
 	})
@@ -382,8 +388,8 @@ func handleMuxSSHChannel(newCh ssh.NewChannel) {
 		if err != nil {
 			return
 		}
-		defer func() { _ = ch.Close() }()
 		_ = conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+			defer func() { _ = ch.Close() }()
 			_ = n.Go(func(context.Context) error { ssh.DiscardRequests(reqs); return nil })
 			_, _ = io.Copy(ch, ch)
 			return nil

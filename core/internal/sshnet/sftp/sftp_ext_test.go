@@ -436,8 +436,8 @@ func serveLoopbackSFTPSSH(raw net.Conn, hostSigner ssh.Signer, pass string, sftp
 	if err != nil {
 		return
 	}
-	defer func() { _ = sConn.Close() }()
 	_ = conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		defer func() { _ = sConn.Close() }()
 		_ = n.Go(func(context.Context) error { ssh.DiscardRequests(reqs); return nil })
 		for newCh := range chans {
 			if newCh.ChannelType() != "session" {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"go.uber.org/goleak"
 
@@ -23,7 +24,8 @@ var (
 
 func TestMuxStream_ZeroValuesAndListenerBridgeRoundTrip(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
 	var zeroSess muxstream.RemoteSession
 	if _, err := zeroSess.StdinPipe(); !errors.Is(err, ports.ErrClosed) {
@@ -77,29 +79,7 @@ func TestMuxStream_ZeroValuesAndListenerBridgeRoundTrip(t *testing.T) {
 func verifyMuxListenerEcho(ctx context.Context, n *conc.Nursery, dialAddr string, rl *muxstream.RemoteListener) error {
 	dialErrCh := make(chan error, 1)
 	if err := n.Go(func(context.Context) error {
-		c, dErr := (&net.Dialer{}).DialContext(ctx, "tcp", dialAddr)
-		if dErr != nil {
-			dialErrCh <- dErr
-			return nil
-		}
-		defer func() { _ = c.Close() }()
-		if _, wErr := c.Write([]byte("hello-mux-listener")); wErr != nil {
-			dialErrCh <- wErr
-			return nil
-		}
-		if tc, ok := c.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		got, rErr := io.ReadAll(c)
-		if rErr != nil {
-			dialErrCh <- rErr
-			return nil
-		}
-		if !bytes.Equal(got, []byte("HELLO-MUX-LISTENER")) {
-			dialErrCh <- errors.New("ListenerBridge 回显内容不一致")
-			return nil
-		}
-		dialErrCh <- nil
+		dialErrCh <- dialAndVerifyMuxEcho(ctx, dialAddr)
 		return nil
 	}); err != nil {
 		return err
@@ -121,5 +101,32 @@ func verifyMuxListenerEcho(ctx context.Context, n *conc.Nursery, dialAddr string
 		_ = hc.CloseWrite()
 	}
 	_ = ac.Close()
-	return <-dialErrCh
+	select {
+	case err := <-dialErrCh:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func dialAndVerifyMuxEcho(ctx context.Context, dialAddr string) error {
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", dialAddr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = c.Close() }()
+	if _, err := c.Write([]byte("hello-mux-listener")); err != nil {
+		return err
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	}
+	got, err := io.ReadAll(c)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(got, []byte("HELLO-MUX-LISTENER")) {
+		return errors.New("ListenerBridge 回显内容不一致")
+	}
+	return nil
 }

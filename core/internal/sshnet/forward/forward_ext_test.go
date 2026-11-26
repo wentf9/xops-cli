@@ -340,6 +340,7 @@ func exerciseRemoteReverse(tr *memTunnelTransport) error {
 		return ports.ErrClosed
 	}
 	defer func() { _ = remoteEnd.Close() }()
+	_ = remoteEnd.SetDeadline(time.Now().Add(5 * time.Second))
 	var got []byte
 	err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
 		if gErr := n.Go(func(context.Context) error {
