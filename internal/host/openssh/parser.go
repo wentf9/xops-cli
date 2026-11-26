@@ -29,6 +29,8 @@ type configStmt struct {
 	line           int
 	key            string
 	rawVal         string
+	parsed         option.ParsedOption
+	hasParsed      bool
 	patterns       []string
 	included       []*parsedFile
 	matchFinal     bool
@@ -178,7 +180,18 @@ func parseDirectiveStmt(filePath string, lineNo int, key, val string) (configStm
 	if cleanedVal == "" {
 		return configStmt{}, false, fmt.Errorf("%w: %s:%d: 指令 %s 缺少参数值", ErrInvalidConfig, filePath, lineNo, key)
 	}
-	return configStmt{kind: stmtDirective, file: filePath, line: lineNo, key: key, rawVal: cleanedVal}, true, nil
+	stmt := configStmt{kind: stmtDirective, file: filePath, line: lineNo, key: key, rawVal: cleanedVal}
+	// 与真实 ssh -G 对齐：凡已注册核心选项均在解析期立即执行语法与值域校验（即便位于未命中的 Host/Match 块内），
+	// 防止非法 Port / StrictHostKeyChecking / IdentityFile 在未命中块或无具体别名流中被静默忽略。
+	if _, known := option.CanonicalOptionKey(key); known {
+		parsed, err := option.ParseOptionKV(key, cleanedVal)
+		if err != nil {
+			return configStmt{}, false, fmt.Errorf("%w: %s:%d: %w", ErrInvalidConfig, filePath, lineNo, err)
+		}
+		stmt.parsed = parsed
+		stmt.hasParsed = true
+	}
+	return stmt, true, nil
 }
 
 func anyIncludedHasFinal(files []*parsedFile) bool {

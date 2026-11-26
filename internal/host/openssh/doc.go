@@ -2,7 +2,7 @@
 //
 // 核心工程与安全不变量：
 //   - 所有 ~/.ssh/config 与递归 Include 文件读取严格通过 ports.OperatorReadFS 完成，
-//     glob 目录枚举仅通过可选 ports.ScopedRootFS 执行，全包零裸 os.Open / os.ReadDir 与零 //nolint:；
+//     glob 目录枚举仅通过可选 ports.ScopedRootFS 执行，全包零裸 os.Open / os.ReadDir 与零 nolint 抑制指令；
 //   - 递归 Include 强制执行祖先路径环路检测、最大嵌套深度上限、最大文件数上限与单文件字节上限；
 //   - 单份配置（含递归 Include）中全部命中的 Host / Match 块指令严格按遭遇序自上而下经
 //     option.OptionLayer.ApplyParsedOption 折叠进同一个 t4 OptionLayer，绝不按块构造再

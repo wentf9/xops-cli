@@ -27,15 +27,16 @@ func walkAliasesInFile(doc *parsedFile, inheritedActive bool, seen map[string]bo
 	if doc == nil {
 		return
 	}
-	// 无条件顶层区域内的 Include 均视为可见别名源；Host/Match 块内的条件 Include 不强行污染顶层别名。
+	// 无条件顶层区域及无条件块（纯 Host * / Match all）内的 Include 均视为可见别名源；
+	// 其余条件 Host/Match 块内的 Include 不强行污染顶层别名。
 	inTopSection := inheritedActive
 	for _, stmt := range doc.stmts {
 		switch stmt.kind {
 		case stmtHost:
-			inTopSection = false
+			inTopSection = inheritedActive && isUnconditionalHostStmt(stmt)
 			appendHostAliases(stmt, seen, out)
 		case stmtMatch:
-			inTopSection = false
+			inTopSection = inheritedActive && isUnconditionalMatchAllStmt(stmt)
 		case stmtInclude:
 			if inTopSection {
 				for _, child := range stmt.included {
@@ -44,6 +45,15 @@ func walkAliasesInFile(doc *parsedFile, inheritedActive bool, seen map[string]bo
 			}
 		}
 	}
+}
+
+func isUnconditionalHostStmt(stmt configStmt) bool {
+	return len(stmt.patterns) == 1 && stmt.patterns[0] == "*"
+}
+
+func isUnconditionalMatchAllStmt(stmt configStmt) bool {
+	return !stmt.matchCanonical && !stmt.matchFinal &&
+		len(stmt.patterns) == 1 && strings.EqualFold(stmt.patterns[0], "all")
 }
 
 func appendHostAliases(stmt configStmt, seen map[string]bool, out *[]aliasCandidate) {
@@ -68,42 +78,27 @@ type evalContext struct {
 }
 
 // evaluateDocument 按遭遇序自上而下将所有命中的 Host / Match / Include 指令折叠进同一个 t4 OptionLayer（Plan §4 #8）：
-//   - Pass 1 跳过 Match final 块并折叠所有常规 Host / Match / Include 指令；
-//   - 若配置树包含 Match final 块，Pass 2 再自上而下仅折叠命中的 Match final 块至同一个 t4 OptionLayer；
+//   - Pass 1 跳过 Match final 块，以原始别名匹配 Host 并折叠全部常规命中指令；
+//   - 若配置树包含 Match final 块，Pass 2 按真实 OpenSSH readconf.c 二轮语义重新自上而下遍历整棵配置树：
+//     Host 改按当前有效主机名（HostName 改写结果）匹配，Match final 激活并允许其内部 Include / Host / Match 生效，
+//     标量项依 FirstWins 自动保底不覆写 Pass 1 胜出值，SendEnv/PathList 按遭遇序精确对齐 ssh -G；
 //   - Match canonical 因不执行主机名规范化而恒失败关闭（false）。
 func (s *ConfigSource) evaluateDocument(doc *parsedFile, target option.OriginalHostSpec, endpoint algebraic.Option[netaddr.Endpoint]) (option.OptionLayer, error) {
 	localUser := ""
 	if id, ok := s.localIdentity.Get(); ok {
 		localUser = id.LocalUser()
 	}
-	ec := &evalContext{
-		target:    target,
-		endpoint:  endpoint,
-		localUser: localUser,
-		layer:     option.UnsetOptionLayer(),
-	}
-	if err := ec.evalFile(doc, true, false); err != nil {
-		return option.UnsetOptionLayer(), err
-	}
-	if doc != nil && doc.hasFinal {
-		if err := ec.evalFile(doc, true, true); err != nil {
-			return option.UnsetOptionLayer(), err
-		}
-	}
-	return ec.layer, nil
+	return evaluateParsedDocument(doc, target, endpoint, localUser)
 }
 
 func (ec *evalContext) evalFile(doc *parsedFile, parentActive, passFinal bool) error {
 	if doc == nil {
 		return nil
 	}
-	// Pass 2 仅对 Match final 块生效，顶层无条件指令已在 Pass 1 折叠，不得重复应用；
-	// 顶层无条件 Include 仍须在 Pass 2 下钻，以确保被包含文件中的 Match final 块按遭遇序折叠。
-	inHeader := parentActive
-	active := parentActive && !passFinal
+	active := parentActive
 	for _, stmt := range doc.stmts {
 		var err error
-		inHeader, active, err = ec.evalStmt(stmt, parentActive, inHeader, active, passFinal)
+		active, err = ec.evalStmt(stmt, parentActive, active, passFinal)
 		if err != nil {
 			return err
 		}
@@ -111,54 +106,45 @@ func (ec *evalContext) evalFile(doc *parsedFile, parentActive, passFinal bool) e
 	return nil
 }
 
-func (ec *evalContext) evalStmt(stmt configStmt, parentActive, inHeader, active, passFinal bool) (bool, bool, error) {
+func (ec *evalContext) evalStmt(stmt configStmt, parentActive, active, passFinal bool) (bool, error) {
 	switch stmt.kind {
 	case stmtHost:
+		// OpenSSH Pass 1 按原始别名匹配 Host；Pass 2（SSHCONF_FINAL）按当前有效主机名匹配。
+		candidate := ec.target.String()
 		if passFinal {
-			return false, false, nil
+			candidate = ec.currentEffectiveHost()
 		}
-		return false, parentActive && matchHostPatternList(ec.target.String(), stmt.patterns), nil
+		return parentActive && matchHostPatternList(candidate, stmt.patterns), nil
 	case stmtMatch:
-		return false, ec.evalMatchStmt(stmt, parentActive, passFinal), nil
+		return ec.evalMatchStmt(stmt, parentActive, passFinal), nil
 	case stmtInclude:
-		shouldDescend := active || (passFinal && inHeader)
-		if !shouldDescend {
-			return inHeader, active, nil
+		if !active {
+			return active, nil
 		}
 		for _, child := range stmt.included {
 			if err := ec.evalFile(child, true, passFinal); err != nil {
-				return false, false, err
+				return false, err
 			}
 		}
-		return inHeader, active, nil
+		return active, nil
 	case stmtDirective:
-		if !active {
-			return inHeader, active, nil
+		if active && stmt.hasParsed {
+			ec.layer = ec.layer.ApplyParsedOption(stmt.parsed)
 		}
-		return inHeader, active, ec.applyDirective(stmt)
+		return active, nil
 	default:
-		return false, false, fmt.Errorf("%w: 未知语句类型 %d", ErrInvalidConfig, stmt.kind)
+		return false, fmt.Errorf("%w: 未知语句类型 %d", ErrInvalidConfig, stmt.kind)
 	}
 }
 
 func (ec *evalContext) evalMatchStmt(stmt configStmt, parentActive, passFinal bool) bool {
-	if !parentActive || stmt.matchCanonical || stmt.matchFinal != passFinal {
+	if !parentActive || stmt.matchCanonical {
+		return false
+	}
+	if stmt.matchFinal && !passFinal {
 		return false
 	}
 	return ec.evalMatchCriteria(stmt.patterns)
-}
-
-func (ec *evalContext) applyDirective(stmt configStmt) error {
-	if _, known := option.CanonicalOptionKey(stmt.key); !known {
-		// 跳过 core/domain/option 25 项核心注册表之外的合法 OpenSSH 扩展指令（如 AddKeysToAgent/Compression）。
-		return nil
-	}
-	parsed, err := option.ParseOptionKV(stmt.key, stmt.rawVal)
-	if err != nil {
-		return fmt.Errorf("%w: %s:%d: %w", ErrInvalidConfig, stmt.file, stmt.line, err)
-	}
-	ec.layer = ec.layer.ApplyParsedOption(parsed)
-	return nil
 }
 
 // validateMatchTokens 在解析期严格校验 Match 条件语法，拒绝畸形或存在安全绕过风险的写法：
@@ -176,7 +162,7 @@ func validateMatchTokens(tokens []string) (hasFinal, hasCanonical bool, err erro
 		if kw == "" {
 			return false, false, fmt.Errorf("match 条件关键字为空")
 		}
-		nextIdx, isFinal, isCanon, isCrit, stepErr := validateMatchStep(kw, negated, inlineVal, hasEq, tokens, i, criteriaCount)
+		nextIdx, isFinal, isCanon, isCrit, stepErr := validateMatchStep(kw, negated, inlineVal, hasEq, tokens, i, criteriaCount, hasFinal, hasCanonical)
 		if stepErr != nil {
 			return false, false, stepErr
 		}
@@ -193,7 +179,7 @@ func validateMatchTokens(tokens []string) (hasFinal, hasCanonical bool, err erro
 	return hasFinal, hasCanonical, nil
 }
 
-func validateMatchStep(kw string, negated bool, inlineVal string, hasEq bool, tokens []string, idx, criteriaCount int) (nextIdx int, isFinal, isCanon, isCrit bool, err error) {
+func validateMatchStep(kw string, negated bool, inlineVal string, hasEq bool, tokens []string, idx, criteriaCount int, seenFinal, seenCanonical bool) (nextIdx int, isFinal, isCanon, isCrit bool, err error) {
 	switch kw {
 	case "all":
 		if negated || hasEq || criteriaCount > 0 || idx != len(tokens) {
@@ -201,13 +187,13 @@ func validateMatchStep(kw string, negated bool, inlineVal string, hasEq bool, to
 		}
 		return idx, false, false, true, nil
 	case "canonical":
-		if negated || hasEq || criteriaCount > 0 {
-			return idx, false, false, false, fmt.Errorf("match canonical 禁止取反、赋值或置于其他条件之后")
+		if negated || hasEq || criteriaCount > 0 || seenCanonical {
+			return idx, false, false, false, fmt.Errorf("match canonical 禁止取反、赋值、重复或置于其他条件之后")
 		}
 		return idx, false, true, false, nil
 	case "final":
-		if negated || hasEq || criteriaCount > 0 {
-			return idx, false, false, false, fmt.Errorf("match final 禁止取反、赋值或置于其他条件之后")
+		if negated || hasEq || criteriaCount > 0 || seenFinal {
+			return idx, false, false, false, fmt.Errorf("match final 禁止取反、赋值、重复或置于其他条件之后")
 		}
 		return idx, true, false, false, nil
 	default:
@@ -293,9 +279,17 @@ func (ec *evalContext) evalSingleCriterion(kw, arg string) (matched, supported b
 		return matchHostPatternList(strings.ToLower(ec.target.String()), lowerStrings(pats)), true
 	case "user":
 		u := ec.currentEffectiveUser()
-		return u != "" && matchHostPatternList(u, pats), true
+		if u == "" {
+			// 未知用户时严格失败关闭（supported=false），防止 Match !user 在缺省身份下取反误放行。
+			return false, false
+		}
+		return matchHostPatternList(u, pats), true
 	case "localuser":
-		return ec.localUser != "" && matchHostPatternList(ec.localUser, pats), true
+		if ec.localUser == "" {
+			// 未知本机用户时严格失败关闭（supported=false），防止 Match !localuser 误放行。
+			return false, false
+		}
+		return matchHostPatternList(ec.localUser, pats), true
 	default:
 		// 包含 Match exec 及一切未受控条件：严格失败关闭（绝不执行外部命令、绝不静默放行）。
 		return false, false

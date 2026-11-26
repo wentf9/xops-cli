@@ -55,9 +55,28 @@ func emptyBaseConfigPath(t *testing.T, dir string) string {
 	return p
 }
 
-// runSSHGDump 在有界超时与常规磁盘文件重定向（零 NUL Stdin、零匿名管道 writerDescriptor 阻塞）下执行 ssh -F <cfg> -G <target>，
-// 规避 Win32-OpenSSH 在 Windows 上因 <NUL 或管道异步写锁死导致 600s 挂起的问题。
-func runSSHGDump(t *testing.T, sshBin, cfgPath, target string) sshGDump {
+// requireRealOpenSSHClient 跨平台探测真实 OpenSSH 客户端：
+// 先查找 PATH 中的 ssh，再以常规磁盘文件重定向执行真实 `ssh -V` 并校验退出码为 0 且输出含 OpenSSH 标识，
+// 防止 Windows Store 占位别名（退出码 9009）或伪桩程序导致误判；仅在确无真实 OpenSSH 时跳过差分测试。
+func requireRealOpenSSHClient(t *testing.T) string {
+	t.Helper()
+	sshBin, err := exec.LookPath("ssh")
+	if err != nil {
+		t.Skipf("本机未找到 ssh 二进制，跳过 ssh -G 差分测试: %v", err)
+	}
+	out, runErr := runSSHCommandWithFiles(t, sshBin, "-V")
+	if runErr != nil {
+		t.Skipf("检测到 ssh (%s) 无法正常执行 `ssh -V`（可能为 Windows 占位别名，跳过差分测试）: %v\n%s", sshBin, runErr, string(out))
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "openssh") {
+		t.Skipf("检测到 ssh (%s) 非 OpenSSH 客户端，跳过 ssh -G 差分测试: %q", sshBin, strings.TrimSpace(string(out)))
+	}
+	return sshBin
+}
+
+// runSSHCommandWithFiles 使用有界超时与常规磁盘文件重定向执行 ssh 子命令，
+// 避免 Windows 上 <NUL 或匿名管道异步写阻塞导致测试挂起。
+func runSSHCommandWithFiles(t *testing.T, sshBin string, args ...string) ([]byte, error) {
 	t.Helper()
 	ioDir := t.TempDir()
 	inPath := filepath.Join(ioDir, "stdin.empty")
@@ -78,7 +97,7 @@ func runSSHGDump(t *testing.T, sshBin, cfgPath, target string) sshGDump {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, sshBin, "-F", cfgPath, "-G", target)
+	cmd := exec.CommandContext(ctx, sshBin, args...)
 	cmd.Stdin = inFile
 	cmd.Stdout = outFile
 	cmd.Stderr = outFile
@@ -87,11 +106,18 @@ func runSSHGDump(t *testing.T, sshBin, cfgPath, target string) sshGDump {
 	runErr := cmd.Run()
 	_ = outFile.Close()
 	out, readErr := os.ReadFile(outPath)
-	if runErr != nil {
-		t.Fatalf("ssh -F %s -G %s 失败 (ctx=%v, readErr=%v): %v\n%s", cfgPath, target, ctx.Err(), readErr, runErr, string(out))
-	}
 	if readErr != nil {
-		t.Fatalf("读取 ssh -G 输出文件失败: %v", readErr)
+		t.Fatalf("读取 ssh 输出文件失败: %v", readErr)
+	}
+	return out, runErr
+}
+
+// runSSHGDump 在有界超时与常规磁盘文件重定向下执行 ssh -F <cfg> -G <target> 并解析转储。
+func runSSHGDump(t *testing.T, sshBin, cfgPath, target string) sshGDump {
+	t.Helper()
+	out, runErr := runSSHCommandWithFiles(t, sshBin, "-F", cfgPath, "-G", target)
+	if runErr != nil {
+		t.Fatalf("ssh -F %s -G %s 失败: %v\n%s", cfgPath, target, runErr, string(out))
 	}
 	return parseSSHGDump(out)
 }
@@ -162,10 +188,7 @@ func applySendEnvDiff(rawTokens []string) []string {
 //   - 验证多块 Host + Include + SendEnv -PATTERN 遭遇序折叠与 ssh -F <cfg> -G 100% 一致。
 func TestSSHG_DifferentialContract(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	sshBin, err := exec.LookPath("ssh")
-	if err != nil {
-		t.Skip("本机未安装 OpenSSH ssh 二进制，跳过 ssh -G 差分测试")
-	}
+	sshBin := requireRealOpenSSHClient(t)
 
 	dir := newPrivateSSHTestDir(t)
 	incDir := filepath.Join(dir, "conf.d")
@@ -352,10 +375,7 @@ func verifyDiffControlSlots(t *testing.T, layer option.OptionLayer, cfgDump sshG
 // Ciphers ^ 前置、KexAlgorithms 扣减以及启用态 ControlPath + ControlMaster + ControlPersist 的 ssh -G 差分一致性。
 func TestSSHG_DifferentialMatchAndProxyModes(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	sshBin, err := exec.LookPath("ssh")
-	if err != nil {
-		t.Skip("本机未安装 OpenSSH ssh 二进制，跳过 ssh -G 差分测试")
-	}
+	sshBin := requireRealOpenSSHClient(t)
 	dir := newPrivateSSHTestDir(t)
 	cfgPath := filepath.Join(dir, "ssh_match_config")
 	ctrlTpl := filepath.ToSlash(filepath.Join(dir, "cm-%C"))
@@ -429,10 +449,7 @@ Host *
 //   - Match final all 位于 Host 之前时的两轮折叠顺序、Match host 大小写不敏感匹配与行内 # 注释语义。
 func TestSSHG_DifferentialMatchFinalCanonicalAndInlineComments(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	sshBin, err := exec.LookPath("ssh")
-	if err != nil {
-		t.Skip("本机未安装 OpenSSH ssh 二进制，跳过 ssh -G 差分测试")
-	}
+	sshBin := requireRealOpenSSHClient(t)
 	dir := newPrivateSSHTestDir(t)
 	target := mustOrigHost(t, "prod-01")
 

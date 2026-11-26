@@ -18,7 +18,7 @@ func (st *loadState) resolveIncludePattern(rawPat string) ([]pathalg.LocalSource
 	if err != nil {
 		return nil, err
 	}
-	if !hasGlobMeta(expanded) {
+	if !hasIncludeGlobMeta(expanded) {
 		p, pErr := pathalg.ParseLocalSourcePath(expanded)
 		if pErr != nil {
 			return nil, pErr
@@ -65,13 +65,18 @@ func (st *loadState) expandIncludeGlob(pattern string) ([]pathalg.LocalSourcePat
 }
 
 func splitStaticBaseAndGlob(pattern string) (pathalg.LocalDir, []string, error) {
-	if strings.Contains(pattern, "..") {
-		return zeroVal[pathalg.LocalDir](), nil, fmt.Errorf("通配符 include 路径 %q 禁止包含 '..'", pattern)
-	}
 	prefix, segs := splitRootPrefixAndSegments(pattern)
-	firstGlob := slices.IndexFunc(segs, hasGlobMeta)
+	if slices.Contains(segs, "..") {
+		return zeroVal[pathalg.LocalDir](), nil, fmt.Errorf("通配符 include 路径 %q 禁止包含 '..' 路径段", pattern)
+	}
+	firstGlob := slices.IndexFunc(segs, hasIncludeGlobMeta)
 	if firstGlob < 0 {
 		return zeroVal[pathalg.LocalDir](), nil, fmt.Errorf("内部错误：路径 %q 不含通配符", pattern)
+	}
+	for _, seg := range segs[firstGlob:] {
+		if err := validateIncludeGlobSegment(seg); err != nil {
+			return zeroVal[pathalg.LocalDir](), nil, err
+		}
 	}
 	baseRaw := prefix + strings.Join(segs[:firstGlob], "/")
 	if baseRaw == "" {
@@ -128,7 +133,14 @@ func matchDirEntriesForGlob(root ports.RootHandle, baseDir pathalg.LocalDir, rel
 
 func matchSingleGlobEntry(root ports.RootHandle, baseDir pathalg.LocalDir, relDir algebraic.Option[pathalg.LocalRootedDest], entry ports.LocalDirEntry, segs []string, out *[]pathalg.LocalSourcePath) error {
 	name, pat, rest := entry.Name(), segs[0], segs[1:]
-	if (strings.HasPrefix(name, ".") && !strings.HasPrefix(pat, ".")) || !matchOpenSSHWildcard(name, pat) {
+	if strings.HasPrefix(name, ".") && !strings.HasPrefix(pat, ".") {
+		return nil
+	}
+	matched, err := matchIncludeGlobSegment(name, pat)
+	if err != nil {
+		return err
+	}
+	if !matched {
 		return nil
 	}
 	nextRel, err := joinRelDest(relDir, name)
@@ -160,7 +172,104 @@ func joinRelDest(parent algebraic.Option[pathalg.LocalRootedDest], name string) 
 	return pathalg.ParseLocalRootedDest(name)
 }
 
-func hasGlobMeta(s string) bool { return strings.ContainsAny(s, "*?") }
+func hasGlobMeta(s string) bool        { return strings.ContainsAny(s, "*?") }
+func hasIncludeGlobMeta(s string) bool { return strings.ContainsAny(s, "*?[") }
+
+// validateIncludeGlobSegment 校验单段 POSIX Include 通配符（*、? 与 [...] / [!...] / [^...] 字符类），
+// 严格拒绝未闭合 '[' 或空/倒置字符范围（如 [z-a]）。
+func validateIncludeGlobSegment(pat string) error {
+	for i := 0; i < len(pat); i++ {
+		if pat[i] != '[' {
+			continue
+		}
+		_, next, err := scanGlobCharClass(pat, i, 0, false)
+		if err != nil {
+			return err
+		}
+		i = next - 1
+	}
+	return nil
+}
+
+// matchIncludeGlobSegment 以 O(|P|*|S|) 非回溯双指针实现 POSIX glob(3) 单路径段匹配
+// （支持 '*'、'?' 及 '[...]' / '[!...]' / '[^...]' 字符类，供 OpenSSH Include 使用）。
+func matchIncludeGlobSegment(name, pat string) (bool, error) {
+	ti, pi, starPi, starTi := 0, 0, -1, 0
+	for ti < len(name) {
+		if pi < len(pat) && pat[pi] == '*' {
+			starPi, starTi, pi = pi, ti, pi+1
+			continue
+		}
+		ok, nextPi, err := matchIncludeGlobAtom(name[ti], pat, pi)
+		if err != nil {
+			return false, err
+		}
+		if ok {
+			ti, pi = ti+1, nextPi
+			continue
+		}
+		if starPi >= 0 {
+			starTi++
+			ti, pi = starTi, starPi+1
+			continue
+		}
+		return false, nil
+	}
+	for pi < len(pat) && pat[pi] == '*' {
+		pi++
+	}
+	return pi == len(pat), nil
+}
+
+func matchIncludeGlobAtom(ch byte, pat string, pi int) (bool, int, error) {
+	if pi >= len(pat) {
+		return false, pi, nil
+	}
+	if pat[pi] == '?' {
+		return true, pi + 1, nil
+	}
+	if pat[pi] == '[' {
+		return scanGlobCharClass(pat, pi, ch, true)
+	}
+	return pat[pi] == ch, pi + 1, nil
+}
+
+func scanGlobCharClass(pat string, start int, target byte, eval bool) (bool, int, error) {
+	i := start + 1
+	if i >= len(pat) {
+		return false, i, fmt.Errorf("通配符 %q 存在未闭合 '['", pat)
+	}
+	// 严格遵循 POSIX glob(3) 与 OpenSSH readconf.c 语义：仅 '[!...]' 取反，前导 '^' 按字面字符匹配。
+	negated := pat[i] == '!'
+	if negated {
+		i++
+	}
+	matched, count := false, 0
+	for i < len(pat) {
+		if pat[i] == ']' && count > 0 {
+			return eval && (matched != negated), i + 1, nil
+		}
+		hit, next, err := scanGlobClassItem(pat, i, target, eval)
+		if err != nil {
+			return false, next, err
+		}
+		matched = matched || hit
+		i, count = next, count+1
+	}
+	return false, i, fmt.Errorf("通配符 %q 存在未闭合 '['", pat)
+}
+
+func scanGlobClassItem(pat string, i int, target byte, eval bool) (bool, int, error) {
+	lo := pat[i]
+	if i+2 < len(pat) && pat[i+1] == '-' && pat[i+2] != ']' {
+		hi := pat[i+2]
+		if lo > hi {
+			return false, i, fmt.Errorf("通配符 %q 存在非法字符范围 [%c-%c]", pat, lo, hi)
+		}
+		return eval && target >= lo && target <= hi, i + 3, nil
+	}
+	return eval && target == lo, i + 1, nil
+}
 
 func isAbsoluteSlashPath(p string) bool {
 	return strings.HasPrefix(p, "/") || (len(p) >= 3 && isASCIIAlpha(p[0]) && p[1] == ':' && p[2] == '/')
