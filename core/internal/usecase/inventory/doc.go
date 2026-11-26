@@ -23,7 +23,6 @@ const (
 	defaultMaxJumpDepth     = 16
 	maxAllowedJumpDepth     = 31
 	maxPlanHops             = 32
-	maxRawTargetBytes       = 512
 	defaultPendingEnrollTTL = 5 * time.Minute
 	cleanupEffectTimeout    = 5 * time.Second
 )

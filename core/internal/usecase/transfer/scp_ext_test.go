@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -678,4 +679,153 @@ func assertSCPDownloadSymlinkDriftRejected(t *testing.T) {
 		requireErrIs(t, lErr, ports.ErrNotFound, "漂移拦截后本地目标文件不得落盘")
 		return nil
 	}), "check no local drift.bin")
+}
+
+// TestSCPUpload_RecursiveScopedDirectoryAndAdversarialGuards 验证 #119 M3：
+// 基于 ScopedRootFS 的单 Gate + 单 Lease 递归目录上传、INV-B4 单次展开、自底向上 mtime 保留及全部对抗护栏。
+func TestSCPUpload_RecursiveScopedDirectoryAndAdversarialGuards(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	assertRecursiveSCPUploadHappyPath(t)
+	assertRecursiveSCPUploadAdversarialGuards(t)
+}
+
+func seedRecursiveUploadLocalTree(t *testing.T, rig *transferTestRig, payload1, payload2 []byte, rootMtime, subMtime, fileMtime time.Time) {
+	t.Helper()
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		for _, d := range []string{"tree/sub", "tree/empty"} {
+			if err := root.MkdirAll(mustLocalDest(t, d), 0o750); err != nil {
+				return err
+			}
+		}
+		if _, err := root.WriteChunk(mustLocalDest(t, "tree/root.bin"), 0, bytes.NewReader(payload1), int64(len(payload1)), 0o640); err != nil {
+			return err
+		}
+		if _, err := root.WriteChunk(mustLocalDest(t, "tree/sub/cfg.txt"), 0, bytes.NewReader(payload2), int64(len(payload2)), 0o600); err != nil {
+			return err
+		}
+		if err := root.Chtimes(mustLocalDest(t, "tree/sub/cfg.txt"), fileMtime, fileMtime); err != nil {
+			return err
+		}
+		if err := root.Chtimes(mustLocalDest(t, "tree/sub"), subMtime, subMtime); err != nil {
+			return err
+		}
+		return root.Chtimes(mustLocalDest(t, "tree"), rootMtime, rootMtime)
+	}), "seed recursive local tree")
+}
+
+func assertRecursiveSCPUploadHappyPath(t *testing.T) {
+	t.Helper()
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	rootMtime := time.Date(2025, time.March, 10, 10, 0, 0, 0, time.UTC)
+	subMtime := time.Date(2025, time.March, 11, 11, 0, 0, 0, time.UTC)
+	fileMtime := time.Date(2025, time.March, 12, 12, 0, 0, 0, time.UTC)
+	payload1, payload2 := makePatternPayload(9*1024+17), []byte("nested-config-body")
+	seedRecursiveUploadLocalTree(t, rig, payload1, payload2, rootMtime, subMtime, fileMtime)
+
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/deploy"), 0o755), "MkdirAll /deploy")
+	src, err := transfer.NewScopedUploadSource(rig.localRoot, mustLocalDest(t, "tree"))
+	requireNoErr(t, err, "NewScopedUploadSource")
+
+	auditBefore := len(rig.auditClust.Entries())
+	res, err := rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: src, RemoteDest: mustRemotePath(t, "/deploy"),
+		Recursive: true, ExpandIntoDir: true, PreserveMode: true, PreserveTimes: true,
+		SymlinkPolicy: pathalg.SymlinkReject, ChunkSize: 4096, Concurrency: 2,
+	})
+	requireNoErr(t, err, "Recursive SCPUpload")
+	if res.RemotePath.String() != "/deploy/tree" || res.FilesUploaded != 2 || res.DirsCreated != 3 || !res.ModTimePreserved || res.BytesTransferred != int64(len(payload1)+len(payload2)) {
+		t.Fatalf("递归上传汇总失配: %+v", res)
+	}
+	if gotAudits := len(rig.auditClust.Entries()) - auditBefore; gotAudits != 2 {
+		t.Fatalf("递归上传必须收口为单次 Gate 鉴权(2 条审计)，实际=%d", gotAudits)
+	}
+	if !bytes.Equal(mustReadRemote(t, rig.remoteFS, "/deploy/tree/root.bin"), payload1) || !bytes.Equal(mustReadRemote(t, rig.remoteFS, "/deploy/tree/sub/cfg.txt"), payload2) {
+		t.Fatalf("远端递归上传文件内容不符")
+	}
+	stRoot, err := rig.remoteFS.Stat(ctx, mustRemotePath(t, "/deploy/tree"))
+	requireNoErr(t, err, "Stat /deploy/tree")
+	stSub, err := rig.remoteFS.Stat(ctx, mustRemotePath(t, "/deploy/tree/sub"))
+	requireNoErr(t, err, "Stat /deploy/tree/sub")
+	stCfg, err := rig.remoteFS.Stat(ctx, mustRemotePath(t, "/deploy/tree/sub/cfg.txt"))
+	requireNoErr(t, err, "Stat cfg.txt")
+	if !stRoot.ModTime().Equal(rootMtime) || !stSub.ModTime().Equal(subMtime) || !stCfg.ModTime().Equal(fileMtime) || stCfg.Perm() != 0o600 {
+		t.Fatalf("自底向上目录/文件 mtime 或 perm 失配: root=%v sub=%v cfg=%v perm=%#o", stRoot.ModTime(), stSub.ModTime(), stCfg.ModTime(), stCfg.Perm())
+	}
+
+	_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: src, RemoteDest: mustRemotePath(t, "/deploy"),
+		Recursive: true, ExpandIntoDir: true, NoClobber: true, SymlinkPolicy: pathalg.SymlinkReject,
+	})
+	requireErrIs(t, err, ports.ErrAlreadyExists, "递归上传 NoClobber 必须拦截已有文件")
+}
+
+func assertRecursiveSCPUploadAdversarialGuards(t *testing.T) {
+	t.Helper()
+	rig := newTransferRig(t, rigOptions{})
+	defer rig.close()
+	ctx := context.Background()
+
+	// 1. OperatorUploadSource + Recursive 必须拒绝
+	opSrc, _ := transfer.NewOperatorUploadSource(mustLocalSource(t, "/op/dir"), pathalg.SymlinkReject)
+	_, err := rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: opSrc, RemoteDest: mustRemotePath(t, "/dst"),
+		Recursive: true, SymlinkPolicy: pathalg.SymlinkReject,
+	})
+	requireErrIs(t, err, ports.ErrUnsupported, "Operator 源递归上传必须拒绝")
+
+	// 2. 非 SymlinkReject 策略必须拒绝
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		if err := root.MkdirAll(mustLocalDest(t, "adv"), 0o755); err != nil {
+			return err
+		}
+		_, err := root.WriteChunk(mustLocalDest(t, "adv/a.txt"), 0, bytes.NewReader([]byte("0123456789")), 10, 0o644)
+		return err
+	}), "seed adv")
+	advSrc, _ := transfer.NewScopedUploadSource(rig.localRoot, mustLocalDest(t, "adv"))
+	_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: advSrc, RemoteDest: mustRemotePath(t, "/dst"),
+		Recursive: true, SymlinkPolicy: pathalg.SymlinkContainedRelative,
+	})
+	requireErrIs(t, err, transfer.ErrSymlinkPolicyDenied, "递归上传仅允许 SymlinkReject")
+
+	// 3. MaxFiles 与 MaxTotalBytes 超限拦截
+	_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: advSrc, RemoteDest: mustRemotePath(t, "/dst1"),
+		Recursive: true, SymlinkPolicy: pathalg.SymlinkReject, MaxFiles: 1,
+	})
+	requireErrIs(t, err, ports.ErrLimitExceeded, "MaxFiles 超限必须拦截")
+	_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: advSrc, RemoteDest: mustRemotePath(t, "/dst2"),
+		Recursive: true, SymlinkPolicy: pathalg.SymlinkReject, MaxTotalBytes: 5,
+	})
+	if err == nil || !errors.Is(err, transfer.ErrInvalidRequest) && !strings.Contains(err.Error(), "超限") {
+		t.Fatalf("MaxTotalBytes 超限期望拒绝，实际=%v", err)
+	}
+
+	// 4. 目录内含软链必须写前全拒绝（零远端残留）
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		return root.CreateSymlink(mustLocalDest(t, "adv/bad_link"), "a.txt")
+	}), "CreateSymlink bad_link")
+	_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: advSrc, RemoteDest: mustRemotePath(t, "/dst_sym"),
+		Recursive: true, SymlinkPolicy: pathalg.SymlinkReject,
+	})
+	requireErrIs(t, err, ports.ErrSymlinkRejected, "目录内软链必须写前拦截")
+	if _, lErr := rig.remoteFS.Lstat(ctx, mustRemotePath(t, "/dst_sym")); !errors.Is(lErr, ports.ErrNotFound) {
+		t.Fatalf("软链拦截后不得在远端创建目录: err=%v", lErr)
+	}
+
+	// 5. INV-B4 碰撞：目标目录展开后若遇到已有常规文件必须拒绝
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		return root.Remove(mustLocalDest(t, "adv/bad_link"))
+	}), "remove bad_link")
+	mustWriteRemote(t, rig.remoteFS, "/box/adv", []byte("blocking-file"))
+	_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: advSrc, RemoteDest: mustRemotePath(t, "/box"),
+		Recursive: true, ExpandIntoDir: true, SymlinkPolicy: pathalg.SymlinkReject,
+	})
+	requireErrIs(t, err, ports.ErrAlreadyExists, "目录展开碰撞已有非目录文件必须拒绝")
 }

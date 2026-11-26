@@ -22,7 +22,7 @@ import (
 //     必须停留 TransferUncertainCommit、上报 OutcomeUnknown 且严格 0 副作用（禁重试、禁覆写、禁删日志）；
 //  3. 空前缀高世代损坏必须 Fail-Closed 返回 ErrCorruptJournal 且严格 0 副作用。
 func (s *Service) RecoverTransfer(ctx context.Context, req RecoverTransferRequest) (TransferRecoveryResult, error) {
-	defer closeStreamIfNonNil(req.OperationStream)
+	defer closeStream(req.OperationStream)
 	hop, err := s.validateBaseCall(ctx, req.CallBase)
 	if lr, ok := req.LocalRootForClean.Get(); err != nil || s.journals == nil || !req.TransferID.IsValid() || (ok && !lr.IsValid()) {
 		return TransferRecoveryResult{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, fmt.Errorf("%w: TransferID 或 LocalRootForClean 无效", ErrInvalidRequest)))
@@ -31,7 +31,7 @@ func (s *Service) RecoverTransfer(ctx context.Context, req RecoverTransferReques
 	return runAuthorizedVal[security.CapTransfer](ctx, s, spec, func(authCtx context.Context, auth gate.Authorized[security.CapTransfer], _ *transferEmitter) (TransferRecoveryResult, error) {
 		out, recErr := s.recoverFromStore(authCtx, req.TransferID, req.PruneSuperseded)
 		if out.UncertainCommit || errors.Is(recErr, ErrUncertainCommit) {
-			reportUnknownOutcome(auth, "transfer_uncertain_commit", fmtErr(recErr))
+			reportUnknownOutcome(auth, "transfer_uncertain_commit", errText(recErr))
 		}
 		if recErr == nil {
 			s.cleanAbortedDownloadStage(out.State, req.LocalRootForClean)
@@ -49,7 +49,7 @@ func (s *Service) cleanAbortedDownloadStage(st fsm.TransferState, localRoot alge
 	}
 }
 
-// RecoverAllTransfers 启动期扫描 JournalStore.ListActive 并逐条安全恢复（Gate Halted 态严格拒绝，单条异常不阻断扫描）。
+// RecoverAllTransfers 启动期扫描 JournalStore.ListActive 并逐条安全恢复（Gate Halted 态严格拒绝，单条异常不阻断扫描；供启动期内部对账使用）。
 func (s *Service) RecoverAllTransfers(ctx context.Context, req RecoverAllRequest) (RecoverAllResult, error) {
 	if err := firstErr(s.checkReadyCtx(ctx), pickIf[error](s.gate.IsHalted(), gate.ErrGateHalted, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, nil))); err != nil {
 		return RecoverAllResult{}, err
@@ -58,26 +58,45 @@ func (s *Service) RecoverAllTransfers(ctx context.Context, req RecoverAllRequest
 	if err != nil {
 		return RecoverAllResult{}, err
 	}
-	entries := make([]TransferRecoveryEntry, 0, len(ids))
-	for _, id := range ids {
+	entries := make([]TransferRecoveryEntry, len(ids))
+	for i, id := range ids {
 		res, rErr := s.recoverFromStore(ctx, id, req.PruneSuperseded)
-		entries = append(entries, TransferRecoveryEntry{TransferID: id, Result: res, Err: rErr})
+		entries[i] = TransferRecoveryEntry{TransferID: id, Result: res, Err: rErr}
 	}
 	return RecoverAllResult{Entries: entries}, nil
+}
+
+// RecoverAllTransfersAuthorized 经 gate.WithAuthorized[security.CapTransfer] 门控与审计闭环执行全量活跃传输恢复/旧代裁剪：
+// 只读扫描基准风险为 RiskSafe，开启 PruneSuperseded 删除旧世代日志时升至 RiskModerate（与调用方 Risk 格并）。
+func (s *Service) RecoverAllTransfersAuthorized(ctx context.Context, req RecoverAllAuthorizedRequest) (RecoverAllResult, error) {
+	defer closeStream(req.OperationStream)
+	rv, hasR := req.Risk.Get()
+	if err := firstErr(s.checkReadyCtx(ctx), pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, pickIf[error](hasR && !rv.IsValid(), fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest), nil))); err != nil {
+		return RecoverAllResult{}, err
+	}
+	spec := authOpSpec{
+		base: CallBase{Risk: req.Risk, Approval: req.Approval, OperationStream: req.OperationStream}, tool: "transfer", action: "recover_all",
+		params:      map[string]string{"prune_superseded": strconv.FormatBool(req.PruneSuperseded)},
+		defaultRisk: pickIf(req.PruneSuperseded, security.RiskModerate, security.RiskSafe),
+		summary:     pickIf(req.PruneSuperseded, "recover and prune superseded transfer journals", "recover all transfer journals"),
+	}
+	return runAuthorizedVal[security.CapTransfer](ctx, s, spec, func(authCtx context.Context, _ gate.Authorized[security.CapTransfer], _ *transferEmitter) (RecoverAllResult, error) {
+		return s.RecoverAllTransfers(authCtx, RecoverAllRequest{PruneSuperseded: req.PruneSuperseded})
+	})
 }
 
 // ResumeTransfer 严守 INV-E5：全流程收口进单一 gate.WithAuthorized[CapTransfer]（鉴权前零 JournalStore 读取与零诊断发射），
 // 非 DirectOperator 经 Round-2 规范化持久化目标路径，遇 UncertainCommit 上报 OutcomeUnknown 且严格 0 副作用，
 // 对活跃句柄实施互斥准入（同代拒绝双活接管，StartNextGen=true 先原子释放旧句柄再登记 gen+1），审计后写失败自动回滚。
 func (s *Service) ResumeTransfer(ctx context.Context, req ResumeTransferRequest) (TransferHandleInfo, error) {
-	defer closeStreamIfNonNil(req.OperationStream)
+	defer closeStream(req.OperationStream)
 	hop, err := s.validateBaseCall(ctx, req.CallBase)
 	rs, hasRS := req.RemoteSource.Get()
 	if err != nil || s.journals == nil || !req.TransferID.IsValid() || (hasRS && !rs.IsValid()) {
 		return TransferHandleInfo{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, fmt.Errorf("%w: TransferID 或 RemoteSource 无效", ErrInvalidRequest)))
 	}
 	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "resume", paths: pickIf(hasRS, []pathalg.RemotePath{rs}, nil), params: map[string]string{"transfer_id": req.TransferID.String(), "start_next_gen": strconv.FormatBool(req.StartNextGen)}, defaultRisk: security.RiskModerate, summary: "transfer resume " + req.TransferID.String()}
-	if s.enforceStrictPaths() {
+	if s.strictPaths() {
 		spec.customCanon = s.makeResumeCanonicalizer(spec, pickIf(req.NodeID != "", req.NodeID, hop.NodeID()), req.TransferID)
 	}
 	return s.runAuthorizedTransferRegister(ctx, spec, func(authCtx context.Context, auth gate.Authorized[security.CapTransfer], emitter *transferEmitter) (TransferHandleInfo, error) {
@@ -113,7 +132,7 @@ func (s *Service) resumeAuthorizedTransfer(ctx context.Context, auth gate.Author
 		return TransferHandleInfo{}, ErrTransferNotFound
 	}
 	if rec.UncertainCommit || errors.Is(err, ErrUncertainCommit) {
-		reportUnknownOutcome(auth, "transfer_uncertain_commit", fmtErr(err))
+		reportUnknownOutcome(auth, "transfer_uncertain_commit", errText(err))
 		return TransferHandleInfo{}, pickIf[error](err != nil, err, ErrUncertainCommit)
 	}
 	if err != nil || rec.State == nil || !rec.State.IsValid() {
@@ -152,15 +171,12 @@ func (s *Service) recoverFromStore(ctx context.Context, transferID security.Oper
 			res.PrunedGenerations = append(res.PrunedGenerations, g)
 		}
 	}
-	s.emitRecoveryDiag(transferID, res, recErr)
-	return res, recErr
-}
-func (s *Service) emitRecoveryDiag(id security.OperationID, res TransferRecoveryResult, err error) {
 	attrs := map[string]string{"selected_gen": strconv.FormatUint(res.SelectedGen, 10), "uncertain": strconv.FormatBool(res.UncertainCommit)}
-	if err == nil && res.State != nil && res.State.IsValid() {
+	if recErr == nil && res.State != nil && res.State.IsValid() {
 		attrs["state"] = res.State.Kind().String()
 	}
-	s.emitDiagnostic(algebraic.Some(id), pickIf(err != nil, events.SeverityError, events.SeverityInfo), pickIf(err != nil, "transfer_recovery_blocked", "transfer_recovered"), pickIf(err != nil, fmtErr(err), "transfer journal recovered"), attrs)
+	s.emitDiagnostic(algebraic.Some(transferID), pickIf(recErr != nil, events.SeverityError, events.SeverityInfo), pickIf(recErr != nil, "transfer_recovery_blocked", "transfer_recovered"), pickIf(recErr != nil, errText(recErr), "transfer journal recovered"), attrs)
+	return res, recErr
 }
 
 // recoverFromGenerationSnapshots 是纯函数双代/多代恢复裁决核心，严格强制全部三条崩溃恢复铁律。
@@ -197,14 +213,12 @@ func detectAnyCommitUncertainty(transferID security.OperationID, snaps []ports.J
 			if slices.ContainsFunc(snap.PartialRecords(), func(r fsm.TransferJournalRecord) bool {
 				return r.IsValid() && (r.Kind() == fsm.JournalRecordCommitStarted || r.Kind() == fsm.JournalRecordCommitted)
 			}) {
-				return TransferRecoveryResult{TransferID: transferID, State: buildUncertainStateFromPartial(snap.PartialRecords()), SelectedGen: snap.Generation(), UncertainCommit: true},
-					fmt.Errorf("%w: 损坏世代 gen=%d 前缀含提交标记，严禁重试或删日志: %w", ErrUncertainCommit, snap.Generation(), snap.Err()), true
+				return TransferRecoveryResult{TransferID: transferID, State: buildUncertainStateFromPartial(snap.PartialRecords()), SelectedGen: snap.Generation(), UncertainCommit: true}, fmt.Errorf("%w: 损坏世代 gen=%d 前缀含提交标记，严禁重试或删日志: %w", ErrUncertainCommit, snap.Generation(), snap.Err()), true
 			}
 			continue
 		}
 		if st, _, _, _ := fsm.RecoverTransferFromJournal(snap.Records()); st != nil && st.Kind() == fsm.TransferKindUncertainCommit {
-			return TransferRecoveryResult{TransferID: transferID, State: st, SelectedGen: snap.Generation(), UncertainCommit: true},
-				fmt.Errorf("%w: 世代 gen=%d 处于 UncertainCommit，严禁重试或删日志", ErrUncertainCommit, snap.Generation()), true
+			return TransferRecoveryResult{TransferID: transferID, State: st, SelectedGen: snap.Generation(), UncertainCommit: true}, fmt.Errorf("%w: 世代 gen=%d 处于 UncertainCommit，严禁重试或删日志", ErrUncertainCommit, snap.Generation()), true
 		}
 	}
 	return TransferRecoveryResult{}, nil, false
@@ -223,8 +237,7 @@ func recoverHealthyHighestWithLowers(transferID security.OperationID, lowers []p
 	if hiErr != nil || !fsm.TransferMetaOf(hiSt).TransferID().Equal(transferID) {
 		return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, fmt.Errorf("%w: 高世代 gen=%d 无效，严禁回退低世代: %w", ErrCorruptJournal, highest.Generation(), hiErr)
 	}
-	pruneList := make([]uint64, 0, len(lowers))
-	hiMeta := fsm.TransferMetaOf(hiSt)
+	pruneList, hiMeta := make([]uint64, 0, len(lowers)), fsm.TransferMetaOf(hiSt)
 	for _, lo := range lowers {
 		if lo.Corrupt() {
 			if err := verifyCorruptLowerIdentity(lo.PartialRecords(), hiMeta); err != nil {

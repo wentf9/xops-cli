@@ -40,6 +40,7 @@ type ForwardInfo struct {
 	valid     bool
 }
 
+// ForwardInfo 零值安全只读访问器。
 func (i ForwardInfo) IsValid() bool {
 	return i.valid && i.handle.IsValid() && i.spec.IsValid() && i.boundAddr != ""
 }
@@ -124,7 +125,6 @@ func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn 
 		return nil
 	})
 }
-
 func startDirectTUNBridge(leaseCtx, revokeCtx context.Context, conn ports.TransportConn, tunPort ports.TUNDevicePort, spec ports.ForwardSpec) (*managedForward, error) {
 	tunSpec, ok := spec.TUN().Get()
 	if !ok || !tunSpec.IsValid() {
@@ -158,7 +158,6 @@ func startDirectTUNBridge(leaseCtx, revokeCtx context.Context, conn ports.Transp
 	}
 	return finishManagedForward(revokeCtx, mf, pump(remoteTUN, localDev), pump(localDev, remoteTUN), func(wCtx context.Context) error { <-wCtx.Done(); _ = mf.closeResources(); return nil })
 }
-
 func finishManagedForward(revokeCtx context.Context, mf *managedForward, workers ...func(context.Context) error) (*managedForward, error) {
 	n, err := conc.NewNursery(revokeCtx)
 	if err != nil {
@@ -268,7 +267,6 @@ func (s *Service) StartForward(ctx context.Context, req StartForwardRequest) (Fo
 	}
 	return ForwardInfo{handle: h, spec: req.Spec, boundAddr: bound, valid: true}, nil
 }
-
 func (s *Service) validateStartForwardCall(ctx context.Context, req StartForwardRequest) error {
 	if err := s.validateBaseCall(ctx, req.Plan, RequestTTYUnset, req.Risk); err != nil {
 		return err
@@ -303,13 +301,11 @@ func defaultForwardRisk(spec ports.ForwardSpec) security.RiskLevel {
 	return security.RiskDangerous
 }
 
-// InspectForward 返回指定世代隧道句柄的不可变运行期状态快照（含绑定地址与活跃状态）。
+// InspectForward / WithForwardHandle / StopForward 提供受管隧道句柄的状态查询、同步借用与显式释放。
 func (s *Service) InspectForward(ctx context.Context, handle plan.ManagedHandle[plan.KindTunnel]) (ForwardStatus, error) {
 	return inspectManagedHandle[plan.KindTunnel, ForwardStatus](ctx, s, handle)
 }
 
-// WithForwardHandle 在同步作用域闭包内借出受管隧道句柄的只读/演练视图（零逃逸、吊销即取消上下文）。
-//
 //xops:syncclosure
 //xops:borrowed
 func (s *Service) WithForwardHandle(ctx context.Context, handle plan.ManagedHandle[plan.KindTunnel], fn func(ctx context.Context, fh ports.ForwardHandle) error) error {
@@ -321,8 +317,6 @@ func (s *Service) WithForwardHandle(ctx context.Context, handle plan.ManagedHand
 	}
 	return pool.WithManagedHandle[plan.KindTunnel, forwardResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, mf forwardResource) error { return fn(hCtx, mf.view()) })
 }
-
-// StopForward 显式释放隧道转发句柄、解钉底层跳板并有界关闭底层监听与传输视图。
 func (s *Service) StopForward(ctx context.Context, handle plan.ManagedHandle[plan.KindTunnel]) error {
 	return releaseManagedHandle[plan.KindTunnel](ctx, s, handle)
 }

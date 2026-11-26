@@ -121,7 +121,6 @@ func validateExtraPending(extra []inventory.PendingSecretRef) error {
 	}
 	return nil
 }
-
 func (s *Service) mergePendingRefsExcluding(exclude security.OperationID, extra []inventory.PendingSecretRef) ([]inventory.PendingSecretRef, error) {
 	if err := validateExtraPending(extra); err != nil {
 		return nil, err
@@ -156,9 +155,8 @@ func (s *Service) requireStoreAndGate(ctx context.Context, risk algebraic.Option
 		return ErrGateUnavailable
 	case risk.IsSome() && !risk.OrElse(zeroVal[security.RiskLevel]()).IsValid():
 		return fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
-	default:
-		return nil
 	}
+	return nil
 }
 
 //xops:syncclosure
@@ -196,7 +194,6 @@ func runMutate[T any](ctx context.Context, s *Service, action, nodeID, summary s
 	})
 	return out, err
 }
-
 func (s *Service) collectOpenSSHJumpNodes(ctx context.Context) ([]inventory.OpenSSHJumpNode, error) {
 	if s.openSSH == nil {
 		return nil, nil
@@ -336,10 +333,7 @@ func wrapCommitError(sentinel error, detail string, cause error) error {
 	if cause != nil {
 		return fmt.Errorf("%w: %w", sentinel, cause)
 	}
-	if detail != "" {
-		return fmt.Errorf("%w: %s", sentinel, detail)
-	}
-	return sentinel
+	return pickIf(detail != "", fmt.Errorf("%w: %s", sentinel, detail), sentinel)
 }
 func buildImporterRegistry(raw []ports.FormatImporter) (map[string]ports.FormatImporter, error) {
 	reg := make(map[string]ports.FormatImporter, len(raw))
@@ -358,11 +352,11 @@ func buildImporterRegistry(raw []ports.FormatImporter) (map[string]ports.FormatI
 func normalizeKnownStores(raw []string) ([]string, error) {
 	out := make([]string, 0, len(raw))
 	for _, s := range raw {
-		if t := strings.TrimSpace(s); t == "" {
+		t := strings.TrimSpace(s)
+		if t == "" {
 			return nil, fmt.Errorf("%w: KnownStores 不能包含空字符串", ErrInvalidConfig)
-		} else {
-			out = append(out, t)
 		}
+		out = append(out, t)
 	}
 	return credential.MergeSortedUniqueStrings(out, nil), nil
 }

@@ -76,15 +76,13 @@ func (s *Service) ExecPrivileged(ctx context.Context, req PrivilegeExecRequest) 
 	}
 	return out, gateErr
 }
-
 func (s *Service) validatePrivilegeCall(ctx context.Context, req PrivilegeExecRequest) error {
-	if err := s.validateBaseCall(ctx, req.Plan, req.RequestTTY, req.Risk); err != nil {
+	switch err := s.validateBaseCall(ctx, req.Plan, req.RequestTTY, req.Risk); {
+	case err != nil:
 		return err
-	}
-	if s.cfg.Escalator == nil {
+	case s.cfg.Escalator == nil:
 		return fmt.Errorf("%w: PrivilegeEscalationPort 未配置", ErrPortUnavailable)
-	}
-	if !req.Privilege.IsValid() {
+	case !req.Privilege.IsValid():
 		return fmt.Errorf("%w: PrivilegeRequest 无效", ErrInvalidRequest)
 	}
 	if err := validateScriptTTY(req.Privilege.Command(), req.RequestTTY); err != nil {
@@ -95,7 +93,6 @@ func (s *Service) validatePrivilegeCall(ctx context.Context, req PrivilegeExecRe
 	}
 	return s.validatePrivilegeSecretSource(req)
 }
-
 func (s *Service) validatePrivilegeSecretSource(req PrivilegeExecRequest) error {
 	ref, hasRef := req.PasswordRef.Get()
 	if (hasRef && !ref.IsValid()) || (hasRef && req.PromptPassword) || (req.PromptPassword && req.Privilege.NonInteractive()) {
@@ -111,7 +108,6 @@ func (s *Service) validatePrivilegeSecretSource(req PrivilegeExecRequest) error 
 	}
 	return nil
 }
-
 func (s *Service) buildPrivilegeGateRequest(req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string) (gate.GateRequest[security.CapExecute], error) {
 	cmd := req.Privilege.Command()
 	cmdDig, err := cmd.Digest()
@@ -323,13 +319,12 @@ func notStartedSessionOutcome(phase execution.StartPhase, code string, err error
 func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.ShellProbeResult, error) {
 	defer closeStream(req.OperationStream)
 	zr := zeroVal[ports.ShellProbeResult]()
-	if err := s.validateBaseCall(ctx, req.Plan, RequestTTYUnset, req.Risk); err != nil {
+	switch err := s.validateBaseCall(ctx, req.Plan, RequestTTYUnset, req.Risk); {
+	case err != nil:
 		return zr, err
-	}
-	if s.cfg.ShellProbe == nil {
+	case s.cfg.ShellProbe == nil:
 		return zr, fmt.Errorf("%w: ShellProbePort 未配置", ErrPortUnavailable)
-	}
-	if d, ok := req.Timeout.Get(); ok && !d.IsPositive() {
+	case req.Timeout.IsSome() && !req.Timeout.OrElse(zeroVal[algebraic.Duration]()).IsPositive():
 		return zr, fmt.Errorf("%w: ProbeShell Timeout 必须为正时长", ErrInvalidRequest)
 	}
 	targetHop, nodeID, err := resolvePlanTargetAndNode(req.Plan, req.NodeID)
@@ -350,10 +345,9 @@ func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.
 			defer cancel()
 			return nil, s.cfg.Pool.WithLease(runCtx, req.Plan, func(leaseCtx context.Context, lease *pool.Lease) error {
 				raw, pErr := s.cfg.ShellProbe.ProbeShell(leaseCtx, lease)
-				if pErr != nil {
-					return pErr
+				if pErr == nil {
+					result, pErr = normalizeShellProbeResult(raw)
 				}
-				result, pErr = normalizeShellProbeResult(raw)
 				return pErr
 			})
 		}); gateErr != nil {
@@ -361,7 +355,6 @@ func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.
 	}
 	return result, nil
 }
-
 func normalizeShellProbeResult(raw ports.ShellProbeResult) (ports.ShellProbeResult, error) {
 	if !raw.IsValid() || !raw.Dialect().IsValid() || !raw.Interpreter().IsValid() || !raw.LaunchProfile().IsValid() || raw.Dialect() == execution.DialectUnknown || (raw.ProbeStage() != 1 && raw.ProbeStage() != 2) {
 		return zeroVal[ports.ShellProbeResult](), fmt.Errorf("%w: 探测快照缺少有效方言、解释器、LaunchProfile 或阶段(%d)非法", ErrInvalidProbeResult, raw.ProbeStage())

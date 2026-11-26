@@ -15,6 +15,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -157,7 +158,6 @@ func (s *Service) RunMuxProxy(ctx context.Context, req MuxRequest, stdin io.Read
 		return firstNonNilErr(runErr, pCtx.Err())
 	})
 }
-
 func copyMuxStream(dst io.Writer, src io.Reader, aborted *atomic.Bool) error {
 	if src == nil {
 		return nil
@@ -168,7 +168,6 @@ func copyMuxStream(dst io.Writer, src io.Reader, aborted *atomic.Bool) error {
 	}
 	return err
 }
-
 func copyMuxStdin(conn net.Conn, stdin io.Reader, aborted *atomic.Bool, abort func()) error {
 	err := copyMuxStream(conn, stdin, aborted)
 	if err != nil && abort != nil {
@@ -219,9 +218,58 @@ func (s *Service) WithMuxConn(ctx context.Context, req MuxRequest, fn func(ctx c
 	})
 }
 
+// TryDialMuxClient 按 ControlPolicy 生效投影执行透明客户端 ControlMaster 附着（INV-C4，供 core/engine 拨号适配复用）：
+//   - 仅在 ControlPath 已启用且 EffectiveMaster 为 no/auto/autoask 时尝试附着（yes/ask 强制新建主连接不走客户端附着）；
+//   - autoask 模式先探测活跃套接字，存活时经 confirmMuxMasterWith 请求操作员确认（拒签/不可交互时失败关闭）；
+//   - 遇 ErrNotFound/ErrMuxUnavailable 透明返回 (nil, false, nil) 供拨号层回退底层新建连接；
+//   - 严格核验 DialMux 返回连接的 IsAlive()、(HopDigest, Endpoint) 精确一致，失配即关闭并失败关闭报错。
+func TryDialMuxClient(ctx context.Context, muxPort ports.MuxSocketPort, env ports.EnvPort, interaction ports.InteractionPort, hop plan.HopSpec, dig plan.HopDigest) (ports.TransportConn, bool, error) {
+	if muxPort == nil || !hop.IsValid() || !dig.IsValid() {
+		return nil, false, nil
+	}
+	cp := hop.Transport().ControlPolicy()
+	if eff := cp.EffectiveMaster(); !cp.IsEnabled() || (eff != option.ControlMasterNo && eff != option.ControlMasterAuto && eff != option.ControlMasterAutoAsk) {
+		return nil, false, nil
+	}
+	sockPath, err := expandControlPath(hop, cp.Path(), env)
+	if err != nil {
+		return nil, false, err
+	}
+	if cp.EffectiveMaster() == option.ControlMasterAutoAsk {
+		if ok, cErr := confirmAutoAskMuxAttach(ctx, muxPort, interaction, sockPath, hop.NodeID()); !ok || cErr != nil {
+			return nil, false, cErr
+		}
+	}
+	conn, err := muxPort.DialMux(ctx, sockPath, dig, hop.Endpoint())
+	if errors.Is(err, ports.ErrNotFound) || errors.Is(err, ports.ErrMuxUnavailable) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return verifyDialedMuxConn(conn, dig, hop.Endpoint())
+}
+func confirmAutoAskMuxAttach(ctx context.Context, muxPort ports.MuxSocketPort, interaction ports.InteractionPort, sockPath pathalg.LocalSourcePath, nodeID string) (bool, error) {
+	resp, err := muxPort.Probe(ctx, sockPath)
+	if errors.Is(err, ports.ErrNotFound) || errors.Is(err, ports.ErrMuxUnavailable) {
+		return false, nil
+	}
+	if err != nil || !resp.IsValid() || !resp.Alive() {
+		return false, err
+	}
+	err = confirmMuxMasterWith(ctx, interaction, nodeID, "Attach to active ControlMaster via DialMux")
+	return err == nil, err
+}
+func verifyDialedMuxConn(conn ports.TransportConn, leafDigest plan.HopDigest, ep netaddr.Endpoint) (ports.TransportConn, bool, error) {
+	if conn == nil || !conn.IsAlive() || !conn.HopDigest().Equal(leafDigest) || !conn.Endpoint().Equal(ep) {
+		_ = closeClosers(conn)
+		return nil, false, fmt.Errorf("%w: DialMux 返回连接无效或与计划末跳身份不匹配", ErrMuxMasterUnavailable)
+	}
+	return conn, true, nil
+}
 func (s *Service) dialVerifiedMuxConn(ctx context.Context, nodeID string, sockPath pathalg.LocalSourcePath, targetHop plan.HopSpec, leafDigest plan.HopDigest, effMaster option.ControlMasterMode) (ports.TransportConn, error) {
 	if effMaster == option.ControlMasterAsk || effMaster == option.ControlMasterAutoAsk {
-		if err := s.confirmMuxMaster(ctx, nodeID, "Attach to active ControlMaster via DialMux"); err != nil {
+		if err := confirmMuxMasterWith(ctx, s.cfg.Interaction, nodeID, "Attach to active ControlMaster via DialMux"); err != nil {
 			return nil, err
 		}
 	}
@@ -229,11 +277,8 @@ func (s *Service) dialVerifiedMuxConn(ctx context.Context, nodeID string, sockPa
 	if err != nil {
 		return nil, err
 	}
-	if conn == nil || !conn.IsAlive() || !conn.HopDigest().Equal(leafDigest) || !conn.Endpoint().Equal(targetHop.Endpoint()) {
-		_ = closeClosers(conn)
-		return nil, fmt.Errorf("%w: DialMux 返回连接无效或与计划末跳身份不匹配", ErrMuxMasterUnavailable)
-	}
-	return conn, nil
+	verified, _, vErr := verifyDialedMuxConn(conn, leafDigest, targetHop.Endpoint())
+	return verified, vErr
 }
 func buildMuxGateReq[C security.Capability](connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec, nodeID, action string, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode, risk security.RiskLevel, extra map[string]string, approval algebraic.Option[gate.ApprovalSubmission], stream *events.OperationStream) (gate.GateRequest[C], error) {
 	params := map[string]string{"socket_path": sockPath.String(), "effective_master": effMaster.String(), "effective_persist": targetHop.Transport().ControlPolicy().EffectivePersist().String()}
@@ -252,18 +297,8 @@ func (s *Service) validateMuxBaseCall(ctx context.Context, connPlan plan.SealedC
 	}
 	return nil
 }
-func effectiveMuxMasterForOp(cp option.ControlPolicy, hasExplicitPath bool) option.ControlMasterMode {
-	if cp.IsDisabled() {
-		return option.ControlMasterNo
-	}
-	if hasExplicitPath && !cp.Path().IsEnabled() {
-		return cp.Master()
-	}
-	return cp.EffectiveMaster()
-}
-func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (plan.HopSpec, string, pathalg.LocalSourcePath, option.ControlMasterMode, error) {
-	zh, zp := zeroVal[plan.HopSpec](), zeroVal[pathalg.LocalSourcePath]()
-	if err := s.validateMuxBaseCall(ctx, req.Plan, req.Risk); err != nil {
+func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (zh plan.HopSpec, nodeID string, zp pathalg.LocalSourcePath, eff option.ControlMasterMode, err error) {
+	if err = s.validateMuxBaseCall(ctx, req.Plan, req.Risk); err != nil {
 		return zh, "", zp, option.ControlMasterNo, err
 	}
 	targetHop, nodeID, err := resolvePlanTargetAndNode(req.Plan, req.NodeID)
@@ -274,15 +309,18 @@ func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (plan.HopSpe
 	if cp.IsDisabled() {
 		return zh, "", zp, option.ControlMasterNo, fmt.Errorf("%w: ControlPath 已显式禁用（none）", ErrControlMasterDisabled)
 	}
-	effMaster := effectiveMuxMasterForOp(cp, req.SocketPath.IsSome())
+	eff = cp.EffectiveMaster()
 	if p, ok := req.SocketPath.Get(); ok {
+		if !cp.Path().IsEnabled() {
+			eff = cp.Master()
+		}
 		if !p.IsValid() {
 			return zh, "", zp, option.ControlMasterNo, fmt.Errorf("%w: 显式 SocketPath 无效", ErrInvalidRequest)
 		}
-		return targetHop, nodeID, p, effMaster, nil
+		return targetHop, nodeID, p, eff, nil
 	}
 	sockPath, err := expandControlPath(targetHop, cp.Path(), s.cfg.Env)
-	return targetHop, nodeID, sockPath, effMaster, err
+	return targetHop, nodeID, sockPath, eff, err
 }
 
 // expandControlPath 展开 ControlPath 模板占位符（%r/%h/%p/%l/%u/%i/%j/%C）与前导 ~/；

@@ -150,7 +150,6 @@ func (s *Service) startManagedMuxMaster(leaseCtx, revokeCtx context.Context, con
 	_ = mm.Close()
 	return nil, err
 }
-
 func (m *managedMuxMaster) launchMuxWorkers(muxPort ports.MuxSocketPort, forwarder ports.ForwarderPort, clk ports.Clock, readyCh chan struct{}, startErrCh chan error) error {
 	if err := m.reaperNursery.Go(m.runAutoRelease); err != nil {
 		return err
@@ -184,7 +183,6 @@ func (m *managedMuxMaster) launchMuxWorkers(muxPort ports.MuxSocketPort, forward
 	}
 	return nil
 }
-
 func (m *managedMuxMaster) runPersistTimer(ctx context.Context, clk ports.Clock, idle time.Duration) error {
 	tm := clk.NewTimer(idle)
 	defer tm.Stop()
@@ -234,10 +232,7 @@ func (m *managedMuxMaster) bindAutoRelease(fn func()) {
 	m.relMu.Unlock()
 }
 func (m *managedMuxMaster) touch(ctx context.Context) {
-	if m == nil || !m.valid || m.closed.Load() {
-		return
-	}
-	if _, hasTimeout := m.effectivePersist.Timeout(); !hasTimeout {
+	if _, hasTimeout := m.effectivePersist.Timeout(); m == nil || !m.valid || m.closed.Load() || !hasTimeout {
 		return
 	}
 	ack := make(chan struct{})
@@ -323,14 +318,13 @@ func (s *Service) StartControlMaster(ctx context.Context, req ControlMasterReque
 	}
 	return info, nil
 }
-
 func (s *Service) execStartControlMaster(authCtx context.Context, connPlan plan.SealedConnectionPlan, nodeID string, binding security.OperationBinding, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode, effPersist option.ControlPersistSpec, outInfo *ControlMasterInfo) error {
 	if reused, rInfo, rErr := s.tryReuseControlMaster(authCtx, nodeID, sockPath, effMaster, effPersist); rErr != nil || reused {
 		*outInfo = rInfo
 		return rErr
 	}
 	if effMaster == option.ControlMasterAsk || effMaster == option.ControlMasterAutoAsk {
-		if err := s.confirmMuxMaster(authCtx, nodeID, "Start ControlMaster listener"); err != nil {
+		if err := confirmMuxMasterWith(authCtx, s.cfg.Interaction, nodeID, "Start ControlMaster listener"); err != nil {
 			return err
 		}
 	}
@@ -363,21 +357,21 @@ func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sock
 		return false, ControlMasterInfo{}, err
 	}
 	if effMaster == option.ControlMasterAutoAsk {
-		if err := s.confirmMuxMaster(ctx, nodeID, "Reuse active ControlMaster connection"); err != nil {
+		if err := confirmMuxMasterWith(ctx, s.cfg.Interaction, nodeID, "Reuse active ControlMaster connection"); err != nil {
 			return false, ControlMasterInfo{}, err
 		}
 	}
 	return true, ControlMasterInfo{socketPath: sockPath, reusedExisting: true, masterPID: resp.MasterPID(), effectiveMaster: effMaster, effectivePersist: effPersist, valid: true}, nil
 }
-func (s *Service) confirmMuxMaster(ctx context.Context, nodeID, message string) error {
-	if s.cfg.Interaction == nil || !s.cfg.Interaction.CanInteract() {
+func confirmMuxMasterWith(ctx context.Context, interaction ports.InteractionPort, nodeID, message string) error {
+	if interaction == nil || !interaction.CanInteract() {
 		return fmt.Errorf("%w: %w: ControlMaster ask/autoask 需要可交互终端", ErrMuxMasterUnavailable, ports.ErrInteractionUnavailable)
 	}
 	cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Title: "ControlMaster Confirmation", Message: message, Subject: nodeID, Risk: security.RiskModerate})
 	if err != nil {
 		return err
 	}
-	if verdict, err := s.cfg.Interaction.Confirm(ctx, cReq); err != nil {
+	if verdict, err := interaction.Confirm(ctx, cReq); err != nil {
 		return fmt.Errorf("%w: %w", ErrMuxMasterUnavailable, err)
 	} else if !verdict.Allowed() {
 		return fmt.Errorf("%w: 操作员拒绝共享或启动 ControlMaster", ErrMuxMasterUnavailable)
@@ -385,20 +379,16 @@ func (s *Service) confirmMuxMaster(ctx context.Context, nodeID, message string) 
 	return nil
 }
 
-// InspectControlMaster 返回指定世代 ControlMaster 句柄的只读状态快照。
+// InspectControlMaster / TouchControlMaster / StopControlMaster 提供受管 ControlMaster 句柄的状态快照、活跃续期与有序停机。
 func (s *Service) InspectControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) (ControlMasterStatus, error) {
 	return inspectManagedHandle[plan.KindMux, ControlMasterStatus](ctx, s, handle)
 }
-
-// TouchControlMaster 刷新处于 ControlPersist 限时驻留模式的 ControlMaster 空闲计时器。
 func (s *Service) TouchControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) error {
 	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
 		return err
 	}
 	return pool.WithManagedHandle[plan.KindMux, muxResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, mm muxResource) error { mm.touch(hCtx); return nil })
 }
-
-// StopControlMaster 释放 ControlMaster 句柄、解钉底层跳板并触发监听套接字与服务端有序停机。
 func (s *Service) StopControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) error {
 	return releaseManagedHandle[plan.KindMux](ctx, s, handle)
 }

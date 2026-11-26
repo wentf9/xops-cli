@@ -21,6 +21,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/gate"
+	"github.com/wentf9/xops-cli/core/internal/usecase/transfer/remotecanon"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -28,25 +29,24 @@ import (
 // 仅经 pool.RegisterLeaseHandleWith[plan.KindTransfer] 构造，持有可撤销钉选 TransportConn（零 borrowed 逃逸），
 // 并由 conc.CtxMutex 串行化分片/提交/中止操作；同步 Close() 零协程且绝不误关共享底层连接。
 type managedTransferSession struct {
-	mu              *conc.CtxMutex
-	conn            ports.TransportConn
-	rfs             ports.RemoteFSPort
-	revokeCtx       context.Context
-	state           fsm.TransferState
-	meta            fsm.TransferMeta
-	opts            TransferSessionOptions
-	remoteStagePath algebraic.Option[pathalg.RemotePath]
-	localStageDest  algebraic.Option[pathalg.LocalRootedDest]
-	renameSpec      ports.RemoteRenameSpec
-	sourceAnchor    ports.RemoteFileAnchor
-	sourceModTime   time.Time
-	effectivePerm   fs.FileMode
-	hasher          hash.Hash // 连续流式加速哈希；崩溃恢复后置 nil 强制全量回读校验
-	startedAt       time.Time
-	valid           bool
-	closed          atomic.Bool
-	closeOnce       sync.Once
-	closeErr        error
+	mu                       *conc.CtxMutex
+	conn                     ports.TransportConn
+	rfs                      ports.RemoteFSPort
+	revokeCtx                context.Context
+	state                    fsm.TransferState
+	meta                     fsm.TransferMeta
+	opts                     TransferSessionOptions
+	remoteStagePath          algebraic.Option[pathalg.RemotePath]
+	localStageDest           algebraic.Option[pathalg.LocalRootedDest]
+	renameSpec               ports.RemoteRenameSpec
+	sourceAnchor             ports.RemoteFileAnchor
+	sourceModTime, startedAt time.Time
+	effectivePerm            fs.FileMode
+	hasher                   hash.Hash // 连续流式加速哈希；崩溃恢复后置 nil 强制全量回读校验
+	valid                    bool
+	closed                   atomic.Bool
+	closeOnce                sync.Once
+	closeErr                 error
 }
 
 // IsValid / Close 实现 pool.ManagedResource 契约。
@@ -97,21 +97,22 @@ func (s *Service) buildManagedTransferSession(probeCtx, revokeCtx context.Contex
 	return &managedTransferSession{mu: conc.NewCtxMutex(), conn: conn, rfs: rfs, revokeCtx: revokeCtx, state: st, meta: meta, opts: opts, remoteStagePath: remoteStage, localStageDest: localStage, renameSpec: renameSpec, sourceAnchor: srcAnchor, sourceModTime: srcModTime, effectivePerm: perm, hasher: pickIf(freshStart, sha256.New(), nil), startedAt: startedAt, valid: true}, effs, evs, nil
 }
 func inspectStreamDownloadSource(ctx context.Context, rfs ports.RemoteFSPort, req StartTransferRequest, defaultPerm fs.FileMode) (uint64, algebraic.Option[time.Time], fs.FileMode, ports.RemoteFileAnchor, time.Time, error) {
+	za := zeroVal[ports.RemoteFileAnchor]()
 	if req.Dest.Direction() != fsm.TransferDirectionDownload {
-		return req.TotalBytes, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, nil
+		return req.TotalBytes, req.ModTime, defaultPerm, za, time.Time{}, nil
 	}
 	rs, ok := req.RemoteSource.Get()
 	if !ok {
-		return 0, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, fmt.Errorf("%w: 下载缺少 RemoteSource", ErrInvalidRequest)
+		return 0, req.ModTime, defaultPerm, za, time.Time{}, fmt.Errorf("%w: 下载缺少 RemoteSource", ErrInvalidRequest)
 	}
 	st, err := rfs.Lstat(ctx, rs)
 	if err != nil || !st.IsRegular() {
-		return 0, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, pickIf[error](err != nil, err, pickIf(st.IsSymlink(), ports.ErrSymlinkRejected, pickIf(st.IsDir(), ports.ErrRemoteIsDir, ports.ErrNotRegularFile)))
+		return 0, req.ModTime, defaultPerm, za, time.Time{}, pickIf[error](err != nil, err, pickIf(st.IsSymlink(), ports.ErrSymlinkRejected, pickIf(st.IsDir(), ports.ErrRemoteIsDir, ports.ErrNotRegularFile)))
 	}
 	if size := uint64(st.Size()); size > fsm.MaxTransferBytes || (req.TotalBytes > 0 && req.TotalBytes != size) {
-		return 0, req.ModTime, defaultPerm, zeroVal[ports.RemoteFileAnchor](), time.Time{}, pickIf[error](size > fsm.MaxTransferBytes, fmt.Errorf("%w: 远端大小 %d 超限", fsm.ErrTransferSizeExceeded, size), fmt.Errorf("%w: 声明大小与远端不符", ErrInvalidRequest))
+		return 0, req.ModTime, defaultPerm, za, time.Time{}, pickIf[error](size > fsm.MaxTransferBytes, fmt.Errorf("%w: 远端大小 %d 超限", fsm.ErrTransferSizeExceeded, size), fmt.Errorf("%w: 声明大小与远端不符", ErrInvalidRequest))
 	}
-	mt := pickIf(req.PreserveTimes && req.ModTime.IsNone() && isValidRFC3339Time(st.ModTime()), algebraic.Some(st.ModTime()), req.ModTime)
+	mt := pickIf(req.PreserveTimes && req.ModTime.IsNone() && validRFC3339(st.ModTime()), algebraic.Some(st.ModTime()), req.ModTime)
 	return uint64(st.Size()), mt, pickIf(req.Perm.IsNone() && st.Perm() != 0, sanitizeLocalDownloadPerm(st.Perm()), defaultPerm), st.Anchor(), st.ModTime(), nil
 }
 func initOrResumeTransferFSM(req StartTransferRequest, totalBytes uint64, resumedState fsm.TransferState, freshStart bool) (fsm.TransferMeta, fsm.TransferState, []fsm.TransferEffect, []fsm.TransferEvent, error) {
@@ -134,7 +135,7 @@ func computeStreamStagePaths(meta fsm.TransferMeta) (rpOpt algebraic.Option[path
 	sum := sha256.Sum256([]byte("xops.stream.transfer.v2\x00" + meta.Direction().String() + ":" + meta.TransferID().String() + ":g" + strconv.FormatUint(meta.Generation(), 10)))
 	token := fmt.Sprintf("%x", sum[:12])
 	if dst, ok := meta.Dest().Remote().Get(); meta.Direction() == fsm.TransferDirectionUpload && ok {
-		rp, rErr := joinRemoteBase(dst.Dir(), ".xops-stage-"+token+".part")
+		rp, rErr := remotecanon.JoinRemoteBase(dst.Dir(), ".xops-stage-"+token+".part", ErrInvalidRequest)
 		return algebraic.Some(rp), lpOpt, rErr
 	}
 	if dst, ok := meta.Dest().Local().Get(); meta.Direction() == fsm.TransferDirectionDownload && ok {
@@ -156,50 +157,24 @@ func (s *Service) verifyStagedDigest(ctx context.Context, sess *managedTransferS
 		if s.scopedFS == nil || !okR || !okS {
 			return dig, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, fmt.Errorf("%w: 缺少 LocalRoot/暂存路径", ErrInvalidRequest))
 		}
-		err = s.scopedFS.WithRoot(lr, func(root ports.RootHandle) (hErr error) {
-			dig, hErr = hashLocalStagedFile(root, stageDest, int64(totalBytes))
-			return hErr
+		return dig, s.scopedFS.WithRoot(lr, func(root ports.RootHandle) error {
+			dig, err = hashLocalStagedFile(root, stageDest, int64(totalBytes))
+			return err
 		})
-		return dig, err
 	}
 	if sess.hasher != nil {
 		return digestFromHash(sess.hasher), nil
 	}
-	return hashRemoteTransferStage(ctx, sess.rfs, sess.remoteStagePath, totalBytes, s.defaultChunkSize)
-}
-func hashRemoteTransferStage(ctx context.Context, rfs ports.RemoteFSPort, stageOpt algebraic.Option[pathalg.RemotePath], totalBytes uint64, chunkSize int64) (security.Digest, error) {
-	stagePath, ok := stageOpt.Get()
-	if !ok {
-		return zeroVal[security.Digest](), fmt.Errorf("%w: 缺少远端暂存路径", ErrInvalidRequest)
-	}
-	if st, err := rfs.Lstat(ctx, stagePath); err != nil || !st.IsRegular() || uint64(st.Size()) != totalBytes {
-		return zeroVal[security.Digest](), pickIf[error](err != nil, err, pickIf(!st.IsRegular(), ports.ErrNotRegularFile, fmt.Errorf("%w: 远端暂存大小 %d 与预期 %d 不符", io.ErrUnexpectedEOF, st.Size(), totalBytes)))
-	}
-	h := sha256.New()
-	for offset := int64(0); uint64(offset) < totalBytes; {
-		data, err := readRemoteChunkExact(ctx, rfs, stagePath, offset, min(chunkSize, int64(totalBytes)-offset))
-		if err != nil {
-			return zeroVal[security.Digest](), err
-		}
-		_, _ = h.Write(data)
-		offset += int64(len(data))
-	}
-	return digestFromHash(h), nil
+	return remotecanon.HashRemoteStage(ctx, sess.rfs, sess.remoteStagePath, totalBytes, s.defaultChunkSize, ErrInvalidRequest)
 }
 
 //xops:syncclosure
 func (s *Service) applyPostCommitModTime(sess *managedTransferSession, fn func(time.Time) error) {
-	if mt, ok := sess.opts.ModTime.Get(); sess.opts.PreserveTimes && ok && isValidRFC3339Time(mt) {
+	if mt, ok := sess.opts.ModTime.Get(); sess.opts.PreserveTimes && ok && validRFC3339(mt) {
 		if cErr := fn(mt); cErr != nil {
 			s.emitDiagnostic(algebraic.Some(sess.meta.TransferID()), events.SeverityWarn, "post_commit_chtimes_failed", cErr.Error(), nil)
 		}
 	}
-}
-func (s *Service) commitByDirection(ctx context.Context, sess *managedTransferSession, handleBinding security.OperationBinding) (fsm.DurabilityStatus, string, error) {
-	if sess.meta.Direction() == fsm.TransferDirectionDownload {
-		return s.commitLocalScopedTransfer(ctx, sess, handleBinding)
-	}
-	return s.commitRemoteSFTPTransfer(ctx, sess, handleBinding)
 }
 func (s *Service) commitLocalScopedTransfer(ctx context.Context, sess *managedTransferSession, handleBinding security.OperationBinding) (fsm.DurabilityStatus, string, error) {
 	lr, okR := sess.opts.LocalRoot.Get()
@@ -209,7 +184,7 @@ func (s *Service) commitLocalScopedTransfer(ctx context.Context, sess *managedTr
 	if s.scopedFS == nil || !okR || !okRS || !okS || !okF {
 		return fsm.DurabilityNotApplied, "invalid_local_commit", pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, ErrInvalidRequest)
 	}
-	if err := verifyRemoteDownloadSource(ctx, s.enforceStrictPaths(), sess.rfs, handleBinding, rs, sess.sourceAnchor, int64(sess.meta.TotalBytes()), sess.sourceModTime); err != nil {
+	if err := remotecanon.VerifyDownloadSource(ctx, s.strictPaths(), sess.rfs, handleBinding, rs, sess.sourceAnchor, int64(sess.meta.TotalBytes()), sess.sourceModTime, canonSentinels()); err != nil {
 		return fsm.DurabilityNotApplied, err.Error(), err
 	}
 	preRejected := false
@@ -241,7 +216,7 @@ func (s *Service) commitRemoteSFTPTransfer(ctx context.Context, sess *managedTra
 	if !okS || !okF {
 		return fsm.DurabilityNotApplied, "invalid_remote_commit", ErrInvalidRequest
 	}
-	err := verifyRemotePathAuthorized(ctx, s.enforceStrictPaths(), sess.rfs, handleBinding, finalPath)
+	err := remotecanon.VerifyPathAuthorized(ctx, s.strictPaths(), sess.rfs, handleBinding, finalPath, canonSentinels())
 	if err == nil && sess.meta.TotalBytes() == 0 {
 		err = sess.rfs.WriteChunk(ctx, stagePath, 0, bytes.NewReader(nil), 0)
 	}
@@ -276,7 +251,7 @@ func (s *Service) cleanupTransferStaging(ctx context.Context, sess *managedTrans
 		_ = sess.rfs.Remove(context.WithoutCancel(ctx), stagePath)
 	}
 }
-func transferProgressOf(st fsm.TransferState) (offset, chunks uint64) {
+func transferProgressOf(st fsm.TransferState) (uint64, uint64) {
 	if st == nil || !st.IsValid() {
 		return 0, 0
 	}
@@ -292,4 +267,49 @@ func transferProgressOf(st fsm.TransferState) (offset, chunks uint64) {
 	default:
 		return 0, 0
 	}
+}
+
+// 以下为 SCP / 流式下载共享的本地 ScopedRootFS 原子落盘与软链覆写辅助函数。
+func hashLocalStagedFile(root ports.RootHandle, stageDest pathalg.LocalRootedDest, expectedSize int64) (security.Digest, error) {
+	limits, err := ports.NewReadLimits(max(expectedSize, 1))
+	h := sha256.New()
+	if err == nil {
+		err = root.WithReadRegular(stageDest, limits, func(r ports.BoundedReadHandle, size int64) error {
+			if size != expectedSize {
+				return fmt.Errorf("%w: 本地暂存大小 %d 与预期 %d 不符", io.ErrUnexpectedEOF, size, expectedSize)
+			}
+			_, copyErr := io.Copy(h, r)
+			return copyErr
+		})
+	}
+	return pickIf(err == nil, digestFromHash(h), zeroVal[security.Digest]()), err
+}
+func ensureParentLocalDir(root ports.RootHandle, dest pathalg.LocalRootedDest) error {
+	if parent, ok := dest.Parent(); ok {
+		return root.MkdirAll(parent, defaultDirPerm)
+	}
+	return nil
+}
+func checkLocalNoClobber(root ports.RootHandle, dest pathalg.LocalRootedDest, noClobber bool) error {
+	if !noClobber {
+		return nil
+	}
+	_, err := root.Lstat(dest)
+	return pickIf[error](err == nil, fmt.Errorf("%w: 本地目标 %s 已存在", ports.ErrAlreadyExists, dest), pickIf[error](errors.Is(err, ports.ErrNotFound), nil, err))
+}
+func createLocalSymlink(root ports.RootHandle, dest pathalg.LocalRootedDest, target string, noClobber bool) error {
+	if st, err := root.Lstat(dest); err == nil {
+		if noClobber || st.IsDir() {
+			return pickIf(noClobber, fmt.Errorf("%w: 本地目标 %s 已存在", ports.ErrAlreadyExists, dest), fmt.Errorf("%w: 禁止以软链覆写已有目录 %s", ports.ErrRemoteIsDir, dest))
+		}
+		if rmErr := root.Remove(dest); rmErr != nil {
+			return rmErr
+		}
+	} else if !errors.Is(err, ports.ErrNotFound) {
+		return err
+	}
+	return root.CreateSymlink(dest, target)
+}
+func sanitizeLocalDownloadPerm(remotePerm fs.FileMode) fs.FileMode {
+	return pickIf(remotePerm.Perm() != 0, remotePerm.Perm()|0o600, defaultLocalStagePerm)
 }

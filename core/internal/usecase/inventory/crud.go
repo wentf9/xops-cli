@@ -174,10 +174,10 @@ func getAssetByID[T any, ID fmt.Stringer](ctx context.Context, s *Service, req Q
 func (s *Service) ValidateDAG(ctx context.Context, req QueryRequest) (inventory.DAGReport, error) {
 	return runInspect(ctx, s, "validate_dag", "validate cross-namespace proxy DAG", req.Risk, req.Approval, req.OperationStream, func(c context.Context) (inventory.DAGReport, error) {
 		snap, err := s.store.Load(c)
-		var openSSH []inventory.OpenSSHJumpNode
-		if err == nil {
-			openSSH, err = s.collectOpenSSHJumpNodes(c)
+		if err != nil {
+			return inventory.DAGReport{}, err
 		}
+		openSSH, err := s.collectOpenSSHJumpNodes(c)
 		if err != nil {
 			return inventory.DAGReport{}, err
 		}
@@ -198,10 +198,10 @@ func (s *Service) CheckSecretReferences(ctx context.Context, req SecretRefCheckR
 	}
 	return runInspect(ctx, s, "check_secret_references", "check 5-location secret references", req.Risk, req.Approval, req.OperationStream, func(c context.Context) ([]inventory.SecretReference, error) {
 		snap, err := s.store.Load(c)
-		var pending []inventory.PendingSecretRef
-		if err == nil {
-			pending, err = s.mergePendingRefsExcluding(zeroVal[security.OperationID](), req.ExtraPending)
+		if err != nil {
+			return nil, err
 		}
+		pending, err := s.mergePendingRefsExcluding(zeroVal[security.OperationID](), req.ExtraPending)
 		if err != nil {
 			return nil, err
 		}
@@ -366,10 +366,10 @@ func (s *Service) execCASMutation(ctx context.Context, spec casMutationSpec) (Mu
 		return MutationResult{}, "", err
 	}
 	hosts, idents, nodes, refs, err := spec.mutate(snap.Graph())
-	if err != nil {
-		return MutationResult{}, "", err
+	var nextGraph inventory.Graph
+	if err == nil {
+		nextGraph, err = s.buildValidatedGraph(ctx, snap.Graph(), hosts, idents, nodes)
 	}
-	nextGraph, err := s.buildValidatedGraph(ctx, snap.Graph(), hosts, idents, nodes)
 	if err == nil && spec.requireSecretsUnref && len(refs) > 0 {
 		err = s.ensureRefsUnreferenced(nextGraph, refs, spec.extraPending)
 	}
@@ -405,10 +405,10 @@ func (s *Service) gcSecretsDetached(ctx context.Context, excludeLease security.O
 	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupEffectTimeout)
 	defer cancel()
 	snap, err := s.store.Load(cleanCtx)
-	var pending []inventory.PendingSecretRef
-	if err == nil {
-		pending, err = s.mergePendingRefsExcluding(excludeLease, extra)
+	if err != nil {
+		return credential.GCUnreferencedResult{}, true, err
 	}
+	pending, err := s.mergePendingRefsExcluding(excludeLease, extra)
 	if err != nil {
 		return credential.GCUnreferencedResult{}, true, err
 	}

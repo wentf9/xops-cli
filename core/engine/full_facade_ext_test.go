@@ -463,7 +463,7 @@ func assertFacadeInventoryQueriesAndVault(t *testing.T, ctx context.Context, rig
 	}); err != nil || rotRes.NewRef() != newRef {
 		t.Fatalf("RotateSecret: res=%+v err=%v", rotRes, err)
 	}
-	if _, err := rig.eng.VaultDoctor(ctx, false, engine.CallOptions{}); err != nil {
+	if _, err := rig.eng.VaultDoctor(ctx, engine.VaultDoctorRequest{SkipSecretProbe: false}); err != nil {
 		t.Fatalf("VaultDoctor: %v", err)
 	}
 }

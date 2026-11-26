@@ -5,9 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/inventory"
+	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -17,6 +20,7 @@ import (
 	"github.com/wentf9/xops-cli/core/internal/pool"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/hostkey"
+	ucsess "github.com/wentf9/xops-cli/core/internal/usecase/session"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -38,7 +42,9 @@ func DefaultGuardrailConfig() GuardrailConfig {
 	return GuardrailConfig{ApprovalThreshold: security.RiskModerate, NoElicitFallback: NoElicitFallbackDeny, ProtectedPatterns: gate.StrictDefaultProtectedPatterns()}
 }
 
-// DialContextFunc / RemoteFSFunc 定义可选底层传输拨号与远端文件系统工厂签名。
+// DialContextFunc 与 RemoteFSFunc 定义底层网络拨号与外置自定义/仿真传输的远端文件系统工厂签名。
+// 注意：RemoteFSFunc 仅接收协议无关的 ports.TransportConn（不可访问未导出 *ssh.Client），专用于自定义或仿真 Dialer 覆写；
+// Phase 4（P4-T2）真实 sshnet/sftp 须在 buildRealDialer 中直接经 dial.Config.OpenRemoteFS 注入。
 type (
 	DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 	RemoteFSFunc    func(ctx context.Context, conn ports.TransportConn) (ports.RemoteFSPort, error)
@@ -46,7 +52,6 @@ type (
 
 // Config 定义 Engine 的全显式依赖注入配置（零全局单例、零隐式 OS/环境变量读取）。
 type Config struct {
-	// 安全策略配置档与护栏配置（均必填）。
 	Profile   PolicyProfile
 	Guardrail GuardrailConfig
 
@@ -87,7 +92,7 @@ type Config struct {
 	TUNDevice           ports.TUNDevicePort
 	MuxSocket           ports.MuxSocketPort
 	Dialer              ports.DialerPort // 为 nil 时默认装配真实 sshnet/dial + sshnet/hostkey
-	RemoteFS            RemoteFSFunc     // 可选覆写 TransportConn.OpenRemoteFS
+	RemoteFS            RemoteFSFunc     // 仅用于外部自定义/仿真 Dialer 覆写 OpenRemoteFS；真实 sshnet/sftp 须经 dial.Config.OpenRemoteFS 装配
 
 	// 拨号、全局选项、跳板深度、限流分片、事件总线与连接池调优参数（全可选，0/None 取安全默认值）。
 	DialContext                                                                  DialContextFunc
@@ -103,16 +108,15 @@ type Config struct {
 }
 
 func compileGuardrailPolicy(cfg GuardrailConfig) (gate.GuardrailPolicy, error) {
-	zeroPol := zeroVal[gate.GuardrailPolicy]()
 	fb, err := cfg.NoElicitFallback.toGateFallback()
 	if err != nil {
-		return zeroPol, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		return zeroVal[gate.GuardrailPolicy](), wrapCfgErr("NoElicitFallback 无效", err)
 	}
 	rules := append(make([]pathalg.ProtectedRule, 0, len(cfg.ProtectedRules)+len(cfg.ProtectedPatterns)), cfg.ProtectedRules...)
 	for _, pat := range cfg.ProtectedPatterns {
 		r, pErr := pathalg.ParseProtectedRule(pat)
 		if pErr != nil {
-			return zeroPol, fmt.Errorf("%w: 受保护路径模式 %q 无效: %w", ErrInvalidConfig, pat, pErr)
+			return zeroVal[gate.GuardrailPolicy](), fmt.Errorf("%w: 受保护路径模式 %q 无效: %w", ErrInvalidConfig, pat, pErr)
 		}
 		rules = append(rules, r)
 	}
@@ -121,45 +125,86 @@ func compileGuardrailPolicy(cfg GuardrailConfig) (gate.GuardrailPolicy, error) {
 		ProtectedRules: rules, ProtectedPathRisk: cfg.ProtectedPathRisk, ApprovalTTL: cfg.ApprovalTTL,
 		MaxPendingChallenges: cfg.MaxPendingChallenges, MaxReplayHistory: cfg.MaxReplayHistory,
 	})
-	if err != nil {
-		return zeroPol, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
-	}
-	return pol, nil
+	return pol, wrapCfgErr("护栏策略无效", err)
 }
-
 func validateBaseConfig(cfg Config) (gate.PolicyProfileKind, gate.GuardrailPolicy, error) {
 	zeroPol := zeroVal[gate.GuardrailPolicy]()
 	prof, err := cfg.Profile.toGateProfile()
 	if err != nil {
-		return gate.PolicyProfileInvalid, zeroPol, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		return gate.PolicyProfileInvalid, zeroPol, wrapCfgErr("PolicyProfile 无效", err)
 	}
 	pol, err := compileGuardrailPolicy(cfg.Guardrail)
 	if err != nil {
 		return gate.PolicyProfileInvalid, zeroPol, err
 	}
-	switch {
-	case cfg.Clock == nil || cfg.Entropy == nil || cfg.AuditSink == nil:
+	if cfg.Clock == nil || cfg.Entropy == nil || cfg.AuditSink == nil {
 		return gate.PolicyProfileInvalid, zeroPol, fmt.Errorf("%w: Clock/Entropy/AuditSink 均不能为 nil", ErrInvalidConfig)
-	case cfg.SystemBus != nil && cfg.SystemBus.IsClosed():
-		return gate.PolicyProfileInvalid, zeroPol, fmt.Errorf("%w: 注入的 SystemBus 未初始化或已关闭", ErrInvalidConfig)
-	case cfg.SystemBusBuffer < 0:
-		return gate.PolicyProfileInvalid, zeroPol, fmt.Errorf("%w: SystemBusBuffer 不能为负", ErrInvalidConfig)
+	}
+	if (cfg.SystemBus != nil && cfg.SystemBus.IsClosed()) || cfg.SystemBusBuffer < 0 {
+		return gate.PolicyProfileInvalid, zeroPol, fmt.Errorf("%w: SystemBus 已关闭或 SystemBusBuffer 为负", ErrInvalidConfig)
 	}
 	return prof, pol, nil
 }
 
-func buildHostTrustPort(cfg Config) (ports.HostTrustPort, error) {
+// hostTrustObserver 在 ports.HostTrustPort 外层只读记录最近经校验通过或合法登记的 (Endpoint -> KeyFingerprint)，
+// 遇冲突或吊销立即驱逐旧记录，支撑 INV-F2 首连暂存探测返回真实服务端指纹（零伪造）。
+type hostTrustObserver struct {
+	inner ports.HostTrustPort
+	mu    sync.Mutex
+	byEP  map[string]inventory.KeyFingerprint
+}
+
+func newHostTrustObserver(inner ports.HostTrustPort) *hostTrustObserver {
+	return &hostTrustObserver{inner: inner, byEP: map[string]inventory.KeyFingerprint{}}
+}
+func (o *hostTrustObserver) PreferredAlgorithms(ctx context.Context, ep netaddr.Endpoint, kh option.KnownHostsList) ([]string, error) {
+	return o.inner.PreferredAlgorithms(ctx, ep, kh)
+}
+func (o *hostTrustObserver) VerifyHostKey(ctx context.Context, req ports.HostTrustRequest) (ports.HostTrustCheck, error) {
+	chk, err := o.inner.VerifyHostKey(ctx, req)
+	if err == nil && chk.Endpoint().IsValid() {
+		switch chk.Status() {
+		case ports.HostTrustTrusted:
+			o.set(chk.Endpoint(), chk.Presented().Fingerprint(), chk.Presented().IsValid())
+		case ports.HostTrustMismatch, ports.HostTrustRevoked:
+			o.set(chk.Endpoint(), zeroVal[inventory.KeyFingerprint](), false)
+		}
+	}
+	return chk, err
+}
+func (o *hostTrustObserver) RecordHostKey(ctx context.Context, ep netaddr.Endpoint, key ports.PublicKeyInfo, kh option.KnownHostsList) error {
+	err := o.inner.RecordHostKey(ctx, ep, key, kh)
+	if err == nil && ep.IsValid() && key.IsValid() {
+		o.set(ep, key.Fingerprint(), true)
+	}
+	return err
+}
+func (o *hostTrustObserver) set(ep netaddr.Endpoint, fp inventory.KeyFingerprint, keep bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if keep {
+		o.byEP[ep.String()] = fp
+		return
+	}
+	delete(o.byEP, ep.String())
+}
+func (o *hostTrustObserver) lookup(ep netaddr.Endpoint) (inventory.KeyFingerprint, bool) {
+	if o == nil || !ep.IsValid() {
+		return zeroVal[inventory.KeyFingerprint](), false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	fp, ok := o.byEP[ep.String()]
+	return fp, ok && fp.IsValid()
+}
+func buildHostTrustPort(cfg Config) (*hostTrustObserver, error) {
 	if cfg.HostTrust != nil {
-		return cfg.HostTrust, nil
+		return newHostTrustObserver(cfg.HostTrust), nil
 	}
 	if cfg.ScopedFS == nil {
 		return nil, fmt.Errorf("%w: 未注入 HostTrust 时必须提供 ScopedFS", ErrInvalidConfig)
 	}
-	homeOpt, err := resolveConfigHomeDir(cfg)
-	if err != nil {
-		return nil, err
-	}
-	khDir, err := resolveKnownHostsDir(cfg.KnownHostsDir, homeOpt)
+	homeOpt, khDir, err := resolveHostTrustDirs(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -168,70 +213,62 @@ func buildHostTrustPort(cfg Config) (ports.HostTrustPort, error) {
 		MaxFileBytes: cfg.KnownHostsMaxBytes, SSHFPLookup: cfg.SSHFPLookup, HashHostnames: cfg.HashKnownHosts,
 		Entropy: cfg.Entropy, Clock: cfg.Clock,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("%w: 初始化 KnownHostsDB 失败: %w", ErrInvalidConfig, err)
-	}
-	return db, nil
+	return validOrZero(err == nil, newHostTrustObserver(db)), wrapCfgErr("初始化 KnownHostsDB 失败", err)
 }
-
-func resolveConfigHomeDir(cfg Config) (algebraic.Option[pathalg.LocalDir], error) {
+func resolveHostTrustDirs(cfg Config) (homeOpt algebraic.Option[pathalg.LocalDir], khDir pathalg.LocalDir, err error) {
 	if home, ok := cfg.HomeDir.Get(); ok {
 		if !home.IsValid() {
-			return algebraic.None[pathalg.LocalDir](), fmt.Errorf("%w: HomeDir 无效", ErrInvalidConfig)
+			return homeOpt, khDir, fmt.Errorf("%w: HomeDir 无效", ErrInvalidConfig)
 		}
-		return algebraic.Some(home), nil
-	}
-	if cfg.Env == nil {
-		return algebraic.None[pathalg.LocalDir](), nil
-	}
-	id, err := cfg.Env.LookupLocalIdentity()
-	if err != nil || !id.IsValid() || id.HomeDir() == "" {
-		return algebraic.None[pathalg.LocalDir](), nil
-	}
-	parsed, pErr := pathalg.ParseLocalDir(id.HomeDir())
-	if pErr != nil {
-		return algebraic.None[pathalg.LocalDir](), fmt.Errorf("%w: Env.LookupLocalIdentity.HomeDir 无效: %w", ErrInvalidConfig, pErr)
-	}
-	return algebraic.Some(parsed), nil
-}
-
-func resolveKnownHostsDir(explicit, homeOpt algebraic.Option[pathalg.LocalDir]) (pathalg.LocalDir, error) {
-	zeroDir := zeroVal[pathalg.LocalDir]()
-	if dir, ok := explicit.Get(); ok {
-		if !dir.IsValid() {
-			return zeroDir, fmt.Errorf("%w: KnownHostsDir 无效", ErrInvalidConfig)
+		homeOpt = algebraic.Some(home)
+	} else if cfg.Env != nil {
+		if id, lErr := cfg.Env.LookupLocalIdentity(); lErr == nil && id.IsValid() && id.HomeDir() != "" {
+			parsed, pErr := pathalg.ParseLocalDir(id.HomeDir())
+			if pErr != nil {
+				return homeOpt, khDir, wrapCfgErr("Env.LookupLocalIdentity.HomeDir 无效", pErr)
+			}
+			homeOpt = algebraic.Some(parsed)
 		}
-		return dir, nil
+	}
+	if dir, ok := cfg.KnownHostsDir.Get(); ok {
+		return homeOpt, dir, validOrZero(!dir.IsValid(), fmt.Errorf("%w: KnownHostsDir 无效", ErrInvalidConfig))
 	}
 	home, ok := homeOpt.Get()
 	if !ok {
-		return zeroDir, fmt.Errorf("%w: 缺少 KnownHostsDir 且无法从 HomeDir/Env 推导默认 ~/.ssh 目录", ErrInvalidConfig)
+		return homeOpt, khDir, fmt.Errorf("%w: 缺少 KnownHostsDir 且无法从 HomeDir/Env 推导默认 ~/.ssh 目录", ErrInvalidConfig)
 	}
-	sshDir, err := home.JoinComponent(".ssh")
-	if err != nil {
-		return zeroDir, fmt.Errorf("%w: 推导 ~/.ssh 目录失败: %w", ErrInvalidConfig, err)
-	}
-	return sshDir, nil
+	sshDir, jErr := home.JoinComponent(".ssh")
+	return homeOpt, sshDir, wrapCfgErr("推导 ~/.ssh 目录失败", jErr)
 }
-
-func buildDialerPort(cfg Config) (ports.DialerPort, error) {
+func buildDialerPort(cfg Config) (ports.DialerPort, *hostTrustObserver, error) {
 	base := cfg.Dialer
+	var obs *hostTrustObserver
 	if base == nil {
-		hostTrust, err := buildHostTrustPort(cfg)
+		var err error
+		if obs, err = buildHostTrustPort(cfg); err == nil {
+			base, err = buildRealDialer(cfg, obs)
+		}
 		if err != nil {
-			return nil, err
-		}
-		if base, err = buildRealDialer(cfg, hostTrust); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	if cfg.RemoteFS == nil {
-		return base, nil
+	// 透明客户端 ControlMaster 复用适配器：位于真实/仿真拨号器外层、RemoteFS 覆写内层，确保 Exec 与 SFTP 统一复用活跃主进程。
+	if cfg.MuxSocket != nil {
+		base = &muxClientDialer{inner: base, mux: cfg.MuxSocket, env: cfg.Env, interaction: cfg.Interaction}
 	}
-	return &remoteFSDialer{inner: base, openFS: cfg.RemoteFS}, nil
+	if cfg.RemoteFS != nil {
+		base = &remoteFSDialer{inner: base, openFS: cfg.RemoteFS}
+	}
+	return base, obs, nil
 }
 
 type (
+	muxClientDialer struct {
+		inner       ports.DialerPort
+		mux         ports.MuxSocketPort
+		env         ports.EnvPort
+		interaction ports.InteractionPort
+	}
 	remoteFSDialer struct {
 		inner  ports.DialerPort
 		openFS RemoteFSFunc
@@ -242,6 +279,12 @@ type (
 	}
 )
 
+func (d *muxClientDialer) DialHop(ctx context.Context, hop plan.HopSpec, dig plan.HopDigest, parent ports.TransportConn) (ports.TransportConn, error) {
+	if conn, used, err := ucsess.TryDialMuxClient(ctx, d.mux, d.env, d.interaction, hop, dig); err != nil || used {
+		return conn, err
+	}
+	return d.inner.DialHop(ctx, hop, dig, parent)
+}
 func (d *remoteFSDialer) DialHop(ctx context.Context, hop plan.HopSpec, dig plan.HopDigest, parent ports.TransportConn) (ports.TransportConn, error) {
 	if wrapped, ok := parent.(*remoteFSConn); ok {
 		parent = wrapped.TransportConn
@@ -255,40 +298,29 @@ func (d *remoteFSDialer) DialHop(ctx context.Context, hop plan.HopSpec, dig plan
 func (c *remoteFSConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	return c.openFS(ctx, c.TransportConn)
 }
-
 func buildRealDialer(cfg Config, hostTrust ports.HostTrustPort) (*dial.Dialer, error) {
-	var dialFn dial.DialContextFunc
-	if cfg.DialContext != nil {
-		dialFn = dial.DialContextFunc(cfg.DialContext)
-	}
 	d, err := dial.NewDialer(dial.Config{
 		HostTrust: hostTrust, Vault: cfg.Vault, KeySigner: cfg.KeySigner, Agent: cfg.Agent,
 		ReadFS: cfg.OperatorReadFS, Process: cfg.Process, Interaction: cfg.Interaction,
-		Clock: cfg.Clock, Env: cfg.Env, DialContext: dialFn, ClientVersion: cfg.ClientVersion,
+		Clock: cfg.Clock, Env: cfg.Env, DialContext: dial.DialContextFunc(cfg.DialContext), ClientVersion: cfg.ClientVersion,
 	})
-	if err != nil {
-		return nil, fmt.Errorf("%w: 初始化 sshnet/dial 失败: %w", ErrInvalidConfig, err)
-	}
-	return d, nil
+	return d, wrapCfgErr("初始化 sshnet/dial 失败", err)
 }
-
 func optPosStdDuration(opt algebraic.Option[algebraic.Duration], name string) (time.Duration, error) {
-	d, ok := opt.Get()
-	if !ok {
-		return 0, nil
+	if d, ok := opt.Get(); ok {
+		if !d.IsPositive() {
+			return 0, fmt.Errorf("%w: %s 必须为正时长", ErrInvalidConfig, name)
+		}
+		return d.Std(), nil
 	}
-	if !d.IsPositive() {
-		return 0, fmt.Errorf("%w: %s 必须为正时长", ErrInvalidConfig, name)
-	}
-	return d.Std(), nil
+	return 0, nil
 }
-
 func buildPoolConfig(cfg Config, d ports.DialerPort, bus *events.SystemBus) (pool.PoolConfig, error) {
-	td, err := optPosStdDuration(cfg.PoolTeardownGrace, "PoolTeardownGrace")
-	idle, err2 := optPosStdDuration(cfg.PoolIdleTTL, "PoolIdleTTL")
-	ka, err3 := optPosStdDuration(cfg.PoolKeepaliveInterval, "PoolKeepaliveInterval")
-	if first := errors.Join(err, err2, err3); first != nil {
-		return pool.PoolConfig{}, first
+	td, e1 := optPosStdDuration(cfg.PoolTeardownGrace, "PoolTeardownGrace")
+	idle, e2 := optPosStdDuration(cfg.PoolIdleTTL, "PoolIdleTTL")
+	ka, e3 := optPosStdDuration(cfg.PoolKeepaliveInterval, "PoolKeepaliveInterval")
+	if err := errors.Join(e1, e2, e3); err != nil {
+		return pool.PoolConfig{}, err
 	}
 	return pool.PoolConfig{
 		Dialer: d, Clock: cfg.Clock, Entropy: cfg.Entropy, Bus: bus,

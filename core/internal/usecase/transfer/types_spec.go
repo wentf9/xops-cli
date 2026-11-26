@@ -172,17 +172,20 @@ func (e TextEdit) ReplaceAll() bool { return e.IsValid() && e.replaceAll }
 type (
 	SCPUploadRequest struct {
 		CallBase
-		Source                                                        LocalUploadSource
-		RemoteDest                                                    pathalg.RemotePath
-		ExpandIntoDir, NoClobber, Resume, PreserveMode, PreserveTimes bool
-		Perm                                                          algebraic.Option[fs.FileMode]
-		ModTime                                                       algebraic.Option[time.Time]
-		ChunkSize                                                     int64
-		Concurrency                                                   int
-		ExpectedDigest                                                algebraic.Option[security.Digest]
+		Source                                                                   LocalUploadSource
+		RemoteDest                                                               pathalg.RemotePath
+		Recursive, ExpandIntoDir, NoClobber, Resume, PreserveMode, PreserveTimes bool
+		SymlinkPolicy                                                            pathalg.SymlinkPolicy
+		Perm                                                                     algebraic.Option[fs.FileMode]
+		ModTime                                                                  algebraic.Option[time.Time]
+		ChunkSize                                                                int64
+		Concurrency, MaxFiles                                                    int
+		MaxTotalBytes                                                            uint64
+		ExpectedDigest                                                           algebraic.Option[security.Digest]
 	}
 	SCPUploadResult struct {
 		RemotePath                                        pathalg.RemotePath
+		FilesUploaded, DirsCreated                        int
 		BytesTransferred, ResumedBytes, ChunksTransferred int64
 		Digest                                            security.Digest
 		ModTimePreserved                                  bool
@@ -371,7 +374,13 @@ type (
 		TransferID   security.OperationID
 		StartNextGen bool
 	}
-	RecoverAllRequest     struct{ PruneSuperseded bool }
+	RecoverAllRequest           struct{ PruneSuperseded bool }
+	RecoverAllAuthorizedRequest struct {
+		PruneSuperseded bool
+		Risk            algebraic.Option[security.RiskLevel]
+		Approval        algebraic.Option[gate.ApprovalSubmission]
+		OperationStream *events.OperationStream
+	}
 	TransferRecoveryEntry struct {
 		TransferID security.OperationID
 		Result     TransferRecoveryResult

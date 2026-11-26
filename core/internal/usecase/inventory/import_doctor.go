@@ -165,12 +165,13 @@ func (s *Service) loadAndPlanImport(ctx context.Context, src ImportSourceRequest
 	if err == nil {
 		openSSH, err = s.collectOpenSSHJumpNodes(ctx)
 	}
+	var enriched inventory.Graph
 	if err == nil {
 		g := snap.Graph()
-		var enriched inventory.Graph
-		if enriched, err = s.buildValidatedGraphWithOpenSSH(ctx, g, g.Hosts(), g.Identities(), g.Nodes(), openSSH); err == nil {
-			report, err = inventory.PlanImport(enriched, bundle)
-		}
+		enriched, err = s.buildValidatedGraphWithOpenSSH(ctx, g, g.Hosts(), g.Identities(), g.Nodes(), openSSH)
+	}
+	if err == nil {
+		report, err = inventory.PlanImport(enriched, bundle)
 	}
 	if err != nil {
 		return snap, bundle, report, nil, err
@@ -237,11 +238,8 @@ func (s *Service) resolveImportBundle(ctx context.Context, req ImportSourceReque
 		return z, fmt.Errorf("%w: %q", ErrUnknownImportFormat, fmtName)
 	}
 	bundle, err := imp.Import(ctx, pickIf(strings.TrimSpace(req.SourceName) != "", req.SourceName, fmtName), req.Reader)
-	if err != nil {
-		return z, err
-	}
-	if !bundle.IsValid() {
-		return z, fmt.Errorf("%w: 导入器 %q 返回无效 ImportBundle", inventory.ErrInvalidImportBundle, fmtName)
+	if err != nil || !bundle.IsValid() {
+		return z, pickIf[error](err != nil, err, fmt.Errorf("%w: 导入器 %q 返回无效 ImportBundle", inventory.ErrInvalidImportBundle, fmtName))
 	}
 	return bundle, nil
 }

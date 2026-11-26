@@ -18,7 +18,6 @@ import (
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime/protocol"
 	ucauto "github.com/wentf9/xops-cli/core/internal/usecase/automation"
-	ucinv "github.com/wentf9/xops-cli/core/internal/usecase/inventory"
 	ucsess "github.com/wentf9/xops-cli/core/internal/usecase/session"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -250,53 +249,23 @@ func (r *Registry) resolveTargetNodes(ctx context.Context, targets []string) ([]
 	if len(targets) == 0 {
 		return nil, nil
 	}
-	resolvedList := make([]ucinv.ResolvedTarget, 0, len(targets))
-	hasManaged := false
+	out := make([]ucauto.TargetNode, 0, len(targets))
 	for _, raw := range targets {
 		resolved, err := r.resolveTarget(ctx, raw, option.UnsetOptionLayer())
 		if err != nil {
 			return nil, err
 		}
-		if resolved.OriginKind() == option.OriginManaged {
-			hasManaged = true
-		}
-		resolvedList = append(resolvedList, resolved)
-	}
-	managedByID, err := r.loadManagedNodeMap(ctx, hasManaged)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]ucauto.TargetNode, 0, len(resolvedList))
-	for _, resolved := range resolvedList {
 		nid, nErr := SynthesizeTargetNodeID(resolved.NodeID(), resolved.OriginKind(), resolved.Plan())
 		if nErr != nil {
 			return nil, fmt.Errorf("%w: 目标节点标识 %q 非法: %w", protocol.ErrInvalidParams, resolved.NodeID(), nErr)
 		}
-		spec := ucauto.TargetNodeSpec{NodeID: nid, Plan: resolved.Plan()}
-		if managed, ok := managedByID[nid]; ok && resolved.OriginKind() == option.OriginManaged {
-			spec.Tags = managed.Tags()
-			spec.DefaultProfile = managed.Execution()
-		}
-		tn, tErr := ucauto.NewTargetNode(spec)
+		tn, tErr := ucauto.NewTargetNode(ucauto.TargetNodeSpec{
+			NodeID: nid, Plan: resolved.Plan(), Tags: resolved.Tags(), DefaultProfile: resolved.DefaultProfile(),
+		})
 		if tErr != nil {
 			return nil, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, tErr)
 		}
 		out = append(out, tn)
-	}
-	return out, nil
-}
-
-func (r *Registry) loadManagedNodeMap(ctx context.Context, needed bool) (map[inventory.NodeID]inventory.Node, error) {
-	if !needed || r.inventory == nil {
-		return nil, nil
-	}
-	nodes, _, err := r.inventory.ListNodes(ctx, ucinv.QueryRequest{})
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[inventory.NodeID]inventory.Node, len(nodes))
-	for _, n := range nodes {
-		out[n.ID()] = n
 	}
 	return out, nil
 }

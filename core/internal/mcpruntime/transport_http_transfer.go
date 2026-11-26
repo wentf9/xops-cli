@@ -88,12 +88,12 @@ func (s *Server) handleHTTPStreamUpload(w http.ResponseWriter, r *http.Request, 
 	}
 	startOffset, err := parseStartOffsetHeader(r.Header.Get(headerStartOffset))
 	if err != nil {
-		writeHTTPJSONError(w, http.StatusBadRequest, "invalid_offset", err.Error(), false)
+		writeHTTPJSONError(w, http.StatusBadRequest, "invalid_offset", protocol.SanitizeErrorMessage(err.Error()), false)
 		return
 	}
 	approvalOpt, err := parseApprovalHeader(r.Header.Get(headerApproval))
 	if err != nil {
-		writeHTTPJSONError(w, http.StatusBadRequest, "invalid_approval", err.Error(), false)
+		writeHTTPJSONError(w, http.StatusBadRequest, "invalid_approval", protocol.SanitizeErrorMessage(err.Error()), false)
 		return
 	}
 	written, nextOffset, lastState, approvalConsumed, err := s.streamUploadBody(r, binding, startOffset, approvalOpt)

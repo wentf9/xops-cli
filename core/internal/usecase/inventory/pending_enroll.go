@@ -254,17 +254,11 @@ func (l *PendingEnrollmentLease) Cancel(ctx context.Context, reason string) erro
 	if err := l.driveStep(ctx, fsm.EnrollInputCancel(reason), false); err != nil {
 		return err
 	}
-	if l.Phase() == fsm.PendingEnrollPhaseUncertain {
-		return l.terminalError(nil)
-	}
-	return nil
+	return pickIf[error](l.Phase() == fsm.PendingEnrollPhaseUncertain, l.terminalError(nil), nil)
 }
 func (l *PendingEnrollmentLease) enterPhase(ctx context.Context, makeIn func(time.Time) (fsm.PendingEnrollInput, error), want fsm.PendingEnrollPhase) error {
-	if ctx == nil {
-		return ErrNilContext
-	}
-	if !l.IsValid() {
-		return ErrLeaseExpired
+	if ctx == nil || !l.IsValid() {
+		return pickIf(ctx == nil, ErrNilContext, ErrLeaseExpired)
 	}
 	return l.finishPhase(ctx, func() (fsm.PendingEnrollInput, error) { return makeIn(l.svc.clock.Now()) }, want, nil)
 }
@@ -312,10 +306,8 @@ func (l *PendingEnrollmentLease) convergeUnfinished(ctx context.Context, phase f
 		})
 	default:
 		now := l.svc.clock.Now()
-		if leaseRead(l, func(x *PendingEnrollmentLease) bool { return x.state.Context().IsExpiredAt(now) }) {
-			if l.driveNew(ctx, true, func() (fsm.PendingEnrollInput, error) { return fsm.EnrollInputExpire(now) }) == nil {
-				return nil
-			}
+		if leaseRead(l, func(x *PendingEnrollmentLease) bool { return x.state.Context().IsExpiredAt(now) }) && l.driveNew(ctx, true, func() (fsm.PendingEnrollInput, error) { return fsm.EnrollInputExpire(now) }) == nil {
+			return nil
 		}
 		return l.driveStep(ctx, fsm.EnrollInputCancel(reason), true)
 	}
@@ -390,12 +382,13 @@ func (l *PendingEnrollmentLease) executeCommitCAS(ctx context.Context) (st fsm.D
 }
 func (l *PendingEnrollmentLease) buildEnrollmentGraph(ctx context.Context, g inventory.Graph) (inventory.Graph, error) {
 	hosts, err := mergeStagedAsset(g.Hosts(), l.req.Host, "host", func(a, b inventory.Host) bool { return a.ID().Equal(b.ID()) }, inventory.Host.Equal, func(h inventory.Host) string { return h.ID().String() })
-	idents, nodes := g.Identities(), g.Nodes()
+	var idents []inventory.Identity
 	if err == nil {
-		idents, err = mergeStagedAsset(idents, l.req.Identity, "identity", func(a, b inventory.Identity) bool { return a.ID().Equal(b.ID()) }, inventory.Identity.Equal, func(i inventory.Identity) string { return i.ID().String() })
+		idents, err = mergeStagedAsset(g.Identities(), l.req.Identity, "identity", func(a, b inventory.Identity) bool { return a.ID().Equal(b.ID()) }, inventory.Identity.Equal, func(i inventory.Identity) string { return i.ID().String() })
 	}
+	var nodes []inventory.Node
 	if err == nil {
-		nodes, _, err = upsertAsset(nodes, l.req.Node, false, "node", l.req.Node.ID().String(), func(n inventory.Node) bool { return n.ID().Equal(l.req.Node.ID()) })
+		nodes, _, err = upsertAsset(g.Nodes(), l.req.Node, false, "node", l.req.Node.ID().String(), func(n inventory.Node) bool { return n.ID().Equal(l.req.Node.ID()) })
 	}
 	if err != nil {
 		return zeroVal[inventory.Graph](), err

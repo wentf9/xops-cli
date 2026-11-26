@@ -47,9 +47,25 @@ type Service struct {
 // NewService 校验必填依赖（Gate、Pool、Clock）并构造会话执行 Service。
 func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Gate == nil || cfg.Pool == nil || cfg.Pool.IsClosed() || cfg.Clock == nil {
-		return nil, fmt.Errorf("%w: Gate/Pool/Clock 为必填且 Pool 不可已关闭", ErrInvalidConfig)
+		return nil, fmt.Errorf("%w: Gate/Pool/Clock 为必填且不可关闭", ErrInvalidConfig)
 	}
 	return &Service{cfg: cfg, valid: true}, nil
+}
+
+// CanSuspendProcessGroup 委托 TerminalPort 执行 POSIX 孤儿进程组安全挂起判定（INV-E1）；
+// 未初始化、未配置 TerminalPort 或底层异常时严格失败关闭返回 (security.VerdictDeny, error)。
+func (s *Service) CanSuspendProcessGroup() (security.Verdict, error) {
+	if s == nil || !s.valid {
+		return security.VerdictDeny, ErrServiceNotInitialized
+	}
+	if s.cfg.Terminal == nil {
+		return security.VerdictDeny, fmt.Errorf("%w: TerminalPort 未配置", ErrPortUnavailable)
+	}
+	v, err := s.cfg.Terminal.CanSuspendProcessGroup()
+	if err != nil || !v.IsValid() {
+		return security.VerdictDeny, firstNonNilErr(err, ports.ErrInvalidArgument)
+	}
+	return v.Normalize(), nil
 }
 
 // ExecRequest 描述单次远端命令执行用例的强类型输入。
@@ -116,7 +132,6 @@ func (s *Service) Interactive(ctx context.Context, req InteractiveRequest) (exec
 	}
 	return s.executeSession(ctx, sessionRunSpec{plan: req.Plan, command: algebraic.None[execution.CommandPlan](), action: "shell", nodeID: req.NodeID, term: req.Term, stdin: req.Stdin, stdout: req.Stdout, stderr: req.Stderr, requestTTY: req.RequestTTY, risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream, summary: "interactive shell"})
 }
-
 func zeroVal[T any]() (z T) { return z }
 func closeStream(stream *events.OperationStream) {
 	if stream != nil {
@@ -148,7 +163,6 @@ func (e *firstErr) record(err error) {
 	}
 }
 func (e *firstErr) get() error { e.mu.Lock(); defer e.mu.Unlock(); return e.err }
-
 func validateScriptTTY(cmd execution.CommandPlan, tty RequestTTYMode) error {
 	if cmd.Kind() == execution.PlanKindScript && (cmd.PTY() || tty == RequestTTYYes || tty == RequestTTYForce) {
 		return fmt.Errorf("%w: PlanKindScript 经 stdin 投递脚本正文，禁止与 RequestTTY yes/force 或 PTY 组合", ErrInvalidRequest)
@@ -156,25 +170,25 @@ func validateScriptTTY(cmd execution.CommandPlan, tty RequestTTYMode) error {
 	return nil
 }
 func (s *Service) validateServiceAndCtx(ctx context.Context) error {
-	if s == nil || !s.valid {
+	switch {
+	case s == nil || !s.valid:
 		return ErrServiceNotInitialized
-	}
-	if ctx == nil {
+	case ctx == nil:
 		return ErrNilContext
+	default:
+		return ctx.Err()
 	}
-	return ctx.Err()
 }
 func (s *Service) validateBaseCall(ctx context.Context, connPlan plan.SealedConnectionPlan, ttyMode RequestTTYMode, risk algebraic.Option[security.RiskLevel]) error {
 	if err := s.validateServiceAndCtx(ctx); err != nil {
 		return err
 	}
-	if !connPlan.IsValid() {
+	switch {
+	case !connPlan.IsValid():
 		return fmt.Errorf("%w: SealedConnectionPlan 无效", ErrInvalidRequest)
-	}
-	if !ttyMode.IsZero() && !ttyMode.IsValid() {
+	case !ttyMode.IsZero() && !ttyMode.IsValid():
 		return ErrInvalidRequestTTY
-	}
-	if r, ok := risk.Get(); ok && !r.IsValid() {
+	case risk.IsSome() && !risk.OrElse(security.RiskUnknown).IsValid():
 		return fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
 	}
 	return nil
@@ -184,10 +198,10 @@ func resolvePlanTargetAndNode(connPlan plan.SealedConnectionPlan, explicitNodeID
 	if !ok {
 		return zeroVal[plan.HopSpec](), "", fmt.Errorf("%w: 连接计划缺少末跳目标", ErrInvalidRequest)
 	}
-	if explicitNodeID != "" {
-		return targetHop, explicitNodeID, nil
+	if explicitNodeID == "" {
+		explicitNodeID = targetHop.NodeID()
 	}
-	return targetHop, targetHop.NodeID(), nil
+	return targetHop, explicitNodeID, nil
 }
 func applyOptionalTimeout(ctx context.Context, durOpt algebraic.Option[algebraic.Duration]) (context.Context, context.CancelFunc) {
 	if d, ok := durOpt.Get(); ok && d.IsPositive() {
@@ -253,12 +267,10 @@ func buildGateReq[C security.Capability](in gateReqInput) (gate.GateRequest[C], 
 // 内部直接消费借用证明 auth（不透传至外部回调），并在 defer 中闭合终态事件确保 panic 路径亦发 OperationCompletedEvent。
 //
 //xops:syncclosure
-func runAuthorized[C security.Capability](ctx context.Context, s *Service, planDigest plan.PlanDigest, nodeID, action string, gateReq gate.GateRequest[C], stream *events.OperationStream, isExec bool, run func(authCtx context.Context, binding security.OperationBinding, emitter *operationEmitter) (execution.ExecutionOutcome, error)) (execution.ExecutionOutcome, bool, error) {
-	var outcome execution.ExecutionOutcome
+func runAuthorized[C security.Capability](ctx context.Context, s *Service, planDigest plan.PlanDigest, nodeID, action string, gateReq gate.GateRequest[C], stream *events.OperationStream, isExec bool, run func(authCtx context.Context, binding security.OperationBinding, emitter *operationEmitter) (execution.ExecutionOutcome, error)) (outcome execution.ExecutionOutcome, entered bool, gateErr error) {
 	var emitter *operationEmitter
 	var startedAt time.Time
-	var gateErr error
-	entered, panicked := false, true
+	panicked := true
 	defer func() {
 		if entered {
 			out, err := outcome, gateErr
@@ -316,9 +328,8 @@ type snapshotResource[S any] interface {
 	snapshot(hs pool.HandleStatus) S
 }
 
-func inspectManagedHandle[K plan.HandleKind, S any](ctx context.Context, s *Service, handle plan.ManagedHandle[K]) (S, error) {
-	var st S
-	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
+func inspectManagedHandle[K plan.HandleKind, S any](ctx context.Context, s *Service, handle plan.ManagedHandle[K]) (st S, err error) {
+	if err = s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
 		return st, err
 	}
 	hs, err := pool.InspectHandle[K](s.cfg.Pool, handle)
@@ -328,16 +339,16 @@ func inspectManagedHandle[K plan.HandleKind, S any](ctx context.Context, s *Serv
 	return st, pool.WithManagedHandle[K, snapshotResource[S]](ctx, s.cfg.Pool, handle, func(_ context.Context, res snapshotResource[S]) error { st = res.snapshot(hs); return nil })
 }
 func (s *Service) validateActiveHandleOp(ctx context.Context, handleValid bool) error {
-	if err := s.validateServiceAndCtx(ctx); err != nil {
+	switch err := s.validateServiceAndCtx(ctx); {
+	case err != nil:
 		return err
-	}
-	if s.cfg.Gate.IsHalted() {
+	case s.cfg.Gate.IsHalted():
 		return gate.ErrGateHalted
-	}
-	if !handleValid {
+	case !handleValid:
 		return pool.ErrInvalidHandle
+	default:
+		return nil
 	}
-	return nil
 }
 func releaseManagedHandle[K plan.HandleKind](ctx context.Context, s *Service, handle plan.ManagedHandle[K]) error {
 	if err := s.validateServiceAndCtx(ctx); err != nil {
@@ -380,7 +391,6 @@ func (s *Service) executeSession(ctx context.Context, spec sessionRunSpec) (exec
 	}
 	return out, gateErr
 }
-
 func (s *Service) runLeasedSession(ctx context.Context, spec sessionRunSpec, targetHop plan.HopSpec, emitter *operationEmitter) (execution.ExecutionOutcome, error) {
 	var outcome execution.ExecutionOutcome
 	var enteredLease bool

@@ -35,7 +35,6 @@ func resolveTTYDecision(mode RequestTTYMode, isShell, cmdPTY, localInteractive b
 	}
 	return ttyDecision{}
 }
-
 func resolvePTYTerm(explicit string, env ports.EnvPort) string {
 	if explicit != "" {
 		return explicit
@@ -103,7 +102,6 @@ func runRawTerminalSession(
 	}
 	return sess.Wait(ctx)
 }
-
 func firstNonNilErr(errs ...error) error {
 	for _, e := range errs {
 		if e != nil {
@@ -112,20 +110,17 @@ func firstNonNilErr(errs ...error) error {
 	}
 	return nil
 }
-func claimSessionPipes(sess ports.RemoteSession) (io.WriteCloser, io.Reader, io.Reader, error) {
-	inPipe, err := sess.StdinPipe()
+func claimSessionPipes(sess ports.RemoteSession) (in io.WriteCloser, out, errR io.Reader, err error) {
+	if in, err = sess.StdinPipe(); err == nil {
+		out, err = sess.StdoutPipe()
+	}
+	if err == nil {
+		errR, err = sess.StderrPipe()
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	outPipe, err := sess.StdoutPipe()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	errPipe, err := sess.StderrPipe()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return inPipe, outPipe, errPipe, nil
+	return in, out, errR, nil
 }
 func prepareOptionalPTY(wantPTY bool, termName string, sz ports.TerminalSize) (algebraic.Option[ports.PTYRequest], error) {
 	if !wantPTY {
@@ -168,7 +163,6 @@ func relayPipesThroughTerminal(
 	})
 	return firstNonNilErr(pumpErr, relayErr, runErr)
 }
-
 func buildResizeCallback(sess ports.RemoteSession, wantPTY bool) func(context.Context, ports.TerminalSize) error {
 	if !wantPTY {
 		return nil
@@ -241,7 +235,6 @@ func (g *gracefulStdinWriter) Write(p []byte) (int, error) {
 	}
 	return n, err
 }
-
 func (g *gracefulStdinWriter) Close() error {
 	g.closed.Store(true)
 	if err := g.w.Close(); err != nil && !isRemotePipeClosedErr(err) {
@@ -277,7 +270,6 @@ func runStreamSession(
 	}
 	return sess.Wait(ctx)
 }
-
 func outcomeForAbortedRun(ctx context.Context, err error) execution.ExecutionOutcome {
 	phase, code, msg := execution.ExecPhaseTransportLost, "session_aborted", "session aborted"
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {

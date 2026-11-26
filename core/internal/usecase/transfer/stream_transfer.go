@@ -16,6 +16,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/pool"
+	"github.com/wentf9/xops-cli/core/internal/usecase/transfer/remotecanon"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -23,7 +24,7 @@ import (
 // 门控前保持 OperationBinding 100% 由显式入参确定（不提前抽熵破坏两步审批），受权后确定 TransferID 锁定 Generation=1、
 // 原子校验互斥准入并登记托管句柄，审计后写失败自动回滚释放。
 func (s *Service) StartTransfer(ctx context.Context, req StartTransferRequest) (TransferHandleInfo, error) {
-	defer closeStreamIfNonNil(req.OperationStream)
+	defer closeStream(req.OperationStream)
 	hop, perm, renameSpec, err := s.normalizeStartRequest(ctx, &req)
 	if err != nil {
 		return TransferHandleInfo{}, err
@@ -99,30 +100,20 @@ func (s *Service) validateStartDirectionFields(req StartTransferRequest) (rename
 	rs, okR := req.RemoteSource.Get()
 	return renameSpec, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, pickIf[error](!okL || !lr.IsValid() || !okR || !rs.IsValid() || req.ExpectedAnchor.IsSome(), fmt.Errorf("%w: 下载传输须提供有效 LocalRoot/RemoteSource 且禁设 ExpectedAnchor", ErrInvalidRequest), nil))
 }
-func (s *Service) getActiveHandle(tid security.OperationID) (plan.ManagedHandle[plan.KindTransfer], bool) {
-	s.handleMu.Lock()
-	h, ok := s.activeHandles[tid]
-	s.handleMu.Unlock()
-	return h, ok
-}
 func (s *Service) dropActiveHandle(tid security.OperationID, h plan.ManagedHandle[plan.KindTransfer], release bool) {
-	s.handleMu.Lock()
-	if cur, ok := s.activeHandles[tid]; ok && cur.Equal(h) {
-		delete(s.activeHandles, tid)
-	}
-	s.handleMu.Unlock()
+	s.handles.drop(tid, h)
 	if release {
 		_ = pool.ReleaseHandle[plan.KindTransfer](s.pool, h)
 	}
 }
 func (s *Service) lookupLiveHandle(ctx context.Context, tid security.OperationID) (plan.ManagedHandle[plan.KindTransfer], bool, error) {
-	h, ok := s.getActiveHandle(tid)
+	h, ok := s.handles.get(tid)
 	if !ok {
 		return zeroVal[plan.ManagedHandle[plan.KindTransfer]](), false, nil
 	}
 	err := pool.WithManagedHandle[plan.KindTransfer, *managedTransferSession](ctx, s.pool, h, func(context.Context, *managedTransferSession) error { return nil })
 	if errors.Is(err, pool.ErrHandleNotFound) {
-		s.dropActiveHandle(tid, h, false)
+		s.handles.drop(tid, h)
 		return zeroVal[plan.ManagedHandle[plan.KindTransfer]](), false, nil
 	}
 	return pickIf(err == nil, h, zeroVal[plan.ManagedHandle[plan.KindTransfer]]()), err == nil, err
@@ -147,14 +138,7 @@ func (s *Service) registerStreamSession(ctx context.Context, binding security.Op
 	}); err != nil {
 		return TransferHandleInfo{}, err
 	}
-	// 在 s.handleMu 内原子占槽，杜绝并发 ResumeTransfer(StartNextGen=false) 覆盖活句柄造成孤儿钉选。
-	s.handleMu.Lock()
-	_, dup := s.activeHandles[info.TransferID]
-	if !dup {
-		s.activeHandles[info.TransferID] = info.Handle
-	}
-	s.handleMu.Unlock()
-	if dup {
+	if !s.handles.tryPut(info.TransferID, info.Handle) {
 		_ = pool.ReleaseHandle[plan.KindTransfer](s.pool, info.Handle)
 		return TransferHandleInfo{}, fmt.Errorf("%w: 传输 %s 已存在并发活跃句柄", ports.ErrAlreadyExists, info.TransferID)
 	}
@@ -174,9 +158,9 @@ func enrichHandleBinding(b security.OperationBinding, tid security.OperationID, 
 	return security.NewOperationBinding(security.OperationBindingSpec{Capability: b.Capability(), Tool: b.Tool(), Action: b.Action(), NodeID: b.NodeID(), NodeIDs: b.NodeIDs(), Endpoint: b.Endpoint(), CanonicalPaths: b.CanonicalPaths(), RecursivePaths: b.RecursivePaths(), CommandDigest: b.CommandDigest(), PlanDigest: b.PlanDigest(), Parameters: params})
 }
 
-// WriteTransferChunk 向活跃上传会话写入单个严格连续分片（<= 64 MiB），写前复核远端路径未发生软链漂移并同步推进 Journal。
+// WriteTransferChunk / PullTransferChunk 顺序写入上传分片或拉取下载分片并同步推进 TransferFSM 与 Journal。
 func (s *Service) WriteTransferChunk(ctx context.Context, req WriteTransferChunkRequest) (WriteTransferChunkResult, error) {
-	defer closeStreamIfNonNil(req.OperationStream)
+	defer closeStream(req.OperationStream)
 	hop, err := s.validateHandleCall(ctx, req.CallBase, req.Handle)
 	if err != nil || len(req.Data) == 0 || uint64(len(req.Data)) > fsm.MaxTransferChunkBytes {
 		return WriteTransferChunkResult{}, pickIf[error](err != nil, err, fmt.Errorf("%w: 分片长度 %d 越界", fsm.ErrInvalidChunkOffset, len(req.Data)))
@@ -187,7 +171,7 @@ func (s *Service) WriteTransferChunk(ctx context.Context, req WriteTransferChunk
 		if sess.meta.Direction() != fsm.TransferDirectionUpload || !okS || !okF {
 			return WriteTransferChunkResult{}, pickIf[error](sess.meta.Direction() != fsm.TransferDirectionUpload, fmt.Errorf("%w: 仅适用于上传", ErrTransferHandleMismatch), ErrInvalidRequest)
 		}
-		if dErr := verifyRemotePathAuthorized(hCtx, s.enforceStrictPaths(), sess.rfs, req.Handle.Binding(), finalPath); dErr != nil {
+		if dErr := remotecanon.VerifyPathAuthorized(hCtx, s.strictPaths(), sess.rfs, req.Handle.Binding(), finalPath, canonSentinels()); dErr != nil {
 			return WriteTransferChunkResult{}, dErr
 		}
 		off, chunkDig, kind, aErr := s.applyChunkWithWriter(hCtx, sess, emitter, req.Offset, req.Data, "streaming", func() error {
@@ -196,10 +180,8 @@ func (s *Service) WriteTransferChunk(ctx context.Context, req WriteTransferChunk
 		return pickIf(aErr == nil, WriteTransferChunkResult{TransferID: sess.meta.TransferID(), NextOffset: off, TotalBytes: sess.meta.TotalBytes(), ChunkDigest: chunkDig, StateKind: kind}, WriteTransferChunkResult{}), aErr
 	})
 }
-
-// PullTransferChunk 从远端向本地 ScopedRootFS 暂存文件拉取下一个连续分片并推进 TransferFSM 与 Journal。
 func (s *Service) PullTransferChunk(ctx context.Context, req PullTransferChunkRequest) (PullTransferChunkResult, error) {
-	defer closeStreamIfNonNil(req.OperationStream)
+	defer closeStream(req.OperationStream)
 	hop, err := s.validateHandleCall(ctx, req.CallBase, req.Handle)
 	maxChunk := pickIf(req.MaxChunkBytes == 0, uint64(s.defaultChunkSize), req.MaxChunkBytes)
 	if err != nil || s.scopedFS == nil || maxChunk == 0 || maxChunk > fsm.MaxTransferChunkBytes {
@@ -220,11 +202,11 @@ func (s *Service) pullOneDownloadChunk(ctx context.Context, sess *managedTransfe
 	if !okR || !okL || !okS {
 		return PullTransferChunkResult{}, ErrInvalidRequest
 	}
-	if err := verifyRemoteDownloadSource(ctx, s.enforceStrictPaths(), sess.rfs, handleBinding, rs, sess.sourceAnchor, int64(sess.meta.TotalBytes()), sess.sourceModTime); err != nil {
+	if err := remotecanon.VerifyDownloadSource(ctx, s.strictPaths(), sess.rfs, handleBinding, rs, sess.sourceAnchor, int64(sess.meta.TotalBytes()), sess.sourceModTime, canonSentinels()); err != nil {
 		return PullTransferChunkResult{}, err
 	}
 	offset, want := streamSt.Offset(), min(maxChunk, sess.meta.TotalBytes()-streamSt.Offset())
-	data, err := readRemoteChunkExact(ctx, sess.rfs, rs, int64(offset), int64(want))
+	data, err := remotecanon.ReadChunkExact(ctx, sess.rfs, rs, int64(offset), int64(want))
 	if err != nil {
 		return PullTransferChunkResult{}, err
 	}
@@ -244,12 +226,10 @@ func (s *Service) pullOneDownloadChunk(ctx context.Context, sess *managedTransfe
 func (s *Service) applyChunkWithWriter(ctx context.Context, sess *managedTransferSession, emitter *transferEmitter, offset uint64, data []byte, stage string, writeData func() error) (uint64, security.Digest, fsm.TransferStateKind, error) {
 	chunkDig, prevKind := security.DigestBytes(data), sess.state.Kind()
 	chunkIn, err := fsm.TransferInputChunk(offset, uint64(len(data)), chunkDig)
-	var nextSt fsm.TransferState
-	var effs []fsm.TransferEffect
-	var evs []fsm.TransferEvent
-	if err == nil {
-		nextSt, effs, evs, err = fsm.TransitionTransfer(sess.state, chunkIn)
+	if err != nil {
+		return 0, zeroVal[security.Digest](), fsm.TransferKindInvalid, err
 	}
+	nextSt, effs, evs, err := fsm.TransitionTransfer(sess.state, chunkIn)
 	if err == nil {
 		err = writeData()
 	}
@@ -285,15 +265,12 @@ func (s *Service) advanceTransferFSM(ctx context.Context, sess *managedTransferS
 	return nextSt, false, nil
 }
 
-// CommitTransfer 执行全量 SHA-256 核验、Journal(Verified+CommitStarted) 落盘与原子提交交接；
-// 瞬态核验错误保留 Verifying 与暂存文件；Committed WAL 落盘失败确定性推进至 *fsm.TransferUncertainCommit 并上报 OutcomeUnknown。
+// CommitTransfer / AbortTransfer 执行受管流式传输的全量 SHA-256 校验原子提交或主动中止清理。
 func (s *Service) CommitTransfer(ctx context.Context, req CommitTransferRequest) (CommitTransferResult, error) {
 	return runReleasableHandleVal(ctx, s, req.CallBase, req.Handle, "commit", func(hCtx context.Context, auth gate.Authorized[security.CapTransfer], sess *managedTransferSession, emitter *transferEmitter) (CommitTransferResult, bool, error) {
 		return s.driveCommitTransfer(hCtx, auth, sess, emitter, req.Handle.Binding())
 	})
 }
-
-// AbortTransfer 主动中止 Streaming/Verifying 受管传输，落盘 Aborted、清理暂存并释放句柄；已进提交态严格拒绝。
 func (s *Service) AbortTransfer(ctx context.Context, req AbortTransferRequest) error {
 	_, err := runReleasableHandleVal(ctx, s, req.CallBase, req.Handle, "abort", func(hCtx context.Context, _ gate.Authorized[security.CapTransfer], sess *managedTransferSession, emitter *transferEmitter) (struct{}, bool, error) {
 		if _, jFail, aErr := s.advanceTransferFSM(hCtx, sess, emitter, fsm.TransferInputAbort(req.Reason), nil); aErr != nil {
@@ -307,7 +284,7 @@ func (s *Service) AbortTransfer(ctx context.Context, req AbortTransferRequest) e
 
 //xops:syncclosure
 func runReleasableHandleVal[T any](ctx context.Context, s *Service, base CallBase, handle plan.ManagedHandle[plan.KindTransfer], action string, fn func(context.Context, gate.Authorized[security.CapTransfer], *managedTransferSession, *transferEmitter) (T, bool, error)) (T, error) {
-	defer closeStreamIfNonNil(base.OperationStream)
+	defer closeStream(base.OperationStream)
 	hop, err := s.validateHandleCall(ctx, base, handle)
 	if err != nil {
 		return zeroVal[T](), err
@@ -333,7 +310,7 @@ func (s *Service) driveCommitTransfer(ctx context.Context, auth gate.Authorized[
 	if vErr != nil && !errors.Is(vErr, io.ErrUnexpectedEOF) && !errors.Is(vErr, ports.ErrNotRegularFile) && !errors.Is(vErr, ports.ErrNotFound) {
 		return CommitTransferResult{}, false, vErr
 	}
-	verifyIn, inErr := fsm.TransferInputVerifyResult(vErr == nil, actualDig, fmtErr(vErr))
+	verifyIn, inErr := fsm.TransferInputVerifyResult(vErr == nil, actualDig, errText(vErr))
 	nextSt, verifyJFail, err := s.advanceTransferFSM(ctx, sess, emitter, verifyIn, inErr)
 	if err != nil {
 		return CommitTransferResult{}, verifyJFail, err
@@ -344,7 +321,8 @@ func (s *Service) driveCommitTransfer(ctx context.Context, auth gate.Authorized[
 		return out, true, pickIf[error](vErr != nil, vErr, ErrDigestMismatch)
 	}
 	out.ActualDigest = algebraic.Some(actualDig)
-	dur, reason, commitErr := s.commitByDirection(ctx, sess, handleBinding)
+	commitFn := pickIf(sess.meta.Direction() == fsm.TransferDirectionDownload, s.commitLocalScopedTransfer, s.commitRemoteSFTPTransfer)
+	dur, reason, commitErr := commitFn(ctx, sess, handleBinding)
 	comIn, inErr := fsm.TransferInputCommitResult(dur, reason)
 	endSt, journalFailed, err := s.advanceTransferFSM(ctx, sess, emitter, comIn, inErr)
 	if err != nil {
@@ -385,7 +363,7 @@ func (s *Service) finalizeCommitState(ctx context.Context, auth gate.Authorized[
 
 // InspectTransfer 严守 INV-E5：先经 Gate 鉴权，再查询活跃受管句柄或持久化 Journal，返回纯值只读快照。
 func (s *Service) InspectTransfer(ctx context.Context, req InspectTransferRequest) (TransferStatusSnapshot, error) {
-	defer closeStreamIfNonNil(req.OperationStream)
+	defer closeStream(req.OperationStream)
 	hop, err := s.validateBaseCall(ctx, req.CallBase)
 	if h, ok := req.Handle.Get(); err != nil || !req.TransferID.IsValid() || (ok && !h.IsValid()) {
 		return TransferStatusSnapshot{}, pickIf[error](err != nil, err, fmt.Errorf("%w: TransferID 或 Handle 无效", ErrInvalidRequest))
@@ -398,7 +376,7 @@ func (s *Service) InspectTransfer(ctx context.Context, req InspectTransferReques
 func (s *Service) inspectAuthorizedTransfer(ctx context.Context, req InspectTransferRequest) (TransferStatusSnapshot, error) {
 	handle, hasHandle := req.Handle.Get()
 	if !hasHandle {
-		handle, hasHandle = s.getActiveHandle(req.TransferID)
+		handle, hasHandle = s.handles.get(req.TransferID)
 	}
 	if hasHandle {
 		var snap TransferStatusSnapshot
@@ -412,7 +390,7 @@ func (s *Service) inspectAuthorizedTransfer(ctx context.Context, req InspectTran
 		if !errors.Is(err, pool.ErrHandleNotFound) || req.Handle.IsSome() {
 			return snap, err
 		}
-		s.dropActiveHandle(req.TransferID, handle, false)
+		s.handles.drop(req.TransferID, handle)
 	}
 	if s.journals == nil {
 		return TransferStatusSnapshot{}, ErrTransferNotFound
@@ -441,10 +419,9 @@ func runAuthorizedHandleVal[T any](ctx context.Context, s *Service, base CallBas
 	}
 	spec := authOpSpec{base: base, targetHop: hop, tool: "transfer", action: action, params: params, defaultRisk: defaultRisk, summary: "transfer " + action + " " + pickIf(params["transfer_id"] != "", params["transfer_id"], handle.ID().String())}
 	return runAuthorizedVal[security.CapTransfer](ctx, s, spec, func(authCtx context.Context, auth gate.Authorized[security.CapTransfer], emitter *transferEmitter) (out T, err error) {
-		err = pool.WithManagedHandle[plan.KindTransfer, *managedTransferSession](authCtx, s.pool, handle, func(hCtx context.Context, sess *managedTransferSession) error {
-			return sess.mu.WithLock(hCtx, func() (fErr error) { out, fErr = fn(hCtx, auth, sess, emitter); return fErr })
+		return out, pool.WithManagedHandle[plan.KindTransfer, *managedTransferSession](authCtx, s.pool, handle, func(hCtx context.Context, sess *managedTransferSession) error {
+			return sess.mu.WithLock(hCtx, func() error { out, err = fn(hCtx, auth, sess, emitter); return err })
 		})
-		return out, err
 	})
 }
 func (s *Service) persistJournalEffects(ctx context.Context, effs []fsm.TransferEffect) error {
