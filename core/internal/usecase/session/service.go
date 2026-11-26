@@ -235,11 +235,7 @@ func buildGateReq[C security.Capability](in gateReqInput) (gate.GateRequest[C], 
 // 内部直接消费借用证明 auth（不透传至外部回调），确保 OutcomeUnknown 绝不降级且流确定性收敛。
 //
 //xops:syncclosure
-func runAuthorized[C security.Capability](
-	ctx context.Context, s *Service, planDigest plan.PlanDigest, nodeID, action string,
-	gateReq gate.GateRequest[C], stream *events.OperationStream, isExec bool,
-	run func(authCtx context.Context, binding security.OperationBinding, emitter *operationEmitter) (execution.ExecutionOutcome, error),
-) (execution.ExecutionOutcome, bool, error) {
+func runAuthorized[C security.Capability](ctx context.Context, s *Service, planDigest plan.PlanDigest, nodeID, action string, gateReq gate.GateRequest[C], stream *events.OperationStream, isExec bool, run func(authCtx context.Context, binding security.OperationBinding, emitter *operationEmitter) (execution.ExecutionOutcome, error)) (execution.ExecutionOutcome, bool, error) {
 	var outcome execution.ExecutionOutcome
 	var entered bool
 	var emitter *operationEmitter
@@ -266,11 +262,7 @@ func runAuthorized[C security.Capability](
 
 // registerAuthorizedHandle 在 gate.WithAuthorized 包裹 pool.WithLease 内调用 pool.RegisterLeaseHandleWith
 // 登记跨请求托管资源；若门控后置审计失败则立即回滚释放句柄，绝不泄漏池钉选。
-func registerAuthorizedHandle[C security.Capability, K plan.HandleKind, R pool.ComparableManagedResource](
-	ctx context.Context, s *Service, connPlan plan.SealedConnectionPlan, nodeID, action string,
-	gateReq gate.GateRequest[C], stream *events.OperationStream,
-	build func(leaseCtx, revokeCtx context.Context, conn ports.TransportConn) (R, error),
-) (plan.ManagedHandle[K], error) {
+func registerAuthorizedHandle[C security.Capability, K plan.HandleKind, R pool.ComparableManagedResource](ctx context.Context, s *Service, connPlan plan.SealedConnectionPlan, nodeID, action string, gateReq gate.GateRequest[C], stream *events.OperationStream, build func(leaseCtx, revokeCtx context.Context, conn ports.TransportConn) (R, error)) (plan.ManagedHandle[K], error) {
 	var handle plan.ManagedHandle[K]
 	_, _, gateErr := runAuthorized[C](ctx, s, connPlan.PlanDigest(), nodeID, action, gateReq, stream, false,
 		func(authCtx context.Context, binding security.OperationBinding, _ *operationEmitter) (execution.ExecutionOutcome, error) {
@@ -310,7 +302,6 @@ func inspectManagedHandle[K plan.HandleKind, S any](ctx context.Context, s *Serv
 	err = pool.WithManagedHandle[K, snapshotResource[S]](ctx, s.cfg.Pool, handle, func(_ context.Context, res snapshotResource[S]) error { st = res.snapshot(hs); return nil })
 	return st, err
 }
-
 func (s *Service) validateActiveHandleOp(ctx context.Context, handleValid bool) error {
 	if err := s.validateServiceAndCtx(ctx); err != nil {
 		return err
@@ -323,7 +314,6 @@ func (s *Service) validateActiveHandleOp(ctx context.Context, handleValid bool) 
 	}
 	return nil
 }
-
 func releaseManagedHandle[K plan.HandleKind](ctx context.Context, s *Service, handle plan.ManagedHandle[K]) error {
 	if err := s.validateServiceAndCtx(ctx); err != nil {
 		return err
@@ -333,7 +323,6 @@ func releaseManagedHandle[K plan.HandleKind](ctx context.Context, s *Service, ha
 	}
 	return pool.ReleaseHandle[K](s.cfg.Pool, handle)
 }
-
 func (s *Service) executeSession(ctx context.Context, spec sessionRunSpec) (execution.ExecutionOutcome, error) {
 	targetHop, nodeID, err := resolvePlanTargetAndNode(spec.plan, spec.nodeID)
 	if err != nil {

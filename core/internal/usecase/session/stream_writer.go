@@ -48,14 +48,12 @@ func newOperationEmitterFor(stream *events.OperationStream, clock ports.Clock, t
 }
 
 func (e *operationEmitter) active() bool { return e != nil && e.stream != nil && !e.stream.IsClosed() }
-
 func (e *operationEmitter) nextMeta() (events.EventMeta, error) {
 	return events.NewEventMeta(events.EventMetaSpec{
 		TraceID: e.traceID, OperationID: algebraic.Some(e.opID),
 		OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID,
 	})
 }
-
 func (e *operationEmitter) emitStarted(ctx context.Context, action string, planDigest plan.PlanDigest, summary string) {
 	if !e.active() {
 		return
@@ -69,7 +67,6 @@ func (e *operationEmitter) emitStarted(ctx context.Context, action string, planD
 		}
 	}
 }
-
 func (e *operationEmitter) emitOutputChunk(ctx context.Context, kind events.OutputStreamKind, data []byte) {
 	if !e.active() || len(data) == 0 {
 		return
@@ -91,7 +88,6 @@ func (e *operationEmitter) emitOutputChunk(ctx context.Context, kind events.Outp
 		}
 	}
 }
-
 func (e *operationEmitter) emitCompleted(ctx context.Context, startedAt time.Time, outcome execution.ExecutionOutcome, finalErr error) {
 	if !e.active() {
 		return

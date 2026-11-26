@@ -98,14 +98,23 @@ type muxResource interface {
 	touch(ctx context.Context)
 }
 
+const (
+	muxReaperIdle uint8 = iota
+	muxReaperReleasing
+	muxReaperDone
+	muxReaperCanceled
+)
+
 // managedMuxMaster 实现 muxResource、snapshotResource[ControlMasterStatus] 与 pool.ComparableManagedResource：
-// 使用分离的 workNursery（监听服务 + ControlPersist 计时器）与 reaperNursery（独立自动回收协程），
-// 确保 WithListener 彻底退出解绑套接字并排空 workNursery 后再触发 ReleaseHandle，彻底杜绝自等待死锁与假活竞态。
+// 使用分离的 workNursery（监听服务 + ControlPersist 计时器）与 reaperNursery（独立自动回收协程）配合
+// 四态原子状态机（Idle/Releasing/Done/Canceled），确保 WithListener 解绑且排空 workNursery 后再触发
+// ReleaseHandle，并在 pool.scheduleCloserBounded 同步重入 Close 降级路径上彻底杜绝自等待死锁与假活竞态。
 //
 //xops:opaque
 //xops:failclosed
 type managedMuxMaster struct {
 	valid, relClosed                        bool
+	reaperState                             uint8
 	socketPath                              pathalg.LocalSourcePath
 	effectiveMaster                         option.ControlMasterMode
 	effectivePersist                        option.ControlPersistSpec
@@ -214,6 +223,7 @@ func (m *managedMuxMaster) runPersistTimer(ctx context.Context, clk ports.Clock,
 	}
 }
 func (m *managedMuxMaster) runAutoRelease(rCtx context.Context) error {
+	defer m.reaperNursery.Cancel(nil)
 	select {
 	case <-rCtx.Done():
 		return nil
@@ -228,19 +238,31 @@ func (m *managedMuxMaster) runAutoRelease(rCtx context.Context) error {
 	if rCtx.Err() != nil {
 		return nil
 	}
-	m.relMu.Lock()
-	fn := m.releaseFn
-	m.releaseFn = nil
-	m.relMu.Unlock()
-	if fn != nil {
-		fn()
+	fn := m.claimAutoRelease()
+	if fn == nil {
+		return nil
 	}
+	defer func() { m.relMu.Lock(); m.reaperState = muxReaperDone; m.relMu.Unlock() }()
+	fn()
 	return nil
+}
+func (m *managedMuxMaster) claimAutoRelease() func() {
+	m.relMu.Lock()
+	defer m.relMu.Unlock()
+	if m.reaperState != muxReaperIdle || m.releaseFn == nil {
+		return nil
+	}
+	fn := m.releaseFn
+	m.releaseFn, m.reaperState = nil, muxReaperReleasing
+	return fn
 }
 func (m *managedMuxMaster) bindAutoRelease(fn func()) {
 	m.relMu.Lock()
 	if !m.relClosed {
-		m.releaseFn, m.relClosed = fn, true
+		m.relClosed = true
+		if m.reaperState == muxReaperIdle {
+			m.releaseFn = fn
+		}
 		close(m.relReady)
 	}
 	m.relMu.Unlock()
@@ -290,11 +312,16 @@ func (m *managedMuxMaster) Close() error {
 	}
 	m.closeOnce.Do(func() {
 		m.relMu.Lock()
-		m.releaseFn, m.relClosed = nil, true
+		state := m.reaperState
+		if state == muxReaperIdle {
+			m.reaperState, m.releaseFn = muxReaperCanceled, nil
+		}
 		m.relMu.Unlock()
 		m.closeWork(ports.ErrClosed)
 		m.reaperNursery.Cancel(ports.ErrClosed)
-		_ = m.reaperNursery.Close()
+		if state != muxReaperReleasing {
+			_ = m.reaperNursery.Close()
+		}
 	})
 	return m.serveErr.get()
 }
@@ -324,11 +351,10 @@ func (s *Service) StartControlMaster(ctx context.Context, req ControlMasterReque
 		return ControlMasterInfo{}, err
 	}
 	var info ControlMasterInfo
-	_, _, gateErr := runAuthorized[security.CapTunnel](ctx, s, req.Plan.PlanDigest(), nodeID, "mux_master_start", gateReq, req.OperationStream, false,
+	if _, _, gateErr := runAuthorized[security.CapTunnel](ctx, s, req.Plan.PlanDigest(), nodeID, "mux_master_start", gateReq, req.OperationStream, false,
 		func(authCtx context.Context, binding security.OperationBinding, _ *operationEmitter) (execution.ExecutionOutcome, error) {
 			return nil, s.execStartControlMaster(authCtx, req.Plan, nodeID, binding, sockPath, effMaster, effPersist, &info)
-		})
-	if gateErr != nil {
+		}); gateErr != nil {
 		if h, ok := info.handle.Get(); ok && h.IsValid() {
 			_ = pool.ReleaseHandle[plan.KindMux](s.cfg.Pool, h)
 		}

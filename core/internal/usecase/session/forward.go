@@ -282,7 +282,6 @@ func (s *Service) validateStartForwardCall(ctx context.Context, req StartForward
 	}
 	return nil
 }
-
 func buildForwardBindingParams(spec ports.ForwardSpec, targetHop plan.HopSpec) map[string]string {
 	params := map[string]string{"user": targetHop.Username().String(), "direction": spec.Direction().String(), "bind_addr": spec.BindAddr()}
 	for k, v := range map[string]string{"bind_kind": spec.BindKind().String(), "target_kind": spec.TargetKind().String(), "target_addr": spec.TargetAddr()} {
@@ -295,7 +294,6 @@ func buildForwardBindingParams(spec ports.ForwardSpec, targetHop plan.HopSpec) m
 	}
 	return params
 }
-
 func defaultForwardRisk(spec ports.ForwardSpec) security.RiskLevel {
 	if spec.Direction() == ports.ForwardLocal {
 		return security.RiskModerate

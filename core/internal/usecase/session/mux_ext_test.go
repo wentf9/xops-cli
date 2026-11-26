@@ -14,6 +14,7 @@ import (
 
 	"go.uber.org/goleak"
 
+	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
@@ -450,6 +451,89 @@ func assertMuxRevocationMode(t *testing.T, pl plan.SealedConnectionPlan, mode st
 	assertTeardownClean(t, r2, "MuxRevocation/"+mode)
 	if pResp, err := r2.muxSocket.Probe(context.Background(), inf.SocketPath()); err != nil || pResp.Alive() {
 		t.Fatalf("%s 吊销后底层监听套接字必须已释放: resp=%#v err=%v", mode, pResp, err)
+	}
+}
+
+func TestSessionMux_ControlPersistConcurrentRaceWithCloseHaltAndStop(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	litPath, _ := option.NewLiteralControlPath("/tmp/mux-persist-race.sock")
+	persist10, _ := option.ParseControlPersist("10s")
+	cp := option.UnsetControlPolicy().WithMaster(option.ControlMasterYes).WithPath(litPath).WithPersist(persist10)
+	pl := mustPlanWithControl(t, cp, false)
+	for _, mode := range []string{"PoolClose", "StopControlMaster", "RetireHop", "GateHalted"} {
+		t.Run(mode, func(t *testing.T) { assertMuxPersistConcurrentRace(t, pl, mode) })
+	}
+}
+
+func assertMuxPersistConcurrentRace(t *testing.T, pl plan.SealedConnectionPlan, mode string) {
+	t.Helper()
+	var faultArmed atomic.Bool
+	opt := fullRigOptions{profile: gate.PolicyProfileDirectOperator}
+	if mode == "GateHalted" {
+		opt.profile = gate.PolicyProfileStrictAgent
+		opt.approvalThreshold = security.RiskDangerous
+		opt.customAuditSink = func(inner ports.AuditSink) ports.AuditSink {
+			return &armedPostWriteFaultSink{inner: inner, armed: &faultArmed}
+		}
+	}
+	rig := newFullSessionRig(t, opt)
+	defer rig.close()
+	baseTimers := rig.clk.PendingTimers()
+	inf, err := rig.svc.StartControlMaster(context.Background(), ucsess.ControlMasterRequest{
+		Plan: pl, Risk: algebraic.Some(security.RiskSafe),
+	})
+	if err != nil {
+		t.Fatalf("StartControlMaster(%s): %v", mode, err)
+	}
+	mh, _ := inf.Handle().Get()
+	if err := rig.clk.WaitPending(context.Background(), baseTimers+1); err != nil {
+		t.Fatalf("WaitPending(%s): %v", mode, err)
+	}
+	// 同时触发 ControlPersist 过期自释放与外部关闭/吊销，验证绝不自等待死锁且 0 泄漏。
+	if err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		start := make(chan struct{})
+		if gErr := n.Go(func(context.Context) error {
+			<-start
+			rig.clk.Advance(10 * time.Second)
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		if gErr := n.Go(func(context.Context) error {
+			<-start
+			triggerMuxAdversary(t, rig, pl, mh, mode, &faultArmed)
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		close(start)
+		return nil
+	}); err != nil {
+		t.Fatalf("RunWait(%s): %v", mode, err)
+	}
+	waitUntil(t, func() bool { return rig.pool.Stats().ActiveHandles == 0 })
+	// 注意：本并发对抗用例在同一 SimClock 上同时 Advance(10s) 与触发 90ms 拆断宽限，虚拟时钟跨越 90ms 属预期，
+	// 此处重点验证 WaitPendingTeardowns 无死锁收敛、底层套接字彻底释放且 goleak 零泄漏。
+	if err := rig.pool.WaitPendingTeardowns(context.Background()); err != nil {
+		t.Fatalf("PersistRace/%s WaitPendingTeardowns: %v", mode, err)
+	}
+	if pResp, err := rig.muxSocket.Probe(context.Background(), inf.SocketPath()); err != nil || pResp.Alive() {
+		t.Fatalf("%s 并发竞态后套接字必须已释放: resp=%#v err=%v", mode, pResp, err)
+	}
+}
+
+func triggerMuxAdversary(t *testing.T, rig *fullSessionRig, pl plan.SealedConnectionPlan, mh plan.ManagedHandle[plan.KindMux], mode string, faultArmed *atomic.Bool) {
+	switch mode {
+	case "PoolClose":
+		_ = rig.pool.Close()
+	case "StopControlMaster":
+		_ = rig.svc.StopControlMaster(context.Background(), mh)
+	case "RetireHop":
+		leaf, _ := pl.HopDigestAt(pl.Len() - 1)
+		_ = rig.pool.RetireHop(leaf)
+	case "GateHalted":
+		faultArmed.Store(true)
+		_, _ = rig.svc.Exec(context.Background(), ucsess.ExecRequest{Plan: pl, Command: mustCommandPlan(t, "id"), Risk: algebraic.Some(security.RiskSafe)})
 	}
 }
 

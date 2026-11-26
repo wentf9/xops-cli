@@ -73,10 +73,7 @@ func (s *Service) ControlMux(ctx context.Context, req MuxControlRequest) (ports.
 }
 
 //xops:syncclosure
-func runMuxAuthorized[C security.Capability](
-	ctx context.Context, s *Service, req MuxRequest, action string, defaultRisk security.RiskLevel,
-	extra map[string]string, run func(authCtx context.Context, targetHop plan.HopSpec, nodeID string, sockPath pathalg.LocalSourcePath) error,
-) error {
+func runMuxAuthorized[C security.Capability](ctx context.Context, s *Service, req MuxRequest, action string, defaultRisk security.RiskLevel, extra map[string]string, run func(authCtx context.Context, targetHop plan.HopSpec, nodeID string, sockPath pathalg.LocalSourcePath) error) error {
 	targetHop, nodeID, sockPath, err := s.prepareMuxOp(ctx, req)
 	if err != nil {
 		return err
@@ -91,11 +88,7 @@ func runMuxAuthorized[C security.Capability](
 		})
 	return gateErr
 }
-
-func runMuxControl[C security.Capability](
-	ctx context.Context, s *Service, req MuxRequest, action string, defaultRisk security.RiskLevel,
-	extra map[string]string, call func(authCtx context.Context, sockPath pathalg.LocalSourcePath) (ports.MuxControlResponse, error),
-) (ports.MuxControlResponse, error) {
+func runMuxControl[C security.Capability](ctx context.Context, s *Service, req MuxRequest, action string, defaultRisk security.RiskLevel, extra map[string]string, call func(authCtx context.Context, sockPath pathalg.LocalSourcePath) (ports.MuxControlResponse, error)) (ports.MuxControlResponse, error) {
 	var resp ports.MuxControlResponse
 	if err := runMuxAuthorized[C](ctx, s, req, action, defaultRisk, extra, func(authCtx context.Context, _ plan.HopSpec, _ string, sockPath pathalg.LocalSourcePath) error {
 		r, rErr := call(authCtx, sockPath)

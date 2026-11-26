@@ -53,7 +53,6 @@ func resolvePTYTerm(explicit string, env ports.EnvPort) string {
 	}
 	return defaultTTYTerm
 }
-
 func buildPTYRequest(termName string, sz ports.TerminalSize) (ports.PTYRequest, error) {
 	if !sz.IsValid() {
 		var err error
@@ -115,7 +114,6 @@ func firstNonNilErr(errs ...error) error {
 	}
 	return nil
 }
-
 func claimSessionPipes(sess ports.RemoteSession) (io.WriteCloser, io.Reader, io.Reader, error) {
 	inPipe, err := sess.StdinPipe()
 	if err != nil {
@@ -131,7 +129,6 @@ func claimSessionPipes(sess ports.RemoteSession) (io.WriteCloser, io.Reader, io.
 	}
 	return inPipe, outPipe, errPipe, nil
 }
-
 func prepareRawPTY(wantPTY bool, termName string, term ports.TerminalHandle) (algebraic.Option[ports.PTYRequest], error) {
 	if !wantPTY {
 		return algebraic.None[ports.PTYRequest](), nil
@@ -222,7 +219,6 @@ func pumpRemotePipesToRelay(ctx context.Context, pw *io.PipeWriter, remoteOut, r
 		return copyAndAbort(errWriter, remoteErr)
 	})
 }
-
 func copyPipeBestEffort(dst io.Writer, src io.Reader) error {
 	if src != nil {
 		if _, err := io.Copy(dst, src); err != nil && !isRemotePipeClosedErr(err) {
@@ -231,7 +227,6 @@ func copyPipeBestEffort(dst io.Writer, src io.Reader) error {
 	}
 	return nil
 }
-
 func isRemotePipeClosedErr(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed) || errors.Is(err, ports.ErrClosed)
 }
