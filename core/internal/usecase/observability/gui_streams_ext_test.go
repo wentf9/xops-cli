@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -370,6 +371,24 @@ func TestStreamLogsPOSIXValidationRound2AndDockerInjection(t *testing.T) {
 		t.Fatalf("expected symlink to /etc/shadow to be denied by Round-2")
 	}
 
+	// 文件日志指向安全软链 /tmp/safe.log -> /tmp/real.log，验证 StrictAgent 下 Round-2 单调并集放行。
+	realLog, _ := pathalg.ParseRemotePath("/tmp/real.log")
+	safeLink, _ := pathalg.ParseRemotePath("/tmp/safe.log")
+	tmpDir, _ := pathalg.ParseRemotePath("/tmp")
+	mustNoErr(t, rig.rfs.MkdirAll(context.Background(), tmpDir, 0o755), "MkdirAll /tmp")
+	mustNoErr(t, rig.rfs.PutSymlink(safeLink, realLog.String()), "PutSymlink safe")
+	safeFileTarget, err := observability.NewFileLogTarget(safeLink)
+	mustNoErr(t, err, "NewFileLogTarget safe")
+	rig.dialer.onCmd = func(_ context.Context, _ execution.CommandPlan, stdout, _ io.Writer) (execution.ExecutionOutcome, error) {
+		_, _ = io.WriteString(stdout, "safe-log\n")
+		return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	}
+	safeRes, err := rig.svc.StreamLogs(context.Background(), observability.LogStreamRequest{Plan: rig.plan, Target: safeFileTarget})
+	mustNoErr(t, err, "StreamLogs safe symlink Round-2 union")
+	if string(safeRes.Data()) != "safe-log\n" {
+		t.Fatalf("unexpected safe log data: %q", safeRes.Data())
+	}
+
 	// 正常 Docker 日志流，校验 ADR-008/009 嵌套顺序与输出镜像。
 	rig.dialer.onCmd = func(_ context.Context, cmd execution.CommandPlan, stdout, _ io.Writer) (execution.ExecutionOutcome, error) {
 		if !strings.Contains(cmd.Command(), "docker logs --tail 25 -- 'api_svc.1'") {
@@ -488,15 +507,58 @@ func TestGUIValidationAndImageProcessing(t *testing.T) {
 	if shot.MIMEType != "image/jpeg" || shot.Width != 1280 || shot.Height != 160 || shot.OrigWidth != 1600 {
 		t.Fatalf("unexpected scaled shot: %+v", shot)
 	}
-	webpShot, err := observability.ProcessScreenshotBytes([]byte("RIFF\x10\x00\x00\x00WEBPfake"))
-	mustNoErr(t, err, "ProcessScreenshotBytes webp")
-	if webpShot.MIMEType != "image/webp" {
-		t.Fatalf("expected webp passthrough, got %s", webpShot.MIMEType)
+	// type 文本控制字符/Bidi 须与 BuildGUIScript 一致拒绝。
+	if err := observability.ValidateGUIAction(observability.GUIActionSpec{Action: observability.GUIActionType, Text: "abc\u202edef"}); !errors.Is(err, observability.ErrInvalidGUIInput) {
+		t.Fatalf("expected Bidi char rejected in ValidateGUIAction, got %v", err)
 	}
-	if _, err := observability.ProcessScreenshotBytes(makeFakeBombPNGHeader(20000, 20000)); !errors.Is(err, observability.ErrScreenshotInvalid) {
-		t.Fatalf("expected decompression bomb rejected, got %v", err)
+	assertWebPImageGuards(t)
+}
+
+func assertWebPImageGuards(t *testing.T) {
+	t.Helper()
+	makeWebP := func(fourCC string, payload []byte) []byte {
+		var buf bytes.Buffer
+		buf.WriteString("RIFF")
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(4+8+len(payload)))
+		buf.WriteString("WEBP")
+		buf.WriteString(fourCC)
+		_ = binary.Write(&buf, binary.LittleEndian, uint32(len(payload)))
+		buf.Write(payload)
+		return buf.Bytes()
 	}
-	// 验证 9 类 GUI 动作均产出硬化 POSIX Bourne 脚本（含 mktemp/trap）。
+	vp8Payload := make([]byte, 10)
+	vp8Payload[3], vp8Payload[4], vp8Payload[5] = 0x9d, 0x01, 0x2a
+	binary.LittleEndian.PutUint16(vp8Payload[6:8], 320)
+	binary.LittleEndian.PutUint16(vp8Payload[8:10], 240)
+	if ws, wErr := observability.ProcessScreenshotBytes(makeWebP("VP8 ", vp8Payload)); wErr != nil || ws.MIMEType != "image/webp" || ws.Width != 320 || ws.Height != 240 {
+		t.Fatalf("expected valid VP8 320x240, got %+v err=%v", ws, wErr)
+	}
+	vp8lPayload := make([]byte, 5)
+	vp8lPayload[0] = 0x2f
+	binary.LittleEndian.PutUint32(vp8lPayload[1:5], uint32(640-1)|(uint32(480-1)<<14))
+	if ws, wErr := observability.ProcessScreenshotBytes(makeWebP("VP8L", vp8lPayload)); wErr != nil || ws.Width != 640 || ws.Height != 480 {
+		t.Fatalf("expected valid VP8L 640x480, got %+v err=%v", ws, wErr)
+	}
+	makeVP8X := func(w, h uint32) []byte {
+		p := make([]byte, 10)
+		wm, hm := w-1, h-1
+		p[4], p[5], p[6] = byte(wm), byte(wm>>8), byte(wm>>16)
+		p[7], p[8], p[9] = byte(hm), byte(hm>>8), byte(hm>>16)
+		return makeWebP("VP8X", p)
+	}
+	if ws, wErr := observability.ProcessScreenshotBytes(makeVP8X(1024, 768)); wErr != nil || ws.Width != 1024 || ws.Height != 768 {
+		t.Fatalf("expected valid VP8X 1024x768, got %+v err=%v", ws, wErr)
+	}
+	for _, badWebP := range [][]byte{[]byte("RIFF\x10\x00\x00\x00WEBPfake"), makeVP8X(20000, 20000), makeFakeBombPNGHeader(20000, 20000)} {
+		if _, err := observability.ProcessScreenshotBytes(badWebP); !errors.Is(err, observability.ErrScreenshotInvalid) {
+			t.Fatalf("expected malformed/bomb image rejected, got %v", err)
+		}
+	}
+}
+
+func TestGUIScriptGenerationAll9Actions(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// 验证 9 类 GUI 动作均产出硬化 POSIX Bourne 脚本（含 mktemp/trap、分辨率换算、Wayland/X11 双分支）。
 	for _, spec := range []observability.GUIActionSpec{
 		{Action: observability.GUIActionScreenshot, WaylandDisplay: "wayland-0"},
 		{Action: observability.GUIActionClick, X: 100, Y: 200},
@@ -508,11 +570,22 @@ func TestGUIValidationAndImageProcessing(t *testing.T) {
 		{Action: observability.GUIActionType, Text: "a'b"},
 		{Action: observability.GUIActionKey, Key: "ctrl+c"},
 	} {
-		sc, sErr := observability.BuildGUIScript(spec)
-		mustNoErr(t, sErr, "BuildGUIScript "+spec.Action.String())
-		if !strings.Contains(sc, "mktemp -d") || !strings.Contains(sc, "trap 'rm -rf") {
-			t.Fatalf("script missing hardened tmpdir/trap: %s", sc)
-		}
+		assertHardenedGUIScript(t, spec)
+	}
+}
+
+func assertHardenedGUIScript(t *testing.T, spec observability.GUIActionSpec) {
+	t.Helper()
+	sc, sErr := observability.BuildGUIScript(spec)
+	mustNoErr(t, sErr, "BuildGUIScript "+spec.Action.String())
+	if !strings.Contains(sc, "mktemp -d") || !strings.Contains(sc, "trap 'rm -rf") {
+		t.Fatalf("script missing hardened tmpdir/trap: %s", sc)
+	}
+	if spec.Action != observability.GUIActionScreenshot && (!strings.Contains(sc, "ydotool") || !strings.Contains(sc, "xdotool")) {
+		t.Fatalf("input script missing Wayland/X11 dispatch: %s", sc)
+	}
+	if spec.Action >= observability.GUIActionClick && spec.Action <= observability.GUIActionScroll && !strings.Contains(sc, "xops_px") {
+		t.Fatalf("pointer script missing normalized coord scaling: %s", sc)
 	}
 }
 
@@ -540,19 +613,37 @@ func TestExecuteGUIScreenshotApprovalAndArtifact(t *testing.T) {
 	if !ok || gotShot.Width != 1280 || res.Artifact().IsNone() {
 		t.Fatalf("expected scaled screenshot & saved artifact, got ok=%v art=%v", ok, res.Artifact())
 	}
+	if strings.Contains(res.Stdout(), "XOPS_GUI_SHOT_BEGIN_V2") {
+		t.Fatalf("expected Base64 screenshot payload stripped from Stdout, got %q", res.Stdout())
+	}
 
-	// type 动作默认 RiskDangerous -> 两步审批，篡改文本必拒，原文 Round 2 通过。
+	// type 动作默认 RiskDangerous -> 两步审批，篡改 Artifact 或文本必拒，原文 Round 2 通过。
 	_, err = rig.svc.ExecuteGUI(context.Background(), observability.GUIExecRequest{
 		Plan: rig.plan, Spec: observability.GUIActionSpec{Action: observability.GUIActionType, Text: "hello"},
+		Artifact: algebraic.Some(observability.GUIArtifactDest{RootDir: rootDir, File: fileDest}),
 	})
 	var chalErr *gate.ApprovalChallengeError
 	if !errors.Is(err, gate.ErrApprovalRequired) || !errors.As(err, &chalErr) {
 		t.Fatalf("expected ApprovalChallengeError on gui type, got %v", err)
 	}
-	sub := makeApprovalForChal(t, chalErr)
+	otherFile, _ := pathalg.ParseLocalRootedDest("tampered.jpg")
+	if _, err := rig.svc.ExecuteGUI(context.Background(), observability.GUIExecRequest{
+		Plan: rig.plan, Spec: observability.GUIActionSpec{Action: observability.GUIActionType, Text: "hello"},
+		Artifact: algebraic.Some(observability.GUIArtifactDest{RootDir: rootDir, File: otherFile}),
+		Approval: algebraic.Some(makeApprovalForChal(t, chalErr)),
+	}); err == nil {
+		t.Fatalf("expected tampered Artifact file rejected in Round 2")
+	}
+	_, err = rig.svc.ExecuteGUI(context.Background(), observability.GUIExecRequest{
+		Plan: rig.plan, Spec: observability.GUIActionSpec{Action: observability.GUIActionType, Text: "hello"},
+	})
+	var chalErr2 *gate.ApprovalChallengeError
+	if !errors.Is(err, gate.ErrApprovalRequired) || !errors.As(err, &chalErr2) {
+		t.Fatalf("expected second ApprovalChallengeError, got %v", err)
+	}
 	resType, err := rig.svc.ExecuteGUI(context.Background(), observability.GUIExecRequest{
 		Plan: rig.plan, Spec: observability.GUIActionSpec{Action: observability.GUIActionType, Text: "hello"},
-		Approval: algebraic.Some(sub),
+		Approval: algebraic.Some(makeApprovalForChal(t, chalErr2)),
 	})
 	mustNoErr(t, err, "ExecuteGUI type Round 2")
 	if resType.Action() != observability.GUIActionType {
@@ -622,4 +713,112 @@ func TestGUISessionX11VNCLifecycleAndGateHaltedRevocation(t *testing.T) {
 		t.Fatalf("expected ErrGateHalted on InspectGUISession, got %v", err)
 	}
 	_ = rig.svc.CloseGUISession(context.Background(), info.Handle())
+
+	// VNC + UseUnixSocket 必须失败关闭拒绝；且 LocalBindPort 篡改必须触发审批校验拒绝。
+	rig2 := newObsRig(t, obsRigOpts{profile: gate.PolicyProfileStrictAgent, fallback: gate.NoElicitFallbackChallenge})
+	defer rig2.close()
+	if _, err := rig2.svc.OpenGUISession(context.Background(), observability.OpenGUISessionRequest{
+		Plan: rig2.plan, Spec: observability.GUISessionSpec{Kind: observability.GUISessionVNC, DisplayNum: 1, UseUnixSocket: true},
+	}); !errors.Is(err, observability.ErrInvalidGUIInput) {
+		t.Fatalf("expected VNC+UseUnixSocket rejected, got %v", err)
+	}
+	_, err = rig2.svc.OpenGUISession(context.Background(), observability.OpenGUISessionRequest{
+		Plan: rig2.plan, Spec: observability.GUISessionSpec{Kind: observability.GUISessionVNC, DisplayNum: 1, LocalBindHost: "0.0.0.0", LocalBindPort: 15901, AllowNonLoopbackBind: true},
+	})
+	var chalSess *gate.ApprovalChallengeError
+	if !errors.Is(err, gate.ErrApprovalRequired) || !errors.As(err, &chalSess) {
+		t.Fatalf("expected session approval challenge, got %v", err)
+	}
+	if _, err := rig2.svc.OpenGUISession(context.Background(), observability.OpenGUISessionRequest{
+		Plan: rig2.plan, Spec: observability.GUISessionSpec{Kind: observability.GUISessionVNC, DisplayNum: 1, LocalBindHost: "0.0.0.0", LocalBindPort: 15902, AllowNonLoopbackBind: true},
+		Approval: algebraic.Some(makeApprovalForChal(t, chalSess)),
+	}); err == nil {
+		t.Fatalf("expected tampered LocalBindPort rejected in Round 2")
+	}
+}
+
+func TestStreamMetricsRealShellStreamingAndLogFollowStop(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newObsRig(t, obsRigOpts{})
+	defer rig.close()
+
+	// 1. StreamMetrics 校验非正 Timeout。
+	if _, err := rig.svc.StreamMetrics(context.Background(), observability.MetricsStreamRequest{
+		Plan: rig.plan, Timeout: algebraic.Some(algebraic.FromStdDuration(-time.Second)),
+	}); !errors.Is(err, observability.ErrInvalidRequest) {
+		t.Fatalf("expected ErrInvalidRequest for negative metrics Timeout, got %v", err)
+	}
+
+	// 2. 逐行实时流式解析、每帧独立时钟盖戳、超长行安全丢弃与 UptimeSec 溢出钳制。
+	var seenTimes []time.Time
+	rig.dialer.onCmd = func(_ context.Context, _ execution.CommandPlan, stdout, _ io.Writer) (execution.ExecutionOutcome, error) {
+		_, _ = io.WriteString(stdout, strings.Repeat("x", 300<<10)+"\n")
+		_, _ = io.WriteString(stdout, `{"hostname":"h1","cpu_total":100,"cpu_idle":50,"uptime_sec":1e30}`+"\n")
+		rig.clock.Advance(2 * time.Second)
+		_, _ = io.WriteString(stdout, `{"hostname":"h1","cpu_total":200,"cpu_idle":75,"uptime_sec":120}`+"\n")
+		return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	}
+	mRes, err := rig.svc.StreamMetrics(context.Background(), observability.MetricsStreamRequest{
+		Plan: rig.plan, MaxSamples: 2, OnFrame: func(f observability.HostMetricsFrame) { seenTimes = append(seenTimes, f.SampledAt) },
+	})
+	mustNoErr(t, err, "StreamMetrics live")
+	if len(seenTimes) != 2 || seenTimes[1].Sub(seenTimes[0]) != 2*time.Second || mRes.Frames()[0].Uptime.IsNegative() || mRes.Frames()[1].CPUPercent != 75.0 {
+		t.Fatalf("unexpected live streaming frames: times=%v frames=%+v", seenTimes, mRes.Frames())
+	}
+
+	// 3. 真实 /bin/sh 执行 StreamMetrics 探针脚本并端到端喂回解析器验证协议兼容性。
+	if shPath, lookErr := exec.LookPath("sh"); lookErr == nil {
+		rig.dialer.onCmd = func(c context.Context, cmd execution.CommandPlan, stdout, stderr io.Writer) (execution.ExecutionOutcome, error) {
+			ec := exec.CommandContext(c, shPath, "-c", cmd.Command())
+			ec.Stdout, ec.Stderr = stdout, stderr
+			if rErr := ec.Run(); rErr != nil {
+				return nil, rErr
+			}
+			return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+		}
+		realRes, rErr := rig.svc.StreamMetrics(context.Background(), observability.MetricsStreamRequest{
+			Plan: rig.plan, Interval: algebraic.Some(algebraic.FromStdDuration(200 * time.Millisecond)), MaxSamples: 2, TopProcesses: 3,
+		})
+		mustNoErr(t, rErr, "StreamMetrics real /bin/sh probe")
+		if len(realRes.Frames()) != 2 || realRes.Frames()[0].Hostname == "" {
+			t.Fatalf("expected 2 real parsed frames from /bin/sh probe, got %+v", realRes.Frames())
+		}
+	}
+}
+
+func TestStreamLogsFollowLimitAndMaxOutputBytes(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newObsRig(t, obsRigOpts{})
+	defer rig.close()
+	// StreamLogs 透传 >4MiB MaxOutputBytes 且 Follow=true 达 maxBytes 确定性停止（0 挂死 / 非 OutcomeUnknown）。
+	dkTarget, _ := observability.NewDockerLogTarget("web-1")
+	var gotMaxOut uint64
+	rig.dialer.onCmd = func(c context.Context, cmd execution.CommandPlan, stdout, _ io.Writer) (execution.ExecutionOutcome, error) {
+		gotMaxOut = cmd.MaxOutputBytes()
+		for {
+			if c.Err() != nil {
+				return nil, c.Err()
+			}
+			_, _ = io.WriteString(stdout, "01234567")
+		}
+	}
+	lRes, err := rig.svc.StreamLogs(context.Background(), observability.LogStreamRequest{
+		Plan: rig.plan, Target: dkTarget, Follow: true, MaxBytes: 16,
+	})
+	mustNoErr(t, err, "StreamLogs follow maxBytes")
+	if gotMaxOut != 16 || !lRes.Truncated() || len(lRes.Data()) != 16 || lRes.Outcome().Kind() != execution.OutcomeKindCompleted {
+		t.Fatalf("unexpected follow stop result: maxOut=%d trunc=%v len=%d out=%v", gotMaxOut, lRes.Truncated(), len(lRes.Data()), lRes.Outcome())
+	}
+	rig.dialer.onCmd = func(_ context.Context, cmd execution.CommandPlan, stdout, _ io.Writer) (execution.ExecutionOutcome, error) {
+		gotMaxOut = cmd.MaxOutputBytes()
+		_, _ = io.WriteString(stdout, "ok")
+		return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	}
+	_, err = rig.svc.StreamLogs(context.Background(), observability.LogStreamRequest{
+		Plan: rig.plan, Target: dkTarget, MaxBytes: 8 << 20,
+	})
+	mustNoErr(t, err, "StreamLogs 8MiB")
+	if gotMaxOut != 8<<20 {
+		t.Fatalf("expected CommandPlan MaxOutputBytes=8MiB, got %d", gotMaxOut)
+	}
 }

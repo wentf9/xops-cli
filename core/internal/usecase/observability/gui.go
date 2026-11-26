@@ -30,40 +30,31 @@ func isASCIIDigits(s string, minLen, maxLen int) bool {
 	return true
 }
 
-func isGUIKeyChar(b byte) bool {
-	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
-}
+func isGUIKeyChar(b byte) bool { return isAlnumASCII(b) || b == '_' }
 
 // ValidateX11Display 严格校验 X11 DISPLAY 格式（仅允许 ":N" 或 ":N.S"），阻断环境变量与命令注入。
 func ValidateX11Display(raw string) error {
-	if len(raw) < 2 || raw[0] != ':' {
-		return fmt.Errorf("%w: 非法 X11 DISPLAY %q", ErrInvalidGUIInput, raw)
+	if len(raw) >= 2 && raw[0] == ':' {
+		if disp, screen, hasDot := strings.Cut(raw[1:], "."); isASCIIDigits(disp, 1, 4) && (!hasDot || isASCIIDigits(screen, 1, 3)) {
+			return nil
+		}
 	}
-	body := raw[1:]
-	disp, screen, hasDot := strings.Cut(body, ".")
-	if !isASCIIDigits(disp, 1, 4) || (hasDot && !isASCIIDigits(screen, 1, 3)) {
-		return fmt.Errorf("%w: 非法 X11 DISPLAY %q", ErrInvalidGUIInput, raw)
-	}
-	return nil
+	return fmt.Errorf("%w: 非法 X11 DISPLAY %q", ErrInvalidGUIInput, raw)
 }
 
 // ValidateWaylandDisplay 严格校验 WAYLAND_DISPLAY 格式（仅允许 "wayland-N"）。
 func ValidateWaylandDisplay(raw string) error {
-	num, ok := strings.CutPrefix(raw, "wayland-")
-	if !ok || !isASCIIDigits(num, 1, 4) {
-		return fmt.Errorf("%w: 非法 WAYLAND_DISPLAY %q", ErrInvalidGUIInput, raw)
+	if num, ok := strings.CutPrefix(raw, "wayland-"); ok && isASCIIDigits(num, 1, 4) {
+		return nil
 	}
-	return nil
+	return fmt.Errorf("%w: 非法 WAYLAND_DISPLAY %q", ErrInvalidGUIInput, raw)
 }
 
 // ValidateGUIKeySpec 严格校验按键或组合和弦名称（如 "Return"、"ctrl+c"），拒绝前导 "-"、空白与 Shell 元字符。
 func ValidateGUIKeySpec(raw string) error {
-	if raw == "" || len(raw) > 64 {
-		return fmt.Errorf("%w: 按键规格长度非法", ErrInvalidGUIInput)
-	}
 	parts := strings.Split(raw, "+")
-	if len(parts) > 5 {
-		return fmt.Errorf("%w: 组合键节数超限", ErrInvalidGUIInput)
+	if raw == "" || len(raw) > 64 || len(parts) > 5 {
+		return fmt.Errorf("%w: 按键规格长度或节数非法 %q", ErrInvalidGUIInput, raw)
 	}
 	for _, p := range parts {
 		if len(p) == 0 || len(p) > 24 {
@@ -108,14 +99,16 @@ func validateGUIActionArgs(spec GUIActionSpec) error {
 		if err := validateNormCoord(spec.X, spec.Y); err != nil {
 			return err
 		}
-		clicks := pickIf(spec.Clicks == 0, 3, spec.Clicks)
-		if !spec.Direction.IsValid() || clicks < 1 || clicks > maxGUIClicks {
+		if clicks := pickIf(spec.Clicks == 0, 3, spec.Clicks); !spec.Direction.IsValid() || clicks < 1 || clicks > maxGUIClicks {
 			return fmt.Errorf("%w: 滚轮方向或步数非法", ErrInvalidGUIInput)
 		}
 		return nil
 	case GUIActionType:
 		if spec.Text == "" || len(spec.Text) > maxGUITypeTextBytes || strings.ContainsRune(spec.Text, 0) {
 			return fmt.Errorf("%w: type 文本为空、超长或含 NUL", ErrInvalidGUIInput)
+		}
+		if _, err := execution.QuotePOSIX(spec.Text); err != nil {
+			return fmt.Errorf("%w: type 文本含非法控制/Bidi/UTF-8 字符: %w", ErrInvalidGUIInput, err)
 		}
 		return nil
 	case GUIActionKey:
@@ -132,7 +125,8 @@ func validateNormCoord(x, y int) error {
 	return nil
 }
 
-// BuildGUIScript 为校验通过的 GUIActionSpec 生成硬化 POSIX Bourne 脚本（mktemp -d 0700 + trap + 全量 QuotePOSIX）。
+// BuildGUIScript 为校验通过的 GUIActionSpec 生成硬化 POSIX Bourne 脚本：
+// mktemp -d 0700 + trap、分辨率感知归一化坐标换算 [0,1000]->像素、Wayland(ydotool)/X11(xdotool) 双分支与全量 QuotePOSIX。
 func BuildGUIScript(spec GUIActionSpec) (string, error) {
 	if err := ValidateGUIAction(spec); err != nil {
 		return "", err
@@ -141,6 +135,9 @@ func BuildGUIScript(spec GUIActionSpec) (string, error) {
 	b.WriteString("set -eu\nXOPS_TMP=$(mktemp -d)\nchmod 700 \"$XOPS_TMP\"\ntrap 'rm -rf \"$XOPS_TMP\"' EXIT\n")
 	if err := writeGUIDisplayEnv(&b, spec); err != nil {
 		return "", err
+	}
+	if guiActionNeedsGeometry(spec.Action) {
+		writeGUIGeometryHelpers(&b)
 	}
 	if err := writeGUIActionBody(&b, spec); err != nil {
 		return "", err
@@ -152,6 +149,24 @@ func BuildGUIScript(spec GUIActionSpec) (string, error) {
 	}
 	return b.String(), nil
 }
+
+func guiActionNeedsGeometry(act GUIActionKind) bool {
+	return act >= GUIActionClick && act <= GUIActionScroll
+}
+
+const guiGeomHelpers = `xops_wh() { W=$(printf '%s' "$1" | awk -F"$2" 'NF>=2&&$1+0>0&&$2+0>0{print int($1);exit}'); H=$(printf '%s' "$1" | awk -F"$2" 'NF>=2&&$1+0>0&&$2+0>0{print int($2);exit}'); }
+xops_geom() {
+  W=''; H=''
+  if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wlr-randr >/dev/null 2>&1; then xops_wh "$(wlr-randr 2>/dev/null | awk '/current/{print $1;exit}')" x; fi
+  [ -z "$W" ] || [ -z "$H" ] && xops_wh "$(xdotool getdisplaygeometry 2>/dev/null || true)" ' '
+  if [ -z "$W" ] || [ -z "$H" ]; then D=$(xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2;exit}'); [ -z "$D" ] && D=$(xrandr --current 2>/dev/null | awk '/\*/{print $1;exit}'); xops_wh "$D" x; fi
+  RES_W=${W:-1920}; RES_H=${H:-1080}
+}
+xops_px() { V=$(( $1 * $2 / 1000 )); [ "$V" -ge "$2" ] && V=$(( $2 - 1 )); [ "$V" -lt 0 ] && V=0; printf '%d' "$V"; }
+xops_geom
+`
+
+func writeGUIGeometryHelpers(b *strings.Builder) { b.WriteString(guiGeomHelpers) }
 
 func writeGUIDisplayEnv(b *strings.Builder, spec GUIActionSpec) error {
 	if spec.Display != "" {
@@ -173,52 +188,76 @@ func writeGUIDisplayEnv(b *strings.Builder, spec GUIActionSpec) error {
 	return nil
 }
 
+func writeGUIInputDispatch(b *strings.Builder, waylandCmd, x11Cmd string) {
+	fmt.Fprintf(b, "if [ -n \"${WAYLAND_DISPLAY:-}\" ] && command -v ydotool >/dev/null 2>&1; then\n  %s\nelif command -v xdotool >/dev/null 2>&1; then\n  %s\nelse\n  echo 'no gui input tool available' >&2; exit 127\nfi\n", waylandCmd, x11Cmd)
+}
+
 func writeGUIActionBody(b *strings.Builder, spec GUIActionSpec) error {
 	switch spec.Action {
 	case GUIActionScreenshot:
 		return nil
 	case GUIActionClick, GUIActionDoubleClick, GUIActionRightClick, GUIActionMove:
-		fmt.Fprintf(b, "xdotool mousemove --sync %d %d\n", spec.X, spec.Y)
-		writePointerClick(b, spec.Action)
+		fmt.Fprintf(b, "PX=$(xops_px %d \"$RES_W\"); PY=$(xops_px %d \"$RES_H\")\n", spec.X, spec.Y)
+		wl, x11 := pointerActionCmds(spec.Action)
+		writeGUIInputDispatch(b, wl, x11)
 		return nil
 	case GUIActionDrag:
-		fmt.Fprintf(b, "xdotool mousemove --sync %d %d mousedown 1 mousemove --sync %d %d mouseup 1\n", spec.StartX, spec.StartY, spec.EndX, spec.EndY)
+		fmt.Fprintf(b, "SX=$(xops_px %d \"$RES_W\"); SY=$(xops_px %d \"$RES_H\"); EX=$(xops_px %d \"$RES_W\"); EY=$(xops_px %d \"$RES_H\")\n", spec.StartX, spec.StartY, spec.EndX, spec.EndY)
+		writeGUIInputDispatch(b,
+			`ydotool mousemove -a -x "$SX" -y "$SY" && ydotool click 0x40 && ydotool mousemove -a -x "$EX" -y "$EY" && ydotool click 0x80`,
+			`xdotool mousemove --sync "$SX" "$SY" mousedown 1 mousemove --sync "$EX" "$EY" mouseup 1`)
 		return nil
 	case GUIActionScroll:
 		clicks := pickIf(spec.Clicks == 0, 3, spec.Clicks)
-		fmt.Fprintf(b, "xdotool mousemove --sync %d %d click --repeat %d %d\n", spec.X, spec.Y, clicks, mapScrollButton(spec.Direction))
+		dx, dy, btn := scrollActionArgs(spec.Direction, clicks)
+		fmt.Fprintf(b, "PX=$(xops_px %d \"$RES_W\"); PY=$(xops_px %d \"$RES_H\")\n", spec.X, spec.Y)
+		writeGUIInputDispatch(b,
+			fmt.Sprintf(`ydotool mousemove -a -x "$PX" -y "$PY" && ydotool mousemove -w -x %d -y %d`, dx, dy),
+			fmt.Sprintf(`xdotool mousemove --sync "$PX" "$PY" click --repeat %d %d`, clicks, btn))
 		return nil
 	case GUIActionType:
 		q, err := execution.QuotePOSIX(spec.Text)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(b, "xdotool type --clearmodifiers -- %s\n", q)
+		writeGUIInputDispatch(b, "ydotool type -- "+q, "xdotool type --clearmodifiers -- "+q)
 		return nil
 	case GUIActionKey:
 		q, err := execution.QuotePOSIX(spec.Key)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(b, "xdotool key --clearmodifiers -- %s\n", q)
+		writeGUIInputDispatch(b, "ydotool key -- "+q, "xdotool key --clearmodifiers -- "+q)
 		return nil
 	default:
 		return ErrInvalidGUIInput
 	}
 }
 
-func writePointerClick(b *strings.Builder, act GUIActionKind) {
+func pointerActionCmds(act GUIActionKind) (wl, x11 string) {
 	switch act {
 	case GUIActionClick:
-		b.WriteString("xdotool click 1\n")
+		return `ydotool mousemove -a -x "$PX" -y "$PY" && ydotool click 0xC0`, `xdotool mousemove --sync "$PX" "$PY" click 1`
 	case GUIActionDoubleClick:
-		b.WriteString("xdotool click --repeat 2 1\n")
+		return `ydotool mousemove -a -x "$PX" -y "$PY" && ydotool click --repeat 2 0xC0`, `xdotool mousemove --sync "$PX" "$PY" click --repeat 2 1`
 	case GUIActionRightClick:
-		b.WriteString("xdotool click 3\n")
+		return `ydotool mousemove -a -x "$PX" -y "$PY" && ydotool click 0xC1`, `xdotool mousemove --sync "$PX" "$PY" click 3`
+	default:
+		return `ydotool mousemove -a -x "$PX" -y "$PY"`, `xdotool mousemove --sync "$PX" "$PY"`
 	}
 }
-func mapScrollButton(dir ScrollDirection) int {
-	return pickIf(dir >= ScrollUp && dir <= ScrollRight, int(dir)+3, 5)
+
+func scrollActionArgs(dir ScrollDirection, clicks int) (dx, dy, btn int) {
+	switch dir {
+	case ScrollUp:
+		return 0, clicks, 4
+	case ScrollDown:
+		return 0, -clicks, 5
+	case ScrollLeft:
+		return -clicks, 0, 6
+	default:
+		return clicks, 0, 7
+	}
 }
 func writeGUIScreenshotSnippet(b *strings.Builder) error {
 	qStart, e1 := execution.QuotePOSIX(screenshotStartMarker)
@@ -235,17 +274,19 @@ func writeGUIScreenshotSnippet(b *strings.Builder) error {
 // 支持纯 Go 截图压缩与可选 ScopedRootFS 产物落盘（物理 0 OperatorReadFS 依赖，供 MCP gui 安全复用）。
 func (s *Service) ExecuteGUI(ctx context.Context, req GUIExecRequest) (GUIExecResult, error) {
 	defer closeStream(req.OperationStream)
-	targetHop, explicitProf, hasProf, script, err := s.validateGUIExecRequest(ctx, req)
+	prep, err := s.validateGUIExecRequest(ctx, req)
 	if err != nil {
 		return GUIExecResult{}, err
 	}
-	nodeID := resolveNodeID(targetHop, req.NodeID)
-	gateReq, err := buildGUIGateRequest(req, targetHop, nodeID, script)
+	nodeID := resolveNodeID(prep.hop, req.NodeID)
+	gateReq, err := buildGUIGateRequest(req, prep.hop, nodeID, prep.script)
 	if err != nil {
 		return GUIExecResult{}, err
 	}
 	startedAt := s.clock.Now().UTC().Round(0)
-	var stdoutRaw, stderrRaw []byte
+	hasShot := req.Spec.Action == GUIActionScreenshot || req.Spec.IncludeShot
+	var stdoutClean string
+	var stderrRaw []byte
 	var shotOpt algebraic.Option[ProcessedScreenshot]
 	var savedArt algebraic.Option[pathalg.LocalRootedDest]
 
@@ -253,17 +294,19 @@ func (s *Service) ExecuteGUI(ctx context.Context, req GUIExecRequest) (GUIExecRe
 		func(authCtx context.Context, _ security.OperationBinding, emitter *obsEmitter) (execution.ExecutionOutcome, error) {
 			runCtx, cancel := applyOptionalTimeout(authCtx, req.Timeout)
 			defer cancel()
-			outTee := &boundedOutputTee{ctx: runCtx, emitter: emitter, kind: events.OutputStreamStdout, limit: maxGUIScriptCaptureBytes}
+			// 含截图采集时静默 stdout 分片发射，避免数十 MB 原始 Base64 灌爆 OperationStream 通道。
+			outTee := &boundedOutputTee{ctx: runCtx, emitter: pickIf[*obsEmitter](hasShot, nil, emitter), kind: events.OutputStreamStdout, limit: maxGUIScriptCaptureBytes}
 			errTee := &boundedOutputTee{ctx: runCtx, emitter: emitter, kind: events.OutputStreamStderr, limit: defaultLogMaxBytes}
 			buildCmd := func(prof execution.LaunchProfile) (execution.CommandPlan, error) {
 				return execution.NewCommandPlan(execution.CommandPlanSpec{
-					Kind: execution.PlanKindCommand, Profile: prof, Command: script,
+					Kind: execution.PlanKindCommand, Profile: prof, Command: prep.script,
 					MaxOutputBytes: algebraic.Some(min(uint64(maxGUIScriptCaptureBytes), execution.MaxAllowedOutputBytes)),
 				})
 			}
-			execOut, execErr := s.execPOSIXInLease(runCtx, req.Plan, targetHop, explicitProf, hasProf, nil, buildCmd, outTee, errTee)
-			stdoutRaw, _ = outTee.snapshot()
+			execOut, execErr := s.execPOSIXInLease(runCtx, req.Plan, prep.hop, prep.prof, prep.hasProf, nil, buildCmd, outTee, errTee)
+			stdoutRaw, _ := outTee.snapshot()
 			stderrRaw, _ = errTee.snapshot()
+			stdoutClean = pickIf(hasShot, stripMarkedPayload(string(stdoutRaw)), string(stdoutRaw))
 			if execErr != nil || !isOutcomeSucceeded(execOut) {
 				return execOut, execErr
 			}
@@ -275,8 +318,7 @@ func (s *Service) ExecuteGUI(ctx context.Context, req GUIExecRequest) (GUIExecRe
 	}
 	return GUIExecResult{
 		action: req.Spec.Action, outcome: out, screenshot: shotOpt, artifact: savedArt,
-		stdout: string(stdoutRaw), stderr: string(stderrRaw),
-		duration: algebraic.FromStdDuration(max(s.clock.Since(startedAt), 0)), valid: out != nil && out.IsValid(),
+		stdout: stdoutClean, stderr: string(stderrRaw), duration: s.elapsed(startedAt), valid: out != nil && out.IsValid(),
 	}, gateErr
 }
 
@@ -289,41 +331,38 @@ func (s *Service) maybeProcessGUIShot(req GUIExecRequest, stdoutRaw []byte) (alg
 	if err != nil {
 		return noneShot, noneArt, err
 	}
-	art, hasArt := req.Artifact.Get()
-	if !hasArt {
-		return algebraic.Some(shot), noneArt, nil
+	if art, hasArt := req.Artifact.Get(); hasArt {
+		if wErr := s.saveGUIArtifact(art, shot.Data); wErr != nil {
+			return algebraic.Some(shot), noneArt, wErr
+		}
+		return algebraic.Some(shot), algebraic.Some(art.File), nil
 	}
-	if wErr := s.saveGUIArtifact(art, shot.Data); wErr != nil {
-		return algebraic.Some(shot), noneArt, wErr
-	}
-	return algebraic.Some(shot), algebraic.Some(art.File), nil
+	return algebraic.Some(shot), noneArt, nil
 }
 
-func (s *Service) validateGUIExecRequest(ctx context.Context, req GUIExecRequest) (plan.HopSpec, execution.LaunchProfile, bool, string, error) {
-	hop, err := s.validatePlanCall(ctx, req.Plan, req.Risk)
+type guiExecPrepared struct {
+	posixCallBase
+	script string
+}
+
+func (s *Service) validateGUIExecRequest(ctx context.Context, req GUIExecRequest) (guiExecPrepared, error) {
+	base, err := s.validatePOSIXCall(ctx, req.Plan, req.Risk, req.Profile, req.Timeout)
 	if err != nil {
-		return zeroVal[plan.HopSpec](), zeroVal[execution.LaunchProfile](), false, "", err
-	}
-	prof, hasProf, err := validateRequestedPOSIXProfile(req.Profile)
-	if err != nil {
-		return zeroVal[plan.HopSpec](), zeroVal[execution.LaunchProfile](), false, "", err
-	}
-	if d, ok := req.Timeout.Get(); ok && !d.IsPositive() {
-		return zeroVal[plan.HopSpec](), zeroVal[execution.LaunchProfile](), false, "", fmt.Errorf("%w: Timeout 必须为正时长", ErrInvalidRequest)
+		return guiExecPrepared{}, err
 	}
 	if art, hasArt := req.Artifact.Get(); hasArt {
 		if !art.RootDir.IsValid() || !art.File.IsValid() {
-			return zeroVal[plan.HopSpec](), zeroVal[execution.LaunchProfile](), false, "", fmt.Errorf("%w: Artifact 路径无效", ErrInvalidRequest)
+			return guiExecPrepared{}, fmt.Errorf("%w: Artifact 路径无效", ErrInvalidRequest)
 		}
 		if s.scopedFS == nil {
-			return zeroVal[plan.HopSpec](), zeroVal[execution.LaunchProfile](), false, "", ErrScopedFSUnavailable
+			return guiExecPrepared{}, ErrScopedFSUnavailable
 		}
 	}
 	script, err := BuildGUIScript(req.Spec)
 	if err != nil {
-		return zeroVal[plan.HopSpec](), zeroVal[execution.LaunchProfile](), false, "", err
+		return guiExecPrepared{}, err
 	}
-	return hop, prof, hasProf, script, nil
+	return guiExecPrepared{posixCallBase: base, script: script}, nil
 }
 
 func defaultGUIRisk(spec GUIActionSpec) security.RiskLevel {
@@ -336,33 +375,38 @@ func defaultGUIRisk(spec GUIActionSpec) security.RiskLevel {
 		return security.RiskModerate
 	}
 }
-
 func buildGUIGateRequest(req GUIExecRequest, hop plan.HopSpec, nodeID, script string) (gate.GateRequest[security.CapExecute], error) {
 	cmdDigest := security.DigestFromSHA256(sha256.Sum256([]byte("xops.observability.gui_script.v1\x00" + script)))
-	params := map[string]string{
-		"action":       req.Spec.Action.String(),
-		"display":      pickIf(req.Spec.Display != "", req.Spec.Display, ":0"),
-		"include_shot": strconv.FormatBool(req.Spec.IncludeShot),
-	}
+	return newObsGateReq[security.CapExecute](security.OperationBindingSpec{
+		Capability: security.CapabilityExecute, Tool: toolObservability, Action: "gui_" + req.Spec.Action.String(),
+		NodeID: nodeID, Endpoint: algebraic.Some(hop.Endpoint()), CommandDigest: algebraic.Some(cmdDigest),
+		PlanDigest: algebraic.Some(req.Plan.PlanDigest().SecurityDigest()), Parameters: buildGUIBindingParams(req),
+	}, req.Risk.OrElse(defaultGUIRisk(req.Spec)), buildGUIScopeSummary(req, nodeID), nil, nil, req.Approval, req.OperationStream)
+}
+func buildGUIBindingParams(req GUIExecRequest) map[string]string {
+	params := map[string]string{"action": req.Spec.Action.String(), "display": pickIf(req.Spec.Display != "", req.Spec.Display, ":0"), "include_shot": strconv.FormatBool(req.Spec.IncludeShot)}
 	if req.Spec.WaylandDisplay != "" {
 		params["wayland_display"] = req.Spec.WaylandDisplay
 	}
-	// type 与 key 动作明文纳入操作绑定与审批摘要，杜绝盲审注入按键或口令文本。
-	if req.Spec.Action == GUIActionType {
-		params["text"] = req.Spec.Text
+	if art, ok := req.Artifact.Get(); ok {
+		params["artifact_root"], params["artifact_file"] = art.RootDir.String(), art.File.String()
 	}
-	if req.Spec.Action == GUIActionKey {
+	// 全部动作坐标、按键、文本与落盘目标均纳入操作绑定，彻底杜绝两步审批参数篡改。
+	switch req.Spec.Action {
+	case GUIActionClick, GUIActionDoubleClick, GUIActionRightClick, GUIActionMove:
+		params["x"], params["y"] = strconv.Itoa(req.Spec.X), strconv.Itoa(req.Spec.Y)
+	case GUIActionDrag:
+		params["start_x"], params["start_y"], params["end_x"], params["end_y"] = strconv.Itoa(req.Spec.StartX), strconv.Itoa(req.Spec.StartY), strconv.Itoa(req.Spec.EndX), strconv.Itoa(req.Spec.EndY)
+	case GUIActionScroll:
+		params["x"], params["y"], params["direction"], params["clicks"] = strconv.Itoa(req.Spec.X), strconv.Itoa(req.Spec.Y), req.Spec.Direction.String(), strconv.Itoa(pickIf(req.Spec.Clicks == 0, 3, req.Spec.Clicks))
+	case GUIActionType:
+		params["text"] = req.Spec.Text
+	case GUIActionKey:
 		params["key"] = req.Spec.Key
 	}
-	binding, err := security.NewOperationBinding(security.OperationBindingSpec{
-		Capability: security.CapabilityExecute, Tool: toolObservability, Action: "gui_" + req.Spec.Action.String(),
-		NodeID: nodeID, Endpoint: algebraic.Some(hop.Endpoint()),
-		CommandDigest: algebraic.Some(cmdDigest), PlanDigest: algebraic.Some(req.Plan.PlanDigest().SecurityDigest()),
-		Parameters: params,
-	})
-	if err != nil {
-		return zeroVal[gate.GateRequest[security.CapExecute]](), err
-	}
+	return params
+}
+func buildGUIScopeSummary(req GUIExecRequest, nodeID string) string {
 	summary := fmt.Sprintf("gui %s on %s", req.Spec.Action, nodeID)
 	switch req.Spec.Action {
 	case GUIActionType:
@@ -370,24 +414,19 @@ func buildGUIGateRequest(req GUIExecRequest, hop plan.HopSpec, nodeID, script st
 	case GUIActionKey:
 		summary = fmt.Sprintf("gui key %s on %s", req.Spec.Key, nodeID)
 	}
-	return gate.NewGateRequest[security.CapExecute](gate.GateRequestSpec[security.CapExecute]{
-		Binding: binding, Risk: req.Risk.OrElse(defaultGUIRisk(req.Spec)),
-		ScopeSummary: summary, Approval: req.Approval, OperationStream: req.OperationStream,
-	})
+	if art, ok := req.Artifact.Get(); ok {
+		summary += " -> " + art.File.String()
+	}
+	return summary
 }
-
 func (s *Service) saveGUIArtifact(art GUIArtifactDest, data []byte) error {
-	if err := s.scopedFS.EnsureRoot(art.RootDir, defaultArtifactDirPerm); err != nil {
+	if err := s.scopedFS.EnsureRoot(art.RootDir, 0o700); err != nil {
 		return err
 	}
 	return s.scopedFS.WithRoot(art.RootDir, func(root ports.RootHandle) error {
-		return root.AtomicReplace(art.File, defaultArtifactFilePerm, func(w io.Writer) error {
-			_, err := w.Write(data)
-			return err
-		})
+		return root.AtomicReplace(art.File, 0o600, func(w io.Writer) error { _, err := w.Write(data); return err })
 	})
 }
-
 func isOutcomeSucceeded(out execution.ExecutionOutcome) bool {
 	c, ok := out.(*execution.OutcomeCompleted)
 	return ok && c.Succeeded()

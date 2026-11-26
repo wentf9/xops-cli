@@ -19,21 +19,24 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/playbook"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
-	"github.com/wentf9/xops-cli/core/internal/pool"
 )
 
 type playbookPathInventory struct {
 	lexicalPaths []string
-	writeDests   []pathalg.RemotePath
+	nodePaths    map[inventory.NodeID][]pathalg.RemotePath
+	hasProbePath bool
+	hasFileWrite bool
 }
 
 type playbookPrepared struct {
-	targets     []TargetNode
-	concurrency int
-	vars        map[string]string
-	varsDigest  security.Digest
-	paths       playbookPathInventory
-	defProfile  execution.LaunchProfile
+	targets          []TargetNode
+	concurrency      int
+	vars             map[string]string
+	varsDigest       security.Digest
+	paths            playbookPathInventory
+	defProfile       execution.LaunchProfile
+	scopedSourceRoot algebraic.Option[pathalg.LocalDir]
+	timeout          algebraic.Option[algebraic.Duration]
 }
 
 // RunPlaybook 执行声明式 Playbook vNext 不可变 AST（P3-T4）：
@@ -77,17 +80,19 @@ func (s *Service) validateAndPreparePlaybook(ctx context.Context, req PlaybookRe
 		return playbookPrepared{}, err
 	}
 	vars := mergeStringMaps(req.Playbook.Vars(), req.ExtraVars)
-	paths, err := collectPlaybookRemotePaths(req.Playbook)
+	paths, err := collectPlaybookRemotePaths(req.Playbook, targets)
 	if err != nil {
 		return playbookPrepared{}, err
 	}
 	return playbookPrepared{
-		targets:     targets,
-		concurrency: concurrency,
-		vars:        vars,
-		varsDigest:  digestStringMap(varsDigestDomainTag, vars),
-		paths:       paths,
-		defProfile:  req.DefaultProfile.OrElse(execution.DefaultServerLaunchProfile()),
+		targets:          targets,
+		concurrency:      concurrency,
+		vars:             vars,
+		varsDigest:       digestStringMap(varsDigestDomainTag, vars),
+		paths:            paths,
+		defProfile:       req.DefaultProfile.OrElse(execution.DefaultServerLaunchProfile()),
+		scopedSourceRoot: req.ScopedSourceRoot,
+		timeout:          req.Timeout,
 	}, nil
 }
 
@@ -123,7 +128,7 @@ func (s *Service) buildPlaybookGateRequest(req PlaybookRequest, prep playbookPre
 		return zeroVal[gate.GateRequest[security.CapExecute]](), err
 	}
 	var canonFn gate.CanonicalizeFunc
-	if s.enforceStrictPaths() && len(prep.paths.writeDests) > 0 {
+	if s.enforceStrictPaths() && prep.paths.hasProbePath {
 		canonFn = s.makePlaybookCanonicalizer(req.Playbook, prep)
 	}
 	return gate.NewGateRequest[security.CapExecute](gate.GateRequestSpec[security.CapExecute]{
@@ -140,28 +145,42 @@ func (s *Service) buildPlaybookGateRequest(req PlaybookRequest, prep playbookPre
 func buildPlaybookBinding(pb playbook.Playbook, prep playbookPrepared, paths []string) (security.OperationBinding, error) {
 	nodeIDs := extractNodeIDStrings(prep.targets)
 	singleNode, singleEP := singleTargetMeta(prep.targets, nodeIDs)
+	params := map[string]string{
+		"playbook_id":        pb.ID().String(),
+		"playbook_digest":    pb.Digest().String(),
+		"on_error":           pb.OnError().String(),
+		"vars_digest":        prep.varsDigest.String(),
+		"step_count":         strconv.Itoa(pb.Steps().Len()),
+		"has_file_write":     strconv.FormatBool(prep.paths.hasFileWrite),
+		"concurrency":        strconv.Itoa(prep.concurrency),
+		"default_profile":    formatLaunchProfile(prep.defProfile),
+		"scoped_source_mode": "operator",
+	}
+	if root, ok := prep.scopedSourceRoot.Get(); ok {
+		params["scoped_source_mode"] = "scoped"
+		params["scoped_source_root"] = root.String()
+	}
+	if d, ok := prep.timeout.Get(); ok {
+		params["timeout"] = d.String()
+	}
 	return security.NewOperationBinding(security.OperationBindingSpec{
 		Capability: security.CapabilityExecute, Tool: toolAutomation, Action: "playbook",
 		NodeID: singleNode, NodeIDs: nodeIDs, Endpoint: singleEP, CanonicalPaths: paths,
 		CommandDigest: algebraic.Some(pb.Digest()), PlanDigest: algebraic.Some(digestTargetPlans(prep.targets)),
-		Parameters: map[string]string{
-			"playbook_id": pb.ID().String(), "playbook_digest": pb.Digest().String(),
-			"on_error": pb.OnError().String(), "vars_digest": prep.varsDigest.String(),
-			"step_count": strconv.Itoa(pb.Steps().Len()), "has_file_write": strconv.FormatBool(len(prep.paths.writeDests) > 0),
-		},
+		Parameters: params,
 	})
 }
 
-// makePlaybookCanonicalizer 为非 DirectOperator 下的 Playbook copy/template 写目标执行 Round-2 软链规范化探测，
-// 取全部目标节点规范路径的单调并集，使任一节点将路径重定向至受保护路径时均被 ApprovalFSM 捕获并拦截或升级审批。
+// makePlaybookCanonicalizer 为非 DirectOperator 下按节点标签实际命中的 copy/template 写目标与 WorkDir 执行 Round-2 软链规范化探测，
+// 仅探测各节点实际匹配的远端路径并取单调并集，避免跨标签误探同时杜绝受保护路径软链绕过。
 func (s *Service) makePlaybookCanonicalizer(pb playbook.Playbook, prep playbookPrepared) gate.CanonicalizeFunc {
 	return func(ctx context.Context) (gate.CanonicalizeResult, error) {
-		pathSet := make(map[string]struct{}, len(prep.paths.lexicalPaths)+len(prep.paths.writeDests))
+		pathSet := make(map[string]struct{}, len(prep.paths.lexicalPaths))
 		for _, p := range prep.paths.lexicalPaths {
 			pathSet[p] = struct{}{}
 		}
 		for _, target := range prep.targets {
-			if err := s.canonicalizeNodeWriteDests(ctx, target.plan, prep.paths.writeDests, pathSet); err != nil {
+			if err := s.canonicalizeNodeRemotePaths(ctx, target.plan, prep.paths.nodePaths[target.nodeID], pathSet); err != nil {
 				return gate.CanonicalizeResult{}, err
 			}
 		}
@@ -172,24 +191,6 @@ func (s *Service) makePlaybookCanonicalizer(pb playbook.Playbook, prep playbookP
 		}
 		return gate.CanonicalizeResult{Binding: canBind, Paths: allPaths}, nil
 	}
-}
-
-func (s *Service) canonicalizeNodeWriteDests(ctx context.Context, connPlan plan.SealedConnectionPlan, dests []pathalg.RemotePath, out map[string]struct{}) error {
-	return s.pool.WithLease(ctx, connPlan, func(leaseCtx context.Context, lease *pool.Lease) error {
-		rfs, err := lease.OpenRemoteFS(leaseCtx)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = rfs.Close() }()
-		for _, dest := range dests {
-			canon, err := resolveCanonicalRemotePath(leaseCtx, rfs, dest)
-			if err != nil {
-				return err
-			}
-			out[canon.String()] = struct{}{}
-		}
-		return nil
-	})
 }
 
 func (s *Service) executeAuthorizedPlaybook(
@@ -240,7 +241,7 @@ func (s *Service) executeAuthorizedPlaybook(
 		if firstUnknown != nil {
 			_ = auth.ReportOutcome(firstUnknown)
 		}
-		return classifyPlaybookRunError(result, firstUnknown, runErr)
+		return classifyPlaybookRunError(result, firstUnknown, runErr, s.gate.IsHalted())
 	})
 	panicked = false
 	return result, gateErr
@@ -278,13 +279,11 @@ func (rc *playbookRunContext) runAllNodes(ctx context.Context) ([]playbook.StepE
 		jobsCh <- job
 	}
 	close(jobsCh)
-
 	var recMu sync.Mutex
 	completedNodes := make(map[inventory.NodeID]bool, len(jobs))
 	allRecords := make([]playbook.StepExecutionRecord, 0, len(jobs)*len(steps))
 	runCtx, cancelRun := context.WithCancelCause(ctx)
 	defer cancelRun(nil)
-
 	runErr := conc.RunWait(runCtx, func(_ context.Context, n *conc.Nursery) error {
 		for range min(rc.prep.concurrency, len(jobs)) {
 			if gErr := n.Go(func(workerCtx context.Context) error {
@@ -306,14 +305,8 @@ func (rc *playbookRunContext) runAllNodes(ctx context.Context) ([]playbook.StepE
 	return allRecords, rc.aborted.Load(), runErr
 }
 
-func (rc *playbookRunContext) backfillMissingNodeRecords(
-	ctx context.Context,
-	records []playbook.StepExecutionRecord,
-	completed map[inventory.NodeID]bool,
-	steps []playbook.Step,
-	runErr error,
-) []playbook.StepExecutionRecord {
-	reason := abortReasonForContext(rc.svc.gate.IsHalted(), rc.aborted.Load(), firstErr(runErr, ctx.Err()))
+func (rc *playbookRunContext) backfillMissingNodeRecords(ctx context.Context, records []playbook.StepExecutionRecord, completed map[inventory.NodeID]bool, steps []playbook.Step, runErr error) []playbook.StepExecutionRecord {
+	reason := abortReasonForContext(rc.svc.gate.IsHalted(), rc.aborted.Load(), firstErr(runErr, context.Cause(ctx), ctx.Err()))
 	for _, target := range rc.prep.targets {
 		if completed[target.nodeID] {
 			continue
@@ -367,11 +360,24 @@ func (rc *playbookRunContext) executeNodeSteps(ctx context.Context, target Targe
 		rec := rc.executeSingleStep(ctx, target, st, nodeEmitter)
 		records = append(records, rec)
 		rc.emitStepToBoth(ctx, nodeEmitter, rec)
-		if rec.Status() == playbook.StepStatusFailed || rec.Status() == playbook.StepStatusOutcomeUnknown {
+		// OutcomeUnknown 严禁在 OnErrorContinue 下继续向不确定主机执行后续变更（ADR-016）：
+		// 除 OnErrorAbort 升级为全盘中止外，均强制停止当前节点后续步骤且不影响独立兄弟节点。
+		if rec.Status() == playbook.StepStatusOutcomeUnknown {
+			nodeStopped, stopReason = rc.applyUnknownOutcomeStop(rc.req.Playbook.EffectiveOnError(st), st.ID(), cancelRun)
+		} else if rec.Status() == playbook.StepStatusFailed {
 			nodeStopped, stopReason = rc.applyOnErrorPolicy(rc.req.Playbook.EffectiveOnError(st), st.ID(), cancelRun)
 		}
 	}
 	return records
+}
+
+func (rc *playbookRunContext) applyUnknownOutcomeStop(pol playbook.OnErrorPolicy, stepID playbook.StepID, cancelRun context.CancelCauseFunc) (bool, string) {
+	if pol == playbook.OnErrorAbort {
+		rc.aborted.Store(true)
+		cancelRun(ErrPlaybookAborted)
+		return true, fmt.Sprintf("playbook aborted after step %s outcome_unknown", stepID)
+	}
+	return true, fmt.Sprintf("aborted after step %s outcome_unknown (halted uncertain node)", stepID)
 }
 
 func (rc *playbookRunContext) applyOnErrorPolicy(pol playbook.OnErrorPolicy, stepID playbook.StepID, cancelRun context.CancelCauseFunc) (bool, string) {
@@ -404,16 +410,21 @@ func findFirstUnknownPlaybookOutcome(records []playbook.StepExecutionRecord) exe
 	return nil
 }
 
-func classifyPlaybookRunError(res PlaybookRunResult, firstUnknown execution.ExecutionOutcome, runErr error) error {
+func classifyPlaybookRunError(res PlaybookRunResult, firstUnknown execution.ExecutionOutcome, runErr error, halted bool) error {
 	if firstUnknown != nil {
 		cause := ErrUncertainOutcome
-		if runErr != nil && !errors.Is(runErr, ErrUncertainOutcome) {
+		if halted {
+			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, gate.ErrGateHalted)
+		} else if runErr != nil && !errors.Is(runErr, ErrUncertainOutcome) {
 			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr)
 		}
 		if wrapped, err := gate.WrapOutcomeError(firstUnknown, cause); err == nil {
 			return wrapped
 		}
 		return cause
+	}
+	if halted && !errors.Is(runErr, gate.ErrGateHalted) {
+		return pickIf[error](runErr != nil, fmt.Errorf("%w: %w", gate.ErrGateHalted, runErr), gate.ErrGateHalted)
 	}
 	if runErr != nil {
 		return runErr

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/playbook"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -43,42 +45,26 @@ type streamEmitter struct {
 	seq, stdoutSeq, stderrSeq atomic.Uint64
 }
 
-func newStreamEmitter(
-	stream *events.OperationStream,
-	clock ports.Clock,
-	traceID security.TraceID,
-	opID security.OperationID,
-	nodeID algebraic.Option[inventory.NodeID],
-	capKind security.CapabilityKind,
-) *streamEmitter {
+func newStreamEmitter(stream *events.OperationStream, clock ports.Clock, traceID security.TraceID, opID security.OperationID, nodeID algebraic.Option[inventory.NodeID], capKind security.CapabilityKind) *streamEmitter {
 	if stream == nil || clock == nil {
 		return nil
 	}
 	// 当流自身已绑定独立 TraceID/OperationID 时以流绑定标识为准，避免跨流 ID 失配导致静默丢弃。
 	if stream.TraceID().IsValid() && stream.OperationID().IsValid() {
-		traceID = stream.TraceID()
-		opID = stream.OperationID()
+		traceID, opID = stream.TraceID(), stream.OperationID()
 	}
-	return &streamEmitter{
-		stream: stream, clock: clock, traceID: traceID, opID: opID,
-		nodeID: nodeID, capability: capKind,
-	}
+	return &streamEmitter{stream: stream, clock: clock, traceID: traceID, opID: opID, nodeID: nodeID, capability: capKind}
 }
 
-func (e *streamEmitter) active() bool {
-	return e != nil && e.stream != nil && !e.stream.IsClosed()
-}
+func (e *streamEmitter) active() bool { return e != nil && e.stream != nil && !e.stream.IsClosed() }
 
 func (e *streamEmitter) nextMeta(nodeOpt algebraic.Option[inventory.NodeID]) (events.EventMeta, error) {
 	if !e.active() {
 		return zeroVal[events.EventMeta](), ports.ErrClosed
 	}
 	return events.NewEventMeta(events.EventMetaSpec{
-		TraceID:     e.traceID,
-		OperationID: algebraic.Some(e.opID),
-		OccurredAt:  e.clock.Now().UTC().Round(0),
-		Seq:         e.seq.Add(1),
-		NodeID:      nodeOpt,
+		TraceID: e.traceID, OperationID: algebraic.Some(e.opID),
+		OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: nodeOpt,
 	})
 }
 
@@ -136,13 +122,7 @@ func (e *streamEmitter) emitStep(ctx context.Context, pbID playbook.PlaybookID, 
 	}
 }
 
-func (e *streamEmitter) emitEnsureTransition(
-	ctx context.Context,
-	nodeID inventory.NodeID,
-	from, to fsm.EnsurePhase,
-	evs []fsm.EnsureEvent,
-	terminal bool,
-) {
+func (e *streamEmitter) emitEnsureTransition(ctx context.Context, nodeID inventory.NodeID, from, to fsm.EnsurePhase, evs []fsm.EnsureEvent, terminal bool) {
 	if !e.active() || len(evs) == 0 {
 		return
 	}
@@ -157,13 +137,7 @@ func (e *streamEmitter) emitEnsureTransition(
 	}
 }
 
-func (e *streamEmitter) emitCompleted(
-	ctx context.Context,
-	startedAt time.Time,
-	outcome execution.ExecutionOutcome,
-	succeeded bool,
-	code, msg string,
-) {
+func (e *streamEmitter) emitCompleted(ctx context.Context, startedAt time.Time, outcome execution.ExecutionOutcome, succeeded bool, code, msg string) {
 	if !e.active() {
 		return
 	}
@@ -174,11 +148,8 @@ func (e *streamEmitter) emitCompleted(
 	outOpt, finalOK, finalCode := normalizeCompletedFields(outcome, succeeded, code)
 	ev, err := events.NewOperationCompletedEvent(events.OperationCompletedSpec{
 		Meta: meta, Capability: e.capability,
-		Duration:  algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)),
-		Outcome:   outOpt,
-		Succeeded: finalOK,
-		Code:      finalCode,
-		Message:   msg,
+		Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)),
+		Outcome:  outOpt, Succeeded: finalOK, Code: finalCode, Message: msg,
 	})
 	if err != nil {
 		return
@@ -188,11 +159,7 @@ func (e *streamEmitter) emitCompleted(
 	_ = e.stream.Emit(emitCtx, ev)
 }
 
-func normalizeCompletedFields(
-	outcome execution.ExecutionOutcome,
-	succeeded bool,
-	code string,
-) (algebraic.Option[execution.ExecutionOutcome], bool, string) {
+func normalizeCompletedFields(outcome execution.ExecutionOutcome, succeeded bool, code string) (algebraic.Option[execution.ExecutionOutcome], bool, string) {
 	if outcome == nil || !outcome.IsValid() {
 		return algebraic.None[execution.ExecutionOutcome](), succeeded, sanitizeEventCode(code)
 	}
@@ -299,4 +266,108 @@ func applyOptionalTimeout(ctx context.Context, durOpt algebraic.Option[algebraic
 		return context.WithTimeout(ctx, d.Std())
 	}
 	return ctx, func() {}
+}
+
+func fillMissingBatchResults(targets []TargetNode, results []BatchNodeResult, ctx context.Context, runErr error, halted bool) {
+	fallbackErr := firstErr(runErr, context.Cause(ctx), ctx.Err(), ErrBatchFailed)
+	if halted && !errors.Is(fallbackErr, gate.ErrGateHalted) {
+		fallbackErr = gate.ErrGateHalted
+	}
+	phase := pickIf(halted, execution.StartPhaseAuthorize, execution.StartPhaseValidate)
+	code := pickIf(halted, "gate_halted", "batch_aborted")
+	for i, target := range targets {
+		if !results[i].IsValid() {
+			results[i] = makeNotStartedBatchResult(target.nodeID, phase, code, fallbackErr, 0)
+		}
+	}
+}
+
+func foldBatchExecReport(results []BatchNodeResult, dur algebraic.Duration) BatchExecReport {
+	var okCnt, failCnt, unkCnt, notStartedCnt int
+	for _, r := range results {
+		switch {
+		case r.IsOutcomeUnknown():
+			unkCnt++
+		case r.Succeeded():
+			okCnt++
+		case r.IsNotStarted():
+			notStartedCnt++
+			failCnt++
+		default:
+			failCnt++
+		}
+	}
+	return BatchExecReport{
+		results: results, succeededCount: okCnt, failedCount: failCnt,
+		unknownCount: unkCnt, notStartedCount: notStartedCnt,
+		hasUnknownOutcome: unkCnt > 0, duration: dur, valid: len(results) > 0,
+	}
+}
+
+func findFirstUnknownBatchOutcome(results []BatchNodeResult) execution.ExecutionOutcome {
+	for _, r := range results {
+		if r.IsOutcomeUnknown() {
+			return r.outcome
+		}
+	}
+	return nil
+}
+
+func classifyBatchRunError(report BatchExecReport, firstUnknown execution.ExecutionOutcome, runErr error, halted bool) error {
+	if firstUnknown != nil {
+		cause := ErrUncertainOutcome
+		if halted {
+			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, gate.ErrGateHalted)
+		} else if runErr != nil && !errors.Is(runErr, ErrUncertainOutcome) {
+			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr)
+		}
+		if wrapped, err := gate.WrapOutcomeError(firstUnknown, cause); err == nil {
+			return wrapped
+		}
+		return cause
+	}
+	if halted && !errors.Is(runErr, gate.ErrGateHalted) {
+		return pickIf[error](runErr != nil, fmt.Errorf("%w: %w", gate.ErrGateHalted, runErr), gate.ErrGateHalted)
+	}
+	if runErr != nil {
+		return runErr
+	}
+	if report.failedCount > 0 {
+		return fmt.Errorf("%w: succeeded=%d failed=%d", ErrBatchFailed, report.succeededCount, report.failedCount)
+	}
+	return nil
+}
+
+func batchCompletedFields(report BatchExecReport, firstUnknown execution.ExecutionOutcome, gateErr error, panicked bool) (execution.ExecutionOutcome, bool, string, string) {
+	if panicked {
+		return nil, false, "operation_panicked", "batch exec panicked"
+	}
+	if firstUnknown != nil {
+		return firstUnknown, false, "outcome_unknown", "batch exec has unknown node outcome"
+	}
+	if gateErr != nil {
+		return nil, false, pickIf(errors.Is(gateErr, gate.ErrGateHalted), "gate_halted", "batch_failed"), gateErr.Error()
+	}
+	return nil, report.failedCount == 0, "", "completed"
+}
+
+func classifyNodeCompletedMeta(res BatchNodeResult) (string, string) {
+	if !res.IsValid() {
+		return "invalid_result", "node result invalid"
+	}
+	if res.Succeeded() {
+		return "", "completed"
+	}
+	if res.IsOutcomeUnknown() {
+		return "outcome_unknown", pickIf(res.errMsg != "", res.errMsg, "execution outcome unknown")
+	}
+	return "node_failed", pickIf(res.errMsg != "", res.errMsg, "node execution failed")
+}
+
+func makeNotStartedBatchResult(nodeID inventory.NodeID, phase execution.StartPhase, code string, err error, elapsed time.Duration) BatchNodeResult {
+	return BatchNodeResult{
+		nodeID: nodeID, outcome: makeNotStartedOutcome(phase, code, err),
+		duration: algebraic.FromStdDuration(max(elapsed, 0)),
+		errMsg:   errString(err, ""), err: err, valid: true,
+	}
 }

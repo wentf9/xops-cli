@@ -13,6 +13,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/playbook"
@@ -70,55 +71,87 @@ func (s *Service) validateSingleLocalSource(src pathalg.LocalSourcePath, policy 
 	return nil
 }
 
-func collectPlaybookRemotePaths(pb playbook.Playbook) (playbookPathInventory, error) {
+func collectPlaybookRemotePaths(pb playbook.Playbook, targets []TargetNode) (playbookPathInventory, error) {
 	lexSet := make(map[string]struct{})
-	destSet := make(map[string]pathalg.RemotePath)
+	nodeSets := make(map[inventory.NodeID]map[string]pathalg.RemotePath, len(targets))
+	hasWrite := false
 	for _, st := range pb.StepSlice() {
-		if err := collectActionRemotePaths(st.Action(), lexSet, destSet); err != nil {
+		stepPaths, stepWrites, err := extractActionRemotePaths(st.Action())
+		if err != nil {
 			return playbookPathInventory{}, err
 		}
+		hasWrite = hasWrite || stepWrites
+		recordStepNodePaths(st, stepPaths, targets, lexSet, nodeSets)
 	}
-	destKeys := slices.Sorted(maps.Keys(destSet))
-	dests := make([]pathalg.RemotePath, 0, len(destKeys))
-	for _, k := range destKeys {
-		dests = append(dests, destSet[k])
-	}
-	return playbookPathInventory{lexicalPaths: slices.Sorted(maps.Keys(lexSet)), writeDests: dests}, nil
+	nodePaths, hasProbe := sortNodeRemotePaths(nodeSets)
+	return playbookPathInventory{
+		lexicalPaths: slices.Sorted(maps.Keys(lexSet)), nodePaths: nodePaths,
+		hasProbePath: hasProbe, hasFileWrite: hasWrite,
+	}, nil
 }
 
-func collectActionRemotePaths(act playbook.StepAction, lexSet map[string]struct{}, destSet map[string]pathalg.RemotePath) error {
+func recordStepNodePaths(st playbook.Step, stepPaths []pathalg.RemotePath, targets []TargetNode, lexSet map[string]struct{}, nodeSets map[inventory.NodeID]map[string]pathalg.RemotePath) {
+	if len(stepPaths) == 0 {
+		return
+	}
+	for _, target := range targets {
+		if !st.MatchesTags(target.tags) {
+			continue
+		}
+		m := nodeSets[target.nodeID]
+		if m == nil {
+			m = make(map[string]pathalg.RemotePath, len(stepPaths))
+			nodeSets[target.nodeID] = m
+		}
+		for _, p := range stepPaths {
+			lexSet[p.String()], m[p.String()] = struct{}{}, p
+		}
+	}
+}
+
+func sortNodeRemotePaths(nodeSets map[inventory.NodeID]map[string]pathalg.RemotePath) (map[inventory.NodeID][]pathalg.RemotePath, bool) {
+	nodePaths := make(map[inventory.NodeID][]pathalg.RemotePath, len(nodeSets))
+	hasProbe := false
+	for id, m := range nodeSets {
+		keys := slices.Sorted(maps.Keys(m))
+		list := make([]pathalg.RemotePath, 0, len(keys))
+		for _, k := range keys {
+			list = append(list, m[k])
+		}
+		hasProbe = hasProbe || len(list) > 0
+		nodePaths[id] = list
+	}
+	return nodePaths, hasProbe
+}
+
+func extractActionRemotePaths(act playbook.StepAction) ([]pathalg.RemotePath, bool, error) {
 	switch v := act.(type) {
 	case *playbook.StepShell:
 		if wd, ok := v.WorkDir().Get(); ok && wd.IsValid() {
-			lexSet[wd.String()] = struct{}{}
+			return []pathalg.RemotePath{wd}, false, nil
 		}
-		return nil
+		return nil, false, nil
 	case *playbook.StepScript:
 		if wd, ok := v.WorkDir().Get(); ok && wd.IsValid() {
-			lexSet[wd.String()] = struct{}{}
+			return []pathalg.RemotePath{wd}, false, nil
 		}
-		return nil
+		return nil, false, nil
 	case *playbook.StepCopy:
-		lexSet[v.Dest().String()], destSet[v.Dest().String()] = struct{}{}, v.Dest()
-		return nil
+		return []pathalg.RemotePath{v.Dest()}, true, nil
 	case *playbook.StepTemplate:
-		lexSet[v.Dest().String()], destSet[v.Dest().String()] = struct{}{}, v.Dest()
-		return nil
+		return []pathalg.RemotePath{v.Dest()}, true, nil
 	case *playbook.StepEnsure:
-		return firstErr(collectActionRemotePaths(v.Check(), lexSet, destSet), collectActionRemotePaths(v.Action(), lexSet, destSet))
+		p1, w1, e1 := extractActionRemotePaths(v.Check())
+		p2, w2, e2 := extractActionRemotePaths(v.Action())
+		return append(p1, p2...), w1 || w2, firstErr(e1, e2)
 	default:
-		return ErrUnsupportedAction
+		return nil, false, ErrUnsupportedAction
 	}
 }
 
 // preloadPlaybookSources 在门控授权通过后冻结本轮 Playbook 所需的本地脚本、文件与模板不可变字节快照，
 // 保证并发多节点读取完全一致且零本地文件句柄逃逸至后台协程。
-func (s *Service) preloadPlaybookSources(
-	ctx context.Context,
-	pb playbook.Playbook,
-	targets []TargetNode,
-	scopedRoot algebraic.Option[pathalg.LocalDir],
-) (map[string][]byte, error) {
+func (s *Service) preloadPlaybookSources(ctx context.Context, pb playbook.Playbook, targets []TargetNode, scopedRoot algebraic.Option[pathalg.LocalDir]) (map[string][]byte, error) {
 	sources := make(map[string][]byte)
 	for _, st := range pb.StepSlice() {
 		if !stepMatchesAnyTarget(st, targets) {
@@ -132,12 +165,7 @@ func (s *Service) preloadPlaybookSources(
 }
 
 func stepMatchesAnyTarget(st playbook.Step, targets []TargetNode) bool {
-	for _, t := range targets {
-		if st.MatchesTags(t.tags) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(targets, func(t TargetNode) bool { return st.MatchesTags(t.tags) })
 }
 
 func (s *Service) preloadActionSources(ctx context.Context, act playbook.StepAction, scopedRoot algebraic.Option[pathalg.LocalDir], cache map[string][]byte) error {
@@ -161,16 +189,12 @@ func sourceCacheKey(src pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy) s
 	return policy.String() + "\x00" + src.String()
 }
 
-func (s *Service) loadLocalSourceInto(
-	ctx context.Context,
-	src pathalg.LocalSourcePath,
-	policy pathalg.SymlinkPolicy,
-	maxBytes int64,
-	scopedRoot algebraic.Option[pathalg.LocalDir],
-	cache map[string][]byte,
-) error {
+func (s *Service) loadLocalSourceInto(ctx context.Context, src pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, maxBytes int64, scopedRoot algebraic.Option[pathalg.LocalDir], cache map[string][]byte) error {
 	key := sourceCacheKey(src, policy)
-	if _, ok := cache[key]; ok {
+	if existing, ok := cache[key]; ok {
+		if int64(len(existing)) > maxBytes {
+			return fmt.Errorf("%w: 本地源文件 %s 大小 %d 超过当前步骤上限 %d", ports.ErrLimitExceeded, src, len(existing), maxBytes)
+		}
 		return nil
 	}
 	data, err := s.readLocalSourceBounded(ctx, src, policy, maxBytes, scopedRoot)
@@ -181,13 +205,7 @@ func (s *Service) loadLocalSourceInto(
 	return nil
 }
 
-func (s *Service) readLocalSourceBounded(
-	ctx context.Context,
-	src pathalg.LocalSourcePath,
-	policy pathalg.SymlinkPolicy,
-	maxBytes int64,
-	scopedRoot algebraic.Option[pathalg.LocalDir],
-) ([]byte, error) {
+func (s *Service) readLocalSourceBounded(ctx context.Context, src pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, maxBytes int64, scopedRoot algebraic.Option[pathalg.LocalDir]) ([]byte, error) {
 	limits, err := ports.NewReadLimits(maxBytes)
 	if err != nil {
 		return nil, err
@@ -309,7 +327,7 @@ func (rc *playbookRunContext) runCommandPlanForStep(ctx context.Context, target 
 	defer cancel()
 	outW := newBoundedCaptureWriter(execCtx, nodeEmitter, events.OutputStreamStdout, cmdPlan.MaxOutputBytes())
 	errW := newBoundedCaptureWriter(execCtx, nodeEmitter, events.OutputStreamStderr, cmdPlan.MaxOutputBytes())
-	outcome, execErr := rc.svc.execCommandWithLease(execCtx, target.plan, cmdPlan, outW, errW)
+	outcome, execErr := rc.svc.execCommandWithLease(execCtx, target.plan, cmdPlan, rc.authBinding, rc.svc.enforceStrictPaths(), outW, errW)
 	return mapOutcomeToStepStatus(outcome, execErr, successStatus)
 }
 
@@ -335,36 +353,39 @@ func (rc *playbookRunContext) runTemplateAction(ctx context.Context, target Targ
 	return rc.writeRemoteStepPayload(ctx, target, act.Dest(), act.Mode(), act.Overwrite(), act.Atomic(), rendered)
 }
 
+type limitedBufferWriter struct {
+	buf   *bytes.Buffer
+	limit int64
+}
+
+func (w *limitedBufferWriter) Write(p []byte) (int, error) {
+	if int64(w.buf.Len())+int64(len(p)) > w.limit {
+		return 0, fmt.Errorf("%w: 渲染输出超过字节上限 %d", ports.ErrLimitExceeded, w.limit)
+	}
+	return w.buf.Write(p)
+}
+
 func renderPlaybookTemplate(tmplText string, vars map[string]string, maxBytes int64) ([]byte, error) {
 	t, err := template.New("playbook").Option("missingkey=error").Parse(tmplText)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrTemplateRender, err)
 	}
 	var buf bytes.Buffer
-	if err := t.Execute(&buf, vars); err != nil {
+	if err := t.Execute(&limitedBufferWriter{buf: &buf, limit: maxBytes}, vars); err != nil {
+		if errors.Is(err, ports.ErrLimitExceeded) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %w", ErrTemplateRender, err)
-	}
-	if int64(buf.Len()) > maxBytes {
-		return nil, fmt.Errorf("%w: 渲染后模板大小 %d 超过上限 %d", ports.ErrLimitExceeded, buf.Len(), maxBytes)
 	}
 	return buf.Bytes(), nil
 }
 
-func (rc *playbookRunContext) writeRemoteStepPayload(
-	ctx context.Context,
-	target TargetNode,
-	dest pathalg.RemotePath,
-	modeOpt algebraic.Option[playbook.FileMode],
-	overwrite, atomicWrite bool,
-	payload []byte,
-) (playbook.StepStatus, execution.ExecutionOutcome, string) {
+func (rc *playbookRunContext) writeRemoteStepPayload(ctx context.Context, target TargetNode, dest pathalg.RemotePath, modeOpt algebraic.Option[playbook.FileMode], overwrite, atomicWrite bool, payload []byte) (playbook.StepStatus, execution.ExecutionOutcome, string) {
 	perm, err := resolveStepFilePerm(modeOpt)
 	if err != nil {
 		return playbook.StepStatusFailed, makeNotStartedOutcome(execution.StartPhaseValidate, "invalid_file_mode", err), err.Error()
 	}
-	writeSpec, err := ports.NewRemoteWriteSpec(ports.RemoteWriteSpecInput{
-		Perm: perm, NoClobber: !overwrite, AtomicRename: atomicWrite,
-	})
+	writeSpec, err := ports.NewRemoteWriteSpec(ports.RemoteWriteSpecInput{Perm: perm, NoClobber: !overwrite, AtomicRename: atomicWrite})
 	if err != nil {
 		return playbook.StepStatusFailed, makeNotStartedOutcome(execution.StartPhaseValidate, "invalid_write_spec", err), err.Error()
 	}
@@ -389,13 +410,7 @@ func resolveStepFilePerm(modeOpt algebraic.Option[playbook.FileMode]) (fs.FileMo
 
 // execRemoteWriteWithLease 在 pool.WithLease 作用域内校验远端目标未漂移出授权范围后写入远端文件，
 // 精确区分写前失败（OutcomeNotStarted）与写期中断/半提交（OutcomeUnknown / Applied&&!Durable，绝不重试）。
-func (rc *playbookRunContext) execRemoteWriteWithLease(
-	ctx context.Context,
-	connPlan plan.SealedConnectionPlan,
-	dest pathalg.RemotePath,
-	writeSpec ports.RemoteWriteSpec,
-	payload []byte,
-) (execution.ExecutionOutcome, error) {
+func (rc *playbookRunContext) execRemoteWriteWithLease(ctx context.Context, connPlan plan.SealedConnectionPlan, dest pathalg.RemotePath, writeSpec ports.RemoteWriteSpec, payload []byte) (execution.ExecutionOutcome, error) {
 	var outcome execution.ExecutionOutcome
 	var enteredLease, writeInvoked bool
 	leaseErr := rc.svc.pool.WithLease(ctx, connPlan, func(leaseCtx context.Context, lease *pool.Lease) error {
@@ -447,11 +462,11 @@ func checkRemoteNoClobber(ctx context.Context, rfs ports.RemoteFSPort, dest path
 }
 
 func classifyRemoteWriteError(ctx context.Context, err error) execution.ExecutionOutcome {
-	// 写前拒绝（已存在/权限/目录/锚点冲突/无效参数）确认未修改目标 -> OutcomeNotStarted；
+	// 写前拒绝（已存在/不存在/权限/目录/软链/非常规文件/锚点冲突/无效参数）确认未修改目标 -> OutcomeNotStarted；
 	// Applied&&!Durable 或写期网络/上下文中断 -> OutcomeUnknown（严禁重试）。
 	for _, preErr := range [...]error{
 		ports.ErrAlreadyExists, ports.ErrNotFound, ports.ErrRemoteIsDir, ports.ErrRemoteAnchorMismatch,
-		ports.ErrPermissionDenied, ports.ErrInvalidArgument, gate.ErrScopeEscalated,
+		ports.ErrSymlinkRejected, ports.ErrNotRegularFile, ports.ErrPermissionDenied, ports.ErrInvalidArgument, gate.ErrScopeEscalated,
 	} {
 		if errors.Is(err, preErr) {
 			return makeNotStartedOutcome(execution.StartPhaseRequestRejected, "remote_write_rejected", err)

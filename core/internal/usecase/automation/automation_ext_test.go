@@ -592,10 +592,10 @@ func TestBatchExecNodeStreamsAndOutDir(t *testing.T) {
 	}
 
 	n1 := makeTargetNode(t, "app-1", "10.0.1.1:22")
-	n2 := makeTargetNode(t, "app-2", "10.0.1.2:22")
+	n2 := makeTargetNode(t, "con", "10.0.1.2:22")
 	batchStream := makeOpStream(t, "batch-main")
 	n1Stream := makeOpStream(t, "node-app1")
-	n2Stream := makeOpStream(t, "node-app2")
+	n2Stream := makeOpStream(t, "node-con")
 	outDir, err := pathalg.ParseLocalDir("/tmp/xops-batch-out")
 	mustOK(t, err, "ParseLocalDir")
 
@@ -627,19 +627,28 @@ func TestBatchExecNodeStreamsAndOutDir(t *testing.T) {
 	mustOK(t, batchErr, "BatchExec")
 	assertStreamHasTerminal(t, "batch", batchEvs, true)
 	assertStreamHasTerminal(t, "app-1", n1Evs, true)
-	assertStreamHasTerminal(t, "app-2", n2Evs, true)
+	assertStreamHasTerminal(t, "con", n2Evs, true)
 
-	// 验证 ScopedRootFS 落盘内容。
+	// 验证 ScopedRootFS 落盘内容（含 Windows 保留名节点 con -> node-con.stdout.log 防护）。
 	limits, _ := ports.NewReadLimits(4096)
-	dest, _ := pathalg.ParseLocalRootedDest("app-1.stdout.log")
-	var saved []byte
-	mustOK(t, rig.scopedFS.WithRoot(outDir, func(root ports.RootHandle) error {
-		var rErr error
-		saved, rErr = root.ReadAllBounded(dest, limits)
-		return rErr
-	}), "WithRoot read")
-	if string(saved) != "out-app-1" || rep.Results()[0].StdoutFile().IsNone() {
-		t.Fatalf("unexpected saved output %q", saved)
+	for _, tc := range []struct{ file, want string }{
+		{"node-app-1.stdout.log", "out-app-1"},
+		{"node-con.stdout.log", "out-con"},
+	} {
+		dest, dErr := pathalg.ParseLocalRootedDest(tc.file)
+		mustOK(t, dErr, "ParseLocalRootedDest "+tc.file)
+		var saved []byte
+		mustOK(t, rig.scopedFS.WithRoot(outDir, func(root ports.RootHandle) error {
+			var rErr error
+			saved, rErr = root.ReadAllBounded(dest, limits)
+			return rErr
+		}), "WithRoot read "+tc.file)
+		if string(saved) != tc.want {
+			t.Fatalf("file %s saved %q want %q", tc.file, saved, tc.want)
+		}
+	}
+	if rep.Results()[0].StdoutFile().IsNone() || rep.Results()[1].StdoutFile().IsNone() {
+		t.Fatalf("expected StdoutFile populated for all nodes")
 	}
 
 	// 缺少 ScopedRootFS 时指定 --out-dir 必须 Fail-Closed。
@@ -810,6 +819,36 @@ func TestBatchExecInventorySelectorAndZeroValueFailClosed(t *testing.T) {
 		t.Fatalf("unexpected inventory target result: %+v", rep.Results())
 	}
 
+	// 验证显式 NodeID 选择器回退 ResolveTarget 兼容 ~/.ssh/config 虚拟主机，以及排除过滤提前生效。
+	vhHost, _ := netaddr.ParseCanonicalHost("198.51.100.77")
+	vhEP, _ := netaddr.NewEndpoint(vhHost, 22)
+	vhUser, _ := option.ParseUsername("ops")
+	vhSpecHost, _ := option.ParseHostNameSpec("198.51.100.77")
+	vhLayer := option.UnsetOptionLayer().WithHostName(vhSpecHost).WithPort(22).WithUser(vhUser)
+	vh, err := ports.NewOpenSSHVirtualHost(ports.OpenSSHVirtualHostSpec{
+		Alias: "ssh-virtual-1", SourceFile: "/home/ops/.ssh/config",
+		Endpoint: algebraic.Some(vhEP), User: algebraic.Some(vhUser), Layer: vhLayer,
+	})
+	mustOK(t, err, "NewOpenSSHVirtualHost")
+	invWithSSH, err := ucinv.NewService(ucinv.ServiceConfig{
+		Store: rig.store, OpenSSH: sim.NewSimOpenSSHConfigSource(vh), Gate: rig.gate, Clock: rig.clock, Entropy: rig.rng,
+	})
+	mustOK(t, err, "inventory.NewService with OpenSSH")
+	svcWithSSH, err := automation.NewService(automation.ServiceConfig{
+		Gate: rig.gate, Pool: rig.pool, Clock: rig.clock, Entropy: rig.rng, Inventory: invWithSSH,
+	})
+	mustOK(t, err, "automation.NewService with OpenSSH")
+	vhNodeID, _ := inventory.ParseNodeID("ssh-virtual-1")
+	selVH, err := playbook.NewTargetSelector(playbook.TargetSelectorSpec{Nodes: []inventory.NodeID{vhNodeID}})
+	mustOK(t, err, "NewTargetSelector virtual")
+	repVH, err := svcWithSSH.BatchExec(context.Background(), automation.BatchExecRequest{
+		Selector: algebraic.Some(selVH), Command: makeCmdPlan(t, "hostname"),
+	})
+	mustOK(t, err, "BatchExec virtual ~/.ssh/config node")
+	if repVH.SucceededCount() != 1 || repVH.Results()[0].NodeID() != vhNodeID {
+		t.Fatalf("expected virtual host resolved and executed, got %+v", repVH.Results())
+	}
+
 	noInv := newAutoRig(t, autoRigOpts{withInventory: false})
 	defer noInv.close()
 	_, err = noInv.svc.BatchExec(context.Background(), automation.BatchExecRequest{
@@ -851,5 +890,70 @@ func TestBatchExecPanicEmitsTerminalEventAndClosesStream(t *testing.T) {
 	last := evs[len(evs)-1].(*events.OperationCompletedEvent)
 	if !strings.Contains(last.Code(), "panic") {
 		t.Fatalf("expected panic terminal code, got %q", last.Code())
+	}
+}
+
+func TestBatchExecWorkDirRound2ProfileInheritanceAndHaltedChain(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// 1. StrictAgent 下 Command.WorkDir 软链重定向至受保护路径 /etc -> Round-2 必须拦截且 0 会话打开。
+	rig := newAutoRig(t, autoRigOpts{profile: gate.PolicyProfileStrictAgent, fallback: gate.NoElicitFallbackDeny})
+	defer rig.close()
+	node := makeTargetNode(t, "wd-1", "10.0.6.1:22")
+	wdLink, _ := pathalg.ParseRemotePath("/tmp/wd-link")
+	mustOK(t, rig.dialer.rfsFor("wd-1", rig.clock).PutSymlink(wdLink, "/etc"), "PutSymlink /etc")
+	shProf, err := execution.POSIXLaunchProfile(execution.InterpreterSH, execution.LoginModeInherit)
+	mustOK(t, err, "POSIXLaunchProfile sh")
+	wdCmd, err := execution.NewCommandPlan(execution.CommandPlanSpec{
+		Kind: execution.PlanKindCommand, Profile: shProf,
+		Command: "ls", WorkDir: algebraic.Some(wdLink),
+	})
+	mustOK(t, err, "NewCommandPlan wd")
+	if _, err := rig.svc.BatchExec(context.Background(), automation.BatchExecRequest{
+		Targets: []automation.TargetNode{node}, Command: wdCmd, Risk: algebraic.Some(security.RiskSafe),
+	}); err == nil || rig.dialer.openCount.Load() != 0 {
+		t.Fatalf("expected Round-2 WorkDir block with 0 sessions, err=%v opens=%d", err, rig.dialer.openCount.Load())
+	}
+
+	// 2. TargetNode.DefaultProfile 继承：当 Command.Profile 为默认服务配置时自动沿用节点默认 Profile。
+	bashProf, err := execution.POSIXLaunchProfile(execution.InterpreterBash, execution.LoginModeLogin)
+	mustOK(t, err, "POSIXLaunchProfile bash")
+	customNode, err := automation.NewTargetNode(automation.TargetNodeSpec{
+		NodeID: node.NodeID(), Plan: node.Plan(), DefaultProfile: algebraic.Some(bashProf),
+	})
+	mustOK(t, err, "NewTargetNode with DefaultProfile")
+	var gotInterp execution.Interpreter
+	rig.dialer.onCmd = func(_ context.Context, _ string, cmd execution.CommandPlan, _ []byte, _, _ io.Writer) (execution.ExecutionOutcome, error) {
+		gotInterp = cmd.Profile().Interpreter()
+		return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	}
+	rep, err := rig.svc.BatchExec(context.Background(), automation.BatchExecRequest{
+		Targets: []automation.TargetNode{customNode}, Command: makeCmdPlan(t, "whoami"), Risk: algebraic.Some(security.RiskSafe),
+	})
+	mustOK(t, err, "BatchExec profile inherit")
+	if rep.SucceededCount() != 1 || gotInterp != execution.InterpreterBash {
+		t.Fatalf("expected inherited bash profile, got ok=%d interp=%v", rep.SucceededCount(), gotInterp)
+	}
+
+	// 3. 批量执行中途触发 Gate.Halted -> 保留 gate.ErrGateHalted 错误链且未执行节点标记 gate_halted。
+	n1 := makeTargetNode(t, "halt-1", "10.0.6.2:22")
+	n2 := makeTargetNode(t, "halt-2", "10.0.6.3:22")
+	rig.dialer.onCmd = func(_ context.Context, nodeID string, _ execution.CommandPlan, _ []byte, _, _ io.Writer) (execution.ExecutionOutcome, error) {
+		if nodeID == "halt-1" {
+			rig.auditClust.Faults().InjectOnce("audit.record.finalized", errors.New("audit io err"))
+			// 借用一次独立小调用触发 StrictAgent 熔断。
+			_, _ = rig.svc.BatchExec(context.Background(), automation.BatchExecRequest{
+				Targets: []automation.TargetNode{customNode}, Command: makeCmdPlan(t, "true"), Risk: algebraic.Some(security.RiskSafe),
+			})
+		}
+		return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	}
+	repHalt, haltErr := rig.svc.BatchExec(context.Background(), automation.BatchExecRequest{
+		Targets: []automation.TargetNode{n1, n2}, Command: makeCmdPlan(t, "true"), Concurrency: 1, Risk: algebraic.Some(security.RiskSafe),
+	})
+	if !errors.Is(haltErr, gate.ErrGateHalted) {
+		t.Fatalf("expected gate.ErrGateHalted preserved in error chain, got %v", haltErr)
+	}
+	if !repHalt.IsValid() || !errors.Is(repHalt.Results()[1].Err(), gate.ErrGateHalted) {
+		t.Fatalf("expected second node aborted with gate.ErrGateHalted, got %v", repHalt.Results()[1].Err())
 	}
 }

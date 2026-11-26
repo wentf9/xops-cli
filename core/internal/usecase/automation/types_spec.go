@@ -127,19 +127,11 @@ func NewTargetNode(spec TargetNodeSpec) (TargetNode, error) {
 	if err != nil {
 		return TargetNode{}, err
 	}
-	return TargetNode{
-		nodeID:         spec.NodeID,
-		plan:           spec.Plan,
-		tags:           tags,
-		defaultProfile: spec.DefaultProfile,
-		valid:          true,
-	}, nil
+	return TargetNode{nodeID: spec.NodeID, plan: spec.Plan, tags: tags, defaultProfile: spec.DefaultProfile, valid: true}, nil
 }
 
 // IsValid / IsZero / 只读访问器（零值恒无效并失败关闭）。
-func (t TargetNode) IsValid() bool {
-	return t.valid && t.nodeID.IsValid() && t.plan.IsValid()
-}
+func (t TargetNode) IsValid() bool                   { return t.valid && t.nodeID.IsValid() && t.plan.IsValid() }
 func (t TargetNode) IsZero() bool                    { return !t.IsValid() }
 func (t TargetNode) NodeID() inventory.NodeID        { return t.nodeID }
 func (t TargetNode) Plan() plan.SealedConnectionPlan { return t.plan }
@@ -238,16 +230,9 @@ func (r BatchNodeResult) MarshalJSONTo(enc *jsontext.Encoder) error {
 		return ErrInvalidRequest
 	}
 	return jsonv2.MarshalEncode(enc, batchNodeResultWire{
-		NodeID:       r.nodeID,
-		OutcomeKind:  r.outcome.Kind(),
-		Succeeded:    r.Succeeded(),
-		Truncated:    r.truncated,
-		Duration:     r.duration,
-		StdoutBytes:  len(r.stdout),
-		StderrBytes:  len(r.stderr),
-		StdoutFile:   r.stdoutFile,
-		StderrFile:   r.stderrFile,
-		ErrorMessage: r.errMsg,
+		NodeID: r.nodeID, OutcomeKind: r.outcome.Kind(), Succeeded: r.Succeeded(),
+		Truncated: r.truncated, Duration: r.duration, StdoutBytes: len(r.stdout), StderrBytes: len(r.stderr),
+		StdoutFile: r.stdoutFile, StderrFile: r.stderrFile, ErrorMessage: r.errMsg,
 	})
 }
 
@@ -256,14 +241,10 @@ func (r BatchNodeResult) MarshalJSONTo(enc *jsontext.Encoder) error {
 //xops:opaque
 //xops:failclosed
 type BatchExecReport struct {
-	results           []BatchNodeResult
-	succeededCount    int
-	failedCount       int
-	unknownCount      int
-	notStartedCount   int
-	hasUnknownOutcome bool
-	duration          algebraic.Duration
-	valid             bool
+	results                                                    []BatchNodeResult
+	succeededCount, failedCount, unknownCount, notStartedCount int
+	hasUnknownOutcome, valid                                   bool
+	duration                                                   algebraic.Duration
 }
 
 // BatchExecReport 只读访问器与确定性 JSON 编码。
@@ -277,8 +258,7 @@ func (r BatchExecReport) Results() []BatchNodeResult {
 	}
 	out := make([]BatchNodeResult, len(r.results))
 	for i, item := range r.results {
-		item.stdout = bytes.Clone(item.stdout)
-		item.stderr = bytes.Clone(item.stderr)
+		item.stdout, item.stderr = bytes.Clone(item.stdout), bytes.Clone(item.stderr)
 		out[i] = item
 	}
 	return out
@@ -306,13 +286,9 @@ func (r BatchExecReport) MarshalJSONTo(enc *jsontext.Encoder) error {
 		return ErrInvalidRequest
 	}
 	return jsonv2.MarshalEncode(enc, batchExecReportWire{
-		Results:           r.results,
-		SucceededCount:    r.succeededCount,
-		FailedCount:       r.failedCount,
-		UnknownCount:      r.unknownCount,
-		NotStartedCount:   r.notStartedCount,
-		HasUnknownOutcome: r.hasUnknownOutcome,
-		Duration:          r.duration,
+		Results: r.results, SucceededCount: r.succeededCount, FailedCount: r.failedCount,
+		UnknownCount: r.unknownCount, NotStartedCount: r.notStartedCount,
+		HasUnknownOutcome: r.hasUnknownOutcome, Duration: r.duration,
 	})
 }
 

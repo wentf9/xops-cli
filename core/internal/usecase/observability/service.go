@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
@@ -50,19 +51,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 }
 
 func zeroVal[T any]() (z T) { return z }
-func pickIf[T any](cond bool, yes, no T) T {
+func pickIf[T any](cond bool, y, n T) T {
 	if cond {
-		return yes
+		return y
 	}
-	return no
-}
-func firstErr(errs ...error) error {
-	for _, err := range errs {
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return n
 }
 func closeStream(st *events.OperationStream) {
 	if st != nil {
@@ -71,6 +64,17 @@ func closeStream(st *events.OperationStream) {
 }
 func (s *Service) enforceStrictPaths() bool {
 	return s.gate.Profile() != gate.PolicyProfileDirectOperator
+}
+func resolveNodeID(hop plan.HopSpec, explicit string) string {
+	return pickIf(explicit != "", explicit, hop.NodeID())
+}
+func firstErr(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *Service) checkReady(ctx context.Context) error {
 	switch {
@@ -84,7 +88,6 @@ func (s *Service) checkReady(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-
 func (s *Service) validatePlanCall(ctx context.Context, connPlan plan.SealedConnectionPlan, risk algebraic.Option[security.RiskLevel]) (plan.HopSpec, error) {
 	if err := s.checkReady(ctx); err != nil {
 		return zeroVal[plan.HopSpec](), err
@@ -102,60 +105,87 @@ func (s *Service) validatePlanCall(ctx context.Context, connPlan plan.SealedConn
 	return hop, nil
 }
 
-func resolveNodeID(hop plan.HopSpec, explicit string) string {
-	return pickIf(explicit != "", explicit, hop.NodeID())
+func (s *Service) elapsed(since time.Time) algebraic.Duration {
+	return algebraic.FromStdDuration(max(s.clock.Since(since), 0))
 }
 
-// validateRequestedPOSIXProfile 在进入门控前校验显式传入的 LaunchProfile 必须满足 POSIX Bourne（INV-E4）。
-func validateRequestedPOSIXProfile(opt algebraic.Option[execution.LaunchProfile]) (execution.LaunchProfile, bool, error) {
-	prof, has := opt.Get()
-	if !has {
-		return zeroVal[execution.LaunchProfile](), false, nil
+type posixCallBase struct {
+	hop     plan.HopSpec
+	prof    execution.LaunchProfile
+	hasProf bool
+}
+
+// validatePOSIXCall 统一校验执行计划、风险等级、显式 POSIX Bourne 启动配置（INV-E4）与正时长超时。
+func (s *Service) validatePOSIXCall(ctx context.Context, connPlan plan.SealedConnectionPlan, risk algebraic.Option[security.RiskLevel], profOpt algebraic.Option[execution.LaunchProfile], timeout algebraic.Option[algebraic.Duration]) (posixCallBase, error) {
+	hop, err := s.validatePlanCall(ctx, connPlan, risk)
+	if err != nil {
+		return posixCallBase{}, err
 	}
-	if !prof.IsValid() {
-		return zeroVal[execution.LaunchProfile](), false, fmt.Errorf("%w: LaunchProfile 无效", ErrInvalidRequest)
+	prof, hasProf := profOpt.Get()
+	if hasProf {
+		if !prof.IsValid() {
+			return posixCallBase{}, fmt.Errorf("%w: LaunchProfile 无效", ErrInvalidRequest)
+		}
+		if err := prof.ValidatePOSIXBourne(); err != nil {
+			return posixCallBase{}, fmt.Errorf("%w: %w", ErrPOSIXShellRequired, err)
+		}
 	}
-	if err := prof.ValidatePOSIXBourne(); err != nil {
-		return zeroVal[execution.LaunchProfile](), false, fmt.Errorf("%w: %w", ErrPOSIXShellRequired, err)
+	if d, ok := timeout.Get(); ok && !d.IsPositive() {
+		return posixCallBase{}, fmt.Errorf("%w: Timeout 必须为正时长", ErrInvalidRequest)
 	}
-	return prof, true, nil
+	return posixCallBase{hop: hop, prof: prof, hasProf: hasProf}, nil
+}
+
+func newObsGateReq[C security.Capability](spec security.OperationBindingSpec, risk security.RiskLevel, summary string, paths []string, canon gate.CanonicalizeFunc, appr algebraic.Option[gate.ApprovalSubmission], st *events.OperationStream) (gate.GateRequest[C], error) {
+	binding, err := security.NewOperationBinding(spec)
+	if err != nil {
+		return zeroVal[gate.GateRequest[C]](), err
+	}
+	return gate.NewGateRequest[C](gate.GateRequestSpec[C]{
+		Binding: binding, Risk: risk, ScopeSummary: summary, Paths: paths, Canonicalize: canon, Approval: appr, OperationStream: st,
+	})
+}
+
+// withLeaseRemoteFS 在已持有的 pool.Lease 内打开 RemoteFSPort 并确定性闭合。
+//
+//xops:syncclosure
+func withLeaseRemoteFS(ctx context.Context, lease *pool.Lease, fn func(ports.RemoteFSPort) error) error {
+	rfs, err := lease.OpenRemoteFS(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rfs.Close() }()
+	return fn(rfs)
 }
 
 // resolvePOSIXProfileInLease 在未显式指定启动配置时，若注入 ShellProbePort 则先执行两阶段探测并验证 POSIX Bourne，
 // 否则使用显式 POSIX sh；若探测为 PowerShell/cmd/raw/unknown 立即失败关闭返回 ErrPOSIXShellRequired。
-func (s *Service) resolvePOSIXProfileInLease(
-	ctx context.Context,
-	opener ports.SessionOpener,
-	explicit execution.LaunchProfile,
-	hasExplicit bool,
-) (execution.LaunchProfile, error) {
+func (s *Service) resolvePOSIXProfileInLease(ctx context.Context, opener ports.SessionOpener, explicit execution.LaunchProfile, hasExplicit bool) (execution.LaunchProfile, error) {
 	if hasExplicit {
 		if err := explicit.ValidatePOSIXBourne(); err != nil {
 			return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: %w", ErrPOSIXShellRequired, err)
 		}
 		return explicit, nil
 	}
-	if s.shellProbe != nil {
-		res, err := s.shellProbe.ProbeShell(ctx, opener)
-		if err != nil {
-			return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: 远端 Shell 探测失败: %w", ErrPOSIXShellRequired, err)
-		}
-		prof := res.LaunchProfile()
-		if err := prof.ValidatePOSIXBourne(); err != nil {
-			return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: 远端探测方言=%s 解释器=%s: %w", ErrPOSIXShellRequired, res.Dialect(), res.Interpreter(), err)
-		}
-		return prof, nil
+	if s.shellProbe == nil {
+		return execution.POSIXLaunchProfile(execution.InterpreterSH, execution.LoginModeInherit)
 	}
-	return execution.POSIXLaunchProfile(execution.InterpreterSH, execution.LoginModeInherit)
+	res, err := s.shellProbe.ProbeShell(ctx, opener)
+	if err != nil {
+		return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: 远端 Shell 探测失败: %w", ErrPOSIXShellRequired, err)
+	}
+	if err := res.LaunchProfile().ValidatePOSIXBourne(); err != nil {
+		return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: 远端探测方言=%s 解释器=%s: %w", ErrPOSIXShellRequired, res.Dialect(), res.Interpreter(), err)
+	}
+	return res.LaunchProfile(), nil
 }
 
 func (s *Service) filterSendEnv(targetHop plan.HopSpec) map[string]string {
-	if filter := targetHop.Transport().SendEnv(); !filter.IsUnset() && s.env != nil {
-		return filter.Filter(s.env.Environ())
+	if f := targetHop.Transport().SendEnv(); !f.IsUnset() && s.env != nil {
+		return f.Filter(s.env.Environ())
 	}
 	return nil
 }
-
 func applyOptionalTimeout(ctx context.Context, durOpt algebraic.Option[algebraic.Duration]) (context.Context, context.CancelFunc) {
 	if d, ok := durOpt.Get(); ok && d.IsPositive() {
 		return context.WithTimeout(ctx, d.Std())
@@ -166,15 +196,7 @@ func applyOptionalTimeout(ctx context.Context, durOpt algebraic.Option[algebraic
 // runAuthorized 统一封装 gate.WithAuthorized[C]、Outcome 上报与隔离 OperationStream 生命周期发射（含 panic defer 终态闭合）。
 //
 //xops:syncclosure
-func runAuthorized[C security.Capability](
-	ctx context.Context,
-	s *Service,
-	planDigest plan.PlanDigest,
-	nodeID, action string,
-	gateReq gate.GateRequest[C],
-	stream *events.OperationStream,
-	run func(authCtx context.Context, binding security.OperationBinding, emitter *obsEmitter) (execution.ExecutionOutcome, error),
-) (execution.ExecutionOutcome, error) {
+func runAuthorized[C security.Capability](ctx context.Context, s *Service, planDigest plan.PlanDigest, nodeID, action string, gateReq gate.GateRequest[C], stream *events.OperationStream, run func(authCtx context.Context, binding security.OperationBinding, emitter *obsEmitter) (execution.ExecutionOutcome, error)) (execution.ExecutionOutcome, error) {
 	var outcome execution.ExecutionOutcome
 	var emitter *obsEmitter
 	var gateErr error
@@ -195,10 +217,7 @@ func runAuthorized[C security.Capability](
 			_ = auth.ReportOutcome(outcome)
 		}
 		if outcome != nil && outcome.Kind() == execution.OutcomeKindUnknown {
-			cause := ErrUncertainOutcome
-			if runErr != nil && !errors.Is(runErr, ErrUncertainOutcome) {
-				cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr)
-			}
+			cause := pickIf(runErr != nil && !errors.Is(runErr, ErrUncertainOutcome), fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr), ErrUncertainOutcome)
 			if wrapped, wErr := gate.WrapOutcomeError(outcome, cause); wErr == nil {
 				return wrapped
 			}
@@ -211,18 +230,17 @@ func runAuthorized[C security.Capability](
 }
 
 func classifyObsTerminal(outcome execution.ExecutionOutcome, err error, panicked bool) (execution.ExecutionOutcome, bool, string, string) {
-	if panicked {
+	switch {
+	case panicked:
 		return nil, false, "operation_panicked", "observability operation panicked"
-	}
-	if outcome != nil && outcome.IsValid() && outcome.Kind() == execution.OutcomeKindUnknown {
+	case outcome != nil && outcome.IsValid() && outcome.Kind() == execution.OutcomeKindUnknown:
 		return outcome, false, "outcome_unknown", "execution outcome unknown"
-	}
-	if err != nil {
+	case err != nil:
 		return outcome, false, pickIf(errors.Is(err, gate.ErrGateHalted), "gate_halted", "operation_failed"), err.Error()
+	default:
+		return outcome, true, "", "completed"
 	}
-	return outcome, true, "", "completed"
 }
-
 func makeNotStartedOutcome(phase execution.StartPhase, code string, err error) execution.ExecutionOutcome {
 	msg := ""
 	if err != nil {
@@ -231,7 +249,6 @@ func makeNotStartedOutcome(phase execution.StartPhase, code string, err error) e
 	out, _ := execution.NewOutcomeNotStarted(phase, code, msg)
 	return out
 }
-
 func classifyPostStartOutcome(ctx context.Context, out execution.ExecutionOutcome, waitErr error) execution.ExecutionOutcome {
 	if out != nil && out.IsValid() {
 		return out
@@ -253,16 +270,7 @@ func classifyPostStartOutcome(ctx context.Context, out execution.ExecutionOutcom
 // 消除 StreamLogs / StreamMetrics / ExecuteGUI 的重复生命周期样板并严分 OutcomeNotStarted 与 OutcomeUnknown。
 //
 //xops:syncclosure
-func (s *Service) execPOSIXInLease(
-	ctx context.Context,
-	connPlan plan.SealedConnectionPlan,
-	targetHop plan.HopSpec,
-	explicitProf execution.LaunchProfile,
-	hasProf bool,
-	preCheck func(context.Context, *pool.Lease) error,
-	buildCmd func(execution.LaunchProfile) (execution.CommandPlan, error),
-	stdout, stderr io.Writer,
-) (execution.ExecutionOutcome, error) {
+func (s *Service) execPOSIXInLease(ctx context.Context, connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec, explicitProf execution.LaunchProfile, hasProf bool, preCheck func(context.Context, *pool.Lease) error, buildCmd func(execution.LaunchProfile) (execution.CommandPlan, error), stdout, stderr io.Writer) (execution.ExecutionOutcome, error) {
 	var outcome execution.ExecutionOutcome
 	var enteredLease, started bool
 	leaseErr := s.pool.WithLease(ctx, connPlan, func(leaseCtx context.Context, lease *pool.Lease) error {
@@ -280,16 +288,7 @@ func (s *Service) execPOSIXInLease(
 	return outcome, leaseErr
 }
 
-func (s *Service) runPOSIXSessionInLease(
-	ctx context.Context,
-	lease *pool.Lease,
-	targetHop plan.HopSpec,
-	explicitProf execution.LaunchProfile,
-	hasProf bool,
-	preCheck func(context.Context, *pool.Lease) error,
-	buildCmd func(execution.LaunchProfile) (execution.CommandPlan, error),
-	stdout, stderr io.Writer,
-) (execution.ExecutionOutcome, bool, error) {
+func (s *Service) runPOSIXSessionInLease(ctx context.Context, lease *pool.Lease, targetHop plan.HopSpec, explicitProf execution.LaunchProfile, hasProf bool, preCheck func(context.Context, *pool.Lease) error, buildCmd func(execution.LaunchProfile) (execution.CommandPlan, error), stdout, stderr io.Writer) (execution.ExecutionOutcome, bool, error) {
 	if preCheck != nil {
 		if err := preCheck(ctx, lease); err != nil {
 			return makeNotStartedOutcome(execution.StartPhaseAuthorize, "precheck_failed", err), false, err

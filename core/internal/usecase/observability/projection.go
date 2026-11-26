@@ -28,12 +28,10 @@ func (r *ringBuf[T]) push(v T) {
 		return
 	}
 	if r.size < r.cap {
-		r.items[(r.head+r.size)%r.cap] = v
-		r.size++
+		r.items[(r.head+r.size)%r.cap], r.size = v, r.size+1
 		return
 	}
-	r.items[r.head] = v
-	r.head = (r.head + 1) % r.cap
+	r.items[r.head], r.head = v, (r.head+1)%r.cap
 }
 func (r *ringBuf[T]) snapshot() []T {
 	if r.size == 0 {
@@ -96,8 +94,7 @@ func NewProjection(ctx context.Context, cfg ProjectionConfig) (*Projection, erro
 		}
 	}
 	p := &Projection{
-		nursery: nursery, sub: sub, maxOps: maxOps, maxMetrics: maxMet,
-		initialized: true, notifyCh: make(chan struct{}),
+		nursery: nursery, sub: sub, maxOps: maxOps, maxMetrics: maxMet, initialized: true, notifyCh: make(chan struct{}),
 		ops: make(map[string]*OperationView, min(maxOps, 64)), metrics: make(map[string]MetricPoint, min(maxMet, 64)),
 		logs: newRingBuf[LogEntry](maxLogs), diags: newRingBuf[DiagnosticRecord](maxDiags), poolEvents: newRingBuf[PoolRecord](maxPool),
 	}
@@ -110,14 +107,9 @@ func NewProjection(ctx context.Context, cfg ProjectionConfig) (*Projection, erro
 	}
 	return p, nil
 }
-
 func normalizeProjectionCaps(cfg ProjectionConfig) (busBuf, maxLogs, maxDiags, maxPool, maxOps, maxMet int, err error) {
-	busBuf = pickIf(cfg.BusBuffer == 0, defaultProjectionBusBuf, cfg.BusBuffer)
-	maxLogs = pickIf(cfg.MaxLogEntries == 0, defaultProjectionLogs, cfg.MaxLogEntries)
-	maxDiags = pickIf(cfg.MaxDiagnostics == 0, defaultProjectionDiags, cfg.MaxDiagnostics)
-	maxPool = pickIf(cfg.MaxPoolEvents == 0, defaultProjectionPoolEvs, cfg.MaxPoolEvents)
-	maxOps = pickIf(cfg.MaxOperations == 0, defaultProjectionOps, cfg.MaxOperations)
-	maxMet = pickIf(cfg.MaxMetrics == 0, defaultProjectionMetrics, cfg.MaxMetrics)
+	busBuf, maxLogs, maxDiags = pickIf(cfg.BusBuffer == 0, 128, cfg.BusBuffer), pickIf(cfg.MaxLogEntries == 0, 512, cfg.MaxLogEntries), pickIf(cfg.MaxDiagnostics == 0, 256, cfg.MaxDiagnostics)
+	maxPool, maxOps, maxMet = pickIf(cfg.MaxPoolEvents == 0, 256, cfg.MaxPoolEvents), pickIf(cfg.MaxOperations == 0, 256, cfg.MaxOperations), pickIf(cfg.MaxMetrics == 0, 512, cfg.MaxMetrics)
 	for _, n := range [...]int{busBuf, maxLogs, maxDiags, maxPool, maxOps, maxMet} {
 		if n < 1 || n > maxProjectionBufferCap {
 			return 0, 0, 0, 0, 0, 0, fmt.Errorf("%w: Projection 缓冲容量 %d 须落在 [1, %d]", ErrInvalidConfig, n, maxProjectionBufferCap)
@@ -144,29 +136,22 @@ func (p *Projection) AttachOperationStream(stream *events.OperationStream) error
 	p.mu.Unlock()
 	if err := p.nursery.Go(func(wCtx context.Context) error {
 		defer p.onStreamDetached()
-		for {
-			ev, ok, err := stream.Next(wCtx)
-			if err != nil || !ok {
-				return nil
-			}
+		for ev, ok, err := stream.Next(wCtx); err == nil && ok; ev, ok, err = stream.Next(wCtx) {
 			_ = p.ApplyEvent(ev)
 		}
+		return nil
 	}); err != nil {
 		p.onStreamDetached()
 		return err
 	}
 	return nil
 }
-
 func (p *Projection) onStreamDetached() {
 	p.mu.Lock()
-	if p.activeStreams > 0 {
-		p.activeStreams--
-	}
+	p.activeStreams = max(p.activeStreams-1, 0)
 	p.bumpLocked()
 	p.mu.Unlock()
 }
-
 func (p *Projection) consumeSystemBus(ctx context.Context, sub *events.SystemSubscription) {
 	for {
 		ev, ok, err := sub.Next(ctx)
@@ -209,65 +194,52 @@ func (p *Projection) applyEventLocked(ev events.Event) error {
 	case *events.OperationStartedEvent:
 		op := p.ensureOpLocked(v.Meta())
 		op.Tool, op.Action, op.Summary = v.Tool(), v.Action(), v.Summary()
-		return nil
 	case *events.OperationCompletedEvent:
 		p.applyOpCompletedLocked(v)
-		return nil
 	case *events.OutputChunkEvent:
-		p.applyOutputChunkLocked(v)
-		return nil
+		m := v.Meta()
+		p.logs.push(LogEntry{TraceID: m.TraceID().String(), OperationID: optStringer(m.OperationID()), NodeID: optStringer(m.NodeID()), Stream: v.Stream(), ChunkIndex: v.ChunkIndex(), Data: string(v.Data()), Truncated: v.Truncated(), OccurredAt: m.OccurredAt()})
 	case *events.StepEvent:
 		p.applyStepLocked(v)
-		return nil
 	case *events.FSMTransitionEvent:
 		op := p.ensureOpLocked(v.Meta())
 		op.LastCode, op.LastMessage = v.EventName(), fmt.Sprintf("%s:%s->%s", v.Machine(), v.FromState(), v.ToState())
-		return nil
 	case *events.ApprovalChallengeEvent:
 		op := p.ensureOpLocked(v.Meta())
 		op.LastCode, op.LastMessage = "approval_challenge", v.Reason()
-		return nil
 	case *events.TransferProgressEvent:
 		op := p.ensureOpLocked(v.Meta())
 		op.LastCode, op.LastMessage = "transfer_progress", fmt.Sprintf("%s %d/%d", v.Stage(), v.BytesTransferred(), v.TotalBytes())
-		return nil
 	case *events.MetricSampleEvent:
 		p.applyMetricSampleLocked(v)
-		return nil
 	case *events.AuditRecordEvent:
-		if v.Stage() == events.AuditStageHalted {
-			p.gateHalted = true
-		}
-		if out, ok := v.Outcome().Get(); ok && out != nil && out.Kind() == execution.OutcomeKindUnknown {
-			p.hasUnknownOutcome = true
-		}
-		return nil
+		p.gateHalted = p.gateHalted || v.Stage() == events.AuditStageHalted
+		p.hasUnknownOutcome = p.hasUnknownOutcome || isOptUnknownOutcome(v.Outcome())
 	case *events.PoolStateEvent:
-		p.applyPoolStateLocked(v)
-		return nil
+		p.gateHalted = p.gateHalted || v.Action() == events.PoolActionGateHalted
+		p.poolEvents.push(PoolRecord{Action: v.Action(), Endpoint: optStringer(v.Endpoint()), ActiveLeases: v.ActiveLeases(), Latency: v.Latency(), Detail: v.Detail(), OccurredAt: v.Meta().OccurredAt()})
 	case *events.DiagnosticEvent:
-		if v.Code() == "gate_halted" {
-			p.gateHalted = true
-		}
+		p.gateHalted = p.gateHalted || v.Code() == "gate_halted"
 		p.diags.push(DiagnosticRecord{Scope: v.Scope(), Severity: v.Severity(), Code: v.Code(), Message: v.Message(), Attrs: v.Attrs(), OccurredAt: v.Meta().OccurredAt()})
-		return nil
 	case *events.BusDroppedEvent:
 		p.dropped += v.DroppedDelta()
-		return nil
 	default:
 		return fmt.Errorf("%w: 不支持的事件类型 %T", ErrInvalidRequest, ev)
 	}
+	return nil
+}
+
+func isOptUnknownOutcome(opt algebraic.Option[execution.ExecutionOutcome]) bool {
+	out, ok := opt.Get()
+	return ok && out != nil && out.Kind() == execution.OutcomeKindUnknown
 }
 
 func (p *Projection) ensureOpLocked(meta events.EventMeta) *OperationView {
-	opID := meta.TraceID().String()
-	if id, ok := meta.OperationID().Get(); ok {
-		opID = id.String()
-	}
+	opID := pickIf(optStringer(meta.OperationID()) != "", optStringer(meta.OperationID()), meta.TraceID().String())
 	if existing, ok := p.ops[opID]; ok {
 		existing.UpdatedAt = meta.OccurredAt()
-		if n, has := meta.NodeID().Get(); has && existing.NodeID == "" {
-			existing.NodeID = n.String()
+		if existing.NodeID == "" {
+			existing.NodeID = optStringer(meta.NodeID())
 		}
 		return existing
 	}
@@ -275,34 +247,22 @@ func (p *Projection) ensureOpLocked(meta events.EventMeta) *OperationView {
 		delete(p.ops, p.opOrder[0])
 		p.opOrder = p.opOrder[1:]
 	}
-	view := &OperationView{OperationID: opID, TraceID: meta.TraceID().String(), UpdatedAt: meta.OccurredAt()}
-	if n, has := meta.NodeID().Get(); has {
-		view.NodeID = n.String()
-	}
-	p.ops[opID] = view
-	p.opOrder = append(p.opOrder, opID)
+	view := &OperationView{OperationID: opID, TraceID: meta.TraceID().String(), NodeID: optStringer(meta.NodeID()), UpdatedAt: meta.OccurredAt()}
+	p.ops[opID], p.opOrder = view, append(p.opOrder, opID)
 	return view
 }
 
 func (p *Projection) applyOpCompletedLocked(v *events.OperationCompletedEvent) {
 	op := p.ensureOpLocked(v.Meta())
 	op.Completed, op.Succeeded, op.Duration, op.LastCode, op.LastMessage = true, v.Succeeded(), v.Duration(), v.Code(), v.Message()
-	if out, ok := v.Outcome().Get(); ok && out != nil && out.Kind() == execution.OutcomeKindUnknown {
+	if isOptUnknownOutcome(v.Outcome()) {
 		op.Unknown, p.hasUnknownOutcome = true, true
 	}
-}
-func (p *Projection) applyOutputChunkLocked(v *events.OutputChunkEvent) {
-	meta := v.Meta()
-	opID, nodeID := optStringer(meta.OperationID()), optStringer(meta.NodeID())
-	p.logs.push(LogEntry{
-		TraceID: meta.TraceID().String(), OperationID: opID, NodeID: nodeID,
-		Stream: v.Stream(), ChunkIndex: v.ChunkIndex(), Data: string(v.Data()), Truncated: v.Truncated(), OccurredAt: meta.OccurredAt(),
-	})
 }
 func (p *Projection) applyStepLocked(v *events.StepEvent) {
 	op := p.ensureOpLocked(v.Meta())
 	op.LastStepID, op.LastStepStat, op.LastMessage = v.StepID().String(), v.Status().String(), v.Message()
-	if out, ok := v.Outcome().Get(); ok && out != nil && out.Kind() == execution.OutcomeKindUnknown {
+	if isOptUnknownOutcome(v.Outcome()) {
 		op.Unknown, p.hasUnknownOutcome = true, true
 	}
 }
@@ -320,15 +280,6 @@ func (p *Projection) applyMetricSampleLocked(v *events.MetricSampleEvent) {
 		Value: v.Value(), Interval: v.Interval(), Labels: v.Labels(), OccurredAt: v.Meta().OccurredAt(),
 	}
 }
-func (p *Projection) applyPoolStateLocked(v *events.PoolStateEvent) {
-	if v.Action() == events.PoolActionGateHalted {
-		p.gateHalted = true
-	}
-	p.poolEvents.push(PoolRecord{
-		Action: v.Action(), Endpoint: optStringer(v.Endpoint()), ActiveLeases: v.ActiveLeases(),
-		Latency: v.Latency(), Detail: v.Detail(), OccurredAt: v.Meta().OccurredAt(),
-	})
-}
 func optStringer[T interface{ String() string }](o algebraic.Option[T]) string {
 	if v, ok := o.Get(); ok {
 		return v.String()
@@ -336,11 +287,8 @@ func optStringer[T interface{ String() string }](o algebraic.Option[T]) string {
 	return ""
 }
 
-func (p *Projection) bumpLocked() {
-	p.version++
-	close(p.notifyCh)
-	p.notifyCh = make(chan struct{})
-}
+func (p *Projection) wakeLocked() { close(p.notifyCh); p.notifyCh = make(chan struct{}) }
+func (p *Projection) bumpLocked() { p.version++; p.wakeLocked() }
 
 // Snapshot 返回当前聚合投影的无锁竞态、确定性排序不可变快照；未初始化零值失败关闭。
 func (p *Projection) Snapshot() ProjectionSnapshot {
@@ -351,7 +299,6 @@ func (p *Projection) Snapshot() ProjectionSnapshot {
 	defer p.mu.Unlock()
 	return p.snapshotLocked()
 }
-
 func (p *Projection) snapshotLocked() ProjectionSnapshot {
 	ops := make([]OperationView, 0, len(p.opOrder))
 	for _, id := range p.opOrder {
@@ -365,12 +312,7 @@ func (p *Projection) snapshotLocked() ProjectionSnapshot {
 		mets = append(mets, m)
 	}
 	slices.SortFunc(mets, func(a, b MetricPoint) int { return cmp.Compare(a.Key, b.Key) })
-	return ProjectionSnapshot{
-		version: p.version, totalEvents: p.totalEvents, droppedEvents: p.dropped,
-		gateHalted: p.gateHalted, hasUnknownOutcome: p.hasUnknownOutcome, activeStreams: p.activeStreams,
-		operations: ops, metrics: mets, logs: p.logs.snapshot(),
-		diagnostics: p.diags.snapshot(), poolEvents: p.poolEvents.snapshot(), valid: true,
-	}
+	return ProjectionSnapshot{wire: projectionSnapshotWire{Version: p.version, TotalEvents: p.totalEvents, DroppedEvents: p.dropped, GateHalted: p.gateHalted, HasUnknownOutcome: p.hasUnknownOutcome, ActiveStreams: p.activeStreams, Operations: ops, Metrics: mets, Logs: p.logs.snapshot(), Diagnostics: p.diags.snapshot(), PoolEvents: p.poolEvents.snapshot()}, valid: true}
 }
 
 // WaitUpdate 以纯事件驱动阻塞等待投影版本号严格大于 sinceVersion，或 ctx 取消 / Projection 关闭（0 轮询）。
@@ -383,15 +325,10 @@ func (p *Projection) WaitUpdate(ctx context.Context, sinceVersion uint64) (Proje
 	}
 	for {
 		p.mu.Lock()
-		if p.version > sinceVersion {
-			snap := p.snapshotLocked()
+		if p.version > sinceVersion || p.closed {
+			snap, closed := p.snapshotLocked(), p.version <= sinceVersion && p.closed
 			p.mu.Unlock()
-			return snap, nil
-		}
-		if p.closed {
-			snap := p.snapshotLocked()
-			p.mu.Unlock()
-			return snap, ErrProjectionClosed
+			return snap, pickIf[error](closed, ErrProjectionClosed, nil)
 		}
 		waitCh := p.notifyCh
 		p.mu.Unlock()
@@ -403,7 +340,7 @@ func (p *Projection) WaitUpdate(ctx context.Context, sinceVersion uint64) (Proje
 	}
 }
 
-// Close 幂等关闭订阅与 Nursery，确定性排空全部后台消费协程并唤醒所有 WaitUpdate 等待者（0 goroutine 泄漏）。
+// Close 幂等关闭订阅与 Nursery，确定性排空全部后台消费协程并唤醒所有 WaitUpdate 等待者（不伪造版本自增，0 goroutine 泄漏）。
 func (p *Projection) Close() error {
 	if p == nil || !p.initialized {
 		return nil
@@ -412,7 +349,7 @@ func (p *Projection) Close() error {
 	p.closeOnce.Do(func() {
 		p.mu.Lock()
 		p.closed = true
-		p.bumpLocked()
+		p.wakeLocked()
 		p.mu.Unlock()
 		if p.sub != nil {
 			p.sub.Close()

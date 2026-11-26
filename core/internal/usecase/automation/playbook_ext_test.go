@@ -408,3 +408,142 @@ func TestPlaybookRound2ProtectedPathTOCTOUAndApprovalDeterminism(t *testing.T) {
 		t.Fatalf("expected scope drift message, got %q", resFlip.Report().Nodes()[0].Steps()[1].Message())
 	}
 }
+
+func TestPlaybookRound2HardeningTemplateBombUnknownStopAndWriteErrors(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// 1. 模板渲染输出炸弹防 OOM（极小源文件展开超限立即返回 ports.ErrLimitExceeded）。
+	rig := newAutoRig(t, autoRigOpts{profile: gate.PolicyProfileStrictAgent, fallback: gate.NoElicitFallbackChallenge})
+	defer rig.close()
+	bombSrc, _ := pathalg.ParseLocalSourcePath("/ops/bomb.tmpl")
+	mustOK(t, rig.opReadFS.PutFile(bombSrc, []byte(`{{$s := printf "%600000s" "x"}}{{$s}}{{$s}}{{$s}}{{$s}}{{$s}}{{$s}}{{$s}}{{$s}}`)), "PutFile bomb")
+	safeDst, _ := pathalg.ParseRemotePath("/tmp/safe/bomb.out")
+	safeDir, _ := pathalg.ParseRemotePath("/tmp/safe")
+	node := makeTargetNode(t, "h-1", "10.1.5.1:22", "web")
+	mustOK(t, rig.dialer.rfsFor("h-1", rig.clock).MkdirAll(context.Background(), safeDir, 0o755), "MkdirAll")
+	tmBomb, _ := playbook.NewStepTemplate(playbook.StepTemplateSpec{Source: bombSrc, Dest: safeDst, Overwrite: true, Atomic: true})
+	pbBomb := mustPlaybookFromSteps(t, "pb-bomb", playbook.OnErrorFailFast, nil, mustStep(t, "t1", tmBomb))
+	resBomb, err := rig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+		Playbook: pbBomb, Targets: []automation.TargetNode{node}, Risk: algebraic.Some(security.RiskSafe),
+	})
+	if !errors.Is(err, automation.ErrPlaybookFailed) || !strings.Contains(resBomb.Report().Nodes()[0].Steps()[0].Message(), "上限") {
+		t.Fatalf("expected template expansion bomb bounded failure, err=%v msg=%q", err, resBomb.Report().Nodes()[0].Steps()[0].Message())
+	}
+
+	// 2. 两步审批绑定 Concurrency/DefaultProfile/ScopedSourceRoot：篡改 Concurrency 必拒。
+	shAct, _ := playbook.NewStepShell(playbook.StepShellSpec{Command: "echo ok"})
+	pbAppr := mustPlaybookFromSteps(t, "pb-bind", playbook.OnErrorFailFast, nil, mustStep(t, "s1", shAct))
+	_, err = rig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+		Playbook: pbAppr, Targets: []automation.TargetNode{node}, Concurrency: 2, Risk: algebraic.Some(security.RiskDangerous),
+	})
+	var chalErr *gate.ApprovalChallengeError
+	if !errors.Is(err, gate.ErrApprovalRequired) || !errors.As(err, &chalErr) {
+		t.Fatalf("expected ApprovalChallengeError, got %v", err)
+	}
+	sub := makeApprovalSub(t, chalErr)
+	if _, err := rig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+		Playbook: pbAppr, Targets: []automation.TargetNode{node}, Concurrency: 4,
+		Risk: algebraic.Some(security.RiskDangerous), Approval: algebraic.Some(sub),
+	}); err == nil {
+		t.Fatalf("expected tampered Concurrency rejected")
+	}
+
+	// 3. WhenTags 隔离 Round-2 软链规范化 + StepShell WorkDir Round-2 拦截。
+	dbNode := makeTargetNode(t, "h-db", "10.1.5.2:22", "db")
+	mustOK(t, rig.dialer.rfsFor("h-db", rig.clock).MkdirAll(context.Background(), safeDir, 0o755), "MkdirAll db")
+	tagLink, _ := pathalg.ParseRemotePath("/tmp/safe/db-only.conf")
+	mustOK(t, rig.dialer.rfsFor("h-1", rig.clock).PutSymlink(tagLink, "/etc/shadow"), "PutSymlink on web only")
+	okSrc, _ := pathalg.ParseLocalSourcePath("/ops/ok.conf")
+	mustOK(t, rig.opReadFS.PutFile(okSrc, []byte("ok")), "PutFile ok")
+	cpDB, _ := playbook.NewStepCopy(playbook.StepCopySpec{Source: okSrc, Dest: tagLink, Overwrite: true, Atomic: true})
+	pbTag := mustPlaybookFromSteps(t, "pb-tag-r2", playbook.OnErrorFailFast, nil, mustStep(t, "c-db", cpDB, "db"))
+	resTag, err := rig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+		Playbook: pbTag, Targets: []automation.TargetNode{node, dbNode}, Risk: algebraic.Some(security.RiskSafe),
+	})
+	mustOK(t, err, "RunPlaybook WhenTags isolated Round-2")
+	if resTag.Report().Status() != playbook.NodeStatusChanged {
+		t.Fatalf("expected Changed, got %v", resTag.Report().Status())
+	}
+
+	wdEvil, _ := pathalg.ParseRemotePath("/tmp/safe/wd-etc")
+	mustOK(t, rig.dialer.rfsFor("h-1", rig.clock).PutSymlink(wdEvil, "/etc"), "PutSymlink wd")
+	shWD, _ := playbook.NewStepShell(playbook.StepShellSpec{Command: "ls", WorkDir: algebraic.Some(wdEvil)})
+	pbWD := mustPlaybookFromSteps(t, "pb-wd-r2", playbook.OnErrorFailFast, nil, mustStep(t, "s-wd", shWD))
+	if _, err := rig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+		Playbook: pbWD, Targets: []automation.TargetNode{node}, Risk: algebraic.Some(security.RiskSafe),
+	}); err == nil {
+		t.Fatalf("expected StepShell WorkDir Round-2 protected redirect blocked/challenged")
+	}
+}
+
+func TestPlaybookUnknownContinueStopWritePreErrorsAndCacheCap(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// 1. OnErrorContinue 下 OutcomeUnknown 仍须立即停止当前不确定节点后续步骤，且不影响兄弟节点。
+	directRig := newAutoRig(t, autoRigOpts{})
+	defer directRig.close()
+	var n1Step2Ran atomic.Bool
+	directRig.dialer.onCmd = func(_ context.Context, nodeID string, cmd execution.CommandPlan, _ []byte, _, _ io.Writer) (execution.ExecutionOutcome, error) {
+		if nodeID == "u-1" && cmd.Command() == "step1" {
+			return nil, errors.New("tcp reset unknown")
+		}
+		if nodeID == "u-1" && cmd.Command() == "step2" {
+			n1Step2Ran.Store(true)
+		}
+		return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	}
+	u1, u2 := makeTargetNode(t, "u-1", "10.1.6.1:22"), makeTargetNode(t, "u-2", "10.1.6.2:22")
+	st1, _ := playbook.NewStepShell(playbook.StepShellSpec{Command: "step1"})
+	st2, _ := playbook.NewStepShell(playbook.StepShellSpec{Command: "step2"})
+	pbUnk := mustPlaybookFromSteps(t, "pb-unk-cont", playbook.OnErrorContinue, nil, mustStep(t, "s1", st1), mustStep(t, "s2", st2))
+	resUnk, err := directRig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+		Playbook: pbUnk, Targets: []automation.TargetNode{u1, u2},
+	})
+	if !errors.Is(err, automation.ErrUncertainOutcome) || n1Step2Ran.Load() {
+		t.Fatalf("OutcomeUnknown under OnErrorContinue must stop uncertain node: err=%v s2Ran=%v", err, n1Step2Ran.Load())
+	}
+	if resUnk.Report().Nodes()[0].Steps()[1].Status() != playbook.StepStatusAborted || resUnk.Report().Nodes()[1].Status() != playbook.NodeStatusChanged {
+		t.Fatalf("unexpected node outcomes: u1=%+v u2=%v", resUnk.Report().Nodes()[0].Steps(), resUnk.Report().Nodes()[1].Status())
+	}
+}
+
+func TestPlaybookWritePreErrorsAndCachedSourceCap(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	directRig := newAutoRig(t, autoRigOpts{})
+	defer directRig.close()
+	u1 := makeTargetNode(t, "u-1", "10.1.6.1:22")
+	okSrc, _ := pathalg.ParseLocalSourcePath("/ops/ok.conf")
+	safeDst, _ := pathalg.ParseRemotePath("/tmp/safe/bomb.out")
+	// 1. ports.ErrSymlinkRejected / ports.ErrNotRegularFile 写前拒绝映射为 OutcomeNotStarted（非 OutcomeUnknown）。
+	mustOK(t, directRig.opReadFS.PutFile(okSrc, []byte("data")), "PutFile ok")
+	for _, preErr := range []error{ports.ErrSymlinkRejected, ports.ErrNotRegularFile} {
+		directRig.dialer.onWrite = func(context.Context, string, pathalg.RemotePath) error { return preErr }
+		cpPre, _ := playbook.NewStepCopy(playbook.StepCopySpec{Source: okSrc, Dest: safeDst, Overwrite: true, Atomic: true})
+		pbPre := mustPlaybookFromSteps(t, "pb-pre", playbook.OnErrorFailFast, nil, mustStep(t, "c1", cpPre))
+		resPre, wErr := directRig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+			Playbook: pbPre, Targets: []automation.TargetNode{u1},
+		})
+		if !errors.Is(wErr, automation.ErrPlaybookFailed) || resPre.HasUnknownOutcome() {
+			t.Fatalf("expected OutcomeNotStarted (not Unknown) for %v, err=%v unk=%v", preErr, wErr, resPre.HasUnknownOutcome())
+		}
+		out, has := resPre.Report().Nodes()[0].Steps()[0].Outcome().Get()
+		if !has || out.Kind() != execution.OutcomeKindNotStarted {
+			t.Fatalf("expected OutcomeKindNotStarted for %v, got %v", preErr, out)
+		}
+	}
+
+	// 6. 缓存命中复用同源不同步骤上限时复核 maxBytes（copy=1024, script=32）。
+	tightSvc, err := automation.NewService(automation.ServiceConfig{
+		Gate: directRig.gate, Pool: directRig.pool, Clock: directRig.clock, Entropy: directRig.rng,
+		OperatorReadFS: directRig.opReadFS, MaxCopyBytes: 1024, MaxScriptBytes: 32,
+	})
+	mustOK(t, err, "NewService tight")
+	dualSrc, _ := pathalg.ParseLocalSourcePath("/ops/dual.sh")
+	mustOK(t, directRig.opReadFS.PutFile(dualSrc, []byte(strings.Repeat("a", 100))), "PutFile dual")
+	cpDual, _ := playbook.NewStepCopy(playbook.StepCopySpec{Source: dualSrc, Dest: safeDst, Overwrite: true, Atomic: true})
+	scDual, _ := playbook.NewStepScript(playbook.StepScriptSpec{Source: dualSrc})
+	pbDual := mustPlaybookFromSteps(t, "pb-dual-cap", playbook.OnErrorFailFast, nil, mustStep(t, "c1", cpDual), mustStep(t, "s1", scDual))
+	if _, err := tightSvc.RunPlaybook(context.Background(), automation.PlaybookRequest{
+		Playbook: pbDual, Targets: []automation.TargetNode{u1},
+	}); !errors.Is(err, ports.ErrLimitExceeded) {
+		t.Fatalf("expected ErrLimitExceeded on cached script exceeding MaxScriptBytes, got %v", err)
+	}
+}

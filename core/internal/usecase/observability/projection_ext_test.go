@@ -263,3 +263,38 @@ func TestProjectionBusStreamAttachWaitUpdateAndCleanClose(t *testing.T) {
 		t.Fatalf("expected ErrProjectionClosed after close, got %v", err)
 	}
 }
+
+func TestProjectionCloseWakesWaitUpdateWithoutVersionBump(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	proj, err := observability.NewProjection(context.Background(), observability.ProjectionConfig{})
+	mustNoErr(t, err, "NewProjection")
+
+	m := makeMeta(t, "trace-c", "op-c", "node-c", 1, sim.DefaultBaseTime())
+	ev, err := events.NewDiagnosticEvent(events.DiagnosticSpec{
+		Meta: m, Scope: events.DiagnosticScopeRuntime, Severity: events.SeverityInfo, Code: "ok", Message: "init",
+	})
+	mustNoErr(t, err, "NewDiagnosticEvent")
+	mustNoErr(t, proj.ApplyEvent(ev), "ApplyEvent")
+	verBefore := proj.Snapshot().Version()
+
+	started := make(chan struct{})
+	var waitErr error
+	var waitSnap observability.ProjectionSnapshot
+	mustNoErr(t, conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		_ = n.Go(func(c context.Context) error {
+			close(started)
+			waitSnap, waitErr = proj.WaitUpdate(c, verBefore)
+			return nil
+		})
+		return n.Go(func(context.Context) error {
+			<-started
+			return proj.Close()
+		})
+	}), "RunWait")
+	if !errors.Is(waitErr, observability.ErrProjectionClosed) {
+		t.Fatalf("expected immediate ErrProjectionClosed without spurious nil update, got err=%v ver=%d", waitErr, waitSnap.Version())
+	}
+	if proj.Snapshot().Version() != verBefore {
+		t.Fatalf("Close must not bump version: before=%d after=%d", verBefore, proj.Snapshot().Version())
+	}
+}

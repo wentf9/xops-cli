@@ -3,6 +3,7 @@ package observability
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -17,8 +18,7 @@ func ExtractAndProcessScreenshot(rawStdout []byte) (ProcessedScreenshot, error) 
 	if err != nil {
 		return ProcessedScreenshot{}, err
 	}
-	maxEncodedLen := base64.StdEncoding.EncodedLen(maxScreenshotRawBytes)
-	if len(b64Payload) == 0 || len(b64Payload) > maxEncodedLen {
+	if len(b64Payload) == 0 || len(b64Payload) > base64.StdEncoding.EncodedLen(maxScreenshotRawBytes) {
 		return ProcessedScreenshot{}, fmt.Errorf("%w: Base64 截图载荷为空或超过字节上限", ErrScreenshotInvalid)
 	}
 	decoded, err := base64.StdEncoding.DecodeString(b64Payload)
@@ -27,28 +27,41 @@ func ExtractAndProcessScreenshot(rawStdout []byte) (ProcessedScreenshot, error) 
 	}
 	return ProcessScreenshotBytes(decoded)
 }
-
 func extractMarkedPayload(stdout string) (string, error) {
-	startIdx := strings.Index(stdout, screenshotStartMarker)
-	if startIdx < 0 {
+	_, rest, ok := strings.Cut(stdout, screenshotStartMarker)
+	if !ok {
 		return "", fmt.Errorf("%w: 缺少截图起始标记", ErrScreenshotInvalid)
 	}
-	rest := stdout[startIdx+len(screenshotStartMarker):]
-	endIdx := strings.Index(rest, screenshotEndMarker)
-	if endIdx < 0 {
+	body, _, ok := strings.Cut(rest, screenshotEndMarker)
+	if !ok {
 		return "", fmt.Errorf("%w: 截图载荷截断（缺少结束标记）", ErrScreenshotInvalid)
 	}
-	return strings.TrimSpace(rest[:endIdx]), nil
+	return strings.TrimSpace(body), nil
+}
+func stripMarkedPayload(stdout string) string {
+	before, rest, ok := strings.Cut(stdout, screenshotStartMarker)
+	if !ok {
+		return stdout
+	}
+	_, after, ok := strings.Cut(rest, screenshotEndMarker)
+	if !ok {
+		return stdout
+	}
+	return before + strings.TrimPrefix(strings.TrimPrefix(after, "\r"), "\n")
 }
 
 // ProcessScreenshotBytes 对原始图像字节执行纯 Go 零 CGO 魔数校验、防解压炸弹校验与最长边 1280px 等比 JPEG 压缩；
-// 合法 WebP 直接有界透传，不支持或受损图像严格失败关闭返回 ErrScreenshotInvalid。
+// 合法 WebP 在完整校验 RIFF/VP8/VP8L/VP8X 尺寸头后有界透传，不支持或受损图像严格失败关闭返回 ErrScreenshotInvalid。
 func ProcessScreenshotBytes(raw []byte) (ProcessedScreenshot, error) {
 	if len(raw) < 12 || len(raw) > maxScreenshotRawBytes {
 		return ProcessedScreenshot{}, fmt.Errorf("%w: 图像字节长度非法", ErrScreenshotInvalid)
 	}
 	if isWebP(raw) {
-		return ProcessedScreenshot{MIMEType: "image/webp", Data: bytes.Clone(raw)}, nil
+		w, h, err := parseWebPDimensions(raw)
+		if err != nil {
+			return ProcessedScreenshot{}, err
+		}
+		return ProcessedScreenshot{MIMEType: "image/webp", Width: w, Height: h, OrigWidth: w, OrigHeight: h, Data: bytes.Clone(raw)}, nil
 	}
 	img, origW, origH, err := decodeGuardedImage(raw)
 	if err != nil {
@@ -63,12 +76,8 @@ func ProcessScreenshotBytes(raw []byte) (ProcessedScreenshot, error) {
 	if err := jpeg.Encode(&out, scaled, &jpeg.Options{Quality: screenshotJPEGQuality}); err != nil {
 		return ProcessedScreenshot{}, fmt.Errorf("%w: JPEG 编码失败: %w", ErrScreenshotInvalid, err)
 	}
-	return ProcessedScreenshot{
-		MIMEType: "image/jpeg", Width: dstW, Height: dstH,
-		OrigWidth: origW, OrigHeight: origH, Data: out.Bytes(),
-	}, nil
+	return ProcessedScreenshot{MIMEType: "image/jpeg", Width: dstW, Height: dstH, OrigWidth: origW, OrigHeight: origH, Data: out.Bytes()}, nil
 }
-
 func isWebP(raw []byte) bool {
 	return len(raw) >= 12 && bytes.Equal(raw[:4], []byte("RIFF")) && bytes.Equal(raw[8:12], []byte("WEBP"))
 }
@@ -77,6 +86,51 @@ func isPNG(raw []byte) bool {
 }
 func isJPEG(raw []byte) bool {
 	return len(raw) >= 3 && raw[0] == 0xff && raw[1] == 0xd8 && raw[2] == 0xff
+}
+func validateImageDimensions(w, h int) error {
+	if w <= 0 || h <= 0 || w > maxScreenshotDim || h > maxScreenshotDim || int64(w)*int64(h) > maxScreenshotPixels {
+		return fmt.Errorf("%w: 图像尺寸 %dx%d 超过安全上限", ErrScreenshotInvalid, w, h)
+	}
+	return nil
+}
+
+// parseWebPDimensions 纯 Go 解析 WebP RIFF 容器长度与 VP8/VP8L/VP8X 宽高头，阻断截断伪造载荷与像素炸弹。
+func parseWebPDimensions(raw []byte) (int, int, error) {
+	if len(raw) < 20 || !isWebP(raw) {
+		return 0, 0, fmt.Errorf("%w: WebP 头截断", ErrScreenshotInvalid)
+	}
+	riffSize := uint64(binary.LittleEndian.Uint32(raw[4:8]))
+	chunkSize := uint64(binary.LittleEndian.Uint32(raw[16:20]))
+	if riffSize < 12 || riffSize+8 > uint64(len(raw)) || 20+chunkSize > uint64(len(raw)) {
+		return 0, 0, fmt.Errorf("%w: WebP RIFF/Chunk 长度越界", ErrScreenshotInvalid)
+	}
+	var w, h int
+	switch string(raw[12:16]) {
+	case "VP8 ":
+		if chunkSize < 10 || raw[20]&0x01 != 0 || raw[23] != 0x9d || raw[24] != 0x01 || raw[25] != 0x2a {
+			return 0, 0, fmt.Errorf("%w: 非法 VP8 关键帧头", ErrScreenshotInvalid)
+		}
+		w = int(binary.LittleEndian.Uint16(raw[26:28]) & 0x3fff)
+		h = int(binary.LittleEndian.Uint16(raw[28:30]) & 0x3fff)
+	case "VP8L":
+		if chunkSize < 5 || raw[20] != 0x2f {
+			return 0, 0, fmt.Errorf("%w: 非法 VP8L 无损头", ErrScreenshotInvalid)
+		}
+		bits := binary.LittleEndian.Uint32(raw[21:25])
+		w, h = int(bits&0x3fff)+1, int((bits>>14)&0x3fff)+1
+	case "VP8X":
+		if chunkSize < 10 {
+			return 0, 0, fmt.Errorf("%w: 非法 VP8X 扩展头", ErrScreenshotInvalid)
+		}
+		w = int(uint32(raw[24])|uint32(raw[25])<<8|uint32(raw[26])<<16) + 1
+		h = int(uint32(raw[27])|uint32(raw[28])<<8|uint32(raw[29])<<16) + 1
+	default:
+		return 0, 0, fmt.Errorf("%w: 不支持的 WebP Chunk 类型 %q", ErrScreenshotInvalid, string(raw[12:16]))
+	}
+	if err := validateImageDimensions(w, h); err != nil {
+		return 0, 0, err
+	}
+	return w, h, nil
 }
 
 func decodeGuardedImage(raw []byte) (image.Image, int, int, error) {
@@ -96,8 +150,8 @@ func decodeGuardedImage(raw []byte) (image.Image, int, int, error) {
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("%w: 图像头解析失败: %w", ErrScreenshotInvalid, err)
 	}
-	if cfg.Width <= 0 || cfg.Height <= 0 || cfg.Width > maxScreenshotDim || cfg.Height > maxScreenshotDim || int64(cfg.Width)*int64(cfg.Height) > maxScreenshotPixels {
-		return nil, 0, 0, fmt.Errorf("%w: 图像尺寸 %dx%d 超过安全上限", ErrScreenshotInvalid, cfg.Width, cfg.Height)
+	if err := validateImageDimensions(cfg.Width, cfg.Height); err != nil {
+		return nil, 0, 0, err
 	}
 	img, err := decodeFn(bytes.NewReader(raw))
 	if err != nil {
@@ -120,19 +174,16 @@ func calcScaledDimensions(w, h, maxEdge int) (int, int) {
 // downscaleBilinear 执行纯 Go 零 CGO 双线性插值缩放，避免引入第三方图像缩放依赖并保持 UI 文本清晰。
 func downscaleBilinear(src image.Image, dstW, dstH int) *image.RGBA {
 	sb := src.Bounds()
-	srcW, srcH := sb.Dx(), sb.Dy()
-	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
-	xRatio, yRatio := float64(srcW)/float64(dstW), float64(srcH)/float64(dstH)
+	srcW, srcH, dst := sb.Dx(), sb.Dy(), image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+	xr, yr := float64(srcW)/float64(dstW), float64(srcH)/float64(dstH)
 	for y := range dstH {
-		sy := (float64(y)+0.5)*yRatio - 0.5
+		sy := (float64(y)+0.5)*yr - 0.5
 		y0 := min(max(int(sy), 0), srcH-1)
-		y1 := min(y0+1, srcH-1)
-		wy := min(max(sy-float64(y0), 0), 1)
+		y1, wy := min(y0+1, srcH-1), min(max(sy-float64(y0), 0), 1)
 		for x := range dstW {
-			sx := (float64(x)+0.5)*xRatio - 0.5
+			sx := (float64(x)+0.5)*xr - 0.5
 			x0 := min(max(int(sx), 0), srcW-1)
-			x1 := min(x0+1, srcW-1)
-			wx := min(max(sx-float64(x0), 0), 1)
+			x1, wx := min(x0+1, srcW-1), min(max(sx-float64(x0), 0), 1)
 			r, g, b := blend4(src, sb.Min.X+x0, sb.Min.Y+y0, sb.Min.X+x1, sb.Min.Y+y1, wx, wy)
 			off := dst.PixOffset(x, y)
 			dst.Pix[off], dst.Pix[off+1], dst.Pix[off+2], dst.Pix[off+3] = r, g, b, 0xff
@@ -140,7 +191,6 @@ func downscaleBilinear(src image.Image, dstW, dstH int) *image.RGBA {
 	}
 	return dst
 }
-
 func blend4(src image.Image, x0, y0, x1, y1 int, wx, wy float64) (uint8, uint8, uint8) {
 	r00, g00, b00, _ := src.At(x0, y0).RGBA()
 	r10, g10, b10, _ := src.At(x1, y0).RGBA()

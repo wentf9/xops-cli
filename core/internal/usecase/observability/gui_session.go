@@ -21,14 +21,21 @@ import (
 
 // OpenGUISession 在 CapTunnel 门控与 pool.RegisterLeaseHandleWith 监督下建立受管 X11/VNC 隧道会话，
 // 强制端口与套接字路径强校验、默认仅绑定本机回环并支持 Gate Halted 即时吊销（0 goroutine 泄漏）。
+type guiSessionPrepared struct {
+	hop                  plan.HopSpec
+	fwdSpec              ports.ForwardSpec
+	bindHost, remoteDesc string
+	nonLoopback          bool
+}
+
 func (s *Service) OpenGUISession(ctx context.Context, req OpenGUISessionRequest) (GUISessionInfo, error) {
 	defer closeStream(req.OperationStream)
-	targetHop, fwdSpec, bindHost, remoteDesc, nonLoopback, err := s.validateOpenGUISession(ctx, req)
+	prep, err := s.validateOpenGUISession(ctx, req)
 	if err != nil {
 		return GUISessionInfo{}, err
 	}
-	nodeID := resolveNodeID(targetHop, req.NodeID)
-	gateReq, err := buildGUISessionGateRequest(req, targetHop, nodeID, bindHost, fwdSpec.BindAddr(), remoteDesc, nonLoopback)
+	nodeID := resolveNodeID(prep.hop, req.NodeID)
+	gateReq, err := buildGUISessionGateRequest(req, prep.hop, nodeID, prep.bindHost, prep.fwdSpec.BindAddr(), prep.remoteDesc, prep.nonLoopback)
 	if err != nil {
 		return GUISessionInfo{}, err
 	}
@@ -39,7 +46,7 @@ func (s *Service) OpenGUISession(ctx context.Context, req OpenGUISessionRequest)
 			err := s.pool.WithLease(authCtx, req.Plan, func(leaseCtx context.Context, lease *pool.Lease) error {
 				var rErr error
 				handle, rErr = pool.RegisterLeaseHandleWith[plan.KindTunnel](s.pool, lease, authBind, func(revokeCtx context.Context, conn ports.TransportConn) (*managedGUITunnel, error) {
-					mt, sErr := startManagedGUITunnel(leaseCtx, revokeCtx, s.forwarder, conn, fwdSpec, req.Spec.Kind, req.Spec.DisplayNum, remoteDesc)
+					mt, sErr := startManagedGUITunnel(leaseCtx, revokeCtx, s.forwarder, conn, prep.fwdSpec, req.Spec.Kind, req.Spec.DisplayNum, prep.remoteDesc)
 					if sErr == nil {
 						boundAddr = mt.boundAddr
 					}
@@ -55,28 +62,22 @@ func (s *Service) OpenGUISession(ctx context.Context, req OpenGUISessionRequest)
 		}
 		return GUISessionInfo{}, gateErr
 	}
-	return GUISessionInfo{handle: handle, kind: req.Spec.Kind, display: req.Spec.DisplayNum, boundAddr: boundAddr, remoteEnd: remoteDesc, valid: true}, nil
+	return GUISessionInfo{handle: handle, kind: req.Spec.Kind, display: req.Spec.DisplayNum, boundAddr: boundAddr, remoteEnd: prep.remoteDesc, valid: true}, nil
 }
 
 func buildGUISessionGateRequest(req OpenGUISessionRequest, hop plan.HopSpec, nodeID, bindHost, bindAddr, remoteDesc string, nonLoopback bool) (gate.GateRequest[security.CapTunnel], error) {
-	defaultRisk := pickIf(nonLoopback, security.RiskDangerous, security.RiskModerate)
-	binding, err := security.NewOperationBinding(security.OperationBindingSpec{
+	return newObsGateReq[security.CapTunnel](security.OperationBindingSpec{
 		Capability: security.CapabilityTunnel, Tool: toolObservability, Action: "gui_session_open",
-		NodeID: nodeID, Endpoint: algebraic.Some(hop.Endpoint()),
-		PlanDigest: algebraic.Some(req.Plan.PlanDigest().SecurityDigest()),
+		NodeID: nodeID, Endpoint: algebraic.Some(hop.Endpoint()), PlanDigest: algebraic.Some(req.Plan.PlanDigest().SecurityDigest()),
 		Parameters: map[string]string{
 			"kind": req.Spec.Kind.String(), "display": strconv.Itoa(req.Spec.DisplayNum),
-			"bind_host": bindHost, "remote": remoteDesc, "non_loopback": strconv.FormatBool(nonLoopback),
+			"bind_host": bindHost, "bind_port": strconv.FormatUint(uint64(req.Spec.LocalBindPort), 10),
+			"bind_addr": bindAddr, "use_unix_socket": strconv.FormatBool(req.Spec.UseUnixSocket),
+			"remote": remoteDesc, "non_loopback": strconv.FormatBool(nonLoopback),
 		},
-	})
-	if err != nil {
-		return zeroVal[gate.GateRequest[security.CapTunnel]](), err
-	}
-	return gate.NewGateRequest[security.CapTunnel](gate.GateRequestSpec[security.CapTunnel]{
-		Binding: binding, Risk: req.Risk.OrElse(defaultRisk),
-		ScopeSummary: fmt.Sprintf("open %s GUI session :%d on %s (%s -> %s)", req.Spec.Kind, req.Spec.DisplayNum, nodeID, bindAddr, remoteDesc),
-		Approval:     req.Approval, OperationStream: req.OperationStream,
-	})
+	}, req.Risk.OrElse(pickIf(nonLoopback, security.RiskDangerous, security.RiskModerate)),
+		fmt.Sprintf("open %s GUI session :%d on %s (%s -> %s)", req.Spec.Kind, req.Spec.DisplayNum, nodeID, bindAddr, remoteDesc),
+		nil, nil, req.Approval, req.OperationStream)
 }
 
 type guiTunnelSnapshotter interface {
@@ -106,51 +107,53 @@ func (s *Service) InspectGUISession(ctx context.Context, handle plan.ManagedHand
 
 // CloseGUISession 显式释放受管 GUI 会话句柄并有界关闭底层转发与守护协程。
 func (s *Service) CloseGUISession(ctx context.Context, handle plan.ManagedHandle[plan.KindTunnel]) error {
-	if s == nil || !s.valid {
+	switch {
+	case s == nil || !s.valid:
 		return ErrServiceNotInitialized
-	}
-	if ctx == nil {
+	case ctx == nil:
 		return ErrNilContext
-	}
-	if !handle.IsValid() {
+	case !handle.IsValid():
 		return pool.ErrInvalidHandle
+	default:
+		return pool.ReleaseHandle[plan.KindTunnel](s.pool, handle)
 	}
-	return pool.ReleaseHandle[plan.KindTunnel](s.pool, handle)
 }
-
-func (s *Service) validateOpenGUISession(ctx context.Context, req OpenGUISessionRequest) (plan.HopSpec, ports.ForwardSpec, string, string, bool, error) {
+func (s *Service) validateOpenGUISession(ctx context.Context, req OpenGUISessionRequest) (guiSessionPrepared, error) {
 	hop, err := s.validatePlanCall(ctx, req.Plan, req.Risk)
 	if err != nil {
-		return zeroVal[plan.HopSpec](), zeroVal[ports.ForwardSpec](), "", "", false, err
+		return guiSessionPrepared{}, err
 	}
 	if s.forwarder == nil {
-		return zeroVal[plan.HopSpec](), zeroVal[ports.ForwardSpec](), "", "", false, ErrForwarderUnavailable
+		return guiSessionPrepared{}, ErrForwarderUnavailable
 	}
 	if !req.Spec.Kind.IsValid() || req.Spec.DisplayNum < 0 || req.Spec.DisplayNum > maxGUIDisplayNum {
-		return zeroVal[plan.HopSpec](), zeroVal[ports.ForwardSpec](), "", "", false, fmt.Errorf("%w: GUI 会话协议或显示编号越界 [0,%d]", ErrInvalidGUIInput, maxGUIDisplayNum)
+		return guiSessionPrepared{}, fmt.Errorf("%w: GUI 会话协议或显示编号越界 [0,%d]", ErrInvalidGUIInput, maxGUIDisplayNum)
 	}
 	bindHost := pickIf(req.Spec.LocalBindHost == "", "127.0.0.1", req.Spec.LocalBindHost)
 	addr, pErr := netip.ParseAddr(bindHost)
 	if pErr != nil {
-		return zeroVal[plan.HopSpec](), zeroVal[ports.ForwardSpec](), "", "", false, fmt.Errorf("%w: LocalBindHost 必须为合法 IP 字面量", ErrInvalidGUIInput)
+		return guiSessionPrepared{}, fmt.Errorf("%w: LocalBindHost 必须为合法 IP 字面量", ErrInvalidGUIInput)
 	}
 	nonLoopback := !addr.IsLoopback()
 	if nonLoopback && !req.Spec.AllowNonLoopbackBind {
-		return zeroVal[plan.HopSpec](), zeroVal[ports.ForwardSpec](), "", "", false, fmt.Errorf("%w: 默认禁止非回环地址 %s 绑定", ErrInvalidGUIInput, bindHost)
+		return guiSessionPrepared{}, fmt.Errorf("%w: 默认禁止非回环地址 %s 绑定", ErrInvalidGUIInput, bindHost)
 	}
-	bindAddr := netip.AddrPortFrom(addr, req.Spec.LocalBindPort).String()
-	fwdSpec, remoteDesc, err := buildGUISessionForwardSpec(req.Spec, bindAddr)
-	return hop, fwdSpec, bindHost, remoteDesc, nonLoopback, err
+	fwdSpec, remoteDesc, err := buildGUISessionForwardSpec(req.Spec, netip.AddrPortFrom(addr, req.Spec.LocalBindPort).String())
+	if err != nil {
+		return guiSessionPrepared{}, err
+	}
+	return guiSessionPrepared{hop: hop, fwdSpec: fwdSpec, bindHost: bindHost, remoteDesc: remoteDesc, nonLoopback: nonLoopback}, nil
 }
-
 func buildGUISessionForwardSpec(spec GUISessionSpec, bindAddr string) (ports.ForwardSpec, string, error) {
-	if spec.Kind == GUISessionX11 && spec.UseUnixSocket {
+	if spec.UseUnixSocket {
+		if spec.Kind != GUISessionX11 {
+			return zeroVal[ports.ForwardSpec](), "", fmt.Errorf("%w: 仅 X11 GUI 会话支持 Unix 套接字转发", ErrInvalidGUIInput)
+		}
 		sockPath := fmt.Sprintf("/tmp/.X11-unix/X%d", spec.DisplayNum)
 		fs, err := ports.NewTypedForwardSpec(ports.ForwardLocal, ports.ForwardEndpointTCP, bindAddr, ports.ForwardEndpointUnix, sockPath)
 		return fs, sockPath, err
 	}
-	basePort := pickIf(spec.Kind == GUISessionX11, 6000, 5900)
-	remote := fmt.Sprintf("127.0.0.1:%d", basePort+spec.DisplayNum)
+	remote := fmt.Sprintf("127.0.0.1:%d", pickIf(spec.Kind == GUISessionX11, 6000, 5900)+spec.DisplayNum)
 	fs, err := ports.NewTypedForwardSpec(ports.ForwardLocal, ports.ForwardEndpointTCP, bindAddr, ports.ForwardEndpointTCP, remote)
 	return fs, remote, err
 }
@@ -206,41 +209,31 @@ func startManagedGUITunnel(leaseCtx, revokeCtx context.Context, fwd ports.Forwar
 	}
 	return mt, nil
 }
-
 func (m *managedGUITunnel) IsValid() bool { return m != nil && m.valid }
 func (m *managedGUITunnel) recordErr(err error) {
-	if err != nil {
-		m.errMu.Lock()
-		if m.err == nil {
-			m.err = err
-		}
-		m.errMu.Unlock()
+	if err == nil {
+		return
 	}
+	m.errMu.Lock()
+	if m.err == nil {
+		m.err = err
+	}
+	m.errMu.Unlock()
 }
 func (m *managedGUITunnel) snapshot(hs pool.HandleStatus) GUISessionStatus {
 	m.errMu.Lock()
 	err := firstErr(m.handle.Err(), m.err)
 	m.errMu.Unlock()
-	return GUISessionStatus{
-		handleStatus: hs, kind: m.kind, display: m.display, boundAddr: m.boundAddr,
-		remoteEnd: m.remoteDesc, active: hs.Active() && !m.closed.Load() && m.handle.IsValid(), err: err, valid: true,
-	}
+	return GUISessionStatus{handleStatus: hs, kind: m.kind, display: m.display, boundAddr: m.boundAddr, remoteEnd: m.remoteDesc, active: hs.Active() && !m.closed.Load() && m.handle.IsValid(), err: err, valid: true}
 }
 func (m *managedGUITunnel) closeResources() {
-	m.resOnce.Do(func() {
-		m.closed.Store(true)
-		m.recordErr(errors.Join(m.handle.Close(), m.conn.Close()))
-	})
+	m.resOnce.Do(func() { m.closed.Store(true); m.recordErr(errors.Join(m.handle.Close(), m.conn.Close())) })
 }
 func (m *managedGUITunnel) Close() error {
-	if m == nil || !m.valid {
+	if !m.IsValid() {
 		return nil
 	}
-	m.closeOnce.Do(func() {
-		m.nursery.Cancel(ports.ErrClosed)
-		m.closeResources()
-		m.recordErr(m.nursery.Close())
-	})
+	m.closeOnce.Do(func() { m.nursery.Cancel(ports.ErrClosed); m.closeResources(); m.recordErr(m.nursery.Close()) })
 	m.errMu.Lock()
 	defer m.errMu.Unlock()
 	return m.err

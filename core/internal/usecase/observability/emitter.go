@@ -34,14 +34,7 @@ type obsEmitter struct {
 	seq, stdoutSeq, stderrSeq atomic.Uint64
 }
 
-func newObsEmitter(
-	stream *events.OperationStream,
-	clock ports.Clock,
-	traceID security.TraceID,
-	opID security.OperationID,
-	nodeID string,
-	capKind security.CapabilityKind,
-) *obsEmitter {
+func newObsEmitter(stream *events.OperationStream, clock ports.Clock, traceID security.TraceID, opID security.OperationID, nodeID string, capKind security.CapabilityKind) *obsEmitter {
 	if stream == nil || clock == nil {
 		return nil
 	}
@@ -60,19 +53,19 @@ func (e *obsEmitter) nextMeta() (events.EventMeta, error) {
 	if !e.active() {
 		return zeroVal[events.EventMeta](), ports.ErrClosed
 	}
-	return events.NewEventMeta(events.EventMetaSpec{
-		TraceID: e.traceID, OperationID: algebraic.Some(e.opID),
-		OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID,
-	})
+	return events.NewEventMeta(events.EventMetaSpec{TraceID: e.traceID, OperationID: algebraic.Some(e.opID), OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID})
 }
-func (e *obsEmitter) emitStarted(ctx context.Context, action string, planDigest algebraic.Option[plan.PlanDigest], summary string) {
+func (e *obsEmitter) emit(ctx context.Context, build func(events.EventMeta) (events.Event, error)) {
 	if meta, err := e.nextMeta(); err == nil {
-		if ev, eErr := events.NewOperationStartedEvent(events.OperationStartedSpec{
-			Meta: meta, Capability: e.capability, Tool: toolObservability, Action: action, PlanDigest: planDigest, Summary: summary,
-		}); eErr == nil {
+		if ev, bErr := build(meta); bErr == nil {
 			_ = e.stream.Emit(ctx, ev)
 		}
 	}
+}
+func (e *obsEmitter) emitStarted(ctx context.Context, action string, planDigest algebraic.Option[plan.PlanDigest], summary string) {
+	e.emit(ctx, func(m events.EventMeta) (events.Event, error) {
+		return events.NewOperationStartedEvent(events.OperationStartedSpec{Meta: m, Capability: e.capability, Tool: toolObservability, Action: action, PlanDigest: planDigest, Summary: summary})
+	})
 }
 func (e *obsEmitter) emitChunk(ctx context.Context, kind events.OutputStreamKind, data []byte) {
 	if len(data) == 0 || !e.active() {
@@ -84,39 +77,24 @@ func (e *obsEmitter) emitChunk(ctx context.Context, kind events.OutputStreamKind
 		if err != nil {
 			return
 		}
-		ev, err := events.NewOutputChunkEvent(events.OutputChunkSpec{
-			Meta: meta, Stream: kind, ChunkIndex: counter.Add(1) - 1, Data: data[off:min(off+outputChunkMaxSize, len(data))],
-		})
+		ev, err := events.NewOutputChunkEvent(events.OutputChunkSpec{Meta: meta, Stream: kind, ChunkIndex: counter.Add(1) - 1, Data: data[off:min(off+outputChunkMaxSize, len(data))]})
 		if err != nil || e.stream.Emit(ctx, ev) != nil {
 			return
 		}
 	}
 }
 func (e *obsEmitter) emitMetric(ctx context.Context, name, unit string, value float64, interval algebraic.Duration, labels map[string]string) {
-	if meta, err := e.nextMeta(); err == nil {
-		if ev, eErr := events.NewMetricSampleEvent(events.MetricSampleSpec{
-			Meta: meta, MetricName: name, Unit: unit, Value: value, Interval: interval, Labels: labels,
-		}); eErr == nil {
-			_ = e.stream.Emit(ctx, ev)
-		}
-	}
+	e.emit(ctx, func(m events.EventMeta) (events.Event, error) {
+		return events.NewMetricSampleEvent(events.MetricSampleSpec{Meta: m, MetricName: name, Unit: unit, Value: value, Interval: interval, Labels: labels})
+	})
 }
 func (e *obsEmitter) emitCompleted(ctx context.Context, startedAt time.Time, outcome execution.ExecutionOutcome, succeeded bool, code, msg string) {
-	meta, err := e.nextMeta()
-	if err != nil {
-		return
-	}
 	outOpt, finalOK := normalizeObsCompleted(outcome, succeeded)
-	ev, err := events.NewOperationCompletedEvent(events.OperationCompletedSpec{
-		Meta: meta, Capability: e.capability, Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)),
-		Outcome: outOpt, Succeeded: finalOK, Code: code, Message: msg,
-	})
-	if err != nil {
-		return
-	}
 	emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalEventTimeout)
 	defer cancel()
-	_ = e.stream.Emit(emitCtx, ev)
+	e.emit(emitCtx, func(m events.EventMeta) (events.Event, error) {
+		return events.NewOperationCompletedEvent(events.OperationCompletedSpec{Meta: m, Capability: e.capability, Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)), Outcome: outOpt, Succeeded: finalOK, Code: code, Message: msg})
+	})
 }
 func normalizeObsCompleted(outcome execution.ExecutionOutcome, succeeded bool) (algebraic.Option[execution.ExecutionOutcome], bool) {
 	if outcome == nil || !outcome.IsValid() {
@@ -135,17 +113,18 @@ func normalizeObsCompleted(outcome execution.ExecutionOutcome, succeeded bool) (
 	}
 }
 
-// boundedOutputTee 在严格字节上限内同时捕获、流式转发至可选 io.Writer 并向 OperationStream 发射 OutputChunkEvent。
+// boundedOutputTee 在严格字节上限内同时捕获、流式转发至可选 io.Writer 并向 OperationStream 发射 OutputChunkEvent；
+// 可选 onLimit 回调在首次触达字节上限后（且末片推送完成后）同步触发一次，供 Follow 日志流确定性停止。
 type boundedOutputTee struct {
-	ctx       context.Context
-	emitter   *obsEmitter
-	kind      events.OutputStreamKind
-	mirror    io.Writer
-	limit     uint64
-	mu        sync.Mutex
-	buf       bytes.Buffer
-	total     uint64
-	truncated bool
+	ctx                   context.Context
+	emitter               *obsEmitter
+	kind                  events.OutputStreamKind
+	mirror                io.Writer
+	limit, total          uint64
+	onLimit               func()
+	mu                    sync.Mutex
+	buf                   bytes.Buffer
+	truncated, limitFired bool
 }
 
 func (w *boundedOutputTee) Write(p []byte) (int, error) {
@@ -154,6 +133,7 @@ func (w *boundedOutputTee) Write(p []byte) (int, error) {
 	}
 	w.mu.Lock()
 	var takeBytes []byte
+	var fireLimit func()
 	if w.total < w.limit {
 		take := min(uint64(len(p)), w.limit-w.total)
 		_, _ = w.buf.Write(p[:take])
@@ -163,12 +143,18 @@ func (w *boundedOutputTee) Write(p []byte) (int, error) {
 	} else {
 		w.truncated = true
 	}
+	if w.total >= w.limit && !w.limitFired && w.onLimit != nil {
+		w.limitFired, fireLimit = true, w.onLimit
+	}
 	w.mu.Unlock()
 	if len(takeBytes) > 0 {
 		if w.mirror != nil {
 			_, _ = w.mirror.Write(takeBytes)
 		}
 		w.emitter.emitChunk(w.ctx, w.kind, takeBytes)
+	}
+	if fireLimit != nil {
+		fireLimit()
 	}
 	return len(p), nil
 }
@@ -182,28 +168,40 @@ func (w *boundedOutputTee) snapshot() ([]byte, bool) {
 func resolveCanonicalRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (pathalg.RemotePath, error) {
 	cur := p
 	var suffix []pathalg.RemoteName
+	rejoin := func(base pathalg.RemotePath, rev []pathalg.RemoteName) (pathalg.RemotePath, error) {
+		if len(rev) == 0 {
+			return base, nil
+		}
+		ord := slices.Clone(rev)
+		slices.Reverse(ord)
+		return base.Join(ord...)
+	}
 	for hops := 0; len(suffix) < maxRemoteCanonicalHops; {
 		if realCur, rErr := rfs.RealPath(ctx, cur); rErr == nil {
-			return rejoinRemoteSuffix(realCur, suffix)
+			return rejoin(realCur, suffix)
 		} else if !errors.Is(rErr, ports.ErrNotFound) {
 			return zeroVal[pathalg.RemotePath](), rErr
 		}
-		if nextCur, jumped, jErr := expandDanglingSymlink(ctx, rfs, cur, suffix, &hops); jErr != nil {
+		if nextCur, jumped, jErr := expandDanglingSymlink(ctx, rfs, cur, &hops); jErr != nil {
 			return zeroVal[pathalg.RemotePath](), jErr
 		} else if jumped {
-			cur, suffix = nextCur, suffix[:0]
+			nextFull, rErr := rejoin(nextCur, suffix)
+			if rErr != nil {
+				return zeroVal[pathalg.RemotePath](), rErr
+			}
+			cur, suffix = nextFull, suffix[:0]
 			continue
 		}
 		base, ok := cur.Base()
 		if !ok || cur.IsRoot() || cur.Dir().Equal(cur) {
-			return rejoinRemoteSuffix(cur, suffix)
+			return rejoin(cur, suffix)
 		}
 		suffix, cur = append(suffix, base), cur.Dir()
 	}
 	return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端路径规范化深度超限", ErrInvalidRequest)
 }
 
-func expandDanglingSymlink(ctx context.Context, rfs ports.RemoteFSPort, cur pathalg.RemotePath, suffix []pathalg.RemoteName, hops *int) (pathalg.RemotePath, bool, error) {
+func expandDanglingSymlink(ctx context.Context, rfs ports.RemoteFSPort, cur pathalg.RemotePath, hops *int) (pathalg.RemotePath, bool, error) {
 	lst, err := rfs.Lstat(ctx, cur)
 	if errors.Is(err, ports.ErrNotFound) || (err == nil && !lst.IsSymlink()) {
 		return zeroVal[pathalg.RemotePath](), false, nil
@@ -223,27 +221,14 @@ func expandDanglingSymlink(ctx context.Context, rfs ports.RemoteFSPort, cur path
 	if err != nil {
 		return zeroVal[pathalg.RemotePath](), false, err
 	}
-	nextBase := targetP
 	if !targetP.IsAbs() {
 		realParent, pErr := rfs.RealPath(ctx, cur.Dir())
 		if pErr != nil || !realParent.IsAbs() {
 			return zeroVal[pathalg.RemotePath](), false, firstErr(pErr, ErrInvalidRequest)
 		}
-		if nextBase, err = realParent.Resolve(targetP); err != nil {
-			return zeroVal[pathalg.RemotePath](), false, err
-		}
+		targetP, err = realParent.Resolve(targetP)
 	}
-	full, err := rejoinRemoteSuffix(nextBase, suffix)
-	return full, err == nil, err
-}
-
-func rejoinRemoteSuffix(base pathalg.RemotePath, revSuffix []pathalg.RemoteName) (pathalg.RemotePath, error) {
-	if len(revSuffix) == 0 {
-		return base, nil
-	}
-	ordered := slices.Clone(revSuffix)
-	slices.Reverse(ordered)
-	return base.Join(ordered...)
+	return targetP, err == nil, err
 }
 
 func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.RemoteFSPort, binding security.OperationBinding, target pathalg.RemotePath) error {
@@ -255,11 +240,7 @@ func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.Rem
 		return err
 	}
 	cs := canon.String()
-	ok := slices.Contains(binding.CanonicalPaths(), cs) ||
-		slices.ContainsFunc(binding.RecursivePaths(), func(root string) bool {
-			return root == "/" || cs == root || strings.HasPrefix(cs, root+"/")
-		})
-	if !ok {
+	if !slices.Contains(binding.CanonicalPaths(), cs) && !slices.ContainsFunc(binding.RecursivePaths(), func(r string) bool { return r == "/" || cs == r || strings.HasPrefix(cs, r+"/") }) {
 		return fmt.Errorf("%w: 远端路径 %s 规范化漂移至未授权目标 %s", gate.ErrScopeEscalated, target, canon)
 	}
 	return nil

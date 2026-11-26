@@ -36,12 +36,6 @@ import (
 
 const (
 	toolObservability        = "observability"
-	defaultProjectionLogs    = 512
-	defaultProjectionDiags   = 256
-	defaultProjectionPoolEvs = 256
-	defaultProjectionOps     = 256
-	defaultProjectionMetrics = 512
-	defaultProjectionBusBuf  = 128
 	maxProjectionBufferCap   = 16384
 	defaultLogTailLines      = 100
 	maxLogTailLines          = 10000
@@ -52,16 +46,15 @@ const (
 	maxMetricsInterval       = 60 * time.Second
 	defaultMetricsTopProcs   = 10
 	maxMetricsTopProcs       = 50
-	defaultMetricsMaxSamples = 1
 	maxMetricsSamples        = 10000
+	maxMetricsLineBytes      = 256 << 10
+	maxUptimeSeconds         = 100 * 365 * 24 * 3600
 	maxGUIScriptCaptureBytes = 48 << 20
 	maxGUITypeTextBytes      = 4096
 	maxGUIClicks             = 100
 	maxGUIDisplayNum         = 99
 	maxRemoteCanonicalHops   = 128
 	outputChunkMaxSize       = 32 << 10
-	defaultArtifactDirPerm   = 0o700
-	defaultArtifactFilePerm  = 0o600
 	terminalEventTimeout     = 50 * time.Millisecond
 	screenshotStartMarker    = "XOPS_GUI_SHOT_BEGIN_V2"
 	screenshotEndMarker      = "XOPS_GUI_SHOT_END_V2"
@@ -87,6 +80,7 @@ var (
 	ErrProjectionClosed      = errors.New("usecase/observability: Projection 未初始化或已关闭")
 	ErrUncertainOutcome      = errors.New("usecase/observability: 远端操作结果未知（OutcomeUnknown），严禁重试")
 	ErrSymlinkPolicyDenied   = errors.New("usecase/observability: 远端软链展开超限或被策略拒绝")
+	errLogLimitReached       = errors.New("usecase/observability: 远端跟随日志已达到 max_bytes 字节上限")
 )
 
 // ServiceConfig 定义可观测性与 GUI 用例服务 Service 的显式出站依赖配置；
@@ -109,7 +103,6 @@ func appendEnumText(b []byte, valid bool, s string, err error) ([]byte, error) {
 	}
 	return append(b, s...), nil
 }
-
 func unmarshalEnum[T any](dst *T, zero T, text []byte, parse func(string) (T, error)) error {
 	if dst == nil {
 		return ports.ErrNilReceiver
@@ -118,21 +111,14 @@ func unmarshalEnum[T any](dst *T, zero T, text []byte, parse func(string) (T, er
 	*dst = pickIf(err == nil, v, zero)
 	return err
 }
-
 func parseEnumTable[T ~uint8](raw string, names []string, baseErr error) (T, error) {
-	for i := 1; i < len(names); i++ {
-		if names[i] == raw {
-			return T(i), nil
-		}
+	if idx := slices.Index(names[1:], raw); idx >= 0 {
+		return T(idx + 1), nil
 	}
 	return 0, fmt.Errorf("%w: 非法枚举值 %q", baseErr, raw)
 }
-
 func enumTableName(idx uint8, names []string) string {
-	if int(idx) > 0 && int(idx) < len(names) {
-		return names[idx]
-	}
-	return "invalid"
+	return pickIf(int(idx) > 0 && int(idx) < len(names), names[idx], "invalid")
 }
 
 // 5 个失败关闭领域枚举类型（零值恒 *Invalid）。
@@ -158,31 +144,27 @@ const (
 	LogTargetInvalid LogTargetKind = iota
 	LogTargetFile
 	LogTargetDocker
-
-	ProcessSortInvalid ProcessSortBy = 0
-	ProcessSortCPU     ProcessSortBy = 1
-	ProcessSortMem     ProcessSortBy = 2
-
-	GUIActionInvalid     GUIActionKind = 0
-	GUIActionScreenshot  GUIActionKind = 1
-	GUIActionClick       GUIActionKind = 2
-	GUIActionDoubleClick GUIActionKind = 3
-	GUIActionRightClick  GUIActionKind = 4
-	GUIActionMove        GUIActionKind = 5
-	GUIActionDrag        GUIActionKind = 6
-	GUIActionScroll      GUIActionKind = 7
-	GUIActionType        GUIActionKind = 8
-	GUIActionKey         GUIActionKind = 9
-
+	ProcessSortInvalid     ProcessSortBy   = 0
+	ProcessSortCPU         ProcessSortBy   = 1
+	ProcessSortMem         ProcessSortBy   = 2
+	GUIActionInvalid       GUIActionKind   = 0
+	GUIActionScreenshot    GUIActionKind   = 1
+	GUIActionClick         GUIActionKind   = 2
+	GUIActionDoubleClick   GUIActionKind   = 3
+	GUIActionRightClick    GUIActionKind   = 4
+	GUIActionMove          GUIActionKind   = 5
+	GUIActionDrag          GUIActionKind   = 6
+	GUIActionScroll        GUIActionKind   = 7
+	GUIActionType          GUIActionKind   = 8
+	GUIActionKey           GUIActionKind   = 9
 	ScrollDirectionInvalid ScrollDirection = 0
 	ScrollUp               ScrollDirection = 1
 	ScrollDown             ScrollDirection = 2
 	ScrollLeft             ScrollDirection = 3
 	ScrollRight            ScrollDirection = 4
-
-	GUISessionInvalid GUISessionKind = 0
-	GUISessionX11     GUISessionKind = 1
-	GUISessionVNC     GUISessionKind = 2
+	GUISessionInvalid      GUISessionKind  = 0
+	GUISessionX11          GUISessionKind  = 1
+	GUISessionVNC          GUISessionKind  = 2
 )
 
 func logTargetNames() []string   { return []string{"invalid", "file", "docker"} }
@@ -209,7 +191,6 @@ func ParseScrollDirection(raw string) (ScrollDirection, error) {
 func ParseGUISessionKind(raw string) (GUISessionKind, error) {
 	return parseEnumTable[GUISessionKind](raw, guiSessionNames(), ErrInvalidGUIInput)
 }
-
 func (k LogTargetKind) IsValid() bool  { return k == LogTargetFile || k == LogTargetDocker }
 func (k LogTargetKind) IsZero() bool   { return !k.IsValid() }
 func (k LogTargetKind) String() string { return enumTableName(uint8(k), logTargetNames()) }
@@ -218,9 +199,8 @@ func (k LogTargetKind) AppendText(b []byte) ([]byte, error) {
 }
 func (k LogTargetKind) MarshalText() ([]byte, error) { return k.AppendText(nil) }
 func (k *LogTargetKind) UnmarshalText(t []byte) error {
-	return unmarshalEnum(k, LogTargetInvalid, t, ParseLogTargetKind)
+	return unmarshalEnum(k, 0, t, ParseLogTargetKind)
 }
-
 func (s ProcessSortBy) IsValid() bool  { return s == ProcessSortCPU || s == ProcessSortMem }
 func (s ProcessSortBy) IsZero() bool   { return !s.IsValid() }
 func (s ProcessSortBy) String() string { return enumTableName(uint8(s), processSortNames()) }
@@ -229,9 +209,8 @@ func (s ProcessSortBy) AppendText(b []byte) ([]byte, error) {
 }
 func (s ProcessSortBy) MarshalText() ([]byte, error) { return s.AppendText(nil) }
 func (s *ProcessSortBy) UnmarshalText(t []byte) error {
-	return unmarshalEnum(s, ProcessSortInvalid, t, ParseProcessSortBy)
+	return unmarshalEnum(s, 0, t, ParseProcessSortBy)
 }
-
 func (k GUIActionKind) IsValid() bool  { return k >= GUIActionScreenshot && k <= GUIActionKey }
 func (k GUIActionKind) IsZero() bool   { return !k.IsValid() }
 func (k GUIActionKind) String() string { return enumTableName(uint8(k), guiActionNames()) }
@@ -240,9 +219,8 @@ func (k GUIActionKind) AppendText(b []byte) ([]byte, error) {
 }
 func (k GUIActionKind) MarshalText() ([]byte, error) { return k.AppendText(nil) }
 func (k *GUIActionKind) UnmarshalText(t []byte) error {
-	return unmarshalEnum(k, GUIActionInvalid, t, ParseGUIActionKind)
+	return unmarshalEnum(k, 0, t, ParseGUIActionKind)
 }
-
 func (d ScrollDirection) IsValid() bool  { return d >= ScrollUp && d <= ScrollRight }
 func (d ScrollDirection) IsZero() bool   { return !d.IsValid() }
 func (d ScrollDirection) String() string { return enumTableName(uint8(d), scrollDirNames()) }
@@ -251,9 +229,8 @@ func (d ScrollDirection) AppendText(b []byte) ([]byte, error) {
 }
 func (d ScrollDirection) MarshalText() ([]byte, error) { return d.AppendText(nil) }
 func (d *ScrollDirection) UnmarshalText(t []byte) error {
-	return unmarshalEnum(d, ScrollDirectionInvalid, t, ParseScrollDirection)
+	return unmarshalEnum(d, 0, t, ParseScrollDirection)
 }
-
 func (k GUISessionKind) IsValid() bool  { return k == GUISessionX11 || k == GUISessionVNC }
 func (k GUISessionKind) IsZero() bool   { return !k.IsValid() }
 func (k GUISessionKind) String() string { return enumTableName(uint8(k), guiSessionNames()) }
@@ -262,7 +239,7 @@ func (k GUISessionKind) AppendText(b []byte) ([]byte, error) {
 }
 func (k GUISessionKind) MarshalText() ([]byte, error) { return k.AppendText(nil) }
 func (k *GUISessionKind) UnmarshalText(t []byte) error {
-	return unmarshalEnum(k, GUISessionInvalid, t, ParseGUISessionKind)
+	return unmarshalEnum(k, 0, t, ParseGUISessionKind)
 }
 
 // LogTarget 表示经校验的远端日志采集目标（常规文件路径或安全白名单 Docker 容器名）；零值恒无效。
@@ -316,11 +293,10 @@ type LogStreamRequest struct {
 //xops:opaque
 //xops:failclosed
 type LogStreamResult struct {
-	outcome   execution.ExecutionOutcome
-	data      []byte
-	truncated bool
-	duration  algebraic.Duration
-	valid     bool
+	outcome          execution.ExecutionOutcome
+	data             []byte
+	duration         algebraic.Duration
+	truncated, valid bool
 }
 
 func (r LogStreamResult) IsValid() bool {
@@ -363,18 +339,17 @@ type (
 		Processes  []ProcessMetric    `json:"processes,omitzero"`
 	}
 	MetricsStreamRequest struct {
-		Plan            plan.SealedConnectionPlan
-		NodeID          string
-		Profile         algebraic.Option[execution.LaunchProfile]
-		Interval        algebraic.Option[algebraic.Duration]
-		MaxSamples      int
-		TopProcesses    int
-		SortBy          algebraic.Option[ProcessSortBy]
-		Timeout         algebraic.Option[algebraic.Duration]
-		OnFrame         func(HostMetricsFrame)
-		Risk            algebraic.Option[security.RiskLevel]
-		Approval        algebraic.Option[gate.ApprovalSubmission]
-		OperationStream *events.OperationStream
+		Plan                     plan.SealedConnectionPlan
+		NodeID                   string
+		Profile                  algebraic.Option[execution.LaunchProfile]
+		Interval                 algebraic.Option[algebraic.Duration]
+		MaxSamples, TopProcesses int
+		SortBy                   algebraic.Option[ProcessSortBy]
+		Timeout                  algebraic.Option[algebraic.Duration]
+		OnFrame                  func(HostMetricsFrame)
+		Risk                     algebraic.Option[security.RiskLevel]
+		Approval                 algebraic.Option[gate.ApprovalSubmission]
+		OperationStream          *events.OperationStream
 	}
 )
 
@@ -398,17 +373,13 @@ func (r MetricsStreamResult) Duration() algebraic.Duration        { return r.dur
 // GUIActionSpec、GUIArtifactDest、GUIExecRequest、ProcessedScreenshot、GUIExecResult 与 GUI 会话类型。
 type (
 	GUIActionSpec struct {
-		Action         GUIActionKind
-		Display        string
-		WaylandDisplay string
-		X, Y           int
-		StartX, StartY int
-		EndX, EndY     int
-		Direction      ScrollDirection
-		Clicks         int
-		Text           string
-		Key            string
-		IncludeShot    bool
+		Action                  GUIActionKind
+		Display, WaylandDisplay string
+		X, Y, StartX, StartY    int
+		EndX, EndY, Clicks      int
+		Direction               ScrollDirection
+		Text, Key               string
+		IncludeShot             bool
 	}
 	GUIArtifactDest struct {
 		RootDir pathalg.LocalDir
@@ -434,12 +405,11 @@ type (
 		Data       []byte `json:"-"`
 	}
 	GUISessionSpec struct {
-		Kind                 GUISessionKind
-		DisplayNum           int
-		UseUnixSocket        bool
-		LocalBindHost        string
-		LocalBindPort        uint16
-		AllowNonLoopbackBind bool
+		Kind                                GUISessionKind
+		DisplayNum                          int
+		UseUnixSocket, AllowNonLoopbackBind bool
+		LocalBindHost                       string
+		LocalBindPort                       uint16
 	}
 	OpenGUISessionRequest struct {
 		Plan            plan.SealedConnectionPlan
@@ -532,13 +502,8 @@ func (s GUISessionStatus) Err() error           { return s.err }
 // ProjectionConfig 与不可变投影视图 DTO（零裸 time.Duration，供 Phase 5 entry/tui 直接消费）。
 type (
 	ProjectionConfig struct {
-		SystemBus      *events.SystemBus
-		BusBuffer      int
-		MaxLogEntries  int
-		MaxDiagnostics int
-		MaxPoolEvents  int
-		MaxOperations  int
-		MaxMetrics     int
+		SystemBus                                                                          *events.SystemBus
+		BusBuffer, MaxLogEntries, MaxDiagnostics, MaxPoolEvents, MaxOperations, MaxMetrics int
 	}
 	OperationView struct {
 		OperationID  string             `json:"operation_id"`
@@ -600,37 +565,30 @@ type (
 //xops:opaque
 //xops:failclosed
 type ProjectionSnapshot struct {
-	version, totalEvents, droppedEvents uint64
-	gateHalted, hasUnknownOutcome       bool
-	activeStreams                       int
-	operations                          []OperationView
-	metrics                             []MetricPoint
-	logs                                []LogEntry
-	diagnostics                         []DiagnosticRecord
-	poolEvents                          []PoolRecord
-	valid                               bool
+	wire  projectionSnapshotWire
+	valid bool
 }
 
 func (s ProjectionSnapshot) IsValid() bool               { return s.valid }
 func (s ProjectionSnapshot) IsZero() bool                { return !s.valid }
-func (s ProjectionSnapshot) Version() uint64             { return s.version }
-func (s ProjectionSnapshot) TotalEvents() uint64         { return s.totalEvents }
-func (s ProjectionSnapshot) DroppedEvents() uint64       { return s.droppedEvents }
-func (s ProjectionSnapshot) GateHalted() bool            { return s.valid && s.gateHalted }
-func (s ProjectionSnapshot) HasUnknownOutcome() bool     { return s.valid && s.hasUnknownOutcome }
-func (s ProjectionSnapshot) ActiveStreams() int          { return s.activeStreams }
-func (s ProjectionSnapshot) Operations() []OperationView { return slices.Clone(s.operations) }
-func (s ProjectionSnapshot) Logs() []LogEntry            { return slices.Clone(s.logs) }
-func (s ProjectionSnapshot) PoolEvents() []PoolRecord    { return slices.Clone(s.poolEvents) }
+func (s ProjectionSnapshot) Version() uint64             { return s.wire.Version }
+func (s ProjectionSnapshot) TotalEvents() uint64         { return s.wire.TotalEvents }
+func (s ProjectionSnapshot) DroppedEvents() uint64       { return s.wire.DroppedEvents }
+func (s ProjectionSnapshot) GateHalted() bool            { return s.valid && s.wire.GateHalted }
+func (s ProjectionSnapshot) HasUnknownOutcome() bool     { return s.valid && s.wire.HasUnknownOutcome }
+func (s ProjectionSnapshot) ActiveStreams() int          { return s.wire.ActiveStreams }
+func (s ProjectionSnapshot) Operations() []OperationView { return slices.Clone(s.wire.Operations) }
+func (s ProjectionSnapshot) Logs() []LogEntry            { return slices.Clone(s.wire.Logs) }
+func (s ProjectionSnapshot) PoolEvents() []PoolRecord    { return slices.Clone(s.wire.PoolEvents) }
 func (s ProjectionSnapshot) Metrics() []MetricPoint {
-	out := slices.Clone(s.metrics)
+	out := slices.Clone(s.wire.Metrics)
 	for i := range out {
 		out[i].Labels = maps.Clone(out[i].Labels)
 	}
 	return out
 }
 func (s ProjectionSnapshot) Diagnostics() []DiagnosticRecord {
-	out := slices.Clone(s.diagnostics)
+	out := slices.Clone(s.wire.Diagnostics)
 	for i := range out {
 		out[i].Attrs = maps.Clone(out[i].Attrs)
 	}
@@ -656,11 +614,7 @@ func (s ProjectionSnapshot) MarshalJSONTo(enc *jsontext.Encoder) error {
 	if !s.valid {
 		return ErrInvalidRequest
 	}
-	return jsonv2.MarshalEncode(enc, projectionSnapshotWire{
-		Version: s.version, TotalEvents: s.totalEvents, DroppedEvents: s.droppedEvents,
-		GateHalted: s.gateHalted, HasUnknownOutcome: s.hasUnknownOutcome, ActiveStreams: s.activeStreams,
-		Operations: s.operations, Metrics: s.metrics, Logs: s.logs, Diagnostics: s.diagnostics, PoolEvents: s.poolEvents,
-	})
+	return jsonv2.MarshalEncode(enc, s.wire)
 }
 func (s ProjectionSnapshot) CanonicalJSON() ([]byte, error) {
 	if !s.valid {

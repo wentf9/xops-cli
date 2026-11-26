@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -151,14 +152,7 @@ func canonicalizeNodeIDs(raw []inventory.NodeID) ([]inventory.NodeID, error) {
 
 // resolveTargets 统一解析、去重、筛选并按 NodeID 确定性排序目标节点集合，
 // 保证门控绑定中的 NodeIDs 与连接计划集合摘要完全由显式输入确定（零随机/map 迭代漂移）。
-func (s *Service) resolveTargets(
-	ctx context.Context,
-	explicit []TargetNode,
-	selector algebraic.Option[playbook.TargetSelector],
-	cliOpts option.OptionLayer,
-	excludeNodes []inventory.NodeID,
-	excludeTags []inventory.Tag,
-) ([]TargetNode, error) {
+func (s *Service) resolveTargets(ctx context.Context, explicit []TargetNode, selector algebraic.Option[playbook.TargetSelector], cliOpts option.OptionLayer, excludeNodes []inventory.NodeID, excludeTags []inventory.Tag) ([]TargetNode, error) {
 	if err := cliOpts.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: CLIOptions 无效: %w", ErrInvalidRequest, err)
 	}
@@ -174,20 +168,14 @@ func (s *Service) resolveTargets(
 	if hasSel && !sel.IsValid() {
 		return nil, fmt.Errorf("%w: TargetSelector 无效", ErrInvalidRequest)
 	}
-	candidates, err := s.gatherCandidateTargets(ctx, explicit, sel, hasSel, cliOpts)
+	candidates, err := s.gatherCandidateTargets(ctx, explicit, sel, hasSel, cliOpts, exNodes, exTags)
 	if err != nil {
 		return nil, err
 	}
 	return filterAndSortTargets(candidates, sel, hasSel, exNodes, exTags)
 }
 
-func (s *Service) gatherCandidateTargets(
-	ctx context.Context,
-	explicit []TargetNode,
-	sel playbook.TargetSelector,
-	hasSel bool,
-	cliOpts option.OptionLayer,
-) ([]TargetNode, error) {
+func (s *Service) gatherCandidateTargets(ctx context.Context, explicit []TargetNode, sel playbook.TargetSelector, hasSel bool, cliOpts option.OptionLayer, exNodes []inventory.NodeID, exTags []inventory.Tag) ([]TargetNode, error) {
 	if len(explicit) > 0 {
 		for i, t := range explicit {
 			if !t.IsValid() {
@@ -199,14 +187,10 @@ func (s *Service) gatherCandidateTargets(
 	if !hasSel {
 		return nil, ErrNoTargets
 	}
-	return s.resolveTargetsFromInventory(ctx, sel, cliOpts)
+	return s.resolveTargetsFromInventory(ctx, sel, cliOpts, exNodes, exTags)
 }
 
-func (s *Service) resolveTargetsFromInventory(
-	ctx context.Context,
-	sel playbook.TargetSelector,
-	cliOpts option.OptionLayer,
-) ([]TargetNode, error) {
+func (s *Service) resolveTargetsFromInventory(ctx context.Context, sel playbook.TargetSelector, cliOpts option.OptionLayer, exNodes []inventory.NodeID, exTags []inventory.Tag) ([]TargetNode, error) {
 	if s.inventory == nil {
 		return nil, ErrInventoryUnavailable
 	}
@@ -215,19 +199,31 @@ func (s *Service) resolveTargetsFromInventory(
 		return nil, err
 	}
 	matched := make([]TargetNode, 0, len(nodes))
+	foundIDs := make(map[inventory.NodeID]bool, len(nodes))
 	for _, n := range nodes {
-		if !sel.Matches(n.ID(), n.Tags()) {
+		if !sel.Matches(n.ID(), n.Tags()) || isNodeExcluded(n.ID(), n.Tags(), exNodes, exTags) {
 			continue
 		}
-		resolved, err := s.inventory.ResolveTarget(ctx, ucinv.ResolveTargetRequest{
-			Target: n.ID().String(), CLIOptions: cliOpts,
-		})
+		tn, err := s.resolveSingleTargetNode(ctx, n.ID(), n.Tags(), n.Execution(), cliOpts)
 		if err != nil {
-			return nil, fmt.Errorf("解析目标节点 %s 失败: %w", n.ID(), err)
+			return nil, err
 		}
-		tn, err := NewTargetNode(TargetNodeSpec{
-			NodeID: n.ID(), Plan: resolved.Plan(), Tags: n.Tags(), DefaultProfile: n.Execution(),
-		})
+		foundIDs[n.ID()] = true
+		matched = append(matched, tn)
+	}
+	return s.appendVirtualSelectorNodes(ctx, sel, foundIDs, exNodes, exTags, cliOpts, matched)
+}
+
+// appendVirtualSelectorNodes 对显式节点名选择器（无 all/tags 筛选）中未命中托管表的条目回退 ResolveTarget，兼容 ~/.ssh/config 虚拟节点（ADR-004）。
+func (s *Service) appendVirtualSelectorNodes(ctx context.Context, sel playbook.TargetSelector, foundIDs map[inventory.NodeID]bool, exNodes []inventory.NodeID, exTags []inventory.Tag, cliOpts option.OptionLayer, matched []TargetNode) ([]TargetNode, error) {
+	if sel.All() || len(sel.Tags()) > 0 {
+		return matched, nil
+	}
+	for _, id := range sel.Nodes() {
+		if foundIDs[id] || isNodeExcluded(id, nil, exNodes, exTags) {
+			continue
+		}
+		tn, err := s.resolveSingleTargetNode(ctx, id, nil, algebraic.None[execution.LaunchProfile](), cliOpts)
 		if err != nil {
 			return nil, err
 		}
@@ -236,13 +232,44 @@ func (s *Service) resolveTargetsFromInventory(
 	return matched, nil
 }
 
-func filterAndSortTargets(
-	candidates []TargetNode,
-	sel playbook.TargetSelector,
-	hasSel bool,
-	exNodes []inventory.NodeID,
-	exTags []inventory.Tag,
-) ([]TargetNode, error) {
+func (s *Service) resolveSingleTargetNode(ctx context.Context, id inventory.NodeID, tags []inventory.Tag, execProf algebraic.Option[execution.LaunchProfile], cliOpts option.OptionLayer) (TargetNode, error) {
+	resolved, err := s.inventory.ResolveTarget(ctx, ucinv.ResolveTargetRequest{Target: id.String(), CLIOptions: cliOpts})
+	if err != nil {
+		return TargetNode{}, fmt.Errorf("解析目标节点 %s 失败: %w", id, err)
+	}
+	return NewTargetNode(TargetNodeSpec{NodeID: id, Plan: resolved.Plan(), Tags: tags, DefaultProfile: execProf})
+}
+
+func formatLaunchProfile(p execution.LaunchProfile) string {
+	d := "unset"
+	if v, ok := p.DialectOption().Get(); ok {
+		d = v.String()
+	}
+	return d + "/" + p.Interpreter().String() + "/" + p.LoginMode().String()
+}
+
+func (s *Service) canonicalizeNodeRemotePaths(ctx context.Context, connPlan plan.SealedConnectionPlan, paths []pathalg.RemotePath, out map[string]struct{}) error {
+	if len(paths) == 0 {
+		return nil
+	}
+	return s.pool.WithLease(ctx, connPlan, func(leaseCtx context.Context, lease *pool.Lease) error {
+		rfs, err := lease.OpenRemoteFS(leaseCtx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rfs.Close() }()
+		for _, p := range paths {
+			canon, err := resolveCanonicalRemotePath(leaseCtx, rfs, p)
+			if err != nil {
+				return err
+			}
+			out[canon.String()] = struct{}{}
+		}
+		return nil
+	})
+}
+
+func filterAndSortTargets(candidates []TargetNode, sel playbook.TargetSelector, hasSel bool, exNodes []inventory.NodeID, exTags []inventory.Tag) ([]TargetNode, error) {
 	seen := make(map[inventory.NodeID]bool, len(candidates))
 	out := make([]TargetNode, 0, len(candidates))
 	for _, t := range candidates {
@@ -370,13 +397,7 @@ func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.Rem
 	return cwd.Resolve(p)
 }
 
-func expandDanglingSymlinkStep(
-	ctx context.Context,
-	rfs ports.RemoteFSPort,
-	cur pathalg.RemotePath,
-	suffix []pathalg.RemoteName,
-	hops *int,
-) (pathalg.RemotePath, bool, error) {
+func expandDanglingSymlinkStep(ctx context.Context, rfs ports.RemoteFSPort, cur pathalg.RemotePath, suffix []pathalg.RemoteName, hops *int) (pathalg.RemotePath, bool, error) {
 	lst, err := rfs.Lstat(ctx, cur)
 	if errors.Is(err, ports.ErrNotFound) || (err == nil && !lst.IsSymlink()) {
 		return zeroVal[pathalg.RemotePath](), false, nil
@@ -424,13 +445,7 @@ func rejoinRemoteSuffix(base pathalg.RemotePath, revSuffix []pathalg.RemoteName)
 	return base.Join(ordered...)
 }
 
-func verifyRemotePathAuthorized(
-	ctx context.Context,
-	enforce bool,
-	rfs ports.RemoteFSPort,
-	binding security.OperationBinding,
-	target pathalg.RemotePath,
-) error {
+func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.RemoteFSPort, binding security.OperationBinding, target pathalg.RemotePath) error {
 	if !enforce {
 		return nil
 	}

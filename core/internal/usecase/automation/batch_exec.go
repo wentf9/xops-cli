@@ -2,9 +2,10 @@ package automation
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ type batchJob struct {
 
 // BatchExec 在 core/conc.Nursery（RunWait）有界并发监督下对多节点执行同一不可变 CommandPlan：
 //   - 严格遵循 gate.WithAuthorized[security.CapExecute] 外包 pool.WithLease 嵌套序（ADR-008 / ADR-009）；
+//   - 非 DirectOperator 配置档下对 Command.WorkDir 执行 Round-2 软链规范化与执行前 TOCTOU 复核；
 //   - 两步审批绑定完全由排序后目标节点、连接计划摘要、命令摘要与显式参数确定（零门控前抽熵漂移）；
 //   - 支持单节点独立隔离 OperationStream（确定性 EOF + panic defer 终态事件）与 ScopedRootFS --out-dir 原子落盘；
 //   - 严分 OutcomeNotStarted 与 OutcomeUnknown，任一节点出现 OutcomeUnknown 时绝不重试并忠实上报 AuditOutcomeUnknown。
@@ -40,7 +42,7 @@ func (s *Service) BatchExec(ctx context.Context, req BatchExecRequest) (BatchExe
 	if err != nil {
 		return BatchExecReport{}, err
 	}
-	gateReq, err := buildBatchGateRequest(req, targets, concurrency)
+	gateReq, err := s.buildBatchGateRequest(req, targets, concurrency)
 	if err != nil {
 		return BatchExecReport{}, err
 	}
@@ -90,17 +92,9 @@ func singleTargetMeta(targets []TargetNode, nodeIDs []string) (string, algebraic
 	return nodeIDs[0], algebraic.None[netaddr.Endpoint]()
 }
 
-func buildBatchGateRequest(req BatchExecRequest, targets []TargetNode, concurrency int) (gate.GateRequest[security.CapExecute], error) {
-	cmdDigest, err := req.Command.Digest()
-	if err != nil {
-		return zeroVal[gate.GateRequest[security.CapExecute]](), err
-	}
+func buildBatchBinding(req BatchExecRequest, targets []TargetNode, concurrency int, cmdDigest security.Digest, paths []string) (security.OperationBinding, error) {
 	nodeIDs := extractNodeIDStrings(targets)
 	singleNode, singleEP := singleTargetMeta(targets, nodeIDs)
-	var paths []string
-	if wd, ok := req.Command.WorkDir().Get(); ok && wd.IsValid() {
-		paths = []string{wd.String()}
-	}
 	params := map[string]string{
 		"concurrency": strconv.Itoa(concurrency),
 		"fail_fast":   strconv.FormatBool(req.FailFast),
@@ -109,31 +103,56 @@ func buildBatchGateRequest(req BatchExecRequest, targets []TargetNode, concurren
 	if outDir, ok := req.OutputDir.Get(); ok {
 		params["out_dir"] = outDir.String()
 	}
-	binding, err := security.NewOperationBinding(security.OperationBindingSpec{
+	return security.NewOperationBinding(security.OperationBindingSpec{
 		Capability: security.CapabilityExecute, Tool: toolAutomation, Action: "batch_exec",
 		NodeID: singleNode, NodeIDs: nodeIDs, Endpoint: singleEP, CanonicalPaths: paths,
 		CommandDigest: algebraic.Some(cmdDigest), PlanDigest: algebraic.Some(digestTargetPlans(targets)), Parameters: params,
 	})
+}
+
+func (s *Service) buildBatchGateRequest(req BatchExecRequest, targets []TargetNode, concurrency int) (gate.GateRequest[security.CapExecute], error) {
+	cmdDigest, err := req.Command.Digest()
+	if err != nil {
+		return zeroVal[gate.GateRequest[security.CapExecute]](), err
+	}
+	var paths []string
+	var canonFn gate.CanonicalizeFunc
+	if wd, ok := req.Command.WorkDir().Get(); ok && wd.IsValid() {
+		paths = []string{wd.String()}
+		if s.enforceStrictPaths() {
+			canonFn = s.makeBatchWorkDirCanonicalizer(req, targets, concurrency, cmdDigest, wd)
+		}
+	}
+	binding, err := buildBatchBinding(req, targets, concurrency, cmdDigest, paths)
 	if err != nil {
 		return zeroVal[gate.GateRequest[security.CapExecute]](), err
 	}
 	return gate.NewGateRequest[security.CapExecute](gate.GateRequestSpec[security.CapExecute]{
 		Binding: binding, Risk: req.Risk.OrElse(security.RiskModerate),
-		ScopeSummary:    fmt.Sprintf("batch exec (%d nodes): %s", len(targets), req.Command.RedactedSummary()),
-		Paths:           paths,
-		Approval:        req.Approval,
-		OperationStream: req.OperationStream,
+		ScopeSummary: fmt.Sprintf("batch exec (%d nodes): %s", len(targets), req.Command.RedactedSummary()),
+		Paths:        paths, Canonicalize: canonFn, Approval: req.Approval, OperationStream: req.OperationStream,
 	})
 }
 
-func (s *Service) executeAuthorizedBatch(
-	ctx context.Context,
-	req BatchExecRequest,
-	gateReq gate.GateRequest[security.CapExecute],
-	targets []TargetNode,
-	concurrency int,
-	maxOut uint64,
-) (BatchExecReport, error) {
+func (s *Service) makeBatchWorkDirCanonicalizer(req BatchExecRequest, targets []TargetNode, concurrency int, cmdDigest security.Digest, wd pathalg.RemotePath) gate.CanonicalizeFunc {
+	return func(ctx context.Context) (gate.CanonicalizeResult, error) {
+		pathSet := map[string]struct{}{wd.String(): {}}
+		wdSlice := []pathalg.RemotePath{wd}
+		for _, target := range targets {
+			if err := s.canonicalizeNodeRemotePaths(ctx, target.plan, wdSlice, pathSet); err != nil {
+				return gate.CanonicalizeResult{}, err
+			}
+		}
+		allPaths := slices.Sorted(maps.Keys(pathSet))
+		canBind, err := buildBatchBinding(req, targets, concurrency, cmdDigest, allPaths)
+		if err != nil {
+			return gate.CanonicalizeResult{}, err
+		}
+		return gate.CanonicalizeResult{Binding: canBind, Paths: allPaths}, nil
+	}
+}
+
+func (s *Service) executeAuthorizedBatch(ctx context.Context, req BatchExecRequest, gateReq gate.GateRequest[security.CapExecute], targets []TargetNode, concurrency int, maxOut uint64) (BatchExecReport, error) {
 	var report BatchExecReport
 	var emitter *streamEmitter
 	var firstUnknown execution.ExecutionOutcome
@@ -154,27 +173,19 @@ func (s *Service) executeAuthorizedBatch(
 				return eErr
 			}
 		}
-		results, runErr := s.runBatchWorkers(authCtx, req, targets, concurrency, maxOut, auth.TraceID(), auth.OperationID())
+		results, runErr := s.runBatchWorkers(authCtx, req, targets, concurrency, maxOut, auth.Binding(), auth.TraceID(), auth.OperationID())
 		report = foldBatchExecReport(results, algebraic.FromStdDuration(max(s.clock.Since(startedAt), 0)))
 		firstUnknown = findFirstUnknownBatchOutcome(results)
 		if firstUnknown != nil {
 			_ = auth.ReportOutcome(firstUnknown)
 		}
-		return classifyBatchRunError(report, firstUnknown, runErr)
+		return classifyBatchRunError(report, firstUnknown, runErr, s.gate.IsHalted())
 	})
 	panicked = false
 	return report, gateErr
 }
 
-func (s *Service) runBatchWorkers(
-	ctx context.Context,
-	req BatchExecRequest,
-	targets []TargetNode,
-	concurrency int,
-	maxOut uint64,
-	traceID security.TraceID,
-	opID security.OperationID,
-) ([]BatchNodeResult, error) {
+func (s *Service) runBatchWorkers(ctx context.Context, req BatchExecRequest, targets []TargetNode, concurrency int, maxOut uint64, authBinding security.OperationBinding, traceID security.TraceID, opID security.OperationID) ([]BatchNodeResult, error) {
 	jobs, factoryStreams, err := prepareBatchJobs(targets, req.NodeStreams, req.NodeStreamFactory, traceID, opID)
 	defer func() {
 		for _, st := range factoryStreams {
@@ -190,30 +201,23 @@ func (s *Service) runBatchWorkers(
 		jobsCh <- job
 	}
 	close(jobsCh)
-
 	runCtx, cancelRun := context.WithCancelCause(ctx)
 	defer cancelRun(nil)
 	runErr := conc.RunWait(runCtx, func(_ context.Context, n *conc.Nursery) error {
 		for range min(concurrency, len(targets)) {
 			if gErr := n.Go(func(workerCtx context.Context) error {
-				return s.consumeBatchJobs(workerCtx, req, jobsCh, results, maxOut, traceID, opID, cancelRun)
+				return s.consumeBatchJobs(workerCtx, req, jobsCh, results, maxOut, authBinding, traceID, opID, cancelRun)
 			}); gErr != nil {
 				return gErr
 			}
 		}
 		return nil
 	})
-	fillMissingBatchResults(targets, results, runCtx, runErr)
+	fillMissingBatchResults(targets, results, runCtx, runErr, s.gate.IsHalted())
 	return results, runErr
 }
 
-func prepareBatchJobs(
-	targets []TargetNode,
-	prebound map[inventory.NodeID]*events.OperationStream,
-	factory NodeStreamFactory,
-	traceID security.TraceID,
-	opID security.OperationID,
-) ([]batchJob, []*events.OperationStream, error) {
+func prepareBatchJobs(targets []TargetNode, prebound map[inventory.NodeID]*events.OperationStream, factory NodeStreamFactory, traceID security.TraceID, opID security.OperationID) ([]batchJob, []*events.OperationStream, error) {
 	jobs := make([]batchJob, len(targets))
 	var created []*events.OperationStream
 	for i, target := range targets {
@@ -232,18 +236,9 @@ func prepareBatchJobs(
 	return jobs, created, nil
 }
 
-func (s *Service) consumeBatchJobs(
-	ctx context.Context,
-	req BatchExecRequest,
-	jobsCh <-chan batchJob,
-	results []BatchNodeResult,
-	maxOut uint64,
-	traceID security.TraceID,
-	opID security.OperationID,
-	cancelRun context.CancelCauseFunc,
-) error {
+func (s *Service) consumeBatchJobs(ctx context.Context, req BatchExecRequest, jobsCh <-chan batchJob, results []BatchNodeResult, maxOut uint64, authBinding security.OperationBinding, traceID security.TraceID, opID security.OperationID, cancelRun context.CancelCauseFunc) error {
 	for job := range jobsCh {
-		res := s.execBatchNode(ctx, req, job, maxOut, traceID, opID)
+		res := s.execBatchNode(ctx, req, job, maxOut, authBinding, traceID, opID)
 		results[job.index] = res
 		if s.gate.IsHalted() {
 			cancelRun(gate.ErrGateHalted)
@@ -254,14 +249,7 @@ func (s *Service) consumeBatchJobs(
 	return nil
 }
 
-func (s *Service) execBatchNode(
-	ctx context.Context,
-	req BatchExecRequest,
-	job batchJob,
-	maxOut uint64,
-	traceID security.TraceID,
-	opID security.OperationID,
-) BatchNodeResult {
+func (s *Service) execBatchNode(ctx context.Context, req BatchExecRequest, job batchJob, maxOut uint64, authBinding security.OperationBinding, traceID security.TraceID, opID security.OperationID) BatchNodeResult {
 	// LIFO 顺序：先注册 closeStream，再注册 emitCompleted，确保节点回调 panic 时仍先发射终态事件再确定性 EOF。
 	defer closeStream(job.stream)
 	startedAt := s.clock.Now().UTC().Round(0)
@@ -279,32 +267,42 @@ func (s *Service) execBatchNode(
 		emitter.emitCompleted(ctx, startedAt, res.outcome, res.Succeeded(), code, msg)
 	}()
 
-	res = s.runSingleNodeCommand(ctx, req, job.target, maxOut, emitter, startedAt)
+	res = s.runSingleNodeCommand(ctx, req, job.target, maxOut, authBinding, emitter, startedAt)
 	panicked = false
 	return res
 }
 
-func (s *Service) runSingleNodeCommand(
-	ctx context.Context,
-	req BatchExecRequest,
-	target TargetNode,
-	maxOut uint64,
-	emitter *streamEmitter,
-	startedAt time.Time,
-) BatchNodeResult {
+func effectiveBatchCommand(base execution.CommandPlan, target TargetNode) (execution.CommandPlan, error) {
+	if !base.Profile().Equal(execution.DefaultServerLaunchProfile()) {
+		return base, nil
+	}
+	prof, ok := target.defaultProfile.Get()
+	if !ok || !prof.IsValid() || prof.Equal(base.Profile()) {
+		return base, nil
+	}
+	return execution.NewCommandPlan(execution.CommandPlanSpec{
+		Kind: base.Kind(), Profile: prof, Command: base.Command(), Argv: base.Argv(),
+		WorkDir: base.WorkDir(), Env: base.Env(), Timeout: base.Timeout(),
+		MaxOutputBytes: algebraic.Some(base.MaxOutputBytes()), PTY: base.PTY(),
+	})
+}
+
+func (s *Service) runSingleNodeCommand(ctx context.Context, req BatchExecRequest, target TargetNode, maxOut uint64, authBinding security.OperationBinding, emitter *streamEmitter, startedAt time.Time) BatchNodeResult {
 	if s.gate.IsHalted() {
 		return makeNotStartedBatchResult(target.nodeID, execution.StartPhaseAuthorize, "gate_halted", gate.ErrGateHalted, s.clock.Since(startedAt))
 	}
 	if err := ctx.Err(); err != nil {
-		return makeNotStartedBatchResult(target.nodeID, execution.StartPhaseValidate, "canceled", err, s.clock.Since(startedAt))
+		return makeNotStartedBatchResult(target.nodeID, execution.StartPhaseValidate, "canceled", firstErr(context.Cause(ctx), err), s.clock.Since(startedAt))
 	}
-	execCtx, cancel := applyOptionalTimeout(ctx, req.Command.Timeout())
+	cmdPlan, err := effectiveBatchCommand(req.Command, target)
+	if err != nil {
+		return makeNotStartedBatchResult(target.nodeID, execution.StartPhaseValidate, "invalid_node_profile", err, s.clock.Since(startedAt))
+	}
+	execCtx, cancel := applyOptionalTimeout(ctx, cmdPlan.Timeout())
 	defer cancel()
-
 	outW := newBoundedCaptureWriter(execCtx, emitter, events.OutputStreamStdout, maxOut)
 	errW := newBoundedCaptureWriter(execCtx, emitter, events.OutputStreamStderr, maxOut)
-	outcome, execErr := s.execCommandWithLease(execCtx, target.plan, req.Command, outW, errW)
-
+	outcome, execErr := s.execCommandWithLease(execCtx, target.plan, cmdPlan, authBinding, s.enforceStrictPaths(), outW, errW)
 	stdout, outTrunc := outW.snapshot()
 	stderr, errTrunc := errW.snapshot()
 	stdoutFile, stderrFile, writeErr := s.writeNodeOutputsIfConfigured(req.OutputDir, target.nodeID, stdout, stderr)
@@ -319,13 +317,8 @@ func (s *Service) runSingleNodeCommand(
 }
 
 // execCommandWithLease 在 pool.WithLease 作用域内执行单条不可变 CommandPlan，
-// 精确区分启动前失败（OutcomeNotStarted）与启动后中断/未知结果（OutcomeUnknown，严禁重试）。
-func (s *Service) execCommandWithLease(
-	ctx context.Context,
-	connPlan plan.SealedConnectionPlan,
-	cmd execution.CommandPlan,
-	stdout, stderr io.Writer,
-) (execution.ExecutionOutcome, error) {
+// 严格执行 WorkDir 写/执行前 TOCTOU 复核，并精确区分 OutcomeNotStarted 与 OutcomeUnknown（严禁重试）。
+func (s *Service) execCommandWithLease(ctx context.Context, connPlan plan.SealedConnectionPlan, cmd execution.CommandPlan, authBinding security.OperationBinding, verifyWorkDir bool, stdout, stderr io.Writer) (execution.ExecutionOutcome, error) {
 	targetHop, ok := connPlan.Target()
 	if !ok {
 		err := fmt.Errorf("%w: 连接计划缺少末跳目标", ErrInvalidRequest)
@@ -335,36 +328,53 @@ func (s *Service) execCommandWithLease(
 	var enteredLease, started bool
 	leaseErr := s.pool.WithLease(ctx, connPlan, func(leaseCtx context.Context, lease *pool.Lease) error {
 		enteredLease = true
-		sess, err := lease.OpenSession(leaseCtx)
-		if err != nil {
-			outcome = makeNotStartedOutcome(execution.StartPhaseSessionOpen, "open_session_failed", err)
-			return err
-		}
-		defer func() { _ = sess.Close() }()
-		var stdin io.Reader
-		if payload, hasStdin := cmd.StdinPayload(); hasStdin {
-			stdin = strings.NewReader(payload)
-		}
-		streams := ports.ExecStreams{Stdin: stdin, Stdout: stdout, Stderr: stderr, Env: s.filterSendEnv(targetHop)}
-		if err := sess.Start(leaseCtx, cmd, streams); err != nil {
-			outcome = makeNotStartedOutcome(execution.StartPhaseRequestRejected, "session_start_failed", err)
-			return err
-		}
-		started = true
-		waitOut, waitErr := sess.Wait(leaseCtx)
-		outcome = classifyPostStartOutcome(leaseCtx, waitOut, waitErr)
-		return waitErr
+		var err error
+		outcome, started, err = s.runCommandInLease(leaseCtx, lease, targetHop, cmd, authBinding, verifyWorkDir, stdout, stderr)
+		return err
 	})
 	if !enteredLease {
 		return makeNotStartedOutcome(execution.StartPhaseDial, "lease_failed", leaseErr), leaseErr
 	}
-	if !started && (outcome == nil || !outcome.IsValid()) {
+	if outcome == nil || !outcome.IsValid() {
+		if started {
+			return classifyPostStartOutcome(ctx, nil, leaseErr), leaseErr
+		}
 		return makeNotStartedOutcome(execution.StartPhaseSessionOpen, "prestart_failed", leaseErr), leaseErr
 	}
-	if started && (outcome == nil || !outcome.IsValid()) {
-		return classifyPostStartOutcome(ctx, nil, leaseErr), leaseErr
-	}
 	return outcome, leaseErr
+}
+
+func (s *Service) runCommandInLease(ctx context.Context, lease *pool.Lease, targetHop plan.HopSpec, cmd execution.CommandPlan, authBinding security.OperationBinding, verifyWorkDir bool, stdout, stderr io.Writer) (execution.ExecutionOutcome, bool, error) {
+	if err := verifyCommandWorkDirInLease(ctx, lease, authBinding, verifyWorkDir, cmd.WorkDir()); err != nil {
+		return makeNotStartedOutcome(execution.StartPhaseAuthorize, "workdir_scope_escalated", err), false, err
+	}
+	sess, err := lease.OpenSession(ctx)
+	if err != nil {
+		return makeNotStartedOutcome(execution.StartPhaseSessionOpen, "open_session_failed", err), false, err
+	}
+	defer func() { _ = sess.Close() }()
+	var stdin io.Reader
+	if payload, hasStdin := cmd.StdinPayload(); hasStdin {
+		stdin = strings.NewReader(payload)
+	}
+	if err := sess.Start(ctx, cmd, ports.ExecStreams{Stdin: stdin, Stdout: stdout, Stderr: stderr, Env: s.filterSendEnv(targetHop)}); err != nil {
+		return makeNotStartedOutcome(execution.StartPhaseRequestRejected, "session_start_failed", err), false, err
+	}
+	waitOut, waitErr := sess.Wait(ctx)
+	return classifyPostStartOutcome(ctx, waitOut, waitErr), true, waitErr
+}
+
+func verifyCommandWorkDirInLease(ctx context.Context, lease *pool.Lease, binding security.OperationBinding, enforce bool, wdOpt algebraic.Option[pathalg.RemotePath]) error {
+	wd, hasWD := wdOpt.Get()
+	if !enforce || !hasWD || !wd.IsValid() {
+		return nil
+	}
+	rfs, err := lease.OpenRemoteFS(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rfs.Close() }()
+	return verifyRemotePathAuthorized(ctx, true, rfs, binding, wd)
 }
 
 func (s *Service) writeNodeOutputsIfConfigured(
@@ -377,8 +387,9 @@ func (s *Service) writeNodeOutputsIfConfigured(
 	if !hasOut {
 		return noneDest, noneDest, nil
 	}
-	outDest, e1 := pathalg.ParseLocalRootedDest(nodeID.String() + ".stdout.log")
-	errDest, e2 := pathalg.ParseLocalRootedDest(nodeID.String() + ".stderr.log")
+	// 加固定非保留前缀 "node-"，防止合法 NodeID（如 con/nul/aux/com1）触发 Windows 保留设备名拒绝。
+	outDest, e1 := pathalg.ParseLocalRootedDest("node-" + nodeID.String() + ".stdout.log")
+	errDest, e2 := pathalg.ParseLocalRootedDest("node-" + nodeID.String() + ".stderr.log")
 	if err := firstErr(e1, e2); err != nil {
 		return noneDest, noneDest, err
 	}
@@ -399,98 +410,4 @@ func (s *Service) writeNodeOutputsIfConfigured(
 		return noneDest, noneDest, err
 	}
 	return algebraic.Some(outDest), algebraic.Some(errDest), nil
-}
-
-func fillMissingBatchResults(targets []TargetNode, results []BatchNodeResult, ctx context.Context, runErr error) {
-	fallbackErr := firstErr(runErr, ctx.Err(), ErrBatchFailed)
-	for i, target := range targets {
-		if !results[i].IsValid() {
-			results[i] = makeNotStartedBatchResult(target.nodeID, execution.StartPhaseValidate, "batch_aborted", fallbackErr, 0)
-		}
-	}
-}
-
-func foldBatchExecReport(results []BatchNodeResult, dur algebraic.Duration) BatchExecReport {
-	var okCnt, failCnt, unkCnt, notStartedCnt int
-	for _, r := range results {
-		switch {
-		case r.IsOutcomeUnknown():
-			unkCnt++
-		case r.Succeeded():
-			okCnt++
-		case r.IsNotStarted():
-			notStartedCnt++
-			failCnt++
-		default:
-			failCnt++
-		}
-	}
-	return BatchExecReport{
-		results: results, succeededCount: okCnt, failedCount: failCnt,
-		unknownCount: unkCnt, notStartedCount: notStartedCnt,
-		hasUnknownOutcome: unkCnt > 0, duration: dur, valid: len(results) > 0,
-	}
-}
-
-func findFirstUnknownBatchOutcome(results []BatchNodeResult) execution.ExecutionOutcome {
-	for _, r := range results {
-		if r.IsOutcomeUnknown() {
-			return r.outcome
-		}
-	}
-	return nil
-}
-
-func classifyBatchRunError(report BatchExecReport, firstUnknown execution.ExecutionOutcome, runErr error) error {
-	if firstUnknown != nil {
-		cause := ErrUncertainOutcome
-		if runErr != nil && !errors.Is(runErr, ErrUncertainOutcome) {
-			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr)
-		}
-		if wrapped, err := gate.WrapOutcomeError(firstUnknown, cause); err == nil {
-			return wrapped
-		}
-		return cause
-	}
-	if runErr != nil {
-		return runErr
-	}
-	if report.failedCount > 0 {
-		return fmt.Errorf("%w: succeeded=%d failed=%d", ErrBatchFailed, report.succeededCount, report.failedCount)
-	}
-	return nil
-}
-
-func batchCompletedFields(report BatchExecReport, firstUnknown execution.ExecutionOutcome, gateErr error, panicked bool) (execution.ExecutionOutcome, bool, string, string) {
-	if panicked {
-		return nil, false, "operation_panicked", "batch exec panicked"
-	}
-	if firstUnknown != nil {
-		return firstUnknown, false, "outcome_unknown", "batch exec has unknown node outcome"
-	}
-	if gateErr != nil {
-		return nil, false, pickIf(errors.Is(gateErr, gate.ErrGateHalted), "gate_halted", "batch_failed"), gateErr.Error()
-	}
-	return nil, report.failedCount == 0, "", "completed"
-}
-
-func classifyNodeCompletedMeta(res BatchNodeResult) (string, string) {
-	if !res.IsValid() {
-		return "invalid_result", "node result invalid"
-	}
-	if res.Succeeded() {
-		return "", "completed"
-	}
-	if res.IsOutcomeUnknown() {
-		return "outcome_unknown", pickIf(res.errMsg != "", res.errMsg, "execution outcome unknown")
-	}
-	return "node_failed", pickIf(res.errMsg != "", res.errMsg, "node execution failed")
-}
-
-func makeNotStartedBatchResult(nodeID inventory.NodeID, phase execution.StartPhase, code string, err error, elapsed time.Duration) BatchNodeResult {
-	return BatchNodeResult{
-		nodeID: nodeID, outcome: makeNotStartedOutcome(phase, code, err),
-		duration: algebraic.FromStdDuration(max(elapsed, 0)),
-		errMsg:   errString(err, ""), err: err, valid: true,
-	}
 }
