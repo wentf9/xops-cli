@@ -150,7 +150,7 @@ Host *
 	// 3. ProxyCommand=none 全禁用，低层 ProxyJump 亦不得生效（跨所有 OpenSSH 版本一致）。
 	assertProxyFullDisableDiff(t, sshBin, cfgPath, src, "cmd-disabled")
 	// 4. 多跳 ProxyJump 下 %C（%j = bastion2.example）与 ControlPersist=0（永久驻留）对齐 ssh -G。
-	assertMultiHopPercentCDiff(t, sshBin, cfgPath, src, "multi-hop")
+	assertMultiHopPercentCDiff(t, sshBin, dir, cfgPath, src, "multi-hop")
 }
 
 func isSSHProxyFieldDisabled(val string) bool {
@@ -247,7 +247,53 @@ func assertProxyFullDisableDiff(t *testing.T, sshBin, cfgPath string, src *opens
 	}
 }
 
-func assertMultiHopPercentCDiff(t *testing.T, sshBin, cfgPath string, src *openssh.ConfigSource, alias string) {
+// probePercentCIncludesJumpHost 对本机真实 ssh -G 执行最小双块探针，实证检测该 OpenSSH 版本
+// 的 %C 是否已合入 %j（OpenSSH 9.6 / bz#3610 引入 %j 并合入 %C = SHA1(%l%h%p%r%j)）：
+//   - OpenSSH >= 9.6：带 ProxyJump 的 %C 匹配 SHA1(%l%h%p%r%j)，返回 true；
+//   - 旧版 OpenSSH <= 9.5（含 Windows 11 内置 Win32-OpenSSH 9.5p1）：%C 仍为 SHA1(%l%h%p%r)，返回 false；
+//   - 若无跳板基线或带跳板输出与上述两种规范哈希均不符，立即失败关闭。
+func probePercentCIncludesJumpHost(t *testing.T, sshBin, dir, localHost string) (bool, error) {
+	t.Helper()
+	probeCfg := filepath.Join(dir, "probe_percent_c.conf")
+	tpl := filepath.ToSlash(filepath.Join(dir, "p-%C"))
+	writeTestFile(t, probeCfg, `
+Host c-nojump
+  HostName 192.0.2.200
+  User probeuser
+  Port 2222
+  ControlPath `+tpl+`
+
+Host c-withjump
+  HostName 192.0.2.200
+  User probeuser
+  Port 2222
+  ProxyJump hop1.example,hop2.example
+  ControlPath `+tpl+`
+`)
+	wantNoJump, err := option.ComputePercentC(localHost, "192.0.2.200", 2222, "probeuser")
+	if err != nil {
+		return false, err
+	}
+	wantWithJump, err := option.ComputeConnectionHash(localHost, "192.0.2.200", 2222, "probeuser", "hop2.example")
+	if err != nil {
+		return false, err
+	}
+	noJumpPath := filepath.ToSlash(runSSHGDump(t, sshBin, probeCfg, "c-nojump").single["controlpath"])
+	if !strings.HasSuffix(noJumpPath, "p-"+wantNoJump) {
+		t.Fatalf("无跳板 %%C 探针失配: wantSuffix=%q ssh-G=%q", "p-"+wantNoJump, noJumpPath)
+	}
+	withJumpPath := filepath.ToSlash(runSSHGDump(t, sshBin, probeCfg, "c-withjump").single["controlpath"])
+	if strings.HasSuffix(withJumpPath, "p-"+wantWithJump) {
+		return true, nil
+	}
+	if strings.HasSuffix(withJumpPath, "p-"+wantNoJump) {
+		return false, nil
+	}
+	t.Fatalf("多跳 %%C 探针输出既不匹配含 %%j (%s) 也不匹配无 %%j (%s): ssh-G=%q", wantWithJump, wantNoJump, withJumpPath)
+	return false, nil
+}
+
+func assertMultiHopPercentCDiff(t *testing.T, sshBin, dir, cfgPath string, src *openssh.ConfigSource, alias string) {
 	t.Helper()
 	dump := runSSHGDump(t, sshBin, cfgPath, alias)
 	target := mustOrigHost(t, alias)
@@ -266,11 +312,28 @@ func assertMultiHopPercentCDiff(t *testing.T, sshBin, cfgPath string, src *opens
 	if err != nil {
 		t.Fatalf("os.Hostname 失败: %v", err)
 	}
+	// 无条件校验 XOps RFC §3.6 锁定的 %C = SHA1(%l%h%p%r%j)（末跳无方括号规范主机名 bastion2.example）。
 	hash, err := eff.PercentC(localHost, "deploy")
 	if err != nil {
 		t.Fatalf("PercentC 失败: %v", err)
 	}
-	wantSuffix := "mux-" + hash
+	wantRFC, err := option.ComputeConnectionHash(localHost, "192.0.2.13", 2222, "deploy", "bastion2.example")
+	if err != nil || hash != wantRFC {
+		t.Fatalf("XOps RFC §3.6 多跳 %%C 违例: got=%q want=%q err=%v", hash, wantRFC, err)
+	}
+	// 按本机 ssh -G 探针结果严格校验精确 40 位十六进制 SHA-1 哈希（OpenSSH >= 9.6 含 %j vs <= 9.5 无 %j）。
+	includesJump, err := probePercentCIncludesJumpHost(t, sshBin, dir, localHost)
+	if err != nil {
+		t.Fatalf("probePercentCIncludesJumpHost 失败: %v", err)
+	}
+	wantSSHHash := hash
+	if !includesJump {
+		wantSSHHash, err = option.ComputePercentC(localHost, "192.0.2.13", 2222, "deploy")
+		if err != nil {
+			t.Fatalf("ComputePercentC(legacy) 失败: %v", err)
+		}
+	}
+	wantSuffix := "mux-" + wantSSHHash
 	if !strings.HasSuffix(filepath.ToSlash(dump.single["controlpath"]), wantSuffix) {
 		t.Fatalf("多跳 ProxyJump %%C 哈希失配: wantSuffix=%q ssh-G=%q", wantSuffix, dump.single["controlpath"])
 	}
