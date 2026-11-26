@@ -21,26 +21,19 @@ import (
 // 脱离已取消的父 ctx 确保终态事件不被静默丢弃，同时有界防止无人读取的满缓冲阻塞停机。
 const terminalEventEmitTimeout = 50 * time.Millisecond
 
-// operationEmitter 封装单次受权会话向可选 OperationStream 发射强类型事件的全部状态。
+// operationEmitter 封装单次受权会话向可选 OperationStream 发射强类型事件的全部状态；
 // 当 stream 为 nil 时全部方法静默空转，绝不阻断核心执行路径。
 type operationEmitter struct {
-	stream    *events.OperationStream
-	clock     ports.Clock
-	traceID   security.TraceID
-	opID      security.OperationID
-	nodeID    algebraic.Option[inventory.NodeID]
-	seq       atomic.Uint64
-	stdoutSeq atomic.Uint64
-	stderrSeq atomic.Uint64
+	stream                    *events.OperationStream
+	clock                     ports.Clock
+	traceID                   security.TraceID
+	opID                      security.OperationID
+	nodeID                    algebraic.Option[inventory.NodeID]
+	capability                security.CapabilityKind
+	seq, stdoutSeq, stderrSeq atomic.Uint64
 }
 
-func newOperationEmitter(
-	stream *events.OperationStream,
-	clock ports.Clock,
-	traceID security.TraceID,
-	opID security.OperationID,
-	nodeLabel string,
-) *operationEmitter {
+func newOperationEmitterFor(stream *events.OperationStream, clock ports.Clock, traceID security.TraceID, opID security.OperationID, nodeLabel string, capKind security.CapabilityKind) *operationEmitter {
 	if stream == nil {
 		return nil
 	}
@@ -48,53 +41,31 @@ func newOperationEmitter(
 	if nid, err := inventory.ParseNodeID(nodeLabel); err == nil {
 		nodeOpt = algebraic.Some(nid)
 	}
-	return &operationEmitter{
-		stream:  stream,
-		clock:   clock,
-		traceID: traceID,
-		opID:    opID,
-		nodeID:  nodeOpt,
+	if !capKind.IsValid() {
+		capKind = security.CapabilityExecute
 	}
+	return &operationEmitter{stream: stream, clock: clock, traceID: traceID, opID: opID, nodeID: nodeOpt, capability: capKind}
 }
 
-func (e *operationEmitter) active() bool {
-	return e != nil && e.stream != nil && !e.stream.IsClosed()
-}
-
+func (e *operationEmitter) active() bool { return e != nil && e.stream != nil && !e.stream.IsClosed() }
 func (e *operationEmitter) nextMeta() (events.EventMeta, error) {
-	now := e.clock.Now().UTC().Round(0)
-	return events.NewEventMeta(events.EventMetaSpec{
-		TraceID:     e.traceID,
-		OperationID: algebraic.Some(e.opID),
-		OccurredAt:  now,
-		Seq:         e.seq.Add(1),
-		NodeID:      e.nodeID,
-	})
-}
-
-func (e *operationEmitter) emitStarted(ctx context.Context, action string, planDigest plan.PlanDigest, summary string) {
 	if !e.active() {
-		return
+		return zeroVal[events.EventMeta](), ports.ErrClosed
 	}
-	meta, err := e.nextMeta()
-	if err != nil {
-		return
-	}
-	ev, err := events.NewOperationStartedEvent(events.OperationStartedSpec{
-		Meta:       meta,
-		Capability: security.CapabilityExecute,
-		Tool:       "ssh",
-		Action:     action,
-		PlanDigest: algebraic.Some(planDigest),
-		Summary:    summary,
+	return events.NewEventMeta(events.EventMetaSpec{
+		TraceID: e.traceID, OperationID: algebraic.Some(e.opID),
+		OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID,
 	})
-	if err == nil {
-		_ = e.stream.Emit(ctx, ev)
+}
+func (e *operationEmitter) emitStarted(ctx context.Context, action string, planDigest plan.PlanDigest, summary string) {
+	if meta, err := e.nextMeta(); err == nil {
+		if ev, err := events.NewOperationStartedEvent(events.OperationStartedSpec{Meta: meta, Capability: e.capability, Tool: "ssh", Action: action, PlanDigest: algebraic.Some(planDigest), Summary: summary}); err == nil {
+			_ = e.stream.Emit(ctx, ev)
+		}
 	}
 }
-
 func (e *operationEmitter) emitOutputChunk(ctx context.Context, kind events.OutputStreamKind, data []byte) {
-	if !e.active() || len(data) == 0 {
+	if len(data) == 0 || !e.active() {
 		return
 	}
 	counter := &e.stdoutSeq
@@ -102,60 +73,33 @@ func (e *operationEmitter) emitOutputChunk(ctx context.Context, kind events.Outp
 		counter = &e.stderrSeq
 	}
 	for off := 0; off < len(data); off += outputChunkMaxSize {
-		end := min(off+outputChunkMaxSize, len(data))
 		meta, err := e.nextMeta()
 		if err != nil {
 			return
 		}
-		ev, err := events.NewOutputChunkEvent(events.OutputChunkSpec{
-			Meta:       meta,
-			Stream:     kind,
-			ChunkIndex: counter.Add(1) - 1,
-			Data:       data[off:end],
-		})
-		if err != nil {
-			return
-		}
-		if e.stream.Emit(ctx, ev) != nil {
+		ev, err := events.NewOutputChunkEvent(events.OutputChunkSpec{Meta: meta, Stream: kind, ChunkIndex: counter.Add(1) - 1, Data: data[off:min(off+outputChunkMaxSize, len(data))]})
+		if err != nil || e.stream.Emit(ctx, ev) != nil {
 			return
 		}
 	}
 }
-
 func (e *operationEmitter) emitCompleted(ctx context.Context, startedAt time.Time, outcome execution.ExecutionOutcome, finalErr error) {
-	if !e.active() {
-		return
-	}
 	meta, err := e.nextMeta()
 	if err != nil {
 		return
 	}
-	elapsed := max(e.clock.Since(startedAt), 0)
 	outOpt, succeeded, code, msg := classifyCompletedEventFields(outcome, finalErr)
-	ev, err := events.NewOperationCompletedEvent(events.OperationCompletedSpec{
-		Meta:       meta,
-		Capability: security.CapabilityExecute,
-		Duration:   algebraic.FromStdDuration(elapsed),
-		Outcome:    outOpt,
-		Succeeded:  succeeded,
-		Code:       code,
-		Message:    msg,
-	})
-	if err != nil {
-		return
+	if ev, err := events.NewOperationCompletedEvent(events.OperationCompletedSpec{Meta: meta, Capability: e.capability, Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)), Outcome: outOpt, Succeeded: succeeded, Code: code, Message: msg}); err == nil {
+		emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalEventEmitTimeout)
+		defer cancel()
+		_ = e.stream.Emit(emitCtx, ev)
 	}
-	emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalEventEmitTimeout)
-	defer cancel()
-	_ = e.stream.Emit(emitCtx, ev)
 }
 
 // classifyCompletedEventFields 穷尽投影 (ExecutionOutcome, finalErr) 至 OperationCompletedEvent 字段，
 // 严格维持与 events.completedOutcomeConsistent 的跨字段不变量：
 // 若远端命令返回退出码 0 但门控终态审计/熔断报错（finalErr != nil），必须发射 Succeeded=false 且 Outcome=None。
-func classifyCompletedEventFields(
-	outcome execution.ExecutionOutcome,
-	finalErr error,
-) (outOpt algebraic.Option[execution.ExecutionOutcome], succeeded bool, code, msg string) {
+func classifyCompletedEventFields(outcome execution.ExecutionOutcome, finalErr error) (algebraic.Option[execution.ExecutionOutcome], bool, string, string) {
 	if outcome != nil && outcome.IsValid() {
 		switch v := outcome.(type) {
 		case *execution.OutcomeCompleted:
@@ -181,16 +125,14 @@ func classifyCompletedEventFields(
 }
 
 func classifyFinalErrorCode(err error) string {
-	switch {
-	case errors.Is(err, ports.ErrAuditPostWrite):
+	if errors.Is(err, ports.ErrAuditPostWrite) {
 		return "audit_post_write_failed"
-	case errors.Is(err, gate.ErrGateHalted):
-		return "gate_halted"
-	default:
-		return "session_error"
 	}
+	if errors.Is(err, gate.ErrGateHalted) {
+		return "gate_halted"
+	}
+	return "session_error"
 }
-
 func sanitizeEventCode(raw, fallback string) string {
 	if raw == "" || len(raw) > 64 {
 		return fallback
@@ -203,7 +145,6 @@ func sanitizeEventCode(raw, fallback string) string {
 	return raw
 }
 
-// chunkTeeWriter 同时将远端输出流写入调用方目标 Writer 并分片发射至 OperationStream。
 type chunkTeeWriter struct {
 	ctx     context.Context
 	dst     io.Writer
@@ -217,13 +158,11 @@ func wrapOutputWriter(ctx context.Context, dst io.Writer, emitter *operationEmit
 	}
 	return &chunkTeeWriter{ctx: ctx, dst: dst, emitter: emitter, kind: kind}
 }
-
 func (w *chunkTeeWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	n := len(p)
-	var writeErr error
+	n, writeErr := len(p), error(nil)
 	if w.dst != nil {
 		n, writeErr = w.dst.Write(p)
 	}

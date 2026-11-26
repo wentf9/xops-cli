@@ -181,6 +181,18 @@ func TestExternalConsumerAccessorsPassLinearLease(t *testing.T) {
 		return nil
 	})
 	extRequireNoErr(t, err, "外置包 WithAuthorized")
+
+	// 验证只读扩展 Authorizer.Policy() 与 GuardrailPolicy.MatchScopedPaths 契约及零值失败关闭。
+	var az gate.Authorizer = g
+	extRequireTrue(t, az.Policy().IsValid() && az.Policy().Digest().Equal(pol.Digest()), "Authorizer.Policy() 应返回一致只读策略")
+	protPol, err := gate.NewGuardrailPolicyFromPatterns(security.RiskModerate, gate.NoElicitFallbackDeny, []string{"/etc/**", "/root/**"})
+	extRequireNoErr(t, err, "NewGuardrailPolicyFromPatterns(protected)")
+	scoped, anyProt, err := protPol.MatchScopedPaths([]string{"/tmp/ok", "/etc/sudoers"}, []string{"/root"})
+	extRequireNoErr(t, err, "MatchScopedPaths")
+	extRequireTrue(t, anyProt && len(scoped) == 3 && !scoped[0].IsProtected() && scoped[1].IsProtected() && scoped[2].IsProtected() && scoped[2].IsRecursive(), "MatchScopedPaths 受保护分区标记异常")
+	var zeroPol gate.GuardrailPolicy
+	_, _, zErr := zeroPol.MatchScopedPaths([]string{"/etc/passwd"}, nil)
+	extRequireErrIs(t, zErr, gate.ErrInvalidPolicy, "零值策略 MatchScopedPaths 必须失败关闭")
 }
 
 type extStubAuditSink struct {

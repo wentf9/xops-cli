@@ -2,6 +2,8 @@ package pool
 
 import (
 	"context"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -252,4 +254,73 @@ func TestGracefulCloseEmitsRetiredNotGateHaltedOnSystemBus(t *testing.T) {
 		}
 	}
 	requireTrue(t, sawRetired && !sawGateHalted, "正常 Pool.Close() 必须对句柄发布 PoolActionRetired 且严禁误报 PoolActionGateHalted")
+}
+
+// selfReleaseManagedRes 模拟在独立 reaperNursery 中自发调用 ReleaseHandle、且 Close() 无条件等待
+// reaperNursery.Close() 的托管资源（如 managedMuxMaster），验证 ReleaseHandle 与 Pool.Close() 并发竞态下
+// 永不落入 teardownNursery 已关闭的同步 Close 回退自死锁且零协程泄漏。
+type selfReleaseManagedRes struct {
+	reaper   *conc.Nursery
+	trigger  chan struct{}
+	closed   atomic.Bool
+	once     sync.Once
+	release  func()
+	relReady chan struct{}
+}
+
+func (r *selfReleaseManagedRes) IsValid() bool { return r != nil && !r.closed.Load() }
+func (r *selfReleaseManagedRes) Close() error {
+	r.once.Do(func() {
+		r.closed.Store(true)
+		r.reaper.Cancel(ErrHandleRevoked)
+		_ = r.reaper.Close()
+	})
+	return nil
+}
+
+// TestReleaseHandleConcurrentWithPoolCloseLinearizedNoSyncSelfWait 回归验证：
+// ReleaseHandle 在持 slots.mu 期间预增 tdPending 与 Pool.Close() 严格线性化，
+// 并发竞态下既不会在调用方自身协程同步重入 res.Close() 导致自死锁，也保证 100% 确定性排空与零泄漏。
+func TestReleaseHandleConcurrentWithPoolCloseLinearizedNoSyncSelfWait(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	pl := mustPlan(t, mustHop(t, 0, "lin-host", "198.51.100.161", 22, 0, 0))
+	binding := mustBindingForPlan(t, pl.PlanDigest(), "mux", "start")
+	for range 40 {
+		p, _, _ := newTestPool(t, PoolConfig{})
+		reaper, err := conc.NewNursery(context.Background())
+		requireNoErr(t, err, "NewNursery")
+		res := &selfReleaseManagedRes{reaper: reaper, trigger: make(chan struct{}), relReady: make(chan struct{})}
+		requireNoErr(t, reaper.Go(func(rCtx context.Context) error {
+			select {
+			case <-rCtx.Done():
+				return nil
+			case <-res.trigger:
+			}
+			select {
+			case <-rCtx.Done():
+				return nil
+			case <-res.relReady:
+			}
+			res.release()
+			return nil
+		}), "reaper.Go")
+		h, err := RegisterHandle[plan.KindMux](p, pl.PlanDigest(), binding, res)
+		requireNoErr(t, err, "RegisterHandle")
+		res.release = func() { _ = ReleaseHandle[plan.KindMux](p, h) }
+		close(res.relReady)
+
+		requireNoErr(t, conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+			start := make(chan struct{})
+			if gErr := n.Go(func(context.Context) error { <-start; close(res.trigger); return nil }); gErr != nil {
+				return gErr
+			}
+			if gErr := n.Go(func(context.Context) error { <-start; _ = p.Close(); return nil }); gErr != nil {
+				return gErr
+			}
+			close(start)
+			return nil
+		}), "RunWait concurrent ReleaseHandle vs Pool.Close")
+		requireTrue(t, res.closed.Load(), "资源必须已确定性关闭")
+		requireNoErr(t, p.WaitPendingTeardowns(context.Background()), "WaitPendingTeardowns")
+	}
 }

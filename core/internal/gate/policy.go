@@ -237,6 +237,15 @@ func (p GuardrailPolicy) ProtectedRuleCount() int {
 	return p.protectedMatcher.RuleCount()
 }
 
+// MatchScopedPaths 使用策略内已编译的受保护路径匹配器对普通与递归路径求值，
+// 返回携带完整受保护分区标签的 []security.ScopedPath 及是否存在受保护路径命中。
+func (p GuardrailPolicy) MatchScopedPaths(paths, recursivePaths []string) ([]security.ScopedPath, bool, error) {
+	if !p.IsValid() {
+		return nil, false, ErrInvalidPolicy
+	}
+	return p.matchScopedPaths(paths, recursivePaths)
+}
+
 // evaluateScopeSnapshot 按有界安全格对单阶段绑定与路径集合求值，生成不可变 security.ScopeSnapshot。
 func (p GuardrailPolicy) evaluateScopeSnapshot(
 	profile PolicyProfileKind,

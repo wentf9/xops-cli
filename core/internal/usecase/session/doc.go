@@ -1,17 +1,16 @@
-// Package session 实现 XOps v2 单命令执行与交互式 SSH 会话用例服务（ADR-008 / ADR-009 / ADR-010 / Plan P2.5-T2）。
+// Package session 实现 XOps v2 全量会话、提权、探测、持久 PTY、隧道转发与多路复用控制面用例服务
+// （ADR-008 / ADR-009 / ADR-010 / ADR-011 / Plan P2.5-T2 & P3-T2）。
 //
-// Phase 2.5 Walking Skeleton 切片核心不变量：
-//   - 严格强制能力门控与连接池嵌套序：gate.WithAuthorized[security.CapExecute] 恒包裹于
-//     pool.WithLease 外层（严禁反序或绕过门控），并把强类型 execution.ExecutionOutcome 上报给
-//     Authorized.ReportOutcome，确保 OutcomeUnknown 绝不被降级；
-//   - 所有 SendEnv 环境变量均严格经由注入的 ports.EnvPort 与连接计划内的 option.EnvFilter 过滤，
-//     全包零隐式 os.Environ/os.Getenv；
-//   - 交互式与 PTY 会话严格通过 RemoteSession.{StdinPipe,StdoutPipe,StderrPipe}、
-//     TerminalPort.WithRawTerminal 与 TerminalHandle.Relay 接线（完整支持 RequestTTY auto/yes/no/force、
-//     窗口缩放事件转发、本地半关闭与远端先达 EOF），保证 0 linearlease 逃逸与 0 goleak 泄漏；
-//   - 支持可选隔离 events.OperationStream，按序发射 OperationStarted / OutputChunk / OperationCompleted
-//     并在返回前幂等关闭以提供确定性 EOF；
-//   - 全包严禁导入 core/osfs 与 core/internal/sshnet/**，零裸 go 语句，零 nolint 豁免。
+// 核心安全、并发与所有权不变量：
+//   - 能力门控与连接池嵌套序恒为 gate.WithAuthorized[C] 包裹 pool.WithLease，严禁反序或绕过护栏，
+//     并向 Authorized.ReportOutcome 上报强类型 ExecutionOutcome（确保 OutcomeUnknown 绝不降级）；
+//   - 提权执行（sudo/su/doas）经 PrivilegeEscalationPort 与 security.CanonicalScopeEscalated 校验，
+//     口令仅经 SecretVault.WithSecret 或 InteractionPort.PromptSecret 借用透传（本包 0 SecretBox.Use）；
+//   - 两阶段远端 Shell 探针经 ShellProbePort 执行并严格失败关闭校验（拒绝非法/未知方言，零盲猜回退）；
+//   - 跨请求持久 PTY、-L/-R/-D/StreamLocal/TUN 转发与 ControlMaster 一律经 pool.RegisterLeaseHandleWith
+//     绑定池钉选可撤销 TransportConn，杜绝失效 *pool.Lease 复用与 //xops:borrowed 逃逸，吊销即止、0 泄漏；
+//   - ControlMaster 控制面门控一律消费 ControlPolicy.EffectiveMaster() / EffectivePersist() 失败关闭投影；
+//   - 全部后台协程受 core/conc.Nursery 监督（0 裸 go、0 goleak、0 time.Sleep），禁导 core/osfs 与 sshnet。
 package session
 
 import (
@@ -29,16 +28,18 @@ const (
 
 // 本包导出的规范化哨兵错误，供 core/engine 与上层测试以 errors.Is 精确区分故障类别。
 var (
-	// ErrNilContext 表示传入的 context.Context 为 nil。
-	ErrNilContext = errors.New("usecase/session: context 不能为 nil")
-	// ErrInvalidConfig 表示 ServiceConfig 缺少必填依赖或配置非法。
-	ErrInvalidConfig = errors.New("usecase/session: 无效的 ServiceConfig 配置")
-	// ErrServiceNotInitialized 表示在零值或未初始化 Service 上调用方法。
-	ErrServiceNotInitialized = errors.New("usecase/session: Service 未初始化")
-	// ErrInvalidRequest 表示会话或命令执行请求字段非法。
-	ErrInvalidRequest = errors.New("usecase/session: 无效的会话执行请求")
-	// ErrInvalidRequestTTY 表示 RequestTTYMode 值非法。
-	ErrInvalidRequestTTY = errors.New("usecase/session: 无效的 RequestTTY 模式")
+	ErrNilContext             = errors.New("usecase/session: context 不能为 nil")
+	ErrInvalidConfig          = errors.New("usecase/session: 无效的 ServiceConfig 配置")
+	ErrServiceNotInitialized  = errors.New("usecase/session: Service 未初始化")
+	ErrInvalidRequest         = errors.New("usecase/session: 无效的会话执行请求")
+	ErrInvalidRequestTTY      = errors.New("usecase/session: 无效的 RequestTTY 模式")
+	ErrPortUnavailable        = errors.New("usecase/session: 必需的出站端口未配置")
+	ErrInvalidProbeResult     = errors.New("usecase/session: 远端 Shell 探测结果无效")
+	ErrEscalationScopeChanged = errors.New("usecase/session: 提权规范作用域校验失败或发生漂移")
+	ErrPTYClosed              = errors.New("usecase/session: 持久 PTY 会话已关闭或已吊销")
+	ErrControlMasterDisabled  = errors.New("usecase/session: ControlPolicy 生效投影已禁用多路复用")
+	ErrMuxMasterUnavailable   = errors.New("usecase/session: ControlMaster 不可用或连接被拒绝")
+	ErrMuxPersistExpired      = errors.New("usecase/session: ControlPersist 驻留超时已过期")
 )
 
 // RequestTTYMode 标识 SSH 伪终端分配策略（对应 OpenSSH RequestTTY auto/yes/no/force 与 -t/-tt/-T）；
@@ -67,45 +68,27 @@ func ParseRequestTTYMode(raw string) (RequestTTYMode, error) {
 		return RequestTTYNo, nil
 	case "force":
 		return RequestTTYForce, nil
-	default:
-		return RequestTTYUnset, fmt.Errorf("%w: %q", ErrInvalidRequestTTY, raw)
 	}
+	return RequestTTYUnset, fmt.Errorf("%w: %q", ErrInvalidRequestTTY, raw)
 }
 
-// IsValid 报告 m 是否为已显式设置的合法 RequestTTYMode。
+// IsValid / IsZero / String / TextAppender / TextMarshaler / TextUnmarshaler 实现 RequestTTYMode 值语义。
 func (m RequestTTYMode) IsValid() bool { return m >= RequestTTYAuto && m <= RequestTTYForce }
-
-// IsZero 报告 m 是否处于未设置零值态。
-func (m RequestTTYMode) IsZero() bool { return m == RequestTTYUnset }
-
-// String 返回规范小写名称；未设置返回 "unset"。
+func (m RequestTTYMode) IsZero() bool  { return m == RequestTTYUnset }
 func (m RequestTTYMode) String() string {
-	switch m {
-	case RequestTTYAuto:
-		return "auto"
-	case RequestTTYYes:
-		return "yes"
-	case RequestTTYNo:
-		return "no"
-	case RequestTTYForce:
-		return "force"
-	default:
-		return "unset"
+	names := [...]string{"unset", "auto", "yes", "no", "force"}
+	if int(m) < len(names) {
+		return names[m]
 	}
+	return "unset"
 }
-
-// AppendText 实现 encoding.TextAppender（值接收者）；对未设置/非法值失败关闭。
 func (m RequestTTYMode) AppendText(b []byte) ([]byte, error) {
 	if !m.IsValid() {
 		return nil, fmt.Errorf("%w: %d", ErrInvalidRequestTTY, uint8(m))
 	}
 	return append(b, m.String()...), nil
 }
-
-// MarshalText 实现 encoding.TextMarshaler（值接收者）。
 func (m RequestTTYMode) MarshalText() ([]byte, error) { return m.AppendText(nil) }
-
-// UnmarshalText 实现 encoding.TextUnmarshaler；失败时重置为 RequestTTYUnset。
 func (m *RequestTTYMode) UnmarshalText(text []byte) error {
 	if m == nil {
 		return ErrInvalidRequestTTY

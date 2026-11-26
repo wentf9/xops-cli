@@ -291,10 +291,15 @@ func ReleaseHandle[K plan.HandleKind](p *Pool, handle plan.ManagedHandle[K]) err
 	}
 	idx := p.slots.byID[handle.ID()]
 	res := p.slots.evictIndexLocked(idx, ErrHandleRevoked)
+	if res != nil {
+		// 持 slots.mu 期间原子预增 tdPending，与 Pool.Close() 的 revokeAllSlots -> WaitPendingTeardowns
+		// 严格线性化，确保 ReleaseHandle 永不落入 teardownNursery 已关闭的同步 Close 回退窗口。
+		p.incTeardownPending()
+	}
 	p.slots.mu.Unlock()
 	p.sendUnpinIfBound(rec.boundHop, rec.boundEpoch, rec.id, rec.gen)
 	p.emitHandleEvent(events.PoolActionRetired, rec.kind, rec.id, rec.planDigest, rec.gen, "managed handle released")
-	p.scheduleResourceClose(res)
+	p.scheduleResourceCloseReserved(res)
 	return nil
 }
 
@@ -335,7 +340,7 @@ func (p *Pool) RevokeHandlesByPlan(planDigest plan.PlanDigest) int {
 	if p == nil || !p.initialized || !planDigest.IsValid() {
 		return 0
 	}
-	evicted := p.slots.evictMatching(ErrHandleRevoked, func(rec slotRecord) bool {
+	evicted := p.evictMatchingSlots(ErrHandleRevoked, func(rec slotRecord) bool {
 		return rec.occupied && rec.planDigest.Equal(planDigest)
 	})
 	p.finalizeRevokedSlots(evicted, events.PoolActionEvicted, "revoked by plan digest", true)
@@ -348,7 +353,7 @@ func (p *Pool) revokeSlotsForHop(pinned map[plan.HandleID]uint64, cause error) {
 		return
 	}
 	cause = pickIf[error](cause != nil, cause, ErrHandleRevoked)
-	evicted := p.slots.evictMatching(cause, func(rec slotRecord) bool {
+	evicted := p.evictMatchingSlots(cause, func(rec slotRecord) bool {
 		gen, ok := pinned[rec.id]
 		return ok && rec.occupied && rec.gen == gen
 	})
@@ -360,20 +365,23 @@ func (p *Pool) revokeAllSlots(action events.PoolEventAction, cause error) {
 	if p == nil || p.slots == nil {
 		return
 	}
-	evicted := p.slots.evictMatching(cause, func(slotRecord) bool { return true })
+	evicted := p.evictMatchingSlots(cause, func(slotRecord) bool { return true })
 	p.finalizeRevokedSlots(evicted, action, cause.Error(), false)
 }
-func (m *slotMap) evictMatching(cause error, match func(slotRecord) bool) []revokedSlot {
+func (p *Pool) evictMatchingSlots(cause error, match func(slotRecord) bool) []revokedSlot {
 	var evicted []revokedSlot
-	m.mu.Lock()
-	for id, idx := range m.byID {
-		rec := m.slots[idx]
+	p.slots.mu.Lock()
+	for id, idx := range p.slots.byID {
+		rec := p.slots.slots[idx]
 		if match(rec) {
-			res := m.evictIndexLocked(idx, cause)
+			res := p.slots.evictIndexLocked(idx, cause)
+			if res != nil {
+				p.incTeardownPending()
+			}
 			evicted = append(evicted, revokedSlot{id: id, kind: rec.kind, gen: rec.gen, pd: rec.planDigest, boundHop: rec.boundHop, boundEpoch: rec.boundEpoch, res: res})
 		}
 	}
-	m.mu.Unlock()
+	p.slots.mu.Unlock()
 	return evicted
 }
 func (p *Pool) finalizeRevokedSlots(evicted []revokedSlot, action events.PoolEventAction, detail string, sendUnpin bool) {
@@ -386,7 +394,7 @@ func (p *Pool) finalizeRevokedSlots(evicted []revokedSlot, action events.PoolEve
 			p.sendUnpinIfBound(ev.boundHop, ev.boundEpoch, ev.id, ev.gen)
 		}
 		p.emitHandleEvent(action, ev.kind, ev.id, ev.pd, ev.gen, detail)
-		p.scheduleResourceClose(ev.res)
+		p.scheduleResourceCloseReserved(ev.res)
 	}
 }
 func (p *Pool) sendUnpinIfBound(hopDig plan.HopDigest, hopEpoch uint64, id plan.HandleID, gen uint64) {
