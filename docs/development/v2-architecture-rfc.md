@@ -18,7 +18,7 @@
 | **ADR-004** | **OpenSSH 集成边界** | 保留完整核心 OpenSSH 体验（`~/.ssh/config` 实时只读虚拟节点、四层选项幺半群、`ProxyJump`/`ProxyCommand`、`ControlMaster`/`ControlPersist`），全部收拢为单一纯代数求解与统一 `NodeOrigin` 和类型。 |
 | **ADR-005** | **业务能力范围** | 保留全部现有业务能力（SSH/Mux/转发含 TUN、SCP/SFTP Shell、Batch Exec、Playbook、TUI 含监控与日志流、MCP 含 stdio/HTTP/Transfer/Tunnel/GUI、离线 Vault/Keychain/Helper），全部按新架构干净重写。 |
 | **ADR-006** | **零兼容契约与统一导入扩展口** | 全面重塑配置文件（YAML vNext）、离线 Vault 格式、判别式 Playbook YAML、强类型判别式 MCP Tool Schema 与干净 CLI 参数体系（仅标准 OpenSSH 短参数 `-p/-l/-i/-J/-L/-R/-D/-o/-O/-M/-S` 保持肌肉记忆）。**100% 零 v1 迁移代码**，但配置 Schema 显式版本化并在导入/初始化层预留统一 `FormatImporter` / `ImportBundle` 扩展入口。 |
-| **ADR-007** | **持久化、双模态本地 FS 端口、Windows 旁路锁与 `AF_UNIX` 符号隔离** | 零 CGO 纯 Go 静态单二进制：静态配置走人类可读 **YAML vNext**，Saga/传输恢复/审计走结构化 **WAL/JSONL**。本地文件端口显式拆分为两个物理隔离接口：① **`ScopedRootFS`**（基于 Go `*os.Root`，专供全部写操作、`~/.xops`、SCP 下载目标与全部 MCP/Agent 路径）；② **`OperatorReadFS`**（仅提供 `WithOperatorRead(path, symlinkPolicy, fn)` 供 CLI/Playbook 读取人工指定的跨盘符/软链只读源文件，**物理上绝不注入 `mcpruntime`**）。`core/osfs` 写锁一律加在同 `os.Root` 下的旁路锁文件 `<name>.lock`，绝不对数据文件本身加锁后 `Rename`；`core/osfs` 严禁导入 `net/*` 子包与 `os/exec`，导入 `"net"` 仅用于本地 `AF_UNIX` `SocketSlot`/`ProbeStaleUnixSocket` 并由 `archbound/osfs_net.go` 实施**四道 fail-closed 符号防线**（18 项包级白名单 + 3 含 `ctx` 受控方法与 3 包级 Unix 直接绑定 + 零同构克隆/零匿名嵌入/`vetssa` 零擦除 + 完整类型树与字面量白名单）。 |
+| **ADR-007** | **持久化、双模态本地 FS 端口、Windows 旁路锁与本地 IPC（`AF_UNIX` / Named Pipe）隔离** | 零 CGO（`CGO_ENABLED=0`）纯 Go 静态单二进制：静态配置走人类可读 **YAML vNext**，Saga/传输恢复/审计走结构化 **WAL/JSONL**；根 CLI `go.mod` 在 `CGO_ENABLED=0` 下获批引入纯 Go 系统适配依赖 `github.com/ebitengine/purego`（macOS `Security.framework`）与 `github.com/godbus/dbus/v5`（Linux Secret Service），所有句柄与符号地址驻留适配器结构体字段（0 `init()`、0 包级 `var`）。本地文件端口显式拆分为两个物理隔离接口：① **`ScopedRootFS`**（基于 Go `*os.Root`，专供全部写操作、`~/.xops`、SCP 下载目标与全部 MCP/Agent 路径）；② **`OperatorReadFS`**（仅提供 `WithOperatorRead(path, symlinkPolicy, fn)` 供 CLI/Playbook 读取人工指定的跨盘符/软链只读源文件及 `SSHFPLookupPort` 读取 `/etc/resolv.conf`，**物理上绝不注入 `mcpruntime`**）。`core/osfs` 写锁一律加在同 `os.Root` 下的旁路锁文件 `<name>.lock`，绝不对数据文件本身加锁后 `Rename`；`core/osfs` 统一独占常规文件 OS 句柄、旁路锁、ACL、`os.Root`、本地 `AF_UNIX`（`SocketSlot`/`ProbeStaleUnixSocket`/`DialUnixVerified`）及受验 Windows Named Pipe 客户端拨号 **`DialWindowsNamedPipeVerified(ctx, pipePath) (net.Conn, error)`**（`OPEN_EXISTING`、`FILE_FLAG_OVERLAPPED \| SECURITY_SQOS_PRESENT \| SECURITY_IDENTIFICATION`、`FILE_TYPE_PIPE`、`GetSecurityInfo(SE_KERNEL_OBJECT, OWNER\|DACL)` + `WindowsACLPipeServerSafe` 阻断非受信任主体 `FILE_CREATE_PIPE_INSTANCE=0x04 \| WRITE_DAC \| WRITE_OWNER \| GENERIC_ALL \| GENERIC_WRITE` 同时放行 `LocalSystem` `openssh-ssh-agent` 的合法双工 `FILE_WRITE_DATA`，对 `archbound/osfs_net.go` 与 `core/ports` 零改动）；`core/osfs` 严禁导入 `net/*` 子包与 `os/exec`，导入 `"net"` 由 `archbound/osfs_net.go` 实施**四道 fail-closed 符号防线**（18 项包级白名单 + 3 含 `ctx` 受控方法与 3 包级 Unix 直接绑定 + 零同构克隆/零匿名嵌入/`vetssa` 零擦除 + 完整类型树与字面量白名单）。 |
 | **ADR-008** | **包级能力门控、`O(1)` 崩溃对账与 `Halted` 熔断** | **`Authorized[C]` 直接定义于 `core/internal/gate`**（内置正向门控 `valid bool` + `revoked *atomic.Bool`，由 Go 包可见性 100% 物理锁死全仓仅 `gate` 可构造；`core/domain/security` 保持纯数学的 `Capability` 幻影类型、格与 `ApprovalEnvelope`），统一经包级泛型函数 **`gate.WithAuthorized[C](ctx, g, req, run)`** 签发。审计采用 **`~/.xops/run/<ProcessInstanceID>.lock` 进程生命周期内核锁**（记录本进程活跃未闭合 `OperationID`）：干净启动 **O(1) 零扫描 `audit.jsonl`**；发现残留锁先独占 `TryLock` 确认进程死亡并防多进程重复补写，短跨进程追加锁补写 `AbortedByCrash` 后原子删锁。`StrictAgentProfile` 遇 `AuditPostWriteError` 立即触发 **`Halted` 熔断**，经 `OnHaltFunc` 出站回调通知池吊销全部活跃 `ManagedHandle` 并拒绝一切新请求。 |
 | **ADR-009** | **六边形解耦连接池与双通道 Actor 硬规约** | `core/internal/pool` **严禁导入 `core/internal/sshnet`**，仅依赖 `core/ports`（生产由 `core/engine` 注入 `sshnet`；`core/engine` 生产源码严禁导入 `core/ports/tck` 与 `core/internal/sim`，仿真装配走 `core/engine/*_test.go`）。底层调度 **`actor.DualActor`**（位于 `core/internal/foundation/actor`，含 0 条裸 `go`、纯内存非 I/O stdlib）配合连接池双模式零裸指针所有权（Scoped `WithLease`/`WithMultiLease` + Generational SlotMap `ManagedHandle`）遵循 6 条并发铁律：① 双通道（有界 `acquireCh` + 永不阻塞 `controlCh`，配对称入站发送者屏障与 panic LIFO `defer` 零分配 `ringQueue.reset()`）；② `actor.DualActor` 主循环采用**两段式 `select`**（先非阻塞排空 `controlCh` 再阻塞监听双通道，`acquireCh` 支路排空 `controlCh` 后必须复核停机状态转 `drainAndStopWithPending(req)`，全停机路径确定性 `stopCh` 优先于 `ctx.Done()`）；③ Actor 主循环 100% 纯内存非阻塞（零 `osfs` 锁/Audit/网络 I/O）；④ 控制面与数据面彻底分离（PTY/转发/10GiB 直走原子 `Epoch`+`ctx` 并发传输）；⑤ **严格嵌套序：`gate.WithAuthorized` 恒包在 `pool.WithLease` 外层**，且所有 `controlCh` 发送必须监听 `actorDone` 防关闭挂起；⑥ `trace.LeaseScope` 为**全局单层不可重入连接租约作用域**，**仅限连接池在即将进入用户回调 `fn(scopedCtx, sess)` 时注入**（严禁 `gate`/`vault`/`osfs` 借用，不误伤池内多跳 DAG 拨号），`domain` 仅只读诊断标签，多租约强制走拓扑序 `WithMultiLease`。 |
 | **ADR-010** | **事件流与背压模型** | **作用域化双层事件流**：每次用例调用拥有独立隔离的 `OperationStream`（确定性 EOF、按事件类差异化 `BlockWithContext` / `CoalesceLatest` 背压、支持纯 `Fold`）；审计走同步 Fail-Closed `AuditSink`；池与诊断走有界非阻塞 `SystemBus`（`DropAndCount`）。 |
@@ -60,8 +60,8 @@ xops-cli/
 │   ├── host/                               # 【CLI 出站基础设施适配器】实现 core/ports，仅依赖 core/{domain,ports,osfs,conc}
 │   │   ├── store/                          # YAML vNext 原子 CAS 存储 + 全图校验 + WAL + FormatImporter 注册点
 │   │   ├── openssh/                        # ~/.ssh/config 只读解析器 + 虚拟节点源 + ControlPersist 规格
-│   │   ├── vault/                          # 离线 AEAD 加密库(Argon2id + XChaCha20-Poly1305/dirfd) + OS Keychain + Helper
-│   │   ├── sys/                            # PTY/ConPTY + Windows JobObject ConsoleRelay + ProcDialer + SSHFP DNS
+│   │   ├── vault/                          # 路由门面 + 5 子包隔离: {offline(Argon2id+XChaCha20-Poly1305/dirfd),wincred,keychain(purego),secretservice(godbus/dbus/v5),helper}
+│   │   ├── sys/                            # PTY/ConPTY + Windows JobObject ConsoleRelay + ProcessStdioConn + SSHAgentPort + TUNDevicePort(Linux/macOS) + TTY InteractionPort(/dev/tty) + SSHFPLookupPort(经 OperatorReadFS)
 │   │   └── audit/                          # Fail-Closed 原子 JSONL + ~/.xops/run/<ProcessInstanceID>.lock O(1) 崩溃对账
 │   └── entry/                              # 【CLI 入站驱动适配器】零业务逻辑，仅依赖 core/{domain,events,engine,conc}，严禁 import internal/host/* 与 core/osfs
 │       ├── cli/                            # 极薄 Cobra 壳（显式 BuildInfo + Flags -> Typed Request -> core/engine -> Stream Renderer）
@@ -92,7 +92,7 @@ xops-cli/
 │   │   ├── system.go                       # ProcessPort, TerminalPort, Clock, Entropy, AuditSink(+Reconciler), InteractionPort
 │   │   └── tck/                            # 测试契约夹具套件（Technology Compatibility Kit，0 生产可达）
 │   ├── events/                             # 【公开契约 3：作用域化双层事件流】Sealed Event ADT + OperationStream + SystemBus
-│   ├── osfs/                               # 【公开契约 4：句柄安全 OS 原语】唯一允许裸调 OS 文件/锁/ACL/os.Root/本地 AF_UNIX SocketSlot(四道 net 防线 + 旁路锁)
+│   ├── osfs/                               # 【公开契约 4：句柄安全 OS 原语】唯一允许裸调 OS 文件/锁/ACL/os.Root/本地 AF_UNIX SocketSlot/Windows Named Pipe 核验拨号(DialWindowsNamedPipeVerified)
 │   ├── conc/                               # 【公开契约 5：零依赖结构化并发】Nursery(双吸收态无私哨 RunWait/RunScoped/PanicError) + CtxMutex（全仓唯一裸 go 白名单，纯非 I/O stdlib）
 │   ├── engine/                             # 【公开契约 6：极简装配门面】生产仅装配 pool<-sshnet、gate.OnHaltFunc->pool、用例与 MCP（生产禁导 tck/sim；仿真装配走 core/engine/*_test.go）
 │   └── internal/                           # 【物理封锁的核心内部实现】外部宿主与 CLI 均不可见！
@@ -129,8 +129,8 @@ flowchart TD
         subgraph HostInfra["本地宿主适配器 internal/host/*"]
             H_STORE["host/store (YAML vNext + WAL + FormatImporter)"]
             H_OPENSSH["host/openssh (~/.ssh/config)"]
-            H_VAULT["host/vault (AEAD Vault/Keychain/Helper)"]
-            H_SYS["host/sys (PTY/ConPTY/Relay/DNS)"]
+            H_VAULT["host/vault ({offline,wincred,keychain,secretservice,helper})"]
+            H_SYS["host/sys (PTY/ConPTY/Relay/Agent/TUN/DNS)"]
             H_AUDIT["host/audit (JSONL + run/*.lock O(1) 崩溃对账)"]
         end
     end
@@ -141,7 +141,7 @@ flowchart TD
             C_DOM["core/domain (100% 零 sync 纯数学核)"]
             C_EVT["core/events (作用域事件流)"]
             C_PRT["core/ports + tck (ScopedRootFS/OperatorReadFS/Transport)"]
-            C_OSFS["core/osfs (os.Root + 旁路锁 + AF_UNIX SocketSlot)"]
+            C_OSFS["core/osfs (os.Root + 旁路锁 + AF_UNIX + Named Pipe)"]
             C_CONC["core/conc (Nursery + CtxMutex，唯一裸 go 白名单)"]
         end
         subgraph CoreInt["物理封锁 core/internal/*"]
@@ -197,7 +197,7 @@ flowchart TD
 | `core/ports/**`（非 `tck`） | `core/domain/**` | `core/internal/**`, `core/osfs`, `core/conc`, `x/crypto/ssh`, `pkg/sftp`, CLI 模块 |
 | `core/ports/tck`（测试夹具层） | `core/domain/**`, `core/ports`, `core/ports/tck`, `core/conc`, `go.uber.org/goleak` | `core/internal/**`, `core/osfs`, `core/engine`, CLI 模块；**严禁被任何生产源码（含 `core/engine`）导入，保证 0 生产可达** |
 | `core/events` | `core/domain/**` | `core/internal/**`, `core/ports`, `core/osfs`, `core/conc`, `os`, `net` |
-| `core/osfs` | `core/domain/{pathalg,security}`, `core/ports`（实现 `ScopedRootFS` / `OperatorReadFS`）；允许导入 `"net"` 仅用于本地 `AF_UNIX` `SocketSlot`/`ProbeStaleUnixSocket`（受下方四道 fail-closed 符号防线强制约束） | `core/internal/**`, `core/events`, `core/conc`, **`net/*` 子包**, `os/exec`（及全部非白名单 `net` 符号/类型/成员/克隆/嵌入/擦除） |
+| `core/osfs` | `core/domain/{pathalg,security}`, `core/ports`（实现 `ScopedRootFS` / `OperatorReadFS`）；允许导入 `"net"` 仅用于本地 `AF_UNIX` `SocketSlot`/`ProbeStaleUnixSocket`/`DialUnixVerified` 及受验 Windows Named Pipe 拨号 `DialWindowsNamedPipeVerified`（复用既有四道 fail-closed 符号防线，对 `archbound/osfs_net.go` 与 `core/ports` 零改动） | `core/internal/**`, `core/events`, `core/conc`, **`net/*` 子包**, `os/exec`（及全部非白名单 `net` 符号/类型/成员/克隆/嵌入/擦除） |
 | `core/conc`（公开契约 5） | 仅自身与纯内存非 I/O stdlib（含 `context`, `errors`, `fmt`, `runtime/debug`, `sync`, `sync/atomic`, `strings`, `time` 等）；全仓唯一裸 `go` 白名单 | 全部其他仓库层（含 `core/domain`、`core/internal/**`）、全部外部包（生产代码）、`os`/`os/*`/`net`/`net/*`/`syscall`/`unsafe`/`reflect`/`math/rand`/`math/rand/*`/`crypto/rand`/`path/filepath`/`io/ioutil`/`log/syslog`/`plugin`/`embed` |
 | `core/internal/foundation/actor` | `core/domain/**`, `core/internal/foundation/{actor,trace}` 与纯内存非 I/O stdlib（与 `core/conc` 零例外同等非 I/O 约束；0 裸 `go`；测试源码允许导入 `core/conc` 驱动） | `core/conc`（生产代码防环）、`core/ports`, `core/events`, `core/osfs`、全部外部包（生产代码）、`os`/`os/*`/`net`/`net/*`/`syscall`/`unsafe`/`reflect`/`math/rand`/`math/rand/*`/`crypto/rand`/`path/filepath`/`io/ioutil`/`log/syslog`/`plugin`/`embed` |
 | `core/internal/foundation/trace` | `core/domain/**`, `core/internal/foundation/trace` 与纯内存非 I/O stdlib（与 `conc`/`actor` 零例外同等非 I/O 约束；纯函数 + 显式 `io.Reader` 熵注入，`trace_test.go` 同样禁导 `crypto/rand`；全仓唯一 `context.WithValue` 白名单） | `core/conc`（生产代码）、`core/internal/foundation/actor`、`core/ports`, `core/osfs`, `core/internal/{pool,gate,usecase,sshnet,mcpruntime,sim}`、全部外部包与上述全部非纯内存 I/O stdlib；全路径封死未登记 `core/internal/foundation/*` 子包 |
@@ -206,7 +206,7 @@ flowchart TD
 | `core/internal/usecase/**` | `core/domain/**`, `core/ports`, `core/events`, `core/conc`, `core/internal/{foundation/{actor,trace},pool,gate}` | `core/internal/sshnet`, `core/internal/mcpruntime`, **`core/osfs`** |
 | `core/internal/mcpruntime` | `core/domain/**`, `core/ports`（仅限 `ScopedRootFS`，禁引 `OperatorReadFS`）、`core/events`, `core/conc`, `core/internal/{foundation/{actor,trace},gate,usecase}` | `core/internal/{pool,sshnet}`, `core/osfs`, **`ports.OperatorReadFS`** |
 | `core/engine` | `core/domain/**`, `core/ports`（不含 `tck`）、`core/events`, `core/conc`, `core/internal/**`（不含 `sim` 与未登记 `foundation/*`；唯一核心内部生产装配点，仅装配真实传输 `sshnet`；**仿真装配直接走 `core/engine/*_test.go`**） | **`core/ports/tck`、`core/internal/sim`（生产源码双禁，确保全仓 0 生产二进制可达 `tck` 与 `sim`）**、CLI 模块 |
-| `internal/host/**`（CLI） | **`core/{domain,ports,osfs,conc}`** | `core/engine`, `core/internal/**`, `internal/entry/**` |
+| `internal/host/**`（CLI） | **`core/{domain,ports,osfs,conc}`**（根 CLI `go.mod` 在 `CGO_ENABLED=0` 下获批引入 `github.com/ebitengine/purego` 供 `vault/keychain` 与 `github.com/godbus/dbus/v5` 供 `vault/secretservice`，句柄/符号驻留结构体字段，0 `init()`、0 包级 `var`） | `core/engine`, `core/internal/**`, `internal/entry/**` |
 | `internal/entry/**`（CLI） | **`core/{domain,events,engine,conc}`** | **`internal/host/**`**, **`core/osfs`**, `core/internal/**` |
 | `cmd/xops` | 唯一外部组合根（组装 `host` + `osfs` + `conc` + `engine` + `entry`；链接期经 `-X 'main.build*'` + `//xops:buildvar` 接收只读构建元信息并封装为显式 `BuildInfo` 传入 `entry/cli`） | 严禁编写业务逻辑、协议解析或并发状态机（禁止 `//nolint:`；`//xops:buildvar` 严守 6 重门控且全包含测试零运行期篡改） |
 
@@ -224,6 +224,13 @@ flowchart TD
    - 扫描全包 `*ast.StructType`（含匿名结构体）：禁止任何嵌入字段（`len(f.Names) == 0`）类型为 `net.Dialer`/`net.ListenConfig`（值或指针），彻底封死 `&struct{ net.Dialer }{}`；
    - 接入 `vetssa.CheckNoErasure`（使用 `vetutil.ContainsExportedValueType` 匹配 `net.Dialer`/`net.ListenConfig`）：封死直接、容器、匿名结构体与导出/嵌入字段形式的 `MakeInterface`/`ChangeInterface`/`ChangeType` 及 `TypesInfo.Instances` 全部类型实参（含 `any` 约束），同时放行仅以未导出非嵌入字段持有的具名结构体（如 `LocalFS`）实现 `ports.ScopedRootFS`（配合 `core/osfs` 物理禁导 `crypto/tls`/`log/syslog`/`reflect` 与非 `x/sys/{unix,windows}` 第三方包，零绕过）。
 4. **防线 4（完整类型树 + 复合字面量字段白名单）**：复用 `vetutil.TypeContains` / `vetutil.TypeContainsLocalPred`（含 `Interface`/`Tuple`/`TypeParam`/`Union`/`Signature`）检查所有成员与表达式类型，对 `net.Dialer`（字段仅 `{Timeout, Deadline, LocalAddr, Control, ControlContext}`、方法仅 `{DialUnix}`）与 `net.ListenConfig`（字段仅 `{Control}`、方法仅 `{Listen, ListenPacket}`）的复合字面量及 `Uses` 实施严格字段白名单，禁止无键位置初始化与引入 `*net.Resolver`/`net.KeepAliveConfig`/`*net.TCPConn`/`*net.UDPConn`/`*net.IPConn`。
+
+#### `core/osfs` Windows Named Pipe 本地 IPC 核验拨号（`DialWindowsNamedPipeVerified`）
+
+- 与 Unix `DialUnixVerified` 对称，`core/osfs` 统一拥有常规文件 OS 句柄、旁路锁、ACL、`os.Root`、本地 `AF_UNIX` `SocketSlot` 及受验 Windows Named Pipe 客户端拨号 **`DialWindowsNamedPipeVerified(ctx, pipePath) (net.Conn, error)`**（直接复用既有 `net.Conn`/`net.Addr`/`net.OpError`/`net.ErrClosed` 白名单，对 `archbound/osfs_net.go` 与 `core/ports` **零改动**）：
+  - 强制使用 `OPEN_EXISTING` 与 `FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` 打开管道句柄，避免隐式创建与冒名提权；
+  - 调用 `GetFileType` 校验句柄类型为 `FILE_TYPE_PIPE`（拒绝非管道设备或常规文件）；
+  - 调用 `GetSecurityInfo(SE_KERNEL_OBJECT, OWNER|DACL)` 核验服务端所有者受信任主体与 DACL，并新增 **`WindowsACLPipeServerSafe`** 评估策略——阻断非受信任主体具备 `FILE_CREATE_PIPE_INSTANCE=0x04 | WRITE_DAC | WRITE_OWNER | GENERIC_ALL | GENERIC_WRITE`（防管道抢注与 DACL 篡改），同时合法放行 `LocalSystem` 所属 `openssh-ssh-agent` 为客户端授予的双工 `FILE_WRITE_DATA`（对同用户进程在 `OpenProcess` 可达时同步核验 `ProcessUserSID`）。
 
 ---
 
@@ -446,7 +453,7 @@ inventory:
       execution: { launch_dialect: posix, interpreter: sh, login: disabled }
 ```
 
-- **Vault vNext & WAL**：Argon2id（隔离 KDF Helper）+ XChaCha20-Poly1305 AEAD + `core/osfs` dirfd 原子落盘（旁路 `<name>.lock`）；CRC/版本化 WAL/JSONL。
+- **Vault vNext & WAL**：`internal/host/vault` 作为路由门面并将各后端物理隔离至 5 个子包 **`internal/host/vault/{offline,wincred,keychain,secretservice,helper}`**，确保 FFI/`unsafe` 后端的 `unsafe.Slice` / `uintptr->unsafe.Pointer` 永不触发 `vault/offline`（Argon2id 隔离 KDF Helper + XChaCha20-Poly1305 AEAD + `core/osfs` dirfd 旁路 `<name>.lock` 原子落盘）中的 `hasUnsafeVaultForge`；根 CLI `go.mod` 在 `CGO_ENABLED=0` 下批准引入 `github.com/ebitengine/purego`（macOS `Security.framework`）与 `github.com/godbus/dbus/v5`（Linux Secret Service），所有句柄与符号地址存储于适配器结构体字段（0 `init()`、0 包级 `var`）；CRC/版本化 WAL/JSONL。
 - **Playbook / MCP / CLI**：Playbook 步骤显式 `kind: shell|script|copy|template|ensure`；MCP 7 个强类型判别工具（`nodes`、`terminal_exec`、`terminal_session`、`file`、`transfer`、`tunnel`、`gui`）；CLI 保留 OpenSSH 标准短参数肌肉记忆（`-p/-l/-i/-J/-L/-R/-D/-o/-O/-M/-S`），统一提供 `--json`、`--policy` 与 `config import` 统一扩展入口；构建元信息由 `cmd/xops` 经 `-X 'main.buildVersion/buildCommit/buildTime'` + `//xops:buildvar` 接收（未注入时回退 `runtime/debug.ReadBuildInfo()`）并以显式 `BuildInfo` 值结构体传入 `entry/cli`。
 - **SFTP v3 纵深防护（ADR-016）**：诚实界定两阶段规范化防的是 AI Agent 困惑副手与静态软链绕过（协议无 `openat`/`O_NOFOLLOW`）；写/改路径执行非截断打开 + `SSH_FXP_FSTAT` 文件类型/`(dev,ino)` 锚定比对 + 同目录随机临时文件原子 `posix-rename@openssh.com`。
 
@@ -461,32 +468,38 @@ inventory:
 | 分析器 | 生产源码 (`!_test.go && !tck`) | 非 `domain` 测试与 `core/ports/tck` | `core/domain/**` 测试源码 (`*_test.go`) |
 | :--- | :--- | :--- | :--- |
 | **`archbound`** | 100% 严格 DAG（**`core/engine` 生产禁导 `tck` 与 `sim`**）+ `core/osfs` 四道 `net` 符号防线（18 符号 + 3 含 `ctx` 方法 + 3 包级直接绑定 + 零同构克隆/零匿名嵌入/`vetssa` 零擦除）+ `core/conc`/`foundation/{actor,trace}` 零例外纯内存非 I/O stdlib（禁 `crypto/rand`/`filepath`/`ioutil`/`syslog`/`plugin`/`embed`，封死 `FoundationOther`）+ `mcpruntime` 禁 `OperatorReadFS` + `domain` 纯白名单 | 严格 DAG + 放行 `testing*`、被测主包、`core/conc`、`go.uber.org/goleak`（`trace_test.go` 同样禁导 `crypto/rand`）；`core/` 非 `domain`/`conc`/`other` 层测试放行 `core/internal/sim`；适配器层测试放行 `core/ports/tck` | 严格 29 纯 stdlib + `x/text/unicode/norm`（及 `option`/`secret` 专属项）+ `testing*` + 被测主包（**物理禁止 `os`/`net`/`os/exec`/`sync`/`sync/atomic`/`reflect`/`time.Now`/`core/conc`/`sim`/`goleak`**） |
-| **`osboundary`（OS/env/exec & Unix Listen）** | **100% 强制**（含 `syscall.CreateProcess`/`unix.Exec`、`x/sys/{unix,windows}` 进程与环境变量原语；文件/锁/ACL/`os.Root`/`SocketSlot` 与 SSA Unix Listen 仅 `core/osfs`，SSA Unix Listen 覆盖 `$thunk`/`$bound`/`Phi`/窄接口；env/exec 仅 `internal/host/sys`；`pkg.init` 按 `ResolvePos` 指令位置判测试） | 豁免（`tck` 已被 `archbound` 锁死 0 生产可达，测试与 `tck` 合法读 `XOPS_DST_SEEDS`、执行 `ssh -G`、构造 `t.TempDir()` 与本地 Unix 夹具） | 由 `archbound` 物理禁止导入 `os`/`os/exec`/`syscall`/`net` |
+| **`osboundary`（OS/env/exec & Unix Listen）** | **100% 强制**（含 `syscall.CreateProcess`/`unix.Exec`、`x/sys/{unix,windows}` 进程与环境变量原语；文件/锁/ACL/`os.Root`/`SocketSlot`/`DialWindowsNamedPipeVerified` 与 SSA Unix Listen 仅 `core/osfs`，SSA Unix Listen 覆盖 `$thunk`/`$bound`/`Phi`/窄接口；`windows.CreateFile`、`windows.GetSecurityInfo`、`os.NewFile`、`unix.Fstat` 在 `core/osfs` 外 **100% 封禁、零动态路径校验器豁免**；env/exec 仅 `internal/host/sys`；`LayerHostSys`（`internal/host/sys/**` 非外置测试生产文件）仅放行直接调用 `golang.org/x/sys/unix.Open` 且 arg 0 为精确编译期字面量 `"/dev/net/tun"`（Linux TUN/TAP，由 `TUNSETIFF` 校验）或 `"/dev/tty"`（Unix 管道 stdin 下 `InteractionPort` 控制终端，由 `term.IsTerminal`/`IoctlGetTermios` 校验）、置位 `O_CLOEXEC` 且不含 `O_CREAT`；`SSHFPLookupPort` 经注入 `ports.OperatorReadFS`（`SymlinkFollow`）读 `/etc/resolv.conf`（0 豁免）；`TUNDevicePort` 支持 Linux `/dev/net/tun`、macOS `AF_SYSTEM` `utun`，Windows/FreeBSD 返回 `ports.ErrUnsupported` 并保留未导出 `driverOpener` 测试接缝供 `tck.RunTUNDeviceSuite` + 原生内核冒烟测试；`pkg.init` 按 `ResolvePos` 指令位置判测试） | 豁免（`tck` 已被 `archbound` 锁死 0 生产可达，测试与 `tck` 合法读 `XOPS_DST_SEEDS`、执行 `ssh -G`、构造 `t.TempDir()` 与本地 Unix 夹具） | 由 `archbound` 物理禁止导入 `os`/`os/exec`/`syscall`/`net` |
 | **`osboundary`（`RemotePath`）** | 100% 强制：SSA `RemotePath` 保持 field-sensitive（含嵌套结构体路径与闭包双向投影，不染值构造器非远端字段），全槽位禁调 `path/filepath.*` | 100% 强制 | 100% 强制 |
 | **`noimplicit`** | 100% 强制（禁 `init()`/可变包级 `var` 含 `new(expr)` 与 Map Key/保护全包级 `error` 哨兵/禁泛型与匿名接口断言/持久化 DTO 禁裸 `time.Duration` 且顶层嵌套一致、`TypeArgs()` 优先、JSON 与 YAML 语义分流；`//xops:buildvar` 仅限精确 `cmd/xops` `package main` 非测试未导出单内置 `string`；`context.WithValue` 与 `Value(any) any` 擦除/调用含 `ChangeType`/`IsInvoke` 仅限 `trace`，保留嵌入 `context.Context` 声明豁免；`//nolint:` 仅限 8 个特权包生产源码） | 100% 强制（禁止声明 `//xops:buildvar`；`cmd/xops/*_test.go` 禁止篡改 `buildvar`；**全仓所有白盒与外置测试 100% 禁 `//nolint:`**） | 100% 强制 |
 | **`sumexhaust`** | 100% 强制（类型优先 + 前置紧邻否定极性对偶复用数字边界分词 + `CompositeLit`/`new(T)`/`error(nil)` 闭环） | 100% 强制（`inTest` 同时包含 `IsPosInTestFile` 与 **`LayerCorePortsTCK`**，允许 `default: t.Fatal`/`t.Error`） | 100% 强制 |
 | **`failclosed`** | 100% 强制（零包白名单、零弱化；禁吞噬新产生局部 `error` 返裸 `bool`，精确豁免纯 `errors.Is`/`AsType`；`zerovalue` 覆盖 `sync/atomic.Bool` 并实施前导否定前缀检查，禁止指针类型充当正向门控） | 100% 强制 | 100% 强制 |
 | **`digestcover`** | 100% 强制（编译期校验 `//xops:canonicalhash` 全字段覆盖，零 `reflect`） | 100% 强制 | 100% 强制 |
 | **`secretbox`** | 100% 强制（Rule 1 使用不入接口方法与签名的 `ContainsValueType` 永不误杀 `ports.SecretVault`；Rule 3 明文消费 5 包白名单；全 `*ast.StructType` 零匿名嵌入；`vetssa.CheckNoErasure` 零接口与含 `any` 泛型擦除） | 100% 强制（外置 `*_test` 剥夺白名单；经 `AllowMakeInterface` **联合精确豁免** `core/domain/secret` 白盒测试按调用点 `ResolvePos` 直调 `jsonv2.{Marshal,MarshalWrite,MarshalEncode}`） | 100% 强制（含上述 `secret` 白盒唯一精确豁免） |
-| **`secrettaint`** | 100% 强制（聚焦 Rule 2 SSA：出参全面 Fail-Closed；精确符号级密码学消费表不含 `argon2`/`AEAD.Open`/整包 `ssh`，`hash.Hash.Write` 验标准库 SSA 源头，`AEAD.Seal` 不染 `dst`；未知回调全路径 Fail-Closed 且 `//xops:secretuse` 仅放行直接 `*ssa.Parameter` 并审计赋值站点；放行嵌套同步 `box.Use`/`runtime/secret.Do`；严隔 `CallerParam` 并反溯写后子切片根分配） | 100% 强制（外置 `*_test` 剥夺明文白名单） | 100% 强制 |
+| **`secrettaint`** | 100% 强制（聚焦 Rule 2 SSA：出参全面 Fail-Closed；全局 `sinks.go` 精确符号级纯 AEAD 密码学消费表不含 `argon2`/`AEAD.Open`/整包 `ssh`，`hash.Hash.Write` 验标准库 SSA 源头，`AEAD.Seal` 不染 `dst`；未知回调全路径 Fail-Closed 且 `//xops:secretuse` 仅放行直接 `*ssa.Parameter` 并审计赋值站点；放行嵌套同步 `box.Use`/`runtime/secret.Do`；严隔 `CallerParam` 并反溯写后子切片根分配；`sinks_narrow.go` 仅对非外置测试生产文件按精确子包门控落地 Phase 4 窄钩子，见 §5.5） | 100% 强制（外置 `*_test` 剥夺明文白名单） | 100% 强制 |
 | **`linearlease`** | 100% 强制（裸 `go` 仅限唯一白名单 **`core/conc`**；彻底废除 `With*`/`Use` 命名猜测，仅认显式 Fact + `(*secret.SecretBox).Use` + `runtime/secret.Do` + IIFE + 白名单同步 `iter.Seq`；全量 SSA 零逃逸含 `new`/`append`/`comma-ok`/`<-ch`/`Defer`/`Go`/Loop `Phi`/写后子切片反溯/`CallerParam`） | 100% 强制（全仓测试经 `core/conc` 派生协程，仅 `core/conc` 内部白盒测试允许裸 `go`） | 100% 强制（且 `domain` 禁导 `core/conc`） |
 
 4. **特权白名单总表（明确区分「能力白名单」「生产源码」与「白盒/外置测试」）**：
 
 | 特权能力 | 唯一合法白名单包（外置 `*_test` 一律剥夺特权） | 生产源码允许 `//nolint:` | 包内白盒 `*_test.go` 允许 `//nolint:` |
 | :--- | :--- | :---: | :---: |
-| 裸 OS 文件 / 锁 / ACL / `os.Root` / 本地 `AF_UNIX` `SocketSlot` | `core/osfs` | 是 | **否** |
+| 裸 OS 文件 / 锁 / ACL / `os.Root` / 本地 `AF_UNIX` `SocketSlot` / 受验 Windows Named Pipe 拨号 (`DialWindowsNamedPipeVerified`) | `core/osfs` | 是 | **否** |
 | 裸 `go` 语句 | `core/conc`（仅含 `Nursery` + `CtxMutex`，全仓唯一） | 是 | **否** |
 | `context.WithValue` / `ctx.Value` | `core/internal/foundation/trace` | 是 | **否** |
-| `os.Getenv` / `exec.Command` / PTY / Console Relay | `internal/host/sys` | 是 | **否** |
-| 明文机密 `[]byte` 消费（生产路径，4 包） | `core/domain/secret`、`internal/host/vault`、`core/internal/sshnet/dial`、`core/internal/sshnet/priv` | 是 | **否** |
+| `os.Getenv` / `exec.Command` / PTY / Console Relay / 窄常量 `unix.Open`（`"/dev/net/tun"`、`"/dev/tty"`） | `internal/host/sys` | 是 | **否** |
+| 明文机密 `[]byte` 消费（生产路径，4 包） | `core/domain/secret`、`internal/host/vault`（含隔离后端子包 `{offline,wincred,keychain,secretservice,helper}`）、`core/internal/sshnet/dial`、`core/internal/sshnet/priv` | 是 | **否** |
 | 明文机密 `[]byte` 消费（仿真 Vault，第 5 包） | `core/internal/sim`（AES-GCM 密文仿真，0 生产可达，仍严格过规则 1/2） | **否** | **否** |
 | 链接期只读构建元信息（`//xops:buildvar`） | `cmd/xops`（精确路径 + `package main` + 非测试 + 未导出单内置 `string`） | **否** | **否** |
 
 > **铁律**：全仓允许行内 `//nolint:` 的仅限上述 **8 个特权包的生产源码文件**（`core/osfs`、`core/conc`、`core/internal/foundation/trace`、`internal/host/sys`、`internal/host/vault`、`core/internal/sshnet/dial`、`core/internal/sshnet/priv`、`core/domain/secret`）；其余全部包及**全仓所有测试文件（含 8 特权包白盒 `*_test.go`、`cmd/xops`、`core/internal/sim`、`core/internal/foundation/actor`、`tools/xopsvet` 及所有外置 `*_test`）100% 禁止行内 `//nolint:`**。
 
-5. **`P4-T1` / `P4-T4` 外部协议结构化受限窄模式钩子契约（A8，0 `//nolint:`）**：
-   - `P4-T1`（`core/internal/sshnet/dial`）对接 `golang.org/x/crypto/ssh.KeyboardInteractiveChallenge`（回调内同步 `box.Use` 写入局部 `answers []string` 返回槽位模式，由外层 challenge 闭包返回前审计防泄漏）与 `P4-T4`（`internal/host/vault`）对接 Windows Credential Manager `CREDENTIALW`（单函数零逃逸局部结构体指针 + `LazyProc.Call`），禁止引入行内 `//nolint:` 或放宽全局规则，统一经 `tools/xopsvet/analyzers/secrettaint/sinks_narrow.go` 的按包层受控结构化窄模式钩子完成适配，并在消费完成后立即零化中间缓冲。其中 `P4-T1` 与 Windows `CREDENTIALW` 窄钩子已在 Phase 0 落地并经对抗测试验证；OS Keychain（macOS Security Framework / Linux Secret Service）与 ExternalHelper 子进程管道的窄模式钩子待 Phase 4 `P4-T4` 引入实际依赖时同步实现并纳入 `sinks_narrow.go` 审计。
+5. **`P4-T1` / `P4-T4` 外部协议结构化受限窄模式钩子与 `vault` 子包隔离契约（A8，0 `//nolint:`）**：
+   - 禁止引入行内 `//nolint:` 或放宽全局规则（全局 `sinks.go` 始终保持纯 AEAD），所有外部协议窄写入统一经 `tools/xopsvet/analyzers/secrettaint/sinks_narrow.go` 的按包/子包精确门控受限钩子完成（仅放行非外置测试生产文件，并在消费完成后立即零化中间缓冲）：
+     - **`P4-T1`（`core/internal/sshnet/dial` 与 `core/internal/sshnet/priv`）**：`sshnet/dial` 适配 `golang.org/x/crypto/ssh.KeyboardInteractiveChallenge`（唯一流向 `ssh.KeyboardInteractive` 的挑战闭包内经同步 `box.Use` 写入局部 `answers []string` 并在槽 0 返回，强制槽 1 `error` 零染毒与闭包全量复审）；`sshnet/priv` 仅按正向来源白名单放行向已验证的 SSH 通道/`StdinPipe` 写入提权明文。
+     - **`P4-T4`（`internal/host/vault/{offline,wincred,keychain,secretservice,helper}` 子包隔离 + 4 项精确子包窄钩子）**：为避免 FFI/`unsafe` 后端的 `unsafe.Slice` / `uintptr->unsafe.Pointer` 触发 `vault/offline`（Argon2id + XChaCha20-Poly1305 AEAD dirfd）中的 `hasUnsafeVaultForge`，OS 与外部后端按子包物理隔离；根 CLI `go.mod` 在 `CGO_ENABLED=0` 下批准引入 `github.com/ebitengine/purego`（macOS `Security.framework`）与 `github.com/godbus/dbus/v5`（Linux Secret Service），所有句柄与符号地址存储于适配器结构体字段（0 `init()`、0 包级 `var`）。`sinks_narrow.go` 定稿 4 项子包级窄钩子：
+       1. `internal/host/vault/wincred`（兼容 `internal/host/vault` Phase 0 回归夹具）：`CREDENTIALW` 作用域自有结构体字段存储 + `LazyProc.Call`；
+       2. `internal/host/vault/keychain`：`purego.SyscallN`（强制 arg 0 `fn uintptr` 未染毒）；
+       3. `internal/host/vault/secretservice`：DH AES-128-CBC（`crypto/cipher.NewCBCEncrypter` + `(cipher.BlockMode).CryptBlocks` 严格限定于 `sinks_narrow.go` 的 `vault/secretservice` 子包，保持全局 `sinks.go` 纯 AEAD）与 `plain` 会话回退（`dbusSecret.Value` 作用域自有字段存储 + `(dbus.BusObject|*dbus.Object).{CallWithContext,Call}` 仅限精确常量方法 `"org.freedesktop.Secret.Collection.CreateItem"` / `"org.freedesktop.Secret.Item.SetSecret"` 且接收者/`ctx`/`flags`/`method` 未染毒）；
+       4. `internal/host/vault/helper`：`(ports.ProcessPort).Run(ctx, spec, stdin)`（接收者、`ctx`、`spec` 均未染毒，仅允许 arg 2 `stdin io.Reader` 携带污点）。
 6. **契约、早验与确定性测试**：`core/ports/tck`（含 `ScopedRootFS`/`OperatorReadFS`）、代数律/Fuzz、10,000 种子 DST（覆盖 `O(1)` 崩溃对账、`Halted` 熔断、两段式 `actor.DualActor` 满邮箱压测、重入拒绝、5 大全局不变量）、`ssh -G` 差分（保证单份配置文件 `ssh -F <cfg> -G` 语义等价，并显式界定两项跨层安全精化：`IdentityFile=none` 对低层吸收，以及 4 层 `SendEnv` 坚持高层覆盖低层而非 OpenSSH `-o` 先于配置文件的解析序），以及 **`Phase 2.5 Walking Skeleton`** 起即跑通三平台原生 CI。
 
 ---
