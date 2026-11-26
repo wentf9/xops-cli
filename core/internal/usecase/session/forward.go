@@ -110,9 +110,9 @@ func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn 
 	if err != nil {
 		return nil, err
 	}
-	if fh == nil || !fh.IsValid() || fh.BoundAddr() == "" {
+	if leaseCtx.Err() != nil || fh == nil || !fh.IsValid() || fh.BoundAddr() == "" {
 		_ = closeClosers(fh)
-		return nil, fmt.Errorf("%w: ForwarderPort 返回无效 ForwardHandle", ErrInvalidRequest)
+		return nil, firstNonNilErr(leaseCtx.Err(), fmt.Errorf("%w: ForwarderPort 返回无效 ForwardHandle", ErrInvalidRequest))
 	}
 	mf := &managedForward{valid: true, spec: spec, boundAddr: fh.BoundAddr(), handle: fh, conn: conn, doneCh: make(chan struct{})}
 	return finishManagedForward(revokeCtx, mf, func(wCtx context.Context) error {

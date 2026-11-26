@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"net"
 	"runtime"
 	"strings"
@@ -552,17 +553,20 @@ func triggerMuxAdversary(t *testing.T, rig *fullSessionRig, pl plan.SealedConnec
 	}
 }
 
-// blockingProxyConn 用于对抗验证 RunMuxProxy 远端先达 EOF 与阻塞写/取消路径（0 死锁、0 goleak）。
+// blockingProxyConn 用于对抗验证 RunMuxProxy 远端先达 EOF、stdin 故障与阻塞写/取消路径（0 死锁、0 goleak）。
 type blockingProxyConn struct {
 	eofImmediately bool
+	readEntered    chan struct{}
+	readOnce       sync.Once
 	closed         chan struct{}
 	closeOnce      sync.Once
 }
 
 func newBlockingProxyConn(eofImmediately bool) *blockingProxyConn {
-	return &blockingProxyConn{eofImmediately: eofImmediately, closed: make(chan struct{})}
+	return &blockingProxyConn{eofImmediately: eofImmediately, readEntered: make(chan struct{}), closed: make(chan struct{})}
 }
 func (c *blockingProxyConn) Read([]byte) (int, error) {
+	c.readOnce.Do(func() { close(c.readEntered) })
 	if c.eofImmediately {
 		return 0, io.EOF
 	}
@@ -582,6 +586,29 @@ func (c *blockingProxyConn) RemoteAddr() net.Addr             { return &net.Unix
 func (c *blockingProxyConn) SetDeadline(time.Time) error      { return nil }
 func (c *blockingProxyConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *blockingProxyConn) SetWriteDeadline(time.Time) error { return nil }
+
+// fsErrClosedStdin 模拟真实 *os.File stdin：关闭后 Read 返回包装 fs.ErrClosed 的 *fs.PathError；
+// 若指定 failErr 则立即返回真实非关闭 I/O 故障。
+type fsErrClosedStdin struct {
+	failErr   error
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newFSErrClosedStdin(failErr error) *fsErrClosedStdin {
+	return &fsErrClosedStdin{failErr: failErr, closed: make(chan struct{})}
+}
+func (s *fsErrClosedStdin) Read([]byte) (int, error) {
+	if s.failErr != nil {
+		return 0, s.failErr
+	}
+	<-s.closed
+	return 0, &fs.PathError{Op: "read", Path: "/dev/stdin", Err: fs.ErrClosed}
+}
+func (s *fsErrClosedStdin) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
 
 type customProxyMuxSocket struct {
 	*spoofDialMuxSocket
@@ -625,25 +652,67 @@ func assertRunMuxProxyBlockingStdinAndCancel(t *testing.T, pl plan.SealedConnect
 		t.Fatalf("RunMuxProxy(remote EOF + blocking stdin): %v", err)
 	}
 
-	// (b) 阻塞 stdin + 背压阻塞 conn + ctx 取消：必须即时解除阻塞并同步回收 AfterFunc。
+	// (b) 阻塞 stdin + 背压阻塞 conn + 进中继后取消 ctx：必须即时解除阻塞、同步回收 AfterFunc 且绝不静默返回 nil。
+	blkConn := newBlockingProxyConn(false)
 	cancelRig := newFullSessionRig(t, fullRigOptions{
 		customMux: &customProxyMuxSocket{
 			spoofDialMuxSocket: &spoofDialMuxSocket{inner: sim.NewSimMuxSocket(nil)},
-			openProxy:          func() net.Conn { return newBlockingProxyConn(false) },
+			openProxy:          func() net.Conn { return blkConn },
 		},
 	})
 	defer cancelRig.close()
 	inR2, inW2 := io.Pipe()
 	defer func() { _ = inW2.Close() }()
 	ctx, cancel := context.WithCancel(context.Background())
+	var cancelRunErr error
 	if err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
-		if gErr := n.Go(func(context.Context) error { cancel(); return nil }); gErr != nil {
+		if gErr := n.Go(func(context.Context) error { <-blkConn.readEntered; cancel(); return nil }); gErr != nil {
 			return gErr
 		}
-		_ = cancelRig.svc.RunMuxProxy(ctx, ucsess.MuxRequest{Plan: pl}, inR2, &out)
+		cancelRunErr = cancelRig.svc.RunMuxProxy(ctx, ucsess.MuxRequest{Plan: pl}, inR2, &out)
 		return nil
 	}); err != nil {
 		t.Fatalf("RunWait(cancel RunMuxProxy): %v", err)
+	}
+	if !errors.Is(cancelRunErr, context.Canceled) {
+		t.Fatalf("RunMuxProxy 在 ctx 取消时必须返回 context.Canceled（绝不伪造成功），实际=%v", cancelRunErr)
+	}
+
+	assertRunMuxProxyStdinFaultAndFSErrClosed(t, pl)
+}
+
+func assertRunMuxProxyStdinFaultAndFSErrClosed(t *testing.T, pl plan.SealedConnectionPlan) {
+	t.Helper()
+	var out bytes.Buffer
+	// (c) stdin.Read 返回真实非关闭故障时，必须主动 abort 关闭空闲 conn 解除阻塞并原样返回错误（0 挂死）。
+	stdinIOErr := errors.New("injected stdin EIO")
+	faultRig := newFullSessionRig(t, fullRigOptions{
+		customMux: &customProxyMuxSocket{
+			spoofDialMuxSocket: &spoofDialMuxSocket{inner: sim.NewSimMuxSocket(nil)},
+			openProxy:          func() net.Conn { return newBlockingProxyConn(false) },
+		},
+	})
+	defer faultRig.close()
+	if err := faultRig.svc.RunMuxProxy(context.Background(), ucsess.MuxRequest{Plan: pl}, newFSErrClosedStdin(stdinIOErr), &out); !errors.Is(err, stdinIOErr) {
+		t.Fatalf("RunMuxProxy(stdin EIO) 期望原样返回 stdinIOErr，实际=%v", err)
+	}
+
+	// (d) 模拟真实 *os.File stdin（返回 *fs.PathError{Err: fs.ErrClosed}）：
+	//     远端先达 EOF 触发 abort 关闭 stdin 时必须干净返回 nil；而调用方传入已关闭坏 stdin 必须报错。
+	osEOFRig := newFullSessionRig(t, fullRigOptions{
+		customMux: &customProxyMuxSocket{
+			spoofDialMuxSocket: &spoofDialMuxSocket{inner: sim.NewSimMuxSocket(nil)},
+			openProxy:          func() net.Conn { return newBlockingProxyConn(true) },
+		},
+	})
+	defer osEOFRig.close()
+	if err := osEOFRig.svc.RunMuxProxy(context.Background(), ucsess.MuxRequest{Plan: pl}, newFSErrClosedStdin(nil), &out); err != nil {
+		t.Fatalf("RunMuxProxy(远端先 EOF + 真实 *os.File fs.ErrClosed) 期望 nil，实际=%v", err)
+	}
+	preClosedStdin := newFSErrClosedStdin(nil)
+	_ = preClosedStdin.Close()
+	if err := faultRig.svc.RunMuxProxy(context.Background(), ucsess.MuxRequest{Plan: pl}, preClosedStdin, &out); !errors.Is(err, fs.ErrClosed) {
+		t.Fatalf("RunMuxProxy(预关闭 *os.File stdin) 不得吞噬 fs.ErrClosed，实际=%v", err)
 	}
 }
 
@@ -668,15 +737,20 @@ func assertExpandControlPathJumpAndTildeFailClosed(t *testing.T) {
 		assertTeardownClean(t, rig, "non-jump-stop")
 	}
 
-	// 缺失 HomeDir 时前导 ~/ 模板与字面量均必须失败关闭（绝不落为相对路径 ./~/...）。
+	// 缺失 HomeDir 或 HomeDir 为非绝对路径（如 "~"）时，前导 ~/ 模板与字面量均必须失败关闭。
 	noEnvRig := newFullSessionRig(t, fullRigOptions{disableEnv: true})
 	defer noEnvRig.close()
+	badHomeID, _ := ports.NewLocalIdentityInfo(ports.LocalIdentityInfoSpec{LocalHost: "workstation", LocalUser: "alice", LocalUID: "1001", HomeDir: "~"})
+	badHomeRig := newFullSessionRig(t, fullRigOptions{customEnv: sim.NewSimEnvPort(nil, badHomeID)})
+	defer badHomeRig.close()
 	tildeTpl, _ := option.ParseControlPath("~/.xops/mux-%h.sock")
 	tildeLit, _ := option.NewLiteralControlPath("~/.xops/literal.sock")
-	for _, cpT := range []option.ControlPathSpec{tildeTpl, tildeLit} {
-		plT := mustPlanWithControl(t, option.UnsetControlPolicy().WithMaster(option.ControlMasterYes).WithPath(cpT), false)
-		if _, err := noEnvRig.svc.StartControlMaster(context.Background(), ucsess.ControlMasterRequest{Plan: plT}); !errors.Is(err, ucsess.ErrInvalidRequest) {
-			t.Fatalf("缺失 HomeDir 的前导 ~ 路径(%s)期望 ErrInvalidRequest，实际=%v", cpT, err)
+	for _, r := range []*fullSessionRig{noEnvRig, badHomeRig} {
+		for _, cpT := range []option.ControlPathSpec{tildeTpl, tildeLit} {
+			plT := mustPlanWithControl(t, option.UnsetControlPolicy().WithMaster(option.ControlMasterYes).WithPath(cpT), false)
+			if _, err := r.svc.StartControlMaster(context.Background(), ucsess.ControlMasterRequest{Plan: plT}); !errors.Is(err, ucsess.ErrInvalidRequest) {
+				t.Fatalf("非绝对/缺失 HomeDir 的前导 ~ 路径(%s)期望 ErrInvalidRequest，实际=%v", cpT, err)
+			}
 		}
 	}
 }

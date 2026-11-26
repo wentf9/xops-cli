@@ -132,9 +132,7 @@ func startManagedPTY(leaseCtx, revokeCtx context.Context, conn ports.TransportCo
 		stopStartAbort := registerSyncAbort(leaseCtx, func() { _ = sess.Close() })
 		err = sess.StartShell(revokeCtx, ports.ExecStreams{PTY: algebraic.Some(ptyReq), Env: sendEnv})
 		stopStartAbort()
-		if err == nil {
-			err = leaseCtx.Err()
-		}
+		err = firstNonNilErr(err, leaseCtx.Err())
 	}
 	var n *conc.Nursery
 	if err == nil {
@@ -144,10 +142,7 @@ func startManagedPTY(leaseCtx, revokeCtx context.Context, conn ports.TransportCo
 		_ = sess.Close()
 		return nil, err
 	}
-	mp := &managedPTY{
-		valid: true, revokeCtx: revokeCtx, conn: conn, sess: sess, inPipe: inPipe, nursery: n, writeMu: conc.NewCtxMutex(),
-		term: ptyReq.Term(), size: ptyReq.Size(), maxBuf: maxBuf, activePipes: 2, readNotify: make(chan struct{}),
-	}
+	mp := &managedPTY{valid: true, revokeCtx: revokeCtx, conn: conn, sess: sess, inPipe: inPipe, nursery: n, writeMu: conc.NewCtxMutex(), term: ptyReq.Term(), size: ptyReq.Size(), maxBuf: maxBuf, activePipes: 2, readNotify: make(chan struct{})}
 	for _, fn := range []func(context.Context) error{
 		func(context.Context) error { mp.pumpReader(outPipe); return nil },
 		func(context.Context) error { mp.pumpReader(errPipe); return nil },
@@ -341,15 +336,6 @@ func (s *Service) prepareOpenPTY(ctx context.Context, req OpenPTYRequest) (plan.
 	return targetHop, nodeID, ptyReq, req.MaxBufferBytes, err
 }
 
-//xops:syncclosure
-//xops:borrowed
-func (s *Service) withPTY(ctx context.Context, handle plan.ManagedHandle[plan.KindPTY], fn func(ctx context.Context, pty ptyResource) error) error {
-	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
-		return err
-	}
-	return pool.WithManagedHandle[plan.KindPTY, ptyResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, pty ptyResource) error { return fn(hCtx, pty) })
-}
-
 // ReadPTY 从指定世代 PTY 句柄读取远端缓冲输出（支持非阻塞轮询与事件驱动阻塞等待，吊销立即唤醒）。
 func (s *Service) ReadPTY(ctx context.Context, req PTYReadRequest) (PTYReadResult, error) {
 	if err := s.validateActiveHandleOp(ctx, req.Handle.IsValid()); err != nil {
@@ -362,7 +348,7 @@ func (s *Service) ReadPTY(ctx context.Context, req PTYReadRequest) (PTYReadResul
 		req.MaxBytes = defaultPTYReadBytes
 	}
 	var res PTYReadResult
-	return res, s.withPTY(ctx, req.Handle, func(hCtx context.Context, pty ptyResource) error {
+	return res, pool.WithManagedHandle[plan.KindPTY, ptyResource](ctx, s.cfg.Pool, req.Handle, func(hCtx context.Context, pty ptyResource) error {
 		var rErr error
 		res, rErr = pty.read(hCtx, req.MaxBytes, req.Wait)
 		return rErr
@@ -371,8 +357,11 @@ func (s *Service) ReadPTY(ctx context.Context, req PTYReadRequest) (PTYReadResul
 
 // WritePTY 向指定世代 PTY 句柄写入输入载荷；陈旧世代、已释放或熔断时严格失败关闭。
 func (s *Service) WritePTY(ctx context.Context, handle plan.ManagedHandle[plan.KindPTY], data []byte) (int, error) {
+	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
+		return 0, err
+	}
 	var n int
-	return n, s.withPTY(ctx, handle, func(hCtx context.Context, pty ptyResource) error {
+	return n, pool.WithManagedHandle[plan.KindPTY, ptyResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, pty ptyResource) error {
 		var err error
 		n, err = pty.write(hCtx, data)
 		return err
@@ -387,7 +376,7 @@ func (s *Service) ResizePTY(ctx context.Context, handle plan.ManagedHandle[plan.
 	if !size.IsValid() {
 		return fmt.Errorf("%w: %w", ErrInvalidRequest, ports.ErrInvalidTTYSize)
 	}
-	return s.withPTY(ctx, handle, func(hCtx context.Context, pty ptyResource) error { return pty.resize(hCtx, size) })
+	return pool.WithManagedHandle[plan.KindPTY, ptyResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, pty ptyResource) error { return pty.resize(hCtx, size) })
 }
 
 // SignalPTY 向指定世代 PTY 句柄对应的远端进程投递 POSIX 信号。
@@ -398,7 +387,7 @@ func (s *Service) SignalPTY(ctx context.Context, handle plan.ManagedHandle[plan.
 	if sig == "" {
 		return fmt.Errorf("%w: Signal 不能为空", ErrInvalidRequest)
 	}
-	return s.withPTY(ctx, handle, func(hCtx context.Context, pty ptyResource) error { return pty.signal(hCtx, sig) })
+	return pool.WithManagedHandle[plan.KindPTY, ptyResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, pty ptyResource) error { return pty.signal(hCtx, sig) })
 }
 
 // InspectPTY 返回指定世代 PTY 句柄的只读状态快照（含缓冲量、丢弃量与世代绑定信息）。

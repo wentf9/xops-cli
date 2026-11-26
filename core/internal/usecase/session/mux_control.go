@@ -2,12 +2,15 @@ package session
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -127,33 +130,50 @@ func (s *Service) WithMuxProxy(ctx context.Context, req MuxRequest, fn func(ctx 
 type muxHalfCloser interface{ CloseWrite() error }
 
 // RunMuxProxy 打开 `-O proxy` 连接并在 conc.RunScoped 监督下完成可关闭 stdin 与 stdout 的双向中继；
-// 无论远端先达 EOF、背压写阻塞还是上下文取消，均同步关闭 conn 与 stdin 并等待 AfterFunc 收敛（0 死锁、0 goleak）。
+// 在 Nursery 作用域内监听 wCtx 同步中止，确保 stdin 真实读错、远端先达 EOF、背压写阻塞或 ctx 取消
+// 均即时关闭 conn 与 stdin 并忠实传播非关闭故障与取消错误（0 死锁、0 goleak，适配真实 *os.File 的 fs.ErrClosed）。
 func (s *Service) RunMuxProxy(ctx context.Context, req MuxRequest, stdin io.ReadCloser, stdout io.Writer) error {
 	defer closeStream(req.OperationStream)
 	return s.openMuxProxyScope(ctx, req, func(pCtx context.Context, conn net.Conn) error {
+		var aborted atomic.Bool
 		var abortOnce sync.Once
-		abort := func() { abortOnce.Do(func() { _ = closeClosers(conn, stdin) }) }
+		abort := func() { abortOnce.Do(func() { aborted.Store(true); _ = closeClosers(conn, stdin) }) }
 		defer abort()
-		defer registerSyncAbort(pCtx, abort)()
-		return conc.RunScoped(pCtx, func(_ context.Context, n *conc.Nursery) error {
+		runErr := conc.RunScoped(pCtx, func(wCtx context.Context, n *conc.Nursery) error {
+			defer registerSyncAbort(wCtx, abort)()
 			if stdout == nil {
-				return copyMuxStdin(conn, stdin)
+				return copyMuxStdin(conn, stdin, &aborted, nil)
 			}
 			if stdin != nil {
-				if err := n.Go(func(context.Context) error { return copyMuxStdin(conn, stdin) }); err != nil {
+				if err := n.Go(func(context.Context) error { return copyMuxStdin(conn, stdin, &aborted, abort) }); err != nil {
 					abort()
 					return err
 				}
 			}
-			err := copyPipeBestEffort(stdout, conn)
+			err := copyMuxStream(stdout, conn, &aborted)
 			abort()
 			return err
 		})
+		return firstNonNilErr(runErr, pCtx.Err())
 	})
 }
 
-func copyMuxStdin(conn net.Conn, stdin io.Reader) error {
-	err := copyPipeBestEffort(conn, stdin)
+func copyMuxStream(dst io.Writer, src io.Reader, aborted *atomic.Bool) error {
+	if src == nil {
+		return nil
+	}
+	_, err := io.Copy(dst, src)
+	if err == nil || isRemotePipeClosedErr(err) || (aborted.Load() && errors.Is(err, fs.ErrClosed)) {
+		return nil
+	}
+	return err
+}
+
+func copyMuxStdin(conn net.Conn, stdin io.Reader, aborted *atomic.Bool, abort func()) error {
+	err := copyMuxStream(conn, stdin, aborted)
+	if err != nil && abort != nil {
+		abort()
+	}
 	if hc, ok := conn.(muxHalfCloser); ok && stdin != nil {
 		_ = hc.CloseWrite()
 	}
@@ -289,7 +309,8 @@ func expandControlPath(targetHop plan.HopSpec, spec option.ControlPathSpec, env 
 		raw = expanded
 	}
 	if strings.HasPrefix(raw, "~") {
-		if (!strings.HasPrefix(raw, "~/") && !strings.HasPrefix(raw, `~\`)) || tokCtx.HomeDir == "" {
+		home, hErr := pathalg.ParseLocalSourcePath(tokCtx.HomeDir)
+		if (!strings.HasPrefix(raw, "~/") && !strings.HasPrefix(raw, `~\`)) || hErr != nil || !home.IsAbs() {
 			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 拒绝未展开的前导 ~ 控制套接字路径 %q", ErrInvalidRequest, raw)
 		}
 		raw = strings.TrimRight(tokCtx.HomeDir, `/\`) + raw[1:]

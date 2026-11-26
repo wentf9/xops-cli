@@ -61,10 +61,12 @@ type fullRigOptions struct {
 	protectedPatterns []string
 	interactive       bool
 	disableEnv        bool
+	customEnv         ports.EnvPort
 	customDialer      ports.DialerPort
 	customAuditSink   func(ports.AuditSink) ports.AuditSink
 	customInteraction ports.InteractionPort
 	customProbe       ports.ShellProbePort
+	customForwarder   ports.ForwarderPort
 	customMux         ports.MuxSocketPort
 	customTUN         ports.TUNDevicePort
 	disableTUN        bool
@@ -155,12 +157,17 @@ func buildRigServiceConfig(r *fullSessionRig, opt fullRigOptions) ucsess.Service
 	}
 	if opt.disableEnv {
 		cfg.Env = nil
+	} else if opt.customEnv != nil {
+		cfg.Env = opt.customEnv
 	}
 	if opt.customInteraction != nil {
 		cfg.Interaction = opt.customInteraction
 	}
 	if opt.customProbe != nil {
 		cfg.ShellProbe = opt.customProbe
+	}
+	if opt.customForwarder != nil {
+		cfg.Forwarder = opt.customForwarder
 	}
 	if opt.disableTUN {
 		cfg.TUNDevice = nil
@@ -423,7 +430,7 @@ func TestSessionExecPrivileged_GuardrailApprovalAndCanonicalScopeEscalated(t *te
 
 // TestSessionExecPrivileged_LatticeMonotonicityProtectedPathsAndPreStartIsolation 验证：
 // 1. LexicalScope 含 VerdictDeny / DecisionDeny 绝不被降级放行（0 拨号）；
-// 2. LexicalScope 含 RiskCritical + NeedApproval 在 DirectOperator 下保留 RiskCritical 审批下限；
+// 2. LexicalScope 含 RiskDangerous + NeedApproval 在 DirectOperator 下保留审批下限；
 // 3. /tmp/benign -> /etc/sudoers 受保护区跃迁与 /etc/a -> /root/b 跨受保护分区替换必被捕获；
 // 4. 取密（Vault 锁定 / 取消）位于 WithLease 外：0 拨号且返回 OutcomeNotStarted（非 OutcomeUnknown）。
 func TestSessionExecPrivileged_LatticeMonotonicityProtectedPathsAndPreStartIsolation(t *testing.T) {
@@ -634,5 +641,17 @@ func TestSessionProbeShell_TwoStageAndFailClosed(t *testing.T) {
 		Plan: pl, Risk: algebraic.Some(security.RiskDangerous),
 	}); err == nil || strictRig.dialer.DialCount() != 0 {
 		t.Fatalf("门控阻断下严禁拨号: err=%v dials=%d", err, strictRig.dialer.DialCount())
+	}
+
+	// 5. 提权拨号失败阶段精确归类为 StartPhaseDial（而非笼统覆盖为 StartPhaseAuthorize）。
+	dialFailRig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator})
+	defer dialFailRig.close()
+	dialFailRig.dialer.Faults().InjectOnce("dial.hop", errors.New("injected dial failure"))
+	out, err := dialFailRig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: mustPrivilegeReq(t, ports.PrivilegeMethodSudo, "id", "root", true),
+	})
+	ns, ok := out.(*execution.OutcomeNotStarted)
+	if err == nil || !ok || ns.Phase() != execution.StartPhaseDial {
+		t.Fatalf("提权拨号失败期望 OutcomeNotStarted(StartPhaseDial)，实际 out=%#v err=%v", out, err)
 	}
 }

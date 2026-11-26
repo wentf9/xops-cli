@@ -104,11 +104,7 @@ func (s *Service) Exec(ctx context.Context, req ExecRequest) (execution.Executio
 	if err := validateScriptTTY(req.Command, req.RequestTTY); err != nil {
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_script_tty", err), err
 	}
-	return s.executeSession(ctx, sessionRunSpec{
-		plan: req.Plan, command: algebraic.Some(req.Command), action: "exec", nodeID: req.NodeID, term: req.Term,
-		stdin: req.Stdin, stdout: req.Stdout, stderr: req.Stderr, requestTTY: req.RequestTTY,
-		risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream, summary: req.Command.RedactedSummary(),
-	})
+	return s.executeSession(ctx, sessionRunSpec{plan: req.Plan, command: algebraic.Some(req.Command), action: "exec", nodeID: req.NodeID, term: req.Term, stdin: req.Stdin, stdout: req.Stdout, stderr: req.Stderr, requestTTY: req.RequestTTY, risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream, summary: req.Command.RedactedSummary()})
 }
 
 // Interactive 启动远端交互式 Shell 会话（严格按 gate.WithAuthorized 包裹 pool.WithLease），
@@ -118,11 +114,7 @@ func (s *Service) Interactive(ctx context.Context, req InteractiveRequest) (exec
 	if err := s.validateBaseCall(ctx, req.Plan, req.RequestTTY, req.Risk); err != nil {
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_request", err), err
 	}
-	return s.executeSession(ctx, sessionRunSpec{
-		plan: req.Plan, command: algebraic.None[execution.CommandPlan](), action: "shell", nodeID: req.NodeID, term: req.Term,
-		stdin: req.Stdin, stdout: req.Stdout, stderr: req.Stderr, requestTTY: req.RequestTTY,
-		risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream, summary: "interactive shell",
-	})
+	return s.executeSession(ctx, sessionRunSpec{plan: req.Plan, command: algebraic.None[execution.CommandPlan](), action: "shell", nodeID: req.NodeID, term: req.Term, stdin: req.Stdin, stdout: req.Stdout, stderr: req.Stderr, requestTTY: req.RequestTTY, risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream, summary: "interactive shell"})
 }
 
 func zeroVal[T any]() (z T) { return z }
@@ -245,17 +237,15 @@ type gateReqInput struct {
 
 func buildGateReq[C security.Capability](in gateReqInput) (gate.GateRequest[C], error) {
 	binding, err := security.NewOperationBinding(security.OperationBindingSpec{
-		Capability: security.CapabilityKindOf[C](), Tool: "ssh", Action: in.action, NodeID: in.nodeID,
-		Endpoint: algebraic.Some(in.targetHop.Endpoint()), CanonicalPaths: in.paths, RecursivePaths: in.recursivePaths,
-		CommandDigest: in.cmdDigest, PlanDigest: algebraic.Some(in.plan.PlanDigest().SecurityDigest()), Parameters: in.params,
+		Capability: security.CapabilityKindOf[C](), Tool: "ssh", Action: in.action, NodeID: in.nodeID, Endpoint: algebraic.Some(in.targetHop.Endpoint()),
+		CanonicalPaths: in.paths, RecursivePaths: in.recursivePaths, CommandDigest: in.cmdDigest, PlanDigest: algebraic.Some(in.plan.PlanDigest().SecurityDigest()), Parameters: in.params,
 	})
 	if err != nil {
 		return zeroVal[gate.GateRequest[C]](), err
 	}
 	return gate.NewGateRequest[C](gate.GateRequestSpec[C]{
 		Binding: binding, Risk: in.risk, Verdict: in.verdict, DecisionFloor: in.decisionFloor, ScopeSummary: in.summary,
-		Paths: in.paths, RecursivePaths: in.recursivePaths, Canonicalize: in.canonicalize,
-		Approval: in.approval, OperationStream: in.stream,
+		Paths: in.paths, RecursivePaths: in.recursivePaths, Canonicalize: in.canonicalize, Approval: in.approval, OperationStream: in.stream,
 	})
 }
 
@@ -305,12 +295,10 @@ func registerAuthorizedHandle[C security.Capability, K plan.HandleKind, R pool.C
 	_, _, gateErr := runAuthorized[C](ctx, s, connPlan.PlanDigest(), nodeID, action, gateReq, stream, false,
 		func(authCtx context.Context, binding security.OperationBinding, _ *operationEmitter) (execution.ExecutionOutcome, error) {
 			return nil, s.cfg.Pool.WithLease(authCtx, connPlan, func(leaseCtx context.Context, lease *pool.Lease) error {
-				h, rErr := pool.RegisterLeaseHandleWith[K](s.cfg.Pool, lease, binding, func(revokeCtx context.Context, conn ports.TransportConn) (R, error) {
+				var rErr error
+				handle, rErr = pool.RegisterLeaseHandleWith[K](s.cfg.Pool, lease, binding, func(revokeCtx context.Context, conn ports.TransportConn) (R, error) {
 					return build(leaseCtx, revokeCtx, conn)
 				})
-				if rErr == nil {
-					handle = h
-				}
 				return rErr
 			})
 		})
@@ -329,16 +317,15 @@ type snapshotResource[S any] interface {
 }
 
 func inspectManagedHandle[K plan.HandleKind, S any](ctx context.Context, s *Service, handle plan.ManagedHandle[K]) (S, error) {
+	var st S
 	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
-		return zeroVal[S](), err
+		return st, err
 	}
 	hs, err := pool.InspectHandle[K](s.cfg.Pool, handle)
 	if err != nil {
-		return zeroVal[S](), err
+		return st, err
 	}
-	var st S
-	err = pool.WithManagedHandle[K, snapshotResource[S]](ctx, s.cfg.Pool, handle, func(_ context.Context, res snapshotResource[S]) error { st = res.snapshot(hs); return nil })
-	return st, err
+	return st, pool.WithManagedHandle[K, snapshotResource[S]](ctx, s.cfg.Pool, handle, func(_ context.Context, res snapshotResource[S]) error { st = res.snapshot(hs); return nil })
 }
 func (s *Service) validateActiveHandleOp(ctx context.Context, handleValid bool) error {
 	if err := s.validateServiceAndCtx(ctx); err != nil {
@@ -376,9 +363,8 @@ func (s *Service) executeSession(ctx context.Context, spec sessionRunSpec) (exec
 		cmdDigOpt, timeoutOpt = algebraic.Some(dig), cmd.Timeout()
 	}
 	gateReq, err := buildGateReq[security.CapExecute](gateReqInput{
-		plan: spec.plan, targetHop: targetHop, nodeID: nodeID, action: spec.action, summary: spec.summary,
-		risk: spec.risk.OrElse(security.RiskModerate), cmdDigest: cmdDigOpt,
-		params: map[string]string{"user": targetHop.Username().String()}, approval: spec.approval, stream: spec.operationStream,
+		plan: spec.plan, targetHop: targetHop, nodeID: nodeID, action: spec.action, summary: spec.summary, risk: spec.risk.OrElse(security.RiskModerate),
+		cmdDigest: cmdDigOpt, params: map[string]string{"user": targetHop.Username().String()}, approval: spec.approval, stream: spec.operationStream,
 	})
 	if err != nil {
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_binding", err), err

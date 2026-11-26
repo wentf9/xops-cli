@@ -753,4 +753,34 @@ func TestSessionPTYAndTUN_CtxMutexAndHandshakeCancel(t *testing.T) {
 		t.Fatalf("TUN 建链取消后 ActiveHandles 必须归零: %+v", hsRig.pool.Stats())
 	}
 	assertTeardownClean(t, hsRig, "TUNHandshakeCancel")
+
+	// 3. 委托 ForwarderPort.StartForward 窗口内调用方取消 leaseCtx：必须关闭已返回句柄且返 context.Canceled。
+	cFwd := &cancelingForwarder{inner: sim.NewSimForwarder()}
+	fwdRig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator, customForwarder: cFwd})
+	defer fwdRig.close()
+	lSpec, _ := ports.NewForwardSpec(ports.ForwardLocal, "127.0.0.1:18888", "10.0.0.2:80")
+	fCtx, fCancel := context.WithCancel(context.Background())
+	cFwd.onStart = fCancel
+	if _, err := fwdRig.svc.StartForward(fCtx, ucsess.StartForwardRequest{Plan: mustTestPlan(t, ""), Spec: lSpec}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("委托 StartForward 建链期取消期望 context.Canceled，实际=%v", err)
+	}
+	if cFwd.lastHandle == nil || cFwd.lastHandle.IsValid() || fwdRig.pool.Stats().ActiveHandles != 0 {
+		t.Fatalf("建链期取消后底层 ForwardHandle 必须已关闭且 0 句柄残留: active=%d", fwdRig.pool.Stats().ActiveHandles)
+	}
+	assertTeardownClean(t, fwdRig, "DelegatedForwardHandshakeCancel")
+}
+
+type cancelingForwarder struct {
+	inner      *sim.SimForwarder
+	onStart    func()
+	lastHandle ports.ForwardHandle
+}
+
+func (f *cancelingForwarder) StartForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (ports.ForwardHandle, error) {
+	h, err := f.inner.StartForward(ctx, transport, spec)
+	f.lastHandle = h
+	if f.onStart != nil {
+		f.onStart()
+	}
+	return h, err
 }

@@ -132,11 +132,7 @@ func (s *Service) startManagedMuxMaster(leaseCtx, revokeCtx context.Context, con
 		_ = workN.Close()
 		return nil, err
 	}
-	mm := &managedMuxMaster{
-		valid: true, socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist,
-		conn: conn, workNursery: workN, reaperNursery: reaperN,
-		activityCh: make(chan chan struct{}, 1), doneCh: make(chan struct{}), relReady: make(chan struct{}),
-	}
+	mm := &managedMuxMaster{valid: true, socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, conn: conn, workNursery: workN, reaperNursery: reaperN, activityCh: make(chan chan struct{}, 1), doneCh: make(chan struct{}), relReady: make(chan struct{})}
 	readyCh, startErrCh := make(chan struct{}), make(chan error, 1)
 	if err := mm.launchMuxWorkers(s.cfg.MuxSocket, s.cfg.Forwarder, s.cfg.Clock, readyCh, startErrCh); err != nil {
 		_ = mm.Close()
@@ -274,10 +270,7 @@ func (m *managedMuxMaster) IsValid() bool {
 	return m != nil && m.valid && !m.closed.Load() && m.conn != nil && m.conn.IsAlive()
 }
 func (m *managedMuxMaster) snapshot(hs pool.HandleStatus) ControlMasterStatus {
-	return ControlMasterStatus{
-		handleStatus: hs, socketPath: m.socketPath, effectiveMaster: m.effectiveMaster,
-		effectivePersist: m.effectivePersist, active: hs.Active() && m.IsValid(), err: m.serveErr.get(), valid: true,
-	}
+	return ControlMasterStatus{handleStatus: hs, socketPath: m.socketPath, effectiveMaster: m.effectiveMaster, effectivePersist: m.effectivePersist, active: hs.Active() && m.IsValid(), err: m.serveErr.get(), valid: true}
 }
 func (m *managedMuxMaster) Close() error {
 	if m == nil || !m.valid {

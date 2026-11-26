@@ -271,10 +271,7 @@ func runStreamSession(
 	if err != nil {
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_pty", err), err
 	}
-	streams := ports.ExecStreams{
-		Stdin: stdin, Stdout: wrapOutputWriter(ctx, stdout, emitter, events.OutputStreamStdout),
-		Stderr: wrapOutputWriter(ctx, stderr, emitter, events.OutputStreamStderr), PTY: ptyOpt, Env: sendEnv,
-	}
+	streams := ports.ExecStreams{Stdin: stdin, Stdout: wrapOutputWriter(ctx, stdout, emitter, events.OutputStreamStdout), Stderr: wrapOutputWriter(ctx, stderr, emitter, events.OutputStreamStderr), PTY: ptyOpt, Env: sendEnv}
 	if err := starter(ctx, streams); err != nil {
 		return notStartedSessionOutcome(execution.StartPhaseRequestRejected, "session_start_failed", err), err
 	}

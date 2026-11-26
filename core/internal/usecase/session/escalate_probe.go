@@ -221,12 +221,14 @@ func hasScopeDriftOrTighten(r security.ScopeEscalationResult) bool {
 }
 
 // runAuthorizedPrivilege 将取密（Vault/交互 PromptSecret）置于 WithLease 之外，避免 LeaseScope 泄漏与提前拨号，
-// 仅在获租后启动执行超时，并经 escalatorCalled 边界严格区分启动前失败（OutcomeNotStarted）与调用后不确定（OutcomeUnknown）。
+// 仅在获租后启动执行超时，并按进入阶段精确区分启动前失败（OutcomeNotStarted）与调用后不确定（OutcomeUnknown）。
 func (s *Service) runAuthorizedPrivilege(ctx context.Context, req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string, emitter *operationEmitter) (execution.ExecutionOutcome, error) {
 	var outcome execution.ExecutionOutcome
-	var escalatorCalled bool
+	var enteredPool, enteredLease, escalatorCalled bool
 	runErr := s.withPrivilegePassword(ctx, req, nodeID, func(passBox *secret.SecretBox) error {
+		enteredPool = true
 		return s.cfg.Pool.WithLease(ctx, req.Plan, func(leaseCtx context.Context, lease *pool.Lease) error {
+			enteredLease = true
 			streams, err := s.buildPrivilegeStreams(leaseCtx, req, targetHop, emitter)
 			if err != nil {
 				outcome = notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_pty", err)
@@ -241,7 +243,15 @@ func (s *Service) runAuthorizedPrivilege(ctx context.Context, req PrivilegeExecR
 		})
 	})
 	if !escalatorCalled {
-		return notStartedSessionOutcome(execution.StartPhaseAuthorize, "privilege_prestart_failed", runErr), runErr
+		err := firstNonNilErr(runErr, ctx.Err(), ports.ErrClosed)
+		if outcome == nil || !outcome.IsValid() {
+			phase, code := execution.StartPhaseAuthorize, "privilege_prestart_failed"
+			if enteredPool && !enteredLease {
+				phase, code = execution.StartPhaseDial, "lease_failed"
+			}
+			outcome = notStartedSessionOutcome(phase, code, err)
+		}
+		return outcome, err
 	}
 	return outcome, runErr
 }
@@ -256,10 +266,7 @@ func (s *Service) buildPrivilegeStreams(ctx context.Context, req PrivilegeExecRe
 	if err != nil {
 		return ports.ExecStreams{}, err
 	}
-	return ports.ExecStreams{
-		Stdin: req.Stdin, Stdout: wrapOutputWriter(ctx, req.Stdout, emitter, events.OutputStreamStdout),
-		Stderr: wrapOutputWriter(ctx, req.Stderr, emitter, events.OutputStreamStderr), PTY: ptyOpt, Env: s.filterSendEnv(targetHop),
-	}, nil
+	return ports.ExecStreams{Stdin: req.Stdin, Stdout: wrapOutputWriter(ctx, req.Stdout, emitter, events.OutputStreamStdout), Stderr: wrapOutputWriter(ctx, req.Stderr, emitter, events.OutputStreamStderr), PTY: ptyOpt, Env: s.filterSendEnv(targetHop)}, nil
 }
 
 // withPrivilegePassword 在同步作用域闭包内借用可选提权口令 *secret.SecretBox 并透传给回调（0 明文消费）。
@@ -356,11 +363,8 @@ func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.
 }
 
 func normalizeShellProbeResult(raw ports.ShellProbeResult) (ports.ShellProbeResult, error) {
-	if !raw.IsValid() || !raw.Dialect().IsValid() || !raw.Interpreter().IsValid() || !raw.LaunchProfile().IsValid() || raw.Dialect() == execution.DialectUnknown {
-		return zeroVal[ports.ShellProbeResult](), fmt.Errorf("%w: 探测快照缺少有效方言、解释器或 LaunchProfile", ErrInvalidProbeResult)
-	}
-	if stage := raw.ProbeStage(); stage != 1 && stage != 2 {
-		return zeroVal[ports.ShellProbeResult](), fmt.Errorf("%w: 探测阶段 %d 非法（仅允许 1 或 2）", ErrInvalidProbeResult, stage)
+	if !raw.IsValid() || !raw.Dialect().IsValid() || !raw.Interpreter().IsValid() || !raw.LaunchProfile().IsValid() || raw.Dialect() == execution.DialectUnknown || (raw.ProbeStage() != 1 && raw.ProbeStage() != 2) {
+		return zeroVal[ports.ShellProbeResult](), fmt.Errorf("%w: 探测快照缺少有效方言、解释器、LaunchProfile 或阶段(%d)非法", ErrInvalidProbeResult, raw.ProbeStage())
 	}
 	norm, err := ports.NewShellProbeResult(ports.ShellProbeResultSpec{Dialect: raw.Dialect(), Interpreter: raw.Interpreter(), OSFamily: raw.OSFamily(), ProbeStage: raw.ProbeStage(), RawBanner: raw.RawBanner()})
 	if err != nil {
