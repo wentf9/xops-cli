@@ -12,123 +12,66 @@ import (
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-// ServiceConfig 定义只读目标解析服务 Service 的显式出站依赖配置。
-type ServiceConfig struct {
-	// OpenSSH 可选注入 ~/.ssh/config 只读虚拟主机与 Tier-4 选项源。
-	OpenSSH ports.OpenSSHConfigSource
-	// Env 可选注入本机环境与身份快照端口（用于默认用户名回退、模板变量展开与默认私钥路径检测）。
-	Env ports.EnvPort
-	// GlobalOptions 可选注入 XOps 全局选项层（t3）。
-	GlobalOptions option.OptionLayer
-	// MaxJumpDepth 限制 ProxyJump 递归解析最大跳板深度；0 使用默认 16，负值或超限失败关闭。
-	MaxJumpDepth int
-}
-
-// Service 是 XOps v2 目标与连接计划解析用例服务（Phase 2.5 Walking Skeleton 只读切片）；
-// 零值恒未初始化并严格失败关闭。
-//
-//xops:opaque
-//xops:failclosed
-type Service struct {
-	openSSH       ports.OpenSSHConfigSource
-	env           ports.EnvPort
-	globalOptions option.OptionLayer
-	maxJumpDepth  int
-	valid         bool
-}
-
-// NewService 校验全局选项层与最大跳板深度上限并构造只读目标解析 Service。
-func NewService(cfg ServiceConfig) (*Service, error) {
-	if err := cfg.GlobalOptions.Validate(); err != nil {
-		return nil, fmt.Errorf("%w: GlobalOptions 无效: %w", ErrInvalidConfig, err)
+// ResolveTargetRequest 与 ResolvedTarget 描述目标解析请求及不可变 Merkle 连接计划产物；零值恒无效。
+type (
+	ResolveTargetRequest struct {
+		Target         string
+		CLIOptions     option.OptionLayer
+		ExplicitOrigin algebraic.Option[option.OriginKind]
+		ExplicitAuth   inventory.AuthMethod
 	}
-	maxDepth := cfg.MaxJumpDepth
-	if maxDepth == 0 {
-		maxDepth = defaultMaxJumpDepth
+	//xops:opaque
+	//xops:failclosed
+	ResolvedTarget struct {
+		nodeID string
+		origin inventory.NodeOrigin
+		policy option.EffectivePolicy
+		plan   plan.SealedConnectionPlan
+		valid  bool
 	}
-	if maxDepth < 0 || maxDepth > maxAllowedJumpDepth {
-		return nil, fmt.Errorf("%w: MaxJumpDepth=%d 必须落在 [1, %d]", ErrInvalidConfig, cfg.MaxJumpDepth, maxAllowedJumpDepth)
+	managedGraphIndex struct {
+		hosts      map[inventory.HostID]inventory.Host
+		identities map[inventory.IdentityID]inventory.Identity
+		byID       map[string]inventory.Node
+		byAlias    map[string]inventory.Node
 	}
-	return &Service{
-		openSSH:       cfg.OpenSSH,
-		env:           cfg.Env,
-		globalOptions: cfg.GlobalOptions.Compose(option.UnsetOptionLayer()),
-		maxJumpDepth:  maxDepth,
-		valid:         true,
-	}, nil
-}
-
-// ResolveTargetRequest 描述单次目标解析与 Merkle 连接计划编译的强类型入参。
-type ResolveTargetRequest struct {
-	// Target 为目标连接字符串（[user@]host[:port]、[ipv6][:port]、裸 IPv6 或 OpenSSH 别名）。
-	Target string
-	// CLIOptions 为最高优先级 CLI 选项层（t1：-l/-p/-i/-J/-o 等）。
-	CLIOptions option.OptionLayer
-	// ExplicitOrigin 可选强制指定目标来源（仅支持 OriginAdHoc 与 OriginOpenSSHVirtual；None 自动判定）。
-	ExplicitOrigin algebraic.Option[option.OriginKind]
-	// ExplicitAuth 可选覆盖末跳认证方式（为 nil 时依据 EffectivePolicy 自动编译）。
-	ExplicitAuth inventory.AuthMethod
-}
-
-// ResolvedTarget 封装目标解析产出的不可变来源证明、末跳生效策略与 Merkle 链式连接计划；零值恒无效。
-//
-//xops:opaque
-//xops:failclosed
-type ResolvedTarget struct {
-	nodeID string
-	origin inventory.NodeOrigin
-	policy option.EffectivePolicy
-	plan   plan.SealedConnectionPlan
-	valid  bool
-}
+	resolveState struct {
+		managedIndex        *managedGraphIndex
+		virtualIndex        map[string]ports.OpenSSHVirtualHost
+		cliJumpPolicy       option.OptionLayer
+		cliJumpAuthFallback option.OptionLayer
+		activeStack         map[string]bool
+		hops                []plan.HopSpec
+		maxJumpDepth        int
+	}
+	resolvedHopInputs struct {
+		nodeLabel   string
+		origin      inventory.NodeOrigin
+		defaultPort uint16
+		t1, t2, t4  option.OptionLayer
+		auth        inventory.AuthMethod
+	}
+)
 
 // ResolvedTarget 零值安全只读访问器。
 func (r ResolvedTarget) IsValid() bool {
 	return r.valid && r.nodeID != "" && r.origin != nil && r.origin.IsValid() && r.policy.IsValid() && r.plan.IsValid()
 }
-func (r ResolvedTarget) IsZero() bool { return !r.IsValid() }
-func (r ResolvedTarget) NodeID() string {
-	if !r.IsValid() {
-		return ""
-	}
-	return r.nodeID
-}
-func (r ResolvedTarget) Origin() inventory.NodeOrigin {
-	if !r.IsValid() {
-		return nil
-	}
-	return r.origin
-}
+func (r ResolvedTarget) IsZero() bool                 { return !r.IsValid() }
+func (r ResolvedTarget) NodeID() string               { return pickIf(r.IsValid(), r.nodeID, "") }
+func (r ResolvedTarget) Origin() inventory.NodeOrigin { return pickIf(r.IsValid(), r.origin, nil) }
 func (r ResolvedTarget) OriginKind() option.OriginKind {
-	if !r.IsValid() {
-		return option.OriginInvalid
-	}
-	return r.origin.Kind()
+	return getIfValid(r, func(v ResolvedTarget) option.OriginKind { return v.origin.Kind() })
 }
 func (r ResolvedTarget) Policy() option.EffectivePolicy {
-	if !r.IsValid() {
-		return zeroVal[option.EffectivePolicy]()
-	}
-	return r.policy
+	return pickIf(r.IsValid(), r.policy, zeroVal[option.EffectivePolicy]())
 }
 func (r ResolvedTarget) Plan() plan.SealedConnectionPlan {
-	if !r.IsValid() {
-		return zeroVal[plan.SealedConnectionPlan]()
-	}
-	return r.plan
+	return pickIf(r.IsValid(), r.plan, zeroVal[plan.SealedConnectionPlan]())
 }
 
-type resolveState struct {
-	virtualIndex        map[string]ports.OpenSSHVirtualHost
-	cliJumpPolicy       option.OptionLayer
-	cliJumpAuthFallback option.OptionLayer
-	activeStack         map[string]bool
-	hops                []plan.HopSpec
-	maxJumpDepth        int
-}
-
-// ResolveTarget 将目标规格、CLI 选项层与可选 OpenSSH 只读配置解析为不可变 ResolvedTarget
-// 与多跳 Merkle plan.SealedConnectionPlan（带环路检测与跳板深度上限护栏）。
+// ResolveTarget 将目标规格、CLI 选项层、可选托管资产图与可选 OpenSSH 只读配置解析为不可变
+// ResolvedTarget 与多跳 Merkle plan.SealedConnectionPlan（带环路检测与跳板深度上限护栏）。
 func (s *Service) ResolveTarget(ctx context.Context, req ResolveTargetRequest) (ResolvedTarget, error) {
 	if err := s.validateResolveInputs(ctx, req); err != nil {
 		return ResolvedTarget{}, err
@@ -137,18 +80,16 @@ func (s *Service) ResolveTarget(ctx context.Context, req ResolveTargetRequest) (
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
+	managedIdx, err := s.loadManagedGraphIndex(ctx)
+	if err != nil {
+		return ResolvedTarget{}, err
+	}
 	vhIndex, err := s.loadVirtualHostIndex(ctx)
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
-	st := &resolveState{
-		virtualIndex:        vhIndex,
-		cliJumpPolicy:       extractCLIJumpPolicy(req.CLIOptions),
-		cliJumpAuthFallback: extractCLIJumpAuthFallback(req.CLIOptions),
-		activeStack:         make(map[string]bool),
-		maxJumpDepth:        s.maxJumpDepth,
-	}
-	origin, policy, err := s.resolveHopRecursive(ctx, st, parsed, req.CLIOptions, req.ExplicitOrigin, req.ExplicitAuth, 0)
+	st := &resolveState{managedIdx, vhIndex, extractCLIJumpPolicy(req.CLIOptions), extractCLIJumpAuthFallback(req.CLIOptions), make(map[string]bool), nil, s.maxJumpDepth}
+	nodeLabel, origin, policy, err := s.resolveHopRecursive(ctx, st, parsed, req.CLIOptions, req.ExplicitOrigin, req.ExplicitAuth, 0, false)
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
@@ -156,235 +97,239 @@ func (s *Service) ResolveTarget(ctx context.Context, req ResolveTargetRequest) (
 	if err != nil {
 		return ResolvedTarget{}, err
 	}
-	return ResolvedTarget{
-		nodeID: parsed.origHost.String(),
-		origin: origin,
-		policy: policy,
-		plan:   sealed,
-		valid:  true,
-	}, nil
+	return ResolvedTarget{nodeLabel, origin, policy, sealed, true}, nil
 }
-
 func (s *Service) validateResolveInputs(ctx context.Context, req ResolveTargetRequest) error {
-	if s == nil || !s.valid {
+	switch {
+	case s == nil || !s.valid:
 		return ErrServiceNotInitialized
-	}
-	if ctx == nil {
+	case ctx == nil:
 		return ErrNilContext
-	}
-	if err := ctx.Err(); err != nil {
-		return err
+	case ctx.Err() != nil:
+		return ctx.Err()
 	}
 	if err := req.CLIOptions.Validate(); err != nil {
 		return fmt.Errorf("%w: CLIOptions 无效: %w", ErrInvalidTarget, err)
 	}
-	if expOrigin, ok := req.ExplicitOrigin.Get(); ok {
-		if expOrigin != option.OriginAdHoc && expOrigin != option.OriginOpenSSHVirtual {
-			return fmt.Errorf("%w: 仅支持 OriginAdHoc 与 OriginOpenSSHVirtual，实际=%s", ErrUnsupportedOrigin, expOrigin)
+	if exp, ok := req.ExplicitOrigin.Get(); ok && !s.supportsExplicitOrigin(exp) {
+		return fmt.Errorf("%w: 当前配置不支持目标来源=%s", ErrUnsupportedOrigin, exp)
+	}
+	return pickIf[error](req.ExplicitAuth == nil || req.ExplicitAuth.IsValid(), nil, fmt.Errorf("%w: ExplicitAuth 无效", ErrNoAuthMethod))
+}
+func (s *Service) supportsExplicitOrigin(exp option.OriginKind) bool {
+	return exp == option.OriginAdHoc || exp == option.OriginOpenSSHVirtual || (s.store != nil && (exp == option.OriginManaged || exp == option.OriginOpenSSHDerived))
+}
+func (s *Service) loadManagedGraphIndex(ctx context.Context) (*managedGraphIndex, error) {
+	if s.store == nil {
+		return nil, nil
+	}
+	snap, err := s.store.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	g := snap.Graph()
+	idx := &managedGraphIndex{make(map[inventory.HostID]inventory.Host, len(g.Hosts())), make(map[inventory.IdentityID]inventory.Identity, len(g.Identities())), make(map[string]inventory.Node, len(g.Nodes())), make(map[string]inventory.Node, len(g.Nodes()))}
+	for _, h := range g.Hosts() {
+		idx.hosts[h.ID()] = h
+	}
+	for _, id := range g.Identities() {
+		idx.identities[id.ID()] = id
+	}
+	for _, n := range g.Nodes() {
+		idx.byID[n.ID().String()] = n
+		for _, a := range n.Aliases() {
+			idx.byAlias[a.String()] = n
 		}
 	}
-	if req.ExplicitAuth != nil && !req.ExplicitAuth.IsValid() {
-		return fmt.Errorf("%w: ExplicitAuth 无效", ErrNoAuthMethod)
-	}
-	return nil
+	return idx, nil
 }
-
+func (idx *managedGraphIndex) lookupManagedEntities(name string) (node inventory.Node, host inventory.Host, ident inventory.Identity, found bool, err error) {
+	if idx == nil {
+		return node, host, ident, false, nil
+	}
+	if node, found = idx.byID[name]; !found {
+		node, found = idx.byAlias[name]
+	}
+	if !found {
+		return node, host, ident, false, nil
+	}
+	var okH, okI bool
+	if host, okH = idx.hosts[node.HostRef()]; okH {
+		ident, okI = idx.identities[node.IdentityRef()]
+	}
+	if !okH || !okI {
+		return zeroVal[inventory.Node](), zeroVal[inventory.Host](), zeroVal[inventory.Identity](), false, fmt.Errorf("%w: 节点 %q 引用的 Host/Identity 缺失", inventory.ErrMissingAssetRef, node.ID())
+	}
+	return node, host, ident, true, nil
+}
 func (s *Service) loadVirtualHostIndex(ctx context.Context) (map[string]ports.OpenSSHVirtualHost, error) {
 	if s.openSSH == nil {
 		return nil, nil
 	}
 	hosts, err := s.openSSH.ListVirtualHosts(ctx)
-	if err != nil {
+	if err != nil || len(hosts) == 0 {
 		return nil, err
-	}
-	if len(hosts) == 0 {
-		return nil, nil
 	}
 	idx := make(map[string]ports.OpenSSHVirtualHost, len(hosts))
 	for _, h := range hosts {
-		if h.IsValid() {
-			if _, exists := idx[h.Alias()]; !exists {
-				idx[h.Alias()] = h
-			}
+		if _, exists := idx[h.Alias()]; h.IsValid() && !exists {
+			idx[h.Alias()] = h
 		}
 	}
 	return idx, nil
 }
 
 func (s *Service) resolveHopRecursive(
-	ctx context.Context,
-	st *resolveState,
-	pt parsedTarget,
-	cliOpts option.OptionLayer,
-	explicitOrigin algebraic.Option[option.OriginKind],
-	explicitAuth inventory.AuthMethod,
-	depth int,
-) (inventory.NodeOrigin, option.EffectivePolicy, error) {
+	ctx context.Context, st *resolveState, pt parsedTarget, cliOpts option.OptionLayer,
+	explicitOrigin algebraic.Option[option.OriginKind], explicitAuth inventory.AuthMethod, depth int, preferOpenSSH bool,
+) (string, inventory.NodeOrigin, option.EffectivePolicy, error) {
 	var zeroPolicy option.EffectivePolicy
 	if err := ctx.Err(); err != nil {
-		return nil, zeroPolicy, err
+		return "", nil, zeroPolicy, err
 	}
 	if depth > st.maxJumpDepth {
-		return nil, zeroPolicy, fmt.Errorf("%w: %w: ProxyJump 深度 %d 超过上限 %d", ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, depth, st.maxJumpDepth)
+		return "", nil, zeroPolicy, fmt.Errorf("%w: %w: ProxyJump 深度 %d 超过上限 %d", ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, depth, st.maxJumpDepth)
 	}
-	origin, t4, t1, err := s.resolveHopOriginAndTiers(ctx, st, pt, cliOpts, explicitOrigin, depth)
+	hopIn, err := s.resolveHopInputs(ctx, st, pt, cliOpts, explicitOrigin, explicitAuth, depth, preferOpenSSH)
 	if err != nil {
-		return nil, zeroPolicy, err
+		return "", nil, zeroPolicy, err
 	}
-	policy, err := option.ResolveEffectivePolicyWithOriginalHost(
-		origin.Kind(), pt.origHost, netaddr.DefaultSSHPort, t1, option.UnsetOptionLayer(), s.globalOptions, t4,
-	)
+	policy, err := option.ResolveEffectivePolicyWithOriginalHost(hopIn.origin.Kind(), pt.origHost, hopIn.defaultPort, hopIn.t1, hopIn.t2, s.globalOptions, hopIn.t4)
 	if err != nil {
-		return nil, zeroPolicy, err
+		return "", nil, zeroPolicy, err
 	}
-	aliasKey, epKey := hopCycleKeys(origin.Kind(), pt.origHost, policy.Endpoint())
+	aliasKey, epKey := hopIn.origin.Kind().String()+":node:"+hopIn.nodeLabel, "ep:"+policy.Endpoint().String()
 	if st.activeStack[aliasKey] || st.activeStack[epKey] {
-		return nil, zeroPolicy, fmt.Errorf("%w: %w: 跳板目标 %s (%s) 存在循环引用", ErrProxyJumpCycle, inventory.ErrProxyJumpCycle, pt.origHost.String(), policy.Endpoint())
+		return "", nil, zeroPolicy, fmt.Errorf("%w: %w: 跳板目标 %s (%s) 存在循环引用", ErrProxyJumpCycle, inventory.ErrProxyJumpCycle, pt.origHost.String(), policy.Endpoint())
 	}
 	st.activeStack[aliasKey], st.activeStack[epKey] = true, true
 	defer func() {
 		delete(st.activeStack, aliasKey)
 		delete(st.activeStack, epKey)
 	}()
-	if err := s.expandUpstreamJumps(ctx, st, policy.Proxy(), depth); err != nil {
-		return nil, zeroPolicy, err
+	if err := s.expandUpstreamJumps(ctx, st, policy.Proxy(), depth, hopIn.origin.Kind() == option.OriginOpenSSHVirtual); err != nil {
+		return "", nil, zeroPolicy, err
 	}
-	if err := s.appendResolvedHop(st, pt.origHost.String(), policy, explicitAuth); err != nil {
-		return nil, zeroPolicy, err
+	if err := s.appendResolvedHop(st, hopIn.nodeLabel, policy, hopIn.auth); err != nil {
+		return "", nil, zeroPolicy, err
 	}
-	return origin, policy, nil
+	return hopIn.nodeLabel, hopIn.origin, policy, nil
 }
 
-func (s *Service) resolveHopOriginAndTiers(
-	ctx context.Context,
-	st *resolveState,
-	pt parsedTarget,
-	cliOpts option.OptionLayer,
-	explicitOrigin algebraic.Option[option.OriginKind],
-	depth int,
-) (inventory.NodeOrigin, option.OptionLayer, option.OptionLayer, error) {
-	originKind, vh, foundVH := classifyOriginKind(st.virtualIndex, pt.origHost, explicitOrigin)
-	// 先以不含 AdHoc 认证兜底的轻量探测层解析 Tier-4，确保通配符虚拟别名在最终 originKind
-	// 收敛前不会提前泄漏叶节点 IdentityFile/IdentitiesOnly 兜底。
-	probeT1 := cliOpts.Compose(pt.inlineLayer())
-	t4, err := s.resolveHopTier4(ctx, pt.origHost, originKind, probeT1)
-	if err != nil {
-		return nil, option.UnsetOptionLayer(), option.UnsetOptionLayer(), err
+func (s *Service) resolveHopInputs(
+	ctx context.Context, st *resolveState, pt parsedTarget, cliOpts option.OptionLayer,
+	explicitOrigin algebraic.Option[option.OriginKind], explicitAuth inventory.AuthMethod, depth int, preferOpenSSH bool,
+) (resolvedHopInputs, error) {
+	_, hasVH := st.virtualIndex[pt.origHost.String()]
+	if !preferOpenSSH || explicitOrigin.IsSome() || !hasVH {
+		if managed, ok, err := s.tryResolveManagedHop(ctx, st, pt, cliOpts, explicitOrigin, explicitAuth, depth); err != nil || ok {
+			return managed, err
+		}
 	}
-	// 未显式指定来源且非具体虚拟别名时，若原始目标非标准 DNS/IP 但命中了通配符 Host 块的 HostName，
-	// 则归入 OpenSSH 虚拟来源以便完成主机名展开；其余临时 user@host 一律保持 OriginAdHoc（INV-D2）。
+	vh, foundVH := st.virtualIndex[pt.origHost.String()]
+	originKind := explicitOrigin.OrElse(pickIf(foundVH, option.OriginOpenSSHVirtual, option.OriginAdHoc))
+	t4, err := s.resolveHopTier4(ctx, pt.origHost, originKind, cliOpts.Compose(pt.inlineLayer()))
+	if err != nil {
+		return resolvedHopInputs{}, err
+	}
 	if explicitOrigin.IsNone() && originKind == option.OriginAdHoc && t4.HostName().IsSome() {
 		if _, isCanon := pt.origHost.CanonicalHost(); !isCanon {
 			originKind = option.OriginOpenSSHVirtual
 		}
 	}
-	t1 := buildHopTier1(pt, cliOpts, st.cliJumpPolicy, st.cliJumpAuthFallback, originKind, depth)
 	nodeOrigin, err := buildNodeOrigin(originKind, pt.origHost, vh, foundVH)
 	if err != nil {
-		return nil, option.UnsetOptionLayer(), option.UnsetOptionLayer(), err
+		return resolvedHopInputs{}, err
 	}
-	return nodeOrigin, t4, t1, nil
+	t1 := buildHopTier1(pt, cliOpts, st.cliJumpPolicy, st.cliJumpAuthFallback, originKind, depth)
+	return resolvedHopInputs{pt.origHost.String(), nodeOrigin, netaddr.DefaultSSHPort, t1, option.UnsetOptionLayer(), t4, explicitAuth}, nil
 }
 
-func classifyOriginKind(
-	vhIndex map[string]ports.OpenSSHVirtualHost,
-	origHost option.OriginalHostSpec,
-	explicit algebraic.Option[option.OriginKind],
-) (option.OriginKind, ports.OpenSSHVirtualHost, bool) {
-	vh, foundVH := vhIndex[origHost.String()]
-	if exp, ok := explicit.Get(); ok {
-		return exp, vh, foundVH
+func (s *Service) tryResolveManagedHop(
+	ctx context.Context, st *resolveState, pt parsedTarget, cliOpts option.OptionLayer,
+	explicitOrigin algebraic.Option[option.OriginKind], explicitAuth inventory.AuthMethod, depth int,
+) (resolvedHopInputs, bool, error) {
+	exp, hasExp := explicitOrigin.Get()
+	if hasExp && exp != option.OriginManaged && exp != option.OriginOpenSSHDerived {
+		return resolvedHopInputs{}, false, nil
 	}
-	if foundVH {
-		return option.OriginOpenSSHVirtual, vh, true
+	node, host, ident, found, err := st.managedIndex.lookupManagedEntities(pt.origHost.String())
+	if err != nil || !found {
+		return resolvedHopInputs{}, false, pickIf(err != nil, err, pickIf[error](hasExp, fmt.Errorf("%w: 未找到托管节点 %q", ErrAssetNotFound, pt.origHost.String()), nil))
 	}
-	return option.OriginAdHoc, zeroVal[ports.OpenSSHVirtualHost](), false
+	origin := node.Origin()
+	if hasExp && origin.Kind() != exp {
+		return resolvedHopInputs{}, false, fmt.Errorf("%w: 节点 %q 实际来源=%s，期望=%s", ErrUnsupportedOrigin, node.ID(), origin.Kind(), exp)
+	}
+	return s.buildManagedHopInputs(ctx, st, pt, cliOpts, explicitAuth, depth, node, host, ident)
 }
 
-func buildHopTier1(
-	pt parsedTarget,
-	cliOpts option.OptionLayer,
-	cliJumpPolicy option.OptionLayer,
-	cliJumpAuthFallback option.OptionLayer,
-	originKind option.OriginKind,
-	depth int,
-) option.OptionLayer {
-	inline := pt.inlineLayer()
+func (s *Service) buildManagedHopInputs(
+	ctx context.Context, st *resolveState, pt parsedTarget, cliOpts option.OptionLayer, explicitAuth inventory.AuthMethod,
+	depth int, node inventory.Node, host inventory.Host, ident inventory.Identity,
+) (resolvedHopInputs, bool, error) {
+	hn, err := option.HostNameSpecFromHost(host.Endpoint().Host())
+	if err != nil {
+		return resolvedHopInputs{}, false, err
+	}
+	origin := node.Origin()
+	t2 := option.UnsetOptionLayer().WithHostName(hn).WithPort(host.Endpoint().Port()).WithUser(ident.User()).WithProxyRoute(node.EffectiveProxy()).Compose(node.Options())
+	t1 := buildHopTier1(pt, cliOpts, st.cliJumpPolicy, st.cliJumpAuthFallback, origin.Kind(), depth)
+	t4Host := pt.origHost
+	if derived, ok := origin.(*inventory.OriginOpenSSHDerived); ok && derived.IsValid() {
+		if spec, pErr := option.ParseOriginalHost(derived.BaseAlias()); pErr == nil {
+			t4Host = spec
+		}
+	}
+	t4, err := s.resolveHopTier4(ctx, t4Host, origin.Kind(), t1.Compose(t2))
+	if err != nil {
+		return resolvedHopInputs{}, false, err
+	}
+	auth := explicitAuth
+	if auth == nil && (depth > 0 || (!cliOpts.IdentityFiles().IsSet() && !cliOpts.IdentityFiles().IsDisabled())) {
+		auth = ident.Auth()
+	}
+	return resolvedHopInputs{node.ID().String(), origin, host.Endpoint().Port(), t1, t2, t4, auth}, true, nil
+}
+
+func buildHopTier1(pt parsedTarget, cliOpts, cliJumpPolicy, cliJumpAuthFallback option.OptionLayer, originKind option.OriginKind, depth int) option.OptionLayer {
 	if depth == 0 {
-		return cliOpts.Compose(inline)
+		return cliOpts.Compose(pt.inlineLayer())
 	}
-	// 多跳跳板遵循 INV-D3（t1 > t4）：所有跳板均继承 CLI 安全/非交互/信任/加密策略覆盖
-	// （cliOpts 携带由右向左归约的 ProxyRoute 覆盖，inline 携带跳板行内 user/port）；
-	// 仅临时 AdHoc 跳板额外继承 CLI 认证兜底（IdentityFile/CertificateFile/IdentitiesOnly），
-	// OpenSSH 虚拟跳板保留自身 t4 密钥配置。
-	base := cliOpts.Compose(inline).Compose(cliJumpPolicy)
-	if originKind == option.OriginAdHoc {
-		return base.Compose(cliJumpAuthFallback)
-	}
-	return base
+	base := cliOpts.Compose(pt.inlineLayer()).Compose(cliJumpPolicy)
+	return pickIf(originKind == option.OriginAdHoc, base.Compose(cliJumpAuthFallback), base)
 }
-
-func (s *Service) resolveHopTier4(
-	ctx context.Context,
-	origHost option.OriginalHostSpec,
-	originKind option.OriginKind,
-	t1 option.OptionLayer,
-) (option.OptionLayer, error) {
+func (s *Service) resolveHopTier4(ctx context.Context, origHost option.OriginalHostSpec, originKind option.OriginKind, probeLayer option.OptionLayer) (option.OptionLayer, error) {
 	if s.openSSH == nil {
 		return option.UnsetOptionLayer(), nil
 	}
-	epOpt := deriveTier4CandidateEndpoint(origHost, originKind, t1.Compose(s.globalOptions))
-	return s.openSSH.ResolveTier4(ctx, origHost, epOpt)
+	return s.openSSH.ResolveTier4(ctx, origHost, deriveTier4CandidateEndpoint(origHost, originKind, probeLayer.Compose(s.globalOptions)))
 }
-
-func deriveTier4CandidateEndpoint(
-	origHost option.OriginalHostSpec,
-	originKind option.OriginKind,
-	probe option.OptionLayer,
-) algebraic.Option[netaddr.Endpoint] {
+func deriveTier4CandidateEndpoint(origHost option.OriginalHostSpec, originKind option.OriginKind, probe option.OptionLayer) algebraic.Option[netaddr.Endpoint] {
 	var host netaddr.CanonicalHost
-	var hasHost bool
-	if hn, ok := probe.HostName().Get(); ok {
-		if resolved, err := hn.ResolveHostFor(origHost); err == nil {
-			host, hasHost = resolved, true
-		}
+	var ok bool
+	if hn, hasHN := probe.HostName().Get(); hasHN {
+		resolved, err := hn.ResolveHostFor(origHost)
+		host, ok = resolved, err == nil
 	} else if originKind == option.OriginAdHoc {
-		host, hasHost = origHost.CanonicalHost()
+		host, ok = origHost.CanonicalHost()
 	}
-	if !hasHost {
-		return algebraic.None[netaddr.Endpoint]()
+	if ep, err := netaddr.NewEndpoint(host, probe.Port().OrElse(netaddr.DefaultSSHPort)); ok && err == nil {
+		return algebraic.Some(ep)
 	}
-	ep, err := netaddr.NewEndpoint(host, probe.Port().OrElse(netaddr.DefaultSSHPort))
-	if err != nil {
-		return algebraic.None[netaddr.Endpoint]()
-	}
-	return algebraic.Some(ep)
+	return algebraic.None[netaddr.Endpoint]()
 }
-
-func buildNodeOrigin(
-	kind option.OriginKind,
-	origHost option.OriginalHostSpec,
-	vh ports.OpenSSHVirtualHost,
-	foundVH bool,
-) (inventory.NodeOrigin, error) {
+func buildNodeOrigin(kind option.OriginKind, origHost option.OriginalHostSpec, vh ports.OpenSSHVirtualHost, foundVH bool) (inventory.NodeOrigin, error) {
 	switch kind {
 	case option.OriginOpenSSHVirtual:
-		srcFile := ""
-		if foundVH {
-			srcFile = vh.SourceFile()
-		}
-		return inventory.NewOriginOpenSSHVirtual(origHost.String(), srcFile)
+		return inventory.NewOriginOpenSSHVirtual(origHost.String(), pickIf(foundVH, vh.SourceFile(), ""))
 	case option.OriginAdHoc:
 		return inventory.NewOriginAdHoc(algebraic.None[inventory.NodeID]())
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnsupportedOrigin, kind)
 	}
 }
-
-// expandUpstreamJumps 严格按 OpenSSH 由右向左归约 ProxyJump 逗号链：
-// 对 ProxyJump h_1,...,h_k 剥离紧邻上游 h_k，当 k > 1 时将前缀 h_1,...,h_{k-1} 作为 CLI ProxyRoute
-// 覆写传入 h_k（覆盖 h_k 自身 t4 ProxyJump、逐跳累加 depth 并保持完整 activeStack 环路检测与 %j/%C）。
-func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, route option.ProxyRoute, depth int) error {
+func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, route option.ProxyRoute, depth int, preferOpenSSH bool) error {
 	switch v := route.(type) {
 	case nil, *option.ProxyUnset, *option.ProxyDisabled, *option.ProxyCommandSpec:
 		return nil
@@ -397,33 +342,30 @@ func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, rou
 		if err != nil {
 			return err
 		}
-		upstreamCLI := option.UnsetOptionLayer()
-		if len(hops) > 1 {
-			prefixNE, neErr := algebraic.NonEmptyFromSlice(hops[:len(hops)-1])
-			if neErr != nil {
-				return fmt.Errorf("%w: %w", ErrInvalidTarget, neErr)
-			}
-			prefixRoute, prErr := option.NewProxyJumpChain(prefixNE)
-			if prErr != nil {
-				return fmt.Errorf("%w: %w", ErrInvalidTarget, prErr)
-			}
-			upstreamCLI = upstreamCLI.WithProxyRoute(prefixRoute)
+		upstreamCLI, err := buildPrefixJumpLayer(hops[:len(hops)-1])
+		if err != nil {
+			return err
 		}
-		_, _, err = s.resolveHopRecursive(
-			ctx, st, lastParsed, upstreamCLI, algebraic.None[option.OriginKind](), nil, depth+1,
-		)
+		_, _, _, err = s.resolveHopRecursive(ctx, st, lastParsed, upstreamCLI, algebraic.None[option.OriginKind](), nil, depth+1, preferOpenSSH)
 		return err
 	default:
 		return fmt.Errorf("%w: 不支持的 ProxyRoute 变体 %T", ErrInvalidTarget, route)
 	}
 }
-
-func (s *Service) appendResolvedHop(
-	st *resolveState,
-	nodeLabel string,
-	policy option.EffectivePolicy,
-	explicitAuth inventory.AuthMethod,
-) error {
+func buildPrefixJumpLayer(prefix []option.HopTarget) (option.OptionLayer, error) {
+	if len(prefix) == 0 {
+		return option.UnsetOptionLayer(), nil
+	}
+	ne, err := algebraic.NonEmptyFromSlice(prefix)
+	if err == nil {
+		var r *option.ProxyJumpChain
+		if r, err = option.NewProxyJumpChain(ne); err == nil {
+			return option.UnsetOptionLayer().WithProxyRoute(r), nil
+		}
+	}
+	return option.UnsetOptionLayer(), fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+}
+func (s *Service) appendResolvedHop(st *resolveState, nodeLabel string, policy option.EffectivePolicy, explicitAuth inventory.AuthMethod) error {
 	if len(st.hops) >= maxPlanHops {
 		return fmt.Errorf("%w: %w: 连接计划跳数超过上限 %d", ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, maxPlanHops)
 	}
@@ -436,29 +378,21 @@ func (s *Service) appendResolvedHop(
 		return err
 	}
 	hopSpec, err := plan.NewHopSpecFromAuth(uint32(len(st.hops)), nodeLabel, user, auth, policy)
-	if err != nil {
-		return err
+	if err == nil {
+		st.hops = append(st.hops, hopSpec)
 	}
-	st.hops = append(st.hops, hopSpec)
-	return nil
+	return err
 }
-
 func (s *Service) resolveHopUsername(policy option.EffectivePolicy) (option.Username, error) {
 	if u, ok := policy.User().Get(); ok && u.IsValid() {
 		return u, nil
 	}
 	if s.env != nil {
-		id, err := s.env.LookupLocalIdentity()
-		if err == nil && id.IsValid() {
-			u, uErr := option.ParseUsername(id.LocalUser())
-			if uErr == nil {
+		if id, err := s.env.LookupLocalIdentity(); err == nil && id.IsValid() {
+			if u, uErr := option.ParseUsername(id.LocalUser()); uErr == nil {
 				return u, nil
 			}
 		}
 	}
 	return zeroVal[option.Username](), fmt.Errorf("%w: 请通过 user@、-l 或 OpenSSH User 指定用户名", ErrMissingUsername)
-}
-
-func hopCycleKeys(kind option.OriginKind, origHost option.OriginalHostSpec, ep netaddr.Endpoint) (aliasKey, epKey string) {
-	return kind.String() + ":host:" + origHost.String(), "ep:" + ep.String()
 }
