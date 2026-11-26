@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -99,10 +100,11 @@ type Config struct {
 	Dialer              ports.DialerPort    // 为 nil 时默认装配真实 sshnet/dial（含 sftp.Open）+ sshnet/hostkey
 	RemoteFS            RemoteFSFunc        // 仅用于外部自定义/仿真 Dialer 覆写 OpenRemoteFS；真实路径由 buildRealDialer 注入 sftp.Open
 
-	// 拨号、全局选项、跳板深度、限流分片、事件总线与连接池调优参数（全可选，0/None 取安全默认值）。
+	// 拨号、全局选项、跳板深度、转发安全开关、限流分片、事件总线与连接池调优参数（全可选，0/false/None 取安全失败关闭默认值）。
 	DialContext                                                                  DialContextFunc
 	ClientVersion                                                                string
 	GlobalOptions                                                                option.OptionLayer
+	ForwardAllowGatewayPorts, ForwardReplaceStaleUnix                            bool // 默认 false：遵循 GatewayPorts=no 且不自动接管过期本地 Unix 转发套接字
 	MaxJumpDepth, TransferDefaultConcurrency, AutomationDefaultConcurrency       int
 	TransferDefaultChunkSize, TransferDefaultMaxReadBytes                        int64
 	AutomationMaxScriptBytes, AutomationMaxTemplateBytes, AutomationMaxCopyBytes int64
@@ -284,7 +286,10 @@ func resolveDefaultPorts(cfg Config) (rp resolvedPorts, err error) {
 	}
 	rp.forwarder = cfg.Forwarder
 	if rp.forwarder == nil {
-		rp.forwarder = forward.NewForwarder(forward.Config{TUNDevice: cfg.TUNDevice, Clock: cfg.Clock})
+		rp.forwarder = forward.NewForwarder(forward.Config{
+			TUNDevice: cfg.TUNDevice, AllowGatewayPorts: cfg.ForwardAllowGatewayPorts,
+			ReplaceStaleUnix: cfg.ForwardReplaceStaleUnix, Clock: cfg.Clock,
+		})
 	}
 	rp.muxSocket = cfg.MuxSocket
 	if rp.muxSocket == nil {
@@ -347,8 +352,28 @@ func (d *remoteFSDialer) DialHop(ctx context.Context, hop plan.HopSpec, dig plan
 	}
 	return &remoteFSConn{TransportConn: conn, openFS: d.openFS}, nil
 }
+
+type (
+	waitDoneProvider      interface{ WaitDone() <-chan struct{} }
+	subsystemStreamOpener interface {
+		OpenSubsystemStream(ctx context.Context, subsystem string) (io.ReadWriteCloser, error)
+	}
+)
+
 func (c *remoteFSConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	return c.openFS(ctx, c.TransportConn)
+}
+func (c *remoteFSConn) WaitDone() <-chan struct{} {
+	if wp, ok := c.TransportConn.(waitDoneProvider); ok {
+		return wp.WaitDone()
+	}
+	return nil
+}
+func (c *remoteFSConn) OpenSubsystemStream(ctx context.Context, subsystem string) (io.ReadWriteCloser, error) {
+	if sso, ok := c.TransportConn.(subsystemStreamOpener); ok {
+		return sso.OpenSubsystemStream(ctx, subsystem)
+	}
+	return nil, ports.ErrUnsupported
 }
 func buildRealDialer(cfg Config, hostTrust ports.HostTrustPort, keySigner ports.KeySignerPort) (*dial.Dialer, error) {
 	d, err := dial.NewDialer(dial.Config{

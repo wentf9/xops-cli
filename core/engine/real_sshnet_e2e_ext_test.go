@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -67,6 +68,7 @@ func TestEngine_AllRealSSHNetLoopbackEndToEnd(t *testing.T) {
 	assertAllRealSFTPAndSCP(t, ctx, eng, rig, baseCLI, srv)
 	assertAllRealLocalForward(t, ctx, eng, baseCLI, srv)
 	assertAllRealControlMasterAndReuse(t, ctx, eng, rig, vault, keyPath, srv)
+	assertRemoteFSOverridePreservesMuxSubsystems(t, ctx, rig, vault, keyPath, srv)
 }
 
 func mustNewAllDefaultRealEngine(t *testing.T, rig *loopbackEngineRig, vault *sim.SimVault, srv *realSSHNetStub) *engine.Engine {
@@ -337,6 +339,15 @@ func assertAllRealLocalForward(
 ) {
 	t.Helper()
 	rc := engine.RemoteCall{TargetInput: engine.TargetInput{TargetSpec: "deploy@127.0.0.1:22100", CLIOptions: baseCLI}}
+	// 默认 ForwardAllowGatewayPorts=false 必须拒绝非回环 0.0.0.0 绑定（OpenSSH GatewayPorts=no）。
+	nonLoopSpec, err := engine.NewForwardSpec(engine.ForwardLocal, "0.0.0.0:0", "10.88.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewForwardSpec(0.0.0.0): %v", err)
+	}
+	if _, err := eng.StartForward(ctx, engine.StartForwardRequest{RemoteCall: rc, Spec: nonLoopSpec}); err == nil {
+		t.Fatal("默认 ForwardAllowGatewayPorts=false 必须拒绝 0.0.0.0 非回环绑定")
+	}
+
 	fwdSpec, err := engine.NewForwardSpec(engine.ForwardLocal, "127.0.0.1:0", "10.88.0.1:8080")
 	if err != nil {
 		t.Fatalf("NewForwardSpec: %v", err)
@@ -345,26 +356,38 @@ func assertAllRealLocalForward(
 	if err != nil {
 		t.Fatalf("Engine.StartForward(-L): %v", err)
 	}
-	defer func() {
-		if sErr := eng.StopForward(ctx, fwdInfo.Handle()); sErr != nil {
-			t.Errorf("Engine.StopForward: %v", sErr)
-		}
-	}()
 	if st, err := eng.InspectForward(ctx, fwdInfo.Handle()); err != nil || !st.Active() {
+		_ = eng.StopForward(ctx, fwdInfo.Handle())
 		t.Fatalf("Engine.InspectForward 失配: st=%+v err=%v", st, err)
 	}
+	roundTripLoopbackForward(t, ctx, fwdInfo.BoundAddr(), "ping-fwd\n", "fwd[10.88.0.1:8080]:ping-fwd\n")
+	if srv.fwdCount.Load() != 1 {
+		_ = eng.StopForward(ctx, fwdInfo.Handle())
+		t.Fatalf("期望 1 次 -L direct-tcpip，实际=%d", srv.fwdCount.Load())
+	}
+	if err := eng.StopForward(ctx, fwdInfo.Handle()); err != nil {
+		t.Fatalf("Engine.StopForward: %v", err)
+	}
+	<-fwdInfo.Done()
+	if err := fwdInfo.Wait(ctx); err != nil {
+		t.Fatalf("StopForward 后 ForwardInfo.Wait(ctx) 期望 nil，实际=%v", err)
+	}
+}
+
+func roundTripLoopbackForward(t *testing.T, ctx context.Context, addr, send, want string) {
+	t.Helper()
 	var nd net.Dialer
-	conn, err := nd.DialContext(ctx, "tcp", fwdInfo.BoundAddr())
+	conn, err := nd.DialContext(ctx, "tcp", addr)
 	if err != nil {
-		t.Fatalf("Dial -L BoundAddr(%s): %v", fwdInfo.BoundAddr(), err)
+		t.Fatalf("Dial -L BoundAddr(%s): %v", addr, err)
 	}
 	defer func() { _ = conn.Close() }()
-	if _, err := io.WriteString(conn, "ping-fwd\n"); err != nil {
+	if _, err := io.WriteString(conn, send); err != nil {
 		t.Fatalf("写入 -L 转发连接失败: %v", err)
 	}
 	reply, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil || reply != "fwd[10.88.0.1:8080]:ping-fwd\n" || srv.fwdCount.Load() != 1 {
-		t.Fatalf("真实 sshnet/forward -L 回显失配: reply=%q err=%v fwdCount=%d", reply, err, srv.fwdCount.Load())
+	if err != nil || reply != want {
+		t.Fatalf("真实 sshnet/forward -L 回显失配: reply=%q err=%v", reply, err)
 	}
 }
 
@@ -401,14 +424,10 @@ func assertAllRealControlMasterAndReuse(
 	if !hasHandle {
 		t.Fatalf("StartControlMaster 期望返回有效托管句柄，实际=%+v", cmInfo)
 	}
-	defer func() {
-		if sErr := masterEng.StopControlMaster(ctx, cmHandle); sErr != nil {
-			t.Errorf("Engine.StopControlMaster: %v", sErr)
-		}
-	}()
 
 	probeResp, err := masterEng.ProbeMux(ctx, engine.MuxControlRequest{RemoteCall: masterRC})
 	if err != nil || !probeResp.Alive() || probeResp.MasterPID() == 0 {
+		_ = masterEng.StopControlMaster(ctx, cmHandle)
 		t.Fatalf("Engine.ProbeMux 期望 Alive && MasterPID>0，实际=%+v err=%v", probeResp, err)
 	}
 
@@ -426,31 +445,108 @@ func assertAllRealControlMasterAndReuse(
 		Stdout:     &muxOut,
 	})
 	if err != nil {
+		_ = masterEng.StopControlMaster(ctx, cmHandle)
 		t.Fatalf("clientEng.Exec(real mux): %v", err)
 	}
 	if comp, ok := out.(*execution.OutcomeCompleted); !ok || !comp.Succeeded() || muxOut.String() != "real-exec:via-real-mux\n" {
+		_ = masterEng.StopControlMaster(ctx, cmHandle)
 		t.Fatalf("复用 Exec 输出失配: out=%#v stdout=%q", out, muxOut.String())
 	}
 	remPath, _ := pathalg.ParseRemotePath("/srv/e2e/written.txt")
 	autoRC := engine.RemoteCall{TargetInput: engine.TargetInput{TargetSpec: "deploy@127.0.0.1:22100", CLIOptions: autoCLI}}
 	rdRes, err := clientEng.ReadRemoteFile(ctx, engine.RemoteFileReadRequest{RemoteCall: autoRC, Path: remPath})
 	if err != nil || string(rdRes.Content) != "real-sftp-atomic-payload" {
+		_ = masterEng.StopControlMaster(ctx, cmHandle)
 		t.Fatalf("复用 SFTP ReadRemoteFile 失配: got=%q err=%v", string(rdRes.Content), err)
 	}
 	if srv.dialCount.Load() != dialsBefore {
+		_ = masterEng.StopControlMaster(ctx, cmHandle)
 		t.Fatalf("透明 ControlMaster 复用期间不得触发底层新 SSH 拨号: before=%d after=%d", dialsBefore, srv.dialCount.Load())
 	}
 
 	chkResp, err := clientEng.ControlMux(ctx, engine.MuxControlRequest{RemoteCall: autoRC, Action: engine.MuxActionCheck})
 	if err != nil || !chkResp.Alive() {
+		_ = masterEng.StopControlMaster(ctx, cmHandle)
 		t.Fatalf("Engine.ControlMux(check) 失配: resp=%+v err=%v", chkResp, err)
+	}
+	// 发送 -O exit 正常退出主进程并验证 ControlMasterInfo.Done()/Wait(ctx) 零轮询收敛返回 nil。
+	if _, err := clientEng.ControlMux(ctx, engine.MuxControlRequest{RemoteCall: autoRC, Action: engine.MuxActionExit}); err != nil {
+		_ = masterEng.StopControlMaster(ctx, cmHandle)
+		t.Fatalf("Engine.ControlMux(exit): %v", err)
+	}
+	<-cmInfo.Done()
+	if err := cmInfo.Wait(ctx); err != nil {
+		t.Fatalf("-O exit 后 ControlMasterInfo.Wait(ctx) 期望 nil，实际=%v", err)
+	}
+}
+
+// assertRemoteFSOverridePreservesMuxSubsystems 验证 #159 Minor 2：
+// 即使调用方设置 engine.Config.RemoteFS != nil，外层 remoteFSConn 仍透明透传 WaitDone 与 OpenSubsystemStream，
+// 保证通过 ControlMaster 复用 SFTP 子系统不受破坏。
+func assertRemoteFSOverridePreservesMuxSubsystems(
+	t *testing.T,
+	ctx context.Context,
+	rig *loopbackEngineRig,
+	vault *sim.SimVault,
+	keyPath string,
+	srv *realSSHNetStub,
+) {
+	t.Helper()
+	overrideEng, err := engine.New(engine.Config{
+		Profile:        engine.PolicyProfileDirectOperator,
+		Guardrail:      engine.DefaultGuardrailConfig(),
+		Clock:          rig.clk,
+		Entropy:        rig.rng.Fork(),
+		AuditSink:      rig.auditSink,
+		ScopedFS:       rig.rootFS,
+		OperatorReadFS: rig.readFS,
+		Env:            rig.env,
+		Vault:          vault,
+		DialContext:    srv.dialFunc(),
+		RemoteFS: func(c context.Context, conn ports.TransportConn) (ports.RemoteFSPort, error) {
+			return conn.OpenRemoteFS(c)
+		},
+	})
+	if err != nil {
+		t.Fatalf("engine.New(RemoteFS override): %v", err)
+	}
+	defer closeEngineChecked(t, overrideEng)
+
+	sockRaw := filepath.Join(shortEngineMuxDir(t), "rfs.sock")
+	cpSpec, _ := option.ParseControlPath(sockRaw)
+	mkCLI := func(mode option.ControlMasterMode) option.OptionLayer {
+		return option.UnsetOptionLayer().
+			WithIdentityFiles(mustIdentityPathList(t, keyPath)).
+			WithIdentitiesOnly(true).
+			WithStrictHostKeyChecking(option.StrictHostKeyCheckingYes).
+			WithControlPolicy(option.UnsetControlPolicy().WithPath(cpSpec).WithMaster(mode))
+	}
+	masterRC := engine.RemoteCall{TargetInput: engine.TargetInput{TargetSpec: "deploy@127.0.0.1:22100", CLIOptions: mkCLI(option.ControlMasterYes)}}
+	cmInfo, err := overrideEng.StartControlMaster(ctx, engine.ControlMasterRequest{RemoteCall: masterRC})
+	if err != nil {
+		t.Fatalf("overrideEng.StartControlMaster: %v", err)
+	}
+	defer func() {
+		if h, ok := cmInfo.Handle().Get(); ok {
+			if sErr := overrideEng.StopControlMaster(ctx, h); sErr != nil && !errors.Is(sErr, engine.ErrHandleNotFound) {
+				t.Errorf("StopControlMaster(override): %v", sErr)
+			}
+		}
+	}()
+	clientEng := mustNewAllDefaultRealEngine(t, rig, vault, srv)
+	defer closeEngineChecked(t, clientEng)
+	remPath, _ := pathalg.ParseRemotePath("/srv/e2e/written.txt")
+	autoRC := engine.RemoteCall{TargetInput: engine.TargetInput{TargetSpec: "deploy@127.0.0.1:22100", CLIOptions: mkCLI(option.ControlMasterAuto)}}
+	rdRes, err := clientEng.ReadRemoteFile(ctx, engine.RemoteFileReadRequest{RemoteCall: autoRC, Path: remPath})
+	if err != nil || string(rdRes.Content) != "real-sftp-atomic-payload" {
+		t.Fatalf("RemoteFS 覆写模式下复用 SFTP 必须透传 OpenSubsystemStream: got=%q err=%v", string(rdRes.Content), err)
 	}
 }
 
 func shortEngineMuxDir(t *testing.T) string {
 	t.Helper()
 	parent := os.TempDir()
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" && len(parent) >= 40 {
 		parent = "/tmp"
 	}
 	dir, err := os.MkdirTemp(parent, "xe-")

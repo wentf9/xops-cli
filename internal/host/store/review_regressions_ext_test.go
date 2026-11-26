@@ -397,3 +397,146 @@ func TestImporterHardeningEdgeCases(t *testing.T) {
 	}
 	verifyOpenSSHImportWarnings(t, bLongSSH.Warnings(), []string{"template_key_skipped", "template_cert_skipped"})
 }
+
+// TestPhase5Readiness_PolicySchemaOptionsOverridesAndLoadDocument 验证 #160 Major-1：
+//   - policy.guardrail.no_elicit_fallback 仅接受 deny / challenge，严格拒绝非法 "ask"；
+//   - cli_default / mcp_default 对齐 engine.ParsePolicyProfile（direct_operator/strict/strict_operator/strict_agent）；
+//   - ConfigDocument.Options（Tier-3 XOpsGlobal）与 GuardrailConfigDTO.NodeOverrides（标量简写 + 完整映射）编解码校验且跨 CommitCAS 完整保留；
+//   - YAMLInventoryStore.LoadDocument 在目录/文件缺失、正常存在、文件损坏及零值接收者下的行为。
+func TestPhase5Readiness_PolicySchemaOptionsOverridesAndLoadDocument(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	assertPolicyEnumAndOverrideValidation(t)
+	assertStoreLoadDocumentAndCommitCASPreservesTopSections(t, ctx)
+}
+
+func assertPolicyEnumAndOverrideValidation(t *testing.T) {
+	t.Helper()
+	validYAML := `version: 2
+policy:
+  cli_default: strict_operator
+  mcp_default: strict
+  guardrail:
+    approval_threshold: moderate
+    no_elicit_fallback: challenge
+    node_overrides:
+      "staging-*": moderate
+      "prod-*":
+        approval_threshold: safe
+        decision_floor: deny
+options:
+  identities_only: true
+  strict_host_key_checking: accept-new
+  connect_timeout: 15s
+inventory: {}
+`
+	doc, _, err := store.DecodeConfigDocumentYAML([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("合法 version:2 配置解码失败: %v", err)
+	}
+	if doc.Policy == nil || doc.Policy.Guardrail == nil || doc.Policy.Guardrail.NoElicitFallback != "challenge" {
+		t.Fatalf("Policy/Guardrail 解码失配: %+v", doc.Policy)
+	}
+	layer, err := store.DecodeOptionLayerDTO(doc.Options)
+	if err != nil || layer.IsUnset() || !layer.IdentitiesOnly().OrElse(false) {
+		t.Fatalf("DecodeOptionLayerDTO 失配: layer=%+v err=%v", layer, err)
+	}
+	if _, err := store.EncodeOptionLayerDTO(layer); err != nil {
+		t.Fatalf("EncodeOptionLayerDTO 失败: %v", err)
+	}
+	ov, err := store.DecodeNodeOverridesDTO(doc.Policy.Guardrail.NodeOverrides)
+	if err != nil || ov.Len() != 2 {
+		t.Fatalf("DecodeNodeOverridesDTO 失配: len=%d err=%v", ov.Len(), err)
+	}
+	if dec := ov.EvaluateNode(security.RiskModerate, security.RiskSafe, "prod-db-1"); dec.Kind() != security.DecisionKindDeny {
+		t.Fatalf("prod-* 决策下限应为 Deny，实际=%s", dec.Kind())
+	}
+	if encOv, err := store.EncodeNodeOverridesDTO(ov); err != nil || len(encOv) != 2 || encOv["prod-*"].DecisionFloor != "deny" {
+		t.Fatalf("EncodeNodeOverridesDTO 失配: %+v err=%v", encOv, err)
+	}
+
+	invalidCases := []struct {
+		name string
+		raw  string
+	}{
+		{"reject_ask_fallback", "version: 2\npolicy:\n  guardrail:\n    no_elicit_fallback: ask\ninventory: {}\n"},
+		{"reject_bad_cli_profile", "version: 2\npolicy:\n  cli_default: superuser\ninventory: {}\n"},
+		{"reject_bad_override_floor", "version: 2\npolicy:\n  guardrail:\n    node_overrides:\n      \"prod-*\":\n        approval_threshold: safe\n        decision_floor: allow_all\ninventory: {}\n"},
+		{"reject_unknown_override_key", "version: 2\npolicy:\n  guardrail:\n    node_overrides:\n      \"prod-*\":\n        approval_threshold: safe\n        bogus: true\ninventory: {}\n"},
+		{"reject_bad_global_options", "version: 2\noptions:\n  port: 0\ninventory: {}\n"},
+	}
+	for _, tc := range invalidCases {
+		if _, _, err := store.DecodeConfigDocumentYAML([]byte(tc.raw)); !errors.Is(err, ports.ErrCorruptData) {
+			t.Fatalf("%s 期望 ErrCorruptData，实际=%v", tc.name, err)
+		}
+	}
+}
+
+func assertStoreLoadDocumentAndCommitCASPreservesTopSections(t *testing.T, ctx context.Context) {
+	t.Helper()
+	var zeroStore store.YAMLInventoryStore
+	if _, _, err := zeroStore.LoadDocument(ctx); !errors.Is(err, ports.ErrInvalidArgument) {
+		t.Fatalf("零值 YAMLInventoryStore.LoadDocument 期望 ErrInvalidArgument，实际=%v", err)
+	}
+
+	fsPort := osfs.NewScopedRootFS()
+	dir, rootDir := newPrivateStoreRoot(t)
+	s, err := store.NewYAMLInventoryStore(store.InventoryStoreSpec{ScopedFS: fsPort, RootDir: rootDir})
+	if err != nil {
+		t.Fatalf("NewYAMLInventoryStore: %v", err)
+	}
+	// 1. 缺失配置文件：返回默认 version:2 文档与空快照，且不创建任何文件。
+	absentDoc, absentSnap, err := s.LoadDocument(ctx)
+	if err != nil || absentDoc.Version != store.SchemaVersionV2 || len(absentSnap.Graph().Nodes()) != 0 {
+		t.Fatalf("缺失文件 LoadDocument 失配: doc=%+v err=%v", absentDoc, err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "config.yaml")); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("缺失文件 LoadDocument 不得创建文件: statErr=%v", statErr)
+	}
+
+	// 2. 写入含 policy.guardrail(challenge + node_overrides) 与顶层 options 的文档，验证 LoadDocument 及 CommitCAS 保留。
+	seedYAML := `version: 2
+policy:
+  cli_default: strict_operator
+  mcp_default: strict_agent
+  guardrail:
+    approval_threshold: moderate
+    no_elicit_fallback: challenge
+    node_overrides:
+      "prod-*":
+        approval_threshold: safe
+        decision_floor: deny
+options:
+  forward_agent: false
+  identities_only: true
+inventory: {}
+`
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(seedYAML), 0o600); err != nil {
+		t.Fatalf("WriteFile(config.yaml): %v", err)
+	}
+	doc1, snap1, err := s.LoadDocument(ctx)
+	if err != nil || doc1.Options == nil || doc1.Policy == nil || doc1.Policy.Guardrail == nil ||
+		doc1.Policy.Guardrail.NoElicitFallback != "challenge" || len(doc1.Policy.Guardrail.NodeOverrides) != 1 {
+		t.Fatalf("存在文件 LoadDocument 失配: doc=%+v err=%v", doc1, err)
+	}
+	if _, err := s.CommitCAS(ctx, snap1.Revision(), snap1.Graph()); err != nil {
+		t.Fatalf("CommitCAS: %v", err)
+	}
+	doc2, _, err := s.LoadDocument(ctx)
+	if err != nil || doc2.Revision != 1 || doc2.Options == nil || !*doc2.Options.IdentitiesOnly ||
+		doc2.Policy == nil || doc2.Policy.Guardrail == nil ||
+		doc2.Policy.Guardrail.NoElicitFallback != "challenge" || doc2.Policy.Guardrail.NodeOverrides["prod-*"].DecisionFloor != "deny" {
+		t.Fatalf("CommitCAS 后必须完整保留 options 与 node_overrides: doc2=%+v err=%v", doc2, err)
+	}
+
+	// 3. 损坏文档：LoadDocument 必须失败关闭返回 ErrCorruptData。
+	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("version: 2\npolicy:\n  guardrail:\n    no_elicit_fallback: ask\ninventory: {}\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(corrupt): %v", err)
+	}
+	if _, _, err := s.LoadDocument(ctx); !errors.Is(err, ports.ErrCorruptData) {
+		t.Fatalf("损坏文件 LoadDocument 期望 ErrCorruptData，实际=%v", err)
+	}
+}

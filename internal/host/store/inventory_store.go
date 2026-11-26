@@ -63,22 +63,31 @@ func NewYAMLInventoryStore(spec InventoryStoreSpec) (*YAMLInventoryStore, error)
 // Load 在旁路共享锁保护下（若目录与父目录存在）加载当前 YAML vNext 配置快照与 CAS Revision；
 // 若根目录或配置文件尚未创建，则安全返回空资产图与初始空 Revision（零副作用、不创建文件）。
 func (s *YAMLInventoryStore) Load(ctx context.Context) (ports.InventorySnapshot, error) {
-	if err := checkCtxReady(ctx, s != nil && s.valid, "YAMLInventoryStore"); err != nil {
-		return zeroVal[ports.InventorySnapshot](), err
-	}
-	var snap ports.InventorySnapshot
-	err := s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
-		var lErr error
-		snap, lErr = s.loadInRoot(ctx, root)
-		return lErr
-	})
-	if errors.Is(err, ports.ErrNotFound) {
-		return emptyInventorySnapshot()
-	}
+	_, snap, err := s.LoadDocument(ctx)
 	return snap, err
 }
 
-// CommitCAS 在旁路独占锁 <config>.lock 下比对期望 Revision，保留现有文档的 vault/policy 顶层段，
+// LoadDocument 在旁路共享锁 <config>.lock 保护下加载完整 YAML vNext ConfigDocument（含 Vault/Policy/Options）
+// 及对应 ports.InventorySnapshot；若根目录或配置文件尚未创建，返回默认空 ConfigDocument{Version: SchemaVersionV2} 与空快照（零副作用）。
+func (s *YAMLInventoryStore) LoadDocument(ctx context.Context) (ConfigDocument, ports.InventorySnapshot, error) {
+	if err := checkCtxReady(ctx, s != nil && s.valid, "YAMLInventoryStore"); err != nil {
+		return ConfigDocument{}, zeroVal[ports.InventorySnapshot](), err
+	}
+	var doc ConfigDocument
+	var snap ports.InventorySnapshot
+	err := s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
+		var lErr error
+		doc, snap, lErr = s.loadDocumentInRoot(ctx, root)
+		return lErr
+	})
+	if errors.Is(err, ports.ErrNotFound) {
+		emptySnap, sErr := emptyInventorySnapshot()
+		return ConfigDocument{Version: SchemaVersionV2}, emptySnap, sErr
+	}
+	return doc, snap, err
+}
+
+// CommitCAS 在旁路独占锁 <config>.lock 下比对期望 Revision，保留现有文档的 vault/policy/options 顶层段，
 // 递增修订号并以原子临时文件替换落盘；若落盘出现异常则精确返回 INV-F3 DurabilityOutcome。
 func (s *YAMLInventoryStore) CommitCAS(ctx context.Context, expected ports.Revision, next inventory.Graph) (ports.DurabilityOutcome, error) {
 	if err := checkCtxReady(ctx, s != nil && s.valid, "YAMLInventoryStore"); err != nil {
@@ -117,21 +126,24 @@ type loadedConfigState struct {
 	exists bool
 }
 
-func (s *YAMLInventoryStore) loadInRoot(ctx context.Context, root ports.RootHandle) (ports.InventorySnapshot, error) {
+func (s *YAMLInventoryStore) loadDocumentInRoot(ctx context.Context, root ports.RootHandle) (ConfigDocument, ports.InventorySnapshot, error) {
 	ancestorsOK, err := checkLstatAncestors(root, s.configDest)
 	if err != nil {
-		return zeroVal[ports.InventorySnapshot](), err
+		return ConfigDocument{}, zeroVal[ports.InventorySnapshot](), err
 	}
 	if !ancestorsOK {
-		return emptyInventorySnapshot()
+		snap, sErr := emptyInventorySnapshot()
+		return ConfigDocument{Version: SchemaVersionV2}, snap, sErr
 	}
 	exists, err := checkLstatRegular(root, s.configDest)
 	if err != nil {
-		return zeroVal[ports.InventorySnapshot](), err
+		return ConfigDocument{}, zeroVal[ports.InventorySnapshot](), err
 	}
 	if !exists {
-		return emptyInventorySnapshot()
+		snap, sErr := emptyInventorySnapshot()
+		return ConfigDocument{Version: SchemaVersionV2}, snap, sErr
 	}
+	var doc ConfigDocument
 	var snap ports.InventorySnapshot
 	err = osfs.WithSidecarLock(ctx, root, s.configDest, ports.LockShared, storeFilePerm, func(ports.LockedFile) error {
 		st, rErr := s.readCurrentLocked(root)
@@ -140,9 +152,12 @@ func (s *YAMLInventoryStore) loadInRoot(ctx context.Context, root ports.RootHand
 		}
 		var sErr error
 		snap, sErr = ports.NewInventorySnapshot(st.rev, st.graph)
+		if sErr == nil {
+			doc = st.doc
+		}
 		return sErr
 	})
-	return snap, err
+	return doc, snap, err
 }
 
 func (s *YAMLInventoryStore) commitLocked(root ports.RootHandle, expected ports.Revision, next inventory.Graph) (ports.DurabilityOutcome, error) {
@@ -165,6 +180,7 @@ func (s *YAMLInventoryStore) commitLocked(root ports.RootHandle, expected ports.
 		Revision:  st.doc.Revision + 1,
 		Vault:     st.doc.Vault,
 		Policy:    st.doc.Policy,
+		Options:   st.doc.Options,
 		Inventory: nextInvDTO,
 	}
 	encoded, err := EncodeConfigDocumentYAML(nextDoc)

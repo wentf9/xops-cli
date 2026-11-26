@@ -37,6 +37,7 @@ type muxServerState struct {
 	stopListenOnce   sync.Once
 	stopListenCh     chan struct{}
 	stoppedByControl atomic.Bool
+	upstreamDropped  atomic.Bool
 
 	fwdMu    sync.Mutex
 	forwards map[string]forwardEntry
@@ -82,13 +83,16 @@ func (m *MuxSocket) Serve(
 	runErr := conc.RunScoped(serveCtx, func(sCtx context.Context, watchN *conc.Nursery) error {
 		watcherStop := make(chan struct{})
 		defer close(watcherStop)
-		if err := spawnUpstreamWatcher(sCtx, watchN, upstream, watcherStop, cancelServe); err != nil {
+		if err := spawnUpstreamWatcher(sCtx, watchN, upstream, watcherStop, &st.upstreamDropped, cancelServe); err != nil {
 			return err
 		}
 		return st.serveClients(sCtx, ln)
 	})
 	if st.stoppedByControl.Load() && ctx.Err() == nil {
 		return nil
+	}
+	if st.upstreamDropped.Load() && ctx.Err() == nil {
+		return ports.ErrClosed
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -115,15 +119,21 @@ func (st *muxServerState) serveClients(
 	})
 }
 
-func spawnUpstreamWatcher(ctx context.Context, n *conc.Nursery, upstream ports.TransportConn, watcherStop <-chan struct{}, cancelServe context.CancelFunc) error {
+func spawnUpstreamWatcher(ctx context.Context, n *conc.Nursery, upstream ports.TransportConn, watcherStop <-chan struct{}, dropped *atomic.Bool, cancelServe context.CancelFunc) error {
 	wp, ok := upstream.(waitDoneProvider)
 	if !ok {
 		return nil
 	}
 	done := wp.WaitDone()
+	if done == nil {
+		return nil
+	}
 	return n.Go(func(wCtx context.Context) error {
 		select {
 		case <-done:
+			if dropped != nil {
+				dropped.Store(true)
+			}
 			cancelServe()
 		case <-watcherStop:
 		case <-wCtx.Done():

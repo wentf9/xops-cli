@@ -784,3 +784,113 @@ func (f *cancelingForwarder) StartForward(ctx context.Context, transport ports.T
 	}
 	return h, err
 }
+
+type failingForwardHandle struct {
+	spec      ports.ForwardSpec
+	boundAddr string
+	doneCh    chan struct{}
+	closeOnce sync.Once
+	err       atomic.Value
+}
+
+func (h *failingForwardHandle) IsValid() bool {
+	select {
+	case <-h.doneCh:
+		return false
+	default:
+		return true
+	}
+}
+func (h *failingForwardHandle) Spec() ports.ForwardSpec { return h.spec }
+func (h *failingForwardHandle) BoundAddr() string       { return h.boundAddr }
+func (h *failingForwardHandle) Done() <-chan struct{}   { return h.doneCh }
+func (h *failingForwardHandle) Err() error {
+	if v := h.err.Load(); v != nil {
+		if err, ok := v.(error); ok {
+			return err
+		}
+	}
+	return nil
+}
+func (h *failingForwardHandle) Close() error {
+	h.closeOnce.Do(func() { close(h.doneCh) })
+	return nil
+}
+func (h *failingForwardHandle) fail(err error) {
+	if err != nil {
+		h.err.Store(err)
+	}
+	h.closeOnce.Do(func() { close(h.doneCh) })
+}
+
+type failingForwarder struct {
+	last *failingForwardHandle
+}
+
+func (f *failingForwarder) StartForward(_ context.Context, _ ports.TunnelTransport, spec ports.ForwardSpec) (ports.ForwardHandle, error) {
+	h := &failingForwardHandle{spec: spec, boundAddr: spec.BindAddr(), doneCh: make(chan struct{})}
+	f.last = h
+	return h, nil
+}
+
+// TestForwardInfo_DoneAndWaitAllTerminationPaths 验证 #160 Major-2：
+//   - 零值 ForwardInfo 失败关闭（Done()==nil、Wait 返回 ErrInvalidRequest / ErrNilContext）；
+//   - 正常 StopForward 后 Done() 关闭且 Wait(ctx) 返回 nil；
+//   - 等待期取消调用方 ctx 立即返回 context.Canceled 且转发保持活跃；
+//   - 上游/底层转发故障关闭时 Done() 关闭且 Wait(ctx) 传播终态错误。
+func TestForwardInfo_DoneAndWaitAllTerminationPaths(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+
+	// 1. 零值失败关闭。
+	var zeroInfo ucsess.ForwardInfo
+	if zeroInfo.Done() != nil {
+		t.Fatal("零值 ForwardInfo.Done() 必须返回 nil")
+	}
+	if err := zeroInfo.Wait(ctx); !errors.Is(err, ucsess.ErrInvalidRequest) || !errors.Is(err, ports.ErrInvalidArgument) {
+		t.Fatalf("零值 ForwardInfo.Wait 期望 ErrInvalidRequest/ErrInvalidArgument，实际=%v", err)
+	}
+	var nilCtx context.Context
+	if err := zeroInfo.Wait(nilCtx); !errors.Is(err, ucsess.ErrNilContext) || !errors.Is(err, ports.ErrNilContext) {
+		t.Fatalf("nil ctx Wait 期望 ErrNilContext，实际=%v", err)
+	}
+
+	// 2. 正常 StopForward 与等待期 ctx 取消。
+	rig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator})
+	defer rig.close()
+	spec, _ := ports.NewForwardSpec(ports.ForwardLocal, "127.0.0.1:18901", "10.0.0.5:80")
+	info, err := rig.svc.StartForward(ctx, ucsess.StartForwardRequest{Plan: mustTestPlan(t, ""), Spec: spec})
+	if err != nil {
+		t.Fatalf("StartForward: %v", err)
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := info.Wait(cancelCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消 ctx Wait 期望 context.Canceled，实际=%v", err)
+	}
+	if err := rig.svc.StopForward(ctx, info.Handle()); err != nil {
+		t.Fatalf("StopForward: %v", err)
+	}
+	<-info.Done()
+	if err := info.Wait(ctx); err != nil {
+		t.Fatalf("正常 StopForward 后 Wait(ctx) 期望 nil，实际=%v", err)
+	}
+	assertTeardownClean(t, rig, "ForwardWaitStop")
+
+	// 3. 底层转发故障退出：Done() 关闭且 Wait(ctx) 精确返回故障错误。
+	dropErr := errors.New("forward upstream broken")
+	ff := &failingForwarder{}
+	dRig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator, customForwarder: ff})
+	defer dRig.close()
+	dInfo, err := dRig.svc.StartForward(ctx, ucsess.StartForwardRequest{Plan: mustTestPlan(t, ""), Spec: spec})
+	if err != nil {
+		t.Fatalf("StartForward(fail): %v", err)
+	}
+	ff.last.fail(dropErr)
+	<-dInfo.Done()
+	if err := dInfo.Wait(ctx); !errors.Is(err, dropErr) {
+		t.Fatalf("转发故障终止后 Wait(ctx) 期望 %v，实际=%v", dropErr, err)
+	}
+	_ = dRig.svc.StopForward(ctx, dInfo.Handle())
+	assertTeardownClean(t, dRig, "ForwardWaitDrop")
+}

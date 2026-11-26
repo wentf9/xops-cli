@@ -26,6 +26,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
+	"github.com/wentf9/xops-cli/core/internal/pool"
 	"github.com/wentf9/xops-cli/core/internal/sim"
 	ucsess "github.com/wentf9/xops-cli/core/internal/usecase/session"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -823,4 +824,167 @@ func waitUntilErr(t *testing.T, cond func() (bool, error)) {
 		}
 		runtime.Gosched()
 	}
+}
+
+type failingServeMuxSocket struct {
+	inner     *sim.SimMuxSocket
+	triggerCh chan struct{}
+	serveErr  error
+}
+
+func (f *failingServeMuxSocket) Probe(ctx context.Context, p pathalg.LocalSourcePath) (ports.MuxControlResponse, error) {
+	return f.inner.Probe(ctx, p)
+}
+func (f *failingServeMuxSocket) Control(ctx context.Context, req ports.MuxControlRequest) (ports.MuxControlResponse, error) {
+	return f.inner.Control(ctx, req)
+}
+func (f *failingServeMuxSocket) DialMux(ctx context.Context, p pathalg.LocalSourcePath, d plan.HopDigest, ep netaddr.Endpoint) (ports.TransportConn, error) {
+	return f.inner.DialMux(ctx, p, d, ep)
+}
+func (f *failingServeMuxSocket) OpenProxy(ctx context.Context, p pathalg.LocalSourcePath) (net.Conn, error) {
+	return f.inner.OpenProxy(ctx, p)
+}
+
+//xops:syncclosure
+//xops:borrowed
+func (f *failingServeMuxSocket) WithListener(ctx context.Context, p pathalg.LocalSourcePath, fn func(ln net.Listener) error) error {
+	return f.inner.WithListener(ctx, p, func(ln net.Listener) error { return fn(ln) })
+}
+func (f *failingServeMuxSocket) Serve(ctx context.Context, _ net.Listener, _ ports.TransportConn, _ ports.ForwarderPort) error {
+	select {
+	case <-f.triggerCh:
+		return f.serveErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// TestControlMasterInfo_DoneAndWaitAllTerminationPaths 验证 #160 Major-2：
+//   - 零值 ControlMasterInfo 失败关闭（Done()==nil、Wait 返回 ErrInvalidRequest / ErrNilContext）；
+//   - reusedExisting==true 时 Done() 已关闭且 Wait(ctx) 返回 nil / ctx.Err()；
+//   - 正常 -O exit 与 ControlPersist 空闲到期映射为 nil（且 runAutoRelease 回收句柄后仍稳定返回）；
+//   - 上游/Serve 传输故障在句柄自动回收后仍被 Wait(ctx) 精确保留透传；
+//   - 等待期取消调用方 ctx 立即返回 context.Canceled 且不中断主进程。
+func TestControlMasterInfo_DoneAndWaitAllTerminationPaths(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+
+	// 1. 零值失败关闭。
+	var zeroInfo ucsess.ControlMasterInfo
+	if zeroInfo.Done() != nil {
+		t.Fatal("零值 ControlMasterInfo.Done() 必须返回 nil")
+	}
+	if err := zeroInfo.Wait(ctx); !errors.Is(err, ucsess.ErrInvalidRequest) || !errors.Is(err, ports.ErrInvalidArgument) {
+		t.Fatalf("零值 ControlMasterInfo.Wait 期望 ErrInvalidRequest/ErrInvalidArgument，实际=%v", err)
+	}
+	var nilCtx context.Context
+	if err := zeroInfo.Wait(nilCtx); !errors.Is(err, ucsess.ErrNilContext) || !errors.Is(err, ports.ErrNilContext) {
+		t.Fatalf("nil ctx Wait 期望 ErrNilContext，实际=%v", err)
+	}
+
+	assertMuxInfoWaitNormalExitAndReuse(t, ctx)
+	assertMuxInfoWaitPersistAndUpstreamDrop(t, ctx)
+}
+
+func assertMuxInfoWaitNormalExitAndReuse(t *testing.T, ctx context.Context) {
+	t.Helper()
+	rig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator})
+	defer rig.close()
+	cpPath, _ := option.ParseControlPath("/tmp/wait-exit.sock")
+	pl := mustPlanWithControl(t, option.UnsetControlPolicy().WithPath(cpPath).WithMaster(option.ControlMasterYes), false)
+
+	info, err := rig.svc.StartControlMaster(ctx, ucsess.ControlMasterRequest{Plan: pl})
+	if err != nil {
+		t.Fatalf("StartControlMaster: %v", err)
+	}
+	// 等待期取消调用方 ctx 立即返回 context.Canceled，主进程仍存活。
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := info.Wait(cancelCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("取消 ctx Wait 期望 context.Canceled，实际=%v", err)
+	}
+	// 复用已有主进程：Done() 已关闭且 Wait(ctx) 返回 nil。
+	autoPl := mustPlanWithControl(t, option.UnsetControlPolicy().WithPath(cpPath).WithMaster(option.ControlMasterAuto), false)
+	reused, err := rig.svc.StartControlMaster(ctx, ucsess.ControlMasterRequest{Plan: autoPl})
+	if err != nil || !reused.ReusedExisting() {
+		t.Fatalf("复用主进程失败: reused=%+v err=%v", reused, err)
+	}
+	select {
+	case <-reused.Done():
+	default:
+		t.Fatal("reusedExisting ControlMasterInfo.Done() 必须已关闭")
+	}
+	if err := reused.Wait(ctx); err != nil {
+		t.Fatalf("reusedExisting Wait 期望 nil，实际=%v", err)
+	}
+
+	// 发送 -O exit 正常退出：等待句柄被 runAutoRelease 自动清理后再调用 Wait(ctx)，须仍返回 nil。
+	if _, err := rig.svc.ControlMux(ctx, ucsess.MuxControlRequest{Target: ucsess.MuxRequest{Plan: pl}, Action: ports.MuxActionExit}); err != nil {
+		t.Fatalf("ControlMux(exit): %v", err)
+	}
+	<-info.Done()
+	h, _ := info.Handle().Get()
+	waitUntilErr(t, func() (bool, error) {
+		_, iErr := rig.svc.InspectControlMaster(ctx, h)
+		if errors.Is(iErr, pool.ErrHandleNotFound) {
+			return true, nil
+		}
+		if iErr == nil || errors.Is(iErr, pool.ErrInvalidResource) || errors.Is(iErr, pool.ErrHandleRevoked) {
+			return false, nil
+		}
+		return false, iErr
+	})
+	if err := info.Wait(ctx); err != nil {
+		t.Fatalf("-O exit 后 Wait(ctx) 期望 nil，实际=%v", err)
+	}
+}
+
+func assertMuxInfoWaitPersistAndUpstreamDrop(t *testing.T, ctx context.Context) {
+	t.Helper()
+	// 1. ControlPersist 空闲到期：Wait(ctx) 映射 ErrMuxPersistExpired 为 nil。
+	pRig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator})
+	defer pRig.close()
+	cpPersist, _ := option.ParseControlPath("/tmp/wait-persist.sock")
+	persist5, _ := option.ParseControlPersist("5s")
+	plPersist := mustPlanWithControl(t, option.UnsetControlPolicy().WithPath(cpPersist).WithMaster(option.ControlMasterYes).WithPersist(persist5), false)
+	pInfo, err := pRig.svc.StartControlMaster(ctx, ucsess.ControlMasterRequest{Plan: plPersist})
+	if err != nil {
+		t.Fatalf("StartControlMaster(persist): %v", err)
+	}
+	waitUntil(t, func() bool { return pRig.clk.PendingTimers() > 0 })
+	pRig.clk.Advance(6 * time.Second)
+	<-pInfo.Done()
+	if err := pInfo.Wait(ctx); err != nil {
+		t.Fatalf("ControlPersist 到期后 Wait(ctx) 期望 nil，实际=%v", err)
+	}
+	assertTeardownClean(t, pRig, "MuxWaitPersist")
+
+	// 2. 上游断连/Serve 故障：runAutoRelease 清理句柄后 Wait(ctx) 仍必须精确返回传输错误。
+	dropErr := errors.New("upstream ssh dropped")
+	failMux := &failingServeMuxSocket{inner: sim.NewSimMuxSocket(nil), triggerCh: make(chan struct{}), serveErr: dropErr}
+	dRig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator, customMux: failMux})
+	defer dRig.close()
+	cpDrop, _ := option.ParseControlPath("/tmp/wait-drop.sock")
+	plDrop := mustPlanWithControl(t, option.UnsetControlPolicy().WithPath(cpDrop).WithMaster(option.ControlMasterYes), false)
+	dInfo, err := dRig.svc.StartControlMaster(ctx, ucsess.ControlMasterRequest{Plan: plDrop})
+	if err != nil {
+		t.Fatalf("StartControlMaster(drop): %v", err)
+	}
+	close(failMux.triggerCh)
+	<-dInfo.Done()
+	dh, _ := dInfo.Handle().Get()
+	waitUntilErr(t, func() (bool, error) {
+		_, iErr := dRig.svc.InspectControlMaster(ctx, dh)
+		if errors.Is(iErr, pool.ErrHandleNotFound) {
+			return true, nil
+		}
+		if iErr == nil || errors.Is(iErr, pool.ErrInvalidResource) || errors.Is(iErr, pool.ErrHandleRevoked) {
+			return false, nil
+		}
+		return false, iErr
+	})
+	if err := dInfo.Wait(ctx); !errors.Is(err, dropErr) {
+		t.Fatalf("上游断连且句柄自动回收后 Wait(ctx) 期望保留 %v，实际=%v", dropErr, err)
+	}
+	assertTeardownClean(t, dRig, "MuxWaitDrop")
 }

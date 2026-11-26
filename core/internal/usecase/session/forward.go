@@ -37,10 +37,12 @@ type ForwardInfo struct {
 	handle    plan.ManagedHandle[plan.KindTunnel]
 	spec      ports.ForwardSpec
 	boundAddr string
+	doneCh    <-chan struct{}
+	waitErr   func() error
 	valid     bool
 }
 
-// ForwardInfo 零值安全只读访问器。
+// ForwardInfo 零值安全只读访问器与响应式停机等待方法（供 entry/cli -N 前台隧道零轮询阻塞等待）。
 func (i ForwardInfo) IsValid() bool {
 	return i.valid && i.handle.IsValid() && i.spec.IsValid() && i.boundAddr != ""
 }
@@ -52,6 +54,36 @@ func (i ForwardInfo) Handle() plan.ManagedHandle[plan.KindTunnel] {
 		return zeroVal[plan.ManagedHandle[plan.KindTunnel]]()
 	}
 	return i.handle
+}
+
+// Done 返回只读完成信号通道：受管转发终止并释放本地监听/资源后关闭；零值/无效返回 nil。
+func (i ForwardInfo) Done() <-chan struct{} {
+	if !i.IsValid() {
+		return nil
+	}
+	return i.doneCh
+}
+
+// Wait 阻塞等待受管转发终止或 ctx 取消，并在终止后返回终态传输错误（正常 StopForward 停止返回 nil，零值严格失败关闭）。
+func (i ForwardInfo) Wait(ctx context.Context) error {
+	if ctx == nil {
+		return fmt.Errorf("%w: %w", ErrNilContext, ports.ErrNilContext)
+	}
+	if !i.IsValid() || i.doneCh == nil {
+		return fmt.Errorf("%w: %w: ForwardInfo 无效", ErrInvalidRequest, ports.ErrInvalidArgument)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-i.doneCh:
+		if i.waitErr != nil {
+			return i.waitErr()
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // ForwardStatus 表示受管隧道转发句柄的不可变只读状态快照；零值恒无效并失败关闭。
@@ -121,6 +153,11 @@ func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn 
 		select {
 		case <-wCtx.Done():
 		case <-fh.Done():
+			if fErr := fh.Err(); fErr != nil {
+				mf.err.record(fErr)
+			} else if !mf.conn.IsAlive() {
+				mf.err.record(ports.ErrClosed)
+			}
 		}
 		return nil
 	})
@@ -253,19 +290,19 @@ func (s *Service) StartForward(ctx context.Context, req StartForwardRequest) (Fo
 	if err != nil {
 		return ForwardInfo{}, err
 	}
-	var bound string
+	var mfRef *managedForward
 	h, err := registerAuthorizedHandle[security.CapTunnel, plan.KindTunnel](ctx, s, req.Plan, nodeID, "forward_start", gateReq, req.OperationStream,
 		func(leaseCtx, revokeCtx context.Context, conn ports.TransportConn) (*managedForward, error) {
 			mf, sErr := s.startManagedForward(leaseCtx, revokeCtx, conn, req.Spec)
 			if sErr == nil {
-				bound = mf.boundAddr
+				mfRef = mf
 			}
 			return mf, sErr
 		})
 	if err != nil {
 		return ForwardInfo{}, err
 	}
-	return ForwardInfo{handle: h, spec: req.Spec, boundAddr: bound, valid: true}, nil
+	return ForwardInfo{handle: h, spec: req.Spec, boundAddr: mfRef.boundAddr, doneCh: mfRef.doneCh, waitErr: mfRef.Err, valid: true}, nil
 }
 func (s *Service) validateStartForwardCall(ctx context.Context, req StartForwardRequest) error {
 	if err := s.validateBaseCall(ctx, req.Plan, RequestTTYUnset, req.Risk); err != nil {
