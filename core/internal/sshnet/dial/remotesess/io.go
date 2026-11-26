@@ -1,4 +1,4 @@
-package dial
+package remotesess
 
 import (
 	"context"
@@ -53,7 +53,7 @@ type outputPumpTarget struct {
 	src io.Reader
 }
 
-func (s *remoteSession) startIOPumps(
+func (s *Session) startIOPumps(
 	streams ports.ExecStreams,
 	maxOutputBytes uint64,
 	stdinSrc io.Reader,
@@ -66,7 +66,7 @@ func (s *remoteSession) startIOPumps(
 	return s.startStdinPump(stdinSrc, closeEmptyStdin, inTaken)
 }
 
-func (s *remoteSession) collectOutputPumpTargets(streams ports.ExecStreams, outTaken, errTaken bool) []outputPumpTarget {
+func (s *Session) collectOutputPumpTargets(streams ports.ExecStreams, outTaken, errTaken bool) []outputPumpTarget {
 	var targets []outputPumpTarget
 	if !outTaken {
 		targets = append(targets, outputPumpTarget{dst: streams.Stdout, src: s.stdoutPipe})
@@ -77,7 +77,7 @@ func (s *remoteSession) collectOutputPumpTargets(streams ports.ExecStreams, outT
 	return targets
 }
 
-func (s *remoteSession) startOutputPumps(targets []outputPumpTarget, maxOutputBytes uint64) error {
+func (s *Session) startOutputPumps(targets []outputPumpTarget, maxOutputBytes uint64) error {
 	if len(targets) == 0 {
 		return nil
 	}
@@ -102,7 +102,7 @@ func (s *remoteSession) startOutputPumps(targets []outputPumpTarget, maxOutputBy
 	return nil
 }
 
-func (s *remoteSession) spawnOutputPump(
+func (s *Session) spawnOutputPump(
 	dst io.Writer,
 	src io.Reader,
 	maxBytes uint64,
@@ -112,7 +112,7 @@ func (s *remoteSession) spawnOutputPump(
 	if dst == nil {
 		dst = io.Discard
 	}
-	if err := s.conn.lifeNursery.Go(func(context.Context) error {
+	if err := s.lifeNursery.Go(func(context.Context) error {
 		err := copyBoundedOutput(dst, src, maxBytes, budget, &s.truncated, &s.outMu, &s.discardOutput)
 		finishOne(err)
 		return nil
@@ -123,7 +123,7 @@ func (s *remoteSession) spawnOutputPump(
 	return nil
 }
 
-func (s *remoteSession) startStdinPump(stdinSrc io.Reader, closeEmptyStdin, inTaken bool) error {
+func (s *Session) startStdinPump(stdinSrc io.Reader, closeEmptyStdin, inTaken bool) error {
 	if inTaken {
 		return nil
 	}
@@ -137,7 +137,7 @@ func (s *remoteSession) startStdinPump(stdinSrc io.Reader, closeEmptyStdin, inTa
 	s.mu.Lock()
 	s.stdinCancel = cancel
 	s.mu.Unlock()
-	if err := s.conn.lifeNursery.Go(func(context.Context) error {
+	if err := s.lifeNursery.Go(func(context.Context) error {
 		defer cancel()
 		return copyStdinToPipe(inCtx, s.stdinPipe, stdinSrc)
 	}); err != nil {
@@ -147,7 +147,7 @@ func (s *remoteSession) startStdinPump(stdinSrc io.Reader, closeEmptyStdin, inTa
 	return nil
 }
 
-func (s *remoteSession) recordIOErr(err error) {
+func (s *Session) recordIOErr(err error) {
 	if err == nil {
 		return
 	}
@@ -158,19 +158,19 @@ func (s *remoteSession) recordIOErr(err error) {
 	s.ioErrMu.Unlock()
 }
 
-func (s *remoteSession) firstIOErr() error {
+func (s *Session) firstIOErr() error {
 	s.ioErrMu.Lock()
 	defer s.ioErrMu.Unlock()
 	return s.ioErr
 }
 
-func (s *remoteSession) markDiscardOutput() {
+func (s *Session) markDiscardOutput() {
 	s.outMu.Lock()
 	s.discardOutput = true
 	s.outMu.Unlock()
 }
 
-func (s *remoteSession) cancelStdin() {
+func (s *Session) cancelStdin() {
 	s.mu.Lock()
 	cancel := s.stdinCancel
 	s.mu.Unlock()
@@ -179,7 +179,7 @@ func (s *remoteSession) cancelStdin() {
 	}
 }
 
-func (s *remoteSession) currentPumpsDone() <-chan struct{} {
+func (s *Session) currentPumpsDone() <-chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.pumpsDone

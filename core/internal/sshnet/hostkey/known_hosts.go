@@ -3,9 +3,6 @@ package hostkey
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
-	"crypto/sha256"
-	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -51,13 +48,17 @@ func (db *KnownHostsDB) VerifyHostKey(ctx context.Context, req ports.HostTrustRe
 	}
 	spec := db.evaluateHostTrust(req, entries)
 	if spec.Status == ports.HostTrustUnknown && !isHostCertificateAlgorithm(req.Presented().Algorithm()) && db.sshfpLookup != nil {
-		matched, sErr := db.verifyViaSSHFP(ctx, req.Endpoint().Host(), req.Presented())
+		verdict, sErr := db.verifyViaSSHFP(ctx, req.Endpoint().Host(), req.Presented())
 		if sErr != nil {
 			return zero, sErr
 		}
-		if matched {
+		switch verdict {
+		case sshfpMatched:
 			spec.Status = ports.HostTrustTrusted
 			spec.Reason = "verified via DNSSEC-authenticated SSHFP"
+		case sshfpMismatch:
+			spec.Status = ports.HostTrustMismatch
+			spec.Reason = "presented host key conflicts with DNSSEC-authenticated SSHFP"
 		}
 	}
 	return ports.NewHostTrustCheck(spec)
@@ -386,46 +387,4 @@ func appendKnownHostsLine(existing []byte, record string) []byte {
 	buf.WriteString(record)
 	buf.WriteByte('\n')
 	return buf.Bytes()
-}
-
-// verifyViaSSHFP 校验 DNSSEC 认证通过（Authenticated==true）的 SSHFP 记录；未认证记录一律拒绝（Fail-Closed）。
-func (db *KnownHostsDB) verifyViaSSHFP(ctx context.Context, host netaddr.CanonicalHost, key ports.PublicKeyInfo) (bool, error) {
-	algoNum, ok := sshfpAlgorithmNumber(key.Algorithm())
-	if !ok {
-		return false, nil
-	}
-	recs, err := db.sshfpLookup.LookupSSHFP(ctx, host)
-	if err != nil {
-		return false, err
-	}
-	blob := key.WireBlob()
-	sum1 := sha1.Sum(blob)
-	sum256 := sha256.Sum256(blob)
-	for _, r := range recs {
-		if !r.IsValid() || !r.Authenticated() || r.Algorithm() != algoNum {
-			continue
-		}
-		if r.FingerprintType() == 2 && subtle.ConstantTimeCompare(r.Digest(), sum256[:]) == 1 {
-			return true, nil
-		}
-		if r.FingerprintType() == 1 && subtle.ConstantTimeCompare(r.Digest(), sum1[:]) == 1 {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func sshfpAlgorithmNumber(algo string) (uint8, bool) {
-	switch algo {
-	case "ssh-rsa":
-		return 1, true
-	case "ssh-dss":
-		return 2, true
-	case "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521":
-		return 3, true
-	case "ssh-ed25519":
-		return 4, true
-	default:
-		return 0, false
-	}
 }

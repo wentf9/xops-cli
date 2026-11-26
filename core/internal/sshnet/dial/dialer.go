@@ -7,18 +7,17 @@ import (
 	"net"
 	"slices"
 	"strings"
-	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
 
-	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/plan"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
 // DialHop 按不可变 HopSpec 与 Merkle HopDigest 建立单跳或多跳（经 parent.DialTCP 隧道）SSH 传输连接。
-// 所有底层拨号与 SSH 握手均受 core/conc.RunScoped 取消/超时看门狗监督，多跳通道自动封装为 watchedChannelConn。
+// 所有底层拨号与 SSH 握手均受 core/conc.RunScoped 取消/超时看门狗监督，多跳通道自动封装为 chanconn.WatchedConn。
 func (d *Dialer) DialHop(ctx context.Context, hop plan.HopSpec, hopDigest plan.HopDigest, parent ports.TransportConn) (ports.TransportConn, error) {
 	if err := d.checkDialArgs(ctx, hop, hopDigest, parent); err != nil {
 		return nil, err
@@ -276,46 +275,6 @@ func scanProxyQuote(raw string, start int) (string, int, error) {
 	return "", 0, fmt.Errorf("存在未闭合引号")
 }
 
-// runWithAbortWatchdog 在 core/conc.RunScoped 监督下执行阻塞操作 op：
-// 一旦 ctx 取消或超时且 op 尚未完成，看门狗协程立即调用 onAbort（通常关闭底层连接或 ssh.Channel）
-// 解除阻塞；op 正常完成时先原子置位 completed 再关闭 doneCh，杜绝 select 随机竞态误伤健康连接。
-//
-//xops:syncclosure
-func runWithAbortWatchdog(ctx context.Context, onAbort func(), op func() error) error {
-	if ctx == nil {
-		return ports.ErrNilContext
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	var completed atomic.Bool
-	doneCh := make(chan struct{})
-	var opErr error
-	scopeErr := conc.RunScoped(ctx, func(_ context.Context, n *conc.Nursery) error {
-		if gErr := n.Go(func(wCtx context.Context) error {
-			select {
-			case <-doneCh:
-				return nil
-			case <-wCtx.Done():
-				if !completed.Load() && onAbort != nil {
-					onAbort()
-				}
-				return nil
-			}
-		}); gErr != nil {
-			return gErr
-		}
-		opErr = op()
-		completed.Store(true)
-		close(doneCh)
-		return nil
-	})
-	if opErr != nil {
-		return opErr
-	}
-	return scopeErr
-}
-
 // performSSHHandshake 在 core/conc.RunScoped 取消看门狗保护下执行 ssh.NewClientConn，
 // 确保即使底层是无原生 SetDeadline 的 ssh.Channel 连接，取消或超时也能立即关闭 rawConn 解阻。
 func performSSHHandshake(ctx context.Context, rawConn net.Conn, addr string, cfg *ssh.ClientConfig) (ssh.Conn, <-chan ssh.NewChannel, <-chan *ssh.Request, error) {
@@ -323,7 +282,7 @@ func performSSHHandshake(ctx context.Context, rawConn net.Conn, addr string, cfg
 	var chans <-chan ssh.NewChannel
 	var reqs <-chan *ssh.Request
 	var hsErr error
-	err := runWithAbortWatchdog(ctx, func() { _ = rawConn.Close() }, func() error {
+	err := chanconn.RunWithAbortWatchdog(ctx, func() { _ = rawConn.Close() }, func() error {
 		sshConn, chans, reqs, hsErr = ssh.NewClientConn(rawConn, addr, cfg)
 		return nil
 	})

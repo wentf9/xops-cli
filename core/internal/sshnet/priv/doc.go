@@ -1,0 +1,66 @@
+// Package priv 实现 XOps v2 的远端提权执行适配器（ports.PrivilegeEscalationPort，P4-T1）。
+//
+// 核心安全、协议与并发不变量：
+//   - 随机化 `-p` 提权提示令牌与提权就绪帧（ready token）分离认证输入与命令输入：
+//     口令仅在识别到合法提示帧后写入已验证的 (ports.RemoteSession).StdinPipe，普通 stdin 与脚本正文
+//     在就绪帧抵达前绝不投递，防止口令混入命令流或命令输入误充口令；
+//   - 完整兼容 POSIX sudo（含 sudo-rs 的 `[sudo: <token>] ...:` 封套、全角冒号与 `*` 回显抑制）、
+//     su 与 doas，支持 NonInteractive（-n）失败关闭；
+//   - 隶属 LayerCoreSSHNetPriv 明文白名单，严格复用 secrettaint/sinks_narrow.go:isAllowedPrivEscalationWrite
+//     正向白名单，并支持双层嵌套 primaryBox.Use -> secondaryBox.Use 组合口令写入（全包零行内 nolint 豁免）；
+//   - *secret.SecretBox 仅在调用方同步协程内消费（零跨协程借用逃逸），全部输出/输入泵均由
+//     core/conc.Nursery 监督（0 裸 go，0 协程泄漏）。
+package priv
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/wentf9/xops-cli/core/ports"
+)
+
+const (
+	defaultHandshakeTimeout = 30 * time.Second
+	maxDiagBufferBytes      = 4096
+	copyChunkBytes          = 32 * 1024
+	nonceRawBytes           = 16
+	maxPromptSignals        = 4
+)
+
+// Config 描述 Escalator 的显式运行期出站依赖配置（零全局单例与隐式状态）。
+type Config struct {
+	// Entropy 可选注入显式随机字节源用于生成随机 -p 提示令牌与就绪帧；为空时回退 crypto/rand.Reader。
+	Entropy ports.Entropy
+	// Clock 可选注入时钟端口用于控制提权握手超时定时器；为空时回退系统时钟。
+	Clock ports.Clock
+	// HandshakeTimeout 可选覆盖等待提权认证完成的最长超时时长（<= 0 时默认 30s）。
+	HandshakeTimeout time.Duration
+}
+
+// Escalator 是基于随机化提示/就绪帧握手协议的 ports.PrivilegeEscalationPort 生产实现；零值恒失败关闭。
+//
+//xops:opaque
+//xops:failclosed
+type Escalator struct {
+	entropy          ports.Entropy
+	clock            ports.Clock
+	handshakeTimeout time.Duration
+	valid            bool
+}
+
+// NewEscalator 校验配置并构造不可变 Escalator 实例。
+func NewEscalator(cfg Config) (*Escalator, error) {
+	if cfg.HandshakeTimeout < 0 {
+		return nil, fmt.Errorf("%w: HandshakeTimeout 不能为负", ports.ErrInvalidArgument)
+	}
+	hsTimeout := cfg.HandshakeTimeout
+	if hsTimeout == 0 {
+		hsTimeout = defaultHandshakeTimeout
+	}
+	return &Escalator{
+		entropy:          cfg.Entropy,
+		clock:            cfg.Clock,
+		handshakeTimeout: hsTimeout,
+		valid:            true,
+	}, nil
+}

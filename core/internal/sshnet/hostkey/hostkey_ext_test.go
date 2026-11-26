@@ -286,6 +286,56 @@ func TestKnownHostsDB_SymlinkRejectedAndDisabledListAndSSHFP(t *testing.T) {
 	if err := db.RecordHostKey(ctx, ep, key, option.DisabledKnownHostsList()); err != nil {
 		t.Fatalf("DisabledKnownHostsList RecordHostKey 应静默成功，实际 %v", err)
 	}
+
+	// 3. DNSSEC SSHFP 冲突、算法降级、SHA-1 兜底与 IP 字面量跳过（Fail-Closed）。
+	assertSSHFPFailClosedCases(t, ctx, db, sshfp, ep, key, disabledReq, authRec)
+}
+
+func assertSSHFPFailClosedCases(
+	t *testing.T,
+	ctx context.Context,
+	db *hostkey.KnownHostsDB,
+	sshfp *sim.SimSSHFPLookup,
+	ep netaddr.Endpoint,
+	key ports.PublicKeyInfo,
+	disabledReq ports.HostTrustRequest,
+	authRec ports.SSHFPRecord,
+) {
+	t.Helper()
+	wrongKey := makeRealBlobKey(t, "ssh-ed25519", []byte{9, 9, 9, 9}, "")
+	reqWrong, _ := ports.NewHostTrustRequest(ports.HostTrustRequestSpec{
+		Endpoint: ep, Presented: wrongKey, Mode: option.StrictHostKeyCheckingAcceptNew, KnownHosts: option.DisabledKnownHostsList(),
+	})
+	if chk, err := db.VerifyHostKey(ctx, reqWrong); err != nil || chk.Status() != ports.HostTrustMismatch {
+		t.Fatalf("DNSSEC SSHFP 指纹冲突须返回 HostTrustMismatch，实际 status=%s err=%v", chk.Status(), err)
+	}
+	rsaKey := makeRealBlobKey(t, "ssh-rsa", []byte{5, 6, 7, 8}, "")
+	reqDowngrade, _ := ports.NewHostTrustRequest(ports.HostTrustRequestSpec{
+		Endpoint: ep, Presented: rsaKey, Mode: option.StrictHostKeyCheckingAcceptNew, KnownHosts: option.DisabledKnownHostsList(),
+	})
+	if chk, err := db.VerifyHostKey(ctx, reqDowngrade); err != nil || chk.Status() != ports.HostTrustMismatch {
+		t.Fatalf("DNSSEC SSHFP 算法降级须返回 HostTrustMismatch，实际 status=%s err=%v", chk.Status(), err)
+	}
+	sum1 := sha1.Sum(key.WireBlob())
+	authSHA1, _ := ports.NewSSHFPRecord(ports.SSHFPRecordSpec{Algorithm: 4, FingerprintType: 1, Digest: sum1[:], Authenticated: true})
+	sshfp.SetRecords(ep.Host(), authSHA1)
+	if chk, err := db.VerifyHostKey(ctx, disabledReq); err != nil || chk.Status() != ports.HostTrustTrusted {
+		t.Fatalf("仅存在已认证 SHA-1 SSHFP 应匹配，实际 status=%s err=%v", chk.Status(), err)
+	}
+	wrongSum256 := sha256.Sum256(wrongKey.WireBlob())
+	badSHA256, _ := ports.NewSSHFPRecord(ports.SSHFPRecordSpec{Algorithm: 4, FingerprintType: 2, Digest: wrongSum256[:], Authenticated: true})
+	sshfp.SetRecords(ep.Host(), authSHA1, badSHA256)
+	if chk, err := db.VerifyHostKey(ctx, disabledReq); err != nil || chk.Status() != ports.HostTrustMismatch {
+		t.Fatalf("已认证 SHA-256 冲突不得被 SHA-1 绕过，实际 status=%s err=%v", chk.Status(), err)
+	}
+	epIP := tck.MustEndpoint(t, "198.51.100.77", 22)
+	sshfp.SetRecords(epIP.Host(), authRec)
+	reqIP, _ := ports.NewHostTrustRequest(ports.HostTrustRequestSpec{
+		Endpoint: epIP, Presented: key, Mode: option.StrictHostKeyCheckingYes, KnownHosts: option.DisabledKnownHostsList(),
+	})
+	if chk, err := db.VerifyHostKey(ctx, reqIP); err != nil || chk.Status() != ports.HostTrustUnknown {
+		t.Fatalf("IP 字面量不得使用 DNS SSHFP，实际 status=%s err=%v", chk.Status(), err)
+	}
 }
 
 func TestKnownHostsDB_ConcurrentRecordAndSidecarLockCleanup(t *testing.T) {

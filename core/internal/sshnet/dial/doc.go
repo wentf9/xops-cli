@@ -1,13 +1,15 @@
 // Package dial 实现 XOps v2 基于 golang.org/x/crypto/ssh 的真实 SSH 拨号、传输连接与会话适配器
-// （ports.DialerPort / ports.TransportConn / ports.RemoteSession，ADR-009 / ADR-015）。
+// （ports.DialerPort / ports.TransportConn / ports.RemoteSession / ports.KeySignerPort，ADR-009 / ADR-015）。
 //
 // 核心安全与并发不变量：
 //   - 全包 0 裸 go 语句，所有异步看门狗与数据面流泵均受 core/conc.Nursery（RunScoped/NewNursery）监督；
-//   - 所有基于 ssh.Channel（无原生 SetDeadline）的多跳连接均封装为 watchedChannelConn，
-//     在取消或截止时间到期时经 RunScoped 看门狗立即关闭通道唤醒阻塞读写（ADR-015）；
-//   - 严禁给 ssh.Session.Stdin 赋值（规避 x/crypto/ssh 孤儿拷贝协程泄漏），统一经 StdinPipe/StdoutPipe/StderrPipe 接线；
+//   - 所有基于 ssh.Channel（无原生 SetDeadline）的多跳连接均封装为 chanconn.WatchedConn，
+//     在取消或截止时间到期时经看门狗立即关闭通道唤醒阻塞读写（ADR-015）；
+//   - 严禁给 ssh.Session.Stdin 赋值（规避 x/crypto/ssh 孤儿拷贝协程泄漏），统一由 remotesess.Session 预绑定管道；
 //   - 严禁使用 ssh.InsecureIgnoreHostKey，所有服务端主机密钥均经 ports.HostTrustPort 强制核验；
-//   - 全部明文凭据均通过 SecretVault.WithSecret + box.Use 或 secret.WithBytes 同步消费，全包零 nolint 豁免。
+//   - 全部明文凭据均通过 SecretVault.WithSecret + box.Use 或 secret.WithBytes 同步消费，全包零 nolint 豁免；
+//   - 面向 Wave 2（sshnet/{sftp,forward,mux}）在 TransportConn 上暴露受 lifeNursery 监督的通道与子系统原语
+//     （OpenChannel / OpenWatchedChannel / OpenSubsystem / SendGlobalRequest / WaitDone / OpenRemoteFS）。
 package dial
 
 import (
@@ -18,16 +20,16 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/keysigner"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
 const (
 	defaultClientVersion          = "SSH-2.0-XOps-2.0"
-	maxPrivateKeyFileBytes  int64 = 1 << 20 // 本地私钥文件读取上限（1 MiB）
-	maxCertFileBytes        int64 = 1 << 20 // 本地证书文件读取上限（1 MiB）
-	sessionCopyBufferBytes        = 32 * 1024
 	defaultTOTPDigits             = 6
 	defaultTOTPPeriodSecond int64 = 30
+	maxKIChallengeRounds          = 16
+	maxKIQuestionsPerRound        = 32
 )
 
 // DialContextFunc 定义底层流传输拨号函数签名（为空时默认使用 (&net.Dialer{}).DialContext）。
@@ -36,6 +38,18 @@ type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, 
 
 // RemoteFSFactory 为 Phase 4（P4-T2 sshnet/sftp）预留的 SFTP 客户端构造注入点。
 type RemoteFSFactory func(ctx context.Context, client *ssh.Client) (ports.RemoteFSPort, error)
+
+// KeySignerConfig 与 KeySigner 为 core/internal/sshnet/dial/keysigner 的便捷别名，
+// 供上层装配与测试在不直接感知子包路径时统一构造 ports.KeySignerPort。
+type (
+	KeySignerConfig = keysigner.Config
+	KeySigner       = keysigner.KeySigner
+)
+
+// NewKeySigner 构造基于 OperatorReadFS / SecretVault / SSHAgentPort 的真实 ports.KeySignerPort 适配器。
+func NewKeySigner(cfg KeySignerConfig) (*KeySigner, error) {
+	return keysigner.NewKeySigner(cfg)
+}
 
 // Config 描述 Dialer 的显式出站依赖配置（全依赖注入，零全局单例与隐式环境变量）。
 type Config struct {

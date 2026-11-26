@@ -1,4 +1,4 @@
-package dial
+package chanconn
 
 import (
 	"bytes"
@@ -13,27 +13,14 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-const (
-	maxChannelCopyChunk      = 32 * 1024
-	channelCloseGraceTimeout = 5 * time.Millisecond
-)
-
-// channelAddr 为基于 ssh.Channel 的虚拟 net.Conn 提供轻量级 net.Addr 表示。
-type channelAddr struct {
-	network string
-	address string
-}
-
-func (a channelAddr) Network() string { return a.network }
-func (a channelAddr) String() string  { return a.address }
-
-// watchedChannelConn 将不原生支持 SetDeadline 的 ssh.Channel 封装为带强制取消/截止时间看门狗的 net.Conn（ADR-015）。
+// WatchedConn 将不原生支持 SetDeadline 的 ssh.Channel 封装为带强制取消/截止时间看门狗的 net.Conn（ADR-015）。
 //
 // 生命周期与半开黑洞防挂死不变量：
-//   - 所有带外排空、O(1) 截止看门狗与脱离的 Read/Write 均受上游 owner.lifeNursery 统一托管，零裸 go；
+//   - 所有带外排空、O(1) 截止看门狗与脱离的 Read/Write 均受上游 lifeNursery 统一托管，零裸 go；
 //   - 仅当具体方向存在活跃 I/O 且该方向当前截止时间确已到期时才中止通道，清除/延长截止或空闲态永不误杀；
 //   - 脱离的 Read 读入内部独立缓冲、Write 拷贝内部切片，通道中止返回后绝不触碰调用方切片（-race 安全）；
 //   - 对端进入半开黑洞（不回传 SSH_MSG_CHANNEL_CLOSE）时，abortCh 立即唤醒 Read/Write 与上层握手，
@@ -41,12 +28,12 @@ func (a channelAddr) String() string  { return a.address }
 //
 //xops:opaque
 //xops:failclosed
-type watchedChannelConn struct {
-	owner      *TransportConn
-	ch         ssh.Channel
-	localAddr  net.Addr
-	remoteAddr net.Addr
-	clock      ports.Clock
+type WatchedConn struct {
+	lifeNursery *conc.Nursery
+	ch          ssh.Channel
+	localAddr   net.Addr
+	remoteAddr  net.Addr
+	clock       ports.Clock
 
 	abortCh      chan struct{}
 	abortOnce    sync.Once
@@ -66,22 +53,22 @@ type watchedChannelConn struct {
 	valid         bool
 }
 
-// newWatchedChannelConn 创建受 owner.lifeNursery 监督的 ssh.Channel 包装器并启动带外排空与 O(1) 截止看门狗。
-func newWatchedChannelConn(
-	owner *TransportConn,
+// WrapChannel 创建受 lifeNursery 监督的 ssh.Channel 包装器并启动带外排空与 O(1) 截止看门狗。
+func WrapChannel(
+	lifeNursery *conc.Nursery,
 	ch ssh.Channel,
 	reqs <-chan *ssh.Request,
 	localAddr, remoteAddr net.Addr,
 	clk ports.Clock,
-) (*watchedChannelConn, error) {
-	if owner == nil || !owner.valid || ch == nil {
+) (*WatchedConn, error) {
+	if lifeNursery == nil || ch == nil {
 		if ch != nil {
 			_ = ch.Close()
 		}
 		return nil, ports.ErrClosed
 	}
-	wc := &watchedChannelConn{
-		owner:        owner,
+	wc := &WatchedConn{
+		lifeNursery:  lifeNursery,
 		ch:           ch,
 		localAddr:    localAddr,
 		remoteAddr:   remoteAddr,
@@ -100,8 +87,8 @@ func newWatchedChannelConn(
 	return wc, nil
 }
 
-func (c *watchedChannelConn) startBackgroundWorkers(reqs <-chan *ssh.Request) error {
-	if err := c.owner.lifeNursery.Go(func(nCtx context.Context) error {
+func (c *WatchedConn) startBackgroundWorkers(reqs <-chan *ssh.Request) error {
+	if err := c.lifeNursery.Go(func(nCtx context.Context) error {
 		defer close(c.watcherDone)
 		return c.runDeadlineWatcher(nCtx)
 	}); err != nil {
@@ -120,7 +107,7 @@ func (c *watchedChannelConn) startBackgroundWorkers(reqs <-chan *ssh.Request) er
 		}
 	}
 	if reqs != nil {
-		if err := c.owner.lifeNursery.Go(func(context.Context) error {
+		if err := c.lifeNursery.Go(func(context.Context) error {
 			defer doneOne()
 			ssh.DiscardRequests(reqs)
 			return nil
@@ -130,7 +117,7 @@ func (c *watchedChannelConn) startBackgroundWorkers(reqs <-chan *ssh.Request) er
 			return ports.ErrClosed
 		}
 	}
-	if err := c.owner.lifeNursery.Go(func(context.Context) error {
+	if err := c.lifeNursery.Go(func(context.Context) error {
 		defer doneOne()
 		_, _ = io.Copy(io.Discard, c.ch.Stderr())
 		return nil
@@ -141,36 +128,36 @@ func (c *watchedChannelConn) startBackgroundWorkers(reqs <-chan *ssh.Request) er
 	return nil
 }
 
-func (c *watchedChannelConn) now() time.Time {
+func (c *WatchedConn) now() time.Time {
 	if c.clock != nil {
 		return c.clock.Now()
 	}
 	return time.Now()
 }
 
-func (c *watchedChannelConn) signalAbort(dueToDeadline bool) {
+func (c *WatchedConn) signalAbort(dueToDeadline bool) {
 	if dueToDeadline {
 		c.deadlineHit.Store(true)
 	}
 	c.abortOnce.Do(func() { close(c.abortCh) })
 }
 
-func (c *watchedChannelConn) abortForDeadline() {
+func (c *WatchedConn) abortForDeadline() {
 	c.signalAbort(true)
-	_ = c.owner.lifeNursery.Go(func(context.Context) error {
+	_ = c.lifeNursery.Go(func(context.Context) error {
 		_ = c.ch.Close()
 		return nil
 	})
 }
 
-func (c *watchedChannelConn) notifyDeadlineWatcher() {
+func (c *WatchedConn) notifyDeadlineWatcher() {
 	select {
 	case c.wakeCh <- struct{}{}:
 	default:
 	}
 }
 
-func (c *watchedChannelConn) runDeadlineWatcher(nurseryCtx context.Context) error {
+func (c *WatchedConn) runDeadlineWatcher(nurseryCtx context.Context) error {
 	for {
 		waitDur, expired := c.nextActiveDeadlineWait()
 		if expired {
@@ -193,7 +180,7 @@ func (c *watchedChannelConn) runDeadlineWatcher(nurseryCtx context.Context) erro
 	}
 }
 
-func (c *watchedChannelConn) nextActiveDeadlineWait() (time.Duration, bool) {
+func (c *WatchedConn) nextActiveDeadlineWait() (time.Duration, bool) {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -218,7 +205,7 @@ func (c *watchedChannelConn) nextActiveDeadlineWait() (time.Duration, bool) {
 	return earliest.Sub(now), false
 }
 
-func (c *watchedChannelConn) waitDeadlineOrWake(nurseryCtx context.Context, d time.Duration) bool {
+func (c *WatchedConn) waitDeadlineOrWake(nurseryCtx context.Context, d time.Duration) bool {
 	if c.clock != nil {
 		tm := c.clock.NewTimer(d)
 		defer tm.Stop()
@@ -253,7 +240,7 @@ type channelIOResult struct {
 }
 
 // Read 从底层 ssh.Channel 读取字节；受 O(1) 读截止看门狗与半开黑洞即时解阻保护。
-func (c *watchedChannelConn) Read(p []byte) (int, error) {
+func (c *WatchedConn) Read(p []byte) (int, error) {
 	if err := c.checkReadyForIO(true); err != nil {
 		return 0, err
 	}
@@ -266,7 +253,7 @@ func (c *watchedChannelConn) Read(p []byte) (int, error) {
 }
 
 // Write 向底层 ssh.Channel 分块写入字节；受 O(1) 写截止看门狗与半开黑洞即时解阻保护。
-func (c *watchedChannelConn) Write(p []byte) (int, error) {
+func (c *WatchedConn) Write(p []byte) (int, error) {
 	if err := c.checkReadyForIO(false); err != nil {
 		return 0, err
 	}
@@ -277,7 +264,7 @@ func (c *watchedChannelConn) Write(p []byte) (int, error) {
 	defer c.leaveIO(false)
 	total := 0
 	for total < len(p) {
-		end := min(total+maxChannelCopyChunk, len(p))
+		end := min(total+MaxCopyChunk, len(p))
 		n, err := c.runDetachedWrite(bytes.Clone(p[total:end]))
 		total += n
 		if err != nil {
@@ -287,7 +274,7 @@ func (c *watchedChannelConn) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-func (c *watchedChannelConn) checkReadyForIO(isRead bool) error {
+func (c *WatchedConn) checkReadyForIO(isRead bool) error {
 	if c == nil || !c.valid {
 		return ports.ErrClosed
 	}
@@ -310,7 +297,7 @@ func (c *watchedChannelConn) checkReadyForIO(isRead bool) error {
 	return nil
 }
 
-func (c *watchedChannelConn) enterIO(isRead bool) {
+func (c *WatchedConn) enterIO(isRead bool) {
 	c.mu.Lock()
 	if isRead {
 		c.activeReads++
@@ -321,7 +308,7 @@ func (c *watchedChannelConn) enterIO(isRead bool) {
 	c.notifyDeadlineWatcher()
 }
 
-func (c *watchedChannelConn) leaveIO(isRead bool) {
+func (c *WatchedConn) leaveIO(isRead bool) {
 	c.mu.Lock()
 	if isRead {
 		c.activeReads--
@@ -332,12 +319,12 @@ func (c *watchedChannelConn) leaveIO(isRead bool) {
 	c.notifyDeadlineWatcher()
 }
 
-func (c *watchedChannelConn) runDetachedRead(p []byte) (int, error) {
-	buf := make([]byte, min(len(p), maxChannelCopyChunk))
+func (c *WatchedConn) runDetachedRead(p []byte) (int, error) {
+	buf := make([]byte, min(len(p), MaxCopyChunk))
 	resCh := make(chan channelIOResult, 1)
 	var opMu sync.Mutex
 	abandoned := false
-	if err := c.owner.lifeNursery.Go(func(context.Context) error {
+	if err := c.lifeNursery.Go(func(context.Context) error {
 		n, err := c.ch.Read(buf)
 		opMu.Lock()
 		if !abandoned {
@@ -362,11 +349,11 @@ func (c *watchedChannelConn) runDetachedRead(p []byte) (int, error) {
 	}
 }
 
-func (c *watchedChannelConn) runDetachedWrite(chunk []byte) (int, error) {
+func (c *WatchedConn) runDetachedWrite(chunk []byte) (int, error) {
 	resCh := make(chan channelIOResult, 1)
 	var opMu sync.Mutex
 	abandoned := false
-	if err := c.owner.lifeNursery.Go(func(context.Context) error {
+	if err := c.lifeNursery.Go(func(context.Context) error {
 		n, err := c.ch.Write(chunk)
 		opMu.Lock()
 		if !abandoned {
@@ -388,14 +375,14 @@ func (c *watchedChannelConn) runDetachedWrite(chunk []byte) (int, error) {
 	}
 }
 
-func (c *watchedChannelConn) abortedErr() error {
+func (c *WatchedConn) abortedErr() error {
 	if c.deadlineHit.Load() {
 		return os.ErrDeadlineExceeded
 	}
 	return net.ErrClosed
 }
 
-func (c *watchedChannelConn) mapIOErr(ioErr error) error {
+func (c *WatchedConn) mapIOErr(ioErr error) error {
 	if ioErr == nil {
 		return nil
 	}
@@ -406,7 +393,7 @@ func (c *watchedChannelConn) mapIOErr(ioErr error) error {
 }
 
 // Close 幂等关闭底层 ssh.Channel、立即唤醒阻塞读写与 O(1) 看门狗，并在有界宽限内收敛带外排空。
-func (c *watchedChannelConn) Close() error {
+func (c *WatchedConn) Close() error {
 	if c == nil || !c.valid {
 		return nil
 	}
@@ -418,31 +405,28 @@ func (c *watchedChannelConn) Close() error {
 			chErr = nil
 		}
 		<-c.watcherDone
-		waitBounded(c.drainersDone, channelCloseGraceTimeout)
+		WaitBounded(c.drainersDone, CloseGraceTimeout)
 		c.closeErr = chErr
 	})
 	return c.closeErr
 }
 
-func waitBounded(done <-chan struct{}, grace time.Duration) {
-	select {
-	case <-done:
-		return
-	default:
+// CloseWrite 半关闭底层 ssh.Channel 的写方向（发送 SSH_MSG_CHANNEL_EOF），供 SFTP/透传子系统使用。
+func (c *WatchedConn) CloseWrite() error {
+	if c == nil || !c.valid || c.closed.Load() {
+		return net.ErrClosed
 	}
-	tm := time.NewTimer(grace)
-	defer tm.Stop()
-	select {
-	case <-done:
-	case <-tm.C:
-	}
+	return c.ch.CloseWrite()
 }
 
-func (c *watchedChannelConn) LocalAddr() net.Addr  { return c.localAddr }
-func (c *watchedChannelConn) RemoteAddr() net.Addr { return c.remoteAddr }
+// LocalAddr 返回虚拟通道本端地址。
+func (c *WatchedConn) LocalAddr() net.Addr { return c.localAddr }
+
+// RemoteAddr 返回虚拟通道远端地址。
+func (c *WatchedConn) RemoteAddr() net.Addr { return c.remoteAddr }
 
 // SetDeadline 原子更新读写截止时间并通知 O(1) 看门狗；无活跃 I/O 时绝不提前销毁通道。
-func (c *watchedChannelConn) SetDeadline(t time.Time) error {
+func (c *WatchedConn) SetDeadline(t time.Time) error {
 	if c == nil || !c.valid || c.closed.Load() {
 		return ports.ErrClosed
 	}
@@ -455,7 +439,7 @@ func (c *watchedChannelConn) SetDeadline(t time.Time) error {
 }
 
 // SetReadDeadline 原子更新读截止时间并通知 O(1) 看门狗；清除或延长截止时立即取消旧到期判断。
-func (c *watchedChannelConn) SetReadDeadline(t time.Time) error {
+func (c *WatchedConn) SetReadDeadline(t time.Time) error {
 	if c == nil || !c.valid || c.closed.Load() {
 		return ports.ErrClosed
 	}
@@ -467,7 +451,7 @@ func (c *watchedChannelConn) SetReadDeadline(t time.Time) error {
 }
 
 // SetWriteDeadline 原子更新写截止时间并通知 O(1) 看门狗；清除或延长截止时立即取消旧到期判断。
-func (c *watchedChannelConn) SetWriteDeadline(t time.Time) error {
+func (c *WatchedConn) SetWriteDeadline(t time.Time) error {
 	if c == nil || !c.valid || c.closed.Load() {
 		return ports.ErrClosed
 	}

@@ -2,7 +2,6 @@ package dial
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"net"
 	"slices"
@@ -14,31 +13,9 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/keysigner"
 	"github.com/wentf9/xops-cli/core/ports"
 )
-
-// publicKeyInfoFromSSH 将 golang.org/x/crypto/ssh.PublicKey 转换为协议库无关的不可变 ports.PublicKeyInfo。
-func publicKeyInfoFromSSH(key ssh.PublicKey) (ports.PublicKeyInfo, error) {
-	if key == nil {
-		var zero ports.PublicKeyInfo
-		return zero, fmt.Errorf("%w: 服务端未呈递有效主机公钥", ports.ErrInvalidArgument)
-	}
-	blob := key.Marshal()
-	fp := inventory.KeyFingerprintFromSHA256(sha256.Sum256(blob))
-	return ports.NewPublicKeyInfo(ports.PublicKeyInfoSpec{
-		Algorithm:   key.Type(),
-		Fingerprint: fp,
-		WireBlob:    blob,
-	})
-}
-
-func fingerprintOfSSHKey(key ssh.PublicKey) inventory.KeyFingerprint {
-	if key == nil {
-		var zero inventory.KeyFingerprint
-		return zero
-	}
-	return inventory.KeyFingerprintFromSHA256(sha256.Sum256(key.Marshal()))
-}
 
 // buildHostKeyCallback 构造严格经 ports.HostTrustPort 裁决的 ssh.HostKeyCallback（绝不使用 InsecureIgnoreHostKey）。
 func (d *Dialer) buildHostKeyCallback(ctx context.Context, hop plan.HopSpec) ssh.HostKeyCallback {
@@ -47,7 +24,7 @@ func (d *Dialer) buildHostKeyCallback(ctx context.Context, hop plan.HopSpec) ssh
 	knownHosts := tp.UserKnownHostsFiles()
 	ep := hop.Endpoint()
 	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
-		pubInfo, err := publicKeyInfoFromSSH(key)
+		pubInfo, err := keysigner.PublicKeyInfoFromSSH(key)
 		if err != nil {
 			return err
 		}

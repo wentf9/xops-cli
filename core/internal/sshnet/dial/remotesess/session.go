@@ -1,4 +1,4 @@
-package dial
+package remotesess
 
 import (
 	"context"
@@ -14,23 +14,23 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-// remoteSession 封装单条 *ssh.Session，实现 ports.RemoteSession。
-// 严格在构造期预绑定 StdinPipe/StdoutPipe/StderrPipe（绝不给 ssh.Session.Stdin/Stdout/Stderr 赋值），
-// 所有 env/pty-req/exec/shell、输入/输出泵与 Wait 均受上游 TransportConn.lifeNursery 统一监督，
-// 既防半开黑洞对端下取消挂死，又保证父连接 Close() 回收 100% 协程（零孤儿协程）。
+// Session 封装单条 *ssh.Session，实现 ports.RemoteSession；零值恒失败关闭。
 //
 //xops:opaque
 //xops:failclosed
-type remoteSession struct {
-	conn       *TransportConn
-	sshSess    *ssh.Session
-	stdinPipe  io.WriteCloser
-	stdoutPipe io.Reader
-	stderrPipe io.Reader
+type Session struct {
+	lifeNursery *conc.Nursery
+	isAlive     func() bool
+	sshSess     *ssh.Session
+	stdinPipe   io.WriteCloser
+	stdoutPipe  io.Reader
+	stderrPipe  io.Reader
 
 	mu              sync.Mutex
 	stdinPipeTaken  bool
@@ -53,7 +53,14 @@ type remoteSession struct {
 	valid     bool
 }
 
-func newRemoteSession(conn *TransportConn, sshSess *ssh.Session) (*remoteSession, error) {
+// New 预绑定 StdinPipe / StdoutPipe / StderrPipe 并构造受 lifeNursery 监督的 Session。
+func New(lifeNursery *conc.Nursery, isAlive func() bool, sshSess *ssh.Session) (*Session, error) {
+	if lifeNursery == nil || isAlive == nil || sshSess == nil {
+		if sshSess != nil {
+			_ = sshSess.Close()
+		}
+		return nil, ports.ErrClosed
+	}
 	inPipe, err := sshSess.StdinPipe()
 	if err != nil {
 		_ = sshSess.Close()
@@ -71,19 +78,20 @@ func newRemoteSession(conn *TransportConn, sshSess *ssh.Session) (*remoteSession
 	}
 	done := make(chan struct{})
 	close(done)
-	return &remoteSession{
-		conn:       conn,
-		sshSess:    sshSess,
-		stdinPipe:  &idempotentStdinPipe{w: inPipe},
-		stdoutPipe: outPipe,
-		stderrPipe: errPipe,
-		pumpsDone:  done,
-		valid:      true,
+	return &Session{
+		lifeNursery: lifeNursery,
+		isAlive:     isAlive,
+		sshSess:     sshSess,
+		stdinPipe:   &idempotentStdinPipe{w: inPipe},
+		stdoutPipe:  outPipe,
+		stderrPipe:  errPipe,
+		pumpsDone:   done,
+		valid:       true,
 	}, nil
 }
 
 // StdinPipe 在 Start/StartShell 前借出远端标准输入写入管道（与非空 ExecStreams.Stdin 及 PlanKindScript 互斥）。
-func (s *remoteSession) StdinPipe() (io.WriteCloser, error) {
+func (s *Session) StdinPipe() (io.WriteCloser, error) {
 	if err := s.claimPipe(&s.stdinPipeTaken); err != nil {
 		return nil, err
 	}
@@ -91,7 +99,7 @@ func (s *remoteSession) StdinPipe() (io.WriteCloser, error) {
 }
 
 // StdoutPipe 在 Start/StartShell 前借出远端标准输出读取管道（与非空 ExecStreams.Stdout 互斥）。
-func (s *remoteSession) StdoutPipe() (io.Reader, error) {
+func (s *Session) StdoutPipe() (io.Reader, error) {
 	if err := s.claimPipe(&s.stdoutPipeTaken); err != nil {
 		return nil, err
 	}
@@ -99,14 +107,14 @@ func (s *remoteSession) StdoutPipe() (io.Reader, error) {
 }
 
 // StderrPipe 在 Start/StartShell 前借出远端标准错误读取管道（与非空 ExecStreams.Stderr 互斥）。
-func (s *remoteSession) StderrPipe() (io.Reader, error) {
+func (s *Session) StderrPipe() (io.Reader, error) {
 	if err := s.claimPipe(&s.stderrPipeTaken); err != nil {
 		return nil, err
 	}
 	return s.stderrPipe, nil
 }
 
-func (s *remoteSession) claimPipe(taken *bool) error {
+func (s *Session) claimPipe(taken *bool) error {
 	if s == nil || !s.valid {
 		return ports.ErrClosed
 	}
@@ -123,7 +131,7 @@ func (s *remoteSession) claimPipe(taken *bool) error {
 }
 
 // Start 在远端会话通道上渲染并启动不可变 CommandPlan（含可选 PTY、环境变量、脚本 stdin 投递与输出上限截断）。
-func (s *remoteSession) Start(ctx context.Context, cmd execution.CommandPlan, streams ports.ExecStreams) error {
+func (s *Session) Start(ctx context.Context, cmd execution.CommandPlan, streams ports.ExecStreams) error {
 	if err := checkSessionStartArgs(ctx, streams); err != nil {
 		return err
 	}
@@ -141,7 +149,7 @@ func (s *remoteSession) Start(ctx context.Context, cmd execution.CommandPlan, st
 }
 
 // StartShell 在远端会话通道上启动交互式 Shell（可选 PTY 与环境变量统一由 streams 承载）。
-func (s *remoteSession) StartShell(ctx context.Context, streams ports.ExecStreams) error {
+func (s *Session) StartShell(ctx context.Context, streams ports.ExecStreams) error {
 	if err := checkSessionStartArgs(ctx, streams); err != nil {
 		return err
 	}
@@ -163,7 +171,7 @@ func checkSessionStartArgs(ctx context.Context, streams ports.ExecStreams) error
 	return nil
 }
 
-func (s *remoteSession) launchSession(
+func (s *Session) launchSession(
 	ctx context.Context,
 	streams ports.ExecStreams,
 	maxOutputBytes uint64,
@@ -175,7 +183,7 @@ func (s *remoteSession) launchSession(
 	if err != nil {
 		return err
 	}
-	_, startErr := runMultiplexedOp(ctx, s.conn, func() (struct{}, error) {
+	_, startErr := chanconn.RunMultiplexedOp(ctx, s.lifeNursery, func() (struct{}, error) {
 		if eErr := s.applyEnvAndPTY(ctx, streams); eErr != nil {
 			return struct{}{}, eErr
 		}
@@ -195,13 +203,13 @@ func (s *remoteSession) launchSession(
 	return nil
 }
 
-func (s *remoteSession) beginStart(streams ports.ExecStreams, hasStdinSrc bool) (inTaken, outTaken, errTaken bool, err error) {
+func (s *Session) beginStart(streams ports.ExecStreams, hasStdinSrc bool) (inTaken, outTaken, errTaken bool, err error) {
 	if s == nil || !s.valid {
 		return false, false, false, ports.ErrClosed
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed.Load() || !s.conn.IsAlive() {
+	if s.closed.Load() || !s.isAlive() {
 		return false, false, false, ports.ErrClosed
 	}
 	if s.starting || s.started.Load() {
@@ -219,7 +227,7 @@ type setenvPayload struct {
 	Value string
 }
 
-func (s *remoteSession) applyEnvAndPTY(ctx context.Context, streams ports.ExecStreams) error {
+func (s *Session) applyEnvAndPTY(ctx context.Context, streams ports.ExecStreams) error {
 	if len(streams.Env) > 0 {
 		for _, k := range slices.Sorted(maps.Keys(streams.Env)) {
 			if err := ctx.Err(); err != nil {
@@ -249,7 +257,7 @@ func defaultPTYModes() ssh.TerminalModes {
 }
 
 // ResizePTY 向远端会话发送 RFC 4254 window-change 窗口尺寸更新请求。
-func (s *remoteSession) ResizePTY(ctx context.Context, size ports.TerminalSize) error {
+func (s *Session) ResizePTY(ctx context.Context, size ports.TerminalSize) error {
 	if ctx == nil {
 		return ports.ErrNilContext
 	}
@@ -266,7 +274,7 @@ func (s *remoteSession) ResizePTY(ctx context.Context, size ports.TerminalSize) 
 }
 
 // Signal 向远端进程发送规范化 POSIX 信号（如 "INT"、"TERM"、"KILL"，兼容可选 "SIG" 前缀）。
-func (s *remoteSession) Signal(ctx context.Context, signal string) error {
+func (s *Session) Signal(ctx context.Context, signal string) error {
 	if ctx == nil {
 		return ports.ErrNilContext
 	}
@@ -285,7 +293,7 @@ func (s *remoteSession) Signal(ctx context.Context, signal string) error {
 
 // Wait 在上游连接 lifeNursery 监督下等待远端进程退出、排空输出泵并映射为封闭 execution.ExecutionOutcome。
 // 对端进入半开黑洞且 ctx 取消/超时时立即返回 OutcomeUnknown 与 ctx.Err()，绝不永久挂起。
-func (s *remoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome, error) {
+func (s *Session) Wait(ctx context.Context) (execution.ExecutionOutcome, error) {
 	if ctx == nil {
 		return nil, ports.ErrNilContext
 	}
@@ -299,7 +307,7 @@ func (s *remoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome, e
 		s.abortWaitOnCancel()
 		return s.buildWaitOutcome(ctx, err, nil)
 	}
-	_, waitErr := runMultiplexedOp(ctx, s.conn, func() (struct{}, error) {
+	_, waitErr := chanconn.RunMultiplexedOp(ctx, s.lifeNursery, func() (struct{}, error) {
 		return struct{}{}, s.sshSess.Wait()
 	}, nil)
 	if ctx.Err() != nil {
@@ -316,13 +324,13 @@ func (s *remoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome, e
 	return s.buildWaitOutcome(ctx, waitErr, s.firstIOErr())
 }
 
-func (s *remoteSession) abortWaitOnCancel() {
+func (s *Session) abortWaitOnCancel() {
 	s.markDiscardOutput()
 	s.cancelStdin()
 	_ = s.sshSess.Close()
 }
 
-func (s *remoteSession) buildWaitOutcome(ctx context.Context, waitErr, ioErr error) (execution.ExecutionOutcome, error) {
+func (s *Session) buildWaitOutcome(ctx context.Context, waitErr, ioErr error) (execution.ExecutionOutcome, error) {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		phase := execution.ExecPhaseCanceled
 		if errors.Is(ctxErr, context.DeadlineExceeded) {
@@ -371,7 +379,7 @@ func buildExitErrorOutcome(exitErr *ssh.ExitError, truncated bool) (execution.Ex
 }
 
 // Close 幂等关闭远端会话通道、停用本地输出写入并在有界宽限内收敛输出排空（零泄漏）。
-func (s *remoteSession) Close() error {
+func (s *Session) Close() error {
 	if s == nil || !s.valid {
 		return nil
 	}
@@ -383,7 +391,7 @@ func (s *remoteSession) Close() error {
 		if errors.Is(sessErr, io.EOF) || errors.Is(sessErr, net.ErrClosed) {
 			sessErr = nil
 		}
-		waitBounded(s.currentPumpsDone(), channelCloseGraceTimeout)
+		chanconn.WaitBounded(s.currentPumpsDone(), chanconn.CloseGraceTimeout)
 		s.closeErr = sessErr
 	})
 	return s.closeErr

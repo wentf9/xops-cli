@@ -37,9 +37,11 @@ type loopbackSSHSpec struct {
 	kiQuestions    []string
 	kiEchos        []bool
 	kiExpected     []string
+	kiRounds       []kiRoundSpec
 	forwardTargets map[string]*loopbackSSHSpec
 	stallTargets   map[string]bool
 	echoTargets    map[string]bool
+	subsystems     map[string]bool
 	hangStarted    chan struct{}
 	stallEntered   chan struct{}
 	hangEnv        bool
@@ -54,6 +56,13 @@ type loopbackSSHSpec struct {
 	activeServerCon []net.Conn
 }
 
+type kiRoundSpec struct {
+	instruction string
+	questions   []string
+	echos       []bool
+	expected    []string
+}
+
 func newLoopbackSSHSpec(t *testing.T) (*loopbackSSHSpec, ports.PublicKeyInfo) {
 	t.Helper()
 	signer, _, _, pubInfo := generateTestEd25519Key(t, "")
@@ -62,6 +71,7 @@ func newLoopbackSSHSpec(t *testing.T) (*loopbackSSHSpec, ports.PublicKeyInfo) {
 		forwardTargets: make(map[string]*loopbackSSHSpec),
 		stallTargets:   make(map[string]bool),
 		echoTargets:    make(map[string]bool),
+		subsystems:     make(map[string]bool),
 		seenEnv:        make(map[string]string),
 	}, pubInfo
 }
@@ -140,7 +150,7 @@ func (s *loopbackSSHSpec) buildServerConfig() *ssh.ServerConfig {
 	if len(s.authorizedPubs) > 0 || s.trustedUserCA != nil {
 		cfg.PublicKeyCallback = s.verifyClientPublicKey
 	}
-	if len(s.kiQuestions) > 0 {
+	if len(s.kiQuestions) > 0 || len(s.kiRounds) > 0 {
 		cfg.KeyboardInteractiveCallback = s.handleKeyboardInteractive
 	}
 	cfg.AddHostKey(s.hostSigner)
@@ -168,16 +178,27 @@ func (s *loopbackSSHSpec) verifyClientPublicKey(meta ssh.ConnMetadata, key ssh.P
 }
 
 func (s *loopbackSSHSpec) handleKeyboardInteractive(_ ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
-	answers, err := client("xops-test", s.kiInstruction, s.kiQuestions, s.kiEchos)
-	if err != nil {
-		return nil, err
+	rounds := s.kiRounds
+	if len(rounds) == 0 {
+		rounds = []kiRoundSpec{{
+			instruction: s.kiInstruction,
+			questions:   s.kiQuestions,
+			echos:       s.kiEchos,
+			expected:    s.kiExpected,
+		}}
 	}
-	if len(answers) != len(s.kiExpected) {
-		return nil, errors.New("wrong answer count")
-	}
-	for i := range s.kiExpected {
-		if answers[i] != s.kiExpected[i] {
-			return nil, fmt.Errorf("answer %d mismatch", i)
+	for ri, r := range rounds {
+		answers, err := client("xops-test", r.instruction, r.questions, r.echos)
+		if err != nil {
+			return nil, err
+		}
+		if len(answers) != len(r.expected) {
+			return nil, fmt.Errorf("round %d wrong answer count", ri)
+		}
+		for i := range r.expected {
+			if answers[i] != r.expected[i] {
+				return nil, fmt.Errorf("round %d answer %d mismatch", ri, i)
+			}
 		}
 	}
 	return &ssh.Permissions{}, nil
@@ -375,6 +396,15 @@ func (s *loopbackSSHSpec) dispatchSessionRequest(n *conc.Nursery, ch ssh.Channel
 	case "shell":
 		replyOK(req, true)
 		_ = n.Go(func(context.Context) error { runStubShell(ch); return nil })
+	case "subsystem":
+		var p struct{ Name string }
+		_ = ssh.Unmarshal(req.Payload, &p)
+		if s.subsystems[p.Name] {
+			replyOK(req, true)
+			_ = n.Go(func(context.Context) error { runStubShell(ch); return nil })
+			return
+		}
+		replyOK(req, false)
 	default:
 		replyOK(req, false)
 	}
