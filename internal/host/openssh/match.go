@@ -82,28 +82,30 @@ func (s *ConfigSource) evaluateDocument(doc *parsedFile, target option.OriginalH
 		localUser: localUser,
 		layer:     option.UnsetOptionLayer(),
 	}
-	if err := ec.evalFile(doc, true, false); err != nil {
+	if err := ec.evalFile(doc, true, false, false); err != nil {
 		return option.UnsetOptionLayer(), err
 	}
 	if doc != nil && doc.hasFinal {
-		if err := ec.evalFile(doc, true, true); err != nil {
+		if err := ec.evalFile(doc, true, true, false); err != nil {
 			return option.UnsetOptionLayer(), err
 		}
 	}
 	return ec.layer, nil
 }
 
-func (ec *evalContext) evalFile(doc *parsedFile, parentActive, passFinal bool) error {
+func (ec *evalContext) evalFile(doc *parsedFile, parentActive, passFinal, inFinalBlock bool) error {
 	if doc == nil {
 		return nil
 	}
 	// Pass 2 仅对 Match final 块生效，顶层无条件指令已在 Pass 1 折叠，不得重复应用；
-	// 顶层无条件 Include 仍须在 Pass 2 下钻，以确保被包含文件中的 Match final 块按遭遇序折叠。
-	inHeader := parentActive
-	active := parentActive && !passFinal
+	// 位于 Match final 块内的 Include（inFinalBlock==true）其顶层指令属于该 final 块，须在 Pass 2 生效；
+	// 位于顶层或匹配 Host/Match 块内的 Include 须按 blockMatched 下钻，确保被包含文件中的 Match final 按遭遇序折叠。
+	blockMatched := parentActive
+	applyDirectives := parentActive && (!passFinal || inFinalBlock)
+	blockIsFinal := inFinalBlock
 	for _, stmt := range doc.stmts {
 		var err error
-		inHeader, active, err = ec.evalStmt(stmt, parentActive, inHeader, active, passFinal)
+		blockMatched, applyDirectives, blockIsFinal, err = ec.evalStmt(stmt, parentActive, blockMatched, applyDirectives, blockIsFinal, passFinal)
 		if err != nil {
 			return err
 		}
@@ -111,41 +113,53 @@ func (ec *evalContext) evalFile(doc *parsedFile, parentActive, passFinal bool) e
 	return nil
 }
 
-func (ec *evalContext) evalStmt(stmt configStmt, parentActive, inHeader, active, passFinal bool) (bool, bool, error) {
+func (ec *evalContext) evalStmt(stmt configStmt, parentActive, blockMatched, applyDirectives, blockIsFinal, passFinal bool) (bool, bool, bool, error) {
 	switch stmt.kind {
 	case stmtHost:
+		// OpenSSH Pass 1 按原始别名匹配 Host；Pass 2（SSHCONF_FINAL）按当前有效主机名匹配，
+		// 因此 HostName 改写后的条件 Include 是否进入 Pass 2 与真实 ssh -G 保持一致。
+		candidate := ec.target.String()
 		if passFinal {
-			return false, false, nil
+			candidate = ec.currentEffectiveHost()
 		}
-		return false, parentActive && matchHostPatternList(ec.target.String(), stmt.patterns), nil
+		matched := parentActive && matchHostPatternList(candidate, stmt.patterns)
+		return matched, matched && !passFinal, false, nil
 	case stmtMatch:
-		return false, ec.evalMatchStmt(stmt, parentActive, passFinal), nil
+		matched, apply, isFinal := ec.evalMatchStmt(stmt, parentActive, passFinal)
+		return matched, apply, isFinal, nil
 	case stmtInclude:
-		shouldDescend := active || (passFinal && inHeader)
-		if !shouldDescend {
-			return inHeader, active, nil
+		if !blockMatched {
+			return blockMatched, applyDirectives, blockIsFinal, nil
 		}
 		for _, child := range stmt.included {
-			if err := ec.evalFile(child, true, passFinal); err != nil {
-				return false, false, err
+			if err := ec.evalFile(child, true, passFinal, blockIsFinal); err != nil {
+				return false, false, false, err
 			}
 		}
-		return inHeader, active, nil
+		return blockMatched, applyDirectives, blockIsFinal, nil
 	case stmtDirective:
-		if !active {
-			return inHeader, active, nil
+		if !applyDirectives {
+			return blockMatched, applyDirectives, blockIsFinal, nil
 		}
-		return inHeader, active, ec.applyDirective(stmt)
+		return blockMatched, applyDirectives, blockIsFinal, ec.applyDirective(stmt)
 	default:
-		return false, false, fmt.Errorf("%w: 未知语句类型 %d", ErrInvalidConfig, stmt.kind)
+		return false, false, false, fmt.Errorf("%w: 未知语句类型 %d", ErrInvalidConfig, stmt.kind)
 	}
 }
 
-func (ec *evalContext) evalMatchStmt(stmt configStmt, parentActive, passFinal bool) bool {
-	if !parentActive || stmt.matchCanonical || stmt.matchFinal != passFinal {
-		return false
+func (ec *evalContext) evalMatchStmt(stmt configStmt, parentActive, passFinal bool) (blockMatched, applyDirectives, isFinal bool) {
+	if !parentActive || stmt.matchCanonical {
+		return false, false, false
 	}
-	return ec.evalMatchCriteria(stmt.patterns)
+	if stmt.matchFinal {
+		if !passFinal {
+			return false, false, false
+		}
+		matched := ec.evalMatchCriteria(stmt.patterns)
+		return matched, matched, matched
+	}
+	matched := ec.evalMatchCriteria(stmt.patterns)
+	return matched, matched && !passFinal, false
 }
 
 func (ec *evalContext) applyDirective(stmt configStmt) error {
@@ -293,9 +307,17 @@ func (ec *evalContext) evalSingleCriterion(kw, arg string) (matched, supported b
 		return matchHostPatternList(strings.ToLower(ec.target.String()), lowerStrings(pats)), true
 	case "user":
 		u := ec.currentEffectiveUser()
-		return u != "" && matchHostPatternList(u, pats), true
+		if u == "" {
+			// 未知用户时严格失败关闭（supported=false），防止 Match !user 在缺省身份下取反误放行。
+			return false, false
+		}
+		return matchHostPatternList(u, pats), true
 	case "localuser":
-		return ec.localUser != "" && matchHostPatternList(ec.localUser, pats), true
+		if ec.localUser == "" {
+			// 未知本机用户时严格失败关闭（supported=false），防止 Match !localuser 误放行。
+			return false, false
+		}
+		return matchHostPatternList(ec.localUser, pats), true
 	default:
 		// 包含 Match exec 及一切未受控条件：严格失败关闭（绝不执行外部命令、绝不静默放行）。
 		return false, false

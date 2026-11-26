@@ -3,7 +3,7 @@
 //
 // 核心工程与安全不变量：
 //   - 所有文件 I/O、内核文件锁与安全删锁严格经由 ports.ScopedRootFS + core/osfs 完成，
-//     全包零裸 os.* 绕过、零裸 go 语句（锁持有协程受 core/conc.Nursery 监督）、零 //nolint:；
+//     全包零裸 os.* 绕过、零裸 go 语句（锁持有协程受 core/conc.Nursery 监督）、零 nolint 抑制指令；
 //   - ~/.xops/run/<ProcessInstanceID>.lock 严格遵循只追加协议：StageOperation 追加 "+<opID>\n"，
 //     UnstageOperation 追加 "-<opID>\n"，仅在内存活跃操作集合归零时调用 Truncate(0) 并紧跟
 //     Seek(0, io.SeekStart) + Sync()，防止 O_RDWR 句柄在旧偏移处产生稀疏 NUL 空洞；
@@ -37,6 +37,8 @@ const (
 	maxAllowedAuditReadBytes = int64(256 << 20) // audit.jsonl 读取硬上限 256 MiB
 	defaultMaxLockReadBytes  = int64(4 << 20)   // 单个死亡 .lock 文件读取默认上限 4 MiB
 	maxAllowedLockReadBytes  = int64(32 << 20)  // 单个 .lock 文件读取硬上限 32 MiB
+	defaultMaxLockLogLines   = 16384            // 长驻进程 .lock 只追加行数触发排空压缩的默认阈值
+	maxAllowedLockLogLines   = 262144           // .lock 排空压缩行数硬上限
 )
 
 // 本包导出的规范化哨兵错误，供调用方与诊断层精确识别审计日志损坏故障。
@@ -59,6 +61,9 @@ type SinkSpec struct {
 	AuditFile algebraic.Option[pathalg.LocalRootedDest]
 	// RunDir 可选覆盖活跃锁目录相对路径（默认 "run"）。
 	RunDir algebraic.Option[pathalg.LocalRootedDest]
+	// MaxLockLogLines 限制单次活跃期 .lock 只追加行数阈值（0 使用默认 16384，负数或超上限失败关闭）；
+	// 达到阈值且仍有在途操作时，暂停新准入直至活跃集合排空归零后再执行 Truncate(0)+Seek(0)（Plan §4 #4）。
+	MaxLockLogLines int
 }
 
 // ReconcilerSpec 是构造 FileReconciler（ports.AuditReconciler）的显式入参规格。

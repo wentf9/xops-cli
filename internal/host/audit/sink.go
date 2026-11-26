@@ -35,22 +35,26 @@ type lockCommand struct {
 //xops:opaque
 //xops:failclosed
 type FileSink struct {
-	fs          ports.ScopedRootFS
-	rootDir     pathalg.LocalDir
-	auditFile   pathalg.LocalRootedDest
-	lockDest    pathalg.LocalRootedDest
-	procID      ports.ProcessInstanceID
-	nursery     *conc.Nursery
-	cmdCh       chan lockCommand
-	closeCh     chan struct{}
-	doneCh      chan struct{}
-	rwMu        sync.RWMutex
-	stageMu     sync.Mutex
-	active      map[security.OperationID]struct{}
-	truncations atomic.Uint64
-	cleanClose  atomic.Bool // Close 时仅当 active 为空才置 true，控制是否截断并删除 .lock（ADR-008）
-	valid       bool
-	closed      bool
+	fs              ports.ScopedRootFS
+	rootDir         pathalg.LocalDir
+	auditFile       pathalg.LocalRootedDest
+	lockDest        pathalg.LocalRootedDest
+	procID          ports.ProcessInstanceID
+	maxLockLogLines int
+	nursery         *conc.Nursery
+	cmdCh           chan lockCommand
+	closeCh         chan struct{}
+	doneCh          chan struct{}
+	rwMu            sync.RWMutex
+	stageMu         sync.Mutex
+	active          map[security.OperationID]struct{}
+	appendedLines   int
+	draining        bool
+	drainCh         chan struct{}
+	truncations     atomic.Uint64
+	cleanClose      atomic.Bool // Close 时仅当 active 为空才置 true，控制是否截断并删除 .lock（ADR-008）
+	valid           bool
+	closed          bool
 }
 
 // NewFileSink 确保目录结构存在（遵循 INV-A4，经 EnsureRoot(0o700) 校验/创建 Owner-Only DACL 根目录）、
@@ -58,6 +62,10 @@ type FileSink struct {
 func NewFileSink(spec SinkSpec) (*FileSink, error) {
 	if spec.ScopedFS == nil || !spec.RootDir.IsValid() || !spec.ProcessID.IsValid() {
 		return nil, fmt.Errorf("%w: ScopedFS、RootDir 或 ProcessID 无效", ports.ErrInvalidArgument)
+	}
+	maxLines, err := normalizeMaxLockLogLines(spec.MaxLockLogLines)
+	if err != nil {
+		return nil, err
 	}
 	auditDest, runDest, err := resolveAuditPaths(spec.AuditFile, spec.RunDir)
 	if err != nil {
@@ -74,7 +82,17 @@ func NewFileSink(spec SinkSpec) (*FileSink, error) {
 	if err := ensureAuditDirectories(spec.ScopedFS, spec.RootDir, runDest); err != nil {
 		return nil, err
 	}
-	return startLockedFileSink(spec.ScopedFS, spec.RootDir, auditDest, lockDest, spec.ProcessID)
+	return startLockedFileSink(spec.ScopedFS, spec.RootDir, auditDest, lockDest, spec.ProcessID, maxLines)
+}
+
+func normalizeMaxLockLogLines(raw int) (int, error) {
+	if raw == 0 {
+		return defaultMaxLockLogLines, nil
+	}
+	if raw < 0 || raw > maxAllowedLockLogLines {
+		return 0, fmt.Errorf("%w: MaxLockLogLines=%d 超出范围", ports.ErrInvalidArgument, raw)
+	}
+	return raw, nil
 }
 
 // NewFileSinkFromEntropy 从显式熵源生成 ProcessInstanceID 并构造 FileSink。
@@ -95,23 +113,24 @@ func ensureAuditDirectories(fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir,
 	})
 }
 
-func startLockedFileSink(fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir, auditDest, lockDest pathalg.LocalRootedDest, procID ports.ProcessInstanceID) (*FileSink, error) {
+func startLockedFileSink(fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir, auditDest, lockDest pathalg.LocalRootedDest, procID ports.ProcessInstanceID, maxLines int) (*FileSink, error) {
 	n, err := conc.NewNursery(context.Background())
 	if err != nil {
 		return nil, err
 	}
 	s := &FileSink{
-		fs:        fsPort,
-		rootDir:   rootDir,
-		auditFile: auditDest,
-		lockDest:  lockDest,
-		procID:    procID,
-		nursery:   n,
-		cmdCh:     make(chan lockCommand),
-		closeCh:   make(chan struct{}),
-		doneCh:    make(chan struct{}),
-		active:    make(map[security.OperationID]struct{}),
-		valid:     true,
+		fs:              fsPort,
+		rootDir:         rootDir,
+		auditFile:       auditDest,
+		lockDest:        lockDest,
+		procID:          procID,
+		maxLockLogLines: maxLines,
+		nursery:         n,
+		cmdCh:           make(chan lockCommand),
+		closeCh:         make(chan struct{}),
+		doneCh:          make(chan struct{}),
+		active:          make(map[security.OperationID]struct{}),
+		valid:           true,
 	}
 	readyCh := make(chan error, 1)
 	if gErr := n.Go(func(context.Context) error {
@@ -146,6 +165,17 @@ func (s *FileSink) runLockHolder(readyCh chan<- error) error {
 func (s *FileSink) holdProcessLockInRoot(root ports.RootHandle, signalReady func(error)) error {
 	var cleanShutdown bool
 	acquired, err := root.TryWithLockedFile(s.lockDest, ports.LockExclusive, true, auditFilePerm, func(lf ports.LockedFile) error {
+		st, stErr := lf.Stat()
+		if stErr != nil {
+			signalReady(stErr)
+			return stErr
+		}
+		if st.Size() > 0 {
+			// 严禁静默截断尚未完成崩溃对账的非空残留 .lock 文件（防止误复用 ProcessInstanceID 擦除未闭合记录）。
+			unreconciledErr := fmt.Errorf("%w: 进程锁文件 %q 包含未对账残留记录，请先执行崩溃对账或使用新的 ProcessInstanceID", ports.ErrAlreadyExists, s.lockDest.String())
+			signalReady(unreconciledErr)
+			return unreconciledErr
+		}
 		if rErr := truncateAndRewind(lf); rErr != nil {
 			signalReady(rErr)
 			return rErr
@@ -252,28 +282,59 @@ func (s *FileSink) LockTruncations() uint64 {
 }
 
 // StageOperation 以只追加协议向当前进程 .lock 文件写入 "+<opID>\n" 并同步刷盘，登记活跃未闭合操作。
+// 若长驻进程单周期追加行数达到 MaxLockLogLines 且仍有在途操作，则暂停新准入并在无锁等待态下
+// 等待活跃集合排空归零触发截断压缩后再继续（严格响应 ctx.Done 与 Close，杜绝死锁）。
 func (s *FileSink) StageOperation(ctx context.Context, opID security.OperationID) error {
 	if err := s.checkOpArgs(ctx, opID); err != nil {
 		return err
 	}
+	for {
+		waitCh, done, err := s.tryStageOperation(ctx, opID)
+		if err != nil || done {
+			return err
+		}
+		select {
+		case <-waitCh:
+		case <-s.closeCh:
+			return ports.ErrClosed
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *FileSink) tryStageOperation(ctx context.Context, opID security.OperationID) (waitCh <-chan struct{}, done bool, err error) {
 	s.rwMu.RLock()
 	defer s.rwMu.RUnlock()
 	if s.closed {
-		return ports.ErrClosed
+		return nil, true, ports.ErrClosed
 	}
 	s.stageMu.Lock()
 	defer s.stageMu.Unlock()
 	if _, exists := s.active[opID]; exists {
-		return nil
+		return nil, true, nil
 	}
-	if err := s.sendLockCmd(lockCommand{kind: lockCmdStage, opID: opID, reply: make(chan error, 1)}); err != nil {
-		return err
+	if s.draining {
+		return s.drainCh, false, nil
+	}
+	if s.appendedLines >= s.maxLockLogLines && len(s.active) > 0 {
+		s.draining = true
+		s.drainCh = make(chan struct{})
+		return s.drainCh, false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
+	if err := s.sendLockCmd(ctx, lockCommand{kind: lockCmdStage, opID: opID, reply: make(chan error, 1)}); err != nil {
+		return nil, true, err
 	}
 	s.active[opID] = struct{}{}
-	return nil
+	s.appendedLines++
+	return nil, true, nil
 }
 
-// UnstageOperation 以只追加协议向 .lock 写入 "-<opID>\n"；仅当活跃操作集合由此归零时执行截断与偏移归零。
+// UnstageOperation 以只追加协议向 .lock 写入 "-<opID>\n"；仅当活跃操作集合由此归零时执行截断与偏移归零，
+// 并唤醒因行数达到压缩阈值而暂停准入的 StageOperation 调用方。
 func (s *FileSink) UnstageOperation(ctx context.Context, opID security.OperationID) error {
 	if err := s.checkOpArgs(ctx, opID); err != nil {
 		return err
@@ -289,21 +350,35 @@ func (s *FileSink) UnstageOperation(ctx context.Context, opID security.Operation
 		return nil
 	}
 	willBeEmpty := len(s.active) == 1
-	if err := s.sendLockCmd(lockCommand{kind: lockCmdUnstage, opID: opID, truncateAfter: willBeEmpty, reply: make(chan error, 1)}); err != nil {
+	if err := s.sendLockCmd(ctx, lockCommand{kind: lockCmdUnstage, opID: opID, truncateAfter: willBeEmpty, reply: make(chan error, 1)}); err != nil {
 		return err
 	}
 	delete(s.active, opID)
 	if willBeEmpty {
+		s.appendedLines = 0
 		s.truncations.Add(1)
+		s.releaseDrainLocked()
+		return nil
 	}
+	s.appendedLines++
 	return nil
 }
 
-func (s *FileSink) sendLockCmd(cmd lockCommand) error {
+func (s *FileSink) releaseDrainLocked() {
+	if s.draining && s.drainCh != nil {
+		close(s.drainCh)
+		s.drainCh = nil
+	}
+	s.draining = false
+}
+
+func (s *FileSink) sendLockCmd(ctx context.Context, cmd lockCommand) error {
 	select {
 	case s.cmdCh <- cmd:
 	case <-s.doneCh:
 		return ports.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	select {
 	case err := <-cmd.reply:
@@ -366,6 +441,7 @@ func (s *FileSink) Close() error {
 	}
 	s.stageMu.Lock()
 	s.cleanClose.Store(len(s.active) == 0)
+	s.releaseDrainLocked()
 	s.stageMu.Unlock()
 	s.closed = true
 	close(s.closeCh)
