@@ -20,13 +20,14 @@ type pipeAddr string
 func (pipeAddr) Network() string  { return "pipe" }
 func (a pipeAddr) String() string { return string(a) }
 
-// opSlot 隔离单方向（读/写）重叠 I/O 句柄、同向串行互斥与可中断截止期，确保全双工无数据竞争。
+// opSlot 隔离单方向（读/写）重叠 I/O 句柄、堆驻留 Overlapped 结构、同向串行互斥与可中断截止期，确保全双工无数据竞争。
 type opSlot struct {
 	mu     sync.Mutex
 	dlMu   sync.Mutex
 	dl     time.Time
 	ioEv   windows.Handle
 	wake   windows.Handle
+	ov     windows.Overlapped
 	closed bool
 }
 
@@ -182,14 +183,24 @@ func (c *Conn) doOverlapped(slot *opSlot, isRead bool, p []byte) (int, error) {
 	if err := windows.ResetEvent(slot.ioEv); err != nil {
 		return 0, err
 	}
-	ov := windows.Overlapped{HEvent: slot.ioEv}
+	// Overlapped 与缓冲区必须在整个内核异步 I/O 期间常驻堆并固定地址，
+	// 防止 goroutine 栈扩容搬移导致内核将 IO_STATUS_BLOCK 写入旧栈而引发假 io.EOF 或内存破坏。
+	slot.ov = windows.Overlapped{HEvent: slot.ioEv}
+	var pinner runtime.Pinner
+	pinner.Pin(&slot.ov)
+	pinner.Pin(&p[0])
+	defer pinner.Unpin()
+
+	// 传入非 nil &done 避免 x/sys/windows 在 -race 模式下解引用 nil；
+	// 同步完成 (err == nil) 时仍经 GetOverlappedResult 读取权威字节数，防止 done 保持 0 误报 io.EOF / io.ErrShortWrite。
 	var done uint32
-	err := startPipeIO(c.h, isRead, p, &done, &ov)
-	if errors.Is(err, windows.ERROR_IO_PENDING) {
-		done, err = c.waitOverlapped(slot, &ov)
+	err := startPipeIO(c.h, isRead, p, &done, &slot.ov)
+	switch {
+	case err == nil:
+		err = windows.GetOverlappedResult(c.h, &slot.ov, &done, true)
+	case errors.Is(err, windows.ERROR_IO_PENDING):
+		done, err = c.waitOverlapped(slot, &slot.ov)
 	}
-	runtime.KeepAlive(p)
-	runtime.KeepAlive(&ov)
 	return int(done), c.mapIOErr(isRead, done, err)
 }
 

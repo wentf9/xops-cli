@@ -191,12 +191,11 @@ func exchangeUDP(ctx context.Context, server string, query []byte) ([]byte, erro
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "udp", server)
 	if err != nil {
-		return nil, err
+		return nil, mapCancelOrErr(ctx, err)
 	}
 	defer func() { _ = conn.Close() }()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
-	applyConnDeadline(ctx, conn)
+	// 仅通过 context.AfterFunc 关闭连接以响应取消与截止时间，避免 netpoller SetDeadline 与 context 定时器竞态先报 i/o timeout。
+	defer bindContextClose(ctx, conn)()
 	if _, err := conn.Write(query); err != nil {
 		return nil, mapCancelOrErr(ctx, err)
 	}
@@ -212,12 +211,10 @@ func exchangeTCP(ctx context.Context, server string, query []byte) ([]byte, erro
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "tcp", server)
 	if err != nil {
-		return nil, err
+		return nil, mapCancelOrErr(ctx, err)
 	}
 	defer func() { _ = conn.Close() }()
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	defer stop()
-	applyConnDeadline(ctx, conn)
+	defer bindContextClose(ctx, conn)()
 
 	frame := make([]byte, 2+len(query))
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
@@ -240,17 +237,24 @@ func exchangeTCP(ctx context.Context, server string, query []byte) ([]byte, erro
 	return resp, nil
 }
 
+func bindContextClose(ctx context.Context, conn net.Conn) func() {
+	afterDone := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		defer close(afterDone)
+		_ = conn.Close()
+	})
+	return func() {
+		if !stop() {
+			<-afterDone
+		}
+	}
+}
+
 func mapCancelOrErr(ctx context.Context, err error) error {
 	if cErr := ctx.Err(); cErr != nil {
 		return cErr
 	}
 	return err
-}
-
-func applyConnDeadline(ctx context.Context, conn net.Conn) {
-	if dl, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(dl)
-	}
 }
 
 func normalizeExplicitServers(raw []string) ([]string, error) {
