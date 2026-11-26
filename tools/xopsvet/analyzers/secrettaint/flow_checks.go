@@ -68,7 +68,7 @@ func (ts *taintScope) checkStore(ins *ssa.Store) {
 		return
 	}
 	if fa, isField := ins.Addr.(*ssa.FieldAddr); isField {
-		if !isVaultNarrowCredentialFieldStore(ts.eng.pkgInfo, fa) || !vetssa.AllRootsOwnedInScope(fa, sc, ts.callerParams) {
+		if !ts.isAllowedVaultNarrowFieldStore(ins, fa) || !vetssa.AllRootsOwnedInScope(fa, sc, ts.callerParams) {
 			ts.report(ins, "secrettaint: 禁止将明文机密存入结构体或非字节切片容器字面量")
 		}
 		return
@@ -235,7 +235,7 @@ func (ts *taintScope) checkTaintedNonWriteCall(callInst ssa.CallInstruction, rc 
 		return
 	}
 	if isSafePredicate(rc.FuncObj) || isTaintPreservingTransform(rc.FuncObj) || vetssa.IsStdlibSyncIter(rc.FuncObj) ||
-		ts.isExactCryptoSanitizer(rc, inSc) || ts.isAllowedNarrowConsumerCall(rc) {
+		ts.isExactCryptoSanitizer(rc, inSc) || ts.isAllowedNarrowConsumerCall(callInst, rc, inSc) {
 		return
 	}
 	if isBufferOrReaderWriteToFunc(rc.FuncObj) {

@@ -21,7 +21,11 @@ const portsPkgPath = vetutil.ModulePrefix + "/core/ports"
 //      会话/通道写入器（(*ssh.Session).StdinPipe、(ports.RemoteSession).StdinPipe、(*ssh.Client).OpenChannel、
 //      (ssh.Conn).OpenChannel、(ssh.NewChannel).Accept 及显式 ssh.Channel 形参）写入提权明文字节（拒绝通用
 //      io.Writer/io.WriteCloser 形参、自定义接口 StdinPipe、io.Pipe/*io.PipeWriter、结构体字段、全局变量与一切未授权外部写入器）；
-//   3. P4-T4（LayerHostVault，含 internal/host/vault/wincred 子包隔离）：Windows CREDENTIALW 本作用域局部结构体写入 + LazyProc.Call。
+//   3. P4-T4（LayerHostVault 子包级精确门控，详见 sinks_narrow_vault.go）：
+//      - vault/wincred（含 vault Phase 0 夹具）：Windows CREDENTIALW 本作用域局部结构体写入 + LazyProc.Call；
+//      - vault/keychain：macOS Security.framework purego.SyscallN（首参 fn 符号未染毒）；
+//      - vault/secretservice：DH AES-128-CBC（NewCBCEncrypter + CryptBlocks）及 plain 回退 dbusSecret.Value + CreateItem/SetSecret；
+//      - vault/helper：(ports.ProcessPort).Run 仅允许 arg 2 stdin 携带明文。
 
 // checkDialKIAnswersStore 放行 P4-T1 挑战闭包内 box.Use 向局部 answers []string 写入并登记 kiFn 直属根集合复审。
 func (ts *taintScope) checkDialKIAnswersStore(ins *ssa.Store) bool {
@@ -47,29 +51,11 @@ func (e *taintEngine) auditDialKIFunc(kiFn *ssa.Function, roots []ssa.Value) {
 	e.runScopeAudit(vetssa.AuditKey{}, kiFn, tainted, callerParams, kiScope, 0, nil, kiFn)
 }
 
-func isVaultNarrowCredentialFieldStore(pkgInfo vetutil.PkgInfo, fa *ssa.FieldAddr) bool {
-	if pkgInfo.IsExternalTest || pkgInfo.Layer != vetutil.LayerHostVault || fa == nil {
-		return false
-	}
-	named, ok := vetutil.UnwrapNamedType(fa.X.Type())
-	return ok && named != nil && named.Obj() != nil && (named.Obj().Name() == "credentialW" || named.Obj().Name() == "CREDENTIALW")
-}
-
-func (ts *taintScope) isAllowedNarrowConsumerCall(rc vetssa.ResolvedCall) bool {
-	if isAllowedVaultProcCall(ts.eng.pkgInfo, rc) {
+func (ts *taintScope) isAllowedNarrowConsumerCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall, inSc vetssa.ScopeRange) bool {
+	if ts.isAllowedVaultNarrowCall(callInst, rc, inSc) {
 		return true
 	}
 	return ts.isAllowedPrivEscalationWrite(rc)
-}
-
-func isAllowedVaultProcCall(pkgInfo vetutil.PkgInfo, rc vetssa.ResolvedCall) bool {
-	if pkgInfo.IsExternalTest || pkgInfo.Layer != vetutil.LayerHostVault || rc.FuncObj == nil || rc.FuncObj.Name() != "Call" {
-		return false
-	}
-	pkgPath := vetutil.ObjectPkgPath(rc.FuncObj)
-	named, ok := secretfact.RecvNamedType(rc.FuncObj)
-	return (pkgPath == "syscall" || pkgPath == "golang.org/x/sys/windows") &&
-		ok && named.Obj() != nil && (named.Obj().Name() == "LazyProc" || named.Obj().Name() == "Proc")
 }
 
 // isAllowedPrivEscalationWrite 仅在 LayerCoreSSHNetPriv 生产/白盒包内按严格正向来源白名单放行向远端 SSH 会话/通道写入提权明文字节；

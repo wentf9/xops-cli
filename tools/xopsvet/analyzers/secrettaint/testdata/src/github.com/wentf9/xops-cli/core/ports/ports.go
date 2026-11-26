@@ -28,3 +28,10 @@ type InteractionPort interface {
 	PromptSecret(ctx context.Context, prompt string, fn func(box *secret.SecretBox) error) error
 	Notify(ctx context.Context, msg any) error
 }
+
+type ProcessSpec struct{ Command string }
+type ProcessResult struct{ Stdout []byte }
+
+type ProcessPort interface {
+	Run(ctx context.Context, spec ProcessSpec, stdin io.Reader) (ProcessResult, error)
+}
