@@ -123,9 +123,16 @@ func TestPendingEnrollment_CleanupOnAbortExpiryPanicAndUncertain(t *testing.T) {
 	// 预置一个已入库的共享凭据，确认回滚清理绝不会误删已引用凭据！
 	sharedRef := mustTestRef(t, "enroll-shared")
 	putTestSecret(t, h.vault, sharedRef, "shared-val")
-	aShared, _ := inventory.NewAuthPassword(sharedRef)
-	_, _ = h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: mustTestHost(t, "h-base", "198.51.100.1", 22)})
-	_, _ = h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: mustTestIdentity(t, "id-base", "ops", aShared)})
+	aShared, err := inventory.NewAuthPassword(sharedRef)
+	if err != nil {
+		t.Fatalf("NewAuthPassword: %v", err)
+	}
+	if _, err := h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: mustTestHost(t, "h-base", "198.51.100.1", 22)}); err != nil {
+		t.Fatalf("CreateHost(h-base): %v", err)
+	}
+	if _, err := h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: mustTestIdentity(t, "id-base", "ops", aShared)}); err != nil {
+		t.Fatalf("CreateIdentity(id-base): %v", err)
+	}
 
 	// 场景 1：Probe 失败 -> 自动清理独占暂存凭据、保留共享凭据、释放钉住。
 	assertPendingProbeFailureCleanup(t, ctx, h, sharedRef)

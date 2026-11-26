@@ -24,6 +24,9 @@ type GraphMutator func(ctx context.Context, snap ports.InventorySnapshot, newRef
 // （例如 KeySignerPort.InspectPrivateKeyFingerprint），失败时自动触发 VaultSagaFSM 补偿 GC。
 type NewSecretVerifier func(ctx context.Context, newRef secret.Ref) error
 
+// OldSecretRefsResolver 在已获 Gate 授权的受权回调内解析本次替换涉及的主旧凭据引用与其余待后置安全回收的旧凭据引用。
+type OldSecretRefsResolver func(ctx context.Context) (primary algebraic.Option[secret.Ref], extra []secret.Ref, err error)
+
 // VaultSagaRequest 描述单次 VaultSagaFSM 凭据写入/轮换编排请求（绝不含明文或 SecretBox）。
 type VaultSagaRequest struct {
 	// NewRef 可选显式指定新凭据引用；为空时须提供 TargetStore，由 Entropy 自动分配唯一条目名。
@@ -32,6 +35,8 @@ type VaultSagaRequest struct {
 	TargetStore string
 	// OldRef 可选指定将被替换的旧凭据引用；仅在 CAS DurabilityCommitted 且 5 位置+Pending 零引用时 GC。
 	OldRef algebraic.Option[secret.Ref]
+	// ResolveOldRefs 可选回调：在 gate.WithAuthorized 作用域内动态读取当前旧凭据（与 OldRef 互斥，避免门控前越权 Store.Load）。
+	ResolveOldRefs OldSecretRefsResolver
 	// ExpectedRevision 可选显式要求 CAS 期望配置版本；失配时立即返回 NotApplied 并补偿删除新凭据。
 	ExpectedRevision algebraic.Option[ports.Revision]
 	// ExpectedCASVersion 可选记录入 VaultSagaContext 的单调期望版本号元数据。
@@ -173,7 +178,10 @@ func (s *Service) ExecuteVaultSaga(
 	if err := s.validateSagaRequest(ctx, req); err != nil {
 		return SagaResult{}, err
 	}
-	return s.executeSagaWithValidatedInputs(ctx, req, newSecret)
+	if !newSecret.IsValid() {
+		return SagaResult{}, ErrInvalidSecretBox
+	}
+	return s.executeSagaAuthorized(ctx, req, algebraic.None[ports.SecretPromptRequest](), newSecret)
 }
 
 // ExecuteVaultSagaFromBytes 经 secret.WithBytes 深拷贝并立即清零 raw 后驱动 VaultSagaFSM。
@@ -187,7 +195,8 @@ func (s *Service) ExecuteVaultSagaFromBytes(ctx context.Context, req VaultSagaRe
 	return res, err
 }
 
-// ExecuteVaultSagaInteractive 经 InteractionPort.PromptSecret 采集新机密后驱动 VaultSagaFSM。
+// ExecuteVaultSagaInteractive 先经 Gate CapMutate 鉴权，获批后方调用 InteractionPort.PromptSecret 采集新机密并驱动 VaultSagaFSM，
+// 确保门控拒绝、Halted 熔断或两步审批拦截时绝不提前弹窗诱导输入明文。
 func (s *Service) ExecuteVaultSagaInteractive(ctx context.Context, req InteractiveVaultSagaRequest) (SagaResult, error) {
 	if req.Saga.OperationStream != nil {
 		defer req.Saga.OperationStream.Close()
@@ -198,16 +207,7 @@ func (s *Service) ExecuteVaultSagaInteractive(ctx context.Context, req Interacti
 	if err := s.validateSagaRequest(ctx, req.Saga); err != nil {
 		return SagaResult{}, err
 	}
-	if s.gate.IsHalted() {
-		return SagaResult{}, gate.ErrGateHalted
-	}
-	var res SagaResult
-	err := s.interaction.PromptSecret(ctx, req.Prompt, func(box *secret.SecretBox) error {
-		var runErr error
-		res, runErr = s.executeSagaWithValidatedInputs(ctx, req.Saga, box)
-		return runErr
-	})
-	return res, err
+	return s.executeSagaAuthorized(ctx, req.Saga, algebraic.Some(req.Prompt), nil)
 }
 
 // RotateSecret 将资产图全部 5 位置中指向 req.OldRef 的引用原子轮换至新凭据，并经 VaultSagaFSM 回收旧凭据。
@@ -277,22 +277,6 @@ func buildRotateSagaRequest(req RotateSecretRequest) (VaultSagaRequest, error) {
 	}, nil
 }
 
-func (s *Service) executeSagaWithValidatedInputs(
-	ctx context.Context,
-	req VaultSagaRequest,
-	//xops:borrowed
-	newSecret *secret.SecretBox,
-) (SagaResult, error) {
-	if !newSecret.IsValid() {
-		return SagaResult{}, ErrInvalidSecretBox
-	}
-	newRef, err := s.resolveSagaNewRef(req)
-	if err != nil {
-		return SagaResult{}, err
-	}
-	return s.executeSagaAuthorized(ctx, req, newRef, newSecret)
-}
-
 func (s *Service) validateSagaRequest(ctx context.Context, req VaultSagaRequest) error {
 	if err := s.validateBaseCall(ctx, req.Risk); err != nil {
 		return err
@@ -305,6 +289,9 @@ func (s *Service) validateSagaRequest(ctx context.Context, req VaultSagaRequest)
 	}
 	if !req.NewRef.IsValid() && req.TargetStore == "" {
 		return fmt.Errorf("%w: 必须提供有效 NewRef 或非空 TargetStore", ErrInvalidRequest)
+	}
+	if req.ResolveOldRefs != nil && req.OldRef.IsSome() {
+		return fmt.Errorf("%w: OldRef 与 ResolveOldRefs 不可同时指定", ErrInvalidRequest)
 	}
 	if old, ok := req.OldRef.Get(); ok && !old.IsValid() {
 		return fmt.Errorf("%w: OldRef 无效", ErrInvalidRequest)

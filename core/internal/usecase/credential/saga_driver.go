@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -29,45 +30,123 @@ type sagaRunState struct {
 func (s *Service) executeSagaAuthorized(
 	ctx context.Context,
 	req VaultSagaRequest,
-	newRef secret.Ref,
+	promptOpt algebraic.Option[ports.SecretPromptRequest],
 	//xops:borrowed
 	newSecret *secret.SecretBox,
-) (SagaResult, error) {
+) (result SagaResult, gateErr error) {
 	action := sanitizeASCIICode(req.Action, "vault_saga")
-	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, action+" "+newRef.String())
-	params := map[string]string{"new_ref": newRef.String()}
-	if old, ok := req.OldRef.Get(); ok {
-		params["old_ref"] = old.String()
-	}
+	targetLabel := pickIf(req.NewRef.IsValid(), req.NewRef.String(), req.TargetStore)
+	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, action+" "+targetLabel)
+	params := buildSagaGateParams(req)
 	gateReq, err := buildMutateGateRequest(action, req.NodeID, params, req.Risk.OrElse(security.RiskModerate), summary, req.Approval, req.OperationStream)
 	if err != nil {
 		return SagaResult{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 
-	var result SagaResult
 	var outcomeOpt algebraic.Option[execution.ExecutionOutcome]
-	var emitter *opEmitter
+	var emitter *OpEmitter
 	var startedAt time.Time
-	gateErr := gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[security.CapMutate]) error {
-		startedAt = s.clock.Now().UTC().Round(0)
-		emitter = newOpEmitter(req.OperationStream, s.clock, auth.TraceID(), auth.OperationID(), req.NodeID)
-		emitter.emitStarted(authCtx, security.CapabilityMutate, action, summary)
+	returnedNormally := false
+	defer func() {
+		emitter.EmitFinal(ctx, security.CapabilityMutate, startedAt, outcomeOpt, returnedNormally, "vault saga panicked", gateErr)
+	}()
 
-		res, runErr := s.driveVaultSaga(authCtx, auth, req, newRef, newSecret, emitter)
+	gateErr = gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[security.CapMutate]) error {
+		startedAt = s.clock.Now().UTC().Round(0)
+		emitter = NewOpEmitter(req.OperationStream, s.clock, toolCredential, auth.TraceID(), auth.OperationID(), req.NodeID)
+		emitter.EmitStarted(authCtx, security.CapabilityMutate, action, summary)
+
+		res, runErr := s.runAuthorizedSagaBody(authCtx, auth, req, promptOpt, newSecret, emitter)
 		result = res
-		if res.IsUncertainDurability() || res.IsFailedUncertain() {
-			unk, uErr := execution.NewOutcomeUnknown(execution.ExecPhaseRunning, classifyCredentialErrorCode(runErr), runErr.Error())
-			if uErr == nil {
-				outcomeOpt = algebraic.Some[execution.ExecutionOutcome](unk)
-				_ = auth.ReportOutcome(unk)
+		if isUncertainSagaOutcome(res, runErr) {
+			detail := pickIf(runErr != nil, fmt.Sprint(runErr), "vault saga uncertain")
+			if unk := ReportOutcomeUnknown(auth, classifyOpErrorCode(toolCredential, runErr), detail); unk.IsSome() {
+				outcomeOpt = unk
 			}
 		}
 		return runErr
 	})
-	if emitter != nil {
-		emitter.emitCompleted(ctx, security.CapabilityMutate, startedAt, outcomeOpt, gateErr)
-	}
+	returnedNormally = true
 	return result, gateErr
+}
+
+func buildSagaGateParams(req VaultSagaRequest) map[string]string {
+	params := make(map[string]string, 2)
+	if req.NewRef.IsValid() {
+		params["new_ref"] = req.NewRef.String()
+	} else {
+		params["target_store"] = req.TargetStore
+	}
+	if old, ok := req.OldRef.Get(); ok {
+		params["old_ref"] = old.String()
+	}
+	return params
+}
+
+func isUncertainSagaOutcome(res SagaResult, runErr error) bool {
+	return res.IsUncertainDurability() || res.IsFailedUncertain() ||
+		errors.Is(runErr, ErrUncertainDurability) || errors.Is(runErr, ErrSagaUncertain)
+}
+
+func (s *Service) runAuthorizedSagaBody(
+	authCtx context.Context,
+	auth gate.Authorized[security.CapMutate],
+	req VaultSagaRequest,
+	promptOpt algebraic.Option[ports.SecretPromptRequest],
+	//xops:borrowed
+	newSecret *secret.SecretBox,
+	emitter *OpEmitter,
+) (SagaResult, error) {
+	newRef, err := s.resolveSagaNewRef(req)
+	if err != nil {
+		return SagaResult{}, err
+	}
+	oldRef, extraOldRefs, err := resolveSagaOldRefs(authCtx, req)
+	if err != nil {
+		return SagaResult{}, err
+	}
+	var res SagaResult
+	if prompt, isInteractive := promptOpt.Get(); isInteractive {
+		err = s.interaction.PromptSecret(authCtx, prompt, func(box *secret.SecretBox) error {
+			var dErr error
+			res, dErr = s.driveVaultSaga(authCtx, auth, req, newRef, oldRef, box, emitter)
+			return dErr
+		})
+	} else {
+		res, err = s.driveVaultSaga(authCtx, auth, req, newRef, oldRef, newSecret, emitter)
+	}
+	if err != nil || len(extraOldRefs) == 0 || res.StateKind() != fsm.VaultSagaKindCompleted {
+		return res, err
+	}
+	if gcErr := s.gcExtraOldRefsAfterCommit(authCtx, extraOldRefs, req.ExtraPending); gcErr != nil {
+		return res, fmt.Errorf("%w: 后置额外旧凭据回收失败: %w", ErrSagaUncertain, gcErr)
+	}
+	return res, nil
+}
+
+func resolveSagaOldRefs(ctx context.Context, req VaultSagaRequest) (algebraic.Option[secret.Ref], []secret.Ref, error) {
+	if req.ResolveOldRefs == nil {
+		return req.OldRef, nil, nil
+	}
+	primary, extra, err := req.ResolveOldRefs(ctx)
+	if err != nil {
+		return algebraic.None[secret.Ref](), nil, err
+	}
+	if p, ok := primary.Get(); ok && !p.IsValid() {
+		return algebraic.None[secret.Ref](), nil, fmt.Errorf("%w: ResolveOldRefs 返回无效主旧凭据引用", ErrInvalidRequest)
+	}
+	uniqExtra, err := canonicalizeSecretRefs(extra)
+	if err != nil {
+		return algebraic.None[secret.Ref](), nil, err
+	}
+	return primary, uniqExtra, nil
+}
+
+func (s *Service) gcExtraOldRefsAfterCommit(ctx context.Context, extraOldRefs []secret.Ref, extraPending []inventory.PendingSecretRef) error {
+	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupEffectTimeout)
+	defer cancel()
+	_, _, err := s.gcCandidatesAuthorized(cleanCtx, extraOldRefs, extraPending)
+	return err
 }
 
 func (s *Service) driveVaultSaga(
@@ -75,9 +154,10 @@ func (s *Service) driveVaultSaga(
 	auth gate.Authorized[security.CapMutate],
 	req VaultSagaRequest,
 	newRef secret.Ref,
+	oldRef algebraic.Option[secret.Ref],
 	//xops:borrowed
 	newSecret *secret.SecretBox,
-	emitter *opEmitter,
+	emitter *OpEmitter,
 ) (SagaResult, error) {
 	sagaID := auth.OperationID()
 	if !sagaID.IsValid() {
@@ -89,7 +169,7 @@ func (s *Service) driveVaultSaga(
 	sagaCtx, err := fsm.NewVaultSagaContext(fsm.VaultSagaContextSpec{
 		SagaID:             sagaID,
 		NewRef:             newRef,
-		OldRef:             req.OldRef,
+		OldRef:             oldRef,
 		ExpectedCASVersion: req.ExpectedCASVersion,
 	})
 	if err != nil {
@@ -108,7 +188,7 @@ func (s *Service) driveVaultSaga(
 			return SagaResult{}, stepErr
 		}
 		if rs.cur.IsTerminal() {
-			return rs.finalize(newRef, req.OldRef)
+			return rs.finalize(newRef, oldRef)
 		}
 		if len(effs) != 1 {
 			return SagaResult{}, fmt.Errorf("%w: 非终态状态 %s 产生异常副作用数 %d", ErrSagaUncertain, rs.cur.Kind(), len(effs))
@@ -121,7 +201,7 @@ func (s *Service) driveVaultSaga(
 	return SagaResult{}, fmt.Errorf("%w: 超过最大状态转移步数 %d", ErrSagaUncertain, maxVaultSagaSteps)
 }
 
-func (rs *sagaRunState) applyTransition(ctx context.Context, in fsm.VaultSagaInput, emitter *opEmitter) ([]fsm.VaultSagaEffect, error) {
+func (rs *sagaRunState) applyTransition(ctx context.Context, in fsm.VaultSagaInput, emitter *OpEmitter) ([]fsm.VaultSagaEffect, error) {
 	fromKind := rs.cur.Kind()
 	next, effs, evs, err := fsm.TransitionVaultSaga(rs.cur, in)
 	if err != nil {
@@ -129,7 +209,7 @@ func (rs *sagaRunState) applyTransition(ctx context.Context, in fsm.VaultSagaInp
 	}
 	rs.cur = next
 	rs.events = append(rs.events, evs...)
-	emitter.emitVaultSagaEvents(ctx, fromKind, next.Kind(), evs, next.IsTerminal())
+	emitter.EmitVaultSagaEvents(ctx, fromKind, next.Kind(), evs, next.IsTerminal())
 	return effs, nil
 }
 
@@ -163,6 +243,9 @@ func (rs *sagaRunState) finalize(newRef secret.Ref, oldRef algebraic.Option[secr
 
 func wrapSagaTerminalError(sentinel error, reason string, cause error) error {
 	if cause != nil {
+		if reason != "" && !strings.Contains(cause.Error(), reason) {
+			return fmt.Errorf("%w (%s): %w", sentinel, reason, cause)
+		}
 		return fmt.Errorf("%w: %w", sentinel, cause)
 	}
 	if reason != "" {
@@ -187,11 +270,19 @@ func (s *Service) execSagaEffect(
 	case fsm.VaultEffectCommitConfigCAS:
 		return s.runEffectCommitConfigCAS(ctx, eff.Ref(), req, rs)
 	case fsm.VaultEffectCheckOldRefs:
-		return s.runEffectCheckOldRefs(ctx, eff.Ref(), req.ExtraPending, rs)
+		// CheckOldRefs 仅在 CommitConfigCAS 持久提交后执行，须与外部取消隔离以保证正常收尾回收。
+		cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupEffectTimeout)
+		defer cancel()
+		return s.runEffectCheckOldRefs(cleanCtx, eff.Ref(), req.ExtraPending, rs)
 	case fsm.VaultEffectDeleteOld:
-		return s.runEffectDeleteVaultSecret(ctx, eff.Ref(), fsm.VaultInputDeleteOldResult, rs)
+		cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupEffectTimeout)
+		defer cancel()
+		return s.runEffectDeleteVaultSecret(cleanCtx, eff.Ref(), fsm.VaultInputDeleteOldResult, rs)
 	case fsm.VaultEffectCompensateDeleteNew:
-		return s.runEffectDeleteVaultSecret(ctx, eff.Ref(), fsm.VaultInputCompensateResult, rs)
+		// 回滚补偿清理新写凭据必须使用有界 WithoutCancel 上下文，杜绝因外层取消/超时遗留孤儿凭据。
+		cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupEffectTimeout)
+		defer cancel()
+		return s.runEffectDeleteVaultSecret(cleanCtx, eff.Ref(), fsm.VaultInputCompensateResult, rs)
 	default:
 		return zeroVal[fsm.VaultSagaInput](), fmt.Errorf("%w: 未知 VaultSagaEffectKind=%s", ErrSagaUncertain, eff.Kind())
 	}
@@ -242,6 +333,37 @@ func (s *Service) runEffectVerifyReadback(
 	return fsm.VaultInputReadbackResult(fsm.SideEffectSucceeded, true, "")
 }
 
+// CommitGraphCAS 执行 InventoryStore.CommitCAS 并按失败关闭法则规范分类持久化状态（供 credential 与 inventory 统一复用）：
+// DurabilityCommitted 若伴随非空错误或缺少有效 Revision，强制降级为 DurabilityOutcomeUnknown，杜绝误判成功或误删旧凭据。
+func CommitGraphCAS(
+	ctx context.Context,
+	store ports.InventoryStore,
+	baseRev ports.Revision,
+	nextGraph inventory.Graph,
+) (status fsm.DurabilityStatus, newRev ports.Revision, out ports.DurabilityOutcome, reason string, err error) {
+	out, commitErr := store.CommitCAS(ctx, baseRev, nextGraph)
+	if out.IsValid() {
+		if rev, ok := out.Revision().Get(); ok && rev.IsValid() {
+			newRev = rev
+		}
+		reason = out.Detail()
+		if reason == "" && commitErr != nil {
+			reason = commitErr.Error()
+		}
+		if out.Status() == fsm.DurabilityCommitted && (commitErr != nil || !newRev.IsValid()) {
+			if reason == "" {
+				reason = "committed durability missing valid revision"
+			}
+			return fsm.DurabilityOutcomeUnknown, newRev, out, reason, commitErr
+		}
+		return out.Status(), newRev, out, reason, commitErr
+	}
+	if commitErr == nil {
+		return fsm.DurabilityOutcomeUnknown, newRev, zeroVal[ports.DurabilityOutcome](), "store returned invalid DurabilityOutcome", nil
+	}
+	return classifyCommitCASError(commitErr), newRev, zeroVal[ports.DurabilityOutcome](), commitErr.Error(), commitErr
+}
+
 func (s *Service) runEffectCommitConfigCAS(
 	ctx context.Context,
 	newRef secret.Ref,
@@ -262,26 +384,17 @@ func (s *Service) runEffectCommitConfigCAS(
 		rs.causeErr = err
 		return fsm.VaultInputCommitCASResult(fsm.DurabilityNotApplied, err.Error())
 	}
-	out, commitErr := s.store.CommitCAS(ctx, snap.Revision(), nextGraph)
+	status, rev, out, reason, commitErr := CommitGraphCAS(ctx, s.store, snap.Revision(), nextGraph)
 	if out.IsValid() {
 		rs.durability = algebraic.Some(out)
-		if rev, ok := out.Revision().Get(); ok {
-			rs.revision = algebraic.Some(rev)
-		}
-		if commitErr != nil {
-			rs.causeErr = commitErr
-		}
-		reason := out.Detail()
-		if reason == "" && commitErr != nil {
-			reason = commitErr.Error()
-		}
-		return fsm.VaultInputCommitCASResult(out.Status(), reason)
 	}
-	if commitErr == nil {
-		return fsm.VaultInputCommitCASResult(fsm.DurabilityOutcomeUnknown, "store returned invalid DurabilityOutcome")
+	if rev.IsValid() {
+		rs.revision = algebraic.Some(rev)
 	}
-	rs.causeErr = commitErr
-	return fsm.VaultInputCommitCASResult(classifyCommitCASError(commitErr), commitErr.Error())
+	if commitErr != nil {
+		rs.causeErr = commitErr
+	}
+	return fsm.VaultInputCommitCASResult(status, reason)
 }
 
 func (s *Service) runEffectCheckOldRefs(
@@ -311,61 +424,48 @@ func (s *Service) runEffectDeleteVaultSecret(
 	rs *sagaRunState,
 ) (fsm.VaultSagaInput, error) {
 	err := s.vault.Delete(ctx, ref)
-	if err == nil {
+	// Saga 补偿删新凭据与后置删旧凭据的后置条件均为「目标条目不存在」：ErrSecretNotFound 幂等视为已满足。
+	if err == nil || errors.Is(err, ports.ErrSecretNotFound) {
 		return build(fsm.SideEffectSucceeded, "")
 	}
 	if rs.causeErr == nil {
 		rs.causeErr = err
+	} else {
+		rs.causeErr = errors.Join(rs.causeErr, err)
 	}
 	return build(classifyVaultDeleteError(err), err.Error())
 }
 
 func classifyVaultWriteError(err error) fsm.SideEffectOutcome {
-	if errors.Is(err, ports.ErrVaultLocked) ||
-		errors.Is(err, ports.ErrInvalidArgument) ||
-		errors.Is(err, ports.ErrPermissionDenied) ||
-		errors.Is(err, ports.ErrAlreadyExists) ||
-		errors.Is(err, ports.ErrLimitExceeded) ||
-		errors.Is(err, ports.ErrSecretVerifyFailed) {
+	switch {
+	case errors.Is(err, ports.ErrVaultLocked), errors.Is(err, ports.ErrInvalidArgument), errors.Is(err, ports.ErrPermissionDenied),
+		errors.Is(err, ports.ErrAlreadyExists), errors.Is(err, ports.ErrLimitExceeded), errors.Is(err, ports.ErrSecretVerifyFailed):
 		return fsm.SideEffectFailedNotApplied
-	}
-	return fsm.SideEffectOutcomeUnknown
-}
-
-func classifyReadbackError(err error) fsm.SideEffectOutcome {
-	if errors.Is(err, ports.ErrSecretNotFound) ||
-		errors.Is(err, ports.ErrSecretVerifyFailed) ||
-		errors.Is(err, ports.ErrCorruptData) {
-		return fsm.SideEffectFailedNotApplied
-	}
-	return fsm.SideEffectOutcomeUnknown
-}
-
-func classifyVerifyHookError(err error) fsm.SideEffectOutcome {
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	default:
 		return fsm.SideEffectOutcomeUnknown
 	}
-	return fsm.SideEffectFailedNotApplied
 }
-
-func classifyCommitCASError(err error) fsm.DurabilityStatus {
-	if errors.Is(err, ports.ErrRevisionConflict) ||
-		errors.Is(err, ports.ErrInvalidArgument) ||
-		errors.Is(err, ports.ErrInvalidRevision) ||
-		errors.Is(err, ports.ErrPermissionDenied) ||
-		errors.Is(err, ports.ErrLimitExceeded) ||
-		errors.Is(err, ports.ErrNotFound) ||
-		errors.Is(err, ports.ErrAlreadyExists) {
-		return fsm.DurabilityNotApplied
+func classifyReadbackError(err error) fsm.SideEffectOutcome {
+	if errors.Is(err, ports.ErrSecretNotFound) || errors.Is(err, ports.ErrSecretVerifyFailed) || errors.Is(err, ports.ErrCorruptData) {
+		return fsm.SideEffectFailedNotApplied
 	}
-	return fsm.DurabilityOutcomeUnknown
+	return fsm.SideEffectOutcomeUnknown
 }
 
+// classifyVerifyHookError 将 CommitConfigCAS 之前只读 VerifyNewRef 的一切失败（含取消与超时）
+// 统一归类为 SideEffectFailedNotApplied，确保状态机立即执行有界非取消补偿删除新写凭据。
+func classifyVerifyHookError(_ error) fsm.SideEffectOutcome { return fsm.SideEffectFailedNotApplied }
+func classifyCommitCASError(err error) fsm.DurabilityStatus {
+	switch {
+	case errors.Is(err, ports.ErrRevisionConflict), errors.Is(err, ports.ErrInvalidArgument), errors.Is(err, ports.ErrInvalidRevision),
+		errors.Is(err, ports.ErrPermissionDenied), errors.Is(err, ports.ErrLimitExceeded), errors.Is(err, ports.ErrNotFound), errors.Is(err, ports.ErrAlreadyExists):
+		return fsm.DurabilityNotApplied
+	default:
+		return fsm.DurabilityOutcomeUnknown
+	}
+}
 func classifyVaultDeleteError(err error) fsm.SideEffectOutcome {
-	if errors.Is(err, ports.ErrVaultLocked) ||
-		errors.Is(err, ports.ErrSecretNotFound) ||
-		errors.Is(err, ports.ErrInvalidArgument) ||
-		errors.Is(err, ports.ErrPermissionDenied) {
+	if errors.Is(err, ports.ErrVaultLocked) || errors.Is(err, ports.ErrInvalidArgument) || errors.Is(err, ports.ErrPermissionDenied) {
 		return fsm.SideEffectFailedNotApplied
 	}
 	return fsm.SideEffectOutcomeUnknown

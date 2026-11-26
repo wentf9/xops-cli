@@ -2,7 +2,6 @@ package inventory
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 
@@ -12,16 +11,19 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/gate"
+	"github.com/wentf9/xops-cli/core/internal/usecase/credential"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-// QueryRequest、SecretRefCheckRequest、各类资产 CAS 写请求与不可变 MutationResult 定义。
+// QueryRequest、SecretRefCheckRequest、资产 CAS 写请求与 MutationResult 定义。
 type (
+	// QueryRequest 描述只读资产查询与 DAG 校验的通用门控参数。
 	QueryRequest struct {
 		Risk            algebraic.Option[security.RiskLevel]
 		Approval        algebraic.Option[gate.ApprovalSubmission]
 		OperationStream *events.OperationStream
 	}
+	// SecretRefCheckRequest 描述全图 5 位置与 Pending 凭据引用检查请求（Ref 与 StoreID 二选一）。
 	SecretRefCheckRequest struct {
 		Ref             secret.Ref
 		StoreID         string
@@ -30,6 +32,7 @@ type (
 		Approval        algebraic.Option[gate.ApprovalSubmission]
 		OperationStream *events.OperationStream
 	}
+	// HostMutationRequest 描述创建或更新 Host 的乐观并发 CAS 写请求。
 	HostMutationRequest struct {
 		Host             inventory.Host
 		ExpectedRevision algebraic.Option[ports.Revision]
@@ -38,6 +41,7 @@ type (
 		Approval         algebraic.Option[gate.ApprovalSubmission]
 		OperationStream  *events.OperationStream
 	}
+	// DeleteHostRequest 描述删除 Host 的 CAS 写请求（受节点反向引用保护）。
 	DeleteHostRequest struct {
 		ID               inventory.HostID
 		ExpectedRevision algebraic.Option[ports.Revision]
@@ -46,6 +50,7 @@ type (
 		Approval         algebraic.Option[gate.ApprovalSubmission]
 		OperationStream  *events.OperationStream
 	}
+	// IdentityMutationRequest 描述创建或更新 Identity 的 CAS 写请求（可选回收旧凭据）。
 	IdentityMutationRequest struct {
 		Identity                 inventory.Identity
 		ExpectedRevision         algebraic.Option[ports.Revision]
@@ -55,6 +60,7 @@ type (
 		Approval                 algebraic.Option[gate.ApprovalSubmission]
 		OperationStream          *events.OperationStream
 	}
+	// DeleteIdentityRequest 描述删除 Identity 的 CAS 写请求（受反向引用及 5 位置+Pending 凭据保护）。
 	DeleteIdentityRequest struct {
 		ID                                              inventory.IdentityID
 		ExpectedRevision                                algebraic.Option[ports.Revision]
@@ -65,6 +71,7 @@ type (
 		Approval                                        algebraic.Option[gate.ApprovalSubmission]
 		OperationStream                                 *events.OperationStream
 	}
+	// NodeMutationRequest 描述创建或更新 Node 的 CAS 写请求（执行跨命名空间 Tarjan DAG 校验）。
 	NodeMutationRequest struct {
 		Node                     inventory.Node
 		ExpectedRevision         algebraic.Option[ports.Revision]
@@ -74,6 +81,7 @@ type (
 		Approval                 algebraic.Option[gate.ApprovalSubmission]
 		OperationStream          *events.OperationStream
 	}
+	// DeleteNodeRequest 描述删除 Node 的 CAS 写请求（受 ProxyJump 反向引用及提权凭据保护）。
 	DeleteNodeRequest struct {
 		ID                                              inventory.NodeID
 		ExpectedRevision                                algebraic.Option[ports.Revision]
@@ -84,6 +92,8 @@ type (
 		Approval                                        algebraic.Option[gate.ApprovalSubmission]
 		OperationStream                                 *events.OperationStream
 	}
+	// MutationResult 封装 CAS 资产写入/删除成功后的不可变版本、持久化结论与凭据回收摘要；零值恒无效。
+	//
 	//xops:opaque
 	//xops:failclosed
 	MutationResult struct {
@@ -94,18 +104,18 @@ type (
 		valid           bool
 	}
 	casMutationSpec struct {
-		action, nodeID, summary string
-		expectedRevision        algebraic.Option[ports.Revision]
-		gcSecrets               bool
-		extraPending            []inventory.PendingSecretRef
-		risk                    security.RiskLevel
-		approval                algebraic.Option[gate.ApprovalSubmission]
-		stream                  *events.OperationStream
-		mutate                  func(authCtx context.Context, g inventory.Graph) (inventory.Graph, []secret.Ref, error)
+		valid, gcSecrets, requireSecretsUnref bool
+		label, action, nodeID, targetID, sum  string
+		expectedRevision                      algebraic.Option[ports.Revision]
+		extraPending                          []inventory.PendingSecretRef
+		risk                                  algebraic.Option[security.RiskLevel]
+		approval                              algebraic.Option[gate.ApprovalSubmission]
+		stream                                *events.OperationStream
+		mutate                                func(inventory.Graph) ([]inventory.Host, []inventory.Identity, []inventory.Node, []secret.Ref, error)
 	}
 )
 
-// MutationResult 只读访问器。
+// MutationResult 只读访问器（零值恒无效）。
 func (r MutationResult) IsValid() bool {
 	return r.valid && r.revision.IsValid() && r.durability.IsValid()
 }
@@ -115,7 +125,7 @@ func (r MutationResult) Durability() ports.DurabilityOutcome { return r.durabili
 func (r MutationResult) DeletedSecrets() []secret.Ref        { return slices.Clone(r.deletedSecrets) }
 func (r MutationResult) RetainedSecrets() []RetainedSecret   { return slices.Clone(r.retainedSecrets) }
 
-// GetSnapshot、List*、Get*、ValidateDAG 与 CheckSecretReferences 提供经 CapInspect 鉴权的只读查询与校验。
+// GetSnapshot、List* 与 Get* 提供经 CapInspect 鉴权的只读快照、全量列表与按 ID 单实体查询。
 func (s *Service) GetSnapshot(ctx context.Context, req QueryRequest) (ports.InventorySnapshot, error) {
 	return runInspect(ctx, s, "get_snapshot", "load inventory snapshot", req.Risk, req.Approval, req.OperationStream, func(c context.Context) (ports.InventorySnapshot, error) { return s.store.Load(c) })
 }
@@ -146,6 +156,7 @@ func (s *Service) GetNode(ctx context.Context, id inventory.NodeID, req QueryReq
 }
 func getAssetByID[T any, ID fmt.Stringer](ctx context.Context, s *Service, req QueryRequest, kind string, id ID, idValid bool, extract func(inventory.Graph) []T, match func(T) bool) (z T, rev ports.Revision, err error) {
 	if !idValid {
+		closeIfNonNil(req.OperationStream)
 		return z, rev, fmt.Errorf("%w: %s ID 无效", ErrInvalidRequest, kind)
 	}
 	items, rev, err := listAssets(ctx, s, req, extract)
@@ -158,43 +169,50 @@ func getAssetByID[T any, ID fmt.Stringer](ctx context.Context, s *Service, req Q
 	return z, zeroVal[ports.Revision](), fmt.Errorf("%w: %s %q", ErrAssetNotFound, kind, id)
 }
 
-// ValidateDAG 经 CapInspect 鉴权对托管资产图与实时 OpenSSH 虚拟主机执行跨命名空间 Tarjan SCC ProxyJump DAG 校验。
+// ValidateDAG 经 CapInspect 鉴权对托管资产图与全部 OpenSSH 虚拟主机执行跨命名空间 Tarjan SCC ProxyJump 校验；
+// 检测到环路返回 ErrProxyJumpCycle 时保留 DAGReport.Cycles 供调用方诊断。
 func (s *Service) ValidateDAG(ctx context.Context, req QueryRequest) (inventory.DAGReport, error) {
-	return runInspect(ctx, s, "validate_dag", "validate cross-namespace proxy DAG", req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context) (inventory.DAGReport, error) {
-		snap, err := s.store.Load(authCtx)
+	return runInspect(ctx, s, "validate_dag", "validate cross-namespace proxy DAG", req.Risk, req.Approval, req.OperationStream, func(c context.Context) (inventory.DAGReport, error) {
+		snap, err := s.store.Load(c)
+		var openSSH []inventory.OpenSSHJumpNode
+		if err == nil {
+			openSSH, err = s.collectOpenSSHJumpNodes(c)
+		}
 		if err != nil {
 			return inventory.DAGReport{}, err
 		}
-		openSSHNodes, err := s.collectOpenSSHJumpNodes(authCtx)
-		if err != nil {
-			return inventory.DAGReport{}, err
-		}
-		return inventory.ValidateProxyDAG(snap.Graph().Nodes(), openSSHNodes, s.maxJumpDepth)
+		return inventory.ValidateProxyDAG(snap.Graph().Nodes(), openSSH, s.maxJumpDepth)
 	})
 }
 
-// CheckSecretReferences 经 CapInspect 鉴权扫描全部 5 位置与活跃 Pending 租约，返回指向指定 Ref 或 StoreID 的引用清单。
+// CheckSecretReferences 经 CapInspect 鉴权在受权回调内同步快照 5 位置与活跃 Pending 租约，返回指定 Ref 或 StoreID 的全部引用清单。
 func (s *Service) CheckSecretReferences(ctx context.Context, req SecretRefCheckRequest) ([]inventory.SecretReference, error) {
-	hasRef, hasStore := req.Ref.IsValid(), req.StoreID != ""
-	if hasRef == hasStore {
+	hasRef := req.Ref.IsValid()
+	if hasRef == (req.StoreID != "") {
 		closeIfNonNil(req.OperationStream)
 		return nil, fmt.Errorf("%w: Ref 与 StoreID 必须二选一提供", ErrInvalidRequest)
 	}
-	pending, err := s.mergePendingRefsExcluding(zeroVal[security.OperationID](), req.ExtraPending)
-	if err != nil {
+	if err := validateExtraPending(req.ExtraPending); err != nil {
 		closeIfNonNil(req.OperationStream)
 		return nil, err
 	}
-	return runInspect(ctx, s, "check_secret_references", "check 5-location secret references", req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context) ([]inventory.SecretReference, error) {
-		snap, lErr := s.store.Load(authCtx)
-		if lErr != nil {
-			return nil, lErr
+	return runInspect(ctx, s, "check_secret_references", "check 5-location secret references", req.Risk, req.Approval, req.OperationStream, func(c context.Context) ([]inventory.SecretReference, error) {
+		snap, err := s.store.Load(c)
+		var pending []inventory.PendingSecretRef
+		if err == nil {
+			pending, err = s.mergePendingRefsExcluding(zeroVal[security.OperationID](), req.ExtraPending)
 		}
-		return pickIf(hasRef, snap.Graph().FindSecretReferences(req.Ref, pending...), snap.Graph().FindStoreReferences(req.StoreID, pending...)), nil
+		if err != nil {
+			return nil, err
+		}
+		if hasRef {
+			return snap.Graph().FindSecretReferences(req.Ref, pending...), nil
+		}
+		return snap.Graph().FindStoreReferences(req.StoreID, pending...), nil
 	})
 }
 
-// Create*/Update*/Delete* 提供经 CapMutate 鉴权、全图 Tarjan DAG 校验与 5 位置+Pending 凭据保护的 CAS 写操作。
+// Create*/Update* 提供经 CapMutate 鉴权、跨命名空间 Tarjan DAG 校验与可选旧凭据安全 GC 的乐观并发 CAS 写操作。
 func (s *Service) CreateHost(ctx context.Context, req HostMutationRequest) (MutationResult, error) {
 	return s.mutateHost(ctx, req, false)
 }
@@ -213,82 +231,90 @@ func (s *Service) CreateNode(ctx context.Context, req NodeMutationRequest) (Muta
 func (s *Service) UpdateNode(ctx context.Context, req NodeMutationRequest) (MutationResult, error) {
 	return s.mutateNode(ctx, req, true)
 }
-func (s *Service) mutateHost(ctx context.Context, req HostMutationRequest, isUpdate bool) (MutationResult, error) {
-	return runValidMutation(ctx, s, req.Host.IsValid(), "Host", pickIf(isUpdate, "update_host", "create_host"), "", req.Host.ID().String(), req.ScopeSummary, req.ExpectedRevision, false, nil, req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context, g inventory.Graph) (inventory.Graph, []secret.Ref, error) {
-		hosts, _, err := upsertAsset(g.Hosts(), req.Host, isUpdate, "host", req.Host.ID().String(), func(h inventory.Host) bool { return h.ID().Equal(req.Host.ID()) })
-		return s.finishGraph(authCtx, g, hosts, g.Identities(), g.Nodes(), nil, err)
-	})
-}
-func (s *Service) DeleteHost(ctx context.Context, req DeleteHostRequest) (MutationResult, error) {
-	return runValidMutation(ctx, s, req.ID.IsValid(), "HostID", "delete_host", "", req.ID.String(), req.ScopeSummary, req.ExpectedRevision, false, nil, req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context, g inventory.Graph) (inventory.Graph, []secret.Ref, error) {
-		hosts, _, err := removeProtectedAsset(g.Hosts(), "host", req.ID.String(), func(h inventory.Host) bool { return h.ID().Equal(req.ID) }, func() (bool, []inventory.AssetReference) { return g.CanDeleteHost(req.ID) })
-		return s.finishGraph(authCtx, g, hosts, g.Identities(), g.Nodes(), nil, err)
-	})
-}
-func (s *Service) mutateIdentity(ctx context.Context, req IdentityMutationRequest, isUpdate bool) (MutationResult, error) {
-	return runValidMutation(ctx, s, req.Identity.IsValid(), "Identity", pickIf(isUpdate, "update_identity", "create_identity"), "", req.Identity.ID().String(), req.ScopeSummary, req.ExpectedRevision, isUpdate && req.GCUnreferencedOldSecrets, nil, req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context, g inventory.Graph) (inventory.Graph, []secret.Ref, error) {
-		idents, prev, err := upsertAsset(g.Identities(), req.Identity, isUpdate, "identity", req.Identity.ID().String(), func(i inventory.Identity) bool { return i.ID().Equal(req.Identity.ID()) })
-		return s.finishGraph(authCtx, g, g.Hosts(), idents, g.Nodes(), pickIf(isUpdate, secretRefsForIdentity(g, prev.ID()), nil), err)
-	})
-}
-func (s *Service) DeleteIdentity(ctx context.Context, req DeleteIdentityRequest) (MutationResult, error) {
-	return runValidMutation(ctx, s, req.ID.IsValid(), "IdentityID", "delete_identity", "", req.ID.String(), req.ScopeSummary, req.ExpectedRevision, req.DeleteUnusedSecrets, req.ExtraPending, req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context, g inventory.Graph) (inventory.Graph, []secret.Ref, error) {
-		idents, _, err := removeProtectedAsset(g.Identities(), "identity", req.ID.String(), func(i inventory.Identity) bool { return i.ID().Equal(req.ID) }, func() (bool, []inventory.AssetReference) { return g.CanDeleteIdentity(req.ID) })
-		next, refs, bErr := s.finishGraph(authCtx, g, g.Hosts(), idents, g.Nodes(), secretRefsForIdentity(g, req.ID), err)
-		return s.finalizeDeleteMutation(next, refs, req.RequireSecretsUnreferenced, req.ExtraPending, bErr)
-	})
-}
-func (s *Service) mutateNode(ctx context.Context, req NodeMutationRequest, isUpdate bool) (MutationResult, error) {
-	return runValidMutation(ctx, s, req.Node.IsValid(), "Node", pickIf(isUpdate, "update_node", "create_node"), req.Node.ID().String(), req.Node.ID().String(), req.ScopeSummary, req.ExpectedRevision, isUpdate && req.GCUnreferencedOldSecrets, nil, req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context, g inventory.Graph) (inventory.Graph, []secret.Ref, error) {
-		nodes, prev, err := upsertAsset(g.Nodes(), req.Node, isUpdate, "node", req.Node.ID().String(), func(n inventory.Node) bool { return n.ID().Equal(req.Node.ID()) })
-		return s.finishGraph(authCtx, g, g.Hosts(), g.Identities(), nodes, pickIf(isUpdate, nodePrivSecretRefs(prev), nil), err)
-	})
-}
-func (s *Service) DeleteNode(ctx context.Context, req DeleteNodeRequest) (MutationResult, error) {
-	return runValidMutation(ctx, s, req.ID.IsValid(), "NodeID", "delete_node", req.ID.String(), req.ID.String(), req.ScopeSummary, req.ExpectedRevision, req.DeleteUnusedSecrets, req.ExtraPending, req.Risk, req.Approval, req.OperationStream, func(authCtx context.Context, g inventory.Graph) (inventory.Graph, []secret.Ref, error) {
-		nodes, removed, err := removeProtectedAsset(g.Nodes(), "node", req.ID.String(), func(n inventory.Node) bool { return n.ID().Equal(req.ID) }, func() (bool, []inventory.AssetReference) { return g.CanDeleteNode(req.ID) })
-		next, refs, bErr := s.finishGraph(authCtx, g, g.Hosts(), g.Identities(), nodes, nodePrivSecretRefs(removed), err)
-		return s.finalizeDeleteMutation(next, refs, req.RequireSecretsUnreferenced, req.ExtraPending, bErr)
+
+func (s *Service) mutateHost(ctx context.Context, req HostMutationRequest, upd bool) (MutationResult, error) {
+	return s.runCASMutation(ctx, casMutationSpec{
+		valid: req.Host.IsValid(), label: "Host", action: pickIf(upd, "update_host", "create_host"), targetID: req.Host.ID().String(),
+		sum: req.ScopeSummary, expectedRevision: req.ExpectedRevision, risk: req.Risk, approval: req.Approval, stream: req.OperationStream,
+		mutate: func(g inventory.Graph) ([]inventory.Host, []inventory.Identity, []inventory.Node, []secret.Ref, error) {
+			hosts, _, err := upsertAsset(g.Hosts(), req.Host, upd, "host", req.Host.ID().String(), func(h inventory.Host) bool { return h.ID().Equal(req.Host.ID()) })
+			return hosts, g.Identities(), g.Nodes(), nil, err
+		},
 	})
 }
 
-func (s *Service) finishGraph(ctx context.Context, base inventory.Graph, hosts []inventory.Host, idents []inventory.Identity, nodes []inventory.Node, refs []secret.Ref, err error) (inventory.Graph, []secret.Ref, error) {
-	if err != nil {
-		return zeroVal[inventory.Graph](), nil, err
-	}
-	next, bErr := s.buildValidatedGraph(ctx, base, hosts, idents, nodes)
-	return next, refs, bErr
+// DeleteHost 经 CapMutate 鉴权与节点反向引用保护后执行 CAS 删除 Host。
+func (s *Service) DeleteHost(ctx context.Context, req DeleteHostRequest) (MutationResult, error) {
+	return s.runCASMutation(ctx, casMutationSpec{
+		valid: req.ID.IsValid(), label: "HostID", action: "delete_host", targetID: req.ID.String(),
+		sum: req.ScopeSummary, expectedRevision: req.ExpectedRevision, risk: req.Risk, approval: req.Approval, stream: req.OperationStream,
+		mutate: func(g inventory.Graph) ([]inventory.Host, []inventory.Identity, []inventory.Node, []secret.Ref, error) {
+			hosts, _, err := removeProtectedAsset(g.Hosts(), "host", req.ID.String(), func(h inventory.Host) bool { return h.ID().Equal(req.ID) }, func() (bool, []inventory.AssetReference) { return g.CanDeleteHost(req.ID) })
+			return hosts, g.Identities(), g.Nodes(), nil, err
+		},
+	})
 }
-func runValidMutation(ctx context.Context, s *Service, ok bool, label, action, nodeID, targetID, customSummary string, expRev algebraic.Option[ports.Revision], gc bool, extra []inventory.PendingSecretRef, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission], stream *events.OperationStream, mutate func(context.Context, inventory.Graph) (inventory.Graph, []secret.Ref, error)) (MutationResult, error) {
+func (s *Service) mutateIdentity(ctx context.Context, req IdentityMutationRequest, upd bool) (MutationResult, error) {
+	return s.runCASMutation(ctx, casMutationSpec{
+		valid: req.Identity.IsValid(), label: "Identity", action: pickIf(upd, "update_identity", "create_identity"), targetID: req.Identity.ID().String(),
+		sum: req.ScopeSummary, expectedRevision: req.ExpectedRevision, gcSecrets: upd && req.GCUnreferencedOldSecrets, risk: req.Risk, approval: req.Approval, stream: req.OperationStream,
+		mutate: func(g inventory.Graph) ([]inventory.Host, []inventory.Identity, []inventory.Node, []secret.Ref, error) {
+			idents, prev, err := upsertAsset(g.Identities(), req.Identity, upd, "identity", req.Identity.ID().String(), func(i inventory.Identity) bool { return i.ID().Equal(req.Identity.ID()) })
+			return g.Hosts(), idents, g.Nodes(), secretRefsIf(err == nil && upd, func() []secret.Ref { return secretRefsForIdentity(g, prev.ID()) }), err
+		},
+	})
+}
+
+// DeleteIdentity 经 CapMutate 鉴权、反向引用保护及 5 位置+Pending 凭据完整性校验后执行 CAS 删除 Identity。
+func (s *Service) DeleteIdentity(ctx context.Context, req DeleteIdentityRequest) (MutationResult, error) {
+	return s.runCASMutation(ctx, casMutationSpec{
+		valid: req.ID.IsValid(), label: "IdentityID", action: "delete_identity", targetID: req.ID.String(),
+		sum: req.ScopeSummary, expectedRevision: req.ExpectedRevision, gcSecrets: req.DeleteUnusedSecrets,
+		requireSecretsUnref: req.RequireSecretsUnreferenced, extraPending: req.ExtraPending, risk: req.Risk, approval: req.Approval, stream: req.OperationStream,
+		mutate: func(g inventory.Graph) ([]inventory.Host, []inventory.Identity, []inventory.Node, []secret.Ref, error) {
+			idents, _, err := removeProtectedAsset(g.Identities(), "identity", req.ID.String(), func(i inventory.Identity) bool { return i.ID().Equal(req.ID) }, func() (bool, []inventory.AssetReference) { return g.CanDeleteIdentity(req.ID) })
+			return g.Hosts(), idents, g.Nodes(), secretRefsIf(err == nil, func() []secret.Ref { return secretRefsForIdentity(g, req.ID) }), err
+		},
+	})
+}
+func (s *Service) mutateNode(ctx context.Context, req NodeMutationRequest, upd bool) (MutationResult, error) {
+	return s.runCASMutation(ctx, casMutationSpec{
+		valid: req.Node.IsValid(), label: "Node", action: pickIf(upd, "update_node", "create_node"), nodeID: req.Node.ID().String(), targetID: req.Node.ID().String(),
+		sum: req.ScopeSummary, expectedRevision: req.ExpectedRevision, gcSecrets: upd && req.GCUnreferencedOldSecrets, risk: req.Risk, approval: req.Approval, stream: req.OperationStream,
+		mutate: func(g inventory.Graph) ([]inventory.Host, []inventory.Identity, []inventory.Node, []secret.Ref, error) {
+			nodes, prev, err := upsertAsset(g.Nodes(), req.Node, upd, "node", req.Node.ID().String(), func(n inventory.Node) bool { return n.ID().Equal(req.Node.ID()) })
+			return g.Hosts(), g.Identities(), nodes, secretRefsIf(err == nil && upd, func() []secret.Ref { return nodePrivSecretRefs(prev) }), err
+		},
+	})
+}
+
+// DeleteNode 经 CapMutate 鉴权、跨命名空间 ProxyJump 反向引用与提权凭据保护后执行 CAS 删除 Node。
+func (s *Service) DeleteNode(ctx context.Context, req DeleteNodeRequest) (MutationResult, error) {
+	return s.runCASMutation(ctx, casMutationSpec{
+		valid: req.ID.IsValid(), label: "NodeID", action: "delete_node", nodeID: req.ID.String(), targetID: req.ID.String(),
+		sum: req.ScopeSummary, expectedRevision: req.ExpectedRevision, gcSecrets: req.DeleteUnusedSecrets,
+		requireSecretsUnref: req.RequireSecretsUnreferenced, extraPending: req.ExtraPending, risk: req.Risk, approval: req.Approval, stream: req.OperationStream,
+		mutate: func(g inventory.Graph) ([]inventory.Host, []inventory.Identity, []inventory.Node, []secret.Ref, error) {
+			nodes, rem, err := removeProtectedAsset(g.Nodes(), "node", req.ID.String(), func(n inventory.Node) bool { return n.ID().Equal(req.ID) }, func() (bool, []inventory.AssetReference) { return g.CanDeleteNode(req.ID) })
+			return g.Hosts(), g.Identities(), nodes, secretRefsIf(err == nil, func() []secret.Ref { return nodePrivSecretRefs(rem) }), err
+		},
+	})
+}
+func secretRefsIf(ok bool, fn func() []secret.Ref) []secret.Ref {
 	if !ok {
-		closeIfNonNil(stream)
-		return MutationResult{}, fmt.Errorf("%w: %s 无效", ErrInvalidRequest, label)
+		return nil
 	}
-	return s.runCASMutation(ctx, casMutationSpec{action, nodeID, pickIf(customSummary != "", customSummary, action+" "+targetID), expRev, gc, extra, risk.OrElse(security.RiskModerate), approval, stream, mutate})
+	return fn()
 }
-func (s *Service) finalizeDeleteMutation(next inventory.Graph, ownedRefs []secret.Ref, requireUnref bool, extra []inventory.PendingSecretRef, err error) (inventory.Graph, []secret.Ref, error) {
-	if err != nil || !requireUnref {
-		return pickIf(err == nil, next, zeroVal[inventory.Graph]()), pickIf(err == nil, ownedRefs, nil), err
-	}
-	pending, pErr := s.mergePendingRefsExcluding(zeroVal[security.OperationID](), extra)
-	if pErr != nil {
-		return zeroVal[inventory.Graph](), nil, pErr
-	}
-	for _, ref := range deduplicateRefs(ownedRefs) {
-		if canGC, blocking := next.CanGCSecret(ref, pending...); !canGC {
-			return zeroVal[inventory.Graph](), nil, newSecretReferencedError(ref.String(), blocking)
-		}
-	}
-	return next, ownedRefs, nil
-}
-func upsertAsset[T any](items []T, item T, isUpdate bool, kind, id string, match func(T) bool) ([]T, T, error) {
+
+func upsertAsset[T any](items []T, item T, upd bool, kind, id string, match func(T) bool) ([]T, T, error) {
 	idx := slices.IndexFunc(items, match)
 	switch {
-	case !isUpdate && idx >= 0:
+	case !upd && idx >= 0:
 		return nil, zeroVal[T](), fmt.Errorf("%w: %s %q", ErrAssetAlreadyExists, kind, id)
-	case isUpdate && idx < 0:
+	case upd && idx < 0:
 		return nil, zeroVal[T](), fmt.Errorf("%w: %s %q", ErrAssetNotFound, kind, id)
-	case isUpdate:
+	case upd:
 		prev := items[idx]
 		items[idx] = item
 		return items, prev, nil
@@ -304,65 +330,96 @@ func removeProtectedAsset[T any](items []T, kind, id string, match func(T) bool,
 	if ok, refs := canDel(); !ok {
 		return nil, zeroVal[T](), newAssetReferencedError(kind, id, refs)
 	}
-	removed := items[idx]
-	return slices.Delete(items, idx, idx+1), removed, nil
+	rem := items[idx]
+	return slices.Delete(items, idx, idx+1), rem, nil
 }
 func (s *Service) runCASMutation(ctx context.Context, spec casMutationSpec) (MutationResult, error) {
-	if rev, ok := spec.expectedRevision.Get(); ok && !rev.IsValid() {
-		closeIfNonNil(spec.stream)
-		return MutationResult{}, fmt.Errorf("%w: ExpectedRevision 无效", ErrInvalidRequest)
+	var vErr error
+	switch {
+	case !spec.valid:
+		vErr = fmt.Errorf("%w: %s 无效", ErrInvalidRequest, spec.label)
+	case spec.expectedRevision.IsSome() && !spec.expectedRevision.OrElse(zeroVal[ports.Revision]()).IsValid():
+		vErr = fmt.Errorf("%w: ExpectedRevision 无效", ErrInvalidRequest)
+	case spec.gcSecrets && s.vault == nil:
+		vErr = ErrVaultUnavailable // 显式请求凭据 GC 但未注入 SecretVault 时写前失败关闭，严禁静默跳过
+	default:
+		vErr = validateExtraPending(spec.extraPending)
 	}
-	return runMutate(ctx, s, spec.action, spec.nodeID, spec.summary, algebraic.Some(spec.risk), spec.approval, spec.stream, func(authCtx context.Context, _ security.TraceID, _ security.OperationID) (MutationResult, string, string, error) {
-		res, unkCode, mErr := s.execCASMutation(authCtx, spec)
-		return res, unkCode, errMsg(mErr), mErr
+	if vErr != nil {
+		closeIfNonNil(spec.stream)
+		return MutationResult{}, vErr
+	}
+	return runMutate(ctx, s, spec.action, spec.nodeID, pickIf(spec.sum != "", spec.sum, spec.action+" "+spec.targetID), spec.risk, spec.approval, spec.stream, func(c context.Context, _ security.TraceID, _ security.OperationID) (MutationResult, string, string, error) {
+		res, unkCode, err := s.execCASMutation(c, spec)
+		return res, unkCode, errMsg(err), err
 	})
 }
-func errMsg(err error) string { return pickIf(err != nil, fmt.Sprint(err), "") }
+func errMsg(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return ""
+}
 func (s *Service) execCASMutation(ctx context.Context, spec casMutationSpec) (MutationResult, string, error) {
 	snap, err := s.loadSnapshotAt(ctx, spec.expectedRevision)
 	if err != nil {
 		return MutationResult{}, "", err
 	}
-	nextGraph, candidateRefs, err := spec.mutate(ctx, snap.Graph())
+	hosts, idents, nodes, refs, err := spec.mutate(snap.Graph())
 	if err != nil {
 		return MutationResult{}, "", err
 	}
-	newRev, out, unkCode, err := s.commitGraphCAS(ctx, snap.Revision(), nextGraph, "commit_missing_revision")
+	nextGraph, err := s.buildValidatedGraph(ctx, snap.Graph(), hosts, idents, nodes)
+	if err == nil && spec.requireSecretsUnref && len(refs) > 0 {
+		err = s.ensureRefsUnreferenced(nextGraph, refs, spec.extraPending)
+	}
 	if err != nil {
-		return MutationResult{}, unkCode, err
+		return MutationResult{}, "", err
 	}
-	if !spec.gcSecrets || len(candidateRefs) == 0 || s.vault == nil {
-		return MutationResult{newRev, out, nil, nil, true}, "", nil
+	_, newRev, out, unkCode, err := s.commitGraphCAS(ctx, snap.Revision(), nextGraph, "commit_missing_revision")
+	if err != nil || !spec.gcSecrets || len(refs) == 0 {
+		return MutationResult{revision: newRev, durability: out, valid: err == nil}, unkCode, err
 	}
-	deleted, retained, gcErr := s.gcUnreferencedAfterCommit(ctx, candidateRefs, spec.extraPending)
-	return MutationResult{newRev, out, deleted, retained, true}, "", gcErr
+	gcRes, _, gcErr := s.gcSecretsDetached(ctx, zeroVal[security.OperationID](), refs, spec.extraPending)
+	res := MutationResult{revision: newRev, durability: out, deletedSecrets: gcRes.Deleted, retainedSecrets: gcRes.Retained, valid: true}
+	return res, pickIf(gcErr != nil, "post_commit_secret_gc_failed", ""), gcErr // 配置已生效，后置 GC 失败须上报 OutcomeUnknown
 }
-func (s *Service) gcUnreferencedAfterCommit(ctx context.Context, candidates []secret.Ref, extra []inventory.PendingSecretRef) ([]secret.Ref, []RetainedSecret, error) {
-	snap, err := s.store.Load(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
+func (s *Service) ensureRefsUnreferenced(next inventory.Graph, refs []secret.Ref, extra []inventory.PendingSecretRef) error {
 	pending, err := s.mergePendingRefsExcluding(zeroVal[security.OperationID](), extra)
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
-	var deleted []secret.Ref
-	var retained []RetainedSecret
-	for _, ref := range deduplicateRefs(candidates) {
-		if canGC, blocking := snap.Graph().CanGCSecret(ref, pending...); !canGC {
-			retained = append(retained, RetainedSecret{ref, blocking})
-		} else if delErr := s.vault.Delete(ctx, ref); delErr == nil {
-			deleted = append(deleted, ref)
-		} else if !errors.Is(delErr, ports.ErrSecretNotFound) {
-			return deleted, retained, delErr
+	sorted := slices.Clone(refs)
+	slices.SortFunc(sorted, secret.Ref.Compare)
+	for _, ref := range slices.CompactFunc(sorted, secret.Ref.Equal) {
+		if canGC, blocking := next.CanGCSecret(ref, pending...); !canGC {
+			return newSecretReferencedError(ref.String(), blocking)
 		}
 	}
-	return deleted, retained, nil
+	return nil
 }
 
+// gcSecretsDetached 在有界 context.WithoutCancel 下重载快照并复用 credential.GCUnreferencedOnGraph 安全清理无引用凭据，
+// 返回 loadFailed 以便区分加载失败（SideEffectFailedNotApplied）与删除失败（SideEffectOutcomeUnknown）。
+func (s *Service) gcSecretsDetached(ctx context.Context, excludeLease security.OperationID, candidates []secret.Ref, extra []inventory.PendingSecretRef) (credential.GCUnreferencedResult, bool, error) {
+	cleanCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupEffectTimeout)
+	defer cancel()
+	snap, err := s.store.Load(cleanCtx)
+	var pending []inventory.PendingSecretRef
+	if err == nil {
+		pending, err = s.mergePendingRefsExcluding(excludeLease, extra)
+	}
+	if err != nil {
+		return credential.GCUnreferencedResult{}, true, err
+	}
+	res, delErr := credential.GCUnreferencedOnGraph(cleanCtx, s.vault, snap.Graph(), candidates, pending)
+	return res, false, delErr
+}
 func nodePrivSecretRefs(n inventory.Node) []secret.Ref {
-	ref, ok := n.PrivilegePasswordRef().Get()
-	return pickIf(ok, []secret.Ref{ref}, nil)
+	if ref, ok := n.PrivilegePasswordRef().Get(); ok {
+		return []secret.Ref{ref}
+	}
+	return nil
 }
 func secretRefsForIdentity(g inventory.Graph, id inventory.IdentityID) []secret.Ref {
 	owner := id.String()
@@ -372,10 +429,6 @@ func secretRefsForIdentity(g inventory.Graph, id inventory.IdentityID) []secret.
 			out = append(out, sr.Ref)
 		}
 	}
-	return deduplicateRefs(out)
-}
-func deduplicateRefs(in []secret.Ref) []secret.Ref {
-	out := slices.Clone(in)
 	slices.SortFunc(out, secret.Ref.Compare)
 	return slices.CompactFunc(out, secret.Ref.Equal)
 }

@@ -7,6 +7,8 @@ import (
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
+	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -121,7 +123,7 @@ func (s *Service) DeleteSecret(ctx context.Context, req DeleteSecretRequest) err
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
-	return gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapMutate]) error {
+	return gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[security.CapMutate]) error {
 		snap, lErr := s.store.Load(authCtx)
 		if lErr != nil {
 			return lErr
@@ -134,12 +136,16 @@ func (s *Service) DeleteSecret(ctx context.Context, req DeleteSecretRequest) err
 		if !canGC {
 			return newSecretReferencedError(req.Ref, refs)
 		}
-		return s.vault.Delete(authCtx, req.Ref)
+		delErr := s.vault.Delete(authCtx, req.Ref)
+		if delErr != nil && !errors.Is(delErr, ports.ErrSecretNotFound) && classifyVaultDeleteError(delErr) == fsm.SideEffectOutcomeUnknown {
+			reportUnknownAuditOutcome(auth, "vault_delete_outcome_unknown", delErr.Error())
+		}
+		return delErr
 	})
 }
 
 // GCUnreferencedSecrets 对去重排序后的候选凭据执行 5 位置 + Pending 零引用核验并安全删除无引用凭据，
-// 任何仍被占用的凭据均保留在 Retained 列表中而不报错中止。
+// 任何仍被占用的凭据均保留在 Retained 列表中而不报错中止；即使 Candidates 为空也必须经 Gate 过闸遵守 Halted 熔断器。
 func (s *Service) GCUnreferencedSecrets(ctx context.Context, req GCUnreferencedRequest) (GCUnreferencedResult, error) {
 	if req.OperationStream != nil {
 		defer req.OperationStream.Close()
@@ -154,44 +160,65 @@ func (s *Service) GCUnreferencedSecrets(ctx context.Context, req GCUnreferencedR
 	if err != nil {
 		return GCUnreferencedResult{}, err
 	}
-	if len(candidates) == 0 {
-		return GCUnreferencedResult{}, nil
-	}
 	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, fmt.Sprintf("gc %d candidate secrets", len(candidates)))
 	gateReq, err := buildMutateGateRequest("vault_gc_secrets", "", nil, req.Risk.OrElse(security.RiskModerate), summary, req.Approval, req.OperationStream)
 	if err != nil {
 		return GCUnreferencedResult{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	var out GCUnreferencedResult
-	err = gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapMutate]) error {
+	err = gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[security.CapMutate]) error {
+		if len(candidates) == 0 {
+			return nil
+		}
+		var deleteAttempted bool
 		var runErr error
-		out, runErr = s.gcCandidatesLocked(authCtx, candidates, req.ExtraPending)
+		out, deleteAttempted, runErr = s.gcCandidatesAuthorized(authCtx, candidates, req.ExtraPending)
+		if runErr != nil && deleteAttempted && (len(out.Deleted) > 0 || classifyVaultDeleteError(runErr) == fsm.SideEffectOutcomeUnknown) {
+			reportUnknownAuditOutcome(auth, "vault_gc_partial_or_unknown", runErr.Error())
+		}
 		return runErr
 	})
 	return out, err
 }
 
-func (s *Service) gcCandidatesLocked(
+func (s *Service) gcCandidatesAuthorized(
 	ctx context.Context,
 	candidates []secret.Ref,
 	extraPending []inventory.PendingSecretRef,
-) (GCUnreferencedResult, error) {
+) (GCUnreferencedResult, bool, error) {
 	snap, err := s.store.Load(ctx)
 	if err != nil {
-		return GCUnreferencedResult{}, err
+		return GCUnreferencedResult{}, false, err
 	}
 	pending, err := s.collectPendingRefs(extraPending)
 	if err != nil {
+		return GCUnreferencedResult{}, false, err
+	}
+	res, gcErr := GCUnreferencedOnGraph(ctx, s.vault, snap.Graph(), candidates, pending)
+	return res, true, gcErr
+}
+
+// GCUnreferencedOnGraph 基于已加载的资产图 g 与活跃 Pending 集合，对去重排序后的候选凭据执行 5 位置+Pending
+// 零引用核验并删除无引用条目（供 credential 与 inventory 后置 GC / 暂存清理统一复用）。
+func GCUnreferencedOnGraph(
+	ctx context.Context,
+	vault ports.SecretVault,
+	g inventory.Graph,
+	candidates []secret.Ref,
+	pending []inventory.PendingSecretRef,
+) (GCUnreferencedResult, error) {
+	uniq, err := canonicalizeSecretRefs(candidates)
+	if err != nil || len(uniq) == 0 {
 		return GCUnreferencedResult{}, err
 	}
 	var res GCUnreferencedResult
-	for _, ref := range candidates {
-		canGC, refs := snap.Graph().CanGCSecret(ref, pending...)
+	for _, ref := range uniq {
+		canGC, refs := g.CanGCSecret(ref, pending...)
 		if !canGC {
 			res.Retained = append(res.Retained, RetainedSecret{Ref: ref, References: refs})
 			continue
 		}
-		delErr := s.vault.Delete(ctx, ref)
+		delErr := vault.Delete(ctx, ref)
 		switch {
 		case delErr == nil:
 			res.Deleted = append(res.Deleted, ref)
@@ -202,6 +229,15 @@ func (s *Service) gcCandidatesLocked(
 		}
 	}
 	return res, nil
+}
+
+func reportUnknownAuditOutcome(auth gate.Authorized[security.CapMutate], code, detail string) {
+	if code == "" || !auth.IsValid() {
+		return
+	}
+	if unk, err := execution.NewOutcomeUnknown(execution.ExecPhaseRunning, code, detail); err == nil {
+		_ = auth.ReportOutcome(unk)
+	}
 }
 
 // ReplaceSecretRefInGraph 以纯函数方式将资产图全部 5 位置中等于 oldRef 的凭据引用替换为 newRef，

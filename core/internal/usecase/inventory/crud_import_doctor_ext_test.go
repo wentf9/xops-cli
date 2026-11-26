@@ -496,18 +496,29 @@ func TestDelete_FiveLocationAndPendingSecretIntegrity(t *testing.T) {
 	}
 
 	host := mustTestHost(t, "h-sec", "198.51.100.60", 22)
-	_, _ = h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: host})
+	if _, err := h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: host}); err != nil {
+		t.Fatalf("CreateHost(h-sec): %v", err)
+	}
 
 	authAll := buildFiveLocationCompositeAuth(t, rPwd, rKey, rTOTP, rChal)
 	idDel := mustTestIdentity(t, "id-del", "ops", authAll)
 	// idKeep 共享 rPwd 以测试安全保留；其余 rKey/rTOTP/rChal 独占可被 GC。
-	authShared, _ := inventory.NewAuthPassword(rPwd)
+	authShared, err := inventory.NewAuthPassword(rPwd)
+	if err != nil {
+		t.Fatalf("NewAuthPassword: %v", err)
+	}
 	idKeep := mustTestIdentity(t, "id-keep", "ops", authShared)
-	_, _ = h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: idDel})
-	_, _ = h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: idKeep})
+	if _, err := h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: idDel}); err != nil {
+		t.Fatalf("CreateIdentity(id-del): %v", err)
+	}
+	if _, err := h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: idKeep}); err != nil {
+		t.Fatalf("CreateIdentity(id-keep): %v", err)
+	}
 
 	nPriv := mustTestNode(t, "n-priv", "h-sec", "id-keep", nil, nil, algebraic.Some(rPriv), nil)
-	_, _ = h.svc.CreateNode(ctx, ucinv.NodeMutationRequest{Node: nPriv})
+	if _, err := h.svc.CreateNode(ctx, ucinv.NodeMutationRequest{Node: nPriv}); err != nil {
+		t.Fatalf("CreateNode(n-priv): %v", err)
+	}
 
 	extraPend := []inventory.PendingSecretRef{{OwnerID: "pending:test", Ref: rPend}}
 	storeRefs, err := h.svc.CheckSecretReferences(ctx, ucinv.SecretRefCheckRequest{StoreID: testStoreName, ExtraPending: extraPend})
@@ -627,9 +638,15 @@ func TestDoctor_ReadOnlyZeroLeakAndDiagnostics(t *testing.T) {
 	hUnused := mustTestHost(t, "h-unused", "198.51.100.82", 22)
 	idUsed := mustTestIdentity(t, "id-used", "ops", compAuth)
 	nShadow := mustTestNode(t, "shadowed", "h-used", "id-used", nil, nil, algebraic.None[secret.Ref](), nil)
-	_, _ = h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: hUsed})
-	_, _ = h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: hUnused})
-	_, _ = h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: idUsed})
+	if _, err := h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: hUsed}); err != nil {
+		t.Fatalf("CreateHost(h-used): %v", err)
+	}
+	if _, err := h.svc.CreateHost(ctx, ucinv.HostMutationRequest{Host: hUnused}); err != nil {
+		t.Fatalf("CreateHost(h-unused): %v", err)
+	}
+	if _, err := h.svc.CreateIdentity(ctx, ucinv.IdentityMutationRequest{Identity: idUsed}); err != nil {
+		t.Fatalf("CreateIdentity(id-used): %v", err)
+	}
 	lastMut, err := h.svc.CreateNode(ctx, ucinv.NodeMutationRequest{Node: nShadow})
 	if err != nil {
 		t.Fatalf("CreateNode: %v", err)

@@ -30,6 +30,7 @@ const (
 	toolCredential           = "credential"
 	randomSecretItemBytes    = 16
 	terminalEventEmitTimeout = 50 * time.Millisecond
+	cleanupEffectTimeout     = 5 * time.Second
 )
 
 // 本包导出的规范哨兵错误，供用例调用方、core/engine 与测试以 errors.Is 精确判定故障类别。

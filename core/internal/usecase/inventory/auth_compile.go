@@ -16,12 +16,7 @@ import (
 //   - 严格遵守 IdentitiesOnly=yes（禁用未限定 SSH Agent 枚举）；
 //   - 严格遵守 BatchMode=yes（禁用交互式 Keyboard-Interactive 质询回退）；
 //   - 自动展开 IdentityFile / CertificateFile 中的 OpenSSH % 占位符与 ${ENV} 引用。
-func compileHopAuth(
-	policy option.EffectivePolicy,
-	user option.Username,
-	env ports.EnvPort,
-	explicit inventory.AuthMethod,
-) (inventory.AuthMethod, error) {
+func compileHopAuth(policy option.EffectivePolicy, user option.Username, env ports.EnvPort, explicit inventory.AuthMethod) (inventory.AuthMethod, error) {
 	if explicit != nil {
 		if !explicit.IsValid() {
 			return nil, fmt.Errorf("%w: 显式 AuthMethod 无效", ErrNoAuthMethod)
@@ -29,92 +24,59 @@ func compileHopAuth(
 		return explicit, nil
 	}
 	tc := buildTokenContext(policy, user, env)
-	certs, err := compileCertPaths(policy.CertificateFiles(), tc, env)
-	if err != nil {
-		return nil, err
+	certs, err := expandOptionPaths(policy.CertificateFiles(), "CertificateFile", tc, env, inventory.ParseCertPathSpec)
+	var privKey, agentAuth, kiAuth inventory.AuthMethod
+	if err == nil {
+		privKey, err = compilePrivateKeyAuth(policy.IdentityFiles(), certs, tc, env)
 	}
-	privKey, err := compilePrivateKeyAuth(policy.IdentityFiles(), certs, tc, env)
-	if err != nil {
-		return nil, err
-	}
-	var agentAuth inventory.AuthMethod
-	if !policy.IdentitiesOnly() {
+	if err == nil && !policy.IdentitiesOnly() {
 		agentAuth, err = inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
-		if err != nil {
-			return nil, err
-		}
 	}
-	var kiAuth inventory.AuthMethod
-	if !policy.BatchMode() {
+	if err == nil && !policy.BatchMode() {
 		kiAuth, err = buildInteractiveFallbackAuth()
-		if err != nil {
-			return nil, err
-		}
+	}
+	if err != nil {
+		return nil, err
 	}
 	return assembleOrderedAuth(policy.IdentityFiles().IsSet(), privKey, agentAuth, kiAuth)
 }
 
 func assembleOrderedAuth(explicitKeys bool, privKey, agentAuth, kiAuth inventory.AuthMethod) (inventory.AuthMethod, error) {
-	var raw [3]inventory.AuthMethod
-	if explicitKeys {
-		// 显式指定 -i / IdentityFile 时优先尝试指定私钥，其次 SSH Agent（未启 IdentitiesOnly 时），最后质询。
-		raw = [3]inventory.AuthMethod{privKey, agentAuth, kiAuth}
-	} else {
-		// 默认回退路径按 OpenSSH 顺序先尝试 SSH Agent，再尝试默认私钥，最后交互质询。
-		raw = [3]inventory.AuthMethod{agentAuth, privKey, kiAuth}
-	}
+	// 显式指定 IdentityFile 时私钥优先，否则按 OpenSSH 默认顺序 Agent -> 私钥 -> 质询。
+	raw := pickIf(explicitKeys, [3]inventory.AuthMethod{privKey, agentAuth, kiAuth}, [3]inventory.AuthMethod{agentAuth, privKey, kiAuth})
 	methods := make([]inventory.AuthMethod, 0, 3)
 	for _, m := range raw {
 		if m != nil && m.IsValid() {
 			methods = append(methods, m)
 		}
 	}
-	if len(methods) == 0 {
+	switch len(methods) {
+	case 0:
 		return nil, fmt.Errorf("%w: %w", ErrNoAuthMethod, ports.ErrAuthFailed)
-	}
-	if len(methods) == 1 {
+	case 1:
 		return methods[0], nil
+	default:
+		ne, err := algebraic.NonEmptyFromSlice(methods)
+		if err != nil {
+			return nil, err
+		}
+		return inventory.NewAuthComposite(ne)
 	}
-	ne, err := algebraic.NonEmptyFromSlice(methods)
-	if err != nil {
-		return nil, err
-	}
-	return inventory.NewAuthComposite(ne)
 }
 
-func compilePrivateKeyAuth(
-	idFiles option.PathList,
-	certs []inventory.CertPathSpec,
-	tc option.TokenContext,
-	env ports.EnvPort,
-) (inventory.AuthMethod, error) {
+func compilePrivateKeyAuth(idFiles option.PathList, certs []inventory.CertPathSpec, tc option.TokenContext, env ports.EnvPort) (inventory.AuthMethod, error) {
 	if idFiles.IsDisabled() {
 		return nil, nil
 	}
 	var specs []inventory.KeyPathSpec
+	var err error
 	if idFiles.IsSet() {
-		items := idFiles.Items()
-		specs = make([]inventory.KeyPathSpec, 0, len(items))
-		for _, entry := range items {
-			expanded, err := expandOptionPathEntry(entry, tc, env)
-			if err != nil {
-				return nil, err
-			}
-			kp, err := inventory.ParseKeyPathSpec(expanded)
-			if err != nil {
-				return nil, fmt.Errorf("%w: IdentityFile %q 无效: %w", ErrInvalidTarget, entry.String(), err)
-			}
-			specs = append(specs, kp)
-		}
+		specs, err = expandOptionPaths(idFiles, "IdentityFile", tc, env, inventory.ParseKeyPathSpec)
 	} else if tc.HomeDir != "" {
-		var err error
 		specs, err = defaultIdentityKeySpecs()
-		if err != nil {
-			return nil, err
-		}
 	}
-	if len(specs) == 0 {
-		return nil, nil
+	if err != nil || len(specs) == 0 {
+		return nil, err
 	}
 	ne, err := algebraic.NonEmptyFromSlice(specs)
 	if err != nil {
@@ -123,30 +85,29 @@ func compilePrivateKeyAuth(
 	return inventory.NewAuthPrivateKey(ne, algebraic.None[inventory.KeyPassphraseBinding](), certs)
 }
 
-func compileCertPaths(certFiles option.PathList, tc option.TokenContext, env ports.EnvPort) ([]inventory.CertPathSpec, error) {
-	if !certFiles.IsSet() {
+func expandOptionPaths[T any](list option.PathList, label string, tc option.TokenContext, env ports.EnvPort, parse func(string) (T, error)) ([]T, error) {
+	if !list.IsSet() {
 		return nil, nil
 	}
-	items := certFiles.Items()
-	out := make([]inventory.CertPathSpec, 0, len(items))
+	items := list.Items()
+	out := make([]T, 0, len(items))
 	for _, entry := range items {
 		expanded, err := expandOptionPathEntry(entry, tc, env)
 		if err != nil {
 			return nil, err
 		}
-		cp, err := inventory.ParseCertPathSpec(expanded)
+		v, err := parse(expanded)
 		if err != nil {
-			return nil, fmt.Errorf("%w: CertificateFile %q 无效: %w", ErrInvalidTarget, entry.String(), err)
+			return nil, fmt.Errorf("%w: %s %q 无效: %w", ErrInvalidTarget, label, entry.String(), err)
 		}
-		out = append(out, cp)
+		out = append(out, v)
 	}
 	return out, nil
 }
 
 func defaultIdentityKeySpecs() ([]inventory.KeyPathSpec, error) {
-	defaults := [3]string{"~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_rsa"}
-	out := make([]inventory.KeyPathSpec, 0, len(defaults))
-	for _, raw := range defaults {
+	out := make([]inventory.KeyPathSpec, 0, 3)
+	for _, raw := range [3]string{"~/.ssh/id_ed25519", "~/.ssh/id_ecdsa", "~/.ssh/id_rsa"} {
 		kp, err := inventory.ParseKeyPathSpec(raw)
 		if err != nil {
 			return nil, err
@@ -159,27 +120,21 @@ func defaultIdentityKeySpecs() ([]inventory.KeyPathSpec, error) {
 // buildInteractiveFallbackAuth 构造永不静态命中的哨兵规则，使 sshnet/dial 遇到服务端质询时
 // 统一落入 planInteractiveKIQuestion（自动遵守 BatchMode 与 InteractionPort.CanInteract 门控）。
 func buildInteractiveFallbackAuth() (inventory.AuthMethod, error) {
-	rule, err := inventory.NewRuleLoginPassword(inventory.ChallengeRuleMeta{
-		Name:          "interactive_fallback",
-		PromptPattern: "a^",
-	})
+	rule, err := inventory.NewRuleLoginPassword(inventory.ChallengeRuleMeta{Name: "interactive_fallback", PromptPattern: "a^"})
 	if err != nil {
 		return nil, err
 	}
-	ne, err := algebraic.NonEmptyFromSlice([]inventory.ChallengeRule{rule})
-	if err != nil {
-		return nil, err
-	}
-	return inventory.NewAuthKeyboardInteractive(ne)
+	return inventory.NewAuthKeyboardInteractive(algebraic.NewNonEmpty[inventory.ChallengeRule](rule))
 }
 
 func buildTokenContext(policy option.EffectivePolicy, user option.Username, env ports.EnvPort) option.TokenContext {
+	jumpHost := ""
+	if hops := proxyJumpHopHosts(policy.Proxy()); len(hops) > 0 {
+		jumpHost = hops[len(hops)-1]
+	}
 	tc := option.TokenContext{
-		TargetHost:   policy.Endpoint().Host().String(),
-		Port:         policy.Endpoint().Port(),
-		RemoteUser:   user.String(),
-		OriginalHost: policy.OriginalHost().String(),
-		JumpHost:     activeJumpHostName(policy.Proxy()),
+		TargetHost: policy.Endpoint().Host().String(), Port: policy.Endpoint().Port(),
+		RemoteUser: user.String(), OriginalHost: policy.OriginalHost().String(), JumpHost: jumpHost,
 	}
 	if env != nil {
 		if id, err := env.LookupLocalIdentity(); err == nil {
@@ -187,21 +142,6 @@ func buildTokenContext(policy option.EffectivePolicy, user option.Username, env 
 		}
 	}
 	return tc
-}
-
-func activeJumpHostName(route option.ProxyRoute) string {
-	switch v := route.(type) {
-	case nil, *option.ProxyUnset, *option.ProxyDisabled, *option.ProxyCommandSpec:
-		return ""
-	case *option.ProxyJumpChain:
-		if !v.IsValid() {
-			return ""
-		}
-		hops := v.Hops().Slice()
-		return hops[len(hops)-1].Host()
-	default:
-		return ""
-	}
 }
 
 // expandOptionPathEntry 是 KeyPathSpec/CertPathSpec 编译前的单一权威 % 与 ${VAR} 展开边界：
@@ -213,20 +153,15 @@ func expandOptionPathEntry(entry option.PathEntry, tc option.TokenContext, env p
 	if !entry.IsTemplate() {
 		return raw, nil
 	}
-	expanded := raw
+	expanded, err := raw, error(nil)
 	if strings.ContainsRune(expanded, '%') {
-		out, err := option.ExpandPathTokens(expanded, tc)
-		if err != nil {
-			return "", fmt.Errorf("%w: 展开路径模板 %q 失败: %w", ErrInvalidTarget, raw, err)
-		}
-		expanded = out
+		expanded, err = option.ExpandPathTokens(expanded, tc)
 	}
-	if strings.Contains(expanded, "${") {
-		out, err := expandEnvBraces(expanded, env)
-		if err != nil {
-			return "", fmt.Errorf("%w: 展开环境变量模板 %q 失败: %w", ErrInvalidTarget, raw, err)
-		}
-		expanded = out
+	if err == nil && strings.Contains(expanded, "${") {
+		expanded, err = expandEnvBraces(expanded, env)
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: 展开路径模板 %q 失败: %w", ErrInvalidTarget, raw, err)
 	}
 	if strings.ContainsRune(expanded, '%') || strings.Contains(expanded, "${") {
 		return "", fmt.Errorf("%w: 路径模板 %q 展开后包含受禁字符 '%%' 或 '${'（拒绝以防下游二次展开）", ErrInvalidTarget, raw)

@@ -27,38 +27,33 @@ func parseTargetSpec(raw string) (parsedTarget, error) {
 		return parsedTarget{}, fmt.Errorf("%w: %q 为空、超长或包含非法空白/控制字符", ErrInvalidTarget, raw)
 	}
 	userOpt, hostPart, err := splitTargetUser(trimmed)
-	if err != nil {
-		return parsedTarget{}, err
+	var origHost option.OriginalHostSpec
+	var portOpt algebraic.Option[uint16]
+	if err == nil {
+		origHost, portOpt, err = parseTargetHostPort(hostPart, trimmed)
 	}
-	origHost, portOpt, err := parseTargetHostPort(hostPart, trimmed)
-	if err != nil {
-		return parsedTarget{}, err
-	}
-	return parsedTarget{user: userOpt, origHost: origHost, port: portOpt}, nil
+	return parsedTarget{user: userOpt, origHost: origHost, port: portOpt}, err
 }
 
 // parseHopTargetSpec 将已校验的 option.HopTarget 转换为统一的 parsedTarget 供递归跳板解析复用。
-func parseHopTargetSpec(h option.HopTarget) (parsedTarget, error) {
+func parseHopTargetSpec(h option.HopTarget) (pt parsedTarget, err error) {
 	if !h.IsValid() {
-		return parsedTarget{}, fmt.Errorf("%w: 无效 ProxyJump HopTarget", ErrInvalidTarget)
+		return pt, fmt.Errorf("%w: 无效 ProxyJump HopTarget", ErrInvalidTarget)
 	}
-	var userOpt algebraic.Option[option.Username]
 	if h.User() != "" {
-		u, err := option.ParseUsername(h.User())
-		if err != nil {
-			return parsedTarget{}, fmt.Errorf("%w: 跳板用户名非法: %w", ErrInvalidTarget, err)
+		u, uErr := option.ParseUsername(h.User())
+		if uErr != nil {
+			return pt, fmt.Errorf("%w: 跳板用户名非法: %w", ErrInvalidTarget, uErr)
 		}
-		userOpt = algebraic.Some(u)
+		pt.user = algebraic.Some(u)
 	}
-	origHost, err := option.ParseOriginalHost(h.Host())
-	if err != nil {
+	if pt.origHost, err = option.ParseOriginalHost(h.Host()); err != nil {
 		return parsedTarget{}, fmt.Errorf("%w: 跳板主机 %q 非法: %w", ErrInvalidTarget, h.Host(), err)
 	}
-	var portOpt algebraic.Option[uint16]
 	if p, ok := h.Port(); ok {
-		portOpt = algebraic.Some(p)
+		pt.port = algebraic.Some(p)
 	}
-	return parsedTarget{user: userOpt, origHost: origHost, port: portOpt}, nil
+	return pt, nil
 }
 
 func splitTargetUser(trimmed string) (algebraic.Option[option.Username], string, error) {
@@ -76,75 +71,71 @@ func splitTargetUser(trimmed string) (algebraic.Option[option.Username], string,
 	return algebraic.Some(u), hostPart, nil
 }
 
-func parseTargetHostPort(hostPart, full string) (option.OriginalHostSpec, algebraic.Option[uint16], error) {
-	var zeroHost option.OriginalHostSpec
-	nonePort := algebraic.None[uint16]()
-	if hostPart == "" {
-		return zeroHost, nonePort, fmt.Errorf("%w: 目标 %q 缺少主机段", ErrInvalidTarget, full)
+func parseIPv6OriginalHost(raw, errMsg string) (z option.OriginalHostSpec, err error) {
+	ch, err := netaddr.ParseCanonicalHost(raw)
+	if err != nil || !ch.IsIPv6() {
+		return z, fmt.Errorf("%w: %s", ErrInvalidTarget, errMsg)
 	}
-	if hostPart[0] == '[' {
+	if orig, oErr := option.OriginalHostFromCanonical(ch); oErr != nil {
+		return z, fmt.Errorf("%w: %w", ErrInvalidTarget, oErr)
+	} else {
+		return orig, nil
+	}
+}
+
+func parseTargetHostPort(hostPart, full string) (z option.OriginalHostSpec, nonePort algebraic.Option[uint16], err error) {
+	switch {
+	case hostPart == "":
+		return z, nonePort, fmt.Errorf("%w: 目标 %q 缺少主机段", ErrInvalidTarget, full)
+	case hostPart[0] == '[':
 		return parseBracketedTargetHostPort(hostPart, full)
-	}
-	if strings.ContainsAny(hostPart, "[]") {
-		return zeroHost, nonePort, fmt.Errorf("%w: 目标 %q 包含非法方括号", ErrInvalidTarget, full)
+	case strings.ContainsAny(hostPart, "[]"):
+		return z, nonePort, fmt.Errorf("%w: 目标 %q 包含非法方括号", ErrInvalidTarget, full)
 	}
 	switch strings.Count(hostPart, ":") {
 	case 0:
 		orig, err := option.ParseOriginalHost(hostPart)
 		if err != nil {
-			return zeroHost, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+			return z, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
 		}
 		return orig, nonePort, nil
 	case 1:
 		h, pStr, _ := strings.Cut(hostPart, ":")
 		orig, err := option.ParseOriginalHost(h)
-		if err != nil {
-			return zeroHost, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+		var p uint16
+		if err == nil {
+			p, err = parseStrictTargetPort(pStr)
 		}
-		p, err := parseStrictTargetPort(pStr)
 		if err != nil {
-			return zeroHost, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+			return z, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
 		}
 		return orig, algebraic.Some(p), nil
 	default:
 		// 含两个及以上冒号时仅接受合法裸 IPv6 字面量（含可选 %zone，不带显式端口）。
-		ch, err := netaddr.ParseCanonicalHost(hostPart)
-		if err != nil || !ch.IsIPv6() {
-			return zeroHost, nonePort, fmt.Errorf("%w: 目标 %q 既非合法 IPv6 也非规范 host:port", ErrInvalidTarget, full)
-		}
-		orig, err := option.OriginalHostFromCanonical(ch)
-		if err != nil {
-			return zeroHost, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
-		}
-		return orig, nonePort, nil
+		orig, err := parseIPv6OriginalHost(hostPart, fmt.Sprintf("目标 %q 既非合法 IPv6 也非规范 host:port", full))
+		return orig, nonePort, err
 	}
 }
 
-func parseBracketedTargetHostPort(hostPart, full string) (option.OriginalHostSpec, algebraic.Option[uint16], error) {
-	var zeroHost option.OriginalHostSpec
-	nonePort := algebraic.None[uint16]()
+func parseBracketedTargetHostPort(hostPart, full string) (z option.OriginalHostSpec, nonePort algebraic.Option[uint16], err error) {
 	closeIdx := strings.IndexByte(hostPart, ']')
 	if closeIdx < 2 {
-		return zeroHost, nonePort, fmt.Errorf("%w: 目标 %q 方括号畸形", ErrInvalidTarget, full)
+		return z, nonePort, fmt.Errorf("%w: 目标 %q 方括号畸形", ErrInvalidTarget, full)
 	}
-	ch, err := netaddr.ParseCanonicalHost(hostPart[:closeIdx+1])
-	if err != nil || !ch.IsIPv6() {
-		return zeroHost, nonePort, fmt.Errorf("%w: 目标 %q 方括号内必须为合法 IPv6 地址", ErrInvalidTarget, full)
-	}
-	orig, err := option.OriginalHostFromCanonical(ch)
+	orig, err := parseIPv6OriginalHost(hostPart[:closeIdx+1], fmt.Sprintf("目标 %q 方括号内必须为合法 IPv6 地址", full))
 	if err != nil {
-		return zeroHost, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+		return z, nonePort, err
 	}
 	rest := hostPart[closeIdx+1:]
 	if rest == "" {
 		return orig, nonePort, nil
 	}
 	if rest[0] != ':' {
-		return zeroHost, nonePort, fmt.Errorf("%w: 目标 %q 方括号后存在非法后缀", ErrInvalidTarget, full)
+		return z, nonePort, fmt.Errorf("%w: 目标 %q 方括号后存在非法后缀", ErrInvalidTarget, full)
 	}
 	p, err := parseStrictTargetPort(rest[1:])
 	if err != nil {
-		return zeroHost, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+		return z, nonePort, fmt.Errorf("%w: %w", ErrInvalidTarget, err)
 	}
 	return orig, algebraic.Some(p), nil
 }
@@ -166,10 +157,7 @@ func parseStrictTargetPort(raw string) (uint16, error) {
 }
 
 func hasForbiddenTargetChars(s string) bool {
-	if !utf8.ValidString(s) {
-		return true
-	}
-	return strings.ContainsFunc(s, func(r rune) bool {
+	return !utf8.ValidString(s) || strings.ContainsFunc(s, func(r rune) bool {
 		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029'
 	})
 }
@@ -188,12 +176,8 @@ func (p parsedTarget) inlineLayer() option.OptionLayer {
 // extractCLIJumpPolicy 提取依 INV-D3 须对全部 ProxyJump 上游跳板（含虚拟与临时跳板）生效的
 // CLI 安全、非交互、信任库与传输算法覆写，绝不污染目标专用 HostName/Port/User/Proxy/SendEnv/LocalCommand。
 func extractCLIJumpPolicy(cli option.OptionLayer) option.OptionLayer {
-	out := option.UnsetOptionLayer().
-		WithUserKnownHostsFiles(cli.UserKnownHostsFiles()).
-		WithCiphers(cli.Ciphers()).
-		WithMACs(cli.MACs()).
-		WithKexAlgorithms(cli.KexAlgorithms()).
-		WithHostKeyAlgorithms(cli.HostKeyAlgorithms())
+	out := option.UnsetOptionLayer().WithUserKnownHostsFiles(cli.UserKnownHostsFiles()).
+		WithCiphers(cli.Ciphers()).WithMACs(cli.MACs()).WithKexAlgorithms(cli.KexAlgorithms()).WithHostKeyAlgorithms(cli.HostKeyAlgorithms())
 	if v, ok := cli.BatchMode().Get(); ok {
 		out = out.WithBatchMode(v)
 	}
@@ -209,9 +193,7 @@ func extractCLIJumpPolicy(cli option.OptionLayer) option.OptionLayer {
 // extractCLIJumpAuthFallback 仅提取供临时 AdHoc ProxyJump 跳板兜底复用的 CLI 密钥认证项，
 // 避免覆盖 OpenSSH 虚拟跳板在 ~/.ssh/config 中显式绑定的 IdentityFile/CertificateFile/IdentitiesOnly。
 func extractCLIJumpAuthFallback(cli option.OptionLayer) option.OptionLayer {
-	out := option.UnsetOptionLayer().
-		WithIdentityFiles(cli.IdentityFiles()).
-		WithCertificateFiles(cli.CertificateFiles())
+	out := option.UnsetOptionLayer().WithIdentityFiles(cli.IdentityFiles()).WithCertificateFiles(cli.CertificateFiles())
 	if v, ok := cli.IdentitiesOnly().Get(); ok {
 		out = out.WithIdentitiesOnly(v)
 	}

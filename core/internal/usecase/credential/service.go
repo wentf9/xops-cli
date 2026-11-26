@@ -175,7 +175,7 @@ func (s *Service) InitInteractive(ctx context.Context, req InteractiveVaultContr
 	if req.OperationStream != nil {
 		defer req.OperationStream.Close()
 	}
-	if err := s.validateInteractiveControlCall(ctx, req); err != nil {
+	if err := s.validateInteractiveControlCall(ctx, req, true); err != nil {
 		return err
 	}
 	ctrlReq := VaultControlRequest{
@@ -236,12 +236,12 @@ func (s *Service) UnlockFromBytes(ctx context.Context, req VaultControlRequest, 
 	})
 }
 
-// UnlockInteractive 通过 InteractionPort.PromptSecret 采集主口令并解锁凭据库。
+// UnlockInteractive 通过 InteractionPort.PromptSecret 采集主口令并解锁凭据库（严禁传入 ConfirmPrompt）。
 func (s *Service) UnlockInteractive(ctx context.Context, req InteractiveVaultControlRequest) error {
 	if req.OperationStream != nil {
 		defer req.OperationStream.Close()
 	}
-	if err := s.validateInteractiveControlCall(ctx, req); err != nil {
+	if err := s.validateInteractiveControlCall(ctx, req, false); err != nil {
 		return err
 	}
 	ctrlReq := VaultControlRequest{
@@ -308,8 +308,8 @@ func (s *Service) WithSecret(ctx context.Context, req WithSecretRequest, fn func
 	})
 }
 
-// WithPromptedSecret 通过 InteractionPort.PromptSecret 以全作用域闭包借出用户交互输入的 *secret.SecretBox；
-// 退出后无条件清零，零命令式 *SecretBox 返回。
+// WithPromptedSecret 经 CapInspect 鉴权后通过 InteractionPort.PromptSecret 以全作用域闭包借出用户交互输入的
+// *secret.SecretBox；门控熔断（Halted）或策略拒绝时严禁弹窗采密，退出后无条件清零，零命令式 *SecretBox 返回。
 //
 //xops:syncclosure
 //xops:borrowed
@@ -320,8 +320,22 @@ func (s *Service) WithPromptedSecret(ctx context.Context, prompt ports.SecretPro
 	if fn == nil {
 		return ErrNilCallback
 	}
-	return s.interaction.PromptSecret(ctx, prompt, func(box *secret.SecretBox) error {
-		return fn(box)
+	gateReq, err := buildInspectGateRequest(
+		"vault_prompt_secret",
+		"",
+		nil,
+		security.RiskSafe,
+		"prompt interactive secret",
+		algebraic.None[gate.ApprovalSubmission](),
+		nil,
+	)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	return gate.WithAuthorized[security.CapInspect](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
+		return s.interaction.PromptSecret(authCtx, prompt, func(box *secret.SecretBox) error {
+			return fn(box)
+		})
 	})
 }
 
