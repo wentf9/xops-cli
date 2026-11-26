@@ -170,6 +170,7 @@ type Server struct {
 	report   StartupReport
 
 	sessMu   sync.Mutex
+	sessSeq  uint64
 	sessions map[string]mcpHTTPSession
 
 	lifeCtx    context.Context
@@ -187,6 +188,7 @@ type Server struct {
 type mcpHTTPSession struct {
 	id              string
 	protocolVersion string
+	seq             uint64
 	createdAt       time.Time
 }
 
@@ -427,7 +429,9 @@ func (s *Server) StartupReport() StartupReport {
 	return cloneStartupReport(s.report)
 }
 
-// Close 幂等优雅关闭 MCP Server，取消全部在途传输与会话并等待收敛（受 ctx 有界约束）。
+// Close 幂等优雅关闭 MCP Server，取消全部在途传输与会话并等待收敛（受 ctx 有界约束）：
+// 尽力释放本 Server 追踪的非持久化活跃句柄（PTY/Forward/GUI/Mux）并清空本地索引，
+// 故意不中止带 Journal 的可恢复 10 GiB 流式传输以保留断点续传与崩溃恢复契约（底层池句柄由 Engine.Close 统一回收）。
 func (s *Server) Close(ctx context.Context) error {
 	if s == nil || !s.valid {
 		return ErrServerNotInitialized
@@ -448,7 +452,7 @@ func (s *Server) Close(ctx context.Context) error {
 		s.stateMu.Unlock()
 
 		s.lifeCancel(ErrServerClosed)
-		s.registry.ClearTrackedHandles()
+		s.registry.CloseEphemeralHandles(ctx)
 		s.sessMu.Lock()
 		clear(s.sessions)
 		s.sessMu.Unlock()

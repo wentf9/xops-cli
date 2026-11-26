@@ -30,7 +30,7 @@ const (
 	PolicyProfileStrictAgent                         // MCP / AI Agent 严格熔断模式（终态审计失败立即 Halted）
 )
 
-// ParsePolicyProfile 严格解析规范小写策略配置档文本（"direct_operator"、"strict"、"strict_operator"、"strict_agent"）。
+// ParsePolicyProfile / ParseNoElicitFallback / ParseRequestTTYMode 严格解析公开枚举文本。
 func ParsePolicyProfile(raw string) (PolicyProfile, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "direct_operator":
@@ -43,23 +43,12 @@ func ParsePolicyProfile(raw string) (PolicyProfile, error) {
 		return PolicyProfileInvalid, fmt.Errorf("%w: %q", ErrInvalidProfile, raw)
 	}
 }
-
-// IsValid / IsZero / String / AppendText / MarshalText / UnmarshalText 实现值对象校验与文本编解码契约。
 func (p PolicyProfile) IsValid() bool {
 	return p >= PolicyProfileDirectOperator && p <= PolicyProfileStrictAgent
 }
 func (p PolicyProfile) IsZero() bool { return p == PolicyProfileInvalid }
 func (p PolicyProfile) String() string {
-	switch p {
-	case PolicyProfileDirectOperator:
-		return "direct_operator"
-	case PolicyProfileStrictOperator:
-		return "strict_operator"
-	case PolicyProfileStrictAgent:
-		return "strict_agent"
-	default:
-		return "invalid"
-	}
+	return lookupEnumName(uint8(p), "invalid", "invalid", "direct_operator", "strict_operator", "strict_agent")
 }
 func (p PolicyProfile) AppendText(b []byte) ([]byte, error) {
 	return appendValidEnumText(b, p.IsValid(), p.String(), ErrInvalidProfile, uint8(p))
@@ -68,18 +57,11 @@ func (p PolicyProfile) MarshalText() ([]byte, error) { return p.AppendText(nil) 
 func (p *PolicyProfile) UnmarshalText(text []byte) error {
 	return unmarshalEnumText(p, PolicyProfileInvalid, text, ErrInvalidProfile, ParsePolicyProfile)
 }
-
 func (p PolicyProfile) toGateProfile() (gate.PolicyProfileKind, error) {
-	switch p {
-	case PolicyProfileDirectOperator:
-		return gate.PolicyProfileDirectOperator, nil
-	case PolicyProfileStrictOperator:
-		return gate.PolicyProfileStrictOperator, nil
-	case PolicyProfileStrictAgent:
-		return gate.PolicyProfileStrictAgent, nil
-	default:
-		return gate.PolicyProfileInvalid, fmt.Errorf("%w: %d", ErrInvalidProfile, uint8(p))
+	if p.IsValid() {
+		return [...]gate.PolicyProfileKind{gate.PolicyProfileInvalid, gate.PolicyProfileDirectOperator, gate.PolicyProfileStrictOperator, gate.PolicyProfileStrictAgent}[p], nil
 	}
+	return gate.PolicyProfileInvalid, fmt.Errorf("%w: %d", ErrInvalidProfile, uint8(p))
 }
 
 // NoElicitFallback 定义护栏要求人工审批但运行环境不可交互时的回退行为；零值恒为 NoElicitFallbackDeny（严格失败关闭）。
@@ -104,21 +86,12 @@ func ParseNoElicitFallback(raw string) (NoElicitFallback, error) {
 		return NoElicitFallbackDeny, fmt.Errorf("%w: %q", ErrInvalidFallback, raw)
 	}
 }
-
-// IsValid / IsZero / String / AppendText / MarshalText / UnmarshalText 实现值对象校验与文本编解码契约。
 func (f NoElicitFallback) IsValid() bool {
 	return f == NoElicitFallbackDeny || f == NoElicitFallbackChallenge
 }
 func (f NoElicitFallback) IsZero() bool { return f == NoElicitFallbackDeny }
 func (f NoElicitFallback) String() string {
-	switch f {
-	case NoElicitFallbackDeny:
-		return "deny"
-	case NoElicitFallbackChallenge:
-		return "challenge"
-	default:
-		return "deny(invalid)"
-	}
+	return lookupEnumName(uint8(f), "deny(invalid)", "deny", "challenge")
 }
 func (f NoElicitFallback) AppendText(b []byte) ([]byte, error) {
 	return appendValidEnumText(b, f.IsValid(), f.String(), ErrInvalidFallback, uint8(f))
@@ -127,16 +100,11 @@ func (f NoElicitFallback) MarshalText() ([]byte, error) { return f.AppendText(ni
 func (f *NoElicitFallback) UnmarshalText(text []byte) error {
 	return unmarshalEnumText(f, NoElicitFallbackDeny, text, ErrInvalidFallback, ParseNoElicitFallback)
 }
-
 func (f NoElicitFallback) toGateFallback() (gate.NoElicitFallback, error) {
-	switch f {
-	case NoElicitFallbackDeny:
-		return gate.NoElicitFallbackDeny, nil
-	case NoElicitFallbackChallenge:
-		return gate.NoElicitFallbackChallenge, nil
-	default:
-		return gate.NoElicitFallbackDeny, fmt.Errorf("%w: %d", ErrInvalidFallback, uint8(f))
+	if f.IsValid() {
+		return [...]gate.NoElicitFallback{gate.NoElicitFallbackDeny, gate.NoElicitFallbackChallenge}[f], nil
 	}
+	return gate.NoElicitFallbackDeny, fmt.Errorf("%w: %d", ErrInvalidFallback, uint8(f))
 }
 
 // RequestTTYMode 标识 SSH 会话的伪终端分配策略（对应 OpenSSH RequestTTY auto/yes/no/force 与 -t/-tt/-T）；
@@ -169,23 +137,10 @@ func ParseRequestTTYMode(raw string) (RequestTTYMode, error) {
 		return RequestTTYUnset, fmt.Errorf("%w: %q", ErrInvalidRequestTTY, raw)
 	}
 }
-
-// IsValid / IsZero / String / AppendText / MarshalText / UnmarshalText 实现值对象校验与文本编解码契约。
 func (m RequestTTYMode) IsValid() bool { return m >= RequestTTYAuto && m <= RequestTTYForce }
 func (m RequestTTYMode) IsZero() bool  { return m == RequestTTYUnset }
 func (m RequestTTYMode) String() string {
-	switch m {
-	case RequestTTYAuto:
-		return "auto"
-	case RequestTTYYes:
-		return "yes"
-	case RequestTTYNo:
-		return "no"
-	case RequestTTYForce:
-		return "force"
-	default:
-		return "unset"
-	}
+	return lookupEnumName(uint8(m), "unset", "unset", "auto", "yes", "no", "force")
 }
 func (m RequestTTYMode) AppendText(b []byte) ([]byte, error) {
 	return appendValidEnumText(b, m.IsValid(), m.String(), ErrInvalidRequestTTY, uint8(m))
@@ -194,22 +149,18 @@ func (m RequestTTYMode) MarshalText() ([]byte, error) { return m.AppendText(nil)
 func (m *RequestTTYMode) UnmarshalText(text []byte) error {
 	return unmarshalEnumText(m, RequestTTYUnset, text, ErrInvalidRequestTTY, ParseRequestTTYMode)
 }
-
 func (m RequestTTYMode) toSessionTTYMode() (ucsess.RequestTTYMode, error) {
-	switch m {
-	case RequestTTYUnset:
-		return ucsess.RequestTTYUnset, nil
-	case RequestTTYAuto:
-		return ucsess.RequestTTYAuto, nil
-	case RequestTTYYes:
-		return ucsess.RequestTTYYes, nil
-	case RequestTTYNo:
-		return ucsess.RequestTTYNo, nil
-	case RequestTTYForce:
-		return ucsess.RequestTTYForce, nil
-	default:
-		return ucsess.RequestTTYUnset, fmt.Errorf("%w: %d", ErrInvalidRequestTTY, uint8(m))
+	if int(m) <= int(RequestTTYForce) {
+		return [...]ucsess.RequestTTYMode{ucsess.RequestTTYUnset, ucsess.RequestTTYAuto, ucsess.RequestTTYYes, ucsess.RequestTTYNo, ucsess.RequestTTYForce}[m], nil
 	}
+	return ucsess.RequestTTYUnset, fmt.Errorf("%w: %d", ErrInvalidRequestTTY, uint8(m))
+}
+
+func lookupEnumName(idx uint8, fallback string, names ...string) string {
+	if int(idx) < len(names) {
+		return names[idx]
+	}
+	return fallback
 }
 
 // HaltInfo 描述 Engine 底层安全门控首次进入不可逆 Halted 熔断态时的只读诊断快照（ADR-008）；零值恒无效并失败关闭。

@@ -5,6 +5,7 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,6 +49,7 @@ type mcpUnitOpts struct {
 	threshold       security.RiskLevel
 	fallback        gate.NoElicitFallback
 	maxMessageBytes int64
+	maxHTTPSessions int
 	reconcileErr    error
 	allowedOrigins  []string
 	allowedHosts    []string
@@ -129,6 +131,7 @@ func newMCPUnitRig(t *testing.T, opts mcpUnitOpts) *mcpUnitRig {
 		Entropy:            rng.Fork(),
 		SystemBus:          bus,
 		MaxMessageBytes:    opts.maxMessageBytes,
+		MaxHTTPSessions:    opts.maxHTTPSessions,
 		HTTPAllowedOrigins: opts.allowedOrigins,
 		HTTPAllowedHosts:   opts.allowedHosts,
 	})
@@ -441,5 +444,164 @@ func TestMCPRuntime_StartupCrashReconcileFailClosedAndHalted(t *testing.T) {
 		if rec.Code != http.StatusServiceUnavailable {
 			t.Fatalf("Halted 后 %s %s 期望 503，实际=%d", p.method, p.path, rec.Code)
 		}
+	}
+}
+
+type failingReader struct{ err error }
+
+func (f failingReader) Read([]byte) (int, error) { return 0, f.err }
+
+func TestMCPRuntime_PrepareCloseGatesAndDecodeSemantics(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+
+	// 1. 启动期对账失败时 /healthz 返回 503，且 HandleMessage 与 HTTP /mcp 均严格 Fail-Closed。
+	failRig := newMCPUnitRig(t, mcpUnitOpts{reconcileErr: errors.New("audit lock io failure")})
+	defer failRig.close(t)
+	failH := failRig.srv.Handler()
+	if rec := doLocalHTTP(failH, http.MethodGet, "/healthz", "", "", nil); rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"ready":false`) {
+		t.Fatalf("未就绪 /healthz 期望 503 ready=false，实际 status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if _, _, err := failRig.srv.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)); !errors.Is(err, mcpruntime.ErrStartupReconcileFailed) {
+		t.Fatalf("Prepare 失败时 HandleMessage 必须 Fail-Closed，实际=%v", err)
+	}
+	if rec := doLocalHTTP(failH, http.MethodPost, "/mcp", "application/json", "", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize"}`)); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Prepare 失败时 POST /mcp 期望 503，实际=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 2. 正常服务未 Prepare 前 /healthz=503；Prepare 后=200；Close 后 HandleMessage 与 HTTP 全部拒绝。
+	rig := newMCPUnitRig(t, mcpUnitOpts{maxMessageBytes: 1024, maxHTTPSessions: 2})
+	defer rig.close(t)
+	h := rig.srv.Handler()
+	if rec := doLocalHTTP(h, http.MethodGet, "/healthz", "", "", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Prepare 前 /healthz 期望 503，实际=%d", rec.Code)
+	}
+	_, err := rig.srv.Prepare(ctx)
+	requireNoErr(t, err, "Prepare")
+	if rec := doLocalHTTP(h, http.MethodGet, "/healthz", "", "", nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"ready":true`) {
+		t.Fatalf("Prepare 后 /healthz 期望 200 ready=true，实际=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	assertHTTPInitializeEvictionAndErrorCodes(t, h)
+
+	requireNoErr(t, rig.srv.Close(ctx), "Close")
+	if _, _, err := rig.srv.HandleMessage(ctx, []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)); !errors.Is(err, mcpruntime.ErrServerClosed) {
+		t.Fatalf("Close 后 HandleMessage 期望 ErrServerClosed，实际=%v", err)
+	}
+	if rec := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", "", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"ping"}`)); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Close 后 POST /mcp 期望 503，实际=%d", rec.Code)
+	}
+	if rec := doLocalHTTP(h, http.MethodGet, "/healthz", "", "", nil); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Close 后 /healthz 期望 503，实际=%d", rec.Code)
+	}
+}
+
+func assertHTTPInitializeEvictionAndErrorCodes(t *testing.T, h http.Handler) {
+	t.Helper()
+	assertHTTPDecodeAndReadErrors(t, h)
+	assertHTTPSessionValidationAndEviction(t, h)
+}
+
+func assertHTTPDecodeAndReadErrors(t *testing.T, h http.Handler) {
+	t.Helper()
+	// 损坏 JSON -> -32700 + "id":null；合法 JSON 但版本错/未知字段 -> -32600 + "id":null。
+	recParse := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", "", strings.NewReader(`{bad-json`))
+	if recParse.Code != http.StatusBadRequest || !strings.Contains(recParse.Body.String(), `"code":-32700`) || !strings.Contains(recParse.Body.String(), `"id":null`) {
+		t.Fatalf("损坏 JSON 期望 -32700 且含 id:null，实际=%d body=%s", recParse.Code, recParse.Body.String())
+	}
+	recInv := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", "", strings.NewReader(`{"jsonrpc":"1.0","id":1,"method":"ping"}`))
+	if recInv.Code != http.StatusBadRequest || !strings.Contains(recInv.Body.String(), `"code":-32600`) || !strings.Contains(recInv.Body.String(), `"id":null`) {
+		t.Fatalf("非法 jsonrpc 版本期望 -32600 且含 id:null，实际=%d body=%s", recInv.Code, recInv.Body.String())
+	}
+	// 非 MaxBytesError 读失败必须返回 400（而非 413）。
+	recRead := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", "", failingReader{err: errors.New("broken stream")})
+	if recRead.Code != http.StatusBadRequest {
+		t.Fatalf("普通读取失败期望 400，实际=%d body=%s", recRead.Code, recRead.Body.String())
+	}
+}
+
+func assertHTTPSessionValidationAndEviction(t *testing.T, h http.Handler) {
+	t.Helper()
+	// 畸形 initialize（通知或未知参数字段）绝不得签发 Mcp-Session-Id。
+	recNotif := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", "", strings.NewReader(`{"jsonrpc":"2.0","method":"initialize"}`))
+	if recNotif.Code != http.StatusBadRequest || recNotif.Header().Get("Mcp-Session-Id") != "" {
+		t.Fatalf("通知形态 initialize 必须拒绝且不建会话: code=%d sid=%q", recNotif.Code, recNotif.Header().Get("Mcp-Session-Id"))
+	}
+	recBadInit := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", "", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"unknown":1}}`))
+	if recBadInit.Header().Get("Mcp-Session-Id") != "" || !strings.Contains(recBadInit.Body.String(), `"code":-32602`) {
+		t.Fatalf("未知字段 initialize 不得签发会话: sid=%q body=%s", recBadInit.Header().Get("Mcp-Session-Id"), recBadInit.Body.String())
+	}
+	// 满容量（MaxHTTPSessions=2）时确定性淘汰最旧会话 s1，保留 s2 与 s3。
+	sids := make([]string, 3)
+	for i := range sids {
+		rec := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", "", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`))
+		if rec.Code != http.StatusOK || rec.Header().Get("Mcp-Session-Id") == "" {
+			t.Fatalf("第 %d 次合法 initialize 失败: code=%d body=%s", i+1, rec.Code, rec.Body.String())
+		}
+		sids[i] = rec.Header().Get("Mcp-Session-Id")
+	}
+	if rec := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", sids[0], strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"ping"}`)); rec.Code != http.StatusNotFound {
+		t.Fatalf("最旧会话 s1 应已被淘汰返回 404，实际=%d", rec.Code)
+	}
+	for _, live := range sids[1:] {
+		if rec := doLocalHTTP(h, http.MethodPost, "/mcp", "application/json", live, strings.NewReader(`{"jsonrpc":"2.0","id":3,"method":"ping"}`)); rec.Code != http.StatusOK {
+			t.Fatalf("较新会话 %s 应仍有效返回 200，实际=%d", live, rec.Code)
+		}
+	}
+}
+
+func doLocalHTTP(h http.Handler, method, path, ct, sid string, body io.Reader) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, "http://127.0.0.1:8080"+path, body)
+	req.Host = "127.0.0.1:8080"
+	if ct != "" {
+		req.Header.Set("Content-Type", ct)
+	}
+	if sid != "" {
+		req.Header.Set("Mcp-Session-Id", sid)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func TestMCPRuntime_NodesResolveGatedAndAudited(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newMCPUnitRig(t, mcpUnitOpts{
+		profile:   gate.PolicyProfileStrictAgent,
+		threshold: security.RiskModerate,
+		fallback:  gate.NoElicitFallbackChallenge,
+	})
+	defer rig.close(t)
+	_, err := rig.srv.Prepare(context.Background())
+	requireNoErr(t, err, "Prepare")
+
+	// 1. 默认 RiskSafe 直接放行且写入 CapInspect 审计记录。
+	res1, body1 := callToolJSON(t, rig.srv, 1, protocol.ToolNameNodes, map[string]any{"action": "resolve", "target": "ops@10.0.0.8:22"})
+	if res1.IsError || body1["node_id"] != "10.0.0.8" {
+		t.Fatalf("nodes resolve(RiskSafe) 失败: isErr=%v body=%+v", res1.IsError, body1)
+	}
+	foundAudit := false
+	for _, entry := range rig.auditCluster.Entries() {
+		if entry.Binding().Tool() == protocol.ToolNameNodes && entry.Binding().Action() == "resolve" && entry.Phase() == ports.AuditPhaseFinalized {
+			foundAudit = true
+			break
+		}
+	}
+	if !foundAudit {
+		t.Fatalf("nodes resolve 必须经 gate.WithAuthorized 写入 Finalized 审计条目")
+	}
+
+	// 2. 显式提升风险为 moderate 时触发两步审批挑战，提交回执后放行。
+	res2, body2 := callToolJSON(t, rig.srv, 2, protocol.ToolNameNodes, map[string]any{"action": "resolve", "target": "ops@10.0.0.8:22", "risk": "moderate"})
+	if !res2.IsError || body2["code"] != "approval_required" {
+		t.Fatalf("nodes resolve(moderate) 期望 approval_required，实际=%+v", body2)
+	}
+	chal := body2["approval_challenge"].(map[string]any)
+	res3, _ := callToolJSON(t, rig.srv, 3, protocol.ToolNameNodes, map[string]any{
+		"action": "resolve", "target": "ops@10.0.0.8:22", "risk": "moderate",
+		"approval": map[string]any{"verdict": "allow", "envelope_digest": chal["envelope_digest"], "envelope": chal["envelope"]},
+	})
+	if res3.IsError {
+		t.Fatalf("nodes resolve 二次审批后应放行: %s", res3.StructuredContent)
 	}
 }

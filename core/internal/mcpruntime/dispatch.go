@@ -16,13 +16,14 @@ import (
 )
 
 // HandleMessage 处理单条入站 JSON-RPC 2.0 MCP 报文并返回确定性 JSON 响应字节；
+// 严格强制 IsClosed() 停机门禁与 Prepare 启动对账/恢复 Fail-Closed 门禁；
 // 当报文为通知（无 id）时返回 (nil, false, nil)；Gate 处于 Halted 熔断态时拒绝全部请求并返回 -32001。
 func (s *Server) HandleMessage(ctx context.Context, raw []byte) ([]byte, bool, error) {
-	if s == nil || !s.valid {
-		return nil, false, ErrServerNotInitialized
+	if err := s.checkReady(ctx); err != nil {
+		return nil, false, err
 	}
-	if ctx == nil {
-		return nil, false, ports.ErrNilContext
+	if err := s.ensurePrepared(ctx); err != nil && !errors.Is(err, gate.ErrGateHalted) {
+		return nil, false, err
 	}
 	if int64(len(raw)) > s.maxMessageBytes {
 		return encodeErrResp(algebraic.None[protocol.RequestID](), protocol.CodeInvalidRequest, ErrMessageTooLarge.Error(), protocol.ToolErrorPayload{
@@ -31,23 +32,14 @@ func (s *Server) HandleMessage(ctx context.Context, raw []byte) ([]byte, bool, e
 	}
 	req, decErr := protocol.DecodeRequest(raw)
 	if decErr != nil {
-		return encodeErrResp(algebraic.None[protocol.RequestID](), protocol.CodeParseError, security.SanitizePromptText(decErr.Error()), protocol.ToolErrorPayload{
-			Code: "parse_error", Message: security.SanitizePromptText(decErr.Error()),
+		code, errCode := classifyDecodeError(decErr)
+		clean := protocol.SanitizeErrorMessage(decErr.Error())
+		return encodeErrResp(algebraic.None[protocol.RequestID](), code, clean, protocol.ToolErrorPayload{
+			Code: errCode, Message: clean,
 		})
 	}
-	if s.gate.IsHalted() {
-		s.registry.ClearTrackedHandles()
-		if req.IsNotification() {
-			return nil, false, nil
-		}
-		return encodeHaltedResp(req.ID)
-	}
-	if req.IsNotification() {
-		return nil, false, nil
-	}
-	id, _ := req.ID.Get()
-	resp, err := s.dispatchRequest(ctx, id, req)
-	if err != nil {
+	resp, hasResp, err := s.handleDecodedRequest(ctx, req)
+	if err != nil || !hasResp {
 		return nil, false, err
 	}
 	out, err := protocol.MarshalCanonical(resp)
@@ -55,6 +47,59 @@ func (s *Server) HandleMessage(ctx context.Context, raw []byte) ([]byte, bool, e
 		return nil, false, err
 	}
 	return out, true, nil
+}
+
+// handleDecodedRequest 处理已完成单次解码的 JSON-RPC 请求（供 HandleMessage 与 Streamable HTTP 共用，避免重复解码）。
+func (s *Server) handleDecodedRequest(ctx context.Context, req protocol.Request) (protocol.Response, bool, error) {
+	if s.gate.IsHalted() {
+		s.registry.ClearTrackedHandles()
+		if req.IsNotification() {
+			return protocol.Response{}, false, nil
+		}
+		resp, err := protocol.NewErrorResponse(req.ID, protocol.CodeGateHalted, gate.ErrGateHalted.Error(), protocol.ToolErrorPayload{
+			Code: "gate_halted", Message: gate.ErrGateHalted.Error(), Halted: true,
+		})
+		return resp, err == nil, err
+	}
+	if req.IsNotification() {
+		return protocol.Response{}, false, nil
+	}
+	id, _ := req.ID.Get()
+	resp, err := s.dispatchRequest(ctx, id, req)
+	if err != nil {
+		return protocol.Response{}, false, err
+	}
+	return resp, true, nil
+}
+
+func classifyDecodeError(err error) (int, string) {
+	if errors.Is(err, protocol.ErrParseJSON) {
+		return protocol.CodeParseError, "parse_error"
+	}
+	return protocol.CodeInvalidRequest, "invalid_request"
+}
+
+func (s *Server) isPrepared() bool {
+	if s == nil || !s.valid {
+		return false
+	}
+	s.prepMu.Lock()
+	ready := s.prepared
+	s.prepMu.Unlock()
+	return ready
+}
+
+// ensurePrepared 在首次服务前幂等执行启动期 O(1) 崩溃审计对账与 Journal 恢复；
+// 若启动期检查失败，s.prepared 保持 false 且每次后续请求均严格 Fail-Closed 拒绝。
+func (s *Server) ensurePrepared(ctx context.Context) error {
+	if err := s.checkReady(ctx); err != nil {
+		return err
+	}
+	if s.isPrepared() {
+		return nil
+	}
+	_, err := s.Prepare(ctx)
+	return err
 }
 
 func (s *Server) dispatchRequest(ctx context.Context, id protocol.RequestID, req protocol.Request) (protocol.Response, error) {
@@ -79,8 +124,9 @@ func (s *Server) handleInitialize(id protocol.RequestID, params jsontext.Value) 
 	if len(params) > 0 {
 		var p protocol.InitializeParams
 		if err := protocol.UnmarshalStrict([]byte(params), &p); err != nil {
-			return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, security.SanitizePromptText(err.Error()), protocol.ToolErrorPayload{
-				Code: "invalid_params", Message: security.SanitizePromptText(err.Error()),
+			clean := protocol.SanitizeErrorMessage(err.Error())
+			return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, clean, protocol.ToolErrorPayload{
+				Code: "invalid_params", Message: clean,
 			})
 		}
 		negotiated = protocol.NegotiateProtocolVersion(p.ProtocolVersion)
@@ -101,8 +147,9 @@ func (s *Server) handleInitialize(id protocol.RequestID, params jsontext.Value) 
 func (s *Server) handleToolsCall(ctx context.Context, id protocol.RequestID, params jsontext.Value) (protocol.Response, error) {
 	var p protocol.CallToolParams
 	if err := protocol.UnmarshalStrict([]byte(params), &p); err != nil {
-		return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, security.SanitizePromptText(err.Error()), protocol.ToolErrorPayload{
-			Code: "invalid_params", Message: security.SanitizePromptText(err.Error()),
+		clean := protocol.SanitizeErrorMessage(err.Error())
+		return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, clean, protocol.ToolErrorPayload{
+			Code: "invalid_params", Message: clean,
 		})
 	}
 	if strings.TrimSpace(p.Name) == "" {
@@ -117,8 +164,9 @@ func (s *Server) handleToolsCall(ctx context.Context, id protocol.RequestID, par
 		})
 	}
 	if err != nil && errors.Is(err, protocol.ErrToolNotFound) {
-		return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, security.SanitizePromptText(err.Error()), protocol.ToolErrorPayload{
-			Code: "tool_not_found", Message: security.SanitizePromptText(err.Error()),
+		clean := protocol.SanitizeErrorMessage(err.Error())
+		return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, clean, protocol.ToolErrorPayload{
+			Code: "tool_not_found", Message: clean,
 		})
 	}
 	return protocol.NewResultResponse(id, callRes)
@@ -134,12 +182,6 @@ func encodeErrResp(id algebraic.Option[protocol.RequestID], code int, msg string
 		return nil, false, err
 	}
 	return raw, true, nil
-}
-
-func encodeHaltedResp(id algebraic.Option[protocol.RequestID]) ([]byte, bool, error) {
-	return encodeErrResp(id, protocol.CodeGateHalted, gate.ErrGateHalted.Error(), protocol.ToolErrorPayload{
-		Code: "gate_halted", Message: gate.ErrGateHalted.Error(), Halted: true,
-	})
 }
 
 func (s *Server) checkReady(ctx context.Context) error {

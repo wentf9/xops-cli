@@ -105,33 +105,32 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	rollbackBus := func() {
+	rollback := func(p *pool.Pool) {
+		if p != nil {
+			_ = p.Close()
+		}
 		if ownsBus && bus != nil {
 			bus.Close()
 		}
 	}
 	pCfg, err := buildPoolConfig(cfg, dialer, bus)
 	if err != nil {
-		rollbackBus()
+		rollback(nil)
 		return nil, err
 	}
 	p, err := pool.NewPool(context.Background(), pCfg)
 	if err != nil {
-		rollbackBus()
+		rollback(nil)
 		return nil, fmt.Errorf("%w: 初始化连接池失败: %w", ErrInvalidConfig, err)
-	}
-	rollbackAll := func() {
-		_ = p.Close()
-		rollbackBus()
 	}
 	g, err := buildEngineGate(cfg, profile, policy, bus, p)
 	if err != nil {
-		rollbackAll()
+		rollback(p)
 		return nil, err
 	}
 	svcs, err := buildEngineServices(cfg, g, p, bus)
 	if err != nil {
-		rollbackAll()
+		rollback(p)
 		return nil, err
 	}
 	opCtx, opCancel := context.WithCancelCause(context.Background())
@@ -160,9 +159,7 @@ func resolveSystemBus(cfg Config) (*events.SystemBus, bool, error) {
 	return bus, true, nil
 }
 
-func buildEngineGate(
-	cfg Config, profile gate.PolicyProfileKind, policy gate.GuardrailPolicy, bus *events.SystemBus, p *pool.Pool,
-) (*gate.Gate, error) {
+func buildEngineGate(cfg Config, profile gate.PolicyProfileKind, policy gate.GuardrailPolicy, bus *events.SystemBus, p *pool.Pool) (*gate.Gate, error) {
 	userOnHalt := cfg.OnHalt
 	g, err := gate.NewGate(gate.GateConfig{
 		Profile: profile, Policy: policy, AuditSink: cfg.AuditSink, Reconciler: cfg.Reconciler,
@@ -228,8 +225,7 @@ func buildTransferAutoObsServices(
 	tCfg := uctrans.ServiceConfig{
 		Gate: g, Pool: p, Clock: cfg.Clock, Entropy: cfg.Entropy, ScopedFS: cfg.ScopedFS,
 		OperatorReadFS: cfg.OperatorReadFS, Journals: cfg.JournalStore, SystemBus: bus,
-		DefaultChunkSize: cfg.TransferDefaultChunkSize, DefaultMaxReadBytes: cfg.TransferDefaultMaxReadBytes,
-		DefaultConcurrency: cfg.TransferDefaultConcurrency,
+		DefaultChunkSize: cfg.TransferDefaultChunkSize, DefaultMaxReadBytes: cfg.TransferDefaultMaxReadBytes, DefaultConcurrency: cfg.TransferDefaultConcurrency,
 	}
 	var err error
 	if out.transfer, err = uctrans.NewService(tCfg); err != nil {
@@ -244,9 +240,8 @@ func buildTransferAutoObsServices(
 	}
 	aCfg := ucauto.ServiceConfig{
 		Gate: g, Pool: p, Clock: cfg.Clock, Entropy: cfg.Entropy, Env: cfg.Env, ScopedFS: cfg.ScopedFS,
-		OperatorReadFS: cfg.OperatorReadFS, Inventory: invSvc, SystemBus: bus,
-		DefaultConcurrency: cfg.AutomationDefaultConcurrency, MaxScriptBytes: cfg.AutomationMaxScriptBytes,
-		MaxTemplateBytes: cfg.AutomationMaxTemplateBytes, MaxCopyBytes: cfg.AutomationMaxCopyBytes,
+		OperatorReadFS: cfg.OperatorReadFS, Inventory: invSvc, SystemBus: bus, DefaultConcurrency: cfg.AutomationDefaultConcurrency,
+		MaxScriptBytes: cfg.AutomationMaxScriptBytes, MaxTemplateBytes: cfg.AutomationMaxTemplateBytes, MaxCopyBytes: cfg.AutomationMaxCopyBytes,
 	}
 	if out.automation, err = ucauto.NewService(aCfg); err != nil {
 		return fmt.Errorf("%w: 初始化自动化服务失败: %w", ErrInvalidConfig, err)
@@ -280,33 +275,23 @@ func (e *Engine) ReconcileCrashedAudits(ctx context.Context) (ReconcileReport, e
 
 // NewOperationStream 从显式熵源分配唯一 TraceID/OperationID，构造单次操作隔离事件流（确定性 EOF）。
 func (e *Engine) NewOperationStream(ctx context.Context, buffer int) (*events.OperationStream, error) {
-	if e == nil || !e.initialized {
-		return nil, ErrEngineNotInitialized
-	}
-	if ctx == nil {
-		return nil, ErrNilContext
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if e.IsClosed() {
-		return nil, ErrEngineClosed
-	}
-	if buffer < 0 {
-		return nil, fmt.Errorf("%w: OperationStream 缓冲容量不能为负", ErrInvalidRequest)
-	}
-	if buffer == 0 {
-		buffer = defaultOperationStreamBuffer
-	}
-	tid, err := trace.NewTraceIDFrom(e.entropy)
-	if err != nil {
-		return nil, fmt.Errorf("engine: 分配 TraceID 失败: %w", err)
-	}
-	oid, err := trace.NewOpIDFrom(e.entropy)
-	if err != nil {
-		return nil, fmt.Errorf("engine: 分配 OperationID 失败: %w", err)
-	}
-	return events.NewOperationStream(events.OperationStreamConfig{TraceID: tid, OperationID: oid, OperationBuffer: buffer})
+	return runOp(e, ctx, func(context.Context) (*events.OperationStream, error) {
+		if buffer < 0 {
+			return nil, fmt.Errorf("%w: OperationStream 缓冲容量不能为负", ErrInvalidRequest)
+		}
+		if buffer == 0 {
+			buffer = defaultOperationStreamBuffer
+		}
+		tid, err := trace.NewTraceIDFrom(e.entropy)
+		if err != nil {
+			return nil, fmt.Errorf("engine: 分配 TraceID 失败: %w", err)
+		}
+		oid, err := trace.NewOpIDFrom(e.entropy)
+		if err != nil {
+			return nil, fmt.Errorf("engine: 分配 OperationID 失败: %w", err)
+		}
+		return events.NewOperationStream(events.OperationStreamConfig{TraceID: tid, OperationID: oid, OperationBuffer: buffer})
+	})
 }
 
 // SystemBus / IsHalted / HaltInfo / IsClosed 提供 Engine 运行态只读查询（未初始化零值严格失败关闭）。
@@ -318,11 +303,10 @@ func (e *Engine) SystemBus() *events.SystemBus {
 }
 func (e *Engine) IsHalted() bool { return e == nil || !e.initialized || e.gate.IsHalted() }
 func (e *Engine) HaltInfo() (HaltInfo, bool) {
-	if e == nil || !e.initialized {
-		return HaltInfo{}, false
-	}
-	if info, ok := e.gate.HaltInfo(); ok {
-		return haltInfoFromGate(info), true
+	if e != nil && e.initialized {
+		if info, ok := e.gate.HaltInfo(); ok {
+			return haltInfoFromGate(info), true
+		}
 	}
 	return HaltInfo{}, false
 }
@@ -399,12 +383,8 @@ func runOp[T any](e *Engine, ctx context.Context, fn func(context.Context) (T, e
 
 //xops:syncclosure
 func runOpErr(e *Engine, ctx context.Context, fn func(context.Context) error) error {
-	runCtx, cleanup, err := e.beginOp(ctx)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	return mapGateError(fn(runCtx))
+	_, err := runOp(e, ctx, func(c context.Context) (struct{}, error) { return struct{}{}, fn(c) })
+	return err
 }
 
 //xops:syncclosure
@@ -419,14 +399,13 @@ func runTargetOp[T any](e *Engine, ctx context.Context, target TargetInput, fn f
 }
 
 func (e *Engine) beginOp(ctx context.Context) (context.Context, func(), error) {
-	if e == nil || !e.initialized {
+	switch {
+	case e == nil || !e.initialized:
 		return nil, nil, ErrEngineNotInitialized
-	}
-	if ctx == nil {
+	case ctx == nil:
 		return nil, nil, ErrNilContext
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, nil, err
+	case ctx.Err() != nil:
+		return nil, nil, ctx.Err()
 	}
 	e.opMu.Lock()
 	if e.closing {
@@ -467,6 +446,9 @@ func mapGateError(err error) error {
 	}
 	if errors.Is(err, gate.ErrReconcilerUnavailable) {
 		return fmt.Errorf("%w: %w", ErrReconcilerUnavailable, err)
+	}
+	if _, isCh := errors.AsType[*gate.ApprovalChallengeError](err); isCh || errors.Is(err, gate.ErrApprovalRequired) {
+		return fmt.Errorf("%w: %w", ErrApprovalRequired, err)
 	}
 	return err
 }

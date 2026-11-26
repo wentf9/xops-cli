@@ -154,12 +154,7 @@ func (r *Registry) nodesQueryNode(ctx context.Context, args nodesArgs, qReq ucin
 	}{rev, n})
 }
 
-func (r *Registry) nodesMutate(
-	ctx context.Context,
-	args nodesArgs,
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (protocol.CallToolResult, error) {
+func (r *Registry) nodesMutate(ctx context.Context, args nodesArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	expRev, err := parseOptionalRevision(args.ExpectedRevision)
 	if err != nil {
 		return protocol.CallToolResult{}, err
@@ -176,16 +171,15 @@ func (r *Registry) nodesMutate(
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
-	return encodeMutationResult(res)
+	return protocol.NewToolSuccessResult(struct {
+		Revision       ports.Revision          `json:"revision"`
+		Durability     ports.DurabilityOutcome `json:"durability"`
+		DeletedSecrets int                     `json:"deleted_secret_count"`
+		RetainedCount  int                     `json:"retained_secret_count"`
+	}{res.Revision(), res.Durability(), len(res.DeletedSecrets()), len(res.RetainedSecrets())})
 }
 
-func (r *Registry) nodesMutateHost(
-	ctx context.Context,
-	args nodesArgs,
-	expRev algebraic.Option[ports.Revision],
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (ucinv.MutationResult, error) {
+func (r *Registry) nodesMutateHost(ctx context.Context, args nodesArgs, expRev algebraic.Option[ports.Revision], risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (ucinv.MutationResult, error) {
 	zeroRes := zeroVal[ucinv.MutationResult]()
 	if args.Action == "delete_host" {
 		id, err := inventory.ParseHostID(args.ID)
@@ -207,13 +201,7 @@ func (r *Registry) nodesMutateHost(
 	return r.inventory.UpdateHost(ctx, req)
 }
 
-func (r *Registry) nodesMutateIdentity(
-	ctx context.Context,
-	args nodesArgs,
-	expRev algebraic.Option[ports.Revision],
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (ucinv.MutationResult, error) {
+func (r *Registry) nodesMutateIdentity(ctx context.Context, args nodesArgs, expRev algebraic.Option[ports.Revision], risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (ucinv.MutationResult, error) {
 	zeroRes := zeroVal[ucinv.MutationResult]()
 	if args.Action == "delete_identity" {
 		id, err := inventory.ParseIdentityID(args.ID)
@@ -239,13 +227,7 @@ func (r *Registry) nodesMutateIdentity(
 	return r.inventory.UpdateIdentity(ctx, req)
 }
 
-func (r *Registry) nodesMutateNode(
-	ctx context.Context,
-	args nodesArgs,
-	expRev algebraic.Option[ports.Revision],
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (ucinv.MutationResult, error) {
+func (r *Registry) nodesMutateNode(ctx context.Context, args nodesArgs, expRev algebraic.Option[ports.Revision], risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (ucinv.MutationResult, error) {
 	zeroRes := zeroVal[ucinv.MutationResult]()
 	if args.Action == "delete_node" {
 		id, err := inventory.ParseNodeID(args.ID)
@@ -271,45 +253,10 @@ func (r *Registry) nodesMutateNode(
 	return r.inventory.UpdateNode(ctx, req)
 }
 
-func encodeMutationResult(res ucinv.MutationResult) (protocol.CallToolResult, error) {
-	return protocol.NewToolSuccessResult(struct {
-		Revision       ports.Revision          `json:"revision"`
-		Durability     ports.DurabilityOutcome `json:"durability"`
-		DeletedSecrets int                     `json:"deleted_secret_count"`
-		RetainedCount  int                     `json:"retained_secret_count"`
-	}{
-		Revision:       res.Revision(),
-		Durability:     res.Durability(),
-		DeletedSecrets: len(res.DeletedSecrets()),
-		RetainedCount:  len(res.RetainedSecrets()),
-	})
-}
-
 func (r *Registry) nodesInspect(ctx context.Context, args nodesArgs, qReq ucinv.QueryRequest) (protocol.CallToolResult, error) {
 	switch args.Action {
 	case "resolve":
-		resolved, err := r.resolveTarget(ctx, args.Target, option.UnsetOptionLayer())
-		if err != nil {
-			return protocol.CallToolResult{}, err
-		}
-		hops := resolved.Plan().Hops().Slice()
-		endpoints := make([]string, 0, len(hops))
-		for _, h := range hops {
-			endpoints = append(endpoints, h.Endpoint().String())
-		}
-		return protocol.NewToolSuccessResult(struct {
-			NodeID     string            `json:"node_id"`
-			OriginKind option.OriginKind `json:"origin_kind"`
-			PlanDigest string            `json:"plan_digest"`
-			HopCount   int               `json:"hop_count"`
-			Endpoints  []string          `json:"endpoints"`
-		}{
-			NodeID:     resolved.NodeID(),
-			OriginKind: resolved.OriginKind(),
-			PlanDigest: resolved.Plan().PlanDigest().String(),
-			HopCount:   len(hops),
-			Endpoints:  endpoints,
-		})
+		return r.nodesResolveAuthorized(ctx, args.Target, qReq)
 	case "validate_dag":
 		rep, err := r.inventory.ValidateDAG(ctx, qReq)
 		if err != nil {
@@ -328,6 +275,53 @@ func (r *Registry) nodesInspect(ctx context.Context, args nodesArgs, qReq ucinv.
 		}
 		return protocol.NewToolSuccessResult(rep)
 	}
+}
+
+// nodesResolveAuthorized 将 MCP 暴露的 nodes.resolve 收口进 gate.WithAuthorized[CapInspect] 与审计闭环（ADR-008）。
+func (r *Registry) nodesResolveAuthorized(ctx context.Context, rawTarget string, qReq ucinv.QueryRequest) (protocol.CallToolResult, error) {
+	target := strings.TrimSpace(rawTarget)
+	if target == "" {
+		return protocol.CallToolResult{}, fmt.Errorf("%w: target 不能为空", protocol.ErrInvalidParams)
+	}
+	binding, err := security.NewOperationBinding(security.OperationBindingSpec{
+		Capability: security.CapabilityKindOf[security.CapInspect](),
+		Tool:       protocol.ToolNameNodes,
+		Action:     "resolve",
+		NodeID:     target,
+		Parameters: map[string]string{"target": target},
+	})
+	if err != nil {
+		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+	}
+	gReq, err := gate.NewGateRequest[security.CapInspect](gate.GateRequestSpec[security.CapInspect]{
+		Binding:      binding,
+		Risk:         qReq.Risk.OrElse(security.RiskSafe),
+		ScopeSummary: "resolve target " + target,
+		Approval:     qReq.Approval,
+	})
+	if err != nil {
+		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+	}
+	var resolved ucinv.ResolvedTarget
+	if err := gate.WithAuthorized[security.CapInspect](ctx, r.gate, gReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
+		var rErr error
+		resolved, rErr = r.resolveTarget(authCtx, rawTarget, option.UnsetOptionLayer())
+		return rErr
+	}); err != nil {
+		return protocol.CallToolResult{}, err
+	}
+	hops := resolved.Plan().Hops().Slice()
+	endpoints := make([]string, 0, len(hops))
+	for _, h := range hops {
+		endpoints = append(endpoints, h.Endpoint().String())
+	}
+	return protocol.NewToolSuccessResult(struct {
+		NodeID     string            `json:"node_id"`
+		OriginKind option.OriginKind `json:"origin_kind"`
+		PlanDigest string            `json:"plan_digest"`
+		HopCount   int               `json:"hop_count"`
+		Endpoints  []string          `json:"endpoints"`
+	}{resolved.NodeID(), resolved.OriginKind(), resolved.Plan().PlanDigest().String(), len(hops), endpoints})
 }
 
 func (r *Registry) nodesImport(

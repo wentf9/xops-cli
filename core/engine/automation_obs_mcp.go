@@ -8,32 +8,67 @@ import (
 	"net/http"
 
 	"github.com/wentf9/xops-cli/core/domain/inventory"
+	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime"
+	mcptools "github.com/wentf9/xops-cli/core/internal/mcpruntime/tools"
 	ucauto "github.com/wentf9/xops-cli/core/internal/usecase/automation"
+	ucinv "github.com/wentf9/xops-cli/core/internal/usecase/inventory"
 	ucobs "github.com/wentf9/xops-cli/core/internal/usecase/observability"
 )
 
-func toAutoTargetNodes(targets []ResolvedTarget) ([]ucauto.TargetNode, error) {
+// toAutoTargetNodes 将公开 ResolvedTarget 切片转换为 automation.TargetNode：
+// 托管目标自动从资产快照补齐 Tags 与 DefaultProfile；IPv6 与多端口 AdHoc 目标按末跳端点生成确定性合法合成 NodeID。
+func (e *Engine) toAutoTargetNodes(ctx context.Context, targets []ResolvedTarget) ([]ucauto.TargetNode, error) {
 	if len(targets) == 0 {
 		return nil, nil
 	}
-	out := make([]ucauto.TargetNode, 0, len(targets))
+	hasManaged := false
 	for i, t := range targets {
 		if !t.IsValid() {
 			return nil, fmt.Errorf("%w: targets[%d] 无效", ErrInvalidRequest, i)
 		}
-		nid, err := inventory.ParseNodeID(t.NodeID())
-		if err != nil {
-			return nil, fmt.Errorf("%w: targets[%d] 节点标识 %q 非法: %w", ErrInvalidRequest, i, t.NodeID(), err)
+		if t.OriginKind() == option.OriginManaged {
+			hasManaged = true
 		}
-		tn, err := ucauto.NewTargetNode(ucauto.TargetNodeSpec{NodeID: nid, Plan: t.Plan()})
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	managedByID, err := e.loadManagedNodeMap(ctx, hasManaged)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ucauto.TargetNode, 0, len(targets))
+	for i, t := range targets {
+		nid, nErr := mcptools.SynthesizeTargetNodeID(t.NodeID(), t.OriginKind(), t.Plan())
+		if nErr != nil {
+			return nil, fmt.Errorf("%w: targets[%d] 节点标识 %q 非法: %w", ErrInvalidRequest, i, t.NodeID(), nErr)
+		}
+		spec := ucauto.TargetNodeSpec{NodeID: nid, Plan: t.Plan()}
+		if managed, ok := managedByID[nid]; ok && t.OriginKind() == option.OriginManaged {
+			spec.Tags = managed.Tags()
+			spec.DefaultProfile = managed.Execution()
+		}
+		tn, tErr := ucauto.NewTargetNode(spec)
+		if tErr != nil {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidRequest, tErr)
 		}
 		out = append(out, tn)
+	}
+	return out, nil
+}
+
+func (e *Engine) loadManagedNodeMap(ctx context.Context, needed bool) (map[inventory.NodeID]inventory.Node, error) {
+	if !needed || e.inventory == nil {
+		return nil, nil
+	}
+	nodes, _, err := e.inventory.ListNodes(ctx, ucinv.QueryRequest{})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[inventory.NodeID]inventory.Node, len(nodes))
+	for _, n := range nodes {
+		out[n.ID()] = n
 	}
 	return out, nil
 }
@@ -41,7 +76,7 @@ func toAutoTargetNodes(targets []ResolvedTarget) ([]ucauto.TargetNode, error) {
 // BatchExec 执行受 Nursery 监督的跨节点并发批量命令，返回确定性排序折叠报告。
 func (e *Engine) BatchExec(ctx context.Context, req BatchExecRequest) (BatchExecReport, error) {
 	return runOp(e, ctx, func(c context.Context) (BatchExecReport, error) {
-		nodes, err := toAutoTargetNodes(req.Targets)
+		nodes, err := e.toAutoTargetNodes(c, req.Targets)
 		if err != nil {
 			return zeroVal[BatchExecReport](), err
 		}
@@ -57,7 +92,7 @@ func (e *Engine) BatchExec(ctx context.Context, req BatchExecRequest) (BatchExec
 // RunPlaybook 执行声明式 Playbook vNext 判别式 AST 与 EnsureFSM 幂等收敛。
 func (e *Engine) RunPlaybook(ctx context.Context, req PlaybookRequest) (PlaybookRunResult, error) {
 	return runOp(e, ctx, func(c context.Context) (PlaybookRunResult, error) {
-		nodes, err := toAutoTargetNodes(req.Targets)
+		nodes, err := e.toAutoTargetNodes(c, req.Targets)
 		if err != nil {
 			return zeroVal[PlaybookRunResult](), err
 		}
@@ -111,8 +146,7 @@ func (e *Engine) CloseGUISession(ctx context.Context, handle plan.ManagedHandle[
 	return runOpErr(e, ctx, func(c context.Context) error { return e.observability.CloseGUISession(c, handle) })
 }
 
-// ParseGUIActionKind / ParseGUISessionKind / ParseScrollDirection / ParseProcessSortBy / NewFileLogTarget / NewDockerLogTarget
-// 代理可观测性与 GUI 值构造器，使 entry 层零 core/internal 引用。
+// ParseGUIActionKind / ParseGUISessionKind / ParseScrollDirection / ParseProcessSortBy / NewFileLogTarget / NewDockerLogTarget。
 func ParseGUIActionKind(raw string) (ucobs.GUIActionKind, error) {
 	return ucobs.ParseGUIActionKind(raw)
 }

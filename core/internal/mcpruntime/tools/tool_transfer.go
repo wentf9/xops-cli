@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -11,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime/protocol"
 	uctrans "github.com/wentf9/xops-cli/core/internal/usecase/transfer"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -97,13 +99,8 @@ func (r *Registry) transferStart(ctx context.Context, base uctrans.CallBase, arg
 		return protocol.CallToolResult{}, err
 	}
 	info, err := r.transfer.StartTransfer(ctx, uctrans.StartTransferRequest{
-		CallBase:               base,
-		TransferSessionOptions: sessOpts,
-		TransferID:             tidOpt,
-		Dest:                   dest,
-		TotalBytes:             args.TotalBytes,
-		ExpectedDigest:         expDig,
-		JournalVersion:         fsm.JournalVersionV2,
+		CallBase: base, TransferSessionOptions: sessOpts, TransferID: tidOpt, Dest: dest,
+		TotalBytes: args.TotalBytes, ExpectedDigest: expDig, JournalVersion: fsm.JournalVersionV2,
 	})
 	if err != nil {
 		return protocol.CallToolResult{}, err
@@ -122,10 +119,7 @@ func (r *Registry) buildTransferDestAndOpts(dir fsm.TransferDirection, args tran
 		return zeroDest, uctrans.TransferSessionOptions{}, err
 	}
 	opts := uctrans.TransferSessionOptions{
-		NoClobber:      args.NoClobber,
-		PreserveTimes:  args.PreserveTimes,
-		ExpectedAnchor: args.ExpectedAnchor,
-		Perm:           permOpt,
+		NoClobber: args.NoClobber, PreserveTimes: args.PreserveTimes, ExpectedAnchor: args.ExpectedAnchor, Perm: permOpt,
 	}
 	if dir == fsm.TransferDirectionUpload {
 		dest, dErr := fsm.NewUploadDest(rp)
@@ -143,26 +137,15 @@ func (r *Registry) buildTransferDestAndOpts(dir fsm.TransferDirection, args tran
 	if dErr != nil {
 		return zeroDest, uctrans.TransferSessionOptions{}, dErr
 	}
-	opts.LocalRoot = algebraic.Some(localRoot)
-	opts.RemoteSource = algebraic.Some(rp)
+	opts.LocalRoot, opts.RemoteSource = algebraic.Some(localRoot), algebraic.Some(rp)
 	return dest, opts, nil
 }
 
-func (r *Registry) recordAndEncodeTransferHandle(
-	base uctrans.CallBase,
-	info uctrans.TransferHandleInfo,
-	localRoot algebraic.Option[pathalg.LocalDir],
-) (protocol.CallToolResult, error) {
+func (r *Registry) recordAndEncodeTransferHandle(base uctrans.CallBase, info uctrans.TransferHandleInfo, localRoot algebraic.Option[pathalg.LocalDir]) (protocol.CallToolResult, error) {
 	b := TransferBinding{
-		transferID: info.TransferID,
-		plan:       base.Plan,
-		nodeID:     base.NodeID,
-		handle:     info.Handle,
-		direction:  info.Meta.Direction(),
-		localRoot:  localRoot,
-		localDest:  info.Meta.Dest().Local(),
-		totalBytes: info.Meta.TotalBytes(),
-		valid:      true,
+		transferID: info.TransferID, plan: base.Plan, nodeID: base.NodeID, handle: info.Handle,
+		direction: info.Meta.Direction(), localRoot: localRoot, localDest: info.Meta.Dest().Local(),
+		totalBytes: info.Meta.TotalBytes(), valid: true,
 	}
 	r.mu.Lock()
 	if len(r.transfers) >= r.maxHandles {
@@ -183,14 +166,8 @@ func (r *Registry) recordAndEncodeTransferHandle(
 		StateKind      fsm.TransferStateKind                 `json:"state_kind"`
 		HTTPStreamPath string                                `json:"http_stream_path"`
 	}{
-		TransferID:     info.TransferID,
-		Handle:         info.Handle,
-		HandleToken:    info.Handle.String(),
-		Direction:      info.Meta.Direction(),
-		Generation:     info.Meta.Generation(),
-		TotalBytes:     info.Meta.TotalBytes(),
-		StateKind:      info.State.Kind(),
-		HTTPStreamPath: "/transfers/" + info.TransferID.String() + "/stream",
+		info.TransferID, info.Handle, info.Handle.String(), info.Meta.Direction(),
+		info.Meta.Generation(), info.Meta.TotalBytes(), info.State.Kind(), "/transfers/" + info.TransferID.String() + "/stream",
 	})
 }
 
@@ -227,12 +204,7 @@ func (r *Registry) transferChunk(ctx context.Context, base uctrans.CallBase, arg
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
-	res, err := r.transfer.WriteTransferChunk(ctx, uctrans.WriteTransferChunkRequest{
-		CallBase: base,
-		Handle:   h,
-		Offset:   args.Offset,
-		Data:     data,
-	})
+	res, err := r.transfer.WriteTransferChunk(ctx, uctrans.WriteTransferChunkRequest{CallBase: base, Handle: h, Offset: args.Offset, Data: data})
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
@@ -250,11 +222,7 @@ func (r *Registry) transferPull(ctx context.Context, base uctrans.CallBase, args
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
-	res, err := r.transfer.PullTransferChunk(ctx, uctrans.PullTransferChunkRequest{
-		CallBase:      base,
-		Handle:        h,
-		MaxChunkBytes: args.MaxChunkBytes,
-	})
+	res, err := r.transfer.PullTransferChunk(ctx, uctrans.PullTransferChunkRequest{CallBase: base, Handle: h, MaxChunkBytes: args.MaxChunkBytes})
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
@@ -294,9 +262,7 @@ func (r *Registry) transferAbort(ctx context.Context, base uctrans.CallBase, arg
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
-	if err := r.transfer.AbortTransfer(ctx, uctrans.AbortTransferRequest{
-		CallBase: base, Handle: h, Reason: args.Reason,
-	}); err != nil {
+	if err := r.transfer.AbortTransfer(ctx, uctrans.AbortTransferRequest{CallBase: base, Handle: h, Reason: args.Reason}); err != nil {
 		return protocol.CallToolResult{}, err
 	}
 	r.dropTransferByHandle(h)
@@ -334,18 +300,11 @@ func (r *Registry) transferResume(ctx context.Context, base uctrans.CallBase, ar
 		remoteSrc = algebraic.Some(rp)
 	}
 	opts := uctrans.TransferSessionOptions{
-		LocalRoot:      r.transferRoot,
-		RemoteSource:   remoteSrc,
-		NoClobber:      args.NoClobber,
-		PreserveTimes:  args.PreserveTimes,
-		ExpectedAnchor: args.ExpectedAnchor,
-		Perm:           permOpt,
+		LocalRoot: r.transferRoot, RemoteSource: remoteSrc, NoClobber: args.NoClobber,
+		PreserveTimes: args.PreserveTimes, ExpectedAnchor: args.ExpectedAnchor, Perm: permOpt,
 	}
 	info, err := r.transfer.ResumeTransfer(ctx, uctrans.ResumeTransferRequest{
-		CallBase:               base,
-		TransferSessionOptions: opts,
-		TransferID:             tid,
-		StartNextGen:           args.StartNextGen,
+		CallBase: base, TransferSessionOptions: opts, TransferID: tid, StartNextGen: args.StartNextGen,
 	})
 	if err != nil {
 		return protocol.CallToolResult{}, err
@@ -359,10 +318,7 @@ func (r *Registry) transferRecoverOne(ctx context.Context, base uctrans.CallBase
 		return protocol.CallToolResult{}, fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
 	}
 	res, err := r.transfer.RecoverTransfer(ctx, uctrans.RecoverTransferRequest{
-		CallBase:          base,
-		TransferID:        tid,
-		PruneSuperseded:   args.PruneSuperseded,
-		LocalRootForClean: r.transferRoot,
+		CallBase: base, TransferID: tid, PruneSuperseded: args.PruneSuperseded, LocalRootForClean: r.transferRoot,
 	})
 	if err != nil {
 		return protocol.CallToolResult{}, err
@@ -370,11 +326,49 @@ func (r *Registry) transferRecoverOne(ctx context.Context, base uctrans.CallBase
 	return protocol.NewToolSuccessResult(transferRecoveryDTO(res))
 }
 
+// transferRecoverAll 将 MCP 暴露的全量日志恢复/裁剪收口进 gate.WithAuthorized[CapTransfer] 与审计闭环（ADR-008）：
+// 只读扫描基准风险为 RiskSafe，开启 prune_superseded 裁剪旧世代日志时基准风险升至 RiskModerate（与调用方 risk 取格并）。
 func (r *Registry) transferRecoverAll(ctx context.Context, args transferArgs) (protocol.CallToolResult, error) {
-	res, err := r.transfer.RecoverAllTransfers(ctx, uctrans.RecoverAllRequest{PruneSuperseded: args.PruneSuperseded})
+	riskOpt, approval, err := validateApprovalAndRisk(args.Risk, args.Approval)
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
+	effRisk := security.RiskSafe
+	summary := "recover all transfer journals"
+	if args.PruneSuperseded {
+		effRisk = security.RiskModerate
+		summary = "recover and prune superseded transfer journals"
+	}
+	if rv, ok := riskOpt.Get(); ok {
+		effRisk = security.FoldRisks(effRisk, rv)
+	}
+	binding, err := security.NewOperationBinding(security.OperationBindingSpec{
+		Capability: security.CapabilityKindOf[security.CapTransfer](),
+		Tool:       protocol.ToolNameTransfer,
+		Action:     "recover_all",
+		Parameters: map[string]string{"prune_superseded": strconv.FormatBool(args.PruneSuperseded)},
+	})
+	if err != nil {
+		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+	}
+	gReq, err := gate.NewGateRequest[security.CapTransfer](gate.GateRequestSpec[security.CapTransfer]{
+		Binding: binding, Risk: effRisk, ScopeSummary: summary, Approval: approval,
+	})
+	if err != nil {
+		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+	}
+	var res uctrans.RecoverAllResult
+	if err := gate.WithAuthorized[security.CapTransfer](ctx, r.gate, gReq, func(authCtx context.Context, _ gate.Authorized[security.CapTransfer]) error {
+		var rErr error
+		res, rErr = r.transfer.RecoverAllTransfers(authCtx, uctrans.RecoverAllRequest{PruneSuperseded: args.PruneSuperseded})
+		return rErr
+	}); err != nil {
+		return protocol.CallToolResult{}, err
+	}
+	return encodeRecoverAllResult(res)
+}
+
+func encodeRecoverAllResult(res uctrans.RecoverAllResult) (protocol.CallToolResult, error) {
 	type entryDTO struct {
 		TransferID        security.OperationID  `json:"transfer_id"`
 		StateKind         fsm.TransferStateKind `json:"state_kind,omitzero"`
@@ -386,10 +380,8 @@ func (r *Registry) transferRecoverAll(ctx context.Context, args transferArgs) (p
 	items := make([]entryDTO, 0, len(res.Entries))
 	for _, e := range res.Entries {
 		item := entryDTO{
-			TransferID:        e.TransferID,
-			SelectedGen:       e.Result.SelectedGen,
-			PrunedGenerations: e.Result.PrunedGenerations,
-			UncertainCommit:   e.Result.UncertainCommit,
+			TransferID: e.TransferID, SelectedGen: e.Result.SelectedGen,
+			PrunedGenerations: e.Result.PrunedGenerations, UncertainCommit: e.Result.UncertainCommit,
 		}
 		if e.Result.State != nil && e.Result.State.IsValid() {
 			item.StateKind = e.Result.State.Kind()
@@ -405,14 +397,12 @@ func (r *Registry) transferRecoverAll(ctx context.Context, args transferArgs) (p
 }
 
 func (r *Registry) transferInspect(ctx context.Context, base uctrans.CallBase, args transferArgs) (protocol.CallToolResult, error) {
-	tid, err := security.ParseOperationID(args.TransferID)
+	tid, handleOpt, err := r.resolveTransferInspectID(args)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, err
 	}
 	snap, err := r.transfer.InspectTransfer(ctx, uctrans.InspectTransferRequest{
-		CallBase:   base,
-		TransferID: tid,
-		Handle:     args.Handle,
+		CallBase: base, TransferID: tid, Handle: handleOpt,
 	})
 	if err != nil {
 		return protocol.CallToolResult{}, err
@@ -428,16 +418,37 @@ func (r *Registry) transferInspect(ctx context.Context, base uctrans.CallBase, a
 		Offset     uint64                `json:"offset"`
 		ChunkCount uint64                `json:"chunk_count"`
 	}{
-		TransferID: snap.TransferID,
-		LiveHandle: snap.LiveHandle,
-		IsTerminal: snap.IsTerminal,
-		Direction:  snap.Meta.Direction(),
-		Generation: snap.Meta.Generation(),
-		TotalBytes: snap.Meta.TotalBytes(),
-		StateKind:  snap.StateKind,
-		Offset:     snap.Offset,
-		ChunkCount: snap.ChunkCount,
+		snap.TransferID, snap.LiveHandle, snap.IsTerminal, snap.Meta.Direction(),
+		snap.Meta.Generation(), snap.Meta.TotalBytes(), snap.StateKind, snap.Offset, snap.ChunkCount,
 	})
+}
+
+func (r *Registry) resolveTransferInspectID(args transferArgs) (security.OperationID, algebraic.Option[plan.ManagedHandle[plan.KindTransfer]], error) {
+	var zeroID security.OperationID
+	if rawID := strings.TrimSpace(args.TransferID); rawID != "" {
+		tid, err := security.ParseOperationID(rawID)
+		if err != nil {
+			return zeroID, algebraic.None[plan.ManagedHandle[plan.KindTransfer]](), fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
+		}
+		return tid, args.Handle, nil
+	}
+	tok := strings.TrimSpace(args.HandleToken)
+	expH, hasExpH := args.Handle.Get()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, b := range r.transfers {
+		if !b.IsValid() {
+			continue
+		}
+		if (tok != "" && b.handle.String() == tok) || (hasExpH && b.handle.Equal(expH)) {
+			hOpt := args.Handle
+			if !hasExpH {
+				hOpt = algebraic.Some(b.handle)
+			}
+			return b.transferID, hOpt, nil
+		}
+	}
+	return zeroID, algebraic.None[plan.ManagedHandle[plan.KindTransfer]](), fmt.Errorf("%w: 缺少有效 transfer_id 或已登记 handle_token", protocol.ErrInvalidParams)
 }
 
 func transferRecoveryDTO(res uctrans.TransferRecoveryResult) any {
@@ -452,15 +463,4 @@ func transferRecoveryDTO(res uctrans.TransferRecoveryResult) any {
 		PrunedGenerations []uint64              `json:"pruned_generations,omitzero"`
 		UncertainCommit   bool                  `json:"uncertain_commit,omitzero"`
 	}{res.TransferID, kind, res.SelectedGen, res.PrunedGenerations, res.UncertainCommit}
-}
-
-func parseOptionalOpID(raw string) (algebraic.Option[security.OperationID], error) {
-	if strings.TrimSpace(raw) == "" {
-		return algebraic.None[security.OperationID](), nil
-	}
-	id, err := security.ParseOperationID(raw)
-	if err != nil {
-		return algebraic.None[security.OperationID](), fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
-	}
-	return algebraic.Some(id), nil
 }

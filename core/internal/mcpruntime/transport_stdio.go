@@ -9,17 +9,17 @@ import (
 	"io"
 	"sync"
 
-	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime/protocol"
 )
 
 const stdioReadBufBytes = 64 * 1024
 
-// ServeStdio 启动标准 MCP stdio（换行分隔 JSON-RPC 2.0）传输循环：
+// ServeStdio 启动标准 MCP stdio（换行分隔 JSON-RPC 2.0）单流同步传输循环：
 //   - 启动前自动执行 Prepare（O(1) 崩溃审计对账 + RecoverJournals）；
-//   - 严格实施入站单条报文大小有界读取（防 OOM 炸弹），所有并发处理由 core/conc.Nursery 监督（0 裸 go）；
-//   - 输入流到达 io.EOF 时确定性退出并返回 nil；上下文取消或 Server.Close 时优雅排空无泄漏。
+//   - 严格实施入站单条报文大小有界读取（防 OOM 炸弹），逐条同步保序处理并输出响应行（0 裸 go）；
+//   - 输入流到达 io.EOF 时确定性退出并返回 nil；若上层（如 entry/mcpcmd）在阻塞读期间取消 ctx 或调用 Server.Close，
+//     调用方需同时关闭传入的 in 读端以立即解除底层阻塞读取并完成优雅停机。
 func (s *Server) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) error {
 	if in == nil || out == nil {
 		return fmt.Errorf("%w: stdio 输入与输出流不能为 nil", ErrInvalidConfig)
@@ -48,14 +48,12 @@ func (s *Server) serveStdioLoop(ctx context.Context, in io.Reader, out io.Writer
 		_, wErr := out.Write(frame)
 		return wErr
 	}
-	return conc.RunScoped(ctx, func(scopeCtx context.Context, _ *conc.Nursery) error {
-		for {
-			done, err := s.stepStdioMessage(scopeCtx, br, writeLine)
-			if done || err != nil {
-				return err
-			}
+	for {
+		done, err := s.stepStdioMessage(ctx, br, writeLine)
+		if done || err != nil {
+			return err
 		}
-	})
+	}
 }
 
 func (s *Server) stepStdioMessage(ctx context.Context, br *bufio.Reader, writeLine func([]byte) error) (bool, error) {

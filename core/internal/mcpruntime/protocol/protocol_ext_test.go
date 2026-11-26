@@ -71,8 +71,24 @@ func TestJSONRPC_StrictDecodeAndCanonicalMarshal(t *testing.T) {
 	if _, err := protocol.DecodeRequest([]byte(`{"jsonrpc":"1.0","id":1,"method":"ping"}`)); !errors.Is(err, protocol.ErrInvalidJSONRPC) {
 		t.Fatalf("jsonrpc!=2.0 期望 ErrInvalidJSONRPC，实际=%v", err)
 	}
-	if _, err := protocol.DecodeRequest([]byte(`{not-json`)); !errors.Is(err, protocol.ErrInvalidJSONRPC) {
-		t.Fatalf("损坏 JSON 期望 ErrInvalidJSONRPC，实际=%v", err)
+	if _, err := protocol.DecodeRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"ping","extra":123}`)); !errors.Is(err, protocol.ErrInvalidJSONRPC) {
+		t.Fatalf("未知顶层字段期望 ErrInvalidJSONRPC，实际=%v", err)
+	}
+	if _, err := protocol.DecodeRequest([]byte(`{not-json`)); !errors.Is(err, protocol.ErrParseJSON) {
+		t.Fatalf("损坏 JSON 期望 ErrParseJSON，实际=%v", err)
+	}
+	// JSON-RPC 2.0 §5：无可用请求 ID 的错误响应必须显式输出 "id":null，且反序列化可准确还原为 None。
+	errResp, err := protocol.NewErrorResponse(algebraic.None[protocol.RequestID](), protocol.CodeParseError, "parse error", nil)
+	if err != nil {
+		t.Fatalf("NewErrorResponse: %v", err)
+	}
+	errRaw, err := protocol.MarshalCanonical(errResp)
+	if err != nil || !strings.Contains(string(errRaw), `"id":null`) {
+		t.Fatalf("无 ID 错误响应必须包含 \"id\":null: raw=%s err=%v", errRaw, err)
+	}
+	var roundTripErr protocol.Response
+	if err := jsonv2.Unmarshal(errRaw, &roundTripErr); err != nil || roundTripErr.ID.IsSome() || roundTripErr.Error == nil || roundTripErr.Error.Code != protocol.CodeParseError {
+		t.Fatalf("反序列化含 id:null 的错误响应失败: resp=%+v err=%v", roundTripErr, err)
 	}
 	notif, err := protocol.DecodeRequest([]byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`))
 	if err != nil || !notif.IsNotification() {
@@ -205,9 +221,16 @@ func assertClassifyErrorCases(t *testing.T) {
 	}{
 		{fmt.Errorf("w: %w", gate.ErrGateHalted), protocol.CodeGateHalted, "gate_halted", true, false},
 		{fmt.Errorf("c: %w", uctrans.ErrUncertainCommit), protocol.CodeUncertainOutcome, "transfer_uncertain_commit", false, true},
+		{fmt.Errorf("u: %w", protocol.ErrOutcomeUnknown), protocol.CodeUncertainOutcome, "uncertain_outcome", false, true},
+		{protocol.ErrParseJSON, protocol.CodeParseError, "parse_error", false, false},
 		{gate.ErrAuthorizationDenied, protocol.CodeAuthorizationDenied, "authorization_denied", false, false},
+		{uctrans.ErrSymlinkPolicyDenied, protocol.CodeAuthorizationDenied, "symlink_policy_denied", false, false},
 		{fmt.Errorf("%w: bad", protocol.ErrInvalidParams), protocol.CodeInvalidParams, "invalid_params", false, false},
+		{fsm.ErrInvalidChunkOffset, protocol.CodeInvalidParams, "invalid_chunk_offset", false, false},
+		{fsm.ErrTransferSizeExceeded, protocol.CodeInvalidParams, "transfer_size_exceeded", false, false},
 		{fsm.ErrIllegalTransition, protocol.CodeInvalidState, "invalid_state", false, false},
+		{uctrans.ErrPatchConflict, protocol.CodeInvalidState, "patch_conflict", false, false},
+		{uctrans.ErrDigestMismatch, protocol.CodeInvalidState, "digest_mismatch", false, false},
 	}
 	for _, tc := range cases {
 		code, payload := protocol.ClassifyError(tc.err)

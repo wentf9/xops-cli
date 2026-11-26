@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime/protocol"
 	ucauto "github.com/wentf9/xops-cli/core/internal/usecase/automation"
+	ucinv "github.com/wentf9/xops-cli/core/internal/usecase/inventory"
 	ucsess "github.com/wentf9/xops-cli/core/internal/usecase/session"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -107,12 +109,7 @@ func compileMCPCommandPlan(args terminalExecArgs) (execution.CommandPlan, error)
 	return cp, nil
 }
 
-func (r *Registry) execSingle(
-	ctx context.Context,
-	args terminalExecArgs,
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (protocol.CallToolResult, error) {
+func (r *Registry) execSingle(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.session == nil {
 		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
 	}
@@ -124,52 +121,52 @@ func (r *Registry) execSingle(
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
-	limit := int(args.MaxOutputBytes)
+	limit := clampOutputLimit(args.MaxOutputBytes)
 	stdout, stderr := newBoundedBuffer(limit), newBoundedBuffer(limit)
 	ttyMode := ucsess.RequestTTYNo
 	if args.PTY {
 		ttyMode = ucsess.RequestTTYForce
 	}
-	var stdinReader *strings.Reader
-	if args.Stdin != "" {
-		stdinReader = strings.NewReader(args.Stdin)
-	}
 	out, execErr := r.session.Exec(ctx, ucsess.ExecRequest{
-		Plan:       resolved.Plan(),
-		Command:    cp,
-		NodeID:     resolved.NodeID(),
-		Term:       args.Term,
-		Stdin:      stdinReader,
-		Stdout:     stdout,
-		Stderr:     stderr,
-		RequestTTY: ttyMode,
-		Risk:       risk,
-		Approval:   approval,
+		Plan: resolved.Plan(), Command: cp, NodeID: resolved.NodeID(), Term: args.Term,
+		Stdin: optionalStringReader(args.Stdin), Stdout: stdout, Stderr: stderr,
+		RequestTTY: ttyMode, Risk: risk, Approval: approval,
 	})
-	if execErr != nil {
-		return protocol.CallToolResult{}, execErr
+	if err := r.checkExecOutcomeError(out, execErr); err != nil {
+		return protocol.CallToolResult{}, err
 	}
+	return encodeExecResult(resolved.NodeID(), out, stdout, stderr)
+}
+
+func encodeExecResult(nodeID string, out execution.ExecutionOutcome, stdout, stderr *boundedBuffer) (protocol.CallToolResult, error) {
 	return protocol.NewToolSuccessResult(struct {
 		NodeID    string      `json:"node_id"`
 		Outcome   outcomeJSON `json:"outcome"`
 		Stdout    string      `json:"stdout"`
 		Stderr    string      `json:"stderr"`
 		Truncated bool        `json:"truncated"`
-	}{
-		NodeID:    resolved.NodeID(),
-		Outcome:   outcomeJSON{outcome: out},
-		Stdout:    stdout.String(),
-		Stderr:    stderr.String(),
-		Truncated: stdout.Truncated() || stderr.Truncated(),
-	})
+	}{nodeID, outcomeJSON{outcome: out}, stdout.String(), stderr.String(), stdout.Truncated() || stderr.Truncated()})
 }
 
-func (r *Registry) execPrivileged(
-	ctx context.Context,
-	args terminalExecArgs,
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (protocol.CallToolResult, error) {
+// checkExecOutcomeError 维护 ADR-008 / ADR-016 优先级：Halted 熔断（-32001）最高优先，
+// 其次将 *execution.OutcomeUnknown 映射为 protocol.ErrOutcomeUnknown（uncertain:true, retryable:false，禁止重试）。
+func (r *Registry) checkExecOutcomeError(out execution.ExecutionOutcome, execErr error) error {
+	if r.gate.IsHalted() || errors.Is(execErr, gate.ErrGateHalted) || errors.Is(execErr, ports.ErrAuditPostWrite) {
+		if execErr != nil {
+			return execErr
+		}
+		return gate.ErrGateHalted
+	}
+	if unk, ok := out.(*execution.OutcomeUnknown); ok && unk != nil && unk.IsValid() {
+		if execErr != nil {
+			return fmt.Errorf("%w (%s): %w", protocol.ErrOutcomeUnknown, unk.Code(), execErr)
+		}
+		return fmt.Errorf("%w (%s): %s", protocol.ErrOutcomeUnknown, unk.Code(), unk.Reason())
+	}
+	return execErr
+}
+
+func (r *Registry) execPrivileged(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.session == nil {
 		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
 	}
@@ -177,19 +174,38 @@ func (r *Registry) execPrivileged(
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
+	privReq, pwRef, err := buildPrivilegeReq(args)
+	if err != nil {
+		return protocol.CallToolResult{}, err
+	}
+	limit := clampOutputLimit(args.MaxOutputBytes)
+	stdout, stderr := newBoundedBuffer(limit), newBoundedBuffer(limit)
+	out, execErr := r.session.ExecPrivileged(ctx, ucsess.PrivilegeExecRequest{
+		Plan: resolved.Plan(), Privilege: privReq, NodeID: resolved.NodeID(), Term: args.Term,
+		PasswordRef: pwRef, Paths: args.Paths, RecursivePaths: args.RecursivePaths,
+		Stdin: optionalStringReader(args.Stdin), Stdout: stdout, Stderr: stderr, Risk: risk, Approval: approval,
+	})
+	if err := r.checkExecOutcomeError(out, execErr); err != nil {
+		return protocol.CallToolResult{}, err
+	}
+	return encodeExecResult(resolved.NodeID(), out, stdout, stderr)
+}
+
+func buildPrivilegeReq(args terminalExecArgs) (ports.PrivilegeRequest, algebraic.Option[secret.Ref], error) {
+	zeroReq, zeroRef := zeroVal[ports.PrivilegeRequest](), algebraic.None[secret.Ref]()
 	method, ok := args.PrivilegeMethod.Get()
 	if !ok || !method.IsValid() {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: privilege_method 必填且须为 sudo/su/doas", protocol.ErrInvalidParams)
+		return zeroReq, zeroRef, fmt.Errorf("%w: privilege_method 必填且须为 sudo/su/doas", protocol.ErrInvalidParams)
 	}
 	cp, err := compileMCPCommandPlan(args)
 	if err != nil {
-		return protocol.CallToolResult{}, err
+		return zeroReq, zeroRef, err
 	}
 	var targetUser algebraic.Option[option.Username]
 	if args.TargetUser != "" {
 		u, uErr := option.ParseUsername(args.TargetUser)
 		if uErr != nil {
-			return protocol.CallToolResult{}, fmt.Errorf("%w: target_user 非法: %w", protocol.ErrInvalidParams, uErr)
+			return zeroReq, zeroRef, fmt.Errorf("%w: target_user 非法: %w", protocol.ErrInvalidParams, uErr)
 		}
 		targetUser = algebraic.Some(u)
 	}
@@ -197,59 +213,20 @@ func (r *Registry) execPrivileged(
 	if args.PasswordRef != "" {
 		ref, rErr := secret.ParseRef(args.PasswordRef)
 		if rErr != nil {
-			return protocol.CallToolResult{}, fmt.Errorf("%w: password_ref 非法: %w", protocol.ErrInvalidParams, rErr)
+			return zeroReq, zeroRef, fmt.Errorf("%w: password_ref 非法: %w", protocol.ErrInvalidParams, rErr)
 		}
 		pwRef = algebraic.Some(ref)
 	}
 	privReq, err := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
-		Method:         method,
-		Command:        cp,
-		TargetUser:     targetUser,
-		NonInteractive: args.NonInteractive,
-		Timeout:        args.Timeout,
+		Method: method, Command: cp, TargetUser: targetUser, NonInteractive: args.NonInteractive, Timeout: args.Timeout,
 	})
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return zeroReq, zeroRef, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
 	}
-	limit := int(args.MaxOutputBytes)
-	stdout, stderr := newBoundedBuffer(limit), newBoundedBuffer(limit)
-	out, execErr := r.session.ExecPrivileged(ctx, ucsess.PrivilegeExecRequest{
-		Plan:           resolved.Plan(),
-		Privilege:      privReq,
-		NodeID:         resolved.NodeID(),
-		Term:           args.Term,
-		PasswordRef:    pwRef,
-		Paths:          args.Paths,
-		RecursivePaths: args.RecursivePaths,
-		Stdout:         stdout,
-		Stderr:         stderr,
-		Risk:           risk,
-		Approval:       approval,
-	})
-	if execErr != nil {
-		return protocol.CallToolResult{}, execErr
-	}
-	return protocol.NewToolSuccessResult(struct {
-		NodeID    string      `json:"node_id"`
-		Outcome   outcomeJSON `json:"outcome"`
-		Stdout    string      `json:"stdout"`
-		Stderr    string      `json:"stderr"`
-		Truncated bool        `json:"truncated"`
-	}{
-		NodeID:    resolved.NodeID(),
-		Outcome:   outcomeJSON{outcome: out},
-		Stdout:    stdout.String(),
-		Stderr:    stderr.String(),
-		Truncated: stdout.Truncated() || stderr.Truncated(),
-	})
+	return privReq, pwRef, nil
 }
 
-func (r *Registry) execProbeShell(
-	ctx context.Context,
-	args terminalExecArgs,
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (protocol.CallToolResult, error) {
+func (r *Registry) execProbeShell(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.session == nil {
 		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
 	}
@@ -258,11 +235,7 @@ func (r *Registry) execProbeShell(
 		return protocol.CallToolResult{}, err
 	}
 	res, err := r.session.ProbeShell(ctx, ucsess.ProbeShellRequest{
-		Plan:     resolved.Plan(),
-		NodeID:   resolved.NodeID(),
-		Timeout:  args.Timeout,
-		Risk:     risk,
-		Approval: approval,
+		Plan: resolved.Plan(), NodeID: resolved.NodeID(), Timeout: args.Timeout, Risk: risk, Approval: approval,
 	})
 	if err != nil {
 		return protocol.CallToolResult{}, err
@@ -277,33 +250,63 @@ func (r *Registry) resolveTargetNodes(ctx context.Context, targets []string) ([]
 	if len(targets) == 0 {
 		return nil, nil
 	}
-	out := make([]ucauto.TargetNode, 0, len(targets))
+	resolvedList := make([]ucinv.ResolvedTarget, 0, len(targets))
+	hasManaged := false
 	for _, raw := range targets {
 		resolved, err := r.resolveTarget(ctx, raw, option.UnsetOptionLayer())
 		if err != nil {
 			return nil, err
 		}
-		nid, err := inventory.ParseNodeID(resolved.NodeID())
-		if err != nil {
-			return nil, fmt.Errorf("%w: 目标节点标识 %q 非法: %w", protocol.ErrInvalidParams, resolved.NodeID(), err)
+		if resolved.OriginKind() == option.OriginManaged {
+			hasManaged = true
 		}
-		tn, err := ucauto.NewTargetNode(ucauto.TargetNodeSpec{NodeID: nid, Plan: resolved.Plan()})
-		if err != nil {
-			return nil, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		resolvedList = append(resolvedList, resolved)
+	}
+	managedByID, err := r.loadManagedNodeMap(ctx, hasManaged)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ucauto.TargetNode, 0, len(resolvedList))
+	for _, resolved := range resolvedList {
+		nid, nErr := SynthesizeTargetNodeID(resolved.NodeID(), resolved.OriginKind(), resolved.Plan())
+		if nErr != nil {
+			return nil, fmt.Errorf("%w: 目标节点标识 %q 非法: %w", protocol.ErrInvalidParams, resolved.NodeID(), nErr)
+		}
+		spec := ucauto.TargetNodeSpec{NodeID: nid, Plan: resolved.Plan()}
+		if managed, ok := managedByID[nid]; ok && resolved.OriginKind() == option.OriginManaged {
+			spec.Tags = managed.Tags()
+			spec.DefaultProfile = managed.Execution()
+		}
+		tn, tErr := ucauto.NewTargetNode(spec)
+		if tErr != nil {
+			return nil, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, tErr)
 		}
 		out = append(out, tn)
 	}
 	return out, nil
 }
 
-func (r *Registry) execBatch(
-	ctx context.Context,
-	args terminalExecArgs,
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (protocol.CallToolResult, error) {
+func (r *Registry) loadManagedNodeMap(ctx context.Context, needed bool) (map[inventory.NodeID]inventory.Node, error) {
+	if !needed || r.inventory == nil {
+		return nil, nil
+	}
+	nodes, _, err := r.inventory.ListNodes(ctx, ucinv.QueryRequest{})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[inventory.NodeID]inventory.Node, len(nodes))
+	for _, n := range nodes {
+		out[n.ID()] = n
+	}
+	return out, nil
+}
+
+func (r *Registry) execBatch(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.automation == nil {
 		return protocol.CallToolResult{}, fmt.Errorf("%w: AutomationService 未配置", ErrServiceUnavailable)
+	}
+	if args.Stdin != "" {
+		return protocol.CallToolResult{}, fmt.Errorf("%w: batch_exec 不支持 stdin 参数", protocol.ErrInvalidParams)
 	}
 	cp, err := compileMCPCommandPlan(args)
 	if err != nil {
@@ -314,16 +317,9 @@ func (r *Registry) execBatch(
 		return protocol.CallToolResult{}, err
 	}
 	rep, err := r.automation.BatchExec(ctx, ucauto.BatchExecRequest{
-		Targets:        nodes,
-		Selector:       args.Selector,
-		ExcludeNodes:   args.ExcludeNodes,
-		ExcludeTags:    args.ExcludeTags,
-		Command:        cp,
-		Concurrency:    args.Concurrency,
-		MaxOutputBytes: args.MaxOutputBytes,
-		FailFast:       args.FailFast,
-		Risk:           risk,
-		Approval:       approval,
+		Targets: nodes, Selector: args.Selector, ExcludeNodes: args.ExcludeNodes, ExcludeTags: args.ExcludeTags,
+		Command: cp, Concurrency: args.Concurrency, MaxOutputBytes: args.MaxOutputBytes, FailFast: args.FailFast,
+		Risk: risk, Approval: approval,
 	})
 	if err != nil {
 		return protocol.CallToolResult{}, err
@@ -331,12 +327,7 @@ func (r *Registry) execBatch(
 	return protocol.NewToolSuccessResult(rep)
 }
 
-func (r *Registry) execPlaybook(
-	ctx context.Context,
-	args terminalExecArgs,
-	risk algebraic.Option[security.RiskLevel],
-	approval algebraic.Option[gate.ApprovalSubmission],
-) (protocol.CallToolResult, error) {
+func (r *Registry) execPlaybook(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.automation == nil {
 		return protocol.CallToolResult{}, fmt.Errorf("%w: AutomationService 未配置", ErrServiceUnavailable)
 	}
@@ -348,16 +339,10 @@ func (r *Registry) execPlaybook(
 	if err != nil {
 		return protocol.CallToolResult{}, err
 	}
-	// MCP 路径物理不持有 OperatorReadFS，仅可选传入沙箱根 ScopedSourceRoot（来自 ArtifactRoot/TransferRoot）。
+	// MCP 路径物理不持有 OperatorReadFS，仅可选传入沙箱根 ScopedSourceRoot（来自 TransferRoot）。
 	res, err := r.automation.RunPlaybook(ctx, ucauto.PlaybookRequest{
-		Playbook:         pb,
-		Targets:          nodes,
-		ScopedSourceRoot: r.transferRoot,
-		Concurrency:      args.Concurrency,
-		Timeout:          args.Timeout,
-		ExtraVars:        args.ExtraVars,
-		Risk:             risk,
-		Approval:         approval,
+		Playbook: pb, Targets: nodes, ScopedSourceRoot: r.transferRoot, Concurrency: args.Concurrency,
+		Timeout: args.Timeout, ExtraVars: args.ExtraVars, Risk: risk, Approval: approval,
 	})
 	if err != nil {
 		return protocol.CallToolResult{}, err

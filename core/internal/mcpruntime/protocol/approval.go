@@ -118,7 +118,8 @@ func classifyUncertainError(err error, msg string) (int, ToolErrorPayload, bool)
 		return CodeUncertainOutcome, ToolErrorPayload{
 			Code: "transfer_uncertain_commit", Message: msg, Uncertain: true,
 		}, true
-	case errors.Is(err, ucauto.ErrUncertainOutcome) ||
+	case errors.Is(err, ErrOutcomeUnknown) ||
+		errors.Is(err, ucauto.ErrUncertainOutcome) ||
 		errors.Is(err, ucauto.ErrUncertainDurability) ||
 		errors.Is(err, ucobs.ErrUncertainOutcome) ||
 		errors.Is(err, ucinv.ErrUncertainDurability) ||
@@ -136,7 +137,34 @@ func classifyUncertainError(err error, msg string) (int, ToolErrorPayload, bool)
 
 func classifyDomainAndPortError(err error, msg string) (int, ToolErrorPayload) {
 	switch {
-	case errors.Is(err, ErrInvalidParams) ||
+	case errors.Is(err, ErrParseJSON):
+		return CodeParseError, ToolErrorPayload{Code: "parse_error", Message: msg}
+	case errors.Is(err, fsm.ErrInvalidChunkOffset):
+		return CodeInvalidParams, ToolErrorPayload{Code: "invalid_chunk_offset", Message: msg}
+	case errors.Is(err, fsm.ErrTransferSizeExceeded):
+		return CodeInvalidParams, ToolErrorPayload{Code: "transfer_size_exceeded", Message: msg}
+	case isInvalidParamsError(err):
+		return CodeInvalidParams, ToolErrorPayload{Code: "invalid_params", Message: msg}
+	case errors.Is(err, ErrToolNotFound):
+		return CodeMethodNotFound, ToolErrorPayload{Code: "tool_not_found", Message: msg}
+	case errors.Is(err, uctrans.ErrPatchConflict):
+		return CodeInvalidState, ToolErrorPayload{Code: "patch_conflict", Message: msg}
+	case errors.Is(err, uctrans.ErrDigestMismatch):
+		return CodeInvalidState, ToolErrorPayload{Code: "digest_mismatch", Message: msg}
+	case isInvalidStateError(err):
+		return CodeInvalidState, ToolErrorPayload{Code: "invalid_state", Message: msg}
+	case errors.Is(err, uctrans.ErrSymlinkPolicyDenied):
+		return CodeAuthorizationDenied, ToolErrorPayload{Code: "symlink_policy_denied", Message: msg}
+	case errors.Is(err, uctrans.ErrOperatorReadUnavailable) ||
+		errors.Is(err, ucauto.ErrOperatorReadUnavailable):
+		return CodeAuthorizationDenied, ToolErrorPayload{Code: "sandbox_policy_denied", Message: msg}
+	default:
+		return CodeInternalError, ToolErrorPayload{Code: "execution_error", Message: msg}
+	}
+}
+
+func isInvalidParamsError(err error) bool {
+	return errors.Is(err, ErrInvalidParams) ||
 		errors.Is(err, ErrInvalidApproval) ||
 		errors.Is(err, ErrInvalidJSONRPC) ||
 		errors.Is(err, ErrInvalidMCPMessage) ||
@@ -147,24 +175,20 @@ func classifyDomainAndPortError(err error, msg string) (int, ToolErrorPayload) {
 		errors.Is(err, uctrans.ErrInvalidRequest) ||
 		errors.Is(err, ucauto.ErrInvalidRequest) ||
 		errors.Is(err, ucobs.ErrInvalidRequest) ||
-		errors.Is(err, ucobs.ErrInvalidGUIInput):
-		return CodeInvalidParams, ToolErrorPayload{Code: "invalid_params", Message: msg}
-	case errors.Is(err, ErrToolNotFound):
-		return CodeMethodNotFound, ToolErrorPayload{Code: "tool_not_found", Message: msg}
-	case errors.Is(err, ports.ErrNotFound) ||
+		errors.Is(err, ucobs.ErrInvalidGUIInput)
+}
+
+func isInvalidStateError(err error) bool {
+	return errors.Is(err, ports.ErrNotFound) ||
 		errors.Is(err, ucinv.ErrAssetNotFound) ||
 		errors.Is(err, uctrans.ErrTransferNotFound) ||
 		errors.Is(err, ucsess.ErrPTYClosed) ||
 		errors.Is(err, fsm.ErrIllegalTransition) ||
-		errors.Is(err, uctrans.ErrCorruptJournal):
-		return CodeInvalidState, ToolErrorPayload{Code: "invalid_state", Message: msg}
-	case errors.Is(err, uctrans.ErrOperatorReadUnavailable) ||
-		errors.Is(err, ucauto.ErrOperatorReadUnavailable):
-		return CodeAuthorizationDenied, ToolErrorPayload{Code: "sandbox_policy_denied", Message: msg}
-	default:
-		return CodeInternalError, ToolErrorPayload{Code: "execution_error", Message: msg}
-	}
+		errors.Is(err, uctrans.ErrCorruptJournal)
 }
+
+// SanitizeErrorMessage 对外暴露统一的提示注入净化与长度截断函数，供 MCP 传输层脱敏错误输出。
+func SanitizeErrorMessage(raw string) string { return sanitizeErrorText(raw) }
 
 // NewToolSuccessResult 将工具成功输出编码为确定性 JSON/v2 的 CallToolResult（文本块 + structuredContent + 附加内容块）。
 func NewToolSuccessResult(payload any, extraBlocks ...ContentBlock) (CallToolResult, error) {

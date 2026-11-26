@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -176,14 +177,18 @@ func (r Request) Validate() error {
 	return nil
 }
 
-// DecodeRequest 严格解码单条 JSON-RPC 2.0 请求报文（拒绝未知字段、尾随垃圾与非法版本）。
+// DecodeRequest 严格解码单条 JSON-RPC 2.0 请求报文：
+// 精确区分 JSON 语法错误（ErrParseJSON -> -32700）与 JSON-RPC 语义/未知字段/版本非法（ErrInvalidJSONRPC -> -32600）。
 func DecodeRequest(raw []byte) (Request, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return Request{}, fmt.Errorf("%w: 空报文", ErrInvalidJSONRPC)
+		return Request{}, fmt.Errorf("%w: 空报文", ErrParseJSON)
 	}
 	var req Request
 	if err := jsonv2.Unmarshal(trimmed, &req, jsonv2.RejectUnknownMembers(true)); err != nil {
+		if _, isSyntax := errors.AsType[*jsontext.SyntacticError](err); isSyntax {
+			return Request{}, fmt.Errorf("%w: %w", ErrParseJSON, err)
+		}
 		return Request{}, fmt.Errorf("%w: %w", ErrInvalidJSONRPC, err)
 	}
 	if err := req.Validate(); err != nil {
@@ -199,12 +204,57 @@ type RPCError struct {
 	Data    jsontext.Value `json:"data,omitzero"`
 }
 
-// Response 表示出站 JSON-RPC 2.0 响应报文（Result 与 Error 互斥）。
+// Response 表示出站 JSON-RPC 2.0 响应报文（Result 与 Error 互斥）；
+// 遵循 JSON-RPC 2.0 §5：当 Error 非空且无法解析请求 ID（ID 为 None）时显式输出 "id":null。
 type Response struct {
 	JSONRPC string                      `json:"jsonrpc"`
 	ID      algebraic.Option[RequestID] `json:"id,omitzero"`
 	Result  jsontext.Value              `json:"result,omitzero"`
 	Error   *RPCError                   `json:"error,omitzero"`
+}
+
+type responseWire struct {
+	JSONRPC string         `json:"jsonrpc"`
+	ID      jsontext.Value `json:"id,omitzero"`
+	Result  jsontext.Value `json:"result,omitzero"`
+	Error   *RPCError      `json:"error,omitzero"`
+}
+
+// MarshalJSONTo 编码 JSON-RPC 2.0 响应；当错误响应无可用请求 ID 时显式输出 "id":null。
+func (r Response) MarshalJSONTo(enc *jsontext.Encoder) error {
+	wire := responseWire{JSONRPC: r.JSONRPC, Result: r.Result, Error: r.Error}
+	if id, ok := r.ID.Get(); ok {
+		rawID, err := MarshalCanonical(id)
+		if err != nil {
+			return err
+		}
+		wire.ID = jsontext.Value(rawID)
+	} else if r.Error != nil {
+		wire.ID = jsontext.Value("null")
+	}
+	return jsonv2.MarshalEncode(enc, wire, jsonv2.Deterministic(true))
+}
+
+// UnmarshalJSONFrom 严格解码 JSON-RPC 2.0 响应，接受错误响应中的 "id":null 并还原为 None。
+func (r *Response) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	if r == nil {
+		return ErrInvalidJSONRPC
+	}
+	var wire responseWire
+	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
+		return err
+	}
+	var idOpt algebraic.Option[RequestID]
+	trimmedID := bytes.TrimSpace(wire.ID)
+	if len(trimmedID) > 0 && !bytes.Equal(trimmedID, []byte("null")) {
+		var parsed RequestID
+		if err := jsonv2.Unmarshal(trimmedID, &parsed); err != nil {
+			return err
+		}
+		idOpt = algebraic.Some(parsed)
+	}
+	*r = Response{JSONRPC: wire.JSONRPC, ID: idOpt, Result: wire.Result, Error: wire.Error}
+	return nil
 }
 
 // MarshalCanonical 使用 Go 1.27 encoding/json/v2 Deterministic(true) 序列化确定性规范 JSON 字节流。

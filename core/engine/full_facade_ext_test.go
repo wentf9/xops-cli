@@ -44,10 +44,11 @@ var (
 )
 
 type fullFacadeDialer struct {
-	inner    *sim.SimDialer
-	remoteFS *sim.SimRemoteFS
-	mu       sync.Mutex
-	onCmd    func(ctx context.Context, cmd execution.CommandPlan, stdout, stderr io.Writer) (execution.ExecutionOutcome, error)
+	inner     *sim.SimDialer
+	remoteFS  *sim.SimRemoteFS
+	mu        sync.Mutex
+	lastStdin string
+	onCmd     func(ctx context.Context, cmd execution.CommandPlan, stdout, stderr io.Writer) (execution.ExecutionOutcome, error)
 }
 
 func (d *fullFacadeDialer) DialHop(ctx context.Context, hop plan.HopSpec, dig plan.HopDigest, parent ports.TransportConn) (ports.TransportConn, error) {
@@ -173,6 +174,12 @@ func (s *fullFacadeSession) Start(ctx context.Context, cmd execution.CommandPlan
 	s.owner.mu.Lock()
 	fn := s.owner.onCmd
 	s.owner.mu.Unlock()
+	if streams.Stdin != nil {
+		rawIn, _ := io.ReadAll(io.LimitReader(streams.Stdin, 4096))
+		s.owner.mu.Lock()
+		s.owner.lastStdin = string(rawIn)
+		s.owner.mu.Unlock()
+	}
 
 	outW := streams.Stdout
 	if outW == nil {
@@ -192,7 +199,7 @@ func (s *fullFacadeSession) Start(ctx context.Context, cmd execution.CommandPlan
 	return nil
 }
 
-func (s *fullFacadeSession) StartShell(_ context.Context, _ ports.ExecStreams) error {
+func (s *fullFacadeSession) StartShell(_ context.Context, streams ports.ExecStreams) error {
 	s.ensureEcho()
 	s.mu.Lock()
 	s.started = true
@@ -200,7 +207,12 @@ func (s *fullFacadeSession) StartShell(_ context.Context, _ ports.ExecStreams) e
 	if s.doneCh == nil {
 		s.doneCh = make(chan struct{})
 	}
+	ch := s.doneCh
 	s.mu.Unlock()
+	if streams.Stdout != nil {
+		_, _ = io.WriteString(streams.Stdout, "shell-ok\n")
+		s.doneOnce.Do(func() { close(ch) })
+	}
 	return nil
 }
 

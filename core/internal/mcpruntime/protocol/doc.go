@@ -13,7 +13,9 @@ import "errors"
 
 // 本包导出的不可变哨兵错误，供 mcpruntime 传输层、工具分发层与测试经 errors.Is 精确区分协议错误类别。
 var (
-	// ErrInvalidJSONRPC 表示 JSON-RPC 2.0 报文结构、版本或方法名非法。
+	// ErrParseJSON 表示入站字节流不是合法 JSON 语法（JSON-RPC 2.0 -32700 Parse error）。
+	ErrParseJSON = errors.New("mcpruntime/protocol: JSON 语法解析失败")
+	// ErrInvalidJSONRPC 表示 JSON-RPC 2.0 报文结构、版本、未知字段或方法名非法（-32600 Invalid Request）。
 	ErrInvalidJSONRPC = errors.New("mcpruntime/protocol: 无效的 JSON-RPC 2.0 报文")
 	// ErrInvalidRequestID 表示 JSON-RPC 2.0 请求标识（id）非法或处于零值无效态。
 	ErrInvalidRequestID = errors.New("mcpruntime/protocol: 无效的 JSON-RPC RequestID")
@@ -27,4 +29,6 @@ var (
 	ErrInvalidParams = errors.New("mcpruntime/protocol: 工具或方法参数非法")
 	// ErrToolNotFound 表示请求的 MCP 工具名未注册。
 	ErrToolNotFound = errors.New("mcpruntime/protocol: 未注册的 MCP 工具")
+	// ErrOutcomeUnknown 表示远端命令已启动但未取得确定终态（ADR-016：禁止自动重试）。
+	ErrOutcomeUnknown = errors.New("mcpruntime/protocol: 远端执行结果不确定（禁止自动重试）")
 )

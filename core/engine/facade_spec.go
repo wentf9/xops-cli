@@ -50,52 +50,59 @@ type (
 	RemoteDirEntry      = ports.RemoteDirEntry
 	SecretPromptRequest = ports.SecretPromptRequest
 
-	MutationResult          = ucinv.MutationResult
-	ImportPreview           = ucinv.ImportPreview
-	ImportResult            = ucinv.ImportResult
-	InventoryDoctorRep      = ucinv.DoctorReport
-	DoctorFinding           = uccred.DoctorFinding
-	CredentialDoctorRep     = uccred.DoctorReport
-	GCUnreferencedResult    = uccred.GCUnreferencedResult
-	SagaResult              = uccred.SagaResult
-	PTYReadResult           = ucsess.PTYReadResult
-	PTYStatus               = ucsess.PTYStatus
-	ForwardInfo             = ucsess.ForwardInfo
-	ForwardStatus           = ucsess.ForwardStatus
-	ControlMasterInfo       = ucsess.ControlMasterInfo
-	ControlMasterStatus     = ucsess.ControlMasterStatus
-	TextEdit                = uctrans.TextEdit
-	LocalUploadSource       = uctrans.LocalUploadSource
-	SCPUploadResult         = uctrans.SCPUploadResult
-	SCPDownloadResult       = uctrans.SCPDownloadResult
-	ReadFileResult          = uctrans.ReadFileResult
-	WriteFileResult         = uctrans.WriteFileResult
-	PatchFileResult         = uctrans.PatchFileResult
-	ListDirResult           = uctrans.ListDirResult
-	TransferHandleInfo      = uctrans.TransferHandleInfo
-	WriteTransferChunkRes   = uctrans.WriteTransferChunkResult
-	PullTransferChunkResult = uctrans.PullTransferChunkResult
-	CommitTransferResult    = uctrans.CommitTransferResult
-	TransferRecoveryResult  = uctrans.TransferRecoveryResult
-	RecoverAllResult        = uctrans.RecoverAllResult
-	TransferStatusSnapshot  = uctrans.TransferStatusSnapshot
-	BatchExecReport         = ucauto.BatchExecReport
-	PlaybookRunResult       = ucauto.PlaybookRunResult
-	HostMetricsFrame        = ucobs.HostMetricsFrame
-	GUIActionSpec           = ucobs.GUIActionSpec
-	GUIArtifactDest         = ucobs.GUIArtifactDest
-	GUISessionSpec          = ucobs.GUISessionSpec
-	LogTarget               = ucobs.LogTarget
-	ProcessSortBy           = ucobs.ProcessSortBy
-	ProjectionConfig        = ucobs.ProjectionConfig
-	ProjectionSnapshot      = ucobs.ProjectionSnapshot
-	MetricsStreamResult     = ucobs.MetricsStreamResult
-	LogStreamResult         = ucobs.LogStreamResult
-	GUIExecResult           = ucobs.GUIExecResult
-	GUISessionInfo          = ucobs.GUISessionInfo
-	GUISessionStatus        = ucobs.GUISessionStatus
-	TransferRecSummary      = mcpruntime.TransferRecoverySummary
-	MCPStartupReport        = mcpruntime.StartupReport
+	MutationResult                  = ucinv.MutationResult
+	ImportPreview                   = ucinv.ImportPreview
+	ImportResult                    = ucinv.ImportResult
+	InventoryDoctorRep              = ucinv.DoctorReport
+	PendingProbeFunc                = ucinv.PendingProbeFunc
+	PendingEnrollmentResult         = ucinv.PendingEnrollmentResult
+	PendingEnrollmentLease          = ucinv.PendingEnrollmentLease
+	EnrollEncryptedPrivateKeyResult = ucinv.EnrollEncryptedPrivateKeyResult
+	DoctorFinding                   = uccred.DoctorFinding
+	CredentialDoctorRep             = uccred.DoctorReport
+	GCUnreferencedResult            = uccred.GCUnreferencedResult
+	SagaResult                      = uccred.SagaResult
+	GraphMutator                    = uccred.GraphMutator
+	OldSecretRefsResolver           = uccred.OldSecretRefsResolver
+	NewSecretVerifier               = uccred.NewSecretVerifier
+	PTYReadResult                   = ucsess.PTYReadResult
+	PTYStatus                       = ucsess.PTYStatus
+	ForwardInfo                     = ucsess.ForwardInfo
+	ForwardStatus                   = ucsess.ForwardStatus
+	ControlMasterInfo               = ucsess.ControlMasterInfo
+	ControlMasterStatus             = ucsess.ControlMasterStatus
+	TextEdit                        = uctrans.TextEdit
+	LocalUploadSource               = uctrans.LocalUploadSource
+	SCPUploadResult                 = uctrans.SCPUploadResult
+	SCPDownloadResult               = uctrans.SCPDownloadResult
+	ReadFileResult                  = uctrans.ReadFileResult
+	WriteFileResult                 = uctrans.WriteFileResult
+	PatchFileResult                 = uctrans.PatchFileResult
+	ListDirResult                   = uctrans.ListDirResult
+	TransferHandleInfo              = uctrans.TransferHandleInfo
+	WriteTransferChunkRes           = uctrans.WriteTransferChunkResult
+	PullTransferChunkResult         = uctrans.PullTransferChunkResult
+	CommitTransferResult            = uctrans.CommitTransferResult
+	TransferRecoveryResult          = uctrans.TransferRecoveryResult
+	RecoverAllResult                = uctrans.RecoverAllResult
+	TransferStatusSnapshot          = uctrans.TransferStatusSnapshot
+	BatchExecReport                 = ucauto.BatchExecReport
+	PlaybookRunResult               = ucauto.PlaybookRunResult
+	HostMetricsFrame                = ucobs.HostMetricsFrame
+	GUIActionSpec                   = ucobs.GUIActionSpec
+	GUIArtifactDest                 = ucobs.GUIArtifactDest
+	GUISessionSpec                  = ucobs.GUISessionSpec
+	LogTarget                       = ucobs.LogTarget
+	ProcessSortBy                   = ucobs.ProcessSortBy
+	ProjectionConfig                = ucobs.ProjectionConfig
+	ProjectionSnapshot              = ucobs.ProjectionSnapshot
+	MetricsStreamResult             = ucobs.MetricsStreamResult
+	LogStreamResult                 = ucobs.LogStreamResult
+	GUIExecResult                   = ucobs.GUIExecResult
+	GUISessionInfo                  = ucobs.GUISessionInfo
+	GUISessionStatus                = ucobs.GUISessionStatus
+	TransferRecSummary              = mcpruntime.TransferRecoverySummary
+	MCPStartupReport                = mcpruntime.StartupReport
 )
 
 // ApprovalSubmission 封装两步审批流程中由入站适配器回传的不可变审批提交对象（零 core/internal/gate 泄漏）。
@@ -108,12 +115,7 @@ type ApprovalSubmission struct {
 }
 
 // NewApprovalSubmission 校验用户审批判定、信封 SHA-256 摘要与可选完整信封，构造公开 ApprovalSubmission。
-func NewApprovalSubmission(
-	verdict security.Verdict,
-	envelopeDigest security.Digest,
-	envelope algebraic.Option[security.ApprovalEnvelope],
-	comment string,
-) (ApprovalSubmission, error) {
+func NewApprovalSubmission(verdict security.Verdict, envelopeDigest security.Digest, envelope algebraic.Option[security.ApprovalEnvelope], comment string) (ApprovalSubmission, error) {
 	resp, err := ports.NewApprovalDecisionResponse(verdict, envelopeDigest, comment)
 	if err != nil {
 		return ApprovalSubmission{}, err
@@ -154,9 +156,7 @@ func ExtractApprovalChallenge(err error) (ApprovalChallenge, bool) {
 	if !ok || ch == nil || !ch.IsValid() {
 		return ApprovalChallenge{}, false
 	}
-	return ApprovalChallenge{
-		envelope: ch.Envelope(), digest: ch.EnvelopeDigest(), escalated: ch.Escalated(), reason: ch.Reason(), valid: true,
-	}, true
+	return ApprovalChallenge{envelope: ch.Envelope(), digest: ch.EnvelopeDigest(), escalated: ch.Escalated(), reason: ch.Reason(), valid: true}, true
 }
 
 func (c ApprovalChallenge) IsValid() bool {
@@ -167,14 +167,12 @@ func (c ApprovalChallenge) EnvelopeDigest() security.Digest     { return c.diges
 func (c ApprovalChallenge) Escalated() bool                     { return c.valid && c.escalated }
 func (c ApprovalChallenge) Reason() string                      { return c.reason }
 
-// RemoteCall 聚合所有远端操作的公共目标解析与风控/审批/隔离事件流入参。
-type RemoteCall struct {
-	TargetInput
-	CallOptions
-}
-
-// 公共入参复用结构体：TargetInput 聚合目标解析参数，CallOptions 聚合风控/审批/隔离事件流。
+// 公共入参复用结构体：RemoteCall / TargetInput / CallOptions / TransferSessionOptions。
 type (
+	RemoteCall struct {
+		TargetInput
+		CallOptions
+	}
 	TargetInput struct {
 		Target     ResolvedTarget
 		TargetSpec string
@@ -219,10 +217,9 @@ type (
 	}
 	DeleteAssetRequest struct {
 		CallOptions
-		ID                                              string
+		ID, ScopeSummary                                string
 		ExpectedRevision                                algebraic.Option[Revision]
 		DeleteUnusedSecrets, RequireSecretsUnreferenced bool
-		ScopeSummary                                    string
 	}
 	InventoryDoctorRequest struct {
 		CallOptions
@@ -261,6 +258,58 @@ type (
 		TargetStore, ScopeSummary string
 		ExpectedRevision          algebraic.Option[Revision]
 	}
+	PendingEnrollmentRequest struct {
+		CallOptions
+		Host             algebraic.Option[inventory.Host]
+		Identity         algebraic.Option[inventory.Identity]
+		Node             inventory.Node
+		PinnedRefs       []secret.Ref
+		ExtraPending     []inventory.PendingSecretRef
+		ExpectedRevision algebraic.Option[Revision]
+		TTL              algebraic.Duration
+		ScopeSummary     string
+	}
+	EnrollEncryptedPrivateKeyRequest struct {
+		CallOptions
+		IdentityID                             inventory.IdentityID
+		User                                   option.Username
+		KeyPath                                inventory.KeyPathSpec
+		CertPaths                              []inventory.CertPathSpec
+		Description, TargetStore, ScopeSummary string
+		Tags                                   []inventory.Tag
+		NewRef                                 secret.Ref
+		ExpectedFingerprint                    algebraic.Option[inventory.KeyFingerprint]
+		ReplaceExisting                        bool
+		ExpectedRevision                       algebraic.Option[Revision]
+		Prompt                                 SecretPromptRequest
+		ExtraPending                           []inventory.PendingSecretRef
+	}
+	InteractiveVaultOpRequest struct {
+		CallOptions
+		Prompt        SecretPromptRequest
+		ConfirmPrompt algebraic.Option[SecretPromptRequest]
+		ScopeSummary  string
+	}
+	VaultSagaRequest struct {
+		CallOptions
+		NewRef                                    secret.Ref
+		TargetStore, Action, NodeID, ScopeSummary string
+		OldRef                                    algebraic.Option[secret.Ref]
+		ResolveOldRefs                            OldSecretRefsResolver
+		ExpectedRevision                          algebraic.Option[Revision]
+		ExpectedCASVersion                        uint64
+		VerifyNewRef                              NewSecretVerifier
+		MutateGraph                               GraphMutator
+		ExtraPending                              []inventory.PendingSecretRef
+	}
+	InteractiveVaultSagaRequest struct {
+		Prompt SecretPromptRequest
+		Saga   VaultSagaRequest
+	}
+	InteractiveRotateSecretRequest struct {
+		Prompt SecretPromptRequest
+		Rotate RotateSecretRequest
+	}
 )
 
 // Session 与 Transfer 公开门面请求类型。
@@ -295,10 +344,8 @@ type (
 		RemoteCall
 		Spec ForwardSpec
 	}
-	ControlMasterRequest struct {
-		RemoteCall
-	}
-	MuxControlRequest struct {
+	ControlMasterRequest struct{ RemoteCall }
+	MuxControlRequest    struct {
 		RemoteCall
 		SocketPath algebraic.Option[pathalg.LocalSourcePath]
 		Action     MuxControlAction
@@ -461,14 +508,12 @@ type (
 	}
 	// MCPConfig 定义从 Engine 派生 MCPServer 时的安全传输与沙箱参数（物理零 OperatorReadFS）。
 	MCPConfig struct {
-		ServerName, ServerVersion, Instructions       string
-		TransferRoot, ArtifactRoot                    algebraic.Option[pathalg.LocalDir]
-		MaxMessageBytes, HTTPChunkSize                int64
-		MaxTrackedHandles, MaxHTTPSessions            int
-		AllowNonLoopbackHTTP                          bool
-		HTTPAllowedOrigins, HTTPAllowedHosts          []string
-		HTTPReadHeaderTimeout, HTTPShutdownTimeout    algebraic.Option[algebraic.Duration]
-		PruneSupersededJournals, FailOnCorruptJournal bool
-		AllowOptionalReconciler                       bool
+		ServerName, ServerVersion, Instructions                                                      string
+		TransferRoot, ArtifactRoot                                                                   algebraic.Option[pathalg.LocalDir]
+		MaxMessageBytes, HTTPChunkSize                                                               int64
+		MaxTrackedHandles, MaxHTTPSessions                                                           int
+		AllowNonLoopbackHTTP, PruneSupersededJournals, FailOnCorruptJournal, AllowOptionalReconciler bool
+		HTTPAllowedOrigins, HTTPAllowedHosts                                                         []string
+		HTTPReadHeaderTimeout, HTTPShutdownTimeout                                                   algebraic.Option[algebraic.Duration]
 	}
 )

@@ -24,19 +24,9 @@ func runTransferOp[T any](
 }
 
 //xops:syncclosure
-func runTransferOpErr(
-	e *Engine, ctx context.Context, target TargetInput, opts CallOptions, fn func(context.Context, uctrans.CallBase) error,
-) error {
-	return runOpErr(e, ctx, func(c context.Context) error {
-		resolved, err := e.resolveTargetRef(c, target.Target, target.TargetSpec, target.CLIOptions)
-		if err != nil {
-			return err
-		}
-		return fn(c, uctrans.CallBase{
-			Plan: resolved.Plan(), NodeID: resolved.NodeID(),
-			Risk: opts.Risk, Approval: toGateApproval(opts.Approval), OperationStream: opts.OperationStream,
-		})
-	})
+func runTransferOpErr(e *Engine, ctx context.Context, target TargetInput, opts CallOptions, fn func(context.Context, uctrans.CallBase) error) error {
+	_, err := runTransferOp(e, ctx, target, opts, func(c context.Context, base uctrans.CallBase) (struct{}, error) { return struct{}{}, fn(c, base) })
+	return err
 }
 
 func toTransferSessionOpts(o TransferSessionOptions) uctrans.TransferSessionOptions {
@@ -187,7 +177,7 @@ func (e *Engine) SCPDownload(ctx context.Context, req SCPDownloadRequest) (SCPDo
 	})
 }
 
-// ReadRemoteFile / WriteRemoteFile / PatchRemoteFile / StatRemoteFile / RenameRemoteFile / ListRemoteDir / MkdirRemoteAll / RemoveRemoteFile / RemoveRemoteDir / ChmodRemote / ChtimesRemote。
+// ReadRemoteFile / WriteRemoteFile / PatchRemoteFile / StatRemoteFile / RenameRemoteFile / ListRemoteDir / MkdirRemoteAll / RemoveRemoteFile / RemoveRemoteDir / ChmodRemote / ChtimesRemote / RealPathRemote / ReadLinkRemote。
 func (e *Engine) ReadRemoteFile(ctx context.Context, req RemoteFileReadRequest) (ReadFileResult, error) {
 	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (ReadFileResult, error) {
 		return e.transfer.ReadFile(c, uctrans.ReadFileRequest{CallBase: base, Path: req.Path, MaxBytes: req.MaxBytes})
@@ -195,17 +185,12 @@ func (e *Engine) ReadRemoteFile(ctx context.Context, req RemoteFileReadRequest) 
 }
 func (e *Engine) WriteRemoteFile(ctx context.Context, req RemoteFileWriteRequest) (WriteFileResult, error) {
 	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (WriteFileResult, error) {
-		return e.transfer.WriteFile(c, uctrans.WriteFileRequest{
-			CallBase: base, Path: req.Path, Content: req.Content, Perm: req.Perm,
-			NoClobber: req.NoClobber, CreateParents: req.CreateParents, ExpectedAnchor: req.ExpectedAnchor,
-		})
+		return e.transfer.WriteFile(c, uctrans.WriteFileRequest{CallBase: base, Path: req.Path, Content: req.Content, Perm: req.Perm, NoClobber: req.NoClobber, CreateParents: req.CreateParents, ExpectedAnchor: req.ExpectedAnchor})
 	})
 }
 func (e *Engine) PatchRemoteFile(ctx context.Context, req RemoteFilePatchRequest) (PatchFileResult, error) {
 	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (PatchFileResult, error) {
-		return e.transfer.PatchFile(c, uctrans.PatchFileRequest{
-			CallBase: base, Path: req.Path, Edits: req.Edits, ExpectedAnchor: req.ExpectedAnchor, ExpectedDigest: req.ExpectedDigest, MaxBytes: req.MaxBytes,
-		})
+		return e.transfer.PatchFile(c, uctrans.PatchFileRequest{CallBase: base, Path: req.Path, Edits: req.Edits, ExpectedAnchor: req.ExpectedAnchor, ExpectedDigest: req.ExpectedDigest, MaxBytes: req.MaxBytes})
 	})
 }
 func (e *Engine) StatRemoteFile(ctx context.Context, req RemoteStatRequest) (RemoteFileStat, error) {
@@ -215,9 +200,7 @@ func (e *Engine) StatRemoteFile(ctx context.Context, req RemoteStatRequest) (Rem
 }
 func (e *Engine) RenameRemoteFile(ctx context.Context, req RemoteRenameRequest) error {
 	return runTransferOpErr(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) error {
-		return e.transfer.RenameFile(c, uctrans.RenameFileRequest{
-			CallBase: base, OldPath: req.OldPath, NewPath: req.NewPath, NoClobber: req.NoClobber, ExpectedAnchor: req.ExpectedAnchor,
-		})
+		return e.transfer.RenameFile(c, uctrans.RenameFileRequest{CallBase: base, OldPath: req.OldPath, NewPath: req.NewPath, NoClobber: req.NoClobber, ExpectedAnchor: req.ExpectedAnchor})
 	})
 }
 func (e *Engine) ListRemoteDir(ctx context.Context, req RemotePathOpRequest) (ListDirResult, error) {
@@ -250,14 +233,21 @@ func (e *Engine) ChtimesRemote(ctx context.Context, req RemotePathOpRequest) err
 		return e.transfer.Chtimes(c, uctrans.ChtimesRequest{CallBase: base, Path: req.Path, Atime: req.Atime, Mtime: req.Mtime})
 	})
 }
+func (e *Engine) RealPathRemote(ctx context.Context, req RemotePathOpRequest) (pathalg.RemotePath, error) {
+	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (pathalg.RemotePath, error) {
+		return e.transfer.RealPath(c, uctrans.RealPathRequest{CallBase: base, Path: req.Path})
+	})
+}
+func (e *Engine) ReadLinkRemote(ctx context.Context, req RemotePathOpRequest) (string, error) {
+	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (string, error) {
+		return e.transfer.ReadLink(c, uctrans.ReadLinkRequest{CallBase: base, Path: req.Path})
+	})
+}
 
 // StartTransfer / WriteTransferChunk / PullTransferChunk / CommitTransfer / AbortTransfer / ResumeTransfer / RecoverTransfer / RecoverAllTransfers / InspectTransfer。
 func (e *Engine) StartTransfer(ctx context.Context, req StartTransferRequest) (TransferHandleInfo, error) {
 	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (TransferHandleInfo, error) {
-		return e.transfer.StartTransfer(c, uctrans.StartTransferRequest{
-			CallBase: base, TransferID: req.TransferID, Dest: req.Dest, TotalBytes: req.TotalBytes, ExpectedDigest: req.ExpectedDigest,
-			TransferSessionOptions: toTransferSessionOpts(req.TransferSessionOptions),
-		})
+		return e.transfer.StartTransfer(c, uctrans.StartTransferRequest{CallBase: base, TransferID: req.TransferID, Dest: req.Dest, TotalBytes: req.TotalBytes, ExpectedDigest: req.ExpectedDigest, TransferSessionOptions: toTransferSessionOpts(req.TransferSessionOptions)})
 	})
 }
 func (e *Engine) WriteTransferChunk(ctx context.Context, req WriteTransferChunkRequest) (WriteTransferChunkRes, error) {
@@ -282,17 +272,12 @@ func (e *Engine) AbortTransfer(ctx context.Context, req TransferHandleOpRequest)
 }
 func (e *Engine) ResumeTransfer(ctx context.Context, req ResumeTransferRequest) (TransferHandleInfo, error) {
 	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (TransferHandleInfo, error) {
-		return e.transfer.ResumeTransfer(c, uctrans.ResumeTransferRequest{
-			CallBase: base, TransferID: req.TransferID, StartNextGen: req.StartNextGen,
-			TransferSessionOptions: toTransferSessionOpts(req.TransferSessionOptions),
-		})
+		return e.transfer.ResumeTransfer(c, uctrans.ResumeTransferRequest{CallBase: base, TransferID: req.TransferID, StartNextGen: req.StartNextGen, TransferSessionOptions: toTransferSessionOpts(req.TransferSessionOptions)})
 	})
 }
 func (e *Engine) RecoverTransfer(ctx context.Context, req RecoverTransferRequest) (TransferRecoveryResult, error) {
 	return runTransferOp(e, ctx, req.TargetInput, req.CallOptions, func(c context.Context, base uctrans.CallBase) (TransferRecoveryResult, error) {
-		return e.transfer.RecoverTransfer(c, uctrans.RecoverTransferRequest{
-			CallBase: base, TransferID: req.TransferID, PruneSuperseded: req.PruneSuperseded, LocalRootForClean: req.LocalRootForClean,
-		})
+		return e.transfer.RecoverTransfer(c, uctrans.RecoverTransferRequest{CallBase: base, TransferID: req.TransferID, PruneSuperseded: req.PruneSuperseded, LocalRootForClean: req.LocalRootForClean})
 	})
 }
 func (e *Engine) RecoverAllTransfers(ctx context.Context, pruneSuperseded bool) (RecoverAllResult, error) {

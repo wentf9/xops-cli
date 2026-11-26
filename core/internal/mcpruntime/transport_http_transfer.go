@@ -29,13 +29,12 @@ const (
 )
 
 // handleTransferHTTP 承载最高 10 GiB 流式上传与下载 HTTP 端点（`/transfers/{transfer_id}/stream`）：
+//   - 严格强制 IsClosed() 停机门禁、Prepare 启动期对账门禁与 Gate.IsHalted() 熔断门禁；
 //   - 全程采用定长分片缓冲（httpChunkSize，默认 1 MiB）直连 usecase/transfer，永不整包缓存在内存；
 //   - 物理不接触 OperatorReadFS：下载流仅经 ScopedRootFS.WithRoot -> WithReadRegular 有界流式读取已原子提交产物；
-//   - 每片读写前均校验 Gate.IsHalted()，熔断即刻中止返回 503；遇 TransferUncertainCommit 忠实返回 503 零重试。
+//   - 完整支持 StrictAgentProfile + NoElicitFallbackChallenge 两步审批闭环，绝不提前销毁待审批/可重试绑定或重放单次审批令牌。
 func (s *Server) handleTransferHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.gate.IsHalted() {
-		s.registry.ClearTrackedHandles()
-		writeHTTPJSONError(w, http.StatusServiceUnavailable, "gate_halted", gate.ErrGateHalted.Error(), true)
+	if err := s.ensureHTTPServiceReady(w, r); err != nil {
 		return
 	}
 	sid := strings.TrimSpace(r.Header.Get(headerMCPSessionID))
@@ -97,12 +96,17 @@ func (s *Server) handleHTTPStreamUpload(w http.ResponseWriter, r *http.Request, 
 		writeHTTPJSONError(w, http.StatusBadRequest, "invalid_approval", err.Error(), false)
 		return
 	}
-	written, nextOffset, lastState, err := s.streamUploadBody(r, binding, startOffset, approvalOpt)
+	written, nextOffset, lastState, approvalConsumed, err := s.streamUploadBody(r, binding, startOffset, approvalOpt)
 	if err != nil {
 		writeUploadStreamErr(w, err)
 		return
 	}
-	committed, actualDigest, finalState, err := s.maybeCommitHTTPUpload(r, binding, nextOffset, lastState, approvalOpt)
+	commitApproval := approvalOpt
+	if written > 0 && approvalConsumed {
+		// 单次审批信封仅允许被首个分片消费；若本次请求已消费该审批，则 CommitTransfer 传 None（留 Verifying 供二次提交）。
+		commitApproval = algebraic.None[gate.ApprovalSubmission]()
+	}
+	committed, actualDigest, finalState, err := s.maybeCommitHTTPUpload(r, binding, nextOffset, lastState, commitApproval)
 	if err != nil {
 		writeClassifiedHTTPError(w, err)
 		return
@@ -123,29 +127,38 @@ func (s *Server) streamUploadBody(
 	binding tools.TransferBinding,
 	offset uint64,
 	approval algebraic.Option[gate.ApprovalSubmission],
-) (written, nextOffset uint64, lastState fsm.TransferStateKind, err error) {
+) (written, nextOffset uint64, lastState fsm.TransferStateKind, approvalConsumed bool, err error) {
 	buf := make([]byte, s.httpChunkSize)
 	lastState = fsm.TransferKindStreaming
 	for {
 		if s.gate.IsHalted() {
 			s.registry.ClearTrackedHandles()
-			return 0, 0, fsm.TransferKindInvalid, gate.ErrGateHalted
+			return 0, 0, fsm.TransferKindInvalid, approvalConsumed, gate.ErrGateHalted
 		}
 		n, readErr := io.ReadFull(r.Body, buf)
 		if n > 0 {
-			offset, lastState, err = s.writeOneUploadChunk(r, binding, offset, buf[:n], approval)
+			chunkApproval := takeOnceApproval(approval, &approvalConsumed)
+			offset, lastState, err = s.writeOneUploadChunk(r, binding, offset, buf[:n], chunkApproval)
 			if err != nil {
-				return 0, 0, fsm.TransferKindInvalid, err
+				return 0, 0, fsm.TransferKindInvalid, approvalConsumed, err
 			}
 			written += uint64(n)
 		}
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-			return written, offset, lastState, nil
+			return written, offset, lastState, approvalConsumed, nil
 		}
 		if readErr != nil {
-			return 0, 0, fsm.TransferKindInvalid, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, readErr)
+			return 0, 0, fsm.TransferKindInvalid, approvalConsumed, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, readErr)
 		}
 	}
+}
+
+func takeOnceApproval(approval algebraic.Option[gate.ApprovalSubmission], consumed *bool) algebraic.Option[gate.ApprovalSubmission] {
+	if *consumed || !approval.IsSome() {
+		return algebraic.None[gate.ApprovalSubmission]()
+	}
+	*consumed = true
+	return approval
 }
 
 func (s *Server) writeOneUploadChunk(
@@ -155,7 +168,8 @@ func (s *Server) writeOneUploadChunk(
 	chunk []byte,
 	approval algebraic.Option[gate.ApprovalSubmission],
 ) (uint64, fsm.TransferStateKind, error) {
-	if offset+uint64(len(chunk)) > binding.TotalBytes() {
+	// 严格以减法边界检查防止恶意 X-Xops-Start-Offset 触发 uint64 回绕。
+	if offset > binding.TotalBytes() || uint64(len(chunk)) > binding.TotalBytes()-offset {
 		return 0, fsm.TransferKindInvalid, ErrMessageTooLarge
 	}
 	chunkRes, err := s.registry.TransferService().WriteTransferChunk(r.Context(), uctrans.WriteTransferChunkRequest{
@@ -192,7 +206,11 @@ func (s *Server) maybeCommitHTTPUpload(
 		CallBase: uctrans.CallBase{Plan: binding.Plan(), NodeID: binding.NodeID(), Approval: approval},
 		Handle:   binding.Handle(),
 	})
-	s.registry.DropTransfer(binding.TransferID())
+	// 仅在 CommitTransfer 真正进入终态并释放槽位（cErr==nil 或 cRes.TransferID.IsValid()）或 Gate 已熔断时摘除绑定，
+	// 绝不在 ApprovalChallengeError/审批失配/瞬态核验失败时提前销毁绑定。
+	if cErr == nil || cRes.TransferID.IsValid() || s.gate.IsHalted() {
+		s.registry.DropTransfer(binding.TransferID())
+	}
 	if cErr != nil {
 		return false, algebraic.None[security.Digest](), fsm.TransferKindInvalid, cErr
 	}
@@ -206,7 +224,7 @@ func (s *Server) handleHTTPStreamDownload(w http.ResponseWriter, r *http.Request
 	}
 	approvalOpt, err := parseApprovalHeader(r.Header.Get(headerApproval))
 	if err != nil {
-		writeHTTPJSONError(w, http.StatusBadRequest, "invalid_approval", err.Error(), false)
+		writeHTTPJSONError(w, http.StatusBadRequest, "invalid_approval", protocol.SanitizeErrorMessage(err.Error()), false)
 		return
 	}
 	scopedFS := s.registry.ScopedFS()
@@ -216,16 +234,32 @@ func (s *Server) handleHTTPStreamDownload(w http.ResponseWriter, r *http.Request
 		writeHTTPJSONError(w, http.StatusServiceUnavailable, "scoped_fs_unavailable", "沙箱 ScopedRootFS 或目标绑定缺失", false)
 		return
 	}
-	base := uctrans.CallBase{Plan: binding.Plan(), NodeID: binding.NodeID(), Approval: approvalOpt}
-	if err := s.pullAllDownloadChunks(r, binding, base); err != nil {
-		writeClassifiedHTTPError(w, err)
+	// 先探测实时状态：已在 Verifying（例如上次 GET 拉取完分片后因 CommitTransfer 挑战 428 返回）则跳过拉取直进 CommitTransfer；
+	// 拉取阶段恒传 Approval: None，严禁将 commit 审批回执错喂给 PullTransferChunk。
+	unapprovedBase := uctrans.CallBase{Plan: binding.Plan(), NodeID: binding.NodeID()}
+	snap, inspErr := s.registry.TransferService().InspectTransfer(r.Context(), uctrans.InspectTransferRequest{
+		CallBase:   unapprovedBase,
+		TransferID: binding.TransferID(),
+		Handle:     algebraic.Some(binding.Handle()),
+	})
+	if inspErr != nil {
+		writeClassifiedHTTPError(w, inspErr)
 		return
 	}
+	if snap.StateKind != fsm.TransferKindVerifying {
+		if err := s.pullAllDownloadChunks(r, binding, unapprovedBase); err != nil {
+			writeClassifiedHTTPError(w, err)
+			return
+		}
+	}
+	commitBase := uctrans.CallBase{Plan: binding.Plan(), NodeID: binding.NodeID(), Approval: approvalOpt}
 	commitRes, cErr := s.registry.TransferService().CommitTransfer(r.Context(), uctrans.CommitTransferRequest{
-		CallBase: base,
+		CallBase: commitBase,
 		Handle:   binding.Handle(),
 	})
-	s.registry.DropTransfer(binding.TransferID())
+	if cErr == nil || commitRes.TransferID.IsValid() || s.gate.IsHalted() {
+		s.registry.DropTransfer(binding.TransferID())
+	}
 	if cErr != nil {
 		writeClassifiedHTTPError(w, cErr)
 		return
@@ -269,10 +303,11 @@ func (s *Server) streamCommittedDownload(
 ) {
 	limits, lErr := ports.NewReadLimits(max(int64(binding.TotalBytes()), 1))
 	if lErr != nil {
-		writeHTTPJSONError(w, http.StatusInternalServerError, "invalid_limits", lErr.Error(), false)
+		writeHTTPJSONError(w, http.StatusInternalServerError, "invalid_limits", protocol.SanitizeErrorMessage(lErr.Error()), false)
 		return
 	}
 	buf := make([]byte, s.httpChunkSize)
+	headersWritten := false
 	streamErr := scopedFS.WithRoot(localRoot, func(root ports.RootHandle) error {
 		return root.WithReadRegular(localDest, limits, func(rd ports.BoundedReadHandle, size int64) error {
 			w.Header().Set(headerContentType, "application/octet-stream")
@@ -282,8 +317,12 @@ func (s *Server) streamCommittedDownload(
 			if dig, ok := commitRes.ActualDigest.Get(); ok {
 				w.Header().Set(headerTransferHash, dig.String())
 			}
+			headersWritten = true
 			w.WriteHeader(http.StatusOK)
-			_, cpErr := io.CopyBuffer(w, rd, buf)
+			n, cpErr := io.CopyBuffer(w, rd, buf)
+			if cpErr == nil && n != size {
+				return io.ErrUnexpectedEOF
+			}
 			return cpErr
 		})
 	})
@@ -291,6 +330,13 @@ func (s *Server) streamCommittedDownload(
 		s.emitDiag(events.SeverityWarn, "mcp_http_download_stream_error", streamErr.Error(), map[string]string{
 			"transfer_id": binding.TransferID().String(),
 		})
+		if !headersWritten {
+			// 写响应头前失败严禁静默返回 200 OK 空体，必须显式返回错误状态码与 JSON 载荷。
+			writeClassifiedHTTPError(w, streamErr)
+			return
+		}
+		// 响应头已发送后中途截断/I/O 失败：触发 net/http.ErrAbortHandler 显式中止连接，防止客户端误认干净 EOF。
+		panic(http.ErrAbortHandler)
 	}
 }
 

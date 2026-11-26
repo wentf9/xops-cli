@@ -193,20 +193,41 @@ func checkLoopbackHostName(host string) error {
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	halted := s.gate.IsHalted()
+	ready := s.isPrepared() && !halted && !s.IsClosed()
 	status := http.StatusOK
-	if halted {
+	if !ready {
 		status = http.StatusServiceUnavailable
 	}
 	writeHTTPJSON(w, status, struct {
 		Ready  bool `json:"ready"`
 		Halted bool `json:"halted"`
-	}{Ready: !halted && !s.IsClosed(), Halted: halted})
+	}{Ready: ready, Halted: halted})
 }
 
-func (s *Server) handleMCPHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ensureHTTPServiceReady(w http.ResponseWriter, r *http.Request) error {
+	if s.IsClosed() {
+		writeHTTPJSONError(w, http.StatusServiceUnavailable, "server_closed", ErrServerClosed.Error(), false)
+		return ErrServerClosed
+	}
 	if s.gate.IsHalted() {
 		s.registry.ClearTrackedHandles()
 		writeHTTPJSONError(w, http.StatusServiceUnavailable, "gate_halted", gate.ErrGateHalted.Error(), true)
+		return gate.ErrGateHalted
+	}
+	if err := s.ensurePrepared(r.Context()); err != nil {
+		if errors.Is(err, gate.ErrGateHalted) {
+			s.registry.ClearTrackedHandles()
+			writeHTTPJSONError(w, http.StatusServiceUnavailable, "gate_halted", gate.ErrGateHalted.Error(), true)
+			return err
+		}
+		writeHTTPJSONError(w, http.StatusServiceUnavailable, "startup_not_ready", protocol.SanitizeErrorMessage(err.Error()), false)
+		return err
+	}
+	return nil
+}
+
+func (s *Server) handleMCPHTTP(w http.ResponseWriter, r *http.Request) {
+	if err := s.ensureHTTPServiceReady(w, r); err != nil {
 		return
 	}
 	switch r.Method {
@@ -227,32 +248,85 @@ func (s *Server) handleMCPHTTPPost(w http.ResponseWriter, r *http.Request) {
 		writeHTTPJSONError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type 必须为 application/json", false)
 		return
 	}
-	raw, err := readBoundedHTTPBody(w, r, s.maxMessageBytes)
+	raw, readStatus, err := readBoundedHTTPBody(w, r, s.maxMessageBytes)
 	if err != nil {
-		writeHTTPJSONError(w, http.StatusRequestEntityTooLarge, "message_too_large", err.Error(), false)
+		errCode := "bad_request"
+		if readStatus == http.StatusRequestEntityTooLarge {
+			errCode = "message_too_large"
+		}
+		writeHTTPJSONError(w, readStatus, errCode, protocol.SanitizeErrorMessage(err.Error()), false)
 		return
 	}
 	req, decErr := protocol.DecodeRequest(raw)
 	if decErr != nil {
-		respBytes, _, _ := encodeErrResp(algebraic.None[protocol.RequestID](), protocol.CodeParseError, decErr.Error(), nil)
+		rpcCode, errCode := classifyDecodeError(decErr)
+		clean := protocol.SanitizeErrorMessage(decErr.Error())
+		respBytes, _, _ := encodeErrResp(algebraic.None[protocol.RequestID](), rpcCode, clean, protocol.ToolErrorPayload{
+			Code: errCode, Message: clean,
+		})
 		writeRawJSON(w, http.StatusBadRequest, respBytes)
 		return
 	}
-	sessID, statusCode, sessErr := s.resolveOrCreateHTTPSession(r, req)
+	if req.Method == protocol.MethodInitialize {
+		s.handleMCPHTTPInitialize(w, r, req)
+		return
+	}
+	sessID, statusCode, sessErr := s.requireExistingHTTPSession(r)
 	if sessErr != nil {
 		writeHTTPJSONError(w, statusCode, "invalid_session", sessErr.Error(), false)
 		return
 	}
-	respBytes, hasResp, handleErr := s.HandleMessage(r.Context(), raw)
-	if handleErr != nil {
-		writeHTTPJSONError(w, http.StatusInternalServerError, "internal_error", handleErr.Error(), false)
+	s.dispatchAndWriteHTTPResponse(w, r, req, sessID)
+}
+
+func (s *Server) handleMCPHTTPInitialize(w http.ResponseWriter, r *http.Request, req protocol.Request) {
+	if req.IsNotification() {
+		respBytes, _, _ := encodeErrResp(algebraic.None[protocol.RequestID](), protocol.CodeInvalidRequest, "initialize 必须携带请求 id", protocol.ToolErrorPayload{
+			Code: "invalid_request", Message: "initialize requires request id",
+		})
+		writeRawJSON(w, http.StatusBadRequest, respBytes)
 		return
 	}
+	resp, hasResp, handleErr := s.handleDecodedRequest(r.Context(), req)
+	if handleErr != nil {
+		writeHTTPJSONError(w, http.StatusInternalServerError, "internal_error", protocol.SanitizeErrorMessage(handleErr.Error()), false)
+		return
+	}
+	// 仅在 initialize 参数严格校验通过且无错误时签发或复用 Mcp-Session-Id，防止畸形握手耗尽会话槽位。
+	var sessID string
+	if hasResp && resp.Error == nil {
+		if given := strings.TrimSpace(r.Header.Get(headerMCPSessionID)); given != "" && s.hasHTTPSession(given) {
+			sessID = given
+		} else if sid, err := s.createHTTPSession(protocol.LatestProtocolVersion); err != nil {
+			writeHTTPJSONError(w, http.StatusServiceUnavailable, "invalid_session", protocol.SanitizeErrorMessage(err.Error()), false)
+			return
+		} else {
+			sessID = sid
+		}
+	}
+	s.writeDecodedHTTPResponse(w, r, resp, hasResp, sessID)
+}
+
+func (s *Server) dispatchAndWriteHTTPResponse(w http.ResponseWriter, r *http.Request, req protocol.Request, sessID string) {
+	resp, hasResp, handleErr := s.handleDecodedRequest(r.Context(), req)
+	if handleErr != nil {
+		writeHTTPJSONError(w, http.StatusInternalServerError, "internal_error", protocol.SanitizeErrorMessage(handleErr.Error()), false)
+		return
+	}
+	s.writeDecodedHTTPResponse(w, r, resp, hasResp, sessID)
+}
+
+func (s *Server) writeDecodedHTTPResponse(w http.ResponseWriter, r *http.Request, resp protocol.Response, hasResp bool, sessID string) {
 	if sessID != "" {
 		w.Header().Set(headerMCPSessionID, sessID)
 	}
 	if !hasResp {
 		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	respBytes, err := protocol.MarshalCanonical(resp)
+	if err != nil {
+		writeHTTPJSONError(w, http.StatusInternalServerError, "internal_error", protocol.SanitizeErrorMessage(err.Error()), false)
 		return
 	}
 	status := http.StatusOK
@@ -266,18 +340,8 @@ func (s *Server) handleMCPHTTPPost(w http.ResponseWriter, r *http.Request) {
 	writeRawJSON(w, status, respBytes)
 }
 
-func (s *Server) resolveOrCreateHTTPSession(r *http.Request, req protocol.Request) (string, int, error) {
+func (s *Server) requireExistingHTTPSession(r *http.Request) (string, int, error) {
 	given := strings.TrimSpace(r.Header.Get(headerMCPSessionID))
-	if req.Method == protocol.MethodInitialize {
-		if given != "" && s.hasHTTPSession(given) {
-			return given, 0, nil
-		}
-		sid, err := s.createHTTPSession(protocol.LatestProtocolVersion)
-		if err != nil {
-			return "", http.StatusServiceUnavailable, err
-		}
-		return sid, 0, nil
-	}
 	if given == "" {
 		return "", http.StatusBadRequest, errors.New("缺少必需的 Mcp-Session-Id 请求头")
 	}
@@ -288,6 +352,9 @@ func (s *Server) resolveOrCreateHTTPSession(r *http.Request, req protocol.Reques
 }
 
 func (s *Server) createHTTPSession(protoVer string) (string, error) {
+	if s.IsClosed() {
+		return "", ErrServerClosed
+	}
 	var raw [sessionIDEntropyLen]byte
 	if _, err := io.ReadFull(s.entropy, raw[:]); err != nil {
 		return "", fmt.Errorf("分配 MCP HTTP 会话标识失败: %w", err)
@@ -295,15 +362,28 @@ func (s *Server) createHTTPSession(protoVer string) (string, error) {
 	sid := hex.EncodeToString(raw[:])
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
+	if s.IsClosed() {
+		return "", ErrServerClosed
+	}
 	if len(s.sessions) >= s.maxHTTPSessions {
-		return "", errors.New("MCP HTTP 活跃会话数已达上限")
+		evictOldestHTTPSessionLocked(s.sessions)
 	}
-	s.sessions[sid] = mcpHTTPSession{
-		id:              sid,
-		protocolVersion: protoVer,
-		createdAt:       s.clock.Now().UTC(),
-	}
+	s.sessSeq++
+	s.sessions[sid] = mcpHTTPSession{id: sid, protocolVersion: protoVer, seq: s.sessSeq, createdAt: s.clock.Now().UTC()}
 	return sid, nil
+}
+
+func evictOldestHTTPSessionLocked(sessions map[string]mcpHTTPSession) {
+	var oldestKey string
+	var oldestSeq uint64
+	for k, v := range sessions {
+		if oldestKey == "" || v.seq < oldestSeq {
+			oldestKey, oldestSeq = k, v.seq
+		}
+	}
+	if oldestKey != "" {
+		delete(sessions, oldestKey)
+	}
 }
 
 func (s *Server) hasHTTPSession(id string) bool {
@@ -352,13 +432,16 @@ func (s *Server) handleMCPHTTPDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func readBoundedHTTPBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, error) {
+func readBoundedHTTPBody(w http.ResponseWriter, r *http.Request, maxBytes int64) ([]byte, int, error) {
 	limited := http.MaxBytesReader(w, r.Body, maxBytes)
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrMessageTooLarge, err)
+		if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
+			return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("%w: %w", ErrMessageTooLarge, err)
+		}
+		return nil, http.StatusBadRequest, fmt.Errorf("读取 HTTP 请求体失败: %w", err)
 	}
-	return data, nil
+	return data, 0, nil
 }
 
 func hasMediaTypePrefix(ct, want string) bool {
