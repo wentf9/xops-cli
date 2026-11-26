@@ -1,4 +1,4 @@
-package store
+package yamlcodec
 
 import (
 	"bytes"
@@ -417,6 +417,7 @@ func encodeAlgoPolicyDTO(p option.AlgoPolicy) *AlgoPolicyDTO {
 	return &AlgoPolicyDTO{Op: p.Op().String(), Tokens: p.Tokens()}
 }
 
+// decodeAlgoPolicyDTO 严格校验算子判别式与逐项算法令牌，禁止在 exact 令牌中走私前导 +/-/^ 或内嵌逗号篡改策略语义。
 func decodeAlgoPolicyDTO(dto *AlgoPolicyDTO) (option.AlgoPolicy, error) {
 	op := strings.ToLower(strings.TrimSpace(dto.Op))
 	if op == "unset" && len(dto.Tokens) == 0 {
@@ -425,11 +426,32 @@ func decodeAlgoPolicyDTO(dto *AlgoPolicyDTO) (option.AlgoPolicy, error) {
 	if len(dto.Tokens) == 0 {
 		return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 算法策略 %q 缺少 tokens", option.ErrInvalidAlgoPolicy, dto.Op)
 	}
-	prefix, ok := map[string]string{"exact": "", "append": "+", "remove": "-", "prepend": "^"}[op]
+	spec, ok := map[string]struct {
+		prefix string
+		op     option.AlgoOp
+	}{
+		"exact":   {"", option.AlgoOpExact},
+		"append":  {"+", option.AlgoOpAppend},
+		"remove":  {"-", option.AlgoOpRemove},
+		"prepend": {"^", option.AlgoOpPrepend},
+	}[op]
 	if !ok {
 		return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 未知算法算子 %q", option.ErrInvalidAlgoPolicy, dto.Op)
 	}
-	return option.ParseAlgoPolicy(prefix + strings.Join(dto.Tokens, ","))
+	for _, tok := range dto.Tokens {
+		if tok == "" || strings.TrimSpace(tok) != tok || strings.ContainsRune(tok, ',') ||
+			tok[0] == '+' || tok[0] == '-' || tok[0] == '^' {
+			return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 算法令牌 %q 包含非法算子前缀、空白或逗号", option.ErrInvalidAlgoPolicy, tok)
+		}
+	}
+	ap, err := option.ParseAlgoPolicy(spec.prefix + strings.Join(dto.Tokens, ","))
+	if err != nil {
+		return option.UnsetAlgoPolicy(), err
+	}
+	if ap.Op() != spec.op || len(ap.Tokens()) != len(dto.Tokens) {
+		return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 算法策略算子或令牌数与判别式 %q 不一致", option.ErrInvalidAlgoPolicy, dto.Op)
+	}
+	return ap, nil
 }
 
 func encodePathListDTO(p option.PathList) *PathListDTO {
@@ -439,6 +461,7 @@ func encodePathListDTO(p option.PathList) *PathListDTO {
 	return &PathListDTO{State: p.State().String(), Items: p.RawItems(), Terminated: p.Terminated()}
 }
 
+// decodePathListDTO 严格校验 state 判别式，state=set 下逐项经 option.ParsePathEntry 构造强类型列表，阻断 "none" 伪装或首尾空白走私。
 func decodePathListDTO(dto *PathListDTO) (option.PathList, error) {
 	st := strings.ToLower(strings.TrimSpace(dto.State))
 	switch {
@@ -447,7 +470,11 @@ func decodePathListDTO(dto *PathListDTO) (option.PathList, error) {
 	case st == "disabled" && len(dto.Items) == 0:
 		return option.DisabledPathList(), nil
 	case st == "set" && len(dto.Items) > 0:
-		pl, err := option.ParsePathListEntries(dto.Items)
+		entries, err := parseStrictSetPathEntries(dto.Items)
+		if err != nil {
+			return option.UnsetPathList(), err
+		}
+		pl, err := option.NewPathList(entries...)
 		if err != nil {
 			return option.UnsetPathList(), err
 		}
@@ -467,6 +494,7 @@ func encodeKnownHostsListDTO(k option.KnownHostsList) *KnownHostsListDTO {
 	return &KnownHostsListDTO{State: k.State().String(), Items: k.RawItems()}
 }
 
+// decodeKnownHostsListDTO 严格校验 state 判别式，state=set 下逐项经 option.ParsePathEntry 构造强类型列表，阻断 "none" 伪装或首尾空白走私。
 func decodeKnownHostsListDTO(dto *KnownHostsListDTO) (option.KnownHostsList, error) {
 	st := strings.ToLower(strings.TrimSpace(dto.State))
 	switch {
@@ -475,10 +503,29 @@ func decodeKnownHostsListDTO(dto *KnownHostsListDTO) (option.KnownHostsList, err
 	case st == "disabled" && len(dto.Items) == 0:
 		return option.DisabledKnownHostsList(), nil
 	case st == "set" && len(dto.Items) > 0:
-		return option.ParseKnownHostsList(dto.Items)
+		entries, err := parseStrictSetPathEntries(dto.Items)
+		if err != nil {
+			return option.UnsetKnownHostsList(), err
+		}
+		return option.NewKnownHostsList(entries...)
 	default:
 		return option.UnsetKnownHostsList(), fmt.Errorf("%w: 非法 KnownHostsList 状态 %q", option.ErrInvalidPathList, dto.State)
 	}
+}
+
+func parseStrictSetPathEntries(items []string) ([]option.PathEntry, error) {
+	entries := make([]option.PathEntry, 0, len(items))
+	for _, raw := range items {
+		if strings.TrimSpace(raw) != raw {
+			return nil, fmt.Errorf("%w: state=set 路径项 %q 禁止包含首尾空白", option.ErrInvalidPathList, raw)
+		}
+		entry, err := option.ParsePathEntry(raw)
+		if err != nil {
+			return nil, fmt.Errorf("%w: state=set 路径项 %q 非法: %w", option.ErrInvalidPathList, raw, err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries, nil
 }
 
 func encodeEnvFilterDTO(f option.EnvFilter) *EnvFilterDTO {
@@ -507,5 +554,3 @@ func decodeEnvFilterDTO(dto *EnvFilterDTO) (option.EnvFilter, error) {
 	}
 	return option.ParseEnvFilterTokens(tokens)
 }
-
-func ptrOf[T any](v T) *T { return &v }

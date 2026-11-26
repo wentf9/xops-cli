@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
@@ -117,20 +118,22 @@ type loadedConfigState struct {
 }
 
 func (s *YAMLInventoryStore) loadInRoot(ctx context.Context, root ports.RootHandle) (ports.InventorySnapshot, error) {
-	if parent, hasParent := s.configDest.Parent(); hasParent {
-		if _, err := root.Stat(parent); errors.Is(err, ports.ErrNotFound) {
-			return emptyInventorySnapshot()
-		} else if err != nil {
-			return zeroVal[ports.InventorySnapshot](), err
-		}
-	}
-	if _, err := root.Stat(s.configDest); errors.Is(err, ports.ErrNotFound) {
-		return emptyInventorySnapshot()
-	} else if err != nil {
+	ancestorsOK, err := checkLstatAncestors(root, s.configDest)
+	if err != nil {
 		return zeroVal[ports.InventorySnapshot](), err
 	}
+	if !ancestorsOK {
+		return emptyInventorySnapshot()
+	}
+	exists, err := checkLstatRegular(root, s.configDest)
+	if err != nil {
+		return zeroVal[ports.InventorySnapshot](), err
+	}
+	if !exists {
+		return emptyInventorySnapshot()
+	}
 	var snap ports.InventorySnapshot
-	err := osfs.WithSidecarLock(ctx, root, s.configDest, ports.LockShared, storeFilePerm, func(ports.LockedFile) error {
+	err = osfs.WithSidecarLock(ctx, root, s.configDest, ports.LockShared, storeFilePerm, func(ports.LockedFile) error {
 		st, rErr := s.readCurrentLocked(root)
 		if rErr != nil {
 			return rErr
@@ -149,6 +152,9 @@ func (s *YAMLInventoryStore) commitLocked(root ports.RootHandle, expected ports.
 	}
 	if !st.rev.Equal(expected) {
 		return zeroVal[ports.DurabilityOutcome](), ports.ErrRevisionConflict
+	}
+	if st.doc.Revision == math.MaxUint64 {
+		return zeroVal[ports.DurabilityOutcome](), fmt.Errorf("%w: 配置修订号已达 uint64 上限", ports.ErrInvalidRevision)
 	}
 	nextInvDTO, err := EncodeInventoryGraphDTO(next)
 	if err != nil {
@@ -182,7 +188,7 @@ func (s *YAMLInventoryStore) classifyReplaceFailure(
 	root ports.RootHandle, prevRaw []byte, prevExists bool,
 	nextRaw []byte, nextRev ports.Revision, cause error,
 ) (ports.DurabilityOutcome, error) {
-	detail := "atomic replace failed: " + cause.Error()
+	detail := sanitizeDurabilityDetail("atomic replace failed", cause)
 	afterRaw, readErr := root.ReadAllBounded(s.configDest, s.limits)
 	if readErr == nil && bytes.Equal(afterRaw, nextRaw) {
 		// 磁盘正文已原子切换为 nextRaw，但后续目录 fsync 等持久化步骤失败 -> Applied && !Durable（禁重试）。

@@ -1,4 +1,4 @@
-package store
+package yamlcodec
 
 import (
 	"bytes"
@@ -203,6 +203,11 @@ func validateVaultConfigDTO(v *VaultConfigDTO) error {
 			return fmt.Errorf("vault.stores.%s.timeout 必须为正时长", name)
 		}
 	}
+	if v.DefaultStore != "" && len(v.Stores) > 0 {
+		if _, ok := v.Stores[v.DefaultStore]; !ok {
+			return fmt.Errorf("vault.default_store=%q 未在 vault.stores 中声明", v.DefaultStore)
+		}
+	}
 	return nil
 }
 
@@ -237,11 +242,23 @@ func decodeInventoryGraph(dto InventoryConfigDTO, vault *VaultConfigDTO) (z inve
 	if err != nil {
 		return z, err
 	}
-	knownStores := slices.Clone(dto.KnownStores)
-	if len(knownStores) == 0 && vault != nil && len(vault.Stores) > 0 {
-		knownStores = slices.Sorted(maps.Keys(vault.Stores))
-	}
+	knownStores := mergeKnownStores(dto.KnownStores, vault)
 	return inventory.NewGraph(inventory.GraphSpec{Hosts: hosts, Identities: idents, Nodes: nodes, KnownStores: knownStores})
+}
+
+// mergeKnownStores 将 inventory.known_stores 与 vault.stores 键取去重有序并集，
+// 防止 CommitCAS 落盘 inventory.known_stores 后用户再于 vault.stores 新增存储名时触发 ErrUnknownSecretStore。
+func mergeKnownStores(declared []string, vault *VaultConfigDTO) []string {
+	if vault == nil || len(vault.Stores) == 0 {
+		return slices.Clone(declared)
+	}
+	out := make([]string, 0, len(declared)+len(vault.Stores))
+	out = append(out, declared...)
+	for k := range maps.Keys(vault.Stores) {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 func encodeHostDTO(h inventory.Host) HostDTO {
@@ -476,101 +493,4 @@ func decodeOptionalSecretRefDTO(dto *SecretRefDTO) (algebraic.Option[secret.Ref]
 		return algebraic.None[secret.Ref](), err
 	}
 	return algebraic.Some(ref), nil
-}
-
-func parseOptional[T any](raw string, parse func(string) (T, error)) (algebraic.Option[T], error) {
-	if raw == "" {
-		return algebraic.None[T](), nil
-	}
-	v, err := parse(raw)
-	if err != nil {
-		return algebraic.None[T](), err
-	}
-	return algebraic.Some(v), nil
-}
-
-func optPtr[T any](o algebraic.Option[T]) *T {
-	if v, ok := o.Get(); ok {
-		return &v
-	}
-	return nil
-}
-
-func optStr[T fmt.Stringer](o algebraic.Option[T]) string {
-	if v, ok := o.Get(); ok {
-		return v.String()
-	}
-	return ""
-}
-
-func encodeMapValues[T, V any](items []T, keyFn func(T) string, encFn func(T) (V, error)) (map[string]V, error) {
-	if len(items) == 0 {
-		return nil, nil
-	}
-	out := make(map[string]V, len(items))
-	for _, it := range items {
-		v, err := encFn(it)
-		if err != nil {
-			return nil, err
-		}
-		out[keyFn(it)] = v
-	}
-	return out, nil
-}
-
-func decodeSortedMap[V, T any](section string, m map[string]V, decFn func(string, V) (T, error)) ([]T, error) {
-	keys := slices.Sorted(maps.Keys(m))
-	out := make([]T, 0, len(keys))
-	for _, k := range keys {
-		item, err := decFn(k, m[k])
-		if err != nil {
-			return nil, fmt.Errorf("%s.%s: %w", section, k, err)
-		}
-		out = append(out, item)
-	}
-	return out, nil
-}
-
-func mapSliceErr[S, D any](in []S, fn func(S) (D, error)) ([]D, error) {
-	if len(in) == 0 {
-		return nil, nil
-	}
-	out := make([]D, len(in))
-	for i, s := range in {
-		v, err := fn(s)
-		if err != nil {
-			return nil, err
-		}
-		out[i] = v
-	}
-	return out, nil
-}
-
-func toStrings[T fmt.Stringer](in []T) []string {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]string, len(in))
-	for i, v := range in {
-		out[i] = v.String()
-	}
-	return out
-}
-
-func isIn(raw string, allowed ...string) bool {
-	return slices.Contains(allowed, strings.ToLower(strings.TrimSpace(raw)))
-}
-
-func isEmptyOrIn(raw string, allowed ...string) bool {
-	return strings.TrimSpace(raw) == "" || isIn(raw, allowed...)
-}
-
-func fieldMask(flags ...bool) uint8 {
-	var m uint8
-	for i, f := range flags {
-		if f {
-			m |= 1 << i
-		}
-	}
-	return m
 }

@@ -79,11 +79,11 @@ func evaluateParsedDocument(doc *parsedFile, target option.OriginalHostSpec, end
 		localUser: localUser,
 		layer:     option.UnsetOptionLayer(),
 	}
-	if err := ec.evalFile(doc, true, false, false); err != nil {
+	if err := ec.evalFile(doc, true, false); err != nil {
 		return option.UnsetOptionLayer(), err
 	}
 	if doc != nil && doc.hasFinal {
-		if err := ec.evalFile(doc, true, true, false); err != nil {
+		if err := ec.evalFile(doc, true, true); err != nil {
 			return option.UnsetOptionLayer(), err
 		}
 	}
@@ -168,8 +168,12 @@ func matchStreamDiagnostic(stmt configStmt) StreamDiagnostic {
 			Message: fmt.Sprintf("第 %d 行 Match canonical 块按安全策略失败关闭未生效", stmt.line),
 		}
 	}
-	for _, tok := range stmt.patterns {
-		kw, _, _, _ := parseMatchKeyword(tok)
+	for i := 0; i < len(stmt.patterns); {
+		kw, _, inlineVal, hasEq := parseMatchKeyword(stmt.patterns[i])
+		i++
+		if kw == "all" || kw == "canonical" || kw == "final" {
+			continue
+		}
 		if kw == "exec" {
 			return StreamDiagnostic{
 				Code:    "match_exec_ignored",
@@ -178,6 +182,11 @@ func matchStreamDiagnostic(stmt configStmt) StreamDiagnostic {
 				Message: fmt.Sprintf("第 %d 行 Match exec 块按安全策略失败关闭且永不执行外部命令", stmt.line),
 			}
 		}
+		_, nextIdx, ok := readMatchCriterionArg(stmt.patterns, i, inlineVal, hasEq)
+		if !ok {
+			break
+		}
+		i = nextIdx
 	}
 	return StreamDiagnostic{}
 }

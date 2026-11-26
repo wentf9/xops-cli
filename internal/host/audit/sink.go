@@ -3,7 +3,6 @@ package audit
 import (
 	"context"
 	"fmt"
-	"io"
 	"sync"
 	"sync/atomic"
 
@@ -79,7 +78,7 @@ func NewFileSink(spec SinkSpec) (*FileSink, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ensureAuditDirectories(spec.ScopedFS, spec.RootDir, runDest); err != nil {
+	if err := ensureAuditDirectories(spec.ScopedFS, spec.RootDir, auditDest, runDest); err != nil {
 		return nil, err
 	}
 	return startLockedFileSink(spec.ScopedFS, spec.RootDir, auditDest, lockDest, spec.ProcessID, maxLines)
@@ -104,12 +103,18 @@ func NewFileSinkFromEntropy(fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir,
 	return NewFileSink(SinkSpec{ScopedFS: fsPort, RootDir: rootDir, ProcessID: procID})
 }
 
-func ensureAuditDirectories(fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir, runDest pathalg.LocalRootedDest) error {
+func ensureAuditDirectories(fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir, auditDest, runDest pathalg.LocalRootedDest) error {
 	if err := fsPort.EnsureRoot(rootDir, runDirPerm); err != nil {
 		return err
 	}
 	return fsPort.WithRoot(rootDir, func(root ports.RootHandle) error {
-		return root.MkdirAll(runDest, runDirPerm)
+		if err := root.MkdirAll(runDest, runDirPerm); err != nil {
+			return err
+		}
+		if parent, ok := auditDest.Parent(); ok {
+			return root.MkdirAll(parent, runDirPerm)
+		}
+		return nil
 	})
 }
 
@@ -144,125 +149,6 @@ func startLockedFileSink(fsPort ports.ScopedRootFS, rootDir pathalg.LocalDir, au
 		return nil, initErr
 	}
 	return s, nil
-}
-
-func (s *FileSink) runLockHolder(readyCh chan<- error) error {
-	defer close(s.doneCh)
-	readySent := false
-	signalReady := func(err error) {
-		if !readySent {
-			readySent = true
-			readyCh <- err
-		}
-	}
-	err := s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
-		return s.holdProcessLockInRoot(root, signalReady)
-	})
-	signalReady(err)
-	return err
-}
-
-func (s *FileSink) holdProcessLockInRoot(root ports.RootHandle, signalReady func(error)) error {
-	var cleanShutdown bool
-	acquired, err := root.TryWithLockedFile(s.lockDest, ports.LockExclusive, true, auditFilePerm, func(lf ports.LockedFile) error {
-		st, stErr := lf.Stat()
-		if stErr != nil {
-			signalReady(stErr)
-			return stErr
-		}
-		if st.Size() > 0 {
-			// 严禁静默截断尚未完成崩溃对账的非空残留 .lock 文件（防止误复用 ProcessInstanceID 擦除未闭合记录）。
-			unreconciledErr := fmt.Errorf("%w: 进程锁文件 %q 包含未对账残留记录，请先执行崩溃对账或使用新的 ProcessInstanceID", ports.ErrAlreadyExists, s.lockDest.String())
-			signalReady(unreconciledErr)
-			return unreconciledErr
-		}
-		if rErr := truncateAndRewind(lf); rErr != nil {
-			signalReady(rErr)
-			return rErr
-		}
-		signalReady(nil)
-		cleanShutdown = true
-		return s.serveLockCommands(lf)
-	})
-	if err != nil {
-		signalReady(err)
-		return err
-	}
-	if !acquired {
-		signalReady(ports.ErrLockBusy)
-		return nil
-	}
-	if !cleanShutdown || !s.cleanClose.Load() {
-		return nil
-	}
-	// 仅在活跃集合归零的正常关闭路径，经 osfs.RemoveLockedFileSafely 按三平台安全协议删除锁文件；
-	// 若仍有未闭合操作（cleanClose==false），故意保留已解锁且含活跃条目的 .lock 供下次启动崩溃对账补写 AbortedByCrash。
-	if _, rmErr := osfs.RemoveLockedFileSafely(root, s.lockDest); rmErr != nil {
-		return rmErr
-	}
-	return nil
-}
-
-func (s *FileSink) serveLockCommands(lf ports.LockedFile) error {
-	for {
-		select {
-		case cmd := <-s.cmdCh:
-			cmd.reply <- applyLockCommand(lf, cmd)
-		case <-s.closeCh:
-			if s.cleanClose.Load() {
-				// 活跃集合为空的正常关闭：持独占锁态截断清空并归零偏移刷盘，随后退出闭包解锁删除。
-				return truncateAndRewind(lf)
-			}
-			// 仍有未闭合操作（如 Halted 熔断退出）：绝不截断 .lock，仅同步刷盘后退出闭包释放内核锁。
-			return lf.Sync()
-		}
-	}
-}
-
-func applyLockCommand(lf ports.LockedFile, cmd lockCommand) error {
-	prefix := byte('-')
-	if cmd.kind == lockCmdStage {
-		prefix = '+'
-	}
-	line := append(append([]byte{prefix}, cmd.opID.String()...), '\n')
-	if err := writeAll(lf, line); err != nil {
-		return fmt.Errorf("%w: 写入进程锁日志失败: %w", ports.ErrAuditWriteFailed, err)
-	}
-	if cmd.kind == lockCmdUnstage && cmd.truncateAfter {
-		// 严格遵循 §4 #4：仅在活跃集合归零后执行 Truncate(0) 并紧跟 Seek(0, io.SeekStart)，防稀疏 NUL 空洞。
-		if err := truncateAndRewind(lf); err != nil {
-			return fmt.Errorf("%w: 排空后截断重置进程锁失败: %w", ports.ErrAuditWriteFailed, err)
-		}
-		return nil
-	}
-	if err := lf.Sync(); err != nil {
-		return fmt.Errorf("%w: 刷盘进程锁日志失败: %w", ports.ErrAuditWriteFailed, err)
-	}
-	return nil
-}
-
-func truncateAndRewind(lf ports.LockedFile) error {
-	if err := lf.Truncate(0); err != nil {
-		return err
-	}
-	if _, err := lf.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	return lf.Sync()
-}
-
-func writeAll(w io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := w.Write(data)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
 }
 
 // ProcessInstanceID 返回当前 FileSink 绑定的进程实例标识；零值接收者返回无效零值。

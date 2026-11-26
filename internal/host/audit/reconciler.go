@@ -242,6 +242,10 @@ func (r *FileReconciler) reconcileSlowPath(ctx context.Context, root ports.RootH
 	if err != nil {
 		return nil, err
 	}
+	parentExists, err := checkAuditParentDir(root, r.auditFile)
+	if err != nil || !parentExists {
+		return nil, err
+	}
 	var aborted []security.OperationID
 	err = osfs.WithSidecarLock(ctx, root, r.auditFile, ports.LockExclusive, auditFilePerm, func(ports.LockedFile) error {
 		r.auditScans.Add(1)
@@ -261,6 +265,27 @@ func (r *FileReconciler) reconcileSlowPath(ctx context.Context, root ports.RootH
 		return wErr
 	})
 	return aborted, err
+}
+
+func checkAuditParentDir(root ports.RootHandle, auditFile pathalg.LocalRootedDest) (bool, error) {
+	parent, ok := auditFile.Parent()
+	if !ok {
+		return true, nil
+	}
+	info, err := root.Lstat(parent)
+	if errors.Is(err, ports.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if info.IsSymlink() {
+		return false, fmt.Errorf("%w: 审计日志父目录 %q 为符号链接", ports.ErrSymlinkRejected, parent.String())
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("%w: 审计日志父路径 %q 不是目录", ports.ErrNotRegularFile, parent.String())
+	}
+	return true, nil
 }
 
 func parseAuditEntriesForProcess(raw []byte, procID ports.ProcessInstanceID) (map[security.OperationID]ports.AuditEntry, map[security.OperationID]bool, error) {

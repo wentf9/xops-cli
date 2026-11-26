@@ -128,10 +128,13 @@ func (i *OpenSSHImporter) resolveImportUser(vh ports.OpenSSHVirtualHost) (option
 
 func buildOpenSSHImportAuth(spec *inventory.ImportBundleSpec, alias string, layer option.OptionLayer) (inventory.AuthMethod, error) {
 	keys := collectLiteralSpecs(spec, alias, layer.IdentityFiles(), inventory.ParseKeyPathSpec, "template_key_skipped", "IdentityFile")
+	certs := collectLiteralSpecs(spec, alias, layer.CertificateFiles(), inventory.ParseCertPathSpec, "template_cert_skipped", "CertificateFile")
 	if len(keys) == 0 {
+		if len(certs) > 0 {
+			appendImportWarning(spec, "cert_without_key_skipped", alias, "无可用字面 IdentityFile，已跳过未绑定的 CertificateFile")
+		}
 		return inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
 	}
-	certs := collectLiteralSpecs(spec, alias, layer.CertificateFiles(), inventory.ParseCertPathSpec, "template_cert_skipped", "CertificateFile")
 	neKeys, err := algebraic.NonEmptyFromSlice(keys)
 	if err != nil {
 		return nil, err

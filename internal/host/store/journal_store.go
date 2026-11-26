@@ -1,18 +1,12 @@
 package store
 
 import (
-	"bytes"
-	"cmp"
 	"context"
-	"encoding/base32"
-	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"maps"
 	"slices"
-	"strconv"
-	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
@@ -23,11 +17,12 @@ import (
 )
 
 const (
-	walKeyPrefix   = "j_"
-	walFileSuffix  = ".wal"
-	walGenMarker   = ".g"
-	walLockExt     = ".lock"
-	walMinFrameLen = len(walFrameVersionPrefix) + walCRC32HexLen + 1
+	walKeyPrefix       = "j_"
+	walFileSuffix      = ".wal"
+	walGenMarker       = ".g"
+	walLockExt         = ".lock"
+	walLockStripeCount = 64
+	walMinFrameLen     = len(walFrameVersionPrefix) + walCRC32HexLen + 1
 )
 
 // WALJournalStore 实现 ports.JournalStore，提供面向 10 GiB 可恢复分片传输的双代（active/staging）
@@ -38,7 +33,8 @@ const (
 //     读取时同时校验帧格式、CRC32、TransferJournalRecord SHA-256 自校验摘要与 (TransferID, Generation) 归属；
 //   - 某世代遇 CRC/截断/格式损坏时，LoadGenerations 在 PartialRecords() 中精确保留损坏点前全部有效前缀，
 //     供上层 TransferService 识别 CommitStarted / UncertainCommit 并禁止回退低世代；
-//   - 并发协调统一使用每个 TransferID 的旁路锁 j_<base32(id)>.lock，绝不对 .wal 数据文件本身加锁。
+//   - 并发协调采用固定数量、永不删除的分片条带旁路锁 journals/.stripe_<00..3f>.lock，
+//     彻底根除 POSIX flock+unlink 竞态且对只读未命中绝不遗留孤儿锁文件；绝不对 .wal 数据文件本身加锁。
 //
 //xops:opaque
 //xops:failclosed
@@ -137,6 +133,17 @@ func (s *WALJournalStore) Load(ctx context.Context, transferID security.Operatio
 // LoadGenerations 按 Generation 升序返回逐代隔离的只读快照：
 // 健康世代返回完整排序记录；损坏世代返回 Corrupt()==true、Records()==nil，
 // 并在 PartialRecords() 中保留损坏点前已通过全部完整性校验的同代前缀记录。
+func (s *WALJournalStore) requireJournalDir(root ports.RootHandle) error {
+	exists, err := checkLstatDir(root, s.journalDir)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ports.ErrNotFound
+	}
+	return nil
+}
+
 func (s *WALJournalStore) LoadGenerations(ctx context.Context, transferID security.OperationID) ([]ports.JournalGenerationSnapshot, error) {
 	lockTarget, err := s.prepareTransferOp(ctx, transferID)
 	if err != nil {
@@ -144,8 +151,14 @@ func (s *WALJournalStore) LoadGenerations(ctx context.Context, transferID securi
 	}
 	var snaps []ports.JournalGenerationSnapshot
 	err = s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
-		if _, stErr := root.Stat(s.journalDir); stErr != nil {
-			return stErr
+		// 先经 Lstat 校验目录与预检目标世代存在性，拒绝悬空符号链接且绝不为不存在的传输创建条带锁文件。
+		if dErr := s.requireJournalDir(root); dErr != nil {
+			return dErr
+		}
+		if gens, gErr := s.listGenerationsLocked(root, transferID); gErr != nil {
+			return gErr
+		} else if len(gens) == 0 {
+			return ports.ErrNotFound
 		}
 		return osfs.WithSidecarLock(ctx, root, lockTarget, ports.LockShared, storeFilePerm, func(ports.LockedFile) error {
 			var lErr error
@@ -157,7 +170,7 @@ func (s *WALJournalStore) LoadGenerations(ctx context.Context, transferID securi
 }
 
 // PruneGeneration 仅移除指定 (transferID, generation) 对应的 WAL 文件；
-// 若不存在则返回 ports.ErrNotFound；当该传输已无剩余世代时顺带按三平台安全协议清理其旁路锁。
+// 若不存在则返回 ports.ErrNotFound；固定条带旁路锁永不删除以杜绝 POSIX flock+unlink 竞态。
 func (s *WALJournalStore) PruneGeneration(ctx context.Context, transferID security.OperationID, generation uint64) error {
 	lockTarget, err := s.prepareTransferOp(ctx, transferID)
 	if err != nil {
@@ -171,72 +184,42 @@ func (s *WALJournalStore) PruneGeneration(ctx context.Context, transferID securi
 		return err
 	}
 	return s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
-		return s.pruneInRoot(ctx, root, transferID, lockTarget, walDest)
+		return s.pruneInRoot(ctx, root, lockTarget, walDest)
 	})
 }
 
-func (s *WALJournalStore) pruneInRoot(
-	ctx context.Context,
-	root ports.RootHandle,
-	transferID security.OperationID,
-	lockTarget, walDest pathalg.LocalRootedDest,
-) error {
-	if _, stErr := root.Stat(s.journalDir); stErr != nil {
-		return stErr
-	}
-	shouldCleanLock := false
-	err := osfs.WithSidecarLock(ctx, root, lockTarget, ports.LockExclusive, storeFilePerm, func(ports.LockedFile) error {
-		if rmErr := root.Remove(walDest); rmErr != nil {
-			return rmErr
-		}
-		rem, fErr := s.listGenerationsLocked(root, transferID)
-		if fErr != nil {
-			return fErr
-		}
-		shouldCleanLock = len(rem) == 0
-		return nil
-	})
-	if err != nil {
+func (s *WALJournalStore) pruneInRoot(ctx context.Context, root ports.RootHandle, lockTarget, walDest pathalg.LocalRootedDest) error {
+	if err := s.requireJournalDir(root); err != nil {
 		return err
 	}
-	if shouldCleanLock {
-		s.cleanupSidecarLock(root, lockTarget)
+	if exists, cErr := checkLstatRegular(root, walDest); cErr != nil {
+		return cErr
+	} else if !exists {
+		return ports.ErrNotFound
 	}
-	return nil
-}
-
-func (s *WALJournalStore) cleanupSidecarLock(root ports.RootHandle, lockTarget pathalg.LocalRootedDest) {
-	if lockDest, lErr := osfs.SidecarLockDest(lockTarget); lErr == nil {
-		_, _ = osfs.RemoveLockedFileSafely(root, lockDest)
-	}
+	return osfs.WithSidecarLock(ctx, root, lockTarget, ports.LockExclusive, storeFilePerm, func(ports.LockedFile) error {
+		return root.Remove(walDest)
+	})
 }
 
 // ListActive 按 OperationID 字典序确定性列举当前磁盘上存在任意世代 WAL 的全部活跃传输标识；
-// 根目录或 journals 目录尚未创建时返回空切片与 nil。
+// 根目录或 journals 目录尚未创建时返回空切片与 nil；匹配 WAL 命名但非正规文件的条目严格失败关闭。
 func (s *WALJournalStore) ListActive(ctx context.Context) ([]security.OperationID, error) {
 	if err := checkCtxReady(ctx, s != nil && s.valid, "WALJournalStore"); err != nil {
 		return nil, err
 	}
 	var ids []security.OperationID
 	err := s.fs.WithRoot(s.rootDir, func(root ports.RootHandle) error {
+		if exists, cErr := checkLstatDir(root, s.journalDir); cErr != nil || !exists {
+			return cErr
+		}
 		entries, rErr := root.ReadDir(algebraic.Some(s.journalDir))
 		if rErr != nil {
 			return rErr
 		}
-		seen := make(map[security.OperationID]struct{})
-		for _, e := range entries {
-			if !e.IsRegular() {
-				continue
-			}
-			if id, _, pErr := parseWALFileName(e.Name()); pErr == nil {
-				seen[id] = struct{}{}
-			}
-		}
-		if len(seen) > 0 {
-			ids = slices.Collect(maps.Keys(seen))
-			slices.SortFunc(ids, security.OperationID.Compare)
-		}
-		return nil
+		var lErr error
+		ids, lErr = collectActiveTransferIDs(entries)
+		return lErr
 	})
 	if errors.Is(err, ports.ErrNotFound) {
 		return nil, nil
@@ -244,8 +227,27 @@ func (s *WALJournalStore) ListActive(ctx context.Context) ([]security.OperationI
 	return ids, err
 }
 
-// Delete 移除指定传输的全部世代 WAL 文件并在释放旁路锁后安全清理其旁路锁文件；
-// 若该传输不存在任何世代文件则返回 ports.ErrNotFound。
+func collectActiveTransferIDs(entries []ports.LocalDirEntry) ([]security.OperationID, error) {
+	seen := make(map[security.OperationID]struct{})
+	for _, e := range entries {
+		id, _, pErr := parseWALFileName(e.Name())
+		if pErr != nil {
+			continue
+		}
+		if err := ensureRegularWALEntry(e); err != nil {
+			return nil, err
+		}
+		seen[id] = struct{}{}
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	ids := slices.Collect(maps.Keys(seen))
+	slices.SortFunc(ids, security.OperationID.Compare)
+	return ids, nil
+}
+
+// Delete 移除指定传输的全部世代 WAL 文件；若该传输不存在任何世代文件则返回 ports.ErrNotFound 且不创建锁文件。
 func (s *WALJournalStore) Delete(ctx context.Context, transferID security.OperationID) error {
 	lockTarget, err := s.prepareTransferOp(ctx, transferID)
 	if err != nil {
@@ -267,17 +269,17 @@ func (s *WALJournalStore) prepareTransferOp(ctx context.Context, transferID secu
 }
 
 func (s *WALJournalStore) deleteInRoot(ctx context.Context, root ports.RootHandle, transferID security.OperationID, lockTarget pathalg.LocalRootedDest) error {
-	if _, stErr := root.Stat(s.journalDir); stErr != nil {
-		return stErr
-	}
-	err := osfs.WithSidecarLock(ctx, root, lockTarget, ports.LockExclusive, storeFilePerm, func(ports.LockedFile) error {
-		return s.removeAllGenerationsLocked(root, transferID)
-	})
-	if err != nil {
+	if err := s.requireJournalDir(root); err != nil {
 		return err
 	}
-	s.cleanupSidecarLock(root, lockTarget)
-	return nil
+	if gens, gErr := s.listGenerationsLocked(root, transferID); gErr != nil {
+		return gErr
+	} else if len(gens) == 0 {
+		return ports.ErrNotFound
+	}
+	return osfs.WithSidecarLock(ctx, root, lockTarget, ports.LockExclusive, storeFilePerm, func(ports.LockedFile) error {
+		return s.removeAllGenerationsLocked(root, transferID)
+	})
 }
 
 func (s *WALJournalStore) removeAllGenerationsLocked(root ports.RootHandle, transferID security.OperationID) error {
@@ -329,15 +331,28 @@ func (s *WALJournalStore) listGenerationsLocked(root ports.RootHandle, transferI
 	}
 	var gens []uint64
 	for _, e := range entries {
-		if !e.IsRegular() {
+		id, gen, pErr := parseWALFileName(e.Name())
+		if pErr != nil || !id.Equal(transferID) {
 			continue
 		}
-		if id, gen, pErr := parseWALFileName(e.Name()); pErr == nil && id.Equal(transferID) {
-			gens = append(gens, gen)
+		// 先匹配 WAL 文件名再校验常规文件类型，防止高世代被替换为目录或符号链接时静默回退至低世代（ADR-016）。
+		if err := ensureRegularWALEntry(e); err != nil {
+			return nil, err
 		}
+		gens = append(gens, gen)
 	}
 	slices.Sort(gens)
 	return slices.Compact(gens), nil
+}
+
+func ensureRegularWALEntry(e ports.LocalDirEntry) error {
+	if e.IsRegular() {
+		return nil
+	}
+	if e.IsSymlink() {
+		return fmt.Errorf("%w: WAL 条目 %q 为符号链接", ports.ErrSymlinkRejected, e.Name())
+	}
+	return fmt.Errorf("%w: WAL 条目 %q 不是常规文件", ports.ErrNotRegularFile, e.Name())
 }
 
 func (s *WALJournalStore) readSingleGenerationLocked(root ports.RootHandle, transferID security.OperationID, gen uint64) (ports.JournalGenerationSnapshot, error) {
@@ -355,125 +370,14 @@ func (s *WALJournalStore) readSingleGenerationLocked(root ports.RootHandle, tran
 	return parseWALGenerationBytes(transferID, gen, raw)
 }
 
-// parseWALGenerationBytes 逐行校验 CRC32 与记录摘要；遇首处截断或损坏立即停机并返回带有效前缀的损坏快照。
-func parseWALGenerationBytes(transferID security.OperationID, gen uint64, raw []byte) (ports.JournalGenerationSnapshot, error) {
-	if len(raw) == 0 {
-		return ports.NewCorruptJournalGenerationSnapshot(gen, fmt.Errorf("%w: %w: 世代 %d WAL 文件为空", ports.ErrCorruptData, ErrCorruptJournalFrame, gen))
-	}
-	hasTrailingNL := bytes.HasSuffix(raw, []byte{'\n'})
-	body := bytes.TrimSuffix(raw, []byte{'\n'})
-	lines := bytes.Split(body, []byte{'\n'})
-	prefix := make([]fsm.TransferJournalRecord, 0, len(lines))
-	for i, line := range lines {
-		if i == len(lines)-1 && !hasTrailingNL {
-			cause := fmt.Errorf("%w: %w: 第 %d 行缺少尾随换行符（疑似写入截断）", ports.ErrCorruptData, ErrCorruptJournalFrame, i+1)
-			return ports.NewCorruptJournalGenerationSnapshot(gen, cause, sortJournalRecordsStable(prefix)...)
-		}
-		rec, err := decodeWALFrame(line, transferID, gen)
-		if err != nil {
-			cause := fmt.Errorf("%w: 第 %d 行: %w", ports.ErrCorruptData, i+1, err)
-			return ports.NewCorruptJournalGenerationSnapshot(gen, cause, sortJournalRecordsStable(prefix)...)
-		}
-		prefix = append(prefix, rec)
-	}
-	return ports.NewJournalGenerationSnapshot(gen, sortJournalRecordsStable(prefix))
-}
-
-func sortJournalRecordsStable(in []fsm.TransferJournalRecord) []fsm.TransferJournalRecord {
-	if len(in) <= 1 {
-		return in
-	}
-	out := slices.Clone(in)
-	slices.SortStableFunc(out, func(a, b fsm.TransferJournalRecord) int { return cmp.Compare(a.Seq(), b.Seq()) })
-	return out
-}
-
-func encodeWALFrame(rec fsm.TransferJournalRecord) ([]byte, error) {
-	payload, err := jsonv2.Marshal(rec, jsonv2.Deterministic(true))
-	if err != nil {
-		return nil, fmt.Errorf("%w: 序列化 Journal 记录失败: %w", ports.ErrInvalidArgument, err)
-	}
-	if bytes.ContainsAny(payload, "\r\n") {
-		return nil, fmt.Errorf("%w: 规范 JSON 记录包含非法换行符", ports.ErrInvalidArgument)
-	}
-	sum := crc32.ChecksumIEEE(payload)
-	buf := make([]byte, 0, len(walFrameVersionPrefix)+walCRC32HexLen+1+len(payload))
-	buf = append(buf, walFrameVersionPrefix...)
-	buf = fmt.Appendf(buf, "%08x:", sum)
-	buf = append(buf, payload...)
-	return buf, nil
-}
-
-func decodeWALFrame(rawLine []byte, wantID security.OperationID, wantGen uint64) (fsm.TransferJournalRecord, error) {
-	line := bytes.TrimSuffix(rawLine, []byte{'\r'})
-	if len(line) < walMinFrameLen || !bytes.HasPrefix(line, []byte(walFrameVersionPrefix)) {
-		return zeroVal[fsm.TransferJournalRecord](), fmt.Errorf("%w: 帧头缺失或版本前缀非法", ErrCorruptJournalFrame)
-	}
-	rest := line[len(walFrameVersionPrefix):]
-	if len(rest) <= walCRC32HexLen+1 || rest[walCRC32HexLen] != ':' {
-		return zeroVal[fsm.TransferJournalRecord](), fmt.Errorf("%w: CRC32 分隔符缺失", ErrCorruptJournalFrame)
-	}
-	crcHex := string(rest[:walCRC32HexLen])
-	wantCRC, err := strconv.ParseUint(crcHex, 16, 32)
-	if err != nil || crcHex != strings.ToLower(crcHex) {
-		return zeroVal[fsm.TransferJournalRecord](), fmt.Errorf("%w: CRC32 十六进制格式非法", ErrCorruptJournalFrame)
-	}
-	payload := rest[walCRC32HexLen+1:]
-	if uint64(crc32.ChecksumIEEE(payload)) != wantCRC {
-		return zeroVal[fsm.TransferJournalRecord](), fmt.Errorf("%w: CRC32 校验和不匹配", ErrCorruptJournalFrame)
-	}
-	var rec fsm.TransferJournalRecord
-	if err := jsonv2.Unmarshal(payload, &rec); err != nil {
-		return zeroVal[fsm.TransferJournalRecord](), fmt.Errorf("%w: 载荷反序列化或摘要校验失败: %w", ErrCorruptJournalFrame, err)
-	}
-	if !rec.IsValid() || !rec.TransferID().Equal(wantID) || rec.Generation() != wantGen {
-		return zeroVal[fsm.TransferJournalRecord](), fmt.Errorf("%w: 记录归属 (transfer_id/generation) 与文件不匹配", ErrCorruptJournalFrame)
-	}
-	return rec, nil
-}
-
+// transferLockTarget 将 TransferID 哈希映射至 64 个固定永不删除的条带锁目标（journals/.stripe_<00..3f>.lock），
+// 消除可复锁文件删除引起的 POSIX flock+unlink 竞态与只读孤儿锁泄漏。
 func (s *WALJournalStore) transferLockTarget(id security.OperationID) (pathalg.LocalRootedDest, error) {
-	return s.journalDir.JoinComponent(encodeJournalKey(id))
+	bucket := crc32.ChecksumIEEE([]byte(id.String())) % walLockStripeCount
+	return s.journalDir.JoinComponent(fmt.Sprintf(".stripe_%02x", bucket))
 }
 
 func (s *WALJournalStore) walFileDest(id security.OperationID, gen uint64) (pathalg.LocalRootedDest, error) {
 	name := fmt.Sprintf("%s%s%d%s", encodeJournalKey(id), walGenMarker, gen, walFileSuffix)
 	return s.journalDir.JoinComponent(name)
-}
-
-// encodeJournalKey 使用无填充小写 Base32（字母表 [a-z2-7]）双射编码 OperationID，
-// 确保在 Linux/macOS(APFS)/Windows(NTFS) 大小写不敏感文件系统下零碰撞且满足 255 字节分量上限。
-func encodeJournalKey(id security.OperationID) string {
-	enc := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString([]byte(id.String()))
-	return walKeyPrefix + strings.ToLower(enc)
-}
-
-func parseWALFileName(name string) (security.OperationID, uint64, error) {
-	if strings.HasSuffix(name, walLockExt) {
-		return zeroVal[security.OperationID](), 0, ErrCorruptJournalFrame
-	}
-	stem, ok := strings.CutSuffix(name, walFileSuffix)
-	if !ok {
-		return zeroVal[security.OperationID](), 0, ErrCorruptJournalFrame
-	}
-	keyPart, genStr, ok := strings.Cut(stem, walGenMarker)
-	if !ok || !strings.HasPrefix(keyPart, walKeyPrefix) || genStr == "" {
-		return zeroVal[security.OperationID](), 0, ErrCorruptJournalFrame
-	}
-	gen, err := strconv.ParseUint(genStr, 10, 64)
-	if err != nil || gen == 0 || strconv.FormatUint(gen, 10) != genStr {
-		return zeroVal[security.OperationID](), 0, fmt.Errorf("%w: 非法世代号 %q", ErrCorruptJournalFrame, genStr)
-	}
-	rawBytes, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(strings.TrimPrefix(keyPart, walKeyPrefix)))
-	if err != nil {
-		return zeroVal[security.OperationID](), 0, err
-	}
-	id, err := security.ParseOperationID(string(rawBytes))
-	if err != nil {
-		return zeroVal[security.OperationID](), 0, err
-	}
-	if encodeJournalKey(id) != keyPart {
-		return zeroVal[security.OperationID](), 0, ErrCorruptJournalFrame
-	}
-	return id, gen, nil
 }
