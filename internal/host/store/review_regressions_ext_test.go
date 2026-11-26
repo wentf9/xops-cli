@@ -511,8 +511,8 @@ options:
   identities_only: true
 inventory: {}
 `
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
+	if err := fsPort.EnsureRoot(rootDir, 0o700); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(seedYAML), 0o600); err != nil {
 		t.Fatalf("WriteFile(config.yaml): %v", err)
