@@ -52,7 +52,7 @@ func (k *KeySigner) listPrivateKeys(ctx context.Context, v *inventory.AuthPrivat
 		return nil, err
 	}
 	skipNotFound := v.Passphrase().IsNone()
-	var out []ports.PublicKeyInfo
+	var rawSigners []ssh.Signer
 	for _, kp := range v.KeyPaths().Slice() {
 		signer, lErr := LoadPrivateKeyFile(ctx, k.readFS, k.vault, k.env, tc, kp, v.Passphrase())
 		if lErr != nil {
@@ -61,6 +61,16 @@ func (k *KeySigner) listPrivateKeys(ctx context.Context, v *inventory.AuthPrivat
 			}
 			return nil, lErr
 		}
+		rawSigners = append(rawSigners, signer)
+	}
+	if len(rawSigners) == 0 {
+		return nil, fmt.Errorf("%w: 未找到任何可用本地私钥", ports.ErrSignerUnavailable)
+	}
+	if err := VerifyPassphraseBindingLoaded(rawSigners, v.Passphrase()); err != nil {
+		return nil, err
+	}
+	out := make([]ports.PublicKeyInfo, 0, len(rawSigners))
+	for _, signer := range rawSigners {
 		attached := AttachMatchingCert(signer, certs)
 		pubInfo, pErr := PublicKeyInfoFromSSH(attached.PublicKey())
 		if pErr != nil {
@@ -68,9 +78,6 @@ func (k *KeySigner) listPrivateKeys(ctx context.Context, v *inventory.AuthPrivat
 		}
 		k.registerSigner(pubInfo.Fingerprint(), attached)
 		out = append(out, pubInfo)
-	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("%w: 未找到任何可用本地私钥", ports.ErrSignerUnavailable)
 	}
 	return out, nil
 }
@@ -81,6 +88,9 @@ func (k *KeySigner) listAgentKeys(ctx context.Context, spec algebraic.Option[inv
 	}
 	keys, err := k.agent.ListAgentKeys(ctx, spec)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %w", ports.ErrSignerUnavailable, err)
 	}
 	k.mu.Lock()

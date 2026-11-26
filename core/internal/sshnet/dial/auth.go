@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"golang.org/x/crypto/ssh"
 
@@ -98,6 +99,9 @@ func (d *Dialer) buildAgentAuth(ctx context.Context, spec algebraic.Option[inven
 	}
 	keys, err := d.agent.ListAgentKeys(ctx, spec)
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %w", ports.ErrSignerUnavailable, err)
 	}
 	signers, err := keysigner.WrapPortSigners(keys, func(fp inventory.KeyFingerprint, algo string, data []byte) (ports.Signature, error) {
@@ -110,8 +114,11 @@ func (d *Dialer) buildAgentAuth(ctx context.Context, spec algebraic.Option[inven
 }
 
 func (d *Dialer) buildPrivateKeyAuth(ctx context.Context, hop plan.HopSpec, v *inventory.AuthPrivateKey) ([]ssh.AuthMethod, error) {
+	// 当密钥或证书路径包含跳板级 % 令牌（如 %h/%p/%r/%n/%C）且注入了 ReadFS 时，
+	// 直接走带 hop TokenContext 的 ReadFS 加载路径，避免经无 hop 上下文的 KeySigner 重复加载或展开缺失。
+	useReadFSDirectly := d.readFS != nil && privateKeyUsesHopTokens(v)
 	var signers []ssh.Signer
-	if d.keySigner != nil {
+	if !useReadFSDirectly && d.keySigner != nil {
 		ks, err := d.loadSignersFromKeyPort(ctx, v)
 		if err == nil {
 			signers = append(signers, ks...)
@@ -132,10 +139,26 @@ func (d *Dialer) buildPrivateKeyAuth(ctx context.Context, hop plan.HopSpec, v *i
 	return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, nil
 }
 
+func privateKeyUsesHopTokens(v *inventory.AuthPrivateKey) bool {
+	for _, kp := range v.KeyPaths().Slice() {
+		if strings.Contains(kp.String(), "%") {
+			return true
+		}
+	}
+	for _, cp := range v.CertPaths() {
+		if strings.Contains(cp.String(), "%") {
+			return true
+		}
+	}
+	return false
+}
+
+// loadSignersFromKeyPort 保留 KeySignerPort 返回的原始安全错误语义（INV-F1 / Vault 锁定 / 软链拒绝等），
+// 绝不无条件包装为 ErrSignerUnavailable，确保 AuthComposite 对硬安全错误严格失败关闭。
 func (d *Dialer) loadSignersFromKeyPort(ctx context.Context, v *inventory.AuthPrivateKey) ([]ssh.Signer, error) {
 	keys, err := d.keySigner.ListPublicKeys(ctx, v)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ports.ErrSignerUnavailable, err)
+		return nil, err
 	}
 	return keysigner.WrapPortSigners(keys, func(fp inventory.KeyFingerprint, algo string, data []byte) (ports.Signature, error) {
 		return d.keySigner.Sign(ctx, fp, algo, data)
@@ -149,7 +172,7 @@ func (d *Dialer) loadSignersFromReadFS(ctx context.Context, hop plan.HopSpec, v 
 		return nil, err
 	}
 	skipNotFound := v.Passphrase().IsNone()
-	var signers []ssh.Signer
+	var rawSigners []ssh.Signer
 	for _, kp := range v.KeyPaths().Slice() {
 		s, lErr := keysigner.LoadPrivateKeyFile(ctx, d.readFS, d.vault, d.env, tc, kp, v.Passphrase())
 		if lErr != nil {
@@ -158,10 +181,17 @@ func (d *Dialer) loadSignersFromReadFS(ctx context.Context, hop plan.HopSpec, v 
 			}
 			return nil, lErr
 		}
-		signers = append(signers, keysigner.AttachMatchingCert(s, certs))
+		rawSigners = append(rawSigners, s)
 	}
-	if len(signers) == 0 {
+	if len(rawSigners) == 0 {
 		return nil, fmt.Errorf("%w: %w: 未找到任何可用私钥文件", ports.ErrAuthFailed, ports.ErrSignerUnavailable)
+	}
+	if err := keysigner.VerifyPassphraseBindingLoaded(rawSigners, v.Passphrase()); err != nil {
+		return nil, err
+	}
+	signers := make([]ssh.Signer, 0, len(rawSigners))
+	for _, s := range rawSigners {
+		signers = append(signers, keysigner.AttachMatchingCert(s, certs))
 	}
 	return signers, nil
 }

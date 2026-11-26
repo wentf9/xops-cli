@@ -154,7 +154,7 @@ func (sc *streamScanner) finishPumpOnReadErr(ctx context.Context, rErr error) er
 	if sc.writeErr != nil {
 		return sc.writeErr
 	}
-	if errors.Is(rErr, io.EOF) {
+	if errors.Is(rErr, io.EOF) || (ctx.Err() != nil && errors.Is(rErr, io.ErrClosedPipe)) {
 		return nil
 	}
 	return rErr
@@ -166,11 +166,28 @@ func (sc *streamScanner) feed(ctx context.Context, data []byte) error {
 		sc.writeToDst(data)
 		return nil
 	}
+	// 严格强制单向因果 DAG：仅主控流允许扫描口令提示与就绪帧；
+	// 次流（如非 PTY 模式的 stdout）严禁解析任何提示/就绪令牌，杜绝混淆代理口令泄露与输出篡改。
+	if !sc.isControl {
+		return sc.bufferSecondaryPreReady(ctx, data)
+	}
 	sc.pending = append(sc.pending, data...)
-	return sc.scanPending(ctx)
+	return sc.scanControlPending()
 }
 
-func (sc *streamScanner) scanPending(ctx context.Context) error {
+func (sc *streamScanner) bufferSecondaryPreReady(ctx context.Context, data []byte) error {
+	if !sc.holdPreReady {
+		sc.state.recordDiag(data)
+		return nil
+	}
+	sc.pending = append(sc.pending, data...)
+	if len(sc.pending) < maxPreReadyHoldBytes {
+		return nil
+	}
+	return sc.resolveHeldPreReady(ctx)
+}
+
+func (sc *streamScanner) scanControlPending() error {
 	readyBytes := []byte(sc.state.tokens.ready)
 	for !sc.state.readyFlag.Load() {
 		sc.pending = sc.feedback.consume(sc.pending)
@@ -189,23 +206,13 @@ func (sc *streamScanner) scanPending(ctx context.Context) error {
 			}
 			continue
 		}
-		return sc.handleUnmatchedPending(ctx, needMore)
-	}
-	sc.flushPendingToDst()
-	return nil
-}
-
-func (sc *streamScanner) handleUnmatchedPending(ctx context.Context, needMore bool) error {
-	if !sc.holdPreReady {
 		if !needMore {
 			sc.trimSafeDiagPrefix()
 		}
 		return nil
 	}
-	if len(sc.pending) < maxPreReadyHoldBytes {
-		return nil
-	}
-	return sc.resolveHeldPreReady(ctx)
+	sc.flushPendingToDst()
+	return nil
 }
 
 func (sc *streamScanner) handleMatchedPrompt(pStart, pEnd int) error {

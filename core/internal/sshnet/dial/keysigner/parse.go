@@ -99,6 +99,10 @@ func ParsePrivateKeyBytes(
 	if !hasPass || vault == nil {
 		return nil, fmt.Errorf("%w: 私钥受口令保护且缺少绑定口令凭据", ports.ErrAuthFailed)
 	}
+	// OpenSSH 加密私钥格式在解密前即携带明文公钥，先做 INV-F1 指纹预校验，避免对失配密钥无谓读取 Vault/KDF。
+	if missingErr.PublicKey != nil && !FingerprintOfSSHKey(missingErr.PublicKey).Equal(binding.KeyFingerprint()) {
+		return nil, fmt.Errorf("%w: 加密私钥公钥指纹与 KeyPassphraseBinding 不匹配 (INV-F1)", ports.ErrAuthFailed)
+	}
 	decrypted, err := decryptKeyWithVaultRef(ctx, vault, keyBytes, binding.PassphraseRef())
 	if err != nil {
 		return nil, err
@@ -107,6 +111,22 @@ func ParsePrivateKeyBytes(
 		return nil, fmt.Errorf("%w: 解密后私钥指纹与 KeyPassphraseBinding 不匹配 (INV-F1)", ports.ErrAuthFailed)
 	}
 	return decrypted, nil
+}
+
+// VerifyPassphraseBindingLoaded 强制校验 INV-F1 防掉包不变式：
+// 当 AuthPrivateKey 声明了 KeyPassphraseBinding 时，必须在附加证书前确认已加载的原始私钥集合中
+// 至少包含一枚与 binding.KeyFingerprint 一致的私钥，彻底阻断将加密私钥静默替换为未加密伪造私钥的绕过攻击。
+func VerifyPassphraseBindingLoaded(rawSigners []ssh.Signer, passOpt algebraic.Option[inventory.KeyPassphraseBinding]) error {
+	binding, hasPass := passOpt.Get()
+	if !hasPass {
+		return nil
+	}
+	for _, s := range rawSigners {
+		if s != nil && FingerprintOfSSHKey(s.PublicKey()).Equal(binding.KeyFingerprint()) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: 已加载私钥均与 KeyPassphraseBinding 指纹不匹配 (INV-F1)", ports.ErrAuthFailed)
 }
 
 // decryptKeyWithVaultRef 在外层明文作用域内嵌套 SecretVault.WithSecret + passBox.Use 解密受保护私钥。

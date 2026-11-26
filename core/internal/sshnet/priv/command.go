@@ -32,10 +32,14 @@ func generateHandshakeTokens(entropy ports.Entropy) (handshakeTokens, error) {
 }
 
 // buildEscalationPlan 按 sudo / su / doas 协议规则包装不可变 CommandPlan，
-// 在提权壳内部先输出随机就绪帧 readyToken 至 stderr 再执行目标命令，实现认证阶段与命令载荷的严格隔离。
+// 拒绝显式非 POSIX 启动方言（cmd / powershell / raw），并在提权壳内部先输出随机就绪帧 readyToken
+// 至 stderr 再执行目标命令，实现认证阶段与命令载荷的严格隔离。
 func buildEscalationPlan(req ports.PrivilegeRequest, tokens handshakeTokens) (execution.CommandPlan, string, bool, error) {
 	var zero execution.CommandPlan
 	cmd := req.Command()
+	if dialect := cmd.Profile().Dialect(); dialect != execution.DialectUnknown && dialect != execution.DialectPOSIX {
+		return zero, "", false, fmt.Errorf("%w: 提权仅支持 POSIX 启动方言（拒绝 %s）", ports.ErrUnsupported, dialect)
+	}
 	innerCmd, err := cmd.RenderCommand()
 	if err != nil {
 		return zero, "", false, fmt.Errorf("%w: 渲染提权目标命令失败: %w", ports.ErrInvalidArgument, err)
@@ -56,11 +60,13 @@ func buildEscalationPlan(req ports.PrivilegeRequest, tokens handshakeTokens) (ex
 	if err != nil {
 		return zero, "", false, err
 	}
+	// 外层会话使用 MaxAllowedOutputBytes，避免握手前提示/就绪帧计入目标命令的 MaxOutputBytes 配额；
+	// 目标命令真实的 MaxOutputBytes 截断预算由 priv 的 streamScanner 在就绪后精确执行。
 	plan, err := execution.NewCommandPlan(execution.CommandPlanSpec{
 		Kind:           execution.PlanKindCommand,
 		Profile:        execution.DefaultServerLaunchProfile(),
 		Command:        wrapped,
-		MaxOutputBytes: algebraic.Some(cmd.MaxOutputBytes()),
+		MaxOutputBytes: algebraic.Some(execution.MaxAllowedOutputBytes),
 	})
 	if err != nil {
 		return zero, "", false, fmt.Errorf("%w: 构造提权包装计划失败: %w", ports.ErrInvalidArgument, err)
@@ -82,13 +88,15 @@ func formatPrivilegeWrapper(req ports.PrivilegeRequest, promptToken, qElevBody s
 }
 
 func formatSudoWrapper(req ports.PrivilegeRequest, promptToken, qElevBody string) (string, error) {
-	qPrompt, err := execution.QuotePOSIX(promptToken)
-	if err != nil {
-		return "", fmt.Errorf("%w: 引用 sudo 提示令牌失败: %w", ports.ErrInvalidArgument, err)
-	}
-	prefix := "LC_ALL=C sudo -S -p " + qPrompt
+	var prefix string
 	if req.NonInteractive() {
-		prefix = "LC_ALL=C sudo -n -S -p " + qPrompt
+		prefix = "LC_ALL=C sudo -n"
+	} else {
+		qPrompt, err := execution.QuotePOSIX(promptToken)
+		if err != nil {
+			return "", fmt.Errorf("%w: 引用 sudo 提示令牌失败: %w", ports.ErrInvalidArgument, err)
+		}
+		prefix = "LC_ALL=C sudo -S -p " + qPrompt
 	}
 	if u, hasUser := req.TargetUser().Get(); hasUser {
 		qUser, uErr := execution.QuotePOSIX(u.String())

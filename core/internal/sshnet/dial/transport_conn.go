@@ -116,6 +116,15 @@ func (c *TransportConn) WaitDone() <-chan struct{} {
 	return c.waitDone
 }
 
+// SSHClient 返回底层 *ssh.Client 仅供同仓 Wave 2（sshnet/sftp）在确需直连协议库时使用；
+// 若连接未初始化或已关闭则返回 nil，优先推荐直接调用 OpenSubsystem / OpenWatchedChannel。
+func (c *TransportConn) SSHClient() *ssh.Client {
+	if !c.IsAlive() {
+		return nil
+	}
+	return c.client
+}
+
 // Close 幂等关闭底层 SSH 传输连接、等待 client.Wait 退出并收敛所有看门狗协程（零泄漏）。
 func (c *TransportConn) Close() error {
 	if c == nil || !c.valid {
@@ -227,8 +236,9 @@ func (c *TransportConn) OpenChannel(ctx context.Context, chanType string, extraD
 	return pair.ch, pair.reqs, nil
 }
 
-// OpenWatchedChannel 打开 SSH 通道并强制封装为带 ADR-015 O(1) 截止/黑洞看门狗的 net.Conn。
-func (c *TransportConn) OpenWatchedChannel(ctx context.Context, chanType string, extraData []byte, remoteAddr net.Addr) (net.Conn, error) {
+// OpenWatchedChannel 打开 SSH 通道并强制封装为带 ADR-015 O(1) 截止/黑洞看门狗的 *chanconn.WatchedConn，
+// 直接暴露 CloseWrite() 与完整 net.Conn 能力（零额外类型断言）。
+func (c *TransportConn) OpenWatchedChannel(ctx context.Context, chanType string, extraData []byte, remoteAddr net.Addr) (*chanconn.WatchedConn, error) {
 	ch, reqs, err := c.OpenChannel(ctx, chanType, extraData)
 	if err != nil {
 		return nil, err
@@ -245,8 +255,8 @@ type subsystemReqMsg struct {
 }
 
 // OpenSubsystem 在 "session" 通道上请求启动命名 SSH 子系统（如 "sftp"），
-// 全程受 lifeNursery 取消看门狗监督并返回带截止看门狗的 net.Conn（供 P4-T2 sshnet/sftp 复用）。
-func (c *TransportConn) OpenSubsystem(ctx context.Context, subsystem string) (net.Conn, error) {
+// 全程受 lifeNursery 取消看门狗监督并返回带截止看门狗与 CloseWrite() 的 *chanconn.WatchedConn（供 P4-T2 sshnet/sftp 复用）。
+func (c *TransportConn) OpenSubsystem(ctx context.Context, subsystem string) (*chanconn.WatchedConn, error) {
 	if err := c.checkAlive(ctx); err != nil {
 		return nil, err
 	}
@@ -296,7 +306,11 @@ func (c *TransportConn) DialTCP(ctx context.Context, target netaddr.HostPort) (n
 		OriginAddr: "127.0.0.1",
 		OriginPort: 0,
 	})
-	return c.OpenWatchedChannel(ctx, "direct-tcpip", payload, chanconn.NewAddr("tcp", target.String()))
+	wc, err := c.OpenWatchedChannel(ctx, "direct-tcpip", payload, chanconn.NewAddr("tcp", target.String()))
+	if err != nil {
+		return nil, err
+	}
+	return wc, nil
 }
 
 // ListenTCP 在远端 SSH 服务端发起 tcpip-forward 监听。
@@ -328,7 +342,11 @@ func (c *TransportConn) DialStreamLocal(ctx context.Context, remoteSocket pathal
 		return nil, fmt.Errorf("%w: 无效远端 Unix 套接字路径", ports.ErrInvalidArgument)
 	}
 	payload := ssh.Marshal(&directStreamLocalMsg{SocketPath: remoteSocket.String()})
-	return c.OpenWatchedChannel(ctx, "direct-streamlocal@openssh.com", payload, chanconn.NewAddr("unix", remoteSocket.String()))
+	wc, err := c.OpenWatchedChannel(ctx, "direct-streamlocal@openssh.com", payload, chanconn.NewAddr("unix", remoteSocket.String()))
+	if err != nil {
+		return nil, err
+	}
+	return wc, nil
 }
 
 // ListenStreamLocal 在远端 SSH 服务端发起 streamlocal-forward@openssh.com 监听。
@@ -364,10 +382,14 @@ func (c *TransportConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.Rea
 	}
 	payload := ssh.Marshal(&tunChannelMsg{Mode: mode, Unit: spec.RemoteUnit()})
 	addr := chanconn.NewAddr("tun", fmt.Sprintf("%s:%d", spec.Mode(), spec.RemoteUnit()))
-	return c.OpenWatchedChannel(ctx, "tun@openssh.com", payload, addr)
+	wc, err := c.OpenWatchedChannel(ctx, "tun@openssh.com", payload, addr)
+	if err != nil {
+		return nil, err
+	}
+	return wc, nil
 }
 
-// OpenRemoteFS 若已注入 SFTP 子系统工厂则打开 RemoteFSPort，否则返回 ports.ErrUnsupported。
+// OpenRemoteFS 若已注入 SFTP 子系统工厂则传入当前 *TransportConn 打开 RemoteFSPort，否则返回 ports.ErrUnsupported。
 func (c *TransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	if err := c.checkAlive(ctx); err != nil {
 		return nil, err
@@ -375,7 +397,7 @@ func (c *TransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, e
 	if c.openRemoteFS == nil {
 		return nil, ports.ErrUnsupported
 	}
-	return c.openRemoteFS(ctx, c.client)
+	return c.openRemoteFS(ctx, c)
 }
 
 func (c *TransportConn) discardAbandonedChannel(p openedChannelPair) {

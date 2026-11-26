@@ -148,12 +148,43 @@ func parsePowerShellStage1(output string) (stage1Hit, bool) {
 }
 
 func isValidDottedVersion(raw string) bool {
-	parts := strings.Split(raw, ".")
+	// 兼容 PowerShell 预发布 SemVer 标签（如 7.5.0-preview.3 / 7.4.0-rc.1）。
+	coreVer, preRel, hasPre := strings.Cut(raw, "-")
+	parts := strings.Split(coreVer, ".")
 	if len(parts) < 2 || len(parts) > 4 {
 		return false
 	}
 	for _, p := range parts {
 		if !isASCIIDigits(p) {
+			return false
+		}
+	}
+	if hasPre {
+		return isValidPreReleaseTag(preRel)
+	}
+	return true
+}
+
+func isValidPreReleaseTag(tag string) bool {
+	if tag == "" || len(tag) > 64 {
+		return false
+	}
+	for seg := range strings.SplitSeq(tag, ".") {
+		if !isPreReleaseSegment(seg) {
+			return false
+		}
+	}
+	return true
+}
+
+func isPreReleaseSegment(seg string) bool {
+	if seg == "" {
+		return false
+	}
+	for i := range len(seg) {
+		c := seg[i]
+		isAlphaNum := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		if !isAlphaNum && c != '-' {
 			return false
 		}
 	}

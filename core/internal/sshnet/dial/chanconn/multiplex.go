@@ -19,6 +19,9 @@ func RunWithAbortWatchdog(ctx context.Context, onAbort func(), op func() error) 
 	if ctx == nil {
 		return ports.ErrNilContext
 	}
+	if op == nil {
+		return ports.ErrNilCallback
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -62,6 +65,9 @@ func RunMultiplexedOp[T any](
 	var zero T
 	if ctx == nil {
 		return zero, ports.ErrNilContext
+	}
+	if op == nil {
+		return zero, ports.ErrNilCallback
 	}
 	if err := ctx.Err(); err != nil {
 		return zero, err

@@ -115,17 +115,23 @@ func (e *Escalator) executeEscalation(
 	}
 	defer func() { _ = sess.Close() }()
 
-	// 直接在本地获取 (ports.RemoteSession).StdinPipe，确保 secrettaint 正向白名单精准溯源（0 nolint）。
+	// 直接在本地获取 (ports.RemoteSession).StdinPipe，确保 secrettaint 正向白名单精准溯源（零 nolint）。
 	stdinPipe, err := sess.StdinPipe()
 	if err != nil {
 		return nil, err
 	}
-	stdoutPipe, stderrPipe, err := claimOutputPipes(sess)
-	if err != nil {
-		return nil, err
+	// 输出流通过内存 io.Pipe() 挂载至 sess.Start，复用上游 RemoteSession 的 lifeNursery 与弃写护栏，
+	// 并在握手超时、就绪后取消或半开黑洞场景下 O(1) 关闭管道解除扫描器阻塞（ADR-015）。
+	outPR, outPW := io.Pipe()
+	errPR, errPW := io.Pipe()
+	startStreams := ports.ExecStreams{
+		Stdout: outPW,
+		Stderr: errPW,
+		PTY:    streams.PTY,
+		Env:    streams.Env,
 	}
-	startStreams := ports.ExecStreams{PTY: streams.PTY, Env: streams.Env}
 	if err := sess.Start(runCtx, wrappedPlan, startStreams); err != nil {
+		closeOutputPipes(outPR, outPW, errPR, errPW)
 		return nil, err
 	}
 
@@ -155,21 +161,14 @@ func (e *Escalator) executeEscalation(
 		})
 	}
 
-	sentAttempts, runErr := e.driveSessionIOAndHandshake(
-		runCtx, sess, stdinPipe, stdoutPipe, stderrPipe, postStdin,
+	res := e.driveSessionIOAndHandshake(
+		runCtx, sess, stdinPipe, outPR, outPW, errPR, errPW, postStdin,
 		req, primary != nil, state, streams, writeSecret,
 	)
-	if runErr != nil {
-		return nil, classifyEscalationErr(runCtx, req, state, sentAttempts, runErr)
-	}
-	out, waitErr := sess.Wait(runCtx)
-	if waitErr != nil {
-		return out, waitErr
-	}
-	return applyTruncationOutcome(out, state.truncated.Load()), nil
+	return finalizeEscalationResult(runCtx, req, state, res)
 }
 
-// driveSessionIOAndHandshake 在 core/conc.RunWait 下并发泵送输出流与就绪后输入流，
+// driveSessionIOAndHandshake 在 core/conc.RunWait 下并发驱动输出扫描器、sess.Wait 与就绪后输入泵，
 // 同时在调用方同步协程内执行提权握手回调 writeSecret（严禁跨协程传递 SecretBox）。
 //
 //xops:syncclosure
@@ -177,46 +176,93 @@ func (e *Escalator) driveSessionIOAndHandshake(
 	runCtx context.Context,
 	sess ports.RemoteSession,
 	stdinPipe io.WriteCloser,
-	stdoutPipe, stderrPipe io.Reader,
+	outPR *io.PipeReader,
+	outPW *io.PipeWriter,
+	errPR *io.PipeReader,
+	errPW *io.PipeWriter,
 	postStdin io.Reader,
 	req ports.PrivilegeRequest,
 	hasSecret bool,
 	state *sharedHandshakeState,
 	streams ports.ExecStreams,
 	writeSecret func() error,
-) (int, error) {
+) driveResult {
 	readersDone := make(chan struct{})
 	ioCtx, cancelIO := context.WithCancel(runCtx)
 	defer cancelIO()
 	stdinCtx, cancelStdin := context.WithCancel(runCtx)
 	defer cancelStdin()
+	waitCtx, cancelWait := context.WithCancel(runCtx)
+	defer cancelWait()
 
-	var sentAttempts int
-	var hsErr error
+	abortAll := func() {
+		cancelIO()
+		cancelStdin()
+		cancelWait()
+		closeOutputPipes(outPR, outPW, errPR, errPW)
+		_ = sess.Close()
+	}
+
+	var (
+		sentAttempts int
+		hsErr        error
+		waitOut      execution.ExecutionOutcome
+		waitErr      error
+	)
 	nurseryErr := conc.RunWait(runCtx, func(nCtx context.Context, n *conc.Nursery) error {
-		if err := spawnOutputScanners(n, ioCtx, stdoutPipe, stderrPipe, state, streams, readersDone); err != nil {
+		if err := spawnOutputScanners(n, ioCtx, outPR, errPR, state, streams, readersDone); err != nil {
+			closeOutputPipes(outPR, outPW, errPR, errPW)
+			return err
+		}
+		if err := spawnWaitDriver(n, waitCtx, sess, outPW, errPW, &waitOut, &waitErr); err != nil {
+			abortAll()
 			return err
 		}
 		if err := spawnPostReadyStdinPump(n, stdinCtx, state.readyCh, stdinPipe, postStdin); err != nil {
+			abortAll()
 			return err
 		}
 		sentAttempts, hsErr = e.awaitHandshakeOnCaller(nCtx, req, hasSecret, state, readersDone, writeSecret)
 		if hsErr != nil {
-			// 握手失败或超时立即解除次流暂存等待并关闭会话，防止暂存缓冲卡住退出。
-			cancelIO()
-			cancelStdin()
-			_ = sess.Close()
-			waitReadersOrCancel(nCtx, readersDone)
+			abortAll()
+			<-readersDone
 			return nil
 		}
 		waitReadersOrCancel(nCtx, readersDone)
+		if nCtx.Err() != nil || runCtx.Err() != nil {
+			abortAll()
+			<-readersDone
+			return nil
+		}
 		cancelStdin()
 		return nil
 	})
-	if hsErr != nil {
-		return sentAttempts, hsErr
-	}
-	return sentAttempts, nurseryErr
+	return buildDriveResult(runCtx, sentAttempts, waitOut, waitErr, hsErr, nurseryErr)
+}
+
+func closeOutputPipes(outPR *io.PipeReader, outPW *io.PipeWriter, errPR *io.PipeReader, errPW *io.PipeWriter) {
+	_ = outPW.Close()
+	_ = errPW.Close()
+	_ = outPR.Close()
+	_ = errPR.Close()
+}
+
+func spawnWaitDriver(
+	n *conc.Nursery,
+	waitCtx context.Context,
+	sess ports.RemoteSession,
+	outPW, errPW *io.PipeWriter,
+	waitOut *execution.ExecutionOutcome,
+	waitErr *error,
+) error {
+	return n.Go(func(context.Context) error {
+		defer func() {
+			_ = outPW.Close()
+			_ = errPW.Close()
+		}()
+		*waitOut, *waitErr = sess.Wait(waitCtx)
+		return nil
+	})
 }
 
 // awaitHandshakeOnCaller 在调用方同步协程内驱动提权握手，按需触发同步回调 writeSecret。
@@ -299,7 +345,7 @@ func checkCanSendPassword(req ports.PrivilegeRequest, hasSecret bool, attempts i
 func spawnOutputScanners(
 	n *conc.Nursery,
 	ioCtx context.Context,
-	stdoutPipe, stderrPipe io.Reader,
+	outPR, errPR *io.PipeReader,
 	state *sharedHandshakeState,
 	streams ports.ExecStreams,
 	readersDone chan struct{},
@@ -314,7 +360,8 @@ func spawnOutputScanners(
 	}
 	if err := n.Go(func(context.Context) error {
 		defer doneOne()
-		return newStreamScanner(state, streams.Stdout, hasPTY).pump(ioCtx, stdoutPipe)
+		defer func() { _ = outPR.Close() }()
+		return newStreamScanner(state, streams.Stdout, hasPTY).pump(ioCtx, outPR)
 	}); err != nil {
 		state.markControlDone()
 		close(readersDone)
@@ -322,7 +369,8 @@ func spawnOutputScanners(
 	}
 	if err := n.Go(func(context.Context) error {
 		defer doneOne()
-		return newStreamScanner(state, streams.Stderr, !hasPTY).pump(ioCtx, stderrPipe)
+		defer func() { _ = errPR.Close() }()
+		return newStreamScanner(state, streams.Stderr, !hasPTY).pump(ioCtx, errPR)
 	}); err != nil {
 		state.markControlDone()
 		doneOne()
@@ -370,18 +418,6 @@ func copyPostReadyStdin(ctx context.Context, dst io.WriteCloser, src io.Reader) 
 	}
 }
 
-func claimOutputPipes(sess ports.RemoteSession) (io.Reader, io.Reader, error) {
-	outPipe, err := sess.StdoutPipe()
-	if err != nil {
-		return nil, nil, err
-	}
-	errPipe, err := sess.StderrPipe()
-	if err != nil {
-		return nil, nil, err
-	}
-	return outPipe, errPipe, nil
-}
-
 func buildPostReadyStdin(scriptBody string, hasScript bool, userStdin io.Reader) io.Reader {
 	if !hasScript {
 		return userStdin
@@ -406,49 +442,4 @@ func waitReadersOrCancel(ctx context.Context, readersDone <-chan struct{}) {
 	case <-readersDone:
 	case <-ctx.Done():
 	}
-}
-
-func applyOptionalRequestTimeout(ctx context.Context, req ports.PrivilegeRequest) (context.Context, context.CancelFunc) {
-	if d, ok := req.Timeout().Get(); ok && d.IsPositive() {
-		return context.WithTimeout(ctx, d.Std())
-	}
-	return context.WithCancel(ctx)
-}
-
-func classifyEscalationErr(
-	ctx context.Context,
-	req ports.PrivilegeRequest,
-	state *sharedHandshakeState,
-	sentAttempts int,
-	err error,
-) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
-	}
-	if errors.Is(err, ports.ErrAuthFailed) || errors.Is(err, context.DeadlineExceeded) {
-		return err
-	}
-	if errors.Is(err, errHandshakeEndedBeforeReady) {
-		diag := state.diagText()
-		if sentAttempts > 0 || req.NonInteractive() || isAuthRejectionDiagnostic(diag) {
-			return fmt.Errorf("%w: 提权认证在命令启动前被拒绝", ports.ErrAuthFailed)
-		}
-		return fmt.Errorf("%w: %w", ports.ErrAuthFailed, err)
-	}
-	return err
-}
-
-func applyTruncationOutcome(out execution.ExecutionOutcome, truncated bool) execution.ExecutionOutcome {
-	if !truncated || out == nil {
-		return out
-	}
-	comp, ok := out.(*execution.OutcomeCompleted)
-	if !ok || comp.Truncated() {
-		return out
-	}
-	rebuilt, err := execution.NewOutcomeCompleted(comp.Status(), true)
-	if err != nil {
-		return out
-	}
-	return rebuilt
 }

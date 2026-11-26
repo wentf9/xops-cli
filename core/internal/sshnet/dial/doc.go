@@ -18,8 +18,6 @@ import (
 	"net"
 	"strings"
 
-	"golang.org/x/crypto/ssh"
-
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/keysigner"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -30,14 +28,16 @@ const (
 	defaultTOTPPeriodSecond int64 = 30
 	maxKIChallengeRounds          = 16
 	maxKIQuestionsPerRound        = 32
+	maxKIBannerBytes              = 4096
 )
 
 // DialContextFunc 定义底层流传输拨号函数签名（为空时默认使用 (&net.Dialer{}).DialContext）。
 // 测试夹具可注入回环重定向函数将测试端点映射至进程内 127.0.0.1 SSH 桩，绝不连接外部真实主机。
 type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
-// RemoteFSFactory 为 Phase 4（P4-T2 sshnet/sftp）预留的 SFTP 客户端构造注入点。
-type RemoteFSFactory func(ctx context.Context, client *ssh.Client) (ports.RemoteFSPort, error)
+// RemoteFSFactory 为 Phase 4（P4-T2 sshnet/sftp）预留的 SFTP 客户端构造注入点：
+// 接收 *TransportConn 以便直接复用 OpenSubsystem(ctx, "sftp")、WaitDone 与 lifeNursery/WatchedConn 护栏。
+type RemoteFSFactory func(ctx context.Context, conn *TransportConn) (ports.RemoteFSPort, error)
 
 // KeySignerConfig 与 KeySigner 为 core/internal/sshnet/dial/keysigner 的便捷别名，
 // 供上层装配与测试在不直接感知子包路径时统一构造 ports.KeySignerPort。

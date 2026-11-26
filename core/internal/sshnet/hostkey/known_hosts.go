@@ -273,6 +273,30 @@ func (db *KnownHostsDB) resolveOneTarget(ep netaddr.Endpoint, entry option.PathE
 
 func (db *KnownHostsDB) expandKnownHostsPath(ep netaddr.Endpoint, entry option.PathEntry, raw string) (string, error) {
 	out := raw
+	hasTildePrefix := strings.HasPrefix(out, "~/") || strings.HasPrefix(out, `~\`)
+	// 先对模板部分执行 % 令牌展开，再展开前置 ~/，防止 HomeDir 中含字面 '%' 时被二次误解析。
+	if entry.IsTemplate() {
+		tc := option.TokenContext{
+			TargetHost: ep.Host().String(),
+			Port:       ep.Port(),
+		}
+		if home, ok := db.homeDir.Get(); ok {
+			tc.HomeDir = home.String()
+		}
+		target := out
+		if hasTildePrefix {
+			target = out[2:]
+		}
+		expanded, err := option.ExpandPathTokens(target, tc)
+		if err != nil {
+			return "", fmt.Errorf("%w: 展开 known_hosts 模板 %q 失败: %w", ports.ErrInvalidArgument, raw, err)
+		}
+		if hasTildePrefix {
+			out = "~/" + expanded
+		} else {
+			out = expanded
+		}
+	}
 	if strings.HasPrefix(out, "~/") || strings.HasPrefix(out, `~\`) {
 		home, ok := db.homeDir.Get()
 		if !ok {
@@ -280,43 +304,53 @@ func (db *KnownHostsDB) expandKnownHostsPath(ep netaddr.Endpoint, entry option.P
 		}
 		out = strings.TrimRight(home.String(), `/\`) + "/" + out[2:]
 	}
-	if !entry.IsTemplate() {
-		return out, nil
-	}
-	tc := option.TokenContext{
-		TargetHost: ep.Host().String(),
-		Port:       ep.Port(),
-	}
-	if home, ok := db.homeDir.Get(); ok {
-		tc.HomeDir = home.String()
-	}
-	expanded, err := option.ExpandPathTokens(out, tc)
-	if err != nil {
-		return "", fmt.Errorf("%w: 展开 known_hosts 模板 %q 失败: %w", ports.ErrInvalidArgument, raw, err)
-	}
-	return expanded, nil
+	return out, nil
 }
 
 func collectPreferredAlgorithms(entries []parsedEntry, ep netaddr.Endpoint) []string {
+	revokedBlobs := collectRevokedBlobs(entries, ep)
 	var algos []string
 	for _, e := range entries {
-		if !e.matchesEndpoint(ep) {
-			continue
-		}
-		switch e.marker {
-		case markerCertAuthority:
-			for _, certAlgo := range hostCertPreferredAlgorithms() {
-				if !slices.Contains(algos, certAlgo) {
-					algos = append(algos, certAlgo)
-				}
-			}
-		case markerRegular:
-			if !slices.Contains(algos, e.algorithm) {
-				algos = append(algos, e.algorithm)
-			}
+		if e.matchesEndpoint(ep) {
+			algos = appendEntryPreferredAlgos(algos, e, revokedBlobs)
 		}
 	}
 	return algos
+}
+
+func collectRevokedBlobs(entries []parsedEntry, ep netaddr.Endpoint) [][]byte {
+	var blobs [][]byte
+	for _, e := range entries {
+		if e.marker == markerRevoked && e.matchesEndpoint(ep) {
+			blobs = append(blobs, e.wireBlob)
+		}
+	}
+	return blobs
+}
+
+func appendEntryPreferredAlgos(algos []string, e parsedEntry, revokedBlobs [][]byte) []string {
+	switch e.marker {
+	case markerCertAuthority:
+		for _, certAlgo := range hostCertPreferredAlgorithms() {
+			if !slices.Contains(algos, certAlgo) {
+				algos = append(algos, certAlgo)
+			}
+		}
+	case markerRegular:
+		if !isBlobRevoked(e.wireBlob, revokedBlobs) && !slices.Contains(algos, e.algorithm) {
+			algos = append(algos, e.algorithm)
+		}
+	}
+	return algos
+}
+
+func isBlobRevoked(blob []byte, revokedBlobs [][]byte) bool {
+	for _, rb := range revokedBlobs {
+		if keyBlobEqual(blob, rb) {
+			return true
+		}
+	}
+	return false
 }
 
 func (db *KnownHostsDB) nowFunc() func() time.Time {

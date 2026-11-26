@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -235,6 +236,54 @@ func TestKnownHostsDB_HashedRevokedWildcardsAndIPv6Isolation(t *testing.T) {
 	verifyStatus(tck.MustEndpoint(t, "explicit22.test", 22), keyWild, ports.HostTrustTrusted)
 	verifyStatus(tck.MustEndpoint(t, "explicit22.test", 2222), keyWild, ports.HostTrustUnknown)
 	verifyStatus(tck.MustEndpoint(t, "ca-only.example.test", 22), keyCA, ports.HostTrustUnknown)
+
+	// PreferredAlgorithms 不得包含同时被标记为 @revoked 的密钥算法（评审 #31 m1）。
+	revAlgos, err := db.PreferredAlgorithms(ctx, tck.MustEndpoint(t, "revoked.example.test", 22), option.UnsetKnownHostsList())
+	if err != nil {
+		t.Fatalf("PreferredAlgorithms(revoked): %v", err)
+	}
+	if slices.Contains(revAlgos, keyRev.Algorithm()) {
+		t.Fatalf("被 @revoked 吊销的密钥算法 %q 不应出现在 PreferredAlgorithms 中，实际 %v", keyRev.Algorithm(), revAlgos)
+	}
+}
+
+func TestKnownHostsDB_HomeDirPercentDoesNotCorruptTildeTemplate(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	base, err := pathalg.ParseLocalDir(t.TempDir())
+	if err != nil {
+		t.Fatalf("ParseLocalDir: %v", err)
+	}
+	// HomeDir 含字面 '%' 字符：先展开 %h 再展开 ~/，严禁将 HomeDir 中的 % 误当作令牌解析（评审 #31 m2）。
+	homeWithPct, err := base.JoinComponent("home100%ops")
+	if err != nil {
+		t.Fatalf("JoinComponent: %v", err)
+	}
+	if err := osfs.NewScopedRootFS().EnsureRoot(homeWithPct, 0o700); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	db, err := hostkey.NewKnownHostsDB(hostkey.Config{
+		RootFS:     osfs.NewScopedRootFS(),
+		DefaultDir: homeWithPct,
+		HomeDir:    algebraic.Some(homeWithPct),
+	})
+	if err != nil {
+		t.Fatalf("NewKnownHostsDB: %v", err)
+	}
+	ep := tck.MustEndpoint(t, "pct.example.test", 22)
+	key := makeRealBlobKey(t, "ssh-ed25519", []byte{7, 8, 9, 10}, "")
+	writeRawKnownHosts(t, homeWithPct, "kh_pct.example.test", "pct.example.test "+key.Algorithm()+" "+base64.StdEncoding.EncodeToString(key.WireBlob())+"\n")
+	khList, err := option.ParseKnownHostsList([]string{"~/kh_%h"})
+	if err != nil {
+		t.Fatalf("ParseKnownHostsList: %v", err)
+	}
+	req, _ := ports.NewHostTrustRequest(ports.HostTrustRequestSpec{
+		Endpoint: ep, Presented: key, Mode: option.StrictHostKeyCheckingYes, KnownHosts: khList,
+	})
+	chk, err := db.VerifyHostKey(ctx, req)
+	if err != nil || chk.Status() != ports.HostTrustTrusted {
+		t.Fatalf("含 %% 的 HomeDir 展开 ~/kh_%%h 须成功信任，实际 status=%s err=%v", chk.Status(), err)
+	}
 }
 
 func TestKnownHostsDB_SymlinkRejectedAndDisabledListAndSSHFP(t *testing.T) {

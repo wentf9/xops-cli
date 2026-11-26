@@ -120,7 +120,16 @@ func runTCKWithRemoteFS(t *testing.T) {
 				HostTrust:   db,
 				Agent:       &testSignerPort{signer: signer, pub: pub},
 				DialContext: srv.dialFunc(),
-				OpenRemoteFS: func(context.Context, *ssh.Client) (ports.RemoteFSPort, error) {
+				OpenRemoteFS: func(fCtx context.Context, conn *dial.TransportConn) (ports.RemoteFSPort, error) {
+					if conn == nil || conn.SSHClient() == nil {
+						return nil, ports.ErrClosed
+					}
+					sub, sErr := conn.OpenSubsystem(fCtx, "sftp")
+					if sErr != nil {
+						return nil, sErr
+					}
+					_ = sub.CloseWrite()
+					_ = sub.Close()
 					return sim.NewSimRemoteFS(sim.NewSimClock(sim.DefaultBaseTime())), nil
 				},
 			})

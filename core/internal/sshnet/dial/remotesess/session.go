@@ -256,7 +256,7 @@ func defaultPTYModes() ssh.TerminalModes {
 	}
 }
 
-// ResizePTY 向远端会话发送 RFC 4254 window-change 窗口尺寸更新请求。
+// ResizePTY 在 lifeNursery 监督下向远端会话发送 RFC 4254 window-change 窗口尺寸更新请求（防黑洞阻塞）。
 func (s *Session) ResizePTY(ctx context.Context, size ports.TerminalSize) error {
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -264,16 +264,19 @@ func (s *Session) ResizePTY(ctx context.Context, size ports.TerminalSize) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if s == nil || !s.valid || s.closed.Load() {
+	if s == nil || !s.valid || s.closed.Load() || !s.isAlive() {
 		return ports.ErrClosed
 	}
 	if !size.IsValid() {
 		return ports.ErrInvalidTTYSize
 	}
-	return s.sshSess.WindowChange(int(size.Rows()), int(size.Cols()))
+	_, err := chanconn.RunMultiplexedOp(ctx, s.lifeNursery, func() (struct{}, error) {
+		return struct{}{}, s.sshSess.WindowChange(int(size.Rows()), int(size.Cols()))
+	}, nil)
+	return err
 }
 
-// Signal 向远端进程发送规范化 POSIX 信号（如 "INT"、"TERM"、"KILL"，兼容可选 "SIG" 前缀）。
+// Signal 在 lifeNursery 监督下向远端进程发送规范化 POSIX 信号（如 "INT"、"TERM"、"KILL"，兼容可选 "SIG" 前缀）。
 func (s *Session) Signal(ctx context.Context, signal string) error {
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -281,14 +284,17 @@ func (s *Session) Signal(ctx context.Context, signal string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if s == nil || !s.valid || s.closed.Load() {
+	if s == nil || !s.valid || s.closed.Load() || !s.isAlive() {
 		return ports.ErrClosed
 	}
 	norm := strings.TrimPrefix(strings.ToUpper(strings.TrimSpace(signal)), "SIG")
 	if norm == "" {
 		return ports.ErrInvalidArgument
 	}
-	return s.sshSess.Signal(ssh.Signal(norm))
+	_, err := chanconn.RunMultiplexedOp(ctx, s.lifeNursery, func() (struct{}, error) {
+		return struct{}{}, s.sshSess.Signal(ssh.Signal(norm))
+	}, nil)
+	return err
 }
 
 // Wait 在上游连接 lifeNursery 监督下等待远端进程退出、排空输出泵并映射为封闭 execution.ExecutionOutcome。

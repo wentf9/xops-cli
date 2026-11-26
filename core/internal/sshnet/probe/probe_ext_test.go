@@ -404,7 +404,7 @@ func testProbePowerShell(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	_, conn := newProbeSSHConn(t, func(cmd string) probeReply {
 		if strings.Contains(cmd, "__XOPS_DIALECT_POWERSHELL__") {
-			return probeReply{stdout: "__XOPS_DIALECT_POWERSHELL__:7.4.2\n__XOPS_PLATFORM__:Unix\n"}
+			return probeReply{stdout: "__XOPS_DIALECT_POWERSHELL__:7.5.0-preview.3\n__XOPS_PLATFORM__:Unix\n"}
 		}
 		if strings.Contains(cmd, "__XOPS_INTERP_END__") {
 			return probeReply{stdout: "__XOPS_INTERP__:pwsh\n__XOPS_INTERP__:bash\n__XOPS_INTERP_END__\n"}

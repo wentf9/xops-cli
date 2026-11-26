@@ -94,9 +94,13 @@ func (s *Session) startOutputPumps(targets []outputPumpTarget, maxOutputBytes ui
 			close(done)
 		}
 	}
-	for _, tgt := range targets {
+	for i, tgt := range targets {
 		if err := s.spawnOutputPump(tgt.dst, tgt.src, maxOutputBytes, &budget, finishOne); err != nil {
-			return err
+			// 为当前及后续尚未启动的输出泵补齐计数递减，确保 pumpsDone 立即关闭，避免 Close() 无谓空等。
+			for j := i; j < len(targets); j++ {
+				finishOne(ports.ErrClosed)
+			}
+			return ports.ErrClosed
 		}
 	}
 	return nil
@@ -117,7 +121,6 @@ func (s *Session) spawnOutputPump(
 		finishOne(err)
 		return nil
 	}); err != nil {
-		finishOne(ports.ErrClosed)
 		return ports.ErrClosed
 	}
 	return nil

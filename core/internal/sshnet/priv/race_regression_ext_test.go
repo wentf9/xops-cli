@@ -7,11 +7,13 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.uber.org/goleak"
 
+	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -27,8 +29,8 @@ type readStep struct {
 	onReturned func()
 }
 
-// gatedStepReader 按预设确定性步骤向扫描器交付字节（零 time.Sleep、零后台协程），
-// 用于在单元测试中 100% 复现跨流 EOF 与大输出并发交错时序。
+// gatedStepReader 按预设确定性步骤交付字节（零 time.Sleep、零裸 go），
+// 用于在单元测试中 100% 复现跨流 EOF、大输出与混淆代理并发交错时序。
 type gatedStepReader struct {
 	steps    []readStep
 	idx      int
@@ -122,14 +124,17 @@ func (p *recordStdinPipe) snapshot() string {
 }
 
 type scriptedSession struct {
-	stdin    *recordStdinPipe
-	stdout   io.Reader
-	stderr   io.Reader
-	buildFn  func(renderedCmd string, closedCh <-chan struct{}) (stdout, stderr io.Reader)
-	exitCode int32
+	stdin        *recordStdinPipe
+	buildFn      func(renderedCmd string, closedCh <-chan struct{}) (stdout, stderr io.Reader)
+	exitCode     int32
+	blackhole    bool
+	seenRendered string
 
-	closeOnce sync.Once
-	closedCh  chan struct{}
+	nursery     *conc.Nursery
+	pumpsDone   chan struct{}
+	closeOnce   sync.Once
+	releaseOnce sync.Once
+	closedCh    chan struct{}
 }
 
 type scriptedOpener struct {
@@ -142,29 +147,51 @@ func (o *scriptedOpener) OpenSession(context.Context) (ports.RemoteSession, erro
 
 func newScriptedSession(exitCode int32, buildFn func(renderedCmd string, closedCh <-chan struct{}) (io.Reader, io.Reader)) *scriptedSession {
 	return &scriptedSession{
-		stdin:    newRecordStdinPipe(),
-		buildFn:  buildFn,
-		exitCode: exitCode,
-		closedCh: make(chan struct{}),
+		stdin:     newRecordStdinPipe(),
+		buildFn:   buildFn,
+		exitCode:  exitCode,
+		pumpsDone: make(chan struct{}),
+		closedCh:  make(chan struct{}),
 	}
 }
 
 func (s *scriptedSession) StdinPipe() (io.WriteCloser, error) { return s.stdin, nil }
+func (s *scriptedSession) StdoutPipe() (io.Reader, error)     { return nil, ports.ErrUnsupported }
+func (s *scriptedSession) StderrPipe() (io.Reader, error)     { return nil, ports.ErrUnsupported }
 
-func (s *scriptedSession) StdoutPipe() (io.Reader, error) {
-	return &deferredReader{get: func() io.Reader { return s.stdout }}, nil
-}
-
-func (s *scriptedSession) StderrPipe() (io.Reader, error) {
-	return &deferredReader{get: func() io.Reader { return s.stderr }}, nil
-}
-
-func (s *scriptedSession) Start(_ context.Context, cmd execution.CommandPlan, _ ports.ExecStreams) error {
+func (s *scriptedSession) Start(_ context.Context, cmd execution.CommandPlan, streams ports.ExecStreams) error {
 	rendered, err := cmd.RenderCommand()
 	if err != nil {
 		return err
 	}
-	s.stdout, s.stderr = s.buildFn(rendered, s.closedCh)
+	s.seenRendered = rendered
+	outR, errR := s.buildFn(rendered, s.closedCh)
+	n, err := conc.NewNursery(context.Background())
+	if err != nil {
+		return err
+	}
+	s.nursery = n
+	var rem atomic.Int32
+	rem.Store(2)
+	doneOne := func() {
+		if rem.Add(-1) == 0 {
+			close(s.pumpsDone)
+		}
+	}
+	_ = n.Go(func(context.Context) error {
+		defer doneOne()
+		if streams.Stdout != nil && outR != nil {
+			_, _ = io.Copy(streams.Stdout, outR)
+		}
+		return nil
+	})
+	_ = n.Go(func(context.Context) error {
+		defer doneOne()
+		if streams.Stderr != nil && errR != nil {
+			_, _ = io.Copy(streams.Stderr, errR)
+		}
+		return nil
+	})
 	return nil
 }
 
@@ -174,24 +201,38 @@ func (*scriptedSession) StartShell(context.Context, ports.ExecStreams) error {
 func (*scriptedSession) ResizePTY(context.Context, ports.TerminalSize) error { return nil }
 func (*scriptedSession) Signal(context.Context, string) error                { return nil }
 
-func (s *scriptedSession) Wait(context.Context) (execution.ExecutionOutcome, error) {
-	return execution.NewOutcomeCompleted(execution.NewExitCode(s.exitCode), false)
+func (s *scriptedSession) Wait(ctx context.Context) (execution.ExecutionOutcome, error) {
+	select {
+	case <-s.pumpsDone:
+		return execution.NewOutcomeCompleted(execution.NewExitCode(s.exitCode), false)
+	case <-ctx.Done():
+		phase := execution.ExecPhaseCanceled
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			phase = execution.ExecPhaseTimedOut
+		}
+		out, _ := execution.NewOutcomeUnknown(phase, "scripted_wait_canceled", ctx.Err().Error())
+		return out, ctx.Err()
+	}
 }
 
 func (s *scriptedSession) Close() error {
 	s.closeOnce.Do(func() {
-		close(s.closedCh)
 		_ = s.stdin.Close()
+		if !s.blackhole {
+			s.releaseOnce.Do(func() { close(s.closedCh) })
+			if s.nursery != nil {
+				_ = s.nursery.Close()
+			}
+		}
 	})
 	return nil
 }
 
-type deferredReader struct {
-	get func() io.Reader
-}
-
-func (d *deferredReader) Read(p []byte) (int, error) {
-	return d.get().Read(p)
+func (s *scriptedSession) releaseBlackhole() {
+	s.releaseOnce.Do(func() { close(s.closedCh) })
+	if s.nursery != nil {
+		_ = s.nursery.Close()
+	}
 }
 
 func TestEscalator_CrossStreamEOFOrdering_Deterministic(t *testing.T) {
@@ -414,7 +455,7 @@ func testScriptStdinOrderAndStdoutRace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("脚本提权跨流时序失败: %v", err)
 	}
-	if !strings.HasPrefix(preReadyStdin, "pw-script\n") {
+	if preReadyStdin != "pw-script\n" {
 		t.Fatalf("就绪前 stdin 须仅包含提权口令，实际 %q", preReadyStdin)
 	}
 	if gotStdin := sess.stdin.snapshot(); gotStdin != "pw-script\nSCRIPT_BODY;USER_DATA" {

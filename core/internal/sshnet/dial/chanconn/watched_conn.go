@@ -119,7 +119,9 @@ func (c *WatchedConn) startBackgroundWorkers(reqs <-chan *ssh.Request) error {
 	}
 	if err := c.lifeNursery.Go(func(context.Context) error {
 		defer doneOne()
-		_, _ = io.Copy(io.Discard, c.ch.Stderr())
+		if stderr := c.ch.Stderr(); stderr != nil {
+			_, _ = io.Copy(io.Discard, stderr)
+		}
 		return nil
 	}); err != nil {
 		doneOne()
@@ -428,7 +430,7 @@ func (c *WatchedConn) RemoteAddr() net.Addr { return c.remoteAddr }
 // SetDeadline 原子更新读写截止时间并通知 O(1) 看门狗；无活跃 I/O 时绝不提前销毁通道。
 func (c *WatchedConn) SetDeadline(t time.Time) error {
 	if c == nil || !c.valid || c.closed.Load() {
-		return ports.ErrClosed
+		return errors.Join(net.ErrClosed, ports.ErrClosed)
 	}
 	c.mu.Lock()
 	c.readDeadline = t
@@ -441,7 +443,7 @@ func (c *WatchedConn) SetDeadline(t time.Time) error {
 // SetReadDeadline 原子更新读截止时间并通知 O(1) 看门狗；清除或延长截止时立即取消旧到期判断。
 func (c *WatchedConn) SetReadDeadline(t time.Time) error {
 	if c == nil || !c.valid || c.closed.Load() {
-		return ports.ErrClosed
+		return errors.Join(net.ErrClosed, ports.ErrClosed)
 	}
 	c.mu.Lock()
 	c.readDeadline = t
@@ -453,7 +455,7 @@ func (c *WatchedConn) SetReadDeadline(t time.Time) error {
 // SetWriteDeadline 原子更新写截止时间并通知 O(1) 看门狗；清除或延长截止时立即取消旧到期判断。
 func (c *WatchedConn) SetWriteDeadline(t time.Time) error {
 	if c == nil || !c.valid || c.closed.Load() {
-		return ports.ErrClosed
+		return errors.Join(net.ErrClosed, ports.ErrClosed)
 	}
 	c.mu.Lock()
 	c.writeDeadline = t
