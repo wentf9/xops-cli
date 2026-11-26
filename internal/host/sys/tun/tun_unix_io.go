@@ -51,28 +51,42 @@ func (c *unixTUNConn) Read(p []byte) (int, error) {
 	}
 	c.ioMu.RLock()
 	defer c.ioMu.RUnlock()
-	if c.closed.Load() {
-		return 0, ports.ErrClosed
+	for {
+		if c.closed.Load() {
+			return 0, ports.ErrClosed
+		}
+		if err := c.waitReady(unix.POLLIN); err != nil {
+			return 0, err
+		}
+		n, retry, err := c.readOnce(p)
+		if retry {
+			continue
+		}
+		return n, err
 	}
-	if err := c.waitReady(unix.POLLIN); err != nil {
-		return 0, err
-	}
-	if c.stripAFHeader {
-		return c.readStripAF(p)
-	}
-	return readNonBlockFD(c.fd, p)
 }
 
-func (c *unixTUNConn) readStripAF(p []byte) (int, error) {
-	buf := make([]byte, len(p)+darwinAFHeaderBytes)
-	n, err := readNonBlockFD(c.fd, buf)
-	if err != nil {
-		return 0, err
+func (c *unixTUNConn) readOnce(p []byte) (int, bool, error) {
+	if c.stripAFHeader {
+		buf := make([]byte, len(p)+darwinAFHeaderBytes)
+		n, err := readNonBlockFD(c.fd, buf)
+		if isUnixWouldBlock(err) {
+			return 0, true, nil
+		}
+		if err != nil {
+			return 0, false, err
+		}
+		if n <= darwinAFHeaderBytes {
+			// 丢弃仅有 AF 头的残缺帧并继续等待下一有效帧，避免返回 (0, nil) 违反 io.Reader 契约。
+			return 0, true, nil
+		}
+		return copy(p, buf[darwinAFHeaderBytes:n]), false, nil
 	}
-	if n <= darwinAFHeaderBytes {
-		return 0, nil
+	n, err := readNonBlockFD(c.fd, p)
+	if isUnixWouldBlock(err) {
+		return 0, true, nil
 	}
-	return copy(p, buf[darwinAFHeaderBytes:n]), nil
+	return n, false, err
 }
 
 func (c *unixTUNConn) Write(p []byte) (int, error) {
@@ -81,31 +95,51 @@ func (c *unixTUNConn) Write(p []byte) (int, error) {
 	}
 	c.ioMu.RLock()
 	defer c.ioMu.RUnlock()
-	if c.closed.Load() {
-		return 0, ports.ErrClosed
-	}
-	payload := p
-	if c.stripAFHeader {
-		framed, err := prependDarwinAFHeader(p)
-		if err != nil {
-			return 0, err
-		}
-		payload = framed
-	}
-	if err := c.waitReady(unix.POLLOUT); err != nil {
-		return 0, err
-	}
-	n, err := writeNonBlockFD(c.fd, payload)
+	payload, err := c.prepareWritePayload(p)
 	if err != nil {
 		return 0, err
 	}
-	if c.stripAFHeader {
-		if n <= darwinAFHeaderBytes {
-			return 0, io.ErrShortWrite
+	for {
+		if c.closed.Load() {
+			return 0, ports.ErrClosed
 		}
-		return n - darwinAFHeaderBytes, nil
+		if err := c.waitReady(unix.POLLOUT); err != nil {
+			return 0, err
+		}
+		n, retry, err := c.writeOnce(payload)
+		if retry {
+			continue
+		}
+		return n, err
 	}
-	return n, nil
+}
+
+func (c *unixTUNConn) prepareWritePayload(p []byte) ([]byte, error) {
+	if !c.stripAFHeader {
+		return p, nil
+	}
+	return prependDarwinAFHeader(p)
+}
+
+func (c *unixTUNConn) writeOnce(payload []byte) (int, bool, error) {
+	n, err := writeNonBlockFD(c.fd, payload)
+	if isUnixWouldBlock(err) {
+		return 0, true, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if !c.stripAFHeader {
+		return n, false, nil
+	}
+	if n <= darwinAFHeaderBytes {
+		return 0, false, io.ErrShortWrite
+	}
+	return n - darwinAFHeaderBytes, false, nil
+}
+
+func isUnixWouldBlock(err error) bool {
+	return errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)
 }
 
 func (c *unixTUNConn) Close() error {

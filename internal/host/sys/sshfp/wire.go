@@ -69,7 +69,7 @@ func encodeDNSName(name string) ([]byte, error) {
 	return out, nil
 }
 
-func parseDNSResponse(raw []byte, wantID uint16) (parsedDNSMessage, error) {
+func parseDNSResponse(raw []byte, wantID uint16, wantQName string) (parsedDNSMessage, error) {
 	if len(raw) < dnsHeaderBytes {
 		return parsedDNSMessage{}, fmt.Errorf("%w: DNS 应答长度不足 12 字节", ports.ErrCorruptData)
 	}
@@ -90,7 +90,7 @@ func parseDNSResponse(raw []byte, wantID uint16) (parsedDNSMessage, error) {
 	if msg.truncated {
 		return msg, nil
 	}
-	off, err := skipDNSQuestions(raw, dnsHeaderBytes, qdCount)
+	off, err := verifyDNSQuestion(raw, dnsHeaderBytes, qdCount, wantQName)
 	if err != nil {
 		return parsedDNSMessage{}, err
 	}
@@ -102,18 +102,25 @@ func parseDNSResponse(raw []byte, wantID uint16) (parsedDNSMessage, error) {
 	return msg, nil
 }
 
-func skipDNSQuestions(raw []byte, off, count int) (int, error) {
-	for range count {
-		next, _, err := decodeDNSName(raw, off)
-		if err != nil {
-			return 0, err
-		}
-		if next+4 > len(raw) {
-			return 0, fmt.Errorf("%w: DNS Question 段截断", ports.ErrCorruptData)
-		}
-		off = next + 4
+// verifyDNSQuestion 按 RFC 5452 §9.1 核验 QDCOUNT==1 且响应 Question 的 (QNAME, QTYPE, QCLASS) 与请求一致。
+func verifyDNSQuestion(raw []byte, off, count int, wantQName string) (int, error) {
+	if count != 1 {
+		return 0, fmt.Errorf("%w: DNS 应答 QDCOUNT=%d 不等于 1", ports.ErrCorruptData, count)
 	}
-	return off, nil
+	next, gotName, err := decodeDNSName(raw, off)
+	if err != nil {
+		return 0, err
+	}
+	if next+4 > len(raw) {
+		return 0, fmt.Errorf("%w: DNS Question 段截断", ports.ErrCorruptData)
+	}
+	qtype := binary.BigEndian.Uint16(raw[next : next+2])
+	qclass := binary.BigEndian.Uint16(raw[next+2 : next+4])
+	want := strings.ToLower(strings.TrimSuffix(wantQName, "."))
+	if gotName != want || qtype != dnsTypeSSHFP || qclass != dnsClassIN {
+		return 0, fmt.Errorf("%w: DNS Question 段 (%q, %d, %d) 与查询不匹配", ports.ErrCorruptData, gotName, qtype, qclass)
+	}
+	return next + 4, nil
 }
 
 func parseDNSAnswers(raw []byte, off, count int) ([]parsedDNSRecord, error) {
@@ -135,9 +142,9 @@ func parseDNSAnswers(raw []byte, off, count int) ([]parsedDNSRecord, error) {
 		}
 		rdata := raw[dataStart : dataStart+rdLen]
 		if rtype == dnsTypeCNAME {
-			_, target, cErr := decodeDNSName(raw, dataStart)
-			if cErr != nil {
-				return nil, cErr
+			cEnd, target, cErr := decodeDNSName(raw, dataStart)
+			if cErr != nil || cEnd != dataStart+rdLen {
+				return nil, fmt.Errorf("%w: DNS CNAME RDATA 长度或名称边界非法", ports.ErrCorruptData)
 			}
 			rdata = []byte(target)
 		}
@@ -154,7 +161,7 @@ func parseDNSAnswers(raw []byte, off, count int) ([]parsedDNSRecord, error) {
 
 func decodeDNSName(raw []byte, start int) (nextOff int, name string, err error) {
 	var labels []string
-	cur, jumped, jumps := start, false, 0
+	cur, jumped, jumps, octets := start, false, 0, 1
 	for {
 		if cur >= len(raw) {
 			return 0, "", fmt.Errorf("%w: DNS 名称解码越界", ports.ErrCorruptData)
@@ -173,6 +180,10 @@ func decodeDNSName(raw []byte, start int) (nextOff int, name string, err error) 
 		label, nextCur, lErr := readDNSLabel(raw, cur, length)
 		if lErr != nil {
 			return 0, "", lErr
+		}
+		octets += 1 + length
+		if octets > 255 {
+			return 0, "", fmt.Errorf("%w: DNS 解码域名超过 RFC 1035 255 字节上限", ports.ErrCorruptData)
 		}
 		labels = append(labels, label)
 		cur = nextCur
@@ -229,6 +240,9 @@ func extractSSHFPRecords(msg parsedDNSMessage, qname string, authenticated bool)
 		}
 		seen[next] = true
 		target = next
+	}
+	if _, stillCNAME := findCNAMETarget(msg.answers, target); stillCNAME {
+		return nil, fmt.Errorf("%w: DNS CNAME 链超过最大跳数上限 %d", ports.ErrCorruptData, maxCNAMEHops)
 	}
 	var out []ports.SSHFPRecord
 	for _, rr := range msg.answers {

@@ -142,8 +142,11 @@ func (l *SystemLookup) queryServers(ctx context.Context, cfg dnsSystemConfig, tx
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		msg, err := l.exchangeServer(ctx, srv, txid, query)
+		msg, err := l.exchangeServer(ctx, srv, txid, qname, query)
 		if err != nil {
+			if cErr := ctx.Err(); cErr != nil {
+				return nil, cErr
+			}
 			lastErr = err
 			continue
 		}
@@ -162,7 +165,7 @@ func (l *SystemLookup) queryServers(ctx context.Context, cfg dnsSystemConfig, tx
 	return nil, lastErr
 }
 
-func (l *SystemLookup) exchangeServer(ctx context.Context, server string, txid uint16, query []byte) (parsedDNSMessage, error) {
+func (l *SystemLookup) exchangeServer(ctx context.Context, server string, txid uint16, qname string, query []byte) (parsedDNSMessage, error) {
 	tryCtx, cancel := context.WithTimeout(ctx, l.perTryWait)
 	defer cancel()
 
@@ -170,7 +173,7 @@ func (l *SystemLookup) exchangeServer(ctx context.Context, server string, txid u
 	if err != nil {
 		return parsedDNSMessage{}, err
 	}
-	msg, err := parseDNSResponse(rawUDP, txid)
+	msg, err := parseDNSResponse(rawUDP, txid, qname)
 	if err != nil {
 		return parsedDNSMessage{}, err
 	}
@@ -181,7 +184,7 @@ func (l *SystemLookup) exchangeServer(ctx context.Context, server string, txid u
 	if err != nil {
 		return parsedDNSMessage{}, err
 	}
-	return parseDNSResponse(rawTCP, txid)
+	return parseDNSResponse(rawTCP, txid, qname)
 }
 
 func exchangeUDP(ctx context.Context, server string, query []byte) ([]byte, error) {
@@ -191,14 +194,16 @@ func exchangeUDP(ctx context.Context, server string, query []byte) ([]byte, erro
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	applyConnDeadline(ctx, conn)
 	if _, err := conn.Write(query); err != nil {
-		return nil, err
+		return nil, mapCancelOrErr(ctx, err)
 	}
 	buf := make([]byte, dnsEDNSUDPPayload+64)
 	n, err := conn.Read(buf)
 	if err != nil {
-		return nil, err
+		return nil, mapCancelOrErr(ctx, err)
 	}
 	return buf[:n], nil
 }
@@ -210,17 +215,19 @@ func exchangeTCP(ctx context.Context, server string, query []byte) ([]byte, erro
 		return nil, err
 	}
 	defer func() { _ = conn.Close() }()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	applyConnDeadline(ctx, conn)
 
 	frame := make([]byte, 2+len(query))
 	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
 	copy(frame[2:], query)
 	if _, err := conn.Write(frame); err != nil {
-		return nil, err
+		return nil, mapCancelOrErr(ctx, err)
 	}
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		return nil, err
+		return nil, mapCancelOrErr(ctx, err)
 	}
 	respLen := int(binary.BigEndian.Uint16(lenBuf[:]))
 	if respLen < dnsHeaderBytes || respLen > maxDNSTCPMessageLen {
@@ -228,9 +235,16 @@ func exchangeTCP(ctx context.Context, server string, query []byte) ([]byte, erro
 	}
 	resp := make([]byte, respLen)
 	if _, err := io.ReadFull(conn, resp); err != nil {
-		return nil, err
+		return nil, mapCancelOrErr(ctx, err)
 	}
 	return resp, nil
+}
+
+func mapCancelOrErr(ctx context.Context, err error) error {
+	if cErr := ctx.Err(); cErr != nil {
+		return cErr
+	}
+	return err
 }
 
 func applyConnDeadline(ctx context.Context, conn net.Conn) {

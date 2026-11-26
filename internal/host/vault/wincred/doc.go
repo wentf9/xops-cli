@@ -7,6 +7,7 @@ package wincred
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -88,12 +89,16 @@ func (s *Store) PutAndVerify(
 	if err := s.backend.Write(target, ref.Item(), box); err != nil {
 		return err
 	}
-	return s.WithSecret(ctx, ref, func(got *secret.SecretBox) error {
+	verifyErr := s.WithSecret(ctx, ref, func(got *secret.SecretBox) error {
 		if !got.Equal(box) {
 			return ports.ErrSecretVerifyFailed
 		}
 		return nil
 	})
+	if verifyErr != nil && !errors.Is(verifyErr, ports.ErrSecretVerifyFailed) && ctx.Err() == nil {
+		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, verifyErr)
+	}
+	return verifyErr
 }
 
 // Delete 删除目标凭据；目标不存在时返回 ports.ErrSecretNotFound。

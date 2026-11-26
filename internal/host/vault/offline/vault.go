@@ -151,21 +151,26 @@ func (v *Vault) Unlock(
 	}
 	v.mu.Lock()
 	v.aead = dataAEAD
+	v.storeNames = slices.Clone(meta.stores)
 	v.mu.Unlock()
 	return nil
 }
 
-// Lock 清空内存中的 AEAD 解锁句柄并进入锁定态；尚未初始化时返回 ports.ErrNotFound。
+// Lock 无条件清空内存中的 AEAD 解锁句柄并进入锁定态；若本就处于未解锁态且磁盘尚未初始化则返回 ports.ErrNotFound。
 func (v *Vault) Lock(ctx context.Context) error {
 	if err := v.checkControlArgs(ctx, nil, false); err != nil {
 		return err
 	}
+	v.mu.Lock()
+	wasUnlocked := v.aead != nil
+	v.aead = nil
+	v.mu.Unlock()
+	if wasUnlocked {
+		return nil
+	}
 	if _, err := v.loadMeta(ctx); err != nil {
 		return err
 	}
-	v.mu.Lock()
-	v.aead = nil
-	v.mu.Unlock()
 	return nil
 }
 
@@ -177,11 +182,12 @@ func (v *Vault) Status(ctx context.Context) (ports.VaultStatus, error) {
 	}
 	v.mu.RLock()
 	unlocked := v.aead != nil
+	stores := slices.Clone(v.storeNames)
 	v.mu.RUnlock()
 	if unlocked {
 		return ports.NewVaultStatus(ports.VaultStatusSpec{
 			State:       ports.VaultStateUnlocked,
-			KnownStores: v.storeNames,
+			KnownStores: stores,
 			Detail:      "offline-xchacha20poly1305",
 		})
 	}
@@ -189,7 +195,7 @@ func (v *Vault) Status(ctx context.Context) (ports.VaultStatus, error) {
 	if errors.Is(err, ports.ErrNotFound) {
 		return ports.NewVaultStatus(ports.VaultStatusSpec{
 			State:       ports.VaultStateUninitialized,
-			KnownStores: v.storeNames,
+			KnownStores: stores,
 			Detail:      "offline-xchacha20poly1305",
 		})
 	}
@@ -263,6 +269,7 @@ func (v *Vault) PutAndVerify(
 }
 
 // Delete 在旁路独占锁保护下删除指定凭据密文条目；条目缺失返回 ports.ErrSecretNotFound。
+// 注意：严禁删除可复用的 <item>.enc.lock 旁路锁文件，否则在 Unix 上会破坏多进程 flock inode 互斥语义。
 func (v *Vault) Delete(ctx context.Context, ref secret.Ref) error {
 	if err := v.checkSecretArgs(ctx, ref); err != nil {
 		return err
@@ -274,28 +281,19 @@ func (v *Vault) Delete(ctx context.Context, ref secret.Ref) error {
 	if err != nil {
 		return err
 	}
-	lockDest, err := osfs.SidecarLockDest(itemDest)
-	if err != nil {
-		return err
-	}
 	return v.fs.WithRoot(v.rootDir, func(root ports.RootHandle) error {
 		if _, sErr := root.Stat(itemDest); errors.Is(sErr, ports.ErrNotFound) {
 			return ports.ErrSecretNotFound
 		} else if sErr != nil {
 			return sErr
 		}
-		if err := osfs.WithSidecarLock(ctx, root, itemDest, ports.LockExclusive, vaultFilePerm, func(ports.LockedFile) error {
+		return osfs.WithSidecarLock(ctx, root, itemDest, ports.LockExclusive, vaultFilePerm, func(ports.LockedFile) error {
 			rmErr := root.Remove(itemDest)
 			if errors.Is(rmErr, ports.ErrNotFound) {
 				return ports.ErrSecretNotFound
 			}
 			return rmErr
-		}); err != nil {
-			return err
-		}
-		// 解锁后按 Windows 安全顺序（持独占锁截断刷盘 -> 解锁关闭 -> Remove）回收旁路锁文件。
-		_, _ = osfs.RemoveLockedFileSafely(root, lockDest)
-		return nil
+		})
 	})
 }
 

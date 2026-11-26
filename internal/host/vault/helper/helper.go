@@ -41,9 +41,9 @@ type HelperVault struct {
 }
 
 type helperResponse struct {
-	SecretB64 string `json:"secret_b64,omitzero"`
-	Code      string `json:"code,omitzero"`
-	Message   string `json:"message,omitzero"`
+	SecretB64 *string `json:"secret_b64,omitzero"`
+	Code      string  `json:"code,omitzero"`
+	Message   string  `json:"message,omitzero"`
 }
 
 // NewHelperVault 校验 ProcessPort 与子进程执行规格并构造外部凭据助手适配器。
@@ -118,12 +118,16 @@ func (v *HelperVault) PutAndVerify(
 	if err := v.execStore(ctx, ref, box); err != nil {
 		return err
 	}
-	return v.WithSecret(ctx, ref, func(got *secret.SecretBox) error {
+	verifyErr := v.WithSecret(ctx, ref, func(got *secret.SecretBox) error {
 		if !got.Equal(box) {
 			return ports.ErrSecretVerifyFailed
 		}
 		return nil
 	})
+	if verifyErr != nil && !errors.Is(verifyErr, ports.ErrSecretVerifyFailed) && ctx.Err() == nil {
+		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, verifyErr)
+	}
+	return verifyErr
 }
 
 func (v *HelperVault) execStore(
@@ -135,14 +139,14 @@ func (v *HelperVault) execStore(
 	prefix := `{"protocol_version":2,"non_interactive":true,"action":"store","store":"` + ref.Store() + `","item":"` + ref.Item() + `","secret_b64":"`
 	var res ports.ProcessResult
 	err := box.Use(func(plain []byte) error {
-		// store 与 item 已由 secret.Ref 校验为纯 ASCII 安全标识符，base64 仅含 [A-Za-z0-9+/=]，
-		// 直接拼装至局部切片可完全规避 JSON 序列化汇点并在作用域退出前 clear 零化。
-		b64 := base64.StdEncoding.EncodeToString(plain)
-		payload := make([]byte, len(prefix)+len(b64)+2)
+		// store 与 item 已由 secret.Ref 校验为纯 ASCII 安全标识符，base64 直接写入可清零局部切片，
+		// 避免构造不可零化的 Go string 副本并规避 JSON 序列化汇点。
+		b64Len := base64.StdEncoding.EncodedLen(len(plain))
+		payload := make([]byte, len(prefix)+b64Len+2)
 		defer clear(payload)
 		copy(payload, prefix)
-		copy(payload[len(prefix):], b64)
-		copy(payload[len(prefix)+len(b64):], `"}`)
+		base64.StdEncoding.Encode(payload[len(prefix):len(prefix)+b64Len], plain)
+		copy(payload[len(prefix)+b64Len:], `"}`)
 		var runErr error
 		res, runErr = v.proc.Run(ctx, v.baseSpec, bytes.NewReader(payload))
 		return runErr
@@ -208,10 +212,10 @@ func decodeSecretResponse(res ports.ProcessResult) ([]byte, error) {
 	if !res.Succeeded() {
 		return nil, fmt.Errorf("%w: 外部凭据助手非零退出", ports.ErrUnsupported)
 	}
-	if resp.SecretB64 == "" {
+	if resp.SecretB64 == nil {
 		return nil, ports.ErrSecretNotFound
 	}
-	raw, err := base64.StdEncoding.DecodeString(resp.SecretB64)
+	raw, err := base64.StdEncoding.DecodeString(*resp.SecretB64)
 	if err != nil {
 		return nil, fmt.Errorf("%w: 凭据载荷 Base64 解码失败", ErrProtocol)
 	}
@@ -219,7 +223,9 @@ func decodeSecretResponse(res ports.ProcessResult) ([]byte, error) {
 }
 
 func checkStatusResponse(res ports.ProcessResult) error {
-	out := bytes.TrimSpace(res.Stdout())
+	rawOut := res.Stdout()
+	defer clear(rawOut)
+	out := bytes.TrimSpace(rawOut)
 	if len(out) == 0 {
 		if res.Succeeded() {
 			return nil
@@ -243,7 +249,9 @@ func parseHelperResponse(res ports.ProcessResult) (helperResponse, error) {
 	if !res.IsValid() || res.Truncated() {
 		return helperResponse{}, fmt.Errorf("%w: 助手输出无效或超过大小上限", ErrProtocol)
 	}
-	out := bytes.TrimSpace(res.Stdout())
+	rawOut := res.Stdout()
+	defer clear(rawOut)
+	out := bytes.TrimSpace(rawOut)
 	if len(out) == 0 {
 		return helperResponse{}, fmt.Errorf("%w: 助手返回空响应", ErrProtocol)
 	}

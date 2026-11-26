@@ -25,7 +25,7 @@ var (
 
 type fakeBlockMode struct{}
 
-func (fakeBlockMode) BlockSize() int          { return 16 }
+func (fakeBlockMode) BlockSize() int              { return 16 }
 func (fakeBlockMode) CryptBlocks(dst, src []byte) {}
 
 func okSecretServiceDHAndPlain(ctx context.Context, obj dbus.BusObject, concrete *dbus.Object, sess dbus.ObjectPath, aesKey, iv []byte, props map[string]dbus.Variant, box *secret.SecretBox) ([]byte, error) {
@@ -60,27 +60,27 @@ func badSecretServiceViolations(ctx context.Context, obj dbus.BusObject, dynMeth
 	var evil cipher.BlockMode = fakeBlockMode{}
 	_ = box.Use(func(plain []byte) error {
 		// 反例 1：全局 dbusSecret 与非 Value 字段写入必须拒绝
-		globalDBusSecret.Value = plain // want "禁止将明文机密存入结构体或非字节切片容器字面量"
+		globalDBusSecret.Value = plain                           // want "禁止将明文机密存入结构体或非字节切片容器字面量"
 		localBad := dbusSecret{Session: sess, Parameters: plain} // want "禁止将明文机密存入结构体或非字节切片容器字面量"
 		_ = localBad
 
 		// 反例 2：非常量或未授权 D-Bus 方法、非 dbusSecret 参数必须拒绝
 		sec := dbusSecret{Session: sess, Value: plain}
-		_ = obj.CallWithContext(ctx, dynMethod, 0, props, sec, true)                   // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
-		_ = obj.CallWithContext(ctx, "org.freedesktop.DBus.ListNames", 0, sec)         // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_ = obj.CallWithContext(ctx, dynMethod, 0, props, sec, true)                                                // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		_ = obj.CallWithContext(ctx, "org.freedesktop.DBus.ListNames", 0, sec)                                      // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 		_ = obj.CallWithContext(ctx, "org.freedesktop.Secret.Collection.CreateItem", 0, props, string(plain), true) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 
 		// 反例 3：CBC 解密器/伪造 BlockMode/外层 dst/原地覆盖 dst/染毒 IV 必须拒绝
 		localDst := make([]byte, len(plain))
-		dec.CryptBlocks(localDst, plain)        // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
-		evil.CryptBlocks(localDst, plain)       // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
-		enc.CryptBlocks(leakedCipherBuf, plain) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
-		enc.CryptBlocks(plain, plain)           // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		dec.CryptBlocks(localDst, plain)         // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		evil.CryptBlocks(localDst, plain)        // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		enc.CryptBlocks(leakedCipherBuf, plain)  // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		enc.CryptBlocks(plain, plain)            // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 		_ = cipher.NewCBCEncrypter(block, plain) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 
 		// 反例 4：跨子包借用 purego 或日志泄漏必须拒绝
 		_, _, _ = purego.SyscallN(1, uintptr(len(plain)), uintptr(plain[0])) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
-		slog.Info("ss-leak", "v", string(plain))                              // want "禁止将明文机密.*传入日志汇点"
+		slog.Info("ss-leak", "v", string(plain))                             // want "禁止将明文机密.*传入日志汇点"
 		return nil
 	})
 }

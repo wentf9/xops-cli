@@ -106,3 +106,24 @@ func TestWinCred_ZeroValueAndTargetName(t *testing.T) {
 		t.Fatalf("零值 WithSecret = %v, 期望 ErrInvalidArgument", err)
 	}
 }
+
+type dropWriteWinCredBackend struct{}
+
+func (dropWriteWinCredBackend) Read(string) ([]byte, error)                   { return nil, ports.ErrSecretNotFound }
+func (dropWriteWinCredBackend) Write(string, string, *secret.SecretBox) error { return nil }
+func (dropWriteWinCredBackend) Delete(string) error                           { return ports.ErrSecretNotFound }
+
+func TestWinCred_PutAndVerifyWrapsReadbackError(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	st, err := wincred.NewStoreWithBackend(dropWriteWinCredBackend{})
+	if err != nil {
+		t.Fatalf("NewStoreWithBackend 失败: %v", err)
+	}
+	ref := tck.MustRef(t, "win", "drop")
+	err = secret.WithBytes([]byte("tok"), func(box *secret.SecretBox) error {
+		return st.PutAndVerify(context.Background(), ref, box)
+	})
+	if !errors.Is(err, ports.ErrSecretVerifyFailed) {
+		t.Fatalf("回读失败 PutAndVerify = %v, 期望 ErrSecretVerifyFailed", err)
+	}
+}

@@ -58,7 +58,10 @@ func generateDHKeyPair(rng io.Reader) (dhKeyPair, error) {
 	priv.Mod(priv, pMinus2)
 	priv.Add(priv, one)
 	pubInt := new(big.Int).Exp(big.NewInt(2), priv, p)
-	return dhKeyPair{priv: priv, pub: pubInt.Bytes()}, nil
+	// 固定填充为 128 字节大端字节序，避免前导零字节被严格 libsecret / gnome-keyring 拒绝。
+	pub := make([]byte, dhPrimeBytes)
+	pubInt.FillBytes(pub)
+	return dhKeyPair{priv: priv, pub: pub}, nil
 }
 
 func deriveDHAES128Key(priv *big.Int, peerPubBytes []byte) ([]byte, error) {

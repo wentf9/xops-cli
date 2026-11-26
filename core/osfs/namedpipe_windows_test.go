@@ -286,3 +286,48 @@ func verifyPipeDeadlineAndClose(ctx context.Context, pipePath string, connected 
 		})
 	})
 }
+
+// TestDialWindowsNamedPipeVerified_RejectsUntrustedDACL 在真实 Win32 管道上验证
+// 当 DACL 授予 Everyone FILE_CREATE_PIPE_INSTANCE (0x04) 时必须以 ErrUnauthorizedPeer / ErrInsecurePermissions 拒绝。
+func TestDialWindowsNamedPipeVerified_RejectsUntrustedDACL(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	var rnd [8]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		t.Fatalf("rand.Read 失败: %v", err)
+	}
+	pipePath := `\\.\pipe\xops-osfs-badacl-` + hex.EncodeToString(rnd[:])
+	currSID, err := osfs.CurrentProcessUserSID()
+	if err != nil {
+		t.Fatalf("CurrentProcessUserSID 失败: %v", err)
+	}
+	// WD (Everyone) 拥有 0x04 (FILE_CREATE_PIPE_INSTANCE) 抢注权限，必须被 WindowsACLPipeServerSafe 拦截。
+	sddl := "O:" + currSID.String() + "D:P(A;;GA;;;" + currSID.String() + ")(A;;0x00000004;;;WD)"
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatalf("SecurityDescriptorFromString 失败: %v", err)
+	}
+	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+	namePtr, err := windows.UTF16PtrFromString(pipePath)
+	if err != nil {
+		t.Fatalf("UTF16PtrFromString 失败: %v", err)
+	}
+	const (
+		pipeAccessDuplex      = 0x00000003
+		fileFlagFirstPipeInst = 0x00080000
+	)
+	h, err := windows.CreateNamedPipe(namePtr, pipeAccessDuplex|fileFlagFirstPipeInst, 0, 1, 4096, 4096, 0, sa)
+	runtime.KeepAlive(sd)
+	runtime.KeepAlive(sa)
+	if err != nil {
+		t.Fatalf("CreateNamedPipe(badacl) 失败: %v", err)
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+
+	conn, dErr := osfs.DialWindowsNamedPipeVerified(context.Background(), pipePath)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	if !errors.Is(dErr, osfs.ErrUnauthorizedPeer) || !errors.Is(dErr, osfs.ErrInsecurePermissions) {
+		t.Fatalf("不安全管道 DACL 拨号 = %v, 期望同时匹配 ErrUnauthorizedPeer 与 ErrInsecurePermissions", dErr)
+	}
+}

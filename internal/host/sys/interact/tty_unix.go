@@ -28,7 +28,7 @@ func probeFileTTYOS(in, out *os.File) (bool, error) {
 }
 
 func probeControllingTTYOS() (bool, error) {
-	fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return false, nil
 	}
@@ -46,7 +46,7 @@ func promptTTYLineOS(ctx context.Context, in, out *os.File, allowDevTTY bool, pr
 	if !allowDevTTY {
 		return nil, ports.ErrInteractionUnavailable
 	}
-	fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open("/dev/tty", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, ports.ErrInteractionUnavailable
 	}
@@ -108,7 +108,7 @@ func readCancelableLineUnixFD(ctx context.Context, inFD int) ([]byte, error) {
 	}
 	var out []byte
 	var one [1]byte
-	for len(out) < maxPromptLineBytes {
+	for {
 		if err := pollNextByteUnix(ctx, fds, wakeR); err != nil {
 			clear(out)
 			return nil, err
@@ -127,9 +127,26 @@ func readCancelableLineUnixFD(ctx context.Context, inFD int) ([]byte, error) {
 		if one[0] == '\n' {
 			return out, nil
 		}
+		if len(out) >= maxPromptLineBytes {
+			clear(out)
+			drainUnixFDToNewline(ctx, inFD, fds, wakeR)
+			return nil, fmt.Errorf("%w: 输入行长度超过上限 %d 字节", ports.ErrLimitExceeded, maxPromptLineBytes)
+		}
 		out = append(out, one[0])
 	}
-	return out, nil
+}
+
+func drainUnixFDToNewline(ctx context.Context, inFD int, fds []unix.PollFd, wakeR *os.File) {
+	var one [1]byte
+	for {
+		if err := pollNextByteUnix(ctx, fds, wakeR); err != nil {
+			return
+		}
+		n, err := readByteUnixFD(inFD, one[:])
+		if err != nil || n == 0 || one[0] == '\n' {
+			return
+		}
+	}
 }
 
 func pollNextByteUnix(ctx context.Context, fds []unix.PollFd, wakeR *os.File) error {

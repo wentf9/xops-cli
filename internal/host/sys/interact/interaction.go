@@ -220,7 +220,7 @@ func (i *Interaction) promptStreamLine(ctx context.Context, prompt string) ([]by
 func readBoundedStreamLine(ctx context.Context, r io.Reader) ([]byte, error) {
 	var out []byte
 	var one [1]byte
-	for len(out) < maxPromptLineBytes {
+	for {
 		if err := ctx.Err(); err != nil {
 			clear(out)
 			return nil, err
@@ -230,13 +230,27 @@ func readBoundedStreamLine(ctx context.Context, r io.Reader) ([]byte, error) {
 			if one[0] == '\n' {
 				return out, nil
 			}
+			if len(out) >= maxPromptLineBytes {
+				clear(out)
+				drainStreamToNewline(ctx, r)
+				return nil, fmt.Errorf("%w: 输入行长度超过上限 %d 字节", ports.ErrLimitExceeded, maxPromptLineBytes)
+			}
 			out = append(out, one[0])
 		}
 		if err != nil {
 			return finishStreamLineOnErr(out, err)
 		}
 	}
-	return out, nil
+}
+
+func drainStreamToNewline(ctx context.Context, r io.Reader) {
+	var one [1]byte
+	for ctx.Err() == nil {
+		n, err := r.Read(one[:])
+		if (n > 0 && one[0] == '\n') || err != nil {
+			return
+		}
+	}
 }
 
 func finishStreamLineOnErr(out []byte, err error) ([]byte, error) {
@@ -292,8 +306,9 @@ func formatTextPrompt(title, subject, prompt string) string {
 		b.WriteString(security.SanitizePromptText(subject))
 		b.WriteString(") ")
 	}
-	b.WriteString(security.SanitizePromptText(prompt))
-	if !strings.HasSuffix(prompt, " ") {
+	sanitized := security.SanitizePromptText(prompt)
+	b.WriteString(sanitized)
+	if !strings.HasSuffix(sanitized, " ") {
 		b.WriteString(" ")
 	}
 	return b.String()

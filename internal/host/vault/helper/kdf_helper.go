@@ -159,7 +159,7 @@ func parseKDFRequest(b []byte) (Argon2idParams, [kdfSaltBytes]byte, []byte, erro
 	if string(b[0:8]) != kdfReqMagic || binary.BigEndian.Uint16(b[8:10]) != kdfFrameVersion {
 		return Argon2idParams{}, salt, nil, ErrProtocol
 	}
-	if int(binary.BigEndian.Uint32(b[10:14])) != len(b) || b[23] != kdfDerivedKeyBytes {
+	if binary.BigEndian.Uint32(b[10:14]) != uint32(len(b)) || b[23] != kdfDerivedKeyBytes || b[42] != 0 || b[43] != 0 {
 		return Argon2idParams{}, salt, nil, ErrProtocol
 	}
 	params, err := NewArgon2idParams(binary.BigEndian.Uint32(b[14:18]), binary.BigEndian.Uint32(b[18:22]), b[22])
@@ -198,7 +198,7 @@ func parseKDFResponse(b []byte) ([kdfDerivedKeyBytes]byte, error) {
 	if string(b[0:8]) != kdfRespMagic || binary.BigEndian.Uint16(b[8:10]) != kdfFrameVersion {
 		return key, ErrProtocol
 	}
-	if int(binary.BigEndian.Uint32(b[10:14])) != len(b) || b[14] != kdfStatusOK {
+	if binary.BigEndian.Uint32(b[10:14]) != uint32(len(b)) || b[14] != kdfStatusOK {
 		return key, ErrProtocol
 	}
 	keyLen := int(binary.BigEndian.Uint16(b[15:17]))

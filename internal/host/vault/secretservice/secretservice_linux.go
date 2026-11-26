@@ -9,10 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/wentf9/xops-cli/core/domain/secret"
+	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -129,15 +129,20 @@ func (s *Store) PutAndVerify(
 	if err := s.writeBox(ctx, ref, box); err != nil {
 		return err
 	}
-	return s.WithSecret(ctx, ref, func(got *secret.SecretBox) error {
+	verifyErr := s.WithSecret(ctx, ref, func(got *secret.SecretBox) error {
 		if !got.Equal(box) {
 			return ports.ErrSecretVerifyFailed
 		}
 		return nil
 	})
+	if verifyErr != nil && !errors.Is(verifyErr, ports.ErrSecretVerifyFailed) && ctx.Err() == nil {
+		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, verifyErr)
+	}
+	return verifyErr
 }
 
-// Delete 删除 Secret Service 中匹配 ref 的全部条目；不存在返回 ports.ErrSecretNotFound。
+// Delete 删除 Secret Service 中匹配 ref 的全部已解锁条目；若存在已锁定匹配项则失败关闭返回 ErrVaultLocked，
+// 无任何匹配项返回 ports.ErrSecretNotFound。
 func (s *Store) Delete(ctx context.Context, ref secret.Ref) error {
 	if err := s.checkArgs(ctx, ref); err != nil {
 		return err
@@ -147,16 +152,24 @@ func (s *Store) Delete(ctx context.Context, ref secret.Ref) error {
 		return err
 	}
 	defer sess.close(ctx)
-	itemPath, err := findUnlockedItem(ctx, sess.conn, ref)
+	unlocked, locked, err := searchMatchingItems(ctx, sess.conn, ref)
 	if err != nil {
 		return err
 	}
-	var prompt dbus.ObjectPath
-	if err := sess.conn.Object(dbusServiceName, itemPath).CallWithContext(ctx, dbusIfaceItem+".Delete", 0).Store(&prompt); err != nil {
-		return mapDBusError(err)
-	}
-	if prompt != "" && prompt != "/" {
+	if len(locked) > 0 {
 		return ports.ErrVaultLocked
+	}
+	if len(unlocked) == 0 {
+		return ports.ErrSecretNotFound
+	}
+	for _, itemPath := range unlocked {
+		var prompt dbus.ObjectPath
+		if err := sess.conn.Object(dbusServiceName, itemPath).CallWithContext(ctx, dbusIfaceItem+".Delete", 0).Store(&prompt); err != nil {
+			return mapDBusError(err)
+		}
+		if prompt != "" && prompt != "/" {
+			return ports.ErrVaultLocked
+		}
 	}
 	return nil
 }
@@ -261,23 +274,40 @@ func (s *Store) openSession(ctx context.Context) (*ssSession, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ports.ErrUnsupported, err)
 	}
-	var dialer net.Dialer
-	rawConn, err := dialer.DialContext(ctx, "unix", sock)
+	ctrlPath, err := osfs.ValidateControlSocketPath(sock)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 连接 D-Bus 会话总线失败: %w", ports.ErrUnsupported, err)
+		return nil, fmt.Errorf("%w: D-Bus 套接字路径安全校验失败: %w", ports.ErrUnsupported, err)
+	}
+	rawConn, _, err := osfs.DialUnixVerified(ctx, ctrlPath)
+	if err != nil {
+		if cErr := ctx.Err(); cErr != nil {
+			return nil, cErr
+		}
+		return nil, fmt.Errorf("%w: 连接并核验 D-Bus 会话总线失败: %w", ports.ErrUnsupported, err)
 	}
 	conn, err := dbus.NewConn(rawConn)
 	if err != nil {
 		_ = rawConn.Close()
 		return nil, fmt.Errorf("%w: 创建 D-Bus 连接失败: %w", ports.ErrUnsupported, err)
 	}
-	if err := conn.Auth(nil); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("%w: D-Bus 认证失败: %w", ports.ErrUnsupported, err)
+	stopHandshake := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	authErr := conn.Auth(nil)
+	var helloErr error
+	if authErr == nil {
+		helloErr = conn.Hello()
 	}
-	if err := conn.Hello(); err != nil {
+	stopHandshake()
+	if cErr := ctx.Err(); cErr != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("%w: D-Bus Hello 失败: %w", ports.ErrUnsupported, err)
+		return nil, cErr
+	}
+	if authErr != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%w: D-Bus 认证失败: %w", ports.ErrUnsupported, authErr)
+	}
+	if helloErr != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%w: D-Bus Hello 失败: %w", ports.ErrUnsupported, helloErr)
 	}
 	sess, err := s.negotiateSession(ctx, conn)
 	if err != nil {
@@ -292,7 +322,7 @@ func (s *Store) negotiateSession(ctx context.Context, conn *dbus.Conn) (*ssSessi
 	if sess, err := s.tryOpenDHSession(ctx, conn, svc); err == nil {
 		return sess, nil
 	} else if !s.allowPlainFallback || !isDBusNotSupported(err) {
-		return nil, err
+		return nil, normalizeDHSessionErr(err)
 	}
 	var out dbus.Variant
 	var path dbus.ObjectPath
@@ -302,11 +332,19 @@ func (s *Store) negotiateSession(ctx context.Context, conn *dbus.Conn) (*ssSessi
 	return &ssSession{conn: conn, path: path}, nil
 }
 
+func normalizeDHSessionErr(err error) error {
+	if errors.Is(err, ports.ErrEntropyShortRead) || errors.Is(err, ports.ErrCorruptData) {
+		return err
+	}
+	return mapDBusError(err)
+}
+
 func (s *Store) tryOpenDHSession(ctx context.Context, conn *dbus.Conn, svc dbus.BusObject) (*ssSession, error) {
 	kp, err := generateDHKeyPair(s.entropy)
 	if err != nil {
 		return nil, err
 	}
+	defer clear(kp.priv.Bits())
 	var out dbus.Variant
 	var path dbus.ObjectPath
 	if err := svc.CallWithContext(ctx, dbusIfaceService+".OpenSession", 0, dbusAlgoDH, dbus.MakeVariant(kp.pub)).Store(&out, &path); err != nil {
@@ -323,17 +361,24 @@ func (s *Store) tryOpenDHSession(ctx context.Context, conn *dbus.Conn, svc dbus.
 	return &ssSession{conn: conn, path: path, aesKey: aesKey}, nil
 }
 
-func findUnlockedItem(ctx context.Context, conn *dbus.Conn, ref secret.Ref) (dbus.ObjectPath, error) {
+func searchMatchingItems(ctx context.Context, conn *dbus.Conn, ref secret.Ref) (unlocked, locked []dbus.ObjectPath, err error) {
 	coll := conn.Object(dbusServiceName, dbus.ObjectPath(dbusDefaultCollection))
-	if locked, lErr := isCollectionLocked(ctx, coll); lErr != nil {
-		return "", lErr
-	} else if locked {
-		return "", ports.ErrVaultLocked
+	if isLocked, lErr := isCollectionLocked(ctx, coll); lErr != nil {
+		return nil, nil, lErr
+	} else if isLocked {
+		return nil, nil, ports.ErrVaultLocked
 	}
 	svc := conn.Object(dbusServiceName, dbus.ObjectPath(dbusServicePath))
-	var unlocked, locked []dbus.ObjectPath
 	if err := svc.CallWithContext(ctx, dbusIfaceService+".SearchItems", 0, itemAttrs(ref)).Store(&unlocked, &locked); err != nil {
-		return "", mapDBusError(err)
+		return nil, nil, mapDBusError(err)
+	}
+	return unlocked, locked, nil
+}
+
+func findUnlockedItem(ctx context.Context, conn *dbus.Conn, ref secret.Ref) (dbus.ObjectPath, error) {
+	unlocked, locked, err := searchMatchingItems(ctx, conn, ref)
+	if err != nil {
+		return "", err
 	}
 	if len(unlocked) > 0 {
 		return unlocked[0], nil

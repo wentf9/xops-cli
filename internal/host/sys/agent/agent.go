@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
@@ -183,16 +184,30 @@ func agentKeyToPublicKeyInfo(k *sshagent.Key) (ports.PublicKeyInfo, error) {
 	if err != nil {
 		return zeroVal[ports.PublicKeyInfo](), err
 	}
-	comment := security.SanitizePromptText(k.Comment)
-	if len(comment) > maxAgentCommentBytes {
-		comment = comment[:maxAgentCommentBytes]
-	}
+	comment := truncateUTF8Bytes(security.SanitizePromptText(k.Comment), maxAgentCommentBytes)
 	return ports.NewPublicKeyInfo(ports.PublicKeyInfoSpec{
 		Algorithm:   pub.Type(),
 		Fingerprint: fingerprintForPubKey(pub),
 		WireBlob:    pub.Marshal(),
 		Comment:     comment,
 	})
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	cut := 0
+	for i := range s {
+		if i > maxBytes {
+			break
+		}
+		cut = i
+	}
+	if cut == 0 && utf8.RuneCountInString(s) > 0 {
+		return ""
+	}
+	return s[:cut]
 }
 
 func fingerprintForPubKey(pub ssh.PublicKey) inventory.KeyFingerprint {

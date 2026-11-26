@@ -107,3 +107,26 @@ func TestKeychain_ZeroValueAndServiceAccount(t *testing.T) {
 		t.Fatalf("零值 WithSecret = %v, 期望 ErrInvalidArgument", err)
 	}
 }
+
+type dropWriteKeychainBackend struct{}
+
+func (dropWriteKeychainBackend) Read(string, string) ([]byte, error) {
+	return nil, ports.ErrSecretNotFound
+}
+func (dropWriteKeychainBackend) Write(string, string, *secret.SecretBox) error { return nil }
+func (dropWriteKeychainBackend) Delete(string, string) error                   { return ports.ErrSecretNotFound }
+
+func TestKeychain_PutAndVerifyWrapsReadbackError(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	st, err := keychain.NewStoreWithBackend(dropWriteKeychainBackend{})
+	if err != nil {
+		t.Fatalf("NewStoreWithBackend 失败: %v", err)
+	}
+	ref := tck.MustRef(t, "mac", "drop")
+	err = secret.WithBytes([]byte("tok"), func(box *secret.SecretBox) error {
+		return st.PutAndVerify(context.Background(), ref, box)
+	})
+	if !errors.Is(err, ports.ErrSecretVerifyFailed) {
+		t.Fatalf("回读失败 PutAndVerify = %v, 期望 ErrSecretVerifyFailed", err)
+	}
+}

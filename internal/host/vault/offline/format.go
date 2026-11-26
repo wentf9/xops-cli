@@ -1,7 +1,9 @@
 package offline
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"slices"
@@ -131,13 +133,21 @@ func metaDest() (pathalg.LocalRootedDest, error) {
 	return pathalg.ParseLocalRootedDest(vaultMetaFileName)
 }
 
+// itemDestForRef 将大小写敏感的 (store, item) 映射为固定长度纯小写十六进制 SHA-256 文件名，
+// 彻底消除 Windows NTFS / macOS APFS 大小写不敏感文件系统上的条目碰撞及长路径膨胀，
+// 同时 wire.Ref 与 AEAD AAD 仍严格绑定规范 ref.String()。
 func itemDestForRef(ref secret.Ref) (pathalg.LocalRootedDest, pathalg.LocalRootedDest, error) {
 	var zero pathalg.LocalRootedDest
-	dir, err := pathalg.ParseLocalRootedDest(vaultItemsDirName + "/" + ref.Store())
+	dir, err := pathalg.ParseLocalRootedDest(vaultItemsDirName)
 	if err != nil {
 		return zero, zero, err
 	}
-	file, err := dir.JoinComponent(ref.Item() + ".enc")
+	h := sha256.New()
+	_, _ = h.Write([]byte(ref.Store()))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(ref.Item()))
+	name := hex.EncodeToString(h.Sum(nil)) + ".enc"
+	file, err := dir.JoinComponent(name)
 	if err != nil {
 		return zero, zero, err
 	}

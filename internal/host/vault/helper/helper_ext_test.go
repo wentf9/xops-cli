@@ -1,6 +1,7 @@
 package helper_test
 
 import (
+	"bytes"
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
@@ -37,8 +38,8 @@ type mockHelperReq struct {
 }
 
 type mockHelperResp struct {
-	SecretB64 string `json:"secret_b64,omitzero"`
-	Code      string `json:"code,omitzero"`
+	SecretB64 *string `json:"secret_b64,omitzero"`
+	Code      string  `json:"code,omitzero"`
 }
 
 // TestVaultHelperSubprocess 为跨平台外部凭据助手与隔离 KDF 子进程提供自托管测试入口。
@@ -55,11 +56,23 @@ func TestVaultHelperSubprocess(t *testing.T) {
 		os.Exit(0)
 	case "locked":
 		writeJSONExit(mockHelperResp{Code: "locked"}, 1)
+	case "drop-write":
+		runMockHelperDropWrite()
 	case "store":
 		runMockHelperStore(os.Getenv(helperDirEnv))
 	default:
 		os.Exit(3)
 	}
+}
+
+func runMockHelperDropWrite() {
+	raw, _ := io.ReadAll(os.Stdin)
+	var req mockHelperReq
+	_ = jsonv2.Unmarshal(raw, &req)
+	if req.Action == "store" {
+		writeJSONExit(mockHelperResp{Code: "ok"}, 0)
+	}
+	writeJSONExit(mockHelperResp{Code: "not-found"}, 1)
 }
 
 func runMockHelperStore(dir string) {
@@ -81,7 +94,8 @@ func runMockHelperStore(dir string) {
 		if rErr != nil {
 			writeJSONExit(mockHelperResp{Code: "unavailable"}, 1)
 		}
-		writeJSONExit(mockHelperResp{SecretB64: string(data)}, 0)
+		val := string(data)
+		writeJSONExit(mockHelperResp{SecretB64: &val}, 0)
 	case "store":
 		if wErr := os.WriteFile(p, []byte(req.SecretB64), 0o600); wErr != nil {
 			writeJSONExit(mockHelperResp{Code: "unavailable"}, 1)
@@ -190,5 +204,56 @@ func TestDeriveArgon2idSubprocess_MatchesInProcess(t *testing.T) {
 	}
 	if string(got[:]) != string(want) {
 		t.Fatal("子进程 Argon2id 派生密钥与本地标准计算结果不一致")
+	}
+}
+
+// TestHelperVault_EmptySecretVerifyFailAndKDFReservedHeader 回归验证空凭据存取、回读丢写归一化及 KDF 保留字节校验。
+func TestHelperVault_EmptySecretVerifyFailAndKDFReservedHeader(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	ref := tck.MustRef(t, "ext", "empty-item")
+
+	// 1. 空凭据 []byte{} 写入与回读不能与 ErrSecretNotFound 混淆。
+	st := newTestHelperVault(t, "store", t.TempDir(), false)
+	if err := secret.WithBytes([]byte{}, func(emptyBox *secret.SecretBox) error {
+		if err := st.PutAndVerify(ctx, ref, emptyBox); err != nil {
+			return err
+		}
+		return st.WithSecret(ctx, ref, func(got *secret.SecretBox) error {
+			if !got.IsValid() || got.Len() != 0 || !got.Equal(emptyBox) {
+				t.Fatalf("空凭据回读异常: valid=%v len=%d", got.IsValid(), got.Len())
+			}
+			return nil
+		})
+	}); err != nil {
+		t.Fatalf("空凭据 PutAndVerify/WithSecret 失败: %v", err)
+	}
+
+	// 2. 助手静默丢写导致回读 ErrSecretNotFound 时，PutAndVerify 须包装返回 ErrSecretVerifyFailed。
+	dropper := newTestHelperVault(t, "drop-write", t.TempDir(), false)
+	err := secret.WithBytes([]byte("lost-secret"), func(box *secret.SecretBox) error {
+		return dropper.PutAndVerify(ctx, ref, box)
+	})
+	if !errors.Is(err, ports.ErrSecretVerifyFailed) {
+		t.Fatalf("丢写助手 PutAndVerify = %v, 期望 ErrSecretVerifyFailed", err)
+	}
+
+	// 3. KDF Worker 须拒绝保留字节 b[42:44] 非零的畸形帧。
+	badFrame := make([]byte, 48)
+	copy(badFrame[0:8], "XOPSKDF2")
+	badFrame[9] = 2
+	badFrame[13] = 48
+	badFrame[17] = 1
+	badFrame[21] = 64
+	badFrame[22] = 1
+	badFrame[23] = 32
+	badFrame[41] = 4
+	badFrame[42] = 1 // 非法非零保留字节
+	var respBuf bytes.Buffer
+	if err := helper.ServeArgon2idWorker(bytes.NewReader(badFrame), &respBuf); err != nil {
+		t.Fatalf("ServeArgon2idWorker 写入错误帧失败: %v", err)
+	}
+	if respBuf.Len() < 15 || respBuf.Bytes()[14] == 0 {
+		t.Fatalf("非零保留字节帧须返回非零错误状态，实际输出长度=%d", respBuf.Len())
 	}
 }

@@ -16,7 +16,6 @@ func TestParseSessionBusUnixSocket(t *testing.T) {
 	valid := map[string]string{
 		"unix:path=/run/user/1000/bus":                  "/run/user/1000/bus",
 		"unix:path=/tmp/my%20bus,guid=1234567890abcdef": "/tmp/my bus",
-		"unix:abstract=/tmp/dbus-abc,guid=deadbeef":     "\x00/tmp/dbus-abc",
 	}
 	for raw, want := range valid {
 		got, err := secretservice.ParseSessionBusUnixSocket(raw)
@@ -29,6 +28,7 @@ func TestParseSessionBusUnixSocket(t *testing.T) {
 		"tcp:host=127.0.0.1,port=1234",
 		"unix:path=/run/a;unix:path=/run/b",
 		"unix:path=relative/sock",
+		"unix:abstract=/tmp/dbus-abc,guid=deadbeef",
 		"unix:path=/run/a,abstract=/tmp/b",
 		"unix:guid=1234",
 	} {

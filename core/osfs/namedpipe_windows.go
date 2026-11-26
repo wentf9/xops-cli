@@ -12,7 +12,6 @@ import (
 	"golang.org/x/sys/windows"
 	"net"
 	"strings"
-	"unsafe"
 )
 
 const winPipePrefix, winPipeOpenFlags = `\\.\pipe\`, windows.FILE_FLAG_OVERLAPPED | windows.SECURITY_SQOS_PRESENT | windows.SECURITY_IDENTIFICATION
@@ -83,7 +82,7 @@ func verifyNamedPipeHandle(h windows.Handle, norm string) error {
 		return fmt.Errorf("%w: 管道 %q 未通过安全策略校验: %w", ErrUnauthorizedPeer, norm, pickIf[error](aErr != nil, aErr, ErrInsecurePermissions))
 	}
 	var pid uint32
-	if r1, _, _ := windows.NewLazySystemDLL("kernel32.dll").NewProc("GetNamedPipeServerProcessId").Call(uintptr(h), uintptr(unsafe.Pointer(&pid))); r1 != 0 && pid != 0 {
+	if err := windows.GetNamedPipeServerProcessId(h, &pid); err == nil && pid != 0 {
 		if peerSID, pErr := ProcessUserSID(pid); pErr == nil && !IsTrustedPrincipalSID(peerSID, currSID) {
 			return fmt.Errorf("%w: 管道服务端 PID %d 用户 SID 不受信任", ErrUnauthorizedPeer, pid)
 		}

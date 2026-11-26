@@ -33,7 +33,7 @@ func badPuregoKeychainViolations(ctx context.Context, proc ports.ProcessPort, ke
 		// 反例 2：跨子包借用 helper 或 secretservice 窄钩子必须拒绝。
 		_, _ = proc.Run(ctx, ports.ProcessSpec{Command: "helper"}, bytes.NewReader(plain)) // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 		dst := make([]byte, len(plain))
-		mode.CryptBlocks(dst, plain)                 // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
+		mode.CryptBlocks(dst, plain)                   // want "禁止将明文机密传入未经授权的外部调用或未知汇点"
 		slog.Info("keychain-leak", "v", string(plain)) // want "禁止将明文机密.*传入日志汇点"
 		return nil
 	})

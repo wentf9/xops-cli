@@ -96,9 +96,9 @@ func (b *darwinSecurityBackend) Read(service, account string) ([]byte, error) {
 		b.symFind,
 		0,
 		uintptr(len(svcBytes)),
-		bytesDataPtr(svcBytes),
+		uintptr(sliceUnsafePtr(svcBytes)),
 		uintptr(len(acctBytes)),
-		bytesDataPtr(acctBytes),
+		uintptr(sliceUnsafePtr(acctBytes)),
 		uintptr(unsafe.Pointer(&pwdLen)),
 		uintptr(unsafe.Pointer(&pwdPtr)),
 		uintptr(unsafe.Pointer(&itemRef)),
@@ -120,6 +120,7 @@ func (b *darwinSecurityBackend) Read(service, account string) ([]byte, error) {
 	src := unsafe.Slice((*byte)(pwdPtr), pwdLen)
 	out := make([]byte, len(src))
 	copy(out, src)
+	clear(src)
 	return out, nil
 }
 
@@ -130,24 +131,26 @@ func (b *darwinSecurityBackend) Write(service, account string, box *secret.Secre
 	svcBytes := []byte(service)
 	acctBytes := []byte(account)
 	return box.Use(func(plain []byte) error {
-		var plainPtr uintptr
+		var emptyByte byte
+		dataPtr := unsafe.Pointer(&emptyByte)
 		if len(plain) > 0 {
-			plainPtr = uintptr(unsafe.Pointer(&plain[0]))
+			dataPtr = unsafe.Pointer(&plain[0])
 		}
 		r1, _, _ := purego.SyscallN(
 			b.symAdd,
 			0,
 			uintptr(len(svcBytes)),
-			bytesDataPtr(svcBytes),
+			uintptr(sliceUnsafePtr(svcBytes)),
 			uintptr(len(acctBytes)),
-			bytesDataPtr(acctBytes),
+			uintptr(sliceUnsafePtr(acctBytes)),
 			uintptr(len(plain)),
-			plainPtr,
+			uintptr(dataPtr),
 			0,
 		)
 		runtime.KeepAlive(svcBytes)
 		runtime.KeepAlive(acctBytes)
 		runtime.KeepAlive(plain)
+		runtime.KeepAlive(&emptyByte)
 		status := int32(r1)
 		if status == errSecSuccess {
 			return nil
@@ -155,18 +158,25 @@ func (b *darwinSecurityBackend) Write(service, account string, box *secret.Secre
 		if status != errSecDuplicateItem {
 			return mapDarwinSecStatus(status)
 		}
-		return b.modifyExisting(svcBytes, acctBytes, plain, plainPtr)
+		return b.modifyExisting(svcBytes, acctBytes, plain)
 	})
 }
 
-func (b *darwinSecurityBackend) modifyExisting(svcBytes, acctBytes, plain []byte, plainPtr uintptr) error {
+func (b *darwinSecurityBackend) modifyExisting(svcBytes, acctBytes, plain []byte) error {
 	itemRef, err := b.findItemRef(svcBytes, acctBytes)
 	if err != nil {
 		return err
 	}
 	defer func() { _, _, _ = purego.SyscallN(b.symCFRel, itemRef) }()
-	r1, _, _ := purego.SyscallN(b.symModify, itemRef, 0, uintptr(len(plain)), plainPtr)
+	// Apple Security.framework 在 data==NULL 时语义为“不修改密码字节”，空密文覆盖必须传非 NULL 指针且 length=0。
+	var emptyByte byte
+	dataPtr := unsafe.Pointer(&emptyByte)
+	if len(plain) > 0 {
+		dataPtr = unsafe.Pointer(&plain[0])
+	}
+	r1, _, _ := purego.SyscallN(b.symModify, itemRef, 0, uintptr(len(plain)), uintptr(dataPtr))
 	runtime.KeepAlive(plain)
+	runtime.KeepAlive(&emptyByte)
 	if status := int32(r1); status != errSecSuccess {
 		return mapDarwinSecStatus(status)
 	}
@@ -195,9 +205,9 @@ func (b *darwinSecurityBackend) findItemRef(svcBytes, acctBytes []byte) (uintptr
 		b.symFind,
 		0,
 		uintptr(len(svcBytes)),
-		bytesDataPtr(svcBytes),
+		uintptr(sliceUnsafePtr(svcBytes)),
 		uintptr(len(acctBytes)),
-		bytesDataPtr(acctBytes),
+		uintptr(sliceUnsafePtr(acctBytes)),
 		0,
 		0,
 		uintptr(unsafe.Pointer(&itemRef)),
@@ -213,11 +223,11 @@ func (b *darwinSecurityBackend) findItemRef(svcBytes, acctBytes []byte) (uintptr
 	return itemRef, nil
 }
 
-func bytesDataPtr(b []byte) uintptr {
+func sliceUnsafePtr(b []byte) unsafe.Pointer {
 	if len(b) == 0 {
-		return 0
+		return nil
 	}
-	return uintptr(unsafe.Pointer(&b[0]))
+	return unsafe.Pointer(&b[0])
 }
 
 func mapDarwinSecStatus(status int32) error {

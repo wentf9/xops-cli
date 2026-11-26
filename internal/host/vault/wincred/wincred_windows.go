@@ -83,6 +83,7 @@ func (b *winAdvapi32Backend) Read(target string) ([]byte, error) {
 	src := unsafe.Slice(credPtr.CredentialBlob, credPtr.CredentialBlobSize)
 	out := make([]byte, len(src))
 	copy(out, src)
+	clear(src)
 	return out, nil
 }
 

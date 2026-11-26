@@ -201,6 +201,7 @@ func startPipeIO(h windows.Handle, isRead bool, p []byte, done *uint32, ov *wind
 }
 
 func (c *Conn) waitOverlapped(slot *opSlot, ov *windows.Overlapped) (uint32, error) {
+	var waitErr error
 	for {
 		ms, bErr := slot.waitBudget(&c.closed)
 		if bErr != nil || c.closed.Load() {
@@ -210,6 +211,7 @@ func (c *Conn) waitOverlapped(slot *opSlot, ov *windows.Overlapped) (uint32, err
 		res, wErr := windows.WaitForMultipleObjects([]windows.Handle{ov.HEvent, slot.wake}, false, ms)
 		if wErr != nil || res == windows.WAIT_OBJECT_0 {
 			if wErr != nil {
+				waitErr = wErr
 				_ = windows.CancelIoEx(c.h, ov)
 			}
 			break
@@ -218,6 +220,9 @@ func (c *Conn) waitOverlapped(slot *opSlot, ov *windows.Overlapped) (uint32, err
 	var done uint32
 	// 返回前必须以 wait=true 排空内核挂起引用，避免栈上 Overlapped 与调用方切片悬空。
 	err := windows.GetOverlappedResult(c.h, ov, &done, true)
+	if waitErr != nil && errors.Is(err, windows.ERROR_OPERATION_ABORTED) {
+		return done, waitErr
+	}
 	return done, err
 }
 

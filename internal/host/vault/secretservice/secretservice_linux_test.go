@@ -13,6 +13,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/godbus/dbus/v5"
 	"github.com/wentf9/xops-cli/core/conc"
+	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/core/ports/tck"
 	"github.com/wentf9/xops-cli/internal/host/sys"
@@ -39,6 +41,8 @@ const (
 	helperSockEnv   = "XOPS_SS_MOCK_SOCK"
 	helperDHEnv     = "XOPS_SS_MOCK_DH"
 	helperLockedEnv = "XOPS_SS_MOCK_LOCKED"
+	helperDenyEnv   = "XOPS_SS_MOCK_DENY"
+	helperDupEnv    = "XOPS_SS_MOCK_DUP"
 )
 
 const testDHPrimeHex = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1" +
@@ -66,6 +70,8 @@ type mockDBusSecretServer struct {
 	nursery   *conc.Nursery
 	supportDH bool
 	locked    bool
+	denyAuth  bool
+	dupOnPut  bool
 	mu        sync.Mutex
 	nextID    int
 	sessions  map[dbus.ObjectPath][]byte // nil => plain, 16B => DH AES-128 key
@@ -74,7 +80,7 @@ type mockDBusSecretServer struct {
 }
 
 // TestSecretServiceHelperProcess 在独立测试子进程中托管 D-Bus Secret Service 桩，
-// 既可完整验证跨进程 Unix 套接字凭证认证，又确保主测试进程内零常驻后台协程满足 TCK goleak 检查。
+// 既可完整验证跨进程 Unix 套接字凭证认证（SO_PEERCRED + 0600 权限），又确保主测试进程零常驻后台协程。
 func TestSecretServiceHelperProcess(t *testing.T) {
 	sock := os.Getenv(helperSockEnv)
 	if sock == "" {
@@ -82,6 +88,10 @@ func TestSecretServiceHelperProcess(t *testing.T) {
 	}
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
+		os.Exit(2)
+	}
+	if err := os.Chmod(sock, 0o600); err != nil {
+		_ = ln.Close()
 		os.Exit(2)
 	}
 	n, err := conc.NewNursery(context.Background())
@@ -94,6 +104,8 @@ func TestSecretServiceHelperProcess(t *testing.T) {
 		nursery:   n,
 		supportDH: os.Getenv(helperDHEnv) == "1",
 		locked:    os.Getenv(helperLockedEnv) == "1",
+		denyAuth:  os.Getenv(helperDenyEnv) == "1",
+		dupOnPut:  os.Getenv(helperDupEnv) == "1",
 		sessions:  make(map[dbus.ObjectPath][]byte),
 		items:     make(map[dbus.ObjectPath]*mockSSItem),
 	}
@@ -111,19 +123,23 @@ func TestSecretServiceHelperProcess(t *testing.T) {
 	os.Exit(0)
 }
 
-func startMockDBusSecretServer(t *testing.T, supportDH, locked bool) string {
+func startMockDBusSecretServer(t *testing.T, supportDH, locked bool, extraEnv ...string) string {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
 		t.Fatalf("os.Executable 失败: %v", err)
 	}
-	// 使用短路径临时目录避免在非 /tmp TMPDIR 或长嵌套子测试名下超出 Linux 108B AF_UNIX sun_path 上限。
+	// 使用短路径且无符号链接的临时目录，满足 Linux 108B sun_path 上限与 osfs.DialUnixVerified 校验。
 	shortDir, err := os.MkdirTemp("", "xops-ss-*")
 	if err != nil {
 		t.Fatalf("os.MkdirTemp 失败: %v", err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
-	sock := filepath.Join(shortDir, "d.sock")
+	realDir, err := filepath.EvalSymlinks(shortDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) 失败: %v", shortDir, err)
+	}
+	sock := filepath.Join(realDir, "d.sock")
 	cmd := exec.Command(exe, "-test.run=^TestSecretServiceHelperProcess$")
 	dhVal, lockVal := "0", "0"
 	if supportDH {
@@ -137,6 +153,7 @@ func startMockDBusSecretServer(t *testing.T, supportDH, locked bool) string {
 		helperDHEnv+"="+dhVal,
 		helperLockedEnv+"="+lockVal,
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	stdinW, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatalf("StdinPipe 失败: %v", err)
@@ -264,6 +281,9 @@ func (s *mockDBusSecretServer) handleCall(req *dbus.Message) *dbus.Message {
 }
 
 func (s *mockDBusSecretServer) handleOpenSession(req *dbus.Message) *dbus.Message {
+	if s.denyAuth {
+		return s.errorReply(req, "org.freedesktop.DBus.Error.AccessDenied", "denied")
+	}
 	if len(req.Body) < 2 {
 		return s.errorReply(req, "org.freedesktop.DBus.Error.InvalidArgs", "bad args")
 	}
@@ -340,6 +360,11 @@ func (s *mockDBusSecretServer) handleCreateItem(req *dbus.Message) *dbus.Message
 	s.nextID++
 	itemPath := dbus.ObjectPath("/org/freedesktop/secrets/collection/default/i" + strconv.Itoa(s.nextID))
 	s.items[itemPath] = &mockSSItem{path: itemPath, attrs: attrs, value: plain}
+	if s.dupOnPut {
+		s.nextID++
+		dupPath := dbus.ObjectPath("/org/freedesktop/secrets/collection/default/i" + strconv.Itoa(s.nextID))
+		s.items[dupPath] = &mockSSItem{path: dupPath, attrs: attrs, value: plain}
+	}
 	return s.methodReply(req, itemPath, dbus.ObjectPath("/"))
 }
 
@@ -532,5 +557,54 @@ func TestTCKSecretVault_SecretServiceDHAndPlain(t *testing.T) {
 				return st
 			},
 		})
+	})
+}
+
+func mustNewSecretServiceStore(t *testing.T, addr string, allowPlain bool) *secretservice.Store {
+	t.Helper()
+	st, err := secretservice.NewStore(secretservice.Spec{
+		Entropy:            sys.NewCryptoEntropy(),
+		BusAddress:         addr,
+		AllowPlainFallback: allowPlain,
+	})
+	if err != nil {
+		t.Fatalf("NewStore 失败: %v", err)
+	}
+	return st
+}
+
+// TestSecretService_ErrorMappingAndMultiItemDelete 验证 DH 失败错误归一化与重复条目全量删除。
+func TestSecretService_ErrorMappingAndMultiItemDelete(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	ref := tck.MustRef(t, "ss", "item1")
+
+	t.Run("DisallowPlainMapsToErrUnsupported", func(t *testing.T) {
+		st := mustNewSecretServiceStore(t, startMockDBusSecretServer(t, false, false), false)
+		if err := st.WithSecret(ctx, ref, func(*secret.SecretBox) error { return nil }); !errors.Is(err, ports.ErrUnsupported) {
+			t.Fatalf("禁止 plain 回退时期望 ErrUnsupported，实际得到: %v", err)
+		}
+	})
+
+	t.Run("AccessDeniedMapsToErrPermissionDenied", func(t *testing.T) {
+		st := mustNewSecretServiceStore(t, startMockDBusSecretServer(t, true, false, helperDenyEnv+"=1"), false)
+		if err := st.WithSecret(ctx, ref, func(*secret.SecretBox) error { return nil }); !errors.Is(err, ports.ErrPermissionDenied) {
+			t.Fatalf("D-Bus AccessDenied 期望 ErrPermissionDenied，实际得到: %v", err)
+		}
+	})
+
+	t.Run("DeleteRemovesAllMatchingItems", func(t *testing.T) {
+		st := mustNewSecretServiceStore(t, startMockDBusSecretServer(t, true, false, helperDupEnv+"=1"), false)
+		if err := secret.WithBytes([]byte("dup-secret"), func(box *secret.SecretBox) error {
+			return st.PutAndVerify(ctx, ref, box)
+		}); err != nil {
+			t.Fatalf("PutAndVerify 失败: %v", err)
+		}
+		if err := st.Delete(ctx, ref); err != nil {
+			t.Fatalf("Delete 失败: %v", err)
+		}
+		if err := st.WithSecret(ctx, ref, func(*secret.SecretBox) error { return nil }); !errors.Is(err, ports.ErrSecretNotFound) {
+			t.Fatalf("删除全部重复项后 WithSecret 期望 ErrSecretNotFound，实际得到: %v", err)
+		}
 	})
 }

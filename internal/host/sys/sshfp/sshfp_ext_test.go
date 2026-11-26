@@ -8,10 +8,13 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/core/ports/tck"
@@ -279,4 +282,64 @@ func TestSSHFPLookupNXDOMAINIPLiteralAndResolvConf(t *testing.T) {
 	if !trustAD || len(srvs) != 3 || srvs[0] != "127.0.0.53:53" || srvs[1] != "[::1]:53" || srvs[2] != "192.0.2.1:53" {
 		t.Fatalf("ParseResolvConf 结果异常: srvs=%v trustAD=%v", srvs, trustAD)
 	}
+}
+
+// TestSSHFPLookup_QuestionMismatchCNAMEOverflowAndCancel 回归验证：
+// 1. RFC 5452 Question 不匹配的 NXDOMAIN 拒绝为 ErrCorruptData；
+// 2. 超过 8 跳的 CNAME 链拒绝为 ErrCorruptData；
+// 3. 无响应服务器在 ctx 取消时立即返回 context.Canceled（无需等待整段 perTryTimeout）。
+func TestSSHFPLookup_QuestionMismatchCNAMEOverflowAndCancel(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	t.Run("QuestionMismatchRejected", func(t *testing.T) {
+		srv := startLoopbackDNSServer(t, func(query []byte, _ bool) []byte {
+			txid := binary.BigEndian.Uint16(query[0:2])
+			return buildTestDNSResponse(txid, 0x8183, "other.example.test", nil)
+		})
+		defer srv.Close()
+		lp, _ := sshfp.NewSystemLookup(sshfp.Spec{Servers: []string{srv.addr}})
+		h, _ := netaddr.ParseCanonicalHost("wanted.example.test")
+		if _, err := lp.LookupSSHFP(context.Background(), h); !errors.Is(err, ports.ErrCorruptData) {
+			t.Fatalf("Question 不匹配应返回 ErrCorruptData，实际得到: %v", err)
+		}
+	})
+
+	t.Run("CNAMEChainOverflowRejected", func(t *testing.T) {
+		srv := startLoopbackDNSServer(t, func(query []byte, _ bool) []byte {
+			txid := binary.BigEndian.Uint16(query[0:2])
+			var ans [][]byte
+			for i := range 9 {
+				src := "h" + strconv.Itoa(i) + ".example.test"
+				dst := "h" + strconv.Itoa(i+1) + ".example.test"
+				ans = append(ans, buildTestRR(src, 5, buildTestWireName(dst)))
+			}
+			return buildTestDNSResponse(txid, 0x8180, "h0.example.test", ans)
+		})
+		defer srv.Close()
+		lp, _ := sshfp.NewSystemLookup(sshfp.Spec{Servers: []string{srv.addr}})
+		h, _ := netaddr.ParseCanonicalHost("h0.example.test")
+		if _, err := lp.LookupSSHFP(context.Background(), h); !errors.Is(err, ports.ErrCorruptData) {
+			t.Fatalf("超长 CNAME 链应返回 ErrCorruptData，实际得到: %v", err)
+		}
+	})
+
+	t.Run("ContextCancelInterruptsBlackhole", func(t *testing.T) {
+		srv := startLoopbackDNSServer(t, func([]byte, bool) []byte { return nil })
+		defer srv.Close()
+		lp, _ := sshfp.NewSystemLookup(sshfp.Spec{
+			Servers:       []string{srv.addr},
+			PerTryTimeout: algebraic.Some(algebraic.FromStdDuration(5 * time.Second)),
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+		defer cancel()
+		h, _ := netaddr.ParseCanonicalHost("hang.example.test")
+		start := time.Now()
+		_, err := lp.LookupSSHFP(ctx, h)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("黑洞服务器超时取消期望 context.DeadlineExceeded，实际得到: %v", err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("ctx 取消未立即中断阻塞连接: elapsed=%v", elapsed)
+		}
+	})
 }

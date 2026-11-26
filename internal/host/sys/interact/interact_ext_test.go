@@ -125,3 +125,35 @@ func TestInteractionDefaultDenyAndEmptySecretReject(t *testing.T) {
 		t.Fatalf("空机密输入期望 ErrInvalidArgument，实际得到: %v", err)
 	}
 }
+
+// TestInteraction_OverlongLineRejectsAndDrains 验证超长输入行（>4096B）严格返回 ErrLimitExceeded 并排空残余尾部，
+// 杜绝尾部字符（如 "y\n"）泄漏并误触发后续 Confirm 确认。
+func TestInteraction_OverlongLineRejectsAndDrains(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	overlong := strings.Repeat("a", 4100) + "y\nno\n"
+	var out bytes.Buffer
+	ui, err := interact.NewStreamInteraction(interact.StreamSpec{
+		In:          strings.NewReader(overlong),
+		Out:         &out,
+		Interactive: true,
+	})
+	if err != nil {
+		t.Fatalf("NewStreamInteraction 失败: %v", err)
+	}
+	tReq, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{Prompt: "Input:"})
+	if err != nil {
+		t.Fatalf("NewTextPromptRequest 失败: %v", err)
+	}
+	if _, err := ui.PromptText(ctx, tReq); !errors.Is(err, ports.ErrLimitExceeded) {
+		t.Fatalf("超长输入行 PromptText = %v, 期望 ErrLimitExceeded", err)
+	}
+	cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Message: "Proceed?", Risk: security.RiskDangerous})
+	if err != nil {
+		t.Fatalf("NewConfirmRequest 失败: %v", err)
+	}
+	v, err := ui.Confirm(ctx, cReq)
+	if err != nil || v != security.VerdictDeny {
+		t.Fatalf("排空后后续 Confirm 应读取下一行 no 并返回 VerdictDeny，实际得到 (%v, %v)", v, err)
+	}
+}
