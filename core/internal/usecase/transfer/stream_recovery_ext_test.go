@@ -6,16 +6,20 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"go.uber.org/goleak"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/gate"
+	"github.com/wentf9/xops-cli/core/internal/pool"
 	"github.com/wentf9/xops-cli/core/internal/sim"
 	"github.com/wentf9/xops-cli/core/internal/usecase/transfer"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -198,9 +202,11 @@ func TestStreamTransfer_CrashResumeSameGenAndNextGenPrune(t *testing.T) {
 	requireNoErr(t, err, "start g1")
 	g2Info, err := rig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: rig.callBase(nil), TransferID: g1Info.TransferID, StartNextGen: true})
 	requireNoErr(t, err, "ResumeTransfer StartNextGen")
-	if g2Info.Meta.Generation() != 2 {
-		t.Fatalf("期望 generation=2，实际=%d", g2Info.Meta.Generation())
+	if g2Info.Meta.Generation() != 2 || rig.pool.Stats().ActiveHandles != 1 {
+		t.Fatalf("期望 generation=2 且旧代句柄已原子释放: gen=%d active=%d", g2Info.Meta.Generation(), rig.pool.Stats().ActiveHandles)
 	}
+	_, err = rig.svc.WriteTransferChunk(ctx, transfer.WriteTransferChunkRequest{CallBase: rig.callBase(nil), Handle: g1Info.Handle, Offset: 0, Data: []byte("1234")})
+	requireErrIs(t, err, pool.ErrHandleNotFound, "StartNextGen=true 必须撤销旧代 g1 活跃句柄")
 	_, err = rig.svc.WriteTransferChunk(ctx, transfer.WriteTransferChunkRequest{CallBase: rig.callBase(nil), Handle: g2Info.Handle, Offset: 0, Data: []byte("12345678")})
 	requireNoErr(t, err, "write g2")
 	_, err = rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(nil), Handle: g2Info.Handle})
@@ -584,6 +590,385 @@ func appendTestEffs(t *testing.T, rig *transferTestRig, effs []fsm.TransferEffec
 				t.Fatalf("missing journal record")
 			}
 			requireNoErr(t, rig.journals.inner.Append(context.Background(), rec), "Append test journal")
+		}
+	}
+}
+
+func TestResumeTransfer_INVE5AntiOracleOnExistingTasksAndRound2ProtectedPath(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	denyRule, err := security.NewNodeOverrideRuleWithFloor("node-*", security.RiskDangerous, security.DecisionKindDeny)
+	requireNoErr(t, err, "NewNodeOverrideRule")
+	denyOvr, err := security.NewNodeOverrides(denyRule)
+	requireNoErr(t, err, "NewNodeOverrides")
+	rig := newTransferRig(t, rigOptions{
+		profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous,
+		nodeOverrides: algebraic.Some(denyOvr), omitOperatorRead: true,
+	})
+	defer rig.close()
+	ctx := context.Background()
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/oracle.bin"))
+	requireNoErr(t, err, "dest")
+
+	// 预置 5 种真实已存在任务态（Committed/Aborted/UncertainCommit/Corrupt/Streaming）
+	idCommitted := seedHealthyGen(t, rig, dest, 1, 8, true, true)
+	idUncertain := seedHealthyGen(t, rig, dest, 1, 8, true, false)
+	idStreaming := seedHealthyGen(t, rig, dest, 1, 8, false, false)
+	idCorrupt := mustOpID(t, rig)
+	rig.journals.inner.CorruptGeneration(idCorrupt, 1, errors.New("corrupt"))
+	idAborted := seedAbortedGen(t, rig, dest, 1, 8)
+
+	sub, err := rig.bus.Subscribe()
+	requireNoErr(t, err, "Subscribe bus")
+	loadsBefore := rig.journals.loadGenCalls.Load()
+	entriesBefore := len(rig.auditClust.Entries())
+
+	for _, id := range []security.OperationID{idCommitted, idAborted, idUncertain, idCorrupt, idStreaming} {
+		_, rErr := rig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: rig.callBase(nil), TransferID: id})
+		requireErrIs(t, rErr, gate.ErrAuthorizationDenied, "INV-E5：已存在任务被拒前严禁泄露存在性或状态")
+	}
+	sub.Close()
+	if rig.journals.loadGenCalls.Load() != loadsBefore {
+		t.Fatalf("Gate 拒绝前不应读取 JournalStore: before=%d after=%d", loadsBefore, rig.journals.loadGenCalls.Load())
+	}
+	assertNoTransferDiagnostics(t, sub)
+	if !hasAuditOutcomeSince(rig.auditClust.Entries()[entriesBefore:], ports.AuditOutcomeDenied) {
+		t.Fatalf("审计日志缺少 AuditOutcomeDenied 记录")
+	}
+
+	// 允许节点但持久化目标经软链指向 /etc -> Round-2 makeResumeCanonicalizer 必须拦截
+	strictRig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous, omitOperatorRead: true})
+	defer strictRig.close()
+	requireNoErr(t, strictRig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp"), 0o755), "MkdirAll /tmp")
+	requireNoErr(t, strictRig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/res_link"), "/etc"), "PutSymlink /tmp/res_link")
+	escDest, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/res_link/pwn.conf"))
+	requireNoErr(t, err, "escDest")
+	escID := seedHealthyGen(t, strictRig, escDest, 1, 8, false, false)
+	_, err = strictRig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: strictRig.callBase(nil), TransferID: escID})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "ResumeTransfer Round-2 必须拦截经软链指向 /etc 的持久化目标")
+}
+
+func TestRecovery_UncertainCommitOutcomeUnknownAuditAndHealthyLowerCommitStarted(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/unc/audit.bin"))
+	requireNoErr(t, err, "dest")
+
+	// 1. 健康 gen 1 悬停于 CommitStarted + 损坏 gen 2（无提交标记）-> 须判 ErrUncertainCommit（非 ErrCorruptJournal）
+	idMix := seedHealthyGen(t, rig, dest, 1, 8, true, false)
+	seedPartialGen(t, rig, idMix, dest, 2, 8, false, false)
+	rig.journals.inner.CorruptGeneration(idMix, 2, errors.New("gen 2 tail corrupt"))
+
+	// RecoverTransfer 必须记录 AuditOutcomeUnknown 且 OperationCompletedEvent 投影 OutcomeKindUnknown
+	beforeRec := len(rig.auditClust.Entries())
+	stRec := mustNewOpStream(t, rig.rng)
+	res, err := rig.svc.RecoverTransfer(ctx, transfer.RecoverTransferRequest{CallBase: rig.callBase(stRec), TransferID: idMix, PruneSuperseded: true})
+	requireErrIs(t, err, transfer.ErrUncertainCommit, "健康低代 CommitStarted + 损坏高代须判 ErrUncertainCommit")
+	if !res.UncertainCommit || res.SelectedGen != 1 {
+		t.Fatalf("应选中 UncertainCommit gen=1: %+v", res)
+	}
+	if !hasAuditOutcomeSince(rig.auditClust.Entries()[beforeRec:], ports.AuditOutcomeUnknown) {
+		t.Fatalf("RecoverTransfer 命中 UncertainCommit 必须写入 AuditOutcomeUnknown")
+	}
+	assertStreamCompletedOutcomeKind(t, drainOpStream(t, stRec), execution.OutcomeKindUnknown)
+
+	// ResumeTransfer 同样必须记录 AuditOutcomeUnknown 且投影 OutcomeKindUnknown
+	beforeRes := len(rig.auditClust.Entries())
+	stRes := mustNewOpStream(t, rig.rng)
+	_, err = rig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: rig.callBase(stRes), TransferID: idMix})
+	requireErrIs(t, err, transfer.ErrUncertainCommit, "ResumeTransfer 命中 UncertainCommit 须返回 ErrUncertainCommit")
+	if !hasAuditOutcomeSince(rig.auditClust.Entries()[beforeRes:], ports.AuditOutcomeUnknown) {
+		t.Fatalf("ResumeTransfer 命中 UncertainCommit 必须写入 AuditOutcomeUnknown")
+	}
+	assertStreamCompletedOutcomeKind(t, drainOpStream(t, stRes), execution.OutcomeKindUnknown)
+}
+
+func TestTransferAdmission_GenerationLockDuplicateIDAndLiveHandleMutex(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/adm"), 0o755), "MkdirAll /adm")
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/adm/f.bin"))
+	requireNoErr(t, err, "dest")
+
+	// 1. StartTransfer 锁定起始 Generation=1，拒绝 Generation > 1
+	_, err = rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest, TotalBytes: 4, Generation: 2})
+	requireErrIs(t, err, transfer.ErrInvalidRequest, "StartTransfer 禁止指定 Generation > 1")
+
+	// 2. 已存在 Committed / UncertainCommit 的 TransferID 禁止重复 StartTransfer
+	idCom := seedHealthyGen(t, rig, dest, 1, 4, true, true)
+	idUnc := seedHealthyGen(t, rig, dest, 1, 4, true, false)
+	for _, existingID := range []security.OperationID{idCom, idUnc} {
+		_, err = rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{
+			CallBase: rig.callBase(nil), TransferID: algebraic.Some(existingID), Dest: dest, TotalBytes: 4,
+		})
+		requireErrIs(t, err, ports.ErrAlreadyExists, "已落盘 TransferID 禁止重复 StartTransfer")
+	}
+
+	// 3. 活跃句柄存在时，重复 StartTransfer 与同代 ResumeTransfer(StartNextGen=false) 均须拒绝
+	liveID := mustOpID(t, rig)
+	info, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{
+		CallBase: rig.callBase(nil), TransferID: algebraic.Some(liveID), Dest: dest, TotalBytes: 4,
+	})
+	requireNoErr(t, err, "StartTransfer live")
+	_, err = rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{
+		CallBase: rig.callBase(nil), TransferID: algebraic.Some(liveID), Dest: dest, TotalBytes: 4,
+	})
+	requireErrIs(t, err, ports.ErrAlreadyExists, "活跃句柄存在时禁止重复 StartTransfer")
+	_, err = rig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{
+		CallBase: rig.callBase(nil), TransferID: liveID, StartNextGen: false,
+	})
+	requireErrIs(t, err, ports.ErrAlreadyExists, "同代句柄活跃时禁止双活 ResumeTransfer")
+	requireNoErr(t, rig.svc.AbortTransfer(ctx, transfer.AbortTransferRequest{CallBase: rig.callBase(nil), Handle: info.Handle, Reason: "cleanup"}), "cleanup abort")
+}
+
+func TestTransferRegister_AuditPostWriteErrorRollsBackHandle(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileDirectOperator, omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/rb/out.bin"))
+	requireNoErr(t, err, "dest")
+
+	// 1. StartTransfer 遭遇 AuditPostWriteError 时回滚释放句柄并返回零 TransferHandleInfo
+	rig.auditSink.SetBoundaryHook(func(b sim.AuditBoundary, _ security.OperationID) {
+		if b == sim.AuditBoundaryAfterAuthorized {
+			rig.auditClust.SetENOSPC(true)
+		}
+	})
+	info, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest, TotalBytes: 4})
+	rig.auditSink.SetBoundaryHook(nil)
+	rig.auditClust.SetENOSPC(false)
+	requireErrIs(t, err, ports.ErrAuditPostWrite, "StartTransfer 终态审计失败须返回 ErrAuditPostWrite")
+	if info.Handle.IsValid() || rig.pool.Stats().ActiveHandles != 0 {
+		t.Fatalf("StartTransfer 审计失败必须回滚句柄并返回零值: handleValid=%v active=%d", info.Handle.IsValid(), rig.pool.Stats().ActiveHandles)
+	}
+
+	// 2. ResumeTransfer 遭遇 AuditPostWriteError 同样回滚释放句柄并返回零值
+	resumeID := seedHealthyGen(t, rig, dest, 1, 4, false, false)
+	rig.auditSink.SetBoundaryHook(func(b sim.AuditBoundary, _ security.OperationID) {
+		if b == sim.AuditBoundaryAfterAuthorized {
+			rig.auditClust.SetENOSPC(true)
+		}
+	})
+	resInfo, err := rig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: rig.callBase(nil), TransferID: resumeID})
+	rig.auditSink.SetBoundaryHook(nil)
+	rig.auditClust.SetENOSPC(false)
+	requireErrIs(t, err, ports.ErrAuditPostWrite, "ResumeTransfer 终态审计失败须返回 ErrAuditPostWrite")
+	if resInfo.Handle.IsValid() || rig.pool.Stats().ActiveHandles != 0 {
+		t.Fatalf("ResumeTransfer 审计失败必须回滚句柄并返回零值: handleValid=%v active=%d", resInfo.Handle.IsValid(), rig.pool.Stats().ActiveHandles)
+	}
+}
+
+func TestCommitTransfer_TransientVerifyPartialWALAndCommittedWALUncertainState(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/cm"), 0o755), "MkdirAll /cm")
+
+	// 1. 瞬态核验失败保留 Verifying 与暂存，重连后 CommitTransfer 可成功；2. Verified 后 CommitStarted WAL 失败释放句柄可同代恢复
+	assertTransientVerifyAndPartialWALRecovery(t, rig)
+
+	// 3. Committed WAL 写盘失败 -> 确定性转 *fsm.TransferUncertainCommit + FSM 事件 + AuditOutcomeUnknown
+	dest3, err := fsm.NewUploadDest(mustRemotePath(t, "/cm/cwal.bin"))
+	requireNoErr(t, err, "dest3")
+	info3, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest3, TotalBytes: 4})
+	requireNoErr(t, err, "start3")
+	_, err = rig.svc.WriteTransferChunk(ctx, transfer.WriteTransferChunkRequest{CallBase: rig.callBase(nil), Handle: info3.Handle, Offset: 0, Data: []byte("abcd")})
+	requireNoErr(t, err, "write3")
+	rig.journals.mu.Lock()
+	rig.journals.failOnAppendKind, rig.journals.appendErr = fsm.JournalRecordCommitted, errors.New("disk full")
+	rig.journals.mu.Unlock()
+	beforeAud := len(rig.auditClust.Entries())
+	stCom := mustNewOpStream(t, rig.rng)
+	comRes, err := rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(stCom), Handle: info3.Handle})
+	rig.journals.mu.Lock()
+	rig.journals.appendErr = nil
+	rig.journals.mu.Unlock()
+	requireErrIs(t, err, transfer.ErrUncertainCommit, "Committed WAL 写盘失败须返回 ErrUncertainCommit")
+	if comRes.State == nil || comRes.State.Kind() != fsm.TransferKindUncertainCommit {
+		t.Fatalf("Committed WAL 失败必须确定性转 TransferUncertainCommit，实际=%+v", comRes.State)
+	}
+	if !hasAuditOutcomeSince(rig.auditClust.Entries()[beforeAud:], ports.AuditOutcomeUnknown) {
+		t.Fatalf("Committed WAL 失败必须写入 AuditOutcomeUnknown")
+	}
+	evs := drainOpStream(t, stCom)
+	assertStreamCompletedOutcomeKind(t, evs, execution.OutcomeKindUnknown)
+	assertStreamHasTransferState(t, evs, fsm.TransferKindUncertainCommit)
+}
+
+func assertTransientVerifyAndPartialWALRecovery(t *testing.T, rig *transferTestRig) {
+	t.Helper()
+	ctx := context.Background()
+	dest, err := fsm.NewUploadDest(mustRemotePath(t, "/cm/tv.bin"))
+	requireNoErr(t, err, "dest")
+	info, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest, TotalBytes: 4})
+	requireNoErr(t, err, "start")
+	_, err = rig.svc.WriteTransferChunk(ctx, transfer.WriteTransferChunkRequest{CallBase: rig.callBase(nil), Handle: info.Handle, Offset: 0, Data: []byte("1234")})
+	requireNoErr(t, err, "write")
+	// 吊销并恢复使 hasher=nil（触发远端回读 verifyStagedDigest）
+	hopDig, _ := rig.plan.HopDigestAt(0)
+	requireNoErr(t, rig.pool.RetireHop(hopDig), "RetireHop")
+	resumed, err := rig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: rig.callBase(nil), TransferID: info.TransferID})
+	requireNoErr(t, err, "ResumeTransfer")
+
+	rig.dialer.mu.Lock()
+	rig.dialer.onReadChunk = func(context.Context, pathalg.RemotePath, int64, int64) error { return ports.ErrClosed }
+	rig.dialer.mu.Unlock()
+	_, err = rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(nil), Handle: resumed.Handle})
+	requireErrIs(t, err, ports.ErrClosed, "瞬态读盘失败须原样返回且不中止")
+	rig.dialer.mu.Lock()
+	rig.dialer.onReadChunk = nil
+	rig.dialer.mu.Unlock()
+	snap, err := rig.svc.InspectTransfer(ctx, transfer.InspectTransferRequest{CallBase: rig.callBase(nil), TransferID: info.TransferID})
+	requireNoErr(t, err, "InspectTransfer after transient verify error")
+	if !snap.LiveHandle || snap.StateKind != fsm.TransferKindVerifying {
+		t.Fatalf("瞬态核验失败必须保留 Verifying 与活跃句柄: %+v", snap)
+	}
+
+	// 在 Verified 落盘后的 CommitStarted 追加处失败 -> 释放句柄防内存 nextSeq 漂移 -> 恢复并重试 CommitTransfer 成功
+	rig.journals.mu.Lock()
+	rig.journals.failOnAppendKind, rig.journals.appendErr = fsm.JournalRecordCommitStarted, errors.New("wal transient")
+	rig.journals.mu.Unlock()
+	_, err = rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(nil), Handle: resumed.Handle})
+	rig.journals.mu.Lock()
+	rig.journals.appendErr = nil
+	rig.journals.mu.Unlock()
+	if err == nil || rig.pool.Stats().ActiveHandles != 0 {
+		t.Fatalf("部分 WAL 落盘失败必须返回错误并释放句柄: err=%v active=%d", err, rig.pool.Stats().ActiveHandles)
+	}
+	resumed2, err := rig.svc.ResumeTransfer(ctx, transfer.ResumeTransferRequest{CallBase: rig.callBase(nil), TransferID: info.TransferID})
+	requireNoErr(t, err, "ResumeTransfer after partial WAL")
+	com2, err := rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(nil), Handle: resumed2.Handle})
+	requireNoErr(t, err, "CommitTransfer retry after partial WAL")
+	if com2.State.Kind() != fsm.TransferKindCommitted || string(mustReadRemote(t, rig.remoteFS, "/cm/tv.bin")) != "1234" {
+		t.Fatalf("恢复后重试提交失败: %+v", com2)
+	}
+}
+
+func TestStreamTransfer_CrossRequestSymlinkDriftAndEnrichedAuditParams(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous, omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp/drift1"), 0o755), "MkdirAll drift1")
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp/drift2"), 0o755), "MkdirAll drift2")
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/etc"), 0o755), "MkdirAll /etc")
+
+	// 1. WriteTransferChunk 前将父目录替换为指向 /etc 的软链 -> ErrScopeEscalated 且 0 远端写分片
+	dest1, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/drift1/a.bin"))
+	requireNoErr(t, err, "dest1")
+	info1, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest1, TotalBytes: 4})
+	requireNoErr(t, err, "start1")
+	requireNoErr(t, rig.remoteFS.RemoveDir(ctx, mustRemotePath(t, "/tmp/drift1")), "rm drift1")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/drift1"), "/etc"), "symlink drift1->/etc")
+	var chunkWrites atomic.Int64
+	rig.dialer.mu.Lock()
+	rig.dialer.onWriteChunk = func(context.Context, pathalg.RemotePath, int64, int64) error { chunkWrites.Add(1); return nil }
+	rig.dialer.mu.Unlock()
+	beforeW := len(rig.auditClust.Entries())
+	_, err = rig.svc.WriteTransferChunk(ctx, transfer.WriteTransferChunkRequest{CallBase: rig.callBase(nil), Handle: info1.Handle, Offset: 0, Data: []byte("evil")})
+	rig.dialer.mu.Lock()
+	rig.dialer.onWriteChunk = nil
+	rig.dialer.mu.Unlock()
+	requireErrIs(t, err, gate.ErrScopeEscalated, "WriteTransferChunk 跨请求软链漂移必须返回 ErrScopeEscalated")
+	if chunkWrites.Load() != 0 {
+		t.Fatalf("漂移拦截后不得调用远端 WriteChunk，实际=%d", chunkWrites.Load())
+	}
+	assertAuditParamsContainTransferID(t, rig.auditClust.Entries()[beforeW:], info1.TransferID.String())
+	requireNoErr(t, rig.svc.AbortTransfer(ctx, transfer.AbortTransferRequest{CallBase: rig.callBase(nil), Handle: info1.Handle, Reason: "drift"}), "abort1")
+
+	// 2. CommitTransfer 前将父目录替换为指向 /etc 的软链 -> ErrScopeEscalated(DurabilityNotApplied) 转 Aborted，0 重命名进 /etc
+	dest2, err := fsm.NewUploadDest(mustRemotePath(t, "/tmp/drift2/b.bin"))
+	requireNoErr(t, err, "dest2")
+	info2, err := rig.svc.StartTransfer(ctx, transfer.StartTransferRequest{CallBase: rig.callBase(nil), Dest: dest2, TotalBytes: 4})
+	requireNoErr(t, err, "start2")
+	_, err = rig.svc.WriteTransferChunk(ctx, transfer.WriteTransferChunkRequest{CallBase: rig.callBase(nil), Handle: info2.Handle, Offset: 0, Data: []byte("abcd")})
+	requireNoErr(t, err, "write2")
+	// 先留出暂存外路径，再将 /tmp/drift2 目录换为软链（SimRemoteFS 要求空目录，故直接给目标文件位置放软链 /tmp/drift2/b.bin -> /etc/b.bin）
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/drift2/b.bin"), "/etc/b.bin"), "symlink b.bin->/etc/b.bin")
+	com2, err := rig.svc.CommitTransfer(ctx, transfer.CommitTransferRequest{CallBase: rig.callBase(nil), Handle: info2.Handle})
+	requireErrIs(t, err, gate.ErrScopeEscalated, "CommitTransfer 跨请求软链漂移必须返回 ErrScopeEscalated")
+	if com2.State == nil || com2.State.Kind() != fsm.TransferKindAborted {
+		t.Fatalf("CommitTransfer 漂移拦截应按 DurabilityNotApplied 转 Aborted: %+v", com2)
+	}
+	if _, sErr := rig.remoteFS.Lstat(ctx, mustRemotePath(t, "/etc/b.bin")); sErr == nil {
+		t.Fatalf("/etc/b.bin 不得被写入")
+	}
+}
+
+func seedAbortedGen(t *testing.T, rig *transferTestRig, dest fsm.TransferDest, gen, total uint64) security.OperationID {
+	t.Helper()
+	id := mustOpID(t, rig)
+	meta, err := fsm.NewTransferMeta(fsm.TransferMetaSpec{TransferID: id, Dest: dest, TotalBytes: total, JournalVersion: fsm.JournalVersionV2, Generation: gen})
+	requireNoErr(t, err, "meta")
+	initSt, err := fsm.NewTransferState(meta)
+	requireNoErr(t, err, "initSt")
+	st, effs, _, err := fsm.TransitionTransfer(initSt, fsm.TransferInputStart())
+	requireNoErr(t, err, "start")
+	appendTestEffs(t, rig, effs)
+	_, effs, _, err = fsm.TransitionTransfer(st, fsm.TransferInputAbort("seeded"))
+	requireNoErr(t, err, "abort")
+	appendTestEffs(t, rig, effs)
+	return id
+}
+
+func hasAuditOutcomeSince(entries []ports.AuditEntry, want ports.AuditOutcome) bool {
+	for _, e := range entries {
+		if e.Outcome() == want {
+			return true
+		}
+	}
+	return false
+}
+
+func assertAuditParamsContainTransferID(t *testing.T, entries []ports.AuditEntry, wantID string) {
+	t.Helper()
+	for _, e := range entries {
+		if e.Binding().Parameters()["transfer_id"] == wantID {
+			return
+		}
+	}
+	t.Fatalf("审计记录缺少 transfer_id=%s 参数上下文", wantID)
+}
+
+func assertStreamCompletedOutcomeKind(t *testing.T, evs []events.Event, want execution.OutcomeKind) {
+	t.Helper()
+	for _, ev := range evs {
+		if c, ok := ev.(*events.OperationCompletedEvent); ok {
+			out, has := c.Outcome().Get()
+			if !has || out.Kind() != want {
+				t.Fatalf("OperationCompletedEvent.Outcome=%v(has=%v), want %s", out, has, want)
+			}
+			return
+		}
+	}
+	t.Fatalf("事件流缺少 OperationCompletedEvent")
+}
+
+func assertStreamHasTransferState(t *testing.T, evs []events.Event, want fsm.TransferStateKind) {
+	t.Helper()
+	for _, ev := range evs {
+		if f, ok := ev.(*events.FSMTransitionEvent); ok && f.ToState() == want.String() {
+			return
+		}
+	}
+	t.Fatalf("事件流缺少目标状态 %s 的 FSMTransitionEvent", want)
+}
+
+func assertNoTransferDiagnostics(t *testing.T, sub *events.SystemSubscription) {
+	t.Helper()
+	for {
+		ev, ok, err := sub.Next(context.Background())
+		requireNoErr(t, err, "SystemSubscription.Next")
+		if !ok {
+			return
+		}
+		if d, ok := ev.(*events.DiagnosticEvent); ok && d.Scope() == events.DiagnosticScopeTransfer {
+			t.Fatalf("Gate 拒绝前不应向 SystemBus 发射 transfer 诊断事件: code=%s msg=%s", d.Code(), d.Message())
 		}
 	}
 }

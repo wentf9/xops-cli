@@ -3,6 +3,9 @@ package transfer_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -13,6 +16,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/usecase/transfer"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -249,8 +253,8 @@ func TestSCPDownload_ParallelSingleFileZeroOpReadResumeTimesAndRejectSpecial(t *
 	fifoStat, err := ports.NewRemoteFileStat(ports.RemoteFileStatSpec{Path: mustRemotePath(t, "/pub/fifo"), Anchor: fifoAnchor})
 	requireNoErr(t, err, "NewRemoteFileStat(Other)")
 	rig.dialer.mu.Lock()
-	rig.dialer.onLstatOverride = func(p pathalg.RemotePath) (ports.RemoteFileStat, bool) {
-		return fifoStat, p.String() == "/pub/fifo"
+	rig.dialer.onLstatOverride = func(p pathalg.RemotePath) (ports.RemoteFileStat, bool, error) {
+		return fifoStat, p.String() == "/pub/fifo", nil
 	}
 	rig.dialer.mu.Unlock()
 	_, err = rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
@@ -362,5 +366,225 @@ func assertHasStartedAndCompleted(t *testing.T, evs []events.Event, expectSuccee
 	}
 	if !sawStart || !sawDone {
 		t.Fatalf("事件流缺少 Started/Completed: sawStart=%v sawDone=%v total=%d", sawStart, sawDone, len(evs))
+	}
+}
+
+func TestSCPUpload_ExpandIntoDirRound2ProtectionAndDrift(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{
+		profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous,
+		protectedPats: []string{"/etc/**", "/root/**", "/**/authorized_keys"},
+	})
+	defer rig.close()
+	ctx := context.Background()
+
+	// 1. ExpandIntoDir=true 展开命中受保护规则 **/authorized_keys（直接目录与目录软链）须被 Round-2 拦截且 0 写入
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/home/ops/.ssh"), 0o700), "MkdirAll .ssh")
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp"), 0o755), "MkdirAll /tmp")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/link_ssh"), "/home/ops/.ssh"), "PutSymlink link_ssh")
+	requireNoErr(t, rig.opReadFS.PutFile(mustLocalSource(t, "/local/authorized_keys"), []byte("ssh-ed25519 AAAA")), "PutFile authorized_keys")
+	akSrc, err := transfer.NewOperatorUploadSource(mustLocalSource(t, "/local/authorized_keys"), pathalg.SymlinkReject)
+	requireNoErr(t, err, "NewOperatorUploadSource")
+
+	for _, target := range []string{"/home/ops/.ssh", "/tmp/link_ssh"} {
+		_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+			CallBase: rig.callBase(nil), Source: akSrc, RemoteDest: mustRemotePath(t, target), ExpandIntoDir: true,
+		})
+		requireErrIs(t, err, gate.ErrApprovalRequired, "ExpandIntoDir 展开至 "+target+"/authorized_keys 必须被 Round-2 拦截")
+	}
+	if _, sErr := rig.remoteFS.Lstat(ctx, mustRemotePath(t, "/home/ops/.ssh/authorized_keys")); sErr == nil {
+		t.Fatalf("/home/ops/.ssh/authorized_keys 不得被写入")
+	}
+
+	// 2. TOCTOU 漂移：Round-2 通过后将 /tmp/drop 替换为指向 /etc 的软链 -> 执行期 verifyRemotePathAuthorized 返回 ErrScopeEscalated
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp/drop"), 0o755), "MkdirAll /tmp/drop")
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/etc"), 0o755), "MkdirAll /etc")
+	requireNoErr(t, rig.opReadFS.PutFile(mustLocalSource(t, "/local/normal.txt"), []byte("hello")), "PutFile normal.txt")
+	normSrc, err := transfer.NewOperatorUploadSource(mustLocalSource(t, "/local/normal.txt"), pathalg.SymlinkReject)
+	requireNoErr(t, err, "normSrc")
+	var lstatHits atomic.Int64
+	rig.dialer.mu.Lock()
+	rig.dialer.onLstatOverride = func(p pathalg.RemotePath) (ports.RemoteFileStat, bool, error) {
+		var z ports.RemoteFileStat
+		if p.String() == "/tmp/drop" && lstatHits.Add(1) == 2 {
+			if rErr := rig.remoteFS.RemoveDir(ctx, mustRemotePath(t, "/tmp/drop")); rErr != nil {
+				return z, false, rErr
+			}
+			if sErr := rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/drop"), "/etc"); sErr != nil {
+				return z, false, sErr
+			}
+		}
+		return z, false, nil
+	}
+	rig.dialer.mu.Unlock()
+	_, err = rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: normSrc, RemoteDest: mustRemotePath(t, "/tmp/drop"), ExpandIntoDir: true,
+	})
+	requireErrIs(t, err, gate.ErrScopeEscalated, "ExpandIntoDir 漂移至 /etc 必须触发 ErrScopeEscalated")
+	if _, sErr := rig.remoteFS.Lstat(ctx, mustRemotePath(t, "/etc/normal.txt")); sErr == nil {
+		t.Fatalf("/etc/normal.txt 不得被写入")
+	}
+}
+
+func TestSCPUpload_ResumePrefixVerificationResistsSparseHolesAndSwappedSource(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{})
+	defer rig.close()
+	ctx := context.Background()
+
+	const chunkSz = 4096
+	payloadA := makePatternPayload(3 * chunkSz)
+	payloadB := bytes.Repeat([]byte{0x5a, 0xa5, 0x3c, 0xc3}, 3*chunkSz/4)
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/up"), 0o755), "MkdirAll /up")
+	dest := mustRemotePath(t, "/up/file.bin")
+	sum := sha256.Sum256([]byte("xops.scp.upload.v1\x00" + dest.String()))
+	stagePath := mustRemotePath(t, "/up/.xops-stage-"+hex.EncodeToString(sum[:12])+".part")
+
+	// 1. 远端暂存存在稀疏空洞（仅 chunk 1 与 chunk 2 有效，chunk 0 为全零空洞）-> 续传须重传 chunk 0 并跳过已验分片
+	requireNoErr(t, rig.remoteFS.WriteChunk(ctx, stagePath, chunkSz, bytes.NewReader(payloadA[chunkSz:2*chunkSz]), chunkSz), "seed chunk 1")
+	requireNoErr(t, rig.remoteFS.WriteChunk(ctx, stagePath, 2*chunkSz, bytes.NewReader(payloadA[2*chunkSz:]), chunkSz), "seed chunk 2")
+	requireNoErr(t, rig.opReadFS.PutFile(mustLocalSource(t, "/local/a.bin"), payloadA), "PutFile a.bin")
+	srcA, err := transfer.NewOperatorUploadSource(mustLocalSource(t, "/local/a.bin"), pathalg.SymlinkReject)
+	requireNoErr(t, err, "srcA")
+	resA, err := rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: srcA, RemoteDest: dest, ChunkSize: chunkSz, Concurrency: 4, Resume: true,
+	})
+	requireNoErr(t, err, "SCPUpload Resume sparse hole repair")
+	if resA.ResumedBytes != 2*chunkSz || resA.ChunksTransferred != 1 || !bytes.Equal(mustReadRemote(t, rig.remoteFS, dest.String()), payloadA) {
+		t.Fatalf("稀疏空洞修复结果异常: res=%+v", resA)
+	}
+
+	// 2. 同大小换源：远端残留 payloadA 全长暂存，改传同长 payloadB -> 逐片回读失配全部重传，ResumedBytes=0 且字节精确
+	requireNoErr(t, rig.remoteFS.WriteChunk(ctx, stagePath, 0, bytes.NewReader(payloadA), int64(len(payloadA))), "seed stale payloadA stage")
+	requireNoErr(t, rig.opReadFS.PutFile(mustLocalSource(t, "/local/b.bin"), payloadB), "PutFile b.bin")
+	srcB, err := transfer.NewOperatorUploadSource(mustLocalSource(t, "/local/b.bin"), pathalg.SymlinkReject)
+	requireNoErr(t, err, "srcB")
+	resB, err := rig.svc.SCPUpload(ctx, transfer.SCPUploadRequest{
+		CallBase: rig.callBase(nil), Source: srcB, RemoteDest: dest, ChunkSize: chunkSz, Concurrency: 4, Resume: true,
+	})
+	requireNoErr(t, err, "SCPUpload Resume swapped source")
+	if resB.ResumedBytes != 0 || resB.ChunksTransferred != 3 || !bytes.Equal(mustReadRemote(t, rig.remoteFS, dest.String()), payloadB) {
+		t.Fatalf("换源续传结果异常: res=%+v", resB)
+	}
+}
+
+func TestSCPDownload_OrderedWindowResumeIsolationAndSymlinkOverwrite(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	const chunkSz = 4096
+	payload1 := makePatternPayload(4 * chunkSz)
+	t1 := time.Date(2025, time.October, 1, 10, 0, 0, 0, time.UTC)
+	mustWriteRemote(t, rig.remoteFS, "/dl/data.bin", payload1)
+	requireNoErr(t, rig.remoteFS.Chtimes(ctx, mustRemotePath(t, "/dl/data.bin"), t1, t1), "Chtimes t1")
+
+	// 1. 4 分片 + 3 并发滑动窗口确定性乱序对抗：
+	//    slot 容量=3，故收到 offset=3*chunkSz 在数学上等价于 consumer 已落盘 chunk 0 并释放 slot；
+	//    待 chunk 2 与 chunk 3 均读回后令 chunk 1 断连，验证本地暂存严格仅落盘 4096B（0 稀疏空洞）。
+	chunk2Read := make(chan struct{})
+	chunk0Written := make(chan struct{})
+	rig.dialer.mu.Lock()
+	rig.dialer.onReadChunk = func(rCtx context.Context, _ pathalg.RemotePath, offset, _ int64) error {
+		switch offset {
+		case 2 * chunkSz:
+			close(chunk2Read)
+		case 3 * chunkSz:
+			close(chunk0Written)
+		case chunkSz:
+			select {
+			case <-chunk2Read:
+			case <-rCtx.Done():
+				return rCtx.Err()
+			}
+			select {
+			case <-chunk0Written:
+			case <-rCtx.Done():
+				return rCtx.Err()
+			}
+			return ports.ErrClosed
+		}
+		return nil
+	}
+	rig.dialer.mu.Unlock()
+	_, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+		CallBase: rig.callBase(nil), RemoteSource: mustRemotePath(t, "/dl/data.bin"),
+		LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, "ordered/data.bin"),
+		SymlinkPolicy: pathalg.SymlinkReject, ChunkSize: chunkSz, Concurrency: 3, Resume: true,
+	})
+	requireErrIs(t, err, ports.ErrClosed, "chunk 1 模拟中断应失败并保留严格连续前缀")
+	rig.dialer.mu.Lock()
+	rig.dialer.onReadChunk = nil
+	rig.dialer.mu.Unlock()
+
+	// 验证同源 Resume=true 从 4096 精准续传剩余 3 片且字节完全一致
+	resResume, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+		CallBase: rig.callBase(nil), RemoteSource: mustRemotePath(t, "/dl/data.bin"),
+		LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, "ordered/data.bin"),
+		SymlinkPolicy: pathalg.SymlinkReject, ChunkSize: chunkSz, Concurrency: 3, Resume: true,
+	})
+	requireNoErr(t, err, "有序续传 SCPDownload")
+	if resResume.ResumedBytes != chunkSz || resResume.ChunksTransferred != 3 || !bytes.Equal(mustReadLocal(t, rig.scopedFS, rig.localRoot, "ordered/data.bin"), payload1) {
+		t.Fatalf("有序续传结果异常: %+v", resResume)
+	}
+
+	// 2. 源变更隔离：旧 stageToken 绑定源元信息，远端更换内容与 mtime 后 Resume=true 不得复用旧暂存
+	payload2 := bytes.Repeat([]byte{0x77, 0x88, 0x99, 0xaa}, chunkSz)
+	t2 := t1.Add(time.Hour)
+	mustWriteRemote(t, rig.remoteFS, "/dl/data.bin", payload2)
+	requireNoErr(t, rig.remoteFS.Chtimes(ctx, mustRemotePath(t, "/dl/data.bin"), t2, t2), "Chtimes t2")
+	resChanged, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+		CallBase: rig.callBase(nil), RemoteSource: mustRemotePath(t, "/dl/data.bin"),
+		LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, "ordered/data.bin"),
+		SymlinkPolicy: pathalg.SymlinkReject, ChunkSize: chunkSz, Concurrency: 3, Resume: true,
+	})
+	requireNoErr(t, err, "换源后 SCPDownload Resume")
+	if resChanged.ResumedBytes != 0 || !bytes.Equal(mustReadLocal(t, rig.scopedFS, rig.localRoot, "ordered/data.bin"), payload2) {
+		t.Fatalf("远端源变更后不得复用旧暂存: %+v", resChanged)
+	}
+
+	// 3. 软链覆写语义：NoClobber=false 可覆写已有常规文件与旧软链，拒绝覆写目录；NoClobber=true 返回 ErrAlreadyExists
+	assertLocalSymlinkOverwriteSemantics(t, rig)
+}
+
+func assertLocalSymlinkOverwriteSemantics(t *testing.T, rig *transferTestRig) {
+	t.Helper()
+	ctx := context.Background()
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/dl/sym"), "target.txt"), "PutSymlink /dl/sym")
+	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {
+		if _, err := root.WriteChunk(mustLocalDest(t, "sym_over_file"), 0, bytes.NewReader([]byte("old")), 3, 0o600); err != nil {
+			return err
+		}
+		if err := root.CreateSymlink(mustLocalDest(t, "sym_over_sym"), "old.txt"); err != nil {
+			return err
+		}
+		return root.MkdirAll(mustLocalDest(t, "sym_over_dir"), 0o755)
+	}), "seed local overwrite targets")
+
+	for _, name := range []string{"sym_over_file", "sym_over_sym"} {
+		_, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+			CallBase: rig.callBase(nil), RemoteSource: mustRemotePath(t, "/dl/sym"),
+			LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, name),
+			SymlinkPolicy: pathalg.SymlinkContainedRelative, NoClobber: true,
+		})
+		requireErrIs(t, err, ports.ErrAlreadyExists, "NoClobber=true 必须阻断软链覆写 "+name)
+		res, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+			CallBase: rig.callBase(nil), RemoteSource: mustRemotePath(t, "/dl/sym"),
+			LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, name),
+			SymlinkPolicy: pathalg.SymlinkContainedRelative, NoClobber: false,
+		})
+		requireNoErr(t, err, "NoClobber=false 覆写 "+name)
+		if res.SymlinksCreated != 1 {
+			t.Fatalf("SymlinksCreated=%d, want 1", res.SymlinksCreated)
+		}
+	}
+	_, err := rig.svc.SCPDownload(ctx, transfer.SCPDownloadRequest{
+		CallBase: rig.callBase(nil), RemoteSource: mustRemotePath(t, "/dl/sym"),
+		LocalRoot: rig.localRoot, LocalDest: mustLocalDest(t, "sym_over_dir"),
+		SymlinkPolicy: pathalg.SymlinkContainedRelative, NoClobber: false,
+	})
+	if !errors.Is(err, ports.ErrRemoteIsDir) {
+		t.Fatalf("软链禁止覆写已有目录: got %v, want ErrRemoteIsDir", err)
 	}
 }

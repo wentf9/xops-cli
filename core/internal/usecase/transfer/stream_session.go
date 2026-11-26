@@ -20,32 +20,31 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
 // managedTransferSession 承载托管于连接池 SlotMap 的跨请求 10 GiB 流式传输会话（ADR-009 / ADR-016）。
 // 仅经 pool.RegisterLeaseHandleWith[plan.KindTransfer] 构造，持有可撤销钉选 TransportConn（零 borrowed 逃逸），
-// 并由 conc.CtxMutex 串行化分片/提交/中止操作；撤销时仅关闭 SFTP 与钉选视图，绝不误关共享底层连接。
+// 并由 conc.CtxMutex 串行化分片/提交/中止操作；同步 Close() 零协程且绝不误关共享底层连接。
 type managedTransferSession struct {
-	mu                                  *conc.CtxMutex
-	conn                                ports.TransportConn
-	rfs                                 ports.RemoteFSPort
-	revokeCtx                           context.Context
-	state                               fsm.TransferState
-	meta                                fsm.TransferMeta
-	remoteSource, remoteStagePath       algebraic.Option[pathalg.RemotePath]
-	localRoot                           algebraic.Option[pathalg.LocalDir]
-	localStageDest                      algebraic.Option[pathalg.LocalRootedDest]
-	renameSpec                          ports.RemoteRenameSpec
-	modTime                             algebraic.Option[time.Time]
-	perm                                fs.FileMode
-	noClobber, applyPerm, preserveTimes bool
-	hasher                              hash.Hash // 连续流式加速哈希；崩溃恢复后置 nil 强制全量回读校验
-	startedAt                           time.Time
-	valid                               bool
-	closed                              atomic.Bool
-	closeOnce                           sync.Once
-	closeErr                            error
+	mu              *conc.CtxMutex
+	conn            ports.TransportConn
+	rfs             ports.RemoteFSPort
+	revokeCtx       context.Context
+	state           fsm.TransferState
+	meta            fsm.TransferMeta
+	opts            TransferSessionOptions
+	remoteStagePath algebraic.Option[pathalg.RemotePath]
+	localStageDest  algebraic.Option[pathalg.LocalRootedDest]
+	renameSpec      ports.RemoteRenameSpec
+	effectivePerm   fs.FileMode
+	hasher          hash.Hash // 连续流式加速哈希；崩溃恢复后置 nil 强制全量回读校验
+	startedAt       time.Time
+	valid           bool
+	closed          atomic.Bool
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 // IsValid / Close 实现 pool.ManagedResource 契约。
@@ -57,24 +56,19 @@ func (m *managedTransferSession) Close() error {
 		return nil
 	}
 	m.closed.Store(true)
-	m.closeOnce.Do(func() { m.closeErr = errors.Join(closeIfNonNil(m.rfs), closeIfNonNil(m.conn)) })
+	m.closeOnce.Do(func() { m.closeErr = errors.Join(m.rfs.Close(), m.conn.Close()) })
 	return m.closeErr
 }
-func closeIfNonNil(c io.Closer) error {
-	if c == nil {
-		return nil
-	}
-	return c.Close()
-}
 func (m *managedTransferSession) snapshotIfMatches(targetID security.OperationID) (TransferStatusSnapshot, bool) {
-	meta := fsm.TransferMetaOf(m.state)
-	if !meta.TransferID().Equal(targetID) {
-		return TransferStatusSnapshot{}, false
+	if meta := fsm.TransferMetaOf(m.state); meta.TransferID().Equal(targetID) {
+		off, chunks := transferProgressOf(m.state)
+		return TransferStatusSnapshot{TransferID: meta.TransferID(), LiveHandle: true, IsTerminal: m.state.IsTerminal(), Meta: meta, StateKind: m.state.Kind(), Offset: off, ChunkCount: chunks}, true
 	}
-	off, chunks := transferProgressOf(m.state)
-	return TransferStatusSnapshot{TransferID: meta.TransferID(), LiveHandle: true, Meta: meta, StateKind: m.state.Kind(), IsTerminal: m.state.IsTerminal(), Offset: off, ChunkCount: chunks}, true
+	return TransferStatusSnapshot{}, false
 }
-func (s *Service) buildManagedTransferSession(revokeCtx context.Context, conn ports.TransportConn, req StartTransferRequest, defaultPerm fs.FileMode, renameSpec ports.RemoteRenameSpec, resumedState fsm.TransferState, freshStart bool, startedAt time.Time) (sess *managedTransferSession, effs []fsm.TransferEffect, evs []fsm.TransferEvent, err error) {
+
+// buildManagedTransferSession 绑定长生命 SFTP 视图至 revokeCtx，并经携带调用方取消信号的 probeCtx 探测下载源。
+func (s *Service) buildManagedTransferSession(probeCtx, revokeCtx context.Context, conn ports.TransportConn, req StartTransferRequest, defaultPerm fs.FileMode, renameSpec ports.RemoteRenameSpec, resumedState fsm.TransferState, freshStart bool, startedAt time.Time) (sess *managedTransferSession, effs []fsm.TransferEffect, evs []fsm.TransferEvent, err error) {
 	rfs, err := conn.OpenRemoteFS(revokeCtx)
 	if err != nil {
 		return nil, nil, nil, err
@@ -84,24 +78,22 @@ func (s *Service) buildManagedTransferSession(revokeCtx context.Context, conn po
 			_ = rfs.Close()
 		}
 	}()
-	totalBytes, modTime, perm, err := inspectStreamDownloadSource(revokeCtx, rfs, req, defaultPerm)
+	totalBytes, modTime, perm, err := inspectStreamDownloadSource(probeCtx, rfs, req, defaultPerm)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	meta, st, effs, evs, err := initOrResumeTransferFSM(req, totalBytes, resumedState, freshStart)
+	var remoteStage algebraic.Option[pathalg.RemotePath]
+	var localStage algebraic.Option[pathalg.LocalRootedDest]
+	if err == nil {
+		remoteStage, localStage, err = computeStreamStagePaths(meta)
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	remoteStage, localStage, err := computeStreamStagePaths(meta)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return &managedTransferSession{
-		mu: conc.NewCtxMutex(), conn: conn, rfs: rfs, revokeCtx: revokeCtx, state: st, meta: meta,
-		remoteSource: req.RemoteSource, remoteStagePath: remoteStage, localRoot: req.LocalRoot, localStageDest: localStage,
-		renameSpec: renameSpec, modTime: modTime, perm: perm, noClobber: req.NoClobber,
-		applyPerm: req.Perm.IsSome(), preserveTimes: req.PreserveTimes, hasher: pickIf(freshStart, sha256.New(), nil), startedAt: startedAt, valid: true,
-	}, effs, evs, nil
+	opts := req.TransferSessionOptions
+	opts.ModTime = modTime
+	return &managedTransferSession{mu: conc.NewCtxMutex(), conn: conn, rfs: rfs, revokeCtx: revokeCtx, state: st, meta: meta, opts: opts, remoteStagePath: remoteStage, localStageDest: localStage, renameSpec: renameSpec, effectivePerm: perm, hasher: pickIf(freshStart, sha256.New(), nil), startedAt: startedAt, valid: true}, effs, evs, nil
 }
 func inspectStreamDownloadSource(ctx context.Context, rfs ports.RemoteFSPort, req StartTransferRequest, defaultPerm fs.FileMode) (uint64, algebraic.Option[time.Time], fs.FileMode, error) {
 	if req.Dest.Direction() != fsm.TransferDirectionDownload {
@@ -115,12 +107,11 @@ func inspectStreamDownloadSource(ctx context.Context, rfs ports.RemoteFSPort, re
 	if err != nil || !st.IsRegular() {
 		return 0, req.ModTime, defaultPerm, pickIf[error](err != nil, err, pickIf(st.IsDir(), ports.ErrRemoteIsDir, ports.ErrNotRegularFile))
 	}
-	size := uint64(st.Size())
-	if size > fsm.MaxTransferBytes || (req.TotalBytes > 0 && req.TotalBytes != size) {
+	if size := uint64(st.Size()); size > fsm.MaxTransferBytes || (req.TotalBytes > 0 && req.TotalBytes != size) {
 		return 0, req.ModTime, defaultPerm, pickIf[error](size > fsm.MaxTransferBytes, fmt.Errorf("%w: 远端大小 %d 超限", fsm.ErrTransferSizeExceeded, size), fmt.Errorf("%w: 声明大小与远端不符", ErrInvalidRequest))
 	}
 	mt := pickIf(req.PreserveTimes && req.ModTime.IsNone() && isValidRFC3339Time(st.ModTime()), algebraic.Some(st.ModTime()), req.ModTime)
-	return size, mt, pickIf(req.Perm.IsNone() && st.Perm() != 0, sanitizeLocalDownloadPerm(st.Perm()), defaultPerm), nil
+	return uint64(st.Size()), mt, pickIf(req.Perm.IsNone() && st.Perm() != 0, sanitizeLocalDownloadPerm(st.Perm()), defaultPerm), nil
 }
 func initOrResumeTransferFSM(req StartTransferRequest, totalBytes uint64, resumedState fsm.TransferState, freshStart bool) (fsm.TransferMeta, fsm.TransferState, []fsm.TransferEffect, []fsm.TransferEvent, error) {
 	if !freshStart {
@@ -142,33 +133,34 @@ func computeStreamStagePaths(meta fsm.TransferMeta) (rpOpt algebraic.Option[path
 	sum := sha256.Sum256([]byte("xops.stream.transfer.v2\x00" + meta.Direction().String() + ":" + meta.TransferID().String() + ":g" + strconv.FormatUint(meta.Generation(), 10)))
 	token := fmt.Sprintf("%x", sum[:12])
 	if meta.Direction() == fsm.TransferDirectionUpload {
-		if dst, ok := meta.Dest().Remote().Get(); ok {
-			rp, rErr := makeRemoteStagePath(dst, token)
-			return algebraic.Some(rp), lpOpt, rErr
+		dst, ok := meta.Dest().Remote().Get()
+		if !ok {
+			return rpOpt, lpOpt, fmt.Errorf("%w: 缺少 RemotePath", ErrInvalidRequest)
 		}
-		return rpOpt, lpOpt, fmt.Errorf("%w: 缺少 RemotePath", ErrInvalidRequest)
+		rp, rErr := makeRemoteStagePath(dst, token)
+		return algebraic.Some(rp), lpOpt, rErr
 	}
-	if dst, ok := meta.Dest().Local().Get(); ok {
-		lp, lErr := makeLocalStageDest(dst, token)
-		return rpOpt, algebraic.Some(lp), lErr
+	dst, ok := meta.Dest().Local().Get()
+	if !ok {
+		return rpOpt, lpOpt, fmt.Errorf("%w: 缺少 LocalRootedDest", ErrInvalidRequest)
 	}
-	return rpOpt, lpOpt, fmt.Errorf("%w: 缺少 LocalRootedDest", ErrInvalidRequest)
+	lp, lErr := makeLocalStageDest(dst, token)
+	return rpOpt, algebraic.Some(lp), lErr
 }
 
 // verifyStagedDigest 计算完整暂存文件 SHA-256（下载重读本机 ScopedRootFS，上传恢复后经 SFTP ReadChunk 回读）。
-func (s *Service) verifyStagedDigest(ctx context.Context, sess *managedTransferSession) (security.Digest, error) {
+func (s *Service) verifyStagedDigest(ctx context.Context, sess *managedTransferSession) (dig security.Digest, err error) {
 	totalBytes := sess.meta.TotalBytes()
 	if totalBytes == 0 {
 		return security.DigestBytes(nil), nil
 	}
 	if sess.meta.Direction() == fsm.TransferDirectionDownload {
-		lr, okR := sess.localRoot.Get()
+		lr, okR := sess.opts.LocalRoot.Get()
 		stageDest, okS := sess.localStageDest.Get()
 		if s.scopedFS == nil || !okR || !okS {
-			return zeroVal[security.Digest](), pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, fmt.Errorf("%w: 缺少 LocalRoot/暂存路径", ErrInvalidRequest))
+			return dig, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, fmt.Errorf("%w: 缺少 LocalRoot/暂存路径", ErrInvalidRequest))
 		}
-		var dig security.Digest
-		err := s.scopedFS.WithRoot(lr, func(root ports.RootHandle) (hErr error) {
+		err = s.scopedFS.WithRoot(lr, func(root ports.RootHandle) (hErr error) {
 			dig, hErr = hashLocalStagedFile(root, stageDest, int64(totalBytes))
 			return hErr
 		})
@@ -185,7 +177,7 @@ func hashRemoteTransferStage(ctx context.Context, rfs ports.RemoteFSPort, stageO
 		return zeroVal[security.Digest](), fmt.Errorf("%w: 缺少远端暂存路径", ErrInvalidRequest)
 	}
 	if st, err := rfs.Lstat(ctx, stagePath); err != nil || !st.IsRegular() || uint64(st.Size()) != totalBytes {
-		return zeroVal[security.Digest](), pickIf[error](err != nil, err, fmt.Errorf("%w: 远端暂存大小 %d 与预期 %d 不符", io.ErrUnexpectedEOF, st.Size(), totalBytes))
+		return zeroVal[security.Digest](), pickIf[error](err != nil, err, pickIf(!st.IsRegular(), ports.ErrNotRegularFile, fmt.Errorf("%w: 远端暂存大小 %d 与预期 %d 不符", io.ErrUnexpectedEOF, st.Size(), totalBytes)))
 	}
 	h := sha256.New()
 	for offset := int64(0); uint64(offset) < totalBytes; {
@@ -199,24 +191,22 @@ func hashRemoteTransferStage(ctx context.Context, rfs ports.RemoteFSPort, stageO
 	return digestFromHash(h), nil
 }
 
-// executeAtomicTransferCommit 显式区分本机 ScopedRootFS 原子 Rename 与远端 SFTP v3 RenameAtomic 边界。
-func (s *Service) executeAtomicTransferCommit(ctx context.Context, sess *managedTransferSession) (fsm.DurabilityStatus, string, error) {
-	if sess.meta.Direction() == fsm.TransferDirectionDownload {
-		return s.commitLocalScopedTransfer(sess)
-	}
-	return s.commitRemoteSFTPTransfer(ctx, sess)
-}
-
 //xops:syncclosure
 func (s *Service) applyPostCommitModTime(sess *managedTransferSession, fn func(time.Time) error) {
-	if mt, ok := sess.modTime.Get(); sess.preserveTimes && ok && isValidRFC3339Time(mt) {
+	if mt, ok := sess.opts.ModTime.Get(); sess.opts.PreserveTimes && ok && isValidRFC3339Time(mt) {
 		if cErr := fn(mt); cErr != nil {
 			s.emitDiagnostic(algebraic.Some(sess.meta.TransferID()), events.SeverityWarn, "post_commit_chtimes_failed", cErr.Error(), nil)
 		}
 	}
 }
+func (s *Service) commitByDirection(ctx context.Context, sess *managedTransferSession, handleBinding security.OperationBinding) (fsm.DurabilityStatus, string, error) {
+	if sess.meta.Direction() == fsm.TransferDirectionDownload {
+		return s.commitLocalScopedTransfer(sess)
+	}
+	return s.commitRemoteSFTPTransfer(ctx, sess, handleBinding)
+}
 func (s *Service) commitLocalScopedTransfer(sess *managedTransferSession) (fsm.DurabilityStatus, string, error) {
-	lr, okR := sess.localRoot.Get()
+	lr, okR := sess.opts.LocalRoot.Get()
 	stageDest, okS := sess.localStageDest.Get()
 	finalDest, okF := sess.meta.Dest().Local().Get()
 	if s.scopedFS == nil || !okR || !okS || !okF {
@@ -224,9 +214,19 @@ func (s *Service) commitLocalScopedTransfer(sess *managedTransferSession) (fsm.D
 	}
 	preRejected := false
 	if err := s.scopedFS.WithRoot(lr, func(root ports.RootHandle) error {
-		var rErr error
-		if preRejected, rErr = renameLocalStageAtomic(root, stageDest, finalDest, sess.meta.TotalBytes(), sess.perm, sess.noClobber); rErr != nil {
-			return rErr
+		err := ensureParentLocalDir(root, finalDest)
+		if err == nil {
+			err = checkLocalNoClobber(root, finalDest, sess.opts.NoClobber)
+		}
+		if err == nil && sess.meta.TotalBytes() == 0 {
+			_, err = root.WriteChunk(stageDest, 0, bytes.NewReader(nil), 0, sanitizeLocalDownloadPerm(sess.effectivePerm))
+		}
+		if err != nil {
+			preRejected = true
+			return err
+		}
+		if err = root.Rename(stageDest, finalDest); err != nil {
+			return err
 		}
 		s.applyPostCommitModTime(sess, func(mt time.Time) error { return root.Chtimes(finalDest, mt, mt) })
 		return nil
@@ -235,48 +235,32 @@ func (s *Service) commitLocalScopedTransfer(sess *managedTransferSession) (fsm.D
 	}
 	return fsm.DurabilityCommitted, "local_root_atomic_rename", nil
 }
-func renameLocalStageAtomic(root ports.RootHandle, stageDest, finalDest pathalg.LocalRootedDest, totalBytes uint64, perm fs.FileMode, noClobber bool) (bool, error) {
-	if err := firstErr(ensureParentLocalDir(root, finalDest), checkLocalNoClobber(root, finalDest, noClobber)); err != nil {
-		return true, err
-	}
-	if totalBytes == 0 {
-		if _, err := root.WriteChunk(stageDest, 0, bytes.NewReader(nil), 0, sanitizeLocalDownloadPerm(perm)); err != nil {
-			return true, err
-		}
-	}
-	return false, root.Rename(stageDest, finalDest)
-}
-func (s *Service) commitRemoteSFTPTransfer(ctx context.Context, sess *managedTransferSession) (fsm.DurabilityStatus, string, error) {
+func (s *Service) commitRemoteSFTPTransfer(ctx context.Context, sess *managedTransferSession, handleBinding security.OperationBinding) (fsm.DurabilityStatus, string, error) {
 	stagePath, okS := sess.remoteStagePath.Get()
 	finalPath, okF := sess.meta.Dest().Remote().Get()
 	if !okS || !okF {
 		return fsm.DurabilityNotApplied, "invalid_remote_commit", ErrInvalidRequest
 	}
-	if err := prepareRemoteStageForCommit(ctx, sess, stagePath); err != nil {
+	err := verifyRemotePathAuthorized(ctx, s.enforceStrictPaths(), sess.rfs, handleBinding, finalPath)
+	if err == nil && sess.meta.TotalBytes() == 0 {
+		err = sess.rfs.WriteChunk(ctx, stagePath, 0, bytes.NewReader(nil), 0)
+	}
+	if err == nil && sess.opts.Perm.IsSome() {
+		err = sess.rfs.Chmod(ctx, stagePath, sess.effectivePerm)
+	}
+	if err != nil {
 		return fsm.DurabilityNotApplied, err.Error(), err
 	}
-	if err := sess.rfs.RenameAtomic(ctx, stagePath, finalPath, sess.renameSpec); err != nil {
+	if err = sess.rfs.RenameAtomic(ctx, stagePath, finalPath, sess.renameSpec); err != nil {
 		return pickIf(isDeterministicNotAppliedErr(err), fsm.DurabilityNotApplied, fsm.DurabilityOutcomeUnknown), err.Error(), err
 	}
 	s.applyPostCommitModTime(sess, func(mt time.Time) error { return sess.rfs.Chtimes(ctx, finalPath, mt, mt) })
 	return fsm.DurabilityCommitted, "remote_sftp_atomic_rename", nil
 }
-func prepareRemoteStageForCommit(ctx context.Context, sess *managedTransferSession, stagePath pathalg.RemotePath) error {
-	if sess.meta.TotalBytes() == 0 {
-		if err := sess.rfs.WriteChunk(ctx, stagePath, 0, bytes.NewReader(nil), 0); err != nil {
-			return err
-		}
-	}
-	if sess.applyPerm {
-		return sess.rfs.Chmod(ctx, stagePath, sess.perm)
-	}
-	return nil
-}
 func isDeterministicNotAppliedErr(err error) bool {
-	return errors.Is(err, ports.ErrAlreadyExists) || errors.Is(err, ports.ErrRemoteAnchorMismatch) ||
-		errors.Is(err, ports.ErrRemoteIsDir) || errors.Is(err, ports.ErrNotRegularFile) ||
-		errors.Is(err, ports.ErrSymlinkRejected) || errors.Is(err, ports.ErrPermissionDenied) ||
-		errors.Is(err, ports.ErrInvalidArgument) || errors.Is(err, ports.ErrNotFound)
+	return errors.Is(err, ports.ErrAlreadyExists) || errors.Is(err, ports.ErrRemoteAnchorMismatch) || errors.Is(err, ports.ErrRemoteIsDir) ||
+		errors.Is(err, ports.ErrNotRegularFile) || errors.Is(err, ports.ErrSymlinkRejected) || errors.Is(err, ports.ErrPermissionDenied) ||
+		errors.Is(err, ports.ErrInvalidArgument) || errors.Is(err, ports.ErrNotFound) || errors.Is(err, gate.ErrScopeEscalated)
 }
 func (s *Service) removeLocalBestEffort(lrOpt algebraic.Option[pathalg.LocalDir], destOpt algebraic.Option[pathalg.LocalRootedDest]) {
 	lr, okR := lrOpt.Get()
@@ -286,13 +270,11 @@ func (s *Service) removeLocalBestEffort(lrOpt algebraic.Option[pathalg.LocalDir]
 	}
 }
 func (s *Service) cleanupTransferStaging(ctx context.Context, sess *managedTransferSession) {
-	if sess.meta.Direction() == fsm.TransferDirectionUpload {
-		if stagePath, ok := sess.remoteStagePath.Get(); ok && sess.rfs != nil {
-			_ = sess.rfs.Remove(context.WithoutCancel(ctx), stagePath)
-		}
-		return
+	if sess.meta.Direction() == fsm.TransferDirectionDownload {
+		s.removeLocalBestEffort(sess.opts.LocalRoot, sess.localStageDest)
+	} else if stagePath, ok := sess.remoteStagePath.Get(); ok && sess.rfs != nil {
+		_ = sess.rfs.Remove(context.WithoutCancel(ctx), stagePath)
 	}
-	s.removeLocalBestEffort(sess.localRoot, sess.localStageDest)
 }
 func transferProgressOf(st fsm.TransferState) (offset, chunks uint64) {
 	if st == nil || !st.IsValid() {

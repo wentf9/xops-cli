@@ -65,6 +65,14 @@ func (h *hookedRemoteFS) RealPath(ctx context.Context, p pathalg.RemotePath) (pa
 		var z pathalg.RemotePath
 		return z, err
 	}
+	h.dialer.mu.Lock()
+	hook := h.dialer.onRealPath
+	h.dialer.mu.Unlock()
+	if hook != nil {
+		if rp, handled, err := hook(ctx, p); handled {
+			return rp, err
+		}
+	}
 	return h.inner.RealPath(ctx, p)
 }
 func (h *hookedRemoteFS) Stat(ctx context.Context, p pathalg.RemotePath) (ports.RemoteFileStat, error) {
@@ -85,8 +93,8 @@ func (h *hookedRemoteFS) Lstat(ctx context.Context, p pathalg.RemotePath) (ports
 	ov := h.dialer.onLstatOverride
 	h.dialer.mu.Unlock()
 	if ov != nil {
-		if st, ok := ov(p); ok {
-			return st, nil
+		if st, ok, oErr := ov(p); oErr != nil || ok {
+			return st, oErr
 		}
 	}
 	return h.inner.Lstat(ctx, p)
@@ -126,12 +134,29 @@ func (h *hookedRemoteFS) WithReadFile(ctx context.Context, p pathalg.RemotePath,
 	}); err != nil {
 		return err
 	}
-	return fn(bytes.NewReader(copied), fSize)
+	if err := fn(bytes.NewReader(copied), fSize); err != nil {
+		return err
+	}
+	h.dialer.mu.Lock()
+	afterHook := h.dialer.onAfterWithReadFile
+	h.dialer.mu.Unlock()
+	if afterHook != nil {
+		return afterHook(ctx, p)
+	}
+	return nil
 }
 func (h *hookedRemoteFS) ReadChunk(ctx context.Context, p pathalg.RemotePath, offset int64, dst io.Writer, length int64) (int64, error) {
 	h.recordCtx(ctx)
 	if err := h.checkOpen(); err != nil {
 		return 0, err
+	}
+	h.dialer.mu.Lock()
+	hook := h.dialer.onReadChunk
+	h.dialer.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, p, offset, length); err != nil {
+			return 0, err
+		}
 	}
 	return h.inner.ReadChunk(ctx, p, offset, dst, length)
 }
@@ -156,6 +181,14 @@ func (h *hookedRemoteFS) WriteChunk(ctx context.Context, p pathalg.RemotePath, o
 	h.recordCtx(ctx)
 	if err := h.checkOpen(); err != nil {
 		return err
+	}
+	h.dialer.mu.Lock()
+	hook := h.dialer.onWriteChunk
+	h.dialer.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, p, offset, length); err != nil {
+			return err
+		}
 	}
 	return h.inner.WriteChunk(ctx, p, offset, r, length)
 }
@@ -218,9 +251,13 @@ type sharedRemoteDialer struct {
 	rfsSawLease          atomic.Bool
 	rfsSawOpID           atomic.Bool
 	mu                   sync.Mutex
+	onRealPath           func(ctx context.Context, p pathalg.RemotePath) (pathalg.RemotePath, bool, error)
+	onAfterWithReadFile  func(ctx context.Context, p pathalg.RemotePath) error
+	onReadChunk          func(ctx context.Context, p pathalg.RemotePath, offset, length int64) error
+	onWriteChunk         func(ctx context.Context, p pathalg.RemotePath, offset, length int64) error
 	onBeforeWriteAtomic  func(ctx context.Context, p pathalg.RemotePath) error
 	onBeforeRenameAtomic func(ctx context.Context, oldP, newP pathalg.RemotePath) error
-	onLstatOverride      func(p pathalg.RemotePath) (ports.RemoteFileStat, bool)
+	onLstatOverride      func(p pathalg.RemotePath) (ports.RemoteFileStat, bool, error)
 }
 
 func (d *sharedRemoteDialer) DialHop(ctx context.Context, hop plan.HopSpec, dig plan.HopDigest, _ ports.TransportConn) (ports.TransportConn, error) {
@@ -278,6 +315,7 @@ type spyJournalStore struct {
 	mu               sync.Mutex
 	pruneCalls       int
 	deleteCalls      int
+	loadGenCalls     atomic.Int64
 	failOnAppendKind fsm.JournalRecordKind
 	appendErr        error
 }
@@ -295,6 +333,7 @@ func (s *spyJournalStore) Load(ctx context.Context, id security.OperationID) ([]
 	return s.inner.Load(ctx, id)
 }
 func (s *spyJournalStore) LoadGenerations(ctx context.Context, id security.OperationID) ([]ports.JournalGenerationSnapshot, error) {
+	s.loadGenCalls.Add(1)
 	return s.inner.LoadGenerations(ctx, id)
 }
 func (s *spyJournalStore) PruneGeneration(ctx context.Context, id security.OperationID, gen uint64) error {

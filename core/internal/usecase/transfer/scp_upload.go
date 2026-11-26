@@ -25,79 +25,64 @@ type chunkBuf struct {
 	offset int64
 	data   []byte
 }
-
 type uploadExecParams struct {
-	finalDest, stagePath                           pathalg.RemotePath
-	renameSpec                                     ports.RemoteRenameSpec
-	perm                                           fs.FileMode
-	applyPerm, preserveMode, preserveTimes, resume bool
-	modTime                                        algebraic.Option[time.Time]
-	chunkSize                                      int64
-	concurrency                                    int
-	expectedDigest                                 algebraic.Option[security.Digest]
-	transferID                                     security.OperationID
-	startedAt                                      time.Time
+	req                  SCPUploadRequest
+	finalDest, stagePath pathalg.RemotePath
+	renameSpec           ports.RemoteRenameSpec
+	perm                 fs.FileMode
+	applyPerm            bool
+	chunkSize            int64
+	concurrency          int
+	transferID           security.OperationID
+	startedAt            time.Time
 }
 
 // SCPUpload 执行受 core/conc.Nursery 有界并发监督的并行分片 SCP 上传：
-// 显式区分 OperatorReadFS（缺席 Fail-Closed）与 ScopedRootFS，严守 INV-B4 单次目录展开与 Lstat 悬空软链检查。
+// 显式区分 OperatorReadFS（缺席 Fail-Closed）与 ScopedRootFS，严守 INV-B4 单次目录展开、
+// Lstat 悬空软链检查、ExpandIntoDir Round-2 保护闭环及续传逐片内容核验防稀疏空洞/换源损坏。
 func (s *Service) SCPUpload(ctx context.Context, req SCPUploadRequest) (SCPUploadResult, error) {
 	defer closeStreamIfNonNil(req.OperationStream)
 	hop, params, err := s.validateSCPUploadRequest(ctx, req)
 	if err != nil {
 		return SCPUploadResult{}, err
 	}
-	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "scp", action: "upload", paths: []pathalg.RemotePath{req.RemoteDest}, defaultRisk: security.RiskModerate, summary: "scp upload -> " + req.RemoteDest.String(), canonicalize: true}
+	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "scp", action: "upload", paths: []pathalg.RemotePath{req.RemoteDest}, expandBase: pickIf(req.ExpandIntoDir, req.Source.BaseName(), ""), defaultRisk: security.RiskModerate, summary: "scp upload -> " + req.RemoteDest.String(), canonicalize: true}
 	return runAuthorizedRemoteFS[security.CapTransfer](ctx, s, spec, func(opCtx context.Context, auth gate.Authorized[security.CapTransfer], rfs ports.RemoteFSPort, emitter *transferEmitter) (SCPUploadResult, error) {
 		finalDest, err := resolveRemoteUploadDest(opCtx, rfs, req.RemoteDest, req.Source.BaseName(), req.ExpandIntoDir, req.NoClobber)
-		if err != nil {
-			return SCPUploadResult{}, err
+		if err == nil {
+			err = verifyRemotePathAuthorized(opCtx, s.enforceStrictPaths(), rfs, auth.Binding(), finalDest)
 		}
-		token, err := s.stageToken("xops.scp.upload.v1", finalDest.String(), req.Resume)
-		if err != nil {
-			return SCPUploadResult{}, err
+		var token string
+		if err == nil {
+			token, err = s.stageToken("xops.scp.upload.v1", finalDest.String(), req.Resume)
 		}
-		if params.stagePath, err = makeRemoteStagePath(finalDest, token); err != nil {
+		if err == nil {
+			params.stagePath, err = makeRemoteStagePath(finalDest, token)
+		}
+		if err != nil {
 			return SCPUploadResult{}, err
 		}
 		params.finalDest, params.transferID, params.startedAt = finalDest, auth.OperationID(), s.clock.Now().UTC().Round(0)
-		return s.openSourceAndUpload(opCtx, rfs, emitter, req.Source, params)
+		return s.openSourceAndUpload(opCtx, rfs, emitter, params)
 	})
 }
-
 func (s *Service) validateSCPUploadRequest(ctx context.Context, req SCPUploadRequest) (hop plan.HopSpec, params uploadExecParams, err error) {
 	if hop, err = s.validateRemotePathOp(ctx, req.CallBase, req.RemoteDest); err != nil {
 		return hop, params, err
 	}
-	switch {
-	case !req.Source.IsValid():
-		return hop, params, fmt.Errorf("%w: LocalUploadSource 无效", ErrInvalidRequest)
-	case req.Source.Kind() == LocalUploadSourceOperator && s.operatorReadFS == nil:
-		return hop, params, ErrOperatorReadUnavailable
-	case req.Source.Kind() == LocalUploadSourceScoped && s.scopedFS == nil:
-		return hop, params, ErrScopedFSUnavailable
+	if !req.Source.IsValid() || (req.Source.Kind() == LocalUploadSourceOperator && s.operatorReadFS == nil) || (req.Source.Kind() == LocalUploadSourceScoped && s.scopedFS == nil) {
+		return hop, params, pickIf[error](!req.Source.IsValid(), fmt.Errorf("%w: LocalUploadSource 无效", ErrInvalidRequest), pickIf[error](req.Source.Kind() == LocalUploadSourceOperator, ErrOperatorReadUnavailable, ErrScopedFSUnavailable))
 	}
 	e1 := validateOptionalUploadAttrs(req.ModTime, req.ExpectedDigest)
 	cs, conc, e2 := s.resolveChunkAndConcurrency(req.ChunkSize, req.Concurrency)
 	perm, e3 := resolvePerm(req.Perm, defaultRemoteFilePerm)
 	renameSpec, e4 := ports.NewRemoteRenameSpec(ports.RemoteRenameSpecInput{NoClobber: req.NoClobber})
-	if err = firstErr(e1, e2, e3, e4); err != nil {
-		return hop, params, err
-	}
-	return hop, uploadExecParams{
-		renameSpec: renameSpec, perm: perm, applyPerm: req.PreserveMode || req.Perm.IsSome(),
-		preserveMode: req.PreserveMode && req.Perm.IsNone(), modTime: req.ModTime, preserveTimes: req.PreserveTimes,
-		resume: req.Resume, chunkSize: cs, concurrency: conc, expectedDigest: req.ExpectedDigest,
-	}, nil
+	return hop, uploadExecParams{req: req, renameSpec: renameSpec, perm: perm, applyPerm: req.PreserveMode || req.Perm.IsSome(), chunkSize: cs, concurrency: conc}, firstErr(e1, e2, e3, e4)
 }
 func validateOptionalUploadAttrs(modTime algebraic.Option[time.Time], expDig algebraic.Option[security.Digest]) error {
-	if mt, ok := modTime.Get(); ok && !isValidRFC3339Time(mt) {
-		return fmt.Errorf("%w: ModTime 必须为有效 RFC 3339 非零时刻", ErrInvalidRequest)
-	}
-	if dig, ok := expDig.Get(); ok && !dig.IsValid() {
-		return fmt.Errorf("%w: ExpectedDigest 无效", ErrInvalidRequest)
-	}
-	return nil
+	mt, okM := modTime.Get()
+	dig, okD := expDig.Get()
+	return firstErr(pickIf[error](okM && !isValidRFC3339Time(mt), fmt.Errorf("%w: ModTime 必须为有效 RFC 3339 非零时刻", ErrInvalidRequest), nil), pickIf[error](okD && !dig.IsValid(), fmt.Errorf("%w: ExpectedDigest 无效", ErrInvalidRequest), nil))
 }
 
 // resolveRemoteUploadDest 严守 INV-B4：至多一次远端容器目录展开，经 Lstat 识别悬空软链与目录冲突。
@@ -117,10 +102,7 @@ func resolveRemoteUploadDest(ctx context.Context, rfs ports.RemoteFSPort, dest p
 			return zeroVal[pathalg.RemotePath](), pickIf[error](err != nil, err, fmt.Errorf("%w: 展开目标 %s 为目录（禁止二次展开）", ports.ErrRemoteIsDir, dest))
 		}
 	}
-	if exists && noClobber {
-		return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端目标 %s 已存在（含悬空软链）", ports.ErrAlreadyExists, dest)
-	}
-	return dest, nil
+	return dest, pickIf[error](exists && noClobber, fmt.Errorf("%w: 远端目标 %s 已存在（含悬空软链）", ports.ErrAlreadyExists, dest), nil)
 }
 func inspectRemoteUploadTarget(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (exists, isDir bool, err error) {
 	lstat, err := rfs.Lstat(ctx, p)
@@ -131,12 +113,10 @@ func inspectRemoteUploadTarget(ctx context.Context, rfs ports.RemoteFSPort, p pa
 		return err == nil, err == nil && lstat.IsDir(), err
 	}
 	st, err := rfs.Stat(ctx, p)
-	if errors.Is(err, ports.ErrNotFound) {
-		return true, false, nil // 悬空软链按非目录已存在条目参与 NoClobber 检查
-	}
-	return true, err == nil && st.IsDir(), err
+	return true, err == nil && st.IsDir(), pickIf[error](errors.Is(err, ports.ErrNotFound), nil, err)
 }
-func (s *Service) openSourceAndUpload(ctx context.Context, rfs ports.RemoteFSPort, emitter *transferEmitter, src LocalUploadSource, params uploadExecParams) (res SCPUploadResult, err error) {
+func (s *Service) openSourceAndUpload(ctx context.Context, rfs ports.RemoteFSPort, emitter *transferEmitter, params uploadExecParams) (res SCPUploadResult, err error) {
+	src := params.req.Source
 	if src.kind == LocalUploadSourceOperator {
 		err = s.operatorReadFS.WithOperatorRead(ctx, src.operatorPath, src.symlinkPolicy, func(r ports.BoundedReadHandle, size int64) (uErr error) {
 			res, uErr = uploadFromBoundedReader(ctx, rfs, emitter, r, size, params)
@@ -150,10 +130,10 @@ func (s *Service) openSourceAndUpload(ctx context.Context, rfs ports.RemoteFSPor
 	}
 	err = s.scopedFS.WithRoot(src.scopedRoot, func(root ports.RootHandle) error {
 		if info, sErr := root.Stat(src.scopedPath); sErr == nil && info.IsValid() {
-			if params.preserveTimes && params.modTime.IsNone() && isValidRFC3339Time(info.ModTime()) {
-				params.modTime = algebraic.Some(info.ModTime())
+			if params.req.PreserveTimes && params.req.ModTime.IsNone() && isValidRFC3339Time(info.ModTime()) {
+				params.req.ModTime = algebraic.Some(info.ModTime())
 			}
-			if params.preserveMode && info.Perm() != 0 {
+			if params.req.PreserveMode && params.req.Perm.IsNone() && info.Perm() != 0 {
 				params.perm = info.Perm()
 			}
 		}
@@ -170,7 +150,7 @@ func uploadFromBoundedReader(ctx context.Context, rfs ports.RemoteFSPort, emitte
 	if size < 0 || uint64(size) > fsm.MaxTransferBytes {
 		return SCPUploadResult{}, fmt.Errorf("%w: 本地文件大小 %d 超出 10 GiB 上限", fsm.ErrTransferSizeExceeded, size)
 	}
-	resumeOffset, err := calcResumeOffset(size, params.chunkSize, params.resume, func() (int64, bool, error) {
+	resumeOffset, err := calcResumeOffset(size, params.chunkSize, params.req.Resume, func() (int64, bool, error) {
 		st, sErr := rfs.Lstat(ctx, params.stagePath)
 		return st.Size(), st.IsRegular(), sErr
 	}, func() error { return rfs.Remove(ctx, params.stagePath) })
@@ -179,24 +159,21 @@ func uploadFromBoundedReader(ctx context.Context, rfs ports.RemoteFSPort, emitte
 	}
 	committed := false
 	defer func() {
-		if !committed && !params.resume {
+		if !committed && !params.req.Resume {
 			_ = rfs.Remove(context.WithoutCancel(ctx), params.stagePath)
 		}
 	}()
-	digest, chunksUploaded, err := streamUploadChunks(ctx, rfs, emitter, r, size, resumeOffset, params)
+	digest, verifiedResumed, chunksUploaded, err := streamUploadChunks(ctx, rfs, emitter, r, size, resumeOffset, params)
 	if err != nil {
 		return SCPUploadResult{}, err
 	}
-	if expDig, ok := params.expectedDigest.Get(); ok && !expDig.Equal(digest) {
+	if expDig, ok := params.req.ExpectedDigest.Get(); ok && !expDig.Equal(digest) {
 		_ = rfs.Remove(context.WithoutCancel(ctx), params.stagePath)
 		return SCPUploadResult{}, fmt.Errorf("%w: 上传源摘要与 ExpectedDigest 不一致", ErrDigestMismatch)
 	}
 	preserved, err := commitUploadedStage(ctx, rfs, params)
-	if err != nil {
-		return SCPUploadResult{}, err
-	}
-	committed = true
-	return SCPUploadResult{RemotePath: params.finalDest, BytesTransferred: size, ResumedBytes: resumeOffset, ChunksTransferred: chunksUploaded, Digest: digest, ModTimePreserved: preserved}, nil
+	committed = err == nil
+	return pickIf(err == nil, SCPUploadResult{RemotePath: params.finalDest, BytesTransferred: size, ResumedBytes: verifiedResumed, ChunksTransferred: chunksUploaded, Digest: digest, ModTimePreserved: preserved}, SCPUploadResult{}), err
 }
 func commitUploadedStage(ctx context.Context, rfs ports.RemoteFSPort, params uploadExecParams) (bool, error) {
 	if params.applyPerm {
@@ -207,7 +184,7 @@ func commitUploadedStage(ctx context.Context, rfs ports.RemoteFSPort, params upl
 	if err := rfs.RenameAtomic(ctx, params.stagePath, params.finalDest, params.renameSpec); err != nil {
 		return false, err
 	}
-	if mt, ok := params.modTime.Get(); params.preserveTimes && ok {
+	if mt, ok := params.req.ModTime.Get(); params.req.PreserveTimes && ok {
 		err := rfs.Chtimes(ctx, params.finalDest, mt, mt)
 		return err == nil, err
 	}
@@ -226,19 +203,16 @@ func calcResumeOffset(totalSize, chunkSize int64, resume bool, statFn func() (in
 	if isReg && curSize >= 0 && curSize <= totalSize {
 		return (curSize / chunkSize) * chunkSize, nil
 	}
-	if rmErr := rmFn(); rmErr != nil && !errors.Is(rmErr, ports.ErrNotFound) {
-		return 0, rmErr
-	}
-	return 0, nil
+	rmErr := rmFn()
+	return 0, pickIf[error](rmErr != nil && !errors.Is(rmErr, ports.ErrNotFound), rmErr, nil)
 }
-func streamUploadChunks(ctx context.Context, rfs ports.RemoteFSPort, emitter *transferEmitter, r ports.BoundedReadHandle, size, resumeOffset int64, params uploadExecParams) (security.Digest, int64, error) {
+func streamUploadChunks(ctx context.Context, rfs ports.RemoteFSPort, emitter *transferEmitter, r ports.BoundedReadHandle, size, resumeOffset int64, params uploadExecParams) (security.Digest, int64, int64, error) {
 	if size == 0 {
-		return security.DigestBytes(nil), 0, rfs.WriteChunk(ctx, params.stagePath, 0, bytes.NewReader(nil), 0)
+		_ = rfs.Remove(ctx, params.stagePath)
+		return security.DigestBytes(nil), 0, 0, rfs.WriteChunk(ctx, params.stagePath, 0, bytes.NewReader(nil), 0)
 	}
-	hasher := sha256.New()
-	var writtenBytes, chunksDone atomic.Int64
-	writtenBytes.Store(resumeOffset)
-	jobsCh := make(chan chunkBuf, params.concurrency)
+	hasher, jobsCh := sha256.New(), make(chan chunkBuf, params.concurrency)
+	var writtenBytes, chunksDone, verifiedResumed atomic.Int64
 	runErr := conc.RunWait(ctx, func(wCtx context.Context, n *conc.Nursery) error {
 		for range params.concurrency {
 			if err := n.Go(func(c context.Context) error {
@@ -248,30 +222,38 @@ func streamUploadChunks(ctx context.Context, rfs ports.RemoteFSPort, emitter *tr
 				return err
 			}
 		}
-		err := produceUploadJobs(wCtx, r, hasher, size, resumeOffset, params.chunkSize, jobsCh)
+		err := produceUploadJobs(wCtx, rfs, r, hasher, size, resumeOffset, params, jobsCh, &writtenBytes, &verifiedResumed)
 		close(jobsCh)
 		return err
 	})
-	if runErr != nil {
-		return zeroVal[security.Digest](), 0, runErr
-	}
-	return digestFromHash(hasher), chunksDone.Load(), nil
+	return pickIf(runErr == nil, digestFromHash(hasher), zeroVal[security.Digest]()), verifiedResumed.Load(), chunksDone.Load(), runErr
 }
-func produceUploadJobs(ctx context.Context, r ports.BoundedReadHandle, hasher io.Writer, size, resumeOffset, chunkSize int64, jobsCh chan<- chunkBuf) error {
+
+// produceUploadJobs 按序读取本地源并计算全量摘要；对 resumeOffset 以内分片逐片回读比对远端暂存内容，
+// 发现稀疏零空洞或换源失配立即重传，彻底杜绝 Resume 静默数据损坏。
+func produceUploadJobs(ctx context.Context, rfs ports.RemoteFSPort, r ports.BoundedReadHandle, hasher io.Writer, size, resumeOffset int64, params uploadExecParams, jobsCh chan<- chunkBuf, writtenBytes, verifiedResumed *atomic.Int64) error {
 	for offset := int64(0); offset < size; {
-		buf := make([]byte, min(chunkSize, size-offset))
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		buf := make([]byte, min(params.chunkSize, size-offset))
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return err
 		}
 		_, _ = hasher.Write(buf)
-		if offset >= resumeOffset {
-			select {
-			case jobsCh <- chunkBuf{offset: offset, data: buf}:
-			case <-ctx.Done():
-				return ctx.Err()
+		n := int64(len(buf))
+		if offset < resumeOffset {
+			if existing, err := readRemoteChunkExact(ctx, rfs, params.stagePath, offset, n); err == nil && bytes.Equal(existing, buf) {
+				writtenBytes.Add(n)
+				verifiedResumed.Add(n)
+				offset += n
+				continue
 			}
 		}
-		offset += int64(len(buf))
+		if err := sendOrDone(ctx, jobsCh, chunkBuf{offset: offset, data: buf}); err != nil {
+			return err
+		}
+		offset += n
 	}
 	return nil
 }
@@ -287,4 +269,49 @@ func runUploadWorker(ctx context.Context, rfs ports.RemoteFSPort, emitter *trans
 		emitter.emitProgress(ctx, params.transferID, fsm.TransferDirectionUpload, uint64(done), uint64(totalSize), uint64(chunks), params.startedAt, "uploading")
 	}
 	return nil
+}
+
+// 以下为 SCP / 流式下载共享的本地 ScopedRootFS 原子落盘与软链覆写辅助函数。
+func hashLocalStagedFile(root ports.RootHandle, stageDest pathalg.LocalRootedDest, expectedSize int64) (security.Digest, error) {
+	limits, err := ports.NewReadLimits(max(expectedSize, 1))
+	h := sha256.New()
+	if err == nil {
+		err = root.WithReadRegular(stageDest, limits, func(r ports.BoundedReadHandle, size int64) error {
+			if size != expectedSize {
+				return fmt.Errorf("%w: 本地暂存大小 %d 与预期 %d 不符", io.ErrUnexpectedEOF, size, expectedSize)
+			}
+			_, copyErr := io.Copy(h, r)
+			return copyErr
+		})
+	}
+	return pickIf(err == nil, digestFromHash(h), zeroVal[security.Digest]()), err
+}
+func ensureParentLocalDir(root ports.RootHandle, dest pathalg.LocalRootedDest) error {
+	if parent, ok := dest.Parent(); ok {
+		return root.MkdirAll(parent, defaultDirPerm)
+	}
+	return nil
+}
+func checkLocalNoClobber(root ports.RootHandle, dest pathalg.LocalRootedDest, noClobber bool) error {
+	if !noClobber {
+		return nil
+	}
+	_, err := root.Lstat(dest)
+	return pickIf[error](err == nil, fmt.Errorf("%w: 本地目标 %s 已存在", ports.ErrAlreadyExists, dest), pickIf[error](errors.Is(err, ports.ErrNotFound), nil, err))
+}
+func createLocalSymlink(root ports.RootHandle, dest pathalg.LocalRootedDest, target string, noClobber bool) error {
+	if st, err := root.Lstat(dest); err == nil {
+		if noClobber || st.IsDir() {
+			return pickIf(noClobber, fmt.Errorf("%w: 本地目标 %s 已存在", ports.ErrAlreadyExists, dest), fmt.Errorf("%w: 禁止以软链覆写已有目录 %s", ports.ErrRemoteIsDir, dest))
+		}
+		if rmErr := root.Remove(dest); rmErr != nil {
+			return rmErr
+		}
+	} else if !errors.Is(err, ports.ErrNotFound) {
+		return err
+	}
+	return root.CreateSymlink(dest, target)
+}
+func sanitizeLocalDownloadPerm(remotePerm fs.FileMode) fs.FileMode {
+	return pickIf(remotePerm.Perm() != 0, remotePerm.Perm()|0o600, defaultLocalStagePerm)
 }

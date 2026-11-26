@@ -5,6 +5,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/goleak"
 
@@ -176,5 +177,93 @@ func TestRemoteAtomic_RenameFilePreconditionsAndRound2Redirect(t *testing.T) {
 	}
 	if string(mustReadRemote(t, strictRig.remoteFS, "/etc/passwd")) != "root:x:0:0" {
 		t.Fatalf("/etc/passwd 不得被篡改")
+	}
+}
+
+func TestRound2Canonicalization_MultiHopIntermediateDanglingAndRelativeAnchoring(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{profile: gate.PolicyProfileStrictAgent, approvalThresh: security.RiskDangerous, omitOperatorRead: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	// 1. 多跳悬空软链：/tmp/h1 -> /tmp/h2 -> /etc/cron.d/pwn（均不存在）必须在 Round-2 拦截
+	requireNoErr(t, rig.remoteFS.MkdirAll(ctx, mustRemotePath(t, "/tmp"), 0o755), "MkdirAll /tmp")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/h1"), "/tmp/h2"), "PutSymlink h1")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/h2"), "/etc/cron.d/pwn"), "PutSymlink h2")
+	_, err := rig.svc.WriteFile(ctx, transfer.WriteFileRequest{CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/h1"), Content: []byte("pwn")})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "多跳悬空软链指向 /etc/cron.d/pwn 必须在 Round-2 拦截")
+
+	// 2. 中间悬空目录软链 + CreateParents=true / MkdirAll 必须在 Round-2 展开并拦截
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/dangling_dir"), "/etc/newdir"), "PutSymlink dangling_dir")
+	_, err = rig.svc.WriteFile(ctx, transfer.WriteFileRequest{
+		CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/dangling_dir/evil.conf"), Content: []byte("x"), CreateParents: true,
+	})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "中间悬空目录软链 WriteFile(CreateParents) 必须拦截")
+	err = rig.svc.MkdirAll(ctx, transfer.MkdirAllRequest{CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/dangling_dir/sub")})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "中间悬空目录软链 MkdirAll 必须拦截")
+	if _, sErr := rig.remoteFS.Lstat(ctx, mustRemotePath(t, "/etc/newdir")); sErr == nil {
+		t.Fatalf("/etc/newdir 不得被创建")
+	}
+
+	// 3. 相对路径含前导 ..（cwd=/tmp, req=../etc/shadow）须经 RealPath(".") 锚定后阻断
+	rig.dialer.mu.Lock()
+	rig.dialer.onRealPath = func(_ context.Context, p pathalg.RemotePath) (pathalg.RemotePath, bool, error) {
+		if p.String() == "." {
+			return mustRemotePath(t, "/tmp"), true, nil
+		}
+		var z pathalg.RemotePath
+		return z, false, nil
+	}
+	rig.dialer.mu.Unlock()
+	_, err = rig.svc.WriteFile(ctx, transfer.WriteFileRequest{CallBase: rig.callBase(nil), Path: mustRemotePath(t, "../etc/shadow"), Content: []byte("pwn")})
+	requireErrIs(t, err, gate.ErrApprovalRequired, "相对路径 ../etc/shadow 必须锚定工作目录并被 Round-2 阻断")
+	rig.dialer.mu.Lock()
+	rig.dialer.onRealPath = nil
+	rig.dialer.mu.Unlock()
+
+	// 4. 悬空软链环路（即使 RealPath 返回 ErrNotFound）必须受 MaxSymlinkHops 有界预算保护并 Fail-Closed
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/loop1"), "/tmp/loop2"), "PutSymlink loop1")
+	requireNoErr(t, rig.remoteFS.PutSymlink(mustRemotePath(t, "/tmp/loop2"), "/tmp/loop1"), "PutSymlink loop2")
+	_, err = rig.svc.WriteFile(ctx, transfer.WriteFileRequest{CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/loop1"), Content: []byte("x")})
+	requireErrIs(t, err, gate.ErrAuthorizationDenied, "RealPath 检出软链环路必须 Fail-Closed 拒绝")
+	rig.dialer.mu.Lock()
+	rig.dialer.onRealPath = func(_ context.Context, _ pathalg.RemotePath) (pathalg.RemotePath, bool, error) {
+		var z pathalg.RemotePath
+		return z, true, ports.ErrNotFound
+	}
+	rig.dialer.mu.Unlock()
+	_, err = rig.svc.WriteFile(ctx, transfer.WriteFileRequest{CallBase: rig.callBase(nil), Path: mustRemotePath(t, "/tmp/loop1"), Content: []byte("x")})
+	requireErrIs(t, err, transfer.ErrSymlinkPolicyDenied, "悬空软链展开环路必须受 MaxSymlinkHops 预算拦截")
+}
+
+func TestRemoteAtomic_ReadFileModTimeChangeAndRelativeSingleSegmentWrite(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newTransferRig(t, rigOptions{omitOperatorRead: true, omitScopedFS: true, omitJournals: true})
+	defer rig.close()
+	ctx := context.Background()
+
+	// 1. 同大小原地覆写导致 ModTime 变化时，ReadFile 必须触发 ErrRemoteAnchorMismatch
+	p := mustRemotePath(t, "/app/same.txt")
+	mustWriteRemote(t, rig.remoteFS, "/app/same.txt", []byte("abcd"))
+	newMod := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
+	var mutated atomic.Bool
+	rig.dialer.mu.Lock()
+	rig.dialer.onAfterWithReadFile = func(hCtx context.Context, target pathalg.RemotePath) error {
+		if target.Equal(p) && mutated.CompareAndSwap(false, true) {
+			return rig.remoteFS.Chtimes(hCtx, p, newMod, newMod)
+		}
+		return nil
+	}
+	rig.dialer.mu.Unlock()
+	_, err := rig.svc.ReadFile(ctx, transfer.ReadFileRequest{CallBase: rig.callBase(nil), Path: p})
+	requireErrIs(t, err, ports.ErrRemoteAnchorMismatch, "读取窗口内 ModTime 变更必须触发 ErrRemoteAnchorMismatch")
+
+	// 2. 单段相对路径 WriteFile(CreateParents=true) 不应调用 MkdirAll(".")
+	wRes, err := rig.svc.WriteFile(ctx, transfer.WriteFileRequest{
+		CallBase: rig.callBase(nil), Path: mustRemotePath(t, "hello.txt"), Content: []byte("hi"), CreateParents: true,
+	})
+	requireNoErr(t, err, "单段相对路径 WriteFile(CreateParents=true)")
+	if wRes.BytesWritten != 2 {
+		t.Fatalf("BytesWritten=%d, want 2", wRes.BytesWritten)
 	}
 }

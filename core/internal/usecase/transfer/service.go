@@ -10,6 +10,7 @@ import (
 	"hash"
 	"io"
 	"io/fs"
+	"math"
 	"path"
 	"slices"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -58,64 +60,71 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cs < minChunkSize || cs > int64(fsm.MaxTransferChunkBytes) || conc < 1 || conc > maxConcurrency || maxRead <= 0 || maxRead > maxAtomicReadBytes {
 		return nil, fmt.Errorf("%w: 默认分片/并发/读上限越界", ErrInvalidConfig)
 	}
-	return &Service{
-		gate: cfg.Gate, pool: cfg.Pool, clock: cfg.Clock, entropy: cfg.Entropy,
-		scopedFS: cfg.ScopedFS, operatorReadFS: cfg.OperatorReadFS, journals: cfg.Journals, bus: cfg.SystemBus,
-		defaultChunkSize: cs, defaultConcurrency: conc, defaultMaxReadBytes: maxRead,
-		activeHandles: make(map[security.OperationID]plan.ManagedHandle[plan.KindTransfer]), valid: true,
-	}, nil
+	return &Service{gate: cfg.Gate, pool: cfg.Pool, clock: cfg.Clock, entropy: cfg.Entropy, scopedFS: cfg.ScopedFS, operatorReadFS: cfg.OperatorReadFS, journals: cfg.Journals, bus: cfg.SystemBus, defaultChunkSize: cs, defaultConcurrency: conc, defaultMaxReadBytes: maxRead, activeHandles: make(map[security.OperationID]plan.ManagedHandle[plan.KindTransfer]), valid: true}, nil
 }
 
-func (s *Service) checkReadyCtx(ctx context.Context) error {
-	switch {
-	case s == nil || !s.valid:
-		return ErrServiceNotInitialized
-	case ctx == nil:
-		return ErrNilContext
-	default:
+func zeroVal[T any]() (z T) { return z }
+func isValidRFC3339Time(t time.Time) bool {
+	return !t.IsZero() && t.UTC().Year() >= 1 && t.UTC().Year() <= 9999
+}
+func pickIf[T any](cond bool, yes, no T) T {
+	if cond {
+		return yes
+	}
+	return no
+}
+func firstErr(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func sendOrDone[T any](ctx context.Context, ch chan<- T, v T) error {
+	select {
+	case ch <- v:
+		return nil
+	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+func (s *Service) enforceStrictPaths() bool {
+	return s.gate.Profile() != gate.PolicyProfileDirectOperator
+}
+func (s *Service) checkReadyCtx(ctx context.Context) error {
+	if s == nil || !s.valid || ctx == nil {
+		return pickIf(s == nil || !s.valid, ErrServiceNotInitialized, ErrNilContext)
+	}
+	return ctx.Err()
 }
 func (s *Service) validateBaseCall(ctx context.Context, base CallBase) (plan.HopSpec, error) {
 	if err := s.checkReadyCtx(ctx); err != nil {
 		return zeroVal[plan.HopSpec](), err
 	}
 	hop, ok := base.Plan.Target()
-	if !base.Plan.IsValid() || !ok || !hop.IsValid() {
-		return zeroVal[plan.HopSpec](), fmt.Errorf("%w: SealedConnectionPlan 无效", ErrInvalidRequest)
-	}
-	if r, hasR := base.Risk.Get(); hasR && !r.IsValid() {
-		return zeroVal[plan.HopSpec](), fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
+	if r, hasR := base.Risk.Get(); !base.Plan.IsValid() || !ok || !hop.IsValid() || (hasR && !r.IsValid()) {
+		return zeroVal[plan.HopSpec](), fmt.Errorf("%w: SealedConnectionPlan 或 RiskLevel 无效", ErrInvalidRequest)
 	}
 	return hop, nil
 }
 func (s *Service) validateRemotePathOp(ctx context.Context, base CallBase, p pathalg.RemotePath) (plan.HopSpec, error) {
 	hop, err := s.validateBaseCall(ctx, base)
-	if err != nil {
-		return hop, err
-	}
-	return hop, pickIf[error](p.IsValid(), nil, fmt.Errorf("%w: RemotePath 无效", ErrInvalidRequest))
+	return hop, firstErr(err, pickIf[error](p.IsValid(), nil, fmt.Errorf("%w: RemotePath 无效", ErrInvalidRequest)))
 }
 func (s *Service) resolveChunkAndConcurrency(chunkSize int64, concurrency int) (int64, int, error) {
 	cs, conc := pickIf(chunkSize == 0, s.defaultChunkSize, chunkSize), pickIf(concurrency == 0, s.defaultConcurrency, concurrency)
-	if cs < minChunkSize || cs > int64(fsm.MaxTransferChunkBytes) || conc < 1 || conc > maxConcurrency {
-		return 0, 0, fmt.Errorf("%w: ChunkSize/Concurrency 越界", ErrInvalidRequest)
-	}
-	return cs, conc, nil
+	return cs, conc, pickIf[error](cs < minChunkSize || cs > int64(fsm.MaxTransferChunkBytes) || conc < 1 || conc > maxConcurrency, fmt.Errorf("%w: ChunkSize/Concurrency 越界", ErrInvalidRequest), nil)
 }
 func (s *Service) resolveReadLimits(maxBytes int64) (ports.ReadLimits, error) {
-	lim := pickIf(maxBytes == 0, s.defaultMaxReadBytes, maxBytes)
-	if lim <= 0 || lim > maxAtomicReadBytes {
-		return zeroVal[ports.ReadLimits](), fmt.Errorf("%w: MaxBytes 越界", ErrInvalidRequest)
+	if lim := pickIf(maxBytes == 0, s.defaultMaxReadBytes, maxBytes); lim > 0 && lim <= maxAtomicReadBytes {
+		return ports.NewReadLimits(lim)
 	}
-	return ports.NewReadLimits(lim)
+	return zeroVal[ports.ReadLimits](), fmt.Errorf("%w: MaxBytes 越界", ErrInvalidRequest)
 }
 func resolvePerm(opt algebraic.Option[fs.FileMode], fallback fs.FileMode) (fs.FileMode, error) {
 	perm, ok := opt.Get()
-	if !ok {
-		return fallback, nil
-	}
-	return perm, pickIf[error](perm != 0 && perm == perm.Perm(), nil, fmt.Errorf("%w: 权限位 %#o 非法", ErrInvalidRequest, perm))
+	return pickIf(ok, perm, fallback), pickIf[error](ok && (perm == 0 || perm != perm.Perm()), fmt.Errorf("%w: 权限位 %#o 非法", ErrInvalidRequest, perm), nil)
 }
 
 type authOpSpec struct {
@@ -123,10 +132,12 @@ type authOpSpec struct {
 	targetHop             plan.HopSpec
 	tool, action, summary string
 	paths, recursivePaths []pathalg.RemotePath
+	expandBase            string
 	extraPaths            []string
 	params                map[string]string
 	defaultRisk           security.RiskLevel
 	canonicalize          bool
+	customCanon           gate.CanonicalizeFunc
 }
 
 func closeStreamIfNonNil(st *events.OperationStream) {
@@ -148,22 +159,21 @@ func runAuthorizedVal[C security.Capability, T any](ctx context.Context, s *Serv
 	}
 	var out T
 	var emitter *transferEmitter
-	startedAt, entered := s.clock.Now().UTC().Round(0), false
-	finalErr := gate.ErrOperationPanicked
+	startedAt, entered, finalErr := s.clock.Now().UTC().Round(0), false, gate.ErrOperationPanicked
 	defer func() {
-		if entered && emitter != nil {
+		if entered {
 			emitter.emitCompleted(ctx, startedAt, finalErr)
 		}
 	}()
-	gateErr := gate.WithAuthorized[C](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[C]) (fErr error) {
-		entered, startedAt = true, s.clock.Now().UTC().Round(0)
-		emitter = newTransferEmitter(spec.base.OperationStream, s.clock, auth.TraceID(), auth.OperationID(), capKind, nodeID)
-		emitter.emitStarted(authCtx, spec.tool, spec.action, spec.base.Plan.PlanDigest(), spec.summary)
+	finalErr = gate.WithAuthorized[C](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[C]) (fErr error) {
+		entered, startedAt, emitter = true, s.clock.Now().UTC().Round(0), newTransferEmitter(spec.base.OperationStream, s.clock, auth.TraceID(), auth.OperationID(), capKind, nodeID)
+		emitter.emitBuilt(authCtx, func(m events.EventMeta) (events.Event, error) {
+			return events.NewOperationStartedEvent(events.OperationStartedSpec{Meta: m, Capability: capKind, Tool: spec.tool, Action: spec.action, PlanDigest: algebraic.Some(spec.base.Plan.PlanDigest()), Summary: spec.summary})
+		})
 		out, fErr = fn(authCtx, auth, emitter)
 		return fErr
 	})
-	finalErr = gateErr
-	return out, gateErr
+	return out, finalErr
 }
 
 // withLeasedRemoteFS 在池租约作用域内借出 RemoteFSPort 并在退出前无条件关闭。
@@ -199,13 +209,11 @@ func runAuthorizedRemoteFS[C security.Capability, T any](ctx context.Context, s 
 func runRemotePathOp[C security.Capability, T any](ctx context.Context, s *Service, base CallBase, tool, action string, p pathalg.RemotePath, defaultRisk security.RiskLevel, params map[string]string, preCheck func() error, fn func(context.Context, ports.RemoteFSPort) (T, error)) (T, error) {
 	defer closeStreamIfNonNil(base.OperationStream)
 	hop, err := s.validateRemotePathOp(ctx, base, p)
+	if err == nil && preCheck != nil {
+		err = preCheck()
+	}
 	if err != nil {
 		return zeroVal[T](), err
-	}
-	if preCheck != nil {
-		if err = preCheck(); err != nil {
-			return zeroVal[T](), err
-		}
 	}
 	spec := authOpSpec{base: base, targetHop: hop, tool: tool, action: action, paths: []pathalg.RemotePath{p}, params: params, defaultRisk: defaultRisk, summary: tool + " " + action + " " + p.String(), canonicalize: true}
 	return runAuthorizedRemoteFS[C](ctx, s, spec, func(opCtx context.Context, _ gate.Authorized[C], rfs ports.RemoteFSPort, _ *transferEmitter) (T, error) {
@@ -218,21 +226,11 @@ func buildGateRequest[C security.Capability](s *Service, spec authOpSpec, capKin
 	if err != nil {
 		return zeroVal[gate.GateRequest[C]](), err
 	}
-	var canonFn gate.CanonicalizeFunc
-	if spec.canonicalize && s.gate.Profile() != gate.PolicyProfileDirectOperator && (len(spec.paths) > 0 || len(spec.recursivePaths) > 0) {
-		canonFn = s.makeRemoteCanonicalizer(capKind, spec, nodeID)
-	}
-	return gate.NewGateRequest[C](gate.GateRequestSpec[C]{
-		Binding: binding, Risk: spec.base.Risk.OrElse(spec.defaultRisk), ScopeSummary: spec.summary,
-		Paths: pathStrs, RecursivePaths: recStrs, Canonicalize: canonFn, Approval: spec.base.Approval, OperationStream: spec.base.OperationStream,
-	})
+	canonFn := pickIf(spec.customCanon == nil && spec.canonicalize && s.enforceStrictPaths() && (len(spec.paths) > 0 || len(spec.recursivePaths) > 0), s.makeRemoteCanonicalizer(capKind, spec, nodeID), spec.customCanon)
+	return gate.NewGateRequest[C](gate.GateRequestSpec[C]{Binding: binding, Risk: spec.base.Risk.OrElse(spec.defaultRisk), ScopeSummary: spec.summary, Paths: pathStrs, RecursivePaths: recStrs, Canonicalize: canonFn, Approval: spec.base.Approval, OperationStream: spec.base.OperationStream})
 }
 func buildOperationBinding(capKind security.CapabilityKind, spec authOpSpec, nodeID string, canonicalPaths, recursivePaths []string) (security.OperationBinding, error) {
-	return security.NewOperationBinding(security.OperationBindingSpec{
-		Capability: capKind, Tool: spec.tool, Action: spec.action, NodeID: nodeID,
-		Endpoint: algebraic.Some(spec.targetHop.Endpoint()), CanonicalPaths: canonicalPaths, RecursivePaths: recursivePaths,
-		PlanDigest: algebraic.Some(spec.base.Plan.PlanDigest().SecurityDigest()), Parameters: spec.params,
-	})
+	return security.NewOperationBinding(security.OperationBindingSpec{Capability: capKind, Tool: spec.tool, Action: spec.action, NodeID: nodeID, Endpoint: algebraic.Some(spec.targetHop.Endpoint()), CanonicalPaths: canonicalPaths, RecursivePaths: recursivePaths, PlanDigest: algebraic.Some(spec.base.Plan.PlanDigest().SecurityDigest()), Parameters: spec.params})
 }
 func remotePathsToStrings(rpaths []pathalg.RemotePath, extra []string) []string {
 	out := make([]string, 0, len(rpaths)+len(extra))
@@ -242,77 +240,6 @@ func remotePathsToStrings(rpaths []pathalg.RemotePath, extra []string) []string 
 		}
 	}
 	return append(out, slices.DeleteFunc(slices.Clone(extra), func(s string) bool { return s == "" })...)
-}
-
-// makeRemoteCanonicalizer 构造 Gate Round-2 远端规范化探测回调（ADR-016 / INV-E5），拦截软链重定向绕过。
-func (s *Service) makeRemoteCanonicalizer(capKind security.CapabilityKind, spec authOpSpec, nodeID string) gate.CanonicalizeFunc {
-	return func(ctx context.Context) (gate.CanonicalizeResult, error) {
-		var resolved, resolvedRec []string
-		if err := s.withLeasedRemoteFS(ctx, spec.base.Plan, func(leaseCtx context.Context, rfs ports.RemoteFSPort) (rErr error) {
-			if resolved, rErr = resolveCanonicalList(leaseCtx, rfs, spec.paths, spec.extraPaths); rErr != nil {
-				return rErr
-			}
-			resolvedRec, rErr = resolveCanonicalList(leaseCtx, rfs, spec.recursivePaths, nil)
-			return rErr
-		}); err != nil {
-			return gate.CanonicalizeResult{}, err
-		}
-		canBind, err := buildOperationBinding(capKind, spec, nodeID, resolved, resolvedRec)
-		return gate.CanonicalizeResult{Binding: canBind, Paths: resolved, RecursivePaths: resolvedRec}, err
-	}
-}
-func resolveCanonicalList(ctx context.Context, rfs ports.RemoteFSPort, rpaths []pathalg.RemotePath, extra []string) ([]string, error) {
-	out := make([]string, 0, len(rpaths)*2+len(extra))
-	for _, p := range rpaths {
-		if !p.IsValid() {
-			continue
-		}
-		out = append(out, p.String())
-		canon, err := resolveCanonicalRemotePath(ctx, rfs, p)
-		if err != nil {
-			return nil, err
-		}
-		if !canon.Equal(p) {
-			out = append(out, canon.String())
-		}
-	}
-	return append(out, slices.DeleteFunc(slices.Clone(extra), func(s string) bool { return s == "" })...), nil
-}
-
-// resolveCanonicalRemotePath 解析远端真实路径（含悬空软链与缺失祖先，严禁使用 path/filepath）。
-func resolveCanonicalRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (pathalg.RemotePath, error) {
-	if realP, err := rfs.RealPath(ctx, p); err == nil || !errors.Is(err, ports.ErrNotFound) {
-		return realP, err
-	}
-	if lst, lErr := rfs.Lstat(ctx, p); lErr == nil && lst.IsSymlink() {
-		raw, e1 := rfs.ReadLink(ctx, p)
-		targetP, e2 := pathalg.ParseRemotePath(raw)
-		if err := firstErr(e1, e2); err != nil {
-			return zeroVal[pathalg.RemotePath](), err
-		}
-		var rErr error
-		if p, rErr = p.Dir().Resolve(targetP); rErr != nil {
-			return zeroVal[pathalg.RemotePath](), rErr
-		}
-	}
-	return walkMissingAncestorCanonical(ctx, rfs, p)
-}
-func walkMissingAncestorCanonical(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (pathalg.RemotePath, error) {
-	var suffix []pathalg.RemoteName
-	for cur := p; len(suffix) < maxRemoteCanonicalDepth; {
-		if realCur, err := rfs.RealPath(ctx, cur); err == nil {
-			slices.Reverse(suffix)
-			return realCur.Join(suffix...)
-		} else if !errors.Is(err, ports.ErrNotFound) {
-			return zeroVal[pathalg.RemotePath](), err
-		}
-		base, ok := cur.Base()
-		if !ok || cur.IsRoot() || cur.Dir().Equal(cur) {
-			return p, nil
-		}
-		suffix, cur = append(suffix, base), cur.Dir()
-	}
-	return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端路径规范化超限 %d", ErrInvalidRequest, maxRemoteCanonicalDepth)
 }
 func readRemoteChunkExact(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath, offset, want int64) ([]byte, error) {
 	var buf bytes.Buffer
@@ -369,66 +296,61 @@ func newTransferEmitter(stream *events.OperationStream, clock ports.Clock, trace
 	if stream == nil {
 		return nil
 	}
-	var nodeOpt algebraic.Option[inventory.NodeID]
-	if nid, err := inventory.ParseNodeID(nodeLabel); err == nil {
-		nodeOpt = algebraic.Some(nid)
-	}
-	return &transferEmitter{stream: stream, clock: clock, traceID: traceID, opID: opID, capability: capKind, nodeID: nodeOpt}
+	nid, err := inventory.ParseNodeID(nodeLabel)
+	return &transferEmitter{stream: stream, clock: clock, traceID: traceID, opID: opID, capability: capKind, nodeID: pickIf(err == nil, algebraic.Some(nid), algebraic.None[inventory.NodeID]())}
 }
-func (e *transferEmitter) nextMeta() (events.EventMeta, error) {
+
+//xops:syncclosure
+func (e *transferEmitter) emitBuilt(ctx context.Context, build func(events.EventMeta) (events.Event, error)) {
 	if e == nil || e.stream == nil || e.stream.IsClosed() {
-		return zeroVal[events.EventMeta](), ports.ErrClosed
+		return
 	}
-	return events.NewEventMeta(events.EventMetaSpec{TraceID: e.traceID, OperationID: algebraic.Some(e.opID), OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID})
-}
-func (e *transferEmitter) emitStarted(ctx context.Context, tool, action string, planDigest plan.PlanDigest, summary string) {
-	if meta, err := e.nextMeta(); err == nil {
-		if ev, err := events.NewOperationStartedEvent(events.OperationStartedSpec{Meta: meta, Capability: e.capability, Tool: tool, Action: action, PlanDigest: algebraic.Some(planDigest), Summary: summary}); err == nil {
+	if meta, err := events.NewEventMeta(events.EventMetaSpec{TraceID: e.traceID, OperationID: algebraic.Some(e.opID), OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID}); err == nil {
+		if ev, err := build(meta); err == nil && ev != nil {
 			_ = e.stream.Emit(ctx, ev)
 		}
 	}
 }
 func (e *transferEmitter) emitProgress(ctx context.Context, transferID security.OperationID, dir fsm.TransferDirection, transferred, total, chunks uint64, startedAt time.Time, stage string) {
-	meta, err := e.nextMeta()
-	if err != nil || !transferID.IsValid() || !dir.IsValid() {
+	if e == nil || !transferID.IsValid() || !dir.IsValid() {
 		return
 	}
-	transferred = pickIf(total > 0 && transferred > total, total, transferred)
-	elapsed := max(e.clock.Since(startedAt), 0)
-	rate := pickIf(elapsed.Seconds() > 0, uint64(float64(transferred)/max(elapsed.Seconds(), 1e-9)), uint64(0))
-	if ev, err := events.NewTransferProgressEvent(events.TransferProgressSpec{
-		Meta: meta, TransferID: transferID, Direction: dir, BytesTransferred: transferred, TotalBytes: total,
-		ChunksCompleted: chunks, Elapsed: algebraic.FromStdDuration(elapsed), RateBytesPerSec: rate, Stage: stage,
-	}); err == nil {
-		_ = e.stream.Emit(ctx, ev)
+	transferred, elapsed := pickIf(total > 0 && transferred > total, total, transferred), max(e.clock.Since(startedAt), 0)
+	var rate uint64
+	if elapsed > 0 && transferred > 0 {
+		rateF := float64(transferred) / elapsed.Seconds()
+		rate = pickIf(rateF >= float64(math.MaxUint64) || math.IsInf(rateF, 0) || math.IsNaN(rateF), uint64(math.MaxUint64), uint64(rateF))
 	}
+	e.emitBuilt(ctx, func(m events.EventMeta) (events.Event, error) {
+		return events.NewTransferProgressEvent(events.TransferProgressSpec{Meta: m, TransferID: transferID, Direction: dir, BytesTransferred: transferred, TotalBytes: total, ChunksCompleted: chunks, Elapsed: algebraic.FromStdDuration(elapsed), RateBytesPerSec: rate, Stage: stage})
+	})
 }
 func (e *transferEmitter) emitFSMTransitions(ctx context.Context, from fsm.TransferStateKind, to fsm.TransferState, evs []fsm.TransferEvent) {
-	if to == nil || !to.IsValid() {
+	if e == nil || to == nil || !to.IsValid() {
 		return
 	}
 	for _, ev := range evs {
-		if meta, err := e.nextMeta(); err == nil {
-			if trEv, err := events.NewTransferTransitionEvent(meta, from, to.Kind(), ev, to.IsTerminal()); err == nil {
-				_ = e.stream.Emit(ctx, trEv)
-			}
-		}
+		e.emitBuilt(ctx, func(m events.EventMeta) (events.Event, error) {
+			return events.NewTransferTransitionEvent(m, from, to.Kind(), ev, to.IsTerminal())
+		})
 	}
 }
 func (e *transferEmitter) emitCompleted(ctx context.Context, startedAt time.Time, finalErr error) {
-	meta, err := e.nextMeta()
-	if err != nil {
+	if e == nil {
 		return
 	}
 	code, msg := pickIf(finalErr != nil, classifyTransferErrorCode(finalErr), ""), pickIf(finalErr != nil, fmtErr(finalErr), "completed")
-	if ev, err := events.NewOperationCompletedEvent(events.OperationCompletedSpec{
-		Meta: meta, Capability: e.capability, Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)),
-		Succeeded: finalErr == nil, Code: code, Message: msg,
-	}); err == nil {
-		emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalEventEmitTimeout)
-		defer cancel()
-		_ = e.stream.Emit(emitCtx, ev)
+	var outcomeOpt algebraic.Option[execution.ExecutionOutcome]
+	if errors.Is(finalErr, ErrUncertainCommit) {
+		if unk, uErr := execution.NewOutcomeUnknown(execution.ExecPhaseTransportLost, code, msg); uErr == nil {
+			outcomeOpt = algebraic.Some[execution.ExecutionOutcome](unk)
+		}
 	}
+	emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalEventEmitTimeout)
+	defer cancel()
+	e.emitBuilt(emitCtx, func(m events.EventMeta) (events.Event, error) {
+		return events.NewOperationCompletedEvent(events.OperationCompletedSpec{Meta: m, Capability: e.capability, Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)), Outcome: outcomeOpt, Succeeded: finalErr == nil, Code: code, Message: msg})
+	})
 }
 func fmtErr(err error) string {
 	if err == nil {
@@ -436,16 +358,11 @@ func fmtErr(err error) string {
 	}
 	return err.Error()
 }
-
 func classifyTransferErrorCode(err error) string {
 	for _, m := range [...]struct {
 		t error
 		c string
-	}{
-		{ErrUncertainCommit, "uncertain_commit"}, {ErrCorruptJournal, "corrupt_journal"},
-		{ports.ErrRemoteAnchorMismatch, "remote_anchor_mismatch"}, {ErrPatchConflict, "patch_conflict"},
-		{ports.ErrAuditPostWrite, "audit_post_write_failed"}, {gate.ErrGateHalted, "gate_halted"},
-	} {
+	}{{ErrUncertainCommit, "uncertain_commit"}, {ErrCorruptJournal, "corrupt_journal"}, {ports.ErrRemoteAnchorMismatch, "remote_anchor_mismatch"}, {ErrPatchConflict, "patch_conflict"}, {ports.ErrAuditPostWrite, "audit_post_write_failed"}, {gate.ErrGateHalted, "gate_halted"}, {gate.ErrScopeEscalated, "scope_escalated"}} {
 		if errors.Is(err, m.t) {
 			return m.c
 		}
@@ -456,11 +373,11 @@ func (s *Service) emitDiagnostic(opID algebraic.Option[security.OperationID], se
 	if s.bus == nil || s.bus.IsClosed() {
 		return
 	}
-	if tid, err := security.ParseTraceID("transfer-service"); err == nil {
-		if meta, err := events.NewEventMeta(events.EventMetaSpec{TraceID: tid, OperationID: opID, OccurredAt: s.clock.Now().UTC().Round(0)}); err == nil {
-			if ev, err := events.NewDiagnosticEvent(events.DiagnosticSpec{Meta: meta, Scope: events.DiagnosticScopeTransfer, Severity: sev, Code: code, Message: msg, Attrs: attrs}); err == nil {
-				_ = s.bus.Publish(ev)
-			}
+	tid, e1 := security.ParseTraceID("transfer-service")
+	meta, e2 := events.NewEventMeta(events.EventMetaSpec{TraceID: tid, OperationID: opID, OccurredAt: s.clock.Now().UTC().Round(0)})
+	if e1 == nil && e2 == nil {
+		if ev, err := events.NewDiagnosticEvent(events.DiagnosticSpec{Meta: meta, Scope: events.DiagnosticScopeTransfer, Severity: sev, Code: code, Message: msg, Attrs: attrs}); err == nil {
+			_ = s.bus.Publish(ev)
 		}
 	}
 }
