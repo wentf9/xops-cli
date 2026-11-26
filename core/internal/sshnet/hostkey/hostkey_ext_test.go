@@ -245,6 +245,33 @@ func TestKnownHostsDB_HashedRevokedWildcardsAndIPv6Isolation(t *testing.T) {
 	if slices.Contains(revAlgos, keyRev.Algorithm()) {
 		t.Fatalf("被 @revoked 吊销的密钥算法 %q 不应出现在 PreferredAlgorithms 中，实际 %v", keyRev.Algorithm(), revAlgos)
 	}
+	assertRevokedCAExcludedFromPreferredAlgos(t, ctx, db, dir, keyCA, keyWild)
+}
+
+func assertRevokedCAExcludedFromPreferredAlgos(
+	t *testing.T,
+	ctx context.Context,
+	db *hostkey.KnownHostsDB,
+	dir pathalg.LocalDir,
+	keyCA, keyWild ports.PublicKeyInfo,
+) {
+	t.Helper()
+	b64 := base64.StdEncoding.EncodeToString
+	// 若 @cert-authority 公钥本身被 @revoked 吊销，PreferredAlgorithms 亦不得继续优先协商证书算法（评审 #45 [n1]）。
+	revCAFixture := strings.Join([]string{
+		"@cert-authority revoked-ca.test ssh-ed25519 " + b64(keyCA.WireBlob()),
+		"@revoked revoked-ca.test ssh-ed25519 " + b64(keyCA.WireBlob()),
+		"revoked-ca.test ssh-ed25519 " + b64(keyWild.WireBlob()),
+	}, "\n") + "\n"
+	writeRawKnownHosts(t, dir, "known_hosts_revca", revCAFixture)
+	khRevCA, _ := option.ParseKnownHostsList([]string{dir.String() + "/known_hosts_revca"})
+	caAlgos, err := db.PreferredAlgorithms(ctx, tck.MustEndpoint(t, "revoked-ca.test", 22), khRevCA)
+	if err != nil {
+		t.Fatalf("PreferredAlgorithms(revoked-ca): %v", err)
+	}
+	if !slices.Equal(caAlgos, []string{"ssh-ed25519"}) {
+		t.Fatalf("吊销的 @cert-authority 不得输出证书算法，期望 [ssh-ed25519]，实际 %v", caAlgos)
+	}
 }
 
 func TestKnownHostsDB_HomeDirPercentDoesNotCorruptTildeTemplate(t *testing.T) {

@@ -125,6 +125,10 @@ func (p *recordStdinPipe) snapshot() string {
 
 type scriptedSession struct {
 	stdin        *recordStdinPipe
+	outPR        *io.PipeReader
+	outPW        *io.PipeWriter
+	errPR        *io.PipeReader
+	errPW        *io.PipeWriter
 	buildFn      func(renderedCmd string, closedCh <-chan struct{}) (stdout, stderr io.Reader)
 	exitCode     int32
 	blackhole    bool
@@ -146,8 +150,14 @@ func (o *scriptedOpener) OpenSession(context.Context) (ports.RemoteSession, erro
 }
 
 func newScriptedSession(exitCode int32, buildFn func(renderedCmd string, closedCh <-chan struct{}) (io.Reader, io.Reader)) *scriptedSession {
+	outPR, outPW := io.Pipe()
+	errPR, errPW := io.Pipe()
 	return &scriptedSession{
 		stdin:     newRecordStdinPipe(),
+		outPR:     outPR,
+		outPW:     outPW,
+		errPR:     errPR,
+		errPW:     errPW,
 		buildFn:   buildFn,
 		exitCode:  exitCode,
 		pumpsDone: make(chan struct{}),
@@ -156,10 +166,10 @@ func newScriptedSession(exitCode int32, buildFn func(renderedCmd string, closedC
 }
 
 func (s *scriptedSession) StdinPipe() (io.WriteCloser, error) { return s.stdin, nil }
-func (s *scriptedSession) StdoutPipe() (io.Reader, error)     { return nil, ports.ErrUnsupported }
-func (s *scriptedSession) StderrPipe() (io.Reader, error)     { return nil, ports.ErrUnsupported }
+func (s *scriptedSession) StdoutPipe() (io.Reader, error)     { return s.outPR, nil }
+func (s *scriptedSession) StderrPipe() (io.Reader, error)     { return s.errPR, nil }
 
-func (s *scriptedSession) Start(_ context.Context, cmd execution.CommandPlan, streams ports.ExecStreams) error {
+func (s *scriptedSession) Start(_ context.Context, cmd execution.CommandPlan, _ ports.ExecStreams) error {
 	rendered, err := cmd.RenderCommand()
 	if err != nil {
 		return err
@@ -178,17 +188,20 @@ func (s *scriptedSession) Start(_ context.Context, cmd execution.CommandPlan, st
 			close(s.pumpsDone)
 		}
 	}
+	// 忠实模拟 remotesess 独立桥接语义：每条流到达自身 EOF 时立即独立关闭对应 PipeWriter。
 	_ = n.Go(func(context.Context) error {
 		defer doneOne()
-		if streams.Stdout != nil && outR != nil {
-			_, _ = io.Copy(streams.Stdout, outR)
+		defer func() { _ = s.outPW.Close() }()
+		if outR != nil {
+			_, _ = io.Copy(s.outPW, outR)
 		}
 		return nil
 	})
 	_ = n.Go(func(context.Context) error {
 		defer doneOne()
-		if streams.Stderr != nil && errR != nil {
-			_, _ = io.Copy(streams.Stderr, errR)
+		defer func() { _ = s.errPW.Close() }()
+		if errR != nil {
+			_, _ = io.Copy(s.errPW, errR)
 		}
 		return nil
 	})
@@ -218,6 +231,8 @@ func (s *scriptedSession) Wait(ctx context.Context) (execution.ExecutionOutcome,
 func (s *scriptedSession) Close() error {
 	s.closeOnce.Do(func() {
 		_ = s.stdin.Close()
+		_ = s.outPW.Close()
+		_ = s.errPW.Close()
 		if !s.blackhole {
 			s.releaseOnce.Do(func() { close(s.closedCh) })
 			if s.nursery != nil {

@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -105,6 +106,63 @@ func TestSession_DeadParentGuardsAndPumpSpawnFailureCleanup(t *testing.T) {
 	}
 	if err := sess2.Close(); err != nil {
 		t.Fatalf("sess2.Close: %v", err)
+	}
+}
+
+// TestSession_ClaimedPipesDecoupledEOFAndCloseO1Unblock 验证评审 #45 [M1] 与 ADR-015：
+//   - StdoutPipe() / StderrPipe() 各自拥有独立的 lifeNursery 桥接，远端通道挂起时 Session.Close O(1) 解除阻塞；
+//   - 调用方未读取借出管道时执行 Session.Close + Wait 绝不死锁且零协程泄漏。
+func TestSession_ClaimedPipesDecoupledEOFAndCloseO1Unblock(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+
+	cli, closePair := newLoopbackSSHClient(t)
+	defer closePair()
+
+	n, err := conc.NewNursery(ctx)
+	if err != nil {
+		t.Fatalf("NewNursery: %v", err)
+	}
+	defer func() { _ = n.Close() }()
+
+	sshSess, err := cli.NewSession()
+	if err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	sess, err := remotesess.New(n, func() bool { return true }, sshSess)
+	if err != nil {
+		t.Fatalf("remotesess.New: %v", err)
+	}
+	outPipe, err := sess.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe: %v", err)
+	}
+	errPipe, err := sess.StderrPipe()
+	if err != nil {
+		t.Fatalf("StderrPipe: %v", err)
+	}
+	if err := sess.Start(ctx, tck.MustCommandPlan(t, "hang"), ports.ExecStreams{}); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// 在远端通道持续保持打开（无 EOF）时，并发读取借出管道并在 Session.Close 后 O(1) 收到 EOF。
+	readDone := make(chan error, 2)
+	_ = n.Go(func(context.Context) error {
+		_, rErr := io.ReadAll(outPipe)
+		readDone <- rErr
+		return nil
+	})
+	_ = n.Go(func(context.Context) error {
+		_, rErr := io.ReadAll(errPipe)
+		readDone <- rErr
+		return nil
+	})
+	if err := sess.Close(); err != nil {
+		t.Fatalf("sess.Close: %v", err)
+	}
+	for range 2 {
+		if rErr := <-readDone; rErr != nil {
+			t.Fatalf("Close 后借出管道应平滑返回 EOF，实际 %v", rErr)
+		}
 	}
 }
 

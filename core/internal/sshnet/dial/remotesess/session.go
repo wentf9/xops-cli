@@ -37,6 +37,9 @@ type Session struct {
 	stdoutPipeTaken bool
 	stderrPipeTaken bool
 	starting        bool
+	outBridgeW      *io.PipeWriter
+	errBridgeW      *io.PipeWriter
+	bridgesDone     chan struct{}
 
 	outMu         sync.Mutex
 	discardOutput bool
@@ -86,6 +89,7 @@ func New(lifeNursery *conc.Nursery, isAlive func() bool, sshSess *ssh.Session) (
 		stdoutPipe:  outPipe,
 		stderrPipe:  errPipe,
 		pumpsDone:   done,
+		bridgesDone: done,
 		valid:       true,
 	}, nil
 }
@@ -99,19 +103,35 @@ func (s *Session) StdinPipe() (io.WriteCloser, error) {
 }
 
 // StdoutPipe 在 Start/StartShell 前借出远端标准输出读取管道（与非空 ExecStreams.Stdout 互斥）。
+// 底层由独立 lifeNursery 监督的 io.Pipe 桥接：该流到达 EOF 时立即独立关闭写端（解耦 stderr 与 Wait），
+// 且在 Session.Close 时 O(1) 关闭写端以解除半开 TCP 黑洞下的读取阻塞（ADR-015）。
 func (s *Session) StdoutPipe() (io.Reader, error) {
-	if err := s.claimPipe(&s.stdoutPipeTaken); err != nil {
-		return nil, err
-	}
-	return s.stdoutPipe, nil
+	return s.claimOutputBridge(&s.stdoutPipeTaken, &s.outBridgeW)
 }
 
 // StderrPipe 在 Start/StartShell 前借出远端标准错误读取管道（与非空 ExecStreams.Stderr 互斥）。
+// 底层由独立 lifeNursery 监督的 io.Pipe 桥接：该流到达 EOF 时立即独立关闭写端（解耦 stdout 与 Wait），
+// 且在 Session.Close 时 O(1) 关闭写端以解除半开 TCP 黑洞下的读取阻塞（ADR-015）。
 func (s *Session) StderrPipe() (io.Reader, error) {
-	if err := s.claimPipe(&s.stderrPipeTaken); err != nil {
-		return nil, err
+	return s.claimOutputBridge(&s.stderrPipeTaken, &s.errBridgeW)
+}
+
+func (s *Session) claimOutputBridge(taken *bool, brW **io.PipeWriter) (io.Reader, error) {
+	if s == nil || !s.valid {
+		return nil, ports.ErrClosed
 	}
-	return s.stderrPipe, nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed.Load() {
+		return nil, ports.ErrClosed
+	}
+	if s.starting || s.started.Load() || *taken {
+		return nil, ports.ErrInvalidArgument
+	}
+	pr, pw := io.Pipe()
+	*taken = true
+	*brW = pw
+	return pr, nil
 }
 
 func (s *Session) claimPipe(taken *bool) error {
@@ -332,6 +352,7 @@ func (s *Session) Wait(ctx context.Context) (execution.ExecutionOutcome, error) 
 
 func (s *Session) abortWaitOnCancel() {
 	s.markDiscardOutput()
+	s.closeBridgeWriters()
 	s.cancelStdin()
 	_ = s.sshSess.Close()
 }
@@ -384,7 +405,7 @@ func buildExitErrorOutcome(exitErr *ssh.ExitError, truncated bool) (execution.Ex
 	return execution.NewOutcomeCompleted(execution.NewExitCode(int32(exitErr.ExitStatus())), truncated)
 }
 
-// Close 幂等关闭远端会话通道、停用本地输出写入并在有界宽限内收敛输出排空（零泄漏）。
+// Close 幂等关闭远端会话通道、停用本地输出写入、O(1) 关闭借出管道桥接写端并在有界宽限内收敛排空（零泄漏）。
 func (s *Session) Close() error {
 	if s == nil || !s.valid {
 		return nil
@@ -392,12 +413,14 @@ func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		s.markDiscardOutput()
+		s.closeBridgeWriters()
 		s.cancelStdin()
 		sessErr := s.sshSess.Close()
 		if errors.Is(sessErr, io.EOF) || errors.Is(sessErr, net.ErrClosed) {
 			sessErr = nil
 		}
 		chanconn.WaitBounded(s.currentPumpsDone(), chanconn.CloseGraceTimeout)
+		chanconn.WaitBounded(s.currentBridgesDone(), chanconn.CloseGraceTimeout)
 		s.closeErr = sessErr
 	})
 	return s.closeErr

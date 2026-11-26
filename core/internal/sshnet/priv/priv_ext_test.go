@@ -49,6 +49,7 @@ type privSSHStub struct {
 	repromptOnFail bool
 	echoStdin      bool
 	stdoutOutput   string
+	preReadyStdout string
 	hangPrompt     bool
 
 	mu          sync.Mutex
@@ -337,6 +338,9 @@ func (s *privSSHStub) handleExec(ch ssh.Channel, cmd string) {
 	if s.hangPrompt {
 		_, _ = io.Copy(io.Discard, ch)
 		return
+	}
+	if s.preReadyStdout != "" {
+		_, _ = ch.Write([]byte(s.preReadyStdout))
 	}
 	if s.requirePass {
 		if isNonInteractive {

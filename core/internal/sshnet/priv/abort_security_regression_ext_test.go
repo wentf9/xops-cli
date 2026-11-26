@@ -32,6 +32,7 @@ func TestEscalator_AbortSecurityAndProtocolRegressions(t *testing.T) {
 	t.Run("NonPTYStdoutPassword_NoConfusedDeputyLeakOrCorruption", testNonPTYStdoutNoConfusedDeputy)
 	t.Run("PromptOverflowPreservesErrAuthFailed", testPromptOverflowPreservesAuthErr)
 	t.Run("RejectNonPOSIXDialectAndNonInteractiveSudoFlags", testNonPOSIXAndNonInteractiveSudo)
+	t.Run("LargePreReadyStdoutWithStderrAuthFail_NoPipeDeadlock", testLargePreReadyStdoutStderrAuthFailNoDeadlock)
 }
 
 func testPostReadyCancelAndTimeout(t *testing.T) {
@@ -283,5 +284,70 @@ func testNonPOSIXAndNonInteractiveSudo(t *testing.T) {
 	}
 	if !strings.HasPrefix(sessNI.seenRendered, "LC_ALL=C sudo -n -- ") || strings.Contains(sessNI.seenRendered, " -S ") || strings.Contains(sessNI.seenRendered, " -p ") {
 		t.Fatalf("NonInteractive sudo 应省略 -S -p，实际命令: %q", sessNI.seenRendered)
+	}
+}
+
+// testLargePreReadyStdoutStderrAuthFailNoDeadlock 回归评审 #45 [M1] 与 [m1]：
+// 当远端在未输出 readyTok 前向 stdout 写入 > 64 KiB（触发次流暂存上限）并向 stderr 写入认证拒绝后立即退出时，
+// 独立解耦的 StdoutPipe/StderrPipe 桥接必须即时关闭 controlDone 并返回 ports.ErrAuthFailed（绝不卡死至 HandshakeTimeout）。
+func testLargePreReadyStdoutStderrAuthFailNoDeadlock(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// 1. 确定性门控桩验证（128 KiB > 64 KiB 暂存上限 + 长 HandshakeTimeout，确认绝不等待超时）。
+	chunk := bytes.Repeat([]byte("M"), 32*1024)
+	hitHold := make(chan struct{})
+	sess := newScriptedSession(1, func(_ string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: chunk},
+				{data: chunk, onReturned: func() { close(hitHold) }},
+				{data: chunk},
+				{data: chunk},
+				{err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: hitHold, data: []byte("sudo: a password is required\n")},
+				{err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{
+		Entropy:          tck.NewDeterministicEntropy(86),
+		HandshakeTimeout: 10 * time.Second,
+	})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:         ports.PrivilegeMethodSudo,
+		Command:        tck.MustCommandPlan(t, "id"),
+		NonInteractive: true,
+	})
+	var stdout bytes.Buffer
+	out, err := esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{Stdout: &stdout})
+	if !errors.Is(err, ports.ErrAuthFailed) || out != nil {
+		t.Fatalf(">64KiB 预就绪 stdout + stderr 认证拒绝须立即返回 (nil, ErrAuthFailed)，实际 out=%#v err=%v", out, err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("认证拒绝时严禁泄露任何预就绪 stdout 字节，实际 %dB", stdout.Len())
+	}
+
+	// 2. 真实回环 SSH + remotesess.Session 端到端验证：先向 stdout 写入 128 KiB 预就绪数据再向 stderr 写入拒绝并退出，0 死锁、0 误判超时。
+	stub, conn := newPrivSSHStub(t)
+	defer func() { _ = conn.Close() }()
+	stub.requirePass = true
+	stub.preReadyStdout = strings.Repeat("B", 128*1024)
+	var realStdout bytes.Buffer
+	reqReal, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:         ports.PrivilegeMethodSudo,
+		Command:        tck.MustCommandPlan(t, "id"),
+		NonInteractive: true,
+	})
+	if _, err := esc.RunPrivileged(context.Background(), conn, reqReal, nil, ports.ExecStreams{Stdout: &realStdout}); !errors.Is(err, ports.ErrAuthFailed) {
+		t.Fatalf("真实回环 SSH 下 >64KiB 预就绪 stdout + NonInteractive 拒绝须立即返回 ErrAuthFailed，实际 %v", err)
+	}
+	if realStdout.Len() != 0 {
+		t.Fatalf("真实回环 SSH 认证拒绝时严禁泄露预就绪 stdout，实际 %dB", realStdout.Len())
 	}
 }

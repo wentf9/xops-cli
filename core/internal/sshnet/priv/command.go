@@ -60,13 +60,13 @@ func buildEscalationPlan(req ports.PrivilegeRequest, tokens handshakeTokens) (ex
 	if err != nil {
 		return zero, "", false, err
 	}
-	// 外层会话使用 MaxAllowedOutputBytes，避免握手前提示/就绪帧计入目标命令的 MaxOutputBytes 配额；
-	// 目标命令真实的 MaxOutputBytes 截断预算由 priv 的 streamScanner 在就绪后精确执行。
+	// 本包直接借用 RemoteSession.StdoutPipe()/StderrPipe()，外层会话不计量借出管道字节；
+	// 目标命令真实的 MaxOutputBytes 截断预算由 priv 的 streamScanner 在就绪后作为唯一权威精确执行。
 	plan, err := execution.NewCommandPlan(execution.CommandPlanSpec{
 		Kind:           execution.PlanKindCommand,
 		Profile:        execution.DefaultServerLaunchProfile(),
 		Command:        wrapped,
-		MaxOutputBytes: algebraic.Some(execution.MaxAllowedOutputBytes),
+		MaxOutputBytes: algebraic.Some(cmd.MaxOutputBytes()),
 	})
 	if err != nil {
 		return zero, "", false, fmt.Errorf("%w: 构造提权包装计划失败: %w", ports.ErrInvalidArgument, err)

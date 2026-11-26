@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"golang.org/x/crypto/ssh"
 
@@ -11,8 +12,11 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/secret"
+	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
 )
+
+const maxInteractivePromptBytes = 512
 
 type kiQuestionAction uint8
 
@@ -159,13 +163,43 @@ func (d *Dialer) planInteractiveKIQuestion(ctx context.Context, hop plan.HopSpec
 	return kiQuestionPlan{action: kiActionLiteral, answer: reply}, nil
 }
 
+// formatInteractiveKIPrompt 构造面向 InteractionPort 的清洗后展示提示文案：
+// 规则匹配仍保留完整 4 KiB pendingBanner，交互回退展示时先经 security.SanitizePromptText 脱敏，
+// 再按 UTF-8 字符边界截断至 <= 512 字节（优先完整保留问题正文），防止超长 MFA 横幅触发 ports.ErrInvalidArgument。
 func formatInteractiveKIPrompt(instruction, prompt string) string {
-	p := normalizeChallengePrompt(prompt)
-	instr := strings.TrimSpace(instruction)
-	if instr == "" {
-		return p
+	cleanPrompt := strings.TrimSpace(security.SanitizePromptText(normalizeChallengePrompt(prompt)))
+	if cleanPrompt == "" {
+		cleanPrompt = "Response:"
 	}
-	return instr + "\n" + p
+	cleanPrompt = truncateUTF8Bytes(cleanPrompt, maxInteractivePromptBytes)
+	cleanInstr := strings.TrimSpace(security.SanitizePromptText(instruction))
+	if cleanInstr == "" {
+		return cleanPrompt
+	}
+	const sep = " | "
+	budget := maxInteractivePromptBytes - len(cleanPrompt) - len(sep)
+	if budget <= 0 {
+		return cleanPrompt
+	}
+	cleanInstr = strings.TrimSpace(truncateUTF8Bytes(cleanInstr, budget))
+	if cleanInstr == "" {
+		return cleanPrompt
+	}
+	return cleanInstr + sep + cleanPrompt
+}
+
+func truncateUTF8Bytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	if maxBytes <= 0 {
+		return ""
+	}
+	cut := maxBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 func (d *Dialer) planMatchedRuleKIQuestion(ctx context.Context, rule inventory.ChallengeRule, loginPassRef algebraic.Option[secret.Ref]) (kiQuestionPlan, error) {

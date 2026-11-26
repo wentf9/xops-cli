@@ -329,6 +329,9 @@ func collectRevokedBlobs(entries []parsedEntry, ep netaddr.Endpoint) [][]byte {
 }
 
 func appendEntryPreferredAlgos(algos []string, e parsedEntry, revokedBlobs [][]byte) []string {
+	if isBlobRevoked(e.wireBlob, revokedBlobs) {
+		return algos
+	}
 	switch e.marker {
 	case markerCertAuthority:
 		for _, certAlgo := range hostCertPreferredAlgorithms() {
@@ -337,7 +340,7 @@ func appendEntryPreferredAlgos(algos []string, e parsedEntry, revokedBlobs [][]b
 			}
 		}
 	case markerRegular:
-		if !isBlobRevoked(e.wireBlob, revokedBlobs) && !slices.Contains(algos, e.algorithm) {
+		if !slices.Contains(algos, e.algorithm) {
 			algos = append(algos, e.algorithm)
 		}
 	}

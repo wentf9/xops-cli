@@ -7,8 +7,10 @@
 //   - 双输出流严格维持无环因果序（次流 -> 主控流，非 PTY 模式主控流为 stderr、PTY 模式主控流为 stdout）：
 //     仅主控流扫描提示帧与就绪帧，次流绝不扫描提示或就绪帧（阻断混淆代理口令泄露与输出串扰），
 //     在主控流观测到 ready token 或到达 EOF 前有界暂存（<= 64 KiB）就绪前字节并按因果序释放；
-//   - 输出流经 io.Pipe() 复用上游 RemoteSession 输出泵与弃写保护，并在握手超时、就绪后取消或半开黑洞下
-//     O(1) 关闭管道解除阻塞；一旦已越过就绪帧后发生中止或超时，恒返回不可重试的 *execution.OutcomeUnknown；
+//   - 直接借用 (ports.RemoteSession).{StdoutPipe,StderrPipe}（由上游独立 io.Pipe 桥接驱动，
+//     各流到达 EOF 独立关闭且不计入外层 MaxOutputBytes 配额，由本包 streamScanner 作为唯一精确截断权威），
+//     在握手超时、就绪后取消或半开黑洞下通过 Session.Close O(1) 解阻；
+//     一旦已越过就绪帧后发生中止或超时，恒返回不可重试的 *execution.OutcomeUnknown；
 //   - 完整兼容 POSIX sudo（含 sudo-rs 的 `[sudo: <token>] ...:` 封套、全角冒号与 `*` 回显抑制）、
 //     su 与 doas，支持 NonInteractive（-n）失败关闭；
 //   - 隶属 LayerCoreSSHNetPriv 明文白名单，严格复用 secrettaint/sinks_narrow.go:isAllowedPrivEscalationWrite

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"go.uber.org/goleak"
 	"golang.org/x/crypto/ssh"
@@ -270,6 +271,28 @@ func testKIBannerAndAttemptFallback(t *testing.T) {
 	hopBatch, digBatch := mustSingleHopPlan(t, ep, kiAuth, batchLayer)
 	if _, err := d.DialHop(ctx, hopBatch, digBatch, nil); !errors.Is(err, ports.ErrAuthFailed) {
 		t.Fatalf("BatchMode 下 attempt>1 须失败关闭返回 ErrAuthFailed，实际 %v", err)
+	}
+
+	// 3. 超长（>512B 含多字节 UTF-8）MFA 横幅回退至交互提示时，须安全截断至 <=512B UTF-8 且保留问题正文（评审 #42 Minor #1）。
+	longBanner := strings.Repeat("安全横幅Notice-", 80) // > 1.5 KiB 多字节 UTF-8
+	srvLong, longPub := newLoopbackSSHSpec(t)
+	srvLong.kiRounds = []kiRoundSpec{
+		{instruction: longBanner},
+		{instruction: "", questions: []string{"Manual OTP:", "Echo Note:"}, echos: []bool{false, true}, expected: []string{"ok-long", "ok-long"}},
+	}
+	epLong := tck.MustEndpoint(t, "ki-long-banner.example.test", 22)
+	_ = db.RecordHostKey(ctx, epLong, longPub, option.UnsetKnownHostsList())
+	interLong := &spyInteraction{canInteract: true, reply: "ok-long"}
+	dLong, _ := dial.NewDialer(dial.Config{HostTrust: db, Vault: vault, Interaction: interLong, DialContext: srvLong.dialFunc()})
+	assertDialSucceeds(t, ctx, dLong, epLong, kiAuth, option.UnsetOptionLayer())
+	if len(interLong.seenPrompts) != 2 {
+		t.Fatalf("期望触发 2 次交互提示，实际 %d", len(interLong.seenPrompts))
+	}
+	for i, wantQ := range []string{"Manual OTP:", "Echo Note:"} {
+		got := interLong.seenPrompts[i]
+		if len(got) > 512 || !utf8.ValidString(got) || !strings.Contains(got, wantQ) {
+			t.Fatalf("超长横幅交互提示 #%d 异常: len=%d validUTF8=%v prompt=%q", i, len(got), utf8.ValidString(got), got)
+		}
 	}
 }
 

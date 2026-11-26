@@ -63,7 +63,109 @@ func (s *Session) startIOPumps(
 	if err := s.startOutputPumps(targets, maxOutputBytes); err != nil {
 		return err
 	}
+	if err := s.startClaimedOutputBridges(outTaken, errTaken); err != nil {
+		return err
+	}
 	return s.startStdinPump(stdinSrc, closeEmptyStdin, inTaken)
+}
+
+type pipeBridgeTarget struct {
+	pw  *io.PipeWriter
+	src io.Reader
+}
+
+// startClaimedOutputBridges 为调用方通过 StdoutPipe()/StderrPipe() 借出的输出流分别启动独立桥接协程：
+// 任一流读到 EOF 即刻关闭各自 io.PipeWriter（互不耦合，亦不计入外层 MaxOutputBytes），
+// 若 Session.Close 提前关闭写端则切换为丢弃排空直至上游传输终止，避免半开黑洞永久阻塞调用方读取。
+func (s *Session) startClaimedOutputBridges(outTaken, errTaken bool) error {
+	bridges := s.collectClaimedBridges(outTaken, errTaken)
+	if len(bridges) == 0 {
+		return nil
+	}
+	done := make(chan struct{})
+	s.mu.Lock()
+	s.bridgesDone = done
+	s.mu.Unlock()
+	var rem atomic.Int32
+	rem.Store(int32(len(bridges)))
+	doneOne := func() {
+		if rem.Add(-1) == 0 {
+			close(done)
+		}
+	}
+	for i, b := range bridges {
+		bridge := b
+		if err := s.lifeNursery.Go(func(context.Context) error {
+			defer doneOne()
+			s.pumpClaimedBridge(bridge.pw, bridge.src)
+			return nil
+		}); err != nil {
+			for j := i; j < len(bridges); j++ {
+				_ = bridges[j].pw.Close()
+				doneOne()
+			}
+			return ports.ErrClosed
+		}
+	}
+	return nil
+}
+
+func (s *Session) collectClaimedBridges(outTaken, errTaken bool) []pipeBridgeTarget {
+	s.mu.Lock()
+	outW, errW := s.outBridgeW, s.errBridgeW
+	s.mu.Unlock()
+	var bridges []pipeBridgeTarget
+	if outTaken && outW != nil {
+		bridges = append(bridges, pipeBridgeTarget{pw: outW, src: s.stdoutPipe})
+	}
+	if errTaken && errW != nil {
+		bridges = append(bridges, pipeBridgeTarget{pw: errW, src: s.stderrPipe})
+	}
+	return bridges
+}
+
+func (s *Session) pumpClaimedBridge(pw *io.PipeWriter, src io.Reader) {
+	defer func() { _ = pw.Close() }()
+	buf := make([]byte, sessionCopyBufferBytes)
+	dropping := false
+	for {
+		n, rErr := src.Read(buf)
+		if n > 0 && !dropping {
+			dropping = s.writeBridgeChunk(pw, buf[:n]) != nil
+		}
+		if rErr != nil {
+			if !errors.Is(rErr, io.EOF) && !dropping {
+				_ = pw.CloseWithError(rErr)
+			}
+			return
+		}
+	}
+}
+
+func (s *Session) writeBridgeChunk(pw *io.PipeWriter, chunk []byte) error {
+	if s.closed.Load() {
+		return ports.ErrClosed
+	}
+	_, err := pw.Write(chunk)
+	return err
+}
+
+func (s *Session) closeBridgeWriters() {
+	s.mu.Lock()
+	outW, errW := s.outBridgeW, s.errBridgeW
+	s.mu.Unlock()
+	if outW != nil {
+		_ = outW.Close()
+	}
+	if errW != nil {
+		_ = errW.Close()
+	}
+}
+
+func (s *Session) currentBridgesDone() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bridgesDone
 }
 
 func (s *Session) collectOutputPumpTargets(streams ports.ExecStreams, outTaken, errTaken bool) []outputPumpTarget {
