@@ -194,7 +194,6 @@ func hasScopeDriftOrTighten(r security.ScopeEscalationResult) bool {
 		r.HasReason(security.EscalationTargetNodeDrift) || r.HasReason(security.EscalationEndpointDrift) ||
 		r.HasReason(security.EscalationVerdictTightened)
 }
-
 func buildScopedPaths(direct, recursive []string) ([]security.ScopedPath, error) {
 	out := make([]security.ScopedPath, 0, len(direct)+len(recursive))
 	add := func(list []string, rec bool) error {
@@ -212,7 +211,6 @@ func buildScopedPaths(direct, recursive []string) ([]security.ScopedPath, error)
 	}
 	return out, add(recursive, true)
 }
-
 func (s *Service) runLeasedPrivilege(ctx context.Context, req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string, emitter *operationEmitter) (execution.ExecutionOutcome, error) {
 	var outcome execution.ExecutionOutcome
 	var enteredLease bool
@@ -237,7 +235,6 @@ func (s *Service) runLeasedPrivilege(ctx context.Context, req PrivilegeExecReque
 	}
 	return outcome, leaseErr
 }
-
 func (s *Service) buildPrivilegeStreams(ctx context.Context, req PrivilegeExecRequest, targetHop plan.HopSpec, emitter *operationEmitter) (ports.ExecStreams, error) {
 	var ptyOpt algebraic.Option[ports.PTYRequest]
 	if localInteractive := s.cfg.Terminal != nil && s.cfg.Terminal.IsInteractive(); resolveTTYDecision(req.RequestTTY, false, req.Privilege.Command().PTY(), localInteractive).requestPTY {
@@ -277,7 +274,6 @@ func (s *Service) withPrivilegePassword(ctx context.Context, req PrivilegeExecRe
 	}
 	return s.cfg.Interaction.PromptSecret(ctx, promptReq, func(box *secret.SecretBox) error { return fn(box) })
 }
-
 func resolvePrivilegeTimeout(priv ports.PrivilegeRequest) algebraic.Option[algebraic.Duration] {
 	pDur, hasP := priv.Timeout().Get()
 	cDur, hasC := priv.Command().Timeout().Get()
@@ -286,7 +282,6 @@ func resolvePrivilegeTimeout(priv ports.PrivilegeRequest) algebraic.Option[algeb
 	}
 	return priv.Command().Timeout()
 }
-
 func classifyPrivilegeOutcome(ctx context.Context, out execution.ExecutionOutcome, runErr error) execution.ExecutionOutcome {
 	if out != nil && out.IsValid() {
 		return out
@@ -301,7 +296,6 @@ func classifyPrivilegeOutcome(ctx context.Context, out execution.ExecutionOutcom
 	}
 	return outcomeForAbortedRun(ctx, runErr)
 }
-
 func notStartedSessionOutcome(phase execution.StartPhase, code string, err error) execution.ExecutionOutcome {
 	msg := ""
 	if err != nil {

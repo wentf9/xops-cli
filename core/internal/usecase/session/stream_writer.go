@@ -149,7 +149,6 @@ func classifyFinalErrorCode(err error) string {
 		return "session_error"
 	}
 }
-
 func sanitizeEventCode(raw, fallback string) string {
 	if raw == "" || len(raw) > 64 {
 		return fallback
@@ -175,7 +174,6 @@ func wrapOutputWriter(ctx context.Context, dst io.Writer, emitter *operationEmit
 	}
 	return &chunkTeeWriter{ctx: ctx, dst: dst, emitter: emitter, kind: kind}
 }
-
 func (w *chunkTeeWriter) Write(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil

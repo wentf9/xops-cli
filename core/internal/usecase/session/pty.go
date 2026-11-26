@@ -357,14 +357,12 @@ func (s *Service) ReadPTY(ctx context.Context, req PTYReadRequest) (PTYReadResul
 		maxBytes = defaultPTYReadBytes
 	}
 	var res PTYReadResult
-	if err := s.withPTY(ctx, req.Handle, func(hCtx context.Context, pty ptyResource) error {
-		var err error
-		res, err = pty.read(hCtx, maxBytes, req.Wait)
-		return err
-	}); err != nil {
-		return PTYReadResult{}, err
-	}
-	return res, nil
+	err := s.withPTY(ctx, req.Handle, func(hCtx context.Context, pty ptyResource) error {
+		var rErr error
+		res, rErr = pty.read(hCtx, maxBytes, req.Wait)
+		return rErr
+	})
+	return res, err
 }
 
 // WritePTY 向指定世代 PTY 句柄写入输入载荷；陈旧世代、已释放或熔断时严格失败关闭。

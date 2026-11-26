@@ -234,6 +234,7 @@ func TestSessionMux_TemplateExpansionMasterReuseAndConfirm(t *testing.T) {
 	if err := rig.svc.StopControlMaster(context.Background(), h1); err != nil {
 		t.Fatalf("StopControlMaster: %v", err)
 	}
+	assertTeardownClean(t, rig, "StopControlMaster")
 
 	// 3. ControlMaster=ask / autoask 确认拒绝与非交互不可用必须失败关闭。
 	askPath, _ := option.NewLiteralControlPath("/tmp/mux-ask.sock")
@@ -277,8 +278,12 @@ func TestSessionMux_ControlActionsProxyAndVerifiedDialMux(t *testing.T) {
 		t.Fatalf("ControlMux(Exit): %v", err)
 	}
 	waitUntil(t, func() bool { return rig.pool.Stats().ActiveHandles == 0 })
+	assertTeardownClean(t, rig, "ControlMux(Exit)")
 	if _, err := rig.svc.InspectControlMaster(context.Background(), h); err == nil {
 		t.Fatalf("Exit 后旧 ControlMaster 句柄必须已失效")
+	}
+	if pResp, err := rig.svc.ProbeMux(context.Background(), ucsess.MuxRequest{Plan: pl}); err != nil || pResp.Alive() {
+		t.Fatalf("Exit 后套接字必须已释放: resp=%#v err=%v", pResp, err)
 	}
 }
 
@@ -397,10 +402,13 @@ func assertMuxPersistTouchAndExpire(t *testing.T, pl plan.SealedConnectionPlan) 
 	}
 	rig.clk.Advance(10 * time.Second)
 	waitUntil(t, func() bool { return rig.pool.Stats().ActiveHandles == 0 })
+	// ActiveHandles 归零前 WithListener 已退出解绑，此处直接 ProbeMux 即可确定性观测套接字释放，
+	// 随后再等待 pool.scheduleResourceClose 收敛确认 0 拆断升级与 0 协程泄漏。
 	pResp, err := rig.svc.ProbeMux(context.Background(), ucsess.MuxRequest{Plan: pl})
 	if err != nil || pResp.Alive() {
 		t.Fatalf("Persist 过期后套接字必须已释放: resp=%#v err=%v", pResp, err)
 	}
+	assertTeardownClean(t, rig, "ControlPersistExpired")
 }
 
 func assertMuxRevocationMode(t *testing.T, pl plan.SealedConnectionPlan, mode string) {
@@ -439,12 +447,38 @@ func assertMuxRevocationMode(t *testing.T, pl plan.SealedConnectionPlan, mode st
 	if r2.pool.Stats().ActiveHandles != 0 {
 		t.Fatalf("%s 吊销后 ActiveHandles 必须归零: %+v", mode, r2.pool.Stats())
 	}
+	assertTeardownClean(t, r2, "MuxRevocation/"+mode)
+	if pResp, err := r2.muxSocket.Probe(context.Background(), inf.SocketPath()); err != nil || pResp.Alive() {
+		t.Fatalf("%s 吊销后底层监听套接字必须已释放: resp=%#v err=%v", mode, pResp, err)
+	}
+}
+
+func assertTeardownClean(t *testing.T, rig *fullSessionRig, label string) {
+	t.Helper()
+	if err := rig.pool.WaitPendingTeardowns(context.Background()); err != nil {
+		t.Fatalf("%s WaitPendingTeardowns: %v", label, err)
+	}
+	if esc := rig.pool.Stats().TeardownEscalations; esc != 0 {
+		t.Fatalf("%s 不得触发有界拆断升级: escalations=%d", label, esc)
+	}
 }
 
 func waitUntil(t *testing.T, cond func() bool) {
 	t.Helper()
+	waitUntilErr(t, func() (bool, error) { return cond(), nil })
+}
+
+func waitUntilErr(t *testing.T, cond func() (bool, error)) {
+	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
-	for !cond() {
+	for {
+		ok, err := cond()
+		if err != nil {
+			t.Fatalf("等待状态收敛出错: %v", err)
+		}
+		if ok {
+			return
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("等待状态收敛超时")
 		}

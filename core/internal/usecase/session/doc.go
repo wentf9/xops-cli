@@ -73,13 +73,9 @@ func ParseRequestTTYMode(raw string) (RequestTTYMode, error) {
 	}
 }
 
-// IsValid 报告 m 是否为已显式设置的合法 RequestTTYMode。
+// IsValid / IsZero / String / TextAppender / TextMarshaler / TextUnmarshaler 实现 RequestTTYMode 值语义。
 func (m RequestTTYMode) IsValid() bool { return m >= RequestTTYAuto && m <= RequestTTYForce }
-
-// IsZero 报告 m 是否处于未设置零值态。
-func (m RequestTTYMode) IsZero() bool { return m == RequestTTYUnset }
-
-// String 返回规范小写名称；未设置返回 "unset"。
+func (m RequestTTYMode) IsZero() bool  { return m == RequestTTYUnset }
 func (m RequestTTYMode) String() string {
 	switch m {
 	case RequestTTYAuto:
@@ -94,19 +90,13 @@ func (m RequestTTYMode) String() string {
 		return "unset"
 	}
 }
-
-// AppendText 实现 encoding.TextAppender（值接收者）；对未设置/非法值失败关闭。
 func (m RequestTTYMode) AppendText(b []byte) ([]byte, error) {
 	if !m.IsValid() {
 		return nil, fmt.Errorf("%w: %d", ErrInvalidRequestTTY, uint8(m))
 	}
 	return append(b, m.String()...), nil
 }
-
-// MarshalText 实现 encoding.TextMarshaler（值接收者）。
 func (m RequestTTYMode) MarshalText() ([]byte, error) { return m.AppendText(nil) }
-
-// UnmarshalText 实现 encoding.TextUnmarshaler；失败时重置为 RequestTTYUnset。
 func (m *RequestTTYMode) UnmarshalText(text []byte) error {
 	if m == nil {
 		return ErrInvalidRequestTTY

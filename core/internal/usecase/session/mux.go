@@ -98,41 +98,45 @@ type muxResource interface {
 	touch(ctx context.Context)
 }
 
-// managedMuxMaster 实现 muxResource、snapshotResource[ControlMasterStatus] 与 pool.ComparableManagedResource，
-// 在 core/conc.Nursery 监督下驱动 MuxSocketPort.WithListener + Serve 与确定性 ControlPersist 驻留计时器（0 裸 go、0 ln 逃逸）。
+// managedMuxMaster 实现 muxResource、snapshotResource[ControlMasterStatus] 与 pool.ComparableManagedResource：
+// 使用分离的 workNursery（监听服务 + ControlPersist 计时器）与 reaperNursery（独立自动回收协程），
+// 确保 WithListener 彻底退出解绑套接字并排空 workNursery 后再触发 ReleaseHandle，彻底杜绝自等待死锁与假活竞态。
 //
 //xops:opaque
 //xops:failclosed
 type managedMuxMaster struct {
-	valid, shouldRelease bool
-	socketPath           pathalg.LocalSourcePath
-	effectiveMaster      option.ControlMasterMode
-	effectivePersist     option.ControlPersistSpec
-	conn                 ports.TransportConn
-	nursery              *conc.Nursery
-	activityCh           chan chan struct{}
-	doneCh               chan struct{}
-	closed               atomic.Bool
-	closeOnce            sync.Once
-	serveErr             firstErr
-	relMu                sync.Mutex
-	releaseFn            func()
+	valid, relClosed                        bool
+	socketPath                              pathalg.LocalSourcePath
+	effectiveMaster                         option.ControlMasterMode
+	effectivePersist                        option.ControlPersistSpec
+	conn                                    ports.TransportConn
+	workNursery, reaperNursery              *conc.Nursery
+	activityCh                              chan chan struct{}
+	doneCh, relReady                        chan struct{}
+	closed                                  atomic.Bool
+	connCloseOnce, workCloseOnce, closeOnce sync.Once
+	serveErr                                firstErr
+	relMu                                   sync.Mutex
+	releaseFn                               func()
 }
 
-func (s *Service) startManagedMuxMaster(
-	leaseCtx, revokeCtx context.Context, conn ports.TransportConn, sockPath pathalg.LocalSourcePath,
-	effMaster option.ControlMasterMode, effPersist option.ControlPersistSpec,
-) (*managedMuxMaster, error) {
+func (s *Service) startManagedMuxMaster(leaseCtx, revokeCtx context.Context, conn ports.TransportConn, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode, effPersist option.ControlPersistSpec) (*managedMuxMaster, error) {
 	if err := leaseCtx.Err(); err != nil {
 		return nil, err
 	}
-	n, err := conc.NewNursery(revokeCtx)
+	workN, err := conc.NewNursery(revokeCtx)
 	if err != nil {
+		return nil, err
+	}
+	reaperN, err := conc.NewNursery(revokeCtx)
+	if err != nil {
+		_ = workN.Close()
 		return nil, err
 	}
 	mm := &managedMuxMaster{
 		valid: true, socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist,
-		conn: conn, nursery: n, activityCh: make(chan chan struct{}, 1), doneCh: make(chan struct{}),
+		conn: conn, workNursery: workN, reaperNursery: reaperN,
+		activityCh: make(chan chan struct{}, 1), doneCh: make(chan struct{}), relReady: make(chan struct{}),
 	}
 	readyCh, startErrCh := make(chan struct{}), make(chan error, 1)
 	if err := mm.launchMuxWorkers(s.cfg.MuxSocket, s.cfg.Forwarder, s.cfg.Clock, readyCh, startErrCh); err != nil {
@@ -154,8 +158,16 @@ func (s *Service) startManagedMuxMaster(
 }
 
 func (m *managedMuxMaster) launchMuxWorkers(muxPort ports.MuxSocketPort, forwarder ports.ForwarderPort, clk ports.Clock, readyCh chan struct{}, startErrCh chan error) error {
-	if err := m.nursery.Go(func(serveCtx context.Context) error {
-		defer close(m.doneCh)
+	if err := m.reaperNursery.Go(m.runAutoRelease); err != nil {
+		return err
+	}
+	if err := m.workNursery.Go(func(serveCtx context.Context) error {
+		defer func() {
+			m.closed.Store(true)
+			_ = m.closeConnOnce()
+			m.workNursery.Cancel(ErrMuxMasterUnavailable)
+			close(m.doneCh)
+		}()
 		bound := false
 		err := muxPort.WithListener(serveCtx, m.socketPath, func(ln net.Listener) error {
 			bound = true
@@ -172,14 +184,12 @@ func (m *managedMuxMaster) launchMuxWorkers(muxPort ports.MuxSocketPort, forward
 		if err != nil && !errors.Is(err, context.Canceled) {
 			m.serveErr.record(err)
 		}
-		m.closed.Store(true)
-		m.setAutoRelease(nil, true)
 		return nil
 	}); err != nil {
 		return err
 	}
 	if timeout, ok := m.effectivePersist.Timeout(); ok {
-		return m.nursery.Go(func(pCtx context.Context) error { return m.runPersistTimer(pCtx, clk, timeout.Std()) })
+		return m.workNursery.Go(func(pCtx context.Context) error { return m.runPersistTimer(pCtx, clk, timeout.Std()) })
 	}
 	return nil
 }
@@ -198,11 +208,42 @@ func (m *managedMuxMaster) runPersistTimer(ctx context.Context, clk ports.Clock,
 			close(ack)
 		case <-tm.C():
 			m.serveErr.record(ErrMuxPersistExpired)
-			m.nursery.Cancel(ErrMuxPersistExpired)
-			m.setAutoRelease(nil, true)
+			m.workNursery.Cancel(ErrMuxPersistExpired)
 			return nil
 		}
 	}
+}
+func (m *managedMuxMaster) runAutoRelease(rCtx context.Context) error {
+	select {
+	case <-rCtx.Done():
+		return nil
+	case <-m.doneCh:
+	}
+	m.closeWork(ErrMuxMasterUnavailable)
+	select {
+	case <-rCtx.Done():
+		return nil
+	case <-m.relReady:
+	}
+	if rCtx.Err() != nil {
+		return nil
+	}
+	m.relMu.Lock()
+	fn := m.releaseFn
+	m.releaseFn = nil
+	m.relMu.Unlock()
+	if fn != nil {
+		fn()
+	}
+	return nil
+}
+func (m *managedMuxMaster) bindAutoRelease(fn func()) {
+	m.relMu.Lock()
+	if !m.relClosed {
+		m.releaseFn, m.relClosed = fn, true
+		close(m.relReady)
+	}
+	m.relMu.Unlock()
 }
 func (m *managedMuxMaster) touch(ctx context.Context) {
 	if _, hasTimeout := m.effectivePersist.Timeout(); !hasTimeout || m == nil || !m.valid || m.closed.Load() {
@@ -222,20 +263,17 @@ func (m *managedMuxMaster) touch(ctx context.Context) {
 	case <-ctx.Done():
 	}
 }
-func (m *managedMuxMaster) setAutoRelease(fn func(), fire bool) {
-	m.relMu.Lock()
-	var call func()
-	if fire {
-		call, m.shouldRelease, m.releaseFn = m.releaseFn, true, nil
-	} else if m.shouldRelease {
-		call = fn
-	} else {
-		m.releaseFn = fn
-	}
-	m.relMu.Unlock()
-	if call != nil {
-		call()
-	}
+func (m *managedMuxMaster) closeConnOnce() error {
+	var err error
+	m.connCloseOnce.Do(func() { err = closeClosers(m.conn) })
+	return err
+}
+func (m *managedMuxMaster) closeWork(cause error) {
+	m.workCloseOnce.Do(func() {
+		m.closed.Store(true)
+		m.workNursery.Cancel(cause)
+		m.serveErr.record(errors.Join(m.workNursery.Close(), m.closeConnOnce()))
+	})
 }
 func (m *managedMuxMaster) IsValid() bool {
 	return m != nil && m.valid && !m.closed.Load() && m.conn != nil && m.conn.IsAlive()
@@ -251,12 +289,12 @@ func (m *managedMuxMaster) Close() error {
 		return nil
 	}
 	m.closeOnce.Do(func() {
-		m.closed.Store(true)
 		m.relMu.Lock()
-		m.releaseFn = nil
+		m.releaseFn, m.relClosed = nil, true
 		m.relMu.Unlock()
-		m.nursery.Cancel(ports.ErrClosed)
-		m.serveErr.record(errors.Join(m.nursery.Close(), m.conn.Close()))
+		m.closeWork(ports.ErrClosed)
+		m.reaperNursery.Cancel(ports.ErrClosed)
+		_ = m.reaperNursery.Close()
 	})
 	return m.serveErr.get()
 }
@@ -299,10 +337,7 @@ func (s *Service) StartControlMaster(ctx context.Context, req ControlMasterReque
 	return info, nil
 }
 
-func (s *Service) execStartControlMaster(
-	authCtx context.Context, connPlan plan.SealedConnectionPlan, nodeID string, binding security.OperationBinding,
-	sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode, effPersist option.ControlPersistSpec, outInfo *ControlMasterInfo,
-) error {
+func (s *Service) execStartControlMaster(authCtx context.Context, connPlan plan.SealedConnectionPlan, nodeID string, binding security.OperationBinding, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode, effPersist option.ControlPersistSpec, outInfo *ControlMasterInfo) error {
 	if reused, rInfo, rErr := s.tryReuseControlMaster(authCtx, nodeID, sockPath, effMaster, effPersist); rErr != nil || reused {
 		*outInfo = rInfo
 		return rErr
@@ -323,13 +358,12 @@ func (s *Service) execStartControlMaster(
 			return err
 		}
 		if master != nil {
-			master.setAutoRelease(func() { _ = pool.ReleaseHandle[plan.KindMux](s.cfg.Pool, h) }, false)
+			master.bindAutoRelease(func() { _ = pool.ReleaseHandle[plan.KindMux](s.cfg.Pool, h) })
 		}
 		*outInfo = ControlMasterInfo{handle: algebraic.Some(h), socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, valid: true}
 		return nil
 	})
 }
-
 func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode, effPersist option.ControlPersistSpec) (bool, ControlMasterInfo, error) {
 	if effMaster != option.ControlMasterAuto && effMaster != option.ControlMasterAutoAsk {
 		return false, ControlMasterInfo{}, nil
@@ -348,7 +382,6 @@ func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sock
 	}
 	return true, ControlMasterInfo{socketPath: sockPath, reusedExisting: true, masterPID: resp.MasterPID(), effectiveMaster: effMaster, effectivePersist: effPersist, valid: true}, nil
 }
-
 func (s *Service) confirmMuxMaster(ctx context.Context, nodeID, message string) error {
 	if s.cfg.Interaction == nil || !s.cfg.Interaction.CanInteract() {
 		return fmt.Errorf("%w: %w: ControlMaster ask/autoask 需要可交互终端", ErrMuxMasterUnavailable, ports.ErrInteractionUnavailable)
@@ -423,10 +456,8 @@ func extractJumpHostForPercentJ(connPlan plan.SealedConnectionPlan, targetHop pl
 			return hops[len(hops)-1].Host()
 		}
 	case *option.ProxyUnset, *option.ProxyDisabled, *option.ProxyCommandSpec:
-		if connPlan.Len() >= 2 {
-			if prev, ok := connPlan.HopAt(connPlan.Len() - 2); ok {
-				return prev.Endpoint().Host().String()
-			}
+		if prev, ok := connPlan.HopAt(connPlan.Len() - 2); connPlan.Len() >= 2 && ok {
+			return prev.Endpoint().Host().String()
 		}
 	default:
 		return ""

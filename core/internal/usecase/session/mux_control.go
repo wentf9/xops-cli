@@ -212,12 +212,7 @@ func (s *Service) dialVerifiedMuxConn(ctx context.Context, nodeID string, sockPa
 	}
 	return conn, nil
 }
-
-func buildMuxGateReq[C security.Capability](
-	connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec, nodeID, action string,
-	sockPath pathalg.LocalSourcePath, risk security.RiskLevel, extra map[string]string,
-	approval algebraic.Option[gate.ApprovalSubmission], stream *events.OperationStream,
-) (gate.GateRequest[C], error) {
+func buildMuxGateReq[C security.Capability](connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec, nodeID, action string, sockPath pathalg.LocalSourcePath, risk security.RiskLevel, extra map[string]string, approval algebraic.Option[gate.ApprovalSubmission], stream *events.OperationStream) (gate.GateRequest[C], error) {
 	cp := targetHop.Transport().ControlPolicy()
 	params := map[string]string{"socket_path": sockPath.String(), "effective_master": cp.EffectiveMaster().String(), "effective_persist": cp.EffectivePersist().String()}
 	maps.Copy(params, extra)
@@ -227,7 +222,6 @@ func buildMuxGateReq[C security.Capability](
 		risk:    risk, params: params, approval: approval, stream: stream,
 	})
 }
-
 func (s *Service) validateMuxBaseCall(ctx context.Context, connPlan plan.SealedConnectionPlan, risk algebraic.Option[security.RiskLevel]) error {
 	if err := s.validateBaseCall(ctx, connPlan, RequestTTYUnset, risk); err != nil {
 		return err
@@ -237,7 +231,6 @@ func (s *Service) validateMuxBaseCall(ctx context.Context, connPlan plan.SealedC
 	}
 	return nil
 }
-
 func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (plan.HopSpec, string, pathalg.LocalSourcePath, error) {
 	zh, zp := zeroVal[plan.HopSpec](), zeroVal[pathalg.LocalSourcePath]()
 	if err := s.validateMuxBaseCall(ctx, req.Plan, req.Risk); err != nil {

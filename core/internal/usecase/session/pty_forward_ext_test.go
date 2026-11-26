@@ -230,6 +230,14 @@ func assertPTYOverflowAndEOF(t *testing.T, rig *fullSessionRig, pd *ptyPipeDiale
 	if _, err := rig.svc.WritePTY(context.Background(), h, payload); err != nil {
 		t.Fatalf("WritePTY(overflow): %v", err)
 	}
+	// 等待泵协程完整回显并触发环形缓冲溢出后再关闭远端管道，杜绝 GOMAXPROCS=1 下的写前关管竞态。
+	waitUntilErr(t, func() (bool, error) {
+		st, iErr := rig.svc.InspectPTY(context.Background(), h)
+		if iErr != nil {
+			return false, iErr
+		}
+		return st.DroppedBytes() >= uint64(len(payload)-16), nil
+	})
 	pd.lastSession.closeRemoteOutput()
 	var collected []byte
 	var dropped uint64
@@ -325,6 +333,7 @@ func assertPTYRevocationMode(t *testing.T, mode string) {
 	if rig.pool.Stats().ActiveHandles != 0 {
 		t.Fatalf("%s 后 ActiveHandles 必须为 0: %+v", mode, rig.pool.Stats())
 	}
+	assertTeardownClean(t, rig, "PTYRevocation/"+mode)
 }
 
 func triggerPTYRevocation(t *testing.T, rig *fullSessionRig, pl plan.SealedConnectionPlan, h plan.ManagedHandle[plan.KindPTY], mode string, faultArmed *atomic.Bool) {
@@ -530,4 +539,5 @@ func assertForwardRevocationMode(t *testing.T, spec ports.ForwardSpec, mode stri
 	if rig.pool.Stats().ActiveHandles != 0 {
 		t.Fatalf("%s 吊销后 ActiveHandles 必须归零: %+v", mode, rig.pool.Stats())
 	}
+	assertTeardownClean(t, rig, "ForwardRevocation/"+mode)
 }
