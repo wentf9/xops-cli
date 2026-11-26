@@ -3,6 +3,7 @@ package mux
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"time"
@@ -14,9 +15,14 @@ import (
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-type subsystemOpener interface {
-	OpenSubsystem(ctx context.Context, subsystem string) (*chanconn.WatchedConn, error)
-}
+type (
+	subsystemOpener interface {
+		OpenSubsystem(ctx context.Context, subsystem string) (*chanconn.WatchedConn, error)
+	}
+	subsystemStreamOpener interface {
+		OpenSubsystemStream(ctx context.Context, subsystem string) (io.ReadWriteCloser, error)
+	}
+)
 
 func (st *muxServerState) dispatchStreamPacket(ctx context.Context, conn net.Conn, msgType uint32, body []byte) (bool, error) {
 	switch msgType {
@@ -56,18 +62,23 @@ func replyStreamFailure(conn net.Conn, reqID uint32, reason string) {
 	muxstream.GracefulHalfClose(conn, muxstream.DefaultHalfCloseDrainTimeout)
 }
 
+func openUpstreamSubsystem(ctx context.Context, upstream ports.TransportConn, subsystem string) (io.ReadWriteCloser, error) {
+	if sso, ok := upstream.(subsystemStreamOpener); ok {
+		return sso.OpenSubsystemStream(ctx, subsystem)
+	}
+	if so, ok := upstream.(subsystemOpener); ok {
+		return so.OpenSubsystem(ctx, subsystem)
+	}
+	return nil, fmt.Errorf("%w: upstream does not support raw %s subsystem", ports.ErrUnsupported, subsystem)
+}
+
 func (st *muxServerState) handleOpenSFTP(ctx context.Context, conn net.Conn, body []byte) {
 	rd := muxstream.NewReader(body)
 	reqID, err := rd.ReadUint32()
 	if err != nil {
 		return
 	}
-	so, ok := st.upstream.(subsystemOpener)
-	if !ok {
-		replyStreamFailure(conn, reqID, "upstream does not support raw sftp subsystem")
-		return
-	}
-	wc, err := so.OpenSubsystem(ctx, "sftp")
+	wc, err := openUpstreamSubsystem(ctx, st.upstream, "sftp")
 	if err != nil {
 		replyStreamFailure(conn, reqID, err.Error())
 		return

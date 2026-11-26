@@ -93,7 +93,11 @@ func New(cfg Config) (eng *Engine, err error) {
 	if err != nil {
 		return nil, err
 	}
-	dialer, hostTrustObs, err := buildDialerPort(cfg)
+	rp, err := resolveDefaultPorts(cfg)
+	if err != nil {
+		return nil, err
+	}
+	dialer, hostTrustObs, err := buildDialerPort(cfg, rp)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +128,7 @@ func New(cfg Config) (eng *Engine, err error) {
 		bus: bus, hostTrustObs: hostTrustObs, pool: p, gate: g, opCtx: opCtx, opCancel: opCancel,
 		mcpServers: map[*MCPServer]struct{}{}, projections: map[*Projection]struct{}{},
 	}
-	return eng, eng.initServices(cfg)
+	return eng, eng.initServices(cfg, rp)
 }
 func resolveSystemBus(cfg Config) (*events.SystemBus, bool, error) {
 	if cfg.SystemBus != nil {
@@ -151,7 +155,7 @@ func buildEngineGate(cfg Config, profile gate.PolicyProfileKind, policy gate.Gua
 	})
 	return g, wrapCfgErr("初始化安全门控失败", err)
 }
-func (e *Engine) initServices(cfg Config) (err error) {
+func (e *Engine) initServices(cfg Config, rp resolvedPorts) (err error) {
 	bridge := &pendingRefBridge{}
 	if cfg.Vault != nil {
 		if e.credential, err = uccred.NewService(uccred.ServiceConfig{
@@ -164,7 +168,7 @@ func (e *Engine) initServices(cfg Config) (err error) {
 	if e.inventory, err = ucinv.NewService(ucinv.ServiceConfig{
 		OpenSSH: cfg.OpenSSH, Env: cfg.Env, GlobalOptions: cfg.GlobalOptions, MaxJumpDepth: cfg.MaxJumpDepth,
 		Store: cfg.InventoryStore, Gate: e.gate, Vault: cfg.Vault, VaultControl: cfg.VaultControl,
-		KeySigner: cfg.KeySigner, Interaction: cfg.Interaction, Credential: e.credential,
+		KeySigner: rp.keySigner, Interaction: cfg.Interaction, Credential: e.credential,
 		Clock: cfg.Clock, Entropy: cfg.Entropy, Importers: cfg.Importers, KnownStores: cfg.KnownStores,
 		DefaultEnrollTTL: cfg.DefaultEnrollTTL.OrElse(zeroVal[algebraic.Duration]()),
 	}); err != nil {
@@ -173,14 +177,14 @@ func (e *Engine) initServices(cfg Config) (err error) {
 	bridge.inv.Store(e.inventory)
 	if e.session, err = ucsess.NewService(ucsess.ServiceConfig{
 		Gate: e.gate, Pool: e.pool, Clock: cfg.Clock, Env: cfg.Env, Terminal: cfg.Terminal,
-		Escalator: cfg.PrivilegeEscalation, Vault: cfg.Vault, Interaction: cfg.Interaction,
-		ShellProbe: cfg.ShellProbe, Forwarder: cfg.Forwarder, TUNDevice: cfg.TUNDevice, MuxSocket: cfg.MuxSocket,
+		Escalator: rp.escalator, Vault: cfg.Vault, Interaction: cfg.Interaction,
+		ShellProbe: rp.shellProbe, Forwarder: rp.forwarder, TUNDevice: cfg.TUNDevice, MuxSocket: rp.muxSocket,
 	}); err != nil {
 		return wrapCfgErr("初始化会话服务失败", err)
 	}
-	return e.initTransferAutoObsServices(cfg)
+	return e.initTransferAutoObsServices(cfg, rp)
 }
-func (e *Engine) initTransferAutoObsServices(cfg Config) (err error) {
+func (e *Engine) initTransferAutoObsServices(cfg Config, rp resolvedPorts) (err error) {
 	if e.transfer, err = uctrans.NewService(uctrans.ServiceConfig{
 		Gate: e.gate, Pool: e.pool, Clock: cfg.Clock, Entropy: cfg.Entropy, ScopedFS: cfg.ScopedFS,
 		OperatorReadFS: cfg.OperatorReadFS, Journals: cfg.JournalStore, SystemBus: e.bus,
@@ -207,7 +211,7 @@ func (e *Engine) initTransferAutoObsServices(cfg Config) (err error) {
 	}
 	e.observability, err = ucobs.NewService(ucobs.ServiceConfig{
 		Gate: e.gate, Pool: e.pool, Clock: cfg.Clock, Entropy: cfg.Entropy, Env: cfg.Env,
-		ScopedFS: cfg.ScopedFS, Forwarder: cfg.Forwarder, ShellProbe: cfg.ShellProbe, SystemBus: e.bus,
+		ScopedFS: cfg.ScopedFS, Forwarder: rp.forwarder, ShellProbe: rp.shellProbe, SystemBus: e.bus,
 	})
 	return wrapCfgErr("初始化可观测性与 GUI 服务失败", err)
 }

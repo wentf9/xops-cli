@@ -229,7 +229,7 @@ func (c *Conn) waitOverlapped(slot *opSlot, ov *windows.Overlapped) (uint32, err
 		}
 	}
 	var done uint32
-	// 返回前必须以 wait=true 排空内核挂起引用，避免栈上 Overlapped 与调用方切片悬空。
+	// 返回前必须以 wait=true 排空内核挂起引用，避免堆上固定 Overlapped 与调用方切片悬空。
 	err := windows.GetOverlappedResult(c.h, ov, &done, true)
 	if waitErr != nil && errors.Is(err, windows.ERROR_OPERATION_ABORTED) {
 		return done, waitErr

@@ -19,7 +19,12 @@ import (
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/pool"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/forward"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/hostkey"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/mux"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/priv"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/probe"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/sftp"
 	ucsess "github.com/wentf9/xops-cli/core/internal/usecase/session"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -44,7 +49,7 @@ func DefaultGuardrailConfig() GuardrailConfig {
 
 // DialContextFunc 与 RemoteFSFunc 定义底层网络拨号与外置自定义/仿真传输的远端文件系统工厂签名。
 // 注意：RemoteFSFunc 仅接收协议无关的 ports.TransportConn（不可访问未导出 *ssh.Client），专用于自定义或仿真 Dialer 覆写；
-// Phase 4（P4-T2）真实 sshnet/sftp 须在 buildRealDialer 中直接经 dial.Config.OpenRemoteFS 注入。
+// 真实 sshnet/sftp 已在 buildRealDialer 中直接经 dial.Config.OpenRemoteFS 注入 sftp.Open。
 type (
 	DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 	RemoteFSFunc    func(ctx context.Context, conn ports.TransportConn) (ports.RemoteFSPort, error)
@@ -78,7 +83,7 @@ type Config struct {
 	OpenSSH             ports.OpenSSHConfigSource
 	Interaction         ports.InteractionPort
 	Vault               ports.SecretVault
-	KeySigner           ports.KeySignerPort
+	KeySigner           ports.KeySignerPort // 为 nil 且已注入 OperatorReadFS/Agent 时默认装配真实 sshnet/dial.NewKeySigner
 	Agent               ports.SSHAgentPort
 	VaultControl        ports.VaultControlPort
 	InventoryStore      ports.InventoryStore
@@ -86,13 +91,13 @@ type Config struct {
 	Importers           []ports.FormatImporter
 	KnownStores         []string
 	DefaultEnrollTTL    algebraic.Option[algebraic.Duration]
-	PrivilegeEscalation ports.PrivilegeEscalationPort
-	ShellProbe          ports.ShellProbePort
-	Forwarder           ports.ForwarderPort
+	PrivilegeEscalation ports.PrivilegeEscalationPort // 为 nil 时默认装配真实 sshnet/priv.NewEscalator
+	ShellProbe          ports.ShellProbePort          // 为 nil 时默认装配真实 sshnet/probe.NewProber
+	Forwarder           ports.ForwarderPort           // 为 nil 时默认装配真实 sshnet/forward.NewForwarder
 	TUNDevice           ports.TUNDevicePort
-	MuxSocket           ports.MuxSocketPort
-	Dialer              ports.DialerPort // 为 nil 时默认装配真实 sshnet/dial + sshnet/hostkey
-	RemoteFS            RemoteFSFunc     // 仅用于外部自定义/仿真 Dialer 覆写 OpenRemoteFS；真实 sshnet/sftp 须经 dial.Config.OpenRemoteFS 装配
+	MuxSocket           ports.MuxSocketPort // 为 nil 时默认装配真实 sshnet/mux.NewMuxSocket
+	Dialer              ports.DialerPort    // 为 nil 时默认装配真实 sshnet/dial（含 sftp.Open）+ sshnet/hostkey
+	RemoteFS            RemoteFSFunc        // 仅用于外部自定义/仿真 Dialer 覆写 OpenRemoteFS；真实路径由 buildRealDialer 注入 sftp.Open
 
 	// 拨号、全局选项、跳板深度、限流分片、事件总线与连接池调优参数（全可选，0/None 取安全默认值）。
 	DialContext                                                                  DialContextFunc
@@ -240,21 +245,68 @@ func resolveHostTrustDirs(cfg Config) (homeOpt algebraic.Option[pathalg.LocalDir
 	sshDir, jErr := home.JoinComponent(".ssh")
 	return homeOpt, sshDir, wrapCfgErr("推导 ~/.ssh 目录失败", jErr)
 }
-func buildDialerPort(cfg Config) (ports.DialerPort, *hostTrustObserver, error) {
+
+type resolvedPorts struct {
+	keySigner  ports.KeySignerPort
+	escalator  ports.PrivilegeEscalationPort
+	shellProbe ports.ShellProbePort
+	forwarder  ports.ForwarderPort
+	muxSocket  ports.MuxSocketPort
+}
+
+func resolveDefaultKeySigner(cfg Config) (ports.KeySignerPort, error) {
+	if cfg.KeySigner != nil || (cfg.OperatorReadFS == nil && cfg.Agent == nil) {
+		return cfg.KeySigner, nil
+	}
+	ks, err := dial.NewKeySigner(dial.KeySignerConfig{
+		ReadFS: cfg.OperatorReadFS, Vault: cfg.Vault, Agent: cfg.Agent, Env: cfg.Env, Entropy: cfg.Entropy,
+	})
+	return ks, wrapCfgErr("初始化 sshnet/dial/keysigner 失败", err)
+}
+
+// resolveDefaultPorts 为未显式注入的可选协议端口装配真实 sshnet/* 生产默认实现；
+// 凡调用方显式注入的端口槽位均原样保留，确保仿真测试与上层宿主覆写 100% 兼容。
+func resolveDefaultPorts(cfg Config) (rp resolvedPorts, err error) {
+	if rp.keySigner, err = resolveDefaultKeySigner(cfg); err != nil {
+		return resolvedPorts{}, err
+	}
+	rp.escalator = cfg.PrivilegeEscalation
+	if rp.escalator == nil {
+		if rp.escalator, err = priv.NewEscalator(priv.Config{Entropy: cfg.Entropy, Clock: cfg.Clock}); err != nil {
+			return resolvedPorts{}, wrapCfgErr("初始化 sshnet/priv 失败", err)
+		}
+	}
+	rp.shellProbe = cfg.ShellProbe
+	if rp.shellProbe == nil {
+		if rp.shellProbe, err = probe.NewProber(probe.Config{}); err != nil {
+			return resolvedPorts{}, wrapCfgErr("初始化 sshnet/probe 失败", err)
+		}
+	}
+	rp.forwarder = cfg.Forwarder
+	if rp.forwarder == nil {
+		rp.forwarder = forward.NewForwarder(forward.Config{TUNDevice: cfg.TUNDevice, Clock: cfg.Clock})
+	}
+	rp.muxSocket = cfg.MuxSocket
+	if rp.muxSocket == nil {
+		rp.muxSocket = mux.NewMuxSocket(mux.Config{Clock: cfg.Clock})
+	}
+	return rp, nil
+}
+func buildDialerPort(cfg Config, rp resolvedPorts) (ports.DialerPort, *hostTrustObserver, error) {
 	base := cfg.Dialer
 	var obs *hostTrustObserver
 	if base == nil {
 		var err error
 		if obs, err = buildHostTrustPort(cfg); err == nil {
-			base, err = buildRealDialer(cfg, obs)
+			base, err = buildRealDialer(cfg, obs, rp.keySigner)
 		}
 		if err != nil {
 			return nil, nil, err
 		}
 	}
 	// 透明客户端 ControlMaster 复用适配器：位于真实/仿真拨号器外层、RemoteFS 覆写内层，确保 Exec 与 SFTP 统一复用活跃主进程。
-	if cfg.MuxSocket != nil {
-		base = &muxClientDialer{inner: base, mux: cfg.MuxSocket, env: cfg.Env, interaction: cfg.Interaction}
+	if rp.muxSocket != nil {
+		base = &muxClientDialer{inner: base, mux: rp.muxSocket, env: cfg.Env, interaction: cfg.Interaction}
 	}
 	if cfg.RemoteFS != nil {
 		base = &remoteFSDialer{inner: base, openFS: cfg.RemoteFS}
@@ -298,11 +350,12 @@ func (d *remoteFSDialer) DialHop(ctx context.Context, hop plan.HopSpec, dig plan
 func (c *remoteFSConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort, error) {
 	return c.openFS(ctx, c.TransportConn)
 }
-func buildRealDialer(cfg Config, hostTrust ports.HostTrustPort) (*dial.Dialer, error) {
+func buildRealDialer(cfg Config, hostTrust ports.HostTrustPort, keySigner ports.KeySignerPort) (*dial.Dialer, error) {
 	d, err := dial.NewDialer(dial.Config{
-		HostTrust: hostTrust, Vault: cfg.Vault, KeySigner: cfg.KeySigner, Agent: cfg.Agent,
+		HostTrust: hostTrust, Vault: cfg.Vault, KeySigner: keySigner, Agent: cfg.Agent,
 		ReadFS: cfg.OperatorReadFS, Process: cfg.Process, Interaction: cfg.Interaction,
-		Clock: cfg.Clock, Env: cfg.Env, DialContext: dial.DialContextFunc(cfg.DialContext), ClientVersion: cfg.ClientVersion,
+		Clock: cfg.Clock, Env: cfg.Env, DialContext: dial.DialContextFunc(cfg.DialContext),
+		OpenRemoteFS: sftp.Open, ClientVersion: cfg.ClientVersion,
 	})
 	return d, wrapCfgErr("初始化 sshnet/dial 失败", err)
 }
