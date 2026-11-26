@@ -87,18 +87,24 @@ func mustInitVault(t *testing.T, v *offline.Vault, master string) {
 	}
 }
 
+func newFreshVaultDir(t *testing.T) string {
+	t.Helper()
+	// 使用 t.TempDir() 下尚未创建的子目录，以便 Windows EnsureRoot 以 Owner-Only DACL 创建根目录而非继承父临时目录宽松 DACL。
+	return filepath.Join(t.TempDir(), "vault")
+}
+
 func TestTCKOfflineVaultAndControl(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	t.Run("SecretVaultTCK", func(t *testing.T) {
 		tck.RunSecretVaultSuite(t, tck.SecretVaultFixture{
 			NewVault: func(t *testing.T) ports.SecretVault {
-				v := newTestOfflineVault(t, t.TempDir(), false)
+				v := newTestOfflineVault(t, newFreshVaultDir(t), false)
 				mustInitVault(t, v, "offline-master-pass")
 				return v
 			},
 			NewLockedVault: func(t *testing.T) ports.SecretVault {
-				v := newTestOfflineVault(t, t.TempDir(), false)
+				v := newTestOfflineVault(t, newFreshVaultDir(t), false)
 				mustInitVault(t, v, "offline-master-pass")
 				if err := v.Lock(context.Background()); err != nil {
 					t.Fatalf("Vault.Lock 失败: %v", err)
@@ -111,7 +117,7 @@ func TestTCKOfflineVaultAndControl(t *testing.T) {
 	t.Run("VaultControlTCK", func(t *testing.T) {
 		tck.RunVaultControlSuite(t, tck.VaultControlFixture{
 			NewUninitialized: func(t *testing.T) ports.VaultControlPort {
-				return newTestOfflineVault(t, t.TempDir(), false)
+				return newTestOfflineVault(t, newFreshVaultDir(t), false)
 			},
 		})
 	})
@@ -120,7 +126,7 @@ func TestTCKOfflineVaultAndControl(t *testing.T) {
 func TestOfflineVault_PersistenceTamperAndSubprocessKDF(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	ctx := context.Background()
-	dir := t.TempDir()
+	dir := newFreshVaultDir(t)
 	ref := tck.MustRef(t, "offline", "db-pass")
 
 	v1 := newTestOfflineVault(t, dir, true)

@@ -117,7 +117,13 @@ func startMockDBusSecretServer(t *testing.T, supportDH, locked bool) string {
 	if err != nil {
 		t.Fatalf("os.Executable 失败: %v", err)
 	}
-	sock := filepath.Join(t.TempDir(), "dbus.sock")
+	// 使用短路径临时目录避免在非 /tmp TMPDIR 或长嵌套子测试名下超出 Linux 108B AF_UNIX sun_path 上限。
+	shortDir, err := os.MkdirTemp("", "xops-ss-*")
+	if err != nil {
+		t.Fatalf("os.MkdirTemp 失败: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	sock := filepath.Join(shortDir, "d.sock")
 	cmd := exec.Command(exe, "-test.run=^TestSecretServiceHelperProcess$")
 	dhVal, lockVal := "0", "0"
 	if supportDH {

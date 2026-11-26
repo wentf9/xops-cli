@@ -79,11 +79,17 @@ func startUnixAgentHelper(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("os.Executable 失败: %v", err)
 	}
-	baseDir, err := filepath.EvalSymlinks(t.TempDir())
+	// 使用短路径临时目录避免在非 /tmp TMPDIR 或 macOS 104B / Linux 108B AF_UNIX sun_path 上限下溢出。
+	shortDir, err := os.MkdirTemp("", "xops-ag-*")
 	if err != nil {
-		t.Fatalf("EvalSymlinks(TempDir) 失败: %v", err)
+		t.Fatalf("os.MkdirTemp 失败: %v", err)
 	}
-	sock := filepath.Join(baseDir, "ag.sock")
+	t.Cleanup(func() { _ = os.RemoveAll(shortDir) })
+	baseDir, err := filepath.EvalSymlinks(shortDir)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) 失败: %v", shortDir, err)
+	}
+	sock := filepath.Join(baseDir, "a.sock")
 	cmd := exec.Command(exe, "-test.run=^TestAgentHelperProcess$")
 	cmd.Env = append(os.Environ(), agentHelperSockEnv+"="+sock)
 	stdinW, err := cmd.StdinPipe()

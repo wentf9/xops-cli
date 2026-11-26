@@ -3,6 +3,7 @@ package vault_test
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -23,7 +24,8 @@ var _ ports.SecretVault = (*vault.RouterVault)(nil)
 
 func newUnlockedOffline(t *testing.T, storeName string) *offline.Vault {
 	t.Helper()
-	dir, err := pathalg.ParseLocalDir(t.TempDir())
+	// 使用 t.TempDir() 下新建子目录，使 Windows EnsureRoot 以 Owner-Only DACL 创建目录。
+	dir, err := pathalg.ParseLocalDir(filepath.Join(t.TempDir(), "vault"))
 	if err != nil {
 		t.Fatalf("ParseLocalDir 失败: %v", err)
 	}

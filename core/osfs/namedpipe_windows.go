@@ -7,37 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/osfs/internal/winpipe"
 	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/sys/windows"
 	"net"
-	"os"
 	"strings"
-	"time"
 	"unsafe"
 )
 
 const winPipePrefix, winPipeOpenFlags = `\\.\pipe\`, windows.FILE_FLAG_OVERLAPPED | windows.SECURITY_SQOS_PRESENT | windows.SECURITY_IDENTIFICATION
 
-type windowsPipeAddr string
-
-func (windowsPipeAddr) Network() string  { return "pipe" }
-func (a windowsPipeAddr) String() string { return string(a) }
-
-type windowsNamedPipeConn struct {
-	file *os.File
-	addr windowsPipeAddr
-}
-
-func (c *windowsNamedPipeConn) Read(p []byte) (int, error)         { return c.file.Read(p) }
-func (c *windowsNamedPipeConn) Write(p []byte) (int, error)        { return c.file.Write(p) }
-func (c *windowsNamedPipeConn) Close() error                       { return c.file.Close() }
-func (c *windowsNamedPipeConn) LocalAddr() net.Addr                { return c.addr }
-func (c *windowsNamedPipeConn) RemoteAddr() net.Addr               { return c.addr }
-func (c *windowsNamedPipeConn) SetDeadline(t time.Time) error      { return c.file.SetDeadline(t) }
-func (c *windowsNamedPipeConn) SetReadDeadline(t time.Time) error  { return c.file.SetReadDeadline(t) }
-func (c *windowsNamedPipeConn) SetWriteDeadline(t time.Time) error { return c.file.SetWriteDeadline(t) }
-
-// DialWindowsNamedPipeVerified 以受控 QoS 与服务端所有者/DACL 强校验拨号本地 Windows 命名管道（\\.\pipe\<name>）。
+// DialWindowsNamedPipeVerified 以受控 QoS 与服务端所有者/DACL 强校验拨号本地 Windows 命名管道（\\.\pipe\<name>），
+// 并以全双工独立重叠 I/O 封装为无数据竞争的 net.Conn。
 func DialWindowsNamedPipeVerified(ctx context.Context, pipePath string) (net.Conn, error) {
 	if ctx == nil {
 		return nil, ports.ErrNilContext
@@ -55,14 +36,16 @@ func DialWindowsNamedPipeVerified(ctx context.Context, pipePath string) (net.Con
 		return nil, err
 	}
 	if err = verifyNamedPipeHandle(h, norm); err == nil {
-		if f := os.NewFile(uintptr(h), norm); f != nil {
-			return &windowsNamedPipeConn{file: f, addr: windowsPipeAddr(norm)}, nil
+		var conn *winpipe.Conn
+		if conn, err = winpipe.NewConn(h, norm); err == nil {
+			return conn, nil
 		}
-		err = fmt.Errorf("%w: 命名管道句柄封装失败", ports.ErrInvalidArgument)
+		err = mapOSError(err)
 	}
 	_ = windows.CloseHandle(h)
 	return nil, err
 }
+
 func parseWindowsPipeUTF16(raw string) (string, *uint16, error) {
 	slashed := strings.ReplaceAll(raw, "/", `\`)
 	if raw == "" || hasForbiddenControlPathRune(raw) || len(slashed) <= len(winPipePrefix) || !strings.EqualFold(slashed[:len(winPipePrefix)], winPipePrefix) || strings.ContainsRune(slashed[len(winPipePrefix):], ':') {
@@ -78,6 +61,7 @@ func parseWindowsPipeUTF16(raw string) (string, *uint16, error) {
 	ptr, err := windows.UTF16PtrFromString(norm)
 	return norm, ptr, pickIf[error](err != nil, fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err), nil)
 }
+
 func verifyNamedPipeHandle(h windows.Handle, norm string) error {
 	if ft, err := windows.GetFileType(h); err != nil || ft != windows.FILE_TYPE_PIPE {
 		return pickIf[error](err != nil, mapOSError(err), fmt.Errorf("%w: %q 不是命名管道", ErrNotSocket, norm))
