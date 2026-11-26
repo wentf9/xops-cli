@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/goleak"
 
@@ -583,14 +585,44 @@ func postEngineHTTPMCPTool(t *testing.T, client *http.Client, baseURL, sid strin
 	return out
 }
 
-// TestEngineMCP_PythonClientInterop_StdioAndHTTP 使用本机独立 Python 进程分别通过
+// findWorkingPython3 依次探测 PATH 中的 python3 / python 并实际运行主版本校验脚本，
+// 规避 Windows 11 默认 Microsoft Store App Execution Alias 占位桩（LookPath 成功但执行返回 exit status 9009）。
+func findWorkingPython3(ctx context.Context) (string, error) {
+	var lastErr error
+	for _, candidate := range []string{"python3", "python"} {
+		binPath, err := exec.LookPath(candidate)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		probeErr := exec.CommandContext(
+			probeCtx,
+			binPath,
+			"-c",
+			"import sys; raise SystemExit(0 if sys.version_info.major == 3 else 1)",
+		).Run()
+		cancel()
+		if probeErr != nil {
+			lastErr = fmt.Errorf("%s 探针失败: %w", binPath, probeErr)
+			continue
+		}
+		return binPath, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("未找到可用的 Python 3 解释器")
+	}
+	return "", lastErr
+}
+
+// TestEngineMCP_PythonClientInterop_StdioAndHTTP 使用本机独立 Python 3 进程分别通过
 // 本地 stdio 管道与 127.0.0.1 回环 Streamable HTTP 端点与真实 Engine.NewMCPServer 互通（0 外部网络）；
-// 若当前运行环境未安装 python3（如 Win11 Runner）则仅跳过本 Python 子测，不影响全平台 Go 确定性测试。
+// 若当前运行环境未安装可执行 Python 3（含 Win11 Store 占位桩）则仅跳过本 Python 子测，不影响全平台 Go 确定性测试。
 func TestEngineMCP_PythonClientInterop_StdioAndHTTP(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	pythonBin, err := exec.LookPath("python3")
+	pythonBin, err := findWorkingPython3(context.Background())
 	if err != nil {
-		t.Skip("python3 不可用，跳过独立 Python MCP 客户端互通测试（Go 端全量测试已覆盖三平台）")
+		t.Skipf("可执行 Python 3 不可用，跳过独立 Python MCP 客户端互通测试（Go 端全量测试已覆盖三平台）: %v", err)
 	}
 
 	t.Run("stdio_with_two_step_approval", func(t *testing.T) {
