@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -159,11 +158,16 @@ func verifyMuxShellPTYResizeSignal(ctx context.Context, mc ports.TransportConn) 
 		return err
 	}
 	defer func() { _ = sh.Close() }()
+	// 通过 StdinPipe 保持 Shell 标准输入在 ResizePTY 与 Signal 完成前持续打开，
+	// 防止对端桩在收到过早 EOF 后提前关闭 SSH 通道导致控制请求竞态失败。
+	inW, err := sh.StdinPipe()
+	if err != nil {
+		return err
+	}
 	sz, _ := ports.NewTerminalSize(80, 24)
 	ptyReq, _ := ports.NewPTYRequest("xterm-256color", sz)
 	var outBuf bytes.Buffer
 	if err := sh.StartShell(ctx, ports.ExecStreams{
-		Stdin:  strings.NewReader("hi"),
 		Stdout: &outBuf,
 		PTY:    algebraic.Some(ptyReq),
 		Env:    map[string]string{"LANG": "C.UTF-8"},
@@ -177,9 +181,18 @@ func verifyMuxShellPTYResizeSignal(ctx context.Context, mc ports.TransportConn) 
 	if err := sh.Signal(ctx, "TERM"); err != nil {
 		return err
 	}
+	if _, err := inW.Write([]byte("hi")); err != nil {
+		return err
+	}
+	if err := inW.Close(); err != nil {
+		return err
+	}
 	out, err := sh.Wait(ctx)
 	if err != nil || out == nil || !out.IsValid() {
 		return errors.Join(errors.New("Shell Wait 失败"), err)
+	}
+	if !bytes.Contains(outBuf.Bytes(), []byte("hi")) {
+		return errors.New("Shell 输出缺少预期回显")
 	}
 	return nil
 }
@@ -343,8 +356,8 @@ func serveMuxSSHStub(raw net.Conn, hostSigner ssh.Signer, pass string) {
 	if err != nil {
 		return
 	}
-	defer func() { _ = sc.Close() }()
 	_ = conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		defer func() { _ = sc.Close() }()
 		_ = n.Go(func(context.Context) error { handleMuxGlobalReqs(reqs); return nil })
 		for newCh := range chans {
 			ch := newCh
