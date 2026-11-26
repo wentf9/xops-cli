@@ -245,11 +245,20 @@ func (p *Pool) fallbackAbortRootDirect(root *hopInstance) {
 // scheduleOrphanConnClose / scheduleResourceClose 在独立 teardownNursery 中以 90ms 有界宽限释放孤儿连接或托管资源。
 func (p *Pool) scheduleOrphanConnClose(conn ports.TransportConn) { p.scheduleCloserBounded(conn) }
 func (p *Pool) scheduleResourceClose(res ManagedResource)        { p.scheduleCloserBounded(res) }
+func (p *Pool) scheduleResourceCloseReserved(res ManagedResource) {
+	p.scheduleCloserBoundedReserved(res)
+}
 func (p *Pool) scheduleCloserBounded(c closeOnly) {
 	if c == nil {
 		return
 	}
 	p.incTeardownPending()
+	p.scheduleCloserBoundedReserved(c)
+}
+func (p *Pool) scheduleCloserBoundedReserved(c closeOnly) {
+	if c == nil {
+		return
+	}
 	if err := p.teardownNursery.Go(func(_ context.Context) error {
 		defer p.decTeardownPending()
 		p.closeCloserBounded(c)

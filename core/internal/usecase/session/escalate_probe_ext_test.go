@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/option"
+	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -57,12 +58,15 @@ type fullRigOptions struct {
 	profile           gate.PolicyProfileKind
 	approvalThreshold security.RiskLevel
 	noElicitFallback  gate.NoElicitFallback
+	protectedPatterns []string
 	interactive       bool
+	disableEnv        bool
 	customDialer      ports.DialerPort
 	customAuditSink   func(ports.AuditSink) ports.AuditSink
 	customInteraction ports.InteractionPort
 	customProbe       ports.ShellProbePort
 	customMux         ports.MuxSocketPort
+	customTUN         ports.TUNDevicePort
 	disableTUN        bool
 }
 
@@ -100,11 +104,11 @@ func newFullSessionRig(t *testing.T, opt fullRigOptions) *fullSessionRig {
 		bus.Close()
 		t.Fatalf("NewPool: %v", err)
 	}
-	pol, err := gate.NewGuardrailPolicy(gate.GuardrailPolicySpec{ApprovalThreshold: opt.approvalThreshold, NoElicitFallback: opt.noElicitFallback})
+	pol, err := gate.NewGuardrailPolicyFromPatterns(opt.approvalThreshold, opt.noElicitFallback, opt.protectedPatterns)
 	if err != nil {
 		_ = p.Close()
 		bus.Close()
-		t.Fatalf("NewGuardrailPolicy: %v", err)
+		t.Fatalf("NewGuardrailPolicyFromPatterns: %v", err)
 	}
 	g, err := gate.NewGate(gate.GateConfig{
 		Profile: opt.profile, Policy: pol, AuditSink: sink, Reconciler: cluster,
@@ -120,47 +124,53 @@ func newFullSessionRig(t *testing.T, opt fullRigOptions) *fullSessionRig {
 	if err != nil {
 		t.Fatalf("NewLocalIdentityInfo: %v", err)
 	}
-	env := sim.NewSimEnvPort(map[string]string{"LANG": "en_US.UTF-8", "TERM": "xterm-256color"}, id)
-	term := sim.NewSimTerminalPort(opt.interactive, 100, 30)
-	esc := sim.NewSimPrivilegeEscalator()
-	vault := sim.NewSimVault(rng.Fork())
-	inter := sim.NewSimInteractionPort(opt.interactive)
-	var interPort ports.InteractionPort = inter
-	if opt.customInteraction != nil {
-		interPort = opt.customInteraction
-	}
 	var zeroProbeRes ports.ShellProbeResult
-	probe := sim.NewSimShellProbe(zeroProbeRes)
-	var probePort ports.ShellProbePort = probe
-	if opt.customProbe != nil {
-		probePort = opt.customProbe
+	rig := &fullSessionRig{
+		clk: clk, rng: rng, cluster: cluster, bus: bus, dialer: simDial, pool: p, gate: g,
+		env:         sim.NewSimEnvPort(map[string]string{"LANG": "en_US.UTF-8", "TERM": "xterm-256color"}, id),
+		term:        sim.NewSimTerminalPort(opt.interactive, 100, 30),
+		escalator:   sim.NewSimPrivilegeEscalator(),
+		vault:       sim.NewSimVault(rng.Fork()),
+		interaction: sim.NewSimInteractionPort(opt.interactive),
+		shellProbe:  sim.NewSimShellProbe(zeroProbeRes),
+		forwarder:   sim.NewSimForwarder(),
+		tunDevice:   sim.NewSimTUNDevicePort(),
+		muxSocket:   sim.NewSimMuxSocket(simDial),
 	}
-	fwd := sim.NewSimForwarder()
-	tun := sim.NewSimTUNDevicePort()
-	var tunPort ports.TUNDevicePort = tun
-	if opt.disableTUN {
-		tunPort = nil
-	}
-	mux := sim.NewSimMuxSocket(simDial)
-	var muxPort ports.MuxSocketPort = mux
-	if opt.customMux != nil {
-		muxPort = opt.customMux
-	}
-	svc, err := ucsess.NewService(ucsess.ServiceConfig{
-		Gate: g, Pool: p, Clock: clk, Env: env, Terminal: term,
-		Escalator: esc, Vault: vault, Interaction: interPort,
-		ShellProbe: probePort, Forwarder: fwd, TUNDevice: tunPort, MuxSocket: muxPort,
-	})
+	svc, err := ucsess.NewService(buildRigServiceConfig(rig, opt))
 	if err != nil {
 		_ = p.Close()
 		bus.Close()
 		t.Fatalf("NewService: %v", err)
 	}
-	return &fullSessionRig{
-		clk: clk, rng: rng, cluster: cluster, bus: bus, dialer: simDial, pool: p, gate: g,
-		env: env, term: term, escalator: esc, vault: vault, interaction: inter,
-		shellProbe: probe, forwarder: fwd, tunDevice: tun, muxSocket: mux, svc: svc,
+	rig.svc = svc
+	return rig
+}
+
+func buildRigServiceConfig(r *fullSessionRig, opt fullRigOptions) ucsess.ServiceConfig {
+	cfg := ucsess.ServiceConfig{
+		Gate: r.gate, Pool: r.pool, Clock: r.clk, Env: r.env, Terminal: r.term,
+		Escalator: r.escalator, Vault: r.vault, Interaction: r.interaction,
+		ShellProbe: r.shellProbe, Forwarder: r.forwarder, TUNDevice: r.tunDevice, MuxSocket: r.muxSocket,
 	}
+	if opt.disableEnv {
+		cfg.Env = nil
+	}
+	if opt.customInteraction != nil {
+		cfg.Interaction = opt.customInteraction
+	}
+	if opt.customProbe != nil {
+		cfg.ShellProbe = opt.customProbe
+	}
+	if opt.disableTUN {
+		cfg.TUNDevice = nil
+	} else if opt.customTUN != nil {
+		cfg.TUNDevice = opt.customTUN
+	}
+	if opt.customMux != nil {
+		cfg.MuxSocket = opt.customMux
+	}
+	return cfg
 }
 
 func (r *fullSessionRig) close() {
@@ -301,7 +311,17 @@ func TestSessionExecPrivileged_MethodsVaultAndInteractivePassword(t *testing.T) 
 	}
 	assertSucceededOutcome(t, out)
 
-	// 4. 参数冲突校验：NonInteractive + PromptPassword 失败关闭；脚本计划 + RequestTTYForce 拒绝。
+	assertPrivilegeConflictRejections(t, rig, pl, goodRef)
+}
+
+func assertPrivilegeConflictRejections(t *testing.T, rig *fullSessionRig, pl plan.SealedConnectionPlan, goodRef secret.Ref) {
+	t.Helper()
+	if _, err := rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: mustPrivilegeReq(t, ports.PrivilegeMethodSudo, "id", "", false),
+		PasswordRef: algebraic.Some(goodRef), PromptPassword: true,
+	}); !errors.Is(err, ucsess.ErrInvalidRequest) {
+		t.Fatalf("PasswordRef+PromptPassword 期望 ErrInvalidRequest，实际=%v", err)
+	}
 	if _, err := rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
 		Plan: pl, Privilege: mustPrivilegeReq(t, ports.PrivilegeMethodSudo, "id", "", true), PromptPassword: true,
 	}); !errors.Is(err, ucsess.ErrInvalidRequest) {
@@ -399,6 +419,153 @@ func TestSessionExecPrivileged_GuardrailApprovalAndCanonicalScopeEscalated(t *te
 	if err != nil || out.Kind() != execution.OutcomeKindUnknown {
 		t.Fatalf("OutcomeUnknown 必须原样保留: out=%#v err=%v", out, err)
 	}
+}
+
+// TestSessionExecPrivileged_LatticeMonotonicityProtectedPathsAndPreStartIsolation 验证：
+// 1. LexicalScope 含 VerdictDeny / DecisionDeny 绝不被降级放行（0 拨号）；
+// 2. LexicalScope 含 RiskCritical + NeedApproval 在 DirectOperator 下保留 RiskCritical 审批下限；
+// 3. /tmp/benign -> /etc/sudoers 受保护区跃迁与 /etc/a -> /root/b 跨受保护分区替换必被捕获；
+// 4. 取密（Vault 锁定 / 取消）位于 WithLease 外：0 拨号且返回 OutcomeNotStarted（非 OutcomeUnknown）。
+func TestSessionExecPrivileged_LatticeMonotonicityProtectedPathsAndPreStartIsolation(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newFullSessionRig(t, fullRigOptions{
+		profile: gate.PolicyProfileDirectOperator, noElicitFallback: gate.NoElicitFallbackChallenge,
+		protectedPatterns: []string{"/etc/**", "/root/**"},
+	})
+	defer rig.close()
+	pl := mustTestPlan(t, "")
+	targetHop, _ := pl.Target()
+	privReq := mustPrivilegeReq(t, ports.PrivilegeMethodSudo, "cat /etc/sudoers", "root", true)
+
+	assertLexicalDenyNeverRelaxed(t, rig, pl, targetHop, privReq)
+	assertLexicalCriticalAndProtectedPathCaught(t, rig, pl, targetHop, privReq)
+	assertPreStartSecretFailureZeroDialNotStarted(t, pl)
+}
+
+func assertLexicalDenyNeverRelaxed(t *testing.T, rig *fullSessionRig, pl plan.SealedConnectionPlan, targetHop plan.HopSpec, privReq ports.PrivilegeRequest) {
+	t.Helper()
+	denyVerdictLex, err := security.NewScopeSnapshot(security.ScopeSnapshotSpec{
+		Capability: security.CapabilityExecute, TargetNode: targetHop.NodeID(), Endpoint: algebraic.Some(targetHop.Endpoint()),
+		Verdict: security.VerdictDeny, Risk: security.RiskDangerous, Decision: security.NewDecisionDeny("lexical deny"),
+	})
+	if err != nil {
+		t.Fatalf("NewScopeSnapshot(verdictDeny): %v", err)
+	}
+	if _, err := rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: privReq, LexicalScope: algebraic.Some(denyVerdictLex),
+	}); !errors.Is(err, ucsess.ErrEscalationScopeChanged) || rig.dialer.DialCount() != 0 {
+		t.Fatalf("VerdictDeny 必须被阻断且 0 拨号: err=%v dials=%d", err, rig.dialer.DialCount())
+	}
+	denyDecLex, err := security.NewScopeSnapshot(security.ScopeSnapshotSpec{
+		Capability: security.CapabilityExecute, TargetNode: targetHop.NodeID(), Endpoint: algebraic.Some(targetHop.Endpoint()),
+		Verdict: security.VerdictAllow, Risk: security.RiskDangerous, Decision: security.NewDecisionDeny("policy deny"),
+	})
+	if err != nil {
+		t.Fatalf("NewScopeSnapshot(decDeny): %v", err)
+	}
+	if _, err := rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: privReq, LexicalScope: algebraic.Some(denyDecLex),
+	}); !errors.Is(err, ucsess.ErrEscalationScopeChanged) || rig.dialer.DialCount() != 0 {
+		t.Fatalf("DecisionDeny 必须被阻断且 0 拨号: err=%v dials=%d", err, rig.dialer.DialCount())
+	}
+}
+
+func assertLexicalCriticalAndProtectedPathCaught(t *testing.T, rig *fullSessionRig, pl plan.SealedConnectionPlan, targetHop plan.HopSpec, privReq ports.PrivilegeRequest) {
+	t.Helper()
+	// 1. 词法阶段已给出 NeedApproval(RiskDangerous) 且路径一致（未继续升级）：DirectOperator 亦不可放松为 Allow。
+	dangDec, _ := security.NewDecisionNeedApproval(security.RiskDangerous, "lexical approval floor")
+	floorLex, err := security.NewScopeSnapshot(security.ScopeSnapshotSpec{
+		Capability: security.CapabilityExecute, TargetNode: targetHop.NodeID(), Endpoint: algebraic.Some(targetHop.Endpoint()),
+		Verdict: security.VerdictAllow, Risk: security.RiskDangerous, Decision: dangDec,
+	})
+	if err != nil {
+		t.Fatalf("NewScopeSnapshot(floor): %v", err)
+	}
+	_, err = rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: privReq, LexicalScope: algebraic.Some(floorLex),
+	})
+	var chErr *gate.ApprovalChallengeError
+	if !errors.As(err, &chErr) || chErr.Envelope().Risk() != security.RiskDangerous || rig.dialer.DialCount() != 0 {
+		t.Fatalf("词法 NeedApproval 下限不可放松为 Allow: err=%v dials=%d", err, rig.dialer.DialCount())
+	}
+
+	// 2. /tmp/benign -> /etc/sudoers 受保护区跃迁与 /etc/a -> /root/b 跨受保护分区替换均须触发审批挑战（0 拨号）。
+	benignPath, _ := security.NewScopedPath("/tmp/benign", false)
+	pathLex, err := security.NewScopeSnapshot(security.ScopeSnapshotSpec{
+		Capability: security.CapabilityExecute, TargetNode: targetHop.NodeID(), Endpoint: algebraic.Some(targetHop.Endpoint()),
+		Verdict: security.VerdictAllow, Risk: security.RiskDangerous, Decision: dangDec, Paths: []security.ScopedPath{benignPath},
+	})
+	if err != nil {
+		t.Fatalf("NewScopeSnapshot(benignPath): %v", err)
+	}
+	_, err = rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: privReq, Paths: []string{"/etc/sudoers"}, LexicalScope: algebraic.Some(pathLex),
+	})
+	_ = mustApproveChallenge(t, err)
+	if rig.dialer.DialCount() != 0 {
+		t.Fatalf("/tmp/benign -> /etc/sudoers 受保护替换前禁止拨号: dials=%d", rig.dialer.DialCount())
+	}
+	etcPath, _ := security.NewScopedPath("/etc/a", false, "/etc/**")
+	etcLex, err := security.NewScopeSnapshot(security.ScopeSnapshotSpec{
+		Capability: security.CapabilityExecute, TargetNode: targetHop.NodeID(), Endpoint: algebraic.Some(targetHop.Endpoint()),
+		Verdict: security.VerdictAllow, Risk: security.RiskDangerous, Decision: dangDec, Paths: []security.ScopedPath{etcPath},
+	})
+	if err != nil {
+		t.Fatalf("NewScopeSnapshot(etcPath): %v", err)
+	}
+	_, err = rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: privReq, Paths: []string{"/root/b"}, LexicalScope: algebraic.Some(etcLex),
+	})
+	_ = mustApproveChallenge(t, err)
+	if rig.dialer.DialCount() != 0 {
+		t.Fatalf("/etc/a -> /root/b 跨受保护分区替换前禁止拨号: dials=%d", rig.dialer.DialCount())
+	}
+}
+
+func assertPreStartSecretFailureZeroDialNotStarted(t *testing.T, pl plan.SealedConnectionPlan) {
+	t.Helper()
+	rig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator})
+	defer rig.close()
+	ref := mustPutVaultSecret(t, rig.vault, "vault/sudo-locked", []byte("pw"))
+	if err := rig.vault.Lock(context.Background()); err != nil {
+		t.Fatalf("vault.Lock: %v", err)
+	}
+	out, err := rig.svc.ExecPrivileged(context.Background(), ucsess.PrivilegeExecRequest{
+		Plan: pl, Privilege: mustPrivilegeReq(t, ports.PrivilegeMethodSudo, "id", "", false),
+		PasswordRef: algebraic.Some(ref),
+	})
+	if !errors.Is(err, ports.ErrVaultLocked) || out.Kind() != execution.OutcomeKindNotStarted || rig.dialer.DialCount() != 0 {
+		t.Fatalf("取密阶段 Vault 锁定必须 0 拨号且返回 NotStarted: out=%#v err=%v dials=%d", out, err, rig.dialer.DialCount())
+	}
+}
+
+type panicShellProbeStub struct{}
+
+func (panicShellProbeStub) ProbeShell(context.Context, ports.SessionOpener) (ports.ShellProbeResult, error) {
+	panic("injected synchronous probe panic")
+}
+
+// TestSessionRunAuthorized_PanicEmitsCompletedEventOnStream 验证同步 run 发生 panic 时 OperationStream 仍收到终态 Completed(Succeeded=false)。
+func TestSessionRunAuthorized_PanicEmitsCompletedEventOnStream(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig := newFullSessionRig(t, fullRigOptions{customProbe: panicShellProbeStub{}})
+	defer rig.close()
+	stream := mustTestOperationStream(t, rig.rng)
+	panicked := false
+	func() {
+		defer func() {
+			if recover() != nil {
+				panicked = true
+			}
+		}()
+		_, _ = rig.svc.ProbeShell(context.Background(), ucsess.ProbeShellRequest{
+			Plan: mustTestPlan(t, ""), OperationStream: stream,
+		})
+	}()
+	if !panicked {
+		t.Fatal("期望 panic 向上传播")
+	}
+	assertStreamHasCompletedEvent(t, stream, false)
 }
 
 type corruptShellProbeStub struct{}

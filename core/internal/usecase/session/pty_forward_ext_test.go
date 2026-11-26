@@ -29,12 +29,13 @@ import (
 
 // ptyPipeDialer 提供跨请求持续存活的双向回显 PTY 会话，用于验证 SlotMap 持久 PTY 读写、缩放、信号与 4 条吊销路径。
 type ptyPipeDialer struct {
-	mu          sync.Mutex
-	dialCount   atomic.Int32
-	resizes     []ports.TerminalSize
-	signals     []string
-	lastSession *ptyPipeSession
-	noAutoEcho  bool
+	mu           sync.Mutex
+	dialCount    atomic.Int32
+	resizes      []ports.TerminalSize
+	signals      []string
+	lastSession  *ptyPipeSession
+	noAutoEcho   bool
+	writeEntered chan struct{}
 }
 
 func (d *ptyPipeDialer) DialHop(_ context.Context, hop plan.HopSpec, dig plan.HopDigest, _ ports.TransportConn) (ports.TransportConn, error) {
@@ -95,8 +96,23 @@ type ptyPipeSession struct {
 	closeOnce sync.Once
 }
 
+type notifyWriteCloser struct {
+	w    io.WriteCloser
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (n *notifyWriteCloser) Write(p []byte) (int, error) {
+	n.once.Do(func() { close(n.ch) })
+	return n.w.Write(p)
+}
+func (n *notifyWriteCloser) Close() error { return n.w.Close() }
+
 func (s *ptyPipeSession) StdinPipe() (io.WriteCloser, error) {
 	s.inR, s.inW = io.Pipe()
+	if s.owner.writeEntered != nil {
+		return &notifyWriteCloser{w: s.inW, ch: s.owner.writeEntered}, nil
+	}
 	return s.inW, nil
 }
 func (s *ptyPipeSession) StdoutPipe() (io.Reader, error) {
@@ -449,15 +465,24 @@ func assertDirectAndFallbackTUNForwards(t *testing.T, rig *fullSessionRig, pl pl
 	_ = noTUNRig.svc.StopForward(context.Background(), info.Handle())
 }
 
-func assertSingleDirectTUNForward(t *testing.T, rig *fullSessionRig, pl plan.SealedConnectionPlan, mode ports.TUNMode, pref string) {
+func assertSingleDirectTUNForward(t *testing.T, _ *fullSessionRig, pl plan.SealedConnectionPlan, mode ports.TUNMode, pref string) {
 	t.Helper()
+	remR, remW := io.Pipe()
+	locR, locW := io.Pipe()
+	defer func() { _ = remW.Close(); _ = locW.Close() }()
+	tunRig := newFullSessionRig(t, fullRigOptions{
+		profile:      gate.PolicyProfileDirectOperator,
+		customDialer: &tunEOFDialer{remoteR: remR, remoteW: remW},
+		customTUN:    &pipeTUNPort{localR: locR, localW: locW, ifaceName: pref + "0"},
+	})
+	defer tunRig.close()
 	ts, _ := ports.NewTUNSpec(mode, ports.TUNUnitAny, 1)
 	fSpec, _ := ports.NewForwardTUNSpec(ts)
-	info, err := rig.svc.StartForward(context.Background(), ucsess.StartForwardRequest{Plan: pl, Spec: fSpec})
+	info, err := tunRig.svc.StartForward(context.Background(), ucsess.StartForwardRequest{Plan: pl, Spec: fSpec})
 	if err != nil || !info.IsValid() || len(info.BoundAddr()) < 4 || info.BoundAddr()[:3] != pref {
 		t.Fatalf("Direct TUN(%v) 失败: info=%#v err=%v", mode, info, err)
 	}
-	if err := rig.svc.WithForwardHandle(context.Background(), info.Handle(), func(_ context.Context, fh ports.ForwardHandle) error {
+	if err := tunRig.svc.WithForwardHandle(context.Background(), info.Handle(), func(_ context.Context, fh ports.ForwardHandle) error {
 		if !fh.IsValid() || fh.BoundAddr() != info.BoundAddr() {
 			return errors.New("unexpected direct TUN ForwardHandle")
 		}
@@ -465,9 +490,10 @@ func assertSingleDirectTUNForward(t *testing.T, rig *fullSessionRig, pl plan.Sea
 	}); err != nil {
 		t.Fatalf("WithForwardHandle(TUN): %v", err)
 	}
-	if err := rig.svc.StopForward(context.Background(), info.Handle()); err != nil {
+	if err := tunRig.svc.StopForward(context.Background(), info.Handle()); err != nil {
 		t.Fatalf("StopForward(TUN): %v", err)
 	}
+	assertTeardownClean(t, tunRig, "DirectTUN/"+pref)
 }
 
 func assertForwardDefaultRiskGate(t *testing.T, pl plan.SealedConnectionPlan) {
@@ -505,6 +531,13 @@ func assertForwardRevocationMode(t *testing.T, spec ports.ForwardSpec, mode stri
 	t.Helper()
 	var faultArmed atomic.Bool
 	opt := fullRigOptions{profile: gate.PolicyProfileDirectOperator}
+	if spec.Direction() == ports.ForwardTUN {
+		remR, remW := io.Pipe()
+		locR, locW := io.Pipe()
+		defer func() { _ = remW.Close(); _ = locW.Close() }()
+		opt.customDialer = &tunEOFDialer{remoteR: remR, remoteW: remW}
+		opt.customTUN = &pipeTUNPort{localR: locR, localW: locW, ifaceName: "tun2"}
+	}
 	if mode == "GateHalted" {
 		opt.profile = gate.PolicyProfileStrictAgent
 		opt.approvalThreshold = security.RiskDangerous
@@ -540,4 +573,184 @@ func assertForwardRevocationMode(t *testing.T, spec ports.ForwardSpec, mode stri
 		t.Fatalf("%s 吊销后 ActiveHandles 必须归零: %+v", mode, rig.pool.Stats())
 	}
 	assertTeardownClean(t, rig, "ForwardRevocation/"+mode)
+}
+
+// tunEOFDialer 与 blockingLocalTUN 用于验证 Direct TUN 远端正常 EOF 即时关闭本地设备、Done() 闭合与 Active()==false。
+type tunEOFDialer struct {
+	remoteR *io.PipeReader
+	remoteW *io.PipeWriter
+}
+
+func (d *tunEOFDialer) DialHop(_ context.Context, hop plan.HopSpec, dig plan.HopDigest, _ ports.TransportConn) (ports.TransportConn, error) {
+	return &tunEOFConn{dig: dig, ep: hop.Endpoint(), rw: &pipeRWC{r: d.remoteR, w: d.remoteW}}, nil
+}
+
+type pipeRWC struct {
+	r *io.PipeReader
+	w *io.PipeWriter
+}
+
+func (p *pipeRWC) Read(b []byte) (int, error)  { return p.r.Read(b) }
+func (p *pipeRWC) Write(b []byte) (int, error) { return p.w.Write(b) }
+func (p *pipeRWC) Close() error                { return errors.Join(p.r.Close(), p.w.Close()) }
+
+type tunEOFConn struct {
+	dig    plan.HopDigest
+	ep     netaddr.Endpoint
+	rw     io.ReadWriteCloser
+	closed atomic.Bool
+}
+
+func (c *tunEOFConn) HopDigest() plan.HopDigest           { return c.dig }
+func (c *tunEOFConn) Endpoint() netaddr.Endpoint          { return c.ep }
+func (c *tunEOFConn) IsAlive() bool                       { return !c.closed.Load() }
+func (c *tunEOFConn) SendKeepalive(context.Context) error { return nil }
+func (c *tunEOFConn) Close() error                        { c.closed.Store(true); return c.rw.Close() }
+func (c *tunEOFConn) OpenSession(context.Context) (ports.RemoteSession, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *tunEOFConn) OpenRemoteFS(context.Context) (ports.RemoteFSPort, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *tunEOFConn) DialTCP(context.Context, netaddr.HostPort) (net.Conn, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *tunEOFConn) ListenTCP(context.Context, string) (net.Listener, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *tunEOFConn) DialStreamLocal(context.Context, pathalg.RemotePath) (net.Conn, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *tunEOFConn) ListenStreamLocal(context.Context, pathalg.RemotePath) (net.Listener, error) {
+	return nil, ports.ErrUnsupported
+}
+func (c *tunEOFConn) OpenTUN(context.Context, ports.TUNSpec) (io.ReadWriteCloser, error) {
+	return c.rw, nil
+}
+
+type pipeTUNPort struct {
+	localR      *io.PipeReader
+	localW      *io.PipeWriter
+	ifaceName   string
+	openEntered chan struct{}
+}
+
+func (p *pipeTUNPort) Available() bool { return true }
+func (p *pipeTUNPort) OpenLocalTUN(ctx context.Context, _ ports.TUNSpec) (io.ReadWriteCloser, string, error) {
+	if p.openEntered != nil {
+		close(p.openEntered)
+		<-ctx.Done()
+		return nil, "", ctx.Err()
+	}
+	name := p.ifaceName
+	if name == "" {
+		name = "tun9"
+	}
+	return &pipeRWC{r: p.localR, w: p.localW}, name, nil
+}
+
+// TestSessionForward_DirectTUNRemoteCleanEOFClosesBridge 验证 Direct TUN 远端正常 EOF 立即收尾双向泵、闭合 Done() 且 Active()==false（0 goleak）。
+func TestSessionForward_DirectTUNRemoteCleanEOFClosesBridge(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	remR, remW := io.Pipe()
+	locR, locW := io.Pipe()
+	defer func() { _ = remW.Close(); _ = locW.Close() }()
+	rig := newFullSessionRig(t, fullRigOptions{
+		customDialer: &tunEOFDialer{remoteR: remR, remoteW: remW},
+		customTUN:    &pipeTUNPort{localR: locR, localW: locW},
+	})
+	defer rig.close()
+	ts, _ := ports.NewTUNSpec(ports.TUNModePointToPoint, 9, 9)
+	spec, _ := ports.NewForwardTUNSpec(ts)
+	info, err := rig.svc.StartForward(context.Background(), ucsess.StartForwardRequest{Plan: mustTestPlan(t, ""), Spec: spec})
+	if err != nil {
+		t.Fatalf("StartForward(TUN): %v", err)
+	}
+	var doneCh <-chan struct{}
+	if err := rig.svc.WithForwardHandle(context.Background(), info.Handle(), func(_ context.Context, fh ports.ForwardHandle) error {
+		doneCh = fh.Done()
+		return nil
+	}); err != nil {
+		t.Fatalf("WithForwardHandle: %v", err)
+	}
+	// 远端正常关闭发送端产出干净 io.EOF，必须立即触发双向收尾与 Done() 闭合。
+	_ = remW.Close()
+	<-doneCh
+	st, err := rig.svc.InspectForward(context.Background(), info.Handle())
+	if err != nil || st.Active() {
+		t.Fatalf("远端 EOF 后 InspectForward 必须报告 Active()==false: st=%#v err=%v", st, err)
+	}
+	if err := rig.svc.StopForward(context.Background(), info.Handle()); err != nil {
+		t.Fatalf("StopForward: %v", err)
+	}
+	assertTeardownClean(t, rig, "DirectTUNEOF")
+}
+
+// TestSessionPTYAndTUN_CtxMutexAndHandshakeCancel 验证 WritePTY 持锁阻塞时次调用可经 CtxMutex 及时取消，
+// 以及 Direct TUN 建链握手阻塞时立即响应调用方 leaseCtx 取消（0 死锁、0 goleak）。
+func TestSessionPTYAndTUN_CtxMutexAndHandshakeCancel(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	// 1. WritePTY 经 conc.CtxMutex 串行化：首个写入持锁阻塞在无读端 pipe 上，次写入经 CtxMutex 及时响应 ctx 取消。
+	writeEntered := make(chan struct{})
+	pd := &ptyPipeDialer{noAutoEcho: true, writeEntered: writeEntered}
+	rig := newFullSessionRig(t, fullRigOptions{customDialer: pd})
+	defer rig.close()
+	h, err := rig.svc.OpenPTY(context.Background(), ucsess.OpenPTYRequest{Plan: mustTestPlan(t, "")})
+	if err != nil {
+		t.Fatalf("OpenPTY: %v", err)
+	}
+	var secondErr error
+	if err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(ctx context.Context) error {
+			_, _ = rig.svc.WritePTY(ctx, h, []byte("block-on-unbuffered-pipe"))
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		<-writeEntered
+		cCtx, cancel := context.WithCancel(context.Background())
+		if gErr := n.Go(func(context.Context) error {
+			cancel()
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		_, secondErr = rig.svc.WritePTY(cCtx, h, []byte("canceled-waiter"))
+		_ = rig.svc.ClosePTY(context.Background(), h)
+		return nil
+	}); err != nil {
+		t.Fatalf("RunWait(WritePTY CtxMutex): %v", err)
+	}
+	if !errors.Is(secondErr, context.Canceled) {
+		t.Fatalf("次 WritePTY 取消期望 context.Canceled，实际=%v", secondErr)
+	}
+	assertTeardownClean(t, rig, "WritePTYCtxMutex")
+
+	// 2. Direct TUN OpenLocalTUN 建链阻塞时取消调用方 ctx（leaseCtx）必须立即返回错误且 0 句柄残留。
+	openEntered := make(chan struct{})
+	hsRig := newFullSessionRig(t, fullRigOptions{
+		profile:   gate.PolicyProfileDirectOperator,
+		customTUN: &pipeTUNPort{openEntered: openEntered},
+	})
+	defer hsRig.close()
+	ts, _ := ports.NewTUNSpec(ports.TUNModePointToPoint, 3, 3)
+	spec, _ := ports.NewForwardTUNSpec(ts)
+	hsCtx, hsCancel := context.WithCancel(context.Background())
+	var startErr error
+	if err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error { <-openEntered; hsCancel(); return nil }); gErr != nil {
+			return gErr
+		}
+		_, startErr = hsRig.svc.StartForward(hsCtx, ucsess.StartForwardRequest{Plan: mustTestPlan(t, ""), Spec: spec})
+		return nil
+	}); err != nil {
+		t.Fatalf("RunWait(TUN handshake cancel): %v", err)
+	}
+	if !errors.Is(startErr, context.Canceled) {
+		t.Fatalf("TUN 建链取消期望 context.Canceled，实际=%v", startErr)
+	}
+	if hsRig.pool.Stats().ActiveHandles != 0 {
+		t.Fatalf("TUN 建链取消后 ActiveHandles 必须归零: %+v", hsRig.pool.Stats())
+	}
+	assertTeardownClean(t, hsRig, "TUNHandshakeCancel")
 }

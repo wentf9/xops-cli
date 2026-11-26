@@ -104,7 +104,8 @@ type managedPTY struct {
 	inPipe                  io.WriteCloser
 	nursery                 *conc.Nursery
 	term                    string
-	writeMu, mu             sync.Mutex
+	writeMu                 *conc.CtxMutex
+	mu                      sync.Mutex
 	size                    ports.TerminalSize
 	buf                     []byte
 	maxBuf, activePipes     int
@@ -119,25 +120,32 @@ func startManagedPTY(leaseCtx, revokeCtx context.Context, conn ports.TransportCo
 	if err := leaseCtx.Err(); err != nil {
 		return nil, err
 	}
-	sess, err := conn.OpenSession(revokeCtx)
+	hsCtx, cleanupHS := deriveHandshakeContext(leaseCtx, revokeCtx)
+	defer cleanupHS()
+	sess, err := conn.OpenSession(hsCtx)
 	if err != nil {
 		return nil, err
 	}
 	inPipe, outPipe, errPipe, err := claimSessionPipes(sess)
 	if err == nil {
+		// StartShell 持留 revokeCtx 驱动会话生命周期，同时挂接 leaseCtx 同步中止钩子确保建链期及时响应调用方取消。
+		stopStartAbort := registerSyncAbort(leaseCtx, func() { _ = sess.Close() })
 		err = sess.StartShell(revokeCtx, ports.ExecStreams{PTY: algebraic.Some(ptyReq), Env: sendEnv})
+		stopStartAbort()
+		if err == nil {
+			err = leaseCtx.Err()
+		}
 	}
-	if err != nil {
-		_ = sess.Close()
-		return nil, err
+	var n *conc.Nursery
+	if err == nil {
+		n, err = conc.NewNursery(revokeCtx)
 	}
-	n, err := conc.NewNursery(revokeCtx)
 	if err != nil {
 		_ = sess.Close()
 		return nil, err
 	}
 	mp := &managedPTY{
-		valid: true, revokeCtx: revokeCtx, conn: conn, sess: sess, inPipe: inPipe, nursery: n,
+		valid: true, revokeCtx: revokeCtx, conn: conn, sess: sess, inPipe: inPipe, nursery: n, writeMu: conc.NewCtxMutex(),
 		term: ptyReq.Term(), size: ptyReq.Size(), maxBuf: maxBuf, activePipes: 2, readNotify: make(chan struct{}),
 	}
 	for _, fn := range []func(context.Context) error{
@@ -219,16 +227,14 @@ func (p *managedPTY) read(ctx context.Context, maxBytes int, wait bool) (PTYRead
 			p.mu.Unlock()
 			return PTYReadResult{}, err
 		}
-		if len(p.buf) > 0 {
-			n := min(len(p.buf), maxBytes)
-			out := bytes.Clone(p.buf[:n])
-			p.buf = p.buf[:copy(p.buf, p.buf[n:])]
+		if len(p.buf) > 0 || p.eof || !wait {
+			var out []byte
+			if len(p.buf) > 0 {
+				n := min(len(p.buf), maxBytes)
+				out = bytes.Clone(p.buf[:n])
+				p.buf = p.buf[:copy(p.buf, p.buf[n:])]
+			}
 			res := PTYReadResult{data: out, eof: p.eof && len(p.buf) == 0, droppedBytes: p.droppedBytes, valid: true}
-			p.mu.Unlock()
-			return res, nil
-		}
-		if p.eof || !wait {
-			res := PTYReadResult{eof: p.eof, droppedBytes: p.droppedBytes, valid: true}
 			p.mu.Unlock()
 			return res, nil
 		}
@@ -245,15 +251,15 @@ func (p *managedPTY) read(ctx context.Context, maxBytes int, wait bool) (PTYRead
 }
 
 func (p *managedPTY) withWriteLock(ctx context.Context, fn func() error) error {
-	p.writeMu.Lock()
-	defer p.writeMu.Unlock()
-	if err := p.revokedErr(ctx); err != nil {
-		return err
-	}
-	if !p.conn.IsAlive() {
-		return ports.ErrClosed
-	}
-	return fn()
+	return p.writeMu.WithLock(ctx, func() error {
+		if err := p.revokedErr(ctx); err != nil {
+			return err
+		}
+		if !p.conn.IsAlive() {
+			return ports.ErrClosed
+		}
+		return fn()
+	})
 }
 
 func (p *managedPTY) write(ctx context.Context, data []byte) (int, error) {
@@ -297,11 +303,9 @@ func (s *Service) OpenPTY(ctx context.Context, req OpenPTYRequest) (plan.Managed
 	}
 	gateReq, err := buildGateReq[security.CapExecute](gateReqInput{
 		plan: req.Plan, targetHop: targetHop, nodeID: nodeID, action: "pty_open",
-		summary: fmt.Sprintf("open persistent PTY on %s (%s)", nodeID, ptyReq.Term()), risk: req.Risk.OrElse(security.RiskModerate),
-		params: map[string]string{
-			"user": targetHop.Username().String(), "term": ptyReq.Term(),
-			"cols": strconv.FormatUint(uint64(ptyReq.Size().Cols()), 10), "rows": strconv.FormatUint(uint64(ptyReq.Size().Rows()), 10),
-		},
+		summary:  fmt.Sprintf("open persistent PTY on %s (%s)", nodeID, ptyReq.Term()),
+		risk:     req.Risk.OrElse(security.RiskModerate),
+		params:   map[string]string{"user": targetHop.Username().String(), "term": ptyReq.Term(), "cols": strconv.FormatUint(uint64(ptyReq.Size().Cols()), 10), "rows": strconv.FormatUint(uint64(ptyReq.Size().Rows()), 10)},
 		approval: req.Approval, stream: req.OperationStream,
 	})
 	if err != nil {
@@ -322,9 +326,8 @@ func (s *Service) prepareOpenPTY(ctx context.Context, req OpenPTYRequest) (plan.
 	if req.MaxBufferBytes < 0 || req.MaxBufferBytes > maxPTYBufferBytes {
 		return zh, "", zp, 0, fmt.Errorf("%w: MaxBufferBytes 超出 [0, %d]", ErrInvalidRequest, maxPTYBufferBytes)
 	}
-	maxBuf := req.MaxBufferBytes
-	if maxBuf == 0 {
-		maxBuf = defaultPTYBufferBytes
+	if req.MaxBufferBytes == 0 {
+		req.MaxBufferBytes = defaultPTYBufferBytes
 	}
 	sz, hasSz := req.Size.Get()
 	if hasSz && !sz.IsValid() {
@@ -335,7 +338,7 @@ func (s *Service) prepareOpenPTY(ctx context.Context, req OpenPTYRequest) (plan.
 		return zh, "", zp, 0, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	targetHop, nodeID, err := resolvePlanTargetAndNode(req.Plan, req.NodeID)
-	return targetHop, nodeID, ptyReq, maxBuf, err
+	return targetHop, nodeID, ptyReq, req.MaxBufferBytes, err
 }
 
 //xops:syncclosure
@@ -349,20 +352,21 @@ func (s *Service) withPTY(ctx context.Context, handle plan.ManagedHandle[plan.Ki
 
 // ReadPTY 从指定世代 PTY 句柄读取远端缓冲输出（支持非阻塞轮询与事件驱动阻塞等待，吊销立即唤醒）。
 func (s *Service) ReadPTY(ctx context.Context, req PTYReadRequest) (PTYReadResult, error) {
+	if err := s.validateActiveHandleOp(ctx, req.Handle.IsValid()); err != nil {
+		return PTYReadResult{}, err
+	}
 	if req.MaxBytes < 0 {
 		return PTYReadResult{}, fmt.Errorf("%w: MaxBytes 不能为负", ErrInvalidRequest)
 	}
-	maxBytes := req.MaxBytes
-	if maxBytes == 0 {
-		maxBytes = defaultPTYReadBytes
+	if req.MaxBytes == 0 {
+		req.MaxBytes = defaultPTYReadBytes
 	}
 	var res PTYReadResult
-	err := s.withPTY(ctx, req.Handle, func(hCtx context.Context, pty ptyResource) error {
+	return res, s.withPTY(ctx, req.Handle, func(hCtx context.Context, pty ptyResource) error {
 		var rErr error
-		res, rErr = pty.read(hCtx, maxBytes, req.Wait)
+		res, rErr = pty.read(hCtx, req.MaxBytes, req.Wait)
 		return rErr
 	})
-	return res, err
 }
 
 // WritePTY 向指定世代 PTY 句柄写入输入载荷；陈旧世代、已释放或熔断时严格失败关闭。
@@ -377,6 +381,9 @@ func (s *Service) WritePTY(ctx context.Context, handle plan.ManagedHandle[plan.K
 
 // ResizePTY 向指定世代 PTY 句柄发送窗口尺寸变更请求。
 func (s *Service) ResizePTY(ctx context.Context, handle plan.ManagedHandle[plan.KindPTY], size ports.TerminalSize) error {
+	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
+		return err
+	}
 	if !size.IsValid() {
 		return fmt.Errorf("%w: %w", ErrInvalidRequest, ports.ErrInvalidTTYSize)
 	}
@@ -385,6 +392,9 @@ func (s *Service) ResizePTY(ctx context.Context, handle plan.ManagedHandle[plan.
 
 // SignalPTY 向指定世代 PTY 句柄对应的远端进程投递 POSIX 信号。
 func (s *Service) SignalPTY(ctx context.Context, handle plan.ManagedHandle[plan.KindPTY], sig string) error {
+	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
+		return err
+	}
 	if sig == "" {
 		return fmt.Errorf("%w: Signal 不能为空", ErrInvalidRequest)
 	}

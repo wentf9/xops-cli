@@ -68,27 +68,19 @@ func ParseRequestTTYMode(raw string) (RequestTTYMode, error) {
 		return RequestTTYNo, nil
 	case "force":
 		return RequestTTYForce, nil
-	default:
-		return RequestTTYUnset, fmt.Errorf("%w: %q", ErrInvalidRequestTTY, raw)
 	}
+	return RequestTTYUnset, fmt.Errorf("%w: %q", ErrInvalidRequestTTY, raw)
 }
 
 // IsValid / IsZero / String / TextAppender / TextMarshaler / TextUnmarshaler 实现 RequestTTYMode 值语义。
 func (m RequestTTYMode) IsValid() bool { return m >= RequestTTYAuto && m <= RequestTTYForce }
 func (m RequestTTYMode) IsZero() bool  { return m == RequestTTYUnset }
 func (m RequestTTYMode) String() string {
-	switch m {
-	case RequestTTYAuto:
-		return "auto"
-	case RequestTTYYes:
-		return "yes"
-	case RequestTTYNo:
-		return "no"
-	case RequestTTYForce:
-		return "force"
-	default:
-		return "unset"
+	names := [...]string{"unset", "auto", "yes", "no", "force"}
+	if int(m) < len(names) {
+		return names[m]
 	}
+	return "unset"
 }
 func (m RequestTTYMode) AppendText(b []byte) ([]byte, error) {
 	if !m.IsValid() {

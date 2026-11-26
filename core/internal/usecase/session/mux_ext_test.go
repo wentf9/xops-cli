@@ -8,6 +8,7 @@ import (
 	"net"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -112,6 +113,11 @@ var (
 
 func mustPlanWithControl(t *testing.T, cp option.ControlPolicy, withJump bool) plan.SealedConnectionPlan {
 	t.Helper()
+	return mustPlanWithControlRoute(t, cp, withJump, nil)
+}
+
+func mustPlanWithControlRoute(t *testing.T, cp option.ControlPolicy, withJump bool, explicitRoute option.ProxyRoute) plan.SealedConnectionPlan {
+	t.Helper()
 	auth, err := inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
 	if err != nil {
 		t.Fatalf("NewAuthAgent: %v", err)
@@ -134,6 +140,15 @@ func mustPlanWithControl(t *testing.T, cp option.ControlPolicy, withJump bool) p
 	th, _ := netaddr.ParseCanonicalHost("198.51.100.42")
 	tep, _ := netaddr.NewEndpoint(th, 22)
 	layer := option.UnsetOptionLayer().WithControlPolicy(cp)
+	if explicitRoute != nil {
+		layer = layer.WithProxyRoute(explicitRoute)
+	} else if withJump {
+		pj, err := option.ParseProxyJump("ops@198.51.100.10:2222")
+		if err != nil {
+			t.Fatalf("ParseProxyJump: %v", err)
+		}
+		layer = layer.WithProxyRoute(pj)
+	}
 	eff, err := option.ResolveEffectivePolicy(option.OriginAdHoc, tep, layer, option.UnsetOptionLayer(), option.UnsetOptionLayer(), option.UnsetOptionLayer())
 	if err != nil {
 		t.Fatalf("ResolveEffectivePolicy(target): %v", err)
@@ -336,7 +351,7 @@ func assertMuxProxyAndDialVerified(t *testing.T, rig *fullSessionRig, pl plan.Se
 	})
 	defer proxyRig.close()
 	var proxyOut bytes.Buffer
-	if err := proxyRig.svc.RunMuxProxy(context.Background(), ucsess.MuxRequest{Plan: pl}, bytes.NewBufferString("stdio-relay"), &proxyOut); err != nil {
+	if err := proxyRig.svc.RunMuxProxy(context.Background(), ucsess.MuxRequest{Plan: pl}, io.NopCloser(bytes.NewBufferString("stdio-relay")), &proxyOut); err != nil {
 		t.Fatalf("RunMuxProxy: %v", err)
 	}
 	if proxyOut.String() != "stdio-relay" {
@@ -534,6 +549,172 @@ func triggerMuxAdversary(t *testing.T, rig *fullSessionRig, pl plan.SealedConnec
 	case "GateHalted":
 		faultArmed.Store(true)
 		_, _ = rig.svc.Exec(context.Background(), ucsess.ExecRequest{Plan: pl, Command: mustCommandPlan(t, "id"), Risk: algebraic.Some(security.RiskSafe)})
+	}
+}
+
+// blockingProxyConn 用于对抗验证 RunMuxProxy 远端先达 EOF 与阻塞写/取消路径（0 死锁、0 goleak）。
+type blockingProxyConn struct {
+	eofImmediately bool
+	closed         chan struct{}
+	closeOnce      sync.Once
+}
+
+func newBlockingProxyConn(eofImmediately bool) *blockingProxyConn {
+	return &blockingProxyConn{eofImmediately: eofImmediately, closed: make(chan struct{})}
+}
+func (c *blockingProxyConn) Read([]byte) (int, error) {
+	if c.eofImmediately {
+		return 0, io.EOF
+	}
+	<-c.closed
+	return 0, net.ErrClosed
+}
+func (c *blockingProxyConn) Write([]byte) (int, error) {
+	<-c.closed
+	return 0, net.ErrClosed
+}
+func (c *blockingProxyConn) Close() error {
+	c.closeOnce.Do(func() { close(c.closed) })
+	return nil
+}
+func (c *blockingProxyConn) LocalAddr() net.Addr              { return &net.UnixAddr{Name: "blk-l", Net: "unix"} }
+func (c *blockingProxyConn) RemoteAddr() net.Addr             { return &net.UnixAddr{Name: "blk-r", Net: "unix"} }
+func (c *blockingProxyConn) SetDeadline(time.Time) error      { return nil }
+func (c *blockingProxyConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *blockingProxyConn) SetWriteDeadline(time.Time) error { return nil }
+
+type customProxyMuxSocket struct {
+	*spoofDialMuxSocket
+	openProxy func() net.Conn
+}
+
+func (c *customProxyMuxSocket) OpenProxy(context.Context, pathalg.LocalSourcePath) (net.Conn, error) {
+	return c.openProxy(), nil
+}
+
+// TestSessionMux_AdversarialPathsProxyAndValidationOrder 覆盖评审要求的全部对抗边界：
+// 1. RunMuxProxy 阻塞 stdin 下远端先达 EOF 与 ctx 取消均确定性退出（0 死锁、0 goleak）；
+// 2. expandControlPath：ProxyDisabled / ProxyCommandSpec / ProxyUnset 均产生 %j==""，未展开 ~ 失败关闭；
+// 3. 显式 SocketPath 覆盖未设置 ControlPath 时仍强制执行 ControlMaster=ask 确认；
+// 4. 零值 Service{} / nil ctx 校验严格早于字段参数校验。
+func TestSessionMux_AdversarialPathsProxyAndValidationOrder(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	litPath, _ := option.NewLiteralControlPath("/tmp/mux-adv.sock")
+	cp := option.UnsetControlPolicy().WithMaster(option.ControlMasterYes).WithPath(litPath)
+	pl := mustPlanWithControl(t, cp, false)
+
+	assertRunMuxProxyBlockingStdinAndCancel(t, pl)
+	assertExpandControlPathJumpAndTildeFailClosed(t)
+	assertExplicitSocketPathEnforcesAskConfirmAndOrder(t)
+}
+
+func assertRunMuxProxyBlockingStdinAndCancel(t *testing.T, pl plan.SealedConnectionPlan) {
+	t.Helper()
+	// (a) 阻塞 stdin + 远端立即 EOF：必须同步关闭 stdin 并立即返回（0 死锁、0 goleak）。
+	eofRig := newFullSessionRig(t, fullRigOptions{
+		customMux: &customProxyMuxSocket{
+			spoofDialMuxSocket: &spoofDialMuxSocket{inner: sim.NewSimMuxSocket(nil)},
+			openProxy:          func() net.Conn { return newBlockingProxyConn(true) },
+		},
+	})
+	defer eofRig.close()
+	inR, inW := io.Pipe()
+	defer func() { _ = inW.Close() }()
+	var out bytes.Buffer
+	if err := eofRig.svc.RunMuxProxy(context.Background(), ucsess.MuxRequest{Plan: pl}, inR, &out); err != nil {
+		t.Fatalf("RunMuxProxy(remote EOF + blocking stdin): %v", err)
+	}
+
+	// (b) 阻塞 stdin + 背压阻塞 conn + ctx 取消：必须即时解除阻塞并同步回收 AfterFunc。
+	cancelRig := newFullSessionRig(t, fullRigOptions{
+		customMux: &customProxyMuxSocket{
+			spoofDialMuxSocket: &spoofDialMuxSocket{inner: sim.NewSimMuxSocket(nil)},
+			openProxy:          func() net.Conn { return newBlockingProxyConn(false) },
+		},
+	})
+	defer cancelRig.close()
+	inR2, inW2 := io.Pipe()
+	defer func() { _ = inW2.Close() }()
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error { cancel(); return nil }); gErr != nil {
+			return gErr
+		}
+		_ = cancelRig.svc.RunMuxProxy(ctx, ucsess.MuxRequest{Plan: pl}, inR2, &out)
+		return nil
+	}); err != nil {
+		t.Fatalf("RunWait(cancel RunMuxProxy): %v", err)
+	}
+}
+
+func assertExpandControlPathJumpAndTildeFailClosed(t *testing.T) {
+	t.Helper()
+	rig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator})
+	defer rig.close()
+	tplJ, _ := option.ParseControlPath("/tmp/mux-j[%j]-end.sock")
+	cpJ := option.UnsetControlPolicy().WithMaster(option.ControlMasterYes).WithPath(tplJ)
+	pCmd, _ := option.ParseProxyCommand("ssh -W %h:%p gw")
+	for _, route := range []option.ProxyRoute{option.NewProxyUnset(), option.NewProxyDisabled(), pCmd} {
+		pl := mustPlanWithControlRoute(t, cpJ, true, route)
+		inf, err := rig.svc.StartControlMaster(context.Background(), ucsess.ControlMasterRequest{Plan: pl})
+		if err != nil {
+			t.Fatalf("StartControlMaster(route=%T): %v", route, err)
+		}
+		if inf.SocketPath().String() != "/tmp/mux-j[]-end.sock" {
+			t.Fatalf("非 ProxyJumpChain 路由 %%j 必须为空串: route=%T got=%q", route, inf.SocketPath().String())
+		}
+		h, _ := inf.Handle().Get()
+		_ = rig.svc.StopControlMaster(context.Background(), h)
+		assertTeardownClean(t, rig, "non-jump-stop")
+	}
+
+	// 缺失 HomeDir 时前导 ~/ 模板与字面量均必须失败关闭（绝不落为相对路径 ./~/...）。
+	noEnvRig := newFullSessionRig(t, fullRigOptions{disableEnv: true})
+	defer noEnvRig.close()
+	tildeTpl, _ := option.ParseControlPath("~/.xops/mux-%h.sock")
+	tildeLit, _ := option.NewLiteralControlPath("~/.xops/literal.sock")
+	for _, cpT := range []option.ControlPathSpec{tildeTpl, tildeLit} {
+		plT := mustPlanWithControl(t, option.UnsetControlPolicy().WithMaster(option.ControlMasterYes).WithPath(cpT), false)
+		if _, err := noEnvRig.svc.StartControlMaster(context.Background(), ucsess.ControlMasterRequest{Plan: plT}); !errors.Is(err, ucsess.ErrInvalidRequest) {
+			t.Fatalf("缺失 HomeDir 的前导 ~ 路径(%s)期望 ErrInvalidRequest，实际=%v", cpT, err)
+		}
+	}
+}
+
+func assertExplicitSocketPathEnforcesAskConfirmAndOrder(t *testing.T) {
+	t.Helper()
+	// ControlPath=unset + ControlMaster=ask + 显式 SocketPath -> WithMuxConn 仍须触发确认门控。
+	askUnsetPathPlan := mustPlanWithControl(t, option.UnsetControlPolicy().WithMaster(option.ControlMasterAsk), false)
+	explicitSock, _ := pathalg.ParseLocalSourcePath("/tmp/mux-explicit-ask.sock")
+	denyRig := newFullSessionRig(t, fullRigOptions{
+		interactive:       true,
+		customInteraction: &denyConfirmInteraction{inner: sim.NewSimInteractionPort(true)},
+	})
+	defer denyRig.close()
+	denyRig.muxSocket.RegisterMaster(explicitSock, 5151)
+	if err := denyRig.svc.WithMuxConn(context.Background(), ucsess.MuxRequest{
+		Plan: askUnsetPathPlan, SocketPath: algebraic.Some(explicitSock),
+	}, func(context.Context, ports.TransportConn) error { return nil }); !errors.Is(err, ucsess.ErrMuxMasterUnavailable) {
+		t.Fatalf("显式 SocketPath 仍须执行 ask 确认并被拒绝: err=%v", err)
+	}
+
+	// 零值 Service{} / nil ctx 校验顺序优先于字段参数校验。
+	var zeroSvc ucsess.Service
+	if _, err := zeroSvc.ControlMux(context.Background(), ucsess.MuxControlRequest{Action: ports.MuxActionProxy}); !errors.Is(err, ucsess.ErrServiceNotInitialized) {
+		t.Fatalf("零值 Service.ControlMux 期望 ErrServiceNotInitialized，实际=%v", err)
+	}
+	if err := zeroSvc.WithMuxProxy(context.Background(), ucsess.MuxRequest{}, nil); !errors.Is(err, ucsess.ErrServiceNotInitialized) {
+		t.Fatalf("零值 Service.WithMuxProxy 期望 ErrServiceNotInitialized，实际=%v", err)
+	}
+	if err := zeroSvc.WithMuxConn(context.Background(), ucsess.MuxRequest{}, nil); !errors.Is(err, ucsess.ErrServiceNotInitialized) {
+		t.Fatalf("零值 Service.WithMuxConn 期望 ErrServiceNotInitialized，实际=%v", err)
+	}
+	if _, err := zeroSvc.ReadPTY(context.Background(), ucsess.PTYReadRequest{MaxBytes: -1}); !errors.Is(err, ucsess.ErrServiceNotInitialized) {
+		t.Fatalf("零值 Service.ReadPTY 期望 ErrServiceNotInitialized，实际=%v", err)
+	}
+	var zeroPTY plan.ManagedHandle[plan.KindPTY]
+	if err := zeroSvc.SignalPTY(context.Background(), zeroPTY, ""); !errors.Is(err, ucsess.ErrServiceNotInitialized) {
+		t.Fatalf("零值 Service.SignalPTY 期望 ErrServiceNotInitialized，实际=%v", err)
 	}
 }
 

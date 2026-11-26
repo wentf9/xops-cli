@@ -6,6 +6,8 @@ import (
 	"io"
 	"maps"
 	"net"
+	"strings"
+	"sync"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -48,6 +50,9 @@ func (s *Service) ProbeMux(ctx context.Context, req MuxRequest) (ports.MuxContro
 // ControlMux 向活跃 ControlMaster 发送 -O 控制命令（check/forward/cancel/exit/stop）。
 func (s *Service) ControlMux(ctx context.Context, req MuxControlRequest) (ports.MuxControlResponse, error) {
 	defer closeStream(req.Target.OperationStream)
+	if err := s.validateServiceAndCtx(ctx); err != nil {
+		return zeroVal[ports.MuxControlResponse](), err
+	}
 	if req.Action == ports.MuxActionProxy {
 		return zeroVal[ports.MuxControlResponse](), fmt.Errorf("%w: MuxActionProxy 请调用 WithMuxProxy 或 RunMuxProxy", ErrInvalidRequest)
 	}
@@ -73,30 +78,27 @@ func (s *Service) ControlMux(ctx context.Context, req MuxControlRequest) (ports.
 }
 
 //xops:syncclosure
-func runMuxAuthorized[C security.Capability](ctx context.Context, s *Service, req MuxRequest, action string, defaultRisk security.RiskLevel, extra map[string]string, run func(authCtx context.Context, targetHop plan.HopSpec, nodeID string, sockPath pathalg.LocalSourcePath) error) error {
-	targetHop, nodeID, sockPath, err := s.prepareMuxOp(ctx, req)
+func runMuxAuthorized[C security.Capability](ctx context.Context, s *Service, req MuxRequest, action string, defaultRisk security.RiskLevel, extra map[string]string, run func(authCtx context.Context, targetHop plan.HopSpec, nodeID string, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode) error) error {
+	targetHop, nodeID, sockPath, effMaster, err := s.prepareMuxOp(ctx, req)
 	if err != nil {
 		return err
 	}
-	gateReq, err := buildMuxGateReq[C](req.Plan, targetHop, nodeID, action, sockPath, req.Risk.OrElse(defaultRisk), extra, req.Approval, req.OperationStream)
+	gateReq, err := buildMuxGateReq[C](req.Plan, targetHop, nodeID, action, sockPath, effMaster, req.Risk.OrElse(defaultRisk), extra, req.Approval, req.OperationStream)
 	if err != nil {
 		return err
 	}
 	_, _, gateErr := runAuthorized[C](ctx, s, req.Plan.PlanDigest(), nodeID, action, gateReq, req.OperationStream, false,
 		func(authCtx context.Context, _ security.OperationBinding, _ *operationEmitter) (execution.ExecutionOutcome, error) {
-			return nil, run(authCtx, targetHop, nodeID, sockPath)
+			return nil, run(authCtx, targetHop, nodeID, sockPath, effMaster)
 		})
 	return gateErr
 }
 func runMuxControl[C security.Capability](ctx context.Context, s *Service, req MuxRequest, action string, defaultRisk security.RiskLevel, extra map[string]string, call func(authCtx context.Context, sockPath pathalg.LocalSourcePath) (ports.MuxControlResponse, error)) (ports.MuxControlResponse, error) {
 	var resp ports.MuxControlResponse
-	if err := runMuxAuthorized[C](ctx, s, req, action, defaultRisk, extra, func(authCtx context.Context, _ plan.HopSpec, _ string, sockPath pathalg.LocalSourcePath) error {
+	if err := runMuxAuthorized[C](ctx, s, req, action, defaultRisk, extra, func(authCtx context.Context, _ plan.HopSpec, _ string, sockPath pathalg.LocalSourcePath, _ option.ControlMasterMode) error {
 		r, rErr := call(authCtx, sockPath)
-		if rErr != nil {
-			return rErr
-		}
-		if !r.IsValid() {
-			return ErrMuxMasterUnavailable
+		if rErr != nil || !r.IsValid() {
+			return firstNonNilErr(rErr, ErrMuxMasterUnavailable)
 		}
 		resp = r
 		return nil
@@ -113,6 +115,9 @@ func runMuxControl[C security.Capability](ctx context.Context, s *Service, req M
 //xops:borrowed
 func (s *Service) WithMuxProxy(ctx context.Context, req MuxRequest, fn func(ctx context.Context, conn net.Conn) error) error {
 	defer closeStream(req.OperationStream)
+	if err := s.validateServiceAndCtx(ctx); err != nil {
+		return err
+	}
 	if fn == nil {
 		return ports.ErrNilCallback
 	}
@@ -121,23 +126,28 @@ func (s *Service) WithMuxProxy(ctx context.Context, req MuxRequest, fn func(ctx 
 
 type muxHalfCloser interface{ CloseWrite() error }
 
-// RunMuxProxy 打开 `-O proxy` 连接并在 conc.RunScoped 监督下完成 stdin/stdout 与 ControlMaster 的双向中继；
-// stdin 读尽时若底层连接支持半关闭则调用 CloseWrite，stdout 结束或上下文取消时立即关闭连接避免泄漏。
-func (s *Service) RunMuxProxy(ctx context.Context, req MuxRequest, stdin io.Reader, stdout io.Writer) error {
+// RunMuxProxy 打开 `-O proxy` 连接并在 conc.RunScoped 监督下完成可关闭 stdin 与 stdout 的双向中继；
+// 无论远端先达 EOF、背压写阻塞还是上下文取消，均同步关闭 conn 与 stdin 并等待 AfterFunc 收敛（0 死锁、0 goleak）。
+func (s *Service) RunMuxProxy(ctx context.Context, req MuxRequest, stdin io.ReadCloser, stdout io.Writer) error {
 	defer closeStream(req.OperationStream)
 	return s.openMuxProxyScope(ctx, req, func(pCtx context.Context, conn net.Conn) error {
-		return conc.RunScoped(pCtx, func(wCtx context.Context, n *conc.Nursery) error {
-			stopClose := context.AfterFunc(wCtx, func() { _ = conn.Close() })
-			defer stopClose()
+		var abortOnce sync.Once
+		abort := func() { abortOnce.Do(func() { _ = closeClosers(conn, stdin) }) }
+		defer abort()
+		defer registerSyncAbort(pCtx, abort)()
+		return conc.RunScoped(pCtx, func(_ context.Context, n *conc.Nursery) error {
 			if stdout == nil {
 				return copyMuxStdin(conn, stdin)
 			}
 			if stdin != nil {
 				if err := n.Go(func(context.Context) error { return copyMuxStdin(conn, stdin) }); err != nil {
+					abort()
 					return err
 				}
 			}
-			return copyPipeBestEffort(stdout, conn)
+			err := copyPipeBestEffort(stdout, conn)
+			abort()
+			return err
 		})
 	})
 }
@@ -152,13 +162,10 @@ func copyMuxStdin(conn net.Conn, stdin io.Reader) error {
 
 //xops:syncclosure
 func (s *Service) openMuxProxyScope(ctx context.Context, req MuxRequest, run func(ctx context.Context, conn net.Conn) error) error {
-	return runMuxAuthorized[security.CapTunnel](ctx, s, req, "mux_proxy", security.RiskModerate, nil, func(authCtx context.Context, _ plan.HopSpec, _ string, sockPath pathalg.LocalSourcePath) error {
+	return runMuxAuthorized[security.CapTunnel](ctx, s, req, "mux_proxy", security.RiskModerate, nil, func(authCtx context.Context, _ plan.HopSpec, _ string, sockPath pathalg.LocalSourcePath, _ option.ControlMasterMode) error {
 		conn, err := s.cfg.MuxSocket.OpenProxy(authCtx, sockPath)
-		if err != nil {
-			return err
-		}
-		if conn == nil {
-			return ErrMuxMasterUnavailable
+		if err != nil || conn == nil {
+			return firstNonNilErr(err, ErrMuxMasterUnavailable)
 		}
 		defer func() { _ = conn.Close() }()
 		return run(authCtx, conn)
@@ -172,6 +179,9 @@ func (s *Service) openMuxProxyScope(ctx context.Context, req MuxRequest, run fun
 //xops:borrowed
 func (s *Service) WithMuxConn(ctx context.Context, req MuxRequest, fn func(ctx context.Context, conn ports.TransportConn) error) error {
 	defer closeStream(req.OperationStream)
+	if err := s.validateServiceAndCtx(ctx); err != nil {
+		return err
+	}
 	if fn == nil {
 		return ports.ErrNilCallback
 	}
@@ -179,8 +189,8 @@ func (s *Service) WithMuxConn(ctx context.Context, req MuxRequest, fn func(ctx c
 	if !ok || !leafDigest.IsValid() {
 		return fmt.Errorf("%w: 计划缺少有效末跳摘要", ErrInvalidRequest)
 	}
-	return runMuxAuthorized[security.CapTunnel](ctx, s, req, "mux_dial", security.RiskModerate, nil, func(authCtx context.Context, targetHop plan.HopSpec, nodeID string, sockPath pathalg.LocalSourcePath) error {
-		conn, err := s.dialVerifiedMuxConn(authCtx, nodeID, sockPath, targetHop, leafDigest)
+	return runMuxAuthorized[security.CapTunnel](ctx, s, req, "mux_dial", security.RiskModerate, nil, func(authCtx context.Context, targetHop plan.HopSpec, nodeID string, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode) error {
+		conn, err := s.dialVerifiedMuxConn(authCtx, nodeID, sockPath, targetHop, leafDigest, effMaster)
 		if err != nil {
 			return err
 		}
@@ -189,8 +199,8 @@ func (s *Service) WithMuxConn(ctx context.Context, req MuxRequest, fn func(ctx c
 	})
 }
 
-func (s *Service) dialVerifiedMuxConn(ctx context.Context, nodeID string, sockPath pathalg.LocalSourcePath, targetHop plan.HopSpec, leafDigest plan.HopDigest) (ports.TransportConn, error) {
-	if eff := targetHop.Transport().ControlPolicy().EffectiveMaster(); eff == option.ControlMasterAsk || eff == option.ControlMasterAutoAsk {
+func (s *Service) dialVerifiedMuxConn(ctx context.Context, nodeID string, sockPath pathalg.LocalSourcePath, targetHop plan.HopSpec, leafDigest plan.HopDigest, effMaster option.ControlMasterMode) (ports.TransportConn, error) {
+	if effMaster == option.ControlMasterAsk || effMaster == option.ControlMasterAutoAsk {
 		if err := s.confirmMuxMaster(ctx, nodeID, "Attach to active ControlMaster via DialMux"); err != nil {
 			return nil, err
 		}
@@ -205,14 +215,12 @@ func (s *Service) dialVerifiedMuxConn(ctx context.Context, nodeID string, sockPa
 	}
 	return conn, nil
 }
-func buildMuxGateReq[C security.Capability](connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec, nodeID, action string, sockPath pathalg.LocalSourcePath, risk security.RiskLevel, extra map[string]string, approval algebraic.Option[gate.ApprovalSubmission], stream *events.OperationStream) (gate.GateRequest[C], error) {
-	cp := targetHop.Transport().ControlPolicy()
-	params := map[string]string{"socket_path": sockPath.String(), "effective_master": cp.EffectiveMaster().String(), "effective_persist": cp.EffectivePersist().String()}
+func buildMuxGateReq[C security.Capability](connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec, nodeID, action string, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode, risk security.RiskLevel, extra map[string]string, approval algebraic.Option[gate.ApprovalSubmission], stream *events.OperationStream) (gate.GateRequest[C], error) {
+	params := map[string]string{"socket_path": sockPath.String(), "effective_master": effMaster.String(), "effective_persist": targetHop.Transport().ControlPolicy().EffectivePersist().String()}
 	maps.Copy(params, extra)
 	return buildGateReq[C](gateReqInput{
-		plan: connPlan, targetHop: targetHop, nodeID: nodeID, action: action,
-		summary: fmt.Sprintf("%s on %s (%s)", action, nodeID, sockPath.String()),
-		risk:    risk, params: params, approval: approval, stream: stream,
+		plan: connPlan, targetHop: targetHop, nodeID: nodeID, action: action, summary: fmt.Sprintf("%s on %s (%s)", action, nodeID, sockPath.String()),
+		risk: risk, params: params, approval: approval, stream: stream,
 	})
 }
 func (s *Service) validateMuxBaseCall(ctx context.Context, connPlan plan.SealedConnectionPlan, risk algebraic.Option[security.RiskLevel]) error {
@@ -224,25 +232,88 @@ func (s *Service) validateMuxBaseCall(ctx context.Context, connPlan plan.SealedC
 	}
 	return nil
 }
-func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (plan.HopSpec, string, pathalg.LocalSourcePath, error) {
+func effectiveMuxMasterForOp(cp option.ControlPolicy, hasExplicitPath bool) option.ControlMasterMode {
+	if cp.IsDisabled() {
+		return option.ControlMasterNo
+	}
+	if hasExplicitPath && !cp.Path().IsEnabled() {
+		return cp.Master()
+	}
+	return cp.EffectiveMaster()
+}
+func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (plan.HopSpec, string, pathalg.LocalSourcePath, option.ControlMasterMode, error) {
 	zh, zp := zeroVal[plan.HopSpec](), zeroVal[pathalg.LocalSourcePath]()
 	if err := s.validateMuxBaseCall(ctx, req.Plan, req.Risk); err != nil {
-		return zh, "", zp, err
+		return zh, "", zp, option.ControlMasterNo, err
 	}
 	targetHop, nodeID, err := resolvePlanTargetAndNode(req.Plan, req.NodeID)
 	if err != nil {
-		return zh, "", zp, err
+		return zh, "", zp, option.ControlMasterNo, err
 	}
 	cp := targetHop.Transport().ControlPolicy()
 	if cp.IsDisabled() {
-		return zh, "", zp, fmt.Errorf("%w: ControlPath 已显式禁用（none）", ErrControlMasterDisabled)
+		return zh, "", zp, option.ControlMasterNo, fmt.Errorf("%w: ControlPath 已显式禁用（none）", ErrControlMasterDisabled)
 	}
+	effMaster := effectiveMuxMasterForOp(cp, req.SocketPath.IsSome())
 	if p, ok := req.SocketPath.Get(); ok {
 		if !p.IsValid() {
-			return zh, "", zp, fmt.Errorf("%w: 显式 SocketPath 无效", ErrInvalidRequest)
+			return zh, "", zp, option.ControlMasterNo, fmt.Errorf("%w: 显式 SocketPath 无效", ErrInvalidRequest)
 		}
-		return targetHop, nodeID, p, nil
+		return targetHop, nodeID, p, effMaster, nil
 	}
-	sockPath, err := expandControlPath(req.Plan, targetHop, cp.Path(), s.cfg.Env)
-	return targetHop, nodeID, sockPath, err
+	sockPath, err := expandControlPath(targetHop, cp.Path(), s.cfg.Env)
+	return targetHop, nodeID, sockPath, effMaster, err
+}
+
+// expandControlPath 展开 ControlPath 模板占位符（%r/%h/%p/%l/%u/%i/%j/%C）与前导 ~/；
+// 对任何无法展开的前导 ~（含 Env 缺失、HomeDir 为空、~user 或字面量 ~）一律严格失败关闭。
+func expandControlPath(targetHop plan.HopSpec, spec option.ControlPathSpec, env ports.EnvPort) (pathalg.LocalSourcePath, error) {
+	if !spec.IsEnabled() {
+		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: ControlPath 未启用", ErrControlMasterDisabled)
+	}
+	raw := spec.String()
+	tokCtx := option.TokenContext{
+		TargetHost: targetHop.Endpoint().Host().String(), Port: targetHop.Endpoint().Port(), RemoteUser: targetHop.Username().String(),
+		OriginalHost: targetHop.OriginalHost().String(), JumpHost: extractJumpHostForPercentJ(targetHop),
+	}
+	if env != nil {
+		if id, err := env.LookupLocalIdentity(); err == nil && id.IsValid() {
+			tokCtx = id.ApplyToTokenContext(tokCtx)
+		}
+	}
+	if !spec.IsLiteral() {
+		expanded, err := option.ExpandPathTokens(raw, tokCtx)
+		if err != nil {
+			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 展开 ControlPath 模板失败: %w", ErrInvalidRequest, err)
+		}
+		raw = expanded
+	}
+	if strings.HasPrefix(raw, "~") {
+		if (!strings.HasPrefix(raw, "~/") && !strings.HasPrefix(raw, `~\`)) || tokCtx.HomeDir == "" {
+			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 拒绝未展开的前导 ~ 控制套接字路径 %q", ErrInvalidRequest, raw)
+		}
+		raw = strings.TrimRight(tokCtx.HomeDir, `/\`) + raw[1:]
+	}
+	p, err := pathalg.ParseLocalSourcePath(raw)
+	if err != nil {
+		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 非法控制套接字路径 %q: %w", ErrInvalidRequest, raw, err)
+	}
+	return p, nil
+}
+
+// extractJumpHostForPercentJ 严格遵循 RFC §3.6 与 option/solver.go：
+// 仅在 ProxyJumpChain 激活时返回末跳规范主机名，其余路由（ProxyUnset/ProxyDisabled/ProxyCommandSpec）一律返回空串。
+func extractJumpHostForPercentJ(targetHop plan.HopSpec) string {
+	switch route := targetHop.Transport().ProxyRoute().(type) {
+	case *option.ProxyJumpChain:
+		if route.IsValid() {
+			hops := route.Hops().Slice()
+			return hops[len(hops)-1].Host()
+		}
+	case nil, *option.ProxyUnset, *option.ProxyDisabled, *option.ProxyCommandSpec:
+		return ""
+	default:
+		return ""
+	}
+	return ""
 }

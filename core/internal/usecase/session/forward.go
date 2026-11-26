@@ -104,7 +104,7 @@ func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn 
 		return nil, err
 	}
 	if spec.Direction() == ports.ForwardTUN && s.cfg.TUNDevice != nil {
-		return startDirectTUNBridge(revokeCtx, conn, s.cfg.TUNDevice, spec)
+		return startDirectTUNBridge(leaseCtx, revokeCtx, conn, s.cfg.TUNDevice, spec)
 	}
 	fh, err := s.cfg.Forwarder.StartForward(revokeCtx, conn, spec)
 	if err != nil {
@@ -114,22 +114,25 @@ func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn 
 		_ = closeClosers(fh)
 		return nil, fmt.Errorf("%w: ForwarderPort 返回无效 ForwardHandle", ErrInvalidRequest)
 	}
-	return finishManagedForward(revokeCtx, &managedForward{valid: true, spec: spec, boundAddr: fh.BoundAddr(), handle: fh, conn: conn, doneCh: make(chan struct{})},
-		func(wCtx context.Context) error {
-			select {
-			case <-wCtx.Done():
-			case <-fh.Done():
-			}
-			return nil
-		})
+	mf := &managedForward{valid: true, spec: spec, boundAddr: fh.BoundAddr(), handle: fh, conn: conn, doneCh: make(chan struct{})}
+	return finishManagedForward(revokeCtx, mf, func(wCtx context.Context) error {
+		defer func() { _ = mf.closeResources() }()
+		select {
+		case <-wCtx.Done():
+		case <-fh.Done():
+		}
+		return nil
+	})
 }
 
-func startDirectTUNBridge(revokeCtx context.Context, conn ports.TransportConn, tunPort ports.TUNDevicePort, spec ports.ForwardSpec) (*managedForward, error) {
+func startDirectTUNBridge(leaseCtx, revokeCtx context.Context, conn ports.TransportConn, tunPort ports.TUNDevicePort, spec ports.ForwardSpec) (*managedForward, error) {
 	tunSpec, ok := spec.TUN().Get()
 	if !ok || !tunSpec.IsValid() {
 		return nil, fmt.Errorf("%w: ForwardTUN 缺少有效 TUNSpec", ErrInvalidRequest)
 	}
-	localDev, ifaceName, err := tunPort.OpenLocalTUN(revokeCtx, tunSpec)
+	hsCtx, cleanupHS := deriveHandshakeContext(leaseCtx, revokeCtx)
+	defer cleanupHS()
+	localDev, ifaceName, err := tunPort.OpenLocalTUN(hsCtx, tunSpec)
 	if err != nil {
 		return nil, err
 	}
@@ -137,7 +140,7 @@ func startDirectTUNBridge(revokeCtx context.Context, conn ports.TransportConn, t
 		_ = closeClosers(localDev)
 		return nil, fmt.Errorf("%w: TUNDevicePort 返回无效设备句柄或空接口名", ErrInvalidRequest)
 	}
-	remoteTUN, err := conn.OpenTUN(revokeCtx, tunSpec)
+	remoteTUN, err := conn.OpenTUN(hsCtx, tunSpec)
 	if err != nil {
 		_ = localDev.Close()
 		return nil, err
@@ -145,14 +148,15 @@ func startDirectTUNBridge(revokeCtx context.Context, conn ports.TransportConn, t
 	mf := &managedForward{valid: true, spec: spec, boundAddr: ifaceName, conn: conn, localTUN: localDev, remoteTUN: remoteTUN, doneCh: make(chan struct{})}
 	pump := func(dst io.Writer, src io.Reader) func(context.Context) error {
 		return func(context.Context) error {
+			// 任一方向流终止（含正常 EOF 或关闭错）即代表隧道结束，立即关闭双端并取消看门狗避免僵尸隧道。
+			defer func() { _ = mf.closeResources(); mf.nursery.Cancel(ports.ErrClosed) }()
 			if _, err := io.Copy(dst, src); err != nil && !isRemotePipeClosedErr(err) {
 				mf.err.record(err)
-				_ = mf.closeResources()
 			}
 			return nil
 		}
 	}
-	return finishManagedForward(revokeCtx, mf, pump(remoteTUN, localDev), pump(localDev, remoteTUN), func(wCtx context.Context) error { <-wCtx.Done(); return nil })
+	return finishManagedForward(revokeCtx, mf, pump(remoteTUN, localDev), pump(localDev, remoteTUN), func(wCtx context.Context) error { <-wCtx.Done(); _ = mf.closeResources(); return nil })
 }
 
 func finishManagedForward(revokeCtx context.Context, mf *managedForward, workers ...func(context.Context) error) (*managedForward, error) {
@@ -162,15 +166,8 @@ func finishManagedForward(revokeCtx context.Context, mf *managedForward, workers
 		return nil, err
 	}
 	mf.nursery = n
-	for i, w := range workers {
-		isWatchdog := i == len(workers)-1
-		if err := n.Go(func(wCtx context.Context) error {
-			err := w(wCtx)
-			if isWatchdog {
-				_ = mf.closeResources()
-			}
-			return err
-		}); err != nil {
+	for _, w := range workers {
+		if err := n.Go(w); err != nil {
 			_ = mf.Close()
 			return nil, err
 		}
@@ -178,7 +175,9 @@ func finishManagedForward(revokeCtx context.Context, mf *managedForward, workers
 	return mf, nil
 }
 
-func (f *managedForward) IsValid() bool {
+// IsValid 仅校验托管槽位资源已正确构造，确保对端 EOF 关闭隧道后 InspectForward 仍能返回 Active()==false 快照。
+func (f *managedForward) IsValid() bool { return f != nil && f.valid }
+func (f *managedForward) isActive() bool {
 	if f == nil || !f.valid || f.closed.Load() {
 		return false
 	}
@@ -187,29 +186,33 @@ func (f *managedForward) IsValid() bool {
 	}
 	return f.conn != nil && f.conn.IsAlive()
 }
-func (f *managedForward) Spec() ports.ForwardSpec { return f.spec }
-func (f *managedForward) BoundAddr() string       { return f.boundAddr }
-func (f *managedForward) Done() <-chan struct{}   { return f.doneCh }
 func (f *managedForward) Err() error {
 	if f == nil || !f.valid {
 		return ports.ErrClosed
 	}
 	if f.handle != nil {
-		if hErr := f.handle.Err(); hErr != nil {
-			return hErr
-		}
+		return firstNonNilErr(f.handle.Err(), f.err.get())
 	}
 	return f.err.get()
 }
 func (f *managedForward) snapshot(hs pool.HandleStatus) ForwardStatus {
-	return ForwardStatus{handleStatus: hs, spec: f.spec, boundAddr: f.boundAddr, active: hs.Active() && f.IsValid(), err: f.Err(), val: true}
+	return ForwardStatus{handleStatus: hs, spec: f.spec, boundAddr: f.boundAddr, active: hs.Active() && f.isActive(), err: f.Err(), val: true}
 }
 func (f *managedForward) view() ports.ForwardHandle {
 	if f.handle != nil {
 		return f.handle
 	}
-	return f
+	return directTUNHandle{f: f}
 }
+
+type directTUNHandle struct{ f *managedForward }
+
+func (h directTUNHandle) IsValid() bool           { return h.f.isActive() }
+func (h directTUNHandle) Spec() ports.ForwardSpec { return h.f.spec }
+func (h directTUNHandle) BoundAddr() string       { return h.f.boundAddr }
+func (h directTUNHandle) Done() <-chan struct{}   { return h.f.doneCh }
+func (h directTUNHandle) Err() error              { return h.f.Err() }
+func (h directTUNHandle) Close() error            { return h.f.Close() }
 func (f *managedForward) closeResources() error {
 	var err error
 	f.resCloseOnce.Do(func() {
@@ -256,7 +259,7 @@ func (s *Service) StartForward(ctx context.Context, req StartForwardRequest) (Fo
 		func(leaseCtx, revokeCtx context.Context, conn ports.TransportConn) (*managedForward, error) {
 			mf, sErr := s.startManagedForward(leaseCtx, revokeCtx, conn, req.Spec)
 			if sErr == nil {
-				bound = mf.BoundAddr()
+				bound = mf.boundAddr
 			}
 			return mf, sErr
 		})
@@ -273,12 +276,11 @@ func (s *Service) validateStartForwardCall(ctx context.Context, req StartForward
 	if !req.Spec.IsValid() {
 		return fmt.Errorf("%w: ForwardSpec 无效", ErrInvalidRequest)
 	}
-	if req.Spec.Direction() == ports.ForwardTUN {
-		if s.cfg.TUNDevice == nil && s.cfg.Forwarder == nil {
-			return fmt.Errorf("%w: ForwardTUN 需要配置 TUNDevicePort 或 ForwarderPort", ErrPortUnavailable)
-		}
-	} else if s.cfg.Forwarder == nil {
-		return fmt.Errorf("%w: ForwarderPort 未配置", ErrPortUnavailable)
+	if req.Spec.Direction() == ports.ForwardTUN && s.cfg.TUNDevice != nil {
+		return nil
+	}
+	if s.cfg.Forwarder == nil {
+		return fmt.Errorf("%w: ForwarderPort 未配置（ForwardTUN 亦可配置 TUNDevicePort）", ErrPortUnavailable)
 	}
 	return nil
 }

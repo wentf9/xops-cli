@@ -101,15 +101,13 @@ func (s *Service) Exec(ctx context.Context, req ExecRequest) (execution.Executio
 		err := fmt.Errorf("%w: CommandPlan 无效", ErrInvalidRequest)
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_command", err), err
 	}
-	if req.Command.Kind() == execution.PlanKindScript && (req.Command.PTY() || req.RequestTTY == RequestTTYYes || req.RequestTTY == RequestTTYForce) {
-		err := fmt.Errorf("%w: PlanKindScript 经 stdin 投递脚本正文，禁止与 RequestTTY yes/force 或 PTY 组合", ErrInvalidRequest)
+	if err := validateScriptTTY(req.Command, req.RequestTTY); err != nil {
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_script_tty", err), err
 	}
 	return s.executeSession(ctx, sessionRunSpec{
-		plan: req.Plan, command: algebraic.Some(req.Command), action: "exec", nodeID: req.NodeID,
+		plan: req.Plan, command: algebraic.Some(req.Command), action: "exec", nodeID: req.NodeID, term: req.Term,
 		stdin: req.Stdin, stdout: req.Stdout, stderr: req.Stderr, requestTTY: req.RequestTTY,
-		term: req.Term, risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream,
-		summary: req.Command.RedactedSummary(),
+		risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream, summary: req.Command.RedactedSummary(),
 	})
 }
 
@@ -121,10 +119,9 @@ func (s *Service) Interactive(ctx context.Context, req InteractiveRequest) (exec
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_request", err), err
 	}
 	return s.executeSession(ctx, sessionRunSpec{
-		plan: req.Plan, command: algebraic.None[execution.CommandPlan](), action: "shell", nodeID: req.NodeID,
+		plan: req.Plan, command: algebraic.None[execution.CommandPlan](), action: "shell", nodeID: req.NodeID, term: req.Term,
 		stdin: req.Stdin, stdout: req.Stdout, stderr: req.Stderr, requestTTY: req.RequestTTY,
-		term: req.Term, risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream,
-		summary: "interactive shell",
+		risk: req.Risk, approval: req.Approval, operationStream: req.OperationStream, summary: "interactive shell",
 	})
 }
 
@@ -160,6 +157,12 @@ func (e *firstErr) record(err error) {
 }
 func (e *firstErr) get() error { e.mu.Lock(); defer e.mu.Unlock(); return e.err }
 
+func validateScriptTTY(cmd execution.CommandPlan, tty RequestTTYMode) error {
+	if cmd.Kind() == execution.PlanKindScript && (cmd.PTY() || tty == RequestTTYYes || tty == RequestTTYForce) {
+		return fmt.Errorf("%w: PlanKindScript 经 stdin 投递脚本正文，禁止与 RequestTTY yes/force 或 PTY 组合", ErrInvalidRequest)
+	}
+	return nil
+}
 func (s *Service) validateServiceAndCtx(ctx context.Context) error {
 	if s == nil || !s.valid {
 		return ErrServiceNotInitialized
@@ -201,11 +204,36 @@ func applyOptionalTimeout(ctx context.Context, durOpt algebraic.Option[algebraic
 	return ctx, func() {}
 }
 
+// registerSyncAbort 在 ctx 取消时同步触发 abort；返回的清理函数保证注销或等待已触发的回调完整收敛（0 泄漏）。
+func registerSyncAbort(ctx context.Context, abort func()) func() {
+	done := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { defer close(done); abort() })
+	return func() {
+		if !stop() {
+			<-done
+		}
+	}
+}
+
+// deriveHandshakeContext 为单次同步建链握手合并 leaseCtx 与 revokeCtx 的取消信号，退出时同步回收 AfterFunc 防泄漏。
+func deriveHandshakeContext(leaseCtx, revokeCtx context.Context) (context.Context, func()) {
+	hsCtx, cancel := context.WithCancelCause(leaseCtx)
+	if revokeCtx == nil || revokeCtx.Err() != nil {
+		if revokeCtx != nil {
+			cancel(context.Cause(revokeCtx))
+		}
+		return hsCtx, func() { cancel(nil) }
+	}
+	stop := registerSyncAbort(revokeCtx, func() { cancel(context.Cause(revokeCtx)) })
+	return hsCtx, func() { stop(); cancel(nil) }
+}
+
 type gateReqInput struct {
 	plan                    plan.SealedConnectionPlan
 	targetHop               plan.HopSpec
 	nodeID, action, summary string
 	risk                    security.RiskLevel
+	verdict                 algebraic.Option[security.Verdict]
 	cmdDigest               algebraic.Option[security.Digest]
 	paths, recursivePaths   []string
 	params                  map[string]string
@@ -225,22 +253,32 @@ func buildGateReq[C security.Capability](in gateReqInput) (gate.GateRequest[C], 
 		return zeroVal[gate.GateRequest[C]](), err
 	}
 	return gate.NewGateRequest[C](gate.GateRequestSpec[C]{
-		Binding: binding, Risk: in.risk, DecisionFloor: in.decisionFloor, ScopeSummary: in.summary,
+		Binding: binding, Risk: in.risk, Verdict: in.verdict, DecisionFloor: in.decisionFloor, ScopeSummary: in.summary,
 		Paths: in.paths, RecursivePaths: in.recursivePaths, Canonicalize: in.canonicalize,
 		Approval: in.approval, OperationStream: in.stream,
 	})
 }
 
 // runAuthorized 统一封装 gate.WithAuthorized[C]、Outcome 上报与可选 OperationStream 生命周期发射；
-// 内部直接消费借用证明 auth（不透传至外部回调），确保 OutcomeUnknown 绝不降级且流确定性收敛。
+// 内部直接消费借用证明 auth（不透传至外部回调），并在 defer 中闭合终态事件确保 panic 路径亦发 OperationCompletedEvent。
 //
 //xops:syncclosure
 func runAuthorized[C security.Capability](ctx context.Context, s *Service, planDigest plan.PlanDigest, nodeID, action string, gateReq gate.GateRequest[C], stream *events.OperationStream, isExec bool, run func(authCtx context.Context, binding security.OperationBinding, emitter *operationEmitter) (execution.ExecutionOutcome, error)) (execution.ExecutionOutcome, bool, error) {
 	var outcome execution.ExecutionOutcome
-	var entered bool
 	var emitter *operationEmitter
 	var startedAt time.Time
-	gateErr := gate.WithAuthorized[C](ctx, s.cfg.Gate, gateReq, func(authCtx context.Context, auth gate.Authorized[C]) error {
+	var gateErr error
+	entered, panicked := false, true
+	defer func() {
+		if entered {
+			out, err := outcome, gateErr
+			if panicked {
+				out, err = nil, gate.ErrOperationPanicked
+			}
+			emitter.emitCompleted(ctx, startedAt, out, err)
+		}
+	}()
+	gateErr = gate.WithAuthorized[C](ctx, s.cfg.Gate, gateReq, func(authCtx context.Context, auth gate.Authorized[C]) error {
 		entered, startedAt = true, s.cfg.Clock.Now().UTC().Round(0)
 		emitter = newOperationEmitterFor(stream, s.cfg.Clock, auth.TraceID(), auth.OperationID(), nodeID, auth.Capability())
 		emitter.emitStarted(authCtx, action, planDigest, gateReq.ScopeSummary())
@@ -250,13 +288,13 @@ func runAuthorized[C security.Capability](ctx context.Context, s *Service, planD
 		}
 		return runErr
 	})
+	panicked = false
 	if !entered {
 		return nil, false, gateErr
 	}
 	if isExec && (outcome == nil || !outcome.IsValid()) {
 		outcome = outcomeForAbortedRun(ctx, gateErr)
 	}
-	emitter.emitCompleted(ctx, startedAt, outcome, gateErr)
 	return outcome, true, gateErr
 }
 
@@ -329,12 +367,13 @@ func (s *Service) executeSession(ctx context.Context, spec sessionRunSpec) (exec
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_plan", err), err
 	}
 	var cmdDigOpt algebraic.Option[security.Digest]
+	var timeoutOpt algebraic.Option[algebraic.Duration]
 	if cmd, hasCmd := spec.command.Get(); hasCmd {
 		dig, dErr := cmd.Digest()
 		if dErr != nil {
 			return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_binding", dErr), dErr
 		}
-		cmdDigOpt = algebraic.Some(dig)
+		cmdDigOpt, timeoutOpt = algebraic.Some(dig), cmd.Timeout()
 	}
 	gateReq, err := buildGateReq[security.CapExecute](gateReqInput{
 		plan: spec.plan, targetHop: targetHop, nodeID: nodeID, action: spec.action, summary: spec.summary,
@@ -346,10 +385,6 @@ func (s *Service) executeSession(ctx context.Context, spec sessionRunSpec) (exec
 	}
 	out, entered, gateErr := runAuthorized[security.CapExecute](ctx, s, spec.plan.PlanDigest(), nodeID, spec.action, gateReq, spec.operationStream, true,
 		func(authCtx context.Context, _ security.OperationBinding, emitter *operationEmitter) (execution.ExecutionOutcome, error) {
-			var timeoutOpt algebraic.Option[algebraic.Duration]
-			if cmd, hasCmd := spec.command.Get(); hasCmd {
-				timeoutOpt = cmd.Timeout()
-			}
 			runCtx, cancel := applyOptionalTimeout(authCtx, timeoutOpt)
 			defer cancel()
 			return s.runLeasedSession(runCtx, spec, targetHop, emitter)
@@ -374,11 +409,9 @@ func (s *Service) runLeasedSession(ctx context.Context, spec sessionRunSpec, tar
 		sendEnv, termName := s.filterSendEnv(targetHop), resolvePTYTerm(spec.term, s.cfg.Env)
 		cmd, hasCmd := spec.command.Get()
 		decision := resolveTTYDecision(spec.requestTTY, !hasCmd, hasCmd && cmd.PTY(), s.cfg.Terminal != nil && s.cfg.Terminal.IsInteractive())
-		starter := func(c context.Context, streams ports.ExecStreams) error {
-			if hasCmd {
-				return sess.Start(c, cmd, streams)
-			}
-			return sess.StartShell(c, streams)
+		starter := sess.StartShell
+		if hasCmd {
+			starter = func(c context.Context, streams ports.ExecStreams) error { return sess.Start(c, cmd, streams) }
 		}
 		if decision.useRawTerminal {
 			outcome, err = runRawTerminalSession(leaseCtx, sess, s.cfg.Terminal, starter, termName, sendEnv, spec.stderr, emitter, decision.requestPTY)

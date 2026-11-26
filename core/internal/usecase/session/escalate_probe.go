@@ -59,7 +59,7 @@ func (s *Service) ExecPrivileged(ctx context.Context, req PrivilegeExecRequest) 
 	if err != nil {
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_plan", err), err
 	}
-	gateReq, err := buildPrivilegeGateRequest(req, targetHop, nodeID)
+	gateReq, err := s.buildPrivilegeGateRequest(req, targetHop, nodeID)
 	if err != nil {
 		code := "invalid_binding"
 		if errors.Is(err, ErrEscalationScopeChanged) {
@@ -69,9 +69,7 @@ func (s *Service) ExecPrivileged(ctx context.Context, req PrivilegeExecRequest) 
 	}
 	out, entered, gateErr := runAuthorized[security.CapExecute](ctx, s, req.Plan.PlanDigest(), nodeID, "exec_privileged", gateReq, req.OperationStream, true,
 		func(authCtx context.Context, _ security.OperationBinding, emitter *operationEmitter) (execution.ExecutionOutcome, error) {
-			runCtx, cancel := applyOptionalTimeout(authCtx, resolvePrivilegeTimeout(req.Privilege))
-			defer cancel()
-			return s.runLeasedPrivilege(runCtx, req, targetHop, nodeID, emitter)
+			return s.runAuthorizedPrivilege(authCtx, req, targetHop, nodeID, emitter)
 		})
 	if !entered {
 		return notStartedSessionOutcome(execution.StartPhaseAuthorize, "authorization_failed", gateErr), gateErr
@@ -89,8 +87,8 @@ func (s *Service) validatePrivilegeCall(ctx context.Context, req PrivilegeExecRe
 	if !req.Privilege.IsValid() {
 		return fmt.Errorf("%w: PrivilegeRequest 无效", ErrInvalidRequest)
 	}
-	if cmd := req.Privilege.Command(); cmd.Kind() == execution.PlanKindScript && (cmd.PTY() || req.RequestTTY == RequestTTYYes || req.RequestTTY == RequestTTYForce) {
-		return fmt.Errorf("%w: 提权脚本计划禁止与 RequestTTY yes/force 或 PTY 组合", ErrInvalidRequest)
+	if err := validateScriptTTY(req.Privilege.Command(), req.RequestTTY); err != nil {
+		return err
 	}
 	if lex, ok := req.LexicalScope.Get(); ok && !lex.IsValid() {
 		return fmt.Errorf("%w: 提供的 LexicalScope 快照无效", ErrEscalationScopeChanged)
@@ -100,22 +98,21 @@ func (s *Service) validatePrivilegeCall(ctx context.Context, req PrivilegeExecRe
 
 func (s *Service) validatePrivilegeSecretSource(req PrivilegeExecRequest) error {
 	ref, hasRef := req.PasswordRef.Get()
-	if (hasRef && !ref.IsValid()) || (req.PromptPassword && req.Privilege.NonInteractive()) {
+	if (hasRef && !ref.IsValid()) || (hasRef && req.PromptPassword) || (req.PromptPassword && req.Privilege.NonInteractive()) {
 		return fmt.Errorf("%w: 提权口令源配置冲突或 PasswordRef 无效", ErrInvalidRequest)
 	}
-	if req.Privilege.NonInteractive() {
-		return nil
-	}
-	if hasRef && s.cfg.Vault == nil {
-		return fmt.Errorf("%w: 使用 PasswordRef 需要配置 SecretVault", ErrPortUnavailable)
-	}
-	if !hasRef && req.PromptPassword && (s.cfg.Interaction == nil || !s.cfg.Interaction.CanInteract()) {
-		return fmt.Errorf("%w: 提权口令交互提示不可用", ports.ErrInteractionUnavailable)
+	if !req.Privilege.NonInteractive() {
+		if hasRef && s.cfg.Vault == nil {
+			return fmt.Errorf("%w: 使用 PasswordRef 需要配置 SecretVault", ErrPortUnavailable)
+		}
+		if !hasRef && req.PromptPassword && (s.cfg.Interaction == nil || !s.cfg.Interaction.CanInteract()) {
+			return fmt.Errorf("%w: 提权口令交互提示不可用", ports.ErrInteractionUnavailable)
+		}
 	}
 	return nil
 }
 
-func buildPrivilegeGateRequest(req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string) (gate.GateRequest[security.CapExecute], error) {
+func (s *Service) buildPrivilegeGateRequest(req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string) (gate.GateRequest[security.CapExecute], error) {
 	cmd := req.Privilege.Command()
 	cmdDig, err := cmd.Digest()
 	if err != nil {
@@ -125,7 +122,7 @@ func buildPrivilegeGateRequest(req PrivilegeExecRequest, targetHop plan.HopSpec,
 	if wd, ok := cmd.WorkDir().Get(); ok && wd.IsValid() && !slices.Contains(paths, wd.String()) {
 		paths = append(paths, wd.String())
 	}
-	effRisk, floorOpt, scopeEscalated, err := evaluatePrivilegeEscalationScope(req, targetHop, nodeID, paths)
+	eval, err := s.evaluatePrivilegeEscalationScope(req, targetHop, nodeID, paths)
 	if err != nil {
 		return zeroVal[gate.GateRequest[security.CapExecute]](), err
 	}
@@ -136,117 +133,128 @@ func buildPrivilegeGateRequest(req PrivilegeExecRequest, targetHop plan.HopSpec,
 	return buildGateReq[security.CapExecute](gateReqInput{
 		plan: req.Plan, targetHop: targetHop, nodeID: nodeID, action: "exec_privileged",
 		summary: fmt.Sprintf("%s: %s", req.Privilege.Method().String(), cmd.RedactedSummary()),
-		risk:    effRisk, cmdDigest: algebraic.Some(cmdDig), paths: paths, recursivePaths: req.RecursivePaths,
+		risk:    eval.risk, verdict: eval.verdict, cmdDigest: algebraic.Some(cmdDig), paths: paths, recursivePaths: req.RecursivePaths,
 		params: map[string]string{
-			"user": targetHop.Username().String(), "privilege_method": req.Privilege.Method().String(),
-			"target_user": targetUser, "non_interactive": strconv.FormatBool(req.Privilege.NonInteractive()),
-			"scope_escalated": strconv.FormatBool(scopeEscalated),
+			"user": targetHop.Username().String(), "privilege_method": req.Privilege.Method().String(), "target_user": targetUser,
+			"non_interactive": strconv.FormatBool(req.Privilege.NonInteractive()), "scope_escalated": strconv.FormatBool(eval.escalated),
 		},
-		decisionFloor: floorOpt, canonicalize: req.Canonicalize, approval: req.Approval, stream: req.OperationStream,
+		decisionFloor: eval.floor, canonicalize: req.Canonicalize, approval: req.Approval, stream: req.OperationStream,
 	})
 }
 
-// evaluatePrivilegeEscalationScope 构造提权规范作用域（风险下限恒为 RiskDangerous）并经
-// security.CanonicalScopeEscalated / InspectScopeEscalation 复核提权前后作用域：
-// 身份漂移或判定收紧立即拒绝；存在词法作用域升级时抬升 DecisionFloor 为 NeedApproval。
-func evaluatePrivilegeEscalationScope(req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string, paths []string) (security.RiskLevel, algebraic.Option[security.GuardrailDecision], bool, error) {
-	noneFloor, effRisk := algebraic.None[security.GuardrailDecision](), security.RiskDangerous
-	if r, ok := req.Risk.Get(); ok {
-		effRisk = effRisk.Join(r)
-	}
-	needApp, err := security.NewDecisionNeedApproval(effRisk, "privilege escalation requires approval")
-	if err != nil {
-		return effRisk, noneFloor, false, err
-	}
-	scopedPaths, err := buildScopedPaths(paths, req.RecursivePaths)
-	if err != nil {
-		return effRisk, noneFloor, false, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
-	}
-	mkSnap := func(risk security.RiskLevel, dec security.GuardrailDecision) (security.ScopeSnapshot, error) {
-		return security.NewScopeSnapshot(security.ScopeSnapshotSpec{
-			Capability: security.CapabilityExecute, TargetNode: nodeID, Endpoint: algebraic.Some(targetHop.Endpoint()),
-			Verdict: security.VerdictAllow, Risk: risk, Decision: dec, Paths: scopedPaths,
-		})
-	}
-	canonicalSnap, err := mkSnap(effRisk, needApp)
-	if err != nil {
-		return effRisk, noneFloor, false, err
-	}
-	if lex, hasLex := req.LexicalScope.Get(); hasLex {
-		escRes := security.InspectScopeEscalation(lex, canonicalSnap)
-		if hasScopeDriftOrTighten(escRes) {
-			return effRisk, noneFloor, true, fmt.Errorf("%w: 提权作用域身份漂移或判定收紧（%v）", ErrEscalationScopeChanged, escRes.Reasons())
-		}
-		if security.CanonicalScopeEscalated(lex, canonicalSnap) {
-			return effRisk, algebraic.Some(security.GuardrailDecision(needApp)), true, nil
-		}
-		return effRisk, noneFloor, false, nil
-	}
-	baseSnap, err := mkSnap(req.Risk.OrElse(security.RiskModerate), security.NewDecisionAllow("pre-escalation baseline"))
-	if err != nil {
-		return effRisk, noneFloor, false, err
-	}
-	return effRisk, noneFloor, security.CanonicalScopeEscalated(baseSnap, canonicalSnap), nil
+type escalationEval struct {
+	risk      security.RiskLevel
+	verdict   algebraic.Option[security.Verdict]
+	floor     algebraic.Option[security.GuardrailDecision]
+	escalated bool
 }
 
+// evaluatePrivilegeEscalationScope 经 Gate.Policy().MatchScopedPaths 注入真实受保护分区并按有界安全格
+// 单调折叠 Verdict(Meet)/Risk(Join)/Decision(Join)，绝不放松前置 LexicalScope 的 Deny 或更高风险，
+// 同时经 security.InspectScopeEscalation 与路径覆盖校验拦截身份漂移、受保护重定向与跨路径替换。
+func (s *Service) evaluatePrivilegeEscalationScope(req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string, paths []string) (escalationEval, error) {
+	pol := s.cfg.Gate.Policy()
+	scopedPaths, anyProt, err := pol.MatchScopedPaths(paths, req.RecursivePaths)
+	if err != nil {
+		return escalationEval{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	effRisk := security.RiskDangerous.Join(req.Risk.OrElse(security.RiskSafe))
+	if anyProt {
+		effRisk = effRisk.Join(pol.ProtectedPathRisk())
+	}
+	mkSnap := func(verdict security.Verdict, risk security.RiskLevel, dec security.GuardrailDecision) (security.ScopeSnapshot, error) {
+		return security.NewScopeSnapshot(security.ScopeSnapshotSpec{
+			Capability: security.CapabilityExecute, TargetNode: nodeID, Endpoint: algebraic.Some(targetHop.Endpoint()),
+			Verdict: verdict, Risk: risk, Decision: dec, Paths: scopedPaths,
+		})
+	}
+	if lex, hasLex := req.LexicalScope.Get(); hasLex {
+		return evaluateWithLexicalScope(lex, effRisk, mkSnap)
+	}
+	needApp, e1 := security.NewDecisionNeedApproval(effRisk, "privilege escalation requires approval")
+	canSnap, e2 := mkSnap(security.VerdictAllow, effRisk, needApp)
+	baseSnap, e3 := mkSnap(security.VerdictAllow, req.Risk.OrElse(security.RiskModerate), security.NewDecisionAllow("pre-escalation baseline"))
+	if err := firstNonNilErr(e1, e2, e3); err != nil {
+		return escalationEval{}, err
+	}
+	return escalationEval{risk: effRisk, escalated: security.CanonicalScopeEscalated(baseSnap, canSnap)}, nil
+}
+func evaluateWithLexicalScope(lex security.ScopeSnapshot, effRisk security.RiskLevel, mkSnap func(security.Verdict, security.RiskLevel, security.GuardrailDecision) (security.ScopeSnapshot, error)) (escalationEval, error) {
+	if lex.Verdict().Denied() || lex.Decision().Kind() == security.DecisionKindDeny {
+		return escalationEval{}, fmt.Errorf("%w: 词法作用域已拒绝，禁止提权放宽", ErrEscalationScopeChanged)
+	}
+	effRisk = effRisk.Join(lex.Risk())
+	if lexNA, ok := lex.Decision().(*security.DecisionNeedApproval); ok && lexNA.IsValid() {
+		effRisk = effRisk.Join(lexNA.Risk())
+	}
+	needApp, e1 := security.NewDecisionNeedApproval(effRisk, "privilege escalation requires approval")
+	canDec := security.JoinDecisions(lex.Decision(), needApp)
+	canSnap, e2 := mkSnap(lex.Verdict().Meet(security.VerdictAllow), effRisk, canDec)
+	if err := firstNonNilErr(e1, e2); err != nil {
+		return escalationEval{}, err
+	}
+	escRes := security.InspectScopeEscalation(lex, canSnap)
+	if hasScopeDriftOrTighten(escRes) {
+		return escalationEval{}, fmt.Errorf("%w: 提权作用域身份漂移或判定收紧（%v）", ErrEscalationScopeChanged, escRes.Reasons())
+	}
+	out := escalationEval{risk: effRisk, verdict: algebraic.Some(lex.Verdict())}
+	if escRes.Escalated() || hasUncoveredCanonicalPath(lex.Paths(), canSnap.Paths()) {
+		out.floor, out.escalated = algebraic.Some(canDec), true
+		return out, nil
+	}
+	if lex.Decision().Kind() != security.DecisionKindAllow {
+		out.floor = algebraic.Some(lex.Decision())
+	}
+	return out, nil
+}
+func hasUncoveredCanonicalPath(lexical, canonical []security.ScopedPath) bool {
+	return slices.ContainsFunc(canonical, func(cp security.ScopedPath) bool {
+		return !slices.ContainsFunc(lexical, func(lp security.ScopedPath) bool {
+			return lp.Path() == cp.Path() && (!cp.IsRecursive() || lp.IsRecursive())
+		})
+	})
+}
 func hasScopeDriftOrTighten(r security.ScopeEscalationResult) bool {
 	return r.HasReason(security.EscalationInvalidInput) || r.HasReason(security.EscalationCapabilityDrift) ||
 		r.HasReason(security.EscalationTargetNodeDrift) || r.HasReason(security.EscalationEndpointDrift) ||
 		r.HasReason(security.EscalationVerdictTightened)
 }
-func buildScopedPaths(direct, recursive []string) ([]security.ScopedPath, error) {
-	out := make([]security.ScopedPath, 0, len(direct)+len(recursive))
-	add := func(list []string, rec bool) error {
-		for _, p := range list {
-			sp, err := security.NewScopedPath(p, rec)
+
+// runAuthorizedPrivilege 将取密（Vault/交互 PromptSecret）置于 WithLease 之外，避免 LeaseScope 泄漏与提前拨号，
+// 仅在获租后启动执行超时，并经 escalatorCalled 边界严格区分启动前失败（OutcomeNotStarted）与调用后不确定（OutcomeUnknown）。
+func (s *Service) runAuthorizedPrivilege(ctx context.Context, req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string, emitter *operationEmitter) (execution.ExecutionOutcome, error) {
+	var outcome execution.ExecutionOutcome
+	var escalatorCalled bool
+	runErr := s.withPrivilegePassword(ctx, req, nodeID, func(passBox *secret.SecretBox) error {
+		return s.cfg.Pool.WithLease(ctx, req.Plan, func(leaseCtx context.Context, lease *pool.Lease) error {
+			streams, err := s.buildPrivilegeStreams(leaseCtx, req, targetHop, emitter)
 			if err != nil {
+				outcome = notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_pty", err)
 				return err
 			}
-			out = append(out, sp)
-		}
-		return nil
-	}
-	if err := add(direct, false); err != nil {
-		return nil, err
-	}
-	return out, add(recursive, true)
-}
-func (s *Service) runLeasedPrivilege(ctx context.Context, req PrivilegeExecRequest, targetHop plan.HopSpec, nodeID string, emitter *operationEmitter) (execution.ExecutionOutcome, error) {
-	var outcome execution.ExecutionOutcome
-	var enteredLease bool
-	leaseErr := s.cfg.Pool.WithLease(ctx, req.Plan, func(leaseCtx context.Context, lease *pool.Lease) error {
-		enteredLease = true
-		streams, err := s.buildPrivilegeStreams(leaseCtx, req, targetHop, emitter)
-		if err != nil {
-			outcome = notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_pty", err)
-			return err
-		}
-		return s.withPrivilegePassword(leaseCtx, req, nodeID, func(passBox *secret.SecretBox) error {
-			out, rErr := s.cfg.Escalator.RunPrivileged(leaseCtx, lease, req.Privilege, passBox, streams)
-			outcome = classifyPrivilegeOutcome(leaseCtx, out, rErr)
+			runCtx, cancel := applyOptionalTimeout(leaseCtx, resolvePrivilegeTimeout(req.Privilege))
+			defer cancel()
+			escalatorCalled = true
+			out, rErr := s.cfg.Escalator.RunPrivileged(runCtx, lease, req.Privilege, passBox, streams)
+			outcome = classifyPrivilegeOutcome(runCtx, out, rErr)
 			return rErr
 		})
 	})
-	if !enteredLease {
-		return notStartedSessionOutcome(execution.StartPhaseDial, "lease_failed", leaseErr), leaseErr
+	if !escalatorCalled {
+		return notStartedSessionOutcome(execution.StartPhaseAuthorize, "privilege_prestart_failed", runErr), runErr
 	}
-	if outcome == nil || !outcome.IsValid() {
-		outcome = classifyPrivilegeOutcome(ctx, nil, leaseErr)
-	}
-	return outcome, leaseErr
+	return outcome, runErr
 }
 func (s *Service) buildPrivilegeStreams(ctx context.Context, req PrivilegeExecRequest, targetHop plan.HopSpec, emitter *operationEmitter) (ports.ExecStreams, error) {
-	var ptyOpt algebraic.Option[ports.PTYRequest]
-	if localInteractive := s.cfg.Terminal != nil && s.cfg.Terminal.IsInteractive(); resolveTTYDecision(req.RequestTTY, false, req.Privilege.Command().PTY(), localInteractive).requestPTY {
-		var sz ports.TerminalSize
-		if localInteractive {
-			sz, _ = s.cfg.Terminal.Size()
-		}
-		ptyReq, err := buildPTYRequest(resolvePTYTerm(req.Term, s.cfg.Env), sz)
-		if err != nil {
-			return ports.ExecStreams{}, err
-		}
-		ptyOpt = algebraic.Some(ptyReq)
+	localInteractive := s.cfg.Terminal != nil && s.cfg.Terminal.IsInteractive()
+	wantPTY := resolveTTYDecision(req.RequestTTY, false, req.Privilege.Command().PTY(), localInteractive).requestPTY
+	var sz ports.TerminalSize
+	if wantPTY && localInteractive {
+		sz, _ = s.cfg.Terminal.Size()
+	}
+	ptyOpt, err := prepareOptionalPTY(wantPTY, resolvePTYTerm(req.Term, s.cfg.Env), sz)
+	if err != nil {
+		return ports.ExecStreams{}, err
 	}
 	return ports.ExecStreams{
 		Stdin: req.Stdin, Stdout: wrapOutputWriter(ctx, req.Stdout, emitter, events.OutputStreamStdout),
@@ -289,10 +297,8 @@ func classifyPrivilegeOutcome(ctx context.Context, out execution.ExecutionOutcom
 	if runErr == nil {
 		return outcomeForAbortedRun(ctx, errors.New("privilege escalator returned empty outcome"))
 	}
-	for _, t := range []error{ports.ErrAuthFailed, ports.ErrVaultLocked, ports.ErrSecretNotFound, ports.ErrInteractionUnavailable, ports.ErrInteractionCanceled, ports.ErrInvalidArgument, ports.ErrUnsupported} {
-		if errors.Is(runErr, t) {
-			return notStartedSessionOutcome(execution.StartPhaseRequestRejected, "privilege_prestart_failed", runErr)
-		}
+	if slices.ContainsFunc([]error{ports.ErrAuthFailed, ports.ErrVaultLocked, ports.ErrSecretNotFound, ports.ErrInteractionUnavailable, ports.ErrInteractionCanceled, ports.ErrInvalidArgument, ports.ErrUnsupported}, func(t error) bool { return errors.Is(runErr, t) }) {
+		return notStartedSessionOutcome(execution.StartPhaseRequestRejected, "privilege_prestart_failed", runErr)
 	}
 	return outcomeForAbortedRun(ctx, runErr)
 }
@@ -324,9 +330,8 @@ func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.
 		return zr, err
 	}
 	gateReq, err := buildGateReq[security.CapInspect](gateReqInput{
-		plan: req.Plan, targetHop: targetHop, nodeID: nodeID, action: "probe_shell",
-		summary: fmt.Sprintf("probe remote shell on %s", nodeID), risk: req.Risk.OrElse(security.RiskSafe),
-		params: map[string]string{"user": targetHop.Username().String()}, approval: req.Approval, stream: req.OperationStream,
+		plan: req.Plan, targetHop: targetHop, nodeID: nodeID, action: "probe_shell", summary: fmt.Sprintf("probe remote shell on %s", nodeID),
+		risk: req.Risk.OrElse(security.RiskSafe), params: map[string]string{"user": targetHop.Username().String()}, approval: req.Approval, stream: req.OperationStream,
 	})
 	if err != nil {
 		return zr, err
@@ -341,9 +346,8 @@ func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.
 				if pErr != nil {
 					return pErr
 				}
-				var nErr error
-				result, nErr = normalizeShellProbeResult(raw)
-				return nErr
+				result, pErr = normalizeShellProbeResult(raw)
+				return pErr
 			})
 		}); gateErr != nil {
 		return zr, gateErr

@@ -49,26 +49,23 @@ func newOperationEmitterFor(stream *events.OperationStream, clock ports.Clock, t
 
 func (e *operationEmitter) active() bool { return e != nil && e.stream != nil && !e.stream.IsClosed() }
 func (e *operationEmitter) nextMeta() (events.EventMeta, error) {
+	if !e.active() {
+		return zeroVal[events.EventMeta](), ports.ErrClosed
+	}
 	return events.NewEventMeta(events.EventMetaSpec{
 		TraceID: e.traceID, OperationID: algebraic.Some(e.opID),
 		OccurredAt: e.clock.Now().UTC().Round(0), Seq: e.seq.Add(1), NodeID: e.nodeID,
 	})
 }
 func (e *operationEmitter) emitStarted(ctx context.Context, action string, planDigest plan.PlanDigest, summary string) {
-	if !e.active() {
-		return
-	}
 	if meta, err := e.nextMeta(); err == nil {
-		if ev, err := events.NewOperationStartedEvent(events.OperationStartedSpec{
-			Meta: meta, Capability: e.capability, Tool: "ssh", Action: action,
-			PlanDigest: algebraic.Some(planDigest), Summary: summary,
-		}); err == nil {
+		if ev, err := events.NewOperationStartedEvent(events.OperationStartedSpec{Meta: meta, Capability: e.capability, Tool: "ssh", Action: action, PlanDigest: algebraic.Some(planDigest), Summary: summary}); err == nil {
 			_ = e.stream.Emit(ctx, ev)
 		}
 	}
 }
 func (e *operationEmitter) emitOutputChunk(ctx context.Context, kind events.OutputStreamKind, data []byte) {
-	if !e.active() || len(data) == 0 {
+	if len(data) == 0 || !e.active() {
 		return
 	}
 	counter := &e.stdoutSeq
@@ -80,27 +77,19 @@ func (e *operationEmitter) emitOutputChunk(ctx context.Context, kind events.Outp
 		if err != nil {
 			return
 		}
-		ev, err := events.NewOutputChunkEvent(events.OutputChunkSpec{
-			Meta: meta, Stream: kind, ChunkIndex: counter.Add(1) - 1, Data: data[off:min(off+outputChunkMaxSize, len(data))],
-		})
+		ev, err := events.NewOutputChunkEvent(events.OutputChunkSpec{Meta: meta, Stream: kind, ChunkIndex: counter.Add(1) - 1, Data: data[off:min(off+outputChunkMaxSize, len(data))]})
 		if err != nil || e.stream.Emit(ctx, ev) != nil {
 			return
 		}
 	}
 }
 func (e *operationEmitter) emitCompleted(ctx context.Context, startedAt time.Time, outcome execution.ExecutionOutcome, finalErr error) {
-	if !e.active() {
-		return
-	}
 	meta, err := e.nextMeta()
 	if err != nil {
 		return
 	}
 	outOpt, succeeded, code, msg := classifyCompletedEventFields(outcome, finalErr)
-	if ev, err := events.NewOperationCompletedEvent(events.OperationCompletedSpec{
-		Meta: meta, Capability: e.capability, Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)),
-		Outcome: outOpt, Succeeded: succeeded, Code: code, Message: msg,
-	}); err == nil {
+	if ev, err := events.NewOperationCompletedEvent(events.OperationCompletedSpec{Meta: meta, Capability: e.capability, Duration: algebraic.FromStdDuration(max(e.clock.Since(startedAt), 0)), Outcome: outOpt, Succeeded: succeeded, Code: code, Message: msg}); err == nil {
 		emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalEventEmitTimeout)
 		defer cancel()
 		_ = e.stream.Emit(emitCtx, ev)
@@ -136,14 +125,13 @@ func classifyCompletedEventFields(outcome execution.ExecutionOutcome, finalErr e
 }
 
 func classifyFinalErrorCode(err error) string {
-	switch {
-	case errors.Is(err, ports.ErrAuditPostWrite):
+	if errors.Is(err, ports.ErrAuditPostWrite) {
 		return "audit_post_write_failed"
-	case errors.Is(err, gate.ErrGateHalted):
-		return "gate_halted"
-	default:
-		return "session_error"
 	}
+	if errors.Is(err, gate.ErrGateHalted) {
+		return "gate_halted"
+	}
+	return "session_error"
 }
 func sanitizeEventCode(raw, fallback string) string {
 	if raw == "" || len(raw) > 64 {

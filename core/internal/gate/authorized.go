@@ -127,6 +127,8 @@ type Authorizer interface {
 	IsHalted() bool
 	// Profile 返回底层门控绑定的策略配置档。
 	Profile() PolicyProfileKind
+	// Policy 返回底层门控绑定的不可变护栏策略只读副本。
+	Policy() GuardrailPolicy
 
 	evaluateAndAudit(ctx context.Context, req rawGateRequest) (issuedPermit, error)
 	finalizeAudit(ctx context.Context, permit issuedPermit, runErr error) error

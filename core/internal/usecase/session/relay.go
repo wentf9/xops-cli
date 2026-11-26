@@ -27,16 +27,10 @@ func resolveTTYDecision(mode RequestTTYMode, isShell, cmdPTY, localInteractive b
 	case RequestTTYForce:
 		return ttyDecision{requestPTY: true, useRawTerminal: localInteractive}
 	case RequestTTYAuto:
-		if isShell || cmdPTY {
-			return ttyDecision{requestPTY: localInteractive, useRawTerminal: localInteractive}
-		}
+		ok := (isShell || cmdPTY) && localInteractive
+		return ttyDecision{requestPTY: ok, useRawTerminal: ok}
 	case RequestTTYUnset:
-		if cmdPTY {
-			return ttyDecision{requestPTY: true, useRawTerminal: localInteractive}
-		}
-		if isShell {
-			return ttyDecision{requestPTY: localInteractive, useRawTerminal: localInteractive}
-		}
+		return ttyDecision{requestPTY: cmdPTY || (isShell && localInteractive), useRawTerminal: (cmdPTY || isShell) && localInteractive}
 	case RequestTTYNo:
 	}
 	return ttyDecision{}
@@ -82,7 +76,11 @@ func runRawTerminalSession(
 			startPhase, startCode = execution.StartPhaseSessionOpen, "session_pipes_failed"
 			return pErr
 		}
-		ptyOpt, ptyErr := prepareRawPTY(wantPTY, termName, term)
+		var sz ports.TerminalSize
+		if wantPTY {
+			sz, _ = term.Size()
+		}
+		ptyOpt, ptyErr := prepareOptionalPTY(wantPTY, termName, sz)
 		if ptyErr != nil {
 			startPhase, startCode = execution.StartPhaseValidate, "invalid_pty"
 			return ptyErr
@@ -129,11 +127,10 @@ func claimSessionPipes(sess ports.RemoteSession) (io.WriteCloser, io.Reader, io.
 	}
 	return inPipe, outPipe, errPipe, nil
 }
-func prepareRawPTY(wantPTY bool, termName string, term ports.TerminalHandle) (algebraic.Option[ports.PTYRequest], error) {
+func prepareOptionalPTY(wantPTY bool, termName string, sz ports.TerminalSize) (algebraic.Option[ports.PTYRequest], error) {
 	if !wantPTY {
 		return algebraic.None[ports.PTYRequest](), nil
 	}
-	sz, _ := term.Size()
 	req, err := buildPTYRequest(termName, sz)
 	if err != nil {
 		return algebraic.None[ports.PTYRequest](), err
@@ -155,19 +152,10 @@ func relayPipesThroughTerminal(
 	onResize := buildResizeCallback(sess, wantPTY)
 	var relayErr, pumpErr error
 	runErr := conc.RunWait(ctx, func(wCtx context.Context, n *conc.Nursery) error {
-		abortDone := make(chan struct{})
-		stopAbort := context.AfterFunc(wCtx, func() { defer close(abortDone); abort() })
-		defer func() {
-			if !stopAbort() {
-				<-abortDone
-			}
-		}()
+		defer registerSyncAbort(wCtx, abort)()
 		if err := n.Go(func(pCtx context.Context) error {
-			err := pumpRemotePipesToRelay(pCtx, pw, remoteOut, remoteErr, stderrDst, emitter, abort)
-			if err != nil {
-				pumpErr = err
-			}
-			return err
+			pumpErr = pumpRemotePipesToRelay(pCtx, pw, remoteOut, remoteErr, stderrDst, emitter, abort)
+			return pumpErr
 		}); err != nil {
 			abort()
 			return err
@@ -279,14 +267,9 @@ func runStreamSession(
 	ctx context.Context, sess ports.RemoteSession, starter sessionStarter, termName string,
 	sendEnv map[string]string, stdin io.Reader, stdout, stderr io.Writer, emitter *operationEmitter, wantPTY bool,
 ) (execution.ExecutionOutcome, error) {
-	var ptyOpt algebraic.Option[ports.PTYRequest]
-	if wantPTY {
-		sz, _ := ports.NewTerminalSize(defaultTTYCols, defaultTTYRows)
-		ptyReq, err := buildPTYRequest(termName, sz)
-		if err != nil {
-			return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_pty", err), err
-		}
-		ptyOpt = algebraic.Some(ptyReq)
+	ptyOpt, err := prepareOptionalPTY(wantPTY, termName, zeroVal[ports.TerminalSize]())
+	if err != nil {
+		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_pty", err), err
 	}
 	streams := ports.ExecStreams{
 		Stdin: stdin, Stdout: wrapOutputWriter(ctx, stdout, emitter, events.OutputStreamStdout),
@@ -299,15 +282,12 @@ func runStreamSession(
 }
 
 func outcomeForAbortedRun(ctx context.Context, err error) execution.ExecutionOutcome {
-	phase, code := execution.ExecPhaseTransportLost, "session_aborted"
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		if errors.Is(ctxErr, context.DeadlineExceeded) {
-			phase, code = execution.ExecPhaseTimedOut, "timed_out"
-		} else {
-			phase, code = execution.ExecPhaseCanceled, "canceled"
-		}
+	phase, code, msg := execution.ExecPhaseTransportLost, "session_aborted", "session aborted"
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		phase, code = execution.ExecPhaseTimedOut, "timed_out"
+	} else if ctx.Err() != nil {
+		phase, code = execution.ExecPhaseCanceled, "canceled"
 	}
-	msg := "session aborted"
 	if err != nil {
 		msg = err.Error()
 	}

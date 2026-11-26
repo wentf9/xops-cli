@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,23 +97,14 @@ type muxResource interface {
 	touch(ctx context.Context)
 }
 
-const (
-	muxReaperIdle uint8 = iota
-	muxReaperReleasing
-	muxReaperDone
-	muxReaperCanceled
-)
-
 // managedMuxMaster 实现 muxResource、snapshotResource[ControlMasterStatus] 与 pool.ComparableManagedResource：
-// 使用分离的 workNursery（监听服务 + ControlPersist 计时器）与 reaperNursery（独立自动回收协程）配合
-// 四态原子状态机（Idle/Releasing/Done/Canceled），确保 WithListener 解绑且排空 workNursery 后再触发
-// ReleaseHandle，并在 pool.scheduleCloserBounded 同步重入 Close 降级路径上彻底杜绝自等待死锁与假活竞态。
+// 使用分离的 workNursery（监听服务 + ControlPersist 计时器）与 reaperNursery（独立自动回收协程），
+// 依托 pool.ReleaseHandle 在持 slots.mu 期间线性化预增 tdPending，Close() 无条件同步排空全部子协程（0 死锁、0 goleak）。
 //
 //xops:opaque
 //xops:failclosed
 type managedMuxMaster struct {
 	valid, relClosed                        bool
-	reaperState                             uint8
 	socketPath                              pathalg.LocalSourcePath
 	effectiveMaster                         option.ControlMasterMode
 	effectivePersist                        option.ControlPersistSpec
@@ -152,18 +142,17 @@ func (s *Service) startManagedMuxMaster(leaseCtx, revokeCtx context.Context, con
 		_ = mm.Close()
 		return nil, err
 	}
-	var failErr error
 	select {
 	case <-readyCh:
 		return mm, nil
-	case failErr = <-startErrCh:
+	case err = <-startErrCh:
 	case <-leaseCtx.Done():
-		failErr = leaseCtx.Err()
+		err = leaseCtx.Err()
 	case <-revokeCtx.Done():
-		failErr = context.Cause(revokeCtx)
+		err = context.Cause(revokeCtx)
 	}
 	_ = mm.Close()
-	return nil, failErr
+	return nil, err
 }
 
 func (m *managedMuxMaster) launchMuxWorkers(muxPort ports.MuxSocketPort, forwarder ports.ForwarderPort, clk ports.Clock, readyCh chan struct{}, startErrCh chan error) error {
@@ -184,10 +173,7 @@ func (m *managedMuxMaster) launchMuxWorkers(muxPort ports.MuxSocketPort, forward
 			return muxPort.Serve(serveCtx, ln, m.conn, forwarder)
 		})
 		if !bound {
-			select {
-			case startErrCh <- firstNonNilErr(err, ErrMuxMasterUnavailable):
-			default:
-			}
+			startErrCh <- firstNonNilErr(err, ErrMuxMasterUnavailable)
 			return err
 		}
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -223,7 +209,6 @@ func (m *managedMuxMaster) runPersistTimer(ctx context.Context, clk ports.Clock,
 	}
 }
 func (m *managedMuxMaster) runAutoRelease(rCtx context.Context) error {
-	defer m.reaperNursery.Cancel(nil)
 	select {
 	case <-rCtx.Done():
 		return nil
@@ -235,40 +220,28 @@ func (m *managedMuxMaster) runAutoRelease(rCtx context.Context) error {
 		return nil
 	case <-m.relReady:
 	}
-	if rCtx.Err() != nil {
-		return nil
-	}
-	fn := m.claimAutoRelease()
-	if fn == nil {
-		return nil
-	}
-	defer func() { m.relMu.Lock(); m.reaperState = muxReaperDone; m.relMu.Unlock() }()
-	fn()
-	return nil
-}
-func (m *managedMuxMaster) claimAutoRelease() func() {
 	m.relMu.Lock()
-	defer m.relMu.Unlock()
-	if m.reaperState != muxReaperIdle || m.releaseFn == nil {
-		return nil
-	}
 	fn := m.releaseFn
-	m.releaseFn, m.reaperState = nil, muxReaperReleasing
-	return fn
+	m.releaseFn = nil
+	m.relMu.Unlock()
+	if rCtx.Err() == nil && fn != nil {
+		fn()
+	}
+	return nil
 }
 func (m *managedMuxMaster) bindAutoRelease(fn func()) {
 	m.relMu.Lock()
 	if !m.relClosed {
-		m.relClosed = true
-		if m.reaperState == muxReaperIdle {
-			m.releaseFn = fn
-		}
+		m.releaseFn, m.relClosed = fn, true
 		close(m.relReady)
 	}
 	m.relMu.Unlock()
 }
 func (m *managedMuxMaster) touch(ctx context.Context) {
-	if _, hasTimeout := m.effectivePersist.Timeout(); !hasTimeout || m == nil || !m.valid || m.closed.Load() {
+	if m == nil || !m.valid || m.closed.Load() {
+		return
+	}
+	if _, hasTimeout := m.effectivePersist.Timeout(); !hasTimeout {
 		return
 	}
 	ack := make(chan struct{})
@@ -312,16 +285,11 @@ func (m *managedMuxMaster) Close() error {
 	}
 	m.closeOnce.Do(func() {
 		m.relMu.Lock()
-		state := m.reaperState
-		if state == muxReaperIdle {
-			m.reaperState, m.releaseFn = muxReaperCanceled, nil
-		}
+		m.releaseFn, m.relClosed = nil, true
 		m.relMu.Unlock()
 		m.closeWork(ports.ErrClosed)
 		m.reaperNursery.Cancel(ports.ErrClosed)
-		if state != muxReaperReleasing {
-			_ = m.reaperNursery.Close()
-		}
+		_ = m.reaperNursery.Close()
 	})
 	return m.serveErr.get()
 }
@@ -342,11 +310,11 @@ func (s *Service) StartControlMaster(ctx context.Context, req ControlMasterReque
 	if effMaster == option.ControlMasterNo || effMaster == option.ControlMasterUnset {
 		return ControlMasterInfo{}, fmt.Errorf("%w: EffectiveMaster=%s（确认 ControlPath 已启用且 ControlMaster 非 no）", ErrControlMasterDisabled, effMaster)
 	}
-	sockPath, err := expandControlPath(req.Plan, targetHop, cp.Path(), s.cfg.Env)
+	sockPath, err := expandControlPath(targetHop, cp.Path(), s.cfg.Env)
 	if err != nil {
 		return ControlMasterInfo{}, err
 	}
-	gateReq, err := buildMuxGateReq[security.CapTunnel](req.Plan, targetHop, nodeID, "mux_master_start", sockPath, req.Risk.OrElse(security.RiskModerate), nil, req.Approval, req.OperationStream)
+	gateReq, err := buildMuxGateReq[security.CapTunnel](req.Plan, targetHop, nodeID, "mux_master_start", sockPath, effMaster, req.Risk.OrElse(security.RiskModerate), nil, req.Approval, req.OperationStream)
 	if err != nil {
 		return ControlMasterInfo{}, err
 	}
@@ -376,9 +344,9 @@ func (s *Service) execStartControlMaster(authCtx context.Context, connPlan plan.
 	return s.cfg.Pool.WithLease(authCtx, connPlan, func(leaseCtx context.Context, lease *pool.Lease) error {
 		var master *managedMuxMaster
 		h, err := pool.RegisterLeaseHandleWith[plan.KindMux](s.cfg.Pool, lease, binding, func(revokeCtx context.Context, conn ports.TransportConn) (*managedMuxMaster, error) {
-			mm, mErr := s.startManagedMuxMaster(leaseCtx, revokeCtx, conn, sockPath, effMaster, effPersist)
-			master = mm
-			return mm, mErr
+			var mErr error
+			master, mErr = s.startManagedMuxMaster(leaseCtx, revokeCtx, conn, sockPath, effMaster, effPersist)
+			return master, mErr
 		})
 		if err != nil {
 			return err
@@ -395,7 +363,7 @@ func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sock
 		return false, ControlMasterInfo{}, nil
 	}
 	resp, err := s.cfg.MuxSocket.Probe(ctx, sockPath)
-	if errors.Is(err, ports.ErrMuxUnavailable) || errors.Is(err, ports.ErrNotFound) || (err == nil && (!resp.IsValid() || !resp.Alive())) {
+	if errors.Is(err, ports.ErrMuxUnavailable) || errors.Is(err, ports.ErrNotFound) || (err == nil && (!resp.IsValid() || !resp.Alive() || resp.MasterPID() == 0)) {
 		return false, ControlMasterInfo{}, nil
 	}
 	if err != nil {
@@ -440,53 +408,4 @@ func (s *Service) TouchControlMaster(ctx context.Context, handle plan.ManagedHan
 // StopControlMaster 释放 ControlMaster 句柄、解钉底层跳板并触发监听套接字与服务端有序停机。
 func (s *Service) StopControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) error {
 	return releaseManagedHandle[plan.KindMux](ctx, s, handle)
-}
-
-func expandControlPath(connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec, spec option.ControlPathSpec, env ports.EnvPort) (pathalg.LocalSourcePath, error) {
-	if !spec.IsEnabled() {
-		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: ControlPath 未启用", ErrControlMasterDisabled)
-	}
-	raw := spec.String()
-	if !spec.IsLiteral() {
-		tokCtx := option.TokenContext{
-			TargetHost: targetHop.Endpoint().Host().String(), Port: targetHop.Endpoint().Port(),
-			RemoteUser: targetHop.Username().String(), OriginalHost: targetHop.OriginalHost().String(),
-			JumpHost: extractJumpHostForPercentJ(connPlan, targetHop),
-		}
-		if env != nil {
-			if id, err := env.LookupLocalIdentity(); err == nil && id.IsValid() {
-				tokCtx = id.ApplyToTokenContext(tokCtx)
-			}
-		}
-		expanded, err := option.ExpandPathTokens(raw, tokCtx)
-		if err != nil {
-			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 展开 ControlPath 模板失败: %w", ErrInvalidRequest, err)
-		}
-		if strings.HasPrefix(expanded, "~/") && tokCtx.HomeDir != "" {
-			expanded = strings.TrimRight(tokCtx.HomeDir, "/") + expanded[1:]
-		}
-		raw = expanded
-	}
-	p, err := pathalg.ParseLocalSourcePath(raw)
-	if err != nil {
-		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 非法控制套接字路径 %q: %w", ErrInvalidRequest, raw, err)
-	}
-	return p, nil
-}
-
-func extractJumpHostForPercentJ(connPlan plan.SealedConnectionPlan, targetHop plan.HopSpec) string {
-	switch route := targetHop.Transport().ProxyRoute().(type) {
-	case *option.ProxyJumpChain:
-		if route.IsValid() {
-			hops := route.Hops().Slice()
-			return hops[len(hops)-1].Host()
-		}
-	case *option.ProxyUnset, *option.ProxyDisabled, *option.ProxyCommandSpec:
-		if prev, ok := connPlan.HopAt(connPlan.Len() - 2); connPlan.Len() >= 2 && ok {
-			return prev.Endpoint().Host().String()
-		}
-	default:
-		return ""
-	}
-	return ""
 }
