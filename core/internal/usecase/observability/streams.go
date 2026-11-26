@@ -256,7 +256,7 @@ func buildMetricsProbePlan(prof execution.LaunchProfile, p metricsReqPrepared) (
 	sortCol := pickIf(p.sortBy == ProcessSortMem, 4, 3)
 	procSnippet := `PROCS=""`
 	if p.topN > 0 {
-		procSnippet = fmt.Sprintf(`PROCS=$(ps -eo pid=,user=,pcpu=,pmem=,comm= 2>/dev/null | sort -rn -k%d,%d 2>/dev/null | head -n %d | awk 'NF>=5&&$1+0>0{u=$2;c=$5;for(i=6;i<=NF;i++)c=c" "$i;gsub(/\\/,"\\\\",u);gsub(/"/,"\\\"",u);gsub(/\\/,"\\\\",c);gsub(/"/,"\\\"",c);printf "%%s{\"pid\":%%d,\"user\":\"%%s\",\"cpu_percent\":%%.2f,\"mem_percent\":%%.2f,\"command\":\"%%s\"}",(n++?",":""),$1+0,u,$3+0,$4+0,c}')`, sortCol, sortCol, p.topN)
+		procSnippet = fmt.Sprintf(`PROCS=$(ps -eo pid=,user=,pcpu=,pmem=,comm= 2>/dev/null | sort -rn -k%d,%d 2>/dev/null | head -n %d | awk 'NF>=5&&$1+0>0{u=$2;c=$5;for(i=6;i<=NF;i++)c=c" "$i;gsub(/[[:cntrl:]]/,"",u);gsub(/\\/,"\\\\",u);gsub(/"/,"\\\"",u);gsub(/[[:cntrl:]]/,"",c);gsub(/\\/,"\\\\",c);gsub(/"/,"\\\"",c);printf "%%s{\"pid\":%%d,\"user\":\"%%s\",\"cpu_percent\":%%.2f,\"mem_percent\":%%.2f,\"command\":\"%%s\"}",(n++?",":""),$1+0,u,$3+0,$4+0,c}')`, sortCol, sortCol, p.topN)
 	}
 	sleepSec, fallbackSec := fmt.Sprintf("%.3f", p.interval.Std().Seconds()), max(int((p.interval.Std()+time.Second-1)/time.Second), 1)
 	script := fmt.Sprintf(`LC_ALL=C; export LC_ALL
@@ -266,9 +266,9 @@ xops_sample() {
   LOAD=$(awk '{printf "%%.2f %%.2f %%.2f",$1+0,$2+0,$3+0;exit}' /proc/loadavg 2>/dev/null || printf '0 0 0')
   MEM=$(awk '/^MemTotal:/{t=$2*1024}/^MemAvailable:/{a=$2*1024;ha=1}/^MemFree:/{f=$2*1024}/^Buffers:/{b=$2*1024}/^Cached:/{c=$2*1024}END{if(!ha)a=f+b+c;u=(t>a)?t-a:0;printf "%%.0f %%.0f",u,t}' /proc/meminfo 2>/dev/null || printf '0 0')
   UP=$(awk '{printf "%%.3f",$1+0;exit}' /proc/uptime 2>/dev/null || printf '0')
-  DISKS=$(df -P -k 2>/dev/null | awk 'NR>1&&NF>=6&&$2+0>0{m=$6;for(i=7;i<=NF;i++)m=m" "$i;gsub(/\\/,"\\\\",m);gsub(/"/,"\\\"",m);t=$2*1024;u=$3*1024;p=(t>0)?u*100/t:0;printf "%%s{\"mount\":\"%%s\",\"used_bytes\":%%.0f,\"total_bytes\":%%.0f,\"used_percent\":%%.2f}",(n++?",":""),m,u,t,p}')
+  DISKS=$(df -P -k 2>/dev/null | awk 'NR>1&&NF>=6&&$2+0>0{m=$6;for(i=7;i<=NF;i++)m=m" "$i;gsub(/[[:cntrl:]]/,"",m);gsub(/\\/,"\\\\",m);gsub(/"/,"\\\"",m);t=$2*1024;u=$3*1024;p=(t>0)?u*100/t:0;printf "%%s{\"mount\":\"%%s\",\"used_bytes\":%%.0f,\"total_bytes\":%%.0f,\"used_percent\":%%.2f}",(n++?",":""),m,u,t,p}')
   %s
-  awk -v h="$H" -v cpu="$CPU" -v ld="$LOAD" -v mem="$MEM" -v up="$UP" -v dk="$DISKS" -v pr="$PROCS" 'BEGIN{gsub(/\\/,"\\\\",h);gsub(/"/,"\\\"",h);split(cpu,c," ");split(ld,l," ");split(mem,m," ");printf "{\"hostname\":\"%%s\",\"cpu_total\":%%.0f,\"cpu_idle\":%%.0f,\"load_1\":%%.2f,\"load_5\":%%.2f,\"load_15\":%%.2f,\"mem_used_bytes\":%%.0f,\"mem_total_bytes\":%%.0f,\"uptime_sec\":%%s,\"disks\":[%%s],\"processes\":[%%s]}\n",h,c[1]+0,c[2]+0,l[1]+0,l[2]+0,l[3]+0,m[1]+0,m[2]+0,(up==""?"0":up),dk,pr}'
+  H="$H" CPU="$CPU" LOAD="$LOAD" MEM="$MEM" UP="$UP" DISKS="$DISKS" PROCS="$PROCS" awk 'BEGIN{h=ENVIRON["H"];gsub(/[[:cntrl:]]/,"",h);gsub(/\\/,"\\\\",h);gsub(/"/,"\\\"",h);if(h=="")h="unknown";split(ENVIRON["CPU"],c," ");split(ENVIRON["LOAD"],l," ");split(ENVIRON["MEM"],m," ");printf "{\"hostname\":\"%%s\",\"cpu_total\":%%.0f,\"cpu_idle\":%%.0f,\"load_1\":%%.2f,\"load_5\":%%.2f,\"load_15\":%%.2f,\"mem_used_bytes\":%%.0f,\"mem_total_bytes\":%%.0f,\"uptime_sec\":%%.3f,\"disks\":[%%s],\"processes\":[%%s]}\n",h,c[1]+0,c[2]+0,l[1]+0,l[2]+0,l[3]+0,m[1]+0,m[2]+0,ENVIRON["UP"]+0,ENVIRON["DISKS"],ENVIRON["PROCS"]}'
 }
 i=0; while [ "$i" -lt %d ]; do xops_sample; i=$((i+1)); if [ "$i" -lt %d ]; then sleep %s 2>/dev/null || sleep %d; fi; done`,
 		procSnippet, p.maxSamples, p.maxSamples, sleepSec, fallbackSec)

@@ -766,11 +766,12 @@ func TestStreamMetricsRealShellStreamingAndLogFollowStop(t *testing.T) {
 		t.Fatalf("unexpected live streaming frames: times=%v frames=%+v", seenTimes, mRes.Frames())
 	}
 
-	// 3. 真实 /bin/sh 执行 StreamMetrics 探针脚本并端到端喂回解析器验证协议兼容性。
+	// 3. 真实 /bin/sh 执行 StreamMetrics 探针脚本并端到端喂回解析器验证协议兼容性（含 CRLF 主机名与含反斜杠/引号挂载点对抗回归）。
 	if shPath, lookErr := exec.LookPath("sh"); lookErr == nil {
+		var rawOut, rawErr bytes.Buffer
 		rig.dialer.onCmd = func(c context.Context, cmd execution.CommandPlan, stdout, stderr io.Writer) (execution.ExecutionOutcome, error) {
 			ec := exec.CommandContext(c, shPath, "-c", cmd.Command())
-			ec.Stdout, ec.Stderr = stdout, stderr
+			ec.Stdout, ec.Stderr = io.MultiWriter(stdout, &rawOut), io.MultiWriter(stderr, &rawErr)
 			if rErr := ec.Run(); rErr != nil {
 				return nil, rErr
 			}
@@ -781,8 +782,30 @@ func TestStreamMetricsRealShellStreamingAndLogFollowStop(t *testing.T) {
 		})
 		mustNoErr(t, rErr, "StreamMetrics real /bin/sh probe")
 		if len(realRes.Frames()) != 2 || realRes.Frames()[0].Hostname == "" {
-			t.Fatalf("expected 2 real parsed frames from /bin/sh probe, got %+v", realRes.Frames())
+			t.Fatalf("expected 2 real parsed frames from /bin/sh probe, got %+v (stdout=%q stderr=%q)", realRes.Frames(), rawOut.String(), rawErr.String())
 		}
+		assertMetricsProbeCRLFAndEscaping(t, rig, shPath)
+	}
+}
+
+func assertMetricsProbeCRLFAndEscaping(t *testing.T, rig *obsRig, shPath string) {
+	t.Helper()
+	// 模拟 Windows hostname.exe 尾部 \r 以及含反斜杠/双引号的 df/ps 输出，验证 ENVIRON + [[:cntrl:]] 剥离保持合法 NDJSON。
+	rig.dialer.onCmd = func(c context.Context, cmd execution.CommandPlan, stdout, stderr io.Writer) (execution.ExecutionOutcome, error) {
+		shim := "hostname() { printf 'win-host\\r\\n'; }\ndf() { printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\nC: 100 40 60 40%% C:\\\\mnt\\\\\"a\"\\r\\n'; }\nps() { printf '42 ops\\r 1.5 2.5 C:\\\\app\\\\\"bin\"\\r\\n'; }\n" + cmd.Command()
+		ec := exec.CommandContext(c, shPath, "-c", shim)
+		ec.Stdout, ec.Stderr = stdout, stderr
+		if rErr := ec.Run(); rErr != nil {
+			return nil, rErr
+		}
+		return execution.NewOutcomeCompleted(execution.NewExitCode(0), false)
+	}
+	crlfRes, cErr := rig.svc.StreamMetrics(context.Background(), observability.MetricsStreamRequest{
+		Plan: rig.plan, MaxSamples: 1, TopProcesses: 2,
+	})
+	mustNoErr(t, cErr, "StreamMetrics CRLF/backslash probe")
+	if len(crlfRes.Frames()) != 1 || crlfRes.Frames()[0].Hostname != "win-host" || len(crlfRes.Frames()[0].Disks) != 1 || crlfRes.Frames()[0].Disks[0].Mount != `C:\mnt\"a"` || len(crlfRes.Frames()[0].Processes) != 1 || crlfRes.Frames()[0].Processes[0].Command != `C:\app\"bin"` {
+		t.Fatalf("unexpected CRLF/backslash parsed frame: %+v", crlfRes.Frames())
 	}
 }
 
