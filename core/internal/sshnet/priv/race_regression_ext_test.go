@@ -1,0 +1,472 @@
+package priv_test
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"go.uber.org/goleak"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
+	"github.com/wentf9/xops-cli/core/domain/secret"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/priv"
+	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/core/ports/tck"
+)
+
+type readStep struct {
+	waitCh     <-chan struct{}
+	data       []byte
+	err        error
+	onReturned func()
+}
+
+// gatedStepReader 按预设确定性步骤向扫描器交付字节（零 time.Sleep、零后台协程），
+// 用于在单元测试中 100% 复现跨流 EOF 与大输出并发交错时序。
+type gatedStepReader struct {
+	steps    []readStep
+	idx      int
+	offset   int
+	closedCh <-chan struct{}
+}
+
+func (r *gatedStepReader) Read(p []byte) (int, error) {
+	for r.idx < len(r.steps) {
+		step := &r.steps[r.idx]
+		if step.waitCh != nil {
+			select {
+			case <-step.waitCh:
+				step.waitCh = nil
+			case <-r.closedCh:
+				return 0, io.EOF
+			}
+		}
+		if r.offset < len(step.data) {
+			n := copy(p, step.data[r.offset:])
+			r.offset += n
+			if r.offset == len(step.data) {
+				r.advanceStep(step.onReturned)
+			}
+			return n, nil
+		}
+		err := step.err
+		r.advanceStep(step.onReturned)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return 0, io.EOF
+}
+
+func (r *gatedStepReader) advanceStep(cb func()) {
+	r.idx++
+	r.offset = 0
+	if cb != nil {
+		cb()
+	}
+}
+
+type recordStdinPipe struct {
+	mu          sync.Mutex
+	buf         bytes.Buffer
+	closed      bool
+	closedCh    chan struct{}
+	firstWrite  sync.Once
+	firstWrote  chan struct{}
+	closeOnce   sync.Once
+	onWriteHook func(snapshot string)
+}
+
+func newRecordStdinPipe() *recordStdinPipe {
+	return &recordStdinPipe{
+		closedCh:   make(chan struct{}),
+		firstWrote: make(chan struct{}),
+	}
+}
+
+func (p *recordStdinPipe) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
+	n, _ := p.buf.Write(b)
+	snap := p.buf.String()
+	hook := p.onWriteHook
+	p.mu.Unlock()
+	p.firstWrite.Do(func() { close(p.firstWrote) })
+	if hook != nil {
+		hook(snap)
+	}
+	return n, nil
+}
+
+func (p *recordStdinPipe) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	p.closeOnce.Do(func() { close(p.closedCh) })
+	return nil
+}
+
+func (p *recordStdinPipe) snapshot() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.buf.String()
+}
+
+type scriptedSession struct {
+	stdin    *recordStdinPipe
+	stdout   io.Reader
+	stderr   io.Reader
+	buildFn  func(renderedCmd string, closedCh <-chan struct{}) (stdout, stderr io.Reader)
+	exitCode int32
+
+	closeOnce sync.Once
+	closedCh  chan struct{}
+}
+
+type scriptedOpener struct {
+	session *scriptedSession
+}
+
+func (o *scriptedOpener) OpenSession(context.Context) (ports.RemoteSession, error) {
+	return o.session, nil
+}
+
+func newScriptedSession(exitCode int32, buildFn func(renderedCmd string, closedCh <-chan struct{}) (io.Reader, io.Reader)) *scriptedSession {
+	return &scriptedSession{
+		stdin:    newRecordStdinPipe(),
+		buildFn:  buildFn,
+		exitCode: exitCode,
+		closedCh: make(chan struct{}),
+	}
+}
+
+func (s *scriptedSession) StdinPipe() (io.WriteCloser, error) { return s.stdin, nil }
+
+func (s *scriptedSession) StdoutPipe() (io.Reader, error) {
+	return &deferredReader{get: func() io.Reader { return s.stdout }}, nil
+}
+
+func (s *scriptedSession) StderrPipe() (io.Reader, error) {
+	return &deferredReader{get: func() io.Reader { return s.stderr }}, nil
+}
+
+func (s *scriptedSession) Start(_ context.Context, cmd execution.CommandPlan, _ ports.ExecStreams) error {
+	rendered, err := cmd.RenderCommand()
+	if err != nil {
+		return err
+	}
+	s.stdout, s.stderr = s.buildFn(rendered, s.closedCh)
+	return nil
+}
+
+func (*scriptedSession) StartShell(context.Context, ports.ExecStreams) error {
+	return ports.ErrUnsupported
+}
+func (*scriptedSession) ResizePTY(context.Context, ports.TerminalSize) error { return nil }
+func (*scriptedSession) Signal(context.Context, string) error                { return nil }
+
+func (s *scriptedSession) Wait(context.Context) (execution.ExecutionOutcome, error) {
+	return execution.NewOutcomeCompleted(execution.NewExitCode(s.exitCode), false)
+}
+
+func (s *scriptedSession) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.closedCh)
+		_ = s.stdin.Close()
+	})
+	return nil
+}
+
+type deferredReader struct {
+	get func() io.Reader
+}
+
+func (d *deferredReader) Read(p []byte) (int, error) {
+	return d.get().Read(p)
+}
+
+func TestEscalator_CrossStreamEOFOrdering_Deterministic(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	t.Run("StdoutEOFArrivesBeforeStderrReady", testStdoutEOFBeforeStderrReady)
+	t.Run("LargeStdoutOverHoldThresholdBeforeStderrReady", testLargeStdoutBeforeStderrReady)
+	t.Run("StdoutAndStderrEOFWithoutReady_FailsClosed", testBothEOFWithoutReadyFailClosed)
+	t.Run("StdoutPausedAtHoldThreshold_HandshakeTimeoutUnblocks", testPausedStdoutTimeoutUnblocks)
+	t.Run("PlanKindScript_StdinAfterReadyAndStdoutRace", testScriptStdinOrderAndStdoutRace)
+	t.Run("PTYMode_CombinedStdoutPromptReadyAndLargeOutput", testPTYModeCombinedStream)
+}
+
+func testStdoutEOFBeforeStderrReady(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	stdoutEOF := make(chan struct{})
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("uid=0(root)\n")},
+				{err: io.EOF, onReturned: func() { close(stdoutEOF) }},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: stdoutEOF, data: []byte(readyTok + "post-err\n")},
+				{err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, err := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(71)})
+	if err != nil {
+		t.Fatalf("NewEscalator: %v", err)
+	}
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodDoas,
+		Command: tck.MustCommandPlan(t, "id"),
+	})
+	var stdout, stderr bytes.Buffer
+	out, err := esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		t.Fatalf("stdout 先于 stderr ready 到达 EOF 时不应失败: %v", err)
+	}
+	if comp, ok := out.(*execution.OutcomeCompleted); !ok || !comp.Succeeded() {
+		t.Fatalf("期望成功 OutcomeCompleted，实际 %#v", out)
+	}
+	if stdout.String() != "uid=0(root)\n" || stderr.String() != "post-err\n" {
+		t.Fatalf("跨流 EOF 时序下输出发生丢失或串扰: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func testLargeStdoutBeforeStderrReady(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	chunk := bytes.Repeat([]byte("A"), 32*1024)
+	want := bytes.Repeat(chunk, 5) // 160 KiB > 64 KiB 暂存上限
+	hitThreshold := make(chan struct{})
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		mid := len(readyTok) / 2
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: chunk},
+				{data: chunk, onReturned: func() { close(hitThreshold) }},
+				{data: chunk},
+				{data: chunk},
+				{data: chunk},
+				{err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: hitThreshold, data: []byte(readyTok[:mid])},
+				{data: []byte(readyTok[mid:])},
+				{err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(72)})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "cat"),
+	})
+	var stdout bytes.Buffer
+	if _, err := esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{Stdout: &stdout}); err != nil {
+		t.Fatalf("超过暂存上限的大 stdout 竞态失败: %v", err)
+	}
+	if !bytes.Equal(stdout.Bytes(), want) {
+		t.Fatalf("大 stdout 字节不完整: got=%d want=%d", stdout.Len(), len(want))
+	}
+}
+
+func testBothEOFWithoutReadyFailClosed(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	stdoutEOF := make(chan struct{})
+	sess := newScriptedSession(1, func(_ string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("untrusted-pre-ready-stdout\n")},
+				{err: io.EOF, onReturned: func() { close(stdoutEOF) }},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: stdoutEOF, data: []byte("sudo: a password is required\n")},
+				{err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(73)})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:         ports.PrivilegeMethodSudo,
+		Command:        tck.MustCommandPlan(t, "id"),
+		NonInteractive: true,
+	})
+	var stdout bytes.Buffer
+	if _, err := esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{Stdout: &stdout}); !errors.Is(err, ports.ErrAuthFailed) {
+		t.Fatalf("未就绪双流结束须返回 ErrAuthFailed，实际 %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("未就绪认证失败时严禁向 stdout 泄露预暂存字节，实际 %q", stdout.String())
+	}
+}
+
+func testPausedStdoutTimeoutUnblocks(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	chunk := bytes.Repeat([]byte("Z"), 32*1024)
+	neverReady := make(chan struct{})
+	sess := newScriptedSession(1, func(_ string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: chunk},
+				{data: chunk},
+				{data: chunk},
+				{data: chunk},
+				{waitCh: neverReady, err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps:    []readStep{{waitCh: neverReady, err: io.EOF}},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{
+		Entropy:          tck.NewDeterministicEntropy(74),
+		HandshakeTimeout: 30 * time.Millisecond,
+	})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "id"),
+	})
+	if _, err := esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("次流暂存暂停期间握手超时须返回 DeadlineExceeded，实际 %v", err)
+	}
+}
+
+func testScriptStdinOrderAndStdoutRace(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	stdoutEOF := make(chan struct{})
+	var preReadyStdin string
+	var sess *scriptedSession
+	sess = newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		promptTok := extractBracketToken(cmd, `[xops-priv-prompt-`)
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: sess.stdin.closedCh, data: []byte("script-done\n")},
+				{err: io.EOF, onReturned: func() { close(stdoutEOF) }},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte(promptTok)},
+				{
+					waitCh: sess.stdin.firstWrote,
+					data:   []byte(readyTok),
+					onReturned: func() {
+						preReadyStdin = sess.stdin.snapshot()
+					},
+				},
+				{waitCh: stdoutEOF, err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(75)})
+	prof, _ := execution.POSIXLaunchProfile(execution.InterpreterSH, execution.LoginModeDisabled)
+	scriptPlan, _ := execution.NewCommandPlan(execution.CommandPlanSpec{
+		Kind:    execution.PlanKindScript,
+		Profile: prof,
+		Command: "SCRIPT_BODY;",
+	})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: scriptPlan,
+	})
+	var stdout bytes.Buffer
+	err := secret.WithBytes([]byte("pw-script"), func(box *secret.SecretBox) error {
+		_, rErr := esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, box, ports.ExecStreams{
+			Stdin:  strings.NewReader("USER_DATA"),
+			Stdout: &stdout,
+		})
+		return rErr
+	})
+	if err != nil {
+		t.Fatalf("脚本提权跨流时序失败: %v", err)
+	}
+	if !strings.HasPrefix(preReadyStdin, "pw-script\n") {
+		t.Fatalf("就绪前 stdin 须仅包含提权口令，实际 %q", preReadyStdin)
+	}
+	if gotStdin := sess.stdin.snapshot(); gotStdin != "pw-script\nSCRIPT_BODY;USER_DATA" {
+		t.Fatalf("stdin 投递顺序异常: got=%q", gotStdin)
+	}
+	if stdout.String() != "script-done\n" {
+		t.Fatalf("stdout 结果异常: got=%q", stdout.String())
+	}
+}
+
+func testPTYModeCombinedStream(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	large := bytes.Repeat([]byte("P"), 96*1024)
+	neverErr := make(chan struct{})
+	var sess *scriptedSession
+	sess = newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		promptTok := extractBracketToken(cmd, `[xops-priv-prompt-`)
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte(promptTok)},
+				{waitCh: sess.stdin.firstWrote, data: []byte(readyTok)},
+				{data: large},
+				{err: io.EOF, onReturned: func() { close(neverErr) }},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps:    []readStep{{waitCh: neverErr, err: io.EOF}},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(76)})
+	sz, _ := ports.NewTerminalSize(24, 80)
+	ptyReq, _ := ports.NewPTYRequest("xterm-256color", sz)
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "id"),
+	})
+	var stdout bytes.Buffer
+	err := secret.WithBytes([]byte("pty-pass"), func(box *secret.SecretBox) error {
+		_, rErr := esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, box, ports.ExecStreams{
+			PTY:    algebraic.Some(ptyReq),
+			Stdout: &stdout,
+		})
+		return rErr
+	})
+	if err != nil {
+		t.Fatalf("PTY 合并流提权失败: %v", err)
+	}
+	if !bytes.Equal(stdout.Bytes(), large) {
+		t.Fatalf("PTY 模式合并流大输出不完整: got=%d want=%d", stdout.Len(), len(large))
+	}
+}

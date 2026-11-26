@@ -186,13 +186,15 @@ func (e *Escalator) driveSessionIOAndHandshake(
 	writeSecret func() error,
 ) (int, error) {
 	readersDone := make(chan struct{})
+	ioCtx, cancelIO := context.WithCancel(runCtx)
+	defer cancelIO()
 	stdinCtx, cancelStdin := context.WithCancel(runCtx)
 	defer cancelStdin()
 
 	var sentAttempts int
 	var hsErr error
 	nurseryErr := conc.RunWait(runCtx, func(nCtx context.Context, n *conc.Nursery) error {
-		if err := spawnOutputScanners(n, stdoutPipe, stderrPipe, state, streams, readersDone); err != nil {
+		if err := spawnOutputScanners(n, ioCtx, stdoutPipe, stderrPipe, state, streams, readersDone); err != nil {
 			return err
 		}
 		if err := spawnPostReadyStdinPump(n, stdinCtx, state.readyCh, stdinPipe, postStdin); err != nil {
@@ -200,6 +202,8 @@ func (e *Escalator) driveSessionIOAndHandshake(
 		}
 		sentAttempts, hsErr = e.awaitHandshakeOnCaller(nCtx, req, hasSecret, state, readersDone, writeSecret)
 		if hsErr != nil {
+			// 握手失败或超时立即解除次流暂存等待并关闭会话，防止暂存缓冲卡住退出。
+			cancelIO()
 			cancelStdin()
 			_ = sess.Close()
 			waitReadersOrCancel(nCtx, readersDone)
@@ -231,28 +235,55 @@ func (e *Escalator) awaitHandshakeOnCaller(
 
 	attempts := 0
 	for {
+		if state.readyFlag.Load() {
+			return attempts, nil
+		}
 		select {
 		case <-state.readyCh:
 			return attempts, nil
 		case <-readersDone:
-			if state.readyFlag.Load() {
-				return attempts, nil
-			}
-			return attempts, errHandshakeEndedBeforeReady
+			return finishHandshakeOnReadersDone(state, attempts)
 		case <-state.promptCh:
-			if err := checkCanSendPassword(req, hasSecret, attempts); err != nil {
+			done, err := handlePromptSignal(req, hasSecret, state, &attempts, writeSecret)
+			if done || err != nil {
 				return attempts, err
 			}
-			if err := writeSecret(); err != nil {
-				return attempts, fmt.Errorf("%w: 写入提权口令失败: %w", ports.ErrAuthFailed, err)
-			}
-			attempts++
 		case <-timerCh:
 			return attempts, fmt.Errorf("%w: 等待远端提权握手超时", context.DeadlineExceeded)
 		case <-ctx.Done():
 			return attempts, ctx.Err()
 		}
 	}
+}
+
+func finishHandshakeOnReadersDone(state *sharedHandshakeState, attempts int) (int, error) {
+	if state.readyFlag.Load() {
+		return attempts, nil
+	}
+	return attempts, errHandshakeEndedBeforeReady
+}
+
+// handlePromptSignal 在调用方同步协程内校验并向远端写入单次提权口令；若已就绪则立即返回 done=true。
+//
+//xops:syncclosure
+func handlePromptSignal(
+	req ports.PrivilegeRequest,
+	hasSecret bool,
+	state *sharedHandshakeState,
+	attempts *int,
+	writeSecret func() error,
+) (bool, error) {
+	if state.readyFlag.Load() {
+		return true, nil
+	}
+	if err := checkCanSendPassword(req, hasSecret, *attempts); err != nil {
+		return false, err
+	}
+	if err := writeSecret(); err != nil {
+		return false, fmt.Errorf("%w: 写入提权口令失败: %w", ports.ErrAuthFailed, err)
+	}
+	*attempts++
+	return false, nil
 }
 
 func checkCanSendPassword(req ports.PrivilegeRequest, hasSecret bool, attempts int) error {
@@ -267,11 +298,13 @@ func checkCanSendPassword(req ports.PrivilegeRequest, hasSecret bool, attempts i
 
 func spawnOutputScanners(
 	n *conc.Nursery,
+	ioCtx context.Context,
 	stdoutPipe, stderrPipe io.Reader,
 	state *sharedHandshakeState,
 	streams ports.ExecStreams,
 	readersDone chan struct{},
 ) error {
+	hasPTY := streams.PTY.IsSome()
 	var rem atomic.Int32
 	rem.Store(2)
 	doneOne := func() {
@@ -281,15 +314,17 @@ func spawnOutputScanners(
 	}
 	if err := n.Go(func(context.Context) error {
 		defer doneOne()
-		return newStreamScanner(state, streams.Stdout).pump(stdoutPipe)
+		return newStreamScanner(state, streams.Stdout, hasPTY).pump(ioCtx, stdoutPipe)
 	}); err != nil {
+		state.markControlDone()
 		close(readersDone)
 		return err
 	}
 	if err := n.Go(func(context.Context) error {
 		defer doneOne()
-		return newStreamScanner(state, streams.Stderr).pump(stderrPipe)
+		return newStreamScanner(state, streams.Stderr, !hasPTY).pump(ioCtx, stderrPipe)
 	}); err != nil {
+		state.markControlDone()
 		doneOne()
 		return err
 	}

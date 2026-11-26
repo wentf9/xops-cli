@@ -2,6 +2,8 @@ package priv
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -16,6 +18,9 @@ const (
 	maxSudoRSSuffixBytes     = 64
 	fullWidthColonUTF8       = "\xef\xbc\x9a"
 	defaultKeepTailHoldBytes = 96
+	// maxPreReadyHoldBytes 限制次流（如非 PTY 模式的 stdout）在主控流观测到 readyTok 前的最大暂存字节数：
+	// 远小于 SSH 2MiB 通道窗口，防止大输出触发流控死锁或内存膨胀，同时确保跨流并发竞争下零输出丢失。
+	maxPreReadyHoldBytes = 64 * 1024
 )
 
 // sudoPromptFeedback 在识别到 sudo-rs 封套提示后抑制紧随其后的回显掩码字节（* / \b / 空格 / \r），
@@ -44,10 +49,12 @@ type sharedHandshakeState struct {
 	usedBytes atomic.Uint64
 	truncated atomic.Bool
 
-	readyFlag atomic.Bool
-	readyOnce sync.Once
-	readyCh   chan struct{}
-	promptCh  chan struct{}
+	readyFlag       atomic.Bool
+	readyOnce       sync.Once
+	readyCh         chan struct{}
+	controlDoneOnce sync.Once
+	controlDone     chan struct{}
+	promptCh        chan struct{}
 
 	diagMu  sync.Mutex
 	diagBuf bytes.Buffer
@@ -55,17 +62,22 @@ type sharedHandshakeState struct {
 
 func newSharedHandshakeState(method ports.PrivilegeMethod, tokens handshakeTokens, maxBytes uint64) *sharedHandshakeState {
 	return &sharedHandshakeState{
-		method:   method,
-		tokens:   tokens,
-		maxBytes: maxBytes,
-		readyCh:  make(chan struct{}),
-		promptCh: make(chan struct{}, maxPromptSignals),
+		method:      method,
+		tokens:      tokens,
+		maxBytes:    maxBytes,
+		readyCh:     make(chan struct{}),
+		controlDone: make(chan struct{}),
+		promptCh:    make(chan struct{}, maxPromptSignals),
 	}
 }
 
 func (s *sharedHandshakeState) markReady() {
 	s.readyFlag.Store(true)
 	s.readyOnce.Do(func() { close(s.readyCh) })
+}
+
+func (s *sharedHandshakeState) markControlDone() {
+	s.controlDoneOnce.Do(func() { close(s.controlDone) })
 }
 
 func (s *sharedHandshakeState) recordDiag(data []byte) {
@@ -91,53 +103,74 @@ func (s *sharedHandshakeState) diagText() string {
 }
 
 type streamScanner struct {
-	state    *sharedHandshakeState
-	dst      io.Writer
-	pending  []byte
-	feedback sudoPromptFeedback
-	writeErr error
+	state        *sharedHandshakeState
+	dst          io.Writer
+	isControl    bool
+	holdPreReady bool
+	pending      []byte
+	feedback     sudoPromptFeedback
+	writeErr     error
 }
 
-func newStreamScanner(state *sharedHandshakeState, dst io.Writer) *streamScanner {
+// newStreamScanner 构造单向输出流扫描器：
+//   - isControl=true 表示主控流（非 PTY 模式下为 stderr，PTY 模式下为合并的 stdout），持续扫描提示帧与就绪帧，
+//     在 EOF 时关闭 state.controlDone；
+//   - isControl=false 表示次流（非 PTY 模式下为 stdout，PTY 模式下为 stderr），在就绪前有界暂存字节
+//     并在达到 maxPreReadyHoldBytes 或 EOF 时等待主控流就绪/结束，形成单向无环因果序（次流 -> 主控流）。
+func newStreamScanner(state *sharedHandshakeState, dst io.Writer, isControl bool) *streamScanner {
 	if dst == nil {
 		dst = io.Discard
 	}
-	return &streamScanner{state: state, dst: dst}
+	return &streamScanner{
+		state:        state,
+		dst:          dst,
+		isControl:    isControl,
+		holdPreReady: !isControl,
+	}
 }
 
-func (sc *streamScanner) pump(src io.Reader) error {
+func (sc *streamScanner) pump(ctx context.Context, src io.Reader) error {
+	if sc.isControl {
+		defer sc.state.markControlDone()
+	}
 	buf := make([]byte, copyChunkBytes)
 	for {
 		n, rErr := src.Read(buf)
 		if n > 0 {
-			if err := sc.feed(buf[:n]); err != nil {
+			if err := sc.feed(ctx, buf[:n]); err != nil {
 				return err
 			}
 		}
 		if rErr != nil {
-			sc.flushTailOnEOF()
-			if sc.writeErr != nil {
-				return sc.writeErr
-			}
-			if rErr == io.EOF {
-				return nil
-			}
-			return rErr
+			return sc.finishPumpOnReadErr(ctx, rErr)
 		}
 	}
 }
 
-func (sc *streamScanner) feed(data []byte) error {
+func (sc *streamScanner) finishPumpOnReadErr(ctx context.Context, rErr error) error {
+	if err := sc.flushTailOnEOF(ctx); err != nil {
+		return err
+	}
+	if sc.writeErr != nil {
+		return sc.writeErr
+	}
+	if errors.Is(rErr, io.EOF) {
+		return nil
+	}
+	return rErr
+}
+
+func (sc *streamScanner) feed(ctx context.Context, data []byte) error {
 	if sc.state.readyFlag.Load() {
 		sc.flushPendingToDst()
 		sc.writeToDst(data)
 		return nil
 	}
 	sc.pending = append(sc.pending, data...)
-	return sc.scanPending()
+	return sc.scanPending(ctx)
 }
 
-func (sc *streamScanner) scanPending() error {
+func (sc *streamScanner) scanPending(ctx context.Context) error {
 	readyBytes := []byte(sc.state.tokens.ready)
 	for !sc.state.readyFlag.Load() {
 		sc.pending = sc.feedback.consume(sc.pending)
@@ -156,12 +189,23 @@ func (sc *streamScanner) scanPending() error {
 			}
 			continue
 		}
+		return sc.handleUnmatchedPending(ctx, needMore)
+	}
+	sc.flushPendingToDst()
+	return nil
+}
+
+func (sc *streamScanner) handleUnmatchedPending(ctx context.Context, needMore bool) error {
+	if !sc.holdPreReady {
 		if !needMore {
 			sc.trimSafeDiagPrefix()
 		}
 		return nil
 	}
-	return nil
+	if len(sc.pending) < maxPreReadyHoldBytes {
+		return nil
+	}
+	return sc.resolveHeldPreReady(ctx)
 }
 
 func (sc *streamScanner) handleMatchedPrompt(pStart, pEnd int) error {
@@ -187,16 +231,47 @@ func (sc *streamScanner) trimSafeDiagPrefix() {
 	sc.pending = sc.pending[cut:]
 }
 
-func (sc *streamScanner) flushTailOnEOF() {
+func (sc *streamScanner) flushTailOnEOF(ctx context.Context) error {
 	if len(sc.pending) == 0 {
-		return
+		return nil
 	}
 	if sc.state.readyFlag.Load() {
 		sc.flushPendingToDst()
-		return
+		return nil
+	}
+	if sc.holdPreReady {
+		return sc.resolveHeldPreReady(ctx)
 	}
 	sc.state.recordDiag(sc.pending)
 	sc.pending = nil
+	return nil
+}
+
+// resolveHeldPreReady 等待主控流观测到 readyTok 或到达 EOF，保证次流先于主控流抵达或先到 EOF 时零字节丢失；
+// 若主控流未就绪即结束，则将暂存数据转入诊断缓冲并退出暂存态，避免任何阻塞或泄漏。
+func (sc *streamScanner) resolveHeldPreReady(ctx context.Context) error {
+	if sc.state.readyFlag.Load() {
+		sc.flushPendingToDst()
+		return nil
+	}
+	select {
+	case <-sc.state.readyCh:
+		sc.flushPendingToDst()
+		return nil
+	case <-sc.state.controlDone:
+		if sc.state.readyFlag.Load() {
+			sc.flushPendingToDst()
+			return nil
+		}
+		sc.state.recordDiag(sc.pending)
+		sc.pending = nil
+		sc.holdPreReady = false
+		return nil
+	case <-ctx.Done():
+		sc.state.recordDiag(sc.pending)
+		sc.pending = nil
+		return ctx.Err()
+	}
 }
 
 func (sc *streamScanner) flushPendingToDst() {
