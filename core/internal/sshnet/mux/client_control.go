@@ -70,6 +70,11 @@ func sendForwardControl(conn *net.UnixConn, reqID uint32, req ports.MuxControlRe
 
 func parseForwardControlReply(respType uint32, respBody []byte, reqID uint32, isOpen bool) (string, error) {
 	if respType == muxstream.SOK {
+		rd := muxstream.NewReader(respBody)
+		gotID, err := rd.ReadUint32()
+		if err != nil || gotID != reqID {
+			return "", ports.ErrCorruptData
+		}
 		if isOpen {
 			return "forward", nil
 		}

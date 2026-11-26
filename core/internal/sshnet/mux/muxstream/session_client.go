@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/execution"
@@ -15,7 +16,7 @@ import (
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-// RemoteSession 通过独立帧流实现 ports.RemoteSession，严格保持管道互斥与零泄漏语义；零值恒失败关闭。
+// RemoteSession 通过独立帧流实现 ports.RemoteSession，严格保持管道互斥、缓冲解耦与零泄漏语义；零值恒失败关闭。
 //
 //xops:opaque
 //xops:failclosed
@@ -32,22 +33,31 @@ type RemoteSession struct {
 	starting       bool
 	stdinPipeW     *io.PipeWriter
 	stdinPipeR     *io.PipeReader
-	stdoutPipeW    *io.PipeWriter
-	stderrPipeW    *io.PipeWriter
+	stdoutPipe     *bufferedPipe
+	stderrPipe     *bufferedPipe
 	stdoutDst      io.Writer
 	stderrDst      io.Writer
 	maxOutputBytes uint64
 	outputUsed     atomic.Uint64
 	truncated      atomic.Bool
-	ctrlCh         chan error
-	outcomeCh      chan sessionWaitResult
-	readerDone     chan struct{}
-	stdinPumpDone  chan struct{}
-	started        atomic.Bool
-	closed         atomic.Bool
-	closeOnce      sync.Once
-	closeErr       error
-	valid          bool
+
+	outMu         sync.Mutex
+	discardOutput bool
+	ioErrMu       sync.Mutex
+	ioErr         error
+
+	ctrlMu      sync.Mutex
+	nextCtrlID  atomic.Uint32
+	pendingCtrl map[uint32]chan error
+
+	outcomeCh     chan sessionWaitResult
+	readerDone    chan struct{}
+	stdinPumpDone chan struct{}
+	started       atomic.Bool
+	closed        atomic.Bool
+	closeOnce     sync.Once
+	closeErr      error
+	valid         bool
 }
 
 type sessionWaitResult struct {
@@ -70,7 +80,7 @@ func NewRemoteSession(lifeNursery *conc.Nursery, isAlive func() bool, conn io.Re
 		isAlive:       isAlive,
 		conn:          conn,
 		fw:            NewSyncFrameWriter(conn),
-		ctrlCh:        make(chan error, 8),
+		pendingCtrl:   make(map[uint32]chan error),
 		outcomeCh:     make(chan sessionWaitResult, 1),
 		readerDone:    done,
 		stdinPumpDone: done,
@@ -98,17 +108,17 @@ func (s *RemoteSession) StdinPipe() (io.WriteCloser, error) {
 	return &idempotentPipeWriter{pw: pw}, nil
 }
 
-// StdoutPipe 在 Start/StartShell 前借出远端标准输出读取管道（与 ExecStreams.Stdout 互斥）。
+// StdoutPipe 在 Start/StartShell 前借出带独立缓冲的远端标准输出读取管道（与 ExecStreams.Stdout 互斥）。
 func (s *RemoteSession) StdoutPipe() (io.Reader, error) {
-	return s.claimOutputPipe(&s.stdoutTaken, &s.stdoutPipeW)
+	return s.claimOutputPipe(&s.stdoutTaken, &s.stdoutPipe)
 }
 
-// StderrPipe 在 Start/StartShell 前借出远端标准错误读取管道（与 ExecStreams.Stderr 互斥）。
+// StderrPipe 在 Start/StartShell 前借出带独立缓冲的远端标准错误读取管道（与 ExecStreams.Stderr 互斥）。
 func (s *RemoteSession) StderrPipe() (io.Reader, error) {
-	return s.claimOutputPipe(&s.stderrTaken, &s.stderrPipeW)
+	return s.claimOutputPipe(&s.stderrTaken, &s.stderrPipe)
 }
 
-func (s *RemoteSession) claimOutputPipe(taken *bool, dstW **io.PipeWriter) (io.Reader, error) {
+func (s *RemoteSession) claimOutputPipe(taken *bool, dstPipe **bufferedPipe) (io.Reader, error) {
 	if s == nil || !s.valid {
 		return nil, ports.ErrClosed
 	}
@@ -120,10 +130,10 @@ func (s *RemoteSession) claimOutputPipe(taken *bool, dstW **io.PipeWriter) (io.R
 	if s.starting || s.started.Load() || *taken {
 		return nil, ports.ErrInvalidArgument
 	}
-	pr, pw := io.Pipe()
+	bp := newBufferedPipe()
 	*taken = true
-	*dstW = pw
-	return pr, nil
+	*dstPipe = bp
+	return bp, nil
 }
 
 // Start 通过 ControlMaster 启动远端不可变 CommandPlan 执行。
@@ -183,12 +193,16 @@ func (s *RemoteSession) launch(ctx context.Context, msgType uint32, body []byte,
 		_ = s.Close()
 		return err
 	}
-	s.started.Store(true)
 	if err := s.startBackgroundPumps(stdinSrc, closeEmptyStdin); err != nil {
 		_ = s.Close()
 		return err
 	}
-	return ctx.Err()
+	s.started.Store(true)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = s.Close()
+		return ctxErr
+	}
+	return nil
 }
 
 func (s *RemoteSession) beginStart(streams ports.ExecStreams, maxBytes uint64, hasStdinSrc bool) error {
@@ -229,7 +243,7 @@ func checkStartedReply(respType uint32, respBody []byte) error {
 	return nil
 }
 
-// ResizePTY 向复用会话发送窗口尺寸更新请求。
+// ResizePTY 向已启动的复用会话发送带关联 reqID 的窗口尺寸更新请求。
 func (s *RemoteSession) ResizePTY(ctx context.Context, size ports.TerminalSize) error {
 	if err := s.checkControlActive(ctx); err != nil {
 		return err
@@ -237,11 +251,12 @@ func (s *RemoteSession) ResizePTY(ctx context.Context, size ports.TerminalSize) 
 	if !size.IsValid() {
 		return ports.ErrInvalidTTYSize
 	}
-	body := AppendU32(AppendU32(nil, uint32(size.Cols())), uint32(size.Rows()))
-	return s.sendSessionControl(ctx, SessMsgResizePTY, body)
+	reqID := s.nextCtrlID.Add(1)
+	body := AppendU32(AppendU32(AppendU32(nil, reqID), uint32(size.Cols())), uint32(size.Rows()))
+	return s.sendSessionControl(ctx, reqID, SessMsgResizePTY, body)
 }
 
-// Signal 向复用会话发送规范化 POSIX 信号。
+// Signal 向已启动的复用会话发送带关联 reqID 的规范化 POSIX 信号。
 func (s *RemoteSession) Signal(ctx context.Context, signal string) error {
 	if err := s.checkControlActive(ctx); err != nil {
 		return err
@@ -250,7 +265,8 @@ func (s *RemoteSession) Signal(ctx context.Context, signal string) error {
 	if norm == "" {
 		return ports.ErrInvalidArgument
 	}
-	return s.sendSessionControl(ctx, SessMsgSignal, AppendStr(nil, norm))
+	reqID := s.nextCtrlID.Add(1)
+	return s.sendSessionControl(ctx, reqID, SessMsgSignal, AppendStr(AppendU32(nil, reqID), norm))
 }
 
 func (s *RemoteSession) checkControlActive(ctx context.Context) error {
@@ -263,16 +279,25 @@ func (s *RemoteSession) checkControlActive(ctx context.Context) error {
 	if s == nil || !s.valid || s.closed.Load() || !s.isAlive() {
 		return ports.ErrClosed
 	}
+	if !s.started.Load() {
+		return ports.ErrInvalidArgument
+	}
 	return nil
 }
 
-func (s *RemoteSession) sendSessionControl(ctx context.Context, msgType uint32, body []byte) error {
+func (s *RemoteSession) sendSessionControl(ctx context.Context, reqID, msgType uint32, body []byte) error {
+	ch, err := s.registerCtrlPending(reqID)
+	if err != nil {
+		return err
+	}
+	defer s.unregisterCtrlPending(reqID)
+
 	if err := s.fw.Write(msgType, body); err != nil {
 		return err
 	}
 	select {
-	case err := <-s.ctrlCh:
-		return err
+	case repErr := <-ch:
+		return repErr
 	case <-s.currentReaderDone():
 		return ports.ErrClosed
 	case <-ctx.Done():
@@ -281,6 +306,8 @@ func (s *RemoteSession) sendSessionControl(ctx context.Context, msgType uint32, 
 }
 
 // Wait 等待远端复用会话退出并返回完整封闭 execution.ExecutionOutcome。
+// 当 ctx 取消或超时时立即停用本地输出写入、关闭管道与底层连接，O(1) 返回 (OutcomeUnknown, ctx.Err())，
+// 绝不因调用方阻塞态 ExecStreams.Stdin 挂死。
 func (s *RemoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome, error) {
 	if ctx == nil {
 		return nil, ports.ErrNilContext
@@ -293,9 +320,14 @@ func (s *RemoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome, e
 	}
 	select {
 	case res := <-s.outcomeCh:
+		if res.err == nil {
+			if ioErr := s.firstIOErr(); ioErr != nil {
+				return res.outcome, ioErr
+			}
+		}
 		return res.outcome, res.err
 	case <-ctx.Done():
-		_ = s.Close()
+		s.abortWaitOnCancel()
 		phase := execution.ExecPhaseCanceled
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			phase = execution.ExecPhaseTimedOut
@@ -305,31 +337,74 @@ func (s *RemoteSession) Wait(ctx context.Context) (execution.ExecutionOutcome, e
 	}
 }
 
-// Close 幂等关闭复用会话管道与底层连接并等待全部后台读写泵退出（零泄漏）。
+type writeDeadliner interface {
+	SetWriteDeadline(time.Time) error
+}
+
+// sendBestEffortCloseFrame 仅在会话已启动后以极短写截止时间尽力发送 SessMsgClose，
+// 防止对端黑洞、未读管道或满发送缓冲导致 abortWaitOnCancel / Close 阻塞。
+func (s *RemoteSession) sendBestEffortCloseFrame() {
+	if !s.started.Load() {
+		return
+	}
+	if wd, ok := s.conn.(writeDeadliner); ok {
+		_ = wd.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+	}
+	_ = s.fw.Write(SessMsgClose, nil)
+}
+
+// abortWaitOnCancel 对齐 dial/remotesess：取消 Wait 时立即停用输出缓冲与管道并断开底层帧流，
+// 绝不在外部调用方拥有的 ExecStreams.Stdin 读泵上无界等待。
+func (s *RemoteSession) abortWaitOnCancel() {
+	s.markDiscardOutput()
+	s.failAllCtrlPending(ports.ErrClosed)
+	s.mu.Lock()
+	inW, inR := s.stdinPipeW, s.stdinPipeR
+	s.mu.Unlock()
+	if inW != nil {
+		_ = inW.Close()
+	}
+	if inR != nil {
+		_ = inR.Close()
+	}
+	s.closeOutputPipesAbort()
+	s.sendBestEffortCloseFrame()
+	_ = s.conn.Close()
+}
+
+// Close 幂等关闭复用会话管道与底层连接并在有界宽限内收敛后台读泵（零泄漏、对阻塞态外部 Stdin 有界解阻）。
 func (s *RemoteSession) Close() error {
 	if s == nil || !s.valid {
 		return nil
 	}
 	s.closeOnce.Do(func() {
-		s.closed.Store(true)
-		_ = s.fw.Write(SessMsgClose, nil)
 		s.mu.Lock()
+		s.closed.Store(true)
+		inTaken := s.stdinTaken
 		inW, inR := s.stdinPipeW, s.stdinPipeR
 		rDone, inDone := s.readerDone, s.stdinPumpDone
 		s.mu.Unlock()
+
+		s.markDiscardOutput()
+		s.failAllCtrlPending(ports.ErrClosed)
+		s.sendBestEffortCloseFrame()
 		if inW != nil {
 			_ = inW.Close()
 		}
 		if inR != nil {
 			_ = inR.Close()
 		}
-		s.closeOutputPipes()
+		s.closeOutputPipesAbort()
 		cErr := s.conn.Close()
 		if IsBenignIOErr(cErr) {
 			cErr = nil
 		}
 		<-rDone
-		<-inDone
+		if inTaken {
+			<-inDone
+		} else {
+			chanconn.WaitBounded(inDone, chanconn.CloseGraceTimeout)
+		}
 		s.closeErr = cErr
 	})
 	return s.closeErr

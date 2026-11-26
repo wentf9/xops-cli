@@ -42,7 +42,7 @@ type Config struct {
 	KeepStaleSocket bool
 	// HandshakeTimeout 限制单次控制面握手与探活超时（默认 5s）。
 	HandshakeTimeout time.Duration
-	// Clock 可选注入时钟端口用于计算握手截止时间（为空时回退系统时间）。
+	// Clock 保留用于配置注入兼容；真实 OS 套接字 SetDeadline 严格使用系统墙钟避免虚拟时钟触发虚假超时。
 	Clock ports.Clock
 	// SelfPID 可选覆写 Serve 响应 MUX_S_ALIVE 时通告的主进程 PID（为 0 时使用 os.Getpid()）。
 	SelfPID uint32
@@ -59,7 +59,6 @@ type Config struct {
 type MuxSocket struct {
 	keepStale        bool
 	handshakeTimeout time.Duration
-	clock            ports.Clock
 	selfPID          uint32
 	onActivity       func()
 	proxyHandler     ProxyHandler
@@ -79,7 +78,6 @@ func NewMuxSocket(cfg Config) *MuxSocket {
 	return &MuxSocket{
 		keepStale:        cfg.KeepStaleSocket,
 		handshakeTimeout: timeout,
-		clock:            cfg.Clock,
 		selfPID:          pid,
 		onActivity:       cfg.OnActivity,
 		proxyHandler:     cfg.ProxyHandler,
@@ -100,15 +98,9 @@ func (m *MuxSocket) checkReady(ctx context.Context) error {
 	return nil
 }
 
-func (m *MuxSocket) now() time.Time {
-	if m.clock != nil {
-		return m.clock.Now()
-	}
-	return time.Now()
-}
-
 func (m *MuxSocket) handshakeDeadline(ctx context.Context) time.Time {
-	dl := m.now().Add(m.handshakeTimeout)
+	// net.Conn.SetDeadline 由 OS 内核按真实墙钟解释，绝不使用虚拟时钟偏移。
+	dl := time.Now().Add(m.handshakeTimeout)
 	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(dl) {
 		return ctxDL
 	}

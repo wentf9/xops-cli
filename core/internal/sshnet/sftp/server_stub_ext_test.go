@@ -92,26 +92,31 @@ type memSFTPHandle struct {
 }
 
 type stubSFTPServerOpts struct {
-	emitDevIno      bool
-	disablePosix    bool
-	disableHardlnk  bool
-	disableLimits   bool
-	blackholeAfter  int
-	growOnSecondRd  bool
-	swapTargetOnTmp string
+	emitDevIno              bool
+	disablePosix            bool
+	disableHardlnk          bool
+	disableLimits           bool
+	blackholeAfter          int
+	growOnSecondRd          bool
+	swapTargetOnTmp         string
+	protoVersion            uint32
+	failHardlinkUnsupported bool
+	emptyReadDirOnce        bool
+	oversizedRead           bool
 }
 
 // stubSFTPServer 实现进程内纯内存 POSIX SFTP v3 服务端桩，用于完整验证线缆协议、FSTAT 锚定、
 // 原子重命名、扩展协商与黑洞取消场景（0 外部二进制依赖、0 path/filepath 依赖）。
 type stubSFTPServer struct {
-	opts    stubSFTPServerOpts
-	mu      sync.Mutex
-	nextIno uint64
-	nextHnd uint64
-	nodes   map[string]*memSFTPNode
-	handles map[string]*memSFTPHandle
-	reqSeen int
-	truncOp bool
+	opts      stubSFTPServerOpts
+	mu        sync.Mutex
+	nextIno   uint64
+	nextHnd   uint64
+	nodes     map[string]*memSFTPNode
+	handles   map[string]*memSFTPHandle
+	reqSeen   int
+	truncOp   bool
+	openPaths []string
 }
 
 func newStubSFTPServer(opts stubSFTPServerOpts) *stubSFTPServer {
@@ -145,6 +150,23 @@ func (s *stubSFTPServer) putRegularFile(filePath string, content []byte) {
 		kind: ports.RemoteFileRegular, perm: 0o100644, data: append([]byte(nil), content...),
 		atime: now, mtime: now, dev: 7, ino: s.nextIno,
 	}
+}
+
+func (s *stubSFTPServer) putFIFO(fifoPath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextIno++
+	now := uint32(time.Date(2026, time.May, 1, 12, 0, 0, 0, time.UTC).Unix())
+	s.nodes[path.Clean(fifoPath)] = &memSFTPNode{
+		kind: ports.RemoteFileOther, perm: 0o010600,
+		atime: now, mtime: now, dev: 7, ino: s.nextIno,
+	}
+}
+
+func (s *stubSFTPServer) openedPath(target string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Contains(s.openPaths, path.Clean(target))
 }
 
 func (s *stubSFTPServer) sawTruncOpen() bool {
@@ -188,8 +210,12 @@ func (s *stubSFTPServer) serve(rw io.ReadWriteCloser) {
 }
 
 func (s *stubSFTPServer) writeVersion(w io.Writer) error {
+	ver := s.opts.protoVersion
+	if ver == 0 {
+		ver = 3
+	}
 	var b []byte
-	b = binary.BigEndian.AppendUint32(b, 3)
+	b = binary.BigEndian.AppendUint32(b, ver)
 	if !s.opts.disablePosix {
 		b = appendTestStr(appendTestStr(b, "posix-rename@openssh.com"), "1")
 	}
@@ -346,6 +372,11 @@ func (s *stubSFTPServer) handleReaddir(reqID uint32, body []byte) (byte, []byte)
 	if h.dirRead {
 		return buildStatusPkt(reqID, fxEOF, "eof")
 	}
+	if s.opts.emptyReadDirOnce {
+		out := binary.BigEndian.AppendUint32(nil, reqID)
+		out = binary.BigEndian.AppendUint32(out, 0)
+		return fxpName, out
+	}
 	h.dirRead = true
 	var names []string
 	for k := range s.nodes {
@@ -380,6 +411,7 @@ func (s *stubSFTPServer) handleOpen(reqID uint32, body []byte) (byte, []byte) {
 	}
 	perm := parseTestPermAttr(rest[4:], 0o644)
 	clean := path.Clean("/" + strings.TrimPrefix(p, "/"))
+	s.openPaths = append(s.openPaths, clean)
 	parent := path.Dir(clean)
 	if pnd := s.nodes[parent]; pnd == nil || pnd.kind != ports.RemoteFileDir {
 		return buildStatusPkt(reqID, fxNoSuchFile, "parent missing")
@@ -449,8 +481,12 @@ func (s *stubSFTPServer) handleRead(reqID uint32, body []byte) (byte, []byte) {
 		return buildStatusPkt(reqID, fxEOF, "eof")
 	}
 	end := min(off+uint64(ln), uint64(len(h.node.data)))
+	chunk := h.node.data[off:end]
+	if s.opts.oversizedRead {
+		chunk = bytes.Repeat([]byte("Z"), int(ln)+8)
+	}
 	out := binary.BigEndian.AppendUint32(nil, reqID)
-	out = appendTestBytes(out, h.node.data[off:end])
+	out = appendTestBytes(out, chunk)
 	return fxpData, out
 }
 
@@ -595,6 +631,9 @@ func (s *stubSFTPServer) handleExtended(reqID uint32, body []byte) (byte, []byte
 	case "posix-rename@openssh.com":
 		return s.handleRename(reqID, rest, true)
 	case "hardlink@openssh.com":
+		if s.opts.failHardlinkUnsupported {
+			return buildStatusPkt(reqID, fxUnsupported, "link unsupported on mount")
+		}
 		oldRaw, r2, ok1 := readTestStr(rest)
 		newRaw, _, ok2 := readTestStr(r2)
 		if !ok1 || !ok2 {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -131,7 +133,9 @@ func (c *MuxTransportConn) dialXOpsStream(ctx context.Context, msgType uint32, b
 	}
 	conn, _, err := c.mux.dialVerified(ctx, c.ctrlPath)
 	if err != nil {
-		c.alive.Store(false)
+		if ctx.Err() == nil {
+			c.alive.Store(false)
+		}
 		return nil, err
 	}
 	if err := chanconn.RunWithAbortWatchdog(ctx, func() { _ = conn.Close() }, func() error {
@@ -154,7 +158,9 @@ func (c *MuxTransportConn) SendKeepalive(ctx context.Context) error {
 	}
 	conn, _, err := c.mux.dialVerified(ctx, c.ctrlPath)
 	if err != nil {
-		c.alive.Store(false)
+		if ctx.Err() == nil {
+			c.alive.Store(false)
+		}
 		return err
 	}
 	defer func() { _ = conn.Close() }()
@@ -166,7 +172,9 @@ func (c *MuxTransportConn) SendKeepalive(ctx context.Context) error {
 		return aErr
 	})
 	if err != nil {
-		c.alive.Store(false)
+		if ctx.Err() == nil {
+			c.alive.Store(false)
+		}
 		return err
 	}
 	return nil
@@ -223,10 +231,26 @@ func (c *MuxTransportConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.
 
 // ListenTCP 经 ControlMaster 在远端 SSH 服务端发起 tcpip-forward 监听并返回多路复用 net.Listener。
 func (c *MuxTransportConn) ListenTCP(ctx context.Context, bindAddr string) (net.Listener, error) {
-	if bindAddr == "" {
-		return nil, fmt.Errorf("%w: bindAddr 不能为空", ports.ErrInvalidArgument)
+	if err := validateMuxListenTCPAddr(bindAddr); err != nil {
+		return nil, err
 	}
 	return c.openRemoteMuxListener(ctx, muxstream.XOpsCListenTCP, "tcp", bindAddr)
+}
+
+func validateMuxListenTCPAddr(bindAddr string) error {
+	host, portStr, err := net.SplitHostPort(bindAddr)
+	if err != nil || portStr == "" || strings.HasPrefix(portStr, "+") || strings.HasPrefix(portStr, "-") {
+		return fmt.Errorf("%w: 非法 ListenTCP 绑定地址 %q", ports.ErrInvalidArgument, bindAddr)
+	}
+	if _, err := strconv.ParseUint(portStr, 10, 16); err != nil {
+		return fmt.Errorf("%w: 非法 ListenTCP 绑定端口 %q", ports.ErrInvalidArgument, portStr)
+	}
+	if host != "" && host != "*" {
+		if _, err := netaddr.ParseCanonicalHost(host); err != nil {
+			return fmt.Errorf("%w: 非法 ListenTCP 绑定主机 %q: %w", ports.ErrInvalidArgument, host, err)
+		}
+	}
+	return nil
 }
 
 // ListenStreamLocal 经 ControlMaster 在远端发起 streamlocal-forward@openssh.com 监听并返回 net.Listener。
@@ -246,7 +270,9 @@ func (c *MuxTransportConn) openRemoteMuxListener(ctx context.Context, msgType ui
 	}
 	conn, _, err := c.mux.dialVerified(ctx, c.ctrlPath)
 	if err != nil {
-		c.alive.Store(false)
+		if ctx.Err() == nil {
+			c.alive.Store(false)
+		}
 		return nil, err
 	}
 	var boundAddr string

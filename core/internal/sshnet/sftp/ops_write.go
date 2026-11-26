@@ -60,8 +60,9 @@ func (c *Client) verifyWritePreconditions(ctx context.Context, p pathalg.RemoteP
 	return nil
 }
 
-// verifyRemoteAnchorByFstat 以严格非截断只读模式打开目标并执行 SSH_FXP_FSTAT 校验锚点（ADR-016）。
-// 若目标不是可打开常规文件（例如符号链接），则结合 Lstat 锚点校验并在任何不匹配或缺失时失败关闭。
+// verifyRemoteAnchorByFstat 对常规文件以严格非截断只读模式打开并执行 SSH_FXP_FSTAT 校验锚点（ADR-016）；
+// 对任何非常规对象（符号链接、目录、FIFO/设备/套接字）直接基于 Lstat 锚点比对，
+// 绝不向 FIFO 发起 SSH_FXP_OPEN(O_RDONLY)（防阻塞单线程 sftp-server），且在目录不匹配时精确返回 ErrRemoteAnchorMismatch。
 func (c *Client) verifyRemoteAnchorByFstat(ctx context.Context, p pathalg.RemotePath, expected ports.RemoteFileAnchor) error {
 	lstat, lErr := c.Lstat(ctx, p)
 	if errors.Is(lErr, ports.ErrNotFound) {
@@ -70,7 +71,7 @@ func (c *Client) verifyRemoteAnchorByFstat(ctx context.Context, p pathalg.Remote
 	if lErr != nil {
 		return lErr
 	}
-	if lstat.IsSymlink() {
+	if !lstat.IsRegular() {
 		if expected.Matches(lstat.Anchor()) {
 			return nil
 		}
@@ -182,14 +183,9 @@ func (c *Client) commitStagedFile(ctx context.Context, tmpPath, destPath pathalg
 
 func (c *Client) commitNoClobber(ctx context.Context, src, dst pathalg.RemotePath) error {
 	if c.hasHardlink {
-		body := appendString(appendString(appendString(nil, extHardlink), src.String()), dst.String())
-		if err := c.expectStatusOK(ctx, sshFXPExtended, body); err != nil {
-			if _, lErr := c.Lstat(ctx, dst); lErr == nil {
-				return ports.ErrAlreadyExists
-			}
+		if handled, err := c.tryHardlinkNoClobber(ctx, src, dst); handled {
 			return err
 		}
-		return c.removeQuiet(ctx, src)
 	}
 	if _, err := c.Lstat(ctx, dst); err == nil {
 		return ports.ErrAlreadyExists
@@ -204,6 +200,23 @@ func (c *Client) commitNoClobber(ctx context.Context, src, dst pathalg.RemotePat
 		return err
 	}
 	return nil
+}
+
+// tryHardlinkNoClobber 优先通过内核原子 hardlink@openssh.com 完成 NoClobber 提交；
+// 当底层挂载点（如 FUSE/VFAT/NFS）拒绝 link(2) 返回 OP_UNSUPPORTED/FAILURE 且目标确证不存在时，
+// 返回 handled=false 交由上层平滑回退至 SFTP v3 非覆写 SSH_FXP_RENAME。
+func (c *Client) tryHardlinkNoClobber(ctx context.Context, src, dst pathalg.RemotePath) (bool, error) {
+	body := appendString(appendString(appendString(nil, extHardlink), src.String()), dst.String())
+	err := c.expectStatusOK(ctx, sshFXPExtended, body)
+	if err == nil {
+		return true, c.removeQuiet(ctx, src)
+	}
+	if _, lErr := c.Lstat(ctx, dst); lErr == nil {
+		return true, ports.ErrAlreadyExists
+	} else if errors.Is(lErr, ports.ErrNotFound) && (isStatusCode(err, sshFXOpUnsupported) || isStatusCode(err, sshFXFailure)) {
+		return false, nil
+	}
+	return true, err
 }
 
 func (c *Client) atomicRenameOverwrite(ctx context.Context, src, dst pathalg.RemotePath) error {
@@ -224,12 +237,19 @@ func (c *Client) atomicRenameOverwrite(ctx context.Context, src, dst pathalg.Rem
 }
 
 // WriteChunk 向远端常规文件 p 的 offset 处严格非截断写入 length 字节（绝不使用 SSH_FXF_TRUNC）。
+// 打开前强制通过 Lstat 拒绝根目录、目录、符号链接（ADR-016）与 FIFO/设备，并在打开后以 FSTAT 二次核验。
 func (c *Client) WriteChunk(ctx context.Context, p pathalg.RemotePath, offset int64, r io.Reader, length int64) error {
 	if err := c.checkPathOp(ctx, p); err != nil {
 		return err
 	}
 	if offset < 0 || length < 0 || r == nil {
 		return fmt.Errorf("%w: WriteChunk 参数非法", ports.ErrInvalidArgument)
+	}
+	if p.IsRoot() {
+		return ports.ErrRemoteIsDir
+	}
+	if err := c.verifyWriteChunkTarget(ctx, p); err != nil {
+		return err
 	}
 	openAttrs := wireAttrs{flags: attrFlagPermissions, perm: 0o600}
 	handle, err := c.openHandle(ctx, p.String(), sshFXFWrite|sshFXFCreat, openAttrs)
@@ -242,6 +262,26 @@ func (c *Client) WriteChunk(ctx context.Context, p pathalg.RemotePath, offset in
 		return err
 	}
 	return c.streamWriteChunk(ctx, handle, uint64(offset), r, length)
+}
+
+func (c *Client) verifyWriteChunkTarget(ctx context.Context, p pathalg.RemotePath) error {
+	st, err := c.Lstat(ctx, p)
+	if errors.Is(err, ports.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if st.IsDir() {
+		return ports.ErrRemoteIsDir
+	}
+	if st.IsSymlink() {
+		return ports.ErrSymlinkRejected
+	}
+	if !st.IsRegular() {
+		return ports.ErrNotRegularFile
+	}
+	return nil
 }
 
 func (c *Client) streamWriteChunk(ctx context.Context, handle []byte, off uint64, r io.Reader, length int64) error {

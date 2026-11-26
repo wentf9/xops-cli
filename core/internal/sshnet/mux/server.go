@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,16 +21,29 @@ type waitDoneProvider interface {
 	WaitDone() <-chan struct{}
 }
 
-// muxServerState 维护单个 ControlMaster 监听生命周期内的动态转发注册表与优雅停机信号。
+type forwardEntry struct {
+	origKey string
+	handle  ports.ForwardHandle
+}
+
+// muxServerState 维护单个 ControlMaster 监听生命周期内的动态转发注册表与停机控制信号：
+//   - CTerminate (-O exit): 立即关闭转发并取消全部活跃会话与监听；
+//   - CStopListening (-O stop): 仅停止接受新连接，允许已在途的复用会话与流平滑排空完成后自然退出。
 type muxServerState struct {
 	owner            *MuxSocket
 	upstream         ports.TransportConn
 	forwarder        ports.ForwarderPort
 	cancelServe      context.CancelFunc
+	stopListenOnce   sync.Once
+	stopListenCh     chan struct{}
 	stoppedByControl atomic.Bool
 
 	fwdMu    sync.Mutex
-	forwards map[string]ports.ForwardHandle
+	forwards map[string]forwardEntry
+}
+
+func (st *muxServerState) triggerStopListening() {
+	st.stopListenOnce.Do(func() { close(st.stopListenCh) })
 }
 
 // Serve 在借用的 net.Listener（须经参数级 //xops:borrowed 确保零逃逸）上运行 OpenSSH PROTOCOL.mux v4
@@ -54,21 +68,28 @@ func (m *MuxSocket) Serve(
 	defer cancelServe()
 
 	st := &muxServerState{
-		owner:       m,
-		upstream:    upstream,
-		forwarder:   forwarder,
-		cancelServe: cancelServe,
-		forwards:    make(map[string]ports.ForwardHandle),
+		owner:        m,
+		upstream:     upstream,
+		forwarder:    forwarder,
+		cancelServe:  cancelServe,
+		stopListenCh: make(chan struct{}),
+		forwards:     make(map[string]forwardEntry),
 	}
 	defer st.closeAllForwards()
 
 	runErr := conc.RunWait(serveCtx, func(wCtx context.Context, n *conc.Nursery) error {
-		defer n.Cancel(ports.ErrClosed)
-		if err := spawnUpstreamWatcher(wCtx, n, upstream, cancelServe); err != nil {
+		watcherStop := make(chan struct{})
+		defer close(watcherStop)
+		if err := spawnUpstreamWatcher(wCtx, n, upstream, watcherStop, cancelServe); err != nil {
 			return err
 		}
-		return chanconn.RunWithAbortWatchdog(wCtx, func() { _ = ln.Close() }, func() error {
-			return st.acceptLoop(wCtx, n, ln)
+		acceptCtx, cancelAccept := context.WithCancel(wCtx)
+		defer cancelAccept()
+		if err := spawnStopListenWatcher(n, st.stopListenCh, watcherStop, cancelAccept); err != nil {
+			return err
+		}
+		return chanconn.RunWithAbortWatchdog(acceptCtx, func() { _ = ln.Close() }, func() error {
+			return st.acceptLoop(acceptCtx, n, ln)
 		})
 	})
 	if st.stoppedByControl.Load() && ctx.Err() == nil {
@@ -80,7 +101,7 @@ func (m *MuxSocket) Serve(
 	return runErr
 }
 
-func spawnUpstreamWatcher(ctx context.Context, n *conc.Nursery, upstream ports.TransportConn, cancelServe context.CancelFunc) error {
+func spawnUpstreamWatcher(ctx context.Context, n *conc.Nursery, upstream ports.TransportConn, watcherStop <-chan struct{}, cancelServe context.CancelFunc) error {
 	wp, ok := upstream.(waitDoneProvider)
 	if !ok {
 		return nil
@@ -90,8 +111,21 @@ func spawnUpstreamWatcher(ctx context.Context, n *conc.Nursery, upstream ports.T
 		select {
 		case <-done:
 			cancelServe()
+		case <-watcherStop:
 		case <-wCtx.Done():
 		case <-ctx.Done():
+		}
+		return nil
+	})
+}
+
+func spawnStopListenWatcher(n *conc.Nursery, stopListenCh, watcherStop <-chan struct{}, cancelAccept context.CancelFunc) error {
+	return n.Go(func(c context.Context) error {
+		select {
+		case <-stopListenCh:
+			cancelAccept()
+		case <-watcherStop:
+		case <-c.Done():
 		}
 		return nil
 	})
@@ -167,8 +201,11 @@ func (st *muxServerState) dispatchPacket(ctx context.Context, conn net.Conn, msg
 	case muxstream.CAliveCheck:
 		st.handleAliveCheck(conn, body)
 		return false, nil
-	case muxstream.CTerminate, muxstream.CStopListening:
-		st.handleStopControl(conn, body)
+	case muxstream.CTerminate:
+		st.handleTerminateControl(conn, body)
+		return true, nil
+	case muxstream.CStopListening:
+		st.handleStopListeningControl(conn, body)
 		return true, nil
 	case muxstream.COpenFwd:
 		st.handleOpenFwd(ctx, conn, body, false)
@@ -204,7 +241,7 @@ func (st *muxServerState) handleAliveCheck(conn net.Conn, body []byte) {
 	_ = muxstream.WritePacket(conn, muxstream.SAlive, resp)
 }
 
-func (st *muxServerState) handleStopControl(conn net.Conn, body []byte) {
+func (st *muxServerState) handleTerminateControl(conn net.Conn, body []byte) {
 	rd := muxstream.NewReader(body)
 	reqID, err := rd.ReadUint32()
 	if err != nil {
@@ -218,6 +255,19 @@ func (st *muxServerState) handleStopControl(conn net.Conn, body []byte) {
 	st.cancelServe()
 }
 
+func (st *muxServerState) handleStopListeningControl(conn net.Conn, body []byte) {
+	rd := muxstream.NewReader(body)
+	reqID, err := rd.ReadUint32()
+	if err != nil {
+		return
+	}
+	st.stoppedByControl.Store(true)
+	_ = muxstream.WriteStatusReply(conn, muxstream.SOK, reqID, "")
+	muxstream.GracefulHalfClose(conn, muxstream.DefaultHalfCloseDrainTimeout)
+	// 仅关闭监听套接字停止接收新连接，保留现有在途会话平滑排空完成后退出。
+	st.triggerStopListening()
+}
+
 func (st *muxServerState) handleOpenFwd(ctx context.Context, conn net.Conn, body []byte, isTUN bool) {
 	reqID, spec, err := decodeFwdPayload(body, isTUN)
 	if err != nil {
@@ -228,8 +278,8 @@ func (st *muxServerState) handleOpenFwd(ctx context.Context, conn net.Conn, body
 		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, "forwarder unavailable")
 		return
 	}
-	key := forwardSpecKey(spec)
-	if st.hasForward(key) {
+	origKey := forwardSpecKey(spec)
+	if !isEphemeralTCPBind(spec) && st.hasLiveForward(origKey) {
 		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, "forward already exists")
 		return
 	}
@@ -238,7 +288,8 @@ func (st *muxServerState) handleOpenFwd(ctx context.Context, conn net.Conn, body
 		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, fErr.Error())
 		return
 	}
-	if !st.storeForward(key, handle) {
+	effKey := effectiveForwardKey(spec, handle.BoundAddr())
+	if !st.storeForward(effKey, origKey, handle) {
 		_ = handle.Close()
 		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, "forward already exists")
 		return
@@ -272,7 +323,7 @@ func (st *muxServerState) handleCloseFwd(conn net.Conn, body []byte, isTUN bool)
 		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
 		return
 	}
-	h := st.takeForward(forwardSpecKey(spec))
+	h := st.takeForward(forwardSpecKey(spec), isEphemeralTCPBind(spec))
 	if h == nil {
 		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, "forward not found")
 		return
@@ -302,36 +353,60 @@ func (st *muxServerState) handleProxyMode(ctx context.Context, conn net.Conn, bo
 	_, _ = io.Copy(io.Discard, conn)
 }
 
-func (st *muxServerState) hasForward(key string) bool {
+func (st *muxServerState) pruneDeadForwardsLocked() {
+	for k, entry := range st.forwards {
+		if entry.handle == nil || !entry.handle.IsValid() {
+			delete(st.forwards, k)
+		}
+	}
+}
+
+func (st *muxServerState) hasLiveForward(key string) bool {
 	st.fwdMu.Lock()
+	defer st.fwdMu.Unlock()
+	st.pruneDeadForwardsLocked()
 	_, ok := st.forwards[key]
-	st.fwdMu.Unlock()
 	return ok
 }
 
-func (st *muxServerState) storeForward(key string, h ports.ForwardHandle) bool {
+func (st *muxServerState) storeForward(effKey, origKey string, h ports.ForwardHandle) bool {
 	st.fwdMu.Lock()
 	defer st.fwdMu.Unlock()
-	if st.forwards == nil || st.forwards[key] != nil {
+	if st.forwards == nil {
 		return false
 	}
-	st.forwards[key] = h
+	st.pruneDeadForwardsLocked()
+	if _, exists := st.forwards[effKey]; exists {
+		return false
+	}
+	st.forwards[effKey] = forwardEntry{origKey: origKey, handle: h}
 	return true
 }
 
-func (st *muxServerState) takeForward(key string) ports.ForwardHandle {
+func (st *muxServerState) takeForward(reqKey string, allowOrigMatch bool) ports.ForwardHandle {
 	st.fwdMu.Lock()
 	defer st.fwdMu.Unlock()
-	h := st.forwards[key]
-	delete(st.forwards, key)
-	return h
+	st.pruneDeadForwardsLocked()
+	if e, ok := st.forwards[reqKey]; ok {
+		delete(st.forwards, reqKey)
+		return e.handle
+	}
+	if allowOrigMatch {
+		for k, e := range st.forwards {
+			if e.origKey == reqKey {
+				delete(st.forwards, k)
+				return e.handle
+			}
+		}
+	}
+	return nil
 }
 
 func (st *muxServerState) closeAllForwards() {
 	st.fwdMu.Lock()
 	list := make([]ports.ForwardHandle, 0, len(st.forwards))
-	for k, h := range st.forwards {
-		list = append(list, h)
+	for k, e := range st.forwards {
+		list = append(list, e.handle)
 		delete(st.forwards, k)
 	}
 	st.fwdMu.Unlock()
@@ -344,4 +419,18 @@ func (st *muxServerState) closeAllForwards() {
 
 func forwardSpecKey(s ports.ForwardSpec) string {
 	return s.Direction().String() + ":" + s.BindKind().String() + ":" + s.BindAddr() + "->" + s.TargetKind().String() + ":" + s.TargetAddr()
+}
+
+func isEphemeralTCPBind(s ports.ForwardSpec) bool {
+	return s.Direction() != ports.ForwardTUN &&
+		s.BindKind() == ports.ForwardEndpointTCP &&
+		strings.HasSuffix(s.BindAddr(), ":0")
+}
+
+func effectiveForwardKey(s ports.ForwardSpec, boundAddr string) string {
+	bindAddr := s.BindAddr()
+	if isEphemeralTCPBind(s) && boundAddr != "" {
+		bindAddr = boundAddr
+	}
+	return s.Direction().String() + ":" + s.BindKind().String() + ":" + bindAddr + "->" + s.TargetKind().String() + ":" + s.TargetAddr()
 }

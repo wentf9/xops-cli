@@ -3,6 +3,7 @@ package mux
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"time"
 
@@ -88,6 +89,10 @@ func (st *muxServerState) handleDialTCP(ctx context.Context, conn net.Conn, body
 		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
+	if port == 0 || port > math.MaxUint16 {
+		replyStreamFailure(conn, reqID, fmt.Sprintf("tcp port out of range: %d", port))
+		return
+	}
 	ch, err := netaddr.ParseCanonicalHost(host)
 	if err != nil {
 		replyStreamFailure(conn, reqID, err.Error())
@@ -167,7 +172,7 @@ func (st *muxServerState) handleOpenTUN(ctx context.Context, conn net.Conn, body
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})
-	_ = muxstream.SpliceStreams(ctx, conn, remote)
+	_ = muxstream.SpliceStreamsStrict(ctx, conn, remote)
 }
 
 func (st *muxServerState) handleOpenSession(ctx context.Context, conn net.Conn, body []byte) {

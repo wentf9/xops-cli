@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strconv"
 
@@ -328,12 +329,18 @@ func DecodeForwardWire(body []byte) (uint32, ports.ForwardSpec, error) {
 	if err != nil {
 		return reqID, ZeroVal[ports.ForwardSpec](), err
 	}
-	bindKind, bindAddr := decodeEndpointHostPort(lHost, lPort)
+	bindKind, bindAddr, err := decodeEndpointHostPort(lHost, lPort)
+	if err != nil {
+		return reqID, ZeroVal[ports.ForwardSpec](), err
+	}
 	if dir == ports.ForwardDynamic {
 		sp, err := ports.NewForwardSpec(ports.ForwardDynamic, bindAddr, "")
 		return reqID, sp, err
 	}
-	targetKind, targetAddr := decodeEndpointHostPort(cHost, cPort)
+	targetKind, targetAddr, err := decodeEndpointHostPort(cHost, cPort)
+	if err != nil {
+		return reqID, ZeroVal[ports.ForwardSpec](), err
+	}
 	sp, err := ports.NewTypedForwardSpec(dir, bindKind, bindAddr, targetKind, targetAddr)
 	return reqID, sp, err
 }
@@ -413,11 +420,14 @@ func encodeEndpointHostPort(kind ports.ForwardEndpointKind, addr string) (string
 	return host, uint32(p), nil
 }
 
-func decodeEndpointHostPort(host string, port uint32) (ports.ForwardEndpointKind, string) {
+func decodeEndpointHostPort(host string, port uint32) (ports.ForwardEndpointKind, string, error) {
 	if port == FwdPortUnix {
-		return ports.ForwardEndpointUnix, host
+		return ports.ForwardEndpointUnix, host, nil
 	}
-	return ports.ForwardEndpointTCP, net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10))
+	if port > math.MaxUint16 {
+		return ports.ForwardEndpointTCP, "", fmt.Errorf("%w: PROTOCOL.mux TCP 端口越界 %d", ports.ErrInvalidArgument, port)
+	}
+	return ports.ForwardEndpointTCP, net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10)), nil
 }
 
 // EncodeCommandPlan 使用确定性 json/v2 编码不可变 execution.CommandPlan。
@@ -514,6 +524,9 @@ func decodePTYOpt(rd *Reader) (algebraic.Option[ports.PTYRequest], error) {
 	rows, e3 := rd.ReadUint32()
 	if err := FirstErr(e1, e2, e3); err != nil {
 		return algebraic.None[ports.PTYRequest](), err
+	}
+	if cols == 0 || cols > math.MaxUint16 || rows == 0 || rows > math.MaxUint16 {
+		return algebraic.None[ports.PTYRequest](), fmt.Errorf("%w: PTY 尺寸越界 (%dx%d)", ports.ErrInvalidTTYSize, cols, rows)
 	}
 	sz, err := ports.NewTerminalSize(uint16(cols), uint16(rows))
 	if err != nil {

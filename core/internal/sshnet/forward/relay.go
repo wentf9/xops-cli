@@ -47,6 +47,13 @@ func (f *Forwarder) buildLocalTargetDialer(spec ports.ForwardSpec) (connDialFunc
 		if err != nil {
 			return nil, fmt.Errorf("%w: 本机 Unix 目标路径非法: %w", ports.ErrInvalidArgument, err)
 		}
+		if !f.hasCustomLocalDialer {
+			// 默认本机 Unix 反向转发强制走 core/osfs.DialUnixVerified（核验对端用户凭证与安全属性）。
+			return func(ctx context.Context) (net.Conn, error) {
+				conn, _, dErr := osfs.DialUnixVerified(ctx, sockPath)
+				return conn, dErr
+			}, nil
+		}
 		native := sockPath.NativePath()
 		return func(ctx context.Context) (net.Conn, error) {
 			return f.localDialer(ctx, "unix", native)
@@ -72,9 +79,18 @@ func relayAcceptedToDial(ctx context.Context, inbound net.Conn, dialTarget connD
 }
 
 // bridgeStreams 在 conc.RunScoped 监督下执行双工零泄漏数据中继：
-//   - 任一方向自然到达 EOF 时仅对其对端调用半关闭 CloseWrite()（若支持），保留反方向完整排空；
-//   - 若任一方向遇到非关闭错误或 ctx 取消，立即同步关闭双端流唤醒阻塞读写，确保 O(1) 零泄漏收敛。
+//   - 任一方向自然到达 io.EOF 且对端支持并成功 CloseWrite() 时保留反方向排空；
+//   - 若对端不支持 CloseWrite()、半关闭失败、源流异常关闭或 ctx 取消，立即同步关闭双端流杜绝僵尸隧道。
 func bridgeStreams(ctx context.Context, left, right io.ReadWriteCloser) error {
+	return bridgeStreamsCore(ctx, left, right, true)
+}
+
+// bridgeStreamsStrict 用于无半关闭语义的双向帧设备（如 TUN）：任一侧 EOF 或故障即刻关闭双端。
+func bridgeStreamsStrict(ctx context.Context, left, right io.ReadWriteCloser) error {
+	return bridgeStreamsCore(ctx, left, right, false)
+}
+
+func bridgeStreamsCore(ctx context.Context, left, right io.ReadWriteCloser, allowHalfClose bool) error {
 	var closeOnce sync.Once
 	closeBoth := func() {
 		closeOnce.Do(func() {
@@ -92,11 +108,11 @@ func bridgeStreams(ctx context.Context, left, right io.ReadWriteCloser) error {
 		}); err != nil {
 			return err
 		}
-		return runBidirectionalCopy(wCtx, left, right, closeBoth)
+		return runBidirectionalCopy(wCtx, left, right, allowHalfClose, closeBoth)
 	})
 }
 
-func runBidirectionalCopy(ctx context.Context, left, right io.ReadWriteCloser, closeBoth func()) error {
+func runBidirectionalCopy(ctx context.Context, left, right io.ReadWriteCloser, allowHalfClose bool, closeBoth func()) error {
 	var errMu sync.Mutex
 	var firstErr error
 	record := func(e error) {
@@ -112,12 +128,12 @@ func runBidirectionalCopy(ctx context.Context, left, right io.ReadWriteCloser, c
 	}
 	copyErr := conc.RunWait(ctx, func(_ context.Context, cn *conc.Nursery) error {
 		if err := cn.Go(func(context.Context) error {
-			record(copyHalfDuplex(right, left))
+			record(copyHalfDuplex(right, left, allowHalfClose, closeBoth))
 			return nil
 		}); err != nil {
 			return err
 		}
-		record(copyHalfDuplex(left, right))
+		record(copyHalfDuplex(left, right, allowHalfClose, closeBoth))
 		return nil
 	})
 	if firstErr != nil {
@@ -126,15 +142,21 @@ func runBidirectionalCopy(ctx context.Context, left, right io.ReadWriteCloser, c
 	return copyErr
 }
 
-func copyHalfDuplex(dst io.Writer, src io.Reader) error {
+func copyHalfDuplex(dst io.Writer, src io.Reader, allowHalfClose bool, closeBoth func()) error {
 	buf := make([]byte, relayCopyBufferBytes)
 	_, err := io.CopyBuffer(dst, src, buf)
 	if err == nil {
-		if hc, ok := dst.(halfWriteCloser); ok {
-			_ = hc.CloseWrite()
+		if allowHalfClose {
+			if hc, ok := dst.(halfWriteCloser); ok {
+				if cwErr := hc.CloseWrite(); cwErr == nil {
+					return nil
+				}
+			}
 		}
+		closeBoth()
 		return nil
 	}
+	closeBoth()
 	if isBenignCloseErr(err) {
 		return nil
 	}

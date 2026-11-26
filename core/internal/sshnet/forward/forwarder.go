@@ -2,22 +2,22 @@ package forward
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/conc"
-	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+)
+
+type (
+	waitDoneProvider interface{ WaitDone() <-chan struct{} }
+	aliveChecker     interface{ IsAlive() bool }
 )
 
 // Handle 表示运行中的受管隧道转发实例，实现 ports.ForwardHandle（兼容 pool.ManagedResource）；零值恒无效。
@@ -115,6 +115,7 @@ func (h *Handle) triggerStop() {
 }
 
 // StartForward 校验规格与安全绑定边界，启动受管长生命周期隧道转发并返回 ports.ForwardHandle。
+// 参数 ctx 仅约束本次同步建链/绑定阶段，返回后 Handle 独立运行，并随上游 transport 断连或 Close() 收敛退出。
 func (f *Forwarder) StartForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (ports.ForwardHandle, error) {
 	if ctx == nil {
 		return nil, ports.ErrNilContext
@@ -127,6 +128,9 @@ func (f *Forwarder) StartForward(ctx context.Context, transport ports.TunnelTran
 	}
 	if transport == nil || !spec.IsValid() {
 		return nil, fmt.Errorf("%w: StartForward 缺少有效 TunnelTransport 或 ForwardSpec", ports.ErrInvalidArgument)
+	}
+	if ac, ok := transport.(aliveChecker); ok && !ac.IsAlive() {
+		return nil, ports.ErrClosed
 	}
 	switch spec.Direction() {
 	case ports.ForwardLocal:
@@ -148,28 +152,42 @@ func (f *Forwarder) startLocalForward(ctx context.Context, transport ports.Tunne
 		return nil, err
 	}
 	if spec.BindKind() == ports.ForwardEndpointUnix {
-		return f.startLocalUnixForward(ctx, spec, remoteDial)
+		return f.startLocalUnixForward(ctx, transport, spec, remoteDial)
 	}
-	listenAddr, err := validateLocalTCPBind(spec.BindAddr(), f.allowGatewayPorts)
+	ln, err := f.listenLocalTCP(ctx, spec.BindAddr(), "本地 TCP")
+	if err != nil {
+		return nil, err
+	}
+	return startListenerHandle(ctx, transport, spec, ln, func(cCtx context.Context, c net.Conn) error {
+		return relayAcceptedToDial(cCtx, c, remoteDial)
+	})
+}
+
+func (f *Forwarder) listenLocalTCP(ctx context.Context, bindAddr, label string) (net.Listener, error) {
+	listenAddr, err := validateLocalTCPBind(bindAddr, f.allowGatewayPorts)
 	if err != nil {
 		return nil, err
 	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", listenAddr)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 监听本地 TCP %q 失败: %w", ports.ErrDialFailed, listenAddr, err)
+		return nil, fmt.Errorf("%w: 监听%s %q 失败: %w", ports.ErrDialFailed, label, listenAddr, err)
 	}
-	return startListenerHandle(ctx, spec, ln, func(cCtx context.Context, c net.Conn) error {
-		return relayAcceptedToDial(cCtx, c, remoteDial)
-	})
+	if !f.allowGatewayPorts {
+		if err := verifyBoundLoopback(ln); err != nil {
+			_ = ln.Close()
+			return nil, err
+		}
+	}
+	return ln, nil
 }
 
-func (f *Forwarder) startLocalUnixForward(ctx context.Context, spec ports.ForwardSpec, remoteDial connDialFunc) (*Handle, error) {
+func (f *Forwarder) startLocalUnixForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec, remoteDial connDialFunc) (*Handle, error) {
 	sockPath, err := osfs.ValidateControlSocketPath(spec.BindAddr())
 	if err != nil {
 		return nil, fmt.Errorf("%w: 本地 Unix 监听路径非法: %w", ports.ErrInvalidArgument, err)
 	}
-	n, err := conc.NewNursery(ctx)
+	n, err := conc.NewNursery(context.Background())
 	if err != nil {
 		return nil, err
 	}
@@ -180,11 +198,13 @@ func (f *Forwarder) startLocalUnixForward(ctx context.Context, spec ports.Forwar
 		defer close(h.doneCh)
 		defer h.closed.Store(true)
 		bound := false
-		wErr := osfs.WithSocketSlot(runCtx, sockPath, osfs.SocketSlotOptions{ReplaceStale: f.replaceStaleUnix}, func(slot *osfs.SocketSlot) error {
-			bound = true
-			readyCh <- slot.Path().NativePath()
-			return serveBorrowedListener(runCtx, slot.Listener(), func(cCtx context.Context, c net.Conn) error {
-				return relayAcceptedToDial(cCtx, c, remoteDial)
+		wErr := runWithUpstreamWatch(runCtx, transport, h, func(wCtx context.Context) error {
+			return osfs.WithSocketSlot(wCtx, sockPath, osfs.SocketSlotOptions{ReplaceStale: f.replaceStaleUnix}, func(slot *osfs.SocketSlot) error {
+				bound = true
+				readyCh <- slot.Path().NativePath()
+				return serveBorrowedListener(wCtx, slot.Listener(), func(cCtx context.Context, c net.Conn) error {
+					return relayAcceptedToDial(cCtx, c, remoteDial)
+				})
 			})
 		})
 		if !bound {
@@ -204,6 +224,10 @@ func (f *Forwarder) startLocalUnixForward(ctx context.Context, spec ports.Forwar
 func awaitAsyncUnixBind(ctx context.Context, h *Handle, readyCh <-chan string, startErrCh <-chan error) (*Handle, error) {
 	select {
 	case addr := <-readyCh:
+		if err := ctx.Err(); err != nil {
+			_ = h.Close()
+			return nil, err
+		}
 		h.boundAddr = addr
 		return h, nil
 	case err := <-startErrCh:
@@ -224,7 +248,7 @@ func (f *Forwarder) startRemoteForward(ctx context.Context, transport ports.Tunn
 	if err != nil {
 		return nil, err
 	}
-	return startListenerHandle(ctx, spec, ln, func(cCtx context.Context, c net.Conn) error {
+	return startListenerHandle(ctx, transport, spec, ln, func(cCtx context.Context, c net.Conn) error {
 		return relayAcceptedToDial(cCtx, c, localDial)
 	})
 }
@@ -244,16 +268,11 @@ func openRemoteListener(ctx context.Context, transport ports.TunnelTransport, sp
 }
 
 func (f *Forwarder) startDynamicForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (*Handle, error) {
-	listenAddr, err := validateLocalTCPBind(spec.BindAddr(), f.allowGatewayPorts)
+	ln, err := f.listenLocalTCP(ctx, spec.BindAddr(), "本地 SOCKS5")
 	if err != nil {
 		return nil, err
 	}
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", listenAddr)
-	if err != nil {
-		return nil, fmt.Errorf("%w: 监听本地 SOCKS5 %q 失败: %w", ports.ErrDialFailed, listenAddr, err)
-	}
-	return startListenerHandle(ctx, spec, ln, func(cCtx context.Context, c net.Conn) error {
+	return startListenerHandle(ctx, transport, spec, ln, func(cCtx context.Context, c net.Conn) error {
 		return f.serveSOCKS5Conn(cCtx, c, transport)
 	})
 }
@@ -281,11 +300,11 @@ func (f *Forwarder) startTUNForward(ctx context.Context, transport ports.TunnelT
 		_ = localDev.Close()
 		return nil, err
 	}
-	return startTUNBridgeHandle(ctx, spec, ifaceName, localDev, remoteTUN)
+	return startTUNBridgeHandle(ctx, transport, spec, ifaceName, localDev, remoteTUN)
 }
 
-func startTUNBridgeHandle(ctx context.Context, spec ports.ForwardSpec, ifaceName string, localDev, remoteTUN io.ReadWriteCloser) (*Handle, error) {
-	n, err := conc.NewNursery(ctx)
+func startTUNBridgeHandle(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec, ifaceName string, localDev, remoteTUN io.ReadWriteCloser) (*Handle, error) {
+	n, err := conc.NewNursery(context.Background())
 	if err != nil {
 		_ = localDev.Close()
 		_ = remoteTUN.Close()
@@ -300,7 +319,9 @@ func startTUNBridgeHandle(ctx context.Context, spec ports.ForwardSpec, ifaceName
 		defer close(h.doneCh)
 		defer h.closed.Store(true)
 		defer h.triggerStop()
-		err := bridgeStreams(runCtx, localDev, remoteTUN)
+		err := runWithUpstreamWatch(runCtx, transport, h, func(wCtx context.Context) error {
+			return bridgeStreamsStrict(wCtx, localDev, remoteTUN)
+		})
 		h.recordErr(err)
 		return nil
 	}); err != nil {
@@ -309,11 +330,11 @@ func startTUNBridgeHandle(ctx context.Context, spec ports.ForwardSpec, ifaceName
 		_ = n.Close()
 		return nil, err
 	}
-	return h, nil
+	return finishStartupHandle(ctx, h)
 }
 
-func startListenerHandle(ctx context.Context, spec ports.ForwardSpec, ln net.Listener, handleConn connHandlerFunc) (*Handle, error) {
-	n, err := conc.NewNursery(ctx)
+func startListenerHandle(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec, ln net.Listener, handleConn connHandlerFunc) (*Handle, error) {
+	n, err := conc.NewNursery(context.Background())
 	if err != nil {
 		_ = ln.Close()
 		return nil, err
@@ -337,7 +358,9 @@ func startListenerHandle(ctx context.Context, spec ports.ForwardSpec, ln net.Lis
 		defer close(h.doneCh)
 		defer h.closed.Store(true)
 		defer h.triggerStop()
-		err := serveBorrowedListener(runCtx, ln, handleConn)
+		err := runWithUpstreamWatch(runCtx, transport, h, func(wCtx context.Context) error {
+			return serveBorrowedListener(wCtx, ln, handleConn)
+		})
 		h.recordErr(err)
 		return nil
 	}); err != nil {
@@ -346,7 +369,39 @@ func startListenerHandle(ctx context.Context, spec ports.ForwardSpec, ln net.Lis
 		_ = n.Close()
 		return nil, err
 	}
+	return finishStartupHandle(ctx, h)
+}
+
+func finishStartupHandle(ctx context.Context, h *Handle) (*Handle, error) {
+	if err := ctx.Err(); err != nil {
+		_ = h.Close()
+		return nil, err
+	}
 	return h, nil
+}
+
+// runWithUpstreamWatch 在上游 transport 暴露 WaitDone() 时同步监督其断连信号：
+// 一旦上游连接终止，立即触发 Handle 停止并取消内部作用域，杜绝空闲本地监听端口/套接字僵死。
+func runWithUpstreamWatch(runCtx context.Context, transport ports.TunnelTransport, h *Handle, body func(context.Context) error) error {
+	wp, ok := transport.(waitDoneProvider)
+	if !ok {
+		return body(runCtx)
+	}
+	done := wp.WaitDone()
+	return conc.RunScoped(runCtx, func(wCtx context.Context, n *conc.Nursery) error {
+		if err := n.Go(func(c context.Context) error {
+			select {
+			case <-done:
+				h.triggerStop()
+				h.nursery.Cancel(ports.ErrClosed)
+			case <-c.Done():
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return body(wCtx)
+	})
 }
 
 // serveBorrowedListener 在同步作用域内通过 chanconn.RunWithAbortWatchdog 驱动 Accept 循环，
@@ -396,74 +451,4 @@ func spawnConnWorker(n *conc.Nursery, conn net.Conn, handleConn connHandlerFunc)
 		return err
 	}
 	return nil
-}
-
-func validateLocalTCPBind(raw string, allowGateway bool) (string, error) {
-	host, portStr, err := net.SplitHostPort(raw)
-	if err != nil {
-		return "", fmt.Errorf("%w: 非法本地 TCP 绑定地址 %q: %w", ports.ErrInvalidArgument, raw, err)
-	}
-	if _, err := parseTCPBindPort(portStr); err != nil {
-		return "", fmt.Errorf("%w: 非法本地 TCP 绑定端口 %q: %w", ports.ErrInvalidArgument, portStr, err)
-	}
-	if host == "*" {
-		host = ""
-	}
-	if !allowGateway {
-		if err := checkLoopbackBindHost(host, raw); err != nil {
-			return "", err
-		}
-	}
-	return net.JoinHostPort(host, portStr), nil
-}
-
-func validateRemoteTCPBind(raw string) error {
-	host, portStr, err := net.SplitHostPort(raw)
-	if err != nil {
-		return fmt.Errorf("%w: 非法远端 TCP 绑定地址 %q: %w", ports.ErrInvalidArgument, raw, err)
-	}
-	if _, err := parseTCPBindPort(portStr); err != nil {
-		return fmt.Errorf("%w: 非法远端 TCP 绑定端口 %q: %w", ports.ErrInvalidArgument, portStr, err)
-	}
-	if host != "" && host != "*" {
-		if _, pErr := netaddr.ParseCanonicalHost(host); pErr != nil {
-			return fmt.Errorf("%w: 非法远端绑定主机 %q: %w", ports.ErrInvalidArgument, host, pErr)
-		}
-	}
-	return nil
-}
-
-func parseTCPBindPort(raw string) (uint16, error) {
-	if raw == "" || strings.HasPrefix(raw, "+") || strings.HasPrefix(raw, "-") {
-		return 0, ports.ErrInvalidArgument
-	}
-	v, err := strconv.ParseUint(raw, 10, 16)
-	if err != nil {
-		return 0, err
-	}
-	return uint16(v), nil
-}
-
-func checkLoopbackBindHost(host, raw string) error {
-	if strings.EqualFold(host, "localhost") {
-		return nil
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil || !addr.IsLoopback() {
-		return fmt.Errorf("%w: 默认禁止绑定非回环本地地址 %q（需显式开启 GatewayPorts）", ports.ErrPermissionDenied, raw)
-	}
-	return nil
-}
-
-func mapUnixSlotErr(err error) error {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, osfs.ErrSlotOccupied) {
-		return fmt.Errorf("%w: %w", ports.ErrAlreadyExists, err)
-	}
-	if errors.Is(err, osfs.ErrInvalidControlPath) || errors.Is(err, osfs.ErrControlPathTooLong) || errors.Is(err, osfs.ErrNotSocket) {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
-	}
-	return err
 }

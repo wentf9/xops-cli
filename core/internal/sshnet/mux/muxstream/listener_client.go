@@ -151,7 +151,10 @@ func (l *RemoteListener) handleFrame(msgType uint32, body []byte) (bool, error) 
 			return true, err
 		}
 		if ac := l.lookupStream(id); ac != nil {
-			ac.pushData(data)
+			if pErr := ac.pushData(data); pErr != nil {
+				l.removeStreamByID(id)
+				_ = l.fw.Write(LstMsgClose, AppendU32(nil, id))
+			}
 		}
 	case LstMsgCloseWrite:
 		id, err := rd.ReadUint32()
@@ -193,6 +196,12 @@ func (l *RemoteListener) handleAcceptFrame(rd *Reader) (bool, error) {
 	}
 }
 
+func (l *RemoteListener) removeStreamByID(id uint32) {
+	l.mu.Lock()
+	delete(l.streams, id)
+	l.mu.Unlock()
+}
+
 func (l *RemoteListener) closeStreamByID(id uint32) {
 	l.mu.Lock()
 	ac := l.streams[id]
@@ -210,6 +219,9 @@ func (l *RemoteListener) lookupStream(id uint32) *muxAcceptedConn {
 	return ac
 }
 
+// maxAcceptedConnBufBytes 限制单条复用远端入站连接的读缓冲高水位（4 MiB），防止慢速消费方导致无界内存增长。
+const maxAcceptedConnBufBytes = 4 << 20
+
 // muxAcceptedConn 表示 RemoteListener.Accept 返回的单条复用远端到站连接（支持半关闭 CloseWrite）。
 type muxAcceptedConn struct {
 	id         uint32
@@ -217,13 +229,15 @@ type muxAcceptedConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	buf     bytes.Buffer
-	eof     bool
-	wClosed bool
-	closed  bool
-	once    sync.Once
+	mu          sync.Mutex
+	cond        *sync.Cond
+	buf         bytes.Buffer
+	eof         bool
+	wClosed     bool
+	closed      bool
+	localClosed bool
+	overflowErr error
+	once        sync.Once
 }
 
 func newMuxAcceptedConn(id uint32, parent *RemoteListener, localAddr, remoteAddr net.Addr) *muxAcceptedConn {
@@ -232,13 +246,21 @@ func newMuxAcceptedConn(id uint32, parent *RemoteListener, localAddr, remoteAddr
 	return c
 }
 
-func (c *muxAcceptedConn) pushData(data []byte) {
+func (c *muxAcceptedConn) pushData(data []byte) error {
 	c.mu.Lock()
-	if !c.closed {
-		c.buf.Write(data)
-		c.cond.Broadcast()
+	defer c.mu.Unlock()
+	if c.closed || c.localClosed {
+		return nil
 	}
-	c.mu.Unlock()
+	if c.buf.Len()+len(data) > maxAcceptedConnBufBytes {
+		c.closed = true
+		c.overflowErr = ports.ErrLimitExceeded
+		c.cond.Broadcast()
+		return ports.ErrLimitExceeded
+	}
+	_, err := c.buf.Write(data)
+	c.cond.Broadcast()
+	return err
 }
 
 func (c *muxAcceptedConn) markReadEOF() {
@@ -259,18 +281,24 @@ func (c *muxAcceptedConn) closeLocalOnly() {
 func (c *muxAcceptedConn) Read(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for c.buf.Len() == 0 && !c.eof && !c.closed {
+	for c.buf.Len() == 0 && !c.eof && !c.closed && !c.localClosed {
 		c.cond.Wait()
+	}
+	if c.localClosed {
+		return 0, net.ErrClosed
 	}
 	if c.buf.Len() > 0 {
 		return c.buf.Read(p)
+	}
+	if c.overflowErr != nil {
+		return 0, c.overflowErr
 	}
 	return 0, io.EOF
 }
 
 func (c *muxAcceptedConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
-	closed := c.closed || c.wClosed
+	closed := c.closed || c.localClosed || c.wClosed
 	c.mu.Unlock()
 	if closed {
 		return 0, net.ErrClosed
@@ -288,7 +316,7 @@ func (c *muxAcceptedConn) Write(p []byte) (int, error) {
 
 func (c *muxAcceptedConn) CloseWrite() error {
 	c.mu.Lock()
-	if c.wClosed || c.closed {
+	if c.wClosed || c.closed || c.localClosed {
 		c.mu.Unlock()
 		return nil
 	}
@@ -299,10 +327,13 @@ func (c *muxAcceptedConn) CloseWrite() error {
 
 func (c *muxAcceptedConn) Close() error {
 	c.once.Do(func() {
-		c.closeLocalOnly()
-		c.parent.mu.Lock()
-		delete(c.parent.streams, c.id)
-		c.parent.mu.Unlock()
+		c.mu.Lock()
+		c.localClosed = true
+		c.eof = true
+		c.closed = true
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		c.parent.removeStreamByID(c.id)
 		_ = c.parent.fw.Write(LstMsgClose, AppendU32(nil, c.id))
 	})
 	return nil

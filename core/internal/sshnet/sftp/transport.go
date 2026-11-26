@@ -82,7 +82,10 @@ func newClient(ctx context.Context, rw io.ReadWriteCloser, cfg Config) (*Client,
 		return nil, err
 	}
 	if c.hasLimits && cfg.MaxPacketSize <= 0 {
-		c.negotiateServerLimits(ctx)
+		if err := c.negotiateServerLimits(ctx); err != nil {
+			_ = c.Close()
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -149,8 +152,8 @@ func decodeVersionPacket(body []byte) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ver < sftpProtocolVersion {
-		return nil, fmt.Errorf("%w: 远端 SFTP 版本 %d 低于最低要求 v3", ports.ErrUnsupported, ver)
+	if ver != sftpProtocolVersion {
+		return nil, fmt.Errorf("%w: 远端 SFTP 协议版本 %d 不兼容（仅支持 v3）", ports.ErrUnsupported, ver)
 	}
 	exts := make(map[string]string)
 	for r.remaining() > 0 {
@@ -168,19 +171,29 @@ func decodeVersionPacket(body []byte) (map[string]string, error) {
 }
 
 // negotiateServerLimits 尽力查询 OpenSSH limits@openssh.com 以对齐服务端单包读写上限；
-// 失败时静默保留安全默认值（32 KiB），不阻断握手。
-func (c *Client) negotiateServerLimits(ctx context.Context) {
+// 若协商期间上下文取消或底层流已关闭，立即失败关闭（绝不返回已死亡的 Client）；
+// 其余服务端不支持或格式异常场景静默保留安全默认值（32 KiB）。
+func (c *Client) negotiateServerLimits(ctx context.Context) error {
 	payload := appendString(nil, extLimits)
 	pktType, body, err := c.roundTrip(ctx, sshFXPExtended, payload)
-	if err != nil || pktType != sshFXPExtendedReply {
-		return
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if c.closed.Load() || errors.Is(err, ports.ErrClosed) {
+			return ports.ErrClosed
+		}
+		return nil
+	}
+	if pktType != sshFXPExtendedReply {
+		return nil
 	}
 	r := wireReader{buf: body}
 	_, e1 := r.readUint64() // max-packet-len
 	maxRead, e2 := r.readUint64()
 	maxWrite, e3 := r.readUint64()
 	if e1 != nil || e2 != nil || e3 != nil {
-		return
+		return nil
 	}
 	if maxRead > 0 {
 		c.maxReadLen = clampChunkSize(int(min(maxRead, uint64(maxChunkBytes))))
@@ -188,6 +201,7 @@ func (c *Client) negotiateServerLimits(ctx context.Context) {
 	if maxWrite > 0 {
 		c.maxWriteLen = clampChunkSize(int(min(maxWrite, uint64(maxChunkBytes))))
 	}
+	return nil
 }
 
 // Close 幂等关闭底层 SFTP 子系统流、唤醒全部在途请求并同步排空后台监督协程（零泄漏）。

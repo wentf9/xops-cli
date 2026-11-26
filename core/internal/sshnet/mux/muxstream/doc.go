@@ -5,7 +5,8 @@
 //   - PROTOCOL.mux v4 控制报文与 xops-stream-mux@xops.dev 扩展帧编解码（wire_codec.go）；
 //   - 远端会话（ports.RemoteSession）双向帧桥接客户端与服务端实现；
 //   - 远端监听器（ListenTCP / ListenStreamLocal）多流复用客户端与服务端实现；
-//   - 基于 core/conc.Nursery 的零泄漏双向字节流拼接（SpliceStreams，支持半关闭）。
+//   - 基于 core/conc.Nursery 的零泄漏双向字节流拼接（SpliceStreams / SpliceStreamsStrict）
+//     与 Windows afunix.sys 防 RST 优雅半关闭排空（GracefulHalfClose）。
 package muxstream
 
 import (
@@ -54,9 +55,20 @@ func (fw *SyncFrameWriter) Write(msgType uint32, body []byte) error {
 	return WritePacket(fw.w, msgType, body)
 }
 
-// SpliceStreams 在 core/conc.Nursery 监督下执行双向原始流透传，任一侧 EOF 尽力传播半关闭，
-// 上下文取消或异常错误时同步关闭两端以保证零协程泄漏。
+// SpliceStreams 在 core/conc.Nursery 监督下执行双向流透传：
+// 当源流正常到达 io.EOF 且目标支持 CloseWrite() 且半关闭成功时保留反方向排空；
+// 若目标不支持 CloseWrite()、半关闭失败或任一侧以非 EOF 错误中止，立即同步关闭双端杜绝僵尸隧道。
 func SpliceStreams(ctx context.Context, left, right io.ReadWriteCloser) error {
+	return spliceCore(ctx, left, right, true)
+}
+
+// SpliceStreamsStrict 在 core/conc.Nursery 监督下执行无半关闭双向透传（适用于 TUN 等帧设备）：
+// 任一侧到达 EOF 或发生错误均立即同步关闭双端，防止无 EOF 侧永久挂起。
+func SpliceStreamsStrict(ctx context.Context, left, right io.ReadWriteCloser) error {
+	return spliceCore(ctx, left, right, false)
+}
+
+func spliceCore(ctx context.Context, left, right io.ReadWriteCloser, allowHalfClose bool) error {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
@@ -75,26 +87,31 @@ func SpliceStreams(ctx context.Context, left, right io.ReadWriteCloser) error {
 		}
 		return conc.RunWait(wCtx, func(_ context.Context, cn *conc.Nursery) error {
 			if err := cn.Go(func(context.Context) error {
-				copyDirection(right, left, closeBoth)
+				copyDirection(right, left, allowHalfClose, closeBoth)
 				return nil
 			}); err != nil {
 				return err
 			}
-			copyDirection(left, right, closeBoth)
+			copyDirection(left, right, allowHalfClose, closeBoth)
 			return nil
 		})
 	})
 }
 
-func copyDirection(dst io.Writer, src io.Reader, closeBoth func()) {
+func copyDirection(dst io.Writer, src io.Reader, allowHalfClose bool, closeBoth func()) {
 	buf := make([]byte, CopyChunkBytes)
-	if _, err := io.CopyBuffer(dst, src, buf); err != nil && !IsBenignIOErr(err) {
+	if _, err := io.CopyBuffer(dst, src, buf); err != nil {
 		closeBoth()
 		return
 	}
-	if hc, ok := dst.(HalfWriteCloser); ok {
-		_ = hc.CloseWrite()
+	if allowHalfClose {
+		if hc, ok := dst.(HalfWriteCloser); ok {
+			if cwErr := hc.CloseWrite(); cwErr == nil {
+				return
+			}
+		}
 	}
+	closeBoth()
 }
 
 // IsBenignIOErr 判断错误是否属于正常断连、管道关闭或上下文取消。

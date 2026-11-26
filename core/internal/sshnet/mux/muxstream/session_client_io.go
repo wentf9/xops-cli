@@ -14,10 +14,16 @@ import (
 func (s *RemoteSession) startBackgroundPumps(stdinSrc io.Reader, closeEmptyStdin bool) error {
 	rDone := make(chan struct{})
 	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		close(rDone)
+		return ports.ErrClosed
+	}
 	s.readerDone = rDone
 	stdinR := s.stdinPipeR
 	stdinTaken := s.stdinTaken
 	s.mu.Unlock()
+
 	if err := s.lifeNursery.Go(func(context.Context) error {
 		defer close(rDone)
 		s.readServerLoop()
@@ -41,23 +47,18 @@ func (s *RemoteSession) startBackgroundPumps(stdinSrc io.Reader, closeEmptyStdin
 func (s *RemoteSession) spawnStdinPump(src io.Reader) error {
 	done := make(chan struct{})
 	s.mu.Lock()
+	if s.closed.Load() {
+		s.mu.Unlock()
+		close(done)
+		return ports.ErrClosed
+	}
 	s.stdinPumpDone = done
 	s.mu.Unlock()
+
 	if err := s.lifeNursery.Go(func(context.Context) error {
 		defer close(done)
-		buf := make([]byte, CopyChunkBytes)
-		for {
-			n, err := src.Read(buf)
-			if n > 0 {
-				if wErr := s.fw.Write(SessMsgStdinData, AppendBytes(nil, buf[:n])); wErr != nil {
-					return nil
-				}
-			}
-			if err != nil {
-				_ = s.fw.Write(SessMsgStdinEOF, nil)
-				return nil
-			}
-		}
+		s.pumpStdinLoop(src)
+		return nil
 	}); err != nil {
 		close(done)
 		return ports.ErrClosed
@@ -65,8 +66,28 @@ func (s *RemoteSession) spawnStdinPump(src io.Reader) error {
 	return nil
 }
 
+func (s *RemoteSession) pumpStdinLoop(src io.Reader) {
+	buf := make([]byte, CopyChunkBytes)
+	for !s.closed.Load() {
+		n, err := src.Read(buf)
+		if s.closed.Load() {
+			return
+		}
+		if n > 0 {
+			if wErr := s.fw.Write(SessMsgStdinData, AppendBytes(nil, buf[:n])); wErr != nil {
+				return
+			}
+		}
+		if err != nil {
+			_ = s.fw.Write(SessMsgStdinEOF, nil)
+			return
+		}
+	}
+}
+
 func (s *RemoteSession) readServerLoop() {
-	defer s.closeOutputPipes()
+	defer s.closeOutputPipesEOF()
+	defer s.failAllCtrlPending(ports.ErrClosed)
 	for {
 		msgType, body, err := ReadPacket(s.conn)
 		if err != nil {
@@ -89,7 +110,7 @@ func (s *RemoteSession) handleServerFrame(msgType uint32, body []byte) (bool, er
 			s.writeOutput(true, data)
 		}
 	case SessMsgStdoutEOF:
-		s.closeSingleOutputPipe(true)
+		s.closeSingleOutputPipe(true, false)
 	case SessMsgStderrData:
 		if data, err := rd.ReadBytes(); err != nil {
 			return false, err
@@ -97,7 +118,7 @@ func (s *RemoteSession) handleServerFrame(msgType uint32, body []byte) (bool, er
 			s.writeOutput(false, data)
 		}
 	case SessMsgStderrEOF:
-		s.closeSingleOutputPipe(false)
+		s.closeSingleOutputPipe(false, false)
 	case SessMsgCtrlReply:
 		s.deliverCtrlReply(&rd)
 	case SessMsgOutcome:
@@ -106,18 +127,51 @@ func (s *RemoteSession) handleServerFrame(msgType uint32, body []byte) (bool, er
 	return false, nil
 }
 
+func (s *RemoteSession) registerCtrlPending(reqID uint32) (chan error, error) {
+	s.ctrlMu.Lock()
+	defer s.ctrlMu.Unlock()
+	if s.pendingCtrl == nil || s.closed.Load() {
+		return nil, ports.ErrClosed
+	}
+	ch := make(chan error, 1)
+	s.pendingCtrl[reqID] = ch
+	return ch, nil
+}
+
+func (s *RemoteSession) unregisterCtrlPending(reqID uint32) {
+	s.ctrlMu.Lock()
+	if s.pendingCtrl != nil {
+		delete(s.pendingCtrl, reqID)
+	}
+	s.ctrlMu.Unlock()
+}
+
+func (s *RemoteSession) failAllCtrlPending(err error) {
+	s.ctrlMu.Lock()
+	pend := s.pendingCtrl
+	s.pendingCtrl = nil
+	s.ctrlMu.Unlock()
+	for _, ch := range pend {
+		ch <- err
+	}
+}
+
 func (s *RemoteSession) deliverCtrlReply(rd *Reader) {
+	reqID, e0 := rd.ReadUint32()
 	okFlag, e1 := rd.ReadUint32()
 	msg, e2 := rd.ReadString()
 	var cErr error
-	if err := FirstErr(e1, e2); err != nil {
+	if err := FirstErr(e0, e1, e2); err != nil {
 		cErr = err
 	} else if okFlag == 0 {
 		cErr = errors.New(msg)
 	}
-	select {
-	case s.ctrlCh <- cErr:
-	default:
+	s.ctrlMu.Lock()
+	ch := s.pendingCtrl[reqID]
+	delete(s.pendingCtrl, reqID)
+	s.ctrlMu.Unlock()
+	if ch != nil {
+		ch <- cErr
 	}
 }
 
@@ -126,6 +180,12 @@ func (s *RemoteSession) deliverOutcomeFrame(body []byte) error {
 	if decErr != nil {
 		s.deliverTransportLost(decErr)
 		return decErr
+	}
+	// 将客户端本地 MaxOutputBytes 截断状态准确回填至 OutcomeCompleted.Truncated()。
+	if comp, ok := out.(*execution.OutcomeCompleted); ok && comp.IsValid() && s.truncated.Load() && !comp.Truncated() {
+		if rebuilt, err := execution.NewOutcomeCompleted(comp.Status(), true); err == nil {
+			out = rebuilt
+		}
 	}
 	select {
 	case s.outcomeCh <- sessionWaitResult{outcome: out, err: wErr}:
@@ -147,27 +207,70 @@ func (s *RemoteSession) writeOutput(isStdout bool, data []byte) {
 		return
 	}
 	s.mu.Lock()
-	var pw *io.PipeWriter
+	var bp *bufferedPipe
 	var dst io.Writer
 	if isStdout {
-		pw, dst = s.stdoutPipeW, s.stdoutDst
+		bp, dst = s.stdoutPipe, s.stdoutDst
 	} else {
-		pw, dst = s.stderrPipeW, s.stderrDst
+		bp, dst = s.stderrPipe, s.stderrDst
 	}
 	maxBytes := s.maxOutputBytes
 	s.mu.Unlock()
 
-	if pw != nil {
-		_, _ = pw.Write(data)
+	if bp != nil {
+		bp.writeChunk(data)
 		return
 	}
 	if dst == nil {
 		return
 	}
 	chunk := sliceOutputBudget(data, maxBytes, &s.outputUsed, &s.truncated)
-	if len(chunk) > 0 {
-		_, _ = dst.Write(chunk)
+	if len(chunk) == 0 {
+		return
 	}
+	s.writeGuardedDst(isStdout, dst, chunk)
+}
+
+func (s *RemoteSession) writeGuardedDst(isStdout bool, dst io.Writer, chunk []byte) {
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if s.discardOutput {
+		return
+	}
+	if _, err := dst.Write(chunk); err != nil {
+		s.recordIOErr(err)
+		// 首次写入失败后静默丢弃后续数据块以继续排空帧流，并由 Wait 暴露错误。
+		s.mu.Lock()
+		if isStdout {
+			s.stdoutDst = io.Discard
+		} else {
+			s.stderrDst = io.Discard
+		}
+		s.mu.Unlock()
+	}
+}
+
+func (s *RemoteSession) markDiscardOutput() {
+	s.outMu.Lock()
+	s.discardOutput = true
+	s.outMu.Unlock()
+}
+
+func (s *RemoteSession) recordIOErr(err error) {
+	if err == nil {
+		return
+	}
+	s.ioErrMu.Lock()
+	if s.ioErr == nil {
+		s.ioErr = err
+	}
+	s.ioErrMu.Unlock()
+}
+
+func (s *RemoteSession) firstIOErr() error {
+	s.ioErrMu.Lock()
+	defer s.ioErrMu.Unlock()
+	return s.ioErr
 }
 
 func sliceOutputBudget(data []byte, maxBytes uint64, used *atomic.Uint64, truncated *atomic.Bool) []byte {
@@ -190,23 +293,33 @@ func sliceOutputBudget(data []byte, maxBytes uint64, used *atomic.Uint64, trunca
 	}
 }
 
-func (s *RemoteSession) closeSingleOutputPipe(isStdout bool) {
+func (s *RemoteSession) closeSingleOutputPipe(isStdout, abort bool) {
 	s.mu.Lock()
-	var pw *io.PipeWriter
+	var bp *bufferedPipe
 	if isStdout {
-		pw, s.stdoutPipeW = s.stdoutPipeW, nil
+		bp, s.stdoutPipe = s.stdoutPipe, nil
 	} else {
-		pw, s.stderrPipeW = s.stderrPipeW, nil
+		bp, s.stderrPipe = s.stderrPipe, nil
 	}
 	s.mu.Unlock()
-	if pw != nil {
-		_ = pw.Close()
+	if bp == nil {
+		return
 	}
+	if abort {
+		bp.closeAbort()
+		return
+	}
+	bp.closeEOF()
 }
 
-func (s *RemoteSession) closeOutputPipes() {
-	s.closeSingleOutputPipe(true)
-	s.closeSingleOutputPipe(false)
+func (s *RemoteSession) closeOutputPipesEOF() {
+	s.closeSingleOutputPipe(true, false)
+	s.closeSingleOutputPipe(false, false)
+}
+
+func (s *RemoteSession) closeOutputPipesAbort() {
+	s.closeSingleOutputPipe(true, true)
+	s.closeSingleOutputPipe(false, true)
 }
 
 func (s *RemoteSession) currentReaderDone() <-chan struct{} {

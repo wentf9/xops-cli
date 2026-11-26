@@ -101,6 +101,9 @@ func verifyMuxListenerEcho(ctx context.Context, n *conc.Nursery, dialAddr string
 		_ = hc.CloseWrite()
 	}
 	_ = ac.Close()
+	if _, rErr := ac.Read(make([]byte, 1)); !errors.Is(rErr, net.ErrClosed) {
+		return errors.New("本地 Close 后 Read 必须返回 net.ErrClosed")
+	}
 	select {
 	case err := <-dialErrCh:
 		return err

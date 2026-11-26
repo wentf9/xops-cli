@@ -82,6 +82,9 @@ func (c *Client) ReadDir(ctx context.Context, dir pathalg.RemotePath) ([]ports.R
 		if eof {
 			break
 		}
+		if len(batch) == 0 {
+			return nil, fmt.Errorf("%w: SSH_FXP_READDIR 返回空目录批次", ports.ErrCorruptData)
+		}
 		out, err = appendValidatedDirEntries(out, batch)
 		if err != nil {
 			return nil, err
@@ -231,12 +234,13 @@ func (c *Client) streamReadChunk(ctx context.Context, handle []byte, off uint64,
 		if err != nil {
 			return total, err
 		}
-		if len(chunk) > 0 {
-			n, wErr := dst.Write(chunk)
-			total += int64(n)
-			if wErr != nil {
-				return total, wErr
-			}
+		if int64(len(chunk)) > want {
+			return total, fmt.Errorf("%w: SSH_FXP_DATA 长度 %d 超过请求上限 %d", ports.ErrCorruptData, len(chunk), want)
+		}
+		written, wErr := writeChunkExact(dst, chunk)
+		total += written
+		if wErr != nil {
+			return total, wErr
 		}
 		if eof || len(chunk) == 0 {
 			return total, io.EOF
@@ -245,15 +249,35 @@ func (c *Client) streamReadChunk(ctx context.Context, handle []byte, off uint64,
 	return total, nil
 }
 
-// openRegularForRead 以只读非截断标志打开远端文件并立即执行 SSH_FXP_FSTAT 校验其必为常规文件。
+func writeChunkExact(dst io.Writer, chunk []byte) (int64, error) {
+	if len(chunk) == 0 {
+		return 0, nil
+	}
+	n, err := dst.Write(chunk)
+	if err != nil {
+		return int64(n), err
+	}
+	if n != len(chunk) {
+		return int64(n), io.ErrShortWrite
+	}
+	return int64(n), nil
+}
+
+// openRegularForRead 先经 SSH_FXP_STAT 预检拦截目录与 FIFO/设备（避免阻塞单线程 sftp-server），
+// 再以只读非截断标志打开并立即执行 SSH_FXP_FSTAT 二次核验（防御 TOCTOU）。
 func (c *Client) openRegularForRead(ctx context.Context, p pathalg.RemotePath) ([]byte, ports.RemoteFileStat, error) {
+	preStat, err := c.Stat(ctx, p)
+	if err != nil {
+		return nil, zeroVal[ports.RemoteFileStat](), err
+	}
+	if preStat.IsDir() {
+		return nil, zeroVal[ports.RemoteFileStat](), ports.ErrRemoteIsDir
+	}
+	if !preStat.IsRegular() {
+		return nil, zeroVal[ports.RemoteFileStat](), ports.ErrNotRegularFile
+	}
 	handle, err := c.openHandle(ctx, p.String(), sshFXFRead, wireAttrs{})
 	if err != nil {
-		if isStatusCode(err, sshFXFailure) || isStatusCode(err, sshFXPermissionDenied) {
-			if st, sErr := c.Stat(ctx, p); sErr == nil && st.IsDir() {
-				return nil, zeroVal[ports.RemoteFileStat](), ports.ErrRemoteIsDir
-			}
-		}
 		return nil, zeroVal[ports.RemoteFileStat](), err
 	}
 	attrs, err := c.fstatHandle(ctx, handle)
@@ -278,15 +302,15 @@ func (c *Client) openRegularForRead(ctx context.Context, p pathalg.RemotePath) (
 }
 
 type sftpScopedReader struct {
-	client   *Client
-	ctx      context.Context
-	handle   []byte
-	offset   uint64
-	readSoFa int64
-	maxBytes int64
-	buf      []byte
-	eof      bool
-	expired  atomic.Bool
+	client    *Client
+	ctx       context.Context
+	handle    []byte
+	offset    uint64
+	readSoFar int64
+	maxBytes  int64
+	buf       []byte
+	eof       bool
+	expired   atomic.Bool
 }
 
 func (sr *sftpScopedReader) Read(p []byte) (int, error) {
@@ -304,7 +328,7 @@ func (sr *sftpScopedReader) Read(p []byte) (int, error) {
 	if sr.eof {
 		return 0, io.EOF
 	}
-	remBudget := sr.maxBytes - sr.readSoFa
+	remBudget := sr.maxBytes - sr.readSoFar
 	// 多探读 1 字节以捕获读取期间远端文件并发增长超出 limits.MaxBytes() 的情形。
 	want := min(int64(sr.client.maxReadLen), remBudget+1)
 	chunk, eof, err := sr.client.readHandleAt(sr.ctx, sr.handle, sr.offset, uint32(want))
@@ -316,10 +340,10 @@ func (sr *sftpScopedReader) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	sr.offset += uint64(len(chunk))
-	if sr.readSoFa+int64(len(chunk)) > sr.maxBytes {
+	if sr.readSoFar+int64(len(chunk)) > sr.maxBytes {
 		return 0, fmt.Errorf("%w: 远端流读取期间超出 ReadLimits 上限 %d", ports.ErrLimitExceeded, sr.maxBytes)
 	}
-	sr.readSoFa += int64(len(chunk))
+	sr.readSoFar += int64(len(chunk))
 	n := copy(p, chunk)
 	if n < len(chunk) {
 		sr.buf = chunk[n:]

@@ -62,7 +62,12 @@ func (f *Forwarder) serveSOCKS5Conn(ctx context.Context, client net.Conn, transp
 }
 
 func (f *Forwarder) handshakeSOCKS5(ctx context.Context, client net.Conn) (netaddr.HostPort, error) {
-	_ = client.SetDeadline(f.now().Add(f.socksTimeout))
+	// net.Conn.SetDeadline 由 OS 内核按系统墙钟解释，绝不使用虚拟时钟偏移。
+	dl := time.Now().Add(f.socksTimeout)
+	if ctxDL, ok := ctx.Deadline(); ok && ctxDL.Before(dl) {
+		dl = ctxDL
+	}
+	_ = client.SetDeadline(dl)
 	var target netaddr.HostPort
 	err := chanconn.RunWithAbortWatchdog(ctx, func() { _ = client.Close() }, func() error {
 		if err := negotiateSOCKS5Method(client); err != nil {
@@ -79,13 +84,6 @@ func (f *Forwarder) handshakeSOCKS5(ctx context.Context, client net.Conn) (netad
 		return zeroVal[netaddr.HostPort](), err
 	}
 	return target, nil
-}
-
-func (f *Forwarder) now() time.Time {
-	if f.clock != nil {
-		return f.clock.Now()
-	}
-	return time.Now()
 }
 
 func negotiateSOCKS5Method(conn net.Conn) error {
