@@ -103,12 +103,11 @@ func TestMuxSocket_ControlForwardCancelStopAndProxy(t *testing.T) {
 	// 未运行主进程时 Probe 返回 alive=false，Control/OpenProxy/DialMux 返回 ErrMuxUnavailable。
 	m := mux.NewMuxSocket(mux.Config{
 		ProxyHandler: func(_ context.Context, conn net.Conn, _ ports.TransportConn) error {
-			buf := make([]byte, 16)
-			n, err := conn.Read(buf)
-			if err != nil {
+			var buf [9]byte
+			if _, err := io.ReadFull(conn, buf[:]); err != nil {
 				return err
 			}
-			_, err = conn.Write(bytes.ToUpper(buf[:n]))
+			_, err := conn.Write(bytes.ToUpper(buf[:]))
 			return err
 		},
 	})

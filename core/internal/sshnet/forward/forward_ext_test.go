@@ -349,12 +349,11 @@ func exerciseRemoteReverse(tr *memTunnelTransport) error {
 		}); gErr != nil {
 			return gErr
 		}
-		buf := make([]byte, 64)
-		nr, rErr := remoteEnd.Read(buf)
+		var rErr error
+		got, rErr = readUntilContains(remoteEnd, []byte("rev-ping"), 4096)
 		if rErr != nil {
 			return rErr
 		}
-		got = buf[:nr]
 		return remoteEnd.Close()
 	})
 	if err != nil {
@@ -364,6 +363,25 @@ func exerciseRemoteReverse(tr *memTunnelTransport) error {
 		return errors.New("反向转发回显不匹配")
 	}
 	return nil
+}
+
+// readUntilContains 在有界字节上限内循环读取，直至缓冲包含目标子串（避免 Windows 较长 TempDir 路径前缀截断单次读）。
+func readUntilContains(r io.Reader, needle []byte, maxBytes int) ([]byte, error) {
+	var acc []byte
+	chunk := make([]byte, 256)
+	for len(acc) < maxBytes {
+		n, err := r.Read(chunk)
+		if n > 0 {
+			acc = append(acc, chunk[:n]...)
+			if bytes.Contains(acc, needle) {
+				return acc, nil
+			}
+		}
+		if err != nil {
+			return acc, err
+		}
+	}
+	return acc, errors.New("读取超过上限仍未收到预期回显")
 }
 
 func roundTripSOCKS5Domain(ctx context.Context, proxyAddr, domain string, port uint16, msg string) error {

@@ -191,13 +191,12 @@ func serveSingleLocalEcho(ctx context.Context, ln net.Listener, gotReverse chan<
 		return err
 	}
 	defer func() { _ = accepted.Close() }()
-	buf := make([]byte, 32)
-	nr, rErr := accepted.Read(buf)
-	if rErr != nil {
+	buf := make([]byte, len("from-remote"))
+	if _, rErr := io.ReadFull(accepted, buf); rErr != nil {
 		return rErr
 	}
-	gotReverse <- append([]byte(nil), buf[:nr]...)
-	_, wErr := accepted.Write(bytes.ToUpper(buf[:nr]))
+	gotReverse <- append([]byte(nil), buf...)
+	_, wErr := accepted.Write(bytes.ToUpper(buf))
 	return wErr
 }
 
