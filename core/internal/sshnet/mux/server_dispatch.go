@@ -50,6 +50,11 @@ func (st *muxServerState) dispatchStreamPacket(ctx context.Context, conn net.Con
 	}
 }
 
+func replyStreamFailure(conn net.Conn, reqID uint32, reason string) {
+	_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, reason)
+	muxstream.GracefulHalfClose(conn, muxstream.DefaultHalfCloseDrainTimeout)
+}
+
 func (st *muxServerState) handleOpenSFTP(ctx context.Context, conn net.Conn, body []byte) {
 	rd := muxstream.NewReader(body)
 	reqID, err := rd.ReadUint32()
@@ -58,12 +63,12 @@ func (st *muxServerState) handleOpenSFTP(ctx context.Context, conn net.Conn, bod
 	}
 	so, ok := st.upstream.(subsystemOpener)
 	if !ok {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, "upstream does not support raw sftp subsystem")
+		replyStreamFailure(conn, reqID, "upstream does not support raw sftp subsystem")
 		return
 	}
 	wc, err := so.OpenSubsystem(ctx, "sftp")
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	defer func() { _ = wc.Close() }()
@@ -80,22 +85,22 @@ func (st *muxServerState) handleDialTCP(ctx context.Context, conn net.Conn, body
 	host, e2 := rd.ReadString()
 	port, e3 := rd.ReadUint32()
 	if err := muxstream.FirstErr(e1, e2, e3); err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	ch, err := netaddr.ParseCanonicalHost(host)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	hp, err := netaddr.NewHostPort(ch, uint16(port))
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	remote, err := st.upstream.DialTCP(ctx, hp)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	defer func() { _ = remote.Close() }()
@@ -111,17 +116,17 @@ func (st *muxServerState) handleDialStreamLocal(ctx context.Context, conn net.Co
 	reqID, e1 := rd.ReadUint32()
 	rawPath, e2 := rd.ReadString()
 	if err := muxstream.FirstErr(e1, e2); err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	rp, err := pathalg.ParseRemotePath(rawPath)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	remote, err := st.upstream.DialStreamLocal(ctx, rp)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	defer func() { _ = remote.Close() }()
@@ -139,22 +144,22 @@ func (st *muxServerState) handleOpenTUN(ctx context.Context, conn net.Conn, body
 	lUnit, e3 := rd.ReadUint32()
 	rUnit, e4 := rd.ReadUint32()
 	if err := muxstream.FirstErr(e1, e2, e3, e4); err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	mode, err := muxstream.WireToTUNMode(modeRaw)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	ts, err := ports.NewTUNSpec(mode, lUnit, rUnit)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	remote, err := st.upstream.OpenTUN(ctx, ts)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	defer func() { _ = remote.Close() }()
@@ -173,7 +178,7 @@ func (st *muxServerState) handleOpenSession(ctx context.Context, conn net.Conn, 
 	}
 	sess, err := st.upstream.OpenSession(ctx)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	defer func() { _ = sess.Close() }()
@@ -189,12 +194,12 @@ func (st *muxServerState) handleRemoteListen(ctx context.Context, conn net.Conn,
 	reqID, e1 := rd.ReadUint32()
 	addr, e2 := rd.ReadString()
 	if err := muxstream.FirstErr(e1, e2); err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	ln, err := openUpstreamRemoteListener(ctx, st.upstream, isUnix, addr)
 	if err != nil {
-		_ = muxstream.WriteStatusReply(conn, muxstream.SFailure, reqID, err.Error())
+		replyStreamFailure(conn, reqID, err.Error())
 		return
 	}
 	defer func() { _ = ln.Close() }()

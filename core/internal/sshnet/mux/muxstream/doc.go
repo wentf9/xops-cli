@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -25,6 +26,9 @@ const (
 	MaxPacketBytes = 1 << 20
 	// CopyChunkBytes 限制单次流拷贝与帧分片大小（32 KiB），保持低内存占用与良好响应性。
 	CopyChunkBytes = 32 * 1024
+	// DefaultHalfCloseDrainTimeout 限制服务端终态回复后等待对端读毕关闭的最大排空时间，
+	// 避免 Windows afunix.sys 立即 closesocket 引发 WSAECONNRESET。
+	DefaultHalfCloseDrainTimeout = 250 * time.Millisecond
 )
 
 // HalfWriteCloser 表达支持 TCP/Unix/SSH 半关闭（写方向 EOF）的底层流接口。
@@ -115,3 +119,24 @@ func FirstErr(errs ...error) error {
 
 // ZeroVal 返回任意类型 T 的零值（规避对跨包 opaque 值类型书写复合字面量）。
 func ZeroVal[T any]() (z T) { return z }
+
+// GracefulHalfClose 在服务端写出最终应答帧后执行半关闭（CloseWrite）并在有界截止时间内等待对端关闭，
+// 防止 Windows afunix.sys 在客户端尚未读走内核发送缓冲时因立即 closesocket 触发 WSAECONNRESET。
+func GracefulHalfClose(conn net.Conn, maxWait time.Duration) {
+	if conn == nil {
+		return
+	}
+	if hc, ok := conn.(HalfWriteCloser); ok {
+		_ = hc.CloseWrite()
+	}
+	if maxWait <= 0 {
+		maxWait = DefaultHalfCloseDrainTimeout
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(maxWait))
+	var drain [64]byte
+	for {
+		if _, err := conn.Read(drain[:]); err != nil {
+			return
+		}
+	}
+}

@@ -213,6 +213,8 @@ func (st *muxServerState) handleStopControl(conn net.Conn, body []byte) {
 	st.stoppedByControl.Store(true)
 	st.closeAllForwards()
 	_ = muxstream.WriteStatusReply(conn, muxstream.SOK, reqID, "")
+	// 先优雅半关闭并排空对端 EOF，再触发 cancelServe，避免 Windows afunix.sys 抢先 RST SOK 帧。
+	muxstream.GracefulHalfClose(conn, muxstream.DefaultHalfCloseDrainTimeout)
 	st.cancelServe()
 }
 
@@ -291,6 +293,9 @@ func (st *muxServerState) handleProxyMode(ctx context.Context, conn net.Conn, bo
 	_ = conn.SetDeadline(time.Time{})
 	if st.owner.proxyHandler != nil {
 		_ = st.owner.proxyHandler(ctx, conn, st.upstream)
+		if ctx.Err() == nil {
+			muxstream.GracefulHalfClose(conn, muxstream.DefaultHalfCloseDrainTimeout)
+		}
 		return
 	}
 	// 默认代理模式保持双向连接存活直至客户端半关闭/断开或 ControlMaster 停机。

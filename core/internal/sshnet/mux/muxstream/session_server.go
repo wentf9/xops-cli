@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
@@ -32,6 +33,7 @@ func ServeSessionBridge(ctx context.Context, conn net.Conn, sess ports.RemoteSes
 	stdinW, stdoutR, stderrR, err := claimAndStartRemoteSession(ctx, sess, msgType, body)
 	if err != nil {
 		_ = fw.Write(SessMsgStarted, AppendStr(AppendU32(nil, 0), err.Error()))
+		GracefulHalfClose(conn, DefaultHalfCloseDrainTimeout)
 		return
 	}
 	if err := fw.Write(SessMsgStarted, AppendStr(AppendU32(nil, 1), "")); err != nil {
@@ -101,7 +103,9 @@ func runSessionPumps(ctx context.Context, conn net.Conn, fw *SyncFrameWriter, se
 			_ = conn.Close()
 			return nil
 		})
+		clientReadDone := make(chan struct{})
 		_ = n.Go(func(c context.Context) error {
+			defer close(clientReadDone)
 			defer func() { _ = stdinW.Close() }()
 			pumpClientSessionFrames(c, conn, fw, sess, stdinW, cancel)
 			return nil
@@ -124,9 +128,25 @@ func runSessionPumps(ctx context.Context, conn net.Conn, fw *SyncFrameWriter, se
 		if payload, pErr := EncodeOutcomePayload(outcome, waitErr); pErr == nil {
 			_ = fw.Write(SessMsgOutcome, payload)
 		}
+		// 半关闭写方向并在有界时间内等待客户端读毕 SessMsgOutcome 后关闭连接，
+		// 避免 Windows afunix.sys 立即 closesocket 截断结果帧引发 WSAECONNRESET。
+		waitPeerHalfClose(wCtx, conn, clientReadDone)
 		cancel()
 		return nil
 	})
+}
+
+func waitPeerHalfClose(ctx context.Context, conn net.Conn, clientReadDone <-chan struct{}) {
+	if hc, ok := conn.(HalfWriteCloser); ok {
+		_ = hc.CloseWrite()
+	}
+	timer := time.NewTimer(DefaultHalfCloseDrainTimeout)
+	defer timer.Stop()
+	select {
+	case <-clientReadDone:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func pumpRemoteOutputFrames(fw *SyncFrameWriter, src io.Reader, dataType, eofType uint32) {

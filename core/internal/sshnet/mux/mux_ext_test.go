@@ -26,6 +26,7 @@ import (
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/forward"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/mux"
+	"github.com/wentf9/xops-cli/core/internal/sshnet/mux/muxstream"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/core/ports/tck"
 )
@@ -107,8 +108,12 @@ func TestMuxSocket_ControlForwardCancelStopAndProxy(t *testing.T) {
 			if _, err := io.ReadFull(conn, buf[:]); err != nil {
 				return err
 			}
-			_, err := conn.Write(bytes.ToUpper(buf[:]))
-			return err
+			if _, err := conn.Write(bytes.ToUpper(buf[:])); err != nil {
+				return err
+			}
+			// 写毕主动半关闭并排空对端 EOF，防止 Windows afunix.sys 在客户端读完前 RST。
+			muxstream.GracefulHalfClose(conn, muxstream.DefaultHalfCloseDrainTimeout)
+			return nil
 		},
 	})
 	resp, err := m.Probe(ctx, sockPath)
@@ -344,6 +349,7 @@ func handleRawOpenSSHConn(c net.Conn) (bool, error) {
 			binary.BigEndian.PutUint32(out[4:8], 0x80000001)
 			binary.BigEndian.PutUint32(out[8:12], reqID)
 			_, wErr := c.Write(out[:])
+			muxstream.GracefulHalfClose(c, muxstream.DefaultHalfCloseDrainTimeout)
 			return true, wErr
 		default:
 			return false, nil
