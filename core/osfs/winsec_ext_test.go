@@ -86,6 +86,27 @@ func TestEvaluateWindowsObjectACL(t *testing.T) {
 			want: security.VerdictDeny,
 		},
 		{
+			name: "pipe_server_safe_allows_duplex_client_write_data",
+			in:   osfs.WindowsACLInput{Mode: osfs.WindowsACLPipeServerSafe, OwnerTrusted: true, HasDACL: true, ACEs: []osfs.ParsedWindowsACE{trustedAllow, untrustedWrite}},
+			want: security.VerdictAllow,
+		},
+		{
+			name: "pipe_server_safe_rejects_create_pipe_instance",
+			in: osfs.WindowsACLInput{
+				Mode: osfs.WindowsACLPipeServerSafe, OwnerTrusted: true, HasDACL: true,
+				ACEs: []osfs.ParsedWindowsACE{trustedAllow, {ACEType: osfs.WinACETypeAllow, Mask: osfs.WinAccessCreatePipeInstance, SIDValid: true, SIDTrusted: false}},
+			},
+			want: security.VerdictDeny,
+		},
+		{
+			name: "pipe_server_safe_rejects_generic_write",
+			in: osfs.WindowsACLInput{
+				Mode: osfs.WindowsACLPipeServerSafe, OwnerTrusted: true, HasDACL: true,
+				ACEs: []osfs.ParsedWindowsACE{trustedAllow, {ACEType: osfs.WinACETypeAllow, Mask: osfs.WinAccessGenericWrite, SIDValid: true, SIDTrusted: false}},
+			},
+			want: security.VerdictDeny,
+		},
+		{
 			name: "rejects_unknown_ace_type",
 			in:   osfs.WindowsACLInput{Mode: osfs.WindowsACLOwnerOnly, OwnerTrusted: true, HasDACL: true, ACEs: []osfs.ParsedWindowsACE{{ACEType: 0x99}}},
 			want: security.VerdictDeny,

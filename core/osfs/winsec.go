@@ -15,11 +15,13 @@ const (
 	WinAttrDirectory, WinAttrDevice, WinAttrReparsePoint                         uint32 = 0x10, 0x40, 0x400
 	WinACEFlagInheritOnly, WinACETypeAllow, WinACETypeDeny                       uint8  = 0x08, 0x00, 0x01
 	WinAccessWriteData, WinAccessAppendData, WinAccessWriteEA                    uint32 = 0x02, 0x04, 0x10
+	WinAccessCreatePipeInstance                                                  uint32 = 0x04 // WinSDK FILE_CREATE_PIPE_INSTANCE（命名管道抢注权限）
 	WinAccessDeleteChild                                                         uint32 = 0x40 // WinSDK winnt.h FILE_DELETE_CHILD（目录删除子项权限）
 	WinAccessWriteAttrs, WinAccessDelete, WinAccessWriteDAC, WinAccessWriteOwner uint32 = 0x100, 0x10000, 0x40000, 0x80000
 	WinAccessGenericAll, WinAccessGenericWrite                                   uint32 = 0x10000000, 0x40000000
 	winMutatingMask                                                              uint32 = WinAccessWriteData | WinAccessAppendData | WinAccessWriteEA | WinAccessDeleteChild |
 		WinAccessWriteAttrs | WinAccessDelete | WinAccessWriteDAC | WinAccessWriteOwner | WinAccessGenericAll | WinAccessGenericWrite
+	winPipeUnsafeMask uint32 = WinAccessCreatePipeInstance | WinAccessWriteDAC | WinAccessWriteOwner | WinAccessGenericAll | WinAccessGenericWrite
 )
 
 // WindowsACLMode 区分 Windows DACL 安全评估策略；零值 WindowsACLInvalid 严格失败关闭。
@@ -32,6 +34,7 @@ const (
 	WindowsACLInvalid         WindowsACLMode = iota // 无效评估模式（零值失败关闭）
 	WindowsACLOwnerOnly                             // 仅受信任所有者/系统主体可访问
 	WindowsACLWriteRestricted                       // 严禁非受信任主体具备写/删/改权位
+	WindowsACLPipeServerSafe                        // 命名管道服务端：阻断非受信任主体抢注实例/改权限，放行合法双工 FILE_WRITE_DATA
 )
 
 // ParsedWindowsACE 表示从 Windows DACL 解码出的单条 ACE 纯数学视图。
@@ -51,7 +54,7 @@ type WindowsACLInput struct {
 
 // EvaluateWindowsObjectACL 以失败关闭交半格语义评估 Windows 对象属性与 DACL 安全性（INV-A4 / INV-E1）。
 func EvaluateWindowsObjectACL(in WindowsACLInput) security.Verdict {
-	if (in.Mode != WindowsACLOwnerOnly && in.Mode != WindowsACLWriteRestricted) ||
+	if (in.Mode != WindowsACLOwnerOnly && in.Mode != WindowsACLWriteRestricted && in.Mode != WindowsACLPipeServerSafe) ||
 		!in.OwnerTrusted || !in.HasDACL || !isSafeWin32ObjectAttrs(in.Attrs, in.ExpectDir, in.AllowReparse) {
 		return security.VerdictDeny
 	}
@@ -70,8 +73,8 @@ func evaluateSingleWindowsACE(mode WindowsACLMode, expectDir bool, ace ParsedWin
 	if (!expectDir && ace.ACEFlags&WinACEFlagInheritOnly != 0) || ace.ACEType == WinACETypeDeny {
 		return security.VerdictAllow
 	}
-	if ace.ACEType != WinACETypeAllow || !ace.SIDValid ||
-		(!ace.SIDTrusted && ((mode == WindowsACLOwnerOnly && ace.Mask != 0) || (mode == WindowsACLWriteRestricted && ace.Mask&winMutatingMask != 0))) {
+	deniedMask := pickIf(mode == WindowsACLPipeServerSafe, winPipeUnsafeMask, pickIf(mode == WindowsACLWriteRestricted, winMutatingMask, ^uint32(0)))
+	if ace.ACEType != WinACETypeAllow || !ace.SIDValid || (!ace.SIDTrusted && ace.Mask&deniedMask != 0) {
 		return security.VerdictDeny
 	}
 	return security.VerdictAllow

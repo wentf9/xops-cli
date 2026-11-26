@@ -26,9 +26,10 @@ func checkOSSymbols(pass *analysis.Pass, s *buildssa.SSA, pkgInfo vetutil.PkgInf
 		return
 	}
 	reported := make(map[token.Pos]bool)
+	allowedSysOpen := collectAllowedSysUnixOpenPositions(pass, allowOSFS, allowSys)
 	vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.SelectorExpr)(nil), (*ast.Ident)(nil)}, func(n ast.Node) {
 		if !vetutil.IsPosInTestFile(pass, n.Pos()) {
-			checkOSSymbolNode(pass, n, allowOSFS, allowSys, reported)
+			checkOSSymbolNode(pass, n, allowOSFS, allowSys, allowedSysOpen, reported)
 		}
 	})
 	if !allowOSFS && s != nil {
@@ -36,7 +37,7 @@ func checkOSSymbols(pass *analysis.Pass, s *buildssa.SSA, pkgInfo vetutil.PkgInf
 	}
 }
 
-func checkOSSymbolNode(pass *analysis.Pass, n ast.Node, allowOSFS, allowSys bool, reported map[token.Pos]bool) {
+func checkOSSymbolNode(pass *analysis.Pass, n ast.Node, allowOSFS, allowSys bool, allowedSysOpen, reported map[token.Pos]bool) {
 	switch node := n.(type) {
 	case *ast.SelectorExpr:
 		if sel := pass.TypesInfo.Selections[node]; sel != nil {
@@ -45,11 +46,11 @@ func checkOSSymbolNode(pass *analysis.Pass, n ast.Node, allowOSFS, allowSys bool
 			}
 			return
 		}
-		if obj := pass.TypesInfo.Uses[node.Sel]; obj != nil {
+		if obj := pass.TypesInfo.Uses[node.Sel]; obj != nil && !allowedSysOpen[node.Sel.Pos()] {
 			reportBannedObject(pass, node.Sel, obj, allowOSFS, allowSys, reported)
 		}
 	case *ast.Ident:
-		if obj := pass.TypesInfo.Uses[node]; obj != nil {
+		if obj := pass.TypesInfo.Uses[node]; obj != nil && !allowedSysOpen[node.Pos()] {
 			reportBannedObject(pass, node, obj, allowOSFS, allowSys, reported)
 		}
 	}

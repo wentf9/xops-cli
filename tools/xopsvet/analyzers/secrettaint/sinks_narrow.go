@@ -47,29 +47,11 @@ func (e *taintEngine) auditDialKIFunc(kiFn *ssa.Function, roots []ssa.Value) {
 	e.runScopeAudit(vetssa.AuditKey{}, kiFn, tainted, callerParams, kiScope, 0, nil, kiFn)
 }
 
-func isVaultNarrowCredentialFieldStore(pkgInfo vetutil.PkgInfo, fa *ssa.FieldAddr) bool {
-	if pkgInfo.IsExternalTest || pkgInfo.Layer != vetutil.LayerHostVault || fa == nil {
-		return false
-	}
-	named, ok := vetutil.UnwrapNamedType(fa.X.Type())
-	return ok && named != nil && named.Obj() != nil && (named.Obj().Name() == "credentialW" || named.Obj().Name() == "CREDENTIALW")
-}
-
-func (ts *taintScope) isAllowedNarrowConsumerCall(rc vetssa.ResolvedCall) bool {
-	if isAllowedVaultProcCall(ts.eng.pkgInfo, rc) {
+func (ts *taintScope) isAllowedNarrowConsumerCall(callInst ssa.CallInstruction, rc vetssa.ResolvedCall, inSc vetssa.ScopeRange) bool {
+	if ts.isAllowedVaultNarrowCall(callInst, rc, inSc) {
 		return true
 	}
 	return ts.isAllowedPrivEscalationWrite(rc)
-}
-
-func isAllowedVaultProcCall(pkgInfo vetutil.PkgInfo, rc vetssa.ResolvedCall) bool {
-	if pkgInfo.IsExternalTest || pkgInfo.Layer != vetutil.LayerHostVault || rc.FuncObj == nil || rc.FuncObj.Name() != "Call" {
-		return false
-	}
-	pkgPath := vetutil.ObjectPkgPath(rc.FuncObj)
-	named, ok := secretfact.RecvNamedType(rc.FuncObj)
-	return (pkgPath == "syscall" || pkgPath == "golang.org/x/sys/windows") &&
-		ok && named.Obj() != nil && (named.Obj().Name() == "LazyProc" || named.Obj().Name() == "Proc")
 }
 
 // isAllowedPrivEscalationWrite 仅在 LayerCoreSSHNetPriv 生产/白盒包内按严格正向来源白名单放行向远端 SSH 会话/通道写入提权明文字节；
