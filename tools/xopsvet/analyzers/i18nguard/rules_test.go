@@ -4,67 +4,59 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
-	"golang.org/x/tools/go/analysis/analysistest"
 )
 
-func TestI18nGuardFullScopeAndConcWhitelist(t *testing.T) {
-	testdata := analysistest.TestData()
-	analysistest.Run(
-		t,
-		testdata,
-		newAnalyzer(true),
-		"github.com/wentf9/xops-cli/core/conc",
-		"github.com/wentf9/xops-cli/internal/entry/cli",
-		"github.com/wentf9/xops-cli/cmd/xops",
-		"github.com/wentf9/xops-cli/internal/host/sys/interact",
-		"github.com/wentf9/xops-cli/core/ports/tck",
-		"github.com/wentf9/xops-cli/core/internal/sim",
-		"github.com/wentf9/xops-cli/tools/xopsvet/sample",
-	)
-}
-
-func TestIsRules23Enforced_M2ScopeMatrix(t *testing.T) {
+func TestPermanentSkipAndRule2AllowlistMatrix(t *testing.T) {
 	cases := []struct {
-		pkg  string
-		want bool
+		pkg           string
+		wantSkipAll   bool
+		wantRule2Skip bool
 	}{
-		// M1 + M2 合闸范围：必须强制执行规则 2/3。
-		{pkg: vetutil.ModulePrefix + "/core/domain/i18n", want: true},
-		{pkg: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/i18n", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/entry/cli", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/entry/cli/clikit", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/entry/cli/cmdssh", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/entry/tui", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/entry/sftpshell", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/entry/mcpcmd", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/entry/muxdaemon", want: true},
-		{pkg: vetutil.ModulePrefix + "/cmd/xops", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/host/sys/interact", want: true},
-		{pkg: vetutil.ModulePrefix + "/internal/host/sys/interact/sub", want: true},
+		// 全局永久跳过：外置 *_test、core/ports/tck、core/internal/sim、tools/xopsvet。
+		{pkg: vetutil.ModulePrefix + "/core/ports/tck", wantSkipAll: true, wantRule2Skip: true},
+		{pkg: vetutil.ModulePrefix + "/core/internal/sim", wantSkipAll: true, wantRule2Skip: true},
+		{pkg: vetutil.ModulePrefix + "/tools/xopsvet/analyzers/i18nguard", wantSkipAll: true, wantRule2Skip: true},
+		{pkg: vetutil.ModulePrefix + "/core/engine_test", wantSkipAll: true, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/host/sys_test", wantSkipAll: true, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/entry/cli_test", wantSkipAll: true, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/cmd/xops_test", wantSkipAll: true, wantRule2Skip: false},
 
-		// 外置测试包：必须豁免。
-		{pkg: vetutil.ModulePrefix + "/internal/entry/cli_test", want: false},
-		{pkg: vetutil.ModulePrefix + "/cmd/xops_test", want: false},
-		{pkg: vetutil.ModulePrefix + "/internal/host/sys/interact_test", want: false},
+		// 规则 2 永久基础设施白名单（仍受规则 1 与规则 3 约束）：core/domain/i18n（含 internal/corecatalog）与 core/conc。
+		{pkg: vetutil.ModulePrefix + "/core/domain/i18n", wantSkipAll: false, wantRule2Skip: true},
+		{pkg: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", wantSkipAll: false, wantRule2Skip: true},
+		{pkg: vetutil.ModulePrefix + "/core/conc", wantSkipAll: false, wantRule2Skip: true},
 
-		// 留待 M3 Wave 3A-3E 迁移的包：M2 阶段暂未对规则 2/3 合闸。
-		{pkg: vetutil.ModulePrefix + "/internal/host/sys", want: false},
-		{pkg: vetutil.ModulePrefix + "/internal/host/sys/agent", want: false},
-		{pkg: vetutil.ModulePrefix + "/internal/host/sys/tun", want: false},
-		{pkg: vetutil.ModulePrefix + "/internal/host/store", want: false},
-		{pkg: vetutil.ModulePrefix + "/internal/host/vault/offline", want: false},
-		{pkg: vetutil.ModulePrefix + "/internal/host/audit", want: false},
-		{pkg: vetutil.ModulePrefix + "/core/engine", want: false},
-		{pkg: vetutil.ModulePrefix + "/core/ports", want: false},
-		{pkg: vetutil.ModulePrefix + "/core/osfs", want: false},
-		{pkg: vetutil.ModulePrefix + "/core/domain/pathalg", want: false},
-		{pkg: vetutil.ModulePrefix + "/core/internal/usecase/session", want: false},
+		// 其余全仓生产包：规则 1、规则 2 与规则 3 100% 强制执行，无豁免。
+		{pkg: vetutil.ModulePrefix + "/internal/i18n", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/domain/algebraic", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/domain/pathalg", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/ports", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/events", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/osfs", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/engine", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/internal/pool", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/internal/gate", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/internal/sshnet/dial", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/internal/usecase/session", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/core/internal/mcpruntime/protocol", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/host/sys", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/host/sys/interact", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/host/sys/agent", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/host/store", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/host/vault/offline", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/host/audit", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/entry/cli", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/entry/tui", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/internal/entry/sftpshell", wantSkipAll: false, wantRule2Skip: false},
+		{pkg: vetutil.ModulePrefix + "/cmd/xops", wantSkipAll: false, wantRule2Skip: false},
 	}
 	for _, tc := range cases {
-		got := isRules23Enforced(vetutil.ClassifyPackage(tc.pkg))
-		if got != tc.want {
-			t.Errorf("isRules23Enforced(%q) = %v, want %v", tc.pkg, got, tc.want)
+		info := vetutil.ClassifyPackage(tc.pkg)
+		if got := isAlwaysSkippedPkg(info); got != tc.wantSkipAll {
+			t.Errorf("isAlwaysSkippedPkg(%q) = %v, want %v", tc.pkg, got, tc.wantSkipAll)
+		}
+		if got := isRule2AllowedPkg(info); got != tc.wantRule2Skip {
+			t.Errorf("isRule2AllowedPkg(%q) = %v, want %v", tc.pkg, got, tc.wantRule2Skip)
 		}
 	}
 }

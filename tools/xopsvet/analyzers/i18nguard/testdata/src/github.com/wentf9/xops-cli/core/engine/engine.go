@@ -82,9 +82,20 @@ func goodUsage(paramID domi18n.MessageID, loc *i18n.Localizer) domi18n.MessageID
 	case domi18n.KeyCore, i18n.KeyRoot:
 		return domi18n.KeyCore
 	}
-	// M1 阶段分阶段作用域：非 i18n 包暂未对规则 2/3 合闸。
-	_ = fmt.Errorf("staged: %w", errors.New("未迁移中文提示"))
 	return domi18n.KeyCore
+}
+
+type badEngineStructErr struct{ msg string } // want "自定义错误类型 badEngineStructErr 必须在匹配的接收者方法集上实现 LocalizableView"
+
+func (e *badEngineStructErr) Error() string { return e.msg }
+
+func badRule2AndRule3InEngine(e error) error {
+	_ = &badEngineStructErr{msg: "bad"}
+	_ = errors.Join(e, nil)
+	_ = errors.New("engine raw")    // want "禁止引用 errors.New"
+	_ = fmt.Errorf("engine: %w", e) // want "禁止引用 fmt.Errorf"
+	_ = "引擎层禁止中文"                   // want "禁止在生产源码中硬编码中文/CJK 字符或全角标点字面量"
+	return nil
 }
 
 func badRule1Positions(existing domi18n.MessageID, raw string, ch chan domi18n.MessageID, loc *i18n.Localizer) domi18n.MessageID {

@@ -7,13 +7,14 @@ import (
 	"golang.org/x/tools/go/analysis/analysistest"
 )
 
-func TestI18nGuardM2StagedScope(t *testing.T) {
+func TestI18nGuardFullRepoScope(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(
 		t,
 		testdata,
 		i18nguard.NewAnalyzer(),
 		"github.com/wentf9/xops-cli/core/domain/i18n",
+		"github.com/wentf9/xops-cli/core/conc",
 		"github.com/wentf9/xops-cli/internal/i18n",
 		"github.com/wentf9/xops-cli/internal/entry/cli",
 		"github.com/wentf9/xops-cli/cmd/xops",
