@@ -1,12 +1,12 @@
-# XOps CLI
+# XOps CLI (v2)
 
 <div align="center">
   <img src="docs/public/logo.svg" width="88" alt="XOps CLI Logo" />
-  <h3>Modern Terminal Operations & AI Automation in a Single Binary</h3>
-  <p><b>SSH / SFTP · Terminal UI · Offline Encrypted Vault · Parallel Batch Execution · YAML Playbooks · Guardrailed MCP Server & Agent Skill</b></p>
+  <h3>Single-Binary, Zero-Remote-Dependency SSH Operations & Guardrailed AI Automation</h3>
+  <p><b>OpenSSH-Compatible CLI · Parallel Execution & Playbook v2 · Resumable SFTP/SCP · Bubble Tea v2 TUI Workbench · AEAD Encrypted Vault · 7-Tool Sandboxed MCP Server & Agent Skill</b></p>
 
   <p>
-    <img alt="Go Version" src="https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat-square&logo=go" />
+    <img alt="Go Version" src="https://img.shields.io/badge/Go-1.27+-00ADD8?style=flat-square&logo=go" />
     <img alt="Platform" src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-4c8bf5?style=flat-square" />
     <img alt="MCP Ready" src="https://img.shields.io/badge/AI-MCP%20%26%20Agent%20Skill-8A2BE2?style=flat-square" />
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-2ea44f?style=flat-square" /></a>
@@ -14,8 +14,10 @@
 
   <p>
     <a href="https://wentf9.github.io/xops-cli/en/"><b>📖 Documentation</b></a> ·
-    <a href="https://wentf9.github.io/xops-cli/en/guide/getting-started"><b>🚀 Getting Started</b></a> ·
-    <a href="https://wentf9.github.io/xops-cli/en/reference/"><b>⌨️ Command Reference</b></a> ·
+    <a href="docs/en/guide/getting-started.md"><b>🚀 Quick Start</b></a> ·
+    <a href="docs/en/reference/index.md"><b>⌨️ CLI Reference</b></a> ·
+    <a href="docs/en/reference/config.md"><b>🧩 Config Schema v2</b></a> ·
+    <a href="docs/en/reference/mcp.md"><b>🤖 MCP Reference</b></a> ·
     <a href="docs/en/troubleshooting/index.md"><b>🔧 Troubleshooting</b></a> ·
     <a href="README.md"><b>简体中文</b></a>
   </p>
@@ -23,202 +25,209 @@
 
 ---
 
-Tired of stitching together half a dozen tools just to manage remote servers?
-- Editing `~/.ssh/config` by hand, or using `sshpass` and leaking plaintext passwords into your shell history?
-- Setting up a heavyweight Python / Ansible environment when all you want is a single binary to run parallel commands, distribute files, and converge state across a fleet?
-- Watching scripts break when hitting Alpine containers (no Bash), Windows OpenSSH (`cmd` / `PowerShell`), or `fish` / `zsh` hosts?
-- Wanting AI assistants (Claude, Codex, Cursor) to help inspect and operate servers—without giving them an unguarded root shell?
+**XOps v2** is a clean-room rewritten, single-binary cross-platform SSH/SFTP operations and AI automation platform built with Go 1.27+ (`CGO_ENABLED=0`):
 
-**XOps CLI** packs all of this into **one self-contained Go binary**: zero remote dependencies, local encrypted credential storage by default, automatic remote shell probing, and first-class **MCP Server** (with risk guardrails, interactive approvals, and audit logs) plus an installable **AI Agent Skill**.
+- **OpenSSH-Native CLI & 4-Layer Option Precedence**: Supports standard flags (`-p/-l/-i/-J/-L/-R/-D/-w/-W/-o/-O/-M/-S/-F/-t/-tt/-T/-N/-f`), deterministic 4-layer policy resolution (`CLI > Managed Node > XOps Global > ~/.ssh/config`), ControlMaster/ControlPersist multiplexing (`xops mux`), and local/remote/SOCKS5/StreamLocal/TUN tunnels (`xops tunnel`).
+- **Graph Inventory & Multi-Backend Encrypted Vault**: Decouples **Host**, **Identity**, and **Node** with Tarjan jump-DAG cycle detection and CAS persistence in strict `version: 2` YAML (`~/.xops/config.yaml`, overridable via `XOPS_HOME`). Plaintext secrets are forbidden in both YAML and CLI flags; supports `offline_aead` (Argon2id + XChaCha20-Poly1305), native `os_keychain` (Windows Credential Manager / macOS Keychain / Linux Secret Service), `external_helper` (JSON v2 stdin/stdout), and `none`.
+- **Batch Execution, Atomic SFTP & Declarative Playbook v2**: Single/batch concurrent command execution, privilege escalation (`--sudo`/`--su`/`--doas`), explicit launch profiles (`posix`/`powershell`/`cmd`/`raw` × `server`/`sh`/`bash`/`zsh`/`powershell`/`pwsh`/`cmd`), parallel resumable SCP, single-shot and interactive SFTP Shell, and declarative Playbook v2 (`shell`/`script`/`copy`/`template`/`ensure`). Strict 3-state execution outcomes flag uncertain network failures with `OutcomeUnknown` / `do_not_retry`.
+- **Fail-Closed Guardrails, O(1) Audit Reconciliation & Sandboxed MCP**: Capability-gated execution with synchronous `audit.jsonl` logging and O(1) startup crash-lock reconciliation; built-in **7 strongly-typed discriminated MCP tools** over `stdio` and Streamable HTTP (plus a 10 GiB dual-generation WAL streaming endpoint), defaulting to `strict_agent` with fail-closed `Halted` circuit breaking and **zero `OperatorReadFS`** (`ScopedRootFS`-only sandboxing).
 
 ---
 
-## ⚡ 30-Second Quick Start
+## ⚡ Quick Start
+
+### 1. Install or Build from Source
 
 ```bash
-# 1. Install prebuilt binary (Linux / macOS)
+# Install prebuilt binary (Linux / macOS)
 curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
 ```
 
 ```powershell
-# Install on Windows from PowerShell 5.1+ (x64 / ARM64, no administrator privileges required)
+# Install on Windows (PowerShell 5.1+, no admin privileges required)
 irm https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 | iex
 ```
 
 ```bash
-# 2. Import your existing ~/.ssh/config (local read only, no remote connections, never overwrites existing nodes)
-xops init
+# Build from source (requires Go 1.27+; CGO_ENABLED=0 works natively on Linux, macOS, and Windows)
+git clone https://github.com/wentf9/xops-cli.git && cd xops-cli && make build
+./bin/xops version
+```
 
-# 3. Connect to any host — saves the node and encrypts your password/passphrase locally only after auth succeeds
-xops ssh root@192.0.2.10
+### 2. Import Existing Inventory & Run Diagnostics
 
-# 4. Launch the interactive Terminal UI (SSH sessions, live system metrics, remote log search, tag management)
+```bash
+# Preview and import ~/.ssh/config (local parse only, zero remote connections; --format csv also supported)
+xops config import --format openssh --file ~/.ssh/config --plan
+xops config import --format openssh --file ~/.ssh/config
+
+# List managed nodes and run read-only inventory/vault diagnostics
+xops hosts list
+xops doctor
+```
+
+### 3. Connect, Run Batch Commands & Launch TUI Workbench
+
+```bash
+# Connect via alias or OpenSSH flags & jump chains
+xops ssh web-01
+xops ssh -J bastion -i ~/.ssh/id_ed25519 deploy@192.0.2.10
+
+# Run a command across tagged nodes concurrently with live streaming (add --json for canonical JSON/v2)
+xops exec --tags web --exclude-nodes web-maint-01 --concurrency 5 --stream -- uptime
+
+# Launch the Bubble Tea v2 terminal workbench (Hosts, Metrics, Logs, Operations + Enter SSH takeover)
 xops tui
 ```
 
-> **Build from source** (requires Go 1.26+; Makefile supports Linux, macOS, and Windows natively):
-> ```bash
-> git clone https://github.com/wentf9/xops-cli.git && cd xops-cli && make build
-> # Produces bin/xops.exe on Windows; run 'make windows' on any OS to cross-compile
-> ```
-
 ---
 
-## ✨ Why XOps CLI?
+## 🛠️ Feature Overview
 
-| Everyday Pain Point | How XOps CLI Solves It |
-| --- | --- |
-| **Plaintext passwords & repetitive prompts** | **Authenticate once, encrypted locally**: Verified login passwords, key passphrases, and `sudo`/`su` passwords are encrypted in `~/.xops/credentials/` (or OS Keychain / `pass` / external helpers). Plaintext secrets never touch YAML or shell history. |
-| **Broken scripts on non-Bash or Windows hosts** | **Zero remote dependencies + Auto Shell Probing**: Commands default to native `server` passthrough without requiring Bash. On first enrollment, XOps reuses the authenticated connection to probe the outer dialect (`posix`/`fish`/`cmd`/`powershell`) and installed interpreters (`bash`/`sh`/`zsh`/`fish`/`powershell`/`pwsh`/`cmd`). |
-| **Disconnect between interactive & batch tools** | **Scale from 1 host to 100**: Use the exact same inventory and credentials for interactive `xops ssh`, `xops tui`, and `xops sftp`, or fan out in parallel with `xops exec --tag web` and `xops scp --tag web`. |
-| **Heavyweight orchestration for simple deployments** | **Declarative YAML Playbooks**: Combine `shell`, `script`, `copy`, `template`, and idempotent `ensure` (`check` → `action` → verify) steps. Strict 3-state outcome tracking (`not_started` / `completed` / `unknown`) guarantees uncertain network drops are never blindly replayed. |
-| **Unsafe AI access to production servers** | **Dual AI Integration (MCP + Agent Skill)**: Built-in MCP server (`stdio` and LAN Streamable `HTTP`) with command risk analysis, interactive Elicitation approvals, protected path rules, and audit logs—plus the `xops-agent` Skill for direct CLI agents. |
-
----
-
-## 🛠️ Feature Tour
-
-### 1. Host Inventory, Auto-Probing & Encrypted Credentials
-
-XOps separates network addresses (**Host**), authentication profiles (**Identity**), and connection targets (**Node**), so multiple accounts can share the same server cleanly:
+### 1. Inventory Graph, Unified Import & 4-Layer OpenSSH Policy
 
 ```bash
-# Bulk-import hosts from CSV with the 'web' tag (verifies SSH auth and probes remote shells by default)
-xops host import hosts.csv --tag web
+# Create Host, Identity, and Node with optional optimistic CAS (--expected-revision)
+xops hosts create-host --id h-web1 --address 192.0.2.10:22 --tag web
+xops hosts create-identity --id id-deploy --user deploy --auth-kind private_key --key-path ~/.ssh/id_ed25519
+xops hosts create-node --id web-01 --host h-web1 --identity id-deploy --tag web --jump bastion
 
-# Add a single host manually
-xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --alias web-01 --tags web
+# Resolve effective connection plan (4-layer OpenSSH resolution + digest) and validate jump DAG
+xops hosts resolve web-01 --json
+xops hosts validate-dag
 
-# List hosts/tags, or probe remote OS and available interpreters on saved nodes
-xops host list
-xops host probe web-01
-xops host probe --all --save
-
-# Inspect credential stores and health
-xops credential store list
-xops credential doctor
+# Import from CSV (strictly rejects plaintext password/passphrase/secret columns)
+xops config import --format csv --file ./hosts.csv --plan
+xops config import --format csv --file ./hosts.csv
 ```
 
-- **Verified before saving**: First connections via `ssh`, `sftp`, `scp`, or `exec` save a new node only after the SSH handshake and authentication succeed—connection timeouts or wrong passwords never leave junk entries.
-- **Flexible saving policies**: Pass `--remember never` for a one-off session, or set `credential.remember_prompted: ask | never` globally. Use `--skip-verify` for offline additions/imports (or `--no-probe` to skip shell probing).
-- Learn more: [Hosts & Identities](docs/en/guide/hosts.md) · [Credential Storage](docs/en/guide/credentials.md) · [Offline Vault](docs/en/guide/offline-store.md) · [Credential Migration](docs/en/guide/migration.md)
+- See: [Hosts, Inventory & Imports](docs/en/guide/hosts.md) · [Config Schema v2 Reference](docs/en/reference/config.md)
 
-### 2. Enhanced SSH, Privilege Escalation & Interactive SFTP
+### 2. Zero-Plaintext Vault & Multi-Backend Routing
 
 ```bash
-# Connect via alias, or as a different user on the same host (reuses Host, isolates credentials)
-xops ssh web-01
-xops ssh audit@web-01
+# Initialize and inspect the offline AEAD vault (Argon2id + XChaCha20-Poly1305)
+xops creds init
+xops creds status
+xops creds doctor
 
-# Jump host traversal (multi-hop ProxyJump via IP/FQDN/host:port or saved node aliases)
-xops ssh -J bastion.example.com -i ~/.ssh/id_rsa root@192.0.2.13
+# Enroll passwords, encrypted private key passphrases, or node privilege secrets interactively
+xops creds enroll-password --id id-app --user app --store offline
+xops creds enroll-key --id id-key --user deploy --key-path ~/.ssh/id_ed25519 --store offline
+xops creds set-node-privilege --node web-01 --store offline
 
-# No root SSH login required: connect as an ordinary user and escalate via sudo / sudo-rs / su
-xops ssh --sudo web-01
-xops exec -x --sudo web-01 id
+# Atomic secret rotation and reference-checked garbage collection
+xops creds rotate offline/old-item --store offline
+xops creds gc offline/orphan-item
+```
 
-# Port forwarding & dynamic SOCKS5 proxy (with smart keepalive and disconnect cleanup)
-xops ssh -L 8080:127.0.0.1:80 -D 1080 -N web-01
+- See: [Credential Routing & Vault](docs/en/guide/credentials.md) · [Offline Encrypted Vault](docs/en/guide/offline-store.md)
 
-# Interactive SFTP shell (multi-page Tab completion, Ctrl+R history search, cwd-aware 'exec')
+### 3. SSH, Tunnels, ControlMaster Multiplexing & SFTP/SCP
+
+```bash
+# Single-target privilege escalation (sudo / su / doas) and explicit launch profiles
+xops exec --sudo --password-ref offline/web01-sudo web-01 -- systemctl status nginx
+xops exec --dialect powershell --interpreter pwsh win-01 -- 'Get-Process | Select-Object -First 5'
+
+# Local (-L), remote (-R), dynamic SOCKS5 (-D), StreamLocal, and TUN (-w) tunnels
+xops tunnel local web-01 127.0.0.1:18080:127.0.0.1:80
+xops ssh -M -f -N -S ~/.xops/mux-%C -o ControlPersist=10m web-01
+xops mux check -S ~/.xops/mux-%C web-01
+
+# Parallel resumable SCP and single-shot / interactive SFTP
+xops scp -r --resume --concurrency 4 ./dist web-01:/srv/app/
+xops sftp patch --old "debug=true" --new "debug=false" web-01 /srv/app/app.ini
 xops sftp web-01
 ```
 
-- Learn more: [SSH & Privilege Escalation](docs/en/guide/ssh.md) · [SFTP & File Transfer](docs/en/guide/sftp.md) · [Terminal UI (TUI)](docs/en/guide/tui.md)
+- See: [SSH, Tunnels & Multiplexing](docs/en/guide/ssh.md) · [Command Execution](docs/en/guide/exec.md) · [SFTP & SCP Transfers](docs/en/guide/sftp.md) · [Terminal Workbench (TUI)](docs/en/guide/tui.md)
 
-### 3. Parallel Batch Execution & YAML Playbooks
+### 4. Declarative Playbook v2, Guardrails & Audit
 
-```bash
-# Run a command in parallel across all 'web' hosts (excluding a maintenance node)
-xops exec --tag web --exclude web-maint-01 -c "uptime"
-
-# Distribute and run a local script across hosts with concurrency of 5
-xops exec --tag web --shell ./setup.sh --task 5
-
-# Distribute a configuration file to a group of servers
-xops scp --tag web ./config.conf /etc/app/
-```
-
-Define idempotent deployments in YAML (`deploy.yaml`):
+Define a declarative Playbook v2 (`deploy.yaml`; strict JSON is also accepted):
 
 ```yaml
-name: deploy-web
-targets:
+version: 2
+id: deploy-web
+name: "Deploy Nginx Web Fleet"
+on_error: fail_fast # fail_fast | continue | abort
+target:
   tags: [web]
-settings:
-  concurrency: 2
-  on_error: stop # stop | abort_all | continue
+  exclude_nodes: [web-maint-01]
 vars:
   app_port: "8080"
 steps:
-  - name: "Ensure nginx is installed"
-    ensure:
-      check: "nginx -v"
-      action: "apt-get update && apt-get install -y nginx"
-    sudo: true
-
-  - name: "Render and distribute configuration"
-    template:
-      src: "./nginx.conf.tmpl"
+  - id: ensure-nginx
+    name: "Ensure nginx is installed"
+    action:
+      kind: ensure
+      check:
+        kind: shell
+        command: "nginx -v"
+      action:
+        kind: shell
+        command: "apt-get update && apt-get install -y nginx"
+  - id: render-conf
+    name: "Render and atomically upload config"
+    action:
+      kind: template
+      source: "./nginx.conf.tmpl"
       dest: "/etc/nginx/nginx.conf"
-    sudo: true
-
-  - name: "Restart nginx service"
-    shell: "systemctl restart nginx"
-    sudo: true
+      mode: "0644"
+      overwrite: true
+      atomic: true
+  - id: reload-nginx
+    name: "Reload nginx"
+    action:
+      kind: shell
+      command: "systemctl reload nginx"
 ```
 
 ```bash
-# Preview the execution plan (dry run) and execute with variable overrides
-xops play deploy.yaml --dry-run
-xops play deploy.yaml --var app_port=8081 --limit web-01
+# Offline AST & schema validation (zero Engine init, zero remote connections)
+xops playbook validate deploy.yaml
+
+# Execute playbook (supports --var, --target, --concurrency, --scoped-root, --policy, --json)
+xops playbook run deploy.yaml --var app_port=8081 --concurrency 2 --json
+
+# Inspect audit records and run O(1) cross-process crash-lock reconciliation
+xops audit tail --limit 20
+xops audit reconcile --json
 ```
 
-- Learn more: [Command Execution](docs/en/guide/exec.md) · [Playbooks & Automation](docs/en/guide/automation.md)
+- See: [Playbooks v2, Guardrails & Audit](docs/en/guide/automation.md)
 
-### 4. AI Integration: MCP Server & Agent Skill
-
-XOps offers two independent ways to integrate with AI assistants:
+### 5. AI Integration: 7-Tool Sandboxed MCP Server & `xops-agent` Skill
 
 #### Option A: Built-in MCP Server (Claude Desktop / Cursor / Codex / Antigravity)
 
 ```bash
-# Start local stdio MCP server (inventory, command execution, SFTP file tools, and -L/-R SSH tunnels)
-xops mcp serve
+# stdio transport (defaults to strict_agent profile with zero OperatorReadFS)
+xops mcp serve --transfer-root ~/.xops/transfers
 
-# Start LAN Streamable HTTP MCP server (Bearer token auth + streamed multi-GiB file transfers)
-xops mcp serve --transport http --listen 0.0.0.0:8080 \
-  --public-url http://192.168.1.10:8080 --token-file ~/.xops/mcp.token
+# Streamable HTTP transport (loopback-only 127.0.0.1:8080 by default, DNS Rebinding/CSRF guard + 10 GiB streaming)
+xops mcp serve --transport http --listen 127.0.0.1:8080 --transfer-root ~/.xops/transfers
 ```
 
-Add to `claude_desktop_config.json`:
+> **Security Boundary Note**: MCP mode physically sets `OperatorReadFS == nil` and exposes only `ScopedRootFS` sandbox directories. Consequently, nodes configured with host private-key file paths (`AuthPrivateKey`) cannot read arbitrary files from host disk in MCP mode—**load your keys into `ssh-agent`** (or use `kind: agent` / an unlocked Vault backend) when connecting via MCP.
 
-```json
-{
-  "mcpServers": {
-    "xops": {
-      "command": "/usr/local/bin/xops",
-      "args": ["mcp", "serve"]
-    }
-  }
-}
-```
+- See: [MCP Server & HTTP Streaming](docs/en/guide/mcp-http.md) · [MCP Tunnel & Mux Tools](docs/en/guide/mcp-tunnels.md) · [MCP 7-Tool Protocol Reference](docs/en/reference/mcp.md)
 
-- **Built-in Guardrails**: Evaluates command and path risk before execution, prompts for interactive client approval (`Elicitation`) on sensitive operations, invalidates permits if target settings change during approval, and writes structured audit logs.
-- Learn more: [MCP HTTP & File Transfers](docs/en/guide/mcp-http.md) · [MCP SSH Tunnels](docs/en/guide/mcp-tunnels.md)
+#### Option B: `xops-agent` Agent Skill
 
-#### Option B: `xops-agent` Skill (Direct CLI Operation for Agents)
-
-Install the [`xops-agent`](skills/xops-agent/SKILL.md) Skill so Skill-capable agents can operate `xops` directly in their shell without running an MCP server:
+Let Skill-capable AI assistants operate `xops` directly via CLI (`--json` & `--policy`):
 
 ```bash
 npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
+# Or from a source checkout
+make install-skill
 ```
 
-For manual installation, copy the complete `skills/xops-agent/` directory (preserving `SKILL.md` and `references/`). See the [Agent Skill Guide](docs/en/guide/agent-skill.md).
+- See: [Agent Skill & AI Overview](docs/en/guide/agent-skill.md) · [`skills/xops-agent/SKILL.md`](skills/xops-agent/SKILL.md)
 
 ---
 
 ## 📄 License
 
-Released under the [MIT License](LICENSE). If XOps CLI makes your server operations or AI workflows easier, please consider giving the repo a **Star ⭐**!
+Released under the [MIT License](LICENSE).

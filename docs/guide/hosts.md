@@ -1,214 +1,137 @@
-# 主机与身份
+# 主机资产与配置导入
 
-XOps 将网络地址（**Host**）、认证身份（**Identity**）和连接节点（**Node**）分开保存。同一台服务器地址可以关联多个不同账号（如 `deploy` 和 `audit`），互不混淆凭据。
+XOps v2 将 SSH 资产建模为不可变强类型三实体资产图（**Host / Identity / Node**），持久化在 `~/.xops/config.yaml`（`version: 2`），并通过乐观并发 CAS（`--expected-revision`）、旁路文件锁（`config.yaml.lock`）与 Tarjan 跳板 DAG 校验保障一致性。
 
-## 快速上手
+## 1. 三实体资产图模型
 
-```bash
-# 手动添加单台主机（支持 [别名] [user@]host[:port] 位置参数简写，默认自动验证 SSH 连接并探测远端 Shell）
-xops host add web-01 deploy@192.0.2.10 -k ~/.ssh/id_ed25519 -t web
-# 完整参数写法（等价）
-xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --alias web-01 --tags web
+| 实体 | 职责 | 关键字段 |
+| --- | --- | --- |
+| **Host** | 网络端点与标签 | `address`、`port`（默认 `22`）、`alias`、`tags`、`description` |
+| **Identity** | 登录用户与认证方式（封闭和类型） | `user`、`auth`（`agent` / `password` / `private_key` / `keyboard_interactive` / `composite`）、`tags`、`description` |
+| **Node** | 绑定单个 Host 与 Identity 的连接目标 | `host`、`identity`、`aliases`、`tags`、`proxy`（`jump` / `command` / `disabled`）、`execution`、`options`、`privilege_password_ref`、`origin` |
 
-# 从 CSV 批量导入主机并打上 web 标签
-xops host import hosts.csv --tag web
+解耦三实体后，同一台服务器地址（Host）可同时关联运维账号（`deploy`）与审计账号（`audit`），各自拥有独立的认证身份、提权凭据与 OpenSSH 选项，互不串扰。
 
-# 查看主机列表与标签汇总（可使用缩写 xops h ls）
-xops host list
-xops host tags
+### 节点来源分类（`NodeOrigin`）
 
-# 快捷管理节点标签与模板绑定
-xops host tag prod web-01 web-02
-xops host tag -d prod web-02
-xops host edit web-01 --add-tag frontend --rm-tag legacy -I deploy-id
+XOps v2 严格区分 4 类节点来源，以确定 OpenSSH 配置层（Tier-4）的合并规则：
 
-# 导出 CSV 导入模板（仅生成空白表头模板，非导出已有主机）
-xops host import --template
-```
+1. `managed`：由 XOps 托管并持久化在 `config.yaml` 中的标准节点。
+2. `openssh_virtual`：运行时直接从 `~/.ssh/config` 解析的只读虚拟主机。
+3. `openssh_derived`：通过 `xops config import --format openssh` 导入生成的持久化派生节点。
+4. `ad_hoc`：命令行临时输入的 `user@host[:port]` 目标（未写入资产库）。
 
-常用命令均提供简短别名：`host`（`h`、`inventory`、`inv`）、`identity`（`id`、`auth`）、`credential`（`cred`、`cr`），以及子命令 `list`（`ls`）、`edit`（`ed`）、`delete`（`rm`、`del`）、`probe`（`pr`）、`import`（`imp`、`load`）。
+## 2. 查询、解析与诊断资产
 
-以不同用户名直接连接同一台主机时，XOps 会自动复用同一个 `Host`，并创建独立的 `Identity` 和 `Node`：
+命令主名为 `xops hosts`（别名 `host`、`inventory`）：
 
 ```bash
-xops ssh deploy@web-01
-xops ssh audit@192.0.2.10
+# 列出节点（默认）、主机、身份或全量快照
+xops hosts list
+xops hosts list --tag web
+xops hosts list --kind hosts
+xops hosts list --kind identities
+xops hosts list --kind all --json
+
+# 查看单个资产详情与当前 CAS revision
+xops hosts get web-01
+xops hosts get --kind host h-web1 --json
+xops hosts get --kind identity id-deploy
+
+# 解析目标生效连接计划（展示来源、最终端点、跳数与 PlanDigest）
+xops hosts resolve web-01
+xops hosts resolve -J bastion -p 2222 deploy@192.0.2.10 --json
+
+# 使用 Tarjan 强连通算法校验跳板机 DAG（检出环路与最大跳板深度）
+xops hosts validate-dag
+
+# 检索引用了指定凭据或存储的全部资产位置
+xops hosts check-secret-refs --ref offline/web-pass
+xops hosts check-secret-refs --store offline
 ```
 
-更多身份管理操作可通过 `xops identity --help` 查看，或运行 `xops tui` 在[终端管理界面](./tui)中可视化编辑。
+## 3. 声明式 CRUD 与乐观锁 CAS
 
-## 添加与导入时的验证策略
-
-### 1. 添加单台节点（`host add`）
-
-`host add` 默认先发起 SSH 连接验证身份：
-- **验证成功**：自动保存节点、凭据与探针推荐的执行配置。
-- **验证失败**：显示失败原因并询问 `是否仍然保存此节点？[y/N]`。只有明确输入 `y` 或 `yes` 才会保存；直接按回车、输入 `n` 或无法读取输入时均不保存。
-- **离线添加（`--skip-verify`）**：自动化脚本或不具备网络连通条件时，可显式跳过连接检查（配置合法性与凭据库检查仍会执行），未提供密码或私钥时也可先保存节点骨架：
+所有写操作支持传入 `--expected-revision <rev>` 执行乐观并发控制（若磁盘配置在读后被并发修改或手工编辑，提交将失败关闭返回 `revision_conflict`）：
 
 ```bash
-xops host add --address 192.0.2.10 --user deploy --skip-verify
+# 创建与更新 Host
+xops hosts create-host --id h-web1 --address 192.0.2.10:22 --alias web1-ep --tag prod,web --desc "Primary web"
+xops hosts update-host --id h-web1 --address 192.0.2.11:22 --expected-revision <rev>
+
+# 创建与更新 Identity（--auth-kind 支持 agent | password | private_key）
+xops hosts create-identity --id id-agent --user deploy --auth-kind agent
+xops hosts create-identity --id id-key --user deploy --auth-kind private_key \
+  --key-path ~/.ssh/id_ed25519 --cert-path ~/.ssh/id_ed25519-cert.pub
+xops hosts create-identity --id id-pass --user app --auth-kind password --password-ref offline/app-login
+
+# 若私钥带口令，passphrase_ref 与 key_fingerprint 必须成对出现（推荐使用 xops creds enroll-key 自动计算指纹）
+xops hosts update-identity --id id-key --user deploy --auth-kind private_key \
+  --key-path ~/.ssh/id_ed25519 --passphrase-ref offline/key-pass --key-fingerprint SHA256:... --gc-old-secrets
+
+# 创建与更新 Node（支持 --jump / --proxy-command、--dialect / --interpreter / --login、--priv-password-ref）
+xops hosts create-node --id web-01 --host h-web1 --identity id-key \
+  --alias prod-web --tag prod,web --jump bastion \
+  --dialect posix --interpreter bash --login disabled
+xops hosts update-node --id web-01 --host h-web1 --identity id-key --gc-old-secrets
+
+# 删除资产（自动执行引用完整性检查；若仍被其他 Node 引用将拒绝删除）
+xops hosts delete-node web-01 --delete-unused-secrets
+xops hosts delete-identity id-key --require-unreferenced
+xops hosts delete-host h-web1
 ```
 
-### 2. 批量导入（`host import`）
+> **提示**：创建密码身份或加密私钥口令身份时，更推荐使用交互式 [`xops creds enroll-password`](./credentials) 与 [`xops creds enroll-key`](./credentials)，可在单次 Saga 事务内安全采集口令、写入凭据库、自动绑定指纹并更新资产图。
 
-默认按行验证 SSH 身份认证，仅保存验证通过的节点；验证失败的行会输出节点 ID、原因并标记“验证失败，未保存”（若该行指向已有节点，失败时不会修改原配置或凭据）。
+## 4. 统一配置导入（`xops config import`）
+
+XOps v2 通过 `ports.FormatImporter` 扩展接口支持外部清单导入（100% 零 v1 兼容代码），内置 **`openssh`** 与 **`csv`** 两种格式：
 
 ```bash
-# 默认：仅保存验证通过的节点
-xops host import hosts.csv
+# 列出可用格式
+xops config formats
 
-# 离线导入：不建立 SSH 连接，直接保存所有有效记录
-xops host import hosts.csv --skip-verify
+# OpenSSH 导入：先预览冲突/告警，再确认落盘
+xops config import --format openssh --file ~/.ssh/config --plan
+xops config import --format openssh --file ~/.ssh/config
 
-# 强制保留：仍执行连接验证，但验证失败的节点也保存并在结果中标记
-xops host import hosts.csv --save-on-verify-failure
+# 从 stdin 导入或执行 dry-run
+cat ./hosts.csv | xops config import --format csv --stdin --dry-run --json
 ```
 
-- `--skip-verify` 与 `--save-on-verify-failure` 互斥；只要存在验证失败的行，命令均返回非零退出码（取消操作不会强制保存）。
-- **并发与顺序**：不同节点并行验证；同一节点的重复行严格按 CSV 顺序串行验证与保存，别名累积保留，后出现的成功行可更新凭据，最终结果始终按 CSV 行顺序输出。
-- **IPv6 兼容**：导入时自动兼容旧版本不带方括号的节点 ID（如 `root@2001:db8::1:22`），匹配后就地更新；新建 IPv6 节点统一使用带方括号格式（如 `root@[2001:db8::1]:22`）。
+### OpenSSH 导入规则（`--format openssh`）
 
-## 节点执行环境配置（`execution`）
+- 纯内存流式解析，不主动建立远端 SSH 连接，也不跟踪外部 `Include` 磁盘文件（遇到 `Include` 会产出结构化 `ImportWarning`）。
+- 自动将具名主机块转换为 `openssh_derived` 节点，保留 `ProxyJump` / `ProxyCommand` 与 OpenSSH `options` 策略层；无法直接导入的通配符或模板键路径会记录警告而非静默丢弃。
 
-### 1. 自动探测与 `host probe` 诊断
+### CSV 导入规则（`--format csv`）
 
-新节点在 `host add`、`host import` 或**启用凭据记忆的首次交互式 `ssh`/`exec` 连接**通过认证后，会直接复用已认证连接探测远端启动方言与可用解释器（最多约 9 秒，无需二次握手），并将推荐的 `execution` 随节点一同保存。
+- 支持 **无表头 4 列紧凑格式**：`alias,address,port,user`（默认生成 `agent` 认证身份）。
+- 支持 **带表头格式**（列名大小写无关，支持 `#` 注释行与 `;` 分隔多值字段）：
+  - 必填列：`name`/`alias`/`id`/`node`/`node_id`、`host`/`address`/`hostname`、`user`/`username`
+  - 可选列：`port`（默认 `22`）、`key_path`/`key_paths`/`identity_file`、`cert_path`/`cert_paths`/`certificate_file`、`proxy_jump`/`jump`、`aliases`、`tags`、`description`/`desc`
+- **零明文铁律**：若 CSV 表头包含 `password`、`passwd`、`pass`、`passphrase`、`secret`、`token`、`private_key`、`key_content`、`totp_secret`、`sudo_password`、`privilege_password` 中的任意一列，导入器将**立即失败关闭**并拒绝导入。
 
-```bash
-# 添加或导入时验证连接，但跳过执行环境探针（也可写 --probe=false）
-xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --no-probe
-xops host import hosts.csv --no-probe
-
-# 显式指定解释器或方言（显式字段优先于探针推荐；导入时仅作用于新节点）
-xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --interpreter sh --launch-dialect posix
-
-# 诊断单个已保存节点（默认只输出表格，不改配置；加 --save 写回该节点 execution）
-xops host probe web-01
-xops host probe web-01 --save
-
-# 批量探测所有已保存节点（不含 OpenSSH 虚拟节点），加 --save 保存成功节点的推荐配置
-xops host probe --all
-xops host probe --all --save
+```csv
+name,address,port,user,key_path,proxy_jump,tags,description
+web-01,192.0.2.10,22,deploy,~/.ssh/id_ed25519,bastion,prod;web,Web server 1
+web-02,192.0.2.11,22,deploy,~/.ssh/id_ed25519,bastion,prod;web,Web server 2
 ```
 
-**探测规则与边界**：
-- **失败不阻断入库**：`host add`/`import` 或首次连接时，若探针超时或失败，仅输出警告，认证成功的节点照常按未配置状态保存（TUI 添加节点、仅会话级凭据、非交互批处理、已有节点导入不触发自动重探）。
-- **显式参数隔离**：添加节点时 `--skip-verify` 会同时跳过探针；显式指定的 `--interpreter` / `--launch-dialect` 始终优先保留（探测连接自身固定使用独立的 `server/unknown` 视图，因此即使全局配置为 `bash/posix`，新节点也可仅指定 `--interpreter powershell` 并由探针自动补齐 Windows 启动方言）。在 `xops ssh` / `xops exec` 中传入 `--interpreter`、`--launch-dialect`、`--login-shell` 或 `--no-login` 时，参数仅用于当次会话并跳过该节点的首次连接入库探测。
-- **推荐优先级**：
-  - **Unix / Linux（`posix` 或 `fish` 方言）**：优先选用远端 `$SHELL` 报告且在 `PATH` 中可用的默认 Shell（支持 `bash`、`sh`、`zsh`、`fish`；`ash`/`dash` 映射为 `sh`），默认 `login: false`。若外层探针确认为原生 `fish` 则优先推荐 `fish`（不受过期 `$SHELL` 影响）；若默认 Shell 未知或不可用，按 `bash` → `sh` → `zsh` → `fish` 顺序回退。
-  - **Windows**：CMD 外层同时存在 Windows PowerShell 时推荐 `server/cmd`（兼顾基础命令直通与受限操作按需切换），仅 CMD 时推荐 `cmd/cmd`；PowerShell 外层优先推荐 `powershell`（仅安装 Core 时推荐 `pwsh`）。
-- **各 Shell 支持范围**：
-  - **`fish`（`launch_dialect: fish`）**：支持命令、Playbook 脚本（含 `#!/usr/bin/env fish`）、`ensure` 检查及免密/密码 `sudo` 与 `su`（提权握手固定使用 `/bin/sh`，见[SSH 与提权](./ssh)）。
-  - **`zsh`（`launch_dialect: posix`）**：支持命令、工作目录、登录模式、`#!/usr/bin/env zsh` 脚本、`ensure` 检查及 `sudo`/`su`（注意 zsh 与 Bash 并非完全兼容，见 [zsh 兼容性说明](https://zsh.sourceforge.io/Doc/Release/Invocation.html#Compatibility)）。
-- **运行时按需探测**：Playbook 无 shebang 的 `script`、`ensure` 以及 SFTP 带非空工作目录的 `exec` 在节点未配置执行环境时会按需探测，结果仅缓存在当前连接内存中，不写回磁盘。
+## 5. 四层 OpenSSH 选项优先级模型
 
-### 2. 手动配置 `execution`
+当执行 `ssh`、`exec`、`scp`、`sftp`、`tunnel`、`mux` 或 `hosts resolve` 时，XOps v2 使用纯函数求解器按严格固定优先级折叠 OpenSSH 选项（FirstWins 幺半群）：
 
-你也可以在 `~/.xops/xops_config.yaml` 中为全局或单个节点手动设置 `execution`：
-
-```yaml
-schema_version: 2
-# 全局默认执行配置（可选，缺省即为 server）
-execution:
-  interpreter: server
-
-nodes:
-  # 场景 1：精简容器 / Alpine Linux（无 Bash，原样直通或指定 sh）
-  alpine-01:
-    host_ref: h_alpine
-    identity_ref: id_root
-    execution:
-      interpreter: sh
-      launch_dialect: posix
-
-  # 场景 2：依赖个人登录环境变量的传统 Linux 节点
-  web-prod-01:
-    host_ref: h_web
-    identity_ref: id_deploy
-    execution:
-      interpreter: bash
-      launch_dialect: posix
-      login: true
-
-  # 场景 3：Windows Server（使用 PowerShell 执行命令）
-  win-ad-01:
-    host_ref: h_win
-    identity_ref: id_admin
-    execution:
-      interpreter: powershell
-      launch_dialect: powershell
+```text
+Tier-1: CLI 命令行参数（-p / -l / -i / -J / -o / -M / -S）
+   > Tier-2: 托管节点自身 options（inventory.nodes.<id>.options）
+      > Tier-3: XOps 全局选项（config.yaml 顶层 options）
+         > Tier-4: OpenSSH 配置文件（~/.ssh/config 或 -F 指定文件）
+            > 内置安全默认层（ControlMaster=no, StrictHostKeyChecking=ask, ForwardAgent=no, PermitLocalCommand=no）
 ```
 
-**生效优先级**：CLI 命令行参数 > Playbook 步骤 `execution` > Playbook 全局 `settings.execution` > 节点配置 (`node.execution`) > 全局配置 (`cfg.execution`) > 系统默认 (`server`)。
+### 安全隔离裁剪规则（INV-D2）
 
-## OpenSSH 客户端选项与连接共享（`ssh_options`）
-
-你可以在 `~/.xops/xops_config.yaml` 的全局或节点层级配置 `ssh_options`，或在 `xops ssh|scp|sftp|exec` 中通过 `-o Key=Value` 临时覆盖。落盘配置统一使用 `snake_case`，同时也支持手动编辑时直接书写 OpenSSH 标准 `PascalCase` 键名（如 `ControlMaster`、`ConnectTimeout`）：
-
-```yaml
-schema_version: 2
-ssh_options:
-  control_master: auto
-  control_path: ~/.ssh/cm-%C
-  control_persist: 10m
-  connect_timeout: 15s
-  server_alive_interval: 30s
-
-nodes:
-  web-prod-01:
-    host_ref: h_web
-    identity_ref: id_deploy
-    ssh_options:
-      control_persist: 30m
-      strict_host_key_checking: accept-new
-```
-
-**生效优先级**：CLI `-M`/`-S`/`-o` > 节点配置 (`node.ssh_options`) > 全局配置 (`cfg.ssh_options`) > `~/.ssh/config`（其中 `StrictHostKeyChecking` 与 `UserKnownHostsFile` 等主机信任选项仅从 CLI `-o` 或 `xops_config.yaml` 显式配置中读取，不从 `~/.ssh/config` 隐式继承；对于 `HashKnownHosts`，当 xops `hash_known_hosts` 未设置时才会从 `~/.ssh/config` 继承 `HashKnownHosts yes`，显式配置 `hash_known_hosts: false` 会按优先级覆盖 `~/.ssh/config`；xops 中显式启用的 `hash_known_hosts: true` 不会被 `~/.ssh/config` 的 `HashKnownHosts no` 降级，除非通过 CLI `-o HashKnownHosts=no` 显式覆盖）。
-
-### 常用选项与端口转发/隧道选项
-
-| 选项名 (`snake_case`) | OpenSSH 名称 (`PascalCase`) | 适用值与格式 | 说明 |
-| --- | --- | --- | --- |
-| `control_master` | `ControlMaster` | `auto` / `yes` / `no` / `ask` / `autoask` | 连接多路复用主连接模式 |
-| `control_path` | `ControlPath` | 路径字符串（如 `~/.ssh/cm-%C`）或 `none` | 多路复用控制套接字路径 |
-| `control_persist` | `ControlPersist` | `no` / `yes` / 时间跨度（如 `10m`、`1h`） | 主连接空闲保活与后台驻留时间 |
-| `connect_timeout` | `ConnectTimeout` | 时间跨度（如 `15s`） | 连接与握手超时时间 |
-| `server_alive_interval` | `ServerAliveInterval` | 时间跨度（如 `30s`） | 客户端向服务器发送保活心跳的间隔 |
-| `strict_host_key_checking` | `StrictHostKeyChecking` | `yes` / `no` / `ask` / `accept-new` / `off` | 远端主机公钥严格检查策略 |
-| `exit_on_forward_failure` | `ExitOnForwardFailure` | `yes` / `no` | 端口转发或隧道建立失败时是否立即退出会话 |
-| `clear_all_forwardings` | `ClearAllForwardings` | `yes` / `no` | 是否清除所有配置文件或命令行中此前声明的转发规则 |
-| `gateway_ports` | `GatewayPorts` | `yes` / `no` / `clientspecified` | 允许外部主机连接本地转发的端口（默认为 `no`；`clientspecified` 按转发指定的绑定地址决定） |
-| `stream_local_bind_unlink` | `StreamLocalBindUnlink` | `yes` / `no` | 绑定 Unix 域套接字前自动删除已存在的旧套接字文件（默认为 `no`） |
-| `stream_local_bind_mask` | `StreamLocalBindMask` | 八进制掩码（如 `0177`、`0117`） | 创建 Unix 域套接字文件时的权限掩码（umask，默认 `0177`） |
-| `fork_after_authentication` | `ForkAfterAuthentication` | `yes` / `no` | 认证及转发建立完成后进入后台运行（对应 `-f`，隐含 `stdin_null`；不可与 `--password-stdin`、`--passphrase-stdin`、`--otp`、`--otp-stdin` 组合使用） |
-| `stdin_null` | `StdinNull` | `yes` / `no` | 将标准输入重定向至 `/dev/null`（对应 `-n`） |
-| `session_type` | `SessionType` | `default` / `none` | 会话模式；`none` 表示仅转发端口或隧道，不打开远端会话（对应 `-N`） |
-| `tunnel` | `Tunnel` | `yes` / `point-to-point` / `no`（`ethernet` 仅兼容配置解析，启动时不支持） | 请求三层虚拟网卡隧道转发（`yes` 等价于 `point-to-point`） |
-| `tunnel_device` | `TunnelDevice` | `local_tun[:remote_tun]`（如 `0:0`, `any:any`） | 指定本地与远程三层 `tun` 设备单元号 |
-| `request_tty` | `RequestTTY` | `no` / `yes` / `force` / `auto` | 伪终端 (PTY) 分配策略 |
-| `local_forward` | `LocalForward` | 字符串或字符串数组 | 本地端口或 Unix 域套接字转发；支持 `"[bind_address:]port host:hostport"` 或 `"local_socket:remote_socket"` |
-| `remote_forward` | `RemoteForward` | 字符串或字符串数组 | 远程端口、Unix 域套接字或反向动态转发；支持 `"[bind_address:]port[:host:hostport]"` 或 `"remote_socket[:local_socket]"` |
-| `dynamic_forward` | `DynamicForward` | 字符串或字符串数组 | 动态应用级 SOCKS4/SOCKS4a/SOCKS5 转发；支持 `"[bind_address:]port"` 或本地 Unix 域套接字路径 |
-
-## 已删除的凭据参数
-
-`host add|edit` 和 `identity add|edit` 已移除明文参数 `--password`、`--key-pass` 及其短参数，避免密码泄露在命令行参数和 Shell 历史中；旧命令 `loadHost` 也已移除（请改用 `xops host import`）。
-
-请使用交互式密码提示（`--ask-pass` / `--ask-passphrase`）、`xops cred set <节点或身份>`（或 `xops host set-secret` / `xops id set`），或通过可信管道/重定向传入 `--password-stdin`（登录密码）与 `--passphrase-stdin`（私钥口令）：
-
-```bash
-# 在终端交互式输入新密码或直接为节点/身份设置凭据
-xops host edit web-01 --ask-pass
-xops cred set web-01 --password
-xops cred set web-01 --sudo
-
-# 从标准输入更新身份密码
-xops identity edit admin --password-stdin
-
-# 从标准输入更新节点私钥与口令
-xops host edit web-01 --key ~/.ssh/id_ed25519 --passphrase-stdin
-```
-
-- `--password-stdin`、`--passphrase-stdin`、`--ask-pass` 与 `--ask-passphrase` 互斥，`--password-stdin`/`--ask-pass` 不能与 `--key` 同用，`host add|edit` 中均不能与 `--identity` 同用。
-- 空输入会在保存前被拒绝；编辑节点或身份时若省略这些选项，将保留原有凭据（切换认证方式或更换私钥路径时会同步更新凭据引用）。
+- 对于 `openssh_virtual` 与 `openssh_derived` 节点，完整应用 Tier-4（`~/.ssh/config`）的全部有效选项。
+- 对于 `managed`（XOps 原生托管）与 `ad_hoc`（临时命令行地址）节点，系统仅从 Tier-4 继承**多路复用与传输层选项**（如 `ControlMaster`/`ControlPath`/`ControlPersist`、超时/保活/算法），防止 `~/.ssh/config` 中宽泛的 `Host *` 规则静默篡改托管节点的认证身份或路由。
+- 若需彻底禁用 Tier-4 读取，可在全局或任意命令传入 `-F none`（或 `--ssh-config none`）。

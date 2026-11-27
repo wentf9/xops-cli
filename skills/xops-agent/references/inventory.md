@@ -1,85 +1,104 @@
-# Inventory and credentials
+# Inventory, Imports, and Vault (XOps v2)
 
-## Inspect and initialize
+XOps v2 models inventory as a 3-entity graph (**Host**, **Identity**, **Node**) stored in strict `version: 2` YAML at `~/.xops/config.yaml` (override root directory with `XOPS_HOME`).
 
-```bash
-xops host list
-xops host list --tag web
-xops host tags
-xops identity list
-xops credential store list
-xops credential doctor
-```
-
-Use the actual node IDs/aliases from inventory; tables are human-readable, not a stable JSON API. `xops --color never` removes ANSI colors from captured output. Listing inventory does not test network connectivity.
-
-When initial setup is requested:
+## Inspect, Resolve, and Diagnose
 
 ```bash
-xops init
-xops init --ssh-config ~/.ssh/config.work
-xops init --skip-ssh-import
+xops hosts list --json
+xops hosts list --tag web --json
+xops hosts list --kind hosts --json        # nodes (default) | hosts | identities | all
+xops hosts get web-01 --json               # --kind node (default) | host | identity
+xops hosts resolve web-01 --json           # resolves 4-layer OpenSSH policy + hop count + PlanDigest
+xops hosts validate-dag --json             # Tarjan jump-DAG cycle check
+xops hosts check-secret-refs --store offline --json
+xops doctor --json                         # combined read-only inventory + vault health check
+xops doctor --scope inventory --check-vault --check-keys --json
 ```
 
-Choose the appropriate variant. `init` creates Schema v2 configuration, normally imports non-wildcard OpenSSH entries, makes no remote connections, and does not create an encryption key. It can be repeated without overwriting existing nodes.
+All `hosts` queries support aliases `host` and `inventory`. Listing and resolving do not open remote SSH connections.
 
-## Hosts, nodes, identities, and tags
+## Declarative CAS CRUD (`xops hosts`)
 
-Host represents the network address, Identity represents authentication, and Node combines them. The same address can have multiple users or ports. Explicit `user@host` selects a distinct identity while reusing applicable host/ProxyJump information.
+Always pass `--expected-revision <rev>` from a prior `list`/`get` when avoiding concurrent overwrite races (`revision_conflict` on mismatch):
 
 ```bash
-xops host add --address 192.0.2.10 --user deploy --key ~/.ssh/id_ed25519 --alias web-01 --tags web
-xops host edit web-01 --alias web-primary --jump bastion
-xops host import --template ./hosts-template.csv
-xops host import ./hosts.csv --tag web
-xops host tag add web web-01,web-02
-xops host tag remove web web-02
-xops identity add --name deploy --user deploy --key ~/.ssh/id_ed25519
+# Host
+xops hosts create-host --id h-web1 --address 192.0.2.10:22 --alias web1-ep --tag prod,web --json
+xops hosts update-host --id h-web1 --address 192.0.2.11:22 --expected-revision <rev> --json
+xops hosts delete-host h-web1 --expected-revision <rev> --json
+
+# Identity (--auth-kind: agent | password | private_key)
+xops hosts create-identity --id id-agent --user deploy --auth-kind agent --json
+xops hosts create-identity --id id-key --user deploy --auth-kind private_key \
+  --key-path ~/.ssh/id_ed25519 --cert-path ~/.ssh/id_ed25519-cert.pub --json
+xops hosts create-identity --id id-pass --user app --auth-kind password --password-ref offline/app-pass --json
+xops hosts update-identity --id id-key --user deploy --auth-kind private_key \
+  --key-path ~/.ssh/id_ed25519 --passphrase-ref offline/kp --key-fingerprint SHA256:... --gc-old-secrets --json
+xops hosts delete-identity id-key --delete-unused-secrets --require-unreferenced --json
+
+# Node
+xops hosts create-node --id web-01 --host h-web1 --identity id-key \
+  --alias prod-web --tag prod,web --jump bastion \
+  --dialect posix --interpreter bash --login disabled --json
+xops hosts update-node --id web-01 --host h-web1 --identity id-key --gc-old-secrets --json
+xops hosts delete-node web-01 --delete-unused-secrets --json
 ```
 
-`host edit --alias` replaces the alias list; preserve needed aliases explicitly. A jump name such as `bastion` must resolve to a configured node/alias. CSV import accepts headers `host,port,alias,user,password,key,keypass`; keep CSVs containing secrets private. `--template` exports the import template, not the current host inventory. `host delete NODE` and `identity delete NAME` remove saved assets; inspect the affected references before an authorized deletion.
+- Encrypted private keys require **paired** `--passphrase-ref` and `--key-fingerprint` (INV-F1). Prefer `xops creds enroll-key` so XOps verifies decryption and computes the fingerprint automatically.
+- Deletions enforce referential integrity and fail closed with `still_referenced` (including `reference_conflict` details in JSON) if another entity still depends on the target.
 
-Host add/import verify SSH by default. Add asks whether to save after verification fails; import normally saves only successful rows and returns nonzero for failed verification. For an explicitly requested offline import use `--skip-verify`; `--save-on-verify-failure` instead attempts verification but saves failed nodes too. These import options are mutually exclusive. Use canonical `host import`, not removed `loadHost`.
+## Unified Config Import (`xops config import`)
 
-New nodes discovered by SSH, exec, SCP, or SFTP are saved after successful SSH authentication, even when the later command/transfer fails. `--remember never` controls automatic saving of prompted secrets, not node metadata. Failed authentication does not create a new node.
-
-## Execution configuration
-
-Inspect global and node `execution` fields in the selected Schema v2 configuration before selecting remote command syntax. Ordinary commands now default to `server`; node settings override global settings. Fields are `interpreter`, `launch_dialect`, and optional boolean `login`. A child interpreter change can drop the parent's interpreter-specific login option, while the launch dialect still inherits and must remain compatible.
-
-`host add` and `host import` accept `--interpreter` and `--launch-dialect` flags along with `--probe`/`--no-probe` controls, whereas `host edit` has no execution flags. For a persistent change to an existing node, preserve the existing YAML and node references, change only the authorized execution fields, and verify configuration loading before remote execution. Do not guess the dialect from the client's OS or rewrite the entire inventory to change one node. See [Execution and Playbooks](execution.md#select-the-execution-environment) for supported combinations and a Bash compatibility fragment.
-
-## Noninteractive access
-
-The default store named `file` uses the `encrypted-file` backend with a separate key file. Verified secrets are saved according to the remember policy; first saving can initialize the default vault and key. Available backends also include `system`, `pass`, `helper`, and `none`.
-
-Batch execution and Playbooks need already accessible credentials. A prompt-unlocked vault is not unlocked across separate processes. Linux system-keyring access requires the appropriate user D-Bus/Secret Service session; `locked` is not repaired by adding `exec -x` to a batch job.
-
-Use `credential doctor` to check noninteractive access. It does not initialize an absent vault, prove write access, or verify all encrypted records. Missing credentials, locked stores, and unknown SSH host keys are separate failures; resolve the actual issue in the CLI environment.
-
-For explicit credential changes, inspect the command's current help:
+XOps v2 supports `openssh` and `csv` importers (zero v1 config reading):
 
 ```bash
-xops identity credential set --help
-xops identity credential delete --help
-xops host edit --help
+xops config formats --json
+
+# Preview conflicts, DAG validity, and warnings without writing
+xops config import --format openssh --file ~/.ssh/config --plan --json
+xops config import --format openssh --file ~/.ssh/config --json
+
+# Dry-run or apply CSV import (headerless: alias,address,port,user; or header-driven)
+xops config import --format csv --file ./hosts.csv --dry-run --json
+cat ./hosts.csv | xops config import --format csv --stdin --json
 ```
 
-Asset/connection commands support `--password-stdin` or `--passphrase-stdin`, not removed plaintext password flags. These stdin options are mutually exclusive; password input also conflicts with key-based options in asset commands. Obtain input from a trusted secret source without placing values in shell arguments. Do not combine a credential stdin stream with a script/SFTP command stream that also requires stdin.
+- **OpenSSH**: Pure in-memory parse; does not open remote connections or follow `Include` files on disk (emits structured `ImportWarning`s); produces `openssh_derived` nodes.
+- **CSV**: Allowed headers: `name`/`alias`/`id`/`node`/`node_id`, `host`/`address`/`hostname`, `port`, `user`/`username`, `key_path`/`key_paths`/`identity_file`, `cert_path`/`cert_paths`/`certificate_file`, `proxy_jump`/`jump`, `aliases`, `tags`, `description`/`desc` (`;` separates multi-value cells). **Any plaintext secret column** (`password`, `passwd`, `pass`, `passphrase`, `secret`, `token`, `private_key`, `key_content`, `totp_secret`, `sudo_password`, `privilege_password`) fails closed immediately.
 
-## Store maintenance
+## Four-Layer OpenSSH Option Precedence
 
-Perform maintenance when requested, using existing configuration and backups:
+`Tier-1 (CLI flags)` > `Tier-2 (Node options)` > `Tier-3 (config.yaml top-level options)` > `Tier-4 (~/.ssh/config or -F <file>)` > built-in defaults.
+- `managed` and `ad_hoc` nodes inherit only transport & mux options from Tier-4 (INV-D2); `openssh_virtual` and `openssh_derived` nodes inherit full Tier-4 options. Pass `-F none` to disable Tier-4.
 
-| Need | CLI entry points | Important distinction |
-| --- | --- | --- |
-| Check store metadata/filesystem | `credential store inspect`, `inspect --verify`, `probe` | Metadata verification is not a complete credential read/write test. `probe` uses temporary filesystem data. |
-| Initialize a configured new store | `credential store init` | Do not initialize over a damaged existing vault or generate a replacement for a lost key. |
-| Change unlock material / data key | `credential store rewrap` / `reencrypt` | Preserve recovery material until new access is verified. |
-| Resume, clone, restore | `credential store resume`, `clone`, `restore` | Read the specific help and keep the source/backup intact. |
-| Prune old generations | `credential store prune`, then `prune --apply` | The first command previews; the latter deletes eligible generations. |
-| Move references between backends | `credential migrate --dry-run --to STORE`, then `credential migrate --to STORE` | Preview does not prove destination write access; changing only `default_store` does not migrate existing secrets. |
-| Clean legacy v1 materials | `credential finalize-migration` | Only after validating migrated access; not a general backend cleanup command. |
-| Remove eligible orphan credentials | `credential gc` | Mutates stores and may need keyring access; not a read-only health check. |
+## Vault Lifecycle & Zero-Plaintext Rules (`xops creds` / `xops vault`)
 
-For detailed recovery procedures use the [credential](https://wentf9.github.io/xops-cli/guide/credentials), [offline store](https://wentf9.github.io/xops-cli/guide/offline-store), and [migration](https://wentf9.github.io/xops-cli/guide/migration) guides. Back up configuration, the complete vault, and unlock material; configuration references alone cannot restore secrets.
+Supported `vault.stores.<name>.kind` backends: `offline_aead` (Argon2id + XChaCha20-Poly1305 AEAD, default at `~/.xops/vault`), `os_keychain` (Windows Credential Manager / macOS `Security.framework` / Linux D-Bus Secret Service), `external_helper` (stdin/stdout JSON v2 protocol), and `none`.
+
+```bash
+xops creds status --json
+xops creds doctor --json                   # add --skip-probe to skip per-secret reads
+xops creds refs offline/web-pass --json
+xops creds delete offline/unused --json
+xops creds gc offline/cand1 offline/cand2 --json
+```
+
+Interactive commands (require a TTY / interaction port; zero plaintext CLI flags exist):
+
+```bash
+xops creds init
+xops creds unlock
+xops creds lock
+xops creds enroll-password --id id-app --user app --store offline
+xops creds enroll-key --id id-key --user deploy --key-path ~/.ssh/id_ed25519 --store offline
+xops creds set-node-privilege --node web-01 --store offline
+xops creds rotate offline/old-item --store offline
+```
+
+- **Process-scoped offline unlock**: `offline_aead` keeps the unwrapped DEK only in process memory. Unattended batch jobs and MCP servers should use `os_keychain`, `external_helper`, or `ssh-agent`.
+- **Uncertain durability rule**: If `enroll-*`, `set-node-privilege`, or `rotate` returns `"uncertain_durability": true` (`do_not_retry: true`), **do not retry and do not delete credentials**; inspect disk state with `xops creds doctor --json` and `xops hosts list --json` first.
+
+## MCP Equivalent (`nodes` tool)
+
+In MCP mode, use `nodes` with `action`: `list_hosts`, `get_host`, `create_host`, `update_host`, `delete_host`, `list_identities`, `get_identity`, `create_identity`, `update_identity`, `delete_identity`, `list_nodes`, `get_node`, `create_node`, `update_node`, `delete_node`, `resolve`, `validate_dag`, `doctor`, `list_import_formats`, `plan_import`, `apply_import` (import uses inline `content` or `bundle`, never host file paths).

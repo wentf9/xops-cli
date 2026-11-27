@@ -1,103 +1,167 @@
-# Playbook 与 MCP
+# Playbook v2、护栏与审计
 
-XOps 提供 YAML 声明式任务编排（`xops play`）和内置 Model Context Protocol 服务端（`xops mcp`）。
+XOps v2 将声明式多节点编排（`xops playbook` / `xops play`）、能力门控护栏（`PolicyProfile` + `policy.guardrail`）与同步 Fail-Closed 审计日志（`xops audit`）深度整合，保证每一次远端变更均经过统一风险评估、确定性摘要绑定与可追溯审计闭环。
 
-> 若希望让支持 Skill 的 AI 助手在本地直接调用 `xops` CLI 完成运维操作（无需启动 MCP 服务），请参阅 [Agent Skill 与功能概览](./agent-skill)。
+## 1. Playbook v2 声明式编排
 
-## Playbook 声明式编排
+Playbook v2 同时支持 **YAML** 与严格 **JSON** 文档，且统一经过 `core/domain/playbook` 判别式校验器：强制 `version: 2`，严格拒绝未知字段、重复键、YAML 别名引用、JSON `null` 动作、嵌套 `ensure` 与篡改摘要。
 
-Playbook 使用 YAML 编排多台主机上的自动化步骤，支持 `shell`（执行命令）、`script`（分发执行本地脚本）、`copy`（上传文件）、`ensure`（状态检查与幂等收敛）和 `template`（渲染配置模板）。
-
-### 1. 快速上手示例
-
-创建 `deploy-service.yaml`：
+### 完整示例（`deploy.yaml`）
 
 ```yaml
-name: deploy-service
-targets:
+version: 2
+id: deploy-web
+name: "Deploy Web Application"
+description: "Install nginx, render config, and reload service"
+on_error: fail_fast # fail_fast | continue | abort
+target:
   tags: [web]
-settings:
-  concurrency: 5
-  on_error: stop
-  execution:
-    interpreter: bash
-    launch_dialect: posix
-    login: true
+  exclude_nodes: [web-maint-01]
 vars:
-  http_port: "8080"
+  app_port: "8080"
+  env_name: "prod"
 steps:
-  - name: 检查系统运行时间
-    shell: uptime
+  - id: ensure-nginx
+    name: "Ensure nginx package is installed"
+    action:
+      kind: ensure
+      check:
+        kind: shell
+        command: "command -v nginx >/dev/null 2>&1"
+      action:
+        kind: shell
+        command: "apt-get update && apt-get install -y nginx"
+        timeout: 3m
+      max_retries: 1
 
-  - name: 确保 Nginx 已安装
-    ensure:
-      check: "nginx -v"
-      action: "apt-get update && apt-get install -y nginx"
-    sudo: true
+  - id: upload-conf
+    name: "Render and atomically publish nginx config"
+    action:
+      kind: template
+      source: "./templates/nginx.conf.tmpl"
+      dest: "/etc/nginx/conf.d/app.conf"
+      vars:
+        listen_port: "8080"
+      mode: "0644"
+      overwrite: true
+      atomic: true
 
-  - name: 渲染并分发配置文件
-    template:
-      src: "./nginx.conf.tmpl"
-      dest: "/etc/nginx/nginx.conf"
-    sudo: true
+  - id: copy-static
+    name: "Copy release manifest"
+    when_tags: [frontend]
+    action:
+      kind: copy
+      source: "./manifest.json"
+      dest: "/srv/www/manifest.json"
+      mode: "0644"
+      overwrite: true
+      atomic: true
 
-  - name: 重启服务
-    shell: "systemctl restart nginx"
-    sudo: true
+  - id: verify-script
+    name: "Run post-deploy check script"
+    on_error: continue
+    action:
+      kind: script
+      source: "./scripts/verify.sh"
+      args: ["--strict"]
+      work_dir: "/srv/www"
+      env:
+        APP_ENV: "prod"
+      timeout: 30s
 ```
 
-运行与调试命令：
+### 5 类封闭步骤动作（`action.kind`）
+
+| `kind` | 必填字段 | 可选字段 | 说明 |
+| --- | --- | --- | --- |
+| `shell` | `command` | `profile`、`work_dir`、`env`、`timeout` | 在远端执行单条命令 |
+| `script` | `source` | `symlink_policy`、`args`、`profile`、`work_dir`、`env`、`timeout` | 读取本地脚本并按启动配置在远端执行 |
+| `copy` | `source`、`dest` | `symlink_policy`、`mode`（3/4 位八进制串如 `"0644"`）、`overwrite`、`atomic` | 将本地文件上传至远端目标路径 |
+| `template` | `source`、`dest` | `symlink_policy`、`vars`、`mode`、`overwrite`、`atomic` | 渲染本地模板并上传至远端 |
+| `ensure` | `check`、`action` | `max_retries` | 幂等状态收敛：`check` 失败时执行 `action` 并复查（禁止嵌套 `ensure`） |
+
+### 错误策略（`on_error`）
+
+- `fail_fast`：当前节点首个步骤失败后立即停止该节点后续步骤，其他节点继续执行。
+- `continue`：记录失败并继续执行当前节点的后续步骤。
+- `abort`：任一节点步骤失败后立即取消整批 Playbook 剩余任务。
+
+### 校验与运行命令
 
 ```bash
-# 预览目标主机与执行步骤（不连接远端、不执行任何更改）
-xops play deploy-service.yaml --dry-run
+# 1. 纯离线 AST / Schema 校验（不初始化 Engine、不触碰远端、输出规范 Digest）
+xops playbook validate deploy.yaml
+xops playbook validate deploy.yaml --json
 
-# 正式运行 Playbook
-xops play deploy-service.yaml
+# 2. 运行 Playbook（支持 --var、--target 覆写选择器、--concurrency、--timeout、--scoped-root）
+xops playbook run deploy.yaml --var app_port=8081 --concurrency 3
+xops play run deploy.yaml --target web-01 --scoped-root ./release-bundle --json
 
-# 命令行注入或覆盖变量（未定义的模板变量会在执行前报错）
-xops play deploy-service.yaml --var http_port=8081
-
-# 仅在指定节点列表上执行
-xops play deploy-service.yaml --limit web-01,web-02
+# 3. 从标准输入读取 Playbook（--stdin 或 -）
+cat deploy.yaml | xops playbook validate --stdin --json
+cat deploy.yaml | xops playbook run --stdin --policy strict
 ```
 
-### 2. 失败策略、重试与执行配置
+> 若 Playbook 运行报告中包含 `OutcomeUnknown` 步骤，CLI 将返回非零退出码并明确警示检查远端状态后再决定后续操作，严禁自动重试不确定变更。
 
-- **失败控制（`settings.on_error`）**：
-  - `stop`（默认）：出错主机停止后续步骤，其他并行主机继续执行。
-  - `abort_all`：任一主机连接失败或步骤失败时，立即取消所有其他正在运行的主机任务。
-  - `continue`：当前主机忽略该步骤错误，继续执行后续步骤。
-- **安全重试边界**：步骤配置 `retries` 后，仅当远端命令**确认已执行完毕且无 I/O 或通道清理错误**时才会按 `retry_delay` 重试；若连接中断导致远端执行结果不确定（`unknown`），XOps 绝不自动重放，避免重复产生副作用。本地脚本内容在任务开始前一次性读取并冻结。
-- **执行环境继承（`execution`）**：支持在步骤级 `step.execution`、全局 `settings.execution` 或节点配置中指定 `interpreter`（如 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd`、`server`）与 `launch_dialect`。
+## 2. 安全护栏策略（`PolicyProfile` & `policy.guardrail`）
 
-### 3. `script` 与 `ensure` 按需探测及状态码规则
+XOps v2 通过**策略配置档（`PolicyProfile`）**与**护栏规则（`policy.guardrail`）**实现统一防线，可在 `~/.xops/config.yaml` 中设定默认值，并在每次调用时经 `--policy` 覆写：
 
-当未指定解释器且启动方言未知时，**无 shebang 的 `script` 步骤**和 **`ensure` 步骤**会在运行用户代码前自动发起一次有界只读探测（同一连接共享缓存，不改写磁盘配置，也不影响普通 `shell` 步骤的默认 `server` 直通）：
-- **支持范围**：`script` 与 `ensure` 支持 `bash`、`sh`、`zsh` 和原生 `fish`（外层启动方言须为 `posix` 或 `fish`）。若探测到 Windows 环境，会在执行用户代码前直接报错拒绝，不做跨平台语法翻译。显式解释器（含 `server`）、UTF-8 BOM 和非白名单 shebang 不会被自动替换；白名单 shebang 仍需已知兼容的外层方言。
-- **`ensure` 收敛与保留退出码保护**：
-  - `ensure` 先运行 `check`：返回 `0` 则判定满足条件并跳过 `action`（`StatusSkipped`）；确认返回普通非零状态（如 `false` 返回 `1`）时执行 `action`，随后再次运行 `check` 复查（`check`、`action`、复查全程冻结使用同一执行配置）。
-  - **异常退出码拦截**：若 `check` 返回保留错误码 `126`/`127`（命令不可执行或未找到）、fish 保留错误码 `121`/`123`/`124`/`125`、发生语法错误、超时、断连或丢失控制帧（例如在 `check` 中调用 `exec` 替换了 Shell 进程），均直接判定步骤失败（`StatusFailed`），**严禁触发 `action`**。
+| 策略配置档 | 默认归属 | 行为说明 |
+| --- | --- | --- |
+| `direct_operator` | CLI 默认 | 执行完整审计闭环与显式 `Deny` 拦截；不因常规风险阈值对直接人工 CLI 操作重复弹窗 |
+| `strict` / `strict_operator` | 按需开启 | 启用完整风险阈值、`node_overrides`、受保护路径检查与审批挑战；审计写失败时向调用方报错但不永久锁死短命 CLI |
+| `strict_agent` | MCP 默认 | 启用全量护栏与审批校验，且任何终态审计写失败（`AuditPostWriteError`）立即触发不可逆 **`Halted` 熔断态**，吊销全部活跃受管句柄并拒绝所有新请求 |
 
-## MCP 服务接入
+### 护栏配置示例（`~/.xops/config.yaml`）
 
-XOps 内置 MCP 服务端，可供 Claude Desktop、Cursor、Codex 等 AI 客户端调用受控的主机查询、远程命令、文件传输与 SSH 隧道工具。
+```yaml
+version: 2
+policy:
+  cli_default: direct_operator
+  mcp_default: strict_agent
+  guardrail:
+    approval_threshold: moderate    # safe | moderate | dangerous | critical
+    no_elicit_fallback: challenge   # deny（零值默认）| challenge（两步审批信封）
+    audit_log: ~/.xops/audit.jsonl
+    approval_ttl: 5m                # 范围 (0, 24h]
+    protected_paths:
+      - "/etc/**"
+      - "/root/**"
+      - "C:/Windows/**"
+    node_overrides:
+      "prod-*":
+        approval_threshold: safe
+        decision_floor: require_approval
+      "staging-*": moderate         # 标量简写，等价于仅设置 approval_threshold
+```
+
+- 命中 `protected_paths` 时风险级别至少提升至 `dangerous`。
+- 节点通配符匹配规则遵循并半格折叠（多重命中自动取最严判定，与声明顺序无关）。
+- `no_elicit_fallback: deny` 在非交互环境中遇到需审批操作直接拒绝；`challenge` 则签发带加密摘要（`envelope_digest`）与有效期（`approval_ttl`）的 `ApprovalEnvelope` 供客户端展示并二次提交核验（防重放、防目标篡改）。
+
+## 3. 审计日志与 O(1) 跨进程崩溃对账（`xops audit`）
+
+每次授权操作均按生命周期写入 `~/.xops/audit.jsonl`（每行规范 JSON/v2，经 `audit.jsonl.lock` 旁路锁保护），阶段包括 `denied`、`authorized` 与 `finalized`。
+
+### O(1) 进程锁崩溃对账机制
+
+- 每个运行中的 XOps 引擎进程在 `~/.xops/run/<ProcessInstanceID>.lock` 持有内核独占锁，并以只追加协议（`+<opID>` / `-<opID>`）追踪在途未闭合操作。
+- **干净启动 O(1)**：若 `run/` 下没有已死亡进程的残留锁文件，启动阶段完全不扫描 `audit.jsonl`。
+- **异常崩溃恢复**：当发现某进程被 `SIGKILL`/断电中止遗留的 `.lock` 文件时，通过非阻塞 `TryLock` 确认原进程已死亡，对比 `audit.jsonl` 补写 `outcome: aborted_by_crash` 记录，并在持锁态安全截断清空后删除残留锁文件。
+
+### 审计查询与手工对账命令
 
 ```bash
-# 启动默认 stdio 模式 MCP 服务
-xops mcp serve
+# 查看最近 50 条审计记录（list 从头取，tail 从尾取）
+xops audit tail --limit 20
+xops audit list --phase finalized --outcome outcome_unknown --json
+xops audit list --node web-01 --trace-id <trace_id>
+
+# 按 OperationID 检视单次操作的完整生命周期轨迹
+xops audit inspect <operation_id> --json
+
+# 显式触发跨进程崩溃锁对账（CLI 引擎与 MCP Server 启动时亦会自动执行）
+xops audit reconcile --json
 ```
-
-### 1. 客户端接入与安全护栏
-
-在 AI 客户端的 MCP 配置中，将启动命令设为 `xops` 的绝对路径，参数设为 `["mcp", "serve"]`。
-
-在 `~/.xops/xops_config.yaml` 的 `guardrail` 字段中可配置审批阈值、高危命令拦截、受保护文件路径和审计日志路径（护栏默认开启，仅可通过 `disabled: true` 显式关闭）：
-- **操作审批**：当工具调用达到需审批的风险级别时，客户端会弹出审批请求（需确认 `approved=true`），拒绝、取消或超时均不会执行远端操作。
-- **默认超时与非交互凭据**：单次工具调用默认超时为 5 分钟（可通过 `mcp.tool_timeout` 调整，如 `30m`）。MCP 全程运行在非交互模式下，不会弹出终端密码提示或密钥环解锁窗口，启动前可用 `xops credential doctor` 检查凭据可用性。
-
-### 2. 进阶指南与参考
-
-- [MCP 命令参考](../reference/commands/xops-mcp)
-- [MCP HTTP 局域网接入、大文件传输与异常恢复](./mcp-http)
-- [MCP stdio SSH 隧道工具（`-L` / `-R`）](./mcp-tunnels)

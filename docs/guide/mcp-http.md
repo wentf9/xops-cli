@@ -1,333 +1,101 @@
-# MCP HTTP 与文件传输
+# MCP 服务与 HTTP 流式传输
 
-通过 HTTP 模式，可以让局域网内的 Codex 或 Antigravity CLI 连接 XOps，查询和操作已配置的服务器。连接的客户端共用同一套节点、SSH 凭据和访问 Token。
+XOps v2 内置符合 MCP 规范（优先协商 **`2025-03-26`**，向下兼容 **`2024-11-05`**）的协议运行时，暴露 **7 个强类型判别式工具**，支持 **`stdio`** 与 **Streamable HTTP** 两种传输，并内置最高 **10 GiB** 双代 WAL 可恢复流式文件传输端点。
 
-## 启动服务
-
-先完成 [主机与身份配置](hosts)，确认运行 XOps 的账户能够连接目标服务器。提前准备好 SSH 凭据、凭据库解锁方式和可信主机密钥；MCP 运行时不会弹出密码输入或解锁提示。
-
-在 XOps 服务端生成 Token 并启动服务：
+## 1. 启动 MCP 服务（`xops mcp`）
 
 ```bash
-umask 077
-openssl rand -hex 32 > "$HOME/.xops/mcp.token"
+# 1. 本地 stdio 模式（默认，适合 Claude Desktop / Cursor / Codex / Antigravity）
+xops mcp serve --transfer-root ~/.xops/transfers --artifact-root ~/.xops/artifacts
+
+# 2. 本地回环 Streamable HTTP 模式（默认监听 127.0.0.1:8080）
+xops mcp serve --transport http --listen 127.0.0.1:8080 \
+  --transfer-root ~/.xops/transfers --artifact-root ~/.xops/artifacts
+
+# 3. 如确需绑定非回环地址（需显式开启并配置 Host/Origin 白名单；建议前置反向代理 TLS 与鉴权）
 xops mcp serve --transport http --listen 0.0.0.0:8080 \
-  --public-url http://192.168.1.10:8080 \
-  --token-file "$HOME/.xops/mcp.token"
+  --allow-non-loopback \
+  --allowed-host 192.168.1.10:8080 \
+  --allowed-origin https://agent.internal.example \
+  --transfer-root ~/.xops/transfers
 ```
 
-将 `192.168.1.10` 替换为客户端可访问的服务端地址。`--public-url` 只填写协议、主机和端口，不加 `/mcp`。未指定监听地址时，服务仅监听 `127.0.0.1:8080`；局域网接入需要设置 `--listen` 和 `--public-url`。
-
-也可用 `--token-env XOPS_MCP_TOKEN` 从服务端环境变量读取 Token，与 `--token-file` 二选一。Token 长度须为 32–4096 字节且不含空白；Token 文件末尾可以有换行。妥善保存 Token，仅提供给需要连接此服务的客户端。
-
-### 保存启动配置
-
-将设置写入 XOps 配置文件的 `mcp` 部分后，可以直接运行 `xops mcp serve`：
-
-```yaml
-mcp:
-  transport: http
-  listen: 0.0.0.0:8080
-  public_url: http://192.168.1.10:8080
-  token_file: /home/operator/.xops/mcp.token
-  state_dir: /home/operator/.xops/mcp-transfers
-  stream_idle_timeout: 1m
-  transfer_timeout: 2h
-  max_file_bytes: 10737418240
-  max_active_transfers: 4
-  max_transfers_per_target: 2
-```
-
-替换示例中的地址和路径。命令行参数优先于配置文件；修改配置后重启服务。
-
-`state_dir` 保存传输任务记录，默认位于配置文件同目录下的 `mcp-transfers`。使用仅服务账户可访问的本地目录，不要让多个服务同时使用，也不要在存在待处理任务时删除它。
-
-`max_requests` 限制普通 HTTP 请求的并发数，包括 SSE 连接和文件传输。初始化完成通知、审批回复和取消通知使用独立且同样有并发上限的控制通道，避免正在结束的初始化请求或长连接阻塞这些消息。普通请求或控制通道各自达到上限时返回 HTTP 429。
-
-## 连接 AI 客户端
-
-客户端选择 **Streamable HTTP**，连接地址为 `http://192.168.1.10:8080/mcp`。不使用旧版 HTTP+SSE 的 `/sse` 地址。
-
-### Codex
-
-在启动 Codex 的客户端环境中设置 `XOPS_MCP_TOKEN`，值与服务端 Token 一致，然后添加配置：
-
-```toml
-[mcp_servers.xops]
-url = "http://192.168.1.10:8080/mcp"
-bearer_token_env_var = "XOPS_MCP_TOKEN"
-startup_timeout_sec = 10
-```
-
-### Antigravity CLI
-
-将以下内容合并到 `~/.gemini/config/mcp_config.json` 的 `mcpServers` 中，并替换地址和 Token：
+### 客户端配置示例（`stdio`）
 
 ```json
 {
   "mcpServers": {
     "xops": {
-      "serverUrl": "http://192.168.1.10:8080/mcp",
-      "headers": {"Authorization": "Bearer REPLACE_WITH_SHARED_TOKEN"}
+      "command": "/usr/local/bin/xops",
+      "args": [
+        "mcp", "serve",
+        "--transfer-root", "/home/alice/.xops/transfers",
+        "--artifact-root", "/home/alice/.xops/artifacts"
+      ]
     }
   }
 }
 ```
 
-限制配置文件的访问权限。重新打开 CLI，或通过 `/mcp` 刷新并确认连接。
+### `xops mcp` 启动标志
 
-Antigravity CLI 1.2.11 可能自动取消 XOps 审批表单，导致需要审批的操作无法执行。遇到这种情况，请使用能够完成审批的客户端处理该操作。
-
-### 确认文件和网络访问权限
-
-文件传输还需要 AI 客户端执行本地命令。该命令环境必须能访问 XOps HTTP 地址，以及本地源文件和下载目录。按照客户端提示允许相应的文件和网络访问。
-
-如果客户端在远程沙箱中运行，文件路径指向沙箱中的文件；桌面电脑上的文件需要先放入该环境。
-
-## 上传和下载文件
-
-可以让 AI 客户端完成准备任务、执行传输和检查结果。例如：“将本机的 `report.zip` 上传到节点 `web-1` 的 `/srv/uploads/report.zip`，不要覆盖已有文件。”
-
-HTTP 文件传输分为两步：先通过 MCP 准备任务，再在客户端运行传输命令。准备工具不会直接读取或保存本地文件。
-
-| 操作 | MCP 工具 |
+| 标志 | 说明 |
 | --- | --- |
-| 准备上传任务 | `transfer`，`action: "prepare_push"` |
-| 准备下载任务 | `transfer`，`action: "prepare_pull"` |
-| 查询任务状态 | `transfer`，`action: "status"` |
-| 取消任务 | `transfer`，`action: "cancel"` |
+| `--transport <mode>` | 传输协议：`stdio`（默认）\| `http` |
+| `--listen <addr>` | `--transport=http` 时的监听地址（默认 `127.0.0.1:8080`） |
+| `--transfer-root <dir>` | MCP 流式传输专用 `ScopedRootFS` 沙箱根目录 |
+| `--artifact-root <dir>` | MCP GUI 截图与产物专用 `ScopedRootFS` 沙箱根目录（未设置时回退 `--transfer-root`） |
+| `--allow-non-loopback` | 显式允许绑定非回环网卡（默认物理拒绝非回环地址） |
+| `--allowed-origin <origin>` | 允许的非回环 HTTP `Origin` 白名单（可重复，支持逗号分隔） |
+| `--allowed-host <host>` | 允许的非回环 HTTP `Host` 白名单（可重复，支持逗号分隔） |
+| `-F <configfile>` | 替代 OpenSSH 配置文件（显式传入时严格检查存在性；`none` 禁用） |
+| `--policy <profile>` | 策略配置档（MCP 默认 **`strict_agent`**） |
 
-让客户端在准备上传时计算文件大小和 SHA-256，并使用目标服务器上的绝对路径。把准备工具返回的完整任务内容保存为 `upload-task.json` 或 `download-task.json`，其中包含传输地址和短期凭证；不要手动修改，也不要公开或提交到版本库。
+## 2. 强制安全边界与 `ssh-agent` 认证说明
 
-### 使用传输辅助程序
+XOps v2 在组合根（`cmd/xops`）与核心引擎两层为 MCP 模式实施了**物理级安全隔离**：
 
-在客户端安装 Python 3，并取得项目中的 `scripts/mcp/transfer.py`。以下示例从项目目录执行，任务 JSON 由前一步准备工具生成：
+1. **物理零 `OperatorReadFS`（仅 `ScopedRootFS`）**：MCP 运行时绝不注入 `OperatorReadFS`、`InteractionPort` 与本地 `TerminalPort`，因此 MCP 工具**无法读取宿主机任意文件路径**，本地文件 I/O 严格锁定在 `--transfer-root` / `--artifact-root` 的 `os.Root` 沙箱之内。
+2. **重要：`AuthPrivateKey` 与 `ssh-agent` 说明**：
+   - 正因为 MCP 模式下 `OperatorReadFS == nil`，配置为直接读取本机磁盘私钥文件的 `kind: private_key`（`AuthPrivateKey`）身份在 MCP 中**无法从宿主机磁盘读取私钥文件**（会安全失败关闭返回 `ErrSignerUnavailable`）。
+   - 在 MCP 中使用密钥认证的推荐做法：提前将私钥添加到本机 **`ssh-agent`**（Unix 通过 `SSH_AUTH_SOCK`，Windows 通过受安全 DACL 校验的 `\\.\pipe\openssh-ssh-agent` 命名管道），并为节点使用 `kind: agent` 身份（或在 `composite` 认证链中包含 `agent`）。
+   - 若使用密码、TOTP 或键盘交互认证，请配合在无交互环境下可读取的 Vault 后端（如 `os_keychain` 或 `external_helper`）。
+3. **默认 `strict_agent` 熔断**：任何 `AuditPostWriteError` 立即触发不可逆 `Halted` 熔断态，清空受管句柄并拒绝所有后续请求（HTTP 端点返回 `503 Service Unavailable`，`code: "gate_halted"`）。
+4. **启动期自动 `Prepare` 对账**：服务在开始接收请求前自动执行 O(1) 跨进程审计崩溃对账与双代 WAL 传输日志恢复（遇 `TransferUncertainCommit` 零副作用隔离并报告，严禁自动覆盖或删除）。
 
-```bash
-chmod 600 upload-task.json
-python3 scripts/mcp/transfer.py upload --server http://192.168.1.10:8080 \
-  --task upload-task.json --file './client file.bin'
+## 3. Streamable HTTP 端点与安全机制
 
-chmod 600 download-task.json
-python3 scripts/mcp/transfer.py download --server http://192.168.1.10:8080 \
-  --task download-task.json --file './downloaded file.bin'
-```
+在 `--transport http` 模式下，服务端暴露三个受 Host/Origin（DNS Rebinding 与 CSRF 防护）及 `Halted` 门禁保护的端点：
 
-PowerShell 示例：
-
-```powershell
-py -3 scripts/mcp/transfer.py upload --server http://192.168.1.10:8080 --task upload-task.json --file '.\client file.bin'
-py -3 scripts/mcp/transfer.py download --server http://192.168.1.10:8080 --task download-task.json --file '.\downloaded file.bin'
-```
-
-`--server` 填写服务端地址，不加 `/mcp`；`--file` 始终是客户端本地路径。Windows 上应将任务 JSON 保存在仅当前用户可访问的目录中。传输结束后删除任务 JSON。
-
-辅助程序会校验大小和 SHA-256。上传成功显示 `completed`；下载成功显示 `localSaved: true`。下载默认不覆盖已有文件，确需覆盖时添加 `--overwrite-local`。私有 HTTPS 证书可用 `--ca-file` 指定可信 CA 文件。
-
-### 文件要求
-
-- 仅支持普通单文件；目录先在客户端打包，目标端不会自动解包。
-- 不支持符号链接、特殊文件或断点续传。传输期间不要修改源文件。
-- 上传默认不覆盖。需要覆盖时，在准备上传任务时明确指定；目标 SFTP 服务须支持原子替换。
-- 上传后的文件权限为 `0600`（仅文件所有者可读写），不保留原文件的所有权、ACL 等元数据。
-- 辅助程序的默认下载方式要求本地文件系统支持硬链接。若提示不支持，可更换下载目录后重新申请任务。
-
-### 查询状态与取消
-
-可以让客户端调用状态工具，也可使用已有任务文件查询：
-
-```bash
-python3 scripts/mcp/transfer.py status --server http://192.168.1.10:8080 \
-  --task upload-task.json
-```
-
-| 状态 | 后续操作 |
-| --- | --- |
-| `ready` | 在任务有效期内运行传输命令 |
-| `transferring`、`verifying`、`committing` | 等待完成，或查询最新状态；不要重复发送文件 |
-| `completed` | 上传已完成 |
-| `streamed` | 下载数据已发送，仍需确认客户端显示 `localSaved: true` |
-| `failed`、`cancelled`、`expired` | 查看错误原因，处理后重新申请传输任务 |
-| `unknown` | 上传结果不确定，先按下文核验，暂勿重传 |
-
-取消时，让客户端调用 `transfer`（`action: "cancel"`）并提供任务 ID。已经开始提交的上传可能无法停止，应继续查询最终状态。关闭客户端或断开网络不代表操作已取消。
-
-如果准备任务的回复丢失，让客户端使用相同的请求 ID 和参数重试准备步骤，并使用新返回的任务内容。文件传输本身不应自动重试；上传超时后先查询状态，避免重复覆盖。
-
-## 调整限制
-
-可在 YAML 的 `mcp` 部分调整以下常用设置：
-
-| 设置 | 默认值 | 配置键 |
+| 端点 | 方法 | 用途 |
 | --- | --- | --- |
-| 单文件大小 | 10 GiB | `max_file_bytes`（字节） |
-| 同时传输数 | 4 | `max_active_transfers` |
-| 单目标同时传输数 | 2 | `max_transfers_per_target` |
-| 任务开始前有效期 | 5 分钟 | `transfer_start_window` |
-| 无进展等待时间 | 1 分钟 | `stream_idle_timeout` |
-| 单次传输最长时间 | 2 小时 | `transfer_timeout` |
-| 普通工具最长执行时间 | 5 分钟 | `tool_timeout` |
-| 上传提交等待时间 | 30 秒 | `commit_timeout` |
-| 任务记录保留时间 | 24 小时 | `transfer_retention` |
-| 待开始任务数 / 记录数 | 256 / 4096 | `max_ready_transfers` / `max_transfer_records` |
+| `/mcp` | `POST` / `GET` / `DELETE` | Streamable HTTP JSON-RPC 2.0 端点：`POST initialize` 签发 `Mcp-Session-Id`（默认最多 64 并发会话、单报文上限 4 MiB）；后续请求必须携带 `Mcp-Session-Id`；`GET` 附带 `Accept: text/event-stream` 建立 SSE；`DELETE` 销毁会话 |
+| `/transfers/{transfer_id}/stream` | `PUT` / `POST` / `GET` | 最高 **10 GiB** 零整包缓冲（默认 1 MiB 定长分片）流式上传与下载端点，要求有效 `Mcp-Session-Id` |
+| `/healthz` | `GET` | 健康探针，返回 `{"ready":true,"halted":false}`；未就绪、已关闭或熔断时返回 HTTP `503` |
 
-限制须为正数；记录保留时间须大于开始有效期、传输最长时间和提交等待时间之和。
+> **网络暴露建议**：Streamable HTTP 内置回环绑定限制与 Host/Origin 校验，但**不内置应用层 Bearer Token 或 TLS**。如需跨主机或局域网访问，请在前方部署带 TLS + 强认证（如 mTLS / OAuth / Bearer Token）的反向代理，并严格限制 `--allowed-host` 与 `--allowed-origin`。
 
-收到繁忙提示时，等待正在执行的任务结束，再重试准备或开始传输。多个节点名称指向同一主机、端口和账户时，共用传输限额；同一路径不能同时上传。不同域名指向同一主机时，应自行避免并行覆盖同一文件。
+## 4. 10 GiB 流式传输流程与两步审批
 
-辅助程序的 `--idle-timeout` 和 `--timeout` 可调整客户端等待时间。超时后不会自动重传；上传结果核验可能额外等待最多 45 秒。
+### 流式上传（`transfer` 工具 + `PUT /transfers/{id}/stream`）
 
-上传请求体完整读取后，HTTP 读取空闲超时不再取消后续校验或提交准备；校验仍受传输总时限约束，进入提交后使用独立的 `commit_timeout`。请求体尚未读完时，读取空闲超时仍然生效。
+1. 通过 `/mcp` 调用 `transfer` 工具（`action: "start"`, `direction: "upload"`, `target`, `remote_path`, `total_bytes`, 可选 `expected_digest`），获得 `transfer_id` 与句柄绑定。
+2. 向 `PUT /transfers/{transfer_id}/stream?commit=true` 发送原始二进制流（携带 `Mcp-Session-Id`；断点续传可附 `X-Xops-Start-Offset: <bytes>`）。
+3. 服务端按定长分片流式直写远端并记录双代 CRC32 WAL；若启用 `?commit=true` 且已达 `total_bytes`，自动完成校验与原子提交并返回实际 SHA-256 摘要。
 
-## 处理异常任务
+### 流式下载（`transfer` 工具 + `GET /transfers/{id}/stream`）
 
-服务重启后，未开始的任务需要重新申请，中断的传输不会自动续传。出现 `unknown` 时，后续对同一路径的上传会被阻止，需要先核验结果。
+1. 通过 `/mcp` 调用 `transfer` 工具（`action: "start"`, `direction: "download"`, `target`, `remote_path`, `local_dest`）。
+2. 向 `GET /transfers/{transfer_id}/stream` 发起请求（携带 `Mcp-Session-Id`），服务端拉取分片、提交至 `--transfer-root` 沙箱，再以 `application/octet-stream` 流式回传，并在响应头附带 `X-Xops-Transfer-Id`、`X-Xops-Transfer-State` 与 `X-Xops-Transfer-Digest`。
 
-新任务使用 v2 私有记录保存原始授权和连接版本。目标、凭据、跳板、信任或策略改变后，旧 ready 任务不能重新取得可用数据凭证；核验和清理也会拒绝失效绑定，保留记录供人工处理。完成提交预约的上传保留原连接和独立提交期限。任务或请求在预约完成前取消会阻止提交；预约完成后不再承诺安全取消。
+### 两步审批闭环（`no_elicit_fallback: challenge`）
 
-任务记录（包括授权元数据）上限为 64 KiB，准备时还会为后续状态和诊断预留空间。准备记录超限会拒绝该任务，之后符合大小限制的任务仍可正常准备；无需因这一输入限制重启服务。旧记录若已占满容量，重启仍会恢复其状态视图并保留原文件；warning 会说明状态仅在内存中更新，unknown 路径锁仍然有效。人工处理说明按 JSON 内容限制为 4096 字节，特殊字符转义也计入大小。实际持久化写入失败仍会停止新任务，以保留结果不确定时的保护。
+当配置 `policy.guardrail.no_elicit_fallback: challenge` 且操作命中护栏审批阈值时：
 
-旧 v1 记录仍可列出并保留 unknown 路径锁，但缺少绑定的记录不能通过 `--verify` 或 `--cleanup` 连接当前节点。应独立核对原始目标后人工处理；`--resolve-unknown --reason` 只记录人工结论，不执行远端操作。未知未来版本拒绝读取，不会覆盖记录。
+- `/mcp` 工具返回 `code: "approval_required"` 及 `approval_challenge`（含 `envelope`、`envelope_digest`、`escalated`、`reason`、`instructions`）；HTTP 流端点返回 HTTP `428 Precondition Required`。
+- 客户端将 `envelope` 展示给人工确认后，在同一调用中附带 `approval` 对象（或 HTTP 流请求头 `X-Xops-Approval: {"verdict":"allow","envelope_digest":"..."}`）重新提交即可通过校验；单次审批信封防重放且受 `approval_ttl` 约束。
 
-先停止 XOps MCP 服务，再列出任务记录：
+## 相关参考
 
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers
-```
-
-将 `TASK_ID` 替换为需要处理的任务 ID，核验目标文件：
-
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers --id TASK_ID --verify
-```
-
-核验使用当前 `mcp.max_file_bytes` 上限，比较目标文件大小和摘要，不修改文件。确认目标内容及后续处理方式后，记录说明并解除上传限制：
-
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers --id TASK_ID \
-  --resolve-unknown --reason '已核验目标内容，允许后续新任务上传'
-```
-
-该操作不会重传或删除目标文件，原任务仍保留 `unknown` 状态及人工处理说明。如果报告中还有临时文件待清理，执行：
-
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers --id TASK_ID --cleanup
-```
-
-若提示临时文件归属尚未确认，先核对远程文件，再通过 `--reason` 记录确认依据。不要仅凭文件名删除无法确认归属的文件。
-
-## HTTPS 与连接排查
-
-明文 HTTP 不加密 Token 或文件内容。需要 HTTPS 时，可通过反向代理提供服务，并将 `public_url` 设置为客户端实际访问的 HTTPS 地址。
-
-代理应保留正确的 Host，关闭 `/mcp` 和文件传输接口的请求、响应缓冲，并允许长时间传输。不要为上传配置自动重试。
-
-### Nginx 反向代理示例
-
-以下示例由 Nginx 提供 HTTPS，XOps 与 Nginx 运行在同一台主机。先准备好 `mcp.example.com` 的 DNS 和受客户端信任的 TLS 证书，再让 XOps 仅监听本机地址，复用已生成的 Token：
-
-```bash
-xops mcp serve --transport http --listen 127.0.0.1:8080 \
-  --public-url https://mcp.example.com \
-  --token-file "$HOME/.xops/mcp.token"
-```
-
-`public_url` 必须是客户端实际访问的 HTTPS 来源地址，不加 `/mcp` 或其他路径前缀；XOps 用它生成文件传输地址，并设置默认允许的 Host 和 Origin。`X-Forwarded-Proto` 不能代替此配置。
-
-将下面的 `server` 块保存到 Nginx 的 `http` 上下文加载的文件中，例如 `/etc/nginx/conf.d/xops-mcp.conf`。替换域名和证书路径：
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name mcp.example.com;
-
-    ssl_certificate     /etc/nginx/certs/mcp.example.com.fullchain.pem;
-    ssl_certificate_key /etc/nginx/certs/mcp.example.com.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-
-    # 与 XOps 默认的 10 GiB 单文件上限对应。
-    client_max_body_size 10g;
-    client_body_timeout 75s;
-    send_timeout 75s;
-
-    proxy_http_version 1.1;
-    proxy_set_header Host $http_host;
-    proxy_set_header Connection "";
-    proxy_set_header Authorization $http_authorization;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_pass_request_headers on;
-
-    # 即时转发 MCP 流式响应和文件内容。
-    proxy_buffering off;
-    proxy_request_buffering off;
-    proxy_cache off;
-    gzip off;
-    proxy_next_upstream off;
-
-    proxy_connect_timeout 5s;
-    proxy_send_timeout 75s;
-    # 上传可能直到完成才返回响应；覆盖默认 2 小时传输时限。
-    proxy_read_timeout 7500s;
-
-    location = /mcp {
-        proxy_pass http://127.0.0.1:8080;
-    }
-
-    location ^~ /v1/transfers/ {
-        proxy_pass http://127.0.0.1:8080;
-    }
-
-    location / {
-        return 404;
-    }
-}
-```
-
-两个 `proxy_pass` 均不带 URI 部分，保留原始路径；不要只代理 `/mcp`、添加路径前缀或将 `/mcp` 重定向到 `/mcp/`。若 Nginx 与 XOps 位于不同容器或主机，应将上游地址改为 Nginx 能访问的 XOps 地址，并相应调整 XOps 的监听地址。
-
-`Authorization` 必须透传请求原值：`/mcp` 使用共享 Token，文件传输接口使用准备任务返回的短期凭证，不能在代理中统一替换成固定 Token。`Origin`、`Mcp-Session-Id`、`MCP-Protocol-Version` 等请求头以及响应中的会话头默认保留；不要删除或重写它们。Streamable HTTP 不需要 WebSocket 的 `Upgrade` 配置。此示例使用单个 XOps 实例，MCP 会话和后续文件传输请求应到达同一实例。
-
-`proxy_read_timeout` 是上游两次读取之间的等待时间，不是整次传输的总时限。示例使用 7500 秒，给默认两小时上传及提交留出余量；其余 75 秒超时略大于 XOps 默认一分钟空闲时限。XOps 和客户端自身的超时仍然生效。调整文件上限或超时时，应同步检查 Nginx、XOps 和客户端设置。
-
-检查配置并重新加载：
-
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-curl --max-time 10 --include https://mcp.example.com/mcp
-```
-
-未携带 Token 的检查请求应返回 `401`，用于确认 TLS 和代理路由可用。随后将 MCP 客户端地址改为 `https://mcp.example.com/mcp`，传输辅助程序的 `--server` 改为 `https://mcp.example.com`，重新连接客户端并准备传输任务。若使用非默认 HTTPS 端口，例如 `8443`，需同时修改 `listen`、`public_url` 和客户端地址；`$http_host` 会保留该端口。
-
-### 连接排查
-
-| 问题 | 检查项 |
-| --- | --- |
-| `401` 或认证失败 | 客户端 Token 是否与服务端一致，配置或环境变量是否已生效 |
-| `host_or_origin_denied` | `public_url` 是否正确；使用额外域名或来源时配置 `--allowed-hosts`、`--allowed-origins` |
-| 能调用 MCP，但传输命令无法连接 | 运行本地命令的环境是否能访问局域网地址，是否已允许网络访问 |
-| Nginx 返回 `413` | `client_max_body_size` 是否足够；同时检查 XOps 的 `max_file_bytes` |
-| Nginx 返回 `502` / `504`，或流式响应延迟出现 | 上游地址、服务状态、代理超时和缓冲设置；上传中断后先查询任务状态，不要直接重传 |
-| 任务已过期 | 重新申请任务，并在开始有效期内运行传输命令 |
-| 凭据或主机密钥错误 | 在服务端运行 `xops credential doctor`，确认凭据可用并完成主机密钥确认 |
-
-参数详情见 [MCP 命令参考](../reference/commands/xops-mcp)。
-
-## 命令解释器与自动探测
-
-`terminal`（`session: "once"`）的执行配置优先级为：请求参数 `execution` > 节点配置 > 全局配置，支持 `bash`、`sh`、`zsh`、`fish`、`powershell`、`pwsh`、`cmd` 和 `server`（JSON 中 `launch_dialect` 与 `launchDialect` 均可识别，`sudo: true` 复用相同的执行配置）：
-
-```json
-{
-  "nodeID": "web-01",
-  "command": "set -l values first second; printf '%s' $values[2]",
-  "execution": { "interpreter": "fish", "launchDialect": "fish", "login": false }
-}
-```
-
-- **按需探测与缓存**：当请求、节点和全局均未指定解释器或方言时，内置 MCP 后端会在执行前通过有界只读 SSH 探针自动识别远端默认 Shell（结果按 SSH 连接缓存，不改写配置文件；探针取消或超时后允许后续请求重探，语法/协议等非上下文错误按连接缓存；探测失败不会执行用户命令）。显式配置（含 `execution.interpreter: server`）不会被探测覆盖。策略明确禁止的命令在探测前即被拒绝；SFTP 文件工具不依赖 Shell 探测。
-- **快照绑定与连接隔离**：探测先获取绑定到当前配置快照的 `Inspect` 许可，完成后再对最终解释器和命令计划进行风险评估与审批；审批期间若节点配置发生变更，执行许可会自动失效，不会将已授权操作重定向到新地址。普通与提权命令复用同一连接代际并在结束时释放租约（嵌入式宿主可通过实现 `ports.ExecutionProber` 获得相同的探测准备能力）。
-- **保守风险评估**：
-  - `fish` 命令始终按 `fish` 语义保守评估，即使外层启动方言为 `posix` 也不会套用 POSIX 安全前缀放行。
-  - 含命令替换、进程替换、变量展开、换行、后台操作符、引号/转义/通配符或环境赋值的命令（即使以 `echo` 开头）统一按至少 `moderate`（中等风险）处理。
-  - 只读安全放行仅限精确匹配的纯查询命令：`hostname`（无参或指定查询选项）、`date`（无参或单个 `+格式`）、`ip`（仅 `addr`/`route` 及无额外参数的 `show`）、`systemctl`（仅完整 `status` 子命令与已知显示选项）。`find`（含 `-delete`/`-exec`/文件输出）、`sed`、`awk`、`file`、`ss`、`journalctl` 和分页器等兼具写入或执行能力的工具一律按至少 `moderate` 风险处理。
+- [MCP 7 工具协议参考](../reference/mcp) — 查阅全部 7 个工具的 `action` 枚举与参数表
+- [MCP 隧道与多路复用工具](./mcp-tunnels) — 深入使用 `tunnel` 工具管理转发与 ControlMaster

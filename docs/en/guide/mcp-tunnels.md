@@ -1,109 +1,120 @@
-# SSH tunnels over MCP stdio
+# MCP Tunnel and Mux Tools
 
-The stdio server started with `xops mcp serve` provides SSH local (`-L`) and remote (`-R`) forwarding. Use it to inspect a remote web application in a browser, connect local tests to a remote database, or let remote workers call a local development service. HTTP MCP does not register tunnel tools. Dynamic SOCKS5 forwarding (`-D`) is not exposed through MCP.
+In XOps v2, `tunnel` is one of the 7 first-class discriminated MCP tools and works identically over both **`stdio`** and **Streamable HTTP** transports. It enables AI assistants to create, inspect, and close local/remote/dynamic SOCKS5/StreamLocal/TUN forwards and ControlMaster multiplexers under full guardrail and audit enforcement.
 
-## Location and preparation
+## 1. Eight Supported Actions (`action`)
 
-“Local” always means **the machine running the XOps MCP process**. When the stdio server runs inside a container or a remote development environment, local listeners and destination connections belong to that environment.
-
-| Mode | Listener location | Destination resolution and connection location |
+| Category | `action` | Purpose |
 | --- | --- | --- |
-| `local` (`-L`) | MCP process machine | SSH node |
-| `remote` (`-R`) | SSH node | MCP process machine |
+| **Port & TUN Forwarding** | `start_forward` | Open a managed forward and return a generation-bound `handle` / `handle_token` |
+| | `inspect_forward` | Inspect bound address and live state of a managed forward |
+| | `stop_forward` | Stop and release a managed forward handle |
+| **ControlMaster Mux** | `start_mux` | Start a managed ControlMaster multiplexer session |
+| | `inspect_mux` | Inspect a managed ControlMaster session |
+| | `stop_mux` | Stop and release a managed ControlMaster session |
+| | `probe_mux` | Probe liveness of an existing ControlMaster socket |
+| | `control_mux` | Send a control command (`mux_action`: `check` \| `forward` \| `cancel` \| `exit` \| `stop`) |
 
-Configure nodes, credentials and trusted host keys first. Tunnels use the configured ProxyJump chain and never prompt for passwords or unknown host keys. Each tunnel uses the node and jump configuration admitted for that operation. Later ordinary edits do not redirect it to another target. External CLI configuration-file changes still require an MCP restart to load.
+## 2. Forwarding Modes and Examples
 
-`nodeID` accepts saved node IDs, aliases and OpenSSH IDs such as `openssh:web`. After creating through the OpenSSH alias `web`, the returned canonical ID `openssh:web` can be reused for creation retries, new tunnels and list filters. Unprefixed aliases prefer saved nodes when names collide; the `openssh:` prefix preserves the OpenSSH namespace.
+`start_forward` supports all 4 `direction` values (`local`, `remote`, `dynamic`, `tun`) and both `tcp` and `unix` (StreamLocal) endpoint kinds:
 
-OpenSSH identifiers, including IDs resolved from aliases, must not contain whitespace or control characters. Such requests fail before policy evaluation, keeping the policy key consistent with the name used for the connection.
-
-## Tools and examples
-
-| Tool | Input | Purpose |
-| --- | --- | --- |
-| `tunnel` with `action: "create"` | `requestID`, `nodeID`, `mode`, `listenPort`, `targetHost`, `targetPort`; optional `listenHost`, `ttlSeconds` | Create a tunnel and return its state |
-| `tunnel` with `action: "list"` | Optional `nodeID`, `state` | List this process's tunnels and retained terminal records |
-| `tunnel` with `action: "status"` | `tunnelID` | Query one tunnel |
-| `tunnel` with `action: "stop"` | `tunnelID` | Stop listening and close existing forwarded connections |
-
-After a node is disabled or deleted, its retained canonical `nodeID` can still filter tunnel history, together with `state`. A retained canonical ID takes precedence over a current alias with that spelling; other aliases use current inventory resolution. History queries still enforce current global and node policies. Cancelling or expiring a list request cancels its node lookup and query without changing background tunnel TTLs.
-
-Forward the loopback web service on SSH node `web-1` to an automatically allocated local port:
+### Local Port Forward (`-L`)
 
 ```json
 {
-  "requestID": "web-preview-001",
-  "nodeID": "web-1",
-  "mode": "local",
-  "listenHost": "127.0.0.1",
-  "listenPort": 0,
-  "targetHost": "127.0.0.1",
-  "targetPort": 3000,
-  "ttlSeconds": 3600
+  "action": "start_forward",
+  "target": "web-01",
+  "direction": "local",
+  "bind_kind": "tcp",
+  "bind_addr": "127.0.0.1:18080",
+  "target_kind": "tcp",
+  "target_addr": "127.0.0.1:80"
 }
 ```
 
-The returned `tunnel.listenAddress` contains the allocated listening port. The browser must be able to reach that machine's listener; on the same machine, open `http://<listenAddress>`.
-
-Let SSH node `worker-1` access a local development service through its loopback port:
+### Remote Port Forward (`-R`)
 
 ```json
 {
-  "requestID": "worker-callback-001",
-  "nodeID": "worker-1",
-  "mode": "remote",
-  "listenHost": "127.0.0.1",
-  "listenPort": 18080,
-  "targetHost": "127.0.0.1",
-  "targetPort": 8080,
-  "ttlSeconds": 1800
+  "action": "start_forward",
+  "target": "worker-01",
+  "direction": "remote",
+  "bind_kind": "tcp",
+  "bind_addr": "127.0.0.1:9000",
+  "target_kind": "tcp",
+  "target_addr": "127.0.0.1:3000"
 }
 ```
 
-Here, destination `127.0.0.1:8080` is on the MCP process machine. The SSH server must permit TCP forwarding. Its `GatewayPorts` policy controls actual bind interfaces; the returned requested address does not prove loopback-only exposure.
+### Dynamic SOCKS5 (`-D`) and StreamLocal (`unix`)
 
-`listenHost` defaults to `127.0.0.1` and accepts IP literals or `localhost`. Supply IPv6 literals without brackets, such as `::1`. `listenPort` accepts `0–65535`, with `0` requesting allocation; destination ports accept `1–65535`. Use a new `requestID` for each new tunnel and the returned `tunnelID` for status and stop calls.
+```json
+{
+  "action": "start_forward",
+  "target": "web-01",
+  "direction": "dynamic",
+  "bind_kind": "tcp",
+  "bind_addr": "127.0.0.1:1080"
+}
+```
 
-## Lifecycle and limits
+```json
+{
+  "action": "start_forward",
+  "target": "web-01",
+  "direction": "local",
+  "bind_kind": "unix",
+  "bind_addr": "/tmp/xops-local.sock",
+  "target_kind": "unix",
+  "target_addr": "/var/run/docker.sock"
+}
+```
 
-`running` means the listener is established, not that the destination service has been verified. Individual connection failures are recorded in `lastConnectionError`; the tunnel can accept later connections. Startup or SSH transport failures enter `failed`, with details in `error`.
+### Inspect and Stop
 
-| State | Meaning |
-| --- | --- |
-| `starting` | Establishing the SSH connection and listener |
-| `running` | Listener established |
-| `stopping` | Stop requested; cleanup in progress |
-| `stopped` | Resources owned by this process have been released |
-| `expired` | Lifetime ended and resources have been released |
-| `failed` | Startup, transport or cleanup failed; inspect the error |
+Pass the `handle` or `handle_token` returned by `start_forward`:
 
-Cancellation before startup is committed aborts creation. After publication, the tunnel survives completion of the creating tool call. Retrying the same `requestID` with the same normalized parameters returns the existing record without renewing its lifetime. Changed parameters cause a conflict. Terminal records never restart; fix the cause and use a new request ID.
+```json
+{
+  "action": "inspect_forward",
+  "handle_token": "<token-from-start_forward>"
+}
+```
 
-Explicit stop, expiry, SSH disconnect or MCP process exit triggers cleanup. Tunnels do not automatically reconnect or survive process restarts. If waiting for stop times out, cleanup continues; query status. Remote forwards report `remoteRelease: "unconfirmed"` after stopping: local cleanup does not confirm release of the remote port, particularly when a network failure delays detection by the SSH server.
+```json
+{
+  "action": "stop_forward",
+  "handle_token": "<token-from-start_forward>"
+}
+```
 
-An EOF caused by closing the listener during a normal stop is treated as cancellation and does not mark the task `failed`. Listener interruptions without a stop request and unexpected listener cleanup errors still report failure.
+## 3. ControlMaster Multiplexing Example
 
-Cancellation, timeout or MCP shutdown during ProxyJump startup releases established jump connections even if the downstream SSH handshake is incomplete or the network is unresponsive.
+```json
+{
+  "action": "start_mux",
+  "target": "web-01",
+  "socket_path": "~/.xops/mcp-mux-%C",
+  "control_master": "yes",
+  "control_persist": "10m"
+}
+```
 
-Remote listener creation and closure each have an independent 10-second request limit; creation also respects task cancellation. A canceled startup request or an expired request limit interrupts the tunnel's dedicated SSH/ProxyJump transport and releases local resources. Remote port release still reports `unconfirmed`.
+```json
+{
+  "action": "control_mux",
+  "target": "web-01",
+  "socket_path": "~/.xops/mcp-mux-%C",
+  "mux_action": "check"
+}
+```
 
-| Limit | Current value |
-| --- | --- |
-| Default / maximum lifetime | 1 hour / 24 hours, selected with `ttlSeconds` |
-| Startup timeout | 30 seconds, excluding approval |
-| Active tunnels | 16 per MCP process, including startup and cleanup |
-| Concurrent connections per tunnel | 64; excess connections are closed immediately |
-| Terminal record retention | 24 hours; cleared on process exit |
-| Total records | 1024; new creation is refused at capacity until records expire or the service restarts |
+## 4. Handle Lifecycle and Security Boundaries
 
-Each tunnel owns its SSH connection and jump chain. Stopping one leaves ordinary MCP SSH/SFTP connections and other tunnels intact. Forwarded reads and writes retain SSH forwarding time limits: five minutes for an idle read and one minute for a write before closing that connection.
-
-## Approval and auditing
-
-Loopback local forwards and stop operations are `moderate`; remote forwards and non-loopback local listeners are `dangerous`; list and status are `safe`. Approval depends on `guardrail` thresholds and node policies. Approval displays the direction, listener, destination and lifetime and binds the complete normalized parameters. Declines, cancellations and approval errors do not create a task.
-
-Lists without `nodeID` check the global policy and every node represented in the results. If any policy requires approval, one approval covers the complete node set. Declines, cancellations and configured denial of execution without approval return no partial list. State filters include only nodes with matching records; approval and audit records include the complete node set. Results come from the snapshot checked by policy, so waiting for approval cannot add unchecked nodes. A modern approval continuation rejects an approval if the node set has changed; issue a fresh query.
-
-The global threshold is checked independently. Node overrides such as `"*"` cannot lower approval requirements for a query without `nodeID`, even when the result is empty. Queries for an explicit node continue to use that node's override.
-
-Creation, running and terminal events share an operation ID in the audit log. An audit failure before creation prevents startup; failures after startup appear in `auditError` and do not recreate the tunnel. Status queries do not add application authentication to forwarded traffic; destination services retain their own authentication requirements.
+- **Generation-Bound Handles**: Active forwards and mux masters are tracked by `ManagedHandle` with generation tokens to prevent ABA handle confusion.
+- **Deterministic Cleanup & Circuit-Break Revocation**:
+  - When the MCP server shuts down (`Close`), all ephemeral managed handles (PTY, Forward, Mux, GUI) are cleanly closed so no orphan listeners remain.
+  - If the Engine enters `Halted` under `strict_agent`, all active handles are revoked immediately.
+- **Network Scope**: "Local" refers to the machine or container running `xops mcp serve`. Prefer `127.0.0.1` binds unless broader exposure is explicitly authorized and approved.
+- **Auth Prerequisite**: Like all MCP tools, `tunnel` operates with `OperatorReadFS == nil`; preload private keys into **`ssh-agent`** (see [MCP Server Security Boundary](./mcp-http)).

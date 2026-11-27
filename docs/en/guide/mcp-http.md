@@ -1,333 +1,101 @@
-# MCP HTTP and file transfers
+# MCP Server and HTTP Streaming
 
-HTTP mode lets Codex or Antigravity CLI connect to XOps over a LAN to query and operate configured servers. Connected clients share the same nodes, SSH credentials and access token.
+XOps v2 includes a standards-compliant MCP runtime (negotiating **`2025-03-26`** with **`2024-11-05`** fallback) that exposes **7 strongly-typed discriminated tools** over **`stdio`** and **Streamable HTTP**, plus a dedicated **10 GiB** dual-generation WAL streaming transfer endpoint.
 
-## Start the service
-
-First configure [hosts and identities](hosts) and confirm that the account running XOps can connect to the target servers. Prepare SSH credentials, credential-store access and trusted host keys in advance; MCP does not display password or unlock prompts.
-
-Generate a token and start the service on the XOps server:
+## 1. Starting the MCP Server (`xops mcp`)
 
 ```bash
-umask 077
-openssl rand -hex 32 > "$HOME/.xops/mcp.token"
+# 1. Local stdio transport (default; for Claude Desktop, Cursor, Codex, Antigravity)
+xops mcp serve --transfer-root ~/.xops/transfers --artifact-root ~/.xops/artifacts
+
+# 2. Loopback Streamable HTTP transport (defaults to 127.0.0.1:8080)
+xops mcp serve --transport http --listen 127.0.0.1:8080 \
+  --transfer-root ~/.xops/transfers --artifact-root ~/.xops/artifacts
+
+# 3. Non-loopback bind (requires explicit opt-in + Host/Origin allowlists; front with TLS + auth proxy)
 xops mcp serve --transport http --listen 0.0.0.0:8080 \
-  --public-url http://192.168.1.10:8080 \
-  --token-file "$HOME/.xops/mcp.token"
+  --allow-non-loopback \
+  --allowed-host 192.168.1.10:8080 \
+  --allowed-origin https://agent.internal.example \
+  --transfer-root ~/.xops/transfers
 ```
 
-Replace `192.168.1.10` with an address reachable from the clients. `--public-url` contains only the scheme, host and port, without `/mcp`. The default listener is `127.0.0.1:8080`; configure both `--listen` and `--public-url` for LAN access.
-
-Alternatively, use `--token-env XOPS_MCP_TOKEN` to read the token from the server environment instead of `--token-file`. Tokens must contain 32–4096 bytes without whitespace; a token file may end with a newline. Keep the token private and share it only with clients that need access.
-
-### Save startup settings
-
-Add an `mcp` section to the XOps configuration file to start with just `xops mcp serve`:
-
-```yaml
-mcp:
-  transport: http
-  listen: 0.0.0.0:8080
-  public_url: http://192.168.1.10:8080
-  token_file: /home/operator/.xops/mcp.token
-  state_dir: /home/operator/.xops/mcp-transfers
-  stream_idle_timeout: 1m
-  transfer_timeout: 2h
-  max_file_bytes: 10737418240
-  max_active_transfers: 4
-  max_transfers_per_target: 2
-```
-
-Replace the example addresses and paths. Command-line flags override configuration settings. Restart the service after changing its configuration.
-
-`state_dir` stores transfer records. It defaults to `mcp-transfers` beside the configuration file. Use a local directory accessible only to the service account. Do not share it between running services or delete it while tasks need attention.
-
-`max_requests` limits concurrent ordinary HTTP requests, including SSE connections and file transfers. Initialization-complete notifications, approval replies and cancellation notifications use a separate control channel with the same concurrency limit, so an initialization request that is still finishing or a long-lived connection cannot block these messages. Either channel returns HTTP 429 when its own capacity is exhausted.
-
-## Connect an AI client
-
-Select **Streamable HTTP** and use `http://192.168.1.10:8080/mcp`. The legacy HTTP+SSE `/sse` address is not supported.
-
-### Codex
-
-Set `XOPS_MCP_TOKEN` in the client environment used to launch Codex, using the same token as the server, then add this configuration:
-
-```toml
-[mcp_servers.xops]
-url = "http://192.168.1.10:8080/mcp"
-bearer_token_env_var = "XOPS_MCP_TOKEN"
-startup_timeout_sec = 10
-```
-
-### Antigravity CLI
-
-Merge this entry into `mcpServers` in `~/.gemini/config/mcp_config.json`, replacing the address and token:
+### Example Client Configuration (`stdio`)
 
 ```json
 {
   "mcpServers": {
     "xops": {
-      "serverUrl": "http://192.168.1.10:8080/mcp",
-      "headers": {"Authorization": "Bearer REPLACE_WITH_SHARED_TOKEN"}
+      "command": "/usr/local/bin/xops",
+      "args": [
+        "mcp", "serve",
+        "--transfer-root", "/home/alice/.xops/transfers",
+        "--artifact-root", "/home/alice/.xops/artifacts"
+      ]
     }
   }
 }
 ```
 
-Restrict access to the configuration file. Reopen the CLI or refresh through `/mcp` and check the connection.
+### `xops mcp` Flags
 
-Antigravity CLI 1.2.11 may automatically cancel XOps approval forms, preventing operations that require approval. If this happens, use a client that can complete the approval for that operation.
-
-### Allow file and network access
-
-File transfers also require the AI client to run local commands. That command environment needs access to the XOps HTTP address, local source files and download directories. Allow the necessary file and network access when prompted by the client.
-
-If the client runs in a remote sandbox, local paths refer to files inside that sandbox. Copy desktop files into that environment first.
-
-## Upload and download files
-
-The AI client can prepare a task, run the transfer and check the result. For example: “Upload my local `report.zip` to `/srv/uploads/report.zip` on node `web-1`, without overwriting an existing file.”
-
-HTTP transfers have two steps: prepare a task through MCP, then run a transfer command on the client. Preparation tools do not directly read or save local files.
-
-| Action | MCP tool |
+| Flag | Description |
 | --- | --- |
-| Prepare an upload | `transfer` with `action: "prepare_push"` |
-| Prepare a download | `transfer` with `action: "prepare_pull"` |
-| Check task status | `transfer` with `action: "status"` |
-| Cancel a task | `transfer` with `action: "cancel"` |
+| `--transport <mode>` | Transport mode: `stdio` (default) \| `http` |
+| `--listen <addr>` | Listen address for `--transport=http` (default `127.0.0.1:8080`) |
+| `--transfer-root <dir>` | `ScopedRootFS` sandbox directory for MCP file transfers |
+| `--artifact-root <dir>` | `ScopedRootFS` sandbox directory for GUI/output artifacts (defaults to `--transfer-root`) |
+| `--allow-non-loopback` | Explicitly allow binding HTTP listener to non-loopback addresses (denied by default) |
+| `--allowed-origin <origin>` | Allowed non-loopback HTTP `Origin` header (repeatable, CSV supported) |
+| `--allowed-host <host>` | Allowed non-loopback HTTP `Host` header (repeatable, CSV supported) |
+| `-F <configfile>` | Alternate OpenSSH config file (validated fail-closed if specified; `none` disables) |
+| `--policy <profile>` | Policy profile (MCP defaults to **`strict_agent`**) |
 
-Have the client calculate the file size and SHA-256 when preparing an upload, and use an absolute path on the target server. Save the complete task content returned by the preparation tool as `upload-task.json` or `download-task.json`. It contains the transfer address and a short-lived credential; do not edit it manually, publish it or commit it to version control.
+## 2. Security Boundary and `ssh-agent` Note
 
-### Use the transfer helper
+In MCP mode, `cmd/xops` and `core/engine` physically enforce strict least-privilege isolation:
 
-Install Python 3 on the client and obtain `scripts/mcp/transfer.py` from the project. Run these examples from the project directory, using task JSON created in the previous step:
+1. **Zero `OperatorReadFS` (`ScopedRootFS` Only)**: MCP mode sets `OperatorReadFS == nil`, `Interaction == nil`, and `Terminal == nil`. MCP tools **cannot read arbitrary host files**—all local I/O is confined inside the `os.Root` sandboxes given by `--transfer-root` / `--artifact-root`.
+2. **Important Note for `AuthPrivateKey` & `ssh-agent`**:
+   - Because `OperatorReadFS == nil`, identities configured with `kind: private_key` (`AuthPrivateKey`) **cannot load private key files directly from host disk** in MCP mode (they fail closed with `ErrSignerUnavailable`).
+   - For key-based SSH authentication under MCP, load your keys into **`ssh-agent`** (`SSH_AUTH_SOCK` on Unix or the ACL-verified `\\.\pipe\openssh-ssh-agent` named pipe on Windows) and configure `kind: agent` (or include `agent` in a `composite` identity).
+   - For password, TOTP, or keyboard-interactive credentials, use a non-interactively accessible Vault backend such as `os_keychain` or `external_helper`.
+3. **Default `strict_agent` Circuit Breaking**: Any `AuditPostWriteError` immediately transitions the Engine into the irreversible `Halted` state, revoking active managed handles and rejecting subsequent requests (`503 Service Unavailable`, `code: "gate_halted"`).
+4. **Automatic Startup `Prepare`**: Before serving requests, the server runs O(1) crash-audit reconciliation and dual-generation WAL transfer recovery (`TransferUncertainCommit` entries are quarantined with zero side effects).
 
-```bash
-chmod 600 upload-task.json
-python3 scripts/mcp/transfer.py upload --server http://192.168.1.10:8080 \
-  --task upload-task.json --file './client file.bin'
+## 3. Streamable HTTP Endpoints and Protections
 
-chmod 600 download-task.json
-python3 scripts/mcp/transfer.py download --server http://192.168.1.10:8080 \
-  --task download-task.json --file './downloaded file.bin'
-```
+When running with `--transport http`, three endpoints are served behind Host/Origin (DNS Rebinding & CSRF) and `Halted` checks:
 
-PowerShell examples:
-
-```powershell
-py -3 scripts/mcp/transfer.py upload --server http://192.168.1.10:8080 --task upload-task.json --file '.\client file.bin'
-py -3 scripts/mcp/transfer.py download --server http://192.168.1.10:8080 --task download-task.json --file '.\downloaded file.bin'
-```
-
-`--server` is the server address without `/mcp`; `--file` is always a client-local path. On Windows, keep task JSON in a directory accessible only to the current user. Delete task JSON after the transfer.
-
-The helper checks file size and SHA-256. Successful uploads report `completed`; successful downloads report `localSaved: true`. Downloads refuse existing destinations by default; add `--overwrite-local` when replacement is intended. Use `--ca-file` to specify a trusted CA file for private HTTPS certificates.
-
-### File requirements
-
-- Only ordinary single files are supported. Archive directories on the client first; the target does not extract them automatically.
-- Symbolic links, special files and resumable transfers are not supported. Do not modify the source file during a transfer.
-- Uploads refuse overwrite by default. Request replacement explicitly when preparing the task; the target SFTP service must support atomic replacement.
-- Uploaded files have mode `0600` (readable and writable only by their owner). Original ownership, ACLs and other metadata are not preserved.
-- The helper's default download mode requires local hard-link support. If it reports that this is unavailable, choose another download directory and prepare a new task.
-
-### Check status or cancel
-
-Ask the client to call the status tool, or query with an existing task file:
-
-```bash
-python3 scripts/mcp/transfer.py status --server http://192.168.1.10:8080 \
-  --task upload-task.json
-```
-
-| Status | What to do |
-| --- | --- |
-| `ready` | Run the transfer command before the task expires |
-| `transferring`, `verifying`, `committing` | Wait or check status again; do not resend the file |
-| `completed` | The upload is complete |
-| `streamed` | Download data has been sent; still check that the client reports `localSaved: true` |
-| `failed`, `cancelled`, `expired` | Read the error, address its cause and prepare a new task |
-| `unknown` | The upload outcome is uncertain; verify it as described below before retrying |
-
-To cancel, ask the client to call `transfer` (`action: "cancel"`) with the task ID. An upload that has started committing may no longer be stoppable; check its final status. Closing the client or disconnecting the network does not confirm cancellation.
-
-If a preparation response is lost, have the client retry preparation with the same request ID and arguments, then use the newly returned task content. Do not automatically replay file transfers. Check status after an upload timeout to avoid overwriting twice.
-
-## Adjust limits
-
-Configure these common settings in the YAML `mcp` section:
-
-| Setting | Default | Configuration key |
+| Endpoint | Methods | Behavior |
 | --- | --- | --- |
-| File size | 10 GiB | `max_file_bytes` (bytes) |
-| Simultaneous transfers | 4 | `max_active_transfers` |
-| Simultaneous transfers per target | 2 | `max_transfers_per_target` |
-| Time allowed to start a task | 5 minutes | `transfer_start_window` |
-| Wait without progress | 1 minute | `stream_idle_timeout` |
-| Maximum transfer duration | 2 hours | `transfer_timeout` |
-| Maximum ordinary tool duration | 5 minutes | `tool_timeout` |
-| Upload commit wait | 30 seconds | `commit_timeout` |
-| Task record retention | 24 hours | `transfer_retention` |
-| Pending tasks / retained records | 256 / 4096 | `max_ready_transfers` / `max_transfer_records` |
+| `/mcp` | `POST` / `GET` / `DELETE` | Streamable HTTP JSON-RPC 2.0 endpoint: `POST initialize` mints `Mcp-Session-Id` (default max 64 sessions, 4 MiB body limit); subsequent calls require `Mcp-Session-Id`; `GET` with `Accept: text/event-stream` opens SSE; `DELETE` closes the session |
+| `/transfers/{transfer_id}/stream` | `PUT` / `POST` / `GET` | Constant-memory (default 1 MiB chunk) streaming upload/download endpoint up to **10 GiB**, requiring a valid `Mcp-Session-Id` |
+| `/healthz` | `GET` | Health check returning `{"ready":true,"halted":false}` (or HTTP `503` when unprepared, closed, or `Halted`) |
 
-Limits must be positive. Record retention must exceed the combined start window, maximum transfer duration and commit wait.
+> **Exposure Guidance**: Streamable HTTP enforces loopback-only binding and Host/Origin checks by default, and intentionally does not embed application-layer Bearer tokens or TLS. If exposing beyond loopback, terminate TLS and strong authentication (mTLS / OAuth / Bearer token) in a reverse proxy and lock down `--allowed-host` and `--allowed-origin`.
 
-If the service reports that it is busy, wait for active tasks to finish before retrying preparation or starting the transfer. Node aliases for the same host, port and account share transfer limits; uploads to the same path cannot run simultaneously. When different hostnames point to the same server, avoid uploading to the same file in parallel.
+## 4. 10 GiB Streaming Transfers and Two-Step Approval
 
-The helper's `--idle-timeout` and `--timeout` options adjust client waiting times. Timeouts do not trigger automatic retransmission; checking an upload outcome may take up to another 45 seconds.
+### Streaming Upload (`transfer` tool + `PUT /transfers/{id}/stream`)
 
-After the complete upload body has been read, the HTTP read-idle deadline no longer cancels verification or commit preparation. Verification remains bounded by the transfer timeout; committing uses the separate `commit_timeout`. Read-idle protection still applies while the request body is incomplete.
+1. Call `transfer` over `/mcp` (`action: "start"`, `direction: "upload"`, `target`, `remote_path`, `total_bytes`, optional `expected_digest`) to obtain `transfer_id` and its managed handle binding.
+2. Stream raw bytes to `PUT /transfers/{transfer_id}/stream?commit=true` with `Mcp-Session-Id` (resume with `X-Xops-Start-Offset: <bytes>`).
+3. Chunks stream straight to the remote host with dual-generation CRC32 WAL persistence; when `?commit=true` reaches `total_bytes`, XOps verifies and commits atomically, returning the actual SHA-256 digest.
 
-## Handle uncertain or interrupted tasks
+### Streaming Download (`transfer` tool + `GET /transfers/{id}/stream`)
 
-After a service restart, prepare new tasks for transfers that had not started. Interrupted transfers do not resume automatically. An `unknown` task blocks further uploads to that destination until its outcome is checked.
+1. Call `transfer` over `/mcp` (`action: "start"`, `direction: "download"`, `target`, `remote_path`, `local_dest`).
+2. Issue `GET /transfers/{transfer_id}/stream` with `Mcp-Session-Id`; XOps pulls chunks, commits atomically inside `--transfer-root`, and streams back `application/octet-stream` with `X-Xops-Transfer-Id`, `X-Xops-Transfer-State`, and `X-Xops-Transfer-Digest` headers.
 
-New tasks use private v2 records containing original authorization and connection versions. Target, credential, jump, trust or policy changes prevent old ready tasks from receiving usable data credentials; verification and cleanup also reject stale bindings and retain evidence for manual handling. Uploads with a completed commit reservation retain their original connection and independent deadline. Task/request cancellation before that reservation prevents commit; safe cancellation is no longer promised afterward.
+### Two-Step Approval (`no_elicit_fallback: challenge`)
 
-Task records, including authorization metadata, are limited to 64 KiB, with preparation reserving room for later state and diagnostic fields. An oversized preparation is rejected without disabling later preparations that fit the limit; this input limit does not require restarting the service. Historical full records still restore their status view while preserving the original file; a warning identifies in-memory recovery, and unknown destination locks remain active. Operator reasons allow 4096 bytes of JSON content, including escape expansion. Actual persistence failures still stop new tasks to preserve protection when write outcomes may be uncertain.
+When `policy.guardrail.no_elicit_fallback: challenge` is configured and an action hits the approval threshold:
 
-Legacy v1 records remain readable and preserve unknown destination locks. Without a binding, `--verify` and `--cleanup` cannot contact the current node. Independently verify the original target before manual handling; `--resolve-unknown --reason` records an operator conclusion without remote execution. Unknown future versions are rejected without overwriting records.
+- `/mcp` returns `code: "approval_required"` with `approval_challenge` (`envelope`, `envelope_digest`, `escalated`, `reason`, `instructions`); HTTP transfer streams return HTTP `428 Precondition Required`.
+- Present `envelope` to the human operator and resubmit with the `approval` object (or `X-Xops-Approval: {"verdict":"allow","envelope_digest":"..."}` on `/transfers/{id}/stream`). Approvals are single-use, replay-protected, and bounded by `approval_ttl`.
 
-Stop the XOps MCP service, then list its transfer records:
+## Related Documentation
 
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers
-```
-
-Replace `TASK_ID` with the task to inspect and verify the target file:
-
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers --id TASK_ID --verify
-```
-
-Verification uses the current `mcp.max_file_bytes` limit and compares the target's size and digest without modifying it. After confirming the target content and deciding how to proceed, record an explanation and permit future uploads:
-
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers --id TASK_ID \
-  --resolve-unknown --reason 'Target content checked; allow a future new upload'
-```
-
-This does not retransmit or delete the destination. The original task retains its `unknown` status and the operator's explanation. If the report also lists a temporary file pending cleanup, run:
-
-```bash
-xops mcp recover --state-dir /home/operator/.xops/mcp-transfers --id TASK_ID --cleanup
-```
-
-If temporary-file ownership is unconfirmed, inspect the remote file first, then use `--reason` to record the basis for confirming ownership. Do not delete an unverified file solely because its name looks familiar.
-
-## HTTPS and connection troubleshooting
-
-Plain HTTP does not encrypt the token or file content. To use HTTPS, place the service behind a reverse proxy and set `public_url` to the HTTPS address clients actually use.
-
-The proxy should preserve the correct Host, disable request and response buffering for `/mcp` and transfer endpoints, and allow long transfers. Do not configure automatic retries for uploads.
-
-### Nginx reverse proxy example
-
-This example terminates HTTPS at Nginx, with XOps and Nginx running on the same host. Configure DNS and a TLS certificate trusted by the clients for `mcp.example.com`, then bind XOps to loopback and reuse the existing token:
-
-```bash
-xops mcp serve --transport http --listen 127.0.0.1:8080 \
-  --public-url https://mcp.example.com \
-  --token-file "$HOME/.xops/mcp.token"
-```
-
-`public_url` must be the HTTPS origin clients actually use, without `/mcp` or another path prefix. XOps uses it to generate transfer URLs and configure the default allowed Host and Origin. `X-Forwarded-Proto` does not replace this setting.
-
-Save this `server` block in a file loaded within Nginx's `http` context, such as `/etc/nginx/conf.d/xops-mcp.conf`. Replace the domain and certificate paths:
-
-```nginx
-server {
-    listen 443 ssl;
-    server_name mcp.example.com;
-
-    ssl_certificate     /etc/nginx/certs/mcp.example.com.fullchain.pem;
-    ssl_certificate_key /etc/nginx/certs/mcp.example.com.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-
-    # Match XOps's default 10 GiB limit per file.
-    client_max_body_size 10g;
-    client_body_timeout 75s;
-    send_timeout 75s;
-
-    proxy_http_version 1.1;
-    proxy_set_header Host $http_host;
-    proxy_set_header Connection "";
-    proxy_set_header Authorization $http_authorization;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_pass_request_headers on;
-
-    # Forward MCP streaming responses and file content immediately.
-    proxy_buffering off;
-    proxy_request_buffering off;
-    proxy_cache off;
-    gzip off;
-    proxy_next_upstream off;
-
-    proxy_connect_timeout 5s;
-    proxy_send_timeout 75s;
-    # Uploads may not respond until complete; allow the default 2-hour limit.
-    proxy_read_timeout 7500s;
-
-    location = /mcp {
-        proxy_pass http://127.0.0.1:8080;
-    }
-
-    location ^~ /v1/transfers/ {
-        proxy_pass http://127.0.0.1:8080;
-    }
-
-    location / {
-        return 404;
-    }
-}
-```
-
-Both `proxy_pass` directives omit a URI component to preserve the original path. Do not proxy only `/mcp`, add a path prefix, or redirect `/mcp` to `/mcp/`. If Nginx and XOps run in separate containers or hosts, use an upstream address reachable from Nginx and adjust the XOps listener accordingly.
-
-Forward each request's original `Authorization` value: `/mcp` uses the shared token, while transfer endpoints use the short-lived credential returned when preparing a task. Do not replace both with a fixed token at the proxy. Request headers such as `Origin`, `Mcp-Session-Id` and `MCP-Protocol-Version`, and session headers in responses, are preserved by default; do not remove or rewrite them. Streamable HTTP does not require WebSocket `Upgrade` settings. This example uses one XOps instance; MCP sessions and subsequent file-transfer requests should reach the same instance.
-
-`proxy_read_timeout` measures the wait between reads from the upstream, not total transfer duration. The example allows 7500 seconds to cover a default two-hour upload plus commit time. The other 75-second timeouts provide some margin over XOps's default one-minute idle limit. XOps and client timeouts still apply. When changing file-size or timeout limits, check the settings in Nginx, XOps and the client together.
-
-Check and reload the configuration:
-
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-curl --max-time 10 --include https://mcp.example.com/mcp
-```
-
-The check request without a token should return `401`, confirming TLS and proxy routing. Then change the MCP client URL to `https://mcp.example.com/mcp` and the transfer helper's `--server` to `https://mcp.example.com`, reconnect the client and prepare new transfer tasks. For a non-default HTTPS port such as `8443`, update `listen`, `public_url` and the client URLs together; `$http_host` preserves that port.
-
-### Connection troubleshooting
-
-| Problem | What to check |
-| --- | --- |
-| `401` or authentication failure | Client and server tokens match; configuration or environment changes have taken effect |
-| `host_or_origin_denied` | `public_url` is correct; configure `--allowed-hosts` and `--allowed-origins` for additional domains or origins |
-| MCP works, but the transfer command cannot connect | The local command environment can reach the LAN address and has network permission |
-| Nginx returns `413` | `client_max_body_size` allows the upload; also check XOps's `max_file_bytes` |
-| Nginx returns `502` / `504`, or streaming output is delayed | Upstream address, service availability, proxy timeouts and buffering; check task status before retrying an interrupted upload |
-| Task expired | Prepare a new task and run the transfer command within its start window |
-| Credential or host-key error | Run `xops credential doctor` on the server, restore credential access and confirm the host key |
-
-See the [MCP command reference](../reference/commands/xops-mcp) for details.
-
-## Command interpreters and discovery
-
-`terminal` (`session: "once"`) resolves execution settings in order: request `execution` > node configuration > global configuration, supporting `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, `cmd`, and `server` (`launch_dialect` is accepted as an alias for `launchDialect`, and `sudo: true` uses the same execution settings):
-
-```json
-{
-  "nodeID": "web-01",
-  "command": "set -l values first second; printf '%s' $values[2]",
-  "execution": { "interpreter": "fish", "launchDialect": "fish", "login": false }
-}
-```
-
-- **On-demand probing and caching**: When neither an interpreter nor a dialect is specified at any level, the built-in MCP backend runs a bounded read-only SSH probe before execution and selects the remote default shell (cached per SSH connection without writing to disk; canceled or timed-out probes can be retried by later calls, while non-context errors stay cached per connection; probe failure prevents running the user command). Explicit settings (including `execution.interpreter: server`) are never overridden. Commands blocked outright by policy fail before probing starts; SFTP file tools do not run shell probes.
-- **Snapshot binding and connection isolation**: Discovery first acquires an `Inspect` permit bound to the current configuration snapshot, then evaluates risk and requests approval for the resolved interpreter and command plan. If node configuration changes during approval, the execution permit is invalidated so an approved operation can never be redirected to a modified endpoint. Ordinary and elevated commands share the same connection generation and release their leases on completion (embedded hosts can implement `ports.ExecutionProber` for the same preparation workflow).
-- **Conservative risk classification**:
-  - `fish` commands always use conservative `fish` risk evaluation, even when launched through a `posix` outer shell.
-  - Commands containing command/process substitutions, variable expansions, newlines, background operators, quoting/escaping/globs, or environment assignments (even starting with `echo`) are classified as at least `moderate` risk.
-  - Read-only safe classification is limited to exact whole-word matches of pure query forms: `hostname` (no arguments or listed query flags), `date` (no arguments or a single `+format`), `ip` (`addr`/`route` and their `show` queries without extra arguments), and `systemctl` (the full `status` subcommand with known display flags). Utilities with write or exec modes—such as `find` (`-delete`, `-exec`, file output), `sed`, `awk`, `file`, `ss`, `journalctl`, and pagers—are always classified as at least `moderate` risk.
+- [MCP 7-Tool Protocol Reference](../reference/mcp) — Complete action enums and parameter schemas for all 7 tools
+- [MCP Tunnel and Mux Tools](./mcp-tunnels) — Managing forwards and ControlMaster handles via MCP

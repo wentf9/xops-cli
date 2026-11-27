@@ -1,46 +1,50 @@
 ---
 name: xops-agent
-description: Use the xops CLI to manage SSH hosts, run remote or batch commands, inspect and edit remote files, transfer data, create SSH tunnels, and automate operations with Playbooks. Apply when the user wants server operations or remote automation through XOps.
+description: Operate remote servers safely with XOps v2 CLI (--json, --policy) or its 7-tool sandboxed MCP server: manage Host/Identity/Node inventory and config imports, run single or batch commands and Playbook v2 workflows, inspect/edit/transfer files via atomic SFTP and resumable SCP, manage SSH tunnels and ControlMaster multiplexers, and enforce fail-closed guardrails and audit recovery.
 ---
 
-# XOps CLI operations
+# XOps v2 Operations
 
-Perform host operations by running `xops` commands in the Agent's command environment. This skill works independently of MCP: it requires the CLI and its SSH configuration, not an MCP connection or MCP tool calls.
+Use this skill when performing remote SSH/SFTP operations, inventory management, vault maintenance, tunnel/mux control, Playbook v2 automation, or MCP server administration with **XOps v2**.
 
-## Start with the execution environment
+## 1. Establish Environment and Policy First
 
-1. Run `xops --version` and the relevant `xops <command> --help`. Installed versions may differ from this reference. If the executable is missing, use the [installation guide](https://wentf9.github.io/xops-cli/guide/getting-started). Do not reinitialize an existing setup as a diagnostic step.
-2. Identify where the command runs. Local paths, SSH keys, configuration, listeners, and downloads belong to that machine or container; they may not belong to the user's desktop. Default configuration is `~/.xops/xops_config.yaml`; an existing `XOPS_CONFIG_DIR` can select another configuration directory.
-3. Resolve the requested hosts with `xops host list` or `xops host list --tag TAG`. Match node IDs, aliases, users, ports, and jump hosts before a batch operation. For `exec` and `scp`, `--host`, `--ifile`/`-I`, and `--tag` are mutually exclusive; choose one selector and use `--exclude` to narrow it. Preserve the user's intended target set.
-4. Prepare trusted SSH host keys and credentials available to that process. Batch commands and Playbooks do not prompt for credential-store unlocks. Diagnose access with `xops credential doctor`; do not replace vaults or disable host-key verification to make a command run.
+1. **Verify binary & help**: Run `xops version --json` and `xops <command> --help` before relying on flag shapes. `xops version` does not initialize Engine state or touch `~/.xops/`.
+2. **Locate state directory**: XOps v2 stores strict `version: 2` YAML at `~/.xops/config.yaml`, vault data in `~/.xops/vault/`, audit logs in `~/.xops/audit.jsonl`, process locks in `~/.xops/run/`, and WAL journals in `~/.xops/journals/`. The environment variable **`XOPS_HOME`** overrides `~/.xops`. Never look for legacy v1 `xops_config.yaml` or `XOPS_CONFIG_DIR`.
+3. **Prefer canonical `--json` and explicit `--policy`**:
+   - Pass `--json` on non-interactive commands to parse deterministic JSON/v2 payloads (`ok`, `exit_code`, `error_code`, `do_not_retry`, `approval_challenge`, `reference_conflict`).
+   - CLI defaults to `--policy direct_operator`. Pass `--policy strict_agent` (or `--policy strict`) whenever guardrail thresholds, protected paths, or fail-closed audit circuit breaking are required.
+   - Interactive `xops tui` and interactive `xops sftp <target>` reject `--json`.
+4. **Resolve targets before mutating**: Run `xops hosts list --json` (or `xops hosts resolve <target> --json`) and `xops doctor --json` before batch mutations. Confirm which machine hosts local files, `ssh-agent`, and listeners.
 
-## Choose the command
+## 2. Choose the Right Workflow
 
-Read only the reference relevant to the current task.
+Read only the reference file needed for your current task:
 
-| Task | CLI workflow | Reference |
-| --- | --- | --- |
-| Discover hosts, manage aliases/tags, import CSV, edit identities or credentials | `host`, `identity`, `credential`, `init` | [Inventory and access](references/inventory.md) |
-| Run a remote command, use sudo, inspect services/logs, execute across a group | `exec`, `exec --sudo`, `exec --tag` | [Execution and Playbooks](references/execution.md) |
-| Run a local script remotely or orchestrate a deployment | `exec --shell`, `play` | [Execution and Playbooks](references/execution.md) |
-| Read/write/append text, list/create/copy/move/delete remote paths | `exec` with target-native commands, or batch `sftp` | [Files and transfers](references/files.md) |
-| Upload/download files and directories, relay between hosts, distribute to a tag | `scp`, batch `sftp` | [Files and transfers](references/files.md) |
-| Create, inspect, and stop SSH forwarding | `ssh -L/-R/-D -N` plus owned process/session tracking | [Tunnels and networking](references/networking.md) |
-| Interactive SSH and TUI | `ssh`, `exec -x`, `tui` | [Execution and Playbooks](references/execution.md) |
+| Task | CLI Commands (v2) | MCP Tool Equivalent | Reference |
+| --- | --- | --- | --- |
+| Inventory CRUD, target resolution, DAG check, OpenSSH/CSV import, Vault & doctor | `hosts`, `config import`, `creds`/`vault`, `doctor` | `nodes` | [Inventory & Vault](references/inventory.md) |
+| Remote exec, `sudo`/`su`/`doas`, batch fan-out, Playbook v2, audit & TUI | `exec`, `playbook`/`play`, `audit`, `tui` | `terminal_exec`, `terminal_session`, `gui` | [Execution, Playbooks & Audit](references/execution.md) |
+| Atomic SFTP ops, FSTAT-anchored patch, resumable parallel SCP, WAL recovery | `sftp <op>`, `scp`, `sftp recover` | `file`, `transfer` | [Files & Transfers](references/files.md) |
+| `-L`/`-R`/`-D`/StreamLocal/TUN tunnels, ControlMaster & `muxdaemon` | `ssh`, `tunnel`/`forward`, `mux` | `tunnel` | [Tunnels & Multiplexing](references/networking.md) |
 
-Prefer `exec`, `scp`, and batch SFTP for unattended operations. Use terminal interfaces only when interaction is part of the task. XOps does not provide standalone CLI commands named `read_file`, `write_file`, `fs`, `upload`, `download`, or `tunnel`; compose the documented commands instead.
+## 3. Fail-Closed Safety Rules (Mandatory)
 
-## Work within the requested scope
+- **Zero plaintext secrets**: XOps v2 has **no** plaintext password CLI flags and forbids plaintext secret columns/fields in YAML and CSV. Use `xops creds` interactive enrollment (`enroll-password`, `enroll-key`, `set-node-privilege`, `rotate`), `<store>/<item>` references, `os_keychain`/`external_helper`, or `ssh-agent`. Never echo or log secret values.
+- **Never blindly retry `ErrOutcomeUnknown` (`do_not_retry: true`)**:
+  - Execution outcomes are strictly 3-state (`completed`, `not_started`, `unknown`). Only `not_started` guarantees zero remote execution.
+  - When `--json` reports `"outcome_kind": "unknown"` or `"do_not_retry": true` (exit code `255`), or MCP returns `"uncertain": true`, **stop and inspect remote state with read-only checks + `xops audit tail`** before deciding whether to re-run.
+- **Never retry or delete credentials on `uncertain_durability`**:
+  - When a `xops creds` saga returns `"uncertain_durability": true` (`Applied && !Durable`, `"do_not_retry": true`), do **not** retry the write or delete old/new vault items. Inspect disk state with `xops creds doctor --json` and `xops hosts list --json` first.
+- **Handle `StrictAgentProfile` `Halted` (`engine_halted` / `gate_halted`)**:
+  - Under `strict_agent`, any audit post-write failure irreversibly halts the Engine and revokes all active managed handles (MCP HTTP returns `503`).
+  - Stop issuing new commands immediately, check disk space and `~/.xops/` owner-only permissions, run `xops audit reconcile --json` and `xops audit tail --limit 20`, and restart the long-lived process only after fixing storage health.
+- **Respect MCP sandboxing (`OperatorReadFS == nil`)**:
+  - `xops mcp serve` physically disables `OperatorReadFS` and accesses only `ScopedRootFS` (`--transfer-root` / `--artifact-root`).
+  - Because `OperatorReadFS == nil`, `AuthPrivateKey` identities cannot read host key files directly in MCP mode (`ErrSignerUnavailable`). Load keys into **`ssh-agent`** (`SSH_AUTH_SOCK` or Windows `\\.\pipe\openssh-ssh-agent`) and use `kind: agent` (or `composite` with `agent`), or use an accessible Vault backend.
+- **Respect two-step approvals (`approval_required`)**:
+  - Under `no_elicit_fallback: challenge`, present the returned `approval_challenge.envelope` and `digest` to the human operator and obtain explicit confirmation before resubmitting with `approval: { verdict, envelope_digest }`. Never forge or auto-approve challenges.
 
-- Carry forward existing authorization. Ask only when a target, overwrite policy, privilege level, destructive effect, or additional network exposure is materially unclear or outside the authorized task.
-- CLI execution does not inherit the MCP server's risk assessment, approval forms, or audit log. Follow the Agent's command-execution controls; the skill itself is guidance, not an enforcement layer.
-- Ordinary commands now default to `server`: XOps sends the command unchanged to the remote SSH shell, without inserting Bash. Resolve the target's actual shell before choosing syntax. Explicit Bash/sh/zsh/fish/PowerShell/cmd adapters require a compatible server launch dialect; `--no-login` deliberately selects compatibility Bash, rather than changing the server shell's login behavior. Read [Execution and Playbooks](references/execution.md) for current CLI combinations and client-platform limits.
-- Protect remote expansions from the local shell. Scripts require a supported interpreter and a known compatible launch dialect; missing or unsupported shebangs are not silently treated as Bash. SFTP file commands need no shell; SFTP `exec` inherits the current working directory, auto-probes on demand when execution is unconfigured (using a temporary CMD adapter for saved `server/cmd`), and rejects a nonempty `cwd` only for explicit `server` configurations with a non-`cmd` launch dialect.
-- Keep credentials out of arguments, command history, logs, and responses. Use configured stores, SSH keys/agent, or supported stdin credential flags with a trusted secret source. Do not pass secret values as literal shell arguments.
-- Use bounded execution for diagnostics and track any long-running session you create. For a timeout after a mutation starts, inspect resulting state before repeating it; do not blindly retry append, deployment, or overwrite operations.
+## 4. Verify and Report
 
-## Verify the outcome
-
-Check exit status and per-host failures, then verify the requested result: read back a file, compare its size/hash, or probe a service. `--no-clobber` can succeed while skipping an existing file; a tunnel listener can start while its destination remains unreachable.
-
-Report the affected hosts, paths, successful checks, failed targets, and remaining uncertainty. Retain the process handle for any tunnel the user wants left running; otherwise stop temporary sessions and verify cleanup. Do not claim MCP task IDs, TTLs, resumability, or atomic replacement guarantees for CLI operations.
+After every mutation, verify the actual outcome (read back modified files via `xops sftp cat`/`stat`, confirm exit codes and per-node statuses, verify listener teardown for temporary tunnels) and report affected nodes, paths, revisions, audit `operation_id`s when relevant, and any unresolved uncertainty.

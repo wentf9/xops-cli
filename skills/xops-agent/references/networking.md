@@ -1,45 +1,70 @@
-# SSH tunnels
+# Tunnels, Port Forwarding, and ControlMaster Multiplexing (XOps v2)
 
-## Create an SSH tunnel
+XOps v2 provides dedicated `xops tunnel` (alias `forward`) and `xops mux` commands alongside OpenSSH-compatible `xops ssh` flags, plus the first-class MCP `tunnel` tool.
 
-Resolve the SSH node, then start the appropriate CLI command in a command-runner session whose process handle you retain:
+## SSH Tunnels (`xops tunnel` / `xops forward` & `xops ssh`)
+
+Start tunnels in a managed process/session whose handle you retain while the forward is needed:
 
 ```bash
-# Local browser/tests reach a service on the SSH node
-xops ssh -n -N -L 127.0.0.1:18080:127.0.0.1:3000 web-01
+# Local TCP port forward (-L): local 127.0.0.1:18080 -> remote 127.0.0.1:80
+xops tunnel local --json web-01 127.0.0.1:18080:127.0.0.1:80
 
-# A remote worker reaches a service on the CLI machine
-xops ssh -n -N -R 127.0.0.1:18080:127.0.0.1:8080 worker-01
+# Remote TCP port forward (-R): remote 127.0.0.1:9000 -> local 127.0.0.1:3000
+xops tunnel remote --json worker-01 127.0.0.1:9000:127.0.0.1:3000
 
-# Local SOCKS5 proxy through the SSH node
-xops ssh -n -N -D 127.0.0.1:1080 web-01
+# Dynamic SOCKS5 proxy (-D)
+xops tunnel dynamic --json web-01 127.0.0.1:1080
+
+# Multiple forwards + StreamLocal Unix sockets in one session
+xops tunnel start -L 127.0.0.1:5432:127.0.0.1:5432 -L unix:/tmp/app.sock:/run/app.sock -D 127.0.0.1:1080 --json web-01
+
+# TUN/TAP tunnel (-w / tun; Linux /dev/net/tun & macOS utun; unsupported on Windows/FreeBSD)
+xops tunnel tun --tun-mode point_to_point gateway-01 0:0
+
+# OpenSSH-style equivalents via xops ssh (-N disables remote command; -W for stdio TCP forward)
+xops ssh -N -L 127.0.0.1:18080:127.0.0.1:80 web-01
+xops ssh -W 10.0.0.10:22 bastion
 ```
 
-Choose one example for the task. `-N` runs forwarding without a remote command, and `-n` prevents reading stdin. Prefer the runner's managed session over `-f` when it makes process ownership and cleanup clearer. The session must remain alive while the tunnel is needed; do not use a short command timeout that immediately kills it.
+### Operational Safety Rules for Tunnels
 
-| Mode | Listener location | Destination connection and name resolution |
-| --- | --- | --- |
-| `-L` | CLI machine | SSH node |
-| `-R` | SSH node | CLI machine |
-| `-D` | CLI machine | SSH node, with proxy-aware clients choosing destinations |
+- Default to explicit loopback binds (`127.0.0.1`); expose broader interfaces only when explicitly authorized.
+- Remember "local" is the host/container running `xops`. Verify end-to-end application reachability (e.g. HTTP or DB probe), not merely TCP port acceptance.
+- Stop temporary tunnels by signaling only the exact owned process (`SIGINT`/`SIGTERM` triggers clean reverse-order teardown) and verify the listener is closed.
 
-“Local” means the Agent's command environment, including a container or remote sandbox. The user's browser must be able to reach that listener. Use an explicit loopback bind by default; broader exposure must match the request. For `-R`, sshd `GatewayPorts` can affect actual bind scope, so inspect the remote listener if isolation matters.
+## ControlMaster Multiplexing (`xops mux` & `xops ssh -M/-S/-O/-f`)
 
-Select an available port and record the node, direction, bind address, target, and process/session handle. Multiple `-L` or `-R` options can share a session; stopping that process closes all its forwards. Use a separate process when independent lifecycle control is needed.
+Reuse an authenticated SSH transport across multiple commands or dynamic forwards:
 
-## Inspect and stop
+```bash
+# Start a ControlMaster daemon (-f / --daemon hands off to supervised muxdaemon)
+xops mux start -S ~/.xops/mux-%C -o ControlPersist=10m --daemon web-01
+# Equivalent OpenSSH flags:
+xops ssh -M -f -N -S ~/.xops/mux-%C -o ControlPersist=10m web-01
 
-The CLI has no `xops tunnel create/list/status/stop`, request IDs, or managed tunnel TTL. Implement those operational steps with the owned process and connectivity checks:
+# Probe liveness and master PID
+xops mux check -S ~/.xops/mux-%C --json web-01
+xops ssh -O check -S ~/.xops/mux-%C --json web-01
 
-1. Check that the session is still running and inspect stderr. `administratively prohibited`, target refusal, and other channel errors can occur after a listener starts. `-L`/`-D` open a forwarding channel on use; `-R` requests the remote listener at startup. `xops ssh` supports `-v`/`-vv`/`-vvv` for leveled connection, authentication, and forwarding channel diagnostics on `stderr`.
-2. Probe the actual application. For the local HTTP example:
+# Dynamically add or cancel a forward on the running master
+xops mux forward -S ~/.xops/mux-%C -L 127.0.0.1:18080:127.0.0.1:80 --json web-01
+xops mux cancel  -S ~/.xops/mux-%C -L 127.0.0.1:18080:127.0.0.1:80 --json web-01
 
-   ```bash
-   curl --connect-timeout 5 --max-time 10 http://127.0.0.1:18080/
-   ```
+# Stdio proxy over active ControlMaster
+xops mux proxy -S ~/.xops/mux-%C web-01
 
-   Checking TCP connection acceptance alone cannot prove the forwarded destination works. Use a database client, HTTP probe, or another protocol-appropriate tool for the service.
-3. For status, inspect the command runner's retained session/PID and the relevant listener (for example local `ss` on Linux or `Get-NetTCPConnection` on Windows). There is no persistent XOps tunnel inventory.
-4. Stop only the session created for this task. Use the runner's stop/cancel action, or signal its exact owned PID, then wait for exit and verify the listener is gone. Avoid broad process-name kills. Remote port release can be delayed after network failure; do not claim release without a check.
+# Graceful stop (no new sessions) or immediate master exit
+xops mux stop -S ~/.xops/mux-%C --json web-01
+xops mux exit -S ~/.xops/mux-%C --json web-01
+```
 
-SSH disconnect/keepalive failure ends forwarding and returns failure; there is no automatic reconnect. If the user requests a lifetime, bound the owned process accordingly and clean it up at that deadline; do not invent a CLI TTL flag. Leave a tunnel running only when ongoing access is part of the task, and report the handle/address needed to manage it.
+- `mux daemon` and `ssh -f` have no interactive stdin; configurations requiring `ControlMaster=ask/autoask` or interactive prompts fail closed.
+- `-f` requires `-N`, `-M`, or at least one forward rule (`-L/-R/-D/-w`) and cannot be combined with a remote command or `-O`.
+
+## MCP Equivalent (`tunnel` tool)
+
+In MCP mode (both `stdio` and Streamable HTTP), use the `tunnel` tool with generation-bound `handle` / `handle_token`:
+- **Forwards**: `start_forward` (`direction`: `local` | `remote` | `dynamic` | `tun`, `bind_kind`/`target_kind`: `tcp` | `unix`), `inspect_forward`, `stop_forward`.
+- **ControlMaster**: `start_mux`, `inspect_mux`, `stop_mux`, `probe_mux`, `control_mux` (`mux_action`: `check` | `forward` | `cancel` | `exit` | `stop`).
+- Ephemeral tunnel/mux handles are automatically revoked on `Halted` and cleaned up on MCP server close.

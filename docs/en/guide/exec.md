@@ -1,125 +1,109 @@
-# Command execution
+# Command Execution and Batch Runs
 
-Use `xops exec` to run commands across one or many remote hosts, distribute and run local scripts, or allocate an interactive pseudo-terminal (PTY).
+`xops exec` handles single-target remote commands, single-target privilege escalation (`sudo`/`su`/`doas`), and concurrent multi-node batch execution with strict launch-profile validation and 3-state execution outcome tracking.
 
-## Quick start
-
-```bash
-# Run a command on a single host
-xops exec web-01 uptime
-
-# Run a command in parallel across all hosts with the 'web' tag
-xops exec --tag web -c 'uptime'
-
-# Run a local script across tagged hosts with a concurrency limit of 5
-xops exec --tag web --shell ./check.sh --task 5
-
-# Run a local script and pass arguments (separated by --)
-xops exec --tag web --shell ./check.sh -- --env prod "arg 2"
-
-# Exclude specific nodes from a batch run
-xops exec --tag web --exclude web-maintenance-01 -c 'df -h'
-```
-
-**Target selection and argument rules**:
-- `--host`, `--ifile`/`-I` (host list file), and `--tag` are mutually exclusive. Once a target selector is set, the first positional argument becomes the remote command (e.g. `xops exec --host web-01 uname -a`), or you can pass the command string explicitly with `-c`.
-- Supports POSIX-style `--` argument separator:
-  - Command mode (without `--shell`): Arguments following `--` are passed as the remote command unchanged (e.g. `xops exec --host web-01 -- echo --help`), equivalent to `-c`, preventing command flags from being interpreted as local options.
-  - Script mode (with `--shell`): Script arguments may only be passed after `--` (e.g. `xops exec --host web-01 --shell ./script.sh -- arg1 "arg 2"`). The remote script safely receives them via `$1`, `$2` (or `$argv` in Fish) preserving spaces and special characters. Positional arguments before `--` are only used for target host resolution when `--host`/`--tag`/`--ifile` is omitted; extra positional arguments result in an error.
-- Global flags can appear before or after the subcommand (e.g. `xops --color never exec --host web-01 uname -a`).
-- **Batch credentials**: Batch runs do not display credential-store unlock dialogs. Unlock the required stores before starting a batch.
-- **Script input**: `--shell` requires a regular file. Pipe scripts through standard input instead, without also supplying credentials through `--password-stdin` or `--passphrase-stdin`.
-- **Explicit interpreter limits**: Ordinary commands are limited to 64 KiB and scripts to 16 MiB, with a default 5-minute timeout for non-interactive execution. Results retain the last 5 MiB of output and report truncation when exceeded; `--stream` displays output live and `--out-dir` saves logs without this retention limit. Some shells impose stricter command-length limits.
-
-
-## Interpreters and cross-platform execution
-
-### 1. Default mode: Native passthrough (`server`)
-
-When `--interpreter` is omitted and the node has no configured `execution`, XOps defaults to `server` mode:
-- Commands run in the remote default shell; XOps does not automatically switch to Bash.
-- Works out of the box on targets without Bash, including Alpine Linux (`ash`/`sh`), Windows OpenSSH (CMD or PowerShell), and network appliances.
-- `server` mode rejects `--login-shell`.
-
-### 2. Choosing an interpreter and launch dialect
-
-When a command relies on specific shell syntax, login profile variables, or cross-platform quoting, specify `--interpreter` and `--launch-dialect`:
+## 1. Single-Target Execution
 
 ```bash
-# Run with Bash and load the login environment
-xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell -c 'echo $PATH'
+# Basic usage (use -- to separate remote flags cleanly)
+xops exec web-01 -- uname -a
+xops exec -p 2222 -l deploy -J bastion 192.0.2.10 -- df -h
 
-# Run with Bash or sh without loading the login environment
-xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false -c 'echo $VAR'
-xops exec --host alpine-01 --interpreter sh --launch-dialect posix -c 'id'
+# Specify working directory, environment overrides, timeout, and output cap
+xops exec --workdir /srv/app --env APP_ENV=prod --timeout 30s --max-output-bytes 1048576 web-01 -- ./healthcheck.sh
 
-# Nodes with zsh or fish as their default shell
-xops exec --host zsh-01 --interpreter zsh --launch-dialect posix -c 'print -r -- $ZSH_VERSION'
-xops exec --host fish-01 --interpreter fish --launch-dialect fish -c 'set greeting hello; echo $greeting'
+# Allocate (-t / -tt) or disable (-T) a pseudo-terminal
+xops exec -t web-01 -- top -b -n 1
 
-# Windows targets whose SSH default shell is CMD
-xops exec --host win-01 --interpreter powershell --launch-dialect cmd -c 'Get-Process | Select-Object -First 5'
-xops exec --host win-01 --interpreter cmd --launch-dialect cmd -c 'dir'
+# Emit canonical JSON/v2 output (exit_code, outcome_kind, stdout, stderr, do_not_retry)
+xops exec --json web-01 -- hostname
 ```
 
-Set `--launch-dialect` to match the remote SSH default shell; for example, use `powershell` when that shell is PowerShell.
+> Captured output defaults to **4 MiB** (configurable up to **64 MiB**) and command text is capped at **1 MiB**. Truncated captures explicitly set `truncated: true`.
 
-| Interpreter (`--interpreter`) | Supported launch dialects (`--launch-dialect`) | Usage notes |
-| --- | --- | --- |
-| `server` (default) | `unknown` (or omitted) | Uses the remote default shell and rejects `--login-shell`; choose a specific interpreter for local scripts |
-| `bash` | `posix`, `fish` | Load the login environment with `--login-shell`; skip it with `--no-login` or `--login-shell=false` |
-| `sh` | `posix`, `fish` | Does not load a login environment or support login mode |
-| `zsh` | `posix`, `fish` | Supports login environments, scripts, and `sudo`/`su` |
-| `fish` | `posix`, `fish` | Supports login environments, scripts, and `sudo`/`su` |
-| `powershell` / `pwsh` | `cmd`, `powershell` (`pwsh` also supports `posix`/`fish`) | Does not load user profiles; preserves command exit status |
-| `cmd` | `cmd` | Subject to CMD's 8191-character limit; commands containing `%`, `!`, newlines, or unpaired double quotes are currently unsupported |
+## 2. Privilege Escalation (Single Target)
 
-Interpreter flags can be combined with `--shell`, `--sudo`, `--stream`, or `--out-dir`:
+Single-target `xops exec` supports `--sudo`, `--su`, and `--doas`:
 
 ```bash
-# Run a local script with sh, elevate, and save per-host logs in logs
-xops exec --tag web --interpreter sh --launch-dialect posix --sudo --shell check.sh --out-dir logs
+# Non-interactive escalation using a Vault secret reference (recommended)
+xops exec --sudo --password-ref offline/web01-sudo web-01 -- systemctl status nginx
 
-# Run a Bash command across hosts and display output live
-xops exec --tag web --interpreter bash --launch-dialect posix --stream -c 'uptime'
+# Escalate to a specific target user (defaults to root)
+xops exec --sudo --privilege-user postgres --password-ref offline/web01-sudo web-01 -- id
 
-# Use the remote default shell and save output to logs
-xops exec --host web-01 --interpreter server --out-dir logs -c 'df -h'
+# Prompt interactively for the privilege password (zero plaintext CLI flags)
+xops exec --sudo --prompt-password web-01 -- cat /etc/shadow
+xops exec --su --prompt-password web-01 -- id
+xops exec --doas --prompt-password web-01 -- id
 ```
 
-Scripts and Unix privilege escalation support `bash`, `sh`, `zsh`, and `fish`, not `server`, `powershell`, `pwsh`, or `cmd`. `--stream` and `--out-dir` remain mutually exclusive; see below for interactive-mode restrictions.
+- When a managed node already has `privilege_password_ref` configured (via `xops creds set-node-privilege --node <id> --store <store>`), omitting `--password-ref` automatically uses the node's binding.
+- **Batch Mode Restriction**: Batch `xops exec` forbids `--sudo`/`--su`/`--doas` interactive escalation; use single-target invocations or [Playbook v2](./automation) for multi-host orchestration.
 
-To avoid passing interpreter flags on every command, save `execution` on the node in `~/.xops/xops_config.yaml` (`host add`/`import` also probes and saves this automatically)—see [Hosts and identities](./hosts#node-execution-configuration-execution). Explicit `--no-login` (including `--no-login=false`) retains its legacy Bash selection semantics.
+## 3. Concurrent Batch Execution
 
-## Interactive terminal and PTY (`-x`)
-
-Add `-x` / `--interactive` to allocate a pseudo-terminal (PTY) for a single host when running full-screen terminal apps (`top`, `htop`, `vim`) or interactive elevated commands:
+Passing `--all`, `--nodes`, `--tags`, or multiple `--target` values switches `xops exec` into concurrent batch mode:
 
 ```bash
-# Run an interactive terminal program
-xops exec -x web-01 top
+# Fan out across a tag while excluding a maintenance node
+xops exec --tags web --exclude-nodes web-maint-01 --concurrency 5 -- uptime
 
-# Run a single elevated command interactively
-xops exec -x --sudo web-01 ls -la /root
+# Target explicit node IDs with live prefixed streaming (--stream) and --fail-fast
+xops exec --nodes web-01,web-02,web-03 --concurrency 3 --stream --fail-fast -- df -h
 
-# Select an interpreter and save interactive output (input still comes from the terminal)
-xops exec --host web-01 -x --interpreter bash --launch-dialect posix -c 'uptime' >output.log 2>error.log
+# Target all managed nodes (excluding canary), writing per-node logs into a ScopedRootFS dir
+xops exec --all --exclude-tags canary --out-dir ./batch-logs --timeout 1m -- uname -r
+
+# Multiple explicit ad-hoc or alias targets
+xops exec --target web-01 --target deploy@192.0.2.20 --json -- hostname
 ```
 
-- **Single-host only**: `-x` targets a single host and cannot be combined with multi-host batches, local scripts (`--shell`), `--stream`, or `--out-dir`.
-- **Output and exit status**: Output appears in the terminal by default. Save it with `>output.log`, `2>error.log`, or `>output.log 2>&1`, including when selecting an explicit interpreter. The 5 MiB result-retention limit above does not apply, and nonzero exit codes and signals are preserved. Input must still come from a local terminal. Logs from terminal programs may contain color or cursor-control characters, and remote stdout and stderr may not remain separate.
-- **Interrupting commands**: Press `Ctrl+C` to interrupt. If the disk or filesystem becomes unresponsive while saving logs, interruption may need to wait; no log writes continue after the command returns. After a disconnection, check what ran remotely before retrying; do not immediately repeat commands that might change data.
+### Batch Selectors and Runtime Flags
 
-## Quoting and variable expansion tips
+| Flag | Description |
+| --- | --- |
+| `--all` | Select all managed nodes in inventory |
+| `--nodes <id,...>` | Select managed nodes by ID (comma-separated, repeatable) |
+| `--tags <tag,...>` | Select managed nodes by tag (comma-separated, repeatable) |
+| `--target <spec,...>` | Explicit target specs (repeatable; >1 switches to batch mode) |
+| `--exclude-nodes <id,...>` | Exclude specific node IDs in batch mode |
+| `--exclude-tags <tag,...>` | Exclude nodes matching specific tags in batch mode |
+| `--concurrency <n>` | Maximum concurrent nodes |
+| `--fail-fast` | Cancel remaining pending nodes after the first failure |
+| `--stream` | Stream live node-prefixed stdout/stderr lines |
+| `--out-dir <dir>` | Write per-node stdout/stderr logs inside a `ScopedRootFS` directory |
 
-When a command contains spaces, pipelines, or environment variables, pass `-c` with single or double quotes depending on where variables should expand:
+## 4. Launch Profile Matrix (`LaunchProfile`)
+
+By default, `xops exec` runs in **`interpreter: server` + `login: inherit`** passthrough mode, sending the command directly to the remote SSH shell with **zero Bash prerequisite** (works cleanly on Alpine, zsh, and Windows OpenSSH).
+
+Override the profile explicitly with `--dialect`, `--interpreter`, and `--login`:
+
+- `--dialect`: `posix` | `powershell` | `cmd` | `raw`
+- `--interpreter`: `server` | `sh` | `bash` | `zsh` | `powershell` | `pwsh` | `cmd`
+- `--login`: `disabled` | `login` | `inherit`
 
 ```bash
-# Single quotes: keep $HOME literal locally so the remote shell expands it
-xops exec web-01 -c 'printf "%s\n" "$HOME"'
+# Explicit POSIX bash (non-login vs. login)
+xops exec --dialect posix --interpreter bash --login disabled web-01 -- 'echo "$PATH"'
+xops exec --dialect posix --interpreter bash --login login web-01 -- 'env'
 
-# Double quotes: expand $USER on the local machine before sending
-xops exec web-01 -c "echo Current User is $USER"
+# Explicit PowerShell / pwsh / cmd on Windows OpenSSH targets
+xops exec --dialect powershell --interpreter pwsh win-01 -- 'Get-Service | Select-Object -First 5'
+xops exec --dialect cmd --interpreter cmd win-01 -- 'ver'
 ```
 
-When running XOps from local Windows PowerShell or CMD, keep local quoting rules in mind; for multi-line or complex logic, put the commands in a script file and run it with `--shell`. See the [`xops exec` command reference](../reference/commands/xops-exec) for all options.
+> Partially specified profiles are completed deterministically (e.g. `--interpreter bash` implies `dialect=posix, login=disabled`). Invalid combinations (such as `sh` with `login=login`, or `raw` with a non-`server` interpreter) fail closed with exit code `2` (`usage_error`).
+
+## 5. Three-State Execution Outcomes & Exit Codes
+
+XOps v2 models every remote execution as a closed 3-state sum type (`ExecutionOutcome`):
+
+| `outcome_kind` | Meaning | Safe to Auto-Retry? | Exit Code / `do_not_retry` |
+| --- | --- | :---: | --- |
+| `completed` | Remote process terminated with an explicit exit code or POSIX signal | Depends on command idempotency | Normalized remote exit code (`0..255`) or `128 + signal`; forced non-zero if post-audit write fails |
+| `not_started` | Failed before remote execution started (dial, auth, guardrail deny) | **Yes** | `255` (`ExitSSHError`) |
+| `unknown` | Command started, then disconnected/timed out/lost status; remote effect is uncertain | **NO** | `255`, JSON sets `"do_not_retry": true` |
+
+> **Safety Rule**: Never blindly replay mutating commands after `outcome_unknown` (`do_not_retry: true`). Inspect actual remote state with read-only checks and `xops audit tail` first.

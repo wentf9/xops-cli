@@ -1,103 +1,167 @@
-# Playbooks and MCP
+# Playbooks v2, Guardrails, and Audit
 
-XOps includes a declarative YAML task engine (`xops play`) and a built-in Model Context Protocol server (`xops mcp`).
+XOps v2 integrates declarative multi-node orchestration (`xops playbook` / `xops play`), capability-gated security guardrails (`PolicyProfile` + `policy.guardrail`), and synchronous fail-closed audit logging (`xops audit`) into one unified execution path.
 
-> To let a Skill-capable AI assistant run `xops` CLI commands directly in its own shell (without running an MCP server), see [Agent Skill and capability overview](./agent-skill).
+## 1. Declarative Playbook v2
 
-## Declarative Playbooks
+Playbook v2 accepts both **YAML** and strict **JSON** documents through the discriminated `core/domain/playbook` validator. Documents must declare `version: 2`; unknown fields, duplicate keys, YAML aliases, JSON `null` actions, nested `ensure`, and tampered digests are rejected fail-closed.
 
-Playbooks define multi-host workflows in YAML using `shell` (run commands), `script` (distribute and run local scripts), `copy` (upload files), `ensure` (check state and converge idempotently), and `template` (render and upload configuration files).
-
-### 1. Quick start example
-
-Save the following as `deploy-service.yaml`:
+### Complete Example (`deploy.yaml`)
 
 ```yaml
-name: deploy-service
-targets:
+version: 2
+id: deploy-web
+name: "Deploy Web Application"
+description: "Install nginx, render config, and reload service"
+on_error: fail_fast # fail_fast | continue | abort
+target:
   tags: [web]
-settings:
-  concurrency: 5
-  on_error: stop
-  execution:
-    interpreter: bash
-    launch_dialect: posix
-    login: true
+  exclude_nodes: [web-maint-01]
 vars:
-  http_port: "8080"
+  app_port: "8080"
+  env_name: "prod"
 steps:
-  - name: Check system uptime
-    shell: uptime
+  - id: ensure-nginx
+    name: "Ensure nginx package is installed"
+    action:
+      kind: ensure
+      check:
+        kind: shell
+        command: "command -v nginx >/dev/null 2>&1"
+      action:
+        kind: shell
+        command: "apt-get update && apt-get install -y nginx"
+        timeout: 3m
+      max_retries: 1
 
-  - name: Ensure Nginx is installed
-    ensure:
-      check: "nginx -v"
-      action: "apt-get update && apt-get install -y nginx"
-    sudo: true
+  - id: upload-conf
+    name: "Render and atomically publish nginx config"
+    action:
+      kind: template
+      source: "./templates/nginx.conf.tmpl"
+      dest: "/etc/nginx/conf.d/app.conf"
+      vars:
+        listen_port: "8080"
+      mode: "0644"
+      overwrite: true
+      atomic: true
 
-  - name: Render and deploy configuration file
-    template:
-      src: "./nginx.conf.tmpl"
-      dest: "/etc/nginx/nginx.conf"
-    sudo: true
+  - id: copy-static
+    name: "Copy release manifest"
+    when_tags: [frontend]
+    action:
+      kind: copy
+      source: "./manifest.json"
+      dest: "/srv/www/manifest.json"
+      mode: "0644"
+      overwrite: true
+      atomic: true
 
-  - name: Restart service
-    shell: "systemctl restart nginx"
-    sudo: true
+  - id: verify-script
+    name: "Run post-deploy check script"
+    on_error: continue
+    action:
+      kind: script
+      source: "./scripts/verify.sh"
+      args: ["--strict"]
+      work_dir: "/srv/www"
+      env:
+        APP_ENV: "prod"
+      timeout: 30s
 ```
 
-Preview and run the Playbook:
+### Five Sealed Step Actions (`action.kind`)
+
+| `kind` | Required Fields | Optional Fields | Purpose |
+| --- | --- | --- | --- |
+| `shell` | `command` | `profile`, `work_dir`, `env`, `timeout` | Run a remote command |
+| `script` | `source` | `symlink_policy`, `args`, `profile`, `work_dir`, `env`, `timeout` | Read a local script and run it remotely |
+| `copy` | `source`, `dest` | `symlink_policy`, `mode` (3/4-digit octal e.g. `"0644"`), `overwrite`, `atomic` | Upload a local file to a remote path |
+| `template` | `source`, `dest` | `symlink_policy`, `vars`, `mode`, `overwrite`, `atomic` | Render a local template and upload it remotely |
+| `ensure` | `check`, `action` | `max_retries` | Idempotent convergence: run `action` and re-verify only when `check` fails (nested `ensure` is forbidden) |
+
+### Error Policies (`on_error`)
+
+- `fail_fast`: Stop remaining steps on the failing node while other nodes continue.
+- `continue`: Record the failure and continue with subsequent steps on the same node.
+- `abort`: Cancel remaining playbook work across all nodes immediately on the first failure.
+
+### Validate and Run
 
 ```bash
-# Preview target hosts and steps without connecting or making changes
-xops play deploy-service.yaml --dry-run
+# 1. Pure offline AST & schema validation (zero Engine init, zero network, prints canonical digest)
+xops playbook validate deploy.yaml
+xops playbook validate deploy.yaml --json
 
-# Run the Playbook
-xops play deploy-service.yaml
+# 2. Execute playbook (--var overrides, --target selector override, --concurrency, --timeout, --scoped-root)
+xops playbook run deploy.yaml --var app_port=8081 --concurrency 3
+xops play run deploy.yaml --target web-01 --scoped-root ./release-bundle --json
 
-# Supply or override variables from the CLI (undefined template variables fail before execution)
-xops play deploy-service.yaml --var http_port=8081
-
-# Restrict execution to specific nodes
-xops play deploy-service.yaml --limit web-01,web-02
+# 3. Read playbook from stdin (--stdin or -)
+cat deploy.yaml | xops playbook validate --stdin --json
+cat deploy.yaml | xops playbook run --stdin --policy strict
 ```
 
-### 2. Failure policies, retries, and execution settings
+> If any step enters `OutcomeUnknown`, the CLI exits non-zero and warns you to inspect actual remote state rather than blindly retrying.
 
-- **Failure policy (`settings.on_error`)**:
-  - `stop` (default): Stop remaining steps on the failing host while other hosts continue.
-  - `abort_all`: Cancel all active and pending host tasks immediately when any host fails.
-  - `continue`: Ignore step failures on the current host and continue to its next step.
-- **Safe retry boundary**: When `retries` is set on a step, XOps retries after `retry_delay` **only when remote execution is confirmed completed with no I/O or channel-cleanup errors**. If a connection drop leaves the remote outcome `unknown`, XOps never replays the step automatically. Local script files are read once and frozen in memory before tasks start.
-- **Execution inheritance (`execution`)**: Set `interpreter` (`bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, `cmd`, or `server`) and `launch_dialect` per step (`step.execution`), per Playbook (`settings.execution`), or per node.
+## 2. Security Guardrails (`PolicyProfile` & `policy.guardrail`)
 
-### 3. On-demand probing and exit-code guards for `script` and `ensure`
+XOps v2 combines **policy profiles** (`PolicyProfile`) with declarative **guardrail rules** (`policy.guardrail`). Configure defaults in `~/.xops/config.yaml` and override per command with `--policy`:
 
-When no interpreter is specified and the launch dialect is unknown, **`script` steps without a shebang** and **`ensure` steps** run a bounded read-only probe once per SSH connection (cached in memory without modifying disk config or changing ordinary `shell` steps):
-- **Supported shells**: `script` and `ensure` support `bash`, `sh`, `zsh`, and native `fish` (requiring a `posix` or `fish` outer launch dialect). If a Windows target is detected, XOps aborts before running user code rather than attempting syntax translation. Explicit interpreters (including `server`), UTF-8 BOMs, and non-allowlisted shebangs are never substituted automatically; allowlisted shebangs still require a known compatible outer dialect.
-- **`ensure` convergence and reserved exit codes**:
-  - `ensure` runs `check` first: exit `0` skips `action` (`StatusSkipped`); a confirmed ordinary nonzero exit (such as `false` returning `1`) runs `action` and then re-runs `check` to verify (using the exact same frozen execution config across `check`, `action`, and verification).
-  - **Blocked error codes**: If `check` returns reserved error codes `126`/`127` (non-executable or command not found), fish execution-error codes `121`/`123`/`124`/`125`, hits a syntax error, times out, disconnects, or fails to emit its completion frame (for example, if `check` replaces the shell process via `exec`), the step fails immediately (`StatusFailed`) and **`action` is never executed**.
+| Profile | Default Scope | Behavior |
+| --- | --- | --- |
+| `direct_operator` | CLI default | Full audit trail + explicit `Deny` enforcement; skips risk-threshold approval prompts for direct human CLI runs |
+| `strict` / `strict_operator` | Opt-in | Full risk thresholds, `node_overrides`, protected paths, and approval challenges; audit errors fail the call without permanently locking short-lived CLIs |
+| `strict_agent` | MCP default | Full guardrails + irreversible **`Halted` circuit break** on any `AuditPostWriteError`, revoking all active managed handles and rejecting new calls |
 
-## MCP server integration
+### Guardrail Config Example (`~/.xops/config.yaml`)
 
-XOps includes an MCP server that lets AI clients such as Claude Desktop, Cursor, and Codex inspect inventory, run guarded commands, transfer files, and manage SSH tunnels.
+```yaml
+version: 2
+policy:
+  cli_default: direct_operator
+  mcp_default: strict_agent
+  guardrail:
+    approval_threshold: moderate    # safe | moderate | dangerous | critical
+    no_elicit_fallback: challenge   # deny (zero-value default) | challenge (two-step approval envelope)
+    audit_log: ~/.xops/audit.jsonl
+    approval_ttl: 5m                # range (0, 24h]
+    protected_paths:
+      - "/etc/**"
+      - "/root/**"
+      - "C:/Windows/**"
+    node_overrides:
+      "prod-*":
+        approval_threshold: safe
+        decision_floor: require_approval
+      "staging-*": moderate         # scalar shorthand sets approval_threshold
+```
+
+- Matching `protected_paths` elevates operation risk to at least `dangerous`.
+- Multiple matching `node_overrides` fold via a join-semilattice (strictest rule always wins regardless of ordering).
+- `no_elicit_fallback: deny` rejects approval-required operations in non-interactive sessions; `challenge` issues a replay-protected, TTL-bound `ApprovalEnvelope` (`envelope_digest`) for human review and two-step resubmission.
+
+## 3. Audit Log and O(1) Crash Reconciliation (`xops audit`)
+
+Every gated operation writes canonical JSON/v2 records (`denied`, `authorized`, `finalized`) to `~/.xops/audit.jsonl` coordinated via sidecar lock `audit.jsonl.lock`.
+
+### O(1) Process-Lock Crash Reconciliation
+
+- Each live Engine holds an OS kernel lock on `~/.xops/run/<ProcessInstanceID>.lock` using an append-only `+<opID>` / `-<opID>` protocol for active operations.
+- **O(1) Clean Startup**: When no dead-process `.lock` files exist under `run/`, startup does zero scanning of `audit.jsonl`.
+- **Crash Recovery**: Any leftover `.lock` file is probed via non-blocking `TryLock`; once confirmed dead, unclosed operations are verified against `audit.jsonl`, finalized with `outcome: aborted_by_crash` under `audit.jsonl.lock`, and the dead lock file is truncated, closed, and removed safely across Unix and Windows.
+
+### Querying and Reconciling Audit Records
 
 ```bash
-# Start the default stdio MCP server
-xops mcp serve
+# Inspect recent or filtered audit records (list takes earliest matches; tail takes latest)
+xops audit tail --limit 20
+xops audit list --phase finalized --outcome outcome_unknown --json
+xops audit list --node web-01 --trace-id <trace_id>
+
+# Inspect the full lifecycle of a single operation
+xops audit inspect <operation_id> --json
+
+# Manually trigger crash-lock reconciliation (also runs automatically at CLI Engine & MCP startup)
+xops audit reconcile --json
 ```
-
-### 1. Client setup and guardrails
-
-Configure your AI client to launch the absolute path to `xops` with arguments `["mcp", "serve"]`.
-
-Under `guardrail` in `~/.xops/xops_config.yaml`, you can configure approval thresholds, blocked command patterns, protected file paths, and audit logs (guardrails are enabled by default and can only be turned off explicitly with `disabled: true`):
-- **Interactive approvals**: Operations that meet or exceed the approval risk threshold trigger an approval prompt in the client (`approved=true` required); rejections, cancellations, or timeouts abort the operation before execution.
-- **Timeouts and non-interactive credentials**: Stdio tool calls default to a 5-minute timeout (configurable via `mcp.tool_timeout`, e.g. `30m`). MCP runs strictly in non-interactive mode and never opens terminal password prompts or keyring unlock dialogs—run `xops credential doctor` beforehand to verify credential access.
-
-### 2. Further MCP guides
-
-- [MCP command reference](../reference/commands/xops-mcp)
-- [MCP HTTP over LAN, streamed file transfers, and recovery](./mcp-http)
-- [SSH tunnels over MCP stdio (`-L` / `-R`)](./mcp-tunnels)

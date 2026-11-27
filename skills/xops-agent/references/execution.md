@@ -1,151 +1,122 @@
-# Remote execution and automation
+# Remote Execution, Playbook v2, Guardrails, and Audit (XOps v2)
 
-Examples use a POSIX local shell. Remote command syntax and utilities depend on the target; POSIX examples require a POSIX server shell, not necessarily Bash. Current source uses the P3 defaults: ordinary `exec`, SSH commands, MCP commands, and Playbook `shell` steps default to `server`, launch dialect `unknown`, and inherited login mode. A server command is sent unchanged in an SSH exec request. Older installed versions can still wrap commands in Bash; check version and available flags before applying these defaults.
-
-## Select the execution environment
-
-Global and node `execution` configuration can change the defaults. For one-off ordinary commands, current `exec` supports:
+## Single-Target Execution (`xops exec`)
 
 ```bash
-# Native cmd.exe server shell; no remote Bash prerequisite
-xops exec --host win-01 -c 'ver'
+# Default launch profile: interpreter=server, login=inherit (zero remote Bash prerequisite)
+xops exec --json web-01 -- uname -a
+xops exec --workdir /srv/app --env APP_ENV=prod --timeout 30s --max-output-bytes 1048576 --json web-01 -- ./check.sh
 
-# Explicit interpreter and verified outer server shell
-xops exec --host linux-01 --interpreter sh --launch-dialect posix -c 'id -u'
-xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell -c 'printf "%s\n" "$PATH"'
-xops exec --host win-01 --interpreter powershell --launch-dialect cmd -c 'Get-Process | Select-Object -First 5'
-xops exec --host win-01 --interpreter cmd --launch-dialect cmd -c 'dir'
+# Explicit LaunchProfile matrix:
+# --dialect:     posix | powershell | cmd | raw
+# --interpreter: server | sh | bash | zsh | powershell | pwsh | cmd
+# --login:       disabled | login | inherit
+xops exec --dialect posix --interpreter bash --login disabled --json web-01 -- 'printf "%s\n" "$PATH"'
+xops exec --dialect powershell --interpreter pwsh --json win-01 -- 'Get-Service | Select-Object -First 5'
+xops exec --dialect cmd --interpreter cmd --json win-01 -- 'ver'
 ```
 
-Select the launch dialect from the **remote SSH default shell**, not the local OS or the requested inner interpreter. Unknown is valid for `server`; explicit adapters need a supported known dialect:
+Always put XOps flags before `<target>` and separate remote flags with `--`. Default capture limit is 4 MiB (max 64 MiB); command length limit is 1 MiB.
 
-| Interpreter | Launch dialect | Login behavior |
-| --- | --- | --- |
-| `server` | `unknown` or a known dialect | Inherited only; do not pass `--login-shell`, including `false`. |
-| `bash` | `posix` or `fish` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
-| `sh` | `posix` or `fish` | Non-login only. |
-| `zsh` | `posix` or `fish` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
-| `fish` | `posix` or `fish` | Explicit adapter defaults to non-login; `--login-shell` enables login. |
-| `powershell` | `cmd` or `powershell` | Inherited; uses `-NoProfile -NonInteractive -EncodedCommand`. |
-| `pwsh` | `posix`, `fish`, `cmd`, or `powershell` | Inherited; uses the encoded PowerShell adapter. |
-| `cmd` | `cmd` | Inherited; currently rejects `%`, `!`, newlines, and unbalanced double quotes. |
-
-`--no-login` alone selects non-login Bash for compatibility and assumes POSIX launch when no dialect was supplied. It is not a generic switch for server/sh/PowerShell/cmd. Explicit `--launch-dialect unknown` is not replaced with POSIX, and `--login-shell` conflicts with `--no-login`.
-
-Current CLI boundaries matter:
-
-- `exec` with explicit `--interpreter`, `--launch-dialect`, or `--login-shell` connects and combines with `--shell`, `--sudo`, `--stream`, and `--out-dir`. Scripts and Unix privilege escalation support `bash`, `sh`, `zsh`, and `fish`, rejecting `server`, `powershell`, `pwsh`, and `cmd`.
-- Bounded execution limits: ordinary commands are bounded to 64 KiB, scripts to 16 MiB (`ssh.MaxCommandInputBytes`), with a 5-minute default timeout for noninteractive execution. Default result retention keeps the last 5 MiB of output (with a truncation note if exceeded); streaming with `--stream` or writing per-host logs with `--out-dir` is not constrained by this 5 MiB retention limit.
-- Output handling: PTY commands (`-x`) support regular-file output redirection (`>output.log 2>error.log`). Native cancelable output covers Linux terminals/pipes, macOS terminals/nonblocking pipes, Windows pipes, Windows consoles (via host-injected console relay), and regular files. macOS blocking anonymous pipes skip auxiliary progress/diagnostics.
-- Explicit execution flags on `ssh` (also `--no-login`) check actual local I/O capabilities across Linux, macOS, and Windows and reject sudo and `-N`. Windows file stdin uses the host-injected input bridge; only a missing bridge causes rejection before remote requests. Ordinary SSH commands and unconfigured piped server-shell input select strict or compatible output paths by capability. Remote Windows support and native Windows **client** output support are separate concerns.
-- One-shot PTY commands report nonzero, signal, and missing-status failures. Unknown outcomes after disconnect or cancellation are not safe to replay automatically.
-
-## One host and bounded inspection
+### Single-Target Privilege Escalation
 
 ```bash
-xops exec web-01 uptime
-xops exec --host web-01 -- uname -a
-xops exec --host web-01 -c 'df -h'
-xops exec --host web-01 -c 'tail -n 100 /var/log/app.log'
-xops exec --host web-01 --sudo -c 'id -u'
+# Non-interactive with Vault secret reference (or node's configured privilege_password_ref)
+xops exec --sudo --password-ref offline/web01-sudo --json web-01 -- systemctl status nginx
+xops exec --sudo --privilege-user postgres --password-ref offline/web01-sudo --json web-01 -- id
+
+# Interactive prompt (only when a human TTY is attached)
+xops exec --sudo --prompt-password web-01 -- id
+xops exec --su --prompt-password web-01 -- id
+xops exec --doas --prompt-password web-01 -- id
 ```
 
-Use `exec` for finite commands. Keep logs bounded; `tail -f`, `top`, and `vim` require a deliberate long-running/interactive workflow. For shell expressions intended for the remote machine, protect expansion locally:
+Batch `xops exec` rejects `--sudo`/`--su`/`--doas`; use single-target invocations or Playbook v2 for multi-host orchestration.
+
+## Concurrent Batch Execution (`xops exec`)
+
+Passing `--all`, `--nodes`, `--tags`, or multiple `--target` values selects batch mode:
 
 ```bash
-xops exec --host web-01 -c 'printf "%s\n" "$HOME"'
+xops exec --tags web --exclude-nodes web-maint-01 --concurrency 5 --timeout 60s --json -- uptime
+xops exec --nodes web-01,web-02 --concurrency 2 --stream --fail-fast -- df -h
+xops exec --all --exclude-tags canary --out-dir ./batch-logs -- uname -r
+xops exec --target web-01 --target deploy@192.0.2.20 --json -- hostname
 ```
 
-After a target selector (`--host`, `--ifile`, or `--tag`), positional arguments are the remote command, not another host. Use `--` to disambiguate remote options, for example `xops exec --host web-01 -- echo --help`. Put XOps options before the remote command. Do not invent an `exec --timeout` flag; set a suitable bound in the Agent's command runner and cancel its process when needed.
+`--out-dir` writes per-node stdout/stderr logs inside a `ScopedRootFS` sandbox directory.
 
-`--sudo` uses the node's configured Unix privilege strategy, including root, sudo, or su modes. Unconfigured escalation retains the legacy Unix Bash compatibility path; explicit server escalation is unsupported. Configured Bash/sh escalation and configured su have narrower support than ordinary execution; do not infer Windows UAC support or silently remove `--sudo`. Login success alone does not prove privilege escalation succeeded.
+## Three-State Outcomes, Exit Codes, and `do_not_retry`
 
-## Batch commands and local scripts
+- Exit codes: `0` success, `1` general/runtime error, `2` usage error, `128 + sig` remote POSIX signal, `255` SSH/auth/host-key/not-started/unknown/post-audit failure.
+- `--json` returns `ExecOutcomeView`:
+  - `"outcome_kind": "completed"` — remote process finished with known exit status (`ok: true` only when exit code is 0 and no post-audit error occurred).
+  - `"outcome_kind": "not_started"` — failed before remote execution started (safe to retry after fixing root cause).
+  - `"outcome_kind": "unknown"` + `"do_not_retry": true` — **never blindly retry**; verify remote state with read-only checks and `xops audit tail` first.
 
-```bash
-xops host list --tag web
-xops exec --tag web --exclude web-02 --task 3 -c 'uptime'
-xops exec --host web-01,web-02 --task 2 --stream -c 'df -h'
-xops exec --ifile ./hosts.txt --out-dir ./results -c 'uname -a'
-# Deliberately run this local script as non-login Bash on POSIX targets
-xops exec --tag web --no-login --shell ./check.sh --task 3
-```
+## Playbook v2 (`xops playbook` / `xops play`)
 
-The `--host`, `--ifile`/`-I`, and `--tag` flags are mutually exclusive: choose one, since combining any of them is rejected before execution. `--exclude` narrows the selected set. `--task` limits concurrent hosts, `--stream` prefixes streamed multi-host output, and `--out-dir` retains per-host logs. Protect logs if command output is sensitive.
-
-Write a local script for complex quoting or several dependent commands, then pass it with `--shell`. The script belongs to the CLI machine and is sent to the selected interpreter through stdin. Do not combine script bytes with a separate runtime stdin stream or credential stdin stream. A no-command `exec` with piped stdin is also a script; a no-command nonterminal `ssh HOST` in server mode instead sends an SSH shell request. Piped `ssh --sudo` remains an escalation operation.
-
-Scripts now require a reliable interpreter. Supported `sh`/`bash`/`zsh`/`fish` shebangs (such as `#!/bin/sh`, `#!/bin/bash`, `#!/bin/zsh`, `#!/bin/fish`, or `#!/usr/bin/env ...`, without extra arguments) can select it; a shebang does **not** establish the outer launch dialect. Configure `launch_dialect: posix` (or `fish`) only after verifying the server shell. Missing shebangs need a configured non-server interpreter or the deliberate Bash `--no-login` compatibility path. An unsupported shebang needs a supported explicit step/settings or CLI interpreter override; a node default alone does not override it. BOMs and explicit server scripts remain rejected. Do not silently strip or rewrite script bytes. The current script adapter supports `bash`, `sh`, `zsh`, and `fish`, not arbitrary Python, cmd, or PowerShell scripts.
-
-For a node that deliberately needs the old login Bash environment, merge this fragment into that node's existing configuration, preserving its connection and identity fields:
+Playbook v2 accepts strict YAML or JSON (`version: 2`, rejecting unknown keys, duplicate keys, YAML aliases, null actions, nested `ensure`, and tampered digests):
 
 ```yaml
-execution:
-  interpreter: bash
-  launch_dialect: posix
-  login: true
-```
-
-Do not automatically apply it to every host. Explicit `--interpreter`, `--launch-dialect`, and `--login-shell` flags can be used together with `--shell` (as well as `--stream`, `--out-dir`, or `--sudo`) to override script resolution directly from the CLI. Use explicit failure handling inside scripts; the last successful command must not hide an earlier failure. Check each host's outcome and the process exit code. After an interrupted mutation, inspect the affected hosts before rerunning it.
-
-## Playbooks
-
-Use `play` for repeatable workflows combining `shell`, `script`, `copy`, `ensure`, and `template`. A read-only starting point:
-
-```yaml
-name: check-web
-targets:
+version: 2
+id: deploy-web
+name: "Deploy Web"
+on_error: fail_fast # fail_fast | continue | abort
+target:
   tags: [web]
-settings:
-  concurrency: 2
-  on_error: stop
-  timeout: 2m
+  exclude_nodes: [web-maint-01]
+vars:
+  app_port: "8080"
 steps:
-  - name: uptime
-    shell: uptime
+  - id: ensure-nginx
+    action:
+      kind: ensure
+      check: { kind: shell, command: "command -v nginx >/dev/null 2>&1" }
+      action: { kind: shell, command: "apt-get update && apt-get install -y nginx" }
+      max_retries: 1
+  - id: render-conf
+    action:
+      kind: template
+      source: "./nginx.conf.tmpl"
+      dest: "/etc/nginx/conf.d/app.conf"
+      mode: "0644"
+      overwrite: true
+      atomic: true
+  - id: reload
+    action:
+      kind: shell
+      command: "systemctl reload nginx"
 ```
 
-Save as `check-web.yaml`, then:
+Step action kinds: `shell`, `script`, `copy`, `template`, `ensure` (no nested `ensure`).
 
 ```bash
-xops play check-web.yaml --dry-run
-xops play check-web.yaml --limit web-01
+# Offline AST/schema validation (zero Engine init, zero network)
+xops playbook validate deploy.yaml --json
+
+# Run playbook (supports --target override, --var KEY=VALUE, --concurrency, --timeout, --scoped-root, --symlink-policy, --policy)
+xops playbook run deploy.yaml --var app_port=8081 --concurrency 2 --json
+cat deploy.yaml | xops playbook run --stdin --policy strict --json
 ```
 
-`--limit` overrides Playbook targets; verify those explicit nodes. `--concurrency` overrides concurrency, `--sudo` forces global elevation, and repeated `--var key=value` overrides/adds variables used by steps and external templates. Empty variable values are valid; missing variables fail and values are not recursively expanded.
+## Policy Profiles, Guardrails, and Audit (`xops audit`)
 
-| Step | Use |
-| --- | --- |
-| `shell` | Execute a remote command. |
-| `script` | Read a local script and send its bytes to the resolved interpreter. |
-| `copy` | Upload a local file. |
-| `ensure` | Run a check and execute its action only if the desired state is absent. |
-| `template` | Render a local Go template and upload the result. |
-
-`on_error: stop` stops later steps on the failing host; `abort_all` cancels other host tasks; `continue` permits later steps on that same host. `--dry-run` previews the workflow without proving connectivity or credentials. More examples are in the [automation guide](https://wentf9.github.io/xops-cli/guide/automation).
-
-Ordinary step configuration resolves from step → `settings.execution` → node → global configuration. For scripts, explicit step/settings interpreter choices precede a supported shebang, then non-server node/global defaults. `server` is not a script interpreter. When a workflow needs POSIX script or ensure adapters, explicitly configure the known environment, for example:
-
-```yaml
-settings:
-  execution:
-    interpreter: bash
-    launch_dialect: posix
-    login: false
-  timeout: 5m
-```
-
-Use this only on compatible hosts. Ensure checks reject explicitly configured server mode; unconfigured checks probe once and require a detected POSIX bash/sh adapter. The same adapter is used for check, action and verification. Playbook scripts without a shebang can use the same bounded connection cache when execution is unspecified. Runtime probing does not persist configuration or change ordinary command defaults. Windows script/ensure remains unsupported; SFTP cwd exec can use a detected Windows adapter. Probe failures stop before user work and are not interpreter retries. Only a confirmed check result can authorize the action and subsequent verification. Timeout, cancellation, signal, I/O, cleanup, or uncertain startup failures must not be treated as an absent desired state. Retry settings apply to confirmed clean command failures; do not assume every failed attempt is retryable. Script sources and execution settings are frozen within a run, so changing local files/configuration during execution is not an update mechanism.
-
-## Interactive terminal and utilities
+- `--policy direct_operator` (CLI default) | `strict` / `strict_operator` | `strict_agent` (MCP default; irreversible `Halted` circuit break on audit post-write failure).
+- Query and reconcile `~/.xops/audit.jsonl` and `~/.xops/run/*.lock`:
 
 ```bash
-xops ssh -J bastion.example.com -i ~/.ssh/id_ed25519 deploy@web-01
-xops ssh --sudo web-01
-xops exec -x web-01 top
-xops tui
+xops audit reconcile --json
+xops audit tail --limit 20 --json
+xops audit list --phase finalized --outcome outcome_unknown --node web-01 --json
+xops audit inspect <operation_id> --json
 ```
 
-Use these when the task needs a terminal. `exec -x` supports one host and no local script; it returns after the requested command and now defaults to the native server payload. Privileged PTY with `--no-login` requires an explicit interpreter (e.g. `--interpreter bash`). `ssh` without a command opens a full server shell; that login session is distinct from one-shot command execution. Single-label jump hosts must be configured nodes/aliases; FQDN, IP, and explicit `host:port` can identify direct jumps. `version`, `help`, and `completion` provide local CLI discovery and shell completion.
+## Interactive Interfaces & MCP Equivalents
 
-The project also has CLI administration commands `xops mcp serve` and `xops mcp recover`. They are for explicitly requested MCP service administration, not prerequisites for this skill's host workflows. Consult `xops mcp --help` and the [HTTP service guide](https://wentf9.github.io/xops-cli/guide/mcp-http) for such a task.
+- Interactive CLI tools (human terminal only, reject `--json`): `xops ssh <target>` and `xops tui [--node <id>] [--refresh 2s] [--no-alt-screen]`.
+- **MCP tools**:
+  - `terminal_exec`: `exec`, `exec_privileged`, `probe_shell`, `batch_exec`, `run_playbook`.
+  - `terminal_session`: managed persistent PTY (`open`, `read`, `write`, `resize`, `signal`, `inspect`, `close`).
+  - `gui`: POSIX-validated remote GUI actions (`exec`, `open_session`, `inspect_session`, `close_session`; screenshots written inside `--artifact-root`).
+  - Start MCP server (when explicitly requested): `xops mcp serve [--transport stdio|http] [--listen 127.0.0.1:8080] [--transfer-root <dir>] [--artifact-root <dir>]`. Remember MCP sets `OperatorReadFS == nil` (use `ssh-agent` for SSH keys).

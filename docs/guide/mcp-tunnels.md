@@ -1,109 +1,120 @@
-# MCP stdio SSH 隧道
+# MCP 隧道与多路复用工具
 
-通过 `xops mcp serve` 启动的 stdio MCP 提供 SSH 本地转发（`-L`）和远程转发（`-R`），用于浏览器访问远端 Web 服务、本地测试连接远端数据库，以及远端程序访问本地开发服务。HTTP MCP 不注册隧道工具，MCP 不提供动态 SOCKS5 转发（`-D`）。
+在 XOps v2 中，`tunnel` 是内置 MCP 服务端的 7 大标准判别式工具之一，在 **`stdio`** 与 **Streamable HTTP** 两种传输模式下均完整可用。通过 `tunnel` 工具，AI 助手可以在安全护栏和审计约束下创建、检查与关闭 SSH 端口转发、动态 SOCKS5、StreamLocal Unix 套接字、TUN 隧道以及 ControlMaster 多路复用会话。
 
-## 运行位置与准备
+## 1. 支持的 8 个操作（`action`）
 
-“本地”始终指 **XOps MCP 进程所在机器**。客户端把 stdio 服务运行在容器或远程开发环境中时，本地监听和目标访问也发生在该环境。
-
-| 模式 | 监听位置 | 目标地址的解析与连接位置 |
+| 类别 | `action` | 功能 |
 | --- | --- | --- |
-| `local`（`-L`） | MCP 进程所在机器 | SSH 节点 |
-| `remote`（`-R`） | SSH 节点 | MCP 进程所在机器 |
+| **转发管理** | `start_forward` | 建立受管转发并返回带世代校验的 `handle` / `handle_token` |
+| | `inspect_forward` | 查询受管转发的实时绑定地址与状态 |
+| | `stop_forward` | 停止并释放指定受管转发句柄 |
+| **ControlMaster 复用** | `start_mux` | 启动并托管 ControlMaster 多路复用主控会话 |
+| | `inspect_mux` | 查询受管 ControlMaster 主控会话状态 |
+| | `stop_mux` | 停止并释放受管 ControlMaster 主控会话 |
+| | `probe_mux` | 探测指定 `socket_path` / 目标的外部或既有 ControlMaster 存活状态 |
+| | `control_mux` | 向活跃 ControlMaster 发送控制命令（`mux_action`: `check` \| `forward` \| `cancel` \| `exit` \| `stop`） |
 
-提前配置节点、凭据和可信主机密钥；隧道使用已配置的 ProxyJump，运行期间不会询问密码或确认未知主机密钥。每条隧道使用本次准入校验的节点和跳板配置视图，之后的普通配置变更不会将它重定向到其他目标。CLI 配置文件的外部修改仍需重启 MCP 加载。
+## 2. 转发类型与调用示例
 
-`nodeID` 接受已保存的节点 ID、别名及 `openssh:web` 形式的 OpenSSH 节点 ID。使用 OpenSSH 别名 `web` 创建后，返回的规范 ID `openssh:web` 可直接用于创建重试、新建隧道和列表筛选。未带前缀的同名别名优先匹配已保存节点；`openssh:` 前缀保留 OpenSSH 命名空间。
+`start_forward` 支持全部 4 类 `direction`（`local` / `remote` / `dynamic` / `tun`）及 `tcp` / `unix` 两种端点类型：
 
-OpenSSH 标识及别名解析出的 OpenSSH ID 不得包含空白或控制字符。包含这些字符的请求会在策略检查前报错，保证节点策略使用的名字与实际连接一致。
-
-## 工具与示例
-
-| 工具 | 输入 | 用途 |
-| --- | --- | --- |
-| `tunnel`，`action: "create"` | `requestID`、`nodeID`、`mode`、`listenPort`、`targetHost`、`targetPort`，可选 `listenHost`、`ttlSeconds` | 创建隧道并返回状态 |
-| `tunnel`，`action: "list"` | 可选 `nodeID`、`state` | 列出当前进程持有的隧道和保留的终态记录 |
-| `tunnel`，`action: "status"` | `tunnelID` | 查询单条隧道 |
-| `tunnel`，`action: "stop"` | `tunnelID` | 停止监听，并关闭已有转发连接 |
-
-节点停用或删除后，仍可用保留记录中的规范 `nodeID` 筛选历史隧道，并继续使用 `state` 过滤。历史规范 ID 优先于当前同名别名；其他别名按当前节点配置解析。历史查询仍执行当前全局和节点策略，不能绕过审批。列表请求取消或到期会取消节点解析及本次查询，不改变后台隧道的 TTL。
-
-将 SSH 节点 `web-1` 的回环 Web 服务转发到本地自动分配的端口：
+### 本地端口转发（`-L`）
 
 ```json
 {
-  "requestID": "web-preview-001",
-  "nodeID": "web-1",
-  "mode": "local",
-  "listenHost": "127.0.0.1",
-  "listenPort": 0,
-  "targetHost": "127.0.0.1",
-  "targetPort": 3000,
-  "ttlSeconds": 3600
+  "action": "start_forward",
+  "target": "web-01",
+  "direction": "local",
+  "bind_kind": "tcp",
+  "bind_addr": "127.0.0.1:18080",
+  "target_kind": "tcp",
+  "target_addr": "127.0.0.1:80"
 }
 ```
 
-创建结果的 `tunnel.listenAddress` 是可使用的监听地址，包含实际分配的端口。浏览器须能访问该机器的监听地址；在同一机器运行时，可打开 `http://<listenAddress>`。
-
-让 SSH 节点 `worker-1` 通过其回环端口访问本地开发服务：
+### 远端端口转发（`-R`）
 
 ```json
 {
-  "requestID": "worker-callback-001",
-  "nodeID": "worker-1",
-  "mode": "remote",
-  "listenHost": "127.0.0.1",
-  "listenPort": 18080,
-  "targetHost": "127.0.0.1",
-  "targetPort": 8080,
-  "ttlSeconds": 1800
+  "action": "start_forward",
+  "target": "worker-01",
+  "direction": "remote",
+  "bind_kind": "tcp",
+  "bind_addr": "127.0.0.1:9000",
+  "target_kind": "tcp",
+  "target_addr": "127.0.0.1:3000"
 }
 ```
 
-此例的目标 `127.0.0.1:8080` 位于 MCP 进程所在机器。远端须允许 SSH TCP 转发；`GatewayPorts` 决定实际绑定范围，返回的请求地址不能证明远端只监听回环接口。
+### 动态 SOCKS5 代理（`-D`）与 StreamLocal（`unix`）
 
-`listenHost` 默认 `127.0.0.1`，接受 IP 字面量或 `localhost`；IPv6 使用不带方括号的地址，例如 `::1`。`listenPort` 为 `0–65535`，`0` 请求自动分配；目标端口为 `1–65535`。每次新建使用新的 `requestID`，查询和停止使用返回的 `tunnelID`。
+```json
+{
+  "action": "start_forward",
+  "target": "web-01",
+  "direction": "dynamic",
+  "bind_kind": "tcp",
+  "bind_addr": "127.0.0.1:1080"
+}
+```
 
-## 生命周期与限制
+```json
+{
+  "action": "start_forward",
+  "target": "web-01",
+  "direction": "local",
+  "bind_kind": "unix",
+  "bind_addr": "/tmp/xops-local.sock",
+  "target_kind": "unix",
+  "target_addr": "/var/run/docker.sock"
+}
+```
 
-`running` 表示监听建立，不表示目标服务已验证可达。目标服务不可达等单次连接错误写入 `lastConnectionError`，隧道仍可接受后续连接。启动或 SSH 连接失败进入 `failed`，原因保存在 `error`。
+### 检查与关闭转发
 
-| 状态 | 含义 |
-| --- | --- |
-| `starting` | 正在建立连接和监听 |
-| `running` | 监听已建立 |
-| `stopping` | 已请求停止，正在回收资源 |
-| `stopped` | 当前进程持有的隧道资源已回收 |
-| `expired` | 有效期结束，资源已回收 |
-| `failed` | 启动、连接或清理失败，查看错误信息 |
+使用 `start_forward` 返回的 `handle` 或 `handle_token` 精确操作该世代会话：
 
-创建发布前取消请求会终止启动；发布成功后，工具调用结束不会关闭隧道。同一 `requestID` 与规范化参数的重试返回原记录，不延长有效期；参数改变会报冲突。终态记录不会重新启动，处理失败原因后需使用新请求 ID。
+```json
+{
+  "action": "inspect_forward",
+  "handle_token": "<token-from-start_forward>"
+}
+```
 
-隧道在主动停止、到期、SSH 断线或 MCP 进程退出时清理；不会自动重连或跨进程恢复。停止超时后清理仍继续，应查询状态。远程转发停止后返回 `remoteRelease: "unconfirmed"`：本地资源回收不等于已经确认远端端口释放，特别是网络中断时，远端 SSH 服务可能稍后才回收监听。
+```json
+{
+  "action": "stop_forward",
+  "handle_token": "<token-from-start_forward>"
+}
+```
 
-正常停止过程中由关闭监听产生的 EOF 按取消处理，不会将任务标为 `failed`。未请求停止时的监听中断，以及非预期的监听关闭错误仍会报告失败。
+## 3. ControlMaster 多路复用示例
 
-ProxyJump 建连中途取消、超时或关闭 MCP 时，会回收已经建立的跳板连接，即使下游 SSH 握手尚未完成或网络已无响应。
+```json
+{
+  "action": "start_mux",
+  "target": "web-01",
+  "socket_path": "~/.xops/mcp-mux-%C",
+  "control_master": "yes",
+  "control_persist": "10m"
+}
+```
 
-远程监听的建立和关闭请求各有独立的 10 秒上限，建立阶段也响应任务取消。请求超时或建立阶段被取消时，会中断该隧道独占的 SSH/ProxyJump 传输并回收本地资源；远端端口释放仍报告为 `unconfirmed`。
+```json
+{
+  "action": "control_mux",
+  "target": "web-01",
+  "socket_path": "~/.xops/mcp-mux-%C",
+  "mux_action": "check"
+}
+```
 
-| 限制 | 当前值 |
-| --- | --- |
-| 默认有效期 / 最大有效期 | 1 小时 / 24 小时，由 `ttlSeconds` 设置 |
-| 启动超时 | 30 秒，不含审批等待 |
-| 活跃隧道数量 | 每个 MCP 进程最多 16 条，启动和清理中的任务计入限额 |
-| 每条隧道并发连接 | 64 个，超额连接立即关闭 |
-| 终态记录保留 | 24 小时，进程退出时清空 |
-| 总记录数 | 1024 条；达到上限时拒绝新建，等待记录过期或重启服务 |
+## 4. 受管句柄生命周期与安全边界
 
-每条隧道持有独立 SSH 连接和跳板链，停止单条隧道不关闭普通 MCP SSH/SFTP 连接或其他隧道。读写沿用 SSH 转发的有界等待；空闲读超过 5 分钟或写操作超过 1 分钟会关闭相应转发连接。
-
-## 审批与审计
-
-回环本地转发和停止操作为 `moderate`；远程转发及非回环本地监听为 `dangerous`；列表和状态查询为 `safe`。是否需要审批取决于 `guardrail` 阈值和节点策略。审批展示方向、监听地址、目标地址和有效期，并绑定完整规范化参数；拒绝、取消和审批错误不会创建任务。
-
-未指定 `nodeID` 的列表查询会检查全局策略及结果涉及的每个节点策略；任一策略要求审批，就需要对完整节点集合统一审批。拒绝、取消或按配置禁止无审批执行时，不返回部分列表。状态筛选只纳入匹配记录的节点；审批和审计记录完整节点集合。列表返回策略检查对应的快照，审批等待期间不会额外加入未经检查的节点；新版协议的审批续传若发现节点集合变化，会拒绝旧审批，需要重新查询。
-
-全局阈值独立检查，`"*"` 等节点覆盖规则不能降低未指定 `nodeID` 时的审批要求，空结果也适用。指定节点的查询继续采用该节点的覆盖规则。
-
-创建、运行和终态记录使用同一操作 ID 关联审计。创建前的审计失败会阻止启动；已经运行后的审计失败通过 `auditError` 返回，不自动重新创建隧道。查询状态不会为服务流量增加应用层认证，目标服务仍使用自身的认证机制。
+- **世代防串扰**：所有活跃转发与 Mux 会话均以不可伪造的世代句柄（`ManagedHandle`）追踪，防止句柄复用误关其他会话。
+- **自动停机与熔断吊销**：
+  - MCP 服务端正常关闭（`Close`）时会自动清理全部非持久化受管句柄（PTY、Forward、Mux、GUI），不会遗留孤儿监听端口。
+  - 若在 `strict_agent` 下发生审计写失败进入 `Halted` 熔断态，引擎会立即吊销全部活跃受管句柄并拒绝后续调用。
+- **网络位置认知**：`bind_addr` 中的“本地”指运行 `xops mcp serve` 进程的宿主机或容器环境。建议默认绑定 `127.0.0.1`，开放非回环地址或高风险转发会触发护栏审批。
+- **认证前置提醒**：与所有 MCP 工具一致，`tunnel` 在 `OperatorReadFS == nil` 沙箱下运行，使用密钥认证的节点请通过 **`ssh-agent`** 提供签名（参见 [MCP 服务安全边界](./mcp-http)）。

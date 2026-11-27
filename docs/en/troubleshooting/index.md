@@ -1,65 +1,65 @@
 # Troubleshooting
 
-## Passwords are not saved
+This guide covers the most common operational errors in XOps v2 across configuration, vaults, guardrails, audit circuit breaking, MCP sandboxing, SFTP/SCP transfers, and ControlMaster multiplexing.
 
-Run `xops credential doctor` and check access permissions for the configuration directory, credential-store directory, and key file. Passing doctor checks establishes read access, not write permissions.
+## 1. Configuration Rejected (`version: 2`, Unknown Fields, or Permissions)
 
-With `--remember never` or `credential.remember_prompted: never`, entered passwords are used only for the current connection. If automatic saving fails, an authenticated interactive connection remains usable. Fix the problem and reconnect to save the credentials.
+- **Symptom**: Errors mentioning unsupported schema version, unknown YAML fields, trailing documents, or unsafe directory permissions.
+- **Cause & Fix**:
+  1. XOps v2 reads `~/.xops/config.yaml` (override with `XOPS_HOME`) using strict **`version: 2`** and `KnownFields(true)`. Legacy v1 `xops_config.yaml` and plaintext password keys are never supported.
+  2. Validate field names against the [Config Schema v2 Reference](../reference/config), or rebuild inventory via `xops config import --format openssh|csv`.
+  3. Ensure `~/.xops` has owner-only permissions (`0700` on Unix, protected Owner-Only DACL on Windows), and never place `policy.guardrail.audit_log` directly in the bare `$HOME` directory.
 
-## System keyring unavailable or locked
+## 2. `AuthPrivateKey` Fails with `ErrSignerUnavailable` Under MCP
 
-On Linux, the `system` backend requires `secret-tool`, a user D-Bus session, and Secret Service. Install `libsecret-tools` on Ubuntu/Debian if the tool is missing. `credential doctor` performs only a non-interactive read check and never opens an unlock dialog. Interactive deletion and `xops credential gc` request an unlock before cleanup. If cleanup previously failed because the keyring was locked, unlock it and run `xops credential gc` again.
+- **Symptom**: A node connects normally with `xops ssh` using a local private key file, but fails under `xops mcp serve` with `ErrSignerUnavailable`.
+- **Cause**: MCP mode physically sets **`OperatorReadFS == nil`** to prevent reading arbitrary host files (including `~/.ssh/id_ed25519`).
+- **Fix**:
+  1. Load your private key into **`ssh-agent`** (`ssh-add ~/.ssh/id_ed25519` on Unix with `SSH_AUTH_SOCK` exported to the MCP process; on Windows, start the `ssh-agent` service so `\\.\pipe\openssh-ssh-agent` is active and run `ssh-add`).
+  2. Configure the node's Identity as `kind: agent` (or include `agent` in a `composite` auth chain).
 
-SSH sessions, scheduled jobs, or sessions belonging to another user may not have access to the desktop keyring. Unattended jobs can use the default key-file offline store. Follow the [migration guide](../guide/migration) to move existing credentials.
+## 3. Vault Locked, Uninitialized, or Linux Secret Service Unavailable
 
-## Lost offline key or interrupted maintenance
+- **Diagnose**:
 
-Do not generate a new key over the old file. Existing stores require their original unlock material; recover the key from backup. After interrupted maintenance, preserve the store and related files. Follow the [offline storage guide](../guide/offline-store) to resume the operation or restore from backup.
+  ```bash
+  xops creds status --json
+  xops doctor --json
+  ```
 
-## Host fingerprint prompt cannot be submitted
+- **Offline Vault (`offline_aead`)**:
+  - `Uninitialized`: Run `xops creds init` (**never delete `vault.meta.json` and re-init over existing `items/*.enc` files**).
+  - `Locked`: Offline vault unlock lives only in process memory; for unattended batch runs or MCP, use `os_keychain`, `external_helper`, or `ssh-agent`.
+- **Linux `os_keychain`**: Requires an active D-Bus user session (`DBUS_SESSION_BUS_ADDRESS`) and a running Secret Service daemon (GNOME Keyring / KWallet). In headless SSH/container environments, switch to `offline_aead` or `external_helper`.
 
-Run the command in an interactive terminal. Text prompts display input, accept Enter, and support Backspace. Hidden password input is expected. Enter `yes` after verifying the fingerprint, or `no` to reject it.
+## 4. `outcome_unknown` (`do_not_retry: true`) or `uncertain_durability`
 
-If submission still fails on Windows, update XOps and retry, recording the terminal type. `context canceled` means the operation was canceled. If you did not cancel it, retain the full sanitized error for troubleshooting.
+- **Symptom**: Execution exits `255` with `OutcomeUnknown` / `do_not_retry: true`, or a `xops creds` saga returns `uncertain_durability: true`.
+- **Rule (Never Blindly Retry)**:
+  1. **Remote `OutcomeUnknown`**: The command may already have taken effect before the channel dropped. Verify remote state with read-only checks (`xops sftp stat`, read-only `xops exec`) and `xops audit tail` before deciding whether to re-run.
+  2. **Vault `UncertainDurability` (`Applied && !Durable`)**: Do not retry or delete old/new credentials automatically. Run `xops creds doctor` and `xops hosts list` to verify what persisted on disk, then clean up safely with `xops creds gc`.
 
-## Unexpected input after an SFTP command
+## 5. `strict_agent` Triggers `engine_halted` (`SECURITY GATE HALTED`)
 
-Wait for the remote command to finish and the SFTP prompt to return before entering another command. On Windows, update XOps and retry if the first character disappears or you see `read stdin failed: EOF`. If it persists, record your OS, terminal, XOps version, and reproduction steps.
+- **Symptom**: MCP endpoints return HTTP `503` (`code: "gate_halted"`), or CLI/TUI reports `engine_halted`.
+- **Cause**: Under `strict_agent`, a post-write failure to `audit.jsonl` (disk full, permission change, or corrupted directory) irreversibly halts the Engine and revokes all active managed handles.
+- **Fix**:
+  1. Check free disk space and permissions on `~/.xops/` and `audit.jsonl`.
+  2. Run `xops audit reconcile --json` to reconcile stale locks and inspect recent events via `xops audit tail --limit 20`.
+  3. Restart the MCP server / Engine process once underlying storage health is restored.
 
-A lost connection makes the SFTP shell exit with a failure status. Once networking is restored, reconnect with `xops sftp <node>`.
+## 6. Host Key Verification Failures (`host_key_unknown` / `host_key_mismatch` / `host_key_revoked`)
 
-## Extra output from exec -x
+- Under non-interactive batch, Playbook, or MCP runs, default `StrictHostKeyChecking=ask` fails closed on unknown host keys (`host_key_unknown`). Verify the fingerprint once via interactive `xops ssh <target>` to record it in `known_hosts`.
+- On `host_key_mismatch` or `host_key_revoked`, verify whether the server was legitimately rebuilt before updating `known_hosts`; never disable host-key checks blindly.
 
-`exec -x` returns to the local terminal when the command finishes. Output from the command and remote login startup scripts remains visible. Check remote Bash startup files for login banners or custom output. Use `xops ssh` for a complete interactive shell.
+## 7. SFTP / SCP Symlink Rejection, Anchor Mismatch, or Transfer Recovery
 
-## Old Linux kernel: identify vault mount / function not implemented
+- **`symlink_rejected`**: Downloads and recursive uploads (`scp -r`) reject escaping symlinks by default; only single-file uploads may opt into `--symlink-policy follow_operator_source`, while downloads allow only `reject` or `contained_relative`.
+- **`remote_anchor_mismatch` / `patch_conflict`**: The remote file's type or `(dev, ino)` changed during `sftp patch` or atomic write; re-read the file and re-apply your edit cleanly.
+- **Interrupted Transfers**: Run `xops sftp recover --json` to inspect dual-generation WAL journals. Resume healthy pending transfers with `scp --resume` or MCP `transfer` `resume`; inspect remote digests manually before touching any `TransferUncertainCommit` entry.
 
-Update XOps first. Some older kernels do not support its preferred mount-information query, so XOps attempts to read `/proc/self/fdinfo`. In containers or restricted environments, make sure procfs is accessible and supplies `mnt_id` information.
+## 8. ControlMaster Socket Issues or Daemon Exit
 
-Run `xops credential store probe file` to check filesystem operations for the target directory. If it still fails, provide the kernel version, filesystem type, and mount configuration. Do not delete the credential store or key as a troubleshooting step.
-
-## Ambiguous node or configuration conflict
-
-If an address or alias matches several nodes, run `xops host list` and use an exact node ID. After a configuration conflict, reload the latest configuration and review changes made in other terminals before editing again.
-
-## Configuration fails to load due to validation errors
-
-XOps enforces full-graph invariants on load and on every durable commit to `xops_config.yaml` (strict alias rules, reserved `openssh:` prefix consistency, and `proxy_jump` self-reference/cycle detection). If an existing configuration violates these rules, loading fails closed and directs you to `xops config doctor`.
-
-Run read-only diagnostics first to inspect every violation:
-
-```sh
-xops config doctor
-```
-
-After reviewing the report, pass `--fix` to explicitly repair fixable violations (invalid or duplicate aliases, invalid/self-referential/cyclic `proxy_jump` hops) and persist the result through full-graph validation:
-
-```sh
-xops config doctor --fix
-```
-
-When unfixable structural errors remain (such as a missing `host_ref` or legacy v1 schema), `--fix` leaves the file on disk untouched so you can correct it manually or run `xops credential migrate`.
-
-## Report a problem
-
-Include the command structure, XOps version, OS and terminal, expected behavior, and sanitized errors. Do not share passwords, private keys, unlock material, or full production configuration. Report problems through [GitHub Issues](https://github.com/wentf9/xops-cli/issues).
+- Probe an existing control socket with `xops mux check -S <socket> <target>`; starting a new master via `xops mux start` automatically probes and cleans stale sockets left by crashed masters.
+- If `xops ssh -f` or `xops mux daemon` exits immediately, verify that neither `ControlMaster=ask/autoask` nor interactive password prompts are required—daemon mode has no interactive stdin and fails closed rather than hanging.

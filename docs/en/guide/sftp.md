@@ -1,155 +1,101 @@
-# SFTP and file transfer
+# SFTP and SCP File Transfers
 
-XOps provides both an interactive SFTP shell (`xops sftp`) and a command-line file transfer tool (`xops scp`).
+XOps v2 explicitly distinguishes **local `os.Root` sandboxed atomic semantics** from **remote SFTP v3 protocol semantics**, offering resumable parallel `xops scp`, 15 scriptable single-shot `xops sftp` subcommands, and an interactive SFTP shell.
 
-## Quick start
+## 1. Parallel Resumable Transfers (`xops scp`)
 
-### 1. Upload, download, and distribute files with SCP
-
-```bash
-# Upload a file or directory relative to the remote login home directory
-xops scp ./test.tar 'web-01:~/tmp/'
-
-# Download from a remote host to a local directory
-xops scp 'web-01:~/tmp/test.tar' ../
-
-# Relay a file directly between two remote hosts (routed through your machine)
-xops scp 'web-01:~/config.conf' 'web-02:~/config.conf'
-
-# Upload to one or more hosts with --host
-xops scp --host web-01 ./config.conf ./
-xops scp --host web-01,web-02 ./config.conf /etc/app/
-
-# Distribute a file to all hosts matching a tag (quote ~ paths so the local shell does not expand them)
-xops scp --tag web ./config.conf '~/tmp/'
-```
-
-Basic syntax: `xops scp [options] <source> <destination>`. Both source and destination paths are required:
-
-- **Single-host and relay transfers**: Without `--host`, `--tag`, or `-I/--ifile`, either path can use `[[user@]host:]file` (where the host part is a node name, alias, or host address). Local-to-remote uploads, remote-to-local downloads, and remote-to-remote relays through the local client are all supported (local-to-local is not).
-- **Ports and special paths**:
-  - Like OpenSSH `scp(1)`, use `-P 122` (or `--port 122`) to set the SSH port and `-c`/`--cipher` to select ciphers; specify usernames via `user@host:` or `-o User=...` (`-l` and `-p` are not provided).
-  - Everything after the host colon is treated as the file path, not a port—for example, `user@host:22:file` refers to a remote file named `22:file`. Enclose IPv6 addresses in brackets, such as `user@[::1]:file`.
-  - When `-P` is omitted, XOps uses the matched node's configured port. If a host matches multiple saved ports, XOps reports the ambiguity rather than guessing port 22—specify `-P` or use a unique alias. To relay between two hosts on different ports, assign each host an alias.
-  - Windows remote paths accept `vm:C:/Users/example/file.txt`. Prefix local filenames containing colons with `./` (e.g., `./22:file`).
-- **Batch or targeted uploads (`--host` / `--tag` / `-I`)**: Passing `--host`, `--tag`, or `-I/--ifile` always uploads from the local machine to the selected hosts (the three flags are mutually exclusive; use `--exclude` to filter out hosts). In this mode, both paths are treated as literal file paths—characters like `:`, `@`, and `[` are treated as ordinary filename characters rather than remote address syntax.
-- **`--src` and `--dest` compatibility flags**: You can pass `--src <source> --dest <dest>` instead of two positional paths, but both flags must be used together and cannot be mixed with positional arguments.
-- **Privilege escalation (`--sudo`)**:
-  - Pass `--sudo` to enable elevated transfers for uploads, downloads, and remote-to-remote relays (when relaying between two remote hosts, privilege escalation is enabled on both sides).
-  - Under the hood, XOps starts the remote `sftp-server` binary via an escalation channel to establish a root SFTPv3 stream; if the login user is already root, it directly requests the standard SFTP subsystem.
-  - Examples: `xops scp --sudo ./app.service web-01:/etc/systemd/system/`, `xops scp --sudo 'web-01:/etc/shadow' ./`, `xops scp --sudo web-01:/root/data.tar web-02:/root/data.tar`.
+`xops scp` requires strictly one local operand and one remote `[user@]host:<remote_path>` operand:
 
 ```bash
-# Connect on port 122 and upload to a remote file named 22:file
-xops scp -P 122 ./config.conf user@host:22:file
+# Upload a local file to a remote directory or exact file path
+xops scp ./release.tar.gz web-01:/srv/releases/
+xops scp --no-clobber --perm 0644 ./app.conf web-01:/etc/app/app.conf
 
-# With --host, @ and : in paths are treated as literal filename characters
-xops scp --host web-01 ./config.conf 'user@name:backup'
+# Recursive directory upload (parallel chunks + resume + preserve mode/times)
+xops scp -r -p --resume --concurrency 4 --chunk-size 1048576 ./dist web-01:/srv/app/
 
-# Using --src and --dest compatibility flags
-xops scp --src ./config.conf --dest web-01:~/config.conf
-xops scp --tag web --src ./config.conf --dest /etc/app/
+# Download a remote file or directory (anchored inside ScopedRootFS)
+xops scp web-01:/var/log/app.log ./app.log
+xops scp -r --local-root ./downloads --max-files 500 --max-bytes 1073741824 web-01:/srv/artifacts ./artifacts
+
+# Verify SHA-256 digest and emit a JSON/v2 report
+xops scp --expected-digest sha256:<hex> --json web-01:/srv/release.bin ./release.bin
 ```
 
-- **Progress bar and connection diagnostics**:
-  - A progress bar is shown on `stderr` by default in interactive terminals and hidden automatically when output is piped or redirected.
-  - `-q` / `--quiet`: Hides the progress bar and SSH warnings/diagnostics (errors and security prompts are still shown).
-  - `-v` / `--verbose`: Prints SSH/SFTP connection and transfer diagnostics (independent of project-level `--debug` logs):
-    - `-v`: Shows connection, authentication, and transfer information.
-    - `-vv`: Adds more detail about file operations.
-    - `-vvv`: Produces the most detailed troubleshooting log.
-  - Combining `-q` and `-v` follows OpenSSH flag order: `-qv` hides the progress bar while keeping SSH/SFTP diagnostics; `-vq` hides both the progress bar and SSH diagnostics, keeping only SCP transfer and SFTP init messages.
-  - If the output environment does not support progress or diagnostics, these extra messages are omitted while file transfers continue. To save diagnostics, append `2>scp.log` to the command.
+### `xops scp` Flags and Guarantees
+
+| Flag | Description |
+| --- | --- |
+| `-P <port>` / `-l` / `-i` / `-J` / `-o` / `-F` | Standard OpenSSH connection options (uppercase `-P` sets port) |
+| `-p` / `--preserve` | Preserve modification times (and permissions on upload) |
+| `-r` / `--recursive` | Recursive transfer (recursive upload requires `--symlink-policy=reject` and uses `ScopedRootFS`) |
+| `--resume` | Resume interrupted transfer with digest verification |
+| `--no-clobber` | Refuse to overwrite an existing destination file |
+| `--expand-into-dir[=bool]` | Expand uploaded filename into an existing remote directory (default `true`) |
+| `--symlink-policy <policy>` | `reject` (strict default) \| `contained_relative` \| `follow_operator_source` (downloads allow `reject` or `contained_relative` only) |
+| `--local-root <dir>` | Explicit `ScopedRootFS` sandbox directory for local I/O |
+| `--perm <octal>` | Remote file mode (`0001..0777`) |
+| `--chunk-size` / `--concurrency` | Parallel chunk size in bytes and concurrent worker count |
+| `--max-files` / `--max-bytes` | Hard file-count and total-byte caps for transfers |
+| `--expected-digest <sha256>` | Fail closed unless transferred content matches the expected SHA-256 digest |
+
+## 2. Single-Shot Remote SFTP Operations (`xops sftp <op>`)
+
+Perform atomic remote filesystem operations without requiring a remote shell (all subcommands support `--json` and `--policy`):
 
 ```bash
-# Quiet mode (no progress bar)
-xops scp -q ./file web-01:~/file
+# Listing, stat, realpath, and symlink inspection
+xops sftp ls web-01 /srv/app --json
+xops sftp stat web-01 /srv/app/app.ini
+xops sftp stat --follow-symlinks web-01 /srv/app/current
+xops sftp realpath web-01 /srv/app/current
+xops sftp readlink web-01 /srv/app/current
 
-# Hide progress bar while showing SSH/SFTP diagnostics
-xops scp -qv ./file web-01:~/file
+# Bounded read (read / cat)
+xops sftp cat --max-bytes 65536 web-01 /srv/app/app.ini
 
-# Get a more detailed troubleshooting log
-xops scp -qvv ./file web-01:~/file
+# Atomic write from local file or stdin ("-")
+xops sftp write --file ./app.ini --perm 0644 --create-parents web-01 /srv/app/app.ini
+printf 'mode=prod\n' | xops sftp write --file - --no-clobber web-01 /srv/app/mode.env
+
+# FSTAT-anchored text patch (concurrent remote edits fail closed with remote_anchor_mismatch / patch_conflict)
+xops sftp patch --old "debug=true" --new "debug=false" web-01 /srv/app/app.ini
+xops sftp patch --old "v1" --new "v2" --all web-01 /srv/app/app.ini
+
+# Directory and metadata operations
+xops sftp mkdir --perm 0755 web-01 /srv/app/releases/v2
+xops sftp mv --no-clobber web-01 /srv/app/app.ini.new /srv/app/app.ini
+xops sftp chmod 0640 web-01 /srv/app/app.ini
+xops sftp rm web-01 /srv/app/tmp.bak
+xops sftp rmdir web-01 /srv/app/empty-dir
+
+# Recover interrupted dual-generation WAL transfers (omit target/id to scan all; --prune cleans superseded gens)
+xops sftp recover --json
+xops sftp recover --prune web-01 <transfer_id>
 ```
 
-- **Remote `~` paths**: Remote paths support `~` and `~/...`, resolved relative to the remote SFTP login directory (typically the user's home directory). `~otheruser` is not supported; use an absolute path instead.
-- **Overwrite behavior**: Answering `y` at a prompt or passing `-f`/`--force` overwrites existing files (even when size and modification time match); passing `-n`/`--no-clobber` skips existing files.
-- **Local download protection**: If an overwrite fails, XOps attempts to restore the original file. If manual recovery is needed, follow the backup path in the error message. An existing directory is never replaced by a regular file.
+## 3. Interactive SFTP Shell (`xops sftp <target>`)
 
-### 2. Interactive SFTP shell
+Start an interactive session by passing a target host (optionally with `--dir <remote_dir>` or `<target>:<remote_dir>`):
 
 ```bash
 xops sftp web-01
+xops sftp --dir /srv/app web-01
+xops sftp web-01:/srv/app
 ```
 
-- **Connection flags** (aligned with OpenSSH `sftp(1)`): supports `-P`/`--port` for port, `-c`/`--cipher` for ciphers, `-i` (identity), `-J` (ProxyJump), `-F` (config file), and `-o` (SSH options); specify username via `user@host` or `-o User=...` (`-l` and `-p` are not provided).
+> The interactive SFTP shell does not support `--json` (use single-shot subcommands for machine parsing). Pressing `Ctrl+C` during a slow transfer cancels only that command and returns cleanly to the `sftp> ` prompt.
 
-Type `help` at the SFTP prompt to list all commands. Common operations:
+### Interactive Shell Commands
 
-```text
-pwd
-ls
-cd /var/tmp
-put ./report.txt
-get report.txt
-exec date
-exit
-```
-
-- `exec <command>`: Runs a command in the current remote directory (allocating a PTY in interactive mode for terminal programs) and returns to the SFTP prompt. When connected with `--sudo`, commands inherit elevated execution by default.
-- `shell` / `lshell`: Opens a remote or local interactive shell (remote shell inherits elevated privileges when connected with `--sudo`); `lexec`: runs a local command. The SFTP prompt resumes when the child program exits.
-- **Privilege escalation (`--sudo`)**:
-  - Pass `--sudo` when connecting to start an elevated SFTP session: `xops sftp --sudo web-01`.
-  - It launches the remote `sftp-server` binary via an escalation channel (or requests the subsystem directly if logged in as root), granting root privileges for all file operations.
-  - Interactive `shell` and built-in `exec` commands also inherit elevated privileges by default.
-- If the connection drops or command output fails, the session ends with a nonzero status. Reconnect to continue working.
-- **Connection diagnostics**: `-v` / `--verbose` prints SSH/SFTP diagnostics to `stderr` (independent of `--debug`). It uses the same `debug1/2/3:` format as `xops ssh -v`:
-  - `-v`: Shows connection, host key verification, authentication, negotiated algorithms, and SFTP initialization.
-  - `-vv`: Adds SFTP extensions, path requests, and `get`/`put` file operations.
-  - `-vvv`: Adds SFTP packet types, request IDs, lengths, and status codes. File contents and credentials are never printed.
-  - Unlike `xops scp`, `xops sftp` has no `-q`. Diagnostics from tab completion or a running command may interleave with the line being edited; to keep the prompt clean, save them to a file, for example `xops sftp -vv web-01 2>sftp.log`.
-
-## Interactive input and keyboard shortcuts
-
-The SFTP prompt supports line editing, command history (saved in `~/.xops_sftp_history`), and local/remote path completion:
-
-| Key | Behavior |
+| Group | Commands |
 | --- | --- |
-| `Tab` / `Shift+Tab` | Request path completion and cycle forward/backward through candidates (turning pages automatically) |
-| `PageUp` / `PageDown` | Move by a full page in the completion menu (stops at first/last page) |
-| `Enter` / `Esc` (completion menu) | `Enter` inserts the selected candidate without running the command; `Esc` closes the menu |
-| `↑` / `↓`, `Ctrl+P` / `N` | Browse history; returning to the newest line restores your current draft |
-| `Ctrl+R` | Reverse-search history; press again for an earlier match |
-| `Enter` / `Esc` / `Ctrl+G` (search) | `Enter`/`Esc` accepts the match and returns to editing; `Ctrl+G` cancels search and restores the draft |
-| `Home` / `End`, `Ctrl+A` / `E` | Jump to the start / end of the line |
-| `Ctrl+U` / `K` / `W` | Delete before cursor / after cursor / previous word |
-| `Delete` / `Ctrl+D` | `Delete` removes the character under the cursor; `Ctrl+D` exits on an empty line or deletes under the cursor |
-| `Ctrl+C` | Cancel current input; at an overwrite/delete prompt, abort remaining files in the current command (`n` skips only the current item) |
+| **Navigation** | `pwd`, `cd [remote-path]`, `ls [-l] [-a] [remote-path]`, `lpwd`, `lcd <local-path>`, `lls [-l] [-a] [local-path]` |
+| **Transfer & Atomic Ops** | `put [-r] [-n] [--resume] [-p] <local> [remote]`, `get [-r] [-n] [--resume] [-p] <remote> [local]`, `cat <remote>`, `write [-n] [-p] <remote> <text>`, `mv\|rename [-n] <old> <new>`, `mkdir [-m <octal>] <remote>`, `rm <remote>`, `rmdir <remote>` |
+| **Metadata & Inspection** | `chmod <octal-mode> <remote>`, `chtimes <mtime> <remote>` (or `chtimes <atime> <mtime> <remote>`, RFC3339 or Unix epoch), `stat [-L] <remote>` (follows symlinks), `lstat <remote>` (no symlink follow), `realpath <remote>`, `readlink <remote>` |
+| **Control** | `help [command]` (`?`), `exit` / `quit` / `bye` |
 
-**Editor and history behavior**:
-- **Completion menu**: A single match is inserted immediately; after completing a directory, press `Tab` again to complete inside it. Multiple matches display in a multi-column grid (up to 6 rows with page and total counts) highlighted with `>`. Remote completion queries time out after 2 seconds and cancel automatically if you keep typing.
-- **Scrolling and paste**: Long lines scroll horizontally while editing and echo in full on submission. Wide characters, combining marks, emoji, and bracketed pastes split across reads are preserved (newlines and tabs in pasted text become spaces without submitting the command). When `stdin` is a terminal and `stdout` is piped (e.g. to `tee`), prompts and terminal resize handling continue to work via the input terminal.
-- **History**: Up to 500 recent non-empty interactive commands are saved, excluding consecutive duplicates, confirmation answers, and batch commands. If the history file is unavailable, XOps warns and temporarily keeps session-only history. A failed save does not erase old entries; saving resumes when the file becomes available.
+## 4. Honest Security and Atomicity Boundaries
 
-## Batch mode
-
-Piping or redirecting input into `xops sftp` (e.g. `xops sftp web-01 < batch.txt`) automatically enables batch mode:
-- The first command failure stops execution immediately with a nonzero exit status, without running later commands or writing interactive history.
-- Local `lls`/`lll` and remote `ls`/`ll` fail immediately on missing paths or read errors; a failure on any wildcard match stops the remaining matches and subsequent commands.
-- Batch `exec` allocates no PTY, and `exec` / `lexec` receive `EOF` on stdin so they cannot consume subsequent SFTP commands.
-- `shell`/`lshell` require an interactive terminal; operations that would prompt for overwrite or removal fail unless resolved with force/no-clobber options. Each command line is capped at 1 MiB.
-
-## Working directory inheritance and probing for `exec`
-
-`exec` runs commands in the current remote directory. Use `cd` to change directories first. If the directory cannot be entered, the command will not run.
-
-For Windows hosts, use paths such as `/C:/...`:
-
-```text
-cd /C:/Windows
-exec dir
-```
-
-Use `cd /C:` to enter the root of the C: drive.
-
-When no interpreter is configured, XOps attempts to detect the remote environment. If execution is reported as unsupported, check the node's `execution` settings and select an interpreter installed on that host—see [Hosts and identities](./hosts#node-execution-configuration-execution). A configured `server` interpreter supports the SFTP working directory only with the `cmd` launch dialect; other environments need an explicit interpreter. If detection fails, the command does not run.
+- **Local Side (`core/osfs` `*os.Root`)**: Downloads and recursive uploads operate strictly inside a non-escaping `os.Root` sandbox with temp-file staging, fsync, and sidecar-locked atomic replacement, blocking path traversal and symlink escapes.
+- **Remote Side (SFTP v3 Protocol)**: Write and patch flows use non-truncating open + `SSH_FXP_FSTAT` file-type/`(dev, ino)` anchor verification, then stage to a sibling temp file and publish atomically via OpenSSH `posix-rename@openssh.com`. Concurrent remote mutations or unsupported extensions fail closed rather than silently corrupting data.

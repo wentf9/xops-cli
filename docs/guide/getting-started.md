@@ -1,75 +1,137 @@
-# 安装与初始化
+# 安装与快速开始
+
+XOps v2 是单二进制、零远端依赖的跨平台 SSH/SFTP 运维与受控 AI 自动化平台，支持 Linux、macOS 与 Windows（amd64 / arm64），纯 Go 1.27+ 构建（`CGO_ENABLED=0`）。
 
 ## 1. 安装
 
-从 [GitHub Releases](https://github.com/wentf9/xops-cli/releases) 下载对应操作系统与架构的二进制文件：
-- **Linux / macOS**：将 `xops` 放入 `PATH` 目录（如 `/usr/local/bin`）。
-- **Windows**：将 `xops.exe` 所在目录加入 `PATH`，或在 PowerShell 中直接运行 `./xops.exe`。
+### 方式一：一键安装脚本
 
-Linux / macOS 可通过 Bash 一键安装（amd64 / arm64，无需管理员权限）：
+**Linux / macOS**：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash
-
-# 指定安装目录
-curl -fsSL https://raw.githubusercontent.com/wentf9/xops-cli/master/install.sh | bash -s -- --install-dir "$HOME/tools/xops"
 ```
 
-Windows 也可在 PowerShell 5.1+ 中一键安装最新发布版（x64 / ARM64，无需管理员权限）：
+**Windows（PowerShell 5.1+，无需管理员权限）**：
 
 ```powershell
 irm https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 | iex
-
-# 需要自定义目录时，下载脚本后传参执行：
-Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/wentf9/xops-cli/master/install.ps1 -OutFile install.ps1
-.\install.ps1 -InstallDir "$HOME\tools\xops"
 ```
 
-脚本自动识别系统架构，将程序安装到 `%LOCALAPPDATA%\Programs\xops\xops.exe` / `$HOME/.local/bin/xops`，并将目录加入用户及当前 shell 的 PATH。其他已打开的终端需要重启后才能直接运行 `xops`。重复安装会更新程序；若程序正在运行，请先关闭再重试。
+也可直接从 [GitHub Releases](https://github.com/wentf9/xops-cli/releases) 下载对应平台的预编译归档。
 
-也可以从源码编译（需要 **Go 1.26+**，Makefile 原生支持 Linux、macOS 与 Windows CMD / PowerShell / Git Bash）：
+### 方式二：从源码编译
+
+需要 **Go 1.27+**（仓库采用 Go Multi-Module Workspace，组合根位于 `./cmd/xops`）：
 
 ```bash
 git clone https://github.com/wentf9/xops-cli.git
 cd xops-cli
 make build
-./bin/xops --help
 ```
 
-在 Windows 上运行 `make build` 会生成 `bin/xops.exe`；在其他平台可通过 `make windows` 交叉编译 Windows 版本。如需指定 Go 工具目录，可传入 `make GOPATH_BIN=/path/to/bin build`；设置 `GOPATH_BIN=` 则跳过自动探测并沿用当前 `PATH`。
+编译产物位于 `bin/xops`（Windows 为 `bin/xops.exe`）。如需为其他平台交叉编译，可使用 `make linux`、`make linux-arm64`、`make darwin`、`make windows`、`make windows-arm64` 或 `make release`。
 
-## 2. 导入现有配置或直接连接
-
-如果你平时使用 `~/.ssh/config`，运行 `xops init` 即可导入所有不含通配符的 `Host` 配置（仅读取本地文件，不发起网络连接，重复运行也不会覆盖已有节点）：
+### 验证安装
 
 ```bash
-xops init
-xops host list
+xops version
+xops version --json
 ```
 
-也可指定其他 OpenSSH 配置文件，或仅创建空白的 `~/.xops/xops_config.yaml`：
+> `xops version`（或 `-V`/`--version`）仅输出编译期注入的版本元信息，**不会初始化核心引擎或创建任何本地状态目录**。
+
+## 2. 本地状态目录与配置文件
+
+XOps v2 默认使用 `~/.xops/` 作为私有状态根目录，可通过环境变量 **`XOPS_HOME`** 覆盖：
+
+| 路径 | 用途 |
+| --- | --- |
+| `~/.xops/config.yaml` | YAML vNext（`version: 2`）主配置文件：凭据存储、护栏策略、全局 OpenSSH 选项与 Host/Identity/Node 资产图 |
+| `~/.xops/vault/` | 默认离线加密凭据库目录（`vault.meta.json` + `items/<sha256>.enc`） |
+| `~/.xops/audit.jsonl` | 同步 Fail-Closed JSONL 审计日志（路径可在 `policy.guardrail.audit_log` 覆写） |
+| `~/.xops/run/<process_id>.lock` | 进程生命周期活跃操作锁，用于启动期 O(1) 崩溃对账 |
+| `~/.xops/journals/` | 最高 10 GiB 可恢复传输的双代 CRC32 WAL 日志目录 |
+
+首次运行时如果 `~/.xops/config.yaml` 尚不存在，只读命令会自动加载空资产图（零副作用）；执行写操作或导入时会自动以 `0700`/`0600` 权限（Windows 为受保护 Owner-Only DACL）创建目录与文件。
+
+> XOps v2 **仅接受 `version: 2` 配置 Schema**，解码时强制启用 `KnownFields(true)`，拒绝未知字段、多文档尾随内容以及任何明文密码字段。详细 Schema 请参阅 [配置 Schema v2 参考](../reference/config)。
+
+## 3. 导入已有主机资产
+
+XOps v2 通过统一 `xops config import` 导入外部配置（纯本地读取、零远端建连、支持 `--plan` 冲突/DAG 预览与 `--dry-run`）：
 
 ```bash
-xops init --ssh-config ~/.ssh/config.work
-xops init --skip-ssh-import
+# 查看已注册的导入格式（内置 openssh、csv）
+xops config formats
+
+# 1. 先预览 ~/.ssh/config 导入计划与告警（不落盘）
+xops config import --format openssh --file ~/.ssh/config --plan
+
+# 2. 确认无误后正式导入
+xops config import --format openssh --file ~/.ssh/config
+
+# 或从 CSV 批量导入（严格拒绝明文 password/passphrase/secret 列）
+xops config import --format csv --file ./hosts.csv --plan
+xops config import --format csv --file ./hosts.csv
 ```
 
-不运行 `xops init` 也可以直接连接主机。首次连接时核对主机密钥指纹，输入 `yes` 确认（注意：若遇到指纹变更警告，请先核实目标服务器是否重装或更换过密钥，切勿当作普通首次连接直接放行）：
+也可以直接使用命令行声明式创建资产：
 
 ```bash
-xops ssh user@192.0.2.10
+xops hosts create-host --id h-web1 --address 192.0.2.10:22 --tag web
+xops hosts create-identity --id id-deploy --user deploy --auth-kind private_key --key-path ~/.ssh/id_ed25519
+xops hosts create-node --id web-01 --host h-web1 --identity id-deploy --tag web
 ```
 
-SSH 握手和身份认证通过后，XOps 会自动保存该节点，并将验证成功的密码或私钥口令加密存入本机 `~/.xops/credentials/`，下次连接无需重复输入。保存策略与备份方式见[凭据存储](./credentials)。
+## 4. 初始化凭据库（如需密码或加密私钥口令）
 
-## 3. 常用下一步
+若你的连接仅依赖未加密私钥或本机 `ssh-agent`，可跳过本步骤。如需托管登录密码、加密私钥口令或 `sudo`/`su`/`doas` 提权密码：
 
-| 场景 | 命令示例 | 详细文档 |
-| --- | --- | --- |
-| 打开终端界面管理主机、查看监控和日志 | `xops tui` | [终端管理界面](./tui) |
-| 从 CSV 批量导入主机并打标签 | `xops host import hosts.csv --tag web` | [主机与身份](./hosts) |
-| 按标签对多台主机并行执行命令或脚本 | `xops exec --tag web -c 'uptime'` | [命令执行](./exec) |
-| 上传/下载文件或打开交互式 SFTP | `xops scp ./app.tar.gz web-01:~/tmp/` | [SFTP 与文件传输](./sftp) |
-| 使用 YAML 编排多步骤部署或启动 MCP 服务 | `xops play deploy.yaml` | [Playbook 与 MCP](./automation) |
+```bash
+# 交互式初始化默认离线 AEAD 凭据库（Argon2id + XChaCha20-Poly1305）
+xops creds init
 
-CLI 支持 `--lang zh` 和 `--lang en` 切换语言。文档跟随 `master` 分支更新，已安装版本的支持选项以 `xops <command> --help` 为准。
+# 查看状态与健康检查
+xops creds status
+xops doctor
+```
+
+详细凭据录入与多后端配置请参阅 [凭据路由与密钥管理](./credentials) 与 [离线加密凭据库](./offline-store)。
+
+## 5. 首次连接与常用工作流
+
+```bash
+# 1. 预览目标的最终连接计划（四层 OpenSSH 选项折叠结果）
+xops hosts resolve web-01
+
+# 2. 交互式 SSH 登录（兼容标准 OpenSSH 标志）
+xops ssh web-01
+xops ssh -J bastion -i ~/.ssh/id_ed25519 deploy@192.0.2.10
+
+# 3. 跨节点并发执行命令并流式输出
+xops exec --tags web --concurrency 4 --stream -- uptime
+
+# 4. 上传/下载文件与交互式 SFTP Shell
+xops scp ./app.tar.gz web-01:/tmp/app.tar.gz
+xops sftp web-01
+
+# 5. 打开 Bubble Tea v2 交互式终端工作台
+xops tui
+```
+
+## 6. 全局选项速览
+
+几乎所有命令均支持统一的前置或子命令级全局选项：
+
+- `--json`：在 `stdout` 输出规范确定性 JSON/v2（开启 `Deterministic(true)`）；报错时输出统一结构化错误信封。
+- `--policy <profile>`：指定本次运行的安全策略配置档：`direct_operator`（CLI 默认）、`strict` / `strict_operator`、`strict_agent`（MCP 默认）。
+- `-F <configfile>`（或 `--ssh-config <path>`）：覆写 OpenSSH 配置文件路径；传入 `none` 可禁用 OpenSSH 配置读取。
+- `-h` / `--help`、`xops help <command>`：查看任意命令精确帮助。
+
+## 下一步
+
+- [主机资产与配置导入](./hosts) — 深入了解 Host/Identity/Node 三实体图、Tarjan 跳板 DAG 校验与四层 OpenSSH 优先级。
+- [SSH、隧道与多路复用](./ssh) — 使用跳板机、端口转发、SOCKS5、TUN 与 ControlMaster 守护进程。
+- [Playbook v2、护栏与审计](./automation) — 编排声明式多节点部署与安全审批审计。
+- [MCP 服务与 HTTP 流式传输](./mcp-http) 或 [Agent Skill 概览](./agent-skill) — 将 XOps 接入 AI 助手。

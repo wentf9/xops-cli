@@ -1,106 +1,120 @@
-# 凭据存储
+# 凭据路由与密钥管理
 
-XOps 将登录密码、私钥解锁口令、`sudo`/`su` 提权密码、TOTP 动态口令密钥（`totp_secret`）以及键盘交互质询答案（`challenge_answer`）保存在专门的凭据库中，配置文件 `~/.xops/xops_config.yaml` 只记录凭据引用（Reference），不保存明文或旧版 `ENC:` 字段。
+XOps v2 在全链路贯彻**零明文配置与零明文 CLI 参数**原则：`~/.xops/config.yaml` 与导入文件只能存放 `<store>/<item>` 格式的凭据引用（`SecretRef`），真实机密全部由多后端 `RouterVault` 加密托管，并在单协程借用闭包（`SecretBox`）退出时自动 `clear()` 零化内存。
 
-新安装默认使用内置离线加密库（`encrypted-file`），开箱即用，无需预先安装桌面密钥环或外部工具。可用选项可通过 `xops credential --help` 查看。
+## 1. 支持的 4 类凭据后端
 
-## 默认保存行为
+在 `~/.xops/config.yaml` 的 `vault.stores` 中可按需声明多个命名存储槽位，并在 `vault.default_store` 中指定默认存储。若未显式配置 `vault.stores`，XOps 会自动装配默认的 `offline`（`offline_aead`）与 `os_keychain`（平台原生钥匙串），默认使用 `offline`。
 
-首次保存凭据时，XOps 会在配置文件同级目录自动创建加密库目录 `credentials/` 与密钥文件 `credentials.key`（默认位于 `~/.xops/`）。
-- **先验证后保存**：登录密码仅在 SSH 认证成功后保存；私钥口令必须成功解锁对应私钥后才会保存。
-- **保存策略控制**：配置项 `credential.remember_prompted` 控制交互式输入的凭据是否自动保存：
-
-| 值 | 行为 |
-| --- | --- |
-| `always`（默认） | 验证成功后自动保存 |
-| `ask` | 验证成功后询问是否保存 |
-| `never` | 仅用于当前连接，不自动保存 |
-
-连接时可通过 `--remember` 临时覆盖单次行为，不会修改全局配置：
-
-```bash
-xops ssh --remember never web-01
-xops tui --remember ask
-```
-
-`never` 仅禁止连接过程中的自动记住，不影响手动提交凭据表单或显式执行迁移。Schema v1 兼容期已结束，若仍在使用旧版配置，请先按[凭据迁移](./migration)显式升级为 v2。
-
-## 选择与检查存储
-
-| 后端类型 | 适用场景 | 前置要求 |
+| `kind` | 实现说明 | 适用场景 |
 | --- | --- | --- |
-| `encrypted-file` | 内置离线加密库（默认） | Linux、Windows 或 macOS（amd64 / arm64） |
-| `system` | 操作系统原生密钥库 | 系统密钥库可访问且已解锁 |
-| `pass` | 复用现有 `pass` 密码库 | 已安装 `pass`、`gpg` 并完成密码库初始化 |
-| `helper` | 接入外部自定义凭据服务 | 实现 XOps 凭据协议的外部可执行程序 |
-| `none` | 纯临时会话 | 不持久化任何凭据 |
+| `offline_aead` | 内置离线加密 dirfd 凭据库（Argon2id + XChaCha20-Poly1305 AEAD，详见[离线加密凭据库](./offline-store)） | 全平台零外部依赖、无桌面会话的服务器或容器环境 |
+| `os_keychain` | 平台原生系统钥匙串（纯 Go `CGO_ENABLED=0`）：<br>- **Windows**：Windows Credential Manager（`CREDENTIALW`）<br>- **macOS**：`Security.framework` Keychain（`purego`）<br>- **Linux**：FreeDesktop Secret Service D-Bus（`godbus`，支持 DH AES-128-CBC 与 `plain` 回退）<br>- 其他平台（如 FreeBSD）返回 `unsupported` | 桌面环境免重复输入主口令、交互与无人值守会话 |
+| `external_helper` | 通过 `stdin`/`stdout` JSON v2 协议对接外部凭据管理工具（如 `pass`、1Password CLI、Bitwarden 或企业 KMS 包装脚本） | 团队集中密钥库与自定义硬件/KMS 集成 |
+| `none` | 显式禁用槽位，所有读写均严格失败关闭返回 `unsupported` | 纯 `ssh-agent` / 无密码存储合规环境 |
 
-默认配置中，`file` 是存储实例名，`encrypted-file` 是后端类型（相对路径以配置文件所在目录为基准）：
+### 多后端配置示例（`~/.xops/config.yaml`）
 
 ```yaml
-credential:
-  default_store: file
-  remember_prompted: always
+version: 2
+vault:
+  default_store: offline
+  remember_prompted: ask # always | ask | never
   stores:
-    file:
-      type: encrypted-file
-      path: credentials
-      unlock: key-file
-      key_file: credentials.key
+    offline:
+      kind: offline_aead
+      path: ~/.xops/vault
+    keychain:
+      kind: os_keychain
+    corp_kms:
+      kind: external_helper
+      command: /usr/local/bin/xops-kms-helper
+      args: ["--profile", "prod"]
+      timeout: 15s
+    disabled_slot:
+      kind: none
 ```
 
-其他后端的完整写法可参考仓库中的 [`xops_config.example.yaml`](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml)。日常可用以下命令查看存储列表与健康状态：
+## 2. `xops creds` / `xops vault` 全生命周期命令
+
+命令主名为 `xops creds`（别名 `cred`、`vault`），全部支持 `--json` 与 `--policy`：
 
 ```bash
-xops credential store list
-xops credential doctor
+# 查看凭据库生命周期状态（Uninitialized / Locked / Unlocked）与已知存储列表
+xops creds status --json
+
+# 交互式初始化、解锁与锁定离线凭据库
+xops creds init
+xops creds unlock
+xops creds lock
+
+# 只读健康诊断（校验资产图中全部引用；加 --skip-probe 仅检查元数据不逐条探活）
+xops creds doctor
+xops creds doctor --skip-probe --json
+
+# 查询某条凭据在资产图中的全部引用位置（5 类位置：密码/私钥口令/提权密码/TOTP/质询规则）
+xops creds refs offline/web01-pass
+
+# 安全删除单条未被任何资产引用的凭据（仍被引用时拒绝删除并返回 still_referenced）
+xops creds delete offline/unused-item
+
+# 批量安全垃圾回收候选凭据（自动保留仍有引用的条目，报告 deleted / retained / missing）
+xops creds gc offline/cand-1 offline/cand-2 --json
 ```
 
-- **`credential doctor` 检查说明**：`doctor` 仅执行只读、非交互检查，不会自动初始化离线库、不会弹出解锁窗口，也不代表目录具备写入权限。对于尚无任何凭据引用、库和密钥文件均尚未创建且允许自动初始化的默认离线库，`doctor` 会显示 `WARN (not initialized)` 并正常退出（不报错、不创建文件）；但如果配置中已有凭据引用而库缺失、部分初始化或路径不安全，则会明确报告 `FAIL`。
-- **切换后端**：仅修改 `default_store` 不会搬迁已有凭据；更换存储后端请按[凭据迁移](./migration)操作。
+### 交互式录入与原子轮换（零明文 CLI 标志）
 
-### Linux 系统密钥库（`system`）
+XOps v2 彻底禁止在命令行参数中传递密码。录入与轮换全部通过交互式密码提示结合 `VaultSagaFSM` 状态机原子完成：
 
-在 Linux 上使用 `system` 后端需要安装 `secret-tool`（Ubuntu/Debian 包名为 `libsecret-tools`），且当前进程能够访问用户的 D-Bus 会话与 Secret Service。
-- 批处理（`exec`、`play`）和 MCP 不会弹出桌面解锁对话框；若密钥库处于锁定状态会返回 `locked`，需先在桌面会话中解锁。
-- 交互式删除节点/身份或运行 `xops credential gc` 时，XOps 会先请求解锁匹配的密钥环条目再执行清理。若取消解锁、仅解锁了部分密钥环或工具报告条目错误（即使退出码为 0；正常的 `attribute.*` stderr 元数据除外），XOps 会保留恢复日志，待全部解锁后再次运行 `xops credential gc` 即可完成清理。
+```bash
+# 1. 录入登录密码并原子创建/替换密码认证 Identity
+xops creds enroll-password --id id-app --user app --store offline --desc "App login" --tag prod
+# 或指定精确引用名并覆盖既有 Identity：
+xops creds enroll-password --id id-app --user app --ref offline/app-login --replace
 
-## 认证重试与临时输入
+# 2. 录入加密私钥口令：读取本地私钥校验解密、自动计算并绑定 key_fingerprint（INV-F1）
+xops creds enroll-key --id id-deploy --user deploy --key-path ~/.ssh/id_ed25519 --store offline
+# 可选附加 SSH 证书与期望指纹校验：
+xops creds enroll-key --id id-deploy --user deploy \
+  --key-path ~/.ssh/id_ed25519 --cert-path ~/.ssh/id_ed25519-cert.pub \
+  --fingerprint SHA256:... --store offline --replace
 
-- **密码与口令重试**：交互式连接中，若服务器拒绝密码或私钥口令错误，最多可重新输入 3 次（若私钥文件本身损坏，请先修复或更换私钥）。
-- **凭据库故障时的临时输入**：当凭据库锁定、不可用、损坏或某条记录无法读取时，交互式命令允许临时输入密码继续连接，但**不会**用临时输入覆盖无法读取的记录，也不会自动替换损坏的库或生成新密钥。MCP 与批处理等非交互模式会直接报错。
-- **保存失败不中断连接**：若 SSH 认证已成功但写入凭据库失败，本次连接仍可正常使用，请按提示排查目录或配置权限（下次连接可能需重新输入）。
+# 3. 为指定节点绑定 sudo/su/doas 提权密码引用
+xops creds set-node-privilege --node web-01 --store offline
 
-## 提权密码（`sudo` / `su`）
+# 4. 原子轮换旧凭据：写入新凭据并校验 -> 全图替换全部 5 类引用位置 -> 删除旧凭据
+xops creds rotate offline/old-pass --store offline
+xops creds rotate offline/old-pass --new-ref keychain/new-pass --expected-revision <rev>
+```
 
-SSH 登录密码与 `sudo`/`su` 提权密码独立验证、分开存储：
-- 免密 `sudo` 或尚在有效期内的 `sudo` 授权缓存不会请求密码。
-- 提权密码一旦通过握手验证，即使后续用户命令返回非零退出码，该提权密码仍会按策略保存，同时命令正常返回失败状态。
-- 提权密码同样最多尝试 3 次；一旦用户命令可能已经开始执行，绝不会为了重试认证而重复运行命令。交互式提权要求远端具备受支持的 Shell 与 `stty`。
+## 3. VaultSagaFSM 与 `UncertainDurability` 安全准则
 
-## TOTP 与质询答案凭据
+凭据录入与轮换是典型的跨存储多步事务（先写 Vault 并回读校验，再 CAS 提交 `config.yaml`，最后清理旧凭据）。XOps v2 使用纯函数 `VaultSagaFSM` 严格分类异常状态：
 
-针对开启多因素认证（2FA/MFA）的主机，XOps 支持在安全凭据库中托管 TOTP 共享密钥与静态安全质询答案：
-- **TOTP 密钥（`totp_secret`）**：保存 Base32 编码的 TOTP 密钥，由内置算法自动生成当前动态口令。
-- **质询答案（`challenge_answer`）**：保存与指定质询规则（`rule`）关联的静态回答文本。
-- **命令行录入**：可通过 `xops cred set <节点或身份>`（或 `xops host set-secret` / `xops id set`）配合类型标志（`--password`、`--passphrase`、`--totp`、`--sudo`、`--challenge <rule>`）与终端交互提示或 `--password-stdin` 安全录入，避免明文落盘或暴露于命令行参数中：
-  ```bash
-  # 直接为节点或身份录入登录密码 / 提权密码 / TOTP 密钥 / 质询答案
-  xops cred set web-01 --password
-  xops cred set web-01 --sudo
-  xops cred set my-id --totp --password-stdin
-  xops cred set my-id --challenge security_question --password-stdin
-  ```
+- **可确认未落盘（`NotApplied`）**：自动触发补偿清理新建的未引用密文（`compensated: true`），保持原配置完好。
+- **已生效但持久性不确定（`Applied && !Durable` → `uncertain_durability: true`、`do_not_retry: true`）**：例如磁盘 `Rename` 成功但目录 `Sync` 报错。此时系统**严禁重试也严禁删除旧凭据或新凭据**，并在输出中明确提示人工核对磁盘状态与运行 `xops creds doctor`。
 
-## 备份与恢复
+## 4. 外部凭据助手协议（`external_helper`）
 
-备份时请同时保存：**配置文件**、**整个凭据库目录**以及**对应的解锁密钥文件**，并将密钥文件与凭据库分开存放。仅备份配置文件无法找回密码；已有凭据库的密钥一旦丢失，读取、检查或解锁均不会生成替代密钥，必须从备份恢复原密钥。
+当配置 `kind: external_helper` 时，XOps 通过子进程 `stdin`/`stdout` 与外部助手交换精简 JSON v2 报文（明文仅经 `stdin` 管道传递，绝不出现在进程命令行或环境变量中，响应大小与超时均受硬上限保护）：
 
-主口令模式、密钥轮换与跨目录恢复步骤见[离线凭据库](./offline-store)。
+**请求（XOps → 助手 `stdin`）**：
 
-## 已移除的明文参数
+```json
+{"protocol_version":2,"non_interactive":true,"action":"get","store":"corp_kms","item":"web-pass"}
+```
 
-为防止密码留在进程列表或 Shell 历史中，`ssh`、`sftp`、`scp`、`exec`、`host`、`identity` 等命令均已移除携带明文值的 `--password <secret>`、`--passphrase <secret>`、`--suPwd <secret>` 参数（`xops cred set` / `delete` 及对应别名命令上的无值布尔类型选择标志 `--password` / `--passphrase` 仍保留，仅用于指定凭据种类，秘密本身只能通过终端交互或 `--password-stdin` / `--passphrase-stdin` 传入）：
-- **SSH / SFTP / SCP / exec**：使用安全交互提示、已保存凭据，或通过受控管道传入 `--password-stdin` / `--passphrase-stdin`。
-- **主机与身份管理（`host` / `identity`）**：使用 `--password-stdin`、`--passphrase-stdin` 或 `xops identity credential set`，详见[主机与身份管理](./hosts#已删除的凭据参数)。
-- **参数边界**：`ssh` 和 `exec` 会拒绝远端命令之前的未知参数；远端命令名或显式 `--` 分隔符之后的参数则原样传给远端。
+```json
+{"protocol_version":2,"non_interactive":true,"action":"store","store":"corp_kms","item":"web-pass","secret_b64":"<base64>"}
+```
+
+```json
+{"protocol_version":2,"non_interactive":true,"action":"erase","store":"corp_kms","item":"web-pass"}
+```
+
+**响应（助手 `stdout` → XOps，严格拒绝未知字段）**：
+
+- `get` 成功：`{"secret_b64":"<base64>"}`
+- `store` / `erase` 成功：`{"code":"ok"}`（或退出码 0 且空输出）
+- 错误码映射：`not_found`、`locked`、`denied`、`unavailable`、`invalid`（XOps 仅映射受控错误码，**绝不回显助手原始非受控诊断文本**，防止凭据反射泄露）。
+- 每次 `store` 后，XOps 会自动执行 `get` 回读并以常量时间 `SecretBox.Equal` 校验写入完整性。

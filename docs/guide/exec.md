@@ -1,125 +1,109 @@
-# 命令执行
+# 命令执行与批量并发
 
-`xops exec` 用于在单台或多台远程主机上执行命令、分发运行本地脚本，或分配交互式终端（PTY）。
+`xops exec` 统一处理单目标远端命令、单目标受控提权（`sudo`/`su`/`doas`）以及多节点并发批量执行，并在全部路径上严格落实启动配置校验与三态执行结果追踪。
 
-## 快速上手
-
-```bash
-# 单台主机执行命令
-xops exec web-01 uptime
-
-# 按标签对多台主机并行执行命令
-xops exec --tag web -c 'uptime'
-
-# 按标签并行分发并执行本地脚本（设置并发数为 5）
-xops exec --tag web --shell ./check.sh --task 5
-
-# 执行本地脚本并传递参数（通过 -- 分隔传递）
-xops exec --tag web --shell ./check.sh -- --env prod "arg 2"
-
-# 排除特定节点
-xops exec --tag web --exclude web-maintenance-01 -c 'df -h'
-```
-
-**目标与参数规则**：
-- `--host`、`--ifile`/`-I`（主机列表文件）、`--tag` 三种目标选择方式互斥；指定其中之一后，第一个位置参数即可作为远程命令（如 `xops exec --host web-01 uname -a`），或用 `-c` 显式传入命令字符串。
-- 支持 POSIX 风格的 `--` 参数分隔：
-  - 普通命令模式（未指定 `--shell`）：`--` 后面的内容原样传递给远程命令（如 `xops exec --host web-01 -- echo --help`），效果与 `-c` 一致，避免命令自身参数被误解析为本地选项。
-  - 脚本执行模式（指定 `--shell`）：仅允许通过 `--` 显式分隔向本地脚本传递位置参数（如 `xops exec --host web-01 --shell ./script.sh -- arg1 "arg 2"`），脚本通过 `$1`、`$2`（Fish 下为 `$argv`）安全接收并完整保留空格与特殊字符；`--` 之前的位置参数仅在未指定 `--host`/`--tag`/`--ifile` 时用于解析目标主机，多余位置参数会报错。
-- 全局参数可放在子命令前后（如 `xops --color never exec --host web-01 uname -a`）。
-- **批处理凭据**：批处理不会弹出凭据库解锁对话框；运行前请先解锁所需的凭据库。
-- **脚本来源**：`--shell` 需指定普通文件；管道脚本请通过标准输入传入，且不能同时使用 `--password-stdin` 或 `--passphrase-stdin` 提供凭据。
-- **显式解释器模式的限额**：普通命令最长 64 KiB，脚本最长 16 MiB，非交互执行默认时限为 5 分钟。默认结果保留最后 5 MiB 输出，超出时会提示截断；使用 `--stream` 实时显示或 `--out-dir` 保存日志时不受此结果保留限制。部分 Shell 还可能有更严格的命令长度限制。
-
-
-## 解释器选择与跨平台执行
-
-### 1. 默认模式：原生直通（`server`）
-
-未指定 `--interpreter` 且节点未配置 `execution` 时，默认使用 `server` 模式：
-- 使用远端默认 Shell 执行命令，不会自动改用 Bash。
-- 远端无需预装 Bash，可直接用于 Alpine Linux（`ash`/`sh`）、Windows OpenSSH（默认 CMD 或 PowerShell）及网络设备。
-- `server` 模式不接受 `--login-shell` 参数。
-
-### 2. 指定解释器与启动方言
-
-当命令依赖特定 Shell 语法、登录环境变量或跨平台脚本转义时，可通过 `--interpreter` 和 `--launch-dialect` 指定：
+## 1. 单目标命令执行
 
 ```bash
-# 使用 Bash 并加载登录环境
-xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell -c 'echo $PATH'
+# 基本用法（支持 -- 分隔远端命令中的 -flag）
+xops exec web-01 -- uname -a
+xops exec -p 2222 -l deploy -J bastion 192.0.2.10 -- df -h
 
-# 使用 Bash 或 sh，不加载登录环境
-xops exec --host linux-01 --interpreter bash --launch-dialect posix --login-shell=false -c 'echo $VAR'
-xops exec --host alpine-01 --interpreter sh --launch-dialect posix -c 'id'
+# 设置工作目录、环境变量、超时与最大捕获字节数
+xops exec --workdir /srv/app --env APP_ENV=prod --timeout 30s --max-output-bytes 1048576 web-01 -- ./healthcheck.sh
 
-# 默认 Shell 为 zsh 或 fish 的节点
-xops exec --host zsh-01 --interpreter zsh --launch-dialect posix -c 'print -r -- $ZSH_VERSION'
-xops exec --host fish-01 --interpreter fish --launch-dialect fish -c 'set greeting hello; echo $greeting'
+# 强制分配 PTY（-t / -tt）或禁用 PTY（-T）
+xops exec -t web-01 -- top -b -n 1
 
-# Windows 节点：远端 SSH 默认 Shell 为 CMD 时
-xops exec --host win-01 --interpreter powershell --launch-dialect cmd -c 'Get-Process | Select-Object -First 5'
-xops exec --host win-01 --interpreter cmd --launch-dialect cmd -c 'dir'
+# 规范 JSON/v2 输出（含 exit_code、outcome_kind、stdout、stderr、do_not_retry）
+xops exec --json web-01 -- hostname
 ```
 
-`--launch-dialect` 应与远端 SSH 默认 Shell 一致；例如默认 Shell 是 PowerShell 时使用 `powershell`。
+> 默认最大捕获输出上限为 **4 MiB**（可配置上限 **64 MiB**），单条命令文本上限 **1 MiB**。超过上限时返回结果中会显式标记 `truncated: true`。
 
-| 解释器 (`--interpreter`) | 适用启动方言 (`--launch-dialect`) | 使用说明 |
-| --- | --- | --- |
-| `server`（默认） | `unknown`（或缺省） | 使用远端默认 Shell，不接受 `--login-shell`；运行本地脚本时需选择具体解释器 |
-| `bash` | `posix`、`fish` | 用 `--login-shell` 加载登录环境；用 `--no-login` 或 `--login-shell=false` 跳过 |
-| `sh` | `posix`、`fish` | 不加载登录环境，不支持登录模式 |
-| `zsh` | `posix`、`fish` | 支持登录环境、脚本及 `sudo`/`su` |
-| `fish` | `posix`、`fish` | 支持登录环境、脚本及 `sudo`/`su` |
-| `powershell` / `pwsh` | `cmd`、`powershell`（`pwsh` 另支持 `posix`/`fish`） | 不加载用户配置文件，保留命令退出码 |
-| `cmd` | `cmd` | 受 CMD 的 8191 字符长度限制；命令中暂不支持 `%`、`!`、换行或未配对的双引号 |
+## 2. 受控提权执行（单目标）
 
-解释器参数可与 `--shell`、`--sudo`、`--stream` 或 `--out-dir` 组合：
+单目标 `xops exec` 支持 `--sudo`、`--su` 与 `--doas` 三种提权方式：
 
 ```bash
-# 指定 sh 执行本地脚本，提权并将各主机日志保存到 logs
-xops exec --tag web --interpreter sh --launch-dialect posix --sudo --shell check.sh --out-dir logs
+# 使用 Vault 中的提权密码引用（推荐，支持无人值守）
+xops exec --sudo --password-ref offline/web01-sudo web-01 -- systemctl status nginx
 
-# 使用 Bash 批量执行并实时显示输出
-xops exec --tag web --interpreter bash --launch-dialect posix --stream -c 'uptime'
+# 指定目标提权用户（默认 root）
+xops exec --sudo --privilege-user postgres --password-ref offline/web01-sudo web-01 -- id
 
-# 使用远端默认 Shell，将输出保存到日志
-xops exec --host web-01 --interpreter server --out-dir logs -c 'df -h'
+# 交互式输入提权口令（零明文 CLI 标志）
+xops exec --sudo --prompt-password web-01 -- cat /etc/shadow
+xops exec --su --prompt-password web-01 -- id
+xops exec --doas --prompt-password web-01 -- id
 ```
 
-脚本和 Unix 提权支持 `bash`、`sh`、`zsh`、`fish`，不支持 `server`、`powershell`、`pwsh` 或 `cmd`。`--stream` 与 `--out-dir` 仍互斥；交互模式的限制见下文。
+- 如果目标节点已在配置中绑定 `privilege_password_ref`（可通过 `xops creds set-node-privilege --node <id> --store <store>` 设置），未传 `--password-ref` 时会自动解析使用该节点引用。
+- **批量模式限制**：`xops exec` 批量模式禁止直接使用 `--sudo`/`--su`/`--doas` 交互提权；跨多机执行运维编排请使用 [Playbook v2](./automation) 或逐节点调用。
 
-若不想每次在命令行传入解释器参数，可在 `~/.xops/xops_config.yaml` 的节点配置中保存 `execution`（`host add`/`import` 默认也会自动探测保存），详见[主机与身份](./hosts#节点执行环境配置-execution)。显式 `--no-login`（含 `--no-login=false`）保留选择 Bash 的兼容语义。
+## 3. 多节点并发批量执行
 
-## 交互式终端与 PTY（`-x`）
-
-需要对单台主机运行全屏程序（如 `top`、`htop`、`vim`）或交互式提权命令时，添加 `-x` / `--interactive` 分配伪终端（PTY）：
+指定 `--all`、`--nodes`、`--tags` 或多个 `--target` 时，`xops exec` 自动进入多节点并发批量模式：
 
 ```bash
-# 运行交互式终端程序
-xops exec -x web-01 top
+# 按标签并发执行并排除维护节点
+xops exec --tags web --exclude-nodes web-maint-01 --concurrency 5 -- uptime
 
-# 交互式提权执行单条命令
-xops exec -x --sudo web-01 ls -la /root
+# 按节点 ID 列表执行，开启实时带前缀流式输出（--stream）与快速失败（--fail-fast）
+xops exec --nodes web-01,web-02,web-03 --concurrency 3 --stream --fail-fast -- df -h
 
-# 指定解释器，将交互命令的输出保存到文件（输入仍来自终端）
-xops exec --host web-01 -x --interpreter bash --launch-dialect posix -c 'uptime' >output.log 2>error.log
+# 对全部托管节点执行（排除 canary 标签），并将每节点日志写入沙箱目录（ScopedRootFS）
+xops exec --all --exclude-tags canary --out-dir ./batch-logs --timeout 1m -- uname -r
+
+# 显式传入多个任意目标规格
+xops exec --target web-01 --target deploy@192.0.2.20 --json -- hostname
 ```
 
-- **单主机专用**：`-x` 仅支持单台目标主机，不能与多主机批量执行、本地脚本（`--shell`）、`--stream` 或 `--out-dir` 组合。
-- **输出与退出码**：输出默认显示在终端，也可用 `>output.log`、`2>error.log` 或 `>output.log 2>&1` 保存到文件，包括显式指定解释器时。不受上述 5 MiB 结果保留限制，并保留远端命令的非零退出码与信号状态。输入仍须来自本地终端；终端程序的日志可能包含颜色或光标控制字符，且远端标准输出和错误输出不一定分开。
-- **中断操作**：可按 `Ctrl+C` 中断。保存日志时若磁盘或文件系统无响应，中断可能需要等待；命令返回后不会继续写入日志。连接断开后，先确认远端执行结果，再决定是否重试；不要直接重复可能修改数据的命令。
+### 批量选择器与运行时标志
 
-## 引号与变量展开建议
+| 标志 | 说明 |
+| --- | --- |
+| `--all` | 选中资产库中全部托管节点 |
+| `--nodes <id,...>` | 按节点 ID 选择（逗号分隔，可重复） |
+| `--tags <tag,...>` | 按标签选择（逗号分隔，可重复） |
+| `--target <spec,...>` | 显式目标规格（可重复；指定多个时自动进入批量模式） |
+| `--exclude-nodes <id,...>` | 批量模式下排除指定节点 ID |
+| `--exclude-tags <tag,...>` | 批量模式下排除带指定标签的节点 |
+| `--concurrency <n>` | 最大并发节点数 |
+| `--fail-fast` | 首个节点失败后立即取消其余待执行节点 |
+| `--stream` | 实时将各节点输出按节点前缀流式打印 |
+| `--out-dir <dir>` | 通过 `ScopedRootFS` 将每节点 stdout/stderr 落盘到指定目录 |
 
-命令中包含空格、管道或环境变量时，建议使用 `-c` 并根据需求选择单双引号：
+## 4. 启动配置矩阵（`LaunchProfile`）
+
+默认情况下，`xops exec` 使用 **`interpreter: server` + `login: inherit`** 直通模式，直接将命令载荷原样发给远端 SSH 默认 Shell，**不假设远端预装 Bash**（Alpine、macOS zsh、Windows OpenSSH 均可直接工作）。
+
+当需要显式指定解释器、登录模式或跨平台方言引用时，可使用 `--dialect`、`--interpreter`、`--login`：
+
+- `--dialect`：`posix` | `powershell` | `cmd` | `raw`
+- `--interpreter`：`server` | `sh` | `bash` | `zsh` | `powershell` | `pwsh` | `cmd`
+- `--login`：`disabled` | `login` | `inherit`
 
 ```bash
-# 单引号：保护 $HOME 不在本地展开，交由远端 Shell 解析
-xops exec web-01 -c 'printf "%s\n" "$HOME"'
+# 显式使用 POSIX bash（非登录 / 登录模式）
+xops exec --dialect posix --interpreter bash --login disabled web-01 -- 'echo "$PATH"'
+xops exec --dialect posix --interpreter bash --login login web-01 -- 'env'
 
-# 双引号：先在本地展开 $USER，再把结果传给远端
-xops exec web-01 -c "echo Current User is $USER"
+# 在 Windows OpenSSH 节点上显式调用 PowerShell / pwsh / cmd
+xops exec --dialect powershell --interpreter pwsh win-01 -- 'Get-Service | Select-Object -First 5'
+xops exec --dialect cmd --interpreter cmd win-01 -- 'ver'
 ```
 
-在本地 Windows（PowerShell 或 CMD）终端下调用时，请注意本地 Shell 的引号转义差异；多行或复杂逻辑建议写成脚本文件并通过 `--shell` 执行。完整参数列表见 [`xops exec` 命令参考](../reference/commands/xops-exec)。
+> 若仅提供其中部分参数，CLI 会依据兼容性矩阵自动推导其余默认值（如仅传 `--interpreter bash` 自动补全 `dialect=posix, login=disabled`）；对不合法组合（如 `sh` + `login=login` 或 `raw` + 非 `server`）立即返回退出码 `2`（`usage_error`）。
+
+## 5. 三态执行结果与退出码规范
+
+XOps v2 在领域核将所有远端执行结果建模为封闭三态和类型 `ExecutionOutcome`，绝不把不确定故障静默归类为失败或成功：
+
+| `outcome_kind` | 含义 | 可否自动重试 | 退出码 / `do_not_retry` |
+| --- | --- | :---: | --- |
+| `completed` | 远端进程已结束并回报明确退出状态（退出码或 POSIX 信号） | 视业务幂等性 | 进程退出码（规范化至 `0..255`）或 `128 + signal`；若终态审计写失败则强制非零 |
+| `not_started` | 在建连、认证、护栏拒绝或启动前失败，远端命令**确定未开始** | **是** | `255`（`ExitSSHError`） |
+| `unknown` | 命令已启动但中途断连、超时或未收到退出状态，**无法确定远端是否已生效** | **严禁自动重试** | `255`，JSON 中强制置位 `"do_not_retry": true` |
+
+> **安全铁律**：收到 `outcome_unknown`（或 `do_not_retry: true`）后，切勿盲目重放写操作或变更命令；请先通过只读命令或 `xops audit tail` 确认远端实际状态。

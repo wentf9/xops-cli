@@ -1,74 +1,63 @@
-# Agent Skill and capability overview
+# Agent Skill and AI Overview
 
-`xops-agent` teaches Skill-capable AI assistants (such as Claude Code, Codex, and Cursor) how to operate XOps CLI. After reading the skill instructions, the assistant runs `xops` commands directly in its own command environment and inspects the results.
+XOps v2 provides two complementary ways to connect AI assistants to remote servers with clear security boundaries:
 
-Skill and MCP are independent workflows—using the Skill does not require running `xops mcp serve` or registering MCP tools.
+1. **Built-in MCP Server (`xops mcp serve`)**: Designed for native MCP clients (Claude Desktop, Cursor, Codex, Antigravity). Exposes **7 strongly-typed discriminated tools**, defaults to the **`strict_agent`** circuit-breaking profile, and physically enforces **zero `OperatorReadFS`** (`ScopedRootFS`-only sandboxing).
+2. **`xops-agent` Agent Skill**: Designed for CLI-capable coding and operations agents. Teaches the assistant how to invoke `xops` commands directly with canonical `--json`, `--policy`, and fail-closed safety practices.
 
-## Quick installation and usage
+## 1. MCP Server vs. Agent Skill
 
-First [install XOps](./getting-started) in the assistant's command environment and prepare SSH configuration, trusted host keys, and accessible credentials. Then install the Skill:
+| Aspect | Built-in MCP Server (`xops mcp`) | `xops-agent` Skill (Direct CLI) |
+| --- | --- | --- |
+| Prerequisite | Run `xops mcp serve` (`stdio` or Streamable HTTP) | Only the `xops` binary and local config are needed |
+| Default policy profile | `strict_agent` (risk guardrails + irreversible `Halted` circuit break on audit post-write failure) | CLI defaults to `direct_operator`; AI workflows can enforce `--policy strict_agent` or `--policy strict` |
+| Local FS isolation | **Physically disables `OperatorReadFS`**; only `ScopedRootFS` (`--transfer-root` / `--artifact-root`) is accessible | Runs with the CLI process's file permissions (downloads and recursive uploads remain `ScopedRootFS`-sandboxed) |
+| Private-key auth | Because `OperatorReadFS == nil`, `AuthPrivateKey` identities require keys preloaded in **`ssh-agent`** (or `kind: agent` / unlocked Vault) | Can read local private keys directly or use `ssh-agent` / Vault |
+| Long-lived sessions | Managed handles for persistent PTY (`terminal_session`), 10 GiB WAL streaming (`transfer`), tunnels/mux (`tunnel`), and GUI (`gui`) | One-shot `exec`/`scp`/`sftp`/`playbook` plus process-owned `tunnel`/`mux` |
+| Audit log | Synchronous `~/.xops/audit.jsonl` + O(1) startup crash reconciliation | Same capability-gated synchronous `~/.xops/audit.jsonl` logging |
+
+## 2. Install the `xops-agent` Skill
+
+### Option A: Using the `skills` CLI
 
 ```bash
 npx skills add https://github.com/wentf9/xops-cli --skill xops-agent
 ```
 
-For manual installation, copy the complete [`skills/xops-agent/`](https://github.com/wentf9/xops-cli/tree/master/skills/xops-agent) directory into your client's skill directory, keeping `SKILL.md` and `references/` intact (updating files in this repository checkout does not automatically update copies installed elsewhere).
+### Option B: From a Source Checkout
 
-Once installed, you can ask the assistant to handle tasks in plain language:
-- “Use xops-agent to check disk usage on all hosts tagged `web` and list any failed nodes.”
-- “Read `web-01`'s application config, change the port, and verify the updated file.”
-- “Distribute the local `assets` directory to hosts tagged `web` without overwriting existing files.”
-- “Forward remote port 3000 through `web-01`, verify the web page, then close the tunnel.”
-- “Turn these deployment steps into a Playbook and preview targets and step order with `--dry-run` first.”
+```bash
+make install-skill
+```
 
-**On-demand reference files inside the Skill**:
+This copies `skills/xops-agent/` into `~/.gemini/skills/xops-agent/`.
 
-| File | Contents |
-| --- | --- |
-| `references/inventory.md` | Hosts, identities, tags, credentials, and offline-store maintenance |
-| `references/execution.md` | Single-host/batch commands, scripts, Playbooks, and interactive terminals |
-| `references/files.md` | Reading/writing files, directory operations, SCP/SFTP, and transfer verification |
-| `references/networking.md` | Tunnel process management and network connectivity |
+### Option C: Manual Installation
 
-## CLI capability overview
+Copy the complete `skills/xops-agent/` directory (keeping `SKILL.md` and all 4 files under `references/`) into your agent's skills directory:
 
-| Area | CLI entry points | Typical Skill workflow |
-| --- | --- | --- |
-| Initialization & OpenSSH import | `init` | Check existing config; initialize or import `~/.ssh/config` when needed |
-| Hosts, identities, aliases & tags | `host`, `identity` | Query nodes, bulk-import CSV, add/edit/delete records, and manage tags |
-| Credentials & offline vaults | `credential`, `identity credential` | Check store health, configure credentials, and run requested migrations, rotations, recovery, or cleanup |
-| SSH connections & elevation | `ssh`, `exec --sudo` | Select identity, port, and ProxyJump; allocate a terminal or escalate via `sudo`/`su` |
-| Single-host & batch commands | `exec` | Select targets by host, tag, or host file, bound concurrency, and inspect per-host output |
-| File reading, writing & directories | `exec`, batch `sftp` | Read bounded content, write/append, list, create, copy, move, and remove |
-| File & directory transfers | `scp`, `sftp` | Upload, download, relay between hosts, distribute by tag, set overwrite policy, and verify |
-| SSH tunnels & proxies | `ssh -L/-R/-D -N` | Track tunnel processes/sessions, verify listeners and target services, stop, and confirm release |
-| Declarative orchestration | `play` | Combine `shell`, `script`, `copy`, `ensure`, and `template` steps; preview with `--dry-run` before running |
-| Interactive terminal UI | `tui` | Visual terminal management, SSH sessions, and real-time monitoring |
-| Service administration & discovery | `mcp serve/recover`, `version`, `help`, `completion` | Manage MCP services when explicitly requested or inspect CLI help |
+```text
+skills/xops-agent/
+├── SKILL.md
+└── references/
+    ├── inventory.md   # Inventory graph, config import, vault, and doctor
+    ├── execution.md   # Single/batch exec, escalation, LaunchProfile, Playbook v2, audit
+    ├── files.md       # Parallel resumable scp, single-shot atomic sftp, SFTP shell
+    └── networking.md  # ssh -L/-R/-D/-w/-W, tunnel, and ControlMaster mux
+```
 
-> Note: `host import --template` exports a blank CSV template rather than your existing inventory. See the [command reference](../reference/) and `xops <command> --help` for full options.
+## 3. Safety Rules Enforced by `xops-agent`
 
-## Execution semantics and operational boundaries
+The v2 skill aligns AI agents with XOps v2's fail-closed contracts:
 
-- **Native passthrough default (`server`)**: Ordinary commands are sent directly to the remote SSH shell without an implicit `bash -l -c` wrapper. Write command syntax for the target's actual shell (Windows hosts no longer require Bash just for default commands).
-- **Explicit interpreters and inheritance**: Global config, nodes, Playbook `settings.execution`, and steps all accept `execution`. Explicit `bash`, `sh`, `zsh`, `fish`, `powershell`, `pwsh`, or `cmd` adapters require a compatible `launch_dialect` describing the **remote outer shell** (not the assistant's local OS). `--no-login` retains its non-login Bash compatibility meaning.
-- **Scripts and on-demand probing**: Local scripts require a supported interpreter and known launch dialect (allowlisted `sh`/`bash`/`zsh`/`fish` shebangs select the interpreter but do not prove a POSIX outer dialect; scripts without a reliable interpreter or with a UTF-8 BOM fail before execution). Playbook `script`/`ensure` steps without a shebang and SFTP `exec` with a nonempty `cwd` probe unspecified execution settings on demand and cache the result per connection; explicit interpreters (including `server`) are never overridden (saved `server/cmd` derives a temporary CMD adapter for SFTP `cwd`, while other explicit `server` settings reject a nonempty `cwd`).
-- **Entry-point combinations & flags**: Explicit CLI execution flags on `exec` (`--interpreter`, `--launch-dialect`, `--login-shell`) combine with `--shell` (scripts), `--sudo`, `--stream`, and `--out-dir` (scripts and elevation support `bash`/`sh`/`zsh`/`fish`); explicit execution flags on `ssh` are supported across Linux, macOS, and Windows by validating host I/O capabilities. `host add` and `host import` support `--interpreter`, `--launch-dialect`, and `--probe`/`--no-probe` during enrollment.
-- **Local environment & paths**: Local file paths and listener ports belong to **the machine running `xops`** (a container or remote sandbox is not the user's desktop). Interactive and batch SFTP both parse single/double quotes and backslash escapes—paths with spaces can be enclosed in quotes or backslash-escaped.
+1. **Prefer canonical `--json`**: Parse deterministic JSON/v2 responses, `error_code`, `do_not_retry`, and `approval_challenge` payloads instead of scraping human text.
+2. **Use explicit policy profiles**: Pass `--policy strict_agent` or `--policy strict` whenever guardrail enforcement or human approval gates are required.
+3. **Zero plaintext secrets**: Never pass passwords on CLI arguments or in YAML/CSV; manage secrets exclusively via `xops creds` and `<store>/<item>` references.
+4. **Never blindly retry uncertain outcomes**: When `outcome_unknown` (`do_not_retry: true`) or `uncertain_durability` (`Applied && !Durable`) occurs, inspect remote or local state before taking any corrective action, and never delete credentials prematurely.
+5. **Respect `engine_halted`**: Stop immediately on `engine_halted`, diagnose audit storage/permissions, and inspect via `xops audit reconcile` and `xops audit tail`.
 
-## Mapping MCP tools to CLI commands
+## Related Documentation
 
-When operating through the Skill, the assistant runs the CLI commands in the right column directly:
-
-| MCP tool | Equivalent CLI workflow |
-| --- | --- |
-| `nodes` | `xops host list` (optionally with `--tag`) |
-| `terminal` (`session: "once"`) | `xops exec --host NODE -c COMMAND` (optionally with `--sudo`); directory operations also use target-native commands via `exec` |
-| `terminal` (named persistent session) | No direct equivalent; each CLI `exec` is independent, use the interactive `xops ssh` terminal when needed |
-| `file` (`read`/`write`/`patch`/`stat`) | Target-native read/write commands via `exec`, or batch `sftp`; use `scp` for large or binary files |
-| `gui` | No CLI equivalent |
-| Stdio `transfer` (`push`/`pull`) | Upload/download files and directories with `xops scp` or batch `sftp` |
-| HTTP `transfer` (`prepare_push`/`prepare_pull`/`status`/`cancel`) | Transfer directly with `xops scp`, check the exit status and destination file, and cancel by stopping the owned process |
-| Stdio `tunnel` (`create`/`list`/`status`/`stop`) | `xops ssh -L/-R -N` (CLI also supports `-D` SOCKS5; manage lifecycle via the owned process/session) |
-
-> **Lifecycle and authorization differences**: The CLI does not create MCP transfer IDs, tunnel IDs, or TTLs, and there is no `xops tunnel list` command; killing a transfer process does not roll back bytes already written. Skill-driven CLI commands follow the assistant's own command-execution authorization—clarify targets, overwrite scope, or network exposure first whenever they are ambiguous.
+- [MCP Server and HTTP Streaming](./mcp-http)
+- [MCP 7-Tool Protocol Reference](../reference/mcp)
+- [CLI Command Reference](../reference/)

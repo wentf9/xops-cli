@@ -1,155 +1,101 @@
-# SFTP 与文件传输
+# SFTP 与 SCP 文件传输
 
-XOps 提供交互式 SFTP 终端（`xops sftp`）和命令行文件分发工具（`xops scp`）。
+XOps v2 的文件与传输体系区分**本地 `os.Root` 强沙箱原子语义**与**远端 SFTP v3 协议语义**，提供并行分片可续传 `xops scp`、15 个脚本友好单步 `xops sftp` 子命令以及交互式 SFTP Shell。
 
-## 快速上手
+## 1. 并行可续传文件传输（`xops scp`）
 
-### 1. 使用 SCP 上传、下载与批量分发
-
-```bash
-# 上传文件或目录到远端用户家目录
-xops scp ./test.tar 'web-01:~/tmp/'
-
-# 从远端下载到本地
-xops scp 'web-01:~/tmp/test.tar' ../
-
-# 在两台远端主机之间直接中转文件（经由本机转发）
-xops scp 'web-01:~/config.conf' 'web-02:~/config.conf'
-
-# 用 --host 上传到单台或多台主机
-xops scp --host web-01 ./config.conf ./
-xops scp --host web-01,web-02 ./config.conf /etc/app/
-
-# 按标签批量分发到多台服务器（含 ~ 的远端路径请加引号，避免被本地 Shell 展开）
-xops scp --tag web ./config.conf '~/tmp/'
-```
-
-基本格式为 `xops scp [选项] <源路径> <目标路径>`，源路径和目标路径都必须提供：
-
-- **单机与跨机传输**：不带 `--host`、`--tag`、`-I/--ifile` 时，源和目标都支持 `[[user@]host:]file` 写法（冒号前可填节点名、别名或主机地址）。本地到远端为上传，远端到本地为下载，两端都是远端时经由本机中转（不支持两端都是本地路径）。
-- **指定端口与特殊路径**：
-  - 与系统 `scp(1)` 一致，用 `-P 122`（或 `--port 122`）指定 SSH 端口，支持 `-c`/`--cipher` 指定加密套件，用户名通过 `user@host:` 或 `-o User=...` 指定（不提供 `-l` 与 `-p`）。
-  - 地址冒号后面的内容全部作为文件路径，不支持 `host:端口:文件` 写法——例如 `user@host:22:file` 表示远端文件名为 `22:file`。IPv6 地址请加方括号，如 `user@[::1]:file`。
-  - 不传 `-P` 时自动使用匹配节点的配置端口；如果同一主机匹配到多个端口会提示歧义，请用 `-P` 或唯一别名区分。若两端远端主机端口不同，可分别为它们设置别名。
-  - Windows 远端路径支持 `vm:C:/Users/example/file.txt`；如果本地文件名本身包含冒号，请加上 `./` 前缀（如 `./22:file`）。
-- **批量或指定主机上传（`--host` / `--tag` / `-I`）**：传入 `--host`、`--tag` 或 `-I/--ifile` 时，固定从本地上传到选中主机（三个选项互斥，可配合 `--exclude` 排除部分主机）。此时两个路径都按纯路径处理，路径里的 `:`、`@`、`[` 等均视为普通文件名字符，不再解析为远程地址。
-- **`--src` 与 `--dest` 兼容写法**：可以用 `--src <源> --dest <目标>` 代替两个位置参数，但两者必须成对出现，且不能与位置路径混用。
-- **提权传输（`--sudo`）**：
-  - 传入 `--sudo` 启用提权传输，在上传、下载以及跨主机中转中均生效（经由本机中转时两端均使用提权会话）。
-  - 底层机制：通过提权通道在远端启动 `sftp-server` 二进制，建立 root 权限的 SFTPv3 流；若远端登录用户本身为 root 则直接请求标准 SFTP subsystem。
-  - 示例：`xops scp --sudo ./app.service web-01:/etc/systemd/system/`、`xops scp --sudo 'web-01:/etc/shadow' ./`、`xops scp --sudo web-01:/root/data.tar web-02:/root/data.tar`。
+`xops scp` 要求源与目标必须一端为本机路径、另一端为 `[user@]host:<remote_path>`：
 
 ```bash
-# 连接 122 端口，上传为远端文件 22:file
-xops scp -P 122 ./config.conf user@host:22:file
+# 上传单个本地文件到远端目录或精确文件路径
+xops scp ./release.tar.gz web-01:/srv/releases/
+xops scp --no-clobber --perm 0644 ./app.conf web-01:/etc/app/app.conf
 
-# 使用 --host 时，路径中的 @ 和 : 均作为普通文件名字符处理
-xops scp --host web-01 ./config.conf 'user@name:backup'
+# 递归上传目录（并行分片 + 断点续传 + SHA-256 摘要校验 + 保留权限/时间戳）
+xops scp -r -p --resume --concurrency 4 --chunk-size 1048576 ./dist web-01:/srv/app/
 
-# 使用 --src 和 --dest 兼容选项
-xops scp --src ./config.conf --dest web-01:~/config.conf
-xops scp --tag web --src ./config.conf --dest /etc/app/
+# 下载远端文件或目录到本机（默认自动锚定至 ScopedRootFS 沙箱）
+xops scp web-01:/var/log/app.log ./app.log
+xops scp -r --local-root ./downloads --max-files 500 --max-bytes 1073741824 web-01:/srv/artifacts ./artifacts
+
+# 校验端到端 SHA-256 摘要并输出 JSON 报告
+xops scp --expected-digest sha256:<hex> --json web-01:/srv/release.bin ./release.bin
 ```
 
-- **进度条与连接诊断**：
-  - 在终端运行时默认显示传输进度条（输出到 `stderr`），管道或重定向时自动隐藏。
-  - `-q` / `--quiet`：隐藏进度条、SSH 告警与诊断输出（失败报错和安全确认提示仍会保留）。
-  - `-v` / `--verbose`：输出 SSH/SFTP 连接与传输诊断（与项目级 `--debug` 日志独立）：
-    - `-v`：查看连接、认证和传输过程。
-    - `-vv`：查看更多文件操作详情。
-    - `-vvv`：输出最详细的故障排查日志。
-  - `-q` 与 `-v` 组合时按出现顺序生效（同 OpenSSH）：`-qv` 隐藏进度条但输出 SSH/SFTP 诊断；`-vq` 隐藏进度条和 SSH 诊断，仅保留 SCP 传输状态与 SFTP 初始化诊断。
-  - 若当前输出环境不支持进度或诊断，会省略这些辅助信息，文件传输仍会继续。需要保存诊断时，可在命令末尾加上 `2>scp.log`。
+### `xops scp` 核心标志与安全约束
+
+| 标志 | 说明 |
+| --- | --- |
+| `-P <port>` / `-l` / `-i` / `-J` / `-o` / `-F` | 标准 OpenSSH 连接选项（注意端口为大写 `-P`） |
+| `-p` / `--preserve` | 保留文件修改时间（上传同时保留权限位） |
+| `-r` / `--recursive` | 递归传输目录（递归上传强制 `--symlink-policy=reject` 并走 `ScopedRootFS` 沙箱） |
+| `--resume` | 开启基于摘要校验的断点续传 |
+| `--no-clobber` | 目标已存在时拒绝覆盖 |
+| `--expand-into-dir[=bool]` | 上传目标为已存在远端目录时是否自动展开文件名（默认 `true`） |
+| `--symlink-policy <policy>` | 软链策略：`reject`（默认最严）\| `contained_relative` \| `follow_operator_source`（下载仅许 `reject` 或 `contained_relative`） |
+| `--local-root <dir>` | 显式指定本地 `ScopedRootFS` 沙箱根目录 |
+| `--perm <octal>` | 显式设置远端文件八进制权限（`0001..0777`） |
+| `--chunk-size` / `--concurrency` | 并行分片大小（字节）与并发分片工作数 |
+| `--max-files` / `--max-bytes` | 递归传输文件数量与总字节数硬上限 |
+| `--expected-digest <sha256>` | 验证内容 SHA-256 摘要，不匹配则失败关闭 |
+
+## 2. 单步远端 SFTP 子命令（`xops sftp <op>`）
+
+无需打开交互终端或依赖远端 Shell，直接执行原子远端文件操作（全部支持 `--json` 与 `--policy`）：
 
 ```bash
-# 静默传输（不显示进度条）
-xops scp -q ./file web-01:~/file
+# 目录列举、元数据与软链检查
+xops sftp ls web-01 /srv/app --json
+xops sftp stat web-01 /srv/app/app.ini
+xops sftp stat --follow-symlinks web-01 /srv/app/current
+xops sftp realpath web-01 /srv/app/current
+xops sftp readlink web-01 /srv/app/current
 
-# 隐藏进度条，查看 SSH/SFTP 诊断信息
-xops scp -qv ./file web-01:~/file
+# 有界读取（read / cat）
+xops sftp cat --max-bytes 65536 web-01 /srv/app/app.ini
 
-# 查看更详细的故障排查日志
-xops scp -qvv ./file web-01:~/file
+# 原子写入（从本地文件或 stdin "-" 写入；支持 --perm、--no-clobber、--create-parents）
+xops sftp write --file ./app.ini --perm 0644 --create-parents web-01 /srv/app/app.ini
+printf 'mode=prod\n' | xops sftp write --file - --no-clobber web-01 /srv/app/mode.env
+
+# FSTAT 锚定文本补丁（若远端文件在读后被并发篡改将触发 remote_anchor_mismatch / patch_conflict）
+xops sftp patch --old "debug=true" --new "debug=false" web-01 /srv/app/app.ini
+xops sftp patch --old "v1" --new "v2" --all web-01 /srv/app/app.ini
+
+# 目录与元数据维护
+xops sftp mkdir --perm 0755 web-01 /srv/app/releases/v2
+xops sftp mv --no-clobber web-01 /srv/app/app.ini.new /srv/app/app.ini
+xops sftp chmod 0640 web-01 /srv/app/app.ini
+xops sftp rm web-01 /srv/app/tmp.bak
+xops sftp rmdir web-01 /srv/app/empty-dir
+
+# 恢复中断的双代 WAL 流式传输日志（不传参数时扫描全部日志，--prune 可清理旧世代）
+xops sftp recover --json
+xops sftp recover --prune web-01 <transfer_id>
 ```
 
-- **远端 `~` 路径**：远端路径支持 `~` 和 `~/...`，相对于远端 SFTP 登录目录（通常是用户家目录）解析；不支持 `~其他用户`，跨目录请使用绝对路径。
-- **同名文件覆盖**：遇到同名文件时，交互式回答 `y` 或传入 `-f`/`--force` 会直接覆盖（即使文件大小和修改时间相同）；传入 `-n`/`--no-clobber` 则自动跳过。
-- **本地下载保护**：覆盖下载失败时会尝试恢复原文件；若提示需要手动恢复，请按错误信息中给出的备份路径处理。同名目录不会被普通文件覆盖。
+## 3. 交互式 SFTP Shell（`xops sftp <target>`）
 
-### 2. 使用交互式 SFTP Shell
+直接传入目标主机（可选 `--dir <remote_dir>` 或 `<target>:<remote_dir>`）进入交互式 SFTP Shell：
 
 ```bash
 xops sftp web-01
+xops sftp --dir /srv/app web-01
+xops sftp web-01:/srv/app
 ```
 
-- **连接标志**（对齐 OpenSSH `sftp(1)`）：支持 `-P`/`--port` 指定端口、`-c`/`--cipher` 指定加密套件、`-i`（私钥）、`-J`（跳板）、`-F`（配置文件）与 `-o`（SSH 选项）；用户名通过 `user@host` 或 `-o User=...` 指定（不提供 `-l`/`-p`）。
+> 交互式 SFTP Shell 不支持 `--json`（脚本自动化请使用上述单步子命令）。执行单条慢传输命令时按 `Ctrl+C` 仅取消当前命令并安全返回 `sftp> ` 提示符，不会强杀整个会话。
 
-进入 SFTP 提示符后可输入 `help` 查看全部命令。常用操作：
+### 交互式 SFTP Shell 内置命令
 
-```text
-pwd
-ls
-cd /var/tmp
-put ./report.txt
-get report.txt
-exec date
-exit
-```
-
-- `exec <命令>`：在当前远端目录执行命令（交互模式下分配 PTY 以支持终端程序），结束后返回 SFTP 提示符。若连接时使用了 `--sudo`，则命令默认继承提权执行。
-- `shell` / `lshell`：进入远端或本地交互式 Shell（若连接时使用了 `--sudo`，远端 Shell 同样继承提权）；`lexec`：执行本地命令。退出子程序后恢复 SFTP 提示符。
-- **提权会话（`--sudo`）**：
-  - 连接时传入 `--sudo` 启动提权 SFTP 会话：`xops sftp --sudo web-01`。
-  - 通过提权通道启动远端 `sftp-server`（root 登录直接请求 subsystem），使 SFTP 文件读写、查看等操作拥有 root 权限。
-  - 交互式 `shell` 与内置 `exec` 命令默认同样继承 `--sudo` 提权执行。
-- 连接中断或命令输出失败时，会话会结束并返回非零状态。需要继续操作时，请重新连接。
-- **连接诊断**：`-v` / `--verbose` 将 SSH/SFTP 诊断信息写入 `stderr`（独立于 `--debug`），采用与 `xops ssh -v` 相同的 `debug1/2/3:` 格式：
-  - `-v`：显示连接、主机密钥验证、认证、协商算法及 SFTP 初始化信息。
-  - `-vv`：增加 SFTP 扩展、路径请求及 `get`/`put` 文件操作。
-  - `-vvv`：再增加 SFTP 数据包类型、请求 ID、长度及状态码。不会输出文件内容和凭据。
-  - 与 `xops scp` 不同，`xops sftp` 没有 `-q`。Tab 补全或命令执行期间产生的诊断可能与正在编辑的输入行交错；需要保持提示符整洁时，可保存到文件，例如 `xops sftp -vv web-01 2>sftp.log`。
-
-## 交互输入与快捷键
-
-SFTP 提示符支持行编辑、命令历史（默认保存在 `~/.xops_sftp_history`）以及本地/远端路径补全：
-
-| 按键 | 行为 |
+| 分类 | 命令与用法 |
 | --- | --- |
-| `Tab` / `Shift+Tab` | 请求路径补全，并在多个候选中正向/反向循环切换（跨页自动翻页） |
-| `PageUp` / `PageDown` | 在补全候选面板中整页翻动（首尾页不循环） |
-| `Enter` / `Esc`（补全中） | `Enter` 确认候选并返回编辑（不直接执行命令）；`Esc` 关闭候选面板 |
-| `↑` / `↓`、`Ctrl+P` / `N` | 浏览历史记录；回到最新位置时恢复当前输入草稿 |
-| `Ctrl+R` | 反向搜索历史；再次按下查找更早的匹配 |
-| `Enter` / `Esc` / `Ctrl+G`（搜索中） | `Enter`/`Esc` 接受匹配并返回编辑；`Ctrl+G` 取消搜索并恢复草稿 |
-| `Home` / `End`、`Ctrl+A` / `E` | 移动到行首 / 行尾 |
-| `Ctrl+U` / `K` / `W` | 删除光标前内容 / 光标后内容 / 前一个单词 |
-| `Delete` / `Ctrl+D` | `Delete` 删除光标后字符；`Ctrl+D` 在空行退出，非空行删除光标后字符 |
-| `Ctrl+C` | 取消当前输入；在覆盖/删除确认提示中停止本条命令的剩余文件处理（回答 `n` 仅跳过当前文件） |
+| **导航** | `pwd`、`cd [remote-path]`、`ls [-l] [-a] [remote-path]`、`lpwd`、`lcd <local-path>`、`lls [-l] [-a] [local-path]` |
+| **传输与原子写入** | `put [-r] [-n] [--resume] [-p] <local> [remote]`、`get [-r] [-n] [--resume] [-p] <remote> [local]`、`cat <remote>`、`write [-n] [-p] <remote> <text>`、`mv\|rename [-n] <old> <new>`、`mkdir [-m <octal>] <remote>`、`rm <remote>`、`rmdir <remote>` |
+| **元数据与探查** | `chmod <octal-mode> <remote>`、`chtimes <mtime> <remote>`（或 `chtimes <atime> <mtime> <remote>`，支持 RFC3339 与 Unix 时间戳）、`stat [-L] <remote>`（默认跟随软链）、`lstat <remote>`（不跟随软链）、`realpath <remote>`、`readlink <remote>` |
+| **控制** | `help [command]`（或 `?`）、`exit` / `quit` / `bye` |
 
-**编辑器与历史细节**：
-- **补全面板**：唯一候选直接上屏；补全目录后可继续按 `Tab` 补全子项。多候选面板按终端宽度分列，最多显示 6 行并附带页码与总数，选中项带 `>` 标记。后台补全最长等待 2 秒，继续打字或退出提示符会自动取消过期查询。
-- **长行与粘贴**：长命令水平滚动，提交后完整回显到终端滚动区；支持中文、组合字符、emoji 和跨提示符的括号粘贴（粘贴中的换行与制表符转为空格，不会自动执行命令）。即使 `stdout` 被管道传给 `tee`，只要 `stdin` 是终端，提示符和尺寸自适应依然正常工作。
-- **历史记录**：最多保留最近 500 条非空且非连续重复的交互命令，确认回答与批处理命令不记录。历史文件不可用时会提示，并暂时只保留本次会话历史；保存失败不会清空旧记录，恢复后会自动保存。
+## 4. 诚实安全与原子语义边界
 
-## 批处理模式
-
-当标准输入来自管道或文件重定向（如 `xops sftp web-01 < batch.txt`）时，自动进入批处理模式：
-- 任一命令失败立即停止并返回非零退出码，不再执行后续命令，也不写交互历史。
-- 批处理中的 `lls`/`lll` 和远端 `ls`/`ll` 遇到路径不存在或目录读取失败会立即失败；通配符匹配中任一路径列出失败也会停止剩余匹配和后续命令。
-- 批处理 `exec` 不申请 PTY，`exec` 和 `lexec` 的标准输入直接为 `EOF`（不会吞掉后续 SFTP 命令）。
-- `shell`/`lshell` 需要交互终端，不能在批处理中使用；涉及覆盖或删除确认的操作必须显式配合 force/no-clobber 选项，否则直接报错。单行命令长度上限为 1 MiB。
-
-## `exec` 工作目录继承与自动探测
-
-`exec` 在当前远端目录执行命令。先用 `cd` 切换目录，再运行 `exec`；若无法进入该目录，命令不会执行。
-
-Windows 主机可使用 `/C:/...` 路径，例如：
-
-```text
-cd /C:/Windows
-exec dir
-```
-
-使用 `cd /C:` 可进入 C 盘根目录。
-
-未配置解释器时，XOps 会尝试自动识别远端环境。若提示不支持当前执行环境，请检查节点的 `execution` 设置，选择主机已安装的解释器，见[主机与身份](./hosts#节点执行环境配置-execution)。已配置的 `server` 模式只有在启动方言为 `cmd` 时支持 SFTP 的当前目录；其他环境需指定解释器。识别失败时命令不会执行。
+- **本机侧（`core/osfs` `*os.Root`）**：下载落盘与递归目录上传全程锁定在不可越界的 `os.Root` 沙箱内，通过临时文件写入 + 刷盘 + 旁路锁协调原子替换，彻底阻断路径穿越与软链逃逸。
+- **远端侧（SFTP v3 协议边界）**：写与补丁路径采用非截断打开 + `SSH_FXP_FSTAT` 文件类型与 `(dev, ino)` 锚定比对，随后通过同目录临时文件 + OpenSSH `posix-rename@openssh.com` 原子替换目标；若远端 SFTP 服务不支持 `posix-rename` 扩展或并发修改导致锚点变化，会明确报错而非静默损坏。

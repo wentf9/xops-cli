@@ -1,106 +1,120 @@
-# Credential storage
+# Credential Routing and Vault
 
-XOps stores login passwords, private-key passphrases, `sudo`/`su` privilege passwords, TOTP secret keys (`totp_secret`), and keyboard-interactive challenge answers (`challenge_answer`) in dedicated credential stores. Your configuration file (`~/.xops/xops_config.yaml`) keeps only references to those items—never plaintext secrets or legacy `ENC:` fields.
+XOps v2 enforces **zero plaintext secrets in config files and CLI flags**. `~/.xops/config.yaml` and import bundles store only `<store>/<item>` secret references (`SecretRef`). Actual secret bytes are routed through a multi-backend `RouterVault` and consumed exclusively inside single-goroutine scoped `SecretBox` closures that `clear()` buffers on exit.
 
-New installations use the built-in offline encrypted store (`encrypted-file`) out of the box, without requiring a desktop keyring or external tools. Run `xops credential --help` to see all available subcommands.
+## 1. Four Supported Vault Backends
 
-## Default saving behavior
+Declare one or more named stores under `vault.stores` in `~/.xops/config.yaml` and select `vault.default_store`. If `vault.stores` is omitted, XOps automatically wires default `offline` (`offline_aead`) and `os_keychain` stores with `offline` as the default backend.
 
-The first time a credential is saved, XOps automatically creates the `credentials/` directory and the `credentials.key` key file beside your configuration file (`~/.xops/` by default).
-- **Verified before saving**: Login passwords are saved only after SSH authentication succeeds; private-key passphrases are saved only after they successfully unlock the key.
-- **Saving policy**: `credential.remember_prompted` controls whether prompted secrets are saved automatically:
-
-| Value | Behavior |
-| --- | --- |
-| `always` (default) | Save automatically after successful verification |
-| `ask` | Ask whether to save after verification |
-| `never` | Use for the current connection only; do not auto-save |
-
-Override the policy for a single command without changing your global configuration:
-
-```bash
-xops ssh --remember never web-01
-xops tui --remember ask
-```
-
-`never` only disables automatic saving during connections; explicit credential-form submissions and migration commands still work as usual. Schema v1 compatibility has ended—if you have a legacy configuration file, convert it first using the [migration guide](./migration).
-
-## Choose and inspect a store
-
-| Backend type | Purpose | Requirements |
+| `kind` | Implementation | Best For |
 | --- | --- | --- |
-| `encrypted-file` | Built-in offline encrypted vault (default) | Linux, Windows, or macOS (amd64 / arm64) |
-| `system` | OS native credential store / keyring | Accessible, unlocked system credential store |
-| `pass` | Existing `pass` password store | `pass`, `gpg`, and an initialized password store |
-| `helper` | Custom external credential service | External executable implementing the XOps credential protocol |
-| `none` | Ephemeral interactive sessions | No credential persistence |
+| `offline_aead` | Built-in offline encrypted dirfd vault (Argon2id + XChaCha20-Poly1305 AEAD; see [Offline Encrypted Vault](./offline-store)) | Zero external dependencies on headless servers, containers, and air-gapped hosts |
+| `os_keychain` | Native platform keychain (`CGO_ENABLED=0` pure Go):<br>- **Windows**: Windows Credential Manager (`CREDENTIALW`)<br>- **macOS**: `Security.framework` Keychain (`purego`)<br>- **Linux**: FreeDesktop Secret Service over D-Bus (`godbus`, DH AES-128-CBC with `plain` fallback)<br>- Other OSes (e.g. FreeBSD): returns `unsupported` | Desktop workstations needing seamless unlock across interactive and unattended runs |
+| `external_helper` | Stdin/stdout JSON v2 subprocess protocol for external secret managers (`pass`, 1Password CLI, Bitwarden, corporate KMS wrappers) | Team-shared secret managers and enterprise KMS integration |
+| `none` | Explicitly disabled slot; every read/write fails closed with `unsupported` | Pure `ssh-agent` or zero-stored-secret compliance environments |
 
-In the default setup, `file` is the store instance name and `encrypted-file` is its backend type (relative paths are resolved relative to the configuration file's directory):
+### Multi-Backend Config Example (`~/.xops/config.yaml`)
 
 ```yaml
-credential:
-  default_store: file
-  remember_prompted: always
+version: 2
+vault:
+  default_store: offline
+  remember_prompted: ask # always | ask | never
   stores:
-    file:
-      type: encrypted-file
-      path: credentials
-      unlock: key-file
-      key_file: credentials.key
+    offline:
+      kind: offline_aead
+      path: ~/.xops/vault
+    keychain:
+      kind: os_keychain
+    corp_kms:
+      kind: external_helper
+      command: /usr/local/bin/xops-kms-helper
+      args: ["--profile", "prod"]
+      timeout: 15s
+    disabled_slot:
+      kind: none
 ```
 
-See [`xops_config.example.yaml`](https://github.com/wentf9/xops-cli/blob/master/xops_config.example.yaml) for examples of other backends. List configured stores and check their status with:
+## 2. `xops creds` / `xops vault` Lifecycle Commands
+
+Primary command: `xops creds` (aliases: `cred`, `vault`). All subcommands support `--json` and `--policy`:
 
 ```bash
-xops credential store list
-xops credential doctor
+# Inspect vault lifecycle state (Uninitialized / Locked / Unlocked) and known stores
+xops creds status --json
+
+# Interactively initialize, unlock, and lock the offline vault
+xops creds init
+xops creds unlock
+xops creds lock
+
+# Read-only health check across all inventory references (--skip-probe checks metadata only)
+xops creds doctor
+xops creds doctor --skip-probe --json
+
+# Find every inventory location referencing a secret (password, passphrase, privilege, TOTP, challenge)
+xops creds refs offline/web01-pass
+
+# Delete an unreferenced secret (refuses with still_referenced if still in use)
+xops creds delete offline/unused-item
+
+# Safe garbage collection for candidate refs (retains referenced entries; reports deleted/retained/missing)
+xops creds gc offline/cand-1 offline/cand-2 --json
 ```
 
-- **How `credential doctor` works**: `doctor` performs non-interactive read checks only—it does not initialize stores, open unlock prompts, or test write permissions. For an uninitialized default offline store that has no credential references yet and neither vault nor key file on disk, `doctor` reports `WARN (not initialized)` and exits cleanly without creating files. Missing stores that are already referenced by your config, partially initialized vaults, or unsafe file paths still report `FAIL`.
-- **Switching stores**: Changing `default_store` alone does not move existing credentials; follow the [migration guide](./migration) to migrate between backends.
+### Interactive Enrollment and Atomic Rotation (Zero Plaintext Flags)
 
-### Linux system keyring (`system`)
+XOps v2 never accepts plaintext passwords on the command line. Enrollment and rotation run interactively through `VaultSagaFSM`:
 
-On Linux, the `system` backend requires `secret-tool` (`libsecret-tools` on Ubuntu/Debian), an active user D-Bus session, and Secret Service.
-- Batch jobs (`exec`, `play`) and MCP never open desktop unlock dialogs; a locked keyring returns `locked` and must be unlocked in your desktop session first.
-- When interactively deleting a node/identity or running `xops credential gc`, XOps requests an unlock for matching keyring items before deleting them. If you cancel the unlock, unlock only some of the keyrings where items reside, or the tool reports item errors on stderr (even with exit code 0, excluding normal `attribute.*` metadata), XOps retains the recovery journal so you can unlock the remaining keyrings and re-run `xops credential gc`.
+```bash
+# 1. Enroll a login password and atomically create/replace a password Identity
+xops creds enroll-password --id id-app --user app --store offline --desc "App login" --tag prod
+# Or target an explicit ref and replace an existing identity:
+xops creds enroll-password --id id-app --user app --ref offline/app-login --replace
 
-## Authentication retries and temporary input
+# 2. Enroll an encrypted private key passphrase: verifies decryption and binds key_fingerprint (INV-F1)
+xops creds enroll-key --id id-deploy --user deploy --key-path ~/.ssh/id_ed25519 --store offline
+# Optional certificate path and expected fingerprint verification:
+xops creds enroll-key --id id-deploy --user deploy \
+  --key-path ~/.ssh/id_ed25519 --cert-path ~/.ssh/id_ed25519-cert.pub \
+  --fingerprint SHA256:... --store offline --replace
 
-- **Password and passphrase retries**: Interactive connections allow up to 3 attempts when a server rejects a password or a key passphrase is wrong (if the private-key file itself is corrupted, repair or replace the file first).
-- **Temporary input when a store is unavailable**: If a credential store is locked, unavailable, corrupted, or a record cannot be read, interactive commands can prompt for temporary input to complete the connection. XOps **never** overwrites unreadable records with temporary input or replaces a damaged vault or lost key. Non-interactive runs (MCP and batch execution) fail immediately until store access is restored.
-- **Connections stay open on save failure**: If automatic saving fails after SSH authentication succeeds, the current session stays connected. Check the reported permission or configuration issue so you do not have to re-enter the password on future connections.
+# 3. Bind a sudo/su/doas privilege secret to a node
+xops creds set-node-privilege --node web-01 --store offline
 
-## Privilege passwords (`sudo` / `su`)
+# 4. Atomically rotate a secret across all 5 reference locations in the inventory graph
+xops creds rotate offline/old-pass --store offline
+xops creds rotate offline/old-pass --new-ref keychain/new-pass --expected-revision <rev>
+```
 
-SSH login and `sudo`/`su` escalation are verified and stored separately:
-- Passwordless `sudo` and valid cached `sudo` sessions do not ask for a password.
-- Once a privilege password passes the escalation handshake, it can be saved according to policy even if the user command itself exits with a nonzero status (the command still reports failure).
-- Privilege passwords allow up to 3 attempts. Once a user command may have started running, XOps never re-runs the command just to retry authentication. Interactive escalation requires a supported remote shell and `stty`.
+## 3. VaultSagaFSM and `UncertainDurability` Safety Rules
 
-## TOTP and challenge credentials
+Credential enrollment and rotation span multiple durable stores (vault write + readback verification, CAS commit to `config.yaml`, then old-secret cleanup). `VaultSagaFSM` classifies failure states strictly:
 
-For hosts with multi-factor authentication (2FA/MFA) enabled, XOps can store and manage TOTP shared secrets and static challenge answers in secure credential vaults:
-- **TOTP secrets (`totp_secret`)**: Stores Base32-encoded TOTP secrets, automatically evaluated by the native time-step algorithm during connection establishment.
-- **Challenge answers (`challenge_answer`)**: Stores static response texts bound to a specific challenge rule (`rule`).
-- **CLI setup**: Use `xops cred set <node-or-identity>` (or `xops host set-secret` / `xops id set`) with kind flags (`--password`, `--passphrase`, `--totp`, `--sudo`, `--challenge <rule>`) and either interactive prompts or `--password-stdin` to safely record secrets without writing plaintext into configuration files or shell histories:
-  ```bash
-  # Set login password, sudo password, TOTP secret, or challenge answer directly
-  xops cred set web-01 --password
-  xops cred set web-01 --sudo
-  xops cred set my-id --totp --password-stdin
-  xops cred set my-id --challenge security_question --password-stdin
-  ```
+- **Confirmed not applied (`NotApplied`)**: Automatically compensates by deleting the newly created unreferenced secret (`compensated: true`).
+- **Applied with uncertain durability (`Applied && !Durable` → `uncertain_durability: true`, `do_not_retry: true`)**: For example, when rename succeeded but directory sync returned an error. XOps **neither retries nor deletes old or new credentials** and instructs you to inspect disk state and run `xops creds doctor`.
 
-## Backup and recovery
+## 4. External Credential Helper Protocol (`external_helper`)
 
-Always back up all three items together: **your configuration file**, **the entire credential-store directory**, and **its unlock key file** (keep key backups separate from vault backups). Backing up the configuration file alone cannot recover passwords. Reading, inspecting, or unlocking never generates a replacement key for an existing store—if the key is lost, you must restore the original key backup.
+With `kind: external_helper`, XOps communicates with the helper over `stdin`/`stdout` using strict JSON v2 frames (plaintext travels only via `stdin` pipe, never argv or env, bounded by response-size and timeout limits):
 
-See [offline credential storage](./offline-store) for master-password vaults, key rotation, and restore commands.
+**Requests (XOps → helper `stdin`)**:
 
-## Removed plaintext flags
+```json
+{"protocol_version":2,"non_interactive":true,"action":"get","store":"corp_kms","item":"web-pass"}
+```
 
-To keep secrets out of process listings and shell history, value-bearing `--password <secret>`, `--passphrase <secret>`, and `--suPwd <secret>` flags have been removed from `ssh`, `sftp`, `scp`, `exec`, `host`, and `identity` commands (the boolean `--password` and `--passphrase` kind-selector flags on `xops cred set` / `delete` and their aliases remain to choose which credential kind to update; secret values are only accepted via interactive prompts or `--password-stdin` / `--passphrase-stdin`):
-- **SSH / SFTP / SCP / exec**: Use interactive prompts, saved credentials, or pipe secrets via `--password-stdin` / `--passphrase-stdin`.
-- **Host and identity commands (`host` / `identity`)**: Use `--password-stdin`, `--passphrase-stdin`, or `xops identity credential set`; see [host and identity management](./hosts#removed-credential-arguments).
-- **Flag boundaries**: `ssh` and `exec` reject unknown flags placed before the remote command; arguments after the remote command name or an explicit `--` separator are passed through unchanged.
+```json
+{"protocol_version":2,"non_interactive":true,"action":"store","store":"corp_kms","item":"web-pass","secret_b64":"<base64>"}
+```
+
+```json
+{"protocol_version":2,"non_interactive":true,"action":"erase","store":"corp_kms","item":"web-pass"}
+```
+
+**Responses (helper `stdout` → XOps; unknown JSON members are rejected)**:
+
+- `get` success: `{"secret_b64":"<base64>"}`
+- `store` / `erase` success: `{"code":"ok"}` (or exit 0 with empty stdout)
+- Controlled error codes: `not_found`, `locked`, `denied`, `unavailable`, `invalid`. XOps maps only controlled codes and **never echoes arbitrary helper stderr/diagnostics** to prevent secret reflection.
+- Every `store` is immediately followed by a `get` readback verified with constant-time `SecretBox.Equal`.
