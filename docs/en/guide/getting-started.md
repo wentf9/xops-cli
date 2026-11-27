@@ -124,10 +124,64 @@ xops tui
 
 Almost every command supports these uniform global flags (either before or after the subcommand):
 
+- `--lang <en|zh>`: Explicitly override the display language for this invocation (`en` English or `zh` Simplified Chinese; valid before or after the subcommand, before `--`, last-wins; see §7 below).
 - `--json`: Emit canonical deterministic JSON/v2 on `stdout` (`Deterministic(true)`), including structured error envelopes on failure.
 - `--policy <profile>`: Override the active security policy profile: `direct_operator` (CLI default), `strict` / `strict_operator`, or `strict_agent` (MCP default).
 - `-F <configfile>` (or `--ssh-config <path>`): Override the OpenSSH configuration file path (`none` disables OpenSSH config loading).
-- `-h` / `--help`, `xops help <command>`: Print exact usage help for any command.
+- `-h` / `--help`, `xops help <command>`: Print exact usage help for any command (like `version`, zero Engine initialization and zero disk touch).
+
+## 7. Language Settings and Localization (`--lang` / `XOPS_LANG`)
+
+XOps v2 embeds pure in-memory **English (`en`)** and **Simplified Chinese (`zh`)** catalogs (`embed.FS`). Language selection is per-process and **never persisted to `~/.xops/config.yaml`** (all `zh*` tags such as `zh_CN`, `zh-Hans`, and `zh-TW` normalize to Simplified Chinese `zh`).
+
+### Locale Detection Precedence
+
+Startup performs zero subprocess calls (no `os/exec`) and zero disk I/O, resolving the active display language from highest to lowest priority:
+
+```text
+1. CLI flag --lang <en|zh> (or --lang=<en|zh>)
+2. Environment variable XOPS_LANG
+3. Environment variable LC_ALL
+4. Environment variable LC_MESSAGES
+5. Environment variable LANG
+6. Platform OS locale (Windows queries kernel32 GetUserDefaultLocaleName; Unix/macOS return empty and rely solely on POSIX env vars)
+7. Default fallback: en (English)
+```
+
+- **POSIX Override Semantics**: `LC_ALL=C` or `LC_ALL=POSIX` (including codeset/modifier suffixes such as `C.UTF-8`) explicitly resolves to `en` and **blocks** lower-priority `LANG` (for example, `LC_ALL=C LANG=zh_CN.UTF-8` resolves to `en`). The GNU `LANGUAGE` colon-separated list is intentionally ignored.
+- **Fail-Closed CLI Flag vs. Safe Env Fallback**: An invalid or missing `--lang` value (such as `--lang fr` or `--lang C`) fails closed immediately with exit code `2` (`usage_error`), zero Engine init, and zero disk touch, rendering the error in the detected environment locale. By contrast, an unrecognized non-empty environment/OS locale tag safely falls back to `en` and stops fallthrough.
+- **Command-Aware Scanning & Remote Passthrough**: `--lang` is accepted before or after a subcommand (including multi-level commands like `xops hosts --lang zh list` or `xops hosts list --lang zh`), uses **last-wins** semantics, and stops at `--`. For `xops ssh` and `xops exec`, scanning stops at the first positional argument (target host) or `--`, so remote command arguments such as `xops ssh web-01 mytool --lang=fr` are passed through untouched.
+
+### Examples
+
+```bash
+# View localized help or version metadata (pure in-memory, zero Engine init or ~/.xops/ creation)
+xops --lang zh --help
+xops help ssh --lang zh
+xops version --lang zh
+
+# Enable Simplified Chinese for the current shell session
+export XOPS_LANG=zh
+xops hosts list
+xops doctor
+
+# Override back to English per command, or enforce POSIX LC_ALL=C
+xops --lang en doctor
+LC_ALL=C LANG=zh_CN.UTF-8 xops version
+
+# Remote --lang flags pass through untouched without triggering XOps usage errors
+xops ssh web-01 mytool --lang=fr
+xops exec --lang zh web-01 -- echo --lang=fr
+```
+
+### Canonical English Machine Contracts
+
+To guarantee stable parsing for scripts, CI pipelines, and AI agents, the following machine-facing outputs remain **invariant canonical English** regardless of `--lang` or `XOPS_LANG`:
+
+- **CLI `--json` Output**: All JSON keys, enum values, `exit_code`, `do_not_retry`, and `error_code` constants remain canonical English. Only human-facing `error` and `diagnostic` strings localize to the active language, while `doctor --json` (diagnostic findings & `vault_note`), `config import --json` (import report & warnings), and `approval_challenge.reason` always stay canonical English.
+- **MCP Server**: All 7 MCP tool names, descriptions, JSON Schemas, JSON-RPC error payloads, approval challenge envelopes, and `OutcomeUnknown` warnings stay canonical English.
+- **Audit Log & OpenSSH Control Receipts**: `~/.xops/audit.jsonl` and OpenSSH `-O` / `xops mux` control text responses stay canonical English.
+- **TUI Live Switching**: Inside `xops tui`, press uppercase **`L`** at any time to toggle between English and Simplified Chinese live (see [Terminal Workbench (TUI)](./tui)).
 
 ## Next Steps
 

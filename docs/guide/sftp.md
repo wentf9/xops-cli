@@ -41,7 +41,7 @@ xops scp --expected-digest sha256:<hex> --json web-01:/srv/release.bin ./release
 
 ## 2. 单步远端 SFTP 子命令（`xops sftp <op>`）
 
-无需打开交互终端或依赖远端 Shell，直接执行原子远端文件操作（全部支持 `--json` 与 `--policy`）：
+无需打开交互终端或依赖远端 Shell，直接执行原子远端文件操作（全部支持 `--lang <en|zh>`、`--json` 与 `--policy`，且支持置于子命令动作词之前，如 `xops sftp --lang zh ls web-01 /srv/app`）：
 
 ```bash
 # 目录列举、元数据与软链检查
@@ -84,7 +84,7 @@ xops sftp --dir /srv/app web-01
 xops sftp web-01:/srv/app
 ```
 
-> 交互式 SFTP Shell 不支持 `--json`（脚本自动化请使用上述单步子命令）。执行单条慢传输命令时按 `Ctrl+C` 仅取消当前命令并安全返回 `sftp> ` 提示符，不会强杀整个会话。
+> 交互式 SFTP Shell 不支持 `--json`（脚本自动化请使用上述单步子命令），并自动继承 `--lang <en|zh>` / `XOPS_LANG` 渲染内置帮助、状态与审批错误提示（如 `xops sftp --lang zh web-01`）。执行单条慢传输命令时按 `Ctrl+C` 仅取消当前命令并安全返回 `sftp> ` 提示符，不会强杀整个会话。
 
 ### 交互式 SFTP Shell 内置命令
 

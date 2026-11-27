@@ -19,7 +19,7 @@ xops exec -t web-01 -- top -b -n 1
 xops exec --json web-01 -- hostname
 ```
 
-> Captured output defaults to **4 MiB** (configurable up to **64 MiB**) and command text is capped at **1 MiB**. Truncated captures explicitly set `truncated: true`.
+> Captured output defaults to **4 MiB** (configurable up to **64 MiB**) and command text is capped at **1 MiB**. Truncated captures explicitly set `truncated: true`. Place `--lang <en|zh>` and `--json` before `<target>` and `--` so remote command flags (e.g. `xops exec --lang zh web-01 -- echo --lang=fr`) pass through untouched; `--json` keys, `outcome_kind`, `do_not_retry`, and `error_code` remain invariant canonical English.
 
 ## 2. Privilege Escalation (Single Target)
 

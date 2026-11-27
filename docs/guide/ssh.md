@@ -41,6 +41,7 @@ xops ssh --json web-01 uname -a
 | `-O <ctl_cmd>` | 控制活跃 ControlMaster：`check` \| `forward` \| `cancel` \| `exit` \| `stop` \| `proxy` |
 | `-N` / `-f` | 不执行远端命令 / 移交进程内 `muxdaemon` 同步守护运行（无 OS `fork()` 脱离，需置于后台或受管会话；需配合 `-N`/`-M` 或转发规则，不可附带远端命令） |
 | `--tun-mode <mode>` | `-w` 隧道模式：`point_to_point`（默认）\| `ethernet` |
+| `--lang <en\|zh>` | 显式覆盖界面语言（须置于目标主机与 `--` 之前；目标主机后的远端命令参数如 `xops ssh web mytool --lang=fr` 会原样透传，不被误拦截） |
 
 > **提权说明**：在 XOps v2 中，非交互与受控 `sudo`/`su`/`doas` 提权由 [`xops exec --sudo|--su|--doas`](./exec) 统一承载（支持从 Vault 引用 `--password-ref` 或 `--prompt-password` 交互采集，零明文参数）。
 
@@ -102,6 +103,7 @@ xops mux exit -S /tmp/xops-mux-web01.sock web-01
 - **安全套接字与残余探测**：本地控制套接字经 `core/osfs` 创建并校验所有者权限（Linux/macOS 使用 `AF_UNIX` 对端凭证与 `0600` 权限）；若检测到异常崩溃遗留的死套接字，自动探活并安全清理后再绑定。
 - **字面 `-S` 与配置模板路径**：`xops mux check/forward/cancel/proxy/stop/exit` 与 `xops ssh -O` 显式传入 `-S` 时会按字面路径直连套接字（不展开 `~` 或 `%C`）。如需自动按 `~` 与 `%C`/`%h`/`%p`/`%r` 令牌展开，请在 `~/.xops/config.yaml` 的节点或全局 `options.control` 中配置 `master`、`path`（如 `"~/.xops/mux-%C"`）与 `persist`（如 `"10m"`），并在控制命令中省略 `-S`。
 - **进程内同步守护与无交互限制**：`xops mux start --daemon`、`xops mux daemon` 与 `xops ssh -f` 均在当前进程内同步运行 `muxdaemon` 直至 `ControlPersist` 空闲过期、收到 `mux exit` 或 `SIGINT`/`SIGTERM`（不执行 OS `fork()` 脱离），脚本与 AI 助手需将其置于后台或独立受管会话中；且其运行于无交互输入流下，若配置了 `ControlMaster=ask/autoask` 或需人工解锁密钥，将会严格失败关闭而非挂起等待。
+- **OpenSSH `-O` 规范英文控制输出**：无论 `--lang` 或 `XOPS_LANG` 为何值，`xops ssh -O` 与 `xops mux check/forward/cancel/stop/exit` 的文本控制回执（如 `mux check: master running (pid=...)`）均保持 OpenSSH 兼容的规范英文机器契约。
 
 ## 4. 主机密钥信任（KnownHosts & SSHFP）
 

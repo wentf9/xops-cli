@@ -41,6 +41,7 @@ xops ssh --json web-01 uname -a
 | `-O <ctl_cmd>` | Control an active master: `check` \| `forward` \| `cancel` \| `exit` \| `stop` \| `proxy` |
 | `-N` / `-f` | Do not execute a remote command / hand off to in-process `muxdaemon` synchronously (no OS `fork()` detach—launch in a background/managed session; requires `-N`, `-M`, or forwards, and cannot include a remote command) |
 | `--tun-mode <mode>` | `-w` tunnel mode: `point_to_point` (default) \| `ethernet` |
+| `--lang <en\|zh>` | Override display language (place before the target host and `--`; remote command arguments after the target host such as `xops ssh web mytool --lang=fr` pass through untouched) |
 
 > **Privilege Escalation**: Controlled `sudo`, `su`, and `doas` execution is handled by [`xops exec --sudo|--su|--doas`](./exec) using Vault references (`--password-ref`) or interactive prompts (`--prompt-password`), never plaintext CLI flags.
 
@@ -102,6 +103,7 @@ xops mux exit -S /tmp/xops-mux-web01.sock web-01
 - **Verified Sockets & Stale Cleanup**: Control sockets are bound through `core/osfs` with owner-only permissions (`0600` and peer-credential verification on Unix). Stale sockets left by crashed masters are probed and safely cleaned before rebinding.
 - **Literal `-S` vs. Config Path Templates**: Control commands (`xops mux check/forward/cancel/proxy/stop/exit` and `xops ssh -O`) pass an explicit `-S` path verbatim without expanding `~` or `%C`. To use automatic `~` and `%C`/`%h`/`%p`/`%r` token expansion, configure `options.control` (`master`, `path: "~/.xops/mux-%C"`, `persist: "10m"`) in `~/.xops/config.yaml` and omit `-S` on control commands.
 - **In-Process Synchronous Supervisor & Non-Interactive Mode**: `xops mux start --daemon`, `xops mux daemon`, and `xops ssh -f` run `muxdaemon` synchronously in the current process until `ControlPersist` idle expiry, `mux exit`, or `SIGINT`/`SIGTERM` (no OS `fork()` detach)—scripts and AI agents should launch them in a background or managed session. Because `muxdaemon` runs without interactive stdin, configurations requiring `ControlMaster=ask/autoask` or interactive prompts fail closed rather than hanging.
+- **OpenSSH `-O` Canonical English Control Receipts**: Regardless of `--lang` or `XOPS_LANG`, `xops ssh -O` and `xops mux check/forward/cancel/stop/exit` text control receipts (such as `mux check: master running (pid=...)`) stay in OpenSSH-compatible canonical English.
 
 ## 4. Host Key Trust (KnownHosts & SSHFP)
 

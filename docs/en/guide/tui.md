@@ -12,8 +12,8 @@ xops tui
 xops tui --node web-01 --refresh 2s
 xops tui --no-alt-screen
 
-# Pair with an alternate OpenSSH config or strict security policy
-xops tui -F ~/.ssh/config.work --policy strict
+# Pair with an alternate OpenSSH config, strict security policy, or explicit initial language
+xops tui -F ~/.ssh/config.work --policy strict --lang zh
 ```
 
 | Flag | Description |
@@ -23,6 +23,7 @@ xops tui -F ~/.ssh/config.work --policy strict
 | `--no-alt-screen` | Disable the alternate screen buffer |
 | `-F <configfile>` | Alternate OpenSSH config file (`none` disables) |
 | `--policy <profile>` | Policy profile: `direct_operator` \| `strict` \| `strict_agent` |
+| `--lang <en\|zh>` | Initial display language on startup (otherwise auto-detected; toggle live with uppercase `L`) |
 
 > `xops tui` is strictly interactive and rejects `--json`.
 
@@ -47,11 +48,19 @@ The header displays all 5 view tabs alongside live event counters (`events`, `dr
 | `/` | Enter live filter mode (`Enter` apply, `Esc` clear, `Backspace` edit) |
 | `r` | Refresh atomic inventory snapshot from the Engine |
 | `m` | Switch to Metrics view and start live metrics streaming for the selected host |
-| `l` | Switch to Logs view and start live log streaming for the selected host |
+| `l` (lowercase) | Switch to Logs view and start live log streaming for the selected host (distinct from uppercase `L`) |
 | `x` | Stop all active metrics and log streams |
 | `s` | Toggle top-process sorting (`CPU` / `Mem`) in Metrics view |
+| `L` (uppercase) | **Live language toggle** (English / Simplified Chinese): immediately re-renders all 5 views, window title, status bar, errors, and safety banners, and syncs `Enter` SSH takeover prompts |
 | `Enter` (in Hosts view) | **Supervised SSH takeover**: cleanly drains TUI -> releases terminal to interactive SSH -> automatically restores TUI on exit |
 | `q` / `Ctrl+C` | Quit cleanly and deterministically restore terminal state |
+
+### Live Language Toggle (`L`) Behavior
+
+- **Case-Sensitive Distinction**: Uppercase **`L`** toggles display language between English and Simplified Chinese; lowercase **`l`** starts live remote log streaming.
+- **Filter-Mode Safe**: While editing a filter after pressing `/`, typing uppercase `L` appends `L` to the filter query instead of switching language. Once you exit filter editing (`Enter` or `Esc`), `L` resumes toggling language.
+- **Synced with Interactive SSH Takeover**: Toggling with `L` immediately notifies the host interaction adapter (`OnLocaleChange`), so subsequent `Enter` SSH takeover prompts (such as host-key verification and passphrase prompts) automatically render in the newly selected language, and the selected language persists when returning to the workbench.
+- **Session-Scoped & Zero Disk Writes**: The switch applies in-memory for the current TUI session only and does not modify `~/.xops/config.yaml`.
 
 ## 4. Real-Time Safety Banners
 

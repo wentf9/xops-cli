@@ -143,7 +143,7 @@ policy:
 
 ## 3. Audit Log and O(1) Crash Reconciliation (`xops audit`)
 
-Every gated operation writes canonical JSON/v2 records (`denied`, `authorized`, `finalized`) to `~/.xops/audit.jsonl` coordinated via sidecar lock `audit.jsonl.lock`.
+Every gated operation writes canonical English JSON/v2 records (`denied`, `authorized`, `finalized`) to `~/.xops/audit.jsonl` (unaffected by `--lang` / `XOPS_LANG`), coordinated via sidecar lock `audit.jsonl.lock`.
 
 ### O(1) Process-Lock Crash Reconciliation
 

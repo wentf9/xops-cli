@@ -31,6 +31,7 @@
 - **Graph Inventory & Multi-Backend Encrypted Vault**: Decouples **Host**, **Identity**, and **Node** with Tarjan jump-DAG cycle detection and CAS persistence in strict `version: 2` YAML (`~/.xops/config.yaml`, overridable via `XOPS_HOME`). Plaintext secrets are forbidden in both YAML and CLI flags; supports `offline_aead` (Argon2id + XChaCha20-Poly1305), native `os_keychain` (Windows Credential Manager / macOS Keychain / Linux Secret Service), `external_helper` (JSON v2 stdin/stdout), and `none`.
 - **Batch Execution, Atomic SFTP & Declarative Playbook v2**: Single/batch concurrent command execution, privilege escalation (`--sudo`/`--su`/`--doas`), explicit launch profiles (`posix`/`powershell`/`cmd`/`raw` × `server`/`sh`/`bash`/`zsh`/`powershell`/`pwsh`/`cmd`), parallel resumable SCP, single-shot and interactive SFTP Shell, and declarative Playbook v2 (`shell`/`script`/`copy`/`template`/`ensure`). Strict 3-state execution outcomes flag uncertain network failures with `OutcomeUnknown` / `do_not_retry`.
 - **Fail-Closed Guardrails, O(1) Audit Reconciliation & Sandboxed MCP**: Capability-gated execution with synchronous `audit.jsonl` logging and O(1) startup crash-lock reconciliation; built-in **7 strongly-typed discriminated MCP tools** over `stdio` and Streamable HTTP (plus a 10 GiB dual-generation WAL streaming endpoint), defaulting to `strict_agent` with fail-closed `Halted` circuit breaking and **zero `OperatorReadFS`** (`ScopedRootFS`-only sandboxing).
+- **Native Bilingual Localization & Canonical English Machine Contracts**: Embedded in-memory English (`en`) and Simplified Chinese (`zh`) catalogs with zero persistence and zero disk touch on `--help`/`version`; supports global `--lang <en|zh>` and `XOPS_LANG` with deterministic precedence (`--lang > XOPS_LANG > LC_ALL > LC_MESSAGES > LANG > OS Locale > en`, where `LC_ALL=C`/`POSIX` explicitly resolves to `en` and blocks `LANG`, and Windows queries `GetUserDefaultLocaleName`); live TUI hot-switching via uppercase **`L`** (synced with SSH takeover prompts); and invariant canonical English for all machine contracts (`--json` field names & `error_code`, `doctor`/`config import` `--json` diagnostics & `approval_challenge.reason`, all 7 MCP tools & responses, `audit.jsonl`, and OpenSSH `-O` / `mux` control output).
 
 ---
 
@@ -76,9 +77,27 @@ xops ssh -J bastion -i ~/.ssh/id_ed25519 deploy@192.0.2.10
 # Run a command across tagged nodes concurrently with live streaming (add --json for canonical JSON/v2)
 xops exec --tags web --exclude-nodes web-maint-01 --concurrency 5 --stream -- uptime
 
-# Launch the Bubble Tea v2 terminal workbench (Hosts, Metrics, Logs, Operations + Enter SSH takeover)
+# Launch the Bubble Tea v2 terminal workbench (Hosts, Metrics, Logs, Operations + Enter SSH takeover + uppercase L live EN/ZH toggle)
 xops tui
 ```
+
+### 4. Global Flags and Bilingual Localization
+
+All CLI commands accept uniform global flags: `--lang <en|zh>`, `--json`, `--policy <profile>`, `-F`/`--ssh-config <file>`, `-h`/`--help`, and `-V`/`--version`.
+
+```bash
+# Switch display language to Simplified Chinese or English (valid before or after subcommand, before '--', last-wins, zero persistence, zero disk touch on --help/version)
+xops --lang zh --help
+xops version --lang zh
+XOPS_LANG=zh xops hosts list
+
+# Remote arguments stay untouched: ssh and exec stop scanning --lang at the target host or '--'
+xops ssh web-01 mytool --lang=fr
+```
+
+- **Locale Detection Precedence**: `--lang > XOPS_LANG > LC_ALL > LC_MESSAGES > LANG > OS Locale > en`. `LC_ALL=C` / `POSIX` explicitly resolves to `en` and blocks lower-priority `LANG`; Windows queries `GetUserDefaultLocaleName` when all locale env vars are blank; invalid `--lang` values (such as `--lang fr`) fail closed with exit code `2` (`usage_error`).
+- **TUI Live Language Switch**: Press uppercase **`L`** inside `xops tui` to switch all views between English and Simplified Chinese immediately (distinct from lowercase `l` log streaming, never triggered in `/` filter mode, and synced with `Enter` interactive SSH takeover prompts).
+- **Canonical English Machine Contracts**: Regardless of active display language, `--json` field names and `error_code` (only human-facing `error`/`diagnostic` strings localize, while `doctor --json` / `config import --json` diagnostic fields and `approval_challenge.reason` stay canonical English), all 7 MCP tool schemas/descriptions/responses, `~/.xops/audit.jsonl`, and OpenSSH `-O` / `mux` control output remain canonical English.
 
 ---
 

@@ -19,7 +19,7 @@ xops exec -t web-01 -- top -b -n 1
 xops exec --json web-01 -- hostname
 ```
 
-> 默认最大捕获输出上限为 **4 MiB**（可配置上限 **64 MiB**），单条命令文本上限 **1 MiB**。超过上限时返回结果中会显式标记 `truncated: true`。
+> 默认最大捕获输出上限为 **4 MiB**（可配置上限 **64 MiB**），单条命令文本上限 **1 MiB**。超过上限时返回结果中会显式标记 `truncated: true`。此外，`--lang <en|zh>` 与 `--json` 须置于 `<target>` 及 `--` 之前，远端命令自带参数（如 `xops exec --lang zh web-01 -- echo --lang=fr`）会原样透传；`--json` 输出中的结构字段名、`outcome_kind`、`do_not_retry` 与 `error_code` 恒为规范英文。
 
 ## 2. 受控提权执行（单目标）
 

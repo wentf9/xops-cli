@@ -32,6 +32,7 @@ xops ssh -J bastion deploy@10.0.0.10 uname -a
 - Default to explicit loopback binds (`127.0.0.1`); expose broader interfaces only when explicitly authorized.
 - Remember "local" is the host/container running `xops`. Verify end-to-end application reachability (e.g. HTTP or DB probe), not merely TCP port acceptance.
 - Stop temporary tunnels by signaling only the exact owned process (`SIGINT`/`SIGTERM` triggers clean reverse-order teardown) and verify the listener is closed.
+- For `xops ssh`, place `--lang <en|zh>` and `--json` before the target host or `--`; remote arguments after `<target>` (such as `xops ssh web-01 mytool --lang=fr`) pass through untouched.
 
 ## ControlMaster Multiplexing (`xops mux` & `xops ssh -M/-S/-O/-f`)
 
@@ -63,10 +64,11 @@ xops mux exit -S /tmp/xops-mux-web01.sock --json web-01
 - `mux daemon` and `ssh -f` have no interactive stdin; configurations requiring `ControlMaster=ask/autoask` or interactive prompts fail closed.
 - `-f` requires `-N`, `-M`, or at least one forward rule (`-L/-R/-D/-w`) and cannot be combined with a remote command or `-O`.
 - Explicit `-S` on `mux check/forward/cancel/proxy/stop/exit` and `ssh -O` uses the socket path **verbatim** without expanding `~` or `%C`. Either pass a concrete literal socket path (such as `/tmp/xops-mux-web01.sock`) or configure `options.control.path: "~/.xops/mux-%C"` in `config.yaml` and omit `-S`.
+- OpenSSH `-O` and `xops mux` text control receipts (`mux check: master running (pid=...)`, `mux <action>: ok`) remain canonical English regardless of `--lang` or `XOPS_LANG`.
 
 ## MCP Equivalent (`tunnel` tool)
 
-In MCP mode (both `stdio` and Streamable HTTP), use the `tunnel` tool with generation-bound `handle` / `handle_token`:
+In MCP mode (both `stdio` and Streamable HTTP), use the `tunnel` tool with generation-bound `handle` / `handle_token` (tool descriptions, JSON Schemas, `approval_challenge` fields, and error payloads remain invariant canonical English regardless of `--lang` or `XOPS_LANG`):
 - **Forwards**: `start_forward` (`direction`: `local` | `remote` | `dynamic` | `tun`, `bind_kind`/`target_kind`: `tcp` | `unix`), `inspect_forward`, `stop_forward`.
 - **ControlMaster**: `start_mux`, `inspect_mux`, `stop_mux`, `probe_mux`, `control_mux` (`mux_action`: `check` | `forward` | `cancel` | `exit` | `stop`). Note: `start_mux` expands `~`/`%C`, whereas `probe_mux` and `control_mux` treat explicit `socket_path` verbatim—pass the concrete expanded `socket_path` returned by `start_mux` (or omit `socket_path` when `options.control.path` is configured).
 - Ephemeral tunnel/mux handles are automatically revoked on `Halted` and cleaned up on MCP server close.

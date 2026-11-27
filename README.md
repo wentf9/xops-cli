@@ -31,6 +31,7 @@
 - **结构化资产图与安全凭据路由**：Host / Identity / Node 三实体解耦 + Tarjan 跳板 DAG 环路检测 + 乐观锁 CAS 落盘；配置采用严格 `version: 2` YAML（`~/.xops/config.yaml`，支持 `XOPS_HOME`），零明文密码字段，零明文密码 CLI 参数；内置 `offline_aead`（Argon2id + XChaCha20-Poly1305）、平台原生 `os_keychain`（Windows Credential Manager / macOS Keychain / Linux Secret Service）、`external_helper`（JSON v2 stdin/stdout）与 `none` 四类凭据存储。
 - **并发批量执行、SFTP 原子操作与 Playbook v2**：支持单机/多机并发执行、受控提权（`--sudo`/`--su`/`--doas`）、多方言启动配置（`posix`/`powershell`/`cmd`/`raw` × `server`/`sh`/`bash`/`zsh`/`powershell`/`pwsh`/`cmd`）、并行分片可续传 SCP、单步与交互式 SFTP Shell、以及声明式 Playbook v2（`shell`/`script`/`copy`/`template`/`ensure`）；全链路严格区分三态结果，面对 `OutcomeUnknown` 显式标记 `do_not_retry` 防止盲目重试。
 - **Fail-Closed 安全护栏、O(1) 审计对账与沙箱 MCP**：所有操作经能力门控签发、同步写入 `audit.jsonl`（含启动期 O(1) 进程锁崩溃对账）；内置 **7 个强类型判别式 MCP 工具**（`stdio` 与 Streamable HTTP 双传输 + 10 GiB 双代 WAL 流式端点），默认启用 `strict_agent` 熔断档并**物理禁用 `OperatorReadFS`**（仅暴露基于 `os.Root` 的 `ScopedRootFS` 沙箱）。
+- **原生中英双语国际化与规范英文机器契约**：内置纯内存 `embed.FS` 英文（`en`）与简体中文（`zh`）双语词库，通过全局 `--lang <en|zh>` 与 `XOPS_LANG` 无持久化零触盘切换；严格按 `--lang > XOPS_LANG > LC_ALL > LC_MESSAGES > LANG > OS Locale > en` 探测（`LC_ALL=C`/`POSIX` 显式解析为 `en` 并阻断 `LANG`，Windows 读取 `GetUserDefaultLocaleName`）；TUI 工作台支持按大写 **`L`** 实时热切换中英文并同步接管交互提示；同时所有机器契约（`--json` 结构字段名与 `error_code`、`doctor`/`config import` 的 `--json` 诊断字段与 `approval_challenge.reason`、MCP 7 工具描述与响应、审计日志 `audit.jsonl`、OpenSSH `-O` / `mux` 控制输出）恒保持规范英文，不受界面语言影响。
 
 ---
 
@@ -76,9 +77,27 @@ xops ssh -J bastion -i ~/.ssh/id_ed25519 deploy@192.0.2.10
 # 跨节点并发执行并实时流式输出（支持 --json 输出规范 JSON/v2）
 xops exec --tags web --exclude-nodes web-maint-01 --concurrency 5 --stream -- uptime
 
-# 启动 Bubble Tea v2 实时终端工作台（资产/指标/日志/操作视图 + Enter 接管 SSH）
+# 启动 Bubble Tea v2 实时终端工作台（资产/指标/日志/操作视图 + Enter 接管 SSH + 大写 L 热切中英文）
 xops tui
 ```
+
+### 4. 全局选项与中英双语切换
+
+所有 CLI 命令均支持统一的全局选项：`--lang <en|zh>`、`--json`、`--policy <profile>`、`-F`/`--ssh-config <file>`、`-h`/`--help`、`-V`/`--version`。
+
+```bash
+# 按需切换简体中文或英文界面（可置于子命令前或后、'--' 之前，末次生效，零持久化且 --help/version 零触盘）
+xops --lang zh --help
+xops version --lang zh
+XOPS_LANG=zh xops hosts list
+
+# 远端命令参数不受影响：ssh / exec 遇到目标主机或 '--' 后即停止扫描 --lang
+xops ssh web-01 mytool --lang=fr
+```
+
+- **语言探测优先级**：`--lang > XOPS_LANG > LC_ALL > LC_MESSAGES > LANG > OS Locale > en`。其中 `LC_ALL=C` / `POSIX` 会显式解析为 `en` 并阻断更低优先级的 `LANG`；Windows 在环境变量全空时查询系统 `GetUserDefaultLocaleName`；非法 `--lang` 值（如 `--lang fr`）会以退出码 `2`（`usage_error`）失败关闭。
+- **TUI 实时热切换**：在 `xops tui` 中按大写 **`L`** 可即时在中英文间切换全部视图（与小写 `l` 日志流区分，过滤模式 `/` 下不误触，并同步更新 `Enter` 接管 SSH 会话时的交互提示语种）。
+- **机器契约规范英文边界**：无论启用何种显示语言，`--json` 结构字段名与 `error_code`（仅面向人工阅读的 `error`/`diagnostic` 文本本地化，`doctor --json` / `config import --json` 诊断字段与 `approval_challenge.reason` 保持规范英文）、MCP 7 工具描述与 JSON-RPC 响应、`~/.xops/audit.jsonl` 审计日志以及 OpenSSH `-O` / `mux` 控制输出恒为规范英文。
 
 ---
 

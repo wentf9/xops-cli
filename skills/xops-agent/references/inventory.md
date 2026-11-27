@@ -16,7 +16,7 @@ xops doctor --json                         # combined read-only inventory + vaul
 xops doctor --scope inventory --check-vault --check-keys --json
 ```
 
-All `hosts` queries support aliases `host` and `inventory`. Listing and resolving do not open remote SSH connections.
+All `hosts` queries support aliases `host` and `inventory`, plus `--lang <en|zh>` (before or after the subcommand, before `--`). Listing and resolving do not open remote SSH connections. Diagnostic fields in `xops doctor --json` (`findings[].message`, `vault_note`) and `xops config import --json` (`report.warnings[].message`) always remain canonical English regardless of `--lang` or `XOPS_LANG`.
 
 ## Declarative CAS CRUD (`xops hosts`)
 
@@ -101,4 +101,4 @@ xops creds rotate offline/old-item --store offline
 
 ## MCP Equivalent (`nodes` tool)
 
-In MCP mode, use `nodes` with `action`: `list_hosts`, `get_host`, `create_host`, `update_host`, `delete_host`, `list_identities`, `get_identity`, `create_identity`, `update_identity`, `delete_identity`, `list_nodes`, `get_node`, `create_node`, `update_node`, `delete_node`, `resolve`, `validate_dag`, `doctor`, `list_import_formats`, `plan_import`, `apply_import` (import uses inline `content` or `bundle`, never host file paths).
+In MCP mode, use `nodes` with `action`: `list_hosts`, `get_host`, `create_host`, `update_host`, `delete_host`, `list_identities`, `get_identity`, `create_identity`, `update_identity`, `delete_identity`, `list_nodes`, `get_node`, `create_node`, `update_node`, `delete_node`, `resolve`, `validate_dag`, `doctor`, `list_import_formats`, `plan_import`, `apply_import` (import uses inline `content` or `bundle`, never host file paths). Tool descriptions, schemas, and responses remain invariant canonical English regardless of `--lang` or `XOPS_LANG`.

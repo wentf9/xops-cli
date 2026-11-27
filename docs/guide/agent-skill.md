@@ -50,7 +50,7 @@ skills/xops-agent/
 
 `xops-agent` Skill 内置了面向 XOps v2 的强约束规范，确保 AI 助手在自动化执行时遵循以下铁律：
 
-1. **优先机器可读输出**：使用 `--json` 解析确定性 JSON/v2 结果与结构化 `error_code`、`do_not_retry`、`approval_challenge` 字段。
+1. **优先机器可读输出与规范英文契约**：使用 `--json` 解析确定性 JSON/v2 结果与结构化 `error_code`、`do_not_retry`、`approval_challenge` 字段。无论终端环境或 `--lang <en|zh>` / `XOPS_LANG` 设置为何种语言，`--json` 结构字段名、`error_code`、`approval_challenge.reason`、`doctor --json` 与 `config import --json` 诊断字段，以及 MCP 7 工具描述、JSON Schema、JSON-RPC 错误响应与 `OutcomeUnknown` 禁止自动重试警告均恒保持**规范英文机器契约**（CLI `--json` 仅面向人工排障的 `error`/`diagnostic` 文本随语种本地化）。
 2. **显式护栏档位**：在无人值守或高风险环境通过 `--policy strict_agent` 或 `--policy strict` 启用风险阈值拦截与两步审批。
 3. **零明文凭据**：严禁向命令行或 YAML 写入明文密码；凭据操作一律通过 `xops creds` 交互录入或只读引用 `<store>/<item>`。
 4. **严禁盲目重试不确定终态**：遇到 `outcome_unknown`（`do_not_retry: true`）或 Vault `uncertain_durability`（`Applied && !Durable`）时，必须先人工或只读核验远端/磁盘状态，严禁自动重放写操作或删除凭据。

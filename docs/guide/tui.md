@@ -12,8 +12,8 @@ xops tui
 xops tui --node web-01 --refresh 2s
 xops tui --no-alt-screen
 
-# 搭配替代 OpenSSH 配置或严格安全档
-xops tui -F ~/.ssh/config.work --policy strict
+# 搭配替代 OpenSSH 配置、严格安全档或显式初始界面语言
+xops tui -F ~/.ssh/config.work --policy strict --lang zh
 ```
 
 | 标志 | 说明 |
@@ -23,6 +23,7 @@ xops tui -F ~/.ssh/config.work --policy strict
 | `--no-alt-screen` | 禁用终端交替屏幕缓冲区 |
 | `-F <configfile>` | 替代 OpenSSH 配置文件路径（传 `none` 禁用） |
 | `--policy <profile>` | 策略配置档：`direct_operator` \| `strict` \| `strict_agent` |
+| `--lang <en\|zh>` | 指定启动时的初始界面语言（未指定时按环境优先级探测；进入后可按大写 `L` 随时热切） |
 
 > `xops tui` 为交互式终端界面，显式拒绝 `--json` 选项。
 
@@ -47,11 +48,19 @@ xops tui -F ~/.ssh/config.work --policy strict
 | `/` | 进入当前视图过滤模式（输入关键词即时筛选，`Enter` 确认，`Esc` 清空，`Backspace` 删除） |
 | `r` | 从核心 Engine 刷新资产快照（原子快照查询，零撕裂读） |
 | `m` | 切换至 Metrics 视图并对当前选中主机启动实时指标流 |
-| `l` | 切换至 Logs 视图并对当前选中主机启动实时日志流 |
+| `l`（小写） | 切换至 Logs 视图并对当前选中主机启动实时日志流（注意与大写 `L` 区分） |
 | `x` | 停止当前所有活跃的指标流与日志流 |
 | `s` | 在 Metrics 视图中切换 Top 进程排序方式（`CPU` / `Mem`） |
+| `L`（大写） | **实时热切换界面语言**（英文 / 简体中文）：立即重绘全部 5 个视图、窗口标题、状态栏与安全横幅，且同步切换后续 `Enter` 交互接管提示语种 |
 | `Enter`（Hosts 视图） | **受监督交互式终端接管**：排空 TUI 渲染 -> 释放终端给交互式 SSH 会话 -> 退出 SSH 后自动恢复 TUI 工作台 |
 | `q` / `Ctrl+C` | 干净退出工作台并确定性恢复终端原始状态 |
+
+### 实时语言切换（大写 `L`）行为说明
+
+- **大小写严格区分**：大写 **`L`** 切换中英文界面；小写 **`l`** 保持启动远端实时日志流。
+- **过滤输入模式不误触**：按 `/` 进入过滤编辑态时，输入大写 `L` 会作为搜索关键词追加到过滤框，绝不误触发语种切换；按 `Enter` 或 `Esc` 退出过滤编辑态后恢复快捷键功能。
+- **接管交互提示同步切换**：按 `L` 切换语种时会即时同步底层交互适配器（`OnLocaleChange`），随后在主机视图按 `Enter` 接管进入交互式 SSH 会话时，主机密钥指纹确认与口令提示会自动使用切换后的语种，且退出 SSH 返回工作台后继续保留该语种。
+- **会话级生效、零落盘**：热切换仅在当前 TUI 进程生命周期内生效，不改写 `~/.xops/config.yaml`。
 
 ## 4. 实时安全熔断与不确定态横幅
 

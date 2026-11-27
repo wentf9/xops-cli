@@ -143,7 +143,7 @@ policy:
 
 ## 3. 审计日志与 O(1) 跨进程崩溃对账（`xops audit`）
 
-每次授权操作均按生命周期写入 `~/.xops/audit.jsonl`（每行规范 JSON/v2，经 `audit.jsonl.lock` 旁路锁保护），阶段包括 `denied`、`authorized` 与 `finalized`。
+每次授权操作均按生命周期写入 `~/.xops/audit.jsonl`（每行规范英文 JSON/v2，不受 `--lang` / `XOPS_LANG` 影响，经 `audit.jsonl.lock` 旁路锁保护），阶段包括 `denied`、`authorized` 与 `finalized`。
 
 ### O(1) 进程锁崩溃对账机制
 

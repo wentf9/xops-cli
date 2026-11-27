@@ -41,7 +41,7 @@ xops scp --expected-digest sha256:<hex> --json web-01:/srv/release.bin ./release
 
 ## 2. Single-Shot Remote SFTP Operations (`xops sftp <op>`)
 
-Perform atomic remote filesystem operations without requiring a remote shell (all subcommands support `--json` and `--policy`):
+Perform atomic remote filesystem operations without requiring a remote shell (all subcommands support `--lang <en|zh>`, `--json`, and `--policy`, including before the subcommand verb such as `xops sftp --lang zh ls web-01 /srv/app`):
 
 ```bash
 # Listing, stat, realpath, and symlink inspection
@@ -84,7 +84,7 @@ xops sftp --dir /srv/app web-01
 xops sftp web-01:/srv/app
 ```
 
-> The interactive SFTP shell does not support `--json` (use single-shot subcommands for machine parsing). Pressing `Ctrl+C` during a slow transfer cancels only that command and returns cleanly to the `sftp> ` prompt.
+> The interactive SFTP shell does not support `--json` (use single-shot subcommands for machine parsing), and inherits `--lang <en|zh>` / `XOPS_LANG` for built-in help, status, and error/approval prompts (e.g. `xops sftp --lang zh web-01`). Pressing `Ctrl+C` during a slow transfer cancels only that command and returns cleanly to the `sftp> ` prompt.
 
 ### Interactive Shell Commands
 

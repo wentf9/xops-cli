@@ -50,6 +50,7 @@ xops mcp serve --transport http --listen 0.0.0.0:8080 \
 | `--allowed-host <host>` | Allowed non-loopback HTTP `Host` header (repeatable, CSV supported) |
 | `-F <configfile>` | Alternate OpenSSH config file (validated fail-closed if specified; `none` disables) |
 | `--policy <profile>` | Policy profile (MCP defaults to **`strict_agent`**) |
+| `--lang <en\|zh>` | Applies only to `xops mcp` CLI help and startup errors; **never affects** MCP wire tool schemas or responses (always canonical English) |
 
 ## 2. Security Boundary and `ssh-agent` Note
 
@@ -62,6 +63,7 @@ In MCP mode, `cmd/xops` and `core/engine` physically enforce strict least-privil
    - For password, TOTP, or keyboard-interactive credentials, use a non-interactively accessible Vault backend such as `os_keychain` or `external_helper`.
 3. **Default `strict_agent` Circuit Breaking**: Any `AuditPostWriteError` immediately transitions the Engine into the irreversible `Halted` state, revoking active managed handles and rejecting subsequent requests (`503 Service Unavailable`, `code: "gate_halted"`).
 4. **Automatic Startup `Prepare`**: Before serving requests, the server runs O(1) crash-audit reconciliation and dual-generation WAL transfer recovery (`TransferUncertainCommit` entries are quarantined with zero side effects).
+5. **Canonical English Machine Contract (Unaffected by `--lang` / `XOPS_LANG`)**: All **7 MCP tool** names, `tools/list` descriptions, and JSON Schemas (`nodes`, `terminal_exec`, `terminal_session`, `file`, `transfer`, `tunnel`, `gui`), all JSON-RPC 2.0 error responses and `ToolErrorPayload` fields (`code`, `message`, `uncertain`, `halted`), `approval_challenge` payloads (`reason`, `instructions`, `envelope`, `envelope_digest`), and `OutcomeUnknown` responses (`code: "uncertain_outcome"` / `"transfer_uncertain_commit"`, `"uncertain": true`, preserving the automatic-retry-forbidden warning) always remain invariant canonical English for deterministic client parsing.
 
 ## 3. Streamable HTTP Endpoints and Protections
 

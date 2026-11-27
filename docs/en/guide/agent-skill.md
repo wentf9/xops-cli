@@ -50,7 +50,7 @@ skills/xops-agent/
 
 The v2 skill aligns AI agents with XOps v2's fail-closed contracts:
 
-1. **Prefer canonical `--json`**: Parse deterministic JSON/v2 responses, `error_code`, `do_not_retry`, and `approval_challenge` payloads instead of scraping human text.
+1. **Prefer canonical `--json` and invariant English contracts**: Parse deterministic JSON/v2 responses, `error_code`, `do_not_retry`, and `approval_challenge` payloads instead of scraping human text. Regardless of `--lang <en|zh>` or `XOPS_LANG`, `--json` keys, `error_code`, `approval_challenge.reason`, `doctor --json` & `config import --json` diagnostics, and all 7 MCP tools' descriptions, JSON Schemas, JSON-RPC error payloads, and `OutcomeUnknown` automatic-retry-forbidden warnings remain **invariant canonical English machine contracts** (only human-facing CLI `--json` `error`/`diagnostic` text localizes).
 2. **Use explicit policy profiles**: Pass `--policy strict_agent` or `--policy strict` whenever guardrail enforcement or human approval gates are required.
 3. **Zero plaintext secrets**: Never pass passwords on CLI arguments or in YAML/CSV; manage secrets exclusively via `xops creds` and `<store>/<item>` references.
 4. **Never blindly retry uncertain outcomes**: When `outcome_unknown` (`do_not_retry: true`) or `uncertain_durability` (`Applied && !Durable`) occurs, inspect remote or local state before taking any corrective action, and never delete credentials prematurely.

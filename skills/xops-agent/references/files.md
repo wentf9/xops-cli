@@ -37,7 +37,7 @@ xops sftp recover --json
 xops sftp recover --local-root ./downloads --prune --json web-01 <transfer_id>
 ```
 
-All `xops sftp` subcommands accept `-P/-p/-l/-i/-J/-o/-F`, `--policy`, and `--json`.
+All `xops sftp` subcommands accept `-P/-p/-l/-i/-J/-o/-F`, `--policy`, `--lang <en|zh>` (valid before or after the subcommand verb before `--`, e.g. `xops sftp --lang zh ls web-01 /srv/app`), and `--json`.
 
 ## Parallel Resumable SCP (`xops scp`)
 
@@ -63,7 +63,7 @@ Key `xops scp` safety constraints:
 
 ## Interactive SFTP Shell (`xops sftp <target>`)
 
-For human interactive sessions only (rejects `--json`):
+For human interactive sessions only (rejects `--json`; inherits `--lang <en|zh>` / `XOPS_LANG` for help, status, and error/approval prompts):
 
 ```bash
 xops sftp [--dir /srv/app] web-01
@@ -75,3 +75,4 @@ Built-in commands: `pwd`, `cd`, `ls [-l] [-a]`, `lpwd`, `lcd`, `lls [-l] [-a]`, 
 
 - **`file`**: `read`, `write`, `patch` (with `edits`, `expected_anchor`, `expected_digest`), `stat`, `rename`, `list`, `mkdir`, `remove`, `removedir`. Zero `OperatorReadFS` access.
 - **`transfer`**: `start`, `chunk`, `pull`, `commit`, `abort`, `resume`, `recover`, `inspect`. Supports up to 10 GiB with dual-generation CRC32 WAL and Streamable HTTP `/transfers/{transfer_id}/stream` (anchored strictly to `--transfer-root`). Never touch `TransferUncertainCommit` entries without inspecting remote state first.
+- Tool descriptions, JSON Schemas, `approval_challenge` payloads, and `OutcomeUnknown` / `transfer_uncertain_commit` error responses remain invariant canonical English regardless of `--lang` or `XOPS_LANG`.

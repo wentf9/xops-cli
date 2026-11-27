@@ -16,7 +16,7 @@ xops exec --dialect powershell --interpreter pwsh --json win-01 -- 'Get-Service 
 xops exec --dialect cmd --interpreter cmd --json win-01 -- 'ver'
 ```
 
-Always put XOps flags before `<target>` and separate remote flags with `--`. Default capture limit is 4 MiB (max 64 MiB); command length limit is 1 MiB.
+Always put XOps flags (`--json`, `--policy`, `--lang <en|zh>`, etc.) before `<target>` and separate remote flags with `--`; pre-scanning stops at `<target>` or `--`, so remote arguments such as `--lang=fr` pass through untouched. Default capture limit is 4 MiB (max 64 MiB); command length limit is 1 MiB.
 
 ### Single-Target Privilege Escalation
 
@@ -49,7 +49,7 @@ xops exec --target web-01 --target deploy@192.0.2.20 --json -- hostname
 ## Three-State Outcomes, Exit Codes, and `do_not_retry`
 
 - Exit codes: `0` success, `1` general/runtime error, `2` usage error, `128 + sig` remote POSIX signal, `255` SSH/auth/host-key/not-started/unknown/post-audit failure.
-- `--json` returns `ExecOutcomeView`:
+- `--json` returns `ExecOutcomeView` (all keys, `outcome_kind`, `exit_code`, `do_not_retry`, and `error_code` are invariant canonical English regardless of `--lang`/`XOPS_LANG`; only human-facing `diagnostic`/`error` text localizes):
   - `"outcome_kind": "completed"` — remote process finished with known exit status (`ok: true` only when exit code is 0 and no post-audit error occurred).
   - `"outcome_kind": "not_started"` — failed before remote execution started (safe to retry after fixing root cause).
   - `"outcome_kind": "unknown"` + `"do_not_retry": true` — **never blindly retry**; verify remote state with read-only checks and `xops audit tail` first.
@@ -103,7 +103,7 @@ cat deploy.yaml | xops playbook run --stdin --policy strict --json
 ## Policy Profiles, Guardrails, and Audit (`xops audit`)
 
 - `--policy direct_operator` (CLI default) | `strict` / `strict_operator` | `strict_agent` (MCP default; irreversible `Halted` circuit break on audit post-write failure).
-- Query and reconcile `~/.xops/audit.jsonl` and `~/.xops/run/*.lock`:
+- Query and reconcile `~/.xops/audit.jsonl` (always canonical English JSON/v2, unaffected by `--lang`/`XOPS_LANG`) and `~/.xops/run/*.lock`:
 
 ```bash
 xops audit reconcile --json
@@ -114,8 +114,8 @@ xops audit inspect <operation_id> --json
 
 ## Interactive Interfaces & MCP Equivalents
 
-- Interactive CLI tools (human terminal only, reject `--json`): `xops ssh <target>` and `xops tui [--node <id>] [--refresh 2s] [--no-alt-screen]`.
-- **MCP tools**:
+- Interactive CLI tools (human terminal only, reject `--json`): `xops ssh <target>` and `xops tui [--node <id>] [--refresh 2s] [--no-alt-screen] [--lang <en|zh>]` (inside TUI, uppercase `L` live-toggles English/Chinese without triggering in `/` filter mode and syncs SSH takeover prompts; lowercase `l` starts log streaming).
+- **MCP tools** (all tool descriptions, JSON Schemas, `approval_challenge` fields, JSON-RPC errors, and `OutcomeUnknown` automatic-retry-forbidden responses remain invariant canonical English regardless of `--lang`/`XOPS_LANG`):
   - `terminal_exec`: `exec`, `exec_privileged`, `probe_shell`, `batch_exec`, `run_playbook`.
   - `terminal_session`: managed persistent PTY (`open`, `read`, `write`, `resize`, `signal`, `inspect`, `close`).
   - `gui`: POSIX-validated remote GUI actions (`exec`, `open_session`, `inspect_session`, `close_session`; screenshots written inside `--artifact-root`).

@@ -50,6 +50,7 @@ xops mcp serve --transport http --listen 0.0.0.0:8080 \
 | `--allowed-host <host>` | 允许的非回环 HTTP `Host` 白名单（可重复，支持逗号分隔） |
 | `-F <configfile>` | 替代 OpenSSH 配置文件（显式传入时严格检查存在性；`none` 禁用） |
 | `--policy <profile>` | 策略配置档（MCP 默认 **`strict_agent`**） |
+| `--lang <en\|zh>` | 仅作用于 `xops mcp` CLI 帮助与启动报错；**不影响** MCP 协议线上工具描述与响应（恒为规范英文） |
 
 ## 2. 强制安全边界与 `ssh-agent` 认证说明
 
@@ -62,6 +63,7 @@ XOps v2 在组合根（`cmd/xops`）与核心引擎两层为 MCP 模式实施了
    - 若使用密码、TOTP 或键盘交互认证，请配合在无交互环境下可读取的 Vault 后端（如 `os_keychain` 或 `external_helper`）。
 3. **默认 `strict_agent` 熔断**：任何 `AuditPostWriteError` 立即触发不可逆 `Halted` 熔断态，清空受管句柄并拒绝所有后续请求（HTTP 端点返回 `503 Service Unavailable`，`code: "gate_halted"`）。
 4. **启动期自动 `Prepare` 对账**：服务在开始接收请求前自动执行 O(1) 跨进程审计崩溃对账与双代 WAL 传输日志恢复（遇 `TransferUncertainCommit` 零副作用隔离并报告，严禁自动覆盖或删除）。
+5. **规范英文机器契约（不受 `--lang` / `XOPS_LANG` 影响）**：全部 **7 个 MCP 工具**（`nodes`、`terminal_exec`、`terminal_session`、`file`、`transfer`、`tunnel`、`gui`）的 `tools/list` 描述与 JSON Schema、JSON-RPC 2.0 错误响应与 `ToolErrorPayload`（`code`、`message`、`uncertain`、`halted`）、`approval_challenge` 信封字段（含 `reason`、`instructions`）以及 `OutcomeUnknown` 响应（`code: "uncertain_outcome"` / `"transfer_uncertain_commit"`、`"uncertain": true`，保留禁止自动重试警告）恒保持规范英文，确保跨语言与跨客户端的确定性机器解析。
 
 ## 3. Streamable HTTP 端点与安全机制
 

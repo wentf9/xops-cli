@@ -124,10 +124,64 @@ xops tui
 
 几乎所有命令均支持统一的前置或子命令级全局选项：
 
+- `--lang <en|zh>`：显式指定本次运行的界面显示语言（`en` 英文、`zh` 简体中文，可置于子命令前或后、`--` 之前，末次覆盖；详见下方 §7）。
 - `--json`：在 `stdout` 输出规范确定性 JSON/v2（开启 `Deterministic(true)`）；报错时输出统一结构化错误信封。
 - `--policy <profile>`：指定本次运行的安全策略配置档：`direct_operator`（CLI 默认）、`strict` / `strict_operator`、`strict_agent`（MCP 默认）。
 - `-F <configfile>`（或 `--ssh-config <path>`）：覆写 OpenSSH 配置文件路径；传入 `none` 可禁用 OpenSSH 配置读取。
-- `-h` / `--help`、`xops help <command>`：查看任意命令精确帮助。
+- `-h` / `--help`、`xops help <command>`：查看任意命令精确帮助（与 `version` 一样零引擎初始化、零触盘）。
+
+## 7. 语言设置与国际化（`--lang` / `XOPS_LANG`）
+
+XOps v2 内置纯内存 `embed.FS` **英文（`en`）与简体中文（`zh`）**双语词库，按进程生效且**不向 `~/.xops/config.yaml` 写入持久化语言配置**（所有 `zh*` 区域变体如 `zh_CN`、`zh-Hans`、`zh-TW` 均归并至简体中文 `zh`）。
+
+### 语言探测优先级
+
+启动期零子进程（零 `os/exec`）、零磁盘 I/O，按以下优先级自高向低确定显示语言：
+
+```text
+1. CLI 标志 --lang <en|zh>（或 --lang=<en|zh>）
+2. 环境变量 XOPS_LANG
+3. 环境变量 LC_ALL
+4. 环境变量 LC_MESSAGES
+5. 环境变量 LANG
+6. 操作系统原生区域（Windows 经 kernel32 GetUserDefaultLocaleName 查询；Unix/macOS 为空，仅依赖 POSIX 环境变量）
+7. 默认兜底 en（英文）
+```
+
+- **POSIX 覆盖语义**：`LC_ALL=C`、`LC_ALL=POSIX`（含 `.UTF-8` 等后缀，如 `C.UTF-8`）显式解析为 `en` 并**阻断**更低优先级的 `LANG`（例如 `LC_ALL=C LANG=zh_CN.UTF-8` 结果为英文）；刻意忽略 GNU `LANGUAGE` 列表。
+- **失败关闭与容错差异**：显式传入非法或缺值的 `--lang`（如 `--lang fr`、`--lang C`）会立即以退出码 `2`（`usage_error`）失败关闭（零引擎初始化、零触盘），并按环境探测语种渲染报错；环境变量或系统区域中的未知非空标签则会安全回退为 `en` 并阻断继续穿透。
+- **命令感知扫描与透传保护**：`--lang` 可写在子命令前、子命令后（多级命令族如 `xops hosts --lang zh list` 或 `xops hosts list --lang zh` 均支持），遵循**末次覆盖**并在 `--` 处停止扫描。对于 `xops ssh` 与 `xops exec`，预扫描遇到首个位置参数（目标主机）或 `--` 即停止，因此远端命令自带的参数（如 `xops ssh web-01 mytool --lang=fr`）绝不会被误拦截。
+
+### 常用示例
+
+```bash
+# 查看中文或英文帮助与版本（纯内存渲染，绝不初始化引擎或创建 ~/.xops/）
+xops --lang zh --help
+xops help ssh --lang zh
+xops version --lang zh
+
+# 通过环境变量为当前 Shell 会话默认启用中文
+export XOPS_LANG=zh
+xops hosts list
+xops doctor
+
+# 单次覆盖为英文，或使用 POSIX LC_ALL=C 强制英文输出
+xops --lang en doctor
+LC_ALL=C LANG=zh_CN.UTF-8 xops version
+
+# 远端命令自带 --lang 参数完整透传，不触发 XOps 语法错误
+xops ssh web-01 mytool --lang=fr
+xops exec --lang zh web-01 -- echo --lang=fr
+```
+
+### 机器契约规范英文边界
+
+为确保脚本、CI 与 AI Agent 解析稳定性，以下结构化与协议输出**恒保持规范英文**，不受 `--lang` 或 `XOPS_LANG` 影响：
+
+- **CLI `--json` 输出**：所有 JSON 字段名、枚举值、`exit_code`、`do_not_retry` 与 `error_code` 常量恒为规范英文；仅面向人工排障的 `error` 与 `diagnostic` 字段随当前语种本地化，且 `doctor --json`（诊断项与 `vault_note`）、`config import --json`（导入报告与告警）及 `approval_challenge.reason` 始终保持规范英文。
+- **MCP 服务端**：全部 7 个 MCP 工具的名称、描述、JSON Schema、JSON-RPC 错误响应、审批挑战信封与 `OutcomeUnknown` 警告恒为规范英文。
+- **审计日志与 OpenSSH 控制契约**：`~/.xops/audit.jsonl` 以及 `xops ssh -O` / `xops mux` 控制文本回执恒为规范英文。
+- **TUI 热切换**：在 `xops tui` 界面中可随时按大写 **`L`** 实时切换中英文（详见 [终端工作台（TUI）](./tui)）。
 
 ## 下一步
 
