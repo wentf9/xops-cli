@@ -3,7 +3,9 @@ package i18n
 import (
 	"slices"
 	"strings"
-	"unicode/utf8"
+
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/errchain"
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/textalg"
 )
 
 const (
@@ -31,15 +33,6 @@ type ErrorNode struct {
 // 避免触发 golangci-lint 的 errorlint 告警且无需任何行内 lint 豁免注释。
 type LocalizableNode interface {
 	LocalizableView() ErrorNode
-}
-
-// singleUnwrapper 与 multiUnwrapper 为包内具名解包接口（满足 noimplicit 禁止匿名接口断言要求）。
-type singleUnwrapper interface {
-	Unwrap() error
-}
-
-type multiUnwrapper interface {
-	Unwrap() []error
 }
 
 // InspectNode 非穿透读取单个 error 节点的 LocalizableNode 视图（不递归展开 Unwrap 链）。
@@ -70,34 +63,7 @@ func inspectLocalizable(err error) (ErrorNode, bool, bool) {
 
 // UnwrapDirect 非穿透提取单个错误节点的直接下层子错误（支持 Unwrap() []error 与 Unwrap() error）。
 func UnwrapDirect(err error) []error {
-	if err == nil {
-		return nil
-	}
-	if u, ok := any(err).(multiUnwrapper); ok && u != nil {
-		return filterNonNilErrors(u.Unwrap())
-	}
-	if u, ok := any(err).(singleUnwrapper); ok && u != nil {
-		if child := u.Unwrap(); child != nil {
-			return []error{child}
-		}
-	}
-	return nil
-}
-
-func filterNonNilErrors(raw []error) []error {
-	if len(raw) == 0 {
-		return nil
-	}
-	out := make([]error, 0, len(raw))
-	for _, item := range raw {
-		if item != nil {
-			out = append(out, item)
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return errchain.UnwrapDirect(err)
 }
 
 // Error 是 XOps v2 纯数据不可变结构化错误节点，实现 error、LocalizableNode、Unwrap 与 Is 契约。
@@ -124,22 +90,13 @@ func Sentinel(id MessageID) error {
 // 防止退化实例在 errors.Is 下与合法 Sentinel(KeyCommonInvalidArgument) 发生假阳性匹配。
 func SentinelWithFallback(id MessageID, fallback string) error {
 	msg := ensureErrorMessage(id, fallback, nil)
-	return &Error{
-		msg:        msg,
-		isSentinel: id.IsValid() && msg.IsValid() && msg.ID() == id,
-		valid:      true,
-	}
+	return &Error{msg: msg, isSentinel: id.IsValid() && msg.IsValid() && msg.ID() == id, valid: true}
 }
 
 // NewErrorWithFallback 以显式规范英文兜底构造结构化错误节点（仅供根模块 internal/i18n 桥接调用）。
 // sentinel 与 cause 均可为 nil，统一承接 E/EF/Wrap/WrapS 四类结构化错误构造路径。
 func NewErrorWithFallback(sentinel, cause error, id MessageID, fallback string, params ...Param) error {
-	return &Error{
-		sentinel: sentinel,
-		msg:      ensureErrorMessage(id, fallback, params),
-		cause:    cause,
-		valid:    true,
-	}
+	return &Error{sentinel: sentinel, msg: ensureErrorMessage(id, fallback, params), cause: cause, valid: true}
 }
 
 // E 构造携带核心规范英文兜底与参数的独立结构化错误。
@@ -169,71 +126,141 @@ func WrapSentinel(sentinel, cause error, replaced ...error) error {
 	if sentinel == nil && cause == nil {
 		return E(KeyCommonInvalidArgument)
 	}
-	suppressed := filterNonNilErrors(replaced)
+	suppressed := errchain.FilterNonNil(replaced)
 	if len(suppressed) > maxErrorSuppressed {
 		suppressed = suppressed[:maxErrorSuppressed]
 	}
-	return &Error{
-		sentinel:            sentinel,
-		cause:               cause,
-		suppressedSentinels: suppressed,
-		valid:               true,
+	return &Error{sentinel: sentinel, cause: cause, suppressedSentinels: suppressed, valid: true}
+}
+
+// WrapSentinelDetail 按规则 M1 将运行期动态明细 detail（经 BoundStr 确定性净化与裁剪）与可选根因 cause
+// 挂载至门面哨兵 sentinel 之下，完整保留 sentinel 头段语义渲染、replaced 抑制集与 cause 展开。
+// 当 detail 为空或纯空白时自动退化为 WrapSentinel(sentinel, cause, replaced...)。
+func WrapSentinelDetail(sentinel, cause error, detail string, replaced ...error) error {
+	bounded, ok := textalg.BoundNonBlankText(detail, MaxParamStringBytes)
+	if !ok {
+		return WrapSentinel(sentinel, cause, replaced...)
 	}
+	inner := NewErrorWithFallback(nil, cause, KeyCommonDetail, CanonicalFallback(KeyCommonDetail), BoundStr("detail", bounded))
+	return WrapSentinel(sentinel, inner, replaced...)
+}
+
+// DynamicDetailError 将不可预知的外部或对端动态错误文本封装为有界有效 UTF-8 叶子结构化错误（不绑定哨兵）。
+// 当 detail 为空或纯空白时安全降级为 E(KeyCommonInternalError)，确保永不返回 nil 或空错误文本。
+func DynamicDetailError(detail string) error {
+	bounded, ok := textalg.BoundNonBlankText(detail, MaxParamStringBytes)
+	if !ok {
+		return E(KeyCommonInternalError)
+	}
+	return NewErrorWithFallback(nil, nil, KeyCommonDetail, CanonicalFallback(KeyCommonDetail), BoundStr("detail", bounded))
 }
 
 // ensureErrorMessage 保证错误构造路径严格失败关闭并最大化保留有效诊断参数：
 //   - 非法 id 降级为 KeyCommonInvalidArgument；
 //   - 非法 UTF-8 或超长 fallback 按 BoundDisplayText 确定性净化；
-//   - 若因个别参数非法/重复/超限导致直构失败，保留全部合法非重复参数并对缺失占位符回填 "<invalid>"，
-//     彻底杜绝原始 "{key}" 占位符泄露至错误文本、审计或终端。
+//   - 快路径以 O(n) 零堆分配检查顶层与全部嵌套 ParamKindMessage 是否缺失占位符，完整闭合时直接返回；
+//   - 慢路径按模板实际必填槽位优先保序抢救、递归闭合嵌套消息并对缺失占位符回填 "<invalid>"；
+//     超过 MaxMessageParams 个不同占位符的病态模板直接降级为 KeyCommonInvalidArgument，彻底杜绝 "{key}" 泄露。
 func ensureErrorMessage(id MessageID, fallback string, params []Param) Message {
+	return ensureClosedMessage(id, fallback, false, 0, params, MaxMessageDepth)
+}
+
+func ensureClosedMessage(id MessageID, fallback string, hasCount bool, count int64, params []Param, remDepth uint8) Message {
 	if !id.IsValid() {
 		return NewMessage(KeyCommonInvalidArgument)
 	}
-	safeFallback := fallback
-	if len(safeFallback) > MaxTemplateBytes || !utf8.ValidString(safeFallback) {
-		safeFallback = BoundDisplayText(safeFallback, MaxTemplateBytes)
-	}
-	if m := buildMessage(id, safeFallback, false, 0, params); m.IsValid() {
+	safeFallback := textalg.SanitizeTemplate(fallback)
+	if m := buildMessage(id, safeFallback, hasCount, count, params); m.IsValid() && !hasMissingErrorPlaceholder(m, remDepth) {
 		return m
 	}
-	salvaged := salvageErrorParams(safeFallback, params)
-	if m := buildMessage(id, safeFallback, false, 0, salvaged); m.IsValid() {
+	salvaged, ok := salvageErrorParams(safeFallback, hasCount, params, remDepth)
+	if !ok {
+		return NewMessage(KeyCommonInvalidArgument)
+	}
+	if m := buildMessage(id, safeFallback, hasCount, count, salvaged); m.IsValid() {
 		return m
 	}
 	return NewMessage(KeyCommonInvalidArgument)
 }
 
-func salvageErrorParams(fallback string, params []Param) []Param {
-	out := make([]Param, 0, min(len(params), MaxMessageParams))
-	for _, p := range params {
-		if len(out) >= MaxMessageParams {
-			break
+func hasMissingErrorPlaceholder(m Message, remDepth uint8) bool {
+	if !m.IsValid() || hasTopLevelMissingPlaceholder(m) {
+		return true
+	}
+	for _, p := range m.params {
+		if p.kind != ParamKindMessage {
+			continue
 		}
-		if p.IsValid() && !hasParamKey(out, p.key) {
-			out = append(out, p)
+		if remDepth == 0 || p.msgVal == nil || hasMissingErrorPlaceholder(*p.msgVal, remDepth-1) {
+			return true
 		}
 	}
-	return backfillMissingPlaceholders(fallback, out)
+	return false
 }
 
-func backfillMissingPlaceholders(fallback string, out []Param) []Param {
-	if len(out) >= MaxMessageParams || !strings.ContainsRune(fallback, '{') {
-		return out
+func hasTopLevelMissingPlaceholder(m Message) bool {
+	if !strings.ContainsRune(m.fallback, '{') {
+		return false
 	}
-	keys, errID, _ := parsePlaceholderKeys(fallback)
-	if errID != MessageIDInvalid {
-		return out
+	return textalg.HasMissingPlaceholder(m.fallback, func(key string) bool {
+		return hasParamKey(m.params, key) || (key == "count" && m.hasCount)
+	})
+}
+
+func salvageErrorParams(fallback string, hasCount bool, params []Param, remDepth uint8) ([]Param, bool) {
+	required := textalg.CollectFormatPlaceholderKeys(fallback)
+	if hasCount && len(required) > 0 {
+		required = slices.DeleteFunc(required, func(k string) bool { return k == "count" })
 	}
-	for _, k := range keys {
-		if len(out) >= MaxMessageParams {
-			break
-		}
+	if len(required) > MaxMessageParams {
+		return nil, false
+	}
+	out := make([]Param, 0, min(max(len(params), len(required)), MaxMessageParams))
+	out = appendSalvagedParams(out, params, required, true, remDepth)
+	for _, k := range required {
 		if !hasParamKey(out, k) {
 			out = append(out, Str(k, degradedParamPlaceholder))
 		}
 	}
+	out = appendSalvagedParams(out, params, nil, false, remDepth)
+	return out, true
+}
+
+func appendSalvagedParams(out, params []Param, required []string, requiredOnly bool, remDepth uint8) []Param {
+	for _, p := range params {
+		if len(out) >= MaxMessageParams {
+			break
+		}
+		if !p.IsValid() || hasParamKey(out, p.key) || (requiredOnly && !slices.Contains(required, p.key)) {
+			continue
+		}
+		if normalized, ok := normalizeSalvagedParam(p, remDepth); ok {
+			out = append(out, normalized)
+		}
+	}
 	return out
+}
+
+func normalizeSalvagedParam(p Param, remDepth uint8) (Param, bool) {
+	if p.kind != ParamKindMessage {
+		return p, true
+	}
+	if p.msgVal == nil || !p.msgVal.IsValid() {
+		return Param{}, false
+	}
+	if remDepth == 0 {
+		rebuilt := Msg(p.key, NewMessage(KeyCommonInvalidArgument))
+		return rebuilt, rebuilt.IsValid()
+	}
+	if !hasMissingErrorPlaceholder(*p.msgVal, remDepth-1) {
+		return p, true
+	}
+	closed := ensureClosedMessage(p.msgVal.id, p.msgVal.fallback, p.msgVal.hasCount, p.msgVal.count, p.msgVal.params, remDepth-1)
+	rebuilt := Msg(p.key, closed)
+	if !rebuilt.IsValid() {
+		rebuilt = Msg(p.key, NewMessage(KeyCommonInvalidArgument))
+	}
+	return rebuilt, rebuilt.IsValid()
 }
 
 // Error 返回恒定规范英文错误文本（委托至 CanonicalError，与 enLoc.RenderError 共享唯一折叠代数）。
@@ -289,19 +316,7 @@ func (e *Error) Is(target error) bool {
 // ErrorID 按广度优先顺序从错误链提取首个有效结构化 MessageID（供测试与边界按语义而非脆弱文本断言）。
 // 本函数不依赖 errors.As/Is 之外的报错路径，并对异常环路设节点遍历上限确保必定终止。
 func ErrorID(err error) (MessageID, bool) {
-	if err == nil {
-		return MessageIDInvalid, false
-	}
-	queue := []error{err}
-	for visited := 0; len(queue) > 0 && visited < maxErrorInspectNodes; visited++ {
-		cur := queue[0]
-		queue = queue[1:]
-		if id, ok := inspectNodeMessageID(cur); ok {
-			return id, true
-		}
-		queue = append(queue, UnwrapDirect(cur)...)
-	}
-	return MessageIDInvalid, false
+	return errchain.FindFirst(err, maxErrorInspectNodes, inspectNodeMessageID)
 }
 
 func inspectNodeMessageID(cur error) (MessageID, bool) {

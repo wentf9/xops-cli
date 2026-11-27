@@ -60,3 +60,13 @@ func TestPublicAPIBlackBox(t *testing.T) {
 		t.Fatalf("BoundDisplayText 外置契约异常: got=%q", got)
 	}
 }
+
+func TestDynamicDetailPrimitivesBlackBox(t *testing.T) {
+	wd := i18n.WrapSentinelDetail(i18n.Sentinel(i18n.KeyCommonPermissionDeny), i18n.ErrInvalidLocale, "peer-denied", i18n.ErrInvalidLocale)
+	if !errors.Is(wd, i18n.ErrInvalidLocale) || wd.Error() != "permission denied: peer-denied" {
+		t.Fatalf("WrapSentinelDetail 外置契约异常: err=%q", wd.Error())
+	}
+	if dyn := i18n.DynamicDetailError("raw remote err"); dyn.Error() != "raw remote err" {
+		t.Fatalf("DynamicDetailError 外置契约异常: err=%q", dyn.Error())
+	}
+}

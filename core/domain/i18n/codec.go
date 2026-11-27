@@ -1,24 +1,11 @@
 package i18n
 
 import (
-	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"time"
-)
 
-type paramWire struct {
-	Key      string   `json:"key"`
-	Kind     string   `json:"kind"`
-	Str      *string  `json:"str,omitzero"`
-	Int64    *int64   `json:"int64,omitzero"`
-	Uint64   *uint64  `json:"uint64,omitzero"`
-	Float64  *float64 `json:"float64,omitzero"`
-	Prec     *int     `json:"prec,omitzero"`
-	Bool     *bool    `json:"bool,omitzero"`
-	Duration *string  `json:"duration,omitzero"`
-	Message  *Message `json:"message,omitzero"`
-}
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/textalg"
+)
 
 type messageWire struct {
 	ID       MessageID `json:"id"`
@@ -69,12 +56,8 @@ func (p *Param) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		return ErrNilReceiver
 	}
 	*p = Param{}
-	raw, err := readCheckedObjectValue(dec, ErrInvalidParam)
-	if err != nil {
-		return err
-	}
-	var wire paramWire
-	if err := jsonv2.Unmarshal(raw, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
+	var wire textalg.ParamWire[Message]
+	if err := textalg.UnmarshalCheckedObject(dec, &wire, ErrInvalidParam); err != nil {
 		return err
 	}
 	parsed, err := decodeParamWire(wire)
@@ -90,11 +73,7 @@ func (m Message) MarshalJSONTo(enc *jsontext.Encoder) error {
 	if !m.IsValid() {
 		return ErrInvalidMessage
 	}
-	wire := messageWire{
-		ID:       m.id,
-		Fallback: m.fallback,
-		Params:   m.params,
-	}
+	wire := messageWire{ID: m.id, Fallback: m.fallback, Params: m.params}
 	if m.hasCount {
 		c := m.count
 		wire.Count = &c
@@ -109,12 +88,8 @@ func (m *Message) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		return ErrNilReceiver
 	}
 	*m = Message{}
-	raw, err := readCheckedObjectValue(dec, ErrInvalidMessage)
-	if err != nil {
-		return err
-	}
 	var wire messageWire
-	if err := jsonv2.Unmarshal(raw, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
+	if err := textalg.UnmarshalCheckedObject(dec, &wire, ErrInvalidMessage); err != nil {
 		return err
 	}
 	parsed, err := decodeMessageWire(wire)
@@ -125,8 +100,8 @@ func (m *Message) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return nil
 }
 
-func encodeParamWire(p Param) paramWire {
-	w := paramWire{Key: p.key, Kind: p.kind.String()}
+func encodeParamWire(p Param) textalg.ParamWire[Message] {
+	w := textalg.ParamWire[Message]{Key: p.key, Kind: p.kind.String()}
 	switch p.kind {
 	case ParamKindString:
 		v := p.strVal
@@ -144,7 +119,7 @@ func encodeParamWire(p Param) paramWire {
 		v := p.boolVal
 		w.Bool = &v
 	case ParamKindDuration:
-		v := time.Duration(p.durNanos).String()
+		v := textalg.FormatDurationNanos(p.durNanos)
 		w.Duration = &v
 	case ParamKindMessage:
 		mc := p.msgVal.clone()
@@ -153,17 +128,17 @@ func encodeParamWire(p Param) paramWire {
 	return w
 }
 
-func decodeParamWire(w paramWire) (Param, error) {
-	if !isValidParamKey(w.Key) {
+func decodeParamWire(w textalg.ParamWire[Message]) (Param, error) {
+	if !textalg.IsValidParamKey(w.Key) {
 		return Param{}, EF(ErrInvalidParam, KeyParamInvalidKey, Str("key", BoundDisplayText(w.Key, MaxParamKeyBytes)))
 	}
-	if countParamPayloadFields(w) != 1 || (w.Kind != "float64" && w.Prec != nil) {
+	if !textalg.HasValidParamWireShape(w) {
 		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
 	}
 	return buildDecodedParam(w)
 }
 
-func buildDecodedParam(w paramWire) (Param, error) {
+func buildDecodedParam(w textalg.ParamWire[Message]) (Param, error) {
 	switch w.Kind {
 	case "string":
 		return validateDecodedParam(w.Key, w.Str != nil, func() Param { return Str(w.Key, *w.Str) })
@@ -188,68 +163,39 @@ func validateDecodedParam(key string, present bool, makeParam func() Param) (Par
 	if !present {
 		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", key))
 	}
-	p := makeParam()
-	if !p.IsValid() {
-		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", key))
+	if p := makeParam(); p.IsValid() {
+		return p, nil
 	}
-	return p, nil
+	return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", key))
 }
 
-func decodeFloatParam(w paramWire) (Param, error) {
-	if w.Float64 == nil {
-		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
-	}
+func decodeFloatParam(w textalg.ParamWire[Message]) (Param, error) {
 	prec := -1
 	if w.Prec != nil {
 		prec = *w.Prec
 	}
-	p := Float(w.Key, *w.Float64, prec)
-	if !p.IsValid() {
-		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
-	}
-	return p, nil
+	return validateDecodedParam(w.Key, w.Float64 != nil, func() Param { return Float(w.Key, *w.Float64, prec) })
 }
 
-func decodeDurationParam(w paramWire) (Param, error) {
+func decodeDurationParam(w textalg.ParamWire[Message]) (Param, error) {
 	if w.Duration == nil || *w.Duration == "" {
 		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
 	}
-	d, err := time.ParseDuration(*w.Duration)
+	nanos, err := textalg.ParseDurationNanos(*w.Duration)
 	if err != nil {
 		return Param{}, WrapS(ErrInvalidParam, err, KeyParamInvalidValue, Str("key", w.Key))
 	}
-	p := Dur(w.Key, d)
-	if !p.IsValid() {
-		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
-	}
-	return p, nil
+	return validateDecodedParam(w.Key, true, func() Param { return DurNanos(w.Key, nanos) })
 }
 
-func decodeNestedMessageParam(w paramWire) (Param, error) {
+func decodeNestedMessageParam(w textalg.ParamWire[Message]) (Param, error) {
 	if w.Message == nil || !w.Message.IsValid() {
 		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
 	}
 	if w.Message.depth >= MaxMessageDepth {
 		return Param{}, EF(ErrInvalidParam, KeyParamDepthExceeded, Int("max", int(MaxMessageDepth)))
 	}
-	p := Msg(w.Key, *w.Message)
-	if !p.IsValid() {
-		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
-	}
-	return p, nil
-}
-
-func countParamPayloadFields(w paramWire) int {
-	n := 0
-	for _, set := range []bool{
-		w.Str != nil, w.Int64 != nil, w.Uint64 != nil,
-		w.Float64 != nil, w.Bool != nil, w.Duration != nil, w.Message != nil,
-	} {
-		if set {
-			n++
-		}
-	}
-	return n
+	return validateDecodedParam(w.Key, true, func() Param { return Msg(w.Key, *w.Message) })
 }
 
 func decodeMessageWire(w messageWire) (Message, error) {
@@ -259,7 +205,7 @@ func decodeMessageWire(w messageWire) (Message, error) {
 	if len(w.Params) > MaxMessageParams {
 		return Message{}, EF(ErrInvalidMessage, KeyMessageTooManyParams, Int("max", MaxMessageParams))
 	}
-	if dupKey, ok := findDuplicateParamKey(w.Params); ok {
+	if dupKey, ok := textalg.FindDuplicateKey(w.Params, func(p Param) (string, bool) { return p.key, p.IsValid() }); ok {
 		return Message{}, EF(ErrInvalidMessage, KeyMessageDuplicateParam, Str("key", dupKey))
 	}
 	var parsed Message
@@ -272,56 +218,4 @@ func decodeMessageWire(w messageWire) (Message, error) {
 		return Message{}, EF(ErrInvalidMessage, KeyMessageInvalid)
 	}
 	return parsed, nil
-}
-
-func findDuplicateParamKey(params []Param) (string, bool) {
-	for i := range params {
-		if !params[i].IsValid() {
-			continue
-		}
-		for j := range i {
-			if params[j].IsValid() && params[j].key == params[i].key {
-				return params[i].key, true
-			}
-		}
-	}
-	return "", false
-}
-
-// readCheckedObjectValue 读取完整 JSON 值并拒绝顶层 null 以及对象内任意显式 null 成员值，
-// 防止类似 {"key":"k","kind":"string","str":"ok","int64":null} 的旁路载荷绕过指针非空校验。
-func readCheckedObjectValue(dec *jsontext.Decoder, baseErr error) (jsontext.Value, error) {
-	raw, err := dec.ReadValue()
-	if err != nil {
-		return nil, err
-	}
-	if err := rejectNullObjectMembers(raw, baseErr); err != nil {
-		return nil, err
-	}
-	return raw, nil
-}
-
-func rejectNullObjectMembers(raw jsontext.Value, baseErr error) error {
-	d := jsontext.NewDecoder(bytes.NewReader(raw))
-	if d.PeekKind() == 'n' {
-		return baseErr
-	}
-	if d.PeekKind() != '{' {
-		return nil
-	}
-	if _, err := d.ReadToken(); err != nil {
-		return err
-	}
-	for d.PeekKind() != '}' {
-		if _, err := d.ReadToken(); err != nil {
-			return err
-		}
-		if d.PeekKind() == 'n' {
-			return baseErr
-		}
-		if err := d.SkipValue(); err != nil {
-			return err
-		}
-	}
-	return nil
 }

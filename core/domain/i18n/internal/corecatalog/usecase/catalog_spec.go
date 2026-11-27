@@ -1,7 +1,9 @@
-package corecatalog
+package usecase
 
-// 本文件收录 Wave 3D（core/internal/{usecase/**,mcpruntime/**} 与 core/engine）全部键的规范英文兜底模板。
-func lookupUsecase(id string) string {
+import "slices"
+
+// Lookup 返回usecase/**、mcpruntime/** 与 engine 键对应的规范英文兜底模板；未命中返回空串。
+func Lookup(id string) string {
 	switch id {
 	case "uc.automation.nil_context":
 		return "usecase/automation: context must not be nil"
@@ -440,8 +442,9 @@ func lookupUsecase(id string) string {
 	}
 }
 
-func keysUsecase() []string {
-	return []string{
+// AllKeys 返回本分片注册的全部消息键（按字典序升序排列，每次返回独立切片副本）。
+func AllKeys() []string {
+	keys := []string{
 		"uc.automation.nil_context",
 		"uc.automation.invalid_config",
 		"uc.automation.not_initialized",
@@ -659,4 +662,6 @@ func keysUsecase() []string {
 		"engine.hostkey_unobserved",
 		"engine.known_hosts_dir_missing",
 	}
+	slices.Sort(keys)
+	return keys
 }

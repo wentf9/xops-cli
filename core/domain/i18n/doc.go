@@ -1,7 +1,7 @@
 // Package i18n 提供 XOps v2 纯数据国际化值对象与结构化错误核心原语。
 //
-// 本包是 core/domain/** 零外部领域依赖的绝对叶包（仅可单向导入内部纯字符串兜底表 internal/corecatalog，
-// 严禁导入 core/domain/algebraic 或任何其他仓内包），
+// 本包是 core/domain/** 零外部领域依赖的绝对叶包（仅可单向导入无环内部叶包
+// internal/corecatalog、internal/textalg 与 internal/errchain，严禁导入 core/domain/algebraic 或任何其他仓内包），
 // 仅依赖 archbound 白名单内的纯函数标准库，严守零 I/O、零全局可变状态、零反射与零多语种词库铁律：
 //   - 延迟渲染边界：core 仅构造纯数据 Message、Error 与 LocalizableNode，不感知运行期 Locale；
 //     err.Error()、audit.jsonl、events 与密码学摘要恒定输出规范英文，终端多语种渲染推迟至根模块 internal/i18n；

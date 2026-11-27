@@ -1,17 +1,12 @@
 package i18n
 
-import (
-	"errors"
-	"strings"
-)
+import "github.com/wentf9/xops-cli/core/domain/i18n/internal/errchain"
 
 const (
 	// maxErrorRenderDepth 限制错误链递归展开的最大深度，防止病态长链或环路导致栈溢出。
-	maxErrorRenderDepth = 64
+	maxErrorRenderDepth = errchain.MaxRenderDepth
 	// maxErrorSuppressed 限制单条因果路径上累积的已抑制哨兵集合容量上限，防止病态膨胀。
-	maxErrorSuppressed = 32
-	// maxErrorVisitNodes 限制单次渲染遍历的最大节点数，杜绝分支型环路或 DAG 指数爆炸。
-	maxErrorVisitNodes = 256
+	maxErrorSuppressed = errchain.MaxSuppressed
 )
 
 // ErrorRenderHooks 定义错误链折叠渲染代数中仅有的 3 个可插拔展示钩子；
@@ -36,7 +31,7 @@ func CanonicalError(err error) string {
 }
 
 // RenderErrorChain 是 core/domain/i18n 与 internal/i18n.(*Localizer).RenderError 共享的唯一递归渲染代数引擎。
-// 遵循形式化折叠规则 M1–M6：
+// 遵循形式化折叠规则 M1–M6（核心折叠代数下沉至无环内部叶包 internal/errchain）：
 //   - M1 纯门面节点：仅当门面未命中已抑制集合 S 时渲染头段，且恒合并 S' = S ∪ {Sentinel} ∪ SuppressedSentinels 向下传播；
 //   - M2 裸结构化哨兵：仅当未命中 S 时渲染；
 //   - M3 带上下文结构化节点：永不被 S 抑制，并携带 S' = S ∪ SuppressedSentinels 穿透递归 Cause；
@@ -44,271 +39,26 @@ func CanonicalError(err error) string {
 //   - M5 精确叶子核验：仅当 errors.Is 且错误文本完全相等时判定为裸叶子哨兵，严防覆盖或吞噬携带自定义文本的叶子错误；
 //   - M6 防重入保护：对任意 LocalizableNode 永不调用 .Error()，并在深度与节点数双上限下确定性终止。
 func RenderErrorChain(err error, hooks ErrorRenderHooks) string {
-	if err == nil {
-		return ""
-	}
-	r := errorRenderer{hooks: hooks}
-	return r.renderBranch(err, nil, 0)
+	return errchain.Render(err, errchain.Ops[Message]{
+		Inspect:            inspectErrChainNode,
+		RenderMessage:      hooks.RenderMessage,
+		CanonicalMessage:   Message.Canonical,
+		JoinCausal:         hooks.JoinCausal,
+		RenderUnstructured: hooks.RenderUnstructured,
+	})
 }
 
-type errorRenderer struct {
-	hooks  ErrorRenderHooks
-	visits int
-}
-
-func (r *errorRenderer) renderBranch(err error, suppressed []error, depth int) string {
-	if err == nil {
-		return ""
-	}
-	segments := r.collectSegments(err, suppressed, depth, nil)
-	segments = collapseAdjacentDuplicates(segments)
-	if len(segments) == 0 {
-		return ""
-	}
-	return r.joinSegments(segments)
-}
-
-func (r *errorRenderer) collectSegments(err error, suppressed []error, depth int, acc []string) []string {
-	if err == nil {
-		return acc
-	}
+func inspectErrChainNode(err error) (errchain.NodeView[Message], bool, bool) {
 	view, isNode, hasView := inspectLocalizable(err)
-	if isNode {
-		if !hasView {
-			return acc
-		}
-		if depth >= maxErrorRenderDepth || r.visits >= maxErrorVisitNodes {
-			return r.collectStructuredAtLimit(err, view, suppressed, acc)
-		}
-		r.visits++
-		return r.collectStructured(err, view, suppressed, depth, acc)
+	if !hasView {
+		return errchain.NodeView[Message]{}, isNode, false
 	}
-	if depth >= maxErrorRenderDepth || r.visits >= maxErrorVisitNodes {
-		return appendNonEmpty(acc, err.Error())
-	}
-	r.visits++
-	return r.collectUnstructured(err, suppressed, depth, acc)
-}
-
-func (r *errorRenderer) collectStructuredAtLimit(orig error, view ErrorNode, suppressed []error, acc []string) []string {
-	if !view.Message.IsValid() {
-		return acc
-	}
-	if view.IsSentinel && matchesAnySentinel(orig, suppressed) {
-		return acc
-	}
-	return appendNonEmpty(acc, r.renderMessage(view.Message))
-}
-
-func (r *errorRenderer) collectStructured(orig error, view ErrorNode, suppressed []error, depth int, acc []string) []string {
-	if !view.Message.IsValid() && view.Sentinel != nil {
-		// 规则 M1：纯门面映射节点；无论本层门面是否被外层抑制，恒向下传递合并后的抑制集。
-		if !matchesAnySentinel(view.Sentinel, suppressed) {
-			acc = appendNonEmpty(acc, r.renderBranch(view.Sentinel, suppressed, depth+1))
-		}
-		if view.Cause != nil {
-			next := mergeSuppressed(suppressed, view.Sentinel, view.SuppressedSentinels...)
-			acc = r.collectSegments(view.Cause, next, depth+1, acc)
-		}
-		return acc
-	}
-	if view.Message.IsValid() {
-		// 规则 M2/M3：裸哨兵受 suppressed 精准过滤；带业务上下文节点永不抑制。
-		if !view.IsSentinel || !matchesAnySentinel(orig, suppressed) {
-			acc = appendNonEmpty(acc, r.renderMessage(view.Message))
-		}
-	}
-	if view.Cause != nil {
-		next := mergeSuppressed(suppressed, nil, view.SuppressedSentinels...)
-		acc = r.collectSegments(view.Cause, next, depth+1, acc)
-	}
-	return acc
-}
-
-func (r *errorRenderer) collectUnstructured(err error, suppressed []error, depth int, acc []string) []string {
-	children := UnwrapDirect(err)
-	if r.hooks.RenderUnstructured != nil {
-		if text, bareTarget, handled := r.hooks.RenderUnstructured(err, children); handled {
-			if bareTarget != nil && matchesAnySentinel(bareTarget, suppressed) {
-				return acc
-			}
-			return appendNonEmpty(acc, text)
-		}
-	}
-	if len(children) > 0 && matchesJoinedErrorText(err, children) {
-		if len(children) == 1 {
-			return r.collectSegments(children[0], suppressed, depth+1, acc)
-		}
-		return appendNonEmpty(acc, r.renderJoinedErrors(children, suppressed, depth))
-	}
-	if len(children) == 0 && matchesExactLeafSentinel(err, suppressed) {
-		return acc
-	}
-	return appendNonEmpty(acc, err.Error())
-}
-
-func (r *errorRenderer) renderJoinedErrors(children []error, suppressed []error, depth int) string {
-	parts := make([]string, 0, len(children))
-	for _, child := range children {
-		if rendered := r.renderBranch(child, suppressed, depth+1); rendered != "" {
-			parts = append(parts, rendered)
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
-func (r *errorRenderer) renderMessage(msg Message) string {
-	if r.hooks.RenderMessage != nil {
-		return r.hooks.RenderMessage(msg)
-	}
-	return msg.Canonical()
-}
-
-func (r *errorRenderer) joinSegments(segments []string) string {
-	if len(segments) == 0 {
-		return ""
-	}
-	out := segments[0]
-	for _, seg := range segments[1:] {
-		out = r.joinTwo(out, seg)
-	}
-	return out
-}
-
-func (r *errorRenderer) joinTwo(head, tail string) string {
-	if head == "" {
-		return tail
-	}
-	if tail == "" || tail == head {
-		return head
-	}
-	if r.hooks.JoinCausal != nil {
-		return r.hooks.JoinCausal(head, tail)
-	}
-	return head + ": " + tail
-}
-
-// mergeSuppressed 返回在 base 基础上追加去重非空哨兵的新切片（上限 maxErrorSuppressed），
-// 绝不原地修改 base 底层数组，保证 errors.Join 各子分支抑制集合完全隔离。
-func mergeSuppressed(base []error, primary error, extras ...error) []error {
-	if len(base) >= maxErrorSuppressed || (primary == nil && len(extras) == 0) {
-		return base
-	}
-	out := make([]error, len(base), min(len(base)+1+len(extras), maxErrorSuppressed))
-	copy(out, base)
-	out = appendUniqueSuppressed(out, primary)
-	for _, item := range extras {
-		if len(out) >= maxErrorSuppressed {
-			break
-		}
-		out = appendUniqueSuppressed(out, item)
-	}
-	if len(out) == len(base) {
-		return base
-	}
-	return out
-}
-
-func appendUniqueSuppressed(out []error, candidate error) []error {
-	if candidate == nil || len(out) >= maxErrorSuppressed {
-		return out
-	}
-	for _, existing := range out {
-		if errors.Is(candidate, existing) && errors.Is(existing, candidate) {
-			return out
-		}
-	}
-	return append(out, candidate)
-}
-
-func matchesAnySentinel(err error, suppressed []error) bool {
-	if err == nil {
-		return false
-	}
-	for _, s := range suppressed {
-		if s != nil && errors.Is(err, s) {
-			return true
-		}
-	}
-	return false
-}
-
-// isExactLeafSentinel 执行 O(1) 零递归精确裸叶子哨兵匹配（对齐 CORE-2 与 M6 不变量）：
-// 仅当 target 为裸叶子哨兵、errors.Is 成立且叶子原文与哨兵规范文本逐字节相等时返回 true，
-// 严禁对复合或自指 LocalizableNode 重入 CanonicalError，杜绝环路爆栈、指数级复杂度与吞噬自定义诊断文本。
-func isExactLeafSentinel(err, target error) bool {
-	if err == nil || target == nil {
-		return false
-	}
-	targetText, ok := bareSentinelLeafText(target)
-	if !ok {
-		return false
-	}
-	return errors.Is(err, target) && err.Error() == targetText
-}
-
-// bareSentinelLeafText 仅对裸叶子哨兵返回其 O(1) 规范文本：
-//   - LocalizableNode：仅当有效纯哨兵且无下层 Cause/Sentinel 时取 view.Message.Canonical()（零递归）；
-//   - 非 LocalizableNode：仅当无直接子错误（len(UnwrapDirect(target)) == 0）时取 target.Error()。
-func bareSentinelLeafText(target error) (string, bool) {
-	if view, isNode, hasView := inspectLocalizable(target); isNode {
-		if hasView && view.IsSentinel && view.Message.IsValid() && view.Cause == nil && view.Sentinel == nil {
-			return view.Message.Canonical(), true
-		}
-		return "", false
-	}
-	if len(UnwrapDirect(target)) != 0 {
-		return "", false
-	}
-	return target.Error(), true
-}
-
-func matchesExactLeafSentinel(err error, suppressed []error) bool {
-	if err == nil || len(suppressed) == 0 {
-		return false
-	}
-	for _, s := range suppressed {
-		if isExactLeafSentinel(err, s) {
-			return true
-		}
-	}
-	return false
-}
-
-// matchesJoinedErrorText 判断非结构化错误 err 是否为纯 errors.Join 风格多错误容器（无额外前缀文案），
-// 通过纯字符串拼接函数 joinChildErrorTexts 避免产生局部 error，零触发 failclosed 检查。
-func matchesJoinedErrorText(err error, children []error) bool {
-	return len(children) > 0 && err.Error() == joinChildErrorTexts(children)
-}
-
-func joinChildErrorTexts(children []error) string {
-	texts := make([]string, len(children))
-	for i, child := range children {
-		texts[i] = child.Error()
-	}
-	return strings.Join(texts, "\n")
-}
-
-func appendNonEmpty(acc []string, s string) []string {
-	if s == "" {
-		return acc
-	}
-	return append(acc, s)
-}
-
-func collapseAdjacentDuplicates(segments []string) []string {
-	if len(segments) <= 1 {
-		return segments
-	}
-	out := make([]string, 0, len(segments))
-	for _, seg := range segments {
-		if seg == "" {
-			continue
-		}
-		if len(out) > 0 && out[len(out)-1] == seg {
-			continue
-		}
-		out = append(out, seg)
-	}
-	return out
+	return errchain.NodeView[Message]{
+		Sentinel:            view.Sentinel,
+		Message:             view.Message,
+		HasMessage:          view.Message.IsValid(),
+		Cause:               view.Cause,
+		SuppressedSentinels: view.SuppressedSentinels,
+		IsSentinel:          view.IsSentinel,
+	}, true, true
 }

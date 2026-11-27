@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/errchain"
 )
 
 type customCanceledLeaf struct {
@@ -311,12 +313,134 @@ func TestRenderErrorChainExactLeafO1AndAcyclicJoin(t *testing.T) {
 	}
 
 	// 3. 复合 LocalizableNode 与带直接子错误的非结构化容器不作为裸叶子哨兵参与精确叶子吞噬。
+	ops := errchain.Ops[Message]{Inspect: inspectErrChainNode, CanonicalMessage: Message.Canonical}
 	wrappedTarget := &suppressedCustomNode{sentinel: ErrInvalidParam, cause: errors.New("inner")}
-	if isExactLeafSentinel(catchAllLeaf{detail: wrappedTarget.Error()}, wrappedTarget) {
-		t.Fatal("复合 LocalizableNode 不得通过 isExactLeafSentinel 裸叶子匹配")
+	if errchain.IsExactLeafSentinel(catchAllLeaf{detail: wrappedTarget.Error()}, wrappedTarget, ops) {
+		t.Fatal("复合 LocalizableNode 不得通过 IsExactLeafSentinel 裸叶子匹配")
 	}
 	joinedTarget := errors.Join(errors.New("a"), errors.New("b"))
-	if isExactLeafSentinel(catchAllLeaf{detail: joinedTarget.Error()}, joinedTarget) {
-		t.Fatal("带直接子错误的非结构化容器不得通过 isExactLeafSentinel 裸叶子匹配")
+	if errchain.IsExactLeafSentinel(catchAllLeaf{detail: joinedTarget.Error()}, joinedTarget, ops) {
+		t.Fatal("带直接子错误的非结构化容器不得通过 IsExactLeafSentinel 裸叶子匹配")
 	}
+}
+
+func TestEnsureErrorMessageMissingPlaceholderMatrix(t *testing.T) {
+	cases := []struct {
+		name   string
+		tmpl   string
+		params []Param
+		want   string
+		wantID MessageID
+	}{
+		{
+			name: "zero_params_backfill",
+			tmpl: "host={host} port={port}",
+			want: "host=<invalid> port=<invalid>",
+		},
+		{
+			name:   "partial_valid_params_backfill",
+			tmpl:   "host={host} port={port} user={user}",
+			params: []Param{Str("host", "web-1"), Int("port", 22)},
+			want:   "host=web-1 port=22 user=<invalid>",
+		},
+		{
+			name:   "escaped_and_triple_braces",
+			tmpl:   "{{escaped}} {{{k}}} {{{{lit}}}} {{{{{x}}}}}",
+			params: []Param{Str("x", "ok")},
+			want:   "{escaped} {<invalid>} {{lit}} {{ok}}",
+		},
+		{
+			name:   "malformed_braces_mixed_with_valid_placeholders",
+			tmpl:   "} bad {unclosed {a} {bad key} {b} {c{d}}",
+			params: []Param{Str("b", "ok")},
+			want:   "} bad {unclosed <invalid> {bad key} ok {c<invalid>}",
+		},
+		{
+			name:   "excess_unrelated_params_prioritize_required",
+			tmpl:   "req={r1},{r2},{r3}",
+			params: makeUnrelatedParams(14),
+			want:   "req=<invalid>,<invalid>,<invalid>",
+		},
+		{
+			name:   "over_max_placeholders_degrades_to_invalid_arg",
+			tmpl:   makeTooManyPlaceholdersTemplate(MaxMessageParams + 1),
+			want:   "invalid argument",
+			wantID: KeyCommonInvalidArgument,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := NewErrorWithFallback(nil, nil, MessageID("test.matrix"), tc.tmpl, tc.params...)
+			if got := err.Error(); got != tc.want {
+				t.Fatalf("got=%q, want=%q", got, tc.want)
+			}
+			if tc.wantID != MessageIDInvalid {
+				if id, ok := ErrorID(err); !ok || id != tc.wantID {
+					t.Fatalf("ErrorID = (%q, %v), want %q", id, ok, tc.wantID)
+				}
+			}
+		})
+	}
+	assertNestedEnsureErrorMessageClosure(t)
+	assertHasMissingPlaceholderZeroAllocs(t)
+}
+
+func assertNestedEnsureErrorMessageClosure(t *testing.T) {
+	t.Helper()
+	// 1. 2–4 层嵌套 Msg 缺参递归回填（含嵌套复数消息保留 count）。
+	for depth := 2; depth <= int(MaxMessageDepth); depth++ {
+		cur := NewPluralMessageWithFallback(MessageID("test.leaf"), "n={count} miss={leaf}", 7)
+		for lvl := depth - 1; lvl >= 1; lvl-- {
+			cur = NewMessageWithFallback(MessageID("test.mid"), "L={child} pad={m}", Msg("child", cur))
+		}
+		err := NewErrorWithFallback(nil, nil, MessageID("test.root"), "root={sub}", Msg("sub", cur))
+		got := err.Error()
+		if strings.Contains(got, "{leaf}") || strings.Contains(got, "{m}") || strings.Contains(got, "{count}") {
+			t.Fatalf("depth=%d 嵌套消息泄露原始占位符: got=%q", depth, got)
+		}
+		if !strings.Contains(got, "n=7 miss=<invalid>") {
+			t.Fatalf("depth=%d 嵌套复数计数或回填异常: got=%q", depth, got)
+		}
+	}
+
+	// 2. 嵌套子消息本身含 >MaxMessageParams 占位符时，仅子消息安全降级为 KeyCommonInvalidArgument。
+	badChild := NewMessageWithFallback(MessageID("test.badchild"), makeTooManyPlaceholdersTemplate(MaxMessageParams+1))
+	parentErr := NewErrorWithFallback(nil, nil, MessageID("test.parent"), "outer={sub}", Msg("sub", badChild))
+	if got := parentErr.Error(); got != "outer=invalid argument" {
+		t.Fatalf("嵌套病态子消息降级异常: got=%q", got)
+	}
+}
+
+func assertHasMissingPlaceholderZeroAllocs(t *testing.T) {
+	t.Helper()
+	plain := NewMessage(KeyCommonNotFound)
+	paramMsg := NewMessageWithFallback(MessageID("test.fast"), "host={host} port={port} ({{lit}})", Str("host", "h"), Int("port", 22))
+	for name, msg := range map[string]Message{"plain": plain, "param": paramMsg} {
+		allocs := testing.AllocsPerRun(50, func() {
+			if hasMissingErrorPlaceholder(msg, MaxMessageDepth) {
+				t.Fatalf("%s 完整消息不应判定为缺参", name)
+			}
+		})
+		if allocs != 0 {
+			t.Fatalf("hasMissingErrorPlaceholder(%s) 应为 0 堆分配, 实际=%.1f", name, allocs)
+		}
+	}
+}
+
+func makeUnrelatedParams(n int) []Param {
+	out := make([]Param, n)
+	for i := range n {
+		out[i] = Int("u"+string(rune('a'+i)), i)
+	}
+	return out
+}
+
+func makeTooManyPlaceholdersTemplate(n int) string {
+	var b strings.Builder
+	for i := range n {
+		b.WriteString("{k")
+		b.WriteByte(byte('a' + i))
+		b.WriteByte('}')
+	}
+	return b.String()
 }

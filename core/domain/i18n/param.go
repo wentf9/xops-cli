@@ -3,9 +3,10 @@ package i18n
 import (
 	"math"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/textalg"
 )
 
 const (
@@ -14,11 +15,11 @@ const (
 	// MaxMessageParams 限制单条 Message 携带的最大参数个数。
 	MaxMessageParams = 16
 	// MaxParamKeyBytes 限制参数键名与模板占位符键名的最大字节长度。
-	MaxParamKeyBytes = 64
+	MaxParamKeyBytes = textalg.MaxParamKeyBytes
 	// MaxParamStringBytes 限制单个字符串参数值的最大 UTF-8 字节长度。
 	MaxParamStringBytes = 4096
 	// MaxTemplateBytes 限制单条消息模板或兜底文本的最大 UTF-8 字节长度。
-	MaxTemplateBytes = 8192
+	MaxTemplateBytes = textalg.MaxTemplateBytes
 	// MaxFloatPrec 限制浮点参数固定小数位数的上限，防止格式化输出爆炸。
 	MaxFloatPrec = 15
 )
@@ -103,7 +104,7 @@ type Param struct {
 
 // Str 构造有界 UTF-8 字符串参数；若键名非法、超长或非有效 UTF-8 则返回无效零值 Param。
 func Str(k, v string) Param {
-	if !isValidParamKey(k) || len(v) > MaxParamStringBytes || !utf8.ValidString(v) {
+	if !textalg.IsValidParamKey(k) || len(v) > MaxParamStringBytes || !utf8.ValidString(v) {
 		return Param{}
 	}
 	return Param{key: k, kind: ParamKindString, strVal: v, valid: true}
@@ -112,7 +113,7 @@ func Str(k, v string) Param {
 // BoundStr 构造有界有效 UTF-8 字符串参数：对外部不可信文本（路径、命令行词、远端消息、panic 值）
 // 执行确定性 UTF-8 净化与按完整 rune 边界裁剪（上限 MaxParamStringBytes）；仅键名非法时失败关闭返回无效零值 Param。
 func BoundStr(k, v string) Param {
-	if !isValidParamKey(k) {
+	if !textalg.IsValidParamKey(k) {
 		return Param{}
 	}
 	return Param{
@@ -130,7 +131,7 @@ func Int(k string, v int) Param {
 
 // Int64 构造 64 位有符号整数参数；若键名非法则返回无效零值 Param。
 func Int64(k string, v int64) Param {
-	if !isValidParamKey(k) {
+	if !textalg.IsValidParamKey(k) {
 		return Param{}
 	}
 	return Param{key: k, kind: ParamKindInt64, intVal: v, valid: true}
@@ -138,7 +139,7 @@ func Int64(k string, v int64) Param {
 
 // Uint64 构造 64 位无符号整数参数；若键名非法则返回无效零值 Param。
 func Uint64(k string, v uint64) Param {
-	if !isValidParamKey(k) {
+	if !textalg.IsValidParamKey(k) {
 		return Param{}
 	}
 	return Param{key: k, kind: ParamKindUint64, uintVal: v, valid: true}
@@ -147,7 +148,7 @@ func Uint64(k string, v uint64) Param {
 // Float 构造有限浮点数参数（prec 为 -1 表示最短精确表示，0..MaxFloatPrec 表示固定小数位数）。
 // 严格拒绝 NaN、±Inf、越界 prec 与非法键名，并将 -0.0 确定性归一化为 0.0。
 func Float(k string, v float64, prec int) Param {
-	if !isValidParamKey(k) || math.IsNaN(v) || math.IsInf(v, 0) || prec < -1 || prec > MaxFloatPrec {
+	if !textalg.IsValidParamKey(k) || math.IsNaN(v) || math.IsInf(v, 0) || prec < -1 || prec > MaxFloatPrec {
 		return Param{}
 	}
 	if v == 0 {
@@ -158,7 +159,7 @@ func Float(k string, v float64, prec int) Param {
 
 // Bool 构造布尔参数；若键名非法则返回无效零值 Param。
 func Bool(k string, v bool) Param {
-	if !isValidParamKey(k) {
+	if !textalg.IsValidParamKey(k) {
 		return Param{}
 	}
 	return Param{key: k, kind: ParamKindBool, boolVal: v, valid: true}
@@ -171,7 +172,7 @@ func Dur(k string, d time.Duration) Param {
 
 // DurNanos 以显式纳秒 int64 构造时长参数；若键名非法则返回无效零值 Param。
 func DurNanos(k string, nanos int64) Param {
-	if !isValidParamKey(k) {
+	if !textalg.IsValidParamKey(k) {
 		return Param{}
 	}
 	return Param{key: k, kind: ParamKindDuration, durNanos: nanos, valid: true}
@@ -179,7 +180,7 @@ func DurNanos(k string, nanos int64) Param {
 
 // Msg 构造嵌套结构化 Message 参数；若键名非法、m 无效或嵌套后深度超过 MaxMessageDepth 则返回无效零值 Param。
 func Msg(k string, m Message) Param {
-	if !isValidParamKey(k) || !m.IsValid() || m.depth >= MaxMessageDepth {
+	if !textalg.IsValidParamKey(k) || !m.IsValid() || m.depth >= MaxMessageDepth {
 		return Param{}
 	}
 	cloned := m.clone()
@@ -188,7 +189,7 @@ func Msg(k string, m Message) Param {
 
 // IsValid 报告当前 Param 是否合法有效（零值与越界变体恒返回 false）。
 func (p Param) IsValid() bool {
-	if !p.valid || !p.kind.IsValid() || !isValidParamKey(p.key) {
+	if !p.valid || !p.kind.IsValid() || !textalg.IsValidParamKey(p.key) {
 		return false
 	}
 	switch p.kind {
@@ -360,43 +361,8 @@ func (p Param) clone() Param {
 	return cp
 }
 
-// isValidParamKey 校验参数键名与占位符名称：长度 1..MaxParamKeyBytes，首字符为 ASCII 字母/数字/下划线，
-// 其余字符仅限 ASCII 字母、数字、下划线、点或连字符。
-func isValidParamKey(k string) bool {
-	if len(k) == 0 || len(k) > MaxParamKeyBytes {
-		return false
-	}
-	for i := range len(k) {
-		c := k[i]
-		isBase := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
-		isSep := i > 0 && (c == '.' || c == '-')
-		if !isBase && !isSep {
-			return false
-		}
-	}
-	return true
-}
-
 // BoundDisplayText 将任意外部字符串确定性净化为有效 UTF-8 并按完整 rune 边界裁剪至不超过 maxBytes 字节。
 // 非法 UTF-8 字节序列以 Unicode 替换字符 U+FFFD 净化（不附加外层引号）；maxBytes <= 0 或空串时返回空串。
 func BoundDisplayText(raw string, maxBytes int) string {
-	if maxBytes <= 0 || raw == "" {
-		return ""
-	}
-	if !utf8.ValidString(raw) {
-		raw = strings.ToValidUTF8(raw, "\uFFFD")
-	}
-	if len(raw) <= maxBytes {
-		return raw
-	}
-	// 显式按完整 UTF-8 rune 边界截断，保证输出字节长度不超过 maxBytes 且恒为合法 UTF-8。
-	end := 0
-	for end < len(raw) {
-		_, size := utf8.DecodeRuneInString(raw[end:])
-		if end+size > maxBytes {
-			break
-		}
-		end += size
-	}
-	return raw[:end]
+	return textalg.BoundDisplayText(raw, maxBytes)
 }

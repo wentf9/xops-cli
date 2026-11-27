@@ -8,6 +8,11 @@ import (
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/i18n/internal/corecatalog"
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/corecatalog/common"
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/corecatalog/domain"
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/corecatalog/ports"
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/corecatalog/runtime"
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/corecatalog/usecase"
 )
 
 const (
@@ -69,6 +74,40 @@ func TestLegacyM1M2FallbacksUnchanged(t *testing.T) {
 		if got := corecatalog.Lookup(k); got != want {
 			t.Errorf("既有键 %q 兜底发生漂移: got=%q want=%q", k, got, want)
 		}
+	}
+}
+
+func TestShardDisjointAndRouterBijection(t *testing.T) {
+	shards := []struct {
+		name   string
+		keys   func() []string
+		lookup func(string) string
+	}{
+		{"common", common.AllKeys, common.Lookup},
+		{"domain", domain.AllKeys, domain.Lookup},
+		{"ports", ports.AllKeys, ports.Lookup},
+		{"runtime", runtime.AllKeys, runtime.Lookup},
+		{"usecase", usecase.AllKeys, usecase.Lookup},
+	}
+	seen := make(map[string]string)
+	for _, s := range shards {
+		keys := s.keys()
+		if len(keys) == 0 || !slices.IsSorted(keys) {
+			t.Fatalf("分片 %s 的 AllKeys 必须非空且严格升序", s.name)
+		}
+		for _, k := range keys {
+			if prev, dup := seen[k]; dup {
+				t.Fatalf("键 %q 在分片 %s 与 %s 间重复定义", k, prev, s.name)
+			}
+			seen[k] = s.name
+			val := s.lookup(k)
+			if val == "" || corecatalog.Lookup(k) != val {
+				t.Fatalf("分片 %s 与路由 Lookup(%q) 不一致: shard=%q router=%q", s.name, k, val, corecatalog.Lookup(k))
+			}
+		}
+	}
+	if all := corecatalog.AllKeys(); len(all) != len(seen) {
+		t.Fatalf("路由 AllKeys() 总数 %d 与 5 分片合计 %d 不一致", len(all), len(seen))
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/textalg"
 )
 
 func FuzzLocaleParsing(f *testing.F) {
@@ -113,7 +115,7 @@ func assertFuzzExtractPlaceholders(t *testing.T, tmpl string) {
 		t.Fatalf("ExtractPlaceholders(%q) 未排序: %v", tmpl, keys)
 	}
 	for i, k := range keys {
-		if !isValidParamKey(k) || (i > 0 && keys[i-1] == k) {
+		if !textalg.IsValidParamKey(k) || (i > 0 && keys[i-1] == k) {
 			t.Fatalf("ExtractPlaceholders(%q) 含非法或重复键: %v", tmpl, keys)
 		}
 	}
@@ -123,6 +125,11 @@ func assertFuzzExtractPlaceholders(t *testing.T, tmpl string) {
 		}
 		return "ok", true
 	})
+	// 验证 ensureErrorMessage 在任意模糊模板与空参下绝不泄露未绑定占位符。
+	salvErr := NewErrorWithFallback(nil, nil, MessageID("fuzz.check"), tmpl)
+	if view, ok := InspectNode(salvErr); !ok || hasMissingErrorPlaceholder(view.Message, MaxMessageDepth) {
+		t.Fatalf("ensureErrorMessage 存在未闭合占位符 (tmpl=%q): err=%q", tmpl, salvErr.Error())
+	}
 }
 
 func FuzzMessageJSONRoundTrip(f *testing.F) {

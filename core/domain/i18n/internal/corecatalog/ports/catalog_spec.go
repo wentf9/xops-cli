@@ -1,7 +1,9 @@
-package corecatalog
+package ports
 
-// 本文件收录 Wave 3B（core/ports、core/events、core/osfs 与 foundation/{actor,trace}）全部键的规范英文兜底模板。
-func lookupPorts(id string) string {
+import "slices"
+
+// Lookup 返回ports、events、osfs 与 foundation 键对应的规范英文兜底模板；未命中返回空串。
+func Lookup(id string) string {
 	switch id {
 	case "ports.nil_context":
 		return "ports: context must not be nil"
@@ -226,8 +228,9 @@ func lookupPorts(id string) string {
 	}
 }
 
-func keysPorts() []string {
-	return []string{
+// AllKeys 返回本分片注册的全部消息键（按字典序升序排列，每次返回独立切片副本）。
+func AllKeys() []string {
+	keys := []string{
 		"ports.nil_context",
 		"ports.nil_callback",
 		"ports.nil_receiver",
@@ -338,4 +341,6 @@ func keysPorts() []string {
 		"trace.reentrant_lease",
 		"trace.reentrant_detail",
 	}
+	slices.Sort(keys)
+	return keys
 }

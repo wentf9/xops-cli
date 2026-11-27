@@ -1,13 +1,13 @@
 package i18n
 
 import (
-	"slices"
 	"strconv"
-	"strings"
 	"unicode/utf8"
+
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/textalg"
 )
 
-const maxMessageIDBytes = 128
+const maxMessageIDBytes = textalg.MaxMessageIDBytes
 
 // MessageID 表示强类型国际化消息标识（规范格式：[a-z][a-z0-9_.]*，不含空分段）；
 // 零值 MessageIDInvalid（""）严格失败关闭。
@@ -23,27 +23,7 @@ const MessageIDInvalid MessageID = ""
 
 // IsValid 报告 id 是否为非空规范小写点分/下划线标识符（[a-z][a-z0-9_.]* 且不含连续或尾部点号）。
 func (id MessageID) IsValid() bool {
-	s := string(id)
-	if len(s) == 0 || len(s) > maxMessageIDBytes || s[0] < 'a' || s[0] > 'z' || s[len(s)-1] == '.' {
-		return false
-	}
-	prevDot := false
-	for i := range len(s) {
-		c := s[i]
-		if c == '.' {
-			if prevDot {
-				return false
-			}
-			prevDot = true
-			continue
-		}
-		prevDot = false
-		isAllowed := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
-		if !isAllowed {
-			return false
-		}
-	}
-	return true
+	return textalg.IsValidMessageID(string(id))
 }
 
 // IsZero 报告 id 是否为零值无效标识（MessageIDInvalid）。
@@ -279,133 +259,23 @@ func (m Message) clone() Message {
 // FormatTemplate 对模板执行单遍零反射 {key} 占位符替换，支持 {{ 与 }} 转义为字面花括号。
 // 缺失键值或 resolve 为 nil 时原样保留 "{key}"；畸形花括号片段按字面安全输出，永不 panic。
 func FormatTemplate(tmpl string, resolve func(string) (string, bool)) string {
-	if !strings.ContainsAny(tmpl, "{}") {
-		return tmpl
-	}
-	var b strings.Builder
-	b.Grow(len(tmpl))
-	for i := 0; i < len(tmpl); {
-		switch tmpl[i] {
-		case '{':
-			if i+1 < len(tmpl) && tmpl[i+1] == '{' {
-				b.WriteByte('{')
-				i += 2
-				continue
-			}
-			rep, next, ok := consumeFormatPlaceholder(tmpl, i, resolve)
-			if ok {
-				b.WriteString(rep)
-				i = next
-				continue
-			}
-			b.WriteByte('{')
-			i++
-		case '}':
-			if i+1 < len(tmpl) && tmpl[i+1] == '}' {
-				b.WriteByte('}')
-				i += 2
-				continue
-			}
-			b.WriteByte('}')
-			i++
-		default:
-			b.WriteByte(tmpl[i])
-			i++
-		}
-	}
-	return b.String()
-}
-
-func consumeFormatPlaceholder(tmpl string, start int, resolve func(string) (string, bool)) (string, int, bool) {
-	end := findPlaceholderEnd(tmpl, start+1)
-	if end < 0 {
-		return "", 0, false
-	}
-	key := tmpl[start+1 : end]
-	if !isValidParamKey(key) {
-		return "", 0, false
-	}
-	if resolve != nil {
-		if val, found := resolve(key); found {
-			return val, end + 1, true
-		}
-	}
-	return tmpl[start : end+1], end + 1, true
-}
-
-// findPlaceholderEnd 从 '{' 之后扫描对应 '}'；若先遇到另一 '{' 或末尾则返回 -1。
-func findPlaceholderEnd(tmpl string, from int) int {
-	for j := from; j < len(tmpl); j++ {
-		if tmpl[j] == '{' {
-			return -1
-		}
-		if tmpl[j] == '}' {
-			return j
-		}
-	}
-	return -1
+	return textalg.FormatTemplate(tmpl, resolve)
 }
 
 // ExtractPlaceholders 严格校验模板语法并提取升序去重后的占位符键名集合。
 // 拒绝非 UTF-8、超长模板、未转义 '}'、未闭合 '{' 以及非法占位符键名，失败时返回包装 ErrInvalidTemplate 的错误。
 func ExtractPlaceholders(tmpl string) ([]string, error) {
-	keys, errID, badKey := parsePlaceholderKeys(tmpl)
-	if errID != MessageIDInvalid {
-		if errID == KeyTemplateBadKey {
-			return nil, EF(ErrInvalidTemplate, errID, Str("key", BoundDisplayText(badKey, MaxParamKeyBytes)))
-		}
-		return nil, EF(ErrInvalidTemplate, errID)
-	}
-	return keys, nil
-}
-
-// parsePlaceholderKeys 执行无哨兵依赖的纯模板占位符扫描（供 ExtractPlaceholders 与 ensureErrorMessage 共享，
-// 避免包级哨兵初始化路径与 ErrInvalidTemplate 形成编译期初始化环）。
-func parsePlaceholderKeys(tmpl string) ([]string, MessageID, string) {
-	if len(tmpl) > MaxTemplateBytes || !utf8.ValidString(tmpl) {
-		return nil, KeyTemplateInvalid, ""
-	}
-	var keys []string
-	for i := 0; i < len(tmpl); {
-		key, next, hasKey, errID, badKey := stepParsePlaceholder(tmpl, i)
-		if errID != MessageIDInvalid {
-			return nil, errID, badKey
-		}
-		if hasKey {
-			keys = append(keys, key)
-		}
-		i = next
-	}
-	slices.Sort(keys)
-	return slices.Compact(keys), MessageIDInvalid, ""
-}
-
-func stepParsePlaceholder(tmpl string, i int) (string, int, bool, MessageID, string) {
-	switch tmpl[i] {
-	case '{':
-		if i+1 < len(tmpl) && tmpl[i+1] == '{' {
-			return "", i + 2, false, MessageIDInvalid, ""
-		}
-		key, next, errID, badKey := parseStrictPlaceholderKey(tmpl, i)
-		return key, next, errID == MessageIDInvalid, errID, badKey
-	case '}':
-		if i+1 < len(tmpl) && tmpl[i+1] == '}' {
-			return "", i + 2, false, MessageIDInvalid, ""
-		}
-		return "", 0, false, KeyTemplateUnescaped, ""
+	keys, errKind, badKey := textalg.ParsePlaceholderKeys(tmpl)
+	switch errKind {
+	case textalg.TemplateErrNone:
+		return keys, nil
+	case textalg.TemplateErrBadKey:
+		return nil, EF(ErrInvalidTemplate, KeyTemplateBadKey, Str("key", BoundDisplayText(badKey, MaxParamKeyBytes)))
+	case textalg.TemplateErrUnclosed:
+		return nil, EF(ErrInvalidTemplate, KeyTemplateUnclosed)
+	case textalg.TemplateErrUnescaped:
+		return nil, EF(ErrInvalidTemplate, KeyTemplateUnescaped)
 	default:
-		return "", i + 1, false, MessageIDInvalid, ""
+		return nil, EF(ErrInvalidTemplate, KeyTemplateInvalid)
 	}
-}
-
-func parseStrictPlaceholderKey(tmpl string, start int) (string, int, MessageID, string) {
-	end := findPlaceholderEnd(tmpl, start+1)
-	if end < 0 {
-		return "", 0, KeyTemplateUnclosed, ""
-	}
-	key := tmpl[start+1 : end]
-	if !isValidParamKey(key) {
-		return "", 0, KeyTemplateBadKey, key
-	}
-	return key, end + 1, MessageIDInvalid, ""
 }

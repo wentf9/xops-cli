@@ -71,6 +71,70 @@ func assertWrapAndFacadeChain(t *testing.T, s1, ef error) {
 	if id, found := ErrorID(mapped); !found || id != KeyCommonPermissionDeny {
 		t.Fatalf("WrapSentinel ErrorID = (%q, %v), 期望 %q", id, found, KeyCommonPermissionDeny)
 	}
+	assertWrapSentinelDetailAndDynamicDetail(t, s1, facade)
+}
+
+func assertWrapSentinelDetailAndDynamicDetail(t *testing.T, srcSentinel, facade error) {
+	t.Helper()
+	assertWrapSentinelDetailBehavior(t, srcSentinel, facade)
+	assertDynamicDetailErrorBehavior(t)
+}
+
+func assertWrapSentinelDetailBehavior(t *testing.T, srcSentinel, facade error) {
+	t.Helper()
+	// 1. WrapSentinelDetail 完整保留门面头段语义、动态明细、replaced 抑制集与 cause 展开。
+	cause := errors.New("peer reset")
+	withCause := WrapSentinelDetail(facade, cause, "remote-err\xff", srcSentinel)
+	if !errors.Is(withCause, facade) || !errors.Is(withCause, cause) || errors.Is(withCause, srcSentinel) {
+		t.Fatal("WrapSentinelDetail errors.Is 语义异常")
+	}
+	if got := withCause.Error(); got != "permission denied: remote-err\uFFFD: peer reset" {
+		t.Fatalf("WrapSentinelDetail 规范渲染异常: got=%q", got)
+	}
+	zhRendered := RenderErrorChain(withCause, ErrorRenderHooks{
+		RenderMessage: func(m Message) string {
+			if m.ID() == KeyCommonPermissionDeny {
+				return "权限不足"
+			}
+			return m.Canonical()
+		},
+		JoinCausal: func(head, tail string) string { return head + "：" + tail },
+	})
+	if zhRendered != "权限不足：remote-err\uFFFD：peer reset" {
+		t.Fatalf("WrapSentinelDetail 本地化渲染未保留哨兵头段: got=%q", zhRendered)
+	}
+	// 2. 折叠被 replaced 抑制的同义源哨兵；空串/纯空白/超长空白明细退化为 WrapSentinel。
+	if got := WrapSentinelDetail(facade, srcSentinel, "ctx-info", srcSentinel).Error(); got != "permission denied: ctx-info" {
+		t.Fatalf("WrapSentinelDetail 抑制源哨兵异常: got=%q", got)
+	}
+	for _, blank := range []string{"", "  \t\n ", strings.Repeat(" ", MaxParamStringBytes+8) + "tail"} {
+		deg := WrapSentinelDetail(facade, srcSentinel, blank, srcSentinel)
+		if !errors.Is(deg, facade) || deg.Error() != "permission denied" {
+			t.Fatalf("WrapSentinelDetail 空白退化异常 (len=%d): got=%q", len(blank), deg.Error())
+		}
+	}
+	if degNil := WrapSentinelDetail(nil, nil, "   "); degNil == nil || degNil.Error() != "invalid argument" {
+		t.Fatalf("WrapSentinelDetail(nil, nil, blank) 应退化为 KeyCommonInvalidArgument: %v", degNil)
+	}
+}
+
+func assertDynamicDetailErrorBehavior(t *testing.T) {
+	t.Helper()
+	// DynamicDetailError 有界 UTF-8 叶子与空白安全降级。
+	dyn := DynamicDetailError("remote\xff" + strings.Repeat("a", MaxParamStringBytes+32))
+	view, ok := InspectNode(dyn)
+	if !ok || view.Sentinel != nil || view.Cause != nil || view.IsSentinel || view.Message.ID() != KeyCommonDetail {
+		t.Fatalf("DynamicDetailError 视图异常: ok=%v view=%+v", ok, view)
+	}
+	if len(dyn.Error()) > MaxParamStringBytes || !strings.HasPrefix(dyn.Error(), "remote\uFFFD") {
+		t.Fatalf("DynamicDetailError 裁剪/净化异常: len=%d", len(dyn.Error()))
+	}
+	for _, blank := range []string{"", " \t\r\n ", strings.Repeat(" ", MaxParamStringBytes+8) + "x"} {
+		fb := DynamicDetailError(blank)
+		if id, found := ErrorID(fb); !found || id != KeyCommonInternalError || fb.Error() != "internal error" {
+			t.Fatalf("DynamicDetailError 空白降级异常: id=%q err=%q", id, fb.Error())
+		}
+	}
 }
 
 func TestInspectNodeUnwrapDirectAndFallbacks(t *testing.T) {

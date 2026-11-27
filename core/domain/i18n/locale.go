@@ -3,9 +3,11 @@ package i18n
 import (
 	"cmp"
 	"strings"
+
+	"github.com/wentf9/xops-cli/core/domain/i18n/internal/textalg"
 )
 
-const maxLocaleTagBytes = 64
+const maxLocaleTagBytes = textalg.MaxLocaleTagBytes
 
 // Locale 表示 XOps v2 支持的不可变界面语言标识；零值 LocaleInvalid 严格失败关闭。
 //
@@ -84,7 +86,7 @@ func MatchEnvLocale(raw string) (Locale, bool) {
 	if strings.TrimSpace(raw) == "" {
 		return LocaleInvalid, false
 	}
-	norm, ok := normalizeLocaleCore(raw)
+	norm, ok := textalg.NormalizeLocaleCore(raw)
 	if !ok {
 		return LocaleEn, true
 	}
@@ -110,43 +112,19 @@ func ResolveLocale(tags ...string) Locale {
 
 // parseKnownLocale 是 ParseLocale 与 MatchEnvLocale 共享的无错解析核心（遵守 failclosed/error_swallow）。
 func parseKnownLocale(raw string) (Locale, bool) {
-	norm, ok := normalizeLocaleCore(raw)
+	norm, ok := textalg.NormalizeLocaleCore(raw)
 	if !ok {
 		return LocaleInvalid, false
 	}
 	return matchNormalizedLocale(norm)
 }
 
-// normalizeLocaleCore 去除首尾空白、先剥离 @modifier 再剥离 .codeset，并将主体转为小写下划线形式。
-func normalizeLocaleCore(raw string) (string, bool) {
-	s := strings.TrimSpace(raw)
-	if s == "" || len(s) > maxLocaleTagBytes {
-		return "", false
-	}
-	if before, mod, hasMod := strings.Cut(s, "@"); hasMod {
-		if !isValidLocaleSuffix(mod) {
-			return "", false
-		}
-		s = before
-	}
-	if before, cs, hasCS := strings.Cut(s, "."); hasCS {
-		if !isValidLocaleSuffix(cs) {
-			return "", false
-		}
-		s = before
-	}
-	if s == "" {
-		return "", false
-	}
-	return strings.ReplaceAll(strings.ToLower(s), "-", "_"), true
-}
-
 // matchNormalizedLocale 校验归一化标签各子段均由非空 ASCII 字母数字构成，并提取主语言段归并至 Locale。
 func matchNormalizedLocale(norm string) (Locale, bool) {
-	if !hasValidLocaleSubtags(norm) {
+	primary, ok := textalg.MatchNormalizedPrimary(norm)
+	if !ok {
 		return LocaleInvalid, false
 	}
-	primary, _, _ := strings.Cut(norm, "_")
 	switch primary {
 	case "en":
 		return LocaleEn, true
@@ -156,47 +134,4 @@ func matchNormalizedLocale(norm string) (Locale, bool) {
 	default:
 		return LocaleInvalid, false
 	}
-}
-
-func hasValidLocaleSubtags(norm string) bool {
-	if norm == "" {
-		return false
-	}
-	for sub := range strings.SplitSeq(norm, "_") {
-		if !isASCIIAlnumNonEmpty(sub) {
-			return false
-		}
-	}
-	return true
-}
-
-// isValidLocaleSuffix 校验 .codeset 与 @modifier 后缀，严格限定 POSIX 字符集 [A-Za-z0-9_-]。
-func isValidLocaleSuffix(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := range len(s) {
-		c := s[i]
-		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-		isDigit := c >= '0' && c <= '9'
-		if !isAlpha && !isDigit && c != '_' && c != '-' {
-			return false
-		}
-	}
-	return true
-}
-
-func isASCIIAlnumNonEmpty(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := range len(s) {
-		c := s[i]
-		isLower := c >= 'a' && c <= 'z'
-		isDigit := c >= '0' && c <= '9'
-		if !isLower && !isDigit {
-			return false
-		}
-	}
-	return true
 }
