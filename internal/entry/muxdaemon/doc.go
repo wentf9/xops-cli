@@ -2,7 +2,7 @@
 // （ADR-001 / ADR-009 / ADR-011 / Phase 5 P5-T3）。
 //
 // 核心工程与安全不变量：
-//   - 仅依赖 core/{domain,conc,engine} 与 Go 标准库，零引用 internal/host/**、core/osfs 与 core/ports；
+//   - 仅依赖 core/{domain,conc,engine}、internal/i18n 与 Go 标准库，零引用 internal/host/**、core/osfs 与 core/ports；
 //   - 全部生命周期监督与响应式退出监听（ControlMasterInfo.Done/Wait、ForwardInfo.Done/Wait）
 //     严格受 core/conc.Nursery 托管，零裸 go、零轮询、零 time.Sleep；
 //   - 严格尊重 !ControlMasterInfo.ReusedExisting() 守卫：绝不关闭外部既有 ControlMaster；
@@ -11,10 +11,10 @@
 //   - 全包零 init()、零可变包级状态、零 //nolint:、零裸 time.Duration 配置字段。
 package muxdaemon
 
-import "errors"
+import "github.com/wentf9/xops-cli/internal/i18n"
 
-// 本包导出的不可变规范哨兵错误，便于组合根与调用方通过 errors.Is 区分配置或入参错误。
+// 本包导出的不可变结构化规范哨兵错误，便于组合根与调用方通过 errors.Is 区分配置或入参错误。
 var (
-	ErrNilContext    = errors.New("muxdaemon: context 不能为 nil")
-	ErrInvalidConfig = errors.New("muxdaemon: 无效的 muxdaemon 配置")
+	ErrNilContext    = i18n.Sentinel(i18n.KeyMuxDaemonNilContext)
+	ErrInvalidConfig = i18n.Sentinel(i18n.KeyMuxDaemonInvalidConfig)
 )

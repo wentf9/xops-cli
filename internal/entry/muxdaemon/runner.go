@@ -13,6 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const defaultShutdownTimeout = 5 * time.Second
@@ -34,7 +35,7 @@ func Run(ctx context.Context, cfg Config) error {
 		if ctx == nil {
 			return ErrNilContext
 		}
-		return fmt.Errorf("%w: Client 不能为 nil", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonNilClient)
 	}
 	return runWithBackend(ctx, cfg, engineBackend{client: cfg.Client})
 }
@@ -47,7 +48,7 @@ func runWithBackend(ctx context.Context, cfg Config, backend daemonBackend) (ret
 		return err
 	}
 	if backend == nil {
-		return fmt.Errorf("%w: backend 不能为 nil", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonNilBackend)
 	}
 	plan, err := prepareStartPlan(cfg)
 	if err != nil {
@@ -100,17 +101,17 @@ func startOptionalMaster(ctx context.Context, backend daemonBackend, plan muxSta
 func prepareStartPlan(cfg Config) (muxStartPlan, error) {
 	targetSpec := strings.TrimSpace(cfg.TargetSpec)
 	if targetSpec == "" && !cfg.Target.IsValid() {
-		return muxStartPlan{}, fmt.Errorf("%w: TargetSpec 与 Target 至少需指定一项", ErrInvalidConfig)
+		return muxStartPlan{}, i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonMissingTarget)
 	}
 	for i, spec := range cfg.Forwards {
 		if !spec.IsValid() {
-			return muxStartPlan{}, fmt.Errorf("%w: Forwards[%d] 无效", ErrInvalidConfig, i)
+			return muxStartPlan{}, i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonInvalidForward, i18n.Int("index", i))
 		}
 	}
 	shutTimeout := defaultShutdownTimeout
 	if d, ok := cfg.ShutdownTimeout.Get(); ok {
 		if !d.IsPositive() {
-			return muxStartPlan{}, fmt.Errorf("%w: ShutdownTimeout 必须为正时长", ErrInvalidConfig)
+			return muxStartPlan{}, i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonShutdownTimeoutPositive)
 		}
 		shutTimeout = d.Std()
 	}
@@ -144,12 +145,12 @@ func buildEffectiveCLIOptions(cfg Config, hasForwards, explicitMuxDisabled bool)
 	cp := opts.Control()
 	if sock, ok := cfg.SocketPath.Get(); ok {
 		if !sock.IsValid() {
-			return option.UnsetOptionLayer(), fmt.Errorf("%w: SocketPath 无效", ErrInvalidConfig)
+			return option.UnsetOptionLayer(), i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonInvalidSocketPath)
 		}
 		if cp.Path().IsUnset() {
 			parsedPath, err := option.ParseControlPath(sock.String())
 			if err != nil {
-				return option.UnsetOptionLayer(), fmt.Errorf("%w: ControlPath 非法: %w", ErrInvalidConfig, err)
+				return option.UnsetOptionLayer(), i18n.WrapS(ErrInvalidConfig, err, i18n.KeyMuxDaemonInvalidControlPath)
 			}
 			cp = cp.WithPath(parsedPath)
 		}
@@ -159,7 +160,7 @@ func buildEffectiveCLIOptions(cfg Config, hasForwards, explicitMuxDisabled bool)
 	}
 	opts = opts.WithControlPolicy(cp)
 	if err := opts.Validate(); err != nil {
-		return option.UnsetOptionLayer(), fmt.Errorf("%w: CLIOptions 校验失败: %w", ErrInvalidConfig, err)
+		return option.UnsetOptionLayer(), i18n.WrapS(ErrInvalidConfig, err, i18n.KeyMuxDaemonInvalidCLIOpts)
 	}
 	return opts, nil
 }
@@ -256,7 +257,7 @@ func spawnSessionWatchers(
 func spawnMasterWatcher(n *conc.Nursery, watchCtx context.Context, master masterLease, onExit func(error)) error {
 	done := master.Done()
 	if done == nil {
-		return fmt.Errorf("%w: ControlMasterInfo.Done() 返回 nil", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonNilDoneChan, i18n.Str("source", "ControlMasterInfo"))
 	}
 	return n.Go(func(wCtx context.Context) error {
 		select {
@@ -272,7 +273,7 @@ func spawnMasterWatcher(n *conc.Nursery, watchCtx context.Context, master master
 func spawnForwardWatcher(n *conc.Nursery, watchCtx context.Context, fwd forwardLease, onExit func(error)) error {
 	done := fwd.Done()
 	if done == nil {
-		return fmt.Errorf("%w: ForwardInfo.Done() 返回 nil", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyMuxDaemonNilDoneChan, i18n.Str("source", "ForwardInfo"))
 	}
 	return n.Go(func(wCtx context.Context) error {
 		select {
@@ -299,13 +300,13 @@ func cleanupResources(ctx context.Context, timeout time.Duration, forwards []for
 		}
 		fwdDone := isChanClosed(fwd.Done())
 		if err := fwd.Stop(shutCtx); err != nil && !isIgnorableSelfExitStopErr(fwdDone || isChanClosed(fwd.Done()), err) {
-			errs = append(errs, fmt.Errorf("stop forward %s failed: %w", fwd.BoundAddr(), err))
+			errs = append(errs, i18n.Wrap(err, i18n.KeyMuxDaemonStopForwardFailed, i18n.BoundStr("addr", fwd.BoundAddr())))
 		}
 	}
 	if master != nil && !master.ReusedExisting() {
 		alreadyDone := masterSelfExited || isChanClosed(master.Done())
 		if err := master.Stop(shutCtx); err != nil && !isIgnorableSelfExitStopErr(alreadyDone || isChanClosed(master.Done()), err) {
-			errs = append(errs, fmt.Errorf("stop control master %s failed: %w", master.SocketPath(), err))
+			errs = append(errs, i18n.Wrap(err, i18n.KeyMuxDaemonStopMasterFailed, i18n.BoundStr("socket", master.SocketPath())))
 		}
 	}
 	return errors.Join(errs...)

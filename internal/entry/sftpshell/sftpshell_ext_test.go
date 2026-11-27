@@ -595,7 +595,7 @@ func TestShell_FatalHaltedAndLocalFSUnsupportedAndEOF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EOF 退出期望 nil，实际=%v", err)
 	}
-	if !strings.Contains(errBuf.String(), "LocalFS") || !strings.Contains(errBuf.String(), "无效八进制权限") {
+	if !strings.Contains(errBuf.String(), "LocalFS") || !strings.Contains(errBuf.String(), "invalid octal permission") {
 		t.Fatalf("缺少预期错误提示，stderr:\n%s", errBuf.String())
 	}
 	if !strings.Contains(out.String(), "/home/alice") {
@@ -692,8 +692,8 @@ func TestShell_TimeoutOperatorFeaturesAndEdgeCases(t *testing.T) {
 	assertContainsAll(t, stderr.String(), []string{
 		"command timed out (returned to prompt)",
 		"CRITICAL OutcomeUnknown",
-		"不是目录",
-		"超出 RFC3339 年份范围",
+		"is not a directory",
+		"outside RFC3339 year range",
 	})
 }
 
@@ -774,11 +774,11 @@ func TestShell_ScopedLocalOnlySandboxInescapableAndDisallowedPaths(t *testing.T)
 		t.Fatalf("ScopedLocalOnly 下载必须锚定 /sandbox: root=%s dest=%s", eng.lastDownload.LocalRoot, eng.lastDownload.LocalDest)
 	}
 	assertContainsAll(t, stderr.String(), []string{
-		"越出沙箱根目录",
-		"禁止使用绝对本地路径",
-		"UNC、设备命名空间或根相对反斜杠前缀",
-		"盘符相对路径",
-		"不能为沙箱根目录",
+		"outside sandbox root",
+		"is forbidden in ScopedLocalOnly mode",
+		"forbidden UNC, device namespace, or root-relative backslash prefix",
+		"forbidden drive-relative path",
+		"cannot be sandbox root '.'",
 	})
 }
 
@@ -803,7 +803,7 @@ func TestShell_StaleInterruptDrainConcurrentFatalAndOversizedLineRecovery(t *tes
 	if err != nil {
 		t.Fatalf("滞留中断与超长行恢复期望 nil，实际=%v", err)
 	}
-	if strings.Count(stdout.String(), "/home/alice") < 2 || !strings.Contains(stderr.String(), "单行命令超过最大长度") {
+	if strings.Count(stdout.String(), "/home/alice") < 2 || !strings.Contains(stderr.String(), "exceeds maximum length") {
 		t.Fatalf("滞留中断排空或超长行恢复异常:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
 	}
 

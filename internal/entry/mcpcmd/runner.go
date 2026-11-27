@@ -14,6 +14,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const defaultShutdownTimeout = 5 * time.Second
@@ -45,10 +46,10 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	}
 	srv, err := factory(cfg.ServerConfig)
 	if err != nil {
-		return fmt.Errorf("create mcp server failed: %w", err)
+		return i18n.Wrap(err, i18n.KeyMCPCreateServerFailed)
 	}
 	if srv == nil {
-		return fmt.Errorf("%w: ServerFactory 返回了 nil MCPServerContract", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyMCPNilServer)
 	}
 
 	var closeOnce sync.Once
@@ -67,7 +68,7 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 
 	report, err := srv.Prepare(ctx)
 	if err != nil {
-		return fmt.Errorf("mcp server prepare failed: %w", err)
+		return i18n.Wrap(err, i18n.KeyMCPPrepareFailed)
 	}
 	writePreparedSummary(cfg.Stderr, cfg.Transport, cfg.ListenAddr, cfg.Listener, report)
 	if cfg.OnPrepared != nil {
@@ -82,7 +83,7 @@ func validateConfig(cfg Config) (ServerFactory, time.Duration, error) {
 	factory := cfg.ServerFactory
 	if factory == nil {
 		if cfg.Engine == nil {
-			return nil, 0, fmt.Errorf("%w: Engine 与 ServerFactory 不能同时为 nil", ErrInvalidConfig)
+			return nil, 0, i18n.EF(ErrInvalidConfig, i18n.KeyMCPNoEngineOrFactory)
 		}
 		eng := cfg.Engine
 		factory = func(mCfg engine.MCPConfig) (MCPServerContract, error) {
@@ -95,7 +96,7 @@ func validateConfig(cfg Config) (ServerFactory, time.Duration, error) {
 	shutTimeout := defaultShutdownTimeout
 	if d, ok := cfg.ShutdownTimeout.Get(); ok {
 		if !d.IsPositive() {
-			return nil, 0, fmt.Errorf("%w: ShutdownTimeout 必须为正时长", ErrInvalidConfig)
+			return nil, 0, i18n.EF(ErrInvalidConfig, i18n.KeyMCPShutdownTimeoutPositive)
 		}
 		shutTimeout = d.Std()
 	}
@@ -106,19 +107,19 @@ func validateTransportConfig(cfg Config) error {
 	switch cfg.Transport {
 	case TransportStdio:
 		if cfg.Stdin == nil || cfg.Stdout == nil {
-			return fmt.Errorf("%w: stdio 传输必须提供非 nil 的 Stdin 与 Stdout", ErrInvalidConfig)
+			return i18n.EF(ErrInvalidConfig, i18n.KeyMCPStdioNilStreams)
 		}
 		if cfg.Listener != nil {
-			return fmt.Errorf("%w: stdio 传输不允许同时传入 HTTP Listener", ErrInvalidConfig)
+			return i18n.EF(ErrInvalidConfig, i18n.KeyMCPStdioForbidsListener)
 		}
 		return nil
 	case TransportHTTP:
 		if cfg.Listener == nil && strings.TrimSpace(cfg.ListenAddr) == "" {
-			return fmt.Errorf("%w: http 传输必须提供 ListenAddr 或 Listener", ErrInvalidConfig)
+			return i18n.EF(ErrInvalidConfig, i18n.KeyMCPHTTPMissingEndpoint)
 		}
 		return nil
 	default:
-		return fmt.Errorf("%w: 未指定有效传输模式（%s）", ErrInvalidTransport, cfg.Transport)
+		return i18n.EF(ErrInvalidTransport, i18n.KeyMCPInvalidTransportValue, i18n.Str("value", cfg.Transport.String()))
 	}
 }
 

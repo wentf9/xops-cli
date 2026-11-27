@@ -2,13 +2,14 @@ package mcpcmd
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // TransportKind 标识 MCP 入口的传输形态；零值 TransportInvalid 严格失败关闭。
@@ -31,7 +32,7 @@ func ParseTransportKind(raw string) (TransportKind, error) {
 	case "http", "streamable-http", "streamable_http":
 		return TransportHTTP, nil
 	default:
-		return TransportInvalid, fmt.Errorf("%w: %q（仅支持 stdio 或 http）", ErrInvalidTransport, raw)
+		return TransportInvalid, i18n.EF(ErrInvalidTransport, i18n.KeyMCPInvalidTransportValue, i18n.BoundStr("value", raw))
 	}
 }
 
@@ -56,7 +57,7 @@ func (k TransportKind) String() string {
 // AppendText 实现 encoding.TextAppender，非法枚举值拒绝序列化。
 func (k TransportKind) AppendText(b []byte) ([]byte, error) {
 	if !k.IsValid() {
-		return nil, fmt.Errorf("%w: %d", ErrInvalidTransport, uint8(k))
+		return nil, i18n.EF(ErrInvalidTransport, i18n.KeyMCPInvalidTransportValue, i18n.Str("value", strconv.FormatUint(uint64(k), 10)))
 	}
 	return append(b, k.String()...), nil
 }

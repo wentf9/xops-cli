@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type transferFlags struct {
@@ -22,7 +23,7 @@ type transferFlags struct {
 	args      []string
 }
 
-func parseTransferFlags(args []string) (transferFlags, error) {
+func parseTransferFlags(cmd string, args []string) (transferFlags, error) {
 	var f transferFlags
 	for _, arg := range args {
 		switch arg {
@@ -36,7 +37,10 @@ func parseTransferFlags(args []string) (transferFlags, error) {
 			f.preserve = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return transferFlags{}, fmt.Errorf("%w: 未知传输选项 %q", ErrSyntax, arg)
+				return transferFlags{}, i18n.EF(ErrSyntax, i18n.KeySFTPUnknownOption,
+					i18n.Str("cmd", cmd),
+					i18n.BoundStr("option", arg),
+				)
 			}
 			f.args = append(f.args, arg)
 		}
@@ -45,12 +49,12 @@ func parseTransferFlags(args []string) (transferFlags, error) {
 }
 
 func (s *Shell) cmdPut(ctx context.Context, args []string) error {
-	f, err := parseTransferFlags(args)
+	f, err := parseTransferFlags("put", args)
 	if err != nil {
 		return err
 	}
 	if len(f.args) < 1 || len(f.args) > 2 {
-		return fmt.Errorf("%w: 用法: put [-r] [-n] [--resume] [-p] <local-path> [remote-path]", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "put [-r] [-n] [--resume] [-p] <local-path> [remote-path]"))
 	}
 	src, baseName, err := s.buildUploadSource(f.args[0], f.recursive)
 	if err != nil {
@@ -80,7 +84,12 @@ func (s *Shell) cmdPut(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(s.stdout, "uploaded %s -> %s (%d files, %d bytes)\n", f.args[0], res.RemotePath.String(), res.FilesUploaded, res.BytesTransferred)
+	_, _ = fmt.Fprintf(s.stdout, "%s\n", s.loc.T(i18n.KeySFTPOutputUploaded,
+		i18n.BoundStr("src", f.args[0]),
+		i18n.BoundStr("dest", res.RemotePath.String()),
+		i18n.Int("files", res.FilesUploaded),
+		i18n.Int64("bytes", res.BytesTransferred),
+	))
 	return nil
 }
 
@@ -141,12 +150,12 @@ func (s *Shell) resolvePutRemoteDest(args []string, localBase string) (pathalg.R
 }
 
 func (s *Shell) cmdGet(ctx context.Context, args []string) error {
-	f, err := parseTransferFlags(args)
+	f, err := parseTransferFlags("get", args)
 	if err != nil {
 		return err
 	}
 	if len(f.args) < 1 || len(f.args) > 2 {
-		return fmt.Errorf("%w: 用法: get [-r] [-n] [--resume] [-p] <remote-path> [local-path]", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "get [-r] [-n] [--resume] [-p] <remote-path> [local-path]"))
 	}
 	remoteSrc, err := resolveRemotePath(s.remoteDir, f.args[0])
 	if err != nil {
@@ -179,13 +188,18 @@ func (s *Shell) cmdGet(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(s.stdout, "downloaded %s -> %s (%d files, %d bytes)\n", remoteSrc.String(), res.LocalDest.String(), res.FilesDownloaded, res.BytesTransferred)
+	_, _ = fmt.Fprintf(s.stdout, "%s\n", s.loc.T(i18n.KeySFTPOutputDownloaded,
+		i18n.BoundStr("src", remoteSrc.String()),
+		i18n.BoundStr("dest", res.LocalDest.String()),
+		i18n.Int("files", res.FilesDownloaded),
+		i18n.Int64("bytes", res.BytesTransferred),
+	))
 	return nil
 }
 
 func (s *Shell) cmdCat(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("%w: 用法: cat <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "cat <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, args[0])
 	if err != nil {
@@ -212,7 +226,7 @@ func (s *Shell) cmdWrite(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(positional) < 2 {
-		return fmt.Errorf("%w: 用法: write [-n] [-p] [--] <remote-path> <content>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "write [-n] [-p] [--] <remote-path> <content>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, positional[0])
 	if err != nil {
@@ -229,7 +243,10 @@ func (s *Shell) cmdWrite(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	_, _ = fmt.Fprintf(s.stdout, "wrote %s (%d bytes)\n", target.String(), res.BytesWritten)
+	_, _ = fmt.Fprintf(s.stdout, "%s\n", s.loc.T(i18n.KeySFTPOutputWrote,
+		i18n.BoundStr("path", target.String()),
+		i18n.Int64("bytes", res.BytesWritten),
+	))
 	return nil
 }
 
@@ -250,7 +267,10 @@ func parseWriteArgs(args []string) (noClobber, createParents bool, positional []
 			createParents = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return false, false, nil, fmt.Errorf("%w: write 未知选项 %q", ErrSyntax, arg)
+				return false, false, nil, i18n.EF(ErrSyntax, i18n.KeySFTPUnknownOption,
+					i18n.Str("cmd", "write"),
+					i18n.BoundStr("option", arg),
+				)
 			}
 			parsingFlags = false
 			positional = append(positional, arg)
@@ -268,13 +288,16 @@ func (s *Shell) cmdRename(ctx context.Context, args []string) error {
 			noClobber = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("%w: mv/rename 未知选项 %q", ErrSyntax, arg)
+				return i18n.EF(ErrSyntax, i18n.KeySFTPUnknownOption,
+					i18n.Str("cmd", "mv/rename"),
+					i18n.BoundStr("option", arg),
+				)
 			}
 			positional = append(positional, arg)
 		}
 	}
 	if len(positional) != 2 {
-		return fmt.Errorf("%w: 用法: mv [-n] <old-path> <new-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "mv [-n] <old-path> <new-path>"))
 	}
 	oldPath, err := resolveRemotePath(s.remoteDir, positional[0])
 	if err != nil {
@@ -298,7 +321,7 @@ func (s *Shell) cmdMkdir(ctx context.Context, args []string) error {
 	for i := 0; i < len(args); i++ {
 		if args[i] == "-m" || args[i] == "--mode" {
 			if i+1 >= len(args) {
-				return fmt.Errorf("%w: mkdir -m 缺少权限参数", ErrSyntax)
+				return i18n.EF(ErrSyntax, i18n.KeySFTPMkdirMissingMode)
 			}
 			i++
 			p, err := parseOctalPerm(args[i])
@@ -309,12 +332,15 @@ func (s *Shell) cmdMkdir(ctx context.Context, args []string) error {
 			continue
 		}
 		if strings.HasPrefix(args[i], "-") {
-			return fmt.Errorf("%w: mkdir 未知选项 %q", ErrSyntax, args[i])
+			return i18n.EF(ErrSyntax, i18n.KeySFTPUnknownOption,
+				i18n.Str("cmd", "mkdir"),
+				i18n.BoundStr("option", args[i]),
+			)
 		}
 		positional = append(positional, args[i])
 	}
 	if len(positional) != 1 {
-		return fmt.Errorf("%w: 用法: mkdir [-m <octal>] <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "mkdir [-m <octal>] <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, positional[0])
 	if err != nil {
@@ -329,7 +355,7 @@ func (s *Shell) cmdMkdir(ctx context.Context, args []string) error {
 
 func (s *Shell) cmdRemove(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("%w: 用法: rm <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "rm <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, args[0])
 	if err != nil {
@@ -343,7 +369,7 @@ func (s *Shell) cmdRemove(ctx context.Context, args []string) error {
 
 func (s *Shell) cmdRemoveDir(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("%w: 用法: rmdir <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "rmdir <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, args[0])
 	if err != nil {
@@ -357,7 +383,7 @@ func (s *Shell) cmdRemoveDir(ctx context.Context, args []string) error {
 
 func (s *Shell) cmdChmod(ctx context.Context, args []string) error {
 	if len(args) != 2 {
-		return fmt.Errorf("%w: 用法: chmod <octal-mode> <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "chmod <octal-mode> <remote-path>"))
 	}
 	perm, err := parseOctalPerm(args[0])
 	if err != nil {
@@ -394,7 +420,7 @@ func (s *Shell) cmdChtimes(ctx context.Context, args []string) error {
 		}
 		pathRaw = args[2]
 	default:
-		return fmt.Errorf("%w: 用法: chtimes <mtime> <remote-path> 或 chtimes <atime> <mtime> <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "chtimes <mtime> <remote-path> | chtimes <atime> <mtime> <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, pathRaw)
 	if err != nil {
@@ -442,7 +468,11 @@ func (s *Shell) consumeTransferProgress(ctx context.Context, stream *events.Oper
 			continue
 		}
 		if tp, ok := ev.(*events.TransferProgressEvent); ok && tp.IsValid() {
-			_, _ = fmt.Fprintf(s.stderr, "sftp: progress [%s] %d/%d bytes\n", tp.Stage(), tp.BytesTransferred(), tp.TotalBytes())
+			_, _ = fmt.Fprintf(s.stderr, "%s\n", s.loc.T(i18n.KeySFTPOutputProgress,
+				i18n.BoundStr("stage", tp.Stage()),
+				i18n.Uint64("transferred", tp.BytesTransferred()),
+				i18n.Uint64("total", tp.TotalBytes()),
+			))
 		}
 	}
 }

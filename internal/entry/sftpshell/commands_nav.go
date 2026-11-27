@@ -11,11 +11,12 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func (s *Shell) cmdPWD(args []string) error {
 	if len(args) > 0 {
-		return fmt.Errorf("%w: pwd 不接受参数", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPNoArgsAllowed, i18n.Str("cmd", "pwd"))
 	}
 	_, _ = fmt.Fprintf(s.stdout, "%s\n", s.remoteDir.String())
 	return nil
@@ -23,7 +24,7 @@ func (s *Shell) cmdPWD(args []string) error {
 
 func (s *Shell) cmdCD(ctx context.Context, args []string) error {
 	if len(args) > 1 {
-		return fmt.Errorf("%w: 用法: cd [remote-path]", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "cd [remote-path]"))
 	}
 	target := s.homeRemoteDir
 	if len(args) == 1 {
@@ -48,14 +49,17 @@ func (s *Shell) cmdCD(ctx context.Context, args []string) error {
 		return err
 	}
 	if !st.IsDir() {
-		return fmt.Errorf("远端路径 %s 不是目录 (%s)", realPath.String(), st.FileType().String())
+		return i18n.E(i18n.KeySFTPRemoteNotDir,
+			i18n.BoundStr("path", realPath.String()),
+			i18n.Str("type", st.FileType().String()),
+		)
 	}
 	s.remoteDir = realPath
 	return nil
 }
 
 func (s *Shell) cmdLS(ctx context.Context, args []string) error {
-	longFmt, showAll, pathArg, err := parseListFlags(args)
+	longFmt, showAll, pathArg, err := parseListFlags("ls", args)
 	if err != nil {
 		return err
 	}
@@ -90,7 +94,7 @@ func (s *Shell) cmdLS(ctx context.Context, args []string) error {
 
 func (s *Shell) cmdLPWD(args []string) error {
 	if len(args) > 0 {
-		return fmt.Errorf("%w: lpwd 不接受参数", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPNoArgsAllowed, i18n.Str("cmd", "lpwd"))
 	}
 	_, _ = fmt.Fprintf(s.stdout, "%s\n", s.localDir.String())
 	return nil
@@ -98,7 +102,7 @@ func (s *Shell) cmdLPWD(args []string) error {
 
 func (s *Shell) cmdLCD(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("%w: 用法: lcd <local-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "lcd <local-path>"))
 	}
 	nextDir, nextSub, err := s.resolveLocalDirArg(args[0])
 	if err != nil {
@@ -110,7 +114,7 @@ func (s *Shell) cmdLCD(ctx context.Context, args []string) error {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("本地路径 %s 不是目录或不存在", nextDir.String())
+			return i18n.E(i18n.KeySFTPLocalNotDir, i18n.BoundStr("path", nextDir.String()))
 		}
 	}
 	s.localDir = nextDir
@@ -134,12 +138,12 @@ func (s *Shell) resolveLocalDirArg(raw string) (pathalg.LocalDir, []string, erro
 }
 
 func (s *Shell) cmdLLS(ctx context.Context, args []string) error {
-	longFmt, showAll, pathArg, err := parseListFlags(args)
+	longFmt, showAll, pathArg, err := parseListFlags("lls", args)
 	if err != nil {
 		return err
 	}
 	if s.localFS == nil {
-		return fmt.Errorf("%w: 当前环境未注入 LocalFS，无法列举本地目录", engine.ErrUnsupported)
+		return i18n.EF(engine.ErrUnsupported, i18n.KeySFTPLocalFSUnavailable)
 	}
 	target := s.localDir
 	if pathArg != "" {
@@ -179,13 +183,16 @@ func (s *Shell) cmdStat(ctx context.Context, args []string, followDefault bool) 
 			follow = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("%w: stat 未知选项 %q", ErrSyntax, arg)
+				return i18n.EF(ErrSyntax, i18n.KeySFTPUnknownOption,
+					i18n.Str("cmd", "stat"),
+					i18n.BoundStr("option", arg),
+				)
 			}
 			positional = append(positional, arg)
 		}
 	}
 	if len(positional) != 1 {
-		return fmt.Errorf("%w: 用法: stat [-L] <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "stat [-L] <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, positional[0])
 	if err != nil {
@@ -204,14 +211,21 @@ func (s *Shell) cmdStat(ctx context.Context, args []string, followDefault bool) 
 	if anchor.HasDevIno() {
 		anchorStr = fmt.Sprintf("%s(dev=%d,ino=%d)", anchor.FileType().String(), anchor.Dev(), anchor.Ino())
 	}
-	_, _ = fmt.Fprintf(s.stdout, "Path: %s\nType: %s\nMode: %s (%#04o)\nSize: %d\nModTime: %s\nAnchor: %s\n",
-		st.Path().String(), st.FileType().String(), st.Mode().String(), st.Perm(), st.Size(), formatMTime(st.ModTime()), anchorStr)
+	_, _ = fmt.Fprintf(s.stdout, "%s\n", s.loc.T(i18n.KeySFTPOutputStat,
+		i18n.BoundStr("path", st.Path().String()),
+		i18n.Str("type", st.FileType().String()),
+		i18n.Str("mode", st.Mode().String()),
+		i18n.Str("perm", fmt.Sprintf("%#04o", st.Perm())),
+		i18n.Int64("size", st.Size()),
+		i18n.Str("mtime", formatMTime(st.ModTime())),
+		i18n.BoundStr("anchor", anchorStr),
+	))
 	return nil
 }
 
 func (s *Shell) cmdRealPath(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("%w: 用法: realpath <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "realpath <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, args[0])
 	if err != nil {
@@ -230,7 +244,7 @@ func (s *Shell) cmdRealPath(ctx context.Context, args []string) error {
 
 func (s *Shell) cmdReadLink(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("%w: 用法: readlink <remote-path>", ErrSyntax)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUsage, i18n.Str("usage", "readlink <remote-path>"))
 	}
 	target, err := resolveRemotePath(s.remoteDir, args[0])
 	if err != nil {
@@ -249,17 +263,17 @@ func (s *Shell) cmdReadLink(ctx context.Context, args []string) error {
 
 func (s *Shell) cmdHelp(args []string) error {
 	if len(args) == 0 {
-		_, _ = io.WriteString(s.stdout, shellHelpSummary())
+		_, _ = io.WriteString(s.stdout, s.loc.T(i18n.KeySFTPHelpSummary))
 		return nil
 	}
-	if detail, ok := shellHelpTopic(strings.ToLower(args[0])); ok {
+	if detail, ok := s.shellHelpTopic(strings.ToLower(args[0])); ok {
 		_, _ = fmt.Fprintf(s.stdout, "%s\n", detail)
 		return nil
 	}
-	return fmt.Errorf("%w: 未知帮助主题 %q", ErrSyntax, args[0])
+	return i18n.EF(ErrSyntax, i18n.KeySFTPUnknownHelpTopic, i18n.BoundStr("topic", args[0]))
 }
 
-func parseListFlags(args []string) (longFmt, showAll bool, pathArg string, err error) {
+func parseListFlags(cmd string, args []string) (longFmt, showAll bool, pathArg string, err error) {
 	for _, arg := range args {
 		if strings.HasPrefix(arg, "-") && len(arg) > 1 {
 			for _, ch := range arg[1:] {
@@ -269,13 +283,16 @@ func parseListFlags(args []string) (longFmt, showAll bool, pathArg string, err e
 				case 'a':
 					showAll = true
 				default:
-					return false, false, "", fmt.Errorf("%w: 未知列表选项 -%c", ErrSyntax, ch)
+					return false, false, "", i18n.EF(ErrSyntax, i18n.KeySFTPUnknownOption,
+						i18n.Str("cmd", cmd),
+						i18n.BoundStr("option", "-"+string(ch)),
+					)
 				}
 			}
 			continue
 		}
 		if pathArg != "" {
-			return false, false, "", fmt.Errorf("%w: ls/lls 仅支持至多一个路径参数", ErrSyntax)
+			return false, false, "", i18n.EF(ErrSyntax, i18n.KeySFTPListTooManyPaths)
 		}
 		pathArg = arg
 	}
@@ -315,60 +332,26 @@ func formatMTime(t time.Time) string {
 	return t.UTC().Format(time.RFC3339)
 }
 
-func shellHelpSummary() string {
-	return `SFTP Shell Commands:
-  Navigation:
-    pwd                         Print remote working directory
-    cd [remote-path]            Change remote working directory (default: initial remote dir)
-    ls [-l] [-a] [remote-path]  List remote directory contents
-    lpwd                        Print local working directory
-    lcd <local-path>            Change local working directory
-    lls [-l] [-a] [local-path]  List local directory contents (requires LocalFS)
-
-  Transfer & Atomic File Operations:
-    put [-r] [-n] [--resume] [-p] <local> [remote]  Upload local file/dir to remote
-    get [-r] [-n] [--resume] [-p] <remote> [local]  Download remote file/dir to local
-    cat <remote-path>                               Read remote file contents
-    write [-n] [-p] <remote-path> <content>         Atomically write text to remote file
-    mv [-n] <old-path> <new-path>                   Atomically rename remote path (alias: rename)
-    mkdir [-m <octal>] <remote-path>                Create remote directory (and parents)
-    rm <remote-path>                                Remove remote file or symlink
-    rmdir <remote-path>                             Remove empty remote directory
-
-  Metadata & Inspection:
-    chmod <octal-mode> <remote-path>                Change remote file permissions (0001..0777)
-    chtimes <mtime> <remote-path>                   Update remote atime/mtime (or <atime> <mtime> <path>)
-    stat [-L] <remote-path>                         Inspect remote metadata & FSTAT anchor (follows symlinks)
-    lstat <remote-path>                             Inspect remote metadata without following symlinks
-    realpath <remote-path>                          Resolve canonical remote path
-    readlink <remote-path>                          Read remote symlink target
-
-  Control:
-    help [command]              Show help
-    exit / quit / bye           Close SFTP shell
-`
-}
-
-func shellHelpTopic(topic string) (string, bool) {
+func (s *Shell) shellHelpTopic(topic string) (string, bool) {
 	switch topic {
 	case "put":
-		return "put [-r] [-n|--no-clobber] [--resume] [-p|--preserve] <local-path> [remote-path]: upload via SCPUpload with progress streaming", true
+		return s.loc.T(i18n.KeySFTPHelpPut), true
 	case "get":
-		return "get [-r] [-n|--no-clobber] [--resume] [-p|--preserve] <remote-path> [local-path]: download into sandboxed local directory via SCPDownload", true
+		return s.loc.T(i18n.KeySFTPHelpGet), true
 	case "mv", "rename":
-		return "mv [-n|--no-clobber] <old-path> <new-path>: atomic SFTP v3 posix-rename@openssh.com", true
+		return s.loc.T(i18n.KeySFTPHelpMV), true
 	case "chmod":
-		return "chmod <octal-mode> <remote-path>: set POSIX permission bits in 0001..0777", true
+		return s.loc.T(i18n.KeySFTPHelpChmod), true
 	case "chtimes":
-		return "chtimes <mtime> <remote-path> | chtimes <atime> <mtime> <remote-path>: set RFC3339 or Unix epoch timestamps", true
+		return s.loc.T(i18n.KeySFTPHelpChtimes), true
 	case "write":
-		return "write [-n|--no-clobber] [-p|--parents] <remote-path> <text>: atomically write UTF-8 text to remote file", true
+		return s.loc.T(i18n.KeySFTPHelpWrite), true
 	case "stat":
-		return "stat [-L|--follow] <remote-path>: inspect remote metadata & FSTAT anchor (follows symlinks by default)", true
+		return s.loc.T(i18n.KeySFTPHelpStat), true
 	case "lstat":
-		return "lstat <remote-path>: inspect remote metadata & FSTAT anchor without following symlinks (pass -L to follow)", true
+		return s.loc.T(i18n.KeySFTPHelpLstat), true
 	case "cd", "pwd", "ls", "lpwd", "lcd", "lls", "mkdir", "rm", "rmdir", "cat", "realpath", "readlink", "exit", "quit", "bye":
-		return fmt.Sprintf("command %q: run 'help' to see full command reference", topic), true
+		return s.loc.T(i18n.KeySFTPHelpGeneric, i18n.BoundStr("cmd", topic)), true
 	default:
 		return "", false
 	}

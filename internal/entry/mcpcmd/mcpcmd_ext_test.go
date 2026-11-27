@@ -17,8 +17,10 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/mcpcmd"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type fakeMCPServer struct {
@@ -452,4 +454,36 @@ func TestRun_ClosesPreboundListenerOnEarlyFailure(t *testing.T) {
 		}
 		assertListenerClosed(t, ln)
 	})
+}
+
+func TestStructuredErrors_BilingualRender(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	enLoc := cat.For(domi18n.LocaleEn)
+	zhLoc := cat.For(domi18n.LocaleZh)
+
+	_, parseErr := mcpcmd.ParseTransportKind("websocket")
+	if !errors.Is(parseErr, mcpcmd.ErrInvalidTransport) {
+		t.Fatalf("期望 ErrInvalidTransport，实际=%v", parseErr)
+	}
+	if id, ok := domi18n.ErrorID(parseErr); !ok || id != i18n.KeyMCPInvalidTransportValue {
+		t.Fatalf("ErrorID = (%q, %v), want %q", id, ok, i18n.KeyMCPInvalidTransportValue)
+	}
+	if enLoc.RenderError(parseErr) != parseErr.Error() {
+		t.Fatalf("en RenderError(%v) = %q != %q", parseErr, enLoc.RenderError(parseErr), parseErr.Error())
+	}
+	if zh := zhLoc.RenderError(parseErr); !strings.Contains(zh, "不支持的传输模式 websocket") {
+		t.Fatalf("zh RenderError 异常: %q", zh)
+	}
+
+	cfgErr := mcpcmd.Run(context.Background(), mcpcmd.Config{Transport: mcpcmd.TransportStdio})
+	if id, ok := domi18n.ErrorID(cfgErr); !ok || id != i18n.KeyMCPNoEngineOrFactory {
+		t.Fatalf("ErrorID = (%q, %v), want %q", id, ok, i18n.KeyMCPNoEngineOrFactory)
+	}
+	if zh := zhLoc.RenderError(cfgErr); !strings.Contains(zh, "Engine 与 ServerFactory 不能同时为空") {
+		t.Fatalf("zh RenderError 异常: %q", zh)
+	}
 }

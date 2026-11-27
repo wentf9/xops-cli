@@ -2,8 +2,6 @@ package sftpshell
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"strings"
@@ -14,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -23,13 +22,13 @@ const (
 	maxLineBytes        = 1 << 20
 )
 
-// 本包导出的不可变哨兵错误，供组合根 cmd/xops、entry/cli 与测试通过 errors.Is 精确区分故障类别。
+// 本包导出的不可变结构化哨兵错误，供组合根 cmd/xops、entry/cli 与测试通过 errors.Is 精确区分故障类别。
 var (
-	ErrNilContext      = errors.New("sftpshell: context 不能为 nil")
-	ErrInvalidConfig   = errors.New("sftpshell: 无效的 SFTP Shell Config 配置")
-	ErrNotInitialized  = errors.New("sftpshell: Shell 未初始化")
-	ErrCommandCanceled = errors.New("sftpshell: 当前命令已被取消")
-	ErrSyntax          = errors.New("sftpshell: 命令语法无效")
+	ErrNilContext      = i18n.Sentinel(i18n.KeySFTPNilContext)
+	ErrInvalidConfig   = i18n.Sentinel(i18n.KeySFTPInvalidConfig)
+	ErrNotInitialized  = i18n.Sentinel(i18n.KeySFTPNotInitialized)
+	ErrCommandCanceled = i18n.Sentinel(i18n.KeySFTPCommandCanceled)
+	ErrSyntax          = i18n.Sentinel(i18n.KeySFTPSyntax)
 )
 
 // TransferClient 定义交互式 SFTP Shell 消费 core/engine 门面所需的最小强类型契约（由 *engine.Engine 原生实现）。
@@ -110,6 +109,8 @@ type Config struct {
 	StreamBuffer int
 	// ShowProgress 控制是否将传输进度事件输出到 Stderr。
 	ShowProgress bool
+	// Localizer 为可选双语延迟渲染器（nil 时由 NewShell 自动经纯内存 embed.FS 回退默认英文 Localizer）。
+	Localizer *i18n.Localizer
 }
 
 // Run 校验配置并启动交互式 SFTP Shell 命令循环，直至用户执行 exit/quit、输入 EOF 或会话上下文取消。
@@ -126,42 +127,45 @@ func Run(ctx context.Context, cfg Config) error {
 
 func validateConfig(cfg Config) error {
 	if cfg.Engine == nil {
-		return fmt.Errorf("%w: Engine 不能为 nil", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigNilEngine)
 	}
 	if cfg.Stdout == nil || cfg.Stderr == nil {
-		return fmt.Errorf("%w: Stdout 与 Stderr 不能为 nil", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigNilStdStreams)
 	}
 	hasTarget, hasSpec := !cfg.Target.IsZero(), strings.TrimSpace(cfg.TargetSpec) != ""
 	if hasTarget == hasSpec {
-		return fmt.Errorf("%w: Target 与 TargetSpec 必须二选一", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigTargetXOR)
 	}
 	if hasTarget && (!cfg.Target.IsValid() || !cfg.CLIOptions.IsUnset()) {
-		return fmt.Errorf("%w: 预解析 Target 无效或禁止同时指定 CLIOptions", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigTargetConflict)
 	}
 	if err := cfg.CLIOptions.Validate(); err != nil {
-		return fmt.Errorf("%w: CLIOptions 无效: %w", ErrInvalidConfig, err)
+		return i18n.WrapS(ErrInvalidConfig, err, i18n.KeySFTPConfigInvalidField, i18n.Str("field", "CLIOptions"))
 	}
 	return validateOptionalConfig(cfg)
 }
 
 func validateOptionalConfig(cfg Config) error {
 	if r, ok := cfg.InitialRemoteDir.Get(); ok && !r.IsValid() {
-		return fmt.Errorf("%w: InitialRemoteDir 无效", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigInvalidField, i18n.Str("field", "InitialRemoteDir"))
 	}
 	if l, ok := cfg.InitialLocalDir.Get(); ok && !l.IsValid() {
-		return fmt.Errorf("%w: InitialLocalDir 无效", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigInvalidField, i18n.Str("field", "InitialLocalDir"))
 	}
 	if !cfg.SymlinkPolicy.IsValid() {
-		return fmt.Errorf("%w: SymlinkPolicy 无效", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigInvalidField, i18n.Str("field", "SymlinkPolicy"))
 	}
 	if cfg.ScopedLocalOnly && cfg.SymlinkPolicy == pathalg.SymlinkFollowOperatorSource {
-		return fmt.Errorf("%w: ScopedLocalOnly 沙箱模式下禁止使用 SymlinkFollowOperatorSource", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigScopedSymlink)
 	}
 	if d, ok := cfg.CommandTimeout.Get(); ok && !d.IsPositive() {
-		return fmt.Errorf("%w: CommandTimeout 必须为正时长", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigTimeoutPositive)
 	}
 	if cfg.StreamBuffer < 0 {
-		return fmt.Errorf("%w: StreamBuffer 不能为负", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigStreamBufNeg)
+	}
+	if cfg.Localizer != nil && !cfg.Localizer.IsValid() {
+		return i18n.EF(ErrInvalidConfig, i18n.KeySFTPConfigInvalidField, i18n.Str("field", "Localizer"))
 	}
 	return nil
 }

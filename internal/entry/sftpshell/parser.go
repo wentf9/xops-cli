@@ -1,7 +1,6 @@
 package sftpshell
 
 import (
-	"fmt"
 	"io/fs"
 	"slices"
 	"strconv"
@@ -10,6 +9,7 @@ import (
 	"unicode"
 
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // ParseLine 将单行交互 SFTP 命令按类 POSIX 引号与反斜杠转义规则切分为参数切片：
@@ -96,7 +96,7 @@ func (p *lineTokenizer) stepUnquoted(r rune) bool {
 
 func (p *lineTokenizer) finish() ([]string, error) {
 	if p.escaped || p.inSingle || p.inDouble {
-		return nil, fmt.Errorf("%w: 存在未闭合引号或悬空转义符", ErrSyntax)
+		return nil, i18n.EF(ErrSyntax, i18n.KeySFTPUnclosedQuote)
 	}
 	if p.inToken {
 		p.tokens = append(p.tokens, string(p.cur))
@@ -108,7 +108,7 @@ func (p *lineTokenizer) finish() ([]string, error) {
 func resolveRemotePath(cwd pathalg.RemotePath, raw string) (pathalg.RemotePath, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端路径不能为空", ErrSyntax)
+		return zeroVal[pathalg.RemotePath](), i18n.EF(ErrSyntax, i18n.KeySFTPEmptyRemotePath)
 	}
 	target, err := pathalg.ParseRemotePath(trimmed)
 	if err != nil {
@@ -124,15 +124,15 @@ func resolveRemotePath(cwd pathalg.RemotePath, raw string) (pathalg.RemotePath, 
 // 盘符相对路径（如 C:foo）以及混用反斜杠的 POSIX 绝对路径，保持与 core/domain/pathalg 失败关闭语义一致。
 func rejectDisallowedLocalInput(raw string) error {
 	if strings.HasPrefix(raw, `\`) || strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "/??/") || raw == "/??" {
-		return fmt.Errorf("%w: 本地路径 %q 使用了禁止的 UNC、设备命名空间或根相对反斜杠前缀", ErrSyntax, raw)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPDisallowedLocalPrefix, i18n.BoundStr("path", raw))
 	}
 	if len(raw) >= 2 && isASCIIAlpha(raw[0]) && raw[1] == ':' {
 		if len(raw) < 3 || (raw[2] != '/' && raw[2] != '\\') {
-			return fmt.Errorf("%w: 本地路径 %q 为禁止的盘符相对路径", ErrSyntax, raw)
+			return i18n.EF(ErrSyntax, i18n.KeySFTPDisallowedDriveRel, i18n.BoundStr("path", raw))
 		}
 	}
 	if strings.HasPrefix(raw, "/") && strings.ContainsRune(raw, '\\') {
-		return fmt.Errorf("%w: POSIX 绝对路径 %q 禁止混用反斜杠", ErrSyntax, raw)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPDisallowedPOSIXBackslash, i18n.BoundStr("path", raw))
 	}
 	return nil
 }
@@ -142,7 +142,7 @@ func rejectDisallowedLocalInput(raw string) error {
 func resolveLocalDir(cwd pathalg.LocalDir, raw string) (pathalg.LocalDir, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return zeroVal[pathalg.LocalDir](), fmt.Errorf("%w: 本地目录路径不能为空", ErrSyntax)
+		return zeroVal[pathalg.LocalDir](), i18n.EF(ErrSyntax, i18n.KeySFTPEmptyLocalPath)
 	}
 	if err := rejectDisallowedLocalInput(trimmed); err != nil {
 		return zeroVal[pathalg.LocalDir](), err
@@ -153,7 +153,7 @@ func resolveLocalDir(cwd pathalg.LocalDir, raw string) (pathalg.LocalDir, error)
 	norm := strings.ReplaceAll(trimmed, `\`, "/")
 	segs := splitCleanLocalRel(cwd, norm)
 	if segs == nil {
-		return zeroVal[pathalg.LocalDir](), fmt.Errorf("%w: 无法在相对本地目录 %q 中向上穿越 '..'", ErrSyntax, cwd.String())
+		return zeroVal[pathalg.LocalDir](), i18n.EF(ErrSyntax, i18n.KeySFTPLocalRelEscape, i18n.BoundStr("dir", cwd.String()))
 	}
 	return rebuildLocalDir(cwd, segs)
 }
@@ -163,13 +163,13 @@ func resolveLocalDir(cwd pathalg.LocalDir, raw string) (pathalg.LocalDir, error)
 func resolveScopedLocalSegments(curSub []string, raw string) ([]string, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return nil, fmt.Errorf("%w: 本地路径不能为空", ErrSyntax)
+		return nil, i18n.EF(ErrSyntax, i18n.KeySFTPEmptyLocalPath)
 	}
 	if err := rejectDisallowedLocalInput(trimmed); err != nil {
 		return nil, err
 	}
 	if isAbsLocalInput(trimmed) {
-		return nil, fmt.Errorf("%w: ScopedLocalOnly 沙箱模式下禁止使用绝对本地路径 %q", ErrSyntax, raw)
+		return nil, i18n.EF(ErrSyntax, i18n.KeySFTPScopedAbsForbidden, i18n.BoundStr("path", raw))
 	}
 	return walkContainedRelSegments(curSub, strings.ReplaceAll(trimmed, `\`, "/"))
 }
@@ -182,12 +182,12 @@ func walkContainedRelSegments(baseSub []string, norm string) ([]string, error) {
 			continue
 		case "..":
 			if len(segs) == 0 {
-				return nil, fmt.Errorf("%w: 本地路径禁止通过 '..' 越出沙箱根目录", ErrSyntax)
+				return nil, i18n.EF(ErrSyntax, i18n.KeySFTPScopedEscape)
 			}
 			segs = segs[:len(segs)-1]
 		default:
 			if err := pathalg.ValidateLocalComponent(part); err != nil {
-				return nil, fmt.Errorf("%w: 非法本地路径分量 %q: %w", ErrSyntax, part, err)
+				return nil, i18n.WrapS(ErrSyntax, err, i18n.KeySFTPInvalidLocalComponent, i18n.BoundStr("component", part))
 			}
 			segs = append(segs, part)
 		}
@@ -282,7 +282,7 @@ func rebuildLocalDir(base pathalg.LocalDir, segs []string) (pathalg.LocalDir, er
 func resolveLocalUploadPath(cwd pathalg.LocalDir, raw string) (pathalg.LocalSourcePath, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 本地源路径不能为空", ErrSyntax)
+		return zeroVal[pathalg.LocalSourcePath](), i18n.EF(ErrSyntax, i18n.KeySFTPEmptyLocalPath)
 	}
 	if err := rejectDisallowedLocalInput(trimmed); err != nil {
 		return zeroVal[pathalg.LocalSourcePath](), err
@@ -304,7 +304,7 @@ func resolveScopedUploadTarget(sandboxSub []string, raw string) (pathalg.LocalRo
 		return zeroVal[pathalg.LocalRootedDest](), err
 	}
 	if len(segs) == 0 {
-		return zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: ScopedLocalOnly 上传源路径不能为沙箱根目录 '.'", ErrSyntax)
+		return zeroVal[pathalg.LocalRootedDest](), i18n.EF(ErrSyntax, i18n.KeySFTPScopedUploadRoot)
 	}
 	return pathalg.LocalRootedDestFromComponents(segs...)
 }
@@ -349,7 +349,7 @@ func resolveScopedDownloadTarget(
 		segs = append(segs, base)
 	}
 	if len(segs) == 0 {
-		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: 下载目标路径无效", ErrSyntax)
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), i18n.EF(ErrSyntax, i18n.KeySFTPInvalidDownloadDest)
 	}
 	dest, err := pathalg.LocalRootedDestFromComponents(segs...)
 	if err != nil {
@@ -425,7 +425,7 @@ func splitAbsLocalFileTarget(trimmed string) (pathalg.LocalDir, pathalg.LocalRoo
 func remoteBaseComponent(remote pathalg.RemotePath) (string, error) {
 	base, ok := remote.Base()
 	if !ok {
-		return "", fmt.Errorf("%w: 无法从远端路径 %q 推导本地文件名，请显式指定目标路径", ErrSyntax, remote.String())
+		return "", i18n.EF(ErrSyntax, i18n.KeySFTPCannotInferLocalName, i18n.BoundStr("path", remote.String()))
 	}
 	return base.String(), nil
 }
@@ -434,11 +434,11 @@ func remoteBaseComponent(remote pathalg.RemotePath) (string, error) {
 func parseOctalPerm(raw string) (fs.FileMode, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return 0, fmt.Errorf("%w: 权限值不能为空", ErrSyntax)
+		return 0, i18n.EF(ErrSyntax, i18n.KeySFTPEmptyPerm)
 	}
 	v, err := strconv.ParseUint(s, 8, 32)
 	if err != nil || v == 0 || v > 0o777 {
-		return 0, fmt.Errorf("%w: 无效八进制权限 %q（须落在 0001..0777）", ErrSyntax, raw)
+		return 0, i18n.EF(ErrSyntax, i18n.KeySFTPInvalidPerm, i18n.BoundStr("value", raw))
 	}
 	return fs.FileMode(v), nil
 }
@@ -447,7 +447,7 @@ func parseOctalPerm(raw string) (fs.FileMode, error) {
 func parseTimestamp(raw string) (time.Time, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return time.Time{}, fmt.Errorf("%w: 时间戳不能为空", ErrSyntax)
+		return time.Time{}, i18n.EF(ErrSyntax, i18n.KeySFTPEmptyTimestamp)
 	}
 	if sec, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return validateTimeRange(time.Unix(sec, 0).UTC(), raw)
@@ -463,13 +463,13 @@ func parseTimestamp(raw string) (time.Time, error) {
 			return validateTimeRange(t.UTC(), raw)
 		}
 	}
-	return time.Time{}, fmt.Errorf("%w: 无法解析时间 %q（支持 RFC3339、YYYY-MM-DDTHH:MM:SS 或 Unix 秒）", ErrSyntax, raw)
+	return time.Time{}, i18n.EF(ErrSyntax, i18n.KeySFTPInvalidTimestamp, i18n.BoundStr("value", raw))
 }
 
 func validateTimeRange(t time.Time, raw string) (time.Time, error) {
 	y := t.UTC().Year()
 	if y < 1 || y > 9999 {
-		return time.Time{}, fmt.Errorf("%w: 时间 %q 超出 RFC3339 年份范围 [1,9999]", ErrSyntax, raw)
+		return time.Time{}, i18n.EF(ErrSyntax, i18n.KeySFTPTimestampOutOfRange, i18n.BoundStr("value", raw))
 	}
 	return t.UTC(), nil
 }

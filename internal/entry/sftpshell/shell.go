@@ -14,6 +14,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // Shell 维护交互式 SFTP 会话的远端/本机工作目录状态与受控命令执行循环；零值恒未初始化并失败关闭。
@@ -43,10 +44,12 @@ type Shell struct {
 	commandTimeout   algebraic.Option[algebraic.Duration]
 	streamBuffer     int
 	showProgress     bool
+	loc              *i18n.Localizer
 	valid            bool
 }
 
 // NewShell 校验依赖配置并构造交互式 SFTP Shell 实例（零网络 I/O，真正初始化在 Run 中进行）。
+// 当 cfg.Localizer 为 nil 时自动经纯内存 embed.FS 回退默认英文 Localizer。
 func NewShell(cfg Config) (*Shell, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
@@ -55,7 +58,14 @@ func NewShell(cfg Config) (*Shell, error) {
 	if !ok {
 		var err error
 		if localDir, err = pathalg.ParseLocalDir("."); err != nil {
-			return nil, fmt.Errorf("%w: 初始化默认本地目录失败: %w", ErrInvalidConfig, err)
+			return nil, i18n.WrapS(ErrInvalidConfig, err, i18n.KeySFTPConfigDefaultLocalDir)
+		}
+	}
+	loc := cfg.Localizer
+	if loc == nil {
+		var err error
+		if loc, err = i18n.DefaultLocalizer(); err != nil {
+			return nil, i18n.WrapS(ErrInvalidConfig, err, i18n.KeySFTPConfigInvalidField, i18n.Str("field", "Localizer"))
 		}
 	}
 	stdin := cfg.Stdin
@@ -89,6 +99,7 @@ func NewShell(cfg Config) (*Shell, error) {
 		commandTimeout:   cfg.CommandTimeout,
 		streamBuffer:     buf,
 		showProgress:     cfg.ShowProgress,
+		loc:              loc,
 		valid:            true,
 	}, nil
 }
@@ -164,7 +175,10 @@ func (s *Shell) initSession(ctx context.Context) error {
 			return sErr
 		}
 		if !st.IsDir() {
-			return fmt.Errorf("%w: 初始远端路径 %s 不是目录 (%s)", ErrInvalidConfig, realPath.String(), st.FileType().String())
+			return i18n.EF(ErrInvalidConfig, i18n.KeySFTPInitialRemoteNotDir,
+				i18n.BoundStr("path", realPath.String()),
+				i18n.Str("type", st.FileType().String()),
+			)
 		}
 	}
 	s.homeRemoteDir = realPath
@@ -191,7 +205,7 @@ func (s *Shell) readEvalLoop(ctx context.Context) error {
 
 func (s *Shell) stepEvalLine(ctx context.Context, line string, eof, tooLong bool) (done bool, fatalErr error) {
 	if tooLong {
-		s.writeCommandErr(fmt.Errorf("%w: 单行命令超过最大长度 %d 字节（已丢弃该行并返回提示符）", ErrSyntax, maxLineBytes))
+		s.writeCommandErr(i18n.EF(ErrSyntax, i18n.KeySFTPLineTooLong, i18n.Int("max", maxLineBytes)))
 		return eof, nil
 	}
 	if eof && strings.TrimSpace(line) == "" {
@@ -375,7 +389,7 @@ func (s *Shell) dispatchCommand(ctx context.Context, cmd string, args []string) 
 	case "help", "?":
 		return s.cmdHelp(args)
 	default:
-		return fmt.Errorf("%w: 未知命令 %q（输入 'help' 查看支持命令）", ErrSyntax, cmd)
+		return i18n.EF(ErrSyntax, i18n.KeySFTPUnknownCommand, i18n.BoundStr("cmd", cmd))
 	}
 }
 
@@ -392,27 +406,34 @@ func (s *Shell) handleCommandError(sessionCtx context.Context, err error) error 
 }
 
 func (s *Shell) writeCommandErr(err error) {
-	_, _ = fmt.Fprintf(s.stderr, "sftp: %s\n", formatCommandError(err))
+	_, _ = fmt.Fprintf(s.stderr, "sftp: %s\n", s.formatCommandError(err))
 }
 
-func formatCommandError(err error) string {
+func (s *Shell) formatCommandError(err error) string {
 	switch {
 	case errors.Is(err, ErrCommandCanceled):
-		return "command canceled (returned to prompt)"
+		return s.loc.T(i18n.KeySFTPMsgCanceled)
 	case errors.Is(err, context.DeadlineExceeded):
-		return "command timed out (returned to prompt)"
+		return s.loc.T(i18n.KeySFTPMsgTimeout)
 	case errors.Is(err, engine.ErrRemoteIsDir):
-		return fmt.Sprintf("%v (hint: use 'rmdir' for empty directories)", err)
+		return s.loc.T(i18n.KeySFTPMsgRemoteIsDirHint, i18n.BoundStr("err", s.loc.RenderError(err)))
 	case errors.Is(err, engine.ErrOutcomeUnknown):
-		return fmt.Sprintf("CRITICAL OutcomeUnknown — DO NOT retry blindly: %v", err)
+		return s.loc.T(i18n.KeySFTPMsgOutcomeUnknown, i18n.BoundStr("err", s.loc.RenderError(err)))
 	case errors.Is(err, engine.ErrApprovalRequired):
 		if ch, ok := engine.ExtractApprovalChallenge(err); ok {
-			return fmt.Sprintf("approval required (%s, digest=%s)", ch.Reason(), ch.EnvelopeDigest().String())
+			return s.formatApprovalRequired(ch.Reason(), ch.EnvelopeDigest().String())
 		}
-		return err.Error()
+		return s.loc.RenderError(err)
 	default:
-		return err.Error()
+		return s.loc.RenderError(err)
 	}
+}
+
+func (s *Shell) formatApprovalRequired(reason, digest string) string {
+	return s.loc.T(i18n.KeySFTPMsgApprovalRequired,
+		i18n.BoundStr("reason", reason),
+		i18n.BoundStr("digest", digest),
+	)
 }
 
 func (s *Shell) remoteCall(stream *events.OperationStream) engine.RemoteCall {
