@@ -76,7 +76,7 @@ var (
 // CoreKeys 返回 core/domain/i18n 注册的全部有效 MessageID 列表（严格排除 MessageIDInvalid），
 // 供根模块 internal/i18n/catalog_test.go 执行双语词库 100% 双射与兜底一致性校验。
 func CoreKeys() []MessageID {
-	return []MessageID{
+	return append([]MessageID{
 		KeyLocaleInvalid,
 		KeyLocaleInvalidValue,
 		KeyParamInvalid,
@@ -104,5 +104,5 @@ func CoreKeys() []MessageID {
 		KeyCommonPermissionDeny,
 		KeyCommonInternalError,
 		KeyCommonErrorJoin,
-	}
+	}, interactKeys()...)
 }

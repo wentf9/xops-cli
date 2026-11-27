@@ -11,6 +11,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -350,5 +351,66 @@ func assertKeyEnrollReplaceAndUncertain(
 	}
 	if _, hasNew := h.vault.CiphertextFor(v3Ref); !hasNew {
 		t.Fatalf("UncertainDurability 绝不可删除新凭据 %s", v3Ref)
+	}
+}
+
+type recordingKeyEnrollUI struct {
+	base    ports.InteractionPort
+	secrets []ports.SecretPromptRequest
+}
+
+func (r *recordingKeyEnrollUI) CanInteract() bool { return r.base.CanInteract() }
+func (r *recordingKeyEnrollUI) Confirm(ctx context.Context, req ports.ConfirmRequest) (security.Verdict, error) {
+	return r.base.Confirm(ctx, req)
+}
+func (r *recordingKeyEnrollUI) PromptApproval(ctx context.Context, env security.ApprovalEnvelope) (ports.ApprovalDecisionResponse, error) {
+	return r.base.PromptApproval(ctx, env)
+}
+func (r *recordingKeyEnrollUI) PromptText(ctx context.Context, req ports.TextPromptRequest) (string, error) {
+	return r.base.PromptText(ctx, req)
+}
+
+//xops:syncclosure
+//xops:borrowed
+func (r *recordingKeyEnrollUI) PromptSecret(ctx context.Context, req ports.SecretPromptRequest, fn func(box *secret.SecretBox) error) error {
+	r.secrets = append(r.secrets, req)
+	return r.base.PromptSecret(ctx, req, func(box *secret.SecretBox) error { return fn(box) })
+}
+
+func TestEnrollEncryptedPrivateKey_DefaultStructuredPromptMessage(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	h := newInvHarness(t, nil)
+	h.ui.SetReplies("", []byte("key-pass-struct"))
+	recUI := &recordingKeyEnrollUI{base: h.ui}
+	svc, err := ucinv.NewService(ucinv.ServiceConfig{
+		Env: mustLocalEnv(t, nil), Store: h.store, Gate: h.gate, Vault: h.vault,
+		VaultControl: h.vault, KeySigner: h.signer, Interaction: recUI, Clock: h.clock, Entropy: h.rng.Fork(),
+		KnownStores: []string{testStoreName},
+	})
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	kp, _ := inventory.ParseKeyPathSpec("~/.ssh/struct_ed25519")
+	user, _ := option.ParseUsername("deploy")
+	id, _ := inventory.ParseIdentityID("id-struct-key")
+	fp := mustTestFP(t, 88)
+	h.signer.Register(kp.String(), "key-pass-struct", fp)
+	ref := mustTestRef(t, "key-struct-ref")
+	res, err := svc.EnrollEncryptedPrivateKeyIdentity(ctx, ucinv.EnrollEncryptedPrivateKeyRequest{
+		IdentityID: id, User: user, KeyPath: kp, NewRef: ref,
+	})
+	if err != nil || !res.IsValid() || len(recUI.secrets) != 1 {
+		t.Fatalf("默认加密私钥登记提示采集异常: res=%+v err=%v count=%d", res, err, len(recUI.secrets))
+	}
+	got := recUI.secrets[0]
+	wantT := domi18n.NewMessage(domi18n.KeyInteractKeyPassphraseTitle)
+	wantB := domi18n.NewMessage(domi18n.KeyInteractKeyPassphraseBody)
+	gotT, okT := got.TitleMessage().Get()
+	gotB, okB := got.BodyMessage().Get()
+	if got.Title() != wantT.Canonical() || got.Prompt() != wantB.Canonical() ||
+		!okT || !gotT.Equal(wantT) || !okB || !gotB.Equal(wantB) {
+		t.Fatalf("默认私钥口令提示缺少匹配的结构化消息: title=%q prompt=%q", got.Title(), got.Prompt())
 	}
 }

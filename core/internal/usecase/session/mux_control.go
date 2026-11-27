@@ -15,6 +15,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -257,7 +258,7 @@ func confirmAutoAskMuxAttach(ctx context.Context, muxPort ports.MuxSocketPort, i
 	if err != nil || !resp.IsValid() || !resp.Alive() {
 		return false, err
 	}
-	err = confirmMuxMasterWith(ctx, interaction, nodeID, "Attach to active ControlMaster via DialMux")
+	err = confirmMuxMasterWith(ctx, interaction, nodeID, domi18n.NewMessage(domi18n.KeyInteractMuxAttachBody))
 	return err == nil, err
 }
 func verifyDialedMuxConn(conn ports.TransportConn, leafDigest plan.HopDigest, ep netaddr.Endpoint) (ports.TransportConn, bool, error) {
@@ -269,7 +270,7 @@ func verifyDialedMuxConn(conn ports.TransportConn, leafDigest plan.HopDigest, ep
 }
 func (s *Service) dialVerifiedMuxConn(ctx context.Context, nodeID string, sockPath pathalg.LocalSourcePath, targetHop plan.HopSpec, leafDigest plan.HopDigest, effMaster option.ControlMasterMode) (ports.TransportConn, error) {
 	if effMaster == option.ControlMasterAsk || effMaster == option.ControlMasterAutoAsk {
-		if err := confirmMuxMasterWith(ctx, s.cfg.Interaction, nodeID, "Attach to active ControlMaster via DialMux"); err != nil {
+		if err := confirmMuxMasterWith(ctx, s.cfg.Interaction, nodeID, domi18n.NewMessage(domi18n.KeyInteractMuxAttachBody)); err != nil {
 			return nil, err
 		}
 	}

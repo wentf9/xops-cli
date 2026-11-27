@@ -18,6 +18,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -987,4 +988,113 @@ func assertMuxInfoWaitPersistAndUpstreamDrop(t *testing.T, ctx context.Context) 
 		t.Fatalf("上游断连且句柄自动回收后 Wait(ctx) 期望保留 %v，实际=%v", dropErr, err)
 	}
 	assertTeardownClean(t, dRig, "MuxWaitDrop")
+}
+
+type recordingSessionUI struct {
+	inner    *sim.SimInteractionPort
+	confirms []ports.ConfirmRequest
+	secrets  []ports.SecretPromptRequest
+}
+
+func (r *recordingSessionUI) CanInteract() bool { return r.inner.CanInteract() }
+func (r *recordingSessionUI) Confirm(ctx context.Context, req ports.ConfirmRequest) (security.Verdict, error) {
+	r.confirms = append(r.confirms, req)
+	return r.inner.Confirm(ctx, req)
+}
+func (r *recordingSessionUI) PromptApproval(ctx context.Context, env security.ApprovalEnvelope) (ports.ApprovalDecisionResponse, error) {
+	return r.inner.PromptApproval(ctx, env)
+}
+func (r *recordingSessionUI) PromptText(ctx context.Context, req ports.TextPromptRequest) (string, error) {
+	return r.inner.PromptText(ctx, req)
+}
+
+//xops:syncclosure
+//xops:borrowed
+func (r *recordingSessionUI) PromptSecret(ctx context.Context, req ports.SecretPromptRequest, fn func(box *secret.SecretBox) error) error {
+	r.secrets = append(r.secrets, req)
+	return r.inner.PromptSecret(ctx, req, func(box *secret.SecretBox) error { return fn(box) })
+}
+
+// TestSession_StructuredPromptMessages 验证提权口令提示与 ControlMaster 全部 3 种确认正文的结构化 i18n.Message。
+func TestSession_StructuredPromptMessages(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	baseUI := sim.NewSimInteractionPort(true)
+	baseUI.SetReplies("", []byte("priv-pass-ok"))
+	recUI := &recordingSessionUI{inner: baseUI}
+	rig := newFullSessionRig(t, fullRigOptions{profile: gate.PolicyProfileDirectOperator, interactive: true, customInteraction: recUI})
+	defer rig.close()
+
+	// 1. 提权口令提示（sudo）。
+	rig.escalator.SetRequiredPassword([]byte("priv-pass-ok"))
+	pl := mustTestPlan(t, "LANG")
+	if _, err := rig.svc.ExecPrivileged(ctx, ucsess.PrivilegeExecRequest{
+		Plan: pl, NodeID: "web-01", Privilege: mustPrivilegeReq(t, ports.PrivilegeMethodSudo, "id", "root", false), PromptPassword: true,
+	}); err != nil {
+		t.Fatalf("ExecPrivileged: %v", err)
+	}
+	assertPrivilegePromptMessage(t, recUI.secrets)
+
+	// 2. ControlMaster 启动（ask）、复用（autoask）、附着（WithMuxConn + TryDialMuxClient）。
+	sockLit, _ := option.NewLiteralControlPath("/tmp/mux-i18n-confirm.sock")
+	autoAskPl := mustPlanWithControl(t, option.UnsetControlPolicy().WithMaster(option.ControlMasterAutoAsk).WithPath(sockLit).WithPersist(option.IndefiniteControlPersist()), false)
+	info1, err := rig.svc.StartControlMaster(ctx, ucsess.ControlMasterRequest{Plan: autoAskPl, NodeID: "web-01"})
+	if err != nil {
+		t.Fatalf("StartControlMaster(start): %v", err)
+	}
+	h1, _ := info1.Handle().Get()
+	if _, err := rig.svc.StartControlMaster(ctx, ucsess.ControlMasterRequest{Plan: autoAskPl, NodeID: "web-01"}); err != nil {
+		t.Fatalf("StartControlMaster(reuse): %v", err)
+	}
+	if err := rig.svc.WithMuxConn(ctx, ucsess.MuxRequest{Plan: autoAskPl, NodeID: "web-01"}, func(context.Context, ports.TransportConn) error { return nil }); err != nil {
+		t.Fatalf("WithMuxConn: %v", err)
+	}
+	leafHop, _ := autoAskPl.HopAt(autoAskPl.Len() - 1)
+	leafDig, _ := autoAskPl.HopDigestAt(autoAskPl.Len() - 1)
+	conn, ok, err := ucsess.TryDialMuxClient(ctx, rig.muxSocket, rig.env, recUI, leafHop, leafDig)
+	if err != nil || !ok || conn == nil {
+		t.Fatalf("TryDialMuxClient: ok=%v err=%v", ok, err)
+	}
+	_ = conn.Close()
+	_ = rig.svc.StopControlMaster(ctx, h1)
+	assertTeardownClean(t, rig, "StructuredPromptMessages")
+	assertMuxConfirmMessages(t, recUI.confirms)
+}
+
+func assertPrivilegePromptMessage(t *testing.T, secrets []ports.SecretPromptRequest) {
+	t.Helper()
+	if len(secrets) != 1 {
+		t.Fatalf("期望 1 次提权口令提示，实际 %d", len(secrets))
+	}
+	wantT := domi18n.NewMessage(domi18n.KeyInteractPrivilegeTitle)
+	wantB := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", "web-01"))
+	gotT, okT := secrets[0].TitleMessage().Get()
+	gotB, okB := secrets[0].BodyMessage().Get()
+	if secrets[0].Title() != wantT.Canonical() || secrets[0].Prompt() != wantB.Canonical() ||
+		!okT || !gotT.Equal(wantT) || !okB || !gotB.Equal(wantB) {
+		t.Fatalf("提权口令提示结构化消息异常: title=%q prompt=%q", secrets[0].Title(), secrets[0].Prompt())
+	}
+}
+
+func assertMuxConfirmMessages(t *testing.T, confirms []ports.ConfirmRequest) {
+	t.Helper()
+	wantBodies := []domi18n.MessageID{
+		domi18n.KeyInteractMuxStartBody,
+		domi18n.KeyInteractMuxReuseBody,
+		domi18n.KeyInteractMuxAttachBody,
+		domi18n.KeyInteractMuxAttachBody,
+	}
+	if len(confirms) != len(wantBodies) {
+		t.Fatalf("期望 %d 次 ControlMaster 确认，实际 %d", len(wantBodies), len(confirms))
+	}
+	wantT := domi18n.NewMessage(domi18n.KeyInteractMuxConfirmTitle)
+	for i, bodyID := range wantBodies {
+		wantB := domi18n.NewMessage(bodyID)
+		gotT, okT := confirms[i].TitleMessage().Get()
+		gotB, okB := confirms[i].BodyMessage().Get()
+		if confirms[i].Title() != wantT.Canonical() || confirms[i].Message() != wantB.Canonical() ||
+			!okT || !gotT.Equal(wantT) || !okB || !gotB.Equal(wantB) {
+			t.Fatalf("ControlMaster 确认 #%d 结构化消息异常: title=%q msg=%q", i, confirms[i].Title(), confirms[i].Message())
+		}
+	}
 }

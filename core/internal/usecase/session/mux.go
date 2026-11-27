@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -322,11 +323,10 @@ func (m *managedMuxMaster) waitErr() error {
 	if m == nil || !m.valid {
 		return ports.ErrClosed
 	}
-	err := m.serveErr.get()
-	if err == nil || errors.Is(err, ErrMuxPersistExpired) {
-		return nil
+	if err := m.serveErr.get(); err != nil && !errors.Is(err, ErrMuxPersistExpired) {
+		return err
 	}
-	return err
+	return nil
 }
 func (m *managedMuxMaster) snapshot(hs pool.HandleStatus) ControlMasterStatus {
 	return ControlMasterStatus{handleStatus: hs, socketPath: m.socketPath, effectiveMaster: m.effectiveMaster, effectivePersist: m.effectivePersist, active: hs.Active() && m.IsValid(), err: m.serveErr.get(), valid: true}
@@ -388,7 +388,7 @@ func (s *Service) execStartControlMaster(authCtx context.Context, connPlan plan.
 		return rErr
 	}
 	if effMaster == option.ControlMasterAsk || effMaster == option.ControlMasterAutoAsk {
-		if err := confirmMuxMasterWith(authCtx, s.cfg.Interaction, nodeID, "Start ControlMaster listener"); err != nil {
+		if err := confirmMuxMasterWith(authCtx, s.cfg.Interaction, nodeID, domi18n.NewMessage(domi18n.KeyInteractMuxStartBody)); err != nil {
 			return err
 		}
 	}
@@ -402,13 +402,12 @@ func (s *Service) execStartControlMaster(authCtx context.Context, connPlan plan.
 		if err != nil {
 			return err
 		}
-		var doneCh <-chan struct{}
-		var waitErrFn func() error
+		info := ControlMasterInfo{handle: algebraic.Some(h), socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, valid: true}
 		if master != nil {
 			master.bindAutoRelease(func() { _ = pool.ReleaseHandle[plan.KindMux](s.cfg.Pool, h) })
-			doneCh, waitErrFn = master.doneCh, master.waitErr
+			info.doneCh, info.waitErr = master.doneCh, master.waitErr
 		}
-		*outInfo = ControlMasterInfo{handle: algebraic.Some(h), socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, doneCh: doneCh, waitErr: waitErrFn, valid: true}
+		*outInfo = info
 		return nil
 	})
 }
@@ -424,7 +423,7 @@ func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sock
 		return false, ControlMasterInfo{}, err
 	}
 	if effMaster == option.ControlMasterAutoAsk {
-		if err := confirmMuxMasterWith(ctx, s.cfg.Interaction, nodeID, "Reuse active ControlMaster connection"); err != nil {
+		if err := confirmMuxMasterWith(ctx, s.cfg.Interaction, nodeID, domi18n.NewMessage(domi18n.KeyInteractMuxReuseBody)); err != nil {
 			return false, ControlMasterInfo{}, err
 		}
 	}
@@ -432,11 +431,12 @@ func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sock
 	close(closedCh)
 	return true, ControlMasterInfo{socketPath: sockPath, reusedExisting: true, masterPID: resp.MasterPID(), effectiveMaster: effMaster, effectivePersist: effPersist, doneCh: closedCh, valid: true}, nil
 }
-func confirmMuxMasterWith(ctx context.Context, interaction ports.InteractionPort, nodeID, message string) error {
+func confirmMuxMasterWith(ctx context.Context, interaction ports.InteractionPort, nodeID string, bodyMsg domi18n.Message) error {
 	if interaction == nil || !interaction.CanInteract() {
 		return fmt.Errorf("%w: %w: ControlMaster ask/autoask 需要可交互终端", ErrMuxMasterUnavailable, ports.ErrInteractionUnavailable)
 	}
-	cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Title: "ControlMaster Confirmation", Message: message, Subject: nodeID, Risk: security.RiskModerate})
+	tMsg := domi18n.NewMessage(domi18n.KeyInteractMuxConfirmTitle)
+	cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Title: tMsg.Canonical(), Message: bodyMsg.Canonical(), Subject: nodeID, Risk: security.RiskModerate, TitleMessage: algebraic.Some(tMsg), BodyMessage: algebraic.Some(bodyMsg)})
 	if err != nil {
 		return err
 	}

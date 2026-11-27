@@ -10,6 +10,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -270,16 +271,14 @@ func (s *Service) buildPrivilegeStreams(ctx context.Context, req PrivilegeExecRe
 //xops:syncclosure
 //xops:borrowed
 func (s *Service) withPrivilegePassword(ctx context.Context, req PrivilegeExecRequest, nodeID string, fn func(passBox *secret.SecretBox) error) error {
-	if req.Privilege.NonInteractive() {
+	if req.Privilege.NonInteractive() || (!req.PasswordRef.IsSome() && !req.PromptPassword) {
 		return fn(nil)
 	}
 	if ref, hasRef := req.PasswordRef.Get(); hasRef {
 		return s.cfg.Vault.WithSecret(ctx, ref, func(box *secret.SecretBox) error { return fn(box) })
 	}
-	if !req.PromptPassword {
-		return fn(nil)
-	}
-	promptReq, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Title: "Privilege Escalation", Prompt: fmt.Sprintf("Enter %s password for %s", req.Privilege.Method().String(), nodeID), Subject: nodeID})
+	tMsg, bMsg := domi18n.NewMessage(domi18n.KeyInteractPrivilegeTitle), domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", req.Privilege.Method().String()), domi18n.BoundStr("node", nodeID))
+	promptReq, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Title: tMsg.Canonical(), Prompt: bMsg.Canonical(), Subject: nodeID, TitleMessage: algebraic.Some(tMsg), BodyMessage: algebraic.Some(bMsg)})
 	if err != nil {
 		return err
 	}

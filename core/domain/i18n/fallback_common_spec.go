@@ -6,7 +6,10 @@ func CanonicalFallback(id MessageID) string {
 	if text := fallbackI18n(id); text != "" {
 		return text
 	}
-	return fallbackCommon(id)
+	if text := fallbackCommon(id); text != "" {
+		return text
+	}
+	return fallbackInteract(id)
 }
 
 func fallbackI18n(id MessageID) string {

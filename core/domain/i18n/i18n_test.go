@@ -402,3 +402,45 @@ func TestFormatTemplateAndExtractPlaceholders(t *testing.T) {
 		}
 	}
 }
+
+func TestInteractCoreKeysAndCanonicalFallbacks(t *testing.T) {
+	allCore := CoreKeys()
+	want := []struct {
+		id       MessageID
+		fallback string
+	}{
+		{KeyInteractHostKeyTitle, "SSH Host Key Verification"},
+		{KeyInteractHostKeyBody, "Trust unknown SSH host key {algorithm} ({fingerprint}) for {endpoint}?"},
+		{KeyInteractSSHChallengeTitle, "SSH Challenge"},
+		{KeyInteractChallengeResponse, "Response:"},
+		{KeyInteractKeyPassphraseTitle, "Private Key Passphrase"},
+		{KeyInteractKeyPassphraseBody, "Enter passphrase for encrypted private key"},
+		{KeyInteractPrivilegeTitle, "Privilege Escalation"},
+		{KeyInteractPrivilegeBody, "Enter {method} password for {node}"},
+		{KeyInteractMuxConfirmTitle, "ControlMaster Confirmation"},
+		{KeyInteractMuxStartBody, "Start ControlMaster listener"},
+		{KeyInteractMuxReuseBody, "Reuse active ControlMaster connection"},
+		{KeyInteractMuxAttachBody, "Attach to active ControlMaster via DialMux"},
+	}
+	for _, tc := range want {
+		if !slices.Contains(allCore, tc.id) {
+			t.Fatalf("CoreKeys 缺少交互提示键 %q", tc.id)
+		}
+		if got := CanonicalFallback(tc.id); got != tc.fallback {
+			t.Fatalf("CanonicalFallback(%q) = %q, 期望 %q", tc.id, got, tc.fallback)
+		}
+	}
+	hostKeyMsg := NewMessage(
+		KeyInteractHostKeyBody,
+		BoundStr("algorithm", "ssh-ed25519"),
+		BoundStr("fingerprint", "SHA256:abc"),
+		BoundStr("endpoint", "192.0.2.10:22"),
+	)
+	if !hostKeyMsg.IsValid() || hostKeyMsg.Canonical() != "Trust unknown SSH host key ssh-ed25519 (SHA256:abc) for 192.0.2.10:22?" {
+		t.Fatalf("主机密钥确认消息渲染异常: valid=%v text=%q", hostKeyMsg.IsValid(), hostKeyMsg.Canonical())
+	}
+	privMsg := NewMessage(KeyInteractPrivilegeBody, BoundStr("method", "sudo"), BoundStr("node", "web-01"))
+	if !privMsg.IsValid() || privMsg.Canonical() != "Enter sudo password for web-01" {
+		t.Fatalf("提权口令提示消息渲染异常: valid=%v text=%q", privMsg.IsValid(), privMsg.Canonical())
+	}
+}

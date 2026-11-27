@@ -15,6 +15,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -576,5 +577,123 @@ func verifyCorruptJournalSnapshotPrefix(t *testing.T, rec1 fsm.TransferJournalRe
 	}
 	if _, err := ports.NewCorruptJournalGenerationSnapshot(1, nil); err == nil {
 		t.Fatal("nil 错误构造损坏快照必须失败关闭")
+	}
+}
+
+func TestPromptRequestStructuredMessagesAndFailClosed(t *testing.T) {
+	var (
+		zeroSec  ports.SecretPromptRequest
+		zeroConf ports.ConfirmRequest
+		zeroTxt  ports.TextPromptRequest
+	)
+	if !zeroSec.TitleMessage().IsNone() || !zeroSec.BodyMessage().IsNone() ||
+		!zeroConf.TitleMessage().IsNone() || !zeroConf.BodyMessage().IsNone() ||
+		!zeroTxt.TitleMessage().IsNone() || !zeroTxt.BodyMessage().IsNone() {
+		t.Fatal("零值交互请求的结构化消息访问器必须返回 None")
+	}
+
+	titleMsg := domi18n.NewMessage(domi18n.KeyInteractPrivilegeTitle)
+	bodyMsg := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", "web-01"))
+	bodyMsgAlt := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", "web-02"))
+
+	sPlain, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Title: titleMsg.Canonical(), Prompt: bodyMsg.Canonical(), Subject: "web-01"})
+	if err != nil || !sPlain.TitleMessage().IsNone() || !sPlain.BodyMessage().IsNone() {
+		t.Fatalf("无结构化消息构造 SecretPromptRequest 异常: err=%v", err)
+	}
+	sMsg1, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+		Title: titleMsg.Canonical(), Prompt: bodyMsg.Canonical(), Subject: "web-01",
+		TitleMessage: algebraic.Some(titleMsg), BodyMessage: algebraic.Some(bodyMsg),
+	})
+	sMsg2, err2 := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+		Title: titleMsg.Canonical(), Prompt: bodyMsg.Canonical(), Subject: "web-01",
+		TitleMessage: algebraic.Some(titleMsg), BodyMessage: algebraic.Some(bodyMsg),
+	})
+	sMsgDiff, err3 := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+		Title: titleMsg.Canonical(), Prompt: bodyMsg.Canonical(), Subject: "web-01",
+		TitleMessage: algebraic.Some(titleMsg), BodyMessage: algebraic.Some(bodyMsgAlt),
+	})
+	if err != nil || err2 != nil || err3 != nil || !sMsg1.Equal(sMsg2) || sMsg1.Equal(sPlain) || sMsg1.Equal(sMsgDiff) {
+		t.Fatalf("SecretPromptRequest 结构化消息 Equal 语义异常: errs=(%v,%v,%v)", err, err2, err3)
+	}
+	if gotT, okT := sMsg1.TitleMessage().Get(); !okT || !gotT.Equal(titleMsg) {
+		t.Fatalf("SecretPromptRequest.TitleMessage 不匹配: ok=%v", okT)
+	}
+	if gotB, okB := sMsg1.BodyMessage().Get(); !okB || !gotB.Equal(bodyMsg) {
+		t.Fatalf("SecretPromptRequest.BodyMessage 不匹配: ok=%v", okB)
+	}
+
+	cTitle := domi18n.NewMessage(domi18n.KeyInteractMuxConfirmTitle)
+	cBody := domi18n.NewMessage(domi18n.KeyInteractMuxStartBody)
+	cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{
+		Title: cTitle.Canonical(), Message: cBody.Canonical(), Subject: "web-01", Risk: security.RiskModerate,
+		TitleMessage: algebraic.Some(cTitle), BodyMessage: algebraic.Some(cBody),
+	})
+	gotCT, okCT := cReq.TitleMessage().Get()
+	gotCB, okCB := cReq.BodyMessage().Get()
+	if err != nil || !okCT || !gotCT.Equal(cTitle) || !okCB || !gotCB.Equal(cBody) {
+		t.Fatalf("ConfirmRequest 结构化消息访问器异常: err=%v", err)
+	}
+
+	tTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+	tReq, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
+		Title: tTitle.Canonical(), Prompt: "OTP:", Subject: "web-01", AllowEmpty: true,
+		TitleMessage: algebraic.Some(tTitle),
+	})
+	gotTT, okTT := tReq.TitleMessage().Get()
+	if err != nil || !okTT || !gotTT.Equal(tTitle) || !tReq.BodyMessage().IsNone() {
+		t.Fatalf("TextPromptRequest 结构化消息访问器异常: err=%v", err)
+	}
+
+	assertInvalidPromptMessagesRejected(t)
+}
+
+func assertInvalidPromptMessagesRejected(t *testing.T) {
+	t.Helper()
+	var zeroMsg domi18n.Message
+	badTitleMsg := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", strings.Repeat("a", 150)))
+	badBodyMsg := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", strings.Repeat("b", 600)))
+	danglingParamMsg := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle, domi18n.BoundStr("extra", strings.Repeat("c", 200)))
+
+	for i, err := range []error{
+		func() error {
+			_, e := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "P", TitleMessage: algebraic.Some(zeroMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "P", BodyMessage: algebraic.Some(zeroMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Message: "M", Risk: security.RiskModerate, TitleMessage: algebraic.Some(zeroMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Message: "M", Risk: security.RiskModerate, BodyMessage: algebraic.Some(zeroMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{Prompt: "P", TitleMessage: algebraic.Some(zeroMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{Prompt: "P", BodyMessage: algebraic.Some(zeroMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "P", TitleMessage: algebraic.Some(badTitleMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "P", BodyMessage: algebraic.Some(badBodyMsg)})
+			return e
+		}(),
+		func() error {
+			_, e := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{Prompt: "P", TitleMessage: algebraic.Some(danglingParamMsg)})
+			return e
+		}(),
+	} {
+		if !errors.Is(err, ports.ErrInvalidArgument) {
+			t.Fatalf("非法结构化提示消息 #%d 应返回 ErrInvalidArgument，实际: %v", i, err)
+		}
 	}
 }

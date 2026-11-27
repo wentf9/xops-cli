@@ -9,6 +9,8 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -114,12 +116,20 @@ func (d *Dialer) confirmAndRecordUnknownHostKey(ctx context.Context, hop plan.Ho
 	if tp.BatchMode() || d.interaction == nil || !d.interaction.CanInteract() {
 		return fmt.Errorf("%w: %s (%s)", ports.ErrHostKeyUnknown, hop.Endpoint(), pub.Fingerprint())
 	}
-	msg := fmt.Sprintf("Trust unknown SSH host key %s (%s) for %s?", pub.Algorithm(), pub.Fingerprint(), hop.Endpoint())
+	titleMsg := domi18n.NewMessage(domi18n.KeyInteractHostKeyTitle)
+	bodyMsg := domi18n.NewMessage(
+		domi18n.KeyInteractHostKeyBody,
+		domi18n.BoundStr("algorithm", pub.Algorithm()),
+		domi18n.BoundStr("fingerprint", pub.Fingerprint().String()),
+		domi18n.BoundStr("endpoint", hop.Endpoint().String()),
+	)
 	req, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{
-		Title:   "SSH Host Key Verification",
-		Message: msg,
-		Subject: hop.Endpoint().String(),
-		Risk:    security.RiskModerate,
+		Title:        titleMsg.Canonical(),
+		Message:      bodyMsg.Canonical(),
+		Subject:      hop.Endpoint().String(),
+		Risk:         security.RiskModerate,
+		TitleMessage: algebraic.Some(titleMsg),
+		BodyMessage:  algebraic.Some(bodyMsg),
 	})
 	if err != nil {
 		return err

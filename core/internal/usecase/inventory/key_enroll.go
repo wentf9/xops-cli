@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -143,7 +144,15 @@ func (s *Service) validateKeyEnrollCall(ctx context.Context, req EnrollEncrypted
 		}
 		return req.Prompt, nil
 	default:
-		return ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Title: "Private Key Passphrase", Prompt: "Enter passphrase for encrypted private key", Subject: req.IdentityID.String()})
+		titleMsg := domi18n.NewMessage(domi18n.KeyInteractKeyPassphraseTitle)
+		bodyMsg := domi18n.NewMessage(domi18n.KeyInteractKeyPassphraseBody)
+		return ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+			Title:        titleMsg.Canonical(),
+			Prompt:       bodyMsg.Canonical(),
+			Subject:      req.IdentityID.String(),
+			TitleMessage: algebraic.Some(titleMsg),
+			BodyMessage:  algebraic.Some(bodyMsg),
+		})
 	}
 }
 func (s *Service) buildEnrollKeySagaRequest(req EnrollEncryptedPrivateKeyRequest) (*keyEnrollState, credential.VaultSagaRequest) {

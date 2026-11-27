@@ -9,6 +9,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -165,14 +166,18 @@ func (d *Dialer) planInteractiveKIQuestion(ctx context.Context, hop plan.HopSpec
 
 // formatInteractiveKIPrompt 构造面向 InteractionPort 的清洗后展示提示文案：
 // 规则匹配仍保留完整 4 KiB pendingBanner，交互回退展示时先经 security.SanitizePromptText 脱敏，
-// 再按 UTF-8 字符边界截断至 <= 512 字节（优先完整保留问题正文），防止超长 MFA 横幅触发 ports.ErrInvalidArgument。
+// 再按 UTF-8 字符边界截断至 <= 512 字节（优先完整保留问题正文），防止超长 MFA 横幅触发 ports.ErrInvalidArgument；
+// 当远端 instruction 与 prompt 脱敏后均为空时返回空串，交由调用方附带结构化默认应答提示。
 func formatInteractiveKIPrompt(instruction, prompt string) string {
-	cleanPrompt := strings.TrimSpace(security.SanitizePromptText(normalizeChallengePrompt(prompt)))
+	cleanPrompt := strings.TrimSpace(security.SanitizePromptText(prompt))
+	cleanInstr := strings.TrimSpace(security.SanitizePromptText(instruction))
+	if cleanPrompt == "" && cleanInstr == "" {
+		return ""
+	}
 	if cleanPrompt == "" {
-		cleanPrompt = "Response:"
+		cleanPrompt = domi18n.NewMessage(domi18n.KeyInteractChallengeResponse).Canonical()
 	}
 	cleanPrompt = truncateUTF8Bytes(cleanPrompt, maxInteractivePromptBytes)
-	cleanInstr := strings.TrimSpace(security.SanitizePromptText(instruction))
 	if cleanInstr == "" {
 		return cleanPrompt
 	}
@@ -232,30 +237,41 @@ func (d *Dialer) planMatchedRuleKIQuestion(ctx context.Context, rule inventory.C
 	}
 }
 
+func buildChallengePromptParts(prompt string) (string, domi18n.Message, string, algebraic.Option[domi18n.Message]) {
+	titleMsg := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+	if strings.TrimSpace(prompt) == "" {
+		bodyMsg := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+		return titleMsg.Canonical(), titleMsg, bodyMsg.Canonical(), algebraic.Some(bodyMsg)
+	}
+	return titleMsg.Canonical(), titleMsg, prompt, algebraic.None[domi18n.Message]()
+}
+
 func newChallengeSecretPrompt(subject, prompt string) (ports.SecretPromptRequest, error) {
+	title, titleMsg, body, bodyMsg := buildChallengePromptParts(prompt)
 	return ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
-		Title:      "SSH Challenge",
-		Prompt:     normalizeChallengePrompt(prompt),
-		Subject:    subject,
-		AllowEmpty: true,
+		Title:        title,
+		Prompt:       body,
+		Subject:      subject,
+		AllowEmpty:   true,
+		TitleMessage: algebraic.Some(titleMsg),
+		BodyMessage:  bodyMsg,
 	})
 }
 
 func (d *Dialer) promptInteractiveText(ctx context.Context, subject, prompt string) (string, error) {
+	title, titleMsg, body, bodyMsg := buildChallengePromptParts(prompt)
 	req, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
-		Title: "SSH Challenge", Prompt: normalizeChallengePrompt(prompt), Subject: subject, AllowEmpty: true,
+		Title:        title,
+		Prompt:       body,
+		Subject:      subject,
+		AllowEmpty:   true,
+		TitleMessage: algebraic.Some(titleMsg),
+		BodyMessage:  bodyMsg,
 	})
 	if err != nil {
 		return "", err
 	}
 	return d.interaction.PromptText(ctx, req)
-}
-
-func normalizeChallengePrompt(prompt string) string {
-	if strings.TrimSpace(prompt) == "" {
-		return "Response:"
-	}
-	return prompt
 }
 
 func (d *Dialer) runChallengeCommand(ctx context.Context, rule *inventory.RuleCommand) (string, error) {

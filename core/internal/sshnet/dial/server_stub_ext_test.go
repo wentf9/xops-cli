@@ -57,6 +57,7 @@ type loopbackSSHSpec struct {
 }
 
 type kiRoundSpec struct {
+	emptyName   bool
 	instruction string
 	questions   []string
 	echos       []bool
@@ -188,7 +189,11 @@ func (s *loopbackSSHSpec) handleKeyboardInteractive(_ ssh.ConnMetadata, client s
 		}}
 	}
 	for ri, r := range rounds {
-		answers, err := client("xops-test", r.instruction, r.questions, r.echos)
+		name := "xops-test"
+		if r.emptyName {
+			name = ""
+		}
+		answers, err := client(name, r.instruction, r.questions, r.echos)
 		if err != nil {
 			return nil, err
 		}

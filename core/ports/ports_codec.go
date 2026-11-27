@@ -470,17 +470,17 @@ func (p *ProcessSpec) UnmarshalJSONFrom(c jDec) error {
 	return decReq(p, c, ErrInvalidArgument, "max_output_bytes", func(w ProcessSpecInput) bool { return w.MaxOutputBytes.IsSome() }, NewProcessSpec)
 }
 func (r SecretPromptRequest) MarshalJSONTo(e jEnc) error {
-	return enc(e, r.IsValid(), SecretPromptRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.core.allowEmpty})
+	return enc(e, r.IsValid(), SecretPromptRequestSpec{Title: r.core.title, Prompt: r.core.prompt, Subject: r.core.subject, AllowEmpty: r.core.allowEmpty, TitleMessage: r.core.titleMsg, BodyMessage: r.core.bodyMsg})
 }
 func (r *SecretPromptRequest) UnmarshalJSONFrom(c jDec) error {
 	return dec(r, c, NewSecretPromptRequest)
 }
 func (r ConfirmRequest) MarshalJSONTo(e jEnc) error {
-	return enc(e, r.IsValid(), ConfirmRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.risk})
+	return enc(e, r.IsValid(), ConfirmRequestSpec{Title: r.core.title, Message: r.core.prompt, Subject: r.core.subject, Risk: r.risk, TitleMessage: r.core.titleMsg, BodyMessage: r.core.bodyMsg})
 }
 func (r *ConfirmRequest) UnmarshalJSONFrom(c jDec) error { return dec(r, c, NewConfirmRequest) }
 func (r TextPromptRequest) MarshalJSONTo(e jEnc) error {
-	return enc(e, r.IsValid(), TextPromptRequestSpec{r.core.title, r.core.prompt, r.core.subject, r.core.allowEmpty})
+	return enc(e, r.IsValid(), TextPromptRequestSpec{Title: r.core.title, Prompt: r.core.prompt, Subject: r.core.subject, AllowEmpty: r.core.allowEmpty, TitleMessage: r.core.titleMsg, BodyMessage: r.core.bodyMsg})
 }
 func (r *TextPromptRequest) UnmarshalJSONFrom(c jDec) error { return dec(r, c, NewTextPromptRequest) }
 func (r ApprovalDecisionResponse) MarshalJSONTo(e jEnc) error {

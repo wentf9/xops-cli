@@ -17,6 +17,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -60,13 +61,21 @@ func (*cancelAgent) SignWithAgent(context.Context, algebraic.Option[inventory.Ag
 }
 
 type spyInteraction struct {
-	canInteract bool
-	reply       string
-	seenPrompts []string
+	canInteract  bool
+	reply        string
+	allowConfirm bool
+	seenPrompts  []string
+	seenConfirms []ports.ConfirmRequest
+	seenSecrets  []ports.SecretPromptRequest
+	seenTexts    []ports.TextPromptRequest
 }
 
 func (s *spyInteraction) CanInteract() bool { return s.canInteract }
-func (*spyInteraction) Confirm(context.Context, ports.ConfirmRequest) (security.Verdict, error) {
+func (s *spyInteraction) Confirm(_ context.Context, req ports.ConfirmRequest) (security.Verdict, error) {
+	s.seenConfirms = append(s.seenConfirms, req)
+	if s.allowConfirm {
+		return security.VerdictAllow, nil
+	}
 	return security.VerdictDeny, ports.ErrUnsupported
 }
 
@@ -74,12 +83,14 @@ func (*spyInteraction) Confirm(context.Context, ports.ConfirmRequest) (security.
 //xops:borrowed
 func (s *spyInteraction) PromptSecret(_ context.Context, req ports.SecretPromptRequest, fn func(*secret.SecretBox) error) error {
 	s.seenPrompts = append(s.seenPrompts, req.Prompt())
+	s.seenSecrets = append(s.seenSecrets, req)
 	return secret.WithBytes([]byte(s.reply), func(box *secret.SecretBox) error {
 		return fn(box)
 	})
 }
 func (s *spyInteraction) PromptText(_ context.Context, req ports.TextPromptRequest) (string, error) {
 	s.seenPrompts = append(s.seenPrompts, req.Prompt())
+	s.seenTexts = append(s.seenTexts, req)
 	return s.reply, nil
 }
 func (*spyInteraction) PromptApproval(context.Context, security.ApprovalEnvelope) (ports.ApprovalDecisionResponse, error) {
@@ -343,4 +354,109 @@ func testTruncatedCmdAndOTPUnescape(t *testing.T) {
 	if _, err := d.DialHop(ctx, hopCmd, digCmd, nil); !errors.Is(err, ports.ErrAuthFailed) {
 		t.Fatalf("截断的 RuleCommand 输出须返回 ErrAuthFailed，实际 %v", err)
 	}
+}
+
+// TestDialer_StructuredPromptMessages 验证主机密钥首次确认与 Keyboard-Interactive 质询均正确附带结构化 i18n.Message，
+// 且远端 PAM 非空提示保持 BodyMessage=None 仅对全空提示附带 KeyInteractChallengeResponse。
+func TestDialer_StructuredPromptMessages(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	ctx := context.Background()
+	db, _ := newRealKnownHostsDB(t)
+	srv, srvPub := newLoopbackSSHSpec(t)
+	srv.kiRounds = []kiRoundSpec{
+		{emptyName: true, instruction: "", questions: []string{"Remote OTP:", "   ", "Echo prompt:", ""}, echos: []bool{false, false, true, true}, expected: []string{"ans", "ans", "ans", "ans"}},
+		{emptyName: true, instruction: "Banner Only", questions: []string{""}, echos: []bool{false}, expected: []string{"ans"}},
+	}
+	ep := tck.MustEndpoint(t, "prompt-i18n.example.test", 22)
+	inter := &spyInteraction{canInteract: true, allowConfirm: true, reply: "ans"}
+	d, err := dial.NewDialer(dial.Config{HostTrust: db, Interaction: inter, DialContext: srv.dialFunc()})
+	if err != nil {
+		t.Fatalf("NewDialer: %v", err)
+	}
+	rDummy, _ := inventory.NewRuleCommand(inventory.ChallengeRuleMeta{PromptPattern: "never-matches"}, "true", nil, algebraic.None[algebraic.Duration]())
+	kiAuth, _ := inventory.NewAuthKeyboardInteractive(algebraic.NewNonEmpty[inventory.ChallengeRule](rDummy))
+	askLayer := option.UnsetOptionLayer().WithStrictHostKeyChecking(option.StrictHostKeyCheckingAsk)
+	assertDialSucceeds(t, ctx, d, ep, kiAuth, askLayer)
+
+	assertHostKeyConfirmMessage(t, inter.seenConfirms, srvPub, ep.String())
+	assertChallengeSecretMessages(t, inter.seenSecrets)
+	assertChallengeTextMessages(t, inter.seenTexts)
+}
+
+func assertOptMsgEq(t *testing.T, label string, opt algebraic.Option[domi18n.Message], want domi18n.Message) {
+	t.Helper()
+	got, ok := opt.Get()
+	if !ok || !got.Equal(want) {
+		t.Fatalf("%s 结构化消息不匹配: ok=%v got=%q want=%q", label, ok, got.Canonical(), want.Canonical())
+	}
+}
+
+func assertHostKeyConfirmMessage(t *testing.T, confirms []ports.ConfirmRequest, pub ports.PublicKeyInfo, epStr string) {
+	t.Helper()
+	if len(confirms) != 1 {
+		t.Fatalf("期望 1 次主机密钥确认，实际 %d", len(confirms))
+	}
+	req := confirms[0]
+	wantTitle := domi18n.NewMessage(domi18n.KeyInteractHostKeyTitle)
+	wantBody := domi18n.NewMessage(
+		domi18n.KeyInteractHostKeyBody,
+		domi18n.BoundStr("algorithm", pub.Algorithm()),
+		domi18n.BoundStr("fingerprint", pub.Fingerprint().String()),
+		domi18n.BoundStr("endpoint", epStr),
+	)
+	if req.Title() != wantTitle.Canonical() {
+		t.Fatalf("主机密钥确认标题异常: title=%q", req.Title())
+	}
+	assertOptMsgEq(t, "hostkey.title", req.TitleMessage(), wantTitle)
+	if req.Message() != wantBody.Canonical() {
+		t.Fatalf("主机密钥确认正文异常: msg=%q", req.Message())
+	}
+	assertOptMsgEq(t, "hostkey.body", req.BodyMessage(), wantBody)
+}
+
+func assertChallengeSecretMessages(t *testing.T, secrets []ports.SecretPromptRequest) {
+	t.Helper()
+	if len(secrets) != 3 {
+		t.Fatalf("期望 3 次机密质询提示，实际 %d", len(secrets))
+	}
+	wantTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+	wantResp := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	for i, req := range secrets {
+		if req.Title() != wantTitle.Canonical() {
+			t.Fatalf("机密质询 #%d 标题异常: title=%q", i, req.Title())
+		}
+		assertOptMsgEq(t, "ki.secret.title", req.TitleMessage(), wantTitle)
+	}
+	if secrets[0].Prompt() != "Remote OTP:" || !secrets[0].BodyMessage().IsNone() {
+		t.Fatalf("非空 PAM 机密提示须保持 BodyMessage=None: prompt=%q", secrets[0].Prompt())
+	}
+	if secrets[1].Prompt() != "Response:" {
+		t.Fatalf("纯空 PAM 机密提示正文异常: prompt=%q", secrets[1].Prompt())
+	}
+	assertOptMsgEq(t, "ki.secret.empty_body", secrets[1].BodyMessage(), wantResp)
+	if secrets[2].Prompt() != "Banner Only | Response:" || !secrets[2].BodyMessage().IsNone() {
+		t.Fatalf("含远端横幅与空问题提示须保持 BodyMessage=None 以保留横幅: prompt=%q", secrets[2].Prompt())
+	}
+}
+
+func assertChallengeTextMessages(t *testing.T, texts []ports.TextPromptRequest) {
+	t.Helper()
+	if len(texts) != 2 {
+		t.Fatalf("期望 2 次明文质询提示，实际 %d", len(texts))
+	}
+	wantTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+	wantResp := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	for i, req := range texts {
+		if req.Title() != wantTitle.Canonical() {
+			t.Fatalf("明文质询 #%d 标题异常: title=%q", i, req.Title())
+		}
+		assertOptMsgEq(t, "ki.text.title", req.TitleMessage(), wantTitle)
+	}
+	if texts[0].Prompt() != "Echo prompt:" || !texts[0].BodyMessage().IsNone() {
+		t.Fatalf("非空 PAM 明文提示须保持 BodyMessage=None: prompt=%q", texts[0].Prompt())
+	}
+	if texts[1].Prompt() != "Response:" {
+		t.Fatalf("纯空 PAM 明文提示正文异常: prompt=%q", texts[1].Prompt())
+	}
+	assertOptMsgEq(t, "ki.text.empty_body", texts[1].BodyMessage(), wantResp)
 }

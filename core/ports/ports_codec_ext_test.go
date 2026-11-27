@@ -10,6 +10,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -328,6 +329,59 @@ func TestAuditAndSystemJSONCodecs(t *testing.T) {
 		`{"verdict":null,"envelope_digest":"`+dig.String()+`"}`,
 		`{"verdict":"allow","envelope_digest":"`+dig.String()+`","extra":1}`,
 	)
+}
+
+func TestInteractionPromptJSONCodecs(t *testing.T) {
+	sreq, _ := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Title: "SSH", Prompt: "Password:", Subject: "web-01"})
+	sRaw := assertJSONRoundTrip(t, "SecretPromptRequest(plain)", sreq,
+		`{"prompt":"Password:","title_message":{}}`,
+		`{"prompt":"Password:","body_message":{"id":"BAD"}}`,
+	)
+	if strings.Contains(string(sRaw), "title_message") || strings.Contains(string(sRaw), "body_message") {
+		t.Fatalf("无结构化消息时 SecretPromptRequest 应经 omitzero 省略消息字段: %s", sRaw)
+	}
+	sTitleMsg := domi18n.NewMessage(domi18n.KeyInteractPrivilegeTitle)
+	sBodyMsg := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", "web-01"))
+	sreqMsg, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+		Title: sTitleMsg.Canonical(), Prompt: sBodyMsg.Canonical(), Subject: "web-01",
+		TitleMessage: algebraic.Some(sTitleMsg), BodyMessage: algebraic.Some(sBodyMsg),
+	})
+	if err != nil {
+		t.Fatalf("NewSecretPromptRequest(with msg) 失败: %v", err)
+	}
+	assertJSONRoundTrip(t, "SecretPromptRequest(with messages)", sreqMsg)
+
+	creq, _ := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Title: "Confirm", Message: "Trust host?", Subject: "web-01", Risk: security.RiskModerate})
+	cRaw := assertJSONRoundTrip(t, "ConfirmRequest(plain)", creq, `{"message":"Trust host?","risk":"safe","body_message":{}}`)
+	if strings.Contains(string(cRaw), "title_message") || strings.Contains(string(cRaw), "body_message") {
+		t.Fatalf("无结构化消息时 ConfirmRequest 应经 omitzero 省略消息字段: %s", cRaw)
+	}
+	cTitleMsg := domi18n.NewMessage(domi18n.KeyInteractHostKeyTitle)
+	cBodyMsg := domi18n.NewMessage(domi18n.KeyInteractHostKeyBody, domi18n.BoundStr("algorithm", "ssh-ed25519"), domi18n.BoundStr("fingerprint", "SHA256:test"), domi18n.BoundStr("endpoint", "192.0.2.10:22"))
+	creqMsg, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{
+		Title: cTitleMsg.Canonical(), Message: cBodyMsg.Canonical(), Subject: "192.0.2.10:22", Risk: security.RiskModerate,
+		TitleMessage: algebraic.Some(cTitleMsg), BodyMessage: algebraic.Some(cBodyMsg),
+	})
+	if err != nil {
+		t.Fatalf("NewConfirmRequest(with msg) 失败: %v", err)
+	}
+	assertJSONRoundTrip(t, "ConfirmRequest(with messages)", creqMsg)
+
+	treq, _ := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{Title: "OTP", Prompt: "Code:", Subject: "web-01"})
+	tRaw := assertJSONRoundTrip(t, "TextPromptRequest(plain)", treq, `{"prompt":"Code:","title_message":{"id":"INVALID"}}`)
+	if strings.Contains(string(tRaw), "title_message") || strings.Contains(string(tRaw), "body_message") {
+		t.Fatalf("无结构化消息时 TextPromptRequest 应经 omitzero 省略消息字段: %s", tRaw)
+	}
+	tTitleMsg := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+	tBodyMsg := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	treqMsg, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
+		Title: tTitleMsg.Canonical(), Prompt: tBodyMsg.Canonical(), Subject: "web-01", AllowEmpty: true,
+		TitleMessage: algebraic.Some(tTitleMsg), BodyMessage: algebraic.Some(tBodyMsg),
+	})
+	if err != nil {
+		t.Fatalf("NewTextPromptRequest(with msg) 失败: %v", err)
+	}
+	assertJSONRoundTrip(t, "TextPromptRequest(with messages)", treqMsg)
 }
 
 // TestDownstreamPortJSONCodecs 验证 Phase 2.5/3/4 新增端口值对象的 json/v2 编解码与不变量。
