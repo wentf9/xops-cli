@@ -30,12 +30,20 @@ type wiredVault struct {
 }
 
 type vaultWireDeps struct {
-	scopedFS ports.ScopedRootFS
-	stateDir pathalg.LocalDir
-	homeDir  pathalg.LocalDir
-	env      ports.EnvPort
-	entropy  ports.Entropy
-	proc     ports.ProcessPort
+	scopedFS      ports.ScopedRootFS
+	stateDir      pathalg.LocalDir
+	homeDir       pathalg.LocalDir
+	env           ports.EnvPort
+	entropy       ports.Entropy
+	proc          ports.ProcessPort
+	newOSKeychain func(ports.EnvPort, ports.Entropy) (ports.SecretVault, error)
+}
+
+func createOSKeychainVault(deps vaultWireDeps) (ports.SecretVault, error) {
+	if deps.newOSKeychain != nil {
+		return deps.newOSKeychain(deps.env, deps.entropy)
+	}
+	return vault.NewPlatformOSKeychain(deps.env, deps.entropy)
 }
 
 // disabledVault 对应 YAML vNext vault.stores.<name>.kind="none" 的显式禁用存储槽位，
@@ -116,8 +124,9 @@ func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps
 	if err != nil {
 		return wiredVault{}, fmt.Errorf("initialize default offline vault failed: %w", err)
 	}
-	osKeychain, err := vault.NewPlatformOSKeychain(deps.env, deps.entropy)
+	osKeychain, err := createOSKeychainVault(deps)
 	if err != nil {
+		_ = offVault.Lock(context.Background())
 		return wiredVault{}, fmt.Errorf("initialize platform os_keychain vault failed: %w", err)
 	}
 	stores := map[string]ports.SecretVault{
@@ -205,7 +214,7 @@ func instantiateVaultStore(
 		}
 		return v, v, nil
 	case "os_keychain":
-		v, err := vault.NewPlatformOSKeychain(deps.env, deps.entropy)
+		v, err := createOSKeychainVault(deps)
 		if err != nil {
 			return nil, nil, fmt.Errorf("initialize os_keychain vault %q failed: %w", name, err)
 		}

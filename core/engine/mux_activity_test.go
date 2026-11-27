@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 
 	"go.uber.org/goleak"
 
@@ -80,26 +83,50 @@ func TestMuxActivityHub_UnregistersOnSocketClosedAndRealMuxServeExit(t *testing.
 	assertMuxServeUnregistersOnExit(t, hub, handle)
 }
 
+func shortMuxActivityDir(t *testing.T) string {
+	t.Helper()
+	parent := os.TempDir()
+	if runtime.GOOS != "windows" && len(parent) >= 40 {
+		parent = "/tmp"
+	}
+	dir, err := os.MkdirTemp(parent, "xm-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sub := filepath.Join(dir, "m")
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	return sub
+}
+
 func assertMuxServeUnregistersOnExit(t *testing.T, hub *muxActivityHub, handle plan.ManagedHandle[plan.KindMux]) {
 	t.Helper()
-	sockPath, err := pathalg.ParseLocalSourcePath(filepath.Join(t.TempDir(), "cm-close.sock"))
+	sockPath, err := pathalg.ParseLocalSourcePath(filepath.Join(shortMuxActivityDir(t), "cm.sock"))
 	if err != nil {
 		t.Fatalf("ParseLocalSourcePath: %v", err)
 	}
 	ms := mux.NewMuxSocket(mux.Config{OnSocketActivity: hub.notify})
 
-	// 3a. Serve 运行中被取消（真实监听路径）。
+	// 3a. Serve 运行中被取消（真实监听路径；带超时与取消感知防止监听异常时死锁）。
 	hub.register(sockPath.String(), handle, nil)
 	if len(hub.bySock) != 1 {
 		t.Fatalf("注册后 bySock 应为 1，实际=%d", len(hub.bySock))
 	}
-	serveCtx, stopServe := context.WithCancel(context.Background())
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelRun()
+	serveCtx, stopServe := context.WithCancel(runCtx)
 	defer stopServe()
 	started := make(chan struct{})
-	if err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
-		if gErr := n.Go(func(context.Context) error {
-			<-started
-			_, _ = ms.Probe(context.Background(), sockPath)
+	if err := conc.RunWait(runCtx, func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(gCtx context.Context) error {
+			select {
+			case <-started:
+			case <-gCtx.Done():
+				return gCtx.Err()
+			}
+			_, _ = ms.Probe(gCtx, sockPath)
 			stopServe()
 			return nil
 		}); gErr != nil {
@@ -110,6 +137,7 @@ func assertMuxServeUnregistersOnExit(t *testing.T, hub *muxActivityHub, handle p
 			return ms.Serve(serveCtx, ln, stubAliveTransport{}, nil)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) {
+			cancelRun()
 			return err
 		}
 		return nil
@@ -122,7 +150,7 @@ func assertMuxServeUnregistersOnExit(t *testing.T, hub *muxActivityHub, handle p
 
 	// 3b. 进入 Serve 前取消（WithListener 兜底路径）。
 	hub.register(sockPath.String(), handle, nil)
-	serveCtx2, stopServe2 := context.WithCancel(context.Background())
+	serveCtx2, stopServe2 := context.WithCancel(runCtx)
 	defer stopServe2()
 	if err := ms.WithListener(serveCtx2, sockPath, func(ln net.Listener) error {
 		stopServe2()

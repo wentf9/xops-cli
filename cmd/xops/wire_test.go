@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -456,10 +457,44 @@ func assertWireRuntimeSubpathLockPlacement(t *testing.T, xopsHome pathalg.LocalD
 	}
 }
 
+type spyKeychainVault struct {
+	err   error
+	calls atomic.Int32
+}
+
+//xops:syncclosure
+//xops:borrowed
+func (s *spyKeychainVault) WithSecret(ctx context.Context, _ secret.Ref, fn func(*secret.SecretBox) error) error {
+	if ctx == nil {
+		return ports.ErrNilContext
+	}
+	if fn == nil {
+		return ports.ErrNilCallback
+	}
+	s.calls.Add(1)
+	return s.err
+}
+
+func (s *spyKeychainVault) PutAndVerify(_ context.Context, _ secret.Ref,
+	//xops:borrowed
+	_ *secret.SecretBox,
+) error {
+	s.calls.Add(1)
+	return s.err
+}
+
+func (s *spyKeychainVault) Delete(_ context.Context, _ secret.Ref) error {
+	s.calls.Add(1)
+	return s.err
+}
+
 func TestBuildVaultAdapters_DefaultStoreWithoutExplicitStores(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	homeDir, xopsHome := setupIsolatedRootEnv(t)
-	deps := vaultWireDeps{
+	errKeychainSpy := errors.New("spy os_keychain selected")
+	spy := &spyKeychainVault{err: errKeychainSpy}
+
+	realDeps := vaultWireDeps{
 		scopedFS: osfs.NewScopedRootFS(),
 		stateDir: xopsHome,
 		homeDir:  homeDir,
@@ -467,36 +502,48 @@ func TestBuildVaultAdapters_DefaultStoreWithoutExplicitStores(t *testing.T) {
 		entropy:  sys.NewCryptoEntropy(),
 		proc:     sys.NewSystemProcess(),
 	}
+	spyDeps := realDeps
+	spyDeps.newOSKeychain = func(ports.EnvPort, ports.Entropy) (ports.SecretVault, error) { return spy, nil }
+
 	unscopedRef, err := secret.NewRef("unregistered_store", "probe_key")
 	if err != nil {
 		t.Fatalf("NewRef: %v", err)
 	}
 	ctx := context.Background()
 
-	// 1. vault.stores 为空但显式指定 default_store=offline：未登记存储回退路由至 offline（锁定态返回 ErrVaultLocked）。
-	offWired, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "offline"}, nil, deps)
+	// 1. 真实平台 os_keychain 工厂在 default_store=os_keychain 时可正常装配与关闭（跨 Linux/macOS/Windows/FreeBSD）。
+	realKC, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "os_keychain"}, nil, realDeps)
+	if err != nil {
+		t.Fatalf("buildVaultAdapters(real os_keychain): %v", err)
+	}
+	if err := realKC.router.Close(); err != nil {
+		t.Fatalf("realKC.router.Close: %v", err)
+	}
+
+	// 2. vault.stores 为空但显式指定 default_store=offline：未登记存储回退路由至 offline（绝不触发 os_keychain）。
+	offWired, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "offline"}, nil, spyDeps)
 	if err != nil {
 		t.Fatalf("buildVaultAdapters(default=offline): %v", err)
 	}
 	defer func() { _ = offWired.router.Close() }()
 	offErr := offWired.router.WithSecret(ctx, unscopedRef, func(*secret.SecretBox) error { return nil })
-	if !errors.Is(offErr, ports.ErrVaultLocked) {
-		t.Fatalf("default_store=offline 时未登记存储期望命中锁定态 offline（ErrVaultLocked），实际=%v", offErr)
+	if !errors.Is(offErr, ports.ErrVaultLocked) || spy.calls.Load() != 0 {
+		t.Fatalf("default_store=offline 期望命中 offline 且零调用 os_keychain: err=%v spyCalls=%d", offErr, spy.calls.Load())
 	}
 
-	// 2. vault.stores 为空但显式指定 default_store=os_keychain：未登记存储回退路由至 os_keychain（绝不落到锁定态 offline）。
-	kcWired, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "os_keychain"}, nil, deps)
+	// 3. vault.stores 为空但显式指定 default_store=os_keychain：未登记存储跨四平台确定性路由至 os_keychain。
+	kcWired, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "os_keychain"}, nil, spyDeps)
 	if err != nil {
 		t.Fatalf("buildVaultAdapters(default=os_keychain): %v", err)
 	}
 	defer func() { _ = kcWired.router.Close() }()
 	kcErr := kcWired.router.WithSecret(ctx, unscopedRef, func(*secret.SecretBox) error { return nil })
-	if errors.Is(kcErr, ports.ErrVaultLocked) {
-		t.Fatalf("default_store=os_keychain 时不应静默忽略并路由到 offline（ErrVaultLocked）: %v", kcErr)
+	if !errors.Is(kcErr, errKeychainSpy) || spy.calls.Load() != 1 {
+		t.Fatalf("default_store=os_keychain 必须路由至 os_keychain 而非 offline: err=%v spyCalls=%d", kcErr, spy.calls.Load())
 	}
 
-	// 3. vault.stores 为空且 default_store 为未知名称：严格失败关闭。
-	if _, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "nonexistent_store"}, nil, deps); err == nil {
+	// 4. vault.stores 为空且 default_store 为未知名称：严格失败关闭。
+	if _, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "nonexistent_store"}, nil, spyDeps); err == nil {
 		t.Fatal("未知 vault.default_store 必须失败关闭")
 	}
 }
