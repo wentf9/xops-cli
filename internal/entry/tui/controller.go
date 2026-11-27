@@ -182,8 +182,8 @@ func (c *workbenchController) handleAction(ctx context.Context, req actionReques
 		slots.stopAll()
 		c.metricsSeq++
 		c.logsSeq++
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Active: false, Seq: c.metricsSeq})
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Active: false, Seq: c.logsSeq})
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindMetrics, Active: false, Seq: c.metricsSeq})
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindLogs, Active: false, Seq: c.logsSeq})
 	case actionStartMetrics:
 		c.metricsSeq++
 		seq := c.metricsSeq
@@ -221,11 +221,12 @@ func (c *workbenchController) refreshInventory(ctx context.Context) {
 		return
 	}
 	if c.cfg.Engine.IsHalted() {
-		reason := "gate halted"
-		if info, ok := c.cfg.Engine.HaltInfo(); ok && info.Reason() != "" {
-			reason = info.Reason()
+		var msg HaltedStateMsg
+		if info, ok := c.cfg.Engine.HaltInfo(); ok {
+			msg.Err = info.Cause()
+			msg.Reason = info.Reason()
 		}
-		sendMsg(ctx, c.prog, HaltedStateMsg{Reason: reason})
+		sendMsg(ctx, c.prog, msg)
 	}
 	q := engine.InventoryQueryRequest{}
 	// 优先走单次原子 GetInventorySnapshot（1 条审计、0 撕裂读）；对最小测试桩回退三路列表查询。
@@ -271,7 +272,7 @@ func (c *workbenchController) refreshInventoryFallback(ctx context.Context, q en
 
 func (c *workbenchController) reportInventoryErr(ctx context.Context, err error) {
 	if errors.Is(err, engine.ErrEngineHalted) {
-		sendMsg(ctx, c.prog, HaltedStateMsg{Reason: err.Error()})
+		sendMsg(ctx, c.prog, HaltedStateMsg{Err: err})
 	}
 	sendMsg(ctx, c.prog, InventoryLoadedMsg{Err: err})
 }
@@ -279,7 +280,7 @@ func (c *workbenchController) reportInventoryErr(ctx context.Context, err error)
 // runMetricsStream 以有界最大连续批次（默认 MaxSamples=10000）驱动实时指标流，
 // 避免核心默认 MaxSamples=1 导致首帧 0% 增量 CPU 后立即退出的问题；单批完成后自动续接直至取消。
 func (c *workbenchController) runMetricsStream(ctx context.Context, target string, sortBy engine.ProcessSortBy, seq uint64) error {
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Target: target, Active: true, Seq: seq})
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindMetrics, Target: target, Active: true, Seq: seq})
 	topN := c.cfg.MetricsTopProcesses
 	if topN <= 0 {
 		topN = defaultTopProcesses
@@ -302,7 +303,7 @@ func (c *workbenchController) runMetricsStream(ctx context.Context, target strin
 	if errors.Is(finalErr, context.Canceled) {
 		finalErr = nil
 	}
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Target: target, Active: false, Seq: seq, Err: finalErr})
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindMetrics, Target: target, Active: false, Seq: seq, Err: finalErr})
 	return nil
 }
 
@@ -346,15 +347,15 @@ func (c *workbenchController) runMetricsBatch(
 // runLogsStream 启动远端日志跟随流：存在 OperationStream 时统一经事件流单路径消费（避免与 Output 重复入队），
 // 仅在无 OperationStream 的极简桩环境下使用绑定 wCtx 的行缓冲写入器回退。
 func (c *workbenchController) runLogsStream(ctx context.Context, target string, seq uint64) error {
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: true, Seq: seq})
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindLogs, Target: target, Active: true, Seq: seq})
 	logTarget, err := resolveDefaultLogTarget(c.cfg)
 	if err != nil {
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Seq: seq, Err: err})
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindLogs, Target: target, Active: false, Seq: seq, Err: err})
 		return nil
 	}
 	stream, err := c.openAndAttachOpStream(ctx)
 	if err != nil {
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Seq: seq, Err: err})
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindLogs, Target: target, Active: false, Seq: seq, Err: err})
 		return nil
 	}
 	tailLines := c.cfg.LogTailLines
@@ -365,7 +366,7 @@ func (c *workbenchController) runLogsStream(ctx context.Context, target string, 
 	if errors.Is(runErr, context.Canceled) {
 		runErr = nil
 	}
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Seq: seq, Err: runErr})
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: StreamKindLogs, Target: target, Active: false, Seq: seq, Err: runErr})
 	return nil
 }
 

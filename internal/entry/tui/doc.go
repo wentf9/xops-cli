@@ -1,8 +1,10 @@
 // Package tui 实现 XOps v2 基于 Bubble Tea v2 的实时流式终端工作台入口层（ADR-001 / ADR-010 / Plan P5-T2）。
 //
 // 核心架构边界与安全不变量：
-//   - 极薄入站适配器：仅依赖 core/{domain/...,events,conc,engine} 与 charm.land/{bubbletea,lipgloss}/v2，
+//   - 极薄入站适配器：仅依赖 core/{domain/...,events,conc,engine}、internal/i18n 与 charm.land/{bubbletea,lipgloss}/v2，
 //     物理零 internal/host/**、零 core/osfs、零 core/ports 导入，零业务域规则实现；
+//   - 全状态延迟双语渲染：工作台状态仅持有结构化 domi18n.Message 与 error，视图文本统一在 View() 中
+//     按当前 Locale 实时渲染，支持运行期按大写 L 键瞬时中英热切换并经 OnLocaleChange 同步外部交互提示语种；
 //   - 实时事件流投影：将 core/events（OperationStream / SystemBus 全部 12 类封闭 Event 变体）
 //     与 core/engine（Projection / InventorySnapshot / StreamMetrics / StreamLogs）无阻塞投影为 tea.Msg；
 //   - 结构化并发全监督：所有后台订阅、投影监听、指标/日志流与终端接管恢复均严格由 core/conc.Nursery

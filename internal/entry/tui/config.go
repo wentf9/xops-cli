@@ -2,17 +2,17 @@ package tui
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -31,13 +31,13 @@ const (
 	maxLineBufferBytes     = 64 << 10
 )
 
-// 本包导出的不可变哨兵错误，供组合根 cmd/xops、entry/cli 与测试通过 errors.Is 精确区分故障类别。
+// 本包导出的不可变结构化哨兵错误，供组合根 cmd/xops、entry/cli 与测试通过 errors.Is 精确区分故障类别。
 var (
-	ErrNilContext       = errors.New("tui: context 不能为 nil")
-	ErrInvalidConfig    = errors.New("tui: 无效的 TUI Config 配置")
-	ErrInvalidEvent     = errors.New("tui: 收到无效或不支持的事件变体")
-	ErrTerminalRestore  = errors.New("tui: 终端状态恢复失败")
-	ErrTakeoverDisabled = errors.New("tui: 未配置交互会话接管回调")
+	ErrNilContext       = i18n.Sentinel(i18n.KeyTUINilContext)
+	ErrInvalidConfig    = i18n.Sentinel(i18n.KeyTUIInvalidConfig)
+	ErrInvalidEvent     = i18n.Sentinel(i18n.KeyTUIInvalidEvent)
+	ErrTerminalRestore  = i18n.Sentinel(i18n.KeyTUITerminalRestore)
+	ErrTakeoverDisabled = i18n.Sentinel(i18n.KeyTUITakeoverDisabled)
 )
 
 // EngineClient 定义 TUI 工作台消费 core/engine 门面所需的最小强类型契约（由 *engine.Engine 原生实现）。
@@ -149,29 +149,36 @@ type Config struct {
 	OnTakeover TakeoverFunc
 	// ExternalMsgs 为可选外部注入消息流（受 Nursery 监督转发至 Bubble Tea，便于无头确定性驱动与集成测试）。
 	ExternalMsgs <-chan tea.Msg
+
+	// Catalog 为可选预加载只读双语词库；为 nil 或无效时自动从内置内存 embed.FS 加载（零触盘、零包级 var）。
+	Catalog *i18n.Catalog
+	// Locale 指定初始界面语言；未设置或无效时回退 domi18n.LocaleEn。
+	Locale domi18n.Locale
+	// OnLocaleChange 在用户按大写 L 热切换语言时同步/非阻塞通知外部组件（如同步交互接管提示语种）。
+	OnLocaleChange func(domi18n.Locale)
 }
 
 func validateConfig(cfg Config) error {
 	if cfg.Engine == nil && cfg.Projection == nil && cfg.SystemBus == nil && len(cfg.OperationStreams) == 0 {
-		return fmt.Errorf("%w: Engine、Projection、SystemBus 与 OperationStreams 不能全部为空", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyTUIConfigNoSource)
 	}
 	if cfg.InitialView != ViewInvalid && !cfg.InitialView.IsValid() {
-		return fmt.Errorf("%w: 无效的 InitialView (%d)", ErrInvalidConfig, cfg.InitialView)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyTUIConfigInvalidView, i18n.Int("view", int(cfg.InitialView)))
 	}
 	if cfg.InitialWidth < 0 || cfg.InitialHeight < 0 || cfg.MaxLogLines < 0 || cfg.MaxStreamBuffer < 0 ||
 		cfg.MetricsMaxSamples < 0 || cfg.MetricsMaxSamples > metricsBatchMaxSamples ||
 		cfg.MetricsTopProcesses < 0 || cfg.LogTailLines < 0 {
-		return fmt.Errorf("%w: 窗口尺寸、缓冲容量与采样条数越界", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyTUIConfigOutOfBounds)
 	}
 	if err := cfg.CLIOptions.Validate(); err != nil {
-		return fmt.Errorf("%w: CLIOptions 无效: %w", ErrInvalidConfig, err)
+		return i18n.WrapS(ErrInvalidConfig, err, i18n.KeyTUIConfigInvalidCLIOpts)
 	}
 	if err := validateOptionalStreamConfig(cfg); err != nil {
 		return err
 	}
 	for i, s := range cfg.OperationStreams {
 		if s == nil {
-			return fmt.Errorf("%w: OperationStreams[%d] 不能为 nil", ErrInvalidConfig, i)
+			return i18n.EF(ErrInvalidConfig, i18n.KeyTUIConfigNilOpStream, i18n.Int("index", i))
 		}
 	}
 	return nil
@@ -179,12 +186,40 @@ func validateConfig(cfg Config) error {
 
 func validateOptionalStreamConfig(cfg Config) error {
 	if iv, ok := cfg.MetricsInterval.Get(); ok && !iv.IsPositive() {
-		return fmt.Errorf("%w: MetricsInterval 必须为正时长", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyTUIConfigMetricsInterval)
 	}
 	if lt, ok := cfg.DefaultLogTarget.Get(); ok && !lt.IsValid() {
-		return fmt.Errorf("%w: DefaultLogTarget 无效", ErrInvalidConfig)
+		return i18n.EF(ErrInvalidConfig, i18n.KeyTUIConfigInvalidLogTarget)
 	}
 	return nil
+}
+
+// resolveCatalog 返回有效只读双语词库；若未注入则回退纯内存内置 embed.FS 词库（零触盘、零全局状态）。
+func resolveCatalog(cat *i18n.Catalog) *i18n.Catalog {
+	if cat.IsValid() {
+		return cat
+	}
+	loaded, err := i18n.LoadCatalog()
+	if err != nil {
+		return nil
+	}
+	return loaded
+}
+
+// resolveCatalogOrLoad 为 Run 入口加载或复用只读双语词库，失败时返回结构化错误而非静默降级。
+func resolveCatalogOrLoad(cat *i18n.Catalog) (*i18n.Catalog, error) {
+	if cat.IsValid() {
+		return cat, nil
+	}
+	return i18n.LoadCatalog()
+}
+
+// resolveLocale 返回有效界面语言；零值或无效值默认回退英文（domi18n.LocaleEn）。
+func resolveLocale(loc domi18n.Locale) domi18n.Locale {
+	if loc.IsValid() {
+		return loc
+	}
+	return domi18n.LocaleEn
 }
 
 // zeroVal 返回类型 T 的零值，用于在错误返回路径替代对跨包 //xops:opaque 类型的空复合字面量构造。

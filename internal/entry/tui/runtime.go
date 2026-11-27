@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/events"
 )
 
@@ -63,7 +63,7 @@ func (g *terminalGuard) restore() error {
 	g.restored = true
 	if g.hooks.OnRestore != nil {
 		if err := g.hooks.OnRestore(); err != nil {
-			return fmt.Errorf("%w: %w", ErrTerminalRestore, err)
+			return domi18n.WrapSentinel(ErrTerminalRestore, err)
 		}
 	}
 	return nil
@@ -81,6 +81,12 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	cat, err := resolveCatalogOrLoad(cfg.Catalog)
+	if err != nil {
+		return err
+	}
+	cfg.Catalog = cat
+	cfg.Locale = resolveLocale(cfg.Locale)
 	guard := &terminalGuard{hooks: cfg.TerminalHooks}
 	if err := guard.enter(); err != nil {
 		return err
@@ -150,6 +156,9 @@ func runWorkbenchLoop(ctx context.Context, cfg Config, proj ProjectionSource, gu
 		InitialTarget:    cfg.InitialTarget,
 		MaxLogLines:      cfg.MaxLogLines,
 		CanTakeover:      cfg.OnTakeover != nil,
+		Catalog:          cfg.Catalog,
+		Locale:           cfg.Locale,
+		OnLocaleChange:   cfg.OnLocaleChange,
 	}, nil)
 	firstPass := true
 

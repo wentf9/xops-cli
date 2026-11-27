@@ -2,7 +2,6 @@ package tui
 
 import (
 	"cmp"
-	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -10,19 +9,24 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func (m *Model) applyInventoryLoaded(msg InventoryLoadedMsg) {
 	if msg.Err != nil {
-		m.lastErr = "inventory: " + msg.Err.Error()
-		m.statusMsg = "Inventory refresh failed"
+		m.lastErr = i18n.Wrap(msg.Err, i18n.KeyTUIInventoryErr)
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusInventoryFailed)
 		return
 	}
 	m.inventoryRev = msg.Revision
 	m.hosts = slices.Clone(msg.Hosts)
-	m.lastErr = ""
+	m.lastErr = nil
 	m.clampHostSelection()
-	m.statusMsg = fmt.Sprintf("Loaded %d target(s) (rev %s)", len(m.hosts), pickStr(m.inventoryRev, "-"))
+	m.statusMsg = i18n.NewMessage(
+		i18n.KeyTUIStatusInventoryLoaded,
+		i18n.Int("count", len(m.hosts)),
+		i18n.BoundStr("rev", pickStr(m.inventoryRev, "-")),
+	)
 }
 
 func (m *Model) applyProjectionSnapshot(snap engine.ProjectionSnapshot) {
@@ -285,27 +289,33 @@ func (m Model) logLimit() int {
 }
 
 func (m *Model) applyStreamState(msg StreamStateMsg) {
+	if !msg.Kind.IsValid() {
+		return
+	}
 	switch msg.Kind {
-	case "metrics":
+	case StreamKindMetrics:
 		if !applyStreamSlotState(&m.metricsSeq, &m.metricsActive, &m.metricsTarget, msg) {
 			return
 		}
-	case "logs":
+	case StreamKindLogs:
 		if !applyStreamSlotState(&m.logsSeq, &m.logsActive, &m.logsTarget, msg) {
 			return
 		}
+	default:
+		return
 	}
+	kindParam := i18n.Msg("kind", i18n.NewMessage(msg.Kind.LabelKey()))
 	if msg.Err != nil {
-		m.lastErr = fmt.Sprintf("%s stream (%s): %v", msg.Kind, msg.Target, msg.Err)
-		m.statusMsg = fmt.Sprintf("%s stream stopped with error", msg.Kind)
+		m.lastErr = i18n.Wrap(msg.Err, i18n.KeyTUIStreamErr, kindParam, i18n.BoundStr("target", msg.Target))
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusStreamErr, kindParam)
 		return
 	}
 	if msg.Active {
-		m.lastErr = ""
-		m.statusMsg = fmt.Sprintf("%s stream active (%s)", msg.Kind, msg.Target)
+		m.lastErr = nil
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusStreamActive, kindParam, i18n.BoundStr("target", msg.Target))
 		return
 	}
-	m.statusMsg = fmt.Sprintf("%s stream idle", msg.Kind)
+	m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusStreamIdle, kindParam)
 }
 
 func applyStreamSlotState(curSeq *uint64, active *bool, target *string, msg StreamStateMsg) bool {
@@ -325,12 +335,12 @@ func applyStreamSlotState(curSeq *uint64, active *bool, target *string, msg Stre
 func (m *Model) applyTakeoverResult(msg TakeoverResultMsg) {
 	m.pendingTakeover = algebraic.None[TakeoverRequest]()
 	if msg.Err != nil {
-		m.lastErr = fmt.Sprintf("session (%s): %v", msg.Target, msg.Err)
-		m.statusMsg = "Interactive session ended with error"
+		m.lastErr = i18n.Wrap(msg.Err, i18n.KeyTUITakeoverErr, i18n.BoundStr("target", msg.Target))
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusTakeoverErr)
 		return
 	}
-	m.lastErr = ""
-	m.statusMsg = fmt.Sprintf("Returned from interactive session (%s)", msg.Target)
+	m.lastErr = nil
+	m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusTakeoverDone, i18n.BoundStr("target", msg.Target))
 }
 
 func (m Model) filteredHosts() []HostItem {

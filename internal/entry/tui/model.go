@@ -1,25 +1,31 @@
 package tui
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // Model 实现 Bubble Tea v2 的纯函数 Elm 状态机（tea.Model）：
-// 所有副作用均通过有界 actionCh 交由 core/conc.Nursery 监督执行，绝不在 Update 中启动不可取消的慢 Cmd。
+// 所有副作用均通过有界 actionCh 交由 core/conc.Nursery 监督执行，绝不在 Update 中启动不可取消的慢 Cmd；
+// 所有可展示状态均保持结构化延迟渲染（statusMsg 为 domi18n.Message、lastErr/haltErr 为 error），
+// 按大写 L 切换语种后下一帧 View() 即可 100% 重绘。
 type Model struct {
 	width, height    int
 	altScreen        bool
 	activeView       ViewKind
+	catalog          *i18n.Catalog
+	locale           domi18n.Locale
+	onLocaleChange   func(domi18n.Locale)
 	filterActive     bool
 	filterQuery      string
-	statusMsg        string
-	lastErr          string
+	statusMsg        domi18n.Message
+	lastErr          error
 	quitting         bool
 	canTakeover      bool
 	pendingTakeover  algebraic.Option[TakeoverRequest]
@@ -40,6 +46,7 @@ type Model struct {
 	logsSeq          uint64
 	latestFrame      algebraic.Option[engine.HostMetricsFrame]
 	gateHalted       bool
+	haltErr          error
 	haltReason       string
 	hasUnknownOut    bool
 	projVersion      uint64
@@ -62,7 +69,7 @@ type Model struct {
 	directPool       []engine.PoolRecord
 }
 
-// ModelOptions 控制纯 Model 构造的初始视图、窗口尺寸与可选异步动作派发通道。
+// ModelOptions 控制纯 Model 构造的初始视图、窗口尺寸、双语词库与可选异步动作派发通道。
 type ModelOptions struct {
 	InitialView      ViewKind
 	InitialWidth     int
@@ -71,6 +78,9 @@ type ModelOptions struct {
 	InitialTarget    string
 	MaxLogLines      int
 	CanTakeover      bool
+	Catalog          *i18n.Catalog
+	Locale           domi18n.Locale
+	OnLocaleChange   func(domi18n.Locale)
 }
 
 // NewModel 构造纯 Elm 架构工作台模型，供 Run 与无头单元测试直接复用。
@@ -99,13 +109,16 @@ func newModelWithActions(opts ModelOptions, actions chan<- actionRequest) Model 
 		height:           h,
 		altScreen:        !opts.DisableAltScreen,
 		activeView:       view,
+		catalog:          resolveCatalog(opts.Catalog),
+		locale:           resolveLocale(opts.Locale),
+		onLocaleChange:   opts.OnLocaleChange,
 		canTakeover:      opts.CanTakeover,
 		initialTarget:    strings.TrimSpace(opts.InitialTarget),
 		processSort:      engine.ProcessSortCPU,
 		maxLogs:          maxLogs,
 		theme:            newWorkbenchTheme(),
 		actions:          actions,
-		statusMsg:        "Ready",
+		statusMsg:        i18n.NewMessage(i18n.KeyTUIStatusReady),
 		directOpsByID:    make(map[string]engine.OperationView),
 		directMetricByID: make(map[string]engine.MetricPoint),
 	}
@@ -113,6 +126,12 @@ func newModelWithActions(opts ModelOptions, actions chan<- actionRequest) Model 
 
 // Init 实现 tea.Model；所有初始化加载由受 Nursery 监督的控制器驱动，避免 Bubble Tea 产生未追踪 Cmd 协程。
 func (m Model) Init() tea.Cmd { return nil }
+
+// Locale 返回工作台当前激活的界面语言标识（零值模型安全回退 LocaleEn）。
+func (m Model) Locale() domi18n.Locale { return resolveLocale(m.locale) }
+
+// loc 返回绑定当前只读词库与激活语种的不可变 Localizer；未配置词库时安全返回失败关闭的零值 Localizer。
+func (m Model) loc() *i18n.Localizer { return m.catalog.For(resolveLocale(m.locale)) }
 
 // ActiveView / FilterQuery / GateHalted / HasUnknownOutcome / PendingTakeover 等提供只读状态访问器。
 func (m Model) ActiveView() ViewKind                                { return m.activeView }
@@ -174,7 +193,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyProjectedEvent(v)
 	case MetricsFrameMsg:
 		m.metricsTarget, m.latestFrame = v.Target, algebraic.Some(v.Frame)
-		m.statusMsg = fmt.Sprintf("Metrics updated (%s: CPU %.1f%% Mem %.1f%%)", v.Target, v.Frame.CPUPercent, v.Frame.MemPercent)
+		m.statusMsg = i18n.NewMessage(
+			i18n.KeyTUIStatusMetricsUpdated,
+			i18n.BoundStr("target", v.Target),
+			safeFloatParam("cpu", v.Frame.CPUPercent, 1),
+			safeFloatParam("mem", v.Frame.MemPercent, 1),
+		)
 	case LogChunkMsg:
 		m.appendLogChunk(v)
 	case StreamStateMsg:
@@ -183,12 +207,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.directDropped += v.Delta
 		m.droppedEvents = max(m.projSnap.DroppedEvents+m.directDropped, v.Total)
 	case HaltedStateMsg:
-		m.gateHalted, m.haltReason = true, v.Reason
-		m.statusMsg = "CRITICAL: Engine security gate HALTED"
+		m.applyHaltedState(v)
 	case TakeoverResultMsg:
 		m.applyTakeoverResult(v)
 	}
 	return m, nil
+}
+
+func (m *Model) applyHaltedState(msg HaltedStateMsg) {
+	m.gateHalted = true
+	if msg.Err != nil {
+		m.haltErr = msg.Err
+		m.haltReason = ""
+	} else if strings.TrimSpace(msg.Reason) != "" {
+		m.haltErr = nil
+		m.haltReason = msg.Reason
+	}
+	m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusGateHalted)
 }
 
 func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -219,7 +254,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.activeView = ViewHelp
 	case "/":
 		m.filterActive = true
-		m.statusMsg = "Filter mode: type to filter, Enter to apply, Esc to clear"
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusFilterMode)
 	default:
 		return m.handleActionOrNavKey(msg.String())
 	}
@@ -232,11 +267,11 @@ func (m Model) handleFilterKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.filterActive = false
 		m.filterQuery = ""
 		m.selectedHost = 0
-		m.statusMsg = "Filter cleared"
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusFilterCleared)
 	case "enter":
 		m.filterActive = false
 		m.clampHostSelection()
-		m.statusMsg = fmt.Sprintf("Filter applied: %q", m.filterQuery)
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusFilterApplied, i18n.BoundStr("query", m.filterQuery))
 	case "backspace":
 		runes := []rune(m.filterQuery)
 		if len(runes) > 0 {
@@ -264,45 +299,59 @@ func (m Model) handleActionOrNavKey(key string) (tea.Model, tea.Cmd) {
 		m.jumpBottom()
 	case "r":
 		m.dispatchAction(actionRequest{kind: actionRefreshInventory})
-		m.statusMsg = "Refreshing inventory..."
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusRefreshingInventory)
 	case "m":
 		return m.triggerMetricsStream()
 	case "l":
 		return m.triggerLogStream()
 	case "x":
 		m.dispatchAction(actionRequest{kind: actionStopStreams})
-		m.statusMsg = "Stopping active streams..."
+		m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusStoppingStreams)
 	case "s":
 		m.toggleProcessSort()
+	case "L":
+		m.toggleLocale()
 	case "enter":
 		return m.triggerTakeover()
 	}
 	return m, nil
 }
 
+// toggleLocale 在英文与简体中文间热切换界面语种，同步触发 OnLocaleChange 并保留既有错误态以便实时重译。
+func (m *Model) toggleLocale() {
+	m.locale = resolveLocale(m.locale).Next()
+	if m.onLocaleChange != nil {
+		m.onLocaleChange(m.locale)
+	}
+	m.statusMsg = i18n.NewMessage(
+		i18n.KeyTUIStatusLanguageSwitched,
+		i18n.Msg("lang", i18n.NewMessage(localeNameKey(m.locale))),
+	)
+}
+
 func (m Model) triggerMetricsStream() (tea.Model, tea.Cmd) {
 	target := m.SelectedTarget()
 	if target == "" {
-		m.lastErr = "no host selected for metrics stream"
+		m.lastErr = i18n.E(i18n.KeyTUINoHostForMetrics)
 		return m, nil
 	}
 	m.activeView = ViewMetrics
 	m.metricsTarget = target
 	m.dispatchAction(actionRequest{kind: actionStartMetrics, target: target, sortBy: m.processSort})
-	m.statusMsg = fmt.Sprintf("Starting metrics stream for %s...", target)
+	m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusStartingMetrics, i18n.BoundStr("target", target))
 	return m, nil
 }
 
 func (m Model) triggerLogStream() (tea.Model, tea.Cmd) {
 	target := m.SelectedTarget()
 	if target == "" {
-		m.lastErr = "no host selected for log stream"
+		m.lastErr = i18n.E(i18n.KeyTUINoHostForLogs)
 		return m, nil
 	}
 	m.activeView = ViewLogs
 	m.logsTarget = target
 	m.dispatchAction(actionRequest{kind: actionStartLogs, target: target})
-	m.statusMsg = fmt.Sprintf("Starting log stream for %s...", target)
+	m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusStartingLogs, i18n.BoundStr("target", target))
 	return m, nil
 }
 
@@ -312,7 +361,10 @@ func (m *Model) toggleProcessSort() {
 	} else {
 		m.processSort = engine.ProcessSortCPU
 	}
-	m.statusMsg = "Process sort: " + m.processSort.String()
+	m.statusMsg = i18n.NewMessage(
+		i18n.KeyTUIStatusProcessSort,
+		i18n.Msg("sort", i18n.NewMessage(processSortKey(m.processSort))),
+	)
 	if m.metricsActive && m.metricsTarget != "" {
 		m.dispatchAction(actionRequest{kind: actionStartMetrics, target: m.metricsTarget, sortBy: m.processSort})
 	}
@@ -329,7 +381,7 @@ func (m Model) triggerTakeover() (tea.Model, tea.Cmd) {
 		nodeID = target
 	}
 	if target == "" {
-		m.lastErr = "no host selected for interactive session"
+		m.lastErr = i18n.E(i18n.KeyTUINoHostForTakeover)
 		return m, nil
 	}
 	m.pendingTakeover = algebraic.Some(TakeoverRequest{NodeID: nodeID, TargetSpec: target})
@@ -344,7 +396,7 @@ func (m *Model) dispatchAction(req actionRequest) {
 	select {
 	case m.actions <- req:
 	default:
-		m.lastErr = "action queue busy; try again"
+		m.lastErr = i18n.E(i18n.KeyTUIActionQueueBusy)
 	}
 }
 

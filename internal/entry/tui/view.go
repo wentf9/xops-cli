@@ -6,7 +6,9 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // workbenchTheme 封装 Lipgloss v2 样式表（在实例字段内构造，严格 0 包级 var、0 init()）。
@@ -36,37 +38,39 @@ func newWorkbenchTheme() workbenchTheme {
 	}
 }
 
-// View 实现 Bubble Tea v2 声明式视图渲染（tea.View），自动控制 AltScreen 与窗口标题。
+// View 实现 Bubble Tea v2 声明式视图渲染（tea.View），按当前激活语种实时本地化全部界面元素并控制 AltScreen 与窗口标题。
 func (m Model) View() tea.View {
+	loc := m.loc()
 	var b strings.Builder
-	b.WriteString(m.renderHeader())
+	b.WriteString(m.renderHeader(loc))
 	b.WriteByte('\n')
-	if banners := m.renderSafetyBanners(); banners != "" {
+	if banners := m.renderSafetyBanners(loc); banners != "" {
 		b.WriteString(banners)
 		b.WriteByte('\n')
 	}
 	if m.filterActive || m.filterQuery != "" {
-		b.WriteString(m.renderFilterBar())
+		b.WriteString(m.renderFilterBar(loc))
 		b.WriteByte('\n')
 	}
-	b.WriteString(m.renderBody())
+	b.WriteString(m.renderBody(loc))
 	b.WriteByte('\n')
-	b.WriteString(m.renderFooter())
+	b.WriteString(m.renderFooter(loc))
 
 	view := tea.NewView(b.String())
 	view.AltScreen = m.altScreen
-	view.WindowTitle = "XOps v2 Workbench — " + m.activeView.String()
+	view.WindowTitle = loc.T(i18n.KeyTUIWindowTitle, i18n.Str("view", loc.T(m.activeView.LabelKey())))
 	return view
 }
 
-func (m Model) renderHeader() string {
+func (m Model) renderHeader(loc *i18n.Localizer) string {
 	tabs := []ViewKind{ViewHosts, ViewMetrics, ViewLogs, ViewOperations, ViewHelp}
 	parts := make([]string, 0, len(tabs)+2)
-	parts = append(parts, m.theme.title.Render("XOps v2"))
+	parts = append(parts, m.theme.title.Render(loc.T(i18n.KeyTUIBrand)))
 	for i, vk := range tabs {
-		label := fmt.Sprintf("%d:%s", i+1, vk.String())
+		viewName := loc.T(vk.LabelKey())
+		label := fmt.Sprintf("%d:%s", i+1, viewName)
 		if vk == ViewHelp {
-			label = "?:Help"
+			label = "?:" + viewName
 		}
 		if vk == m.activeView {
 			parts = append(parts, m.theme.tabActive.Render(label))
@@ -74,55 +78,77 @@ func (m Model) renderHeader() string {
 			parts = append(parts, m.theme.tabIdle.Render(label))
 		}
 	}
-	meta := fmt.Sprintf("events=%d dropped=%d streams=%d", m.totalEvents, m.droppedEvents, m.activeStreams)
+	meta := loc.T(
+		i18n.KeyTUIHeaderMeta,
+		i18n.Uint64("events", m.totalEvents),
+		i18n.Uint64("dropped", m.droppedEvents),
+		i18n.Int("streams", m.activeStreams),
+	)
 	parts = append(parts, m.theme.muted.Render(meta))
 	return strings.Join(parts, " ")
 }
 
-func (m Model) renderSafetyBanners() string {
+func (m Model) renderSafetyBanners(loc *i18n.Localizer) string {
 	var lines []string
 	if m.gateHalted {
-		reason := pickStr(m.haltReason, "audit post-write failure")
-		lines = append(lines, m.theme.bannerErr.Render("SECURITY GATE HALTED: "+reason))
+		reason := m.resolveHaltReason(loc)
+		lines = append(lines, m.theme.bannerErr.Render(loc.T(i18n.KeyTUIBannerHalted, i18n.BoundStr("reason", reason))))
 	}
 	if m.hasUnknownOut {
-		lines = append(lines, m.theme.bannerWrn.Render("WARNING: OutcomeUnknown detected — DO NOT auto-retry"))
+		lines = append(lines, m.theme.bannerWrn.Render(loc.T(i18n.KeyTUIBannerUnknownOutcome)))
 	}
 	return strings.Join(lines, "\n")
 }
 
-func (m Model) renderFilterBar() string {
-	mode := "filter"
-	if m.filterActive {
-		mode = "filter (editing)"
+func (m Model) resolveHaltReason(loc *i18n.Localizer) string {
+	if m.haltErr != nil {
+		if rendered := strings.TrimSpace(loc.RenderError(m.haltErr)); rendered != "" {
+			return rendered
+		}
 	}
-	return fmt.Sprintf("[%s]: %s", mode, m.filterQuery)
+	if trimmed := strings.TrimSpace(m.haltReason); trimmed != "" {
+		return trimmed
+	}
+	return loc.T(i18n.KeyTUIBannerHaltedDefaultReason)
 }
 
-func (m Model) renderBody() string {
+func (m Model) renderFilterBar(loc *i18n.Localizer) string {
+	if m.filterActive {
+		return loc.T(i18n.KeyTUIFilterEditing, i18n.BoundStr("query", m.filterQuery))
+	}
+	return loc.T(i18n.KeyTUIFilterLabel, i18n.BoundStr("query", m.filterQuery))
+}
+
+func (m Model) renderBody(loc *i18n.Localizer) string {
 	switch m.activeView {
 	case ViewHosts:
-		return m.renderHostsView()
+		return m.renderHostsView(loc)
 	case ViewMetrics:
-		return m.renderMetricsView()
+		return m.renderMetricsView(loc)
 	case ViewLogs:
-		return m.renderLogsView()
+		return m.renderLogsView(loc)
 	case ViewOperations:
-		return m.renderOperationsView()
+		return m.renderOperationsView(loc)
 	case ViewHelp:
-		return m.renderHelpView()
+		return m.renderHelpView(loc)
 	default:
-		return "Invalid view"
+		return loc.T(i18n.KeyTUIViewInvalid)
 	}
 }
 
-func (m Model) renderHostsView() string {
+func (m Model) renderHostsView(loc *i18n.Localizer) string {
 	hosts := m.filteredHosts()
 	var b strings.Builder
-	b.WriteString(m.theme.section.Render(fmt.Sprintf("Hosts & Nodes (%d/%d) rev=%s", len(hosts), len(m.hosts), pickStr(m.inventoryRev, "-"))))
+	title := loc.T(
+		i18n.KeyTUIHostsTitle,
+		i18n.Int("shown", len(hosts)),
+		i18n.Int("total", len(m.hosts)),
+		i18n.BoundStr("rev", pickStr(m.inventoryRev, "-")),
+	)
+	b.WriteString(m.theme.section.Render(title))
 	b.WriteByte('\n')
 	if len(hosts) == 0 {
-		b.WriteString(m.theme.muted.Render("  (no hosts loaded; press 'r' to refresh or adjust filter)"))
+		b.WriteString(m.theme.muted.Render(loc.T(i18n.KeyTUIHostsEmpty)))
 		return b.String()
 	}
 	maxRows := max(m.height-8, 5)
@@ -150,20 +176,22 @@ func (m Model) renderHostsView() string {
 	return b.String()
 }
 
-func (m Model) renderMetricsView() string {
+func (m Model) renderMetricsView(loc *i18n.Localizer) string {
 	var b strings.Builder
-	state := "idle"
-	if m.metricsActive {
-		state = "streaming"
-	}
-	b.WriteString(m.theme.section.Render(fmt.Sprintf("Host Metrics [%s] target=%s sort=%s", state, pickStr(m.metricsTarget, "-"), m.processSort.String())))
+	title := loc.T(
+		i18n.KeyTUIMetricsTitle,
+		i18n.Str("state", loc.T(streamActiveKey(m.metricsActive))),
+		i18n.BoundStr("target", pickStr(m.metricsTarget, "-")),
+		i18n.Str("sort", loc.T(processSortKey(m.processSort))),
+	)
+	b.WriteString(m.theme.section.Render(title))
 	b.WriteByte('\n')
 	if frame, ok := m.latestFrame.Get(); ok {
-		b.WriteString(formatMetricsFrame(frame))
+		b.WriteString(formatMetricsFrame(loc, frame))
 		b.WriteByte('\n')
 	}
 	if len(m.metrics) == 0 && m.latestFrame.IsNone() {
-		b.WriteString(m.theme.muted.Render("  (no metric samples yet; press 'm' on a host to start streaming)"))
+		b.WriteString(m.theme.muted.Render(loc.T(i18n.KeyTUIMetricsEmpty)))
 		return b.String()
 	}
 	q := strings.ToLower(strings.TrimSpace(m.filterQuery))
@@ -181,19 +209,31 @@ func (m Model) renderMetricsView() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func formatMetricsFrame(f engine.HostMetricsFrame) string {
+func formatMetricsFrame(loc *i18n.Localizer, f engine.HostMetricsFrame) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "  Host: %s (%s)  CPU: %.1f%%  Load: %.2f %.2f %.2f  Mem: %.1f%% (%d/%d B)  Uptime: %s",
-		pickStr(f.Hostname, f.NodeID), f.NodeID, f.CPUPercent, f.Load1, f.Load5, f.Load15,
-		f.MemPercent, f.MemUsed, f.MemTotal, f.Uptime.String())
+	b.WriteString(loc.T(
+		i18n.KeyTUIMetricsFrameSummary,
+		i18n.BoundStr("host", pickStr(f.Hostname, f.NodeID)),
+		i18n.BoundStr("node", f.NodeID),
+		safeFloatParam("cpu", f.CPUPercent, 1),
+		safeFloatParam("load1", f.Load1, 2),
+		safeFloatParam("load5", f.Load5, 2),
+		safeFloatParam("load15", f.Load15, 2),
+		safeFloatParam("mem_pct", f.MemPercent, 1),
+		i18n.Uint64("mem_used", f.MemUsed),
+		i18n.Uint64("mem_total", f.MemTotal),
+		i18n.BoundStr("uptime", f.Uptime.String()),
+	))
 	if len(f.Disks) > 0 {
-		b.WriteString("\n  Disks:")
+		b.WriteByte('\n')
+		b.WriteString(loc.T(i18n.KeyTUIMetricsDisks))
 		for _, d := range f.Disks {
 			fmt.Fprintf(&b, " %s=%.1f%%", d.Mount, d.UsedPercent)
 		}
 	}
 	if len(f.Processes) > 0 {
-		b.WriteString("\n  Top Processes:")
+		b.WriteByte('\n')
+		b.WriteString(loc.T(i18n.KeyTUIMetricsTopProcesses))
 		for i, p := range f.Processes {
 			if i >= 5 {
 				break
@@ -204,27 +244,30 @@ func formatMetricsFrame(f engine.HostMetricsFrame) string {
 	return b.String()
 }
 
-func (m Model) renderLogsView() string {
+func (m Model) renderLogsView(loc *i18n.Localizer) string {
 	var b strings.Builder
-	state := "idle"
-	if m.logsActive {
-		state = "streaming"
-	}
 	logs := m.filteredLogs()
-	b.WriteString(m.theme.section.Render(fmt.Sprintf("Live Logs [%s] target=%s lines=%d", state, pickStr(m.logsTarget, "-"), len(logs))))
+	title := loc.T(
+		i18n.KeyTUILogsTitle,
+		i18n.Str("state", loc.T(streamActiveKey(m.logsActive))),
+		i18n.BoundStr("target", pickStr(m.logsTarget, "-")),
+		i18n.Int("lines", len(logs)),
+	)
+	b.WriteString(m.theme.section.Render(title))
 	b.WriteByte('\n')
 	if len(logs) == 0 {
-		b.WriteString(m.theme.muted.Render("  (no log entries yet; press 'l' on a host to stream logs)"))
+		b.WriteString(m.theme.muted.Render(loc.T(i18n.KeyTUILogsEmpty)))
 		return b.String()
 	}
 	maxRows := max(m.height-8, 5)
 	start := min(m.logScroll, max(len(logs)-maxRows, 0))
 	end := min(start+maxRows, len(logs))
+	truncLabel := " " + loc.T(i18n.KeyTUILogsTruncated)
 	for i := start; i < end; i++ {
 		l := logs[i]
 		trunc := ""
 		if l.Truncated {
-			trunc = " [truncated]"
+			trunc = truncLabel
 		}
 		fmt.Fprintf(&b, "  [%s|%s] %s%s", pickStr(l.NodeID, "-"), l.Stream.String(), l.Data, trunc)
 		if i+1 < end {
@@ -234,17 +277,23 @@ func (m Model) renderLogsView() string {
 	return b.String()
 }
 
-func (m Model) renderOperationsView() string {
+func (m Model) renderOperationsView(loc *i18n.Localizer) string {
 	var b strings.Builder
-	b.WriteString(m.theme.section.Render(fmt.Sprintf("Operations (%d) | Pool (%d) | Diagnostics (%d)", len(m.operations), len(m.poolEvents), len(m.diagnostics))))
+	title := loc.T(
+		i18n.KeyTUIOpsTitle,
+		i18n.Int("ops", len(m.operations)),
+		i18n.Int("pool", len(m.poolEvents)),
+		i18n.Int("diags", len(m.diagnostics)),
+	)
+	b.WriteString(m.theme.section.Render(title))
 	b.WriteByte('\n')
 	if len(m.operations) == 0 && len(m.poolEvents) == 0 && len(m.diagnostics) == 0 {
-		b.WriteString(m.theme.muted.Render("  (no operation or system events recorded yet)"))
+		b.WriteString(m.theme.muted.Render(loc.T(i18n.KeyTUIOpsEmpty)))
 		return b.String()
 	}
 	q := strings.ToLower(strings.TrimSpace(m.filterQuery))
 	for _, op := range m.operations {
-		line := formatOperationLine(op)
+		line := formatOperationLine(loc, op)
 		if q != "" && !strings.Contains(strings.ToLower(line), q) {
 			continue
 		}
@@ -259,40 +308,70 @@ func (m Model) renderOperationsView() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func formatOperationLine(op engine.OperationView) string {
-	status := "RUNNING"
-	switch {
-	case op.Unknown:
-		status = "UNKNOWN"
-	case op.Completed && op.Succeeded:
-		status = "OK"
-	case op.Completed:
-		status = "FAILED"
-	}
+func formatOperationLine(loc *i18n.Localizer, op engine.OperationView) string {
+	status := loc.T(operationStatusKey(op))
 	return fmt.Sprintf("%-8s %-12s %s.%s node=%s %s", status, shortID(op.OperationID), pickStr(op.Tool, "-"), pickStr(op.Action, "-"), pickStr(op.NodeID, "-"), pickStr(op.LastMessage, op.Summary))
 }
 
-func (m Model) renderHelpView() string {
-	return strings.Join([]string{
-		m.theme.section.Render("Keybindings & Runtime Controls"),
-		"  1-4 / ? / Tab / Shift+Tab : Switch workbench views (Hosts, Metrics, Logs, Operations, Help)",
-		"  j/k or Up/Down / g / G    : Navigate host selection or scroll logs",
-		"  /                         : Filter current view (Enter apply, Esc clear)",
-		"  r                         : Refresh inventory snapshot from Engine",
-		"  m / l / x                 : Start Metrics stream / Start Log stream / Stop active streams",
-		"  s                         : Toggle process sort order (CPU / Mem)",
-		"  Enter (Hosts view)        : Trigger supervised interactive terminal takeover (if wired)",
-		"  q / Ctrl+C                : Quit cleanly and restore terminal state",
-	}, "\n")
+func (m Model) renderHelpView(loc *i18n.Localizer) string {
+	var b strings.Builder
+	b.WriteString(m.theme.section.Render(loc.T(i18n.KeyTUIHelpTitle)))
+	for line := range strings.SplitSeq(loc.T(i18n.KeyTUIHelpBody), "\n") {
+		b.WriteString("\n  ")
+		b.WriteString(line)
+	}
+	return b.String()
 }
 
-func (m Model) renderFooter() string {
-	status := m.statusMsg
-	if m.lastErr != "" {
-		status = "ERR: " + m.lastErr
+func (m Model) renderFooter(loc *i18n.Localizer) string {
+	status := loc.Render(m.statusMsg)
+	if m.lastErr != nil {
+		status = loc.T(i18n.KeyTUIFooterErrPrefix, i18n.BoundStr("err", loc.RenderError(m.lastErr)))
 	}
-	help := "keys: 1-4/? views | / filter | r refresh | m metrics | l logs | x stop | q quit"
+	help := loc.T(i18n.KeyTUIFooterHelp)
 	return m.theme.footer.Render(status) + "  " + m.theme.muted.Render(help)
+}
+
+func streamActiveKey(active bool) domi18n.MessageID {
+	if active {
+		return i18n.KeyTUIStreamStreaming
+	}
+	return i18n.KeyTUIStreamIdle
+}
+
+func processSortKey(sortBy engine.ProcessSortBy) domi18n.MessageID {
+	if sortBy == engine.ProcessSortMem {
+		return i18n.KeyTUISortMem
+	}
+	return i18n.KeyTUISortCPU
+}
+
+func localeNameKey(loc domi18n.Locale) domi18n.MessageID {
+	if loc == domi18n.LocaleZh {
+		return i18n.KeyTUILangNameZh
+	}
+	return i18n.KeyTUILangNameEn
+}
+
+func operationStatusKey(op engine.OperationView) domi18n.MessageID {
+	switch {
+	case op.Unknown:
+		return i18n.KeyTUIOpStatusUnknown
+	case op.Completed && op.Succeeded:
+		return i18n.KeyTUIOpStatusOK
+	case op.Completed:
+		return i18n.KeyTUIOpStatusFailed
+	default:
+		return i18n.KeyTUIOpStatusRunning
+	}
+}
+
+// safeFloatParam 构造有限浮点参数；对 NaN/±Inf 降级为 "-" 占位串，防止单帧异常浮点导致整条消息失效。
+func safeFloatParam(key string, v float64, prec int) domi18n.Param {
+	if p := i18n.Float(key, v, prec); p.IsValid() {
+		return p
+	}
+	return i18n.Str(key, "-")
 }
 
 func visibleWindow(cursor, total, maxRows int) (int, int) {

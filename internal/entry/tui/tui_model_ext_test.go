@@ -445,9 +445,9 @@ func TestModel_StandaloneHostTargetAndStreamSeqOrdering(t *testing.T) {
 	}
 
 	// 验证旧流延迟到达的 idle 状态不会覆盖新序号流状态。
-	next, _ = m.Update(tui.StreamStateMsg{Kind: "metrics", Target: "host-b", Active: true, Seq: 2})
+	next, _ = m.Update(tui.StreamStateMsg{Kind: tui.StreamKindMetrics, Target: "host-b", Active: true, Seq: 2})
 	m = next.(tui.Model)
-	next, _ = m.Update(tui.StreamStateMsg{Kind: "metrics", Target: "host-a", Active: false, Seq: 1})
+	next, _ = m.Update(tui.StreamStateMsg{Kind: tui.StreamKindMetrics, Target: "host-a", Active: false, Seq: 1})
 	m = next.(tui.Model)
 	if !m.MetricsActive() {
 		t.Fatalf("陈旧序号 Seq=1 的 idle 消息不应覆盖 Seq=2 的活跃状态")

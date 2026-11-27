@@ -37,8 +37,8 @@ func TestInternal_LineBufferedLogWriterAndResetActiveStreams(t *testing.T) {
 	}
 
 	m := NewModel(ModelOptions{})
-	m.applyStreamState(StreamStateMsg{Kind: "metrics", Target: "app-01", Active: true, Seq: 3})
-	m.applyStreamState(StreamStateMsg{Kind: "logs", Target: "app-01", Active: true, Seq: 2})
+	m.applyStreamState(StreamStateMsg{Kind: StreamKindMetrics, Target: "app-01", Active: true, Seq: 3})
+	m.applyStreamState(StreamStateMsg{Kind: StreamKindLogs, Target: "app-01", Active: true, Seq: 2})
 	if !m.MetricsActive() || !m.LogsActive() {
 		t.Fatalf("流状态应为活跃")
 	}
