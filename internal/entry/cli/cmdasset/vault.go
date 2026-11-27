@@ -38,8 +38,14 @@ func RunVault(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return runVaultGC(ctx, rt, rest)
 	case "enroll-key":
 		return runVaultEnrollKey(ctx, rt, rest)
+	case "enroll-password":
+		return runVaultEnrollPassword(ctx, rt, rest)
+	case "set-node-privilege":
+		return runVaultSetNodePrivilege(ctx, rt, rest)
+	case "rotate":
+		return runVaultRotate(ctx, rt, rest)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: 未知 creds/vault 子命令 %q", clikit.ErrUsage, sub))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(rest)), fmt.Errorf("%w: 未知 creds/vault 子命令 %q", clikit.ErrUsage, sub))
 	}
 }
 
@@ -66,7 +72,7 @@ func parseCommonOnly(sub string, args []string) (clikit.CommonFlags, error) {
 func runVaultStatus(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, err := parseCommonOnly("status", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -100,7 +106,7 @@ func runVaultInitOrUnlock(ctx context.Context, rt *clikit.Runtime, isInit bool, 
 	}
 	common, err := parseCommonOnly(sub, args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -158,7 +164,7 @@ func buildInteractiveVaultReq(sub string, isInit bool) (engine.InteractiveVaultO
 func runVaultLock(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, err := parseCommonOnly("lock", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -187,7 +193,7 @@ func runVaultLock(ctx context.Context, rt *clikit.Runtime, args []string) int {
 func runVaultDoctor(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, skipProbe, err := parseVaultDoctorFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -236,8 +242,8 @@ func parseVaultDoctorFlags(args []string) (clikit.CommonFlags, bool, error) {
 			common.ShowHelp = true
 			return common, false, nil
 		}
-		name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
-		if name == "skip-probe" {
+		name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
+		if isLong && name == "skip-probe" {
 			v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
 			if err != nil {
 				return common, false, err

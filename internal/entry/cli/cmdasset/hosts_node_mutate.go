@@ -36,7 +36,7 @@ type nodeUpsertFlags struct {
 func runNodeUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args []string) int {
 	f, err := parseNodeUpsertFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
@@ -91,7 +91,10 @@ func parseNodeToken(cur *clikit.FlagCursor, f *nodeUpsertFlags) error {
 		f.common.ShowHelp = true
 		return nil
 	}
-	name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
+	if !isLong {
+		return fmt.Errorf("%w: node 未知参数 %q", clikit.ErrUsage, tok)
+	}
 	if name == "gc-old-secrets" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
 		f.gcOld = v
@@ -205,9 +208,6 @@ func buildNodeProxyRoute(jumpRaw, proxyCmdRaw string) (option.ProxyRoute, error)
 }
 
 func buildOptionalNodeProfile(dialectRaw, interpRaw, loginRaw string) (algebraic.Option[execution.LaunchProfile], error) {
-	if strings.TrimSpace(dialectRaw) == "" && strings.TrimSpace(interpRaw) == "" && strings.TrimSpace(loginRaw) == "" {
-		return algebraic.None[execution.LaunchProfile](), nil
-	}
 	var dOpt algebraic.Option[execution.LaunchDialect]
 	if strings.TrimSpace(dialectRaw) != "" {
 		d, err := execution.ParseLaunchDialect(dialectRaw)
@@ -216,7 +216,7 @@ func buildOptionalNodeProfile(dialectRaw, interpRaw, loginRaw string) (algebraic
 		}
 		dOpt = algebraic.Some(d)
 	}
-	interp := execution.InterpreterSH
+	var interp execution.Interpreter
 	if strings.TrimSpace(interpRaw) != "" {
 		var err error
 		interp, err = execution.ParseInterpreter(interpRaw)
@@ -224,7 +224,7 @@ func buildOptionalNodeProfile(dialectRaw, interpRaw, loginRaw string) (algebraic
 			return algebraic.None[execution.LaunchProfile](), fmt.Errorf("%w: --interpreter 非法: %w", clikit.ErrUsage, err)
 		}
 	}
-	login := execution.LoginModeDisabled
+	var login execution.LoginMode
 	if strings.TrimSpace(loginRaw) != "" {
 		var err error
 		login, err = execution.ParseLoginMode(loginRaw)
@@ -232,11 +232,7 @@ func buildOptionalNodeProfile(dialectRaw, interpRaw, loginRaw string) (algebraic
 			return algebraic.None[execution.LaunchProfile](), fmt.Errorf("%w: --login 非法: %w", clikit.ErrUsage, err)
 		}
 	}
-	prof, err := execution.NewLaunchProfile(execution.LaunchProfileSpec{Dialect: dOpt, Interpreter: interp, Login: login})
-	if err != nil {
-		return algebraic.None[execution.LaunchProfile](), fmt.Errorf("%w: %w", clikit.ErrUsage, err)
-	}
-	return algebraic.Some(prof), nil
+	return clikit.BuildOptionalLaunchProfile(dOpt, interp, login)
 }
 
 type assetDeleteFlags struct {
@@ -250,7 +246,7 @@ type assetDeleteFlags struct {
 func runAssetDelete(ctx context.Context, rt *clikit.Runtime, kind string, args []string) int {
 	f, err := parseAssetDeleteFlags(kind, args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
@@ -286,26 +282,33 @@ func parseAssetDeleteFlags(kind string, args []string) (assetDeleteFlags, error)
 	var f assetDeleteFlags
 	cur := clikit.NewFlagCursor(args)
 	for cur.HasNext() {
-		if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &f.common); err != nil || consumed {
-			if err != nil {
-				return f, err
-			}
-			continue
+		if err := parseAssetDeleteToken(cur, kind, &f); err != nil {
+			return f, err
 		}
-		tok := cur.Next()
-		if tok == "-h" {
-			f.common.ShowHelp = true
+		if f.common.ShowHelp {
 			return f, nil
 		}
-		if strings.HasPrefix(tok, "--") {
-			if err := applyAssetDeleteLongFlag(cur, kind, tok, &f); err != nil {
-				return f, err
-			}
-			continue
-		}
-		f.pos = append(f.pos, tok)
 	}
 	return f, nil
+}
+
+func parseAssetDeleteToken(cur *clikit.FlagCursor, kind string, f *assetDeleteFlags) error {
+	if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &f.common); err != nil || consumed {
+		return err
+	}
+	tok := cur.Next()
+	if tok == "-h" {
+		f.common.ShowHelp = true
+		return nil
+	}
+	if strings.HasPrefix(tok, "--") {
+		return applyAssetDeleteLongFlag(cur, kind, tok, f)
+	}
+	if strings.HasPrefix(tok, "-") && tok != "-" {
+		return fmt.Errorf("%w: delete-%s 未知选项 %q", clikit.ErrUsage, kind, tok)
+	}
+	f.pos = append(f.pos, tok)
+	return nil
 }
 
 func applyAssetDeleteLongFlag(cur *clikit.FlagCursor, kind, tok string, f *assetDeleteFlags) error {

@@ -47,7 +47,7 @@ func RunPlaybook(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	}
 	parsed, err := parsePlaybookArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, PlaybookHelpText())
@@ -132,6 +132,13 @@ func resolvePlaybookTargets(ctx context.Context, client clikit.AutomationClient,
 	return out, nil
 }
 
+type playbookRunJSONEnvelope struct {
+	OK        bool                     `json:"ok"`
+	Error     string                   `json:"error,omitzero"`
+	ErrorCode string                   `json:"error_code,omitzero"`
+	Result    engine.PlaybookRunResult `json:"result"`
+}
+
 func renderPlaybookRunResult(rt *clikit.Runtime, res engine.PlaybookRunResult, runErr error, jsonOut bool) int {
 	if !res.IsValid() {
 		return rt.Fail(clikit.ExitGeneral, jsonOut, runErr)
@@ -143,7 +150,12 @@ func renderPlaybookRunResult(rt *clikit.Runtime, res engine.PlaybookRunResult, r
 		code = clikit.ExitGeneral
 	}
 	if jsonOut {
-		if err := clikit.WriteJSON(rt.Stdout, res); err != nil {
+		env := playbookRunJSONEnvelope{OK: code == clikit.ExitOK, Result: res}
+		if runErr != nil {
+			env.Error = runErr.Error()
+			env.ErrorCode = clikit.ClassifyErrorCode(runErr)
+		}
+		if err := clikit.WriteJSON(rt.Stdout, env); err != nil {
 			rt.WriteErr("marshal json failed: " + err.Error())
 			return clikit.ExitGeneral
 		}
@@ -159,6 +171,9 @@ func renderPlaybookRunResult(rt *clikit.Runtime, res engine.PlaybookRunResult, r
 	if res.HasUnknownOutcome() {
 		rt.WriteErr("playbook contains OutcomeUnknown steps; inspect remote state before retrying")
 	}
+	if runErr != nil {
+		rt.WriteErr(runErr.Error())
+	}
 	return code
 }
 
@@ -168,6 +183,9 @@ func DecodePlaybookDocument(raw []byte) (pb playbook.Playbook, err error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
 		return pb, fmt.Errorf("playbook 输入为空")
+	}
+	if trimmed[0] == '[' {
+		return pb, fmt.Errorf("playbook 顶层文档必须为对象而非数组")
 	}
 	if trimmed[0] == '{' {
 		var decoded playbook.Playbook
@@ -220,6 +238,9 @@ func yamlNodeToJSONValue(n *yaml.Node) (any, error) {
 		}
 		return out, nil
 	case yaml.ScalarNode:
+		if n.Tag == "!!timestamp" {
+			return n.Value, nil
+		}
 		var v any
 		if err := n.Decode(&v); err != nil {
 			return nil, fmt.Errorf("YAML 标量解码失败: %w", err)
@@ -305,6 +326,9 @@ func parsePlaybookFlag(cur *clikit.FlagCursor, out *playbookArgs) error {
 	}
 	ch := cluster[0]
 	if ch == 'h' {
+		if len(cluster) > 1 {
+			return fmt.Errorf("%w: playbook 未知短选项 -%s", clikit.ErrUsage, cluster)
+		}
 		out.common.ShowHelp = true
 		return nil
 	}
@@ -394,22 +418,5 @@ func applyPlaybookLongValue(name, val, rawTok string, out *playbookArgs) error {
 }
 
 func buildPlaybookDefaultProfile(parsed playbookArgs) (algebraic.Option[execution.LaunchProfile], error) {
-	if parsed.dialect.IsNone() && !parsed.interpreter.IsValid() && !parsed.loginMode.IsValid() {
-		return algebraic.None[execution.LaunchProfile](), nil
-	}
-	interp := parsed.interpreter
-	if !interp.IsValid() {
-		interp = execution.InterpreterSH
-	}
-	login := parsed.loginMode
-	if !login.IsValid() {
-		login = execution.LoginModeDisabled
-	}
-	prof, err := execution.NewLaunchProfile(execution.LaunchProfileSpec{
-		Dialect: parsed.dialect, Interpreter: interp, Login: login,
-	})
-	if err != nil {
-		return algebraic.None[execution.LaunchProfile](), fmt.Errorf("%w: 默认启动配置组合非法: %w", clikit.ErrUsage, err)
-	}
-	return algebraic.Some(prof), nil
+	return clikit.BuildOptionalLaunchProfile(parsed.dialect, parsed.interpreter, parsed.loginMode)
 }

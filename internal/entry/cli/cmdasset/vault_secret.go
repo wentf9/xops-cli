@@ -17,7 +17,7 @@ import (
 func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, pos, err := parseVaultPositionalArgs("refs", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -58,7 +58,7 @@ func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 func runVaultDelete(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, pos, err := parseVaultPositionalArgs("delete", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -94,7 +94,7 @@ func runVaultDelete(ctx context.Context, rt *clikit.Runtime, args []string) int 
 func runVaultGC(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, pos, err := parseVaultPositionalArgs("gc", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -151,7 +151,7 @@ type enrollKeyFlags struct {
 func runVaultEnrollKey(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseEnrollKeyFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
@@ -212,7 +212,10 @@ func parseEnrollKeyToken(cur *clikit.FlagCursor, f *enrollKeyFlags) error {
 		f.common.ShowHelp = true
 		return nil
 	}
-	name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
+	if !isLong {
+		return fmt.Errorf("%w: enroll-key 未知参数 %q", clikit.ErrUsage, tok)
+	}
 	if name == "replace" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
 		f.replace = v

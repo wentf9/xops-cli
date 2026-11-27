@@ -51,7 +51,7 @@ type hostUpsertFlags struct {
 func runHostUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args []string) int {
 	f, err := parseHostUpsertFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
@@ -98,7 +98,10 @@ func parseHostUpsertFlags(args []string) (hostUpsertFlags, error) {
 			f.common.ShowHelp = true
 			return f, nil
 		}
-		name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
+		name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
+		if !isLong {
+			return f, fmt.Errorf("%w: host 未知参数 %q", clikit.ErrUsage, tok)
+		}
 		val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 		if err != nil {
 			return f, err
@@ -178,7 +181,7 @@ type identityUpsertFlags struct {
 func runIdentityUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args []string) int {
 	f, err := parseIdentityUpsertFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
@@ -233,7 +236,10 @@ func parseIdentityToken(cur *clikit.FlagCursor, f *identityUpsertFlags) error {
 		f.common.ShowHelp = true
 		return nil
 	}
-	name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
+	if !isLong {
+		return fmt.Errorf("%w: identity 未知参数 %q", clikit.ErrUsage, tok)
+	}
 	if name == "gc-old-secrets" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
 		f.gcOld = v

@@ -60,6 +60,7 @@ type sshFlagParser struct {
 	muxAction  engine.MuxControlAction
 	ctlSocket  string
 	masterCnt  int
+	masterWins bool
 	noCommand  bool
 	background bool
 	stdioFwd   algebraic.Option[netaddr.HostPort]
@@ -189,11 +190,12 @@ func (p *sshFlagParser) applyShortBoolFlag(ch byte) (bool, error) {
 		return true, nil
 	case 'M':
 		p.masterCnt++
-		mode := "yes"
-		if p.masterCnt >= 2 {
-			mode = "ask"
+		// 仅在首个 -M 出现前尚未通过 -o ControlMaster 设置时标记 -M 胜出（严守 OpenSSH FirstWins），
+		// 并在 finish() 按累计次数一次性折叠为 yes(1) 或 ask(>=2)，避免二次 -M 被 FirstWins 吞掉。
+		if p.masterCnt == 1 && !p.layer.Control().Master().IsSet() {
+			p.masterWins = true
 		}
-		return true, clikit.ApplyOptionKV(&p.layer, "ControlMaster", mode, "-M")
+		return true, nil
 	default:
 		return false, nil
 	}
@@ -272,6 +274,17 @@ func (p *sshFlagParser) finish() (SSHCommandArgs, error) {
 			return SSHCommandArgs{}, err
 		}
 		p.forwards = append(p.forwards, spec)
+	}
+	if p.masterWins && p.masterCnt > 0 {
+		mode := "yes"
+		if p.masterCnt >= 2 {
+			mode = "ask"
+		}
+		mLayer := option.UnsetOptionLayer()
+		if err := clikit.ApplyOptionKV(&mLayer, "ControlMaster", mode, "-M"); err != nil {
+			return SSHCommandArgs{}, err
+		}
+		p.layer = mLayer.Compose(p.layer)
 	}
 	if err := p.layer.Validate(); err != nil {
 		return SSHCommandArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)

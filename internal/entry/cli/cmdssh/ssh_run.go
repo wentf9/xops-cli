@@ -3,6 +3,7 @@ package cmdssh
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -17,7 +18,7 @@ import (
 func RunSSH(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := ParseSSHArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, SSHHelpText())
@@ -114,7 +115,7 @@ func runSSHMuxControl(ctx context.Context, rt *clikit.Runtime, runner clikit.Ses
 	return renderMuxResponse(rt, jsonOut, parsed.MuxAction, resp)
 }
 
-func runSSHNoCommand(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed SSHCommandArgs, jsonOut bool) int {
+func runSSHNoCommand(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed SSHCommandArgs, jsonOut bool) (exitCode int) {
 	if len(parsed.Forwards) == 0 && parsed.MasterCount == 0 {
 		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: -N 模式至少需要 -M 或一条转发规则（-L/-R/-D/-w）", clikit.ErrUsage))
 	}
@@ -127,26 +128,26 @@ func runSSHNoCommand(ctx context.Context, rt *clikit.Runtime, runner clikit.Sess
 	}
 	var masterPtr *engine.ControlMasterInfo
 	if parsed.MasterCount > 0 {
-		cm, err := client.StartControlMaster(ctx, engine.ControlMasterRequest{RemoteCall: rc})
-		if err != nil {
-			return rt.Fail(clikit.ExitSSHError, jsonOut, err)
+		cm, mErr := client.StartControlMaster(ctx, engine.ControlMasterRequest{RemoteCall: rc})
+		if mErr != nil {
+			return rt.Fail(clikit.ExitSSHError, jsonOut, mErr)
 		}
 		masterPtr = &cm
-		defer stopControlMaster(ctx, client, cm)
+		defer func() { reportCleanupError(rt, stopControlMaster(ctx, client, cm), &exitCode) }()
 	}
 	infos, err := startForwards(ctx, client, rc, parsed.Forwards)
 	if err != nil {
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 	}
-	defer func() { _ = stopForwards(ctx, client, infos) }()
+	defer func() { reportCleanupError(rt, stopForwards(ctx, client, infos), &exitCode) }()
 	announceActiveSession(rt, jsonOut, parsed.TargetSpec, infos, masterPtr)
 	if err := waitForwards(ctx, infos, masterPtr); err != nil {
-		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
+		return failAfterAnnounce(rt, jsonOut, err)
 	}
 	return clikit.ExitOK
 }
 
-func runSSHWithSessionExtensions(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed SSHCommandArgs, jsonOut bool) int {
+func runSSHWithSessionExtensions(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed SSHCommandArgs, jsonOut bool) (exitCode int) {
 	client, err := requireSSHClient(runner)
 	if err != nil {
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
@@ -155,17 +156,17 @@ func runSSHWithSessionExtensions(ctx context.Context, rt *clikit.Runtime, runner
 		TargetInput: engine.TargetInput{TargetSpec: parsed.TargetSpec, CLIOptions: parsed.CLIOptions},
 	}
 	if parsed.MasterCount > 0 {
-		cm, err := client.StartControlMaster(ctx, engine.ControlMasterRequest{RemoteCall: rc})
-		if err != nil {
-			return rt.Fail(clikit.ExitSSHError, jsonOut, err)
+		cm, mErr := client.StartControlMaster(ctx, engine.ControlMasterRequest{RemoteCall: rc})
+		if mErr != nil {
+			return rt.Fail(clikit.ExitSSHError, jsonOut, mErr)
 		}
-		defer stopControlMaster(ctx, client, cm)
+		defer func() { reportCleanupError(rt, stopControlMaster(ctx, client, cm), &exitCode) }()
 	}
 	infos, err := startForwards(ctx, client, rc, parsed.Forwards)
 	if err != nil {
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 	}
-	defer func() { _ = stopForwards(ctx, client, infos) }()
+	defer func() { reportCleanupError(rt, stopForwards(ctx, client, infos), &exitCode) }()
 	return runPlainSSHSession(ctx, rt, runner, parsed, jsonOut)
 }
 
@@ -224,17 +225,20 @@ func toReadCloser(r io.Reader) io.ReadCloser {
 	return io.NopCloser(r)
 }
 
-func stopControlMaster(ctx context.Context, client clikit.SSHClient, cm engine.ControlMasterInfo) {
-	if !cm.IsValid() {
-		return
+func stopControlMaster(ctx context.Context, client clikit.SSHClient, cm engine.ControlMasterInfo) error {
+	if !cm.IsValid() || cm.ReusedExisting() {
+		return nil
 	}
 	h, ok := cm.Handle().Get()
 	if !ok || !h.IsValid() {
-		return
+		return nil
 	}
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultCleanupTimeout)
 	defer cancel()
-	_ = client.StopControlMaster(stopCtx, h)
+	if err := client.StopControlMaster(stopCtx, h); err != nil && !errors.Is(err, engine.ErrHandleNotFound) {
+		return err
+	}
+	return nil
 }
 
 type activeTunnelSummary struct {
@@ -256,6 +260,9 @@ func announceActiveSession(rt *clikit.Runtime, jsonOut bool, target string, info
 		summary.MasterSock = master.SocketPath().String()
 	}
 	for _, info := range infos {
+		if !info.IsValid() {
+			continue
+		}
 		summary.Forwards = append(summary.Forwards, forwardRecordView{
 			Direction:  info.Spec().Direction(),
 			BindAddr:   info.BoundAddr(),

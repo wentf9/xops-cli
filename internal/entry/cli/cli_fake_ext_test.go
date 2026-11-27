@@ -63,6 +63,10 @@ type fakeFullEngine struct {
 	lastRenameReq   engine.RemoteRenameRequest
 	lastChmodReq    engine.RemotePathOpRequest
 	lastRecoverReq  engine.RecoverTransferRequest
+	lastVaultSaga   engine.InteractiveVaultSagaRequest
+	lastRotateReq   engine.InteractiveRotateSecretRequest
+	vaultSagaFn     func(context.Context, engine.InteractiveVaultSagaRequest) (engine.SagaResult, error)
+	rotateSecretFn  func(context.Context, engine.InteractiveRotateSecretRequest) (engine.SagaResult, error)
 }
 
 var (
@@ -233,6 +237,10 @@ func (f *fakeFullEngine) RunPlaybook(ctx context.Context, req engine.PlaybookReq
 func (f *fakeFullEngine) SCPUpload(ctx context.Context, req engine.SCPUploadRequest) (engine.SCPUploadResult, error) {
 	f.record("SCPUpload")
 	f.lastUploadReq = req
+	// 严格对齐 core/internal/usecase/transfer/scp_upload.go 真实不变量：递归上传必须使用 ScopedRootFS 且 SymlinkReject。
+	if req.Recursive && (req.Source.Kind() != engine.LocalUploadSourceScoped || req.SymlinkPolicy != pathalg.SymlinkReject) {
+		return engine.SCPUploadResult{}, engine.ErrInvalidRequest
+	}
 	if f.scpUploadFn != nil {
 		return f.scpUploadFn(ctx, req)
 	}
@@ -242,6 +250,10 @@ func (f *fakeFullEngine) SCPUpload(ctx context.Context, req engine.SCPUploadRequ
 func (f *fakeFullEngine) SCPDownload(ctx context.Context, req engine.SCPDownloadRequest) (engine.SCPDownloadResult, error) {
 	f.record("SCPDownload")
 	f.lastDownloadReq = req
+	// 严格对齐 core/internal/usecase/transfer/scp_download.go 真实不变量：下载严禁 SymlinkFollowOperatorSource。
+	if req.SymlinkPolicy == pathalg.SymlinkFollowOperatorSource {
+		return engine.SCPDownloadResult{}, engine.ErrInvalidRequest
+	}
 	if f.scpDownloadFn != nil {
 		return f.scpDownloadFn(ctx, req)
 	}
@@ -535,6 +547,30 @@ func (f *fakeFullEngine) DeleteSecret(_ context.Context, _ engine.DeleteSecretRe
 func (f *fakeFullEngine) GCUnreferencedSecrets(_ context.Context, req engine.GCUnreferencedRequest) (engine.GCUnreferencedResult, error) {
 	f.record("GCUnreferencedSecrets")
 	return engine.GCUnreferencedResult{Deleted: req.Candidates}, nil
+}
+
+func (f *fakeFullEngine) ExecuteVaultSagaInteractive(ctx context.Context, req engine.InteractiveVaultSagaRequest) (res engine.SagaResult, err error) {
+	f.record("ExecuteVaultSagaInteractive")
+	f.lastVaultSaga = req
+	if req.Saga.MutateGraph == nil || (req.Saga.NewRef.IsValid() == (req.Saga.TargetStore != "")) {
+		return res, engine.ErrInvalidRequest
+	}
+	if f.vaultSagaFn != nil {
+		return f.vaultSagaFn(ctx, req)
+	}
+	return res, nil
+}
+
+func (f *fakeFullEngine) RotateSecretInteractive(ctx context.Context, req engine.InteractiveRotateSecretRequest) (res engine.SagaResult, err error) {
+	f.record("RotateSecretInteractive")
+	f.lastRotateReq = req
+	if !req.Rotate.OldRef.IsValid() || (req.Rotate.NewRef.IsValid() == (req.Rotate.TargetStore != "")) {
+		return res, engine.ErrInvalidRequest
+	}
+	if f.rotateSecretFn != nil {
+		return f.rotateSecretFn(ctx, req)
+	}
+	return res, nil
 }
 
 func (f *fakeFullEngine) ReconcileCrashedAudits(ctx context.Context) (engine.ReconcileReport, error) {

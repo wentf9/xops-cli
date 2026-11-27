@@ -138,7 +138,7 @@ type InventoryClient interface {
 	EnrollEncryptedPrivateKeyIdentity(ctx context.Context, req engine.EnrollEncryptedPrivateKeyRequest) (engine.EnrollEncryptedPrivateKeyResult, error)
 }
 
-// VaultClient 聚合凭据库生命周期控制、健康诊断、引用查询与安全回收能力。
+// VaultClient 聚合凭据库生命周期控制、交互式写入/轮换 Saga、健康诊断、引用查询与安全回收能力。
 type VaultClient interface {
 	SessionRunner
 	VaultStatus(ctx context.Context, req engine.VaultOpRequest) (engine.VaultStatus, error)
@@ -149,6 +149,8 @@ type VaultClient interface {
 	FindSecretReferences(ctx context.Context, req engine.FindSecretReferencesRequest) ([]inventory.SecretReference, error)
 	DeleteSecret(ctx context.Context, req engine.DeleteSecretRequest) error
 	GCUnreferencedSecrets(ctx context.Context, req engine.GCUnreferencedRequest) (engine.GCUnreferencedResult, error)
+	ExecuteVaultSagaInteractive(ctx context.Context, req engine.InteractiveVaultSagaRequest) (engine.SagaResult, error)
+	RotateSecretInteractive(ctx context.Context, req engine.InteractiveRotateSecretRequest) (engine.SagaResult, error)
 }
 
 // ReconcileClient 聚合启动期 O(1) 跨进程审计崩溃对账能力。

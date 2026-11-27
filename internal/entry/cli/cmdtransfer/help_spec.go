@@ -17,7 +17,7 @@ Flags:
   -F <configfile>            Alternative per-user OpenSSH configuration file
   --resume                   Resume interrupted transfer with digest verification
   --no-clobber               Refuse to overwrite existing destination file
-  --expand-into-dir          Expand uploaded file into existing remote directory
+  --expand-into-dir[=bool]   Expand uploaded file into existing remote directory (default true)
   --symlink-policy <policy>  Symlink policy: reject | contained_relative | follow_operator_source
   --local-root <dir>         Explicit ScopedRootFS root directory for local file I/O
   --perm <octal>             Override remote file permissions (e.g. 0644)
@@ -48,7 +48,7 @@ func SFTPHelpText() string {
   xops sftp chmod    [ssh-flags] <target> <mode> <remote_path>
   xops sftp realpath [ssh-flags] <target> <remote_path>
   xops sftp readlink [ssh-flags] <target> <remote_path>
-  xops sftp recover  [ssh-flags] [--prune] [<target> <transfer_id>]
+  xops sftp recover  [ssh-flags] [--local-root <dir>] [--prune] [<target> <transfer_id>]
 
 Flags:
   -P/-p/-l/-i/-J/-o/-F       Standard OpenSSH connection options

@@ -43,7 +43,7 @@ func RunHosts(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	case "delete-node":
 		return runAssetDelete(ctx, rt, "node", rest)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: 未知 hosts 子命令 %q", clikit.ErrUsage, sub))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(rest)), fmt.Errorf("%w: 未知 hosts 子命令 %q", clikit.ErrUsage, sub))
 	}
 }
 
@@ -56,7 +56,7 @@ type hostsListFlags struct {
 func runHostsList(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseHostsListFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
@@ -96,7 +96,10 @@ func parseHostsListToken(cur *clikit.FlagCursor, f *hostsListFlags) error {
 		f.common.ShowHelp = true
 		return nil
 	}
-	name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
+	if !isLong {
+		return fmt.Errorf("%w: hosts list 未知参数 %q", clikit.ErrUsage, tok)
+	}
 	val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 	if err != nil {
 		return err
@@ -222,7 +225,7 @@ type hostsGetFlags struct {
 func runHostsGet(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseHostsGetFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
@@ -265,9 +268,9 @@ func parseHostsGetToken(cur *clikit.FlagCursor, f *hostsGetFlags) error {
 		f.common.ShowHelp = true
 		return nil
 	}
-	if strings.HasPrefix(tok, "--") {
-		name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
-		if name != "kind" {
+	if strings.HasPrefix(tok, "-") && tok != "-" {
+		name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
+		if !isLong || name != "kind" {
 			return fmt.Errorf("%w: hosts get 未知参数 %q", clikit.ErrUsage, tok)
 		}
 		val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)

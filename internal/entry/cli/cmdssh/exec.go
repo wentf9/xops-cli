@@ -51,7 +51,7 @@ type execArgs struct {
 func RunExec(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseExecArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, ExecHelpText())
@@ -357,25 +357,9 @@ func finalizeExecArgs(out execArgs) (execArgs, error) {
 }
 
 func buildExecCommandPlan(parsed execArgs) (cp execution.CommandPlan, err error) {
-	prof := execution.DefaultServerLaunchProfile()
-	if parsed.dialect.IsSome() || parsed.interpreter.IsValid() || parsed.loginMode.IsValid() {
-		interp := parsed.interpreter
-		if !interp.IsValid() {
-			interp = execution.InterpreterSH
-		}
-		login := parsed.loginMode
-		if !login.IsValid() {
-			login = execution.LoginModeDisabled
-		}
-		var pErr error
-		prof, pErr = execution.NewLaunchProfile(execution.LaunchProfileSpec{
-			Dialect:     parsed.dialect,
-			Interpreter: interp,
-			Login:       login,
-		})
-		if pErr != nil {
-			return cp, fmt.Errorf("%w: 启动配置组合非法: %w", clikit.ErrUsage, pErr)
-		}
+	prof, pErr := clikit.BuildLaunchProfile(parsed.dialect, parsed.interpreter, parsed.loginMode)
+	if pErr != nil {
+		return cp, pErr
 	}
 	spec := execution.CommandPlanSpec{
 		Kind:           execution.PlanKindCommand,

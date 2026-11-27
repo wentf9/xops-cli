@@ -107,6 +107,13 @@ func buildLocalOrRemoteForwardSpec(dir engine.ForwardDirection, parts []string, 
 		if isUnixSocketSpec(parts[0]) && isUnixSocketSpec(parts[1]) {
 			return engine.NewTypedForwardSpec(dir, engine.ForwardEndpointUnix, parts[0], engine.ForwardEndpointUnix, parts[1])
 		}
+		if !isUnixSocketSpec(parts[0]) && isUnixSocketSpec(parts[1]) {
+			bindAddr, bErr := joinTCPHostPort("127.0.0.1", parts[0], true)
+			if bErr != nil {
+				return spec, fmt.Errorf("%w: 转发规格 %q 监听端口非法: %w", ErrUsage, raw, bErr)
+			}
+			return engine.NewTypedForwardSpec(dir, engine.ForwardEndpointTCP, bindAddr, engine.ForwardEndpointUnix, parts[1])
+		}
 		return spec, fmt.Errorf("%w: 转发规格 %q 缺少目标主机或端口", ErrUsage, raw)
 	case 3:
 		return parseThreePartForward(dir, parts, raw)

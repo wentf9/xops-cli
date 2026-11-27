@@ -22,13 +22,16 @@ type tuiArgs struct {
 func RunTUI(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseTUIArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, TUIHelpText())
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
+	if jsonOut {
+		return rt.Fail(clikit.ExitUsage, true, fmt.Errorf("%w: 交互式 TUI 工作台不支持 --json 输出", clikit.ErrUsage))
+	}
 	if rt.Hooks.RunTUI == nil {
 		return rt.Fail(clikit.ExitGeneral, jsonOut, fmt.Errorf("%w: 未注入 RunTUI 回调，无法启动 TUI 工作台", clikit.ErrNotConfigured))
 	}
@@ -70,8 +73,8 @@ func parseTUIToken(cur *clikit.FlagCursor, out *tuiArgs) error {
 		out.common.ShowHelp = true
 		return nil
 	}
-	if tok == "-F" {
-		val, err := cur.ConsumeShortArg('F', "")
+	if strings.HasPrefix(tok, "-F") {
+		val, err := cur.ConsumeShortArg('F', tok[2:])
 		if err != nil {
 			return err
 		}
@@ -81,7 +84,10 @@ func parseTUIToken(cur *clikit.FlagCursor, out *tuiArgs) error {
 }
 
 func applyTUILongFlag(cur *clikit.FlagCursor, rawTok string, out *tuiArgs) error {
-	name, inlineVal, hasEq := clikit.SplitLongFlag(rawTok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(rawTok)
+	if !isLong {
+		return fmt.Errorf("%w: tui 未知参数 %q", clikit.ErrUsage, rawTok)
+	}
 	switch name {
 	case "node":
 		val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
@@ -121,7 +127,7 @@ type mcpArgs struct {
 func RunMCP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseMCPArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, MCPHelpText())
@@ -180,8 +186,8 @@ func parseMCPToken(cur *clikit.FlagCursor, out *mcpArgs) error {
 		out.common.ShowHelp = true
 		return nil
 	}
-	if tok == "-F" {
-		val, err := cur.ConsumeShortArg('F', "")
+	if strings.HasPrefix(tok, "-F") {
+		val, err := cur.ConsumeShortArg('F', tok[2:])
 		if err != nil {
 			return err
 		}
@@ -191,7 +197,10 @@ func parseMCPToken(cur *clikit.FlagCursor, out *mcpArgs) error {
 }
 
 func parseMCPLongFlag(cur *clikit.FlagCursor, rawTok string, out *mcpArgs) error {
-	name, inlineVal, hasEq := clikit.SplitLongFlag(rawTok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(rawTok)
+	if !isLong {
+		return fmt.Errorf("%w: mcp 未知参数 %q", clikit.ErrUsage, rawTok)
+	}
 	if name == "allow-non-loopback" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
 		out.allowNonLoopback = v

@@ -39,14 +39,14 @@ func RunConfig(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	case "formats":
 		return runConfigFormats(ctx, rt, args[1:])
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: 未知 config 子命令 %q", clikit.ErrUsage, args[0]))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args[1:])), fmt.Errorf("%w: 未知 config 子命令 %q", clikit.ErrUsage, args[0]))
 	}
 }
 
 func runConfigFormats(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, err := parseCommonOnly("formats", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, ConfigHelpText())
@@ -79,7 +79,7 @@ func runConfigFormats(ctx context.Context, rt *clikit.Runtime, args []string) in
 func runConfigImport(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseImportArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, ConfigHelpText())
@@ -191,14 +191,24 @@ func parseImportToken(cur *clikit.FlagCursor, out *importArgs) error {
 		out.common.ShowHelp = true
 		return nil
 	}
-	if !strings.HasPrefix(tok, "--") {
-		if out.filePath == "" {
-			out.filePath = tok
-			return nil
+	if strings.HasPrefix(tok, "-F") {
+		val, err := cur.ConsumeShortArg('F', tok[2:])
+		if err != nil {
+			return err
 		}
-		return fmt.Errorf("%w: config import 多余位置参数 %q", clikit.ErrUsage, tok)
+		return clikit.SetConfigFile(&out.common.ConfigFile, val)
 	}
-	return parseImportLongFlag(cur, tok, out)
+	if strings.HasPrefix(tok, "--") {
+		return parseImportLongFlag(cur, tok, out)
+	}
+	if strings.HasPrefix(tok, "-") && tok != "-" {
+		return fmt.Errorf("%w: config import 未知短选项 %q", clikit.ErrUsage, tok)
+	}
+	if out.filePath == "" {
+		out.filePath = tok
+		return nil
+	}
+	return fmt.Errorf("%w: config import 多余位置参数 %q", clikit.ErrUsage, tok)
 }
 
 func parseImportLongFlag(cur *clikit.FlagCursor, rawTok string, out *importArgs) error {

@@ -102,7 +102,9 @@ func waitForwards(ctx context.Context, infos []engine.ForwardInfo, master *engin
 
 func collectForwardWaiters(infos []engine.ForwardInfo, master *engine.ControlMasterInfo) []func(context.Context) error {
 	waiters := make([]func(context.Context) error, 0, len(infos)+1)
-	if master != nil && master.IsValid() {
+	// 仅等待本进程实际启动的 ControlMaster；ReusedExisting 外部主控的 Wait 会立即返回 nil，
+	// 若纳入等待列表会误触发早退并撕毁刚建立的转发句柄。
+	if master != nil && master.IsValid() && !master.ReusedExisting() {
 		m := *master
 		waiters = append(waiters, m.Wait)
 	}
@@ -113,6 +115,27 @@ func collectForwardWaiters(infos []engine.ForwardInfo, master *engine.ControlMas
 		}
 	}
 	return waiters
+}
+
+// reportCleanupError 将隧道/主控清理故障输出至 stderr，并在业务原退出码为 0 时失败关闭提升为 ExitGeneral。
+func reportCleanupError(rt *clikit.Runtime, err error, exitCode *int) {
+	if err == nil {
+		return
+	}
+	rt.WriteErr("cleanup failed: " + err.Error())
+	if *exitCode == clikit.ExitOK {
+		*exitCode = clikit.ExitGeneral
+	}
+}
+
+// failAfterAnnounce 在 announceActiveSession 已输出启动信息后处理等待期故障：
+// JSON 模式下绝不向 stdout 追加第二个 JSON 文档，仅将错误写入 stderr 并返回 ExitSSHError。
+func failAfterAnnounce(rt *clikit.Runtime, jsonOut bool, err error) int {
+	if jsonOut {
+		rt.WriteErr(err.Error())
+		return clikit.ExitSSHError
+	}
+	return rt.Fail(clikit.ExitSSHError, false, err)
 }
 
 func spawnWaiters(n *conc.Nursery, waiters []func(context.Context) error, signalDone func(error)) error {

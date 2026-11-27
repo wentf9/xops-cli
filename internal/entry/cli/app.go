@@ -177,7 +177,7 @@ func (a *App) dispatchCommand(ctx context.Context, rt *clikit.Runtime, cmd strin
 	case "tui":
 		return cmdops.RunTUI(ctx, rt, subArgs)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: unknown command %q (run 'xops --help' for usage)", ErrUsage, cmd))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(subArgs)), fmt.Errorf("%w: unknown command %q (run 'xops --help' for usage)", ErrUsage, cmd))
 	}
 }
 
@@ -187,11 +187,11 @@ func (a *App) runHelp(rt *clikit.Runtime, args []string) int {
 		return clikit.ExitOK
 	}
 	if len(args) > 1 {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: help accepts at most one topic, got %q", ErrUsage, strings.Join(args, " ")))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), fmt.Errorf("%w: help accepts at most one topic, got %q", ErrUsage, strings.Join(args, " ")))
 	}
 	text, ok := lookupHelpTopic(args[0])
 	if !ok {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: unknown help topic %q", ErrUsage, args[0]))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), fmt.Errorf("%w: unknown help topic %q", ErrUsage, args[0]))
 	}
 	_, _ = io.WriteString(a.stdout, text)
 	return clikit.ExitOK
@@ -199,14 +199,14 @@ func (a *App) runHelp(rt *clikit.Runtime, args []string) int {
 
 // runVersion 仅渲染显式注入的 BuildInfo（支持 --json），绝不初始化 Engine 或触碰任何本地状态目录。
 func (a *App) runVersion(rt *clikit.Runtime, args []string) int {
-	jsonOut := rt.Global.JSON
+	jsonOut := rt.EffectiveJSON(clikit.HasJSONFlag(args))
 	for _, arg := range args {
 		switch arg {
 		case "-h", "--help":
 			writeVersionHelp(a.stdout)
 			return clikit.ExitOK
-		case "--json":
-			jsonOut = true
+		case "--json", "--json=true", "--json=false", "--json=1", "--json=0", "--json=yes", "--json=no":
+			// 已由 HasJSONFlag 统一求值（支持末次覆盖语义）。
 		default:
 			return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: version accepts only --json or --help, got %q", ErrUsage, arg))
 		}

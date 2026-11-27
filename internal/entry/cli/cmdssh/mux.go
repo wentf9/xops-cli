@@ -41,7 +41,7 @@ func RunMux(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	}
 	parsed, err := parseMuxArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, MuxHelpText())
@@ -124,20 +124,20 @@ func dispatchMuxAction(ctx context.Context, rt *clikit.Runtime, client clikit.SS
 	return renderMuxResponse(rt, jsonOut, act, resp)
 }
 
-func runMuxStartForeground(ctx context.Context, rt *clikit.Runtime, client clikit.SSHClient, rc engine.RemoteCall, parsed muxArgs, jsonOut bool) int {
+func runMuxStartForeground(ctx context.Context, rt *clikit.Runtime, client clikit.SSHClient, rc engine.RemoteCall, parsed muxArgs, jsonOut bool) (exitCode int) {
 	cm, err := client.StartControlMaster(ctx, engine.ControlMasterRequest{RemoteCall: rc})
 	if err != nil {
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 	}
-	defer stopControlMaster(ctx, client, cm)
+	defer func() { reportCleanupError(rt, stopControlMaster(ctx, client, cm), &exitCode) }()
 	infos, err := startForwards(ctx, client, rc, parsed.forwards)
 	if err != nil {
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 	}
-	defer func() { _ = stopForwards(ctx, client, infos) }()
+	defer func() { reportCleanupError(rt, stopForwards(ctx, client, infos), &exitCode) }()
 	announceActiveSession(rt, jsonOut, parsed.target, infos, &cm)
 	if err := waitForwards(ctx, infos, &cm); err != nil {
-		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
+		return failAfterAnnounce(rt, jsonOut, err)
 	}
 	return clikit.ExitOK
 }

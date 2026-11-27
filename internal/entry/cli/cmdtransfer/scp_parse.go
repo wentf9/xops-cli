@@ -12,16 +12,21 @@ import (
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
 )
 
-// splitSCPEndpoint 区分远端 `[user@]host:<path>` 与本地路径（保护 Windows 盘符 `C:\...` / `C:/...` 不被误判为远端主机）。
+// splitSCPEndpoint 区分远端 `[user@]host:[path]` 与本地路径：
+//   - 保护全部 Windows 盘符路径（含绝对 `C:\...`、`C:/...` 与盘符相对 `C:foo`）不被误判为远端主机；
+//   - 支持 OpenSSH 标准空路径写法 `user@host:`（自动规约为远端家目录相对路径 "."）。
 func splitSCPEndpoint(raw string) (host, remotePath string, isRemote bool) {
 	trimmed := strings.TrimSpace(raw)
-	if len(trimmed) >= 3 && isASCIIAlpha(trimmed[0]) && trimmed[1] == ':' && (trimmed[2] == '\\' || trimmed[2] == '/') {
+	if len(trimmed) >= 2 && isASCIIAlpha(trimmed[0]) && trimmed[1] == ':' {
 		return "", "", false
 	}
 	if strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "./") || strings.HasPrefix(trimmed, "../") {
 		return "", "", false
 	}
-	if idx := findRemoteColon(trimmed); idx > 0 && idx+1 < len(trimmed) {
+	if idx := findRemoteColon(trimmed); idx > 0 {
+		if idx+1 == len(trimmed) {
+			return trimmed[:idx], ".", true
+		}
 		return trimmed[:idx], trimmed[idx+1:], true
 	}
 	return "", "", false
@@ -55,6 +60,7 @@ func isASCIIAlpha(b byte) bool {
 func parseSCPArgs(args []string) (scpArgs, error) {
 	out := scpArgs{
 		cliOpts:       option.UnsetOptionLayer(),
+		expandIntoDir: true, // 对齐 OpenSSH scp 习惯（单层 INV-B4 展开到远端已有目录，可通过 --expand-into-dir=false 关闭）
 		symlinkPolicy: pathalg.SymlinkReject,
 	}
 	cur := clikit.NewFlagCursor(args)

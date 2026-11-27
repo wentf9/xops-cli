@@ -38,8 +38,11 @@ func VaultHelpText() string {
   xops creds doctor     [--skip-probe]
   xops creds refs       <store>/<item>
   xops creds delete     <store>/<item>
-  xops creds gc         <store>/<item> [<store>/<item>...]
-  xops creds enroll-key --id <identity_id> --user <u> --key-path <path> --store <store> [--cert-path <p>] [--fingerprint <fp>] [--replace]
+  xops creds gc                <store>/<item> [<store>/<item>...]
+  xops creds enroll-key        --id <identity_id> --user <u> --key-path <path> --store <store> [--cert-path <p>] [--fingerprint <fp>] [--replace]
+  xops creds enroll-password   --id <identity_id> --user <u> (--store <store> | --ref <store>/<item>) [--replace] [--desc <d>] [--tag <tags>]
+  xops creds set-node-privilege --node <node_id> (--store <store> | --ref <store>/<item>) [--expected-revision <rev>]
+  xops creds rotate            <old_store>/<item> (--store <store> | --new-ref <store>/<item>) [--expected-revision <rev>]
 
 Aliases:
   cred, vault

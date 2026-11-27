@@ -66,6 +66,9 @@ func TestApp_HostsVaultAndConfigCommands(t *testing.T) {
 		{"hosts", "create-node", "--id", "n1", "--host", "h1", "--identity", "id1", "--jump", "bastion", "--dialect", "posix"},
 		{"hosts", "delete-node", "n1", "--delete-unused-secrets", "--require-unreferenced"},
 		{"vault", "enroll-key", "--id", "key-id", "--user", "ops", "--key-path", "/home/ops/.ssh/id_ed25519"},
+		{"vault", "enroll-password", "--id", "pw-id", "--user", "ops", "--store", "offline"},
+		{"vault", "set-node-privilege", "--node", "n1", "--ref", "offline/sudo-pw"},
+		{"vault", "rotate", "offline/old-pw", "--store", "offline"},
 		{"config", "import", "--format", "openssh", "--file", "/tmp/ssh_config", "--plan"},
 		{"config", "import", "--format", "csv", "--stdin", "--dry-run"},
 	}
@@ -179,7 +182,7 @@ func assertAuditQueryAndSubEntryHooks(t *testing.T) {
 					ProcessID:   "proc-1",
 					TraceID:     tr,
 					OperationID: op,
-					Phase:       "post",
+					Phase:       "finalized",
 					Outcome:     "succeeded",
 					Risk:        security.RiskSafe,
 					Decision:    security.DecisionKindAllow,
@@ -201,10 +204,10 @@ func assertAuditQueryAndSubEntryHooks(t *testing.T) {
 		}
 	}, nil)
 
-	if code := h.app.Run(context.Background(), []string{"audit", "tail", "--limit", "5", "--phase", "post", "--json"}); code != 0 {
+	if code := h.app.Run(context.Background(), []string{"audit", "tail", "--limit", "5", "--phase", "finalized", "--json"}); code != 0 {
 		t.Fatalf("audit tail 失败: code=%d stderr=%q", code, h.stderr.String())
 	}
-	if gotAuditReq.Limit != 5 || !gotAuditReq.Tail || gotAuditReq.Phase != "post" || !strings.Contains(h.stdout.String(), `"duration":"250ms"`) {
+	if gotAuditReq.Limit != 5 || !gotAuditReq.Tail || gotAuditReq.Phase != "finalized" || !strings.Contains(h.stdout.String(), `"duration":"250ms"`) {
 		t.Fatalf("audit tail 请求或 algebraic.Duration 序列化异常: req=%+v out=%q", gotAuditReq, h.stdout.String())
 	}
 	if code := h.app.Run(context.Background(), []string{"audit", "list", "--limit", "3"}); code != 0 || gotAuditReq.Tail || gotAuditReq.Limit != 3 {

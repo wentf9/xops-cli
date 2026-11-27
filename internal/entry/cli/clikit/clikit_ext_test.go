@@ -11,6 +11,7 @@ import (
 
 	"go.uber.org/goleak"
 
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
@@ -34,6 +35,8 @@ func TestParseForwardFlagSpec_TCPUnixIPv6DynamicAndTUN(t *testing.T) {
 		{name: "remote_port_zero", dir: engine.ForwardRemote, raw: "0:127.0.0.1:3000", wantBind: "127.0.0.1:0", wantDst: "127.0.0.1:3000"},
 		{name: "local_unix_to_tcp", dir: engine.ForwardLocal, raw: "/tmp/local.sock:127.0.0.1:5432", wantBind: "/tmp/local.sock", wantDst: "127.0.0.1:5432"},
 		{name: "local_tcp_to_unix", dir: engine.ForwardLocal, raw: "127.0.0.1:8080:/var/run/app.sock", wantBind: "127.0.0.1:8080", wantDst: "/var/run/app.sock"},
+		{name: "local_port_to_unix", dir: engine.ForwardLocal, raw: "8080:/var/run/app.sock", wantBind: "127.0.0.1:8080", wantDst: "/var/run/app.sock"},
+		{name: "remote_port_to_unix", dir: engine.ForwardRemote, raw: "9090:/tmp/svc.sock", wantBind: "127.0.0.1:9090", wantDst: "/tmp/svc.sock"},
 		{name: "local_unix_to_unix", dir: engine.ForwardLocal, raw: "/tmp/a.sock:/var/run/b.sock", wantBind: "/tmp/a.sock", wantDst: "/var/run/b.sock"},
 		{name: "dynamic_port_only", dir: engine.ForwardDynamic, raw: "1080", wantBind: "127.0.0.1:1080", wantDst: ""},
 		{name: "dynamic_ipv6", dir: engine.ForwardDynamic, raw: "[::1]:1080", wantBind: "[::1]:1080", wantDst: ""},
@@ -198,5 +201,101 @@ func TestRuntime_WithEngineAndReadLocalInputFailClosed(t *testing.T) {
 	}
 	if _, err := clikit.ReadBounded(strings.NewReader("123456"), 4); !errors.Is(err, engine.ErrLimitExceeded) {
 		t.Fatalf("超出上限读取应返回 ErrLimitExceeded，实际=%v", err)
+	}
+}
+
+func TestBuildLaunchProfile_MatrixAndValidation(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	optEmpty, err := clikit.BuildOptionalLaunchProfile(algebraic.None[execution.LaunchDialect](), execution.InterpreterInvalid, execution.LoginModeUnset)
+	if err != nil || optEmpty.IsSome() {
+		t.Fatalf("全空参数应返回 None: opt=%v err=%v", optEmpty, err)
+	}
+
+	noneD := algebraic.None[execution.LaunchDialect]()
+	someD := algebraic.Some[execution.LaunchDialect]
+	validCases := []struct {
+		name      string
+		dialect   algebraic.Option[execution.LaunchDialect]
+		interp    execution.Interpreter
+		login     execution.LoginMode
+		wantDial  execution.LaunchDialect
+		wantInter execution.Interpreter
+		wantLogin execution.LoginMode
+	}{
+		{"default", noneD, execution.InterpreterInvalid, execution.LoginModeUnset, execution.DialectUnknown, execution.InterpreterServer, execution.LoginModeInherit},
+		{"powershell_only", someD(execution.DialectPowerShell), execution.InterpreterInvalid, execution.LoginModeUnset, execution.DialectPowerShell, execution.InterpreterPowerShell, execution.LoginModeDisabled},
+		{"cmd_only", someD(execution.DialectCmd), execution.InterpreterInvalid, execution.LoginModeUnset, execution.DialectCmd, execution.InterpreterCmd, execution.LoginModeDisabled},
+		{"raw_only", someD(execution.DialectRaw), execution.InterpreterInvalid, execution.LoginModeUnset, execution.DialectRaw, execution.InterpreterServer, execution.LoginModeInherit},
+		{"server_interp", noneD, execution.InterpreterServer, execution.LoginModeUnset, execution.DialectUnknown, execution.InterpreterServer, execution.LoginModeInherit},
+		{"pwsh_interp", noneD, execution.InterpreterPwsh, execution.LoginModeUnset, execution.DialectPowerShell, execution.InterpreterPwsh, execution.LoginModeDisabled},
+		{"login_only", noneD, execution.InterpreterInvalid, execution.LoginModeLogin, execution.DialectPOSIX, execution.InterpreterBash, execution.LoginModeLogin},
+		{"bash_login", someD(execution.DialectPOSIX), execution.InterpreterBash, execution.LoginModeLogin, execution.DialectPOSIX, execution.InterpreterBash, execution.LoginModeLogin},
+	}
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := clikit.BuildLaunchProfile(tc.dialect, tc.interp, tc.login)
+			if err != nil {
+				t.Fatalf("BuildLaunchProfile(%v,%v,%v) 失败: %v", tc.dialect, tc.interp, tc.login, err)
+			}
+			if p.Dialect() != tc.wantDial || p.Interpreter() != tc.wantInter || p.LoginMode() != tc.wantLogin {
+				t.Fatalf("组合不符: got=(%v,%v,%v) want=(%v,%v,%v)",
+					p.Dialect(), p.Interpreter(), p.LoginMode(), tc.wantDial, tc.wantInter, tc.wantLogin)
+			}
+		})
+	}
+
+	invalidCases := []struct {
+		dialect algebraic.Option[execution.LaunchDialect]
+		interp  execution.Interpreter
+		login   execution.LoginMode
+	}{
+		{someD(execution.DialectPOSIX), execution.InterpreterSH, execution.LoginModeLogin},
+		{someD(execution.DialectRaw), execution.InterpreterPwsh, execution.LoginModeUnset},
+		{noneD, execution.InterpreterServer, execution.LoginModeDisabled},
+		{someD(execution.DialectCmd), execution.InterpreterBash, execution.LoginModeUnset},
+	}
+	for _, bad := range invalidCases {
+		if _, err := clikit.BuildLaunchProfile(bad.dialect, bad.interp, bad.login); !errors.Is(err, clikit.ErrUsage) {
+			t.Fatalf("非法组合 %+v 应返回 ErrUsage，实际=%v", bad, err)
+		}
+	}
+}
+
+func TestParseOctalPermBounds(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	for _, okPerm := range []string{"0001", "0644", "0755", "0777"} {
+		if _, err := clikit.ParseOctalPerm("--perm", okPerm); err != nil {
+			t.Fatalf("合法权限 %q 不应失败: %v", okPerm, err)
+		}
+	}
+	for _, badPerm := range []string{"0", "0000", "01000", "04755", "07777", "999", ""} {
+		if _, err := clikit.ParseOctalPerm("--perm", badPerm); !errors.Is(err, clikit.ErrUsage) {
+			t.Fatalf("越界/非法权限 %q 应返回 ErrUsage，实际=%v", badPerm, err)
+		}
+	}
+}
+
+func TestParseLongFlagNameAndJSONPreservation(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	if n, v, hasEq, isLong := clikit.ParseLongFlagName("--foo=bar"); !isLong || !hasEq || n != "foo" || v != "bar" {
+		t.Fatalf("ParseLongFlagName(--foo=bar) 异常: %q %q %v %v", n, v, hasEq, isLong)
+	}
+	for _, nonLong := range []string{"foo", "foo=bar", "-f", "-", "--", "--=v"} {
+		if _, _, _, isLong := clikit.ParseLongFlagName(nonLong); isLong {
+			t.Fatalf("%q 不应被视为长选项", nonLong)
+		}
+	}
+	if !clikit.HasJSONFlag([]string{"--json=false", "--json=true"}) || clikit.HasJSONFlag([]string{"--json", "--json=false"}) {
+		t.Fatalf("HasJSONFlag 末次覆盖语义异常")
+	}
+	if clikit.HasJSONFlag([]string{"--", "--json"}) {
+		t.Fatalf("HasJSONFlag 不得扫描 `--` 之后的参数")
+	}
+	cf, _, err := clikit.ParseGlobalPrefix([]string{"--json", "--policy", "invalid", "ssh", "web"})
+	if !errors.Is(err, clikit.ErrUsage) || !cf.JSON {
+		t.Fatalf("全局前缀报错时必须保留已解析的 --json 标志: cf=%+v err=%v", cf, err)
 	}
 }

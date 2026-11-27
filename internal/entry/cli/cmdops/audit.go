@@ -27,7 +27,7 @@ func RunAudit(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	case "inspect":
 		return runAuditInspect(ctx, rt, args[1:])
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: 未知 audit 子命令 %q", clikit.ErrUsage, args[0]))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args[1:])), fmt.Errorf("%w: 未知 audit 子命令 %q", clikit.ErrUsage, args[0]))
 	}
 }
 
@@ -37,7 +37,7 @@ func runAuditReconcile(ctx context.Context, rt *clikit.Runtime, args []string) i
 	for cur.HasNext() {
 		if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &common); err != nil || consumed {
 			if err != nil {
-				return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 			}
 			continue
 		}
@@ -46,7 +46,7 @@ func runAuditReconcile(ctx context.Context, rt *clikit.Runtime, args []string) i
 			common.ShowHelp = true
 			break
 		}
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: audit reconcile 未知参数 %q", clikit.ErrUsage, tok))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), fmt.Errorf("%w: audit reconcile 未知参数 %q", clikit.ErrUsage, tok))
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, AuditHelpText())
@@ -77,7 +77,7 @@ func runAuditQuery(ctx context.Context, rt *clikit.Runtime, sub string, args []s
 	for cur.HasNext() {
 		if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &common); err != nil || consumed {
 			if err != nil {
-				return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 			}
 			continue
 		}
@@ -87,7 +87,7 @@ func runAuditQuery(ctx context.Context, rt *clikit.Runtime, sub string, args []s
 			break
 		}
 		if err := parseAuditQueryFlag(cur, tok, sub, &req); err != nil {
-			return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+			return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 		}
 	}
 	if common.ShowHelp {
@@ -99,7 +99,10 @@ func runAuditQuery(ctx context.Context, rt *clikit.Runtime, sub string, args []s
 }
 
 func parseAuditQueryFlag(cur *clikit.FlagCursor, rawTok, sub string, req *clikit.AuditQueryRequest) error {
-	name, inlineVal, hasEq := clikit.SplitLongFlag(rawTok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(rawTok)
+	if !isLong {
+		return fmt.Errorf("%w: audit %s 未知参数 %q", clikit.ErrUsage, sub, rawTok)
+	}
 	val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 	if err != nil {
 		return err
@@ -109,9 +112,9 @@ func parseAuditQueryFlag(cur *clikit.FlagCursor, rawTok, sub string, req *clikit
 		req.Limit, err = clikit.ParsePositiveInt("--limit", val)
 		return err
 	case "phase":
-		req.Phase = strings.ToLower(strings.TrimSpace(val))
+		return setValidatedAuditPhase(&req.Phase, val)
 	case "outcome":
-		req.Outcome = strings.ToLower(strings.TrimSpace(val))
+		return setValidatedAuditOutcome(&req.Outcome, val)
 	case "node":
 		req.NodeID = strings.TrimSpace(val)
 	case "op-id":
@@ -132,6 +135,28 @@ func parseAuditQueryFlag(cur *clikit.FlagCursor, rawTok, sub string, req *clikit
 	return nil
 }
 
+func setValidatedAuditPhase(dst *string, raw string) error {
+	p := strings.ToLower(strings.TrimSpace(raw))
+	switch p {
+	case "denied", "authorized", "finalized":
+		*dst = p
+		return nil
+	default:
+		return fmt.Errorf("%w: --phase 必须为 denied|authorized|finalized，实际=%q", clikit.ErrUsage, raw)
+	}
+}
+
+func setValidatedAuditOutcome(dst *string, raw string) error {
+	o := strings.ToLower(strings.TrimSpace(raw))
+	switch o {
+	case "pending", "denied", "succeeded", "failed", "canceled", "escalated", "aborted_by_crash", "outcome_unknown":
+		*dst = o
+		return nil
+	default:
+		return fmt.Errorf("%w: --outcome 非法，实际=%q", clikit.ErrUsage, raw)
+	}
+}
+
 func runAuditInspect(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	var common clikit.CommonFlags
 	var pos []string
@@ -139,7 +164,7 @@ func runAuditInspect(ctx context.Context, rt *clikit.Runtime, args []string) int
 	for cur.HasNext() {
 		if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &common); err != nil || consumed {
 			if err != nil {
-				return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 			}
 			continue
 		}
@@ -149,7 +174,7 @@ func runAuditInspect(ctx context.Context, rt *clikit.Runtime, args []string) int
 			break
 		}
 		if strings.HasPrefix(tok, "-") && tok != "-" {
-			return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: audit inspect 未知选项 %q", clikit.ErrUsage, tok))
+			return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), fmt.Errorf("%w: audit inspect 未知选项 %q", clikit.ErrUsage, tok))
 		}
 		pos = append(pos, tok)
 	}

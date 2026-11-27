@@ -27,6 +27,7 @@ type sftpArgs struct {
 	prune          bool
 	maxBytes       int64
 	perm           algebraic.Option[fs.FileMode]
+	localRoot      algebraic.Option[pathalg.LocalDir]
 	filePath       string
 	symlinkPolicy  pathalg.SymlinkPolicy
 	oldText        string
@@ -42,7 +43,7 @@ func RunSFTP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	}
 	parsed, err := parseSFTPArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, SFTPHelpText())
@@ -63,6 +64,9 @@ func RunSFTP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 }
 
 func runSFTPInteractive(ctx context.Context, rt *clikit.Runtime, parsed sftpArgs, jsonOut bool) int {
+	if jsonOut {
+		return rt.Fail(clikit.ExitUsage, true, fmt.Errorf("%w: 交互式 SFTP Shell 不支持 --json 输出，请使用单步 sftp 子命令", clikit.ErrUsage))
+	}
 	if len(parsed.pos) != 1 || strings.TrimSpace(parsed.pos[0]) == "" {
 		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 交互式 sftp 需要恰好 1 个目标主机参数", clikit.ErrUsage))
 	}
@@ -156,6 +160,9 @@ func parseSFTPShortCluster(cur *clikit.FlagCursor, cluster string, out *sftpArgs
 	rest := cluster[1:]
 	switch ch {
 	case 'h':
+		if rest != "" {
+			return fmt.Errorf("%w: sftp 未知短选项 -%s", clikit.ErrUsage, cluster)
+		}
 		out.common.ShowHelp = true
 		return nil
 	case 'P':
@@ -235,6 +242,17 @@ func parseSFTPValueFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq bo
 			out.perm = algebraic.Some(mode)
 		}
 		return err
+	case "local-root":
+		raw, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
+		if err != nil {
+			return err
+		}
+		d, err := pathalg.ParseLocalDir(raw)
+		if err != nil {
+			return fmt.Errorf("%w: --local-root 非法: %w", clikit.ErrUsage, err)
+		}
+		out.localRoot = algebraic.Some(d)
+		return nil
 	case "file":
 		raw, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 		out.filePath = raw

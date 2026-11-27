@@ -29,7 +29,7 @@ func RunTunnel(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	}
 	parsed, err := parseTunnelArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, TunnelHelpText())
@@ -37,7 +37,7 @@ func RunTunnel(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
 	initOpts := rt.EffectiveInitOptions(parsed.common.ConfigFile, parsed.common.Policy)
-	return rt.WithEngine(ctx, initOpts, clikit.ExitSSHError, jsonOut, func(runner clikit.SessionRunner) int {
+	return rt.WithEngine(ctx, initOpts, clikit.ExitSSHError, jsonOut, func(runner clikit.SessionRunner) (exitCode int) {
 		client, err := requireSSHClient(runner)
 		if err != nil {
 			return rt.Fail(clikit.ExitSSHError, jsonOut, err)
@@ -49,10 +49,10 @@ func RunTunnel(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		if err != nil {
 			return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 		}
-		defer func() { _ = stopForwards(ctx, client, infos) }()
+		defer func() { reportCleanupError(rt, stopForwards(ctx, client, infos), &exitCode) }()
 		announceActiveSession(rt, jsonOut, parsed.target, infos, nil)
 		if err := waitForwards(ctx, infos, nil); err != nil {
-			return rt.Fail(clikit.ExitSSHError, jsonOut, err)
+			return failAfterAnnounce(rt, jsonOut, err)
 		}
 		return clikit.ExitOK
 	})
@@ -133,6 +133,9 @@ func parseTunnelShortCluster(cur *clikit.FlagCursor, cluster string, out *tunnel
 	}
 	switch ch {
 	case 'h':
+		if rest != "" {
+			return fmt.Errorf("%w: tunnel 未知短选项 -%s", clikit.ErrUsage, cluster)
+		}
 		out.common.ShowHelp = true
 		return nil
 	case 'L', 'R', 'D', 'w':

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
+	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -11,10 +13,13 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/playbook"
+	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
 )
+
+const defaultNodeStreamBuffer = 128
 
 func runBatchExec(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed execArgs, cmdPlan execution.CommandPlan, jsonOut bool) int {
 	client, err := requireAutomationClient(runner)
@@ -41,8 +46,8 @@ func runBatchExec(ctx context.Context, rt *clikit.Runtime, runner clikit.Session
 		OutputDir:      parsed.outputDir,
 		FailFast:       parsed.failFast,
 	}
-	rep, runErr := executeBatchWithOptionalStream(ctx, rt, client, req, parsed.stream && !jsonOut)
-	return renderBatchExecResult(rt, rep, runErr, jsonOut, parsed.stream)
+	rep, runErr, streamed := executeBatchWithOptionalStream(ctx, rt, client, req, parsed.stream && !jsonOut)
+	return renderBatchExecResult(rt, rep, runErr, jsonOut, streamed)
 }
 
 func resolveBatchTargets(ctx context.Context, client clikit.AutomationClient, specs []string, cliOpts option.OptionLayer) ([]engine.ResolvedTarget, error) {
@@ -77,35 +82,69 @@ func buildBatchSelector(parsed execArgs) (algebraic.Option[playbook.TargetSelect
 	return algebraic.Some(sel), nil
 }
 
-// executeBatchWithOptionalStream 在开启 --stream 时创建隔离的 OperationStream，
-// 并使用 core/conc.RunWait 并行排空实时事件流，确保 EOF 后确定性收敛且零协程泄漏。
-func executeBatchWithOptionalStream(ctx context.Context, rt *clikit.Runtime, client clikit.AutomationClient, req engine.BatchExecRequest, stream bool) (engine.BatchExecReport, error) {
+// executeBatchWithOptionalStream 在开启 --stream 时通过 req.NodeStreamFactory 为每个节点创建隔离的
+// OperationStream（对齐 core/internal/usecase/automation/batch_exec.go 实时分块输出契约），
+// 并使用 core/conc.RunWait + 互斥写锁并发排空节点流，确保无竞态、无静默回退与零协程泄漏。
+func executeBatchWithOptionalStream(
+	ctx context.Context,
+	rt *clikit.Runtime,
+	client clikit.AutomationClient,
+	req engine.BatchExecRequest,
+	stream bool,
+) (engine.BatchExecReport, error, bool) {
 	if !stream {
-		return client.BatchExec(ctx, req)
+		rep, err := client.BatchExec(ctx, req)
+		return rep, err, false
 	}
-	opStream, err := client.NewOperationStream(ctx, 128)
-	if err != nil {
-		return client.BatchExec(ctx, req)
-	}
-	req.OperationStream = opStream
 	var rep engine.BatchExecReport
 	var batchErr error
-	_ = conc.RunWait(ctx, func(waitCtx context.Context, n *conc.Nursery) error {
-		if err := n.Go(func(c context.Context) error {
-			drainStreamOutput(c, opStream, rt.Stdout, rt.Stderr)
-			return nil
-		}); err != nil {
-			opStream.Close()
-			return err
-		}
+	var outMu sync.Mutex
+	var streamedChunks atomic.Bool
+	waitErr := conc.RunWait(ctx, func(waitCtx context.Context, n *conc.Nursery) error {
+		req.NodeStreamFactory = newNodeStreamFactory(n, &outMu, rt.Stdout, rt.Stderr, &streamedChunks)
 		rep, batchErr = client.BatchExec(waitCtx, req)
-		opStream.Close()
 		return nil
 	})
-	return rep, batchErr
+	if batchErr == nil && waitErr != nil {
+		batchErr = waitErr
+	}
+	return rep, batchErr, streamedChunks.Load()
 }
 
-func drainStreamOutput(ctx context.Context, stream *events.OperationStream, stdout, stderr io.Writer) {
+func newNodeStreamFactory(
+	n *conc.Nursery,
+	outMu *sync.Mutex,
+	stdout, stderr io.Writer,
+	streamedChunks *atomic.Bool,
+) engine.NodeStreamFactory {
+	return func(nodeID inventory.NodeID, traceID security.TraceID, opID security.OperationID) (*events.OperationStream, error) {
+		st, err := events.NewOperationStream(events.OperationStreamConfig{
+			TraceID:         traceID,
+			OperationID:     opID,
+			OperationBuffer: defaultNodeStreamBuffer,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if gErr := n.Go(func(c context.Context) error {
+			drainStreamOutput(c, st, nodeID, outMu, stdout, stderr, streamedChunks)
+			return nil
+		}); gErr != nil {
+			st.Close()
+			return nil, gErr
+		}
+		return st, nil
+	}
+}
+
+func drainStreamOutput(
+	ctx context.Context,
+	stream *events.OperationStream,
+	fallbackNode inventory.NodeID,
+	outMu *sync.Mutex,
+	stdout, stderr io.Writer,
+	streamedChunks *atomic.Bool,
+) {
 	for {
 		ev, ok, err := stream.Next(ctx)
 		if err != nil || !ok {
@@ -115,16 +154,30 @@ func drainStreamOutput(ctx context.Context, stream *events.OperationStream, stdo
 		if !isChunk || !chunk.IsValid() {
 			continue
 		}
+		streamedChunks.Store(true)
 		w := stdout
 		if chunk.Stream() == events.OutputStreamStderr {
 			w = stderr
 		}
+		label := fallbackNode
 		if nodeID, hasNode := chunk.Meta().NodeID().Get(); hasNode && nodeID.IsValid() {
-			_, _ = fmt.Fprintf(w, "[%s] %s", nodeID, string(chunk.Data()))
+			label = nodeID
+		}
+		outMu.Lock()
+		if label.IsValid() {
+			_, _ = fmt.Fprintf(w, "[%s] %s", label, string(chunk.Data()))
 		} else {
 			_, _ = w.Write(chunk.Data())
 		}
+		outMu.Unlock()
 	}
+}
+
+type batchExecJSONEnvelope struct {
+	OK        bool                   `json:"ok"`
+	Error     string                 `json:"error,omitzero"`
+	ErrorCode string                 `json:"error_code,omitzero"`
+	Report    engine.BatchExecReport `json:"report"`
 }
 
 func renderBatchExecResult(rt *clikit.Runtime, rep engine.BatchExecReport, runErr error, jsonOut, streamed bool) int {
@@ -136,7 +189,12 @@ func renderBatchExecResult(rt *clikit.Runtime, rep engine.BatchExecReport, runEr
 		code = clikit.ExitGeneral
 	}
 	if jsonOut {
-		if err := clikit.WriteJSON(rt.Stdout, rep); err != nil {
+		env := batchExecJSONEnvelope{OK: code == clikit.ExitOK, Report: rep}
+		if runErr != nil {
+			env.Error = runErr.Error()
+			env.ErrorCode = clikit.ClassifyErrorCode(runErr)
+		}
+		if err := clikit.WriteJSON(rt.Stdout, env); err != nil {
 			rt.WriteErr("marshal json failed: " + err.Error())
 			return clikit.ExitGeneral
 		}
@@ -147,13 +205,20 @@ func renderBatchExecResult(rt *clikit.Runtime, rep engine.BatchExecReport, runEr
 	}
 	_, _ = fmt.Fprintf(rt.Stdout, "summary: succeeded=%d failed=%d unknown=%d not_started=%d duration=%s\n",
 		rep.SucceededCount(), rep.FailedCount(), rep.UnknownCount(), rep.NotStartedCount(), rep.Duration())
+	if runErr != nil {
+		rt.WriteErr(runErr.Error())
+	}
 	return code
 }
 
 func writeBatchNodeResult(rt *clikit.Runtime, nr engine.BatchNodeResult, streamed bool) {
 	status := "ok"
 	if !nr.Succeeded() {
-		status = nr.Outcome().Kind().String()
+		if nr.Outcome() != nil {
+			status = nr.Outcome().Kind().String()
+		} else {
+			status = "failed"
+		}
 	}
 	_, _ = fmt.Fprintf(rt.Stdout, "== %s [%s] (%s) ==\n", nr.NodeID(), status, nr.Duration())
 	if !streamed && len(nr.Stdout()) > 0 {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
+	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
@@ -41,6 +42,9 @@ func TestParseSSHArgs_ExtendedOpenSSHFlags(t *testing.T) {
 	}
 	if len(parsed.Forwards) != 4 || parsed.MasterCount != 2 || parsed.ControlSocket != "/tmp/mux.sock" {
 		t.Fatalf("扩展标志解析失配: fwds=%d master=%d sock=%q", len(parsed.Forwards), parsed.MasterCount, parsed.ControlSocket)
+	}
+	if master := parsed.CLIOptions.Control().Master(); master != option.ControlMasterAsk {
+		t.Fatalf("-MM 必须折叠为 ControlMaster=ask，实际=%v", master)
 	}
 	if !parsed.NoCommand || !parsed.Background || !parsed.JSON || parsed.Policy != engine.PolicyProfileStrictOperator {
 		t.Fatalf("标志状态失配: N=%v f=%v json=%v policy=%v", parsed.NoCommand, parsed.Background, parsed.JSON, parsed.Policy)
@@ -189,26 +193,32 @@ func TestApp_ExecSinglePrivilegedAndBatchStream(t *testing.T) {
 		t.Fatalf("提权方式不符: %v", hPriv.eng.lastPrivReq.Privilege.Method())
 	}
 
-	// 3) 批量 exec --nodes + --stream（验证 OperationStream 实时消费且 0 goroutine 泄漏）。
+	// 3) 批量 exec --nodes + --stream（严格经真实 NodeStreamFactory 实时消费分块输出且 0 goroutine 泄漏）。
 	hBatch := newFullAppHarness(t, nil, nil)
 	hBatch.eng.batchExecFn = func(ctx context.Context, req engine.BatchExecRequest) (rep engine.BatchExecReport, err error) {
-		if req.OperationStream != nil {
-			tr, _ := security.ParseTraceID("0123456789abcdef0123456789abcdef")
-			op, _ := security.ParseOperationID("fedcba9876543210")
-			nid, _ := inventory.ParseNodeID("web-1")
-			meta, _ := events.NewEventMeta(events.EventMetaSpec{
-				TraceID: tr, OperationID: algebraic.Some(op), NodeID: algebraic.Some(nid), OccurredAt: time.Unix(1700000000, 0).UTC(), Seq: 1,
-			})
-			evOut, _ := events.NewOutputChunkEvent(events.OutputChunkSpec{
-				Meta: meta, Stream: events.OutputStreamStdout, ChunkIndex: 0, Data: []byte("stream-line\n"),
-			})
-			evErr, _ := events.NewOutputChunkEvent(events.OutputChunkSpec{
-				Meta: meta, Stream: events.OutputStreamStderr, ChunkIndex: 1, Data: []byte("warn-line\n"),
-			})
-			_ = req.OperationStream.Emit(ctx, evOut)
-			_ = req.OperationStream.Emit(ctx, evErr)
-			req.OperationStream.Close()
+		if req.NodeStreamFactory == nil {
+			t.Errorf("--stream 模式下必须注入 req.NodeStreamFactory")
+			return rep, errors.New("missing NodeStreamFactory")
 		}
+		tr, _ := security.ParseTraceID("0123456789abcdef0123456789abcdef")
+		op, _ := security.ParseOperationID("fedcba9876543210")
+		nid, _ := inventory.ParseNodeID("web-1")
+		nodeStream, sErr := req.NodeStreamFactory(nid, tr, op)
+		if sErr != nil {
+			return rep, sErr
+		}
+		defer nodeStream.Close()
+		meta, _ := events.NewEventMeta(events.EventMetaSpec{
+			TraceID: tr, OperationID: algebraic.Some(op), NodeID: algebraic.Some(nid), OccurredAt: time.Unix(1700000000, 0).UTC(), Seq: 1,
+		})
+		evOut, _ := events.NewOutputChunkEvent(events.OutputChunkSpec{
+			Meta: meta, Stream: events.OutputStreamStdout, ChunkIndex: 0, Data: []byte("stream-line\n"),
+		})
+		evErr, _ := events.NewOutputChunkEvent(events.OutputChunkSpec{
+			Meta: meta, Stream: events.OutputStreamStderr, ChunkIndex: 1, Data: []byte("warn-line\n"),
+		})
+		_ = nodeStream.Emit(ctx, evOut)
+		_ = nodeStream.Emit(ctx, evErr)
 		return rep, errors.New("stub-report")
 	}
 	_ = hBatch.app.Run(context.Background(), []string{
@@ -297,7 +307,7 @@ func TestApp_SCPAndSFTPCommands(t *testing.T) {
 	if code := hUp.app.Run(context.Background(), []string{"scp", "/tmp/a", "/tmp/b"}); code != 2 {
 		t.Fatalf("本地到本地 scp 应返回退出码 2，实际=%d", code)
 	}
-	if code := hUp.app.Run(context.Background(), []string{"scp", "a:/tmp/x", "b:/tmp/y"}); code != 2 {
+	if code := hUp.app.Run(context.Background(), []string{"scp", "hostA:/tmp/x", "hostB:/tmp/y"}); code != 2 {
 		t.Fatalf("远端到远端 scp 应返回退出码 2，实际=%d", code)
 	}
 

@@ -32,7 +32,7 @@ type doctorAggregateView struct {
 func RunDoctor(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseDoctorArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, DoctorHelpText())
@@ -152,7 +152,10 @@ func parseDoctorToken(cur *clikit.FlagCursor, out *doctorArgs) error {
 }
 
 func applyDoctorLongFlag(cur *clikit.FlagCursor, rawTok string, out *doctorArgs) error {
-	name, inlineVal, hasEq := clikit.SplitLongFlag(rawTok)
+	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(rawTok)
+	if !isLong {
+		return fmt.Errorf("%w: doctor 未知参数 %q", clikit.ErrUsage, rawTok)
+	}
 	switch name {
 	case "scope":
 		val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)

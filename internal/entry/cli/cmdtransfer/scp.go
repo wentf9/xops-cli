@@ -69,7 +69,7 @@ type scpDownloadView struct {
 func RunSCP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseSCPArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, SCPHelpText())
@@ -95,7 +95,7 @@ func RunSCP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 }
 
 func runSCPUpload(ctx context.Context, rt *clikit.Runtime, client clikit.TransferClient, parsed scpArgs, localRaw, targetHost, remoteRaw string, jsonOut bool) int {
-	srcSpec, err := buildUploadSource(parsed, localRaw)
+	srcSpec, err := buildUploadSource(rt, parsed, localRaw)
 	if err != nil {
 		return rt.Fail(clikit.ExitUsage, jsonOut, err)
 	}
@@ -145,6 +145,9 @@ func runSCPUpload(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 }
 
 func runSCPDownload(ctx context.Context, rt *clikit.Runtime, client clikit.TransferClient, parsed scpArgs, targetHost, remoteRaw, localRaw string, jsonOut bool) int {
+	if parsed.symlinkPolicy == pathalg.SymlinkFollowOperatorSource {
+		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: scp 下载仅允许 --symlink-policy=reject 或 contained_relative", clikit.ErrUsage))
+	}
 	remotePath, err := pathalg.ParseRemotePath(remoteRaw)
 	if err != nil {
 		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 远端源路径 %q 非法: %w", clikit.ErrUsage, remoteRaw, err))
@@ -194,11 +197,23 @@ func runSCPDownload(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 	})
 }
 
-func buildUploadSource(parsed scpArgs, localRaw string) (src engine.LocalUploadSource, err error) {
+func buildUploadSource(rt *clikit.Runtime, parsed scpArgs, localRaw string) (src engine.LocalUploadSource, err error) {
+	if parsed.recursive && parsed.symlinkPolicy != pathalg.SymlinkReject {
+		return src, fmt.Errorf("%w: 递归目录上传（-r）仅允许 --symlink-policy=reject", clikit.ErrUsage)
+	}
 	if root, ok := parsed.localRoot.Get(); ok {
-		rel, pErr := pathalg.ParseLocalRootedDest(localRaw)
+		rel, pErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(localRaw))
 		if pErr != nil {
 			return src, fmt.Errorf("%w: --local-root 模式下本地源必须为沙箱相对路径: %w", clikit.ErrUsage, pErr)
+		}
+		return engine.NewScopedUploadSource(root, rel)
+	}
+	// 对齐 core/internal/usecase/transfer/scp_upload.go:validateRecursiveUploadParams：
+	// 递归目录上传强制使用 ScopedRootFS 沙箱源，未显式指定 --local-root 时自动解析父目录为沙箱根。
+	if parsed.recursive {
+		root, rel, rErr := resolveScopedRecursiveUploadSource(rt, localRaw)
+		if rErr != nil {
+			return src, rErr
 		}
 		return engine.NewScopedUploadSource(root, rel)
 	}
@@ -207,6 +222,53 @@ func buildUploadSource(parsed scpArgs, localRaw string) (src engine.LocalUploadS
 		return src, fmt.Errorf("%w: 本地源路径 %q 非法: %w", clikit.ErrUsage, localRaw, pErr)
 	}
 	return engine.NewOperatorUploadSource(srcPath, parsed.symlinkPolicy)
+}
+
+func resolveScopedRecursiveUploadSource(rt *clikit.Runtime, localRaw string) (root pathalg.LocalDir, rel pathalg.LocalRootedDest, err error) {
+	trimmed := strings.TrimSpace(localRaw)
+	if trimmed == "." || trimmed == "./" {
+		wd, wErr := resolveWorkDirOrDot(rt)
+		if wErr != nil {
+			return root, rel, wErr
+		}
+		wdSrc, pErr := pathalg.ParseLocalSourcePath(wd.String())
+		if pErr != nil || !wdSrc.IsAbs() {
+			return root, rel, fmt.Errorf("%w: 递归上传当前目录 '.' 需要绝对工作目录或显式指定 --local-root 与相对路径", clikit.ErrUsage)
+		}
+		d, dErr := pathalg.ParseLocalRootedDest(wdSrc.Base())
+		if dErr != nil {
+			return root, rel, fmt.Errorf("%w: 无法从工作目录推导沙箱相对名: %w", clikit.ErrUsage, dErr)
+		}
+		return wdSrc.Dir(), d, nil
+	}
+	srcPath, pErr := pathalg.ParseLocalSourcePath(trimmed)
+	if pErr != nil {
+		return root, rel, fmt.Errorf("%w: 本地递归源路径 %q 非法: %w", clikit.ErrUsage, localRaw, pErr)
+	}
+	if srcPath.IsAbs() {
+		d, dErr := pathalg.ParseLocalRootedDest(srcPath.Base())
+		if dErr != nil {
+			return root, rel, fmt.Errorf("%w: 本地递归源目录名 %q 非法: %w", clikit.ErrUsage, srcPath.Base(), dErr)
+		}
+		return srcPath.Dir(), d, nil
+	}
+	wd, wErr := resolveWorkDirOrDot(rt)
+	if wErr != nil {
+		return root, rel, wErr
+	}
+	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(srcPath.String()))
+	if dErr != nil {
+		return root, rel, fmt.Errorf("%w: 本地递归相对路径 %q 非法: %w", clikit.ErrUsage, localRaw, dErr)
+	}
+	return wd, d, nil
+}
+
+func normalizeLocalRootedRel(raw string) string {
+	s := strings.ReplaceAll(strings.TrimSpace(raw), `\`, "/")
+	for strings.HasPrefix(s, "./") {
+		s = strings.TrimPrefix(s, "./")
+	}
+	return strings.TrimSuffix(s, "/")
 }
 
 func resolveDownloadTarget(rt *clikit.Runtime, rootOpt algebraic.Option[pathalg.LocalDir], localRaw string, remotePath pathalg.RemotePath) (root pathalg.LocalDir, dest pathalg.LocalRootedDest, err error) {
@@ -236,7 +298,7 @@ func resolveDownloadTarget(rt *clikit.Runtime, rootOpt algebraic.Option[pathalg.
 	if wErr != nil {
 		return root, dest, wErr
 	}
-	d, dErr := pathalg.ParseLocalRootedDest(src.String())
+	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(src.String()))
 	if dErr != nil {
 		return root, dest, fmt.Errorf("%w: 本地相对路径 %q 非法: %w", clikit.ErrUsage, src.String(), dErr)
 	}
@@ -248,7 +310,7 @@ func resolveRootedDownload(fixedRoot pathalg.LocalDir, localRaw string, remotePa
 	if rErr != nil {
 		return root, dest, rErr
 	}
-	d, dErr := pathalg.ParseLocalRootedDest(relRaw)
+	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(relRaw))
 	if dErr != nil {
 		return root, dest, fmt.Errorf("%w: 本地目标相对路径 %q 非法: %w", clikit.ErrUsage, localRaw, dErr)
 	}

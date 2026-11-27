@@ -2,8 +2,10 @@ package cmdtransfer
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -106,12 +108,22 @@ func runSFTPRead(ctx context.Context, rt *clikit.Runtime, client clikit.Transfer
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 	}
 	type readView struct {
-		OK      bool                  `json:"ok"`
-		Stat    engine.RemoteFileStat `json:"stat"`
-		Digest  security.Digest       `json:"digest"`
-		Content string                `json:"content"`
+		OK            bool                  `json:"ok"`
+		Stat          engine.RemoteFileStat `json:"stat"`
+		Digest        security.Digest       `json:"digest"`
+		Encoding      string                `json:"encoding"`
+		Content       string                `json:"content,omitzero"`
+		ContentBase64 string                `json:"content_base64,omitzero"`
 	}
-	return rt.WriteResult(jsonOut, readView{OK: true, Stat: res.Stat, Digest: res.Digest, Content: string(res.Content)}, func(w io.Writer) {
+	v := readView{OK: true, Stat: res.Stat, Digest: res.Digest}
+	if utf8.Valid(res.Content) {
+		v.Encoding = "utf-8"
+		v.Content = string(res.Content)
+	} else {
+		v.Encoding = "base64"
+		v.ContentBase64 = base64.StdEncoding.EncodeToString(res.Content)
+	}
+	return rt.WriteResult(jsonOut, v, func(w io.Writer) {
 		_, _ = w.Write(res.Content)
 	})
 }
@@ -296,31 +308,7 @@ func runSFTPChmod(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 
 func runSFTPRecover(ctx context.Context, rt *clikit.Runtime, client clikit.TransferClient, parsed sftpArgs, jsonOut bool) int {
 	if len(parsed.pos) == 0 {
-		res, err := client.RecoverAllTransfers(ctx, engine.RecoverAllTransfersRequest{PruneSuperseded: parsed.prune})
-		if err != nil {
-			return rt.Fail(clikit.ExitGeneral, jsonOut, err)
-		}
-		type recEntryView struct {
-			TransferID      security.OperationID `json:"transfer_id"`
-			SelectedGen     uint64               `json:"selected_generation"`
-			UncertainCommit bool                 `json:"uncertain_commit,omitzero"`
-			Error           string               `json:"error,omitzero"`
-		}
-		type recAllView struct {
-			OK      bool           `json:"ok"`
-			Entries []recEntryView `json:"entries"`
-		}
-		v := recAllView{OK: true}
-		for _, e := range res.Entries {
-			item := recEntryView{TransferID: e.TransferID, SelectedGen: e.Result.SelectedGen, UncertainCommit: e.Result.UncertainCommit}
-			if e.Err != nil {
-				item.Error = e.Err.Error()
-			}
-			v.Entries = append(v.Entries, item)
-		}
-		return rt.WriteResult(jsonOut, v, func(w io.Writer) {
-			_, _ = fmt.Fprintf(w, "recovered %d transfer journal(s)\n", len(v.Entries))
-		})
+		return runSFTPRecoverAll(ctx, rt, client, parsed, jsonOut)
 	}
 	if len(parsed.pos) != 2 {
 		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: sftp recover 需要 0 个参数（全量恢复）或 <target> <transfer_id>", clikit.ErrUsage))
@@ -330,9 +318,10 @@ func runSFTPRecover(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: transfer_id %q 非法: %w", clikit.ErrUsage, parsed.pos[1], err))
 	}
 	res, err := client.RecoverTransfer(ctx, engine.RecoverTransferRequest{
-		RemoteCall:      sftpRemoteCall(parsed.pos[0], parsed.cliOpts),
-		TransferID:      tid,
-		PruneSuperseded: parsed.prune,
+		RemoteCall:        sftpRemoteCall(parsed.pos[0], parsed.cliOpts),
+		TransferID:        tid,
+		LocalRootForClean: parsed.localRoot,
+		PruneSuperseded:   parsed.prune,
 	})
 	if err != nil {
 		return rt.Fail(clikit.ExitGeneral, jsonOut, err)
@@ -342,10 +331,78 @@ func runSFTPRecover(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 		TransferID      security.OperationID `json:"transfer_id"`
 		SelectedGen     uint64               `json:"selected_generation"`
 		UncertainCommit bool                 `json:"uncertain_commit,omitzero"`
+		DoNotRetry      bool                 `json:"do_not_retry,omitzero"`
 	}
-	return rt.WriteResult(jsonOut, recOneView{
-		OK: true, TransferID: res.TransferID, SelectedGen: res.SelectedGen, UncertainCommit: res.UncertainCommit,
+	code := clikit.ExitOK
+	if res.UncertainCommit {
+		code = clikit.ExitGeneral
+	}
+	if rt.WriteResult(jsonOut, recOneView{
+		OK: !res.UncertainCommit, TransferID: res.TransferID, SelectedGen: res.SelectedGen,
+		UncertainCommit: res.UncertainCommit, DoNotRetry: res.UncertainCommit,
 	}, func(w io.Writer) {
 		_, _ = fmt.Fprintf(w, "recovered transfer %s (generation=%d uncertain=%v)\n", res.TransferID, res.SelectedGen, res.UncertainCommit)
-	})
+		if res.UncertainCommit {
+			rt.WriteErr(fmt.Sprintf("transfer %s has uncertain commit; inspect remote target before retrying", res.TransferID))
+		}
+	}) != clikit.ExitOK {
+		return clikit.ExitGeneral
+	}
+	return code
+}
+
+func runSFTPRecoverAll(ctx context.Context, rt *clikit.Runtime, client clikit.TransferClient, parsed sftpArgs, jsonOut bool) int {
+	res, err := client.RecoverAllTransfers(ctx, engine.RecoverAllTransfersRequest{PruneSuperseded: parsed.prune})
+	if err != nil {
+		return rt.Fail(clikit.ExitGeneral, jsonOut, err)
+	}
+	type recAllView struct {
+		OK             bool           `json:"ok"`
+		FailedCount    int            `json:"failed_count,omitzero"`
+		UncertainCount int            `json:"uncertain_count,omitzero"`
+		Entries        []recEntryView `json:"entries"`
+	}
+	v := recAllView{OK: true}
+	for _, e := range res.Entries {
+		item := recEntryView{TransferID: e.TransferID, SelectedGen: e.Result.SelectedGen, UncertainCommit: e.Result.UncertainCommit}
+		if e.Err != nil {
+			item.Error = e.Err.Error()
+			v.FailedCount++
+		}
+		if e.Result.UncertainCommit {
+			v.UncertainCount++
+		}
+		v.Entries = append(v.Entries, item)
+	}
+	v.OK = v.FailedCount == 0 && v.UncertainCount == 0
+	code := clikit.ExitOK
+	if !v.OK {
+		code = clikit.ExitGeneral
+	}
+	if rt.WriteResult(jsonOut, v, func(w io.Writer) {
+		writeRecoverAllText(rt, w, v.FailedCount, v.UncertainCount, v.Entries)
+	}) != clikit.ExitOK {
+		return clikit.ExitGeneral
+	}
+	return code
+}
+
+type recEntryView struct {
+	TransferID      security.OperationID `json:"transfer_id"`
+	SelectedGen     uint64               `json:"selected_generation"`
+	UncertainCommit bool                 `json:"uncertain_commit,omitzero"`
+	Error           string               `json:"error,omitzero"`
+}
+
+func writeRecoverAllText(rt *clikit.Runtime, w io.Writer, failedCount, uncertainCount int, entries []recEntryView) {
+	_, _ = fmt.Fprintf(w, "recovered %d transfer journal(s) (failed=%d uncertain=%d)\n", len(entries), failedCount, uncertainCount)
+	for _, item := range entries {
+		_, _ = fmt.Fprintf(w, "  transfer=%s generation=%d uncertain=%v\n", item.TransferID, item.SelectedGen, item.UncertainCommit)
+		if item.Error != "" {
+			rt.WriteErr(fmt.Sprintf("transfer %s recovery error: %s", item.TransferID, item.Error))
+		}
+		if item.UncertainCommit {
+			rt.WriteErr(fmt.Sprintf("transfer %s has uncertain commit; do not blindly retry", item.TransferID))
+		}
+	}
 }

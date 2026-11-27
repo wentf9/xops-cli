@@ -70,6 +70,45 @@ func SplitLongFlag(raw string) (name, val string, hasEq bool) {
 	return body, "", false
 }
 
+// ParseLongFlagName 严格校验 raw 以 `--` 开头且名称非空后拆分 (name, val, hasEq, isLong)；
+// 拒绝把裸位置词或单横线选项误判为长选项。
+func ParseLongFlagName(raw string) (name, val string, hasEq, isLong bool) {
+	if !strings.HasPrefix(raw, "--") || len(raw) <= 2 {
+		return "", "", false, false
+	}
+	name, val, hasEq = SplitLongFlag(raw)
+	if name == "" {
+		return "", "", false, false
+	}
+	return name, val, hasEq, true
+}
+
+// HasJSONFlag 预扫描参数（遇到 `--` 即止）判断是否声明了 `--json`（兼容 `--json=true/false` 末次生效），
+// 确保任何子命令在参数语法报错时仍能稳定输出规范 JSON ErrorEnvelope。
+func HasJSONFlag(args []string) bool {
+	enabled := false
+	for _, tok := range args {
+		if tok == "--" {
+			break
+		}
+		name, inlineVal, hasEq, isLong := ParseLongFlagName(tok)
+		if !isLong || name != "json" {
+			continue
+		}
+		if !hasEq {
+			enabled = true
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(inlineVal)) {
+		case "true", "1", "t", "yes":
+			enabled = true
+		case "false", "0", "f", "no":
+			enabled = false
+		}
+	}
+	return enabled
+}
+
 // ConsumeLongValue 读取长选项值：已携带 `=value` 时直接返回，否则消耗下一参数（缺失则返 ErrUsage）。
 func (c *FlagCursor) ConsumeLongValue(name, inlineVal string, hasEq bool) (string, error) {
 	if hasEq {
@@ -100,7 +139,8 @@ func ParseGlobalPrefix(args []string) (CommonFlags, []string, error) {
 		}
 		consumed, err := consumeGlobalPrefixToken(cur, &cf)
 		if err != nil {
-			return CommonFlags{}, nil, err
+			cf.JSON = cf.JSON || HasJSONFlag(args)
+			return cf, nil, err
 		}
 		if !consumed {
 			break
@@ -236,15 +276,15 @@ func ParsePositiveDuration(flagName, raw string) (algebraic.Duration, error) {
 	return d, nil
 }
 
-// ParseOctalPerm 解析 POSIX 八进制权限位（如 0644、600、0755）。
+// ParseOctalPerm 解析标准 POSIX 八进制文件权限位（0001..0777，与 transfer 用例 resolvePerm 保持一致）。
 func ParseOctalPerm(flagName, raw string) (fs.FileMode, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return 0, fmt.Errorf("%w: %s 权限不能为空", ErrUsage, flagName)
 	}
 	v, err := strconv.ParseUint(trimmed, 8, 32)
-	if err != nil || v > 0o7777 {
-		return 0, fmt.Errorf("%w: %s 需要合法八进制权限位（0000..07777），实际=%q", ErrUsage, flagName, raw)
+	if err != nil || v == 0 || v > 0o777 {
+		return 0, fmt.Errorf("%w: %s 需要合法八进制权限位（0001..0777），实际=%q", ErrUsage, flagName, raw)
 	}
 	return fs.FileMode(v), nil
 }
