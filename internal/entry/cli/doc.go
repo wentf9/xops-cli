@@ -1,42 +1,38 @@
-// Package cli 实现 XOps v2 极薄 CLI 入站驱动适配器（ADR-001 / ADR-011 / Plan P2.5-T2）。
+// Package cli 实现 XOps v2 完整极薄 CLI 入站驱动适配器（ADR-001 / ADR-010 / ADR-011 / Plan P5-T1）。
+//
+// 包结构采用按命令族正交拆分的子包布局，保证每个子包生产代码体量远低于 3,000 LOC 红线：
+//   - internal/entry/cli/clikit      共享命令行底座（具名能力接口、作用域引擎会话、JSON/v2 编码、通用选项解析）；
+//   - internal/entry/cli/cmdssh      会话、单机/批量执行、端口/TUN 转发与多路复用命令族（ssh/exec/tunnel/mux）；
+//   - internal/entry/cli/cmdtransfer 文件传输命令族（scp/sftp）；
+//   - internal/entry/cli/cmdasset    资产清单、凭据库与统一配置导入命令族（hosts/creds/vault/config）；
+//   - internal/entry/cli/cmdops      编排、健康诊断、审计与交互/协议子入口命令族（playbook/doctor/audit/mcp/tui）。
 //
 // 核心架构与安全不变量：
 //   - 零业务逻辑、零 internal/host/** 导入、零 core/osfs 与 core/ports 导入、零 os.Exit 调用；
-//   - 仅依赖 core/{domain,events,engine,conc} 与 Go 标准库，所有 I/O 流与核心引擎按需构造工厂均通过
-//     AppConfig 显式注入，保证命令解析、退出码映射与交互边界可 100% 进程内确定性单测；
-//   - 构建元信息通过只读值结构体 BuildInfo 由组合根（cmd/xops）显式注入，xops version 与 --help
-//     严禁触发 Engine 初始化或触碰本机状态目录；
+//   - 全部子入口（tui/sftpshell/mcp/muxdaemon）与宿主只读钩子（审计检索、受控文件读取、工作目录解析）
+//     均通过 AppConfig 强类型可选回调显式注入，未注入时严格失败关闭；
+//   - `xops version`、`--help` 与 `playbook validate` 严禁触发 Engine 初始化或触碰本地状态目录；
 //   - 全包 0 init()、0 可变包级 var、0 裸 go 语句、0 //nolint: 豁免。
 package cli
 
 import (
-	"errors"
-
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
 )
 
-// 编译期契约断言：确保 *engine.Engine 原生满足 CLI 入站层所需的最小会话执行接口。
+// 编译期契约断言：确保 *engine.Engine 原生满足 CLI 入站层最小会话执行契约。
 var _ SessionRunner = (*engine.Engine)(nil)
 
-// 本包导出的规范化哨兵错误，供调用方与测试精确区分配置、参数语法与运行期失败类别。
-var (
-	// ErrInvalidConfig 表示构造 CLI App 时缺少必填依赖或参数非法。
-	ErrInvalidConfig = errors.New("cli: 无效的 AppConfig 配置")
-	// ErrAppNotInitialized 表示在 nil 或未初始化零值 App 上调用运行方法。
-	ErrAppNotInitialized = errors.New("cli: App 未初始化")
-	// ErrUsage 表示命令行子命令或参数语法非法。
-	ErrUsage = errors.New("cli: 命令行参数无效")
-)
-
+// 本包重导出的不可变哨兵错误，与内部子包共享完全一致的错误标识。
 const (
-	// exitCodeOK 表示命令成功退出。
-	exitCodeOK = 0
-	// exitCodeGeneralError 表示通用运行期错误或关闭阶段故障。
-	exitCodeGeneralError = 1
-	// exitCodeUsage 表示命令行子命令或选项参数语法错误。
-	exitCodeUsage = 2
-	// exitCodeSSHError 对齐 OpenSSH ssh(1) 约定，表示 SSH 连接、认证、启动前拒绝或未知终态错误。
-	exitCodeSSHError = 255
-	// exitCodeSignalBase 为 POSIX 信号终止退出码基址（128 + signal）。
-	exitCodeSignalBase = 128
+	// ErrInvalidConfig 表示构造 CLI App 时缺少必填依赖或参数非法。
+	ErrInvalidConfig = clikit.ErrInvalidConfig
+	// ErrAppNotInitialized 表示在 nil 或未初始化零值 App 上调用运行方法。
+	ErrAppNotInitialized = clikit.ErrAppNotInitialized
+	// ErrUsage 表示命令行子命令或参数语法非法。
+	ErrUsage = clikit.ErrUsage
+	// ErrNotConfigured 表示所请求的子入口或宿主只读钩子尚未由组合根注入。
+	ErrNotConfigured = clikit.ErrNotConfigured
+	// ErrUnsupportedRunner 表示注入的 EngineHandle.Runner 未实现当前子命令所需能力接口。
+	ErrUnsupportedRunner = clikit.ErrUnsupportedRunner
 )
