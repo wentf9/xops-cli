@@ -20,7 +20,10 @@ func rootFallback(id domi18n.MessageID) string {
 	if text := fallbackSFTPAndDaemons(id); text != "" {
 		return text
 	}
-	return fallbackInteract(id)
+	if text := fallbackInteract(id); text != "" {
+		return text
+	}
+	return fallbackHost(id)
 }
 
 // fallbackForID 先查根模块规范英文兜底表，未命中再回退核心规范英文兜底表。

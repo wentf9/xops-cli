@@ -84,7 +84,7 @@ func RootErrorKeys() []domi18n.MessageID {
 		KeyConcNurseryNotInitialized, KeyConcNurseryClosed, KeyConcNilTask, KeyConcTaskPanicked,
 		KeyConcMutexNotInitialized, KeyConcNilContext, KeyConcPanic,
 	}
-	return slices.Concat(base, cliErrorKeys(), tuiErrorKeys(), sftpAndDaemonErrorKeys(), interactErrorAndPromptKeys())
+	return slices.Concat(base, cliErrorKeys(), tuiErrorKeys(), sftpAndDaemonErrorKeys(), interactErrorAndPromptKeys(), hostErrorKeys())
 }
 
 // RootKeys 返回根模块注册的全部有效 MessageID 列表（包含错误/提示键与全部纯 UI/帮助/TUI/SFTP 展示键），
