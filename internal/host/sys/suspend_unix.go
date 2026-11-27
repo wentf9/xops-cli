@@ -5,6 +5,7 @@ package sys
 import (
 	"os"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/unix"
@@ -59,19 +60,19 @@ func evaluateSuspendProcessGroup(s suspendProcessSnapshot) (security.Verdict, er
 		return security.VerdictDeny, ErrOrphanedProcessGroup
 	}
 	if s.sidErr != nil {
-		return security.VerdictDeny, i18n.WrapS(ErrOrphanedProcessGroup, s.sidErr, i18n.KeyHostSysSyscallFailed, i18n.Str("call", "getsid(0)"))
+		return security.VerdictDeny, domi18n.WrapSentinel(ErrOrphanedProcessGroup, i18n.Wrap(s.sidErr, i18n.KeyHostSysSyscallFailed, i18n.Str("call", "getsid(0)")))
 	}
 	if s.sid <= 0 || s.pid == s.sid || s.pgrp == s.sid {
 		return security.VerdictDeny, ErrOrphanedProcessGroup
 	}
 	if s.parentSIDErr != nil {
-		return security.VerdictDeny, i18n.WrapS(ErrOrphanedProcessGroup, s.parentSIDErr, i18n.KeyHostSysSyscallFailed, i18n.Str("call", "getsid(ppid)"))
+		return security.VerdictDeny, domi18n.WrapSentinel(ErrOrphanedProcessGroup, i18n.Wrap(s.parentSIDErr, i18n.KeyHostSysSyscallFailed, i18n.Str("call", "getsid(ppid)")))
 	}
 	if s.parentSID <= 0 || s.parentSID != s.sid {
 		return security.VerdictDeny, ErrOrphanedProcessGroup
 	}
 	if s.parentPGRPErr != nil {
-		return security.VerdictDeny, i18n.WrapS(ErrOrphanedProcessGroup, s.parentPGRPErr, i18n.KeyHostSysSyscallFailed, i18n.Str("call", "getpgid(ppid)"))
+		return security.VerdictDeny, domi18n.WrapSentinel(ErrOrphanedProcessGroup, i18n.Wrap(s.parentPGRPErr, i18n.KeyHostSysSyscallFailed, i18n.Str("call", "getpgid(ppid)")))
 	}
 	if s.parentPGRP <= 0 || s.parentPGRP == s.pgrp {
 		return security.VerdictDeny, ErrOrphanedProcessGroup

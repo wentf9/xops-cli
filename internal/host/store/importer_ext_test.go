@@ -9,11 +9,13 @@ import (
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/core/ports/tck"
 	"github.com/wentf9/xops-cli/internal/host/store"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"go.uber.org/goleak"
 )
 
@@ -217,5 +219,120 @@ func verifyOpenSSHImportWarnings(t *testing.T, warnings []inventory.ImportWarnin
 		if !slices.Contains(gotCodes, code) {
 			t.Fatalf("缺少预期导入告警 %q，实际告警码=%v", code, gotCodes)
 		}
+	}
+}
+
+// TestOpenSSHImporterLocalizedWarningsBilingual 验证全部 8 类 OpenSSH 导入告警
+// （3 类转发自 openssh.StreamDiagnostic + 5 类由 importer_openssh 产生）均携带有效 LocalizedMessage，
+// 规范英文与原契约逐字一致，中文渲染完整无占位符残留。
+func TestOpenSSHImporterLocalizedWarningsBilingual(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	enLoc := cat.For(domi18n.LocaleEn)
+	zhLoc := cat.For(domi18n.LocaleZh)
+
+	imp, err := store.NewOpenSSHImporter(store.OpenSSHImporterSpec{})
+	if err != nil {
+		t.Fatalf("NewOpenSSHImporter 失败: %v", err)
+	}
+	rawCfg := `Include conf.d/*.conf
+Match canonical all
+  Port 9998
+Match exec "echo nope"
+  Port 9999
+Host 2001:db8::1
+  HostName 192.0.2.1
+  User ops
+Host unresolved_no_host
+  User ops
+Host no-user
+  HostName 192.0.2.2
+Host cert-only
+  HostName 192.0.2.3
+  User ops
+  CertificateFile ~/.ssh/id_cert.pub
+Host tpl-node
+  HostName 192.0.2.4
+  User ops
+  IdentityFile ~/.ssh/id_%r
+  CertificateFile ~/.ssh/cert_%r.pub
+`
+	bundle, err := imp.Import(context.Background(), "~/.ssh/config", strings.NewReader(rawCfg))
+	if err != nil {
+		t.Fatalf("Import 失败: %v", err)
+	}
+	wantByCode := map[string][2]string{
+		"include_skipped": {
+			`line 1: Include "conf.d/*.conf" skipped in stream-only import (local files are not expanded)`,
+			`第 1 行：纯流式导入已跳过 Include "conf.d/*.conf"（不展开本地文件）`,
+		},
+		"match_canonical_ignored": {
+			"line 2: Match canonical block ignored (fail-closed by security policy)",
+			"第 2 行：已忽略 Match canonical 代码块（按安全策略失败关闭）",
+		},
+		"match_exec_ignored": {
+			"line 4: Match exec block ignored (fail-closed; external commands are never executed)",
+			"第 4 行：已忽略 Match exec 代码块（失败关闭；绝不执行外部命令）",
+		},
+		"alias_skipped": {
+			"alias does not satisfy managed NodeID naming rules; skipped",
+			"别名不满足托管节点 ID 命名规则，已跳过",
+		},
+		"host_unresolved": {
+			"missing resolvable HostName or valid host; skipped",
+			"缺少可解析的 HostName 或有效主机地址，已跳过",
+		},
+		"user_missing": {
+			"missing User and no default username configured; skipped",
+			"缺少 User 且未配置默认用户名，已跳过",
+		},
+		"cert_without_key_skipped": {
+			"no usable literal IdentityFile; skipped unbound CertificateFile",
+			"缺少可用的字面量 IdentityFile，已跳过未绑定的 CertificateFile",
+		},
+		"template_key_skipped": {
+			`skipped unsupported IdentityFile "~/.ssh/id_%r" for direct import`,
+			`直接导入已跳过不受支持的 IdentityFile 项 "~/.ssh/id_%r"`,
+		},
+		"template_cert_skipped": {
+			`skipped unsupported CertificateFile "~/.ssh/cert_%r.pub" for direct import`,
+			`直接导入已跳过不受支持的 CertificateFile 项 "~/.ssh/cert_%r.pub"`,
+		},
+	}
+	assertLocalizedWarningsMatch(t, enLoc, zhLoc, bundle.Warnings(), wantByCode)
+}
+
+func assertLocalizedWarningsMatch(t *testing.T, enLoc, zhLoc *i18n.Localizer, warnings []inventory.ImportWarning, wantByCode map[string][2]string) {
+	t.Helper()
+	seen := make(map[string]bool, len(wantByCode))
+	for _, w := range warnings {
+		want, ok := wantByCode[w.Code()]
+		if !ok {
+			t.Fatalf("非预期导入告警码 %q: %q", w.Code(), w.Message())
+		}
+		seen[w.Code()] = true
+		assertSingleLocalizedWarning(t, enLoc, zhLoc, w, want[0], want[1])
+	}
+	for code := range wantByCode {
+		if !seen[code] {
+			t.Fatalf("缺少预期告警码 %q", code)
+		}
+	}
+}
+
+func assertSingleLocalizedWarning(t *testing.T, enLoc, zhLoc *i18n.Localizer, w inventory.ImportWarning, wantEn, wantZh string) {
+	t.Helper()
+	if w.Message() != wantEn {
+		t.Fatalf("告警 %s 规范英文失配: got=%q want=%q", w.Code(), w.Message(), wantEn)
+	}
+	msg, hasLoc := w.LocalizedMessage().Get()
+	if !hasLoc || !msg.IsValid() || msg.Canonical() != w.Message() || enLoc.Render(msg) != w.Message() {
+		t.Fatalf("告警 %s LocalizedMessage 异常: has=%v en=%q msg=%q", w.Code(), hasLoc, enLoc.Render(msg), w.Message())
+	}
+	if gotZh := zhLoc.Render(msg); gotZh != wantZh {
+		t.Fatalf("告警 %s 中文渲染失配: got=%q want=%q", w.Code(), gotZh, wantZh)
 	}
 }

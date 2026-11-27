@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -16,6 +18,7 @@ import (
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/core/ports/tck"
 	"github.com/wentf9/xops-cli/internal/host/openssh"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"go.uber.org/goleak"
 )
 
@@ -360,5 +363,102 @@ Host web-01 # phantom-host !web-01
 	}
 	if _, err := noScopedSrc.ResolveTier4(context.Background(), mustOrigHost(t, "a"), algebraic.None[netaddr.Endpoint]()); !errors.Is(err, ports.ErrInvalidArgument) {
 		t.Fatalf("ScopedFS==nil 通配符 Include 返回 %v, 期望 ErrInvalidArgument", err)
+	}
+}
+
+// TestBilingualErrorsAndStreamDiagnostics 验证 OpenSSH 升级后的自包含错误键、无空格组件标识
+// 以及 StreamDiagnostic 3 类诊断的双轨本地化（规范英文零漂移 + 中文完整本地化）。
+func TestBilingualErrorsAndStreamDiagnostics(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	enLoc := cat.For(domi18n.LocaleEn)
+	zhLoc := cat.For(domi18n.LocaleZh)
+	assertOpenSSHBilingualErrors(t, enLoc, zhLoc)
+	assertOpenSSHStreamDiagBilingual(t, enLoc, zhLoc)
+}
+
+func assertOpenSSHBilingualErrors(t *testing.T, enLoc, zhLoc *i18n.Localizer) {
+	t.Helper()
+	var zero openssh.ConfigSource
+	_, zErr := zero.ListVirtualHosts(context.Background())
+	assertBilingualErrorMatch(t, enLoc, zhLoc, zErr, ports.ErrInvalidArgument, "OpenSSHConfigSource is not initialized", "OpenSSHConfigSource 尚未初始化")
+
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, "d0.conf"), "Include d1.conf\n")
+	writeTestFile(t, filepath.Join(dir, "d1.conf"), "Include d2.conf\n")
+	writeTestFile(t, filepath.Join(dir, "d2.conf"), "Host deep\n  User u\n")
+	_, depthErr := newTestSource(t, filepath.Join(dir, "d0.conf"), pathalg.SymlinkReject, 1).ResolveTier4(
+		context.Background(), mustOrigHost(t, "deep"), algebraic.None[netaddr.Endpoint](),
+	)
+	assertBilingualErrorMatch(t, enLoc, zhLoc, depthErr, openssh.ErrIncludeDepthExceeded, "Include nesting depth exceeded", "Include 嵌套深度超出上限")
+
+	_, lineErr := openssh.ParseConfigStream("bad.conf", []byte("BrokenKeywordWithoutValue\n"), algebraic.None[ports.LocalIdentityInfo]())
+	assertBilingualErrorMatch(t, enLoc, zhLoc, lineErr, openssh.ErrInvalidConfig, "openssh: invalid configuration at bad.conf:1", "OpenSSH 配置文件 bad.conf 第 1 行配置无效")
+}
+
+func assertBilingualErrorMatch(t *testing.T, enLoc, zhLoc *i18n.Localizer, err, sentinel error, wantEn, wantZh string) {
+	t.Helper()
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("错误链缺失哨兵 %v，实际=%v", sentinel, err)
+	}
+	if enText := enLoc.RenderError(err); enText != err.Error() || !strings.Contains(enText, wantEn) {
+		t.Fatalf("EN 渲染异常: en=%q raw=%q wantSubstr=%q", enText, err.Error(), wantEn)
+	}
+	if zhText := zhLoc.RenderError(err); !strings.Contains(zhText, wantZh) || strings.ContainsAny(zhText, "{}") {
+		t.Fatalf("ZH 渲染异常: zh=%q wantSubstr=%q", zhText, wantZh)
+	}
+}
+
+func assertOpenSSHStreamDiagBilingual(t *testing.T, enLoc, zhLoc *i18n.Localizer) {
+	t.Helper()
+	res, err := openssh.ParseConfigStream("stream.conf", []byte(
+		"Include conf.d/*.conf extra.conf\n"+
+			"Match canonical all\n  Port 2201\n"+
+			"Match exec \"echo noop\"\n  Port 2202\n"+
+			"Host web\n  HostName 192.0.2.1\n",
+	), algebraic.None[ports.LocalIdentityInfo]())
+	if err != nil {
+		t.Fatalf("ParseConfigStream 失败: %v", err)
+	}
+	wantDiags := map[string][2]string{
+		"include_skipped": {
+			`line 1: Include "conf.d/*.conf extra.conf" skipped in stream-only import (local files are not expanded)`,
+			`第 1 行：纯流式导入已跳过 Include "conf.d/*.conf extra.conf"（不展开本地文件）`,
+		},
+		"match_canonical_ignored": {
+			"line 2: Match canonical block ignored (fail-closed by security policy)",
+			"第 2 行：已忽略 Match canonical 代码块（按安全策略失败关闭）",
+		},
+		"match_exec_ignored": {
+			"line 4: Match exec block ignored (fail-closed; external commands are never executed)",
+			"第 4 行：已忽略 Match exec 代码块（失败关闭；绝不执行外部命令）",
+		},
+	}
+	if len(res.Diagnostics) != len(wantDiags) {
+		t.Fatalf("诊断条数 = %d, 期望 %d: %+v", len(res.Diagnostics), len(wantDiags), res.Diagnostics)
+	}
+	for _, d := range res.Diagnostics {
+		want, ok := wantDiags[d.Code]
+		if !ok {
+			t.Fatalf("非预期诊断码: %+v", d)
+		}
+		assertStreamDiagnosticMatch(t, enLoc, zhLoc, d, want[0], want[1])
+	}
+}
+
+func assertStreamDiagnosticMatch(t *testing.T, enLoc, zhLoc *i18n.Localizer, d openssh.StreamDiagnostic, wantEn, wantZh string) {
+	t.Helper()
+	if d.Message != wantEn {
+		t.Fatalf("诊断 %s 规范英文漂移: got=%q want=%q", d.Code, d.Message, wantEn)
+	}
+	msg, hasLoc := d.Localized.Get()
+	if !hasLoc || !msg.IsValid() || msg.Canonical() != d.Message || enLoc.Render(msg) != d.Message {
+		t.Fatalf("诊断 %s Localized 失配: has=%v en=%q msg=%q", d.Code, hasLoc, enLoc.Render(msg), d.Message)
+	}
+	if gotZh := zhLoc.Render(msg); gotZh != wantZh {
+		t.Fatalf("诊断 %s 中文渲染失配: got=%q want=%q", d.Code, gotZh, wantZh)
 	}
 }

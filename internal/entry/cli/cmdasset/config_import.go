@@ -161,9 +161,10 @@ func executeApplyImport(ctx context.Context, rt *clikit.Runtime, client clikit.I
 }
 
 func renderImportReportText(loc *i18n.Localizer, w io.Writer, labelKey domi18n.MessageID, rev engine.Revision, applied bool, rep inventory.ImportReport) {
-	_, _ = fmt.Fprintln(w, loc.T(
+	eff := clikit.EnsureLocalizer(loc)
+	_, _ = fmt.Fprintln(w, eff.T(
 		i18n.KeyCLIConfigImportSummary,
-		i18n.BoundStr("label", loc.T(labelKey)),
+		i18n.BoundStr("label", eff.T(labelKey)),
 		i18n.BoundStr("format", rep.SourceFormat),
 		i18n.BoundStr("revision", rev.String()),
 		i18n.Bool("applied", applied),
@@ -176,7 +177,11 @@ func renderImportReportText(loc *i18n.Localizer, w io.Writer, labelKey domi18n.M
 		_, _ = fmt.Fprintf(w, "  [%s] %s/%s %s\n", entry.Action, entry.AssetKind, entry.AssetID, entry.Reason)
 	}
 	for _, warn := range rep.Warnings {
-		_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLIConfigImportWarnLine, i18n.BoundStr("code", warn.Code()), i18n.BoundStr("subject", warn.Subject()), i18n.BoundStr("message", warn.Message())))
+		msgText := warn.Message()
+		if msg, ok := warn.LocalizedMessage().Get(); ok && msg.IsValid() {
+			msgText = eff.Render(msg)
+		}
+		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIConfigImportWarnLine, i18n.BoundStr("code", warn.Code()), i18n.BoundStr("subject", warn.Subject()), i18n.BoundStr("message", msgText)))
 	}
 }
 

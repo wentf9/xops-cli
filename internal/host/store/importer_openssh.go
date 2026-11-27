@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
@@ -82,6 +81,10 @@ func (i *OpenSSHImporter) Import(ctx context.Context, sourceName string, r io.Re
 func (i *OpenSSHImporter) convertParsedStream(srcName string, parsed openssh.ParsedStreamResult) (inventory.ImportBundle, error) {
 	spec := inventory.ImportBundleSpec{SourceFormat: openSSHFormatName}
 	for _, d := range parsed.Diagnostics {
+		if msg, ok := d.Localized.Get(); ok && msg.IsValid() {
+			appendLocalizedImportWarning(&spec, d.Code, d.Subject, msg)
+			continue
+		}
 		appendImportWarning(&spec, d.Code, d.Subject, d.Message)
 	}
 	for _, vh := range parsed.Hosts {
@@ -98,17 +101,17 @@ func (i *OpenSSHImporter) convertParsedStream(srcName string, parsed openssh.Par
 func (i *OpenSSHImporter) appendVirtualHost(spec *inventory.ImportBundleSpec, srcName string, vh ports.OpenSSHVirtualHost) error {
 	nid, err := inventory.ParseNodeID(vh.Alias())
 	if err != nil {
-		appendImportWarning(spec, "alias_skipped", vh.Alias(), "alias does not satisfy managed NodeID naming rules; skipped")
+		appendLocalizedImportWarning(spec, "alias_skipped", vh.Alias(), i18n.NewMessage(i18n.KeyHostStoreImportWarnAlias))
 		return nil
 	}
 	ep, hasEP := vh.Endpoint().Get()
 	if !hasEP || !ep.IsValid() {
-		appendImportWarning(spec, "host_unresolved", vh.Alias(), "missing resolvable HostName or valid host; skipped")
+		appendLocalizedImportWarning(spec, "host_unresolved", vh.Alias(), i18n.NewMessage(i18n.KeyHostStoreImportWarnHost))
 		return nil
 	}
 	user, uErr := i.resolveImportUser(vh)
 	if uErr != nil {
-		appendImportWarning(spec, "user_missing", vh.Alias(), "missing User and no default username configured; skipped")
+		appendLocalizedImportWarning(spec, "user_missing", vh.Alias(), i18n.NewMessage(i18n.KeyHostStoreImportWarnUser))
 		return nil
 	}
 	auth, err := buildOpenSSHImportAuth(spec, vh.Alias(), vh.Layer())
@@ -136,7 +139,7 @@ func buildOpenSSHImportAuth(spec *inventory.ImportBundleSpec, alias string, laye
 	certs := collectLiteralSpecs(spec, alias, layer.CertificateFiles(), inventory.ParseCertPathSpec, "template_cert_skipped", "CertificateFile")
 	if len(keys) == 0 {
 		if len(certs) > 0 {
-			appendImportWarning(spec, "cert_without_key_skipped", alias, "no usable literal IdentityFile; skipped unbound CertificateFile")
+			appendLocalizedImportWarning(spec, "cert_without_key_skipped", alias, i18n.NewMessage(i18n.KeyHostStoreImportWarnCertNoKey))
 		}
 		return inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
 	}
@@ -158,7 +161,12 @@ func collectLiteralSpecs[T any](
 	for _, raw := range pl.RawItems() {
 		v, err := parseFn(raw)
 		if err != nil {
-			appendImportWarning(spec, warnCode, alias, fmt.Sprintf("skipped unsupported %s %q for direct import", directive, raw))
+			msg := i18n.NewMessage(
+				i18n.KeyHostStoreImportWarnDirective,
+				i18n.BoundStr("directive", directive),
+				i18n.BoundStr("value", raw),
+			)
+			appendLocalizedImportWarning(spec, warnCode, alias, msg)
 			continue
 		}
 		out = append(out, v)
@@ -192,6 +200,12 @@ func appendDerivedOpenSSHEntities(
 
 func appendImportWarning(spec *inventory.ImportBundleSpec, code, subject, msg string) {
 	if w, err := inventory.NewImportWarning(code, subject, msg); err == nil {
+		spec.Warnings = append(spec.Warnings, w)
+	}
+}
+
+func appendLocalizedImportWarning(spec *inventory.ImportBundleSpec, code, subject string, msg domi18n.Message) {
+	if w, err := inventory.NewLocalizedImportWarning(code, subject, msg); err == nil {
 		spec.Warnings = append(spec.Warnings, w)
 	}
 }

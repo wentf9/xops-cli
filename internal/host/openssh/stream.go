@@ -3,10 +3,10 @@ package openssh
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -15,11 +15,13 @@ import (
 
 // StreamDiagnostic 描述纯内存流式解析 OpenSSH 配置时产生的非致命结构化告警
 // （例如因无磁盘访问而跳过的 Include，或按安全策略失败关闭忽略的 Match exec / canonical）。
+// Message 恒为规范英文文本，Localized 携带用于人类可读终端渲染的延迟本地化结构化消息。
 type StreamDiagnostic struct {
-	Code    string
-	Line    int
-	Subject string
-	Message string
+	Code      string
+	Line      int
+	Subject   string
+	Message   string
+	Localized algebraic.Option[domi18n.Message]
 }
 
 // ParsedStreamResult 封装对单份内存 OpenSSH 配置流执行纯只读解析后的全部虚拟主机视图与诊断告警。
@@ -151,22 +153,30 @@ func parseStreamInclude(sourceName string, lineNo int, key, val string) (configS
 	if err != nil || len(pats) == 0 {
 		return configStmt{}, false, StreamDiagnostic{}, i18n.EF(ErrInvalidConfig, i18n.KeyHostOpenSSHInvalidClause, i18n.BoundStr("file", sourceName), i18n.Int("line", lineNo), i18n.Str("clause", "Include"))
 	}
+	msg := i18n.NewMessage(
+		i18n.KeyHostOpenSSHDiagIncludeSkip,
+		i18n.Int("line", lineNo),
+		i18n.BoundStr("patterns", strings.Join(pats, " ")),
+	)
 	diag := StreamDiagnostic{
-		Code:    "include_skipped",
-		Line:    lineNo,
-		Subject: pats[0],
-		Message: fmt.Sprintf("line %d: Include %q skipped in stream-only import (local files are not expanded)", lineNo, strings.Join(pats, " ")),
+		Code:      "include_skipped",
+		Line:      lineNo,
+		Subject:   pats[0],
+		Message:   msg.Canonical(),
+		Localized: algebraic.Some(msg),
 	}
 	return configStmt{kind: stmtInclude, file: sourceName, line: lineNo, key: key, rawVal: val, patterns: pats}, true, diag, nil
 }
 
 func matchStreamDiagnostic(stmt configStmt) StreamDiagnostic {
 	if stmt.matchCanonical {
+		msg := i18n.NewMessage(i18n.KeyHostOpenSSHDiagMatchCanon, i18n.Int("line", stmt.line))
 		return StreamDiagnostic{
-			Code:    "match_canonical_ignored",
-			Line:    stmt.line,
-			Subject: "canonical",
-			Message: fmt.Sprintf("line %d: Match canonical block ignored (fail-closed by security policy)", stmt.line),
+			Code:      "match_canonical_ignored",
+			Line:      stmt.line,
+			Subject:   "canonical",
+			Message:   msg.Canonical(),
+			Localized: algebraic.Some(msg),
 		}
 	}
 	for i := 0; i < len(stmt.patterns); {
@@ -176,11 +186,13 @@ func matchStreamDiagnostic(stmt configStmt) StreamDiagnostic {
 			continue
 		}
 		if kw == "exec" {
+			msg := i18n.NewMessage(i18n.KeyHostOpenSSHDiagMatchExec, i18n.Int("line", stmt.line))
 			return StreamDiagnostic{
-				Code:    "match_exec_ignored",
-				Line:    stmt.line,
-				Subject: "exec",
-				Message: fmt.Sprintf("line %d: Match exec block ignored (fail-closed; external commands are never executed)", stmt.line),
+				Code:      "match_exec_ignored",
+				Line:      stmt.line,
+				Subject:   "exec",
+				Message:   msg.Canonical(),
+				Localized: algebraic.Some(msg),
 			}
 		}
 		_, nextIdx, ok := readMatchCriterionArg(stmt.patterns, i, inlineVal, hasEq)

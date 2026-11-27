@@ -5,15 +5,18 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
-// ImportWarning 描述格式导入过程中产生的非致命诊断告警（已校验单行纯文本）。
+// ImportWarning 描述格式导入过程中产生的非致命诊断告警（已校验单行纯文本）；
+// 可选携带延迟渲染的结构化本地化消息（仅内存使用，不参与 JSON 线协议编解码与规范相等性比对）。
 //
 //xops:opaque
 //xops:failclosed
 type ImportWarning struct {
 	code, subject, message string
+	localized              algebraic.Option[domi18n.Message]
 	valid                  bool
 }
 
@@ -30,12 +33,34 @@ func NewImportWarning(code, subject, message string) (ImportWarning, error) {
 	if err != nil || msg == "" {
 		return ImportWarning{}, domi18n.EF(ErrInvalidImportBundle, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "message"))
 	}
-	return ImportWarning{code, subj, msg, true}, nil
+	return ImportWarning{code: code, subject: subj, message: msg, valid: true}, nil
+}
+
+// NewLocalizedImportWarning 校验告警码、主题与结构化本地化消息并构造不可变 ImportWarning，
+// 自动以 msg.Canonical() 填充规范英文 message 字段，并保留 msg 供人类可读终端按语种渲染。
+func NewLocalizedImportWarning(code, subject string, msg domi18n.Message) (ImportWarning, error) {
+	if !msg.IsValid() {
+		return ImportWarning{}, domi18n.EF(ErrInvalidImportBundle, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "message"))
+	}
+	w, err := NewImportWarning(code, subject, msg.Canonical())
+	if err != nil {
+		return ImportWarning{}, err
+	}
+	w.localized = algebraic.Some(msg)
+	return w, nil
 }
 func (w ImportWarning) IsValid() bool   { return w.valid && w.code != "" && w.message != "" }
 func (w ImportWarning) Code() string    { return w.code }
 func (w ImportWarning) Subject() string { return w.subject }
 func (w ImportWarning) Message() string { return w.message }
+
+// LocalizedMessage 返回告警可选的延迟本地化结构化消息；零值、无效或经 JSON 反序列化后的告警返回 None。
+func (w ImportWarning) LocalizedMessage() algebraic.Option[domi18n.Message] {
+	if !w.IsValid() {
+		return algebraic.None[domi18n.Message]()
+	}
+	return w.localized
+}
 func (w ImportWarning) Equal(o ImportWarning) bool {
 	return w.IsValid() && o.IsValid() && w.code == o.code && w.subject == o.subject && w.message == o.message
 }

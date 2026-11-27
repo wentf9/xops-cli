@@ -215,7 +215,7 @@ func (s *ConfigSource) checkReady(ctx context.Context) error {
 		return err
 	}
 	if s == nil || !s.valid {
-		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "OpenSSH ConfigSource"))
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "OpenSSHConfigSource"))
 	}
 	return nil
 }
