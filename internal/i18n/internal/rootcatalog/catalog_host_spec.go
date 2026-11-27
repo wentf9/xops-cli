@@ -146,7 +146,7 @@ func lookupHost(id string) string {
 	case "host.yaml.unsupported_schema_version":
 		return "yamlcodec: unsupported config schema version (only version: 2 is supported)"
 	case "host.yaml.section_key":
-		return "{section}.{key}"
+		return "invalid YAML entry {section}.{key}"
 	case "host.yaml.empty_config":
 		return "config file is empty"
 	case "host.yaml.decode_failed":

@@ -23,6 +23,7 @@ type doctorStub struct {
 	opsStub
 	invRep   engine.InventoryDoctorRep
 	vaultRep engine.CredentialDoctorRep
+	vaultErr error
 }
 
 func (s *doctorStub) InventoryDoctor(_ context.Context, _ engine.InventoryDoctorRequest) (engine.InventoryDoctorRep, error) {
@@ -30,6 +31,9 @@ func (s *doctorStub) InventoryDoctor(_ context.Context, _ engine.InventoryDoctor
 }
 
 func (s *doctorStub) VaultDoctor(_ context.Context, _ engine.VaultDoctorRequest) (engine.CredentialDoctorRep, error) {
+	if s.vaultErr != nil {
+		return engine.CredentialDoctorRep{}, s.vaultErr
+	}
 	return s.vaultRep, nil
 }
 
@@ -199,4 +203,28 @@ func TestRunDoctor_BilingualTextAndCanonicalJSON(t *testing.T) {
 		t.Fatalf("unhealthy doctor (--json) 应返回 ExitGeneral，实际=%d", codeJSON)
 	}
 	assertDoctorCanonicalJSON(t, outJSON)
+
+	// 验证 Vault 未配置时：中文文本输出本地化说明，而 --lang zh --json 保持规范纯英文 vault_note。
+	noVaultStub := &doctorStub{
+		invRep:   engine.InventoryDoctorRep{Healthy: true},
+		vaultErr: engine.ErrVaultUnavailable,
+	}
+	codeNVText, outNVText := runDoctorWithLocale(t, noVaultStub, cat.For(domi18n.LocaleZh), []string{"--scope", "all"})
+	if codeNVText != clikit.ExitOK {
+		t.Fatalf("healthy doctor (zh vault unavailable) 应返回 ExitOK，实际=%d", codeNVText)
+	}
+	assertDoctorTextOutput(t, "ZH-no-vault", outNVText, []string{"凭据库：未配置凭据库"}, []string{"vault not configured"})
+
+	codeNVJSON, outNVJSON := runDoctorWithLocale(t, noVaultStub, cat.For(domi18n.LocaleZh), []string{"--scope", "all", "--json"})
+	if codeNVJSON != clikit.ExitOK {
+		t.Fatalf("healthy doctor (--json vault unavailable) 应返回 ExitOK，实际=%d", codeNVJSON)
+	}
+	for _, r := range outNVJSON {
+		if unicode.Is(unicode.Han, r) {
+			t.Fatalf("Doctor vault_note JSON 必须保持规范纯英文（检出汉字 %q）:\n%s", r, outNVJSON)
+		}
+	}
+	if !strings.Contains(outNVJSON, `"vault_note":"vault not configured"`) {
+		t.Fatalf("Doctor JSON 缺少规范英文 vault_note:\n%s", outNVJSON)
+	}
 }

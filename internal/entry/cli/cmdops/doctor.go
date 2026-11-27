@@ -23,12 +23,13 @@ type doctorArgs struct {
 }
 
 type doctorAggregateView struct {
-	OK        bool                        `json:"ok"`
-	Healthy   bool                        `json:"healthy"`
-	Scope     string                      `json:"scope"`
-	Inventory *engine.InventoryDoctorRep  `json:"inventory,omitzero"`
-	Vault     *engine.CredentialDoctorRep `json:"vault,omitzero"`
-	VaultNote string                      `json:"vault_note,omitzero"`
+	OK           bool                        `json:"ok"`
+	Healthy      bool                        `json:"healthy"`
+	Scope        string                      `json:"scope"`
+	Inventory    *engine.InventoryDoctorRep  `json:"inventory,omitzero"`
+	Vault        *engine.CredentialDoctorRep `json:"vault,omitzero"`
+	VaultNote    string                      `json:"vault_note,omitzero"`
+	vaultNoteKey domi18n.MessageID
 }
 
 // RunDoctor 执行 `xops doctor` 只读零泄露系统健康诊断（整合 InventoryDoctor 与 VaultDoctor）。
@@ -84,19 +85,18 @@ func executeDoctor(ctx context.Context, rt *clikit.Runtime, runner clikit.Sessio
 }
 
 func runVaultDoctorSection(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed doctorArgs, view *doctorAggregateView, jsonOut bool) int {
-	loc := rt.Loc()
 	vClient, err := requireVaultClient(runner)
 	if err != nil {
 		if parsed.scope == "vault" {
 			return rt.Fail(clikit.ExitGeneral, jsonOut, err)
 		}
-		view.VaultNote = loc.T(i18n.KeyCLIDoctorVaultNoCap)
+		setDoctorVaultNote(rt, view, i18n.KeyCLIDoctorVaultNoCap)
 		return clikit.ExitOK
 	}
 	rep, err := vClient.VaultDoctor(ctx, engine.VaultDoctorRequest{SkipSecretProbe: parsed.skipVaultProbe})
 	if err != nil {
 		if parsed.scope == "all" && errors.Is(err, engine.ErrVaultUnavailable) {
-			view.VaultNote = loc.T(i18n.KeyCLIDoctorVaultNotConfigured)
+			setDoctorVaultNote(rt, view, i18n.KeyCLIDoctorVaultNotConfigured)
 			return clikit.ExitOK
 		}
 		return rt.Fail(clikit.ExitGeneral, jsonOut, err)
@@ -106,6 +106,14 @@ func runVaultDoctorSection(ctx context.Context, rt *clikit.Runtime, runner cliki
 		view.Healthy = false
 	}
 	return clikit.ExitOK
+}
+
+// setDoctorVaultNote 记录 Vault 附加说明键，并向 JSON 字段写入恒定规范英文文本，
+// 保证 --lang zh --json 输出严格纯英文而文本模式可按目标语种渲染。
+func setDoctorVaultNote(rt *clikit.Runtime, view *doctorAggregateView, key domi18n.MessageID) {
+	view.vaultNoteKey = key
+	enLoc := clikit.EnsureLocalizer(rt.Loc()).WithLocale(domi18n.LocaleEn)
+	view.VaultNote = enLoc.T(key)
 }
 
 func renderDoctorText(loc *i18n.Localizer, w io.Writer, view doctorAggregateView) {
@@ -140,6 +148,8 @@ func renderDoctorText(loc *i18n.Localizer, w io.Writer, view doctorAggregateView
 		for _, f := range v.Findings {
 			renderDoctorFindingLine(eff, w, f)
 		}
+	} else if view.vaultNoteKey.IsValid() {
+		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorVaultNote, i18n.BoundStr("note", eff.T(view.vaultNoteKey))))
 	} else if view.VaultNote != "" {
 		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorVaultNote, i18n.BoundStr("note", view.VaultNote)))
 	}

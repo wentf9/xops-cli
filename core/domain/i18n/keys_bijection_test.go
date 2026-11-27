@@ -76,7 +76,7 @@ func allDeclaredCoreKeys() []MessageID {
 		KeyCommonJSONTrailingData, KeyCommonJSONMissingField, KeyCommonJSONVariantInvalid, KeyCommonMutuallyExclusive,
 		KeyCommonOneOfRequired, KeyCommonInvalidTextChars, KeyCommonInvalidUTF8, KeyCommonBase64DecodeFailed,
 		KeyCommonZeroEntropy, KeyCommonPermInvalid, KeyCommonEitherMissingDep, KeyCommonUnsupportedVariant,
-		KeyCommonIDGenFailed, KeyCommonPathTemplateFailed, KeyCommonDetail, KeyInteractHostKeyTitle,
+		KeyCommonIDGenFailed, KeyCommonPathTemplateFailed, keyCommonDetail, KeyInteractHostKeyTitle,
 		KeyInteractHostKeyBody, KeyInteractSSHChallengeTitle, KeyInteractChallengeResponse, KeyInteractChallengeBannerResponse,
 		KeyInteractKeyPassphraseTitle, KeyInteractKeyPassphraseBody, KeyInteractPrivilegeTitle, KeyInteractPrivilegeBody,
 		KeyInteractMuxConfirmTitle, KeyInteractMuxStartBody, KeyInteractMuxReuseBody, KeyInteractMuxAttachBody,

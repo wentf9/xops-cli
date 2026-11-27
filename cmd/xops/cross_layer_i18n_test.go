@@ -52,6 +52,7 @@ func TestCrossLayerRealErrors_BilingualZeroMixedLanguage(t *testing.T) {
 
 	assertRealDomainErrors(t, enLoc, zhLoc)
 	assertRealPortsAuditErrors(t, enLoc, zhLoc)
+	assertRealAuditHaltedAndOrphanedPGroupErrors(t, ctx, enLoc, zhLoc)
 	assertRealYAMLCodecErrors(t, enLoc, zhLoc)
 	assertRealGateChallengeAndEngineErrors(t, ctx, xopsHome, enLoc, zhLoc)
 	assertRealGateOutcomeErrorViaStreamLogs(t, ctx, homeDir, xopsHome, enLoc, zhLoc)
@@ -77,7 +78,7 @@ func assertRealDomainErrors(t *testing.T, enLoc, zhLoc *i18n.Localizer) {
 		{"domain/netaddr.ParseHostPort", hpErr, []string{"address bad-host-no-port must be in <host>:<port> or [<ipv6>]:<port> format"}, []string{"地址 bad-host-no-port 必须符合 <host>:<port> 或 [<ipv6>]:<port> 格式"}, []string{"netaddr:", "must be in"}},
 		{"domain/pathalg.ParseRemotePath", rpErr, []string{"remote_path", "control characters"}, []string{"remote_path", "控制字符"}, []string{"pathalg:", "control characters"}},
 		{"domain/algebraic.ParseDuration", durErr, []string{"invalid duration: not-a-duration"}, []string{"duration 无效", "not-a-duration"}, []string{"algebraic:", "invalid duration: not-a-duration"}},
-		{"domain/inventory.NewGraph", graphErr, []string{"invalid node: web-1"}, []string{"node 无效：web-1"}, []string{"inventory:", "invalid node:"}},
+		{"domain/inventory.NewGraph", graphErr, []string{"inventory: node web-1 references missing host or identity"}, []string{"节点 web-1 引用了不存在的主机或身份资产"}, []string{"inventory:", "invalid node:", "references missing", "host or identity"}},
 	} {
 		assertRealBilingualParity(t, tc, enLoc, zhLoc)
 	}
@@ -183,9 +184,9 @@ inventory:
 	assertRealBilingualParity(t, crossLayerErrorCheck{
 		name:     "gate.ApprovalChallengeError+engine.mapEngineError",
 		err:      chErr,
-		wantEn:   []string{"engine: operation requires two-step approval confirmation", "gate: approval challenge required"},
-		wantZh:   []string{"操作需要两阶段人工审批确认", "需要人工审批"},
-		forbidZh: []string{"engine:", "gate:", "approval challenge required", "requires two-step approval"},
+		wantEn:   []string{"engine: operation requires two-step approval confirmation", "gate: approval challenge required", "operation risk meets or exceeds approval threshold"},
+		wantZh:   []string{"操作需要两阶段人工审批确认", "需要人工审批", "操作风险达到或超过审批阈值"},
+		forbidZh: []string{"engine:", "gate:", "approval challenge required", "requires two-step approval", "approval required", "threshold", "protected path", "risk"},
 	}, enLoc, zhLoc)
 
 	// 2. 真实 engine.mapEngineError 分组抑制：GetNode(missing) -> engine.ErrNotFound 折叠 ucinv.ErrAssetNotFound。
@@ -218,6 +219,9 @@ inventory:
 		wantZh:   []string{"目标资产或凭据仍被引用", "host h1 仍被"},
 		forbidZh: []string{"engine:", "usecase/inventory:", "is still referenced"},
 	}, enLoc, zhLoc)
+
+	// 4. 真实 MCPServer 非回环绑定拒绝 -> mcpruntime.ErrNonLoopbackAddress（完整回环说明双语校验）。
+	assertRealNonLoopbackMCPServerError(t, ctx, rt.engine, enLoc, zhLoc)
 }
 
 type cancelOnWriteWriter struct {
@@ -295,9 +299,9 @@ func assertRealGateOutcomeErrorViaStreamLogs(
 	assertRealBilingualParity(t, crossLayerErrorCheck{
 		name:     "gate.OutcomeError+engine.mapEngineError",
 		err:      obsErr,
-		wantEn:   []string{"engine: side-effect outcome is unknown", "gate: execution outcome=unknown", "context canceled"},
-		wantZh:   []string{"副作用终态未知", "执行终态=unknown", "上下文已取消"},
-		forbidZh: []string{"engine:", "gate:", "usecase/observability:", "execution outcome="},
+		wantEn:   []string{"engine: side-effect outcome is unknown; automatic retry is forbidden", "gate: execution outcome=unknown", "context canceled"},
+		wantZh:   []string{"副作用终态未知，禁止自动重试", "执行终态=unknown", "上下文已取消"},
+		forbidZh: []string{"engine:", "gate:", "usecase/observability:", "execution outcome=", "automatic retry is forbidden"},
 	}, enLoc, zhLoc)
 }
 
@@ -331,9 +335,9 @@ func TestRunProcess_InvalidConfigYAML_BilingualTextAndJSON(t *testing.T) {
 		{
 			name:     "missing-inventory-graph-ref",
 			content:  "version: 2\ninventory:\n  nodes:\n    n1:\n      host: ghost-h\n      identity: ghost-i\n",
-			wantEn:   []string{"failed to load config.yaml", "invalid node: n1"},
-			wantZh:   []string{"加载 config.yaml 失败", "持久化数据损坏或完整性校验失败", "node 无效：n1"},
-			forbidZh: []string{"failed to load config.yaml", "invalid node:", "inventory:", "ports:"},
+			wantEn:   []string{"failed to load config.yaml", "inventory: node n1 references missing host or identity"},
+			wantZh:   []string{"加载 config.yaml 失败", "持久化数据损坏或完整性校验失败", "节点 n1 引用了不存在的主机或身份资产"},
+			forbidZh: []string{"failed to load config.yaml", "invalid node:", "references missing", "inventory:", "ports:"},
 		},
 	}
 
@@ -466,12 +470,16 @@ func hasRawPlaceholderInCmd(s string) bool {
 }
 
 func isPlaceholderIdentInCmd(k string) bool {
+	if len(k) == 0 || len(k) > domi18n.MaxParamKeyBytes {
+		return false
+	}
 	for i := range len(k) {
 		c := k[i]
-		isValid := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
-		if !isValid {
+		isBase := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+		isSep := i > 0 && (c == '.' || c == '-')
+		if !isBase && !isSep {
 			return false
 		}
 	}
-	return len(k) > 0
+	return true
 }

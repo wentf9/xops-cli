@@ -141,7 +141,7 @@ func WrapSentinelDetail(sentinel, cause error, detail string, replaced ...error)
 	if !ok {
 		return WrapSentinel(sentinel, cause, replaced...)
 	}
-	inner := NewErrorWithFallback(nil, cause, KeyCommonDetail, CanonicalFallback(KeyCommonDetail), BoundStr("detail", bounded))
+	inner := NewErrorWithFallback(nil, cause, keyCommonDetail, CanonicalFallback(keyCommonDetail), BoundStr("detail", bounded))
 	return WrapSentinel(sentinel, inner, replaced...)
 }
 
@@ -152,7 +152,7 @@ func DynamicDetailError(detail string) error {
 	if !ok {
 		return E(KeyCommonInternalError)
 	}
-	return NewErrorWithFallback(nil, nil, KeyCommonDetail, CanonicalFallback(KeyCommonDetail), BoundStr("detail", bounded))
+	return NewErrorWithFallback(nil, nil, keyCommonDetail, CanonicalFallback(keyCommonDetail), BoundStr("detail", bounded))
 }
 
 // ensureErrorMessage 保证错误构造路径严格失败关闭并最大化保留有效诊断参数：

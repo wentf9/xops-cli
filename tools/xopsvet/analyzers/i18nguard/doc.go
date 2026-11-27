@@ -1,6 +1,6 @@
 // Package i18nguard 实现 XOps v2 第 10 个静态分析器：国际化（i18n）强类型契约与反硬编码护栏。
 //
-// 本分析器在全仓所有生产包强制执行规则 1、规则 2 与规则 3，仅跳过 go test 合成 .test 入口包、
+// 本分析器在全仓所有生产包强制执行规则 1 至规则 5，仅跳过 go test 合成 .test 入口包、
 // 全部 *_test.go 与外置 *_test 包，以及测试基础设施与分析器自身（core/ports/tck、core/internal/sim、
 // tools/xopsvet）：
 //   - 规则 1（MessageID 强类型完整性）：禁止在 core/domain/i18n 与 internal/i18n 之外声明
@@ -18,5 +18,13 @@
 //     与 tools/xopsvet；
 //   - 规则 3（禁止生产源码硬编码 CJK 与全角中文标点）：对全部非跳过生产包无例外生效，检查生产文件
 //     STRING/CHAR 字面量（含转义解码后），拦截任何 unicode.Han 字符以及 U+3000..U+303F、
-//     U+FF00..U+FFEF 全角标点。
+//     U+FF00..U+FFEF 全角标点；
+//   - 规则 4（动态明细与哨兵防吞噬守卫）：
+//     4A 禁止向 core/domain/i18n.WrapSentinelDetail（arg2）与 DynamicDetailError（arg0）传入非空编译期字符串常量；
+//     4B 拦截 {core/domain/i18n, internal/i18n}.{EF, WrapS} 传入 "common.detail"（含包内亦禁）、对安全/不可逆
+//     红线哨兵（ErrOutcomeUnknown/ErrAuditHalted/ErrGateHalted 等）使用 "common.*" 弱模板，以及对非通用输入/格式
+//     哨兵前缀（ErrInvalid*/ErrUsage/ErrCorrupt*/ErrCatalogCorrupt）的包级哨兵使用泛化空壳骨架键；
+//   - 规则 5（编译期常量参数散文拦截）：拦截全仓生产包对 {core/domain/i18n, internal/i18n}.{Str, BoundStr} 的调用，
+//     5A 对 "reason"/"detail"/"op" 槽位禁止任何非空编译期字符串常量，
+//     5B 对 "field"/"kind"/"component"/"feature"/"expected"/"action" 槽位禁止包含 ASCII 空格。
 package i18nguard

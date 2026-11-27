@@ -81,7 +81,7 @@ host.store.import_warn.unsupported_directive: "直接导入已跳过不受支持
 
 # ---- YAML vNext 编解码器错误（internal/host/store/yamlcodec） ----
 host.yaml.unsupported_schema_version: "不受支持的配置 schema 版本（仅支持 version: 2）"
-host.yaml.section_key: "{section}.{key}"
+host.yaml.section_key: "YAML 配置项 {section}.{key} 无效"
 host.yaml.empty_config: "配置文件为空"
 host.yaml.decode_failed: "解析 YAML vNext 配置文档失败"
 host.yaml.invalid_version: "不支持的 schema 版本 {version}（仅支持 2）"

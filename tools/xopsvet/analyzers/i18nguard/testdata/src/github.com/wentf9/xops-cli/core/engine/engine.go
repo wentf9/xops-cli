@@ -179,3 +179,92 @@ func badRule1Positions(existing domi18n.MessageID, raw string, ch chan domi18n.M
 	}
 	return domi18n.KeyCore
 }
+
+var (
+	ErrOutcomeUnknown       = domi18n.Sentinel(domi18n.KeyCore)
+	ErrAuditHalted          = domi18n.Sentinel(domi18n.KeyCore)
+	ErrNonLoopbackAddress   = domi18n.Sentinel(domi18n.KeyCore)
+	ErrOrphanedProcessGroup = domi18n.Sentinel(domi18n.KeyCore)
+	ErrMissingAssetRef      = domi18n.Sentinel(domi18n.KeyCore)
+	ErrScopeEscalated       = domi18n.Sentinel(domi18n.KeyCore)
+	ErrInvalidConfig        = domi18n.Sentinel(domi18n.KeyCore)
+	ErrUsage                = domi18n.Sentinel(domi18n.KeyCore)
+	ErrCorruptData          = domi18n.Sentinel(domi18n.KeyCore)
+	ErrCatalogCorrupt       = domi18n.Sentinel(domi18n.KeyCore)
+)
+
+const (
+	constDetail = "static detail"
+	constProse  = "not a directory"
+)
+
+func goodRule4AndRule5(dyn string, cause, localSent error) {
+	// 规则 4A 合法：运行期变量与空串常量。
+	_ = domi18n.WrapSentinelDetail(ErrOutcomeUnknown, cause, dyn)
+	_ = domi18n.WrapSentinelDetail(ErrOutcomeUnknown, cause, "")
+	_ = domi18n.DynamicDetailError(dyn)
+	_ = domi18n.DynamicDetailError("")
+
+	// 规则 4B 合法：安全红线配自包含领域键；通用输入/损坏哨兵配骨架键；局部哨兵变量；非红线业务哨兵配非骨架键。
+	_ = domi18n.EF(ErrOutcomeUnknown, domi18n.KeyCore)
+	_ = domi18n.WrapS(ErrAuditHalted, cause, domi18n.KeyCore)
+	_ = domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "host"))
+	_ = domi18n.EF(ErrUsage, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "flag"))
+	_ = domi18n.EF(ErrCorruptData, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", dyn))
+	_ = domi18n.EF(ErrCatalogCorrupt, domi18n.KeyCommonOpFailed)
+	_ = domi18n.EF(localSent, domi18n.KeyCommonFieldInvalid)
+	_ = domi18n.EF(ErrMissingAssetRef, domi18n.KeyCore)
+	_ = domi18n.EF(ErrMissingAssetRef, domi18n.KeyCommonNotFound)
+	_ = i18n.WrapS(ErrOrphanedProcessGroup, cause, i18n.KeyHostSpecific)
+
+	// 规则 5A/5B 合法：运行期动态值、空串、单标识符、未受限展示槽位（options/cmd/allowed）。
+	_ = domi18n.Str("reason", dyn)
+	_ = domi18n.BoundStr("detail", dyn)
+	_ = i18n.Str("op", dyn)
+	_ = domi18n.Str("reason", "")
+	_ = domi18n.Str("field", "node_id")
+	_ = domi18n.BoundStr("kind", "SOCKS5")
+	_ = i18n.Str("component", "SecretVault")
+	_ = domi18n.Str("feature", "follow_symlink")
+	_ = domi18n.Str("expected", "v2")
+	_ = i18n.BoundStr("action", "exec")
+	_ = domi18n.Str("field", dyn)
+	_ = domi18n.Str("options", "command, argv")
+	_ = i18n.Str("cmd", "config import")
+	_ = i18n.Str("allowed", "zh | en")
+}
+
+func badRule4AndRule5(cause error) {
+	// 规则 4A 违规：动态原语禁止传入非空编译期字符串常量。
+	_ = domi18n.WrapSentinelDetail(ErrOutcomeUnknown, cause, "static literal") // want "禁止向 WrapSentinelDetail 传入非空编译期字符串常量"
+	_ = domi18n.WrapSentinelDetail(ErrAuditHalted, cause, constDetail)         // want "禁止向 WrapSentinelDetail 传入非空编译期字符串常量"
+	_ = domi18n.DynamicDetailError("peer static error")                        // want "禁止向 DynamicDetailError 传入非空编译期字符串常量"
+	_ = domi18n.DynamicDetailError("prefix " + "suffix")                       // want "禁止向 DynamicDetailError 传入非空编译期字符串常量"
+
+	// 规则 4B-2 违规：安全红线哨兵禁止任何 "common.*" 弱模板。
+	_ = domi18n.EF(ErrOutcomeUnknown, domi18n.KeyCommonNotFound)              // want "禁止对安全红线哨兵 ErrOutcomeUnknown 在 EF 中使用泛化弱模板"
+	_ = domi18n.WrapS(ErrAuditHalted, cause, domi18n.KeyCommonOpFailed)       // want "禁止对安全红线哨兵 ErrAuditHalted 在 WrapS 中使用泛化弱模板"
+	_ = i18n.EF(ErrNonLoopbackAddress, domi18n.KeyCommonFieldInvalid)         // want "禁止对安全红线哨兵 ErrNonLoopbackAddress 在 EF 中使用泛化弱模板"
+	_ = i18n.WrapS(ErrOrphanedProcessGroup, cause, i18n.KeyHostSysSyscallErr) // want "禁止对具名业务哨兵 ErrOrphanedProcessGroup 在 WrapS 中使用泛化骨架键"
+
+	// 规则 4B-3 违规：非通用输入/格式具名业务哨兵禁止泛化空壳骨架键。
+	_ = domi18n.EF(ErrMissingAssetRef, domi18n.KeyCommonFieldInvalid)            // want "禁止对具名业务哨兵 ErrMissingAssetRef 在 EF 中使用泛化骨架键"
+	_ = domi18n.EF(ErrScopeEscalated, domi18n.KeyCommonFieldValueInvalid)        // want "禁止对具名业务哨兵 ErrScopeEscalated 在 EF 中使用泛化骨架键"
+	_ = domi18n.EF(ErrScopeEscalated, domi18n.KeyCommonValueInvalid)             // want "禁止对具名业务哨兵 ErrScopeEscalated 在 EF 中使用泛化骨架键"
+	_ = domi18n.WrapS(ErrScopeEscalated, cause, domi18n.KeyCommonOpTargetFailed) // want "禁止对具名业务哨兵 ErrScopeEscalated 在 WrapS 中使用泛化骨架键"
+	_ = i18n.EF(ErrMissingAssetRef, i18n.KeyHostSysSyscallErr)                   // want "禁止对具名业务哨兵 ErrMissingAssetRef 在 EF 中使用泛化骨架键"
+
+	// 规则 5A 违规：reason / detail / op 禁止任何非空编译期字符串常量。
+	_ = domi18n.Str("reason", "not_a_dir")      // want "禁止向 Str\\(\"reason\", ...\\) 传入非空编译期字符串常量"
+	_ = domi18n.BoundStr("detail", constDetail) // want "禁止向 BoundStr\\(\"detail\", ...\\) 传入非空编译期字符串常量"
+	_ = i18n.Str("op", "decrypt")               // want "禁止向 Str\\(\"op\", ...\\) 传入非空编译期字符串常量"
+	_ = i18n.BoundStr("reason", constProse)     // want "禁止向 BoundStr\\(\"reason\", ...\\) 传入非空编译期字符串常量"
+
+	// 规则 5B 违规：field / kind / component / feature / expected / action 禁止含空格散文常量。
+	_ = domi18n.Str("field", "jump host")                        // want "禁止向 Str\\(\"field\", ...\\) 传入含空格的散文常量"
+	_ = domi18n.BoundStr("kind", "import format")                // want "禁止向 BoundStr\\(\"kind\", ...\\) 传入含空格的散文常量"
+	_ = i18n.Str("component", "KeySignerPort or OperatorReadFS") // want "禁止向 Str\\(\"component\", ...\\) 传入含空格的散文常量"
+	_ = domi18n.Str("feature", "stdin in batch_exec")            // want "禁止向 Str\\(\"feature\", ...\\) 传入含空格的散文常量"
+	_ = i18n.Str("expected", "non-empty string")                 // want "禁止向 Str\\(\"expected\", ...\\) 传入含空格的散文常量"
+	_ = i18n.BoundStr("action", "delete host")                   // want "禁止向 BoundStr\\(\"action\", ...\\) 传入含空格的散文常量"
+}

@@ -76,7 +76,9 @@ const (
 	KeyCommonUnsupportedVariant MessageID = "common.unsupported_variant"  // 不支持的代数和类型变体
 	KeyCommonIDGenFailed        MessageID = "common.id_gen_failed"        // 生成标识或令牌失败
 	KeyCommonPathTemplateFailed MessageID = "common.path_template_failed" // 展开路径模板失败
-	KeyCommonDetail             MessageID = "common.detail"               // 受限净化原始明细
+	// keyCommonDetail 为包内私有受限净化明细键，禁止包外直接传入 EF/WrapS；
+	// 仅经 WrapSentinelDetail 与 DynamicDetailError 受控签发，并在 corecatalog/common 与双语词库维持双射。
+	keyCommonDetail MessageID = "common.detail"
 )
 
 // 本包导出的不可变哨兵错误集合，均经 Sentinel 构造以支持 errors.Is 语义匹配与边界延迟本地化。

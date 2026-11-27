@@ -18,7 +18,7 @@ const (
 func NewAnalyzer() *analysis.Analyzer {
 	return &analysis.Analyzer{
 		Name:     "i18nguard",
-		Doc:      "全仓检查 i18n MessageID 强类型完整性、禁止裸错误构造绕过与禁止生产源码硬编码 CJK/全角标点字面量",
+		Doc:      "全仓检查 i18n MessageID 强类型完整性、禁止裸错误构造绕过、禁硬编码 CJK/全角标点、哨兵防吞噬与参数散文拦截",
 		Requires: []*analysis.Analyzer{inspect.Analyzer},
 		Run:      run,
 	}
@@ -32,10 +32,12 @@ func run(pass *analysis.Pass) (any, error) {
 	if isAlwaysSkippedPkg(pkgInfo) {
 		return nil, nil
 	}
-	// 全仓所有非跳过生产包无条件执行规则 1、规则 2（含永久基础设施白名单）与规则 3。
+	// 全仓所有非跳过生产包无条件执行规则 1、规则 2（含永久基础设施白名单）、规则 3、规则 4 与规则 5。
 	checkMessageIDIntegrity(pass, pkgInfo)
 	checkRawErrorConstructions(pass, pkgInfo)
 	checkCJKLiterals(pass)
+	checkSentinelAndDetailGuards(pass)
+	checkConstParamProse(pass)
 	return nil, nil
 }
 

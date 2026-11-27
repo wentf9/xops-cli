@@ -123,7 +123,7 @@ func assertDynamicDetailErrorBehavior(t *testing.T) {
 	// DynamicDetailError 有界 UTF-8 叶子与空白安全降级。
 	dyn := DynamicDetailError("remote\xff" + strings.Repeat("a", MaxParamStringBytes+32))
 	view, ok := InspectNode(dyn)
-	if !ok || view.Sentinel != nil || view.Cause != nil || view.IsSentinel || view.Message.ID() != KeyCommonDetail {
+	if !ok || view.Sentinel != nil || view.Cause != nil || view.IsSentinel || view.Message.ID() != keyCommonDetail || view.Message.ID().String() != "common.detail" {
 		t.Fatalf("DynamicDetailError 视图异常: ok=%v view=%+v", ok, view)
 	}
 	if len(dyn.Error()) > MaxParamStringBytes || !strings.HasPrefix(dyn.Error(), "remote\uFFFD") {

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"testing/fstest"
 	"time"
+	"unicode"
 
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
@@ -478,4 +479,96 @@ func assertNestedFieldAndDisplayContracts(t *testing.T, enLoc, zhLoc *Localizer)
 		enLoc.T(KeyCLIConfigImportLabelPlan) != "plan" || zhLoc.T(KeyCLIConfigImportLabelPlan) != "预检计划" {
 		t.Error("CLI 展示标签中英文渲染异常")
 	}
+}
+
+// TestErrorTemplatesSelfContained 强校验 (CoreKeys() ∪ RootErrorKeys()) \ {"common.detail", "common.error_join"}
+// 的每条错误/诊断双语模板在剥离全部 {key} 占位符后均为自包含文本（EN 至少含 1 个 >=2 字母英文词，ZH 至少含 2 个汉字），
+// 永久封堵 "{file}:{line}"、"{section}.{key}" 或纯占位符碎片模板回流。
+func TestErrorTemplatesSelfContained(t *testing.T) {
+	cat, err := LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog() 失败: %v", err)
+	}
+	enTable := cat.entries[domi18n.LocaleEn]
+	zhTable := cat.entries[domi18n.LocaleZh]
+	keys := make([]domi18n.MessageID, 0, len(domi18n.CoreKeys())+len(RootErrorKeys()))
+	keys = append(keys, domi18n.CoreKeys()...)
+	keys = append(keys, RootErrorKeys()...)
+	for _, id := range keys {
+		key := string(id)
+		if key == "common.detail" || key == "common.error_join" {
+			continue
+		}
+		assertTemplateEntrySelfContained(t, key, enTable[key], zhTable[key])
+	}
+}
+
+func assertTemplateEntrySelfContained(t *testing.T, key string, enEntry, zhEntry Entry) {
+	t.Helper()
+	assertSelfContainedForm(t, key, "Other", enEntry.Other, zhEntry.Other)
+	if enEntry.One != "" || zhEntry.One != "" {
+		assertSelfContainedForm(t, key, "One", enEntry.One, zhEntry.One)
+	}
+}
+
+func assertSelfContainedForm(t *testing.T, key, form, enTmpl, zhTmpl string) {
+	t.Helper()
+	enStripped := stripTemplatePlaceholders(enTmpl)
+	if !hasEnglishWordMinLen(enStripped, 2) {
+		t.Errorf("键 %q (%s) EN 模板剥离占位符后缺少 >=2 字母英文实词: tmpl=%q stripped=%q", key, form, enTmpl, enStripped)
+	}
+	zhStripped := stripTemplatePlaceholders(zhTmpl)
+	if countHanRunes(zhStripped) < 2 {
+		t.Errorf("键 %q (%s) ZH 模板剥离占位符后汉字不足 2 个: tmpl=%q stripped=%q", key, form, zhTmpl, zhStripped)
+	}
+}
+
+func stripTemplatePlaceholders(tmpl string) string {
+	var b strings.Builder
+	b.Grow(len(tmpl))
+	for i := 0; i < len(tmpl); {
+		if tmpl[i] == '{' {
+			if i+1 < len(tmpl) && tmpl[i+1] == '{' {
+				i += 2
+				continue
+			}
+			if end := strings.IndexByte(tmpl[i+1:], '}'); end >= 0 {
+				i += end + 2
+				continue
+			}
+		}
+		if tmpl[i] == '}' && i+1 < len(tmpl) && tmpl[i+1] == '}' {
+			i += 2
+			continue
+		}
+		b.WriteByte(tmpl[i])
+		i++
+	}
+	return b.String()
+}
+
+func hasEnglishWordMinLen(s string, minLetters int) bool {
+	run := 0
+	for i := range len(s) {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			run++
+			if run >= minLetters {
+				return true
+			}
+			continue
+		}
+		run = 0
+	}
+	return false
+}
+
+func countHanRunes(s string) int {
+	n := 0
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) {
+			n++
+		}
+	}
+	return n
 }

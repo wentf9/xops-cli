@@ -94,3 +94,64 @@ func TestIsMessageIDOwnerPkg(t *testing.T) {
 		}
 	}
 }
+
+func TestRule4SentinelAndSkeletonPredicates(t *testing.T) {
+	assertStringPredicate(t, "isSafetyRedlineSentinel", isSafetyRedlineSentinel,
+		[]string{
+			"ErrOutcomeUnknown", "ErrAuditHalted", "ErrGateHalted", "ErrUncertainDurability",
+			"ErrUncertainCommit", "ErrUncertainOutcome", "ErrSagaUncertain", "ErrEnrollmentUncertain",
+			"ErrCommitOutcomeUnknown", "ErrNonLoopbackAddress", "ErrOrphanedProcessGroup",
+			"ErrIncludeDepthExceeded", "ErrIncludeCycle",
+		},
+		[]string{"ErrInvalidConfig", "ErrUsage", "ErrMissingAssetRef", "ErrNotFound", ""},
+	)
+	assertStringPredicate(t, "isGenericInputSentinel", isGenericInputSentinel,
+		[]string{"ErrInvalidConfig", "ErrInvalidArgument", "ErrUsage", "ErrCorruptData", "ErrCorruptJournal", "ErrCatalogCorrupt"},
+		[]string{"ErrMissingAssetRef", "ErrOutcomeUnknown", "ErrAuditHalted", "ErrUsageExtra", "ErrNotFound", ""},
+	)
+	assertStringPredicate(t, "isGenericSkeletonKey", isGenericSkeletonKey,
+		[]string{
+			"common.field_invalid", "common.field_value_invalid", "common.value_invalid",
+			"common.op_failed", "common.op_target_failed", "host.sys.syscall_failed",
+		},
+		[]string{"common.not_found", "common.detail", "inventory.node_missing_asset_ref", "mcp.non_loopback_bind"},
+	)
+}
+
+func assertStringPredicate(t *testing.T, label string, fn func(string) bool, wantTrue, wantFalse []string) {
+	t.Helper()
+	for _, s := range wantTrue {
+		if !fn(s) {
+			t.Errorf("%s(%q) = false, want true", label, s)
+		}
+	}
+	for _, s := range wantFalse {
+		if fn(s) {
+			t.Errorf("%s(%q) = true, want false", label, s)
+		}
+	}
+}
+
+func TestRule5ParamProseSlots(t *testing.T) {
+	for _, k := range []string{"reason", "detail", "op"} {
+		if !isForbiddenConstValueSlot(k) {
+			t.Errorf("isForbiddenConstValueSlot(%q) = false, want true", k)
+		}
+		if isSingleIdentParamSlot(k) {
+			t.Errorf("isSingleIdentParamSlot(%q) = true, want false", k)
+		}
+	}
+	for _, k := range []string{"field", "kind", "component", "feature", "expected", "action"} {
+		if !isSingleIdentParamSlot(k) {
+			t.Errorf("isSingleIdentParamSlot(%q) = false, want true", k)
+		}
+		if isForbiddenConstValueSlot(k) {
+			t.Errorf("isForbiddenConstValueSlot(%q) = true, want false", k)
+		}
+	}
+	for _, k := range []string{"options", "cmd", "allowed", "target", "value", "flag", "path", ""} {
+		if isForbiddenConstValueSlot(k) || isSingleIdentParamSlot(k) {
+			t.Errorf("展示/技术槽位 %q 不应命中规则 5 拦截集合", k)
+		}
+	}
+}

@@ -8,17 +8,29 @@ import (
 )
 
 const (
-	rootPrefix                   = "cli."
-	KeyRoot    domi18n.MessageID = rootPrefix + "help"
+	rootPrefix                             = "cli."
+	KeyRoot              domi18n.MessageID = rootPrefix + "help"
+	KeyHostSysSyscallErr domi18n.MessageID = "host.sys.syscall_failed"
+	KeyHostSpecific      domi18n.MessageID = "host.specific"
 )
 
 type Localizer struct{}
 
-func NewMessage(id domi18n.MessageID) domi18n.Message {
-	return domi18n.NewMessageWithFallback(id, "root")
+func Str(k, v string) domi18n.Param      { return domi18n.Str(k, v) }
+func BoundStr(k, v string) domi18n.Param { return domi18n.BoundStr(k, v) }
+func NewMessage(id domi18n.MessageID, params ...domi18n.Param) domi18n.Message {
+	return domi18n.NewMessageWithFallback(id, "root", params...)
 }
-func Sentinel(id domi18n.MessageID) error                       { return domi18n.SentinelWithFallback(id, "root") }
-func E(id domi18n.MessageID) error                              { return domi18n.NewErrorWithFallback(nil, nil, id, "root") }
+func Sentinel(id domi18n.MessageID) error { return domi18n.SentinelWithFallback(id, "root") }
+func E(id domi18n.MessageID, params ...domi18n.Param) error {
+	return domi18n.NewErrorWithFallback(nil, nil, id, "root", params...)
+}
+func EF(s error, id domi18n.MessageID, params ...domi18n.Param) error {
+	return domi18n.NewErrorWithFallback(s, nil, id, "root", params...)
+}
+func WrapS(s, c error, id domi18n.MessageID, params ...domi18n.Param) error {
+	return domi18n.NewErrorWithFallback(s, c, id, "root", params...)
+}
 func (*Localizer) T(id domi18n.MessageID) string                { return "" }
 func (*Localizer) TPlural(id domi18n.MessageID, n int64) string { return "" }
 

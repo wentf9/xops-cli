@@ -81,7 +81,7 @@ host.store.import_warn.unsupported_directive: "skipped unsupported {directive} \
 
 # ---- YAML vNext Codec Errors (internal/host/store/yamlcodec) ----
 host.yaml.unsupported_schema_version: "yamlcodec: unsupported config schema version (only version: 2 is supported)"
-host.yaml.section_key: "{section}.{key}"
+host.yaml.section_key: "invalid YAML entry {section}.{key}"
 host.yaml.empty_config: "config file is empty"
 host.yaml.decode_failed: "failed to decode YAML vNext document"
 host.yaml.invalid_version: "unsupported schema version {version} (expected 2)"

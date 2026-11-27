@@ -176,7 +176,7 @@ func assertAllViewsInLocale(t *testing.T, m tui.Model, loc domi18n.Locale) {
 			"警告：检测到未知终态（OutcomeUnknown）— 严禁自动重试",
 			"[过滤]：db",
 			"主机与节点（1/2）版本=rev-7",
-			"错误：日志流（db-01）：上下文已超时",
+			"错误：日志数据流（db-01）：上下文已超时",
 			"L 语言",
 		)
 	} else {
