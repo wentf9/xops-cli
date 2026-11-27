@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 
@@ -79,7 +78,7 @@ func (s DoctorSeverity) MarshalText() ([]byte, error) { return s.AppendText(nil)
 // UnmarshalText 实现 encoding.TextUnmarshaler；非法文本时失败关闭将接收者归零为 DoctorSeverityInvalid。
 func (s *DoctorSeverity) UnmarshalText(text []byte) error {
 	if s == nil {
-		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNil, domi18n.Str("field", "DoctorSeverity receiver"))
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNil, domi18n.Str("field", "DoctorSeverity"))
 	}
 	parsed, err := ParseDoctorSeverity(string(text))
 	if err != nil {
@@ -91,11 +90,47 @@ func (s *DoctorSeverity) UnmarshalText(text []byte) error {
 }
 
 // DoctorFinding 描述单条凭据健康诊断发现（仅含脱敏元数据，严禁包含任何明文）。
+// Message 恒为面向 JSON/MCP 契约的规范英文文本；Localized 与 Cause 物理屏蔽于 JSON 之外，
+// 供 CLI/TUI 展示层延迟本地化主句并递归渲染下层结构化根因错误。
 type DoctorFinding struct {
-	Severity DoctorSeverity `json:"severity"`
-	Code     string         `json:"code"`
-	Subject  string         `json:"subject,omitzero"`
-	Message  string         `json:"message"`
+	Severity  DoctorSeverity                    `json:"severity"`
+	Code      string                            `json:"code"`
+	Subject   string                            `json:"subject,omitzero"`
+	Message   string                            `json:"message"`
+	Localized algebraic.Option[domi18n.Message] `json:"-"` // 人类视图结构化主句（JSON/MCP 物理屏蔽）
+	Cause     error                             `json:"-"` // 可选下层结构化根因错误，供 CLI 递归本地化
+}
+
+// NewLocalizedDoctorFinding 构造双轨只读诊断发现：自动由结构化 msg 与可选 cause 派生脱敏规范英文 Message，
+// 并保留 json:"-" 的 Localized 与 Cause 供展示层按语种延迟渲染，保证单源零漂移。
+func NewLocalizedDoctorFinding(sev DoctorSeverity, code, subject string, msg domi18n.Message, cause error) DoctorFinding {
+	var locOpt algebraic.Option[domi18n.Message]
+	if msg.IsValid() {
+		locOpt = algebraic.Some(msg)
+	}
+	return DoctorFinding{
+		Severity:  sev,
+		Code:      code,
+		Subject:   subject,
+		Message:   security.SanitizePromptText(canonicalFindingText(msg, cause)),
+		Localized: locOpt,
+		Cause:     cause,
+	}
+}
+
+func canonicalFindingText(msg domi18n.Message, cause error) string {
+	head := msg.Canonical()
+	if cause == nil {
+		return head
+	}
+	tail := cause.Error()
+	if head == "" {
+		return tail
+	}
+	if tail == "" {
+		return head
+	}
+	return head + ": " + tail
 }
 
 // DoctorRequest 描述只读凭据系统诊断请求。
@@ -175,7 +210,7 @@ func InspectVaultAndSecrets(ctx context.Context, spec VaultSecretCheckSpec) Vaul
 		return res
 	}
 	if spec.Vault == nil {
-		appendVaultFinding(&res, DoctorSeverityWarn, "vault_unavailable", "", "SecretVault is not configured; skipping read-only secret probe")
+		appendVaultFinding(&res, DoctorSeverityWarn, "vault_unavailable", "", domi18n.NewMessage(domi18n.KeyUCDoctorVaultUnavailable), nil)
 		return res
 	}
 	if vState.unlocked {
@@ -218,7 +253,7 @@ func checkVaultControlStatus(ctx context.Context, ctrl ports.VaultControlPort, h
 	}
 	st, err := ctrl.Status(ctx)
 	if err != nil {
-		appendVaultFinding(res, DoctorSeverityError, "vault_status_failed", "", "failed to query vault status: "+err.Error())
+		appendVaultFinding(res, DoctorSeverityError, "vault_status_failed", "", domi18n.NewMessage(domi18n.KeyUCDoctorVaultStatusFailed), err)
 		return vaultDoctorState{}
 	}
 	res.VaultStatus = algebraic.Some(st)
@@ -226,13 +261,13 @@ func checkVaultControlStatus(ctx context.Context, ctrl ports.VaultControlPort, h
 	case ports.VaultStateUnlocked:
 		return vaultDoctorState{knownStores: st.KnownStores(), unlocked: true}
 	case ports.VaultStateLocked:
-		appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", "", "vault is locked; skipping read-only secret probe")
+		appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", "", domi18n.NewMessage(domi18n.KeyUCDoctorVaultLockedSkip), nil)
 		return vaultDoctorState{knownStores: st.KnownStores()}
 	case ports.VaultStateUninitialized:
-		appendVaultFinding(res, DoctorSeverityWarn, "vault_uninitialized", "", "vault is not initialized")
+		appendVaultFinding(res, DoctorSeverityWarn, "vault_uninitialized", "", domi18n.NewMessage(domi18n.KeyUCDoctorVaultUninit), nil)
 		return vaultDoctorState{knownStores: st.KnownStores()}
 	default:
-		appendVaultFinding(res, DoctorSeverityError, "vault_state_invalid", "", "vault returned invalid state")
+		appendVaultFinding(res, DoctorSeverityError, "vault_state_invalid", "", domi18n.NewMessage(domi18n.KeyUCDoctorVaultStateInvalid), nil)
 		return vaultDoctorState{}
 	}
 }
@@ -247,7 +282,7 @@ func (s *Service) doctorLoadGraphRefs(
 	}
 	snap, err := s.store.Load(ctx)
 	if err != nil {
-		addDoctorFinding(rep, DoctorSeverityError, "store_load_failed", "", "failed to load inventory graph: "+err.Error())
+		addDoctorFinding(rep, DoctorSeverityError, "store_load_failed", "", domi18n.NewMessage(domi18n.KeyUCDoctorStoreLoadGraph), err)
 		// 存储加载失败时仍保留活跃 Pending 凭据引用参与后续存储白名单与只读探活诊断。
 		return pendingToSecretRefs(pending), nil
 	}
@@ -272,7 +307,11 @@ func checkUnknownSecretStores(allRefs []inventory.SecretReference, knownStores [
 	for _, sr := range allRefs {
 		if !slices.Contains(knownStores, sr.Ref.Store()) {
 			appendVaultFinding(res, DoctorSeverityError, "unknown_secret_store", sr.Ref.String(),
-				fmt.Sprintf("%s (%s) references unregistered secret store %q", sr.OwnerID, sr.Location, sr.Ref.Store()))
+				domi18n.NewMessage(domi18n.KeyUCDoctorUnknownStore,
+					domi18n.BoundStr("owner", sr.OwnerID),
+					domi18n.BoundStr("location", sr.Location.String()),
+					domi18n.BoundStr("store", sr.Ref.Store()),
+				), nil)
 		}
 	}
 }
@@ -288,31 +327,21 @@ func probeDistinctSecrets(ctx context.Context, vault ports.SecretVault, distinct
 		switch {
 		case err == nil:
 		case errors.Is(err, ports.ErrSecretNotFound):
-			appendVaultFinding(res, DoctorSeverityError, "secret_not_found", ref.String(), "referenced secret entry is missing from vault")
+			appendVaultFinding(res, DoctorSeverityError, "secret_not_found", ref.String(), domi18n.NewMessage(domi18n.KeyUCDoctorSecretNotFound), nil)
 		case errors.Is(err, ports.ErrVaultLocked):
-			appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", ref.String(), "vault is locked; unable to probe secret entry")
+			appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", ref.String(), domi18n.NewMessage(domi18n.KeyUCDoctorVaultLockedProbe), nil)
 		default:
-			appendVaultFinding(res, DoctorSeverityError, "secret_probe_failed", ref.String(), "read-only secret probe failed: "+err.Error())
+			appendVaultFinding(res, DoctorSeverityError, "secret_probe_failed", ref.String(), domi18n.NewMessage(domi18n.KeyUCDoctorSecretProbeFailed), err)
 		}
 	}
 }
 
-func appendVaultFinding(res *VaultSecretCheckResult, sev DoctorSeverity, code, subject, msg string) {
-	res.Findings = append(res.Findings, DoctorFinding{
-		Severity: sev,
-		Code:     code,
-		Subject:  subject,
-		Message:  security.SanitizePromptText(msg),
-	})
+func appendVaultFinding(res *VaultSecretCheckResult, sev DoctorSeverity, code, subject string, msg domi18n.Message, cause error) {
+	res.Findings = append(res.Findings, NewLocalizedDoctorFinding(sev, code, subject, msg, cause))
 }
 
-func addDoctorFinding(rep *DoctorReport, sev DoctorSeverity, code, subject, msg string) {
-	rep.Findings = append(rep.Findings, DoctorFinding{
-		Severity: sev,
-		Code:     code,
-		Subject:  subject,
-		Message:  security.SanitizePromptText(msg),
-	})
+func addDoctorFinding(rep *DoctorReport, sev DoctorSeverity, code, subject string, msg domi18n.Message, cause error) {
+	rep.Findings = append(rep.Findings, NewLocalizedDoctorFinding(sev, code, subject, msg, cause))
 	if sev == DoctorSeverityError {
 		rep.Healthy = false
 	}

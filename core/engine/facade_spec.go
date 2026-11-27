@@ -727,7 +727,7 @@ func mapEngineError(err error) error {
 		return nil
 	}
 	var groups []engineErrGroup
-	if _, isCh := errors.AsType[*gate.ApprovalChallengeError](err); isCh && !errors.Is(err, ErrApprovalRequired) {
+	if ch, isCh := errors.AsType[*gate.ApprovalChallengeError](err); isCh && ch != nil && ch.IsValid() && !errors.Is(err, ErrApprovalRequired) {
 		groups = addEngineErrGroup(groups, ErrApprovalRequired, gate.ErrApprovalRequired)
 	}
 	for _, r := range engineErrorRules() {

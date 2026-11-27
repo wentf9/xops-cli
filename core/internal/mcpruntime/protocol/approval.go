@@ -194,7 +194,7 @@ func SanitizeErrorMessage(raw string) string { return sanitizeErrorText(raw) }
 func NewToolSuccessResult(payload any, extraBlocks ...ContentBlock) (CallToolResult, error) {
 	raw, err := MarshalCanonical(payload)
 	if err != nil {
-		return CallToolResult{}, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal tool result"))
+		return CallToolResult{}, domi18n.Wrap(err, domi18n.KeyMCPProtoMarshalFailed, domi18n.Str("target", "tool_result"))
 	}
 	blocks := make([]ContentBlock, 0, 1+len(extraBlocks))
 	blocks = append(blocks, NewTextContent(string(raw)))
@@ -211,7 +211,7 @@ func NewToolErrorResult(err error) (CallToolResult, int, error) {
 	code, payload := ClassifyError(err)
 	raw, mErr := MarshalCanonical(payload)
 	if mErr != nil {
-		return CallToolResult{}, CodeInternalError, domi18n.Wrap(mErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal tool error payload"))
+		return CallToolResult{}, CodeInternalError, domi18n.Wrap(mErr, domi18n.KeyMCPProtoMarshalFailed, domi18n.Str("target", "tool_error"))
 	}
 	return CallToolResult{
 		Content:           []ContentBlock{NewTextContent(string(raw))},

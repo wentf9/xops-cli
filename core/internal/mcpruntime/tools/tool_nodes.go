@@ -64,7 +64,7 @@ func (r *Registry) callNodes(ctx context.Context, rawArgs jsontext.Value) (proto
 	case "list_import_formats", "plan_import", "apply_import":
 		return r.nodesImport(ctx, args, risk, approval)
 	default:
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "nodes action"), domi18n.BoundStr("value", args.Action))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPUnknownToolAction, domi18n.Str("tool", protocol.ToolNameNodes), domi18n.BoundStr("action", args.Action))
 	}
 }
 

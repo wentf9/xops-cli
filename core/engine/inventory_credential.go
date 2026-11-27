@@ -202,7 +202,7 @@ func (e *Engine) probePendingEnrollment(ctx context.Context,
 		return zeroFP, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Risk"))
 	}
 	if e.hostTrustObs == nil {
-		return zeroFP, domi18n.EF(ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "host key trust observer"))
+		return zeroFP, domi18n.EF(ErrUnsupported, domi18n.KeyEngineHostKeyObserverUnsup)
 	}
 	res, err := e.inventory.ResolvePendingEnrollmentTarget(ctx, lease, req.CLIOptions)
 	if err != nil {
@@ -210,7 +210,7 @@ func (e *Engine) probePendingEnrollment(ctx context.Context,
 	}
 	targetHop, ok := res.Plan().Target()
 	if !ok {
-		return zeroFP, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "pending connection plan"))
+		return zeroFP, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "pending_connection_plan"))
 	}
 	ep := targetHop.Endpoint()
 	gateReq, err := uccred.BuildGateRequest[security.CapInspect](

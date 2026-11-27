@@ -2,7 +2,6 @@ package inventory
 
 import (
 	"context"
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -125,7 +124,7 @@ func (s *Service) ResolveStagedTarget(ctx context.Context, req ResolveStagedTarg
 		return ResolvedTarget{}, err
 	}
 	if !req.Node.IsValid() || (hasH && !h.IsValid()) || (hasI && !id.IsValid()) {
-		return ResolvedTarget{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "staged Host/Identity/Node"))
+		return ResolvedTarget{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "staged_asset"))
 	}
 	parsed, err := targetparse.ParseSpec(req.Node.ID().String(), ErrInvalidTarget)
 	var managedIdx *managedGraphIndex
@@ -198,13 +197,13 @@ func (s *Service) validateResolveInputs(ctx context.Context, req ResolveTargetRe
 	case ctx.Err() != nil:
 		return ctx.Err()
 	case req.ExplicitAuth != nil && !req.ExplicitAuth.IsValid():
-		return domi18n.EF(ErrNoAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExplicitAuth"))
+		return domi18n.WrapSentinel(ErrNoAuthMethod, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExplicitAuth")))
 	}
 	if err := req.CLIOptions.Validate(); err != nil {
 		return domi18n.WrapS(ErrInvalidTarget, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "CLIOptions"))
 	}
 	if exp, ok := req.ExplicitOrigin.Get(); ok && !s.supportsExplicitOrigin(exp) {
-		return domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", "origin "+exp.String()))
+		return domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyUCInvOriginUnsupported, domi18n.Str("origin", exp.String()))
 	}
 	return nil
 }
@@ -248,7 +247,7 @@ func (idx *managedGraphIndex) lookupManagedEntities(name string) (node inventory
 	host, okH := idx.hosts[node.HostRef()]
 	ident, okI := idx.identities[node.IdentityRef()]
 	if !okH || !okI {
-		return zeroVal[inventory.Node](), zeroVal[inventory.Host](), zeroVal[inventory.Identity](), false, domi18n.EF(inventory.ErrMissingAssetRef, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "lookup Host/Identity"), domi18n.BoundStr("target", node.ID().String()))
+		return zeroVal[inventory.Node](), zeroVal[inventory.Host](), zeroVal[inventory.Identity](), false, domi18n.EF(inventory.ErrMissingAssetRef, domi18n.KeyInvNodeMissingAssetRef, domi18n.BoundStr("node", node.ID().String()))
 	}
 	return node, host, ident, true, nil
 }
@@ -273,7 +272,7 @@ func (s *Service) resolveHopRecursive(ctx context.Context, st *resolveState, pt 
 		return z, err
 	}
 	if depth > st.maxJumpDepth {
-		return z, domi18n.WrapS(ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "ProxyJump depth"), domi18n.Int("count", depth), domi18n.Int("limit", st.maxJumpDepth))
+		return z, domi18n.WrapS(ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, domi18n.KeyUCInvProxyDepthLimit, domi18n.Int("depth", depth), domi18n.Int("limit", st.maxJumpDepth))
 	}
 	hopIn, err := s.resolveHopInputs(ctx, st, pt, cliOpts, explicitOrigin, explicitAuth, depth, preferOpenSSH)
 	if err != nil {
@@ -333,7 +332,7 @@ func (s *Service) tryResolveManagedHop(ctx context.Context, st *resolveState, pt
 		return resolvedHopInputs{}, false, pickIf[error](err != nil, err, pickIf[error](hasExp, domi18n.EF(ErrAssetNotFound, domi18n.KeyUCInvNodeNotFound, domi18n.BoundStr("node", pt.OrigHost.String())), nil))
 	}
 	if hasExp && node.Origin().Kind() != exp {
-		return resolvedHopInputs{}, false, domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyCommonMismatch, domi18n.BoundStr("field", "node "+node.ID().String()+" origin"), domi18n.Str("expected", exp.String()), domi18n.Str("actual", node.Origin().Kind().String()))
+		return resolvedHopInputs{}, false, domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyUCInvNodeOriginMismatch, domi18n.BoundStr("node", node.ID().String()), domi18n.Str("expected", exp.String()), domi18n.Str("actual", node.Origin().Kind().String()))
 	}
 	return s.buildManagedHopInputs(ctx, st, pt, cliOpts, explicitAuth, depth, node, host, ident)
 }
@@ -394,7 +393,7 @@ func buildNodeOrigin(kind option.OriginKind, origHost option.OriginalHostSpec, v
 	case option.OriginAdHoc:
 		return inventory.NewOriginAdHoc(algebraic.None[inventory.NodeID]())
 	default:
-		return nil, domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "OriginKind"), domi18n.BoundStr("value", kind.String()))
+		return nil, domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyUCInvOriginUnsupported, domi18n.Str("origin", kind.String()))
 	}
 }
 func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, route option.ProxyRoute, depth int, preferOpenSSH bool) error {
@@ -417,7 +416,7 @@ func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, rou
 		_, err = s.resolveHopRecursive(ctx, st, lastParsed, upstreamCLI, algebraic.None[option.OriginKind](), nil, depth+1, preferOpenSSH)
 		return err
 	default:
-		return domi18n.EF(ErrInvalidTarget, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", fmt.Sprintf("ProxyRoute %T", route)))
+		return domi18n.EF(ErrInvalidTarget, domi18n.KeyCommonUnsupportedVariant, domi18n.Str("type", "ProxyRoute"))
 	}
 }
 func buildPrefixJumpLayer(prefix []option.HopTarget) (option.OptionLayer, error) {
@@ -436,7 +435,7 @@ func buildPrefixJumpLayer(prefix []option.HopTarget) (option.OptionLayer, error)
 }
 func (s *Service) appendResolvedHop(st *resolveState, nodeLabel string, policy option.EffectivePolicy, explicitAuth inventory.AuthMethod) error {
 	if len(st.hops) >= maxPlanHops {
-		return domi18n.WrapS(ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "connection plan hops"), domi18n.Int("count", len(st.hops)+1), domi18n.Int("limit", maxPlanHops))
+		return domi18n.WrapS(ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, domi18n.KeyUCInvPlanHopsLimit, domi18n.Int("count", len(st.hops)+1), domi18n.Int("limit", maxPlanHops))
 	}
 	user, err := s.resolveHopUsername(policy)
 	if err != nil {

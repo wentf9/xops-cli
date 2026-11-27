@@ -75,7 +75,7 @@ func ProcessScreenshotBytes(raw []byte) (ProcessedScreenshot, error) {
 	}
 	var out bytes.Buffer
 	if err := jpeg.Encode(&out, scaled, &jpeg.Options{Quality: screenshotJPEGQuality}); err != nil {
-		return ProcessedScreenshot{}, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "jpeg_encode"))
+		return ProcessedScreenshot{}, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyUCObsJPEGEncodeFailed)
 	}
 	return ProcessedScreenshot{MIMEType: "image/jpeg", Width: dstW, Height: dstH, OrigWidth: origW, OrigHeight: origH, Data: out.Bytes()}, nil
 }
@@ -98,30 +98,30 @@ func validateImageDimensions(w, h int) error {
 // parseWebPDimensions 纯 Go 解析 WebP RIFF 容器长度与 VP8/VP8L/VP8X 宽高头，阻断截断伪造载荷与像素炸弹。
 func parseWebPDimensions(raw []byte) (int, int, error) {
 	if len(raw) < 20 || !isWebP(raw) {
-		return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_header"))
+		return 0, 0, domi18n.WrapSentinel(ErrScreenshotInvalid, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_header")))
 	}
 	riffSize := uint64(binary.LittleEndian.Uint32(raw[4:8]))
 	chunkSize := uint64(binary.LittleEndian.Uint32(raw[16:20]))
 	if riffSize < 12 || riffSize+8 > uint64(len(raw)) || 20+chunkSize > uint64(len(raw)) {
-		return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_chunk_size"))
+		return 0, 0, domi18n.WrapSentinel(ErrScreenshotInvalid, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_chunk_size")))
 	}
 	var w, h int
 	switch string(raw[12:16]) {
 	case "VP8 ":
 		if chunkSize < 10 || raw[20]&0x01 != 0 || raw[23] != 0x9d || raw[24] != 0x01 || raw[25] != 0x2a {
-			return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8_header"))
+			return 0, 0, domi18n.WrapSentinel(ErrScreenshotInvalid, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8_header")))
 		}
 		w = int(binary.LittleEndian.Uint16(raw[26:28]) & 0x3fff)
 		h = int(binary.LittleEndian.Uint16(raw[28:30]) & 0x3fff)
 	case "VP8L":
 		if chunkSize < 5 || raw[20] != 0x2f {
-			return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8l_header"))
+			return 0, 0, domi18n.WrapSentinel(ErrScreenshotInvalid, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8l_header")))
 		}
 		bits := binary.LittleEndian.Uint32(raw[21:25])
 		w, h = int(bits&0x3fff)+1, int((bits>>14)&0x3fff)+1
 	case "VP8X":
 		if chunkSize < 10 {
-			return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8x_header"))
+			return 0, 0, domi18n.WrapSentinel(ErrScreenshotInvalid, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8x_header")))
 		}
 		w = int(uint32(raw[24])|uint32(raw[25])<<8|uint32(raw[26])<<16) + 1
 		h = int(uint32(raw[27])|uint32(raw[28])<<8|uint32(raw[29])<<16) + 1
@@ -149,14 +149,14 @@ func decodeGuardedImage(raw []byte) (image.Image, int, int, error) {
 		return nil, 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyUCObsImageFormat)
 	}
 	if err != nil {
-		return nil, 0, 0, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "image_header_decode"))
+		return nil, 0, 0, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyUCObsImageDecodeFailed)
 	}
 	if err := validateImageDimensions(cfg.Width, cfg.Height); err != nil {
 		return nil, 0, 0, err
 	}
 	img, err := decodeFn(bytes.NewReader(raw))
 	if err != nil {
-		return nil, 0, 0, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "image_decode"))
+		return nil, 0, 0, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyUCObsImageDecodeFailed)
 	}
 	b := img.Bounds()
 	return img, b.Dx(), b.Dy(), nil

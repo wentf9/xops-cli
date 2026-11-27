@@ -668,8 +668,8 @@ func TestSecretReferencedError_NilAndZeroLocalizableSafety(t *testing.T) {
 			t.Fatalf("%s SecretReferencedError 必须零值失效且 Unwrap==nil", name)
 		}
 		view := e.LocalizableView()
-		if !errors.Is(view.Sentinel, credential.ErrSecretStillReferenced) || view.Message.IsValid() {
-			t.Fatalf("%s LocalizableView 必须退化为纯哨兵视图: %+v", name, view)
+		if view.Sentinel != nil || !view.Message.IsValid() || view.Message.ID() != domi18n.KeyUCCredSecretReferenced {
+			t.Fatalf("%s LocalizableView 必须退化为无哨兵纯消息兜底: %+v", name, view)
 		}
 		if e.Error() != want || domi18n.CanonicalError(e) != want {
 			t.Fatalf("%s Error/CanonicalError 期望 %q，实际 err=%q canon=%q", name, want, e.Error(), domi18n.CanonicalError(e))

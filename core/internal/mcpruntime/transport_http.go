@@ -56,7 +56,7 @@ func (s *Server) ListenAndServeHTTP(ctx context.Context, addr string) error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
-		return domi18n.Wrap(err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "listen MCP HTTP"), domi18n.BoundStr("target", addr))
+		return domi18n.Wrap(err, domi18n.KeyMCPHTTPListenFailed, domi18n.BoundStr("addr", addr))
 	}
 	return s.ServeHTTPListener(ctx, ln)
 }
@@ -108,7 +108,7 @@ func (s *Server) ServeHTTPListener(ctx context.Context, ln net.Listener) error {
 func validateHTTPBindAddr(addr string, allowNonLoopback bool) error {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
-		return domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "listen address"), domi18n.BoundStr("value", addr))
+		return domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyMCPInvalidListenAddr, domi18n.BoundStr("addr", addr))
 	}
 	if allowNonLoopback {
 		return nil
@@ -118,7 +118,7 @@ func validateHTTPBindAddr(addr string, allowNonLoopback bool) error {
 	}
 	ip, pErr := netip.ParseAddr(host)
 	if pErr != nil || !ip.IsLoopback() {
-		return domi18n.EF(ErrNonLoopbackAddress, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "listen address"), domi18n.BoundStr("value", addr))
+		return domi18n.EF(ErrNonLoopbackAddress, domi18n.KeyMCPNonLoopbackBind, domi18n.BoundStr("addr", addr))
 	}
 	return nil
 }
@@ -186,7 +186,7 @@ func checkLoopbackHostName(host string) error {
 		return err
 	}
 	if !ip.IsLoopback() {
-		return domi18n.EF(ErrNonLoopbackAddress, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "host"), domi18n.BoundStr("value", host))
+		return domi18n.EF(ErrNonLoopbackAddress, domi18n.KeyMCPNonLoopbackHost, domi18n.BoundStr("host", host))
 	}
 	return nil
 }
@@ -357,7 +357,7 @@ func (s *Server) createHTTPSession(protoVer string) (string, error) {
 	}
 	var raw [sessionIDEntropyLen]byte
 	if _, err := io.ReadFull(s.entropy, raw[:]); err != nil {
-		return "", domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "allocate MCP HTTP session ID"))
+		return "", domi18n.Wrap(err, domi18n.KeyCommonIDGenFailed, domi18n.Str("kind", "session_id"))
 	}
 	sid := hex.EncodeToString(raw[:])
 	s.sessMu.Lock()
@@ -439,7 +439,7 @@ func readBoundedHTTPBody(w http.ResponseWriter, r *http.Request, maxBytes int64)
 		if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
 			return nil, http.StatusRequestEntityTooLarge, domi18n.WrapSentinel(ErrMessageTooLarge, err)
 		}
-		return nil, http.StatusBadRequest, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "read HTTP request body"))
+		return nil, http.StatusBadRequest, domi18n.Wrap(err, domi18n.KeyMCPHTTPReadBodyFailed)
 	}
 	return data, 0, nil
 }

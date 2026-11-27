@@ -263,7 +263,7 @@ func confirmAutoAskMuxAttach(ctx context.Context, muxPort ports.MuxSocketPort, i
 func verifyDialedMuxConn(conn ports.TransportConn, leafDigest plan.HopDigest, ep netaddr.Endpoint) (ports.TransportConn, bool, error) {
 	if conn == nil || !conn.IsAlive() || !conn.HopDigest().Equal(leafDigest) || !conn.Endpoint().Equal(ep) {
 		_ = closeClosers(conn)
-		return nil, false, domi18n.EF(ErrMuxMasterUnavailable, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "mux_conn"))
+		return nil, false, domi18n.WrapSentinel(ErrMuxMasterUnavailable, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "mux_conn")))
 	}
 	return conn, true, nil
 }
@@ -342,7 +342,7 @@ func expandControlPath(targetHop plan.HopSpec, spec option.ControlPathSpec, env 
 	if !spec.IsLiteral() {
 		expanded, err := option.ExpandPathTokens(raw, tokCtx)
 		if err != nil {
-			return zeroVal[pathalg.LocalSourcePath](), domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "expand_control_path"))
+			return zeroVal[pathalg.LocalSourcePath](), domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonPathTemplateFailed, domi18n.BoundStr("target", raw))
 		}
 		raw = expanded
 	}

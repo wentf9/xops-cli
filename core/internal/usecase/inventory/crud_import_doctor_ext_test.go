@@ -583,13 +583,13 @@ func TestReferencedErrors_NilAndZeroLocalizableSafety(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	var nilAsset *ucinv.AssetReferencedError
 	var zeroAssetVal ucinv.AssetReferencedError
-	assertInvalidRefErr(t, "nil AssetReferencedError", nilAsset, ucinv.ErrAssetStillReferenced)
-	assertInvalidRefErr(t, "zero AssetReferencedError", &zeroAssetVal, ucinv.ErrAssetStillReferenced)
+	assertInvalidRefErr(t, "nil AssetReferencedError", nilAsset, ucinv.ErrAssetStillReferenced, domi18n.KeyUCInvAssetReferenced)
+	assertInvalidRefErr(t, "zero AssetReferencedError", &zeroAssetVal, ucinv.ErrAssetStillReferenced, domi18n.KeyUCInvAssetReferenced)
 
 	var nilSec *ucinv.SecretReferencedError
 	var zeroSecVal ucinv.SecretReferencedError
-	assertInvalidRefErr(t, "nil SecretReferencedError", nilSec, ucinv.ErrSecretStillReferenced)
-	assertInvalidRefErr(t, "zero SecretReferencedError", &zeroSecVal, ucinv.ErrSecretStillReferenced)
+	assertInvalidRefErr(t, "nil SecretReferencedError", nilSec, ucinv.ErrSecretStillReferenced, domi18n.KeyUCInvSecretReferenced)
+	assertInvalidRefErr(t, "zero SecretReferencedError", &zeroSecVal, ucinv.ErrSecretStillReferenced, domi18n.KeyUCInvSecretReferenced)
 }
 
 type invalidRefErrNode interface {
@@ -599,12 +599,12 @@ type invalidRefErrNode interface {
 	Unwrap() error
 }
 
-func assertInvalidRefErr(t *testing.T, label string, e invalidRefErrNode, wantSentinel error) {
+func assertInvalidRefErr(t *testing.T, label string, e invalidRefErrNode, wantSentinel error, wantKey domi18n.MessageID) {
 	t.Helper()
 	if e.IsValid() || e.Unwrap() != nil || errors.Is(e, wantSentinel) {
 		t.Fatalf("%s 必须零值失效且 Unwrap==nil", label)
 	}
-	if v := e.LocalizableView(); !errors.Is(v.Sentinel, wantSentinel) || v.Message.IsValid() {
+	if v := e.LocalizableView(); v.Sentinel != nil || !v.Message.IsValid() || v.Message.ID() != wantKey {
 		t.Fatalf("%s LocalizableView 失配: %+v", label, v)
 	}
 	want := wantSentinel.Error()
@@ -737,16 +737,30 @@ func TestDoctor_ReadOnlyZeroLeakAndDiagnostics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("jsonv2.Marshal(DoctorReport): %v", err)
 	}
-	if strings.Contains(string(encoded), topSecret) {
+	assertInvDoctorReportContract(t, encoded, topSecret, rep.Findings, []string{
+		"openssh_alias_shadowed", "secret_not_found", "private_key_fingerprint_mismatch", "unused_host",
+	})
+}
+
+func assertInvDoctorReportContract(t *testing.T, encoded []byte, topSecret string, findings []ucinv.DoctorFinding, wantCodes []string) {
+	t.Helper()
+	raw := string(encoded)
+	if strings.Contains(raw, topSecret) {
 		t.Fatalf("DoctorReport 泄露了机密明文!")
 	}
-	codes := make(map[string]bool, len(rep.Findings))
-	for _, f := range rep.Findings {
+	if strings.Contains(raw, `"Localized"`) || strings.Contains(raw, `"Cause"`) {
+		t.Fatalf("DoctorReport JSON 不得暴露 json:\"-\" 双轨字段: %s", raw)
+	}
+	codes := make(map[string]bool, len(findings))
+	for _, f := range findings {
+		if msg, ok := f.Localized.Get(); !ok || !msg.IsValid() {
+			t.Fatalf("DoctorFinding(%s) 必须携带有效 Localized 结构化消息: %+v", f.Code, f)
+		}
 		codes[f.Code] = true
 	}
-	for _, want := range []string{"openssh_alias_shadowed", "secret_not_found", "private_key_fingerprint_mismatch", "unused_host"} {
+	for _, want := range wantCodes {
 		if !codes[want] {
-			t.Fatalf("Doctor 遗漏预期告警 %q，实际=%v", want, rep.Findings)
+			t.Fatalf("Doctor 遗漏预期告警 %q，实际=%v", want, findings)
 		}
 	}
 }

@@ -77,7 +77,7 @@ func (r *Registry) callTransfer(ctx context.Context, rawArgs jsontext.Value) (pr
 	case "inspect":
 		return r.transferInspect(ctx, base, args)
 	default:
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "transfer action"), domi18n.BoundStr("value", args.Action))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPUnknownToolAction, domi18n.Str("tool", protocol.ToolNameTransfer), domi18n.BoundStr("action", args.Action))
 	}
 }
 

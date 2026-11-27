@@ -234,7 +234,7 @@ func (e *Engine) ReconcileCrashedAudits(ctx context.Context) (ReconcileReport, e
 func (e *Engine) NewOperationStream(ctx context.Context, buffer int) (*events.OperationStream, error) {
 	return runOp(e, ctx, func(context.Context) (*events.OperationStream, error) {
 		if buffer < 0 {
-			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "OperationStream buffer"))
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "operation_stream_buffer"))
 		}
 		if buffer == 0 {
 			buffer = defaultOperationStreamBuffer
@@ -242,7 +242,7 @@ func (e *Engine) NewOperationStream(ctx context.Context, buffer int) (*events.Op
 		tid, e1 := trace.NewTraceIDFrom(e.entropy)
 		oid, e2 := trace.NewOpIDFrom(e.entropy)
 		if err := errors.Join(e1, e2); err != nil {
-			return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "allocate TraceID/OperationID"))
+			return nil, domi18n.Wrap(err, domi18n.KeyCommonIDGenFailed, domi18n.Str("kind", "TraceID/OperationID"))
 		}
 		return events.NewOperationStream(events.OperationStreamConfig{TraceID: tid, OperationID: oid, OperationBuffer: buffer})
 	})

@@ -68,7 +68,7 @@ func (r *Registry) callGUI(ctx context.Context, rawArgs jsontext.Value) (protoco
 	case "inspect_session", "close_session":
 		return r.guiManageSession(ctx, args)
 	default:
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "gui action"), domi18n.BoundStr("value", args.Action))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPUnknownToolAction, domi18n.Str("tool", protocol.ToolNameGUI), domi18n.BoundStr("action", args.Action))
 	}
 }
 

@@ -294,12 +294,12 @@ func (l *PendingEnrollmentLease) convergeUnfinished(ctx context.Context, phase f
 	switch phase {
 	case fsm.PendingEnrollPhaseCommitting:
 		// CommitCAS 期间 panic 绝不可投递 Cancel（FSM 拒绝），须按结果未知转入 Uncertain 并保留钉住。
-		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_commit_panic", domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
+		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_commit_panic", domi18n.DynamicDetailError(reason))
 		return l.driveNew(ctx, true, func() (fsm.PendingEnrollInput, error) {
 			return fsm.EnrollInputCommitResult(fsm.DurabilityOutcomeUnknown, reason)
 		})
 	case fsm.PendingEnrollPhaseCleaningUp:
-		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_cleanup_interrupted", domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
+		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_cleanup_interrupted", domi18n.DynamicDetailError(reason))
 		return l.driveNew(ctx, true, func() (fsm.PendingEnrollInput, error) {
 			return fsm.EnrollInputCleanupResult(fsm.SideEffectOutcomeUnknown, reason)
 		})

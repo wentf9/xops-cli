@@ -103,9 +103,9 @@ func ResolveUploadTarget(ctx context.Context, rfs ports.RemoteFSPort, dest patha
 		return zeroVal[pathalg.RemotePath](), err
 	}
 	if exists && isDir != wantDir {
-		return zeroVal[pathalg.RemotePath](), pickIf(wantDir, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "exists_non_dir")), domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "target_is_dir")))
+		return zeroVal[pathalg.RemotePath](), pickIf(wantDir, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonExistsNonDir))), domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonTargetIsDir))))
 	}
-	return dest, pickIf[error](exists && noClobber, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "no_clobber")), nil)
+	return dest, pickIf[error](exists && noClobber, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonNoClobber))), nil)
 }
 func expandUploadContainer(ctx context.Context, rfs ports.RemoteFSPort, dest pathalg.RemotePath, sourceBase string, invalidErr error) (pathalg.RemotePath, bool, bool, error) {
 	joined, err := JoinRemoteBase(dest, sourceBase, invalidErr)

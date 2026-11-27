@@ -119,10 +119,10 @@ func (e *SecretReferencedError) Unwrap() error {
 	return ErrSecretStillReferenced
 }
 
-// LocalizableView 实现 domi18n.LocalizableNode，返回脱敏结构化错误节点视图（nil 或无效实例退化为纯哨兵视图）。
+// LocalizableView 实现 domi18n.LocalizableNode，返回脱敏结构化错误节点视图（nil 或无效实例退化为无哨兵纯消息兜底，与 Unwrap()==nil 一致）。
 func (e *SecretReferencedError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return domi18n.ErrorNode{Sentinel: ErrSecretStillReferenced}
+		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyUCCredSecretReferenced)}
 	}
 	return domi18n.ErrorNode{
 		Sentinel: ErrSecretStillReferenced,

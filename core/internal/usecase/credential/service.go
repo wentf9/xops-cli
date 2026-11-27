@@ -342,7 +342,7 @@ func (s *Service) WithPromptedSecret(ctx context.Context, prompt ports.SecretPro
 func (s *Service) allocateRandomRef(storeID string) (secret.Ref, error) {
 	var raw [randomSecretItemBytes]byte
 	if _, err := io.ReadFull(s.entropy, raw[:]); err != nil {
-		return zeroVal[secret.Ref](), domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate random secret item"))
+		return zeroVal[secret.Ref](), domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyUCCredGenItemFailed)
 	}
 	return secret.NewRef(storeID, "sec-"+hex.EncodeToString(raw[:]))
 }

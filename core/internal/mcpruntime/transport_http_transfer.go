@@ -72,7 +72,7 @@ func parseTransferStreamPath(urlPath string) (security.OperationID, error) {
 	trimmed := strings.TrimPrefix(urlPath, "/transfers/")
 	idStr, suffix, ok := strings.Cut(trimmed, "/")
 	if !ok || suffix != "stream" || idStr == "" {
-		return zeroID, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "transfer stream path"), domi18n.BoundStr("value", urlPath))
+		return zeroID, domi18n.E(domi18n.KeyMCPTransferPathInvalid, domi18n.BoundStr("path", urlPath))
 	}
 	tid, err := security.ParseOperationID(idStr)
 	if err != nil {

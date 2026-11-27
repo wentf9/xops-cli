@@ -22,7 +22,7 @@ const stdioReadBufBytes = 64 * 1024
 //     调用方需同时关闭传入的 in 读端以立即解除底层阻塞读取并完成优雅停机。
 func (s *Server) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) error {
 	if in == nil || out == nil {
-		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "stdio reader/writer"))
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "stdio_io"))
 	}
 	runCtx, cleanup, err := s.beginTransport(ctx)
 	if err != nil {

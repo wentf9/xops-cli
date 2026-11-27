@@ -136,7 +136,7 @@ func validateRecursiveUploadParams(req SCPUploadRequest) (int, uint64, error) {
 		return 0, 0, domi18n.WrapS(ErrInvalidRequest, ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "recursive_operator_upload"))
 	}
 	if !req.SymlinkPolicy.IsValid() || req.SymlinkPolicy != pathalg.SymlinkReject {
-		return 0, 0, domi18n.WrapS(ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SymlinkPolicy"), domi18n.Str("value", req.SymlinkPolicy.String()))
+		return 0, 0, domi18n.WrapSentinel(ErrSymlinkPolicyDenied, domi18n.Wrap(ports.ErrSymlinkRejected, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SymlinkPolicy"), domi18n.Str("value", req.SymlinkPolicy.String())), ports.ErrSymlinkRejected)
 	}
 	return resolveRecursiveLimits(req.MaxFiles, req.MaxTotalBytes)
 }
@@ -312,7 +312,7 @@ func (s *Service) executeRecursiveSCPUpload(ctx context.Context, binding securit
 			out, sErr = s.uploadScopedDirectoryTree(ctx, binding, rfs, root, emitter, lstat, params)
 			return sErr
 		default:
-			return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", src.scopedPath.String()), domi18n.Str("reason", "not_regular_file"))
+			return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", src.scopedPath.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonNotRegular)))
 		}
 	})
 	if err != nil || !isRegular {
@@ -404,7 +404,7 @@ func walkLocalUploadEntry(ctx context.Context, root ports.RootHandle, localDir p
 		pl.totalBytes, pl.files, pl.allLocal = pl.totalBytes+uint64(childStat.Size()), append(pl.files, plannedUploadFile{plannedUploadDir: plannedUploadDir{remote: childRemote, perm: childStat.Perm(), modTime: childStat.ModTime()}, local: childLocal}), append(pl.allLocal, childLocal)
 		return nil
 	default:
-		return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", childLocal.String()), domi18n.Str("reason", "not_regular_file"))
+		return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", childLocal.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonNotRegular)))
 	}
 }
 func (s *Service) createRemoteUploadDirs(ctx context.Context, binding security.OperationBinding, rfs ports.RemoteFSPort, dirs []plannedUploadDir, out *SCPUploadResult) error {
@@ -413,7 +413,7 @@ func (s *Service) createRemoteUploadDirs(ctx context.Context, binding security.O
 			return err
 		}
 		if exists, isDir, err := remotecanon.InspectUploadTarget(ctx, rfs, d.remote); err != nil || (exists && !isDir) {
-			return pickIf[error](err != nil, err, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", d.remote.String()), domi18n.Str("reason", "exists_non_dir")))
+			return pickIf[error](err != nil, err, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", d.remote.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonExistsNonDir))))
 		}
 		if err := rfs.MkdirAll(ctx, d.remote, d.perm); err != nil {
 			return err
@@ -424,7 +424,7 @@ func (s *Service) createRemoteUploadDirs(ctx context.Context, binding security.O
 }
 func (s *Service) uploadOnePlannedFile(ctx context.Context, binding security.OperationBinding, rfs ports.RemoteFSPort, root ports.RootHandle, emitter *transferEmitter, f plannedUploadFile, limits ports.ReadLimits, base uploadExecParams, out *SCPUploadResult) error {
 	if exists, isDir, err := remotecanon.InspectUploadTarget(ctx, rfs, f.remote); err != nil || (exists && (isDir || base.req.NoClobber)) {
-		return pickIf[error](err != nil, err, pickIf(isDir, domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", f.remote.String()), domi18n.Str("reason", "target_is_dir")), domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", f.remote.String()), domi18n.Str("reason", "already_exists"))))
+		return pickIf[error](err != nil, err, pickIf(isDir, domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", f.remote.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonTargetIsDir))), domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", f.remote.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonAlreadyExist)))))
 	}
 	if err := remotecanon.VerifyPathAuthorized(ctx, s.strictPaths(), rfs, binding, f.remote, canonSentinels()); err != nil {
 		return err

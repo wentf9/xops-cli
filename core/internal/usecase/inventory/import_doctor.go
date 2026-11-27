@@ -235,14 +235,14 @@ func (s *Service) resolveImportBundle(ctx context.Context, req ImportSourceReque
 	fmtName := strings.ToLower(strings.TrimSpace(req.Format))
 	imp, ok := s.importers[fmtName]
 	if !ok {
-		return z, domi18n.EF(ErrUnknownImportFormat, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "import format"), domi18n.BoundStr("value", fmtName))
+		return z, domi18n.EF(ErrUnknownImportFormat, domi18n.KeyUCInvUnknownImportFmtVal, domi18n.BoundStr("format", fmtName))
 	}
 	bundle, err := imp.Import(ctx, pickIf(strings.TrimSpace(req.SourceName) != "", req.SourceName, fmtName), req.Reader)
 	if err != nil {
 		return z, err
 	}
 	if !bundle.IsValid() {
-		return z, domi18n.EF(inventory.ErrInvalidImportBundle, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "import bundle validation"), domi18n.BoundStr("target", fmtName))
+		return z, domi18n.EF(inventory.ErrInvalidImportBundle, domi18n.KeyUCInvImportBundleInvalid, domi18n.BoundStr("format", fmtName))
 	}
 	return bundle, nil
 }
@@ -279,12 +279,12 @@ func (s *Service) Doctor(ctx context.Context, req DoctorRequest) (DoctorReport, 
 func (s *Service) runDoctor(ctx context.Context, req DoctorRequest, pending []inventory.PendingSecretRef) DoctorReport {
 	rep := DoctorReport{Healthy: true, ActivePendingCount: len(pending)}
 	for _, p := range pending {
-		addFinding(&rep, DoctorSeverityInfo, "active_pending_secret_pin", p.Ref.String(), "secret is pinned by pending enrollment lease to prevent GC: "+p.OwnerID)
+		addFinding(&rep, DoctorSeverityInfo, "active_pending_secret_pin", p.Ref.String(), domi18n.NewMessage(domi18n.KeyUCDoctorPendingSecretPin, domi18n.BoundStr("owner", p.OwnerID)), nil)
 	}
 	var allRefs []inventory.SecretReference
 	var graphStores []string
 	if snap, err := s.store.Load(ctx); err != nil {
-		addFinding(&rep, DoctorSeverityError, "store_load_failed", "", "failed to load inventory store snapshot: "+err.Error())
+		addFinding(&rep, DoctorSeverityError, "store_load_failed", "", domi18n.NewMessage(domi18n.KeyUCDoctorStoreLoadSnap), err)
 		for _, p := range pending {
 			allRefs = append(allRefs, inventory.SecretReference{Location: inventory.SecretLocPending, OwnerID: p.OwnerID, Ref: p.Ref})
 		}
@@ -307,7 +307,7 @@ func (s *Service) runDoctor(ctx context.Context, req DoctorRequest, pending []in
 }
 func (s *Service) doctorCheckGraphTopology(ctx context.Context, g inventory.Graph, checkKeys bool, rep *DoctorReport) {
 	if dagRep, err := inventory.ValidateProxyDAG(g.Nodes(), s.doctorCheckOpenSSH(ctx, g, rep), s.maxJumpDepth); err != nil {
-		addFinding(rep, DoctorSeverityError, "proxy_dag_invalid", "", "cross-namespace ProxyJump DAG validation failed: "+err.Error())
+		addFinding(rep, DoctorSeverityError, "proxy_dag_invalid", "", domi18n.NewMessage(domi18n.KeyUCDoctorProxyDAGInvalid), err)
 	} else {
 		rep.DAGMaxDepth = dagRep.MaxObservedDepth
 	}
@@ -316,12 +316,12 @@ func (s *Service) doctorCheckGraphTopology(ctx context.Context, g inventory.Grap
 	}
 	for _, h := range g.Hosts() {
 		if len(g.FindHostReferences(h.ID())) == 0 {
-			addFinding(rep, DoctorSeverityInfo, "unused_host", h.ID().String(), "Host is not referenced by any Node")
+			addFinding(rep, DoctorSeverityInfo, "unused_host", h.ID().String(), domi18n.NewMessage(domi18n.KeyUCDoctorUnusedHost), nil)
 		}
 	}
 	for _, id := range g.Identities() {
 		if len(g.FindIdentityReferences(id.ID())) == 0 {
-			addFinding(rep, DoctorSeverityInfo, "unused_identity", id.ID().String(), "Identity is not referenced by any Node")
+			addFinding(rep, DoctorSeverityInfo, "unused_identity", id.ID().String(), domi18n.NewMessage(domi18n.KeyUCDoctorUnusedIdentity), nil)
 		}
 	}
 }
@@ -331,30 +331,30 @@ func (s *Service) doctorCheckOpenSSH(ctx context.Context, g inventory.Graph, rep
 	}
 	vhs, err := s.openSSH.ListVirtualHosts(ctx)
 	if err != nil {
-		addFinding(rep, DoctorSeverityWarn, "openssh_source_error", "", "failed to read OpenSSH read-only configuration: "+err.Error())
+		addFinding(rep, DoctorSeverityWarn, "openssh_source_error", "", domi18n.NewMessage(domi18n.KeyUCDoctorOpenSSHReadFailed), err)
 		return nil
 	}
 	managed := indexManagedNames(g.Nodes())
 	for _, vh := range vhs {
 		if vh.IsValid() && managed[vh.Alias()] {
-			addFinding(rep, DoctorSeverityWarn, "openssh_alias_shadowed", vh.Alias(), "managed node ID or alias shadows OpenSSH Host alias")
+			addFinding(rep, DoctorSeverityWarn, "openssh_alias_shadowed", vh.Alias(), domi18n.NewMessage(domi18n.KeyUCDoctorOpenSSHAliasShadow), nil)
 		}
 	}
 	jns, err := virtualHostsToJumpNodes(vhs)
 	if err != nil {
-		addFinding(rep, DoctorSeverityWarn, "openssh_jump_invalid", "", "invalid OpenSSH virtual host jump configuration: "+err.Error())
+		addFinding(rep, DoctorSeverityWarn, "openssh_jump_invalid", "", domi18n.NewMessage(domi18n.KeyUCDoctorOpenSSHJumpInvalid), err)
 		return nil
 	}
 	return jns
 }
 func (s *Service) doctorCheckPrivateKeys(ctx context.Context, g inventory.Graph, rep *DoctorReport) {
 	if s.keySigner == nil {
-		addFinding(rep, DoctorSeverityWarn, "key_signer_unavailable", "", "KeySignerPort is not configured; skipping private key verification")
+		addFinding(rep, DoctorSeverityWarn, "key_signer_unavailable", "", domi18n.NewMessage(domi18n.KeyUCDoctorKeySignerUnavail), nil)
 		return
 	}
 	for _, id := range g.Identities() {
 		if err := s.inspectAuthPrivateKeys(ctx, id.ID().String(), id.Auth(), rep); err != nil {
-			addFinding(rep, DoctorSeverityError, "unknown_auth_method", id.ID().String(), err.Error())
+			addFinding(rep, DoctorSeverityError, "unknown_auth_method", id.ID().String(), domi18n.NewMessage(domi18n.KeyUCDoctorUnknownAuthMethod), err)
 		}
 	}
 }
@@ -380,17 +380,17 @@ func (s *Service) checkPrivateKeySet(ctx context.Context, ownerID string, pk *in
 	matched, inspected := !hasPB, false
 	for _, kp := range pk.KeyPaths().Slice() {
 		if fp, err := s.keySigner.InspectPrivateKeyFingerprint(ctx, kp, passOpt); err != nil {
-			addFinding(rep, DoctorSeverityError, "private_key_inspect_failed", ownerID, "failed to verify private key ("+kp.String()+"): "+err.Error())
+			addFinding(rep, DoctorSeverityError, "private_key_inspect_failed", ownerID, domi18n.NewMessage(domi18n.KeyUCDoctorPrivKeyInspectFail, domi18n.BoundStr("path", kp.String())), err)
 		} else {
 			inspected, matched = true, matched || (hasPB && fp.Equal(pb.KeyFingerprint()))
 		}
 	}
 	if hasPB && inspected && !matched {
-		addFinding(rep, DoctorSeverityError, "private_key_fingerprint_mismatch", ownerID, "encrypted private key fingerprint does not match configured binding")
+		addFinding(rep, DoctorSeverityError, "private_key_fingerprint_mismatch", ownerID, domi18n.NewMessage(domi18n.KeyUCDoctorPrivKeyFPMismatch), nil)
 	}
 }
-func addFinding(rep *DoctorReport, sev DoctorSeverity, code, subject, msg string) {
-	appendDoctorFinding(rep, DoctorFinding{Severity: sev, Code: code, Subject: subject, Message: security.SanitizePromptText(msg)})
+func addFinding(rep *DoctorReport, sev DoctorSeverity, code, subject string, msg domi18n.Message, cause error) {
+	appendDoctorFinding(rep, credential.NewLocalizedDoctorFinding(sev, code, subject, msg, cause))
 }
 func appendDoctorFinding(rep *DoctorReport, f DoctorFinding) {
 	rep.Findings = append(rep.Findings, f)

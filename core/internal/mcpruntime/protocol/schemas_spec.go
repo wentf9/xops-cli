@@ -289,7 +289,7 @@ func ToolDescriptors() ([]ToolDescriptor, error) {
 	for _, sp := range specs {
 		val := jsontext.Value(sp.raw)
 		if err := val.Canonicalize(); err != nil {
-			return nil, domi18n.WrapS(ErrInvalidSchema, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "canonicalize tool schema"), domi18n.BoundStr("target", sp.name))
+			return nil, domi18n.WrapS(ErrInvalidSchema, err, domi18n.KeyMCPProtoSchemaCanonFailed, domi18n.BoundStr("tool", sp.name))
 		}
 		out = append(out, ToolDescriptor{
 			Name:        sp.name,

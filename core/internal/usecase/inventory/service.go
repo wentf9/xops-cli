@@ -101,7 +101,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 			Gate: svc.gate, Vault: svc.vault, VaultControl: svc.vaultControl, Store: svc.store,
 			Interaction: svc.interaction, Clock: svc.clock, Entropy: svc.entropy, PendingRefs: svc,
 		}); err != nil {
-			return nil, domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "initialize built-in CredentialService"))
+			return nil, domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyUCInvInitCredSvcFailed)
 		}
 	}
 	return svc, nil
@@ -228,7 +228,7 @@ func (s *Service) resolveAuthoritativeKnownStores(ctx context.Context, base inve
 	if s.vaultControl != nil {
 		st, err := s.vaultControl.Status(ctx)
 		if err != nil {
-			return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "query authoritative vault known stores"))
+			return nil, domi18n.Wrap(err, domi18n.KeyUCInvQueryStoresFailed)
 		}
 		vaultStores = st.KnownStores()
 	}
@@ -337,7 +337,7 @@ func wrapCommitError(sentinel error, detail string, cause error) error {
 		return domi18n.WrapSentinel(sentinel, cause)
 	}
 	if detail != "" {
-		return domi18n.WrapSentinel(sentinel, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", detail)))
+		return domi18n.WrapSentinelDetail(sentinel, nil, detail)
 	}
 	return sentinel
 }
@@ -349,7 +349,7 @@ func buildImporterRegistry(raw []ports.FormatImporter) (map[string]ports.FormatI
 		}
 		name := strings.ToLower(strings.TrimSpace(imp.Format()))
 		if _, dup := reg[name]; dup {
-			return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "import format"), domi18n.BoundStr("value", name))
+			return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyUCInvDupImportFormat, domi18n.BoundStr("format", name))
 		}
 		reg[name] = imp
 	}
@@ -360,7 +360,7 @@ func normalizeKnownStores(raw []string) ([]string, error) {
 	for _, s := range raw {
 		t := strings.TrimSpace(s)
 		if t == "" {
-			return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "KnownStores entry"))
+			return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "known_stores_entry"))
 		}
 		out = append(out, t)
 	}

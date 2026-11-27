@@ -296,12 +296,12 @@ func checkLocalNoClobber(root ports.RootHandle, dest pathalg.LocalRootedDest, no
 		return nil
 	}
 	_, err := root.Lstat(dest)
-	return pickIf[error](err == nil, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "already_exists")), pickIf[error](errors.Is(err, ports.ErrNotFound), nil, err))
+	return pickIf[error](err == nil, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonAlreadyExist))), pickIf[error](errors.Is(err, ports.ErrNotFound), nil, err))
 }
 func createLocalSymlink(root ports.RootHandle, dest pathalg.LocalRootedDest, target string, noClobber bool) error {
 	if st, err := root.Lstat(dest); err == nil {
 		if noClobber || st.IsDir() {
-			return pickIf(noClobber, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "already_exists")), domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "symlink_over_dir")))
+			return pickIf(noClobber, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonAlreadyExist))), domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonLinkOverDir))))
 		}
 		if rmErr := root.Remove(dest); rmErr != nil {
 			return rmErr

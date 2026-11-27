@@ -19,7 +19,7 @@ import (
 func compileHopAuth(policy option.EffectivePolicy, user option.Username, env ports.EnvPort, explicit inventory.AuthMethod) (inventory.AuthMethod, error) {
 	if explicit != nil {
 		if !explicit.IsValid() {
-			return nil, domi18n.EF(ErrNoAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "explicit AuthMethod"))
+			return nil, domi18n.WrapSentinel(ErrNoAuthMethod, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExplicitAuth")))
 		}
 		return explicit, nil
 	}
@@ -161,7 +161,7 @@ func expandOptionPathEntry(entry option.PathEntry, tc option.TokenContext, env p
 		expanded, err = expandEnvBraces(expanded, env)
 	}
 	if err != nil {
-		return "", domi18n.WrapS(ErrInvalidTarget, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "expand path template"), domi18n.BoundStr("target", raw))
+		return "", domi18n.WrapS(ErrInvalidTarget, err, domi18n.KeyCommonPathTemplateFailed, domi18n.BoundStr("target", raw))
 	}
 	if strings.ContainsRune(expanded, '%') || strings.Contains(expanded, "${") {
 		return "", domi18n.EF(ErrInvalidTarget, domi18n.KeyUCInvTemplateToken, domi18n.BoundStr("template", raw))
@@ -184,7 +184,7 @@ func expandEnvBraces(raw string, env ports.EnvPort) (string, error) {
 		b.WriteString(raw[i : i+idx])
 		end := strings.IndexByte(raw[i+idx+2:], '}')
 		if end <= 0 {
-			return "", domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "environment variable placeholder"))
+			return "", domi18n.E(domi18n.KeyUCInvEnvVarPlaceholder)
 		}
 		name := raw[i+idx+2 : i+idx+2+end]
 		val, ok := env.LookupEnv(name)

@@ -108,7 +108,7 @@ func (e *AssetReferencedError) Unwrap() error {
 }
 func (e *AssetReferencedError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return domi18n.ErrorNode{Sentinel: ErrAssetStillReferenced}
+		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyUCInvAssetReferenced)}
 	}
 	return domi18n.ErrorNode{
 		Sentinel: ErrAssetStillReferenced,
@@ -141,7 +141,7 @@ func (e *SecretReferencedError) Unwrap() error {
 }
 func (e *SecretReferencedError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return domi18n.ErrorNode{Sentinel: ErrSecretStillReferenced}
+		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyUCInvSecretReferenced)}
 	}
 	return domi18n.ErrorNode{
 		Sentinel: ErrSecretStillReferenced,

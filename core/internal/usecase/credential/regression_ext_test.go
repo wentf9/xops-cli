@@ -15,6 +15,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -257,6 +258,7 @@ func TestDoctor_AuthoritativeKnownStoresAndPendingOnStoreFailure(t *testing.T) {
 		!hasCredFinding(repLoadFail.Findings, credential.DoctorSeverityError, "secret_not_found") {
 		t.Fatalf("store.Load 失败时须保留 Pending 参与诊断: rep=%+v err=%v", repLoadFail, err)
 	}
+	assertCredDoctorFindingsLocalized(t, repLoadFail.Findings, io.ErrUnexpectedEOF)
 
 	// 3. InspectVaultAndSecrets 在 ProbeSecrets=true 且 Vault==nil 时必须发出 Warn(vault_unavailable)。
 	vRes := credential.InspectVaultAndSecrets(ctx, credential.VaultSecretCheckSpec{
@@ -264,6 +266,21 @@ func TestDoctor_AuthoritativeKnownStoresAndPendingOnStoreFailure(t *testing.T) {
 	})
 	if !hasCredFinding(vRes.Findings, credential.DoctorSeverityWarn, "vault_unavailable") {
 		t.Fatalf("ProbeSecrets=true 且 Vault==nil 应发出 vault_unavailable Warn: %+v", vRes.Findings)
+	}
+	if msg, ok := vRes.Findings[0].Localized.Get(); !ok || msg.ID() != domi18n.KeyUCDoctorVaultUnavailable {
+		t.Fatalf("vault_unavailable 必须绑定 KeyUCDoctorVaultUnavailable: %+v", vRes.Findings[0])
+	}
+}
+
+func assertCredDoctorFindingsLocalized(t *testing.T, findings []credential.DoctorFinding, wantStoreCause error) {
+	t.Helper()
+	for _, f := range findings {
+		if msg, ok := f.Localized.Get(); !ok || !msg.IsValid() {
+			t.Fatalf("DoctorFinding(%s) 必须携带有效 Localized 结构化主句: %+v", f.Code, f)
+		}
+		if f.Code == "store_load_failed" && !errors.Is(f.Cause, wantStoreCause) {
+			t.Fatalf("store_load_failed 必须保留下层结构化 Cause，实际=%v", f.Cause)
+		}
 	}
 }
 

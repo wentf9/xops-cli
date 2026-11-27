@@ -172,10 +172,10 @@ func (s *Service) resolvePOSIXProfileInLease(ctx context.Context, opener ports.S
 	}
 	res, err := s.shellProbe.ProbeShell(ctx, opener)
 	if err != nil {
-		return zeroVal[execution.LaunchProfile](), domi18n.WrapS(ErrPOSIXShellRequired, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "probe_shell"))
+		return zeroVal[execution.LaunchProfile](), domi18n.WrapS(ErrPOSIXShellRequired, err, domi18n.KeyUCObsProbeShellFailed)
 	}
 	if err := res.LaunchProfile().ValidatePOSIXBourne(); err != nil {
-		return zeroVal[execution.LaunchProfile](), domi18n.WrapS(ErrPOSIXShellRequired, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "shell_dialect"), domi18n.BoundStr("value", res.Dialect().String()+"/"+res.Interpreter().String()))
+		return zeroVal[execution.LaunchProfile](), domi18n.WrapSentinel(ErrPOSIXShellRequired, domi18n.Wrap(err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "shell_dialect"), domi18n.BoundStr("value", res.Dialect().String()+"/"+res.Interpreter().String())))
 	}
 	return res.LaunchProfile(), nil
 }

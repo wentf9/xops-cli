@@ -116,7 +116,7 @@ func executeAnchoredPatch(ctx context.Context, rfs ports.RemoteFSPort, req Patch
 		return PatchFileResult{}, err
 	}
 	if expAnc, okA := req.ExpectedAnchor.Get(); okA && !expAnc.Matches(beforeStat.Anchor()) {
-		return PatchFileResult{}, domi18n.EF(ports.ErrRemoteAnchorMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExpectedAnchor"))
+		return PatchFileResult{}, domi18n.WrapSentinel(ports.ErrRemoteAnchorMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExpectedAnchor")))
 	} else if expDig, okD := req.ExpectedDigest.Get(); okD && !expDig.Equal(beforeDigest) {
 		return PatchFileResult{}, domi18n.WrapSentinel(ErrPatchConflict, ErrDigestMismatch)
 	}
@@ -137,7 +137,7 @@ func applyTextEdits(content string, edits []TextEdit) (string, int, error) {
 	for i, ed := range edits {
 		oldStr, count := ed.OldText(), strings.Count(cur, ed.OldText())
 		if count == 0 || (!ed.ReplaceAll() && count > 1) {
-			return "", 0, pickIf(count == 0, domi18n.WrapS(ErrPatchConflict, ErrPatchNoMatch, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "Edits"), domi18n.Int("index", i)), domi18n.WrapS(ErrPatchConflict, ErrPatchAmbiguous, domi18n.KeyUCTransferPatchMulti, domi18n.Int("index", i), domi18n.Int("count", count)))
+			return "", 0, pickIf(count == 0, domi18n.WrapS(ErrPatchConflict, ErrPatchNoMatch, domi18n.KeyUCTransferPatchNoHitIdx, domi18n.Int("index", i)), domi18n.WrapS(ErrPatchConflict, ErrPatchAmbiguous, domi18n.KeyUCTransferPatchMulti, domi18n.Int("index", i), domi18n.Int("count", count)))
 		}
 		cur, total = strings.Replace(cur, oldStr, ed.NewText(), pickIf(ed.ReplaceAll(), -1, 1)), total+pickIf(ed.ReplaceAll(), count, 1)
 	}

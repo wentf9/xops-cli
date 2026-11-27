@@ -80,7 +80,7 @@ func (s *Service) validateSCPDownloadRequest(ctx context.Context, req SCPDownloa
 		return hop, spec, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LocalRoot/LocalDest/ExpectedDigest"))
 	}
 	if !req.SymlinkPolicy.IsValid() || req.SymlinkPolicy == pathalg.SymlinkFollowOperatorSource {
-		return hop, spec, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SymlinkPolicy"), domi18n.Str("value", req.SymlinkPolicy.String()))
+		return hop, spec, domi18n.WrapSentinel(ErrSymlinkPolicyDenied, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SymlinkPolicy"), domi18n.Str("value", req.SymlinkPolicy.String())))
 	}
 	maxFiles, maxBytes, e1 := resolveRecursiveLimits(req.MaxFiles, req.MaxTotalBytes)
 	cs, conc, e2 := s.resolveChunkAndConcurrency(req.ChunkSize, req.Concurrency)
@@ -112,7 +112,7 @@ func (s *Service) executeSCPDownload(ctx context.Context, rfs ports.RemoteFSPort
 		return s.downloadSingleSymlink(ctx, rfs, req)
 	case ports.RemoteFileDir:
 		if !req.Recursive {
-			return out, domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", req.RemoteSource.String()), domi18n.Str("reason", "recursive_required"))
+			return out, domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", req.RemoteSource.String()), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCTransferReasonRecursiveReq)))
 		}
 		spec.req.ExpectedDigest = algebraic.None[security.Digest]()
 		return s.downloadDirectoryTree(ctx, rfs, emitter, lstat, spec)

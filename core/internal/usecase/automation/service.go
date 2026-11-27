@@ -235,7 +235,7 @@ func (s *Service) appendVirtualSelectorNodes(ctx context.Context, sel playbook.T
 func (s *Service) resolveSingleTargetNode(ctx context.Context, id inventory.NodeID, tags []inventory.Tag, execProf algebraic.Option[execution.LaunchProfile], cliOpts option.OptionLayer) (TargetNode, error) {
 	resolved, err := s.inventory.ResolveTarget(ctx, ucinv.ResolveTargetRequest{Target: id.String(), CLIOptions: cliOpts})
 	if err != nil {
-		return TargetNode{}, domi18n.Wrap(err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "resolve target"), domi18n.BoundStr("target", id.String()))
+		return TargetNode{}, domi18n.Wrap(err, domi18n.KeyUCAutoResolveTargetFailed, domi18n.BoundStr("target", id.String()))
 	}
 	return NewTargetNode(TargetNodeSpec{NodeID: id, Plan: resolved.Plan(), Tags: tags, DefaultProfile: execProf})
 }
@@ -274,7 +274,7 @@ func filterAndSortTargets(candidates []TargetNode, sel playbook.TargetSelector, 
 	out := make([]TargetNode, 0, len(candidates))
 	for _, t := range candidates {
 		if seen[t.nodeID] {
-			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "target node"), domi18n.BoundStr("value", t.nodeID.String()))
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyUCAutoDupTargetNode, domi18n.BoundStr("node", t.nodeID.String()))
 		}
 		seen[t.nodeID] = true
 		if (hasSel && !sel.Matches(t.nodeID, t.tags)) || isNodeExcluded(t.nodeID, t.tags, exNodes, exTags) {
@@ -382,7 +382,7 @@ func resolveCanonicalRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p p
 		}
 		suffix, cur = append(suffix, base), cur.Dir()
 	}
-	return zeroVal[pathalg.RemotePath](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "remote path canonicalization hops"), domi18n.Int("count", len(suffix)), domi18n.Int("limit", maxRemoteCanonicalHops))
+	return zeroVal[pathalg.RemotePath](), domi18n.EF(ErrInvalidRequest, domi18n.KeyUCAutoRemoteCanonHops, domi18n.Int("count", len(suffix)), domi18n.Int("limit", maxRemoteCanonicalHops))
 }
 
 func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (pathalg.RemotePath, error) {
@@ -392,7 +392,7 @@ func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.Rem
 	dot, _ := pathalg.ParseRemotePath(".")
 	cwd, err := rfs.RealPath(ctx, dot)
 	if err != nil || !cwd.IsAbs() {
-		return zeroVal[pathalg.RemotePath](), firstErr(err, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", cwd.String()), domi18n.Str("reason", "remote working directory must be absolute")))
+		return zeroVal[pathalg.RemotePath](), firstErr(err, domi18n.EF(ErrInvalidRequest, domi18n.KeyUCTransferRemoteAbs))
 	}
 	return cwd.Resolve(p)
 }
@@ -406,7 +406,7 @@ func expandDanglingSymlinkStep(ctx context.Context, rfs ports.RemoteFSPort, cur 
 		return zeroVal[pathalg.RemotePath](), false, err
 	}
 	if *hops >= pathalg.MaxSymlinkHops {
-		return zeroVal[pathalg.RemotePath](), false, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "remote symlink hops"), domi18n.Int("count", *hops), domi18n.Int("limit", pathalg.MaxSymlinkHops))
+		return zeroVal[pathalg.RemotePath](), false, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyUCTransferRemoteHops, domi18n.Int("limit", pathalg.MaxSymlinkHops))
 	}
 	*hops++
 	raw, err := rfs.ReadLink(ctx, cur)
@@ -431,7 +431,7 @@ func resolveSymlinkBase(ctx context.Context, rfs ports.RemoteFSPort, cur, target
 	}
 	realParent, err := rfs.RealPath(ctx, cur.Dir())
 	if err != nil || !realParent.IsAbs() {
-		return zeroVal[pathalg.RemotePath](), firstErr(err, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", realParent.String()), domi18n.Str("reason", "remote symlink parent directory must be absolute")))
+		return zeroVal[pathalg.RemotePath](), firstErr(err, domi18n.EF(ErrInvalidRequest, domi18n.KeyUCTransferRemoteAbs))
 	}
 	return realParent.Resolve(targetP)
 }
@@ -459,7 +459,7 @@ func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.Rem
 			return root == "/" || cs == root || strings.HasPrefix(cs, root+"/")
 		})
 	if !ok {
-		return domi18n.EF(gate.ErrScopeEscalated, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target.String()), domi18n.BoundStr("reason", "canonicalized to unauthorized target "+canon.String()))
+		return domi18n.EF(gate.ErrScopeEscalated, domi18n.KeyUCTransferRemoteDrift, domi18n.BoundStr("path", target.String()), domi18n.BoundStr("target", canon.String()))
 	}
 	return nil
 }

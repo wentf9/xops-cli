@@ -404,7 +404,7 @@ func (s *Service) inspectAuthorizedTransfer(ctx context.Context, req InspectTran
 }
 func (s *Service) validateHandleCall(ctx context.Context, base CallBase, handle plan.ManagedHandle[plan.KindTransfer]) (hop plan.HopSpec, err error) {
 	if hop, err = s.validateBaseCall(ctx, base); err != nil || s.journals == nil || !handle.IsValid() || !handle.MatchesPlan(base.Plan.PlanDigest()) {
-		return zeroVal[plan.HopSpec](), firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, pickIf[error](!handle.IsValid(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ManagedHandle")), domi18n.EF(ErrTransferHandleMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ManagedHandle")))))
+		return zeroVal[plan.HopSpec](), firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, pickIf[error](!handle.IsValid(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ManagedHandle")), domi18n.WrapSentinel(ErrTransferHandleMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ManagedHandle"))))))
 	}
 	return hop, nil
 }

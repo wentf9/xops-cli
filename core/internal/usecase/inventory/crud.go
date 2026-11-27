@@ -158,7 +158,7 @@ func (s *Service) GetNode(ctx context.Context, id inventory.NodeID, req QueryReq
 func getAssetByID[T any, ID fmt.Stringer](ctx context.Context, s *Service, req QueryRequest, kind string, id ID, idValid bool, extract func(inventory.Graph) []T, match func(T) bool) (z T, rev ports.Revision, err error) {
 	if !idValid {
 		closeIfNonNil(req.OperationStream)
-		return z, rev, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", kind+" ID"))
+		return z, rev, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", kind+"_id"))
 	}
 	items, rev, err := listAssets(ctx, s, req, extract)
 	if err != nil {
@@ -167,7 +167,7 @@ func getAssetByID[T any, ID fmt.Stringer](ctx context.Context, s *Service, req Q
 	if idx := slices.IndexFunc(items, match); idx >= 0 {
 		return items[idx], rev, nil
 	}
-	return z, zeroVal[ports.Revision](), domi18n.WrapSentinel(ErrAssetNotFound, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", kind+" "+id.String())))
+	return z, zeroVal[ports.Revision](), domi18n.WrapSentinelDetail(ErrAssetNotFound, nil, kind+" "+id.String())
 }
 
 // ValidateDAG 经 CapInspect 鉴权对托管资产图与全部 OpenSSH 虚拟主机执行跨命名空间 Tarjan SCC ProxyJump 校验；
@@ -314,7 +314,7 @@ func upsertAsset[T any](items []T, item T, upd bool, kind, id string, match func
 	case !upd && idx >= 0:
 		return nil, zeroVal[T](), domi18n.EF(ErrAssetAlreadyExists, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", kind), domi18n.BoundStr("value", id))
 	case upd && idx < 0:
-		return nil, zeroVal[T](), domi18n.WrapSentinel(ErrAssetNotFound, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", kind+" "+id)))
+		return nil, zeroVal[T](), domi18n.WrapSentinelDetail(ErrAssetNotFound, nil, kind+" "+id)
 	case upd:
 		prev := items[idx]
 		items[idx] = item
@@ -326,7 +326,7 @@ func upsertAsset[T any](items []T, item T, upd bool, kind, id string, match func
 func removeProtectedAsset[T any](items []T, kind, id string, match func(T) bool, canDel func() (bool, []inventory.AssetReference)) ([]T, T, error) {
 	idx := slices.IndexFunc(items, match)
 	if idx < 0 {
-		return nil, zeroVal[T](), domi18n.WrapSentinel(ErrAssetNotFound, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", kind+" "+id)))
+		return nil, zeroVal[T](), domi18n.WrapSentinelDetail(ErrAssetNotFound, nil, kind+" "+id)
 	}
 	if ok, refs := canDel(); !ok {
 		return nil, zeroVal[T](), newAssetReferencedError(kind, id, refs)

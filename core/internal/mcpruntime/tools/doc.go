@@ -192,7 +192,7 @@ func (r *Registry) CallTool(ctx context.Context, name string, rawArgs jsontext.V
 	case protocol.ToolNameGUI:
 		res, err = r.callGUI(ctx, rawArgs)
 	default:
-		err = domi18n.EF(protocol.ErrToolNotFound, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "MCP tool"), domi18n.BoundStr("value", name))
+		err = domi18n.EF(protocol.ErrToolNotFound, domi18n.KeyMCPUnknownTool, domi18n.BoundStr("tool", name))
 	}
 	if err != nil {
 		if r.gate.IsHalted() {

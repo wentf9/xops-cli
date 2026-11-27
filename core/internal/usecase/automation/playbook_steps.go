@@ -59,10 +59,10 @@ func (s *Service) validateSingleLocalSource(src pathalg.LocalSourcePath, policy 
 			return domi18n.EF(ErrInvalidRequest, domi18n.KeyUCAutoSandboxAbsForbid, domi18n.BoundStr("path", src.String()))
 		}
 		if policy.AllowsOperatorFollow() {
-			return domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "follow_operator_source symlink policy in sandbox mode"))
+			return domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyUCAutoSandboxFollowUnsup)
 		}
 		if _, err := pathalg.ParseLocalRootedDest(src.String()); err != nil {
-			return domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "sandbox source path"), domi18n.BoundStr("value", src.String()))
+			return domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "sandbox_source_path"), domi18n.BoundStr("value", src.String()))
 		}
 		return nil
 	}
@@ -194,7 +194,7 @@ func (s *Service) loadLocalSourceInto(ctx context.Context, src pathalg.LocalSour
 	key := sourceCacheKey(src, policy)
 	if existing, ok := cache[key]; ok {
 		if int64(len(existing)) > maxBytes {
-			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.BoundStr("kind", "local source "+src.String()), domi18n.Int64("size", int64(len(existing))), domi18n.Int64("limit", maxBytes))
+			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyUCAutoLocalSourceLimit, domi18n.BoundStr("source", src.String()), domi18n.Int64("size", int64(len(existing))), domi18n.Int64("limit", maxBytes))
 		}
 		return nil
 	}
@@ -233,12 +233,12 @@ func (s *Service) readLocalSourceBounded(ctx context.Context, src pathalg.LocalS
 	var data []byte
 	err = s.operatorReadFS.WithOperatorRead(ctx, src, policy, func(r ports.BoundedReadHandle, size int64) error {
 		if size > maxBytes {
-			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.BoundStr("kind", "local source "+src.String()), domi18n.Int64("size", size), domi18n.Int64("limit", maxBytes))
+			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyUCAutoLocalSourceLimit, domi18n.BoundStr("source", src.String()), domi18n.Int64("size", size), domi18n.Int64("limit", maxBytes))
 		}
 		var rErr error
 		data, rErr = io.ReadAll(io.LimitReader(r, maxBytes+1))
 		if rErr == nil && int64(len(data)) > maxBytes {
-			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.BoundStr("kind", "local source "+src.String()), domi18n.Int64("size", int64(len(data))), domi18n.Int64("limit", maxBytes))
+			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyUCAutoLocalSourceLimit, domi18n.BoundStr("source", src.String()), domi18n.Int64("size", int64(len(data))), domi18n.Int64("limit", maxBytes))
 		}
 		return rErr
 	})
@@ -361,7 +361,7 @@ type limitedBufferWriter struct {
 
 func (w *limitedBufferWriter) Write(p []byte) (int, error) {
 	if int64(w.buf.Len())+int64(len(p)) > w.limit {
-		return 0, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "rendered template output"), domi18n.Int64("size", int64(w.buf.Len())+int64(len(p))), domi18n.Int64("limit", w.limit))
+		return 0, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyUCAutoTemplateSizeLimit, domi18n.Int64("size", int64(w.buf.Len())+int64(len(p))), domi18n.Int64("limit", w.limit))
 	}
 	return w.buf.Write(p)
 }

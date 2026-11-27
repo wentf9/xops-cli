@@ -72,7 +72,7 @@ func (r *Registry) callTerminalExec(ctx context.Context, rawArgs jsontext.Value)
 	case "run_playbook":
 		return r.execPlaybook(ctx, args, risk, approval)
 	default:
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "terminal_exec action"), domi18n.BoundStr("value", args.Action))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPUnknownToolAction, domi18n.Str("tool", protocol.ToolNameTerminalExec), domi18n.BoundStr("action", args.Action))
 	}
 }
 
@@ -158,9 +158,12 @@ func (r *Registry) checkExecOutcomeError(out execution.ExecutionOutcome, execErr
 	}
 	if unk, ok := out.(*execution.OutcomeUnknown); ok && unk != nil && unk.IsValid() {
 		if execErr != nil {
-			return domi18n.WrapS(protocol.ErrOutcomeUnknown, execErr, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", unk.Code()))
+			return domi18n.WrapS(protocol.ErrOutcomeUnknown, execErr, domi18n.KeyMCPProtoOutcomeUnkDetail, domi18n.BoundStr("code", unk.Code()))
 		}
-		return domi18n.EF(protocol.ErrOutcomeUnknown, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", unk.Code()+": "+unk.Reason()))
+		if unk.Reason() == "" {
+			return domi18n.EF(protocol.ErrOutcomeUnknown, domi18n.KeyMCPProtoOutcomeUnkDetail, domi18n.BoundStr("code", unk.Code()))
+		}
+		return domi18n.EF(protocol.ErrOutcomeUnknown, domi18n.KeyMCPProtoOutcomeUnkReason, domi18n.BoundStr("code", unk.Code()), domi18n.BoundStr("reason", unk.Reason()))
 	}
 	return execErr
 }
@@ -275,7 +278,7 @@ func (r *Registry) execBatch(ctx context.Context, args terminalExecArgs, risk al
 		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "AutomationService"))
 	}
 	if args.Stdin != "" {
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "batch_exec stdin"))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPBatchExecStdinUnsup)
 	}
 	cp, err := compileMCPCommandPlan(args)
 	if err != nil {

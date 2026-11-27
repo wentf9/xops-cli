@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -112,5 +113,29 @@ func assertApprovalChallengeMapping(t *testing.T) {
 	}
 	if mapped.Error() != domi18n.CanonicalError(mapped) {
 		t.Fatalf("ApprovalChallengeError CanonicalError 失配: err=%q canonical=%q", mapped.Error(), domi18n.CanonicalError(mapped))
+	}
+
+	// 7. 零值与 typed-nil *gate.ApprovalChallengeError 负例：绝不可误包 ErrApprovalRequired 或产生双头段。
+	var zeroCh gate.ApprovalChallengeError
+	assertInvalidApprovalChallengeNotWrapped(t, "zero", &zeroCh)
+	var typedNil *gate.ApprovalChallengeError
+	assertInvalidApprovalChallengeNotWrapped(t, "typed-nil", typedNil)
+}
+
+func assertInvalidApprovalChallengeNotWrapped(t *testing.T, label string, raw error) {
+	t.Helper()
+	mapped := mapEngineError(raw)
+	if errors.Is(mapped, ErrApprovalRequired) || errors.Is(mapped, gate.ErrApprovalRequired) {
+		t.Fatalf("%s ApprovalChallengeError 不得映射为 ErrApprovalRequired: %v", label, mapped)
+	}
+	if ch, ok := ExtractApprovalChallenge(mapped); ok || ch.IsValid() {
+		t.Fatalf("%s ApprovalChallengeError ExtractApprovalChallenge 必须返回 false: ok=%v ch=%+v", label, ok, ch)
+	}
+	got := mapped.Error()
+	if got != raw.Error() || got != domi18n.CanonicalError(mapped) {
+		t.Fatalf("%s ApprovalChallengeError 文本异常: mapped=%q raw=%q canonical=%q", label, got, raw.Error(), domi18n.CanonicalError(mapped))
+	}
+	if strings.Contains(got, ErrApprovalRequired.Error()) {
+		t.Fatalf("%s ApprovalChallengeError 出现重复审批头段: %q", label, got)
 	}
 }

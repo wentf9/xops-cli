@@ -226,7 +226,7 @@ func prepareBatchJobs(targets []TargetNode, prebound map[inventory.NodeID]*event
 		if st == nil && factory != nil {
 			var err error
 			if st, err = factory(target.nodeID, traceID, opID); err != nil {
-				return nil, created, domi18n.Wrap(err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "create node event stream"), domi18n.BoundStr("target", target.nodeID.String()))
+				return nil, created, domi18n.Wrap(err, domi18n.KeyUCAutoNodeStreamFailed, domi18n.BoundStr("target", target.nodeID.String()))
 			}
 			if st != nil {
 				created = append(created, st)
@@ -322,7 +322,7 @@ func (s *Service) runSingleNodeCommand(ctx context.Context, req BatchExecRequest
 func (s *Service) execCommandWithLease(ctx context.Context, connPlan plan.SealedConnectionPlan, cmd execution.CommandPlan, authBinding security.OperationBinding, verifyWorkDir bool, stdout, stderr io.Writer) (execution.ExecutionOutcome, error) {
 	targetHop, ok := connPlan.Target()
 	if !ok {
-		err := domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "connection plan target hop"))
+		err := domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "target_hop"))
 		return makeNotStartedOutcome(execution.StartPhaseValidate, "invalid_plan", err), err
 	}
 	var outcome execution.ExecutionOutcome

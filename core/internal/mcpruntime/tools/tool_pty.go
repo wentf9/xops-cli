@@ -86,7 +86,7 @@ func (r *Registry) callTerminalSession(ctx context.Context, rawArgs jsontext.Val
 			HandleToken string `json:"handle_token"`
 		}{true, h.String()})
 	default:
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "terminal_session action"), domi18n.BoundStr("value", args.Action))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPUnknownToolAction, domi18n.Str("tool", protocol.ToolNameTerminalSession), domi18n.BoundStr("action", args.Action))
 	}
 }
 

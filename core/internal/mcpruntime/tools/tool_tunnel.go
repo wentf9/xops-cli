@@ -62,7 +62,7 @@ func (r *Registry) callTunnel(ctx context.Context, rawArgs jsontext.Value) (prot
 	case "probe_mux", "control_mux":
 		return r.tunnelProbeOrControlMux(ctx, args, risk, approval)
 	default:
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "tunnel action"), domi18n.BoundStr("value", args.Action))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPUnknownToolAction, domi18n.Str("tool", protocol.ToolNameTunnel), domi18n.BoundStr("action", args.Action))
 	}
 }
 
@@ -197,7 +197,7 @@ func (r *Registry) tunnelStartMux(
 		var err error
 		cliOpts, err = option.ParseOptionLayer(directives...)
 		if err != nil {
-			return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ControlMaster options"))
+			return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "control_master_options"))
 		}
 	}
 	resolved, err := r.resolveTarget(ctx, args.Target, cliOpts)

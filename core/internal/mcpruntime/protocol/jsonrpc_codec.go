@@ -182,7 +182,7 @@ func (r Request) Validate() error {
 func DecodeRequest(raw []byte) (Request, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return Request{}, domi18n.EF(ErrParseJSON, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "payload"))
+		return Request{}, domi18n.WrapSentinel(ErrParseJSON, domi18n.E(domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "payload")))
 	}
 	var req Request
 	if err := jsonv2.Unmarshal(trimmed, &req, jsonv2.RejectUnknownMembers(true)); err != nil {
@@ -281,7 +281,7 @@ func NewResultResponse(id RequestID, result any) (Response, error) {
 	}
 	raw, err := MarshalCanonical(result)
 	if err != nil {
-		return Response{}, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal JSON-RPC result"))
+		return Response{}, domi18n.Wrap(err, domi18n.KeyMCPProtoMarshalFailed, domi18n.Str("target", "jsonrpc_result"))
 	}
 	return Response{
 		JSONRPC: JSONRPCVersion,
@@ -299,7 +299,7 @@ func NewErrorResponse(id algebraic.Option[RequestID], code int, msg string, data
 	if data != nil {
 		encoded, err := MarshalCanonical(data)
 		if err != nil {
-			return Response{}, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal JSON-RPC error.data"))
+			return Response{}, domi18n.Wrap(err, domi18n.KeyMCPProtoMarshalFailed, domi18n.Str("target", "jsonrpc_error_data"))
 		}
 		rawData = jsontext.Value(encoded)
 	}

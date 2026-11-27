@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
 	"github.com/wentf9/xops-cli/internal/i18n"
@@ -124,7 +126,7 @@ func renderDoctorText(loc *i18n.Localizer, w io.Writer, view doctorAggregateView
 			i18n.Int("warns", inv.WarnCount),
 		))
 		for _, f := range inv.Findings {
-			_, _ = fmt.Fprintf(w, "    [%s] %s (%s): %s\n", f.Severity, f.Code, f.Subject, f.Message)
+			renderDoctorFindingLine(eff, w, f)
 		}
 	}
 	if view.Vault != nil {
@@ -136,11 +138,57 @@ func renderDoctorText(loc *i18n.Localizer, w io.Writer, view doctorAggregateView
 			i18n.Int("findings", len(v.Findings)),
 		))
 		for _, f := range v.Findings {
-			_, _ = fmt.Fprintf(w, "    [%s] %s (%s): %s\n", f.Severity, f.Code, f.Subject, f.Message)
+			renderDoctorFindingLine(eff, w, f)
 		}
 	} else if view.VaultNote != "" {
 		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorVaultNote, i18n.BoundStr("note", view.VaultNote)))
 	}
+}
+
+func renderDoctorFindingLine(eff *i18n.Localizer, w io.Writer, f engine.DoctorFinding) {
+	sev := doctorSeverityLabel(eff, f.Severity)
+	msg := renderDoctorFindingMessage(eff, f)
+	if f.Subject != "" {
+		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorFindingLineSubj,
+			i18n.BoundStr("severity", sev),
+			i18n.BoundStr("code", f.Code),
+			i18n.BoundStr("subject", f.Subject),
+			i18n.BoundStr("message", msg),
+		))
+		return
+	}
+	_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorFindingLine,
+		i18n.BoundStr("severity", sev),
+		i18n.BoundStr("code", f.Code),
+		i18n.BoundStr("message", msg),
+	))
+}
+
+func doctorSeverityLabel(eff *i18n.Localizer, sev engine.DoctorSeverity) string {
+	switch sev {
+	case engine.DoctorSeverityInfo:
+		return eff.T(i18n.KeyCLIDoctorSevInfo)
+	case engine.DoctorSeverityWarn:
+		return eff.T(i18n.KeyCLIDoctorSevWarn)
+	case engine.DoctorSeverityError:
+		return eff.T(i18n.KeyCLIDoctorSevError)
+	default:
+		return sev.String()
+	}
+}
+
+func renderDoctorFindingMessage(eff *i18n.Localizer, f engine.DoctorFinding) string {
+	if msg, ok := f.Localized.Get(); ok && msg.IsValid() {
+		head := eff.Render(msg)
+		if f.Cause != nil {
+			head = eff.T(domi18n.KeyCommonErrorJoin,
+				i18n.BoundStr("head", head),
+				i18n.BoundStr("tail", eff.RenderError(f.Cause)),
+			)
+		}
+		return security.SanitizePromptText(head)
+	}
+	return security.SanitizePromptText(f.Message)
 }
 
 func parseDoctorArgs(args []string) (doctorArgs, error) {

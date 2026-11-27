@@ -210,7 +210,7 @@ func expandDanglingSymlink(ctx context.Context, rfs ports.RemoteFSPort, cur path
 		return zeroVal[pathalg.RemotePath](), false, err
 	}
 	if *hops >= pathalg.MaxSymlinkHops {
-		return zeroVal[pathalg.RemotePath](), false, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "symlink_hops"), domi18n.Int("value", pathalg.MaxSymlinkHops), domi18n.Int("max", pathalg.MaxSymlinkHops))
+		return zeroVal[pathalg.RemotePath](), false, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyUCTransferRemoteHops, domi18n.Int("limit", pathalg.MaxSymlinkHops))
 	}
 	*hops++
 	raw, err := rfs.ReadLink(ctx, cur)
@@ -241,7 +241,7 @@ func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.Rem
 	}
 	cs := canon.String()
 	if !slices.Contains(binding.CanonicalPaths(), cs) && !slices.ContainsFunc(binding.RecursivePaths(), func(r string) bool { return r == "/" || cs == r || strings.HasPrefix(cs, r+"/") }) {
-		return domi18n.EF(gate.ErrScopeEscalated, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target.String()), domi18n.BoundStr("reason", canon.String()))
+		return domi18n.EF(gate.ErrScopeEscalated, domi18n.KeyUCTransferRemoteDrift, domi18n.BoundStr("path", target.String()), domi18n.BoundStr("target", canon.String()))
 	}
 	return nil
 }

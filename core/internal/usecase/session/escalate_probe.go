@@ -90,7 +90,7 @@ func (s *Service) validatePrivilegeCall(ctx context.Context, req PrivilegeExecRe
 		return err
 	}
 	if lex, ok := req.LexicalScope.Get(); ok && !lex.IsValid() {
-		return domi18n.EF(ErrEscalationScopeChanged, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LexicalScope"))
+		return domi18n.WrapSentinel(ErrEscalationScopeChanged, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LexicalScope")))
 	}
 	return s.validatePrivilegeSecretSource(req)
 }
@@ -178,7 +178,7 @@ func (s *Service) evaluatePrivilegeEscalationScope(req PrivilegeExecRequest, tar
 }
 func evaluateWithLexicalScope(lex security.ScopeSnapshot, effRisk security.RiskLevel, mkSnap func(security.Verdict, security.RiskLevel, security.GuardrailDecision) (security.ScopeSnapshot, error)) (escalationEval, error) {
 	if lex.Verdict().Denied() || lex.Decision().Kind() == security.DecisionKindDeny {
-		return escalationEval{}, domi18n.EF(ErrEscalationScopeChanged, domi18n.KeyUCSessEscalationDrift, domi18n.Str("reason", "lexical_scope_denied"))
+		return escalationEval{}, domi18n.EF(ErrEscalationScopeChanged, domi18n.KeyUCSessEscalationDrift, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyUCSessReasonLexDenied)))
 	}
 	effRisk = effRisk.Join(lex.Risk())
 	if lexNA, ok := lex.Decision().(*security.DecisionNeedApproval); ok && lexNA.IsValid() {

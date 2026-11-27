@@ -83,8 +83,8 @@ func TestMCPRuntime_StreamableHTTPHardeningAndSessionLifecycle(t *testing.T) {
 	rig := newMCPUnitRig(t, mcpUnitOpts{maxMessageBytes: 4096})
 	defer rig.close(t)
 
-	if err := rig.srv.ListenAndServeHTTP(context.Background(), "0.0.0.0:0"); !errors.Is(err, mcpruntime.ErrNonLoopbackAddress) {
-		t.Fatalf("非回环监听必须返回 ErrNonLoopbackAddress，实际=%v", err)
+	if err := rig.srv.ListenAndServeHTTP(context.Background(), "0.0.0.0:0"); !errors.Is(err, mcpruntime.ErrNonLoopbackAddress) || !strings.Contains(err.Error(), "127.0.0.1 / ::1 / localhost") || !strings.Contains(err.Error(), "0.0.0.0:0") {
+		t.Fatalf("非回环监听必须返回含回环安全说明的 ErrNonLoopbackAddress，实际=%v", err)
 	}
 
 	var lc net.ListenConfig

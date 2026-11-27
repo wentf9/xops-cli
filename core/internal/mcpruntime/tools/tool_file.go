@@ -67,7 +67,7 @@ func (r *Registry) callFile(ctx context.Context, rawArgs jsontext.Value) (protoc
 	case "list", "mkdir", "remove", "removedir":
 		return r.fileWorkspaceOp(ctx, base, args)
 	default:
-		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "file action"), domi18n.BoundStr("value", args.Action))
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyMCPUnknownToolAction, domi18n.Str("tool", protocol.ToolNameFile), domi18n.BoundStr("action", args.Action))
 	}
 }
 

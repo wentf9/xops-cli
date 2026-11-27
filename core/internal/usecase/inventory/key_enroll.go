@@ -114,7 +114,7 @@ func (s *Service) runKeyEnroll(ctx context.Context, req EnrollEncryptedPrivateKe
 			identity: st.builtIdent, fingerprint: st.verifiedFP, passphraseRef: sagaRes.NewRef(), revision: rev, saga: sagaRes, valid: true,
 		}, nil
 	}
-	return EnrollEncryptedPrivateKeyResult{saga: sagaRes}, domi18n.EF(ErrCommitOutcomeUnknown, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "VaultSaga revision"))
+	return EnrollEncryptedPrivateKeyResult{saga: sagaRes}, domi18n.WrapSentinel(ErrCommitOutcomeUnknown, domi18n.E(domi18n.KeyCommonFieldRequired, domi18n.Str("field", "saga_revision")))
 }
 func closeIfNonNil(stream *events.OperationStream) {
 	if stream != nil {
@@ -187,7 +187,7 @@ func (s *Service) verifyEnrolledKey(ctx context.Context, req EnrollEncryptedPriv
 		return err
 	}
 	if !fp.IsValid() {
-		return domi18n.EF(ErrKeyFingerprintMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "KeySignerPort fingerprint"))
+		return domi18n.WrapSentinel(ErrKeyFingerprintMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "key_fingerprint")))
 	}
 	if expFP, ok := req.ExpectedFingerprint.Get(); ok && !fp.Equal(expFP) {
 		return domi18n.EF(ErrKeyFingerprintMismatch, domi18n.KeyUCInvFPMismatchDetail, domi18n.BoundStr("actual", fp.String()), domi18n.BoundStr("expected", expFP.String()))
@@ -197,7 +197,7 @@ func (s *Service) verifyEnrolledKey(ctx context.Context, req EnrollEncryptedPriv
 }
 func (s *Service) mutateGraphForKeyEnroll(ctx context.Context, g inventory.Graph, req EnrollEncryptedPrivateKeyRequest, newRef secret.Ref, st *keyEnrollState) (z inventory.Graph, err error) {
 	if !st.verifiedFP.IsValid() {
-		return z, domi18n.EF(ErrKeyFingerprintMismatch, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "verified private key fingerprint"))
+		return z, domi18n.WrapSentinel(ErrKeyFingerprintMismatch, domi18n.E(domi18n.KeyCommonFieldRequired, domi18n.Str("field", "verified_fingerprint")))
 	}
 	binding, err := inventory.NewKeyPassphraseBinding(newRef, st.verifiedFP)
 	var auth *inventory.AuthPrivateKey
