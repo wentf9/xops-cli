@@ -87,6 +87,11 @@ const (
 	KeyCLIDoctorInventory             domi18n.MessageID = "cli.doctor.inventory"                // 资产诊断分节汇总行
 	KeyCLIDoctorVault                 domi18n.MessageID = "cli.doctor.vault"                    // 凭据库诊断分节汇总行
 	KeyCLIDoctorVaultNote             domi18n.MessageID = "cli.doctor.vault_note"               // 凭据库诊断附加说明行
+	KeyCLIDoctorSevInfo               domi18n.MessageID = "cli.doctor.sev.info"                 // 诊断严重度标签：提示
+	KeyCLIDoctorSevWarn               domi18n.MessageID = "cli.doctor.sev.warn"                 // 诊断严重度标签：警告
+	KeyCLIDoctorSevError              domi18n.MessageID = "cli.doctor.sev.error"                // 诊断严重度标签：错误
+	KeyCLIDoctorFindingLine           domi18n.MessageID = "cli.doctor.finding_line"             // 诊断发现明细行（无主题）
+	KeyCLIDoctorFindingLineSubj       domi18n.MessageID = "cli.doctor.finding_line_subject"     // 诊断发现明细行（含主题）
 	KeyCLIPlaybookValid               domi18n.MessageID = "cli.playbook.valid"                  // Playbook 离线校验通过行
 	KeyCLIPlaybookSummary             domi18n.MessageID = "cli.playbook.summary"                // Playbook 执行汇总行
 	KeyCLIPlaybookUnknownWarning      domi18n.MessageID = "cli.playbook.unknown_warning"        // Playbook 含未知终态步骤警告

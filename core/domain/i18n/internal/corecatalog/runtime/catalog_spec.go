@@ -1,9 +1,7 @@
 package runtime
 
-import "slices"
-
-// Lookup 返回pool、gate 与 sshnet/** 运行时键对应的规范英文兜底模板；未命中返回空串。
-func Lookup(id string) string {
+// lookupPoolGate 返回 pool 与 gate（含规范护栏原因封闭集）键对应的规范英文兜底模板；未命中返回空串。
+func lookupPoolGate(id string) string {
 	switch id {
 	case "pool.not_initialized":
 		return "pool: connection pool is not initialized"
@@ -127,92 +125,105 @@ func Lookup(id string) string {
 		return "WithAuthorized requires a concrete Capability type"
 	case "gate.invalid_clock_time":
 		return "clock returned an invalid timestamp"
-	case "sshnet.priv.handshake_ended_before_ready":
-		return "sshnet/priv: remote stream ended before privilege ready frame arrived"
-	case "sshnet.probe.failed":
-		return "sshnet/probe: remote shell probe failed or produced untrusted result"
-	case "sshnet.dial.parent_required":
-		return "multi-hop connection requires an active parent hop connection"
-	case "sshnet.dial.no_auth_methods":
-		return "no usable SSH authentication method could be built"
-	case "sshnet.dial.empty_algo_intersection":
-		return "no common SSH algorithm between policy and transport"
-	case "sshnet.dial.challenge_unmatched":
-		return "keyboard-interactive prompt {prompt} matched no automatic rule and interaction is unavailable"
-	case "sshnet.dial.challenge_cmd_failed":
-		return "challenge response command failed"
-	case "sshnet.dial.totp_invalid":
-		return "invalid TOTP configuration or secret"
-	case "sshnet.dial.tcp_failed":
-		return "TCP dial to {addr} failed"
-	case "sshnet.dial.direct_tcpip_failed":
-		return "failed to open direct-tcpip channel via parent hop"
-	case "sshnet.keysigner.passphrase_required":
-		return "private key is encrypted and no bound passphrase secret is configured"
-	case "sshnet.keysigner.fingerprint_mismatch":
-		return "private key fingerprint does not match KeyPassphraseBinding"
-	case "sshnet.keysigner.no_keys_found":
-		return "no usable local private key found"
-	case "sshnet.keysigner.not_found":
-		return "no signer found for key fingerprint {fingerprint}"
-	case "sshnet.keysigner.invalid_cert":
-		return "file {path} is not a valid SSH certificate"
-	case "sshnet.forward.non_loopback_denied":
-		return "binding non-loopback address {addr} requires GatewayPorts"
-	case "sshnet.forward.socks5_header":
-		return "invalid SOCKS5 protocol header"
-	case "sshnet.forward.socks5_no_auth":
-		return "SOCKS5 client does not support no-auth method"
-	case "sshnet.forward.socks5_cmd_rejected":
-		return "SOCKS5 only supports CONNECT, rejected command {cmd}"
-	case "sshnet.hostkey.cert_tofu_forbidden":
-		return "cannot record raw SSH host certificate {key} via TOFU"
-	case "sshnet.hostkey.line_malformed":
-		return "malformed known_hosts entry: {reason}"
-	case "sshnet.mux.ext_not_negotiated":
-		return "ControlMaster did not negotiate xops-stream-mux extension"
-	case "sshnet.mux.proto_version":
-		return "unsupported PROTOCOL.mux version {version} (only v4 is supported)"
-	case "sshnet.mux.unexpected_frame":
-		return "unexpected PROTOCOL.mux frame type {actual} (expected {expected})"
-	case "sshnet.mux.frame_truncated":
-		return "truncated PROTOCOL.mux frame"
-	case "sshnet.mux.pty_size_invalid":
-		return "PTY dimensions {cols}x{rows} are out of range"
-	case "sshnet.priv.dialect_posix_only":
-		return "privilege escalation only supports POSIX dialect (rejected {dialect})"
-	case "sshnet.priv.handshake_timeout":
-		return "timed out waiting for remote privilege escalation handshake"
-	case "sshnet.priv.password_required":
-		return "remote privilege escalation requires a password"
-	case "sshnet.priv.auth_rejected":
-		return "remote privilege escalation authentication rejected"
-	case "sshnet.probe.no_dialect":
-		return "stage 1 failed to detect a supported launch dialect"
-	case "sshnet.probe.no_interpreter":
-		return "stage 2 found no compatible interpreter for dialect {dialect}"
-	case "sshnet.probe.frame_invalid":
-		return "invalid or incomplete stage 2 probe frame"
-	case "sshnet.sftp.status_code":
-		return "sftp: status={code}"
-	case "sshnet.sftp.status_code_detail":
-		return "sftp: status={code} ({detail})"
-	case "sshnet.sftp.proto_version":
-		return "unsupported SFTP protocol version {version} (only v3 is supported)"
-	case "sshnet.sftp.unexpected_packet":
-		return "unexpected SFTP packet type {actual} (expected {expected})"
-	case "sshnet.sftp.packet_truncated":
-		return "truncated or malformed SFTP packet"
-	case "sshnet.sftp.not_symlink":
-		return "{path} is not a symbolic link"
+	case "gate.unknown_approval_phase":
+		return "gate: unexpected approval phase {phase}"
+	case "gate.protected_path_check_failed":
+		return "gate: protected path check failed"
+	case "gate.approval_digest_mismatch":
+		return "gate: approval response digest does not match envelope"
+	case "gate.round2_canonicalize_required":
+		return "gate: approval invalidated because Round-2 canonicalization callback is missing"
+	case "gate.canonical_binding_invalid":
+		return "gate: canonicalized operation binding is invalid or capability drifted"
+	case "gate.reason.nil_decision":
+		return "nil or uninitialized guardrail decision"
+	case "gate.reason.empty_decisions":
+		return "no guardrail decision evaluated"
+	case "gate.reason.unknown_risk":
+		return "operation risk level is unknown or invalid"
+	case "gate.reason.invalid_threshold":
+		return "approval threshold is unknown or invalid"
+	case "gate.reason.risk_meets_threshold":
+		return "operation risk meets or exceeds approval threshold"
+	case "gate.reason.risk_below_threshold":
+		return "operation risk is below approval threshold"
+	case "gate.reason.invalid_overrides":
+		return "node overrides set is uninitialized or invalid"
+	case "gate.reason.node_override_allow":
+		return "node override permits threshold evaluation"
+	case "gate.reason.node_override_unknown_risk":
+		return "node override approval floor with unknown risk"
+	case "gate.reason.node_override_approval":
+		return "node override requires explicit approval"
+	case "gate.reason.node_override_deny":
+		return "node override denies operation"
+	case "gate.reason.lexical_verdict_denied":
+		return "lexical verdict denied"
+	case "gate.reason.lexical_guardrail_denied":
+		return "lexical guardrail denied"
+	case "gate.reason.invalid_lexical_decision":
+		return "invalid lexical guardrail decision"
+	case "gate.reason.round2_canon_failed":
+		return "round2 canonicalization probe failed"
+	case "gate.reason.canonical_binding_drifted":
+		return "canonical identity or non-path binding drifted"
+	case "gate.reason.round2_escalation_failed":
+		return "round2 probe failed during escalation check"
+	case "gate.reason.effective_verdict_denied":
+		return "effective verdict denied"
+	case "gate.reason.canonical_guardrail_denied":
+		return "canonical guardrail denied"
+	case "gate.reason.canonical_scope_escalated":
+		return "canonical_scope_escalated"
+	case "gate.reason.invalid_canonical_decision":
+		return "invalid canonical guardrail decision"
+	case "gate.reason.user_rejected":
+		return "user rejected approval challenge"
+	case "gate.reason.token_expired_or_mismatch":
+		return "approval token expired or binding mismatch"
+	case "gate.reason.token_digest_mismatch":
+		return "approval token digest mismatch"
+	case "gate.reason.round2_probe_failed":
+		return "round2 probe failed"
+	case "gate.reason.post_challenge_drift":
+		return "post-challenge canonical scope escalated or binding drifted"
+	case "gate.reason.invalid_profile":
+		return "invalid policy profile"
+	case "gate.reason.verdict_denied":
+		return "security verdict denied"
+	case "gate.reason.direct_operator_allow":
+		return "direct operator profile allow"
+	case "gate.reason.unexpected_decision":
+		return "unexpected guardrail decision"
+	case "gate.reason.protected_path":
+		return "operation touches protected path"
+	case "gate.reason.guardrail_denied":
+		return "guardrail denied"
+	case "gate.reason.canonical_denied":
+		return "canonical denied"
+	case "gate.reason.approval_required":
+		return "approval required"
+	case "gate.reason.scope_escalated":
+		return "scope escalated"
+	case "gate.reason.token_invalidated":
+		return "token invalidated"
+	case "gate.reason.authorization_denied":
+		return "authorization denied"
+	case "gate.reason.gate_halted":
+		return "gate halted"
+	case "gate.reason.privilege_escalation":
+		return "privilege escalation requires approval"
+	case "gate.reason.pre_escalation_baseline":
+		return "pre-escalation baseline"
+	case "gate.reason.invalid_audit_event":
+		return "audit event is invalid"
 	default:
 		return ""
 	}
 }
 
-// AllKeys 返回本分片注册的全部消息键（按字典序升序排列，每次返回独立切片副本）。
-func AllKeys() []string {
-	keys := []string{
+func keysPoolGate() []string {
+	return []string{
 		"pool.not_initialized",
 		"pool.invalid_config",
 		"pool.closed",
@@ -274,46 +285,51 @@ func AllKeys() []string {
 		"gate.approval_round2_mismatch",
 		"gate.abstract_capability",
 		"gate.invalid_clock_time",
-		"sshnet.priv.handshake_ended_before_ready",
-		"sshnet.probe.failed",
-		"sshnet.dial.parent_required",
-		"sshnet.dial.no_auth_methods",
-		"sshnet.dial.empty_algo_intersection",
-		"sshnet.dial.challenge_unmatched",
-		"sshnet.dial.challenge_cmd_failed",
-		"sshnet.dial.totp_invalid",
-		"sshnet.dial.tcp_failed",
-		"sshnet.dial.direct_tcpip_failed",
-		"sshnet.keysigner.passphrase_required",
-		"sshnet.keysigner.fingerprint_mismatch",
-		"sshnet.keysigner.no_keys_found",
-		"sshnet.keysigner.not_found",
-		"sshnet.keysigner.invalid_cert",
-		"sshnet.forward.non_loopback_denied",
-		"sshnet.forward.socks5_header",
-		"sshnet.forward.socks5_no_auth",
-		"sshnet.forward.socks5_cmd_rejected",
-		"sshnet.hostkey.cert_tofu_forbidden",
-		"sshnet.hostkey.line_malformed",
-		"sshnet.mux.ext_not_negotiated",
-		"sshnet.mux.proto_version",
-		"sshnet.mux.unexpected_frame",
-		"sshnet.mux.frame_truncated",
-		"sshnet.mux.pty_size_invalid",
-		"sshnet.priv.dialect_posix_only",
-		"sshnet.priv.handshake_timeout",
-		"sshnet.priv.password_required",
-		"sshnet.priv.auth_rejected",
-		"sshnet.probe.no_dialect",
-		"sshnet.probe.no_interpreter",
-		"sshnet.probe.frame_invalid",
-		"sshnet.sftp.status_code",
-		"sshnet.sftp.status_code_detail",
-		"sshnet.sftp.proto_version",
-		"sshnet.sftp.unexpected_packet",
-		"sshnet.sftp.packet_truncated",
-		"sshnet.sftp.not_symlink",
+		"gate.unknown_approval_phase",
+		"gate.protected_path_check_failed",
+		"gate.approval_digest_mismatch",
+		"gate.round2_canonicalize_required",
+		"gate.canonical_binding_invalid",
+		"gate.reason.nil_decision",
+		"gate.reason.empty_decisions",
+		"gate.reason.unknown_risk",
+		"gate.reason.invalid_threshold",
+		"gate.reason.risk_meets_threshold",
+		"gate.reason.risk_below_threshold",
+		"gate.reason.invalid_overrides",
+		"gate.reason.node_override_allow",
+		"gate.reason.node_override_unknown_risk",
+		"gate.reason.node_override_approval",
+		"gate.reason.node_override_deny",
+		"gate.reason.lexical_verdict_denied",
+		"gate.reason.lexical_guardrail_denied",
+		"gate.reason.invalid_lexical_decision",
+		"gate.reason.round2_canon_failed",
+		"gate.reason.canonical_binding_drifted",
+		"gate.reason.round2_escalation_failed",
+		"gate.reason.effective_verdict_denied",
+		"gate.reason.canonical_guardrail_denied",
+		"gate.reason.canonical_scope_escalated",
+		"gate.reason.invalid_canonical_decision",
+		"gate.reason.user_rejected",
+		"gate.reason.token_expired_or_mismatch",
+		"gate.reason.token_digest_mismatch",
+		"gate.reason.round2_probe_failed",
+		"gate.reason.post_challenge_drift",
+		"gate.reason.invalid_profile",
+		"gate.reason.verdict_denied",
+		"gate.reason.direct_operator_allow",
+		"gate.reason.unexpected_decision",
+		"gate.reason.protected_path",
+		"gate.reason.guardrail_denied",
+		"gate.reason.canonical_denied",
+		"gate.reason.approval_required",
+		"gate.reason.scope_escalated",
+		"gate.reason.token_invalidated",
+		"gate.reason.authorization_denied",
+		"gate.reason.gate_halted",
+		"gate.reason.privilege_escalation",
+		"gate.reason.pre_escalation_baseline",
+		"gate.reason.invalid_audit_event",
 	}
-	slices.Sort(keys)
-	return keys
 }

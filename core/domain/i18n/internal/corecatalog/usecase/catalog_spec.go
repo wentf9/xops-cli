@@ -1,9 +1,7 @@
 package usecase
 
-import "slices"
-
-// Lookup 返回usecase/**、mcpruntime/** 与 engine 键对应的规范英文兜底模板；未命中返回空串。
-func Lookup(id string) string {
+// lookupUsecase 返回六大核心用例包（automation/credential/inventory/observability/session/transfer）的规范英文兜底模板。
+func lookupUsecase(id string) string {
 	switch id {
 	case "uc.automation.nil_context":
 		return "usecase/automation: context must not be nil"
@@ -45,6 +43,20 @@ func Lookup(id string) string {
 		return "remote destination {path} already exists (overwrite=false)"
 	case "uc.automation.batch_counts":
 		return "batch completed with {succeeded} succeeded and {failed} failed"
+	case "uc.automation.node_stream_failed":
+		return "failed to create event stream for node {target}"
+	case "uc.automation.sandbox_follow_unsupported":
+		return "follow_operator_source symlink policy is not supported in sandbox mode"
+	case "uc.automation.local_source_limit":
+		return "local source {source} size {size} exceeds limit {limit}"
+	case "uc.automation.template_size_limit":
+		return "rendered template output size {size} exceeds limit {limit}"
+	case "uc.automation.resolve_target_failed":
+		return "failed to resolve target {target}"
+	case "uc.automation.duplicate_target_node":
+		return "duplicate target node {node}"
+	case "uc.automation.remote_canon_hops":
+		return "remote path canonicalization depth {count} exceeds limit {limit}"
 	case "uc.credential.nil_context":
 		return "usecase/credential: context must not be nil"
 	case "uc.credential.nil_callback":
@@ -81,6 +93,12 @@ func Lookup(id string) string {
 		return "secret {ref} is not referenced in inventory graph"
 	case "uc.credential.saga_step_limit":
 		return "vault saga exceeded maximum transitions ({max})"
+	case "uc.credential.old_secret_gc_failed":
+		return "failed to garbage-collect replaced old secret after commit"
+	case "uc.credential.saga_effect_count":
+		return "vault saga state {state} expected {expected} effect(s), got {actual}"
+	case "uc.credential.gen_item_failed":
+		return "failed to generate random secret item identifier"
 	case "uc.inventory.nil_context":
 		return "usecase/inventory: context must not be nil"
 	case "uc.inventory.invalid_config":
@@ -161,6 +179,48 @@ func Lookup(id string) string {
 		return "specify SSH username via user@, -l, or OpenSSH User"
 	case "uc.inventory.target_malformed":
 		return "malformed target {target}: {reason}"
+	case "uc.inventory.env_var_placeholder":
+		return "invalid environment variable placeholder in path template"
+	case "uc.inventory.unknown_import_format_value":
+		return "unregistered import format {format}"
+	case "uc.inventory.import_bundle_invalid":
+		return "imported bundle validation failed for format {format}"
+	case "uc.inventory.origin_unsupported":
+		return "unsupported target origin {origin}"
+	case "uc.inventory.node_origin_mismatch":
+		return "node {node} origin mismatch: expected {expected}, got {actual}"
+	case "uc.inventory.proxy_depth_limit":
+		return "ProxyJump depth {depth} exceeds limit {limit}"
+	case "uc.inventory.plan_hops_limit":
+		return "connection plan hop count {count} exceeds limit {limit}"
+	case "uc.inventory.init_cred_service_failed":
+		return "failed to initialize built-in CredentialService"
+	case "uc.inventory.query_stores_failed":
+		return "failed to query authoritative vault known stores"
+	case "uc.inventory.duplicate_import_format":
+		return "duplicate import format {format}"
+	case "uc.inventory.jump_hop_invalid":
+		return "invalid ProxyJump hop specification"
+	case "uc.inventory.jump_user_invalid":
+		return "invalid ProxyJump jump username"
+	case "uc.inventory.jump_host_invalid":
+		return "invalid ProxyJump jump host {host}"
+	case "uc.inventory.target_reason.bad_chars":
+		return "empty, too long, or contains illegal whitespace/control characters"
+	case "uc.inventory.target_reason.bad_at":
+		return "empty user/host or duplicate '@'"
+	case "uc.inventory.target_reason.missing_host":
+		return "missing host segment"
+	case "uc.inventory.target_reason.bad_brackets":
+		return "invalid brackets"
+	case "uc.inventory.target_reason.not_ipv6_or_hp":
+		return "neither valid IPv6 nor valid host:port"
+	case "uc.inventory.target_reason.malformed_brackets":
+		return "malformed brackets"
+	case "uc.inventory.target_reason.bracket_not_ipv6":
+		return "bracketed host must be a valid IPv6 address"
+	case "uc.inventory.target_reason.bad_suffix":
+		return "invalid suffix after brackets"
 	case "uc.observability.nil_context":
 		return "usecase/observability: context must not be nil"
 	case "uc.observability.invalid_config":
@@ -199,6 +259,12 @@ func Lookup(id string) string {
 		return "screenshot payload is missing start or end marker"
 	case "uc.observability.non_loopback_denied":
 		return "binding non-loopback address {addr} is forbidden by default"
+	case "uc.observability.jpeg_encode_failed":
+		return "failed to encode screenshot as JPEG"
+	case "uc.observability.image_decode_failed":
+		return "failed to decode screenshot image"
+	case "uc.observability.probe_shell_failed":
+		return "failed to probe remote shell for POSIX compatibility"
 	case "uc.session.nil_context":
 		return "usecase/session: context must not be nil"
 	case "uc.session.invalid_config":
@@ -233,6 +299,8 @@ func Lookup(id string) string {
 		return "operator declined to start or share ControlMaster"
 	case "uc.session.control_path_tilde":
 		return "rejected unexpanded leading ~ in control socket path {path}"
+	case "uc.session.reason.lexical_scope_denied":
+		return "lexical scope denied"
 	case "uc.transfer.nil_context":
 		return "usecase/transfer: context must not be nil"
 	case "uc.transfer.invalid_config":
@@ -277,6 +345,8 @@ func Lookup(id string) string {
 		return "generation {gen} is in UncertainCommit; retry and cleanup are forbidden"
 	case "uc.transfer.patch_multi_match":
 		return "Edits[{index}] matched {count} locations"
+	case "uc.transfer.patch_no_match_index":
+		return "Edits[{index}] target text not found"
 	case "uc.transfer.symlink_policy":
 		return "symlink policy {policy} forbids {path}"
 	case "uc.transfer.remote_drift":
@@ -289,162 +359,27 @@ func Lookup(id string) string {
 		return "remote symlink expansion exceeded limit {limit}"
 	case "uc.transfer.remote_not_regular":
 		return "remote path {path} has unsupported type {kind}"
-	case "mcp.invalid_config":
-		return "mcpruntime: invalid ServerConfig"
-	case "mcp.server_not_initialized":
-		return "mcpruntime: MCP server is not initialized"
-	case "mcp.server_closed":
-		return "mcpruntime: MCP server is closed"
-	case "mcp.non_loopback_address":
-		return "mcpruntime: only loopback bind addresses (127.0.0.1 / ::1 / localhost) are allowed by default"
-	case "mcp.message_too_large":
-		return "mcpruntime: inbound MCP message exceeds maximum byte limit"
-	case "mcp.startup_reconcile_failed":
-		return "mcpruntime: startup crash audit reconciliation failed"
-	case "mcp.startup_recovery_failed":
-		return "mcpruntime: startup transfer journal recovery failed"
-	case "mcp.protocol.parse_json":
-		return "mcpruntime/protocol: JSON syntax parse failed"
-	case "mcp.protocol.invalid_jsonrpc":
-		return "mcpruntime/protocol: invalid JSON-RPC 2.0 message"
-	case "mcp.protocol.invalid_request_id":
-		return "mcpruntime/protocol: invalid JSON-RPC RequestID"
-	case "mcp.protocol.invalid_mcp_message":
-		return "mcpruntime/protocol: invalid MCP protocol payload"
-	case "mcp.protocol.invalid_approval":
-		return "mcpruntime/protocol: invalid approval submission payload"
-	case "mcp.protocol.invalid_schema":
-		return "mcpruntime/protocol: invalid built-in tool JSON Schema"
-	case "mcp.protocol.invalid_params":
-		return "mcpruntime/protocol: invalid tool or method parameters"
-	case "mcp.protocol.tool_not_found":
-		return "mcpruntime/protocol: unregistered MCP tool"
-	case "mcp.protocol.outcome_unknown":
-		return "mcpruntime/protocol: remote execution outcome is unknown; automatic retry is forbidden"
-	case "mcp.tools.invalid_config":
-		return "mcpruntime/tools: invalid RegistryConfig"
-	case "mcp.tools.not_initialized":
-		return "mcpruntime/tools: Registry is not initialized"
-	case "mcp.tools.service_unavailable":
-		return "mcpruntime/tools: required usecase service is not configured"
-	case "mcp.tools.handle_not_found":
-		return "mcpruntime/tools: managed handle token not found"
-	case "mcp.http.header_missing":
-		return "missing required HTTP header {header}"
-	case "mcp.http.header_rejected":
-		return "unauthorized or invalid HTTP header {header}: {value}"
-	case "mcp.http.session_missing":
-		return "Mcp-Session-Id session does not exist or is closed"
-	case "mcp.corrupt_journal_limit":
-		return "found {count} corrupt transfer journal(s) with FailOnCorruptJournal enabled"
-	case "mcp.protocol.id_type":
-		return "JSON-RPC id must be a non-empty string or exact integer"
-	case "engine.nil_context":
-		return "engine: context must not be nil"
-	case "engine.invalid_config":
-		return "engine: invalid Engine Config"
-	case "engine.not_initialized":
-		return "engine: Engine is not initialized"
-	case "engine.closed":
-		return "engine: Engine is closed"
-	case "engine.halted":
-		return "engine: security gate entered irreversible Halted state"
-	case "engine.invalid_request":
-		return "engine: invalid request parameters"
-	case "engine.invalid_profile":
-		return "engine: invalid PolicyProfile"
-	case "engine.invalid_fallback":
-		return "engine: invalid NoElicitFallback policy"
-	case "engine.invalid_request_tty":
-		return "engine: invalid RequestTTY mode"
-	case "engine.reconciler_unavailable":
-		return "engine: AuditReconciler port is not configured"
-	case "engine.vault_unavailable":
-		return "engine: SecretVault port is not configured"
-	case "engine.mcp_server_not_initialized":
-		return "engine: MCPServer is not initialized"
-	case "engine.projection_not_initialized":
-		return "engine: Projection is not initialized"
-	case "engine.approval_required":
-		return "engine: operation requires two-step approval confirmation"
-	case "engine.approval_rejected":
-		return "engine: operator rejected two-step approval challenge"
-	case "engine.authorization_denied":
-		return "engine: operation denied by guardrail or permission policy"
-	case "engine.scope_escalated":
-		return "engine: scope escalation or path drift detected during canonicalization"
-	case "engine.not_found":
-		return "engine: target resource not found"
-	case "engine.already_exists":
-		return "engine: target resource already exists"
-	case "engine.revision_conflict":
-		return "engine: inventory revision CAS conflict"
-	case "engine.still_referenced":
-		return "engine: target asset or secret is still referenced; refusing deletion"
-	case "engine.import_conflict":
-		return "engine: import preflight detected conflicts; refusing write"
-	case "engine.uncertain_durability":
-		return "engine: change applied with uncertain durability; retry and secret deletion are forbidden"
-	case "engine.outcome_unknown":
-		return "engine: side-effect outcome is unknown; automatic retry is forbidden"
-	case "engine.vault_locked":
-		return "engine: secret vault is locked"
-	case "engine.secret_not_found":
-		return "engine: secret entry not found"
-	case "engine.auth_failed":
-		return "engine: remote authentication or credential verification failed"
-	case "engine.host_key_unknown":
-		return "engine: unknown remote host key rejected by policy"
-	case "engine.host_key_mismatch":
-		return "engine: remote host key fingerprint conflicts with trust store"
-	case "engine.host_key_revoked":
-		return "engine: remote host key has been revoked"
-	case "engine.dial_failed":
-		return "engine: failed to establish remote transport connection"
-	case "engine.control_master_disabled":
-		return "engine: ControlPolicy effective projection disabled multiplexing"
-	case "engine.mux_unavailable":
-		return "engine: ControlMaster multiplex socket is unavailable"
-	case "engine.handle_not_found":
-		return "engine: managed session handle not found or already released"
-	case "engine.handle_revoked":
-		return "engine: managed handle or connection lease has been revoked"
-	case "engine.interaction_unavailable":
-		return "engine: interactive input is unavailable in current environment"
-	case "engine.interaction_canceled":
-		return "engine: operator canceled interaction request"
-	case "engine.remote_anchor_mismatch":
-		return "engine: remote file FSTAT type or (dev,ino) anchor mismatch"
-	case "engine.remote_is_dir":
-		return "engine: remote target is a directory"
-	case "engine.not_regular_file":
-		return "engine: target path is not a regular file"
-	case "engine.patch_conflict":
-		return "engine: remote file patch match failed or ambiguous"
-	case "engine.digest_mismatch":
-		return "engine: file SHA-256 digest verification mismatch"
-	case "engine.symlink_rejected":
-		return "engine: symbolic link rejected by security policy"
-	case "engine.corrupt_data":
-		return "engine: persisted data or transfer journal is corrupt"
-	case "engine.limit_exceeded":
-		return "engine: data size or object count exceeds safety limit"
-	case "engine.unsupported":
-		return "engine: capability is not supported by current configuration or adapter"
-	case "engine.init_component_failed":
-		return "failed to initialize {component}"
-	case "engine.hostkey_unobserved":
-		return "handshake completed without observing a verified host key fingerprint for {endpoint}"
-	case "engine.known_hosts_dir_missing":
-		return "KnownHostsDir is missing and default ~/.ssh could not be derived"
+	case "uc.transfer.reason.exists_non_dir":
+		return "target path exists and is not a directory"
+	case "uc.transfer.reason.target_is_dir":
+		return "target path is a directory"
+	case "uc.transfer.reason.no_clobber":
+		return "target already exists and overwrite is disabled"
+	case "uc.transfer.reason.recursive_required":
+		return "remote source is a directory and requires recursive mode"
+	case "uc.transfer.reason.not_regular_file":
+		return "source path is not a regular file"
+	case "uc.transfer.reason.already_exists":
+		return "destination path already exists"
+	case "uc.transfer.reason.symlink_over_dir":
+		return "cannot replace directory with symbolic link"
 	default:
 		return ""
 	}
 }
 
-// AllKeys 返回本分片注册的全部消息键（按字典序升序排列，每次返回独立切片副本）。
-func AllKeys() []string {
-	keys := []string{
+func keysUsecase() []string {
+	return []string{
 		"uc.automation.nil_context",
 		"uc.automation.invalid_config",
 		"uc.automation.not_initialized",
@@ -465,6 +400,13 @@ func AllKeys() []string {
 		"uc.automation.snapshot_missing",
 		"uc.automation.remote_exists",
 		"uc.automation.batch_counts",
+		"uc.automation.node_stream_failed",
+		"uc.automation.sandbox_follow_unsupported",
+		"uc.automation.local_source_limit",
+		"uc.automation.template_size_limit",
+		"uc.automation.resolve_target_failed",
+		"uc.automation.duplicate_target_node",
+		"uc.automation.remote_canon_hops",
 		"uc.credential.nil_context",
 		"uc.credential.nil_callback",
 		"uc.credential.invalid_config",
@@ -483,6 +425,9 @@ func AllKeys() []string {
 		"uc.credential.store_unknown",
 		"uc.credential.ref_not_in_graph",
 		"uc.credential.saga_step_limit",
+		"uc.credential.old_secret_gc_failed",
+		"uc.credential.saga_effect_count",
+		"uc.credential.gen_item_failed",
 		"uc.inventory.nil_context",
 		"uc.inventory.invalid_config",
 		"uc.inventory.not_initialized",
@@ -523,6 +468,27 @@ func AllKeys() []string {
 		"uc.inventory.node_not_found",
 		"uc.inventory.username_hint",
 		"uc.inventory.target_malformed",
+		"uc.inventory.env_var_placeholder",
+		"uc.inventory.unknown_import_format_value",
+		"uc.inventory.import_bundle_invalid",
+		"uc.inventory.origin_unsupported",
+		"uc.inventory.node_origin_mismatch",
+		"uc.inventory.proxy_depth_limit",
+		"uc.inventory.plan_hops_limit",
+		"uc.inventory.init_cred_service_failed",
+		"uc.inventory.query_stores_failed",
+		"uc.inventory.duplicate_import_format",
+		"uc.inventory.jump_hop_invalid",
+		"uc.inventory.jump_user_invalid",
+		"uc.inventory.jump_host_invalid",
+		"uc.inventory.target_reason.bad_chars",
+		"uc.inventory.target_reason.bad_at",
+		"uc.inventory.target_reason.missing_host",
+		"uc.inventory.target_reason.bad_brackets",
+		"uc.inventory.target_reason.not_ipv6_or_hp",
+		"uc.inventory.target_reason.malformed_brackets",
+		"uc.inventory.target_reason.bracket_not_ipv6",
+		"uc.inventory.target_reason.bad_suffix",
 		"uc.observability.nil_context",
 		"uc.observability.invalid_config",
 		"uc.observability.not_initialized",
@@ -542,6 +508,9 @@ func AllKeys() []string {
 		"uc.observability.image_format",
 		"uc.observability.screenshot_marker",
 		"uc.observability.non_loopback_denied",
+		"uc.observability.jpeg_encode_failed",
+		"uc.observability.image_decode_failed",
+		"uc.observability.probe_shell_failed",
 		"uc.session.nil_context",
 		"uc.session.invalid_config",
 		"uc.session.not_initialized",
@@ -559,6 +528,7 @@ func AllKeys() []string {
 		"uc.session.mux_ask_requires_tty",
 		"uc.session.mux_rejected",
 		"uc.session.control_path_tilde",
+		"uc.session.reason.lexical_scope_denied",
 		"uc.transfer.nil_context",
 		"uc.transfer.invalid_config",
 		"uc.transfer.not_initialized",
@@ -581,87 +551,19 @@ func AllKeys() []string {
 		"uc.transfer.gen_rollback",
 		"uc.transfer.gen_uncertain",
 		"uc.transfer.patch_multi_match",
+		"uc.transfer.patch_no_match_index",
 		"uc.transfer.symlink_policy",
 		"uc.transfer.remote_drift",
 		"uc.transfer.remote_dir_cycle",
 		"uc.transfer.remote_abs_required",
 		"uc.transfer.remote_symlink_hops",
 		"uc.transfer.remote_not_regular",
-		"mcp.invalid_config",
-		"mcp.server_not_initialized",
-		"mcp.server_closed",
-		"mcp.non_loopback_address",
-		"mcp.message_too_large",
-		"mcp.startup_reconcile_failed",
-		"mcp.startup_recovery_failed",
-		"mcp.protocol.parse_json",
-		"mcp.protocol.invalid_jsonrpc",
-		"mcp.protocol.invalid_request_id",
-		"mcp.protocol.invalid_mcp_message",
-		"mcp.protocol.invalid_approval",
-		"mcp.protocol.invalid_schema",
-		"mcp.protocol.invalid_params",
-		"mcp.protocol.tool_not_found",
-		"mcp.protocol.outcome_unknown",
-		"mcp.tools.invalid_config",
-		"mcp.tools.not_initialized",
-		"mcp.tools.service_unavailable",
-		"mcp.tools.handle_not_found",
-		"mcp.http.header_missing",
-		"mcp.http.header_rejected",
-		"mcp.http.session_missing",
-		"mcp.corrupt_journal_limit",
-		"mcp.protocol.id_type",
-		"engine.nil_context",
-		"engine.invalid_config",
-		"engine.not_initialized",
-		"engine.closed",
-		"engine.halted",
-		"engine.invalid_request",
-		"engine.invalid_profile",
-		"engine.invalid_fallback",
-		"engine.invalid_request_tty",
-		"engine.reconciler_unavailable",
-		"engine.vault_unavailable",
-		"engine.mcp_server_not_initialized",
-		"engine.projection_not_initialized",
-		"engine.approval_required",
-		"engine.approval_rejected",
-		"engine.authorization_denied",
-		"engine.scope_escalated",
-		"engine.not_found",
-		"engine.already_exists",
-		"engine.revision_conflict",
-		"engine.still_referenced",
-		"engine.import_conflict",
-		"engine.uncertain_durability",
-		"engine.outcome_unknown",
-		"engine.vault_locked",
-		"engine.secret_not_found",
-		"engine.auth_failed",
-		"engine.host_key_unknown",
-		"engine.host_key_mismatch",
-		"engine.host_key_revoked",
-		"engine.dial_failed",
-		"engine.control_master_disabled",
-		"engine.mux_unavailable",
-		"engine.handle_not_found",
-		"engine.handle_revoked",
-		"engine.interaction_unavailable",
-		"engine.interaction_canceled",
-		"engine.remote_anchor_mismatch",
-		"engine.remote_is_dir",
-		"engine.not_regular_file",
-		"engine.patch_conflict",
-		"engine.digest_mismatch",
-		"engine.symlink_rejected",
-		"engine.corrupt_data",
-		"engine.limit_exceeded",
-		"engine.unsupported",
-		"engine.init_component_failed",
-		"engine.hostkey_unobserved",
-		"engine.known_hosts_dir_missing",
+		"uc.transfer.reason.exists_non_dir",
+		"uc.transfer.reason.target_is_dir",
+		"uc.transfer.reason.no_clobber",
+		"uc.transfer.reason.recursive_required",
+		"uc.transfer.reason.not_regular_file",
+		"uc.transfer.reason.already_exists",
+		"uc.transfer.reason.symlink_over_dir",
 	}
-	slices.Sort(keys)
-	return keys
 }

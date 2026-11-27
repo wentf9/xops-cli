@@ -51,7 +51,6 @@ const (
 	KeyCommonDuplicateItem      MessageID = "common.duplicate_item"       // 唯一项重复
 	KeyCommonMismatch           MessageID = "common.mismatch"             // 期望与实际值失配
 	KeyCommonStateForbidden     MessageID = "common.state_forbidden"      // 当前状态禁止操作
-	KeyCommonStateInputRejected MessageID = "common.state_input_rejected" // 状态拒绝该输入
 	KeyCommonUnknownValue       MessageID = "common.unknown_value"        // 未知枚举或类别取值
 	KeyCommonValueInvalid       MessageID = "common.value_invalid"        // 通用非法值诊断
 	KeyCommonOpFailed           MessageID = "common.op_failed"            // 通用操作执行失败
@@ -73,6 +72,10 @@ const (
 	KeyCommonBase64DecodeFailed MessageID = "common.base64_decode_failed" // Base64 解码失败
 	KeyCommonZeroEntropy        MessageID = "common.zero_entropy"         // 熵源返回全零字节
 	KeyCommonPermInvalid        MessageID = "common.perm_invalid"         // POSIX 文件权限位非法
+	KeyCommonEitherMissingDep   MessageID = "common.either_missing_dep"   // 必需依赖二选一缺失
+	KeyCommonUnsupportedVariant MessageID = "common.unsupported_variant"  // 不支持的代数和类型变体
+	KeyCommonIDGenFailed        MessageID = "common.id_gen_failed"        // 生成标识或令牌失败
+	KeyCommonPathTemplateFailed MessageID = "common.path_template_failed" // 展开路径模板失败
 	KeyCommonDetail             MessageID = "common.detail"               // 受限净化原始明细
 )
 

@@ -147,6 +147,8 @@ func Lookup(id string) string {
 		return "node {node} references unknown proxy hop {hop}"
 	case "inventory.regex_compile_failed":
 		return "failed to compile challenge regex"
+	case "inventory.node_missing_asset_ref":
+		return "inventory: node {node} references missing host or identity"
 	case "netaddr.invalid_host":
 		return "netaddr: invalid network host"
 	case "netaddr.invalid_zone":
@@ -167,6 +169,18 @@ func Lookup(id string) string {
 		return "invalid port {value}: must be an integer in [1, 65535] without leading zeros"
 	case "netaddr.hostname_invalid":
 		return "invalid hostname {value}: {reason}"
+	case "netaddr.reason.length":
+		return "length out of range"
+	case "netaddr.reason.edge_dot":
+		return "leading or trailing dot"
+	case "netaddr.reason.numeric_tld":
+		return "numeric final label"
+	case "netaddr.reason.label_length":
+		return "invalid label length"
+	case "netaddr.reason.edge_hyphen":
+		return "leading or trailing hyphen in label"
+	case "netaddr.reason.illegal_char":
+		return "illegal character in label"
 	case "option.invalid_option":
 		return "option: invalid OpenSSH option"
 	case "option.unknown_option":
@@ -233,6 +247,34 @@ func Lookup(id string) string {
 		return "unclosed character class in glob pattern"
 	case "pathalg.glob_range_invalid":
 		return "invalid character range {lo}-{hi} in glob pattern"
+	case "pathalg.reason.sep_or_traversal":
+		return "contains path separator or traversal segment"
+	case "pathalg.reason.edge_slash":
+		return "contains leading or trailing slash"
+	case "pathalg.reason.disallowed_prefix":
+		return "uses disallowed platform path prefix"
+	case "pathalg.reason.drive_relative":
+		return "drive-relative Windows path is forbidden"
+	case "pathalg.reason.bare_drive_root":
+		return "bare drive root path is forbidden"
+	case "pathalg.reason.bare_root":
+		return "bare filesystem root path is forbidden"
+	case "pathalg.reason.current_dir":
+		return "current directory '.' is forbidden"
+	case "pathalg.reason.must_be_absolute":
+		return "path must be absolute"
+	case "pathalg.reason.abs_rel_mismatch":
+		return "cannot compute relative path across absolute and relative paths"
+	case "pathalg.reason.unresolvable_relative_base":
+		return "cannot resolve against relative base path"
+	case "pathalg.reason.escapes_root":
+		return "symbolic link target escapes sandbox root"
+	case "pathalg.reason.non_relative_or_char":
+		return "symbolic link target must be relative and free of forbidden characters"
+	case "pathalg.reason.ancestor_is_symlink":
+		return "ancestor path component is a symbolic link"
+	case "pathalg.reason.chain_escapes_root":
+		return "symbolic link chain escapes sandbox root"
 	case "plan.invalid_digest":
 		return "plan: invalid SHA-256 digest"
 	case "plan.invalid_transport_policy":
@@ -432,6 +474,7 @@ func AllKeys() []string {
 		"inventory.alias_conflict",
 		"inventory.hop_unknown",
 		"inventory.regex_compile_failed",
+		"inventory.node_missing_asset_ref",
 		"netaddr.invalid_host",
 		"netaddr.invalid_zone",
 		"netaddr.invalid_port",
@@ -442,6 +485,12 @@ func AllKeys() []string {
 		"netaddr.host_port_format",
 		"netaddr.port_format",
 		"netaddr.hostname_invalid",
+		"netaddr.reason.length",
+		"netaddr.reason.edge_dot",
+		"netaddr.reason.numeric_tld",
+		"netaddr.reason.label_length",
+		"netaddr.reason.edge_hyphen",
+		"netaddr.reason.illegal_char",
 		"option.invalid_option",
 		"option.unknown_option",
 		"option.invalid_origin",
@@ -475,6 +524,20 @@ func AllKeys() []string {
 		"pathalg.forbidden_char",
 		"pathalg.glob_unclosed",
 		"pathalg.glob_range_invalid",
+		"pathalg.reason.sep_or_traversal",
+		"pathalg.reason.edge_slash",
+		"pathalg.reason.disallowed_prefix",
+		"pathalg.reason.drive_relative",
+		"pathalg.reason.bare_drive_root",
+		"pathalg.reason.bare_root",
+		"pathalg.reason.current_dir",
+		"pathalg.reason.must_be_absolute",
+		"pathalg.reason.abs_rel_mismatch",
+		"pathalg.reason.unresolvable_relative_base",
+		"pathalg.reason.escapes_root",
+		"pathalg.reason.non_relative_or_char",
+		"pathalg.reason.ancestor_is_symlink",
+		"pathalg.reason.chain_escapes_root",
 		"plan.invalid_digest",
 		"plan.invalid_transport_policy",
 		"plan.invalid_hop_spec",

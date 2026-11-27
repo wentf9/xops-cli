@@ -50,43 +50,45 @@ const (
 	KeyPortsDurabilitySpec       MessageID = "ports.durability_spec"             // 持久化状态字段组合非法
 	KeyPortsTUNSpecConflict      MessageID = "ports.tun_spec_conflict"           // ForwardTUN 端点规格冲突
 
-	// core/events 哨兵与上下文错误标识（30 哨兵 + 4 上下文）。
-	KeyEventsNilContext          MessageID = "events.nil_context"                      // context 为 nil
-	KeyEventsNilReceiver         MessageID = "events.nil_receiver"                     // 反序列化接收者为 nil
-	KeyEventsNilWriter           MessageID = "events.nil_writer"                       // 编码输出 writer 为 nil
-	KeyEventsInvalidEvent        MessageID = "events.invalid_event"                    // 事件实例或变体无效
-	KeyEventsInvalidEventMeta    MessageID = "events.invalid_event_meta"               // EventMeta 无效
-	KeyEventsInvalidEventKind    MessageID = "events.invalid_event_kind"               // EventKind 无效
-	KeyEventsInvalidEventClass   MessageID = "events.invalid_event_class"              // EventClass 无效
-	KeyEventsInvalidBackpressure MessageID = "events.invalid_backpressure"             // 背压策略无效
-	KeyEventsInvalidSeverity     MessageID = "events.invalid_severity"                 // 严重等级无效
-	KeyEventsInvalidOutputStream MessageID = "events.invalid_output_stream"            // 输出流种类无效
-	KeyEventsInvalidAuditStage   MessageID = "events.invalid_audit_stage"              // 审计阶段无效
-	KeyEventsInvalidPoolAction   MessageID = "events.invalid_pool_action"              // 连接池事件动作无效
-	KeyEventsInvalidDiagScope    MessageID = "events.invalid_diagnostic_scope"         // 诊断作用域无效
-	KeyEventsInvalidFSMMachine   MessageID = "events.invalid_fsm_machine"              // 状态机类别无效
-	KeyEventsUnsupportedClass    MessageID = "events.unsupported_event_class"          // 通道不支持该事件类别
-	KeyEventsOperationMismatch   MessageID = "events.operation_mismatch"               // 事件与操作流绑定不一致
-	KeyEventsInvalidStreamConfig MessageID = "events.invalid_stream_config"            // 操作流配置无效
-	KeyEventsStreamNotInit       MessageID = "events.stream_not_initialized"           // 操作流未初始化
-	KeyEventsStreamClosed        MessageID = "events.stream_closed"                    // 操作流已关闭
-	KeyEventsInvalidFoldFunc     MessageID = "events.invalid_fold_func"                // 归约函数为 nil
-	KeyEventsInvalidAuditConfig  MessageID = "events.invalid_audit_config"             // 审计分发器配置无效
-	KeyEventsNilAuditWriter      MessageID = "events.nil_audit_writer"                 // AuditWriter 为 nil
-	KeyEventsAuditDispNotInit    MessageID = "events.audit_dispatcher_not_initialized" // 审计分发器未初始化
-	KeyEventsAuditHalted         MessageID = "events.audit_halted"                     // 审计分发器已熔断
-	KeyEventsAuditDispatchFailed MessageID = "events.audit_dispatch_failed"            // 同步审计分发失败
-	KeyEventsInvalidBusConfig    MessageID = "events.invalid_bus_config"               // 系统总线配置无效
-	KeyEventsBusNotInit          MessageID = "events.bus_not_initialized"              // 系统总线未初始化
-	KeyEventsBusClosed           MessageID = "events.bus_closed"                       // 系统总线已关闭
-	KeyEventsBusSubscriberLimit  MessageID = "events.bus_subscriber_limit"             // 系统总线订阅数达上限
-	KeyEventsSubNotInit          MessageID = "events.subscription_not_initialized"     // 订阅句柄未初始化
-	KeyEventsClassMismatch       MessageID = "events.class_mismatch"                   // 事件通道类别不匹配
-	KeyEventsAuditConflict       MessageID = "events.audit_conflict"                   // 审计阶段与安全决策矛盾
-	KeyEventsOutcomeConflict     MessageID = "events.outcome_conflict"                 // 事件状态与执行结果矛盾
-	KeyEventsJSONObjectRequired  MessageID = "events.json_object_required"             // 事件 JSON 必须为对象
+	// core/events 哨兵与上下文错误标识（30 哨兵 + 6 上下文）。
+	KeyEventsNilContext           MessageID = "events.nil_context"                      // context 为 nil
+	KeyEventsNilReceiver          MessageID = "events.nil_receiver"                     // 反序列化接收者为 nil
+	KeyEventsNilWriter            MessageID = "events.nil_writer"                       // 编码输出 writer 为 nil
+	KeyEventsInvalidEvent         MessageID = "events.invalid_event"                    // 事件实例或变体无效
+	KeyEventsInvalidEventMeta     MessageID = "events.invalid_event_meta"               // EventMeta 无效
+	KeyEventsInvalidEventKind     MessageID = "events.invalid_event_kind"               // EventKind 无效
+	KeyEventsInvalidEventClass    MessageID = "events.invalid_event_class"              // EventClass 无效
+	KeyEventsInvalidBackpressure  MessageID = "events.invalid_backpressure"             // 背压策略无效
+	KeyEventsInvalidSeverity      MessageID = "events.invalid_severity"                 // 严重等级无效
+	KeyEventsInvalidOutputStream  MessageID = "events.invalid_output_stream"            // 输出流种类无效
+	KeyEventsInvalidAuditStage    MessageID = "events.invalid_audit_stage"              // 审计阶段无效
+	KeyEventsInvalidPoolAction    MessageID = "events.invalid_pool_action"              // 连接池事件动作无效
+	KeyEventsInvalidDiagScope     MessageID = "events.invalid_diagnostic_scope"         // 诊断作用域无效
+	KeyEventsInvalidFSMMachine    MessageID = "events.invalid_fsm_machine"              // 状态机类别无效
+	KeyEventsUnsupportedClass     MessageID = "events.unsupported_event_class"          // 通道不支持该事件类别
+	KeyEventsOperationMismatch    MessageID = "events.operation_mismatch"               // 事件与操作流绑定不一致
+	KeyEventsInvalidStreamConfig  MessageID = "events.invalid_stream_config"            // 操作流配置无效
+	KeyEventsStreamNotInit        MessageID = "events.stream_not_initialized"           // 操作流未初始化
+	KeyEventsStreamClosed         MessageID = "events.stream_closed"                    // 操作流已关闭
+	KeyEventsInvalidFoldFunc      MessageID = "events.invalid_fold_func"                // 归约函数为 nil
+	KeyEventsInvalidAuditConfig   MessageID = "events.invalid_audit_config"             // 审计分发器配置无效
+	KeyEventsNilAuditWriter       MessageID = "events.nil_audit_writer"                 // AuditWriter 为 nil
+	KeyEventsAuditDispNotInit     MessageID = "events.audit_dispatcher_not_initialized" // 审计分发器未初始化
+	KeyEventsAuditHalted          MessageID = "events.audit_halted"                     // 审计分发器已熔断
+	KeyEventsAuditDispatchFailed  MessageID = "events.audit_dispatch_failed"            // 同步审计分发失败
+	KeyEventsInvalidBusConfig     MessageID = "events.invalid_bus_config"               // 系统总线配置无效
+	KeyEventsBusNotInit           MessageID = "events.bus_not_initialized"              // 系统总线未初始化
+	KeyEventsBusClosed            MessageID = "events.bus_closed"                       // 系统总线已关闭
+	KeyEventsBusSubscriberLimit   MessageID = "events.bus_subscriber_limit"             // 系统总线订阅数达上限
+	KeyEventsSubNotInit           MessageID = "events.subscription_not_initialized"     // 订阅句柄未初始化
+	KeyEventsClassMismatch        MessageID = "events.class_mismatch"                   // 事件通道类别不匹配
+	KeyEventsAuditConflict        MessageID = "events.audit_conflict"                   // 审计阶段与安全决策矛盾
+	KeyEventsOutcomeConflict      MessageID = "events.outcome_conflict"                 // 事件状态与执行结果矛盾
+	KeyEventsJSONObjectRequired   MessageID = "events.json_object_required"             // 事件 JSON 必须为对象
+	KeyEventsAuditHaltWriteFailed MessageID = "events.audit_halted_write_failed"        // 同步审计落盘写入失败触发熔断
+	KeyEventsAuditHaltReason      MessageID = "events.audit_halted_reason"              // 审计分发器熔断原因明细
 
-	// core/osfs 哨兵与上下文错误标识（8 哨兵 + 12 上下文）。
+	// core/osfs 哨兵与上下文错误标识（8 哨兵 + 17 上下文）。
 	KeyOSFSSlotOccupied         MessageID = "osfs.slot_occupied"          // 控制套接字槽位已占用
 	KeyOSFSNotSocket            MessageID = "osfs.not_socket"             // 目标路径不是本地 Unix 套接字
 	KeyOSFSInvalidControlPath   MessageID = "osfs.invalid_control_path"   // 控制套接字路径非法
@@ -107,6 +109,11 @@ const (
 	KeyOSFSLockTargetReplaced   MessageID = "osfs.lock_target_replaced"   // 加锁目标被并发替换
 	KeyOSFSAppendNewline        MessageID = "osfs.append_newline"         // AppendLine 禁含内嵌换行符
 	KeyOSFSStaleProbeFailed     MessageID = "osfs.stale_probe_failed"     // 无法确认过期套接字状态
+	KeyOSFSSyscallFailed        MessageID = "osfs.syscall_failed"         // 操作系统调用失败
+	KeyOSFSOpenFailed           MessageID = "osfs.open_failed"            // 打开本地文件或句柄失败
+	KeyOSFSRandomHexFailed      MessageID = "osfs.random_hex_failed"      // 生成随机临时文件名令牌失败
+	KeyOSFSSlotOccupiedAt       MessageID = "osfs.slot_occupied_at"       // 指定路径控制套接字槽位已占用
+	KeyOSFSRootAccessDenied     MessageID = "osfs.root_access_denied"     // 根目录权限不安全或访问被拒绝
 
 	// core/internal/foundation/{actor,trace} 哨兵与上下文错误标识（8 哨兵 + 1 上下文）。
 	KeyActorNotInitialized    MessageID = "actor.not_initialized"     // DualActor 未初始化

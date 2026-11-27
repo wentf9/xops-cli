@@ -64,7 +64,7 @@ func lookupHost(id string) string {
 	case "host.openssh.match_criterion_missing_arg":
 		return "Match criterion {keyword} is missing a valid argument"
 	case "host.openssh.include_depth_at":
-		return "{path} (depth={depth})"
+		return "openssh: Include nesting depth exceeded at {path} (depth={depth})"
 	case "host.openssh.include_cycle_at":
 		return "include cycle at {path}"
 	case "host.openssh.include_files_exceeded":
@@ -72,13 +72,19 @@ func lookupHost(id string) string {
 	case "host.openssh.file_too_large":
 		return "{path} exceeds maximum size of {max} bytes"
 	case "host.openssh.line_error":
-		return "{file}:{line}"
+		return "openssh: invalid configuration at {file}:{line}"
 	case "host.openssh.invalid_clause":
 		return "{file}:{line}: invalid {clause} directive"
 	case "host.openssh.directive_missing_value":
 		return "directive {key} is missing a value"
 	case "host.openssh.unclosed_quote":
 		return "unclosed quote"
+	case "host.openssh.diag.include_skipped":
+		return "line {line}: Include \"{patterns}\" skipped in stream-only import (local files are not expanded)"
+	case "host.openssh.diag.match_canonical_ignored":
+		return "line {line}: Match canonical block ignored (fail-closed by security policy)"
+	case "host.openssh.diag.match_exec_ignored":
+		return "line {line}: Match exec block ignored (fail-closed; external commands are never executed)"
 	case "host.store.unsupported_schema_version":
 		return "store: unsupported config schema version (only version: 2 is supported)"
 	case "host.store.plaintext_secret_forbidden":
@@ -127,6 +133,16 @@ func lookupHost(id string) string {
 		return "WAL CRC32 checksum mismatch"
 	case "host.store.wal_payload_failed":
 		return "WAL payload unmarshal, digest, or ownership verification failed"
+	case "host.store.import_warn.alias_skipped":
+		return "alias does not satisfy managed NodeID naming rules; skipped"
+	case "host.store.import_warn.host_unresolved":
+		return "missing resolvable HostName or valid host; skipped"
+	case "host.store.import_warn.user_missing":
+		return "missing User and no default username configured; skipped"
+	case "host.store.import_warn.cert_without_key_skipped":
+		return "no usable literal IdentityFile; skipped unbound CertificateFile"
+	case "host.store.import_warn.unsupported_directive":
+		return "skipped unsupported {directive} \"{value}\" for direct import"
 	case "host.yaml.unsupported_schema_version":
 		return "yamlcodec: unsupported config schema version (only version: 2 is supported)"
 	case "host.yaml.section_key":
@@ -324,6 +340,9 @@ func errorKeysHost() []string {
 		"host.openssh.invalid_clause",
 		"host.openssh.directive_missing_value",
 		"host.openssh.unclosed_quote",
+		"host.openssh.diag.include_skipped",
+		"host.openssh.diag.match_canonical_ignored",
+		"host.openssh.diag.match_exec_ignored",
 		"host.store.unsupported_schema_version",
 		"host.store.plaintext_secret_forbidden",
 		"host.store.invalid_csv",
@@ -348,6 +367,11 @@ func errorKeysHost() []string {
 		"host.store.wal_invalid_frame",
 		"host.store.wal_crc_mismatch",
 		"host.store.wal_payload_failed",
+		"host.store.import_warn.alias_skipped",
+		"host.store.import_warn.host_unresolved",
+		"host.store.import_warn.user_missing",
+		"host.store.import_warn.cert_without_key_skipped",
+		"host.store.import_warn.unsupported_directive",
 		"host.yaml.unsupported_schema_version",
 		"host.yaml.section_key",
 		"host.yaml.empty_config",

@@ -8,7 +8,7 @@ import (
 )
 
 // TestAllRootKeyConstantsBijection 镜像 core/domain/i18n/keys_bijection_test.go，
-// 严格在 LayerInternalI18n 纯内存无 I/O 边界内校验本包声明的全部 604 个 Key* 常量与
+// 严格在 LayerInternalI18n 纯内存无 I/O 边界内校验本包声明的全部 617 个 Key* 常量与
 // RootKeys() / RootErrorKeys() / rootcatalog 保持 100% 双向双射（零孤儿、零缺失、零重复、零影子兜底）。
 func TestAllRootKeyConstantsBijection(t *testing.T) {
 	declared := allDeclaredRootKeys()
@@ -112,7 +112,9 @@ func allDeclaredRootKeys() []domi18n.MessageID {
 		KeyCLIVaultSagaUncertain, KeyCLIVaultRefsSummary, KeyCLIVaultDeleted, KeyCLIVaultGCComplete,
 		KeyCLIVaultEnrolled, KeyCLIAuditReconcileSummary, KeyCLIAuditEntriesSummary, KeyCLIDoctorVaultNoCap,
 		KeyCLIDoctorVaultNotConfigured, KeyCLIDoctorSummary, KeyCLIDoctorInventory, KeyCLIDoctorVault,
-		KeyCLIDoctorVaultNote, KeyCLIPlaybookValid, KeyCLIPlaybookSummary, KeyCLIPlaybookUnknownWarning,
+		KeyCLIDoctorVaultNote, KeyCLIDoctorSevInfo, KeyCLIDoctorSevWarn, KeyCLIDoctorSevError,
+		KeyCLIDoctorFindingLine, KeyCLIDoctorFindingLineSubj, KeyCLIPlaybookValid, KeyCLIPlaybookSummary,
+		KeyCLIPlaybookUnknownWarning,
 		KeyCLIInvalidConfig, KeyCLIAppNotInitialized, KeyCLIUsage, KeyCLINotConfigured,
 		KeyCLIUnsupportedRunner, KeyCLINilContext, KeyCLINilEngineFactory, KeyCLINilStdStreams,
 		KeyCLIShutdownTimeoutPositive, KeyCLINilSessionRunner, KeyCLICapabilityRequired, KeyCLIHookNotConfigured,
@@ -162,12 +164,15 @@ func allDeclaredRootKeys() []domi18n.MessageID {
 		KeyHostOpenSSHInvalidGlob, KeyHostOpenSSHMatchMissingCriteria, KeyHostOpenSSHMatchModifierInvalid, KeyHostOpenSSHMatchCriterionMissingArg,
 		KeyHostOpenSSHIncludeDepthAt, KeyHostOpenSSHIncludeCycleAt, KeyHostOpenSSHIncludeFilesExceeded, KeyHostOpenSSHFileTooLarge,
 		KeyHostOpenSSHLineError, KeyHostOpenSSHInvalidClause, KeyHostOpenSSHDirectiveMissingValue, KeyHostOpenSSHUnclosedQuote,
-		KeyHostStoreUnsupportedSchema, KeyHostStorePlaintextSecretForbidden, KeyHostStoreInvalidCSV, KeyHostStoreCorruptJournalFrame,
+		KeyHostOpenSSHDiagIncludeSkip, KeyHostOpenSSHDiagMatchCanon, KeyHostOpenSSHDiagMatchExec, KeyHostStoreUnsupportedSchema,
+		KeyHostStorePlaintextSecretForbidden, KeyHostStoreInvalidCSV, KeyHostStoreCorruptJournalFrame,
 		KeyHostStoreCSVEmpty, KeyHostStoreCSVTooManyRows, KeyHostStoreCSVForbiddenColumn, KeyHostStoreCSVDupOrEmptyColumn,
 		KeyHostStoreCSVMissingReqColumns, KeyHostStoreCSVUnknownColumn, KeyHostStoreCSVColumnCountMismatch, KeyHostStoreCSVRowInvalidField,
 		KeyHostStoreCSVInvalidPort, KeyHostStoreCSVCertRequiresKey, KeyHostStoreOpenSSHNoNodes, KeyHostStoreRevisionOverflow,
 		KeyHostStoreWALGenerationCorrupt, KeyHostStoreWALEmpty, KeyHostStoreWALTruncatedLine, KeyHostStoreWALLineError,
 		KeyHostStoreWALMarshalFailed, KeyHostStoreWALInvalidFrame, KeyHostStoreWALCRCMismatch, KeyHostStoreWALPayloadFailed,
+		KeyHostStoreImportWarnAlias, KeyHostStoreImportWarnHost, KeyHostStoreImportWarnUser, KeyHostStoreImportWarnCertNoKey,
+		KeyHostStoreImportWarnDirective,
 		KeyHostYAMLUnsupportedSchema, KeyHostYAMLSectionKey, KeyHostYAMLEmptyConfig, KeyHostYAMLDecodeFailed,
 		KeyHostYAMLInvalidVersion, KeyHostYAMLMultipleDocs, KeyHostYAMLNodeOverrideInvalid, KeyHostYAMLDuplicateField,
 		KeyHostYAMLUnknownField, KeyHostYAMLNodeOverrideFieldInvalid, KeyHostYAMLInvalidFieldValue, KeyHostYAMLVaultStoreInvalid,

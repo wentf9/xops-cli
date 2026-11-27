@@ -1,5 +1,5 @@
 # XOps v2 Canonical English Message Catalog (host)
-# All RootErrorKeys() entries in this file must match fallback_host_spec.go verbatim.
+# All RootErrorKeys() entries in this file must match internal/rootcatalog/catalog_host_spec.go verbatim.
 
 # ---- Shared Host Common Errors ----
 host.common.not_initialized: "{component} is not initialized"
@@ -36,14 +36,17 @@ host.openssh.invalid_glob: "invalid include wildcard pattern {pattern}"
 host.openssh.match_missing_criteria: "Match directive is missing valid criteria"
 host.openssh.match_modifier_invalid: "Match {modifier} has invalid negation, assignment, duplication, or ordering"
 host.openssh.match_criterion_missing_arg: "Match criterion {keyword} is missing a valid argument"
-host.openssh.include_depth_at: "{path} (depth={depth})"
+host.openssh.include_depth_at: "openssh: Include nesting depth exceeded at {path} (depth={depth})"
 host.openssh.include_cycle_at: "include cycle at {path}"
 host.openssh.include_files_exceeded: "included file count exceeds limit of {max}"
 host.openssh.file_too_large: "{path} exceeds maximum size of {max} bytes"
-host.openssh.line_error: "{file}:{line}"
+host.openssh.line_error: "openssh: invalid configuration at {file}:{line}"
 host.openssh.invalid_clause: "{file}:{line}: invalid {clause} directive"
 host.openssh.directive_missing_value: "directive {key} is missing a value"
 host.openssh.unclosed_quote: "unclosed quote"
+host.openssh.diag.include_skipped: "line {line}: Include \"{patterns}\" skipped in stream-only import (local files are not expanded)"
+host.openssh.diag.match_canonical_ignored: "line {line}: Match canonical block ignored (fail-closed by security policy)"
+host.openssh.diag.match_exec_ignored: "line {line}: Match exec block ignored (fail-closed; external commands are never executed)"
 
 # ---- Store, WAL Journal & Importer Errors (internal/host/store) ----
 host.store.unsupported_schema_version: "store: unsupported config schema version (only version: 2 is supported)"
@@ -70,6 +73,11 @@ host.store.wal_marshal_failed: "failed to marshal canonical WAL journal record"
 host.store.wal_invalid_frame: "malformed WAL frame header or CRC32 format"
 host.store.wal_crc_mismatch: "WAL CRC32 checksum mismatch"
 host.store.wal_payload_failed: "WAL payload unmarshal, digest, or ownership verification failed"
+host.store.import_warn.alias_skipped: "alias does not satisfy managed NodeID naming rules; skipped"
+host.store.import_warn.host_unresolved: "missing resolvable HostName or valid host; skipped"
+host.store.import_warn.user_missing: "missing User and no default username configured; skipped"
+host.store.import_warn.cert_without_key_skipped: "no usable literal IdentityFile; skipped unbound CertificateFile"
+host.store.import_warn.unsupported_directive: "skipped unsupported {directive} \"{value}\" for direct import"
 
 # ---- YAML vNext Codec Errors (internal/host/store/yamlcodec) ----
 host.yaml.unsupported_schema_version: "yamlcodec: unsupported config schema version (only version: 2 is supported)"

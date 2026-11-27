@@ -87,8 +87,6 @@ func Lookup(id string) string {
 		return "{field} mismatch: expected {expected}, got {actual}"
 	case "common.state_forbidden":
 		return "cannot {action} in state {state}"
-	case "common.state_input_rejected":
-		return "state {state} does not accept this input"
 	case "common.unknown_value":
 		return "unknown {kind}: {value}"
 	case "common.value_invalid":
@@ -131,6 +129,14 @@ func Lookup(id string) string {
 		return "entropy source returned all-zero bytes"
 	case "common.perm_invalid":
 		return "invalid file permission mode {perm}"
+	case "common.either_missing_dep":
+		return "{first} or {second} is required"
+	case "common.unsupported_variant":
+		return "unsupported {type} variant"
+	case "common.id_gen_failed":
+		return "failed to generate {kind}"
+	case "common.path_template_failed":
+		return "failed to expand path template {target}"
 	case "common.detail":
 		return "{detail}"
 	case "interact.hostkey.title":
@@ -208,7 +214,6 @@ func AllKeys() []string {
 		"common.duplicate_item",
 		"common.mismatch",
 		"common.state_forbidden",
-		"common.state_input_rejected",
 		"common.unknown_value",
 		"common.value_invalid",
 		"common.op_failed",
@@ -230,6 +235,10 @@ func AllKeys() []string {
 		"common.base64_decode_failed",
 		"common.zero_entropy",
 		"common.perm_invalid",
+		"common.either_missing_dep",
+		"common.unsupported_variant",
+		"common.id_gen_failed",
+		"common.path_template_failed",
 		"common.detail",
 		"interact.hostkey.title",
 		"interact.hostkey.body",

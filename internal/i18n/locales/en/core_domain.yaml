@@ -1,5 +1,5 @@
 # XOps v2 Canonical English Message Catalog (core_domain)
-# All CoreKeys() entries in this file must match core/domain/i18n/internal/corecatalog/catalog_domain_spec.go verbatim.
+# All CoreKeys() entries in this file must match core/domain/i18n/internal/corecatalog/domain verbatim.
 
 # ---- Algebraic Types (core/domain/algebraic) ----
 algebraic.empty_slice: "algebraic: NonEmpty requires at least one element"
@@ -79,6 +79,7 @@ inventory.cycle_detected: "detected {count} proxy jump cycle(s) (first: {first})
 inventory.alias_conflict: "alias {alias} conflicts between {first} and {second}"
 inventory.hop_unknown: "node {node} references unknown proxy hop {hop}"
 inventory.regex_compile_failed: "failed to compile challenge regex"
+inventory.node_missing_asset_ref: "inventory: node {node} references missing host or identity"
 
 # ---- Network Addresses & Endpoints (core/domain/netaddr) ----
 netaddr.invalid_host: "netaddr: invalid network host"
@@ -91,6 +92,12 @@ netaddr.brackets_malformed: "malformed bracketed address {value}"
 netaddr.host_port_format: "address {value} must be in <host>:<port> or [<ipv6>]:<port> format"
 netaddr.port_format: "invalid port {value}: must be an integer in [1, 65535] without leading zeros"
 netaddr.hostname_invalid: "invalid hostname {value}: {reason}"
+netaddr.reason.length: "length out of range"
+netaddr.reason.edge_dot: "leading or trailing dot"
+netaddr.reason.numeric_tld: "numeric final label"
+netaddr.reason.label_length: "invalid label length"
+netaddr.reason.edge_hyphen: "leading or trailing hyphen in label"
+netaddr.reason.illegal_char: "illegal character in label"
 
 # ---- OpenSSH Option Monoid (core/domain/option) ----
 option.invalid_option: "option: invalid OpenSSH option"
@@ -128,6 +135,20 @@ pathalg.reserved_name: "path component {value} uses a reserved Windows device na
 pathalg.forbidden_char: "path {value} contains forbidden character {char}"
 pathalg.glob_unclosed: "unclosed character class in glob pattern"
 pathalg.glob_range_invalid: "invalid character range {lo}-{hi} in glob pattern"
+pathalg.reason.sep_or_traversal: "contains path separator or traversal segment"
+pathalg.reason.edge_slash: "contains leading or trailing slash"
+pathalg.reason.disallowed_prefix: "uses disallowed platform path prefix"
+pathalg.reason.drive_relative: "drive-relative Windows path is forbidden"
+pathalg.reason.bare_drive_root: "bare drive root path is forbidden"
+pathalg.reason.bare_root: "bare filesystem root path is forbidden"
+pathalg.reason.current_dir: "current directory '.' is forbidden"
+pathalg.reason.must_be_absolute: "path must be absolute"
+pathalg.reason.abs_rel_mismatch: "cannot compute relative path across absolute and relative paths"
+pathalg.reason.unresolvable_relative_base: "cannot resolve against relative base path"
+pathalg.reason.escapes_root: "symbolic link target escapes sandbox root"
+pathalg.reason.non_relative_or_char: "symbolic link target must be relative and free of forbidden characters"
+pathalg.reason.ancestor_is_symlink: "ancestor path component is a symbolic link"
+pathalg.reason.chain_escapes_root: "symbolic link chain escapes sandbox root"
 
 # ---- Sealed Connection Plan & Handles (core/domain/plan) ----
 plan.invalid_digest: "plan: invalid SHA-256 digest"

@@ -56,7 +56,7 @@ const (
 	KeyFSMTimeBeforeStaged         MessageID = "fsm.time_before_staged"         // 操作时刻早于 staged_at
 	KeyFSMLeaseNotExpired          MessageID = "fsm.lease_not_expired"          // 租约尚未到期
 
-	// core/domain/inventory 哨兵与上下文错误标识（19 哨兵 + 4 上下文）。
+	// core/domain/inventory 哨兵与上下文错误标识（19 哨兵 + 5 上下文）。
 	KeyInventoryInvalidID            MessageID = "inventory.invalid_id"                // 资产标识符无效
 	KeyInventoryInvalidKeySpec       MessageID = "inventory.invalid_key_spec"          // 私钥/证书/指纹规格无效
 	KeyInventoryInvalidChallengeRule MessageID = "inventory.invalid_challenge_rule"    // 质询应答规则无效
@@ -80,18 +80,25 @@ const (
 	KeyInventoryAliasConflict        MessageID = "inventory.alias_conflict"            // 别名被多个节点占用
 	KeyInventoryHopUnknown           MessageID = "inventory.hop_unknown"               // 节点引用未知跳板
 	KeyInventoryRegexCompileFailed   MessageID = "inventory.regex_compile_failed"      // 质询正则编译失败
+	KeyInvNodeMissingAssetRef        MessageID = "inventory.node_missing_asset_ref"    // 指定节点引用缺失主机或身份资产
 
-	// core/domain/netaddr 哨兵与上下文错误标识（6 哨兵 + 4 上下文）。
-	KeyNetaddrInvalidHost       MessageID = "netaddr.invalid_host"       // 网络主机无效
-	KeyNetaddrInvalidZone       MessageID = "netaddr.invalid_zone"       // IPv6 区段标识无效
-	KeyNetaddrInvalidPort       MessageID = "netaddr.invalid_port"       // 端口号无效
-	KeyNetaddrInvalidHostPort   MessageID = "netaddr.invalid_host_port"  // HostPort 无效
-	KeyNetaddrInvalidEndpoint   MessageID = "netaddr.invalid_endpoint"   // SSH Endpoint 无效
-	KeyNetaddrNilReceiver       MessageID = "netaddr.nil_receiver"       // 反序列化接收者为 nil
-	KeyNetaddrBracketsMalformed MessageID = "netaddr.brackets_malformed" // 方括号地址畸形
-	KeyNetaddrHostPortFormat    MessageID = "netaddr.host_port_format"   // 地址不满足 host:port 格式
-	KeyNetaddrPortFormat        MessageID = "netaddr.port_format"        // 端口格式或范围非法
-	KeyNetaddrHostnameInvalid   MessageID = "netaddr.hostname_invalid"   // 主机名格式校验失败
+	// core/domain/netaddr 哨兵与上下文错误标识（6 哨兵 + 10 上下文）。
+	KeyNetaddrInvalidHost       MessageID = "netaddr.invalid_host"        // 网络主机无效
+	KeyNetaddrInvalidZone       MessageID = "netaddr.invalid_zone"        // IPv6 区段标识无效
+	KeyNetaddrInvalidPort       MessageID = "netaddr.invalid_port"        // 端口号无效
+	KeyNetaddrInvalidHostPort   MessageID = "netaddr.invalid_host_port"   // HostPort 无效
+	KeyNetaddrInvalidEndpoint   MessageID = "netaddr.invalid_endpoint"    // SSH Endpoint 无效
+	KeyNetaddrNilReceiver       MessageID = "netaddr.nil_receiver"        // 反序列化接收者为 nil
+	KeyNetaddrBracketsMalformed MessageID = "netaddr.brackets_malformed"  // 方括号地址畸形
+	KeyNetaddrHostPortFormat    MessageID = "netaddr.host_port_format"    // 地址不满足 host:port 格式
+	KeyNetaddrPortFormat        MessageID = "netaddr.port_format"         // 端口格式或范围非法
+	KeyNetaddrHostnameInvalid   MessageID = "netaddr.hostname_invalid"    // 主机名格式校验失败
+	KeyNetaddrReasonLength      MessageID = "netaddr.reason.length"       // 主机名原因：长度越界
+	KeyNetaddrReasonEdgeDot     MessageID = "netaddr.reason.edge_dot"     // 主机名原因：首尾点号
+	KeyNetaddrReasonNumericTLD  MessageID = "netaddr.reason.numeric_tld"  // 主机名原因：末级纯数字标签
+	KeyNetaddrReasonLabelLength MessageID = "netaddr.reason.label_length" // 主机名原因：标签长度非法
+	KeyNetaddrReasonEdgeHyphen  MessageID = "netaddr.reason.edge_hyphen"  // 主机名原因：标签首尾连字符
+	KeyNetaddrReasonIllegalChar MessageID = "netaddr.reason.illegal_char" // 主机名原因：标签含非法字符
 
 	// core/domain/option 哨兵与上下文错误标识（12 哨兵 + 3 上下文）。
 	KeyOptionInvalidOption        MessageID = "option.invalid_option"         // OpenSSH 选项无效
@@ -110,25 +117,39 @@ const (
 	KeyOptionDurationInvalid      MessageID = "option.duration_invalid"       // OpenSSH 时长格式非法
 	KeyOptionTemplateInvalid      MessageID = "option.template_invalid"       // OpenSSH 令牌模板非法
 
-	// core/domain/pathalg 哨兵与上下文错误标识（13 哨兵 + 5 上下文）。
-	KeyPathalgInvalidComponent     MessageID = "pathalg.invalid_component"      // 本地路径分量无效
-	KeyPathalgInvalidRemoteName    MessageID = "pathalg.invalid_remote_name"    // 远端名称无效
-	KeyPathalgInvalidRemotePath    MessageID = "pathalg.invalid_remote_path"    // 远端路径无效
-	KeyPathalgInvalidLocalDest     MessageID = "pathalg.invalid_local_dest"     // 本地沙箱目标路径无效
-	KeyPathalgInvalidLocalDir      MessageID = "pathalg.invalid_local_dir"      // 本地根目录路径无效
-	KeyPathalgInvalidLocalSource   MessageID = "pathalg.invalid_local_source"   // 本地只读源路径无效
-	KeyPathalgInvalidSymlinkPolicy MessageID = "pathalg.invalid_symlink_policy" // 软链接策略无效
-	KeyPathalgUnsafeSymlink        MessageID = "pathalg.unsafe_symlink"         // 不安全的符号链接
-	KeyPathalgNameCollision        MessageID = "pathalg.name_collision"         // 路径名存在 Unicode/大小写碰撞
-	KeyPathalgInvalidUTF8          MessageID = "pathalg.invalid_utf8"           // 无效 UTF-8 编码
-	KeyPathalgInvalidProtectedRule MessageID = "pathalg.invalid_protected_rule" // 受保护路径规则无效
-	KeyPathalgInvalidGlob          MessageID = "pathalg.invalid_glob"           // 通配符模式无效
-	KeyPathalgNilReceiver          MessageID = "pathalg.nil_receiver"           // 反序列化接收者为 nil
-	KeyPathalgTraversalForbidden   MessageID = "pathalg.traversal_forbidden"    // 禁止目录遍历路径段
-	KeyPathalgReservedName         MessageID = "pathalg.reserved_name"          // 禁止 Windows 保留设备名
-	KeyPathalgForbiddenChar        MessageID = "pathalg.forbidden_char"         // 路径含跨平台禁用字符
-	KeyPathalgGlobUnclosed         MessageID = "pathalg.glob_unclosed"          // 通配符字符类未闭合
-	KeyPathalgGlobRangeInvalid     MessageID = "pathalg.glob_range_invalid"     // 通配符字符范围非法
+	// core/domain/pathalg 哨兵与上下文错误标识（13 哨兵 + 19 上下文）。
+	KeyPathalgInvalidComponent     MessageID = "pathalg.invalid_component"                 // 本地路径分量无效
+	KeyPathalgInvalidRemoteName    MessageID = "pathalg.invalid_remote_name"               // 远端名称无效
+	KeyPathalgInvalidRemotePath    MessageID = "pathalg.invalid_remote_path"               // 远端路径无效
+	KeyPathalgInvalidLocalDest     MessageID = "pathalg.invalid_local_dest"                // 本地沙箱目标路径无效
+	KeyPathalgInvalidLocalDir      MessageID = "pathalg.invalid_local_dir"                 // 本地根目录路径无效
+	KeyPathalgInvalidLocalSource   MessageID = "pathalg.invalid_local_source"              // 本地只读源路径无效
+	KeyPathalgInvalidSymlinkPolicy MessageID = "pathalg.invalid_symlink_policy"            // 软链接策略无效
+	KeyPathalgUnsafeSymlink        MessageID = "pathalg.unsafe_symlink"                    // 不安全的符号链接
+	KeyPathalgNameCollision        MessageID = "pathalg.name_collision"                    // 路径名存在 Unicode/大小写碰撞
+	KeyPathalgInvalidUTF8          MessageID = "pathalg.invalid_utf8"                      // 无效 UTF-8 编码
+	KeyPathalgInvalidProtectedRule MessageID = "pathalg.invalid_protected_rule"            // 受保护路径规则无效
+	KeyPathalgInvalidGlob          MessageID = "pathalg.invalid_glob"                      // 通配符模式无效
+	KeyPathalgNilReceiver          MessageID = "pathalg.nil_receiver"                      // 反序列化接收者为 nil
+	KeyPathalgTraversalForbidden   MessageID = "pathalg.traversal_forbidden"               // 禁止目录遍历路径段
+	KeyPathalgReservedName         MessageID = "pathalg.reserved_name"                     // 禁止 Windows 保留设备名
+	KeyPathalgForbiddenChar        MessageID = "pathalg.forbidden_char"                    // 路径含跨平台禁用字符
+	KeyPathalgGlobUnclosed         MessageID = "pathalg.glob_unclosed"                     // 通配符字符类未闭合
+	KeyPathalgGlobRangeInvalid     MessageID = "pathalg.glob_range_invalid"                // 通配符字符范围非法
+	KeyPathalgReasonSepOrTraversal MessageID = "pathalg.reason.sep_or_traversal"           // 路径原因：含路径分隔符或穿越段
+	KeyPathalgReasonEdgeSlash      MessageID = "pathalg.reason.edge_slash"                 // 路径原因：含首尾斜杠
+	KeyPathalgReasonDisallowedPfx  MessageID = "pathalg.reason.disallowed_prefix"          // 路径原因：受禁平台路径前缀
+	KeyPathalgReasonDriveRelative  MessageID = "pathalg.reason.drive_relative"             // 路径原因：盘符相对路径受禁
+	KeyPathalgReasonBareDriveRoot  MessageID = "pathalg.reason.bare_drive_root"            // 路径原因：裸盘符根路径受禁
+	KeyPathalgReasonBareRoot       MessageID = "pathalg.reason.bare_root"                  // 路径原因：裸根目录受禁
+	KeyPathalgReasonCurrentDir     MessageID = "pathalg.reason.current_dir"                // 路径原因：当前目录 '.' 受禁
+	KeyPathalgReasonMustBeAbs      MessageID = "pathalg.reason.must_be_absolute"           // 路径原因：必须为绝对路径
+	KeyPathalgReasonAbsRelMismatch MessageID = "pathalg.reason.abs_rel_mismatch"           // 路径原因：绝对与相对路径不匹配
+	KeyPathalgReasonUnresolvBase   MessageID = "pathalg.reason.unresolvable_relative_base" // 路径原因：无法基于相对基准路径解析
+	KeyPathalgReasonEscapesRoot    MessageID = "pathalg.reason.escapes_root"               // 路径原因：软链目标逃逸沙箱根目录
+	KeyPathalgReasonNonRelOrChar   MessageID = "pathalg.reason.non_relative_or_char"       // 路径原因：软链目标非相对路径或含禁用字符
+	KeyPathalgReasonAncestorLink   MessageID = "pathalg.reason.ancestor_is_symlink"        // 路径原因：祖先路径分量是软链
+	KeyPathalgReasonChainEscapes   MessageID = "pathalg.reason.chain_escapes_root"         // 路径原因：软链解析链逃逸沙箱根目录
 
 	// core/domain/plan 哨兵与上下文错误标识（11 哨兵 + 2 上下文）。
 	KeyPlanInvalidDigest          MessageID = "plan.invalid_digest"           // SHA-256 摘要无效

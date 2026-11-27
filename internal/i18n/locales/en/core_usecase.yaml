@@ -1,5 +1,5 @@
 # XOps v2 Canonical English Message Catalog (core_usecase)
-# All CoreKeys() entries in this file must match core/domain/i18n/internal/corecatalog/catalog_usecase_spec.go verbatim.
+# All CoreKeys() entries in this file must match core/domain/i18n/internal/corecatalog/usecase verbatim.
 
 # ---- Automation Usecase (core/internal/usecase/automation) ----
 uc.automation.nil_context: "usecase/automation: context must not be nil"
@@ -22,6 +22,13 @@ uc.automation.sandbox_abs_forbidden: "sandbox mode forbids absolute local source
 uc.automation.snapshot_missing: "missing {kind} source snapshot for {source}"
 uc.automation.remote_exists: "remote destination {path} already exists (overwrite=false)"
 uc.automation.batch_counts: "batch completed with {succeeded} succeeded and {failed} failed"
+uc.automation.node_stream_failed: "failed to create event stream for node {target}"
+uc.automation.sandbox_follow_unsupported: "follow_operator_source symlink policy is not supported in sandbox mode"
+uc.automation.local_source_limit: "local source {source} size {size} exceeds limit {limit}"
+uc.automation.template_size_limit: "rendered template output size {size} exceeds limit {limit}"
+uc.automation.resolve_target_failed: "failed to resolve target {target}"
+uc.automation.duplicate_target_node: "duplicate target node {node}"
+uc.automation.remote_canon_hops: "remote path canonicalization depth {count} exceeds limit {limit}"
 
 # ---- Credential Usecase (core/internal/usecase/credential) ----
 uc.credential.nil_context: "usecase/credential: context must not be nil"
@@ -42,6 +49,33 @@ uc.credential.secret_referenced_detail: "secret {ref} still has {count} referenc
 uc.credential.store_unknown: "secret store {store} is not registered in KnownStores"
 uc.credential.ref_not_in_graph: "secret {ref} is not referenced in inventory graph"
 uc.credential.saga_step_limit: "vault saga exceeded maximum transitions ({max})"
+uc.credential.old_secret_gc_failed: "failed to garbage-collect replaced old secret after commit"
+uc.credential.saga_effect_count: "vault saga state {state} expected {expected} effect(s), got {actual}"
+uc.credential.gen_item_failed: "failed to generate random secret item identifier"
+
+# ---- Shared Read-Only Doctor Findings (credential/doctor.go & inventory/import_doctor.go) ----
+uc.doctor.vault_unavailable: "SecretVault is not configured; skipping read-only secret probe"
+uc.doctor.vault_status_failed: "failed to query vault status"
+uc.doctor.vault_locked_skip: "vault is locked; skipping read-only secret probe"
+uc.doctor.vault_uninitialized: "vault is not initialized"
+uc.doctor.vault_state_invalid: "vault returned invalid state"
+uc.doctor.store_load_graph_failed: "failed to load inventory graph"
+uc.doctor.unknown_secret_store: "{owner} ({location}) references unregistered secret store {store}"
+uc.doctor.secret_not_found: "referenced secret entry is missing from vault"
+uc.doctor.vault_locked_probe: "vault is locked; unable to probe secret entry"
+uc.doctor.secret_probe_failed: "read-only secret probe failed"
+uc.doctor.pending_secret_pin: "secret is pinned by pending enrollment lease to prevent GC: {owner}"
+uc.doctor.store_load_snapshot_failed: "failed to load inventory store snapshot"
+uc.doctor.proxy_dag_invalid: "cross-namespace ProxyJump DAG validation failed"
+uc.doctor.unused_host: "Host is not referenced by any Node"
+uc.doctor.unused_identity: "Identity is not referenced by any Node"
+uc.doctor.openssh_read_failed: "failed to read OpenSSH read-only configuration"
+uc.doctor.openssh_alias_shadowed: "managed node ID or alias shadows OpenSSH Host alias"
+uc.doctor.openssh_jump_invalid: "invalid OpenSSH virtual host jump configuration"
+uc.doctor.key_signer_unavailable: "KeySignerPort is not configured; skipping private key verification"
+uc.doctor.unknown_auth_method: "identity uses an unknown or invalid authentication method"
+uc.doctor.private_key_inspect_failed: "failed to verify private key ({path})"
+uc.doctor.private_key_fp_mismatch: "encrypted private key fingerprint does not match configured binding"
 
 # ---- Inventory Usecase (core/internal/usecase/inventory) ----
 uc.inventory.nil_context: "usecase/inventory: context must not be nil"
@@ -84,6 +118,27 @@ uc.inventory.hop_cycle: "proxy jump cycle detected at {target} ({key})"
 uc.inventory.node_not_found: "managed node {node} not found"
 uc.inventory.username_hint: "specify SSH username via user@, -l, or OpenSSH User"
 uc.inventory.target_malformed: "malformed target {target}: {reason}"
+uc.inventory.env_var_placeholder: "invalid environment variable placeholder in path template"
+uc.inventory.unknown_import_format_value: "unregistered import format {format}"
+uc.inventory.import_bundle_invalid: "imported bundle validation failed for format {format}"
+uc.inventory.origin_unsupported: "unsupported target origin {origin}"
+uc.inventory.node_origin_mismatch: "node {node} origin mismatch: expected {expected}, got {actual}"
+uc.inventory.proxy_depth_limit: "ProxyJump depth {depth} exceeds limit {limit}"
+uc.inventory.plan_hops_limit: "connection plan hop count {count} exceeds limit {limit}"
+uc.inventory.init_cred_service_failed: "failed to initialize built-in CredentialService"
+uc.inventory.query_stores_failed: "failed to query authoritative vault known stores"
+uc.inventory.duplicate_import_format: "duplicate import format {format}"
+uc.inventory.jump_hop_invalid: "invalid ProxyJump hop specification"
+uc.inventory.jump_user_invalid: "invalid ProxyJump jump username"
+uc.inventory.jump_host_invalid: "invalid ProxyJump jump host {host}"
+uc.inventory.target_reason.bad_chars: "empty, too long, or contains illegal whitespace/control characters"
+uc.inventory.target_reason.bad_at: "empty user/host or duplicate '@'"
+uc.inventory.target_reason.missing_host: "missing host segment"
+uc.inventory.target_reason.bad_brackets: "invalid brackets"
+uc.inventory.target_reason.not_ipv6_or_hp: "neither valid IPv6 nor valid host:port"
+uc.inventory.target_reason.malformed_brackets: "malformed brackets"
+uc.inventory.target_reason.bracket_not_ipv6: "bracketed host must be a valid IPv6 address"
+uc.inventory.target_reason.bad_suffix: "invalid suffix after brackets"
 
 # ---- Observability Usecase (core/internal/usecase/observability) ----
 uc.observability.nil_context: "usecase/observability: context must not be nil"
@@ -105,6 +160,9 @@ uc.observability.image_dimensions: "image dimensions {width}x{height} exceed saf
 uc.observability.image_format: "unsupported image format (only PNG, JPEG, and WebP are supported)"
 uc.observability.screenshot_marker: "screenshot payload is missing start or end marker"
 uc.observability.non_loopback_denied: "binding non-loopback address {addr} is forbidden by default"
+uc.observability.jpeg_encode_failed: "failed to encode screenshot as JPEG"
+uc.observability.image_decode_failed: "failed to decode screenshot image"
+uc.observability.probe_shell_failed: "failed to probe remote shell for POSIX compatibility"
 
 # ---- Session Usecase (core/internal/usecase/session) ----
 uc.session.nil_context: "usecase/session: context must not be nil"
@@ -124,6 +182,7 @@ uc.session.mux_disabled_detail: "ControlMaster is disabled (EffectiveMaster={mod
 uc.session.mux_ask_requires_tty: "ControlMaster ask/autoask requires an interactive terminal"
 uc.session.mux_rejected: "operator declined to start or share ControlMaster"
 uc.session.control_path_tilde: "rejected unexpanded leading ~ in control socket path {path}"
+uc.session.reason.lexical_scope_denied: "lexical scope denied"
 
 # ---- Transfer Usecase (core/internal/usecase/transfer) ----
 uc.transfer.nil_context: "usecase/transfer: context must not be nil"
@@ -148,12 +207,20 @@ uc.transfer.dual_active: "transfer {id} has an active handle for the same genera
 uc.transfer.gen_rollback: "generation {gen} is corrupt or uncertain; rollback to older generation is forbidden"
 uc.transfer.gen_uncertain: "generation {gen} is in UncertainCommit; retry and cleanup are forbidden"
 uc.transfer.patch_multi_match: "Edits[{index}] matched {count} locations"
+uc.transfer.patch_no_match_index: "Edits[{index}] target text not found"
 uc.transfer.symlink_policy: "symlink policy {policy} forbids {path}"
 uc.transfer.remote_drift: "remote path {path} canonicalized to unauthorized target {target}"
 uc.transfer.remote_dir_cycle: "detected remote directory cycle at {path}"
 uc.transfer.remote_abs_required: "remote working or parent directory must be absolute"
 uc.transfer.remote_symlink_hops: "remote symlink expansion exceeded limit {limit}"
 uc.transfer.remote_not_regular: "remote path {path} has unsupported type {kind}"
+uc.transfer.reason.exists_non_dir: "target path exists and is not a directory"
+uc.transfer.reason.target_is_dir: "target path is a directory"
+uc.transfer.reason.no_clobber: "target already exists and overwrite is disabled"
+uc.transfer.reason.recursive_required: "remote source is a directory and requires recursive mode"
+uc.transfer.reason.not_regular_file: "source path is not a regular file"
+uc.transfer.reason.already_exists: "destination path already exists"
+uc.transfer.reason.symlink_over_dir: "cannot replace directory with symbolic link"
 
 # ---- MCP Runtime, Protocol & Tools (core/internal/mcpruntime/**) ----
 mcp.invalid_config: "mcpruntime: invalid ServerConfig"
@@ -172,6 +239,8 @@ mcp.protocol.invalid_schema: "mcpruntime/protocol: invalid built-in tool JSON Sc
 mcp.protocol.invalid_params: "mcpruntime/protocol: invalid tool or method parameters"
 mcp.protocol.tool_not_found: "mcpruntime/protocol: unregistered MCP tool"
 mcp.protocol.outcome_unknown: "mcpruntime/protocol: remote execution outcome is unknown; automatic retry is forbidden"
+mcp.protocol.outcome_unknown_detail: "mcp: remote execution outcome is unknown ({code}); automatic retry is forbidden"
+mcp.protocol.outcome_unknown_reason: "mcp: remote execution outcome is unknown ({code}: {reason}); automatic retry is forbidden"
 mcp.tools.invalid_config: "mcpruntime/tools: invalid RegistryConfig"
 mcp.tools.not_initialized: "mcpruntime/tools: Registry is not initialized"
 mcp.tools.service_unavailable: "mcpruntime/tools: required usecase service is not configured"
@@ -181,6 +250,17 @@ mcp.http.header_rejected: "unauthorized or invalid HTTP header {header}: {value}
 mcp.http.session_missing: "Mcp-Session-Id session does not exist or is closed"
 mcp.corrupt_journal_limit: "found {count} corrupt transfer journal(s) with FailOnCorruptJournal enabled"
 mcp.protocol.id_type: "JSON-RPC id must be a non-empty string or exact integer"
+mcp.non_loopback_bind: "mcpruntime: refusing non-loopback HTTP listen address {addr} (only 127.0.0.1 / ::1 / localhost are allowed by default)"
+mcp.non_loopback_host: "mcpruntime: host {host} is not a loopback address (only 127.0.0.1 / ::1 / localhost are allowed by default)"
+mcp.invalid_listen_addr: "invalid MCP HTTP listen address {addr}"
+mcp.protocol.marshal_failed: "failed to marshal MCP {target}"
+mcp.protocol.schema_canon_failed: "failed to canonicalize tool schema for {tool}"
+mcp.tools.unknown_tool: "unknown MCP tool {tool}"
+mcp.tools.unknown_tool_action: "unknown action {action} for MCP tool {tool}"
+mcp.tools.batch_exec_stdin_unsupported: "batch_exec does not support stdin input"
+mcp.http.listen_failed: "failed to listen on MCP HTTP address {addr}"
+mcp.http.read_body_failed: "failed to read MCP HTTP request body"
+mcp.http.transfer_path_invalid: "invalid MCP transfer stream path {path}"
 
 # ---- Core Engine Facade (core/engine) ----
 engine.nil_context: "engine: context must not be nil"
@@ -232,3 +312,4 @@ engine.unsupported: "engine: capability is not supported by current configuratio
 engine.init_component_failed: "failed to initialize {component}"
 engine.hostkey_unobserved: "handshake completed without observing a verified host key fingerprint for {endpoint}"
 engine.known_hosts_dir_missing: "KnownHostsDir is missing and default ~/.ssh could not be derived"
+engine.hostkey_observer_unsupported: "dialer does not support host key trust observation"

@@ -84,6 +84,8 @@ events.class_mismatch: "当前通道要求 {expected} 类事件，实际收到 {
 events.audit_conflict: "审计阶段 {stage} 与决策 {decision} 冲突"
 events.outcome_conflict: "事件状态与执行终态冲突"
 events.json_object_required: "事件 JSON 载荷必须为对象"
+events.audit_halted_write_failed: "审计分发器（AuditDispatcher）已进入熔断态（Halted）：同步审计落盘写入失败"
+events.audit_halted_reason: "审计分发器（AuditDispatcher）已进入熔断态（Halted）（原因：{reason}）"
 
 # ---- 安全操作系统文件系统与本地套接字（core/osfs） ----
 osfs.slot_occupied: "控制套接字槽位已被占用"
@@ -106,6 +108,11 @@ osfs.path_platform_mismatch: "当前平台不支持路径 {path}"
 osfs.lock_target_replaced: "锁目标 {path} 被并发替换"
 osfs.append_newline: "AppendLine 输入禁止包含内嵌换行符"
 osfs.stale_probe_failed: "无法确认陈旧套接字 {path} 已失效（状态={status}）"
+osfs.syscall_failed: "系统调用 {call} 失败"
+osfs.open_failed: "打开路径 {path} 失败"
+osfs.random_hex_failed: "生成随机临时文件名令牌失败"
+osfs.slot_occupied_at: "控制套接字槽位 {path} 已被占用"
+osfs.root_access_denied: "根目录 {path} 权限不安全或访问被拒绝"
 
 # ---- 基础运行时 Actor 与 Trace（core/internal/foundation/{actor,trace}） ----
 actor.not_initialized: "DualActor 尚未初始化"

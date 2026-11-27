@@ -1,5 +1,5 @@
 # XOps v2 Canonical English Message Catalog (core_ports)
-# All CoreKeys() entries in this file must match core/domain/i18n/internal/corecatalog/catalog_ports_spec.go verbatim.
+# All CoreKeys() entries in this file must match core/domain/i18n/internal/corecatalog/ports verbatim.
 
 # ---- Outbound Ports Contracts (core/ports) ----
 ports.nil_context: "ports: context must not be nil"
@@ -84,6 +84,8 @@ events.class_mismatch: "channel requires {expected} event, got {actual}"
 events.audit_conflict: "audit stage {stage} conflicts with decision {decision}"
 events.outcome_conflict: "event status conflicts with execution outcome"
 events.json_object_required: "event JSON payload must be an object"
+events.audit_halted_write_failed: "events: AuditDispatcher entered Halted state: synchronous audit write failed"
+events.audit_halted_reason: "events: AuditDispatcher entered Halted state ({reason})"
 
 # ---- Secure OS Filesystem & Sockets (core/osfs) ----
 osfs.slot_occupied: "osfs: control socket slot is already occupied"
@@ -106,6 +108,11 @@ osfs.path_platform_mismatch: "path {path} is not supported on this platform"
 osfs.lock_target_replaced: "lock target {path} was concurrently replaced"
 osfs.append_newline: "AppendLine input must not contain embedded newlines"
 osfs.stale_probe_failed: "cannot confirm stale socket {path} (status={status})"
+osfs.syscall_failed: "OS call {call} failed"
+osfs.open_failed: "failed to open {path}"
+osfs.random_hex_failed: "failed to generate random temporary filename token"
+osfs.slot_occupied_at: "control socket slot {path} is already occupied"
+osfs.root_access_denied: "insecure permissions or access denied on root directory {path}"
 
 # ---- Foundation Actor & Trace (core/internal/foundation/{actor,trace}) ----
 actor.not_initialized: "actor: DualActor is not initialized"

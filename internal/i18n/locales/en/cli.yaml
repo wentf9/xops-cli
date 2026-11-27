@@ -1,5 +1,5 @@
 # XOps v2 Canonical English Message Catalog (cli)
-# All RootErrorKeys() entries in this file must match fallback_cli_spec.go verbatim.
+# All RootErrorKeys() entries in this file must match internal/rootcatalog/catalog_cli_spec.go verbatim.
 
 # ---- Version & CLI Display Summaries (UI-only) ----
 cli.version.output: |
@@ -73,6 +73,11 @@ cli.doctor.summary: "doctor scope={scope} healthy={healthy}"
 cli.doctor.inventory: "  inventory: healthy={healthy} hosts={hosts} identities={identities} nodes={nodes} dag_depth={dag_depth} errors={errors} warns={warns}"
 cli.doctor.vault: "  vault: healthy={healthy} refs={refs} distinct={distinct} findings={findings}"
 cli.doctor.vault_note: "  vault: {note}"
+cli.doctor.sev.info: "info"
+cli.doctor.sev.warn: "warn"
+cli.doctor.sev.error: "error"
+cli.doctor.finding_line: "    [{severity}] {code}: {message}"
+cli.doctor.finding_line_subject: "    [{severity}] {code} ({subject}): {message}"
 cli.playbook.valid: "playbook valid: id={id} name={name} version={version} steps={steps} digest={digest}"
 cli.playbook.summary: "playbook {id} status={status} duration={duration} (succeeded={succeeded} changed={changed} skipped={skipped} failed={failed} unknown={unknown} aborted={aborted})"
 cli.playbook.unknown_warning: "playbook contains OutcomeUnknown steps; inspect remote state before retrying"

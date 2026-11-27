@@ -165,6 +165,10 @@ func Lookup(id string) string {
 		return "event status conflicts with execution outcome"
 	case "events.json_object_required":
 		return "event JSON payload must be an object"
+	case "events.audit_halted_write_failed":
+		return "events: AuditDispatcher entered Halted state: synchronous audit write failed"
+	case "events.audit_halted_reason":
+		return "events: AuditDispatcher entered Halted state ({reason})"
 	case "osfs.slot_occupied":
 		return "osfs: control socket slot is already occupied"
 	case "osfs.not_socket":
@@ -205,6 +209,16 @@ func Lookup(id string) string {
 		return "AppendLine input must not contain embedded newlines"
 	case "osfs.stale_probe_failed":
 		return "cannot confirm stale socket {path} (status={status})"
+	case "osfs.syscall_failed":
+		return "OS call {call} failed"
+	case "osfs.open_failed":
+		return "failed to open {path}"
+	case "osfs.random_hex_failed":
+		return "failed to generate random temporary filename token"
+	case "osfs.slot_occupied_at":
+		return "control socket slot {path} is already occupied"
+	case "osfs.root_access_denied":
+		return "insecure permissions or access denied on root directory {path}"
 	case "actor.not_initialized":
 		return "actor: DualActor is not initialized"
 	case "actor.already_started":
@@ -311,6 +325,8 @@ func AllKeys() []string {
 		"events.audit_conflict",
 		"events.outcome_conflict",
 		"events.json_object_required",
+		"events.audit_halted_write_failed",
+		"events.audit_halted_reason",
 		"osfs.slot_occupied",
 		"osfs.not_socket",
 		"osfs.invalid_control_path",
@@ -331,6 +347,11 @@ func AllKeys() []string {
 		"osfs.lock_target_replaced",
 		"osfs.append_newline",
 		"osfs.stale_probe_failed",
+		"osfs.syscall_failed",
+		"osfs.open_failed",
+		"osfs.random_hex_failed",
+		"osfs.slot_occupied_at",
+		"osfs.root_access_denied",
 		"actor.not_initialized",
 		"actor.already_started",
 		"actor.stopped",
