@@ -8,38 +8,17 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/execution"
-	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/entry/cli/cmdasset"
+	"github.com/wentf9/xops-cli/internal/entry/cli/cmdops"
+	"github.com/wentf9/xops-cli/internal/entry/cli/cmdssh"
+	"github.com/wentf9/xops-cli/internal/entry/cli/cmdtransfer"
 )
 
 const defaultShutdownTimeout = 5 * time.Second
 
-// SessionRunner 定义 CLI 入站层驱动核心 SSH 执行所需的最小引擎契约（由 *engine.Engine 原生实现）。
-type SessionRunner interface {
-	RunSSH(ctx context.Context, req engine.RunSSHRequest) (execution.ExecutionOutcome, error)
-	Close(ctx context.Context) error
-}
-
-// EngineInitOptions 描述 CLI 命令按需初始化核心引擎时透传给组合根的只读覆盖项。
-// 通过该值结构体传递 `-F <configfile>` 等宿主路径参数，确保 internal/entry/cli 零引用 host/openssh 或 core/osfs。
-type EngineInitOptions struct {
-	// OpenSSHConfigFile 为 `-F <configfile>` 指定的 OpenSSH 配置文件覆盖路径（空串沿用默认配置，"none" 禁用）。
-	OpenSSHConfigFile string
-}
-
-// EngineHandle 封装按需创建的运行期引擎及其确定性逆序关闭回调。
-// 当 Close 非空时，CLI 优先调用 Close 以允许组合根按 Engine -> AuditSink 严格逆序关闭全部宿主资源。
-type EngineHandle struct {
-	// Runner 为核心 SSH 会话执行入口（非 nil）。
-	Runner SessionRunner
-	// Close 为组合根提供的完整逆序停机回调；为 nil 时回退调用 Runner.Close。
-	Close func(ctx context.Context) error
-}
-
-// EngineFactory 按需为需要运行期核心的命令构造 EngineHandle（`xops version` 与 `--help` 严禁触发调用）。
-type EngineFactory func(ctx context.Context, opts EngineInitOptions) (EngineHandle, error)
-
-// AppConfig 是构造 CLI 入站调度器 App 的全显式依赖注入规格。
+// AppConfig 是构造完整 CLI 入站调度器 App 的全显式依赖注入规格。
+// 必填字段与 Wave 1 完全一致；新增子入口与宿主只读钩子均为可选字段，调用时若为 nil 一律失败关闭。
 type AppConfig struct {
 	// BuildInfo 为由组合根注入的只读构建元信息。
 	BuildInfo BuildInfo
@@ -53,9 +32,24 @@ type AppConfig struct {
 	Stderr io.Writer
 	// ShutdownTimeout 可选配置命令退出期等待引擎与审计落盘收敛的最大时长（None 默认 5s）。
 	ShutdownTimeout algebraic.Option[algebraic.Duration]
+
+	// RunTUI 为可选注入的 Bubble Tea v2 交互式终端工作台启动回调（供 `xops tui` 调用）。
+	RunTUI TUIRunner
+	// RunSFTPShell 为可选注入的交互式 SFTP Shell 启动回调（供 `xops sftp <target>` 调用）。
+	RunSFTPShell SFTPShellRunner
+	// RunMCP 为可选注入的 MCP 服务器启动回调（供 `xops mcp` 调用）。
+	RunMCP MCPRunner
+	// RunMuxDaemon 为可选注入的 ControlMaster 后台守护启动回调（供 `xops ssh -f` / `xops mux daemon` 调用）。
+	RunMuxDaemon MuxDaemonRunner
+	// ReadAuditLog 为可选注入的本地审计日志只读查询钩子（供 `xops audit list/tail/inspect` 调用）。
+	ReadAuditLog AuditLogReader
+	// ReadOperatorFile 为可选注入的操作员本地文件受控只读钩子（供 playbook/config import/sftp write 调用）。
+	ReadOperatorFile OperatorFileReader
+	// ResolveWorkDir 为可选注入的当前工作目录解析钩子（供 scp 下载解析相对路径，零直调 os.Getwd）。
+	ResolveWorkDir WorkDirResolver
 }
 
-// App 是 XOps v2 Walking Skeleton 的极薄 CLI 入站调度器（零业务逻辑、零全局状态、零 os.Exit）；
+// App 是 XOps v2 的极薄 CLI 入站调度器（零业务逻辑、零全局状态、零 os.Exit）；
 // 零值恒未初始化并严格失败关闭。
 //
 //xops:opaque
@@ -67,6 +61,7 @@ type App struct {
 	stdout          io.Writer
 	stderr          io.Writer
 	shutdownTimeout time.Duration
+	hooks           clikit.SubEntryHooks
 	valid           bool
 }
 
@@ -96,171 +91,127 @@ func NewApp(cfg AppConfig) (*App, error) {
 		stdout:          cfg.Stdout,
 		stderr:          cfg.Stderr,
 		shutdownTimeout: timeout,
-		valid:           true,
+		hooks: clikit.SubEntryHooks{
+			RunTUI:           cfg.RunTUI,
+			RunSFTPShell:     cfg.RunSFTPShell,
+			RunMCP:           cfg.RunMCP,
+			RunMuxDaemon:     cfg.RunMuxDaemon,
+			ReadAuditLog:     cfg.ReadAuditLog,
+			ReadOperatorFile: cfg.ReadOperatorFile,
+			ResolveWorkDir:   cfg.ResolveWorkDir,
+		},
+		valid: true,
 	}, nil
 }
 
-// Run 解析命令行子命令与参数，驱动对应动作并返回确定性进程退出码（不调用 os.Exit）。
+// Run 解析全局前置选项与子命令，驱动对应命令族执行器并返回确定性进程退出码（不调用 os.Exit）。
 func (a *App) Run(ctx context.Context, args []string) int {
 	if a == nil || !a.valid {
-		return exitCodeGeneralError
+		return clikit.ExitGeneral
 	}
+	rt := a.newRuntime(clikit.CommonFlags{})
 	if ctx == nil {
-		a.writeErr("cli: context 不能为 nil")
-		return exitCodeGeneralError
+		rt.WriteErr("cli: context 不能为 nil")
+		return clikit.ExitGeneral
 	}
-	if len(args) == 0 {
-		a.writeRootHelp()
-		return exitCodeOK
+	global, rest, err := clikit.ParseGlobalPrefix(args)
+	if err != nil {
+		return rt.Fail(clikit.ExitUsage, global.JSON, err)
 	}
-	switch args[0] {
+	rt.Global = global
+	if len(rest) == 0 {
+		writeRootHelp(a.stdout)
+		return clikit.ExitOK
+	}
+	cmd, subArgs := rest[0], rest[1:]
+	switch cmd {
 	case "-h", "--help", "help":
-		return a.runHelp(args[1:])
+		return a.runHelp(rt, subArgs)
 	case "version", "-V", "--version":
-		return a.runVersion(args[1:])
-	case "ssh":
-		return a.runSSH(ctx, args[1:])
+		return a.runVersion(rt, subArgs)
 	default:
-		a.writeErr(fmt.Sprintf("unknown command %q (run 'xops --help' for usage)", args[0]))
-		return exitCodeUsage
+		return a.dispatchCommand(ctx, rt, cmd, subArgs)
 	}
 }
 
-func (a *App) runHelp(args []string) int {
+func (a *App) newRuntime(global clikit.CommonFlags) *clikit.Runtime {
+	return &clikit.Runtime{
+		Stdin:           a.stdin,
+		Stdout:          a.stdout,
+		Stderr:          a.stderr,
+		EngineFactory:   a.engineFactory,
+		ShutdownTimeout: a.shutdownTimeout,
+		Hooks:           a.hooks,
+		Global:          global,
+	}
+}
+
+func (a *App) dispatchCommand(ctx context.Context, rt *clikit.Runtime, cmd string, subArgs []string) int {
+	switch cmd {
+	case "ssh":
+		return cmdssh.RunSSH(ctx, rt, subArgs)
+	case "exec":
+		return cmdssh.RunExec(ctx, rt, subArgs)
+	case "tunnel", "forward":
+		return cmdssh.RunTunnel(ctx, rt, subArgs)
+	case "mux":
+		return cmdssh.RunMux(ctx, rt, subArgs)
+	case "scp":
+		return cmdtransfer.RunSCP(ctx, rt, subArgs)
+	case "sftp":
+		return cmdtransfer.RunSFTP(ctx, rt, subArgs)
+	case "hosts", "host", "inventory":
+		return cmdasset.RunHosts(ctx, rt, subArgs)
+	case "creds", "cred", "vault":
+		return cmdasset.RunVault(ctx, rt, subArgs)
+	case "config":
+		return cmdasset.RunConfig(ctx, rt, subArgs)
+	case "playbook", "play":
+		return cmdops.RunPlaybook(ctx, rt, subArgs)
+	case "doctor":
+		return cmdops.RunDoctor(ctx, rt, subArgs)
+	case "audit":
+		return cmdops.RunAudit(ctx, rt, subArgs)
+	case "mcp":
+		return cmdops.RunMCP(ctx, rt, subArgs)
+	case "tui":
+		return cmdops.RunTUI(ctx, rt, subArgs)
+	default:
+		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: unknown command %q (run 'xops --help' for usage)", ErrUsage, cmd))
+	}
+}
+
+func (a *App) runHelp(rt *clikit.Runtime, args []string) int {
 	if len(args) == 0 {
-		a.writeRootHelp()
-		return exitCodeOK
+		writeRootHelp(a.stdout)
+		return clikit.ExitOK
 	}
-	switch args[0] {
-	case "ssh":
-		a.writeSSHHelp()
-		return exitCodeOK
-	case "version":
-		a.writeVersionHelp()
-		return exitCodeOK
-	default:
-		a.writeErr(fmt.Sprintf("unknown help topic %q", args[0]))
-		return exitCodeUsage
+	if len(args) > 1 {
+		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: help accepts at most one topic, got %q", ErrUsage, strings.Join(args, " ")))
 	}
+	text, ok := lookupHelpTopic(args[0])
+	if !ok {
+		return rt.Fail(clikit.ExitUsage, rt.Global.JSON, fmt.Errorf("%w: unknown help topic %q", ErrUsage, args[0]))
+	}
+	_, _ = io.WriteString(a.stdout, text)
+	return clikit.ExitOK
 }
 
-// runVersion 仅渲染显式注入的 BuildInfo，绝不初始化 Engine 或触碰任何本地状态目录。
-func (a *App) runVersion(args []string) int {
-	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
-		a.writeVersionHelp()
-		return exitCodeOK
-	}
-	if len(args) > 0 {
-		a.writeErr(fmt.Sprintf("version accepts no arguments, got %q", strings.Join(args, " ")))
-		return exitCodeUsage
-	}
-	_, _ = io.WriteString(a.stdout, FormatVersion(a.buildInfo))
-	return exitCodeOK
-}
-
-func (a *App) runSSH(ctx context.Context, args []string) (exitCode int) {
-	parsed, err := ParseSSHArgs(args)
-	if err != nil {
-		a.writeErr(err.Error())
-		return exitCodeUsage
-	}
-	if parsed.ShowHelp {
-		a.writeSSHHelp()
-		return exitCodeOK
-	}
-	if err := ctx.Err(); err != nil {
-		a.writeErr(err.Error())
-		return exitCodeSSHError
-	}
-
-	handle, err := a.engineFactory(ctx, EngineInitOptions{
-		OpenSSHConfigFile: parsed.ConfigFile,
-	})
-	if err != nil {
-		a.writeErr(err.Error())
-		return exitCodeSSHError
-	}
-	if handle.Runner == nil {
-		if handle.Close != nil {
-			_ = a.closeHandle(ctx, handle)
+// runVersion 仅渲染显式注入的 BuildInfo（支持 --json），绝不初始化 Engine 或触碰任何本地状态目录。
+func (a *App) runVersion(rt *clikit.Runtime, args []string) int {
+	jsonOut := rt.Global.JSON
+	for _, arg := range args {
+		switch arg {
+		case "-h", "--help":
+			writeVersionHelp(a.stdout)
+			return clikit.ExitOK
+		case "--json":
+			jsonOut = true
+		default:
+			return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: version accepts only --json or --help, got %q", ErrUsage, arg))
 		}
-		a.writeErr("cli: EngineFactory 返回了 nil SessionRunner")
-		return exitCodeGeneralError
 	}
-	defer func() {
-		if closeErr := a.closeHandle(ctx, handle); closeErr != nil {
-			a.writeErr("shutdown failed: " + closeErr.Error())
-			if exitCode == exitCodeOK {
-				exitCode = exitCodeGeneralError
-			}
-		}
-	}()
-
-	outcome, runErr := handle.Runner.RunSSH(ctx, engine.RunSSHRequest{
-		TargetSpec:  parsed.TargetSpec,
-		CLIOptions:  parsed.CLIOptions,
-		CommandArgs: parsed.CommandArgs,
-		Stdin:       a.stdin,
-		Stdout:      a.stdout,
-		Stderr:      a.stderr,
-		RequestTTY:  parsed.RequestTTY,
+	return rt.WriteResult(jsonOut, NewVersionView(a.buildInfo), func(w io.Writer) {
+		_, _ = io.WriteString(w, FormatVersion(a.buildInfo))
 	})
-	code, diag, _ := mapOutcomeToExit(outcome, runErr)
-	if diag != "" {
-		a.writeErr(diag)
-	}
-	return code
-}
-
-// closeHandle 使用剥离取消但带有限超时的上下文关闭运行期句柄，
-// 确保即便用户按下 Ctrl+C 取消操作上下文，仍能按严格逆序排空连接池并安全释放审计锁。
-func (a *App) closeHandle(ctx context.Context, handle EngineHandle) error {
-	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.shutdownTimeout)
-	defer cancel()
-	if handle.Close != nil {
-		return handle.Close(closeCtx)
-	}
-	return handle.Runner.Close(closeCtx)
-}
-
-func (a *App) writeErr(msg string) {
-	_, _ = fmt.Fprintf(a.stderr, "xops: %s\n", strings.TrimSpace(msg))
-}
-
-func (a *App) writeRootHelp() {
-	_, _ = io.WriteString(a.stdout, `Usage:
-  xops <command> [flags]
-
-Commands:
-  ssh       Connect to a remote host or execute a remote command over SSH
-  version   Print XOps build version metadata
-  help      Show help for a command
-
-Run 'xops <command> --help' for details on a specific command.
-`)
-}
-
-func (a *App) writeVersionHelp() {
-	_, _ = io.WriteString(a.stdout, `Usage:
-  xops version
-
-Print XOps version, commit, build time, and Go toolchain metadata without initializing Engine state.
-`)
-}
-
-func (a *App) writeSSHHelp() {
-	_, _ = io.WriteString(a.stdout, `Usage:
-  xops ssh [flags] [user@]host [command [args...]]
-
-Flags:
-  -p <port>           Port to connect to on the remote host
-  -l <user>           Login name on the remote machine
-  -i <identity_file>  Private key file for public key authentication (repeatable)
-  -J <proxy_jump>     Jump host destination chain (e.g. jump1,jump2)
-  -o <Key=Value>      OpenSSH option override (repeatable)
-  -t                  Force pseudo-terminal allocation (-tt forces even without local TTY)
-  -T                  Disable pseudo-terminal allocation
-  -F <configfile>     Alternative per-user OpenSSH configuration file ("none" to disable)
-  -h, --help          Show this help message
-`)
 }

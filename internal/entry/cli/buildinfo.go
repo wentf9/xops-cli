@@ -20,6 +20,15 @@ type BuildInfo struct {
 	Platform string
 }
 
+// VersionView 描述 `xops version --json` 输出的规范 JSON/v2 结构化版本元信息。
+type VersionView struct {
+	Version   string `json:"version"`
+	Commit    string `json:"commit"`
+	BuildTime string `json:"build_time"`
+	GoVersion string `json:"go_version"`
+	Platform  string `json:"platform,omitzero"`
+}
+
 // Normalized 返回将空白字段规范回退为确定性默认值后的 BuildInfo 副本。
 func (b BuildInfo) Normalized() BuildInfo {
 	out := BuildInfo{
@@ -42,6 +51,11 @@ func (b BuildInfo) Normalized() BuildInfo {
 		out.GoVersion = "unknown"
 	}
 	return out
+}
+
+// NewVersionView 将 BuildInfo 规范化并转换为供 JSON/v2 输出的 VersionView。
+func NewVersionView(info BuildInfo) VersionView {
+	return VersionView(info.Normalized())
 }
 
 // FormatVersion 将构建元信息渲染为简洁、确定性的多行版本文本，供 `xops version` 直接输出至 stdout。
