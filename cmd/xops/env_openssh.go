@@ -77,11 +77,11 @@ func (e *homeAwareEnv) LookupLocalIdentity() (ports.LocalIdentityInfo, error) {
 func resolveHostDirs(env ports.EnvPort) (homeDir, stateDir pathalg.LocalDir, localID ports.LocalIdentityInfo, err error) {
 	localID, err = env.LookupLocalIdentity()
 	if err != nil {
-		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "local identity"))
+		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetLocalIdentity)))
 	}
 	homeDir, err = pathalg.ParseLocalDir(localID.HomeDir())
 	if err != nil {
-		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "home directory"), i18n.BoundStr("path", localID.HomeDir()))
+		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetHomeDir)), i18n.BoundStr("path", localID.HomeDir()))
 	}
 	if rawHome, ok := env.LookupEnv(xopsHomeEnvKey); ok && strings.TrimSpace(rawHome) != "" {
 		stateDir, err = pathalg.ParseLocalDir(strings.TrimSpace(rawHome))
@@ -92,7 +92,7 @@ func resolveHostDirs(env ports.EnvPort) (homeDir, stateDir pathalg.LocalDir, loc
 	}
 	stateDir, err = homeDir.JoinComponent(defaultStateDirName)
 	if err != nil {
-		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default state directory"))
+		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetDefaultStateDir)))
 	}
 	return homeDir, stateDir, localID, nil
 }
@@ -136,18 +136,18 @@ func resolveOpenSSHConfigPath(override string, homeDir pathalg.LocalDir) (pathal
 	if override == "" {
 		sshDir, err := homeDir.JoinComponent(defaultSSHDirName)
 		if err != nil {
-			return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default .ssh directory"))
+			return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetDefaultSSHDir)))
 		}
 		joined, err := sshDir.JoinComponent(defaultSSHConfigName)
 		if err != nil {
-			return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default ssh config"))
+			return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetDefaultSSHConfig)))
 		}
 		return pathalg.ParseLocalSourcePath(joined.String())
 	}
 	expanded := expandTildePrefix(override, homeDir)
 	p, err := pathalg.ParseLocalSourcePath(expanded)
 	if err != nil {
-		return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "OpenSSH config"), i18n.BoundStr("path", override))
+		return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetOpenSSHConfig)), i18n.BoundStr("path", override))
 	}
 	return p, nil
 }

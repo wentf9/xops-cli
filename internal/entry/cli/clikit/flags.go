@@ -85,30 +85,62 @@ func ParseLongFlagName(raw string) (name, val string, hasEq, isLong bool) {
 	return name, val, hasEq, true
 }
 
-// HasJSONFlag 预扫描参数（遇到 `--` 即止）判断是否声明了 `--json`（兼容 `--json=true/false` 末次生效），
-// 确保任何子命令在参数语法报错时仍能稳定输出规范 JSON ErrorEnvelope。
+// HasJSONFlag 通过与 ScanPreFlags 共享的命令与带值选项感知词法状态机判断完整命令行 args 是否声明了 CLI `--json`
+// （兼容 `--json=true/false` 末次生效，不误拦 ssh/exec 远端命令参数或带值选项参数），
+// 确保早退语法报错时仍能稳定输出规范 JSON ErrorEnvelope 且不污染纯文本 stdout。
 func HasJSONFlag(args []string) bool {
-	enabled := false
-	for _, tok := range args {
-		if tok == "--" {
+	return scanPreFlagsInto(args, nil).JSON
+}
+
+// MergeCommonFlags 将子命令前置通用标志 overlay 合并至基础标志 base（非零覆写、JSON 保留真值）。
+func MergeCommonFlags(base, overlay CommonFlags) CommonFlags {
+	out := base
+	if overlay.JSON {
+		out.JSON = true
+	}
+	if overlay.Policy.IsValid() {
+		out.Policy = overlay.Policy
+	}
+	if overlay.Locale.IsSome() {
+		out.Locale = overlay.Locale
+	}
+	if strings.TrimSpace(overlay.ConfigFile) != "" {
+		out.ConfigFile = overlay.ConfigFile
+	}
+	if overlay.ShowHelp {
+		out.ShowHelp = true
+	}
+	return out
+}
+
+// ConsumeSubcommandPrefix 在多级命令族的二级子命令动作词之前消费前置跨命令通用标志
+// （--lang / --json / --policy / --ssh-config / -F / -h / --help）。
+// 遇到 `--`、首个非选项位置词（二级子命令词）或非通用选项时立即停止；遇到 `-h` / `--help` 时置位 ShowHelp 并立即返回。
+func ConsumeSubcommandPrefix(args []string) (CommonFlags, []string, error) {
+	var cf CommonFlags
+	cur := NewFlagCursor(args)
+	for cur.HasNext() {
+		tok := cur.Peek()
+		if tok == "--" || !strings.HasPrefix(tok, "-") || tok == "-" {
 			break
 		}
-		name, inlineVal, hasEq, isLong := ParseLongFlagName(tok)
-		if !isLong || name != "json" {
-			continue
+		if tok == "-h" {
+			cur.Next()
+			cf.ShowHelp = true
+			return cf, nil, nil
 		}
-		if !hasEq {
-			enabled = true
-			continue
+		consumed, err := consumeGlobalPrefixToken(cur, &cf)
+		if err != nil {
+			return cf, nil, err
 		}
-		switch strings.ToLower(strings.TrimSpace(inlineVal)) {
-		case "true", "1", "t", "yes":
-			enabled = true
-		case "false", "0", "f", "no":
-			enabled = false
+		if cf.ShowHelp {
+			return cf, nil, nil
+		}
+		if !consumed {
+			break
 		}
 	}
-	return enabled
+	return cf, cur.Rest(), nil
 }
 
 // ConsumeLongValue 读取长选项值：已携带 `=value` 时直接返回，否则消耗下一参数（缺失则返 ErrUsage）。

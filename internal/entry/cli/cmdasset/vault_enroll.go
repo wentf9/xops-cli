@@ -29,7 +29,7 @@ type enrollPasswordFlags struct {
 func runVaultEnrollPassword(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseEnrollPasswordFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -201,7 +201,7 @@ type setNodePrivFlags struct {
 func runVaultSetNodePrivilege(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseSetNodePrivFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))

@@ -175,7 +175,8 @@ type Runtime struct {
 	Localizer       *i18n.Localizer
 }
 
-// EnsureLocalizer 返回可用的不可变 Localizer；当 loc 为 nil 或无效时从内置词库兜底英文（纯内存、零触盘）。
+// EnsureLocalizer 返回可用的不可变 Localizer；作为纯渲染路径兜底辅助，当 loc 为 nil 或无效时从内置词库回退英文
+// （纯内存、零触盘，确保诊断与错误渲染路径永不因 Localizer 缺失而丢失信息；构造期配置校验仍由 cli.NewApp 严格失败关闭）。
 // 若极端情况下内置词库不可用则返回 nil（*i18n.Localizer 对 nil 接收者严格安全失败关闭）。
 func EnsureLocalizer(loc *i18n.Localizer) *i18n.Localizer {
 	if loc != nil && loc.IsValid() {
@@ -187,7 +188,9 @@ func EnsureLocalizer(loc *i18n.Localizer) *i18n.Localizer {
 	return nil
 }
 
-// Loc 返回当前运行期绑定的不可变 Localizer；未显式设置时回退内置英文词库（零触盘、永不返回 nil）。
+// Loc 返回当前运行期绑定的不可变 Localizer；渲染期若未显式设置或收到无效零值，
+// 按「已绑定有效 Localizer -> 有效 Catalog + Global.Locale -> 内置英文词库 DefaultLocalizer」顺序安全回退
+// （与 cli.NewApp 对非 nil 无效 Catalog 的构造期失败关闭互补，保障报错渲染绝不递归失败）。
 func (r *Runtime) Loc() *i18n.Localizer {
 	if r != nil && r.Localizer != nil && r.Localizer.IsValid() {
 		return r.Localizer
@@ -199,6 +202,55 @@ func (r *Runtime) Loc() *i18n.Localizer {
 		return r.Catalog.For(domi18n.LocaleEn)
 	}
 	return EnsureLocalizer(nil)
+}
+
+// WithPrefix 返回浅拷贝的 Runtime，将多级命令前置通用标志（--json / --policy / --lang / -F / --ssh-config）
+// 合并至副本的 Global 字段并同步更新 Localizer（不修改原 Runtime）。
+func (r *Runtime) WithPrefix(prefix CommonFlags) *Runtime {
+	if r == nil {
+		return nil
+	}
+	cp := *r
+	cp.Global = MergeCommonFlags(r.Global, prefix)
+	if loc, ok := prefix.Locale.Get(); ok && loc.IsValid() && cp.Catalog != nil && cp.Catalog.IsValid() {
+		cp.Localizer = cp.Catalog.For(loc)
+	}
+	return &cp
+}
+
+// SubcommandDispatch 保存多级命令前置通用标志消费与二级动作词提取的分发结果。
+type SubcommandDispatch struct {
+	RT       *Runtime
+	Sub      string
+	Rest     []string
+	ExitCode int
+	Handled  bool
+}
+
+// PrepareSubcommand 在多级子命令入口统一消费前置通用标志并合并至副本 Runtime：
+//   - 前置标志报错时按命令感知 JSON 开关输出错误并返回 Handled=true；
+//   - 遇到 -h / --help / help 或无二级动作词时输出本地化帮助并返回 ExitOK 与 Handled=true；
+//   - 其余情况返回合并后的 Runtime、二级子命令词 Sub、剩余参数 Rest 与 Handled=false。
+func (r *Runtime) PrepareSubcommand(
+	cmd string,
+	args []string,
+	helpText func(*i18n.Localizer) string,
+) SubcommandDispatch {
+	prefix, rem, err := ConsumeSubcommandPrefix(args)
+	if err != nil {
+		return SubcommandDispatch{
+			ExitCode: r.Fail(ExitUsage, r.EffectiveJSON(prefix.JSON || HasJSONFlagForCommand(cmd, args)), err),
+			Handled:  true,
+		}
+	}
+	next := r.WithPrefix(prefix)
+	if prefix.ShowHelp || len(rem) == 0 || rem[0] == "help" {
+		if helpText != nil {
+			_, _ = io.WriteString(next.Stdout, helpText(next.Loc()))
+		}
+		return SubcommandDispatch{ExitCode: ExitOK, Handled: true}
+	}
+	return SubcommandDispatch{RT: next, Sub: rem[0], Rest: rem[1:]}
 }
 
 // EffectiveLocale 返回当前运行期生效的显示语言标识（优先 Localizer，其次 Global.Locale，回退 LocaleEn）。
@@ -359,7 +411,7 @@ func (r *Runtime) ReadLocalInput(ctx context.Context, rawPath string, policy pat
 	}
 	srcPath, err := pathalg.ParseLocalSourcePath(trimmed)
 	if err != nil {
-		return nil, "", i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "local file path"), i18n.BoundStr("value", trimmed))
+		return nil, "", i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalFilePath)), i18n.BoundStr("value", trimmed))
 	}
 	data, err := r.Hooks.ReadOperatorFile(ctx, srcPath, policy, maxBytes)
 	if err != nil {

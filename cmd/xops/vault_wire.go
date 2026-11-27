@@ -113,7 +113,7 @@ func buildVaultAdapters(
 func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps vaultWireDeps) (wiredVault, error) {
 	vaultDir, err := deps.stateDir.JoinComponent(defaultVaultDirName)
 	if err != nil {
-		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default vault directory"))
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetDefaultVaultDir)))
 	}
 	offVault, err := offline.NewVault(offline.Spec{
 		ScopedFS:   deps.scopedFS,
@@ -122,12 +122,12 @@ func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps
 		StoreNames: []string{defaultOfflineStoreName},
 	})
 	if err != nil {
-		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "default offline vault"))
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompDefaultOfflineVault)))
 	}
 	osKeychain, err := createOSKeychainVault(deps)
 	if err != nil {
 		_ = offVault.Lock(context.Background())
-		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "platform os_keychain vault"))
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompPlatformKeychainVault)))
 	}
 	stores := map[string]ports.SecretVault{
 		defaultOfflineStoreName:    offVault,
@@ -148,7 +148,7 @@ func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps
 	})
 	if err != nil {
 		closeBuiltVaults(stores)
-		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "router vault"))
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompRouterVault)))
 	}
 	return wiredVault{
 		router:      router,
@@ -183,7 +183,7 @@ func buildConfiguredVaultAdapters(
 	})
 	if err != nil {
 		closeBuiltVaults(stores)
-		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "configured router vault"))
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompConfiguredRouterVault)))
 	}
 	return wiredVault{
 		router:      router,
@@ -201,7 +201,7 @@ func instantiateVaultStore(
 	case "offline_aead":
 		dir, err := resolveVaultDir(dto.Path, deps.stateDir, deps.homeDir)
 		if err != nil {
-			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.BoundStr("target", "vault store "+name), i18n.BoundStr("path", dto.Path))
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetVaultStore, i18n.BoundStr("name", name))), i18n.BoundStr("path", dto.Path))
 		}
 		v, err := offline.NewVault(offline.Spec{
 			ScopedFS:   deps.scopedFS,
@@ -210,13 +210,13 @@ func instantiateVaultStore(
 			StoreNames: []string{name},
 		})
 		if err != nil {
-			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.BoundStr("component", "offline_aead vault "+name))
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompOfflineAEADVault, i18n.BoundStr("name", name))))
 		}
 		return v, v, nil
 	case "os_keychain":
 		v, err := createOSKeychainVault(deps)
 		if err != nil {
-			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.BoundStr("component", "os_keychain vault "+name))
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompOSKeychainVault, i18n.BoundStr("name", name))))
 		}
 		return v, nil, nil
 	case "external_helper":
@@ -231,7 +231,7 @@ func instantiateVaultStore(
 			Timeout: timeoutOpt,
 		})
 		if err != nil {
-			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.BoundStr("component", "external_helper vault "+name))
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompExternalHelperVault, i18n.BoundStr("name", name))))
 		}
 		return v, nil, nil
 	case "none":

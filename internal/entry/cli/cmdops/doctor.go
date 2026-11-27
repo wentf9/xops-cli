@@ -33,7 +33,7 @@ type doctorAggregateView struct {
 func RunDoctor(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseDoctorArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("doctor", args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, DoctorHelpText(rt.Loc()))
@@ -139,7 +139,7 @@ func renderDoctorText(loc *i18n.Localizer, w io.Writer, view doctorAggregateView
 			_, _ = fmt.Fprintf(w, "    [%s] %s (%s): %s\n", f.Severity, f.Code, f.Subject, f.Message)
 		}
 	} else if view.VaultNote != "" {
-		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorVaultNote, i18n.Str("note", view.VaultNote)))
+		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorVaultNote, i18n.BoundStr("note", view.VaultNote)))
 	}
 }
 

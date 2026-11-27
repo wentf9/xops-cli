@@ -14,12 +14,11 @@ import (
 
 // RunHosts 执行 `xops hosts`（别名 `host` / `inventory`）全量资产查询、目标解析、DAG 校验与 CAS CRUD 命令。
 func RunHosts(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
-		return clikit.ExitOK
+	d := rt.PrepareSubcommand("hosts", args, HostsHelpText)
+	if d.Handled {
+		return d.ExitCode
 	}
-	sub := args[0]
-	rest := args[1:]
+	rt, sub, rest := d.RT, d.Sub, d.Rest
 	switch sub {
 	case "list", "ls":
 		return runHostsList(ctx, rt, rest)
@@ -44,7 +43,7 @@ func RunHosts(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	case "delete-node":
 		return runAssetDelete(ctx, rt, "node", rest)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(rest)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "hosts"), i18n.BoundStr("sub", sub)))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", rest)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "hosts"), i18n.BoundStr("sub", sub)))
 	}
 }
 
@@ -57,7 +56,7 @@ type hostsListFlags struct {
 func runHostsList(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseHostsListFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
@@ -233,7 +232,7 @@ type hostsGetFlags struct {
 func runHostsGet(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseHostsGetFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))

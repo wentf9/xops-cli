@@ -37,7 +37,7 @@ type nodeUpsertFlags struct {
 func runNodeUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args []string) int {
 	f, err := parseNodeUpsertFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
@@ -247,7 +247,7 @@ type assetDeleteFlags struct {
 func runAssetDelete(ctx context.Context, rt *clikit.Runtime, kind string, args []string) int {
 	f, err := parseAssetDeleteFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))

@@ -14,12 +14,11 @@ import (
 
 // RunVault 执行 `xops creds` 与 `xops vault` 凭据库全生命周期与安全回收子命令族。
 func RunVault(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
-		return clikit.ExitOK
+	d := rt.PrepareSubcommand("vault", args, VaultHelpText)
+	if d.Handled {
+		return d.ExitCode
 	}
-	sub := args[0]
-	rest := args[1:]
+	rt, sub, rest := d.RT, d.Sub, d.Rest
 	switch sub {
 	case "status":
 		return runVaultStatus(ctx, rt, rest)
@@ -46,7 +45,7 @@ func RunVault(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	case "rotate":
 		return runVaultRotate(ctx, rt, rest)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(rest)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "vault"), i18n.BoundStr("sub", sub)))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", rest)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "vault"), i18n.BoundStr("sub", sub)))
 	}
 }
 
@@ -73,7 +72,7 @@ func parseCommonOnly(_ string, args []string) (clikit.CommonFlags, error) {
 func runVaultStatus(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, err := parseCommonOnly("status", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -114,7 +113,7 @@ func runVaultInitOrUnlock(ctx context.Context, rt *clikit.Runtime, isInit bool, 
 	}
 	common, err := parseCommonOnly(sub, args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -173,7 +172,7 @@ func buildInteractiveVaultReq(sub string, isInit bool) (engine.InteractiveVaultO
 func runVaultLock(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, err := parseCommonOnly("lock", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -203,7 +202,7 @@ func runVaultLock(ctx context.Context, rt *clikit.Runtime, args []string) int {
 func runVaultDoctor(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, skipProbe, err := parseVaultDoctorFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))

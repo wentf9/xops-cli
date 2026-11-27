@@ -34,7 +34,7 @@ type AppConfig struct {
 	Stderr io.Writer
 	// ShutdownTimeout 可选配置命令退出期等待引擎与审计落盘收敛的最大时长（None 默认 5s）。
 	ShutdownTimeout algebraic.Option[algebraic.Duration]
-	// Catalog 为可选注入的国际化双语词库只读快照（nil 时经内置 embed.FS 内存加载，零触盘）。
+	// Catalog 为可选注入的国际化双语词库只读快照（nil 时经内置 embed.FS 内存加载，零触盘；非 nil 无效零值严格失败关闭返回 ErrInvalidConfig）。
 	Catalog *i18n.Catalog
 	// DefaultLocale 为宿主探测的默认界面语言（零值或非法时回退 LocaleEn）。
 	DefaultLocale domi18n.Locale
@@ -131,7 +131,10 @@ func resolveShutdownTimeout(opt algebraic.Option[algebraic.Duration]) (time.Dura
 }
 
 func resolveAppCatalog(cat *i18n.Catalog) (*i18n.Catalog, error) {
-	if cat != nil && cat.IsValid() {
+	if cat != nil {
+		if !cat.IsValid() {
+			return nil, i18n.EF(ErrInvalidConfig, i18n.KeyCLIInvalidConfig)
+		}
 		return cat, nil
 	}
 	loaded, err := i18n.LoadCatalog()
@@ -141,7 +144,7 @@ func resolveAppCatalog(cat *i18n.Catalog) (*i18n.Catalog, error) {
 	return loaded, nil
 }
 
-// Run 统一执行命令/选项感知 `--lang` 扫描、全局前置选项解析与子命令分发，并返回确定性退出码（不调用 os.Exit）。
+// Run 统一执行命令/选项感知预扫描（--lang 与 --json）、全局前置选项解析与子命令分发，并返回确定性退出码（不调用 os.Exit）。
 func (a *App) Run(ctx context.Context, args []string) int {
 	if a == nil || !a.valid {
 		return clikit.ExitGeneral
@@ -151,12 +154,12 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		rt.WriteErr(rt.Loc().RenderError(i18n.E(i18n.KeyCLINilContext)))
 		return clikit.ExitGeneral
 	}
-	scannedLoc, langErr := clikit.ScanLangFlag(args)
+	pre, langErr := clikit.ScanPreFlags(args)
 	if langErr != nil {
-		return rt.Fail(clikit.ExitUsage, clikit.HasJSONFlag(args), langErr)
+		return rt.Fail(clikit.ExitUsage, pre.JSON, langErr)
 	}
 	effectiveLocale := a.defaultLocale
-	if loc, ok := scannedLoc.Get(); ok && loc.IsValid() {
+	if loc, ok := pre.Locale.Get(); ok && loc.IsValid() {
 		effectiveLocale = loc
 	}
 	rt.Localizer = a.catalog.For(effectiveLocale)
@@ -226,25 +229,26 @@ func (a *App) dispatchCommand(ctx context.Context, rt *clikit.Runtime, cmd strin
 	case "tui":
 		return cmdops.RunTUI(ctx, rt, subArgs)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(subArgs)), i18n.EF(ErrUsage, i18n.KeyCLIUnknownCommand, i18n.BoundStr("cmd", cmd)))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand(cmd, subArgs)), i18n.EF(ErrUsage, i18n.KeyCLIUnknownCommand, i18n.BoundStr("cmd", cmd)))
 	}
 }
 
 func (a *App) runHelp(rt *clikit.Runtime, args []string) int {
+	jsonErrMode := rt.EffectiveJSON(clikit.HasJSONFlagForCommand("help", args))
 	topics, err := parseHelpArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, jsonErrMode, err)
 	}
 	if len(topics) == 0 {
 		writeRootHelp(a.stdout, rt.Loc())
 		return clikit.ExitOK
 	}
 	if len(topics) > 1 {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), i18n.EF(ErrUsage, i18n.KeyCLIHelpTooManyTopics, i18n.BoundStr("args", strings.Join(topics, " "))))
+		return rt.Fail(clikit.ExitUsage, jsonErrMode, i18n.EF(ErrUsage, i18n.KeyCLIHelpTooManyTopics, i18n.BoundStr("args", strings.Join(topics, " "))))
 	}
 	text, ok := lookupHelpTopic(rt.Loc(), topics[0])
 	if !ok {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), i18n.EF(ErrUsage, i18n.KeyCLIUnknownHelpTopic, i18n.BoundStr("topic", topics[0])))
+		return rt.Fail(clikit.ExitUsage, jsonErrMode, i18n.EF(ErrUsage, i18n.KeyCLIUnknownHelpTopic, i18n.BoundStr("topic", topics[0])))
 	}
 	_, _ = io.WriteString(a.stdout, text)
 	return clikit.ExitOK
@@ -279,7 +283,7 @@ func parseHelpArgs(args []string) ([]string, error) {
 // runVersion 仅渲染显式注入的 BuildInfo（支持 --json / --lang / --help），绝不初始化 Engine 或触碰任何本地状态目录。
 func (a *App) runVersion(rt *clikit.Runtime, args []string) int {
 	var cf clikit.CommonFlags
-	jsonErrMode := rt.EffectiveJSON(clikit.HasJSONFlag(args))
+	jsonErrMode := rt.EffectiveJSON(clikit.HasJSONFlagForCommand("version", args))
 	cur := clikit.NewFlagCursor(args)
 	for cur.HasNext() {
 		tok := cur.Peek()

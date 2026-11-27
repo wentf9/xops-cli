@@ -19,7 +19,7 @@ import (
 func RunSSH(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := ParseSSHArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("ssh", args)), err)
 	}
 	if parsed.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, SSHHelpText(rt.Loc()))
@@ -213,7 +213,7 @@ func parseOptionalControlSocket(raw string) (algebraic.Option[pathalg.LocalSourc
 	}
 	p, err := pathalg.ParseLocalSourcePath(trimmed)
 	if err != nil {
-		return algebraic.None[pathalg.LocalSourcePath](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "control socket path"), i18n.BoundStr("value", raw))
+		return algebraic.None[pathalg.LocalSourcePath](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldControlSocketPath)), i18n.BoundStr("value", raw))
 	}
 	return algebraic.Some(p), nil
 }

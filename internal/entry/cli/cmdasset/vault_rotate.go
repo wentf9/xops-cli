@@ -42,7 +42,7 @@ type sagaResultView struct {
 func runVaultRotate(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseRotateSecretFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -118,7 +118,7 @@ func buildRotateSecretReq(f rotateSecretFlags) (engine.InteractiveRotateSecretRe
 	}
 	oldRef, err := secret.ParseRef(f.pos[0])
 	if err != nil {
-		return engine.InteractiveRotateSecretRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", f.pos[0]))
+		return engine.InteractiveRotateSecretRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldSecretRef)), i18n.BoundStr("value", f.pos[0]))
 	}
 	newRef, store, err := parseTargetRefOrStore(f.newRefRaw, f.store)
 	if err != nil {
@@ -153,7 +153,7 @@ func parseTargetRefOrStore(refRaw, storeRaw string) (ref secret.Ref, store strin
 	if trimmedRef != "" {
 		parsed, pErr := secret.ParseRef(trimmedRef)
 		if pErr != nil {
-			return ref, "", i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", trimmedRef))
+			return ref, "", i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldSecretRef)), i18n.BoundStr("value", trimmedRef))
 		}
 		return parsed, "", nil
 	}

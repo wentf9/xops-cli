@@ -42,13 +42,14 @@ type playbookArgs struct {
 
 // RunPlaybook 执行 `xops playbook`（别名 `play`）：支持 `validate`（纯离线 AST 校验，零引擎初始化）与 `run`。
 func RunPlaybook(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, PlaybookHelpText(rt.Loc()))
-		return clikit.ExitOK
+	d := rt.PrepareSubcommand("playbook", args, PlaybookHelpText)
+	if d.Handled {
+		return d.ExitCode
 	}
-	parsed, err := parsePlaybookArgs(args)
+	rt, sub, rest := d.RT, d.Sub, d.Rest
+	parsed, err := parsePlaybookArgs(sub, rest)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("playbook", rest)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, PlaybookHelpText(rt.Loc()))
@@ -164,7 +165,7 @@ func renderPlaybookRunResult(rt *clikit.Runtime, res engine.PlaybookRunResult, r
 			env.ErrorCode = clikit.ClassifyErrorCode(runErr)
 		}
 		if err := clikit.WriteJSON(rt.Stdout, env); err != nil {
-			rt.WriteErr(loc.T(i18n.KeyCLIMarshalJSONFailed, i18n.Str("err", loc.RenderError(err))))
+			rt.WriteErr(loc.T(i18n.KeyCLIMarshalJSONFailed, i18n.BoundStr("err", loc.RenderError(err))))
 			return clikit.ExitGeneral
 		}
 		return code
@@ -290,9 +291,9 @@ func yamlMappingToMap(n *yaml.Node) (map[string]any, error) {
 	return out, nil
 }
 
-func parsePlaybookArgs(args []string) (playbookArgs, error) {
+func parsePlaybookArgs(sub string, args []string) (playbookArgs, error) {
 	out := playbookArgs{
-		sub:           args[0],
+		sub:           sub,
 		cliOpts:       option.UnsetOptionLayer(),
 		symlinkPolicy: pathalg.SymlinkReject,
 		extraVars:     map[string]string{},
@@ -300,7 +301,7 @@ func parsePlaybookArgs(args []string) (playbookArgs, error) {
 	if out.sub != "run" && out.sub != "validate" {
 		return playbookArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "playbook"), i18n.BoundStr("sub", out.sub))
 	}
-	cur := clikit.NewFlagCursor(args[1:])
+	cur := clikit.NewFlagCursor(args)
 	for cur.HasNext() {
 		if err := parsePlaybookToken(cur, &out); err != nil {
 			return playbookArgs{}, err

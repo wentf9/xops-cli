@@ -18,7 +18,7 @@ import (
 func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, pos, err := parseVaultPositionalArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -30,7 +30,7 @@ func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	}
 	ref, err := secret.ParseRef(pos[0])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", pos[0])))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldSecretRef)), i18n.BoundStr("value", pos[0])))
 	}
 	initOpts := rt.EffectiveInitOptions(common.ConfigFile, common.Policy)
 	return rt.WithEngine(ctx, initOpts, clikit.ExitGeneral, jsonOut, func(runner clikit.SessionRunner) int {
@@ -60,7 +60,7 @@ func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 func runVaultDelete(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, pos, err := parseVaultPositionalArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -72,7 +72,7 @@ func runVaultDelete(ctx context.Context, rt *clikit.Runtime, args []string) int 
 	}
 	ref, err := secret.ParseRef(pos[0])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", pos[0])))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldSecretRef)), i18n.BoundStr("value", pos[0])))
 	}
 	initOpts := rt.EffectiveInitOptions(common.ConfigFile, common.Policy)
 	return rt.WithEngine(ctx, initOpts, clikit.ExitGeneral, jsonOut, func(runner clikit.SessionRunner) int {
@@ -97,7 +97,7 @@ func runVaultDelete(ctx context.Context, rt *clikit.Runtime, args []string) int 
 func runVaultGC(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, pos, err := parseVaultPositionalArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
@@ -111,7 +111,7 @@ func runVaultGC(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	for _, raw := range pos {
 		ref, err := secret.ParseRef(raw)
 		if err != nil {
-			return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", raw)))
+			return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldSecretRef)), i18n.BoundStr("value", raw)))
 		}
 		candidates = append(candidates, ref)
 	}
@@ -160,7 +160,7 @@ type enrollKeyFlags struct {
 func runVaultEnrollKey(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseEnrollKeyFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("vault", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))

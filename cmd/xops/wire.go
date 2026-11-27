@@ -224,7 +224,7 @@ func initStoreAndPolicy(
 		ScopedFS: a.scopedFS,
 		RootDir:  a.stateDir,
 	}); err != nil {
-		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "inventory store"))
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompInventoryStore)))
 	}
 	doc, _, err := a.invStore.LoadDocument(ctx)
 	if err != nil {
@@ -237,7 +237,7 @@ func initStoreAndPolicy(
 		ScopedFS: a.scopedFS,
 		RootDir:  a.stateDir,
 	}); err != nil {
-		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "WAL journal store"))
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompWALJournalStore)))
 	}
 	if a.importers, err = buildFormatImporters(localID); err != nil {
 		return err
@@ -289,16 +289,16 @@ func initModeSpecificAdapters(
 	a.readFS = osfs.NewOperatorReadFS()
 	var err error
 	if a.term, err = buildTerminalAdapter(stdin, stdout); err != nil {
-		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "terminal adapter"))
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompTerminalAdapter)))
 	}
 	if a.interaction, err = buildInteractionAdapter(stdin, stdout, loc); err != nil {
-		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "interaction adapter"))
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompInteractionAdapter)))
 	}
 	if a.sshfpLookup, err = sshfp.NewSystemLookup(sshfp.Spec{
 		OperatorFS: a.readFS,
 		Entropy:    a.entropy,
 	}); err != nil {
-		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "sshfp lookup adapter"))
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompSSHFPLookupAdapter)))
 	}
 	if a.openSSH, err = buildOpenSSHSource(ctx, opts.OpenSSHConfigFile, a.homeDir, localID, a.scopedFS, a.readFS); err != nil {
 		return err
@@ -345,11 +345,11 @@ func buildFormatImporters(localID ports.LocalIdentityInfo) ([]ports.FormatImport
 		LocalIdentity: algebraic.Some(localID),
 	})
 	if err != nil {
-		return nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "openssh importer"))
+		return nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompOpenSSHImporter)))
 	}
 	csvImp, err := store.NewCSVImporter(store.CSVImporterSpec{})
 	if err != nil {
-		return nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "csv importer"))
+		return nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompCSVImporter)))
 	}
 	return []ports.FormatImporter{openSSHImp, csvImp}, nil
 }
@@ -414,7 +414,7 @@ func buildAuditAdapters(
 ) (*audit.FileSink, *audit.FileReconciler, error) {
 	procID, err := ports.NewProcessInstanceIDFrom(entropy)
 	if err != nil {
-		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "process instance id"))
+		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompProcessInstanceID)))
 	}
 	sink, err := audit.NewFileSink(audit.SinkSpec{
 		ScopedFS:  scopedFS,
@@ -423,7 +423,7 @@ func buildAuditAdapters(
 		AuditFile: auditFile,
 	})
 	if err != nil {
-		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "audit sink"))
+		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompAuditSink)))
 	}
 	reconciler, err := audit.NewFileReconciler(audit.ReconcilerSpec{
 		ScopedFS:  scopedFS,
@@ -432,7 +432,7 @@ func buildAuditAdapters(
 	})
 	if err != nil {
 		_ = sink.Close()
-		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "audit reconciler"))
+		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Msg("component", i18n.NewMessage(i18n.KeyCmdCompAuditReconciler)))
 	}
 	return sink, reconciler, nil
 }

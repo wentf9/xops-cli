@@ -150,7 +150,7 @@ func runSFTPShellSubEntry(
 	if trimmed := strings.TrimSpace(req.InitialDir); trimmed != "" {
 		rp, pErr := pathalg.ParseRemotePath(trimmed)
 		if pErr != nil {
-			return i18n.Wrap(pErr, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "initial remote dir"), i18n.BoundStr("path", req.InitialDir))
+			return i18n.Wrap(pErr, i18n.KeyCmdInvalidDirPath, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetInitialRemoteDir)), i18n.BoundStr("path", req.InitialDir))
 		}
 		initRemote = algebraic.Some(rp)
 	}
@@ -423,7 +423,7 @@ func readOperatorFileHook(
 func resolveWorkDir() (pathalg.LocalDir, error) {
 	abs, err := filepath.Abs(".")
 	if err != nil {
-		return zeroVal[pathalg.LocalDir](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "working directory"))
+		return zeroVal[pathalg.LocalDir](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetWorkingDir)))
 	}
 	return pathalg.ParseLocalDir(abs)
 }

@@ -8,7 +8,10 @@ import (
 
 	"go.uber.org/goleak"
 
+	"github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	rooti18n "github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func TestCleanupAndPostAnnounceErrorHelpers(t *testing.T) {
@@ -37,5 +40,23 @@ func TestCleanupAndPostAnnounceErrorHelpers(t *testing.T) {
 	}
 	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "forward dropped") {
 		t.Fatalf("JSON 模式下 post-announce 错误不得污染 stdout: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
+func TestLocalizeBatchNodeStatus_Bilingual(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	cat, err := rooti18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	enLoc := cat.For(i18n.LocaleEn)
+	zhLoc := cat.For(i18n.LocaleZh)
+	var zeroNR engine.BatchNodeResult
+	if got := localizeBatchNodeStatus(enLoc, zeroNR); got != "failed" {
+		t.Fatalf("EN 零值 BatchNodeResult 状态期望 failed，实际=%q", got)
+	}
+	if got := localizeBatchNodeStatus(zhLoc, zeroNR); got != "失败" {
+		t.Fatalf("ZH 零值 BatchNodeResult 状态期望 失败，实际=%q", got)
 	}
 }

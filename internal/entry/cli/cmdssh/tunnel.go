@@ -23,13 +23,18 @@ type tunnelArgs struct {
 
 // RunTunnel 执行 `xops tunnel`（别名 `forward`），支持 start / local / remote / dynamic / tun 及 OpenSSH -L/-R/-D/-w 风格。
 func RunTunnel(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+	prefix, rest, err := clikit.ConsumeSubcommandPrefix(args)
+	if err != nil {
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(prefix.JSON || clikit.HasJSONFlagForCommand("tunnel", args)), err)
+	}
+	rt = rt.WithPrefix(prefix)
+	if prefix.ShowHelp || len(rest) == 0 || rest[0] == "help" {
 		_, _ = io.WriteString(rt.Stdout, TunnelHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
-	parsed, err := parseTunnelArgs(args)
+	parsed, err := parseTunnelArgs(rest)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("tunnel", rest)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, TunnelHelpText(rt.Loc()))

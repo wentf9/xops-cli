@@ -5,6 +5,7 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,9 +14,11 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func TestParseForwardFlagSpec_TCPUnixIPv6DynamicAndTUN(t *testing.T) {
@@ -297,5 +300,91 @@ func TestParseLongFlagNameAndJSONPreservation(t *testing.T) {
 	cf, _, err := clikit.ParseGlobalPrefix([]string{"--json", "--policy", "invalid", "ssh", "web"})
 	if !errors.Is(err, clikit.ErrUsage) || !cf.JSON {
 		t.Fatalf("全局前缀报错时必须保留已解析的 --json 标志: cf=%+v err=%v", cf, err)
+	}
+}
+
+func TestScanPreFlags_CommandAwareJSONAndShortClusterHelp(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	// 1. 远端参数或选项值中的 --json 绝不得误判为 CLI JSON 模式。
+	noJSONCases := []struct {
+		name    string
+		args    []string
+		wantErr bool
+	}{
+		{"ssh_bad_lang_remote_json", []string{"ssh", "--lang=fr", "web", "echo", "--json"}, true},
+		{"ssh_short_l_val_json_bad_lang", []string{"ssh", "-l", "--json", "--lang=fr", "web"}, true},
+		{"global_policy_val_json", []string{"--policy", "--json", "ssh", "web"}, false},
+		{"ssh_bad_short_remote_json", []string{"ssh", "-z", "web", "mytool", "--json"}, false},
+		{"exec_bad_short_remote_json", []string{"exec", "-z", "web", "mytool", "--json"}, false},
+		{"hosts_desc_val_json", []string{"hosts", "create-host", "--desc", "--json"}, false},
+		{"creds_F_val_json", []string{"creds", "-F", "--json", "status"}, false},
+		{"ssh_short_hl_bad_lang", []string{"ssh", "-hl", "--lang=fr"}, true},
+		{"ssh_short_thl_bad_lang", []string{"ssh", "-thl", "--lang=fr"}, true},
+	}
+	for _, tc := range noJSONCases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := clikit.ScanPreFlags(tc.args)
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("ScanPreFlags(%v) err=%v, wantErr=%v", tc.args, err, tc.wantErr)
+			}
+			if res.JSON || clikit.HasJSONFlag(tc.args) {
+				t.Fatalf("args=%v 不得误判为 JSON 模式: res=%+v", tc.args, res)
+			}
+		})
+	}
+
+	// 2. -hl --lang=zh 不得被 -l 吞掉，且 ssh/exec 子命令上下文 HasJSONFlagForCommand 同样不误判远端 --json。
+	resHL, err := clikit.ScanPreFlags([]string{"ssh", "-hl", "--lang=zh"})
+	if err != nil || resHL.Locale.OrElse(domi18n.LocaleInvalid) != domi18n.LocaleZh {
+		t.Fatalf("ssh -hl --lang=zh 应识别 LocaleZh: res=%+v err=%v", resHL, err)
+	}
+	resErrJSON, err := clikit.ScanPreFlags([]string{"ssh", "--lang=fr", "--json", "web", "echo", "--json=false"})
+	if !errors.Is(err, clikit.ErrUsage) || !resErrJSON.JSON {
+		t.Fatalf("ssh --lang=fr --json 应在保留 JSON=true 的同时返回 ErrUsage: res=%+v err=%v", resErrJSON, err)
+	}
+	if clikit.HasJSONFlagForCommand("ssh", []string{"-z", "web", "mytool", "--json"}) {
+		t.Fatalf("HasJSONFlagForCommand(ssh) 不得误判远端 --json")
+	}
+	if clikit.HasJSONFlagForCommand("exec", []string{"-z", "web", "mytool", "--json"}) {
+		t.Fatalf("HasJSONFlagForCommand(exec) 不得误判远端 --json")
+	}
+	if clikit.HasJSONFlagForCommand("hosts", []string{"create-host", "--desc", "--json"}) {
+		t.Fatalf("HasJSONFlagForCommand(hosts) 不得误判 --desc 参数值 --json")
+	}
+}
+
+func TestConsumeSubcommandPrefixAndWithPrefix(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	prefix, rest, err := clikit.ConsumeSubcommandPrefix([]string{"--lang", "zh", "--json", "--policy", "strict_agent", "-F", "/tmp/ssh.cfg", "list", "--kind", "all"})
+	if err != nil {
+		t.Fatalf("ConsumeSubcommandPrefix 失败: %v", err)
+	}
+	if !prefix.JSON || prefix.Policy != engine.PolicyProfileStrictAgent || prefix.ConfigFile != "/tmp/ssh.cfg" ||
+		prefix.Locale.OrElse(domi18n.LocaleInvalid) != domi18n.LocaleZh {
+		t.Fatalf("前置通用标志解析异常: %+v", prefix)
+	}
+	if !slices.Equal(rest, []string{"list", "--kind", "all"}) {
+		t.Fatalf("剩余子命令参数失配: %v", rest)
+	}
+
+	helpPrefix, helpRest, err := clikit.ConsumeSubcommandPrefix([]string{"--lang", "zh", "--help"})
+	if err != nil || !helpPrefix.ShowHelp || len(helpRest) != 0 {
+		t.Fatalf("--lang zh --help 应置位 ShowHelp: prefix=%+v rest=%v err=%v", helpPrefix, helpRest, err)
+	}
+
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	baseRT := &clikit.Runtime{Catalog: cat, Localizer: cat.For(domi18n.LocaleEn)}
+	nextRT := baseRT.WithPrefix(prefix)
+	if nextRT.EffectiveLocale() != domi18n.LocaleZh || !nextRT.EffectiveJSON(false) ||
+		nextRT.EffectiveInitOptions("", engine.PolicyProfileInvalid).PolicyProfile != engine.PolicyProfileStrictAgent {
+		t.Fatalf("WithPrefix 未正确合并前置通用标志: next=%+v", nextRT)
+	}
+	if baseRT.EffectiveLocale() != domi18n.LocaleEn || baseRT.EffectiveJSON(false) {
+		t.Fatalf("WithPrefix 不得修改原 Runtime")
 	}
 }

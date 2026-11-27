@@ -22,7 +22,7 @@ type tuiArgs struct {
 func RunTUI(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseTUIArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("tui", args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, TUIHelpText(rt.Loc()))
@@ -126,9 +126,18 @@ type mcpArgs struct {
 
 // RunMCP 解析 `xops mcp [serve]` 参数并通过组合根注入的 AppConfig.RunMCP 回调启动 MCP 宿主入口（未注入严格失败关闭）。
 func RunMCP(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	parsed, err := parseMCPArgs(args)
+	prefix, rest, err := clikit.ConsumeSubcommandPrefix(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(prefix.JSON || clikit.HasJSONFlagForCommand("mcp", args)), err)
+	}
+	rt = rt.WithPrefix(prefix)
+	if prefix.ShowHelp {
+		_, _ = io.WriteString(rt.Stdout, MCPHelpText(rt.Loc()))
+		return clikit.ExitOK
+	}
+	parsed, err := parseMCPArgs(rest)
+	if err != nil {
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("mcp", rest)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, MCPHelpText(rt.Loc()))

@@ -59,7 +59,7 @@ type hostUpsertFlags struct {
 func runHostUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args []string) int {
 	f, err := parseHostUpsertFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
@@ -189,7 +189,7 @@ type identityUpsertFlags struct {
 func runIdentityUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args []string) int {
 	f, err := parseIdentityUpsertFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))

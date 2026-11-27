@@ -8,138 +8,194 @@ import (
 	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
-// ScanLangFlag 以命令与选项语法感知方式预扫描命令行中的 `--lang <v>` / `--lang=<v>`（末次覆盖语义）：
-//   - 全局前置区跳过已知带值选项的值 token（-F / --policy / --ssh-config），遇 `--` 立即停止；
-//   - 进入 `ssh` 或 `exec` 子命令后，跳过对应带值短/长选项的值 token（完整支持短选项簇与紧贴参数），
-//     一旦遇到 `--` 或首个位置参数（目标主机）立即停止，彻底避免误拦远端命令自带的 `--lang=...` 参数；
-//   - 进入其余子命令（含 version / help / --help / hosts / creds / scp / sftp / tunnel / mux / playbook / doctor / audit / config / mcp / tui）后，
-//     跳过对应带值选项的值 token，扫描 `--` 之前全部位置以同时支持前置与后置 `--lang`；
-//   - 任一有效扫描位置出现缺值或非法 `--lang` 均失败关闭返回包装 ErrUsage 的结构化错误。
-func ScanLangFlag(args []string) (algebraic.Option[domi18n.Locale], error) {
-	var found algebraic.Option[domi18n.Locale]
-	idx, cmd, stopped, err := scanGlobalLangPrefix(args, &found)
-	if err != nil || stopped || idx >= len(args) {
-		return found, err
-	}
-	if cmd == "ssh" || cmd == "exec" {
-		if err := scanSSHOrExecLang(args[idx:], cmd, &found); err != nil {
-			return algebraic.None[domi18n.Locale](), err
-		}
-		return found, nil
-	}
-	if err := scanGeneralSubcommandLang(args[idx:], cmd, &found); err != nil {
-		return algebraic.None[domi18n.Locale](), err
-	}
-	return found, nil
+// PreScanResult 保存统一词法预扫描识别出的语言覆盖与 CLI `--json` 输出开关。
+type PreScanResult struct {
+	Locale algebraic.Option[domi18n.Locale]
+	JSON   bool
 }
 
-func scanGlobalLangPrefix(args []string, found *algebraic.Option[domi18n.Locale]) (int, string, bool, error) {
+// ScanPreFlags 以统一的命令与选项语法感知状态机预扫描命令行中的 `--lang` 与 `--json`（末次覆盖语义）：
+//   - 全局前置区跳过已知带值选项的值 token（-F / --policy / --ssh-config），遇 `--` 立即停止；
+//   - 进入 `ssh` 或 `exec` 子命令后，跳过对应带值短/长选项的值 token（支持短选项簇、`-h` 立即短路与紧贴参数），
+//     一旦遇到 `--` 或首个位置参数（目标主机或远端命令起点）立即停止，彻底避免误拦远端命令自带的 `--lang` 或 `--json`；
+//   - 进入其余子命令后，跳过对应带值选项的值 token，扫描 `--` 之前全部位置以同时支持前置、中置与后置 `--lang` / `--json`；
+//   - 任一有效扫描位置出现缺值或非法 `--lang` 时记录首个错误并继续完成同一边界内的 `--json` 扫描，
+//     最终失败关闭返回清空 Locale（保留准确 JSON 标志）的 PreScanResult 与包装 ErrUsage 的结构化错误。
+func ScanPreFlags(args []string) (PreScanResult, error) {
+	var firstErr error
+	res := scanPreFlagsInto(args, &firstErr)
+	if firstErr != nil {
+		res.Locale = algebraic.None[domi18n.Locale]()
+		return res, firstErr
+	}
+	return res, nil
+}
+
+func scanPreFlagsInto(args []string, firstErr *error) PreScanResult {
+	var res PreScanResult
+	idx, cmd, stopped := scanGlobalPrePrefix(args, &res, firstErr)
+	if !stopped && idx < len(args) {
+		scanSubcommandPreInto(cmd, args[idx:], &res, firstErr)
+	}
+	return res
+}
+
+// ScanLangFlag 以命令与选项语法感知方式预扫描命令行中的 `--lang <v>` / `--lang=<v>`（末次覆盖语义），
+// 作为 ScanPreFlags 的薄包装供仅关心语言覆盖的调用方使用。
+func ScanLangFlag(args []string) (algebraic.Option[domi18n.Locale], error) {
+	res, err := ScanPreFlags(args)
+	if err != nil {
+		return algebraic.None[domi18n.Locale](), err
+	}
+	return res.Locale, nil
+}
+
+// HasJSONFlagForCommand 在已知子命令上下文 cmd 下，复用与 ScanPreFlags 相同的命令与带值选项词法状态机
+// 判断 args 是否声明了 CLI `--json`（兼容 `--json=true/false` 末次生效），
+// 专供各子命令语法报错早退路径使用，避免将 ssh/exec 远端命令或选项值中的 `--json` 误判为 JSON 输出模式。
+func HasJSONFlagForCommand(cmd string, args []string) bool {
+	var res PreScanResult
+	scanSubcommandPreInto(cmd, args, &res, nil)
+	return res.JSON
+}
+
+func scanSubcommandPreInto(cmd string, args []string, res *PreScanResult, firstErr *error) {
+	if cmd == "ssh" || cmd == "exec" {
+		scanSSHOrExecPre(args, cmd, res, firstErr)
+		return
+	}
+	scanGeneralSubcommandPre(args, cmd, res, firstErr)
+}
+
+func scanGlobalPrePrefix(args []string, res *PreScanResult, firstErr *error) (int, string, bool) {
 	for i := 0; i < len(args); i++ {
 		tok := args[i]
 		if tok == "--" {
-			return i + 1, "", true, nil
+			return i + 1, "", true
 		}
 		if tok == "-h" || tok == "--help" || tok == "-V" || tok == "--version" {
-			return i + 1, tok, false, nil
+			return i + 1, tok, false
 		}
 		if !strings.HasPrefix(tok, "-") || tok == "-" {
-			return i + 1, tok, false, nil
+			return i + 1, tok, false
 		}
-		skip, err := consumePrefixLangToken(args, i, found)
-		if err != nil {
-			return i, "", true, err
-		}
-		i += skip
+		i += consumePrefixPreToken(args, i, res, firstErr)
 	}
-	return len(args), "", true, nil
+	return len(args), "", true
 }
 
-func consumePrefixLangToken(args []string, idx int, found *algebraic.Option[domi18n.Locale]) (int, error) {
+func consumePrefixPreToken(args []string, idx int, res *PreScanResult, firstErr *error) int {
 	tok := args[idx]
 	if strings.HasPrefix(tok, "--") {
 		name, inlineVal, hasEq := SplitLongFlag(tok)
 		if name == "lang" {
-			return parseLangOptionAt(args, idx, inlineVal, hasEq, found)
+			return parseLangOptionAt(args, idx, inlineVal, hasEq, &res.Locale, firstErr)
+		}
+		if name == "json" {
+			applyJSONFlagToken(inlineVal, hasEq, &res.JSON)
+			return 0
 		}
 		if !hasEq && (name == "policy" || name == "ssh-config") {
-			return skipNextValue(args, idx), nil
+			return skipNextValue(args, idx)
 		}
-		return 0, nil
+		return 0
 	}
 	if tok == "-F" {
-		return skipNextValue(args, idx), nil
+		return skipNextValue(args, idx)
 	}
-	return 0, nil
+	return 0
 }
 
-func scanSSHOrExecLang(args []string, cmd string, found *algebraic.Option[domi18n.Locale]) error {
+func scanSSHOrExecPre(args []string, cmd string, res *PreScanResult, firstErr *error) {
 	for i := 0; i < len(args); i++ {
 		tok := args[i]
 		if tok == "--" || !strings.HasPrefix(tok, "-") || tok == "-" {
-			return nil
+			return
 		}
 		if strings.HasPrefix(tok, "--") {
-			skip, err := consumeSubcommandLongToken(args, i, cmd, found)
-			if err != nil {
-				return err
-			}
-			i += skip
+			i += consumeSubcommandLongToken(args, i, cmd, res, firstErr)
 			continue
 		}
 		i += skipShortClusterValue(args, i, cmd, tok[1:])
 	}
-	return nil
 }
 
-func scanGeneralSubcommandLang(args []string, cmd string, found *algebraic.Option[domi18n.Locale]) error {
+func scanGeneralSubcommandPre(args []string, cmd string, res *PreScanResult, firstErr *error) {
 	for i := 0; i < len(args); i++ {
 		tok := args[i]
 		if tok == "--" {
-			return nil
+			return
 		}
 		if !strings.HasPrefix(tok, "-") || tok == "-" {
 			continue
 		}
 		if strings.HasPrefix(tok, "--") {
-			skip, err := consumeSubcommandLongToken(args, i, cmd, found)
-			if err != nil {
-				return err
-			}
-			i += skip
+			i += consumeSubcommandLongToken(args, i, cmd, res, firstErr)
 			continue
 		}
 		i += skipShortClusterValue(args, i, cmd, tok[1:])
 	}
-	return nil
 }
 
-func consumeSubcommandLongToken(args []string, idx int, cmd string, found *algebraic.Option[domi18n.Locale]) (int, error) {
+func consumeSubcommandLongToken(args []string, idx int, cmd string, res *PreScanResult, firstErr *error) int {
 	name, inlineVal, hasEq := SplitLongFlag(args[idx])
 	if name == "lang" {
-		return parseLangOptionAt(args, idx, inlineVal, hasEq, found)
+		return parseLangOptionAt(args, idx, inlineVal, hasEq, &res.Locale, firstErr)
+	}
+	if name == "json" {
+		applyJSONFlagToken(inlineVal, hasEq, &res.JSON)
+		return 0
 	}
 	if !hasEq && isValueTakingLongFlag(cmd, name) {
-		return skipNextValue(args, idx), nil
+		return skipNextValue(args, idx)
 	}
-	return 0, nil
+	return 0
 }
 
-func parseLangOptionAt(args []string, idx int, inlineVal string, hasEq bool, found *algebraic.Option[domi18n.Locale]) (int, error) {
+func applyJSONFlagToken(inlineVal string, hasEq bool, dst *bool) {
+	if !hasEq {
+		*dst = true
+		return
+	}
+	switch strings.ToLower(strings.TrimSpace(inlineVal)) {
+	case "true", "1", "t", "yes":
+		*dst = true
+	case "false", "0", "f", "no":
+		*dst = false
+	}
+}
+
+func parseLangOptionAt(
+	args []string,
+	idx int,
+	inlineVal string,
+	hasEq bool,
+	found *algebraic.Option[domi18n.Locale],
+	firstErr *error,
+) int {
 	skip := 0
 	raw := inlineVal
 	if !hasEq {
 		if idx+1 >= len(args) {
-			return 0, i18n.EF(ErrUsage, i18n.KeyCLIMissingLongValue, i18n.Str("flag", "lang"))
+			recordFirstErr(firstErr, i18n.EF(ErrUsage, i18n.KeyCLIMissingLongValue, i18n.Str("flag", "lang")))
+			return 0
 		}
 		raw = args[idx+1]
 		skip = 1
 	}
 	loc, err := domi18n.ParseLocale(raw)
 	if err != nil {
-		return 0, i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--lang"), i18n.BoundStr("value", raw))
+		recordFirstErr(firstErr, i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--lang"), i18n.BoundStr("value", raw)))
+		return skip
 	}
 	*found = algebraic.Some(loc)
-	return skip, nil
+	return skip
+}
+
+func recordFirstErr(dst *error, err error) {
+	if dst != nil && *dst == nil {
+		*dst = err
+	}
 }
 
 func skipNextValue(args []string, idx int) int {
@@ -150,11 +206,16 @@ func skipNextValue(args []string, idx int) int {
 }
 
 // skipShortClusterValue 按 OpenSSH 短选项簇规则判断当前短标志是否需要消耗下一参数 token：
-// 遇到带值短标志且其后仍有紧贴字符时，余串即为参数值（不消耗下一 token）；
-// 位于短簇末尾时才消耗下一 token。
+//   - 遇到 `-h` 帮助短标志时立即短路（与各子命令解析器一致），停止后续字符的参数值消费，防止 `-hl --lang=...` 误吞 `--lang`；
+//   - 遇到带值短标志且其后仍有紧贴字符时，余串即为参数值（不消耗下一 token）；
+//   - 位于短簇末尾时才消耗下一 token。
 func skipShortClusterValue(args []string, idx int, cmd, cluster string) int {
 	for i := range len(cluster) {
-		if isValueTakingShortFlag(cmd, cluster[i]) {
+		ch := cluster[i]
+		if ch == 'h' {
+			return 0
+		}
+		if isValueTakingShortFlag(cmd, ch) {
 			if i+1 < len(cluster) {
 				return 0
 			}
@@ -178,7 +239,7 @@ func isValueTakingShortFlag(cmd string, ch byte) bool {
 		return ch == 'P' || ch == 'l' || ch == 'i' || ch == 'J' || ch == 'o' || ch == 'F'
 	case "sftp":
 		return ch == 'P' || isCommonSSHShortValue(ch)
-	case "config", "tui", "mcp":
+	case "config", "tui", "mcp", "creds", "cred", "vault", "audit":
 		return ch == 'F'
 	default:
 		return false

@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
@@ -30,24 +31,25 @@ type importArgs struct {
 
 // RunConfig 执行 `xops config` 命令族（`config import` 与 `config formats`，100% 零 v1 兼容代码）。
 func RunConfig(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, ConfigHelpText(rt.Loc()))
-		return clikit.ExitOK
+	d := rt.PrepareSubcommand("config", args, ConfigHelpText)
+	if d.Handled {
+		return d.ExitCode
 	}
-	switch args[0] {
+	rt, sub, rest := d.RT, d.Sub, d.Rest
+	switch sub {
 	case "import":
-		return runConfigImport(ctx, rt, args[1:])
+		return runConfigImport(ctx, rt, rest)
 	case "formats":
-		return runConfigFormats(ctx, rt, args[1:])
+		return runConfigFormats(ctx, rt, rest)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args[1:])), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "config"), i18n.BoundStr("sub", args[0])))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("config", rest)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "config"), i18n.BoundStr("sub", sub)))
 	}
 }
 
 func runConfigFormats(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, err := parseCommonOnly("formats", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("config", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, ConfigHelpText(rt.Loc()))
@@ -81,7 +83,7 @@ func runConfigFormats(ctx context.Context, rt *clikit.Runtime, args []string) in
 func runConfigImport(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseImportArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("config", args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, ConfigHelpText(rt.Loc()))
@@ -133,7 +135,7 @@ func executePlanImport(ctx context.Context, rt *clikit.Runtime, client clikit.In
 	}
 	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, view{OK: true, BaseRevision: preview.BaseRevision(), Report: rep}, func(w io.Writer) {
-		renderImportReportText(loc, w, "plan", preview.BaseRevision(), false, rep)
+		renderImportReportText(loc, w, i18n.KeyCLIConfigImportLabelPlan, preview.BaseRevision(), false, rep)
 	})
 }
 
@@ -154,14 +156,14 @@ func executeApplyImport(ctx context.Context, rt *clikit.Runtime, client clikit.I
 	return rt.WriteResult(jsonOut, view{
 		OK: true, Applied: res.Applied(), Revision: res.Revision(), Durability: res.Durability(), Report: rep,
 	}, func(w io.Writer) {
-		renderImportReportText(loc, w, "import", res.Revision(), res.Applied(), rep)
+		renderImportReportText(loc, w, i18n.KeyCLIConfigImportLabelImport, res.Revision(), res.Applied(), rep)
 	})
 }
 
-func renderImportReportText(loc *i18n.Localizer, w io.Writer, label string, rev engine.Revision, applied bool, rep inventory.ImportReport) {
+func renderImportReportText(loc *i18n.Localizer, w io.Writer, labelKey domi18n.MessageID, rev engine.Revision, applied bool, rep inventory.ImportReport) {
 	_, _ = fmt.Fprintln(w, loc.T(
 		i18n.KeyCLIConfigImportSummary,
-		i18n.Str("label", label),
+		i18n.BoundStr("label", loc.T(labelKey)),
 		i18n.BoundStr("format", rep.SourceFormat),
 		i18n.BoundStr("revision", rev.String()),
 		i18n.Bool("applied", applied),
@@ -174,7 +176,7 @@ func renderImportReportText(loc *i18n.Localizer, w io.Writer, label string, rev 
 		_, _ = fmt.Fprintf(w, "  [%s] %s/%s %s\n", entry.Action, entry.AssetKind, entry.AssetID, entry.Reason)
 	}
 	for _, warn := range rep.Warnings {
-		_, _ = fmt.Fprintf(w, "  [warn] %s (%s): %s\n", warn.Code(), warn.Subject(), warn.Message())
+		_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLIConfigImportWarnLine, i18n.BoundStr("code", warn.Code()), i18n.BoundStr("subject", warn.Subject()), i18n.BoundStr("message", warn.Message())))
 	}
 }
 

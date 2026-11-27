@@ -220,18 +220,10 @@ func renderBatchExecResult(rt *clikit.Runtime, rep engine.BatchExecReport, runEr
 }
 
 func writeBatchNodeResult(rt *clikit.Runtime, loc *i18n.Localizer, nr engine.BatchNodeResult, streamed bool) {
-	status := "ok"
-	if !nr.Succeeded() {
-		if nr.Outcome() != nil {
-			status = nr.Outcome().Kind().String()
-		} else {
-			status = "failed"
-		}
-	}
 	_, _ = fmt.Fprintln(rt.Stdout, loc.T(
 		i18n.KeyCLIExecBatchNodeHeader,
 		i18n.BoundStr("node", nr.NodeID().String()),
-		i18n.Str("status", status),
+		i18n.BoundStr("status", localizeBatchNodeStatus(loc, nr)),
 		i18n.Str("duration", nr.Duration().String()),
 	))
 	if !streamed && len(nr.Stdout()) > 0 {
@@ -242,6 +234,25 @@ func writeBatchNodeResult(rt *clikit.Runtime, loc *i18n.Localizer, nr engine.Bat
 	}
 	if nr.ErrorMessage() != "" {
 		rt.WriteErr(fmt.Sprintf("%s: %s", nr.NodeID(), nr.ErrorMessage()))
+	}
+}
+
+func localizeBatchNodeStatus(loc *i18n.Localizer, nr engine.BatchNodeResult) string {
+	if nr.Succeeded() {
+		return loc.T(i18n.KeyCLIExecStatusOK)
+	}
+	if nr.Outcome() == nil {
+		return loc.T(i18n.KeyCLIExecStatusFailed)
+	}
+	switch nr.Outcome().Kind() {
+	case execution.OutcomeKindNotStarted:
+		return loc.T(i18n.KeyCLIExecStatusNotStarted)
+	case execution.OutcomeKindCompleted:
+		return loc.T(i18n.KeyCLIExecStatusCompleted)
+	case execution.OutcomeKindUnknown:
+		return loc.T(i18n.KeyCLIExecStatusUnknown)
+	default:
+		return loc.T(i18n.KeyCLIExecStatusFailed)
 	}
 }
 

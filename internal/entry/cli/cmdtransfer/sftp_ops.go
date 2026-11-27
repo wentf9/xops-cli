@@ -48,7 +48,7 @@ func requireTargetAndRemotePath(parsed sftpArgs) (target string, rp pathalg.Remo
 	}
 	parsedPath, pErr := pathalg.ParseRemotePath(parsed.pos[1])
 	if pErr != nil {
-		return "", rp, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "remote path"), i18n.BoundStr("value", parsed.pos[1]))
+		return "", rp, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldRemotePath)), i18n.BoundStr("value", parsed.pos[1]))
 	}
 	return parsed.pos[0], parsedPath, nil
 }
@@ -273,11 +273,11 @@ func runSFTPRename(ctx context.Context, rt *clikit.Runtime, client clikit.Transf
 	}
 	oldPath, err := pathalg.ParseRemotePath(parsed.pos[1])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "old path"), i18n.BoundStr("value", parsed.pos[1])))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldOldPath)), i18n.BoundStr("value", parsed.pos[1])))
 	}
 	newPath, err := pathalg.ParseRemotePath(parsed.pos[2])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "new path"), i18n.BoundStr("value", parsed.pos[2])))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldNewPath)), i18n.BoundStr("value", parsed.pos[2])))
 	}
 	err = client.RenameRemoteFile(ctx, engine.RemoteRenameRequest{
 		RemoteCall: sftpRemoteCall(parsed.pos[0], parsed.cliOpts),
@@ -309,7 +309,7 @@ func runSFTPChmod(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 	}
 	rp, err := pathalg.ParseRemotePath(parsed.pos[2])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "remote path"), i18n.BoundStr("value", parsed.pos[2])))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldRemotePath)), i18n.BoundStr("value", parsed.pos[2])))
 	}
 	err = client.ChmodRemote(ctx, engine.RemotePathOpRequest{
 		RemoteCall: sftpRemoteCall(parsed.pos[0], parsed.cliOpts),
@@ -340,7 +340,7 @@ func runSFTPRecover(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 	}
 	tid, err := security.ParseOperationID(parsed.pos[1])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "transfer_id"), i18n.BoundStr("value", parsed.pos[1])))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldTransferID)), i18n.BoundStr("value", parsed.pos[1])))
 	}
 	res, err := client.RecoverTransfer(ctx, engine.RecoverTransferRequest{
 		RemoteCall:        sftpRemoteCall(parsed.pos[0], parsed.cliOpts),

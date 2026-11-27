@@ -51,7 +51,7 @@ type execArgs struct {
 func RunExec(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseExecArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("exec", args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, ExecHelpText(rt.Loc()))

@@ -52,7 +52,7 @@ func parseTagsCSV(raw string, dst *[]inventory.Tag) error {
 	for _, item := range clikit.SplitCSV(raw) {
 		tag, err := inventory.ParseTag(item)
 		if err != nil {
-			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "tag"), i18n.BoundStr("value", item))
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldTag)), i18n.BoundStr("value", item))
 		}
 		*dst = append(*dst, tag)
 	}
@@ -63,7 +63,7 @@ func parseAliasesCSV(raw string, dst *[]inventory.Alias) error {
 	for _, item := range clikit.SplitCSV(raw) {
 		a, err := inventory.ParseAlias(item)
 		if err != nil {
-			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "alias"), i18n.BoundStr("value", item))
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldAlias)), i18n.BoundStr("value", item))
 		}
 		*dst = append(*dst, a)
 	}

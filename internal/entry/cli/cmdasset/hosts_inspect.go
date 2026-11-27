@@ -24,7 +24,7 @@ type hostsResolveFlags struct {
 func runHostsResolve(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseHostsResolveFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
@@ -132,7 +132,7 @@ func renderResolvedTarget(rt *clikit.Runtime, res engine.ResolvedTarget, jsonOut
 func runHostsValidateDAG(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	common, err := parseCommonOnly("validate-dag", args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
@@ -170,7 +170,7 @@ type secretRefCheckFlags struct {
 func runHostsCheckSecretRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	f, err := parseSecretRefCheckFlags(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("hosts", args)), err)
 	}
 	if f.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))

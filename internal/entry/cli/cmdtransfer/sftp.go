@@ -37,13 +37,18 @@ type sftpArgs struct {
 
 // RunSFTP 执行 `xops sftp`：支持交互式 SFTP Shell（经 AppConfig.RunSFTPShell 回调注入）及全部单步远端 SFTP 子命令。
 func RunSFTP(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+	prefix, rest, err := clikit.ConsumeSubcommandPrefix(args)
+	if err != nil {
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(prefix.JSON || clikit.HasJSONFlagForCommand("sftp", args)), err)
+	}
+	rt = rt.WithPrefix(prefix)
+	if prefix.ShowHelp || len(rest) == 0 || rest[0] == "help" {
 		_, _ = io.WriteString(rt.Stdout, SFTPHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
-	parsed, err := parseSFTPArgs(args)
+	parsed, err := parseSFTPArgs(rest)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("sftp", rest)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, SFTPHelpText(rt.Loc()))
@@ -106,43 +111,63 @@ func isSFTPSubcommand(tok string) bool {
 	}
 }
 
+// parseSFTPArgs 在跳过全部前置通用标志与 SSH 选项（-P/-p/-l/-i/-J/-o/-F 等）后的首个非选项位置词上识别 SFTP 子命令，
+// 防止 `xops sftp --lang zh ls web /tmp` 或 `xops sftp -P 2222 ls web /tmp` 静默误路由为拨号名为 "ls" 的交互主机；
+// 显式 `--` 之后的全部参数均按普通位置参数保留，不触发子命令识别。
 func parseSFTPArgs(args []string) (sftpArgs, error) {
 	out := sftpArgs{
 		cliOpts:       option.UnsetOptionLayer(),
 		symlinkPolicy: pathalg.SymlinkReject,
 	}
-	rest := args
-	if isSFTPSubcommand(args[0]) {
-		out.sub = args[0]
-		rest = args[1:]
-	}
-	cur := clikit.NewFlagCursor(rest)
+	cur := clikit.NewFlagCursor(args)
 	for cur.HasNext() {
-		tok := cur.Peek()
-		if tok == "--" {
-			cur.Next()
-			out.pos = append(out.pos, cur.Rest()...)
-			break
-		}
-		if tok == "-h" || tok == "--help" {
-			out.common.ShowHelp = true
-			return out, nil
-		}
-		if !strings.HasPrefix(tok, "-") || tok == "-" {
-			out.pos = append(out.pos, cur.Next())
-			continue
-		}
-		if err := parseSFTPFlag(cur, &out); err != nil {
+		done, err := parseSFTPToken(cur, &out)
+		if err != nil {
 			return sftpArgs{}, err
 		}
 		if out.common.ShowHelp {
 			return out, nil
+		}
+		if done {
+			break
 		}
 	}
 	if err := out.cliOpts.Validate(); err != nil {
 		return sftpArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	return out, nil
+}
+
+func parseSFTPToken(cur *clikit.FlagCursor, out *sftpArgs) (bool, error) {
+	tok := cur.Peek()
+	if tok == "--" {
+		cur.Next()
+		out.pos = append(out.pos, cur.Rest()...)
+		return true, nil
+	}
+	if tok == "-h" || tok == "--help" {
+		out.common.ShowHelp = true
+		return true, nil
+	}
+	if !strings.HasPrefix(tok, "-") || tok == "-" {
+		return consumeSFTPPositional(cur.Next(), out), nil
+	}
+	return false, parseSFTPFlag(cur, out)
+}
+
+func consumeSFTPPositional(tok string, out *sftpArgs) bool {
+	if out.sub == "" && len(out.pos) == 0 {
+		if tok == "help" {
+			out.common.ShowHelp = true
+			return true
+		}
+		if isSFTPSubcommand(tok) {
+			out.sub = tok
+			return false
+		}
+	}
+	out.pos = append(out.pos, tok)
+	return false
 }
 
 func parseSFTPFlag(cur *clikit.FlagCursor, out *sftpArgs) error {

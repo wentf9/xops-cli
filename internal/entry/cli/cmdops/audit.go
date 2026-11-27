@@ -16,19 +16,20 @@ const defaultAuditListLimit = 50
 
 // RunAudit 执行 `xops audit` 命令族：reconcile（调用 Engine.ReconcileCrashedAudits）与 list/tail/inspect（经宿主只读钩子）。
 func RunAudit(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, AuditHelpText(rt.Loc()))
-		return clikit.ExitOK
+	d := rt.PrepareSubcommand("audit", args, AuditHelpText)
+	if d.Handled {
+		return d.ExitCode
 	}
-	switch args[0] {
+	rt, sub, rest := d.RT, d.Sub, d.Rest
+	switch sub {
 	case "reconcile":
-		return runAuditReconcile(ctx, rt, args[1:])
+		return runAuditReconcile(ctx, rt, rest)
 	case "list", "tail":
-		return runAuditQuery(ctx, rt, args[0], args[1:])
+		return runAuditQuery(ctx, rt, sub, rest)
 	case "inspect":
-		return runAuditInspect(ctx, rt, args[1:])
+		return runAuditInspect(ctx, rt, rest)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args[1:])), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "audit"), i18n.BoundStr("sub", args[0])))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("audit", rest)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "audit"), i18n.BoundStr("sub", sub)))
 	}
 }
 
@@ -38,7 +39,7 @@ func runAuditReconcile(ctx context.Context, rt *clikit.Runtime, args []string) i
 	for cur.HasNext() {
 		if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &common); err != nil || consumed {
 			if err != nil {
-				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("audit", args)), err)
 			}
 			continue
 		}
@@ -47,7 +48,7 @@ func runAuditReconcile(ctx context.Context, rt *clikit.Runtime, args []string) i
 			common.ShowHelp = true
 			break
 		}
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnexpectedArg, i18n.BoundStr("arg", tok)))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("audit", args)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnexpectedArg, i18n.BoundStr("arg", tok)))
 	}
 	if common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, AuditHelpText(rt.Loc()))
@@ -83,7 +84,7 @@ func runAuditQuery(ctx context.Context, rt *clikit.Runtime, sub string, args []s
 	for cur.HasNext() {
 		if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &common); err != nil || consumed {
 			if err != nil {
-				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("audit", args)), err)
 			}
 			continue
 		}
@@ -93,7 +94,7 @@ func runAuditQuery(ctx context.Context, rt *clikit.Runtime, sub string, args []s
 			break
 		}
 		if err := parseAuditQueryFlag(cur, tok, &req); err != nil {
-			return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+			return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("audit", args)), err)
 		}
 	}
 	if common.ShowHelp {
@@ -170,7 +171,7 @@ func runAuditInspect(ctx context.Context, rt *clikit.Runtime, args []string) int
 	for cur.HasNext() {
 		if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &common); err != nil || consumed {
 			if err != nil {
-				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+				return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("audit", args)), err)
 			}
 			continue
 		}
@@ -180,7 +181,7 @@ func runAuditInspect(ctx context.Context, rt *clikit.Runtime, args []string) int
 			break
 		}
 		if strings.HasPrefix(tok, "-") && tok != "-" {
-			return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok)))
+			return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("audit", args)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok)))
 		}
 		pos = append(pos, tok)
 	}

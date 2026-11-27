@@ -214,11 +214,11 @@ func splitAbsoluteAuditLocation(raw string) (pathalg.LocalDir, algebraic.Option[
 	}
 	rootDir, err := pathalg.ParseLocalDir(dirPart)
 	if err != nil {
-		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "policy.guardrail.audit_log dir"), i18n.BoundStr("path", raw))
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetAuditLogDir)), i18n.BoundStr("path", raw))
 	}
 	fileDest, err := pathalg.ParseLocalRootedDest(basePart)
 	if err != nil {
-		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "policy.guardrail.audit_log file"), i18n.BoundStr("path", raw))
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Msg("target", i18n.NewMessage(i18n.KeyCmdTargetAuditLogFile)), i18n.BoundStr("path", raw))
 	}
 	return rootDir, algebraic.Some(fileDest), nil
 }

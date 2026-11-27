@@ -36,13 +36,14 @@ type muxResponseView struct {
 
 // RunMux 执行 `xops mux` 子命令族：start / check(status) / forward / cancel / exit / stop / proxy / daemon。
 func RunMux(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, MuxHelpText(rt.Loc()))
-		return clikit.ExitOK
+	d := rt.PrepareSubcommand("mux", args, MuxHelpText)
+	if d.Handled {
+		return d.ExitCode
 	}
-	parsed, err := parseMuxArgs(args)
+	rt, sub, rest := d.RT, d.Sub, d.Rest
+	parsed, err := parseMuxArgs(sub, rest)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("mux", rest)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, MuxHelpText(rt.Loc()))
@@ -193,13 +194,13 @@ func renderMuxResponse(rt *clikit.Runtime, jsonOut bool, action engine.MuxContro
 	return code
 }
 
-func parseMuxArgs(args []string) (muxArgs, error) {
+func parseMuxArgs(sub string, args []string) (muxArgs, error) {
 	out := muxArgs{
-		sub:     args[0],
+		sub:     sub,
 		cliOpts: option.UnsetOptionLayer(),
 		tunMode: engine.TUNModePointToPoint,
 	}
-	cur := clikit.NewFlagCursor(args[1:])
+	cur := clikit.NewFlagCursor(args)
 	var pos []string
 	for cur.HasNext() {
 		tok := cur.Peek()

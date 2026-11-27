@@ -70,7 +70,7 @@ type scpDownloadView struct {
 func RunSCP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	parsed, err := parseSCPArgs(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlagForCommand("scp", args)), err)
 	}
 	if parsed.common.ShowHelp {
 		_, _ = io.WriteString(rt.Stdout, SCPHelpText(rt.Loc()))
@@ -102,7 +102,7 @@ func runSCPUpload(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 	}
 	remotePath, err := pathalg.ParseRemotePath(remoteRaw)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "remote destination path"), i18n.BoundStr("value", remoteRaw)))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldRemoteDestPath)), i18n.BoundStr("value", remoteRaw)))
 	}
 	res, err := client.SCPUpload(ctx, engine.SCPUploadRequest{
 		RemoteCall: engine.RemoteCall{
@@ -158,7 +158,7 @@ func runSCPDownload(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 	}
 	remotePath, err := pathalg.ParseRemotePath(remoteRaw)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "remote source path"), i18n.BoundStr("value", remoteRaw)))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldRemoteSourcePath)), i18n.BoundStr("value", remoteRaw)))
 	}
 	localRoot, localDest, err := resolveDownloadTarget(rt, parsed.localRoot, localRaw, remotePath)
 	if err != nil {
@@ -234,7 +234,7 @@ func buildUploadSource(rt *clikit.Runtime, parsed scpArgs, localRaw string) (src
 	}
 	srcPath, pErr := pathalg.ParseLocalSourcePath(localRaw)
 	if pErr != nil {
-		return src, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local source path"), i18n.BoundStr("value", localRaw))
+		return src, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalSourcePath)), i18n.BoundStr("value", localRaw))
 	}
 	return engine.NewOperatorUploadSource(srcPath, parsed.symlinkPolicy)
 }
@@ -252,18 +252,18 @@ func resolveScopedRecursiveUploadSource(rt *clikit.Runtime, localRaw string) (ro
 		}
 		d, dErr := pathalg.ParseLocalRootedDest(wdSrc.Base())
 		if dErr != nil {
-			return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local relative path"), i18n.BoundStr("value", wdSrc.Base()))
+			return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalRelPath)), i18n.BoundStr("value", wdSrc.Base()))
 		}
 		return wdSrc.Dir(), d, nil
 	}
 	srcPath, pErr := pathalg.ParseLocalSourcePath(trimmed)
 	if pErr != nil {
-		return root, rel, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local source path"), i18n.BoundStr("value", localRaw))
+		return root, rel, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalSourcePath)), i18n.BoundStr("value", localRaw))
 	}
 	if srcPath.IsAbs() {
 		d, dErr := pathalg.ParseLocalRootedDest(srcPath.Base())
 		if dErr != nil {
-			return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local directory name"), i18n.BoundStr("value", srcPath.Base()))
+			return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalDirName)), i18n.BoundStr("value", srcPath.Base()))
 		}
 		return srcPath.Dir(), d, nil
 	}
@@ -273,7 +273,7 @@ func resolveScopedRecursiveUploadSource(rt *clikit.Runtime, localRaw string) (ro
 	}
 	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(srcPath.String()))
 	if dErr != nil {
-		return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local relative path"), i18n.BoundStr("value", localRaw))
+		return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalRelPath)), i18n.BoundStr("value", localRaw))
 	}
 	return wd, d, nil
 }
@@ -300,12 +300,12 @@ func resolveDownloadTarget(rt *clikit.Runtime, rootOpt algebraic.Option[pathalg.
 	}
 	src, pErr := pathalg.ParseLocalSourcePath(trimmed)
 	if pErr != nil {
-		return root, dest, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local destination path"), i18n.BoundStr("value", localRaw))
+		return root, dest, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalDestPath)), i18n.BoundStr("value", localRaw))
 	}
 	if src.IsAbs() {
 		d, dErr := pathalg.ParseLocalRootedDest(src.Base())
 		if dErr != nil {
-			return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local destination filename"), i18n.BoundStr("value", src.Base()))
+			return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalDestFilename)), i18n.BoundStr("value", src.Base()))
 		}
 		return src.Dir(), d, nil
 	}
@@ -315,7 +315,7 @@ func resolveDownloadTarget(rt *clikit.Runtime, rootOpt algebraic.Option[pathalg.
 	}
 	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(src.String()))
 	if dErr != nil {
-		return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local relative path"), i18n.BoundStr("value", src.String()))
+		return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalRelPath)), i18n.BoundStr("value", src.String()))
 	}
 	return wd, d, nil
 }
@@ -327,7 +327,7 @@ func resolveRootedDownload(fixedRoot pathalg.LocalDir, localRaw string, remotePa
 	}
 	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(relRaw))
 	if dErr != nil {
-		return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local destination relative path"), i18n.BoundStr("value", localRaw))
+		return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Msg("field", i18n.NewMessage(i18n.KeyCLIFieldLocalDestRelPath)), i18n.BoundStr("value", localRaw))
 	}
 	return fixedRoot, d, nil
 }
