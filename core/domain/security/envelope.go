@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -60,10 +60,10 @@ type ApprovalEnvelope struct {
 func NewApprovalNonceFrom(entropy io.Reader) ([approvalNonceBytes]byte, error) {
 	raw, err := readExact16Bytes(entropy)
 	if err != nil {
-		return [approvalNonceBytes]byte{}, fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, err)
+		return [approvalNonceBytes]byte{}, domi18n.WrapSentinel(ErrInvalidApprovalEnvelope, err)
 	}
 	if isAllZero16(raw) {
-		return [approvalNonceBytes]byte{}, fmt.Errorf("%w: 审批 Nonce 不能为全零", ErrInvalidApprovalEnvelope)
+		return [approvalNonceBytes]byte{}, domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonZeroEntropy)
 	}
 	return raw, nil
 }
@@ -84,21 +84,21 @@ func NewApprovalEnvelope(spec ApprovalEnvelopeSpec) (ApprovalEnvelope, error) {
 func validateApprovalSpec(spec ApprovalEnvelopeSpec) error {
 	switch {
 	case !spec.OperationID.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, ErrInvalidOperationID)
+		return domi18n.WrapSentinel(ErrInvalidApprovalEnvelope, ErrInvalidOperationID)
 	case !spec.Binding.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, ErrInvalidOperationBinding)
+		return domi18n.WrapSentinel(ErrInvalidApprovalEnvelope, ErrInvalidOperationBinding)
 	case !spec.Risk.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, ErrInvalidRiskLevel)
+		return domi18n.WrapSentinel(ErrInvalidApprovalEnvelope, ErrInvalidRiskLevel)
 	case spec.Decision == nil || !spec.Decision.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, ErrInvalidDecision)
+		return domi18n.WrapSentinel(ErrInvalidApprovalEnvelope, ErrInvalidDecision)
 	case !decisionMatchesEnvelopeRisk(spec.Decision, spec.Risk):
-		return fmt.Errorf("%w: 信封风险与审批决策风险不一致", ErrInvalidApprovalEnvelope)
+		return domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "risk"))
 	case !hasVisibleSummary(spec.ScopeSummary):
-		return fmt.Errorf("%w: scope_summary 必须包含有效可见 UTF-8 内容", ErrInvalidApprovalEnvelope)
+		return domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "scope_summary"))
 	case !isValidApprovalWindow(spec.IssuedAt.UTC().Round(0), spec.TTL) || isAllZero16(spec.Nonce):
-		return fmt.Errorf("%w: issued_at/ttl 越界溢出或 nonce 全零", ErrInvalidApprovalEnvelope)
+		return domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "issued_at/ttl/nonce"))
 	case optInvalid(spec.PolicyDigest):
-		return fmt.Errorf("%w: policy_digest 不可为无效零值", ErrInvalidApprovalEnvelope)
+		return domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "policy_digest"))
 	}
 	return nil
 }
@@ -316,11 +316,11 @@ func decodeApprovalEnvelopeWire(w approvalEnvelopeWire) (ApprovalEnvelopeSpec, e
 	ttl, okT := w.TTL.Get()
 	nonceHex, okN := w.Nonce.Get()
 	if !okID || !okB || !okR || !okD || !okS || !okI || !okT || !okN {
-		return ApprovalEnvelopeSpec{}, fmt.Errorf("%w: 缺少必需的审批信封字段", ErrInvalidApprovalEnvelope)
+		return ApprovalEnvelopeSpec{}, domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "approval_envelope"))
 	}
 	decision, err := decodeDecisionWire(dw)
 	if err != nil {
-		return ApprovalEnvelopeSpec{}, fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, err)
+		return ApprovalEnvelopeSpec{}, domi18n.WrapSentinel(ErrInvalidApprovalEnvelope, err)
 	}
 	nonce, err := parseApprovalNonceHex(nonceHex)
 	if err != nil {
@@ -332,7 +332,7 @@ func decodeApprovalEnvelopeWire(w approvalEnvelopeWire) (ApprovalEnvelopeSpec, e
 func parseApprovalNonceHex(raw string) ([approvalNonceBytes]byte, error) {
 	var out [approvalNonceBytes]byte
 	if len(raw) != approvalNonceHexLen || !isLowerHexString(raw) {
-		return out, fmt.Errorf("%w: 非法 nonce 编码 %q", ErrInvalidApprovalEnvelope, raw)
+		return out, domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "nonce"), domi18n.BoundStr("value", raw))
 	}
 	_, err := hex.Decode(out[:], []byte(raw))
 	return out, err

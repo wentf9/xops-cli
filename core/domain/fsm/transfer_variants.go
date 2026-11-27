@@ -1,9 +1,8 @@
 package fsm
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -101,13 +100,13 @@ type TransferDest struct {
 // NewUploadDest 与 NewDownloadDest 分别校验远端绝对路径与本机受限根目录相对目标，构造不可变 TransferDest。
 func NewUploadDest(remote pathalg.RemotePath) (TransferDest, error) {
 	if !remote.IsValid() {
-		return TransferDest{}, fmt.Errorf("%w: 上传目标 RemotePath 无效", ErrInvalidContext)
+		return TransferDest{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	return TransferDest{direction: TransferDirectionUpload, remote: remote, valid: true}, nil
 }
 func NewDownloadDest(local pathalg.LocalRootedDest) (TransferDest, error) {
 	if !local.IsValid() {
-		return TransferDest{}, fmt.Errorf("%w: 下载目标 LocalRootedDest 无效", ErrInvalidContext)
+		return TransferDest{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_dest"))
 	}
 	return TransferDest{direction: TransferDirectionDownload, local: local, valid: true}, nil
 }
@@ -167,13 +166,13 @@ type (
 // NewTransferMeta 校验传输标识、方向感知目标、总大小（<= 10 GiB）、可选预期摘要、Journal 版本与世代号（>= 1）。
 func NewTransferMeta(spec TransferMetaSpec) (TransferMeta, error) {
 	if spec.TotalBytes > MaxTransferBytes {
-		return TransferMeta{}, fmt.Errorf("%w: total_bytes=%d 超出 10 GiB 上限 %d", ErrTransferSizeExceeded, spec.TotalBytes, MaxTransferBytes)
+		return TransferMeta{}, domi18n.EF(ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "total_bytes"), domi18n.Uint64("size", spec.TotalBytes), domi18n.Uint64("limit", MaxTransferBytes))
 	}
 	if d, ok := spec.ExpectedDigest.Get(); ok && !d.IsValid() {
-		return TransferMeta{}, fmt.Errorf("%w: expected_digest 存在时必须有效", ErrInvalidContext)
+		return TransferMeta{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "expected_digest"))
 	}
 	if !spec.TransferID.IsValid() || !spec.Dest.IsValid() || !spec.JournalVersion.IsValid() || spec.Generation == 0 {
-		return TransferMeta{}, fmt.Errorf("%w: transfer_id/dest/journal_version/generation(>=1) 均须有效", ErrInvalidContext)
+		return TransferMeta{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "transfer_meta"))
 	}
 	return TransferMeta{spec.TransferID, spec.Dest, spec.TotalBytes, spec.ExpectedDigest, spec.JournalVersion, spec.Generation, true}, nil
 }

@@ -1,9 +1,10 @@
 package option
 
 import (
-	"fmt"
 	"slices"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const allowedPathPercentTokens = "%CdhijLlnpru"
@@ -46,10 +47,10 @@ type PathEntry struct {
 func ParsePathEntry(raw string) (PathEntry, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" || len(t) > maxTokenLen || isNoneKeyword(t) {
-		return PathEntry{}, fmt.Errorf("%w: 路径 %q 非法或为保留字 none", ErrInvalidPathList, raw)
+		return PathEntry{}, domi18n.EF(ErrInvalidPathList, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "path"), domi18n.BoundStr("value", raw))
 	}
 	if err := validateTemplateTokens(t, allowedPathPercentTokens, true); err != nil {
-		return PathEntry{}, fmt.Errorf("%w: 路径占位符非法: %w", ErrInvalidPathList, err)
+		return PathEntry{}, domi18n.WrapS(ErrInvalidPathList, err, domi18n.KeyOptionTemplateInvalid, domi18n.Str("option", "PathEntry"))
 	}
 	kind := PathEntryLiteral
 	if strings.ContainsRune(t, '%') || strings.Contains(t, "${") {
@@ -79,7 +80,7 @@ func dedupPathEntries(entries []PathEntry) ([]PathEntry, error) {
 	items := make([]PathEntry, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsValid() {
-			return nil, fmt.Errorf("%w: 包含无效 PathEntry", ErrInvalidPathList)
+			return nil, domi18n.EF(ErrInvalidPathList, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "path_entry"))
 		}
 		if !slices.Contains(items, e) {
 			items = append(items, e)
@@ -119,11 +120,11 @@ func parsePathTokens(rawItems []string, allowMixedNone bool) (PathListState, []P
 func parseOnePathToken(raw string, allowMixedNone bool, total int) (PathEntry, bool, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" {
-		return PathEntry{}, false, fmt.Errorf("%w: 路径项 %q 非法或为空", ErrInvalidPathList, raw)
+		return PathEntry{}, false, domi18n.EF(ErrInvalidPathList, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "path"), domi18n.BoundStr("value", raw))
 	}
 	if isNoneKeyword(t) {
 		if !allowMixedNone && total > 1 {
-			return PathEntry{}, false, fmt.Errorf("%w: none 必须单独出现", ErrInvalidPathList)
+			return PathEntry{}, false, domi18n.EF(ErrInvalidPathList, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "path"), domi18n.Str("value", "none"))
 		}
 		return PathEntry{}, true, nil
 	}

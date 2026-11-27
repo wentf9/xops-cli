@@ -1,12 +1,12 @@
 package playbook
 
 import (
-	"fmt"
 	"io"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 )
 
@@ -22,14 +22,14 @@ const (
 // 当显式指定 Profile 时同步委托 execution.NewCommandPlan 验证方言/引用/命令行长度等全部不变量。
 func NewStepShell(spec StepShellSpec) (*StepShell, error) {
 	if spec.Command == "" || len(spec.Command) > maxCommandBytes || hasForbiddenCommandText(spec.Command) || !hasVisibleText(spec.Command) {
-		return nil, fmt.Errorf("%w: shell.command 不能为空、超长或含非法控制/Cf 字符", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "shell.command"))
 	}
 	if err := validateExecOptions(spec.Profile, spec.WorkDir, spec.Timeout, false); err != nil {
 		return nil, err
 	}
 	env, err := canonicalizeKVMap(spec.Env, maxEnvCount, maxEnvValBytes, isValidEnvKey, false)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidStepAction, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidStepAction, err)
 	}
 	if err := validateShellPlan(spec); err != nil {
 		return nil, err
@@ -41,7 +41,7 @@ func NewStepShell(spec StepShellSpec) (*StepShell, error) {
 // 当显式指定 Profile 时同步委托 execution.NewCommandPlan 与对应方言参数引用规则校验全量组合合法性。
 func NewStepScript(spec StepScriptSpec) (*StepScript, error) {
 	if !spec.Source.IsValid() || !spec.SymlinkPolicy.IsValid() {
-		return nil, fmt.Errorf("%w: script.source 与 symlink_policy 必须有效", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "script.source/symlink_policy"))
 	}
 	if err := validateExecOptions(spec.Profile, spec.WorkDir, spec.Timeout, true); err != nil {
 		return nil, err
@@ -52,7 +52,7 @@ func NewStepScript(spec StepScriptSpec) (*StepScript, error) {
 	}
 	env, err := canonicalizeKVMap(spec.Env, maxEnvCount, maxEnvValBytes, isValidEnvKey, false)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidStepAction, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidStepAction, err)
 	}
 	if err := validateScriptPlan(spec, args); err != nil {
 		return nil, err
@@ -75,7 +75,7 @@ func NewStepTemplate(spec StepTemplateSpec) (*StepTemplate, error) {
 	}
 	vars, err := canonicalizeKVMap(spec.Vars, maxVarsCount, maxVarValBytes, isValidVarKey, true)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidStepAction, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidStepAction, err)
 	}
 	return &StepTemplate{source: spec.Source, symlinkPolicy: spec.SymlinkPolicy, dest: spec.Dest, vars: vars, mode: spec.Mode, overwrite: spec.Overwrite, atomic: spec.Atomic, valid: true}, nil
 }
@@ -83,7 +83,7 @@ func NewStepTemplate(spec StepTemplateSpec) (*StepTemplate, error) {
 // NewStepEnsure 校验 Check（仅 shell/script）与 Action（严禁嵌套 *StepEnsure）并构造 *StepEnsure。
 func NewStepEnsure(spec StepEnsureSpec) (*StepEnsure, error) {
 	if spec.MaxRetries > MaxEnsureRetries {
-		return nil, fmt.Errorf("%w: ensure.max_retries=%d 超出上限 %d", ErrInvalidStepAction, spec.MaxRetries, MaxEnsureRetries)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "ensure.max_retries"), domi18n.Uint64("value", uint64(spec.MaxRetries)), domi18n.Uint64("max", uint64(MaxEnsureRetries)))
 	}
 	check, err := validateEnsureBranch(spec.Check, true)
 	if err != nil {
@@ -105,7 +105,7 @@ func validateEnsureBranch(a StepAction, checkOnly bool) (StepAction, error) {
 		return mustCloneValidAction(v), nil
 	case *StepCopy, *StepTemplate:
 		if checkOnly {
-			return nil, fmt.Errorf("%w: 不允许使用 %s 作为 ensure.check", ErrInvalidEnsureCheck, v.Kind())
+			return nil, domi18n.EF(ErrInvalidEnsureCheck, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ensure.check"), domi18n.Str("value", v.Kind().String()))
 		}
 		return mustCloneValidAction(v), nil
 	case *StepEnsure:
@@ -249,17 +249,17 @@ func mustCloneValidAction(a StepAction) StepAction {
 func validateExecOptions(prof algebraic.Option[execution.LaunchProfile], wd algebraic.Option[pathalg.RemotePath], to algebraic.Option[algebraic.Duration], isScript bool) error {
 	if p, ok := prof.Get(); ok {
 		if !p.IsValid() {
-			return fmt.Errorf("%w: profile 无效", ErrInvalidStepAction)
+			return domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "profile"))
 		}
 		if isScript && (p.Interpreter() == execution.InterpreterServer || p.Interpreter() == execution.InterpreterCmd) {
-			return fmt.Errorf("%w: script 步骤仅支持 POSIX 或 PowerShell 显式解释器", ErrInvalidStepAction)
+			return domi18n.EF(ErrInvalidStepAction, domi18n.KeyExecutionScriptInterpreter)
 		}
 	}
 	if w, ok := wd.Get(); ok && !w.IsValid() {
-		return fmt.Errorf("%w: work_dir 无效", ErrInvalidStepAction)
+		return domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "work_dir"))
 	}
 	if d, ok := to.Get(); ok && !d.IsPositive() {
-		return fmt.Errorf("%w: timeout 必须为正时长", ErrInvalidStepAction)
+		return domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "timeout"))
 	}
 	return nil
 }
@@ -272,7 +272,7 @@ func validateShellPlan(spec StepShellSpec) error {
 	if _, err := execution.NewCommandPlan(execution.CommandPlanSpec{
 		Kind: execution.PlanKindCommand, Profile: p, Command: spec.Command, WorkDir: spec.WorkDir, Env: spec.Env, Timeout: spec.Timeout,
 	}); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidStepAction, err)
+		return domi18n.WrapSentinel(ErrInvalidStepAction, err)
 	}
 	return nil
 }
@@ -286,7 +286,7 @@ func validateScriptPlan(spec StepScriptSpec, args []string) error {
 		Kind: execution.PlanKindScript, Profile: p, Command: "true", Argv: args,
 		WorkDir: spec.WorkDir, Env: spec.Env, Timeout: spec.Timeout,
 	}); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidStepAction, err)
+		return domi18n.WrapSentinel(ErrInvalidStepAction, err)
 	}
 	return nil
 }
@@ -296,12 +296,12 @@ func validateArgs(raw []string) ([]string, error) {
 		return nil, nil
 	}
 	if len(raw) > maxArgsCount {
-		return nil, fmt.Errorf("%w: args 数量 %d 超出上限 %d", ErrInvalidStepAction, len(raw), maxArgsCount)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "args"), domi18n.Int("count", len(raw)), domi18n.Int("limit", maxArgsCount))
 	}
 	out := make([]string, len(raw))
 	for i, arg := range raw {
 		if len(arg) > maxArgBytes || hasForbiddenStrictText(arg) {
-			return nil, fmt.Errorf("%w: args[%d] 超长或包含非法字符", ErrInvalidStepAction, i)
+			return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "args"), domi18n.Int("index", i))
 		}
 		out[i] = arg
 	}
@@ -310,10 +310,10 @@ func validateArgs(raw []string) ([]string, error) {
 
 func validateTransferTargets(src pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy, dest pathalg.RemotePath, mode algebraic.Option[FileMode]) error {
 	if !src.IsValid() || !policy.IsValid() || !dest.IsValid() {
-		return fmt.Errorf("%w: source/symlink_policy/dest 必须均有效", ErrInvalidStepAction)
+		return domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "source/symlink_policy/dest"))
 	}
 	if m, ok := mode.Get(); ok && !m.IsValid() {
-		return fmt.Errorf("%w: %w", ErrInvalidStepAction, ErrInvalidFileMode)
+		return domi18n.WrapSentinel(ErrInvalidStepAction, ErrInvalidFileMode)
 	}
 	return nil
 }

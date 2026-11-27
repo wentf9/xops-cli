@@ -2,9 +2,9 @@ package inventory
 
 import (
 	"cmp"
-	"fmt"
 	"slices"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
@@ -116,7 +116,7 @@ func EmptyGraph() Graph { return Graph{valid: true} }
 // 仅 spec.MaxJumpDepth == 0 时采用 DefaultMaxJumpDepth，负数严格失败关闭。
 func NewGraph(spec GraphSpec) (Graph, error) {
 	if spec.MaxJumpDepth < 0 {
-		return Graph{}, fmt.Errorf("%w: MaxJumpDepth=%d 不能为负数", ErrInvalidGraph, spec.MaxJumpDepth)
+		return Graph{}, domi18n.EF(ErrInvalidGraph, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "max_jump_depth"))
 	}
 	hosts, hostSet, err := validateUniqueHosts(spec.Hosts)
 	if err != nil {
@@ -161,7 +161,7 @@ func validateUniqueHosts(raw []Host) ([]Host, map[HostID]bool, error) {
 		}
 		s := a.String()
 		if hostSet[HostID{assetIDToken{s}}] || seenAlias[s] {
-			return nil, nil, fmt.Errorf("%w: Host.Alias %q 与已有 HostID 或 Host.Alias 冲突", ErrDuplicateAssetID, s)
+			return nil, nil, domi18n.EF(ErrDuplicateAssetID, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "host.alias"), domi18n.BoundStr("value", s))
 		}
 		seenAlias[s] = true
 	}
@@ -170,10 +170,10 @@ func validateUniqueHosts(raw []Host) ([]Host, map[HostID]bool, error) {
 func validateAndSortNodes(raw []Node, hosts map[HostID]bool, idents map[IdentityID]bool) ([]Node, error) {
 	for i, n := range raw {
 		if !n.IsValid() {
-			return nil, fmt.Errorf("%w: nodes[%d] 无效", ErrInvalidNode, i)
+			return nil, domi18n.EF(ErrInvalidNode, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "nodes"), domi18n.Int("index", i))
 		}
 		if !hosts[n.hostRef] || !idents[n.identityRef] {
-			return nil, fmt.Errorf("%w: 节点 %q 引用不存在的 Host/Identity", ErrMissingAssetRef, n.id)
+			return nil, domi18n.EF(ErrMissingAssetRef, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "node"), domi18n.BoundStr("value", n.id.String()))
 		}
 	}
 	out := slices.Clone(raw)
@@ -185,7 +185,7 @@ func canonicalizeStores(raw []string) ([]string, error) {
 		return nil, nil
 	}
 	if slices.ContainsFunc(raw, func(s string) bool { return s == "" || len(s) > maxIDLen || hasSpaceOrForbidden(s) }) {
-		return nil, fmt.Errorf("%w: 包含非法凭据存储名", ErrInvalidGraph)
+		return nil, domi18n.EF(ErrInvalidGraph, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "known_stores"))
 	}
 	out := slices.Clone(raw)
 	slices.Sort(out)
@@ -272,7 +272,7 @@ func (g Graph) ValidateSecretStores(knownStores []string, extraPending ...Pendin
 	}
 	for _, sr := range all {
 		if !slices.Contains(knownStores, sr.Ref.Store()) {
-			return fmt.Errorf("%w: %s (%s) 引用了未注册存储 %q", ErrUnknownSecretStore, sr.OwnerID, sr.Location, sr.Ref.Store())
+			return domi18n.EF(ErrUnknownSecretStore, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "secret_store"), domi18n.BoundStr("value", sr.Ref.Store()))
 		}
 	}
 	return nil

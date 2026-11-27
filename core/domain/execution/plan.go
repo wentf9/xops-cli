@@ -4,13 +4,13 @@ import (
 	"cmp"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"maps"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -39,7 +39,7 @@ func ParsePlanKind(raw string) (PlanKind, error) {
 			return PlanKindScript, nil
 		}
 	}
-	return PlanKindInvalid, fmt.Errorf("%w: %q", ErrInvalidPlanKind, raw)
+	return PlanKindInvalid, domi18n.EF(ErrInvalidPlanKind, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "plan_kind"), domi18n.BoundStr("value", raw))
 }
 
 // IsValid 报告 k 是否为合法计划类型。
@@ -136,19 +136,19 @@ func NewCommandPlan(spec CommandPlanSpec) (CommandPlan, error) {
 func validateCommandPlanHeader(spec CommandPlanSpec) error {
 	switch {
 	case !spec.Kind.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidCommandPlan, ErrInvalidPlanKind)
+		return domi18n.WrapSentinel(ErrInvalidCommandPlan, ErrInvalidPlanKind)
 	case !spec.Profile.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidCommandPlan, ErrInvalidLaunchProfile)
+		return domi18n.WrapSentinel(ErrInvalidCommandPlan, ErrInvalidLaunchProfile)
 	case spec.Kind == PlanKindScript && (spec.Profile.Interpreter() == InterpreterServer || spec.Profile.Interpreter() == InterpreterCmd):
-		return fmt.Errorf("%w: 脚本计划仅支持 POSIX 或 PowerShell 显式解释器", ErrUnsupportedExecutionCombination)
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionScriptInterpreter)
 	case spec.Kind == PlanKindScript && spec.PTY:
-		return fmt.Errorf("%w: 脚本计划经 stdin 投递正文，禁止同时启用 PTY", ErrUnsupportedExecutionCombination)
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionScriptPTYForbidden)
 	}
 	if wd, ok := spec.WorkDir.Get(); ok && !wd.IsValid() {
-		return fmt.Errorf("%w: work_dir 不可为无效 RemotePath", ErrInvalidCommandPlan)
+		return domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "work_dir"))
 	}
 	if d, ok := spec.Timeout.Get(); ok && !d.IsPositive() {
-		return fmt.Errorf("%w: timeout 必须为正时长", ErrInvalidCommandPlan)
+		return domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "timeout"))
 	}
 	return nil
 }
@@ -159,7 +159,7 @@ func validateCommandPayload(kind PlanKind, cmd string, rawArgv []string) ([]stri
 	}
 	hasCmd, hasArgv := cmd != "", len(rawArgv) > 0
 	if hasCmd == hasArgv {
-		return nil, fmt.Errorf("%w: command 与 argv 必须二选一且非空", ErrInvalidCommandPlan)
+		return nil, domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "command, argv"))
 	}
 	if hasCmd {
 		if err := validateCommandText(cmd); err != nil {
@@ -168,14 +168,14 @@ func validateCommandPayload(kind PlanKind, cmd string, rawArgv []string) ([]stri
 		return nil, nil
 	}
 	if rawArgv[0] == "" {
-		return nil, fmt.Errorf("%w: argv[0] 不能为空", ErrInvalidCommandPlan)
+		return nil, domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "argv[0]"))
 	}
 	return cloneAndValidateArgv(rawArgv)
 }
 
 func validateScriptPayload(script string, rawArgv []string) ([]string, error) {
 	if script == "" {
-		return nil, fmt.Errorf("%w: script 计划必须提供非空脚本文本 command", ErrInvalidCommandPlan)
+		return nil, domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "command"))
 	}
 	if err := validateCommandText(script); err != nil {
 		return nil, err
@@ -188,19 +188,19 @@ func validateScriptPayload(script string, rawArgv []string) ([]string, error) {
 
 func validateCommandText(cmd string) error {
 	if len(cmd) > maxCommandBytes || hasForbiddenCommandText(cmd) {
-		return fmt.Errorf("%w: command 超长或包含非法 UTF-8/NUL/控制/Cf 字符", ErrInvalidCommandPlan)
+		return domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "command"))
 	}
 	return nil
 }
 
 func cloneAndValidateArgv(rawArgv []string) ([]string, error) {
 	if len(rawArgv) > maxArgvCount {
-		return nil, fmt.Errorf("%w: argv 数量 %d 超过上限 %d", ErrInvalidCommandPlan, len(rawArgv), maxArgvCount)
+		return nil, domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "argv"), domi18n.Int("count", len(rawArgv)), domi18n.Int("limit", maxArgvCount))
 	}
 	out := make([]string, len(rawArgv))
 	for i, arg := range rawArgv {
 		if len(arg) > maxArgBytes || hasForbiddenCommandText(arg) {
-			return nil, fmt.Errorf("%w: argv[%d] 超长或包含非法字符", ErrInvalidCommandPlan, i)
+			return nil, domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "argv"), domi18n.Int("index", i))
 		}
 		out[i] = arg
 	}
@@ -212,16 +212,16 @@ func canonicalizeEnvMap(raw map[string]string) ([]envEntry, error) {
 		return nil, nil
 	}
 	if len(raw) > maxEnvCount {
-		return nil, fmt.Errorf("%w: 环境变量数量 %d 超过上限 %d", ErrInvalidEnvVar, len(raw), maxEnvCount)
+		return nil, domi18n.EF(ErrInvalidEnvVar, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "env"), domi18n.Int("count", len(raw)), domi18n.Int("limit", maxEnvCount))
 	}
 	out := make([]envEntry, 0, len(raw))
 	for _, k := range slices.Sorted(maps.Keys(raw)) {
 		v := raw[k]
 		if !isValidEnvKey(k) {
-			return nil, fmt.Errorf("%w: 非法环境变量名 %q", ErrInvalidEnvVar, k)
+			return nil, domi18n.EF(ErrInvalidEnvVar, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "env"), domi18n.BoundStr("value", k))
 		}
 		if len(v) > maxEnvValBytes || hasForbiddenStrictText(v) {
-			return nil, fmt.Errorf("%w: 环境变量 %q 的值超长或包含非法字符", ErrInvalidEnvVar, k)
+			return nil, domi18n.EF(ErrInvalidEnvVar, domi18n.KeyCommonInvalidTextChars, domi18n.BoundStr("field", k))
 		}
 		out = append(out, envEntry{key: k, value: v})
 	}
@@ -234,7 +234,7 @@ func resolveMaxOutputBytes(opt algebraic.Option[uint64]) (uint64, error) {
 		return DefaultMaxOutputBytes, nil
 	}
 	if v == 0 || v > MaxAllowedOutputBytes {
-		return 0, fmt.Errorf("%w: max_output_bytes=%d 必须落在 [1, %d]", ErrInvalidCommandPlan, v, MaxAllowedOutputBytes)
+		return 0, domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonFieldRange, domi18n.Str("field", "max_output_bytes"), domi18n.Uint64("value", v), domi18n.Int("min", 1), domi18n.Uint64("max", MaxAllowedOutputBytes))
 	}
 	return v, nil
 }
@@ -397,7 +397,7 @@ func (p *CommandPlan) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		kind, okK := w.Kind.Get()
 		profile, okP := w.Profile.Get()
 		if !okK || !okP || w.MaxOutputBytes.IsNone() {
-			return CommandPlan{}, fmt.Errorf("%w: 缺少必需的 kind/profile/max_output_bytes 字段", ErrInvalidCommandPlan)
+			return CommandPlan{}, domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "kind/profile/max_output_bytes"))
 		}
 		return NewCommandPlan(CommandPlanSpec{
 			Kind: kind, Profile: profile, Command: w.Command, Argv: w.Argv,

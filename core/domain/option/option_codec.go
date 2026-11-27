@@ -4,11 +4,11 @@ import (
 	"cmp"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 )
 
@@ -58,7 +58,7 @@ func marshalPathStateJSON(enc *jsontext.Encoder, st PathListState, items []PathE
 }
 func decodePathStateWire(w pathListJSON, allowTerminated bool) (PathListState, []PathEntry, error) {
 	if !allowTerminated && w.Terminated {
-		return PathListUnset, nil, fmt.Errorf("%w: 非法 terminated 标志", ErrInvalidPathList)
+		return PathListUnset, nil, domi18n.EF(ErrInvalidPathList, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "terminated"))
 	}
 	switch {
 	case w.State == "unset" && len(w.Items) == 0 && !w.Terminated:
@@ -69,7 +69,7 @@ func decodePathStateWire(w pathListJSON, allowTerminated bool) (PathListState, [
 		dedup, err := dedupPathEntries(w.Items)
 		return PathListSet, dedup, err
 	}
-	return PathListUnset, nil, fmt.Errorf("%w: 非法状态 %q", ErrInvalidPathList, w.State)
+	return PathListUnset, nil, domi18n.EF(ErrInvalidPathList, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "state"), domi18n.BoundStr("value", w.State))
 }
 
 // MarshalJSONTo 与 UnmarshalJSONFrom 实现 PathList、KnownHostsList、AlgoPolicy、EnvFilter 与 ControlPolicy 的 json/v2 确定性编解码。
@@ -127,7 +127,7 @@ func decodeAlgoPolicyWire(w algoPolicyJSON) (AlgoPolicy, error) {
 	}
 	op, ok := map[string]AlgoOp{"exact": AlgoOpExact, "append": AlgoOpAppend, "remove": AlgoOpRemove, "prepend": AlgoOpPrepend}[w.Op]
 	if !ok || len(w.Tokens) == 0 {
-		return UnsetAlgoPolicy(), fmt.Errorf("%w: 非法算子或空令牌 %q", ErrInvalidAlgoPolicy, w.Op)
+		return UnsetAlgoPolicy(), domi18n.EF(ErrInvalidAlgoPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "op"), domi18n.BoundStr("value", w.Op))
 	}
 	tokens, err := validateAlgoSlice(w.Tokens, op == AlgoOpRemove)
 	return AlgoPolicy{op: op, tokens: tokens}, err
@@ -137,7 +137,7 @@ func decodeEnvFilterWire(w envFilterJSON) (EnvFilter, error) {
 	for i, src := range [2][]string{w.Clear, w.Added} {
 		for _, pat := range src {
 			if !isValidEnvPattern(pat) {
-				return UnsetEnvFilter(), fmt.Errorf("%w: 非法模式 %q", ErrInvalidEnvFilter, pat)
+				return UnsetEnvFilter(), domi18n.EF(ErrInvalidEnvFilter, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "pattern"), domi18n.BoundStr("value", pat))
 			}
 			out[i] = appendUniqueStrings(out[i], []string{pat})
 		}
@@ -147,7 +147,7 @@ func decodeEnvFilterWire(w envFilterJSON) (EnvFilter, error) {
 }
 func decodeControlPolicyWire(w controlPolicyJSON) (ControlPolicy, error) {
 	if w.LiteralPath && (w.Path == "" || isNoneKeyword(strings.TrimSpace(w.Path))) {
-		return UnsetControlPolicy(), fmt.Errorf("%w: literal_path 要求有效字面路径", ErrInvalidControlPolicy)
+		return UnsetControlPolicy(), domi18n.EF(ErrInvalidControlPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "literal_path"))
 	}
 	m, errM := decodeOpt(w.Master, ParseControlMasterMode)
 	p, errP := decodeOpt(w.Path, func(s string) (ControlPathSpec, error) { return parseControlPathInternal(s, w.LiteralPath) })
@@ -224,7 +224,7 @@ func decodeProxyRouteWire(w proxyRouteJSON) (proxyRouteField, error) {
 		cmd, err := NewProxySanitizedCmd(w.Command)
 		return proxyRouteField{&ProxyCommandSpec{cmd}}, err
 	}
-	return proxyRouteField{}, fmt.Errorf("%w: 非法编码 %q", ErrInvalidProxyRoute, w.Kind)
+	return proxyRouteField{}, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "proxy_route"), domi18n.BoundStr("value", w.Kind))
 }
 func decodeProxyJumpWire(w proxyRouteJSON) (ProxyRoute, error) {
 	ne, err := algebraic.NonEmptyFromSlice(w.Hops)

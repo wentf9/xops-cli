@@ -3,9 +3,10 @@ package netaddr
 import (
 	"cmp"
 	"encoding"
-	"fmt"
 	"strconv"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 var (
@@ -30,10 +31,10 @@ type HostPort struct {
 // NewHostPort 校验并构造不可变 HostPort（要求 host 有效且 port 在 [1, 65535] 范围内）。
 func NewHostPort(host CanonicalHost, port uint16) (HostPort, error) {
 	if !host.IsValid() {
-		return HostPort{}, fmt.Errorf("%w: %w", ErrInvalidHostPort, ErrInvalidHost)
+		return HostPort{}, domi18n.WrapSentinel(ErrInvalidHostPort, ErrInvalidHost)
 	}
 	if port == 0 {
-		return HostPort{}, fmt.Errorf("%w: %w: 端口必须位于 [1, 65535]", ErrInvalidHostPort, ErrInvalidPort)
+		return HostPort{}, domi18n.WrapS(ErrInvalidHostPort, ErrInvalidPort, domi18n.KeyCommonFieldRange, domi18n.Str("field", "port"), domi18n.Int("value", int(port)), domi18n.Int("min", 1), domi18n.Int("max", 65535))
 	}
 	return HostPort{host: host, port: port}, nil
 }
@@ -42,19 +43,19 @@ func NewHostPort(host CanonicalHost, port uint16) (HostPort, error) {
 // 省略端口、端口为 0 或含前导零、未加方括号的 IPv6、空白与控制字符一律失败关闭拒绝。
 func ParseHostPort(raw string) (HostPort, error) {
 	if raw == "" {
-		return HostPort{}, fmt.Errorf("%w: 地址不能为空", ErrInvalidHostPort)
+		return HostPort{}, domi18n.EF(ErrInvalidHostPort, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "address"))
 	}
 	if hasForbiddenHostChar(raw) {
-		return HostPort{}, fmt.Errorf("%w: %q 包含空白、控制字符或非法 UTF-8", ErrInvalidHostPort, raw)
+		return HostPort{}, domi18n.EF(ErrInvalidHostPort, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "address"))
 	}
 	if raw[0] == '[' {
 		return parseBracketedHostPort(raw)
 	}
 	if strings.ContainsAny(raw, "[]") {
-		return HostPort{}, fmt.Errorf("%w: %q 包含非预期方括号", ErrInvalidHostPort, raw)
+		return HostPort{}, domi18n.EF(ErrInvalidHostPort, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	if strings.Count(raw, ":") != 1 {
-		return HostPort{}, fmt.Errorf("%w: %q 必须为 <host>:<port> 或 [<ipv6>]:<port> 格式", ErrInvalidHostPort, raw)
+		return HostPort{}, domi18n.EF(ErrInvalidHostPort, domi18n.KeyNetaddrHostPortFormat, domi18n.BoundStr("value", raw))
 	}
 	hostPart, portPart, _ := strings.Cut(raw, ":")
 	return buildHostPort(hostPart, portPart)
@@ -63,12 +64,12 @@ func ParseHostPort(raw string) (HostPort, error) {
 func parseBracketedHostPort(raw string) (HostPort, error) {
 	closeIdx := strings.IndexByte(raw, ']')
 	if closeIdx < 2 {
-		return HostPort{}, fmt.Errorf("%w: 畸形方括号地址 %q", ErrInvalidHostPort, raw)
+		return HostPort{}, domi18n.EF(ErrInvalidHostPort, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	hostPart := raw[:closeIdx+1]
 	rest := raw[closeIdx+1:]
 	if len(rest) < 2 || rest[0] != ':' {
-		return HostPort{}, fmt.Errorf("%w: %q 缺失显式端口", ErrInvalidHostPort, raw)
+		return HostPort{}, domi18n.EF(ErrInvalidHostPort, domi18n.KeyNetaddrHostPortFormat, domi18n.BoundStr("value", raw))
 	}
 	return buildHostPort(hostPart, rest[1:])
 }
@@ -76,11 +77,11 @@ func parseBracketedHostPort(raw string) (HostPort, error) {
 func buildHostPort(hostPart, portPart string) (HostPort, error) {
 	host, err := ParseCanonicalHost(hostPart)
 	if err != nil {
-		return HostPort{}, fmt.Errorf("%w: %w", ErrInvalidHostPort, err)
+		return HostPort{}, domi18n.WrapSentinel(ErrInvalidHostPort, err)
 	}
 	port, err := parseStrictPort(portPart)
 	if err != nil {
-		return HostPort{}, fmt.Errorf("%w: %w", ErrInvalidHostPort, err)
+		return HostPort{}, domi18n.WrapSentinel(ErrInvalidHostPort, err)
 	}
 	return HostPort{host: host, port: port}, nil
 }
@@ -89,19 +90,19 @@ func buildHostPort(hostPart, portPart string) (HostPort, error) {
 // 拒绝 "0"、"022"（阻断八进制歧义）、"+22"、"-1" 与非 ASCII 数字。
 func parseStrictPort(raw string) (uint16, error) {
 	if raw == "" {
-		return 0, fmt.Errorf("%w: 端口不能为空", ErrInvalidPort)
+		return 0, domi18n.EF(ErrInvalidPort, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "port"))
 	}
 	if raw[0] == '0' {
-		return 0, fmt.Errorf("%w: 端口 %q 不能为 0 或包含前导零", ErrInvalidPort, raw)
+		return 0, domi18n.EF(ErrInvalidPort, domi18n.KeyNetaddrPortFormat, domi18n.BoundStr("value", raw))
 	}
 	for i := 0; i < len(raw); i++ {
 		if raw[i] < '0' || raw[i] > '9' {
-			return 0, fmt.Errorf("%w: 端口 %q 包含非法字符", ErrInvalidPort, raw)
+			return 0, domi18n.EF(ErrInvalidPort, domi18n.KeyNetaddrPortFormat, domi18n.BoundStr("value", raw))
 		}
 	}
 	v, err := strconv.ParseUint(raw, 10, 16)
 	if err != nil || v == 0 {
-		return 0, fmt.Errorf("%w: 端口 %q 超出 [1, 65535] 范围", ErrInvalidPort, raw)
+		return 0, domi18n.EF(ErrInvalidPort, domi18n.KeyNetaddrPortFormat, domi18n.BoundStr("value", raw))
 	}
 	return uint16(v), nil
 }

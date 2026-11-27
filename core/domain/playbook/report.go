@@ -3,11 +3,11 @@ package playbook
 import (
 	"cmp"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -107,7 +107,7 @@ type StepExecutionRecord struct {
 // NewStepExecutionRecord 校验节点、步骤、状态、结果一致性与非负耗时并构造不可变记录。
 func NewStepExecutionRecord(spec StepExecutionRecordSpec) (StepExecutionRecord, error) {
 	if !spec.NodeID.IsValid() || !spec.StepID.IsValid() || !spec.Status.IsValid() || spec.Duration.IsNegative() {
-		return StepExecutionRecord{}, fmt.Errorf("%w: node_id/step_id/status 须有效且 duration 不能为负", ErrInvalidStepRecord)
+		return StepExecutionRecord{}, domi18n.EF(ErrInvalidStepRecord, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "step_record"))
 	}
 	if err := validateOutcomeStatusConsistency(spec.Status, spec.Outcome); err != nil {
 		return StepExecutionRecord{}, err
@@ -122,21 +122,21 @@ func validateOutcomeStatusConsistency(status StepStatus, opt algebraic.Option[ex
 		return nil
 	}
 	if out == nil || !out.IsValid() {
-		return fmt.Errorf("%w: outcome 不可为 nil 或无效零值", ErrInvalidStepRecord)
+		return domi18n.EF(ErrInvalidStepRecord, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "outcome"))
 	}
 	switch v := out.(type) {
 	case *execution.OutcomeUnknown:
 		if status != StepStatusOutcomeUnknown {
-			return fmt.Errorf("%w: OutcomeUnknown 仅允许对应 outcome_unknown（实际=%s）", ErrOutcomeStatusMismatch, status)
+			return domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "status"), domi18n.Str("expected", StepStatusOutcomeUnknown.String()), domi18n.Str("actual", status.String()))
 		}
 	case *execution.OutcomeNotStarted:
 		if status != StepStatusFailed && status != StepStatusAborted {
-			return fmt.Errorf("%w: OutcomeNotStarted 仅允许对应 failed/aborted（实际=%s）", ErrOutcomeStatusMismatch, status)
+			return domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "status"), domi18n.Str("expected", "failed/aborted"), domi18n.Str("actual", status.String()))
 		}
 	case *execution.OutcomeCompleted:
 		if (v.Succeeded() && status != StepStatusSucceeded && status != StepStatusChanged) ||
 			(!v.Succeeded() && status != StepStatusFailed && status != StepStatusAborted) {
-			return fmt.Errorf("%w: OutcomeCompleted 与状态 %s 冲突", ErrOutcomeStatusMismatch, status)
+			return domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "status"), domi18n.Str("value", status.String()))
 		}
 	default:
 		return ErrInvalidStepRecord
@@ -313,14 +313,14 @@ func groupRecordsByNode(records []StepExecutionRecord, stepOrder map[StepID]int)
 	grouped, seen := make(map[inventory.NodeID][]StepExecutionRecord), make(map[nodeStepKey]bool, len(records))
 	for i, rec := range records {
 		if !rec.IsValid() {
-			return nil, fmt.Errorf("%w: records[%d] 无效", ErrInvalidStepRecord, i)
+			return nil, domi18n.EF(ErrInvalidStepRecord, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "records"), domi18n.Int("index", i))
 		}
 		if _, ok := stepOrder[rec.stepID]; !ok {
-			return nil, fmt.Errorf("%w: %q", ErrUnknownStepID, rec.stepID)
+			return nil, domi18n.EF(ErrUnknownStepID, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "step_id"), domi18n.BoundStr("value", rec.stepID.String()))
 		}
 		k := nodeStepKey{rec.nodeID, rec.stepID}
 		if seen[k] {
-			return nil, fmt.Errorf("%w: node=%s step=%s", ErrDuplicateStepRecord, rec.nodeID, rec.stepID)
+			return nil, domi18n.EF(ErrDuplicateStepRecord, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "step_record"), domi18n.BoundStr("value", rec.nodeID.String()+"/"+rec.stepID.String()))
 		}
 		seen[k] = true
 		grouped[rec.nodeID] = append(grouped[rec.nodeID], rec)
@@ -340,7 +340,7 @@ func foldNodeReport(nodeID inventory.NodeID, recs []StepExecutionRecord, stepOrd
 		}
 		nextDur, err := totalDur.CheckedAdd(rec.duration)
 		if err != nil {
-			return NodeReport{}, fmt.Errorf("%w: 节点 %s 耗时累加溢出: %w", ErrInvalidStepRecord, nodeID, err)
+			return NodeReport{}, domi18n.WrapS(ErrInvalidStepRecord, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "total_duration"))
 		}
 		totalDur = nextDur
 	}

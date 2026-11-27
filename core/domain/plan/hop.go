@@ -4,10 +4,10 @@ import (
 	"crypto/sha256"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -54,7 +54,7 @@ func AuthMethodDigest(auth inventory.AuthMethod) (security.Digest, error) {
 	h := sha256.New()
 	if err := inventory.WriteAuthMethodCanonical(h, auth); err != nil {
 		var zero security.Digest
-		return zero, fmt.Errorf("%w: %w", ErrInvalidHopSpec, err)
+		return zero, domi18n.WrapSentinel(ErrInvalidHopSpec, err)
 	}
 	var sum [sha256.Size]byte
 	h.Sum(sum[:0])
@@ -80,11 +80,11 @@ func NewHopSpec(in HopSpecInput) (HopSpec, error) {
 // NewHopSpecFromAuth 直接结合已求解 EffectivePolicy 与封闭 AuthMethod 构造不可变 HopSpec。
 func NewHopSpecFromAuth(hopIndex uint32, nodeID string, user option.Username, auth inventory.AuthMethod, policy option.EffectivePolicy) (HopSpec, error) {
 	if !policy.IsValid() {
-		return HopSpec{}, fmt.Errorf("%w: EffectivePolicy 无效", ErrInvalidHopSpec)
+		return HopSpec{}, domi18n.EF(ErrInvalidHopSpec, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "effective_policy"))
 	}
 	tp, err := TransportPolicyFromEffective(policy)
 	if err != nil {
-		return HopSpec{}, fmt.Errorf("%w: %w", ErrInvalidHopSpec, err)
+		return HopSpec{}, domi18n.WrapSentinel(ErrInvalidHopSpec, err)
 	}
 	return NewHopSpec(HopSpecInput{
 		HopIndex: hopIndex, NodeID: nodeID, Origin: policy.Origin(),
@@ -96,17 +96,17 @@ func NewHopSpecFromAuth(hopIndex uint32, nodeID string, user option.Username, au
 func validateHopSpecInput(in HopSpecInput) error {
 	switch {
 	case !isValidNodeLabel(in.NodeID):
-		return fmt.Errorf("%w: 非法 node_id %q", ErrInvalidHopSpec, in.NodeID)
+		return domi18n.EF(ErrInvalidHopSpec, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "node_id"), domi18n.BoundStr("value", in.NodeID))
 	case !in.Origin.IsValid():
-		return fmt.Errorf("%w: 无效 OriginKind", ErrInvalidHopSpec)
+		return domi18n.EF(ErrInvalidHopSpec, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "origin"))
 	case !in.Endpoint.IsValid() || !in.OriginalHost.IsValid():
-		return fmt.Errorf("%w: Endpoint 与 OriginalHost 均须有效", ErrInvalidHopSpec)
+		return domi18n.EF(ErrInvalidHopSpec, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "endpoint"))
 	case !in.Username.IsValid():
-		return fmt.Errorf("%w: 无效 Username", ErrInvalidHopSpec)
+		return domi18n.EF(ErrInvalidHopSpec, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "username"))
 	case in.Auth == nil || !in.Auth.IsValid() || !in.Auth.Kind().IsValid():
-		return fmt.Errorf("%w: Auth 必须为有效的非 nil inventory.AuthMethod", ErrInvalidHopSpec)
+		return domi18n.EF(ErrInvalidHopSpec, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "auth"))
 	case !in.Transport.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidHopSpec, ErrInvalidTransportPolicy)
+		return domi18n.WrapSentinel(ErrInvalidHopSpec, ErrInvalidTransportPolicy)
 	}
 	return nil
 }
@@ -224,14 +224,14 @@ func (h *HopSpec) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		ad, okAD := w.AuthDigest.Get()
 		tp, okT := w.Transport.Get()
 		if !okIdx || !okN || !okO || !okE || !okH || !okU || !okA || !okAK || !okAD || !okT {
-			return HopSpec{}, fmt.Errorf("%w: 缺少必需的 HopSpec 字段", ErrInvalidHopSpec)
+			return HopSpec{}, domi18n.EF(ErrInvalidHopSpec, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "hop_spec"))
 		}
 		rebuilt, err := NewHopSpec(HopSpecInput{idx, nid, ori, ep, origHost, user, aw.auth, tp})
 		if err != nil {
 			return HopSpec{}, err
 		}
 		if rebuilt.authKind != ak || !rebuilt.authDigest.Equal(ad) {
-			return HopSpec{}, fmt.Errorf("%w: HopSpec auth_kind/auth_digest 与 auth 负载不匹配", ErrTamperedPlanDigest)
+			return HopSpec{}, domi18n.EF(ErrTamperedPlanDigest, domi18n.KeyPlanDigestVerifyFailed, domi18n.Str("field", "auth_digest"))
 		}
 		return rebuilt, nil
 	})

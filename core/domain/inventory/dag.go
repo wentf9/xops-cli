@@ -2,10 +2,10 @@ package inventory
 
 import (
 	"cmp"
-	"fmt"
 	"slices"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 )
 
@@ -51,7 +51,7 @@ type TargetKey struct {
 func NewTargetKey(ns NamespaceKind, name string) (TargetKey, error) {
 	t := strings.TrimSpace(name)
 	if !ns.IsValid() || t == "" || len(t) > maxIDLen || hasSpaceOrForbidden(t) || strings.EqualFold(t, "none") {
-		return TargetKey{}, fmt.Errorf("%w: 目标键 (%s, %q) 非法", ErrInvalidID, ns, name)
+		return TargetKey{}, domi18n.EF(ErrInvalidID, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "target_key"), domi18n.BoundStr("value", ns.String()+":"+name))
 	}
 	if ns == NamespaceManaged {
 		if _, err := ParseNodeID(t); err != nil {
@@ -65,7 +65,7 @@ func NewTargetKey(ns NamespaceKind, name string) (TargetKey, error) {
 func ParseTargetKey(raw string) (TargetKey, error) {
 	nsRaw, name, ok := strings.Cut(raw, ":")
 	if !ok {
-		return TargetKey{}, fmt.Errorf("%w: 目标键 %q 缺少命名空间分隔符 ':'", ErrInvalidID, raw)
+		return TargetKey{}, domi18n.EF(ErrInvalidID, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "target_key"), domi18n.BoundStr("value", raw))
 	}
 	ns, err := ParseNamespaceKind(nsRaw)
 	if err != nil {
@@ -106,10 +106,10 @@ type OpenSSHJumpNode struct {
 func NewOpenSSHJumpNode(alias string, proxy option.ProxyRoute) (OpenSSHJumpNode, error) {
 	t := strings.TrimSpace(alias)
 	if t == "" || len(t) > maxIDLen || hasSpaceOrForbidden(t) || strings.EqualFold(t, "none") {
-		return OpenSSHJumpNode{}, fmt.Errorf("%w: OpenSSH 别名 %q 非法", ErrInvalidID, alias)
+		return OpenSSHJumpNode{}, domi18n.EF(ErrInvalidID, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "openssh_alias"), domi18n.BoundStr("value", alias))
 	}
 	if err := option.ValidateProxyRoute(proxy); err != nil {
-		return OpenSSHJumpNode{}, fmt.Errorf("%w: %w", ErrInvalidGraph, err)
+		return OpenSSHJumpNode{}, domi18n.WrapSentinel(ErrInvalidGraph, err)
 	}
 	proxy = pickIf(proxy != nil, proxy, option.ProxyRoute(option.NewProxyUnset()))
 	return OpenSSHJumpNode{t, option.ComposeProxyRoute(proxy, nil), true}, nil
@@ -145,14 +145,14 @@ func ValidateProxyDAG(nodes []Node, openSSH []OpenSSHJumpNode, maxDepth int) (DA
 // ResolveJumpDAG 校验全图无环且深度合规后，按拓扑去重顺序解析 start 的上游到目标跳板链 [bastion..., start]（O(V+E)）。
 func ResolveJumpDAG(nodes []Node, openSSH []OpenSSHJumpNode, start TargetKey, maxDepth int) ([]TargetKey, error) {
 	if !start.IsValid() {
-		return nil, fmt.Errorf("%w: start 顶点无效", ErrInvalidGraph)
+		return nil, domi18n.EF(ErrInvalidGraph, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "start"))
 	}
 	g, _, err := buildAndValidateProxyGraph(nodes, openSSH, maxDepth)
 	if err != nil {
 		return nil, err
 	}
 	if _, ok := g.adj[start]; !ok {
-		return nil, fmt.Errorf("%w: 起始目标 %s 不在资产图中", ErrMissingProxyHop, start)
+		return nil, domi18n.EF(ErrMissingProxyHop, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "target"), domi18n.BoundStr("value", start.String()))
 	}
 	var chain []TargetKey
 	collectJumpChain(g, start, make(map[TargetKey]bool), &chain)
@@ -161,14 +161,14 @@ func ResolveJumpDAG(nodes []Node, openSSH []OpenSSHJumpNode, start TargetKey, ma
 
 func buildAndValidateProxyGraph(nodes []Node, openSSH []OpenSSHJumpNode, maxDepth int) (*proxyGraph, DAGReport, error) {
 	if maxDepth <= 0 {
-		return nil, DAGReport{}, fmt.Errorf("%w: maxDepth=%d 必须为正整数", ErrInvalidGraph, maxDepth)
+		return nil, DAGReport{}, domi18n.EF(ErrInvalidGraph, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "max_depth"))
 	}
 	g, err := buildProxyGraph(nodes, openSSH)
 	if err != nil {
 		return nil, DAGReport{}, err
 	}
 	if cycles := findTarjanCycles(g); len(cycles) > 0 {
-		return nil, DAGReport{Cycles: cycles}, fmt.Errorf("%w: 发现 %d 个环路（首个：%s）", ErrProxyJumpCycle, len(cycles), formatCycle(cycles[0]))
+		return nil, DAGReport{Cycles: cycles}, domi18n.EF(ErrProxyJumpCycle, domi18n.KeyInventoryCycleDetected, domi18n.Int("count", len(cycles)), domi18n.BoundStr("first", formatCycle(cycles[0])))
 	}
 	maxObs, err := computeMaxHopCount(g, maxDepth)
 	if err != nil {
@@ -205,7 +205,7 @@ func buildProxyGraph(nodes []Node, openSSH []OpenSSHJumpNode) (*proxyGraph, erro
 func registerVertices(g *proxyGraph, nodes []Node, openSSH []OpenSSHJumpNode) error {
 	for i, n := range nodes {
 		if !n.IsValid() {
-			return fmt.Errorf("%w: nodes[%d] 无效", ErrInvalidNode, i)
+			return domi18n.EF(ErrInvalidNode, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "nodes"), domi18n.Int("index", i))
 		}
 		if err := g.addVertex(g.managedByID, NamespaceManaged, n.ID().String()); err != nil {
 			return err
@@ -216,7 +216,7 @@ func registerVertices(g *proxyGraph, nodes []Node, openSSH []OpenSSHJumpNode) er
 	}
 	for i, on := range openSSH {
 		if !on.IsValid() {
-			return fmt.Errorf("%w: openSSH[%d] 无效", ErrInvalidGraph, i)
+			return domi18n.EF(ErrInvalidGraph, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "openssh_nodes"), domi18n.Int("index", i))
 		}
 		if err := g.addVertex(g.openSSHKeys, NamespaceOpenSSH, on.alias); err != nil {
 			return err
@@ -226,7 +226,7 @@ func registerVertices(g *proxyGraph, nodes []Node, openSSH []OpenSSHJumpNode) er
 }
 func (g *proxyGraph) addVertex(index map[string]TargetKey, ns NamespaceKind, name string) error {
 	if _, dup := index[name]; dup {
-		return fmt.Errorf("%w: 重复的目标标识 %q", ErrDuplicateAssetID, name)
+		return domi18n.EF(ErrDuplicateAssetID, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "target"), domi18n.BoundStr("value", name))
 	}
 	key := TargetKey{ns, name}
 	index[name], g.adj[key] = key, nil
@@ -239,10 +239,10 @@ func registerManagedAliases(g *proxyGraph, nodes []Node) error {
 		for _, a := range n.Aliases() {
 			name := a.String()
 			if _, col := g.managedByID[name]; col {
-				return fmt.Errorf("%w: 节点 %q 别名 %q 与 NodeID 冲突", ErrDuplicateAssetID, key.name, name)
+				return domi18n.EF(ErrDuplicateAssetID, domi18n.KeyInventoryAliasConflict, domi18n.BoundStr("alias", name), domi18n.BoundStr("first", name), domi18n.BoundStr("second", key.name))
 			}
 			if prev, dup := g.aliasToKey[name]; dup {
-				return fmt.Errorf("%w: 别名 %q 同时被 %q 与 %q 占用", ErrDuplicateAssetID, name, prev.name, key.name)
+				return domi18n.EF(ErrDuplicateAssetID, domi18n.KeyInventoryAliasConflict, domi18n.BoundStr("alias", name), domi18n.BoundStr("first", prev.name), domi18n.BoundStr("second", key.name))
 			}
 			g.aliasToKey[name] = key
 		}
@@ -275,16 +275,16 @@ func resolveRouteHops(g *proxyGraph, src TargetKey, route option.ProxyRoute) ([]
 		return nil, nil
 	case *option.ProxyJumpChain:
 		if !v.IsValid() {
-			return nil, fmt.Errorf("%w: 节点 %s 含无效 ProxyJumpChain", ErrInvalidGraph, src)
+			return nil, domi18n.EF(ErrInvalidGraph, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "proxy_jump"), domi18n.BoundStr("value", src.String()))
 		}
 		return mapSliceErr(v.Hops().Slice(), func(h option.HopTarget) (TargetKey, error) {
 			if dst, ok := g.lookupHop(h.Host(), src.ns); ok {
 				return dst, nil
 			}
-			return TargetKey{}, fmt.Errorf("%w: 节点 %s 引用了未知跳板 %q", ErrMissingProxyHop, src, h.Host())
+			return TargetKey{}, domi18n.EF(ErrMissingProxyHop, domi18n.KeyInventoryHopUnknown, domi18n.BoundStr("node", src.String()), domi18n.BoundStr("hop", h.Host()))
 		})
 	default:
-		return nil, fmt.Errorf("%w: 节点 %s 含未知 ProxyRoute 变体", ErrInvalidGraph, src)
+		return nil, domi18n.EF(ErrInvalidGraph, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "proxy_route"), domi18n.BoundStr("value", src.String()))
 	}
 }
 func (g *proxyGraph) lookupHop(host string, fromNS NamespaceKind) (TargetKey, bool) {
@@ -359,7 +359,7 @@ func computeMaxHopCount(g *proxyGraph, maxDepth int) (int, error) {
 	for _, v := range g.vertices {
 		seen := make(map[TargetKey]bool)
 		if err := countAncestorsBounded(g, v, maxDepth, seen); err != nil {
-			return 0, fmt.Errorf("%w: 目标 %s 上游跳板数超过上限 %d", ErrProxyJumpDepthExceeded, v, maxDepth)
+			return 0, domi18n.EF(ErrProxyJumpDepthExceeded, domi18n.KeyCommonFieldMaxExceeded, domi18n.BoundStr("field", v.String()), domi18n.Int("value", len(seen)), domi18n.Int("max", maxDepth))
 		}
 		maxObs = max(maxObs, len(seen))
 	}

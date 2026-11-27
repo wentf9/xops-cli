@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -18,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -38,25 +38,25 @@ const (
 
 // 本包导出的规范哨兵错误，所有非法输入、环路、缺失引用与 JSON null 均严格失败关闭。
 var (
-	ErrInvalidID              = errors.New("inventory: 无效的资产标识符")
-	ErrInvalidKeySpec         = errors.New("inventory: 无效的私钥、证书或指纹规格")
-	ErrInvalidChallengeRule   = errors.New("inventory: 无效的 keyboard-interactive 质询应答规则")
-	ErrInvalidAuthMethod      = errors.New("inventory: 无效的认证方式 AuthMethod")
-	ErrAuthCompositeTooDeep   = errors.New("inventory: AuthComposite 嵌套深度超限")
-	ErrInvalidNodeOrigin      = errors.New("inventory: 无效的节点来源 NodeOrigin")
-	ErrInvalidHost            = errors.New("inventory: 无效的主机实体 Host")
-	ErrInvalidIdentity        = errors.New("inventory: 无效的身份实体 Identity")
-	ErrInvalidNode            = errors.New("inventory: 无效的节点实体 Node")
-	ErrInvalidGraph           = errors.New("inventory: 无效的资产配置图 Graph")
-	ErrDuplicateAssetID       = errors.New("inventory: 存在重复的资产标识或别名碰撞")
-	ErrMissingAssetRef        = errors.New("inventory: 节点引用了不存在的 Host 或 Identity")
-	ErrMissingProxyHop        = errors.New("inventory: ProxyJump 引用了不存在的跳板目标")
-	ErrProxyJumpCycle         = errors.New("inventory: 检测到跨命名空间 ProxyJump 环路")
-	ErrProxyJumpDepthExceeded = errors.New("inventory: ProxyJump 跳板链深度超过上限")
-	ErrUnknownSecretStore     = errors.New("inventory: 凭据引用指向未注册的凭据存储")
-	ErrInvalidImportBundle    = errors.New("inventory: 无效的格式无关导入包 ImportBundle")
-	ErrNilWriter              = errors.New("inventory: WriteCanonical 或编码目标不能为 nil")
-	ErrNilReceiver            = errors.New("inventory: 反序列化目标接收者不能为 nil")
+	ErrInvalidID              = domi18n.Sentinel(domi18n.KeyInventoryInvalidID)
+	ErrInvalidKeySpec         = domi18n.Sentinel(domi18n.KeyInventoryInvalidKeySpec)
+	ErrInvalidChallengeRule   = domi18n.Sentinel(domi18n.KeyInventoryInvalidChallengeRule)
+	ErrInvalidAuthMethod      = domi18n.Sentinel(domi18n.KeyInventoryInvalidAuthMethod)
+	ErrAuthCompositeTooDeep   = domi18n.Sentinel(domi18n.KeyInventoryAuthCompositeTooDeep)
+	ErrInvalidNodeOrigin      = domi18n.Sentinel(domi18n.KeyInventoryInvalidNodeOrigin)
+	ErrInvalidHost            = domi18n.Sentinel(domi18n.KeyInventoryInvalidHost)
+	ErrInvalidIdentity        = domi18n.Sentinel(domi18n.KeyInventoryInvalidIdentity)
+	ErrInvalidNode            = domi18n.Sentinel(domi18n.KeyInventoryInvalidNode)
+	ErrInvalidGraph           = domi18n.Sentinel(domi18n.KeyInventoryInvalidGraph)
+	ErrDuplicateAssetID       = domi18n.Sentinel(domi18n.KeyInventoryDuplicateAssetID)
+	ErrMissingAssetRef        = domi18n.Sentinel(domi18n.KeyInventoryMissingAssetRef)
+	ErrMissingProxyHop        = domi18n.Sentinel(domi18n.KeyInventoryMissingProxyHop)
+	ErrProxyJumpCycle         = domi18n.Sentinel(domi18n.KeyInventoryProxyJumpCycle)
+	ErrProxyJumpDepthExceeded = domi18n.Sentinel(domi18n.KeyInventoryProxyJumpDepth)
+	ErrUnknownSecretStore     = domi18n.Sentinel(domi18n.KeyInventoryUnknownSecretStore)
+	ErrInvalidImportBundle    = domi18n.Sentinel(domi18n.KeyInventoryInvalidImportBundle)
+	ErrNilWriter              = domi18n.Sentinel(domi18n.KeyInventoryNilWriter)
+	ErrNilReceiver            = domi18n.Sentinel(domi18n.KeyInventoryNilReceiver)
 )
 
 type validatable interface{ IsValid() bool }
@@ -119,7 +119,7 @@ func parseEnumByName[T ~uint8](raw string, lo, hi, zero T, nameFn func(T) string
 			}
 		}
 	}
-	return zero, fmt.Errorf("%w: %q", baseErr, raw)
+	return zero, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 func appendValidText(b []byte, valid bool, text string, baseErr error) ([]byte, error) {
 	if !valid {
@@ -150,7 +150,7 @@ func unmarshalJSON[T, W any](dst *T, dec *jsontext.Decoder, baseErr error, build
 		if _, err := dec.ReadToken(); err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: JSON null 不是有效值", baseErr)
+		return domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden)
 	}
 	var wire W
 	if err := jsonv2.UnmarshalDecode(dec, &wire); err != nil {
@@ -170,11 +170,11 @@ func indexUnique[T any, K comparable](raw []T, valid func(T) bool, keyOf func(T)
 	out, seen := make([]T, len(raw)), make(map[K]bool, len(raw))
 	for i, item := range raw {
 		if !valid(item) {
-			return nil, nil, fmt.Errorf("%w: 第 %d 项无效", badErr, i)
+			return nil, nil, domi18n.EF(badErr, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "items"), domi18n.Int("index", i))
 		}
 		k := keyOf(item)
 		if seen[k] {
-			return nil, nil, fmt.Errorf("%w: 重复标识 %v", ErrDuplicateAssetID, k)
+			return nil, nil, domi18n.EF(ErrDuplicateAssetID, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "asset_id"), domi18n.BoundStr("value", fmt.Sprint(k)))
 		}
 		seen[k], out[i] = true, item
 	}
@@ -201,7 +201,7 @@ func hasSpaceOrForbidden(s string) bool {
 }
 func sanitizeSingleLine(s string, maxBytes int) (string, error) {
 	if len(s) > maxBytes || hasForbiddenText(s) {
-		return "", fmt.Errorf("文本超长或包含非法 UTF-8/控制/Cf 字符")
+		return "", domi18n.E(domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "text"))
 	}
 	return s, nil
 }

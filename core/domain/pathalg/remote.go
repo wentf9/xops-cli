@@ -3,9 +3,10 @@ package pathalg
 import (
 	"cmp"
 	"encoding"
-	"fmt"
 	"path"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 var (
@@ -32,19 +33,19 @@ type RemoteName struct {
 // ParseRemoteName 校验并构造单个远端 POSIX 目录项名称。
 func ParseRemoteName(raw string) (RemoteName, error) {
 	if raw == "" {
-		return RemoteName{}, fmt.Errorf("%w: 远端名称不能为空", ErrInvalidRemoteName)
+		return RemoteName{}, domi18n.EF(ErrInvalidRemoteName, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "remote_name"))
 	}
 	if len(raw) > MaxComponentBytes {
-		return RemoteName{}, fmt.Errorf("%w: 远端名称长度 %d 超过上限 %d", ErrInvalidRemoteName, len(raw), MaxComponentBytes)
+		return RemoteName{}, domi18n.EF(ErrInvalidRemoteName, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote_name"), domi18n.Int("size", len(raw)), domi18n.Int("limit", MaxComponentBytes))
 	}
 	if raw == "." || raw == ".." {
-		return RemoteName{}, fmt.Errorf("%w: 远端名称不能为 %q", ErrInvalidRemoteName, raw)
+		return RemoteName{}, domi18n.EF(ErrInvalidRemoteName, domi18n.KeyPathalgTraversalForbidden, domi18n.BoundStr("segment", raw))
 	}
 	if strings.ContainsRune(raw, '/') {
-		return RemoteName{}, fmt.Errorf("%w: 远端名称 %q 不得包含 '/'", ErrInvalidRemoteName, raw)
+		return RemoteName{}, domi18n.EF(ErrInvalidRemoteName, domi18n.KeyPathalgForbiddenChar, domi18n.BoundStr("value", raw), domi18n.Str("char", "/"))
 	}
 	if hasForbiddenPathText(raw) {
-		return RemoteName{}, fmt.Errorf("%w: 远端名称 %q 包含非法 UTF-8、控制字符或不可见/Bidi 字符", ErrInvalidRemoteName, raw)
+		return RemoteName{}, domi18n.EF(ErrInvalidRemoteName, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "remote_name"))
 	}
 	return RemoteName{name: raw}, nil
 }
@@ -110,13 +111,13 @@ type RemotePath struct {
 // ParseRemotePath 校验并按 POSIX 语义规范化远端路径字符串。
 func ParseRemotePath(raw string) (RemotePath, error) {
 	if raw == "" {
-		return RemotePath{}, fmt.Errorf("%w: 远端路径不能为空", ErrInvalidRemotePath)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "remote_path"))
 	}
 	if len(raw) > MaxRemotePathBytes {
-		return RemotePath{}, fmt.Errorf("%w: 远端路径长度 %d 超过上限 %d", ErrInvalidRemotePath, len(raw), MaxRemotePathBytes)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote_path"), domi18n.Int("size", len(raw)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	if hasForbiddenPathText(raw) {
-		return RemotePath{}, fmt.Errorf("%w: 远端路径 %q 包含非法 UTF-8、控制字符或不可见/Bidi 字符", ErrInvalidRemotePath, raw)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "remote_path"))
 	}
 	cleaned := path.Clean(raw)
 	if err := validateRemotePathSegments(cleaned); err != nil {
@@ -132,18 +133,18 @@ func ParseAbsRemotePath(raw string) (RemotePath, error) {
 		return RemotePath{}, err
 	}
 	if !p.IsAbs() {
-		return RemotePath{}, fmt.Errorf("%w: 远端路径 %q 必须为绝对 POSIX 路径", ErrInvalidRemotePath, raw)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "must_be_absolute"))
 	}
 	return p, nil
 }
 
 func validateRemotePathSegments(cleaned string) error {
 	if len(cleaned) > MaxRemotePathBytes {
-		return fmt.Errorf("%w: 规范化后远端路径长度超过上限 %d", ErrInvalidRemotePath, MaxRemotePathBytes)
+		return domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote_path"), domi18n.Int("size", len(cleaned)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	for seg := range strings.SplitSeq(cleaned, "/") {
 		if len(seg) > MaxComponentBytes {
-			return fmt.Errorf("%w: 路径分量 %q 长度 %d 超过上限 %d", ErrInvalidRemotePath, seg, len(seg), MaxComponentBytes)
+			return domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "component"), domi18n.Int("size", len(seg)), domi18n.Int("limit", MaxComponentBytes))
 		}
 	}
 	return nil
@@ -195,17 +196,17 @@ func (p RemotePath) Base() (RemoteName, bool) {
 // Join 在当前有效路径下依次拼接一个或多个已校验的 RemoteName，返回规范化后的新 RemotePath。
 func (p RemotePath) Join(names ...RemoteName) (RemotePath, error) {
 	if !p.IsValid() {
-		return RemotePath{}, fmt.Errorf("%w: 无法在无效 RemotePath 上执行 Join", ErrInvalidRemotePath)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	cur := p.clean
 	for _, n := range names {
 		if !n.IsValid() {
-			return RemotePath{}, fmt.Errorf("%w: Join 收到无效 RemoteName", ErrInvalidRemotePath)
+			return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_name"))
 		}
 		cur = path.Join(cur, n.name)
 	}
 	if len(cur) > MaxRemotePathBytes {
-		return RemotePath{}, fmt.Errorf("%w: Join 后路径长度 %d 超过上限 %d", ErrInvalidRemotePath, len(cur), MaxRemotePathBytes)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote_path"), domi18n.Int("size", len(cur)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	return RemotePath{clean: cur}, nil
 }
@@ -213,7 +214,7 @@ func (p RemotePath) Join(names ...RemoteName) (RemotePath, error) {
 // Resolve 以当前路径为基准解析目标路径：若 target 为绝对路径则直接返回 target，否则按 POSIX 词法拼接并清洗。
 func (p RemotePath) Resolve(target RemotePath) (RemotePath, error) {
 	if !p.IsValid() || !target.IsValid() {
-		return RemotePath{}, fmt.Errorf("%w: Resolve 需要两个有效的 RemotePath", ErrInvalidRemotePath)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	if target.IsAbs() {
 		return target, nil
@@ -231,10 +232,10 @@ func (p RemotePath) Resolve(target RemotePath) (RemotePath, error) {
 // 在消除公共前缀后仍以 ".." 开头导致无法脱离当前工作目录确定上行段时，严格失败关闭返回错误。
 func (p RemotePath) Rel(target RemotePath) (RemotePath, error) {
 	if !p.IsValid() || !target.IsValid() {
-		return RemotePath{}, fmt.Errorf("%w: Rel 需要两个有效的 RemotePath", ErrInvalidRemotePath)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	if p.IsAbs() != target.IsAbs() {
-		return RemotePath{}, fmt.Errorf("%w: 无法在绝对路径与相对路径间计算 Rel (%q -> %q)", ErrInvalidRemotePath, p.clean, target.clean)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target.clean), domi18n.Str("reason", "abs_rel_mismatch"))
 	}
 	if p.clean == target.clean {
 		return RemotePath{clean: "."}, nil
@@ -245,7 +246,7 @@ func (p RemotePath) Rel(target RemotePath) (RemotePath, error) {
 	remBase := baseSegs[common:]
 	remTarg := targSegs[common:]
 	if len(remBase) > 0 && remBase[0] == ".." {
-		return RemotePath{}, fmt.Errorf("%w: 相对基准路径 %q 无法确定通向 %q 的唯一相对路径", ErrInvalidRemotePath, p.clean, target.clean)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", p.clean), domi18n.Str("reason", "unresolvable_relative_base"))
 	}
 	out := make([]string, 0, len(remBase)+len(remTarg))
 	for range remBase {
@@ -257,7 +258,7 @@ func (p RemotePath) Rel(target RemotePath) (RemotePath, error) {
 		rel = strings.Join(out, "/")
 	}
 	if len(rel) > MaxRemotePathBytes {
-		return RemotePath{}, fmt.Errorf("%w: 相对路径长度超过上限 %d", ErrInvalidRemotePath, MaxRemotePathBytes)
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote_path"), domi18n.Int("size", len(rel)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	return RemotePath{clean: rel}, nil
 }

@@ -2,11 +2,11 @@ package playbook
 
 import (
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -40,17 +40,17 @@ type Step struct {
 // NewStep 校验步骤 ID、名称、封闭动作、可选错误覆盖与条件标签，构造不可变 Step。
 func NewStep(spec StepSpec) (Step, error) {
 	if !spec.ID.IsValid() {
-		return Step{}, fmt.Errorf("%w: %w", ErrInvalidStep, ErrInvalidStepID)
+		return Step{}, domi18n.WrapSentinel(ErrInvalidStep, ErrInvalidStepID)
 	}
 	if len(spec.Name) > maxNameBytes || hasForbiddenStrictText(spec.Name) {
-		return Step{}, fmt.Errorf("%w: step.name 超长或包含非法 UTF-8/控制/Cf 字符", ErrInvalidStep)
+		return Step{}, domi18n.EF(ErrInvalidStep, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "step.name"))
 	}
 	if p, ok := spec.OnError.Get(); ok && !p.IsValid() {
-		return Step{}, fmt.Errorf("%w: %w", ErrInvalidStep, ErrInvalidOnErrorPolicy)
+		return Step{}, domi18n.WrapSentinel(ErrInvalidStep, ErrInvalidOnErrorPolicy)
 	}
 	action, err := cloneStepAction(spec.Action)
 	if err != nil {
-		return Step{}, fmt.Errorf("%w: %w", ErrInvalidStep, err)
+		return Step{}, domi18n.WrapSentinel(ErrInvalidStep, err)
 	}
 	whenTags, err := canonicalizeTags(spec.WhenTags, maxStepTags, ErrInvalidStep)
 	if err != nil {
@@ -137,7 +137,7 @@ func NewPlaybook(spec PlaybookSpec) (Playbook, error) {
 	}
 	vars, err := canonicalizeKVMap(spec.Vars, maxVarsCount, maxVarValBytes, isValidVarKey, true)
 	if err != nil {
-		return Playbook{}, fmt.Errorf("%w: %w", ErrInvalidPlaybook, err)
+		return Playbook{}, domi18n.WrapSentinel(ErrInvalidPlaybook, err)
 	}
 	steps, err := cloneAndValidateSteps(spec.Steps)
 	if err != nil {
@@ -146,7 +146,7 @@ func NewPlaybook(spec PlaybookSpec) (Playbook, error) {
 	pb := Playbook{VersionV2, spec.ID, spec.Name, spec.Description, spec.OnError, spec.Target, vars, steps, zeroVal[security.Digest](), true}
 	digest, err := digestCanonical(pb.WriteCanonical)
 	if err != nil {
-		return Playbook{}, fmt.Errorf("%w: %w", ErrInvalidPlaybook, err)
+		return Playbook{}, domi18n.WrapSentinel(ErrInvalidPlaybook, err)
 	}
 	pb.snapshotDigest = digest
 	return pb, nil
@@ -155,36 +155,36 @@ func NewPlaybook(spec PlaybookSpec) (Playbook, error) {
 func validatePlaybookHeader(spec PlaybookSpec) error {
 	switch {
 	case spec.Version != VersionV2:
-		return fmt.Errorf("%w: got=%d", ErrUnsupportedVersion, spec.Version)
+		return domi18n.EF(ErrUnsupportedVersion, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "version"), domi18n.Uint64("value", uint64(spec.Version)))
 	case !spec.ID.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidPlaybook, ErrInvalidPlaybookID)
+		return domi18n.WrapSentinel(ErrInvalidPlaybook, ErrInvalidPlaybookID)
 	case spec.Name == "" || len(spec.Name) > maxNameBytes || hasForbiddenStrictText(spec.Name) || !hasVisibleText(spec.Name):
-		return fmt.Errorf("%w: playbook.name 不能为空、超长或含非法字符", ErrInvalidPlaybook)
+		return domi18n.EF(ErrInvalidPlaybook, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "playbook.name"))
 	case len(spec.Description) > maxDescriptionBytes || hasForbiddenStrictText(spec.Description):
-		return fmt.Errorf("%w: playbook.description 超长或含非法字符", ErrInvalidPlaybook)
+		return domi18n.EF(ErrInvalidPlaybook, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "playbook.description"))
 	case !spec.OnError.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidPlaybook, ErrInvalidOnErrorPolicy)
+		return domi18n.WrapSentinel(ErrInvalidPlaybook, ErrInvalidOnErrorPolicy)
 	case !spec.Target.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidPlaybook, ErrInvalidTargetSelector)
+		return domi18n.WrapSentinel(ErrInvalidPlaybook, ErrInvalidTargetSelector)
 	}
 	return nil
 }
 
 func cloneAndValidateSteps(raw algebraic.NonEmpty[Step]) (algebraic.NonEmpty[Step], error) {
 	if !raw.IsValid() {
-		return zeroVal[algebraic.NonEmpty[Step]](), fmt.Errorf("%w: steps 不能为空", ErrInvalidPlaybook)
+		return zeroVal[algebraic.NonEmpty[Step]](), domi18n.EF(ErrInvalidPlaybook, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "steps"))
 	}
 	slice := raw.Slice()
 	if len(slice) > maxStepsPerPlaybook {
-		return zeroVal[algebraic.NonEmpty[Step]](), fmt.Errorf("%w: 步骤数 %d 超过上限 %d", ErrInvalidPlaybook, len(slice), maxStepsPerPlaybook)
+		return zeroVal[algebraic.NonEmpty[Step]](), domi18n.EF(ErrInvalidPlaybook, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "steps"), domi18n.Int("count", len(slice)), domi18n.Int("limit", maxStepsPerPlaybook))
 	}
 	seen, cloned := make(map[StepID]bool, len(slice)), make([]Step, len(slice))
 	for i, st := range slice {
 		if !st.IsValid() {
-			return zeroVal[algebraic.NonEmpty[Step]](), fmt.Errorf("%w: steps[%d] 无效", ErrInvalidStep, i)
+			return zeroVal[algebraic.NonEmpty[Step]](), domi18n.EF(ErrInvalidStep, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "steps"), domi18n.Int("index", i))
 		}
 		if seen[st.id] {
-			return zeroVal[algebraic.NonEmpty[Step]](), fmt.Errorf("%w: %q", ErrDuplicateStepID, st.id)
+			return zeroVal[algebraic.NonEmpty[Step]](), domi18n.EF(ErrDuplicateStepID, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "step_id"), domi18n.BoundStr("value", st.id.String()))
 		}
 		seen[st.id] = true
 		cloned[i] = cloneValidStep(st)

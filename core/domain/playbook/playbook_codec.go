@@ -3,10 +3,10 @@ package playbook
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -31,7 +31,7 @@ func (o *optActionWire) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		if _, err := dec.ReadToken(); err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: 嵌套动作不能为 JSON null", ErrInvalidStepAction)
+		return domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonJSONNullForbidden)
 	}
 	var w stepActionWire
 	if err := jsonv2.UnmarshalDecode(dec, &w, jsonv2.RejectUnknownMembers(true)); err != nil {
@@ -182,7 +182,7 @@ func encodeEnsureWire(v *StepEnsure, depth int) (stepActionWire, error) {
 func decodeStepActionWire(w stepActionWire, depth int) (StepAction, error) {
 	kind, ok := w.Kind.Get()
 	if !ok {
-		return nil, fmt.Errorf("%w: 缺少必需的 action.kind 字段", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "action.kind"))
 	}
 	mask := stepActionFieldMask(w)
 	switch kind {
@@ -197,7 +197,7 @@ func decodeStepActionWire(w stepActionWire, depth int) (StepAction, error) {
 	case StepActionKindEnsure:
 		return decodeEnsureWire(w, mask, depth)
 	default:
-		return nil, fmt.Errorf("%w: 未知动作类别 %d", ErrInvalidStepAction, uint8(kind))
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "action.kind"), domi18n.Uint64("value", uint64(kind)))
 	}
 }
 
@@ -218,7 +218,7 @@ func stepActionFieldMask(w stepActionWire) uint16 {
 func decodeShellWire(w stepActionWire, mask uint16) (StepAction, error) {
 	const allowed = (1 << 0) | (1 << 5)
 	if mask&^allowed != 0 || w.Command == "" {
-		return nil, fmt.Errorf("%w: shell 变体字段组合非法", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "shell"))
 	}
 	return NewStepShell(StepShellSpec{w.Command, w.Profile, w.WorkDir, w.Env, w.Timeout})
 }
@@ -227,7 +227,7 @@ func decodeScriptWire(w stepActionWire, mask uint16) (StepAction, error) {
 	const allowed = (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5)
 	src, hasSrc := w.Source.Get()
 	if mask&^allowed != 0 || !hasSrc {
-		return nil, fmt.Errorf("%w: script 变体字段组合非法", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "script"))
 	}
 	return NewStepScript(StepScriptSpec{src, w.SymlinkPolicy.OrElse(pathalg.SymlinkReject), w.Args, w.Profile, w.WorkDir, w.Env, w.Timeout})
 }
@@ -237,7 +237,7 @@ func decodeCopyWire(w stepActionWire, mask uint16) (StepAction, error) {
 	src, hasSrc := w.Source.Get()
 	dst, hasDst := w.Dest.Get()
 	if mask&^allowed != 0 || !hasSrc || !hasDst {
-		return nil, fmt.Errorf("%w: copy 变体字段组合非法", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "copy"))
 	}
 	return NewStepCopy(StepCopySpec{src, w.SymlinkPolicy.OrElse(pathalg.SymlinkReject), dst, w.Mode, w.Overwrite.OrElse(false), w.Atomic.OrElse(false)})
 }
@@ -247,7 +247,7 @@ func decodeTemplateWire(w stepActionWire, mask uint16) (StepAction, error) {
 	src, hasSrc := w.Source.Get()
 	dst, hasDst := w.Dest.Get()
 	if mask&^allowed != 0 || !hasSrc || !hasDst {
-		return nil, fmt.Errorf("%w: template 变体字段组合非法", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "template"))
 	}
 	return NewStepTemplate(StepTemplateSpec{src, w.SymlinkPolicy.OrElse(pathalg.SymlinkReject), dst, w.Vars, w.Mode, w.Overwrite.OrElse(false), w.Atomic.OrElse(false)})
 }
@@ -257,7 +257,7 @@ func decodeEnsureWire(w stepActionWire, mask uint16, depth int) (StepAction, err
 		return nil, ErrNestedEnsureForbidden
 	}
 	if mask&^(1<<8) != 0 || !w.Check.set || w.Check.val == nil || !w.Action.set || w.Action.val == nil {
-		return nil, fmt.Errorf("%w: ensure 变体必须携带 check 与 action 且不得混用其他字段", ErrInvalidStepAction)
+		return nil, domi18n.EF(ErrInvalidStepAction, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "ensure"))
 	}
 	check, err := decodeStepActionWire(*w.Check.val, depth+1)
 	if err != nil {
@@ -287,11 +287,11 @@ func (s *Step) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return unmarshalJSONStrict(s, dec, ErrInvalidStep, func(w stepWire) (Step, error) {
 		id, okID := w.ID.Get()
 		if !okID || !w.Action.set || w.Action.val == nil {
-			return Step{}, fmt.Errorf("%w: 缺少必需的 step.id 或 step.action 字段", ErrInvalidStep)
+			return Step{}, domi18n.EF(ErrInvalidStep, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "step.id/action"))
 		}
 		action, err := decodeStepActionWire(*w.Action.val, 0)
 		if err != nil {
-			return Step{}, fmt.Errorf("%w: %w", ErrInvalidStep, err)
+			return Step{}, domi18n.WrapSentinel(ErrInvalidStep, err)
 		}
 		return NewStep(StepSpec{id, w.Name, action, w.OnError, w.WhenTags})
 	})
@@ -317,11 +317,11 @@ func buildPlaybookFromWire(w playbookWire) (Playbook, error) {
 	onErr, okE := w.OnError.Get()
 	target, okT := w.Target.Get()
 	if !okV || !okID || !okN || !okE || !okT {
-		return Playbook{}, fmt.Errorf("%w: 缺少必需的 version/id/name/on_error/target 字段", ErrInvalidPlaybook)
+		return Playbook{}, domi18n.EF(ErrInvalidPlaybook, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "version/id/name/on_error/target"))
 	}
 	steps, err := algebraic.NonEmptyFromSlice(w.Steps)
 	if err != nil {
-		return Playbook{}, fmt.Errorf("%w: %w", ErrInvalidPlaybook, err)
+		return Playbook{}, domi18n.WrapSentinel(ErrInvalidPlaybook, err)
 	}
 	pb, err := NewPlaybook(PlaybookSpec{ver, id, name, w.Description, onErr, target, w.Vars, steps})
 	if err != nil {

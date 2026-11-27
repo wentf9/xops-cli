@@ -1,11 +1,11 @@
 package fsm
 
 import (
-	"fmt"
 	"slices"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -130,7 +130,7 @@ func NewPendingEnrollContext(spec PendingEnrollContextSpec) (PendingEnrollContex
 	stagedUTC := spec.StagedAt.UTC().Round(0)
 	if !spec.LeaseID.IsValid() || !spec.TargetNode.IsValid() || !isValidTimeWindow(stagedUTC, spec.TTL) ||
 		len(spec.PinnedRefs) > MaxPendingSecretRefs || slices.ContainsFunc(spec.PinnedRefs, secret.Ref.IsZero) {
-		return PendingEnrollContext{}, fmt.Errorf("%w: 首连租约参数或 pinned_refs 非法", ErrInvalidEnrollLease)
+		return PendingEnrollContext{}, domi18n.EF(ErrInvalidEnrollLease, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "enroll_lease"))
 	}
 	refs := slices.Clone(spec.PinnedRefs)
 	slices.SortFunc(refs, secret.Ref.Compare)
@@ -212,13 +212,13 @@ func EnrollInputProbeResult(ok bool, fp inventory.KeyFingerprint, now time.Time,
 func EnrollInputCommit(t time.Time) (PendingEnrollInput, error) { return eT(enrollInCommit, t) }
 func EnrollInputCommitResult(durability DurabilityStatus, reason string) (PendingEnrollInput, error) {
 	if !durability.IsValid() {
-		return PendingEnrollInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidDurability)
+		return PendingEnrollInput{}, domi18n.WrapSentinel(ErrInvalidInput, ErrInvalidDurability)
 	}
 	return PendingEnrollInput{kind: enrollInCommitResult, durability: durability, reason: sanitizeReason(reason), valid: true}, nil
 }
 func EnrollInputCleanupResult(outcome SideEffectOutcome, reason string) (PendingEnrollInput, error) {
 	if !outcome.IsValid() {
-		return PendingEnrollInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidOutcome)
+		return PendingEnrollInput{}, domi18n.WrapSentinel(ErrInvalidInput, ErrInvalidOutcome)
 	}
 	return PendingEnrollInput{kind: enrollInCleanupResult, outcome: outcome, reason: sanitizeReason(reason), valid: true}, nil
 }
@@ -257,26 +257,26 @@ func TransitionPendingEnroll(state PendingEnrollState, input PendingEnrollInput)
 	case PendingEnrollPhaseCleaningUp:
 		return stepEnrollCleaningUp(state, input)
 	case PendingEnrollPhaseEnrolled, PendingEnrollPhaseAborted, PendingEnrollPhaseUncertain:
-		return state, nil, nil, fmt.Errorf("%w: 终态 %s 不接受输入", ErrIllegalTransition, state.phase)
+		return state, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMTerminalState, domi18n.Str("state", state.phase.String()))
 	default:
 		return state, nil, nil, ErrInvalidState
 	}
 }
 func stepEnrollIdle(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
 	if in.kind != enrollInStage {
-		return s, nil, nil, fmt.Errorf("%w: idle 仅接受 Stage", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", "Stage"))
 	}
 	effs := pickIf(len(in.ctx.pinnedRefs) > 0, []PendingEnrollEffect{enrollEffect(EnrollEffectPinSecrets, in.ctx.targetNode, in.ctx.pinnedRefs)}, nil)
 	return PendingEnrollState{phase: PendingEnrollPhaseStaged, ctx: in.ctx, valid: true}, effs, []PendingEnrollEvent{newEvent(EnrollEventStaged, in.ctx.targetNode.String())}, nil
 }
 func stepEnrollStaged(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
-	if next, eff, ev, done, err := guardEnrollActive(s, in, enrollInStartProbe, "staged 严禁跳过探测直接入库", "lease expired before probe"); done {
+	if next, eff, ev, done, err := guardEnrollActive(s, in, enrollInStartProbe, "StartProbe/Cancel/Expire", "lease expired before probe"); done {
 		return next, eff, ev, err
 	}
 	return PendingEnrollState{phase: PendingEnrollPhaseProbing, ctx: s.ctx, valid: true}, []PendingEnrollEffect{enrollEffect(EnrollEffectProbeConnection, s.ctx.targetNode, nil)}, []PendingEnrollEvent{newEvent(EnrollEventProbeStarted, s.ctx.targetNode.String())}, nil
 }
 func stepEnrollProbing(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
-	if next, eff, ev, done, err := guardEnrollActive(s, in, enrollInProbeResult, "probing 仅接受 ProbeResult/Cancel/Expire", "lease expired during probe"); done {
+	if next, eff, ev, done, err := guardEnrollActive(s, in, enrollInProbeResult, "ProbeResult/Cancel/Expire", "lease expired during probe"); done {
 		return next, eff, ev, err
 	}
 	if !in.ok {
@@ -285,14 +285,14 @@ func stepEnrollProbing(s PendingEnrollState, in PendingEnrollInput) (PendingEnro
 	return PendingEnrollState{phase: PendingEnrollPhaseVerified, ctx: s.ctx, hostKeyFingerprint: algebraic.Some(in.hostKeyFingerprint), valid: true}, nil, []PendingEnrollEvent{newEvent(EnrollEventVerified, in.hostKeyFingerprint.String())}, nil
 }
 func stepEnrollVerified(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
-	if next, eff, ev, done, err := guardEnrollActive(s, in, enrollInCommit, "verified 仅接受 Commit/Cancel/Expire", "lease expired before commit"); done {
+	if next, eff, ev, done, err := guardEnrollActive(s, in, enrollInCommit, "Commit/Cancel/Expire", "lease expired before commit"); done {
 		return next, eff, ev, err
 	}
 	return PendingEnrollState{phase: PendingEnrollPhaseCommitting, ctx: s.ctx, hostKeyFingerprint: s.hostKeyFingerprint, valid: true}, []PendingEnrollEffect{enrollEffect(EnrollEffectCommitInventoryCAS, s.ctx.targetNode, s.ctx.pinnedRefs)}, []PendingEnrollEvent{newEvent(EnrollEventCommitStarted, s.ctx.targetNode.String())}, nil
 }
 func stepEnrollCommitting(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
 	if in.kind != enrollInCommitResult {
-		return s, nil, nil, fmt.Errorf("%w: committing 仅接受 CommitResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", "CommitResult"))
 	}
 	switch in.durability {
 	case DurabilityCommitted:
@@ -308,30 +308,30 @@ func stepEnrollCommitting(s PendingEnrollState, in PendingEnrollInput) (PendingE
 }
 func stepEnrollCleaningUp(s PendingEnrollState, in PendingEnrollInput) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, error) {
 	if in.kind != enrollInCleanupResult {
-		return s, nil, nil, fmt.Errorf("%w: cleaning_up 仅接受 CleanupResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", "CleanupResult"))
 	}
 	if in.outcome == SideEffectSucceeded {
 		return PendingEnrollState{phase: PendingEnrollPhaseAborted, ctx: s.ctx, reason: s.reason, valid: true}, []PendingEnrollEffect{enrollEffect(EnrollEffectReleasePins, s.ctx.targetNode, s.ctx.pinnedRefs)}, []PendingEnrollEvent{newEvent(EnrollEventAborted, s.reason)}, nil
 	}
 	return enrollUncertain(s.ctx, pickIf(in.reason != "", in.reason, "cleanup failed or uncertain"))
 }
-func guardEnrollActive(s PendingEnrollState, in PendingEnrollInput, expect uint8, illegalMsg, expMsg string) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, bool, error) {
+func guardEnrollActive(s PendingEnrollState, in PendingEnrollInput, expect uint8, expected, expMsg string) (PendingEnrollState, []PendingEnrollEffect, []PendingEnrollEvent, bool, error) {
 	if in.kind == enrollInCancel {
 		next, eff, ev, err := beginEnrollCleanup(s.ctx, EnrollEventCancelled, pickIf(in.reason != "", in.reason, "cancelled"))
 		return next, eff, ev, true, err
 	}
 	if in.kind != enrollInExpire && in.kind != expect {
-		return s, nil, nil, true, fmt.Errorf("%w: %s", ErrIllegalTransition, illegalMsg)
+		return s, nil, nil, true, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", expected))
 	}
 	if in.now.UTC().Before(s.ctx.stagedAt) {
-		return s, nil, nil, true, fmt.Errorf("%w: 操作时刻早于 staged_at", ErrInvalidInput)
+		return s, nil, nil, true, domi18n.EF(ErrInvalidInput, domi18n.KeyFSMTimeBeforeStaged)
 	}
 	if s.ctx.IsExpiredAt(in.now) {
 		next, eff, ev, err := beginEnrollCleanup(s.ctx, EnrollEventExpired, pickIf(in.kind == enrollInExpire, "lease expired", expMsg))
 		return next, eff, ev, true, err
 	}
 	if in.kind == enrollInExpire {
-		return s, nil, nil, true, fmt.Errorf("%w: 租约尚未到期", ErrIllegalTransition)
+		return s, nil, nil, true, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMLeaseNotExpired)
 	}
 	return PendingEnrollState{}, nil, nil, false, nil
 }

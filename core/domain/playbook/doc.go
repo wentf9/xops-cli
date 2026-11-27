@@ -17,7 +17,6 @@ import (
 	"encoding/binary"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -27,6 +26,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -47,29 +47,29 @@ const (
 
 // 本包导出的规范哨兵错误，所有非法字段、v1 版本、嵌套 ensure、重复步骤、JSON null/未知字段及零值调用均失败关闭。
 var (
-	ErrUnsupportedVersion    = errors.New("playbook: 不支持的 Playbook Schema 版本（仅接受 version=2）")
-	ErrInvalidPlaybookID     = errors.New("playbook: 无效的 PlaybookID")
-	ErrInvalidStepID         = errors.New("playbook: 无效的 StepID")
-	ErrInvalidOnErrorPolicy  = errors.New("playbook: 无效的 OnErrorPolicy")
-	ErrInvalidFileMode       = errors.New("playbook: 无效的 POSIX FileMode")
-	ErrInvalidTargetSelector = errors.New("playbook: 无效的目标节点选择器 TargetSelector")
-	ErrInvalidStepAction     = errors.New("playbook: 无效的步骤动作 StepAction")
-	ErrInvalidEnsureCheck    = errors.New("playbook: StepEnsure.Check 仅允许只读探测动作（shell 或 script）")
-	ErrNestedEnsureForbidden = errors.New("playbook: 禁止在 StepEnsure 内部嵌套 StepEnsure")
-	ErrInvalidStep           = errors.New("playbook: 无效的步骤定义 Step")
-	ErrDuplicateStepID       = errors.New("playbook: Playbook 中存在重复的 StepID")
-	ErrInvalidPlaybook       = errors.New("playbook: 无效的 Playbook 定义")
-	ErrTamperedDigest        = errors.New("playbook: 编码携带的 Playbook 规范摘要与重算结果不匹配")
-	ErrInvalidVar            = errors.New("playbook: 无效的环境变量或模板变量键值")
-	ErrInvalidStepStatus     = errors.New("playbook: 无效的步骤执行状态 StepStatus")
-	ErrInvalidNodeStatus     = errors.New("playbook: 无效的节点汇总状态 NodeStatus")
-	ErrInvalidStepRecord     = errors.New("playbook: 无效的步骤执行记录 StepExecutionRecord")
-	ErrOutcomeStatusMismatch = errors.New("playbook: ExecutionOutcome 与 StepStatus 语义冲突（严禁降级 OutcomeUnknown）")
-	ErrDuplicateStepRecord   = errors.New("playbook: 同一节点的同一步骤存在重复执行记录")
-	ErrUnknownStepID         = errors.New("playbook: 执行记录引用了不在 Playbook 中的 StepID")
-	ErrEmptyReport           = errors.New("playbook: 执行记录列表为空，无法生成 PlaybookReport")
-	ErrNilWriter             = errors.New("playbook: WriteCanonical 或编码目标不能为 nil")
-	ErrNilReceiver           = errors.New("playbook: 反序列化目标接收者不能为 nil")
+	ErrUnsupportedVersion    = domi18n.Sentinel(domi18n.KeyPlaybookUnsupportedVersion)
+	ErrInvalidPlaybookID     = domi18n.Sentinel(domi18n.KeyPlaybookInvalidPlaybookID)
+	ErrInvalidStepID         = domi18n.Sentinel(domi18n.KeyPlaybookInvalidStepID)
+	ErrInvalidOnErrorPolicy  = domi18n.Sentinel(domi18n.KeyPlaybookInvalidOnErrorPolicy)
+	ErrInvalidFileMode       = domi18n.Sentinel(domi18n.KeyPlaybookInvalidFileMode)
+	ErrInvalidTargetSelector = domi18n.Sentinel(domi18n.KeyPlaybookInvalidTargetSelector)
+	ErrInvalidStepAction     = domi18n.Sentinel(domi18n.KeyPlaybookInvalidStepAction)
+	ErrInvalidEnsureCheck    = domi18n.Sentinel(domi18n.KeyPlaybookInvalidEnsureCheck)
+	ErrNestedEnsureForbidden = domi18n.Sentinel(domi18n.KeyPlaybookNestedEnsureForbidden)
+	ErrInvalidStep           = domi18n.Sentinel(domi18n.KeyPlaybookInvalidStep)
+	ErrDuplicateStepID       = domi18n.Sentinel(domi18n.KeyPlaybookDuplicateStepID)
+	ErrInvalidPlaybook       = domi18n.Sentinel(domi18n.KeyPlaybookInvalidPlaybook)
+	ErrTamperedDigest        = domi18n.Sentinel(domi18n.KeyPlaybookTamperedDigest)
+	ErrInvalidVar            = domi18n.Sentinel(domi18n.KeyPlaybookInvalidVar)
+	ErrInvalidStepStatus     = domi18n.Sentinel(domi18n.KeyPlaybookInvalidStepStatus)
+	ErrInvalidNodeStatus     = domi18n.Sentinel(domi18n.KeyPlaybookInvalidNodeStatus)
+	ErrInvalidStepRecord     = domi18n.Sentinel(domi18n.KeyPlaybookInvalidStepRecord)
+	ErrOutcomeStatusMismatch = domi18n.Sentinel(domi18n.KeyPlaybookOutcomeStatusMismatch)
+	ErrDuplicateStepRecord   = domi18n.Sentinel(domi18n.KeyPlaybookDuplicateStepRecord)
+	ErrUnknownStepID         = domi18n.Sentinel(domi18n.KeyPlaybookUnknownStepID)
+	ErrEmptyReport           = domi18n.Sentinel(domi18n.KeyPlaybookEmptyReport)
+	ErrNilWriter             = domi18n.Sentinel(domi18n.KeyPlaybookNilWriter)
+	ErrNilReceiver           = domi18n.Sentinel(domi18n.KeyPlaybookNilReceiver)
 )
 
 type kvEntry struct{ key, value string }
@@ -98,7 +98,7 @@ func parseEnumByName[T ~uint8](raw string, lo, hi, zero T, nameFn func(T) string
 			}
 		}
 	}
-	return zero, fmt.Errorf("%w: %q", baseErr, raw)
+	return zero, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 
 func appendValidText(b []byte, valid bool, text string, baseErr error) ([]byte, error) {
@@ -131,7 +131,7 @@ func unmarshalJSONStrict[T, W any](dst *T, dec *jsontext.Decoder, baseErr error,
 		if _, err := dec.ReadToken(); err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: JSON null 不是有效值", baseErr)
+		return domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden)
 	}
 	var wire W
 	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
@@ -195,7 +195,7 @@ func truncateUTF8(s string, maxBytes int) string {
 
 func validateIdentToken(raw string, baseErr error) error {
 	if raw == "" || len(raw) > maxIDLen || hasSpaceOrForbidden(raw) || raw == "." || raw == ".." || raw[0] == '-' || strings.ContainsAny(raw, forbiddenIDChars) {
-		return fmt.Errorf("%w: %q 格式非法", baseErr, raw)
+		return domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 	}
 	return nil
 }
@@ -228,13 +228,13 @@ func canonicalizeKVMap(raw map[string]string, maxCount, maxValBytes int, keyOK f
 		return nil, nil
 	}
 	if len(raw) > maxCount {
-		return nil, fmt.Errorf("%w: 条目数 %d 超过上限 %d", ErrInvalidVar, len(raw), maxCount)
+		return nil, domi18n.EF(ErrInvalidVar, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "vars"), domi18n.Int("count", len(raw)), domi18n.Int("limit", maxCount))
 	}
 	out := make([]kvEntry, 0, len(raw))
 	for _, k := range slices.Sorted(maps.Keys(raw)) {
 		v := raw[k]
 		if !keyOK(k) || len(v) > maxValBytes || pickIf(allowMultiline, hasForbiddenCommandText(v), hasForbiddenStrictText(v)) {
-			return nil, fmt.Errorf("%w: 非法键值 %q", ErrInvalidVar, k)
+			return nil, domi18n.EF(ErrInvalidVar, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "var"), domi18n.BoundStr("value", k))
 		}
 		out = append(out, kvEntry{key: k, value: v})
 	}

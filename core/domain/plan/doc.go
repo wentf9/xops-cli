@@ -14,11 +14,11 @@ import (
 	"encoding/binary"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
-	"fmt"
 	"io"
 	"unicode"
 	"unicode/utf8"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -29,17 +29,17 @@ const (
 
 // 本包导出的规范哨兵错误，所有非法字段、篡改摘要、JSON null 及零值访问均严格失败关闭。
 var (
-	ErrInvalidDigest          = errors.New("plan: 无效的 SHA-256 摘要")
-	ErrInvalidTransportPolicy = errors.New("plan: 无效的连接传输策略投影 TransportPolicySpec")
-	ErrInvalidHopSpec         = errors.New("plan: 无效的单跳连接规格 HopSpec")
-	ErrInvalidConnectionPlan  = errors.New("plan: 无效的 Merkle 连接计划 SealedConnectionPlan")
-	ErrTamperedPlanDigest     = errors.New("plan: 编码携带的连接计划或跳板 Merkle 摘要与重算结果不匹配")
-	ErrInvalidHandleKind      = errors.New("plan: 无效的句柄类别 HandleKind")
-	ErrInvalidHandleID        = errors.New("plan: 无效的句柄标识 HandleID")
-	ErrInvalidManagedHandle   = errors.New("plan: 无效的世代托管句柄 ManagedHandle")
-	ErrNilEntropy             = errors.New("plan: 熵源 io.Reader 不能为 nil")
-	ErrNilWriter              = errors.New("plan: WriteCanonical 或编码目标不能为 nil")
-	ErrNilReceiver            = errors.New("plan: 反序列化目标接收者不能为 nil")
+	ErrInvalidDigest          = domi18n.Sentinel(domi18n.KeyPlanInvalidDigest)
+	ErrInvalidTransportPolicy = domi18n.Sentinel(domi18n.KeyPlanInvalidTransportPolicy)
+	ErrInvalidHopSpec         = domi18n.Sentinel(domi18n.KeyPlanInvalidHopSpec)
+	ErrInvalidConnectionPlan  = domi18n.Sentinel(domi18n.KeyPlanInvalidConnectionPlan)
+	ErrTamperedPlanDigest     = domi18n.Sentinel(domi18n.KeyPlanTamperedPlanDigest)
+	ErrInvalidHandleKind      = domi18n.Sentinel(domi18n.KeyPlanInvalidHandleKind)
+	ErrInvalidHandleID        = domi18n.Sentinel(domi18n.KeyPlanInvalidHandleID)
+	ErrInvalidManagedHandle   = domi18n.Sentinel(domi18n.KeyPlanInvalidManagedHandle)
+	ErrNilEntropy             = domi18n.Sentinel(domi18n.KeyPlanNilEntropy)
+	ErrNilWriter              = domi18n.Sentinel(domi18n.KeyPlanNilWriter)
+	ErrNilReceiver            = domi18n.Sentinel(domi18n.KeyPlanNilReceiver)
 )
 
 func pickIf[T any](ok bool, yes, no T) T {
@@ -83,7 +83,7 @@ func rejectJSONNull(dec *jsontext.Decoder, baseErr error) (bool, error) {
 	if _, err := dec.ReadToken(); err != nil {
 		return true, err
 	}
-	return true, fmt.Errorf("%w: JSON null 不是有效值", baseErr)
+	return true, domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden)
 }
 
 func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseErr error, build func(W) (T, error)) error {

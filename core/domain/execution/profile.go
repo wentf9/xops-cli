@@ -3,11 +3,11 @@ package execution
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const launchProfileDomainTag = "xops.execution.launch_profile.v1"
@@ -40,7 +40,7 @@ func ParseLaunchDialect(raw string) (LaunchDialect, error) {
 			return DialectRaw, nil
 		}
 	}
-	return DialectUnknown, fmt.Errorf("%w: %q", ErrInvalidLaunchDialect, raw)
+	return DialectUnknown, domi18n.EF(ErrInvalidLaunchDialect, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "launch_dialect"), domi18n.BoundStr("value", raw))
 }
 
 // IsValid 报告 d 是否为已明确声明的合法启动方言（不含零值 DialectUnknown）。
@@ -104,7 +104,7 @@ func ParseInterpreter(raw string) (Interpreter, error) {
 			return InterpreterCmd, nil
 		}
 	}
-	return InterpreterInvalid, fmt.Errorf("%w: %q", ErrInvalidInterpreter, raw)
+	return InterpreterInvalid, domi18n.EF(ErrInvalidInterpreter, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "interpreter"), domi18n.BoundStr("value", raw))
 }
 
 // IsValid 报告 i 是否为受支持的合法解释器。
@@ -166,7 +166,7 @@ func ParseLoginMode(raw string) (LoginMode, error) {
 			return LoginModeInherit, nil
 		}
 	}
-	return LoginModeUnset, fmt.Errorf("%w: %q", ErrInvalidLoginMode, raw)
+	return LoginModeUnset, domi18n.EF(ErrInvalidLoginMode, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "login_mode"), domi18n.BoundStr("value", raw))
 }
 
 // IsValid 报告 m 是否为合法登录模式。
@@ -235,14 +235,14 @@ func POSIXLaunchProfile(interp Interpreter, login LoginMode) (LaunchProfile, err
 // NewLaunchProfile 按严格兼容性矩阵校验并构造不可变 LaunchProfile。
 func NewLaunchProfile(spec LaunchProfileSpec) (LaunchProfile, error) {
 	if !spec.Interpreter.IsValid() {
-		return LaunchProfile{}, fmt.Errorf("%w: %w", ErrInvalidLaunchProfile, ErrInvalidInterpreter)
+		return LaunchProfile{}, domi18n.WrapSentinel(ErrInvalidLaunchProfile, ErrInvalidInterpreter)
 	}
 	if !spec.Login.IsValid() {
-		return LaunchProfile{}, fmt.Errorf("%w: %w", ErrInvalidLaunchProfile, ErrInvalidLoginMode)
+		return LaunchProfile{}, domi18n.WrapSentinel(ErrInvalidLaunchProfile, ErrInvalidLoginMode)
 	}
 	dialect, hasDialect := spec.Dialect.Get()
 	if hasDialect && !dialect.IsValid() {
-		return LaunchProfile{}, fmt.Errorf("%w: %w", ErrInvalidLaunchProfile, ErrInvalidLaunchDialect)
+		return LaunchProfile{}, domi18n.WrapSentinel(ErrInvalidLaunchProfile, ErrInvalidLaunchDialect)
 	}
 	if err := validateProfileCombination(dialect, hasDialect, spec.Interpreter, spec.Login); err != nil {
 		return LaunchProfile{}, err
@@ -259,7 +259,7 @@ func validateProfileCombination(dialect LaunchDialect, hasDialect bool, interp I
 	switch interp {
 	case InterpreterServer:
 		if login != LoginModeInherit {
-			return fmt.Errorf("%w: server 解释器仅允许 login=inherit", ErrUnsupportedExecutionCombination)
+			return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionLoginUnsupported, domi18n.Str("interpreter", interp.String()), domi18n.Str("mode", login.String()))
 		}
 		return nil
 	case InterpreterSH, InterpreterBash, InterpreterZsh:
@@ -269,30 +269,36 @@ func validateProfileCombination(dialect LaunchDialect, hasDialect bool, interp I
 	case InterpreterCmd:
 		return validateCmdProfile(dialect, hasDialect, login)
 	default:
-		return fmt.Errorf("%w: 未知解释器 %d", ErrInvalidLaunchProfile, uint8(interp))
+		return domi18n.EF(ErrInvalidLaunchProfile, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "interpreter"), domi18n.Uint64("value", uint64(interp)))
 	}
 }
 
 func validatePOSIXProfile(dialect LaunchDialect, hasDialect bool, interp Interpreter, login LoginMode) error {
 	if !hasDialect || dialect != DialectPOSIX {
-		return fmt.Errorf("%w: %s 要求 launch_dialect=posix", ErrUnsupportedExecutionCombination, interp)
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionProfileMismatch, domi18n.Str("dialect", dialect.String()), domi18n.Str("interpreter", interp.String()))
 	}
 	if interp == InterpreterSH && login == LoginModeLogin {
-		return fmt.Errorf("%w: sh 不支持 login=login", ErrUnsupportedExecutionCombination)
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionLoginUnsupported, domi18n.Str("interpreter", interp.String()), domi18n.Str("mode", login.String()))
 	}
 	return nil
 }
 
 func validatePowerShellProfile(dialect LaunchDialect, hasDialect bool, interp Interpreter, login LoginMode) error {
-	if !hasDialect || dialect == DialectRaw || login == LoginModeLogin {
-		return fmt.Errorf("%w: %s 要求已知非 raw 方言且不支持 POSIX login=login", ErrUnsupportedExecutionCombination, interp)
+	if login == LoginModeLogin {
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionLoginUnsupported, domi18n.Str("interpreter", interp.String()), domi18n.Str("mode", login.String()))
+	}
+	if !hasDialect || dialect == DialectRaw {
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionProfileMismatch, domi18n.Str("dialect", dialect.String()), domi18n.Str("interpreter", interp.String()))
 	}
 	return nil
 }
 
 func validateCmdProfile(dialect LaunchDialect, hasDialect bool, login LoginMode) error {
-	if !hasDialect || dialect != DialectCmd || login == LoginModeLogin {
-		return fmt.Errorf("%w: cmd 要求 launch_dialect=cmd 且不支持 login=login", ErrUnsupportedExecutionCombination)
+	if login == LoginModeLogin {
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionLoginUnsupported, domi18n.Str("interpreter", InterpreterCmd.String()), domi18n.Str("mode", login.String()))
+	}
+	if !hasDialect || dialect != DialectCmd {
+		return domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionProfileMismatch, domi18n.Str("dialect", dialect.String()), domi18n.Str("interpreter", InterpreterCmd.String()))
 	}
 	return nil
 }
@@ -347,7 +353,7 @@ func (p LaunchProfile) IsPOSIXBourne() bool {
 // ValidatePOSIXBourne 校验当前配置是否满足 POSIX Bourne 要求，不满足时返回 ErrNotPOSIXBourne。
 func (p LaunchProfile) ValidatePOSIXBourne() error {
 	if !p.IsPOSIXBourne() {
-		return fmt.Errorf("%w: dialect=%s interpreter=%s", ErrNotPOSIXBourne, p.Dialect(), p.Interpreter())
+		return domi18n.EF(ErrNotPOSIXBourne, domi18n.KeyExecutionProfileMismatch, domi18n.Str("dialect", p.Dialect().String()), domi18n.Str("interpreter", p.Interpreter().String()))
 	}
 	return nil
 }
@@ -405,7 +411,7 @@ func (p *LaunchProfile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		interp, okI := w.Interpreter.Get()
 		login, okL := w.Login.Get()
 		if !okI || !okL {
-			return LaunchProfile{}, fmt.Errorf("%w: 缺少必需的 interpreter 或 login 字段", ErrInvalidLaunchProfile)
+			return LaunchProfile{}, domi18n.EF(ErrInvalidLaunchProfile, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "interpreter/login"))
 		}
 		return NewLaunchProfile(LaunchProfileSpec{
 			Dialect:     w.Dialect,

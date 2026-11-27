@@ -4,7 +4,6 @@ import (
 	"cmp"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -12,6 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 )
 
@@ -88,13 +88,13 @@ func NewOperationBinding(spec OperationBindingSpec) (OperationBinding, error) {
 func validateBindingSpec(spec OperationBindingSpec) error {
 	switch {
 	case !spec.Capability.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidOperationBinding, ErrInvalidCapability)
+		return domi18n.WrapSentinel(ErrInvalidOperationBinding, ErrInvalidCapability)
 	case !isValidASCIIToken(spec.Tool, maxOperationIDLen) || !isValidASCIIToken(spec.Action, maxOperationIDLen):
-		return fmt.Errorf("%w: tool/action 标识非法", ErrInvalidOperationBinding)
+		return domi18n.EF(ErrInvalidOperationBinding, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "tool/action"))
 	case spec.NodeID != "" && !isValidNodeID(spec.NodeID):
-		return fmt.Errorf("%w: 非法 node_id %q", ErrInvalidOperationBinding, spec.NodeID)
+		return domi18n.EF(ErrInvalidOperationBinding, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "node_id"), domi18n.BoundStr("value", spec.NodeID))
 	case optInvalid(spec.Endpoint) || optInvalid(spec.CommandDigest) || optInvalid(spec.PlanDigest):
-		return fmt.Errorf("%w: 可选 endpoint/command_digest/plan_digest 不可为无效零值", ErrInvalidOperationBinding)
+		return domi18n.EF(ErrInvalidOperationBinding, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "endpoint/digest"))
 	}
 	return nil
 }
@@ -112,7 +112,7 @@ func canonicalizeUniqueFiltered(items []string, field string, baseErr error, val
 	out := make([]string, len(items))
 	for i, item := range items {
 		if !valid(item) {
-			return nil, fmt.Errorf("%w: %s[%d] 非法", baseErr, field, i)
+			return nil, domi18n.EF(baseErr, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", field), domi18n.Int("index", i))
 		}
 		out[i] = item
 	}
@@ -128,10 +128,10 @@ func canonicalizeBindingParams(raw map[string]string) ([]bindingParam, error) {
 	for _, k := range slices.Sorted(maps.Keys(raw)) {
 		v := raw[k]
 		if k == "" || hasInvalidUTF8OrControl(k) {
-			return nil, fmt.Errorf("%w: 参数键 %q 非法", ErrInvalidOperationBinding, k)
+			return nil, domi18n.EF(ErrInvalidOperationBinding, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "parameter"), domi18n.BoundStr("value", k))
 		}
 		if !utf8.ValidString(v) || strings.IndexByte(v, 0) >= 0 {
-			return nil, fmt.Errorf("%w: 参数 %q 的值包含非法 UTF-8 或 NUL 字节", ErrInvalidOperationBinding, k)
+			return nil, domi18n.EF(ErrInvalidOperationBinding, domi18n.KeyCommonInvalidTextChars, domi18n.BoundStr("field", k))
 		}
 		out = append(out, bindingParam{key: k, value: v})
 	}
@@ -274,7 +274,7 @@ func (b *OperationBinding) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		tool, okT := w.Tool.Get()
 		action, okA := w.Action.Get()
 		if !okC || !okT || !okA {
-			return OperationBinding{}, fmt.Errorf("%w: 缺少必需的 capability/tool/action 字段", ErrInvalidOperationBinding)
+			return OperationBinding{}, domi18n.EF(ErrInvalidOperationBinding, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "capability/tool/action"))
 		}
 		return NewOperationBinding(OperationBindingSpec{
 			Capability: capKind, Tool: tool, Action: action, NodeID: w.NodeID, NodeIDs: w.NodeIDs,

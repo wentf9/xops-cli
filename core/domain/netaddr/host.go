@@ -3,11 +3,12 @@ package netaddr
 import (
 	"cmp"
 	"encoding"
-	"fmt"
 	"net/netip"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -74,10 +75,10 @@ type CanonicalHost struct {
 // CanonicalHostFromAddr 从已解析的 netip.Addr 构造规范化 CanonicalHost，并严格校验 IPv6 区段标识。
 func CanonicalHostFromAddr(addr netip.Addr) (CanonicalHost, error) {
 	if !addr.IsValid() {
-		return CanonicalHost{}, fmt.Errorf("%w: 无效的 IP 地址", ErrInvalidHost)
+		return CanonicalHost{}, domi18n.EF(ErrInvalidHost, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ip"))
 	}
 	if err := ValidateIPv6Zone(addr.Zone()); err != nil {
-		return CanonicalHost{}, fmt.Errorf("%w: %w", ErrInvalidHost, err)
+		return CanonicalHost{}, domi18n.WrapSentinel(ErrInvalidHost, err)
 	}
 	if addr.Is4() {
 		return CanonicalHost{addr: addr, kind: HostKindIPv4}, nil
@@ -89,38 +90,38 @@ func CanonicalHostFromAddr(addr netip.Addr) (CanonicalHost, error) {
 // 方括号仅允许包裹合法 IPv6 字面量（禁止 [192.0.2.1] 或 [example.com]）；拒绝一切空白与控制字符。
 func ParseCanonicalHost(raw string) (CanonicalHost, error) {
 	if raw == "" {
-		return CanonicalHost{}, fmt.Errorf("%w: 主机不能为空", ErrInvalidHost)
+		return CanonicalHost{}, domi18n.EF(ErrInvalidHost, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "host"))
 	}
 	if hasForbiddenHostChar(raw) {
-		return CanonicalHost{}, fmt.Errorf("%w: 主机 %q 包含空白、控制字符或非法 UTF-8", ErrInvalidHost, raw)
+		return CanonicalHost{}, domi18n.EF(ErrInvalidHost, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "host"))
 	}
 	if raw[0] == '[' || raw[len(raw)-1] == ']' {
 		return parseBracketedIPv6Host(raw)
 	}
 	if strings.ContainsAny(raw, "[]") {
-		return CanonicalHost{}, fmt.Errorf("%w: 主机 %q 包含非预期方括号", ErrInvalidHost, raw)
+		return CanonicalHost{}, domi18n.EF(ErrInvalidHost, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	if addr, err := netip.ParseAddr(raw); err == nil {
 		return CanonicalHostFromAddr(addr)
 	}
 	folded, err := validateAndFoldRFC1123Hostname(raw)
 	if err != nil {
-		return CanonicalHost{}, fmt.Errorf("%w: %w", ErrInvalidHost, err)
+		return CanonicalHost{}, domi18n.WrapSentinel(ErrInvalidHost, err)
 	}
 	return CanonicalHost{hostname: folded, kind: HostKindDNS}, nil
 }
 
 func parseBracketedIPv6Host(raw string) (CanonicalHost, error) {
 	if len(raw) < 3 || raw[0] != '[' || raw[len(raw)-1] != ']' {
-		return CanonicalHost{}, fmt.Errorf("%w: 畸形方括号主机 %q", ErrInvalidHost, raw)
+		return CanonicalHost{}, domi18n.EF(ErrInvalidHost, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	inner := raw[1 : len(raw)-1]
 	if strings.ContainsAny(inner, "[]") {
-		return CanonicalHost{}, fmt.Errorf("%w: 主机 %q 包含嵌套方括号", ErrInvalidHost, raw)
+		return CanonicalHost{}, domi18n.EF(ErrInvalidHost, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	addr, err := netip.ParseAddr(inner)
 	if err != nil || !addr.Is6() {
-		return CanonicalHost{}, fmt.Errorf("%w: 方括号内 %q 必须为合法 IPv6 字面量", ErrInvalidHost, raw)
+		return CanonicalHost{}, domi18n.EF(ErrInvalidHost, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	return CanonicalHostFromAddr(addr)
 }
@@ -135,14 +136,14 @@ func ValidateIPv6Zone(zone string) error {
 		return nil
 	}
 	if len(zone) > maxIPv6ZoneLen {
-		return fmt.Errorf("%w: 区段 %q 长度超过上限 %d", ErrInvalidZone, zone, maxIPv6ZoneLen)
+		return domi18n.EF(ErrInvalidZone, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "zone"), domi18n.Int("value", len(zone)), domi18n.Int("max", maxIPv6ZoneLen))
 	}
 	if !isZoneStartByte(zone[0]) || zone[len(zone)-1] == '.' {
-		return fmt.Errorf("%w: 区段 %q 首尾字节不符合 ASCII 白名单", ErrInvalidZone, zone)
+		return domi18n.EF(ErrInvalidZone, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "zone"), domi18n.BoundStr("value", zone))
 	}
 	for i := 1; i < len(zone); i++ {
 		if !isZoneBodyByte(zone[i]) {
-			return fmt.Errorf("%w: 区段 %q 包含非白名单字节 0x%02x", ErrInvalidZone, zone, zone[i])
+			return domi18n.EF(ErrInvalidZone, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "zone"), domi18n.BoundStr("value", zone))
 		}
 	}
 	return nil
@@ -302,10 +303,10 @@ func hasForbiddenHostChar(s string) bool {
 
 func validateAndFoldRFC1123Hostname(raw string) (string, error) {
 	if len(raw) == 0 || len(raw) > maxHostnameLen {
-		return "", fmt.Errorf("主机名 %q 长度必须在 [1, %d] 之间", raw, maxHostnameLen)
+		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Str("reason", "length out of range"))
 	}
 	if raw[0] == '.' || raw[len(raw)-1] == '.' {
-		return "", fmt.Errorf("主机名 %q 不得以 '.' 开头或结尾", raw)
+		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Str("reason", "leading or trailing dot"))
 	}
 
 	var b strings.Builder
@@ -330,7 +331,7 @@ func validateAndFoldRFC1123Hostname(raw string) (string, error) {
 	}
 	folded := b.String()
 	if !lastLabelHasAlpha || isHexNumericLabel(folded[lastFoldedStart:]) {
-		return "", fmt.Errorf("主机名 %q 末段标签不得为十进制或十六进制纯数值形式", raw)
+		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Str("reason", "numeric final label"))
 	}
 	return folded, nil
 }
@@ -353,17 +354,17 @@ func isHexNumericLabel(foldedLabel string) bool {
 
 func appendFoldedLabel(b *strings.Builder, label, full string) (bool, error) {
 	if len(label) == 0 || len(label) > maxHostLabelLen {
-		return false, fmt.Errorf("主机名 %q 含有非法长度标签 %q", full, label)
+		return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Str("reason", "invalid label length"))
 	}
 	if label[0] == '-' || label[len(label)-1] == '-' {
-		return false, fmt.Errorf("主机名 %q 标签 %q 不得以 '-' 开头或结尾", full, label)
+		return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Str("reason", "leading or trailing hyphen in label"))
 	}
 	hasAlpha := false
 	for i := 0; i < len(label); i++ {
 		ch := label[i]
 		folded, alpha, ok := foldLabelByte(ch)
 		if !ok {
-			return false, fmt.Errorf("主机名 %q 含有非法字符 %q", full, ch)
+			return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Str("reason", "illegal character in label"))
 		}
 		if alpha {
 			hasAlpha = true

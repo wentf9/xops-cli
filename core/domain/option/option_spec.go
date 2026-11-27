@@ -1,11 +1,11 @@
 package option
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 )
 
@@ -124,7 +124,7 @@ func parseOptionKey(s string) (OptionKey, error) {
 	if key, ok := CanonicalOptionKey(s); ok {
 		return key, nil
 	}
-	return OptionKeyInvalid, fmt.Errorf("%w: %q", ErrUnknownOption, s)
+	return OptionKeyInvalid, domi18n.EF(ErrUnknownOption, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "option"), domi18n.BoundStr("value", s))
 }
 
 // ParseStrictHostKeyChecking 解析 StrictHostKeyChecking（yes/no/ask/accept-new），拒绝控制与格式字符。
@@ -138,7 +138,7 @@ func ParseStrictHostKeyChecking(raw string) (StrictHostKeyCheckingMode, error) {
 			return m, nil
 		}
 	}
-	return StrictHostKeyCheckingUnset, fmt.Errorf("%w: 无效 StrictHostKeyChecking %q", ErrInvalidOption, raw)
+	return StrictHostKeyCheckingUnset, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "strict_host_key_checking"), domi18n.BoundStr("value", raw))
 }
 func (m StrictHostKeyCheckingMode) String() string {
 	return enumName(uint8(m), "yes", "no", "ask", "accept-new")
@@ -173,7 +173,7 @@ type Username struct{ textToken }
 func ParseUsername(raw string) (Username, error) {
 	if hasAnySpaceOrControl(raw) || raw == "" || len(raw) > maxTokenLen ||
 		raw == "." || raw == ".." || raw[0] == '-' || strings.ContainsAny(raw, "@/:[]"+forbiddenHopShellChars) {
-		return Username{}, fmt.Errorf("%w: 无效用户名 %q", ErrInvalidOption, raw)
+		return Username{}, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "username"), domi18n.BoundStr("value", raw))
 	}
 	return Username{textToken{raw, true}}, nil
 }
@@ -191,20 +191,20 @@ type HostNameSpec struct{ textToken }
 // ParseHostNameSpec 按 OpenSSH 模板语法解析 HostName（仅允许 %% 与 %h；含 %h 时探针校验，字面主机经 % -> %% 规范存储）。
 func ParseHostNameSpec(raw string) (HostNameSpec, error) {
 	if hasAnySpaceOrControl(raw) || raw == "" || len(raw) > maxTokenLen || raw[0] == '-' {
-		return HostNameSpec{}, fmt.Errorf("%w: 无效 HostName %q", ErrInvalidOption, raw)
+		return HostNameSpec{}, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "hostname"), domi18n.BoundStr("value", raw))
 	}
 	if err := validateTemplateTokens(raw, "%h", false); err != nil {
-		return HostNameSpec{}, fmt.Errorf("%w: HostName 模板非法: %w", ErrInvalidOption, err)
+		return HostNameSpec{}, domi18n.WrapS(ErrInvalidOption, err, domi18n.KeyOptionTemplateInvalid, domi18n.Str("option", "HostName"))
 	}
 	if strings.Contains(strings.ReplaceAll(raw, "%%", ""), "%h") {
 		if _, err := netaddr.ParseCanonicalHost(strings.NewReplacer("%%", "%", "%h", "host").Replace(raw)); err != nil {
-			return HostNameSpec{}, fmt.Errorf("%w: HostName 模板校验失败: %w", ErrInvalidOption, err)
+			return HostNameSpec{}, domi18n.WrapS(ErrInvalidOption, err, domi18n.KeyOptionTemplateInvalid, domi18n.Str("option", "HostName"))
 		}
 		return HostNameSpec{textToken{raw, true}}, nil
 	}
 	ch, err := netaddr.ParseCanonicalHost(strings.ReplaceAll(raw, "%%", "%"))
 	if err != nil {
-		return HostNameSpec{}, fmt.Errorf("%w: %w", ErrInvalidOption, err)
+		return HostNameSpec{}, domi18n.WrapSentinel(ErrInvalidOption, err)
 	}
 	return HostNameSpec{textToken{strings.ReplaceAll(ch.String(), "%", "%%"), true}}, nil
 }
@@ -212,7 +212,7 @@ func ParseHostNameSpec(raw string) (HostNameSpec, error) {
 // HostNameSpecFromHost 由已校验字面 netaddr.CanonicalHost 构造 HostNameSpec（% -> %% 规范存储，保证带区 IPv6 双射往返）。
 func HostNameSpecFromHost(host netaddr.CanonicalHost) (HostNameSpec, error) {
 	if !host.IsValid() {
-		return HostNameSpec{}, fmt.Errorf("%w: 无效 CanonicalHost", ErrInvalidOption)
+		return HostNameSpec{}, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "hostname"))
 	}
 	return HostNameSpec{textToken{strings.ReplaceAll(host.String(), "%", "%%"), true}}, nil
 }
@@ -231,7 +231,7 @@ type OriginalHostSpec struct {
 // ParseOriginalHost 校验并构造原始主机/别名值对象（IP 字面量规范化，非 IP 别名保留大小写）。
 func ParseOriginalHost(raw string) (OriginalHostSpec, error) {
 	if raw == "" || len(raw) > maxTokenLen || hasAnySpaceOrControl(raw) {
-		return OriginalHostSpec{}, fmt.Errorf("%w: 无效 OriginalHost %q", ErrInvalidEndpoint, raw)
+		return OriginalHostSpec{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "original_host"), domi18n.BoundStr("value", raw))
 	}
 	if ch, err := netaddr.ParseCanonicalHost(raw); err == nil && ch.IsIP() {
 		return OriginalHostSpec{textToken{ch.String(), true}, algebraic.Some(ch)}, nil
@@ -286,20 +286,20 @@ func (h *HostNameSpec) UnmarshalText(t []byte) error {
 }
 
 func parseStrictPortNumber(raw string) (uint16, error) {
-	v, err := parseStrictUint(raw, 1, 16, "端口")
+	v, err := parseStrictUint(raw, 1, 16, "port")
 	return uint16(v), err
 }
 func parseNonNegativeUint32(raw string) (uint32, error) {
-	v, err := parseStrictUint(raw, 0, 32, "非负整数")
+	v, err := parseStrictUint(raw, 0, 32, "uint32")
 	return uint32(v), err
 }
 func parseStrictUint(raw string, minVal uint64, bits int, label string) (uint64, error) {
 	if raw == "" || (raw[0] == '0' && (minVal > 0 || len(raw) > 1)) || !isAllASCIIDigits(raw) {
-		return 0, fmt.Errorf("%w: %s %q 格式非法", ErrInvalidOption, label, raw)
+		return 0, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", label), domi18n.BoundStr("value", raw))
 	}
 	v, err := strconv.ParseUint(raw, 10, bits)
 	if err != nil || v < minVal {
-		return 0, fmt.Errorf("%w: %s %q 超出允许范围", ErrInvalidOption, label, raw)
+		return 0, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", label), domi18n.BoundStr("value", raw))
 	}
 	return v, nil
 }

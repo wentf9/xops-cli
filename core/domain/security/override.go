@@ -3,11 +3,11 @@ package security
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"maps"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // NodeOverrideRule 表示单条经过语法与阈值校验的不可变节点护栏覆盖规则；零值恒无效并严格失败关闭。
@@ -29,13 +29,13 @@ func NewNodeOverrideRule(pattern string, approvalThreshold RiskLevel) (NodeOverr
 // NewNodeOverrideRuleWithFloor 校验模式、审批阈值与强制决策下限，构造完整节点覆盖规则。
 func NewNodeOverrideRuleWithFloor(pattern string, approvalThreshold RiskLevel, decisionFloor DecisionKind) (NodeOverrideRule, error) {
 	if err := ValidateGlob(pattern); err != nil {
-		return NodeOverrideRule{}, fmt.Errorf("%w: %w", ErrInvalidNodeOverride, err)
+		return NodeOverrideRule{}, domi18n.WrapSentinel(ErrInvalidNodeOverride, err)
 	}
 	if !approvalThreshold.IsValid() {
-		return NodeOverrideRule{}, fmt.Errorf("%w: %w", ErrInvalidNodeOverride, ErrInvalidRiskLevel)
+		return NodeOverrideRule{}, domi18n.WrapSentinel(ErrInvalidNodeOverride, ErrInvalidRiskLevel)
 	}
 	if !decisionFloor.IsValid() {
-		return NodeOverrideRule{}, fmt.Errorf("%w: %w", ErrInvalidNodeOverride, ErrInvalidDecision)
+		return NodeOverrideRule{}, domi18n.WrapSentinel(ErrInvalidNodeOverride, ErrInvalidDecision)
 	}
 	return NodeOverrideRule{pattern: pattern, approvalThreshold: approvalThreshold, decisionFloor: decisionFloor, valid: true}, nil
 }
@@ -103,7 +103,7 @@ func (r *NodeOverrideRule) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		th, okT := w.ApprovalThreshold.Get()
 		fl, okF := w.DecisionFloor.Get()
 		if !okP || !okT || !okF {
-			return NodeOverrideRule{}, fmt.Errorf("%w: 缺少必需的 pattern/approval_threshold/decision_floor 字段", ErrInvalidNodeOverride)
+			return NodeOverrideRule{}, domi18n.EF(ErrInvalidNodeOverride, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "pattern/approval_threshold/decision_floor"))
 		}
 		return NewNodeOverrideRuleWithFloor(pat, th, fl)
 	})
@@ -130,7 +130,7 @@ func NewNodeOverrides(rules ...NodeOverrideRule) (NodeOverrides, error) {
 	cloned := make([]NodeOverrideRule, len(rules))
 	for i, rule := range rules {
 		if !rule.IsValid() {
-			return NodeOverrides{}, fmt.Errorf("%w: 第 %d 条规则无效", ErrInvalidNodeOverride, i)
+			return NodeOverrides{}, domi18n.EF(ErrInvalidNodeOverride, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "rules"), domi18n.Int("index", i))
 		}
 		cloned[i] = rule
 	}
@@ -189,13 +189,13 @@ func (o NodeOverrides) Join(other NodeOverrides) NodeOverrides {
 func (o NodeOverrides) matchRules(nodeID string) (matchedAny bool, threshold RiskLevel, floor DecisionKind, err error) {
 	// 即使 o 为 EmptyNodeOverrides()（len(rules)==0），仍须前置校验 nodeID 防止非法 UTF-8/控制字符绕过失败关闭。
 	if !isValidNodeID(nodeID) {
-		return false, RiskUnknown, DecisionKindDeny, fmt.Errorf("%w: 非法 node_id %q", ErrInvalidNodeOverride, nodeID)
+		return false, RiskUnknown, DecisionKindDeny, domi18n.EF(ErrInvalidNodeOverride, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "node_id"), domi18n.BoundStr("value", nodeID))
 	}
 	threshold, floor = RiskDangerous, DecisionKindAllow
 	for _, rule := range o.rules {
 		matched, matchErr := MatchGlob(rule.pattern, nodeID)
 		if matchErr != nil {
-			return false, RiskUnknown, DecisionKindDeny, fmt.Errorf("%w: %w", ErrInvalidNodeOverride, matchErr)
+			return false, RiskUnknown, DecisionKindDeny, domi18n.WrapSentinel(ErrInvalidNodeOverride, matchErr)
 		}
 		if matched {
 			threshold, floor, matchedAny = threshold.StrictestThreshold(rule.approvalThreshold), floor.Join(rule.decisionFloor), true

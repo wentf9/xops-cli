@@ -1,9 +1,10 @@
 package option
 
 import (
-	"fmt"
 	"slices"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // EnvFilter 表示 OpenSSH SendEnv 模式列表及 -PATTERN 减法语义的结合律幺半群。
@@ -22,7 +23,7 @@ func UnsetEnvFilter() EnvFilter { return EnvFilter{} }
 func ParseEnvFilter(raw string) (EnvFilter, error) {
 	fields := strings.Fields(raw)
 	if hasForbiddenControlChar(raw) || len(fields) == 0 {
-		return EnvFilter{}, fmt.Errorf("%w: SendEnv 规则含控制字符或为空", ErrInvalidEnvFilter)
+		return EnvFilter{}, domi18n.EF(ErrInvalidEnvFilter, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "send_env"))
 	}
 	return ParseEnvFilterTokens(fields)
 }
@@ -32,17 +33,17 @@ func ParseEnvFilterTokens(tokens []string) (EnvFilter, error) {
 	var clearSet, added []string
 	for _, tok := range tokens {
 		if hasAnySpaceOrControl(tok) || tok == "" {
-			return EnvFilter{}, fmt.Errorf("%w: 非法 SendEnv 令牌 %q", ErrInvalidEnvFilter, tok)
+			return EnvFilter{}, domi18n.EF(ErrInvalidEnvFilter, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "send_env"), domi18n.BoundStr("value", tok))
 		}
 		if pat, isSub := strings.CutPrefix(tok, "-"); isSub {
 			if !isValidEnvPattern(pat) {
-				return EnvFilter{}, fmt.Errorf("%w: 非法减法模式 %q", ErrInvalidEnvFilter, tok)
+				return EnvFilter{}, domi18n.EF(ErrInvalidEnvFilter, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "send_env"), domi18n.BoundStr("value", tok))
 			}
 			clearSet, added = appendUniqueStrings(clearSet, []string{pat}), filterOutMatchedPatterns(added, []string{pat})
 			continue
 		}
 		if !isValidEnvPattern(tok) {
-			return EnvFilter{}, fmt.Errorf("%w: 非法模式 %q", ErrInvalidEnvFilter, tok)
+			return EnvFilter{}, domi18n.EF(ErrInvalidEnvFilter, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "send_env"), domi18n.BoundStr("value", tok))
 		}
 		added = appendUniqueStrings(added, []string{tok})
 	}

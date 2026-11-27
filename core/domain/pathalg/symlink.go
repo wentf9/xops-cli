@@ -2,9 +2,10 @@ package pathalg
 
 import (
 	"encoding"
-	"fmt"
 	"slices"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 var (
@@ -45,7 +46,7 @@ func ParseSymlinkPolicy(raw string) (SymlinkPolicy, error) {
 	case "follow_operator_source":
 		return SymlinkFollowOperatorSource, nil
 	default:
-		return SymlinkReject, fmt.Errorf("%w: 未知软链接策略 %q", ErrInvalidSymlinkPolicy, raw)
+		return SymlinkReject, domi18n.EF(ErrInvalidSymlinkPolicy, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "symlink_policy"), domi18n.BoundStr("value", raw))
 	}
 }
 
@@ -112,16 +113,16 @@ func (p *SymlinkPolicy) UnmarshalText(text []byte) error {
 func ValidateSymlinkTarget(policy SymlinkPolicy, target string, linkDirDepth int) error {
 	switch policy {
 	case SymlinkReject:
-		return fmt.Errorf("%w: 当前策略 reject 禁止任何符号链接", ErrUnsafeSymlink)
+		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "symlink"), domi18n.Str("state", "reject"))
 	case SymlinkContainedRelative:
 		return ValidateContainedSymlink(target, linkDirDepth)
 	case SymlinkFollowOperatorSource:
 		if target == "" || len(target) > MaxLocalPathBytes || hasForbiddenPathText(target) {
-			return fmt.Errorf("%w: 操作员源软链接目标 %q 语法非法或含控制/Bidi 字符", ErrUnsafeSymlink, target)
+			return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "symlink_target"), domi18n.BoundStr("value", target))
 		}
 		return nil
 	default:
-		return fmt.Errorf("%w: 未知软链接策略 %d", ErrInvalidSymlinkPolicy, policy)
+		return domi18n.EF(ErrInvalidSymlinkPolicy, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "symlink_policy"), domi18n.Int("value", int(policy)))
 	}
 }
 
@@ -135,7 +136,7 @@ func ValidateSymlinkTarget(policy SymlinkPolicy, target string, linkDirDepth int
 //     逐段解析过程中任意中间步深度均严格保持 >= 0（绝不允许先逃出根再折返）。
 func ValidateContainedSymlink(target string, linkDirDepth int) error {
 	if linkDirDepth < 0 {
-		return fmt.Errorf("%w: 非法目录深度 %d", ErrUnsafeSymlink, linkDirDepth)
+		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "link_dir_depth"))
 	}
 	if err := validateContainedSymlinkSyntax(target); err != nil {
 		return err
@@ -148,7 +149,7 @@ func ValidateContainedSymlink(target string, linkDirDepth int) error {
 		case "..":
 			depth--
 			if depth < 0 {
-				return fmt.Errorf("%w: 软链目标 %q 在解析过程中逃逸沙箱根目录", ErrUnsafeSymlink, target)
+				return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target), domi18n.Str("reason", "escapes_root"))
 			}
 		default:
 			depth++
@@ -159,23 +160,23 @@ func ValidateContainedSymlink(target string, linkDirDepth int) error {
 
 func validateContainedSymlinkSyntax(target string) error {
 	if target == "" {
-		return fmt.Errorf("%w: 软链目标不能为空", ErrUnsafeSymlink)
+		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "symlink_target"))
 	}
 	if len(target) > MaxRemotePathBytes {
-		return fmt.Errorf("%w: 软链目标长度 %d 超过上限 %d", ErrUnsafeSymlink, len(target), MaxRemotePathBytes)
+		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "symlink_target"), domi18n.Int("size", len(target)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	if hasForbiddenPathText(target) {
-		return fmt.Errorf("%w: 软链目标 %q 包含非法 UTF-8、控制或 Bidi/Cf 字符", ErrUnsafeSymlink, target)
+		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "symlink_target"))
 	}
 	if strings.HasPrefix(target, "/") || strings.ContainsAny(target, `\:`) {
-		return fmt.Errorf("%w: 软链目标 %q 必须为不含反斜杠与冒号的相对 POSIX 路径", ErrUnsafeSymlink, target)
+		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target), domi18n.Str("reason", "non_relative_or_forbidden_char"))
 	}
 	for seg := range strings.SplitSeq(target, "/") {
 		if seg == "" || seg == "." || seg == ".." {
 			continue
 		}
 		if err := ValidateLocalComponent(seg); err != nil {
-			return fmt.Errorf("%w: 软链目标 %q 含不安全分量: %w", ErrUnsafeSymlink, target, err)
+			return domi18n.WrapSentinel(ErrUnsafeSymlink, err)
 		}
 	}
 	return nil
@@ -193,10 +194,10 @@ type SymlinkBinding struct {
 // NewSymlinkBinding 构造经基础语法校验的沙箱符号链接绑定条目。
 func NewSymlinkBinding(link LocalRootedDest, target string) (SymlinkBinding, error) {
 	if !link.IsValid() {
-		return SymlinkBinding{}, fmt.Errorf("%w: 软链位置无效", ErrUnsafeSymlink)
+		return SymlinkBinding{}, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "symlink_link"))
 	}
 	if target == "" || len(target) > MaxRemotePathBytes || hasForbiddenPathText(target) {
-		return SymlinkBinding{}, fmt.Errorf("%w: 软链目标 %q 语法非法", ErrUnsafeSymlink, target)
+		return SymlinkBinding{}, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "symlink_target"), domi18n.BoundStr("value", target))
 	}
 	return SymlinkBinding{link: link, target: target}, nil
 }
@@ -276,18 +277,15 @@ func buildFoldedSymlinkIndex(ordered []SymlinkBinding) (*foldedSymlinkIndex, err
 	}
 	for _, entry := range ordered {
 		if !entry.IsValid() {
-			return nil, fmt.Errorf("%w: 软链集合包含无效 SymlinkBinding", ErrUnsafeSymlink)
+			return nil, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "symlink_binding"))
 		}
 		rel := entry.link.rel
 		folded, err := foldSlashPath(rel)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrUnsafeSymlink, err)
+			return nil, domi18n.WrapSentinel(ErrUnsafeSymlink, err)
 		}
-		if prev, dup := idx.folded[folded]; dup {
-			if prev.exactRel == rel {
-				return nil, fmt.Errorf("%w: %w: 重复符号链接路径 %q", ErrUnsafeSymlink, ErrNameCollision, rel)
-			}
-			return nil, fmt.Errorf("%w: %w: 软链 %q 与 %q 折叠碰撞", ErrUnsafeSymlink, ErrNameCollision, prev.exactRel, rel)
+		if _, dup := idx.folded[folded]; dup {
+			return nil, domi18n.WrapS(ErrUnsafeSymlink, ErrNameCollision, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "symlink"), domi18n.BoundStr("value", rel))
 		}
 		idx.exact[rel] = entry.target
 		idx.folded[folded] = foldedSymlinkRecord{exactRel: rel, target: entry.target}
@@ -301,7 +299,7 @@ func checkSymlinkParents(idx *foldedSymlinkIndex, parentParts []string) error {
 		if _, found, err := lookupFoldedSymlink(idx, prefix); err != nil {
 			return err
 		} else if found {
-			return fmt.Errorf("%w: 祖先目录分量 %q 命中已有符号链接", ErrUnsafeSymlink, prefix)
+			return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", prefix), domi18n.Str("reason", "ancestor_is_symlink"))
 		}
 	}
 	return nil
@@ -313,7 +311,7 @@ func lookupFoldedSymlink(idx *foldedSymlinkIndex, rel string) (string, bool, err
 	}
 	folded, err := foldSlashPath(rel)
 	if err != nil {
-		return "", false, fmt.Errorf("%w: %w", ErrUnsafeSymlink, err)
+		return "", false, domi18n.WrapSentinel(ErrUnsafeSymlink, err)
 	}
 	if rec, ok := idx.folded[folded]; ok {
 		return rec.target, true, nil
@@ -328,7 +326,7 @@ func walkContainedSymlinkChain(idx *foldedSymlinkIndex, origTarget string, start
 	for len(queue) > 0 {
 		steps++
 		if steps > MaxSymlinkSteps {
-			return fmt.Errorf("%w: 软链 %q 超过最大解析步数上限 (%d)", ErrUnsafeSymlink, origTarget, MaxSymlinkSteps)
+			return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "symlink_steps"), domi18n.Int("count", steps), domi18n.Int("limit", MaxSymlinkSteps))
 		}
 		var err error
 		cur, queue, hops, err = stepContainedSymlink(idx, origTarget, cur, queue, hops)
@@ -344,7 +342,7 @@ func stepContainedSymlink(idx *foldedSymlinkIndex, origTarget string, cur, queue
 	queue = queue[1:]
 	if seg == ".." {
 		if len(cur) == 0 {
-			return nil, nil, hops, fmt.Errorf("%w: 软链 %q 经链式展开后逃逸沙箱根目录", ErrUnsafeSymlink, origTarget)
+			return nil, nil, hops, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", origTarget), domi18n.Str("reason", "chain_escapes_root"))
 		}
 		return cur[:len(cur)-1], queue, hops, nil
 	}
@@ -358,7 +356,7 @@ func stepContainedSymlink(idx *foldedSymlinkIndex, origTarget string, cur, queue
 	}
 	hops++
 	if hops > MaxSymlinkHops {
-		return nil, nil, hops, fmt.Errorf("%w: 软链 %q 超过最大展开跳数上限 (%d)（疑似环路）", ErrUnsafeSymlink, origTarget, MaxSymlinkHops)
+		return nil, nil, hops, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "symlink_hops"), domi18n.Int("count", hops), domi18n.Int("limit", MaxSymlinkHops))
 	}
 	if err := ValidateContainedSymlink(symTarget, len(cur)); err != nil {
 		return nil, nil, hops, err

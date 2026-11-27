@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"slices"
 	"strings"
 	"unicode"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 )
 
@@ -49,14 +49,14 @@ type TransportPolicySpec struct {
 // TransportPolicyFromEffective 从已求解的有效策略提取不可变 TransportPolicySpec。
 func TransportPolicyFromEffective(ep option.EffectivePolicy) (TransportPolicySpec, error) {
 	if !ep.IsValid() {
-		return TransportPolicySpec{}, fmt.Errorf("%w: EffectivePolicy 无效", ErrInvalidTransportPolicy)
+		return TransportPolicySpec{}, domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "effective_policy"))
 	}
 	ciphers, macs, kex, hk := ep.Ciphers(), ep.MACs(), ep.KexAlgorithms(), ep.HostKeyAlgorithms()
 	if len(ciphers) == 0 || len(macs) == 0 || len(kex) == 0 || len(hk) == 0 {
-		return TransportPolicySpec{}, fmt.Errorf("%w: 协商算法集合不可为空", ErrInvalidTransportPolicy)
+		return TransportPolicySpec{}, domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "algorithms"))
 	}
 	if err := option.ValidateProxyRoute(ep.Proxy()); err != nil {
-		return TransportPolicySpec{}, fmt.Errorf("%w: %w", ErrInvalidTransportPolicy, err)
+		return TransportPolicySpec{}, domi18n.WrapSentinel(ErrInvalidTransportPolicy, err)
 	}
 	return TransportPolicySpec{
 		ciphers: ciphers, macs: macs, kexAlgorithms: kex, hostKeyAlgorithms: hk,
@@ -207,12 +207,12 @@ func writeProxyRouteCanonical(enc *canonicalEncoder, route option.ProxyRoute) er
 	}
 	if err := option.ValidateProxyRoute(route); err != nil {
 		enc.fail(ErrInvalidTransportPolicy)
-		return fmt.Errorf("%w: %w", ErrInvalidTransportPolicy, err)
+		return domi18n.WrapSentinel(ErrInvalidTransportPolicy, err)
 	}
 	var buf bytes.Buffer
 	if err := option.MarshalProxyRouteTo(jsontext.NewEncoder(&buf), route); err != nil {
 		enc.fail(ErrInvalidTransportPolicy)
-		return fmt.Errorf("%w: %w", ErrInvalidTransportPolicy, err)
+		return domi18n.WrapSentinel(ErrInvalidTransportPolicy, err)
 	}
 	enc.writeBytes(buf.Bytes())
 	return enc.err
@@ -303,16 +303,16 @@ func decodeTransportPolicyWire(w transportPolicyWire) (TransportPolicySpec, erro
 	sal, okA := w.ServerAliveInterval.Get()
 	sacm, okC := w.ServerAliveCountMax.Get()
 	if !okS || !okA || !okC || len(w.Ciphers) == 0 || len(w.MACs) == 0 || len(w.KexAlgorithms) == 0 || len(w.HostKeyAlgorithms) == 0 {
-		return TransportPolicySpec{}, fmt.Errorf("%w: 缺少必需的算法、主机密钥校验或保活配置字段", ErrInvalidTransportPolicy)
+		return TransportPolicySpec{}, domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "transport_policy"))
 	}
 	if sal.IsNegative() {
-		return TransportPolicySpec{}, fmt.Errorf("%w: server_alive_interval 不能为负", ErrInvalidTransportPolicy)
+		return TransportPolicySpec{}, domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "server_alive_interval"))
 	}
 	if ct, ok := w.ConnectTimeout.Get(); ok && ct.IsNegative() {
-		return TransportPolicySpec{}, fmt.Errorf("%w: connect_timeout 不能为负", ErrInvalidTransportPolicy)
+		return TransportPolicySpec{}, domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "connect_timeout"))
 	}
 	if err := option.ValidateProxyRoute(w.ProxyRoute.route); err != nil {
-		return TransportPolicySpec{}, fmt.Errorf("%w: %w", ErrInvalidTransportPolicy, err)
+		return TransportPolicySpec{}, domi18n.WrapSentinel(ErrInvalidTransportPolicy, err)
 	}
 	lc, err := validateLocalCommandWire(w.PermitLocalCommand, w.LocalCommand)
 	if err != nil {
@@ -340,16 +340,16 @@ func decodeTransportPolicyWire(w transportPolicyWire) (TransportPolicySpec, erro
 // 拒绝空项、逗号、空白、通配符、增删前缀（+/-/^）、非 ASCII 与重复算法名。
 func validateExactAlgoList(list []string) error {
 	if len(list) == 0 {
-		return fmt.Errorf("%w: 算法列表不可为空", ErrInvalidTransportPolicy)
+		return domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "algorithms"))
 	}
 	for _, item := range list {
 		if item == "" || strings.ContainsRune(item, ',') || strings.ContainsFunc(item, unicode.IsSpace) {
-			return fmt.Errorf("%w: 算法名称 %q 非法", ErrInvalidTransportPolicy, item)
+			return domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "algorithm"), domi18n.BoundStr("value", item))
 		}
 	}
 	pol, err := option.ParseAlgoPolicy(strings.Join(list, ","))
 	if err != nil || !pol.IsExact() || !slices.Equal(pol.Tokens(), list) {
-		return fmt.Errorf("%w: 算法列表未通过精确规范算法策略校验", ErrInvalidTransportPolicy)
+		return domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "algorithms"))
 	}
 	return nil
 }
@@ -359,7 +359,7 @@ func validateLocalCommandWire(permit bool, opt algebraic.Option[option.Sanitized
 		return algebraic.None[option.SanitizedCmd](), nil
 	}
 	if c, ok := opt.Get(); ok && !c.IsValid() {
-		return algebraic.None[option.SanitizedCmd](), fmt.Errorf("%w: 无效 local_command", ErrInvalidTransportPolicy)
+		return algebraic.None[option.SanitizedCmd](), domi18n.EF(ErrInvalidTransportPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_command"))
 	}
 	return opt, nil
 }

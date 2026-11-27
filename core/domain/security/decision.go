@@ -4,9 +4,9 @@ import (
 	"cmp"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // DecisionKind 表示 GuardrailDecision 的三态判别枚举，零值恒为 DecisionKindDeny（限制支配吸收元）。
@@ -140,7 +140,7 @@ type DecisionNeedApproval struct {
 // NewDecisionNeedApproval 校验风险等级并构造不可变需审批决策。
 func NewDecisionNeedApproval(risk RiskLevel, reason string) (*DecisionNeedApproval, error) {
 	if !risk.IsValid() {
-		return nil, fmt.Errorf("%w: 审批决策必须绑定有效风险等级", ErrInvalidRiskLevel)
+		return nil, domi18n.EF(ErrInvalidRiskLevel, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "risk"))
 	}
 	return &DecisionNeedApproval{risk: risk, reason: SanitizePromptText(reason), valid: true}, nil
 }
@@ -383,26 +383,26 @@ func encodeDecisionWire(d GuardrailDecision) (decisionWire, error) {
 func decodeDecisionWire(w decisionWire) (GuardrailDecision, error) {
 	kind, ok := w.Kind.Get()
 	if !ok {
-		return nil, fmt.Errorf("%w: 缺少必需的 decision.kind 字段", ErrInvalidDecision)
+		return nil, domi18n.EF(ErrInvalidDecision, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "decision.kind"))
 	}
 	switch kind {
 	case DecisionKindDeny:
 		if w.Risk.IsSome() {
-			return nil, fmt.Errorf("%w: deny 变体不得携带 risk", ErrInvalidDecision)
+			return nil, domi18n.EF(ErrInvalidDecision, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "deny"))
 		}
 		return NewDecisionDenyWithCode(w.Code, w.Reason), nil
 	case DecisionKindNeedApproval:
 		risk, hasRisk := w.Risk.Get()
 		if w.Code != "" || !hasRisk {
-			return nil, fmt.Errorf("%w: need_approval 变体必须携带有效 risk 且不得含 code", ErrInvalidDecision)
+			return nil, domi18n.EF(ErrInvalidDecision, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "need_approval"))
 		}
 		return NewDecisionNeedApproval(risk, w.Reason)
 	case DecisionKindAllow:
 		if w.Code != "" || w.Risk.IsSome() {
-			return nil, fmt.Errorf("%w: allow 变体不得携带 code 或 risk", ErrInvalidDecision)
+			return nil, domi18n.EF(ErrInvalidDecision, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "allow"))
 		}
 		return NewDecisionAllow(w.Reason), nil
 	default:
-		return nil, fmt.Errorf("%w: 未知决策类别 %d", ErrInvalidDecision, uint8(kind))
+		return nil, domi18n.EF(ErrInvalidDecision, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "decision.kind"), domi18n.Uint64("value", uint64(kind)))
 	}
 }

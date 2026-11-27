@@ -2,9 +2,10 @@ package inventory
 
 import (
 	"cmp"
-	"fmt"
 	"slices"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // ImportWarning 描述格式导入过程中产生的非致命诊断告警（已校验单行纯文本）。
@@ -19,15 +20,15 @@ type ImportWarning struct {
 // NewImportWarning 校验告警码、主题与消息并构造不可变 ImportWarning。
 func NewImportWarning(code, subject, message string) (ImportWarning, error) {
 	if err := validateAssetIdent(code, false); err != nil {
-		return ImportWarning{}, fmt.Errorf("%w: 非法告警码 %q", ErrInvalidImportBundle, code)
+		return ImportWarning{}, domi18n.EF(ErrInvalidImportBundle, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "warning_code"), domi18n.BoundStr("value", code))
 	}
 	subj, err := sanitizeSingleLine(strings.TrimSpace(subject), maxIDLen)
 	if err != nil {
-		return ImportWarning{}, fmt.Errorf("%w: subject: %w", ErrInvalidImportBundle, err)
+		return ImportWarning{}, domi18n.WrapS(ErrInvalidImportBundle, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "subject"))
 	}
 	msg, err := sanitizeSingleLine(strings.TrimSpace(message), maxWarningMsgBytes)
 	if err != nil || msg == "" {
-		return ImportWarning{}, fmt.Errorf("%w: 告警消息为空或包含非法字符", ErrInvalidImportBundle)
+		return ImportWarning{}, domi18n.EF(ErrInvalidImportBundle, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "message"))
 	}
 	return ImportWarning{code, subj, msg, true}, nil
 }
@@ -66,19 +67,19 @@ type ImportBundle struct {
 func NewImportBundle(spec ImportBundleSpec) (ImportBundle, error) {
 	fmtName := strings.ToLower(strings.TrimSpace(spec.SourceFormat))
 	if fmtName == "" || len(fmtName) > maxFormatNameLen || validateAssetIdent(fmtName, false) != nil {
-		return ImportBundle{}, fmt.Errorf("%w: 非法 source_format %q", ErrInvalidImportBundle, spec.SourceFormat)
+		return ImportBundle{}, domi18n.EF(ErrInvalidImportBundle, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "source_format"), domi18n.BoundStr("value", spec.SourceFormat))
 	}
 	hosts, _, err := validateUniqueHosts(spec.Hosts)
 	if err != nil {
-		return ImportBundle{}, fmt.Errorf("%w: %w", ErrInvalidImportBundle, err)
+		return ImportBundle{}, domi18n.WrapSentinel(ErrInvalidImportBundle, err)
 	}
 	idents, _, err := indexUnique(spec.Identities, Identity.IsValid, Identity.ID, IdentityID.Compare, ErrInvalidIdentity)
 	if err != nil {
-		return ImportBundle{}, fmt.Errorf("%w: %w", ErrInvalidImportBundle, err)
+		return ImportBundle{}, domi18n.WrapSentinel(ErrInvalidImportBundle, err)
 	}
 	nodes, err := validateBundleNodes(spec.Nodes)
 	if err != nil {
-		return ImportBundle{}, fmt.Errorf("%w: %w", ErrInvalidImportBundle, err)
+		return ImportBundle{}, domi18n.WrapSentinel(ErrInvalidImportBundle, err)
 	}
 	warnings, err := cloneAndSortWarnings(spec.Warnings)
 	if err != nil {
@@ -97,7 +98,7 @@ func validateBundleNodes(raw []Node) ([]Node, error) {
 		for _, a := range n.aliases {
 			s := a.String()
 			if seenID[NodeID{assetIDToken{s}}] || seenAlias[s] {
-				return nil, fmt.Errorf("%w: 导入包别名 %q 发生冲突", ErrDuplicateAssetID, s)
+				return nil, domi18n.EF(ErrDuplicateAssetID, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "alias"), domi18n.BoundStr("value", s))
 			}
 			seenAlias[s] = true
 		}
@@ -111,7 +112,7 @@ func cloneAndSortWarnings(raw []ImportWarning) ([]ImportWarning, error) {
 	}
 	out := slices.Clone(raw)
 	if slices.ContainsFunc(out, func(w ImportWarning) bool { return !w.IsValid() }) {
-		return nil, fmt.Errorf("%w: warnings 含无效条目", ErrInvalidImportBundle)
+		return nil, domi18n.EF(ErrInvalidImportBundle, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "warnings"))
 	}
 	slices.SortFunc(out, func(a, b ImportWarning) int {
 		return cmp.Or(cmp.Compare(a.code, b.code), cmp.Compare(a.subject, b.subject), cmp.Compare(a.message, b.message))

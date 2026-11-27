@@ -1,9 +1,8 @@
 package fsm
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -19,22 +18,22 @@ func NewTransferState(meta TransferMeta) (*TransferInitialized, error) {
 func TransferInputStart() TransferInput { return TransferInput{kind: transferInStart, valid: true} }
 func TransferInputChunk(offset, length uint64, chunkDigest security.Digest) (TransferInput, error) {
 	if length == 0 || length > MaxTransferChunkBytes {
-		return TransferInput{}, fmt.Errorf("%w: 分片长度 %d 必须落在 [1, %d]", ErrInvalidChunkOffset, length, MaxTransferChunkBytes)
+		return TransferInput{}, domi18n.EF(ErrInvalidChunkOffset, domi18n.KeyCommonFieldRange, domi18n.Str("field", "chunk_length"), domi18n.Uint64("value", length), domi18n.Int("min", 1), domi18n.Uint64("max", MaxTransferChunkBytes))
 	}
 	if !chunkDigest.IsValid() {
-		return TransferInput{}, fmt.Errorf("%w: 分片摘要必须有效", ErrInvalidInput)
+		return TransferInput{}, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "chunk_digest"))
 	}
 	return TransferInput{kind: transferInChunk, offset: offset, length: length, digest: chunkDigest, valid: true}, nil
 }
 func TransferInputVerifyResult(ok bool, actualDigest security.Digest, reason string) (TransferInput, error) {
 	if ok && !actualDigest.IsValid() {
-		return TransferInput{}, fmt.Errorf("%w: 校验成功必须携带有效摘要", ErrInvalidInput)
+		return TransferInput{}, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "actual_digest"))
 	}
 	return TransferInput{kind: transferInVerifyResult, ok: ok, digest: actualDigest, reason: sanitizeReason(reason), valid: true}, nil
 }
 func TransferInputCommitResult(durability DurabilityStatus, reason string) (TransferInput, error) {
 	if !durability.IsValid() {
-		return TransferInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidDurability)
+		return TransferInput{}, domi18n.WrapSentinel(ErrInvalidInput, ErrInvalidDurability)
 	}
 	return TransferInput{kind: transferInCommitResult, durability: durability, reason: sanitizeReason(reason), valid: true}, nil
 }
@@ -63,7 +62,7 @@ func TransitionTransfer(state TransferState, input TransferInput) (TransferState
 	case *TransferCommitting:
 		return stepTransferCommitting(s, input)
 	case *TransferCommitted, *TransferAborted, *TransferUncertainCommit:
-		return state, nil, nil, fmt.Errorf("%w: 终态 %s 不接受输入", ErrIllegalTransition, s.Kind())
+		return state, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMTerminalState, domi18n.Str("state", s.Kind().String()))
 	default:
 		return state, nil, nil, ErrInvalidState
 	}
@@ -83,7 +82,7 @@ func stepTransferInitialized(s *TransferInitialized, in TransferInput) (Transfer
 	case transferInAbort:
 		return &TransferAborted{tMix(s.meta, TransferKindAborted, in.reason)}, []TransferEffect{simpleTransferEffect(TransferEffectCleanupStaging)}, []TransferEvent{transferEvent(TransferEventAborted, 0, in.reason)}, nil
 	default:
-		return s, nil, nil, fmt.Errorf("%w: initialized 仅接受 Start 或 Abort", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "Start/Abort"))
 	}
 }
 func stepTransferStreaming(s *TransferStreaming, in TransferInput) (TransferState, []TransferEffect, []TransferEvent, error) {
@@ -93,15 +92,15 @@ func stepTransferStreaming(s *TransferStreaming, in TransferInput) (TransferStat
 	case transferInAbort:
 		return abortTransferWithJournal(s, s.meta, s.offset, s.nextSeq, s.lastDigest, in.reason)
 	default:
-		return s, nil, nil, fmt.Errorf("%w: streaming 仅接受 Chunk 或 Abort", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "Chunk/Abort"))
 	}
 }
 func acceptTransferChunk(s *TransferStreaming, in TransferInput) (TransferState, []TransferEffect, []TransferEvent, error) {
 	if in.offset != s.offset {
-		return s, nil, nil, fmt.Errorf("%w: 期望偏移 %d，实际 %d", ErrInvalidChunkOffset, s.offset, in.offset)
+		return s, nil, nil, domi18n.EF(ErrInvalidChunkOffset, domi18n.KeyCommonMismatch, domi18n.Str("field", "offset"), domi18n.Uint64("expected", s.offset), domi18n.Uint64("actual", in.offset))
 	}
 	if in.length > s.meta.totalBytes-s.offset {
-		return s, nil, nil, fmt.Errorf("%w: 分片长度 %d 超出剩余字节数 %d", ErrTransferSizeExceeded, in.length, s.meta.totalBytes-s.offset)
+		return s, nil, nil, domi18n.EF(ErrTransferSizeExceeded, domi18n.KeyFSMChunkRemainingExceeded, domi18n.Uint64("length", in.length), domi18n.Uint64("remaining", s.meta.totalBytes-s.offset))
 	}
 	rec, err := buildFollowRecord(s.meta, s.nextSeq, s.lastDigest, JournalRecordChunk, in.offset, in.length, algebraic.Some(in.digest))
 	if err != nil {
@@ -132,12 +131,12 @@ func stepTransferVerifying(s *TransferVerifying, in TransferInput) (TransferStat
 	case transferInAbort:
 		return abortTransferWithJournal(s, s.meta, s.meta.totalBytes, s.nextSeq, s.lastDigest, in.reason)
 	default:
-		return s, nil, nil, fmt.Errorf("%w: verifying 仅接受 VerifyResult 或 Abort", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "VerifyResult/Abort"))
 	}
 }
 func stepTransferCommitting(s *TransferCommitting, in TransferInput) (TransferState, []TransferEffect, []TransferEvent, error) {
 	if in.kind != transferInCommitResult {
-		return s, nil, nil, fmt.Errorf("%w: committing 仅接受 CommitResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "CommitResult"))
 	}
 	switch in.durability {
 	case DurabilityCommitted:
@@ -180,7 +179,7 @@ func RecoverTransferFromDualJournal(active, staging []TransferJournalRecord) (Tr
 	mA, _, errHeadA := parseJournalInitMeta(active)
 	mS, _, errHeadS := parseJournalInitMeta(staging)
 	if errHeadA == nil && errHeadS == nil && (!sameTransferIdentity(mA, mS) || mA.generation == mS.generation) {
-		return nil, nil, nil, fmt.Errorf("%w: 双代 Journal 元数据不一致或世代号重复", ErrCorruptJournal)
+		return nil, nil, nil, domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "dual_journal_meta"))
 	}
 	stA, effA, evA, errA := RecoverTransferFromJournal(active)
 	stS, effS, evS, errS := RecoverTransferFromJournal(staging)
@@ -206,7 +205,7 @@ func selectBothValidDualJournal(mA TransferMeta, stA TransferState, effA []Trans
 		loSt, hiSt, hiEff, hiEv = stS, stA, effA, evA
 	}
 	if loSt.Kind() == TransferKindCommitted && hiSt.Kind() != TransferKindCommitted {
-		return nil, nil, nil, fmt.Errorf("%w: 低世代已提交而高世代未提交（双代脑裂）", ErrCorruptJournal)
+		return nil, nil, nil, domi18n.EF(ErrCorruptJournal, domi18n.KeyFSMJournalSplitBrain)
 	}
 	return hiSt, hiEff, hiEv, nil
 }
@@ -215,10 +214,10 @@ func selectSingleValidDualJournal(hasHeadA bool, mA TransferMeta, stA TransferSt
 		return stA, effA, evA, nil
 	}
 	if errS != nil {
-		return nil, nil, nil, fmt.Errorf("%w: active 与 staging Journal 均损坏: %w", ErrCorruptJournal, errA)
+		return nil, nil, nil, domi18n.WrapS(ErrCorruptJournal, errA, domi18n.KeyFSMJournalBothCorrupt)
 	}
 	if !hasHeadA || mS.generation <= mA.generation {
-		return nil, nil, nil, fmt.Errorf("%w: 禁止从损坏的高世代或未知世代 active 回退至旧世代 staging: %w", ErrCorruptJournal, errA)
+		return nil, nil, nil, domi18n.WrapS(ErrCorruptJournal, errA, domi18n.KeyFSMJournalRollbackForbidden)
 	}
 	return stS, effS, evS, nil
 }

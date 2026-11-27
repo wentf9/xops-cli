@@ -3,9 +3,10 @@ package pathalg
 import (
 	"cmp"
 	"encoding"
-	"fmt"
 	"slices"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 var (
@@ -66,7 +67,7 @@ type LocalDir struct {
 func ParseLocalDir(raw string) (LocalDir, error) {
 	canon, kind, drive, err := parseLocalPath(raw, true)
 	if err != nil {
-		return LocalDir{}, fmt.Errorf("%w: %w", ErrInvalidLocalDir, err)
+		return LocalDir{}, domi18n.WrapSentinel(ErrInvalidLocalDir, err)
 	}
 	return LocalDir{canon: canon, kind: kind, drive: drive}, nil
 }
@@ -100,10 +101,10 @@ func (d LocalDir) String() string { return d.canon }
 // 正确处理 POSIX 根目录 "/"、Windows 盘符根目录 "C:/" 与当前目录 "."（绝不产生 "//sub"）。
 func (d LocalDir) JoinComponent(name string) (LocalDir, error) {
 	if !d.IsValid() {
-		return LocalDir{}, fmt.Errorf("%w: 无法在无效 LocalDir 上追加分量", ErrInvalidLocalDir)
+		return LocalDir{}, domi18n.EF(ErrInvalidLocalDir, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_dir"))
 	}
 	if err := ValidateLocalComponent(name); err != nil {
-		return LocalDir{}, fmt.Errorf("%w: %w", ErrInvalidLocalDir, err)
+		return LocalDir{}, domi18n.WrapSentinel(ErrInvalidLocalDir, err)
 	}
 	return joinLocalDirRel(d, name)
 }
@@ -112,10 +113,10 @@ func (d LocalDir) JoinComponent(name string) (LocalDir, error) {
 // 正确处理 POSIX 根目录 "/"、Windows 盘符根目录 "C:/" 与当前目录 "."（绝不产生 "//sub"）。
 func (d LocalDir) JoinDest(dest LocalRootedDest) (LocalDir, error) {
 	if !d.IsValid() {
-		return LocalDir{}, fmt.Errorf("%w: 无法在无效 LocalDir 上拼接沙箱路径", ErrInvalidLocalDir)
+		return LocalDir{}, domi18n.EF(ErrInvalidLocalDir, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_dir"))
 	}
 	if !dest.IsValid() {
-		return LocalDir{}, fmt.Errorf("%w: %w", ErrInvalidLocalDir, ErrInvalidLocalDest)
+		return LocalDir{}, domi18n.WrapSentinel(ErrInvalidLocalDir, ErrInvalidLocalDest)
 	}
 	return joinLocalDirRel(d, dest.rel)
 }
@@ -131,7 +132,7 @@ func joinLocalDirRel(d LocalDir, rel string) (LocalDir, error) {
 		joined = d.canon + "/" + rel
 	}
 	if len(joined) > MaxLocalPathBytes {
-		return LocalDir{}, fmt.Errorf("%w: 拼接后路径长度 %d 超过上限 %d", ErrInvalidLocalDir, len(joined), MaxLocalPathBytes)
+		return LocalDir{}, domi18n.EF(ErrInvalidLocalDir, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_dir"), domi18n.Int("size", len(joined)), domi18n.Int("limit", MaxLocalPathBytes))
 	}
 	return LocalDir{canon: joined, kind: d.kind, drive: d.drive}, nil
 }
@@ -192,7 +193,7 @@ type LocalSourcePath struct {
 func ParseLocalSourcePath(raw string) (LocalSourcePath, error) {
 	canon, kind, drive, err := parseLocalPath(raw, false)
 	if err != nil {
-		return LocalSourcePath{}, fmt.Errorf("%w: %w", ErrInvalidLocalSource, err)
+		return LocalSourcePath{}, domi18n.WrapSentinel(ErrInvalidLocalSource, err)
 	}
 	return LocalSourcePath{canon: canon, kind: kind, drive: drive}, nil
 }
@@ -300,16 +301,16 @@ func (s *LocalSourcePath) UnmarshalText(text []byte) error {
 
 func parseLocalPath(raw string, allowRootOrDot bool) (canon string, kind LocalPathKind, drive byte, err error) {
 	if raw == "" {
-		return "", LocalPathInvalid, 0, fmt.Errorf("路径不能为空")
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "local_path"))
 	}
 	if len(raw) > MaxLocalPathBytes {
-		return "", LocalPathInvalid, 0, fmt.Errorf("路径长度 %d 超过上限 %d", len(raw), MaxLocalPathBytes)
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_path"), domi18n.Int("size", len(raw)), domi18n.Int("limit", MaxLocalPathBytes))
 	}
 	if hasForbiddenPathText(raw) {
-		return "", LocalPathInvalid, 0, fmt.Errorf("路径 %q 包含非法 UTF-8、控制字符或不可见/Bidi 字符", raw)
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "local_path"))
 	}
 	if hasDisallowedLocalPrefix(raw) {
-		return "", LocalPathInvalid, 0, fmt.Errorf("路径 %q 使用了禁止的 UNC、设备命名空间或根相对反斜杠前缀", raw)
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "disallowed_prefix"))
 	}
 	if hasWindowsDrivePrefix(raw) {
 		return parseWindowsDriveLocalPath(raw, allowRootOrDot)
@@ -334,7 +335,7 @@ func hasDisallowedLocalPrefix(raw string) bool {
 
 func parseWindowsDriveLocalPath(raw string, allowRoot bool) (string, LocalPathKind, byte, error) {
 	if len(raw) < 3 || (raw[2] != '\\' && raw[2] != '/') {
-		return "", LocalPathInvalid, 0, fmt.Errorf("盘符路径 %q 缺少盘符后分隔符（禁止盘符相对路径）", raw)
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "drive_relative"))
 	}
 	drive := toUpperASCII(raw[0])
 	rest := strings.ReplaceAll(raw[3:], "\\", "/")
@@ -344,7 +345,7 @@ func parseWindowsDriveLocalPath(raw string, allowRoot bool) (string, LocalPathKi
 	}
 	if len(segs) == 0 {
 		if !allowRoot {
-			return "", LocalPathInvalid, 0, fmt.Errorf("本地源路径 %q 不能为裸盘符根目录", raw)
+			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "bare_drive_root"))
 		}
 		return string([]byte{drive, ':', '/'}), LocalPathWindowsDrive, drive, nil
 	}
@@ -353,7 +354,7 @@ func parseWindowsDriveLocalPath(raw string, allowRoot bool) (string, LocalPathKi
 
 func parsePOSIXAbsLocalPath(raw string, allowRoot bool) (string, LocalPathKind, byte, error) {
 	if strings.ContainsRune(raw, '\\') {
-		return "", LocalPathInvalid, 0, fmt.Errorf("POSIX 绝对路径 %q 禁止混用反斜杠 '\\'", raw)
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyPathalgForbiddenChar, domi18n.BoundStr("value", raw), domi18n.Str("char", `\`))
 	}
 	segs, err := parseLocalSegments(raw[1:], false)
 	if err != nil {
@@ -361,7 +362,7 @@ func parsePOSIXAbsLocalPath(raw string, allowRoot bool) (string, LocalPathKind, 
 	}
 	if len(segs) == 0 {
 		if !allowRoot {
-			return "", LocalPathInvalid, 0, fmt.Errorf("本地源路径 %q 不能为裸根目录 '/'", raw)
+			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "bare_root"))
 		}
 		return "/", LocalPathPOSIXAbs, 0, nil
 	}
@@ -379,7 +380,7 @@ func parseRelativeLocalPath(raw string, allowDot bool) (string, LocalPathKind, b
 	}
 	if len(segs) == 0 {
 		if !allowDot {
-			return "", LocalPathInvalid, 0, fmt.Errorf("本地源路径 %q 不能解析为当前目录 '.'", raw)
+			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "current_dir"))
 		}
 		return ".", LocalPathRelative, 0, nil
 	}
@@ -388,7 +389,7 @@ func parseRelativeLocalPath(raw string, allowDot bool) (string, LocalPathKind, b
 	// 防止序列化往返时与被禁止的 Windows 盘符相对路径（"C:foo"）发生语法歧义。
 	if hasWindowsDrivePrefix(segs[0]) {
 		if len(joined)+2 > MaxLocalPathBytes {
-			return "", LocalPathInvalid, 0, fmt.Errorf("规范化路径长度超过上限 %d", MaxLocalPathBytes)
+			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_path"), domi18n.Int("size", len(joined)+2), domi18n.Int("limit", MaxLocalPathBytes))
 		}
 		return "./" + joined, LocalPathRelative, 0, nil
 	}
@@ -405,14 +406,14 @@ func parseLocalSegments(rest string, strictComponent bool) ([]string, error) {
 			continue
 		}
 		if seg == ".." {
-			return nil, fmt.Errorf("本地路径禁止包含相对穿越段 '..'")
+			return nil, domi18n.E(domi18n.KeyPathalgTraversalForbidden, domi18n.Str("segment", ".."))
 		}
 		if strictComponent {
 			if err := ValidateLocalComponent(seg); err != nil {
 				return nil, err
 			}
 		} else if len(seg) > MaxComponentBytes {
-			return nil, fmt.Errorf("路径分量 %q 长度 %d 超过上限 %d", seg, len(seg), MaxComponentBytes)
+			return nil, domi18n.E(domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "component"), domi18n.Int("size", len(seg)), domi18n.Int("limit", MaxComponentBytes))
 		}
 		out = append(out, seg)
 	}

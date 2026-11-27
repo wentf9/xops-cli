@@ -1,9 +1,8 @@
 package fsm
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -94,10 +93,10 @@ type (
 // NewVaultSagaContext 校验 Saga 标识与新旧凭据引用（OldRef 若存在须有效且不同于 NewRef），零明文、零凭据摘要。
 func NewVaultSagaContext(spec VaultSagaContextSpec) (VaultSagaContext, error) {
 	if !spec.SagaID.IsValid() || !spec.NewRef.IsValid() {
-		return VaultSagaContext{}, fmt.Errorf("%w: saga_id 与 new_ref 均须有效", ErrInvalidContext)
+		return VaultSagaContext{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "saga_id/new_ref"))
 	}
 	if old, ok := spec.OldRef.Get(); ok && (!old.IsValid() || old.Equal(spec.NewRef)) {
-		return VaultSagaContext{}, fmt.Errorf("%w: old_ref 必须有效且不同于 new_ref", ErrInvalidContext)
+		return VaultSagaContext{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "old_ref"))
 	}
 	return VaultSagaContext{spec.SagaID, spec.NewRef, spec.OldRef, spec.ExpectedCASVersion, true}, nil
 }

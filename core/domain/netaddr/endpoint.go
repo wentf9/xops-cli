@@ -2,10 +2,11 @@ package netaddr
 
 import (
 	"encoding"
-	"fmt"
 	"net/netip"
 	"strconv"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 var (
@@ -32,7 +33,7 @@ type Endpoint struct {
 func NewEndpoint(host CanonicalHost, port uint16) (Endpoint, error) {
 	hp, err := NewHostPort(host, port)
 	if err != nil {
-		return Endpoint{}, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+		return Endpoint{}, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 	}
 	return Endpoint{addr: hp}, nil
 }
@@ -45,7 +46,7 @@ func NewDefaultEndpoint(host CanonicalHost) (Endpoint, error) {
 // NewEndpointFromHostPort 将已验证的 HostPort 提升为 SSH Endpoint。
 func NewEndpointFromHostPort(hp HostPort) (Endpoint, error) {
 	if !hp.IsValid() {
-		return Endpoint{}, fmt.Errorf("%w: %w", ErrInvalidEndpoint, ErrInvalidHostPort)
+		return Endpoint{}, domi18n.WrapSentinel(ErrInvalidEndpoint, ErrInvalidHostPort)
 	}
 	return Endpoint{addr: hp}, nil
 }
@@ -55,16 +56,16 @@ func NewEndpointFromHostPort(hp HostPort) (Endpoint, error) {
 // 拒绝空白、控制字符、显式端口 0、前导零端口及非 IPv6 方括号包裹。
 func ParseEndpoint(raw string) (Endpoint, error) {
 	if raw == "" {
-		return Endpoint{}, fmt.Errorf("%w: 端点不能为空", ErrInvalidEndpoint)
+		return Endpoint{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "endpoint"))
 	}
 	if hasForbiddenHostChar(raw) {
-		return Endpoint{}, fmt.Errorf("%w: %q 包含空白、控制字符或非法 UTF-8", ErrInvalidEndpoint, raw)
+		return Endpoint{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "endpoint"))
 	}
 	if raw[0] == '[' {
 		return parseBracketedEndpoint(raw)
 	}
 	if strings.ContainsAny(raw, "[]") {
-		return Endpoint{}, fmt.Errorf("%w: %q 包含非预期方括号", ErrInvalidEndpoint, raw)
+		return Endpoint{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	return parseUnbracketedEndpoint(raw)
 }
@@ -72,23 +73,23 @@ func ParseEndpoint(raw string) (Endpoint, error) {
 func parseBracketedEndpoint(raw string) (Endpoint, error) {
 	closeIdx := strings.IndexByte(raw, ']')
 	if closeIdx < 2 {
-		return Endpoint{}, fmt.Errorf("%w: 畸形方括号端点 %q", ErrInvalidEndpoint, raw)
+		return Endpoint{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	hostPart := raw[:closeIdx+1]
 	rest := raw[closeIdx+1:]
 	if rest == "" {
 		host, err := ParseCanonicalHost(hostPart)
 		if err != nil {
-			return Endpoint{}, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+			return Endpoint{}, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 		}
 		return NewDefaultEndpoint(host)
 	}
 	if rest[0] != ':' {
-		return Endpoint{}, fmt.Errorf("%w: 端点 %q 方括号后存在非法后缀", ErrInvalidEndpoint, raw)
+		return Endpoint{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyNetaddrBracketsMalformed, domi18n.BoundStr("value", raw))
 	}
 	hp, err := buildHostPort(hostPart, rest[1:])
 	if err != nil {
-		return Endpoint{}, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+		return Endpoint{}, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 	}
 	return Endpoint{addr: hp}, nil
 }
@@ -98,25 +99,25 @@ func parseUnbracketedEndpoint(raw string) (Endpoint, error) {
 	case 0:
 		host, err := ParseCanonicalHost(raw)
 		if err != nil {
-			return Endpoint{}, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+			return Endpoint{}, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 		}
 		return NewDefaultEndpoint(host)
 	case 1:
 		hostPart, portPart, _ := strings.Cut(raw, ":")
 		hp, err := buildHostPort(hostPart, portPart)
 		if err != nil {
-			return Endpoint{}, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+			return Endpoint{}, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 		}
 		return Endpoint{addr: hp}, nil
 	default:
 		// 含两个及以上冒号且无方括号时，仅允许作为合法裸 IPv6 字面量（默认 SSH 端口 22）。
 		addr, err := netip.ParseAddr(raw)
 		if err != nil || !addr.Is6() {
-			return Endpoint{}, fmt.Errorf("%w: %q 既非合法裸 IPv6 也非规范 <host>:<port>", ErrInvalidEndpoint, raw)
+			return Endpoint{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyNetaddrHostPortFormat, domi18n.BoundStr("value", raw))
 		}
 		host, err := CanonicalHostFromAddr(addr)
 		if err != nil {
-			return Endpoint{}, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+			return Endpoint{}, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 		}
 		return NewDefaultEndpoint(host)
 	}
@@ -150,7 +151,7 @@ func (e Endpoint) HostPort() HostPort {
 // WithPort 返回替换为新非零端口的 Endpoint 副本；若当前端点无效或 port == 0 则失败关闭。
 func (e Endpoint) WithPort(port uint16) (Endpoint, error) {
 	if !e.IsValid() {
-		return Endpoint{}, fmt.Errorf("%w: 禁止修改无效 Endpoint 的端口", ErrInvalidEndpoint)
+		return Endpoint{}, domi18n.EF(ErrInvalidEndpoint, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "endpoint"))
 	}
 	return NewEndpoint(e.addr.Host(), port)
 }

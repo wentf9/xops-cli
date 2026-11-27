@@ -17,7 +17,7 @@
 // 并以指针接收者实现 encoding.TextUnmarshaler，原生支持 Go 1.27 encoding/json/v2 与 YAML 确定性往返。
 package pathalg
 
-import "errors"
+import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 const (
 	// MaxComponentBytes 是单个路径分量允许的最大 UTF-8 字节长度（对齐 POSIX NAME_MAX 与 NTFS/APFS 255 单元上限）。
@@ -33,40 +33,40 @@ const (
 )
 
 // ErrInvalidComponent 表示单个本地文件名/目录分量违反跨平台安全规则。
-var ErrInvalidComponent = errors.New("pathalg: 无效的本地路径分量")
+var ErrInvalidComponent = domi18n.Sentinel(domi18n.KeyPathalgInvalidComponent)
 
 // ErrInvalidRemoteName 表示单个远端 POSIX 目录项名称为空、含 '/'、为 '.'/'..' 或含控制/Bidi 字符。
-var ErrInvalidRemoteName = errors.New("pathalg: 无效的远端名称")
+var ErrInvalidRemoteName = domi18n.Sentinel(domi18n.KeyPathalgInvalidRemoteName)
 
 // ErrInvalidRemotePath 表示远端 POSIX 路径为空、超长、含非法 UTF-8 或含控制/Bidi 字符。
-var ErrInvalidRemotePath = errors.New("pathalg: 无效的远端路径")
+var ErrInvalidRemotePath = domi18n.Sentinel(domi18n.KeyPathalgInvalidRemotePath)
 
 // ErrInvalidLocalDest 表示面向 ScopedRootFS 的沙箱相对目标路径非法或存在逃逸风险。
-var ErrInvalidLocalDest = errors.New("pathalg: 无效的本地沙箱目标路径")
+var ErrInvalidLocalDest = domi18n.Sentinel(domi18n.KeyPathalgInvalidLocalDest)
 
 // ErrInvalidLocalDir 表示面向 ScopedRootFS.WithRoot 的本地根目录路径非法或存在穿越风险。
-var ErrInvalidLocalDir = errors.New("pathalg: 无效的本地根目录路径")
+var ErrInvalidLocalDir = domi18n.Sentinel(domi18n.KeyPathalgInvalidLocalDir)
 
 // ErrInvalidLocalSource 表示面向 OperatorReadFS.WithOperatorRead 的本地源路径非法。
-var ErrInvalidLocalSource = errors.New("pathalg: 无效的本地只读源路径")
+var ErrInvalidLocalSource = domi18n.Sentinel(domi18n.KeyPathalgInvalidLocalSource)
 
 // ErrInvalidSymlinkPolicy 表示软链接策略未识别、格式无效或不允许当前操作。
-var ErrInvalidSymlinkPolicy = errors.New("pathalg: 无效的软链接策略")
+var ErrInvalidSymlinkPolicy = domi18n.Sentinel(domi18n.KeyPathalgInvalidSymlinkPolicy)
 
 // ErrUnsafeSymlink 表示符号链接目标或链式解析违反安全策略（如绝对路径、逃逸根目录、环路或碰撞）。
-var ErrUnsafeSymlink = errors.New("pathalg: 不安全的符号链接")
+var ErrUnsafeSymlink = domi18n.Sentinel(domi18n.KeyPathalgUnsafeSymlink)
 
 // ErrNameCollision 表示两个不同名称或路径经 Unicode NFC/NFD 与跨 OS 大小写折叠后发生碰撞。
-var ErrNameCollision = errors.New("pathalg: 路径名称存在 Unicode 或大小写折叠碰撞")
+var ErrNameCollision = domi18n.Sentinel(domi18n.KeyPathalgNameCollision)
 
 // ErrInvalidUTF8 表示输入字符串包含非法 UTF-8 字节序列。
-var ErrInvalidUTF8 = errors.New("pathalg: 无效的 UTF-8 编码")
+var ErrInvalidUTF8 = domi18n.Sentinel(domi18n.KeyPathalgInvalidUTF8)
 
 // ErrInvalidProtectedRule 表示受保护路径规则或匹配器未初始化、语法无效或包含非法字符。
-var ErrInvalidProtectedRule = errors.New("pathalg: 无效的受保护路径规则")
+var ErrInvalidProtectedRule = domi18n.Sentinel(domi18n.KeyPathalgInvalidProtectedRule)
 
 // ErrInvalidGlob 表示 UTF-8 通配符模式存在未闭合字符类或非法字符范围。
-var ErrInvalidGlob = errors.New("pathalg: 无效的通配符模式")
+var ErrInvalidGlob = domi18n.Sentinel(domi18n.KeyPathalgInvalidGlob)
 
 // ErrNilReceiver 表示在 nil 指针接收者上调用反序列化方法。
-var ErrNilReceiver = errors.New("pathalg: 反序列化目标接收者不能为 nil")
+var ErrNilReceiver = domi18n.Sentinel(domi18n.KeyPathalgNilReceiver)

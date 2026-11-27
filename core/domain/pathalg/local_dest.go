@@ -3,8 +3,9 @@ package pathalg
 import (
 	"cmp"
 	"encoding"
-	"fmt"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 var (
@@ -30,20 +31,20 @@ type LocalRootedDest struct {
 // ParseLocalRootedDest 校验并构造严格位于沙箱根目录内的相对目标路径。
 func ParseLocalRootedDest(raw string) (LocalRootedDest, error) {
 	if raw == "" {
-		return LocalRootedDest{}, fmt.Errorf("%w: 沙箱目标路径不能为空", ErrInvalidLocalDest)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "local_dest"))
 	}
 	if len(raw) > MaxRemotePathBytes {
-		return LocalRootedDest{}, fmt.Errorf("%w: 沙箱目标路径长度 %d 超过上限 %d", ErrInvalidLocalDest, len(raw), MaxRemotePathBytes)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_dest"), domi18n.Int("size", len(raw)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	if strings.HasPrefix(raw, "/") || strings.HasSuffix(raw, "/") {
-		return LocalRootedDest{}, fmt.Errorf("%w: 沙箱目标路径 %q 不得以 '/' 开头或结尾", ErrInvalidLocalDest, raw)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "leading_or_trailing_slash"))
 	}
 	if strings.ContainsRune(raw, '\\') {
-		return LocalRootedDest{}, fmt.Errorf("%w: 沙箱目标路径 %q 禁止包含反斜杠 '\\'", ErrInvalidLocalDest, raw)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyPathalgForbiddenChar, domi18n.BoundStr("value", raw), domi18n.Str("char", `\`))
 	}
 	for seg := range strings.SplitSeq(raw, "/") {
 		if err := ValidateLocalComponent(seg); err != nil {
-			return LocalRootedDest{}, fmt.Errorf("%w: 分量 %q 校验失败: %w", ErrInvalidLocalDest, seg, err)
+			return LocalRootedDest{}, domi18n.WrapSentinel(ErrInvalidLocalDest, err)
 		}
 	}
 	return LocalRootedDest{rel: raw}, nil
@@ -52,16 +53,16 @@ func ParseLocalRootedDest(raw string) (LocalRootedDest, error) {
 // LocalRootedDestFromComponents 将一组单个本地分量校验并拼接为 LocalRootedDest。
 func LocalRootedDestFromComponents(parts ...string) (LocalRootedDest, error) {
 	if len(parts) == 0 {
-		return LocalRootedDest{}, fmt.Errorf("%w: 至少需要一个路径分量", ErrInvalidLocalDest)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "components"))
 	}
 	for _, seg := range parts {
 		if err := ValidateLocalComponent(seg); err != nil {
-			return LocalRootedDest{}, fmt.Errorf("%w: 分量 %q 校验失败: %w", ErrInvalidLocalDest, seg, err)
+			return LocalRootedDest{}, domi18n.WrapSentinel(ErrInvalidLocalDest, err)
 		}
 	}
 	joined := strings.Join(parts, "/")
 	if len(joined) > MaxRemotePathBytes {
-		return LocalRootedDest{}, fmt.Errorf("%w: 拼接后路径长度 %d 超过上限 %d", ErrInvalidLocalDest, len(joined), MaxRemotePathBytes)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_dest"), domi18n.Int("size", len(joined)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	return LocalRootedDest{rel: joined}, nil
 }
@@ -69,14 +70,14 @@ func LocalRootedDestFromComponents(parts ...string) (LocalRootedDest, error) {
 // JoinComponent 在当前沙箱目标路径下追加单个经 ValidateLocalComponent 校验的分量。
 func (d LocalRootedDest) JoinComponent(name string) (LocalRootedDest, error) {
 	if !d.IsValid() {
-		return LocalRootedDest{}, fmt.Errorf("%w: 无法在无效 LocalRootedDest 上追加分量", ErrInvalidLocalDest)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_dest"))
 	}
 	if err := ValidateLocalComponent(name); err != nil {
-		return LocalRootedDest{}, fmt.Errorf("%w: %w", ErrInvalidLocalDest, err)
+		return LocalRootedDest{}, domi18n.WrapSentinel(ErrInvalidLocalDest, err)
 	}
 	joined := d.rel + "/" + name
 	if len(joined) > MaxRemotePathBytes {
-		return LocalRootedDest{}, fmt.Errorf("%w: 拼接后路径长度 %d 超过上限 %d", ErrInvalidLocalDest, len(joined), MaxRemotePathBytes)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_dest"), domi18n.Int("size", len(joined)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	return LocalRootedDest{rel: joined}, nil
 }
@@ -84,7 +85,7 @@ func (d LocalRootedDest) JoinComponent(name string) (LocalRootedDest, error) {
 // JoinRemoteName 将已校验的远端名称通过跨平台 ValidateLocalComponent 桥接追加到当前沙箱目标路径。
 func (d LocalRootedDest) JoinRemoteName(name RemoteName) (LocalRootedDest, error) {
 	if !name.IsValid() {
-		return LocalRootedDest{}, fmt.Errorf("%w: 远端名称无效", ErrInvalidLocalDest)
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_name"))
 	}
 	return d.JoinComponent(name.name)
 }

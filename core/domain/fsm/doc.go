@@ -17,7 +17,6 @@ import (
 	"crypto/sha256"
 	"encoding"
 	"encoding/binary"
-	"errors"
 	"io"
 	"strings"
 	"time"
@@ -25,6 +24,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -41,21 +41,21 @@ const (
 
 // 本包导出的规范哨兵错误，所有零值状态、非法输入、越界转换与 Journal 损坏均严格失败关闭。
 var (
-	ErrInvalidState            = errors.New("fsm: 无效或未初始化的状态")
-	ErrInvalidInput            = errors.New("fsm: 无效或未初始化的输入")
-	ErrIllegalTransition       = errors.New("fsm: 当前状态不接受该输入（非法状态转换）")
-	ErrInvalidContext          = errors.New("fsm: 无效的状态机上下文参数")
-	ErrInvalidDurability       = errors.New("fsm: 无效的持久化提交状态 DurabilityStatus")
-	ErrInvalidOutcome          = errors.New("fsm: 无效的副作用执行结果 SideEffectOutcome")
-	ErrInvalidJournal          = errors.New("fsm: 无效的传输 Journal 记录")
-	ErrCorruptJournal          = errors.New("fsm: 检测到损坏、乱序或被篡改的传输 Journal")
-	ErrTransferSizeExceeded    = errors.New("fsm: 传输大小超过 10 GiB 上限或发生偏移溢出")
-	ErrInvalidChunkOffset      = errors.New("fsm: 分片偏移不连续或长度非法")
-	ErrInvalidApprovalEnvelope = errors.New("fsm: 审批挑战信封与当前上下文或绑定不匹配")
-	ErrInvalidEnsureStep       = errors.New("fsm: 无效的 Ensure 步骤参数")
-	ErrInvalidEnrollLease      = errors.New("fsm: 无效的首连暂存租约上下文")
-	ErrNilWriter               = errors.New("fsm: WriteCanonical 或编码目标不能为 nil")
-	ErrNilReceiver             = errors.New("fsm: 反序列化目标接收者不能为 nil")
+	ErrInvalidState            = domi18n.Sentinel(domi18n.KeyFSMInvalidState)
+	ErrInvalidInput            = domi18n.Sentinel(domi18n.KeyFSMInvalidInput)
+	ErrIllegalTransition       = domi18n.Sentinel(domi18n.KeyFSMIllegalTransition)
+	ErrInvalidContext          = domi18n.Sentinel(domi18n.KeyFSMInvalidContext)
+	ErrInvalidDurability       = domi18n.Sentinel(domi18n.KeyFSMInvalidDurability)
+	ErrInvalidOutcome          = domi18n.Sentinel(domi18n.KeyFSMInvalidOutcome)
+	ErrInvalidJournal          = domi18n.Sentinel(domi18n.KeyFSMInvalidJournal)
+	ErrCorruptJournal          = domi18n.Sentinel(domi18n.KeyFSMCorruptJournal)
+	ErrTransferSizeExceeded    = domi18n.Sentinel(domi18n.KeyFSMTransferSizeExceeded)
+	ErrInvalidChunkOffset      = domi18n.Sentinel(domi18n.KeyFSMInvalidChunkOffset)
+	ErrInvalidApprovalEnvelope = domi18n.Sentinel(domi18n.KeyFSMInvalidApprovalEnvelope)
+	ErrInvalidEnsureStep       = domi18n.Sentinel(domi18n.KeyFSMInvalidEnsureStep)
+	ErrInvalidEnrollLease      = domi18n.Sentinel(domi18n.KeyFSMInvalidEnrollLease)
+	ErrNilWriter               = domi18n.Sentinel(domi18n.KeyFSMNilWriter)
+	ErrNilReceiver             = domi18n.Sentinel(domi18n.KeyFSMNilReceiver)
 )
 
 // DurabilityStatus 与 SideEffectOutcome 为持久化提交与单步副作用的失败关闭结果枚举。

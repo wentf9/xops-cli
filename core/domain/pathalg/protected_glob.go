@@ -1,11 +1,12 @@
 package pathalg
 
 import (
-	"fmt"
 	"path"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 type compiledProtectedRule struct {
@@ -109,7 +110,7 @@ func parseProtectedRuleHeader(nfcPattern string) (ns pathNamespace, drive byte, 
 		rawSegs := splitCleanAbsSegments(cleaned)
 		return nsPOSIX, 0, "", "", rawSegs, nil
 	}
-	return nsInvalid, 0, "", "", nil, fmt.Errorf("%w: 规则 %q 必须以 '/'、Windows 盘符/设备、UNC 或 '**/' 开头", ErrInvalidProtectedRule, nfcPattern)
+	return nsInvalid, 0, "", "", nil, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "pattern"), domi18n.BoundStr("value", nfcPattern))
 }
 
 func finalizeWin32RuleHeader(nfcPattern string, spec win32HeaderSpec) (pathNamespace, byte, string, string, []string, error) {
@@ -119,16 +120,16 @@ func finalizeWin32RuleHeader(nfcPattern string, spec win32HeaderSpec) (pathNames
 		return nsWinDrive, spec.drive, "", "", rawSegs, nil
 	case nsWinUNC:
 		if spec.share == "" {
-			return nsInvalid, 0, "", "", nil, fmt.Errorf("%w: UNC 规则 %q 必须包含服务器与共享名", ErrInvalidProtectedRule, nfcPattern)
+			return nsInvalid, 0, "", "", nil, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "unc_rule"), domi18n.BoundStr("value", nfcPattern))
 		}
 		return nsWinUNC, 0, spec.server, spec.share, rawSegs, nil
 	case nsWinDevice:
 		if len(rawSegs) == 0 {
-			return nsInvalid, 0, "", "", nil, fmt.Errorf("%w: Win32 设备规则 %q 缺少设备路径", ErrInvalidProtectedRule, nfcPattern)
+			return nsInvalid, 0, "", "", nil, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "win32_device_rule"), domi18n.BoundStr("value", nfcPattern))
 		}
 		return nsWinDevice, 0, "", "", rawSegs, nil
 	default:
-		return nsInvalid, 0, "", "", nil, fmt.Errorf("%w: 无法识别的 Win32 规则 %q", ErrInvalidProtectedRule, nfcPattern)
+		return nsInvalid, 0, "", "", nil, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "win32_rule"), domi18n.BoundStr("value", nfcPattern))
 	}
 }
 
@@ -150,7 +151,7 @@ func compileRuleSegments(rawSegs []string) ([]compiledGlobSeg, bool, error) {
 		}
 		tokens, segWild, err := parseSegmentGlob(raw)
 		if err != nil {
-			return nil, false, fmt.Errorf("%w: %w", ErrInvalidProtectedRule, err)
+			return nil, false, domi18n.WrapSentinel(ErrInvalidProtectedRule, err)
 		}
 		hasWildcard = hasWildcard || segWild
 		segs = append(segs, compiledGlobSeg{raw: raw, tokens: tokens})
@@ -245,7 +246,7 @@ func propagateDoubleStar(ruleSegs []compiledGlobSeg, dp []bool) {
 
 func parseSegmentGlob(pattern string) ([]globToken, bool, error) {
 	if !utf8.ValidString(pattern) {
-		return nil, false, fmt.Errorf("%w: 非法 UTF-8", ErrInvalidGlob)
+		return nil, false, domi18n.EF(ErrInvalidGlob, domi18n.KeyCommonInvalidUTF8)
 	}
 	runes := []rune(pattern)
 	tokens := make([]globToken, 0, len(runes))
@@ -281,7 +282,7 @@ func parseSegmentGlob(pattern string) ([]globToken, bool, error) {
 func parseCharClass(runes []rune, start int) (globToken, int, error) {
 	i := start
 	if i >= len(runes) {
-		return globToken{}, 0, fmt.Errorf("%w: 未闭合字符类 '['", ErrInvalidGlob)
+		return globToken{}, 0, domi18n.EF(ErrInvalidGlob, domi18n.KeyPathalgGlobUnclosed)
 	}
 	negated := false
 	if runes[i] == '^' || runes[i] == '!' {
@@ -298,7 +299,7 @@ func parseCharClass(runes []rune, start int) (globToken, int, error) {
 		if i+1 < len(runes) && runes[i] == '-' && runes[i+1] != ']' {
 			hi := runes[i+1]
 			if hi < lo {
-				return globToken{}, 0, fmt.Errorf("%w: 非法字符范围 %q-%q", ErrInvalidGlob, lo, hi)
+				return globToken{}, 0, domi18n.EF(ErrInvalidGlob, domi18n.KeyPathalgGlobRangeInvalid, domi18n.Str("lo", string(lo)), domi18n.Str("hi", string(hi)))
 			}
 			ranges = append(ranges, runeRange{lo: lo, hi: hi})
 			i += 2
@@ -306,7 +307,7 @@ func parseCharClass(runes []rune, start int) (globToken, int, error) {
 		}
 		ranges = append(ranges, runeRange{lo: lo, hi: lo})
 	}
-	return globToken{}, 0, fmt.Errorf("%w: 未闭合字符类 '['", ErrInvalidGlob)
+	return globToken{}, 0, domi18n.EF(ErrInvalidGlob, domi18n.KeyPathalgGlobUnclosed)
 }
 
 // matchGlobTokens 在单段 UTF-8 码点序列上执行 O(|tokens| * |seg|) 双指针迭代通配匹配。

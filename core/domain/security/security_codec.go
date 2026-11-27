@@ -3,10 +3,10 @@ package security
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 )
 
@@ -43,7 +43,7 @@ func (p *ScopedPath) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return unmarshalJSONWithNullReject(p, dec, ErrInvalidScopeSnapshot, func(w scopedPathWire) (ScopedPath, error) {
 		path, ok := w.Path.Get()
 		if !ok {
-			return ScopedPath{}, fmt.Errorf("%w: 缺少必需的 path 字段", ErrInvalidScopeSnapshot)
+			return ScopedPath{}, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "path"))
 		}
 		return NewScopedPath(path, w.Recursive, w.ProtectedZones...)
 	})
@@ -80,11 +80,11 @@ func decodeScopeSnapshotWire(w scopeSnapshotWire) (ScopeSnapshot, error) {
 	risk, okR := w.Risk.Get()
 	dw, okD := w.Decision.Get()
 	if !okC || !okV || !okR || !okD {
-		return ScopeSnapshot{}, fmt.Errorf("%w: 缺少必需的 capability/verdict/risk/decision 字段", ErrInvalidScopeSnapshot)
+		return ScopeSnapshot{}, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "capability/verdict/risk/decision"))
 	}
 	decision, err := decodeDecisionWire(dw)
 	if err != nil {
-		return ScopeSnapshot{}, fmt.Errorf("%w: %w", ErrInvalidScopeSnapshot, err)
+		return ScopeSnapshot{}, domi18n.WrapSentinel(ErrInvalidScopeSnapshot, err)
 	}
 	return NewScopeSnapshot(ScopeSnapshotSpec{capKind, w.TargetNode, w.Endpoint, verdict, risk, decision, w.Paths})
 }
@@ -92,21 +92,21 @@ func decodeScopeSnapshotWire(w scopeSnapshotWire) (ScopeSnapshot, error) {
 func decodeScopeEscalationWire(w scopeEscalationResultWire) (ScopeEscalationResult, error) {
 	escalated, ok := w.Escalated.Get()
 	if !ok {
-		return ScopeEscalationResult{}, fmt.Errorf("%w: 缺少必需的 escalated 字段", ErrInvalidScopeSnapshot)
+		return ScopeEscalationResult{}, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "escalated"))
 	}
 	if !escalated {
 		if len(w.Reasons) > 0 || len(w.AddedProtectedPaths) > 0 {
-			return ScopeEscalationResult{}, fmt.Errorf("%w: 非升级结果不得携带 reasons 或 added_protected_paths", ErrInvalidScopeSnapshot)
+			return ScopeEscalationResult{}, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeySecurityEscalationReasons)
 		}
 		return ScopeEscalationResult{valid: true}, nil
 	}
 	if len(w.Reasons) == 0 {
-		return ScopeEscalationResult{}, fmt.Errorf("%w: 升级结果必须至少包含一个有效 reason", ErrInvalidScopeSnapshot)
+		return ScopeEscalationResult{}, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeySecurityEscalationReasons)
 	}
 	reasons := make([]EscalationReason, 0, len(w.Reasons))
 	for _, reason := range w.Reasons {
 		if !reason.IsValid() || slices.Contains(reasons, reason) {
-			return ScopeEscalationResult{}, fmt.Errorf("%w: 非法或重复的升级原因 %v", ErrInvalidScopeSnapshot, reason)
+			return ScopeEscalationResult{}, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeySecurityEscalationReasons)
 		}
 		reasons = append(reasons, reason)
 	}

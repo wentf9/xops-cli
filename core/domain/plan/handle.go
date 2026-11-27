@@ -5,12 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -98,7 +98,7 @@ func ParseHandleKindCode(raw string) (HandleKindCode, error) {
 			return HandleKindSession, nil
 		}
 	}
-	return HandleKindInvalid, fmt.Errorf("%w: %q", ErrInvalidHandleKind, raw)
+	return HandleKindInvalid, domi18n.EF(ErrInvalidHandleKind, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "handle_kind"), domi18n.BoundStr("value", raw))
 }
 
 func (c HandleKindCode) IsValid() bool { return c >= HandleKindPTY && c <= HandleKindSession }
@@ -128,11 +128,11 @@ func HandleIDFromBytes(raw [handleIDEntropyBytes]byte) HandleID {
 // NewHandleIDFrom 从显式注入的熵源 io.Reader 读取 16 字节构造 HandleID（零隐式 crypto/rand）。
 func NewHandleIDFrom(entropy io.Reader) (HandleID, error) {
 	if entropy == nil {
-		return HandleID{}, fmt.Errorf("%w: %w", ErrInvalidHandleID, ErrNilEntropy)
+		return HandleID{}, domi18n.WrapSentinel(ErrInvalidHandleID, ErrNilEntropy)
 	}
 	var buf [handleIDEntropyBytes]byte
 	if _, err := io.ReadFull(entropy, buf[:]); err != nil {
-		return HandleID{}, fmt.Errorf("%w: %w", ErrInvalidHandleID, err)
+		return HandleID{}, domi18n.WrapSentinel(ErrInvalidHandleID, err)
 	}
 	return HandleIDFromBytes(buf), nil
 }
@@ -140,7 +140,7 @@ func NewHandleIDFrom(entropy io.Reader) (HandleID, error) {
 // ParseHandleID 校验并构造 HandleID（长度 1..128 的可打印非空白非冒号 ASCII）。
 func ParseHandleID(raw string) (HandleID, error) {
 	if !isValidASCIIToken(raw, maxHandleIDLen) || strings.ContainsRune(raw, ':') {
-		return HandleID{}, fmt.Errorf("%w: %q", ErrInvalidHandleID, raw)
+		return HandleID{}, domi18n.EF(ErrInvalidHandleID, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "handle_id"), domi18n.BoundStr("value", raw))
 	}
 	return HandleID{value: raw}, nil
 }
@@ -183,14 +183,14 @@ type ManagedHandle[K HandleKind] struct {
 func NewManagedHandle[K HandleKind](id HandleID, gen uint64, planDigest PlanDigest, binding security.OperationBinding) (ManagedHandle[K], error) {
 	kind := HandleKindOf[K]()
 	if !kind.IsValid() {
-		return ManagedHandle[K]{}, fmt.Errorf("%w: %w", ErrInvalidManagedHandle, ErrInvalidHandleKind)
+		return ManagedHandle[K]{}, domi18n.WrapSentinel(ErrInvalidManagedHandle, ErrInvalidHandleKind)
 	}
 	if !id.IsValid() || gen == 0 || !planDigest.IsValid() || !binding.IsValid() {
-		return ManagedHandle[K]{}, fmt.Errorf("%w: id/gen(>=1)/plan_digest/binding 均须有效", ErrInvalidManagedHandle)
+		return ManagedHandle[K]{}, domi18n.EF(ErrInvalidManagedHandle, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "managed_handle"))
 	}
 	bpd, ok := binding.PlanDigest().Get()
 	if !ok || !bpd.Equal(planDigest.SecurityDigest()) {
-		return ManagedHandle[K]{}, fmt.Errorf("%w: OperationBinding 必须显式绑定一致的 PlanDigest", ErrInvalidManagedHandle)
+		return ManagedHandle[K]{}, domi18n.EF(ErrInvalidManagedHandle, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "binding.plan_digest"))
 	}
 	return ManagedHandle[K]{
 		id: id, gen: gen, planDigest: planDigest, binding: binding, valid: true,
@@ -310,10 +310,10 @@ func (h *ManagedHandle[K]) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		pd, okP := w.PlanDigest.Get()
 		binding, okB := w.Binding.Get()
 		if !okK || !okID || !okG || !okP || !okB {
-			return ManagedHandle[K]{}, fmt.Errorf("%w: 缺少必需的句柄字段", ErrInvalidManagedHandle)
+			return ManagedHandle[K]{}, domi18n.EF(ErrInvalidManagedHandle, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "managed_handle"))
 		}
 		if kind != HandleKindOf[K]() {
-			return ManagedHandle[K]{}, fmt.Errorf("%w: 句柄类别不匹配（got=%s want=%s）", ErrInvalidHandleKind, kind, HandleKindOf[K]())
+			return ManagedHandle[K]{}, domi18n.EF(ErrInvalidHandleKind, domi18n.KeyCommonMismatch, domi18n.Str("field", "handle_kind"), domi18n.Str("expected", HandleKindOf[K]().String()), domi18n.Str("actual", kind.String()))
 		}
 		return NewManagedHandle[K](id, gen, pd, binding)
 	})

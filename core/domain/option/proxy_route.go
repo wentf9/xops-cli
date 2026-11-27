@@ -1,12 +1,12 @@
 package option
 
 import (
-	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 )
 
@@ -31,13 +31,13 @@ func ParseHopTarget(raw string) (HopTarget, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" || len(t) > maxTokenLen || hasAnySpaceOrControl(t) ||
 		strings.ContainsRune(t, ',') || strings.ContainsAny(t, forbiddenHopShellChars) || isNoneKeyword(t) {
-		return HopTarget{}, fmt.Errorf("%w: 跳板目标 %q 非法", ErrInvalidProxyRoute, raw)
+		return HopTarget{}, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "hop_target"), domi18n.BoundStr("value", raw))
 	}
 	user, hostPart, hasAt := strings.Cut(t, "@")
 	if !hasAt {
 		user, hostPart = "", t
 	} else if hostPart == "" || strings.ContainsRune(hostPart, '@') {
-		return HopTarget{}, fmt.Errorf("%w: 跳板目标 %q 格式非法", ErrInvalidProxyRoute, t)
+		return HopTarget{}, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "hop_target"), domi18n.BoundStr("value", t))
 	} else if _, err := ParseUsername(user); err != nil {
 		return HopTarget{}, wrapProxyErr(err)
 	}
@@ -53,7 +53,7 @@ func parseHopHostPort(hostPart, full string) (string, uint16, error) {
 		return parseBracketedHop(hostPart, full)
 	}
 	if strings.ContainsAny(hostPart, "[]") || strings.Count(hostPart, ":") > 1 {
-		return "", 0, fmt.Errorf("%w: 跳板目标 %q 含非法方括号或裸 IPv6", ErrInvalidProxyRoute, full)
+		return "", 0, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "hop_target"), domi18n.BoundStr("value", full))
 	}
 	h, pStr, hasPort := strings.Cut(hostPart, ":")
 	host, err := parseHopPlainHost(h, full)
@@ -68,7 +68,7 @@ func wrapProxyErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: %w", ErrInvalidProxyRoute, err)
+	return domi18n.WrapSentinel(ErrInvalidProxyRoute, err)
 }
 
 func parseHopPlainHost(h, full string) (string, error) {
@@ -82,13 +82,13 @@ func parsePlainHostOrAlias(h, full string, baseErr error) (string, error) {
 	if h == "" || len(h) > maxTokenLen || hasAnySpaceOrControl(h) || h[0] == '-' ||
 		h[0] == '.' || h[len(h)-1] == '.' || strings.Contains(h, "..") || isNoneKeyword(h) ||
 		strings.ContainsAny(h, "@:/\\,[]"+forbiddenHopShellChars) {
-		return "", fmt.Errorf("%w: 主机或别名 %q 非法", baseErr, full)
+		return "", domi18n.EF(baseErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "host"), domi18n.BoundStr("value", full))
 	}
 	if ch, err := netaddr.ParseCanonicalHost(h); err == nil && ch.IsIP() {
 		return ch.String(), nil
 	}
 	if isNumericIPLike(h) {
-		return "", fmt.Errorf("%w: 主机 %q 为畸形数值 IP 形态", baseErr, full)
+		return "", domi18n.EF(baseErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "host"), domi18n.BoundStr("value", full))
 	}
 	return h, nil
 }
@@ -115,18 +115,18 @@ func isNumericOrHexSeg(seg string) bool {
 func parseBracketedHop(hostPart, full string) (string, uint16, error) {
 	closeIdx := strings.IndexByte(hostPart, ']')
 	if closeIdx < 2 {
-		return "", 0, fmt.Errorf("%w: 跳板目标 %q 方括号畸形", ErrInvalidProxyRoute, full)
+		return "", 0, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "hop_target"), domi18n.BoundStr("value", full))
 	}
 	ch, err := netaddr.ParseCanonicalHost(hostPart[:closeIdx+1])
 	if err != nil || !ch.IsIPv6() {
-		return "", 0, fmt.Errorf("%w: 跳板目标 %q 方括号内须为合法 IPv6", ErrInvalidProxyRoute, full)
+		return "", 0, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "hop_target"), domi18n.BoundStr("value", full))
 	}
 	rest := hostPart[closeIdx+1:]
 	if rest == "" {
 		return ch.String(), 0, nil
 	}
 	if rest[0] != ':' {
-		return "", 0, fmt.Errorf("%w: 跳板目标 %q 方括号后缀非法", ErrInvalidProxyRoute, full)
+		return "", 0, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "hop_target"), domi18n.BoundStr("value", full))
 	}
 	p, err := parseStrictPortNumber(rest[1:])
 	return ch.String(), p, wrapProxyErr(err)
@@ -173,24 +173,24 @@ type SanitizedCmd struct{ textToken }
 func NewSanitizedCmd(raw string) (SanitizedCmd, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" || len(t) > maxCmdLen || isNoneKeyword(t) {
-		return SanitizedCmd{}, fmt.Errorf("%w: 命令非法、为空、超长或为保留字 none", ErrInvalidProxyRoute)
+		return SanitizedCmd{}, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "command"))
 	}
 	if err := validateTemplateTokens(t, allowedPathPercentTokens, false); err != nil {
-		return SanitizedCmd{}, fmt.Errorf("%w: %w", ErrInvalidProxyRoute, err)
+		return SanitizedCmd{}, domi18n.WrapSentinel(ErrInvalidProxyRoute, err)
 	}
 	return SanitizedCmd{textToken{t, true}}, nil
 }
 func NewProxySanitizedCmd(raw string) (SanitizedCmd, error) {
 	cmd, err := NewSanitizedCmd(raw)
 	if err == nil && !cmd.isValidProxyCmd() {
-		return SanitizedCmd{}, fmt.Errorf("%w: %w", ErrInvalidProxyRoute, ErrInvalidPercentInput)
+		return SanitizedCmd{}, domi18n.WrapSentinel(ErrInvalidProxyRoute, ErrInvalidPercentInput)
 	}
 	return cmd, err
 }
 func NewLocalSanitizedCmd(raw string) (SanitizedCmd, error) {
 	cmd, err := NewSanitizedCmd(raw)
 	if err != nil {
-		err = fmt.Errorf("%w: %w", ErrInvalidOption, err)
+		err = domi18n.WrapSentinel(ErrInvalidOption, err)
 	}
 	return cmd, err
 }
@@ -281,13 +281,13 @@ func (c *ProxyCommandSpec) Command() SanitizedCmd {
 }
 func NewProxyJumpChain(hops algebraic.NonEmpty[HopTarget]) (*ProxyJumpChain, error) {
 	if !hops.IsValid() || slices.ContainsFunc(hops.Slice(), func(h HopTarget) bool { return !h.IsValid() }) {
-		return nil, fmt.Errorf("%w: ProxyJump 跳板链为空或含无效跳板", ErrInvalidProxyRoute)
+		return nil, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "proxy_jump"))
 	}
 	return &ProxyJumpChain{hops: hops}, nil
 }
 func NewProxyCommandSpec(cmd SanitizedCmd) (*ProxyCommandSpec, error) {
 	if !cmd.isValidProxyCmd() {
-		return nil, fmt.Errorf("%w: ProxyCommand 无效或含非法占位符", ErrInvalidProxyRoute)
+		return nil, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "proxy_command"))
 	}
 	return &ProxyCommandSpec{cmd}, nil
 }
@@ -332,7 +332,7 @@ func ParseProxyCommand(raw string) (ProxyRoute, error) {
 func trimProxyDirective(raw, name string) (string, bool, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" {
-		return "", false, fmt.Errorf("%w: %s %q 无效", ErrInvalidProxyRoute, name, raw)
+		return "", false, domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", name), domi18n.BoundStr("value", raw))
 	}
 	return t, isNoneKeyword(t), nil
 }
@@ -390,7 +390,7 @@ func fromProxyPair(p proxyPair) ProxyRoute {
 // ValidateProxyRoute、ComposeProxyRoute、FoldProxyRoutes 与 EqualProxyRoute 提供 ProxyRoute 校验、双槽复合、折叠与等价判定。
 func ValidateProxyRoute(route ProxyRoute) error {
 	if _, ok := toProxyPair(route); !ok {
-		return fmt.Errorf("%w: 无效 ProxyRoute 变体 %T", ErrInvalidProxyRoute, route)
+		return domi18n.EF(ErrInvalidProxyRoute, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "proxy_route"))
 	}
 	return nil
 }

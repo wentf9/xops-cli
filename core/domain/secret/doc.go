@@ -10,19 +10,19 @@
 //   - 独占标准库 "runtime/secret" 导入权限（通过 goexperiment.runtimesecret 构建标签隔离）。
 package secret
 
-import "errors"
+import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // ErrSecretInvalid 表示 SecretBox 为 nil 或未通过 WithBytes 初始化的无效零值。
-var ErrSecretInvalid = errors.New("secret: SecretBox 无效或未初始化")
+var ErrSecretInvalid = domi18n.Sentinel(domi18n.KeySecretInvalid)
 
 // ErrSecretWiped 表示 SecretBox 已被 Wipe 清零销毁，禁止再次访问明文。
-var ErrSecretWiped = errors.New("secret: SecretBox 已销毁清零")
+var ErrSecretWiped = domi18n.Sentinel(domi18n.KeySecretWiped)
 
 // ErrNilCallback 表示传入 WithBytes 或 SecretBox.Use 的作用域回调函数为 nil。
-var ErrNilCallback = errors.New("secret: 作用域回调函数不能为 nil")
+var ErrNilCallback = domi18n.Sentinel(domi18n.KeySecretNilCallback)
 
 // ErrInvalidRef 表示凭据引用 Ref 的 store 或 item 标识为空、超长或包含非法字符。
-var ErrInvalidRef = errors.New("secret: 无效的凭据引用 Ref")
+var ErrInvalidRef = domi18n.Sentinel(domi18n.KeySecretInvalidRef)
 
 // ErrNilReceiver 表示在 nil 指针接收者上调用反序列化方法。
-var ErrNilReceiver = errors.New("secret: 反序列化目标接收者不能为 nil")
+var ErrNilReceiver = domi18n.Sentinel(domi18n.KeySecretNilReceiver)

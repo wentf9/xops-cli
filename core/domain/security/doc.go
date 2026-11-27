@@ -14,32 +14,31 @@ import (
 	"cmp"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
-	"fmt"
 	"slices"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // 本包导出的规范化哨兵错误集合，均由失败关闭路径显式返回以便调用方使用 errors.Is 判定。
 var (
-	ErrInvalidVerdict          = errors.New("security: 无效的 Verdict")
-	ErrInvalidRiskLevel        = errors.New("security: 无效的 RiskLevel")
-	ErrInvalidDecision         = errors.New("security: 无效的 GuardrailDecision")
-	ErrInvalidCapability       = errors.New("security: 无效的 Capability")
-	ErrInvalidGlob             = errors.New("security: 无效的通配符模式")
-	ErrInvalidNodeOverride     = errors.New("security: 无效的 NodeOverrides 规则")
-	ErrInvalidTraceID          = errors.New("security: 无效的 TraceID")
-	ErrInvalidOperationID      = errors.New("security: 无效的 OperationID")
-	ErrNilEntropy              = errors.New("security: 熵源 io.Reader 不能为 nil")
-	ErrInvalidDigest           = errors.New("security: 无效的 SHA-256 Digest")
-	ErrInvalidOperationBinding = errors.New("security: 无效的 OperationBinding")
-	ErrInvalidApprovalEnvelope = errors.New("security: 无效的 ApprovalEnvelope")
-	ErrInvalidScopeSnapshot    = errors.New("security: 无效的 ScopeSnapshot")
-	ErrNilWriter               = errors.New("security: WriteCanonical 目标 writer 不能为 nil")
-	ErrNilReceiver             = errors.New("security: 反序列化目标接收者不能为 nil")
+	ErrInvalidVerdict          = domi18n.Sentinel(domi18n.KeySecurityInvalidVerdict)
+	ErrInvalidRiskLevel        = domi18n.Sentinel(domi18n.KeySecurityInvalidRiskLevel)
+	ErrInvalidDecision         = domi18n.Sentinel(domi18n.KeySecurityInvalidDecision)
+	ErrInvalidCapability       = domi18n.Sentinel(domi18n.KeySecurityInvalidCapability)
+	ErrInvalidGlob             = domi18n.Sentinel(domi18n.KeySecurityInvalidGlob)
+	ErrInvalidNodeOverride     = domi18n.Sentinel(domi18n.KeySecurityInvalidNodeOverride)
+	ErrInvalidTraceID          = domi18n.Sentinel(domi18n.KeySecurityInvalidTraceID)
+	ErrInvalidOperationID      = domi18n.Sentinel(domi18n.KeySecurityInvalidOperationID)
+	ErrNilEntropy              = domi18n.Sentinel(domi18n.KeySecurityNilEntropy)
+	ErrInvalidDigest           = domi18n.Sentinel(domi18n.KeySecurityInvalidDigest)
+	ErrInvalidOperationBinding = domi18n.Sentinel(domi18n.KeySecurityInvalidBinding)
+	ErrInvalidApprovalEnvelope = domi18n.Sentinel(domi18n.KeySecurityInvalidEnvelope)
+	ErrInvalidScopeSnapshot    = domi18n.Sentinel(domi18n.KeySecurityInvalidScope)
+	ErrNilWriter               = domi18n.Sentinel(domi18n.KeySecurityNilWriter)
+	ErrNilReceiver             = domi18n.Sentinel(domi18n.KeySecurityNilReceiver)
 )
 
 func pickIf[T any](ok bool, yes, no T) T {
@@ -63,7 +62,7 @@ func enumName(idx uint8, fallback string, names ...string) string {
 
 func appendValidText(b []byte, valid bool, text string, baseErr error, raw uint8) ([]byte, error) {
 	if !valid {
-		return nil, fmt.Errorf("%w: %d", baseErr, raw)
+		return nil, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.Uint64("value", uint64(raw)))
 	}
 	return append(b, text...), nil
 }
@@ -74,7 +73,7 @@ func parseEnumByName[T ~uint8](raw string, lo, hi, zero T, nameFn func(T) string
 			return v, nil
 		}
 	}
-	return zero, fmt.Errorf("%w: %q", baseErr, raw)
+	return zero, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 
 func unmarshalTextWithReset[T any](dst *T, zero T, text []byte, parse func(string) (T, error)) error {
@@ -98,7 +97,7 @@ func rejectJSONNull(dec *jsontext.Decoder, baseErr error) (bool, error) {
 	if _, err := dec.ReadToken(); err != nil {
 		return true, err
 	}
-	return true, fmt.Errorf("%w: JSON null 不是有效值", baseErr)
+	return true, domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden)
 }
 
 // unmarshalJSONWithNullReject 统一实现失败关闭的 JSON/v2 反序列化：重置零值、拦截顶层 null、拒绝未知字段、解码 wire 并构造校验值。

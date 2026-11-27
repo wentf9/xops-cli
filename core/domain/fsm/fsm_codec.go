@@ -3,10 +3,10 @@ package fsm
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -59,7 +59,7 @@ func eParse[T fsmEnum](raw string, _ T, baseErr error) (T, error) {
 			}
 		}
 	}
-	return 0, fmt.Errorf("%w: %q", baseErr, raw)
+	return 0, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 func eAppend[T fsmEnum](b []byte, v T, baseErr error) ([]byte, error) {
 	if !v.IsValid() {
@@ -98,7 +98,7 @@ func unmJSON[T, W any](dst *T, dec *jsontext.Decoder, baseErr error, build func(
 	*dst = zeroVal[T]()
 	if dec.PeekKind() == 'n' {
 		_, err := dec.ReadToken()
-		return pickIf(err != nil, err, fmt.Errorf("%w: JSON null 不是有效值", baseErr))
+		return pickIf(err != nil, err, domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden))
 	}
 	var wire W
 	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
@@ -119,7 +119,7 @@ func mJSON[W any](enc *jsontext.Encoder, valid bool, badErr error, wire W) error
 func decKind[K interface{ IsValid() bool }](opt algebraic.Option[K], detail string) (K, error) {
 	k, ok := opt.Get()
 	if !ok || !k.IsValid() || len(detail) > maxReasonBytes || hasForbiddenStrictText(detail) {
-		return k, fmt.Errorf("%w: 事件 kind 或 detail 非法", ErrInvalidInput)
+		return k, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "event"))
 	}
 	return k, nil
 }
@@ -311,7 +311,7 @@ func decEEv(w ensureEventWire) (EnsureEvent, error) {
 	if p, okP := w.Phase.Get(); err == nil && okP && p.IsValid() {
 		return EnsureEvent{k, p, w.Detail, true}, nil
 	}
-	return EnsureEvent{}, pickIf(err != nil, err, fmt.Errorf("%w: 缺少或无效的 EnsureEvent phase", ErrInvalidInput))
+	return EnsureEvent{}, pickIf(err != nil, err, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "phase")))
 }
 func (d TransferDest) MarshalJSONTo(enc *jsontext.Encoder) error {
 	return mJSON(enc, d.IsValid(), ErrInvalidContext, transferDestWire{algebraic.Some(d.direction), d.Remote(), d.Local()})
@@ -329,7 +329,7 @@ func decTDst(w transferDestWire) (TransferDest, error) {
 	if okDir && dir == TransferDirectionDownload && hasLoc && !hasRem {
 		return NewDownloadDest(loc)
 	}
-	return TransferDest{}, fmt.Errorf("%w: 非法 TransferDest 方向或字段组合", ErrInvalidContext)
+	return TransferDest{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "transfer_dest"))
 }
 func (r TransferJournalRecord) MarshalJSONTo(enc *jsontext.Encoder) error {
 	return mJSON(enc, r.IsValid(), ErrInvalidJournal, transferJournalWire{
@@ -344,14 +344,14 @@ func decJRec(w transferJournalWire) (TransferJournalRecord, error) {
 	tid, okT := w.TransferID.Get()
 	rd, okRD := w.RecordDigest.Get()
 	if !okT || !okRD || w.Version.IsNone() || w.Generation.IsNone() || w.Seq.IsNone() || w.Kind.IsNone() {
-		return TransferJournalRecord{}, fmt.Errorf("%w: 缺少必需的 Journal 字段", ErrCorruptJournal)
+		return TransferJournalRecord{}, domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "journal_record"))
 	}
 	rec, err := NewTransferJournalRecord(TransferJournalRecordSpec{w.Version.OrElse(0), w.Generation.OrElse(0), w.Seq.OrElse(0), w.Kind.OrElse(0), tid, w.Dest, w.Offset, w.Length, w.TotalBytes, w.Digest, w.PrevDigest})
 	if err != nil {
-		return TransferJournalRecord{}, fmt.Errorf("%w: %w", ErrCorruptJournal, err)
+		return TransferJournalRecord{}, domi18n.WrapSentinel(ErrCorruptJournal, err)
 	}
 	if !rd.Equal(rec.recordDigest) {
-		return TransferJournalRecord{}, fmt.Errorf("%w: record_digest 校验失败", ErrCorruptJournal)
+		return TransferJournalRecord{}, domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "record_digest"))
 	}
 	return rec, nil
 }

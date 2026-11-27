@@ -3,9 +3,10 @@ package option
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"fmt"
 	"strconv"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // TokenContext 为 OpenSSH % token 纯字符串展开提供全部显式输入（零 os.Hostname / os/user 隐式访问）。
@@ -28,11 +29,11 @@ func ComputePercentC(localHost, targetHost string, port uint16, user string) (st
 }
 func ComputeConnectionHash(localHost, targetHost string, port uint16, user, jumpHost string) (string, error) {
 	if localHost == "" || targetHost == "" || port == 0 || user == "" {
-		return "", fmt.Errorf("%w: %%C 计算要求非空 localHost、targetHost、user 与有效端口", ErrInvalidPercentInput)
+		return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "localHost/targetHost/port/user"))
 	}
 	for _, s := range [4]string{localHost, targetHost, user, jumpHost} {
 		if hasForbiddenControlChar(s) {
-			return "", fmt.Errorf("%w: 输入 %q 含控制字符或非法 UTF-8", ErrInvalidPercentInput, s)
+			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "percent_input"))
 		}
 	}
 	h := sha1.New()
@@ -53,11 +54,11 @@ func ExpandPathTokens(template string, ctx TokenContext) (string, error) {
 
 func expandTokensInternal(template string, ctx TokenContext, pathSafe bool) (string, error) {
 	if ctx.Port == 0 || ctx.TargetHost == "" {
-		return "", fmt.Errorf("%w: TokenContext 缺少有效 Port 或 TargetHost", ErrInvalidPercentInput)
+		return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "port/target_host"))
 	}
 	for _, s := range [9]string{template, ctx.LocalHost, ctx.TargetHost, ctx.RemoteUser, ctx.OriginalHost, ctx.LocalUser, ctx.LocalUID, ctx.HomeDir, ctx.JumpHost} {
 		if hasForbiddenControlChar(s) {
-			return "", fmt.Errorf("%w: 模板或 TokenContext 含控制字符", ErrInvalidPercentInput)
+			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "token_context"))
 		}
 	}
 	var b strings.Builder
@@ -69,7 +70,7 @@ func expandTokensInternal(template string, ctx TokenContext, pathSafe bool) (str
 			continue
 		}
 		if i+1 >= len(template) {
-			return "", fmt.Errorf("%w: 模板 %q 存在悬尾 '%%'", ErrInvalidPercentInput, template)
+			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyOptionTemplateInvalid, domi18n.Str("option", "percent_template"))
 		}
 		val, err := resolvePercentToken(template[i+1], ctx, pathSafe)
 		if err != nil {
@@ -89,7 +90,7 @@ func resolvePercentToken(tok byte, ctx TokenContext, pathSafe bool) (string, err
 		return strconv.FormatUint(uint64(ctx.Port), 10), nil
 	case 'd':
 		if ctx.HomeDir == "" {
-			return "", fmt.Errorf("%w: 占位符 %%d 需要非空 HomeDir", ErrInvalidPercentInput)
+			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "home_dir"))
 		}
 		return ctx.HomeDir, nil
 	case 'C':
@@ -97,10 +98,10 @@ func resolvePercentToken(tok byte, ctx TokenContext, pathSafe bool) (string, err
 	default:
 		val, ok := lookupStringPercentToken(tok, ctx)
 		if !ok || (tok != 'j' && val == "") {
-			return "", fmt.Errorf("%w: 占位符 %%%c 无效或对应字段为空", ErrInvalidPercentInput, tok)
+			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "token"), domi18n.BoundStr("value", "%"+string(tok)))
 		}
 		if pathSafe && val != "" && (strings.ContainsAny(val, `/\`) || val == "." || strings.Contains(val, "..")) {
-			return "", fmt.Errorf("%w: 路径占位符 %%%c 展开值 %q 含路径分隔符或目录穿越", ErrInvalidPercentInput, tok, val)
+			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", val), domi18n.Str("reason", "path_separator_or_traversal"))
 		}
 		return val, nil
 	}

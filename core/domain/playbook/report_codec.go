@@ -3,11 +3,11 @@ package playbook
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -78,7 +78,7 @@ func (r *StepExecutionRecord) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		status, okSt := w.Status.Get()
 		dur, okD := w.Duration.Get()
 		if !okN || !okS || !okSt || !okD {
-			return StepExecutionRecord{}, fmt.Errorf("%w: 缺少必需的 node_id/step_id/status/duration 字段", ErrInvalidStepRecord)
+			return StepExecutionRecord{}, domi18n.EF(ErrInvalidStepRecord, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "node_id/step_id/status/duration"))
 		}
 		var outOpt algebraic.Option[execution.ExecutionOutcome]
 		if ow, ok := w.Outcome.Get(); ok {
@@ -113,14 +113,14 @@ func decodeNodeReportWire(w nodeReportWire) (NodeReport, error) {
 	totalDur, okD := w.TotalDuration.Get()
 	hasUnknown, okU := w.HasUnknownOutcome.Get()
 	if !okN || !okS || !okC || !okD || !okU || !nodeID.IsValid() || !status.IsValid() || len(w.Steps) == 0 {
-		return NodeReport{}, fmt.Errorf("%w: 缺少必需字段或 steps 为空", ErrEmptyReport)
+		return NodeReport{}, domi18n.EF(ErrEmptyReport, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "node_report"))
 	}
 	reStatus, reDur, reUnknown := NodeStatusSucceeded, algebraic.ZeroDuration(), false
 	var reCounts StepCounts
 	seen := make(map[StepID]bool, len(w.Steps))
 	for i, rec := range w.Steps {
 		if !rec.IsValid() || !rec.nodeID.Equal(nodeID) || seen[rec.stepID] {
-			return NodeReport{}, fmt.Errorf("%w: steps[%d] 无效、节点归属漂移或 step_id 重复", ErrInvalidStepRecord, i)
+			return NodeReport{}, domi18n.EF(ErrInvalidStepRecord, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "steps"), domi18n.Int("index", i))
 		}
 		seen[rec.stepID] = true
 		reStatus = JoinNodeStatus(reStatus, reCounts.addStatus(rec.status))
@@ -129,12 +129,12 @@ func decodeNodeReportWire(w nodeReportWire) (NodeReport, error) {
 		}
 		nextDur, err := reDur.CheckedAdd(rec.duration)
 		if err != nil {
-			return NodeReport{}, fmt.Errorf("%w: 节点总耗时溢出: %w", ErrInvalidStepRecord, err)
+			return NodeReport{}, domi18n.WrapS(ErrInvalidStepRecord, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "total_duration"))
 		}
 		reDur = nextDur
 	}
 	if reStatus != status || reCounts != counts || !reDur.Equal(totalDur) || reUnknown != hasUnknown {
-		return NodeReport{}, fmt.Errorf("%w: NodeReport 汇总计数/状态/耗时/OutcomeUnknown 与步骤记录不一致", ErrOutcomeStatusMismatch)
+		return NodeReport{}, domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "node_report"))
 	}
 	return NodeReport{nodeID, status, slices.Clone(w.Steps), counts, totalDur, hasUnknown, true}, nil
 }
@@ -162,26 +162,26 @@ func decodePlaybookReportWire(w playbookReportWire) (PlaybookReport, error) {
 	counts, okC := w.StepCounts.Get()
 	hasUnknown, okU := w.HasUnknownOutcome.Get()
 	if !okID || !okDig || !okSt || !okC || !okU || !pbID.IsValid() || !pbDig.IsValid() || !status.IsValid() || len(w.Nodes) == 0 {
-		return PlaybookReport{}, fmt.Errorf("%w: 缺少必需字段或 nodes 为空", ErrEmptyReport)
+		return PlaybookReport{}, domi18n.EF(ErrEmptyReport, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "playbook_report"))
 	}
 	reStatus, reUnknown := NodeStatusSucceeded, false
 	var reCounts StepCounts
 	for i, nr := range w.Nodes {
 		if !nr.IsValid() {
-			return PlaybookReport{}, fmt.Errorf("%w: nodes[%d] 无效", ErrEmptyReport, i)
+			return PlaybookReport{}, domi18n.EF(ErrEmptyReport, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "nodes"), domi18n.Int("index", i))
 		}
 		if i > 0 && w.Nodes[i-1].nodeID.Compare(nr.nodeID) >= 0 {
-			return PlaybookReport{}, fmt.Errorf("%w: nodes 未按 NodeID 严格升序或存在重复节点 %s", ErrDuplicateStepRecord, nr.nodeID)
+			return PlaybookReport{}, domi18n.EF(ErrDuplicateStepRecord, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "node_id"), domi18n.BoundStr("value", nr.nodeID.String()))
 		}
 		reStatus = JoinNodeStatus(reStatus, nr.status)
 		reCounts.merge(nr.counts)
 		reUnknown = reUnknown || nr.hasUnknownOutcome
 	}
 	if reUnknown && reStatus != NodeStatusOutcomeUnknown {
-		return PlaybookReport{}, fmt.Errorf("%w: OutcomeUnknown 严禁降级", ErrOutcomeStatusMismatch)
+		return PlaybookReport{}, domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "has_unknown_outcome"))
 	}
 	if reStatus != status || reCounts != counts || reUnknown != hasUnknown {
-		return PlaybookReport{}, fmt.Errorf("%w: PlaybookReport 汇总计数/状态/OutcomeUnknown 与节点报表不一致", ErrOutcomeStatusMismatch)
+		return PlaybookReport{}, domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "playbook_report"))
 	}
 	return PlaybookReport{pbID, pbDig, status, slices.Clone(w.Nodes), counts, hasUnknown, true}, nil
 }

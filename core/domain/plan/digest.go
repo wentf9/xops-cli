@@ -5,9 +5,9 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"fmt"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -20,10 +20,10 @@ func parseSHA256Bytes(raw string) ([sha256.Size]byte, error) {
 	var sum [sha256.Size]byte
 	hexPart, ok := strings.CutPrefix(raw, sha256Prefix)
 	if !ok || len(hexPart) != sha256HexLen || !isLowerHexString(hexPart) {
-		return sum, fmt.Errorf("%w: %q", ErrInvalidDigest, raw)
+		return sum, domi18n.EF(ErrInvalidDigest, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "digest"), domi18n.BoundStr("value", raw))
 	}
 	if _, err := hex.Decode(sum[:], []byte(hexPart)); err != nil {
-		return [sha256.Size]byte{}, fmt.Errorf("%w: %w", ErrInvalidDigest, err)
+		return [sha256.Size]byte{}, domi18n.WrapSentinel(ErrInvalidDigest, err)
 	}
 	return sum, nil
 }

@@ -14,13 +14,12 @@ import (
 	"encoding/binary"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -44,21 +43,21 @@ const (
 
 // 本包导出的规范哨兵错误，所有非法组合、越界输入、JSON null 及零值调用均严格失败关闭。
 var (
-	ErrInvalidLaunchDialect            = errors.New("execution: 无效的启动方言 LaunchDialect")
-	ErrInvalidInterpreter              = errors.New("execution: 无效的解释器 Interpreter")
-	ErrInvalidLoginMode                = errors.New("execution: 无效的登录模式 LoginMode")
-	ErrInvalidLaunchProfile            = errors.New("execution: 无效的启动配置 LaunchProfile")
-	ErrUnsupportedExecutionCombination = errors.New("execution: 不支持的启动方言、解释器、登录模式或工作目录组合")
-	ErrNotPOSIXBourne                  = errors.New("execution: 当前启动配置不满足 POSIX Bourne 解释器要求")
-	ErrInvalidPlanKind                 = errors.New("execution: 无效的计划类型 PlanKind")
-	ErrInvalidCommandPlan              = errors.New("execution: 无效的命令执行计划 CommandPlan")
-	ErrInvalidEnvVar                   = errors.New("execution: 无效的环境变量键值")
-	ErrInvalidShellQuote               = errors.New("execution: 无法对包含非法控制字符或不可转义序列的文本进行安全引用")
-	ErrInvalidPhase                    = errors.New("execution: 无效的执行阶段枚举")
-	ErrInvalidExitStatus               = errors.New("execution: 无效的退出状态 ExitStatus")
-	ErrInvalidExecutionOutcome         = errors.New("execution: 无效的执行结果 ExecutionOutcome")
-	ErrNilWriter                       = errors.New("execution: WriteCanonical 或编码目标不能为 nil")
-	ErrNilReceiver                     = errors.New("execution: 反序列化目标接收者不能为 nil")
+	ErrInvalidLaunchDialect            = domi18n.Sentinel(domi18n.KeyExecutionInvalidLaunchDialect)
+	ErrInvalidInterpreter              = domi18n.Sentinel(domi18n.KeyExecutionInvalidInterpreter)
+	ErrInvalidLoginMode                = domi18n.Sentinel(domi18n.KeyExecutionInvalidLoginMode)
+	ErrInvalidLaunchProfile            = domi18n.Sentinel(domi18n.KeyExecutionInvalidLaunchProfile)
+	ErrUnsupportedExecutionCombination = domi18n.Sentinel(domi18n.KeyExecutionUnsupportedCombination)
+	ErrNotPOSIXBourne                  = domi18n.Sentinel(domi18n.KeyExecutionNotPOSIXBourne)
+	ErrInvalidPlanKind                 = domi18n.Sentinel(domi18n.KeyExecutionInvalidPlanKind)
+	ErrInvalidCommandPlan              = domi18n.Sentinel(domi18n.KeyExecutionInvalidCommandPlan)
+	ErrInvalidEnvVar                   = domi18n.Sentinel(domi18n.KeyExecutionInvalidEnvVar)
+	ErrInvalidShellQuote               = domi18n.Sentinel(domi18n.KeyExecutionInvalidShellQuote)
+	ErrInvalidPhase                    = domi18n.Sentinel(domi18n.KeyExecutionInvalidPhase)
+	ErrInvalidExitStatus               = domi18n.Sentinel(domi18n.KeyExecutionInvalidExitStatus)
+	ErrInvalidExecutionOutcome         = domi18n.Sentinel(domi18n.KeyExecutionInvalidOutcome)
+	ErrNilWriter                       = domi18n.Sentinel(domi18n.KeyExecutionNilWriter)
+	ErrNilReceiver                     = domi18n.Sentinel(domi18n.KeyExecutionNilReceiver)
 )
 
 func pickIf[T any](ok bool, yes, no T) T {
@@ -77,7 +76,7 @@ func enumName(idx uint8, fallback string, names ...string) string {
 
 func appendValidText(b []byte, valid bool, text string, baseErr error, raw uint8) ([]byte, error) {
 	if !valid {
-		return nil, fmt.Errorf("%w: %d", baseErr, raw)
+		return nil, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.Uint64("value", uint64(raw)))
 	}
 	return append(b, text...), nil
 }
@@ -103,7 +102,7 @@ func rejectJSONNull(dec *jsontext.Decoder, baseErr error) (bool, error) {
 	if _, err := dec.ReadToken(); err != nil {
 		return true, err
 	}
-	return true, fmt.Errorf("%w: JSON null 不是有效值", baseErr)
+	return true, domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden)
 }
 
 func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseErr error, build func(W) (T, error)) error {

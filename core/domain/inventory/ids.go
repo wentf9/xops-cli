@@ -6,9 +6,9 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json/jsontext"
-	"fmt"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
 
@@ -22,10 +22,10 @@ const (
 func validateAssetIdent(raw string, forbidOpenSSH bool) error {
 	if raw == "" || len(raw) > maxIDLen || hasSpaceOrForbidden(raw) || raw == "." || raw == ".." ||
 		raw[0] == '-' || strings.EqualFold(raw, "none") || strings.ContainsAny(raw, forbiddenIDChars) {
-		return fmt.Errorf("%w: %q 格式非法或使用了保留字", ErrInvalidID, raw)
+		return domi18n.EF(ErrInvalidID, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 	}
 	if forbidOpenSSH && len(raw) >= 8 && strings.EqualFold(raw[:8], "openssh:") {
-		return fmt.Errorf("%w: %q 禁止使用保留前缀 %q", ErrInvalidID, raw, "openssh:")
+		return domi18n.EF(ErrInvalidID, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "asset_id"), domi18n.BoundStr("value", raw))
 	}
 	return nil
 }
@@ -35,7 +35,7 @@ func validateKeyFileSpec(raw string) (string, error) {
 	if t == "" || len(t) > maxKeyPathBytes || hasForbiddenText(raw) || strings.EqualFold(t, "none") ||
 		strings.ContainsRune(t, '%') || strings.Contains(t, "${") ||
 		(strings.HasPrefix(t, "~") && t != "~" && !strings.HasPrefix(t, "~/") && !strings.HasPrefix(t, `~\`)) {
-		return "", fmt.Errorf("%w: 密钥/证书路径 %q 非法", ErrInvalidKeySpec, raw)
+		return "", domi18n.EF(ErrInvalidKeySpec, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "key_path"), domi18n.BoundStr("value", raw))
 	}
 	return t, nil
 }
@@ -122,7 +122,7 @@ func ParseCertPathSpec(raw string) (CertPathSpec, error) { return parseKeyFile[C
 func ParseAgentSpec(raw string) (AgentSpec, error) {
 	t := strings.TrimSpace(raw)
 	if t == "" || len(t) > maxAgentSpecBytes || hasForbiddenText(raw) {
-		return AgentSpec{}, fmt.Errorf("%w: 非法 AgentSpec %q", ErrInvalidAuthMethod, raw)
+		return AgentSpec{}, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "agent_spec"), domi18n.BoundStr("value", raw))
 	}
 	return AgentSpec{t}, nil
 }
@@ -178,11 +178,11 @@ func KeyFingerprintFromSHA256(sum [sha256.Size]byte) KeyFingerprint {
 func ParseKeyFingerprint(raw string) (KeyFingerprint, error) {
 	b64, ok := strings.CutPrefix(raw, sha256FingerprintTag)
 	if !ok || hasSpaceOrForbidden(raw) || len(b64) != sha256FingerprintB64 {
-		return KeyFingerprint{}, fmt.Errorf("%w: 指纹 %q 非法", ErrInvalidKeySpec, raw)
+		return KeyFingerprint{}, domi18n.EF(ErrInvalidKeySpec, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "fingerprint"), domi18n.BoundStr("value", raw))
 	}
 	decoded, err := base64.RawStdEncoding.Strict().DecodeString(b64)
 	if err != nil || len(decoded) != sha256.Size {
-		return KeyFingerprint{}, fmt.Errorf("%w: 指纹 Base64 解码失败", ErrInvalidKeySpec)
+		return KeyFingerprint{}, domi18n.EF(ErrInvalidKeySpec, domi18n.KeyCommonBase64DecodeFailed)
 	}
 	var sum [sha256.Size]byte
 	copy(sum[:], decoded)
@@ -215,7 +215,7 @@ type KeyPassphraseBinding struct {
 // NewKeyPassphraseBinding 校验口令凭据引用与公钥指纹均有效后构造不可变 KeyPassphraseBinding。
 func NewKeyPassphraseBinding(ref secret.Ref, fp KeyFingerprint) (KeyPassphraseBinding, error) {
 	if !ref.IsValid() || !fp.IsValid() {
-		return KeyPassphraseBinding{}, fmt.Errorf("%w: 私钥口令引用与公钥指纹均必须有效", ErrInvalidKeySpec)
+		return KeyPassphraseBinding{}, domi18n.EF(ErrInvalidKeySpec, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "passphrase_binding"))
 	}
 	return KeyPassphraseBinding{ref, fp, true}, nil
 }

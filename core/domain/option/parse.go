@@ -1,10 +1,10 @@
 package option
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // ParsedOption 表示经严格语法与值域校验的单条 OpenSSH 选项解析结果；零值恒无效。
@@ -30,7 +30,7 @@ func (p ParsedOption) Layer() OptionLayer { return p.layer.clone() }
 func ParseOption(directive string) (ParsedOption, error) {
 	t := strings.TrimSpace(directive)
 	if hasForbiddenControlChar(directive) || t == "" || t[0] == '#' || t[0] == '-' {
-		return ParsedOption{}, fmt.Errorf("%w: 空指令、注释或非法指令 %q", ErrInvalidOption, directive)
+		return ParsedOption{}, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "directive"), domi18n.BoundStr("value", directive))
 	}
 	rawKey, rawVal, err := splitDirectiveKV(t)
 	if err != nil {
@@ -41,7 +41,7 @@ func ParseOption(directive string) (ParsedOption, error) {
 func ParseOptionKV(key, value string) (ParsedOption, error) {
 	t := strings.TrimSpace(value)
 	if hasForbiddenControlChar(key) || hasForbiddenControlChar(value) || t == "" {
-		return ParsedOption{}, fmt.Errorf("%w: 键或值非法/为空", ErrInvalidOption)
+		return ParsedOption{}, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "option"))
 	}
 	return parseOptionWithRawValue(key, t)
 }
@@ -60,7 +60,7 @@ func ParseOptionLayer(directives ...string) (OptionLayer, error) {
 func parseOptionWithRawValue(rawKey, rawVal string) (ParsedOption, error) {
 	key, ok := CanonicalOptionKey(rawKey)
 	if !ok {
-		return ParsedOption{}, fmt.Errorf("%w: %q", ErrUnknownOption, rawKey)
+		return ParsedOption{}, domi18n.EF(ErrUnknownOption, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "option"), domi18n.BoundStr("value", rawKey))
 	}
 	spec, _ := LookupOptionSpec(key)
 	tokens, rawOut, err := parseDirectiveValues(rawVal, spec)
@@ -77,7 +77,7 @@ func parseOptionWithRawValue(rawKey, rawVal string) (ParsedOption, error) {
 func splitDirectiveKV(t string) (key, val string, err error) {
 	i := strings.IndexFunc(t, func(r rune) bool { return r > 127 || (!isASCIIAlphaNum(byte(r)) && r != '_') })
 	if i <= 0 {
-		return "", "", fmt.Errorf("%w: 指令 %q 缺少合法键或值", ErrInvalidOption, t)
+		return "", "", domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "directive"), domi18n.BoundStr("value", t))
 	}
 	key, rest := t[:i], t[i:]
 	switch rest[0] {
@@ -86,10 +86,10 @@ func splitDirectiveKV(t string) (key, val string, err error) {
 	case ' ', '\t':
 		val = strings.TrimSpace(strings.TrimPrefix(strings.TrimLeft(rest, " \t"), "="))
 	default:
-		return "", "", fmt.Errorf("%w: 选项键后分隔符非法", ErrInvalidOption)
+		return "", "", domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "separator"))
 	}
 	if val == "" {
-		return "", "", fmt.Errorf("%w: 选项 %s 值不能为空", ErrInvalidOption, key)
+		return "", "", domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldEmpty, domi18n.BoundStr("field", key))
 	}
 	return key, val, nil
 }
@@ -101,7 +101,7 @@ func parseDirectiveValues(raw string, spec OptionSpec) ([]string, string, error)
 	if spec.Key == KeySendEnv || spec.Key == KeyUserKnownHostsFile {
 		tokens, err := splitQuotedTokens(raw, spec.OpenSSHName)
 		if err != nil || len(tokens) == 0 {
-			return nil, "", fmt.Errorf("%w: %s 值无效", ErrInvalidOption, spec.OpenSSHName)
+			return nil, "", domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", spec.OpenSSHName))
 		}
 		return tokens, strings.Join(tokens, " "), nil
 	}
@@ -115,13 +115,13 @@ func parseWholeLineCommand(raw, name string) (string, error) {
 	}
 	seg, next, err := scanQuotedSpan(raw, 0, name)
 	if err != nil || strings.TrimSpace(seg) == "" {
-		return "", fmt.Errorf("%w: %s 引号未闭合或命令为空", ErrInvalidOption, name)
+		return "", domi18n.EF(ErrInvalidOption, domi18n.KeyOptionQuotedSyntax, domi18n.Str("option", name))
 	}
 	if next == len(raw) {
 		return seg, nil
 	}
 	if raw[next] != ' ' && raw[next] != '\t' {
-		return "", fmt.Errorf("%w: %s 引号闭合后缺少空白分隔", ErrInvalidOption, name)
+		return "", domi18n.EF(ErrInvalidOption, domi18n.KeyOptionQuotedSyntax, domi18n.Str("option", name))
 	}
 	_, err = splitQuotedTokens(raw[next:], name)
 	return raw, err
@@ -129,14 +129,14 @@ func parseWholeLineCommand(raw, name string) (string, error) {
 func unquoteSingleValue(raw, name string) (string, error) {
 	if raw[0] != '"' && raw[0] != '\'' {
 		if strings.ContainsAny(raw, " \t\"'") {
-			return "", fmt.Errorf("%w: %s 含未引号包裹的空白或内嵌引号", ErrInvalidOption, name)
+			return "", domi18n.EF(ErrInvalidOption, domi18n.KeyOptionQuotedSyntax, domi18n.Str("option", name))
 		}
 		return raw, nil
 	}
 	if seg, next, err := scanQuotedSpan(raw, 0, name); err == nil && next == len(raw) && seg != "" {
 		return seg, nil
 	}
-	return "", fmt.Errorf("%w: %s 引号语法非法或包含多值", ErrInvalidOption, name)
+	return "", domi18n.EF(ErrInvalidOption, domi18n.KeyOptionQuotedSyntax, domi18n.Str("option", name))
 }
 func splitQuotedTokens(raw, name string) ([]string, error) {
 	var tokens []string
@@ -184,7 +184,7 @@ func scanQuotedSpan(raw string, start int, name string) (string, int, error) {
 		}
 		b.WriteByte(raw[i])
 	}
-	return "", 0, fmt.Errorf("%w: %s 存在未闭合引号", ErrInvalidOption, name)
+	return "", 0, domi18n.EF(ErrInvalidOption, domi18n.KeyOptionQuotedSyntax, domi18n.Str("option", name))
 }
 
 func applyWith[A, T any](l *OptionLayer, arg A, parse func(A) (T, error), set func(OptionLayer, T) OptionLayer) error {
@@ -241,7 +241,7 @@ func applyOptionField(l *OptionLayer, key OptionKey, tokens []string, val string
 			KeyForwardAgent: OptionLayer.WithForwardAgent, KeyPermitLocalCommand: OptionLayer.WithPermitLocalCommand,
 		}[key])
 	default:
-		return fmt.Errorf("%w: %q", ErrUnknownOption, key)
+		return domi18n.EF(ErrUnknownOption, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "option"), domi18n.BoundStr("value", string(key)))
 	}
 }
 func applyControl[T any](l *OptionLayer, val string, parse func(string) (T, error), with func(ControlPolicy, T) ControlPolicy) error {
@@ -255,5 +255,5 @@ func parseSSHBool(raw string) (bool, error) {
 	if b, ok := map[string]bool{"yes": true, "true": true, "no": false, "false": false}[strings.ToLower(strings.TrimSpace(raw))]; ok {
 		return b, nil
 	}
-	return false, fmt.Errorf("%w: 无效布尔值 %q", ErrInvalidOption, raw)
+	return false, domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "bool"), domi18n.BoundStr("value", raw))
 }

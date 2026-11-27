@@ -1,10 +1,9 @@
 package fsm
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -103,7 +102,7 @@ type (
 // NewEnsureContext 校验操作标识、步骤标签与重试预算上限（<= MaxEnsureRetries），构造 EnsureContext。
 func NewEnsureContext(opID security.OperationID, stepLabel string, maxRetries uint8) (EnsureContext, error) {
 	if !opID.IsValid() || stepLabel == "" || len(stepLabel) > maxLabelLen || hasForbiddenStrictText(stepLabel) || maxRetries > MaxEnsureRetries {
-		return EnsureContext{}, fmt.Errorf("%w: operation_id/step_label/max_retries 参数非法", ErrInvalidEnsureStep)
+		return EnsureContext{}, domi18n.EF(ErrInvalidEnsureStep, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "operation_id/step_label/max_retries"))
 	}
 	return EnsureContext{opID, stepLabel, maxRetries, true}, nil
 }
@@ -155,7 +154,7 @@ func (e EnsureEvent) Equal(o EnsureEvent) bool {
 func EnsureInputStart() EnsureInput { return EnsureInput{kind: ensureInStart, valid: true} }
 func EnsureInputOutcome(outcome execution.ExecutionOutcome) (EnsureInput, error) {
 	if outcome == nil || !outcome.IsValid() {
-		return EnsureInput{}, fmt.Errorf("%w: ExecutionOutcome 无效", ErrInvalidInput)
+		return EnsureInput{}, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "execution_outcome"))
 	}
 	return EnsureInput{kind: ensureInOutcome, outcome: outcome, valid: true}, nil
 }
@@ -174,20 +173,20 @@ func TransitionEnsure(state EnsureState, input EnsureInput) (EnsureState, []Ensu
 	switch state.phase {
 	case EnsurePhasePending:
 		if input.kind != ensureInStart {
-			return state, nil, nil, fmt.Errorf("%w: pending 仅接受 Start", ErrIllegalTransition)
+			return state, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", state.phase.String()), domi18n.Str("expected", "Start"))
 		}
 		return ensureRun(EnsurePhaseChecking, state.ctx, 0, EnsureEffectRunCheck, EnsureEventCheckStarted, state.ctx.stepLabel)
 	case EnsurePhaseChecking, EnsurePhaseApplying, EnsurePhasePostChecking:
 		return stepEnsurePhaseOutcome(state, input)
 	case EnsurePhaseConvergedUnchanged, EnsurePhaseConvergedChanged, EnsurePhaseFailed, EnsurePhaseUncertainOutcome:
-		return state, nil, nil, fmt.Errorf("%w: 终态 %s 不接受输入", ErrIllegalTransition, state.phase)
+		return state, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMTerminalState, domi18n.Str("state", state.phase.String()))
 	default:
 		return state, nil, nil, ErrInvalidState
 	}
 }
 func stepEnsurePhaseOutcome(s EnsureState, in EnsureInput) (EnsureState, []EnsureEffect, []EnsureEvent, error) {
 	if in.kind != ensureInOutcome {
-		return s, nil, nil, fmt.Errorf("%w: %s 仅接受 Outcome", ErrIllegalTransition, s.phase)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", "Outcome"))
 	}
 	switch v := in.outcome.(type) {
 	case *execution.OutcomeUnknown:

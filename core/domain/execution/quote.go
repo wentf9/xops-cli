@@ -7,6 +7,7 @@ import (
 	"strings"
 	"unicode/utf16"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -14,7 +15,7 @@ import (
 // 拒绝 NUL、非法 UTF-8、控制字符（允许 \n/\r/\t）及 Unicode Cf/Bidi 字符；空串编码为 ””。
 func QuotePOSIX(arg string) (string, error) {
 	if hasForbiddenCommandText(arg) {
-		return "", fmt.Errorf("%w: POSIX 参数包含非法 UTF-8、NUL、控制或 Cf/Bidi 字符", ErrInvalidShellQuote)
+		return "", domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", "posix_arg"))
 	}
 	return quotePOSIXTrusted(arg), nil
 }
@@ -42,10 +43,10 @@ func quotePOSIXTrusted(arg string) string {
 // Unicode 弯引号（U+2018..U+201B）一并拒绝或转义，阻断引号逃逸注入。
 func QuotePowerShell(arg string) (string, error) {
 	if hasForbiddenCommandText(arg) {
-		return "", fmt.Errorf("%w: PowerShell 参数包含非法 UTF-8、NUL、控制或 Cf/Bidi 字符", ErrInvalidShellQuote)
+		return "", domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", "powershell_arg"))
 	}
 	if strings.ContainsFunc(arg, isPowerShellSmartSingleQuote) {
-		return "", fmt.Errorf("%w: PowerShell 单引号字面量拒绝 Unicode 弯单引号以防解析器逃逸", ErrInvalidShellQuote)
+		return "", domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", "powershell_arg"))
 	}
 	return quotePowerShellTrusted(arg), nil
 }
@@ -77,7 +78,7 @@ func isPowerShellSmartSingleQuote(r rune) bool {
 // 本函数严格拒绝换行、控制/Cf 字符与危险元字符；当含空白/逗号/分号/等号需加双引号时，
 // 同步拒绝尾部反斜杠以防 Win32 CommandLineToArgvW 将 \" 解释为转义引号。
 func QuoteCmdArg(arg string) (string, error) {
-	if err := validateCmdText(arg, "cmd 参数"); err != nil {
+	if err := validateCmdText(arg, "cmd_arg"); err != nil {
 		return "", err
 	}
 	if arg == "" {
@@ -87,17 +88,17 @@ func QuoteCmdArg(arg string) (string, error) {
 		return arg, nil
 	}
 	if strings.HasSuffix(arg, `\`) {
-		return "", fmt.Errorf("%w: cmd 双引号参数禁止以反斜杠结尾以防转义闭合引号", ErrInvalidShellQuote)
+		return "", domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", "cmd_arg"))
 	}
 	return `"` + arg + `"`, nil
 }
 
 func validateCmdText(val, label string) error {
 	if hasForbiddenStrictText(val) {
-		return fmt.Errorf("%w: %s包含非法 UTF-8、控制或 Cf/Bidi 字符", ErrInvalidShellQuote, label)
+		return domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", label))
 	}
 	if strings.ContainsAny(val, "\"%!^&|<>()\r\n") {
-		return fmt.Errorf("%w: %s包含禁止的元字符或变量展开符", ErrInvalidShellQuote, label)
+		return domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", label))
 	}
 	return nil
 }
@@ -106,7 +107,7 @@ func validateCmdText(val, label string) error {
 // 供 powershell.exe / pwsh 的 -EncodedCommand 参数安全传递（彻底隔离外层 POSIX/cmd 引号解析）。
 func EncodePowerShellUTF16LEBase64(script string) (string, error) {
 	if script == "" || hasForbiddenCommandText(script) {
-		return "", fmt.Errorf("%w: PowerShell 脚本为空或包含非法 UTF-8/NUL/控制/Cf 字符", ErrInvalidShellQuote)
+		return "", domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", "powershell_script"))
 	}
 	units := utf16.Encode([]rune(script))
 	raw := make([]byte, len(units)*2)

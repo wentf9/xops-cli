@@ -2,9 +2,9 @@ package pathalg
 
 import (
 	"cmp"
-	"fmt"
 	"slices"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -59,16 +59,16 @@ func ParseProtectedRule(pattern string) (ProtectedRule, error) {
 // UNC 规则（"//server/share/**"）与全局递归规则（"**/.ssh/**"）；拒绝空串、相对裸路径与非法控制/Bidi 字符。
 func NewProtectedRule(pattern, class string) (ProtectedRule, error) {
 	if pattern == "" {
-		return ProtectedRule{}, fmt.Errorf("%w: 受保护路径规则不能为空", ErrInvalidProtectedRule)
+		return ProtectedRule{}, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "pattern"))
 	}
 	if len(pattern) > MaxRemotePathBytes {
-		return ProtectedRule{}, fmt.Errorf("%w: 规则长度 %d 超过上限 %d", ErrInvalidProtectedRule, len(pattern), MaxRemotePathBytes)
+		return ProtectedRule{}, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "pattern"), domi18n.Int("size", len(pattern)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	if hasForbiddenPathText(pattern) {
-		return ProtectedRule{}, fmt.Errorf("%w: 规则 %q 包含非法 UTF-8、控制或 Bidi/Cf 字符", ErrInvalidProtectedRule, pattern)
+		return ProtectedRule{}, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "pattern"))
 	}
 	if class != "" && hasForbiddenPathText(class) {
-		return ProtectedRule{}, fmt.Errorf("%w: 规则类别 %q 包含非法字符", ErrInvalidProtectedRule, class)
+		return ProtectedRule{}, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "class"))
 	}
 	compiled, canonical, err := compileProtectedRule(norm.NFC.String(pattern))
 	if err != nil {
@@ -227,7 +227,7 @@ func NewClassifiedProtectedPathMatcher(rules []ProtectedRule) (ProtectedPathMatc
 	compiled := make([]compiledProtectedRule, 0, len(rules))
 	for _, r := range rules {
 		if !r.IsValid() {
-			return ProtectedPathMatcher{}, fmt.Errorf("%w: 规则列表包含无效 ProtectedRule", ErrInvalidProtectedRule)
+			return ProtectedPathMatcher{}, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "protected_rule"))
 		}
 		compiled = append(compiled, r.compiled)
 	}
@@ -259,7 +259,7 @@ func (m ProtectedPathMatcher) Match(target string) (ProtectedMatch, error) {
 // MatchRemotePath 对已校验的 RemotePath 执行受保护路径直接匹配。
 func (m ProtectedPathMatcher) MatchRemotePath(p RemotePath) (ProtectedMatch, error) {
 	if !p.IsValid() {
-		return ProtectedMatch{}, fmt.Errorf("%w: RemotePath 无效", ErrInvalidRemotePath)
+		return ProtectedMatch{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	return m.evaluate(p.clean, false)
 }
@@ -271,10 +271,10 @@ func (m ProtectedPathMatcher) MatchRecursive(dir string) (ProtectedMatch, error)
 
 func (m ProtectedPathMatcher) evaluate(target string, includeAncestors bool) (ProtectedMatch, error) {
 	if !m.valid {
-		return ProtectedMatch{}, fmt.Errorf("%w: ProtectedPathMatcher 未初始化", ErrInvalidProtectedRule)
+		return ProtectedMatch{}, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "protected_path_matcher"))
 	}
 	if target == "" || len(target) > MaxLocalPathBytes || hasForbiddenPathText(target) {
-		return ProtectedMatch{}, fmt.Errorf("%w: 待匹配目标路径 %q 为空、超长或含非法/控制/Bidi 字符", ErrInvalidProtectedRule, target)
+		return ProtectedMatch{}, domi18n.EF(ErrInvalidProtectedRule, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "target"), domi18n.BoundStr("value", target))
 	}
 	cands := extractMatchCandidates(norm.NFC.String(target))
 	var hits []ProtectedRuleMatch

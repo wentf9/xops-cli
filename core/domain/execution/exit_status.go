@@ -1,9 +1,9 @@
 package execution
 
 import (
-	"fmt"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -32,7 +32,7 @@ func ParseExitStatusKind(raw string) (ExitStatusKind, error) {
 			return ExitStatusKindUnknown, nil
 		}
 	}
-	return ExitStatusKindInvalid, fmt.Errorf("%w: kind %q", ErrInvalidExitStatus, raw)
+	return ExitStatusKindInvalid, domi18n.EF(ErrInvalidExitStatus, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "exit_status.kind"), domi18n.BoundStr("value", raw))
 }
 
 // IsValid 报告 k 是否为合法退出状态类别。
@@ -118,7 +118,7 @@ type ExitSignal struct {
 func NewExitSignal(signal string, coreDumped bool, message string) (*ExitSignal, error) {
 	norm := strings.ToUpper(strings.TrimSpace(signal))
 	if !isValidSignalName(norm) {
-		return nil, fmt.Errorf("%w: 非法信号名 %q", ErrInvalidExitStatus, signal)
+		return nil, domi18n.EF(ErrInvalidExitStatus, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "signal"), domi18n.BoundStr("value", signal))
 	}
 	return &ExitSignal{
 		signal: norm, coreDumped: coreDumped,

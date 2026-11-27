@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 )
 
@@ -87,7 +88,7 @@ func (p CommandPlan) renderServerCommand() (string, error) {
 	dialect := p.profile.Dialect()
 	if p.workDir.IsSome() || len(p.env) > 0 || len(p.argv) > 0 {
 		if dialect == DialectUnknown || dialect == DialectRaw {
-			return "", fmt.Errorf("%w: server 在 %s 方言下不支持拼接 cwd/env/argv", ErrUnsupportedExecutionCombination, dialect)
+			return "", domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionProfileMismatch, domi18n.Str("dialect", dialect.String()), domi18n.Str("interpreter", InterpreterServer.String()))
 		}
 	}
 	if dialect == DialectUnknown || dialect == DialectRaw {
@@ -234,14 +235,14 @@ func (p CommandPlan) renderPowerShellInterpreter() (string, error) {
 	}
 	cmd := exe + " -NoProfile -NonInteractive -EncodedCommand " + encoded
 	if len(cmd) > maxWindowsCommandLineChars {
-		return "", fmt.Errorf("%w: PowerShell -EncodedCommand 长度 %d 超过 Windows 命令行上限 %d", ErrInvalidCommandPlan, len(cmd), maxWindowsCommandLineChars)
+		return "", domi18n.EF(ErrInvalidCommandPlan, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "powershell_command"), domi18n.Int("size", len(cmd)), domi18n.Int("limit", maxWindowsCommandLineChars))
 	}
 	return cmd, nil
 }
 
 func (p CommandPlan) renderCmdBody() (string, error) {
 	if p.kind == PlanKindScript {
-		return "", fmt.Errorf("%w: cmd 解释器不支持脚本模式", ErrUnsupportedExecutionCombination)
+		return "", domi18n.EF(ErrUnsupportedExecutionCombination, domi18n.KeyExecutionScriptInterpreter)
 	}
 	var parts []string
 	if wd, ok := p.workDir.Get(); ok {
@@ -252,7 +253,7 @@ func (p CommandPlan) renderCmdBody() (string, error) {
 		parts = append(parts, "cd /d "+q+" || exit 1")
 	}
 	for _, kv := range p.env {
-		if err := validateCmdText(kv.value, "cmd 环境变量值"); err != nil {
+		if err := validateCmdText(kv.value, "cmd_env_value"); err != nil {
 			return "", err
 		}
 		parts = append(parts, fmt.Sprintf(`set "%s=%s"`, kv.key, kv.value))
@@ -267,7 +268,7 @@ func (p CommandPlan) renderCmdBody() (string, error) {
 	parts = append(parts, body)
 	rendered := strings.Join(parts, " && ")
 	if strings.ContainsAny(rendered, "\r\n") {
-		return "", fmt.Errorf("%w: cmd.exe 命令禁止包含换行符", ErrInvalidShellQuote)
+		return "", domi18n.EF(ErrInvalidShellQuote, domi18n.KeyExecutionQuoteForbiddenChar, domi18n.Str("field", "cmd_command"))
 	}
 	return rendered, nil
 }

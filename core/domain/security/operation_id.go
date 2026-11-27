@@ -6,9 +6,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -123,11 +124,11 @@ func DigestBytes(data []byte) Digest { return DigestFromSHA256(sha256.Sum256(dat
 func ParseDigest(raw string) (Digest, error) {
 	hexPart, ok := strings.CutPrefix(raw, sha256DigestPrefix)
 	if !ok || len(hexPart) != sha256HexLen || !isLowerHexString(hexPart) {
-		return Digest{}, fmt.Errorf("%w: %q", ErrInvalidDigest, raw)
+		return Digest{}, domi18n.EF(ErrInvalidDigest, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "digest"), domi18n.BoundStr("value", raw))
 	}
 	var sum [sha256.Size]byte
 	if _, err := hex.Decode(sum[:], []byte(hexPart)); err != nil {
-		return Digest{}, fmt.Errorf("%w: %w", ErrInvalidDigest, err)
+		return Digest{}, domi18n.WrapSentinel(ErrInvalidDigest, err)
 	}
 	return Digest{sum: sum, valid: true}, nil
 }
@@ -177,14 +178,14 @@ func appendValidToken(b []byte, val string, baseErr error) ([]byte, error) {
 }
 func parseToken(raw string, baseErr error) (string, error) {
 	if !isValidASCIIToken(raw, maxOperationIDLen) {
-		return "", fmt.Errorf("%w: %q", baseErr, raw)
+		return "", domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 	}
 	return raw, nil
 }
 func readHexID(entropy io.Reader, baseErr error) (string, error) {
 	raw, err := readExact16Bytes(entropy)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", baseErr, err)
+		return "", domi18n.WrapSentinel(baseErr, err)
 	}
 	return hex.EncodeToString(raw[:]), nil
 }

@@ -3,9 +3,10 @@ package algebraic
 import (
 	"cmp"
 	"encoding"
-	"fmt"
 	"math"
 	"time"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 var (
@@ -40,11 +41,11 @@ func FromStdDuration(d time.Duration) Duration {
 // 空串、含空白字符或非法单位均严格失败关闭，返回包装 ErrInvalidDuration 的错误。
 func ParseDuration(raw string) (Duration, error) {
 	if raw == "" {
-		return Duration{}, fmt.Errorf("%w: 空时长字符串", ErrInvalidDuration)
+		return Duration{}, domi18n.EF(ErrInvalidDuration, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "duration"))
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		return Duration{}, fmt.Errorf("%w: %q: %w", ErrInvalidDuration, raw, err)
+		return Duration{}, domi18n.WrapS(ErrInvalidDuration, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "duration"), domi18n.BoundStr("value", raw))
 	}
 	return Duration{raw: d}, nil
 }

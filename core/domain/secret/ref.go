@@ -3,8 +3,9 @@ package secret
 import (
 	"cmp"
 	"encoding"
-	"fmt"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const maxRefSegmentLen = 128
@@ -34,10 +35,10 @@ type Ref struct {
 // 确保跨 Linux/macOS/Windows 文件系统与 dirfd 映射无路径穿越或保留设备名碰撞风险。
 func NewRef(store, item string) (Ref, error) {
 	if !isValidRefSegment(store) {
-		return Ref{}, fmt.Errorf("%w: 非法 store 标识 %q", ErrInvalidRef, store)
+		return Ref{}, domi18n.EF(ErrInvalidRef, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "store"), domi18n.BoundStr("value", store))
 	}
 	if !isValidRefSegment(item) {
-		return Ref{}, fmt.Errorf("%w: 非法 item 标识 %q", ErrInvalidRef, item)
+		return Ref{}, domi18n.EF(ErrInvalidRef, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "item"), domi18n.BoundStr("value", item))
 	}
 	return Ref{
 		store: store,
@@ -49,7 +50,7 @@ func NewRef(store, item string) (Ref, error) {
 func ParseRef(raw string) (Ref, error) {
 	store, item, ok := strings.Cut(raw, "/")
 	if !ok {
-		return Ref{}, fmt.Errorf("%w: %q 必须为 <store>/<item> 格式", ErrInvalidRef, raw)
+		return Ref{}, domi18n.EF(ErrInvalidRef, domi18n.KeySecretRefFormat, domi18n.BoundStr("value", raw))
 	}
 	return NewRef(store, item)
 }

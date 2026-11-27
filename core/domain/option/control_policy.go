@@ -1,13 +1,13 @@
 package option
 
 import (
-	"fmt"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // ControlMasterMode、ControlPathKind 与 ControlPersistKind 为多路复用枚举；零值代表未设置。
@@ -51,7 +51,7 @@ func ParseControlMasterMode(raw string) (ControlMasterMode, error) {
 			return m, nil
 		}
 	}
-	return ControlMasterUnset, fmt.Errorf("%w: 无效 ControlMaster %q", ErrInvalidControlPolicy, raw)
+	return ControlMasterUnset, domi18n.EF(ErrInvalidControlPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "control_master"), domi18n.BoundStr("value", raw))
 }
 func (m ControlMasterMode) IsSet() bool { return m >= ControlMasterNo && m <= ControlMasterAutoAsk }
 func (m ControlMasterMode) String() string {
@@ -96,7 +96,7 @@ func (s ControlPathSpec) Equal(o ControlPathSpec) bool { return s.kind == o.kind
 func parseControlPathInternal(raw string, literal bool) (ControlPathSpec, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" || len(raw) > maxTokenLen {
-		return ControlPathSpec{}, fmt.Errorf("%w: ControlPath %q 非法", ErrInvalidControlPolicy, raw)
+		return ControlPathSpec{}, domi18n.EF(ErrInvalidControlPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "control_path"), domi18n.BoundStr("value", raw))
 	}
 	if isNoneKeyword(t) {
 		return DisabledControlPath(), nil
@@ -105,7 +105,7 @@ func parseControlPathInternal(raw string, literal bool) (ControlPathSpec, error)
 		return ControlPathSpec{ControlPathLiteral, raw}, nil
 	}
 	if err := validateTemplateTokens(t, allowedPathPercentTokens, true); err != nil {
-		return ControlPathSpec{}, fmt.Errorf("%w: ControlPath 占位符非法: %w", ErrInvalidControlPolicy, err)
+		return ControlPathSpec{}, domi18n.WrapS(ErrInvalidControlPolicy, err, domi18n.KeyOptionTemplateInvalid, domi18n.Str("option", "ControlPath"))
 	}
 	return ControlPathSpec{ControlPathTemplate, t}, nil
 }
@@ -127,14 +127,14 @@ func IndefiniteControlPersist() ControlPersistSpec {
 }
 func TimeoutControlPersist(d algebraic.Duration) (ControlPersistSpec, error) {
 	if !d.IsPositive() || d.Std()%time.Second != 0 {
-		return ControlPersistSpec{}, fmt.Errorf("%w: 时长 %s 须为正整秒", ErrInvalidControlPolicy, d.String())
+		return ControlPersistSpec{}, domi18n.EF(ErrInvalidControlPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "control_persist"), domi18n.Str("value", d.String()))
 	}
 	return ControlPersistSpec{ControlPersistTimeout, d}, nil
 }
 func ParseControlPersist(raw string) (ControlPersistSpec, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" {
-		return ControlPersistSpec{}, fmt.Errorf("%w: ControlPersist %q 无效", ErrInvalidControlPolicy, raw)
+		return ControlPersistSpec{}, domi18n.EF(ErrInvalidControlPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "control_persist"), domi18n.BoundStr("value", raw))
 	}
 	if spec, ok := map[string]ControlPersistSpec{
 		"no": DisabledControlPersist(), "false": DisabledControlPersist(),
@@ -144,7 +144,7 @@ func ParseControlPersist(raw string) (ControlPersistSpec, error) {
 	}
 	d, err := parseOpenSSHDuration(t)
 	if err != nil {
-		return ControlPersistSpec{}, fmt.Errorf("%w: %w", ErrInvalidControlPolicy, err)
+		return ControlPersistSpec{}, domi18n.WrapSentinel(ErrInvalidControlPolicy, err)
 	}
 	if d.IsZero() {
 		return IndefiniteControlPersist(), nil
@@ -158,14 +158,14 @@ func parseNonNegativeOpenSSHDuration(raw string, allowNone bool) (algebraic.Dura
 	}
 	d, err := parseOpenSSHDuration(raw)
 	if err != nil {
-		return algebraic.ZeroDuration(), fmt.Errorf("%w: %w", ErrInvalidOption, err)
+		return algebraic.ZeroDuration(), domi18n.WrapSentinel(ErrInvalidOption, err)
 	}
 	return d, nil
 }
 func parseOpenSSHDuration(raw string) (algebraic.Duration, error) {
 	s := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || s == "" {
-		return algebraic.ZeroDuration(), fmt.Errorf("非法时长 %q", raw)
+		return algebraic.ZeroDuration(), domi18n.E(domi18n.KeyOptionDurationInvalid, domi18n.BoundStr("value", raw))
 	}
 	const maxDur = time.Duration(math.MaxInt64)
 	var total time.Duration
@@ -175,7 +175,7 @@ func parseOpenSSHDuration(raw string) (algebraic.Duration, error) {
 			return algebraic.ZeroDuration(), err
 		}
 		if n > int64(maxDur/unit) || total > maxDur-time.Duration(n)*unit {
-			return algebraic.ZeroDuration(), fmt.Errorf("时长溢出 %q", s)
+			return algebraic.ZeroDuration(), domi18n.E(domi18n.KeyOptionDurationInvalid, domi18n.BoundStr("value", s))
 		}
 		total, rem = total+time.Duration(n)*unit, rest
 	}
@@ -188,7 +188,7 @@ func parseOpenSSHDurationPart(rem, full string) (int64, time.Duration, string, e
 	}
 	n, err := strconv.ParseInt(rem[:i], 10, 64)
 	if i == 0 || err != nil || n < 0 {
-		return 0, 0, "", fmt.Errorf("非法时长 %q", full)
+		return 0, 0, "", domi18n.E(domi18n.KeyOptionDurationInvalid, domi18n.BoundStr("value", full))
 	}
 	rest, unit := rem[i:], time.Second
 	if len(rest) == 0 {
@@ -196,7 +196,7 @@ func parseOpenSSHDurationPart(rem, full string) (int64, time.Duration, string, e
 	}
 	idx := strings.IndexByte("smhdw", rest[0]|0x20)
 	if idx < 0 {
-		return 0, 0, "", fmt.Errorf("未知单位 %q", rest[0])
+		return 0, 0, "", domi18n.E(domi18n.KeyOptionDurationInvalid, domi18n.BoundStr("value", full))
 	}
 	return n, [5]time.Duration{time.Second, time.Minute, time.Hour, 24 * time.Hour, 7 * 24 * time.Hour}[idx], rest[1:], nil
 }

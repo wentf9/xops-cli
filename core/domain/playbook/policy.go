@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 )
 
@@ -106,22 +107,22 @@ type FileMode struct {
 // NewFileMode 与 ParseFileMode 校验并构造不可变 FileMode（ParseFileMode 仅接受 3/4 位八进制串）。
 func NewFileMode(bits uint32) (FileMode, error) {
 	if bits > maxFileMode {
-		return FileMode{}, fmt.Errorf("%w: 权限位 0%o 超出 07777 上限", ErrInvalidFileMode, bits)
+		return FileMode{}, domi18n.EF(ErrInvalidFileMode, domi18n.KeyCommonPermInvalid, domi18n.Str("perm", fmt.Sprintf("0%o", bits)))
 	}
 	return FileMode{bits: bits, valid: true}, nil
 }
 func ParseFileMode(raw string) (FileMode, error) {
 	if len(raw) < 3 || len(raw) > 4 || hasForbiddenStrictText(raw) {
-		return FileMode{}, fmt.Errorf("%w: %q 必须为 3 或 4 位八进制权限串", ErrInvalidFileMode, raw)
+		return FileMode{}, domi18n.EF(ErrInvalidFileMode, domi18n.KeyPlaybookOctalModeInvalid, domi18n.BoundStr("value", raw))
 	}
 	for i := range len(raw) {
 		if raw[i] < '0' || raw[i] > '7' {
-			return FileMode{}, fmt.Errorf("%w: %q 包含非八进制字符", ErrInvalidFileMode, raw)
+			return FileMode{}, domi18n.EF(ErrInvalidFileMode, domi18n.KeyPlaybookOctalModeInvalid, domi18n.BoundStr("value", raw))
 		}
 	}
 	parsed, err := strconv.ParseUint(raw, 8, 32)
 	if err != nil {
-		return FileMode{}, fmt.Errorf("%w: %w", ErrInvalidFileMode, err)
+		return FileMode{}, domi18n.WrapSentinel(ErrInvalidFileMode, err)
 	}
 	return NewFileMode(uint32(parsed))
 }
@@ -179,10 +180,10 @@ func NewTargetSelector(spec TargetSelectorSpec) (TargetSelector, error) {
 		return TargetSelector{}, err
 	}
 	if !spec.All && len(nodes) == 0 && len(tags) == 0 {
-		return TargetSelector{}, fmt.Errorf("%w: 必须显式指定 all、nodes 或 tags 中的至少一项", ErrInvalidTargetSelector)
+		return TargetSelector{}, domi18n.EF(ErrInvalidTargetSelector, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "all, nodes, tags"))
 	}
 	if hasSortedOverlap(nodes, exNodes, inventory.NodeID.Compare) || hasSortedOverlap(tags, exTags, inventory.Tag.Compare) {
-		return TargetSelector{}, fmt.Errorf("%w: 包含集合与排除集合存在直接重叠冲突", ErrInvalidTargetSelector)
+		return TargetSelector{}, domi18n.EF(ErrInvalidTargetSelector, domi18n.KeyPlaybookSelectorOverlap)
 	}
 	return TargetSelector{spec.All, nodes, tags, exNodes, exTags, true}, nil
 }
@@ -196,7 +197,7 @@ func canonicalizeOrdered[T any](raw []T, limit int, isZero func(T) bool, cmpFn f
 		return nil, nil
 	}
 	if len(raw) > limit || slices.ContainsFunc(raw, isZero) {
-		return nil, fmt.Errorf("%w: 集合超限或包含无效零值元素", baseErr)
+		return nil, domi18n.EF(baseErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "selector"))
 	}
 	out := slices.Clone(raw)
 	slices.SortFunc(out, cmpFn)

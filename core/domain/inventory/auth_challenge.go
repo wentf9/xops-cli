@@ -1,12 +1,12 @@
 package inventory
 
 import (
-	"fmt"
 	"regexp"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
 
@@ -70,7 +70,7 @@ type ruleMeta struct {
 func compileRuleMeta(meta ChallengeRuleMeta, requireName bool) (ruleMeta, error) {
 	name := strings.TrimSpace(meta.Name)
 	if (requireName && name == "") || (name != "" && validateAssetIdent(name, false) != nil) {
-		return ruleMeta{}, fmt.Errorf("%w: 非法规则名 %q", ErrInvalidChallengeRule, meta.Name)
+		return ruleMeta{}, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "name"), domi18n.BoundStr("value", meta.Name))
 	}
 	pr, err := compileBoundedRegex(meta.PromptPattern, true)
 	if err != nil {
@@ -84,14 +84,14 @@ func compileRuleMeta(meta ChallengeRuleMeta, requireName bool) (ruleMeta, error)
 }
 func compileBoundedRegex(pat string, required bool) (*regexp.Regexp, error) {
 	if pat == "" {
-		return nil, pickIf[error](required, fmt.Errorf("%w: 正则模式不能为空", ErrInvalidChallengeRule), nil)
+		return nil, pickIf[error](required, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "pattern")), nil)
 	}
 	if len(pat) > maxPatternBytes || hasForbiddenText(pat) {
-		return nil, fmt.Errorf("%w: 正则模式超长或含非法字符", ErrInvalidChallengeRule)
+		return nil, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "pattern"))
 	}
 	re, err := regexp.Compile(pat)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 正则编译失败: %w", ErrInvalidChallengeRule, err)
+		return nil, domi18n.WrapS(ErrInvalidChallengeRule, err, domi18n.KeyInventoryRegexCompileFailed)
 	}
 	return re, nil
 }
@@ -141,7 +141,7 @@ type RuleLoginPassword struct {
 func compileSecretRule(meta ChallengeRuleMeta, requireName bool, ref secret.Ref) (ruleMeta, error) {
 	cm, err := compileRuleMeta(meta, requireName)
 	if err != nil || !ref.IsValid() {
-		return ruleMeta{}, fmt.Errorf("%w: 质询规则元数据或凭据引用无效", ErrInvalidChallengeRule)
+		return ruleMeta{}, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "challenge_rule"))
 	}
 	return cm, nil
 }
@@ -161,10 +161,10 @@ func NewRuleCommand(meta ChallengeRuleMeta, command string, args []string, timeo
 	cmd := strings.TrimSpace(command)
 	if cmd == "" || len(cmd) > maxCommandBytes || hasForbiddenText(command) || strings.ContainsAny(cmd, forbiddenCmdShellMeta) || len(args) > maxCommandArgs ||
 		slices.ContainsFunc(args, func(a string) bool { return len(a) > maxCommandBytes || hasForbiddenText(a) }) {
-		return nil, fmt.Errorf("%w: RuleCommand.command 或 args 非法", ErrInvalidChallengeRule)
+		return nil, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "command/args"))
 	}
 	if d, ok := timeout.Get(); ok && !d.IsPositive() {
-		return nil, fmt.Errorf("%w: RuleCommand.timeout 必须为正时长", ErrInvalidChallengeRule)
+		return nil, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "timeout"))
 	}
 	return &RuleCommand{cm, cmd, slices.Clone(args), timeout, true}, nil
 }

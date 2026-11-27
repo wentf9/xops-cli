@@ -1,10 +1,10 @@
 package security
 
 import (
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 )
 
@@ -23,7 +23,7 @@ type ScopedPath struct {
 // NewScopedPath 校验路径与受保护分区标签并构造不可变 ScopedPath。
 func NewScopedPath(path string, recursive bool, protectedZones ...string) (ScopedPath, error) {
 	if path == "" || hasInvalidUTF8OrControl(path) {
-		return ScopedPath{}, fmt.Errorf("%w: 路径不能为空且不得包含非法 UTF-8/控制/格式字符", ErrInvalidScopeSnapshot)
+		return ScopedPath{}, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "path"))
 	}
 	zones, err := canonicalizeUniqueStrings(protectedZones, "protected_zones", ErrInvalidScopeSnapshot)
 	if err != nil {
@@ -113,13 +113,13 @@ func NewScopeSnapshot(spec ScopeSnapshotSpec) (ScopeSnapshot, error) {
 func validateScopeSnapshotSpec(spec ScopeSnapshotSpec) error {
 	switch {
 	case !spec.Capability.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidScopeSnapshot, ErrInvalidCapability)
+		return domi18n.WrapSentinel(ErrInvalidScopeSnapshot, ErrInvalidCapability)
 	case spec.TargetNode != "" && !isValidNodeID(spec.TargetNode):
-		return fmt.Errorf("%w: 非法 target_node %q", ErrInvalidScopeSnapshot, spec.TargetNode)
+		return domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "target_node"), domi18n.BoundStr("value", spec.TargetNode))
 	case !spec.Verdict.IsValid() || !spec.Risk.IsValid() || spec.Decision == nil || !spec.Decision.IsValid():
-		return fmt.Errorf("%w: verdict/risk/decision 必须均有效", ErrInvalidScopeSnapshot)
+		return domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "verdict/risk/decision"))
 	case optInvalid(spec.Endpoint):
-		return fmt.Errorf("%w: endpoint 不可为无效零值", ErrInvalidScopeSnapshot)
+		return domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "endpoint"))
 	}
 	return nil
 }
@@ -131,7 +131,7 @@ func canonicalizeScopedPaths(raw []ScopedPath) ([]ScopedPath, error) {
 	cloned := make([]ScopedPath, len(raw))
 	for i, sp := range raw {
 		if !sp.IsValid() {
-			return nil, fmt.Errorf("%w: paths[%d] 无效", ErrInvalidScopeSnapshot, i)
+			return nil, domi18n.EF(ErrInvalidScopeSnapshot, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "paths"), domi18n.Int("index", i))
 		}
 		cloned[i] = cloneScopedPath(sp)
 	}

@@ -16,10 +16,11 @@ package option
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -30,18 +31,18 @@ const (
 
 // 包级哨兵错误：所有无效输入、未知选项与零值访问均严格失败关闭。
 var (
-	ErrInvalidOption        = errors.New("option: 无效的 OpenSSH 选项")
-	ErrUnknownOption        = errors.New("option: 未知或不支持的 OpenSSH 选项")
-	ErrInvalidOrigin        = errors.New("option: 无效的策略来源分类")
-	ErrInvalidEndpoint      = errors.New("option: 无效的目标端点")
-	ErrInvalidPathList      = errors.New("option: 无效的路径列表")
-	ErrInvalidAlgoPolicy    = errors.New("option: 无效的算法策略")
-	ErrEmptyAlgorithmList   = errors.New("option: 求解后的算法列表为空")
-	ErrInvalidProxyRoute    = errors.New("option: 无效的代理路由")
-	ErrInvalidControlPolicy = errors.New("option: 无效的多路复用策略")
-	ErrInvalidEnvFilter     = errors.New("option: 无效的环境变量过滤规则")
-	ErrInvalidPercentInput  = errors.New("option: 无效的 OpenSSH 令牌或 %C 哈希输入")
-	ErrNilReceiver          = errors.New("option: 编解码目标或编码器不能为 nil")
+	ErrInvalidOption        = domi18n.Sentinel(domi18n.KeyOptionInvalidOption)
+	ErrUnknownOption        = domi18n.Sentinel(domi18n.KeyOptionUnknownOption)
+	ErrInvalidOrigin        = domi18n.Sentinel(domi18n.KeyOptionInvalidOrigin)
+	ErrInvalidEndpoint      = domi18n.Sentinel(domi18n.KeyOptionInvalidEndpoint)
+	ErrInvalidPathList      = domi18n.Sentinel(domi18n.KeyOptionInvalidPathList)
+	ErrInvalidAlgoPolicy    = domi18n.Sentinel(domi18n.KeyOptionInvalidAlgoPolicy)
+	ErrEmptyAlgorithmList   = domi18n.Sentinel(domi18n.KeyOptionEmptyAlgorithmList)
+	ErrInvalidProxyRoute    = domi18n.Sentinel(domi18n.KeyOptionInvalidProxyRoute)
+	ErrInvalidControlPolicy = domi18n.Sentinel(domi18n.KeyOptionInvalidControlPolicy)
+	ErrInvalidEnvFilter     = domi18n.Sentinel(domi18n.KeyOptionInvalidEnvFilter)
+	ErrInvalidPercentInput  = domi18n.Sentinel(domi18n.KeyOptionInvalidPercentInput)
+	ErrNilReceiver          = domi18n.Sentinel(domi18n.KeyOptionNilReceiver)
 )
 
 // hasForbiddenControlChar 阻断非法 UTF-8、控制字符、行/段分隔符与全部 Unicode Cf 格式/双向/零宽/标签字符。

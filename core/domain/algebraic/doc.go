@@ -10,19 +10,19 @@
 // 依据 ADR-014，本包故意不提供泛化 Result[T]，失败路径统一回归地道 Go 的 (T, error) 契约。
 package algebraic
 
-import "errors"
+import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // ErrEmptySlice 表示构造或反序列化 NonEmpty[T] 时收到空切片、JSON 空数组或 JSON null。
-var ErrEmptySlice = errors.New("algebraic: NonEmpty 至少需要一个元素")
+var ErrEmptySlice = domi18n.Sentinel(domi18n.KeyAlgebraicEmptySlice)
 
 // ErrInvalidDuration 表示解析 Duration 时遇到空串、非法时长语法或非预期输入。
-var ErrInvalidDuration = errors.New("algebraic: 无效的 Duration 文本格式")
+var ErrInvalidDuration = domi18n.Sentinel(domi18n.KeyAlgebraicInvalidDuration)
 
 // ErrDurationOverflow 表示两个 Duration 相加超出 int64 纳秒可表示范围。
-var ErrDurationOverflow = errors.New("algebraic: Duration 加法发生溢出")
+var ErrDurationOverflow = domi18n.Sentinel(domi18n.KeyAlgebraicDurationOverflow)
 
 // ErrNilReceiver 表示在 nil 指针接收者上调用反序列化方法。
-var ErrNilReceiver = errors.New("algebraic: 反序列化目标接收者不能为 nil")
+var ErrNilReceiver = domi18n.Sentinel(domi18n.KeyAlgebraicNilReceiver)
 
 // ErrNilCallback 表示传入同步迭代回调方法（如 NonEmpty.ForEach）的函数为 nil。
-var ErrNilCallback = errors.New("algebraic: 回调函数不能为 nil")
+var ErrNilCallback = domi18n.Sentinel(domi18n.KeyAlgebraicNilCallback)

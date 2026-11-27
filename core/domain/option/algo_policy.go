@@ -1,9 +1,10 @@
 package option
 
 import (
-	"fmt"
 	"slices"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // AlgoOp 表示单条 OpenSSH 算法指令的列表算子类型；零值 AlgoOpUnset 代表幺半群单位元（未设置）。
@@ -45,20 +46,20 @@ func IdentityAlgoPolicy() AlgoPolicy { return AlgoPolicy{} }
 func ParseAlgoPolicy(raw string) (AlgoPolicy, error) {
 	t := strings.TrimSpace(raw)
 	if hasForbiddenControlChar(raw) || t == "" {
-		return AlgoPolicy{}, fmt.Errorf("%w: 算法策略 %q 无效", ErrInvalidAlgoPolicy, raw)
+		return AlgoPolicy{}, domi18n.EF(ErrInvalidAlgoPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "algo_policy"), domi18n.BoundStr("value", raw))
 	}
 	op, body := AlgoOpExact, t
 	if idx := strings.IndexByte("+-^", t[0]); idx >= 0 {
 		op, body = [3]AlgoOp{AlgoOpAppend, AlgoOpRemove, AlgoOpPrepend}[idx], t[1:]
 		if strings.TrimSpace(body) == "" {
-			return AlgoPolicy{}, fmt.Errorf("%w: 禁止裸修饰符 %q", ErrInvalidAlgoPolicy, t[:1])
+			return AlgoPolicy{}, domi18n.EF(ErrInvalidAlgoPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "algo_modifier"), domi18n.BoundStr("value", t[:1]))
 		}
 	}
 	var tokens []string
 	for part := range strings.SplitSeq(body, ",") {
 		tok := strings.TrimSpace(part)
 		if !isValidAlgoEntry(tok, op == AlgoOpRemove) {
-			return AlgoPolicy{}, fmt.Errorf("%w: 非法算法令牌 %q", ErrInvalidAlgoPolicy, tok)
+			return AlgoPolicy{}, domi18n.EF(ErrInvalidAlgoPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "algorithm"), domi18n.BoundStr("value", tok))
 		}
 		tokens = appendUniqueStrings(tokens, []string{tok})
 	}
@@ -136,7 +137,7 @@ func validateAlgoSlice(in []string, allowWildcard bool) ([]string, error) {
 	var out []string
 	for _, tok := range in {
 		if !isValidAlgoEntry(tok, allowWildcard) {
-			return nil, fmt.Errorf("%w: 非法算法令牌 %q", ErrInvalidAlgoPolicy, tok)
+			return nil, domi18n.EF(ErrInvalidAlgoPolicy, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "algorithm"), domi18n.BoundStr("value", tok))
 		}
 		out = appendUniqueStrings(out, []string{tok})
 	}

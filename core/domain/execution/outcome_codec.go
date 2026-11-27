@@ -3,9 +3,9 @@ package execution
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 type exitStatusWire struct {
@@ -66,27 +66,27 @@ func encodeExitStatusWire(s ExitStatus) (exitStatusWire, error) {
 func decodeExitStatusWire(w exitStatusWire) (ExitStatus, error) {
 	kind, ok := w.Kind.Get()
 	if !ok {
-		return nil, fmt.Errorf("%w: 缺少必需的 exit_status.kind 字段", ErrInvalidExitStatus)
+		return nil, domi18n.EF(ErrInvalidExitStatus, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "exit_status.kind"))
 	}
 	switch kind {
 	case ExitStatusKindCode:
 		code, hasCode := w.Code.Get()
 		if !hasCode || w.Signal != "" || w.CoreDumped || w.Message != "" || w.Reason != "" {
-			return nil, fmt.Errorf("%w: code 变体必须携带 code 且不得含其他变体字段", ErrInvalidExitStatus)
+			return nil, domi18n.EF(ErrInvalidExitStatus, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "code"))
 		}
 		return NewExitCode(code), nil
 	case ExitStatusKindSignal:
 		if w.Code.IsSome() || w.Reason != "" || w.Signal == "" {
-			return nil, fmt.Errorf("%w: signal 变体必须携带 signal 且不得含 code/reason", ErrInvalidExitStatus)
+			return nil, domi18n.EF(ErrInvalidExitStatus, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "signal"))
 		}
 		return NewExitSignal(w.Signal, w.CoreDumped, w.Message)
 	case ExitStatusKindUnknown:
 		if w.Code.IsSome() || w.Signal != "" || w.CoreDumped || w.Message != "" {
-			return nil, fmt.Errorf("%w: unknown 变体不得含 code/signal/message", ErrInvalidExitStatus)
+			return nil, domi18n.EF(ErrInvalidExitStatus, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "unknown"))
 		}
 		return NewExitUnknown(w.Reason), nil
 	default:
-		return nil, fmt.Errorf("%w: 未知退出状态类别 %d", ErrInvalidExitStatus, uint8(kind))
+		return nil, domi18n.EF(ErrInvalidExitStatus, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "exit_status.kind"), domi18n.Uint64("value", uint64(kind)))
 	}
 }
 
@@ -166,7 +166,7 @@ func encodeOutcomeWire(o ExecutionOutcome) (outcomeWire, error) {
 func decodeOutcomeWire(w outcomeWire) (ExecutionOutcome, error) {
 	kind, ok := w.Kind.Get()
 	if !ok {
-		return nil, fmt.Errorf("%w: 缺少必需的 outcome.kind 字段", ErrInvalidExecutionOutcome)
+		return nil, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "outcome.kind"))
 	}
 	switch kind {
 	case OutcomeKindNotStarted:
@@ -176,14 +176,14 @@ func decodeOutcomeWire(w outcomeWire) (ExecutionOutcome, error) {
 	case OutcomeKindUnknown:
 		return decodeUnknownWire(w)
 	default:
-		return nil, fmt.Errorf("%w: 未知执行结果类别 %d", ErrInvalidExecutionOutcome, uint8(kind))
+		return nil, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "outcome.kind"), domi18n.Uint64("value", uint64(kind)))
 	}
 }
 
 func decodeNotStartedWire(w outcomeWire) (ExecutionOutcome, error) {
 	phase, ok := w.StartPhase.Get()
 	if !ok || w.ExecPhase.IsSome() || w.ExitStatus.IsSome() || w.Truncated {
-		return nil, fmt.Errorf("%w: not_started 变体必须携带 start_phase 且不得含其他变体字段", ErrInvalidExecutionOutcome)
+		return nil, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "not_started"))
 	}
 	return NewOutcomeNotStarted(phase, w.Code, w.Reason)
 }
@@ -191,11 +191,11 @@ func decodeNotStartedWire(w outcomeWire) (ExecutionOutcome, error) {
 func decodeCompletedWire(w outcomeWire) (ExecutionOutcome, error) {
 	ew, ok := w.ExitStatus.Get()
 	if !ok || w.StartPhase.IsSome() || w.ExecPhase.IsSome() || w.Code != "" || w.Reason != "" {
-		return nil, fmt.Errorf("%w: completed 变体必须携带 exit_status 且不得含 phase/code/reason", ErrInvalidExecutionOutcome)
+		return nil, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "completed"))
 	}
 	st, err := decodeExitStatusWire(ew)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidExecutionOutcome, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidExecutionOutcome, err)
 	}
 	return NewOutcomeCompleted(st, w.Truncated)
 }
@@ -203,7 +203,7 @@ func decodeCompletedWire(w outcomeWire) (ExecutionOutcome, error) {
 func decodeUnknownWire(w outcomeWire) (ExecutionOutcome, error) {
 	phase, ok := w.ExecPhase.Get()
 	if !ok || w.StartPhase.IsSome() || w.ExitStatus.IsSome() || w.Truncated {
-		return nil, fmt.Errorf("%w: unknown 变体必须携带 exec_phase 且不得含其他变体字段", ErrInvalidExecutionOutcome)
+		return nil, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "unknown"))
 	}
 	return NewOutcomeUnknown(phase, w.Code, w.Reason)
 }

@@ -1,11 +1,11 @@
 package inventory
 
 import (
-	"fmt"
 	"io"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
 
@@ -103,7 +103,7 @@ func (*AuthComposite) sealedAuthMethod()           {}
 // NewAuthPassword、NewAuthPrivateKey、NewAuthAgent、NewAuthKeyboardInteractive 与 NewAuthComposite 构造不可变认证方式。
 func NewAuthPassword(ref secret.Ref) (*AuthPassword, error) {
 	if !ref.IsValid() {
-		return nil, fmt.Errorf("%w: AuthPassword 必须绑定有效 secret.Ref", ErrInvalidAuthMethod)
+		return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "password_ref"))
 	}
 	return &AuthPassword{ref, true}, nil
 }
@@ -111,28 +111,28 @@ func NewAuthPrivateKey(keyPaths algebraic.NonEmpty[KeyPathSpec], passphrase alge
 	pb, hasPB := passphrase.Get()
 	if !keyPaths.IsValid() || slices.ContainsFunc(keyPaths.Slice(), KeyPathSpec.IsZero) ||
 		(hasPB && !pb.IsValid()) || len(certPaths) > maxCertPaths || slices.ContainsFunc(certPaths, CertPathSpec.IsZero) {
-		return nil, fmt.Errorf("%w: AuthPrivateKey 密钥/口令绑定/证书路径非法", ErrInvalidAuthMethod)
+		return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "private_key"))
 	}
 	return &AuthPrivateKey{keyPaths, passphrase, slices.Clone(certPaths), true}, nil
 }
 func NewAuthAgent(spec algebraic.Option[AgentSpec]) (*AuthAgent, error) {
 	if s, ok := spec.Get(); ok && !s.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 AgentSpec", ErrInvalidAuthMethod)
+		return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "agent_spec"))
 	}
 	return &AuthAgent{spec, true}, nil
 }
 func NewAuthKeyboardInteractive(rules algebraic.NonEmpty[ChallengeRule]) (*AuthKeyboardInteractive, error) {
 	if !rules.IsValid() {
-		return nil, fmt.Errorf("%w: keyboard_interactive 需要至少一条规则", ErrInvalidAuthMethod)
+		return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "rules"))
 	}
 	seen := make(map[string]bool, rules.Len())
 	for i, r := range rules.Slice() {
 		if r == nil || !r.IsValid() {
-			return nil, fmt.Errorf("%w: rules[%d] 无效", ErrInvalidAuthMethod, i)
+			return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "rules"), domi18n.Int("index", i))
 		}
 		if name := r.Name(); name != "" {
 			if seen[name] {
-				return nil, fmt.Errorf("%w: 重复质询规则名 %q", ErrInvalidChallengeRule, name)
+				return nil, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "challenge_rule"), domi18n.BoundStr("value", name))
 			}
 			seen[name] = true
 		}
@@ -141,7 +141,7 @@ func NewAuthKeyboardInteractive(rules algebraic.NonEmpty[ChallengeRule]) (*AuthK
 }
 func NewAuthComposite(methods algebraic.NonEmpty[AuthMethod]) (*AuthComposite, error) {
 	if !methods.IsValid() {
-		return nil, fmt.Errorf("%w: AuthComposite 子列表不能为空", ErrInvalidAuthMethod)
+		return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "methods"))
 	}
 	visiting := make(map[*AuthComposite]bool)
 	for _, m := range methods.Slice() {
@@ -161,10 +161,10 @@ func validateAuthMethodDepth(m AuthMethod, depth int, visiting map[*AuthComposit
 		return nil
 	case *AuthComposite:
 		if depth > maxAuthCompositeDepth {
-			return fmt.Errorf("%w: 超过最大嵌套深度 %d", ErrAuthCompositeTooDeep, maxAuthCompositeDepth)
+			return domi18n.EF(ErrAuthCompositeTooDeep, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "depth"), domi18n.Int("value", depth), domi18n.Int("max", maxAuthCompositeDepth))
 		}
 		if visiting[v] {
-			return fmt.Errorf("%w: 检测到 AuthComposite 循环引用", ErrInvalidAuthMethod)
+			return domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "composite"))
 		}
 		visiting[v] = true
 		defer delete(visiting, v)

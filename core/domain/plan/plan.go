@@ -4,11 +4,11 @@ import (
 	"crypto/sha256"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"io"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -39,7 +39,7 @@ type SealedConnectionPlan struct {
 func SealConnectionPlan(hops ...HopSpec) (SealedConnectionPlan, error) {
 	ne, err := algebraic.NonEmptyFromSlice(hops)
 	if err != nil {
-		return SealedConnectionPlan{}, fmt.Errorf("%w: 连接计划至少需要 1 跳", ErrInvalidConnectionPlan)
+		return SealedConnectionPlan{}, domi18n.EF(ErrInvalidConnectionPlan, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "hops"))
 	}
 	return NewSealedConnectionPlan(ne)
 }
@@ -47,20 +47,20 @@ func SealConnectionPlan(hops ...HopSpec) (SealedConnectionPlan, error) {
 // NewSealedConnectionPlan 校验全部跳板规格及其连续索引 [0..n-1]，计算 Merkle 跳板摘要链与顶层 PlanDigest。
 func NewSealedConnectionPlan(hops algebraic.NonEmpty[HopSpec]) (SealedConnectionPlan, error) {
 	if !hops.IsValid() {
-		return SealedConnectionPlan{}, fmt.Errorf("%w: hops 不能为空", ErrInvalidConnectionPlan)
+		return SealedConnectionPlan{}, domi18n.EF(ErrInvalidConnectionPlan, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "hops"))
 	}
 	src := hops.Slice()
 	if len(src) > maxPlanHops {
-		return SealedConnectionPlan{}, fmt.Errorf("%w: 跳板数量 %d 超过上限 %d", ErrInvalidConnectionPlan, len(src), maxPlanHops)
+		return SealedConnectionPlan{}, domi18n.EF(ErrInvalidConnectionPlan, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "hops"), domi18n.Int("count", len(src)), domi18n.Int("limit", maxPlanHops))
 	}
 	digests := make([]HopDigest, len(src))
 	var prev HopDigest
 	for i, hop := range src {
 		if !hop.IsValid() {
-			return SealedConnectionPlan{}, fmt.Errorf("%w: hops[%d] 无效", ErrInvalidConnectionPlan, i)
+			return SealedConnectionPlan{}, domi18n.EF(ErrInvalidConnectionPlan, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "hops"), domi18n.Int("index", i))
 		}
 		if hop.hopIndex != uint32(i) {
-			return SealedConnectionPlan{}, fmt.Errorf("%w: hops[%d].hop_index=%d 与顺序索引不连续", ErrInvalidConnectionPlan, i, hop.hopIndex)
+			return SealedConnectionPlan{}, domi18n.EF(ErrInvalidConnectionPlan, domi18n.KeyPlanHopIndexDiscontinuous, domi18n.Int("index", i), domi18n.Uint64("actual", uint64(hop.hopIndex)))
 		}
 		hd, err := computeMerkleHopDigest(prev, hop)
 		if err != nil {
@@ -71,7 +71,7 @@ func NewSealedConnectionPlan(hops algebraic.NonEmpty[HopSpec]) (SealedConnection
 	}
 	neDigests, err := algebraic.NonEmptyFromSlice(digests)
 	if err != nil {
-		return SealedConnectionPlan{}, fmt.Errorf("%w: %w", ErrInvalidConnectionPlan, err)
+		return SealedConnectionPlan{}, domi18n.WrapSentinel(ErrInvalidConnectionPlan, err)
 	}
 	pd, err := computePlanDigest(uint64(len(src)), prev)
 	if err != nil {
@@ -161,7 +161,7 @@ func (p SealedConnectionPlan) Target() (HopSpec, bool) {
 // 供连接池多跳拨号逐级缓存并安全复用公共堡垒机前缀。
 func (p SealedConnectionPlan) Prefix(count int) (SealedConnectionPlan, error) {
 	if !p.IsValid() || count < 1 || count > p.hops.Len() {
-		return SealedConnectionPlan{}, fmt.Errorf("%w: 非法前缀长度 %d", ErrInvalidConnectionPlan, count)
+		return SealedConnectionPlan{}, domi18n.EF(ErrInvalidConnectionPlan, domi18n.KeyCommonFieldRange, domi18n.Str("field", "prefix"), domi18n.Int("value", count), domi18n.Int("min", 1), domi18n.Int("max", p.hops.Len()))
 	}
 	subHops, err := algebraic.NonEmptyFromSlice(p.hops.Slice()[:count])
 	if err != nil {
@@ -256,21 +256,21 @@ func (p *SealedConnectionPlan) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return unmarshalJSONWithNullReject(p, dec, ErrInvalidConnectionPlan, func(w sealedPlanWire) (SealedConnectionPlan, error) {
 		neHops, err := algebraic.NonEmptyFromSlice(w.Hops)
 		if err != nil {
-			return SealedConnectionPlan{}, fmt.Errorf("%w: %w", ErrInvalidConnectionPlan, err)
+			return SealedConnectionPlan{}, domi18n.WrapSentinel(ErrInvalidConnectionPlan, err)
 		}
 		pd, hasPD := w.PlanDigest.Get()
 		if !hasPD || len(w.HopDigests) == 0 {
-			return SealedConnectionPlan{}, fmt.Errorf("%w: 缺少必需的 hop_digests 或 plan_digest", ErrTamperedPlanDigest)
+			return SealedConnectionPlan{}, domi18n.EF(ErrTamperedPlanDigest, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", "hop_digests/plan_digest"))
 		}
 		rebuilt, err := NewSealedConnectionPlan(neHops)
 		if err != nil {
 			return SealedConnectionPlan{}, err
 		}
 		if !slices.EqualFunc(w.HopDigests, rebuilt.hopDigests.Slice(), HopDigest.Equal) {
-			return SealedConnectionPlan{}, fmt.Errorf("%w: hop_digests 校验失败", ErrTamperedPlanDigest)
+			return SealedConnectionPlan{}, domi18n.EF(ErrTamperedPlanDigest, domi18n.KeyPlanDigestVerifyFailed, domi18n.Str("field", "hop_digests"))
 		}
 		if !pd.Equal(rebuilt.planDigest) {
-			return SealedConnectionPlan{}, fmt.Errorf("%w: plan_digest 校验失败", ErrTamperedPlanDigest)
+			return SealedConnectionPlan{}, domi18n.EF(ErrTamperedPlanDigest, domi18n.KeyPlanDigestVerifyFailed, domi18n.Str("field", "plan_digest"))
 		}
 		return rebuilt, nil
 	})

@@ -3,6 +3,7 @@ package fsm
 import (
 	"fmt"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
 
@@ -30,28 +31,28 @@ func VaultInputCompensateResult(o SideEffectOutcome, r string) (VaultSagaInput, 
 // 仅当 outcome == SideEffectSucceeded 时允许 matched=true；遇 SideEffectOutcomeUnknown 进入 FailedUncertain 且 0 副作用。
 func VaultInputReadbackResult(outcome SideEffectOutcome, matched bool, reason string) (VaultSagaInput, error) {
 	if !outcome.IsValid() {
-		return VaultSagaInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidOutcome)
+		return VaultSagaInput{}, domi18n.WrapSentinel(ErrInvalidInput, ErrInvalidOutcome)
 	}
 	if outcome != SideEffectSucceeded && matched {
-		return VaultSagaInput{}, fmt.Errorf("%w: 非成功回读结果不得声称 matched=true", ErrInvalidInput)
+		return VaultSagaInput{}, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "readback_matched"))
 	}
 	return VaultSagaInput{kind: vaultInReadback, outcome: outcome, ok: matched, reason: sanitizeReason(reason), valid: true}, nil
 }
 func VaultInputCommitCASResult(durability DurabilityStatus, reason string) (VaultSagaInput, error) {
 	if !durability.IsValid() {
-		return VaultSagaInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidDurability)
+		return VaultSagaInput{}, domi18n.WrapSentinel(ErrInvalidInput, ErrInvalidDurability)
 	}
 	return VaultSagaInput{kind: vaultInCommitCAS, durability: durability, reason: sanitizeReason(reason), valid: true}, nil
 }
 func VaultInputOldRefsResult(ok bool, refCount int, reason string) (VaultSagaInput, error) {
 	if ok && refCount < 0 {
-		return VaultSagaInput{}, fmt.Errorf("%w: 引用计数不能为负数", ErrInvalidInput)
+		return VaultSagaInput{}, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "ref_count"))
 	}
 	return VaultSagaInput{kind: vaultInOldRefs, ok: ok, refCount: refCount, reason: sanitizeReason(reason), valid: true}, nil
 }
 func vOutIn(kind uint8, outcome SideEffectOutcome, reason string) (VaultSagaInput, error) {
 	if !outcome.IsValid() {
-		return VaultSagaInput{}, fmt.Errorf("%w: %w", ErrInvalidInput, ErrInvalidOutcome)
+		return VaultSagaInput{}, domi18n.WrapSentinel(ErrInvalidInput, ErrInvalidOutcome)
 	}
 	return VaultSagaInput{kind: kind, outcome: outcome, reason: sanitizeReason(reason), valid: true}, nil
 }
@@ -83,7 +84,7 @@ func TransitionVaultSaga(state VaultSagaState, input VaultSagaInput) (VaultSagaS
 	case *VaultSagaCompensating:
 		return stepVaultCompensating(s, input)
 	case *VaultSagaCompleted, *VaultSagaRolledBack, *VaultSagaUncertainDurability, *VaultSagaFailedUncertain:
-		return state, nil, nil, fmt.Errorf("%w: 终态 %s 不接受输入", ErrIllegalTransition, s.Kind())
+		return state, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMTerminalState, domi18n.Str("state", s.Kind().String()))
 	default:
 		return state, nil, nil, ErrInvalidState
 	}
@@ -91,13 +92,13 @@ func TransitionVaultSaga(state VaultSagaState, input VaultSagaInput) (VaultSagaS
 
 func stepVaultInit(s *VaultSagaInit, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInStart {
-		return s, nil, nil, fmt.Errorf("%w: init 仅接受 Start", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "Start"))
 	}
 	return vaultNext(&VaultSagaWritingNew{vMix(s.ctx, VaultSagaKindWritingNew, "")}, VaultEffectWriteNew, s.ctx.newRef, 0, VaultEventStarted, s.ctx.newRef.String())
 }
 func stepVaultWritingNew(s *VaultSagaWritingNew, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInWriteNew {
-		return s, nil, nil, fmt.Errorf("%w: writing_new 仅接受 WriteNewResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "WriteNewResult"))
 	}
 	switch in.outcome {
 	case SideEffectSucceeded:
@@ -112,7 +113,7 @@ func stepVaultWritingNew(s *VaultSagaWritingNew, in VaultSagaInput) (VaultSagaSt
 }
 func stepVaultVerifyingReadback(s *VaultSagaVerifyingReadback, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInReadback {
-		return s, nil, nil, fmt.Errorf("%w: verifying_readback 仅接受 ReadbackResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "ReadbackResult"))
 	}
 	switch in.outcome {
 	case SideEffectSucceeded:
@@ -131,7 +132,7 @@ func stepVaultVerifyingReadback(s *VaultSagaVerifyingReadback, in VaultSagaInput
 }
 func stepVaultCommittingConfig(s *VaultSagaCommittingConfig, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInCommitCAS {
-		return s, nil, nil, fmt.Errorf("%w: committing_config 仅接受 CommitCASResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "CommitCASResult"))
 	}
 	switch in.durability {
 	case DurabilityCommitted:
@@ -152,7 +153,7 @@ func stepVaultCommittingConfig(s *VaultSagaCommittingConfig, in VaultSagaInput) 
 }
 func stepVaultCheckingOldRefs(s *VaultSagaCheckingOldRefs, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInOldRefs {
-		return s, nil, nil, fmt.Errorf("%w: checking_old_refs 仅接受 OldRefsResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "OldRefsResult"))
 	}
 	if !in.ok {
 		return vaultUncertain(s.ctx, VaultSagaKindCheckingOldRefs, in.reason)
@@ -166,7 +167,7 @@ func stepVaultCheckingOldRefs(s *VaultSagaCheckingOldRefs, in VaultSagaInput) (V
 }
 func stepVaultDeletingOld(s *VaultSagaDeletingOld, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInDeleteOld {
-		return s, nil, nil, fmt.Errorf("%w: deleting_old 仅接受 DeleteOldResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "DeleteOldResult"))
 	}
 	if in.outcome == SideEffectSucceeded {
 		oldRef, _ := s.ctx.oldRef.Get()
@@ -176,7 +177,7 @@ func stepVaultDeletingOld(s *VaultSagaDeletingOld, in VaultSagaInput) (VaultSaga
 }
 func stepVaultCompensating(s *VaultSagaCompensating, in VaultSagaInput) (VaultSagaState, []VaultSagaEffect, []VaultSagaEvent, error) {
 	if in.kind != vaultInCompensate {
-		return s, nil, nil, fmt.Errorf("%w: compensating 仅接受 CompensateResult", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.Kind().String()), domi18n.Str("expected", "CompensateResult"))
 	}
 	if in.outcome == SideEffectSucceeded {
 		return &VaultSagaRolledBack{vMix(s.ctx, VaultSagaKindRolledBack, s.reason), true}, nil, []VaultSagaEvent{newEvent(VaultEventCompensated, s.ctx.newRef.String()), newEvent(VaultEventRolledBack, s.reason)}, nil

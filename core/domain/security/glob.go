@@ -1,12 +1,13 @@
 package security
 
 import (
-	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -46,7 +47,7 @@ func ValidateGlob(pattern string) error { _, err := compileGlob(pattern); return
 // '*' 跨 '/'、'\' 与换行匹配任意序列，'?' 匹配单码点，'[...]' 支持取反与范围，'\' 恒为字面字符。
 func MatchGlob(pattern, target string) (bool, error) {
 	if !utf8.ValidString(target) {
-		return false, fmt.Errorf("%w: 目标文本包含非法 UTF-8", ErrInvalidGlob)
+		return false, domi18n.EF(ErrInvalidGlob, domi18n.KeyCommonInvalidUTF8)
 	}
 	tokens, err := compileGlob(pattern)
 	if err != nil {
@@ -78,7 +79,7 @@ func matchCompiledGlob(tokens []globToken, rs []rune) bool {
 
 func compileGlob(pattern string) ([]globToken, error) {
 	if pattern == "" || hasInvalidUTF8OrControl(pattern) {
-		return nil, fmt.Errorf("%w: 模式为空、非法 UTF-8 或包含控制/格式字符", ErrInvalidGlob)
+		return nil, domi18n.EF(ErrInvalidGlob, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "pattern"))
 	}
 	runes := []rune(pattern)
 	tokens := make([]globToken, 0, len(runes))
@@ -110,7 +111,7 @@ func parseNextGlobToken(runes []rune, idx int) (globToken, int, error) {
 
 func parseGlobCharClass(runes []rune, i int) (globToken, int, error) {
 	if i >= len(runes) {
-		return globToken{}, 0, fmt.Errorf("%w: 未闭合的字符类", ErrInvalidGlob)
+		return globToken{}, 0, domi18n.EF(ErrInvalidGlob, domi18n.KeyPathalgGlobUnclosed)
 	}
 	negated := runes[i] == '^' || runes[i] == '!'
 	if negated {
@@ -127,7 +128,7 @@ func parseGlobCharClass(runes []rune, i int) (globToken, int, error) {
 		}
 		ranges, i = append(ranges, rg), next
 	}
-	return globToken{}, 0, fmt.Errorf("%w: 未闭合的字符类", ErrInvalidGlob)
+	return globToken{}, 0, domi18n.EF(ErrInvalidGlob, domi18n.KeyPathalgGlobUnclosed)
 }
 
 func parseGlobRuneRange(runes []rune, idx int) (runeRange, int, error) {
@@ -135,7 +136,7 @@ func parseGlobRuneRange(runes []rune, idx int) (runeRange, int, error) {
 	if idx+2 < len(runes) && runes[idx+1] == '-' && runes[idx+2] != ']' {
 		hi := runes[idx+2]
 		if hi < lo {
-			return runeRange{}, 0, fmt.Errorf("%w: 非法字符范围 %q-%q", ErrInvalidGlob, lo, hi)
+			return runeRange{}, 0, domi18n.EF(ErrInvalidGlob, domi18n.KeyPathalgGlobRangeInvalid, domi18n.BoundStr("lo", string(lo)), domi18n.BoundStr("hi", string(hi)))
 		}
 		return runeRange{lo: lo, hi: hi}, idx + 3, nil
 	}

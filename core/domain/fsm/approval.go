@@ -1,12 +1,12 @@
 package fsm
 
 import (
-	"fmt"
 	"maps"
 	"slices"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -128,10 +128,10 @@ type ApprovalEvent = Event[ApprovalEventKind]
 func NewApprovalContext(spec ApprovalContextSpec) (ApprovalContext, error) {
 	if !spec.OperationID.IsValid() || !spec.LexicalBinding.IsValid() || !spec.LexicalSnapshot.IsValid() ||
 		!bindingMatchesSnapshot(spec.LexicalBinding, spec.LexicalSnapshot) {
-		return ApprovalContext{}, fmt.Errorf("%w: operation_id/lexical_binding/lexical_snapshot 须有效且能力/目标节点/端点一致", ErrInvalidContext)
+		return ApprovalContext{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "operation_id/lexical_binding/lexical_snapshot"))
 	}
 	if pd, ok := spec.PolicyDigest.Get(); ok && !pd.IsValid() {
-		return ApprovalContext{}, fmt.Errorf("%w: policy_digest 无效", ErrInvalidContext)
+		return ApprovalContext{}, domi18n.EF(ErrInvalidContext, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "policy_digest"))
 	}
 	return ApprovalContext{spec.OperationID, spec.LexicalBinding, spec.LexicalSnapshot, spec.PolicyDigest, true}, nil
 }
@@ -184,7 +184,7 @@ func ApprovalInputEvaluateLexical(requiresCanonicalization bool) ApprovalInput {
 }
 func ApprovalInputCanonicalized(snapshot security.ScopeSnapshot, binding security.OperationBinding) (ApprovalInput, error) {
 	if !snapshot.IsValid() || !binding.IsValid() || !bindingMatchesSnapshot(binding, snapshot) {
-		return ApprovalInput{}, fmt.Errorf("%w: 规范化快照与操作绑定必须有效且能力/目标节点/端点一致", ErrInvalidInput)
+		return ApprovalInput{}, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "canonical_snapshot/binding"))
 	}
 	return ApprovalInput{kind: approvalInCanonicalized, canonicalSnapshot: snapshot, canonicalBinding: binding, valid: true}, nil
 }
@@ -196,13 +196,13 @@ func ApprovalInputEvaluateEscalation() ApprovalInput {
 }
 func ApprovalInputIssueChallenge(envelope security.ApprovalEnvelope) (ApprovalInput, error) {
 	if !envelope.IsValid() || !envelope.CanApprove() {
-		return ApprovalInput{}, fmt.Errorf("%w: 信封必须有效且为 NeedApproval 挑战类型", ErrInvalidApprovalEnvelope)
+		return ApprovalInput{}, domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "approval_envelope"))
 	}
 	return ApprovalInput{kind: approvalInIssueChallenge, envelope: envelope, valid: true}, nil
 }
 func ApprovalInputVerifyToken(submittedDigest security.Digest, submittedBinding security.OperationBinding, now time.Time, userApproved bool) (ApprovalInput, error) {
 	if !isValidRFC3339Time(now) || (userApproved && (!submittedDigest.IsValid() || !submittedBinding.IsValid())) {
-		return ApprovalInput{}, fmt.Errorf("%w: 核验时刻或同意审批摘要/绑定非法", ErrInvalidInput)
+		return ApprovalInput{}, domi18n.EF(ErrInvalidInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "verify_token"))
 	}
 	return ApprovalInput{kind: approvalInVerifyToken, submittedDigest: submittedDigest, submittedBinding: submittedBinding, now: now.UTC().Round(0), userApproved: userApproved, valid: true}, nil
 }
@@ -229,9 +229,9 @@ func TransitionApproval(state ApprovalState, input ApprovalInput) (ApprovalState
 	case ApprovalPhaseChallengeIssued:
 		return stepApprovalChallengeIssued(state, input)
 	case ApprovalPhaseApproved:
-		return stepApprovalReprobe(state, state.envelopeDigest, input, "approved 禁止重放校验或回退状态")
+		return stepApprovalReprobe(state, state.envelopeDigest, input, "Canonicalized/Round2ProbeFailed")
 	case ApprovalPhaseTokenInvalidated, ApprovalPhaseDenied:
-		return state, nil, nil, fmt.Errorf("%w: 终态 %s 不接受任何输入", ErrIllegalTransition, state.phase)
+		return state, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMTerminalState, domi18n.Str("state", state.phase.String()))
 	default:
 		return state, nil, nil, ErrInvalidState
 	}
@@ -239,7 +239,7 @@ func TransitionApproval(state ApprovalState, input ApprovalInput) (ApprovalState
 
 func stepApprovalLexical(s ApprovalState, in ApprovalInput) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	if in.kind != approvalInEvalLexical {
-		return s, nil, nil, fmt.Errorf("%w: lexical_precheck 仅接受 EvaluateLexical", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", "EvaluateLexical"))
 	}
 	if s.ctx.lexicalSnapshot.Verdict().Denied() {
 		return approvalDeny(s, "lexical verdict denied", nil)
@@ -264,7 +264,7 @@ func stepApprovalCanonicalizing(s ApprovalState, in ApprovalInput) (ApprovalStat
 		return approvalDeny(s, pickIf(in.reason != "", in.reason, "round2 canonicalization probe failed"), nil)
 	}
 	if in.kind != approvalInCanonicalized {
-		return s, nil, nil, fmt.Errorf("%w: canonicalizing 仅接受 Canonicalized 或 Round2ProbeFailed", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", "Canonicalized/Round2ProbeFailed"))
 	}
 	if res := security.InspectScopeEscalation(s.ctx.lexicalSnapshot, in.canonicalSnapshot); !sameNonPathBinding(s.ctx.lexicalBinding, in.canonicalBinding) || hasIdentityDrift(res) {
 		return approvalDeny(s, "canonical identity or non-path binding drifted", res.Reasons())
@@ -278,7 +278,7 @@ func stepApprovalEvaluateEscalation(s ApprovalState, in ApprovalInput) (Approval
 		return approvalDeny(s, pickIf(in.reason != "", in.reason, "round2 probe failed during escalation check"), nil)
 	}
 	if in.kind != approvalInEvalEscalation {
-		return s, nil, nil, fmt.Errorf("%w: evaluating_escalation 仅接受 EvaluateEscalation 或 Round2ProbeFailed", ErrIllegalTransition)
+		return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", "EvaluateEscalation/Round2ProbeFailed"))
 	}
 	res := security.InspectScopeEscalation(s.ctx.lexicalSnapshot, s.activeSnapshot)
 	reasons := res.Reasons()
@@ -319,16 +319,16 @@ func stepApprovalChallengePending(s ApprovalState, in ApprovalInput) (ApprovalSt
 	if in.kind == approvalInIssueChallenge {
 		return bindIssuedChallenge(s, in.envelope)
 	}
-	return stepApprovalReprobe(s, algebraic.None[security.Digest](), in, "challenge_pending 仅接受 IssueChallenge 或 Round-2 探针事件")
+	return stepApprovalReprobe(s, algebraic.None[security.Digest](), in, "IssueChallenge/Round2Probe")
 }
 func bindIssuedChallenge(s ApprovalState, env security.ApprovalEnvelope) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	if !s.effectiveRisk.IsValid() || !env.OperationID().Equal(s.ctx.operationID) || !env.MatchesBinding(s.activeBinding) ||
 		env.Risk() != s.effectiveRisk || !equalOptionFunc(s.ctx.policyDigest, env.PolicyDigest(), security.Digest.Equal) {
-		return s, nil, nil, fmt.Errorf("%w: 信封 op_id/binding/risk/policy_digest 与待审批作用域不匹配", ErrInvalidApprovalEnvelope)
+		return s, nil, nil, domi18n.EF(ErrInvalidApprovalEnvelope, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "approval_envelope"))
 	}
 	dig, err := env.Digest()
 	if err != nil {
-		return s, nil, nil, fmt.Errorf("%w: %w", ErrInvalidApprovalEnvelope, err)
+		return s, nil, nil, domi18n.WrapSentinel(ErrInvalidApprovalEnvelope, err)
 	}
 	next := s
 	next.phase, next.envelope, next.envelopeDigest, next.escalationReasons = ApprovalPhaseChallengeIssued, algebraic.Some(env), algebraic.Some(dig), slices.Clone(s.escalationReasons)
@@ -338,7 +338,7 @@ func stepApprovalChallengeIssued(s ApprovalState, in ApprovalInput) (ApprovalSta
 	if in.kind == approvalInVerifyToken {
 		return verifyIssuedToken(s, in)
 	}
-	return stepApprovalReprobe(s, s.envelopeDigest, in, "challenge_issued 仅接受 VerifyToken 或 Round-2 复检")
+	return stepApprovalReprobe(s, s.envelopeDigest, in, "VerifyToken/Round2Probe")
 }
 func verifyIssuedToken(s ApprovalState, in ApprovalInput) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	env, okE := s.envelope.Get()
@@ -360,14 +360,14 @@ func verifyIssuedToken(s ApprovalState, in ApprovalInput) (ApprovalState, []Appr
 	next.phase, next.escalationReasons = ApprovalPhaseApproved, slices.Clone(s.escalationReasons)
 	return next, nil, []ApprovalEvent{newEvent(ApprovalEventApproved, dig.String())}, nil
 }
-func stepApprovalReprobe(s ApprovalState, tokDig algebraic.Option[security.Digest], in ApprovalInput, illegalMsg string) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
+func stepApprovalReprobe(s ApprovalState, tokDig algebraic.Option[security.Digest], in ApprovalInput, expected string) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	if in.kind == approvalInRound2Failed {
 		return invalidateToken(s, tokDig, pickIf(in.reason != "", in.reason, "round2 probe failed"), nil)
 	}
 	if in.kind == approvalInCanonicalized {
 		return stepApprovalReprobeCanonical(s, tokDig, in)
 	}
-	return s, nil, nil, fmt.Errorf("%w: %s", ErrIllegalTransition, illegalMsg)
+	return s, nil, nil, domi18n.EF(ErrIllegalTransition, domi18n.KeyFSMExpectedInput, domi18n.Str("state", s.phase.String()), domi18n.Str("expected", expected))
 }
 func stepApprovalReprobeCanonical(s ApprovalState, tokDig algebraic.Option[security.Digest], in ApprovalInput) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	res := security.InspectScopeEscalation(s.activeSnapshot, in.canonicalSnapshot)

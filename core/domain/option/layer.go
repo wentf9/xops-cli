@@ -1,9 +1,8 @@
 package option
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // OptionLayer 表示四层 OpenSSH 选项总幺半群 (OptionLayer, Compose, Unset) 的不可变层值对象。
@@ -175,10 +174,10 @@ func (l OptionLayer) Validate() error {
 		return err
 	}
 	if l.hasInvalidScalar() {
-		return fmt.Errorf("%w: OptionLayer 含无效字段值", ErrInvalidOption)
+		return domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "option_layer"))
 	}
 	if cmd, ok := l.localCommand.Get(); ok && (!cmd.IsValid() || !hasValidTemplateTokens(cmd.raw, allowedPathPercentTokens, false)) {
-		return fmt.Errorf("%w: OptionLayer.LocalCommand 非法", ErrInvalidOption)
+		return domi18n.EF(ErrInvalidOption, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_command"))
 	}
 	return nil
 }

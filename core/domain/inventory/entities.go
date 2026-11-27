@@ -1,12 +1,12 @@
 package inventory
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -62,18 +62,18 @@ func NewOriginOpenSSHDerived(baseAlias, sourceFile string) (*OriginOpenSSHDerive
 }
 func NewOriginAdHoc(parentNode algebraic.Option[NodeID]) (*OriginAdHoc, error) {
 	if pid, ok := parentNode.Get(); ok && !pid.IsValid() {
-		return nil, fmt.Errorf("%w: parent_node 不可为无效 NodeID", ErrInvalidNodeOrigin)
+		return nil, domi18n.EF(ErrInvalidNodeOrigin, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "parent_node"))
 	}
 	return &OriginAdHoc{parentNode, true}, nil
 }
 func validateOpenSSHOriginMeta(token, sourceFile string) (string, string, error) {
 	t := strings.TrimSpace(token)
 	if t == "" || len(t) > maxIDLen || hasSpaceOrForbidden(t) {
-		return "", "", fmt.Errorf("%w: OpenSSH 标识 %q 非法", ErrInvalidNodeOrigin, token)
+		return "", "", domi18n.EF(ErrInvalidNodeOrigin, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "openssh_origin"), domi18n.BoundStr("value", token))
 	}
 	src, err := sanitizeSingleLine(strings.TrimSpace(sourceFile), maxKeyPathBytes)
 	if err != nil {
-		return "", "", fmt.Errorf("%w: source_file 非法: %w", ErrInvalidNodeOrigin, err)
+		return "", "", domi18n.WrapS(ErrInvalidNodeOrigin, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "source_file"))
 	}
 	return t, src, nil
 }
@@ -227,10 +227,10 @@ type Node struct {
 // NewHost 校验主机标识、端点、可选别名（不得与自身 HostID 同名）、描述与标签并构造不可变 Host。
 func NewHost(spec HostSpec) (Host, error) {
 	if !spec.ID.IsValid() || !spec.Endpoint.IsValid() {
-		return Host{}, fmt.Errorf("%w: HostID 与 Endpoint 均须有效", ErrInvalidHost)
+		return Host{}, domi18n.EF(ErrInvalidHost, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "id/endpoint"))
 	}
 	if a, ok := spec.Alias.Get(); ok && (!a.IsValid() || a.String() == spec.ID.String()) {
-		return Host{}, fmt.Errorf("%w: Host.Alias 无效或与自身 HostID 重复", ErrInvalidHost)
+		return Host{}, domi18n.EF(ErrInvalidHost, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "host.alias"))
 	}
 	desc, tags, err := sanitizeDescAndTags(spec.Description, spec.Tags, ErrInvalidHost)
 	if err != nil {
@@ -242,10 +242,10 @@ func NewHost(spec HostSpec) (Host, error) {
 // NewIdentity 校验身份标识、用户名、不可变认证方式与标签并构造不可变 Identity。
 func NewIdentity(spec IdentitySpec) (Identity, error) {
 	if !spec.ID.IsValid() || !spec.User.IsValid() {
-		return Identity{}, fmt.Errorf("%w: IdentityID 与 Username 均须有效", ErrInvalidIdentity)
+		return Identity{}, domi18n.EF(ErrInvalidIdentity, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "id/user"))
 	}
 	if err := validateAuthMethodDepth(spec.Auth, 1, make(map[*AuthComposite]bool)); err != nil {
-		return Identity{}, fmt.Errorf("%w: %w", ErrInvalidIdentity, err)
+		return Identity{}, domi18n.WrapSentinel(ErrInvalidIdentity, err)
 	}
 	desc, tags, err := sanitizeDescAndTags(spec.Description, spec.Tags, ErrInvalidIdentity)
 	if err != nil {
@@ -261,7 +261,7 @@ func NewNode(spec NodeSpec) (Node, error) {
 	}
 	aliases, err := canonicalizeAliases(spec.Aliases, spec.ID)
 	if err != nil {
-		return Node{}, fmt.Errorf("%w: %w", ErrInvalidNode, err)
+		return Node{}, domi18n.WrapSentinel(ErrInvalidNode, err)
 	}
 	desc, tags, err := sanitizeDescAndTags(spec.Description, spec.Tags, ErrInvalidNode)
 	if err != nil {
@@ -280,11 +280,11 @@ func validateNodeHeader(spec NodeSpec) error {
 	ref, hasRef := spec.PrivilegePasswordRef.Get()
 	switch {
 	case !spec.ID.IsValid() || !spec.HostRef.IsValid() || !spec.IdentityRef.IsValid():
-		return fmt.Errorf("%w: id/host_ref/identity_ref 均必须有效", ErrInvalidNode)
+		return domi18n.EF(ErrInvalidNode, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "id/host_ref/identity_ref"))
 	case spec.Origin == nil || !spec.Origin.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidNode, ErrInvalidNodeOrigin)
+		return domi18n.WrapSentinel(ErrInvalidNode, ErrInvalidNodeOrigin)
 	case option.ValidateProxyRoute(spec.Proxy) != nil || spec.Options.Validate() != nil || (hasProf && !prof.IsValid()) || (hasRef && !ref.IsValid()):
-		return fmt.Errorf("%w: 无效 ProxyRoute/OptionLayer/LaunchProfile/privilege_password_ref", ErrInvalidNode)
+		return domi18n.EF(ErrInvalidNode, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "node_options"))
 	}
 	return nil
 }
@@ -292,13 +292,13 @@ func validateNodeHeader(spec NodeSpec) error {
 func sanitizeDescAndTags(rawDesc string, rawTags []Tag, baseErr error) (string, []Tag, error) {
 	desc, err := sanitizeSingleLine(rawDesc, maxDescriptionBytes)
 	if err != nil {
-		return "", nil, fmt.Errorf("%w: description: %w", baseErr, err)
+		return "", nil, domi18n.WrapS(baseErr, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "description"))
 	}
 	if len(rawTags) == 0 {
 		return desc, nil, nil
 	}
 	if len(rawTags) > maxTagsOrAliases || slices.ContainsFunc(rawTags, Tag.IsZero) {
-		return "", nil, fmt.Errorf("%w: tags 超限或含无效标签", baseErr)
+		return "", nil, domi18n.EF(baseErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "tags"))
 	}
 	tags := slices.Clone(rawTags)
 	slices.SortFunc(tags, Tag.Compare)
@@ -310,7 +310,7 @@ func canonicalizeAliases(raw []Alias, selfID NodeID) ([]Alias, error) {
 		return nil, nil
 	}
 	if len(raw) > maxTagsOrAliases || slices.ContainsFunc(raw, func(a Alias) bool { return !a.IsValid() || a.String() == selfID.String() }) {
-		return nil, fmt.Errorf("aliases 超限、无效或与自身 NodeID 重复")
+		return nil, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "aliases"))
 	}
 	out := slices.Clone(raw)
 	slices.SortFunc(out, Alias.Compare)

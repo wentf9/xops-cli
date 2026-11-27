@@ -1,11 +1,11 @@
 package option
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 )
 
@@ -32,7 +32,7 @@ func ParseOriginKind(raw string) (OriginKind, error) {
 			return v, nil
 		}
 	}
-	return OriginInvalid, fmt.Errorf("%w: 未知策略来源 %q", ErrInvalidOrigin, raw)
+	return OriginInvalid, domi18n.EF(ErrInvalidOrigin, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "origin"), domi18n.BoundStr("value", raw))
 }
 func (o OriginKind) IsValid() bool { return o >= OriginManaged && o <= OriginAdHoc }
 func (o OriginKind) AllowsFullOpenSSHConfig() bool {
@@ -143,11 +143,11 @@ func resolveEffectiveEndpoint(origHost OriginalHostSpec, defaultPort uint16, mer
 		host, err = netaddr.ParseCanonicalHost(origHost.String())
 	}
 	if err != nil {
-		return zero, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+		return zero, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 	}
 	ep, err := netaddr.NewEndpoint(host, merged.port.OrElse(defaultPort))
 	if err != nil {
-		return zero, fmt.Errorf("%w: %w", ErrInvalidEndpoint, err)
+		return zero, domi18n.WrapSentinel(ErrInvalidEndpoint, err)
 	}
 	return ep, nil
 }

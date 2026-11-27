@@ -1,19 +1,19 @@
 package pathalg
 
 import (
-	"fmt"
 	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"golang.org/x/text/unicode/norm"
 )
 
 // NormalizeNFC 将合法 UTF-8 字符串规范化为 Unicode 规范组合形式（NFC）；非法 UTF-8 失败关闭。
 func NormalizeNFC(s string) (string, error) {
 	if !utf8.ValidString(s) {
-		return "", fmt.Errorf("%w: 输入包含非法 UTF-8 字节", ErrInvalidUTF8)
+		return "", domi18n.EF(ErrInvalidUTF8, domi18n.KeyCommonInvalidUTF8)
 	}
 	return norm.NFC.String(s), nil
 }
@@ -21,7 +21,7 @@ func NormalizeNFC(s string) (string, error) {
 // NormalizeNFD 将合法 UTF-8 字符串规范化为 Unicode 规范分解形式（NFD）；非法 UTF-8 失败关闭。
 func NormalizeNFD(s string) (string, error) {
 	if !utf8.ValidString(s) {
-		return "", fmt.Errorf("%w: 输入包含非法 UTF-8 字节", ErrInvalidUTF8)
+		return "", domi18n.EF(ErrInvalidUTF8, domi18n.KeyCommonInvalidUTF8)
 	}
 	return norm.NFD.String(s), nil
 }
@@ -39,7 +39,7 @@ func NormalizeNFD(s string) (string, error) {
 //     规范化不变律 Fold(NFC(x)) == Fold(NFD(x))。
 func FoldCollisionKey(name string) (string, error) {
 	if !utf8.ValidString(name) {
-		return "", fmt.Errorf("%w: 折叠键输入包含非法 UTF-8 字节", ErrInvalidUTF8)
+		return "", domi18n.EF(ErrInvalidUTF8, domi18n.KeyCommonInvalidUTF8)
 	}
 	nfd := norm.NFD.String(name)
 	expanded := expandFullAndSimpleFold(nfd)
@@ -50,7 +50,7 @@ func FoldCollisionKey(name string) (string, error) {
 // FoldLocalDestKey 计算沙箱相对路径 LocalRootedDest 的逐段跨 OS 规范折叠键（以 '/' 连接）。
 func FoldLocalDestKey(dest LocalRootedDest) (string, error) {
 	if !dest.IsValid() {
-		return "", fmt.Errorf("%w: 无效的 LocalRootedDest", ErrInvalidLocalDest)
+		return "", domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_dest"))
 	}
 	return foldSlashPath(dest.rel)
 }
@@ -108,11 +108,8 @@ func (s *CollisionSet) Add(raw string) error {
 	if s.seen == nil {
 		s.seen = make(map[string]string)
 	}
-	if prev, exists := s.seen[key]; exists {
-		if prev == raw {
-			return fmt.Errorf("%w: 重复条目 %q", ErrNameCollision, raw)
-		}
-		return fmt.Errorf("%w: %q 与 %q 在跨 OS Unicode/大小写折叠后发生碰撞", ErrNameCollision, prev, raw)
+	if _, exists := s.seen[key]; exists {
+		return domi18n.EF(ErrNameCollision, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "name"), domi18n.BoundStr("value", raw))
 	}
 	s.seen[key] = raw
 	return nil
@@ -152,7 +149,7 @@ func CheckPathCollisions(paths []LocalRootedDest) error {
 	strs := make([]string, 0, len(paths))
 	for _, p := range paths {
 		if !p.IsValid() {
-			return fmt.Errorf("%w: 碰撞检测收到无效 LocalRootedDest", ErrInvalidLocalDest)
+			return domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_dest"))
 		}
 		strs = append(strs, p.rel)
 	}

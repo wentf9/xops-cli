@@ -1,9 +1,9 @@
 package execution
 
 import (
-	"fmt"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -38,7 +38,7 @@ func ParseStartPhase(raw string) (StartPhase, error) {
 			return StartPhaseRequestRejected, nil
 		}
 	}
-	return StartPhaseUnknown, fmt.Errorf("%w: StartPhase %q", ErrInvalidPhase, raw)
+	return StartPhaseUnknown, domi18n.EF(ErrInvalidPhase, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "start_phase"), domi18n.BoundStr("value", raw))
 }
 
 func (p StartPhase) IsValid() bool { return p >= StartPhaseValidate && p <= StartPhaseRequestRejected }
@@ -88,7 +88,7 @@ func ParseExecPhase(raw string) (ExecPhase, error) {
 			return ExecPhaseCanceled, nil
 		}
 	}
-	return ExecPhaseUnknown, fmt.Errorf("%w: ExecPhase %q", ErrInvalidPhase, raw)
+	return ExecPhaseUnknown, domi18n.EF(ErrInvalidPhase, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "exec_phase"), domi18n.BoundStr("value", raw))
 }
 
 func (p ExecPhase) IsValid() bool { return p >= ExecPhaseRequestSent && p <= ExecPhaseCanceled }
@@ -129,7 +129,7 @@ func ParseOutcomeKind(raw string) (OutcomeKind, error) {
 			return OutcomeKindUnknown, nil
 		}
 	}
-	return OutcomeKindInvalid, fmt.Errorf("%w: kind %q", ErrInvalidExecutionOutcome, raw)
+	return OutcomeKindInvalid, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "outcome.kind"), domi18n.BoundStr("value", raw))
 }
 
 func (k OutcomeKind) IsValid() bool { return k >= OutcomeKindNotStarted && k <= OutcomeKindUnknown }
@@ -171,10 +171,10 @@ type OutcomeNotStarted struct {
 // NewOutcomeNotStarted 校验启动前阶段与错误代码并构造 *OutcomeNotStarted。
 func NewOutcomeNotStarted(phase StartPhase, code, reason string) (*OutcomeNotStarted, error) {
 	if !phase.IsValid() {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidExecutionOutcome, ErrInvalidPhase)
+		return nil, domi18n.WrapSentinel(ErrInvalidExecutionOutcome, ErrInvalidPhase)
 	}
 	if code != "" && !isValidASCIICode(code, maxCodeLen) {
-		return nil, fmt.Errorf("%w: 非法错误码 %q", ErrInvalidExecutionOutcome, code)
+		return nil, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "code"), domi18n.BoundStr("value", code))
 	}
 	return &OutcomeNotStarted{
 		phase: phase, code: code, reason: security.SanitizePromptText(reason), valid: true,
@@ -222,7 +222,7 @@ type OutcomeCompleted struct {
 func NewOutcomeCompleted(status ExitStatus, truncated bool) (*OutcomeCompleted, error) {
 	cloned, err := cloneExitStatus(status)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidExecutionOutcome, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidExecutionOutcome, err)
 	}
 	return &OutcomeCompleted{status: cloned, truncated: truncated, valid: true}, nil
 }
@@ -266,10 +266,10 @@ type OutcomeUnknown struct {
 // NewOutcomeUnknown 校验执行阶段与错误代码并构造 *OutcomeUnknown。
 func NewOutcomeUnknown(phase ExecPhase, code, reason string) (*OutcomeUnknown, error) {
 	if !phase.IsValid() {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidExecutionOutcome, ErrInvalidPhase)
+		return nil, domi18n.WrapSentinel(ErrInvalidExecutionOutcome, ErrInvalidPhase)
 	}
 	if code != "" && !isValidASCIICode(code, maxCodeLen) {
-		return nil, fmt.Errorf("%w: 非法错误码 %q", ErrInvalidExecutionOutcome, code)
+		return nil, domi18n.EF(ErrInvalidExecutionOutcome, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "code"), domi18n.BoundStr("value", code))
 	}
 	return &OutcomeUnknown{
 		phase: phase, code: code, reason: security.SanitizePromptText(reason), valid: true,

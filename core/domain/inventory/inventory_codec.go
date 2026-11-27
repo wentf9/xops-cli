@@ -3,10 +3,10 @@ package inventory
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -190,7 +190,7 @@ func decodeChallengeRuleWire(w challengeRuleWire) (ChallengeRule, error) {
 			return NewRuleLoginPassword(meta)
 		}
 	}
-	return nil, fmt.Errorf("%w: 质询规则类别或字段组合非法", ErrInvalidChallengeRule)
+	return nil, domi18n.EF(ErrInvalidChallengeRule, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", w.Kind.String()))
 }
 func encodeAuthMethodWire(m AuthMethod, depth int) (authMethodWire, error) {
 	if m == nil || !m.IsValid() {
@@ -242,11 +242,11 @@ func decodeAuthMethodWire(w authMethodWire, depth int) (AuthMethod, error) {
 		}
 		return decodeAuthList(mask == 16, w.Methods, func(sub authMethodWire) (AuthMethod, error) { return decodeAuthMethodWire(sub, depth+1) }, NewAuthComposite)
 	}
-	return nil, fmt.Errorf("%w: 认证类别或字段组合非法", ErrInvalidAuthMethod)
+	return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", w.Kind.String()))
 }
 func decodeAuthList[W, T any, R AuthMethod](maskOK bool, raw []W, decFn func(W) (T, error), build func(algebraic.NonEmpty[T]) (R, error)) (AuthMethod, error) {
 	if !maskOK {
-		return nil, fmt.Errorf("%w: 组合认证字段组合非法", ErrInvalidAuthMethod)
+		return nil, domi18n.EF(ErrInvalidAuthMethod, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "composite"))
 	}
 	items, err := mapSliceErr(raw, decFn)
 	if err != nil {
@@ -254,7 +254,7 @@ func decodeAuthList[W, T any, R AuthMethod](maskOK bool, raw []W, decFn func(W) 
 	}
 	ne, err := algebraic.NonEmptyFromSlice(items)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidAuthMethod, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidAuthMethod, err)
 	}
 	return build(ne)
 }
@@ -295,7 +295,7 @@ func decodeNodeOriginWire(w nodeOriginWire) (NodeOrigin, error) {
 			return NewOriginAdHoc(w.ParentNode)
 		}
 	}
-	return nil, fmt.Errorf("%w: 节点来源类别或字段组合非法", ErrInvalidNodeOrigin)
+	return nil, domi18n.EF(ErrInvalidNodeOrigin, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", w.Kind.String()))
 }
 
 // Host、Identity、Node、ImportWarning 与 ImportBundle 的 Go 1.27 JSON/v2 确定性编解码方法。
@@ -316,7 +316,7 @@ func (id *Identity) UnmarshalJSONFrom(d *jsontext.Decoder) error {
 	return unmarshalJSON(id, d, ErrInvalidIdentity, func(w identityWire) (Identity, error) {
 		auth, err := decodeAuthMethodWire(w.Auth, 1)
 		if err != nil {
-			return Identity{}, fmt.Errorf("%w: %w", ErrInvalidIdentity, err)
+			return Identity{}, domi18n.WrapSentinel(ErrInvalidIdentity, err)
 		}
 		return NewIdentity(IdentitySpec{w.ID, w.User, auth, w.Description, w.Tags})
 	})
@@ -332,7 +332,7 @@ func (n *Node) UnmarshalJSONFrom(d *jsontext.Decoder) error {
 	return unmarshalJSON(n, d, ErrInvalidNode, func(w nodeWire) (Node, error) {
 		origin, err := decodeNodeOriginWire(w.Origin)
 		if err != nil {
-			return Node{}, fmt.Errorf("%w: %w", ErrInvalidNode, err)
+			return Node{}, domi18n.WrapSentinel(ErrInvalidNode, err)
 		}
 		return NewNode(NodeSpec{w.ID, w.HostRef, w.IdentityRef, w.Aliases, w.Tags, w.Proxy.route, w.Execution, w.Options, w.PrivilegePasswordRef, origin, w.Description})
 	})

@@ -1,10 +1,11 @@
 package pathalg
 
 import (
-	"fmt"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // ValidateLocalComponent 以三平台（Linux/macOS/Windows）完全一致的失败关闭规则校验单个本地路径分量。
@@ -22,25 +23,25 @@ import (
 // 所有拒绝错误均包装 ErrInvalidComponent。
 func ValidateLocalComponent(name string) error {
 	if name == "" {
-		return fmt.Errorf("%w: 分量不能为空", ErrInvalidComponent)
+		return domi18n.EF(ErrInvalidComponent, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "component"))
 	}
 	if len(name) > MaxComponentBytes {
-		return fmt.Errorf("%w: 分量长度 %d 超过上限 %d", ErrInvalidComponent, len(name), MaxComponentBytes)
+		return domi18n.EF(ErrInvalidComponent, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "component"), domi18n.Int("size", len(name)), domi18n.Int("limit", MaxComponentBytes))
 	}
 	if name == "." || name == ".." {
-		return fmt.Errorf("%w: 禁止使用目录遍历分量 %q", ErrInvalidComponent, name)
+		return domi18n.EF(ErrInvalidComponent, domi18n.KeyPathalgTraversalForbidden, domi18n.BoundStr("segment", name))
 	}
 	if !utf8.ValidString(name) {
-		return fmt.Errorf("%w: %q 包含非法 UTF-8 字节", ErrInvalidComponent, name)
+		return domi18n.EF(ErrInvalidComponent, domi18n.KeyCommonInvalidUTF8)
 	}
 	if strings.HasSuffix(name, ".") || strings.HasSuffix(name, " ") {
-		return fmt.Errorf("%w: %q 不得以 '.' 或空格结尾", ErrInvalidComponent, name)
+		return domi18n.EF(ErrInvalidComponent, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "component"), domi18n.BoundStr("value", name))
 	}
 	if err := validateLocalComponentRunes(name); err != nil {
 		return err
 	}
 	if isWindowsReservedDeviceStem(name) {
-		return fmt.Errorf("%w: %q 使用了 Windows 保留设备名", ErrInvalidComponent, name)
+		return domi18n.EF(ErrInvalidComponent, domi18n.KeyPathalgReservedName, domi18n.BoundStr("value", name))
 	}
 	return nil
 }
@@ -48,10 +49,10 @@ func ValidateLocalComponent(name string) error {
 func validateLocalComponentRunes(name string) error {
 	for _, r := range name {
 		if isForbiddenPathRune(r) {
-			return fmt.Errorf("%w: %q 包含 NUL、控制字符或不可见/Bidi 格式字符 U+%04X", ErrInvalidComponent, name, r)
+			return domi18n.EF(ErrInvalidComponent, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "component"))
 		}
 		if isForbiddenLocalComponentRune(r) {
-			return fmt.Errorf("%w: %q 包含跨平台禁用字符 %q", ErrInvalidComponent, name, r)
+			return domi18n.EF(ErrInvalidComponent, domi18n.KeyPathalgForbiddenChar, domi18n.BoundStr("value", name), domi18n.Str("char", string(r)))
 		}
 	}
 	return nil

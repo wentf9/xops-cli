@@ -1,11 +1,11 @@
 package fsm
 
 import (
-	"fmt"
 	"io"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -58,7 +58,7 @@ func NewTransferJournalRecord(spec TransferJournalRecordSpec) (TransferJournalRe
 	}
 	dig, err := digestCanonical(rec.WriteCanonical)
 	if err != nil {
-		return TransferJournalRecord{}, fmt.Errorf("%w: %w", ErrInvalidJournal, err)
+		return TransferJournalRecord{}, domi18n.WrapSentinel(ErrInvalidJournal, err)
 	}
 	rec.recordDigest = dig
 	return rec, nil
@@ -66,14 +66,14 @@ func NewTransferJournalRecord(spec TransferJournalRecordSpec) (TransferJournalRe
 
 func validateJournalRecordSpec(s TransferJournalRecordSpec) error {
 	if !s.Version.IsValid() || s.Generation == 0 || s.Seq == 0 || !s.Kind.IsValid() || !s.TransferID.IsValid() {
-		return fmt.Errorf("%w: version/generation/seq/kind/transfer_id 均须有效", ErrInvalidJournal)
+		return domi18n.EF(ErrInvalidJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "journal_header"))
 	}
 	if s.TotalBytes > MaxTransferBytes {
-		return fmt.Errorf("%w: total_bytes=%d 超出 10 GiB 上限", ErrTransferSizeExceeded, s.TotalBytes)
+		return domi18n.EF(ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "total_bytes"), domi18n.Uint64("size", s.TotalBytes), domi18n.Uint64("limit", MaxTransferBytes))
 	}
 	p, hasPrev := s.PrevDigest.Get()
 	if (hasPrev && !p.IsValid()) || (s.Version == JournalVersionV1 && hasPrev) || (s.Version == JournalVersionV2 && (s.Seq == 1) == hasPrev) {
-		return fmt.Errorf("%w: prev_digest 与 Journal 版本/序号规则冲突", ErrInvalidJournal)
+		return domi18n.EF(ErrInvalidJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "prev_digest"))
 	}
 	return validateJournalKindFields(s)
 }
@@ -84,7 +84,7 @@ func validateJournalKindFields(s TransferJournalRecordSpec) error {
 	dest, hasDest := s.Dest.Get()
 	dig, hasDig := s.Digest.Get()
 	if (hasDest && !dest.IsValid()) || (hasDig && !dig.IsValid()) {
-		return fmt.Errorf("%w: dest 或 digest 零值无效", ErrInvalidJournal)
+		return domi18n.EF(ErrInvalidJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "dest/digest"))
 	}
 	zeroSpan := s.Offset == 0 && s.Length == 0
 	var ok bool
@@ -99,7 +99,7 @@ func validateJournalKindFields(s TransferJournalRecordSpec) error {
 		ok = s.Seq >= 2 && !hasDest && !hasDig && zeroSpan
 	}
 	if !ok {
-		return fmt.Errorf("%w: %s 记录字段组合非法", ErrInvalidJournal, s.Kind)
+		return domi18n.EF(ErrInvalidJournal, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "journal_record"), domi18n.Str("value", s.Kind.String()))
 	}
 	return nil
 }
@@ -196,16 +196,16 @@ func RecoverTransferFromJournal(records []TransferJournalRecord) (TransferState,
 }
 func parseJournalInitMeta(records []TransferJournalRecord) (TransferMeta, TransferJournalRecord, error) {
 	if len(records) == 0 || len(records) > MaxJournalRecords {
-		return TransferMeta{}, TransferJournalRecord{}, fmt.Errorf("%w: Journal 记录数 %d 非法", ErrCorruptJournal, len(records))
+		return TransferMeta{}, TransferJournalRecord{}, domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "journal_records"), domi18n.Int("count", len(records)), domi18n.Int("limit", MaxJournalRecords))
 	}
 	first := records[0]
 	dest, okD := first.dest.Get()
 	if !first.IsValid() || first.kind != JournalRecordInit || first.seq != 1 || !okD {
-		return TransferMeta{}, TransferJournalRecord{}, fmt.Errorf("%w: 首条记录必须为有效的 seq=1 init 记录", ErrCorruptJournal)
+		return TransferMeta{}, TransferJournalRecord{}, domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "init_record"))
 	}
 	meta, err := NewTransferMeta(TransferMetaSpec{first.transferID, dest, first.totalBytes, first.digest, first.version, first.generation})
 	if err != nil {
-		return TransferMeta{}, TransferJournalRecord{}, fmt.Errorf("%w: %w", ErrCorruptJournal, err)
+		return TransferMeta{}, TransferJournalRecord{}, domi18n.WrapSentinel(ErrCorruptJournal, err)
 	}
 	return meta, first, nil
 }
@@ -218,10 +218,10 @@ func hasCommitMarkerInTail(tail []TransferJournalRecord, meta TransferMeta) bool
 func applyRecoveryRecord(acc *recoveryAcc, rec TransferJournalRecord) error {
 	if !rec.IsValid() || !rec.transferID.Equal(acc.meta.transferID) || rec.version != acc.meta.journalVersion ||
 		rec.generation != acc.meta.generation || rec.totalBytes != acc.meta.totalBytes || rec.seq != acc.lastSeq+1 {
-		return fmt.Errorf("%w: 记录归属、版本、世代、总大小或序号不连续", ErrCorruptJournal)
+		return domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "journal_sequence"))
 	}
 	if prev, ok := rec.prevDigest.Get(); acc.meta.journalVersion == JournalVersionV2 && (!ok || !prev.Equal(acc.lastDigest)) {
-		return fmt.Errorf("%w: V2 Journal 哈希链断裂", ErrCorruptJournal)
+		return domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "prev_digest_chain"))
 	}
 	if err := advanceRecoveryPhase(acc, rec); err != nil {
 		return err
@@ -231,7 +231,7 @@ func applyRecoveryRecord(acc *recoveryAcc, rec TransferJournalRecord) error {
 }
 func applyRecoveryChunk(acc *recoveryAcc, rec TransferJournalRecord) error {
 	if (acc.phase != JournalRecordInit && acc.phase != JournalRecordChunk) || rec.offset != acc.offset || rec.length > acc.meta.totalBytes-acc.offset {
-		return fmt.Errorf("%w: chunk 偏移不连续或超出总大小", ErrCorruptJournal)
+		return domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "chunk_offset"))
 	}
 	acc.offset, acc.chunks, acc.phase = acc.offset+rec.length, acc.chunks+1, JournalRecordChunk
 	return nil
@@ -241,10 +241,10 @@ func applyRecoveryVerified(acc *recoveryAcc, rec TransferJournalRecord) error {
 	exp, hasExp := acc.meta.expectedDigest.Get()
 	canVerify := acc.phase == JournalRecordInit || acc.phase == JournalRecordChunk || acc.phase == JournalRecordVerified
 	if !canVerify || acc.offset != acc.meta.totalBytes || !ok || (hasExp && !exp.Equal(dig)) {
-		return fmt.Errorf("%w: verified 前置条件或摘要不匹配", ErrCorruptJournal)
+		return domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "verified_digest"))
 	}
 	if prev, hasPrev := acc.verifiedDigest.Get(); hasPrev && !prev.Equal(dig) {
-		return fmt.Errorf("%w: 重复 verified 记录摘要不一致", ErrCorruptJournal)
+		return domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "verified_digest"))
 	}
 	acc.verifiedDigest, acc.phase = algebraic.Some(dig), JournalRecordVerified
 	return nil
@@ -257,21 +257,21 @@ func advanceRecoveryPhase(acc *recoveryAcc, rec TransferJournalRecord) error {
 		return applyRecoveryVerified(acc, rec)
 	case JournalRecordCommitStarted:
 		if acc.phase != JournalRecordVerified {
-			return fmt.Errorf("%w: commit_started 必须紧随 verified", ErrCorruptJournal)
+			return domi18n.EF(ErrCorruptJournal, domi18n.KeyFSMExpectedInput, domi18n.Str("state", acc.phase.String()), domi18n.Str("expected", "verified_before_commit_started"))
 		}
 		acc.commitSeen, acc.phase = true, JournalRecordCommitStarted
 	case JournalRecordCommitted:
 		if acc.phase != JournalRecordCommitStarted {
-			return fmt.Errorf("%w: committed 必须紧随 commit_started", ErrCorruptJournal)
+			return domi18n.EF(ErrCorruptJournal, domi18n.KeyFSMExpectedInput, domi18n.Str("state", acc.phase.String()), domi18n.Str("expected", "commit_started_before_committed"))
 		}
 		acc.phase = JournalRecordCommitted
 	case JournalRecordAborted:
 		if acc.phase == JournalRecordCommitted || acc.phase == JournalRecordAborted {
-			return fmt.Errorf("%w: 终态 %s 后不得再出现 aborted", ErrCorruptJournal, acc.phase)
+			return domi18n.EF(ErrCorruptJournal, domi18n.KeyFSMTerminalState, domi18n.Str("state", acc.phase.String()))
 		}
 		acc.phase = JournalRecordAborted
 	default:
-		return fmt.Errorf("%w: 非法记录阶段 %s", ErrCorruptJournal, rec.kind)
+		return domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "journal_record"), domi18n.Str("value", rec.kind.String()))
 	}
 	return nil
 }
