@@ -8,14 +8,14 @@ import (
 	"golang.org/x/tools/go/analysis"
 )
 
-// checkRawErrorConstructions 执行规则 2：禁止通过 errors.New、fmt.Errorf（含函数值引用）
-// 或底层 string 自定义错误类型绕过结构化 i18n 错误体系（显式放行 errors.Join）。
+// checkRawErrorConstructions 执行规则 2：禁止通过 errors.New、fmt.Errorf（含函数值引用）、
+// 底层 string 自定义错误类型或未实现 LocalizableView() ErrorNode 的自定义具体错误类型绕过结构化 i18n 体系（显式放行 errors.Join）。
 func checkRawErrorConstructions(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	if isRule2AllowedPkg(pkgInfo) {
 		return
 	}
 	checkBannedErrorUses(pass)
-	checkStringErrorTypes(pass)
+	checkCustomErrorTypes(pass)
 }
 
 // isRule2AllowedPkg 返回规则 2 永久基础设施白名单包（core/domain/i18n、core/conc 及测试/工具包）。
@@ -43,8 +43,9 @@ func checkBannedErrorUses(pass *analysis.Pass) {
 	})
 }
 
-// checkStringErrorTypes 禁止在 core/domain/i18n 之外声明底层为 string 且实现 Error() string 的自定义错误类型。
-func checkStringErrorTypes(pass *analysis.Pass) {
+// checkCustomErrorTypes 禁止声明底层为 string 的自定义错误类型，并要求所有其他实现生产 error 接口的具体类型
+// 在匹配的接收者方法集上同步实现 LocalizableView() core/domain/i18n.ErrorNode。
+func checkCustomErrorTypes(pass *analysis.Pass) {
 	vetutil.ForEachTypeSpec(pass, func(file *ast.File, _ *ast.GenDecl, ts *ast.TypeSpec) {
 		if vetutil.IsTestFile(pass, file) || ts.Assign.IsValid() {
 			return
@@ -53,21 +54,77 @@ func checkStringErrorTypes(pass *analysis.Pass) {
 		if !ok || obj == nil || obj.Type() == nil {
 			return
 		}
-		basic, isBasic := obj.Type().Underlying().(*types.Basic)
-		if !isBasic || basic.Info()&types.IsString == 0 {
+		t := types.Unalias(obj.Type())
+		if _, isIface := t.Underlying().(*types.Interface); isIface {
 			return
 		}
-		if hasProdErrorMethod(pass, obj.Type()) {
+		ms := prodErrorMethodSet(pass, t)
+		if ms == nil {
+			return
+		}
+		if isStringUnderlying(t) {
 			pass.ReportRangef(ts.Name, "i18nguard: 禁止声明基于 string 的自定义错误类型 %s，请使用 i18n 结构化错误体系", ts.Name.Name)
+			return
+		}
+		if !hasProdLocalizableView(pass, ms) {
+			pass.ReportRangef(ts.Name, "i18nguard: 自定义错误类型 %s 必须在匹配的接收者方法集上实现 LocalizableView() core/domain/i18n.ErrorNode", ts.Name.Name)
 		}
 	})
 }
 
-func hasProdErrorMethod(pass *analysis.Pass, t types.Type) bool {
-	if !vetutil.ImplementsError(t) {
+func isStringUnderlying(t types.Type) bool {
+	basic, ok := t.Underlying().(*types.Basic)
+	return ok && basic.Info()&types.IsString != 0
+}
+
+// prodErrorMethodSet 返回令具体类型 t 实现生产 error 接口的最小匹配方法集（优先值方法集，其次指针方法集）。
+func prodErrorMethodSet(pass *analysis.Pass, t types.Type) *types.MethodSet {
+	errIface := builtinErrorInterface()
+	if errIface == nil {
+		return nil
+	}
+	if types.Implements(t, errIface) {
+		if ms := types.NewMethodSet(t); isProdMethod(pass, ms.Lookup(pass.Pkg, "Error")) {
+			return ms
+		}
+		return nil
+	}
+	ptr := types.NewPointer(t)
+	if !types.Implements(ptr, errIface) {
+		return nil
+	}
+	if ms := types.NewMethodSet(ptr); isProdMethod(pass, ms.Lookup(pass.Pkg, "Error")) {
+		return ms
+	}
+	return nil
+}
+
+func builtinErrorInterface() *types.Interface {
+	errObj := types.Universe.Lookup("error")
+	if errObj == nil {
+		return nil
+	}
+	iface, _ := errObj.Type().Underlying().(*types.Interface)
+	return iface
+}
+
+func isProdMethod(pass *analysis.Pass, sel *types.Selection) bool {
+	return sel != nil && sel.Obj() != nil && !vetutil.IsPosInTestFile(pass, sel.Obj().Pos())
+}
+
+func hasProdLocalizableView(pass *analysis.Pass, ms *types.MethodSet) bool {
+	sel := ms.Lookup(pass.Pkg, "LocalizableView")
+	if !isProdMethod(pass, sel) {
 		return false
 	}
-	ms := types.NewMethodSet(types.NewPointer(t))
-	sel := ms.Lookup(pass.Pkg, "Error")
-	return sel != nil && sel.Obj() != nil && !vetutil.IsPosInTestFile(pass, sel.Obj().Pos())
+	fn, ok := sel.Obj().(*types.Func)
+	if !ok {
+		return false
+	}
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok || sig.Variadic() || sig.Params().Len() != 0 || sig.Results().Len() != 1 {
+		return false
+	}
+	named, ok := types.Unalias(sig.Results().At(0).Type()).(*types.Named)
+	return ok && named != nil && vetutil.IsPkgSymbol(named.Obj(), coreDomainI18nPkgPath, "ErrorNode")
 }

@@ -18,8 +18,11 @@ var ErrReexportRoot = i18n.ErrRoot
 //go:embed locales.txt
 var subEmbed embed.FS // want "禁止声明可变包级 var"
 
-var ErrRootNonConst = i18n.Sentinel(dynID())      // want "禁止声明可变包级 var"
-var ErrRootRawLit = i18n.Sentinel("root.raw.lit") // want "禁止声明可变包级 var"
+var ErrRootNonConst = i18n.Sentinel(dynID())             // want "禁止声明可变包级 var"
+var ErrRootRawLit = i18n.Sentinel("root.raw.lit")        // want "禁止声明可变包级 var"
+var ErrCrossCore = domi18n.Sentinel(i18n.KeyRootErr)     // want "禁止声明可变包级 var"
+var ErrCrossRoot = i18n.Sentinel(domi18n.KeyCoreErr)     // want "禁止声明可变包级 var"
+var ErrRootInv = i18n.Sentinel(domi18n.MessageIDInvalid) // want "禁止声明可变包级 var"
 
 func useSubEmbed() {
 	_ = subEmbed

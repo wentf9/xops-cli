@@ -66,6 +66,8 @@ linters:
               desc: "internal/i18n/** must not depend on core/events"
             - pkg: "github.com/wentf9/xops-cli/core/internal"
               desc: "internal/i18n/** must not depend on core/internal/**"
+            - pkg: "github.com/wentf9/xops-cli/tools"
+              desc: "internal/i18n/** must not depend on tools/**"
   exclusions:
     rules:
       - path: "_test\\.go"

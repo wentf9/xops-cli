@@ -35,3 +35,26 @@ type ProcessResult struct{ Stdout []byte }
 type ProcessPort interface {
 	Run(ctx context.Context, spec ProcessSpec, stdin io.Reader) (ProcessResult, error)
 }
+
+//xops:syncclosure
+func RunSyncStr(fn func() string) string {
+	return fn()
+}
+
+//xops:syncclosure
+func RunSyncErr(fn func() error) error {
+	return fn()
+}
+
+//xops:secretuse
+type SecretConsumerCB func(plain []byte) error
+
+func WithMixedCallback(nonSec func(), sec SecretConsumerCB) error {
+	if nonSec != nil {
+		nonSec()
+	}
+	if sec != nil {
+		return sec(nil)
+	}
+	return nil
+}

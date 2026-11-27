@@ -6,6 +6,7 @@ import (
 )
 
 var ErrShared = errors.New("shared")
+var SharedFailure = errors.New("non sentinel") // want "禁止声明可变包级 var"
 
 type FieldHolder struct {
 	ErrField error

@@ -98,11 +98,35 @@ func (ts *taintScope) checkMakeClosure(mc *ssa.MakeClosure) {
 	}
 	if ts.allClosureReferrersMatch(mc, ts.isSyncClosureCallSite) {
 		if !ts.allClosureReferrersMatch(mc, ts.isSecretUseCallSite) {
-			ts.eng.auditFunc(target, nil, captured, ts.ownScope, ts.depth+1, ts.tainted, mc, ts.kiFn)
+			if retMask := ts.eng.auditFunc(target, nil, captured, ts.ownScope, ts.depth+1, ts.tainted, mc, ts.kiFn); retMask != 0 {
+				ts.report(mc, "secrettaint: 禁止在同步闭包回调中通过 return 返回明文机密")
+				ts.propagateDirectIIFEReturns(mc, retMask)
+			}
 		}
 		return
 	}
 	ts.report(mc, "secrettaint: 禁止在内层闭包中捕获明文机密变量")
+}
+
+// propagateDirectIIFEReturns 将捕获明文后通过 return 返回值的本地立即执行闭包（IIFE）结果按槽位回染，
+// 配合 checkMakeClosure 的 Fail-Closed 报错构成双重纵深拦截。
+func (ts *taintScope) propagateDirectIIFEReturns(mc *ssa.MakeClosure, retMask uint64) {
+	if mc.Referrers() == nil || retMask == 0 {
+		return
+	}
+	capSc, ok := vetssa.CombinedScope(ts.tainted, mc.Bindings...)
+	if !ok {
+		return
+	}
+	for _, ref := range *mc.Referrers() {
+		callInst, isCall := ref.(ssa.CallInstruction)
+		if !isCall {
+			continue
+		}
+		if rc := vetssa.ResolveCall(ts.eng.ssaInfo, callInst); rc.Common != nil && rc.Common.Value == mc {
+			ts.markCallReturns(callInst, retMask, capSc)
+		}
+	}
 }
 
 func (ts *taintScope) checkYieldClosure(mc *ssa.MakeClosure, target *ssa.Function, captured map[ssa.Value]vetssa.ScopeRange) {
@@ -119,7 +143,9 @@ func (ts *taintScope) checkYieldClosure(mc *ssa.MakeClosure, target *ssa.Functio
 		return
 	}
 	if len(seeds) > 0 || len(captured) > 0 {
-		ts.eng.auditFunc(target, seeds, captured, yScope, ts.depth+1, ts.tainted, callInst, ts.kiFn)
+		if retMask := ts.eng.auditFunc(target, seeds, captured, yScope, ts.depth+1, ts.tainted, callInst, ts.kiFn); retMask != 0 {
+			ts.report(mc, "secrettaint: 禁止在同步闭包回调中通过 return 返回明文机密")
+		}
 	}
 }
 
@@ -135,13 +161,24 @@ func (ts *taintScope) allClosureReferrersMatch(mc *ssa.MakeClosure, pred func(ss
 	return true
 }
 
+// isSyncClosureCallSite 判定闭包引用点是否为受控同步执行站点：
+// 对已登记公共汇点（SinkError/SinkLog/SinkSerialize/SinkEventAudit）恒返 false 实现纵深互斥，
+// 并对 //xops:secretuse 具名回调参数按精确槽位匹配，杜绝非机密回调槽位借道逃逸。
 func (ts *taintScope) isSyncClosureCallSite(callInst ssa.CallInstruction, mc *ssa.MakeClosure) bool {
 	if _, isGo := callInst.(*ssa.Go); isGo {
 		return false
 	}
 	rc := vetssa.ResolveCall(ts.eng.ssaInfo, callInst)
-	return (rc.Common != nil && rc.Common.Value == mc) || (rc.FuncObj != nil && (vetssa.IsRuntimeSecretDo(rc.FuncObj) ||
-		(ts.eng.facts != nil && (ts.eng.facts.IsSyncClosureObject(rc.FuncObj) || ts.eng.facts.HasSecretUseCallbackParam(rc.FuncObj)))))
+	if rc.Common != nil && rc.Common.Value == mc {
+		return true
+	}
+	if rc.FuncObj == nil || secretfact.ClassifyCommonSink(rc.FuncObj) != secretfact.SinkNone {
+		return false
+	}
+	if vetssa.IsRuntimeSecretDo(rc.FuncObj) {
+		return true
+	}
+	return ts.eng.facts != nil && (ts.eng.facts.IsSyncClosureObject(rc.FuncObj) || ts.isSecretUseCallSite(callInst, mc))
 }
 
 func (ts *taintScope) isSecretUseCallSite(callInst ssa.CallInstruction, mc *ssa.MakeClosure) bool {

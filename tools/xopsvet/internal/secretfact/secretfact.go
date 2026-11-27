@@ -135,6 +135,10 @@ func recordFuncDeclFact(pass *analysis.Pass, comments []*ast.CommentGroup, ident
 		pass.ExportObjectFact(orig, &fact)
 		return
 	}
+	// 高危公共汇点与 //xops:syncclosure 严格互斥，禁止向日志/错误/序列化/审计汇点导出 SyncFact。
+	if ClassifyCommonSink(orig) != SinkNone {
+		return
+	}
 	res.syncFuncs[orig] = true
 	pass.ExportObjectFact(orig, &SyncFact{})
 }

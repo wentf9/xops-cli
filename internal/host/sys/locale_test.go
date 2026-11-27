@@ -196,6 +196,20 @@ func TestDetectLocalePriorityMatrix(t *testing.T) {
 			wantOSCall: true,
 		},
 		{
+			name:       "empty_env_windows_os_tag_zh_CN_stroke",
+			env:        map[string]string{},
+			osTag:      "zh-CN_stroke",
+			want:       domi18n.LocaleZh,
+			wantOSCall: true,
+		},
+		{
+			name:       "empty_env_windows_os_tag_zh_TW_radstr",
+			env:        map[string]string{},
+			osTag:      "zh-TW_radstr",
+			want:       domi18n.LocaleZh,
+			wantOSCall: true,
+		},
+		{
 			name:       "empty_env_windows_os_tag_en_US",
 			env:        map[string]string{},
 			osTag:      "en-US",

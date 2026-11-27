@@ -2,6 +2,7 @@ package crosspkg
 
 import (
 	"embed"
+	"io"
 
 	"example.com/sentinelpkg"
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
@@ -12,17 +13,20 @@ const untypedKey = "raw.untyped"
 func dynID() domi18n.MessageID { return domi18n.KeyCoreErr }
 func dynStr() string           { return "dyn" }
 
-// 合法：跨包只读哨兵重导出与纯常量 i18n.Sentinel 构造。
+// 合法：跨包只读哨兵重导出（Err* / io.EOF）与同域非空常量 i18n.Sentinel 构造。
 var ErrReexport = sentinelpkg.ErrShared
+var ErrEOF = io.EOF
 var ErrFromCore = domi18n.Sentinel(domi18n.KeyCoreErr)
-var ErrFromCoreFB = domi18n.SentinelWithFallback(domi18n.KeyCoreErr, "fallback")
 
-// 非法：非常量参数、无类型字面量/常量、同包非跨包拷贝与白名单外 //go:embed。
-var ErrRawLit = domi18n.Sentinel("raw.lit")                               // want "禁止声明可变包级 var"
-var ErrUntyped = domi18n.Sentinel(untypedKey)                             // want "禁止声明可变包级 var"
-var ErrNonConst = domi18n.Sentinel(dynID())                               // want "禁止声明可变包级 var"
-var ErrDynFB = domi18n.SentinelWithFallback(domi18n.KeyCoreErr, dynStr()) // want "禁止声明可变包级 var"
-var ErrSamePkgCopy = ErrReexport                                          // want "禁止声明可变包级 var"
+// 非法：SentinelWithFallback、空常量 MessageIDInvalid、非哨兵名跨包重导出、非常量参数与白名单外 //go:embed。
+var ErrFromCoreFB = domi18n.SentinelWithFallback(domi18n.KeyCoreErr, "fallback") // want "禁止声明可变包级 var"
+var ErrInvalidID = domi18n.Sentinel(domi18n.MessageIDInvalid)                    // want "禁止声明可变包级 var"
+var ErrBadReexport = sentinelpkg.SharedFailure                                   // want "禁止声明可变包级 var"
+var ErrRawLit = domi18n.Sentinel("raw.lit")                                      // want "禁止声明可变包级 var"
+var ErrUntyped = domi18n.Sentinel(untypedKey)                                    // want "禁止声明可变包级 var"
+var ErrNonConst = domi18n.Sentinel(dynID())                                      // want "禁止声明可变包级 var"
+var ErrDynFB = domi18n.SentinelWithFallback(domi18n.KeyCoreErr, dynStr())        // want "禁止声明可变包级 var"
+var ErrSamePkgCopy = ErrReexport                                                 // want "禁止声明可变包级 var"
 
 //go:embed locales.txt
 var wrongPkgEmbed embed.FS // want "禁止声明可变包级 var"

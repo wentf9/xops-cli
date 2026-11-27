@@ -16,7 +16,9 @@ func checkSymbolBoundaries(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	}
 	switch pkgInfo.Layer {
 	case vetutil.LayerCoreDomain:
-		checkDomainTimeSymbols(pass)
+		checkDomainTimeSymbols(pass, "core/domain/**")
+	case vetutil.LayerInternalI18n:
+		checkDomainTimeSymbols(pass, "internal/i18n")
 	case vetutil.LayerCoreOSFS:
 		checkOSFSNetSymbols(pass)
 	case vetutil.LayerCoreMCPRuntime:
@@ -24,7 +26,7 @@ func checkSymbolBoundaries(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	}
 }
 
-func checkDomainTimeSymbols(pass *analysis.Pass) {
+func checkDomainTimeSymbols(pass *analysis.Pass, layerLabel string) {
 	var diags []vetutil.Diag
 	for ident, obj := range pass.TypesInfo.Uses {
 		if fn, isFn := obj.(*types.Func); isFn {
@@ -34,13 +36,13 @@ func checkDomainTimeSymbols(pass *analysis.Pass) {
 		}
 		if ident != nil && ident.Pos().IsValid() &&
 			vetutil.IsPkgSymbol(obj, "time", "Now", "Since", "Until", "NewTimer", "NewTicker", "After", "Sleep", "AfterFunc", "Tick", "LoadLocation", "Local") {
-			diags = append(diags, vetutil.Diag{Pos: ident.Pos(), End: ident.End(), Msg: "archbound: core/domain/** 禁止使用非确定性时钟或定时符号 time." + obj.Name()})
+			diags = append(diags, vetutil.Diag{Pos: ident.Pos(), End: ident.End(), Msg: "archbound: " + layerLabel + " 禁止使用非确定性时钟或定时符号 time." + obj.Name()})
 		}
 	}
 	for selExpr, sel := range pass.TypesInfo.Selections {
 		if selExpr != nil && sel != nil && sel.Obj() != nil && sel.Obj().Name() == "Local" &&
 			vetutil.ContainsValueNamed(sel.Recv(), "time", "Time") {
-			diags = append(diags, vetutil.Diag{Pos: selExpr.Sel.Pos(), End: selExpr.Sel.End(), Msg: "archbound: core/domain/** 禁止使用非确定性本地时区方法 (time.Time).Local"})
+			diags = append(diags, vetutil.Diag{Pos: selExpr.Sel.Pos(), End: selExpr.Sel.End(), Msg: "archbound: " + layerLabel + " 禁止使用非确定性本地时区方法 (time.Time).Local"})
 		}
 	}
 	vetutil.ReportSortedDedup(pass, diags, false)

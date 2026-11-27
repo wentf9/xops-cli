@@ -124,14 +124,14 @@ func isDomainAllowedStdlib(basePath, impPath string) bool {
 	}, impPath)
 }
 
-// isInternalI18nAllowedStdlib 精确匹配 internal/i18n 纯内存词库叶层的允许标准库白名单（含 embed 与 context 错误映射）。
+// isInternalI18nAllowedStdlib 按最小权限精确匹配 internal/i18n 纯内存词库叶层的允许标准库白名单
+// （保留 time 仅用于转发 time.Duration，非确定性时钟符号由 symbols.go 同步封禁）。
 func isInternalI18nAllowedStdlib(impPath string) bool {
 	return slices.Contains([]string{
 		"bytes", "cmp", "context", "embed",
-		"encoding/json/jsontext", "encoding/json/v2",
-		"errors", "fmt", "io", "io/fs", "iter", "maps", "math",
-		"path", "slices", "sort", "strconv", "strings",
-		"sync", "sync/atomic", "time", "unicode", "unicode/utf8",
+		"errors", "fmt", "io", "io/fs", "iter", "maps",
+		"path", "slices", "strconv", "strings",
+		"time", "unicode", "unicode/utf8",
 	}, impPath)
 }
 

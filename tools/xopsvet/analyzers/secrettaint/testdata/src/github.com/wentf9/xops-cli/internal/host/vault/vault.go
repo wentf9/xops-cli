@@ -19,6 +19,7 @@ import (
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/i18n"
 	"gopkg.in/yaml.v3"
 )
@@ -528,11 +529,57 @@ func badV232B3Regressions(box *secret.SecretBox, cond bool) {
 func badI18nSinkLeaks(box *secret.SecretBox, loc *i18n.Localizer) {
 	_ = box.Use(func(plain []byte) error {
 		s := string(plain)
-		_ = domi18n.Str("secret", s) // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = domi18n.Str("secret", s)        // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = domi18n.BoundStr("secret", s)   // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = domi18n.BoundDisplayText(s, 32) // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = i18n.Str("secret", s)           // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = i18n.BoundStr("secret", s)      // want "禁止将明文机密.*传入错误格式化汇点"
 		_ = domi18n.E(domi18n.KeySample, domi18n.Int("len", len(plain)))
 		_ = i18n.E(domi18n.KeySample, domi18n.Str("k", s)) // want "禁止将明文机密.*传入错误格式化汇点"
 		_ = loc.T(domi18n.KeySample, domi18n.Str("k", s))  // want "禁止将明文机密.*传入错误格式化汇点"
 		_ = loc.Render(domi18n.NewMessage(domi18n.KeySample, domi18n.Int("len", len(plain))))
+		return nil
+	})
+}
+
+func badSyncClosureReturnAndSlotLeaks(box *secret.SecretBox) {
+	_ = box.Use(func(plain []byte) error {
+		// 1. FormatTemplate 属于 SinkError，即便带 //xops:syncclosure 也绝不放行明文捕获闭包。
+		_ = domi18n.FormatTemplate("{k}", func(string) (string, bool) { // want "禁止在内层闭包中捕获明文机密变量"
+			return string(plain), true
+		})
+
+		// 2. 跨包合法 //xops:syncclosure 回调禁止通过 return 返回明文机密。
+		_ = ports.RunSyncStr(func() string { // want "禁止在同步闭包回调中通过 return 返回明文机密"
+			return string(plain)
+		})
+
+		// 3. 本地捕获明文的 IIFE 返回明文并流入 slog.Info：同步闭包 return 与日志汇点双重拦截。
+		leaked := func() string { // want "禁止在同步闭包回调中通过 return 返回明文机密"
+			return string(plain)
+		}()
+		slog.Info("iife-capture-leak", "v", leaked) // want "禁止将明文机密.*传入日志汇点"
+
+		// 4. 混合回调的非机密槽位不得搭便车享受 //xops:secretuse 具名回调放行。
+		_ = ports.WithMixedCallback(func() { // want "禁止在内层闭包中捕获明文机密变量"
+			_ = len(plain)
+		}, func(b []byte) error {
+			clear(b)
+			return nil
+		})
+
+		// 5. 正例对照：defer 清零与同步闭包返回 nil / 非污点 error 零误报。
+		defer func() {
+			clear(plain)
+		}()
+		_ = ports.RunSyncErr(func() error {
+			clear(plain)
+			return nil
+		})
+		_ = ports.RunSyncErr(func() error {
+			_ = len(plain)
+			return errors.New("clean error")
+		})
 		return nil
 	})
 }

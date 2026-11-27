@@ -206,7 +206,9 @@ func (ts *taintScope) auditNestedCall(ins ssa.CallInstruction) {
 	}
 	if targets, iterSc, ok := vetssa.ResolveDirectStdlibIterCallback(ts.eng.ssaInfo, rc, ts.tainted); ok {
 		for _, tgt := range targets {
-			ts.eng.auditFunc(tgt.Fn, vetssa.SeedAllParamIndices(tgt.Fn), vetssa.CollectCaptured(tgt.MC, tgt.Fn, ts.tainted), iterSc, ts.depth+1, ts.tainted, ins, ts.kiFn)
+			if retMask := ts.eng.auditFunc(tgt.Fn, vetssa.SeedAllParamIndices(tgt.Fn), vetssa.CollectCaptured(tgt.MC, tgt.Fn, ts.tainted), iterSc, ts.depth+1, ts.tainted, ins, ts.kiFn); retMask != 0 {
+				ts.report(ins, "secrettaint: 禁止在同步闭包回调中通过 return 返回明文机密")
+			}
 		}
 		ts.auditedCalls[ins] = true
 		return

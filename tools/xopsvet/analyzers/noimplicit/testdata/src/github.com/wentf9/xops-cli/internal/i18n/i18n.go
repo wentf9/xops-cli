@@ -11,6 +11,8 @@ const KeyRootErr domi18n.MessageID = "root.err"
 func Sentinel(id domi18n.MessageID) error { return nil }
 
 var ErrRoot = Sentinel(KeyRootErr)
+var ErrRootInvalid = Sentinel(domi18n.MessageIDInvalid) // want "禁止声明可变包级 var"
+var ErrRootWrongDomain = Sentinel(domi18n.KeyCoreErr)   // want "禁止声明可变包级 var"
 
 //go:embed locales.txt
 var localeFiles embed.FS

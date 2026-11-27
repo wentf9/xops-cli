@@ -10,15 +10,23 @@ import (
 )
 
 const (
-	msgIDValueErr = "i18nguard: i18n.MessageID 必须源自 core/domain/i18n 或 internal/i18n 声明的常量，禁止使用字面量、非常量转换或拼接值"
-	msgIDConvErr  = "i18nguard: 禁止在属主包外通过类型转换构造 i18n.MessageID，请直接使用 core/domain/i18n 或 internal/i18n 导出的 MessageID 常量"
-	msgIDConcat   = "i18nguard: 禁止通过拼接构造或修改 i18n.MessageID，请直接使用导出的 MessageID 常量"
+	msgIDValueErr      = "i18nguard: i18n.MessageID 必须源自 core/domain/i18n 或 internal/i18n 声明的常量，禁止使用字面量、非常量转换或拼接值"
+	msgIDConvErr       = "i18nguard: 禁止在属主包外通过类型转换构造 i18n.MessageID，请直接使用 core/domain/i18n 或 internal/i18n 导出的 MessageID 常量"
+	msgIDConcat        = "i18nguard: 禁止通过拼接构造或修改 i18n.MessageID，请直接使用导出的 MessageID 常量"
+	msgIDGenericErr    = "i18nguard: 禁止在属主包外将 i18n.MessageID 实例化至含 string 底层约束的非标准库泛型声明"
+	msgIDInvalidArgErr = "i18nguard: 禁止向 i18n 构造或渲染函数传入无效标识 MessageIDInvalid"
+	msgIDCrossDomain   = "i18nguard: 禁止将 internal/i18n 声明的 MessageID 常量传入 core/domain/i18n 构造器，请改用 internal/i18n 对应构造器"
 )
 
-// checkMessageIDIntegrity 执行规则 1：保护 core/domain/i18n.MessageID 强类型完整性。
+// checkMessageIDIntegrity 执行规则 1：保护 core/domain/i18n.MessageID 强类型完整性、
+// 封锁包外 *WithFallback 桥接符号与 ~string 泛型伪造，并拦截 MessageIDInvalid 实参与跨域键错配。
 func checkMessageIDIntegrity(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	isOwner := !pkgInfo.IsExternalTest && isMessageIDOwnerPkg(pkgInfo.BasePath)
 	constSpecs, constAddExprs := inspectConstAndTypeDecls(pass, isOwner)
+	if !isOwner {
+		checkForbiddenWithFallbackUses(pass)
+		checkMessageIDGenericInstances(pass)
+	}
 	reported := make(map[token.Pos]bool)
 	vetutil.InspectorOf(pass).Preorder([]ast.Node{
 		(*ast.CallExpr)(nil),
@@ -135,12 +143,11 @@ func checkMessageIDNode(
 
 func checkMessageIDCall(pass *analysis.Pass, call *ast.CallExpr, isOwner bool, reported map[token.Pos]bool) {
 	if tv, ok := pass.TypesInfo.Types[call.Fun]; ok && tv.IsType() {
-		if !isOwner && isMessageIDType(tv.Type) && len(call.Args) == 1 && !isAllowedMessageIDExpr(pass.TypesInfo, call.Args[0], false) {
-			reportOnce(pass, call, reported, msgIDConvErr)
-		}
+		checkMessageIDTypeConversion(pass, call, tv.Type, isOwner, reported)
 		return
 	}
 	checkMessageIDExprs(pass, call.Args, isOwner, reported)
+	checkI18nConstructorCall(pass, call, reported)
 }
 
 func checkMessageIDAssign(pass *analysis.Pass, stmt *ast.AssignStmt, isOwner bool, reported map[token.Pos]bool) {
@@ -211,9 +218,10 @@ func isAllowedMessageIDExpr(info *types.Info, expr ast.Expr, isOwner bool) bool 
 		}
 		return isAllowedMessageIDObj(info.Uses[node.Sel])
 	case *ast.CallExpr:
-		// 显式类型转换由 checkMessageIDCall 独立检查，此处放行避免同行重复报错。
+		// 仅放行目标类型为 MessageID 的显式类型转换（由 checkMessageIDCall 独立检查，避免同行重复报错）；
+		// 严格拦截 string(...) / []byte(...) / localStr(...) 等非 MessageID 转换包装绕过。
 		if tv, ok := info.Types[node.Fun]; ok && tv.IsType() {
-			return true
+			return isMessageIDType(tv.Type)
 		}
 		tv, ok := info.Types[node]
 		return ok && tv.Value == nil && isMessageIDType(tv.Type)

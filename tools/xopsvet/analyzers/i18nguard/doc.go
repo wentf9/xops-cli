@@ -3,13 +3,17 @@
 // 本分析器仅约束生产源码，自动跳过 go test 合成 .test 入口包、全部 *_test.go 与外置 *_test 包，
 // 以及测试基础设施与分析器自身（core/ports/tck、core/internal/sim、tools/xopsvet）：
 //   - 规则 1（MessageID 强类型完整性，M1 起全仓强制）：禁止在 core/domain/i18n 与 internal/i18n
-//     之外声明 i18n.MessageID 常量或类型别名；全节点检查赋值、变量初始化、函数实参、复合字面量
-//     （切片/数组/Map 键与值/结构体字段）、返回值、索引、通道发送、switch case、比较与类型转换，
-//     要求来源必须为上述两包导出的 *types.Const 或既有 MessageID 类型值，拒绝字面量、非常量转换与拼接；
+//     之外声明 i18n.MessageID 常量或类型别名、引用 core/domain/i18n.*WithFallback 桥接符号或将
+//     MessageID 实例化至含 string 底层约束（如 ~string/cmp.Ordered）的非标准库泛型声明；全节点检查
+//     赋值、变量初始化、函数实参、复合字面量（切片/数组/Map 键与值/结构体字段）、返回值、索引、
+//     通道发送、switch case、比较、多层指针与显式类型转换，要求来源必须为上述两包导出的 *types.Const
+//     或既有 MessageID 类型值，拒绝字面量、嵌套非 MessageID 类型转换与拼接；禁止向 i18n 构造/渲染
+//     函数传入空常量 MessageIDInvalid，并禁止将 internal/i18n 常量传入 core/domain/i18n 自动兜底构造器；
 //   - 规则 2（禁止绕过结构化错误构造器）：基于 TypesInfo.Uses 禁止直接调用或以函数值引用
-//     errors.New 与 fmt.Errorf（显式放行 errors.Join），并禁止在 core/domain/i18n 之外声明实现
-//     Error() string 的底层 string 自定义错误类型；永久基础设施白名单为 core/domain/i18n、core/conc、
-//     core/internal/sim、core/ports/tck 与 tools/xopsvet；
+//     errors.New 与 fmt.Errorf（显式放行 errors.Join），禁止在 core/domain/i18n 之外声明实现
+//     Error() string 的底层 string 自定义错误类型，并要求其他具体自定义错误类型在匹配的接收者
+//     方法集上同步实现 LocalizableView() core/domain/i18n.ErrorNode；永久基础设施白名单为
+//     core/domain/i18n、core/conc、core/internal/sim、core/ports/tck 与 tools/xopsvet；
 //   - 规则 3（禁止生产源码硬编码 CJK 与全角中文标点）：检查生产文件 STRING/CHAR 字面量（含转义解码后），
 //     拦截任何 unicode.Han 字符以及 U+3000..U+303F、U+FF00..U+FFEF 全角标点。
 //

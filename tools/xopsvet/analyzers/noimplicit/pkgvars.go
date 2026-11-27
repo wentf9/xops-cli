@@ -187,21 +187,21 @@ func isImmutableSentinelSpec(pass *analysis.Pass, vs *ast.ValueSpec, sentinels m
 		!slices.ContainsFunc(call.Args[1:], func(arg ast.Expr) bool { return !isPureErrorArg(info, arg, sentinels) })
 }
 
-// isI18nSentinelCall 放行 core/domain/i18n.Sentinel、SentinelWithFallback 与 internal/i18n.Sentinel 的纯常量哨兵构造。
+// isI18nSentinelCall 仅放行 core/domain/i18n.Sentinel 与 internal/i18n.Sentinel 的同域非空常量哨兵构造。
 func isI18nSentinelCall(info *types.Info, call *ast.CallExpr, callee types.Object) bool {
-	if call.Ellipsis.IsValid() {
+	if call.Ellipsis.IsValid() || len(call.Args) != 1 {
 		return false
 	}
-	if vetutil.IsPkgSymbol(callee, coreDomainI18nPath, "Sentinel") || vetutil.IsPkgSymbol(callee, internalI18nPkgPath, "Sentinel") {
-		return len(call.Args) == 1 && isMessageIDConstExpr(info, call.Args[0])
+	if vetutil.IsPkgSymbol(callee, coreDomainI18nPath, "Sentinel") {
+		return isMessageIDConstExpr(info, call.Args[0], coreDomainI18nPath)
 	}
-	if vetutil.IsPkgSymbol(callee, coreDomainI18nPath, "SentinelWithFallback") {
-		return len(call.Args) == 2 && isMessageIDConstExpr(info, call.Args[0]) && isConstStringExpr(info, call.Args[1])
+	if vetutil.IsPkgSymbol(callee, internalI18nPkgPath, "Sentinel") {
+		return isMessageIDConstExpr(info, call.Args[0], internalI18nPkgPath)
 	}
 	return false
 }
 
-func isMessageIDConstExpr(info *types.Info, expr ast.Expr) bool {
+func isMessageIDConstExpr(info *types.Info, expr ast.Expr, expectedOwnerPkg string) bool {
 	var obj types.Object
 	switch e := ast.Unparen(expr).(type) {
 	case *ast.Ident:
@@ -215,16 +215,15 @@ func isMessageIDConstExpr(info *types.Info, expr ast.Expr) bool {
 		return false
 	}
 	c, ok := obj.(*types.Const)
-	if !ok || c == nil {
+	if !ok || c == nil || c.Val() == nil || c.Val().Kind() != constant.String || constant.StringVal(c.Val()) == "" {
 		return false
 	}
-	named, ok := c.Type().(*types.Named)
-	return ok && named != nil && vetutil.IsPkgSymbol(named.Obj(), coreDomainI18nPath, "MessageID")
-}
-
-func isConstStringExpr(info *types.Info, expr ast.Expr) bool {
-	tv, ok := info.Types[expr]
-	return ok && tv.Value != nil && tv.Value.Kind() == constant.String
+	named, ok := types.Unalias(c.Type()).(*types.Named)
+	if !ok || named == nil || !vetutil.IsPkgSymbol(named.Obj(), coreDomainI18nPath, "MessageID") {
+		return false
+	}
+	ownerPath := vetutil.ObjectPkgPath(c)
+	return ownerPath == expectedOwnerPkg || strings.HasPrefix(ownerPath, expectedOwnerPkg+"/")
 }
 
 // isCrossPkgSentinelReexport 放行跨包只读哨兵错误重导出 `var ErrX = otherpkg.ErrX`。
@@ -254,7 +253,8 @@ func isPureErrorArg(info *types.Info, expr ast.Expr, sentinels map[*types.Var]bo
 
 func isExportedPkgErrorVar(v *types.Var) bool {
 	return v != nil && v.Pkg() != nil && v.Exported() && !v.IsField() &&
-		v.Parent() == v.Pkg().Scope() && vetutil.IsErrorInterfaceType(v.Type())
+		v.Parent() == v.Pkg().Scope() && vetutil.IsErrorInterfaceType(v.Type()) &&
+		(isSentinelName(v.Name()) || v.Name() == "EOF" || vetutil.IsPkgSymbol(v, "context", "Canceled", "DeadlineExceeded"))
 }
 
 func isConstExpr(info *types.Info, expr ast.Expr) bool {

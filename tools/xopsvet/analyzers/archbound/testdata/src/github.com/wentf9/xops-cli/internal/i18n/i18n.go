@@ -5,7 +5,7 @@ import (
 	"context"
 	"embed"
 	"io/fs"
-	"sync/atomic"
+	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -17,11 +17,12 @@ type Catalog struct {
 	Node yaml.Node
 	Dur  algebraic.Duration
 	N    *conc.Nursery
-	Cur  atomic.Int64
+	TTL  time.Duration
 }
 
-func Touch(ctx context.Context, fsys fs.FS) []byte {
+func Touch(ctx context.Context, fsys fs.FS, d time.Duration) []byte {
 	_ = ctx
 	_ = fsys
+	_ = d
 	return bytes.Clone(nil)
 }

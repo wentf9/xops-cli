@@ -76,18 +76,18 @@ func classifyLogOrErrorSink(pkgPath, name string) SinkKind {
 		}
 	case coreDomainI18nPkgPath:
 		if slices.Contains([]string{
-			"Str", "Int", "Int64", "Uint64", "Float", "Bool", "Dur", "DurNanos", "Msg",
+			"Str", "BoundStr", "BoundDisplayText", "Int", "Int64", "Uint64", "Float", "Bool", "Dur", "DurNanos", "Msg",
 			"NewMessage", "NewMessageWithFallback", "NewPluralMessage", "NewPluralMessageWithFallback",
-			"Sentinel", "SentinelWithFallback", "E", "EF", "Wrap", "WrapS", "WrapSentinel",
-			"EWithFallback", "EFWithFallback", "WrapWithFallback", "WrapSWithFallback",
-			"FormatTemplate",
+			"Sentinel", "SentinelWithFallback", "NewErrorWithFallback", "E", "EF", "Wrap", "WrapS", "WrapSentinel",
+			"CanonicalError", "RenderErrorChain", "FormatTemplate",
 		}, name) {
 			return SinkError
 		}
 	case internalI18nPkgPath:
 		if slices.Contains([]string{
-			"Sentinel", "E", "EF", "Wrap", "WrapS",
+			"Str", "BoundStr", "Int", "Int64", "Uint64", "Float", "Bool", "Dur", "DurNanos", "Msg",
 			"NewMessage", "NewPluralMessage",
+			"Sentinel", "E", "EF", "Wrap", "WrapS",
 			"T", "TPlural", "Render", "RenderError",
 		}, name) {
 			return SinkError
