@@ -24,6 +24,15 @@ const defaultShutdownTimeout = 5 * time.Second
 //  3. 在 core/conc.Nursery（RunScoped）监督下运行传输主循环与取消看门狗；
 //  4. 无论正常结束、信号取消还是异常返回，均以剥离取消的有限超时上下文幂等调用 MCPServer.Close 并聚合关闭错误。
 func Run(ctx context.Context, cfg Config) (retErr error) {
+	// 无论是在校验/Prepare 阶段提前失败，还是 ServeHTTPListener 结束后退出，
+	// 均幂等兜底关闭调用方预绑定的 cfg.Listener（忽略已关闭的 net.ErrClosed），杜绝套接字描述符泄漏。
+	defer func() {
+		if cfg.Listener != nil {
+			if lErr := cfg.Listener.Close(); lErr != nil && !errors.Is(lErr, net.ErrClosed) {
+				retErr = errors.Join(retErr, lErr)
+			}
+		}
+	}()
 	if ctx == nil {
 		return ErrNilContext
 	}

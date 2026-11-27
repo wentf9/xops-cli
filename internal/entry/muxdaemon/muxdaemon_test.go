@@ -118,16 +118,18 @@ func (f *fakeForward) Stop(ctx context.Context) error {
 }
 
 type fakeBackend struct {
-	master       *fakeMaster
-	masterErr    error
-	forwards     []*fakeForward
-	failFwdAt    int
-	failFwdErr   error
-	startedFwds  atomic.Int32
-	seenMasterRC engine.RemoteCall
+	master           *fakeMaster
+	masterErr        error
+	masterStartCalls atomic.Int32
+	forwards         []*fakeForward
+	failFwdAt        int
+	failFwdErr       error
+	startedFwds      atomic.Int32
+	seenMasterRC     engine.RemoteCall
 }
 
 func (b *fakeBackend) StartMaster(_ context.Context, rc engine.RemoteCall) (masterLease, error) {
+	b.masterStartCalls.Add(1)
 	b.seenMasterRC = rc
 	if b.masterErr != nil {
 		return nil, b.masterErr
@@ -355,3 +357,152 @@ func TestRunWithBackend_PartialForwardRollbackAndCleanupErrors(t *testing.T) {
 		t.Fatalf("转发断连后必须停止自建主控: stopCalls=%d", master2.stopCalls.Load())
 	}
 }
+
+func TestRunWithBackend_PureForwardFallbackAndExplicitMasterContract(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	spec := mustLocalFwdSpec(t, "127.0.0.1:10051", "10.0.0.9:8080")
+
+	// 1. ControlMaster=no + Forwards：跳过 StartMaster，进入纯转发监督模式并在取消后清理转发。
+	assertPureForwardMode(t, "control_master_no", Config{
+		TargetSpec: "deploy@fwd.internal",
+		CLIOptions: option.UnsetOptionLayer().WithControlPolicy(option.UnsetControlPolicy().WithMaster(option.ControlMasterNo)),
+		Forwards:   []engine.ForwardSpec{spec},
+	}, 0, nil)
+
+	// 2. ControlPath=none + Forwards：跳过 StartMaster，纯转发监督模式。
+	assertPureForwardMode(t, "control_path_none", Config{
+		TargetSpec: "deploy@fwd.internal",
+		CLIOptions: option.UnsetOptionLayer().WithControlPolicy(option.UnsetControlPolicy().WithPath(option.DisabledControlPath())),
+		Forwards:   []engine.ForwardSpec{spec},
+	}, 0, nil)
+
+	// 3. 未显式指定 -M/-S 且有 Forwards（典型 `ssh -f -N -L`）：StartMaster 返回 ErrControlMasterDisabled 时平滑降级纯转发。
+	assertPureForwardMode(t, "unset_mux_fallback", Config{
+		TargetSpec: "deploy@fwd.internal",
+		Forwards:   []engine.ForwardSpec{spec},
+	}, 1, engine.ErrControlMasterDisabled)
+
+	// 4. 无 Forwards 时 ErrControlMasterDisabled 必须失败关闭（禁止静默退化）。
+	if err := runWithBackend(context.Background(), Config{
+		TargetSpec: "deploy@nomux.internal",
+	}, &fakeBackend{masterErr: engine.ErrControlMasterDisabled}); !errors.Is(err, engine.ErrControlMasterDisabled) {
+		t.Fatalf("无转发时 ErrControlMasterDisabled 必须失败关闭，实际=%v", err)
+	}
+
+	// 5. 显式要求 ControlMaster=yes 时，即便有 Forwards 也严禁静默降级。
+	if err := runWithBackend(context.Background(), Config{
+		TargetSpec: "deploy@explicit.internal",
+		CLIOptions: option.UnsetOptionLayer().WithControlPolicy(option.UnsetControlPolicy().WithMaster(option.ControlMasterYes)),
+		Forwards:   []engine.ForwardSpec{spec},
+	}, &fakeBackend{masterErr: engine.ErrControlMasterDisabled}); !errors.Is(err, engine.ErrControlMasterDisabled) {
+		t.Fatalf("显式 ControlMaster=yes 遇到 ErrControlMasterDisabled 必须失败关闭，实际=%v", err)
+	}
+}
+
+func assertPureForwardMode(t *testing.T, name string, cfg Config, wantMasterStarts int32, masterErr error) {
+	t.Helper()
+	t.Run(name, func(t *testing.T) {
+		fwd := newFakeForward(cfg.Forwards[0], "127.0.0.1:10051")
+		backend := &fakeBackend{masterErr: masterErr, forwards: []*fakeForward{fwd}}
+		runCtx, cancel := context.WithCancel(context.Background())
+		readyCh := make(chan ReadyInfo, 1)
+		var stdout bytes.Buffer
+		cfg.Stdout = &stdout
+		cfg.OnReady = func(info ReadyInfo) { readyCh <- info }
+
+		var runErr error
+		outerErr := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+			if gErr := n.Go(func(context.Context) error {
+				runErr = runWithBackend(runCtx, cfg, backend)
+				return nil
+			}); gErr != nil {
+				return gErr
+			}
+			ready := <-readyCh
+			if ready.SocketPath != "" || len(ready.Forwards) != 1 {
+				cancel()
+				return errors.New("unexpected pure-forward ready info")
+			}
+			cancel()
+			return nil
+		})
+		if outerErr != nil || runErr != nil {
+			t.Fatalf("%s: 纯转发取消期望 nil，实际 outer=%v run=%v", name, outerErr, runErr)
+		}
+		if backend.masterStartCalls.Load() != wantMasterStarts || fwd.stopCalls.Load() != 1 {
+			t.Fatalf("%s: 调用计数失配 masterStarts=%d want=%d fwdStops=%d",
+				name, backend.masterStartCalls.Load(), wantMasterStarts, fwd.stopCalls.Load())
+		}
+		if !strings.Contains(stdout.String(), "mux daemon ready (forwards)") {
+			t.Fatalf("%s: 纯转发横幅失配: %q", name, stdout.String())
+		}
+	})
+}
+
+func TestRunWithBackend_CleanupTOCTOUAndDeadlineExceeded(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	spec := mustLocalFwdSpec(t, "127.0.0.1:10061", "10.0.0.8:80")
+
+	// 1. TOCTOU 竞态：清理进入 Stop 前 Done() 尚未关闭，Stop 执行期间并发自退出关闭 Done() 并返回 ErrHandleNotFound/Revoked，
+	// cleanupResources 二次核验 Done() 后应判定为良性自退出而非虚假清理错误。
+	master := newFakeMaster("/tmp/cm-toctou.sock", false, option.IndefiniteControlPersist())
+	master.stopErr = engine.ErrHandleRevoked
+	fwd := newFakeForward(spec, "127.0.0.1:10061")
+	fwd.stopErr = engine.ErrHandleNotFound
+	runCtx, cancel := context.WithCancel(context.Background())
+	readyCh := make(chan struct{})
+	var runErr error
+	outerErr := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error {
+			runErr = runWithBackend(runCtx, Config{
+				TargetSpec: "deploy@toctou.internal",
+				Forwards:   []engine.ForwardSpec{spec},
+				OnReady:    func(ReadyInfo) { close(readyCh) },
+			}, &fakeBackend{master: master, forwards: []*fakeForward{fwd}})
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		<-readyCh
+		cancel()
+		return nil
+	})
+	if outerErr != nil || runErr != nil {
+		t.Fatalf("并发自退出 TOCTOU 竞态下清理必须返回 nil，实际 outer=%v run=%v", outerErr, runErr)
+	}
+
+	// 2. 若资源未关闭（Done() 仍未闭合）而 Stop 返回 ErrHandleNotFound，则不得吞错。
+	stuck := &stuckForwardLease{spec: spec, bound: "127.0.0.1:10062", doneCh: make(chan struct{}), stopErr: engine.ErrHandleNotFound}
+	if err := cleanupResources(context.Background(), time.Second, []forwardLease{stuck}, nil, false); !errors.Is(err, engine.ErrHandleNotFound) {
+		t.Fatalf("未自退出却返回 ErrHandleNotFound 必须失败关闭暴露错误，实际=%v", err)
+	}
+
+	// 3. 父上下文因超时终止（DeadlineExceeded）时，runWithBackend 必须透传 context.DeadlineExceeded 并完成全量清理。
+	masterDL := newFakeMaster("/tmp/cm-dl.sock", false, option.IndefiniteControlPersist())
+	fwdDL := newFakeForward(spec, "127.0.0.1:10063")
+	dlCtx, dlCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer dlCancel()
+	dlErr := runWithBackend(dlCtx, Config{
+		TargetSpec: "deploy@deadline.internal",
+		Forwards:   []engine.ForwardSpec{spec},
+	}, &fakeBackend{master: masterDL, forwards: []*fakeForward{fwdDL}})
+	if !errors.Is(dlErr, context.DeadlineExceeded) {
+		t.Fatalf("超时截止必须透传 context.DeadlineExceeded，实际=%v", dlErr)
+	}
+	if fwdDL.stopCalls.Load() != 1 || masterDL.stopCalls.Load() != 1 {
+		t.Fatalf("超时退出后必须完成资源清理: fwd=%d master=%d", fwdDL.stopCalls.Load(), masterDL.stopCalls.Load())
+	}
+}
+
+type stuckForwardLease struct {
+	spec    engine.ForwardSpec
+	bound   string
+	doneCh  chan struct{}
+	stopErr error
+}
+
+func (s *stuckForwardLease) Spec() engine.ForwardSpec   { return s.spec }
+func (s *stuckForwardLease) BoundAddr() string          { return s.bound }
+func (s *stuckForwardLease) Done() <-chan struct{}      { return s.doneCh }
+func (s *stuckForwardLease) Wait(context.Context) error { return nil }
+func (s *stuckForwardLease) Stop(context.Context) error { return s.stopErr }

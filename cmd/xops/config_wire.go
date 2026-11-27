@@ -153,7 +153,50 @@ func resolveAuditLocation(
 	if rel, err := pathalg.ParseLocalRootedDest(raw); err == nil {
 		return stateDir, algebraic.Some(rel), nil
 	}
-	return splitAbsoluteAuditLocation(raw)
+	// 若绝对路径位于 stateDir 内（如 ~/.xops/audit.jsonl 或 ~/.xops/logs/audit.jsonl），
+	// 保持 RootDir=stateDir 并转为相对 LocalRootedDest，确保进程锁始终锚定 ~/.xops/run/*.lock。
+	if relUnderState, inside := stripAuditStatePrefix(raw, stateDir); inside {
+		relDest, err := pathalg.ParseLocalRootedDest(relUnderState)
+		if err != nil {
+			return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), fmt.Errorf("invalid policy.guardrail.audit_log under stateDir %q: %w", raw, err)
+		}
+		return stateDir, algebraic.Some(relDest), nil
+	}
+	rootDir, fileOpt, err := splitAbsoluteAuditLocation(raw)
+	if err != nil {
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), err
+	}
+	// 禁止将裸 homeDir（如 ~/xops-audit.jsonl）作为 FileSink.RootDir：
+	// Windows 下 %USERPROFILE% 含继承 ACL 会触发 EnsureOwnerOnlyDirectory 失败，Unix 下会污染 ~/run/*.lock。
+	if rootDir.Equal(homeDir) {
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), fmt.Errorf("policy.guardrail.audit_log %q cannot place audit root directly in home directory; use a path under state directory or a dedicated private directory", pol.Guardrail.AuditLog)
+	}
+	return rootDir, fileOpt, nil
+}
+
+func stripAuditStatePrefix(raw string, stateDir pathalg.LocalDir) (string, bool) {
+	normRaw := path.Clean(strings.ReplaceAll(raw, `\`, "/"))
+	normState := strings.TrimRight(path.Clean(strings.ReplaceAll(stateDir.String(), `\`, "/")), "/")
+	if normState == "" {
+		return "", false
+	}
+	// Windows 盘符大小写无关比对。
+	cmpRaw, cmpState := foldWindowsDrivePrefix(normRaw), foldWindowsDrivePrefix(normState)
+	if !strings.HasPrefix(cmpRaw, cmpState+"/") {
+		return "", false
+	}
+	rel := normRaw[len(normState)+1:]
+	if rel == "" {
+		return "", false
+	}
+	return rel, true
+}
+
+func foldWindowsDrivePrefix(p string) string {
+	if len(p) >= 2 && p[1] == ':' && p[0] >= 'A' && p[0] <= 'Z' {
+		return strings.ToLower(p[:1]) + p[1:]
+	}
+	return p
 }
 
 func splitAbsoluteAuditLocation(raw string) (pathalg.LocalDir, algebraic.Option[pathalg.LocalRootedDest], error) {

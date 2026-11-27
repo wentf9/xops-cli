@@ -123,7 +123,7 @@ func (e *Engine) StartControlMaster(ctx context.Context, req ControlMasterReques
 		info, err := e.session.StartControlMaster(c, ucsess.ControlMasterRequest{Plan: r.Plan(), NodeID: r.NodeID(), Risk: req.Risk, Approval: req.Approval, OperationStream: req.OperationStream})
 		if err == nil && !info.ReusedExisting() {
 			if h, ok := info.Handle().Get(); ok && h.IsValid() {
-				e.muxActivity.register(info.SocketPath().String(), h)
+				e.muxActivity.register(info.SocketPath().String(), h, info.Done())
 			}
 		}
 		return info, err

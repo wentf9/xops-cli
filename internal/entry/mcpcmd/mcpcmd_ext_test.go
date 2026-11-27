@@ -377,3 +377,79 @@ func TestRun_HTTPLoopbackAndListenAddrGracefulCancel(t *testing.T) {
 		t.Fatalf("ListenAddr 透传异常: calls=%d addr=%q", srv2.listenCalls.Load(), srv2.seenAddr)
 	}
 }
+
+func TestRun_ClosesPreboundListenerOnEarlyFailure(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	newLoopbackLn := func(t *testing.T) net.Listener {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("net.Listen: %v", err)
+		}
+		return ln
+	}
+	assertListenerClosed := func(t *testing.T, ln net.Listener) {
+		t.Helper()
+		_, err := ln.Accept()
+		if !errors.Is(err, net.ErrClosed) {
+			_ = ln.Close()
+			t.Fatalf("提前失败后预绑定 Listener 必须已关闭（net.ErrClosed），实际 Accept err=%v", err)
+		}
+	}
+
+	t.Run("canceled_ctx", func(t *testing.T) {
+		ln := newLoopbackLn(t)
+		canceledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := mcpcmd.Run(canceledCtx, mcpcmd.Config{Transport: mcpcmd.TransportHTTP, Listener: ln}); !errors.Is(err, context.Canceled) {
+			t.Fatalf("期望 context.Canceled，实际=%v", err)
+		}
+		assertListenerClosed(t, ln)
+	})
+
+	t.Run("invalid_config", func(t *testing.T) {
+		ln := newLoopbackLn(t)
+		srv := newFakeMCPServer()
+		err := mcpcmd.Run(context.Background(), mcpcmd.Config{
+			ServerFactory: func(engine.MCPConfig) (mcpcmd.MCPServerContract, error) { return srv, nil },
+			Transport:     mcpcmd.TransportStdio,
+			Stdin:         strings.NewReader(""),
+			Stdout:        &bytes.Buffer{},
+			Listener:      ln,
+		})
+		if !errors.Is(err, mcpcmd.ErrInvalidConfig) {
+			t.Fatalf("期望 ErrInvalidConfig，实际=%v", err)
+		}
+		assertListenerClosed(t, ln)
+	})
+
+	t.Run("factory_error", func(t *testing.T) {
+		ln := newLoopbackLn(t)
+		wantErr := errors.New("factory boom")
+		err := mcpcmd.Run(context.Background(), mcpcmd.Config{
+			ServerFactory: func(engine.MCPConfig) (mcpcmd.MCPServerContract, error) { return nil, wantErr },
+			Transport:     mcpcmd.TransportHTTP,
+			Listener:      ln,
+		})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("期望 factory 错误，实际=%v", err)
+		}
+		assertListenerClosed(t, ln)
+	})
+
+	t.Run("prepare_error", func(t *testing.T) {
+		ln := newLoopbackLn(t)
+		srv := newFakeMCPServer()
+		wantErr := errors.New("prepare boom")
+		srv.prepareErr = wantErr
+		err := mcpcmd.Run(context.Background(), mcpcmd.Config{
+			ServerFactory: func(engine.MCPConfig) (mcpcmd.MCPServerContract, error) { return srv, nil },
+			Transport:     mcpcmd.TransportHTTP,
+			Listener:      ln,
+		})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("期望 prepare 错误，实际=%v", err)
+		}
+		assertListenerClosed(t, ln)
+	})
+}

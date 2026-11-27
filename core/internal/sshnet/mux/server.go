@@ -48,15 +48,15 @@ func (st *muxServerState) triggerStopListening() {
 	st.stopListenOnce.Do(func() { close(st.stopListenCh) })
 }
 
-func (st *muxServerState) notifyActivity(ctx context.Context) {
+func (st *muxServerState) notifyActivity(ctx context.Context, kind SocketActivityKind) {
 	if st.stoppedByControl.Load() {
 		return
 	}
-	if st.owner.onActivity != nil {
+	if st.owner.onActivity != nil && kind != SocketActivityClientLeave {
 		st.owner.onActivity()
 	}
 	if st.owner.onSocketActivity != nil && st.socketAddr != "" && ctx.Err() == nil {
-		st.owner.onSocketActivity(ctx, st.socketAddr)
+		st.owner.onSocketActivity(ctx, st.socketAddr, kind)
 	}
 }
 
@@ -82,6 +82,7 @@ func (m *MuxSocket) Serve(
 	if ln.Addr() != nil {
 		socketAddr = m.resolveBoundPath(ln.Addr().String())
 	}
+	defer m.notifySocketClosed(socketAddr)
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 
@@ -217,8 +218,8 @@ func (st *muxServerState) handleClientConn(ctx context.Context, conn net.Conn) {
 	if _, err := muxstream.ReadHello(conn); err != nil {
 		return
 	}
-	st.notifyActivity(ctx)
-	defer st.notifyActivity(ctx)
+	st.notifyActivity(ctx, SocketActivityClientEnter)
+	defer st.notifyActivity(ctx, SocketActivityClientLeave)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -227,7 +228,7 @@ func (st *muxServerState) handleClientConn(ctx context.Context, conn net.Conn) {
 		if err != nil {
 			return
 		}
-		st.notifyActivity(ctx)
+		st.notifyActivity(ctx, SocketActivityTouch)
 		if stop, _ := st.dispatchPacket(ctx, conn, msgType, body); stop {
 			return
 		}

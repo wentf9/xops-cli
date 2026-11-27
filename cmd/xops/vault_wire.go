@@ -85,19 +85,24 @@ func (disabledVault) Delete(ctx context.Context, ref secret.Ref) error {
 }
 
 // buildVaultAdapters 依据 ConfigDocument.Vault 装配多后端 RouterVault（offline_aead、os_keychain、
-// external_helper、none）与可选 VaultControlPort；未配置时自动装配默认 offline + 平台原生 os_keychain。
+// external_helper、none）与可选 VaultControlPort；未配置 stores 时自动装配默认 offline + 平台原生 os_keychain，
+// 并严格尊重显式 vault.default_store（对未知默认存储名失败关闭）。
 func buildVaultAdapters(
 	cfg *store.VaultConfigDTO,
 	invKnownStores []string,
 	deps vaultWireDeps,
 ) (wiredVault, error) {
 	if cfg == nil || len(cfg.Stores) == 0 {
-		return buildDefaultVaultAdapters(invKnownStores, deps)
+		defaultName := ""
+		if cfg != nil {
+			defaultName = strings.TrimSpace(cfg.DefaultStore)
+		}
+		return buildDefaultVaultAdapters(defaultName, invKnownStores, deps)
 	}
 	return buildConfiguredVaultAdapters(cfg, invKnownStores, deps)
 }
 
-func buildDefaultVaultAdapters(invKnownStores []string, deps vaultWireDeps) (wiredVault, error) {
+func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps vaultWireDeps) (wiredVault, error) {
 	vaultDir, err := deps.stateDir.JoinComponent(defaultVaultDirName)
 	if err != nil {
 		return wiredVault{}, fmt.Errorf("resolve default vault directory failed: %w", err)
@@ -119,11 +124,21 @@ func buildDefaultVaultAdapters(invKnownStores []string, deps vaultWireDeps) (wir
 		defaultOfflineStoreName:    offVault,
 		defaultOSKeychainStoreName: osKeychain,
 	}
+	defaultBackend := ports.SecretVault(offVault)
+	if defaultName != "" {
+		selected, ok := stores[defaultName]
+		if !ok {
+			closeBuiltVaults(stores)
+			return wiredVault{}, fmt.Errorf("vault.default_store %q is not a known default store", defaultName)
+		}
+		defaultBackend = selected
+	}
 	router, err := vault.NewRouterVault(vault.RouterSpec{
 		Stores:       stores,
-		DefaultStore: offVault,
+		DefaultStore: defaultBackend,
 	})
 	if err != nil {
+		closeBuiltVaults(stores)
 		return wiredVault{}, fmt.Errorf("initialize router vault failed: %w", err)
 	}
 	return wiredVault{

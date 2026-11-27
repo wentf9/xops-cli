@@ -37,6 +37,16 @@ const defaultHandshakeTimeout = 5 * time.Second
 // ProxyHandler 定义 ControlMaster 收到 MUX_C_PROXY 请求并回复 MUX_S_PROXY 后的可选自定义代理流处理函数。
 type ProxyHandler func(ctx context.Context, conn net.Conn, upstream ports.TransportConn) error
 
+// SocketActivityKind 描述 ControlMaster 本地控制套接字上的客户端活跃状态与监听退出事件。
+type SocketActivityKind uint8
+
+const (
+	SocketActivityTouch       SocketActivityKind = iota + 1 // 客户端控制报文活动
+	SocketActivityClientEnter                               // 客户端完成 HELLO 握手进入活跃态
+	SocketActivityClientLeave                               // 活跃客户端连接关闭离开
+	SocketActivityClosed                                    // ControlMaster 监听退出关闭（解除上层索引）
+)
+
 // Config 描述 MuxSocket 适配器的显式配置项（零值即安全失败关闭默认配置）。
 type Config struct {
 	// KeepStaleSocket 为 true 时禁止 WithListener 自动清理目录锁内确证为过期的套接字（默认 false：安全接管陈旧槽位）。
@@ -49,9 +59,9 @@ type Config struct {
 	SelfPID uint32
 	// OnActivity 可选在 ControlMaster 收到活跃客户端请求时回调（供上层刷新 ControlPersist 空闲计时器）。
 	OnActivity func()
-	// OnSocketActivity 可选在 ControlMaster 收到活跃客户端请求或客户端断开时回调，
-	// 携带与当前 Serve 生命周期绑定的 ctx 与监听套接字地址，供上层按套接字无死锁刷新 ControlPersist 计时器。
-	OnSocketActivity func(ctx context.Context, socketAddr string)
+	// OnSocketActivity 可选在 ControlMaster 收到客户端进入/活跃/离开或监听关闭时回调，
+	// 携带与当前 Serve 生命周期绑定的 ctx、规范监听套接字路径与事件类型，供上层保活与索引清理。
+	OnSocketActivity func(ctx context.Context, socketAddr string, kind SocketActivityKind)
 	// ProxyHandler 可选定制 Serve 收到 MUX_C_PROXY 后的双向代理流处理逻辑。
 	ProxyHandler ProxyHandler
 }
@@ -65,7 +75,7 @@ type MuxSocket struct {
 	handshakeTimeout time.Duration
 	selfPID          uint32
 	onActivity       func()
-	onSocketActivity func(ctx context.Context, socketAddr string)
+	onSocketActivity func(ctx context.Context, socketAddr string, kind SocketActivityKind)
 	proxyHandler     ProxyHandler
 	boundMu          sync.Mutex
 	boundPaths       map[string]string
@@ -125,6 +135,12 @@ func (m *MuxSocket) resolveBoundPath(rawAddr string) string {
 	return rawAddr
 }
 
+func (m *MuxSocket) notifySocketClosed(socketAddr string) {
+	if m != nil && m.onSocketActivity != nil && socketAddr != "" {
+		m.onSocketActivity(context.Background(), socketAddr, SocketActivityClosed)
+	}
+}
+
 func (m *MuxSocket) checkReady(ctx context.Context) error {
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -164,12 +180,15 @@ func (m *MuxSocket) WithListener(ctx context.Context, socketPath pathalg.LocalSo
 		return err
 	}
 	err = osfs.WithSocketSlot(ctx, ctrlPath, osfs.SocketSlotOptions{ReplaceStale: !m.keepStale}, func(slot *osfs.SocketSlot) error {
+		canonical := slot.Path().NativePath()
+		// 在目录锁释放前无条件通知监听槽位关闭，覆盖 Serve 正常/异常退出及进入 Serve 前取消的全路径零泄漏注销。
+		defer m.notifySocketClosed(canonical)
 		rawAddr := ""
 		if lnAddr := slot.Listener().Addr(); lnAddr != nil {
 			rawAddr = lnAddr.String()
 		}
 		if rawAddr != "" {
-			m.registerBoundPath(rawAddr, slot.Path().NativePath())
+			m.registerBoundPath(rawAddr, canonical)
 			defer m.unregisterBoundPath(rawAddr)
 		}
 		return fn(slot.Listener())

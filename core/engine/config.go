@@ -293,7 +293,7 @@ func resolveDefaultPorts(cfg Config, activity *muxActivityHub) (rp resolvedPorts
 	}
 	rp.muxSocket = cfg.MuxSocket
 	if rp.muxSocket == nil {
-		var onSocketActivity func(context.Context, string)
+		var onSocketActivity func(context.Context, string, mux.SocketActivityKind)
 		if activity != nil {
 			onSocketActivity = activity.notify
 		}

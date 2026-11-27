@@ -16,11 +16,14 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/entry/cli"
+	"github.com/wentf9/xops-cli/internal/host/store"
+	"github.com/wentf9/xops-cli/internal/host/sys"
 )
 
 func setupIsolatedRootEnv(t *testing.T) (homeDir, xopsHome pathalg.LocalDir) {
@@ -361,5 +364,139 @@ func assertOperatorFileAndLocalFSHooks(t *testing.T, ctx context.Context, homeDi
 	entries, err := localFS.ReadDir(ctx, homeDir)
 	if err != nil || len(entries) != 1 || entries[0].Name != "sample.txt" || entries[0].IsDir {
 		t.Fatalf("ReadDir(homeDir) 失配: entries=%+v err=%v", entries, err)
+	}
+}
+
+func TestResolveAuditLocation_StateSubpathDedicatedDirAndRejectBareHome(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	homeDir, xopsHome := setupIsolatedRootEnv(t)
+
+	// 1. stateDir 下的绝对路径（如 <xopsHome>/logs/audit.jsonl）必须保持 RootDir=stateDir，确保进程锁留在 <xopsHome>/run/*.lock。
+	subAbs := filepath.Join(filepath.FromSlash(xopsHome.String()), "logs", "audit.jsonl")
+	root1, file1, err := resolveAuditLocation(xopsHome, homeDir, &store.PolicyConfigDTO{
+		Guardrail: &store.GuardrailConfigDTO{AuditLog: subAbs},
+	})
+	if err != nil {
+		t.Fatalf("stateDir 子路径审计日志解析失败: %v", err)
+	}
+	if !root1.Equal(xopsHome) {
+		t.Fatalf("stateDir 内路径的 auditRootDir 必须维持 stateDir: got=%s want=%s", root1.String(), xopsHome.String())
+	}
+	if gotFile, ok := file1.Get(); !ok || gotFile.String() != "logs/audit.jsonl" {
+		t.Fatalf("stateDir 内相对路径失配: opt=%v", file1)
+	}
+
+	// 2. 裸 homeDir（如 ~/xops-audit.jsonl）必须失败关闭，禁止在 $HOME/%USERPROFILE% 根目录执行 EnsureRoot(0o700) 与落锁。
+	if _, _, err := resolveAuditLocation(xopsHome, homeDir, &store.PolicyConfigDTO{
+		Guardrail: &store.GuardrailConfigDTO{AuditLog: "~/xops-audit.jsonl"},
+	}); err == nil || !strings.Contains(err.Error(), "home directory") {
+		t.Fatalf("裸 homeDir audit_log 必须失败关闭，实际=%v", err)
+	}
+
+	// 3. 独立专用私有目录（!= homeDir）应正常拆分 RootDir + 文件名。
+	dedicatedDir := filepath.Join(t.TempDir(), "xops-audit-private")
+	dedicatedLog := filepath.Join(dedicatedDir, "custom.jsonl")
+	root3, file3, err := resolveAuditLocation(xopsHome, homeDir, &store.PolicyConfigDTO{
+		Guardrail: &store.GuardrailConfigDTO{AuditLog: dedicatedLog},
+	})
+	if err != nil {
+		t.Fatalf("独立私有目录 audit_log 解析失败: %v", err)
+	}
+	wantDedicated, _ := pathalg.ParseLocalDir(dedicatedDir)
+	if !root3.Equal(wantDedicated) {
+		t.Fatalf("独立目录 auditRootDir 失配: got=%s want=%s", root3.String(), wantDedicated.String())
+	}
+	if gotFile, ok := file3.Get(); !ok || gotFile.String() != "custom.jsonl" {
+		t.Fatalf("独立目录文件名失配: opt=%v", file3)
+	}
+
+	// 4. 真实 wireRuntime 验证：配置 stateDir/logs/audit.jsonl 时进程锁落在 stateDir/run/*.lock 而非 stateDir/logs/run。
+	assertWireRuntimeSubpathLockPlacement(t, xopsHome, subAbs)
+}
+
+func assertWireRuntimeSubpathLockPlacement(t *testing.T, xopsHome pathalg.LocalDir, auditAbs string) {
+	t.Helper()
+	rootFS := osfs.NewScopedRootFS()
+	cfgDest, _ := pathalg.ParseLocalRootedDest("config.yaml")
+	cfgYAML := "version: 2\npolicy:\n  guardrail:\n    audit_log: " + filepath.ToSlash(auditAbs) + "\n"
+	if err := rootFS.WithRoot(xopsHome, func(root ports.RootHandle) error {
+		return root.AtomicReplace(cfgDest, 0o600, func(w io.Writer) error {
+			_, wErr := io.WriteString(w, cfgYAML)
+			return wErr
+		})
+	}); err != nil {
+		t.Fatalf("写入 config.yaml 失败: %v", err)
+	}
+	ctx := context.Background()
+	rt, err := wireRuntime(ctx, cli.EngineInitOptions{OpenSSHConfigFile: "none"}, runtimeModeCLI, strings.NewReader(""), io.Discard)
+	if err != nil {
+		t.Fatalf("wireRuntime(stateDir subpath audit_log): %v", err)
+	}
+	runDest, _ := pathalg.ParseLocalRootedDest("run")
+	logsRunDest, _ := pathalg.ParseLocalRootedDest("logs/run")
+	var stateRunCount int
+	if err := rootFS.WithRoot(xopsHome, func(root ports.RootHandle) error {
+		entries, rErr := root.ReadDir(algebraic.Some(runDest))
+		if rErr != nil {
+			return rErr
+		}
+		stateRunCount = len(entries)
+		if _, lErr := root.Lstat(logsRunDest); !errors.Is(lErr, ports.ErrNotFound) {
+			t.Errorf("不应在 stateDir/logs/run 创建锁目录，实际 Lstat err=%v", lErr)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("检查 stateDir/run 失败: %v", err)
+	}
+	if stateRunCount == 0 {
+		t.Fatal("wireRuntime 活跃期内 stateDir/run 下应持有进程锁文件")
+	}
+	if err := rt.Close(ctx); err != nil {
+		t.Fatalf("rt.Close: %v", err)
+	}
+}
+
+func TestBuildVaultAdapters_DefaultStoreWithoutExplicitStores(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	homeDir, xopsHome := setupIsolatedRootEnv(t)
+	deps := vaultWireDeps{
+		scopedFS: osfs.NewScopedRootFS(),
+		stateDir: xopsHome,
+		homeDir:  homeDir,
+		env:      newHomeAwareEnv(sys.NewSystemEnv()),
+		entropy:  sys.NewCryptoEntropy(),
+		proc:     sys.NewSystemProcess(),
+	}
+	unscopedRef, err := secret.NewRef("unregistered_store", "probe_key")
+	if err != nil {
+		t.Fatalf("NewRef: %v", err)
+	}
+	ctx := context.Background()
+
+	// 1. vault.stores 为空但显式指定 default_store=offline：未登记存储回退路由至 offline（锁定态返回 ErrVaultLocked）。
+	offWired, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "offline"}, nil, deps)
+	if err != nil {
+		t.Fatalf("buildVaultAdapters(default=offline): %v", err)
+	}
+	defer func() { _ = offWired.router.Close() }()
+	offErr := offWired.router.WithSecret(ctx, unscopedRef, func(*secret.SecretBox) error { return nil })
+	if !errors.Is(offErr, ports.ErrVaultLocked) {
+		t.Fatalf("default_store=offline 时未登记存储期望命中锁定态 offline（ErrVaultLocked），实际=%v", offErr)
+	}
+
+	// 2. vault.stores 为空但显式指定 default_store=os_keychain：未登记存储回退路由至 os_keychain（绝不落到锁定态 offline）。
+	kcWired, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "os_keychain"}, nil, deps)
+	if err != nil {
+		t.Fatalf("buildVaultAdapters(default=os_keychain): %v", err)
+	}
+	defer func() { _ = kcWired.router.Close() }()
+	kcErr := kcWired.router.WithSecret(ctx, unscopedRef, func(*secret.SecretBox) error { return nil })
+	if errors.Is(kcErr, ports.ErrVaultLocked) {
+		t.Fatalf("default_store=os_keychain 时不应静默忽略并路由到 offline（ErrVaultLocked）: %v", kcErr)
+	}
+
+	// 3. vault.stores 为空且 default_store 为未知名称：严格失败关闭。
+	if _, err := buildVaultAdapters(&store.VaultConfigDTO{DefaultStore: "nonexistent_store"}, nil, deps); err == nil {
+		t.Fatal("未知 vault.default_store 必须失败关闭")
 	}
 }

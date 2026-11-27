@@ -130,9 +130,13 @@ func (st ControlMasterStatus) EffectivePersist() option.ControlPersistSpec {
 func (st ControlMasterStatus) Active() bool { return st.IsValid() && st.active }
 func (st ControlMasterStatus) Err() error   { return st.err }
 
+type muxActivityReq struct {
+	delta int
+	ack   chan struct{}
+}
 type muxResource interface {
 	pool.ManagedResource
-	touch(ctx context.Context)
+	touchDelta(ctx context.Context, delta int)
 }
 
 // managedMuxMaster 实现 muxResource、snapshotResource[ControlMasterStatus] 与 pool.ComparableManagedResource：
@@ -148,7 +152,7 @@ type managedMuxMaster struct {
 	effectivePersist                        option.ControlPersistSpec
 	conn                                    ports.TransportConn
 	workNursery, reaperNursery              *conc.Nursery
-	activityCh                              chan chan struct{}
+	activityCh                              chan muxActivityReq
 	doneCh, relReady                        chan struct{}
 	closed                                  atomic.Bool
 	connCloseOnce, workCloseOnce, closeOnce sync.Once
@@ -170,7 +174,7 @@ func (s *Service) startManagedMuxMaster(leaseCtx, revokeCtx context.Context, con
 		_ = workN.Close()
 		return nil, err
 	}
-	mm := &managedMuxMaster{valid: true, socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, conn: conn, workNursery: workN, reaperNursery: reaperN, activityCh: make(chan chan struct{}, 1), doneCh: make(chan struct{}), relReady: make(chan struct{})}
+	mm := &managedMuxMaster{valid: true, socketPath: sockPath, effectiveMaster: effMaster, effectivePersist: effPersist, conn: conn, workNursery: workN, reaperNursery: reaperN, activityCh: make(chan muxActivityReq, 1), doneCh: make(chan struct{}), relReady: make(chan struct{})}
 	readyCh, startErrCh := make(chan struct{}), make(chan error, 1)
 	if err := mm.launchMuxWorkers(s.cfg.MuxSocket, s.cfg.Forwarder, s.cfg.Clock, readyCh, startErrCh); err != nil {
 		_ = mm.Close()
@@ -224,16 +228,25 @@ func (m *managedMuxMaster) launchMuxWorkers(muxPort ports.MuxSocketPort, forward
 func (m *managedMuxMaster) runPersistTimer(ctx context.Context, clk ports.Clock, idle time.Duration) error {
 	tm := clk.NewTimer(idle)
 	defer tm.Stop()
+	activeClients := 0
 	for {
+		var fireCh <-chan time.Time
+		if activeClients == 0 {
+			fireCh = tm.C()
+		}
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-m.doneCh:
 			return nil
-		case ack := <-m.activityCh:
-			tm.Reset(idle)
-			close(ack)
-		case <-tm.C():
+		case req := <-m.activityCh:
+			if activeClients = max(0, activeClients+req.delta); activeClients > 0 {
+				tm.Stop()
+			} else {
+				tm.Reset(idle)
+			}
+			close(req.ack)
+		case <-fireCh:
 			m.serveErr.record(ErrMuxPersistExpired)
 			m.workNursery.Cancel(ErrMuxPersistExpired)
 			return nil
@@ -269,13 +282,16 @@ func (m *managedMuxMaster) bindAutoRelease(fn func()) {
 	}
 	m.relMu.Unlock()
 }
-func (m *managedMuxMaster) touch(ctx context.Context) {
-	if _, hasTimeout := m.effectivePersist.Timeout(); m == nil || !m.valid || m.closed.Load() || !hasTimeout {
+func (m *managedMuxMaster) touchDelta(ctx context.Context, delta int) {
+	if m == nil || !m.valid || m.closed.Load() {
+		return
+	}
+	if _, hasTimeout := m.effectivePersist.Timeout(); !hasTimeout {
 		return
 	}
 	ack := make(chan struct{})
 	select {
-	case m.activityCh <- ack:
+	case m.activityCh <- muxActivityReq{delta: delta, ack: ack}:
 	case <-m.doneCh:
 		return
 	case <-ctx.Done():
@@ -437,10 +453,13 @@ func (s *Service) InspectControlMaster(ctx context.Context, handle plan.ManagedH
 	return inspectManagedHandle[plan.KindMux, ControlMasterStatus](ctx, s, handle)
 }
 func (s *Service) TouchControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) error {
+	return s.TouchControlMasterActivity(ctx, handle, 0)
+}
+func (s *Service) TouchControlMasterActivity(ctx context.Context, handle plan.ManagedHandle[plan.KindMux], delta int) error {
 	if err := s.validateActiveHandleOp(ctx, handle.IsValid()); err != nil {
 		return err
 	}
-	return pool.WithManagedHandle[plan.KindMux, muxResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, mm muxResource) error { mm.touch(hCtx); return nil })
+	return pool.WithManagedHandle[plan.KindMux, muxResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, mm muxResource) error { mm.touchDelta(hCtx, delta); return nil })
 }
 func (s *Service) StopControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) error {
 	return releaseManagedHandle[plan.KindMux](ctx, s, handle)

@@ -17,96 +17,15 @@ import (
 
 const defaultShutdownTimeout = 5 * time.Second
 
-// masterLease / forwardLease / daemonBackend 为包内可测试窄缝，
-// 生产路径 100% 直接委托给 *engine.Engine、engine.ControlMasterInfo 与 engine.ForwardInfo。
-type (
-	masterLease interface {
-		SocketPath() string
-		ReusedExisting() bool
-		MasterPID() uint32
-		EffectivePersist() option.ControlPersistSpec
-		Done() <-chan struct{}
-		Wait(ctx context.Context) error
-		Stop(ctx context.Context) error
-	}
-	forwardLease interface {
-		Spec() engine.ForwardSpec
-		BoundAddr() string
-		Done() <-chan struct{}
-		Wait(ctx context.Context) error
-		Stop(ctx context.Context) error
-	}
-	daemonBackend interface {
-		StartMaster(ctx context.Context, rc engine.RemoteCall) (masterLease, error)
-		StartForward(ctx context.Context, rc engine.RemoteCall, spec engine.ForwardSpec) (forwardLease, error)
-	}
-)
-
-type engineBackend struct {
-	client DaemonClient
+type muxStartPlan struct {
+	rc             engine.RemoteCall
+	shutTimeout    time.Duration
+	skipMaster     bool
+	allowFwdOnlyFB bool
 }
 
-func (b engineBackend) StartMaster(ctx context.Context, rc engine.RemoteCall) (masterLease, error) {
-	info, err := b.client.StartControlMaster(ctx, engine.ControlMasterRequest{RemoteCall: rc})
-	if err != nil {
-		return nil, err
-	}
-	return engineMasterLease{client: b.client, info: info}, nil
-}
-
-func (b engineBackend) StartForward(ctx context.Context, rc engine.RemoteCall, spec engine.ForwardSpec) (forwardLease, error) {
-	info, err := b.client.StartForward(ctx, engine.StartForwardRequest{RemoteCall: rc, Spec: spec})
-	if err != nil {
-		return nil, err
-	}
-	return engineForwardLease{client: b.client, info: info}, nil
-}
-
-type engineMasterLease struct {
-	client DaemonClient
-	info   engine.ControlMasterInfo
-}
-
-func (l engineMasterLease) SocketPath() string { return l.info.SocketPath().String() }
-func (l engineMasterLease) ReusedExisting() bool {
-	return l.info.ReusedExisting()
-}
-func (l engineMasterLease) MasterPID() uint32 { return l.info.MasterPID() }
-func (l engineMasterLease) EffectivePersist() option.ControlPersistSpec {
-	return l.info.EffectivePersist()
-}
-func (l engineMasterLease) Done() <-chan struct{}          { return l.info.Done() }
-func (l engineMasterLease) Wait(ctx context.Context) error { return l.info.Wait(ctx) }
-func (l engineMasterLease) Stop(ctx context.Context) error {
-	if l.info.ReusedExisting() {
-		return nil
-	}
-	h, ok := l.info.Handle().Get()
-	if !ok || !h.IsValid() {
-		return nil
-	}
-	return l.client.StopControlMaster(ctx, h)
-}
-
-type engineForwardLease struct {
-	client DaemonClient
-	info   engine.ForwardInfo
-}
-
-func (l engineForwardLease) Spec() engine.ForwardSpec       { return l.info.Spec() }
-func (l engineForwardLease) BoundAddr() string              { return l.info.BoundAddr() }
-func (l engineForwardLease) Done() <-chan struct{}          { return l.info.Done() }
-func (l engineForwardLease) Wait(ctx context.Context) error { return l.info.Wait(ctx) }
-func (l engineForwardLease) Stop(ctx context.Context) error {
-	h := l.info.Handle()
-	if !h.IsValid() {
-		return nil
-	}
-	return l.client.StopForward(ctx, h)
-}
-
-// Run 启动并监督 ControlMaster/ControlPersist 守护进程及其附带转发的完整生命周期：
-//  1. 严格校验 ctx 与 Config 并补齐缺失的 ControlMaster/ControlPath 选项；
+// Run 启动并监督 ControlMaster/ControlPersist 守护进程（或 `ssh -f -N -L` 纯后台转发）的完整生命周期：
+//  1. 严格校验 ctx 与 Config，按显式标志与转发列表判定是否启动 ControlMaster 或退化为纯转发托管；
 //  2. 启动 ControlMaster 与全部初始转发（部分失败时立即逆序回滚，绝不泄漏资源）；
 //  3. 通告就绪状态并在 core/conc.Nursery 监督下响应式等待 ctx 取消、主控退出（含有限 ControlPersist 空闲回收）或转发异常；
 //  4. 按「已启动转发（逆序）-> 自建 ControlMaster」执行有限超时确定性清理并聚合全部清理错误。
@@ -130,12 +49,12 @@ func runWithBackend(ctx context.Context, cfg Config, backend daemonBackend) (ret
 	if backend == nil {
 		return fmt.Errorf("%w: backend 不能为 nil", ErrInvalidConfig)
 	}
-	rc, shutTimeout, err := prepareRemoteCall(cfg)
+	plan, err := prepareStartPlan(cfg)
 	if err != nil {
 		return err
 	}
 
-	master, err := backend.StartMaster(ctx, rc)
+	master, err := startOptionalMaster(ctx, backend, plan)
 	if err != nil {
 		return err
 	}
@@ -144,11 +63,11 @@ func runWithBackend(ctx context.Context, cfg Config, backend daemonBackend) (ret
 		masterSelfExited bool
 	)
 	defer func() {
-		cleanErr := cleanupResources(ctx, shutTimeout, forwards, master, masterSelfExited)
+		cleanErr := cleanupResources(ctx, plan.shutTimeout, forwards, master, masterSelfExited)
 		retErr = errors.Join(retErr, cleanErr)
 	}()
 
-	forwards, err = startForwards(ctx, backend, rc, cfg.Forwards)
+	forwards, err = startForwards(ctx, backend, plan.rc, cfg.Forwards)
 	if err != nil {
 		return err
 	}
@@ -164,37 +83,63 @@ func runWithBackend(ctx context.Context, cfg Config, backend daemonBackend) (ret
 	return waitErr
 }
 
-func prepareRemoteCall(cfg Config) (engine.RemoteCall, time.Duration, error) {
+func startOptionalMaster(ctx context.Context, backend daemonBackend, plan muxStartPlan) (masterLease, error) {
+	if plan.skipMaster {
+		return nil, nil
+	}
+	master, err := backend.StartMaster(ctx, plan.rc)
+	if err != nil {
+		if plan.allowFwdOnlyFB && errors.Is(err, engine.ErrControlMasterDisabled) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return master, nil
+}
+
+func prepareStartPlan(cfg Config) (muxStartPlan, error) {
 	targetSpec := strings.TrimSpace(cfg.TargetSpec)
 	if targetSpec == "" && !cfg.Target.IsValid() {
-		return engine.RemoteCall{}, 0, fmt.Errorf("%w: TargetSpec 与 Target 至少需指定一项", ErrInvalidConfig)
+		return muxStartPlan{}, fmt.Errorf("%w: TargetSpec 与 Target 至少需指定一项", ErrInvalidConfig)
 	}
 	for i, spec := range cfg.Forwards {
 		if !spec.IsValid() {
-			return engine.RemoteCall{}, 0, fmt.Errorf("%w: Forwards[%d] 无效", ErrInvalidConfig, i)
+			return muxStartPlan{}, fmt.Errorf("%w: Forwards[%d] 无效", ErrInvalidConfig, i)
 		}
 	}
 	shutTimeout := defaultShutdownTimeout
 	if d, ok := cfg.ShutdownTimeout.Get(); ok {
 		if !d.IsPositive() {
-			return engine.RemoteCall{}, 0, fmt.Errorf("%w: ShutdownTimeout 必须为正时长", ErrInvalidConfig)
+			return muxStartPlan{}, fmt.Errorf("%w: ShutdownTimeout 必须为正时长", ErrInvalidConfig)
 		}
 		shutTimeout = d.Std()
 	}
-	opts, err := buildEffectiveCLIOptions(cfg)
+	origCtrl := cfg.CLIOptions.Control()
+	explicitMaster := origCtrl.Master()
+	explicitPath := origCtrl.Path()
+	explicitMuxRequested := cfg.SocketPath.IsSome() || (explicitMaster.IsSet() && explicitMaster != option.ControlMasterNo)
+	explicitMuxDisabled := explicitMaster == option.ControlMasterNo || explicitPath.IsDisabled()
+	hasForwards := len(cfg.Forwards) > 0
+
+	opts, err := buildEffectiveCLIOptions(cfg, hasForwards, explicitMuxDisabled)
 	if err != nil {
-		return engine.RemoteCall{}, 0, err
+		return muxStartPlan{}, err
 	}
-	return engine.RemoteCall{
-		TargetInput: engine.TargetInput{
-			Target:     cfg.Target,
-			TargetSpec: targetSpec,
-			CLIOptions: opts,
+	return muxStartPlan{
+		rc: engine.RemoteCall{
+			TargetInput: engine.TargetInput{
+				Target:     cfg.Target,
+				TargetSpec: targetSpec,
+				CLIOptions: opts,
+			},
 		},
-	}, shutTimeout, nil
+		shutTimeout:    shutTimeout,
+		skipMaster:     hasForwards && explicitMuxDisabled,
+		allowFwdOnlyFB: hasForwards && !explicitMuxRequested,
+	}, nil
 }
 
-func buildEffectiveCLIOptions(cfg Config) (option.OptionLayer, error) {
+func buildEffectiveCLIOptions(cfg Config, hasForwards, explicitMuxDisabled bool) (option.OptionLayer, error) {
 	opts := cfg.CLIOptions
 	cp := opts.Control()
 	if sock, ok := cfg.SocketPath.Get(); ok {
@@ -209,7 +154,7 @@ func buildEffectiveCLIOptions(cfg Config) (option.OptionLayer, error) {
 			cp = cp.WithPath(parsedPath)
 		}
 	}
-	if !cp.Master().IsSet() {
+	if !cp.Master().IsSet() && !explicitMuxDisabled && (!hasForwards || cp.Path().IsEnabled()) {
 		cp = cp.WithMaster(option.ControlMasterYes)
 	}
 	opts = opts.WithControlPolicy(cp)
@@ -258,8 +203,8 @@ func (s *exitState) snapshot() (bool, error) {
 }
 
 func waitForTermination(ctx context.Context, master masterLease, forwards []forwardLease) (bool, error) {
-	// 复用外部既有 ControlMaster 且没有受管转发时，无需常驻阻塞。
-	if master.ReusedExisting() && len(forwards) == 0 {
+	// 复用外部既有 ControlMaster 且没有受管转发，或既无主控也无转发时，无需常驻阻塞。
+	if (master == nil || master.ReusedExisting()) && len(forwards) == 0 {
 		return false, nil
 	}
 	var st exitState
@@ -275,6 +220,9 @@ func waitForTermination(ctx context.Context, master masterLease, forwards []forw
 	if scopeErr != nil && ctx.Err() == nil {
 		st.record(false, scopeErr)
 	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		st.record(false, ctx.Err())
+	}
 	return st.snapshot()
 }
 
@@ -286,7 +234,7 @@ func spawnSessionWatchers(
 	forwards []forwardLease,
 	st *exitState,
 ) error {
-	if !master.ReusedExisting() {
+	if master != nil && !master.ReusedExisting() {
 		if err := spawnMasterWatcher(n, watchCtx, master, func(err error) {
 			st.record(true, err)
 			cancelWatch()
@@ -343,19 +291,20 @@ func cleanupResources(ctx context.Context, timeout time.Duration, forwards []for
 
 	var errs []error
 	// 严格逆序关闭：先停止所有已启动的转发，再停止自建 ControlMaster（若 ReusedExisting 则永不停止外部主控）。
+	// 并在 Stop 返回句柄失效错误后二次核验 Done() 通道，消除并发自退出与 SIGINT 间的 TOCTOU 竞态。
 	for i := len(forwards) - 1; i >= 0; i-- {
 		fwd := forwards[i]
 		if fwd == nil {
 			continue
 		}
 		fwdDone := isChanClosed(fwd.Done())
-		if err := fwd.Stop(shutCtx); err != nil && !isIgnorableSelfExitStopErr(fwdDone, err) {
+		if err := fwd.Stop(shutCtx); err != nil && !isIgnorableSelfExitStopErr(fwdDone || isChanClosed(fwd.Done()), err) {
 			errs = append(errs, fmt.Errorf("stop forward %s failed: %w", fwd.BoundAddr(), err))
 		}
 	}
 	if master != nil && !master.ReusedExisting() {
 		alreadyDone := masterSelfExited || isChanClosed(master.Done())
-		if err := master.Stop(shutCtx); err != nil && !isIgnorableSelfExitStopErr(alreadyDone, err) {
+		if err := master.Stop(shutCtx); err != nil && !isIgnorableSelfExitStopErr(alreadyDone || isChanClosed(master.Done()), err) {
 			errs = append(errs, fmt.Errorf("stop control master %s failed: %w", master.SocketPath(), err))
 		}
 	}
@@ -389,26 +338,33 @@ func buildReadyInfo(targetSpec string, master masterLease, forwards []forwardLea
 			BoundAddr: f.BoundAddr(),
 		})
 	}
-	return ReadyInfo{
-		TargetSpec:       strings.TrimSpace(targetSpec),
-		SocketPath:       master.SocketPath(),
-		ReusedExisting:   master.ReusedExisting(),
-		MasterPID:        master.MasterPID(),
-		EffectivePersist: master.EffectivePersist(),
-		Forwards:         slices.Clone(outFwds),
+	info := ReadyInfo{
+		TargetSpec: strings.TrimSpace(targetSpec),
+		Forwards:   slices.Clone(outFwds),
 	}
+	if master != nil {
+		info.SocketPath = master.SocketPath()
+		info.ReusedExisting = master.ReusedExisting()
+		info.MasterPID = master.MasterPID()
+		info.EffectivePersist = master.EffectivePersist()
+	}
+	return info
 }
 
 func writeReadyBanner(stdout io.Writer, info ReadyInfo) {
 	if stdout == nil {
 		return
 	}
-	mode := "master"
-	if info.ReusedExisting {
-		mode = "reused"
+	if info.SocketPath == "" {
+		_, _ = fmt.Fprintf(stdout, "mux daemon ready (forwards): count=%d\n", len(info.Forwards))
+	} else {
+		mode := "master"
+		if info.ReusedExisting {
+			mode = "reused"
+		}
+		_, _ = fmt.Fprintf(stdout, "mux daemon ready (%s): socket=%s pid=%d persist=%s\n",
+			mode, info.SocketPath, info.MasterPID, info.EffectivePersist.String())
 	}
-	_, _ = fmt.Fprintf(stdout, "mux daemon ready (%s): socket=%s pid=%d persist=%s\n",
-		mode, info.SocketPath, info.MasterPID, info.EffectivePersist.String())
 	for _, f := range info.Forwards {
 		_, _ = fmt.Fprintf(stdout, "  forward %s -> %s\n", f.Spec.Direction(), f.BoundAddr)
 	}
