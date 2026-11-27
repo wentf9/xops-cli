@@ -2,17 +2,18 @@ package cmdasset
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type nodeUpsertFlags struct {
@@ -39,7 +40,7 @@ func runNodeUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args 
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -93,7 +94,7 @@ func parseNodeToken(cur *clikit.FlagCursor, f *nodeUpsertFlags) error {
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: node 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	if name == "gc-old-secrets" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
@@ -136,7 +137,7 @@ func applyNodeFlagValue(name, val, rawTok string, f *nodeUpsertFlags) error {
 	case "expected-revision":
 		f.expRevRaw = val
 	default:
-		return fmt.Errorf("%w: node 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }
@@ -144,15 +145,15 @@ func applyNodeFlagValue(name, val, rawTok string, f *nodeUpsertFlags) error {
 func buildNodeMutationReq(f nodeUpsertFlags) (engine.NodeMutationRequest, error) {
 	id, err := inventory.ParseNodeID(f.idRaw)
 	if err != nil {
-		return engine.NodeMutationRequest{}, fmt.Errorf("%w: --id 非法: %w", clikit.ErrUsage, err)
+		return engine.NodeMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--id"), i18n.BoundStr("value", f.idRaw))
 	}
 	hostID, err := inventory.ParseHostID(f.hostRaw)
 	if err != nil {
-		return engine.NodeMutationRequest{}, fmt.Errorf("%w: --host 非法: %w", clikit.ErrUsage, err)
+		return engine.NodeMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--host"), i18n.BoundStr("value", f.hostRaw))
 	}
 	identID, err := inventory.ParseIdentityID(f.identRaw)
 	if err != nil {
-		return engine.NodeMutationRequest{}, fmt.Errorf("%w: --identity 非法: %w", clikit.ErrUsage, err)
+		return engine.NodeMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--identity"), i18n.BoundStr("value", f.identRaw))
 	}
 	proxy, err := buildNodeProxyRoute(f.jumpRaw, f.proxyCmdRaw)
 	if err != nil {
@@ -166,7 +167,7 @@ func buildNodeMutationReq(f nodeUpsertFlags) (engine.NodeMutationRequest, error)
 	if strings.TrimSpace(f.privRefRaw) != "" {
 		ref, err := secret.ParseRef(f.privRefRaw)
 		if err != nil {
-			return engine.NodeMutationRequest{}, fmt.Errorf("%w: --priv-password-ref 非法: %w", clikit.ErrUsage, err)
+			return engine.NodeMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--priv-password-ref"), i18n.BoundStr("value", f.privRefRaw))
 		}
 		privOpt = algebraic.Some(ref)
 	}
@@ -180,7 +181,7 @@ func buildNodeMutationReq(f nodeUpsertFlags) (engine.NodeMutationRequest, error)
 		Origin: inventory.NewOriginManaged(), Description: f.desc,
 	})
 	if err != nil {
-		return engine.NodeMutationRequest{}, fmt.Errorf("%w: %w", clikit.ErrUsage, err)
+		return engine.NodeMutationRequest{}, domi18n.WrapSentinel(clikit.ErrUsage, err)
 	}
 	return engine.NodeMutationRequest{Node: node, ExpectedRevision: expRev, GCUnreferencedOldSecrets: f.gcOld}, nil
 }
@@ -188,19 +189,19 @@ func buildNodeMutationReq(f nodeUpsertFlags) (engine.NodeMutationRequest, error)
 func buildNodeProxyRoute(jumpRaw, proxyCmdRaw string) (option.ProxyRoute, error) {
 	hasJump, hasCmd := strings.TrimSpace(jumpRaw) != "", strings.TrimSpace(proxyCmdRaw) != ""
 	if hasJump && hasCmd {
-		return nil, fmt.Errorf("%w: --jump 与 --proxy-command 不能同时指定", clikit.ErrUsage)
+		return nil, i18n.EF(clikit.ErrUsage, i18n.KeyCLIMutuallyExclusiveFlags, i18n.Str("flag_a", "--jump"), i18n.Str("flag_b", "--proxy-command"))
 	}
 	if hasJump {
 		p, err := option.ParseOptionKV("ProxyJump", jumpRaw)
 		if err != nil {
-			return nil, fmt.Errorf("%w: --jump 非法: %w", clikit.ErrUsage, err)
+			return nil, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--jump"), i18n.BoundStr("value", jumpRaw))
 		}
 		return p.Layer().Proxy(), nil
 	}
 	if hasCmd {
 		p, err := option.ParseOptionKV("ProxyCommand", proxyCmdRaw)
 		if err != nil {
-			return nil, fmt.Errorf("%w: --proxy-command 非法: %w", clikit.ErrUsage, err)
+			return nil, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--proxy-command"), i18n.BoundStr("value", proxyCmdRaw))
 		}
 		return p.Layer().Proxy(), nil
 	}
@@ -212,7 +213,7 @@ func buildOptionalNodeProfile(dialectRaw, interpRaw, loginRaw string) (algebraic
 	if strings.TrimSpace(dialectRaw) != "" {
 		d, err := execution.ParseLaunchDialect(dialectRaw)
 		if err != nil {
-			return algebraic.None[execution.LaunchProfile](), fmt.Errorf("%w: --dialect 非法: %w", clikit.ErrUsage, err)
+			return algebraic.None[execution.LaunchProfile](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--dialect"), i18n.BoundStr("value", dialectRaw))
 		}
 		dOpt = algebraic.Some(d)
 	}
@@ -221,7 +222,7 @@ func buildOptionalNodeProfile(dialectRaw, interpRaw, loginRaw string) (algebraic
 		var err error
 		interp, err = execution.ParseInterpreter(interpRaw)
 		if err != nil {
-			return algebraic.None[execution.LaunchProfile](), fmt.Errorf("%w: --interpreter 非法: %w", clikit.ErrUsage, err)
+			return algebraic.None[execution.LaunchProfile](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--interpreter"), i18n.BoundStr("value", interpRaw))
 		}
 	}
 	var login execution.LoginMode
@@ -229,7 +230,7 @@ func buildOptionalNodeProfile(dialectRaw, interpRaw, loginRaw string) (algebraic
 		var err error
 		login, err = execution.ParseLoginMode(loginRaw)
 		if err != nil {
-			return algebraic.None[execution.LaunchProfile](), fmt.Errorf("%w: --login 非法: %w", clikit.ErrUsage, err)
+			return algebraic.None[execution.LaunchProfile](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--login"), i18n.BoundStr("value", loginRaw))
 		}
 	}
 	return clikit.BuildOptionalLaunchProfile(dOpt, interp, login)
@@ -244,17 +245,17 @@ type assetDeleteFlags struct {
 }
 
 func runAssetDelete(ctx context.Context, rt *clikit.Runtime, kind string, args []string) int {
-	f, err := parseAssetDeleteFlags(kind, args)
+	f, err := parseAssetDeleteFlags(args)
 	if err != nil {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
 	if len(f.pos) != 1 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: delete-%s 需要恰好 1 个资产 ID", clikit.ErrUsage, kind))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "delete-"+kind), i18n.Int("count", 1), i18n.Str("usage", "<id>")))
 	}
 	expRev, err := parseOptionalRevision(f.expRevRaw)
 	if err != nil {
@@ -278,11 +279,11 @@ func runAssetDelete(ctx context.Context, rt *clikit.Runtime, kind string, args [
 	})
 }
 
-func parseAssetDeleteFlags(kind string, args []string) (assetDeleteFlags, error) {
+func parseAssetDeleteFlags(args []string) (assetDeleteFlags, error) {
 	var f assetDeleteFlags
 	cur := clikit.NewFlagCursor(args)
 	for cur.HasNext() {
-		if err := parseAssetDeleteToken(cur, kind, &f); err != nil {
+		if err := parseAssetDeleteToken(cur, &f); err != nil {
 			return f, err
 		}
 		if f.common.ShowHelp {
@@ -292,7 +293,7 @@ func parseAssetDeleteFlags(kind string, args []string) (assetDeleteFlags, error)
 	return f, nil
 }
 
-func parseAssetDeleteToken(cur *clikit.FlagCursor, kind string, f *assetDeleteFlags) error {
+func parseAssetDeleteToken(cur *clikit.FlagCursor, f *assetDeleteFlags) error {
 	if consumed, err := clikit.TryConsumeCommonLongFlag(cur, &f.common); err != nil || consumed {
 		return err
 	}
@@ -302,16 +303,16 @@ func parseAssetDeleteToken(cur *clikit.FlagCursor, kind string, f *assetDeleteFl
 		return nil
 	}
 	if strings.HasPrefix(tok, "--") {
-		return applyAssetDeleteLongFlag(cur, kind, tok, f)
+		return applyAssetDeleteLongFlag(cur, tok, f)
 	}
 	if strings.HasPrefix(tok, "-") && tok != "-" {
-		return fmt.Errorf("%w: delete-%s 未知选项 %q", clikit.ErrUsage, kind, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	f.pos = append(f.pos, tok)
 	return nil
 }
 
-func applyAssetDeleteLongFlag(cur *clikit.FlagCursor, kind, tok string, f *assetDeleteFlags) error {
+func applyAssetDeleteLongFlag(cur *clikit.FlagCursor, tok string, f *assetDeleteFlags) error {
 	name, inlineVal, hasEq := clikit.SplitLongFlag(tok)
 	switch name {
 	case "expected-revision":
@@ -327,7 +328,7 @@ func applyAssetDeleteLongFlag(cur *clikit.FlagCursor, kind, tok string, f *asset
 		f.reqUnref = v
 		return err
 	default:
-		return fmt.Errorf("%w: delete-%s 未知选项 %q", clikit.ErrUsage, kind, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 }
 

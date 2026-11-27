@@ -9,12 +9,13 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // RunHosts 执行 `xops hosts`（别名 `host` / `inventory`）全量资产查询、目标解析、DAG 校验与 CAS CRUD 命令。
 func RunHosts(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	sub := args[0]
@@ -43,7 +44,7 @@ func RunHosts(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	case "delete-node":
 		return runAssetDelete(ctx, rt, "node", rest)
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(rest)), fmt.Errorf("%w: 未知 hosts 子命令 %q", clikit.ErrUsage, sub))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(rest)), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "hosts"), i18n.BoundStr("sub", sub)))
 	}
 }
 
@@ -59,7 +60,7 @@ func runHostsList(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -98,7 +99,7 @@ func parseHostsListToken(cur *clikit.FlagCursor, f *hostsListFlags) error {
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: hosts list 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 	if err != nil {
@@ -110,7 +111,7 @@ func parseHostsListToken(cur *clikit.FlagCursor, f *hostsListFlags) error {
 	case "tag":
 		f.filterTag = strings.TrimSpace(val)
 	default:
-		return fmt.Errorf("%w: hosts list 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	return nil
 }
@@ -126,7 +127,7 @@ func executeHostsList(ctx context.Context, rt *clikit.Runtime, client clikit.Inv
 	case "all":
 		return renderAllAssetsList(ctx, rt, client, jsonOut)
 	default:
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: --kind 必须为 nodes|hosts|identities|all，实际=%q", clikit.ErrUsage, kind))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIInvalidFlagValueEnum, i18n.Str("flag", "--kind"), i18n.Str("allowed", "nodes|hosts|identities|all"), i18n.BoundStr("value", kind)))
 	}
 }
 
@@ -195,8 +196,15 @@ func renderAllAssetsList(ctx context.Context, rt *clikit.Runtime, client clikit.
 		Identities []inventory.Identity `json:"identities"`
 		Nodes      []inventory.Node     `json:"nodes"`
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, view{OK: true, Revision: snap.Revision(), Hosts: g.Hosts(), Identities: g.Identities(), Nodes: g.Nodes()}, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "revision=%s hosts=%d identities=%d nodes=%d\n", snap.Revision(), len(g.Hosts()), len(g.Identities()), len(g.Nodes()))
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLIHostsAllSummary,
+			i18n.BoundStr("revision", snap.Revision().String()),
+			i18n.Int("hosts", len(g.Hosts())),
+			i18n.Int("identities", len(g.Identities())),
+			i18n.Int("nodes", len(g.Nodes())),
+		))
 	})
 }
 
@@ -228,12 +236,12 @@ func runHostsGet(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
 	if len(f.pos) != 1 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: hosts get 需要恰好 1 个资产 ID", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "hosts get"), i18n.Int("count", 1), i18n.Str("usage", "<id>")))
 	}
 	initOpts := rt.EffectiveInitOptions(f.common.ConfigFile, f.common.Policy)
 	return rt.WithEngine(ctx, initOpts, clikit.ExitGeneral, jsonOut, func(runner clikit.SessionRunner) int {
@@ -271,7 +279,7 @@ func parseHostsGetToken(cur *clikit.FlagCursor, f *hostsGetFlags) error {
 	if strings.HasPrefix(tok, "-") && tok != "-" {
 		name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 		if !isLong || name != "kind" {
-			return fmt.Errorf("%w: hosts get 未知参数 %q", clikit.ErrUsage, tok)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 		}
 		val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 		if err != nil {
@@ -293,14 +301,14 @@ func executeHostsGet(ctx context.Context, rt *clikit.Runtime, client clikit.Inve
 	case "identity":
 		return renderGetIdentity(ctx, rt, client, rawID, jsonOut)
 	default:
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: --kind 必须为 node|host|identity，实际=%q", clikit.ErrUsage, kind))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIInvalidFlagValueEnum, i18n.Str("flag", "--kind"), i18n.Str("allowed", "node|host|identity"), i18n.BoundStr("value", kind)))
 	}
 }
 
 func renderGetNode(ctx context.Context, rt *clikit.Runtime, client clikit.InventoryClient, rawID string, jsonOut bool) int {
 	id, err := inventory.ParseNodeID(rawID)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: NodeID 非法: %w", clikit.ErrUsage, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "NodeID"), i18n.BoundStr("value", rawID)))
 	}
 	item, rev, err := client.GetNode(ctx, id, engine.InventoryQueryRequest{})
 	if err != nil {
@@ -319,7 +327,7 @@ func renderGetNode(ctx context.Context, rt *clikit.Runtime, client clikit.Invent
 func renderGetHost(ctx context.Context, rt *clikit.Runtime, client clikit.InventoryClient, rawID string, jsonOut bool) int {
 	id, err := inventory.ParseHostID(rawID)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: HostID 非法: %w", clikit.ErrUsage, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "HostID"), i18n.BoundStr("value", rawID)))
 	}
 	item, rev, err := client.GetHost(ctx, id, engine.InventoryQueryRequest{})
 	if err != nil {
@@ -338,7 +346,7 @@ func renderGetHost(ctx context.Context, rt *clikit.Runtime, client clikit.Invent
 func renderGetIdentity(ctx context.Context, rt *clikit.Runtime, client clikit.InventoryClient, rawID string, jsonOut bool) int {
 	id, err := inventory.ParseIdentityID(rawID)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: IdentityID 非法: %w", clikit.ErrUsage, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "IdentityID"), i18n.BoundStr("value", rawID)))
 	}
 	item, rev, err := client.GetIdentity(ctx, id, engine.InventoryQueryRequest{})
 	if err != nil {

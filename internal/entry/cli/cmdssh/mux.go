@@ -11,6 +11,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type muxArgs struct {
@@ -36,7 +37,7 @@ type muxResponseView struct {
 // RunMux 执行 `xops mux` 子命令族：start / check(status) / forward / cancel / exit / stop / proxy / daemon。
 func RunMux(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, MuxHelpText())
+		_, _ = io.WriteString(rt.Stdout, MuxHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	parsed, err := parseMuxArgs(args)
@@ -44,7 +45,7 @@ func RunMux(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, MuxHelpText())
+		_, _ = io.WriteString(rt.Stdout, MuxHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
@@ -63,7 +64,7 @@ func RunMux(ctx context.Context, rt *clikit.Runtime, args []string) int {
 
 func runMuxDaemon(ctx context.Context, rt *clikit.Runtime, parsed muxArgs, jsonOut bool) int {
 	if rt.Hooks.RunMuxDaemon == nil {
-		return rt.Fail(clikit.ExitGeneral, jsonOut, fmt.Errorf("%w: 未注入 RunMuxDaemon 回调，无法启动 ControlPersist 守护进程", clikit.ErrNotConfigured))
+		return rt.Fail(clikit.ExitGeneral, jsonOut, i18n.EF(clikit.ErrNotConfigured, i18n.KeyCLIHookNotConfigured, i18n.Str("hook", "RunMuxDaemon")))
 	}
 	sockOpt, err := parseOptionalControlSocket(parsed.socketPath)
 	if err != nil {
@@ -71,6 +72,7 @@ func runMuxDaemon(ctx context.Context, rt *clikit.Runtime, parsed muxArgs, jsonO
 	}
 	req := clikit.MuxDaemonStartRequest{
 		InitOptions: rt.EffectiveInitOptions(parsed.common.ConfigFile, parsed.common.Policy),
+		Locale:      rt.EffectiveLocale(),
 		TargetSpec:  parsed.target,
 		CLIOptions:  parsed.cliOpts,
 		Forwards:    parsed.forwards,
@@ -108,7 +110,7 @@ func dispatchMuxAction(ctx context.Context, rt *clikit.Runtime, client clikit.SS
 	}
 	if act == engine.MuxActionForward || act == engine.MuxActionCancel {
 		if len(parsed.forwards) != 1 {
-			return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: mux %s 需要恰好一条转发规则（-L/-R/-D/-w）", clikit.ErrUsage, parsed.sub))
+			return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIMuxRequiresSingleForward, i18n.BoundStr("action", parsed.sub)))
 		}
 		req.Forward = algebraic.Some(parsed.forwards[0])
 	}
@@ -157,10 +159,11 @@ func muxSubcommandToAction(sub string) (engine.MuxControlAction, error) {
 	case "proxy":
 		return engine.MuxActionProxy, nil
 	default:
-		return engine.MuxActionInvalid, fmt.Errorf("%w: 未知 mux 子命令 %q", clikit.ErrUsage, sub)
+		return engine.MuxActionInvalid, i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "mux"), i18n.BoundStr("sub", sub))
 	}
 }
 
+// renderMuxResponse 渲染 ControlMaster 控制回执；文本模式保留 OpenSSH `-O` 兼容英文机器输出契约。
 func renderMuxResponse(rt *clikit.Runtime, jsonOut bool, action engine.MuxControlAction, resp engine.MuxControlResponse) int {
 	ok := action != engine.MuxActionCheck || resp.Alive()
 	code := clikit.ExitOK
@@ -249,12 +252,12 @@ func parseMuxFlag(cur *clikit.FlagCursor, out *muxArgs) error {
 			}
 			m, err := engine.ParseTUNMode(raw)
 			if err != nil {
-				return fmt.Errorf("%w: --tun-mode 非法: %w", clikit.ErrUsage, err)
+				return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--tun-mode"), i18n.BoundStr("value", raw))
 			}
 			out.tunMode = m
 			return nil
 		default:
-			return fmt.Errorf("%w: mux 未知长选项 %q", clikit.ErrUsage, tok)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 		}
 	}
 	tok := cur.Next()
@@ -288,7 +291,7 @@ func parseMuxShortCluster(cur *clikit.FlagCursor, cluster string, out *muxArgs) 
 			return applyMuxShortForward(ch, val, out)
 		default:
 			r, _ := utf8.DecodeRuneInString(cluster[i:])
-			return fmt.Errorf("%w: mux 未知短选项 -%c", clikit.ErrUsage, r)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 		}
 	}
 	return nil
@@ -306,7 +309,7 @@ func applyMuxShortForward(ch byte, val string, out *muxArgs) error {
 		out.rawTUNs = append(out.rawTUNs, val)
 		return nil
 	default:
-		return fmt.Errorf("%w: 不支持的转发标志 -%c", clikit.ErrUsage, ch)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.Str("flag", string(ch)))
 	}
 }
 
@@ -314,7 +317,7 @@ func finalizeMuxArgs(pos []string, out muxArgs) (muxArgs, error) {
 	switch out.sub {
 	case "start", "check", "status", "forward", "cancel", "exit", "stop", "proxy", "daemon":
 	default:
-		return muxArgs{}, fmt.Errorf("%w: 未知 mux 子命令 %q", clikit.ErrUsage, out.sub)
+		return muxArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "mux"), i18n.BoundStr("sub", out.sub))
 	}
 	for _, rawTUN := range out.rawTUNs {
 		spec, err := clikit.ParseTUNForwardSpec(out.tunMode, rawTUN)
@@ -324,7 +327,7 @@ func finalizeMuxArgs(pos []string, out muxArgs) (muxArgs, error) {
 		out.forwards = append(out.forwards, spec)
 	}
 	if len(pos) != 1 || strings.TrimSpace(pos[0]) == "" {
-		return muxArgs{}, fmt.Errorf("%w: mux %s 需要恰好 1 个目标主机参数", clikit.ErrUsage, out.sub)
+		return muxArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.BoundStr("cmd", "mux "+out.sub), i18n.Int("count", 1), i18n.Str("usage", "<target>"))
 	}
 	out.target = strings.TrimSpace(pos[0])
 	if (out.sub == "start" || out.sub == "daemon") && !out.cliOpts.Control().Master().IsSet() {
@@ -333,7 +336,7 @@ func finalizeMuxArgs(pos []string, out muxArgs) (muxArgs, error) {
 		}
 	}
 	if err := out.cliOpts.Validate(); err != nil {
-		return muxArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)
+		return muxArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	return out, nil
 }

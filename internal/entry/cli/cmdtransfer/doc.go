@@ -9,15 +9,14 @@
 package cmdtransfer
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func requireTransferClient(runner clikit.SessionRunner) (clikit.TransferClient, error) {
 	c, ok := runner.(clikit.TransferClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 TransferClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "TransferClient"))
 	}
 	return c, nil
 }

@@ -170,7 +170,7 @@ func TestRunSCP_EndpointSemanticsAndRejects(t *testing.T) {
 	}
 	// 盘符相对路径 `C:rel.txt` 不得被误判为远端主机 `C`，而是进入本地源路径校验并由 pathalg 显式拒绝。
 	rtDrive, _, errDrive := newTransferRuntime(&transferStub{}, "/tmp")
-	if code := cmdtransfer.RunSCP(context.Background(), rtDrive, []string{"C:rel.txt", "web:/tmp/x"}); code != clikit.ExitUsage || !strings.Contains(errDrive.String(), "本地源路径") {
+	if code := cmdtransfer.RunSCP(context.Background(), rtDrive, []string{"C:rel.txt", "web:/tmp/x"}); code != clikit.ExitUsage || !strings.Contains(errDrive.String(), "local source path") {
 		t.Fatalf("C:rel.txt 应识别为本地盘符路径并由 pathalg 校验拒绝: code=%d stderr=%q", code, errDrive.String())
 	}
 	if code := cmdtransfer.RunSCP(context.Background(), rt, []string{"--local-root", "/tmp/sand", "./sub/a.txt", "web:/dst"}); code != 0 {

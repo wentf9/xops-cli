@@ -41,32 +41,34 @@ type fakeFullEngine struct {
 	closeFn       func(context.Context) error
 	importFormats []string
 
-	calls           []string
-	lastSSHReq      engine.RunSSHRequest
-	lastExecReq     engine.ExecRequest
-	lastPrivReq     engine.PrivilegeExecRequest
-	lastBatchReq    engine.BatchExecRequest
-	lastPlaybookReq engine.PlaybookRequest
-	lastFwdReqs     []engine.StartForwardRequest
-	lastMasterReq   engine.ControlMasterRequest
-	lastMuxReq      engine.MuxControlRequest
-	lastUploadReq   engine.SCPUploadRequest
-	lastDownloadReq engine.SCPDownloadRequest
-	lastImportReq   engine.ImportRequest
-	lastHostMut     engine.HostMutationRequest
-	lastIdentMut    engine.IdentityMutationRequest
-	lastNodeMut     engine.NodeMutationRequest
-	lastDeleteReq   engine.DeleteAssetRequest
-	lastWriteReq    engine.RemoteFileWriteRequest
-	lastPatchReq    engine.RemoteFilePatchRequest
-	lastEnrollReq   engine.EnrollEncryptedPrivateKeyRequest
-	lastRenameReq   engine.RemoteRenameRequest
-	lastChmodReq    engine.RemotePathOpRequest
-	lastRecoverReq  engine.RecoverTransferRequest
-	lastVaultSaga   engine.InteractiveVaultSagaRequest
-	lastRotateReq   engine.InteractiveRotateSecretRequest
-	vaultSagaFn     func(context.Context, engine.InteractiveVaultSagaRequest) (engine.SagaResult, error)
-	rotateSecretFn  func(context.Context, engine.InteractiveRotateSecretRequest) (engine.SagaResult, error)
+	calls              []string
+	lastSSHReq         engine.RunSSHRequest
+	lastExecReq        engine.ExecRequest
+	lastPrivReq        engine.PrivilegeExecRequest
+	lastBatchReq       engine.BatchExecRequest
+	lastPlaybookReq    engine.PlaybookRequest
+	lastFwdReqs        []engine.StartForwardRequest
+	lastMasterReq      engine.ControlMasterRequest
+	lastMuxReq         engine.MuxControlRequest
+	lastUploadReq      engine.SCPUploadRequest
+	lastDownloadReq    engine.SCPDownloadRequest
+	lastImportReq      engine.ImportRequest
+	lastHostMut        engine.HostMutationRequest
+	lastIdentMut       engine.IdentityMutationRequest
+	lastNodeMut        engine.NodeMutationRequest
+	lastDeleteReq      engine.DeleteAssetRequest
+	lastWriteReq       engine.RemoteFileWriteRequest
+	lastPatchReq       engine.RemoteFilePatchRequest
+	lastEnrollReq      engine.EnrollEncryptedPrivateKeyRequest
+	lastRenameReq      engine.RemoteRenameRequest
+	lastChmodReq       engine.RemotePathOpRequest
+	lastRecoverReq     engine.RecoverTransferRequest
+	lastVaultInitReq   engine.InteractiveVaultOpRequest
+	lastVaultUnlockReq engine.InteractiveVaultOpRequest
+	lastVaultSaga      engine.InteractiveVaultSagaRequest
+	lastRotateReq      engine.InteractiveRotateSecretRequest
+	vaultSagaFn        func(context.Context, engine.InteractiveVaultSagaRequest) (engine.SagaResult, error)
+	rotateSecretFn     func(context.Context, engine.InteractiveRotateSecretRequest) (engine.SagaResult, error)
 }
 
 var (
@@ -511,13 +513,15 @@ func (f *fakeFullEngine) VaultStatus(_ context.Context, _ engine.VaultOpRequest)
 	return mustDecodeJSON[engine.VaultStatus](`{"state":"unlocked","known_stores":["offline"],"detail":"ready"}`), nil
 }
 
-func (f *fakeFullEngine) VaultInitInteractive(_ context.Context, _ engine.InteractiveVaultOpRequest) error {
+func (f *fakeFullEngine) VaultInitInteractive(_ context.Context, req engine.InteractiveVaultOpRequest) error {
 	f.record("VaultInitInteractive")
+	f.lastVaultInitReq = req
 	return nil
 }
 
-func (f *fakeFullEngine) VaultUnlockInteractive(_ context.Context, _ engine.InteractiveVaultOpRequest) error {
+func (f *fakeFullEngine) VaultUnlockInteractive(_ context.Context, req engine.InteractiveVaultOpRequest) error {
 	f.record("VaultUnlockInteractive")
+	f.lastVaultUnlockReq = req
 	return nil
 }
 

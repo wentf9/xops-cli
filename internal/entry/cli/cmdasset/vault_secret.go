@@ -12,24 +12,25 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	common, pos, err := parseVaultPositionalArgs("refs", args)
+	common, pos, err := parseVaultPositionalArgs(args)
 	if err != nil {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
+		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(common.JSON)
 	if len(pos) != 1 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: vault refs 需要恰好 1 个 <store>/<item> 引用", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "vault refs"), i18n.Int("count", 1), i18n.Str("usage", "<store>/<item>")))
 	}
 	ref, err := secret.ParseRef(pos[0])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 凭据引用非法: %w", clikit.ErrUsage, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", pos[0])))
 	}
 	initOpts := rt.EffectiveInitOptions(common.ConfigFile, common.Policy)
 	return rt.WithEngine(ctx, initOpts, clikit.ExitGeneral, jsonOut, func(runner clikit.SessionRunner) int {
@@ -46,8 +47,9 @@ func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 			Ref        secret.Ref                  `json:"ref"`
 			References []inventory.SecretReference `json:"references"`
 		}
+		loc := rt.Loc()
 		return rt.WriteResult(jsonOut, view{OK: true, Ref: ref, References: refs}, func(w io.Writer) {
-			_, _ = fmt.Fprintf(w, "ref=%s references=%d\n", ref, len(refs))
+			_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLIVaultRefsSummary, i18n.BoundStr("ref", ref.String()), i18n.Int("count", len(refs))))
 			for _, r := range refs {
 				_, _ = fmt.Fprintf(w, "  %s owner=%s\n", r.Location, r.OwnerID)
 			}
@@ -56,21 +58,21 @@ func runVaultRefs(ctx context.Context, rt *clikit.Runtime, args []string) int {
 }
 
 func runVaultDelete(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	common, pos, err := parseVaultPositionalArgs("delete", args)
+	common, pos, err := parseVaultPositionalArgs(args)
 	if err != nil {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
+		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(common.JSON)
 	if len(pos) != 1 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: vault delete 需要恰好 1 个 <store>/<item> 引用", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "vault delete"), i18n.Int("count", 1), i18n.Str("usage", "<store>/<item>")))
 	}
 	ref, err := secret.ParseRef(pos[0])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 凭据引用非法: %w", clikit.ErrUsage, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", pos[0])))
 	}
 	initOpts := rt.EffectiveInitOptions(common.ConfigFile, common.Policy)
 	return rt.WithEngine(ctx, initOpts, clikit.ExitGeneral, jsonOut, func(runner clikit.SessionRunner) int {
@@ -85,30 +87,31 @@ func runVaultDelete(ctx context.Context, rt *clikit.Runtime, args []string) int 
 			OK      bool       `json:"ok"`
 			Deleted secret.Ref `json:"deleted"`
 		}
+		loc := rt.Loc()
 		return rt.WriteResult(jsonOut, view{OK: true, Deleted: ref}, func(w io.Writer) {
-			_, _ = fmt.Fprintf(w, "deleted secret %s\n", ref)
+			_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLIVaultDeleted, i18n.BoundStr("ref", ref.String())))
 		})
 	})
 }
 
 func runVaultGC(ctx context.Context, rt *clikit.Runtime, args []string) int {
-	common, pos, err := parseVaultPositionalArgs("gc", args)
+	common, pos, err := parseVaultPositionalArgs(args)
 	if err != nil {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
+		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(common.JSON)
 	if len(pos) == 0 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: vault gc 至少需要 1 个候选 <store>/<item> 引用", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountAtLeast, i18n.Str("cmd", "vault gc"), i18n.Int("count", 1), i18n.Str("usage", "<store>/<item>...")))
 	}
 	candidates := make([]secret.Ref, 0, len(pos))
 	for _, raw := range pos {
 		ref, err := secret.ParseRef(raw)
 		if err != nil {
-			return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 候选引用 %q 非法: %w", clikit.ErrUsage, raw, err))
+			return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", raw)))
 		}
 		candidates = append(candidates, ref)
 	}
@@ -128,8 +131,14 @@ func runVaultGC(ctx context.Context, rt *clikit.Runtime, args []string) int {
 			Retained []engine.RetainedSecret `json:"retained,omitzero"`
 			Missing  []secret.Ref            `json:"missing,omitzero"`
 		}
+		loc := rt.Loc()
 		return rt.WriteResult(jsonOut, view{OK: true, Deleted: res.Deleted, Retained: res.Retained, Missing: res.Missing}, func(w io.Writer) {
-			_, _ = fmt.Fprintf(w, "gc complete: deleted=%d retained=%d missing=%d\n", len(res.Deleted), len(res.Retained), len(res.Missing))
+			_, _ = fmt.Fprintln(w, loc.T(
+				i18n.KeyCLIVaultGCComplete,
+				i18n.Int("deleted", len(res.Deleted)),
+				i18n.Int("retained", len(res.Retained)),
+				i18n.Int("missing", len(res.Missing)),
+			))
 		})
 	})
 }
@@ -154,7 +163,7 @@ func runVaultEnrollKey(ctx context.Context, rt *clikit.Runtime, args []string) i
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
+		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -179,12 +188,18 @@ func runVaultEnrollKey(ctx context.Context, rt *clikit.Runtime, args []string) i
 			PassphraseRef secret.Ref               `json:"passphrase_ref"`
 			Revision      engine.Revision          `json:"revision"`
 		}
+		loc := rt.Loc()
 		return rt.WriteResult(jsonOut, view{
 			OK: true, IdentityID: res.Identity().ID(), Fingerprint: res.Fingerprint(),
 			PassphraseRef: res.PassphraseRef(), Revision: res.Revision(),
 		}, func(w io.Writer) {
-			_, _ = fmt.Fprintf(w, "enrolled identity=%s fingerprint=%s ref=%s revision=%s\n",
-				res.Identity().ID(), res.Fingerprint(), res.PassphraseRef(), res.Revision())
+			_, _ = fmt.Fprintln(w, loc.T(
+				i18n.KeyCLIVaultEnrolled,
+				i18n.BoundStr("identity", res.Identity().ID().String()),
+				i18n.BoundStr("fingerprint", res.Fingerprint().String()),
+				i18n.BoundStr("ref", res.PassphraseRef().String()),
+				i18n.BoundStr("revision", res.Revision().String()),
+			))
 		})
 	})
 }
@@ -214,7 +229,7 @@ func parseEnrollKeyToken(cur *clikit.FlagCursor, f *enrollKeyFlags) error {
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: enroll-key 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	if name == "replace" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
@@ -249,7 +264,7 @@ func applyEnrollKeyFlag(name, val, rawTok string, f *enrollKeyFlags) error {
 	case "expected-revision":
 		f.expRevRaw = val
 	default:
-		return fmt.Errorf("%w: enroll-key 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }
@@ -257,21 +272,21 @@ func applyEnrollKeyFlag(name, val, rawTok string, f *enrollKeyFlags) error {
 func buildEnrollKeyRequest(f enrollKeyFlags) (engine.EnrollEncryptedPrivateKeyRequest, error) {
 	id, err := inventory.ParseIdentityID(f.idRaw)
 	if err != nil {
-		return engine.EnrollEncryptedPrivateKeyRequest{}, fmt.Errorf("%w: --id 非法: %w", clikit.ErrUsage, err)
+		return engine.EnrollEncryptedPrivateKeyRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--id"), i18n.BoundStr("value", f.idRaw))
 	}
 	user, err := option.ParseUsername(f.userRaw)
 	if err != nil {
-		return engine.EnrollEncryptedPrivateKeyRequest{}, fmt.Errorf("%w: --user 非法: %w", clikit.ErrUsage, err)
+		return engine.EnrollEncryptedPrivateKeyRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--user"), i18n.BoundStr("value", f.userRaw))
 	}
 	keySpec, err := inventory.ParseKeyPathSpec(f.keyRaw)
 	if err != nil {
-		return engine.EnrollEncryptedPrivateKeyRequest{}, fmt.Errorf("%w: --key-path 非法: %w", clikit.ErrUsage, err)
+		return engine.EnrollEncryptedPrivateKeyRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--key-path"), i18n.BoundStr("value", f.keyRaw))
 	}
 	var certs []inventory.CertPathSpec
 	for _, raw := range f.certPaths {
 		c, err := inventory.ParseCertPathSpec(raw)
 		if err != nil {
-			return engine.EnrollEncryptedPrivateKeyRequest{}, fmt.Errorf("%w: --cert-path %q 非法: %w", clikit.ErrUsage, raw, err)
+			return engine.EnrollEncryptedPrivateKeyRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--cert-path"), i18n.BoundStr("value", raw))
 		}
 		certs = append(certs, c)
 	}
@@ -279,7 +294,7 @@ func buildEnrollKeyRequest(f enrollKeyFlags) (engine.EnrollEncryptedPrivateKeyRe
 	if strings.TrimSpace(f.fpRaw) != "" {
 		fp, err := inventory.ParseKeyFingerprint(f.fpRaw)
 		if err != nil {
-			return engine.EnrollEncryptedPrivateKeyRequest{}, fmt.Errorf("%w: --fingerprint 非法: %w", clikit.ErrUsage, err)
+			return engine.EnrollEncryptedPrivateKeyRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--fingerprint"), i18n.BoundStr("value", f.fpRaw))
 		}
 		fpOpt = algebraic.Some(fp)
 	}
@@ -287,9 +302,7 @@ func buildEnrollKeyRequest(f enrollKeyFlags) (engine.EnrollEncryptedPrivateKeyRe
 	if err != nil {
 		return engine.EnrollEncryptedPrivateKeyRequest{}, err
 	}
-	prompt, err := engine.NewSecretPromptRequest(engine.SecretPromptRequestSpec{
-		Title: "Private Key Passphrase", Prompt: "Enter private key passphrase", Subject: keySpec.String(),
-	})
+	prompt, err := newVaultSecretPrompt(i18n.KeyInteractVaultEnrollKeyTitle, i18n.KeyInteractVaultEnrollKeyPrompt, keySpec.String())
 	if err != nil {
 		return engine.EnrollEncryptedPrivateKeyRequest{}, err
 	}

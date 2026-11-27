@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type pathalgRemotePath = pathalg.RemotePath
@@ -23,6 +25,8 @@ type EngineInitOptions struct {
 	OpenSSHConfigFile string
 	// PolicyProfile 为 `--policy` 指定的安全策略配置档（零值 PolicyProfileInvalid 表示沿用宿主默认配置档）。
 	PolicyProfile engine.PolicyProfile
+	// Locale 为当前 CLI 生效的界面语言（供组合根同步宿主交互适配器 Localizer；零值表示沿用默认）。
+	Locale domi18n.Locale
 }
 
 // EngineHandle 封装按需创建的运行期引擎及其确定性逆序关闭回调。
@@ -40,6 +44,7 @@ type EngineFactory func(ctx context.Context, opts EngineInitOptions) (EngineHand
 // TUIStartRequest 描述通过回调启动 Bubble Tea v2 终端工作台的强类型参数。
 type TUIStartRequest struct {
 	InitOptions     EngineInitOptions
+	Locale          domi18n.Locale
 	InitialNode     string
 	RefreshInterval algebraic.Option[algebraic.Duration]
 	NoAltScreen     bool
@@ -54,6 +59,7 @@ type TUIRunner func(ctx context.Context, req TUIStartRequest) error
 // SFTPShellStartRequest 描述通过回调启动交互式 SFTP Shell 的强类型参数。
 type SFTPShellStartRequest struct {
 	InitOptions EngineInitOptions
+	Locale      domi18n.Locale
 	TargetSpec  string
 	CLIOptions  option.OptionLayer
 	InitialDir  string
@@ -68,6 +74,7 @@ type SFTPShellRunner func(ctx context.Context, req SFTPShellStartRequest) error
 // MCPStartRequest 描述通过回调启动 MCP 服务器（stdio / Streamable HTTP）的强类型参数。
 type MCPStartRequest struct {
 	InitOptions          EngineInitOptions
+	Locale               domi18n.Locale
 	Transport            string // "stdio" | "http"
 	ListenAddr           string
 	TransferRoot         algebraic.Option[pathalg.LocalDir]
@@ -86,6 +93,7 @@ type MCPRunner func(ctx context.Context, req MCPStartRequest) error
 // MuxDaemonStartRequest 描述通过回调启动 ControlMaster/ControlPersist 后台守护进程的强类型参数。
 type MuxDaemonStartRequest struct {
 	InitOptions EngineInitOptions
+	Locale      domi18n.Locale
 	TargetSpec  string
 	CLIOptions  option.OptionLayer
 	Forwards    []engine.ForwardSpec
@@ -154,7 +162,7 @@ type SubEntryHooks struct {
 	ResolveWorkDir   WorkDirResolver
 }
 
-// Runtime 聚合单次命令分发期间只读的 I/O 流、全局标志、引擎按需工厂与注入钩子。
+// Runtime 聚合单次命令分发期间只读的 I/O 流、全局标志、引擎按需工厂、国际化词库与注入钩子。
 type Runtime struct {
 	Stdin           io.Reader
 	Stdout          io.Writer
@@ -163,9 +171,50 @@ type Runtime struct {
 	ShutdownTimeout time.Duration
 	Hooks           SubEntryHooks
 	Global          CommonFlags
+	Catalog         *i18n.Catalog
+	Localizer       *i18n.Localizer
 }
 
-// EffectiveInitOptions 合并全局与命令级 `-F` / `--policy` 覆盖项，生成最终 EngineInitOptions。
+// EnsureLocalizer 返回可用的不可变 Localizer；当 loc 为 nil 或无效时从内置词库兜底英文（纯内存、零触盘）。
+// 若极端情况下内置词库不可用则返回 nil（*i18n.Localizer 对 nil 接收者严格安全失败关闭）。
+func EnsureLocalizer(loc *i18n.Localizer) *i18n.Localizer {
+	if loc != nil && loc.IsValid() {
+		return loc
+	}
+	if def, err := i18n.DefaultLocalizer(); err == nil && def.IsValid() {
+		return def
+	}
+	return nil
+}
+
+// Loc 返回当前运行期绑定的不可变 Localizer；未显式设置时回退内置英文词库（零触盘、永不返回 nil）。
+func (r *Runtime) Loc() *i18n.Localizer {
+	if r != nil && r.Localizer != nil && r.Localizer.IsValid() {
+		return r.Localizer
+	}
+	if r != nil && r.Catalog != nil && r.Catalog.IsValid() {
+		if loc, ok := r.Global.Locale.Get(); ok && loc.IsValid() {
+			return r.Catalog.For(loc)
+		}
+		return r.Catalog.For(domi18n.LocaleEn)
+	}
+	return EnsureLocalizer(nil)
+}
+
+// EffectiveLocale 返回当前运行期生效的显示语言标识（优先 Localizer，其次 Global.Locale，回退 LocaleEn）。
+func (r *Runtime) EffectiveLocale() domi18n.Locale {
+	if r != nil && r.Localizer != nil && r.Localizer.IsValid() {
+		return r.Localizer.Locale()
+	}
+	if r != nil {
+		if loc, ok := r.Global.Locale.Get(); ok && loc.IsValid() {
+			return loc
+		}
+	}
+	return domi18n.LocaleEn
+}
+
+// EffectiveInitOptions 合并全局与命令级 `-F` / `--policy` 覆盖项及生效语言，生成最终 EngineInitOptions。
 func (r *Runtime) EffectiveInitOptions(localCfg string, localPolicy engine.PolicyProfile) EngineInitOptions {
 	cfg := r.Global.ConfigFile
 	if strings.TrimSpace(localCfg) != "" {
@@ -178,6 +227,7 @@ func (r *Runtime) EffectiveInitOptions(localCfg string, localPolicy engine.Polic
 	return EngineInitOptions{
 		OpenSSHConfigFile: cfg,
 		PolicyProfile:     pol,
+		Locale:            r.EffectiveLocale(),
 	}
 }
 
@@ -202,11 +252,12 @@ func (r *Runtime) WithEngine(ctx context.Context, opts EngineInitOptions, failCo
 		if handle.Close != nil {
 			_ = r.closeHandle(ctx, handle)
 		}
-		return r.Fail(ExitGeneral, jsonOut, fmt.Errorf("%w: EngineFactory 返回了 nil SessionRunner", ErrInvalidConfig))
+		return r.Fail(ExitGeneral, jsonOut, i18n.EF(ErrInvalidConfig, i18n.KeyCLINilSessionRunner))
 	}
 	defer func() {
 		if closeErr := r.closeHandle(ctx, handle); closeErr != nil {
-			r.WriteErr("shutdown failed: " + closeErr.Error())
+			loc := r.Loc()
+			r.WriteErr(loc.T(i18n.KeyCLIShutdownFailed, i18n.BoundStr("err", loc.RenderError(closeErr))))
 			if exitCode == ExitOK {
 				exitCode = ExitGeneral
 			}
@@ -229,33 +280,49 @@ func (r *Runtime) WriteErr(msg string) {
 	_, _ = fmt.Fprintf(r.Stderr, "xops: %s\n", strings.TrimSpace(msg))
 }
 
-// Fail 按当前输出模式渲染错误诊断（JSON 模式写入规范 ErrorEnvelope，文本模式写 Stderr）并返回退出码。
+// Fail 按当前输出模式与生效语言渲染错误诊断（JSON 模式写入规范 ErrorEnvelope，文本模式写 Stderr）并返回退出码。
 func (r *Runtime) Fail(exitCode int, jsonOut bool, err error) int {
 	if exitCode == ExitOK {
 		exitCode = ExitGeneral
 	}
+	loc := r.Loc()
 	if jsonOut {
-		WriteJSONError(r.Stdout, exitCode, err)
+		WriteJSONErrorLocalized(r.Stdout, loc, exitCode, err)
 		return exitCode
 	}
 	if err != nil {
-		r.WriteErr(err.Error())
+		r.WriteErr(loc.RenderError(err))
 		if rc, ok := engine.ExtractReferenceConflict(err); ok && rc.IsValid() {
-			r.writeRefConflictText(rc)
+			r.writeRefConflictText(loc, rc)
 		}
 		if ch, ok := engine.ExtractApprovalChallenge(err); ok && ch.IsValid() {
-			r.WriteErr(fmt.Sprintf("approval required: digest=%s escalated=%v reason=%s", ch.EnvelopeDigest(), ch.Escalated(), ch.Reason()))
+			r.WriteErr(loc.T(
+				i18n.KeyCLIApprovalRequired,
+				i18n.BoundStr("digest", ch.EnvelopeDigest().String()),
+				i18n.Bool("escalated", ch.Escalated()),
+				i18n.BoundStr("reason", ch.Reason()),
+			))
 		}
 	}
 	return exitCode
 }
 
-func (r *Runtime) writeRefConflictText(rc engine.ReferenceConflict) {
+func (r *Runtime) writeRefConflictText(loc *i18n.Localizer, rc engine.ReferenceConflict) {
 	for _, ref := range rc.AssetReferences() {
-		r.WriteErr(fmt.Sprintf("  referenced by %s node=%s target=%s", ref.Location, ref.FromNode, ref.Target))
+		r.WriteErr(loc.T(
+			i18n.KeyCLIRefAsset,
+			i18n.Str("location", ref.Location.String()),
+			i18n.BoundStr("node", ref.FromNode.String()),
+			i18n.BoundStr("target", ref.Target),
+		))
 	}
 	for _, ref := range rc.SecretReferences() {
-		r.WriteErr(fmt.Sprintf("  secret referenced at %s owner=%s ref=%s", ref.Location, ref.OwnerID, ref.Ref))
+		r.WriteErr(loc.T(
+			i18n.KeyCLIRefSecret,
+			i18n.Str("location", ref.Location.String()),
+			i18n.BoundStr("owner", ref.OwnerID),
+			i18n.BoundStr("ref", ref.Ref.String()),
+		))
 	}
 }
 
@@ -265,7 +332,8 @@ func (r *Runtime) writeRefConflictText(rc engine.ReferenceConflict) {
 func (r *Runtime) WriteResult(jsonOut bool, payload any, renderText func(io.Writer)) int {
 	if jsonOut {
 		if err := WriteJSON(r.Stdout, payload); err != nil {
-			r.WriteErr("marshal json failed: " + err.Error())
+			loc := r.Loc()
+			r.WriteErr(loc.T(i18n.KeyCLIMarshalJSONFailed, i18n.BoundStr("err", loc.RenderError(err))))
 			return ExitGeneral
 		}
 		return ExitOK
@@ -287,11 +355,11 @@ func (r *Runtime) ReadLocalInput(ctx context.Context, rawPath string, policy pat
 		return data, "<stdin>", nil
 	}
 	if r.Hooks.ReadOperatorFile == nil {
-		return nil, "", fmt.Errorf("%w: 未注入 ReadOperatorFile 钩子，无法读取本地文件 %q（可使用 '-' 从 stdin 读取）", ErrNotConfigured, trimmed)
+		return nil, "", i18n.EF(ErrNotConfigured, i18n.KeyCLIHookNotConfigured, i18n.Str("hook", "ReadOperatorFile"))
 	}
 	srcPath, err := pathalg.ParseLocalSourcePath(trimmed)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: 本地文件路径 %q 非法: %w", ErrUsage, trimmed, err)
+		return nil, "", i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "local file path"), i18n.BoundStr("value", trimmed))
 	}
 	data, err := r.Hooks.ReadOperatorFile(ctx, srcPath, policy, maxBytes)
 	if err != nil {
@@ -313,7 +381,7 @@ func ReadBounded(r io.Reader, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(data)) > maxBytes {
-		return nil, fmt.Errorf("%w: 输入超过最大允许大小 %d 字节", engine.ErrLimitExceeded, maxBytes)
+		return nil, i18n.EF(engine.ErrLimitExceeded, i18n.KeyCLIInputTooLarge, i18n.Int64("max", maxBytes))
 	}
 	return data, nil
 }

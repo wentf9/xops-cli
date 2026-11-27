@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const maxConfigImportBytes int64 = 16 << 20
@@ -30,7 +31,7 @@ type importArgs struct {
 // RunConfig 执行 `xops config` 命令族（`config import` 与 `config formats`，100% 零 v1 兼容代码）。
 func RunConfig(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, ConfigHelpText())
+		_, _ = io.WriteString(rt.Stdout, ConfigHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	switch args[0] {
@@ -39,7 +40,7 @@ func RunConfig(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	case "formats":
 		return runConfigFormats(ctx, rt, args[1:])
 	default:
-		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args[1:])), fmt.Errorf("%w: 未知 config 子命令 %q", clikit.ErrUsage, args[0]))
+		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args[1:])), i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "config"), i18n.BoundStr("sub", args[0])))
 	}
 }
 
@@ -49,7 +50,7 @@ func runConfigFormats(ctx context.Context, rt *clikit.Runtime, args []string) in
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, ConfigHelpText())
+		_, _ = io.WriteString(rt.Stdout, ConfigHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(common.JSON)
@@ -64,9 +65,10 @@ func runConfigFormats(ctx context.Context, rt *clikit.Runtime, args []string) in
 			OK      bool     `json:"ok"`
 			Formats []string `json:"formats"`
 		}
+		loc := rt.Loc()
 		return rt.WriteResult(jsonOut, view{OK: true, Formats: formats}, func(w io.Writer) {
 			if len(formats) == 0 {
-				_, _ = io.WriteString(w, "no registered import formats\n")
+				_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLIConfigNoFormats))
 				return
 			}
 			for _, f := range formats {
@@ -82,7 +84,7 @@ func runConfigImport(ctx context.Context, rt *clikit.Runtime, args []string) int
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, ConfigHelpText())
+		_, _ = io.WriteString(rt.Stdout, ConfigHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
@@ -129,8 +131,9 @@ func executePlanImport(ctx context.Context, rt *clikit.Runtime, client clikit.In
 		BaseRevision engine.Revision        `json:"base_revision"`
 		Report       inventory.ImportReport `json:"report"`
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, view{OK: true, BaseRevision: preview.BaseRevision(), Report: rep}, func(w io.Writer) {
-		renderImportReportText(w, "plan", preview.BaseRevision(), false, rep)
+		renderImportReportText(loc, w, "plan", preview.BaseRevision(), false, rep)
 	})
 }
 
@@ -147,16 +150,26 @@ func executeApplyImport(ctx context.Context, rt *clikit.Runtime, client clikit.I
 		Durability algebraic.Option[engine.DurabilityOutcome] `json:"durability,omitzero"`
 		Report     inventory.ImportReport                     `json:"report"`
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, view{
 		OK: true, Applied: res.Applied(), Revision: res.Revision(), Durability: res.Durability(), Report: rep,
 	}, func(w io.Writer) {
-		renderImportReportText(w, "import", res.Revision(), res.Applied(), rep)
+		renderImportReportText(loc, w, "import", res.Revision(), res.Applied(), rep)
 	})
 }
 
-func renderImportReportText(w io.Writer, label string, rev engine.Revision, applied bool, rep inventory.ImportReport) {
-	_, _ = fmt.Fprintf(w, "%s (%s) revision=%s applied=%v add=%d unchanged=%d conflict=%d warnings=%d\n",
-		label, rep.SourceFormat, rev, applied, rep.AddCount, rep.UnchangedCount, rep.ConflictCount, len(rep.Warnings))
+func renderImportReportText(loc *i18n.Localizer, w io.Writer, label string, rev engine.Revision, applied bool, rep inventory.ImportReport) {
+	_, _ = fmt.Fprintln(w, loc.T(
+		i18n.KeyCLIConfigImportSummary,
+		i18n.Str("label", label),
+		i18n.BoundStr("format", rep.SourceFormat),
+		i18n.BoundStr("revision", rev.String()),
+		i18n.Bool("applied", applied),
+		i18n.Int("add", rep.AddCount),
+		i18n.Int("unchanged", rep.UnchangedCount),
+		i18n.Int("conflict", rep.ConflictCount),
+		i18n.Int("warnings", len(rep.Warnings)),
+	))
 	for _, entry := range rep.Entries {
 		_, _ = fmt.Fprintf(w, "  [%s] %s/%s %s\n", entry.Action, entry.AssetKind, entry.AssetID, entry.Reason)
 	}
@@ -177,7 +190,7 @@ func parseImportArgs(args []string) (importArgs, error) {
 		}
 	}
 	if strings.TrimSpace(out.format) == "" {
-		return importArgs{}, fmt.Errorf("%w: config import 必须指定 --format <format>（如 openssh / csv）", clikit.ErrUsage)
+		return importArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIMissingRequiredFlag, i18n.Str("cmd", "config import"), i18n.Str("flag", "--format"))
 	}
 	return out, nil
 }
@@ -202,13 +215,13 @@ func parseImportToken(cur *clikit.FlagCursor, out *importArgs) error {
 		return parseImportLongFlag(cur, tok, out)
 	}
 	if strings.HasPrefix(tok, "-") && tok != "-" {
-		return fmt.Errorf("%w: config import 未知短选项 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", strings.TrimPrefix(tok, "-")))
 	}
 	if out.filePath == "" {
 		out.filePath = tok
 		return nil
 	}
-	return fmt.Errorf("%w: config import 多余位置参数 %q", clikit.ErrUsage, tok)
+	return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnexpectedArg, i18n.BoundStr("arg", tok))
 }
 
 func parseImportLongFlag(cur *clikit.FlagCursor, rawTok string, out *importArgs) error {
@@ -245,11 +258,11 @@ func parseImportLongFlag(cur *clikit.FlagCursor, rawTok string, out *importArgs)
 	case "symlink-policy":
 		p, err := pathalg.ParseSymlinkPolicy(val)
 		if err != nil {
-			return fmt.Errorf("%w: --symlink-policy 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--symlink-policy"), i18n.BoundStr("value", val))
 		}
 		out.symlinkPolicy = p
 	default:
-		return fmt.Errorf("%w: config import 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }

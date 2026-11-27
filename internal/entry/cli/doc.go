@@ -23,8 +23,8 @@ import (
 // 编译期契约断言：确保 *engine.Engine 原生满足 CLI 入站层最小会话执行契约。
 var _ SessionRunner = (*engine.Engine)(nil)
 
-// 本包重导出的不可变哨兵错误，与内部子包共享完全一致的错误标识。
-const (
+// 本包重导出的不可变结构化哨兵错误，与内部子包共享完全一致的错误标识。
+var (
 	// ErrInvalidConfig 表示构造 CLI App 时缺少必填依赖或参数非法。
 	ErrInvalidConfig = clikit.ErrInvalidConfig
 	// ErrAppNotInitialized 表示在 nil 或未初始化零值 App 上调用运行方法。

@@ -13,6 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type scpArgs struct {
@@ -72,14 +73,14 @@ func RunSCP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, SCPHelpText())
+		_, _ = io.WriteString(rt.Stdout, SCPHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
 	srcHost, srcRemote, srcIsRemote := splitSCPEndpoint(parsed.srcRaw)
 	dstHost, dstRemote, dstIsRemote := splitSCPEndpoint(parsed.dstRaw)
 	if srcIsRemote == dstIsRemote {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: scp 源与目标必须一端为本地路径、另一端为 [user@]host:<remote_path>", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLISCPEndpointMismatch))
 	}
 	initOpts := rt.EffectiveInitOptions(parsed.common.ConfigFile, parsed.common.Policy)
 	return rt.WithEngine(ctx, initOpts, clikit.ExitSSHError, jsonOut, func(runner clikit.SessionRunner) int {
@@ -101,7 +102,7 @@ func runSCPUpload(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 	}
 	remotePath, err := pathalg.ParseRemotePath(remoteRaw)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 远端目标路径 %q 非法: %w", clikit.ErrUsage, remoteRaw, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "remote destination path"), i18n.BoundStr("value", remoteRaw)))
 	}
 	res, err := client.SCPUpload(ctx, engine.SCPUploadRequest{
 		RemoteCall: engine.RemoteCall{
@@ -139,18 +140,25 @@ func runSCPUpload(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 		Digest:            res.Digest.String(),
 		ModTimePreserved:  res.ModTimePreserved,
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, view, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "uploaded %d file(s), %d bytes -> %s:%s\n", res.FilesUploaded, res.BytesTransferred, targetHost, res.RemotePath)
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLISCPUploaded,
+			i18n.Int("files", res.FilesUploaded),
+			i18n.Int64("bytes", res.BytesTransferred),
+			i18n.BoundStr("target", targetHost),
+			i18n.BoundStr("path", res.RemotePath.String()),
+		))
 	})
 }
 
 func runSCPDownload(ctx context.Context, rt *clikit.Runtime, client clikit.TransferClient, parsed scpArgs, targetHost, remoteRaw, localRaw string, jsonOut bool) int {
 	if parsed.symlinkPolicy == pathalg.SymlinkFollowOperatorSource {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: scp 下载仅允许 --symlink-policy=reject 或 contained_relative", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLISCPDownloadSymlinkPolicy))
 	}
 	remotePath, err := pathalg.ParseRemotePath(remoteRaw)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 远端源路径 %q 非法: %w", clikit.ErrUsage, remoteRaw, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "remote source path"), i18n.BoundStr("value", remoteRaw)))
 	}
 	localRoot, localDest, err := resolveDownloadTarget(rt, parsed.localRoot, localRaw, remotePath)
 	if err != nil {
@@ -192,19 +200,26 @@ func runSCPDownload(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 		Digest:            res.Digest,
 		ModTimePreserved:  res.ModTimePreserved,
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, view, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "downloaded %d file(s), %d bytes -> %s/%s\n", res.FilesDownloaded, res.BytesTransferred, localRoot, res.LocalDest)
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLISCPDownloaded,
+			i18n.Int("files", res.FilesDownloaded),
+			i18n.Int64("bytes", res.BytesTransferred),
+			i18n.BoundStr("root", localRoot.String()),
+			i18n.BoundStr("dest", res.LocalDest.String()),
+		))
 	})
 }
 
 func buildUploadSource(rt *clikit.Runtime, parsed scpArgs, localRaw string) (src engine.LocalUploadSource, err error) {
 	if parsed.recursive && parsed.symlinkPolicy != pathalg.SymlinkReject {
-		return src, fmt.Errorf("%w: 递归目录上传（-r）仅允许 --symlink-policy=reject", clikit.ErrUsage)
+		return src, i18n.EF(clikit.ErrUsage, i18n.KeyCLISCPRecursiveSymlinkPolicy)
 	}
 	if root, ok := parsed.localRoot.Get(); ok {
 		rel, pErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(localRaw))
 		if pErr != nil {
-			return src, fmt.Errorf("%w: --local-root 模式下本地源必须为沙箱相对路径: %w", clikit.ErrUsage, pErr)
+			return src, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLISCPLocalRootRelative)
 		}
 		return engine.NewScopedUploadSource(root, rel)
 	}
@@ -219,7 +234,7 @@ func buildUploadSource(rt *clikit.Runtime, parsed scpArgs, localRaw string) (src
 	}
 	srcPath, pErr := pathalg.ParseLocalSourcePath(localRaw)
 	if pErr != nil {
-		return src, fmt.Errorf("%w: 本地源路径 %q 非法: %w", clikit.ErrUsage, localRaw, pErr)
+		return src, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local source path"), i18n.BoundStr("value", localRaw))
 	}
 	return engine.NewOperatorUploadSource(srcPath, parsed.symlinkPolicy)
 }
@@ -233,22 +248,22 @@ func resolveScopedRecursiveUploadSource(rt *clikit.Runtime, localRaw string) (ro
 		}
 		wdSrc, pErr := pathalg.ParseLocalSourcePath(wd.String())
 		if pErr != nil || !wdSrc.IsAbs() {
-			return root, rel, fmt.Errorf("%w: 递归上传当前目录 '.' 需要绝对工作目录或显式指定 --local-root 与相对路径", clikit.ErrUsage)
+			return root, rel, i18n.EF(clikit.ErrUsage, i18n.KeyCLISCPRecursiveDotAbs)
 		}
 		d, dErr := pathalg.ParseLocalRootedDest(wdSrc.Base())
 		if dErr != nil {
-			return root, rel, fmt.Errorf("%w: 无法从工作目录推导沙箱相对名: %w", clikit.ErrUsage, dErr)
+			return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local relative path"), i18n.BoundStr("value", wdSrc.Base()))
 		}
 		return wdSrc.Dir(), d, nil
 	}
 	srcPath, pErr := pathalg.ParseLocalSourcePath(trimmed)
 	if pErr != nil {
-		return root, rel, fmt.Errorf("%w: 本地递归源路径 %q 非法: %w", clikit.ErrUsage, localRaw, pErr)
+		return root, rel, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local source path"), i18n.BoundStr("value", localRaw))
 	}
 	if srcPath.IsAbs() {
 		d, dErr := pathalg.ParseLocalRootedDest(srcPath.Base())
 		if dErr != nil {
-			return root, rel, fmt.Errorf("%w: 本地递归源目录名 %q 非法: %w", clikit.ErrUsage, srcPath.Base(), dErr)
+			return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local directory name"), i18n.BoundStr("value", srcPath.Base()))
 		}
 		return srcPath.Dir(), d, nil
 	}
@@ -258,7 +273,7 @@ func resolveScopedRecursiveUploadSource(rt *clikit.Runtime, localRaw string) (ro
 	}
 	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(srcPath.String()))
 	if dErr != nil {
-		return root, rel, fmt.Errorf("%w: 本地递归相对路径 %q 非法: %w", clikit.ErrUsage, localRaw, dErr)
+		return root, rel, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local relative path"), i18n.BoundStr("value", localRaw))
 	}
 	return wd, d, nil
 }
@@ -285,12 +300,12 @@ func resolveDownloadTarget(rt *clikit.Runtime, rootOpt algebraic.Option[pathalg.
 	}
 	src, pErr := pathalg.ParseLocalSourcePath(trimmed)
 	if pErr != nil {
-		return root, dest, fmt.Errorf("%w: 本地目标路径 %q 非法: %w", clikit.ErrUsage, localRaw, pErr)
+		return root, dest, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local destination path"), i18n.BoundStr("value", localRaw))
 	}
 	if src.IsAbs() {
 		d, dErr := pathalg.ParseLocalRootedDest(src.Base())
 		if dErr != nil {
-			return root, dest, fmt.Errorf("%w: 本地目标文件名 %q 非法: %w", clikit.ErrUsage, src.Base(), dErr)
+			return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local destination filename"), i18n.BoundStr("value", src.Base()))
 		}
 		return src.Dir(), d, nil
 	}
@@ -300,7 +315,7 @@ func resolveDownloadTarget(rt *clikit.Runtime, rootOpt algebraic.Option[pathalg.
 	}
 	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(src.String()))
 	if dErr != nil {
-		return root, dest, fmt.Errorf("%w: 本地相对路径 %q 非法: %w", clikit.ErrUsage, src.String(), dErr)
+		return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local relative path"), i18n.BoundStr("value", src.String()))
 	}
 	return wd, d, nil
 }
@@ -312,7 +327,7 @@ func resolveRootedDownload(fixedRoot pathalg.LocalDir, localRaw string, remotePa
 	}
 	d, dErr := pathalg.ParseLocalRootedDest(normalizeLocalRootedRel(relRaw))
 	if dErr != nil {
-		return root, dest, fmt.Errorf("%w: 本地目标相对路径 %q 非法: %w", clikit.ErrUsage, localRaw, dErr)
+		return root, dest, i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidField, i18n.Str("field", "local destination relative path"), i18n.BoundStr("value", localRaw))
 	}
 	return fixedRoot, d, nil
 }
@@ -324,7 +339,7 @@ func resolveLocalRelName(localRaw string, remotePath pathalg.RemotePath) (string
 	}
 	base, ok := remotePath.Base()
 	if !ok {
-		return "", fmt.Errorf("%w: 远端路径 %q 无文件名组件，无法推导本地目标名", clikit.ErrUsage, remotePath)
+		return "", i18n.EF(clikit.ErrUsage, i18n.KeyCLISCPNoRemoteBase, i18n.BoundStr("path", remotePath.String()))
 	}
 	return base.String(), nil
 }

@@ -11,13 +11,13 @@ package cmdssh
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const defaultCleanupTimeout = 5 * time.Second
@@ -25,7 +25,7 @@ const defaultCleanupTimeout = 5 * time.Second
 func requireSSHClient(runner clikit.SessionRunner) (clikit.SSHClient, error) {
 	c, ok := runner.(clikit.SSHClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 SSHClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "SSHClient"))
 	}
 	return c, nil
 }
@@ -33,7 +33,7 @@ func requireSSHClient(runner clikit.SessionRunner) (clikit.SSHClient, error) {
 func requireAutomationClient(runner clikit.SessionRunner) (clikit.AutomationClient, error) {
 	c, ok := runner.(clikit.AutomationClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 AutomationClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "AutomationClient"))
 	}
 	return c, nil
 }
@@ -122,7 +122,8 @@ func reportCleanupError(rt *clikit.Runtime, err error, exitCode *int) {
 	if err == nil {
 		return
 	}
-	rt.WriteErr("cleanup failed: " + err.Error())
+	loc := rt.Loc()
+	rt.WriteErr(loc.T(i18n.KeyCLICleanupFailed, i18n.BoundStr("err", loc.RenderError(err))))
 	if *exitCode == clikit.ExitOK {
 		*exitCode = clikit.ExitGeneral
 	}
@@ -132,7 +133,7 @@ func reportCleanupError(rt *clikit.Runtime, err error, exitCode *int) {
 // JSON 模式下绝不向 stdout 追加第二个 JSON 文档，仅将错误写入 stderr 并返回 ExitSSHError。
 func failAfterAnnounce(rt *clikit.Runtime, jsonOut bool, err error) int {
 	if jsonOut {
-		rt.WriteErr(err.Error())
+		rt.WriteErr(rt.Loc().RenderError(err))
 		return clikit.ExitSSHError
 	}
 	return rt.Fail(clikit.ExitSSHError, false, err)

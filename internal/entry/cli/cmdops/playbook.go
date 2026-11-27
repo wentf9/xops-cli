@@ -19,6 +19,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const maxPlaybookFileBytes int64 = 4 << 20
@@ -42,7 +43,7 @@ type playbookArgs struct {
 // RunPlaybook 执行 `xops playbook`（别名 `play`）：支持 `validate`（纯离线 AST 校验，零引擎初始化）与 `run`。
 func RunPlaybook(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, PlaybookHelpText())
+		_, _ = io.WriteString(rt.Stdout, PlaybookHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	parsed, err := parsePlaybookArgs(args)
@@ -50,7 +51,7 @@ func RunPlaybook(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, PlaybookHelpText())
+		_, _ = io.WriteString(rt.Stdout, PlaybookHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
@@ -60,7 +61,7 @@ func RunPlaybook(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	}
 	pb, err := DecodePlaybookDocument(raw)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 解析 Playbook %q 失败: %w", clikit.ErrUsage, sourceName, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIPlaybookDecodeFailed, i18n.BoundStr("source", sourceName)))
 	}
 	if parsed.sub == "validate" {
 		return renderPlaybookValidate(rt, pb, sourceName, jsonOut)
@@ -82,9 +83,15 @@ func renderPlaybookValidate(rt *clikit.Runtime, pb playbook.Playbook, sourceName
 		OK: true, Source: sourceName, Version: pb.Version(), ID: pb.ID(),
 		Name: pb.Name(), Steps: pb.Steps().Len(), Digest: pb.Digest(),
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, v, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "playbook valid: id=%s name=%q version=%d steps=%d digest=%s\n",
-			v.ID, v.Name, v.Version, v.Steps, v.Digest)
+		_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLIPlaybookValid,
+			i18n.Str("id", v.ID.String()),
+			i18n.BoundStr("name", v.Name),
+			i18n.Uint64("version", uint64(v.Version)),
+			i18n.Int("steps", v.Steps),
+			i18n.Str("digest", v.Digest.String()),
+		))
 	})
 }
 
@@ -143,6 +150,7 @@ func renderPlaybookRunResult(rt *clikit.Runtime, res engine.PlaybookRunResult, r
 	if !res.IsValid() {
 		return rt.Fail(clikit.ExitGeneral, jsonOut, runErr)
 	}
+	loc := rt.Loc()
 	rep := res.Report()
 	code := clikit.ExitOK
 	if runErr != nil || res.Aborted() || res.HasUnknownOutcome() ||
@@ -152,27 +160,35 @@ func renderPlaybookRunResult(rt *clikit.Runtime, res engine.PlaybookRunResult, r
 	if jsonOut {
 		env := playbookRunJSONEnvelope{OK: code == clikit.ExitOK, Result: res}
 		if runErr != nil {
-			env.Error = runErr.Error()
+			env.Error = loc.RenderError(runErr)
 			env.ErrorCode = clikit.ClassifyErrorCode(runErr)
 		}
 		if err := clikit.WriteJSON(rt.Stdout, env); err != nil {
-			rt.WriteErr("marshal json failed: " + err.Error())
+			rt.WriteErr(loc.T(i18n.KeyCLIMarshalJSONFailed, i18n.Str("err", loc.RenderError(err))))
 			return clikit.ExitGeneral
 		}
 		return code
 	}
 	counts := rep.StepCounts()
-	_, _ = fmt.Fprintf(rt.Stdout, "playbook %s status=%s duration=%s (succeeded=%d changed=%d skipped=%d failed=%d unknown=%d aborted=%d)\n",
-		rep.PlaybookID(), rep.Status(), res.Duration(),
-		counts.Succeeded, counts.Changed, counts.Skipped, counts.Failed, counts.Unknown, counts.Aborted)
+	_, _ = fmt.Fprintln(rt.Stdout, loc.T(i18n.KeyCLIPlaybookSummary,
+		i18n.Str("id", rep.PlaybookID().String()),
+		i18n.Str("status", rep.Status().String()),
+		i18n.Str("duration", res.Duration().String()),
+		i18n.Int("succeeded", counts.Succeeded),
+		i18n.Int("changed", counts.Changed),
+		i18n.Int("skipped", counts.Skipped),
+		i18n.Int("failed", counts.Failed),
+		i18n.Int("unknown", counts.Unknown),
+		i18n.Int("aborted", counts.Aborted),
+	))
 	for _, nr := range rep.Nodes() {
 		_, _ = fmt.Fprintf(rt.Stdout, "  node=%-20s status=%-15s duration=%s\n", nr.NodeID(), nr.Status(), nr.TotalDuration())
 	}
 	if res.HasUnknownOutcome() {
-		rt.WriteErr("playbook contains OutcomeUnknown steps; inspect remote state before retrying")
+		rt.WriteErr(loc.T(i18n.KeyCLIPlaybookUnknownWarning))
 	}
 	if runErr != nil {
-		rt.WriteErr(runErr.Error())
+		rt.WriteErr(loc.RenderError(runErr))
 	}
 	return code
 }
@@ -182,10 +198,10 @@ func renderPlaybookRunResult(rt *clikit.Runtime, res engine.PlaybookRunResult, r
 func DecodePlaybookDocument(raw []byte) (pb playbook.Playbook, err error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return pb, fmt.Errorf("playbook 输入为空")
+		return pb, i18n.E(i18n.KeyCLIPlaybookEmpty)
 	}
 	if trimmed[0] == '[' {
-		return pb, fmt.Errorf("playbook 顶层文档必须为对象而非数组")
+		return pb, i18n.E(i18n.KeyCLIPlaybookMustBeObject)
 	}
 	if trimmed[0] == '{' {
 		var decoded playbook.Playbook
@@ -196,7 +212,7 @@ func DecodePlaybookDocument(raw []byte) (pb playbook.Playbook, err error) {
 	}
 	var doc yaml.Node
 	if yErr := yaml.Unmarshal(trimmed, &doc); yErr != nil {
-		return pb, fmt.Errorf("YAML 解析失败: %w", yErr)
+		return pb, i18n.Wrap(yErr, i18n.KeyCLIPlaybookYAMLFailed)
 	}
 	val, vErr := yamlNodeToJSONValue(&doc)
 	if vErr != nil {
@@ -204,7 +220,7 @@ func DecodePlaybookDocument(raw []byte) (pb playbook.Playbook, err error) {
 	}
 	jsonBytes, mErr := jsonv2.Marshal(val, jsonv2.Deterministic(true))
 	if mErr != nil {
-		return pb, fmt.Errorf("YAML 转规范 JSON 失败: %w", mErr)
+		return pb, i18n.Wrap(mErr, i18n.KeyCLIPlaybookYAMLFailed)
 	}
 	var decoded playbook.Playbook
 	if uErr := jsonv2.Unmarshal(jsonBytes, &decoded); uErr != nil {
@@ -215,16 +231,16 @@ func DecodePlaybookDocument(raw []byte) (pb playbook.Playbook, err error) {
 
 func yamlNodeToJSONValue(n *yaml.Node) (any, error) {
 	if n == nil {
-		return nil, fmt.Errorf("空 YAML 节点")
+		return nil, i18n.E(i18n.KeyCLIPlaybookYAMLFailed)
 	}
 	switch n.Kind {
 	case yaml.DocumentNode:
 		if len(n.Content) != 1 {
-			return nil, fmt.Errorf("YAML 必须包含单一文档")
+			return nil, i18n.E(i18n.KeyCLIPlaybookYAMLFailed)
 		}
 		return yamlNodeToJSONValue(n.Content[0])
 	case yaml.AliasNode:
-		return nil, fmt.Errorf("playbook YAML 禁止使用别名引用")
+		return nil, i18n.E(i18n.KeyCLIPlaybookYAMLNoAlias)
 	case yaml.MappingNode:
 		return yamlMappingToMap(n)
 	case yaml.SequenceNode:
@@ -243,27 +259,27 @@ func yamlNodeToJSONValue(n *yaml.Node) (any, error) {
 		}
 		var v any
 		if err := n.Decode(&v); err != nil {
-			return nil, fmt.Errorf("YAML 标量解码失败: %w", err)
+			return nil, i18n.Wrap(err, i18n.KeyCLIPlaybookYAMLFailed)
 		}
 		return v, nil
 	default:
-		return nil, fmt.Errorf("不支持的 YAML 节点类型 %d", n.Kind)
+		return nil, i18n.E(i18n.KeyCLIPlaybookYAMLFailed)
 	}
 }
 
 func yamlMappingToMap(n *yaml.Node) (map[string]any, error) {
 	if len(n.Content)%2 != 0 {
-		return nil, fmt.Errorf("YAML 映射键值对不完整")
+		return nil, i18n.E(i18n.KeyCLIPlaybookYAMLFailed)
 	}
 	out := make(map[string]any, len(n.Content)/2)
 	for i := 0; i < len(n.Content); i += 2 {
 		kNode, vNode := n.Content[i], n.Content[i+1]
 		if kNode.Kind != yaml.ScalarNode {
-			return nil, fmt.Errorf("YAML 映射键必须为标量字符串")
+			return nil, i18n.E(i18n.KeyCLIPlaybookYAMLFailed)
 		}
 		key := kNode.Value
 		if _, dup := out[key]; dup {
-			return nil, fmt.Errorf("YAML 存在重复键 %q", key)
+			return nil, i18n.E(i18n.KeyCLIPlaybookYAMLDupKey, i18n.BoundStr("key", key))
 		}
 		val, err := yamlNodeToJSONValue(vNode)
 		if err != nil {
@@ -282,7 +298,7 @@ func parsePlaybookArgs(args []string) (playbookArgs, error) {
 		extraVars:     map[string]string{},
 	}
 	if out.sub != "run" && out.sub != "validate" {
-		return playbookArgs{}, fmt.Errorf("%w: playbook 子命令必须为 run 或 validate，实际=%q", clikit.ErrUsage, out.sub)
+		return playbookArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "playbook"), i18n.BoundStr("sub", out.sub))
 	}
 	cur := clikit.NewFlagCursor(args[1:])
 	for cur.HasNext() {
@@ -294,7 +310,7 @@ func parsePlaybookArgs(args []string) (playbookArgs, error) {
 		}
 	}
 	if err := out.cliOpts.Validate(); err != nil {
-		return playbookArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)
+		return playbookArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	return out, nil
 }
@@ -310,7 +326,7 @@ func parsePlaybookToken(cur *clikit.FlagCursor, out *playbookArgs) error {
 			out.filePath = cur.Next()
 			return nil
 		}
-		return fmt.Errorf("%w: playbook %s 多余位置参数 %q", clikit.ErrUsage, out.sub, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnexpectedArg, i18n.BoundStr("arg", tok))
 	}
 	return parsePlaybookFlag(cur, out)
 }
@@ -327,7 +343,7 @@ func parsePlaybookFlag(cur *clikit.FlagCursor, out *playbookArgs) error {
 	ch := cluster[0]
 	if ch == 'h' {
 		if len(cluster) > 1 {
-			return fmt.Errorf("%w: playbook 未知短选项 -%s", clikit.ErrUsage, cluster)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", cluster))
 		}
 		out.common.ShowHelp = true
 		return nil
@@ -336,7 +352,7 @@ func parsePlaybookFlag(cur *clikit.FlagCursor, out *playbookArgs) error {
 		return err
 	}
 	r, _ := utf8.DecodeRuneInString(cluster)
-	return fmt.Errorf("%w: playbook 未知短选项 -%c", clikit.ErrUsage, r)
+	return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 }
 
 func parsePlaybookLongFlag(cur *clikit.FlagCursor, out *playbookArgs) error {
@@ -384,35 +400,35 @@ func applyPlaybookLongValue(name, val, rawTok string, out *playbookArgs) error {
 	case "scoped-root":
 		d, err := pathalg.ParseLocalDir(val)
 		if err != nil {
-			return fmt.Errorf("%w: --scoped-root 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--scoped-root"), i18n.BoundStr("value", val))
 		}
 		out.scopedRoot = algebraic.Some(d)
 	case "symlink-policy":
 		p, err := pathalg.ParseSymlinkPolicy(val)
 		if err != nil {
-			return fmt.Errorf("%w: --symlink-policy 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--symlink-policy"), i18n.BoundStr("value", val))
 		}
 		out.symlinkPolicy = p
 	case "dialect":
 		d, err := execution.ParseLaunchDialect(val)
 		if err != nil {
-			return fmt.Errorf("%w: --dialect 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--dialect"), i18n.BoundStr("value", val))
 		}
 		out.dialect = algebraic.Some(d)
 	case "interpreter":
 		interp, err := execution.ParseInterpreter(val)
 		if err != nil {
-			return fmt.Errorf("%w: --interpreter 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--interpreter"), i18n.BoundStr("value", val))
 		}
 		out.interpreter = interp
 	case "login":
 		lm, err := execution.ParseLoginMode(val)
 		if err != nil {
-			return fmt.Errorf("%w: --login 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--login"), i18n.BoundStr("value", val))
 		}
 		out.loginMode = lm
 	default:
-		return fmt.Errorf("%w: playbook 未知长选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }

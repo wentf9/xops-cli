@@ -2,13 +2,13 @@ package cmdops
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type tuiArgs struct {
@@ -25,18 +25,19 @@ func RunTUI(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, TUIHelpText())
+		_, _ = io.WriteString(rt.Stdout, TUIHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
 	if jsonOut {
-		return rt.Fail(clikit.ExitUsage, true, fmt.Errorf("%w: 交互式 TUI 工作台不支持 --json 输出", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, true, i18n.EF(clikit.ErrUsage, i18n.KeyCLIInteractiveNoJSON, i18n.Str("mode", "tui")))
 	}
 	if rt.Hooks.RunTUI == nil {
-		return rt.Fail(clikit.ExitGeneral, jsonOut, fmt.Errorf("%w: 未注入 RunTUI 回调，无法启动 TUI 工作台", clikit.ErrNotConfigured))
+		return rt.Fail(clikit.ExitGeneral, jsonOut, i18n.EF(clikit.ErrNotConfigured, i18n.KeyCLIHookNotConfigured, i18n.Str("hook", "RunTUI")))
 	}
 	req := clikit.TUIStartRequest{
 		InitOptions:     rt.EffectiveInitOptions(parsed.common.ConfigFile, parsed.common.Policy),
+		Locale:          rt.EffectiveLocale(),
 		InitialNode:     parsed.initialNode,
 		RefreshInterval: parsed.refresh,
 		NoAltScreen:     parsed.noAltScreen,
@@ -86,7 +87,7 @@ func parseTUIToken(cur *clikit.FlagCursor, out *tuiArgs) error {
 func applyTUILongFlag(cur *clikit.FlagCursor, rawTok string, out *tuiArgs) error {
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(rawTok)
 	if !isLong {
-		return fmt.Errorf("%w: tui 未知参数 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnexpectedArg, i18n.BoundStr("arg", rawTok))
 	}
 	switch name {
 	case "node":
@@ -108,7 +109,7 @@ func applyTUILongFlag(cur *clikit.FlagCursor, rawTok string, out *tuiArgs) error
 		out.noAltScreen = v
 		return err
 	default:
-		return fmt.Errorf("%w: tui 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 }
 
@@ -130,15 +131,16 @@ func RunMCP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, MCPHelpText())
+		_, _ = io.WriteString(rt.Stdout, MCPHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
 	if rt.Hooks.RunMCP == nil {
-		return rt.Fail(clikit.ExitGeneral, jsonOut, fmt.Errorf("%w: 未注入 RunMCP 回调，无法启动 MCP 服务", clikit.ErrNotConfigured))
+		return rt.Fail(clikit.ExitGeneral, jsonOut, i18n.EF(clikit.ErrNotConfigured, i18n.KeyCLIHookNotConfigured, i18n.Str("hook", "RunMCP")))
 	}
 	req := clikit.MCPStartRequest{
 		InitOptions:          rt.EffectiveInitOptions(parsed.common.ConfigFile, parsed.common.Policy),
+		Locale:               rt.EffectiveLocale(),
 		Transport:            parsed.transport,
 		ListenAddr:           parsed.listenAddr,
 		TransferRoot:         parsed.transferRoot,
@@ -199,7 +201,7 @@ func parseMCPToken(cur *clikit.FlagCursor, out *mcpArgs) error {
 func parseMCPLongFlag(cur *clikit.FlagCursor, rawTok string, out *mcpArgs) error {
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(rawTok)
 	if !isLong {
-		return fmt.Errorf("%w: mcp 未知参数 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnexpectedArg, i18n.BoundStr("arg", rawTok))
 	}
 	if name == "allow-non-loopback" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
@@ -214,7 +216,7 @@ func parseMCPLongFlag(cur *clikit.FlagCursor, rawTok string, out *mcpArgs) error
 	case "transport":
 		t := strings.ToLower(strings.TrimSpace(val))
 		if t != "stdio" && t != "http" {
-			return fmt.Errorf("%w: --transport 必须为 stdio|http，实际=%q", clikit.ErrUsage, val)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIInvalidFlagValueEnum, i18n.Str("flag", "--transport"), i18n.Str("allowed", "stdio|http"), i18n.BoundStr("value", val))
 		}
 		out.transport = t
 	case "listen":
@@ -222,13 +224,13 @@ func parseMCPLongFlag(cur *clikit.FlagCursor, rawTok string, out *mcpArgs) error
 	case "transfer-root":
 		d, err := pathalg.ParseLocalDir(val)
 		if err != nil {
-			return fmt.Errorf("%w: --transfer-root 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--transfer-root"), i18n.BoundStr("value", val))
 		}
 		out.transferRoot = algebraic.Some(d)
 	case "artifact-root":
 		d, err := pathalg.ParseLocalDir(val)
 		if err != nil {
-			return fmt.Errorf("%w: --artifact-root 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--artifact-root"), i18n.BoundStr("value", val))
 		}
 		out.artifactRoot = algebraic.Some(d)
 	case "allowed-origin":
@@ -236,7 +238,7 @@ func parseMCPLongFlag(cur *clikit.FlagCursor, rawTok string, out *mcpArgs) error
 	case "allowed-host":
 		out.allowedHosts = append(out.allowedHosts, clikit.SplitCSV(val)...)
 	default:
-		return fmt.Errorf("%w: mcp 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }

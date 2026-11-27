@@ -1,7 +1,6 @@
 package cmdssh
 
 import (
-	"fmt"
 	"strings"
 	"unicode/utf8"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // SSHCommandArgs 保存 `xops ssh` 参数解析产出的强类型命令行参数、Tier-1（CLI）选项层与 OpenSSH 控制标志。
@@ -68,7 +68,7 @@ type sshFlagParser struct {
 }
 
 // ParseSSHArgs 按 OpenSSH ssh(1) 标准短选项习惯解析 `xops ssh` 后续参数列表：
-//   - 支持 -p/-l/-i/-J/-L/-R/-D/-o/-O/-M/-S/-F/-t/-tt/-T/-N/-f/-W/-w、--json、--policy、--tun-mode、-- 与 -h/--help；
+//   - 支持 -p/-l/-i/-J/-L/-R/-D/-o/-O/-M/-S/-F/-t/-tt/-T/-N/-f/-W/-w、--json、--policy、--lang、--tun-mode、-- 与 -h/--help；
 //   - 遇到首个非选项位置参数（[user@]host）后立即停止选项解析，确保远端命令自带的 `-flag` 完整透传。
 func ParseSSHArgs(args []string) (SSHCommandArgs, error) {
 	p := &sshFlagParser{
@@ -128,12 +128,12 @@ func (p *sshFlagParser) parseLongFlag() error {
 		}
 		m, err := engine.ParseTUNMode(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --tun-mode 参数 %q 非法: %w", clikit.ErrUsage, raw, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--tun-mode"), i18n.BoundStr("value", raw))
 		}
 		p.tunMode = m
 		return nil
 	}
-	return fmt.Errorf("%w: 未知长选项 %q", clikit.ErrUsage, tok)
+	return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 }
 
 func (p *sshFlagParser) parseShortCluster(cluster string) error {
@@ -148,7 +148,7 @@ func (p *sshFlagParser) parseShortCluster(cluster string) error {
 		}
 		if !handled {
 			r, _ := utf8.DecodeRuneInString(cluster[i:])
-			return fmt.Errorf("%w: 未知短选项 -%c", clikit.ErrUsage, r)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 		}
 	}
 	return nil
@@ -228,7 +228,7 @@ func (p *sshFlagParser) applyExtraValue(ch byte, val string) error {
 	case 'O':
 		act, err := engine.ParseMuxControlAction(val)
 		if err != nil {
-			return fmt.Errorf("%w: -O 控制动作 %q 非法: %w", clikit.ErrUsage, val, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "-O"), i18n.BoundStr("value", val))
 		}
 		p.muxAction = act
 		return nil
@@ -238,12 +238,12 @@ func (p *sshFlagParser) applyExtraValue(ch byte, val string) error {
 	case 'W':
 		hp, err := netaddr.ParseHostPort(strings.TrimSpace(val))
 		if err != nil {
-			return fmt.Errorf("%w: -W 参数 %q 必须为 host:port: %w", clikit.ErrUsage, val, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "-W"), i18n.BoundStr("value", val))
 		}
 		p.stdioFwd = algebraic.Some(hp)
 		return nil
 	default:
-		return fmt.Errorf("%w: 不支持的选项 -%c", clikit.ErrUsage, ch)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.Str("flag", string(ch)))
 	}
 }
 
@@ -261,13 +261,10 @@ func (p *sshFlagParser) finish() (SSHCommandArgs, error) {
 		return SSHCommandArgs{ShowHelp: true}, nil
 	}
 	pos := p.cur.Rest()
-	if len(pos) == 0 {
-		return SSHCommandArgs{}, fmt.Errorf("%w: 缺少目标主机 [user@]host", clikit.ErrUsage)
+	if len(pos) == 0 || strings.TrimSpace(pos[0]) == "" {
+		return SSHCommandArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHMissingTarget)
 	}
 	target := strings.TrimSpace(pos[0])
-	if target == "" {
-		return SSHCommandArgs{}, fmt.Errorf("%w: 目标主机不能为空", clikit.ErrUsage)
-	}
 	for _, rawTUN := range p.rawTUNs {
 		spec, err := clikit.ParseTUNForwardSpec(p.tunMode, rawTUN)
 		if err != nil {
@@ -287,7 +284,7 @@ func (p *sshFlagParser) finish() (SSHCommandArgs, error) {
 		p.layer = mLayer.Compose(p.layer)
 	}
 	if err := p.layer.Validate(); err != nil {
-		return SSHCommandArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)
+		return SSHCommandArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	var cmdArgs []string
 	if len(pos) > 1 {
@@ -317,22 +314,22 @@ func (p *sshFlagParser) finish() (SSHCommandArgs, error) {
 
 func validateSSHFlagCombinations(p *sshFlagParser, cmdArgs []string) error {
 	if p.noCommand && len(cmdArgs) > 0 {
-		return fmt.Errorf("%w: -N 模式下不得同时提供远端命令参数", clikit.ErrUsage)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHFlagConflictCmd, i18n.Str("flag", "-N"))
 	}
 	if p.stdioFwd.IsSome() && len(cmdArgs) > 0 {
-		return fmt.Errorf("%w: -W 模式下不得同时提供远端命令参数", clikit.ErrUsage)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHFlagConflictCmd, i18n.Str("flag", "-W"))
 	}
 	if p.muxAction.IsValid() && len(cmdArgs) > 0 {
-		return fmt.Errorf("%w: -O 控制模式下不得同时提供远端命令参数", clikit.ErrUsage)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHFlagConflictCmd, i18n.Str("flag", "-O"))
 	}
 	if p.muxAction.IsValid() && p.background {
-		return fmt.Errorf("%w: -O 控制模式不能与 -f 后台守护模式同时使用", clikit.ErrUsage)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHControlConflictBg)
 	}
 	if p.background && len(cmdArgs) > 0 {
-		return fmt.Errorf("%w: -f 后台守护模式不支持附带远端命令，请配合 -N / -M 或转发规则使用", clikit.ErrUsage)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHFlagConflictCmd, i18n.Str("flag", "-f"))
 	}
 	if p.background && !p.noCommand && p.masterCnt == 0 && len(p.forwards) == 0 {
-		return fmt.Errorf("%w: -f 后台守护模式至少需要配合 -N、-M 或转发规则（-L/-R/-D/-w）", clikit.ErrUsage)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHBgRequiresForward)
 	}
 	return nil
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // ApplyCommonSSHShortOption 解析各远程命令共用的 OpenSSH 短选项（-p/-l/-i/-J/-o/-F）。
@@ -40,7 +41,7 @@ func applySSHValueFlag(flagChar byte, val string, layer *option.OptionLayer, cfg
 	case 'F':
 		return SetConfigFile(cfgFile, val)
 	default:
-		return fmt.Errorf("%w: 不支持的 SSH 短选项 -%c", ErrUsage, flagChar)
+		return i18n.EF(ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.Str("flag", string(flagChar)))
 	}
 }
 
@@ -48,7 +49,7 @@ func applySSHValueFlag(flagChar byte, val string, layer *option.OptionLayer, cfg
 func ApplyOptionKV(layer *option.OptionLayer, key, val, flagLabel string) error {
 	parsed, err := option.ParseOptionKV(key, val)
 	if err != nil {
-		return fmt.Errorf("%w: %s 参数 %q 非法: %w", ErrUsage, flagLabel, val, err)
+		return i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.BoundStr("flag", flagLabel), i18n.BoundStr("value", val))
 	}
 	*layer = layer.ApplyParsedOption(parsed)
 	return nil
@@ -59,7 +60,7 @@ func ApplyOptionKV(layer *option.OptionLayer, key, val, flagLabel string) error 
 func ApplyIdentityFile(layer *option.OptionLayer, val string) error {
 	pl, err := option.ParsePathListEntries([]string{val})
 	if err != nil {
-		return fmt.Errorf("%w: -i 参数 %q 非法: %w", ErrUsage, val, err)
+		return i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "-i"), i18n.BoundStr("value", val))
 	}
 	*layer = layer.Compose(option.UnsetOptionLayer().WithIdentityFiles(pl))
 	return nil
@@ -69,7 +70,7 @@ func ApplyIdentityFile(layer *option.OptionLayer, val string) error {
 func ApplyRawOption(layer *option.OptionLayer, directive string) error {
 	parsed, err := option.ParseOption(directive)
 	if err != nil {
-		return fmt.Errorf("%w: -o 选项 %q 无效: %w", ErrUsage, directive, err)
+		return i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "-o"), i18n.BoundStr("value", directive))
 	}
 	*layer = layer.ApplyParsedOption(parsed)
 	return nil
@@ -82,7 +83,7 @@ func ApplyRawOption(layer *option.OptionLayer, directive string) error {
 func ParseForwardFlagSpec(dir engine.ForwardDirection, raw string) (spec engine.ForwardSpec, err error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return spec, fmt.Errorf("%w: 转发规格不能为空", ErrUsage)
+		return spec, i18n.EF(ErrUsage, i18n.KeyCLIForwardEmpty)
 	}
 	if dir == engine.ForwardDynamic {
 		bindAddr, bErr := normalizeTCPBindAddr(trimmed)
@@ -92,7 +93,7 @@ func ParseForwardFlagSpec(dir engine.ForwardDirection, raw string) (spec engine.
 		return engine.NewForwardSpec(engine.ForwardDynamic, bindAddr, "")
 	}
 	if dir != engine.ForwardLocal && dir != engine.ForwardRemote {
-		return spec, fmt.Errorf("%w: 不支持的转发方向 %s", ErrUsage, dir)
+		return spec, i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidDir, i18n.Str("dir", dir.String()))
 	}
 	parts, pErr := splitForwardFields(trimmed)
 	if pErr != nil {
@@ -110,25 +111,25 @@ func buildLocalOrRemoteForwardSpec(dir engine.ForwardDirection, parts []string, 
 		if !isUnixSocketSpec(parts[0]) && isUnixSocketSpec(parts[1]) {
 			bindAddr, bErr := joinTCPHostPort("127.0.0.1", parts[0], true)
 			if bErr != nil {
-				return spec, fmt.Errorf("%w: 转发规格 %q 监听端口非法: %w", ErrUsage, raw, bErr)
+				return spec, i18n.WrapS(ErrUsage, bErr, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 			}
 			return engine.NewTypedForwardSpec(dir, engine.ForwardEndpointTCP, bindAddr, engine.ForwardEndpointUnix, parts[1])
 		}
-		return spec, fmt.Errorf("%w: 转发规格 %q 缺少目标主机或端口", ErrUsage, raw)
+		return spec, i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 	case 3:
 		return parseThreePartForward(dir, parts, raw)
 	case 4:
 		bindAddr, bErr := joinTCPHostPort(parts[0], parts[1], true)
 		if bErr != nil {
-			return spec, fmt.Errorf("%w: 转发规格 %q 监听端非法: %w", ErrUsage, raw, bErr)
+			return spec, i18n.WrapS(ErrUsage, bErr, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 		}
 		targetAddr, tErr := joinTCPHostPort(parts[2], parts[3], false)
 		if tErr != nil {
-			return spec, fmt.Errorf("%w: 转发规格 %q 目标端非法: %w", ErrUsage, raw, tErr)
+			return spec, i18n.WrapS(ErrUsage, tErr, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 		}
 		return engine.NewForwardSpec(dir, bindAddr, targetAddr)
 	default:
-		return spec, fmt.Errorf("%w: 转发规格 %q 分段数非法", ErrUsage, raw)
+		return spec, i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 	}
 }
 
@@ -137,23 +138,23 @@ func parseThreePartForward(dir engine.ForwardDirection, parts []string, raw stri
 	case isUnixSocketSpec(parts[0]):
 		targetAddr, tErr := joinTCPHostPort(parts[1], parts[2], false)
 		if tErr != nil {
-			return spec, fmt.Errorf("%w: 转发规格 %q 目标端非法: %w", ErrUsage, raw, tErr)
+			return spec, i18n.WrapS(ErrUsage, tErr, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 		}
 		return engine.NewTypedForwardSpec(dir, engine.ForwardEndpointUnix, parts[0], engine.ForwardEndpointTCP, targetAddr)
 	case isUnixSocketSpec(parts[2]):
 		bindAddr, bErr := joinTCPHostPort(parts[0], parts[1], true)
 		if bErr != nil {
-			return spec, fmt.Errorf("%w: 转发规格 %q 监听端非法: %w", ErrUsage, raw, bErr)
+			return spec, i18n.WrapS(ErrUsage, bErr, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 		}
 		return engine.NewTypedForwardSpec(dir, engine.ForwardEndpointTCP, bindAddr, engine.ForwardEndpointUnix, parts[2])
 	default:
 		bindAddr, bErr := joinTCPHostPort("127.0.0.1", parts[0], true)
 		if bErr != nil {
-			return spec, fmt.Errorf("%w: 转发规格 %q 监听端口非法: %w", ErrUsage, raw, bErr)
+			return spec, i18n.WrapS(ErrUsage, bErr, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 		}
 		targetAddr, tErr := joinTCPHostPort(parts[1], parts[2], false)
 		if tErr != nil {
-			return spec, fmt.Errorf("%w: 转发规格 %q 目标端非法: %w", ErrUsage, raw, tErr)
+			return spec, i18n.WrapS(ErrUsage, tErr, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 		}
 		return engine.NewForwardSpec(dir, bindAddr, targetAddr)
 	}
@@ -166,7 +167,7 @@ func ParseTUNForwardSpec(mode engine.TUNMode, raw string) (spec engine.ForwardSp
 	}
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return spec, fmt.Errorf("%w: -w TUN 设备规格不能为空", ErrUsage)
+		return spec, i18n.EF(ErrUsage, i18n.KeyCLITUNEmpty)
 	}
 	localPart, remotePart, hasRemote := strings.Cut(trimmed, ":")
 	if !hasRemote {
@@ -174,15 +175,15 @@ func ParseTUNForwardSpec(mode engine.TUNMode, raw string) (spec engine.ForwardSp
 	}
 	localUnit, lErr := parseTUNUnit(localPart)
 	if lErr != nil {
-		return spec, fmt.Errorf("%w: -w 本地设备编号 %q 非法: %w", ErrUsage, localPart, lErr)
+		return spec, lErr
 	}
 	remoteUnit, rErr := parseTUNUnit(remotePart)
 	if rErr != nil {
-		return spec, fmt.Errorf("%w: -w 远端设备编号 %q 非法: %w", ErrUsage, remotePart, rErr)
+		return spec, rErr
 	}
 	tun, tErr := engine.NewTUNSpec(mode, localUnit, remoteUnit)
 	if tErr != nil {
-		return spec, fmt.Errorf("%w: %w", ErrUsage, tErr)
+		return spec, i18n.WrapS(ErrUsage, tErr, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "-w"), i18n.BoundStr("value", raw))
 	}
 	return engine.NewForwardTUNSpec(tun)
 }
@@ -194,7 +195,7 @@ func parseTUNUnit(raw string) (uint32, error) {
 	}
 	v, err := strconv.ParseUint(s, 10, 32)
 	if err != nil {
-		return 0, fmt.Errorf("必须为 any 或非负整数")
+		return 0, i18n.EF(ErrUsage, i18n.KeyCLITUNInvalidUnit, i18n.BoundStr("value", raw))
 	}
 	return uint32(v), nil
 }
@@ -210,7 +211,7 @@ func normalizeTCPBindAddr(raw string) (string, error) {
 	case 2:
 		return joinTCPHostPort(parts[0], parts[1], true)
 	default:
-		return "", fmt.Errorf("%w: 动态转发 -D 参数 %q 必须为 [bind_address:]port", ErrUsage, raw)
+		return "", i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 	}
 }
 
@@ -224,7 +225,7 @@ func joinTCPHostPort(hostRaw, portRaw string, allowZeroPort bool) (string, error
 	}
 	portNum, err := strconv.ParseUint(strings.TrimSpace(portRaw), 10, 16)
 	if err != nil || (!allowZeroPort && portNum == 0) {
-		return "", fmt.Errorf("端口 %q 非法", portRaw)
+		return "", i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidPort, i18n.BoundStr("port", portRaw))
 	}
 	if portNum == 0 {
 		ch, err := netaddr.ParseCanonicalHost(host)
@@ -264,13 +265,13 @@ func splitForwardFields(raw string) ([]string, error) {
 		switch ch {
 		case '[':
 			if inBracket {
-				return nil, fmt.Errorf("%w: 转发规格 %q 存在嵌套方括号", ErrUsage, raw)
+				return nil, i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 			}
 			inBracket = true
 			cur.WriteByte(ch)
 		case ']':
 			if !inBracket {
-				return nil, fmt.Errorf("%w: 转发规格 %q 存在未匹配方括号", ErrUsage, raw)
+				return nil, i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 			}
 			inBracket = false
 			cur.WriteByte(ch)
@@ -286,7 +287,7 @@ func splitForwardFields(raw string) ([]string, error) {
 		}
 	}
 	if inBracket {
-		return nil, fmt.Errorf("%w: 转发规格 %q 方括号未闭合", ErrUsage, raw)
+		return nil, i18n.EF(ErrUsage, i18n.KeyCLIForwardInvalidSpec, i18n.BoundStr("spec", raw))
 	}
 	parts = append(parts, cur.String())
 	return parts, nil

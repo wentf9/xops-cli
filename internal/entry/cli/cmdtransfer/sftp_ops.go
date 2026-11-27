@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const defaultSFTPWriteMaxBytes int64 = 16 << 20
@@ -37,17 +38,17 @@ func dispatchSFTPOp(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 	case "recover":
 		return runSFTPRecover(ctx, rt, client, parsed, jsonOut)
 	default:
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 未知 sftp 子命令 %q", clikit.ErrUsage, parsed.sub))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "sftp"), i18n.BoundStr("sub", parsed.sub)))
 	}
 }
 
 func requireTargetAndRemotePath(parsed sftpArgs) (target string, rp pathalg.RemotePath, err error) {
 	if len(parsed.pos) != 2 {
-		return "", rp, fmt.Errorf("%w: sftp %s 需要 <target> <remote_path> 两个参数", clikit.ErrUsage, parsed.sub)
+		return "", rp, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.BoundStr("cmd", "sftp "+parsed.sub), i18n.Int("count", 2), i18n.Str("usage", "<target> <remote_path>"))
 	}
 	parsedPath, pErr := pathalg.ParseRemotePath(parsed.pos[1])
 	if pErr != nil {
-		return "", rp, fmt.Errorf("%w: 远端路径 %q 非法: %w", clikit.ErrUsage, parsed.pos[1], pErr)
+		return "", rp, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "remote path"), i18n.BoundStr("value", parsed.pos[1]))
 	}
 	return parsed.pos[0], parsedPath, nil
 }
@@ -89,8 +90,15 @@ func runSFTPStat(ctx context.Context, rt *clikit.Runtime, client clikit.Transfer
 	if err != nil {
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, st, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "path: %s\ntype: %s\nsize: %d\nmode: %04o\n", st.Path(), st.FileType(), st.Size(), st.Perm())
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLISFTPStat,
+			i18n.BoundStr("path", st.Path().String()),
+			i18n.Str("type", st.FileType().String()),
+			i18n.Int64("size", st.Size()),
+			i18n.Str("mode", fmt.Sprintf("%04o", st.Perm())),
+		))
 	})
 }
 
@@ -158,8 +166,15 @@ func runSFTPWrite(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 		BytesWritten int64                 `json:"bytes_written"`
 		Digest       security.Digest       `json:"digest"`
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, writeView{OK: true, Stat: res.Stat, BytesWritten: res.BytesWritten, Digest: res.Digest}, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "wrote %d bytes -> %s:%s (%s)\n", res.BytesWritten, target, rp, res.Digest)
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLISFTPWrote,
+			i18n.Int64("bytes", res.BytesWritten),
+			i18n.BoundStr("target", target),
+			i18n.BoundStr("path", rp.String()),
+			i18n.Str("digest", res.Digest.String()),
+		))
 	})
 }
 
@@ -170,7 +185,7 @@ func runSFTPPatch(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 	}
 	edit, err := engine.NewTextEdit(parsed.oldText, parsed.newText, parsed.replaceAll)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: --old 不能为空: %w", clikit.ErrUsage, err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--old"), i18n.BoundStr("value", parsed.oldText)))
 	}
 	res, err := client.PatchRemoteFile(ctx, engine.RemoteFilePatchRequest{
 		RemoteCall: sftpRemoteCall(target, parsed.cliOpts),
@@ -189,11 +204,17 @@ func runSFTPPatch(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 		BeforeDigest security.Digest    `json:"before_digest"`
 		AfterDigest  security.Digest    `json:"after_digest"`
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, patchView{
 		OK: true, Path: rp, Replacements: res.Replacements, BytesWritten: res.BytesWritten,
 		BeforeDigest: res.BeforeDigest, AfterDigest: res.AfterDigest,
 	}, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "patched %s (%d replacements, %d bytes)\n", rp, res.Replacements, res.BytesWritten)
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLISFTPPatch,
+			i18n.BoundStr("path", rp.String()),
+			i18n.Int("replacements", res.Replacements),
+			i18n.Int64("bytes", res.BytesWritten),
+		))
 	})
 }
 
@@ -240,22 +261,23 @@ func runSFTPSimplePathOp(ctx context.Context, rt *clikit.Runtime, client clikit.
 	if err != nil {
 		return rt.Fail(clikit.ExitSSHError, jsonOut, err)
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, pathOpView{OK: true, Action: parsed.sub, Path: rp}, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "%s ok: %s\n", parsed.sub, rp)
+		_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLISFTPActionOK, i18n.Str("action", parsed.sub), i18n.BoundStr("path", rp.String())))
 	})
 }
 
 func runSFTPRename(ctx context.Context, rt *clikit.Runtime, client clikit.TransferClient, parsed sftpArgs, jsonOut bool) int {
 	if len(parsed.pos) != 3 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: sftp %s 需要 <target> <old_path> <new_path> 三个参数", clikit.ErrUsage, parsed.sub))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.BoundStr("cmd", "sftp "+parsed.sub), i18n.Int("count", 3), i18n.Str("usage", "<target> <old_path> <new_path>")))
 	}
 	oldPath, err := pathalg.ParseRemotePath(parsed.pos[1])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 源路径 %q 非法: %w", clikit.ErrUsage, parsed.pos[1], err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "old path"), i18n.BoundStr("value", parsed.pos[1])))
 	}
 	newPath, err := pathalg.ParseRemotePath(parsed.pos[2])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 目标路径 %q 非法: %w", clikit.ErrUsage, parsed.pos[2], err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "new path"), i18n.BoundStr("value", parsed.pos[2])))
 	}
 	err = client.RenameRemoteFile(ctx, engine.RemoteRenameRequest{
 		RemoteCall: sftpRemoteCall(parsed.pos[0], parsed.cliOpts),
@@ -271,14 +293,15 @@ func runSFTPRename(ctx context.Context, rt *clikit.Runtime, client clikit.Transf
 		OldPath pathalg.RemotePath `json:"old_path"`
 		NewPath pathalg.RemotePath `json:"new_path"`
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, mvView{OK: true, OldPath: oldPath, NewPath: newPath}, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "renamed %s -> %s\n", oldPath, newPath)
+		_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLISFTPRenamed, i18n.BoundStr("old", oldPath.String()), i18n.BoundStr("new", newPath.String())))
 	})
 }
 
 func runSFTPChmod(ctx context.Context, rt *clikit.Runtime, client clikit.TransferClient, parsed sftpArgs, jsonOut bool) int {
 	if len(parsed.pos) != 3 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: sftp chmod 需要 <target> <mode> <remote_path> 三个参数", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "sftp chmod"), i18n.Int("count", 3), i18n.Str("usage", "<target> <mode> <remote_path>")))
 	}
 	mode, err := clikit.ParseOctalPerm("mode", parsed.pos[1])
 	if err != nil {
@@ -286,7 +309,7 @@ func runSFTPChmod(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 	}
 	rp, err := pathalg.ParseRemotePath(parsed.pos[2])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 远端路径 %q 非法: %w", clikit.ErrUsage, parsed.pos[2], err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "remote path"), i18n.BoundStr("value", parsed.pos[2])))
 	}
 	err = client.ChmodRemote(ctx, engine.RemotePathOpRequest{
 		RemoteCall: sftpRemoteCall(parsed.pos[0], parsed.cliOpts),
@@ -301,8 +324,10 @@ func runSFTPChmod(ctx context.Context, rt *clikit.Runtime, client clikit.Transfe
 		Path pathalg.RemotePath `json:"path"`
 		Mode string             `json:"mode"`
 	}
-	return rt.WriteResult(jsonOut, chmodView{OK: true, Path: rp, Mode: fmt.Sprintf("%04o", mode)}, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "chmod %04o %s ok\n", mode, rp)
+	modeStr := fmt.Sprintf("%04o", mode)
+	loc := rt.Loc()
+	return rt.WriteResult(jsonOut, chmodView{OK: true, Path: rp, Mode: modeStr}, func(w io.Writer) {
+		_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLISFTPChmodOK, i18n.Str("mode", modeStr), i18n.BoundStr("path", rp.String())))
 	})
 }
 
@@ -311,11 +336,11 @@ func runSFTPRecover(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 		return runSFTPRecoverAll(ctx, rt, client, parsed, jsonOut)
 	}
 	if len(parsed.pos) != 2 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: sftp recover 需要 0 个参数（全量恢复）或 <target> <transfer_id>", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLISFTPRecoverUsage))
 	}
 	tid, err := security.ParseOperationID(parsed.pos[1])
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: transfer_id %q 非法: %w", clikit.ErrUsage, parsed.pos[1], err))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "transfer_id"), i18n.BoundStr("value", parsed.pos[1])))
 	}
 	res, err := client.RecoverTransfer(ctx, engine.RecoverTransferRequest{
 		RemoteCall:        sftpRemoteCall(parsed.pos[0], parsed.cliOpts),
@@ -337,13 +362,19 @@ func runSFTPRecover(ctx context.Context, rt *clikit.Runtime, client clikit.Trans
 	if res.UncertainCommit {
 		code = clikit.ExitGeneral
 	}
+	loc := rt.Loc()
 	if rt.WriteResult(jsonOut, recOneView{
 		OK: !res.UncertainCommit, TransferID: res.TransferID, SelectedGen: res.SelectedGen,
 		UncertainCommit: res.UncertainCommit, DoNotRetry: res.UncertainCommit,
 	}, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "recovered transfer %s (generation=%d uncertain=%v)\n", res.TransferID, res.SelectedGen, res.UncertainCommit)
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLISFTPRecoveredOne,
+			i18n.Str("id", res.TransferID.String()),
+			i18n.Uint64("generation", res.SelectedGen),
+			i18n.Bool("uncertain", res.UncertainCommit),
+		))
 		if res.UncertainCommit {
-			rt.WriteErr(fmt.Sprintf("transfer %s has uncertain commit; inspect remote target before retrying", res.TransferID))
+			rt.WriteErr(loc.T(i18n.KeyCLISFTPRecoverUncertainInspect, i18n.Str("id", res.TransferID.String())))
 		}
 	}) != clikit.ExitOK {
 		return clikit.ExitGeneral
@@ -362,11 +393,12 @@ func runSFTPRecoverAll(ctx context.Context, rt *clikit.Runtime, client clikit.Tr
 		UncertainCount int            `json:"uncertain_count,omitzero"`
 		Entries        []recEntryView `json:"entries"`
 	}
+	loc := rt.Loc()
 	v := recAllView{OK: true}
 	for _, e := range res.Entries {
 		item := recEntryView{TransferID: e.TransferID, SelectedGen: e.Result.SelectedGen, UncertainCommit: e.Result.UncertainCommit}
 		if e.Err != nil {
-			item.Error = e.Err.Error()
+			item.Error = loc.RenderError(e.Err)
 			v.FailedCount++
 		}
 		if e.Result.UncertainCommit {
@@ -380,7 +412,7 @@ func runSFTPRecoverAll(ctx context.Context, rt *clikit.Runtime, client clikit.Tr
 		code = clikit.ExitGeneral
 	}
 	if rt.WriteResult(jsonOut, v, func(w io.Writer) {
-		writeRecoverAllText(rt, w, v.FailedCount, v.UncertainCount, v.Entries)
+		writeRecoverAllText(rt, loc, w, v.FailedCount, v.UncertainCount, v.Entries)
 	}) != clikit.ExitOK {
 		return clikit.ExitGeneral
 	}
@@ -394,15 +426,26 @@ type recEntryView struct {
 	Error           string               `json:"error,omitzero"`
 }
 
-func writeRecoverAllText(rt *clikit.Runtime, w io.Writer, failedCount, uncertainCount int, entries []recEntryView) {
-	_, _ = fmt.Fprintf(w, "recovered %d transfer journal(s) (failed=%d uncertain=%d)\n", len(entries), failedCount, uncertainCount)
+func writeRecoverAllText(rt *clikit.Runtime, loc *i18n.Localizer, w io.Writer, failedCount, uncertainCount int, entries []recEntryView) {
+	_, _ = fmt.Fprintln(w, loc.T(
+		i18n.KeyCLISFTPRecoveredAll,
+		i18n.Int("count", len(entries)),
+		i18n.Int("failed", failedCount),
+		i18n.Int("uncertain", uncertainCount),
+	))
 	for _, item := range entries {
-		_, _ = fmt.Fprintf(w, "  transfer=%s generation=%d uncertain=%v\n", item.TransferID, item.SelectedGen, item.UncertainCommit)
+		tid := item.TransferID.String()
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLISFTPRecoverEntry,
+			i18n.Str("id", tid),
+			i18n.Uint64("generation", item.SelectedGen),
+			i18n.Bool("uncertain", item.UncertainCommit),
+		))
 		if item.Error != "" {
-			rt.WriteErr(fmt.Sprintf("transfer %s recovery error: %s", item.TransferID, item.Error))
+			rt.WriteErr(loc.T(i18n.KeyCLISFTPRecoverError, i18n.Str("id", tid), i18n.BoundStr("err", item.Error)))
 		}
 		if item.UncertainCommit {
-			rt.WriteErr(fmt.Sprintf("transfer %s has uncertain commit; do not blindly retry", item.TransferID))
+			rt.WriteErr(loc.T(i18n.KeyCLISFTPRecoverUncertainNoRetry, i18n.Str("id", tid)))
 		}
 	}
 }

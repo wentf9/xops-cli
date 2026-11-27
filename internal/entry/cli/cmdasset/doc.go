@@ -10,19 +10,20 @@
 package cmdasset
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func requireInventoryClient(runner clikit.SessionRunner) (clikit.InventoryClient, error) {
 	c, ok := runner.(clikit.InventoryClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 InventoryClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "InventoryClient"))
 	}
 	return c, nil
 }
@@ -30,7 +31,7 @@ func requireInventoryClient(runner clikit.SessionRunner) (clikit.InventoryClient
 func requireVaultClient(runner clikit.SessionRunner) (clikit.VaultClient, error) {
 	c, ok := runner.(clikit.VaultClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 VaultClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "VaultClient"))
 	}
 	return c, nil
 }
@@ -42,7 +43,7 @@ func parseOptionalRevision(raw string) (algebraic.Option[engine.Revision], error
 	}
 	rev, err := engine.ParseRevision(trimmed)
 	if err != nil {
-		return algebraic.None[engine.Revision](), fmt.Errorf("%w: --expected-revision %q 非法: %w", clikit.ErrUsage, raw, err)
+		return algebraic.None[engine.Revision](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--expected-revision"), i18n.BoundStr("value", raw))
 	}
 	return algebraic.Some(rev), nil
 }
@@ -51,7 +52,7 @@ func parseTagsCSV(raw string, dst *[]inventory.Tag) error {
 	for _, item := range clikit.SplitCSV(raw) {
 		tag, err := inventory.ParseTag(item)
 		if err != nil {
-			return fmt.Errorf("%w: 标签 %q 非法: %w", clikit.ErrUsage, item, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "tag"), i18n.BoundStr("value", item))
 		}
 		*dst = append(*dst, tag)
 	}
@@ -62,9 +63,22 @@ func parseAliasesCSV(raw string, dst *[]inventory.Alias) error {
 	for _, item := range clikit.SplitCSV(raw) {
 		a, err := inventory.ParseAlias(item)
 		if err != nil {
-			return fmt.Errorf("%w: 别名 %q 非法: %w", clikit.ErrUsage, item, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "alias"), i18n.BoundStr("value", item))
 		}
 		*dst = append(*dst, a)
 	}
 	return nil
+}
+
+// newVaultSecretPrompt 构造携带规范英文兜底与结构化双语 TitleMessage/BodyMessage 的机密口令提示请求。
+func newVaultSecretPrompt(titleID, bodyID domi18n.MessageID, subject string) (engine.SecretPromptRequest, error) {
+	titleMsg := i18n.NewMessage(titleID)
+	bodyMsg := i18n.NewMessage(bodyID)
+	return engine.NewSecretPromptRequest(engine.SecretPromptRequestSpec{
+		Title:        titleMsg.Canonical(),
+		Prompt:       bodyMsg.Canonical(),
+		Subject:      subject,
+		TitleMessage: algebraic.Some(titleMsg),
+		BodyMessage:  algebraic.Some(bodyMsg),
+	})
 }

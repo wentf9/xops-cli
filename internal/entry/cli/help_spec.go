@@ -3,89 +3,55 @@ package cli
 import (
 	"io"
 
+	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
 	"github.com/wentf9/xops-cli/internal/entry/cli/cmdasset"
 	"github.com/wentf9/xops-cli/internal/entry/cli/cmdops"
 	"github.com/wentf9/xops-cli/internal/entry/cli/cmdssh"
 	"github.com/wentf9/xops-cli/internal/entry/cli/cmdtransfer"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
-const rootHelpText = `Usage:
-  xops [global flags] <command> [flags] [args...]
-
-Global Flags:
-  --json              Emit canonical JSON/v2 output on stdout
-  --policy <profile>  Security policy profile: direct_operator, strict_operator, strict_agent
-  -F <configfile>     Alternative per-user OpenSSH configuration file ("none" to disable)
-  -h, --help          Show help information
-  -V, --version       Print XOps build version metadata
-
-Commands:
-  ssh                 Connect to a remote host, execute a command, or manage forwards/mux
-  exec                Execute a single or batch command across one or more target nodes
-  scp                 Upload or download files over parallel SFTP/SCP transfer
-  sftp                Launch interactive SFTP shell or execute a single remote SFTP operation
-  hosts               Manage inventory hosts, identities, nodes, DAG validation & secret refs
-  creds, vault        Manage encrypted credential vault lifecycle, diagnostics & safe GC
-  tunnel, forward     Start local (-L), remote (-R), dynamic SOCKS5 (-D), or TUN (-w) forwards
-  mux                 Control OpenSSH-compatible ControlMaster multiplexers
-  playbook            Validate or run declarative v2 automation playbooks (YAML/JSON)
-  doctor              Run inventory and credential vault health diagnostics
-  audit               Reconcile crashed audit locks or inspect local audit log records
-  config              Inspect registered import formats or import external configurations
-  mcp                 Start the Model Context Protocol (MCP) server (stdio or Streamable HTTP)
-  tui                 Launch the interactive Bubble Tea v2 terminal workbench
-  version             Print XOps build version metadata without initializing Engine state
-  help                Show help for a specific command
-
-Run 'xops <command> --help' or 'xops help <command>' for details on a specific command.
-`
-
-const versionHelpText = `Usage:
-  xops version [--json]
-
-Print XOps version, commit, build time, and Go toolchain metadata without initializing Engine state.
-`
-
-func writeRootHelp(w io.Writer) {
-	_, _ = io.WriteString(w, rootHelpText)
+func writeRootHelp(w io.Writer, loc *i18n.Localizer) {
+	_, _ = io.WriteString(w, clikit.EnsureLocalizer(loc).T(i18n.KeyCLIHelpRoot))
 }
 
-func writeVersionHelp(w io.Writer) {
-	_, _ = io.WriteString(w, versionHelpText)
+func writeVersionHelp(w io.Writer, loc *i18n.Localizer) {
+	_, _ = io.WriteString(w, clikit.EnsureLocalizer(loc).T(i18n.KeyCLIHelpVersion))
 }
 
-func lookupHelpTopic(topic string) (string, bool) {
+func lookupHelpTopic(loc *i18n.Localizer, topic string) (string, bool) {
+	eff := clikit.EnsureLocalizer(loc)
 	switch topic {
 	case "ssh":
-		return cmdssh.SSHHelpText(), true
+		return cmdssh.SSHHelpText(eff), true
 	case "exec":
-		return cmdssh.ExecHelpText(), true
+		return cmdssh.ExecHelpText(eff), true
 	case "tunnel", "forward":
-		return cmdssh.TunnelHelpText(), true
+		return cmdssh.TunnelHelpText(eff), true
 	case "mux":
-		return cmdssh.MuxHelpText(), true
+		return cmdssh.MuxHelpText(eff), true
 	case "scp":
-		return cmdtransfer.SCPHelpText(), true
+		return cmdtransfer.SCPHelpText(eff), true
 	case "sftp":
-		return cmdtransfer.SFTPHelpText(), true
+		return cmdtransfer.SFTPHelpText(eff), true
 	case "hosts", "host", "inventory":
-		return cmdasset.HostsHelpText(), true
+		return cmdasset.HostsHelpText(eff), true
 	case "creds", "cred", "vault":
-		return cmdasset.VaultHelpText(), true
+		return cmdasset.VaultHelpText(eff), true
 	case "config":
-		return cmdasset.ConfigHelpText(), true
+		return cmdasset.ConfigHelpText(eff), true
 	case "playbook", "play":
-		return cmdops.PlaybookHelpText(), true
+		return cmdops.PlaybookHelpText(eff), true
 	case "doctor":
-		return cmdops.DoctorHelpText(), true
+		return cmdops.DoctorHelpText(eff), true
 	case "audit":
-		return cmdops.AuditHelpText(), true
+		return cmdops.AuditHelpText(eff), true
 	case "mcp":
-		return cmdops.MCPHelpText(), true
+		return cmdops.MCPHelpText(eff), true
 	case "tui":
-		return cmdops.TUIHelpText(), true
+		return cmdops.TUIHelpText(eff), true
 	case "version":
-		return versionHelpText, true
+		return eff.T(i18n.KeyCLIHelpVersion), true
 	default:
 		return "", false
 	}

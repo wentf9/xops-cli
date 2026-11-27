@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type hostsResolveFlags struct {
@@ -26,12 +27,12 @@ func runHostsResolve(ctx context.Context, rt *clikit.Runtime, args []string) int
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
 	if len(f.pos) != 1 || strings.TrimSpace(f.pos[0]) == "" {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: hosts resolve 需要恰好 1 个目标规格", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "hosts resolve"), i18n.Int("count", 1), i18n.Str("usage", "<target>")))
 	}
 	initOpts := rt.EffectiveInitOptions(f.common.ConfigFile, f.common.Policy)
 	return rt.WithEngine(ctx, initOpts, clikit.ExitGeneral, jsonOut, func(runner clikit.SessionRunner) int {
@@ -94,7 +95,7 @@ func parseResolveShortCluster(cur *clikit.FlagCursor, cluster string, layer *opt
 		return err
 	}
 	r, _ := utf8.DecodeRuneInString(cluster)
-	return fmt.Errorf("%w: hosts resolve 未知短选项 -%c", clikit.ErrUsage, r)
+	return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 }
 
 func renderResolvedTarget(rt *clikit.Runtime, res engine.ResolvedTarget, jsonOut bool) int {
@@ -115,8 +116,16 @@ func renderResolvedTarget(rt *clikit.Runtime, res engine.ResolvedTarget, jsonOut
 		HopCount:   res.Plan().Len(),
 		PlanDigest: res.Plan().PlanDigest().String(),
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, v, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "node=%s origin=%s endpoint=%s hops=%d digest=%s\n", v.NodeID, v.Origin, v.Endpoint, v.HopCount, v.PlanDigest)
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLIHostsResolved,
+			i18n.BoundStr("node", v.NodeID),
+			i18n.Str("origin", v.Origin),
+			i18n.BoundStr("endpoint", v.Endpoint),
+			i18n.Int("hops", v.HopCount),
+			i18n.Str("digest", v.PlanDigest),
+		))
 	})
 }
 
@@ -126,7 +135,7 @@ func runHostsValidateDAG(ctx context.Context, rt *clikit.Runtime, args []string)
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(common.JSON)
@@ -140,8 +149,14 @@ func runHostsValidateDAG(ctx context.Context, rt *clikit.Runtime, args []string)
 		if err != nil {
 			return rt.Fail(clikit.ExitGeneral, jsonOut, err)
 		}
+		loc := rt.Loc()
 		return rt.WriteResult(jsonOut, rep, func(w io.Writer) {
-			_, _ = fmt.Fprintf(w, "dag valid: max_depth=%d nodes=%d cycles=%d\n", rep.MaxObservedDepth, len(rep.TopoOrder), len(rep.Cycles))
+			_, _ = fmt.Fprintln(w, loc.T(
+				i18n.KeyCLIHostsDAGValid,
+				i18n.Int("max_depth", rep.MaxObservedDepth),
+				i18n.Int("nodes", len(rep.TopoOrder)),
+				i18n.Int("cycles", len(rep.Cycles)),
+			))
 		})
 	})
 }
@@ -158,7 +173,7 @@ func runHostsCheckSecretRefs(ctx context.Context, rt *clikit.Runtime, args []str
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -180,8 +195,9 @@ func runHostsCheckSecretRefs(ctx context.Context, rt *clikit.Runtime, args []str
 			OK         bool                        `json:"ok"`
 			References []inventory.SecretReference `json:"references"`
 		}
+		loc := rt.Loc()
 		return rt.WriteResult(jsonOut, view{OK: true, References: refs}, func(w io.Writer) {
-			_, _ = fmt.Fprintf(w, "found %d reference(s)\n", len(refs))
+			_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLIHostsFoundRefs, i18n.Int("count", len(refs))))
 			for _, r := range refs {
 				_, _ = fmt.Fprintf(w, "  %s owner=%s ref=%s\n", r.Location, r.OwnerID, r.Ref)
 			}
@@ -214,7 +230,7 @@ func parseSecretRefCheckToken(cur *clikit.FlagCursor, f *secretRefCheckFlags) er
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: hosts check-secret-refs 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 	if err != nil {
@@ -226,7 +242,7 @@ func parseSecretRefCheckToken(cur *clikit.FlagCursor, f *secretRefCheckFlags) er
 	case "store":
 		f.storeID = val
 	default:
-		return fmt.Errorf("%w: hosts check-secret-refs 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	return nil
 }
@@ -234,13 +250,13 @@ func parseSecretRefCheckToken(cur *clikit.FlagCursor, f *secretRefCheckFlags) er
 func buildSecretRefCheckReq(refRaw, storeID string) (engine.SecretRefCheckRequest, error) {
 	hasRef, hasStore := strings.TrimSpace(refRaw) != "", strings.TrimSpace(storeID) != ""
 	if hasRef == hasStore {
-		return engine.SecretRefCheckRequest{}, fmt.Errorf("%w: 必须二选一指定 --ref <store/item> 或 --store <store_id>", clikit.ErrUsage)
+		return engine.SecretRefCheckRequest{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIExactlyOneFlagRequired, i18n.Str("flag_a", "--ref"), i18n.Str("flag_b", "--store"))
 	}
 	var req engine.SecretRefCheckRequest
 	if hasRef {
 		ref, err := secret.ParseRef(refRaw)
 		if err != nil {
-			return engine.SecretRefCheckRequest{}, fmt.Errorf("%w: --ref 非法: %w", clikit.ErrUsage, err)
+			return engine.SecretRefCheckRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--ref"), i18n.BoundStr("value", refRaw))
 		}
 		req.Ref = ref
 	} else {

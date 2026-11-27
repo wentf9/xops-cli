@@ -154,9 +154,9 @@ func assertSSHDaemonAndNoCommand(t *testing.T) {
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_ = hKeep.app.Run(cancelCtx, []string{"ssh", "-N", "-M", "-L", "8080:db:5432", "web"})
+	hKeep2 := newFullAppHarness(t, nil, nil)
 	runCtx, stopRun := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer stopRun()
-	hKeep2 := newFullAppHarness(t, nil, nil)
 	if code := hKeep2.app.Run(runCtx, []string{"ssh", "-N", "-M", "-L", "8080:db:5432", "web"}); code != 0 {
 		t.Fatalf("ssh -N -M -L 在 ctx 取消时应正常退出 0: code=%d stderr=%q", code, hKeep2.stderr.String())
 	}
@@ -232,9 +232,9 @@ func TestApp_ExecSinglePrivilegedAndBatchStream(t *testing.T) {
 func TestApp_TunnelAndMuxCommands(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
+	h := newFullAppHarness(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	h := newFullAppHarness(t, nil, nil)
 	if code := h.app.Run(ctx, []string{"tunnel", "-L", "8080:app:80", "-D", "1080", "-w", "0:1", "--tun-mode", "ethernet", "bastion"}); code != 0 {
 		t.Fatalf("tunnel 多转发失败: code=%d stderr=%q", code, h.stderr.String())
 	}
@@ -243,9 +243,9 @@ func TestApp_TunnelAndMuxCommands(t *testing.T) {
 	}
 
 	// 验证 tunnel 显式子命令形式及 mux 各动作。
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Millisecond)
-	defer cancel2()
 	hDyn := newFullAppHarness(t, nil, nil)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel2()
 	if code := hDyn.app.Run(ctx2, []string{"forward", "dynamic", "bastion", "1080"}); code != 0 || len(hDyn.eng.lastFwdReqs) != 1 {
 		t.Fatalf("forward dynamic 失败: code=%d fwds=%d", code, len(hDyn.eng.lastFwdReqs))
 	}

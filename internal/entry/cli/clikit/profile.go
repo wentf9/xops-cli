@@ -1,10 +1,9 @@
 package clikit
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // BuildLaunchProfile 依据 core/domain/execution 的组合约束矩阵，将部分指定的
@@ -26,7 +25,7 @@ func BuildLaunchProfile(
 		Login:       resolvedLogin,
 	})
 	if pErr != nil {
-		return prof, fmt.Errorf("%w: 启动配置组合非法: %w", ErrUsage, pErr)
+		return prof, i18n.WrapS(ErrUsage, pErr, i18n.KeyCLIInvalidLaunchProfile)
 	}
 	return built, nil
 }

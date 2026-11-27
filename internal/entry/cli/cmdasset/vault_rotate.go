@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type rotateSecretFlags struct {
@@ -44,7 +45,7 @@ func runVaultRotate(ctx context.Context, rt *clikit.Runtime, args []string) int 
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
+		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -92,7 +93,7 @@ func parseRotateSecretToken(cur *clikit.FlagCursor, f *rotateSecretFlags) error 
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: vault rotate 未知选项 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 	if err != nil {
@@ -106,20 +107,20 @@ func parseRotateSecretToken(cur *clikit.FlagCursor, f *rotateSecretFlags) error 
 	case "expected-revision":
 		f.expRevRaw = val
 	default:
-		return fmt.Errorf("%w: vault rotate 未知选项 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	return nil
 }
 
 func buildRotateSecretReq(f rotateSecretFlags) (engine.InteractiveRotateSecretRequest, error) {
 	if len(f.pos) != 1 {
-		return engine.InteractiveRotateSecretRequest{}, fmt.Errorf("%w: vault rotate 需要恰好 1 个旧凭据引用 <store>/<item>", clikit.ErrUsage)
+		return engine.InteractiveRotateSecretRequest{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "vault rotate"), i18n.Int("count", 1), i18n.Str("usage", "<store>/<item>"))
 	}
 	oldRef, err := secret.ParseRef(f.pos[0])
 	if err != nil {
-		return engine.InteractiveRotateSecretRequest{}, fmt.Errorf("%w: 旧凭据引用非法: %w", clikit.ErrUsage, err)
+		return engine.InteractiveRotateSecretRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", f.pos[0]))
 	}
-	newRef, store, err := parseTargetRefOrStore(f.newRefRaw, f.store, "rotate")
+	newRef, store, err := parseTargetRefOrStore(f.newRefRaw, f.store)
 	if err != nil {
 		return engine.InteractiveRotateSecretRequest{}, err
 	}
@@ -127,9 +128,7 @@ func buildRotateSecretReq(f rotateSecretFlags) (engine.InteractiveRotateSecretRe
 	if err != nil {
 		return engine.InteractiveRotateSecretRequest{}, err
 	}
-	prompt, err := engine.NewSecretPromptRequest(engine.SecretPromptRequestSpec{
-		Title: "Rotate Secret", Prompt: "Enter new secret value", Subject: oldRef.String(),
-	})
+	prompt, err := newVaultSecretPrompt(i18n.KeyInteractVaultRotateTitle, i18n.KeyInteractVaultRotatePrompt, oldRef.String())
 	if err != nil {
 		return engine.InteractiveRotateSecretRequest{}, err
 	}
@@ -146,15 +145,15 @@ func buildRotateSecretReq(f rotateSecretFlags) (engine.InteractiveRotateSecretRe
 }
 
 // parseTargetRefOrStore 严格校验 --ref/--new-ref 与 --store 互斥二选一约束，对齐 VaultSagaRequest 不变量。
-func parseTargetRefOrStore(refRaw, storeRaw, sub string) (ref secret.Ref, store string, err error) {
+func parseTargetRefOrStore(refRaw, storeRaw string) (ref secret.Ref, store string, err error) {
 	trimmedRef, trimmedStore := strings.TrimSpace(refRaw), strings.TrimSpace(storeRaw)
 	if (trimmedRef == "") == (trimmedStore == "") {
-		return ref, "", fmt.Errorf("%w: vault %s 必须二选一指定 --ref/--new-ref <store>/<item> 或 --store <store_id>", clikit.ErrUsage, sub)
+		return ref, "", i18n.EF(clikit.ErrUsage, i18n.KeyCLIExactlyOneFlagRequired, i18n.Str("flag_a", "--ref/--new-ref"), i18n.Str("flag_b", "--store"))
 	}
 	if trimmedRef != "" {
 		parsed, pErr := secret.ParseRef(trimmedRef)
 		if pErr != nil {
-			return ref, "", fmt.Errorf("%w: 凭据引用 %q 非法: %w", clikit.ErrUsage, trimmedRef, pErr)
+			return ref, "", i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidField, i18n.Str("field", "secret ref"), i18n.BoundStr("value", trimmedRef))
 		}
 		return parsed, "", nil
 	}
@@ -174,16 +173,17 @@ func renderSagaResult(rt *clikit.Runtime, action string, res engine.SagaResult, 
 	if !ok {
 		code = clikit.ExitGeneral
 	}
-	v := buildSagaResultView(action, res, runErr, ok, uncertainDur, uncertainFail)
+	loc := rt.Loc()
+	v := buildSagaResultView(loc, action, res, runErr, ok, uncertainDur, uncertainFail)
 	if rt.WriteResult(jsonOut, v, func(w io.Writer) {
-		writeSagaResultText(rt, w, v, runErr)
+		writeSagaResultText(rt, loc, w, v, runErr)
 	}) != clikit.ExitOK {
 		return clikit.ExitGeneral
 	}
 	return code
 }
 
-func buildSagaResultView(action string, res engine.SagaResult, runErr error, ok, uncertainDur, uncertainFail bool) sagaResultView {
+func buildSagaResultView(loc *i18n.Localizer, action string, res engine.SagaResult, runErr error, ok, uncertainDur, uncertainFail bool) sagaResultView {
 	v := sagaResultView{
 		OK:                  ok,
 		Action:              action,
@@ -203,19 +203,25 @@ func buildSagaResultView(action string, res engine.SagaResult, runErr error, ok,
 		v.OldRef = oldRef.String()
 	}
 	if runErr != nil {
-		v.Error = runErr.Error()
+		v.Error = loc.RenderError(runErr)
 		v.ErrorCode = clikit.ClassifyErrorCode(runErr)
 	}
 	return v
 }
 
-func writeSagaResultText(rt *clikit.Runtime, w io.Writer, v sagaResultView, runErr error) {
-	_, _ = fmt.Fprintf(w, "%s state=%s new_ref=%s old_deleted=%v compensated=%v\n",
-		v.Action, v.State, v.NewRef, v.OldDeleted, v.Compensated)
+func writeSagaResultText(rt *clikit.Runtime, loc *i18n.Localizer, w io.Writer, v sagaResultView, runErr error) {
+	_, _ = fmt.Fprintln(w, loc.T(
+		i18n.KeyCLIVaultSagaResult,
+		i18n.Str("action", v.Action),
+		i18n.Str("state", v.State),
+		i18n.BoundStr("new_ref", v.NewRef),
+		i18n.Bool("old_deleted", v.OldDeleted),
+		i18n.Bool("compensated", v.Compensated),
+	))
 	if v.DoNotRetry {
-		rt.WriteErr(v.Action + ": uncertain outcome or durability (do not retry or delete credentials)")
+		rt.WriteErr(loc.T(i18n.KeyCLIVaultSagaUncertain, i18n.Str("action", v.Action)))
 	}
 	if runErr != nil {
-		rt.WriteErr(runErr.Error())
+		rt.WriteErr(loc.RenderError(runErr))
 	}
 }

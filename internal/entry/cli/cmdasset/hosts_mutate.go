@@ -7,12 +7,14 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type mutationView struct {
@@ -33,8 +35,14 @@ func renderMutationResult(rt *clikit.Runtime, action string, res engine.Mutation
 		DeletedSecrets:  res.DeletedSecrets(),
 		RetainedSecrets: res.RetainedSecrets(),
 	}
+	loc := rt.Loc()
 	return rt.WriteResult(jsonOut, v, func(w io.Writer) {
-		_, _ = fmt.Fprintf(w, "%s ok: revision=%s durability=%s\n", action, res.Revision(), res.Durability().Status())
+		_, _ = fmt.Fprintln(w, loc.T(
+			i18n.KeyCLIHostsMutationOK,
+			i18n.Str("action", action),
+			i18n.BoundStr("revision", res.Revision().String()),
+			i18n.Str("durability", res.Durability().Status().String()),
+		))
 	})
 }
 
@@ -54,7 +62,7 @@ func runHostUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, args 
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -100,7 +108,7 @@ func parseHostUpsertFlags(args []string) (hostUpsertFlags, error) {
 		}
 		name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 		if !isLong {
-			return f, fmt.Errorf("%w: host 未知参数 %q", clikit.ErrUsage, tok)
+			return f, i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 		}
 		val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 		if err != nil {
@@ -128,7 +136,7 @@ func applyHostFlagValue(name, val, rawTok string, f *hostUpsertFlags) error {
 	case "expected-revision":
 		f.expRevRaw = val
 	default:
-		return fmt.Errorf("%w: host 参数未知 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }
@@ -136,17 +144,17 @@ func applyHostFlagValue(name, val, rawTok string, f *hostUpsertFlags) error {
 func buildHostMutationReq(f hostUpsertFlags) (engine.HostMutationRequest, error) {
 	id, err := inventory.ParseHostID(f.idRaw)
 	if err != nil {
-		return engine.HostMutationRequest{}, fmt.Errorf("%w: --id 非法: %w", clikit.ErrUsage, err)
+		return engine.HostMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--id"), i18n.BoundStr("value", f.idRaw))
 	}
 	ep, err := netaddr.ParseEndpoint(f.addrRaw)
 	if err != nil {
-		return engine.HostMutationRequest{}, fmt.Errorf("%w: --address 非法: %w", clikit.ErrUsage, err)
+		return engine.HostMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--address"), i18n.BoundStr("value", f.addrRaw))
 	}
 	var aliasOpt algebraic.Option[inventory.Alias]
 	if strings.TrimSpace(f.aliasRaw) != "" {
 		a, err := inventory.ParseAlias(f.aliasRaw)
 		if err != nil {
-			return engine.HostMutationRequest{}, fmt.Errorf("%w: --alias 非法: %w", clikit.ErrUsage, err)
+			return engine.HostMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--alias"), i18n.BoundStr("value", f.aliasRaw))
 		}
 		aliasOpt = algebraic.Some(a)
 	}
@@ -156,7 +164,7 @@ func buildHostMutationReq(f hostUpsertFlags) (engine.HostMutationRequest, error)
 	}
 	host, err := inventory.NewHost(inventory.HostSpec{ID: id, Endpoint: ep, Alias: aliasOpt, Description: f.desc, Tags: f.tags})
 	if err != nil {
-		return engine.HostMutationRequest{}, fmt.Errorf("%w: %w", clikit.ErrUsage, err)
+		return engine.HostMutationRequest{}, domi18n.WrapSentinel(clikit.ErrUsage, err)
 	}
 	return engine.HostMutationRequest{Host: host, ExpectedRevision: expRev}, nil
 }
@@ -184,7 +192,7 @@ func runIdentityUpsert(ctx context.Context, rt *clikit.Runtime, isUpdate bool, a
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, HostsHelpText())
+		_, _ = io.WriteString(rt.Stdout, HostsHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -238,7 +246,7 @@ func parseIdentityToken(cur *clikit.FlagCursor, f *identityUpsertFlags) error {
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: identity 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	if name == "gc-old-secrets" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
@@ -279,7 +287,7 @@ func applyIdentityFlagValue(name, val, rawTok string, f *identityUpsertFlags) er
 	case "expected-revision":
 		f.expRevRaw = val
 	default:
-		return fmt.Errorf("%w: identity 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }
@@ -287,11 +295,11 @@ func applyIdentityFlagValue(name, val, rawTok string, f *identityUpsertFlags) er
 func buildIdentityMutationReq(f identityUpsertFlags) (engine.IdentityMutationRequest, error) {
 	id, err := inventory.ParseIdentityID(f.idRaw)
 	if err != nil {
-		return engine.IdentityMutationRequest{}, fmt.Errorf("%w: --id 非法: %w", clikit.ErrUsage, err)
+		return engine.IdentityMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--id"), i18n.BoundStr("value", f.idRaw))
 	}
 	user, err := option.ParseUsername(f.userRaw)
 	if err != nil {
-		return engine.IdentityMutationRequest{}, fmt.Errorf("%w: --user 非法: %w", clikit.ErrUsage, err)
+		return engine.IdentityMutationRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--user"), i18n.BoundStr("value", f.userRaw))
 	}
 	auth, err := buildAuthMethod(f)
 	if err != nil {
@@ -303,7 +311,7 @@ func buildIdentityMutationReq(f identityUpsertFlags) (engine.IdentityMutationReq
 	}
 	ident, err := inventory.NewIdentity(inventory.IdentitySpec{ID: id, User: user, Auth: auth, Description: f.desc, Tags: f.tags})
 	if err != nil {
-		return engine.IdentityMutationRequest{}, fmt.Errorf("%w: %w", clikit.ErrUsage, err)
+		return engine.IdentityMutationRequest{}, domi18n.WrapSentinel(clikit.ErrUsage, err)
 	}
 	return engine.IdentityMutationRequest{Identity: ident, ExpectedRevision: expRev, GCUnreferencedOldSecrets: f.gcOld}, nil
 }
@@ -315,7 +323,7 @@ func buildAuthMethod(f identityUpsertFlags) (inventory.AuthMethod, error) {
 		if strings.TrimSpace(f.agentSpec) != "" {
 			s, err := inventory.ParseAgentSpec(f.agentSpec)
 			if err != nil {
-				return nil, fmt.Errorf("%w: --agent-spec 非法: %w", clikit.ErrUsage, err)
+				return nil, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--agent-spec"), i18n.BoundStr("value", f.agentSpec))
 			}
 			specOpt = algebraic.Some(s)
 		}
@@ -323,37 +331,37 @@ func buildAuthMethod(f identityUpsertFlags) (inventory.AuthMethod, error) {
 	case "password":
 		ref, err := secret.ParseRef(f.passRefRaw)
 		if err != nil {
-			return nil, fmt.Errorf("%w: password 认证需要合法 --password-ref: %w", clikit.ErrUsage, err)
+			return nil, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--password-ref"), i18n.BoundStr("value", f.passRefRaw))
 		}
 		return inventory.NewAuthPassword(ref)
 	case "private_key":
 		return buildPrivateKeyAuth(f)
 	default:
-		return nil, fmt.Errorf("%w: --auth-kind 必须为 agent|password|private_key，实际=%q", clikit.ErrUsage, f.authKind)
+		return nil, i18n.EF(clikit.ErrUsage, i18n.KeyCLIInvalidFlagValueEnum, i18n.Str("flag", "--auth-kind"), i18n.Str("allowed", "agent|password|private_key"), i18n.BoundStr("value", f.authKind))
 	}
 }
 
 func buildPrivateKeyAuth(f identityUpsertFlags) (inventory.AuthMethod, error) {
 	if len(f.keyPaths) == 0 {
-		return nil, fmt.Errorf("%w: private_key 认证至少需要一个 --key-path", clikit.ErrUsage)
+		return nil, i18n.EF(clikit.ErrUsage, i18n.KeyCLIMissingRequiredFlag, i18n.Str("cmd", "private_key"), i18n.Str("flag", "--key-path"))
 	}
 	var keys []inventory.KeyPathSpec
 	for _, raw := range f.keyPaths {
 		k, err := inventory.ParseKeyPathSpec(raw)
 		if err != nil {
-			return nil, fmt.Errorf("%w: --key-path %q 非法: %w", clikit.ErrUsage, raw, err)
+			return nil, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--key-path"), i18n.BoundStr("value", raw))
 		}
 		keys = append(keys, k)
 	}
 	neKeys, err := algebraic.NonEmptyFromSlice(keys)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", clikit.ErrUsage, err)
+		return nil, domi18n.WrapSentinel(clikit.ErrUsage, err)
 	}
 	var certs []inventory.CertPathSpec
 	for _, raw := range f.certPaths {
 		c, err := inventory.ParseCertPathSpec(raw)
 		if err != nil {
-			return nil, fmt.Errorf("%w: --cert-path %q 非法: %w", clikit.ErrUsage, raw, err)
+			return nil, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--cert-path"), i18n.BoundStr("value", raw))
 		}
 		certs = append(certs, c)
 	}
@@ -370,15 +378,15 @@ func buildPassphraseBinding(passphraseRaw, keyFPRaw string) (algebraic.Option[in
 	}
 	ref, err := secret.ParseRef(passphraseRaw)
 	if err != nil {
-		return algebraic.None[inventory.KeyPassphraseBinding](), fmt.Errorf("%w: --passphrase-ref 非法: %w", clikit.ErrUsage, err)
+		return algebraic.None[inventory.KeyPassphraseBinding](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--passphrase-ref"), i18n.BoundStr("value", passphraseRaw))
 	}
 	fp, err := inventory.ParseKeyFingerprint(keyFPRaw)
 	if err != nil {
-		return algebraic.None[inventory.KeyPassphraseBinding](), fmt.Errorf("%w: --key-fingerprint 非法: %w", clikit.ErrUsage, err)
+		return algebraic.None[inventory.KeyPassphraseBinding](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--key-fingerprint"), i18n.BoundStr("value", keyFPRaw))
 	}
 	pb, err := inventory.NewKeyPassphraseBinding(ref, fp)
 	if err != nil {
-		return algebraic.None[inventory.KeyPassphraseBinding](), fmt.Errorf("%w: %w", clikit.ErrUsage, err)
+		return algebraic.None[inventory.KeyPassphraseBinding](), domi18n.WrapSentinel(clikit.ErrUsage, err)
 	}
 	return algebraic.Some(pb), nil
 }

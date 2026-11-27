@@ -1,19 +1,21 @@
 package clikit
 
 import (
-	"fmt"
 	"io/fs"
 	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
-// CommonFlags 聚合所有命令统一支持的跨命令选项（--json / --policy / -F / -h）。
+// CommonFlags 聚合所有命令统一支持的跨命令选项（--json / --policy / --lang / -F / -h）。
 type CommonFlags struct {
 	JSON       bool
 	Policy     engine.PolicyProfile
+	Locale     algebraic.Option[domi18n.Locale]
 	ConfigFile string
 	ShowHelp   bool
 }
@@ -56,7 +58,7 @@ func (c *FlagCursor) ConsumeShortArg(flagChar byte, remainder string) (string, e
 		return remainder, nil
 	}
 	if !c.HasNext() {
-		return "", fmt.Errorf("%w: 选项 -%c 缺少参数值", ErrUsage, flagChar)
+		return "", i18n.EF(ErrUsage, i18n.KeyCLIMissingShortValue, i18n.Str("flag", string(flagChar)))
 	}
 	return c.Next(), nil
 }
@@ -115,12 +117,12 @@ func (c *FlagCursor) ConsumeLongValue(name, inlineVal string, hasEq bool) (strin
 		return inlineVal, nil
 	}
 	if !c.HasNext() {
-		return "", fmt.Errorf("%w: 选项 --%s 缺少参数值", ErrUsage, name)
+		return "", i18n.EF(ErrUsage, i18n.KeyCLIMissingLongValue, i18n.BoundStr("flag", name))
 	}
 	return c.Next(), nil
 }
 
-// ParseGlobalPrefix 解析出现在子命令之前的全局前置标志（--json / --policy / -F / -h / --help / -V / --version）。
+// ParseGlobalPrefix 解析出现在子命令之前的全局前置标志（--json / --policy / --lang / --ssh-config / -F / -h / --help / -V / --version）。
 // 遇到首个子命令词时立即停止，返回剩余参数切片。
 func ParseGlobalPrefix(args []string) (CommonFlags, []string, error) {
 	var cf CommonFlags
@@ -168,7 +170,7 @@ func consumeGlobalPrefixToken(cur *FlagCursor, cf *CommonFlags) (bool, error) {
 	return false, nil
 }
 
-// TryConsumeCommonLongFlag 尝试解析统一长选项（--json / --policy / --ssh-config / --help）。
+// TryConsumeCommonLongFlag 尝试解析统一长选项（--json / --policy / --lang / --ssh-config / --help）。
 // 若当前 token 匹配则消耗并更新 cf 返回 (true, nil)；不匹配返回 (false, nil) 不推进游标。
 func TryConsumeCommonLongFlag(cur *FlagCursor, cf *CommonFlags) (bool, error) {
 	tok := cur.Peek()
@@ -180,7 +182,7 @@ func TryConsumeCommonLongFlag(cur *FlagCursor, cf *CommonFlags) (bool, error) {
 	case "help":
 		cur.Next()
 		if hasEq {
-			return false, fmt.Errorf("%w: --help 不接受参数值", ErrUsage)
+			return false, i18n.EF(ErrUsage, i18n.KeyCLIHelpNoValue)
 		}
 		cf.ShowHelp = true
 		return true, nil
@@ -193,17 +195,9 @@ func TryConsumeCommonLongFlag(cur *FlagCursor, cf *CommonFlags) (bool, error) {
 		cf.JSON = v
 		return true, nil
 	case "policy":
-		cur.Next()
-		raw, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
-		if err != nil {
-			return false, err
-		}
-		p, err := engine.ParsePolicyProfile(raw)
-		if err != nil {
-			return false, fmt.Errorf("%w: --policy 参数 %q 非法: %w", ErrUsage, raw, err)
-		}
-		cf.Policy = p
-		return true, nil
+		return consumePolicyLongFlag(cur, cf, name, inlineVal, hasEq)
+	case "lang":
+		return consumeLangLongFlag(cur, cf, name, inlineVal, hasEq)
 	case "ssh-config":
 		cur.Next()
 		raw, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
@@ -216,10 +210,38 @@ func TryConsumeCommonLongFlag(cur *FlagCursor, cf *CommonFlags) (bool, error) {
 	}
 }
 
+func consumePolicyLongFlag(cur *FlagCursor, cf *CommonFlags, name, inlineVal string, hasEq bool) (bool, error) {
+	cur.Next()
+	raw, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
+	if err != nil {
+		return false, err
+	}
+	p, err := engine.ParsePolicyProfile(raw)
+	if err != nil {
+		return false, i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--policy"), i18n.BoundStr("value", raw))
+	}
+	cf.Policy = p
+	return true, nil
+}
+
+func consumeLangLongFlag(cur *FlagCursor, cf *CommonFlags, name, inlineVal string, hasEq bool) (bool, error) {
+	cur.Next()
+	raw, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
+	if err != nil {
+		return false, err
+	}
+	loc, err := domi18n.ParseLocale(raw)
+	if err != nil {
+		return false, i18n.WrapS(ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--lang"), i18n.BoundStr("value", raw))
+	}
+	cf.Locale = algebraic.Some(loc)
+	return true, nil
+}
+
 // SetConfigFile 校验并写入 OpenSSH `-F` 配置文件覆写路径（拒绝纯空白字符串）。
 func SetConfigFile(dst *string, raw string) error {
 	if strings.TrimSpace(raw) == "" {
-		return fmt.Errorf("%w: -F 配置文件路径不能为空", ErrUsage)
+		return i18n.EF(ErrUsage, i18n.KeyCLIEmptyConfigFile)
 	}
 	*dst = raw
 	return nil
@@ -236,7 +258,7 @@ func ParseOptionalBool(name, inlineVal string, hasEq bool) (bool, error) {
 	case "false", "0", "no":
 		return false, nil
 	default:
-		return false, fmt.Errorf("%w: 布尔选项 --%s 参数 %q 非法", ErrUsage, name, inlineVal)
+		return false, i18n.EF(ErrUsage, i18n.KeyCLIInvalidBoolFlag, i18n.BoundStr("flag", name), i18n.BoundStr("value", inlineVal))
 	}
 }
 
@@ -244,7 +266,7 @@ func ParseOptionalBool(name, inlineVal string, hasEq bool) (bool, error) {
 func ParsePositiveInt(flagName, raw string) (int, error) {
 	v, err := strconv.Atoi(strings.TrimSpace(raw))
 	if err != nil || v <= 0 {
-		return 0, fmt.Errorf("%w: %s 需要正整数，实际=%q", ErrUsage, flagName, raw)
+		return 0, i18n.EF(ErrUsage, i18n.KeyCLIInvalidPositiveInt, i18n.BoundStr("flag", flagName), i18n.BoundStr("value", raw))
 	}
 	return v, nil
 }
@@ -253,7 +275,7 @@ func ParsePositiveInt(flagName, raw string) (int, error) {
 func ParseNonNegInt64(flagName, raw string) (int64, error) {
 	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil || v < 0 {
-		return 0, fmt.Errorf("%w: %s 需要非负整数，实际=%q", ErrUsage, flagName, raw)
+		return 0, i18n.EF(ErrUsage, i18n.KeyCLIInvalidNonNegInt, i18n.BoundStr("flag", flagName), i18n.BoundStr("value", raw))
 	}
 	return v, nil
 }
@@ -262,7 +284,7 @@ func ParseNonNegInt64(flagName, raw string) (int64, error) {
 func ParseNonNegUint64(flagName, raw string) (uint64, error) {
 	v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("%w: %s 需要非负整数，实际=%q", ErrUsage, flagName, raw)
+		return 0, i18n.EF(ErrUsage, i18n.KeyCLIInvalidNonNegInt, i18n.BoundStr("flag", flagName), i18n.BoundStr("value", raw))
 	}
 	return v, nil
 }
@@ -271,7 +293,7 @@ func ParseNonNegUint64(flagName, raw string) (uint64, error) {
 func ParsePositiveDuration(flagName, raw string) (algebraic.Duration, error) {
 	d, err := algebraic.ParseDuration(strings.TrimSpace(raw))
 	if err != nil || !d.IsPositive() {
-		return algebraic.ZeroDuration(), fmt.Errorf("%w: %s 需要正时长（如 30s、5m），实际=%q", ErrUsage, flagName, raw)
+		return algebraic.ZeroDuration(), i18n.EF(ErrUsage, i18n.KeyCLIInvalidDuration, i18n.BoundStr("flag", flagName), i18n.BoundStr("value", raw))
 	}
 	return d, nil
 }
@@ -280,11 +302,11 @@ func ParsePositiveDuration(flagName, raw string) (algebraic.Duration, error) {
 func ParseOctalPerm(flagName, raw string) (fs.FileMode, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
-		return 0, fmt.Errorf("%w: %s 权限不能为空", ErrUsage, flagName)
+		return 0, i18n.EF(ErrUsage, i18n.KeyCLIEmptyPerm, i18n.BoundStr("flag", flagName))
 	}
 	v, err := strconv.ParseUint(trimmed, 8, 32)
 	if err != nil || v == 0 || v > 0o777 {
-		return 0, fmt.Errorf("%w: %s 需要合法八进制权限位（0001..0777），实际=%q", ErrUsage, flagName, raw)
+		return 0, i18n.EF(ErrUsage, i18n.KeyCLIInvalidOctalPerm, i18n.BoundStr("flag", flagName), i18n.BoundStr("value", raw))
 	}
 	return fs.FileMode(v), nil
 }
@@ -293,7 +315,7 @@ func ParseOctalPerm(flagName, raw string) (fs.FileMode, error) {
 func ParseKeyValue(flagName, raw string) (key, val string, err error) {
 	k, v, ok := strings.Cut(raw, "=")
 	if !ok || strings.TrimSpace(k) == "" {
-		return "", "", fmt.Errorf("%w: %s 需要 KEY=VALUE 格式，实际=%q", ErrUsage, flagName, raw)
+		return "", "", i18n.EF(ErrUsage, i18n.KeyCLIInvalidKeyValue, i18n.BoundStr("flag", flagName), i18n.BoundStr("value", raw))
 	}
 	return k, v, nil
 }

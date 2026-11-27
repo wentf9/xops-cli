@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // RunSSH 执行 `xops ssh` 全量路径：交互/命令会话、-O 多路复用控制、-M/-N 隧道常驻与 -f 守护移交。
@@ -21,12 +22,12 @@ func RunSSH(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, SSHHelpText())
+		_, _ = io.WriteString(rt.Stdout, SSHHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.JSON)
 	if parsed.StdioForward.IsSome() {
-		return rt.Fail(clikit.ExitSSHError, jsonOut, fmt.Errorf("%w: -W host:port stdio 转发暂未在引擎门面开放，请使用 -J ProxyJump 或 -O proxy", engine.ErrUnsupported))
+		return rt.Fail(clikit.ExitSSHError, jsonOut, i18n.EF(engine.ErrUnsupported, i18n.KeyCLISSHStdioFwdUnsupported))
 	}
 	if parsed.Background {
 		return runSSHBackground(ctx, rt, parsed, jsonOut)
@@ -39,7 +40,7 @@ func RunSSH(ctx context.Context, rt *clikit.Runtime, args []string) int {
 
 func runSSHBackground(ctx context.Context, rt *clikit.Runtime, parsed SSHCommandArgs, jsonOut bool) int {
 	if rt.Hooks.RunMuxDaemon == nil {
-		return rt.Fail(clikit.ExitSSHError, jsonOut, fmt.Errorf("%w: 未注入 RunMuxDaemon 回调，无法执行 -f 后台驻留", clikit.ErrNotConfigured))
+		return rt.Fail(clikit.ExitSSHError, jsonOut, i18n.EF(clikit.ErrNotConfigured, i18n.KeyCLIHookNotConfigured, i18n.Str("hook", "RunMuxDaemon")))
 	}
 	sockOpt, err := parseOptionalControlSocket(parsed.ControlSocket)
 	if err != nil {
@@ -47,6 +48,7 @@ func runSSHBackground(ctx context.Context, rt *clikit.Runtime, parsed SSHCommand
 	}
 	req := clikit.MuxDaemonStartRequest{
 		InitOptions: rt.EffectiveInitOptions(parsed.ConfigFile, parsed.Policy),
+		Locale:      rt.EffectiveLocale(),
 		TargetSpec:  parsed.TargetSpec,
 		CLIOptions:  parsed.CLIOptions,
 		Forwards:    parsed.Forwards,
@@ -104,7 +106,7 @@ func runSSHMuxControl(ctx context.Context, rt *clikit.Runtime, runner clikit.Ses
 	}
 	if parsed.MuxAction == engine.MuxActionForward || parsed.MuxAction == engine.MuxActionCancel {
 		if len(parsed.Forwards) != 1 {
-			return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: -O %s 需要恰好一条转发规则（-L/-R/-D/-w）", clikit.ErrUsage, parsed.MuxAction))
+			return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIMuxRequiresSingleForward, i18n.Str("action", parsed.MuxAction.String())))
 		}
 		req.Forward = algebraic.Some(parsed.Forwards[0])
 	}
@@ -117,7 +119,7 @@ func runSSHMuxControl(ctx context.Context, rt *clikit.Runtime, runner clikit.Ses
 
 func runSSHNoCommand(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed SSHCommandArgs, jsonOut bool) (exitCode int) {
 	if len(parsed.Forwards) == 0 && parsed.MasterCount == 0 {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: -N 模式至少需要 -M 或一条转发规则（-L/-R/-D/-w）", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHNoCmdRequiresForward))
 	}
 	client, err := requireSSHClient(runner)
 	if err != nil {
@@ -172,7 +174,7 @@ func runSSHWithSessionExtensions(ctx context.Context, rt *clikit.Runtime, runner
 
 func runPlainSSHSession(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed SSHCommandArgs, jsonOut bool) int {
 	if jsonOut && len(parsed.CommandArgs) == 0 {
-		return rt.Fail(clikit.ExitUsage, true, fmt.Errorf("%w: 交互式 SSH Shell 不支持 --json 输出，请提供远端命令", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, true, i18n.EF(clikit.ErrUsage, i18n.KeyCLIInteractiveNoJSON, i18n.Str("mode", "ssh")))
 	}
 	var outBuf, errBuf bytes.Buffer
 	stdout, stderr := rt.Stdout, rt.Stderr
@@ -188,15 +190,16 @@ func runPlainSSHSession(ctx context.Context, rt *clikit.Runtime, runner clikit.S
 		Stderr:      stderr,
 		RequestTTY:  parsed.RequestTTY,
 	})
+	loc := rt.Loc()
 	if jsonOut {
-		view, code, _ := clikit.BuildExecOutcomeView(outcome, runErr, outBuf.String(), errBuf.String())
+		view, code, _ := clikit.BuildExecOutcomeViewLocalized(loc, outcome, runErr, outBuf.String(), errBuf.String())
 		if mErr := clikit.WriteJSON(rt.Stdout, view); mErr != nil {
-			rt.WriteErr("marshal json failed: " + mErr.Error())
+			rt.WriteErr(loc.T(i18n.KeyCLIMarshalJSONFailed, i18n.BoundStr("err", loc.RenderError(mErr))))
 			return clikit.ExitGeneral
 		}
 		return code
 	}
-	code, diag, _ := clikit.MapOutcomeToExit(outcome, runErr)
+	code, diag, _ := clikit.MapOutcomeToExitLocalized(loc, outcome, runErr)
 	if diag != "" {
 		rt.WriteErr(diag)
 	}
@@ -210,7 +213,7 @@ func parseOptionalControlSocket(raw string) (algebraic.Option[pathalg.LocalSourc
 	}
 	p, err := pathalg.ParseLocalSourcePath(trimmed)
 	if err != nil {
-		return algebraic.None[pathalg.LocalSourcePath](), fmt.Errorf("%w: 控制套接字路径 %q 非法: %w", clikit.ErrUsage, raw, err)
+		return algebraic.None[pathalg.LocalSourcePath](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidField, i18n.Str("field", "control socket path"), i18n.BoundStr("value", raw))
 	}
 	return algebraic.Some(p), nil
 }
@@ -269,12 +272,13 @@ func announceActiveSession(rt *clikit.Runtime, jsonOut bool, target string, info
 			TargetAddr: info.Spec().TargetAddr(),
 		})
 	}
+	loc := rt.Loc()
 	_ = rt.WriteResult(jsonOut, summary, func(w io.Writer) {
 		if summary.MasterSock != "" {
-			_, _ = fmt.Fprintf(w, "control master active: %s\n", summary.MasterSock)
+			_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLISSHMasterActive, i18n.BoundStr("socket", summary.MasterSock)))
 		}
 		for _, f := range summary.Forwards {
-			_, _ = fmt.Fprintf(w, "forward [%s] listening on %s -> %s\n", f.Direction, f.BindAddr, f.TargetAddr)
+			_, _ = fmt.Fprintln(w, loc.T(i18n.KeyCLISSHForwardListening, i18n.Str("direction", f.Direction.String()), i18n.BoundStr("bind", f.BindAddr), i18n.BoundStr("target", f.TargetAddr)))
 		}
 	})
 }

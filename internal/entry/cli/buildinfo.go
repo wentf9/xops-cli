@@ -3,6 +3,9 @@ package cli
 import (
 	"fmt"
 	"strings"
+
+	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // BuildInfo 封装由组合根（cmd/xops）通过显式依赖注入传入的只读构建元信息（ADR-011 / RFC §6）。
@@ -58,18 +61,23 @@ func NewVersionView(info BuildInfo) VersionView {
 	return VersionView(info.Normalized())
 }
 
-// FormatVersion 将构建元信息渲染为简洁、确定性的多行版本文本，供 `xops version` 直接输出至 stdout。
+// FormatVersion 将构建元信息渲染为规范英文的多行版本文本，供 `xops version` 直接输出至 stdout。
 func FormatVersion(info BuildInfo) string {
+	return FormatVersionLocalized(nil, info)
+}
+
+// FormatVersionLocalized 使用指定 Localizer 将构建元信息渲染为双语多行版本文本。
+func FormatVersionLocalized(loc *i18n.Localizer, info BuildInfo) string {
 	norm := info.Normalized()
 	goLine := norm.GoVersion
 	if norm.Platform != "" {
 		goLine = fmt.Sprintf("%s (%s)", norm.GoVersion, norm.Platform)
 	}
-	return fmt.Sprintf(
-		"xops version %s\ncommit: %s\nbuilt:  %s\ngo:     %s\n",
-		norm.Version,
-		norm.Commit,
-		norm.BuildTime,
-		goLine,
+	return clikit.EnsureLocalizer(loc).T(
+		i18n.KeyCLIVersionOutput,
+		i18n.BoundStr("version", norm.Version),
+		i18n.BoundStr("commit", norm.Commit),
+		i18n.BoundStr("built", norm.BuildTime),
+		i18n.BoundStr("go", goLine),
 	)
 }

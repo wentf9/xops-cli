@@ -2,7 +2,6 @@ package cmdasset
 
 import (
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -11,6 +10,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type enrollPasswordFlags struct {
@@ -32,7 +32,7 @@ func runVaultEnrollPassword(ctx context.Context, rt *clikit.Runtime, args []stri
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
+		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -76,7 +76,7 @@ func parseEnrollPasswordToken(cur *clikit.FlagCursor, f *enrollPasswordFlags) er
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: vault enroll-password 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	if name == "replace" {
 		v, err := clikit.ParseOptionalBool(name, inlineVal, hasEq)
@@ -107,7 +107,7 @@ func applyEnrollPasswordFlag(name, val, rawTok string, f *enrollPasswordFlags) e
 	case "expected-revision":
 		f.expRevRaw = val
 	default:
-		return fmt.Errorf("%w: vault enroll-password 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return nil
 }
@@ -115,13 +115,13 @@ func applyEnrollPasswordFlag(name, val, rawTok string, f *enrollPasswordFlags) e
 func buildEnrollPasswordSagaReq(f enrollPasswordFlags) (engine.InteractiveVaultSagaRequest, error) {
 	id, err := inventory.ParseIdentityID(f.idRaw)
 	if err != nil {
-		return engine.InteractiveVaultSagaRequest{}, fmt.Errorf("%w: --id 非法: %w", clikit.ErrUsage, err)
+		return engine.InteractiveVaultSagaRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--id"), i18n.BoundStr("value", f.idRaw))
 	}
 	user, err := option.ParseUsername(f.userRaw)
 	if err != nil {
-		return engine.InteractiveVaultSagaRequest{}, fmt.Errorf("%w: --user 非法: %w", clikit.ErrUsage, err)
+		return engine.InteractiveVaultSagaRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--user"), i18n.BoundStr("value", f.userRaw))
 	}
-	newRef, store, err := parseTargetRefOrStore(f.refRaw, f.store, "enroll-password")
+	newRef, store, err := parseTargetRefOrStore(f.refRaw, f.store)
 	if err != nil {
 		return engine.InteractiveVaultSagaRequest{}, err
 	}
@@ -129,9 +129,7 @@ func buildEnrollPasswordSagaReq(f enrollPasswordFlags) (engine.InteractiveVaultS
 	if err != nil {
 		return engine.InteractiveVaultSagaRequest{}, err
 	}
-	prompt, err := engine.NewSecretPromptRequest(engine.SecretPromptRequestSpec{
-		Title: "Enroll SSH Password", Prompt: "Enter SSH login password", Subject: id.String(),
-	})
+	prompt, err := newVaultSecretPrompt(i18n.KeyInteractVaultEnrollPassTitle, i18n.KeyInteractVaultEnrollPassPrompt, id.String())
 	if err != nil {
 		return engine.InteractiveVaultSagaRequest{}, err
 	}
@@ -172,7 +170,7 @@ func upsertPasswordIdentityInGraph(
 	for i, existing := range idents {
 		if existing.ID() == id {
 			if !replace {
-				return out, fmt.Errorf("%w: identity %s 已存在（可传 --replace 覆盖）", engine.ErrAlreadyExists, id)
+				return out, i18n.EF(engine.ErrAlreadyExists, i18n.KeyCLIVaultIdentityExists, i18n.BoundStr("id", id.String()))
 			}
 			idents[i] = ident
 			replaced = true
@@ -206,7 +204,7 @@ func runVaultSetNodePrivilege(ctx context.Context, rt *clikit.Runtime, args []st
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if f.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, VaultHelpText())
+		_, _ = io.WriteString(rt.Stdout, VaultHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(f.common.JSON)
@@ -250,7 +248,7 @@ func parseSetNodePrivToken(cur *clikit.FlagCursor, f *setNodePrivFlags) error {
 	}
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(tok)
 	if !isLong {
-		return fmt.Errorf("%w: vault set-node-privilege 未知参数 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	val, err := cur.ConsumeLongValue(name, inlineVal, hasEq)
 	if err != nil {
@@ -266,7 +264,7 @@ func parseSetNodePrivToken(cur *clikit.FlagCursor, f *setNodePrivFlags) error {
 	case "expected-revision":
 		f.expRevRaw = val
 	default:
-		return fmt.Errorf("%w: vault set-node-privilege 未知选项 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	return nil
 }
@@ -274,9 +272,9 @@ func parseSetNodePrivToken(cur *clikit.FlagCursor, f *setNodePrivFlags) error {
 func buildSetNodePrivSagaReq(f setNodePrivFlags) (engine.InteractiveVaultSagaRequest, error) {
 	nodeID, err := inventory.ParseNodeID(f.nodeRaw)
 	if err != nil {
-		return engine.InteractiveVaultSagaRequest{}, fmt.Errorf("%w: --node 非法: %w", clikit.ErrUsage, err)
+		return engine.InteractiveVaultSagaRequest{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--node"), i18n.BoundStr("value", f.nodeRaw))
 	}
-	newRef, store, err := parseTargetRefOrStore(f.refRaw, f.store, "set-node-privilege")
+	newRef, store, err := parseTargetRefOrStore(f.refRaw, f.store)
 	if err != nil {
 		return engine.InteractiveVaultSagaRequest{}, err
 	}
@@ -284,9 +282,7 @@ func buildSetNodePrivSagaReq(f setNodePrivFlags) (engine.InteractiveVaultSagaReq
 	if err != nil {
 		return engine.InteractiveVaultSagaRequest{}, err
 	}
-	prompt, err := engine.NewSecretPromptRequest(engine.SecretPromptRequestSpec{
-		Title: "Set Node Privilege Secret", Prompt: "Enter sudo/su/doas privilege password", Subject: nodeID.String(),
-	})
+	prompt, err := newVaultSecretPrompt(i18n.KeyInteractVaultNodePrivTitle, i18n.KeyInteractVaultNodePrivPrompt, nodeID.String())
 	if err != nil {
 		return engine.InteractiveVaultSagaRequest{}, err
 	}
@@ -336,5 +332,5 @@ func bindNodePrivilegeInGraph(g inventory.Graph, nodeID inventory.NodeID, ref se
 			KnownStores:  g.KnownStores(),
 		})
 	}
-	return out, fmt.Errorf("%w: node %s 不存在", engine.ErrNotFound, nodeID)
+	return out, i18n.EF(engine.ErrNotFound, i18n.KeyCLIVaultNodeNotFound, i18n.BoundStr("id", nodeID.String()))
 }

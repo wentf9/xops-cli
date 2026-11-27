@@ -2,7 +2,7 @@
 // （退出码映射、具名引擎能力窄接口、作用域引擎会话、规范 JSON/v2 编码与 OpenSSH 选项解析）。
 //
 // 核心架构与安全不变量：
-//   - 仅依赖 core/{domain,events,engine,conc} 与 Go 标准库，严禁导入 internal/host/**、core/osfs 或 core/ports；
+//   - 仅依赖 core/{domain,events,engine,conc}、internal/i18n 与 Go 标准库，严禁导入 internal/host/**、core/osfs 或 core/ports；
 //   - 全包 0 init()、0 可变包级 var、0 裸 go 语句、0 os.Exit、0 行内 //nolint:；
 //   - 所有 JSON 序列化 DTO 严禁裸用 time.Duration（统一使用 algebraic.Duration），严禁携带 *secret.SecretBox；
 //   - 所有运行期回调（子入口、宿主只读文件、审计查询、工作目录解析）在为 nil 时严格失败关闭。
@@ -17,13 +17,8 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
-
-// SentinelError 表示编译期不可变的字符串哨兵错误类型，保证跨包重导出时严格保持错误标识同一性且零可变包级状态。
-type SentinelError string
-
-// Error 实现标准 error 接口。
-func (e SentinelError) Error() string { return string(e) }
 
 // 规范进程退出码常量，全 CLI 入口统一消费。
 const (
@@ -39,18 +34,18 @@ const (
 	ExitSignalBase = 128
 )
 
-// 本包导出的不可变哨兵错误，供根 cli 包、命令子包与单测精确判定错误类别。
-const (
+// 本包导出的不可变结构化哨兵错误，供根 cli 包、命令子包与单测精确判定错误类别并支持边界延迟本地化。
+var (
 	// ErrInvalidConfig 表示构造 CLI App 时缺少必填依赖或配置项非法。
-	ErrInvalidConfig SentinelError = "cli: 无效的 AppConfig 配置"
+	ErrInvalidConfig = i18n.Sentinel(i18n.KeyCLIInvalidConfig)
 	// ErrAppNotInitialized 表示在 nil 或未初始化零值 App 上调用运行方法。
-	ErrAppNotInitialized SentinelError = "cli: App 未初始化"
+	ErrAppNotInitialized = i18n.Sentinel(i18n.KeyCLIAppNotInitialized)
 	// ErrUsage 表示命令行子命令或选项参数语法非法。
-	ErrUsage SentinelError = "cli: 命令行参数无效"
+	ErrUsage = i18n.Sentinel(i18n.KeyCLIUsage)
 	// ErrNotConfigured 表示所请求的子入口或宿主只读钩子尚未由组合根注入。
-	ErrNotConfigured SentinelError = "cli: 宿主未注入该能力回调"
+	ErrNotConfigured = i18n.Sentinel(i18n.KeyCLINotConfigured)
 	// ErrUnsupportedRunner 表示注入的 EngineHandle.Runner 未实现当前子命令所需引擎能力接口。
-	ErrUnsupportedRunner SentinelError = "cli: 当前 Engine Runner 不支持该命令能力"
+	ErrUnsupportedRunner = i18n.Sentinel(i18n.KeyCLIUnsupportedRunner)
 )
 
 // SessionRunner 定义 CLI 最小核心会话执行与停机契约（保持 Wave 1 cmd/xops 100% 兼容）。

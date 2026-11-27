@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // ExecOutcomeView 描述单节点 SSH/Exec 在 `--json` 模式下的规范输出载荷（零裸 time.Duration）。
@@ -22,9 +23,15 @@ type ExecOutcomeView struct {
 	DoNotRetry  bool   `json:"do_not_retry,omitzero"`
 }
 
-// BuildExecOutcomeView 穷尽投影 execution.ExecutionOutcome 与 runErr 为机器可读视图，保证零 fail-open。
+// BuildExecOutcomeView 以规范英文穷尽投影 execution.ExecutionOutcome 与 runErr 为机器可读视图，保证零 fail-open。
 func BuildExecOutcomeView(outcome execution.ExecutionOutcome, runErr error, stdoutText, stderrText string) (ExecOutcomeView, int, string) {
-	code, diag, _ := MapOutcomeToExit(outcome, runErr)
+	return BuildExecOutcomeViewLocalized(nil, outcome, runErr, stdoutText, stderrText)
+}
+
+// BuildExecOutcomeViewLocalized 使用指定 Localizer 本地化 Diagnostic 字段并穷尽投影 execution.ExecutionOutcome，
+// 保持 ExitCode、OutcomeKind、ErrorCode 与 DoNotRetry 机器契约完全不变。
+func BuildExecOutcomeViewLocalized(loc *i18n.Localizer, outcome execution.ExecutionOutcome, runErr error, stdoutText, stderrText string) (ExecOutcomeView, int, string) {
+	code, diag, _ := MapOutcomeToExitLocalized(loc, outcome, runErr)
 	view := ExecOutcomeView{
 		OK:         code == ExitOK && runErr == nil,
 		ExitCode:   code,
@@ -45,7 +52,7 @@ func BuildExecOutcomeView(outcome execution.ExecutionOutcome, runErr error, stdo
 func populateOutcomeFields(view *ExecOutcomeView, outcome execution.ExecutionOutcome) error {
 	if outcome == nil || !outcome.IsValid() {
 		view.OutcomeKind = "invalid"
-		return fmt.Errorf("invalid execution outcome")
+		return i18n.E(i18n.KeyCLIExitInvalidOutcome)
 	}
 	view.OutcomeKind = outcome.Kind().String()
 	switch v := outcome.(type) {
@@ -64,27 +71,34 @@ func populateOutcomeFields(view *ExecOutcomeView, outcome execution.ExecutionOut
 		return nil
 	default:
 		view.OutcomeKind = "invalid"
-		return fmt.Errorf("unexpected execution outcome type %T", outcome)
+		return i18n.E(i18n.KeyCLIExitUnexpectedOutcome, i18n.Str("type", fmt.Sprintf("%T", outcome)))
 	}
 }
 
 // MapOutcomeToExit 穷尽映射封闭和类型 execution.ExecutionOutcome 与可选运行期错误，
-// 返回确定性进程退出码与面向 stderr 的简洁诊断信息（零 fail-open 路径）。
+// 返回确定性进程退出码与面向 stderr 的规范英文诊断信息（零 fail-open 路径）。
+func MapOutcomeToExit(outcome execution.ExecutionOutcome, runErr error) (exitCode int, diagMsg string, mapErr error) {
+	return MapOutcomeToExitLocalized(nil, outcome, runErr)
+}
+
+// MapOutcomeToExitLocalized 使用指定 Localizer 穷尽映射 execution.ExecutionOutcome 与可选运行期错误，
+// 返回确定性进程退出码与本地化诊断文本（零 fail-open 路径）。
 //
 // 核心安全不变量：
 //   - 即使远端进程退出码为 0，若 runErr != nil（例如终态审计写入失败触发 Halted 熔断），
 //     也绝不返回 0 退出码，必须强制失败关闭返回非零退出码并输出错误诊断；
 //   - OutcomeNotStarted、OutcomeUnknown、ExitUnknown 或任何无效结果一律返回非零退出码。
-func MapOutcomeToExit(outcome execution.ExecutionOutcome, runErr error) (exitCode int, diagMsg string, mapErr error) {
+func MapOutcomeToExitLocalized(loc *i18n.Localizer, outcome execution.ExecutionOutcome, runErr error) (exitCode int, diagMsg string, mapErr error) {
+	effLoc := EnsureLocalizer(loc)
 	if outcome == nil || !outcome.IsValid() {
-		msg := formatFallbackError("ssh execution failed: invalid execution outcome", runErr)
-		return ExitSSHError, msg, fmt.Errorf("%s", msg)
+		err := pickOrFallbackErr(runErr, i18n.E(i18n.KeyCLIExitInvalidOutcome))
+		return ExitSSHError, effLoc.RenderError(err), err
 	}
 	switch v := outcome.(type) {
 	case *execution.OutcomeCompleted:
-		code, statusDiag, err := mapExitStatusToExit(v.Status())
+		code, statusDiag, err := mapExitStatusToExit(effLoc, v.Status())
 		if runErr != nil {
-			diag := joinDiagnostics(statusDiag, runErr.Error())
+			diag := joinDiagnostics(effLoc, statusDiag, effLoc.RenderError(runErr))
 			if code == ExitOK {
 				code = ExitSSHError
 			}
@@ -92,38 +106,38 @@ func MapOutcomeToExit(outcome execution.ExecutionOutcome, runErr error) (exitCod
 		}
 		return code, statusDiag, err
 	case *execution.OutcomeNotStarted:
-		msg := formatNotStartedDiag(v, runErr)
-		return ExitSSHError, msg, fmt.Errorf("%s", msg)
+		err := buildNotStartedErr(v, runErr)
+		return ExitSSHError, effLoc.RenderError(err), err
 	case *execution.OutcomeUnknown:
-		msg := formatUnknownOutcomeDiag(v, runErr)
-		return ExitSSHError, msg, fmt.Errorf("%s", msg)
+		err := buildUnknownOutcomeErr(v, runErr)
+		return ExitSSHError, effLoc.RenderError(err), err
 	default:
-		msg := formatFallbackError(fmt.Sprintf("unexpected execution outcome type %T", outcome), runErr)
-		return ExitSSHError, msg, fmt.Errorf("%s", msg)
+		err := pickOrFallbackErr(runErr, i18n.E(i18n.KeyCLIExitUnexpectedOutcome, i18n.Str("type", fmt.Sprintf("%T", outcome))))
+		return ExitSSHError, effLoc.RenderError(err), err
 	}
 }
 
-func mapExitStatusToExit(status execution.ExitStatus) (exitCode int, diagMsg string, mapErr error) {
+func mapExitStatusToExit(loc *i18n.Localizer, status execution.ExitStatus) (exitCode int, diagMsg string, mapErr error) {
 	if status == nil || !status.IsValid() {
-		msg := "ssh execution finished with invalid exit status"
-		return ExitSSHError, msg, fmt.Errorf("%s", msg)
+		err := i18n.E(i18n.KeyCLIExitInvalidStatus)
+		return ExitSSHError, loc.RenderError(err), err
 	}
 	switch s := status.(type) {
 	case *execution.ExitCode:
 		code, ok := s.Code()
 		if !ok {
-			msg := "ssh execution finished with unreadable exit code"
-			return ExitSSHError, msg, fmt.Errorf("%s", msg)
+			err := i18n.E(i18n.KeyCLIExitUnreadableCode)
+			return ExitSSHError, loc.RenderError(err), err
 		}
 		return NormalizeProcessExitCode(code), "", nil
 	case *execution.ExitSignal:
-		return mapSignalExit(s), formatSignalDiag(s), nil
+		return mapSignalExit(s), formatSignalDiag(loc, s), nil
 	case *execution.ExitUnknown:
-		msg := formatExitUnknownDiag(s)
-		return ExitSSHError, msg, fmt.Errorf("%s", msg)
+		err := buildExitUnknownErr(s)
+		return ExitSSHError, loc.RenderError(err), err
 	default:
-		msg := fmt.Sprintf("unexpected exit status type %T", status)
-		return ExitSSHError, msg, fmt.Errorf("%s", msg)
+		err := i18n.E(i18n.KeyCLIExitUnexpectedStatus, i18n.Str("type", fmt.Sprintf("%T", status)))
+		return ExitSSHError, loc.RenderError(err), err
 	}
 }
 
@@ -163,52 +177,57 @@ func posixSignalNumber(raw string) (int, bool) {
 	return n, ok
 }
 
-func formatSignalDiag(sig *execution.ExitSignal) string {
-	base := fmt.Sprintf("remote process terminated by signal %s", sig.Signal())
-	if sig.CoreDumped() {
-		base += " (core dumped)"
+func formatSignalDiag(loc *i18n.Localizer, sig *execution.ExitSignal) string {
+	msg := strings.TrimSpace(sig.Message())
+	sigParam := i18n.BoundStr("signal", sig.Signal())
+	switch {
+	case sig.CoreDumped() && msg != "":
+		return loc.T(i18n.KeyCLIExitSignalCoreMsg, sigParam, i18n.BoundStr("message", msg))
+	case sig.CoreDumped():
+		return loc.T(i18n.KeyCLIExitSignalCore, sigParam)
+	case msg != "":
+		return loc.T(i18n.KeyCLIExitSignalMsg, sigParam, i18n.BoundStr("message", msg))
+	default:
+		return loc.T(i18n.KeyCLIExitSignal, sigParam)
 	}
-	if msg := strings.TrimSpace(sig.Message()); msg != "" {
-		base += ": " + msg
-	}
-	return base
 }
 
-func formatExitUnknownDiag(u *execution.ExitUnknown) string {
+func buildExitUnknownErr(u *execution.ExitUnknown) error {
 	if reason := strings.TrimSpace(u.Reason()); reason != "" {
-		return "remote process exited without exit status: " + reason
+		return i18n.E(i18n.KeyCLIExitUnknownReason, i18n.BoundStr("reason", reason))
 	}
-	return "remote process exited without exit status"
+	return i18n.E(i18n.KeyCLIExitUnknown)
 }
 
-func formatNotStartedDiag(ns *execution.OutcomeNotStarted, runErr error) string {
+func buildNotStartedErr(ns *execution.OutcomeNotStarted, runErr error) error {
 	if runErr != nil && strings.TrimSpace(runErr.Error()) != "" {
-		return runErr.Error()
+		return runErr
 	}
 	if reason := strings.TrimSpace(ns.Reason()); reason != "" {
-		return fmt.Sprintf("ssh failed before start (%s): %s", ns.Phase(), reason)
+		return i18n.E(i18n.KeyCLIExitNotStartedReason, i18n.Str("phase", ns.Phase().String()), i18n.BoundStr("reason", reason))
 	}
-	return fmt.Sprintf("ssh failed before start (%s)", ns.Phase())
+	return i18n.E(i18n.KeyCLIExitNotStarted, i18n.Str("phase", ns.Phase().String()))
 }
 
-func formatUnknownOutcomeDiag(u *execution.OutcomeUnknown, runErr error) string {
+func buildUnknownOutcomeErr(u *execution.OutcomeUnknown, runErr error) error {
+	phaseParam := i18n.Str("phase", u.Phase().String())
 	if runErr != nil && strings.TrimSpace(runErr.Error()) != "" {
-		return fmt.Sprintf("ssh outcome unknown (%s; do not blindly retry): %s", u.Phase(), runErr.Error())
+		return i18n.Wrap(runErr, i18n.KeyCLIExitOutcomeUnknown, phaseParam)
 	}
 	if reason := strings.TrimSpace(u.Reason()); reason != "" {
-		return fmt.Sprintf("ssh outcome unknown (%s; do not blindly retry): %s", u.Phase(), reason)
+		return i18n.E(i18n.KeyCLIExitOutcomeUnknownReason, phaseParam, i18n.BoundStr("reason", reason))
 	}
-	return fmt.Sprintf("ssh outcome unknown (%s; do not blindly retry)", u.Phase())
+	return i18n.E(i18n.KeyCLIExitOutcomeUnknown, phaseParam)
 }
 
-func formatFallbackError(fallback string, err error) string {
+func pickOrFallbackErr(err, fallback error) error {
 	if err != nil && strings.TrimSpace(err.Error()) != "" {
-		return err.Error()
+		return err
 	}
 	return fallback
 }
 
-func joinDiagnostics(a, b string) string {
+func joinDiagnostics(loc *i18n.Localizer, a, b string) string {
 	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
 	switch {
 	case a == "":
@@ -216,6 +235,6 @@ func joinDiagnostics(a, b string) string {
 	case b == "" || a == b:
 		return a
 	default:
-		return a + "; " + b
+		return loc.T(i18n.KeyCLIExitJoinDiag, i18n.BoundStr("a", a), i18n.BoundStr("b", b))
 	}
 }

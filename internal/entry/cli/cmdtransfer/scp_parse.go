@@ -1,7 +1,6 @@
 package cmdtransfer
 
 import (
-	"fmt"
 	"strings"
 	"unicode/utf8"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // splitSCPEndpoint 区分远端 `[user@]host:[path]` 与本地路径：
@@ -88,11 +88,11 @@ func parseSCPArgs(args []string) (scpArgs, error) {
 		}
 	}
 	if len(pos) != 2 {
-		return scpArgs{}, fmt.Errorf("%w: scp 需要恰好 2 个位置参数 <source> <dest>", clikit.ErrUsage)
+		return scpArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "scp"), i18n.Int("count", 2), i18n.Str("usage", "<source> <dest>"))
 	}
 	out.srcRaw, out.dstRaw = pos[0], pos[1]
 	if err := out.cliOpts.Validate(); err != nil {
-		return scpArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)
+		return scpArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	return out, nil
 }
@@ -127,7 +127,7 @@ func parseSCPShortCluster(cur *clikit.FlagCursor, cluster string, out *scpArgs) 
 			return err
 		default:
 			r, _ := utf8.DecodeRuneInString(cluster[i:])
-			return fmt.Errorf("%w: scp 未知短选项 -%c", clikit.ErrUsage, r)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 		}
 	}
 	return nil
@@ -181,13 +181,13 @@ func parseSCPValueLongFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq
 	case "symlink-policy":
 		p, pErr := pathalg.ParseSymlinkPolicy(raw)
 		if pErr != nil {
-			return fmt.Errorf("%w: --symlink-policy 非法: %w", clikit.ErrUsage, pErr)
+			return i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--symlink-policy"), i18n.BoundStr("value", raw))
 		}
 		out.symlinkPolicy = p
 	case "local-root":
 		d, dErr := pathalg.ParseLocalDir(raw)
 		if dErr != nil {
-			return fmt.Errorf("%w: --local-root 非法: %w", clikit.ErrUsage, dErr)
+			return i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--local-root"), i18n.BoundStr("value", raw))
 		}
 		out.localRoot = algebraic.Some(d)
 	case "perm":
@@ -207,11 +207,11 @@ func parseSCPValueLongFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq
 	case "expected-digest":
 		dig, dErr := security.ParseDigest(raw)
 		if dErr != nil {
-			return fmt.Errorf("%w: --expected-digest 非法: %w", clikit.ErrUsage, dErr)
+			return i18n.WrapS(clikit.ErrUsage, dErr, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--expected-digest"), i18n.BoundStr("value", raw))
 		}
 		out.expectedDigest = algebraic.Some(dig)
 	default:
-		return fmt.Errorf("%w: scp 未知长选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 	return err
 }

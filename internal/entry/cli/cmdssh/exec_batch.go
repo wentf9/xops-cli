@@ -17,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const defaultNodeStreamBuffer = 128
@@ -77,7 +78,7 @@ func buildBatchSelector(parsed execArgs) (algebraic.Option[playbook.TargetSelect
 		ExcludeTags:  parsed.excludeTags,
 	})
 	if err != nil {
-		return algebraic.None[playbook.TargetSelector](), fmt.Errorf("%w: 目标选择器非法: %w", clikit.ErrUsage, err)
+		return algebraic.None[playbook.TargetSelector](), i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIExecSelectorInvalid)
 	}
 	return algebraic.Some(sel), nil
 }
@@ -188,30 +189,37 @@ func renderBatchExecResult(rt *clikit.Runtime, rep engine.BatchExecReport, runEr
 	if runErr != nil || rep.FailedCount() > 0 || rep.UnknownCount() > 0 || rep.NotStartedCount() > 0 {
 		code = clikit.ExitGeneral
 	}
+	loc := rt.Loc()
 	if jsonOut {
 		env := batchExecJSONEnvelope{OK: code == clikit.ExitOK, Report: rep}
 		if runErr != nil {
-			env.Error = runErr.Error()
+			env.Error = loc.RenderError(runErr)
 			env.ErrorCode = clikit.ClassifyErrorCode(runErr)
 		}
 		if err := clikit.WriteJSON(rt.Stdout, env); err != nil {
-			rt.WriteErr("marshal json failed: " + err.Error())
+			rt.WriteErr(loc.T(i18n.KeyCLIMarshalJSONFailed, i18n.BoundStr("err", loc.RenderError(err))))
 			return clikit.ExitGeneral
 		}
 		return code
 	}
 	for _, nr := range rep.Results() {
-		writeBatchNodeResult(rt, nr, streamed)
+		writeBatchNodeResult(rt, loc, nr, streamed)
 	}
-	_, _ = fmt.Fprintf(rt.Stdout, "summary: succeeded=%d failed=%d unknown=%d not_started=%d duration=%s\n",
-		rep.SucceededCount(), rep.FailedCount(), rep.UnknownCount(), rep.NotStartedCount(), rep.Duration())
+	_, _ = fmt.Fprintln(rt.Stdout, loc.T(
+		i18n.KeyCLIExecBatchSummary,
+		i18n.Int("succeeded", rep.SucceededCount()),
+		i18n.Int("failed", rep.FailedCount()),
+		i18n.Int("unknown", rep.UnknownCount()),
+		i18n.Int("not_started", rep.NotStartedCount()),
+		i18n.Str("duration", rep.Duration().String()),
+	))
 	if runErr != nil {
-		rt.WriteErr(runErr.Error())
+		rt.WriteErr(loc.RenderError(runErr))
 	}
 	return code
 }
 
-func writeBatchNodeResult(rt *clikit.Runtime, nr engine.BatchNodeResult, streamed bool) {
+func writeBatchNodeResult(rt *clikit.Runtime, loc *i18n.Localizer, nr engine.BatchNodeResult, streamed bool) {
 	status := "ok"
 	if !nr.Succeeded() {
 		if nr.Outcome() != nil {
@@ -220,7 +228,12 @@ func writeBatchNodeResult(rt *clikit.Runtime, nr engine.BatchNodeResult, streame
 			status = "failed"
 		}
 	}
-	_, _ = fmt.Fprintf(rt.Stdout, "== %s [%s] (%s) ==\n", nr.NodeID(), status, nr.Duration())
+	_, _ = fmt.Fprintln(rt.Stdout, loc.T(
+		i18n.KeyCLIExecBatchNodeHeader,
+		i18n.BoundStr("node", nr.NodeID().String()),
+		i18n.Str("status", status),
+		i18n.Str("duration", nr.Duration().String()),
+	))
 	if !streamed && len(nr.Stdout()) > 0 {
 		_, _ = rt.Stdout.Write(nr.Stdout())
 	}
@@ -240,7 +253,7 @@ func appendParsedNodeIDs(cur *clikit.FlagCursor, name, inlineVal string, hasEq b
 	for _, item := range clikit.SplitCSV(raw) {
 		id, err := inventory.ParseNodeID(item)
 		if err != nil {
-			return fmt.Errorf("%w: --%s 节点标识 %q 非法: %w", clikit.ErrUsage, name, item, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.BoundStr("flag", "--"+name), i18n.BoundStr("value", item))
 		}
 		*dst = append(*dst, id)
 	}
@@ -255,7 +268,7 @@ func appendParsedTags(cur *clikit.FlagCursor, name, inlineVal string, hasEq bool
 	for _, item := range clikit.SplitCSV(raw) {
 		tag, err := inventory.ParseTag(item)
 		if err != nil {
-			return fmt.Errorf("%w: --%s 标签 %q 非法: %w", clikit.ErrUsage, name, item, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.BoundStr("flag", "--"+name), i18n.BoundStr("value", item))
 		}
 		*dst = append(*dst, tag)
 	}

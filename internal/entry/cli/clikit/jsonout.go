@@ -11,6 +11,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // ReferenceConflictView 是引用冲突错误的规范 JSON/v2 视图（零明文、零裸 time.Duration）。
@@ -53,11 +54,17 @@ func WriteJSON(w io.Writer, v any) error {
 	return err
 }
 
-// WriteJSONError 构造 ErrorEnvelope 并以确定性 JSON/v2 写入输出流。
+// WriteJSONError 以规范英文构造 ErrorEnvelope 并以确定性 JSON/v2 写入输出流。
 func WriteJSONError(w io.Writer, exitCode int, err error) {
-	msg := "command failed"
+	WriteJSONErrorLocalized(w, nil, exitCode, err)
+}
+
+// WriteJSONErrorLocalized 使用指定 Localizer 渲染 ErrorEnvelope.Error，同时保持 ErrorCode 与全部 JSON 字段名为规范英文常量。
+func WriteJSONErrorLocalized(w io.Writer, loc *i18n.Localizer, exitCode int, err error) {
+	effLoc := EnsureLocalizer(loc)
+	msg := effLoc.T(i18n.KeyCLICommandFailed)
 	if err != nil {
-		msg = err.Error()
+		msg = effLoc.RenderError(err)
 	}
 	env := ErrorEnvelope{
 		OK:        false,

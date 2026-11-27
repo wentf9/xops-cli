@@ -2,7 +2,6 @@ package cmdtransfer
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"io/fs"
 	"strings"
@@ -13,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type sftpArgs struct {
@@ -38,7 +38,7 @@ type sftpArgs struct {
 // RunSFTP 执行 `xops sftp`：支持交互式 SFTP Shell（经 AppConfig.RunSFTPShell 回调注入）及全部单步远端 SFTP 子命令。
 func RunSFTP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, SFTPHelpText())
+		_, _ = io.WriteString(rt.Stdout, SFTPHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	parsed, err := parseSFTPArgs(args)
@@ -46,7 +46,7 @@ func RunSFTP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, SFTPHelpText())
+		_, _ = io.WriteString(rt.Stdout, SFTPHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
@@ -65,13 +65,13 @@ func RunSFTP(ctx context.Context, rt *clikit.Runtime, args []string) int {
 
 func runSFTPInteractive(ctx context.Context, rt *clikit.Runtime, parsed sftpArgs, jsonOut bool) int {
 	if jsonOut {
-		return rt.Fail(clikit.ExitUsage, true, fmt.Errorf("%w: 交互式 SFTP Shell 不支持 --json 输出，请使用单步 sftp 子命令", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, true, i18n.EF(clikit.ErrUsage, i18n.KeyCLIInteractiveNoJSON, i18n.Str("mode", "sftp")))
 	}
 	if len(parsed.pos) != 1 || strings.TrimSpace(parsed.pos[0]) == "" {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: 交互式 sftp 需要恰好 1 个目标主机参数", clikit.ErrUsage))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "sftp"), i18n.Int("count", 1), i18n.Str("usage", "<target>")))
 	}
 	if rt.Hooks.RunSFTPShell == nil {
-		return rt.Fail(clikit.ExitGeneral, jsonOut, fmt.Errorf("%w: 未注入 RunSFTPShell 回调，无法启动交互式 SFTP Shell", clikit.ErrNotConfigured))
+		return rt.Fail(clikit.ExitGeneral, jsonOut, i18n.EF(clikit.ErrNotConfigured, i18n.KeyCLIHookNotConfigured, i18n.Str("hook", "RunSFTPShell")))
 	}
 	targetSpec := strings.TrimSpace(parsed.pos[0])
 	initialDir := parsed.initialDir
@@ -83,6 +83,7 @@ func runSFTPInteractive(ctx context.Context, rt *clikit.Runtime, parsed sftpArgs
 	}
 	req := clikit.SFTPShellStartRequest{
 		InitOptions: rt.EffectiveInitOptions(parsed.common.ConfigFile, parsed.common.Policy),
+		Locale:      rt.EffectiveLocale(),
 		TargetSpec:  targetSpec,
 		CLIOptions:  parsed.cliOpts,
 		InitialDir:  initialDir,
@@ -139,7 +140,7 @@ func parseSFTPArgs(args []string) (sftpArgs, error) {
 		}
 	}
 	if err := out.cliOpts.Validate(); err != nil {
-		return sftpArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)
+		return sftpArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	return out, nil
 }
@@ -161,7 +162,7 @@ func parseSFTPShortCluster(cur *clikit.FlagCursor, cluster string, out *sftpArgs
 	switch ch {
 	case 'h':
 		if rest != "" {
-			return fmt.Errorf("%w: sftp 未知短选项 -%s", clikit.ErrUsage, cluster)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", cluster))
 		}
 		out.common.ShowHelp = true
 		return nil
@@ -176,7 +177,7 @@ func parseSFTPShortCluster(cur *clikit.FlagCursor, cluster string, out *sftpArgs
 		return err
 	default:
 		r, _ := utf8.DecodeRuneInString(cluster)
-		return fmt.Errorf("%w: sftp 未知短选项 -%c", clikit.ErrUsage, r)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 	}
 }
 
@@ -249,7 +250,7 @@ func parseSFTPValueFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq bo
 		}
 		d, err := pathalg.ParseLocalDir(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --local-root 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--local-root"), i18n.BoundStr("value", raw))
 		}
 		out.localRoot = algebraic.Some(d)
 		return nil
@@ -264,7 +265,7 @@ func parseSFTPValueFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq bo
 		}
 		p, err := pathalg.ParseSymlinkPolicy(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --symlink-policy 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--symlink-policy"), i18n.BoundStr("value", raw))
 		}
 		out.symlinkPolicy = p
 		return nil
@@ -277,7 +278,7 @@ func parseSFTPValueFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq bo
 		out.newText = raw
 		return err
 	default:
-		return fmt.Errorf("%w: sftp 未知长选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 }
 

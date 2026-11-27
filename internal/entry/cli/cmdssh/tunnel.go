@@ -2,7 +2,6 @@ package cmdssh
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 	"unicode/utf8"
@@ -10,6 +9,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type tunnelArgs struct {
@@ -24,7 +24,7 @@ type tunnelArgs struct {
 // RunTunnel 执行 `xops tunnel`（别名 `forward`），支持 start / local / remote / dynamic / tun 及 OpenSSH -L/-R/-D/-w 风格。
 func RunTunnel(ctx context.Context, rt *clikit.Runtime, args []string) int {
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		_, _ = io.WriteString(rt.Stdout, TunnelHelpText())
+		_, _ = io.WriteString(rt.Stdout, TunnelHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	parsed, err := parseTunnelArgs(args)
@@ -32,7 +32,7 @@ func RunTunnel(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, TunnelHelpText())
+		_, _ = io.WriteString(rt.Stdout, TunnelHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
@@ -111,12 +111,12 @@ func parseTunnelFlag(cur *clikit.FlagCursor, out *tunnelArgs) error {
 			}
 			m, err := engine.ParseTUNMode(raw)
 			if err != nil {
-				return fmt.Errorf("%w: --tun-mode 非法: %w", clikit.ErrUsage, err)
+				return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--tun-mode"), i18n.BoundStr("value", raw))
 			}
 			out.tunMode = m
 			return nil
 		}
-		return fmt.Errorf("%w: tunnel 未知长选项 %q", clikit.ErrUsage, tok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", tok))
 	}
 	tok := cur.Next()
 	return parseTunnelShortCluster(cur, tok[1:], out)
@@ -134,7 +134,7 @@ func parseTunnelShortCluster(cur *clikit.FlagCursor, cluster string, out *tunnel
 	switch ch {
 	case 'h':
 		if rest != "" {
-			return fmt.Errorf("%w: tunnel 未知短选项 -%s", clikit.ErrUsage, cluster)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", cluster))
 		}
 		out.common.ShowHelp = true
 		return nil
@@ -146,7 +146,7 @@ func parseTunnelShortCluster(cur *clikit.FlagCursor, cluster string, out *tunnel
 		return applyTunnelShortForward(ch, val, out)
 	default:
 		r, _ := utf8.DecodeRuneInString(cluster)
-		return fmt.Errorf("%w: tunnel 未知短选项 -%c", clikit.ErrUsage, r)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 	}
 }
 
@@ -162,7 +162,7 @@ func applyTunnelShortForward(ch byte, val string, out *tunnelArgs) error {
 		out.rawTUNs = append(out.rawTUNs, val)
 		return nil
 	default:
-		return fmt.Errorf("%w: 不支持的转发标志 -%c", clikit.ErrUsage, ch)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.Str("flag", string(ch)))
 	}
 }
 
@@ -187,13 +187,13 @@ func finalizeTunnelArgs(sub string, pos []string, out tunnelArgs) (tunnelArgs, e
 		out.forwards = append(out.forwards, spec)
 	}
 	if strings.TrimSpace(out.target) == "" {
-		return tunnelArgs{}, fmt.Errorf("%w: tunnel 缺少目标主机", clikit.ErrUsage)
+		return tunnelArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLISSHMissingTarget)
 	}
 	if len(out.forwards) == 0 {
-		return tunnelArgs{}, fmt.Errorf("%w: tunnel 至少需要一条转发规则（-L/-R/-D/-w）", clikit.ErrUsage)
+		return tunnelArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLITunnelRequiresForward)
 	}
 	if err := out.cliOpts.Validate(); err != nil {
-		return tunnelArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)
+		return tunnelArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	return out, nil
 }
@@ -202,13 +202,13 @@ func applyTunnelSubcommandPositionals(sub string, pos []string, out *tunnelArgs)
 	switch sub {
 	case "", "start":
 		if len(pos) != 1 {
-			return fmt.Errorf("%w: tunnel %s 需要恰好 1 个目标主机参数", clikit.ErrUsage, sub)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", strings.TrimSpace("tunnel "+sub)), i18n.Int("count", 1), i18n.Str("usage", "<target>"))
 		}
 		out.target = pos[0]
 		return nil
 	case "local", "remote":
 		if len(pos) != 2 {
-			return fmt.Errorf("%w: tunnel %s 需要 <target> <bind:target> 两个位置参数", clikit.ErrUsage, sub)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "tunnel "+sub), i18n.Int("count", 2), i18n.Str("usage", "<target> <bind:target>"))
 		}
 		out.target = pos[0]
 		dir := engine.ForwardLocal
@@ -218,18 +218,18 @@ func applyTunnelSubcommandPositionals(sub string, pos []string, out *tunnelArgs)
 		return appendParsedFwd(dir, pos[1], &out.forwards)
 	case "dynamic":
 		if len(pos) != 2 {
-			return fmt.Errorf("%w: tunnel dynamic 需要 <target> <[bind:]port> 两个位置参数", clikit.ErrUsage)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "tunnel dynamic"), i18n.Int("count", 2), i18n.Str("usage", "<target> <[bind:]port>"))
 		}
 		out.target = pos[0]
 		return appendParsedFwd(engine.ForwardDynamic, pos[1], &out.forwards)
 	case "tun":
 		if len(pos) != 2 {
-			return fmt.Errorf("%w: tunnel tun 需要 <target> <local[:remote]> 两个位置参数", clikit.ErrUsage)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIArgCountExact, i18n.Str("cmd", "tunnel tun"), i18n.Int("count", 2), i18n.Str("usage", "<target> <local[:remote]>"))
 		}
 		out.target = pos[0]
 		out.rawTUNs = append(out.rawTUNs, pos[1])
 		return nil
 	default:
-		return fmt.Errorf("%w: 未知 tunnel 子命令 %q", clikit.ErrUsage, sub)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownSubcommand, i18n.Str("cmd", "tunnel"), i18n.BoundStr("sub", sub))
 	}
 }

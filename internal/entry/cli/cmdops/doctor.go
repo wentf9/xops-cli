@@ -9,6 +9,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type doctorArgs struct {
@@ -35,7 +36,7 @@ func RunDoctor(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, DoctorHelpText())
+		_, _ = io.WriteString(rt.Stdout, DoctorHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
@@ -73,25 +74,27 @@ func executeDoctor(ctx context.Context, rt *clikit.Runtime, runner clikit.Sessio
 	if !view.Healthy {
 		code = clikit.ExitGeneral
 	}
-	if rt.WriteResult(jsonOut, view, func(w io.Writer) { renderDoctorText(w, view) }) != clikit.ExitOK {
+	loc := rt.Loc()
+	if rt.WriteResult(jsonOut, view, func(w io.Writer) { renderDoctorText(loc, w, view) }) != clikit.ExitOK {
 		return clikit.ExitGeneral
 	}
 	return code
 }
 
 func runVaultDoctorSection(ctx context.Context, rt *clikit.Runtime, runner clikit.SessionRunner, parsed doctorArgs, view *doctorAggregateView, jsonOut bool) int {
+	loc := rt.Loc()
 	vClient, err := requireVaultClient(runner)
 	if err != nil {
 		if parsed.scope == "vault" {
 			return rt.Fail(clikit.ExitGeneral, jsonOut, err)
 		}
-		view.VaultNote = "vault capability not available on current runner"
+		view.VaultNote = loc.T(i18n.KeyCLIDoctorVaultNoCap)
 		return clikit.ExitOK
 	}
 	rep, err := vClient.VaultDoctor(ctx, engine.VaultDoctorRequest{SkipSecretProbe: parsed.skipVaultProbe})
 	if err != nil {
 		if parsed.scope == "all" && errors.Is(err, engine.ErrVaultUnavailable) {
-			view.VaultNote = "vault not configured"
+			view.VaultNote = loc.T(i18n.KeyCLIDoctorVaultNotConfigured)
 			return clikit.ExitOK
 		}
 		return rt.Fail(clikit.ExitGeneral, jsonOut, err)
@@ -103,25 +106,40 @@ func runVaultDoctorSection(ctx context.Context, rt *clikit.Runtime, runner cliki
 	return clikit.ExitOK
 }
 
-func renderDoctorText(w io.Writer, view doctorAggregateView) {
-	_, _ = fmt.Fprintf(w, "doctor scope=%s healthy=%v\n", view.Scope, view.Healthy)
+func renderDoctorText(loc *i18n.Localizer, w io.Writer, view doctorAggregateView) {
+	eff := clikit.EnsureLocalizer(loc)
+	_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorSummary,
+		i18n.Str("scope", view.Scope),
+		i18n.Bool("healthy", view.Healthy),
+	))
 	if view.Inventory != nil {
 		inv := view.Inventory
-		_, _ = fmt.Fprintf(w, "  inventory: healthy=%v hosts=%d identities=%d nodes=%d dag_depth=%d errors=%d warns=%d\n",
-			inv.Healthy, inv.HostCount, inv.IdentityCount, inv.NodeCount, inv.DAGMaxDepth, inv.ErrorCount, inv.WarnCount)
+		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorInventory,
+			i18n.Bool("healthy", inv.Healthy),
+			i18n.Int("hosts", inv.HostCount),
+			i18n.Int("identities", inv.IdentityCount),
+			i18n.Int("nodes", inv.NodeCount),
+			i18n.Int("dag_depth", inv.DAGMaxDepth),
+			i18n.Int("errors", inv.ErrorCount),
+			i18n.Int("warns", inv.WarnCount),
+		))
 		for _, f := range inv.Findings {
 			_, _ = fmt.Fprintf(w, "    [%s] %s (%s): %s\n", f.Severity, f.Code, f.Subject, f.Message)
 		}
 	}
 	if view.Vault != nil {
 		v := view.Vault
-		_, _ = fmt.Fprintf(w, "  vault: healthy=%v refs=%d distinct=%d findings=%d\n",
-			v.Healthy, v.ReferencedCount, v.DistinctRefCount, len(v.Findings))
+		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorVault,
+			i18n.Bool("healthy", v.Healthy),
+			i18n.Int("refs", v.ReferencedCount),
+			i18n.Int("distinct", v.DistinctRefCount),
+			i18n.Int("findings", len(v.Findings)),
+		))
 		for _, f := range v.Findings {
 			_, _ = fmt.Fprintf(w, "    [%s] %s (%s): %s\n", f.Severity, f.Code, f.Subject, f.Message)
 		}
 	} else if view.VaultNote != "" {
-		_, _ = fmt.Fprintf(w, "  vault: %s\n", view.VaultNote)
+		_, _ = fmt.Fprintln(w, eff.T(i18n.KeyCLIDoctorVaultNote, i18n.Str("note", view.VaultNote)))
 	}
 }
 
@@ -154,7 +172,7 @@ func parseDoctorToken(cur *clikit.FlagCursor, out *doctorArgs) error {
 func applyDoctorLongFlag(cur *clikit.FlagCursor, rawTok string, out *doctorArgs) error {
 	name, inlineVal, hasEq, isLong := clikit.ParseLongFlagName(rawTok)
 	if !isLong {
-		return fmt.Errorf("%w: doctor 未知参数 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnexpectedArg, i18n.BoundStr("arg", rawTok))
 	}
 	switch name {
 	case "scope":
@@ -164,7 +182,7 @@ func applyDoctorLongFlag(cur *clikit.FlagCursor, rawTok string, out *doctorArgs)
 		}
 		s := strings.ToLower(strings.TrimSpace(val))
 		if s != "all" && s != "inventory" && s != "vault" {
-			return fmt.Errorf("%w: --scope 必须为 all|inventory|vault，实际=%q", clikit.ErrUsage, val)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIInvalidFlagValueEnum, i18n.Str("flag", "--scope"), i18n.Str("allowed", "all|inventory|vault"), i18n.BoundStr("value", val))
 		}
 		out.scope = s
 		return nil
@@ -181,6 +199,6 @@ func applyDoctorLongFlag(cur *clikit.FlagCursor, rawTok string, out *doctorArgs)
 		out.skipVaultProbe = v
 		return err
 	default:
-		return fmt.Errorf("%w: doctor 未知选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 }

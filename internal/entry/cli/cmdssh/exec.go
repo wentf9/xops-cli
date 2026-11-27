@@ -3,7 +3,6 @@ package cmdssh
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"strings"
 	"unicode/utf8"
@@ -16,6 +15,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type execArgs struct {
@@ -54,7 +54,7 @@ func RunExec(ctx context.Context, rt *clikit.Runtime, args []string) int {
 		return rt.Fail(clikit.ExitUsage, rt.EffectiveJSON(clikit.HasJSONFlag(args)), err)
 	}
 	if parsed.common.ShowHelp {
-		_, _ = io.WriteString(rt.Stdout, ExecHelpText())
+		_, _ = io.WriteString(rt.Stdout, ExecHelpText(rt.Loc()))
 		return clikit.ExitOK
 	}
 	jsonOut := rt.EffectiveJSON(parsed.common.JSON)
@@ -148,7 +148,7 @@ func parseExecShortCluster(cur *clikit.FlagCursor, cluster string, out *execArgs
 			out.requestTTY = engine.RequestTTYNo
 		default:
 			r, _ := utf8.DecodeRuneInString(cluster[i:])
-			return fmt.Errorf("%w: exec 未知短选项 -%c", clikit.ErrUsage, r)
+			return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownShortFlag, i18n.BoundStr("flag", string(r)))
 		}
 	}
 	return nil
@@ -228,7 +228,7 @@ func parseExecRuntimeFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq 
 		}
 		d, err := pathalg.ParseLocalDir(raw)
 		if err != nil {
-			return true, fmt.Errorf("%w: --out-dir 非法: %w", clikit.ErrUsage, err)
+			return true, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--out-dir"), i18n.BoundStr("value", raw))
 		}
 		out.outputDir = algebraic.Some(d)
 		return true, nil
@@ -265,25 +265,25 @@ func applyExecPlanFlagValue(name, raw string, out *execArgs) error {
 	case "dialect":
 		d, err := execution.ParseLaunchDialect(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --dialect 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--dialect"), i18n.BoundStr("value", raw))
 		}
 		out.dialect = algebraic.Some(d)
 	case "interpreter":
 		interp, err := execution.ParseInterpreter(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --interpreter 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--interpreter"), i18n.BoundStr("value", raw))
 		}
 		out.interpreter = interp
 	case "login":
 		lm, err := execution.ParseLoginMode(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --login 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--login"), i18n.BoundStr("value", raw))
 		}
 		out.loginMode = lm
 	case "workdir":
 		rp, err := pathalg.ParseRemotePath(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --workdir 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--workdir"), i18n.BoundStr("value", raw))
 		}
 		out.workDir = algebraic.Some(rp)
 	case "env":
@@ -327,7 +327,7 @@ func parseExecPrivFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq boo
 		}
 		ref, err := secret.ParseRef(raw)
 		if err != nil {
-			return fmt.Errorf("%w: --password-ref 非法: %w", clikit.ErrUsage, err)
+			return i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--password-ref"), i18n.BoundStr("value", raw))
 		}
 		out.privPasswordRef = algebraic.Some(ref)
 		return nil
@@ -336,22 +336,22 @@ func parseExecPrivFlag(cur *clikit.FlagCursor, name, inlineVal string, hasEq boo
 		out.promptPassword = v
 		return err
 	default:
-		return fmt.Errorf("%w: exec 未知长选项 %q", clikit.ErrUsage, rawTok)
+		return i18n.EF(clikit.ErrUsage, i18n.KeyCLIUnknownLongFlag, i18n.BoundStr("flag", rawTok))
 	}
 }
 
 func finalizeExecArgs(out execArgs) (execArgs, error) {
 	if !out.isBatch() && len(out.targets) == 0 {
-		return execArgs{}, fmt.Errorf("%w: exec 缺少目标主机（或 --all/--nodes/--tags）", clikit.ErrUsage)
+		return execArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIExecMissingTarget)
 	}
 	if len(out.commandArgs) == 0 {
-		return execArgs{}, fmt.Errorf("%w: exec 缺少待执行的远端命令", clikit.ErrUsage)
+		return execArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIExecMissingCommand)
 	}
 	if out.isBatch() && out.privMethod.IsValid() {
-		return execArgs{}, fmt.Errorf("%w: 批量 exec 暂不支持 --sudo/--su/--doas 交互提权，请使用单目标或 Playbook", clikit.ErrUsage)
+		return execArgs{}, i18n.EF(clikit.ErrUsage, i18n.KeyCLIExecBatchPrivUnsupported)
 	}
 	if err := out.cliOpts.Validate(); err != nil {
-		return execArgs{}, fmt.Errorf("%w: CLI 选项层校验失败: %w", clikit.ErrUsage, err)
+		return execArgs{}, i18n.WrapS(clikit.ErrUsage, err, i18n.KeyCLIInvalidOptionLayer)
 	}
 	return out, nil
 }
@@ -377,7 +377,7 @@ func buildExecCommandPlan(parsed execArgs) (cp execution.CommandPlan, err error)
 	}
 	built, cErr := execution.NewCommandPlan(spec)
 	if cErr != nil {
-		return cp, fmt.Errorf("%w: 构造 CommandPlan 失败: %w", clikit.ErrUsage, cErr)
+		return cp, i18n.WrapS(clikit.ErrUsage, cErr, i18n.KeyCLIExecPlanFailed)
 	}
 	return built, nil
 }
@@ -421,7 +421,7 @@ func runPrivilegedExec(
 	if strings.TrimSpace(parsed.privUser) != "" {
 		u, uErr := option.ParseUsername(parsed.privUser)
 		if uErr != nil {
-			return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: --privilege-user 非法: %w", clikit.ErrUsage, uErr))
+			return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, uErr, i18n.KeyCLIInvalidFlagValue, i18n.Str("flag", "--privilege-user"), i18n.BoundStr("value", parsed.privUser)))
 		}
 		targetUserOpt = algebraic.Some(u)
 	}
@@ -431,7 +431,7 @@ func runPrivilegedExec(
 		Command:    cmdPlan,
 	})
 	if pErr != nil {
-		return rt.Fail(clikit.ExitUsage, jsonOut, fmt.Errorf("%w: %w", clikit.ErrUsage, pErr))
+		return rt.Fail(clikit.ExitUsage, jsonOut, i18n.WrapS(clikit.ErrUsage, pErr, i18n.KeyCLIExecPlanFailed))
 	}
 	outcome, runErr := client.ExecPrivileged(ctx, engine.PrivilegeExecRequest{
 		RemoteCall: engine.RemoteCall{
@@ -449,15 +449,16 @@ func runPrivilegedExec(
 }
 
 func finishExecOutcome(rt *clikit.Runtime, outcome execution.ExecutionOutcome, runErr error, stdoutText, stderrText string, jsonOut bool) int {
+	loc := rt.Loc()
 	if jsonOut {
-		view, code, _ := clikit.BuildExecOutcomeView(outcome, runErr, stdoutText, stderrText)
+		view, code, _ := clikit.BuildExecOutcomeViewLocalized(loc, outcome, runErr, stdoutText, stderrText)
 		if mErr := clikit.WriteJSON(rt.Stdout, view); mErr != nil {
-			rt.WriteErr("marshal json failed: " + mErr.Error())
+			rt.WriteErr(loc.T(i18n.KeyCLIMarshalJSONFailed, i18n.BoundStr("err", loc.RenderError(mErr))))
 			return clikit.ExitGeneral
 		}
 		return code
 	}
-	code, diag, _ := clikit.MapOutcomeToExit(outcome, runErr)
+	code, diag, _ := clikit.MapOutcomeToExitLocalized(loc, outcome, runErr)
 	if diag != "" {
 		rt.WriteErr(diag)
 	}

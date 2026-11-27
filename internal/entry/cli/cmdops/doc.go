@@ -10,15 +10,14 @@
 package cmdops
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func requireAutomationClient(runner clikit.SessionRunner) (clikit.AutomationClient, error) {
 	c, ok := runner.(clikit.AutomationClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 AutomationClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "AutomationClient"))
 	}
 	return c, nil
 }
@@ -26,7 +25,7 @@ func requireAutomationClient(runner clikit.SessionRunner) (clikit.AutomationClie
 func requireInventoryClient(runner clikit.SessionRunner) (clikit.InventoryClient, error) {
 	c, ok := runner.(clikit.InventoryClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 InventoryClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "InventoryClient"))
 	}
 	return c, nil
 }
@@ -34,7 +33,7 @@ func requireInventoryClient(runner clikit.SessionRunner) (clikit.InventoryClient
 func requireVaultClient(runner clikit.SessionRunner) (clikit.VaultClient, error) {
 	c, ok := runner.(clikit.VaultClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 VaultClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "VaultClient"))
 	}
 	return c, nil
 }
@@ -42,7 +41,7 @@ func requireVaultClient(runner clikit.SessionRunner) (clikit.VaultClient, error)
 func requireReconcileClient(runner clikit.SessionRunner) (clikit.ReconcileClient, error) {
 	c, ok := runner.(clikit.ReconcileClient)
 	if !ok {
-		return nil, fmt.Errorf("%w: 需要 ReconcileClient 能力接口", clikit.ErrUnsupportedRunner)
+		return nil, i18n.EF(clikit.ErrUnsupportedRunner, i18n.KeyCLICapabilityRequired, i18n.Str("capability", "ReconcileClient"))
 	}
 	return c, nil
 }
