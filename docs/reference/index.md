@@ -18,7 +18,7 @@
 
 | 命令 | 别名 | 说明 |
 | --- | --- | --- |
-| `ssh` | — | 交互式登录、执行单条命令、建立 `-L/-R/-D/-w/-W` 转发或 `-M/-S/-O/-f` 多路复用 |
+| `ssh` | — | 交互式登录、执行单条命令、建立 `-L/-R/-D/-w` 转发或 `-M/-S/-O/-f` 多路复用 |
 | `exec` | — | 单目标命令、单目标提权（`--sudo`/`--su`/`--doas`）与多节点并发批量执行 |
 | `scp` | — | 并行分片可续传文件/目录上传与下载 |
 | `sftp` | — | 交互式 SFTP Shell 或 15 个单步原子远端 SFTP 子命令 |
@@ -42,7 +42,7 @@
 ```text
 xops ssh [flags] [user@]host [command [args...]]
   -p <port>  -l <user>  -i <key> (可重复)  -J <jumps>  -o <K=V> (可重复)
-  -L/-R/-D/-w <spec> (可重复)  -W <host:port>  --tun-mode point_to_point|ethernet
+  -L/-R/-D/-w <spec> (可重复)  --tun-mode point_to_point|ethernet
   -M (-MM)  -S <ctl_path>  -O check|forward|cancel|exit|stop|proxy
   -N  -f  -t (-tt)  -T  -F <cfg>  --policy <p>  --json
 

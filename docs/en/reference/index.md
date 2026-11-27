@@ -18,7 +18,7 @@ Accepted before or inside subcommand arguments:
 
 | Command | Aliases | Purpose |
 | --- | --- | --- |
-| `ssh` | — | Interactive SSH shell, single command, `-L/-R/-D/-w/-W` forwarding, or `-M/-S/-O/-f` mux control |
+| `ssh` | — | Interactive SSH shell, single command, `-L/-R/-D/-w` forwarding, or `-M/-S/-O/-f` mux control |
 | `exec` | — | Single-target command, single-target escalation (`--sudo`/`--su`/`--doas`), or concurrent multi-node batch execution |
 | `scp` | — | Resumable parallel chunked upload and download |
 | `sftp` | — | Interactive SFTP shell or 15 single-shot atomic remote SFTP operations |
@@ -42,7 +42,7 @@ Accepted before or inside subcommand arguments:
 ```text
 xops ssh [flags] [user@]host [command [args...]]
   -p <port>  -l <user>  -i <key> (repeatable)  -J <jumps>  -o <K=V> (repeatable)
-  -L/-R/-D/-w <spec> (repeatable)  -W <host:port>  --tun-mode point_to_point|ethernet
+  -L/-R/-D/-w <spec> (repeatable)  --tun-mode point_to_point|ethernet
   -M (-MM)  -S <ctl_path>  -O check|forward|cancel|exit|stop|proxy
   -N  -f  -t (-tt)  -T  -F <cfg>  --policy <p>  --json
 

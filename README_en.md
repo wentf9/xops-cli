@@ -27,7 +27,7 @@
 
 **XOps v2** is a clean-room rewritten, single-binary cross-platform SSH/SFTP operations and AI automation platform built with Go 1.27+ (`CGO_ENABLED=0`):
 
-- **OpenSSH-Native CLI & 4-Layer Option Precedence**: Supports standard flags (`-p/-l/-i/-J/-L/-R/-D/-w/-W/-o/-O/-M/-S/-F/-t/-tt/-T/-N/-f`), deterministic 4-layer policy resolution (`CLI > Managed Node > XOps Global > ~/.ssh/config`), ControlMaster/ControlPersist multiplexing (`xops mux`), and local/remote/SOCKS5/StreamLocal/TUN tunnels (`xops tunnel`).
+- **OpenSSH-Native CLI & 4-Layer Option Precedence**: Supports standard flags (`-p/-l/-i/-J/-L/-R/-D/-w/-o/-O/-M/-S/-F/-t/-tt/-T/-N/-f`), deterministic 4-layer policy resolution (`CLI > Managed Node > XOps Global > ~/.ssh/config`), ControlMaster/ControlPersist multiplexing (`xops mux`), and local/remote/SOCKS5/StreamLocal/TUN tunnels (`xops tunnel`).
 - **Graph Inventory & Multi-Backend Encrypted Vault**: Decouples **Host**, **Identity**, and **Node** with Tarjan jump-DAG cycle detection and CAS persistence in strict `version: 2` YAML (`~/.xops/config.yaml`, overridable via `XOPS_HOME`). Plaintext secrets are forbidden in both YAML and CLI flags; supports `offline_aead` (Argon2id + XChaCha20-Poly1305), native `os_keychain` (Windows Credential Manager / macOS Keychain / Linux Secret Service), `external_helper` (JSON v2 stdin/stdout), and `none`.
 - **Batch Execution, Atomic SFTP & Declarative Playbook v2**: Single/batch concurrent command execution, privilege escalation (`--sudo`/`--su`/`--doas`), explicit launch profiles (`posix`/`powershell`/`cmd`/`raw` × `server`/`sh`/`bash`/`zsh`/`powershell`/`pwsh`/`cmd`), parallel resumable SCP, single-shot and interactive SFTP Shell, and declarative Playbook v2 (`shell`/`script`/`copy`/`template`/`ensure`). Strict 3-state execution outcomes flag uncertain network failures with `OutcomeUnknown` / `do_not_retry`.
 - **Fail-Closed Guardrails, O(1) Audit Reconciliation & Sandboxed MCP**: Capability-gated execution with synchronous `audit.jsonl` logging and O(1) startup crash-lock reconciliation; built-in **7 strongly-typed discriminated MCP tools** over `stdio` and Streamable HTTP (plus a 10 GiB dual-generation WAL streaming endpoint), defaulting to `strict_agent` with fail-closed `Halted` circuit breaking and **zero `OperatorReadFS`** (`ScopedRootFS`-only sandboxing).
@@ -130,10 +130,10 @@ xops creds gc offline/orphan-item
 xops exec --sudo --password-ref offline/web01-sudo web-01 -- systemctl status nginx
 xops exec --dialect powershell --interpreter pwsh win-01 -- 'Get-Process | Select-Object -First 5'
 
-# Local (-L), remote (-R), dynamic SOCKS5 (-D), StreamLocal, and TUN (-w) tunnels
+# Local (-L), remote (-R), dynamic SOCKS5 (-D), StreamLocal, TUN (-w) tunnels, and ControlMaster mux
 xops tunnel local web-01 127.0.0.1:18080:127.0.0.1:80
-xops ssh -M -f -N -S ~/.xops/mux-%C -o ControlPersist=10m web-01
-xops mux check -S ~/.xops/mux-%C web-01
+xops ssh -M -f -N -S /tmp/xops-mux-web01.sock -o ControlPersist=10m web-01 &
+xops mux check -S /tmp/xops-mux-web01.sock web-01
 
 # Parallel resumable SCP and single-shot / interactive SFTP
 xops scp -r --resume --concurrency 4 ./dist web-01:/srv/app/

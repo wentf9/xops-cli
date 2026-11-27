@@ -35,11 +35,11 @@ xops ssh --json web-01 uname -a
 | `-F <configfile>` | 替代 OpenSSH 配置文件路径（传 `none` 禁用） |
 | `-t` / `-tt` / `-T` | 请求 PTY / 即使本地无 TTY 仍强制分配 PTY / 禁用 PTY |
 | `-L` / `-R` / `-D` / `-w` | 本地转发、远端转发、动态 SOCKS5、TUN/TAP 转发（均可重复） |
-| `-W <host:port>` | 标准输入/输出 TCP 转发（适合作为 `ProxyCommand` 目标） |
+| `-W <host:port>` | 仅作 CLI 兼容解析，当前会严格失败关闭返回 `unsupported`（退出码 `255`）；请改用 `-J`（`ProxyJump`）或 `-O proxy` / `xops mux proxy` |
 | `-M` / `-MM` | 启用 ControlMaster（`-M` = `yes`，`-MM` = `ask`） |
-| `-S <ctl_path>` | 指定 ControlPath 控制套接字路径（传 `none` 禁用） |
+| `-S <ctl_path>` | 指定 ControlPath 控制套接字路径（传 `none` 禁用；控制子命令按字面路径匹配，不展开 `~`/`%C`） |
 | `-O <ctl_cmd>` | 控制活跃 ControlMaster：`check` \| `forward` \| `cancel` \| `exit` \| `stop` \| `proxy` |
-| `-N` / `-f` | 不执行远端命令 / 移交后台 `muxdaemon` 运行（需配合 `-N`/`-M` 或转发规则，不可附带远端命令） |
+| `-N` / `-f` | 不执行远端命令 / 移交进程内 `muxdaemon` 同步守护运行（无 OS `fork()` 脱离，需置于后台或受管会话；需配合 `-N`/`-M` 或转发规则，不可附带远端命令） |
 | `--tun-mode <mode>` | `-w` 隧道模式：`point_to_point`（默认）\| `ethernet` |
 
 > **提权说明**：在 XOps v2 中，非交互与受控 `sudo`/`su`/`doas` 提权由 [`xops exec --sudo|--su|--doas`](./exec) 统一承载（支持从 Vault 引用 `--password-ref` 或 `--prompt-password` 交互采集，零明文参数）。
@@ -58,8 +58,8 @@ xops tunnel remote worker-01 127.0.0.1:9000:127.0.0.1:3000
 # 动态 SOCKS5 代理（-D）
 xops tunnel dynamic web-01 127.0.0.1:1080
 
-# 同一会话组合多条转发规则（含 StreamLocal Unix 套接字）
-xops tunnel start -L 127.0.0.1:5432:127.0.0.1:5432 -L unix:/tmp/app.sock:/run/app.sock -D 127.0.0.1:1080 web-01
+# 同一会话组合多条转发规则（StreamLocal Unix 套接字遵循 OpenSSH 路径语法，以 /、./、../ 或 ~/ 开头）
+xops tunnel start -L 127.0.0.1:5432:127.0.0.1:5432 -L /tmp/app.sock:/run/app.sock -D 127.0.0.1:1080 web-01
 
 # TUN/TAP 隧道转发（-w / tun）
 xops tunnel tun --tun-mode point_to_point gateway-01 0:0
@@ -76,32 +76,32 @@ xops tunnel tun --tun-mode point_to_point gateway-01 0:0
 XOps v2 支持 OpenSSH 兼容的 ControlMaster 协议与受结构化并发监督的 `muxdaemon`，可通过 `xops ssh -M/-S/-O/-f` 或专用 `xops mux` 命令操作：
 
 ```bash
-# 1. 启动 ControlMaster（-f / --daemon 移交 muxdaemon，并支持 ControlPersist 空闲保活）
-xops mux start -S ~/.xops/mux-%C -o ControlPersist=10m --daemon web-01
+# 1. 启动 ControlMaster（--daemon / -f 在当前进程同步运行 muxdaemon，不会 OS fork() 脱离，请在后台或受管会话中启动）
+xops mux start -S /tmp/xops-mux-web01.sock -o ControlPersist=10m --daemon web-01 &
 # 等价 OpenSSH 写法：
-xops ssh -M -f -N -S ~/.xops/mux-%C -o ControlPersist=10m web-01
+xops ssh -M -f -N -S /tmp/xops-mux-web01.sock -o ControlPersist=10m web-01 &
 
-# 2. 检查主控连接存活状态与 PID
-xops mux check -S ~/.xops/mux-%C web-01 --json
-xops ssh -O check -S ~/.xops/mux-%C web-01
+# 2. 检查主控连接存活状态与 PID（显式 -S 传具体字面路径；若已在 config.yaml 配置 options.control.path，可省略 -S）
+xops mux check -S /tmp/xops-mux-web01.sock web-01 --json
+xops ssh -O check -S /tmp/xops-mux-web01.sock web-01
 
 # 3. 向已运行的主控动态增删转发
-xops mux forward -S ~/.xops/mux-%C -L 127.0.0.1:18080:127.0.0.1:80 web-01
-xops mux cancel  -S ~/.xops/mux-%C -L 127.0.0.1:18080:127.0.0.1:80 web-01
+xops mux forward -S /tmp/xops-mux-web01.sock -L 127.0.0.1:18080:127.0.0.1:80 web-01
+xops mux cancel  -S /tmp/xops-mux-web01.sock -L 127.0.0.1:18080:127.0.0.1:80 web-01
 
 # 4. 通过主控以 stdio 代理模式运行（-O proxy）
-xops mux proxy -S ~/.xops/mux-%C web-01
+xops mux proxy -S /tmp/xops-mux-web01.sock web-01
 
 # 5. 优雅停止接受新会话（stop）或立即退出主控（exit）
-xops mux stop -S ~/.xops/mux-%C web-01
-xops mux exit -S ~/.xops/mux-%C web-01
+xops mux stop -S /tmp/xops-mux-web01.sock web-01
+xops mux exit -S /tmp/xops-mux-web01.sock web-01
 ```
 
 ### ControlMaster 关键机制
 
 - **安全套接字与残余探测**：本地控制套接字经 `core/osfs` 创建并校验所有者权限（Linux/macOS 使用 `AF_UNIX` 对端凭证与 `0600` 权限）；若检测到异常崩溃遗留的死套接字，自动探活并安全清理后再绑定。
-- **配置层控制**：可在 `~/.xops/config.yaml` 的节点或全局 `options.control` 中持久化 `master`（`no`/`yes`/`auto`/`ask`/`autoask`）、`path`（支持 `%C`/`%h`/`%p`/`%r` 等 OpenSSH 令牌）与 `persist`（如 `10m`/`yes`/`no`）。
-- **无交互后台限制**：`xops mux daemon` 与 `ssh -f` 运行于非交互输入流下；若配置了 `ControlMaster=ask/autoask` 或需人工解锁密钥，将会严格失败关闭而非挂起等待。
+- **字面 `-S` 与配置模板路径**：`xops mux check/forward/cancel/proxy/stop/exit` 与 `xops ssh -O` 显式传入 `-S` 时会按字面路径直连套接字（不展开 `~` 或 `%C`）。如需自动按 `~` 与 `%C`/`%h`/`%p`/`%r` 令牌展开，请在 `~/.xops/config.yaml` 的节点或全局 `options.control` 中配置 `master`、`path`（如 `"~/.xops/mux-%C"`）与 `persist`（如 `"10m"`），并在控制命令中省略 `-S`。
+- **进程内同步守护与无交互限制**：`xops mux start --daemon`、`xops mux daemon` 与 `xops ssh -f` 均在当前进程内同步运行 `muxdaemon` 直至 `ControlPersist` 空闲过期、收到 `mux exit` 或 `SIGINT`/`SIGTERM`（不执行 OS `fork()` 脱离），脚本与 AI 助手需将其置于后台或独立受管会话中；且其运行于无交互输入流下，若配置了 `ControlMaster=ask/autoask` 或需人工解锁密钥，将会严格失败关闭而非挂起等待。
 
 ## 4. 主机密钥信任（KnownHosts & SSHFP）
 

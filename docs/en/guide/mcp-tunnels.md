@@ -91,6 +91,8 @@ Pass the `handle` or `handle_token` returned by `start_forward`:
 
 ## 3. ControlMaster Multiplexing Example
 
+`start_mux` expands OpenSSH tokens such as `~` and `%C` through `ControlPath` and returns the concrete expanded `socket_path`:
+
 ```json
 {
   "action": "start_mux",
@@ -101,11 +103,13 @@ Pass the `handle` or `handle_token` returned by `start_forward`:
 }
 ```
 
+For subsequent `probe_mux` or `control_mux` calls, **an explicit `socket_path` is used verbatim without expanding `~` or `%C`**—pass the exact expanded `socket_path` returned by `start_mux` (or omit `socket_path` when `options.control.path` is configured in `~/.xops/config.yaml`):
+
 ```json
 {
   "action": "control_mux",
   "target": "web-01",
-  "socket_path": "~/.xops/mcp-mux-%C",
+  "socket_path": "<expanded-socket_path-returned-by-start_mux>",
   "mux_action": "check"
 }
 ```

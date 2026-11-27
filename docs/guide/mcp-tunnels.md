@@ -91,6 +91,8 @@
 
 ## 3. ControlMaster 多路复用示例
 
+`start_mux` 会通过 `ControlPath` 展开 `~` 与 `%C` 等 OpenSSH 令牌，并在结果中返回展开后的具体 `socket_path`：
+
 ```json
 {
   "action": "start_mux",
@@ -101,11 +103,13 @@
 }
 ```
 
+后续调用 `probe_mux` 或 `control_mux` 时，**显式 `socket_path` 按字面路径使用，不会再展开 `~` 或 `%C`**——请直接传入 `start_mux` 返回的具体展开路径（或当 `~/.xops/config.yaml` 已配置 `options.control.path` 时省略 `socket_path`）：
+
 ```json
 {
   "action": "control_mux",
   "target": "web-01",
-  "socket_path": "~/.xops/mcp-mux-%C",
+  "socket_path": "<expanded-socket_path-returned-by-start_mux>",
   "mux_action": "check"
 }
 ```

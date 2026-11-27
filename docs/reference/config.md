@@ -42,7 +42,7 @@ policy:
     node_overrides:
       "prod-*":
         approval_threshold: safe
-        decision_floor: require_approval # allow | require_approval | deny
+        decision_floor: need_approval # allow | need_approval | deny
       "staging-*": moderate
 
 # Tier-3 XOps 全局 OpenSSH 选项层
@@ -87,7 +87,7 @@ inventory:
         passphrase_ref:
           store: offline
           item: deploy-key-pass
-        key_fingerprint: "SHA256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        key_fingerprint: "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
     id-pass:
       user: app
       auth:
@@ -104,7 +104,7 @@ inventory:
           - kind: keyboard_interactive
             rules:
               - kind: totp
-                name: "Authenticator OTP"
+                name: "authenticator-otp"
                 prompt_pattern: "(?i)verification code|otp"
                 totp_secret_ref:
                   store: offline

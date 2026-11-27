@@ -133,7 +133,7 @@ policy:
     node_overrides:
       "prod-*":
         approval_threshold: safe
-        decision_floor: require_approval
+        decision_floor: need_approval # allow | need_approval | deny
       "staging-*": moderate         # 标量简写，等价于仅设置 approval_threshold
 ```
 

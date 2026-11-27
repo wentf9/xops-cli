@@ -27,7 +27,7 @@
 
 **XOps v2** 是基于全新零历史包袱架构重写的单二进制跨平台 SSH/SFTP 运维与 AI 自动化工具箱（Go 1.27+、`CGO_ENABLED=0`）：
 
-- **OpenSSH 原生体验与四层选项求解**：直接支持 `-p/-l/-i/-J/-L/-R/-D/-w/-W/-o/-O/-M/-S/-F/-t/-tt/-T/-N/-f`，统一按 `CLI > 托管节点 > XOps 全局 > ~/.ssh/config` 四层代数求解；支持 ControlMaster/ControlPersist 多路复用守护（`xops mux`）与本地/远端/SOCKS5/StreamLocal/TUN 隧道（`xops tunnel`）。
+- **OpenSSH 原生体验与四层选项求解**：直接支持 `-p/-l/-i/-J/-L/-R/-D/-w/-o/-O/-M/-S/-F/-t/-tt/-T/-N/-f`，统一按 `CLI > 托管节点 > XOps 全局 > ~/.ssh/config` 四层代数求解；支持 ControlMaster/ControlPersist 多路复用守护（`xops mux`）与本地/远端/SOCKS5/StreamLocal/TUN 隧道（`xops tunnel`）。
 - **结构化资产图与安全凭据路由**：Host / Identity / Node 三实体解耦 + Tarjan 跳板 DAG 环路检测 + 乐观锁 CAS 落盘；配置采用严格 `version: 2` YAML（`~/.xops/config.yaml`，支持 `XOPS_HOME`），零明文密码字段，零明文密码 CLI 参数；内置 `offline_aead`（Argon2id + XChaCha20-Poly1305）、平台原生 `os_keychain`（Windows Credential Manager / macOS Keychain / Linux Secret Service）、`external_helper`（JSON v2 stdin/stdout）与 `none` 四类凭据存储。
 - **并发批量执行、SFTP 原子操作与 Playbook v2**：支持单机/多机并发执行、受控提权（`--sudo`/`--su`/`--doas`）、多方言启动配置（`posix`/`powershell`/`cmd`/`raw` × `server`/`sh`/`bash`/`zsh`/`powershell`/`pwsh`/`cmd`）、并行分片可续传 SCP、单步与交互式 SFTP Shell、以及声明式 Playbook v2（`shell`/`script`/`copy`/`template`/`ensure`）；全链路严格区分三态结果，面对 `OutcomeUnknown` 显式标记 `do_not_retry` 防止盲目重试。
 - **Fail-Closed 安全护栏、O(1) 审计对账与沙箱 MCP**：所有操作经能力门控签发、同步写入 `audit.jsonl`（含启动期 O(1) 进程锁崩溃对账）；内置 **7 个强类型判别式 MCP 工具**（`stdio` 与 Streamable HTTP 双传输 + 10 GiB 双代 WAL 流式端点），默认启用 `strict_agent` 熔断档并**物理禁用 `OperatorReadFS`**（仅暴露基于 `os.Root` 的 `ScopedRootFS` 沙箱）。
@@ -130,10 +130,10 @@ xops creds gc offline/orphan-item
 xops exec --sudo --password-ref offline/web01-sudo web-01 -- systemctl status nginx
 xops exec --dialect powershell --interpreter pwsh win-01 -- 'Get-Process | Select-Object -First 5'
 
-# 本地 (-L)、远端 (-R)、动态 SOCKS5 (-D)、StreamLocal 或 TUN (-w) 转发
+# 本地 (-L)、远端 (-R)、动态 SOCKS5 (-D)、StreamLocal 或 TUN (-w) 转发，及 ControlMaster 复用
 xops tunnel local web-01 127.0.0.1:18080:127.0.0.1:80
-xops ssh -M -f -N -S ~/.xops/mux-%C -o ControlPersist=10m web-01
-xops mux check -S ~/.xops/mux-%C web-01
+xops ssh -M -f -N -S /tmp/xops-mux-web01.sock -o ControlPersist=10m web-01 &
+xops mux check -S /tmp/xops-mux-web01.sock web-01
 
 # 并行可续传 SCP 与单步/交互式 SFTP
 xops scp -r --resume --concurrency 4 ./dist web-01:/srv/app/

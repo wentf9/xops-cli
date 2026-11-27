@@ -35,11 +35,11 @@ xops ssh --json web-01 uname -a
 | `-F <configfile>` | Alternative OpenSSH config file (`none` disables) |
 | `-t` / `-tt` / `-T` | Request PTY / force PTY even without local TTY / disable PTY |
 | `-L` / `-R` / `-D` / `-w` | Local, remote, dynamic SOCKS5, and TUN/TAP forwarding (repeatable) |
-| `-W <host:port>` | Stdio TCP forwarding target (for `ProxyCommand`-style chaining) |
+| `-W <host:port>` | Parsed for CLI compatibility only; currently fails closed with `unsupported` (exit `255`); use `-J` (`ProxyJump`) or `-O proxy` / `xops mux proxy` instead |
 | `-M` / `-MM` | Enable ControlMaster (`-M` = `yes`, `-MM` = `ask`) |
-| `-S <ctl_path>` | ControlMaster socket path override (`none` disables) |
+| `-S <ctl_path>` | ControlMaster socket path override (`none` disables; control subcommands use explicit `-S` literally without expanding `~`/`%C`) |
 | `-O <ctl_cmd>` | Control an active master: `check` \| `forward` \| `cancel` \| `exit` \| `stop` \| `proxy` |
-| `-N` / `-f` | Do not execute a remote command / hand off to background `muxdaemon` (requires `-N`, `-M`, or forwards; cannot include a remote command) |
+| `-N` / `-f` | Do not execute a remote command / hand off to in-process `muxdaemon` synchronously (no OS `fork()` detach—launch in a background/managed session; requires `-N`, `-M`, or forwards, and cannot include a remote command) |
 | `--tun-mode <mode>` | `-w` tunnel mode: `point_to_point` (default) \| `ethernet` |
 
 > **Privilege Escalation**: Controlled `sudo`, `su`, and `doas` execution is handled by [`xops exec --sudo|--su|--doas`](./exec) using Vault references (`--password-ref`) or interactive prompts (`--prompt-password`), never plaintext CLI flags.
@@ -58,8 +58,8 @@ xops tunnel remote worker-01 127.0.0.1:9000:127.0.0.1:3000
 # Dynamic SOCKS5 proxy (-D)
 xops tunnel dynamic web-01 127.0.0.1:1080
 
-# Combine multiple forwards (including StreamLocal Unix sockets) in one session
-xops tunnel start -L 127.0.0.1:5432:127.0.0.1:5432 -L unix:/tmp/app.sock:/run/app.sock -D 127.0.0.1:1080 web-01
+# Combine multiple forwards in one session (StreamLocal Unix sockets use OpenSSH path syntax starting with /, ./, ../, or ~/)
+xops tunnel start -L 127.0.0.1:5432:127.0.0.1:5432 -L /tmp/app.sock:/run/app.sock -D 127.0.0.1:1080 web-01
 
 # TUN/TAP layer-2/3 tunnel (-w / tun)
 xops tunnel tun --tun-mode point_to_point gateway-01 0:0
@@ -76,32 +76,32 @@ xops tunnel tun --tun-mode point_to_point gateway-01 0:0
 XOps v2 supports OpenSSH-compatible ControlMaster sockets and a Nursery-supervised `muxdaemon` via `xops ssh -M/-S/-O/-f` or `xops mux`:
 
 ```bash
-# 1. Start a ControlMaster (-f / --daemon delegates to muxdaemon with ControlPersist)
-xops mux start -S ~/.xops/mux-%C -o ControlPersist=10m --daemon web-01
+# 1. Start a ControlMaster (--daemon / -f runs muxdaemon synchronously in the current process with no OS fork() detach; run in a background/managed session)
+xops mux start -S /tmp/xops-mux-web01.sock -o ControlPersist=10m --daemon web-01 &
 # Equivalent OpenSSH form:
-xops ssh -M -f -N -S ~/.xops/mux-%C -o ControlPersist=10m web-01
+xops ssh -M -f -N -S /tmp/xops-mux-web01.sock -o ControlPersist=10m web-01 &
 
-# 2. Check master liveness and PID
-xops mux check -S ~/.xops/mux-%C web-01 --json
-xops ssh -O check -S ~/.xops/mux-%C web-01
+# 2. Check master liveness and PID (explicit -S takes a literal path; omit -S when options.control.path is configured in config.yaml)
+xops mux check -S /tmp/xops-mux-web01.sock web-01 --json
+xops ssh -O check -S /tmp/xops-mux-web01.sock web-01
 
 # 3. Dynamically add or cancel forwards on an active master
-xops mux forward -S ~/.xops/mux-%C -L 127.0.0.1:18080:127.0.0.1:80 web-01
-xops mux cancel  -S ~/.xops/mux-%C -L 127.0.0.1:18080:127.0.0.1:80 web-01
+xops mux forward -S /tmp/xops-mux-web01.sock -L 127.0.0.1:18080:127.0.0.1:80 web-01
+xops mux cancel  -S /tmp/xops-mux-web01.sock -L 127.0.0.1:18080:127.0.0.1:80 web-01
 
 # 4. Run stdio proxy through the active master (-O proxy)
-xops mux proxy -S ~/.xops/mux-%C web-01
+xops mux proxy -S /tmp/xops-mux-web01.sock web-01
 
 # 5. Stop accepting new sessions (stop) or terminate immediately (exit)
-xops mux stop -S ~/.xops/mux-%C web-01
-xops mux exit -S ~/.xops/mux-%C web-01
+xops mux stop -S /tmp/xops-mux-web01.sock web-01
+xops mux exit -S /tmp/xops-mux-web01.sock web-01
 ```
 
 ### ControlMaster Internals
 
 - **Verified Sockets & Stale Cleanup**: Control sockets are bound through `core/osfs` with owner-only permissions (`0600` and peer-credential verification on Unix). Stale sockets left by crashed masters are probed and safely cleaned before rebinding.
-- **Persistent Configuration**: Configure `options.control` (`master`, `path`, `persist`) globally or per node in `~/.xops/config.yaml` (supports `%C`, `%h`, `%p`, `%r` tokens).
-- **Non-Interactive Daemon**: `xops mux daemon` and `ssh -f` run without interactive stdin; configurations requiring `ControlMaster=ask/autoask` or interactive prompts fail closed rather than hanging.
+- **Literal `-S` vs. Config Path Templates**: Control commands (`xops mux check/forward/cancel/proxy/stop/exit` and `xops ssh -O`) pass an explicit `-S` path verbatim without expanding `~` or `%C`. To use automatic `~` and `%C`/`%h`/`%p`/`%r` token expansion, configure `options.control` (`master`, `path: "~/.xops/mux-%C"`, `persist: "10m"`) in `~/.xops/config.yaml` and omit `-S` on control commands.
+- **In-Process Synchronous Supervisor & Non-Interactive Mode**: `xops mux start --daemon`, `xops mux daemon`, and `xops ssh -f` run `muxdaemon` synchronously in the current process until `ControlPersist` idle expiry, `mux exit`, or `SIGINT`/`SIGTERM` (no OS `fork()` detach)—scripts and AI agents should launch them in a background or managed session. Because `muxdaemon` runs without interactive stdin, configurations requiring `ControlMaster=ask/autoask` or interactive prompts fail closed rather than hanging.
 
 ## 4. Host Key Trust (KnownHosts & SSHFP)
 

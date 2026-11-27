@@ -43,7 +43,7 @@ skills/xops-agent/
     ├── inventory.md   # Inventory graph, config import, vault, and doctor
     ├── execution.md   # Single/batch exec, escalation, LaunchProfile, Playbook v2, audit
     ├── files.md       # Parallel resumable scp, single-shot atomic sftp, SFTP shell
-    └── networking.md  # ssh -L/-R/-D/-w/-W, tunnel, and ControlMaster mux
+    └── networking.md  # ssh -L/-R/-D/-w, tunnel, and ControlMaster mux
 ```
 
 ## 3. Safety Rules Enforced by `xops-agent`

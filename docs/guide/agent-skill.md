@@ -43,7 +43,7 @@ skills/xops-agent/
     ├── inventory.md   # 资产图查询、config import、Vault 与 doctor
     ├── execution.md   # 单机/批量 exec、提权、LaunchProfile、Playbook v2 与审计
     ├── files.md       # scp 并行续传、单步 sftp 原子操作与 SFTP Shell
-    └── networking.md  # ssh -L/-R/-D/-w/-W、tunnel 与 mux ControlMaster
+    └── networking.md  # ssh -L/-R/-D/-w、tunnel 与 mux ControlMaster
 ```
 
 ## 3. AI 调用 CLI 的核心安全准则

@@ -114,6 +114,7 @@ cat ./hosts.csv | xops config import --format csv --stdin --dry-run --json
 
 ```csv
 name,address,port,user,key_path,proxy_jump,tags,description
+bastion,bastion.example.com,22,deploy,~/.ssh/id_ed25519,,infra,Jump bastion
 web-01,192.0.2.10,22,deploy,~/.ssh/id_ed25519,bastion,prod;web,Web server 1
 web-02,192.0.2.11,22,deploy,~/.ssh/id_ed25519,bastion,prod;web,Web server 2
 ```

@@ -65,7 +65,7 @@ xops sftp patch --old "v1" --new "v2" --all web-01 /srv/app/app.ini
 # Directory and metadata operations
 xops sftp mkdir --perm 0755 web-01 /srv/app/releases/v2
 xops sftp mv --no-clobber web-01 /srv/app/app.ini.new /srv/app/app.ini
-xops sftp chmod 0640 web-01 /srv/app/app.ini
+xops sftp chmod web-01 0640 /srv/app/app.ini
 xops sftp rm web-01 /srv/app/tmp.bak
 xops sftp rmdir web-01 /srv/app/empty-dir
 
