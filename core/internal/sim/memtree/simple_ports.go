@@ -183,5 +183,5 @@ func (t *TUNDevicePort) OpenLocalTUN(ctx context.Context, spec ports.TUNSpec) (i
 	if !avail {
 		return nil, "", ports.ErrPermissionDenied
 	}
-	return NewEchoConn("local:" + iface), iface, nil
+	return NewBlockingTUNConn("local:" + iface), iface, nil
 }

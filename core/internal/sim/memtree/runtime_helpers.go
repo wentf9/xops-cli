@@ -133,6 +133,50 @@ func (p *StreamPipe) Close() error {
 	return nil
 }
 
+// BlockingTUNConn 是基于零协程 StreamPipe 封装的纯内存阻塞 TUN/TAP 双向连接（完整兼容 net.Conn）：
+// Read 在缓冲为空且未关闭时阻塞等待写入或 Close() 才返回 (0, io.EOF)，消除非阻塞 EchoConn 空读秒返 EOF 的竞态；
+// Write 在连接打开时接受写入并在已关闭后返回 ports.ErrClosed；Close 幂等且唤醒全部阻塞读者。
+type BlockingTUNConn struct {
+	addr Addr
+	pipe *StreamPipe
+}
+
+// NewBlockingTUNConn 构造绑定虚拟标签地址的纯内存阻塞 TUN 连接。
+func NewBlockingTUNConn(label string) *BlockingTUNConn {
+	return &BlockingTUNConn{addr: Addr(label), pipe: NewStreamPipe()}
+}
+
+func (c *BlockingTUNConn) Read(p []byte) (int, error) {
+	if c == nil || c.pipe == nil {
+		return 0, io.EOF
+	}
+	return c.pipe.Read(p)
+}
+
+func (c *BlockingTUNConn) Write(p []byte) (int, error) {
+	if c == nil || c.pipe == nil {
+		return 0, ports.ErrClosed
+	}
+	n, err := c.pipe.Write(p)
+	if errors.Is(err, io.ErrClosedPipe) {
+		return 0, ports.ErrClosed
+	}
+	return n, err
+}
+
+func (c *BlockingTUNConn) Close() error {
+	if c == nil || c.pipe == nil {
+		return nil
+	}
+	return c.pipe.Close()
+}
+
+func (c *BlockingTUNConn) LocalAddr() net.Addr              { return c.addr }
+func (c *BlockingTUNConn) RemoteAddr() net.Addr             { return c.addr }
+func (c *BlockingTUNConn) SetDeadline(time.Time) error      { return nil }
+func (c *BlockingTUNConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *BlockingTUNConn) SetWriteDeadline(time.Time) error { return nil }
+
 // SeedXoshiro256 使用 SplitMix64 从 64 位种子展开跨平台一致的非零 xoshiro256++ 状态向量。
 func SeedXoshiro256(seed uint64) (st [4]uint64) {
 	sm := seed

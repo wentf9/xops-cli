@@ -374,12 +374,60 @@ func TestCheckImportAllowedInternalI18n(t *testing.T) {
 		{name: "core_engine_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/engine", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
 		{name: "core_domain_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
 		{name: "core_domain_i18n_allows_internal_corecatalog", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", wantOK: true},
-		{name: "core_domain_i18n_subpkg_allows_parent", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
+		{name: "core_domain_i18n_allows_internal_textalg", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg", wantOK: true},
+		{name: "core_domain_i18n_allows_internal_errchain", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/errchain", wantOK: true},
+		{name: "corecatalog_router_allows_shard", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/common", wantOK: true},
+		{name: "corecatalog_router_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "corecatalog_router_denies_textalg", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg", wantOK: false},
+		{name: "corecatalog_test_allows_self", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", wantOK: true},
+		{name: "corecatalog_test_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "corecatalog_shard_denies_router", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/common", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", wantOK: false},
+		{name: "corecatalog_shard_denies_sibling_shard", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/common", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/domain", wantOK: false},
+		{name: "corecatalog_shard_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/usecase", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "corecatalog_shard_test_allows_self", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/common_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/common", wantOK: true},
+		{name: "corecatalog_shard_test_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/common_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "corecatalog_prod_allows_slices", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: "slices", wantOK: true},
+		{name: "corecatalog_prod_denies_strings", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: "strings", wantOK: false},
+		{name: "corecatalog_shard_prod_allows_slices", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/ports", impPath: "slices", wantOK: true},
+		{name: "corecatalog_shard_prod_denies_embed", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/ports", impPath: "embed", wantOK: false},
+		{name: "corecatalog_shard_prod_denies_context", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/runtime", impPath: "context", wantOK: false},
+		{name: "corecatalog_shard_prod_denies_unicode_norm", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog/domain", impPath: "golang.org/x/text/unicode/norm", wantOK: false},
+		{name: "corecatalog_test_allows_strings", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog_test", isTest: true, impPath: "strings", wantOK: true},
+		{name: "textalg_prod_allows_json_v2", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg", impPath: "encoding/json/v2", wantOK: true},
+		{name: "textalg_prod_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "textalg_prod_denies_errchain", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/errchain", wantOK: false},
+		{name: "textalg_prod_denies_unicode_norm", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg", impPath: "golang.org/x/text/unicode/norm", wantOK: false},
+		{name: "textalg_test_allows_self", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg", wantOK: true},
+		{name: "textalg_test_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/textalg_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "errchain_prod_allows_errors", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/errchain", impPath: "errors", wantOK: true},
+		{name: "errchain_prod_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/errchain", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "errchain_test_allows_self", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/errchain_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/errchain", wantOK: true},
+		{name: "errchain_test_denies_parent_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/errchain_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "internal_i18n_allows_rootcatalog", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", wantOK: true},
+		{name: "rootcatalog_prod_allows_slices", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: "slices", wantOK: true},
+		{name: "rootcatalog_prod_denies_embed", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: "embed", wantOK: false},
+		{name: "rootcatalog_prod_denies_context", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: "context", wantOK: false},
+		{name: "rootcatalog_prod_denies_strings", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: "strings", wantOK: false},
+		{name: "rootcatalog_prod_denies_yaml", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: "go.yaml.in/yaml/v3", wantOK: false},
+		{name: "rootcatalog_prod_denies_parent_internal_i18n", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
+		{name: "rootcatalog_prod_denies_core_domain_i18n", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "rootcatalog_prod_denies_core_conc", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", impPath: vetutil.ModulePrefix + "/core/conc", wantOK: false},
+		{name: "rootcatalog_test_allows_self", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog_test", isTest: true, impPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", wantOK: true},
+		{name: "rootcatalog_test_denies_parent_internal_i18n", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog_test", isTest: true, impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
+		{name: "rootcatalog_test_denies_core_domain_i18n", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: false},
+		{name: "rootcatalog_test_denies_core_conc", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/conc", wantOK: false},
+		{name: "rootcatalog_test_denies_yaml", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog_test", isTest: true, impPath: "go.yaml.in/yaml/v3", wantOK: false},
+		{name: "rootcatalog_shard_prod_allows_slices", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog/cli", impPath: "slices", wantOK: true},
+		{name: "rootcatalog_shard_prod_denies_parent", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog/cli", impPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog", wantOK: false},
+		{name: "rootcatalog_shard_test_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/internal/i18n/internal/rootcatalog/cli_test", isTest: true, impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
 		{name: "core_domain_i18n_denies_sibling_algebraic", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/core/domain/algebraic", wantOK: false},
 		{name: "core_domain_i18n_subpkg_denies_sibling_algebraic", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: vetutil.ModulePrefix + "/core/domain/algebraic", wantOK: false},
 		{name: "core_domain_i18n_test_denies_sibling_algebraic", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/algebraic", wantOK: false},
 		{name: "core_domain_i18n_test_allows_self", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
 		{name: "core_domain_sibling_allows_core_domain_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/algebraic", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
+		{name: "gate_reasonmsg_allows_core_domain_i18n", pkgPath: vetutil.ModulePrefix + "/core/internal/gate/internal/reasonmsg", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
+		{name: "gate_reasonmsg_denies_pool", pkgPath: vetutil.ModulePrefix + "/core/internal/gate/internal/reasonmsg", impPath: vetutil.ModulePrefix + "/core/internal/pool", wantOK: false},
+		{name: "gate_reasonmsg_denies_osfs", pkgPath: vetutil.ModulePrefix + "/core/internal/gate/internal/reasonmsg", impPath: vetutil.ModulePrefix + "/core/osfs", wantOK: false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -389,6 +437,9 @@ func TestCheckImportAllowedInternalI18n(t *testing.T) {
 				t.Fatalf("checkImportAllowed(%s, test=%v, %s) = (%q, %v), want %v", tc.pkgPath, tc.isTest, tc.impPath, reason, ok, tc.wantOK)
 			}
 		})
+	}
+	if got := vetutil.ClassifyPackage(vetutil.ModulePrefix + "/core/internal/gate/internal/reasonmsg").Layer; got != vetutil.LayerCoreGate {
+		t.Fatalf("gate/internal/reasonmsg Layer = %v, want %v", got, vetutil.LayerCoreGate)
 	}
 }
 

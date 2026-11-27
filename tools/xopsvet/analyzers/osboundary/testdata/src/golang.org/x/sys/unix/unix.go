@@ -10,6 +10,6 @@ const (
 
 type Stat_t struct{}
 
-func Open(path string, mode int, perm uint32) (int, error)             { return 0, nil }
+func Open(path string, mode int, perm uint32) (int, error)               { return 0, nil }
 func Openat(dirfd int, path string, flags int, mode uint32) (int, error) { return 0, nil }
-func Fstat(fd int, stat *Stat_t) error                                 { return nil }
+func Fstat(fd int, stat *Stat_t) error                                   { return nil }

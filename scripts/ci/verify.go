@@ -305,32 +305,44 @@ func (r *verifyRunner) runModuleStage(modDir, label, pkg string, goworkOff, pres
 
 func (r *verifyRunner) runCrossStage() error {
 	xopsDir, coreDir := filepath.Join(r.repoRoot, "tools", "xopsvet"), filepath.Join(r.repoRoot, "core")
-	fmt.Println("[verify] === Stage: cross (Windows & macOS cross-build & cross-lint, CGO_ENABLED=0) ===")
+	vettool, hasVet, err := r.ensureVettool()
+	if err != nil {
+		return err
+	}
+	fmt.Println("[verify] === Stage: cross (Windows & macOS cross-build, cross-vet & cross-lint, CGO_ENABLED=0) ===")
 	for _, goos := range []string{"windows", "darwin"} {
 		extra := []string{"GOOS=" + goos, "GOARCH=amd64", "CGO_ENABLED=0"}
 		offEnv := buildEnv(true, extra...)
 		for _, t := range []struct {
-			on, lint bool
-			dir      string
-			env      []string
+			on, vet, lint bool
+			dir           string
+			env           []string
 		}{
-			{hasGoFiles(filepath.Join(xopsDir, "cmd", "xopsvet")), false, xopsDir, offEnv},
-			{hasGoFiles(coreDir), !r.opts.skipLint, coreDir, offEnv},
-			{hasRootGoFiles(r.repoRoot), !r.opts.skipLint, r.repoRoot, buildEnv(r.opts.goworkOff, extra...)},
+			{hasGoFiles(filepath.Join(xopsDir, "cmd", "xopsvet")), false, false, xopsDir, offEnv},
+			{hasGoFiles(coreDir), hasVet, !r.opts.skipLint, coreDir, offEnv},
+			{hasRootGoFiles(r.repoRoot), hasVet, !r.opts.skipLint, r.repoRoot, buildEnv(r.opts.goworkOff, extra...)},
 		} {
 			if !t.on {
 				continue
 			}
-			steps := []cmdStep{{"go", []string{"build", "./..."}}}
-			if t.lint {
-				steps = append(steps, cmdStep{"golangci-lint", golangciLintArgs})
-			}
-			if err := runSteps(t.dir, t.env, steps); err != nil {
+			if err := runSteps(t.dir, t.env, crossTargetSteps(vettool, t.vet, t.lint)); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// crossTargetSteps 构造跨平台目标模块的校验步骤：必跑编译，按需追加宿主机 xopsvet 跨平台静态检查与 golangci-lint。
+func crossTargetSteps(vettool string, runVet, runLint bool) []cmdStep {
+	steps := []cmdStep{{"go", []string{"build", "./..."}}}
+	if runVet && vettool != "" {
+		steps = append(steps, cmdStep{"go", []string{"vet", "-vettool=" + vettool, "./..."}})
+	}
+	if runLint {
+		steps = append(steps, cmdStep{"golangci-lint", golangciLintArgs})
+	}
+	return steps
 }
 
 func (r *verifyRunner) runDSTStage() error {
@@ -431,12 +443,18 @@ func runInternalSelfTest(repoRoot string) error {
 	_, _, trErr := resolveAllStagePkgs(repoRoot, "../outside")
 	c1, r1, e1 := resolveAllStagePkgs(repoRoot, "./core/conc/...")
 	c2, r2, e2 := resolveAllStagePkgs(repoRoot, "conc")
+	xsFull := crossTargetSteps("/tmp/xopsvet", true, true)
+	xsNoLint := crossTargetSteps("/tmp/xopsvet", true, false)
+	xsBuildOnly := crossTargetSteps("/tmp/xopsvet", false, false)
 	for i, ok := range []bool{
 		!hasReplaceDirective([]byte("module m\n// replace a => b\n")) && hasReplaceDirective([]byte("module m\nreplace a => ./a\n")) && hasReplaceDirective([]byte("module m\n\treplace (\n\t\ta => ./a\n\t)\n")),
 		!slices.ContainsFunc(rEnv, func(kv string) bool { k, _, _ := strings.Cut(kv, "="); return strings.EqualFold(k, "GOWORK") }),
 		slices.Contains(cEnv, "GOWORK=off") && slices.Contains(cEnv, "CGO_ENABLED=0"),
 		exErr != nil, emErr == nil && emOpt.dstSeeds == "10000", trErr != nil,
 		e1 == nil && c1 == "./conc/..." && r1 == "", e2 == nil && c2 == "./conc" && r2 == "",
+		len(xsFull) == 3 && slices.Equal(xsFull[1].args, []string{"vet", "-vettool=/tmp/xopsvet", "./..."}) && xsFull[2].name == "golangci-lint",
+		len(xsNoLint) == 2 && slices.Equal(xsNoLint[1].args, []string{"vet", "-vettool=/tmp/xopsvet", "./..."}),
+		len(xsBuildOnly) == 1 && slices.Equal(xsBuildOnly[0].args, []string{"build", "./..."}),
 	} {
 		if !ok {
 			return fmt.Errorf("内部自检 #%d 失败", i+1)

@@ -8,7 +8,10 @@
 //   - core/conc 与 core/internal/foundation/{actor,trace} 零例外共享纯内存非 I/O stdlib 约束，
 //     并全路径封死未登记 core/internal/foundation/* 子包；
 //   - core/internal/mcpruntime 物理禁止引用 ports.OperatorReadFS；
-//   - internal/i18n 纯内存词库叶层仅允许 embed 与纯内存标准库、go.yaml.in/yaml/v3 及 core/{domain,conc}。
+//   - internal/i18n 纯内存词库叶层仅允许 embed 与纯内存标准库、go.yaml.in/yaml/v3 及 core/{domain,conc}；
+//   - i18n 内部叶包（core/domain/i18n/internal/{textalg,errchain,corecatalog/*} 与
+//     internal/i18n/internal/rootcatalog/**，含外置 *_test）严禁反向导入任何 XOps 仓内包或第三方库，
+//     corecatalog 路由包仅允许导入 corecatalog/*，且 corecatalog/** 与 rootcatalog/** 生产代码仅允许导入 "slices"。
 package archbound
 
 import (

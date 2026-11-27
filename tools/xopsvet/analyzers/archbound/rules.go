@@ -19,7 +19,7 @@ func checkImportAllowed(src vetutil.PkgInfo, isTest bool, impPath string) (strin
 		return "", true
 	}
 	if vetutil.IsStdlibImport(impPath) {
-		return checkStdlibImport(src, impPath)
+		return checkStdlibImport(src, isTest, impPath)
 	}
 	dst := vetutil.ClassifyPackage(impPath)
 	if !dst.IsXops {
@@ -35,7 +35,7 @@ func isCommonTestImportAllowed(src vetutil.PkgInfo, impPath string) bool {
 	if impPath == "testing" || strings.HasPrefix(impPath, "testing/") || (src.IsExternalTest && impPath == src.BasePath) {
 		return true
 	}
-	if src.Layer != vetutil.LayerCoreDomain && !isUnregisteredCoreLayer(src.Layer) &&
+	if src.Layer != vetutil.LayerCoreDomain && !isI18nInternalSubpkg(src.BasePath) && !isUnregisteredCoreLayer(src.Layer) &&
 		(impPath == vetutil.ModulePrefix+"/core/conc" || impPath == "go.uber.org/goleak") {
 		return true
 	}
@@ -51,12 +51,10 @@ func isUnregisteredCoreLayer(layer vetutil.Layer) bool {
 	return layer == vetutil.LayerCoreOther || layer == vetutil.LayerCoreFoundationOther
 }
 
-func checkStdlibImport(src vetutil.PkgInfo, impPath string) (string, bool) {
+func checkStdlibImport(src vetutil.PkgInfo, isTest bool, impPath string) (string, bool) {
 	switch src.Layer {
 	case vetutil.LayerCoreDomain:
-		if !isDomainAllowedStdlib(src.BasePath, impPath) {
-			return fmt.Sprintf("core/domain/** 禁止导入非白名单标准库 %q", impPath), false
-		}
+		return checkDomainStdlibImport(src, isTest, impPath)
 	case vetutil.LayerCorePorts, vetutil.LayerCorePortsTCK:
 		return checkPortsStdlibImport(src.Layer, impPath)
 	case vetutil.LayerCoreEvents:
@@ -75,13 +73,41 @@ func checkStdlibImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 			return fmt.Sprintf("core/conc 与 core/internal/foundation/{actor,trace} 禁止导入非纯内存 I/O、反射或随机标准库 %q", impPath), false
 		}
 	case vetutil.LayerInternalI18n:
-		if !isInternalI18nAllowedStdlib(impPath) {
-			return fmt.Sprintf("internal/i18n 禁止导入非纯内存/非白名单标准库 %q", impPath), false
-		}
+		return checkInternalI18nStdlibImport(src, isTest, impPath)
 	case vetutil.LayerCoreOther:
 		return fmt.Sprintf("未知 core/ 包路径 %q，未在 RFC §2.1/§2.3 授权包清单内", src.BasePath), false
 	case vetutil.LayerCoreFoundationOther:
 		return fmt.Sprintf("未登记 core/internal/foundation 子包 %q，未在 RFC §2.1/§2.3 授权包清单内", src.BasePath), false
+	}
+	return "", true
+}
+
+// checkDomainStdlibImport 核验 core/domain/** 的标准库导入；
+// 其中 core/domain/i18n/internal/corecatalog/** 生产代码作为纯查表叶包，仅允许导入 "slices"。
+func checkDomainStdlibImport(src vetutil.PkgInfo, isTest bool, impPath string) (string, bool) {
+	if !isTest && matchBasePrefix(src.BasePath, coreCatalogPrefix) {
+		if impPath != "slices" {
+			return fmt.Sprintf("core/domain/i18n/internal/corecatalog/** 生产代码仅允许导入标准库 \"slices\"，禁止导入 %q", impPath), false
+		}
+		return "", true
+	}
+	if !isDomainAllowedStdlib(src.BasePath, impPath) {
+		return fmt.Sprintf("core/domain/** 禁止导入非白名单标准库 %q", impPath), false
+	}
+	return "", true
+}
+
+// checkInternalI18nStdlibImport 核验 internal/i18n/** 的标准库导入；
+// 其中 internal/i18n/internal/rootcatalog/** 生产代码作为纯查表叶包，仅允许导入 "slices"。
+func checkInternalI18nStdlibImport(src vetutil.PkgInfo, isTest bool, impPath string) (string, bool) {
+	if !isTest && matchBasePrefix(src.BasePath, rootCatalogPrefix) {
+		if impPath != "slices" {
+			return fmt.Sprintf("internal/i18n/internal/rootcatalog/** 生产代码仅允许导入标准库 \"slices\"，禁止导入 %q", impPath), false
+		}
+		return "", true
+	}
+	if !isInternalI18nAllowedStdlib(impPath) {
+		return fmt.Sprintf("internal/i18n 禁止导入非纯内存/非白名单标准库 %q", impPath), false
 	}
 	return "", true
 }
@@ -142,7 +168,7 @@ func matchBasePrefix(basePath, prefix string) bool {
 func checkExternalImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 	switch src.Layer {
 	case vetutil.LayerCoreDomain:
-		if impPath == "golang.org/x/text/unicode/norm" {
+		if !isI18nInternalSubpkg(src.BasePath) && impPath == "golang.org/x/text/unicode/norm" {
 			return "", true
 		}
 	case vetutil.LayerCorePortsTCK:
@@ -154,7 +180,7 @@ func checkExternalImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 			return "", true
 		}
 	case vetutil.LayerInternalI18n:
-		if impPath == "go.yaml.in/yaml/v3" {
+		if !isI18nInternalSubpkg(src.BasePath) && impPath == "go.yaml.in/yaml/v3" {
 			return "", true
 		}
 	case vetutil.LayerCorePorts, vetutil.LayerCoreEvents, vetutil.LayerCoreConc,
@@ -166,9 +192,23 @@ func checkExternalImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 	return fmt.Sprintf("当前架构层禁止导入外部第三方包 %q", impPath), false
 }
 
-const coreDomainI18nPrefix = vetutil.ModulePrefix + "/core/domain/i18n"
+const (
+	coreDomainI18nPrefix    = vetutil.ModulePrefix + "/core/domain/i18n"
+	coreDomainI18nIntPrefix = coreDomainI18nPrefix + "/internal"
+	coreCatalogPrefix       = coreDomainI18nIntPrefix + "/corecatalog"
+	internalI18nPrefix      = vetutil.ModulePrefix + "/internal/i18n"
+	internalI18nIntPrefix   = internalI18nPrefix + "/internal"
+	rootCatalogPrefix       = internalI18nIntPrefix + "/rootcatalog"
+)
+
+func isI18nInternalSubpkg(basePath string) bool {
+	return matchBasePrefix(basePath, coreDomainI18nIntPrefix) || matchBasePrefix(basePath, internalI18nIntPrefix)
+}
 
 func checkInternalImport(src, dst vetutil.PkgInfo, impPath string) (string, bool) {
+	if reason, allowed, handled := checkI18nInternalSubpkgImport(src, dst, impPath); handled {
+		return reason, allowed
+	}
 	if matchBasePrefix(src.BasePath, coreDomainI18nPrefix) && !matchBasePrefix(dst.BasePath, coreDomainI18nPrefix) {
 		return fmt.Sprintf("core/domain/i18n 为绝对叶包，禁止导入同层或其他仓内包 %q", impPath), false
 	}
@@ -182,6 +222,23 @@ func checkInternalImport(src, dst vetutil.PkgInfo, impPath string) (string, bool
 		return fmt.Sprintf("未登记 core/internal/foundation 子包 %q，未在 RFC §2.1/§2.3 授权包清单内", src.BasePath), false
 	}
 	return fmt.Sprintf("架构边界违规：当前层禁止导入 %q", impPath), false
+}
+
+// checkI18nInternalSubpkgImport 锁死 i18n 内部包单向无环 DAG：
+//   - core/domain/i18n/internal/corecatalog 路由包仅允许导入其直属叶分片 corecatalog/*；
+//   - core/domain/i18n/internal/{textalg,errchain,corecatalog/*} 及 internal/i18n/internal/rootcatalog/**
+//     （含外置 *_test，不含 isCommonTestImportAllowed 已放行的直接被测 src.BasePath）均严禁导入任何 XOps 仓内包。
+func checkI18nInternalSubpkgImport(src, dst vetutil.PkgInfo, impPath string) (string, bool, bool) {
+	if src.BasePath == coreCatalogPrefix {
+		if strings.HasPrefix(dst.BasePath, coreCatalogPrefix+"/") {
+			return "", true, true
+		}
+		return fmt.Sprintf("core/domain/i18n/internal/corecatalog 路由包仅允许导入子分片 corecatalog/*，禁止导入 %q", impPath), false, true
+	}
+	if isI18nInternalSubpkg(src.BasePath) {
+		return fmt.Sprintf("i18n 内部叶包 %q 禁止导入任何 XOps 仓内包 %q", src.BasePath, impPath), false, true
+	}
+	return "", false, false
 }
 
 // isInternalLayerAllowed 按 ADR-001 / RFC v2.3.3 §2.3 单向依赖矩阵裁决仓内包间导入合法性。

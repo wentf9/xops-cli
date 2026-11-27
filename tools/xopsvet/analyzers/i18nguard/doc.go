@@ -14,7 +14,7 @@
 //     errors.New 与 fmt.Errorf（显式放行 errors.Join），禁止在 core/domain/i18n 之外声明实现
 //     Error() string 的底层 string 自定义错误类型，并要求其他具体自定义错误类型在匹配的接收者
 //     方法集上同步实现 LocalizableView() core/domain/i18n.ErrorNode；永久基础设施白名单仅限
-//     core/domain/i18n（含 internal/corecatalog）、core/conc、core/internal/sim、core/ports/tck
+//     core/domain/i18n（精确主包，不含 internal/* 子包）、core/conc、core/internal/sim、core/ports/tck
 //     与 tools/xopsvet；
 //   - 规则 3（禁止生产源码硬编码 CJK 与全角中文标点）：对全部非跳过生产包无例外生效，检查生产文件
 //     STRING/CHAR 字面量（含转义解码后），拦截任何 unicode.Han 字符以及 U+3000..U+303F、

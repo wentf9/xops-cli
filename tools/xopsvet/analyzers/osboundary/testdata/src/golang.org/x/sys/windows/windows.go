@@ -3,7 +3,7 @@ package windows
 type Handle uintptr
 
 const (
-	OPEN_EXISTING   = 3
+	OPEN_EXISTING    = 3
 	SE_KERNEL_OBJECT = 6
 )
 

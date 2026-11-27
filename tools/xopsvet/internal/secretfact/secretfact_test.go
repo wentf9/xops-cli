@@ -44,6 +44,8 @@ func TestClassifyCommonSinkI18n(t *testing.T) {
 		{name: "core_wrap", pkg: coreI18n, sym: "Wrap", want: secretfact.SinkError},
 		{name: "core_wraps", pkg: coreI18n, sym: "WrapS", want: secretfact.SinkError},
 		{name: "core_wrap_sentinel", pkg: coreI18n, sym: "WrapSentinel", want: secretfact.SinkError},
+		{name: "core_wrap_sentinel_detail", pkg: coreI18n, sym: "WrapSentinelDetail", want: secretfact.SinkError},
+		{name: "core_dynamic_detail_error", pkg: coreI18n, sym: "DynamicDetailError", want: secretfact.SinkError},
 		{name: "core_sentinel", pkg: coreI18n, sym: "Sentinel", want: secretfact.SinkError},
 		{name: "core_sentinel_fb", pkg: coreI18n, sym: "SentinelWithFallback", want: secretfact.SinkError},
 		{name: "core_new_message", pkg: coreI18n, sym: "NewMessage", want: secretfact.SinkError},

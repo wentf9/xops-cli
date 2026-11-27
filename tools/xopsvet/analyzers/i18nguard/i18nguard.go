@@ -1,6 +1,7 @@
 package i18nguard
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/tools/xopsvet/internal/vetutil"
@@ -46,13 +47,28 @@ func isAlwaysSkippedPkg(pkgInfo vetutil.PkgInfo) bool {
 		pkgInfo.Layer == vetutil.LayerToolsXopsvet
 }
 
+// isCoreDomainI18nPkg 精确匹配 core/domain/i18n 主包（其 internal/{textalg,errchain,corecatalog/**} 子包不豁免规则 2）。
 func isCoreDomainI18nPkg(pkgInfo vetutil.PkgInfo) bool {
 	return !pkgInfo.IsExternalTest && pkgInfo.Layer == vetutil.LayerCoreDomain &&
-		matchPkgPrefix(pkgInfo.BasePath, coreDomainI18nPkgPath)
+		pkgInfo.BasePath == coreDomainI18nPkgPath
 }
 
+// isMessageIDOwnerPkg 判断包是否为 MessageID 常量合法属主（core/domain/i18n 或 internal/i18n 及其非 internal 子包），
+// 显式排除两包下任何含 "internal" 路径段的子包，防止 internal/* 伪造 MessageID。
 func isMessageIDOwnerPkg(pkgPath string) bool {
-	return matchPkgPrefix(pkgPath, coreDomainI18nPkgPath) || matchPkgPrefix(pkgPath, internalI18nPkgPath)
+	return isOwnedPkgWithoutInternal(pkgPath, coreDomainI18nPkgPath) ||
+		isOwnedPkgWithoutInternal(pkgPath, internalI18nPkgPath)
+}
+
+func isOwnedPkgWithoutInternal(pkgPath, ownerPrefix string) bool {
+	if pkgPath == ownerPrefix {
+		return true
+	}
+	rel, ok := strings.CutPrefix(pkgPath, ownerPrefix+"/")
+	if !ok || rel == "" {
+		return false
+	}
+	return !slices.Contains(strings.Split(rel, "/"), "internal")
 }
 
 func matchPkgPrefix(path, prefix string) bool {

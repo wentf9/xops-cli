@@ -79,6 +79,7 @@ func classifyLogOrErrorSink(pkgPath, name string) SinkKind {
 			"Str", "BoundStr", "BoundDisplayText", "Int", "Int64", "Uint64", "Float", "Bool", "Dur", "DurNanos", "Msg",
 			"NewMessage", "NewMessageWithFallback", "NewPluralMessage", "NewPluralMessageWithFallback",
 			"Sentinel", "SentinelWithFallback", "NewErrorWithFallback", "E", "EF", "Wrap", "WrapS", "WrapSentinel",
+			"WrapSentinelDetail", "DynamicDetailError",
 			"CanonicalError", "RenderErrorChain", "FormatTemplate",
 		}, name) {
 			return SinkError
