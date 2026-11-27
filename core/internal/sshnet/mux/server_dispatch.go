@@ -70,7 +70,7 @@ func openUpstreamSubsystem(ctx context.Context, upstream ports.TransportConn, su
 	if so, ok := upstream.(subsystemOpener); ok {
 		return so.OpenSubsystem(ctx, subsystem)
 	}
-	return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", "raw "+subsystem+" subsystem"))
+	return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyMuxRawSubsysUnsup, domi18n.BoundStr("subsystem", subsystem))
 }
 
 func (st *muxServerState) handleOpenSFTP(ctx context.Context, conn net.Conn, body []byte) {

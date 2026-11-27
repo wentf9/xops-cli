@@ -101,7 +101,7 @@ func resolvePercentToken(tok byte, ctx TokenContext, pathSafe bool) (string, err
 			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "token"), domi18n.BoundStr("value", "%"+string(tok)))
 		}
 		if pathSafe && val != "" && (strings.ContainsAny(val, `/\`) || val == "." || strings.Contains(val, "..")) {
-			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", val), domi18n.Str("reason", "path_separator_or_traversal"))
+			return "", domi18n.EF(ErrInvalidPercentInput, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", val), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonSepOrTraversal)))
 		}
 		return val, nil
 	}

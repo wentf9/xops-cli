@@ -75,7 +75,7 @@ func listenSocketLockedOS(ctx context.Context, path ControlSocketPath) (*net.Uni
 			return nil, nil, err
 		}
 		if lErr := os.Link(tmpPath, target); lErr != nil {
-			return nil, nil, cleanupSocketBind(uln, tmpPath, pickIf(errors.Is(lErr, os.ErrExist), domi18n.EF(ErrSlotOccupied, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "link_socket"), domi18n.BoundStr("target", target)), mapOSError(lErr)))
+			return nil, nil, cleanupSocketBind(uln, tmpPath, pickIf(errors.Is(lErr, os.ErrExist), domi18n.EF(ErrSlotOccupied, domi18n.KeyOSFSSlotOccupiedAt, domi18n.BoundStr("path", target)), mapOSError(lErr)))
 		}
 		_ = os.Remove(tmpPath)
 		return uln, origID, nil

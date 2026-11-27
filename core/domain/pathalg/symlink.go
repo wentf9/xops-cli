@@ -118,7 +118,7 @@ func ValidateSymlinkTarget(policy SymlinkPolicy, target string, linkDirDepth int
 		return ValidateContainedSymlink(target, linkDirDepth)
 	case SymlinkFollowOperatorSource:
 		if target == "" || len(target) > MaxLocalPathBytes || hasForbiddenPathText(target) {
-			return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "symlink_target"), domi18n.BoundStr("value", target))
+			return domi18n.WrapSentinel(ErrUnsafeSymlink, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "symlink_target"), domi18n.BoundStr("value", target)))
 		}
 		return nil
 	default:
@@ -149,7 +149,7 @@ func ValidateContainedSymlink(target string, linkDirDepth int) error {
 		case "..":
 			depth--
 			if depth < 0 {
-				return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target), domi18n.Str("reason", "escapes_root"))
+				return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonEscapesRoot)))
 			}
 		default:
 			depth++
@@ -169,7 +169,7 @@ func validateContainedSymlinkSyntax(target string) error {
 		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "symlink_target"))
 	}
 	if strings.HasPrefix(target, "/") || strings.ContainsAny(target, `\:`) {
-		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target), domi18n.Str("reason", "non_relative_or_forbidden_char"))
+		return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonNonRelOrChar)))
 	}
 	for seg := range strings.SplitSeq(target, "/") {
 		if seg == "" || seg == "." || seg == ".." {
@@ -194,10 +194,10 @@ type SymlinkBinding struct {
 // NewSymlinkBinding 构造经基础语法校验的沙箱符号链接绑定条目。
 func NewSymlinkBinding(link LocalRootedDest, target string) (SymlinkBinding, error) {
 	if !link.IsValid() {
-		return SymlinkBinding{}, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "symlink_link"))
+		return SymlinkBinding{}, domi18n.WrapSentinel(ErrUnsafeSymlink, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "symlink_link")))
 	}
 	if target == "" || len(target) > MaxRemotePathBytes || hasForbiddenPathText(target) {
-		return SymlinkBinding{}, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "symlink_target"), domi18n.BoundStr("value", target))
+		return SymlinkBinding{}, domi18n.WrapSentinel(ErrUnsafeSymlink, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "symlink_target"), domi18n.BoundStr("value", target)))
 	}
 	return SymlinkBinding{link: link, target: target}, nil
 }
@@ -277,7 +277,7 @@ func buildFoldedSymlinkIndex(ordered []SymlinkBinding) (*foldedSymlinkIndex, err
 	}
 	for _, entry := range ordered {
 		if !entry.IsValid() {
-			return nil, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "symlink_binding"))
+			return nil, domi18n.WrapSentinel(ErrUnsafeSymlink, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "symlink_binding")))
 		}
 		rel := entry.link.rel
 		folded, err := foldSlashPath(rel)
@@ -299,7 +299,7 @@ func checkSymlinkParents(idx *foldedSymlinkIndex, parentParts []string) error {
 		if _, found, err := lookupFoldedSymlink(idx, prefix); err != nil {
 			return err
 		} else if found {
-			return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", prefix), domi18n.Str("reason", "ancestor_is_symlink"))
+			return domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", prefix), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonAncestorLink)))
 		}
 	}
 	return nil
@@ -342,7 +342,7 @@ func stepContainedSymlink(idx *foldedSymlinkIndex, origTarget string, cur, queue
 	queue = queue[1:]
 	if seg == ".." {
 		if len(cur) == 0 {
-			return nil, nil, hops, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", origTarget), domi18n.Str("reason", "chain_escapes_root"))
+			return nil, nil, hops, domi18n.EF(ErrUnsafeSymlink, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", origTarget), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonChainEscapes)))
 		}
 		return cur[:len(cur)-1], queue, hops, nil
 	}

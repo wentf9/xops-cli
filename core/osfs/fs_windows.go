@@ -192,13 +192,13 @@ func validateWindowsHandle(handle windows.Handle, path string, expectDir, reject
 
 type winErrMap struct{ src, out error }
 
-func wrapTarget(s, c error, op, tgt string) error {
-	return domi18n.WrapS(s, c, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", op), domi18n.BoundStr("target", tgt))
+func wrapTarget(s, c error, tgt string) error {
+	return domi18n.WrapSentinel(s, domi18n.Wrap(c, domi18n.KeyOSFSOpenFailed, domi18n.BoundStr("path", tgt)))
 }
 func mapWinErrTable(path string, err error, tbl []winErrMap) error {
 	for _, m := range tbl {
 		if errors.Is(err, m.src) {
-			return wrapTarget(m.out, err, "open", path)
+			return wrapTarget(m.out, err, path)
 		}
 	}
 	return nil

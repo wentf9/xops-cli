@@ -54,13 +54,13 @@ func (d *Dialer) enforceHostTrustCheck(ctx context.Context, hop plan.HopSpec, pu
 	case ports.HostTrustTrusted:
 		return nil
 	case ports.HostTrustRevoked:
-		return domi18n.WrapSentinel(ports.ErrHostKeyRevoked, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyRevoked, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 	case ports.HostTrustMismatch:
 		return d.handleHostKeyMismatch(hop, pub)
 	case ports.HostTrustUnknown:
 		return d.handleUnknownHostKey(ctx, hop, pub)
 	default:
-		return domi18n.EF(ports.ErrHostKeyUnknown, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "host key verification status"), domi18n.Str("value", chk.Status().String()))
+		return domi18n.EF(ports.ErrHostKeyUnknown, domi18n.KeyDialUnknownHostTrustStatus, domi18n.Str("status", chk.Status().String()))
 	}
 }
 
@@ -71,13 +71,13 @@ func enforceHostCertTrustCheck(hop plan.HopSpec, pub ports.PublicKeyInfo, chk po
 	case ports.HostTrustTrusted:
 		return nil
 	case ports.HostTrustRevoked:
-		return domi18n.WrapSentinel(ports.ErrHostKeyRevoked, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyRevoked, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 	case ports.HostTrustMismatch:
-		return domi18n.WrapSentinel(ports.ErrHostKeyMismatch, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+"): "+chk.Reason())))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyMismatch, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+"): "+chk.Reason())
 	case ports.HostTrustUnknown:
-		return domi18n.WrapSentinel(ports.ErrHostKeyUnknown, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyUnknown, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 	default:
-		return domi18n.EF(ports.ErrHostKeyUnknown, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "host certificate verification status"), domi18n.Str("value", chk.Status().String()))
+		return domi18n.EF(ports.ErrHostKeyUnknown, domi18n.KeyDialUnknownHostTrustStatus, domi18n.Str("status", chk.Status().String()))
 	}
 }
 
@@ -87,7 +87,7 @@ func (d *Dialer) handleHostKeyMismatch(hop plan.HopSpec, pub ports.PublicKeyInfo
 	if hop.Transport().StrictHostKeyChecking() == option.StrictHostKeyCheckingNo && authAllowsInsecureMismatch(hop.Auth()) {
 		return nil
 	}
-	return domi18n.WrapSentinel(ports.ErrHostKeyMismatch, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+	return domi18n.WrapSentinelDetail(ports.ErrHostKeyMismatch, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 }
 
 func (d *Dialer) handleUnknownHostKey(ctx context.Context, hop plan.HopSpec, pub ports.PublicKeyInfo) error {
@@ -95,7 +95,7 @@ func (d *Dialer) handleUnknownHostKey(ctx context.Context, hop plan.HopSpec, pub
 	switch tp.StrictHostKeyChecking() {
 	case option.StrictHostKeyCheckingAcceptNew:
 		if err := d.hostTrust.RecordHostKey(ctx, hop.Endpoint(), pub, tp.UserKnownHostsFiles()); err != nil {
-			return domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "record new host key"))
+			return domi18n.Wrap(err, domi18n.KeyDialHostKeyRecordFailed)
 		}
 		return nil
 	case option.StrictHostKeyCheckingNo:
@@ -104,16 +104,16 @@ func (d *Dialer) handleUnknownHostKey(ctx context.Context, hop plan.HopSpec, pub
 	case option.StrictHostKeyCheckingAsk:
 		return d.confirmAndRecordUnknownHostKey(ctx, hop, pub)
 	case option.StrictHostKeyCheckingYes, option.StrictHostKeyCheckingUnset:
-		return domi18n.WrapSentinel(ports.ErrHostKeyUnknown, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyUnknown, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 	default:
-		return domi18n.WrapSentinel(ports.ErrHostKeyUnknown, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyUnknown, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 	}
 }
 
 func (d *Dialer) confirmAndRecordUnknownHostKey(ctx context.Context, hop plan.HopSpec, pub ports.PublicKeyInfo) error {
 	tp := hop.Transport()
 	if tp.BatchMode() || d.interaction == nil || !d.interaction.CanInteract() {
-		return domi18n.WrapSentinel(ports.ErrHostKeyUnknown, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyUnknown, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 	}
 	titleMsg := domi18n.NewMessage(domi18n.KeyInteractHostKeyTitle)
 	bodyMsg := domi18n.NewMessage(
@@ -138,10 +138,10 @@ func (d *Dialer) confirmAndRecordUnknownHostKey(ctx context.Context, hop plan.Ho
 		return domi18n.WrapSentinel(ports.ErrHostKeyUnknown, err)
 	}
 	if !verdict.Allowed() {
-		return domi18n.WrapSentinel(ports.ErrHostKeyUnknown, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")))
+		return domi18n.WrapSentinelDetail(ports.ErrHostKeyUnknown, nil, hop.Endpoint().String()+" ("+pub.Fingerprint().String()+")")
 	}
 	if err := d.hostTrust.RecordHostKey(ctx, hop.Endpoint(), pub, tp.UserKnownHostsFiles()); err != nil {
-		return domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "record confirmed host key"))
+		return domi18n.Wrap(err, domi18n.KeyDialHostKeyRecordFailed)
 	}
 	return nil
 }

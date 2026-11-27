@@ -84,7 +84,7 @@ func (p *Prober) runStage2(
 		return zero, err
 	}
 	if !succeeded {
-		return zero, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "stage 2 interpreter enumeration"), domi18n.Str("target", hit.dialect.String()))
+		return zero, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeStage2EnumFailed, domi18n.Str("dialect", hit.dialect.String()))
 	}
 	interpreters, err := parseStage2Interpreters(output)
 	if err != nil {
@@ -143,19 +143,19 @@ func (p *Prober) execProbeCommand(
 
 func inspectProbeOutcome(out execution.ExecutionOutcome, stdout string, maxBytes uint64) (string, bool, error) {
 	if out == nil || !out.IsValid() {
-		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExecutionOutcome"))
+		return "", false, domi18n.WrapSentinel(ErrProbeFailed, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExecutionOutcome")))
 	}
 	switch v := out.(type) {
 	case *execution.OutcomeCompleted:
 		if v.Truncated() || uint64(len(stdout)) > maxBytes {
-			return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "probe output"), domi18n.Uint64("size", uint64(len(stdout))), domi18n.Uint64("limit", maxBytes))
+			return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeOutputLimit, domi18n.Uint64("size", uint64(len(stdout))), domi18n.Uint64("limit", maxBytes))
 		}
 		return stdout, v.Succeeded(), nil
 	case *execution.OutcomeNotStarted:
-		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "start probe session"), domi18n.BoundStr("target", v.Code()))
+		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeSessionStartFailed, domi18n.BoundStr("code", v.Code()))
 	case *execution.OutcomeUnknown:
-		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "probe session execution"), domi18n.BoundStr("target", v.Code()))
+		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeSessionExecFailed, domi18n.BoundStr("code", v.Code()))
 	default:
-		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "execution outcome variant"))
+		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonUnsupportedVariant, domi18n.Str("type", "ExecutionOutcome"))
 	}
 }

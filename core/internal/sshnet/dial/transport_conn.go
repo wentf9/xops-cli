@@ -170,7 +170,7 @@ func (c *TransportConn) SendGlobalRequest(ctx context.Context, name string, want
 		return false, nil, err
 	}
 	if name == "" {
-		return false, nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "global request name"))
+		return false, nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "request_name"))
 	}
 	type reqResp struct {
 		ok   bool
@@ -223,7 +223,7 @@ func (c *TransportConn) OpenChannel(ctx context.Context, chanType string, extraD
 		return nil, nil, err
 	}
 	if chanType == "" {
-		return nil, nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "channel type"))
+		return nil, nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "channel_type"))
 	}
 	pair, err := chanconn.RunMultiplexedOp(ctx, c.lifeNursery, func() (openedChannelPair, error) {
 		ch, reqs, oErr := c.client.OpenChannel(chanType, extraData)
@@ -283,7 +283,7 @@ func (c *TransportConn) OpenSubsystem(ctx context.Context, subsystem string) (*c
 		if rErr != nil {
 			return nil, rErr
 		}
-		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", "subsystem "+subsystem))
+		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyDialSubsystemUnsupported, domi18n.BoundStr("subsystem", subsystem))
 	}
 	localAddr := chanconn.NewAddr("subsystem", c.endpoint.String())
 	remoteAddr := chanconn.NewAddr("subsystem", subsystem+"@"+c.endpoint.String())
@@ -305,7 +305,7 @@ func (c *TransportConn) DialTCP(ctx context.Context, target netaddr.HostPort) (n
 		return nil, err
 	}
 	if !target.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "DialTCP target"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "tcp_target"))
 	}
 	payload := ssh.Marshal(&directTCPIPMsg{
 		DestAddr:   target.Host().String(),
@@ -346,7 +346,7 @@ func (c *TransportConn) DialStreamLocal(ctx context.Context, remoteSocket pathal
 		return nil, err
 	}
 	if !remoteSocket.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix socket path"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "unix_path"))
 	}
 	payload := ssh.Marshal(&directStreamLocalMsg{SocketPath: remoteSocket.String()})
 	wc, err := c.OpenWatchedChannel(ctx, "direct-streamlocal@openssh.com", payload, chanconn.NewAddr("unix", remoteSocket.String()))
@@ -362,7 +362,7 @@ func (c *TransportConn) ListenStreamLocal(ctx context.Context, remoteSocket path
 		return nil, err
 	}
 	if !remoteSocket.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix listen path"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "unix_listen_path"))
 	}
 	return chanconn.RunMultiplexedOp(ctx, c.lifeNursery, func() (net.Listener, error) {
 		return c.client.ListenUnix(remoteSocket.String())

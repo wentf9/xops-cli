@@ -252,7 +252,9 @@ func stepApprovalLexical(s ApprovalState, in ApprovalInput) (ApprovalState, []Ap
 			return approvalNext(approvalAt(s.ctx, ApprovalPhaseCanonicalizing, s.activeSnapshot, s.activeBinding), ApprovalEffectCanonicalize, ApprovalEventCanonicalizeRequested, "requires_canonicalize")
 		}
 		if na, ok := d.(*security.DecisionNeedApproval); ok {
-			return approvalNext(approvalAt(s.ctx, ApprovalPhaseChallengePending, s.ctx.lexicalSnapshot, s.ctx.lexicalBinding), ApprovalEffectRequestChallenge, ApprovalEventChallengeRequested, na.Reason())
+			next := approvalAt(s.ctx, ApprovalPhaseChallengePending, s.ctx.lexicalSnapshot, s.ctx.lexicalBinding)
+			next.reason = sanitizeReason(na.Reason())
+			return approvalNext(next, ApprovalEffectRequestChallenge, ApprovalEventChallengeRequested, na.Reason())
 		}
 		return approvalAt(s.ctx, ApprovalPhaseApproved, s.ctx.lexicalSnapshot, s.ctx.lexicalBinding), nil, []ApprovalEvent{newEvent(ApprovalEventApproved, "lexical_direct_allow")}, nil
 	default:
@@ -310,7 +312,7 @@ func decideAfterEscalation(s ApprovalState, effDec security.GuardrailDecision, e
 }
 func enterChallengePending(s ApprovalState, effRisk security.RiskLevel, escalated bool, reasons []security.EscalationReason, detail string) (ApprovalState, []ApprovalEffect, []ApprovalEvent, error) {
 	next := approvalAt(s.ctx, ApprovalPhaseChallengePending, s.activeSnapshot, s.activeBinding)
-	next.effectiveRisk, next.escalated, next.escalationReasons = effRisk, escalated, reasons
+	next.effectiveRisk, next.escalated, next.escalationReasons, next.reason = effRisk, escalated, reasons, sanitizeReason(detail)
 	reqEv := newEvent(ApprovalEventChallengeRequested, detail)
 	events := pickIf(escalated, []ApprovalEvent{newEvent(ApprovalEventEscalationDetected, detail), reqEv}, []ApprovalEvent{reqEv})
 	return next, []ApprovalEffect{{kind: ApprovalEffectRequestChallenge, valid: true}}, events, nil

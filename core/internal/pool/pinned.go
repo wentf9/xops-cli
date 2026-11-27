@@ -214,7 +214,7 @@ func RegisterLeaseHandleWith[K plan.HandleKind, R ComparableManagedResource](p *
 	}
 	id, err := plan.NewHandleIDFrom(p.entropy)
 	if err != nil {
-		return zero, domi18n.WrapS(ErrInvalidHandle, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate HandleID"))
+		return zero, domi18n.WrapS(ErrInvalidHandle, err, domi18n.KeyCommonIDGenFailed, domi18n.Str("kind", "HandleID"))
 	}
 	meta, err := p.slots.allocateHandle(p, id, planDig, binding, nil, plan.HandleKindOf[K]())
 	if err != nil {

@@ -185,10 +185,14 @@ func (d *AuditDispatcher) haltedErr() error {
 	if !halted {
 		return nil
 	}
-	if cause != nil {
-		return domi18n.WrapS(ErrAuditHalted, cause, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason))
+	switch reason {
+	case "audit_write_failed":
+		return domi18n.WrapS(ErrAuditHalted, cause, domi18n.KeyEventsAuditHaltWriteFailed)
+	case "", "audit_halted":
+		return pickIf[error](cause != nil, domi18n.WrapSentinel(ErrAuditHalted, cause), ErrAuditHalted)
+	default:
+		return domi18n.WrapS(ErrAuditHalted, cause, domi18n.KeyEventsAuditHaltReason, domi18n.BoundStr("reason", reason))
 	}
-	return domi18n.EF(ErrAuditHalted, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason))
 }
 
 func (d *AuditDispatcher) mirrorFailureDiag(ev *AuditRecordEvent, writeErr error) {

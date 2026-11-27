@@ -216,7 +216,7 @@ func (m *MuxSocket) Probe(ctx context.Context, socketPath pathalg.LocalSourcePat
 	case osfs.SocketProbeMissing, osfs.SocketProbeStale:
 		return ports.NewMuxControlResponse(false, 0, "not running")
 	case osfs.SocketProbeNotSocket:
-		return muxstream.ZeroVal[ports.MuxControlResponse](), domi18n.EF(ports.ErrMuxUnavailable, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "control socket path"))
+		return muxstream.ZeroVal[ports.MuxControlResponse](), domi18n.WrapSentinel(ports.ErrMuxUnavailable, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "control_socket_path")))
 	}
 	return m.probeLiveSocket(ctx, ctrlPath)
 }
@@ -233,11 +233,11 @@ func (m *MuxSocket) probeLiveSocket(ctx context.Context, ctrlPath osfs.ControlSo
 	var pid uint32
 	err = chanconn.RunWithAbortWatchdog(ctx, func() { _ = conn.Close() }, func() error {
 		if _, hErr := muxstream.ExchangeClientHello(conn); hErr != nil {
-			return domi18n.WrapS(ports.ErrMuxUnavailable, hErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "PROTOCOL.mux handshake"))
+			return domi18n.WrapS(ports.ErrMuxUnavailable, hErr, domi18n.KeyMuxHandshakeFailed)
 		}
 		p, aErr := muxstream.SendAliveCheck(conn, 1)
 		if aErr != nil {
-			return domi18n.WrapS(ports.ErrMuxUnavailable, aErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "ControlMaster alive check"))
+			return domi18n.WrapS(ports.ErrMuxUnavailable, aErr, domi18n.KeyMuxAliveCheckFailed)
 		}
 		pid = p
 		return nil
@@ -313,7 +313,7 @@ func (m *MuxSocket) DialMux(ctx context.Context, socketPath pathalg.LocalSourceP
 		return nil, err
 	}
 	if !hopDigest.IsValid() || !endpoint.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "HopDigest or Endpoint"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "hop_endpoint"))
 	}
 	ctrlPath, err := toControlSocketPath(socketPath)
 	if err != nil {
@@ -337,7 +337,7 @@ func (m *MuxSocket) DialMux(ctx context.Context, socketPath pathalg.LocalSourceP
 	})
 	_ = conn.Close()
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrMuxUnavailable, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "ControlMaster handshake or alive check"))
+		return nil, domi18n.WrapS(ports.ErrMuxUnavailable, err, domi18n.KeyMuxSessionCheckFailed)
 	}
 	return newMuxTransportConn(m, ctrlPath, hopDigest, endpoint, exts[muxstream.ExtXOpsStreamMux] == "1", formatPeerDetail(cred))
 }
@@ -359,7 +359,7 @@ func (m *MuxSocket) dialVerified(ctx context.Context, ctrlPath osfs.ControlSocke
 
 func toControlSocketPath(src pathalg.LocalSourcePath) (osfs.ControlSocketPath, error) {
 	if !src.IsValid() {
-		return muxstream.ZeroVal[osfs.ControlSocketPath](), domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "control socket path"))
+		return muxstream.ZeroVal[osfs.ControlSocketPath](), domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "control_socket_path"))
 	}
 	cp, err := osfs.ControlSocketPathFromSource(src)
 	if err != nil {

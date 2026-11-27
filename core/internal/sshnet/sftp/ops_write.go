@@ -24,7 +24,7 @@ func (c *Client) WriteFileAtomic(ctx context.Context, p pathalg.RemotePath, spec
 		return zeroVal[ports.RemoteFileStat](), err
 	}
 	if !spec.IsValid() || r == nil {
-		return zeroVal[ports.RemoteFileStat](), domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "WriteFileAtomic spec or reader"))
+		return zeroVal[ports.RemoteFileStat](), domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "write_spec"))
 	}
 	if p.IsRoot() {
 		return zeroVal[ports.RemoteFileStat](), ports.ErrRemoteIsDir
@@ -243,7 +243,7 @@ func (c *Client) WriteChunk(ctx context.Context, p pathalg.RemotePath, offset in
 		return err
 	}
 	if offset < 0 || length < 0 || r == nil {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "WriteChunk arguments"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "write_chunk_args"))
 	}
 	if p.IsRoot() {
 		return ports.ErrRemoteIsDir

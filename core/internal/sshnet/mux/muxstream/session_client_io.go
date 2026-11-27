@@ -164,7 +164,7 @@ func (s *RemoteSession) deliverCtrlReply(rd *Reader) {
 	if err := FirstErr(e0, e1, e2); err != nil {
 		cErr = err
 	} else if okFlag == 0 {
-		cErr = domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", msg))
+		cErr = domi18n.E(domi18n.KeyMuxRemoteError, domi18n.BoundStr("detail", msg))
 	}
 	s.ctrlMu.Lock()
 	ch := s.pendingCtrl[reqID]

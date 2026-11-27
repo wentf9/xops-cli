@@ -206,7 +206,7 @@ func (c *MuxTransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort
 // DialTCP 经 ControlMaster 发起远端 direct-tcpip 通道并返回原始双向流。
 func (c *MuxTransportConn) DialTCP(ctx context.Context, target netaddr.HostPort) (net.Conn, error) {
 	if !target.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "DialTCP target"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "tcp_target"))
 	}
 	body := muxstream.AppendU32(muxstream.AppendStr(muxstream.AppendU32(nil, 1), target.Host().String()), uint32(target.Port()))
 	return c.dialXOpsStream(ctx, muxstream.XOpsCDialTCP, body)
@@ -215,7 +215,7 @@ func (c *MuxTransportConn) DialTCP(ctx context.Context, target netaddr.HostPort)
 // DialStreamLocal 经 ControlMaster 发起远端 direct-streamlocal@openssh.com 通道并返回原始双向流。
 func (c *MuxTransportConn) DialStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Conn, error) {
 	if !remoteSocket.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix socket path"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "unix_path"))
 	}
 	return c.dialXOpsStream(ctx, muxstream.XOpsCDialStreamLocal, muxstream.AppendStr(muxstream.AppendU32(nil, 1), remoteSocket.String()))
 }
@@ -240,14 +240,14 @@ func (c *MuxTransportConn) ListenTCP(ctx context.Context, bindAddr string) (net.
 func validateMuxListenTCPAddr(bindAddr string) error {
 	host, portStr, err := net.SplitHostPort(bindAddr)
 	if err != nil || portStr == "" || strings.HasPrefix(portStr, "+") || strings.HasPrefix(portStr, "-") {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ListenTCP bind address"), domi18n.BoundStr("value", bindAddr))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyForwardBindAddrInvalid, domi18n.BoundStr("addr", bindAddr))
 	}
 	if _, err := strconv.ParseUint(portStr, 10, 16); err != nil {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ListenTCP bind port"), domi18n.BoundStr("value", portStr))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyForwardBindPortInvalid, domi18n.BoundStr("port", portStr))
 	}
 	if host != "" && host != "*" {
 		if _, err := netaddr.ParseCanonicalHost(host); err != nil {
-			return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ListenTCP bind host"), domi18n.BoundStr("value", host))
+			return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardBindAddrInvalid, domi18n.BoundStr("addr", host))
 		}
 	}
 	return nil
@@ -256,7 +256,7 @@ func validateMuxListenTCPAddr(bindAddr string) error {
 // ListenStreamLocal 经 ControlMaster 在远端发起 streamlocal-forward@openssh.com 监听并返回 net.Listener。
 func (c *MuxTransportConn) ListenStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Listener, error) {
 	if !remoteSocket.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix listen path"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "unix_listen_path"))
 	}
 	return c.openRemoteMuxListener(ctx, muxstream.XOpsCListenStreamLocal, "unix", remoteSocket.String())
 }

@@ -22,7 +22,7 @@ import (
 func PublicKeyInfoFromSSH(key ssh.PublicKey) (ports.PublicKeyInfo, error) {
 	if key == nil {
 		var zero ports.PublicKeyInfo
-		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "public key"))
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "public_key"))
 	}
 	blob := key.Marshal()
 	fp := inventory.KeyFingerprintFromSHA256(sha256.Sum256(blob))
@@ -62,7 +62,7 @@ func LoadPrivateKeyFile(
 	}
 	raw, err := ReadBoundedFile(ctx, readFS, srcPath, MaxPrivateKeyFileBytes)
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "read private key"), domi18n.BoundStr("target", kp.String()))
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyKeySignerReadKeyFailed, domi18n.BoundStr("target", kp.String()))
 	}
 	var signer ssh.Signer
 	err = secret.WithBytes(raw, func(keyBox *secret.SecretBox) error {
@@ -93,7 +93,7 @@ func ParsePrivateKeyBytes(
 	}
 	var missingErr *ssh.PassphraseMissingError
 	if !errors.As(err, &missingErr) {
-		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "parse private key"))
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyKeySignerParseKeyFailed)
 	}
 	binding, hasPass := passOpt.Get()
 	if !hasPass || vault == nil {
@@ -142,7 +142,7 @@ func decryptKeyWithVaultRef(ctx context.Context, vault ports.SecretVault, keyByt
 		})
 	})
 	if vErr != nil {
-		return nil, domi18n.WrapS(ports.ErrAuthFailed, vErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "decrypt private key"))
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, vErr, domi18n.KeyKeySignerDecryptKeyFailed)
 	}
 	return decrypted, nil
 }
@@ -169,11 +169,11 @@ func LoadCertificates(
 			if ctx.Err() == nil && errors.Is(err, ports.ErrNotFound) {
 				continue
 			}
-			return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "read certificate"), domi18n.BoundStr("target", cp.String()))
+			return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyKeySignerReadCertFailed, domi18n.BoundStr("target", cp.String()))
 		}
 		pub, _, _, _, err := ssh.ParseAuthorizedKey(raw)
 		if err != nil {
-			return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "parse certificate"), domi18n.BoundStr("target", cp.String()))
+			return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyKeySignerParseCertFailed, domi18n.BoundStr("target", cp.String()))
 		}
 		cert, ok := pub.(*ssh.Certificate)
 		if !ok {
@@ -228,7 +228,7 @@ func ResolveLocalFilePath(env ports.EnvPort, tokenCtx option.TokenContext, raw s
 	if strings.ContainsRune(expanded, '%') {
 		out, err := option.ExpandPathTokens(expanded, tokenCtx)
 		if err != nil {
-			return zero, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "expand path template"), domi18n.BoundStr("target", raw))
+			return zero, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonPathTemplateFailed, domi18n.BoundStr("target", raw))
 		}
 		expanded = out
 	}
@@ -238,7 +238,7 @@ func ResolveLocalFilePath(env ports.EnvPort, tokenCtx option.TokenContext, raw s
 		}
 		id, err := env.LookupLocalIdentity()
 		if err != nil {
-			return zero, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "resolve home directory"))
+			return zero, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyKeySignerResolveHomeFailed)
 		}
 		expanded = strings.TrimRight(id.HomeDir(), `/\`) + "/" + expanded[2:]
 	}
@@ -261,7 +261,7 @@ func WrapPortSigners(keys []ports.PublicKeyInfo, signFn PortSignFunc) ([]ssh.Sig
 	for _, k := range keys {
 		pub, err := ssh.ParsePublicKey(k.WireBlob())
 		if err != nil {
-			return nil, domi18n.WrapS(ports.ErrSignerUnavailable, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "parse port public key"))
+			return nil, domi18n.WrapS(ports.ErrSignerUnavailable, err, domi18n.KeyKeySignerParsePubKeyFailed)
 		}
 		out = append(out, &portSignerAdapter{pub: pub, fp: k.Fingerprint(), sign: signFn})
 	}

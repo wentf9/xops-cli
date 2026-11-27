@@ -144,7 +144,7 @@ func resolveApprovalTTL(opt algebraic.Option[algebraic.Duration]) (algebraic.Dur
 
 func resolvePolicyLimits(maxPending, maxReplay int) (int, int, error) {
 	if maxPending < 0 || maxReplay < 0 {
-		return 0, 0, domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "policy capacity limit"))
+		return 0, 0, domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "capacity_limit"))
 	}
 	if maxPending == 0 {
 		maxPending = defaultPendingCapacity
@@ -256,11 +256,11 @@ func (p GuardrailPolicy) evaluateScopeSnapshot(
 	paths, recursivePaths []string,
 ) (security.ScopeSnapshot, error) {
 	if !p.IsValid() || !profile.IsValid() || !binding.IsValid() || !baseRisk.IsValid() {
-		return zeroVal[security.ScopeSnapshot](), domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "policy evaluation input"))
+		return zeroVal[security.ScopeSnapshot](), domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "policy_input"))
 	}
 	scopedPaths, anyProtected, pathErr := p.matchScopedPaths(paths, recursivePaths)
 	if pathErr != nil {
-		return zeroVal[security.ScopeSnapshot](), domi18n.WrapS(ErrAuthorizationDenied, pathErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "protected path check"))
+		return zeroVal[security.ScopeSnapshot](), domi18n.WrapS(ErrAuthorizationDenied, pathErr, domi18n.KeyGateProtectedPathCheckFailed)
 	}
 	effRisk := baseRisk
 	if anyProtected {

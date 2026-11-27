@@ -134,7 +134,7 @@ func decodeNodeReportWire(w nodeReportWire) (NodeReport, error) {
 		reDur = nextDur
 	}
 	if reStatus != status || reCounts != counts || !reDur.Equal(totalDur) || reUnknown != hasUnknown {
-		return NodeReport{}, domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "node_report"))
+		return NodeReport{}, domi18n.WrapSentinel(ErrOutcomeStatusMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "node_report")))
 	}
 	return NodeReport{nodeID, status, slices.Clone(w.Steps), counts, totalDur, hasUnknown, true}, nil
 }
@@ -178,10 +178,10 @@ func decodePlaybookReportWire(w playbookReportWire) (PlaybookReport, error) {
 		reUnknown = reUnknown || nr.hasUnknownOutcome
 	}
 	if reUnknown && reStatus != NodeStatusOutcomeUnknown {
-		return PlaybookReport{}, domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "has_unknown_outcome"))
+		return PlaybookReport{}, domi18n.WrapSentinel(ErrOutcomeStatusMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "has_unknown_outcome")))
 	}
 	if reStatus != status || reCounts != counts || reUnknown != hasUnknown {
-		return PlaybookReport{}, domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "playbook_report"))
+		return PlaybookReport{}, domi18n.WrapSentinel(ErrOutcomeStatusMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "playbook_report")))
 	}
 	return PlaybookReport{pbID, pbDig, status, slices.Clone(w.Nodes), counts, hasUnknown, true}, nil
 }

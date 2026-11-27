@@ -368,7 +368,7 @@ func readRawPacket(r io.Reader) (byte, []byte, error) {
 	}
 	pktLen := binary.BigEndian.Uint32(hdr[:])
 	if pktLen < 1 || pktLen > maxInboundPacketBytes {
-		return 0, nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SFTP packet length"), domi18n.Uint64("value", uint64(pktLen)))
+		return 0, nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "sftp_packet_length"), domi18n.Uint64("value", uint64(pktLen)))
 	}
 	buf := make([]byte, pktLen)
 	if _, err := io.ReadFull(r, buf); err != nil {

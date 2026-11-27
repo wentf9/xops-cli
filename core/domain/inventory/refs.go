@@ -173,7 +173,7 @@ func validateAndSortNodes(raw []Node, hosts map[HostID]bool, idents map[Identity
 			return nil, domi18n.EF(ErrInvalidNode, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "nodes"), domi18n.Int("index", i))
 		}
 		if !hosts[n.hostRef] || !idents[n.identityRef] {
-			return nil, domi18n.EF(ErrMissingAssetRef, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "node"), domi18n.BoundStr("value", n.id.String()))
+			return nil, domi18n.EF(ErrMissingAssetRef, domi18n.KeyInvNodeMissingAssetRef, domi18n.BoundStr("node", n.id.String()))
 		}
 	}
 	out := slices.Clone(raw)

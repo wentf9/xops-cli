@@ -59,7 +59,7 @@ func stage2EnumCommand(dialect execution.LaunchDialect) (string, error) {
 	case execution.DialectPowerShell:
 		return stage2EnumPowerShell, nil
 	default:
-		return "", domi18n.EF(ErrProbeFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "stage 2 probe for dialect "+dialect.String()))
+		return "", domi18n.EF(ErrProbeFailed, domi18n.KeyProbeStage2DialectUnsup, domi18n.Str("dialect", dialect.String()))
 	}
 }
 

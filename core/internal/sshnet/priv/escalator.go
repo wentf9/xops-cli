@@ -50,7 +50,7 @@ func (e *Escalator) RunPrivilegedWithCombinedSecret(
 		return nil, err
 	}
 	if primary == nil || secondary == nil || !secondary.IsValid() {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "combined SecretBox"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "secret_box"))
 	}
 	return e.executeEscalation(ctx, opener, req, primary, secondary, streams)
 }
@@ -74,10 +74,10 @@ func (e *Escalator) validateCall(
 		return err
 	}
 	if opener == nil || !req.IsValid() {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SessionOpener or PrivilegeRequest"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "privilege_request"))
 	}
 	if password != nil && !password.IsValid() {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "password SecretBox"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "password_box"))
 	}
 	if ptyReq, ok := streams.PTY.Get(); ok && !ptyReq.IsValid() {
 		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "PTYRequest"))
@@ -320,7 +320,7 @@ func handlePromptSignal(
 		return false, err
 	}
 	if err := writeSecret(); err != nil {
-		return false, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "write privilege password"))
+		return false, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyPrivWritePasswordFailed)
 	}
 	*attempts++
 	return false, nil

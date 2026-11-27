@@ -369,7 +369,7 @@ func decodeNameList(payload []byte) ([]wireNameEntry, error) {
 		return nil, err
 	}
 	if count > maxReadDirEntries {
-		return nil, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "SFTP NAME entries"), domi18n.Uint64("count", uint64(count)), domi18n.Int("limit", maxReadDirEntries))
+		return nil, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeySFTPDirEntriesLimit, domi18n.Uint64("count", uint64(count)), domi18n.Int("limit", maxReadDirEntries))
 	}
 	entries := make([]wireNameEntry, 0, min(int(count), 1024))
 	for range count {
@@ -434,7 +434,7 @@ func attrsToAnchor(a wireAttrs) (ports.RemoteFileAnchor, fs.FileMode, error) {
 
 func attrsToRemoteStat(p pathalg.RemotePath, a wireAttrs) (ports.RemoteFileStat, error) {
 	if a.size > math.MaxInt64 {
-		return zeroVal[ports.RemoteFileStat](), domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote file"), domi18n.Uint64("size", a.size), domi18n.Int64("limit", math.MaxInt64))
+		return zeroVal[ports.RemoteFileStat](), domi18n.EF(ports.ErrLimitExceeded, domi18n.KeySFTPRemoteSizeLimit, domi18n.Uint64("size", a.size), domi18n.Int64("limit", math.MaxInt64))
 	}
 	anc, fm, err := attrsToAnchor(a)
 	if err != nil {

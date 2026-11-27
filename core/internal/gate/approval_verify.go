@@ -8,6 +8,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/fsm"
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/internal/gate/internal/reasonmsg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -51,13 +52,13 @@ func validateSubmissionEnvelopeConsistency(req rawGateRequest, sub ApprovalSubmi
 	}
 	matched, err := env.MatchesDigest(dig)
 	if err != nil || !matched {
-		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "approval response digest"))
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalDigestMismatch)
 	}
 	if env.Binding().Capability() != req.capKind {
-		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "envelope capability"), domi18n.Str("expected", req.capKind.String()), domi18n.Str("actual", env.Binding().Capability().String()))
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "envelope.capability"), domi18n.Str("expected", req.capKind.String()), domi18n.Str("actual", env.Binding().Capability().String()))
 	}
 	if reqOp, ok := req.operationID.Get(); ok && !reqOp.Equal(env.OperationID()) {
-		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "envelope OperationID"))
+		return domi18n.WrapSentinel(ErrApprovalMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "envelope.operation_id")))
 	}
 	return nil
 }
@@ -96,7 +97,7 @@ func (g *Gate) claimPendingChallenge(
 
 func validateClaimedChallengeAgainstRequest(req rawGateRequest, sub ApprovalSubmission, pc *pendingChallenge) error {
 	if pc.capKind != req.capKind {
-		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "challenge capability"), domi18n.Str("expected", pc.capKind.String()), domi18n.Str("actual", req.capKind.String()))
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "challenge.capability"), domi18n.Str("expected", pc.capKind.String()), domi18n.Str("actual", req.capKind.String()))
 	}
 	if reqOp, ok := req.operationID.Get(); ok && !reqOp.Equal(pc.opID) {
 		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalRound2Diff)
@@ -126,7 +127,7 @@ func (g *Gate) reprobeClaimedChallenge(
 	zSt, zBind := zeroVal[fsm.ApprovalState](), zeroVal[security.OperationBinding]()
 	if pc.hadCanonical {
 		if req.canonicalize == nil {
-			err := domi18n.WrapS(ErrApprovalInvalidated, ErrApprovalMismatch, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "Round-2 Canonicalize"))
+			err := domi18n.WrapS(ErrApprovalInvalidated, ErrApprovalMismatch, domi18n.KeyGateRound2CanonRequired)
 			return zSt, zBind, denyRejection(err, pc.opID, pc.binding, pc.fsmState.EffectiveRisk(), "round2_canonicalize_missing")
 		}
 		return g.runRound2Reprobe(ctx, traceID, pc.opID, req, pc.fsmState, pc.binding)
@@ -192,7 +193,7 @@ func (g *Gate) runRound2Reprobe(
 	}
 	g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prev, next, evs)
 	if next.Phase() == fsm.ApprovalPhaseTokenInvalidated {
-		err := domi18n.WrapSentinel(ErrScopeEscalated, domi18n.WrapSentinel(ErrApprovalInvalidated, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", sanitizeReason(next.Reason(), "scope escalated")))))
+		err := domi18n.WrapSentinel(ErrScopeEscalated, reasonmsg.ErrorForSentinel(ErrApprovalInvalidated, next.Reason(), domi18n.KeyGateReasonScopeEscalated))
 		return zSt, zBind, denyRejection(err, opID, canBinding, next.EffectiveRisk(), "scope_escalated")
 	}
 	return next, canBinding, nil
@@ -233,7 +234,7 @@ func (g *Gate) verifyTokenWithFSM(
 		if !env.IsActiveAt(now) {
 			return approvalOutcome{}, needApprovalRejection(ErrApprovalExpired, opID, verifyBinding, st.EffectiveRisk(), "approval_expired")
 		}
-		err := domi18n.WrapSentinel(ErrApprovalMismatch, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", sanitizeReason(finalState.Reason(), "token invalidated"))))
+		err := reasonmsg.ErrorForSentinel(ErrApprovalMismatch, finalState.Reason(), domi18n.KeyGateReasonTokenInvalidated)
 		return approvalOutcome{}, denyRejection(err, opID, verifyBinding, st.EffectiveRisk(), "approval_mismatch")
 	default:
 		return approvalOutcome{}, denyRejection(ErrApprovalInvalidated, opID, verifyBinding, st.EffectiveRisk(), "approval_invalidated")
@@ -247,7 +248,7 @@ func (g *Gate) runCanonicalizeProbe(ctx context.Context, req rawGateRequest) (se
 		return zSnap, zBind, err
 	}
 	if !res.Binding.IsValid() || res.Binding.Capability() != req.capKind {
-		return zSnap, zBind, domi18n.EF(ErrScopeEscalated, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "canonicalized binding"))
+		return zSnap, zBind, domi18n.EF(ErrScopeEscalated, domi18n.KeyGateCanonBindingInvalid)
 	}
 	canRisk := req.risk
 	if r, ok := res.Risk.Get(); ok {

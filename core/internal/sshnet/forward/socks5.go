@@ -137,7 +137,7 @@ func readSOCKS5ConnectTarget(conn net.Conn) (netaddr.HostPort, error) {
 	hp, err := netaddr.NewHostPort(host, port)
 	if err != nil {
 		_ = writeSOCKS5Reply(conn, socks5RepAddrUnsupported)
-		return zeroVal[netaddr.HostPort](), domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SOCKS5 target port"))
+		return zeroVal[netaddr.HostPort](), domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "socks5_port"))
 	}
 	return hp, nil
 }
@@ -161,7 +161,7 @@ func readSOCKS5Address(conn net.Conn, atyp byte) (netaddr.CanonicalHost, byte, e
 	case socks5AtypDomain:
 		return readSOCKS5Domain(conn)
 	default:
-		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", fmt.Sprintf("SOCKS5 ATYP %#x", atyp)))
+		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.EF(ports.ErrUnsupported, domi18n.KeyForwardSOCKS5ATYP, domi18n.Str("atyp", fmt.Sprintf("%#x", atyp)))
 	}
 }
 
@@ -171,7 +171,7 @@ func readSOCKS5Domain(conn net.Conn) (netaddr.CanonicalHost, byte, error) {
 		return zeroVal[netaddr.CanonicalHost](), socks5RepGeneralFailure, err
 	}
 	if lenBuf[0] == 0 {
-		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "SOCKS5 domain"))
+		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "socks5_domain"))
 	}
 	raw := make([]byte, lenBuf[0])
 	if _, err := io.ReadFull(conn, raw); err != nil {
@@ -180,7 +180,7 @@ func readSOCKS5Domain(conn net.Conn) (netaddr.CanonicalHost, byte, error) {
 	// 仅执行纯数学域名规范化，零 net.LookupHost 调用，确保 100% 域名解析发生在远端 SSH 出口。
 	h, err := netaddr.ParseCanonicalHost(string(raw))
 	if err != nil {
-		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SOCKS5 domain"), domi18n.BoundStr("value", string(raw)))
+		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardSOCKS5DomainInvalid, domi18n.BoundStr("domain", string(raw)))
 	}
 	return h, socks5RepAddrUnsupported, nil
 }

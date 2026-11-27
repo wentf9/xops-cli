@@ -38,7 +38,7 @@ func ProcessUserSID(pid uint32) (*windows.SID, error) {
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "OpenProcess"))
+		return nil, domi18n.Wrap(err, domi18n.KeyOSFSSyscallFailed, domi18n.Str("call", "OpenProcess"))
 	}
 	defer func() { _ = windows.CloseHandle(h) }()
 	return tokenUserSIDForProcess(h)
@@ -46,12 +46,12 @@ func ProcessUserSID(pid uint32) (*windows.SID, error) {
 func tokenUserSIDForProcess(procHandle windows.Handle) (*windows.SID, error) {
 	var tok windows.Token
 	if err := windows.OpenProcessToken(procHandle, windows.TOKEN_QUERY, &tok); err != nil {
-		return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "OpenProcessToken"))
+		return nil, domi18n.Wrap(err, domi18n.KeyOSFSSyscallFailed, domi18n.Str("call", "OpenProcessToken"))
 	}
 	defer func() { _ = tok.Close() }()
 	tu, err := tok.GetTokenUser()
 	if err != nil || tu == nil || tu.User.Sid == nil {
-		return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "GetTokenUser"))
+		return nil, domi18n.Wrap(err, domi18n.KeyOSFSSyscallFailed, domi18n.Str("call", "GetTokenUser"))
 	}
 	return tu.User.Sid.Copy()
 }
@@ -221,11 +221,11 @@ func collectMissingDirs(dir string) (string, []string, error) {
 		if checkErr := checkDirAttrsNoFollowWin(cur); checkErr == nil {
 			return absDir, toCreate, nil
 		} else if !errors.Is(checkErr, ports.ErrNotFound) {
-			return "", nil, wrapTarget(ErrInsecurePermissions, checkErr, "check_dir", cur)
+			return "", nil, wrapS(ErrInsecurePermissions, checkErr)
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
-			return "", nil, domi18n.EF(ErrInsecurePermissions, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "access_root"), domi18n.BoundStr("target", cur))
+			return "", nil, domi18n.EF(ErrInsecurePermissions, domi18n.KeyOSFSRootAccessDenied, domi18n.BoundStr("path", cur))
 		}
 		toCreate, cur = append(toCreate, cur), parent
 	}
@@ -297,7 +297,7 @@ func verifyOwnerOnlyPathByHandle(path string, expectDir, expectSocket bool, curr
 	defer func() { _ = windows.CloseHandle(handle) }()
 	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil || sd == nil {
-		return wrapTarget(ErrInsecurePermissions, err, "GetSecurityInfo", path)
+		return wrapOp(ErrInsecurePermissions, err, "GetSecurityInfo")
 	}
 	owner, _, oErr := sd.Owner()
 	dacl, _, dErr := sd.DACL()

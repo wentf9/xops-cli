@@ -142,7 +142,7 @@ func AppendStr(dst []byte, s string) []byte {
 func WritePacket(w io.Writer, msgType uint32, body []byte) error {
 	pktLen := 4 + len(body)
 	if pktLen > MaxPacketBytes {
-		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "PROTOCOL.mux outbound packet"), domi18n.Int("size", pktLen), domi18n.Int("limit", MaxPacketBytes))
+		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyMuxPacketTooLarge, domi18n.Int("size", pktLen), domi18n.Int("limit", MaxPacketBytes))
 	}
 	frame := make([]byte, 4+pktLen)
 	binary.BigEndian.PutUint32(frame[0:4], uint32(pktLen))
@@ -169,7 +169,7 @@ func ReadPacket(r io.Reader) (uint32, []byte, error) {
 	}
 	pktLen := binary.BigEndian.Uint32(hdr[:])
 	if pktLen < 4 || pktLen > MaxPacketBytes {
-		return 0, nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "PROTOCOL.mux packet length"), domi18n.Uint64("value", uint64(pktLen)))
+		return 0, nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "packet_length"), domi18n.Uint64("value", uint64(pktLen)))
 	}
 	buf := make([]byte, pktLen)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -243,7 +243,7 @@ func SendAliveCheck(rw io.ReadWriter, reqID uint32) (uint32, error) {
 		return 0, err
 	}
 	if gotID != reqID {
-		return 0, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonMismatch, domi18n.Str("field", "MUX_S_ALIVE reqID"), domi18n.Uint64("expected", uint64(reqID)), domi18n.Uint64("actual", uint64(gotID)))
+		return 0, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonMismatch, domi18n.Str("field", "req_id"), domi18n.Uint64("expected", uint64(reqID)), domi18n.Uint64("actual", uint64(gotID)))
 	}
 	return pid, nil
 }
@@ -255,14 +255,17 @@ func DecodeServerError(msgType uint32, body []byte) error {
 	reason, _ := rd.ReadString()
 	switch msgType {
 	case SPermissionDenied:
-		return domi18n.WrapSentinel(ports.ErrPermissionDenied, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
+		if reason == "" {
+			return ports.ErrPermissionDenied
+		}
+		return domi18n.WrapSentinel(ports.ErrPermissionDenied, domi18n.E(domi18n.KeyMuxRemoteError, domi18n.BoundStr("detail", reason)))
 	case SFailure:
 		if reason == "" {
 			return ports.ErrInvalidArgument
 		}
-		return domi18n.WrapSentinel(ports.ErrInvalidArgument, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, domi18n.E(domi18n.KeyMuxRemoteError, domi18n.BoundStr("detail", reason)))
 	default:
-		return domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxUnexpectedFrame, domi18n.Str("actual", fmt.Sprintf("%#x", msgType)), domi18n.Str("expected", "PROTOCOL.mux response"))
+		return domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxUnexpectedFrame, domi18n.Str("actual", fmt.Sprintf("%#x", msgType)), domi18n.Str("expected", "MUX_S_RESPONSE"))
 	}
 }
 
@@ -375,7 +378,7 @@ func WireToTUNMode(v uint32) (ports.TUNMode, error) {
 	case uint32(ports.TUNModeEthernet):
 		return ports.TUNModeEthernet, nil
 	default:
-		return ports.TUNModeInvalid, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "TUNMode wire value"), domi18n.Uint64("value", uint64(v)))
+		return ports.TUNModeInvalid, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "tun_mode"), domi18n.Uint64("value", uint64(v)))
 	}
 }
 
@@ -388,7 +391,7 @@ func directionToWireFwdType(dir ports.ForwardDirection) (uint32, error) {
 	case ports.ForwardDynamic:
 		return FwdDynamic, nil
 	default:
-		return 0, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "forward direction "+dir.String()))
+		return 0, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyForwardDirUnsupported, domi18n.Str("direction", dir.String()))
 	}
 }
 
@@ -401,7 +404,7 @@ func wireFwdTypeToDirection(t uint32) (ports.ForwardDirection, error) {
 	case FwdDynamic:
 		return ports.ForwardDynamic, nil
 	default:
-		return ports.ForwardDirectionInvalid, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "PROTOCOL.mux forward type"), domi18n.Uint64("value", uint64(t)))
+		return ports.ForwardDirectionInvalid, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "forward_type"), domi18n.Uint64("value", uint64(t)))
 	}
 }
 
@@ -411,11 +414,11 @@ func encodeEndpointHostPort(kind ports.ForwardEndpointKind, addr string) (string
 	}
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return "", 0, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "TCP address"), domi18n.BoundStr("value", addr))
+		return "", 0, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardBindAddrInvalid, domi18n.BoundStr("addr", addr))
 	}
 	p, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
-		return "", 0, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "TCP port"), domi18n.BoundStr("value", portStr))
+		return "", 0, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardBindPortInvalid, domi18n.BoundStr("port", portStr))
 	}
 	return host, uint32(p), nil
 }
@@ -425,7 +428,7 @@ func decodeEndpointHostPort(host string, port uint32) (ports.ForwardEndpointKind
 		return ports.ForwardEndpointUnix, host, nil
 	}
 	if port > math.MaxUint16 {
-		return ports.ForwardEndpointTCP, "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldRange, domi18n.Str("field", "PROTOCOL.mux TCP port"), domi18n.Uint64("value", uint64(port)), domi18n.Int("min", 0), domi18n.Int("max", math.MaxUint16))
+		return ports.ForwardEndpointTCP, "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldRange, domi18n.Str("field", "tcp_port"), domi18n.Uint64("value", uint64(port)), domi18n.Int("min", 0), domi18n.Int("max", math.MaxUint16))
 	}
 	return ports.ForwardEndpointTCP, net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10)), nil
 }
@@ -482,7 +485,7 @@ func DecodeOutcomePayload(body []byte) (execution.ExecutionOutcome, error, error
 	}
 	var waitErr error
 	if errStr != "" {
-		waitErr = domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", errStr))
+		waitErr = domi18n.E(domi18n.KeyMuxRemoteError, domi18n.BoundStr("detail", errStr))
 	}
 	return outcome, waitErr, nil
 }

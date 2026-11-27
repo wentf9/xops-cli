@@ -303,10 +303,10 @@ func hasForbiddenHostChar(s string) bool {
 
 func validateAndFoldRFC1123Hostname(raw string) (string, error) {
 	if len(raw) == 0 || len(raw) > maxHostnameLen {
-		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Str("reason", "length out of range"))
+		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyNetaddrReasonLength)))
 	}
 	if raw[0] == '.' || raw[len(raw)-1] == '.' {
-		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Str("reason", "leading or trailing dot"))
+		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyNetaddrReasonEdgeDot)))
 	}
 
 	var b strings.Builder
@@ -331,7 +331,7 @@ func validateAndFoldRFC1123Hostname(raw string) (string, error) {
 	}
 	folded := b.String()
 	if !lastLabelHasAlpha || isHexNumericLabel(folded[lastFoldedStart:]) {
-		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Str("reason", "numeric final label"))
+		return "", domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyNetaddrReasonNumericTLD)))
 	}
 	return folded, nil
 }
@@ -354,17 +354,17 @@ func isHexNumericLabel(foldedLabel string) bool {
 
 func appendFoldedLabel(b *strings.Builder, label, full string) (bool, error) {
 	if len(label) == 0 || len(label) > maxHostLabelLen {
-		return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Str("reason", "invalid label length"))
+		return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyNetaddrReasonLabelLength)))
 	}
 	if label[0] == '-' || label[len(label)-1] == '-' {
-		return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Str("reason", "leading or trailing hyphen in label"))
+		return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyNetaddrReasonEdgeHyphen)))
 	}
 	hasAlpha := false
 	for i := 0; i < len(label); i++ {
 		ch := label[i]
 		folded, alpha, ok := foldLabelByte(ch)
 		if !ok {
-			return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Str("reason", "illegal character in label"))
+			return false, domi18n.E(domi18n.KeyNetaddrHostnameInvalid, domi18n.BoundStr("value", full), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyNetaddrReasonIllegalChar)))
 		}
 		if alpha {
 			hasAlpha = true

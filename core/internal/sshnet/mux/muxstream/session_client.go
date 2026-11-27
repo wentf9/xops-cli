@@ -239,7 +239,7 @@ func checkStartedReply(respType uint32, respBody []byte) error {
 		return err
 	}
 	if okFlag == 0 {
-		return domi18n.WrapSentinel(ports.ErrInvalidArgument, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", msg)))
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, domi18n.E(domi18n.KeyMuxRemoteError, domi18n.BoundStr("detail", msg)))
 	}
 	return nil
 }

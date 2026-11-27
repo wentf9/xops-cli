@@ -83,7 +83,7 @@ func (c *Client) ReadDir(ctx context.Context, dir pathalg.RemotePath) ([]ports.R
 			break
 		}
 		if len(batch) == 0 {
-			return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "SSH_FXP_READDIR batch"))
+			return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "readdir_batch"))
 		}
 		out, err = appendValidatedDirEntries(out, batch)
 		if err != nil {
@@ -103,7 +103,7 @@ func (c *Client) openDirHandle(ctx context.Context, dir pathalg.RemotePath) ([]b
 		stErr := decodeStatus(respBody)
 		if isStatusCode(stErr, sshFXFailure) {
 			if st, sErr := c.Stat(ctx, dir); sErr == nil && !st.IsDir() {
-				return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dir.String()), domi18n.Str("reason", "not a directory"))
+				return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyOSFSNotDirectory, domi18n.BoundStr("path", dir.String()))
 			}
 		}
 		return nil, stErr
@@ -140,11 +140,11 @@ func appendValidatedDirEntries(dst []ports.RemoteDirEntry, batch []wireNameEntry
 			continue
 		}
 		if len(dst) >= maxReadDirEntries {
-			return nil, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "remote directory entries"), domi18n.Int("count", len(dst)+1), domi18n.Int("limit", maxReadDirEntries))
+			return nil, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeySFTPDirEntriesLimit, domi18n.Int("count", len(dst)+1), domi18n.Int("limit", maxReadDirEntries))
 		}
 		rn, err := pathalg.ParseRemoteName(item.filename)
 		if err != nil {
-			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "remote directory entry name"), domi18n.BoundStr("value", item.filename))
+			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "entry_name"), domi18n.BoundStr("value", item.filename))
 		}
 		ent, err := wireEntryToRemoteDirEntry(rn, item.attrs)
 		if err != nil {
@@ -157,7 +157,7 @@ func appendValidatedDirEntries(dst []ports.RemoteDirEntry, batch []wireNameEntry
 
 func wireEntryToRemoteDirEntry(rn pathalg.RemoteName, a wireAttrs) (ports.RemoteDirEntry, error) {
 	if a.size > math.MaxInt64 {
-		return zeroVal[ports.RemoteDirEntry](), domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote directory entry"), domi18n.Uint64("size", a.size), domi18n.Int64("limit", math.MaxInt64))
+		return zeroVal[ports.RemoteDirEntry](), domi18n.EF(ports.ErrLimitExceeded, domi18n.KeySFTPRemoteSizeLimit, domi18n.Uint64("size", a.size), domi18n.Int64("limit", math.MaxInt64))
 	}
 	ft, fm := posixModeToRemote(a)
 	return ports.NewRemoteDirEntry(ports.RemoteDirEntrySpec{
@@ -185,7 +185,7 @@ func (c *Client) WithReadFile(ctx context.Context, p pathalg.RemotePath, limits 
 		return ports.ErrInvalidReadLimits
 	}
 	if !p.IsValid() {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote path"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	handle, st, err := c.openRegularForRead(ctx, p)
 	if err != nil {
@@ -194,7 +194,7 @@ func (c *Client) WithReadFile(ctx context.Context, p pathalg.RemotePath, limits 
 	defer c.closeHandle(ctx, handle)
 
 	if st.Size() > limits.MaxBytes() {
-		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote file"), domi18n.Int64("size", st.Size()), domi18n.Int64("limit", limits.MaxBytes()))
+		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeySFTPRemoteSizeLimit, domi18n.Int64("size", st.Size()), domi18n.Int64("limit", limits.MaxBytes()))
 	}
 	sr := &sftpScopedReader{
 		client:   c,
@@ -213,7 +213,7 @@ func (c *Client) ReadChunk(ctx context.Context, p pathalg.RemotePath, offset int
 		return 0, err
 	}
 	if offset < 0 || length < 0 || dst == nil {
-		return 0, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ReadChunk arguments"))
+		return 0, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "read_chunk_args"))
 	}
 	handle, _, err := c.openRegularForRead(ctx, p)
 	if err != nil {
@@ -341,7 +341,7 @@ func (sr *sftpScopedReader) Read(p []byte) (int, error) {
 	}
 	sr.offset += uint64(len(chunk))
 	if sr.readSoFar+int64(len(chunk)) > sr.maxBytes {
-		return 0, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote stream"), domi18n.Int64("size", sr.readSoFar+int64(len(chunk))), domi18n.Int64("limit", sr.maxBytes))
+		return 0, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeySFTPRemoteSizeLimit, domi18n.Int64("size", sr.readSoFar+int64(len(chunk))), domi18n.Int64("limit", sr.maxBytes))
 	}
 	sr.readSoFar += int64(len(chunk))
 	n := copy(p, chunk)
@@ -356,7 +356,7 @@ func (c *Client) checkPathOp(ctx context.Context, p pathalg.RemotePath) error {
 		return err
 	}
 	if !p.IsValid() {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote path"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	return nil
 }
@@ -377,7 +377,7 @@ func (c *Client) singleNameOp(ctx context.Context, pktType byte, rawPath string)
 		return wireNameEntry{}, err
 	}
 	if len(entries) == 0 {
-		return wireNameEntry{}, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "SFTP NAME response"))
+		return wireNameEntry{}, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "sftp_name_response"))
 	}
 	return entries[0], nil
 }

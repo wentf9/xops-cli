@@ -36,7 +36,7 @@ func sendControlCommand(conn *net.UnixConn, reqID uint32, req ports.MuxControlRe
 	case ports.MuxActionCancel:
 		return sendForwardControl(conn, reqID, req, false, hasXOps)
 	default:
-		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "control action "+req.Action().String()))
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyMuxControlActionUnsup, domi18n.Str("action", req.Action().String()))
 	}
 }
 
@@ -50,7 +50,7 @@ func sendForwardControl(conn *net.UnixConn, reqID uint32, req ports.MuxControlRe
 		return "", err
 	}
 	if msgType == muxstream.XOpsCOpenTUNFwd && !hasXOps {
-		return "", domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "TUN dynamic forwarding"))
+		return "", domi18n.EF(ports.ErrUnsupported, domi18n.KeyMuxTUNDynamicUnsup)
 	}
 	if !isOpen {
 		if msgType == muxstream.XOpsCOpenTUNFwd {

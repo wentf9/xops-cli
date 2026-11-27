@@ -39,13 +39,13 @@ var (
 
 func wrapS(s, c error) error { return domi18n.WrapSentinel(s, c) }
 func errField(s error, f string) error {
-	return domi18n.EF(s, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", f))
+	return domi18n.WrapSentinel(s, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", f)))
 }
 func errFieldNil(s error, f string) error {
 	return domi18n.EF(s, domi18n.KeyCommonFieldNil, domi18n.Str("field", f))
 }
 func wrapOp(s, c error, op string) error {
-	return domi18n.WrapS(s, c, domi18n.KeyCommonOpFailed, domi18n.Str("op", op))
+	return domi18n.WrapSentinel(s, domi18n.Wrap(c, domi18n.KeyOSFSSyscallFailed, domi18n.Str("call", op)))
 }
 func errWrongKind(p string, wantDir bool) error {
 	if wantDir {
@@ -101,7 +101,7 @@ func siblingDest(dest pathalg.LocalRootedDest, name string) (pathalg.LocalRooted
 func randomHexToken(n int) (string, error) {
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
-		return "", domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "random_hex"))
+		return "", domi18n.Wrap(err, domi18n.KeyOSFSRandomHexFailed)
 	}
 	return hex.EncodeToString(buf), nil
 }

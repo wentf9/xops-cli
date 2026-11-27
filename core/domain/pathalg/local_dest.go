@@ -37,7 +37,7 @@ func ParseLocalRootedDest(raw string) (LocalRootedDest, error) {
 		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_dest"), domi18n.Int("size", len(raw)), domi18n.Int("limit", MaxRemotePathBytes))
 	}
 	if strings.HasPrefix(raw, "/") || strings.HasSuffix(raw, "/") {
-		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "leading_or_trailing_slash"))
+		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonEdgeSlash)))
 	}
 	if strings.ContainsRune(raw, '\\') {
 		return LocalRootedDest{}, domi18n.EF(ErrInvalidLocalDest, domi18n.KeyPathalgForbiddenChar, domi18n.BoundStr("value", raw), domi18n.Str("char", `\`))

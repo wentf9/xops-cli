@@ -133,7 +133,7 @@ func ParseAbsRemotePath(raw string) (RemotePath, error) {
 		return RemotePath{}, err
 	}
 	if !p.IsAbs() {
-		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "must_be_absolute"))
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonMustBeAbs)))
 	}
 	return p, nil
 }
@@ -235,7 +235,7 @@ func (p RemotePath) Rel(target RemotePath) (RemotePath, error) {
 		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote_path"))
 	}
 	if p.IsAbs() != target.IsAbs() {
-		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target.clean), domi18n.Str("reason", "abs_rel_mismatch"))
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target.clean), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonAbsRelMismatch)))
 	}
 	if p.clean == target.clean {
 		return RemotePath{clean: "."}, nil
@@ -246,7 +246,7 @@ func (p RemotePath) Rel(target RemotePath) (RemotePath, error) {
 	remBase := baseSegs[common:]
 	remTarg := targSegs[common:]
 	if len(remBase) > 0 && remBase[0] == ".." {
-		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", p.clean), domi18n.Str("reason", "unresolvable_relative_base"))
+		return RemotePath{}, domi18n.EF(ErrInvalidRemotePath, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", p.clean), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonUnresolvBase)))
 	}
 	out := make([]string, 0, len(remBase)+len(remTarg))
 	for range remBase {

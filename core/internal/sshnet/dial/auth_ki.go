@@ -228,7 +228,7 @@ func (d *Dialer) planMatchedRuleKIQuestion(ctx context.Context, rule inventory.C
 	case *inventory.RuleLoginPassword:
 		ref, hasRef := loginPassRef.Get()
 		if !hasRef || d.vault == nil {
-			return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "login password secret or SecretVault"))
+			return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialLoginPasswordUnavail)
 		}
 		return kiQuestionPlan{action: kiActionVaultSecret, secretRef: ref}, nil
 	case *inventory.RuleCommand:
@@ -238,7 +238,7 @@ func (d *Dialer) planMatchedRuleKIQuestion(ctx context.Context, rule inventory.C
 		}
 		return kiQuestionPlan{action: kiActionLiteral, answer: ans}, nil
 	default:
-		return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "challenge rule"))
+		return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonUnsupportedVariant, domi18n.Str("type", "ChallengeRule"))
 	}
 }
 

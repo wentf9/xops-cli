@@ -81,7 +81,7 @@ func NewPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 	}
 	poolTID, err := trace.NewTraceIDFrom(norm.Entropy)
 	if err != nil {
-		return nil, domi18n.WrapS(ErrInvalidPoolConfig, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate pool TraceID"))
+		return nil, domi18n.WrapS(ErrInvalidPoolConfig, err, domi18n.KeyCommonIDGenFailed, domi18n.Str("kind", "TraceID"))
 	}
 	return buildAndStartPool(ctx, norm, poolTID)
 }
@@ -123,7 +123,7 @@ func validatePoolPorts(cfg PoolConfig) error {
 func validatePoolLimits(cfg PoolConfig) error {
 	if cfg.AcquireBuffer < 0 || cfg.MaxConns < 0 || cfg.MaxHandles < 0 ||
 		cfg.TeardownGrace < 0 || cfg.IdleTTL < 0 || cfg.DefaultKeepaliveInterval < 0 {
-		return domi18n.EF(ErrInvalidPoolConfig, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "pool capacity or duration limit"))
+		return domi18n.EF(ErrInvalidPoolConfig, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "pool_limit"))
 	}
 	return nil
 }

@@ -260,13 +260,13 @@ func (db *KnownHostsDB) resolveOneTarget(ep netaddr.Endpoint, entry option.PathE
 	if !src.IsAbs() {
 		dest, dErr := pathalg.ParseLocalRootedDest(src.String())
 		if dErr != nil {
-			return knownHostsTarget{}, false, domi18n.WrapS(ports.ErrInvalidArgument, dErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "relative known_hosts path"), domi18n.BoundStr("value", raw))
+			return knownHostsTarget{}, false, domi18n.WrapS(ports.ErrInvalidArgument, dErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "known_hosts_path"), domi18n.BoundStr("value", raw))
 		}
 		return knownHostsTarget{dir: db.defaultDir, dest: dest}, false, nil
 	}
 	dest, err := pathalg.ParseLocalRootedDest(src.Base())
 	if err != nil {
-		return knownHostsTarget{}, false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "known_hosts file name"), domi18n.BoundStr("value", src.Base()))
+		return knownHostsTarget{}, false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "known_hosts_filename"), domi18n.BoundStr("value", src.Base()))
 	}
 	return knownHostsTarget{dir: src.Dir(), dest: dest}, false, nil
 }
@@ -289,7 +289,7 @@ func (db *KnownHostsDB) expandKnownHostsPath(ep netaddr.Endpoint, entry option.P
 		}
 		expanded, err := option.ExpandPathTokens(target, tc)
 		if err != nil {
-			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "expand known_hosts template"), domi18n.BoundStr("target", raw))
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonPathTemplateFailed, domi18n.BoundStr("target", raw))
 		}
 		if hasTildePrefix {
 			out = "~/" + expanded

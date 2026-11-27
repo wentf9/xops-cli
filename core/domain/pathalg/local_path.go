@@ -310,7 +310,7 @@ func parseLocalPath(raw string, allowRootOrDot bool) (canon string, kind LocalPa
 		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "local_path"))
 	}
 	if hasDisallowedLocalPrefix(raw) {
-		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "disallowed_prefix"))
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonDisallowedPfx)))
 	}
 	if hasWindowsDrivePrefix(raw) {
 		return parseWindowsDriveLocalPath(raw, allowRootOrDot)
@@ -335,7 +335,7 @@ func hasDisallowedLocalPrefix(raw string) bool {
 
 func parseWindowsDriveLocalPath(raw string, allowRoot bool) (string, LocalPathKind, byte, error) {
 	if len(raw) < 3 || (raw[2] != '\\' && raw[2] != '/') {
-		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "drive_relative"))
+		return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonDriveRelative)))
 	}
 	drive := toUpperASCII(raw[0])
 	rest := strings.ReplaceAll(raw[3:], "\\", "/")
@@ -345,7 +345,7 @@ func parseWindowsDriveLocalPath(raw string, allowRoot bool) (string, LocalPathKi
 	}
 	if len(segs) == 0 {
 		if !allowRoot {
-			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "bare_drive_root"))
+			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonBareDriveRoot)))
 		}
 		return string([]byte{drive, ':', '/'}), LocalPathWindowsDrive, drive, nil
 	}
@@ -362,7 +362,7 @@ func parsePOSIXAbsLocalPath(raw string, allowRoot bool) (string, LocalPathKind, 
 	}
 	if len(segs) == 0 {
 		if !allowRoot {
-			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "bare_root"))
+			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonBareRoot)))
 		}
 		return "/", LocalPathPOSIXAbs, 0, nil
 	}
@@ -380,7 +380,7 @@ func parseRelativeLocalPath(raw string, allowDot bool) (string, LocalPathKind, b
 	}
 	if len(segs) == 0 {
 		if !allowDot {
-			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Str("reason", "current_dir"))
+			return "", LocalPathInvalid, 0, domi18n.E(domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", raw), domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyPathalgReasonCurrentDir)))
 		}
 		return ".", LocalPathRelative, 0, nil
 	}

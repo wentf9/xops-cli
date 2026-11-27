@@ -73,7 +73,7 @@ func (m *MuxSocket) Serve(
 		return err
 	}
 	if ln == nil || upstream == nil {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "listener or upstream"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "listener/upstream"))
 	}
 	if !upstream.IsAlive() {
 		return ports.ErrClosed

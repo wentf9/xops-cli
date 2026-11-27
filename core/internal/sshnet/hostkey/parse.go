@@ -58,23 +58,23 @@ func parseKnownHostsLine(rawLine string) (parsedEntry, error) {
 	}
 	marker, rest, ok := cutEntryMarker(line)
 	if !ok {
-		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid marker"))
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonBadMarker)))
 	}
 	hostField, rest, ok := cutSpaceField(rest)
 	if !ok {
-		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "missing host field"))
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonMissingHost)))
 	}
 	algo, rest, ok := cutSpaceField(rest)
 	if !ok {
-		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "missing algorithm field"))
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonMissingAlg)))
 	}
 	keyB64, _, ok := cutSpaceField(rest)
 	if !ok {
-		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "missing public key field"))
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonMissingKey)))
 	}
 	blob, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil || len(blob) == 0 {
-		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid base64 public key"))
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonBadKeyBase64)))
 	}
 	entry := parsedEntry{
 		marker:      marker,
@@ -99,15 +99,15 @@ func decodeHashedHostField(field string) (salt, digest []byte, err error) {
 	rest := strings.TrimPrefix(field, "|1|")
 	saltB64, hashB64, ok := strings.Cut(rest, "|")
 	if !ok || saltB64 == "" || hashB64 == "" || strings.ContainsRune(hashB64, '|') {
-		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "malformed hashed host field"))
+		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonMalformedHash)))
 	}
 	salt, err = base64.StdEncoding.DecodeString(saltB64)
 	if err != nil || len(salt) == 0 {
-		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid hashed host salt"))
+		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonBadHashSalt)))
 	}
 	digest, err = base64.StdEncoding.DecodeString(hashB64)
 	if err != nil || len(digest) != sha1.Size {
-		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid hashed host digest"))
+		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Msg("reason", domi18n.NewMessage(domi18n.KeyHostKeyReasonBadHashDigest)))
 	}
 	return salt, digest, nil
 }

@@ -315,10 +315,7 @@ func (g *Gate) haltedErrLocked() error {
 	if !g.halted {
 		return nil
 	}
-	if g.haltInfo.cause != nil {
-		return domi18n.WrapSentinel(ErrGateHalted, domi18n.Wrap(g.haltInfo.cause, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", g.haltInfo.reason)))
-	}
-	return domi18n.WrapSentinel(ErrGateHalted, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", g.haltInfo.reason)))
+	return domi18n.WrapSentinelDetail(ErrGateHalted, g.haltInfo.cause, g.haltInfo.reason)
 }
 
 func (g *Gate) emitReconcileDiagnostic(report ports.CrashReconcileReport) {

@@ -155,7 +155,7 @@ func NewPlaybook(spec PlaybookSpec) (Playbook, error) {
 func validatePlaybookHeader(spec PlaybookSpec) error {
 	switch {
 	case spec.Version != VersionV2:
-		return domi18n.EF(ErrUnsupportedVersion, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "version"), domi18n.Uint64("value", uint64(spec.Version)))
+		return domi18n.WrapSentinel(ErrUnsupportedVersion, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "version"), domi18n.Uint64("value", uint64(spec.Version))))
 	case !spec.ID.IsValid():
 		return domi18n.WrapSentinel(ErrInvalidPlaybook, ErrInvalidPlaybookID)
 	case spec.Name == "" || len(spec.Name) > maxNameBytes || hasForbiddenStrictText(spec.Name) || !hasVisibleText(spec.Name):

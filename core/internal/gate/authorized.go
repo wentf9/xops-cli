@@ -10,6 +10,7 @@ import (
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
+	"github.com/wentf9/xops-cli/core/internal/gate/internal/reasonmsg"
 )
 
 // Authorized 是由 core/internal/gate 物理独占定义与签发的编译期强类型能力证明（ADR-008 / RFC §3.1）。
@@ -381,6 +382,6 @@ func (e *ApprovalChallengeError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
 		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyGateApprovalRequired)}
 	}
-	return domi18n.ErrorNode{Sentinel: ErrApprovalRequired, Message: domi18n.NewMessage(domi18n.KeyGateApprovalChallenge, domi18n.Str("op", e.envelope.OperationID().String()), domi18n.Bool("escalated", e.escalated), domi18n.BoundStr("reason", e.reason))}
+	return domi18n.ErrorNode{Sentinel: ErrApprovalRequired, Message: domi18n.NewMessage(domi18n.KeyGateApprovalChallenge, domi18n.Str("op", e.envelope.OperationID().String()), domi18n.Bool("escalated", e.escalated), reasonmsg.Param("reason", e.reason, domi18n.KeyGateReasonApprovalRequired))}
 }
 func (e *ApprovalChallengeError) Error() string { return domi18n.CanonicalError(e) }

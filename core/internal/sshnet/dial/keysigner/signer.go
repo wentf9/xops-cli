@@ -38,7 +38,7 @@ func (k *KeySigner) listForAuth(ctx context.Context, auth inventory.AuthMethod) 
 	case *inventory.AuthPassword, *inventory.AuthKeyboardInteractive:
 		return nil, nil
 	default:
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "auth method variant"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonUnsupportedVariant, domi18n.Str("type", "AuthMethod"))
 	}
 }
 
@@ -130,7 +130,7 @@ func (k *KeySigner) Sign(ctx context.Context, key inventory.KeyFingerprint, algo
 		return zero, err
 	}
 	if !key.IsValid() || len(data) == 0 {
-		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "key fingerprint or signing data"))
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "signing_input"))
 	}
 	fpKey := key.String()
 	k.mu.RLock()
@@ -164,7 +164,7 @@ func (k *KeySigner) signWithLocal(signer ssh.Signer, algorithm string, data []by
 		sig, err = signer.Sign(rnd, data)
 	}
 	if err != nil {
-		return zero, domi18n.WrapS(ports.ErrSignerUnavailable, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "SSH private key sign"))
+		return zero, domi18n.WrapS(ports.ErrSignerUnavailable, err, domi18n.KeyKeySignerSignFailed)
 	}
 	return ports.NewSignature(sig.Format, sig.Blob)
 }
@@ -209,7 +209,7 @@ func (k *KeySigner) InspectPrivateKeyFingerprint(
 	}
 	passRef, hasPass := passphrase.Get()
 	if hasPass && !passRef.IsValid() {
-		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "passphrase secret reference"))
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "passphrase_ref"))
 	}
 	if k.readFS == nil {
 		return zero, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "OperatorReadFS"))
@@ -220,7 +220,7 @@ func (k *KeySigner) InspectPrivateKeyFingerprint(
 	}
 	raw, err := ReadBoundedFile(ctx, k.readFS, srcPath, MaxPrivateKeyFileBytes)
 	if err != nil {
-		return zero, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "read private key"), domi18n.BoundStr("target", keyPath.String()))
+		return zero, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyKeySignerReadKeyFailed, domi18n.BoundStr("target", keyPath.String()))
 	}
 	var fp inventory.KeyFingerprint
 	err = secret.WithBytes(raw, func(keyBox *secret.SecretBox) error {
@@ -237,7 +237,7 @@ func (k *KeySigner) InspectPrivateKeyFingerprint(
 		return zero, err
 	}
 	if !fp.IsValid() {
-		return zero, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "private key fingerprint"))
+		return zero, domi18n.WrapSentinel(ports.ErrAuthFailed, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "key_fingerprint")))
 	}
 	return fp, nil
 }
@@ -254,7 +254,7 @@ func (k *KeySigner) parseInspectKeyBytes(ctx context.Context, keyBytes []byte, p
 	}
 	signer, err := ssh.ParsePrivateKey(keyBytes)
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "parse private key"))
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyKeySignerParseKeyFailed)
 	}
 	return signer, nil
 }

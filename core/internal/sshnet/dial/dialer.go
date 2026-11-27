@@ -52,7 +52,7 @@ func (d *Dialer) checkDialArgs(ctx context.Context, hop plan.HopSpec, hopDigest 
 		return err
 	}
 	if !hop.IsValid() || !hopDigest.IsValid() {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "HopSpec or HopDigest"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "HopSpec/HopDigest"))
 	}
 	if parent == nil {
 		if hop.HopIndex() > 0 {
@@ -152,7 +152,7 @@ func (d *Dialer) dialUnderlyingConn(ctx context.Context, hop plan.HopSpec, paren
 	case *option.ProxyJumpChain:
 		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyDialParentRequired)
 	default:
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "proxy route variant"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonUnsupportedVariant, domi18n.Str("type", "ProxyRoute"))
 	}
 }
 
@@ -174,11 +174,11 @@ func (d *Dialer) dialProxyCommand(ctx context.Context, hop plan.HopSpec, cmdSpec
 	tc := d.buildHopTokenContext(hop)
 	expanded, err := option.ExpandTokens(cmdSpec.Command().String(), tc)
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "expand ProxyCommand tokens"))
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyDialProxyCmdExpandFailed)
 	}
 	parts, err := splitProxyCommandTokens(expanded)
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "parse ProxyCommand"))
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyDialProxyCmdParseFailed)
 	}
 	if len(parts) == 0 {
 		return nil, domi18n.EF(ports.ErrDialFailed, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "ProxyCommand"))
@@ -195,7 +195,7 @@ func (d *Dialer) dialProxyCommand(ctx context.Context, hop plan.HopSpec, cmdSpec
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "start ProxyCommand"))
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyDialProxyCmdStartFailed)
 	}
 	return conn, nil
 }
@@ -272,7 +272,7 @@ func scanProxyQuote(raw string, start int) (string, int, error) {
 		}
 		b.WriteByte(raw[i])
 	}
-	return "", 0, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ProxyCommand quotes"))
+	return "", 0, domi18n.E(domi18n.KeyDialProxyCmdUnclosedQuote)
 }
 
 // performSSHHandshake 在 core/conc.RunScoped 取消看门狗保护下执行 ssh.NewClientConn，

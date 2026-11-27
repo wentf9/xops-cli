@@ -64,7 +64,7 @@ type KeySigner struct {
 // NewKeySigner 校验至少注入 ReadFS 或 Agent 端口后构造不可变 KeySigner。
 func NewKeySigner(cfg Config) (*KeySigner, error) {
 	if cfg.ReadFS == nil && cfg.Agent == nil {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ReadFS or Agent"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonEitherMissingDep, domi18n.Str("first", "ReadFS"), domi18n.Str("second", "Agent"))
 	}
 	return &KeySigner{
 		readFS:    cfg.ReadFS,

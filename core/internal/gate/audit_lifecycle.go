@@ -235,7 +235,7 @@ func (g *Gate) recordDeniedAudit(ctx context.Context, traceID security.TraceID, 
 	}
 	now := g.clock.Now().UTC().Round(0)
 	if !isValidRFC3339Time(now) || !rej.binding.IsValid() || !rej.risk.IsValid() {
-		return errors.Join(rej.err, domi18n.EF(ErrAuditPreWriteFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "denied audit metadata")))
+		return errors.Join(rej.err, domi18n.WrapSentinel(ErrAuditPreWriteFailed, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "audit_meta"))))
 	}
 	entry, err := ports.NewAuditEntry(ports.AuditEntrySpec{
 		ProcessID:   g.procID,

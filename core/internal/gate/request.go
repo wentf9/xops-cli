@@ -47,11 +47,11 @@ type ApprovalSubmission struct {
 // NewApprovalSubmission 校验审批回执及可选完整信封后构造不可变 ApprovalSubmission。
 func NewApprovalSubmission(spec ApprovalSubmissionSpec) (ApprovalSubmission, error) {
 	if !spec.Response.IsValid() {
-		return ApprovalSubmission{}, domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ApprovalDecisionResponse"))
+		return ApprovalSubmission{}, domi18n.WrapSentinel(ErrApprovalMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ApprovalDecisionResponse")))
 	}
 	if env, ok := spec.Envelope.Get(); ok {
 		if !env.IsValid() {
-			return ApprovalSubmission{}, domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ApprovalEnvelope"))
+			return ApprovalSubmission{}, domi18n.WrapSentinel(ErrApprovalMismatch, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ApprovalEnvelope")))
 		}
 	}
 	return ApprovalSubmission{
@@ -193,7 +193,7 @@ func resolveGateRequestOptionals(
 ) (algebraic.Option[security.TraceID], algebraic.Option[security.OperationID], error) {
 	noneT, noneO := algebraic.None[security.TraceID](), algebraic.None[security.OperationID]()
 	if optInvalid(tid) || optInvalid(opID) || optInvalid(verdict) || optInvalid(approval) {
-		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "optional request field"))
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "request_option"))
 	}
 	if fl, ok := floor.Get(); ok && (fl == nil || !fl.IsValid()) {
 		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "decision_floor"))
@@ -216,7 +216,7 @@ func alignIDsWithOperationStream(
 	}
 	streamTID, streamOpID := opStream.TraceID(), opStream.OperationID()
 	if !streamTID.IsValid() || !streamOpID.IsValid() {
-		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "operation_stream binding"))
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "operation_stream"))
 	}
 	if explicitT, ok := tid.Get(); ok && !explicitT.Equal(streamTID) {
 		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonMismatch, domi18n.Str("field", "trace_id"), domi18n.Str("expected", streamTID.String()), domi18n.Str("actual", explicitT.String()))
@@ -226,7 +226,7 @@ func alignIDsWithOperationStream(
 	}
 	if sub, ok := approval.Get(); ok {
 		if env, hasEnv := sub.Envelope().Get(); hasEnv && !env.OperationID().Equal(streamOpID) {
-			return noneT, noneO, domi18n.WrapS(ErrInvalidRequest, ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "envelope OperationID"), domi18n.Str("expected", streamOpID.String()), domi18n.Str("actual", env.OperationID().String()))
+			return noneT, noneO, domi18n.WrapS(ErrInvalidRequest, ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "envelope.operation_id"), domi18n.Str("expected", streamOpID.String()), domi18n.Str("actual", env.OperationID().String()))
 		}
 	}
 	return algebraic.Some(streamTID), algebraic.Some(streamOpID), nil

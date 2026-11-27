@@ -32,7 +32,7 @@ func (d *Dialer) buildAuthMethods(ctx context.Context, hop plan.HopSpec) ([]ssh.
 
 func (d *Dialer) compileAuthMethod(ctx context.Context, hop plan.HopSpec, auth inventory.AuthMethod, loginPassRef algebraic.Option[secret.Ref]) ([]ssh.AuthMethod, error) {
 	if auth == nil || !auth.IsValid() {
-		return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "AuthMethod"))
+		return nil, domi18n.WrapSentinel(ports.ErrAuthFailed, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "AuthMethod")))
 	}
 	switch v := auth.(type) {
 	case *inventory.AuthPassword:
@@ -50,7 +50,7 @@ func (d *Dialer) compileAuthMethod(ctx context.Context, hop plan.HopSpec, auth i
 	case *inventory.AuthComposite:
 		return d.buildCompositeAuth(ctx, hop, v, loginPassRef)
 	default:
-		return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "auth method variant"))
+		return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonUnsupportedVariant, domi18n.Str("type", "AuthMethod"))
 	}
 }
 
@@ -88,7 +88,7 @@ func (d *Dialer) buildPasswordAuth(ctx context.Context, ref secret.Ref) (ssh.Aut
 		})
 	})
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "read password secret"))
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyDialReadPasswordFailed)
 	}
 	return method, nil
 }
@@ -134,7 +134,7 @@ func (d *Dialer) buildPrivateKeyAuth(ctx context.Context, hop plan.HopSpec, v *i
 		signers = append(signers, fsSigners...)
 	}
 	if len(signers) == 0 {
-		return nil, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "KeySignerPort or OperatorReadFS"))
+		return nil, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonEitherMissingDep, domi18n.Str("first", "KeySignerPort"), domi18n.Str("second", "OperatorReadFS"))
 	}
 	return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, nil
 }

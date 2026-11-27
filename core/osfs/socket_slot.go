@@ -263,7 +263,7 @@ func prepareSocketSlotLocked(ctx context.Context, path ControlSocketPath, replac
 		return domi18n.EF(ErrNotSocket, domi18n.KeyOSFSNotUnixSocket, domi18n.BoundStr("path", path.NativePath()))
 	}
 	if !replaceStale {
-		return domi18n.EF(ErrSlotOccupied, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "acquire_slot"), domi18n.BoundStr("target", path.NativePath()))
+		return domi18n.EF(ErrSlotOccupied, domi18n.KeyOSFSSlotOccupiedAt, domi18n.BoundStr("path", path.NativePath()))
 	}
 	probed, pErr := ProbeStaleUnixSocket(ctx, path)
 	if errors.Is(pErr, context.Canceled) || errors.Is(pErr, context.DeadlineExceeded) {

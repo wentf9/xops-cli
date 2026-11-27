@@ -23,7 +23,7 @@ func generateHandshakeTokens(entropy ports.Entropy) (handshakeTokens, error) {
 	}
 	var raw [nonceRawBytes * 2]byte
 	if _, err := io.ReadFull(r, raw[:]); err != nil {
-		return handshakeTokens{}, domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate privilege handshake tokens"))
+		return handshakeTokens{}, domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyPrivTokenGenFailed)
 	}
 	return handshakeTokens{
 		prompt: "[xops-priv-prompt-" + hex.EncodeToString(raw[:nonceRawBytes]) + "]",
@@ -42,18 +42,18 @@ func buildEscalationPlan(req ports.PrivilegeRequest, tokens handshakeTokens) (ex
 	}
 	innerCmd, err := cmd.RenderCommand()
 	if err != nil {
-		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "render privilege target command"))
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivBuildCmdFailed)
 	}
 	scriptBody, hasScript := cmd.StdinPayload()
 
 	qReady, err := execution.QuotePOSIX(tokens.ready)
 	if err != nil {
-		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote ready frame token"))
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivQuoteArgFailed)
 	}
 	elevBody := "printf '%s' " + qReady + " >&2; " + innerCmd
 	qElevBody, err := execution.QuotePOSIX(elevBody)
 	if err != nil {
-		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote privilege payload"))
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivQuoteArgFailed)
 	}
 
 	wrapped, err := formatPrivilegeWrapper(req, tokens.prompt, qElevBody)
@@ -69,7 +69,7 @@ func buildEscalationPlan(req ports.PrivilegeRequest, tokens handshakeTokens) (ex
 		MaxOutputBytes: algebraic.Some(cmd.MaxOutputBytes()),
 	})
 	if err != nil {
-		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "build privilege command plan"))
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivBuildCmdFailed)
 	}
 	return plan, scriptBody, hasScript, nil
 }
@@ -83,7 +83,7 @@ func formatPrivilegeWrapper(req ports.PrivilegeRequest, promptToken, qElevBody s
 	case ports.PrivilegeMethodDoas:
 		return formatDoasWrapper(req, qElevBody)
 	default:
-		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "privilege method "+req.Method().String()))
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyPrivMethodUnsupported, domi18n.Str("method", req.Method().String()))
 	}
 }
 
@@ -94,14 +94,14 @@ func formatSudoWrapper(req ports.PrivilegeRequest, promptToken, qElevBody string
 	} else {
 		qPrompt, err := execution.QuotePOSIX(promptToken)
 		if err != nil {
-			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote sudo prompt token"))
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivQuoteArgFailed)
 		}
 		prefix = "LC_ALL=C sudo -S -p " + qPrompt
 	}
 	if u, hasUser := req.TargetUser().Get(); hasUser {
 		qUser, uErr := execution.QuotePOSIX(u.String())
 		if uErr != nil {
-			return "", domi18n.WrapS(ports.ErrInvalidArgument, uErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote target user"))
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, uErr, domi18n.KeyPrivQuoteArgFailed)
 		}
 		prefix += " -u " + qUser
 	}
@@ -115,11 +115,11 @@ func formatSuWrapper(req ports.PrivilegeRequest, qElevBody string) (string, erro
 	}
 	qUser, err := execution.QuotePOSIX(targetUser)
 	if err != nil {
-		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote su target user"))
+		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivQuoteArgFailed)
 	}
 	qInner, err := execution.QuotePOSIX("exec /bin/sh -c " + qElevBody)
 	if err != nil {
-		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote su payload"))
+		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivQuoteArgFailed)
 	}
 	return "LC_ALL=C su " + qUser + " -c " + qInner, nil
 }
@@ -132,7 +132,7 @@ func formatDoasWrapper(req ports.PrivilegeRequest, qElevBody string) (string, er
 	if u, hasUser := req.TargetUser().Get(); hasUser {
 		qUser, err := execution.QuotePOSIX(u.String())
 		if err != nil {
-			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote doas target user"))
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyPrivQuoteArgFailed)
 		}
 		prefix += " -u " + qUser
 	}

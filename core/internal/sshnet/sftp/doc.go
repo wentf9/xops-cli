@@ -90,7 +90,7 @@ func OpenStream(ctx context.Context, rw io.ReadWriteCloser, cfg Config) (*Client
 		return nil, err
 	}
 	if rw == nil {
-		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "SFTP stream"))
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "sftp_stream"))
 	}
 	return newClient(ctx, rw, cfg)
 }
@@ -102,7 +102,7 @@ func randomTempSuffix(entropy ports.Entropy) (string, error) {
 	}
 	var raw [8]byte
 	if _, err := io.ReadFull(src, raw[:]); err != nil {
-		return "", domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate remote temp suffix"))
+		return "", domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeySFTPTempSuffixFailed)
 	}
 	return ".xops-tmp-" + hex.EncodeToString(raw[:]), nil
 }

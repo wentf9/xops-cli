@@ -136,7 +136,7 @@ func validateOutcomeStatusConsistency(status StepStatus, opt algebraic.Option[ex
 	case *execution.OutcomeCompleted:
 		if (v.Succeeded() && status != StepStatusSucceeded && status != StepStatusChanged) ||
 			(!v.Succeeded() && status != StepStatusFailed && status != StepStatusAborted) {
-			return domi18n.EF(ErrOutcomeStatusMismatch, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "status"), domi18n.Str("value", status.String()))
+			return domi18n.WrapSentinel(ErrOutcomeStatusMismatch, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "status"), domi18n.Str("value", status.String())))
 		}
 	default:
 		return ErrInvalidStepRecord

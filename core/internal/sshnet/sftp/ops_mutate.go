@@ -40,7 +40,7 @@ func (c *Client) checkRenameArgs(ctx context.Context, oldPath, newPath pathalg.R
 		return err
 	}
 	if !newPath.IsValid() || !spec.IsValid() {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RenameAtomic destination or spec"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "rename_spec"))
 	}
 	if oldPath.IsRoot() || newPath.IsRoot() {
 		return ports.ErrPermissionDenied
@@ -115,7 +115,7 @@ func (c *Client) Chtimes(ctx context.Context, p pathalg.RemotePath, atime, mtime
 		return err
 	}
 	if !isValidSFTPTimestamp(atime) || !isValidSFTPTimestamp(mtime) {
-		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Chtimes timestamp"))
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "chtimes"))
 	}
 	body := appendAttrs(appendString(nil, p.String()), wireAttrs{
 		flags: attrFlagACModTime,
@@ -227,7 +227,7 @@ func (c *Client) RemoveDir(ctx context.Context, dir pathalg.RemotePath) error {
 		if _, sErr := c.Lstat(ctx, dir); errors.Is(sErr, ports.ErrNotFound) {
 			return ports.ErrNotFound
 		}
-		return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote directory (not empty)"))
+		return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeySFTPDirNotEmpty, domi18n.BoundStr("path", dir.String()))
 	}
 	return err
 }

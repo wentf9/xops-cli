@@ -26,7 +26,7 @@ func buildRemoteTargetDialer(transport ports.TunnelTransport, spec ports.Forward
 	if spec.TargetKind() == ports.ForwardEndpointUnix {
 		rp, err := pathalg.ParseRemotePath(spec.TargetAddr())
 		if err != nil {
-			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix target path"))
+			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardTargetAddrInvalid)
 		}
 		return func(ctx context.Context) (net.Conn, error) {
 			return transport.DialStreamLocal(ctx, rp)
@@ -34,7 +34,7 @@ func buildRemoteTargetDialer(transport ports.TunnelTransport, spec ports.Forward
 	}
 	hp, err := netaddr.ParseHostPort(spec.TargetAddr())
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote TCP target address"))
+		return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardTargetAddrInvalid)
 	}
 	return func(ctx context.Context) (net.Conn, error) {
 		return transport.DialTCP(ctx, hp)
@@ -45,7 +45,7 @@ func (f *Forwarder) buildLocalTargetDialer(spec ports.ForwardSpec) (connDialFunc
 	if spec.TargetKind() == ports.ForwardEndpointUnix {
 		sockPath, err := osfs.ValidateControlSocketPath(spec.TargetAddr())
 		if err != nil {
-			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local Unix target path"))
+			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardTargetAddrInvalid)
 		}
 		if !f.hasCustomLocalDialer {
 			// 默认本机 Unix 反向转发强制走 core/osfs.DialUnixVerified（核验对端用户凭证与安全属性）。
@@ -61,7 +61,7 @@ func (f *Forwarder) buildLocalTargetDialer(spec ports.ForwardSpec) (connDialFunc
 	}
 	hp, err := netaddr.ParseHostPort(spec.TargetAddr())
 	if err != nil {
-		return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local TCP target address"))
+		return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardTargetAddrInvalid)
 	}
 	target := hp.String()
 	return func(ctx context.Context) (net.Conn, error) {

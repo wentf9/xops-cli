@@ -16,10 +16,10 @@ import (
 func validateLocalTCPBind(raw string, allowGateway bool) (string, error) {
 	host, portStr, err := net.SplitHostPort(raw)
 	if err != nil {
-		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "local TCP bind address"), domi18n.BoundStr("value", raw))
+		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardBindAddrInvalid, domi18n.BoundStr("addr", raw))
 	}
 	if _, err := parseTCPBindPort(portStr); err != nil {
-		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "local TCP bind port"), domi18n.BoundStr("value", portStr))
+		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardBindPortInvalid, domi18n.BoundStr("port", portStr))
 	}
 	if host == "*" {
 		host = ""
@@ -49,14 +49,14 @@ func verifyBoundLoopback(ln net.Listener) error {
 func validateRemoteTCPBind(raw string) error {
 	host, portStr, err := net.SplitHostPort(raw)
 	if err != nil {
-		return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "remote TCP bind address"), domi18n.BoundStr("value", raw))
+		return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardBindAddrInvalid, domi18n.BoundStr("addr", raw))
 	}
 	if _, err := parseTCPBindPort(portStr); err != nil {
-		return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "remote TCP bind port"), domi18n.BoundStr("value", portStr))
+		return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyForwardBindPortInvalid, domi18n.BoundStr("port", portStr))
 	}
 	if host != "" && host != "*" {
 		if _, pErr := netaddr.ParseCanonicalHost(host); pErr != nil {
-			return domi18n.WrapS(ports.ErrInvalidArgument, pErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "remote bind host"), domi18n.BoundStr("value", host))
+			return domi18n.WrapS(ports.ErrInvalidArgument, pErr, domi18n.KeyForwardBindAddrInvalid, domi18n.BoundStr("addr", host))
 		}
 	}
 	return nil
