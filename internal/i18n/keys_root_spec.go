@@ -1,6 +1,7 @@
 package i18n
 
 import (
+	"slices"
 	"time"
 
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
@@ -71,42 +72,25 @@ var (
 	ErrCatalogCorrupt = Sentinel(KeyCatalogCorrupt)
 )
 
-// RootErrorKeys 返回根模块中须在 rootFallback 登记规范英文兜底模板的全部错误与诊断 MessageID 列表。
+// RootErrorKeys 返回根模块中须在 rootFallback 登记规范英文兜底模板的全部错误、诊断与提示 MessageID 列表。
 func RootErrorKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyCatalogCorrupt,
-		KeyCatalogLoadFailed,
-		KeyCatalogMissingLocale,
-		KeyCatalogInvalidYAML,
-		KeyCatalogInvalidKey,
-		KeyCatalogDuplicateKey,
-		KeyCatalogInvalidEntry,
-		KeyCatalogInvalidEntryNode,
-		KeyCatalogEmptyEntry,
-		KeyCatalogUnknownField,
-		KeyCatalogDuplicateField,
-		KeyCatalogNonScalarField,
-		KeyCatalogMissingOther,
-		KeyCatalogInvalidTemplate,
-		KeyCatalogPluralPlaceholderMismatch,
-		KeyCatalogPlaceholderMismatch,
-		KeyCatalogMissingKey,
-		KeyStdContextCanceled,
-		KeyStdDeadlineExceeded,
-		KeyConcNurseryNotInitialized,
-		KeyConcNurseryClosed,
-		KeyConcNilTask,
-		KeyConcTaskPanicked,
-		KeyConcMutexNotInitialized,
-		KeyConcNilContext,
-		KeyConcPanic,
+	base := []domi18n.MessageID{
+		KeyCatalogCorrupt, KeyCatalogLoadFailed, KeyCatalogMissingLocale, KeyCatalogInvalidYAML,
+		KeyCatalogInvalidKey, KeyCatalogDuplicateKey, KeyCatalogInvalidEntry, KeyCatalogInvalidEntryNode,
+		KeyCatalogEmptyEntry, KeyCatalogUnknownField, KeyCatalogDuplicateField, KeyCatalogNonScalarField,
+		KeyCatalogMissingOther, KeyCatalogInvalidTemplate, KeyCatalogPluralPlaceholderMismatch,
+		KeyCatalogPlaceholderMismatch, KeyCatalogMissingKey,
+		KeyStdContextCanceled, KeyStdDeadlineExceeded,
+		KeyConcNurseryNotInitialized, KeyConcNurseryClosed, KeyConcNilTask, KeyConcTaskPanicked,
+		KeyConcMutexNotInitialized, KeyConcNilContext, KeyConcPanic,
 	}
+	return slices.Concat(base, cliErrorKeys(), tuiErrorKeys(), sftpAndDaemonErrorKeys(), interactErrorAndPromptKeys())
 }
 
-// RootKeys 返回根模块注册的全部有效 MessageID 列表（包含错误键与后续 UI/帮助/TUI/SFTP 键），
-// 供 catalog_test.go 执行与 locales/{en,zh}/*.yaml 的 100% 双射校验。
+// RootKeys 返回根模块注册的全部有效 MessageID 列表（包含错误/提示键与全部纯 UI/帮助/TUI/SFTP 展示键），
+// 供 catalog_test.go 执行与 locales/{en,zh}/*.yaml 的 100% 双射校验与反向兜底穷尽校验。
 func RootKeys() []domi18n.MessageID {
-	return RootErrorKeys()
+	return slices.Concat(RootErrorKeys(), cliDisplayKeys(), tuiDisplayKeys(), sftpDisplayKeys(), interactDisplayKeys())
 }
 
 // Sentinel 构造带根模块规范英文兜底的不可变哨兵错误（单参签名，供 var ErrX = i18n.Sentinel(i18n.KeyX) 使用）。

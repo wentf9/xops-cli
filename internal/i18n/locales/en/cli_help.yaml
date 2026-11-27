@@ -1,0 +1,354 @@
+# XOps v2 Canonical English Message Catalog (cli_help)
+# Full help documentation for all 16 v2 CLI commands, including --lang <zh|en>.
+
+cli.help.root: |
+  Usage:
+    xops [global flags] <command> [flags] [args...]
+
+  Global Flags:
+    --lang <zh|en>      Display language: zh | en (overrides XOPS_LANG / locale env)
+    --json              Emit canonical JSON/v2 output on stdout
+    --policy <profile>  Security policy profile: direct_operator, strict_operator, strict_agent
+    -F <configfile>     Alternative per-user OpenSSH configuration file ("none" to disable)
+    -h, --help          Show help information
+    -V, --version       Print XOps build version metadata
+
+  Commands:
+    ssh                 Connect to a remote host, execute a command, or manage forwards/mux
+    exec                Execute a single or batch command across one or more target nodes
+    scp                 Upload or download files over parallel SFTP/SCP transfer
+    sftp                Launch interactive SFTP shell or execute a single remote SFTP operation
+    hosts               Manage inventory hosts, identities, nodes, DAG validation & secret refs
+    creds, vault        Manage encrypted credential vault lifecycle, diagnostics & safe GC
+    tunnel, forward     Start local (-L), remote (-R), dynamic SOCKS5 (-D), or TUN (-w) forwards
+    mux                 Control OpenSSH-compatible ControlMaster multiplexers
+    playbook            Validate or run declarative v2 automation playbooks (YAML/JSON)
+    doctor              Run inventory and credential vault health diagnostics
+    audit               Reconcile crashed audit locks or inspect local audit log records
+    config              Inspect registered import formats or import external configurations
+    mcp                 Start the Model Context Protocol (MCP) server (stdio or Streamable HTTP)
+    tui                 Launch the interactive Bubble Tea v2 terminal workbench
+    version             Print XOps build version metadata without initializing Engine state
+    help                Show help for a specific command
+
+  Run 'xops <command> --help' or 'xops help <command>' for details on a specific command.
+
+cli.help.version: |
+  Usage:
+    xops version [--json] [--lang <zh|en>]
+
+  Print XOps version, commit, build time, and Go toolchain metadata without initializing Engine state.
+
+cli.help.ssh: |
+  Usage:
+    xops ssh [flags] [user@]host [command [args...]]
+
+  Flags:
+    -p <port>              Port to connect to on the remote host
+    -l <user>              Login name on the remote machine
+    -i <identity_file>     Private key file for public key authentication (repeatable)
+    -J <proxy_jump>        Jump host destination chain (e.g. jump1,jump2)
+    -L <[bind:]port:host:port | unix:...>  Local port or StreamLocal forwarding (repeatable)
+    -R <[bind:]port:host:port | unix:...>  Remote port or StreamLocal forwarding (repeatable)
+    -D <[bind:]port>       Dynamic SOCKS5 forwarding (repeatable)
+    -w <local[:remote]>    TUN/TAP device forwarding (repeatable)
+    -W <host:port>         Standard input/output forwarding target
+    -o <Key=Value>         OpenSSH option override (repeatable)
+    -M                     Place connection in ControlMaster mode (-MM for ask)
+    -S <ctl_path>          Location of ControlMaster control socket ("none" to disable)
+    -O <ctl_cmd>           Control active ControlMaster (check|forward|cancel|exit|stop|proxy)
+    -N                     Do not execute a remote command (useful with -L/-R/-D/-w/-M)
+    -f                     Background / hand off to muxdaemon before execution
+    -t                     Force pseudo-terminal allocation (-tt forces even without local TTY)
+    -T                     Disable pseudo-terminal allocation
+    -F <configfile>        Alternative per-user OpenSSH configuration file ("none" to disable)
+    --tun-mode <mode>      TUN forwarding mode: point_to_point (default) | ethernet
+    --policy <profile>     Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>         Display language: zh | en
+    --json                 Emit canonical JSON/v2 output (non-interactive commands & mux control)
+    -h, --help             Show this help message
+
+cli.help.exec: |
+  Usage:
+    xops exec [flags] <target> [--] <command [args...]>
+    xops exec [flags] (--all | --nodes <id,...> | --tags <tag,...> | --target <t>...) -- <command [args...]>
+
+  Flags:
+    -p/-l/-i/-J/-o/-F/-t/-T   Standard OpenSSH connection and TTY flags
+    --all                     Target all managed inventory nodes (batch mode)
+    --nodes <id,...>          Select managed nodes by ID (repeatable, batch mode)
+    --tags <tag,...>          Select managed nodes by tag (repeatable, batch mode)
+    --target <spec,...>       Explicit target specs (repeatable)
+    --exclude-nodes <id,...>  Exclude node IDs in batch mode
+    --exclude-tags <tag,...>  Exclude tags in batch mode
+    --concurrency <n>         Maximum concurrent nodes in batch mode
+    --fail-fast               Cancel remaining nodes on first batch failure
+    --stream                  Stream live prefixed output lines in batch mode
+    --out-dir <dir>           Write per-node stdout/stderr logs into ScopedRootFS directory
+    --max-output-bytes <n>    Maximum captured output bytes per node
+    --timeout <duration>      Per-command execution timeout (e.g. 30s, 5m)
+    --dialect <dialect>       Launch dialect: posix | powershell | cmd | raw
+    --interpreter <interp>    Interpreter: server | sh | bash | zsh | powershell | pwsh | cmd
+    --login <mode>            Login mode: disabled | login | inherit
+    --workdir <remote_path>   Remote working directory
+    --env <KEY=VALUE>         Remote environment variable override (repeatable)
+    --sudo | --su | --doas    Execute single-target command with privilege escalation
+    --privilege-user <user>   Target escalation user (e.g. root)
+    --password-ref <s/i>      Vault secret reference for privilege password
+    --prompt-password         Prompt interactively for privilege password
+    --policy <profile>        Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>            Display language: zh | en
+    --json                    Emit canonical JSON/v2 output
+    -h, --help                Show this help message
+
+cli.help.tunnel: |
+  Usage:
+    xops tunnel [start] [ssh-flags] (-L|-R|-D|-w <spec>)... <target>
+    xops tunnel local   [ssh-flags] <target> <[bind:]port:host:port>
+    xops tunnel remote  [ssh-flags] <target> <[bind:]port:host:port>
+    xops tunnel dynamic [ssh-flags] <target> <[bind:]port>
+    xops tunnel tun     [ssh-flags] [--tun-mode point_to_point|ethernet] <target> <local[:remote]>
+
+  Aliases:
+    forward
+
+  Flags:
+    -p/-l/-i/-J/-o/-F        Standard OpenSSH connection options
+    -L / -R / -D / -w        OpenSSH forwarding specifications (repeatable)
+    --tun-mode <mode>        TUN mode: point_to_point | ethernet
+    --policy <profile>       Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>           Display language: zh | en
+    --json                   Emit canonical JSON/v2 summary
+    -h, --help               Show this help message
+
+cli.help.mux: |
+  Usage:
+    xops mux start   [ssh-flags] [-S <socket>] [-f|--daemon] [-L/-R/-D/-w ...] <target>
+    xops mux check   [ssh-flags] [-S <socket>] <target>
+    xops mux forward [ssh-flags] [-S <socket>] (-L|-R|-D|-w <spec>) <target>
+    xops mux cancel  [ssh-flags] [-S <socket>] (-L|-R|-D|-w <spec>) <target>
+    xops mux exit    [ssh-flags] [-S <socket>] <target>
+    xops mux stop    [ssh-flags] [-S <socket>] <target>
+    xops mux proxy   [ssh-flags] [-S <socket>] <target>
+    xops mux daemon  [ssh-flags] [-S <socket>] [-L/-R/-D/-w ...] <target>
+
+  Flags:
+    -p/-l/-i/-J/-o/-F        Standard OpenSSH connection options
+    -S, --socket <path>      ControlMaster socket path override
+    -f, --daemon             Hand off to background muxdaemon runner
+    --policy <profile>       Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>           Display language: zh | en
+    --json                   Emit canonical JSON/v2 output
+    -h, --help               Show this help message
+
+cli.help.scp: |
+  Usage:
+    xops scp [flags] <local_src> [user@]host:<remote_dest>
+    xops scp [flags] [user@]host:<remote_src> <local_dest>
+
+  Flags:
+    -P <port>                  Port to connect to on the remote host
+    -p, --preserve             Preserve modification times and file modes
+    -r, --recursive            Recursively copy entire directories
+    -l <user>                  Login name on the remote machine
+    -i <identity_file>         Private key file for authentication (repeatable)
+    -J <proxy_jump>            Jump host destination chain
+    -o <Key=Value>             OpenSSH option override (repeatable)
+    -F <configfile>            Alternative per-user OpenSSH configuration file
+    --resume                   Resume interrupted transfer with digest verification
+    --no-clobber               Refuse to overwrite existing destination file
+    --expand-into-dir[=bool]   Expand uploaded file into existing remote directory (default true)
+    --symlink-policy <policy>  Symlink policy: reject | contained_relative | follow_operator_source
+    --local-root <dir>         Explicit ScopedRootFS root directory for local file I/O
+    --perm <octal>             Override remote file permissions (e.g. 0644)
+    --chunk-size <bytes>       Chunk size in bytes for parallel transfer
+    --concurrency <n>          Maximum parallel chunk workers
+    --max-files <n>            Maximum files for recursive transfer
+    --max-bytes <n>            Maximum total bytes for transfer
+    --expected-digest <sha256> Verify content SHA-256 digest
+    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>             Display language: zh | en
+    --json                     Emit canonical JSON/v2 transfer report
+    -h, --help                 Show this help message
+
+cli.help.sftp: |
+  Usage:
+    xops sftp [ssh-flags] [--dir <remote_dir>] <target>
+    xops sftp ls       [ssh-flags] <target> <remote_path>
+    xops sftp stat     [ssh-flags] [--follow-symlinks] <target> <remote_path>
+    xops sftp read|cat [ssh-flags] [--max-bytes N] <target> <remote_path>
+    xops sftp write    [ssh-flags] [--file <local>|-] [--perm 0644] [--no-clobber] [--create-parents] <target> <remote_path>
+    xops sftp patch    [ssh-flags] --old <text> --new <text> [--all] <target> <remote_path>
+    xops sftp mkdir    [ssh-flags] [--perm 0755] <target> <remote_path>
+    xops sftp mv|rename [ssh-flags] [--no-clobber] <target> <old_path> <new_path>
+    xops sftp rm       [ssh-flags] <target> <remote_path>
+    xops sftp rmdir    [ssh-flags] <target> <remote_path>
+    xops sftp chmod    [ssh-flags] <target> <mode> <remote_path>
+    xops sftp realpath [ssh-flags] <target> <remote_path>
+    xops sftp readlink [ssh-flags] <target> <remote_path>
+    xops sftp recover  [ssh-flags] [--local-root <dir>] [--prune] [<target> <transfer_id>]
+
+  Flags:
+    -P/-p/-l/-i/-J/-o/-F       Standard OpenSSH connection options
+    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>             Display language: zh | en
+    --json                     Emit canonical JSON/v2 output
+    -h, --help                 Show this help message
+
+cli.help.hosts: |
+  Usage:
+    xops hosts list              [--kind nodes|hosts|identities|all] [--tag <tag>]
+    xops hosts get               [--kind node|host|identity] <id>
+    xops hosts resolve           [ssh-flags] <target>
+    xops hosts validate-dag
+    xops hosts check-secret-refs (--ref <store/item> | --store <store_id>)
+    xops hosts create-host       --id <id> --address <host:port> [--alias <a>] [--desc <d>] [--tag <t>] [--expected-revision <rev>]
+    xops hosts update-host       --id <id> --address <host:port> [--alias <a>] [--desc <d>] [--tag <t>] [--expected-revision <rev>]
+    xops hosts delete-host       [--expected-revision <rev>] <id>
+    xops hosts create-identity   --id <id> --user <u> --auth-kind agent|password|private_key [auth-flags] [--expected-revision <rev>]
+    xops hosts update-identity   --id <id> --user <u> --auth-kind agent|password|private_key [auth-flags] [--gc-old-secrets]
+    xops hosts delete-identity   [--delete-unused-secrets] [--require-unreferenced] [--expected-revision <rev>] <id>
+    xops hosts create-node       --id <id> --host <host_id> --identity <identity_id> [--alias <a>] [--tag <t>] [--jump <hops>] [--proxy-command <cmd>]
+    xops hosts update-node       --id <id> --host <host_id> --identity <identity_id> [node-flags] [--gc-old-secrets]
+    xops hosts delete-node       [--delete-unused-secrets] [--require-unreferenced] [--expected-revision <rev>] <id>
+
+  Aliases:
+    host, inventory
+
+  Common Flags:
+    --policy <profile>           Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>               Display language: zh | en
+    --json                       Emit canonical JSON/v2 output
+    -h, --help                   Show this help message
+
+cli.help.vault: |
+  Usage:
+    xops creds status
+    xops creds init
+    xops creds unlock
+    xops creds lock
+    xops creds doctor     [--skip-probe]
+    xops creds refs       <store>/<item>
+    xops creds delete     <store>/<item>
+    xops creds gc                <store>/<item> [<store>/<item>...]
+    xops creds enroll-key        --id <identity_id> --user <u> --key-path <path> --store <store> [--cert-path <p>] [--fingerprint <fp>] [--replace]
+    xops creds enroll-password   --id <identity_id> --user <u> (--store <store> | --ref <store>/<item>) [--replace] [--desc <d>] [--tag <tags>]
+    xops creds set-node-privilege --node <node_id> (--store <store> | --ref <store>/<item>) [--expected-revision <rev>]
+    xops creds rotate            <old_store>/<item> (--store <store> | --new-ref <store>/<item>) [--expected-revision <rev>]
+
+  Aliases:
+    cred, vault
+
+  Common Flags:
+    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>        Display language: zh | en
+    --json                Emit canonical JSON/v2 output
+    -h, --help            Show this help message
+
+cli.help.config: |
+  Usage:
+    xops config formats
+    xops config import --format <format> [--file <path> | --stdin] [--plan] [--dry-run] [--expected-revision <rev>] [--source-name <name>] [--symlink-policy <policy>]
+
+  Flags:
+    --format <format>            Registered FormatImporter name (e.g. openssh, csv)
+    --file <path>                Input file path (read via OperatorReadFS hook; "-" for stdin)
+    --stdin                      Read import payload from stdin
+    --plan                       Run read-only PlanImport conflict/DAG preview without writing
+    --dry-run                    Run ApplyImport in dry-run mode without persisting
+    --expected-revision <rev>    Optional CAS expected revision token
+    --source-name <name>         Override logical source label in diagnostics
+    --symlink-policy <policy>    reject | contained_relative | follow_operator_source
+    --policy <profile>           Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>               Display language: zh | en
+    --json                       Emit canonical JSON/v2 output
+    -h, --help                   Show this help message
+
+cli.help.playbook: |
+  Usage:
+    xops playbook validate (<file> | --file <file> | --stdin) [--json]
+    xops playbook run      [flags] (<file> | --file <file> | --stdin)
+
+  Aliases:
+    play
+
+  Flags:
+    -p/-l/-i/-J/-o/-F          Standard OpenSSH connection options
+    --file <path>              Playbook vNext (version: 2) YAML or JSON file ("-" for stdin)
+    --stdin                    Read Playbook document from stdin
+    --target <spec,...>        Explicit target specs overriding selector (repeatable)
+    --concurrency <n>          Maximum concurrent target nodes
+    --timeout <duration>       Overall playbook timeout (e.g. 5m)
+    --var <KEY=VALUE>          Extra template/step variable override (repeatable)
+    --scoped-root <dir>        ScopedRootFS source root directory
+    --symlink-policy <policy>  reject | contained_relative | follow_operator_source
+    --dialect <dialect>        Default launch dialect: posix | powershell | cmd | raw
+    --interpreter <interp>     Default interpreter: server | sh | bash | zsh | powershell | pwsh | cmd
+    --login <mode>             Default login mode: disabled | login | inherit
+    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>             Display language: zh | en
+    --json                     Emit canonical JSON/v2 report
+    -h, --help                 Show this help message
+
+cli.help.doctor: |
+  Usage:
+    xops doctor [flags]
+
+  Flags:
+    --scope <scope>       Diagnostic scope: all (default) | inventory | vault
+    --check-vault         Verify referenced secrets exist in unlocked vault
+    --check-keys          Verify local private key fingerprints
+    --skip-vault-probe    Skip probing individual secrets during vault doctor
+    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>        Display language: zh | en
+    --json                Emit canonical JSON/v2 diagnostic report
+    -h, --help            Show this help message
+
+cli.help.audit: |
+  Usage:
+    xops audit reconcile [--json]
+    xops audit list      [--limit N] [--phase <p>] [--outcome <o>] [--node <id>] [--op-id <id>] [--trace-id <id>] [--json]
+    xops audit tail      [--limit N] [--phase <p>] [--outcome <o>] [--node <id>] [--json]
+    xops audit inspect   <operation_id> [--json]
+
+  Flags:
+    --limit <n>           Maximum number of audit records to return (default 50)
+    --phase <phase>       Filter by phase: denied | authorized | finalized
+    --outcome <outcome>   Filter by outcome: pending | denied | succeeded | failed | canceled | escalated | aborted_by_crash | outcome_unknown
+    --node <id>           Filter by target node ID
+    --op-id <id>          Filter by OperationID
+    --trace-id <id>       Filter by TraceID
+    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>        Display language: zh | en
+    --json                Emit canonical JSON/v2 output
+    -h, --help            Show this help message
+
+cli.help.mcp: |
+  Usage:
+    xops mcp [serve] [flags]
+
+  Flags:
+    --transport <mode>         Transport mode: stdio (default) | http
+    --listen <addr>            HTTP listen address (default 127.0.0.1:8080 when --transport=http)
+    --transfer-root <dir>      ScopedRootFS root for MCP file transfers
+    --artifact-root <dir>      ScopedRootFS root for MCP GUI/output artifacts
+    --allow-non-loopback       Allow binding HTTP listener on non-loopback interfaces
+    --allowed-origin <origin>  Allowed HTTP Origin header (repeatable)
+    --allowed-host <host>      Allowed HTTP Host header (repeatable)
+    -F <configfile>            Alternative OpenSSH configuration file
+    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>             Display language: zh | en
+    -h, --help                 Show this help message
+
+cli.help.tui: |
+  Usage:
+    xops tui [flags]
+
+  Flags:
+    --node <id>           Initial focused node ID
+    --refresh <duration>  Metrics/projection refresh interval (e.g. 2s)
+    --no-alt-screen       Disable alternate screen buffer
+    -F <configfile>       Alternative OpenSSH configuration file
+    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
+    --lang <zh|en>        Display language: zh | en
+    -h, --help            Show this help message

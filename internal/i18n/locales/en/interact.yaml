@@ -1,0 +1,40 @@
+# XOps v2 Canonical English Message Catalog (interact)
+# All RootErrorKeys() entries in this file must match fallback_interact_spec.go verbatim.
+
+# ---- Interaction Adapter Errors ----
+interact.err.nil_file_handles: "input and output file handles must not be nil"
+interact.err.nil_stream_handles: "StreamSpec In and Out must not be nil"
+interact.err.invalid_request: "{kind} is invalid"
+interact.err.empty_text: "text input must not be empty"
+interact.err.empty_secret: "secret input must not be empty"
+interact.err.line_too_long: "input line length exceeds limit of {max} bytes"
+interact.err.unix_read_termios: "failed to read Unix terminal termios"
+interact.err.unix_disable_echo: "failed to disable Unix terminal echo"
+interact.err.unix_wake_pipe: "failed to create terminal wakeup pipe"
+interact.err.win_read_console: "failed to read Windows console input mode"
+interact.err.win_disable_echo: "failed to disable Windows console echo"
+interact.err.win_cancel_event: "failed to create Windows cancel event"
+
+# ---- CLI Vault Interactive Prompts (6 sites in cmdasset/vault*.go) ----
+interact.vault.init.title: "Vault init"
+interact.vault.unlock.title: "Vault unlock"
+interact.vault.master.prompt: "Master passphrase"
+interact.vault.confirm.title: "Confirm Vault Passphrase"
+interact.vault.confirm.prompt: "Confirm master passphrase"
+interact.vault.enroll_password.title: "Enroll SSH Password"
+interact.vault.enroll_password.prompt: "Enter SSH login password"
+interact.vault.node_privilege.title: "Set Node Privilege Secret"
+interact.vault.node_privilege.prompt: "Enter sudo/su/doas privilege password"
+interact.vault.rotate.title: "Rotate Secret"
+interact.vault.rotate.prompt: "Enter new secret value"
+interact.vault.enroll_key.title: "Private Key Passphrase"
+interact.vault.enroll_key.prompt: "Enter private key passphrase"
+
+# ---- Interaction Frame & Risk Level Labels (UI-only; [y/N]: and [approve/N]: remain ASCII) ----
+interact.risk.unknown: "unknown"
+interact.risk.safe: "safe"
+interact.risk.moderate: "moderate"
+interact.risk.dangerous: "dangerous"
+interact.risk.critical: "critical"
+interact.approval.banner: "APPROVAL"
+interact.approval.digest_label: "digest"

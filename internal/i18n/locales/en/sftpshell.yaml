@@ -1,0 +1,137 @@
+# XOps v2 Canonical English Message Catalog (sftpshell, mcpcmd, muxdaemon)
+# All RootErrorKeys() entries in this file must match fallback_sftp_spec.go verbatim.
+
+# ---- SFTP Shell Sentinels, Config & Syntax Errors ----
+sftpshell.err.nil_context: "sftpshell: context must not be nil"
+sftpshell.err.invalid_config: "sftpshell: invalid SFTP Shell configuration"
+sftpshell.err.not_initialized: "sftpshell: Shell is not initialized"
+sftpshell.err.command_canceled: "sftpshell: current command was canceled"
+sftpshell.err.syntax: "sftpshell: invalid command syntax"
+sftpshell.err.config_nil_engine: "Engine must not be nil"
+sftpshell.err.config_nil_std_streams: "Stdout and Stderr must not be nil"
+sftpshell.err.config_target_xor: "Target and TargetSpec are mutually exclusive and one is required"
+sftpshell.err.config_target_conflict: "pre-resolved Target is invalid or cannot be combined with CLIOptions"
+sftpshell.err.config_invalid_field: "invalid {field}"
+sftpshell.err.config_scoped_symlink: "SymlinkFollowOperatorSource is forbidden in ScopedLocalOnly mode"
+sftpshell.err.config_timeout_positive: "CommandTimeout must be positive"
+sftpshell.err.config_stream_buf_neg: "StreamBuffer must not be negative"
+sftpshell.err.config_default_local_dir: "failed to initialize default local directory"
+sftpshell.err.initial_remote_not_dir: "initial remote path {path} is not a directory ({type})"
+sftpshell.err.unclosed_quote: "unclosed quote or dangling escape"
+sftpshell.err.empty_remote_path: "remote path must not be empty"
+sftpshell.err.empty_local_path: "local path must not be empty"
+sftpshell.err.disallowed_local_prefix: "local path {path} uses a forbidden UNC, device namespace, or root-relative backslash prefix"
+sftpshell.err.disallowed_drive_rel: "local path {path} is a forbidden drive-relative path"
+sftpshell.err.disallowed_posix_backslash: "POSIX absolute path {path} must not contain backslashes"
+sftpshell.err.local_rel_escape: "cannot traverse '..' above relative local directory {dir}"
+sftpshell.err.scoped_abs_forbidden: "absolute local path {path} is forbidden in ScopedLocalOnly mode"
+sftpshell.err.scoped_escape: "local path cannot traverse '..' outside sandbox root"
+sftpshell.err.invalid_local_component: "invalid local path component {component}"
+sftpshell.err.scoped_upload_root: "ScopedLocalOnly upload source cannot be sandbox root '.'"
+sftpshell.err.invalid_download_dest: "invalid download destination path"
+sftpshell.err.cannot_infer_local_name: "cannot infer local filename from remote path {path}; specify destination explicitly"
+sftpshell.err.empty_perm: "permission must not be empty"
+sftpshell.err.invalid_perm: "invalid octal permission {value} (must be in 0001..0777)"
+sftpshell.err.empty_timestamp: "timestamp must not be empty"
+sftpshell.err.invalid_timestamp: "cannot parse timestamp {value} (supports RFC3339, YYYY-MM-DDTHH:MM:SS, or Unix seconds)"
+sftpshell.err.timestamp_out_of_range: "timestamp {value} is outside RFC3339 year range [1,9999]"
+sftpshell.err.line_too_long: "command line exceeds maximum length of {max} bytes (line discarded)"
+sftpshell.err.unknown_command: "unknown command {cmd} (type 'help' for available commands)"
+sftpshell.err.no_args_allowed: "{cmd} accepts no arguments"
+sftpshell.err.usage: "usage: {usage}"
+sftpshell.err.remote_not_dir: "remote path {path} is not a directory ({type})"
+sftpshell.err.local_not_dir: "local path {path} is not a directory or does not exist"
+sftpshell.err.localfs_unavailable: "LocalFS is not configured; cannot list local directory"
+sftpshell.err.unknown_option: "{cmd}: unknown option {option}"
+sftpshell.err.list_too_many_paths: "ls/lls accepts at most one path argument"
+sftpshell.err.unknown_help_topic: "unknown help topic {topic}"
+sftpshell.err.mkdir_missing_mode: "mkdir -m requires a permission argument"
+
+# ---- SFTP Shell Interactive Messages, Output & Help (UI-only) ----
+sftpshell.msg.canceled: "command canceled (returned to prompt)"
+sftpshell.msg.timeout: "command timed out (returned to prompt)"
+sftpshell.msg.remote_is_dir_hint: "{err} (hint: use 'rmdir' for empty directories)"
+sftpshell.msg.outcome_unknown: "CRITICAL OutcomeUnknown — DO NOT retry blindly: {err}"
+sftpshell.msg.approval_required: "approval required ({reason}, digest={digest})"
+sftpshell.output.stat: |-
+  Path: {path}
+  Type: {type}
+  Mode: {mode} ({perm})
+  Size: {size}
+  ModTime: {mtime}
+  Anchor: {anchor}
+sftpshell.output.uploaded: "uploaded {src} -> {dest} ({files} files, {bytes} bytes)"
+sftpshell.output.downloaded: "downloaded {src} -> {dest} ({files} files, {bytes} bytes)"
+sftpshell.output.wrote: "wrote {path} ({bytes} bytes)"
+sftpshell.output.progress: "sftp: progress [{stage}] {transferred}/{total} bytes"
+
+sftpshell.help.summary: |
+  SFTP Shell Commands:
+    Navigation:
+      pwd                         Print remote working directory
+      cd [remote-path]            Change remote working directory (default: initial remote dir)
+      ls [-l] [-a] [remote-path]  List remote directory contents
+      lpwd                        Print local working directory
+      lcd <local-path>            Change local working directory
+      lls [-l] [-a] [local-path]  List local directory contents (requires LocalFS)
+
+    Transfer & Atomic File Operations:
+      put [-r] [-n] [--resume] [-p] <local> [remote]  Upload local file/dir to remote
+      get [-r] [-n] [--resume] [-p] <remote> [local]  Download remote file/dir to local
+      cat <remote-path>                               Read remote file contents
+      write [-n] [-p] <remote-path> <content>         Atomically write text to remote file
+      mv [-n] <old-path> <new-path>                   Atomically rename remote path (alias: rename)
+      mkdir [-m <octal>] <remote-path>                Create remote directory (and parents)
+      rm <remote-path>                                Remove remote file or symlink
+      rmdir <remote-path>                             Remove empty remote directory
+
+    Metadata & Inspection:
+      chmod <octal-mode> <remote-path>                Change remote file permissions (0001..0777)
+      chtimes <mtime> <remote-path>                   Update remote atime/mtime (or <atime> <mtime> <path>)
+      stat [-L] <remote-path>                         Inspect remote metadata & FSTAT anchor (follows symlinks)
+      lstat <remote-path>                             Inspect remote metadata without following symlinks
+      realpath <remote-path>                          Resolve canonical remote path
+      readlink <remote-path>                          Read remote symlink target
+
+    Control:
+      help [command]              Show help
+      exit / quit / bye           Close SFTP shell
+
+sftpshell.help.put: "put [-r] [-n|--no-clobber] [--resume] [-p|--preserve] <local-path> [remote-path]: upload via SCPUpload with progress streaming"
+sftpshell.help.get: "get [-r] [-n|--no-clobber] [--resume] [-p|--preserve] <remote-path> [local-path]: download into sandboxed local directory via SCPDownload"
+sftpshell.help.mv: "mv [-n|--no-clobber] <old-path> <new-path>: atomic SFTP v3 posix-rename@openssh.com"
+sftpshell.help.chmod: "chmod <octal-mode> <remote-path>: set POSIX permission bits in 0001..0777"
+sftpshell.help.chtimes: "chtimes <mtime> <remote-path> | chtimes <atime> <mtime> <remote-path>: set RFC3339 or Unix epoch timestamps"
+sftpshell.help.write: "write [-n|--no-clobber] [-p|--parents] <remote-path> <text>: atomically write UTF-8 text to remote file"
+sftpshell.help.stat: "stat [-L|--follow] <remote-path>: inspect remote metadata & FSTAT anchor (follows symlinks by default)"
+sftpshell.help.lstat: "lstat <remote-path>: inspect remote metadata & FSTAT anchor without following symlinks (pass -L to follow)"
+sftpshell.help.generic: "command {cmd}: run 'help' to see full command reference"
+
+# ---- MCP Daemon Entry Errors ----
+mcpcmd.err.nil_context: "mcpcmd: context must not be nil"
+mcpcmd.err.invalid_config: "mcpcmd: invalid MCP entry configuration"
+mcpcmd.err.invalid_transport: "mcpcmd: unsupported MCP transport mode"
+mcpcmd.err.invalid_transport_value: "unsupported transport {value} (only stdio or http is supported)"
+mcpcmd.err.create_server_failed: "create mcp server failed"
+mcpcmd.err.nil_server: "ServerFactory returned nil MCPServerContract"
+mcpcmd.err.prepare_failed: "mcp server prepare failed"
+mcpcmd.err.no_engine_or_factory: "Engine and ServerFactory cannot both be nil"
+mcpcmd.err.shutdown_timeout_positive: "ShutdownTimeout must be positive"
+mcpcmd.err.stdio_nil_streams: "stdio transport requires non-nil Stdin and Stdout"
+mcpcmd.err.stdio_forbids_listener: "stdio transport does not allow an HTTP Listener"
+mcpcmd.err.http_missing_endpoint: "http transport requires ListenAddr or Listener"
+
+# ---- ControlMaster Mux Daemon Entry Errors ----
+muxdaemon.err.nil_context: "muxdaemon: context must not be nil"
+muxdaemon.err.invalid_config: "muxdaemon: invalid muxdaemon configuration"
+muxdaemon.err.nil_client: "Client must not be nil"
+muxdaemon.err.nil_backend: "backend must not be nil"
+muxdaemon.err.missing_target: "TargetSpec or Target must be specified"
+muxdaemon.err.invalid_forward: "Forwards[{index}] is invalid"
+muxdaemon.err.shutdown_timeout_positive: "ShutdownTimeout must be positive"
+muxdaemon.err.invalid_socket_path: "invalid SocketPath"
+muxdaemon.err.invalid_control_path: "invalid ControlPath"
+muxdaemon.err.invalid_cli_opts: "CLIOptions validation failed"
+muxdaemon.err.nil_done_chan: "{source}.Done() returned nil"
+muxdaemon.err.stop_forward_failed: "stop forward {addr} failed"
+muxdaemon.err.stop_master_failed: "stop control master {socket} failed"

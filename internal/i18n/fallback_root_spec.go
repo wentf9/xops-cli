@@ -2,13 +2,25 @@ package i18n
 
 import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
-// rootFallback 返回根模块错误/诊断类 MessageID 对应的规范英文兜底模板（纯函数、零包级 var）。
+// rootFallback 返回根模块错误、诊断与提示类 MessageID 对应的规范英文兜底模板（纯函数、零包级 var）。
 // 每条返回文本须与 locales/en/*.yaml 中的对应词条保持 100% 逐字一致，由 catalog_test.go 强制锁死。
 func rootFallback(id domi18n.MessageID) string {
 	if text := fallbackCatalog(id); text != "" {
 		return text
 	}
-	return fallbackStdAndConc(id)
+	if text := fallbackStdAndConc(id); text != "" {
+		return text
+	}
+	if text := fallbackCLI(id); text != "" {
+		return text
+	}
+	if text := fallbackTUI(id); text != "" {
+		return text
+	}
+	if text := fallbackSFTPAndDaemons(id); text != "" {
+		return text
+	}
+	return fallbackInteract(id)
 }
 
 // fallbackForID 先查根模块规范英文兜底表，未命中再回退核心规范英文兜底表。

@@ -1,0 +1,137 @@
+# XOps v2 简体中文国际化词库（sftpshell / mcpcmd / muxdaemon）
+# 与 locales/en/sftpshell.yaml 保持 100% 键双射与占位符集合一致。
+
+# ---- SFTP Shell 哨兵、配置与语法错误 ----
+sftpshell.err.nil_context: "SFTP Shell 上下文不能为空"
+sftpshell.err.invalid_config: "SFTP Shell 配置无效"
+sftpshell.err.not_initialized: "SFTP Shell 尚未初始化"
+sftpshell.err.command_canceled: "当前 SFTP 命令已取消"
+sftpshell.err.syntax: "SFTP 命令语法无效"
+sftpshell.err.config_nil_engine: "Engine 不能为空"
+sftpshell.err.config_nil_std_streams: "Stdout 与 Stderr 均不能为空"
+sftpshell.err.config_target_xor: "Target 与 TargetSpec 必须二选一"
+sftpshell.err.config_target_conflict: "预解析 Target 无效或禁止同时指定 CLIOptions"
+sftpshell.err.config_invalid_field: "{field} 无效"
+sftpshell.err.config_scoped_symlink: "ScopedLocalOnly 沙箱模式下禁止使用 SymlinkFollowOperatorSource"
+sftpshell.err.config_timeout_positive: "CommandTimeout 必须为正时长"
+sftpshell.err.config_stream_buf_neg: "StreamBuffer 不能为负"
+sftpshell.err.config_default_local_dir: "初始化默认本地目录失败"
+sftpshell.err.initial_remote_not_dir: "初始远端路径 {path} 不是目录（{type}）"
+sftpshell.err.unclosed_quote: "存在未闭合引号或悬空转义符"
+sftpshell.err.empty_remote_path: "远端路径不能为空"
+sftpshell.err.empty_local_path: "本地路径不能为空"
+sftpshell.err.disallowed_local_prefix: "本地路径 {path} 使用了禁止的 UNC、设备命名空间或根相对反斜杠前缀"
+sftpshell.err.disallowed_drive_rel: "本地路径 {path} 为禁止的盘符相对路径"
+sftpshell.err.disallowed_posix_backslash: "POSIX 绝对路径 {path} 禁止混用反斜杠"
+sftpshell.err.local_rel_escape: "无法在相对本地目录 {dir} 中向上穿越 '..'"
+sftpshell.err.scoped_abs_forbidden: "ScopedLocalOnly 沙箱模式下禁止使用绝对本地路径 {path}"
+sftpshell.err.scoped_escape: "本地路径禁止通过 '..' 越出沙箱根目录"
+sftpshell.err.invalid_local_component: "非法本地路径分量 {component}"
+sftpshell.err.scoped_upload_root: "ScopedLocalOnly 上传源路径不能为沙箱根目录 '.'"
+sftpshell.err.invalid_download_dest: "下载目标路径无效"
+sftpshell.err.cannot_infer_local_name: "无法从远端路径 {path} 推导本地文件名，请显式指定目标路径"
+sftpshell.err.empty_perm: "权限值不能为空"
+sftpshell.err.invalid_perm: "无效八进制权限 {value}（须落在 0001..0777）"
+sftpshell.err.empty_timestamp: "时间戳不能为空"
+sftpshell.err.invalid_timestamp: "无法解析时间 {value}（支持 RFC3339、YYYY-MM-DDTHH:MM:SS 或 Unix 秒）"
+sftpshell.err.timestamp_out_of_range: "时间 {value} 超出 RFC3339 年份范围 [1,9999]"
+sftpshell.err.line_too_long: "单行命令超过最大长度 {max} 字节（已丢弃该行并返回提示符）"
+sftpshell.err.unknown_command: "未知命令 {cmd}（输入 'help' 查看支持命令）"
+sftpshell.err.no_args_allowed: "{cmd} 不接受参数"
+sftpshell.err.usage: "用法：{usage}"
+sftpshell.err.remote_not_dir: "远端路径 {path} 不是目录（{type}）"
+sftpshell.err.local_not_dir: "本地路径 {path} 不是目录或不存在"
+sftpshell.err.localfs_unavailable: "当前环境未注入 LocalFS，无法列举本地目录"
+sftpshell.err.unknown_option: "{cmd}：未知选项 {option}"
+sftpshell.err.list_too_many_paths: "ls/lls 至多接受一个路径参数"
+sftpshell.err.unknown_help_topic: "未知帮助主题 {topic}"
+sftpshell.err.mkdir_missing_mode: "mkdir -m 缺少权限参数"
+
+# ---- SFTP Shell 交互消息、输出与帮助 ----
+sftpshell.msg.canceled: "当前命令已取消（已返回提示符）"
+sftpshell.msg.timeout: "当前命令已超时（已返回提示符）"
+sftpshell.msg.remote_is_dir_hint: "{err}（提示：删除空目录请使用 'rmdir'）"
+sftpshell.msg.outcome_unknown: "严重：执行终态未知（OutcomeUnknown）— 严禁盲目重试：{err}"
+sftpshell.msg.approval_required: "需要人工审批（{reason}，摘要={digest}）"
+sftpshell.output.stat: |-
+  路径：{path}
+  类型：{type}
+  权限：{mode} ({perm})
+  大小：{size}
+  修改时间：{mtime}
+  文件锚点：{anchor}
+sftpshell.output.uploaded: "已上传 {src} -> {dest}（{files} 个文件，{bytes} 字节）"
+sftpshell.output.downloaded: "已下载 {src} -> {dest}（{files} 个文件，{bytes} 字节）"
+sftpshell.output.wrote: "已写入 {path}（{bytes} 字节）"
+sftpshell.output.progress: "sftp: 进度 [{stage}] {transferred}/{total} 字节"
+
+sftpshell.help.summary: |
+  SFTP Shell 交互命令：
+    目录导航：
+      pwd                         显示当前远端工作目录
+      cd [远端路径]               切换远端工作目录（默认返回初始远端目录）
+      ls [-l] [-a] [远端路径]     列举远端目录内容
+      lpwd                        显示当前本地工作目录
+      lcd <本地路径>              切换本地工作目录
+      lls [-l] [-a] [本地路径]    列举本地目录内容（需注入 LocalFS）
+
+    文件传输与原子操作：
+      put [-r] [-n] [--resume] [-p] <本地> [远端]  上传本地文件或目录至远端
+      get [-r] [-n] [--resume] [-p] <远端> [本地]  从远端下载文件或目录至本地
+      cat <远端路径>                               读取远端文件内容
+      write [-n] [-p] <远端路径> <文本内容>        原子写入文本至远端文件
+      mv [-n] <旧路径> <新路径>                    原子重命名远端路径（别名：rename）
+      mkdir [-m <八进制权限>] <远端路径>           递归创建远端目录
+      rm <远端路径>                                删除远端文件或符号链接
+      rmdir <远端路径>                             删除远端空目录
+
+    元数据与探测：
+      chmod <八进制权限> <远端路径>                修改远端文件权限（0001..0777）
+      chtimes <mtime> <远端路径>                   更新远端访问/修改时间（或 <atime> <mtime> <路径>）
+      stat [-L] <远端路径>                         查看远端元数据与 FSTAT 锚点（默认跟随软链）
+      lstat <远端路径>                             查看远端元数据（不跟随软链）
+      realpath <远端路径>                          解析远端规范绝对路径
+      readlink <远端路径>                          读取远端符号链接目标
+
+    控制：
+      help [命令]                 显示帮助信息
+      exit / quit / bye           退出 SFTP Shell
+
+sftpshell.help.put: "put [-r] [-n|--no-clobber] [--resume] [-p|--preserve] <本地路径> [远端路径]：经 SCPUpload 上传并流式汇报进度"
+sftpshell.help.get: "get [-r] [-n|--no-clobber] [--resume] [-p|--preserve] <远端路径> [本地路径]：经 SCPDownload 下载至受控本地目录"
+sftpshell.help.mv: "mv [-n|--no-clobber] <旧路径> <新路径>：执行 SFTP v3 posix-rename@openssh.com 原子重命名"
+sftpshell.help.chmod: "chmod <八进制权限> <远端路径>：设置 POSIX 权限位（0001..0777）"
+sftpshell.help.chtimes: "chtimes <mtime> <远端路径> | chtimes <atime> <mtime> <远端路径>：设置 RFC3339 或 Unix 秒级时间戳"
+sftpshell.help.write: "write [-n|--no-clobber] [-p|--parents] <远端路径> <文本>：原子写入 UTF-8 文本至远端文件"
+sftpshell.help.stat: "stat [-L|--follow] <远端路径>：查看远端元数据与 FSTAT 锚点（默认跟随软链）"
+sftpshell.help.lstat: "lstat <远端路径>：查看远端元数据与 FSTAT 锚点（不跟随软链，传 -L 可跟随）"
+sftpshell.help.generic: "命令 {cmd}：输入 'help' 查看完整命令列表"
+
+# ---- MCP 守护入口错误 ----
+mcpcmd.err.nil_context: "MCP 入口上下文不能为空"
+mcpcmd.err.invalid_config: "MCP 入口配置无效"
+mcpcmd.err.invalid_transport: "不支持的 MCP 传输模式"
+mcpcmd.err.invalid_transport_value: "不支持的传输模式 {value}（仅支持 stdio 或 http）"
+mcpcmd.err.create_server_failed: "创建 MCP 服务失败"
+mcpcmd.err.nil_server: "ServerFactory 返回了空的 MCPServerContract"
+mcpcmd.err.prepare_failed: "MCP 服务启动预检失败"
+mcpcmd.err.no_engine_or_factory: "Engine 与 ServerFactory 不能同时为空"
+mcpcmd.err.shutdown_timeout_positive: "ShutdownTimeout 必须为正时长"
+mcpcmd.err.stdio_nil_streams: "stdio 传输必须提供非空的 Stdin 与 Stdout"
+mcpcmd.err.stdio_forbids_listener: "stdio 传输不允许同时传入 HTTP Listener"
+mcpcmd.err.http_missing_endpoint: "http 传输必须提供 ListenAddr 或 Listener"
+
+# ---- ControlMaster 守护入口错误 ----
+muxdaemon.err.nil_context: "muxdaemon 上下文不能为空"
+muxdaemon.err.invalid_config: "muxdaemon 配置无效"
+muxdaemon.err.nil_client: "Client 不能为空"
+muxdaemon.err.nil_backend: "backend 不能为空"
+muxdaemon.err.missing_target: "TargetSpec 与 Target 至少须指定一项"
+muxdaemon.err.invalid_forward: "Forwards[{index}] 无效"
+muxdaemon.err.shutdown_timeout_positive: "ShutdownTimeout 必须为正时长"
+muxdaemon.err.invalid_socket_path: "SocketPath 无效"
+muxdaemon.err.invalid_control_path: "ControlPath 非法"
+muxdaemon.err.invalid_cli_opts: "CLIOptions 校验失败"
+muxdaemon.err.nil_done_chan: "{source}.Done() 返回了空通道"
+muxdaemon.err.stop_forward_failed: "停止转发 {addr} 失败"
+muxdaemon.err.stop_master_failed: "停止 ControlMaster {socket} 失败"

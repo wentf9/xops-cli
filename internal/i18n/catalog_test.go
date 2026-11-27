@@ -346,3 +346,74 @@ func TestLoadCatalogFromFSPluralAndMultiFile(t *testing.T) {
 		t.Fatalf("最小词库缺失键 T 应回退规范英文: %q", got)
 	}
 }
+
+func TestM2DomainCatalogRenderingContracts(t *testing.T) {
+	cat, err := LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog() 失败: %v", err)
+	}
+	enLoc := cat.For(domi18n.LocaleEn)
+	zhLoc := cat.For(domi18n.LocaleZh)
+	assertCLIHelpContracts(t, enLoc, zhLoc)
+	assertTUIAndInteractContracts(t, enLoc, zhLoc)
+	assertM2SampleErrorRendering(t, enLoc, zhLoc)
+}
+
+func assertCLIHelpContracts(t *testing.T, enLoc, zhLoc *Localizer) {
+	t.Helper()
+	// 全部 16 条 CLI 帮助文档在中英文词库中均须包含 --lang <zh|en> 并以换行结尾。
+	helpKeys := []domi18n.MessageID{
+		KeyCLIHelpRoot, KeyCLIHelpVersion, KeyCLIHelpSSH, KeyCLIHelpExec, KeyCLIHelpTunnel, KeyCLIHelpMux,
+		KeyCLIHelpSCP, KeyCLIHelpSFTP, KeyCLIHelpHosts, KeyCLIHelpVault, KeyCLIHelpConfig, KeyCLIHelpPlaybook,
+		KeyCLIHelpDoctor, KeyCLIHelpAudit, KeyCLIHelpMCP, KeyCLIHelpTUI,
+	}
+	for _, id := range helpKeys {
+		assertHelpTextValid(t, "en", id, enLoc.T(id))
+		assertHelpTextValid(t, "zh", id, zhLoc.T(id))
+	}
+}
+
+func assertHelpTextValid(t *testing.T, locale string, id domi18n.MessageID, text string) {
+	t.Helper()
+	if !strings.Contains(text, "--lang <zh|en>") || !strings.HasSuffix(text, "\n") {
+		t.Errorf("%s %q 帮助文档缺少 --lang <zh|en> 或尾部换行", locale, id)
+	}
+}
+
+func assertTUIAndInteractContracts(t *testing.T, enLoc, zhLoc *Localizer) {
+	t.Helper()
+	// TUI 帮助页与底栏须明确区分大写 L 语言切换与小写 l 日志流。
+	for name, loc := range map[string]*Localizer{"en": enLoc, "zh": zhLoc} {
+		body := loc.T(KeyTUIHelpBody)
+		footer := loc.T(KeyTUIFooterHelp)
+		if !strings.Contains(body, "L ") || !strings.Contains(body, "m / l / x") || !strings.Contains(footer, "L ") {
+			t.Errorf("%s TUI 帮助/底栏缺少 L 语言切换与 l 日志流说明", name)
+		}
+	}
+	// CLI 凭据库交互提示经 NewMessage 构造后，Canonical() 与英文词库一致且中文正常渲染。
+	vaultTitle := NewMessage(KeyInteractVaultInitTitle)
+	if vaultTitle.Canonical() != "Vault init" || zhLoc.Render(vaultTitle) != "初始化凭据库" {
+		t.Fatalf("凭据库提示渲染异常: en=%q zh=%q", vaultTitle.Canonical(), zhLoc.Render(vaultTitle))
+	}
+}
+
+func assertM2SampleErrorRendering(t *testing.T, enLoc, zhLoc *Localizer) {
+	t.Helper()
+	sampleErrs := []error{
+		EF(Sentinel(KeyCLIUsage), KeyCLIInvalidFlagValueEnum, Str("flag", "--lang"), Str("allowed", "zh|en"), Str("value", "fr")),
+		Wrap(Sentinel(KeySFTPCommandCanceled), KeySFTPUnknownOption, Str("cmd", "put"), Str("option", "-z")),
+		EF(Sentinel(KeyMCPInvalidTransport), KeyMCPInvalidTransportValue, Str("value", "grpc")),
+		Wrap(Sentinel(KeyMuxDaemonInvalidConfig), KeyMuxDaemonStopMasterFailed, Str("socket", "/tmp/mux.sock")),
+		EF(Sentinel(KeyTUIInvalidConfig), KeyTUIConfigNilOpStream, Int("index", 2)),
+	}
+	for _, e := range sampleErrs {
+		gotEn := enLoc.RenderError(e)
+		gotZh := zhLoc.RenderError(e)
+		if gotEn != e.Error() {
+			t.Errorf("en RenderError(%q) != err.Error()(%q)", gotEn, e.Error())
+		}
+		if gotZh == "" || strings.ContainsAny(gotZh, "{}") {
+			t.Errorf("zh RenderError 异常或存在占位符残留: %q", gotZh)
+		}
+	}
+}

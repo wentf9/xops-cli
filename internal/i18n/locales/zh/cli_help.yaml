@@ -1,0 +1,354 @@
+# XOps v2 简体中文国际化词库（cli_help）
+# 全部 16 个 v2 CLI 命令的完整简体中文帮助文档（含 --lang <zh|en>）。
+
+cli.help.root: |
+  用法：
+    xops [全局选项] <命令> [选项] [参数...]
+
+  全局选项：
+    --lang <zh|en>      界面语言：zh | en（覆盖 XOPS_LANG 与系统区域环境变量）
+    --json              在标准输出以规范 JSON/v2 格式输出结果
+    --policy <profile>  安全策略配置档：direct_operator、strict_operator、strict_agent
+    -F <configfile>     指定替代的用户级 OpenSSH 配置文件（传 "none" 禁用）
+    -h, --help          显示帮助信息
+    -V, --version       打印 XOps 构建版本元信息
+
+  命令：
+    ssh                 连接远端主机、执行单次命令或管理端口转发与连接复用
+    exec                在单个或多个目标节点上执行单机或批量命令
+    scp                 通过并行分片 SFTP/SCP 传输上传或下载文件
+    sftp                启动交互式 SFTP Shell 或执行单步远端 SFTP 文件操作
+    hosts               管理资产主机、身份、节点、DAG 拓扑校验与凭据引用检查
+    creds, vault        管理加密凭据库生命周期、健康诊断与安全回收
+    tunnel, forward     启动本地（-L）、远端（-R）、动态 SOCKS5（-D）或 TUN（-w）转发
+    mux                 控制兼容 OpenSSH 的 ControlMaster 多路复用主控
+    playbook            离线校验或执行声明式 v2 自动化 Playbook（YAML/JSON）
+    doctor              运行资产清单与加密凭据库健康诊断
+    audit               对账残留崩溃审计锁或检索本地审计日志记录
+    config              查看已注册导入格式或导入外部配置
+    mcp                 启动 Model Context Protocol (MCP) 服务（stdio 或 Streamable HTTP）
+    tui                 启动交互式 Bubble Tea v2 实时终端工作台
+    version             打印 XOps 构建版本元信息（不初始化引擎状态）
+    help                显示指定命令的详细帮助
+
+  运行 'xops <命令> --help' 或 'xops help <命令>' 查看各子命令完整说明。
+
+cli.help.version: |
+  用法：
+    xops version [--json] [--lang <zh|en>]
+
+  打印 XOps 版本号、Git 提交、构建时间及 Go 工具链元信息（不初始化引擎状态或触碰本地目录）。
+
+cli.help.ssh: |
+  用法：
+    xops ssh [选项] [user@]host [命令 [参数...]]
+
+  选项：
+    -p <port>              远端主机连接端口
+    -l <user>              远端登录用户名
+    -i <identity_file>     公钥认证所用的私钥文件路径（可重复指定）
+    -J <proxy_jump>        跳板机链路（如 jump1,jump2）
+    -L <[bind:]port:host:port | unix:...>  本地端口或 StreamLocal 转发（可重复指定）
+    -R <[bind:]port:host:port | unix:...>  远端端口或 StreamLocal 转发（可重复指定）
+    -D <[bind:]port>       动态 SOCKS5 转发（可重复指定）
+    -w <local[:remote]>    TUN/TAP 虚拟网卡隧道转发（可重复指定）
+    -W <host:port>         标准输入/输出转发目标
+    -o <Key=Value>         OpenSSH 选项覆盖（可重复指定）
+    -M                     将连接置于 ControlMaster 主控模式（-MM 为确认模式）
+    -S <ctl_path>          ControlMaster 控制套接字路径（传 "none" 禁用）
+    -O <ctl_cmd>           控制活跃主控（check|forward|cancel|exit|stop|proxy）
+    -N                     不执行远端命令（常与 -L/-R/-D/-w/-M 配合使用）
+    -f                     转入后台并移交 muxdaemon 托管运行
+    -t                     强制分配伪终端（-tt 在本地无 TTY 时仍强制分配）
+    -T                     禁用伪终端分配
+    -F <configfile>        指定替代的用户级 OpenSSH 配置文件（传 "none" 禁用）
+    --tun-mode <mode>      TUN 转发封装模式：point_to_point（默认）| ethernet
+    --policy <profile>     安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>         界面语言：zh | en
+    --json                 以规范 JSON/v2 输出（仅适用于非交互命令与多路复用控制）
+    -h, --help             显示此帮助信息
+
+cli.help.exec: |
+  用法：
+    xops exec [选项] <目标> [--] <命令 [参数...]>
+    xops exec [选项] (--all | --nodes <id,...> | --tags <tag,...> | --target <t>...) -- <命令 [参数...]>
+
+  选项：
+    -p/-l/-i/-J/-o/-F/-t/-T   标准 OpenSSH 连接与伪终端选项
+    --all                     选中全部受管资产节点（批量模式）
+    --nodes <id,...>          按节点 ID 选择受管节点（可重复指定，批量模式）
+    --tags <tag,...>          按标签选择受管节点（可重复指定，批量模式）
+    --target <spec,...>       显式指定目标连接规格（可重复指定）
+    --exclude-nodes <id,...>  批量模式下排除指定节点 ID
+    --exclude-tags <tag,...>  批量模式下排除指定标签
+    --concurrency <n>         批量模式最大并发节点数
+    --fail-fast               首个节点失败时立即取消其余待执行节点
+    --stream                  批量模式下实时流式输出带节点前缀的日志行
+    --out-dir <dir>           将各节点 stdout/stderr 写入 ScopedRootFS 沙箱目录
+    --max-output-bytes <n>    单节点最大捕获输出字节数
+    --timeout <duration>      单命令执行超时时长（如 30s、5m）
+    --dialect <dialect>       启动方言：posix | powershell | cmd | raw
+    --interpreter <interp>    解释器：server | sh | bash | zsh | powershell | pwsh | cmd
+    --login <mode>            登录模式：disabled | login | inherit
+    --workdir <remote_path>   远端工作目录
+    --env <KEY=VALUE>         远端环境变量覆盖（可重复指定）
+    --sudo | --su | --doas    以提权方式执行单目标命令
+    --privilege-user <user>   提权目标用户（如 root）
+    --password-ref <s/i>      提权密码的凭据库引用
+    --prompt-password         交互式提示输入提权密码
+    --policy <profile>        安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>            界面语言：zh | en
+    --json                    以规范 JSON/v2 输出
+    -h, --help                显示此帮助信息
+
+cli.help.tunnel: |
+  用法：
+    xops tunnel [start] [ssh选项] (-L|-R|-D|-w <规格>)... <目标>
+    xops tunnel local   [ssh选项] <目标> <[bind:]port:host:port>
+    xops tunnel remote  [ssh选项] <目标> <[bind:]port:host:port>
+    xops tunnel dynamic [ssh选项] <目标> <[bind:]port>
+    xops tunnel tun     [ssh选项] [--tun-mode point_to_point|ethernet] <目标> <local[:remote]>
+
+  别名：
+    forward
+
+  选项：
+    -p/-l/-i/-J/-o/-F        标准 OpenSSH 连接选项
+    -L / -R / -D / -w        OpenSSH 转发规格（可重复指定）
+    --tun-mode <mode>        TUN 模式：point_to_point | ethernet
+    --policy <profile>       安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>           界面语言：zh | en
+    --json                   以规范 JSON/v2 输出摘要
+    -h, --help               显示此帮助信息
+
+cli.help.mux: |
+  用法：
+    xops mux start   [ssh选项] [-S <socket>] [-f|--daemon] [-L/-R/-D/-w ...] <目标>
+    xops mux check   [ssh选项] [-S <socket>] <目标>
+    xops mux forward [ssh选项] [-S <socket>] (-L|-R|-D|-w <规格>) <目标>
+    xops mux cancel  [ssh选项] [-S <socket>] (-L|-R|-D|-w <规格>) <目标>
+    xops mux exit    [ssh选项] [-S <socket>] <目标>
+    xops mux stop    [ssh选项] [-S <socket>] <目标>
+    xops mux proxy   [ssh选项] [-S <socket>] <目标>
+    xops mux daemon  [ssh选项] [-S <socket>] [-L/-R/-D/-w ...] <目标>
+
+  选项：
+    -p/-l/-i/-J/-o/-F        标准 OpenSSH 连接选项
+    -S, --socket <path>      覆盖 ControlMaster 控制套接字路径
+    -f, --daemon             移交至后台 muxdaemon 守护进程运行
+    --policy <profile>       安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>           界面语言：zh | en
+    --json                   以规范 JSON/v2 输出
+    -h, --help               显示此帮助信息
+
+cli.help.scp: |
+  用法：
+    xops scp [选项] <本地源路径> [user@]host:<远端目标路径>
+    xops scp [选项] [user@]host:<远端源路径> <本地目标路径>
+
+  选项：
+    -P <port>                  远端主机连接端口
+    -p, --preserve             保留文件修改时间与权限位
+    -r, --recursive            递归复制整个目录树
+    -l <user>                  远端登录用户名
+    -i <identity_file>         认证所用私钥文件路径（可重复指定）
+    -J <proxy_jump>            跳板机链路
+    -o <Key=Value>             OpenSSH 选项覆盖（可重复指定）
+    -F <configfile>            指定替代的用户级 OpenSSH 配置文件
+    --resume                   校验摘要后断点续传未完成传输
+    --no-clobber               拒绝覆盖已存在的目标文件
+    --expand-into-dir[=bool]   将上传文件展开写入已有远端目录（默认 true）
+    --symlink-policy <policy>  软链策略：reject | contained_relative | follow_operator_source
+    --local-root <dir>         显式指定本地文件 I/O 的 ScopedRootFS 沙箱根目录
+    --perm <octal>             覆盖远端文件权限位（如 0644）
+    --chunk-size <bytes>       并行传输分片大小（字节）
+    --concurrency <n>          最大并行分片工作协程数
+    --max-files <n>            递归传输允许的最大文件数
+    --max-bytes <n>            传输允许的最大总字节数
+    --expected-digest <sha256> 校验内容 SHA-256 摘要
+    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>             界面语言：zh | en
+    --json                     以规范 JSON/v2 输出传输报告
+    -h, --help                 显示此帮助信息
+
+cli.help.sftp: |
+  用法：
+    xops sftp [ssh选项] [--dir <远端目录>] <目标>
+    xops sftp ls       [ssh选项] <目标> <远端路径>
+    xops sftp stat     [ssh选项] [--follow-symlinks] <目标> <远端路径>
+    xops sftp read|cat [ssh选项] [--max-bytes N] <目标> <远端路径>
+    xops sftp write    [ssh选项] [--file <本地路径>|-] [--perm 0644] [--no-clobber] [--create-parents] <目标> <远端路径>
+    xops sftp patch    [ssh选项] --old <旧文本> --new <新文本> [--all] <目标> <远端路径>
+    xops sftp mkdir    [ssh选项] [--perm 0755] <目标> <远端路径>
+    xops sftp mv|rename [ssh选项] [--no-clobber] <目标> <旧路径> <新路径>
+    xops sftp rm       [ssh选项] <目标> <远端路径>
+    xops sftp rmdir    [ssh选项] <目标> <远端路径>
+    xops sftp chmod    [ssh选项] <目标> <八进制权限> <远端路径>
+    xops sftp realpath [ssh选项] <目标> <远端路径>
+    xops sftp readlink [ssh选项] <目标> <远端路径>
+    xops sftp recover  [ssh选项] [--local-root <目录>] [--prune] [<目标> <传输ID>]
+
+  选项：
+    -P/-p/-l/-i/-J/-o/-F       标准 OpenSSH 连接选项
+    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>             界面语言：zh | en
+    --json                     以规范 JSON/v2 输出
+    -h, --help                 显示此帮助信息
+
+cli.help.hosts: |
+  用法：
+    xops hosts list              [--kind nodes|hosts|identities|all] [--tag <标签>]
+    xops hosts get               [--kind node|host|identity] <id>
+    xops hosts resolve           [ssh选项] <目标>
+    xops hosts validate-dag
+    xops hosts check-secret-refs (--ref <store/item> | --store <store_id>)
+    xops hosts create-host       --id <id> --address <host:port> [--alias <a>] [--desc <d>] [--tag <t>] [--expected-revision <rev>]
+    xops hosts update-host       --id <id> --address <host:port> [--alias <a>] [--desc <d>] [--tag <t>] [--expected-revision <rev>]
+    xops hosts delete-host       [--expected-revision <rev>] <id>
+    xops hosts create-identity   --id <id> --user <u> --auth-kind agent|password|private_key [认证选项] [--expected-revision <rev>]
+    xops hosts update-identity   --id <id> --user <u> --auth-kind agent|password|private_key [认证选项] [--gc-old-secrets]
+    xops hosts delete-identity   [--delete-unused-secrets] [--require-unreferenced] [--expected-revision <rev>] <id>
+    xops hosts create-node       --id <id> --host <host_id> --identity <identity_id> [--alias <a>] [--tag <t>] [--jump <跳板链>] [--proxy-command <命令>]
+    xops hosts update-node       --id <id> --host <host_id> --identity <identity_id> [节点选项] [--gc-old-secrets]
+    xops hosts delete-node       [--delete-unused-secrets] [--require-unreferenced] [--expected-revision <rev>] <id>
+
+  别名：
+    host, inventory
+
+  通用选项：
+    --policy <profile>           安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>               界面语言：zh | en
+    --json                       以规范 JSON/v2 输出
+    -h, --help                   显示此帮助信息
+
+cli.help.vault: |
+  用法：
+    xops creds status
+    xops creds init
+    xops creds unlock
+    xops creds lock
+    xops creds doctor     [--skip-probe]
+    xops creds refs       <store>/<item>
+    xops creds delete     <store>/<item>
+    xops creds gc                <store>/<item> [<store>/<item>...]
+    xops creds enroll-key        --id <identity_id> --user <u> --key-path <路径> --store <store> [--cert-path <p>] [--fingerprint <fp>] [--replace]
+    xops creds enroll-password   --id <identity_id> --user <u> (--store <store> | --ref <store>/<item>) [--replace] [--desc <d>] [--tag <标签>]
+    xops creds set-node-privilege --node <node_id> (--store <store> | --ref <store>/<item>) [--expected-revision <rev>]
+    xops creds rotate            <old_store>/<item> (--store <store> | --new-ref <store>/<item>) [--expected-revision <rev>]
+
+  别名：
+    cred, vault
+
+  通用选项：
+    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>        界面语言：zh | en
+    --json                以规范 JSON/v2 输出
+    -h, --help            显示此帮助信息
+
+cli.help.config: |
+  用法：
+    xops config formats
+    xops config import --format <格式> [--file <路径> | --stdin] [--plan] [--dry-run] [--expected-revision <rev>] [--source-name <名称>] [--symlink-policy <策略>]
+
+  选项：
+    --format <format>            已注册的 FormatImporter 格式名（如 openssh、csv）
+    --file <path>                输入文件路径（经 OperatorReadFS 读取；"-" 表示标准输入）
+    --stdin                      从标准输入读取导入内容
+    --plan                       执行只读 PlanImport 冲突与 DAG 预览（不落盘）
+    --dry-run                    以试运行模式执行 ApplyImport（不持久化）
+    --expected-revision <rev>    可选 CAS 预期版本令牌
+    --source-name <name>         覆盖诊断报告中的逻辑来源标签
+    --symlink-policy <policy>    软链策略：reject | contained_relative | follow_operator_source
+    --policy <profile>           安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>               界面语言：zh | en
+    --json                       以规范 JSON/v2 输出
+    -h, --help                   显示此帮助信息
+
+cli.help.playbook: |
+  用法：
+    xops playbook validate (<文件> | --file <文件> | --stdin) [--json]
+    xops playbook run      [选项] (<文件> | --file <文件> | --stdin)
+
+  别名：
+    play
+
+  选项：
+    -p/-l/-i/-J/-o/-F          标准 OpenSSH 连接选项
+    --file <path>              Playbook vNext（version: 2）YAML 或 JSON 文件（"-" 表示标准输入）
+    --stdin                    从标准输入读取 Playbook 文档
+    --target <spec,...>        显式覆盖目标节点列表（可重复指定）
+    --concurrency <n>          最大并发目标节点数
+    --timeout <duration>       Playbook 整体超时时长（如 5m）
+    --var <KEY=VALUE>          附加模板/步骤变量覆盖（可重复指定）
+    --scoped-root <dir>        ScopedRootFS 源目录根路径
+    --symlink-policy <policy>  软链策略：reject | contained_relative | follow_operator_source
+    --dialect <dialect>        默认启动方言：posix | powershell | cmd | raw
+    --interpreter <interp>     默认解释器：server | sh | bash | zsh | powershell | pwsh | cmd
+    --login <mode>             默认登录模式：disabled | login | inherit
+    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>             界面语言：zh | en
+    --json                     以规范 JSON/v2 输出执行报告
+    -h, --help                 显示此帮助信息
+
+cli.help.doctor: |
+  用法：
+    xops doctor [选项]
+
+  选项：
+    --scope <scope>       诊断范围：all（默认）| inventory | vault
+    --check-vault         校验已解锁凭据库中引用的机密是否存在
+    --check-keys          校验本地私钥文件指纹
+    --skip-vault-probe    凭据库诊断期间跳过逐条机密探测
+    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>        界面语言：zh | en
+    --json                以规范 JSON/v2 输出诊断报告
+    -h, --help            显示此帮助信息
+
+cli.help.audit: |
+  用法：
+    xops audit reconcile [--json]
+    xops audit list      [--limit N] [--phase <阶段>] [--outcome <终态>] [--node <id>] [--op-id <id>] [--trace-id <id>] [--json]
+    xops audit tail      [--limit N] [--phase <阶段>] [--outcome <终态>] [--node <id>] [--json]
+    xops audit inspect   <operation_id> [--json]
+
+  选项：
+    --limit <n>           返回审计记录最大条数（默认 50）
+    --phase <phase>       按阶段过滤：denied | authorized | finalized
+    --outcome <outcome>   按终态过滤：pending | denied | succeeded | failed | canceled | escalated | aborted_by_crash | outcome_unknown
+    --node <id>           按目标节点 ID 过滤
+    --op-id <id>          按 OperationID 过滤
+    --trace-id <id>       按 TraceID 过滤
+    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>        界面语言：zh | en
+    --json                以规范 JSON/v2 输出
+    -h, --help            显示此帮助信息
+
+cli.help.mcp: |
+  用法：
+    xops mcp [serve] [选项]
+
+  选项：
+    --transport <mode>         传输模式：stdio（默认）| http
+    --listen <addr>            HTTP 监听地址（--transport=http 时默认 127.0.0.1:8080）
+    --transfer-root <dir>      MCP 文件传输的 ScopedRootFS 沙箱根目录
+    --artifact-root <dir>      MCP 产物输出的 ScopedRootFS 沙箱根目录
+    --allow-non-loopback       允许在非回环网卡上绑定 HTTP 监听
+    --allowed-origin <origin>  允许的 HTTP Origin 请求头（可重复指定）
+    --allowed-host <host>      允许的 HTTP Host 请求头（可重复指定）
+    -F <configfile>            指定替代的 OpenSSH 配置文件
+    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>             界面语言：zh | en
+    -h, --help                 显示此帮助信息
+
+cli.help.tui: |
+  用法：
+    xops tui [选项]
+
+  选项：
+    --node <id>           初始聚焦的目标节点 ID
+    --refresh <duration>  指标与投影刷新周期（如 2s）
+    --no-alt-screen       禁用交替屏幕缓冲区
+    -F <configfile>       指定替代的 OpenSSH 配置文件
+    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
+    --lang <zh|en>        界面语言：zh | en
+    -h, --help            显示此帮助信息
