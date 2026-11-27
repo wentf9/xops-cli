@@ -480,7 +480,7 @@ func writeSPHelperJSONExit(resp spVaultHelperResp, code int) {
 }
 
 // spSetupExternalHelperVault 在隔离 xopsHome 下写入配置了 external_helper 凭据库的 config.yaml，
-// 并生成只读明文映射文件（以 Base64 落盘于独立临时目录），返回 (vaultFilePath, configYAMLPath)。
+// 并生成只读明文映射文件（以 Base64 落盘于独立临时目录），返回该映射文件路径 vaultFilePath。
 func spSetupExternalHelperVault(t *testing.T, xopsHome pathalg.LocalDir, secrets map[string]string) string {
 	t.Helper()
 	exe, err := os.Executable()

@@ -23,6 +23,7 @@ import (
 )
 
 type readStep struct {
+	onEnter    func()
 	waitCh     <-chan struct{}
 	data       []byte
 	err        error
@@ -41,6 +42,11 @@ type gatedStepReader struct {
 func (r *gatedStepReader) Read(p []byte) (int, error) {
 	for r.idx < len(r.steps) {
 		step := &r.steps[r.idx]
+		if step.onEnter != nil {
+			cb := step.onEnter
+			step.onEnter = nil
+			cb()
+		}
 		if step.waitCh != nil {
 			select {
 			case <-step.waitCh:
@@ -260,6 +266,7 @@ func TestEscalator_CrossStreamEOFOrdering_Deterministic(t *testing.T) {
 	t.Run("PTYMode_CombinedStdoutPromptReadyAndLargeOutput", testPTYModeCombinedStream)
 	t.Run("SecondaryPreReadyFlushedImmediatelyOnReadyWhileBlocked", testSecondaryPreReadyFlushedImmediatelyWhileBlocked)
 	t.Run("SecondaryPreReadyFlushedBeforePostReadyCancel", testSecondaryPreReadyFlushedBeforePostReadyCancel)
+	t.Run("SecondaryConcurrentReadyAndCancel_NoFIFOGap", testSecondaryConcurrentReadyAndCancelNoFIFOGap)
 }
 
 func testStdoutEOFBeforeStderrReady(t *testing.T) {
@@ -569,8 +576,8 @@ func testSecondaryPreReadyFlushedImmediatelyWhileBlocked(t *testing.T) {
 		out := &gatedStepReader{
 			closedCh: closedCh,
 			steps: []readStep{
-				{data: []byte("post-ready-started\n"), onReturned: func() { close(firstChunkRead) }},
-				{waitCh: releaseTail, data: []byte("tail-after-flush\n")},
+				{data: []byte("post-ready-started\n")},
+				{onEnter: func() { close(firstChunkRead) }, waitCh: releaseTail, data: []byte("tail-after-flush\n")},
 				{err: io.EOF},
 			},
 		}
@@ -640,8 +647,8 @@ func testSecondaryPreReadyFlushedBeforePostReadyCancel(t *testing.T) {
 		out := &gatedStepReader{
 			closedCh: closedCh,
 			steps: []readStep{
-				{data: []byte("post-ready-started\n"), onReturned: func() { close(firstChunkRead) }},
-				{waitCh: neverRelease, err: io.EOF},
+				{data: []byte("post-ready-started\n")},
+				{onEnter: func() { close(firstChunkRead) }, waitCh: neverRelease, err: io.EOF},
 			},
 		}
 		errR := &gatedStepReader{
@@ -693,5 +700,50 @@ func testSecondaryPreReadyFlushedBeforePostReadyCancel(t *testing.T) {
 	}
 	if outW.String() != "post-ready-started\n" {
 		t.Fatalf("首包内容失配: stdout=%q", outW.String())
+	}
+}
+
+// testSecondaryConcurrentReadyAndCancelNoFIFOGap 在端到端 RunPrivileged 中并发触发 readyTok、
+// 多分片次流 stdout 与外部 ctx 取消，验证任何调度序下 dst 恒为完整输出的前缀（零中段 FIFO 断层、零数据竞争）。
+func testSecondaryConcurrentReadyAndCancelNoFIFOGap(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	const fullStream = "chunk-1\nchunk-2\n"
+	firstHandedOff := make(chan struct{})
+	readyHandedOff := make(chan struct{})
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("chunk-1\n")},
+				{onEnter: func() { close(firstHandedOff) }, waitCh: readyHandedOff, data: []byte("chunk-2\n")},
+				{err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: firstHandedOff, data: []byte(readyTok)},
+				{onEnter: func() {
+					close(readyHandedOff)
+					cancel()
+				}, err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(79)})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "race-cancel"),
+	})
+	outW := newSignalMatchWriter("")
+	_, _ = esc.RunPrivileged(runCtx, &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{Stdout: outW})
+	got := outW.String()
+	if !strings.HasPrefix(fullStream, got) {
+		t.Fatalf("并发就绪与取消下出现中段 FIFO 断层: got=%q must be prefix of %q", got, fullStream)
 	}
 }

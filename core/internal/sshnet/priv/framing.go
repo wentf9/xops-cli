@@ -89,12 +89,15 @@ type streamScanner struct {
 
 	// 以下字段仅用于次流（isControl == false）的就绪前暂存与就绪时即时刷出：
 	//   - preMu 仅保护纯内存状态（preDone / preBuf），绝不在持锁期间执行 dst.Write 阻塞 I/O；
-	//   - preFlushed 在一次性暂存刷出或丢弃完成后关闭，经 happens-before 严格隔离 flusher 与次流协程对 dst/writeErr 的访问，
+	//   - preDiscarded 仅在 discardPreReadyIfPending 丢弃暂存字节时且关闭 preFlushed 前置位，
+	//     经 preFlushed 关闭建立的 happens-before 屏障保证次流在任何丢弃路径后永不向 dst 产生断层写入；
+	//   - preFlushed 在一次性暂存刷出或丢弃完成后关闭，严格隔离 flusher 与次流协程对 dst/writeErr 的访问，
 	//     保证精确 FIFO 顺序、零重复写入与零数据竞争；
-	//   - preLocalDone 仅由次流自身协程访问，用于就绪后的零锁快路径。
+	//   - preLocalDone 仅由次流自身协程访问，用于就绪且未丢弃后的零锁快路径。
 	preMu          sync.Mutex
 	preDone        bool
 	preBuf         []byte
+	preDiscarded   bool
 	preFlushedOnce sync.Once
 	preFlushed     chan struct{}
 	preLocalDone   bool
@@ -176,6 +179,10 @@ func (sc *streamScanner) feedSecondary(ctx context.Context, data []byte) error {
 		if err := sc.ensureSecondaryReady(ctx); err != nil {
 			return err
 		}
+		if sc.preDiscarded {
+			sc.state.recordDiag(data)
+			return nil
+		}
 		sc.writeToDst(data)
 		return nil
 	}
@@ -184,37 +191,44 @@ func (sc *streamScanner) feedSecondary(ctx context.Context, data []byte) error {
 
 func (sc *streamScanner) bufferSecondaryPreReady(ctx context.Context, data []byte) error {
 	sc.preMu.Lock()
-	if !sc.preDone {
-		if !sc.state.readyFlag.Load() {
-			sc.preBuf = append(sc.preBuf, data...)
-			needWait := len(sc.preBuf) >= maxPreReadyHoldBytes
-			sc.preMu.Unlock()
-			if !needWait {
-				return nil
-			}
-			if err := sc.waitPreReadyFlushed(ctx); err != nil {
-				return err
-			}
-			if sc.state.readyFlag.Load() {
-				sc.preLocalDone = true
-			}
+	if sc.preDone {
+		sc.preMu.Unlock()
+		return sc.deliverSecondaryAfterPreDone(ctx, data)
+	}
+	if !sc.state.readyFlag.Load() {
+		sc.preBuf = append(sc.preBuf, data...)
+		needWait := len(sc.preBuf) >= maxPreReadyHoldBytes
+		sc.preMu.Unlock()
+		if !needWait {
 			return nil
 		}
-		batch := sc.preBuf
-		sc.preBuf = nil
-		sc.preDone = true
-		sc.preMu.Unlock()
-		sc.completePreReadyWrite(batch)
-		sc.preLocalDone = true
-		sc.writeToDst(data)
-		return nil
+		return sc.waitPreReadyAndMarkLocal(ctx)
 	}
+	batch := sc.preBuf
+	sc.preBuf = nil
+	sc.preDone = true
 	sc.preMu.Unlock()
+	sc.completePreReadyWrite(batch)
+	sc.preLocalDone = true
+	sc.writeToDst(data)
+	return nil
+}
+
+func (sc *streamScanner) waitPreReadyAndMarkLocal(ctx context.Context) error {
 	if err := sc.waitPreReadyFlushed(ctx); err != nil {
 		return err
 	}
-	if sc.state.readyFlag.Load() {
+	if !sc.preDiscarded && sc.state.readyFlag.Load() {
 		sc.preLocalDone = true
+	}
+	return nil
+}
+
+func (sc *streamScanner) deliverSecondaryAfterPreDone(ctx context.Context, data []byte) error {
+	if err := sc.waitPreReadyAndMarkLocal(ctx); err != nil {
+		return err
+	}
+	if sc.preLocalDone {
 		sc.writeToDst(data)
 		return nil
 	}
@@ -223,20 +237,25 @@ func (sc *streamScanner) bufferSecondaryPreReady(ctx context.Context, data []byt
 }
 
 // runSecondaryReadyFlusher 监听主控流就绪/结束事件，在主控流触发 markReady() 后立即将次流暂存字节
-// 无锁刷出至 dst（绝不阻塞主控流，亦绝不在持锁态执行 I/O）。
+// 无锁刷出至 dst（绝不阻塞主控流，亦绝不在持锁态执行 I/O）；
+// 即使 controlDone 或 ctx.Done 与 readyCh 同时就绪，也优先以 readyFlag 为准避免误丢已就绪首包。
 func runSecondaryReadyFlusher(ctx context.Context, state *sharedHandshakeState, sec *streamScanner) {
 	select {
 	case <-state.readyCh:
 		sec.flushPreReadyIfPending()
 	case <-state.controlDone:
-		if state.readyFlag.Load() {
-			sec.flushPreReadyIfPending()
-		} else {
-			sec.discardPreReadyIfPending()
-		}
+		finishPreReadyByFlag(state, sec)
 	case <-ctx.Done():
-		sec.discardPreReadyIfPending()
+		finishPreReadyByFlag(state, sec)
 	}
+}
+
+func finishPreReadyByFlag(state *sharedHandshakeState, sec *streamScanner) {
+	if state.readyFlag.Load() {
+		sec.flushPreReadyIfPending()
+		return
+	}
+	sec.discardPreReadyIfPending()
 }
 
 func (sc *streamScanner) claimPreReady() (batch []byte, won bool) {
@@ -271,6 +290,7 @@ func (sc *streamScanner) flushPreReadyIfPending() {
 func (sc *streamScanner) discardPreReadyIfPending() {
 	if batch, won := sc.claimPreReady(); won {
 		defer sc.markPreFlushed()
+		sc.preDiscarded = true
 		sc.state.recordDiag(batch)
 	}
 }
@@ -284,7 +304,9 @@ func (sc *streamScanner) ensureSecondaryReady(ctx context.Context) error {
 	if err := sc.waitPreReadyFlushed(ctx); err != nil {
 		return err
 	}
-	sc.preLocalDone = true
+	if !sc.preDiscarded {
+		sc.preLocalDone = true
+	}
 	return nil
 }
 
@@ -356,7 +378,7 @@ func (sc *streamScanner) flushTailOnEOF(ctx context.Context) error {
 		if err := sc.waitPreReadyFlushed(ctx); err != nil {
 			return err
 		}
-		if sc.state.readyFlag.Load() {
+		if !sc.preDiscarded && sc.state.readyFlag.Load() {
 			sc.preLocalDone = true
 		}
 		return nil
