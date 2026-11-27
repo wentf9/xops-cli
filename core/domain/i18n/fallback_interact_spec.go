@@ -11,6 +11,8 @@ func fallbackInteract(id MessageID) string {
 		return "SSH Challenge"
 	case KeyInteractChallengeResponse:
 		return "Response:"
+	case KeyInteractChallengeBannerResponse:
+		return "{banner} | Response:"
 	case KeyInteractKeyPassphraseTitle:
 		return "Private Key Passphrase"
 	case KeyInteractKeyPassphraseBody:

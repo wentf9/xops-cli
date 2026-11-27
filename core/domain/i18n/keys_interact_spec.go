@@ -12,6 +12,8 @@ const (
 	KeyInteractSSHChallengeTitle MessageID = "interact.ssh_challenge.title"
 	// KeyInteractChallengeResponse 表示远端 SSH 质询文本为空时的默认应答提示正文。
 	KeyInteractChallengeResponse MessageID = "interact.ssh_challenge.response"
+	// KeyInteractChallengeBannerResponse 表示远端 SSH 质询含非空横幅但单题提示为空时的应答提示正文（含 banner 参数）。
+	KeyInteractChallengeBannerResponse MessageID = "interact.ssh_challenge.banner_response"
 
 	// KeyInteractKeyPassphraseTitle 表示加密私钥登记流程口令提示的标题。
 	KeyInteractKeyPassphraseTitle MessageID = "interact.enroll_key.title"
@@ -39,6 +41,7 @@ func interactKeys() []MessageID {
 		KeyInteractHostKeyBody,
 		KeyInteractSSHChallengeTitle,
 		KeyInteractChallengeResponse,
+		KeyInteractChallengeBannerResponse,
 		KeyInteractKeyPassphraseTitle,
 		KeyInteractKeyPassphraseBody,
 		KeyInteractPrivilegeTitle,

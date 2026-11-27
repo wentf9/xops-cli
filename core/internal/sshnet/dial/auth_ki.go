@@ -149,35 +149,41 @@ func (d *Dialer) planInteractiveKIQuestion(ctx context.Context, hop plan.HopSpec
 	if hop.Transport().BatchMode() || d.interaction == nil || !d.interaction.CanInteract() {
 		return kiQuestionPlan{}, fmt.Errorf("%w: 质询 %q 未命中可用自动规则且不可交互", ports.ErrAuthFailed, prompt)
 	}
-	displayPrompt := formatInteractiveKIPrompt(instruction, prompt)
 	if !echo {
-		req, err := newChallengeSecretPrompt(hop.Endpoint().String(), displayPrompt)
+		req, err := newChallengeSecretPrompt(hop.Endpoint().String(), instruction, prompt)
 		if err != nil {
 			return kiQuestionPlan{}, err
 		}
 		return kiQuestionPlan{action: kiActionPromptSecret, promptReq: req}, nil
 	}
-	reply, err := d.promptInteractiveText(ctx, hop.Endpoint().String(), displayPrompt)
+	reply, err := d.promptInteractiveText(ctx, hop.Endpoint().String(), instruction, prompt)
 	if err != nil {
 		return kiQuestionPlan{}, err
 	}
 	return kiQuestionPlan{action: kiActionLiteral, answer: reply}, nil
 }
 
-// formatInteractiveKIPrompt 构造面向 InteractionPort 的清洗后展示提示文案：
+// buildEmptyPromptChallengeBody 为远端 PAM 空提示构造结构化应答消息：
+//   - 横幅同为空时返回 KeyInteractChallengeResponse；
+//   - 横幅非空时返回携带脱敏有界 banner 参数的 KeyInteractChallengeBannerResponse，
+//     在非英文环境下保留远端横幅并本地化应答尾缀。
+func buildEmptyPromptChallengeBody(cleanInstr string) domi18n.Message {
+	if cleanInstr == "" {
+		return domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	}
+	budget := maxInteractivePromptBytes - len(domi18n.KeyInteractChallengeBannerResponse) - len(domi18n.CanonicalFallback(domi18n.KeyInteractChallengeBannerResponse))
+	banner := strings.TrimSpace(truncateUTF8Bytes(cleanInstr, budget))
+	if banner == "" {
+		return domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	}
+	return domi18n.NewMessage(domi18n.KeyInteractChallengeBannerResponse, domi18n.BoundStr("banner", banner))
+}
+
+// formatNonEmptyKIPrompt 构造携带非空远端 PAM 问题的脱敏展示文本：
 // 规则匹配仍保留完整 4 KiB pendingBanner，交互回退展示时先经 security.SanitizePromptText 脱敏，
-// 再按 UTF-8 字符边界截断至 <= 512 字节（优先完整保留问题正文），防止超长 MFA 横幅触发 ports.ErrInvalidArgument；
-// 当远端 instruction 与 prompt 脱敏后均为空时返回空串，交由调用方附带结构化默认应答提示。
-func formatInteractiveKIPrompt(instruction, prompt string) string {
-	cleanPrompt := strings.TrimSpace(security.SanitizePromptText(prompt))
-	cleanInstr := strings.TrimSpace(security.SanitizePromptText(instruction))
-	if cleanPrompt == "" && cleanInstr == "" {
-		return ""
-	}
-	if cleanPrompt == "" {
-		cleanPrompt = domi18n.NewMessage(domi18n.KeyInteractChallengeResponse).Canonical()
-	}
-	cleanPrompt = truncateUTF8Bytes(cleanPrompt, maxInteractivePromptBytes)
+// 再按 UTF-8 字符边界截断至 <= 512 字节（优先完整保留问题正文），防止超长 MFA 横幅触发 ports.ErrInvalidArgument。
+func formatNonEmptyKIPrompt(cleanInstr, cleanPrompt string) string {
+	cleanPrompt = strings.TrimSpace(truncateUTF8Bytes(cleanPrompt, maxInteractivePromptBytes))
 	if cleanInstr == "" {
 		return cleanPrompt
 	}
@@ -237,17 +243,22 @@ func (d *Dialer) planMatchedRuleKIQuestion(ctx context.Context, rule inventory.C
 	}
 }
 
-func buildChallengePromptParts(prompt string) (string, domi18n.Message, string, algebraic.Option[domi18n.Message]) {
+// buildChallengePromptParts 构造质询提示标题、清洗后正文与可选结构化消息：
+// 仅当远端 prompt 为空时附带 BodyMessage（无横幅用 KeyInteractChallengeResponse，有横幅用
+// KeyInteractChallengeBannerResponse）；远端 prompt 非空时保持 BodyMessage=None 原样透传远端 PAM 提示。
+func buildChallengePromptParts(instruction, prompt string) (string, domi18n.Message, string, algebraic.Option[domi18n.Message]) {
 	titleMsg := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
-	if strings.TrimSpace(prompt) == "" {
-		bodyMsg := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	cleanPrompt := strings.TrimSpace(security.SanitizePromptText(prompt))
+	cleanInstr := strings.TrimSpace(security.SanitizePromptText(instruction))
+	if cleanPrompt == "" {
+		bodyMsg := buildEmptyPromptChallengeBody(cleanInstr)
 		return titleMsg.Canonical(), titleMsg, bodyMsg.Canonical(), algebraic.Some(bodyMsg)
 	}
-	return titleMsg.Canonical(), titleMsg, prompt, algebraic.None[domi18n.Message]()
+	return titleMsg.Canonical(), titleMsg, formatNonEmptyKIPrompt(cleanInstr, cleanPrompt), algebraic.None[domi18n.Message]()
 }
 
-func newChallengeSecretPrompt(subject, prompt string) (ports.SecretPromptRequest, error) {
-	title, titleMsg, body, bodyMsg := buildChallengePromptParts(prompt)
+func newChallengeSecretPrompt(subject, instruction, prompt string) (ports.SecretPromptRequest, error) {
+	title, titleMsg, body, bodyMsg := buildChallengePromptParts(instruction, prompt)
 	return ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
 		Title:        title,
 		Prompt:       body,
@@ -258,8 +269,8 @@ func newChallengeSecretPrompt(subject, prompt string) (ports.SecretPromptRequest
 	})
 }
 
-func (d *Dialer) promptInteractiveText(ctx context.Context, subject, prompt string) (string, error) {
-	title, titleMsg, body, bodyMsg := buildChallengePromptParts(prompt)
+func (d *Dialer) promptInteractiveText(ctx context.Context, subject, instruction, prompt string) (string, error) {
+	title, titleMsg, body, bodyMsg := buildChallengePromptParts(instruction, prompt)
 	req, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
 		Title:        title,
 		Prompt:       body,

@@ -645,6 +645,98 @@ func TestPromptRequestStructuredMessagesAndFailClosed(t *testing.T) {
 	}
 
 	assertInvalidPromptMessagesRejected(t)
+	assertAdversarialPromptMessagesRejected(t)
+}
+
+func assertAdversarialPromptMessagesRejected(t *testing.T) {
+	t.Helper()
+	// 合法嵌套结构化消息（无控制字符且总字节预算受控）必须正常放行。
+	nestedChild := domi18n.NewMessageWithFallback(domi18n.MessageID("test.nested.child"), "{k}", domi18n.Str("k", "ok"))
+	nestedValid := domi18n.NewMessageWithFallback(domi18n.MessageID("test.nested.parent"), "Parent: {c}", domi18n.Msg("c", nestedChild))
+	if _, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
+		Title: "T", Prompt: "P", TitleMessage: algebraic.Some(nestedValid), BodyMessage: algebraic.Some(nestedValid),
+	}); err != nil {
+		t.Fatalf("合法嵌套结构化提示消息应通过校验，实际: %v", err)
+	}
+
+	assertControlCharPromptMessagesRejected(t)
+	assertNestedBudgetPromptMessagesRejected(t)
+}
+
+func assertControlCharPromptMessagesRejected(t *testing.T) {
+	t.Helper()
+	osc52Fallback := domi18n.NewMessageWithFallback(domi18n.MessageID("test.osc"), "\x1b]52;c;YQ==\x07ok")
+	hugeANSI := domi18n.NewMessageWithFallback(domi18n.MessageID("test.ansi"), strings.Repeat("\x1b[31m", 800)+"ok")
+	bidiFallback := domi18n.NewMessageWithFallback(domi18n.MessageID("test.bidi"), "Trust \u202ehost")
+	oscParam := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", "web\x1b]52;c;YQ==\x07"))
+	bidiDangling := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle, domi18n.BoundStr("extra", "safe\u202eoverride"))
+	trailingLF := domi18n.NewMessageWithFallback(domi18n.MessageID("test.lf"), "ok\n")
+	nestedBadLeaf := domi18n.NewMessageWithFallback(
+		domi18n.MessageID("test.nested.bad"), "",
+		domi18n.Msg("child", domi18n.NewMessageWithFallback(domi18n.MessageID("test.leaf"), "", domi18n.Str("v", "bad\u202e"))),
+	)
+	nestedBadFB := domi18n.NewMessageWithFallback(
+		domi18n.MessageID("test.nested.badfb"), "ok",
+		domi18n.Msg("child", domi18n.NewMessageWithFallback(domi18n.MessageID("test.leaf"), "\x1b[2Jclear")),
+	)
+
+	for i, msg := range []domi18n.Message{
+		osc52Fallback, hugeANSI, bidiFallback, oscParam, bidiDangling, trailingLF, nestedBadLeaf, nestedBadFB,
+	} {
+		if _, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "P", TitleMessage: algebraic.Some(msg)}); !errors.Is(err, ports.ErrInvalidArgument) {
+			t.Fatalf("含控制/Bidi 字符 TitleMessage #%d 应返回 ErrInvalidArgument，实际: %v", i, err)
+		}
+		if _, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Message: "M", Risk: security.RiskModerate, BodyMessage: algebraic.Some(msg)}); !errors.Is(err, ports.ErrInvalidArgument) {
+			t.Fatalf("含控制/Bidi 字符 BodyMessage #%d 应返回 ErrInvalidArgument，实际: %v", i, err)
+		}
+	}
+}
+
+func assertNestedBudgetPromptMessagesRejected(t *testing.T) {
+	t.Helper()
+	// 嵌套 ParamKindMessage 空 Fallback 绕过攻击：顶层 Canonical 极短，但子树叶子参数超限。
+	emptyFBTitleOverflow := domi18n.NewMessageWithFallback(
+		domi18n.MessageID("a.b"), "",
+		domi18n.Msg("c", domi18n.NewMessageWithFallback(domi18n.MessageID("c.d"), "", domi18n.Str("x", strings.Repeat("t", 130)))),
+	)
+	emptyFBBodyOverflow := domi18n.NewMessageWithFallback(
+		domi18n.MessageID("a.b"), "",
+		domi18n.Msg("c", domi18n.NewMessageWithFallback(domi18n.MessageID("c.d"), "", domi18n.Str("x", strings.Repeat("b", 520)))),
+	)
+	// 多层/多兄弟叶子参数累计超限（单叶虽未越界，但整棵嵌套树累加超过 512B）。
+	leaf1 := domi18n.NewMessageWithFallback(domi18n.MessageID("l.one"), "", domi18n.Str("a", strings.Repeat("x", 200)), domi18n.Str("b", strings.Repeat("y", 200)))
+	leaf2 := domi18n.NewMessageWithFallback(domi18n.MessageID("l.two"), "", domi18n.Str("c", strings.Repeat("z", 200)))
+	cumulativeOverflow := domi18n.NewMessageWithFallback(domi18n.MessageID("p.root"), "ok", domi18n.Msg("m1", leaf1), domi18n.Msg("m2", leaf2))
+	// 嵌套占位符放大攻击：子树节点自身原始字节虽小，但 Canonical 展开超限。
+	ampChild := domi18n.NewMessageWithFallback(domi18n.MessageID("a.amp"), strings.Repeat("{x}", 20), domi18n.Str("x", strings.Repeat("q", 30)))
+	ampParent := domi18n.NewMessageWithFallback(domi18n.MessageID("p.amp"), "", domi18n.Msg("c", ampChild))
+
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{"title_nested_empty_fb", func() error {
+			_, e := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "P", TitleMessage: algebraic.Some(emptyFBTitleOverflow)})
+			return e
+		}()},
+		{"body_nested_empty_fb", func() error {
+			_, e := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{Prompt: "P", BodyMessage: algebraic.Some(emptyFBBodyOverflow)})
+			return e
+		}()},
+		{"body_cumulative_tree", func() error {
+			_, e := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Message: "M", Risk: security.RiskModerate, BodyMessage: algebraic.Some(cumulativeOverflow)})
+			return e
+		}()},
+		{"body_nested_amplification", func() error {
+			_, e := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{Prompt: "P", BodyMessage: algebraic.Some(ampParent)})
+			return e
+		}()},
+	}
+	for _, tc := range cases {
+		if !errors.Is(tc.err, ports.ErrInvalidArgument) {
+			t.Fatalf("嵌套预算绕过用例 %s 应返回 ErrInvalidArgument，实际: %v", tc.name, tc.err)
+		}
+	}
 }
 
 func assertInvalidPromptMessagesRejected(t *testing.T) {

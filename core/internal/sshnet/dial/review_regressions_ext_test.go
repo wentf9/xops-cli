@@ -356,16 +356,21 @@ func testTruncatedCmdAndOTPUnescape(t *testing.T) {
 	}
 }
 
-// TestDialer_StructuredPromptMessages 验证主机密钥首次确认与 Keyboard-Interactive 质询均正确附带结构化 i18n.Message，
-// 且远端 PAM 非空提示保持 BodyMessage=None 仅对全空提示附带 KeyInteractChallengeResponse。
+// TestDialer_StructuredPromptMessages 验证主机密钥首次确认与 Keyboard-Interactive 质询均正确附带结构化 i18n.Message：
+//   - 远端 PAM 非空提示（无论有无 instruction）保持 BodyMessage=None 原样透传；
+//   - 远端 instruction 与 prompt 均为空时附带 KeyInteractChallengeResponse；
+//   - 远端 instruction 非空且 prompt 为空时附带 KeyInteractChallengeBannerResponse（保留脱敏有界横幅）。
 func TestDialer_StructuredPromptMessages(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	ctx := context.Background()
 	db, _ := newRealKnownHostsDB(t)
 	srv, srvPub := newLoopbackSSHSpec(t)
+	longEvilBanner := "PAM\x1b[31m\u202e" + strings.Repeat("横幅Banner-", 60)
 	srv.kiRounds = []kiRoundSpec{
 		{emptyName: true, instruction: "", questions: []string{"Remote OTP:", "   ", "Echo prompt:", ""}, echos: []bool{false, false, true, true}, expected: []string{"ans", "ans", "ans", "ans"}},
-		{emptyName: true, instruction: "Banner Only", questions: []string{""}, echos: []bool{false}, expected: []string{"ans"}},
+		{emptyName: true, instruction: "Banner Only", questions: []string{"", ""}, echos: []bool{false, true}, expected: []string{"ans", "ans"}},
+		{emptyName: true, instruction: "Banner And Prompt", questions: []string{"Real PAM Prompt:"}, echos: []bool{false}, expected: []string{"ans"}},
+		{emptyName: true, instruction: longEvilBanner, questions: []string{""}, echos: []bool{false}, expected: []string{"ans"}},
 	}
 	ep := tck.MustEndpoint(t, "prompt-i18n.example.test", 22)
 	inter := &spyInteraction{canInteract: true, allowConfirm: true, reply: "ans"}
@@ -416,11 +421,12 @@ func assertHostKeyConfirmMessage(t *testing.T, confirms []ports.ConfirmRequest, 
 
 func assertChallengeSecretMessages(t *testing.T, secrets []ports.SecretPromptRequest) {
 	t.Helper()
-	if len(secrets) != 3 {
-		t.Fatalf("期望 3 次机密质询提示，实际 %d", len(secrets))
+	if len(secrets) != 5 {
+		t.Fatalf("期望 5 次机密质询提示，实际 %d", len(secrets))
 	}
 	wantTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
 	wantResp := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	wantBannerResp := domi18n.NewMessage(domi18n.KeyInteractChallengeBannerResponse, domi18n.BoundStr("banner", "Banner Only"))
 	for i, req := range secrets {
 		if req.Title() != wantTitle.Canonical() {
 			t.Fatalf("机密质询 #%d 标题异常: title=%q", i, req.Title())
@@ -434,18 +440,40 @@ func assertChallengeSecretMessages(t *testing.T, secrets []ports.SecretPromptReq
 		t.Fatalf("纯空 PAM 机密提示正文异常: prompt=%q", secrets[1].Prompt())
 	}
 	assertOptMsgEq(t, "ki.secret.empty_body", secrets[1].BodyMessage(), wantResp)
-	if secrets[2].Prompt() != "Banner Only | Response:" || !secrets[2].BodyMessage().IsNone() {
-		t.Fatalf("含远端横幅与空问题提示须保持 BodyMessage=None 以保留横幅: prompt=%q", secrets[2].Prompt())
+	if secrets[2].Prompt() != "Banner Only | Response:" {
+		t.Fatalf("含远端横幅与空问题机密提示正文异常: prompt=%q", secrets[2].Prompt())
+	}
+	assertOptMsgEq(t, "ki.secret.banner_body", secrets[2].BodyMessage(), wantBannerResp)
+	if secrets[3].Prompt() != "Banner And Prompt | Real PAM Prompt:" || !secrets[3].BodyMessage().IsNone() {
+		t.Fatalf("同时含远端横幅与非空问题提示须保持 BodyMessage=None: prompt=%q", secrets[3].Prompt())
+	}
+	assertSanitizedLongBannerChallenge(t, secrets[4])
+}
+
+func assertSanitizedLongBannerChallenge(t *testing.T, req ports.SecretPromptRequest) {
+	t.Helper()
+	gotMsg, ok := req.BodyMessage().Get()
+	if !ok || gotMsg.ID() != domi18n.KeyInteractChallengeBannerResponse {
+		t.Fatalf("超长含转义横幅空提示应携带 KeyInteractChallengeBannerResponse，实际 ok=%v id=%q", ok, gotMsg.ID())
+	}
+	bannerParam, hasBanner := gotMsg.ParamByKey("banner")
+	bannerVal, isStr := bannerParam.StringVal()
+	if !hasBanner || !isStr || bannerVal == "" || !utf8.ValidString(bannerVal) || strings.ContainsAny(bannerVal, "\x1b\u202e") {
+		t.Fatalf("超长横幅 banner 参数未正确脱敏或非法: has=%v val=%q", hasBanner, bannerVal)
+	}
+	if req.Prompt() != gotMsg.Canonical() || len(req.Prompt()) > 512 {
+		t.Fatalf("超长横幅提示正文与 BodyMessage.Canonical 不一致或超长: len=%d prompt=%q", len(req.Prompt()), req.Prompt())
 	}
 }
 
 func assertChallengeTextMessages(t *testing.T, texts []ports.TextPromptRequest) {
 	t.Helper()
-	if len(texts) != 2 {
-		t.Fatalf("期望 2 次明文质询提示，实际 %d", len(texts))
+	if len(texts) != 3 {
+		t.Fatalf("期望 3 次明文质询提示，实际 %d", len(texts))
 	}
 	wantTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
 	wantResp := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	wantBannerResp := domi18n.NewMessage(domi18n.KeyInteractChallengeBannerResponse, domi18n.BoundStr("banner", "Banner Only"))
 	for i, req := range texts {
 		if req.Title() != wantTitle.Canonical() {
 			t.Fatalf("明文质询 #%d 标题异常: title=%q", i, req.Title())
@@ -459,4 +487,8 @@ func assertChallengeTextMessages(t *testing.T, texts []ports.TextPromptRequest) 
 		t.Fatalf("纯空 PAM 明文提示正文异常: prompt=%q", texts[1].Prompt())
 	}
 	assertOptMsgEq(t, "ki.text.empty_body", texts[1].BodyMessage(), wantResp)
+	if texts[2].Prompt() != "Banner Only | Response:" {
+		t.Fatalf("含远端横幅与空问题明文提示正文异常: prompt=%q", texts[2].Prompt())
+	}
+	assertOptMsgEq(t, "ki.text.banner_body", texts[2].BodyMessage(), wantBannerResp)
 }

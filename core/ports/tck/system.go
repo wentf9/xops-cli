@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"github.com/wentf9/xops-cli/core/conc"
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -436,5 +438,63 @@ func RunInteractionSuite(t *testing.T, fx InteractionFixture) {
 		})
 		requireNoErr(t, err, "PromptSecret")
 		requireTrue(t, matched, "PromptSecret 借出的 SecretBox 须与预期常量时间相等")
+	})
+	runInteractionStructuredSuite(t, fx, expectedSecret)
+}
+
+// runInteractionStructuredSuite 验证携带结构化 TitleMessage/BodyMessage 的 Confirm、PromptText 与 PromptSecret 契约。
+func runInteractionStructuredSuite(t *testing.T, fx InteractionFixture, expectedSecret string) {
+	t.Helper()
+	t.Run("StructuredMessagesConfirmAndText", func(t *testing.T) {
+		ctx := context.Background()
+		ui := fx.NewInteraction(t)
+		cTitle := domi18n.NewMessage(domi18n.KeyInteractMuxConfirmTitle)
+		cBody := domi18n.NewMessage(domi18n.KeyInteractMuxStartBody)
+		cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{
+			Title: cTitle.Canonical(), Message: cBody.Canonical(), Subject: "tck-node",
+			Risk: security.RiskModerate, TitleMessage: algebraic.Some(cTitle), BodyMessage: algebraic.Some(cBody),
+		})
+		requireNoErr(t, err, "NewConfirmRequest(structured)")
+		verdict, err := ui.Confirm(ctx, cReq)
+		requireNoErr(t, err, "Confirm(structured)")
+		requireTrue(t, verdict.IsValid(), "结构化 Confirm 必须返回有效 Verdict")
+		env := MustApprovalEnvelope(t, NewDeterministicEntropy(78))
+		wantDig, err := env.Digest()
+		requireNoErr(t, err, "ApprovalEnvelope.Digest(structured)")
+		resp, err := ui.PromptApproval(ctx, env)
+		requireNoErr(t, err, "PromptApproval(structured)")
+		requireTrue(t, resp.IsValid() && resp.EnvelopeDigest().Equal(wantDig), "结构化子测试审批响应摘要不匹配")
+		tTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+		tBody := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+		tReq, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
+			Title: tTitle.Canonical(), Prompt: tBody.Canonical(), Subject: "tck-node",
+			TitleMessage: algebraic.Some(tTitle), BodyMessage: algebraic.Some(tBody),
+		})
+		requireNoErr(t, err, "NewTextPromptRequest(structured)")
+		txt, err := ui.PromptText(ctx, tReq)
+		requireNoErr(t, err, "PromptText(structured)")
+		if fx.ExpectedText != "" {
+			requireTrue(t, txt == fx.ExpectedText, "结构化 PromptText 返回内容不匹配")
+		}
+	})
+	t.Run("StructuredMessagesPromptSecret", func(t *testing.T) {
+		ctx := context.Background()
+		ui := fx.NewInteraction(t)
+		sTitle := domi18n.NewMessage(domi18n.KeyInteractPrivilegeTitle)
+		sBody := domi18n.NewMessage(domi18n.KeyInteractPrivilegeBody, domi18n.BoundStr("method", "sudo"), domi18n.BoundStr("node", "tck-node"))
+		sReq, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+			Title: sTitle.Canonical(), Prompt: sBody.Canonical(), Subject: "tck-node",
+			TitleMessage: algebraic.Some(sTitle), BodyMessage: algebraic.Some(sBody),
+		})
+		requireNoErr(t, err, "NewSecretPromptRequest(structured)")
+		var matched bool
+		err = secret.WithBytes([]byte(expectedSecret), func(expected *secret.SecretBox) error {
+			return ui.PromptSecret(ctx, sReq, func(got *secret.SecretBox) error {
+				matched = got.IsValid() && got.Len() == expected.Len() && got.Equal(expected)
+				return nil
+			})
+		})
+		requireNoErr(t, err, "PromptSecret(structured)")
+		requireTrue(t, matched, "结构化 PromptSecret 借出的 SecretBox 须与预期常量时间相等")
 	})
 }

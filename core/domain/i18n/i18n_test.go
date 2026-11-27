@@ -413,6 +413,7 @@ func TestInteractCoreKeysAndCanonicalFallbacks(t *testing.T) {
 		{KeyInteractHostKeyBody, "Trust unknown SSH host key {algorithm} ({fingerprint}) for {endpoint}?"},
 		{KeyInteractSSHChallengeTitle, "SSH Challenge"},
 		{KeyInteractChallengeResponse, "Response:"},
+		{KeyInteractChallengeBannerResponse, "{banner} | Response:"},
 		{KeyInteractKeyPassphraseTitle, "Private Key Passphrase"},
 		{KeyInteractKeyPassphraseBody, "Enter passphrase for encrypted private key"},
 		{KeyInteractPrivilegeTitle, "Privilege Escalation"},
@@ -442,5 +443,9 @@ func TestInteractCoreKeysAndCanonicalFallbacks(t *testing.T) {
 	privMsg := NewMessage(KeyInteractPrivilegeBody, BoundStr("method", "sudo"), BoundStr("node", "web-01"))
 	if !privMsg.IsValid() || privMsg.Canonical() != "Enter sudo password for web-01" {
 		t.Fatalf("提权口令提示消息渲染异常: valid=%v text=%q", privMsg.IsValid(), privMsg.Canonical())
+	}
+	bannerMsg := NewMessage(KeyInteractChallengeBannerResponse, BoundStr("banner", "PAM MFA"))
+	if !bannerMsg.IsValid() || bannerMsg.Canonical() != "PAM MFA | Response:" {
+		t.Fatalf("带横幅 SSH 质询消息渲染异常: valid=%v text=%q", bannerMsg.IsValid(), bannerMsg.Canonical())
 	}
 }

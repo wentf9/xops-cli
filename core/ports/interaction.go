@@ -3,6 +3,7 @@ package ports
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
@@ -16,6 +17,9 @@ type promptCore struct {
 	allowEmpty, valid      bool
 }
 
+// validatePromptMessage 递归严格校验可选结构化提示消息：
+// 拒绝非法 UTF-8、任何控制/转义/Bidi 字符，并累计整棵嵌套消息树与规范渲染文本的字节预算，
+// 确保结构化消息在构造期即满足「构造即安全」不变量（零逃生口）。
 func validatePromptMessage(opt algebraic.Option[domi18n.Message], maxBytes int) error {
 	msg, ok := opt.Get()
 	if !ok {
@@ -24,15 +28,58 @@ func validatePromptMessage(opt algebraic.Option[domi18n.Message], maxBytes int) 
 	if !msg.IsValid() {
 		return fmt.Errorf("%w: 结构化提示消息无效", ErrInvalidArgument)
 	}
-	if _, err := sanitizeBoundedText(security.SanitizePromptText(msg.Canonical()), maxBytes, false, ErrInvalidArgument); err != nil {
-		return err
+	canon := msg.Canonical()
+	if len(canon) > maxBytes || hasForbiddenControl(canon) {
+		return fmt.Errorf("%w: 结构化提示消息规范文本超长或包含非法 UTF-8/控制/Bidi 字符", ErrInvalidArgument)
 	}
-	totalParamBytes := 0
+	if strings.TrimSpace(canon) == "" {
+		return fmt.Errorf("%w: 结构化提示消息规范文本不能为空", ErrInvalidArgument)
+	}
+	used := 0
+	return inspectPromptMessageTree(msg, 0, maxBytes, &used)
+}
+
+func inspectPromptMessageTree(msg domi18n.Message, depth uint8, maxBytes int, used *int) error {
+	if !msg.IsValid() || depth > domi18n.MaxMessageDepth {
+		return fmt.Errorf("%w: 结构化提示消息无效或嵌套超深", ErrInvalidArgument)
+	}
+	fb := msg.Fallback()
+	if hasForbiddenControl(fb) {
+		return fmt.Errorf("%w: 结构化提示消息模板包含非法 UTF-8/控制/Bidi 字符", ErrInvalidArgument)
+	}
+	if depth > 0 && len(msg.Canonical()) > maxBytes {
+		return fmt.Errorf("%w: 嵌套结构化提示消息规范文本超长", ErrInvalidArgument)
+	}
+	*used += len(msg.ID()) + len(fb)
+	if *used > maxBytes {
+		return fmt.Errorf("%w: 结构化提示消息字节预算超限", ErrInvalidArgument)
+	}
 	for _, p := range msg.Params() {
-		totalParamBytes += len(p.FormatCanonical())
-		if totalParamBytes > maxBytes {
-			return fmt.Errorf("%w: 结构化提示消息参数文本超长", ErrInvalidArgument)
+		if err := inspectPromptMessageParam(p, depth, maxBytes, used); err != nil {
+			return err
 		}
+	}
+	return nil
+}
+
+func inspectPromptMessageParam(p domi18n.Param, depth uint8, maxBytes int, used *int) error {
+	if !p.IsValid() {
+		return fmt.Errorf("%w: 结构化提示消息参数无效", ErrInvalidArgument)
+	}
+	if p.Kind() == domi18n.ParamKindMessage {
+		child, ok := p.MessageVal()
+		if !ok {
+			return fmt.Errorf("%w: 结构化提示消息嵌套子消息无效", ErrInvalidArgument)
+		}
+		return inspectPromptMessageTree(child, depth+1, maxBytes, used)
+	}
+	text := p.FormatCanonical()
+	if hasForbiddenControl(text) {
+		return fmt.Errorf("%w: 结构化提示消息参数包含非法 UTF-8/控制/Bidi 字符", ErrInvalidArgument)
+	}
+	*used += len(text)
+	if *used > maxBytes {
+		return fmt.Errorf("%w: 结构化提示消息参数文本超长", ErrInvalidArgument)
 	}
 	return nil
 }
@@ -76,7 +123,8 @@ type SecretPromptRequestSpec struct {
 //xops:failclosed
 type SecretPromptRequest struct{ core promptCore }
 
-// NewSecretPromptRequest 校验并脱敏提示文案与可选结构化消息后构造不可变 SecretPromptRequest。
+// NewSecretPromptRequest 校验并脱敏提示文案，并对可选结构化消息（TitleMessage/BodyMessage）
+// 递归严格拒绝非法控制/Bidi 字符与字节预算超限后构造不可变 SecretPromptRequest。
 func NewSecretPromptRequest(spec SecretPromptRequestSpec) (SecretPromptRequest, error) {
 	c, err := buildPromptCore(spec.Title, spec.Prompt, spec.Subject, spec.AllowEmpty, spec.TitleMessage, spec.BodyMessage)
 	return SecretPromptRequest{core: c}, err
@@ -114,7 +162,8 @@ type ConfirmRequest struct {
 	risk security.RiskLevel
 }
 
-// NewConfirmRequest 校验消息、风险等级与可选结构化消息后构造不可变 ConfirmRequest。
+// NewConfirmRequest 校验并脱敏确认文案与风险等级，并对可选结构化消息（TitleMessage/BodyMessage）
+// 递归严格拒绝非法控制/Bidi 字符与字节预算超限后构造不可变 ConfirmRequest。
 func NewConfirmRequest(spec ConfirmRequestSpec) (ConfirmRequest, error) {
 	if !spec.Risk.IsValid() {
 		return ConfirmRequest{}, fmt.Errorf("%w: ConfirmRequest 需要有效 RiskLevel", ErrInvalidArgument)
@@ -154,7 +203,8 @@ type TextPromptRequestSpec struct {
 //xops:failclosed
 type TextPromptRequest struct{ core promptCore }
 
-// NewTextPromptRequest 校验并脱敏提示文案与可选结构化消息后构造不可变 TextPromptRequest。
+// NewTextPromptRequest 校验并脱敏提示文案，并对可选结构化消息（TitleMessage/BodyMessage）
+// 递归严格拒绝非法控制/Bidi 字符与字节预算超限后构造不可变 TextPromptRequest。
 func NewTextPromptRequest(spec TextPromptRequestSpec) (TextPromptRequest, error) {
 	c, err := buildPromptCore(spec.Title, spec.Prompt, spec.Subject, spec.AllowEmpty, spec.TitleMessage, spec.BodyMessage)
 	return TextPromptRequest{core: c}, err

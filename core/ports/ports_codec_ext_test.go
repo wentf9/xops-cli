@@ -382,6 +382,38 @@ func TestInteractionPromptJSONCodecs(t *testing.T) {
 		t.Fatalf("NewTextPromptRequest(with msg) 失败: %v", err)
 	}
 	assertJSONRoundTrip(t, "TextPromptRequest(with messages)", treqMsg)
+	assertAdversarialInteractionPromptJSONRejected(t)
+}
+
+func assertAdversarialInteractionPromptJSONRejected(t *testing.T) {
+	t.Helper()
+	longTitleLeaf := strings.Repeat("t", 140)
+	longBodyLeaf := strings.Repeat("b", 530)
+
+	// 1. 嵌套空 Fallback 子消息携带超长叶子参数（JSON 反序列化路径必须拒绝并返回 ErrInvalidArgument）。
+	nestedTitleOverflow := `{"prompt":"Password:","title_message":{"id":"a.b","params":[{"key":"c","kind":"message","message":{"id":"c.d","params":[{"key":"x","kind":"string","str":"` + longTitleLeaf + `"}]}}]}}`
+	nestedBodyOverflow := `{"prompt":"Code:","body_message":{"id":"a.b","params":[{"key":"c","kind":"message","message":{"id":"c.d","params":[{"key":"x","kind":"string","str":"` + longBodyLeaf + `"}]}}]}}`
+	// 2. OSC 52 与 Bidi 覆写字符经 JSON 注入 TitleMessage/BodyMessage 模板或参数，必须拒绝。
+	oscTitleJSON := `{"prompt":"Password:","title_message":{"id":"a.osc","fallback":"\u001b]52;c;YQ==\u0007ok"}}`
+	bidiBodyJSON := `{"message":"Trust?","risk":"moderate","body_message":{"id":"a.bidi","fallback":"hello {x}","params":[{"key":"x","kind":"string","str":"bad\u202evalue"}]}}`
+
+	for name, raw := range map[string]string{
+		"secret_nested_title_overflow": nestedTitleOverflow,
+		"secret_osc_title":             oscTitleJSON,
+	} {
+		var dst ports.SecretPromptRequest
+		if err := jsonv2.Unmarshal([]byte(raw), &dst); !errors.Is(err, ports.ErrInvalidArgument) || dst.IsValid() {
+			t.Fatalf("%s 应返回 ErrInvalidArgument 且保持零值，实际 err=%v valid=%v", name, err, dst.IsValid())
+		}
+	}
+	var dstText ports.TextPromptRequest
+	if err := jsonv2.Unmarshal([]byte(nestedBodyOverflow), &dstText); !errors.Is(err, ports.ErrInvalidArgument) || dstText.IsValid() {
+		t.Fatalf("text_nested_body_overflow 应返回 ErrInvalidArgument 且保持零值，实际 err=%v valid=%v", err, dstText.IsValid())
+	}
+	var dstConf ports.ConfirmRequest
+	if err := jsonv2.Unmarshal([]byte(bidiBodyJSON), &dstConf); !errors.Is(err, ports.ErrInvalidArgument) || dstConf.IsValid() {
+		t.Fatalf("confirm_bidi_body 应返回 ErrInvalidArgument 且保持零值，实际 err=%v valid=%v", err, dstConf.IsValid())
+	}
 }
 
 // TestDownstreamPortJSONCodecs 验证 Phase 2.5/3/4 新增端口值对象的 json/v2 编解码与不变量。
