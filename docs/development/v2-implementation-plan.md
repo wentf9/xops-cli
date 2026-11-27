@@ -1,7 +1,7 @@
 # XOps v2 全新架构分阶段实施计划（Implementation Plan）
 
 > **关联架构宪法**：[XOps v2 全新架构定稿规范（Architecture RFC v2.3.3 校准终稿）](./v2-architecture-rfc.md)（ADR-001 – ADR-016）  
-> **计划状态**：Phase 0（`Gate G0-R2`）、Phase 1（`Gate G1`）、Phase 2（`P2-T1`–`P2-T6` + `Gate G2`）、Phase 2.5（`P2.5-T1`–`P2.5-T2` + `Gate G2.5` Walking Skeleton）、**Phase 3（`P3-T1`–`P3-T5` + `Gate G3`）与 Phase 4（`P4-T1`–`P4-T4` + `core/engine` 真实协议装配 + `Gate G4`）** 均已完成（`core/ports` 零漂移），可进入 **Phase 5（`P5-T1`–`P5-T4` + `Gate G5`）**（按 Gate G0/G0-R/G0-R2 → G1 → G2 → G2.5 → G3 ∥ G4 → G5 顺序严格过闸推进）  
+> **计划状态**：**Phase 0 – Phase 5 全量收口完成**——Phase 0（`Gate G0-R2`）、Phase 1（`Gate G1`）、Phase 2（`P2-T1`–`P2-T6` + `Gate G2`）、Phase 2.5（`P2.5-T1`–`P2.5-T2` + `Gate G2.5` Walking Skeleton）、Phase 3（`P3-T1`–`P3-T5` + `Gate G3`）、Phase 4（`P4-T1`–`P4-T4` + `core/engine` 真实协议装配 + `Gate G4`）与 **Phase 5（`P5-T1`–`P5-T4` + `Gate G5`）** 均已全量完成（`core/v1.0.0` 已在根 `go.mod` 锁定正式版本，三模块全量 `--gowork-off` 验证通过，`core/ports` 零漂移，Gate G0/G0-R/G0-R2 → G1 → G2 → G2.5 → G3 ∥ G4 → G5 全部过闸闭环）  
 > **执行铁律**：**Go 1.27+** · 全仓 3 个 `go.mod` 零 `replace`（`core/` 与 `tools/xopsvet/` 全程 `GOWORK=off`，根 CLI 开发期经 `go.work`，打 **`core/v1.0.0`** Tag 发布时三模块全量 `GOWORK=off`）· **先筑 `xopsvet` 护栏与四端统一 `verify.go` CI 再写业务代码** · **Gate G2 后即交付 Walking Skeleton 纵向真机闭环** · 严禁新旧双轨补丁
 
 ---
@@ -235,4 +235,4 @@ go run ./scripts/ci/verify.go --stage=dst
 - **Phase 2.5（Walking Skeleton 闭环，`Gate G2.5` 已通过并完成 Phase 3 ∥ Phase 4 端口冻结）**：`[x] P2.5-T1` · `[x] P2.5-T2` · **`[x] Gate G2.5`**
 - **Phase 3（全量用例服务、MCP 运行时与 `core/engine` 全量门面闭环，`Gate G3` 已通过且 `core/ports` 零漂移）**：`[x] P3-T1` · `[x] P3-T2` · `[x] P3-T3` · `[x] P3-T4` · `[x] P3-T5` · **`[x] Gate G3`**
 - **Phase 4（全量真实协议、本机宿主适配器、`core/engine` 真实默认装配与 Phase 5 就绪性闭环，`Gate G4` 已通过且 `core/ports` 零漂移）**：`[x] P4-T1` · `[x] P4-T2` · `[x] P4-T3` · `[x] P4-T4` · **`[x] Gate G4`**
-- **Phase 5**：`[ ] P5-T1` · `[ ] P5-T2` · `[ ] P5-T3` · `[ ] P5-T4` · **`[ ] Gate G5`**
+- **Phase 5（全量极薄入口、完整 `cmd/xops` 组合根、发布与文档收口，`core/v1.0.0` 已在根 `go.mod` 锁定且三模块 `--gowork-off` 与 `Gate G5` 已通过）**：`[x] P5-T1` · `[x] P5-T2` · `[x] P5-T3` · `[x] P5-T4` · **`[x] Gate G5`**
