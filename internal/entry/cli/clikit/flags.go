@@ -13,11 +13,13 @@ import (
 
 // CommonFlags 聚合所有命令统一支持的跨命令选项（--json / --policy / --lang / -F / -h）。
 type CommonFlags struct {
-	JSON       bool
-	Policy     engine.PolicyProfile
-	Locale     algebraic.Option[domi18n.Locale]
-	ConfigFile string
-	ShowHelp   bool
+	JSON bool
+	// JSONExplicit 记录当前词法域内是否显式指定了 `--json` / `--json=true|false`（None 表示未显式声明，便于跨层末次覆盖）。
+	JSONExplicit algebraic.Option[bool]
+	Policy       engine.PolicyProfile
+	Locale       algebraic.Option[domi18n.Locale]
+	ConfigFile   string
+	ShowHelp     bool
 }
 
 // FlagCursor 提供零全局状态的轻量命令行参数游标，支持长选项（--k v / --k=v）、短选项与 `--` 终止符。
@@ -92,11 +94,15 @@ func HasJSONFlag(args []string) bool {
 	return scanPreFlagsInto(args, nil).JSON
 }
 
-// MergeCommonFlags 将子命令前置通用标志 overlay 合并至基础标志 base（非零覆写、JSON 保留真值）。
+// MergeCommonFlags 将子命令前置通用标志 overlay 合并至基础标志 base（非零覆写；显式 --json=true/false 按末次覆盖生效）。
 func MergeCommonFlags(base, overlay CommonFlags) CommonFlags {
 	out := base
-	if overlay.JSON {
+	if v, ok := overlay.JSONExplicit.Get(); ok {
+		out.JSON = v
+		out.JSONExplicit = overlay.JSONExplicit
+	} else if overlay.JSON {
 		out.JSON = true
+		out.JSONExplicit = algebraic.Some(true)
 	}
 	if overlay.Policy.IsValid() {
 		out.Policy = overlay.Policy
@@ -173,7 +179,7 @@ func ParseGlobalPrefix(args []string) (CommonFlags, []string, error) {
 		}
 		consumed, err := consumeGlobalPrefixToken(cur, &cf)
 		if err != nil {
-			cf.JSON = cf.JSON || HasJSONFlag(args)
+			applyPreScannedJSON(&cf, args)
 			return cf, nil, err
 		}
 		if !consumed {
@@ -181,6 +187,14 @@ func ParseGlobalPrefix(args []string) (CommonFlags, []string, error) {
 		}
 	}
 	return cf, cur.Rest(), nil
+}
+
+func applyPreScannedJSON(cf *CommonFlags, args []string) {
+	pre := scanPreFlagsInto(args, nil)
+	if pre.JSONExplicit.IsSome() {
+		cf.JSON = pre.JSON
+		cf.JSONExplicit = pre.JSONExplicit
+	}
 }
 
 func consumeGlobalPrefixToken(cur *FlagCursor, cf *CommonFlags) (bool, error) {
@@ -225,6 +239,7 @@ func TryConsumeCommonLongFlag(cur *FlagCursor, cf *CommonFlags) (bool, error) {
 			return false, err
 		}
 		cf.JSON = v
+		cf.JSONExplicit = algebraic.Some(v)
 		return true, nil
 	case "policy":
 		return consumePolicyLongFlag(cur, cf, name, inlineVal, hasEq)

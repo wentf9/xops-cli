@@ -165,10 +165,11 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	rt.Localizer = a.catalog.For(effectiveLocale)
 	global, rest, err := clikit.ParseGlobalPrefix(args)
 	if err != nil {
-		return rt.Fail(clikit.ExitUsage, global.JSON, err)
+		return rt.Fail(clikit.ExitUsage, pre.JSON, err)
 	}
 	global.Locale = algebraic.Some(effectiveLocale)
 	rt.Global = global
+	rt.PreScannedJSON = algebraic.Some(pre.JSON)
 	if len(rest) == 0 {
 		writeRootHelp(a.stdout, rt.Loc())
 		return clikit.ExitOK

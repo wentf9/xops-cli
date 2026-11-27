@@ -173,6 +173,10 @@ type Runtime struct {
 	Global          CommonFlags
 	Catalog         *i18n.Catalog
 	Localizer       *i18n.Localizer
+	// PreScannedJSON 保存由 App.Run（或 PrepareSubcommand 直接回退路径）通过命令感知词法预扫描算出的
+	// 全命令行末次生效 `--json` 开关；为 Some 时跨全局/中置/子命令强制服从末次覆盖语义，
+	// 为 None 时回退为 Global.JSON || localJSON 以兼容直接构造 Runtime 的单元测试。
+	PreScannedJSON algebraic.Option[bool]
 }
 
 // EnsureLocalizer 返回可用的不可变 Localizer；作为纯渲染路径兜底辅助，当 loc 为 nil 或无效时从内置词库回退英文
@@ -205,15 +209,24 @@ func (r *Runtime) Loc() *i18n.Localizer {
 }
 
 // WithPrefix 返回浅拷贝的 Runtime，将多级命令前置通用标志（--json / --policy / --lang / -F / --ssh-config）
-// 合并至副本的 Global 字段并同步更新 Localizer（不修改原 Runtime）。
+// 合并至副本的 Global 字段（不修改原 Runtime）。
+// 当原 Runtime 已由 App.Run 经全命令行预扫描锁定权威最终语言（Global.Locale.IsSome() 且合法）时，
+// 严禁以二级子命令之前的中置 prefix.Locale 覆写 Global.Locale 或 Localizer；
+// 仅在 Global.Locale.IsNone()（如绕过 App.Run 直接调用子命令入口的单测）时回退应用 prefix.Locale 并同步 Localizer。
 func (r *Runtime) WithPrefix(prefix CommonFlags) *Runtime {
 	if r == nil {
 		return nil
 	}
 	cp := *r
 	cp.Global = MergeCommonFlags(r.Global, prefix)
-	if loc, ok := prefix.Locale.Get(); ok && loc.IsValid() && cp.Catalog != nil && cp.Catalog.IsValid() {
-		cp.Localizer = cp.Catalog.For(loc)
+	if baseLoc, ok := r.Global.Locale.Get(); ok && baseLoc.IsValid() {
+		cp.Global.Locale = algebraic.Some(baseLoc)
+		return &cp
+	}
+	if loc, ok := prefix.Locale.Get(); ok && loc.IsValid() {
+		if resolved := resolvePrefixLocalizer(cp.Catalog, loc); resolved != nil {
+			cp.Localizer = resolved
+		}
 	}
 	return &cp
 }
@@ -228,7 +241,7 @@ type SubcommandDispatch struct {
 }
 
 // PrepareSubcommand 在多级子命令入口统一消费前置通用标志并合并至副本 Runtime：
-//   - 前置标志报错时按命令感知 JSON 开关输出错误并返回 Handled=true；
+//   - 前置标志报错时按全命令行/命令感知末次 JSON 开关输出错误并返回 Handled=true；
 //   - 遇到 -h / --help / help 或无二级动作词时输出本地化帮助并返回 ExitOK 与 Handled=true；
 //   - 其余情况返回合并后的 Runtime、二级子命令词 Sub、剩余参数 Rest 与 Handled=false。
 func (r *Runtime) PrepareSubcommand(
@@ -239,11 +252,11 @@ func (r *Runtime) PrepareSubcommand(
 	prefix, rem, err := ConsumeSubcommandPrefix(args)
 	if err != nil {
 		return SubcommandDispatch{
-			ExitCode: r.Fail(ExitUsage, r.EffectiveJSON(prefix.JSON || HasJSONFlagForCommand(cmd, args)), err),
+			ExitCode: r.Fail(ExitUsage, r.effectiveJSONForCommand(cmd, args), err),
 			Handled:  true,
 		}
 	}
-	next := r.WithPrefix(prefix)
+	next := r.applySubcommandPrefix(cmd, args, prefix)
 	if prefix.ShowHelp || len(rem) == 0 || rem[0] == "help" {
 		if helpText != nil {
 			_, _ = io.WriteString(next.Stdout, helpText(next.Loc()))
@@ -283,8 +296,16 @@ func (r *Runtime) EffectiveInitOptions(localCfg string, localPolicy engine.Polic
 	}
 }
 
-// EffectiveJSON 返回全局与命令级 `--json` 标志的逻辑并集。
+// EffectiveJSON 计算当前命令的最终 `--json` 输出开关：
+// 若已通过全命令行预扫描确定末次生效结果（PreScannedJSON.IsSome()），直接采用该权威值以保证
+// 跨全局/中置/子命令的 `--json` 与 `--json=false` 严格服从末次覆盖；否则回退为 Global.JSON || localJSON。
 func (r *Runtime) EffectiveJSON(localJSON bool) bool {
+	if r == nil {
+		return localJSON
+	}
+	if v, ok := r.PreScannedJSON.Get(); ok {
+		return v
+	}
 	return r.Global.JSON || localJSON
 }
 

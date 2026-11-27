@@ -16,6 +16,7 @@ import (
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/entry/cli"
 	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/entry/cli/cmdasset"
 	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
@@ -290,6 +291,148 @@ func TestApp_ChineseNestedFieldLabelsZeroEnglishLeak(t *testing.T) {
 			}
 			if strings.Contains(got, tc.forbidEng) {
 				t.Fatalf("args=%v 中文报错不得泄露英文短语 %q，实际=%q", tc.args, tc.forbidEng, got)
+			}
+		})
+	}
+}
+
+func TestApp_MultiLevelSubcommandLastWinsLocaleAndJSON(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	assertMultiLevelLastWinsHelp(t, cat)
+	assertMultiLevelLastWinsRuntimeAndDirectFallback(t, cat)
+	assertMultiLevelLastWinsJSONOverride(t, cat)
+}
+
+func assertMultiLevelLastWinsHelp(t *testing.T, cat *i18n.Catalog) {
+	t.Helper()
+	cases := []struct {
+		name   string
+		args   []string
+		want   string
+		forbid string
+	}{
+		{"hosts_en_then_zh", []string{"hosts", "--lang", "en", "list", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"hosts_zh_then_en", []string{"hosts", "--lang", "zh", "list", "--lang", "en", "--help"}, "Usage:", "用法："},
+		{"sftp_en_then_zh", []string{"sftp", "--lang", "en", "ls", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"mcp_en_then_zh", []string{"mcp", "--lang", "en", "serve", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"playbook_en_then_zh", []string{"playbook", "--lang", "en", "run", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"tunnel_en_then_zh", []string{"tunnel", "--lang", "en", "local", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"creds_en_then_zh", []string{"creds", "--lang", "en", "status", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"config_en_then_zh", []string{"config", "--lang", "en", "formats", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"audit_en_then_zh", []string{"audit", "--lang", "en", "list", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+		{"mux_en_then_zh", []string{"mux", "--lang", "en", "check", "--lang", "zh", "--help"}, "用法：", "Usage:"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+			code := h.app.Run(context.Background(), tc.args)
+			if code != clikit.ExitOK || h.factoryCalls != 0 {
+				t.Fatalf("args=%v 期望 ExitOK 且零触盘: code=%d calls=%d err=%q", tc.args, code, h.factoryCalls, h.stderr.String())
+			}
+			got := h.stdout.String()
+			if !strings.Contains(got, tc.want) || strings.Contains(got, tc.forbid) {
+				t.Fatalf("args=%v 帮助语言不符合末次覆盖: want=%q forbid=%q got=%q", tc.args, tc.want, tc.forbid, got)
+			}
+		})
+	}
+}
+
+func assertMultiLevelLastWinsRuntimeAndDirectFallback(t *testing.T, cat *i18n.Catalog) {
+	t.Helper()
+	// 1. 运行期语法错误必须按后置 --lang 渲染对应语言诊断，证实 rt.Loc() 与 rt.EffectiveLocale() 同样服从末次覆盖。
+	hBadZh := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+	code := hBadZh.app.Run(context.Background(), []string{"hosts", "--lang", "en", "list", "--lang", "zh", "--badflag"})
+	if code != clikit.ExitUsage || hBadZh.stdout.Len() != 0 ||
+		!strings.Contains(hBadZh.stderr.String(), "选项 --badflag 缺少参数值") ||
+		strings.Contains(hBadZh.stderr.String(), "requires a value") {
+		t.Fatalf("hosts --lang en list --lang zh --badflag 应输出中文用法错误: code=%d out=%q err=%q",
+			code, hBadZh.stdout.String(), hBadZh.stderr.String())
+	}
+	hBadEn := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+	codeEn := hBadEn.app.Run(context.Background(), []string{"hosts", "--lang", "zh", "list", "--lang", "en", "--badflag"})
+	if codeEn != clikit.ExitUsage || hBadEn.stdout.Len() != 0 ||
+		!strings.Contains(hBadEn.stderr.String(), "requires a value") ||
+		strings.Contains(hBadEn.stderr.String(), "缺少参数值") {
+		t.Fatalf("hosts --lang zh list --lang en --badflag 应输出英文用法错误: code=%d out=%q err=%q",
+			codeEn, hBadEn.stdout.String(), hBadEn.stderr.String())
+	}
+
+	// 2. 实际执行命令时透传给 EngineFactory 的 InitOptions.Locale 也必须服从后置 --lang 末次覆盖。
+	hZhExec := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+	if c := hZhExec.app.Run(context.Background(), []string{"hosts", "--lang", "en", "list", "--lang", "zh"}); c != clikit.ExitOK || hZhExec.lastInitOpts.Locale != domi18n.LocaleZh {
+		t.Fatalf("hosts --lang en list --lang zh 应透传 LocaleZh: code=%d loc=%s err=%q", c, hZhExec.lastInitOpts.Locale, hZhExec.stderr.String())
+	}
+	hEnExec := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+	if c := hEnExec.app.Run(context.Background(), []string{"hosts", "--lang", "zh", "list", "--lang", "en"}); c != clikit.ExitOK || hEnExec.lastInitOpts.Locale != domi18n.LocaleEn {
+		t.Fatalf("hosts --lang zh list --lang en 应透传 LocaleEn: code=%d loc=%s err=%q", c, hEnExec.lastInitOpts.Locale, hEnExec.stderr.String())
+	}
+
+	// 3. 绕过 App.Run 直接调用 RunHosts（rt.Global.Locale == None）时，前置 `--lang zh --help` 仍须回退生效输出中文帮助。
+	for _, withCatalog := range []bool{true, false} {
+		var out, errBuf bytes.Buffer
+		rt := &clikit.Runtime{Stdout: &out, Stderr: &errBuf}
+		if withCatalog {
+			rt.Catalog = cat
+			rt.Localizer = cat.For(domi18n.LocaleEn)
+		}
+		if c := cmdasset.RunHosts(context.Background(), rt, []string{"--lang", "zh", "--help"}); c != clikit.ExitOK || !strings.Contains(out.String(), "用法：") {
+			t.Fatalf("直接调用 RunHosts(withCatalog=%v) --lang zh --help 应回退输出中文帮助: code=%d out=%q err=%q",
+				withCatalog, c, out.String(), errBuf.String())
+		}
+	}
+}
+
+func assertMultiLevelLastWinsJSONOverride(t *testing.T, cat *i18n.Catalog) {
+	t.Helper()
+	// 1. hosts --json list --json=false --badflag 必须按末次 --json=false 输出纯文本 stderr，禁止 JSON stdout。
+	hTextErr := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+	if c := hTextErr.app.Run(context.Background(), []string{"hosts", "--json", "list", "--json=false", "--badflag"}); c != clikit.ExitUsage || hTextErr.stdout.Len() != 0 || strings.TrimSpace(hTextErr.stderr.String()) == "" {
+		t.Fatalf("hosts --json list --json=false --badflag 应输出纯文本错误: code=%d out=%q err=%q",
+			c, hTextErr.stdout.String(), hTextErr.stderr.String())
+	}
+
+	// 2. hosts --json list --badflag 未传 --json=false 时必须继承前置 --json 输出规范 JSON ErrorEnvelope。
+	hJSONErr := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+	if c := hJSONErr.app.Run(context.Background(), []string{"hosts", "--json", "list", "--badflag"}); c != clikit.ExitUsage {
+		t.Fatalf("hosts --json list --badflag 期望 ExitUsage，实际=%d", c)
+	}
+	var env clikit.ErrorEnvelope
+	if err := jsonv2.Unmarshal(hJSONErr.stdout.Bytes(), &env); err != nil || env.OK || env.ErrorCode != "usage_error" {
+		t.Fatalf("hosts --json list --badflag 应输出 JSON ErrorEnvelope: err=%v out=%q", err, hJSONErr.stdout.String())
+	}
+
+	// 3. 全局 --json 在子命令未显式关闭时仍输出 JSON；显式 --json=false 覆盖回纯文本；再次 --json 恢复 JSON。
+	assertJSONExecMatrix(t, cat)
+}
+
+func assertJSONExecMatrix(t *testing.T, cat *i18n.Catalog) {
+	t.Helper()
+	cases := []struct {
+		name     string
+		args     []string
+		wantJSON bool
+	}{
+		{"global_json_inherited", []string{"--json", "hosts", "list"}, true},
+		{"global_json_overridden_false", []string{"--json", "hosts", "list", "--json=false"}, false},
+		{"mid_json_overridden_false", []string{"hosts", "--json", "list", "--json=false"}, false},
+		{"global_mid_false_trailing_true", []string{"--json", "hosts", "--json=false", "list", "--json"}, true},
+		{"global_json_ssh_remote_false_ignored", []string{"--json", "ssh", "web", "echo", "--json=false"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newFullAppHarness(t, func(cfg *cli.AppConfig) { cfg.Catalog = cat }, nil)
+			if c := h.app.Run(context.Background(), tc.args); c != clikit.ExitOK {
+				t.Fatalf("args=%v 执行失败: code=%d err=%q", tc.args, c, h.stderr.String())
+			}
+			var decoded map[string]any
+			isJSON := jsonv2.Unmarshal(h.stdout.Bytes(), &decoded) == nil
+			if isJSON != tc.wantJSON {
+				t.Fatalf("args=%v JSON 模式不符: wantJSON=%v gotJSON=%v out=%q", tc.args, tc.wantJSON, isJSON, h.stdout.String())
 			}
 		})
 	}

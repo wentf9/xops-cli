@@ -388,3 +388,72 @@ func TestConsumeSubcommandPrefixAndWithPrefix(t *testing.T) {
 		t.Fatalf("WithPrefix 不得修改原 Runtime")
 	}
 }
+
+func TestWithPrefix_PreservesAuthoritativeLocaleAndLastWinsJSON(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	// 1. 当 Runtime.Global.Locale 已由 App.Run 锁定（IsSome），中置 prefix.Locale 严禁覆盖语言或 Localizer。
+	authRT := &clikit.Runtime{
+		Catalog:   cat,
+		Localizer: cat.For(domi18n.LocaleZh),
+		Global:    clikit.CommonFlags{Locale: algebraic.Some(domi18n.LocaleZh)},
+	}
+	enPrefix, _, err := clikit.ConsumeSubcommandPrefix([]string{"--lang", "en", "list"})
+	if err != nil {
+		t.Fatalf("ConsumeSubcommandPrefix 失败: %v", err)
+	}
+	kept := authRT.WithPrefix(enPrefix)
+	if kept.EffectiveLocale() != domi18n.LocaleZh || kept.Loc().Locale() != domi18n.LocaleZh ||
+		kept.Global.Locale.OrElse(domi18n.LocaleInvalid) != domi18n.LocaleZh {
+		t.Fatalf("Global.Locale 已锁定时 WithPrefix 不得被中置 --lang 覆写: locale=%s loc=%s global=%v",
+			kept.EffectiveLocale(), kept.Loc().Locale(), kept.Global.Locale)
+	}
+
+	// 2. 绕过 App.Run（Global.Locale=None）时，即使 Catalog 为 nil 也能回退应用 prefix.Locale。
+	noCatRT := &clikit.Runtime{}
+	zhPrefix, _, err := clikit.ConsumeSubcommandPrefix([]string{"--lang", "zh", "--help"})
+	if err != nil {
+		t.Fatalf("ConsumeSubcommandPrefix 失败: %v", err)
+	}
+	applied := noCatRT.WithPrefix(zhPrefix)
+	if applied.EffectiveLocale() != domi18n.LocaleZh || applied.Loc().Locale() != domi18n.LocaleZh {
+		t.Fatalf("Global.Locale 为 None 时 WithPrefix 应回退生效 prefix.Locale: eff=%s loc=%s",
+			applied.EffectiveLocale(), applied.Loc().Locale())
+	}
+
+	// 3. MergeCommonFlags 与 EffectiveJSON 对显式 --json=false 服从末次覆盖，同时未指定时继承前置 --json。
+	assertMergeAndEffectiveJSON(t)
+}
+
+func assertMergeAndEffectiveJSON(t *testing.T) {
+	t.Helper()
+	base := clikit.CommonFlags{JSON: true, JSONExplicit: algebraic.Some(true)}
+	if m := clikit.MergeCommonFlags(base, clikit.CommonFlags{}); !m.JSON || !m.JSONExplicit.OrElse(false) {
+		t.Fatalf("空 overlay 应继承 base.JSON=true: %+v", m)
+	}
+	offOverlay := clikit.CommonFlags{JSON: false, JSONExplicit: algebraic.Some(false)}
+	if m := clikit.MergeCommonFlags(base, offOverlay); m.JSON || m.JSONExplicit.OrElse(true) {
+		t.Fatalf("显式 --json=false 应覆写 base.JSON=true: %+v", m)
+	}
+
+	rtOff := &clikit.Runtime{Global: base, PreScannedJSON: algebraic.Some(false)}
+	if rtOff.EffectiveJSON(true) {
+		t.Fatalf("PreScannedJSON=Some(false) 应覆写 Global.JSON 与 localJSON")
+	}
+	rtFallback := &clikit.Runtime{Global: clikit.CommonFlags{JSON: true}}
+	if !rtFallback.EffectiveJSON(false) {
+		t.Fatalf("PreScannedJSON=None 时应回退保留 Global.JSON=true")
+	}
+
+	var out, errBuf bytes.Buffer
+	directRT := &clikit.Runtime{Stdout: &out, Stderr: &errBuf}
+	d := directRT.PrepareSubcommand("hosts", []string{"--lang", "en", "--json", "list", "--lang", "zh", "--json=false"}, nil)
+	if d.Handled || d.Sub != "list" || d.RT.EffectiveLocale() != domi18n.LocaleZh || d.RT.EffectiveJSON(false) {
+		t.Fatalf("PrepareSubcommand 直接调用应保留完整参数末次覆盖语义: sub=%q loc=%s json=%v",
+			d.Sub, d.RT.EffectiveLocale(), d.RT.EffectiveJSON(false))
+	}
+}

@@ -10,8 +10,9 @@ import (
 
 // PreScanResult 保存统一词法预扫描识别出的语言覆盖与 CLI `--json` 输出开关。
 type PreScanResult struct {
-	Locale algebraic.Option[domi18n.Locale]
-	JSON   bool
+	Locale       algebraic.Option[domi18n.Locale]
+	JSON         bool
+	JSONExplicit algebraic.Option[bool]
 }
 
 // ScanPreFlags 以统一的命令与选项语法感知状态机预扫描命令行中的 `--lang` 与 `--json`（末次覆盖语义）：
@@ -59,6 +60,48 @@ func HasJSONFlagForCommand(cmd string, args []string) bool {
 	return res.JSON
 }
 
+func resolvePrefixLocalizer(cat *i18n.Catalog, loc domi18n.Locale) *i18n.Localizer {
+	if cat != nil {
+		if cat.IsValid() {
+			return cat.For(loc)
+		}
+		return nil
+	}
+	if loaded, err := i18n.LoadCatalog(); err == nil && loaded.IsValid() {
+		return loaded.For(loc)
+	}
+	return nil
+}
+
+func (r *Runtime) applySubcommandPrefix(cmd string, args []string, prefix CommonFlags) *Runtime {
+	var subPre PreScanResult
+	if r != nil && (!r.Global.Locale.IsSome() || r.PreScannedJSON.IsNone()) {
+		scanSubcommandPreInto(cmd, args, &subPre, nil)
+		if !r.Global.Locale.IsSome() && subPre.Locale.IsSome() {
+			prefix.Locale = subPre.Locale
+		}
+	}
+	next := r.WithPrefix(prefix)
+	if next != nil && next.PreScannedJSON.IsNone() && subPre.JSONExplicit.IsSome() {
+		next.PreScannedJSON = subPre.JSONExplicit
+	}
+	return next
+}
+
+func (r *Runtime) effectiveJSONForCommand(cmd string, args []string) bool {
+	if r != nil {
+		if v, ok := r.PreScannedJSON.Get(); ok {
+			return v
+		}
+	}
+	var subPre PreScanResult
+	scanSubcommandPreInto(cmd, args, &subPre, nil)
+	if v, ok := subPre.JSONExplicit.Get(); ok {
+		return v
+	}
+	return r.EffectiveJSON(false)
+}
+
 func scanSubcommandPreInto(cmd string, args []string, res *PreScanResult, firstErr *error) {
 	if cmd == "ssh" || cmd == "exec" {
 		scanSSHOrExecPre(args, cmd, res, firstErr)
@@ -92,7 +135,7 @@ func consumePrefixPreToken(args []string, idx int, res *PreScanResult, firstErr 
 			return parseLangOptionAt(args, idx, inlineVal, hasEq, &res.Locale, firstErr)
 		}
 		if name == "json" {
-			applyJSONFlagToken(inlineVal, hasEq, &res.JSON)
+			applyJSONFlagToken(inlineVal, hasEq, res)
 			return 0
 		}
 		if !hasEq && (name == "policy" || name == "ssh-config") {
@@ -143,7 +186,7 @@ func consumeSubcommandLongToken(args []string, idx int, cmd string, res *PreScan
 		return parseLangOptionAt(args, idx, inlineVal, hasEq, &res.Locale, firstErr)
 	}
 	if name == "json" {
-		applyJSONFlagToken(inlineVal, hasEq, &res.JSON)
+		applyJSONFlagToken(inlineVal, hasEq, res)
 		return 0
 	}
 	if !hasEq && isValueTakingLongFlag(cmd, name) {
@@ -152,16 +195,19 @@ func consumeSubcommandLongToken(args []string, idx int, cmd string, res *PreScan
 	return 0
 }
 
-func applyJSONFlagToken(inlineVal string, hasEq bool, dst *bool) {
+func applyJSONFlagToken(inlineVal string, hasEq bool, res *PreScanResult) {
 	if !hasEq {
-		*dst = true
+		res.JSON = true
+		res.JSONExplicit = algebraic.Some(true)
 		return
 	}
 	switch strings.ToLower(strings.TrimSpace(inlineVal)) {
 	case "true", "1", "t", "yes":
-		*dst = true
+		res.JSON = true
+		res.JSONExplicit = algebraic.Some(true)
 	case "false", "0", "f", "no":
-		*dst = false
+		res.JSON = false
+		res.JSONExplicit = algebraic.Some(false)
 	}
 }
 
