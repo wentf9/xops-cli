@@ -258,6 +258,8 @@ func TestEscalator_CrossStreamEOFOrdering_Deterministic(t *testing.T) {
 	t.Run("StdoutPausedAtHoldThreshold_HandshakeTimeoutUnblocks", testPausedStdoutTimeoutUnblocks)
 	t.Run("PlanKindScript_StdinAfterReadyAndStdoutRace", testScriptStdinOrderAndStdoutRace)
 	t.Run("PTYMode_CombinedStdoutPromptReadyAndLargeOutput", testPTYModeCombinedStream)
+	t.Run("SecondaryPreReadyFlushedImmediatelyOnReadyWhileBlocked", testSecondaryPreReadyFlushedImmediatelyWhileBlocked)
+	t.Run("SecondaryPreReadyFlushedBeforePostReadyCancel", testSecondaryPreReadyFlushedBeforePostReadyCancel)
 }
 
 func testStdoutEOFBeforeStderrReady(t *testing.T) {
@@ -524,5 +526,172 @@ func testPTYModeCombinedStream(t *testing.T) {
 	}
 	if !bytes.Equal(stdout.Bytes(), large) {
 		t.Fatalf("PTY 模式合并流大输出不完整: got=%d want=%d", stdout.Len(), len(large))
+	}
+}
+
+type signalMatchWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	substr string
+	once   sync.Once
+	hitCh  chan struct{}
+}
+
+func newSignalMatchWriter(substr string) *signalMatchWriter {
+	return &signalMatchWriter{substr: substr, hitCh: make(chan struct{})}
+}
+
+func (w *signalMatchWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.buf.Write(p)
+	if w.substr != "" && strings.Contains(w.buf.String(), w.substr) {
+		w.once.Do(func() { close(w.hitCh) })
+	}
+	w.mu.Unlock()
+	return n, err
+}
+
+func (w *signalMatchWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// testSecondaryPreReadyFlushedImmediatelyWhileBlocked 确定性复现次流（stdout）先于主控流（stderr）readyTok
+// 抵达少量字节（< maxPreReadyHoldBytes）随后管道阻塞的场景：验证 markReady() 立即刷出暂存字节、
+// 零永久滞留，且与后续 stdout 字节维持严格 FIFO 顺序与零重复写入。
+func testSecondaryPreReadyFlushedImmediatelyWhileBlocked(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	firstChunkRead := make(chan struct{})
+	releaseTail := make(chan struct{})
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("post-ready-started\n"), onReturned: func() { close(firstChunkRead) }},
+				{waitCh: releaseTail, data: []byte("tail-after-flush\n")},
+				{err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: firstChunkRead, data: []byte(readyTok)},
+				{waitCh: releaseTail, data: []byte("err-after-flush\n")},
+				{err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, err := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(77)})
+	if err != nil {
+		t.Fatalf("NewEscalator: %v", err)
+	}
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "long-op"),
+	})
+	outW := newSignalMatchWriter("post-ready-started\n")
+	var errBuf bytes.Buffer
+	var runOut execution.ExecutionOutcome
+	var runErr error
+
+	waitErr := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error {
+			runOut, runErr = esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{
+				Stdout: outW,
+				Stderr: &errBuf,
+			})
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		tm := time.NewTimer(5 * time.Second)
+		defer tm.Stop()
+		select {
+		case <-outW.hitCh:
+			close(releaseTail)
+			return nil
+		case <-tm.C:
+			_ = sess.Close()
+			return context.DeadlineExceeded
+		}
+	})
+	if waitErr != nil || runErr != nil {
+		t.Fatalf("markReady 须立即刷出次流暂存首包: waitErr=%v runErr=%v stdout=%q", waitErr, runErr, outW.String())
+	}
+	if comp, ok := runOut.(*execution.OutcomeCompleted); !ok || !comp.Succeeded() {
+		t.Fatalf("期望成功 OutcomeCompleted，实际 %#v", runOut)
+	}
+	if outW.String() != "post-ready-started\ntail-after-flush\n" || errBuf.String() != "err-after-flush\n" {
+		t.Fatalf("即时刷出后 FIFO 顺序或内容失配: stdout=%q stderr=%q", outW.String(), errBuf.String())
+	}
+}
+
+// testSecondaryPreReadyFlushedBeforePostReadyCancel 确定性验证次流首包在 markReady() 后立即刷出并触发
+// 外部 ctx 取消时，RunPrivileged 返回不可重试的 *execution.OutcomeUnknown 且零协程泄漏。
+func testSecondaryPreReadyFlushedBeforePostReadyCancel(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	firstChunkRead := make(chan struct{})
+	neverRelease := make(chan struct{})
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("post-ready-started\n"), onReturned: func() { close(firstChunkRead) }},
+				{waitCh: neverRelease, err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: firstChunkRead, data: []byte(readyTok)},
+				{waitCh: neverRelease, err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(78)})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "hang-op"),
+	})
+	outW := newSignalMatchWriter("post-ready-started\n")
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var runOut execution.ExecutionOutcome
+	var runErr error
+
+	waitErr := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error {
+			runOut, runErr = esc.RunPrivileged(runCtx, &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{
+				Stdout: outW,
+			})
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		tm := time.NewTimer(5 * time.Second)
+		defer tm.Stop()
+		select {
+		case <-outW.hitCh:
+			cancel()
+			return nil
+		case <-tm.C:
+			cancel()
+			return context.DeadlineExceeded
+		}
+	})
+	if waitErr != nil || !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("期望首包刷出后取消返回 context.Canceled: waitErr=%v runErr=%v", waitErr, runErr)
+	}
+	unk, ok := runOut.(*execution.OutcomeUnknown)
+	if !ok || unk.CanRetry() {
+		t.Fatalf("就绪后取消必须返回不可重试 OutcomeUnknown，实际 %#v", runOut)
+	}
+	if outW.String() != "post-ready-started\n" {
+		t.Fatalf("首包内容失配: stdout=%q", outW.String())
 	}
 }
