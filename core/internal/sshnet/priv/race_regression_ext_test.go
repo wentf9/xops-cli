@@ -23,6 +23,7 @@ import (
 )
 
 type readStep struct {
+	onEnter    func()
 	waitCh     <-chan struct{}
 	data       []byte
 	err        error
@@ -41,6 +42,11 @@ type gatedStepReader struct {
 func (r *gatedStepReader) Read(p []byte) (int, error) {
 	for r.idx < len(r.steps) {
 		step := &r.steps[r.idx]
+		if step.onEnter != nil {
+			cb := step.onEnter
+			step.onEnter = nil
+			cb()
+		}
 		if step.waitCh != nil {
 			select {
 			case <-step.waitCh:
@@ -258,6 +264,9 @@ func TestEscalator_CrossStreamEOFOrdering_Deterministic(t *testing.T) {
 	t.Run("StdoutPausedAtHoldThreshold_HandshakeTimeoutUnblocks", testPausedStdoutTimeoutUnblocks)
 	t.Run("PlanKindScript_StdinAfterReadyAndStdoutRace", testScriptStdinOrderAndStdoutRace)
 	t.Run("PTYMode_CombinedStdoutPromptReadyAndLargeOutput", testPTYModeCombinedStream)
+	t.Run("SecondaryPreReadyFlushedImmediatelyOnReadyWhileBlocked", testSecondaryPreReadyFlushedImmediatelyWhileBlocked)
+	t.Run("SecondaryPreReadyFlushedBeforePostReadyCancel", testSecondaryPreReadyFlushedBeforePostReadyCancel)
+	t.Run("SecondaryConcurrentReadyAndCancel_NoFIFOGap", testSecondaryConcurrentReadyAndCancelNoFIFOGap)
 }
 
 func testStdoutEOFBeforeStderrReady(t *testing.T) {
@@ -524,5 +533,217 @@ func testPTYModeCombinedStream(t *testing.T) {
 	}
 	if !bytes.Equal(stdout.Bytes(), large) {
 		t.Fatalf("PTY 模式合并流大输出不完整: got=%d want=%d", stdout.Len(), len(large))
+	}
+}
+
+type signalMatchWriter struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	substr string
+	once   sync.Once
+	hitCh  chan struct{}
+}
+
+func newSignalMatchWriter(substr string) *signalMatchWriter {
+	return &signalMatchWriter{substr: substr, hitCh: make(chan struct{})}
+}
+
+func (w *signalMatchWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.buf.Write(p)
+	if w.substr != "" && strings.Contains(w.buf.String(), w.substr) {
+		w.once.Do(func() { close(w.hitCh) })
+	}
+	w.mu.Unlock()
+	return n, err
+}
+
+func (w *signalMatchWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
+// testSecondaryPreReadyFlushedImmediatelyWhileBlocked 确定性复现次流（stdout）先于主控流（stderr）readyTok
+// 抵达少量字节（< maxPreReadyHoldBytes）随后管道阻塞的场景：验证 markReady() 立即刷出暂存字节、
+// 零永久滞留，且与后续 stdout 字节维持严格 FIFO 顺序与零重复写入。
+func testSecondaryPreReadyFlushedImmediatelyWhileBlocked(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	firstChunkRead := make(chan struct{})
+	releaseTail := make(chan struct{})
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("post-ready-started\n")},
+				{onEnter: func() { close(firstChunkRead) }, waitCh: releaseTail, data: []byte("tail-after-flush\n")},
+				{err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: firstChunkRead, data: []byte(readyTok)},
+				{waitCh: releaseTail, data: []byte("err-after-flush\n")},
+				{err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, err := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(77)})
+	if err != nil {
+		t.Fatalf("NewEscalator: %v", err)
+	}
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "long-op"),
+	})
+	outW := newSignalMatchWriter("post-ready-started\n")
+	var errBuf bytes.Buffer
+	var runOut execution.ExecutionOutcome
+	var runErr error
+
+	waitErr := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error {
+			runOut, runErr = esc.RunPrivileged(context.Background(), &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{
+				Stdout: outW,
+				Stderr: &errBuf,
+			})
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		tm := time.NewTimer(5 * time.Second)
+		defer tm.Stop()
+		select {
+		case <-outW.hitCh:
+			close(releaseTail)
+			return nil
+		case <-tm.C:
+			_ = sess.Close()
+			return context.DeadlineExceeded
+		}
+	})
+	if waitErr != nil || runErr != nil {
+		t.Fatalf("markReady 须立即刷出次流暂存首包: waitErr=%v runErr=%v stdout=%q", waitErr, runErr, outW.String())
+	}
+	if comp, ok := runOut.(*execution.OutcomeCompleted); !ok || !comp.Succeeded() {
+		t.Fatalf("期望成功 OutcomeCompleted，实际 %#v", runOut)
+	}
+	if outW.String() != "post-ready-started\ntail-after-flush\n" || errBuf.String() != "err-after-flush\n" {
+		t.Fatalf("即时刷出后 FIFO 顺序或内容失配: stdout=%q stderr=%q", outW.String(), errBuf.String())
+	}
+}
+
+// testSecondaryPreReadyFlushedBeforePostReadyCancel 确定性验证次流首包在 markReady() 后立即刷出并触发
+// 外部 ctx 取消时，RunPrivileged 返回不可重试的 *execution.OutcomeUnknown 且零协程泄漏。
+func testSecondaryPreReadyFlushedBeforePostReadyCancel(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	firstChunkRead := make(chan struct{})
+	neverRelease := make(chan struct{})
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("post-ready-started\n")},
+				{onEnter: func() { close(firstChunkRead) }, waitCh: neverRelease, err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: firstChunkRead, data: []byte(readyTok)},
+				{waitCh: neverRelease, err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(78)})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "hang-op"),
+	})
+	outW := newSignalMatchWriter("post-ready-started\n")
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var runOut execution.ExecutionOutcome
+	var runErr error
+
+	waitErr := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+		if gErr := n.Go(func(context.Context) error {
+			runOut, runErr = esc.RunPrivileged(runCtx, &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{
+				Stdout: outW,
+			})
+			return nil
+		}); gErr != nil {
+			return gErr
+		}
+		tm := time.NewTimer(5 * time.Second)
+		defer tm.Stop()
+		select {
+		case <-outW.hitCh:
+			cancel()
+			return nil
+		case <-tm.C:
+			cancel()
+			return context.DeadlineExceeded
+		}
+	})
+	if waitErr != nil || !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("期望首包刷出后取消返回 context.Canceled: waitErr=%v runErr=%v", waitErr, runErr)
+	}
+	unk, ok := runOut.(*execution.OutcomeUnknown)
+	if !ok || unk.CanRetry() {
+		t.Fatalf("就绪后取消必须返回不可重试 OutcomeUnknown，实际 %#v", runOut)
+	}
+	if outW.String() != "post-ready-started\n" {
+		t.Fatalf("首包内容失配: stdout=%q", outW.String())
+	}
+}
+
+// testSecondaryConcurrentReadyAndCancelNoFIFOGap 在端到端 RunPrivileged 中并发触发 readyTok、
+// 多分片次流 stdout 与外部 ctx 取消，验证任何调度序下 dst 恒为完整输出的前缀（零中段 FIFO 断层、零数据竞争）。
+func testSecondaryConcurrentReadyAndCancelNoFIFOGap(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	const fullStream = "chunk-1\nchunk-2\n"
+	firstHandedOff := make(chan struct{})
+	readyHandedOff := make(chan struct{})
+	runCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sess := newScriptedSession(0, func(cmd string, closedCh <-chan struct{}) (io.Reader, io.Reader) {
+		readyTok := extractBracketToken(cmd, `[xops-priv-ready-`)
+		out := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{data: []byte("chunk-1\n")},
+				{onEnter: func() { close(firstHandedOff) }, waitCh: readyHandedOff, data: []byte("chunk-2\n")},
+				{err: io.EOF},
+			},
+		}
+		errR := &gatedStepReader{
+			closedCh: closedCh,
+			steps: []readStep{
+				{waitCh: firstHandedOff, data: []byte(readyTok)},
+				{onEnter: func() {
+					close(readyHandedOff)
+					cancel()
+				}, err: io.EOF},
+			},
+		}
+		return out, errR
+	})
+	esc, _ := priv.NewEscalator(priv.Config{Entropy: tck.NewDeterministicEntropy(79)})
+	req, _ := ports.NewPrivilegeRequest(ports.PrivilegeRequestSpec{
+		Method:  ports.PrivilegeMethodSudo,
+		Command: tck.MustCommandPlan(t, "race-cancel"),
+	})
+	outW := newSignalMatchWriter("")
+	_, _ = esc.RunPrivileged(runCtx, &scriptedOpener{session: sess}, req, nil, ports.ExecStreams{Stdout: outW})
+	got := outW.String()
+	if !strings.HasPrefix(fullStream, got) {
+		t.Fatalf("并发就绪与取消下出现中段 FIFO 断层: got=%q must be prefix of %q", got, fullStream)
 	}
 }

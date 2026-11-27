@@ -346,8 +346,15 @@ func spawnOutputScanners(
 	readersDone chan struct{},
 ) error {
 	hasPTY := streams.PTY.IsSome()
+	outScanner := newStreamScanner(state, streams.Stdout, hasPTY)
+	errScanner := newStreamScanner(state, streams.Stderr, !hasPTY)
+	secondary := outScanner
+	if hasPTY {
+		secondary = errScanner
+	}
+
 	var rem atomic.Int32
-	rem.Store(2)
+	rem.Store(3)
 	doneOne := func() {
 		if rem.Add(-1) == 0 {
 			close(readersDone)
@@ -355,21 +362,39 @@ func spawnOutputScanners(
 	}
 	if err := n.Go(func(context.Context) error {
 		defer doneOne()
-		return newStreamScanner(state, streams.Stdout, hasPTY).pump(ioCtx, stdoutPipe)
+		runSecondaryReadyFlusher(ioCtx, state, secondary)
+		return nil
 	}); err != nil {
+		secondary.discardPreReadyIfPending()
 		state.markControlDone()
 		close(readersDone)
 		return err
 	}
-	if err := n.Go(func(context.Context) error {
-		defer doneOne()
-		return newStreamScanner(state, streams.Stderr, !hasPTY).pump(ioCtx, stderrPipe)
-	}); err != nil {
+	if err := spawnScannerPump(n, ioCtx, stdoutPipe, outScanner, doneOne); err != nil {
+		state.markControlDone()
+		doneOne()
+		doneOne()
+		return err
+	}
+	if err := spawnScannerPump(n, ioCtx, stderrPipe, errScanner, doneOne); err != nil {
 		state.markControlDone()
 		doneOne()
 		return err
 	}
 	return nil
+}
+
+func spawnScannerPump(
+	n *conc.Nursery,
+	ioCtx context.Context,
+	src io.Reader,
+	sc *streamScanner,
+	doneOne func(),
+) error {
+	return n.Go(func(context.Context) error {
+		defer doneOne()
+		return sc.pump(ioCtx, src)
+	})
 }
 
 func spawnPostReadyStdinPump(
