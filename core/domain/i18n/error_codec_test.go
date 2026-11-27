@@ -60,12 +60,12 @@ func assertWrapAndFacadeChain(t *testing.T, s1, ef error) {
 	}
 
 	facade := Sentinel(KeyCommonPermissionDeny)
-	mapped := WrapSentinel(facade, ef)
+	mapped := WrapSentinel(facade, ef, s1)
 	if !errors.Is(mapped, facade) || !errors.Is(mapped, s1) {
 		t.Fatal("WrapSentinel 应同时保留门面哨兵与底层错误链")
 	}
 	view, ok := InspectNode(mapped)
-	if !ok || !view.SuppressInnerID || !errors.Is(view.Sentinel, facade) || !errors.Is(view.Cause, ef) {
+	if !ok || len(view.SuppressedSentinels) != 1 || !errors.Is(view.SuppressedSentinels[0], s1) || !errors.Is(view.Sentinel, facade) || !errors.Is(view.Cause, ef) {
 		t.Fatalf("WrapSentinel 视图异常: ok=%v view=%+v", ok, view)
 	}
 	if id, found := ErrorID(mapped); !found || id != KeyCommonPermissionDeny {
@@ -114,7 +114,7 @@ func assertCustomNodeAndJoinInspect(t *testing.T) {
 		t.Fatalf("ErrorID 穿透外层非结构化包装失败: (%q, %v)", id, ok)
 	}
 
-	joined := errors.Join(errors.New("plain"), EWithFallback(MessageID("root.custom"), "custom {k}", Str("k", "v")))
+	joined := errors.Join(errors.New("plain"), NewErrorWithFallback(nil, nil, MessageID("root.custom"), "custom {k}", Str("k", "v")))
 	if len(UnwrapDirect(joined)) != 2 {
 		t.Fatal("UnwrapDirect 应完整返回 errors.Join 子错误")
 	}
@@ -128,17 +128,105 @@ func assertWithFallbackConstructors(t *testing.T) {
 	if SentinelWithFallback(MessageID("root.s"), "root sentinel").Error() != "root sentinel" {
 		t.Fatal("SentinelWithFallback 文本异常")
 	}
-	if EFWithFallback(ErrInvalidParam, MessageID("root.ef"), "ef {x}", Int("x", 7)).Error() != "ef 7" {
-		t.Fatal("EFWithFallback 文本异常")
+	if NewErrorWithFallback(nil, nil, MessageID("root.e"), "e {x}", Int("x", 3)).Error() != "e 3" {
+		t.Fatal("NewErrorWithFallback(nil, nil) 文本异常")
 	}
-	if WrapWithFallback(errors.New("c"), MessageID("root.w"), "w").Error() != "w: c" {
-		t.Fatal("WrapWithFallback 文本异常")
+	if NewErrorWithFallback(ErrInvalidParam, nil, MessageID("root.ef"), "ef {x}", Int("x", 7)).Error() != "ef 7" {
+		t.Fatal("NewErrorWithFallback(sentinel, nil) 文本异常")
 	}
-	if WrapSWithFallback(ErrInvalidParam, errors.New("c"), MessageID("root.ws"), "ws").Error() != "ws: c" {
-		t.Fatal("WrapSWithFallback 文本异常")
+	if NewErrorWithFallback(nil, errors.New("c"), MessageID("root.w"), "w").Error() != "w: c" {
+		t.Fatal("NewErrorWithFallback(nil, cause) 文本异常")
+	}
+	ws := NewErrorWithFallback(ErrInvalidParam, errors.New("c"), MessageID("root.ws"), "ws")
+	if !errors.Is(ws, ErrInvalidParam) || ws.Error() != "ws: c" {
+		t.Fatalf("NewErrorWithFallback(sentinel, cause) 异常: err=%q", ws.Error())
 	}
 	if E(MessageIDInvalid) == nil || WrapSentinel(nil, nil) == nil {
 		t.Fatal("错误构造器在非法输入下亦绝不能返回 nil")
+	}
+	assertDegradedSentinelIsolation(t)
+	assertEnsureErrorMessageSalvage(t)
+}
+
+func assertDegradedSentinelIsolation(t *testing.T) {
+	t.Helper()
+	validInvalidArg := Sentinel(KeyCommonInvalidArgument)
+	degradedEmpty := SentinelWithFallback(MessageIDInvalid, "")
+	degradedBad := SentinelWithFallback(MessageID("BadID"), "oops")
+	for name, err := range map[string]error{"empty": degradedEmpty, "bad": degradedBad} {
+		view, ok := InspectNode(err)
+		if !ok || view.IsSentinel || view.Message.ID() != KeyCommonInvalidArgument {
+			t.Fatalf("退化哨兵 %s 视图异常: ok=%v view=%+v", name, ok, view)
+		}
+		if errors.Is(err, validInvalidArg) || errors.Is(validInvalidArg, err) {
+			t.Fatalf("退化哨兵 %s 不得与合法 Sentinel(KeyCommonInvalidArgument) 假阳性匹配", name)
+		}
+	}
+	if errors.Is(degradedEmpty, degradedBad) {
+		t.Fatal("两个不同退化哨兵实例不得互相 errors.Is 匹配")
+	}
+	// 合法 ID 即使 fallback 含非法 UTF-8 经净化后仍应保留 isSentinel=true。
+	sanitized := SentinelWithFallback(MessageID("root.sanitized"), "bad\xfftext")
+	if sv, ok := InspectNode(sanitized); !ok || !sv.IsSentinel || sanitized.Error() != "bad\uFFFDtext" {
+		t.Fatalf("合法 ID 净化兜底应保持哨兵语义: ok=%v view=%+v err=%q", ok, sv, sanitized.Error())
+	}
+}
+
+func assertEnsureErrorMessageSalvage(t *testing.T) {
+	t.Helper()
+	// 单参超长/非法 UTF-8 时保留其余合法参数，并对缺失占位符回填 "<invalid>"（零 {key} 裸露）。
+	oversized := strings.Repeat("x", MaxParamStringBytes+10)
+	err := NewErrorWithFallback(
+		nil, nil,
+		MessageID("test.salvage"),
+		"host={host} path={path} port={port}",
+		Str("host", "web-1"),
+		Str("path", oversized),
+		Int("port", 22),
+	)
+	if got := err.Error(); got != "host=web-1 path=<invalid> port=22" {
+		t.Fatalf("部分参数保留与占位符回填异常: got=%q", got)
+	}
+	if strings.Contains(err.Error(), "{path}") {
+		t.Fatalf("降级错误不得裸露原始占位符: got=%q", err.Error())
+	}
+
+	// 重复参数键时保留首个有效值及兄弟参数，并回填缺失占位符。
+	dupErr := NewErrorWithFallback(
+		nil, nil,
+		MessageID("test.dup"),
+		"a={a} b={b} c={c}",
+		Str("a", "first"),
+		Str("a", "second"),
+		Str("b", "\xff"),
+		Int("c", 9),
+	)
+	if got := dupErr.Error(); got != "a=first b=<invalid> c=9" {
+		t.Fatalf("重复/非法参数抢救异常: got=%q", got)
+	}
+
+	// 超过 MaxMessageParams 时裁剪保留前 MaxMessageParams 个有效唯一参数且不 panic。
+	tooMany := make([]Param, MaxMessageParams+3)
+	for i := range tooMany {
+		tooMany[i] = Int("k"+string(rune('a'+i)), i)
+	}
+	excessErr := NewErrorWithFallback(nil, nil, MessageID("test.excess"), "first={ka} last={kp}", tooMany...)
+	if got := excessErr.Error(); got != "first=0 last=15" {
+		t.Fatalf("超限参数抢救异常: got=%q", got)
+	}
+
+	// fallback 含非法 UTF-8 或超长且伴随非法参数时仍可安全净化并回填；畸形模板语法亦保留合法参数且不 panic。
+	badFB := NewErrorWithFallback(nil, nil, MessageID("test.badfb"), "bad\xff {key}", Str("key", "\xff"))
+	if got := badFB.Error(); got != "bad\uFFFD <invalid>" {
+		t.Fatalf("非法 UTF-8 fallback 净化异常: got=%q", got)
+	}
+	longFB := NewErrorWithFallback(nil, nil, MessageID("test.longfb"), strings.Repeat("a", MaxTemplateBytes+32))
+	if got := longFB.Error(); len(got) != MaxTemplateBytes {
+		t.Fatalf("超长 fallback 应裁剪至 MaxTemplateBytes: len=%d", len(got))
+	}
+	malformedFB := NewErrorWithFallback(nil, nil, MessageID("test.malformed"), "ok={ok} {unclosed", Str("ok", "yes"), Str("bad", "\xff"))
+	if got := malformedFB.Error(); got != "ok=yes {unclosed" {
+		t.Fatalf("畸形模板语法降级应保留有效参数: got=%q", got)
 	}
 }
 
@@ -210,7 +298,12 @@ func assertJSONCodecRejectsInvalid(t *testing.T) {
 		`{"key":"k","kind":"string","str":"v","extra":1}`,
 		`{"key":"k","kind":"string"}`,
 		`{"key":"k","kind":"string","str":"v","int64":1}`,
+		`{"key":"k","kind":"string","str":"v","int64":null}`,
+		`{"key":"k","kind":"string","str":null}`,
+		`{"key":"k","kind":"string","str":"v","message":null}`,
 		`{"key":"k","kind":"string","str":"v","prec":2}`,
+		`{"key":"k","kind":"float64","float64":1.5,"prec":null}`,
+		`{"key":null,"kind":"string","str":"v"}`,
 		`{"key":"k","kind":"unknown","str":"v"}`,
 		`{"key":"k","kind":"duration","duration":"not-a-dur"}`,
 		`{"key":"k","kind":"float64","float64":1.5,"prec":99}`,
@@ -231,6 +324,12 @@ func assertJSONCodecRejectsInvalid(t *testing.T) {
 	badMsgs := []string{
 		`null`,
 		`{"id":"BadID"}`,
+		`{"id":null}`,
+		`{"id":"common.not_found","count":null}`,
+		`{"id":"common.not_found","params":null}`,
+		`{"id":"common.not_found","fallback":null}`,
+		`{"id":"common.not_found","params":[null]}`,
+		`{"id":"common.not_found","params":[{"key":"k","kind":"string","str":"ok","bool":null}]}`,
 		`{"id":"common.not_found","unknown":true}`,
 		`{"id":"common.not_found","params":[{"key":"a","kind":"int64","int64":1},{"key":"a","kind":"int64","int64":2}]}`,
 		`{"id":"common.not_found","fallback":"` + strings.Repeat("x", MaxTemplateBytes+1) + `"}`,

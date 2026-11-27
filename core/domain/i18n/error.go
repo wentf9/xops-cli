@@ -1,8 +1,17 @@
 package i18n
 
-const maxErrorInspectNodes = 64
+import (
+	"slices"
+	"strings"
+	"unicode/utf8"
+)
 
-// ErrorNode 描述单个结构化错误节点的只读视图，供展示层逐层无穿透本地化与结构化去重。
+const (
+	maxErrorInspectNodes     = 64
+	degradedParamPlaceholder = "<invalid>"
+)
+
+// ErrorNode 描述单个结构化错误节点的只读视图，供核心渲染代数与展示层逐层无穿透本地化与结构化去重。
 type ErrorNode struct {
 	// Sentinel 是当前错误节点关联的哨兵分类错误（用于 errors.Is 语义匹配）。
 	Sentinel error
@@ -10,10 +19,10 @@ type ErrorNode struct {
 	Message Message
 	// Cause 是被当前节点包装的下层根因错误（需要递归展开渲染）。
 	Cause error
-	// IsSentinel 标识当前节点本身是否为不可变哨兵错误。
+	// SuppressedSentinels 声明渲染期被本节点替代的同义源哨兵集合；绝不经 Unwrap 暴露。
+	SuppressedSentinels []error
+	// IsSentinel 标识当前节点本身是否为不可变纯哨兵定义。
 	IsSentinel bool
-	// SuppressInnerID 由 WrapSentinel 标记，指示边界 RenderError 折叠紧邻同义内层哨兵节点。
-	SuppressInnerID bool
 }
 
 // LocalizableNode 由全部结构化错误及自定义业务错误实现。
@@ -35,18 +44,28 @@ type multiUnwrapper interface {
 
 // InspectNode 非穿透读取单个 error 节点的 LocalizableNode 视图（不递归展开 Unwrap 链）。
 func InspectNode(err error) (ErrorNode, bool) {
+	view, _, hasView := inspectLocalizable(err)
+	return view, hasView
+}
+
+// inspectLocalizable 非穿透探测单个 error 是否实现 LocalizableNode 及是否携带有效视图。
+// 当返回 isNode == true 时，核心渲染代数严禁对其调用 .Error()（规则 M6 防重入与环路爆栈保护）。
+func inspectLocalizable(err error) (ErrorNode, bool, bool) {
 	if err == nil {
-		return ErrorNode{}, false
+		return ErrorNode{}, false, false
 	}
 	node, ok := any(err).(LocalizableNode)
-	if !ok || node == nil {
-		return ErrorNode{}, false
+	if !ok {
+		return ErrorNode{}, false, false
+	}
+	if node == nil {
+		return ErrorNode{}, true, false
 	}
 	view := node.LocalizableView()
 	if !view.Message.IsValid() && view.Sentinel == nil && view.Cause == nil {
-		return ErrorNode{}, false
+		return ErrorNode{}, true, false
 	}
-	return view, true
+	return view, true, true
 }
 
 // UnwrapDirect 非穿透提取单个错误节点的直接下层子错误（支持 Unwrap() []error 与 Unwrap() error）。
@@ -87,12 +106,12 @@ func filterNonNilErrors(raw []error) []error {
 //xops:opaque
 //xops:failclosed
 type Error struct {
-	sentinel        error
-	msg             Message
-	cause           error
-	isSentinel      bool
-	suppressInnerID bool
-	valid           bool
+	sentinel            error
+	msg                 Message
+	cause               error
+	suppressedSentinels []error
+	isSentinel          bool
+	valid               bool
 }
 
 // Sentinel 使用核心规范英文兜底构造不可变哨兵错误（供各核心包以 var ErrX = i18n.Sentinel(KeyX) 声明）。
@@ -100,107 +119,129 @@ func Sentinel(id MessageID) error {
 	return SentinelWithFallback(id, CanonicalFallback(id))
 }
 
-// SentinelWithFallback 使用显式规范英文兜底构造不可变哨兵错误（供根模块 internal/i18n 定义专属哨兵）。
+// SentinelWithFallback 使用显式规范英文兜底构造不可变哨兵错误（仅供根模块 internal/i18n 桥接调用）。
+// 当传入非法或零值 MessageID 触发降级时，仍返回非 nil 有效错误但严格置 isSentinel=false，
+// 防止退化实例在 errors.Is 下与合法 Sentinel(KeyCommonInvalidArgument) 发生假阳性匹配。
 func SentinelWithFallback(id MessageID, fallback string) error {
 	msg := ensureErrorMessage(id, fallback, nil)
-	return &Error{msg: msg, isSentinel: true, valid: true}
+	return &Error{
+		msg:        msg,
+		isSentinel: id.IsValid() && msg.IsValid() && msg.ID() == id,
+		valid:      true,
+	}
+}
+
+// NewErrorWithFallback 以显式规范英文兜底构造结构化错误节点（仅供根模块 internal/i18n 桥接调用）。
+// sentinel 与 cause 均可为 nil，统一承接 E/EF/Wrap/WrapS 四类结构化错误构造路径。
+func NewErrorWithFallback(sentinel, cause error, id MessageID, fallback string, params ...Param) error {
+	return &Error{
+		sentinel: sentinel,
+		msg:      ensureErrorMessage(id, fallback, params),
+		cause:    cause,
+		valid:    true,
+	}
 }
 
 // E 构造携带核心规范英文兜底与参数的独立结构化错误。
 func E(id MessageID, params ...Param) error {
-	return EWithFallback(id, CanonicalFallback(id), params...)
-}
-
-// EWithFallback 以显式规范英文兜底构造独立结构化错误（供 internal/i18n 根模块封装使用）。
-func EWithFallback(id MessageID, fallback string, params ...Param) error {
-	return &Error{msg: ensureErrorMessage(id, fallback, params), valid: true}
+	return NewErrorWithFallback(nil, nil, id, CanonicalFallback(id), params...)
 }
 
 // EF 构造同时关联分类哨兵 sentinel 与参数化上下文消息的结构化错误。
 func EF(sentinel error, id MessageID, params ...Param) error {
-	return EFWithFallback(sentinel, id, CanonicalFallback(id), params...)
-}
-
-// EFWithFallback 以显式兜底构造同时关联分类哨兵与参数化上下文消息的结构化错误。
-func EFWithFallback(sentinel error, id MessageID, fallback string, params ...Param) error {
-	return &Error{sentinel: sentinel, msg: ensureErrorMessage(id, fallback, params), valid: true}
+	return NewErrorWithFallback(sentinel, nil, id, CanonicalFallback(id), params...)
 }
 
 // Wrap 以核心规范英文兜底与参数包装下层根因错误 cause。
 func Wrap(cause error, id MessageID, params ...Param) error {
-	return WrapWithFallback(cause, id, CanonicalFallback(id), params...)
-}
-
-// WrapWithFallback 以显式兜底与参数包装下层根因错误 cause。
-func WrapWithFallback(cause error, id MessageID, fallback string, params ...Param) error {
-	return &Error{msg: ensureErrorMessage(id, fallback, params), cause: cause, valid: true}
+	return NewErrorWithFallback(nil, cause, id, CanonicalFallback(id), params...)
 }
 
 // WrapS 同时绑定分类哨兵 sentinel、下层根因 cause 与参数化上下文消息。
 func WrapS(sentinel, cause error, id MessageID, params ...Param) error {
-	return WrapSWithFallback(sentinel, cause, id, CanonicalFallback(id), params...)
+	return NewErrorWithFallback(sentinel, cause, id, CanonicalFallback(id), params...)
 }
 
-// WrapSWithFallback 以显式兜底同时绑定分类哨兵、下层根因与参数化上下文消息。
-func WrapSWithFallback(sentinel, cause error, id MessageID, fallback string, params ...Param) error {
-	return &Error{sentinel: sentinel, msg: ensureErrorMessage(id, fallback, params), cause: cause, valid: true}
-}
-
-// WrapSentinel 将底层错误 cause 映射至门面哨兵 sentinel，并置 SuppressInnerID = true
-// 以指示展示层 RenderError 在本地化时结构化折叠紧邻的同义内层哨兵。
-func WrapSentinel(sentinel, cause error) error {
+// WrapSentinel 将底层错误 cause 映射至门面哨兵 sentinel，并显式登记本次映射替代的同义源哨兵集合 replaced。
+// Unwrap 仅返回 [sentinel, cause]（绝不暴露 replaced，避免污染 errors.Is）；
+// 未传 replaced 时仅对 sentinel 自身沿因果路径去重，绝不做跨类型盲目抑制。
+func WrapSentinel(sentinel, cause error, replaced ...error) error {
 	if sentinel == nil && cause == nil {
 		return E(KeyCommonInvalidArgument)
 	}
+	suppressed := filterNonNilErrors(replaced)
+	if len(suppressed) > maxErrorSuppressed {
+		suppressed = suppressed[:maxErrorSuppressed]
+	}
 	return &Error{
-		sentinel:        sentinel,
-		cause:           cause,
-		suppressInnerID: sentinel != nil && cause != nil,
-		valid:           true,
+		sentinel:            sentinel,
+		cause:               cause,
+		suppressedSentinels: suppressed,
+		valid:               true,
 	}
 }
 
-// ensureErrorMessage 保证错误构造路径严格失败关闭：非法 id 或参数降级为有效通用错误消息，永不产生无效节点。
+// ensureErrorMessage 保证错误构造路径严格失败关闭并最大化保留有效诊断参数：
+//   - 非法 id 降级为 KeyCommonInvalidArgument；
+//   - 非法 UTF-8 或超长 fallback 按 BoundDisplayText 确定性净化；
+//   - 若因个别参数非法/重复/超限导致直构失败，保留全部合法非重复参数并对缺失占位符回填 "<invalid>"，
+//     彻底杜绝原始 "{key}" 占位符泄露至错误文本、审计或终端。
 func ensureErrorMessage(id MessageID, fallback string, params []Param) Message {
-	if m := NewMessageWithFallback(id, fallback, params...); m.IsValid() {
+	if !id.IsValid() {
+		return NewMessage(KeyCommonInvalidArgument)
+	}
+	safeFallback := fallback
+	if len(safeFallback) > MaxTemplateBytes || !utf8.ValidString(safeFallback) {
+		safeFallback = BoundDisplayText(safeFallback, MaxTemplateBytes)
+	}
+	if m := buildMessage(id, safeFallback, false, 0, params); m.IsValid() {
 		return m
 	}
-	if m := NewMessageWithFallback(id, fallback); m.IsValid() {
+	salvaged := salvageErrorParams(safeFallback, params)
+	if m := buildMessage(id, safeFallback, false, 0, salvaged); m.IsValid() {
 		return m
 	}
-	return NewMessageWithFallback(KeyCommonInvalidArgument, CanonicalFallback(KeyCommonInvalidArgument))
+	return NewMessage(KeyCommonInvalidArgument)
 }
 
-// Error 返回恒定规范英文错误文本（用于日志、审计、事件与机器诊断，零运行期 locale 依赖）。
+func salvageErrorParams(fallback string, params []Param) []Param {
+	out := make([]Param, 0, min(len(params), MaxMessageParams))
+	for _, p := range params {
+		if len(out) >= MaxMessageParams {
+			break
+		}
+		if p.IsValid() && !hasParamKey(out, p.key) {
+			out = append(out, p)
+		}
+	}
+	return backfillMissingPlaceholders(fallback, out)
+}
+
+func backfillMissingPlaceholders(fallback string, out []Param) []Param {
+	if len(out) >= MaxMessageParams || !strings.ContainsRune(fallback, '{') {
+		return out
+	}
+	keys, errID, _ := parsePlaceholderKeys(fallback)
+	if errID != MessageIDInvalid {
+		return out
+	}
+	for _, k := range keys {
+		if len(out) >= MaxMessageParams {
+			break
+		}
+		if !hasParamKey(out, k) {
+			out = append(out, Str(k, degradedParamPlaceholder))
+		}
+	}
+	return out
+}
+
+// Error 返回恒定规范英文错误文本（委托至 CanonicalError，与 enLoc.RenderError 共享唯一折叠代数）。
 func (e *Error) Error() string {
 	if e == nil || !e.valid {
 		return ""
 	}
-	head := e.canonicalHead()
-	if e.cause == nil {
-		return head
-	}
-	return joinCanonicalError(head, e.cause.Error())
-}
-
-func (e *Error) canonicalHead() string {
-	if e.msg.IsValid() {
-		return e.msg.Canonical()
-	}
-	if e.sentinel != nil {
-		return e.sentinel.Error()
-	}
-	return ""
-}
-
-func joinCanonicalError(head, tail string) string {
-	if head == "" {
-		return tail
-	}
-	if tail == "" || tail == head {
-		return head
-	}
-	return head + ": " + tail
+	return CanonicalError(e)
 }
 
 // LocalizableView 返回当前错误节点的只读结构化视图（nil 接收者或无效节点安全返回零值）。
@@ -209,15 +250,16 @@ func (e *Error) LocalizableView() ErrorNode {
 		return ErrorNode{}
 	}
 	return ErrorNode{
-		Sentinel:        e.sentinel,
-		Message:         e.msg.clone(),
-		Cause:           e.cause,
-		IsSentinel:      e.isSentinel,
-		SuppressInnerID: e.suppressInnerID,
+		Sentinel:            e.sentinel,
+		Message:             e.msg.clone(),
+		Cause:               e.cause,
+		SuppressedSentinels: slices.Clone(e.suppressedSentinels),
+		IsSentinel:          e.isSentinel,
 	}
 }
 
-// Unwrap 返回当前错误节点关联的直接下层错误切片（按 Sentinel -> Cause 顺序），完整支持 errors.Is / errors.AsType。
+// Unwrap 返回当前错误节点关联的直接下层错误切片（按 Sentinel -> Cause 顺序，绝不包含 SuppressedSentinels），
+// 完整支持 errors.Is / errors.AsType 语义匹配。
 func (e *Error) Unwrap() []error {
 	if e == nil || !e.valid {
 		return nil

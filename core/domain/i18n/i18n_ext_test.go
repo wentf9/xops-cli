@@ -32,7 +32,11 @@ func TestPublicAPIBlackBox(t *testing.T) {
 		t.Fatalf("Message 外置 JSON 往返异常: raw=%s err=%v", raw, err)
 	}
 
-	wrapped := i18n.WrapSentinel(i18n.Sentinel(i18n.KeyCommonPermissionDeny), i18n.EF(i18n.ErrInvalidLocale, i18n.KeyLocaleInvalidValue, i18n.Str("value", "bad")))
+	wrapped := i18n.WrapSentinel(
+		i18n.Sentinel(i18n.KeyCommonPermissionDeny),
+		i18n.EF(i18n.ErrInvalidLocale, i18n.KeyLocaleInvalidValue, i18n.BoundStr("value", "bad\xff")),
+		i18n.ErrInvalidLocale,
+	)
 	if !errors.Is(wrapped, i18n.ErrInvalidLocale) {
 		t.Fatal("WrapSentinel 外置 errors.Is 链路断裂")
 	}
@@ -40,7 +44,19 @@ func TestPublicAPIBlackBox(t *testing.T) {
 		t.Fatalf("ErrorID 外置契约异常: (%q, %v)", id, ok)
 	}
 	view, ok := i18n.InspectNode(wrapped)
-	if !ok || !view.SuppressInnerID || len(i18n.UnwrapDirect(wrapped)) != 2 {
+	if !ok || len(view.SuppressedSentinels) != 1 || !errors.Is(view.SuppressedSentinels[0], i18n.ErrInvalidLocale) || len(i18n.UnwrapDirect(wrapped)) != 2 {
 		t.Fatalf("InspectNode/UnwrapDirect 外置契约异常: ok=%v view=%+v", ok, view)
+	}
+	if got := i18n.CanonicalError(wrapped); got != wrapped.Error() {
+		t.Fatalf("CanonicalError 与 Error() 不一致: %q vs %q", got, wrapped.Error())
+	}
+	customRendered := i18n.RenderErrorChain(wrapped, i18n.ErrorRenderHooks{
+		JoinCausal: func(head, tail string) string { return head + " | " + tail },
+	})
+	if customRendered != "permission denied | i18n: invalid locale bad\uFFFD" {
+		t.Fatalf("RenderErrorChain 外置契约异常: got=%q", customRendered)
+	}
+	if got := i18n.BoundDisplayText("ab中文", 5); got != "ab中" {
+		t.Fatalf("BoundDisplayText 外置契约异常: got=%q", got)
 	}
 }

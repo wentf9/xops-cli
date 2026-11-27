@@ -70,7 +70,7 @@ func (l Locale) canonicalOrder() uint8 {
 func ParseLocale(raw string) (Locale, error) {
 	loc, ok := parseKnownLocale(raw)
 	if !ok {
-		return LocaleInvalid, EF(ErrInvalidLocale, KeyLocaleInvalidValue, Str("value", boundDisplayText(raw, maxLocaleTagBytes)))
+		return LocaleInvalid, EF(ErrInvalidLocale, KeyLocaleInvalidValue, Str("value", BoundDisplayText(raw, maxLocaleTagBytes)))
 	}
 	return loc, nil
 }
@@ -170,13 +170,16 @@ func hasValidLocaleSubtags(norm string) bool {
 	return true
 }
 
+// isValidLocaleSuffix 校验 .codeset 与 @modifier 后缀，严格限定 POSIX 字符集 [A-Za-z0-9_-]。
 func isValidLocaleSuffix(s string) bool {
 	if s == "" {
 		return false
 	}
 	for i := range len(s) {
 		c := s[i]
-		if c < 0x21 || c > 0x7E || c == '@' || c == '.' {
+		isAlpha := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+		isDigit := c >= '0' && c <= '9'
+		if !isAlpha && !isDigit && c != '_' && c != '-' {
 			return false
 		}
 	}

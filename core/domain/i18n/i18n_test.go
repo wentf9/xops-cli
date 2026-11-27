@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func TestLocaleParsingAndResolution(t *testing.T) {
@@ -27,6 +28,9 @@ func TestLocaleParsingAndResolution(t *testing.T) {
 		{"zh-Hans-CN", LocaleZh},
 		{"zh-TW", LocaleZh},
 		{"zh_Hant_HK", LocaleZh},
+		{"zh-CN_stroke", LocaleZh},
+		{"zh-TW_radstr", LocaleZh},
+		{"en_US.UTF-8@latin_1", LocaleEn},
 	}
 	for _, tc := range validCases {
 		got, err := ParseLocale(tc.raw)
@@ -38,7 +42,8 @@ func TestLocaleParsingAndResolution(t *testing.T) {
 	invalidCases := []string{
 		"", "   ", "\t\n", "C", "POSIX", "C.UTF-8", "fr_FR.UTF-8", "ja",
 		"english", "zh_", "en--us", "en us", "en.", "en@", ".UTF-8", "@euro",
-		"en.UTF 8", "zh_CN@bad mod", strings.Repeat("a", maxLocaleTagBytes+1), "\xff\xfe",
+		"en.UTF 8", "zh_CN@bad mod", "zh@;rm-rf", "en.utf8/../../etc",
+		"zh@mod+1", "en.utf8$1", strings.Repeat("a", maxLocaleTagBytes+1), "\xff\xfe",
 	}
 	for _, raw := range invalidCases {
 		got, err := ParseLocale(raw)
@@ -169,6 +174,7 @@ func assertFloatAndCompoundParamAccessors(t *testing.T, params []Param, nested M
 	if !params[4].Equal(Float("f", 0.0, 2)) {
 		t.Fatal("Float(-0.0) 应与 Float(0.0) 相等")
 	}
+	assertFloatAutoFormat(t)
 	if d, ok := params[6].DurationVal(); !ok || d != 1500*time.Millisecond || params[6].FormatCanonical() != "1.5s" {
 		t.Fatalf("Dur 异常: %v %v", d, ok)
 	}
@@ -177,6 +183,73 @@ func assertFloatAndCompoundParamAccessors(t *testing.T, params []Param, nested M
 	}
 	if mv, ok := params[8].MessageVal(); !ok || !mv.Equal(nested) || params[8].FormatCanonical() != nested.Canonical() {
 		t.Fatalf("Msg 异常: ok=%v fmt=%q", ok, params[8].FormatCanonical())
+	}
+}
+
+func assertFloatAutoFormat(t *testing.T) {
+	t.Helper()
+	cases := []struct {
+		v    float64
+		prec int
+		want string
+	}{
+		{1e308, -1, "1e+308"},
+		{1e-300, -1, "1e-300"},
+		{1.5, -1, "1.5"},
+		{0.0, -1, "0"},
+		{1.5, 2, "1.50"},
+	}
+	for _, tc := range cases {
+		p := Float("f", tc.v, tc.prec)
+		if got := p.FormatCanonical(); got != tc.want {
+			t.Fatalf("Float(%g, %d).FormatCanonical() = %q, 期望 %q", tc.v, tc.prec, got, tc.want)
+		}
+	}
+}
+
+func TestBoundDisplayTextAndBoundStr(t *testing.T) {
+	cases := []struct {
+		raw      string
+		maxBytes int
+		want     string
+	}{
+		{"", 16, ""},
+		{"hello", 0, ""},
+		{"hello", -5, ""},
+		{"hello", 5, "hello"},
+		{"hello", 3, "hel"},
+		{"a\xffb", 16, "a\uFFFDb"},
+		{"\xff\xfe", 16, "\uFFFD"},
+		{"ab中文", 2, "ab"},
+		{"ab中文", 3, "ab"},
+		{"ab中文", 4, "ab"},
+		{"ab中文", 5, "ab中"},
+		{"ab中文", 8, "ab中文"},
+		{"🚀a", 3, ""},
+		{"🚀a", 4, "🚀"},
+		{"🚀a", 5, "🚀a"},
+	}
+	for _, tc := range cases {
+		got := BoundDisplayText(tc.raw, tc.maxBytes)
+		if got != tc.want || !utf8.ValidString(got) || (tc.maxBytes > 0 && len(got) > tc.maxBytes) {
+			t.Fatalf("BoundDisplayText(%q, %d) = %q, 期望 %q", tc.raw, tc.maxBytes, got, tc.want)
+		}
+		if strings.HasPrefix(got, `"`) && !strings.HasPrefix(tc.raw, `"`) {
+			t.Fatalf("BoundDisplayText 不得附加外层引号: got=%q", got)
+		}
+	}
+
+	if bad := BoundStr("", "ok"); bad.IsValid() || !bad.IsZero() {
+		t.Fatal("BoundStr 非法键名应严格失败关闭")
+	}
+	longCJK := strings.Repeat("中", MaxParamStringBytes/3+20)
+	p := BoundStr("detail", "bad\xff"+longCJK)
+	val, ok := p.StringVal()
+	if !p.IsValid() || !ok || len(val) > MaxParamStringBytes || !utf8.ValidString(val) {
+		t.Fatalf("BoundStr 应确定性净化并按 rune 裁剪: valid=%v len=%d", p.IsValid(), len(val))
+	}
+	if !strings.HasPrefix(val, "bad\uFFFD") {
+		t.Fatalf("BoundStr 应以 U+FFFD 净化非法 UTF-8 且无外层引号: prefix=%q", val[:min(12, len(val))])
 	}
 }
 

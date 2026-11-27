@@ -278,8 +278,6 @@ func (m Message) clone() Message {
 
 // FormatTemplate 对模板执行单遍零反射 {key} 占位符替换，支持 {{ 与 }} 转义为字面花括号。
 // 缺失键值或 resolve 为 nil 时原样保留 "{key}"；畸形花括号片段按字面安全输出，永不 panic。
-//
-//xops:syncclosure
 func FormatTemplate(tmpl string, resolve func(string) (string, bool)) string {
 	if !strings.ContainsAny(tmpl, "{}") {
 		return tmpl
@@ -351,14 +349,27 @@ func findPlaceholderEnd(tmpl string, from int) int {
 // ExtractPlaceholders 严格校验模板语法并提取升序去重后的占位符键名集合。
 // 拒绝非 UTF-8、超长模板、未转义 '}'、未闭合 '{' 以及非法占位符键名，失败时返回包装 ErrInvalidTemplate 的错误。
 func ExtractPlaceholders(tmpl string) ([]string, error) {
+	keys, errID, badKey := parsePlaceholderKeys(tmpl)
+	if errID != MessageIDInvalid {
+		if errID == KeyTemplateBadKey {
+			return nil, EF(ErrInvalidTemplate, errID, Str("key", BoundDisplayText(badKey, MaxParamKeyBytes)))
+		}
+		return nil, EF(ErrInvalidTemplate, errID)
+	}
+	return keys, nil
+}
+
+// parsePlaceholderKeys 执行无哨兵依赖的纯模板占位符扫描（供 ExtractPlaceholders 与 ensureErrorMessage 共享，
+// 避免包级哨兵初始化路径与 ErrInvalidTemplate 形成编译期初始化环）。
+func parsePlaceholderKeys(tmpl string) ([]string, MessageID, string) {
 	if len(tmpl) > MaxTemplateBytes || !utf8.ValidString(tmpl) {
-		return nil, EF(ErrInvalidTemplate, KeyTemplateInvalid)
+		return nil, KeyTemplateInvalid, ""
 	}
 	var keys []string
 	for i := 0; i < len(tmpl); {
-		key, next, hasKey, err := stepExtractPlaceholder(tmpl, i)
-		if err != nil {
-			return nil, err
+		key, next, hasKey, errID, badKey := stepParsePlaceholder(tmpl, i)
+		if errID != MessageIDInvalid {
+			return nil, errID, badKey
 		}
 		if hasKey {
 			keys = append(keys, key)
@@ -366,35 +377,35 @@ func ExtractPlaceholders(tmpl string) ([]string, error) {
 		i = next
 	}
 	slices.Sort(keys)
-	return slices.Compact(keys), nil
+	return slices.Compact(keys), MessageIDInvalid, ""
 }
 
-func stepExtractPlaceholder(tmpl string, i int) (string, int, bool, error) {
+func stepParsePlaceholder(tmpl string, i int) (string, int, bool, MessageID, string) {
 	switch tmpl[i] {
 	case '{':
 		if i+1 < len(tmpl) && tmpl[i+1] == '{' {
-			return "", i + 2, false, nil
+			return "", i + 2, false, MessageIDInvalid, ""
 		}
-		key, next, err := parseStrictPlaceholder(tmpl, i)
-		return key, next, err == nil, err
+		key, next, errID, badKey := parseStrictPlaceholderKey(tmpl, i)
+		return key, next, errID == MessageIDInvalid, errID, badKey
 	case '}':
 		if i+1 < len(tmpl) && tmpl[i+1] == '}' {
-			return "", i + 2, false, nil
+			return "", i + 2, false, MessageIDInvalid, ""
 		}
-		return "", 0, false, EF(ErrInvalidTemplate, KeyTemplateUnescaped)
+		return "", 0, false, KeyTemplateUnescaped, ""
 	default:
-		return "", i + 1, false, nil
+		return "", i + 1, false, MessageIDInvalid, ""
 	}
 }
 
-func parseStrictPlaceholder(tmpl string, start int) (string, int, error) {
+func parseStrictPlaceholderKey(tmpl string, start int) (string, int, MessageID, string) {
 	end := findPlaceholderEnd(tmpl, start+1)
 	if end < 0 {
-		return "", 0, EF(ErrInvalidTemplate, KeyTemplateUnclosed)
+		return "", 0, KeyTemplateUnclosed, ""
 	}
 	key := tmpl[start+1 : end]
 	if !isValidParamKey(key) {
-		return "", 0, EF(ErrInvalidTemplate, KeyTemplateBadKey, Str("key", boundDisplayText(key, MaxParamKeyBytes)))
+		return "", 0, KeyTemplateBadKey, key
 	}
-	return key, end + 1, nil
+	return key, end + 1, MessageIDInvalid, ""
 }

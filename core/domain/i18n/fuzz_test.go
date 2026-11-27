@@ -7,6 +7,7 @@ import (
 	"slices"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func FuzzLocaleParsing(f *testing.F) {
@@ -172,4 +173,34 @@ func collectValidFuzzParams(sVal string, iVal int64, uVal uint64, fVal float64, 
 		}
 	}
 	return out
+}
+
+func FuzzBoundDisplayText(f *testing.F) {
+	f.Add("hello world", 8)
+	f.Add("中文边界裁剪🚀", 7)
+	f.Add("bad\xff\xfeutf8", 5)
+	f.Add("", 0)
+	f.Add("abc", -1)
+
+	f.Fuzz(func(t *testing.T, raw string, maxBytes int) {
+		if maxBytes > 16384 {
+			maxBytes = 16384
+		}
+		out := BoundDisplayText(raw, maxBytes)
+		if !utf8.ValidString(out) {
+			t.Fatalf("BoundDisplayText(%q, %d) 返回非法 UTF-8: %q", raw, maxBytes, out)
+		}
+		if maxBytes <= 0 && out != "" {
+			t.Fatalf("maxBytes=%d 应返回空串, 实际=%q", maxBytes, out)
+		}
+		if maxBytes > 0 && len(out) > maxBytes {
+			t.Fatalf("BoundDisplayText 超出 maxBytes=%d: len=%d", maxBytes, len(out))
+		}
+		if BoundDisplayText(out, maxBytes) != out {
+			t.Fatalf("BoundDisplayText 非幂等: out=%q", out)
+		}
+		if p := BoundStr("k", raw); !p.IsValid() {
+			t.Fatalf("BoundStr 合法键名应始终构造有效 Param: raw=%q", raw)
+		}
+	})
 }

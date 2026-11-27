@@ -1,6 +1,7 @@
 package i18n
 
 import (
+	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"time"
@@ -62,17 +63,18 @@ func (p Param) MarshalJSONTo(enc *jsontext.Encoder) error {
 }
 
 // UnmarshalJSONFrom 实现 Param 的 encoding/json/v2.UnmarshalerFrom：
-// 失败时重置为零值，拒绝 JSON null、未知字段、冲突字段、NaN/±Inf、超长字符串与超深嵌套。
+// 失败时重置为零值，拒绝 JSON null、显式 null 旁路载荷键、未知字段、冲突字段、NaN/±Inf、超长字符串与超深嵌套。
 func (p *Param) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	if p == nil {
 		return ErrNilReceiver
 	}
 	*p = Param{}
-	if isNull, err := rejectJSONNull(dec, ErrInvalidParam); isNull {
+	raw, err := readCheckedObjectValue(dec, ErrInvalidParam)
+	if err != nil {
 		return err
 	}
 	var wire paramWire
-	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
+	if err := jsonv2.Unmarshal(raw, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return err
 	}
 	parsed, err := decodeParamWire(wire)
@@ -101,17 +103,18 @@ func (m Message) MarshalJSONTo(enc *jsontext.Encoder) error {
 }
 
 // UnmarshalJSONFrom 实现 Message 的 encoding/json/v2.UnmarshalerFrom：
-// 失败时重置为零值，拒绝 JSON null、未知字段、非法 MessageID、参数超限/重复与嵌套超深。
+// 失败时重置为零值，拒绝 JSON null、显式 null 成员键、未知字段、非法 MessageID、参数超限/重复与嵌套超深。
 func (m *Message) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	if m == nil {
 		return ErrNilReceiver
 	}
 	*m = Message{}
-	if isNull, err := rejectJSONNull(dec, ErrInvalidMessage); isNull {
+	raw, err := readCheckedObjectValue(dec, ErrInvalidMessage)
+	if err != nil {
 		return err
 	}
 	var wire messageWire
-	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
+	if err := jsonv2.Unmarshal(raw, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return err
 	}
 	parsed, err := decodeMessageWire(wire)
@@ -152,7 +155,7 @@ func encodeParamWire(p Param) paramWire {
 
 func decodeParamWire(w paramWire) (Param, error) {
 	if !isValidParamKey(w.Key) {
-		return Param{}, EF(ErrInvalidParam, KeyParamInvalidKey, Str("key", boundDisplayText(w.Key, MaxParamKeyBytes)))
+		return Param{}, EF(ErrInvalidParam, KeyParamInvalidKey, Str("key", BoundDisplayText(w.Key, MaxParamKeyBytes)))
 	}
 	if countParamPayloadFields(w) != 1 || (w.Kind != "float64" && w.Prec != nil) {
 		return Param{}, EF(ErrInvalidParam, KeyParamInvalidValue, Str("key", w.Key))
@@ -177,7 +180,7 @@ func buildDecodedParam(w paramWire) (Param, error) {
 	case "message":
 		return decodeNestedMessageParam(w)
 	default:
-		return Param{}, EF(ErrInvalidParam, KeyParamInvalidKind, Str("kind", boundDisplayText(w.Kind, MaxParamKeyBytes)))
+		return Param{}, EF(ErrInvalidParam, KeyParamInvalidKind, Str("kind", BoundDisplayText(w.Kind, MaxParamKeyBytes)))
 	}
 }
 
@@ -285,13 +288,40 @@ func findDuplicateParamKey(params []Param) (string, bool) {
 	return "", false
 }
 
-// rejectJSONNull 拦截 JSON 顶层 null 并透传畸形语法前缀错误。
-func rejectJSONNull(dec *jsontext.Decoder, baseErr error) (bool, error) {
-	if dec.PeekKind() != 'n' {
-		return false, nil
+// readCheckedObjectValue 读取完整 JSON 值并拒绝顶层 null 以及对象内任意显式 null 成员值，
+// 防止类似 {"key":"k","kind":"string","str":"ok","int64":null} 的旁路载荷绕过指针非空校验。
+func readCheckedObjectValue(dec *jsontext.Decoder, baseErr error) (jsontext.Value, error) {
+	raw, err := dec.ReadValue()
+	if err != nil {
+		return nil, err
 	}
-	if _, err := dec.ReadToken(); err != nil {
-		return true, err
+	if err := rejectNullObjectMembers(raw, baseErr); err != nil {
+		return nil, err
 	}
-	return true, baseErr
+	return raw, nil
+}
+
+func rejectNullObjectMembers(raw jsontext.Value, baseErr error) error {
+	d := jsontext.NewDecoder(bytes.NewReader(raw))
+	if d.PeekKind() == 'n' {
+		return baseErr
+	}
+	if d.PeekKind() != '{' {
+		return nil
+	}
+	if _, err := d.ReadToken(); err != nil {
+		return err
+	}
+	for d.PeekKind() != '}' {
+		if _, err := d.ReadToken(); err != nil {
+			return err
+		}
+		if d.PeekKind() == 'n' {
+			return baseErr
+		}
+		if err := d.SkipValue(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
