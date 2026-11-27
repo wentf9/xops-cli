@@ -453,3 +453,34 @@ func assertCycleAndDepthSafety(t *testing.T, enLoc, zhLoc *Localizer) {
 		t.Fatalf("超深链中文渲染异常: %q", gotDeepZh)
 	}
 }
+
+func TestRenderErrorLongSegmentsRawBytesAndNestedPanicJoin(t *testing.T) {
+	enLoc, zhLoc := mustLoadBilingualLocalizers(t)
+
+	// 1. 满额 4096B BoundStr 参数被外层 Wrap 包装时不得二次截断，严格保持英文等价与中文无损。
+	full4K := strings.Repeat("a", domi18n.MaxParamStringBytes)
+	wrappedFull := domi18n.Wrap(domi18n.E(domi18n.KeyLocaleInvalidValue, domi18n.BoundStr("value", full4K)), domi18n.KeyCommonTimeout)
+	assertBilingualParity(t, enLoc, zhLoc, wrappedFull, "operation timed out: i18n: invalid locale "+full4K, "操作超时：无效的语言标识："+full4K)
+
+	// 2. 超过 4096B 的多段链与 errors.Join 链左折叠不得丢失中段上下文或后续分支。
+	segA, segB := strings.Repeat("x", 2500), strings.Repeat("y", 2500)
+	multiOver4K := domi18n.Wrap(domi18n.Wrap(errors.New("tail-leaf"), domi18n.KeyLocaleInvalidValue, domi18n.BoundStr("value", segB)), domi18n.KeyLocaleInvalidValue, domi18n.BoundStr("value", segA))
+	assertBilingualParity(t, enLoc, zhLoc, multiOver4K, "i18n: invalid locale "+segA+": i18n: invalid locale "+segB+": tail-leaf", "无效的语言标识："+segA+"：无效的语言标识："+segB+"：tail-leaf")
+
+	joinOver4K := domi18n.Wrap(errors.Join(errors.New(segA), errors.New(segB)), domi18n.KeyCommonTimeout)
+	assertBilingualParity(t, enLoc, zhLoc, joinOver4K, "operation timed out: "+segA+"\n"+segB, "操作超时："+segA+"\n"+segB)
+
+	// 3. 被 Wrap 包装的原始非 UTF-8 叶子错误须按字节原样保留，不得经 BoundStr 改写为 \uFFFD。
+	rawBadUTF8 := domi18n.Wrap(errors.New("bad\xff"), domi18n.KeyCommonTimeout)
+	assertBilingualParity(t, enLoc, zhLoc, rawBadUTF8, "operation timed out: bad\xff", "操作超时：bad\xff")
+
+	// 4. 嵌套 errors.Join 携带 *conc.PanicError 在 O(1) 单层非穿透断言下精准本地化全部子分支。
+	panicErr := conc.RunWait(context.Background(), func(_ context.Context, _ *conc.Nursery) error { panic("nested-boom") })
+	nestedJoin := Wrap(errors.Join(context.Canceled, errors.Join(panicErr, conc.ErrNilTask)), KeyCatalogLoadFailed, Str("file", "p.yaml"))
+	if gotEn := enLoc.RenderError(nestedJoin); gotEn != "i18n: failed to load catalog file p.yaml: context canceled\nconc: supervised goroutine panicked: nested-boom\nconc: task callback must not be nil" {
+		t.Fatalf("en nested Join+PanicError = %q", gotEn)
+	}
+	if gotZh := zhLoc.RenderError(nestedJoin); gotZh != "加载国际化词库文件 p.yaml 失败：上下文已取消\n受监督并发协程发生 panic：nested-boom\n并发任务回调不能为空" {
+		t.Fatalf("zh nested Join+PanicError = %q", gotZh)
+	}
+}

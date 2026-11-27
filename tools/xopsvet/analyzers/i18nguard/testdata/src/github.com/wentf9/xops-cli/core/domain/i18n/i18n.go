@@ -19,6 +19,7 @@ type ErrorNode struct {
 	Message Message
 }
 
+func CanonicalFallback(id MessageID) string                         { return "" }
 func NewMessage(id MessageID) Message                               { return Message{ID: id} }
 func NewMessageWithFallback(id MessageID, fb string) Message        { return Message{ID: id} }
 func NewPluralMessage(id MessageID, n int64) Message                { return Message{ID: id} }

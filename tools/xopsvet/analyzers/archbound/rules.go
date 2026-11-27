@@ -166,7 +166,12 @@ func checkExternalImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 	return fmt.Sprintf("当前架构层禁止导入外部第三方包 %q", impPath), false
 }
 
+const coreDomainI18nPrefix = vetutil.ModulePrefix + "/core/domain/i18n"
+
 func checkInternalImport(src, dst vetutil.PkgInfo, impPath string) (string, bool) {
+	if matchBasePrefix(src.BasePath, coreDomainI18nPrefix) && !matchBasePrefix(dst.BasePath, coreDomainI18nPrefix) {
+		return fmt.Sprintf("core/domain/i18n 为绝对叶包，禁止导入同层或其他仓内包 %q", impPath), false
+	}
 	if isInternalLayerAllowed(src.Layer, dst.Layer) {
 		return "", true
 	}

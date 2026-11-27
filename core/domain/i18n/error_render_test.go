@@ -25,11 +25,19 @@ func (c *cyclicLocalizable) LocalizableView() ErrorNode {
 	return ErrorNode{Sentinel: c.sentinel, Message: c.msg, Cause: c.cause}
 }
 
+type catchAllLeaf struct {
+	detail string
+}
+
+func (c catchAllLeaf) Error() string { return c.detail }
+func (c catchAllLeaf) Is(error) bool { return true }
+
 type suppressedCustomNode struct {
 	sentinel   error
 	msg        Message
 	cause      error
 	suppressed []error
+	isSentinel bool
 }
 
 func (s *suppressedCustomNode) Error() string { return CanonicalError(s) }
@@ -39,6 +47,7 @@ func (s *suppressedCustomNode) LocalizableView() ErrorNode {
 		Message:             s.msg,
 		Cause:               s.cause,
 		SuppressedSentinels: s.suppressed,
+		IsSentinel:          s.isSentinel,
 	}
 }
 
@@ -276,5 +285,38 @@ func TestRenderErrorChainCyclesDepthAndCustomNode(t *testing.T) {
 	}
 	if got := auditWithDisk.Error(); got != "i18n: invalid parameter key op-1: disk full" {
 		t.Fatalf("自定义节点应保留非哨兵真实根因: got=%q", got)
+	}
+}
+
+func TestRenderErrorChainExactLeafO1AndAcyclicJoin(t *testing.T) {
+	// 1. 自指 SuppressedSentinels + 捕获全部目标的 Is 叶子绝不重入爆栈（O(1) 裸叶子判定）。
+	selfSuppressed := &suppressedCustomNode{
+		msg:        NewMessage(KeyCommonInternalError),
+		cause:      catchAllLeaf{detail: "catch-all leaf"},
+		isSentinel: true,
+	}
+	selfSuppressed.suppressed = []error{selfSuppressed}
+	if got := selfSuppressed.Error(); got != "internal error: catch-all leaf" {
+		t.Fatalf("自指 SuppressedSentinels + catch-all 叶子应 O(1) 安全终止并保留叶子文本: got=%q", got)
+	}
+
+	// 2. 深度 k=30 的无环 WrapSentinel + errors.Join(leaf, leaf) 链必须在节点预算内 O(1) 裸叶匹配并瞬时终止，零指数挂起。
+	leaf := catchAllLeaf{detail: "leaf"}
+	cur := Sentinel(KeyCommonNotFound)
+	for range 30 {
+		cur = WrapSentinel(cur, errors.Join(leaf, leaf))
+	}
+	if got := cur.Error(); !strings.HasPrefix(got, "resource not found: ") {
+		t.Fatalf("深层无环 WrapSentinel+Join 链应瞬时终止: got=%q", got)
+	}
+
+	// 3. 复合 LocalizableNode 与带直接子错误的非结构化容器不作为裸叶子哨兵参与精确叶子吞噬。
+	wrappedTarget := &suppressedCustomNode{sentinel: ErrInvalidParam, cause: errors.New("inner")}
+	if isExactLeafSentinel(catchAllLeaf{detail: wrappedTarget.Error()}, wrappedTarget) {
+		t.Fatal("复合 LocalizableNode 不得通过 isExactLeafSentinel 裸叶子匹配")
+	}
+	joinedTarget := errors.Join(errors.New("a"), errors.New("b"))
+	if isExactLeafSentinel(catchAllLeaf{detail: joinedTarget.Error()}, joinedTarget) {
+		t.Fatal("带直接子错误的非结构化容器不得通过 isExactLeafSentinel 裸叶子匹配")
 	}
 }

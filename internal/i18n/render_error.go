@@ -29,12 +29,27 @@ func (l *Localizer) RenderError(err error) string {
 	})
 }
 
+// joinCausalSegments 直接取用词库或规范兜底中的 common.error_join 模板并原样插值 head/tail，
+// 避免二次经由 BoundStr 触发 4096B 截断或非 UTF-8 改写，确保任意长度与字节内容均满足 enLoc.RenderError(err) == err.Error()。
 func (l *Localizer) joinCausalSegments(head, tail string) string {
-	return l.T(domi18n.KeyCommonErrorJoin, domi18n.BoundStr("head", head), domi18n.BoundStr("tail", tail))
+	tmpl, ok := l.lookupTemplate(domi18n.KeyCommonErrorJoin, false, 0)
+	if !ok || tmpl == "" {
+		tmpl = domi18n.CanonicalFallback(domi18n.KeyCommonErrorJoin)
+	}
+	return domi18n.FormatTemplate(tmpl, func(key string) (string, bool) {
+		switch key {
+		case "head":
+			return head, true
+		case "tail":
+			return tail, true
+		default:
+			return "", false
+		}
+	})
 }
 
 func (l *Localizer) renderUnstructuredNode(err error, children []error) (string, error, bool) {
-	if text, bareTarget, ok := l.renderDirectPanicError(err, children); ok {
+	if text, bareTarget, ok := l.renderDirectPanicError(err); ok {
 		return text, bareTarget, true
 	}
 	if len(children) == 0 {
@@ -43,24 +58,17 @@ func (l *Localizer) renderUnstructuredNode(err error, children []error) (string,
 	return "", nil, false
 }
 
-func (l *Localizer) renderDirectPanicError(err error, children []error) (string, error, bool) {
-	pe, ok := errors.AsType[*conc.PanicError](err)
-	if !ok || childrenHavePanicError(children) {
+// renderDirectPanicError 以 O(1) 单层非穿透断言识别直接 *conc.PanicError 节点，
+// 避免对嵌套 errors.Join 或带环兄弟分支执行整树重复穿透扫描。
+func (l *Localizer) renderDirectPanicError(err error) (string, error, bool) {
+	pe, ok := any(err).(*conc.PanicError)
+	if !ok {
 		return "", nil, false
 	}
 	if pe == nil || pe.Value() == nil {
 		return l.T(KeyConcTaskPanicked), conc.ErrTaskPanicked, true
 	}
 	return l.T(KeyConcPanic, domi18n.BoundStr("value", fmt.Sprint(pe.Value()))), nil, true
-}
-
-func childrenHavePanicError(children []error) bool {
-	for _, child := range children {
-		if _, ok := errors.AsType[*conc.PanicError](child); ok {
-			return true
-		}
-	}
-	return false
 }
 
 // renderMappedLeafSentinel 对纯叶子非结构化错误执行精确文本匹配（CORE-2），

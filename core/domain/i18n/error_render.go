@@ -233,20 +233,34 @@ func matchesAnySentinel(err error, suppressed []error) bool {
 	return false
 }
 
-// isExactLeafSentinel 执行精确叶子哨兵匹配（对齐 CORE-2 不变量）：
-// 要求 errors.Is 成立且叶子原文与目标哨兵规范文本逐字节相等，杜绝吞噬携带自定义诊断信息的叶子错误。
+// isExactLeafSentinel 执行 O(1) 零递归精确裸叶子哨兵匹配（对齐 CORE-2 与 M6 不变量）：
+// 仅当 target 为裸叶子哨兵、errors.Is 成立且叶子原文与哨兵规范文本逐字节相等时返回 true，
+// 严禁对复合或自指 LocalizableNode 重入 CanonicalError，杜绝环路爆栈、指数级复杂度与吞噬自定义诊断文本。
 func isExactLeafSentinel(err, target error) bool {
 	if err == nil || target == nil {
 		return false
 	}
-	return errors.Is(err, target) && err.Error() == sentinelErrorText(target)
+	targetText, ok := bareSentinelLeafText(target)
+	if !ok {
+		return false
+	}
+	return errors.Is(err, target) && err.Error() == targetText
 }
 
-func sentinelErrorText(target error) string {
-	if _, isNode, _ := inspectLocalizable(target); isNode {
-		return CanonicalError(target)
+// bareSentinelLeafText 仅对裸叶子哨兵返回其 O(1) 规范文本：
+//   - LocalizableNode：仅当有效纯哨兵且无下层 Cause/Sentinel 时取 view.Message.Canonical()（零递归）；
+//   - 非 LocalizableNode：仅当无直接子错误（len(UnwrapDirect(target)) == 0）时取 target.Error()。
+func bareSentinelLeafText(target error) (string, bool) {
+	if view, isNode, hasView := inspectLocalizable(target); isNode {
+		if hasView && view.IsSentinel && view.Message.IsValid() && view.Cause == nil && view.Sentinel == nil {
+			return view.Message.Canonical(), true
+		}
+		return "", false
 	}
-	return target.Error()
+	if len(UnwrapDirect(target)) != 0 {
+		return "", false
+	}
+	return target.Error(), true
 }
 
 func matchesExactLeafSentinel(err error, suppressed []error) bool {

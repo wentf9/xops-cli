@@ -82,7 +82,7 @@ func objectTypeParams(obj types.Object) *types.TypeParamList {
 	return nil
 }
 
-// hasStringUnderlyingTerm 递归检查泛型约束接口是否包含底层类型为 string 的项（含联合项 ~string 与嵌入接口如 cmp.Ordered）。
+// hasStringUnderlyingTerm 递归检查泛型约束接口是否包含底层类型为 string 的项（含指针项、联合项 ~string 与嵌入接口如 cmp.Ordered）。
 func hasStringUnderlyingTerm(t types.Type, seen map[types.Type]bool) bool {
 	if t == nil {
 		return false
@@ -95,6 +95,8 @@ func hasStringUnderlyingTerm(t types.Type, seen map[types.Type]bool) bool {
 	switch v := u.(type) {
 	case *types.Basic:
 		return v.Info()&types.IsString != 0
+	case *types.Pointer:
+		return hasStringUnderlyingTerm(v.Elem(), seen)
 	case *types.Named:
 		return hasStringUnderlyingTerm(v.Underlying(), seen)
 	case *types.Union:
@@ -202,7 +204,6 @@ func isI18nConstructorOrRenderer(obj types.Object) bool {
 			"NewMessage", "NewMessageWithFallback", "NewPluralMessage", "NewPluralMessageWithFallback",
 			"Sentinel", "SentinelWithFallback", "NewErrorWithFallback",
 			"E", "EF", "Wrap", "WrapS",
-			"EWithFallback", "EFWithFallback", "WrapWithFallback", "WrapSWithFallback",
 		}, obj.Name())
 	case internalI18nPkgPath:
 		return slices.Contains([]string{
@@ -217,7 +218,7 @@ func isI18nConstructorOrRenderer(obj types.Object) bool {
 
 func isCoreAutoFallbackConstructor(obj types.Object) bool {
 	return vetutil.IsPkgSymbol(obj, coreDomainI18nPkgPath,
-		"Sentinel", "E", "EF", "Wrap", "WrapS", "NewMessage", "NewPluralMessage",
+		"CanonicalFallback", "Sentinel", "E", "EF", "Wrap", "WrapS", "NewMessage", "NewPluralMessage",
 	)
 }
 

@@ -10,16 +10,17 @@ import (
 )
 
 const (
-	msgIDValueErr      = "i18nguard: i18n.MessageID 必须源自 core/domain/i18n 或 internal/i18n 声明的常量，禁止使用字面量、非常量转换或拼接值"
+	msgIDValueErr      = "i18nguard: i18n.MessageID 必须源自 core/domain/i18n 或 internal/i18n 声明的常量，禁止使用字面量、非常量转换、切片或拼接值"
 	msgIDConvErr       = "i18nguard: 禁止在属主包外通过类型转换构造 i18n.MessageID，请直接使用 core/domain/i18n 或 internal/i18n 导出的 MessageID 常量"
 	msgIDConcat        = "i18nguard: 禁止通过拼接构造或修改 i18n.MessageID，请直接使用导出的 MessageID 常量"
+	msgIDSlice         = "i18nguard: 禁止对 i18n.MessageID 执行切片运算构造新标识，请直接使用导出的 MessageID 常量"
 	msgIDGenericErr    = "i18nguard: 禁止在属主包外将 i18n.MessageID 实例化至含 string 底层约束的非标准库泛型声明"
 	msgIDInvalidArgErr = "i18nguard: 禁止向 i18n 构造或渲染函数传入无效标识 MessageIDInvalid"
 	msgIDCrossDomain   = "i18nguard: 禁止将 internal/i18n 声明的 MessageID 常量传入 core/domain/i18n 构造器，请改用 internal/i18n 对应构造器"
 )
 
 // checkMessageIDIntegrity 执行规则 1：保护 core/domain/i18n.MessageID 强类型完整性、
-// 封锁包外 *WithFallback 桥接符号与 ~string 泛型伪造，并拦截 MessageIDInvalid 实参与跨域键错配。
+// 封锁包外 *WithFallback 桥接符号、字符串切片与 ~string/指针泛型伪造，并拦截 MessageIDInvalid 实参与跨域键错配。
 func checkMessageIDIntegrity(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	isOwner := !pkgInfo.IsExternalTest && isMessageIDOwnerPkg(pkgInfo.BasePath)
 	constSpecs, constAddExprs := inspectConstAndTypeDecls(pass, isOwner)
@@ -38,6 +39,7 @@ func checkMessageIDIntegrity(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 		(*ast.SendStmt)(nil),
 		(*ast.CaseClause)(nil),
 		(*ast.BinaryExpr)(nil),
+		(*ast.SliceExpr)(nil),
 	}, func(n ast.Node) {
 		if !vetutil.IsPosInTestFile(pass, n.Pos()) {
 			checkMessageIDNode(pass, n, isOwner, constSpecs, constAddExprs, reported)
@@ -138,6 +140,8 @@ func checkMessageIDNode(
 		checkMessageIDExprs(pass, node.List, isOwner, reported)
 	case *ast.BinaryExpr:
 		checkMessageIDBinary(pass, node, isOwner, constAddExprs, reported)
+	case *ast.SliceExpr:
+		checkMessageIDSlice(pass, node, reported)
 	}
 }
 
@@ -183,6 +187,12 @@ func checkMessageIDBinary(pass *analysis.Pass, bin *ast.BinaryExpr, isOwner bool
 	}
 }
 
+func checkMessageIDSlice(pass *analysis.Pass, slice *ast.SliceExpr, reported map[token.Pos]bool) {
+	if isMessageIDType(pass.TypesInfo.TypeOf(slice)) {
+		reportOnce(pass, slice, reported, msgIDSlice)
+	}
+}
+
 func checkMessageIDExprs(pass *analysis.Pass, exprs []ast.Expr, isOwner bool, reported map[token.Pos]bool) {
 	for _, expr := range exprs {
 		checkMessageIDValueExpr(pass, expr, isOwner, reported)
@@ -208,7 +218,7 @@ func isAllowedMessageIDExpr(info *types.Info, expr ast.Expr, isOwner bool) bool 
 	case *ast.BasicLit:
 		// 仅属主包内允许零值空串 ""（等价于 MessageIDInvalid）；包外一律禁止任何字面量。
 		return isOwner && node.Kind == token.STRING && isEmptyStringLit(node.Value)
-	case *ast.BinaryExpr:
+	case *ast.BinaryExpr, *ast.SliceExpr:
 		return false
 	case *ast.Ident:
 		return isAllowedMessageIDObj(info.Uses[node])

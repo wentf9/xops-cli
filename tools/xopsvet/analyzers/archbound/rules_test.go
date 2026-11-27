@@ -373,6 +373,13 @@ func TestCheckImportAllowedInternalI18n(t *testing.T) {
 		{name: "conc_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/conc", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
 		{name: "core_engine_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/engine", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
 		{name: "core_domain_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
+		{name: "core_domain_i18n_allows_internal_corecatalog", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", wantOK: true},
+		{name: "core_domain_i18n_subpkg_allows_parent", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
+		{name: "core_domain_i18n_denies_sibling_algebraic", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/core/domain/algebraic", wantOK: false},
+		{name: "core_domain_i18n_subpkg_denies_sibling_algebraic", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n/internal/corecatalog", impPath: vetutil.ModulePrefix + "/core/domain/algebraic", wantOK: false},
+		{name: "core_domain_i18n_test_denies_sibling_algebraic", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/algebraic", wantOK: false},
+		{name: "core_domain_i18n_test_allows_self", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n_test", isTest: true, impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
+		{name: "core_domain_sibling_allows_core_domain_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/algebraic", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
