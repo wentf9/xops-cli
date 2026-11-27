@@ -16,6 +16,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -113,7 +114,7 @@ func (s *Service) validateLogRequest(ctx context.Context, req LogStreamRequest) 
 	}
 	tailN, maxBytes := pickIf(req.TailLines == 0, defaultLogTailLines, req.TailLines), pickIf(req.MaxBytes == 0, uint64(defaultLogMaxBytes), req.MaxBytes)
 	if tailN < 1 || tailN > maxLogTailLines || maxBytes > maxAllowedLogBytes {
-		return logReqPrepared{}, fmt.Errorf("%w: tail_lines 或 max_bytes 越界", ErrInvalidRequest)
+		return logReqPrepared{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "tail_lines/max_bytes"))
 	}
 	return logReqPrepared{posixCallBase: base, tailN: tailN, maxBytes: maxBytes}, nil
 }
@@ -237,7 +238,7 @@ func (s *Service) validateMetricsRequest(ctx context.Context, req MetricsStreamR
 	maxSamples, topN, sortBy := pickIf(req.MaxSamples == 0, 1, req.MaxSamples), pickIf(req.TopProcesses == 0, defaultMetricsTopProcs, req.TopProcesses), req.SortBy.OrElse(ProcessSortCPU)
 	if interval.Std() < minMetricsInterval || interval.Std() > maxMetricsInterval ||
 		maxSamples < 1 || maxSamples > maxMetricsSamples || topN < 0 || topN > maxMetricsTopProcs || !sortBy.IsValid() {
-		return metricsReqPrepared{}, fmt.Errorf("%w: metrics 参数越界", ErrInvalidRequest)
+		return metricsReqPrepared{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "metrics_params"))
 	}
 	return metricsReqPrepared{posixCallBase: base, interval: interval, maxSamples: maxSamples, topN: topN, sortBy: sortBy}, nil
 }

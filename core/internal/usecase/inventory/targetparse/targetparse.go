@@ -3,13 +3,13 @@
 package targetparse
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 )
@@ -40,7 +40,7 @@ func (p ParsedTarget) InlineLayer() option.OptionLayer {
 func ParseSpec(raw string, invalidErr error) (ParsedTarget, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" || len(trimmed) > maxRawTargetBytes || hasForbiddenTargetChars(raw) || strings.ContainsFunc(trimmed, unicode.IsSpace) {
-		return ParsedTarget{}, fmt.Errorf("%w: %q 为空、超长或包含非法空白/控制字符", invalidErr, raw)
+		return ParsedTarget{}, domi18n.EF(invalidErr, domi18n.KeyUCInvTargetMalformed, domi18n.BoundStr("target", raw), domi18n.Str("reason", "empty, too long, or contains illegal whitespace/control characters"))
 	}
 	userOpt, hostPart, err := splitTargetUser(trimmed, invalidErr)
 	var origHost option.OriginalHostSpec
@@ -54,17 +54,17 @@ func ParseSpec(raw string, invalidErr error) (ParsedTarget, error) {
 // ParseHopSpec 将已校验的 option.HopTarget 转换为统一的 ParsedTarget 供递归跳板解析复用。
 func ParseHopSpec(h option.HopTarget, invalidErr error) (pt ParsedTarget, err error) {
 	if !h.IsValid() {
-		return pt, fmt.Errorf("%w: 无效 ProxyJump HopTarget", invalidErr)
+		return pt, domi18n.EF(invalidErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ProxyJump HopTarget"))
 	}
 	if h.User() != "" {
 		u, uErr := option.ParseUsername(h.User())
 		if uErr != nil {
-			return pt, fmt.Errorf("%w: 跳板用户名非法: %w", invalidErr, uErr)
+			return pt, domi18n.WrapS(invalidErr, uErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "jump username"))
 		}
 		pt.User = algebraic.Some(u)
 	}
 	if pt.OrigHost, err = option.ParseOriginalHost(h.Host()); err != nil {
-		return ParsedTarget{}, fmt.Errorf("%w: 跳板主机 %q 非法: %w", invalidErr, h.Host(), err)
+		return ParsedTarget{}, domi18n.WrapS(invalidErr, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "jump host"), domi18n.BoundStr("value", h.Host()))
 	}
 	if p, ok := h.Port(); ok {
 		pt.Port = algebraic.Some(p)
@@ -78,23 +78,23 @@ func splitTargetUser(trimmed string, invalidErr error) (algebraic.Option[option.
 		return algebraic.None[option.Username](), trimmed, nil
 	}
 	if userPart == "" || hostPart == "" || strings.ContainsRune(hostPart, '@') {
-		return algebraic.None[option.Username](), "", fmt.Errorf("%w: 目标 %q 含空用户/空主机或重复 '@'", invalidErr, trimmed)
+		return algebraic.None[option.Username](), "", domi18n.EF(invalidErr, domi18n.KeyUCInvTargetMalformed, domi18n.BoundStr("target", trimmed), domi18n.Str("reason", "empty user/host or duplicate '@'"))
 	}
 	u, err := option.ParseUsername(userPart)
 	if err != nil {
-		return algebraic.None[option.Username](), "", fmt.Errorf("%w: %w", invalidErr, err)
+		return algebraic.None[option.Username](), "", domi18n.WrapSentinel(invalidErr, err)
 	}
 	return algebraic.Some(u), hostPart, nil
 }
 
-func parseIPv6OriginalHost(raw, errMsg string, invalidErr error) (z option.OriginalHostSpec, err error) {
+func parseIPv6OriginalHost(raw, full, reason string, invalidErr error) (z option.OriginalHostSpec, err error) {
 	ch, err := netaddr.ParseCanonicalHost(raw)
 	if err != nil || !ch.IsIPv6() {
-		return z, fmt.Errorf("%w: %s", invalidErr, errMsg)
+		return z, domi18n.EF(invalidErr, domi18n.KeyUCInvTargetMalformed, domi18n.BoundStr("target", full), domi18n.Str("reason", reason))
 	}
 	orig, oErr := option.OriginalHostFromCanonical(ch)
 	if oErr != nil {
-		return z, fmt.Errorf("%w: %w", invalidErr, oErr)
+		return z, domi18n.WrapSentinel(invalidErr, oErr)
 	}
 	return orig, nil
 }
@@ -102,17 +102,17 @@ func parseIPv6OriginalHost(raw, errMsg string, invalidErr error) (z option.Origi
 func parseTargetHostPort(hostPart, full string, invalidErr error) (z option.OriginalHostSpec, nonePort algebraic.Option[uint16], err error) {
 	switch {
 	case hostPart == "":
-		return z, nonePort, fmt.Errorf("%w: 目标 %q 缺少主机段", invalidErr, full)
+		return z, nonePort, domi18n.EF(invalidErr, domi18n.KeyUCInvTargetMalformed, domi18n.BoundStr("target", full), domi18n.Str("reason", "missing host segment"))
 	case hostPart[0] == '[':
 		return parseBracketedTargetHostPort(hostPart, full, invalidErr)
 	case strings.ContainsAny(hostPart, "[]"):
-		return z, nonePort, fmt.Errorf("%w: 目标 %q 包含非法方括号", invalidErr, full)
+		return z, nonePort, domi18n.EF(invalidErr, domi18n.KeyUCInvTargetMalformed, domi18n.BoundStr("target", full), domi18n.Str("reason", "invalid brackets"))
 	}
 	switch strings.Count(hostPart, ":") {
 	case 0:
 		orig, err := option.ParseOriginalHost(hostPart)
 		if err != nil {
-			return z, nonePort, fmt.Errorf("%w: %w", invalidErr, err)
+			return z, nonePort, domi18n.WrapSentinel(invalidErr, err)
 		}
 		return orig, nonePort, nil
 	case 1:
@@ -123,12 +123,12 @@ func parseTargetHostPort(hostPart, full string, invalidErr error) (z option.Orig
 			p, err = parseStrictTargetPort(pStr)
 		}
 		if err != nil {
-			return z, nonePort, fmt.Errorf("%w: %w", invalidErr, err)
+			return z, nonePort, domi18n.WrapSentinel(invalidErr, err)
 		}
 		return orig, algebraic.Some(p), nil
 	default:
 		// 含两个及以上冒号时仅接受合法裸 IPv6 字面量（含可选 %zone，不带显式端口）。
-		orig, err := parseIPv6OriginalHost(hostPart, fmt.Sprintf("目标 %q 既非合法 IPv6 也非规范 host:port", full), invalidErr)
+		orig, err := parseIPv6OriginalHost(hostPart, full, "neither valid IPv6 nor valid host:port", invalidErr)
 		return orig, nonePort, err
 	}
 }
@@ -136,9 +136,9 @@ func parseTargetHostPort(hostPart, full string, invalidErr error) (z option.Orig
 func parseBracketedTargetHostPort(hostPart, full string, invalidErr error) (z option.OriginalHostSpec, nonePort algebraic.Option[uint16], err error) {
 	closeIdx := strings.IndexByte(hostPart, ']')
 	if closeIdx < 2 {
-		return z, nonePort, fmt.Errorf("%w: 目标 %q 方括号畸形", invalidErr, full)
+		return z, nonePort, domi18n.EF(invalidErr, domi18n.KeyUCInvTargetMalformed, domi18n.BoundStr("target", full), domi18n.Str("reason", "malformed brackets"))
 	}
-	orig, err := parseIPv6OriginalHost(hostPart[:closeIdx+1], fmt.Sprintf("目标 %q 方括号内必须为合法 IPv6 地址", full), invalidErr)
+	orig, err := parseIPv6OriginalHost(hostPart[:closeIdx+1], full, "bracketed host must be a valid IPv6 address", invalidErr)
 	if err != nil {
 		return z, nonePort, err
 	}
@@ -147,27 +147,27 @@ func parseBracketedTargetHostPort(hostPart, full string, invalidErr error) (z op
 		return orig, nonePort, nil
 	}
 	if rest[0] != ':' {
-		return z, nonePort, fmt.Errorf("%w: 目标 %q 方括号后存在非法后缀", invalidErr, full)
+		return z, nonePort, domi18n.EF(invalidErr, domi18n.KeyUCInvTargetMalformed, domi18n.BoundStr("target", full), domi18n.Str("reason", "invalid suffix after brackets"))
 	}
 	p, err := parseStrictTargetPort(rest[1:])
 	if err != nil {
-		return z, nonePort, fmt.Errorf("%w: %w", invalidErr, err)
+		return z, nonePort, domi18n.WrapSentinel(invalidErr, err)
 	}
 	return orig, algebraic.Some(p), nil
 }
 
 func parseStrictTargetPort(raw string) (uint16, error) {
 	if raw == "" || raw[0] == '0' {
-		return 0, fmt.Errorf("端口 %q 不能为空或含前导零", raw)
+		return 0, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "port"), domi18n.BoundStr("value", raw))
 	}
 	for i := range len(raw) {
 		if raw[i] < '0' || raw[i] > '9' {
-			return 0, fmt.Errorf("端口 %q 含非数字字符", raw)
+			return 0, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "port"), domi18n.BoundStr("value", raw))
 		}
 	}
 	v, err := strconv.ParseUint(raw, 10, 16)
 	if err != nil || v == 0 {
-		return 0, fmt.Errorf("端口 %q 超出 [1, 65535] 范围", raw)
+		return 0, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "port"), domi18n.BoundStr("value", raw))
 	}
 	return uint16(v), nil
 }

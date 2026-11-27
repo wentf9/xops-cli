@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/playbook"
@@ -317,9 +317,9 @@ func classifyBatchRunError(report BatchExecReport, firstUnknown execution.Execut
 	if firstUnknown != nil {
 		cause := ErrUncertainOutcome
 		if halted {
-			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, gate.ErrGateHalted)
+			cause = domi18n.WrapSentinel(ErrUncertainOutcome, gate.ErrGateHalted)
 		} else if runErr != nil && !errors.Is(runErr, ErrUncertainOutcome) {
-			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr)
+			cause = domi18n.WrapSentinel(ErrUncertainOutcome, runErr)
 		}
 		if wrapped, err := gate.WrapOutcomeError(firstUnknown, cause); err == nil {
 			return wrapped
@@ -327,13 +327,13 @@ func classifyBatchRunError(report BatchExecReport, firstUnknown execution.Execut
 		return cause
 	}
 	if halted && !errors.Is(runErr, gate.ErrGateHalted) {
-		return pickIf[error](runErr != nil, fmt.Errorf("%w: %w", gate.ErrGateHalted, runErr), gate.ErrGateHalted)
+		return pickIf[error](runErr != nil, domi18n.WrapSentinel(gate.ErrGateHalted, runErr), gate.ErrGateHalted)
 	}
 	if runErr != nil {
 		return runErr
 	}
 	if report.failedCount > 0 {
-		return fmt.Errorf("%w: succeeded=%d failed=%d", ErrBatchFailed, report.succeededCount, report.failedCount)
+		return domi18n.EF(ErrBatchFailed, domi18n.KeyUCAutoBatchCounts, domi18n.Int("succeeded", report.succeededCount), domi18n.Int("failed", report.failedCount))
 	}
 	return nil
 }

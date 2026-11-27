@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime/protocol"
 )
@@ -41,7 +41,7 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if err := s.validateHTTPHostAndOrigin(r); err != nil {
-			writeHTTPJSONError(w, http.StatusForbidden, "forbidden_origin_or_host", "拒绝非法 Host 或 Origin 请求头（DNS Rebinding / CSRF 防护）", false)
+			writeHTTPJSONError(w, http.StatusForbidden, "forbidden_origin_or_host", "rejected unauthorized Host or Origin header (DNS rebinding / CSRF protection)", false)
 			return
 		}
 		mux.ServeHTTP(w, r)
@@ -56,7 +56,7 @@ func (s *Server) ListenAndServeHTTP(ctx context.Context, addr string) error {
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", addr)
 	if err != nil {
-		return fmt.Errorf("监听 MCP HTTP 地址 %q 失败: %w", addr, err)
+		return domi18n.Wrap(err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "listen MCP HTTP"), domi18n.BoundStr("target", addr))
 	}
 	return s.ServeHTTPListener(ctx, ln)
 }
@@ -65,7 +65,7 @@ func (s *Server) ListenAndServeHTTP(ctx context.Context, addr string) error {
 // 启动前自动执行 Prepare（O(1) 崩溃审计对账 + RecoverJournals），取消或 Close 时同步优雅排空（0 goleak）。
 func (s *Server) ServeHTTPListener(ctx context.Context, ln net.Listener) error {
 	if ln == nil {
-		return fmt.Errorf("%w: net.Listener 不能为 nil", ErrInvalidConfig)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "net.Listener"))
 	}
 	runCtx, cleanup, err := s.beginTransport(ctx)
 	if err != nil {
@@ -108,7 +108,7 @@ func (s *Server) ServeHTTPListener(ctx context.Context, ln net.Listener) error {
 func validateHTTPBindAddr(addr string, allowNonLoopback bool) error {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(addr))
 	if err != nil {
-		return fmt.Errorf("%w: 无效监听地址 %q: %w", ErrInvalidConfig, addr, err)
+		return domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "listen address"), domi18n.BoundStr("value", addr))
 	}
 	if allowNonLoopback {
 		return nil
@@ -118,7 +118,7 @@ func validateHTTPBindAddr(addr string, allowNonLoopback bool) error {
 	}
 	ip, pErr := netip.ParseAddr(host)
 	if pErr != nil || !ip.IsLoopback() {
-		return fmt.Errorf("%w: %q", ErrNonLoopbackAddress, addr)
+		return domi18n.EF(ErrNonLoopbackAddress, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "listen address"), domi18n.BoundStr("value", addr))
 	}
 	return nil
 }
@@ -136,7 +136,7 @@ func (s *Server) validateHTTPHostAndOrigin(r *http.Request) error {
 
 func (s *Server) validateAllowedHost(rawHost string) error {
 	if rawHost == "" {
-		return errors.New("缺少 Host 请求头")
+		return domi18n.E(domi18n.KeyMCPHTTPHeaderMissing, domi18n.Str("header", "Host"))
 	}
 	host := rawHost
 	if strings.Contains(rawHost, ":") {
@@ -155,16 +155,16 @@ func (s *Server) validateAllowedHost(rawHost string) error {
 	}) {
 		return nil
 	}
-	return fmt.Errorf("未授权的 Host 请求头 %q", rawHost)
+	return domi18n.E(domi18n.KeyMCPHTTPHeaderReject, domi18n.Str("header", "Host"), domi18n.BoundStr("value", rawHost))
 }
 
 func (s *Server) validateAllowedOrigin(origin string) error {
 	u, err := url.Parse(origin)
 	if err != nil {
-		return fmt.Errorf("无效 Origin %q: %w", origin, err)
+		return domi18n.Wrap(err, domi18n.KeyMCPHTTPHeaderReject, domi18n.Str("header", "Origin"), domi18n.BoundStr("value", origin))
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
-		return fmt.Errorf("非法 Origin 协议或主机 %q", origin)
+		return domi18n.E(domi18n.KeyMCPHTTPHeaderReject, domi18n.Str("header", "Origin"), domi18n.BoundStr("value", origin))
 	}
 	if lbErr := checkLoopbackHostName(u.Hostname()); lbErr == nil {
 		return nil
@@ -174,7 +174,7 @@ func (s *Server) validateAllowedOrigin(origin string) error {
 	}) {
 		return nil
 	}
-	return fmt.Errorf("未授权的 Origin %q", origin)
+	return domi18n.E(domi18n.KeyMCPHTTPHeaderReject, domi18n.Str("header", "Origin"), domi18n.BoundStr("value", origin))
 }
 
 func checkLoopbackHostName(host string) error {
@@ -186,7 +186,7 @@ func checkLoopbackHostName(host string) error {
 		return err
 	}
 	if !ip.IsLoopback() {
-		return fmt.Errorf("%w: %q", ErrNonLoopbackAddress, host)
+		return domi18n.EF(ErrNonLoopbackAddress, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "host"), domi18n.BoundStr("value", host))
 	}
 	return nil
 }
@@ -239,13 +239,13 @@ func (s *Server) handleMCPHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleMCPHTTPDelete(w, r)
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
-		writeHTTPJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "仅允许 GET/POST/DELETE", false)
+		writeHTTPJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET, POST, and DELETE are allowed", false)
 	}
 }
 
 func (s *Server) handleMCPHTTPPost(w http.ResponseWriter, r *http.Request) {
 	if !hasMediaTypePrefix(r.Header.Get(headerContentType), mimeJSON) {
-		writeHTTPJSONError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type 必须为 application/json", false)
+		writeHTTPJSONError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json", false)
 		return
 	}
 	raw, readStatus, err := readBoundedHTTPBody(w, r, s.maxMessageBytes)
@@ -281,7 +281,7 @@ func (s *Server) handleMCPHTTPPost(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMCPHTTPInitialize(w http.ResponseWriter, r *http.Request, req protocol.Request) {
 	if req.IsNotification() {
-		respBytes, _, _ := encodeErrResp(algebraic.None[protocol.RequestID](), protocol.CodeInvalidRequest, "initialize 必须携带请求 id", protocol.ToolErrorPayload{
+		respBytes, _, _ := encodeErrResp(algebraic.None[protocol.RequestID](), protocol.CodeInvalidRequest, "initialize requires request id", protocol.ToolErrorPayload{
 			Code: "invalid_request", Message: "initialize requires request id",
 		})
 		writeRawJSON(w, http.StatusBadRequest, respBytes)
@@ -343,10 +343,10 @@ func (s *Server) writeDecodedHTTPResponse(w http.ResponseWriter, r *http.Request
 func (s *Server) requireExistingHTTPSession(r *http.Request) (string, int, error) {
 	given := strings.TrimSpace(r.Header.Get(headerMCPSessionID))
 	if given == "" {
-		return "", http.StatusBadRequest, errors.New("缺少必需的 Mcp-Session-Id 请求头")
+		return "", http.StatusBadRequest, domi18n.E(domi18n.KeyMCPHTTPHeaderMissing, domi18n.Str("header", headerMCPSessionID))
 	}
 	if !s.hasHTTPSession(given) {
-		return "", http.StatusNotFound, errors.New("Mcp-Session-Id 会话不存在或已关闭")
+		return "", http.StatusNotFound, domi18n.E(domi18n.KeyMCPHTTPSessionMiss)
 	}
 	return given, 0, nil
 }
@@ -357,7 +357,7 @@ func (s *Server) createHTTPSession(protoVer string) (string, error) {
 	}
 	var raw [sessionIDEntropyLen]byte
 	if _, err := io.ReadFull(s.entropy, raw[:]); err != nil {
-		return "", fmt.Errorf("分配 MCP HTTP 会话标识失败: %w", err)
+		return "", domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "allocate MCP HTTP session ID"))
 	}
 	sid := hex.EncodeToString(raw[:])
 	s.sessMu.Lock()
@@ -396,16 +396,16 @@ func (s *Server) hasHTTPSession(id string) bool {
 func (s *Server) handleMCPHTTPGetSSE(w http.ResponseWriter, r *http.Request) {
 	sid := strings.TrimSpace(r.Header.Get(headerMCPSessionID))
 	if sid == "" || !s.hasHTTPSession(sid) {
-		writeHTTPJSONError(w, http.StatusNotFound, "invalid_session", "缺少或无效的 Mcp-Session-Id", false)
+		writeHTTPJSONError(w, http.StatusNotFound, "invalid_session", "missing or invalid Mcp-Session-Id", false)
 		return
 	}
 	if !strings.Contains(strings.ToLower(r.Header.Get(headerAccept)), mimeEventStream) {
-		writeHTTPJSONError(w, http.StatusNotAcceptable, "not_acceptable", "GET /mcp 需声明 Accept: text/event-stream", false)
+		writeHTTPJSONError(w, http.StatusNotAcceptable, "not_acceptable", "GET /mcp requires Accept: text/event-stream", false)
 		return
 	}
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeHTTPJSONError(w, http.StatusInternalServerError, "streaming_unsupported", "响应写入器不支持流式刷新", false)
+		writeHTTPJSONError(w, http.StatusInternalServerError, "streaming_unsupported", "response writer does not support streaming flush", false)
 		return
 	}
 	w.Header().Set(headerContentType, mimeEventStream)
@@ -423,7 +423,7 @@ func (s *Server) handleMCPHTTPGetSSE(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMCPHTTPDelete(w http.ResponseWriter, r *http.Request) {
 	sid := strings.TrimSpace(r.Header.Get(headerMCPSessionID))
 	if sid == "" || !s.hasHTTPSession(sid) {
-		writeHTTPJSONError(w, http.StatusNotFound, "invalid_session", "Mcp-Session-Id 会话不存在", false)
+		writeHTTPJSONError(w, http.StatusNotFound, "invalid_session", "Mcp-Session-Id session does not exist", false)
 		return
 	}
 	s.sessMu.Lock()
@@ -437,9 +437,9 @@ func readBoundedHTTPBody(w http.ResponseWriter, r *http.Request, maxBytes int64)
 	data, err := io.ReadAll(limited)
 	if err != nil {
 		if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
-			return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("%w: %w", ErrMessageTooLarge, err)
+			return nil, http.StatusRequestEntityTooLarge, domi18n.WrapSentinel(ErrMessageTooLarge, err)
 		}
-		return nil, http.StatusBadRequest, fmt.Errorf("读取 HTTP 请求体失败: %w", err)
+		return nil, http.StatusBadRequest, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "read HTTP request body"))
 	}
 	return data, 0, nil
 }

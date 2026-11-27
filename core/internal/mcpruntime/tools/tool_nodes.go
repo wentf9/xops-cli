@@ -3,10 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json/jsontext"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -41,7 +41,7 @@ type nodesArgs struct {
 
 func (r *Registry) callNodes(ctx context.Context, rawArgs jsontext.Value) (protocol.CallToolResult, error) {
 	if r.inventory == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: InventoryService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "InventoryService"))
 	}
 	args, err := decodeToolArgs[nodesArgs](rawArgs)
 	if err != nil {
@@ -64,7 +64,7 @@ func (r *Registry) callNodes(ctx context.Context, rawArgs jsontext.Value) (proto
 	case "list_import_formats", "plan_import", "apply_import":
 		return r.nodesImport(ctx, args, risk, approval)
 	default:
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 未知 nodes action %q", protocol.ErrInvalidParams, args.Action)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "nodes action"), domi18n.BoundStr("value", args.Action))
 	}
 }
 
@@ -92,7 +92,7 @@ func (r *Registry) nodesQueryHost(ctx context.Context, args nodesArgs, qReq ucin
 	}
 	id, err := inventory.ParseHostID(args.ID)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	h, rev, err := r.inventory.GetHost(ctx, id, qReq)
 	if err != nil {
@@ -117,7 +117,7 @@ func (r *Registry) nodesQueryIdentity(ctx context.Context, args nodesArgs, qReq 
 	}
 	id, err := inventory.ParseIdentityID(args.ID)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	ident, rev, err := r.inventory.GetIdentity(ctx, id, qReq)
 	if err != nil {
@@ -142,7 +142,7 @@ func (r *Registry) nodesQueryNode(ctx context.Context, args nodesArgs, qReq ucin
 	}
 	id, err := inventory.ParseNodeID(args.ID)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	n, rev, err := r.inventory.GetNode(ctx, id, qReq)
 	if err != nil {
@@ -184,7 +184,7 @@ func (r *Registry) nodesMutateHost(ctx context.Context, args nodesArgs, expRev a
 	if args.Action == "delete_host" {
 		id, err := inventory.ParseHostID(args.ID)
 		if err != nil {
-			return zeroRes, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+			return zeroRes, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 		}
 		return r.inventory.DeleteHost(ctx, ucinv.DeleteHostRequest{
 			ID: id, ExpectedRevision: expRev, ScopeSummary: args.ScopeSummary, Risk: risk, Approval: approval,
@@ -192,7 +192,7 @@ func (r *Registry) nodesMutateHost(ctx context.Context, args nodesArgs, expRev a
 	}
 	h, ok := args.Host.Get()
 	if !ok {
-		return zeroRes, fmt.Errorf("%w: 缺少 host 对象", protocol.ErrInvalidParams)
+		return zeroRes, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "host"))
 	}
 	req := ucinv.HostMutationRequest{Host: h, ExpectedRevision: expRev, ScopeSummary: args.ScopeSummary, Risk: risk, Approval: approval}
 	if args.Action == "create_host" {
@@ -206,7 +206,7 @@ func (r *Registry) nodesMutateIdentity(ctx context.Context, args nodesArgs, expR
 	if args.Action == "delete_identity" {
 		id, err := inventory.ParseIdentityID(args.ID)
 		if err != nil {
-			return zeroRes, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+			return zeroRes, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 		}
 		return r.inventory.DeleteIdentity(ctx, ucinv.DeleteIdentityRequest{
 			ID: id, ExpectedRevision: expRev, DeleteUnusedSecrets: args.DeleteUnusedSecrets,
@@ -215,7 +215,7 @@ func (r *Registry) nodesMutateIdentity(ctx context.Context, args nodesArgs, expR
 	}
 	ident, ok := args.Identity.Get()
 	if !ok {
-		return zeroRes, fmt.Errorf("%w: 缺少 identity 对象", protocol.ErrInvalidParams)
+		return zeroRes, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "identity"))
 	}
 	req := ucinv.IdentityMutationRequest{
 		Identity: ident, ExpectedRevision: expRev, GCUnreferencedOldSecrets: args.GCUnreferencedOldSecrets,
@@ -232,7 +232,7 @@ func (r *Registry) nodesMutateNode(ctx context.Context, args nodesArgs, expRev a
 	if args.Action == "delete_node" {
 		id, err := inventory.ParseNodeID(args.ID)
 		if err != nil {
-			return zeroRes, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+			return zeroRes, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 		}
 		return r.inventory.DeleteNode(ctx, ucinv.DeleteNodeRequest{
 			ID: id, ExpectedRevision: expRev, DeleteUnusedSecrets: args.DeleteUnusedSecrets,
@@ -241,7 +241,7 @@ func (r *Registry) nodesMutateNode(ctx context.Context, args nodesArgs, expRev a
 	}
 	n, ok := args.Node.Get()
 	if !ok {
-		return zeroRes, fmt.Errorf("%w: 缺少 node 对象", protocol.ErrInvalidParams)
+		return zeroRes, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "node"))
 	}
 	req := ucinv.NodeMutationRequest{
 		Node: n, ExpectedRevision: expRev, GCUnreferencedOldSecrets: args.GCUnreferencedOldSecrets,
@@ -281,7 +281,7 @@ func (r *Registry) nodesInspect(ctx context.Context, args nodesArgs, qReq ucinv.
 func (r *Registry) nodesResolveAuthorized(ctx context.Context, rawTarget string, qReq ucinv.QueryRequest) (protocol.CallToolResult, error) {
 	target := strings.TrimSpace(rawTarget)
 	if target == "" {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: target 不能为空", protocol.ErrInvalidParams)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "target"))
 	}
 	binding, err := security.NewOperationBinding(security.OperationBindingSpec{
 		Capability: security.CapabilityKindOf[security.CapInspect](),
@@ -291,7 +291,7 @@ func (r *Registry) nodesResolveAuthorized(ctx context.Context, rawTarget string,
 		Parameters: map[string]string{"target": target},
 	})
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	gReq, err := gate.NewGateRequest[security.CapInspect](gate.GateRequestSpec[security.CapInspect]{
 		Binding:      binding,
@@ -300,7 +300,7 @@ func (r *Registry) nodesResolveAuthorized(ctx context.Context, rawTarget string,
 		Approval:     qReq.Approval,
 	})
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	var resolved ucinv.ResolvedTarget
 	if err := gate.WithAuthorized[security.CapInspect](ctx, r.gate, gReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {

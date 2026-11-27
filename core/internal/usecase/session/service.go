@@ -3,13 +3,13 @@ package session
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -47,7 +47,7 @@ type Service struct {
 // NewService 校验必填依赖（Gate、Pool、Clock）并构造会话执行 Service。
 func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Gate == nil || cfg.Pool == nil || cfg.Pool.IsClosed() || cfg.Clock == nil {
-		return nil, fmt.Errorf("%w: Gate/Pool/Clock 为必填且不可关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Gate/Pool/Clock"))
 	}
 	return &Service{cfg: cfg, valid: true}, nil
 }
@@ -59,7 +59,7 @@ func (s *Service) CanSuspendProcessGroup() (security.Verdict, error) {
 		return security.VerdictDeny, ErrServiceNotInitialized
 	}
 	if s.cfg.Terminal == nil {
-		return security.VerdictDeny, fmt.Errorf("%w: TerminalPort 未配置", ErrPortUnavailable)
+		return security.VerdictDeny, domi18n.EF(ErrPortUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "TerminalPort"))
 	}
 	v, err := s.cfg.Terminal.CanSuspendProcessGroup()
 	if err != nil || !v.IsValid() {
@@ -114,7 +114,7 @@ func (s *Service) Exec(ctx context.Context, req ExecRequest) (execution.Executio
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_request", err), err
 	}
 	if !req.Command.IsValid() {
-		err := fmt.Errorf("%w: CommandPlan 无效", ErrInvalidRequest)
+		err := domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "CommandPlan"))
 		return notStartedSessionOutcome(execution.StartPhaseValidate, "invalid_command", err), err
 	}
 	if err := validateScriptTTY(req.Command, req.RequestTTY); err != nil {
@@ -165,7 +165,7 @@ func (e *firstErr) record(err error) {
 func (e *firstErr) get() error { e.mu.Lock(); defer e.mu.Unlock(); return e.err }
 func validateScriptTTY(cmd execution.CommandPlan, tty RequestTTYMode) error {
 	if cmd.Kind() == execution.PlanKindScript && (cmd.PTY() || tty == RequestTTYYes || tty == RequestTTYForce) {
-		return fmt.Errorf("%w: PlanKindScript 经 stdin 投递脚本正文，禁止与 RequestTTY yes/force 或 PTY 组合", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonMutuallyExclusive, domi18n.Str("first", "PlanKindScript"), domi18n.Str("second", "PTY/RequestTTY"))
 	}
 	return nil
 }
@@ -185,18 +185,18 @@ func (s *Service) validateBaseCall(ctx context.Context, connPlan plan.SealedConn
 	}
 	switch {
 	case !connPlan.IsValid():
-		return fmt.Errorf("%w: SealedConnectionPlan 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SealedConnectionPlan"))
 	case !ttyMode.IsZero() && !ttyMode.IsValid():
 		return ErrInvalidRequestTTY
 	case risk.IsSome() && !risk.OrElse(security.RiskUnknown).IsValid():
-		return fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel"))
 	}
 	return nil
 }
 func resolvePlanTargetAndNode(connPlan plan.SealedConnectionPlan, explicitNodeID string) (plan.HopSpec, string, error) {
 	targetHop, ok := connPlan.Target()
 	if !ok {
-		return zeroVal[plan.HopSpec](), "", fmt.Errorf("%w: 连接计划缺少末跳目标", ErrInvalidRequest)
+		return zeroVal[plan.HopSpec](), "", domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "target_hop"))
 	}
 	if explicitNodeID == "" {
 		explicitNodeID = targetHop.NodeID()

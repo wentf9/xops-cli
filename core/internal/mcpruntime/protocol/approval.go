@@ -3,10 +3,10 @@ package protocol
 import (
 	"encoding/json/jsontext"
 	"errors"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	ucauto "github.com/wentf9/xops-cli/core/internal/usecase/automation"
@@ -20,7 +20,7 @@ import (
 
 const (
 	maxErrorMessageBytes = 1024
-	approvalNextStepHint = "向人工操作员展示 envelope 与 envelope_digest，确认后携带相同参数与 approval={verdict, envelope_digest, envelope} 重新调用。"
+	approvalNextStepHint = "Present envelope and envelope_digest to a human operator; once approved, re-invoke with identical parameters and approval={verdict, envelope_digest, envelope}."
 )
 
 // DecodeApprovalSubmission 将可选的 MCP ApprovalSubmissionDTO 校验并转换为不可变 gate.ApprovalSubmission。
@@ -31,15 +31,15 @@ func DecodeApprovalSubmission(opt algebraic.Option[ApprovalSubmissionDTO]) (alge
 	}
 	resp, err := ports.NewApprovalDecisionResponse(dto.Verdict, dto.EnvelopeDigest, dto.Comment)
 	if err != nil {
-		return algebraic.None[gate.ApprovalSubmission](), fmt.Errorf("%w: %w", ErrInvalidApproval, err)
+		return algebraic.None[gate.ApprovalSubmission](), domi18n.WrapSentinel(ErrInvalidApproval, err)
 	}
 	if env, hasEnv := dto.Envelope.Get(); hasEnv {
 		envDig, dErr := env.Digest()
 		if dErr != nil {
-			return algebraic.None[gate.ApprovalSubmission](), fmt.Errorf("%w: %w", ErrInvalidApproval, dErr)
+			return algebraic.None[gate.ApprovalSubmission](), domi18n.WrapSentinel(ErrInvalidApproval, dErr)
 		}
 		if envDig != dto.EnvelopeDigest {
-			return algebraic.None[gate.ApprovalSubmission](), fmt.Errorf("%w: envelope_digest 与信封内容摘要不匹配", ErrInvalidApproval)
+			return algebraic.None[gate.ApprovalSubmission](), domi18n.EF(ErrInvalidApproval, domi18n.KeyCommonMismatch, domi18n.Str("field", "envelope_digest"), domi18n.BoundStr("expected", envDig.String()), domi18n.BoundStr("actual", dto.EnvelopeDigest.String()))
 		}
 	}
 	sub, err := gate.NewApprovalSubmission(gate.ApprovalSubmissionSpec{
@@ -47,7 +47,7 @@ func DecodeApprovalSubmission(opt algebraic.Option[ApprovalSubmissionDTO]) (alge
 		Response: resp,
 	})
 	if err != nil {
-		return algebraic.None[gate.ApprovalSubmission](), fmt.Errorf("%w: %w", ErrInvalidApproval, err)
+		return algebraic.None[gate.ApprovalSubmission](), domi18n.WrapSentinel(ErrInvalidApproval, err)
 	}
 	return algebraic.Some(sub), nil
 }
@@ -194,7 +194,7 @@ func SanitizeErrorMessage(raw string) string { return sanitizeErrorText(raw) }
 func NewToolSuccessResult(payload any, extraBlocks ...ContentBlock) (CallToolResult, error) {
 	raw, err := MarshalCanonical(payload)
 	if err != nil {
-		return CallToolResult{}, fmt.Errorf("编码工具响应载荷失败: %w", err)
+		return CallToolResult{}, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal tool result"))
 	}
 	blocks := make([]ContentBlock, 0, 1+len(extraBlocks))
 	blocks = append(blocks, NewTextContent(string(raw)))
@@ -211,7 +211,7 @@ func NewToolErrorResult(err error) (CallToolResult, int, error) {
 	code, payload := ClassifyError(err)
 	raw, mErr := MarshalCanonical(payload)
 	if mErr != nil {
-		return CallToolResult{}, CodeInternalError, fmt.Errorf("编码工具错误载荷失败: %w", mErr)
+		return CallToolResult{}, CodeInternalError, domi18n.Wrap(mErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal tool error payload"))
 	}
 	return CallToolResult{
 		Content:           []ContentBlock{NewTextContent(string(raw))},

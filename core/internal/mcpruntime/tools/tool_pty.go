@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json/jsontext"
-	"fmt"
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -37,7 +37,7 @@ type terminalSessionArgs struct {
 
 func (r *Registry) callTerminalSession(ctx context.Context, rawArgs jsontext.Value) (protocol.CallToolResult, error) {
 	if r.session == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SessionService"))
 	}
 	args, err := decodeToolArgs[terminalSessionArgs](rawArgs)
 	if err != nil {
@@ -63,7 +63,7 @@ func (r *Registry) callTerminalSession(ctx context.Context, rawArgs jsontext.Val
 		return r.ptyResize(ctx, h, args)
 	case "signal":
 		if args.Signal == "" {
-			return protocol.CallToolResult{}, fmt.Errorf("%w: signal 不能为空", protocol.ErrInvalidParams)
+			return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "signal"))
 		}
 		if err := r.session.SignalPTY(ctx, h, args.Signal); err != nil {
 			return protocol.CallToolResult{}, err
@@ -86,7 +86,7 @@ func (r *Registry) callTerminalSession(ctx context.Context, rawArgs jsontext.Val
 			HandleToken string `json:"handle_token"`
 		}{true, h.String()})
 	default:
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 未知 terminal_session action %q", protocol.ErrInvalidParams, args.Action)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "terminal_session action"), domi18n.BoundStr("value", args.Action))
 	}
 }
 
@@ -104,7 +104,7 @@ func (r *Registry) ptyOpen(
 	if args.Cols > 0 || args.Rows > 0 {
 		sz, sErr := ports.NewTerminalSize(args.Cols, args.Rows)
 		if sErr != nil {
-			return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, sErr)
+			return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, sErr)
 		}
 		szOpt = algebraic.Some(sz)
 	}
@@ -174,7 +174,7 @@ func (r *Registry) ptyWrite(ctx context.Context, h plan.ManagedHandle[plan.KindP
 func (r *Registry) ptyResize(ctx context.Context, h plan.ManagedHandle[plan.KindPTY], args terminalSessionArgs) (protocol.CallToolResult, error) {
 	sz, err := ports.NewTerminalSize(args.Cols, args.Rows)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	if err := r.session.ResizePTY(ctx, h, sz); err != nil {
 		return protocol.CallToolResult{}, err

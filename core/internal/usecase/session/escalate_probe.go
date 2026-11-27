@@ -82,29 +82,29 @@ func (s *Service) validatePrivilegeCall(ctx context.Context, req PrivilegeExecRe
 	case err != nil:
 		return err
 	case s.cfg.Escalator == nil:
-		return fmt.Errorf("%w: PrivilegeEscalationPort 未配置", ErrPortUnavailable)
+		return domi18n.EF(ErrPortUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "PrivilegeEscalationPort"))
 	case !req.Privilege.IsValid():
-		return fmt.Errorf("%w: PrivilegeRequest 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "PrivilegeRequest"))
 	}
 	if err := validateScriptTTY(req.Privilege.Command(), req.RequestTTY); err != nil {
 		return err
 	}
 	if lex, ok := req.LexicalScope.Get(); ok && !lex.IsValid() {
-		return fmt.Errorf("%w: 提供的 LexicalScope 快照无效", ErrEscalationScopeChanged)
+		return domi18n.EF(ErrEscalationScopeChanged, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LexicalScope"))
 	}
 	return s.validatePrivilegeSecretSource(req)
 }
 func (s *Service) validatePrivilegeSecretSource(req PrivilegeExecRequest) error {
 	ref, hasRef := req.PasswordRef.Get()
 	if (hasRef && !ref.IsValid()) || (hasRef && req.PromptPassword) || (req.PromptPassword && req.Privilege.NonInteractive()) {
-		return fmt.Errorf("%w: 提权口令源配置冲突或 PasswordRef 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "password_source"))
 	}
 	if !req.Privilege.NonInteractive() {
 		if hasRef && s.cfg.Vault == nil {
-			return fmt.Errorf("%w: 使用 PasswordRef 需要配置 SecretVault", ErrPortUnavailable)
+			return domi18n.EF(ErrPortUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SecretVault"))
 		}
 		if !hasRef && req.PromptPassword && (s.cfg.Interaction == nil || !s.cfg.Interaction.CanInteract()) {
-			return fmt.Errorf("%w: 提权口令交互提示不可用", ports.ErrInteractionUnavailable)
+			return domi18n.EF(ports.ErrInteractionUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "InteractionPort"))
 		}
 	}
 	return nil
@@ -153,7 +153,7 @@ func (s *Service) evaluatePrivilegeEscalationScope(req PrivilegeExecRequest, tar
 	pol := s.cfg.Gate.Policy()
 	scopedPaths, anyProt, err := pol.MatchScopedPaths(paths, req.RecursivePaths)
 	if err != nil {
-		return escalationEval{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return escalationEval{}, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	effRisk := security.RiskDangerous.Join(req.Risk.OrElse(security.RiskSafe))
 	if anyProt {
@@ -178,7 +178,7 @@ func (s *Service) evaluatePrivilegeEscalationScope(req PrivilegeExecRequest, tar
 }
 func evaluateWithLexicalScope(lex security.ScopeSnapshot, effRisk security.RiskLevel, mkSnap func(security.Verdict, security.RiskLevel, security.GuardrailDecision) (security.ScopeSnapshot, error)) (escalationEval, error) {
 	if lex.Verdict().Denied() || lex.Decision().Kind() == security.DecisionKindDeny {
-		return escalationEval{}, fmt.Errorf("%w: 词法作用域已拒绝，禁止提权放宽", ErrEscalationScopeChanged)
+		return escalationEval{}, domi18n.EF(ErrEscalationScopeChanged, domi18n.KeyUCSessEscalationDrift, domi18n.Str("reason", "lexical_scope_denied"))
 	}
 	effRisk = effRisk.Join(lex.Risk())
 	if lexNA, ok := lex.Decision().(*security.DecisionNeedApproval); ok && lexNA.IsValid() {
@@ -192,7 +192,7 @@ func evaluateWithLexicalScope(lex security.ScopeSnapshot, effRisk security.RiskL
 	}
 	escRes := security.InspectScopeEscalation(lex, canSnap)
 	if hasScopeDriftOrTighten(escRes) {
-		return escalationEval{}, fmt.Errorf("%w: 提权作用域身份漂移或判定收紧（%v）", ErrEscalationScopeChanged, escRes.Reasons())
+		return escalationEval{}, domi18n.EF(ErrEscalationScopeChanged, domi18n.KeyUCSessEscalationDrift, domi18n.BoundStr("reason", fmt.Sprintf("%v", escRes.Reasons())))
 	}
 	out := escalationEval{risk: effRisk, verdict: algebraic.Some(lex.Verdict())}
 	if escRes.Escalated() || hasUncoveredCanonicalPath(lex.Paths(), canSnap.Paths()) {
@@ -297,7 +297,7 @@ func classifyPrivilegeOutcome(ctx context.Context, out execution.ExecutionOutcom
 		return out
 	}
 	if runErr == nil {
-		return outcomeForAbortedRun(ctx, errors.New("privilege escalator returned empty outcome"))
+		return outcomeForAbortedRun(ctx, domi18n.E(domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "outcome")))
 	}
 	if slices.ContainsFunc([]error{ports.ErrAuthFailed, ports.ErrVaultLocked, ports.ErrSecretNotFound, ports.ErrInteractionUnavailable, ports.ErrInteractionCanceled, ports.ErrInvalidArgument, ports.ErrUnsupported}, func(t error) bool { return errors.Is(runErr, t) }) {
 		return notStartedSessionOutcome(execution.StartPhaseRequestRejected, "privilege_prestart_failed", runErr)
@@ -322,9 +322,9 @@ func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.
 	case err != nil:
 		return zr, err
 	case s.cfg.ShellProbe == nil:
-		return zr, fmt.Errorf("%w: ShellProbePort 未配置", ErrPortUnavailable)
+		return zr, domi18n.EF(ErrPortUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ShellProbePort"))
 	case req.Timeout.IsSome() && !req.Timeout.OrElse(zeroVal[algebraic.Duration]()).IsPositive():
-		return zr, fmt.Errorf("%w: ProbeShell Timeout 必须为正时长", ErrInvalidRequest)
+		return zr, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "Timeout"))
 	}
 	targetHop, nodeID, err := resolvePlanTargetAndNode(req.Plan, req.NodeID)
 	if err != nil {
@@ -356,11 +356,11 @@ func (s *Service) ProbeShell(ctx context.Context, req ProbeShellRequest) (ports.
 }
 func normalizeShellProbeResult(raw ports.ShellProbeResult) (ports.ShellProbeResult, error) {
 	if !raw.IsValid() || !raw.Dialect().IsValid() || !raw.Interpreter().IsValid() || !raw.LaunchProfile().IsValid() || raw.Dialect() == execution.DialectUnknown || (raw.ProbeStage() != 1 && raw.ProbeStage() != 2) {
-		return zeroVal[ports.ShellProbeResult](), fmt.Errorf("%w: 探测快照缺少有效方言、解释器、LaunchProfile 或阶段(%d)非法", ErrInvalidProbeResult, raw.ProbeStage())
+		return zeroVal[ports.ShellProbeResult](), domi18n.EF(ErrInvalidProbeResult, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "probe_stage"), domi18n.Int("value", int(raw.ProbeStage())))
 	}
 	norm, err := ports.NewShellProbeResult(ports.ShellProbeResultSpec{Dialect: raw.Dialect(), Interpreter: raw.Interpreter(), OSFamily: raw.OSFamily(), ProbeStage: raw.ProbeStage(), RawBanner: raw.RawBanner()})
 	if err != nil {
-		return zeroVal[ports.ShellProbeResult](), fmt.Errorf("%w: %w", ErrInvalidProbeResult, err)
+		return zeroVal[ports.ShellProbeResult](), domi18n.WrapSentinel(ErrInvalidProbeResult, err)
 	}
 	return norm, nil
 }

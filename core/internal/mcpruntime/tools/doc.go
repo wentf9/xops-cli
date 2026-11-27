@@ -13,12 +13,11 @@ package tools
 import (
 	"context"
 	"encoding/json/jsontext"
-	"errors"
-	"fmt"
 	"sync"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -35,13 +34,13 @@ import (
 // 本包导出的不可变哨兵错误。
 var (
 	// ErrInvalidConfig 表示 RegistryConfig 缺少必填服务依赖或沙箱根目录无效。
-	ErrInvalidConfig = errors.New("mcpruntime/tools: 无效的 RegistryConfig 配置")
+	ErrInvalidConfig = domi18n.Sentinel(domi18n.KeyMCPToolsInvalidConfig)
 	// ErrRegistryNotInitialized 表示在 nil 或零值未初始化 Registry 上调用方法。
-	ErrRegistryNotInitialized = errors.New("mcpruntime/tools: Registry 未初始化")
+	ErrRegistryNotInitialized = domi18n.Sentinel(domi18n.KeyMCPToolsNotInit)
 	// ErrServiceUnavailable 表示当前工具所需的底层用例服务未装配。
-	ErrServiceUnavailable = errors.New("mcpruntime/tools: 所需的用例服务未装配")
+	ErrServiceUnavailable = domi18n.Sentinel(domi18n.KeyMCPToolsSvcUnavail)
 	// ErrHandleNotFound 表示指定的句柄令牌未在当前运行时登记或已释放。
-	ErrHandleNotFound = errors.New("mcpruntime/tools: 未找到对应的受管句柄令牌")
+	ErrHandleNotFound = domi18n.Sentinel(domi18n.KeyMCPToolsHandleNotFnd)
 )
 
 const (
@@ -125,16 +124,16 @@ type Registry struct {
 // NewRegistry 校验必填能力门控与可选沙箱根目录，构造不可绕过护栏的工具注册表。
 func NewRegistry(cfg RegistryConfig) (*Registry, error) {
 	if cfg.Gate == nil {
-		return nil, fmt.Errorf("%w: Gate 不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Gate"))
 	}
 	if tr, ok := cfg.TransferRoot.Get(); ok && !tr.IsValid() {
-		return nil, fmt.Errorf("%w: TransferRoot 无效", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TransferRoot"))
 	}
 	if ar, ok := cfg.ArtifactRoot.Get(); ok && !ar.IsValid() {
-		return nil, fmt.Errorf("%w: ArtifactRoot 无效", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ArtifactRoot"))
 	}
 	if cfg.MaxHandles < 0 {
-		return nil, fmt.Errorf("%w: MaxHandles 不能为负", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "MaxHandles"))
 	}
 	maxH := cfg.MaxHandles
 	if maxH == 0 {
@@ -193,7 +192,7 @@ func (r *Registry) CallTool(ctx context.Context, name string, rawArgs jsontext.V
 	case protocol.ToolNameGUI:
 		res, err = r.callGUI(ctx, rawArgs)
 	default:
-		err = fmt.Errorf("%w: %q", protocol.ErrToolNotFound, name)
+		err = domi18n.EF(protocol.ErrToolNotFound, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "MCP tool"), domi18n.BoundStr("value", name))
 	}
 	if err != nil {
 		if r.gate.IsHalted() {

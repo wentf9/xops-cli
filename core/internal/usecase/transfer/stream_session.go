@@ -17,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -103,14 +104,14 @@ func inspectStreamDownloadSource(ctx context.Context, rfs ports.RemoteFSPort, re
 	}
 	rs, ok := req.RemoteSource.Get()
 	if !ok {
-		return 0, req.ModTime, defaultPerm, za, time.Time{}, fmt.Errorf("%w: 下载缺少 RemoteSource", ErrInvalidRequest)
+		return 0, req.ModTime, defaultPerm, za, time.Time{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "RemoteSource"))
 	}
 	st, err := rfs.Lstat(ctx, rs)
 	if err != nil || !st.IsRegular() {
 		return 0, req.ModTime, defaultPerm, za, time.Time{}, pickIf[error](err != nil, err, pickIf(st.IsSymlink(), ports.ErrSymlinkRejected, pickIf(st.IsDir(), ports.ErrRemoteIsDir, ports.ErrNotRegularFile)))
 	}
 	if size := uint64(st.Size()); size > fsm.MaxTransferBytes || (req.TotalBytes > 0 && req.TotalBytes != size) {
-		return 0, req.ModTime, defaultPerm, za, time.Time{}, pickIf[error](size > fsm.MaxTransferBytes, fmt.Errorf("%w: 远端大小 %d 超限", fsm.ErrTransferSizeExceeded, size), fmt.Errorf("%w: 声明大小与远端不符", ErrInvalidRequest))
+		return 0, req.ModTime, defaultPerm, za, time.Time{}, pickIf[error](size > fsm.MaxTransferBytes, domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote_file"), domi18n.Uint64("size", size), domi18n.Uint64("limit", fsm.MaxTransferBytes)), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonMismatch, domi18n.Str("field", "TotalBytes"), domi18n.Uint64("expected", size), domi18n.Uint64("actual", req.TotalBytes)))
 	}
 	mt := pickIf(req.PreserveTimes && req.ModTime.IsNone() && validRFC3339(st.ModTime()), algebraic.Some(st.ModTime()), req.ModTime)
 	return uint64(st.Size()), mt, pickIf(req.Perm.IsNone() && st.Perm() != 0, sanitizeLocalDownloadPerm(st.Perm()), defaultPerm), st.Anchor(), st.ModTime(), nil
@@ -142,7 +143,7 @@ func computeStreamStagePaths(meta fsm.TransferMeta) (rpOpt algebraic.Option[path
 		lp, lErr := makeLocalStageDest(dst, token)
 		return rpOpt, algebraic.Some(lp), lErr
 	}
-	return rpOpt, lpOpt, fmt.Errorf("%w: 缺少传输目标路径", ErrInvalidRequest)
+	return rpOpt, lpOpt, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "transfer_dest"))
 }
 
 // verifyStagedDigest 计算完整暂存文件 SHA-256（下载重读本机 ScopedRootFS，上传恢复后经 SFTP ReadChunk 回读）。
@@ -155,7 +156,7 @@ func (s *Service) verifyStagedDigest(ctx context.Context, sess *managedTransferS
 		lr, okR := sess.opts.LocalRoot.Get()
 		stageDest, okS := sess.localStageDest.Get()
 		if s.scopedFS == nil || !okR || !okS {
-			return dig, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, fmt.Errorf("%w: 缺少 LocalRoot/暂存路径", ErrInvalidRequest))
+			return dig, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "LocalRoot/stage_path")))
 		}
 		return dig, s.scopedFS.WithRoot(lr, func(root ports.RootHandle) error {
 			dig, err = hashLocalStagedFile(root, stageDest, int64(totalBytes))
@@ -276,7 +277,7 @@ func hashLocalStagedFile(root ports.RootHandle, stageDest pathalg.LocalRootedDes
 	if err == nil {
 		err = root.WithReadRegular(stageDest, limits, func(r ports.BoundedReadHandle, size int64) error {
 			if size != expectedSize {
-				return fmt.Errorf("%w: 本地暂存大小 %d 与预期 %d 不符", io.ErrUnexpectedEOF, size, expectedSize)
+				return domi18n.EF(io.ErrUnexpectedEOF, domi18n.KeyCommonMismatch, domi18n.Str("field", "local_stage_size"), domi18n.Int64("expected", expectedSize), domi18n.Int64("actual", size))
 			}
 			_, copyErr := io.Copy(h, r)
 			return copyErr
@@ -295,12 +296,12 @@ func checkLocalNoClobber(root ports.RootHandle, dest pathalg.LocalRootedDest, no
 		return nil
 	}
 	_, err := root.Lstat(dest)
-	return pickIf[error](err == nil, fmt.Errorf("%w: 本地目标 %s 已存在", ports.ErrAlreadyExists, dest), pickIf[error](errors.Is(err, ports.ErrNotFound), nil, err))
+	return pickIf[error](err == nil, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "already_exists")), pickIf[error](errors.Is(err, ports.ErrNotFound), nil, err))
 }
 func createLocalSymlink(root ports.RootHandle, dest pathalg.LocalRootedDest, target string, noClobber bool) error {
 	if st, err := root.Lstat(dest); err == nil {
 		if noClobber || st.IsDir() {
-			return pickIf(noClobber, fmt.Errorf("%w: 本地目标 %s 已存在", ports.ErrAlreadyExists, dest), fmt.Errorf("%w: 禁止以软链覆写已有目录 %s", ports.ErrRemoteIsDir, dest))
+			return pickIf(noClobber, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "already_exists")), domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "symlink_over_dir")))
 		}
 		if rmErr := root.Remove(dest); rmErr != nil {
 			return rmErr

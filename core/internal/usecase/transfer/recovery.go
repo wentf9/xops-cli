@@ -3,12 +3,12 @@ package transfer
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strconv"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -25,7 +25,7 @@ func (s *Service) RecoverTransfer(ctx context.Context, req RecoverTransferReques
 	defer closeStream(req.OperationStream)
 	hop, err := s.validateBaseCall(ctx, req.CallBase)
 	if lr, ok := req.LocalRootForClean.Get(); err != nil || s.journals == nil || !req.TransferID.IsValid() || (ok && !lr.IsValid()) {
-		return TransferRecoveryResult{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, fmt.Errorf("%w: TransferID 或 LocalRootForClean 无效", ErrInvalidRequest)))
+		return TransferRecoveryResult{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TransferID/LocalRootForClean"))))
 	}
 	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "recover", params: map[string]string{"transfer_id": req.TransferID.String()}, defaultRisk: security.RiskSafe, summary: "transfer recover " + req.TransferID.String()}
 	return runAuthorizedVal[security.CapTransfer](ctx, s, spec, func(authCtx context.Context, auth gate.Authorized[security.CapTransfer], _ *transferEmitter) (TransferRecoveryResult, error) {
@@ -71,7 +71,7 @@ func (s *Service) RecoverAllTransfers(ctx context.Context, req RecoverAllRequest
 func (s *Service) RecoverAllTransfersAuthorized(ctx context.Context, req RecoverAllAuthorizedRequest) (RecoverAllResult, error) {
 	defer closeStream(req.OperationStream)
 	rv, hasR := req.Risk.Get()
-	if err := firstErr(s.checkReadyCtx(ctx), pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, pickIf[error](hasR && !rv.IsValid(), fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest), nil))); err != nil {
+	if err := firstErr(s.checkReadyCtx(ctx), pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, pickIf[error](hasR && !rv.IsValid(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel")), nil))); err != nil {
 		return RecoverAllResult{}, err
 	}
 	spec := authOpSpec{
@@ -93,7 +93,7 @@ func (s *Service) ResumeTransfer(ctx context.Context, req ResumeTransferRequest)
 	hop, err := s.validateBaseCall(ctx, req.CallBase)
 	rs, hasRS := req.RemoteSource.Get()
 	if err != nil || s.journals == nil || !req.TransferID.IsValid() || (hasRS && !rs.IsValid()) {
-		return TransferHandleInfo{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, fmt.Errorf("%w: TransferID 或 RemoteSource 无效", ErrInvalidRequest)))
+		return TransferHandleInfo{}, firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TransferID/RemoteSource"))))
 	}
 	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "resume", paths: pickIf(hasRS, []pathalg.RemotePath{rs}, nil), params: map[string]string{"transfer_id": req.TransferID.String(), "start_next_gen": strconv.FormatBool(req.StartNextGen)}, defaultRisk: security.RiskModerate, summary: "transfer resume " + req.TransferID.String()}
 	if s.strictPaths() {
@@ -139,7 +139,7 @@ func (s *Service) resumeAuthorizedTransfer(ctx context.Context, auth gate.Author
 		return TransferHandleInfo{}, pickIf[error](err != nil, err, fsm.ErrInvalidState)
 	}
 	if rec.State.IsTerminal() {
-		return TransferHandleInfo{}, fmt.Errorf("%w: 传输 %s 已处于终态 %s", fsm.ErrIllegalTransition, req.TransferID, rec.State.Kind())
+		return TransferHandleInfo{}, domi18n.EF(fsm.ErrIllegalTransition, domi18n.KeyUCTransferTerminal, domi18n.BoundStr("id", req.TransferID.String()), domi18n.Str("state", rec.State.Kind().String()))
 	}
 	meta := fsm.TransferMetaOf(rec.State)
 	startReq := StartTransferRequest{CallBase: req.CallBase, TransferSessionOptions: req.TransferSessionOptions, TransferID: algebraic.Some(meta.TransferID()), Dest: meta.Dest(), TotalBytes: meta.TotalBytes(), ExpectedDigest: meta.ExpectedDigest(), JournalVersion: meta.JournalVersion(), Generation: pickIf(req.StartNextGen, meta.Generation()+1, meta.Generation())}
@@ -150,7 +150,7 @@ func (s *Service) resumeAuthorizedTransfer(ctx context.Context, auth gate.Author
 	}
 	oldHandle, live, hErr := s.lookupLiveHandle(ctx, req.TransferID)
 	if hErr != nil || (live && !req.StartNextGen) {
-		return TransferHandleInfo{}, pickIf[error](hErr != nil, hErr, fmt.Errorf("%w: 传输 %s 同世代句柄仍活跃，禁止双活接管", ports.ErrAlreadyExists, req.TransferID))
+		return TransferHandleInfo{}, pickIf[error](hErr != nil, hErr, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyUCTransferDualActive, domi18n.BoundStr("id", req.TransferID.String())))
 	}
 	if live {
 		s.dropActiveHandle(req.TransferID, oldHandle, true)
@@ -191,8 +191,7 @@ func recoverFromGenerationSnapshots(transferID security.OperationID, snaps []por
 	// 铁律 1 & 3：高世代损坏（含空前缀损坏）严禁回退低世代，Fail-Closed 返回 ErrCorruptJournal。
 	highest := snaps[len(snaps)-1]
 	if highest.Corrupt() {
-		msg := pickIf(len(highest.PartialRecords()) == 0, "空前缀损坏", "损坏")
-		return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, fmt.Errorf("%w: 高世代 gen=%d %s，严禁回退低世代: %w", ErrCorruptJournal, highest.Generation(), msg, highest.Err())
+		return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, domi18n.WrapS(ErrCorruptJournal, highest.Err(), domi18n.KeyUCTransferGenRollback, domi18n.Uint64("gen", highest.Generation()))
 	}
 	return recoverHealthyHighestWithLowers(transferID, snaps[:len(snaps)-1], highest)
 }
@@ -200,11 +199,11 @@ func validateSnapshotOrdering(snaps []ports.JournalGenerationSnapshot) error {
 	var prevGen uint64
 	for _, snap := range snaps {
 		if !snap.IsValid() || snap.Generation() <= prevGen {
-			return fmt.Errorf("%w: 世代快照无效或未严格升序", ErrCorruptJournal)
+			return domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "generation_snapshots"))
 		}
 		prevGen = snap.Generation()
 	}
-	return pickIf[error](len(snaps) == 0, fmt.Errorf("%w: 空世代快照列表", ErrCorruptJournal), nil)
+	return pickIf[error](len(snaps) == 0, domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "generation_snapshots")), nil)
 }
 func detectAnyCommitUncertainty(transferID security.OperationID, snaps []ports.JournalGenerationSnapshot) (TransferRecoveryResult, error, bool) {
 	for i := len(snaps) - 1; i >= 0; i-- {
@@ -213,12 +212,12 @@ func detectAnyCommitUncertainty(transferID security.OperationID, snaps []ports.J
 			if slices.ContainsFunc(snap.PartialRecords(), func(r fsm.TransferJournalRecord) bool {
 				return r.IsValid() && (r.Kind() == fsm.JournalRecordCommitStarted || r.Kind() == fsm.JournalRecordCommitted)
 			}) {
-				return TransferRecoveryResult{TransferID: transferID, State: buildUncertainStateFromPartial(snap.PartialRecords()), SelectedGen: snap.Generation(), UncertainCommit: true}, fmt.Errorf("%w: 损坏世代 gen=%d 前缀含提交标记，严禁重试或删日志: %w", ErrUncertainCommit, snap.Generation(), snap.Err()), true
+				return TransferRecoveryResult{TransferID: transferID, State: buildUncertainStateFromPartial(snap.PartialRecords()), SelectedGen: snap.Generation(), UncertainCommit: true}, domi18n.WrapS(ErrUncertainCommit, snap.Err(), domi18n.KeyUCTransferGenUncert, domi18n.Uint64("gen", snap.Generation())), true
 			}
 			continue
 		}
 		if st, _, _, _ := fsm.RecoverTransferFromJournal(snap.Records()); st != nil && st.Kind() == fsm.TransferKindUncertainCommit {
-			return TransferRecoveryResult{TransferID: transferID, State: st, SelectedGen: snap.Generation(), UncertainCommit: true}, fmt.Errorf("%w: 世代 gen=%d 处于 UncertainCommit，严禁重试或删日志", ErrUncertainCommit, snap.Generation()), true
+			return TransferRecoveryResult{TransferID: transferID, State: st, SelectedGen: snap.Generation(), UncertainCommit: true}, domi18n.EF(ErrUncertainCommit, domi18n.KeyUCTransferGenUncert, domi18n.Uint64("gen", snap.Generation())), true
 		}
 	}
 	return TransferRecoveryResult{}, nil, false
@@ -235,7 +234,7 @@ func recoverHealthyHighestWithLowers(transferID security.OperationID, lowers []p
 	hiRecs := highest.Records()
 	hiSt, hiEffs, _, hiErr := fsm.RecoverTransferFromJournal(hiRecs)
 	if hiErr != nil || !fsm.TransferMetaOf(hiSt).TransferID().Equal(transferID) {
-		return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, fmt.Errorf("%w: 高世代 gen=%d 无效，严禁回退低世代: %w", ErrCorruptJournal, highest.Generation(), hiErr)
+		return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, domi18n.WrapS(ErrCorruptJournal, hiErr, domi18n.KeyUCTransferGenRollback, domi18n.Uint64("gen", highest.Generation()))
 	}
 	pruneList, hiMeta := make([]uint64, 0, len(lowers)), fsm.TransferMetaOf(hiSt)
 	for _, lo := range lowers {
@@ -244,7 +243,7 @@ func recoverHealthyHighestWithLowers(transferID security.OperationID, lowers []p
 				return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, err
 			}
 		} else if _, _, _, dErr := fsm.RecoverTransferFromDualJournal(lo.Records(), hiRecs); dErr != nil {
-			return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, fmt.Errorf("%w: %w", ErrCorruptJournal, dErr)
+			return TransferRecoveryResult{TransferID: transferID, SelectedGen: highest.Generation()}, nil, domi18n.WrapSentinel(ErrCorruptJournal, dErr)
 		}
 		pruneList = append(pruneList, lo.Generation())
 	}
@@ -259,5 +258,5 @@ func verifyCorruptLowerIdentity(partial []fsm.TransferJournalRecord, hiMeta fsm.
 	hiExp, okH := hiMeta.ExpectedDigest().Get()
 	loExp, okL := first.Digest().Get()
 	bad := !okD || !first.TransferID().Equal(hiMeta.TransferID()) || !dest.Equal(hiMeta.Dest()) || first.TotalBytes() != hiMeta.TotalBytes() || okH != okL || (okH && !hiExp.Equal(loExp))
-	return pickIf[error](bad, fmt.Errorf("%w: 损坏低世代 gen=%d 元数据与高世代不一致", ErrCorruptJournal, first.Generation()), nil)
+	return pickIf[error](bad, domi18n.EF(ErrCorruptJournal, domi18n.KeyCommonMismatch, domi18n.Str("field", "journal_generation_meta"), domi18n.Uint64("expected", hiMeta.Generation()), domi18n.Uint64("actual", first.Generation())), nil)
 }

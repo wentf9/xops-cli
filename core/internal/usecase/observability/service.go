@@ -3,12 +3,12 @@ package observability
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -38,10 +38,10 @@ type Service struct {
 // NewService 校验必填出站依赖并构造不可绕过能力门控的 observability.Service。
 func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Gate == nil || cfg.Pool == nil || cfg.Pool.IsClosed() || cfg.Clock == nil || cfg.Entropy == nil {
-		return nil, fmt.Errorf("%w: Gate/Pool/Clock/Entropy 必填且 Pool 不可已关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Gate/Pool/Clock/Entropy"))
 	}
 	if cfg.SystemBus != nil && cfg.SystemBus.IsClosed() {
-		return nil, fmt.Errorf("%w: SystemBus 未初始化或已关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "SystemBus"))
 	}
 	return &Service{
 		gate: cfg.Gate, pool: cfg.Pool, clock: cfg.Clock, entropy: cfg.Entropy,
@@ -93,14 +93,14 @@ func (s *Service) validatePlanCall(ctx context.Context, connPlan plan.SealedConn
 		return zeroVal[plan.HopSpec](), err
 	}
 	if !connPlan.IsValid() {
-		return zeroVal[plan.HopSpec](), fmt.Errorf("%w: SealedConnectionPlan 无效", ErrInvalidRequest)
+		return zeroVal[plan.HopSpec](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SealedConnectionPlan"))
 	}
 	if r, ok := risk.Get(); ok && !r.IsValid() {
-		return zeroVal[plan.HopSpec](), fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
+		return zeroVal[plan.HopSpec](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel"))
 	}
 	hop, ok := connPlan.Target()
 	if !ok {
-		return zeroVal[plan.HopSpec](), fmt.Errorf("%w: 连接计划缺少末跳目标", ErrInvalidRequest)
+		return zeroVal[plan.HopSpec](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "target_hop"))
 	}
 	return hop, nil
 }
@@ -124,14 +124,14 @@ func (s *Service) validatePOSIXCall(ctx context.Context, connPlan plan.SealedCon
 	prof, hasProf := profOpt.Get()
 	if hasProf {
 		if !prof.IsValid() {
-			return posixCallBase{}, fmt.Errorf("%w: LaunchProfile 无效", ErrInvalidRequest)
+			return posixCallBase{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LaunchProfile"))
 		}
 		if err := prof.ValidatePOSIXBourne(); err != nil {
-			return posixCallBase{}, fmt.Errorf("%w: %w", ErrPOSIXShellRequired, err)
+			return posixCallBase{}, domi18n.WrapSentinel(ErrPOSIXShellRequired, err)
 		}
 	}
 	if d, ok := timeout.Get(); ok && !d.IsPositive() {
-		return posixCallBase{}, fmt.Errorf("%w: Timeout 必须为正时长", ErrInvalidRequest)
+		return posixCallBase{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "Timeout"))
 	}
 	return posixCallBase{hop: hop, prof: prof, hasProf: hasProf}, nil
 }
@@ -163,7 +163,7 @@ func withLeaseRemoteFS(ctx context.Context, lease *pool.Lease, fn func(ports.Rem
 func (s *Service) resolvePOSIXProfileInLease(ctx context.Context, opener ports.SessionOpener, explicit execution.LaunchProfile, hasExplicit bool) (execution.LaunchProfile, error) {
 	if hasExplicit {
 		if err := explicit.ValidatePOSIXBourne(); err != nil {
-			return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: %w", ErrPOSIXShellRequired, err)
+			return zeroVal[execution.LaunchProfile](), domi18n.WrapSentinel(ErrPOSIXShellRequired, err)
 		}
 		return explicit, nil
 	}
@@ -172,10 +172,10 @@ func (s *Service) resolvePOSIXProfileInLease(ctx context.Context, opener ports.S
 	}
 	res, err := s.shellProbe.ProbeShell(ctx, opener)
 	if err != nil {
-		return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: 远端 Shell 探测失败: %w", ErrPOSIXShellRequired, err)
+		return zeroVal[execution.LaunchProfile](), domi18n.WrapS(ErrPOSIXShellRequired, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "probe_shell"))
 	}
 	if err := res.LaunchProfile().ValidatePOSIXBourne(); err != nil {
-		return zeroVal[execution.LaunchProfile](), fmt.Errorf("%w: 远端探测方言=%s 解释器=%s: %w", ErrPOSIXShellRequired, res.Dialect(), res.Interpreter(), err)
+		return zeroVal[execution.LaunchProfile](), domi18n.WrapS(ErrPOSIXShellRequired, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "shell_dialect"), domi18n.BoundStr("value", res.Dialect().String()+"/"+res.Interpreter().String()))
 	}
 	return res.LaunchProfile(), nil
 }
@@ -217,7 +217,7 @@ func runAuthorized[C security.Capability](ctx context.Context, s *Service, planD
 			_ = auth.ReportOutcome(outcome)
 		}
 		if outcome != nil && outcome.Kind() == execution.OutcomeKindUnknown {
-			cause := pickIf(runErr != nil && !errors.Is(runErr, ErrUncertainOutcome), fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr), ErrUncertainOutcome)
+			cause := pickIf(runErr != nil && !errors.Is(runErr, ErrUncertainOutcome), domi18n.WrapSentinel(ErrUncertainOutcome, runErr), ErrUncertainOutcome)
 			if wrapped, wErr := gate.WrapOutcomeError(outcome, cause); wErr == nil {
 				return wrapped
 			}

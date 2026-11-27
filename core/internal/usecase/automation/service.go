@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -55,10 +55,10 @@ type Service struct {
 // NewService 严格校验必填出站依赖与容量上下界，构造不可绕过能力门控的 automation.Service。
 func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Gate == nil || cfg.Pool == nil || cfg.Pool.IsClosed() || cfg.Clock == nil || cfg.Entropy == nil {
-		return nil, fmt.Errorf("%w: Gate/Pool/Clock/Entropy 必填且 Pool 不可已关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Gate/Pool/Clock/Entropy"))
 	}
 	if cfg.SystemBus != nil && cfg.SystemBus.IsClosed() {
-		return nil, fmt.Errorf("%w: SystemBus 未初始化或已关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "SystemBus"))
 	}
 	conc := pickIf(cfg.DefaultConcurrency == 0, defaultConcurrency, cfg.DefaultConcurrency)
 	maxScript := pickIf(cfg.MaxScriptBytes == 0, defaultMaxScriptBytes, cfg.MaxScriptBytes)
@@ -68,7 +68,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		maxScript <= 0 || maxScript > maxAllowedScriptBytes ||
 		maxTmpl <= 0 || maxTmpl > maxAllowedTemplateSize ||
 		maxCopy <= 0 || maxCopy > maxAllowedCopyBytes {
-		return nil, fmt.Errorf("%w: 并发度或本地文件字节上限越界", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "concurrency/size_limits"))
 	}
 	return &Service{
 		gate: cfg.Gate, pool: cfg.Pool, clock: cfg.Clock, entropy: cfg.Entropy,
@@ -117,7 +117,7 @@ func (s *Service) checkReady(ctx context.Context) error {
 func (s *Service) resolveConcurrency(requested int) (int, error) {
 	c := pickIf(requested == 0, s.defaultConcurrency, requested)
 	if c < 1 || c > maxConcurrency {
-		return 0, fmt.Errorf("%w: concurrency=%d 须落在 [1, %d]", ErrInvalidRequest, requested, maxConcurrency)
+		return 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRange, domi18n.Str("field", "concurrency"), domi18n.Int("value", requested), domi18n.Int("min", 1), domi18n.Int("max", maxConcurrency))
 	}
 	return c, nil
 }
@@ -128,7 +128,7 @@ func canonicalizeTags(raw []inventory.Tag) ([]inventory.Tag, error) {
 	}
 	for i, tag := range raw {
 		if !tag.IsValid() {
-			return nil, fmt.Errorf("%w: tags[%d] 无效", ErrInvalidRequest, i)
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "tags"), domi18n.Int("index", i))
 		}
 	}
 	out := slices.Clone(raw)
@@ -142,7 +142,7 @@ func canonicalizeNodeIDs(raw []inventory.NodeID) ([]inventory.NodeID, error) {
 	}
 	for i, id := range raw {
 		if !id.IsValid() {
-			return nil, fmt.Errorf("%w: exclude_nodes[%d] 无效", ErrInvalidRequest, i)
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "exclude_nodes"), domi18n.Int("index", i))
 		}
 	}
 	out := slices.Clone(raw)
@@ -154,7 +154,7 @@ func canonicalizeNodeIDs(raw []inventory.NodeID) ([]inventory.NodeID, error) {
 // 保证门控绑定中的 NodeIDs 与连接计划集合摘要完全由显式输入确定（零随机/map 迭代漂移）。
 func (s *Service) resolveTargets(ctx context.Context, explicit []TargetNode, selector algebraic.Option[playbook.TargetSelector], cliOpts option.OptionLayer, excludeNodes []inventory.NodeID, excludeTags []inventory.Tag) ([]TargetNode, error) {
 	if err := cliOpts.Validate(); err != nil {
-		return nil, fmt.Errorf("%w: CLIOptions 无效: %w", ErrInvalidRequest, err)
+		return nil, domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "CLIOptions"))
 	}
 	exNodes, err := canonicalizeNodeIDs(excludeNodes)
 	if err != nil {
@@ -166,7 +166,7 @@ func (s *Service) resolveTargets(ctx context.Context, explicit []TargetNode, sel
 	}
 	sel, hasSel := selector.Get()
 	if hasSel && !sel.IsValid() {
-		return nil, fmt.Errorf("%w: TargetSelector 无效", ErrInvalidRequest)
+		return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TargetSelector"))
 	}
 	candidates, err := s.gatherCandidateTargets(ctx, explicit, sel, hasSel, cliOpts, exNodes, exTags)
 	if err != nil {
@@ -179,7 +179,7 @@ func (s *Service) gatherCandidateTargets(ctx context.Context, explicit []TargetN
 	if len(explicit) > 0 {
 		for i, t := range explicit {
 			if !t.IsValid() {
-				return nil, fmt.Errorf("%w: targets[%d] 无效", ErrInvalidRequest, i)
+				return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "targets"), domi18n.Int("index", i))
 			}
 		}
 		return explicit, nil
@@ -235,7 +235,7 @@ func (s *Service) appendVirtualSelectorNodes(ctx context.Context, sel playbook.T
 func (s *Service) resolveSingleTargetNode(ctx context.Context, id inventory.NodeID, tags []inventory.Tag, execProf algebraic.Option[execution.LaunchProfile], cliOpts option.OptionLayer) (TargetNode, error) {
 	resolved, err := s.inventory.ResolveTarget(ctx, ucinv.ResolveTargetRequest{Target: id.String(), CLIOptions: cliOpts})
 	if err != nil {
-		return TargetNode{}, fmt.Errorf("解析目标节点 %s 失败: %w", id, err)
+		return TargetNode{}, domi18n.Wrap(err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "resolve target"), domi18n.BoundStr("target", id.String()))
 	}
 	return NewTargetNode(TargetNodeSpec{NodeID: id, Plan: resolved.Plan(), Tags: tags, DefaultProfile: execProf})
 }
@@ -274,7 +274,7 @@ func filterAndSortTargets(candidates []TargetNode, sel playbook.TargetSelector, 
 	out := make([]TargetNode, 0, len(candidates))
 	for _, t := range candidates {
 		if seen[t.nodeID] {
-			return nil, fmt.Errorf("%w: 目标节点 %s 重复", ErrInvalidRequest, t.nodeID)
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "target node"), domi18n.BoundStr("value", t.nodeID.String()))
 		}
 		seen[t.nodeID] = true
 		if (hasSel && !sel.Matches(t.nodeID, t.tags)) || isNodeExcluded(t.nodeID, t.tags, exNodes, exTags) {
@@ -382,7 +382,7 @@ func resolveCanonicalRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p p
 		}
 		suffix, cur = append(suffix, base), cur.Dir()
 	}
-	return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端路径规范化深度超限 %d", ErrInvalidRequest, maxRemoteCanonicalHops)
+	return zeroVal[pathalg.RemotePath](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "remote path canonicalization hops"), domi18n.Int("count", len(suffix)), domi18n.Int("limit", maxRemoteCanonicalHops))
 }
 
 func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath) (pathalg.RemotePath, error) {
@@ -392,7 +392,7 @@ func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.Rem
 	dot, _ := pathalg.ParseRemotePath(".")
 	cwd, err := rfs.RealPath(ctx, dot)
 	if err != nil || !cwd.IsAbs() {
-		return zeroVal[pathalg.RemotePath](), firstErr(err, fmt.Errorf("%w: 远端工作目录非绝对路径", ErrInvalidRequest))
+		return zeroVal[pathalg.RemotePath](), firstErr(err, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", cwd.String()), domi18n.Str("reason", "remote working directory must be absolute")))
 	}
 	return cwd.Resolve(p)
 }
@@ -406,7 +406,7 @@ func expandDanglingSymlinkStep(ctx context.Context, rfs ports.RemoteFSPort, cur 
 		return zeroVal[pathalg.RemotePath](), false, err
 	}
 	if *hops >= pathalg.MaxSymlinkHops {
-		return zeroVal[pathalg.RemotePath](), false, fmt.Errorf("%w: 远端软链跳数超限 %d", ErrSymlinkPolicyDenied, pathalg.MaxSymlinkHops)
+		return zeroVal[pathalg.RemotePath](), false, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "remote symlink hops"), domi18n.Int("count", *hops), domi18n.Int("limit", pathalg.MaxSymlinkHops))
 	}
 	*hops++
 	raw, err := rfs.ReadLink(ctx, cur)
@@ -431,7 +431,7 @@ func resolveSymlinkBase(ctx context.Context, rfs ports.RemoteFSPort, cur, target
 	}
 	realParent, err := rfs.RealPath(ctx, cur.Dir())
 	if err != nil || !realParent.IsAbs() {
-		return zeroVal[pathalg.RemotePath](), firstErr(err, fmt.Errorf("%w: 远端软链父目录非绝对路径", ErrInvalidRequest))
+		return zeroVal[pathalg.RemotePath](), firstErr(err, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", realParent.String()), domi18n.Str("reason", "remote symlink parent directory must be absolute")))
 	}
 	return realParent.Resolve(targetP)
 }
@@ -459,7 +459,7 @@ func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.Rem
 			return root == "/" || cs == root || strings.HasPrefix(cs, root+"/")
 		})
 	if !ok {
-		return fmt.Errorf("%w: 远端路径 %s 规范化漂移至未授权目标 %s", gate.ErrScopeEscalated, target, canon)
+		return domi18n.EF(gate.ErrScopeEscalated, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target.String()), domi18n.BoundStr("reason", "canonicalized to unauthorized target "+canon.String()))
 	}
 	return nil
 }

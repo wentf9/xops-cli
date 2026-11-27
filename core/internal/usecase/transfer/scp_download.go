@@ -13,6 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -76,10 +77,10 @@ func (s *Service) validateSCPDownloadRequest(ctx context.Context, req SCPDownloa
 		return hop, spec, pickIf[error](err != nil, err, ErrScopedFSUnavailable)
 	}
 	if dig, hasDig := req.ExpectedDigest.Get(); !req.LocalRoot.IsValid() || !req.LocalDest.IsValid() || (hasDig && !dig.IsValid()) {
-		return hop, spec, fmt.Errorf("%w: LocalRoot/LocalDest/ExpectedDigest 无效", ErrInvalidRequest)
+		return hop, spec, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LocalRoot/LocalDest/ExpectedDigest"))
 	}
 	if !req.SymlinkPolicy.IsValid() || req.SymlinkPolicy == pathalg.SymlinkFollowOperatorSource {
-		return hop, spec, fmt.Errorf("%w: 下载仅允许 SymlinkReject 或 SymlinkContainedRelative", ErrSymlinkPolicyDenied)
+		return hop, spec, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SymlinkPolicy"), domi18n.Str("value", req.SymlinkPolicy.String()))
 	}
 	maxFiles, maxBytes, e1 := resolveRecursiveLimits(req.MaxFiles, req.MaxTotalBytes)
 	cs, conc, e2 := s.resolveChunkAndConcurrency(req.ChunkSize, req.Concurrency)
@@ -94,7 +95,7 @@ func (s *Service) executeSCPDownload(ctx context.Context, rfs ports.RemoteFSPort
 	switch lstat.FileType() {
 	case ports.RemoteFileRegular:
 		if uint64(lstat.Size()) > spec.maxBytes {
-			return out, fmt.Errorf("%w: 远端文件大小 %d 超限 %d", fsm.ErrTransferSizeExceeded, lstat.Size(), spec.maxBytes)
+			return out, domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote_file"), domi18n.Int64("size", lstat.Size()), domi18n.Uint64("limit", spec.maxBytes))
 		}
 		spec.remoteStat = lstat
 		return out, s.scopedFS.WithRoot(req.LocalRoot, func(root ports.RootHandle) error {
@@ -111,24 +112,24 @@ func (s *Service) executeSCPDownload(ctx context.Context, rfs ports.RemoteFSPort
 		return s.downloadSingleSymlink(ctx, rfs, req)
 	case ports.RemoteFileDir:
 		if !req.Recursive {
-			return out, fmt.Errorf("%w: 远端路径 %s 为目录（需启用 Recursive）", ports.ErrRemoteIsDir, req.RemoteSource)
+			return out, domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", req.RemoteSource.String()), domi18n.Str("reason", "recursive_required"))
 		}
 		spec.req.ExpectedDigest = algebraic.None[security.Digest]()
 		return s.downloadDirectoryTree(ctx, rfs, emitter, lstat, spec)
 	default:
-		return out, fmt.Errorf("%w: 拒绝下载特殊对象 %s (%s)", ErrRemoteObjectUnsupported, req.RemoteSource, lstat.FileType())
+		return out, domi18n.EF(ErrRemoteObjectUnsupported, domi18n.KeyUCTransferRemoteType, domi18n.BoundStr("path", req.RemoteSource.String()), domi18n.Str("kind", lstat.FileType().String()))
 	}
 }
 func (s *Service) downloadSingleSymlink(ctx context.Context, rfs ports.RemoteFSPort, req SCPDownloadRequest) (SCPDownloadResult, error) {
 	if req.SymlinkPolicy != pathalg.SymlinkContainedRelative {
-		return SCPDownloadResult{}, fmt.Errorf("%w: %w: 策略 %s 禁止下载软链", ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, req.SymlinkPolicy)
+		return SCPDownloadResult{}, domi18n.WrapS(ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, domi18n.KeyUCTransferSymlinkPol, domi18n.Str("policy", req.SymlinkPolicy.String()), domi18n.BoundStr("path", req.RemoteSource.String()))
 	}
 	target, err := rfs.ReadLink(ctx, req.RemoteSource)
 	if err != nil {
 		return SCPDownloadResult{}, err
 	}
 	if vErr := pathalg.ValidateContainedSymlink(target, req.LocalDest.Depth()-1); vErr != nil {
-		return SCPDownloadResult{}, fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, vErr)
+		return SCPDownloadResult{}, domi18n.WrapSentinel(ErrSymlinkPolicyDenied, vErr)
 	}
 	err = s.scopedFS.WithRoot(req.LocalRoot, func(root ports.RootHandle) error {
 		if e := ensureParentLocalDir(root, req.LocalDest); e != nil {
@@ -169,7 +170,7 @@ func (s *Service) downloadFileIntoRoot(ctx context.Context, rfs ports.RemoteFSPo
 	}
 	if expDig, ok := req.ExpectedDigest.Get(); ok && !expDig.Equal(dig) {
 		dropStage = true
-		return 0, 0, 0, dig, false, fmt.Errorf("%w: 下载摘要不匹配", ErrDigestMismatch)
+		return 0, 0, 0, dig, false, domi18n.EF(ErrDigestMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "sha256"), domi18n.Str("expected", expDig.String()), domi18n.Str("actual", dig.String()))
 	}
 	if err = remotecanon.VerifyDownloadSource(ctx, s.strictPaths(), rfs, spec.authBinding, req.RemoteSource, st.Anchor(), fileSize, st.ModTime(), canonSentinels()); err != nil {
 		dropStage = true
@@ -315,11 +316,11 @@ func (s *Service) downloadDirectoryTree(ctx context.Context, rfs ports.RemoteFSP
 }
 func walkRemoteDirTree(ctx context.Context, rfs ports.RemoteFSPort, remoteDir pathalg.RemotePath, dirStat ports.RemoteFileStat, localDir pathalg.LocalRootedDest, symPolicy pathalg.SymlinkPolicy, pl *recursiveDownloadPlan) error {
 	if err := ctx.Err(); err != nil || len(pl.allDests) >= pl.maxFiles {
-		return pickIf[error](err != nil, err, fmt.Errorf("%w: 递归下载对象数超限 %d", ports.ErrLimitExceeded, pl.maxFiles))
+		return pickIf[error](err != nil, err, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "download_entries"), domi18n.Int("count", len(pl.allDests)), domi18n.Int("limit", pl.maxFiles)))
 	}
 	visitKey := pickIf(dirStat.Anchor().HasDevIno(), fmt.Sprintf("%d:%d", dirStat.Anchor().Dev(), dirStat.Anchor().Ino()), remoteDir.String())
 	if _, seen := pl.visited[visitKey]; seen {
-		return fmt.Errorf("%w: 检测到远端目录环路 %s", ErrInvalidRequest, remoteDir)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyUCTransferRemoteCycle, domi18n.BoundStr("path", remoteDir.String()))
 	}
 	pl.visited[visitKey], pl.dirs, pl.allDests = struct{}{}, append(pl.dirs, plannedDir{local: localDir, modTime: dirStat.ModTime()}), append(pl.allDests, localDir)
 	entries, err := rfs.ReadDir(ctx, remoteDir)
@@ -336,7 +337,7 @@ func walkRemoteDirTree(ctx context.Context, rfs ports.RemoteFSPort, remoteDir pa
 }
 func walkRemoteEntry(ctx context.Context, rfs ports.RemoteFSPort, remoteDir pathalg.RemotePath, localDir pathalg.LocalRootedDest, ent ports.RemoteDirEntry, symPolicy pathalg.SymlinkPolicy, pl *recursiveDownloadPlan) error {
 	if len(pl.allDests) >= pl.maxFiles {
-		return fmt.Errorf("%w: 递归下载对象数超限 %d", ports.ErrLimitExceeded, pl.maxFiles)
+		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "download_entries"), domi18n.Int("count", len(pl.allDests)), domi18n.Int("limit", pl.maxFiles))
 	}
 	childRemote, e1 := remoteDir.Join(ent.Name())
 	childLocal, e2 := localDir.JoinRemoteName(ent.Name())
@@ -352,13 +353,13 @@ func walkRemoteEntry(ctx context.Context, rfs ports.RemoteFSPort, remoteDir path
 		return walkRemoteDirTree(ctx, rfs, childRemote, childStat, childLocal, symPolicy, pl)
 	case ports.RemoteFileRegular:
 		if uint64(childStat.Size()) > pl.maxBytes-pl.totalBytes {
-			return fmt.Errorf("%w: 递归下载总大小超限 %d", fsm.ErrTransferSizeExceeded, pl.maxBytes)
+			return domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "download_total"), domi18n.Uint64("size", pl.totalBytes+uint64(childStat.Size())), domi18n.Uint64("limit", pl.maxBytes))
 		}
 		pl.totalBytes, pl.files, pl.allDests = pl.totalBytes+uint64(childStat.Size()), append(pl.files, plannedFile{remote: childRemote, local: childLocal, stat: childStat}), append(pl.allDests, childLocal)
 		return nil
 	case ports.RemoteFileSymlink:
 		if symPolicy != pathalg.SymlinkContainedRelative {
-			return fmt.Errorf("%w: %w: 策略 %s 禁止软链 %s", ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, symPolicy, childRemote)
+			return domi18n.WrapS(ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, domi18n.KeyUCTransferSymlinkPol, domi18n.Str("policy", symPolicy.String()), domi18n.BoundStr("path", childRemote.String()))
 		}
 		target, rErr := rfs.ReadLink(ctx, childRemote)
 		if rErr == nil {
@@ -366,7 +367,7 @@ func walkRemoteEntry(ctx context.Context, rfs ports.RemoteFSPort, remoteDir path
 		}
 		return rErr
 	default:
-		return fmt.Errorf("%w: 远端路径 %s 为不受支持类型 %s", ErrRemoteObjectUnsupported, childRemote, childStat.FileType())
+		return domi18n.EF(ErrRemoteObjectUnsupported, domi18n.KeyUCTransferRemoteType, domi18n.BoundStr("path", childRemote.String()), domi18n.Str("kind", childStat.FileType().String()))
 	}
 }
 func validateRecursivePlan(pl *recursiveDownloadPlan) error {
@@ -376,13 +377,13 @@ func validateRecursivePlan(pl *recursiveDownloadPlan) error {
 		for _, sl := range pl.symlinks {
 			b, bErr := pathalg.NewSymlinkBinding(sl.local, sl.target)
 			if bErr != nil {
-				return fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, bErr)
+				return domi18n.WrapSentinel(ErrSymlinkPolicyDenied, bErr)
 			}
 			bindings = append(bindings, b)
 		}
 		err = pathalg.ValidateContainedSymlinkSet(bindings)
 	}
-	return pickIf[error](err != nil, fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, err), nil)
+	return pickIf[error](err != nil, domi18n.WrapSentinel(ErrSymlinkPolicyDenied, err), nil)
 }
 func createPlannedDirsAndSymlinks(root ports.RootHandle, dirs []plannedDir, symlinks []plannedSymlink, noClobber bool, out *SCPDownloadResult) error {
 	for _, d := range dirs {

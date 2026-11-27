@@ -2,11 +2,11 @@ package credential
 
 import (
 	"context"
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -244,7 +244,7 @@ func (s *Service) RotateSecretInteractive(ctx context.Context, req InteractiveRo
 
 func buildRotateSagaRequest(req RotateSecretRequest) (VaultSagaRequest, error) {
 	if !req.OldRef.IsValid() {
-		return VaultSagaRequest{}, fmt.Errorf("%w: RotateSecret 需要有效的 OldRef", ErrInvalidRequest)
+		return VaultSagaRequest{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "OldRef"))
 	}
 	targetStore := req.TargetStore
 	if !req.NewRef.IsValid() && targetStore == "" {
@@ -264,7 +264,7 @@ func buildRotateSagaRequest(req RotateSecretRequest) (VaultSagaRequest, error) {
 				return zeroVal[inventory.Graph](), err
 			}
 			if replaced == 0 {
-				return zeroVal[inventory.Graph](), fmt.Errorf("%w: 资产图中不存在对 %s 的引用", ports.ErrNotFound, req.OldRef)
+				return zeroVal[inventory.Graph](), domi18n.EF(ports.ErrNotFound, domi18n.KeyUCCredRefNotInGraph, domi18n.BoundStr("ref", req.OldRef.String()))
 			}
 			return nextGraph, nil
 		},
@@ -285,23 +285,23 @@ func (s *Service) validateSagaRequest(ctx context.Context, req VaultSagaRequest)
 		return ErrStoreUnavailable
 	}
 	if req.MutateGraph == nil {
-		return fmt.Errorf("%w: MutateGraph 回调不能为 nil", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNil, domi18n.Str("field", "MutateGraph"))
 	}
 	if !req.NewRef.IsValid() && req.TargetStore == "" {
-		return fmt.Errorf("%w: 必须提供有效 NewRef 或非空 TargetStore", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "NewRef, TargetStore"))
 	}
 	if req.ResolveOldRefs != nil && req.OldRef.IsSome() {
-		return fmt.Errorf("%w: OldRef 与 ResolveOldRefs 不可同时指定", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonMutuallyExclusive, domi18n.Str("first", "OldRef"), domi18n.Str("second", "ResolveOldRefs"))
 	}
 	if old, ok := req.OldRef.Get(); ok && !old.IsValid() {
-		return fmt.Errorf("%w: OldRef 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "OldRef"))
 	}
 	if rev, ok := req.ExpectedRevision.Get(); ok && !rev.IsValid() {
-		return fmt.Errorf("%w: ExpectedRevision 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExpectedRevision"))
 	}
-	for _, p := range req.ExtraPending {
+	for i, p := range req.ExtraPending {
 		if !p.Ref.IsValid() {
-			return fmt.Errorf("%w: ExtraPending 包含无效 Ref", ErrInvalidRequest)
+			return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "ExtraPending"), domi18n.Int("index", i))
 		}
 	}
 	return nil
@@ -313,7 +313,7 @@ func (s *Service) resolveSagaNewRef(req VaultSagaRequest) (secret.Ref, error) {
 	}
 	ref, err := s.allocateRandomRef(req.TargetStore)
 	if err != nil {
-		return zeroVal[secret.Ref](), fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return zeroVal[secret.Ref](), domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	return ref, nil
 }

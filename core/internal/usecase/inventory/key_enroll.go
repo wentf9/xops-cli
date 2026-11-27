@@ -2,7 +2,6 @@ package inventory
 
 import (
 	"context"
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -115,7 +114,7 @@ func (s *Service) runKeyEnroll(ctx context.Context, req EnrollEncryptedPrivateKe
 			identity: st.builtIdent, fingerprint: st.verifiedFP, passphraseRef: sagaRes.NewRef(), revision: rev, saga: sagaRes, valid: true,
 		}, nil
 	}
-	return EnrollEncryptedPrivateKeyResult{saga: sagaRes}, fmt.Errorf("%w: VaultSaga 完成后缺少有效 Revision", ErrCommitOutcomeUnknown)
+	return EnrollEncryptedPrivateKeyResult{saga: sagaRes}, domi18n.EF(ErrCommitOutcomeUnknown, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "VaultSaga revision"))
 }
 func closeIfNonNil(stream *events.OperationStream) {
 	if stream != nil {
@@ -135,12 +134,12 @@ func (s *Service) validateKeyEnrollCall(ctx context.Context, req EnrollEncrypted
 	case interactive && (s.interaction == nil || !s.interaction.CanInteract()):
 		return z, ErrInteractionUnavailable
 	case !req.IdentityID.IsValid() || !req.User.IsValid() || !req.KeyPath.IsValid() || (!req.NewRef.IsValid() && req.TargetStore == "") || (hasFP && !fp.IsValid()):
-		return z, fmt.Errorf("%w: 加密私钥登记请求参数无效", ErrInvalidRequest)
+		return z, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "EnrollEncryptedPrivateKeyRequest"))
 	case !interactive:
 		return z, nil
 	case !req.Prompt.IsZero():
 		if !req.Prompt.IsValid() {
-			return z, fmt.Errorf("%w: SecretPromptRequest 无效", ErrInvalidRequest)
+			return z, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SecretPromptRequest"))
 		}
 		return req.Prompt, nil
 	default:
@@ -188,17 +187,17 @@ func (s *Service) verifyEnrolledKey(ctx context.Context, req EnrollEncryptedPriv
 		return err
 	}
 	if !fp.IsValid() {
-		return fmt.Errorf("%w: KeySignerPort 返回无效公钥指纹", ErrKeyFingerprintMismatch)
+		return domi18n.EF(ErrKeyFingerprintMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "KeySignerPort fingerprint"))
 	}
 	if expFP, ok := req.ExpectedFingerprint.Get(); ok && !fp.Equal(expFP) {
-		return fmt.Errorf("%w: 实际指纹 %s 与预期指纹 %s 不一致", ErrKeyFingerprintMismatch, fp, expFP)
+		return domi18n.EF(ErrKeyFingerprintMismatch, domi18n.KeyUCInvFPMismatchDetail, domi18n.BoundStr("actual", fp.String()), domi18n.BoundStr("expected", expFP.String()))
 	}
 	st.verifiedFP = fp
 	return nil
 }
 func (s *Service) mutateGraphForKeyEnroll(ctx context.Context, g inventory.Graph, req EnrollEncryptedPrivateKeyRequest, newRef secret.Ref, st *keyEnrollState) (z inventory.Graph, err error) {
 	if !st.verifiedFP.IsValid() {
-		return z, fmt.Errorf("%w: 缺少经验证的私钥指纹", ErrKeyFingerprintMismatch)
+		return z, domi18n.EF(ErrKeyFingerprintMismatch, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "verified private key fingerprint"))
 	}
 	binding, err := inventory.NewKeyPassphraseBinding(newRef, st.verifiedFP)
 	var auth *inventory.AuthPrivateKey
@@ -215,7 +214,7 @@ func (s *Service) mutateGraphForKeyEnroll(ctx context.Context, g inventory.Graph
 	idents := g.Identities()
 	if idx := slices.IndexFunc(idents, func(i inventory.Identity) bool { return i.ID().Equal(req.IdentityID) }); idx >= 0 {
 		if !req.ReplaceExisting {
-			return z, fmt.Errorf("%w: identity %q", ErrAssetAlreadyExists, req.IdentityID)
+			return z, domi18n.EF(ErrAssetAlreadyExists, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "identity"), domi18n.BoundStr("value", req.IdentityID.String()))
 		}
 		if !slices.EqualFunc(secretRefsForIdentity(g, req.IdentityID), st.expectedOldRefs, secret.Ref.Equal) {
 			return z, ports.ErrRevisionConflict

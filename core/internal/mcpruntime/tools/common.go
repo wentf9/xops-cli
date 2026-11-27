@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json/jsontext"
-	"fmt"
 	"io"
 	"io/fs"
 	"strconv"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -40,10 +40,10 @@ func decodeToolArgs[T any](raw jsontext.Value) (T, error) {
 // resolveTarget 经 InventoryService 解析目标串并编译不可变 Merkle 多跳连接计划。
 func (r *Registry) resolveTarget(ctx context.Context, target string, cliOpts option.OptionLayer) (ucinv.ResolvedTarget, error) {
 	if r.inventory == nil {
-		return zeroVal[ucinv.ResolvedTarget](), fmt.Errorf("%w: InventoryService 未配置", ErrServiceUnavailable)
+		return zeroVal[ucinv.ResolvedTarget](), domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "InventoryService"))
 	}
 	if strings.TrimSpace(target) == "" {
-		return zeroVal[ucinv.ResolvedTarget](), fmt.Errorf("%w: target 不能为空", protocol.ErrInvalidParams)
+		return zeroVal[ucinv.ResolvedTarget](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "target"))
 	}
 	return r.inventory.ResolveTarget(ctx, ucinv.ResolveTargetRequest{
 		Target:     target,
@@ -69,7 +69,7 @@ func parseOptionalRevision(raw string) (algebraic.Option[ports.Revision], error)
 	}
 	rev, err := ports.ParseRevision(raw)
 	if err != nil {
-		return algebraic.None[ports.Revision](), fmt.Errorf("%w: expected_revision 非法: %w", protocol.ErrInvalidParams, err)
+		return algebraic.None[ports.Revision](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "expected_revision"))
 	}
 	return algebraic.Some(rev), nil
 }
@@ -80,7 +80,7 @@ func parseOptionalPerm(opt algebraic.Option[uint32]) (algebraic.Option[fs.FileMo
 		return algebraic.None[fs.FileMode](), nil
 	}
 	if v == 0 || v > 0o777 {
-		return algebraic.None[fs.FileMode](), fmt.Errorf("%w: perm=%#o 超出 0001..0777", protocol.ErrInvalidParams, v)
+		return algebraic.None[fs.FileMode](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonPermInvalid, domi18n.Str("perm", strconv.FormatUint(uint64(v), 8)))
 	}
 	return algebraic.Some(fs.FileMode(v)), nil
 }
@@ -88,7 +88,7 @@ func parseOptionalPerm(opt algebraic.Option[uint32]) (algebraic.Option[fs.FileMo
 func decodeBase64Strict(raw string) ([]byte, error) {
 	b, err := base64.StdEncoding.Strict().DecodeString(raw)
 	if err != nil {
-		return nil, fmt.Errorf("%w: Base64 解码失败: %w", protocol.ErrInvalidParams, err)
+		return nil, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonBase64DecodeFailed)
 	}
 	return b, nil
 }
@@ -97,7 +97,7 @@ func decodeTextOrBase64(text algebraic.Option[string], b64 algebraic.Option[stri
 	tVal, hasT := text.Get()
 	bVal, hasB := b64.Get()
 	if hasT == hasB {
-		return nil, fmt.Errorf("%w: 文本字段与 base64 字段必须二选一", protocol.ErrInvalidParams)
+		return nil, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "text, base64"))
 	}
 	if hasB {
 		return decodeBase64Strict(bVal)
@@ -108,7 +108,7 @@ func decodeTextOrBase64(text algebraic.Option[string], b64 algebraic.Option[stri
 func parseRemotePathParam(name, raw string) (pathalg.RemotePath, error) {
 	p, err := pathalg.ParseRemotePath(raw)
 	if err != nil {
-		return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: %s 非法: %w", protocol.ErrInvalidParams, name, err)
+		return zeroVal[pathalg.RemotePath](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.BoundStr("field", name))
 	}
 	return p, nil
 }
@@ -119,7 +119,7 @@ func parseOptionalDigest(raw string) (algebraic.Option[security.Digest], error) 
 	}
 	d, err := security.ParseDigest(raw)
 	if err != nil {
-		return algebraic.None[security.Digest](), fmt.Errorf("%w: expected_digest 非法: %w", protocol.ErrInvalidParams, err)
+		return algebraic.None[security.Digest](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "expected_digest"))
 	}
 	return algebraic.Some(d), nil
 }
@@ -235,19 +235,19 @@ func storeHandleMap[K plan.HandleKind](m map[string]plan.ManagedHandle[K], maxCa
 func resolveHandleArg[K plan.HandleKind](mu *sync.Mutex, m map[string]plan.ManagedHandle[K], explicit algebraic.Option[plan.ManagedHandle[K]], token string) (plan.ManagedHandle[K], error) {
 	if h, ok := explicit.Get(); ok {
 		if !h.IsValid() {
-			return zeroVal[plan.ManagedHandle[K]](), fmt.Errorf("%w: handle 无效", protocol.ErrInvalidParams)
+			return zeroVal[plan.ManagedHandle[K]](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "handle"))
 		}
 		return h, nil
 	}
 	tok := strings.TrimSpace(token)
 	if tok == "" {
-		return zeroVal[plan.ManagedHandle[K]](), fmt.Errorf("%w: 必须提供 handle 或 handle_token", protocol.ErrInvalidParams)
+		return zeroVal[plan.ManagedHandle[K]](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "handle, handle_token"))
 	}
 	mu.Lock()
 	h, ok := m[tok]
 	mu.Unlock()
 	if !ok || !h.IsValid() {
-		return zeroVal[plan.ManagedHandle[K]](), fmt.Errorf("%w: %s", ErrHandleNotFound, tok)
+		return zeroVal[plan.ManagedHandle[K]](), domi18n.EF(ErrHandleNotFound, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "handle_token"), domi18n.BoundStr("value", tok))
 	}
 	return h, nil
 }
@@ -302,7 +302,7 @@ func parseOptionalOpID(raw string) (algebraic.Option[security.OperationID], erro
 	}
 	id, err := security.ParseOperationID(raw)
 	if err != nil {
-		return algebraic.None[security.OperationID](), fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
+		return algebraic.None[security.OperationID](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "transfer_id"))
 	}
 	return algebraic.Some(id), nil
 }
@@ -375,7 +375,7 @@ func validateApprovalAndRisk(
 	approval algebraic.Option[protocol.ApprovalSubmissionDTO],
 ) (algebraic.Option[security.RiskLevel], algebraic.Option[gate.ApprovalSubmission], error) {
 	if rv, ok := risk.Get(); ok && !rv.IsValid() {
-		return algebraic.None[security.RiskLevel](), algebraic.None[gate.ApprovalSubmission](), fmt.Errorf("%w: risk 非法", protocol.ErrInvalidParams)
+		return algebraic.None[security.RiskLevel](), algebraic.None[gate.ApprovalSubmission](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "risk"))
 	}
 	sub, err := protocol.DecodeApprovalSubmission(approval)
 	if err != nil {

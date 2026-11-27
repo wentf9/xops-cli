@@ -7,6 +7,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -124,7 +125,7 @@ func (s *Service) ResolveStagedTarget(ctx context.Context, req ResolveStagedTarg
 		return ResolvedTarget{}, err
 	}
 	if !req.Node.IsValid() || (hasH && !h.IsValid()) || (hasI && !id.IsValid()) {
-		return ResolvedTarget{}, fmt.Errorf("%w: 暂存 Host/Identity/Node 无效", ErrInvalidRequest)
+		return ResolvedTarget{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "staged Host/Identity/Node"))
 	}
 	parsed, err := targetparse.ParseSpec(req.Node.ID().String(), ErrInvalidTarget)
 	var managedIdx *managedGraphIndex
@@ -197,13 +198,13 @@ func (s *Service) validateResolveInputs(ctx context.Context, req ResolveTargetRe
 	case ctx.Err() != nil:
 		return ctx.Err()
 	case req.ExplicitAuth != nil && !req.ExplicitAuth.IsValid():
-		return fmt.Errorf("%w: ExplicitAuth 无效", ErrNoAuthMethod)
+		return domi18n.EF(ErrNoAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExplicitAuth"))
 	}
 	if err := req.CLIOptions.Validate(); err != nil {
-		return fmt.Errorf("%w: CLIOptions 无效: %w", ErrInvalidTarget, err)
+		return domi18n.WrapS(ErrInvalidTarget, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "CLIOptions"))
 	}
 	if exp, ok := req.ExplicitOrigin.Get(); ok && !s.supportsExplicitOrigin(exp) {
-		return fmt.Errorf("%w: 当前配置不支持目标来源=%s", ErrUnsupportedOrigin, exp)
+		return domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", "origin "+exp.String()))
 	}
 	return nil
 }
@@ -247,7 +248,7 @@ func (idx *managedGraphIndex) lookupManagedEntities(name string) (node inventory
 	host, okH := idx.hosts[node.HostRef()]
 	ident, okI := idx.identities[node.IdentityRef()]
 	if !okH || !okI {
-		return zeroVal[inventory.Node](), zeroVal[inventory.Host](), zeroVal[inventory.Identity](), false, fmt.Errorf("%w: 节点 %q 引用的 Host/Identity 缺失", inventory.ErrMissingAssetRef, node.ID())
+		return zeroVal[inventory.Node](), zeroVal[inventory.Host](), zeroVal[inventory.Identity](), false, domi18n.EF(inventory.ErrMissingAssetRef, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "lookup Host/Identity"), domi18n.BoundStr("target", node.ID().String()))
 	}
 	return node, host, ident, true, nil
 }
@@ -272,7 +273,7 @@ func (s *Service) resolveHopRecursive(ctx context.Context, st *resolveState, pt 
 		return z, err
 	}
 	if depth > st.maxJumpDepth {
-		return z, fmt.Errorf("%w: %w: ProxyJump 深度 %d 超过上限 %d", ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, depth, st.maxJumpDepth)
+		return z, domi18n.WrapS(ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "ProxyJump depth"), domi18n.Int("count", depth), domi18n.Int("limit", st.maxJumpDepth))
 	}
 	hopIn, err := s.resolveHopInputs(ctx, st, pt, cliOpts, explicitOrigin, explicitAuth, depth, preferOpenSSH)
 	if err != nil {
@@ -284,7 +285,7 @@ func (s *Service) resolveHopRecursive(ctx context.Context, st *resolveState, pt 
 	}
 	aliasKey, epKey := hopIn.origin.Kind().String()+":node:"+hopIn.nodeLabel, "ep:"+policy.Endpoint().String()
 	if st.activeStack[aliasKey] || st.activeStack[epKey] {
-		return z, fmt.Errorf("%w: %w: 跳板目标 %s (%s) 存在循环引用", ErrProxyJumpCycle, inventory.ErrProxyJumpCycle, pt.OrigHost.String(), policy.Endpoint())
+		return z, domi18n.WrapS(ErrProxyJumpCycle, inventory.ErrProxyJumpCycle, domi18n.KeyUCInvHopCycleDetail, domi18n.BoundStr("target", pt.OrigHost.String()), domi18n.BoundStr("key", policy.Endpoint().String()))
 	}
 	st.activeStack[aliasKey], st.activeStack[epKey] = true, true
 	defer func() { delete(st.activeStack, aliasKey); delete(st.activeStack, epKey) }()
@@ -329,10 +330,10 @@ func (s *Service) tryResolveManagedHop(ctx context.Context, st *resolveState, pt
 	}
 	node, host, ident, found, err := st.managedIndex.lookupManagedEntities(pt.OrigHost.String())
 	if err != nil || !found {
-		return resolvedHopInputs{}, false, pickIf[error](err != nil, err, pickIf[error](hasExp, fmt.Errorf("%w: 未找到托管节点 %q", ErrAssetNotFound, pt.OrigHost.String()), nil))
+		return resolvedHopInputs{}, false, pickIf[error](err != nil, err, pickIf[error](hasExp, domi18n.EF(ErrAssetNotFound, domi18n.KeyUCInvNodeNotFound, domi18n.BoundStr("node", pt.OrigHost.String())), nil))
 	}
 	if hasExp && node.Origin().Kind() != exp {
-		return resolvedHopInputs{}, false, fmt.Errorf("%w: 节点 %q 实际来源=%s，期望=%s", ErrUnsupportedOrigin, node.ID(), node.Origin().Kind(), exp)
+		return resolvedHopInputs{}, false, domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyCommonMismatch, domi18n.BoundStr("field", "node "+node.ID().String()+" origin"), domi18n.Str("expected", exp.String()), domi18n.Str("actual", node.Origin().Kind().String()))
 	}
 	return s.buildManagedHopInputs(ctx, st, pt, cliOpts, explicitAuth, depth, node, host, ident)
 }
@@ -393,7 +394,7 @@ func buildNodeOrigin(kind option.OriginKind, origHost option.OriginalHostSpec, v
 	case option.OriginAdHoc:
 		return inventory.NewOriginAdHoc(algebraic.None[inventory.NodeID]())
 	default:
-		return nil, fmt.Errorf("%w: %s", ErrUnsupportedOrigin, kind)
+		return nil, domi18n.EF(ErrUnsupportedOrigin, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "OriginKind"), domi18n.BoundStr("value", kind.String()))
 	}
 }
 func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, route option.ProxyRoute, depth int, preferOpenSSH bool) error {
@@ -402,7 +403,7 @@ func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, rou
 		return nil
 	case *option.ProxyJumpChain:
 		if !v.IsValid() {
-			return fmt.Errorf("%w: 无效 ProxyJumpChain", ErrInvalidTarget)
+			return domi18n.EF(ErrInvalidTarget, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ProxyJumpChain"))
 		}
 		hops := v.Hops().Slice()
 		lastParsed, err := targetparse.ParseHopSpec(hops[len(hops)-1], ErrInvalidTarget)
@@ -416,7 +417,7 @@ func (s *Service) expandUpstreamJumps(ctx context.Context, st *resolveState, rou
 		_, err = s.resolveHopRecursive(ctx, st, lastParsed, upstreamCLI, algebraic.None[option.OriginKind](), nil, depth+1, preferOpenSSH)
 		return err
 	default:
-		return fmt.Errorf("%w: 不支持的 ProxyRoute 变体 %T", ErrInvalidTarget, route)
+		return domi18n.EF(ErrInvalidTarget, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", fmt.Sprintf("ProxyRoute %T", route)))
 	}
 }
 func buildPrefixJumpLayer(prefix []option.HopTarget) (option.OptionLayer, error) {
@@ -425,17 +426,17 @@ func buildPrefixJumpLayer(prefix []option.HopTarget) (option.OptionLayer, error)
 	}
 	ne, err := algebraic.NonEmptyFromSlice(prefix)
 	if err != nil {
-		return option.UnsetOptionLayer(), fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+		return option.UnsetOptionLayer(), domi18n.WrapSentinel(ErrInvalidTarget, err)
 	}
 	r, err := option.NewProxyJumpChain(ne)
 	if err != nil {
-		return option.UnsetOptionLayer(), fmt.Errorf("%w: %w", ErrInvalidTarget, err)
+		return option.UnsetOptionLayer(), domi18n.WrapSentinel(ErrInvalidTarget, err)
 	}
 	return option.UnsetOptionLayer().WithProxyRoute(r), nil
 }
 func (s *Service) appendResolvedHop(st *resolveState, nodeLabel string, policy option.EffectivePolicy, explicitAuth inventory.AuthMethod) error {
 	if len(st.hops) >= maxPlanHops {
-		return fmt.Errorf("%w: %w: 连接计划跳数超过上限 %d", ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, maxPlanHops)
+		return domi18n.WrapS(ErrProxyJumpDepthExceeded, inventory.ErrProxyJumpDepthExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "connection plan hops"), domi18n.Int("count", len(st.hops)+1), domi18n.Int("limit", maxPlanHops))
 	}
 	user, err := s.resolveHopUsername(policy)
 	if err != nil {
@@ -462,5 +463,5 @@ func (s *Service) resolveHopUsername(policy option.EffectivePolicy) (option.User
 			}
 		}
 	}
-	return zeroVal[option.Username](), fmt.Errorf("%w: 请通过 user@、-l 或 OpenSSH User 指定用户名", ErrMissingUsername)
+	return zeroVal[option.Username](), domi18n.EF(ErrMissingUsername, domi18n.KeyUCInvUsernameHint)
 }

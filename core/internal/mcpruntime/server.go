@@ -3,7 +3,6 @@ package mcpruntime
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -199,7 +199,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	descriptors, err := protocol.ToolDescriptors()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidConfig, err)
 	}
 	reg, err := tools.NewRegistry(tools.RegistryConfig{
 		Gate:          cfg.Gate,
@@ -214,7 +214,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		MaxHandles:    cfg.MaxTrackedHandles,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidConfig, err)
 	}
 	maxMsg, chunkSize, maxSess, readHdr, shutDur := resolveServerDefaults(cfg)
 	lifeCtx, lifeCancel := context.WithCancelCause(context.Background())
@@ -251,21 +251,21 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 func validateServerConfig(cfg ServerConfig) error {
 	switch {
 	case cfg.Gate == nil || cfg.Clock == nil || cfg.Entropy == nil:
-		return fmt.Errorf("%w: Gate/Clock/Entropy 必填", ErrInvalidConfig)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Gate/Clock/Entropy"))
 	case cfg.SystemBus != nil && cfg.SystemBus.IsClosed():
-		return fmt.Errorf("%w: 注入的 SystemBus 已关闭", ErrInvalidConfig)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "SystemBus"))
 	case cfg.MaxMessageBytes < 0 || cfg.MaxMessageBytes > maxAllowedMessageBytes:
-		return fmt.Errorf("%w: MaxMessageBytes=%d 越界", ErrInvalidConfig, cfg.MaxMessageBytes)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldRange, domi18n.Str("field", "MaxMessageBytes"), domi18n.Int64("value", cfg.MaxMessageBytes), domi18n.Int64("min", 0), domi18n.Int64("max", maxAllowedMessageBytes))
 	case cfg.HTTPChunkSize < 0 || (cfg.HTTPChunkSize > 0 && (cfg.HTTPChunkSize < minHTTPChunkSize || uint64(cfg.HTTPChunkSize) > fsm.MaxTransferChunkBytes)):
-		return fmt.Errorf("%w: HTTPChunkSize=%d 越界", ErrInvalidConfig, cfg.HTTPChunkSize)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldRange, domi18n.Str("field", "HTTPChunkSize"), domi18n.Int64("value", cfg.HTTPChunkSize), domi18n.Int64("min", minHTTPChunkSize), domi18n.Uint64("max", fsm.MaxTransferChunkBytes))
 	case cfg.MaxHTTPSessions < 0:
-		return fmt.Errorf("%w: MaxHTTPSessions 不能为负", ErrInvalidConfig)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "MaxHTTPSessions"))
 	}
 	if d, ok := cfg.HTTPReadHeaderTimeout.Get(); ok && !d.IsPositive() {
-		return fmt.Errorf("%w: HTTPReadHeaderTimeout 必须为正时长", ErrInvalidConfig)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "HTTPReadHeaderTimeout"))
 	}
 	if d, ok := cfg.HTTPShutdownTimeout.Get(); ok && !d.IsPositive() {
-		return fmt.Errorf("%w: HTTPShutdownTimeout 必须为正时长", ErrInvalidConfig)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "HTTPShutdownTimeout"))
 	}
 	return nil
 }
@@ -339,7 +339,7 @@ func (s *Server) runStartupReconcileAndRecovery(ctx context.Context) (StartupRep
 func (s *Server) runStartupAuditReconcile(ctx context.Context, rep *StartupReport) error {
 	if s.reconcileAudits == nil {
 		if s.gate.Profile() == gate.PolicyProfileStrictAgent && !s.allowOptionalReconciler {
-			return fmt.Errorf("%w: %w", ErrStartupReconcileFailed, gate.ErrReconcilerUnavailable)
+			return domi18n.WrapSentinel(ErrStartupReconcileFailed, gate.ErrReconcilerUnavailable)
 		}
 		return nil
 	}
@@ -349,7 +349,7 @@ func (s *Server) runStartupAuditReconcile(ctx context.Context, rep *StartupRepor
 			return nil
 		}
 		s.emitDiag(events.SeverityError, "mcp_startup_reconcile_failed", err.Error(), nil)
-		return fmt.Errorf("%w: %w", ErrStartupReconcileFailed, err)
+		return domi18n.WrapSentinel(ErrStartupReconcileFailed, err)
 	}
 	rep.auditReport = algebraic.Some(auditRep)
 	return nil
@@ -367,7 +367,7 @@ func (s *Server) runStartupJournalRecovery(ctx context.Context, rep *StartupRepo
 			return nil
 		}
 		s.emitDiag(events.SeverityError, "mcp_startup_recovery_failed", err.Error(), nil)
-		return fmt.Errorf("%w: %w", ErrStartupRecoveryFailed, err)
+		return domi18n.WrapSentinel(ErrStartupRecoveryFailed, err)
 	}
 	for _, entry := range recRes.Entries {
 		sum := buildTransferSummary(entry)
@@ -375,7 +375,7 @@ func (s *Server) runStartupJournalRecovery(ctx context.Context, rep *StartupRepo
 		case entry.Result.UncertainCommit || errors.Is(entry.Err, uctrans.ErrUncertainCommit):
 			// 忠实记录 TransferUncertainCommit，严禁重试、覆写或删除日志（零副作用）。
 			rep.uncertainTransfers = append(rep.uncertainTransfers, sum)
-			s.emitDiag(events.SeverityError, "mcp_startup_uncertain_transfer", "发现处于 TransferUncertainCommit 的传输，已隔离零副作用保留", map[string]string{
+			s.emitDiag(events.SeverityError, "mcp_startup_uncertain_transfer", "transfer in TransferUncertainCommit quarantined with zero side effects", map[string]string{
 				"transfer_id": entry.TransferID.String(),
 			})
 		case entry.Err != nil:
@@ -388,7 +388,7 @@ func (s *Server) runStartupJournalRecovery(ctx context.Context, rep *StartupRepo
 		}
 	}
 	if s.failOnCorruptJournal && len(rep.corruptTransfers) > 0 {
-		return fmt.Errorf("%w: 发现 %d 条损坏传输日志且 FailOnCorruptJournal 已启用", ErrStartupRecoveryFailed, len(rep.corruptTransfers))
+		return domi18n.EF(ErrStartupRecoveryFailed, domi18n.KeyMCPCorruptJournalLim, domi18n.Int("count", len(rep.corruptTransfers)))
 	}
 	return nil
 }

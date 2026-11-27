@@ -14,9 +14,9 @@
 package session
 
 import (
-	"errors"
-	"fmt"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -28,18 +28,18 @@ const (
 
 // 本包导出的规范化哨兵错误，供 core/engine 与上层测试以 errors.Is 精确区分故障类别。
 var (
-	ErrNilContext             = errors.New("usecase/session: context 不能为 nil")
-	ErrInvalidConfig          = errors.New("usecase/session: 无效的 ServiceConfig 配置")
-	ErrServiceNotInitialized  = errors.New("usecase/session: Service 未初始化")
-	ErrInvalidRequest         = errors.New("usecase/session: 无效的会话执行请求")
-	ErrInvalidRequestTTY      = errors.New("usecase/session: 无效的 RequestTTY 模式")
-	ErrPortUnavailable        = errors.New("usecase/session: 必需的出站端口未配置")
-	ErrInvalidProbeResult     = errors.New("usecase/session: 远端 Shell 探测结果无效")
-	ErrEscalationScopeChanged = errors.New("usecase/session: 提权规范作用域校验失败或发生漂移")
-	ErrPTYClosed              = errors.New("usecase/session: 持久 PTY 会话已关闭或已吊销")
-	ErrControlMasterDisabled  = errors.New("usecase/session: ControlPolicy 生效投影已禁用多路复用")
-	ErrMuxMasterUnavailable   = errors.New("usecase/session: ControlMaster 不可用或连接被拒绝")
-	ErrMuxPersistExpired      = errors.New("usecase/session: ControlPersist 驻留超时已过期")
+	ErrNilContext             = domi18n.Sentinel(domi18n.KeyUCSessNilContext)
+	ErrInvalidConfig          = domi18n.Sentinel(domi18n.KeyUCSessInvalidConfig)
+	ErrServiceNotInitialized  = domi18n.Sentinel(domi18n.KeyUCSessNotInitialized)
+	ErrInvalidRequest         = domi18n.Sentinel(domi18n.KeyUCSessInvalidRequest)
+	ErrInvalidRequestTTY      = domi18n.Sentinel(domi18n.KeyUCSessInvalidReqTTY)
+	ErrPortUnavailable        = domi18n.Sentinel(domi18n.KeyUCSessPortUnavailable)
+	ErrInvalidProbeResult     = domi18n.Sentinel(domi18n.KeyUCSessInvalidProbe)
+	ErrEscalationScopeChanged = domi18n.Sentinel(domi18n.KeyUCSessEscScopeChanged)
+	ErrPTYClosed              = domi18n.Sentinel(domi18n.KeyUCSessPTYClosed)
+	ErrControlMasterDisabled  = domi18n.Sentinel(domi18n.KeyUCSessMuxDisabled)
+	ErrMuxMasterUnavailable   = domi18n.Sentinel(domi18n.KeyUCSessMuxUnavailable)
+	ErrMuxPersistExpired      = domi18n.Sentinel(domi18n.KeyUCSessMuxPersistExp)
 )
 
 // RequestTTYMode 标识 SSH 伪终端分配策略（对应 OpenSSH RequestTTY auto/yes/no/force 与 -t/-tt/-T）；
@@ -69,7 +69,7 @@ func ParseRequestTTYMode(raw string) (RequestTTYMode, error) {
 	case "force":
 		return RequestTTYForce, nil
 	}
-	return RequestTTYUnset, fmt.Errorf("%w: %q", ErrInvalidRequestTTY, raw)
+	return RequestTTYUnset, domi18n.EF(ErrInvalidRequestTTY, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 
 // IsValid / IsZero / String / TextAppender / TextMarshaler / TextUnmarshaler 实现 RequestTTYMode 值语义。
@@ -84,7 +84,7 @@ func (m RequestTTYMode) String() string {
 }
 func (m RequestTTYMode) AppendText(b []byte) ([]byte, error) {
 	if !m.IsValid() {
-		return nil, fmt.Errorf("%w: %d", ErrInvalidRequestTTY, uint8(m))
+		return nil, domi18n.EF(ErrInvalidRequestTTY, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "RequestTTYMode"), domi18n.Uint64("value", uint64(m)))
 	}
 	return append(b, m.String()...), nil
 }

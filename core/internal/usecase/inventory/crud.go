@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -157,7 +158,7 @@ func (s *Service) GetNode(ctx context.Context, id inventory.NodeID, req QueryReq
 func getAssetByID[T any, ID fmt.Stringer](ctx context.Context, s *Service, req QueryRequest, kind string, id ID, idValid bool, extract func(inventory.Graph) []T, match func(T) bool) (z T, rev ports.Revision, err error) {
 	if !idValid {
 		closeIfNonNil(req.OperationStream)
-		return z, rev, fmt.Errorf("%w: %s ID 无效", ErrInvalidRequest, kind)
+		return z, rev, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", kind+" ID"))
 	}
 	items, rev, err := listAssets(ctx, s, req, extract)
 	if err != nil {
@@ -166,7 +167,7 @@ func getAssetByID[T any, ID fmt.Stringer](ctx context.Context, s *Service, req Q
 	if idx := slices.IndexFunc(items, match); idx >= 0 {
 		return items[idx], rev, nil
 	}
-	return z, zeroVal[ports.Revision](), fmt.Errorf("%w: %s %q", ErrAssetNotFound, kind, id)
+	return z, zeroVal[ports.Revision](), domi18n.WrapSentinel(ErrAssetNotFound, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", kind+" "+id.String())))
 }
 
 // ValidateDAG 经 CapInspect 鉴权对托管资产图与全部 OpenSSH 虚拟主机执行跨命名空间 Tarjan SCC ProxyJump 校验；
@@ -190,7 +191,7 @@ func (s *Service) CheckSecretReferences(ctx context.Context, req SecretRefCheckR
 	hasRef := req.Ref.IsValid()
 	if hasRef == (req.StoreID != "") {
 		closeIfNonNil(req.OperationStream)
-		return nil, fmt.Errorf("%w: Ref 与 StoreID 必须二选一提供", ErrInvalidRequest)
+		return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "Ref, StoreID"))
 	}
 	if err := validateExtraPending(req.ExtraPending); err != nil {
 		closeIfNonNil(req.OperationStream)
@@ -311,9 +312,9 @@ func upsertAsset[T any](items []T, item T, upd bool, kind, id string, match func
 	idx := slices.IndexFunc(items, match)
 	switch {
 	case !upd && idx >= 0:
-		return nil, zeroVal[T](), fmt.Errorf("%w: %s %q", ErrAssetAlreadyExists, kind, id)
+		return nil, zeroVal[T](), domi18n.EF(ErrAssetAlreadyExists, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", kind), domi18n.BoundStr("value", id))
 	case upd && idx < 0:
-		return nil, zeroVal[T](), fmt.Errorf("%w: %s %q", ErrAssetNotFound, kind, id)
+		return nil, zeroVal[T](), domi18n.WrapSentinel(ErrAssetNotFound, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", kind+" "+id)))
 	case upd:
 		prev := items[idx]
 		items[idx] = item
@@ -325,7 +326,7 @@ func upsertAsset[T any](items []T, item T, upd bool, kind, id string, match func
 func removeProtectedAsset[T any](items []T, kind, id string, match func(T) bool, canDel func() (bool, []inventory.AssetReference)) ([]T, T, error) {
 	idx := slices.IndexFunc(items, match)
 	if idx < 0 {
-		return nil, zeroVal[T](), fmt.Errorf("%w: %s %q", ErrAssetNotFound, kind, id)
+		return nil, zeroVal[T](), domi18n.WrapSentinel(ErrAssetNotFound, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", kind+" "+id)))
 	}
 	if ok, refs := canDel(); !ok {
 		return nil, zeroVal[T](), newAssetReferencedError(kind, id, refs)
@@ -337,9 +338,9 @@ func (s *Service) runCASMutation(ctx context.Context, spec casMutationSpec) (Mut
 	var vErr error
 	switch {
 	case !spec.valid:
-		vErr = fmt.Errorf("%w: %s 无效", ErrInvalidRequest, spec.label)
+		vErr = domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", spec.label))
 	case spec.expectedRevision.IsSome() && !spec.expectedRevision.OrElse(zeroVal[ports.Revision]()).IsValid():
-		vErr = fmt.Errorf("%w: ExpectedRevision 无效", ErrInvalidRequest)
+		vErr = domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExpectedRevision"))
 	case spec.gcSecrets && s.vault == nil:
 		vErr = ErrVaultUnavailable // 显式请求凭据 GC 但未注入 SecretVault 时写前失败关闭，严禁静默跳过
 	default:

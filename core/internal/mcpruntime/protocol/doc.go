@@ -9,26 +9,26 @@
 //   - 全包 0 init()、0 可变包级 var、0 裸 go 语句、0 nolint 豁免。
 package protocol
 
-import "errors"
+import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // 本包导出的不可变哨兵错误，供 mcpruntime 传输层、工具分发层与测试经 errors.Is 精确区分协议错误类别。
 var (
 	// ErrParseJSON 表示入站字节流不是合法 JSON 语法（JSON-RPC 2.0 -32700 Parse error）。
-	ErrParseJSON = errors.New("mcpruntime/protocol: JSON 语法解析失败")
+	ErrParseJSON = domi18n.Sentinel(domi18n.KeyMCPProtoParseJSON)
 	// ErrInvalidJSONRPC 表示 JSON-RPC 2.0 报文结构、版本、未知字段或方法名非法（-32600 Invalid Request）。
-	ErrInvalidJSONRPC = errors.New("mcpruntime/protocol: 无效的 JSON-RPC 2.0 报文")
+	ErrInvalidJSONRPC = domi18n.Sentinel(domi18n.KeyMCPProtoInvalidRPC)
 	// ErrInvalidRequestID 表示 JSON-RPC 2.0 请求标识（id）非法或处于零值无效态。
-	ErrInvalidRequestID = errors.New("mcpruntime/protocol: 无效的 JSON-RPC RequestID")
+	ErrInvalidRequestID = domi18n.Sentinel(domi18n.KeyMCPProtoInvalidReqID)
 	// ErrInvalidMCPMessage 表示 MCP 协议握手、工具调用或内容块载荷非法。
-	ErrInvalidMCPMessage = errors.New("mcpruntime/protocol: 无效的 MCP 协议载荷")
+	ErrInvalidMCPMessage = domi18n.Sentinel(domi18n.KeyMCPProtoInvalidMsg)
 	// ErrInvalidApproval 表示两步审批回执 DTO 缺失必填字段或摘要/判定非法。
-	ErrInvalidApproval = errors.New("mcpruntime/protocol: 无效的审批提交载荷")
+	ErrInvalidApproval = domi18n.Sentinel(domi18n.KeyMCPProtoInvalidAppr)
 	// ErrInvalidSchema 表示内置工具 JSON Schema 语法校验失败。
-	ErrInvalidSchema = errors.New("mcpruntime/protocol: 内置工具 JSON Schema 无效")
+	ErrInvalidSchema = domi18n.Sentinel(domi18n.KeyMCPProtoInvalidSchema)
 	// ErrInvalidParams 表示 MCP 工具或方法入参不符合强类型判别式 Schema。
-	ErrInvalidParams = errors.New("mcpruntime/protocol: 工具或方法参数非法")
+	ErrInvalidParams = domi18n.Sentinel(domi18n.KeyMCPProtoInvalidParams)
 	// ErrToolNotFound 表示请求的 MCP 工具名未注册。
-	ErrToolNotFound = errors.New("mcpruntime/protocol: 未注册的 MCP 工具")
+	ErrToolNotFound = domi18n.Sentinel(domi18n.KeyMCPProtoToolNotFound)
 	// ErrOutcomeUnknown 表示远端命令已启动但未取得确定终态（ADR-016：禁止自动重试）。
-	ErrOutcomeUnknown = errors.New("mcpruntime/protocol: 远端执行结果不确定（禁止自动重试）")
+	ErrOutcomeUnknown = domi18n.Sentinel(domi18n.KeyMCPProtoOutcomeUnk)
 )

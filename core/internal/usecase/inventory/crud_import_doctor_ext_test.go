@@ -16,6 +16,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -28,11 +29,13 @@ import (
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-// 编译期契约断言：验证 *ucinv.Service 满足 credential.PendingSecretRefProvider，自定义错误满足 Unwrap 契约。
+// 编译期契约断言：验证 *ucinv.Service 满足 credential.PendingSecretRefProvider，自定义错误满足 Unwrap 与 LocalizableNode 契约。
 var (
 	_ credential.PendingSecretRefProvider = (*ucinv.Service)(nil)
 	_ interface{ Unwrap() error }         = (*ucinv.AssetReferencedError)(nil)
 	_ interface{ Unwrap() error }         = (*ucinv.SecretReferencedError)(nil)
+	_ domi18n.LocalizableNode             = (*ucinv.AssetReferencedError)(nil)
+	_ domi18n.LocalizableNode             = (*ucinv.SecretReferencedError)(nil)
 )
 
 const testStoreName = "sim-aes256gcm"
@@ -400,15 +403,12 @@ func assertReverseRefAndUncertainDurability(t *testing.T, ctx context.Context, h
 			t.Fatalf("CreateNode(%s): %v", n.ID(), err)
 		}
 	}
-	if _, err := h.svc.DeleteHost(ctx, ucinv.DeleteHostRequest{ID: host1.ID()}); !errors.Is(err, ucinv.ErrAssetStillReferenced) {
-		t.Fatalf("被 Node 引用的 Host 删除应拒绝: %v", err)
-	}
-	if _, err := h.svc.DeleteIdentity(ctx, ucinv.DeleteIdentityRequest{ID: id1.ID()}); !errors.Is(err, ucinv.ErrAssetStillReferenced) {
-		t.Fatalf("被 Node 引用的 Identity 删除应拒绝: %v", err)
-	}
-	if _, err := h.svc.DeleteNode(ctx, ucinv.DeleteNodeRequest{ID: n1.ID()}); !errors.Is(err, ucinv.ErrAssetStillReferenced) {
-		t.Fatalf("被 ProxyJump 引用的 Node 删除应拒绝: %v", err)
-	}
+	_, err := h.svc.DeleteHost(ctx, ucinv.DeleteHostRequest{ID: host1.ID()})
+	assertInvAssetRefErr(t, err, "host", host1.ID().String())
+	_, err = h.svc.DeleteIdentity(ctx, ucinv.DeleteIdentityRequest{ID: id1.ID()})
+	assertInvAssetRefErr(t, err, "identity", id1.ID().String())
+	_, err = h.svc.DeleteNode(ctx, ucinv.DeleteNodeRequest{ID: n1.ID()})
+	assertInvAssetRefErr(t, err, "node", n1.ID().String())
 
 	// 注入 AppliedNotDurable：返回 ErrUncertainDurability，不删除凭据并上报 AuditOutcomeUnknown。
 	uncRev, _ := ports.ParseRevision("rev-uncertain")
@@ -526,9 +526,8 @@ func TestDelete_FiveLocationAndPendingSecretIntegrity(t *testing.T) {
 		t.Fatalf("全图 5 位置+Pending 应命中 7 条引用，实际=%d err=%v", len(storeRefs), err)
 	}
 	// RequireSecretsUnreferenced=true 在 rPwd 仍被 idKeep 共享时拒绝删除。
-	if _, err := h.svc.DeleteIdentity(ctx, ucinv.DeleteIdentityRequest{ID: idDel.ID(), RequireSecretsUnreferenced: true}); !errors.Is(err, ucinv.ErrSecretStillReferenced) {
-		t.Fatalf("存在共享凭据时 RequireSecretsUnreferenced 应拒绝删除: %v", err)
-	}
+	_, err = h.svc.DeleteIdentity(ctx, ucinv.DeleteIdentityRequest{ID: idDel.ID(), RequireSecretsUnreferenced: true})
+	assertInvSecretRefErr(t, err, rPwd.String())
 	// DeleteUnusedSecrets=true 仅删除独占凭据（rKey/rTOTP/rChal），安全保留共享的 rPwd！
 	delRes, err := h.svc.DeleteIdentity(ctx, ucinv.DeleteIdentityRequest{ID: idDel.ID(), DeleteUnusedSecrets: true})
 	if err != nil || len(delRes.DeletedSecrets()) != 3 || len(delRes.RetainedSecrets()) != 1 || !delRes.RetainedSecrets()[0].Ref.Equal(rPwd) {
@@ -536,12 +535,81 @@ func TestDelete_FiveLocationAndPendingSecretIntegrity(t *testing.T) {
 	}
 	// DeleteNode 对 rPriv 执行回收：当存在 SecretLocPending 保护时保留，解除后彻底删除。
 	pendPriv := []inventory.PendingSecretRef{{OwnerID: "pending:hold-priv", Ref: rPriv}}
-	if _, err := h.svc.DeleteNode(ctx, ucinv.DeleteNodeRequest{ID: nPriv.ID(), RequireSecretsUnreferenced: true, ExtraPending: pendPriv}); !errors.Is(err, ucinv.ErrSecretStillReferenced) {
-		t.Fatalf("rPriv 被 Pending 钉住时应拒绝删除: %v", err)
-	}
+	_, err = h.svc.DeleteNode(ctx, ucinv.DeleteNodeRequest{ID: nPriv.ID(), RequireSecretsUnreferenced: true, ExtraPending: pendPriv})
+	assertInvSecretRefErr(t, err, rPriv.String())
 	dnRes, err := h.svc.DeleteNode(ctx, ucinv.DeleteNodeRequest{ID: nPriv.ID(), DeleteUnusedSecrets: true})
 	if err != nil || len(dnRes.DeletedSecrets()) != 1 || !dnRes.DeletedSecrets()[0].Equal(rPriv) {
 		t.Fatalf("DeleteNode 应安全回收无引用提权凭据 rPriv: err=%v del=%v", err, dnRes.DeletedSecrets())
+	}
+}
+
+func assertInvAssetRefErr(t *testing.T, err error, wantKind, wantID string) {
+	t.Helper()
+	ae, ok := errors.AsType[*ucinv.AssetReferencedError](err)
+	if !ok || !ae.IsValid() || !errors.Is(err, ucinv.ErrAssetStillReferenced) || ae.AssetKind() != wantKind || ae.AssetID() != wantID {
+		t.Fatalf("期望 AssetReferencedError(%s/%s)，实际=%v", wantKind, wantID, err)
+	}
+	view, okV := domi18n.InspectNode(ae)
+	if !okV || !errors.Is(view.Sentinel, ucinv.ErrAssetStillReferenced) || view.Message.ID() != domi18n.KeyUCInvAssetRefDetail {
+		t.Fatalf("AssetReferencedError.LocalizableView 失配: ok=%v view=%+v", okV, view)
+	}
+	if id, okID := domi18n.ErrorID(err); !okID || id != domi18n.KeyUCInvAssetRefDetail {
+		t.Fatalf("ErrorID 期望 %s，实际 ok=%v id=%s", domi18n.KeyUCInvAssetRefDetail, okID, id)
+	}
+	if ae.Error() != domi18n.CanonicalError(ae) || !strings.Contains(ae.Error(), wantID) {
+		t.Fatalf("AssetReferencedError.Error 失配: %q", ae.Error())
+	}
+}
+
+func assertInvSecretRefErr(t *testing.T, err error, wantSubj string) {
+	t.Helper()
+	se, ok := errors.AsType[*ucinv.SecretReferencedError](err)
+	if !ok || !se.IsValid() || !errors.Is(err, ucinv.ErrSecretStillReferenced) || se.Subject() != wantSubj {
+		t.Fatalf("期望 SecretReferencedError(%s)，实际=%v", wantSubj, err)
+	}
+	view, okV := domi18n.InspectNode(se)
+	if !okV || !errors.Is(view.Sentinel, ucinv.ErrSecretStillReferenced) || view.Message.ID() != domi18n.KeyUCInvSecretRefDetail {
+		t.Fatalf("SecretReferencedError.LocalizableView 失配: ok=%v view=%+v", okV, view)
+	}
+	if id, okID := domi18n.ErrorID(err); !okID || id != domi18n.KeyUCInvSecretRefDetail {
+		t.Fatalf("ErrorID 期望 %s，实际 ok=%v id=%s", domi18n.KeyUCInvSecretRefDetail, okID, id)
+	}
+	if se.Error() != domi18n.CanonicalError(se) || !strings.Contains(se.Error(), wantSubj) {
+		t.Fatalf("SecretReferencedError.Error 失配: %q", se.Error())
+	}
+}
+
+func TestReferencedErrors_NilAndZeroLocalizableSafety(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	var nilAsset *ucinv.AssetReferencedError
+	var zeroAssetVal ucinv.AssetReferencedError
+	assertInvalidRefErr(t, "nil AssetReferencedError", nilAsset, ucinv.ErrAssetStillReferenced)
+	assertInvalidRefErr(t, "zero AssetReferencedError", &zeroAssetVal, ucinv.ErrAssetStillReferenced)
+
+	var nilSec *ucinv.SecretReferencedError
+	var zeroSecVal ucinv.SecretReferencedError
+	assertInvalidRefErr(t, "nil SecretReferencedError", nilSec, ucinv.ErrSecretStillReferenced)
+	assertInvalidRefErr(t, "zero SecretReferencedError", &zeroSecVal, ucinv.ErrSecretStillReferenced)
+}
+
+type invalidRefErrNode interface {
+	error
+	domi18n.LocalizableNode
+	IsValid() bool
+	Unwrap() error
+}
+
+func assertInvalidRefErr(t *testing.T, label string, e invalidRefErrNode, wantSentinel error) {
+	t.Helper()
+	if e.IsValid() || e.Unwrap() != nil || errors.Is(e, wantSentinel) {
+		t.Fatalf("%s 必须零值失效且 Unwrap==nil", label)
+	}
+	if v := e.LocalizableView(); !errors.Is(v.Sentinel, wantSentinel) || v.Message.IsValid() {
+		t.Fatalf("%s LocalizableView 失配: %+v", label, v)
+	}
+	want := wantSentinel.Error()
+	if e.Error() != want || domi18n.CanonicalError(e) != want {
+		t.Fatalf("%s Error 失配: err=%q canon=%q want=%q", label, e.Error(), domi18n.CanonicalError(e), want)
 	}
 }
 

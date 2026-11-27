@@ -1,11 +1,11 @@
 package engine
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	ucsess "github.com/wentf9/xops-cli/core/internal/usecase/session"
@@ -61,7 +61,7 @@ func parseEnumPairs[T any](raw string, zero T, baseErr error, pairs ...enumPair[
 			return p.v, nil
 		}
 	}
-	return zero, fmt.Errorf("%w: %q", baseErr, raw)
+	return zero, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 
 // ParsePolicyProfile / ParseNoElicitFallback / ParseRequestTTYMode 严格解析公开枚举文本（零堆分配）。
@@ -173,7 +173,7 @@ func mapEnum[F ~uint8, T any](v F, ok bool, baseErr error, table ...T) (T, error
 	if ok && int(v) < len(table) {
 		return table[v], nil
 	}
-	return zeroVal[T](), fmt.Errorf("%w: %d", baseErr, uint8(v))
+	return zeroVal[T](), domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.Int("value", int(v)))
 }
 func lookupEnumName(idx uint8, fallback string, names ...string) string {
 	if int(idx) < len(names) {
@@ -183,7 +183,7 @@ func lookupEnumName(idx uint8, fallback string, names ...string) string {
 }
 func appendValidEnumText(b []byte, valid bool, name string, baseErr error, raw uint8) ([]byte, error) {
 	if !valid {
-		return nil, fmt.Errorf("%w: %d", baseErr, raw)
+		return nil, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.Int("value", int(raw)))
 	}
 	return append(b, name...), nil
 }

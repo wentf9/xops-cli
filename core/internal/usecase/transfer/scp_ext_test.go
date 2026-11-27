@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +13,7 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/fsm"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -801,9 +801,7 @@ func assertRecursiveSCPUploadAdversarialGuards(t *testing.T) {
 		CallBase: rig.callBase(nil), Source: advSrc, RemoteDest: mustRemotePath(t, "/dst2"),
 		Recursive: true, SymlinkPolicy: pathalg.SymlinkReject, MaxTotalBytes: 5,
 	})
-	if err == nil || !errors.Is(err, transfer.ErrInvalidRequest) && !strings.Contains(err.Error(), "超限") {
-		t.Fatalf("MaxTotalBytes 超限期望拒绝，实际=%v", err)
-	}
+	requireErrIs(t, err, fsm.ErrTransferSizeExceeded, "MaxTotalBytes 超限必须拦截")
 
 	// 4. 目录内含软链必须写前全拒绝（零远端残留）
 	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {

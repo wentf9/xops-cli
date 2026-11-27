@@ -17,11 +17,10 @@
 package credential
 
 import (
-	"errors"
-	"fmt"
 	"slices"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 )
@@ -36,33 +35,33 @@ const (
 // 本包导出的规范哨兵错误，供用例调用方、core/engine 与测试以 errors.Is 精确判定故障类别。
 var (
 	// ErrNilContext 表示调用方传入了 nil context.Context。
-	ErrNilContext = errors.New("usecase/credential: context 不能为 nil")
+	ErrNilContext = domi18n.Sentinel(domi18n.KeyUCCredNilContext)
 	// ErrNilCallback 表示作用域闭包回调为 nil。
-	ErrNilCallback = errors.New("usecase/credential: 回调函数不能为 nil")
+	ErrNilCallback = domi18n.Sentinel(domi18n.KeyUCCredNilCallback)
 	// ErrInvalidConfig 表示 ServiceConfig 缺少必填依赖或参数非法。
-	ErrInvalidConfig = errors.New("usecase/credential: 无效的 ServiceConfig 配置")
+	ErrInvalidConfig = domi18n.Sentinel(domi18n.KeyUCCredInvalidConfig)
 	// ErrServiceNotInitialized 表示在零值或未初始化 Service 上调用方法。
-	ErrServiceNotInitialized = errors.New("usecase/credential: Service 未初始化")
+	ErrServiceNotInitialized = domi18n.Sentinel(domi18n.KeyUCCredNotInitialized)
 	// ErrInvalidRequest 表示凭据操作请求参数无效。
-	ErrInvalidRequest = errors.New("usecase/credential: 无效的凭据操作请求")
+	ErrInvalidRequest = domi18n.Sentinel(domi18n.KeyUCCredInvalidRequest)
 	// ErrInvalidSecretBox 表示传入的 *secret.SecretBox 为 nil、零值或已销毁。
-	ErrInvalidSecretBox = errors.New("usecase/credential: SecretBox 无效或已销毁")
+	ErrInvalidSecretBox = domi18n.Sentinel(domi18n.KeyUCCredInvalidSecretBox)
 	// ErrVaultControlUnavailable 表示未注入 ports.VaultControlPort，无法执行凭据库生命周期控制。
-	ErrVaultControlUnavailable = errors.New("usecase/credential: 未配置 VaultControlPort")
+	ErrVaultControlUnavailable = domi18n.Sentinel(domi18n.KeyUCCredVaultCtrlUnavail)
 	// ErrStoreUnavailable 表示未注入 ports.InventoryStore，无法执行配置 CAS 或 5 位置引用检查。
-	ErrStoreUnavailable = errors.New("usecase/credential: 未配置 InventoryStore")
+	ErrStoreUnavailable = domi18n.Sentinel(domi18n.KeyUCCredStoreUnavail)
 	// ErrInteractionUnavailable 表示未注入 ports.InteractionPort 或当前环境不可交互。
-	ErrInteractionUnavailable = errors.New("usecase/credential: 当前环境不支持交互式机密输入")
+	ErrInteractionUnavailable = domi18n.Sentinel(domi18n.KeyUCCredInteractUnavail)
 	// ErrPassphraseConfirmMismatch 表示交互式两次输入的主口令常量时间比对不一致。
-	ErrPassphraseConfirmMismatch = errors.New("usecase/credential: 两次输入的口令不一致")
+	ErrPassphraseConfirmMismatch = domi18n.Sentinel(domi18n.KeyUCCredPassphraseDiff)
 	// ErrSecretStillReferenced 表示凭据仍被资产图 5 处位置或活跃 Pending 租约引用，拒绝删除。
-	ErrSecretStillReferenced = errors.New("usecase/credential: 凭据仍被引用，拒绝删除")
+	ErrSecretStillReferenced = domi18n.Sentinel(domi18n.KeyUCCredSecretReferenced)
 	// ErrSagaRolledBack 表示 VaultSagaFSM 已安全回滚（未生效配置且已补偿清理新凭据）。
-	ErrSagaRolledBack = errors.New("usecase/credential: 凭据变更 Saga 已回滚")
+	ErrSagaRolledBack = domi18n.Sentinel(domi18n.KeyUCCredSagaRolledBack)
 	// ErrUncertainDurability 表示配置 CAS 处于 Applied && !Durable 状态，停机禁重试且禁删凭据。
-	ErrUncertainDurability = errors.New("usecase/credential: 配置提交已生效但持久化未确认，严禁重试或删除凭据")
+	ErrUncertainDurability = domi18n.Sentinel(domi18n.KeyUCCredUncertainDurable)
 	// ErrSagaUncertain 表示 VaultSagaFSM 副作用结果未知或补偿失败，停机禁自动重试。
-	ErrSagaUncertain = errors.New("usecase/credential: 凭据变更 Saga 结果未知，严禁自动重试")
+	ErrSagaUncertain = domi18n.Sentinel(domi18n.KeyUCCredSagaUncertain)
 )
 
 // PendingSecretRefProvider 向凭据服务提供当前运行期全部活跃的待确认暂存凭据引用（SecretLocPending），
@@ -72,7 +71,7 @@ type PendingSecretRefProvider interface {
 }
 
 // SecretReferencedError 携带阻止凭据删除或回收的精确 5 位置与 Pending 引用清单（零明文），
-// 实现 Unwrap() -> ErrSecretStillReferenced 以便调用方同时支持 errors.Is 与 errors.AsType。
+// 实现 Unwrap() -> ErrSecretStillReferenced 与 domi18n.LocalizableNode，支持 errors.Is、errors.AsType 与边界本地化。
 //
 //xops:opaque
 //xops:failclosed
@@ -120,13 +119,26 @@ func (e *SecretReferencedError) Unwrap() error {
 	return ErrSecretStillReferenced
 }
 
-// Error 返回脱敏诊断描述（仅含 Ref 逻辑标识与引用数，绝不含明文）。
-func (e *SecretReferencedError) Error() string {
+// LocalizableView 实现 domi18n.LocalizableNode，返回脱敏结构化错误节点视图（nil 或无效实例退化为纯哨兵视图）。
+func (e *SecretReferencedError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return ErrSecretStillReferenced.Error()
+		return domi18n.ErrorNode{Sentinel: ErrSecretStillReferenced}
 	}
-	return fmt.Sprintf("%s: ref=%s 仍存在 %d 处引用（首个：%s/%s）",
-		ErrSecretStillReferenced, e.ref, len(e.refs), e.refs[0].Location, e.refs[0].OwnerID)
+	return domi18n.ErrorNode{
+		Sentinel: ErrSecretStillReferenced,
+		Message: domi18n.NewMessage(
+			domi18n.KeyUCCredSecretRefDetail,
+			domi18n.BoundStr("ref", e.ref.String()),
+			domi18n.Int("count", len(e.refs)),
+			domi18n.BoundStr("location", e.refs[0].Location.String()),
+			domi18n.BoundStr("owner", e.refs[0].OwnerID),
+		),
+	}
+}
+
+// Error 返回恒定规范英文脱敏诊断描述（委托至 domi18n.CanonicalError，绝不含明文）。
+func (e *SecretReferencedError) Error() string {
+	return domi18n.CanonicalError(e)
 }
 
 func zeroVal[T any]() (z T) { return z }

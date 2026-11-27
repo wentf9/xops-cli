@@ -3,10 +3,10 @@ package credential
 import (
 	"context"
 	"encoding/hex"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -56,13 +56,13 @@ type Service struct {
 func NewService(cfg ServiceConfig) (*Service, error) {
 	switch {
 	case cfg.Gate == nil:
-		return nil, fmt.Errorf("%w: Gate 授权器不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Gate"))
 	case cfg.Vault == nil:
-		return nil, fmt.Errorf("%w: Vault 凭据端口不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Vault"))
 	case cfg.Clock == nil:
-		return nil, fmt.Errorf("%w: Clock 时钟端口不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Clock"))
 	case cfg.Entropy == nil:
-		return nil, fmt.Errorf("%w: Entropy 熵源端口不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Entropy"))
 	}
 	return &Service{
 		gate:         cfg.Gate,
@@ -125,7 +125,7 @@ func (s *Service) Status(ctx context.Context, req StatusRequest) (ports.VaultSta
 	}
 	gateReq, err := buildInspectGateRequest("vault_status", "", nil, req.Risk.OrElse(security.RiskSafe), "inspect vault status", req.Approval, req.OperationStream)
 	if err != nil {
-		return zeroVal[ports.VaultStatus](), fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return zeroVal[ports.VaultStatus](), domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	var out ports.VaultStatus
 	err = gate.WithAuthorized[security.CapInspect](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
@@ -286,7 +286,7 @@ func (s *Service) WithSecret(ctx context.Context, req WithSecretRequest, fn func
 		return ErrNilCallback
 	}
 	if !req.Ref.IsValid() {
-		return fmt.Errorf("%w: Ref 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Ref"))
 	}
 	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, "with secret "+req.Ref.String())
 	gateReq, err := buildInspectGateRequest(
@@ -299,7 +299,7 @@ func (s *Service) WithSecret(ctx context.Context, req WithSecretRequest, fn func
 		req.OperationStream,
 	)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	return gate.WithAuthorized[security.CapInspect](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
 		return s.vault.WithSecret(authCtx, req.Ref, func(box *secret.SecretBox) error {
@@ -330,7 +330,7 @@ func (s *Service) WithPromptedSecret(ctx context.Context, prompt ports.SecretPro
 		nil,
 	)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	return gate.WithAuthorized[security.CapInspect](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
 		return s.interaction.PromptSecret(authCtx, prompt, func(box *secret.SecretBox) error {
@@ -342,7 +342,7 @@ func (s *Service) WithPromptedSecret(ctx context.Context, prompt ports.SecretPro
 func (s *Service) allocateRandomRef(storeID string) (secret.Ref, error) {
 	var raw [randomSecretItemBytes]byte
 	if _, err := io.ReadFull(s.entropy, raw[:]); err != nil {
-		return zeroVal[secret.Ref](), fmt.Errorf("%w: 生成随机凭据条目失败: %w", ports.ErrEntropyShortRead, err)
+		return zeroVal[secret.Ref](), domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate random secret item"))
 	}
 	return secret.NewRef(storeID, "sec-"+hex.EncodeToString(raw[:]))
 }
@@ -356,7 +356,7 @@ func (s *Service) collectPendingRefs(extra []inventory.PendingSecretRef) ([]inve
 	for _, group := range [2][]inventory.PendingSecretRef{live, extra} {
 		for _, p := range group {
 			if !p.Ref.IsValid() {
-				return nil, fmt.Errorf("%w: 存在无效 PendingSecretRef", ErrInvalidRequest)
+				return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "PendingSecretRef"))
 			}
 			out = append(out, p)
 		}

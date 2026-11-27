@@ -2,8 +2,8 @@ package engine
 
 import (
 	"context"
-	"fmt"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -125,7 +125,7 @@ func runDeleteAsset[ID any](e *Engine, ctx context.Context, req DeleteAssetReque
 	return runOpStream(e, ctx, req.OperationStream, func(c context.Context) (MutationResult, error) {
 		id, err := parse(req.ID)
 		if err != nil {
-			return zeroVal[MutationResult](), fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+			return zeroVal[MutationResult](), domi18n.WrapSentinel(ErrInvalidRequest, err)
 		}
 		return del(c, id)
 	})
@@ -164,7 +164,7 @@ func toImportSourceReq(req ImportRequest) ucinv.ImportSourceRequest {
 func (e *Engine) WithPendingEnrollment(ctx context.Context, req PendingEnrollmentRequest, fn func(ctx context.Context, lease *PendingEnrollmentLease) error) (PendingEnrollmentResult, error) {
 	defer closeStreamIfNonNil(req.OperationStream)
 	if fn == nil {
-		return zeroVal[PendingEnrollmentResult](), fmt.Errorf("%w: 回调函数不能为 nil", ErrInvalidRequest)
+		return zeroVal[PendingEnrollmentResult](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonNilCallback)
 	}
 	return runOp(e, ctx, func(c context.Context) (PendingEnrollmentResult, error) {
 		return e.inventory.WithPendingEnrollment(c, req, func(lCtx context.Context, lease *PendingEnrollmentLease) error { return fn(lCtx, lease) })
@@ -199,10 +199,10 @@ func (e *Engine) probePendingEnrollment(ctx context.Context,
 	req ProbePendingEnrollmentRequest,
 ) (zeroFP inventory.KeyFingerprint, err error) {
 	if r, ok := req.Risk.Get(); ok && !r.IsValid() {
-		return zeroFP, fmt.Errorf("%w: Risk 无效", ErrInvalidRequest)
+		return zeroFP, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Risk"))
 	}
 	if e.hostTrustObs == nil {
-		return zeroFP, fmt.Errorf("%w: 当前拨号器未启用主机密钥信任观测器，无法核验服务端指纹", ErrUnsupported)
+		return zeroFP, domi18n.EF(ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "host key trust observer"))
 	}
 	res, err := e.inventory.ResolvePendingEnrollmentTarget(ctx, lease, req.CLIOptions)
 	if err != nil {
@@ -210,7 +210,7 @@ func (e *Engine) probePendingEnrollment(ctx context.Context,
 	}
 	targetHop, ok := res.Plan().Target()
 	if !ok {
-		return zeroFP, fmt.Errorf("%w: 暂存连接计划缺少末跳目标", ErrInvalidRequest)
+		return zeroFP, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "pending connection plan"))
 	}
 	ep := targetHop.Endpoint()
 	gateReq, err := uccred.BuildGateRequest[security.CapInspect](
@@ -219,14 +219,14 @@ func (e *Engine) probePendingEnrollment(ctx context.Context,
 		req.Risk.OrElse(security.RiskSafe), "probe pending enrollment "+res.NodeID(), req.Approval, req.OperationStream,
 	)
 	if err != nil {
-		return zeroFP, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return zeroFP, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	var verified inventory.KeyFingerprint
 	err = gate.WithAuthorized[security.CapInspect](ctx, e.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
 		return e.pool.WithLease(authCtx, res.Plan(), func(context.Context, *pool.Lease) error {
 			fp, found := e.hostTrustObs.lookup(ep)
 			if !found {
-				return fmt.Errorf("%w: 握手完成但未观测到已通过验证的主机密钥指纹 (%s)", ErrHostKeyUnknown, ep)
+				return domi18n.EF(ErrHostKeyUnknown, domi18n.KeyEngineHostKeyUnobs, domi18n.BoundStr("endpoint", ep.String()))
 			}
 			verified = fp
 			return nil
@@ -301,7 +301,7 @@ func (e *Engine) FindSecretReferences(ctx context.Context, req FindSecretReferen
 func (e *Engine) WithSecret(ctx context.Context, req WithSecretRequest, fn func(box *secret.SecretBox) error) error {
 	defer closeStreamIfNonNil(req.OperationStream)
 	if fn == nil {
-		return fmt.Errorf("%w: 回调函数不能为 nil", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonNilCallback)
 	}
 	return runCredOpErr(e, ctx, req.OperationStream, func(c context.Context, svc *uccred.Service) error {
 		return svc.WithSecret(c, req, func(box *secret.SecretBox) error { return fn(box) })
@@ -314,7 +314,7 @@ func (e *Engine) WithSecret(ctx context.Context, req WithSecretRequest, fn func(
 //xops:borrowed
 func (e *Engine) WithPromptedSecret(ctx context.Context, prompt SecretPromptRequest, fn func(box *secret.SecretBox) error) error {
 	if fn == nil {
-		return fmt.Errorf("%w: 回调函数不能为 nil", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonNilCallback)
 	}
 	return runCredOpErr(e, ctx, nil, func(c context.Context, svc *uccred.Service) error {
 		return svc.WithPromptedSecret(c, prompt, func(box *secret.SecretBox) error { return fn(box) })

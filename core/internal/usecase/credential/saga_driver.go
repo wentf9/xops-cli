@@ -11,6 +11,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -40,7 +41,7 @@ func (s *Service) executeSagaAuthorized(
 	params := buildSagaGateParams(req)
 	gateReq, err := buildMutateGateRequest(action, req.NodeID, params, req.Risk.OrElse(security.RiskModerate), summary, req.Approval, req.OperationStream)
 	if err != nil {
-		return SagaResult{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return SagaResult{}, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 
 	var outcomeOpt algebraic.Option[execution.ExecutionOutcome]
@@ -119,7 +120,7 @@ func (s *Service) runAuthorizedSagaBody(
 		return res, err
 	}
 	if gcErr := s.gcExtraOldRefsAfterCommit(authCtx, extraOldRefs, req.ExtraPending); gcErr != nil {
-		return res, fmt.Errorf("%w: 后置额外旧凭据回收失败: %w", ErrSagaUncertain, gcErr)
+		return res, domi18n.WrapS(ErrSagaUncertain, gcErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "post-commit extra old secret gc"))
 	}
 	return res, nil
 }
@@ -133,7 +134,7 @@ func resolveSagaOldRefs(ctx context.Context, req VaultSagaRequest) (algebraic.Op
 		return algebraic.None[secret.Ref](), nil, err
 	}
 	if p, ok := primary.Get(); ok && !p.IsValid() {
-		return algebraic.None[secret.Ref](), nil, fmt.Errorf("%w: ResolveOldRefs 返回无效主旧凭据引用", ErrInvalidRequest)
+		return algebraic.None[secret.Ref](), nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ResolveOldRefs primary ref"))
 	}
 	uniqExtra, err := canonicalizeSecretRefs(extra)
 	if err != nil {
@@ -173,11 +174,11 @@ func (s *Service) driveVaultSaga(
 		ExpectedCASVersion: req.ExpectedCASVersion,
 	})
 	if err != nil {
-		return SagaResult{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return SagaResult{}, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	initSt, err := fsm.NewVaultSagaState(sagaCtx)
 	if err != nil {
-		return SagaResult{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return SagaResult{}, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 
 	rs := &sagaRunState{cur: initSt}
@@ -191,14 +192,14 @@ func (s *Service) driveVaultSaga(
 			return rs.finalize(newRef, oldRef)
 		}
 		if len(effs) != 1 {
-			return SagaResult{}, fmt.Errorf("%w: 非终态状态 %s 产生异常副作用数 %d", ErrSagaUncertain, rs.cur.Kind(), len(effs))
+			return SagaResult{}, domi18n.EF(ErrSagaUncertain, domi18n.KeyCommonMismatch, domi18n.Str("field", "saga effect count for "+rs.cur.Kind().String()), domi18n.Int("expected", 1), domi18n.Int("actual", len(effs)))
 		}
 		nextIn, err = s.execSagaEffect(ctx, effs[0], req, newSecret, rs)
 		if err != nil {
 			return SagaResult{}, err
 		}
 	}
-	return SagaResult{}, fmt.Errorf("%w: 超过最大状态转移步数 %d", ErrSagaUncertain, maxVaultSagaSteps)
+	return SagaResult{}, domi18n.EF(ErrSagaUncertain, domi18n.KeyUCCredSagaStepLimit, domi18n.Int("max", maxVaultSagaSteps))
 }
 
 func (rs *sagaRunState) applyTransition(ctx context.Context, in fsm.VaultSagaInput, emitter *OpEmitter) ([]fsm.VaultSagaEffect, error) {
@@ -235,21 +236,21 @@ func (rs *sagaRunState) finalize(newRef secret.Ref, oldRef algebraic.Option[secr
 	case *fsm.VaultSagaInit, *fsm.VaultSagaWritingNew, *fsm.VaultSagaVerifyingReadback,
 		*fsm.VaultSagaCommittingConfig, *fsm.VaultSagaCheckingOldRefs,
 		*fsm.VaultSagaDeletingOld, *fsm.VaultSagaCompensating:
-		return SagaResult{}, fmt.Errorf("%w: 非终态 %s 提前结束", ErrSagaUncertain, st.Kind())
+		return SagaResult{}, domi18n.EF(ErrSagaUncertain, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "finalize"), domi18n.Str("state", st.Kind().String()))
 	default:
-		return SagaResult{}, fmt.Errorf("%w: 未知 VaultSagaState 变体 %T", ErrSagaUncertain, rs.cur)
+		return SagaResult{}, domi18n.EF(ErrSagaUncertain, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "VaultSagaState"), domi18n.BoundStr("value", fmt.Sprintf("%T", rs.cur)))
 	}
 }
 
 func wrapSagaTerminalError(sentinel error, reason string, cause error) error {
 	if cause != nil {
 		if reason != "" && !strings.Contains(cause.Error(), reason) {
-			return fmt.Errorf("%w (%s): %w", sentinel, reason, cause)
+			return domi18n.WrapSentinel(sentinel, domi18n.Wrap(cause, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
 		}
-		return fmt.Errorf("%w: %w", sentinel, cause)
+		return domi18n.WrapSentinel(sentinel, cause)
 	}
 	if reason != "" {
-		return fmt.Errorf("%w: %s", sentinel, reason)
+		return domi18n.WrapSentinel(sentinel, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
 	}
 	return sentinel
 }
@@ -284,7 +285,7 @@ func (s *Service) execSagaEffect(
 		defer cancel()
 		return s.runEffectDeleteVaultSecret(cleanCtx, eff.Ref(), fsm.VaultInputCompensateResult, rs)
 	default:
-		return zeroVal[fsm.VaultSagaInput](), fmt.Errorf("%w: 未知 VaultSagaEffectKind=%s", ErrSagaUncertain, eff.Kind())
+		return zeroVal[fsm.VaultSagaInput](), domi18n.EF(ErrSagaUncertain, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "VaultSagaEffectKind"), domi18n.BoundStr("value", eff.Kind().String()))
 	}
 }
 

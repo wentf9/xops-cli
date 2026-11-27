@@ -4,15 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"maps"
 	"slices"
+	"strconv"
 	"text/template"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -55,13 +56,13 @@ func (s *Service) validateSingleLocalSource(src pathalg.LocalSourcePath, policy 
 			return ErrScopedFSUnavailable
 		}
 		if src.IsAbs() {
-			return fmt.Errorf("%w: 沙箱模式禁止绝对本地源路径 %s", ErrInvalidRequest, src)
+			return domi18n.EF(ErrInvalidRequest, domi18n.KeyUCAutoSandboxAbsForbid, domi18n.BoundStr("path", src.String()))
 		}
 		if policy.AllowsOperatorFollow() {
-			return fmt.Errorf("%w: 沙箱模式禁止 follow_operator_source 软链策略", ErrSymlinkPolicyDenied)
+			return domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "follow_operator_source symlink policy in sandbox mode"))
 		}
 		if _, err := pathalg.ParseLocalRootedDest(src.String()); err != nil {
-			return fmt.Errorf("%w: 沙箱本地源路径 %s 非法: %w", ErrInvalidRequest, src, err)
+			return domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "sandbox source path"), domi18n.BoundStr("value", src.String()))
 		}
 		return nil
 	}
@@ -193,7 +194,7 @@ func (s *Service) loadLocalSourceInto(ctx context.Context, src pathalg.LocalSour
 	key := sourceCacheKey(src, policy)
 	if existing, ok := cache[key]; ok {
 		if int64(len(existing)) > maxBytes {
-			return fmt.Errorf("%w: 本地源文件 %s 大小 %d 超过当前步骤上限 %d", ports.ErrLimitExceeded, src, len(existing), maxBytes)
+			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.BoundStr("kind", "local source "+src.String()), domi18n.Int64("size", int64(len(existing))), domi18n.Int64("limit", maxBytes))
 		}
 		return nil
 	}
@@ -216,7 +217,7 @@ func (s *Service) readLocalSourceBounded(ctx context.Context, src pathalg.LocalS
 		}
 		dest, err := pathalg.ParseLocalRootedDest(src.String())
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+			return nil, domi18n.WrapSentinel(ErrInvalidRequest, err)
 		}
 		var data []byte
 		err = s.scopedFS.WithRoot(rootDir, func(root ports.RootHandle) error {
@@ -232,12 +233,12 @@ func (s *Service) readLocalSourceBounded(ctx context.Context, src pathalg.LocalS
 	var data []byte
 	err = s.operatorReadFS.WithOperatorRead(ctx, src, policy, func(r ports.BoundedReadHandle, size int64) error {
 		if size > maxBytes {
-			return fmt.Errorf("%w: 本地源文件 %s 大小 %d 超过上限 %d", ports.ErrLimitExceeded, src, size, maxBytes)
+			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.BoundStr("kind", "local source "+src.String()), domi18n.Int64("size", size), domi18n.Int64("limit", maxBytes))
 		}
 		var rErr error
 		data, rErr = io.ReadAll(io.LimitReader(r, maxBytes+1))
 		if rErr == nil && int64(len(data)) > maxBytes {
-			return fmt.Errorf("%w: 本地源文件 %s 超出上限 %d", ports.ErrLimitExceeded, src, maxBytes)
+			return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.BoundStr("kind", "local source "+src.String()), domi18n.Int64("size", int64(len(data))), domi18n.Int64("limit", maxBytes))
 		}
 		return rErr
 	})
@@ -297,7 +298,7 @@ func (rc *playbookRunContext) runShellAction(ctx context.Context, target TargetN
 func (rc *playbookRunContext) runScriptAction(ctx context.Context, target TargetNode, act *playbook.StepScript, nodeEmitter *streamEmitter) (playbook.StepStatus, execution.ExecutionOutcome, string) {
 	raw, ok := rc.sources[sourceCacheKey(act.Source(), act.SymlinkPolicy())]
 	if !ok {
-		err := fmt.Errorf("%w: 脚本快照缺失 %s", ErrInvalidRequest, act.Source())
+		err := domi18n.EF(ErrInvalidRequest, domi18n.KeyUCAutoSnapshotMissing, domi18n.Str("kind", "script"), domi18n.BoundStr("source", act.Source().String()))
 		return playbook.StepStatusFailed, makeNotStartedOutcome(execution.StartPhaseValidate, "missing_script", err), err.Error()
 	}
 	prof := rc.resolveScriptProfile(target, act.Profile())
@@ -334,7 +335,7 @@ func (rc *playbookRunContext) runCommandPlanForStep(ctx context.Context, target 
 func (rc *playbookRunContext) runCopyAction(ctx context.Context, target TargetNode, act *playbook.StepCopy) (playbook.StepStatus, execution.ExecutionOutcome, string) {
 	payload, ok := rc.sources[sourceCacheKey(act.Source(), act.SymlinkPolicy())]
 	if !ok {
-		err := fmt.Errorf("%w: copy 源快照缺失 %s", ErrInvalidRequest, act.Source())
+		err := domi18n.EF(ErrInvalidRequest, domi18n.KeyUCAutoSnapshotMissing, domi18n.Str("kind", "copy"), domi18n.BoundStr("source", act.Source().String()))
 		return playbook.StepStatusFailed, makeNotStartedOutcome(execution.StartPhaseValidate, "missing_copy_source", err), err.Error()
 	}
 	return rc.writeRemoteStepPayload(ctx, target, act.Dest(), act.Mode(), act.Overwrite(), act.Atomic(), payload)
@@ -343,7 +344,7 @@ func (rc *playbookRunContext) runCopyAction(ctx context.Context, target TargetNo
 func (rc *playbookRunContext) runTemplateAction(ctx context.Context, target TargetNode, act *playbook.StepTemplate) (playbook.StepStatus, execution.ExecutionOutcome, string) {
 	rawTmpl, ok := rc.sources[sourceCacheKey(act.Source(), act.SymlinkPolicy())]
 	if !ok {
-		err := fmt.Errorf("%w: template 源快照缺失 %s", ErrInvalidRequest, act.Source())
+		err := domi18n.EF(ErrInvalidRequest, domi18n.KeyUCAutoSnapshotMissing, domi18n.Str("kind", "template"), domi18n.BoundStr("source", act.Source().String()))
 		return playbook.StepStatusFailed, makeNotStartedOutcome(execution.StartPhaseValidate, "missing_template_source", err), err.Error()
 	}
 	rendered, err := renderPlaybookTemplate(string(rawTmpl), mergeStringMaps(rc.prep.vars, act.Vars()), rc.svc.maxTemplateBytes)
@@ -360,7 +361,7 @@ type limitedBufferWriter struct {
 
 func (w *limitedBufferWriter) Write(p []byte) (int, error) {
 	if int64(w.buf.Len())+int64(len(p)) > w.limit {
-		return 0, fmt.Errorf("%w: 渲染输出超过字节上限 %d", ports.ErrLimitExceeded, w.limit)
+		return 0, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "rendered template output"), domi18n.Int64("size", int64(w.buf.Len())+int64(len(p))), domi18n.Int64("limit", w.limit))
 	}
 	return w.buf.Write(p)
 }
@@ -368,14 +369,14 @@ func (w *limitedBufferWriter) Write(p []byte) (int, error) {
 func renderPlaybookTemplate(tmplText string, vars map[string]string, maxBytes int64) ([]byte, error) {
 	t, err := template.New("playbook").Option("missingkey=error").Parse(tmplText)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrTemplateRender, err)
+		return nil, domi18n.WrapSentinel(ErrTemplateRender, err)
 	}
 	var buf bytes.Buffer
 	if err := t.Execute(&limitedBufferWriter{buf: &buf, limit: maxBytes}, vars); err != nil {
 		if errors.Is(err, ports.ErrLimitExceeded) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: %w", ErrTemplateRender, err)
+		return nil, domi18n.WrapSentinel(ErrTemplateRender, err)
 	}
 	return buf.Bytes(), nil
 }
@@ -399,11 +400,11 @@ func resolveStepFilePerm(modeOpt algebraic.Option[playbook.FileMode]) (fs.FileMo
 		return defaultRemoteFilePerm, nil
 	}
 	if !m.IsValid() {
-		return 0, fmt.Errorf("%w: 无效文件权限位", ErrInvalidRequest)
+		return 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "file_mode"))
 	}
 	p := fs.FileMode(m.Bits())
 	if p == 0 || p != p.Perm() {
-		return 0, fmt.Errorf("%w: 远端文件权限位 %#o 必须落在 0001..0777", ErrInvalidRequest, m.Bits())
+		return 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonPermInvalid, domi18n.Str("perm", "0"+strconv.FormatUint(uint64(m.Bits()), 8)))
 	}
 	return p, nil
 }
@@ -453,7 +454,7 @@ func checkRemoteNoClobber(ctx context.Context, rfs ports.RemoteFSPort, dest path
 	}
 	_, err := rfs.Lstat(ctx, dest)
 	if err == nil {
-		return fmt.Errorf("%w: 远端目标 %s 已存在（overwrite=false）", ports.ErrAlreadyExists, dest)
+		return domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyUCAutoRemoteExists, domi18n.BoundStr("path", dest.String()))
 	}
 	if errors.Is(err, ports.ErrNotFound) {
 		return nil

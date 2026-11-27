@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strconv"
 	"sync"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -294,7 +294,7 @@ func (s *Service) OpenPTY(ctx context.Context, req OpenPTYRequest) (plan.Managed
 	}
 	gateReq, err := buildGateReq[security.CapExecute](gateReqInput{
 		plan: req.Plan, targetHop: targetHop, nodeID: nodeID, action: "pty_open",
-		summary:  fmt.Sprintf("open persistent PTY on %s (%s)", nodeID, ptyReq.Term()),
+		summary:  "open persistent PTY on " + nodeID + " (" + ptyReq.Term() + ")",
 		risk:     req.Risk.OrElse(security.RiskModerate),
 		params:   map[string]string{"user": targetHop.Username().String(), "term": ptyReq.Term(), "cols": strconv.FormatUint(uint64(ptyReq.Size().Cols()), 10), "rows": strconv.FormatUint(uint64(ptyReq.Size().Rows()), 10)},
 		approval: req.Approval, stream: req.OperationStream,
@@ -314,18 +314,18 @@ func (s *Service) prepareOpenPTY(ctx context.Context, req OpenPTYRequest) (plan.
 		return zh, "", zp, 0, err
 	}
 	if req.MaxBufferBytes < 0 || req.MaxBufferBytes > maxPTYBufferBytes {
-		return zh, "", zp, 0, fmt.Errorf("%w: MaxBufferBytes 超出 [0, %d]", ErrInvalidRequest, maxPTYBufferBytes)
+		return zh, "", zp, 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRange, domi18n.Str("field", "MaxBufferBytes"), domi18n.Int("value", req.MaxBufferBytes), domi18n.Int("min", 0), domi18n.Int("max", maxPTYBufferBytes))
 	}
 	if req.MaxBufferBytes == 0 {
 		req.MaxBufferBytes = defaultPTYBufferBytes
 	}
 	sz, hasSz := req.Size.Get()
 	if hasSz && !sz.IsValid() {
-		return zh, "", zp, 0, fmt.Errorf("%w: %w", ErrInvalidRequest, ports.ErrInvalidTTYSize)
+		return zh, "", zp, 0, domi18n.WrapSentinel(ErrInvalidRequest, ports.ErrInvalidTTYSize)
 	}
 	ptyReq, err := buildPTYRequest(resolvePTYTerm(req.Term, s.cfg.Env), sz)
 	if err != nil {
-		return zh, "", zp, 0, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return zh, "", zp, 0, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	targetHop, nodeID, err := resolvePlanTargetAndNode(req.Plan, req.NodeID)
 	return targetHop, nodeID, ptyReq, req.MaxBufferBytes, err
@@ -337,7 +337,7 @@ func (s *Service) ReadPTY(ctx context.Context, req PTYReadRequest) (res PTYReadR
 		return res, err
 	}
 	if req.MaxBytes < 0 {
-		return res, fmt.Errorf("%w: MaxBytes 不能为负", ErrInvalidRequest)
+		return res, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "MaxBytes"))
 	}
 	if req.MaxBytes == 0 {
 		req.MaxBytes = defaultPTYReadBytes
@@ -361,7 +361,7 @@ func (s *Service) ResizePTY(ctx context.Context, handle plan.ManagedHandle[plan.
 		return err
 	}
 	if !size.IsValid() {
-		return fmt.Errorf("%w: %w", ErrInvalidRequest, ports.ErrInvalidTTYSize)
+		return domi18n.WrapSentinel(ErrInvalidRequest, ports.ErrInvalidTTYSize)
 	}
 	return pool.WithManagedHandle[plan.KindPTY, ptyResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, pty ptyResource) error { return pty.resize(hCtx, size) })
 }
@@ -370,7 +370,7 @@ func (s *Service) SignalPTY(ctx context.Context, handle plan.ManagedHandle[plan.
 		return err
 	}
 	if sig == "" {
-		return fmt.Errorf("%w: Signal 不能为空", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "Signal"))
 	}
 	return pool.WithManagedHandle[plan.KindPTY, ptyResource](ctx, s.cfg.Pool, handle, func(hCtx context.Context, pty ptyResource) error { return pty.signal(hCtx, sig) })
 }

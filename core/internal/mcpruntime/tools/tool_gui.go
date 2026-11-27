@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json/jsontext"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -50,7 +50,7 @@ type guiArgs struct {
 
 func (r *Registry) callGUI(ctx context.Context, rawArgs jsontext.Value) (protocol.CallToolResult, error) {
 	if r.observability == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: ObservabilityService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ObservabilityService"))
 	}
 	args, err := decodeToolArgs[guiArgs](rawArgs)
 	if err != nil {
@@ -68,7 +68,7 @@ func (r *Registry) callGUI(ctx context.Context, rawArgs jsontext.Value) (protoco
 	case "inspect_session", "close_session":
 		return r.guiManageSession(ctx, args)
 	default:
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 未知 gui action %q", protocol.ErrInvalidParams, args.Action)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "gui action"), domi18n.BoundStr("value", args.Action))
 	}
 }
 
@@ -81,11 +81,11 @@ func (r *Registry) resolveGUIArtifact(artifactFile string) (algebraic.Option[uco
 		rootDir, okRoot = r.transferRoot.Get()
 	}
 	if !okRoot || !rootDir.IsValid() {
-		return algebraic.None[ucobs.GUIArtifactDest](), fmt.Errorf("%w: 未配置沙箱 ArtifactRoot/TransferRoot", ucobs.ErrScopedFSUnavailable)
+		return algebraic.None[ucobs.GUIArtifactDest](), domi18n.EF(ucobs.ErrScopedFSUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ArtifactRoot/TransferRoot"))
 	}
 	dest, err := pathalg.ParseLocalRootedDest(artifactFile)
 	if err != nil {
-		return algebraic.None[ucobs.GUIArtifactDest](), fmt.Errorf("%w: artifact_file 必须为沙箱相对路径: %w", protocol.ErrInvalidParams, err)
+		return algebraic.None[ucobs.GUIArtifactDest](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "artifact_file"))
 	}
 	return algebraic.Some(ucobs.GUIArtifactDest{RootDir: rootDir, File: dest}), nil
 }
@@ -96,7 +96,7 @@ func parseOptionalScrollDir(raw string) (ucobs.ScrollDirection, error) {
 	}
 	dir, err := ucobs.ParseScrollDirection(raw)
 	if err != nil {
-		return ucobs.ScrollDirectionInvalid, fmt.Errorf("%w: direction 非法: %w", protocol.ErrInvalidParams, err)
+		return ucobs.ScrollDirectionInvalid, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "direction"))
 	}
 	return dir, nil
 }
@@ -113,7 +113,7 @@ func (r *Registry) guiExec(
 	}
 	actionKind, err := ucobs.ParseGUIActionKind(args.GUIAction)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: gui_action 非法: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "gui_action"))
 	}
 	scrollDir, err := parseOptionalScrollDir(args.Direction)
 	if err != nil {
@@ -185,7 +185,7 @@ func (r *Registry) guiOpenSession(
 	}
 	kind, err := ucobs.ParseGUISessionKind(args.SessionKind)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: session_kind 须为 x11 或 vnc: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "session_kind"))
 	}
 	info, err := r.observability.OpenGUISession(ctx, ucobs.OpenGUISessionRequest{
 		Plan:   resolved.Plan(),

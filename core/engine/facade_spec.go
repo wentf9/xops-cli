@@ -2,7 +2,6 @@ package engine
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"slices"
@@ -11,6 +10,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -575,52 +575,52 @@ type (
 
 // 本包导出的不可变规范哨兵错误，供组合根与受 archbound 约束的 internal/entry/** 通过 errors.Is 精确区分运行期故障类别。
 var (
-	ErrNilContext               = errors.New("engine: context 不能为 nil")
-	ErrInvalidConfig            = errors.New("engine: 无效的 Engine Config 配置")
-	ErrEngineNotInitialized     = errors.New("engine: Engine 未初始化")
-	ErrEngineClosed             = errors.New("engine: Engine 已关闭")
-	ErrEngineHalted             = errors.New("engine: Engine 安全门控已进入不可逆 Halted 熔断态")
-	ErrInvalidRequest           = errors.New("engine: 无效的请求参数")
-	ErrInvalidProfile           = errors.New("engine: 无效的 PolicyProfile 策略配置档")
-	ErrInvalidFallback          = errors.New("engine: 无效的 NoElicitFallback 回退策略")
-	ErrInvalidRequestTTY        = errors.New("engine: 无效的 RequestTTY 模式")
-	ErrReconcilerUnavailable    = errors.New("engine: 未配置 AuditReconciler 崩溃对账端口")
-	ErrVaultUnavailable         = errors.New("engine: 未配置 SecretVault 凭据库端口")
-	ErrMCPServerNotInitialized  = errors.New("engine: MCPServer 未初始化")
-	ErrProjectionNotInitialized = errors.New("engine: Projection 未初始化")
-	ErrApprovalRequired         = errors.New("engine: 操作需要两步审批确认")
-	ErrApprovalRejected         = errors.New("engine: 操作员拒绝了两步审批挑战")
-	ErrAuthorizationDenied      = errors.New("engine: 安全护栏或权限策略拒绝该操作")
-	ErrScopeEscalated           = errors.New("engine: 规范化阶段检测到作用域升级或路径漂移")
-	ErrNotFound                 = errors.New("engine: 目标资源不存在")
-	ErrAlreadyExists            = errors.New("engine: 目标资源已存在")
-	ErrRevisionConflict         = errors.New("engine: 资产配置版本 CAS 冲突")
-	ErrStillReferenced          = errors.New("engine: 目标资产或凭据仍被引用，拒绝删除")
-	ErrImportConflict           = errors.New("engine: 导入预检发现冲突，拒绝写入")
-	ErrUncertainDurability      = errors.New("engine: 变更已生效但持久性未确认，严禁重试或删除凭据")
-	ErrOutcomeUnknown           = errors.New("engine: 副作用结果未知，严禁自动重试")
-	ErrVaultLocked              = errors.New("engine: 凭据库处于锁定状态")
-	ErrSecretNotFound           = errors.New("engine: 凭据条目不存在")
-	ErrAuthFailed               = errors.New("engine: 远端身份认证或凭据校验失败")
-	ErrHostKeyUnknown           = errors.New("engine: 远端主机密钥未知且策略禁止自动信任")
-	ErrHostKeyMismatch          = errors.New("engine: 远端主机密钥指纹与信任库冲突")
-	ErrHostKeyRevoked           = errors.New("engine: 远端主机密钥已被吊销")
-	ErrDialFailed               = errors.New("engine: 建立远端传输连接失败")
-	ErrControlMasterDisabled    = errors.New("engine: ControlPolicy 生效投影已禁用多路复用")
-	ErrMuxUnavailable           = errors.New("engine: ControlMaster 多路复用套接字不可用")
-	ErrHandleNotFound           = errors.New("engine: 托管长会话句柄不存在或已释放")
-	ErrHandleRevoked            = errors.New("engine: 托管句柄或连接租约已被吊销")
-	ErrInteractionUnavailable   = errors.New("engine: 当前运行环境不支持交互式输入")
-	ErrInteractionCanceled      = errors.New("engine: 操作员取消了交互请求")
-	ErrRemoteAnchorMismatch     = errors.New("engine: 远端文件 FSTAT 类型或 (dev,ino) 锚点不匹配")
-	ErrRemoteIsDir              = errors.New("engine: 远端目标为目录而非文件")
-	ErrNotRegularFile           = errors.New("engine: 目标路径不是常规文件")
-	ErrPatchConflict            = errors.New("engine: 远端文件补丁匹配失败或存在歧义冲突")
-	ErrDigestMismatch           = errors.New("engine: 文件 SHA-256 摘要校验不匹配")
-	ErrSymlinkRejected          = errors.New("engine: 符号链接被当前安全策略拒绝")
-	ErrCorruptData              = errors.New("engine: 持久化数据或传输日志损坏")
-	ErrLimitExceeded            = errors.New("engine: 数据大小或对象数量超出安全上限")
-	ErrUnsupported              = errors.New("engine: 当前配置或适配器不支持该能力")
+	ErrNilContext               = domi18n.Sentinel(domi18n.KeyEngineNilContext)
+	ErrInvalidConfig            = domi18n.Sentinel(domi18n.KeyEngineInvalidConfig)
+	ErrEngineNotInitialized     = domi18n.Sentinel(domi18n.KeyEngineNotInitialized)
+	ErrEngineClosed             = domi18n.Sentinel(domi18n.KeyEngineClosed)
+	ErrEngineHalted             = domi18n.Sentinel(domi18n.KeyEngineHalted)
+	ErrInvalidRequest           = domi18n.Sentinel(domi18n.KeyEngineInvalidRequest)
+	ErrInvalidProfile           = domi18n.Sentinel(domi18n.KeyEngineInvalidProfile)
+	ErrInvalidFallback          = domi18n.Sentinel(domi18n.KeyEngineInvalidFallback)
+	ErrInvalidRequestTTY        = domi18n.Sentinel(domi18n.KeyEngineInvalidReqTTY)
+	ErrReconcilerUnavailable    = domi18n.Sentinel(domi18n.KeyEngineReconcilerUnav)
+	ErrVaultUnavailable         = domi18n.Sentinel(domi18n.KeyEngineVaultUnavail)
+	ErrMCPServerNotInitialized  = domi18n.Sentinel(domi18n.KeyEngineMCPNotInit)
+	ErrProjectionNotInitialized = domi18n.Sentinel(domi18n.KeyEngineProjNotInit)
+	ErrApprovalRequired         = domi18n.Sentinel(domi18n.KeyEngineApprovalReq)
+	ErrApprovalRejected         = domi18n.Sentinel(domi18n.KeyEngineApprovalReject)
+	ErrAuthorizationDenied      = domi18n.Sentinel(domi18n.KeyEngineAuthDenied)
+	ErrScopeEscalated           = domi18n.Sentinel(domi18n.KeyEngineScopeEscalated)
+	ErrNotFound                 = domi18n.Sentinel(domi18n.KeyEngineNotFound)
+	ErrAlreadyExists            = domi18n.Sentinel(domi18n.KeyEngineAlreadyExists)
+	ErrRevisionConflict         = domi18n.Sentinel(domi18n.KeyEngineRevisionConf)
+	ErrStillReferenced          = domi18n.Sentinel(domi18n.KeyEngineStillReferenced)
+	ErrImportConflict           = domi18n.Sentinel(domi18n.KeyEngineImportConflict)
+	ErrUncertainDurability      = domi18n.Sentinel(domi18n.KeyEngineUncertainDur)
+	ErrOutcomeUnknown           = domi18n.Sentinel(domi18n.KeyEngineOutcomeUnknown)
+	ErrVaultLocked              = domi18n.Sentinel(domi18n.KeyEngineVaultLocked)
+	ErrSecretNotFound           = domi18n.Sentinel(domi18n.KeyEngineSecretNotFound)
+	ErrAuthFailed               = domi18n.Sentinel(domi18n.KeyEngineAuthFailed)
+	ErrHostKeyUnknown           = domi18n.Sentinel(domi18n.KeyEngineHostKeyUnknown)
+	ErrHostKeyMismatch          = domi18n.Sentinel(domi18n.KeyEngineHostKeyMismatch)
+	ErrHostKeyRevoked           = domi18n.Sentinel(domi18n.KeyEngineHostKeyRevoked)
+	ErrDialFailed               = domi18n.Sentinel(domi18n.KeyEngineDialFailed)
+	ErrControlMasterDisabled    = domi18n.Sentinel(domi18n.KeyEngineMuxDisabled)
+	ErrMuxUnavailable           = domi18n.Sentinel(domi18n.KeyEngineMuxUnavailable)
+	ErrHandleNotFound           = domi18n.Sentinel(domi18n.KeyEngineHandleNotFound)
+	ErrHandleRevoked            = domi18n.Sentinel(domi18n.KeyEngineHandleRevoked)
+	ErrInteractionUnavailable   = domi18n.Sentinel(domi18n.KeyEngineInteractUnav)
+	ErrInteractionCanceled      = domi18n.Sentinel(domi18n.KeyEngineInteractCancel)
+	ErrRemoteAnchorMismatch     = domi18n.Sentinel(domi18n.KeyEngineAnchorMismatch)
+	ErrRemoteIsDir              = domi18n.Sentinel(domi18n.KeyEngineRemoteIsDir)
+	ErrNotRegularFile           = domi18n.Sentinel(domi18n.KeyEngineNotRegularFile)
+	ErrPatchConflict            = domi18n.Sentinel(domi18n.KeyEnginePatchConflict)
+	ErrDigestMismatch           = domi18n.Sentinel(domi18n.KeyEngineDigestMismatch)
+	ErrSymlinkRejected          = domi18n.Sentinel(domi18n.KeyEngineSymlinkReject)
+	ErrCorruptData              = domi18n.Sentinel(domi18n.KeyEngineCorruptData)
+	ErrLimitExceeded            = domi18n.Sentinel(domi18n.KeyEngineLimitExceeded)
+	ErrUnsupported              = domi18n.Sentinel(domi18n.KeyEngineUnsupported)
 )
 
 func zeroVal[T any]() (z T)                   { return z }
@@ -703,24 +703,41 @@ func engineErrorRules() []engineErrRule {
 	}
 }
 
-// mapEngineError 以保链方式将底层 ports/usecase/gate/pool 哨兵映射为公开 engine 哨兵，
-// 完整保留原错误链（支持底层 errors.Is、ExtractApprovalChallenge 与 ExtractReferenceConflict）。
+type engineErrGroup struct {
+	pub  error
+	srcs []error
+}
+
+func addEngineErrGroup(groups []engineErrGroup, pub, src error) []engineErrGroup {
+	for i := range groups {
+		if errors.Is(groups[i].pub, pub) {
+			if !slices.ContainsFunc(groups[i].srcs, func(s error) bool { return errors.Is(s, src) && errors.Is(src, s) }) {
+				groups[i].srcs = append(groups[i].srcs, src)
+			}
+			return groups
+		}
+	}
+	return append(groups, engineErrGroup{pub: pub, srcs: []error{src}})
+}
+
+// mapEngineError 按目标门面哨兵分组收集全部命中的底层源哨兵（保首次命中序），
+// 并逆序经 domi18n.WrapSentinel 封装以完整保留错误链与结构化无损折叠渲染。
 func mapEngineError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var matched []error
+	var groups []engineErrGroup
 	if _, isCh := errors.AsType[*gate.ApprovalChallengeError](err); isCh && !errors.Is(err, ErrApprovalRequired) {
-		matched = append(matched, ErrApprovalRequired)
+		groups = addEngineErrGroup(groups, ErrApprovalRequired, gate.ErrApprovalRequired)
 	}
 	for _, r := range engineErrorRules() {
-		if errors.Is(err, r.src) && !errors.Is(err, r.pub) && !slices.Contains(matched, r.pub) {
-			matched = append(matched, r.pub)
+		if errors.Is(err, r.src) && !errors.Is(err, r.pub) {
+			groups = addEngineErrGroup(groups, r.pub, r.src)
 		}
 	}
 	out := err
-	for i := len(matched) - 1; i >= 0; i-- {
-		out = fmt.Errorf("%w: %w", matched[i], out)
+	for i := len(groups) - 1; i >= 0; i-- {
+		out = domi18n.WrapSentinel(groups[i].pub, out, groups[i].srcs...)
 	}
 	return out
 }

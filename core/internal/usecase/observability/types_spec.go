@@ -16,8 +16,6 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -25,6 +23,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -67,20 +66,20 @@ const (
 
 // 本包导出的不可变哨兵错误，供 core/engine、entry/tui、mcpruntime 与测试经 errors.Is 精确区分故障类别。
 var (
-	ErrNilContext            = errors.New("usecase/observability: context 不能为 nil")
-	ErrInvalidConfig         = errors.New("usecase/observability: 无效的 ServiceConfig 或 ProjectionConfig 配置")
-	ErrServiceNotInitialized = errors.New("usecase/observability: Service 未初始化")
-	ErrInvalidRequest        = errors.New("usecase/observability: 无效的可观测性或 GUI 请求")
-	ErrPOSIXShellRequired    = errors.New("usecase/observability: 目标节点必须使用 POSIX Bourne 兼容 Shell（sh/bash/zsh）")
-	ErrInvalidLogTarget      = errors.New("usecase/observability: 无效的远端日志目标或非法容器名称")
-	ErrInvalidGUIInput       = errors.New("usecase/observability: 无效或包含注入风险的 GUI 输入参数")
-	ErrScreenshotInvalid     = errors.New("usecase/observability: 远端截图载荷缺失、格式不受支持或触发解压炸弹防护")
-	ErrScopedFSUnavailable   = errors.New("usecase/observability: 未配置 ScopedRootFS，无法落盘沙箱产物")
-	ErrForwarderUnavailable  = errors.New("usecase/observability: 未配置 ForwarderPort，无法建立受管 GUI 隧道会话")
-	ErrProjectionClosed      = errors.New("usecase/observability: Projection 未初始化或已关闭")
-	ErrUncertainOutcome      = errors.New("usecase/observability: 远端操作结果未知（OutcomeUnknown），严禁重试")
-	ErrSymlinkPolicyDenied   = errors.New("usecase/observability: 远端软链展开超限或被策略拒绝")
-	errLogLimitReached       = errors.New("usecase/observability: 远端跟随日志已达到 max_bytes 字节上限")
+	ErrNilContext            = domi18n.Sentinel(domi18n.KeyUCObsNilContext)
+	ErrInvalidConfig         = domi18n.Sentinel(domi18n.KeyUCObsInvalidConfig)
+	ErrServiceNotInitialized = domi18n.Sentinel(domi18n.KeyUCObsNotInitialized)
+	ErrInvalidRequest        = domi18n.Sentinel(domi18n.KeyUCObsInvalidRequest)
+	ErrPOSIXShellRequired    = domi18n.Sentinel(domi18n.KeyUCObsPOSIXRequired)
+	ErrInvalidLogTarget      = domi18n.Sentinel(domi18n.KeyUCObsInvalidLogTarget)
+	ErrInvalidGUIInput       = domi18n.Sentinel(domi18n.KeyUCObsInvalidGUIInput)
+	ErrScreenshotInvalid     = domi18n.Sentinel(domi18n.KeyUCObsScreenshotInvalid)
+	ErrScopedFSUnavailable   = domi18n.Sentinel(domi18n.KeyUCObsScopedFSUnavail)
+	ErrForwarderUnavailable  = domi18n.Sentinel(domi18n.KeyUCObsForwarderUnavail)
+	ErrProjectionClosed      = domi18n.Sentinel(domi18n.KeyUCObsProjectionClosed)
+	ErrUncertainOutcome      = domi18n.Sentinel(domi18n.KeyUCObsUncertainOutcome)
+	ErrSymlinkPolicyDenied   = domi18n.Sentinel(domi18n.KeyUCObsSymlinkDenied)
+	errLogLimitReached       = domi18n.Sentinel(domi18n.KeyUCObsLogLimitReached)
 )
 
 // ServiceConfig 定义可观测性与 GUI 用例服务 Service 的显式出站依赖配置；
@@ -115,7 +114,7 @@ func parseEnumTable[T ~uint8](raw string, names []string, baseErr error) (T, err
 	if idx := slices.Index(names[1:], raw); idx >= 0 {
 		return T(idx + 1), nil
 	}
-	return 0, fmt.Errorf("%w: 非法枚举值 %q", baseErr, raw)
+	return 0, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 func enumTableName(idx uint8, names []string) string {
 	return pickIf(int(idx) > 0 && int(idx) < len(names), names[idx], "invalid")
@@ -256,13 +255,13 @@ type LogTarget struct {
 // NewFileLogTarget 与 NewDockerLogTarget 构造校验后的远端日志目标。
 func NewFileLogTarget(p pathalg.RemotePath) (LogTarget, error) {
 	if !p.IsValid() || !p.IsAbs() {
-		return LogTarget{}, fmt.Errorf("%w: 远端日志文件路径必须为有效绝对路径", ErrInvalidLogTarget)
+		return LogTarget{}, domi18n.EF(ErrInvalidLogTarget, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "file_path"))
 	}
 	return LogTarget{kind: LogTargetFile, filePath: p, valid: true}, nil
 }
 func NewDockerLogTarget(container string) (LogTarget, error) {
 	if !isValidDockerContainerName(container) {
-		return LogTarget{}, fmt.Errorf("%w: 非法 Docker 容器名称 %q", ErrInvalidLogTarget, container)
+		return LogTarget{}, domi18n.EF(ErrInvalidLogTarget, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "container"), domi18n.BoundStr("value", container))
 	}
 	return LogTarget{kind: LogTargetDocker, container: container, valid: true}, nil
 }

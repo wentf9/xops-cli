@@ -404,8 +404,11 @@ func TestPlaybookRound2ProtectedPathTOCTOUAndApprovalDeterminism(t *testing.T) {
 	if !errors.Is(err, automation.ErrPlaybookFailed) {
 		t.Fatalf("expected TOCTOU write failure, got err=%v", err)
 	}
-	if !strings.Contains(resFlip.Report().Nodes()[0].Steps()[1].Message(), "漂移") {
-		t.Fatalf("expected scope drift message, got %q", resFlip.Report().Nodes()[0].Steps()[1].Message())
+	step1 := resFlip.Report().Nodes()[0].Steps()[1]
+	out1, hasOut1 := step1.Outcome().Get()
+	ns1, okNS1 := out1.(*execution.OutcomeNotStarted)
+	if !hasOut1 || !okNS1 || ns1.Code() != "scope_escalated" || !strings.Contains(step1.Message(), "unauthorized target") {
+		t.Fatalf("expected scope_escalated drift rejection, got code=%v msg=%q", out1, step1.Message())
 	}
 }
 
@@ -425,7 +428,7 @@ func TestPlaybookRound2HardeningTemplateBombUnknownStopAndWriteErrors(t *testing
 	resBomb, err := rig.svc.RunPlaybook(context.Background(), automation.PlaybookRequest{
 		Playbook: pbBomb, Targets: []automation.TargetNode{node}, Risk: algebraic.Some(security.RiskSafe),
 	})
-	if !errors.Is(err, automation.ErrPlaybookFailed) || !strings.Contains(resBomb.Report().Nodes()[0].Steps()[0].Message(), "上限") {
+	if !errors.Is(err, automation.ErrPlaybookFailed) || !strings.Contains(resBomb.Report().Nodes()[0].Steps()[0].Message(), "exceeds limit") {
 		t.Fatalf("expected template expansion bomb bounded failure, err=%v msg=%q", err, resBomb.Report().Nodes()[0].Steps()[0].Message())
 	}
 

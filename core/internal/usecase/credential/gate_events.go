@@ -3,13 +3,13 @@ package credential
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync/atomic"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -27,7 +27,7 @@ func (s *Service) runVaultControlMutation(
 	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, action)
 	gateReq, err := buildMutateGateRequest(action, "", nil, req.Risk.OrElse(security.RiskModerate), summary, req.Approval, req.OperationStream)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	var emitter *OpEmitter
 	var startedAt time.Time
@@ -56,7 +56,7 @@ func (s *Service) validateBaseCall(ctx context.Context, risk algebraic.Option[se
 		return err
 	}
 	if r, ok := risk.Get(); ok && !r.IsValid() {
-		return fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel"))
 	}
 	return nil
 }
@@ -82,10 +82,10 @@ func (s *Service) validateInteractionCall(ctx context.Context, prompt ports.Secr
 		return err
 	}
 	if !prompt.IsValid() {
-		return fmt.Errorf("%w: SecretPromptRequest 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SecretPromptRequest"))
 	}
 	if s.interaction == nil || !s.interaction.CanInteract() {
-		return fmt.Errorf("%w: %w", ErrInteractionUnavailable, ports.ErrInteractionUnavailable)
+		return domi18n.WrapSentinel(ErrInteractionUnavailable, ports.ErrInteractionUnavailable)
 	}
 	return nil
 }
@@ -95,18 +95,18 @@ func (s *Service) validateInteractiveControlCall(ctx context.Context, req Intera
 		return err
 	}
 	if !req.Prompt.IsValid() {
-		return fmt.Errorf("%w: Prompt 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Prompt"))
 	}
 	if cp, ok := req.ConfirmPrompt.Get(); ok {
 		if !allowConfirm {
-			return fmt.Errorf("%w: 当前交互操作不支持 ConfirmPrompt", ErrInvalidRequest)
+			return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "ConfirmPrompt"))
 		}
 		if !cp.IsValid() {
-			return fmt.Errorf("%w: ConfirmPrompt 无效", ErrInvalidRequest)
+			return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ConfirmPrompt"))
 		}
 	}
 	if s.interaction == nil || !s.interaction.CanInteract() {
-		return fmt.Errorf("%w: %w", ErrInteractionUnavailable, ports.ErrInteractionUnavailable)
+		return domi18n.WrapSentinel(ErrInteractionUnavailable, ports.ErrInteractionUnavailable)
 	}
 	return nil
 }

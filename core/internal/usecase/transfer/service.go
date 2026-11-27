@@ -17,6 +17,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -78,11 +79,11 @@ type Service struct {
 // NewService 严格校验必填依赖与限流上下界，构造不可绕过能力门控的 transfer.Service。
 func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.Gate == nil || cfg.Pool == nil || cfg.Pool.IsClosed() || cfg.Clock == nil || cfg.Entropy == nil || (cfg.SystemBus != nil && cfg.SystemBus.IsClosed()) {
-		return nil, fmt.Errorf("%w: Gate/Pool/Clock/Entropy 必填且不可关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Gate/Pool/Clock/Entropy"))
 	}
 	cs, conc, maxRead := pickIf(cfg.DefaultChunkSize == 0, defaultChunkSize, cfg.DefaultChunkSize), pickIf(cfg.DefaultConcurrency == 0, defaultConcurrency, cfg.DefaultConcurrency), pickIf(cfg.DefaultMaxReadBytes == 0, defaultMaxReadBytes, cfg.DefaultMaxReadBytes)
 	if cs < minChunkSize || cs > int64(fsm.MaxTransferChunkBytes) || conc < 1 || conc > maxConcurrency || maxRead <= 0 || maxRead > maxAtomicReadBytes {
-		return nil, fmt.Errorf("%w: 默认分片/并发/读上限越界", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "default_limits"))
 	}
 	return &Service{gate: cfg.Gate, pool: cfg.Pool, clock: cfg.Clock, entropy: cfg.Entropy, scopedFS: cfg.ScopedFS, operatorReadFS: cfg.OperatorReadFS, journals: cfg.Journals, bus: cfg.SystemBus, defaultChunkSize: cs, defaultConcurrency: conc, defaultMaxReadBytes: maxRead, handles: &transferHandleTable{items: map[security.OperationID]plan.ManagedHandle[plan.KindTransfer]{}}, valid: true}, nil
 }
@@ -145,16 +146,16 @@ func (s *Service) checkReadyCtx(ctx context.Context) error {
 func (s *Service) validateBaseCall(ctx context.Context, base CallBase) (plan.HopSpec, error) {
 	hop, ok := base.Plan.Target()
 	r, hasR := base.Risk.Get()
-	err := firstErr(s.checkReadyCtx(ctx), pickIf[error](!base.Plan.IsValid() || !ok || !hop.IsValid() || (hasR && !r.IsValid()), fmt.Errorf("%w: SealedConnectionPlan 或 RiskLevel 无效", ErrInvalidRequest), nil))
+	err := firstErr(s.checkReadyCtx(ctx), pickIf[error](!base.Plan.IsValid() || !ok || !hop.IsValid() || (hasR && !r.IsValid()), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SealedConnectionPlan/RiskLevel")), nil))
 	return pickIf(err == nil, hop, zeroVal[plan.HopSpec]()), err
 }
 func (s *Service) validateRemotePathOp(ctx context.Context, base CallBase, p pathalg.RemotePath) (plan.HopSpec, error) {
 	hop, err := s.validateBaseCall(ctx, base)
-	return hop, firstErr(err, pickIf[error](p.IsValid(), nil, fmt.Errorf("%w: RemotePath 无效", ErrInvalidRequest)))
+	return hop, firstErr(err, pickIf[error](p.IsValid(), nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RemotePath"))))
 }
 func (s *Service) resolveChunkAndConcurrency(chunkSize int64, concurrency int) (int64, int, error) {
 	cs, conc := pickIf(chunkSize == 0, s.defaultChunkSize, chunkSize), pickIf(concurrency == 0, s.defaultConcurrency, concurrency)
-	return cs, conc, pickIf[error](cs < minChunkSize || cs > int64(fsm.MaxTransferChunkBytes) || conc < 1 || conc > maxConcurrency, fmt.Errorf("%w: ChunkSize/Concurrency 越界", ErrInvalidRequest), nil)
+	return cs, conc, pickIf[error](cs < minChunkSize || cs > int64(fsm.MaxTransferChunkBytes) || conc < 1 || conc > maxConcurrency, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ChunkSize/Concurrency")), nil)
 }
 func (s *Service) resolveReadLimits(maxBytes int64) (ports.ReadLimits, error) {
 	if s == nil || !s.valid {
@@ -163,11 +164,11 @@ func (s *Service) resolveReadLimits(maxBytes int64) (ports.ReadLimits, error) {
 	if lim := pickIf(maxBytes == 0, s.defaultMaxReadBytes, maxBytes); lim > 0 && lim <= maxAtomicReadBytes {
 		return ports.NewReadLimits(lim)
 	}
-	return zeroVal[ports.ReadLimits](), fmt.Errorf("%w: MaxBytes 越界", ErrInvalidRequest)
+	return zeroVal[ports.ReadLimits](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRange, domi18n.Str("field", "MaxBytes"), domi18n.Int64("value", maxBytes), domi18n.Int64("min", 1), domi18n.Int64("max", maxAtomicReadBytes))
 }
 func resolvePerm(opt algebraic.Option[fs.FileMode], fallback fs.FileMode) (fs.FileMode, error) {
 	perm, ok := opt.Get()
-	return pickIf(ok, perm, fallback), pickIf[error](ok && (perm == 0 || perm != perm.Perm()), fmt.Errorf("%w: 权限位 %#o 非法", ErrInvalidRequest, perm), nil)
+	return pickIf(ok, perm, fallback), pickIf[error](ok && (perm == 0 || perm != perm.Perm()), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonPermInvalid, domi18n.Str("perm", fmt.Sprintf("%#o", perm))), nil)
 }
 
 type authOpSpec struct {
@@ -297,7 +298,7 @@ func (s *Service) stageToken(domainTag, key string, deterministic bool) (string,
 	}
 	buf := make([]byte, 12)
 	_, err := io.ReadFull(s.entropy, buf)
-	return pickIf(err == nil, fmt.Sprintf("%x", buf), ""), pickIf[error](err != nil, fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err), nil)
+	return pickIf(err == nil, fmt.Sprintf("%x", buf), ""), pickIf[error](err != nil, domi18n.WrapSentinel(ports.ErrEntropyShortRead, err), nil)
 }
 func makeLocalStageDest(finalDest pathalg.LocalRootedDest, token string) (pathalg.LocalRootedDest, error) {
 	if parent, ok := finalDest.Parent(); ok {

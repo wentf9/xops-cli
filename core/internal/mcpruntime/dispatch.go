@@ -153,7 +153,7 @@ func (s *Server) handleToolsCall(ctx context.Context, id protocol.RequestID, par
 		})
 	}
 	if strings.TrimSpace(p.Name) == "" {
-		return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, "tools/call 缺少工具名 name", protocol.ToolErrorPayload{
+		return protocol.NewErrorResponse(algebraic.Some(id), protocol.CodeInvalidParams, "tools/call requires tool name", protocol.ToolErrorPayload{
 			Code: "invalid_params", Message: "missing tool name",
 		})
 	}

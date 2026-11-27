@@ -3,7 +3,6 @@ package session
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -83,10 +82,10 @@ func (i ControlMasterInfo) Done() <-chan struct{} {
 //   - 正常 -O exit / -O stop 与 ControlPersist 空闲到期（ErrMuxPersistExpired）映射为 nil，其余传输故障原样透传（即使句柄已自动回收）。
 func (i ControlMasterInfo) Wait(ctx context.Context) error {
 	if ctx == nil {
-		return fmt.Errorf("%w: %w", ErrNilContext, ports.ErrNilContext)
+		return domi18n.WrapSentinel(ErrNilContext, ports.ErrNilContext)
 	}
 	if !i.IsValid() {
-		return fmt.Errorf("%w: %w: ControlMasterInfo 无效", ErrInvalidRequest, ports.ErrInvalidArgument)
+		return domi18n.WrapS(ErrInvalidRequest, ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ControlMasterInfo"))
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -360,7 +359,7 @@ func (s *Service) StartControlMaster(ctx context.Context, req ControlMasterReque
 	cp := targetHop.Transport().ControlPolicy()
 	effMaster, effPersist := cp.EffectiveMaster(), cp.EffectivePersist()
 	if effMaster == option.ControlMasterNo || effMaster == option.ControlMasterUnset {
-		return ControlMasterInfo{}, fmt.Errorf("%w: EffectiveMaster=%s（确认 ControlPath 已启用且 ControlMaster 非 no）", ErrControlMasterDisabled, effMaster)
+		return ControlMasterInfo{}, domi18n.EF(ErrControlMasterDisabled, domi18n.KeyUCSessMuxDisabledInfo, domi18n.Str("mode", effMaster.String()))
 	}
 	sockPath, err := expandControlPath(targetHop, cp.Path(), s.cfg.Env)
 	if err != nil {
@@ -433,7 +432,7 @@ func (s *Service) tryReuseControlMaster(ctx context.Context, nodeID string, sock
 }
 func confirmMuxMasterWith(ctx context.Context, interaction ports.InteractionPort, nodeID string, bodyMsg domi18n.Message) error {
 	if interaction == nil || !interaction.CanInteract() {
-		return fmt.Errorf("%w: %w: ControlMaster ask/autoask 需要可交互终端", ErrMuxMasterUnavailable, ports.ErrInteractionUnavailable)
+		return domi18n.WrapS(ErrMuxMasterUnavailable, ports.ErrInteractionUnavailable, domi18n.KeyUCSessMuxAskNeedsTTY)
 	}
 	tMsg := domi18n.NewMessage(domi18n.KeyInteractMuxConfirmTitle)
 	cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{Title: tMsg.Canonical(), Message: bodyMsg.Canonical(), Subject: nodeID, Risk: security.RiskModerate, TitleMessage: algebraic.Some(tMsg), BodyMessage: algebraic.Some(bodyMsg)})
@@ -441,9 +440,9 @@ func confirmMuxMasterWith(ctx context.Context, interaction ports.InteractionPort
 		return err
 	}
 	if verdict, err := interaction.Confirm(ctx, cReq); err != nil {
-		return fmt.Errorf("%w: %w", ErrMuxMasterUnavailable, err)
+		return domi18n.WrapSentinel(ErrMuxMasterUnavailable, err)
 	} else if !verdict.Allowed() {
-		return fmt.Errorf("%w: 操作员拒绝共享或启动 ControlMaster", ErrMuxMasterUnavailable)
+		return domi18n.EF(ErrMuxMasterUnavailable, domi18n.KeyUCSessMuxRejected)
 	}
 	return nil
 }

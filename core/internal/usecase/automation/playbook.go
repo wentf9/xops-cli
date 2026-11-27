@@ -13,6 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -63,7 +64,7 @@ func (s *Service) validateAndPreparePlaybook(ctx context.Context, req PlaybookRe
 		return playbookPrepared{}, err
 	}
 	if !req.Playbook.IsValid() {
-		return playbookPrepared{}, fmt.Errorf("%w: Playbook 无效", ErrInvalidRequest)
+		return playbookPrepared{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Playbook"))
 	}
 	if err := validatePlaybookOptionals(req); err != nil {
 		return playbookPrepared{}, err
@@ -98,16 +99,16 @@ func (s *Service) validateAndPreparePlaybook(ctx context.Context, req PlaybookRe
 
 func validatePlaybookOptionals(req PlaybookRequest) error {
 	if p, ok := req.DefaultProfile.Get(); ok && !p.IsValid() {
-		return fmt.Errorf("%w: DefaultProfile 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "DefaultProfile"))
 	}
 	if d, ok := req.Timeout.Get(); ok && !d.IsPositive() {
-		return fmt.Errorf("%w: Timeout 必须为正时长", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "Timeout"))
 	}
 	if r, ok := req.Risk.Get(); ok && !r.IsValid() {
-		return fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel"))
 	}
 	if root, ok := req.ScopedSourceRoot.Get(); ok && !root.IsValid() {
-		return fmt.Errorf("%w: ScopedSourceRoot 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ScopedSourceRoot"))
 	}
 	return nil
 }
@@ -414,9 +415,9 @@ func classifyPlaybookRunError(res PlaybookRunResult, firstUnknown execution.Exec
 	if firstUnknown != nil {
 		cause := ErrUncertainOutcome
 		if halted {
-			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, gate.ErrGateHalted)
+			cause = domi18n.WrapSentinel(ErrUncertainOutcome, gate.ErrGateHalted)
 		} else if runErr != nil && !errors.Is(runErr, ErrUncertainOutcome) {
-			cause = fmt.Errorf("%w: %w", ErrUncertainOutcome, runErr)
+			cause = domi18n.WrapSentinel(ErrUncertainOutcome, runErr)
 		}
 		if wrapped, err := gate.WrapOutcomeError(firstUnknown, cause); err == nil {
 			return wrapped
@@ -424,7 +425,7 @@ func classifyPlaybookRunError(res PlaybookRunResult, firstUnknown execution.Exec
 		return cause
 	}
 	if halted && !errors.Is(runErr, gate.ErrGateHalted) {
-		return pickIf[error](runErr != nil, fmt.Errorf("%w: %w", gate.ErrGateHalted, runErr), gate.ErrGateHalted)
+		return pickIf[error](runErr != nil, domi18n.WrapSentinel(gate.ErrGateHalted, runErr), gate.ErrGateHalted)
 	}
 	if runErr != nil {
 		return runErr
@@ -437,7 +438,7 @@ func classifyPlaybookRunError(res PlaybookRunResult, firstUnknown execution.Exec
 	case playbook.NodeStatusOutcomeUnknown:
 		return ErrUncertainOutcome
 	default:
-		return pickIf[error](res.aborted, fmt.Errorf("%w: %w", ErrPlaybookAborted, ErrPlaybookFailed), ErrPlaybookFailed)
+		return pickIf[error](res.aborted, domi18n.WrapSentinel(ErrPlaybookAborted, ErrPlaybookFailed), ErrPlaybookFailed)
 	}
 }
 

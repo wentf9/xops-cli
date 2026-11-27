@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json/jsontext"
-	"fmt"
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime/protocol"
@@ -43,7 +43,7 @@ type fileArgs struct {
 
 func (r *Registry) callFile(ctx context.Context, rawArgs jsontext.Value) (protocol.CallToolResult, error) {
 	if r.transfer == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: TransferService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "TransferService"))
 	}
 	args, err := decodeToolArgs[fileArgs](rawArgs)
 	if err != nil {
@@ -67,7 +67,7 @@ func (r *Registry) callFile(ctx context.Context, rawArgs jsontext.Value) (protoc
 	case "list", "mkdir", "remove", "removedir":
 		return r.fileWorkspaceOp(ctx, base, args)
 	default:
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 未知 file action %q", protocol.ErrInvalidParams, args.Action)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "file action"), domi18n.BoundStr("value", args.Action))
 	}
 }
 
@@ -141,13 +141,13 @@ func (r *Registry) filePatch(ctx context.Context, base uctrans.CallBase, args fi
 		return protocol.CallToolResult{}, err
 	}
 	if len(args.Edits) == 0 {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: edits 不能为空", protocol.ErrInvalidParams)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "edits"))
 	}
 	edits := make([]uctrans.TextEdit, 0, len(args.Edits))
 	for i, e := range args.Edits {
 		te, eErr := uctrans.NewTextEdit(e.OldText, e.NewText, e.ReplaceAll)
 		if eErr != nil {
-			return protocol.CallToolResult{}, fmt.Errorf("%w: edits[%d] 无效: %w", protocol.ErrInvalidParams, i, eErr)
+			return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, eErr, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "edits"), domi18n.Int("index", i))
 		}
 		edits = append(edits, te)
 	}

@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -39,10 +39,10 @@ func (s *Service) StartTransfer(ctx context.Context, req StartTransferRequest) (
 		tid := req.TransferID.OrElse(auth.OperationID())
 		req.TransferID = algebraic.Some(tid)
 		if _, live, lErr := s.lookupLiveHandle(authCtx, tid); lErr != nil || live {
-			return TransferHandleInfo{}, pickIf[error](lErr != nil, lErr, fmt.Errorf("%w: 传输 %s 已存在活跃受管句柄", ports.ErrAlreadyExists, tid))
+			return TransferHandleInfo{}, pickIf[error](lErr != nil, lErr, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyUCTransferDualActive, domi18n.BoundStr("id", tid.String())))
 		}
 		if _, lErr := s.journals.LoadGenerations(authCtx, tid); lErr == nil || !errors.Is(lErr, ports.ErrNotFound) {
-			return TransferHandleInfo{}, pickIf[error](lErr == nil, fmt.Errorf("%w: 传输 %s 已存在于 JournalStore，禁止重复 StartTransfer", ports.ErrAlreadyExists, tid), lErr)
+			return TransferHandleInfo{}, pickIf[error](lErr == nil, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "transfer_id"), domi18n.BoundStr("value", tid.String())), lErr)
 		}
 		return s.registerStreamSession(authCtx, auth.Binding(), emitter, req, perm, renameSpec, nil, true)
 	})
@@ -82,12 +82,12 @@ func (s *Service) normalizeStartRequest(ctx context.Context, req *StartTransferR
 		return hop, 0, renameSpec, pickIf[error](err != nil, err, ErrJournalStoreUnavailable)
 	}
 	if id, ok := req.TransferID.Get(); !req.Dest.IsValid() || req.TotalBytes > fsm.MaxTransferBytes || req.Generation > 1 || (ok && !id.IsValid()) {
-		return hop, 0, renameSpec, pickIf[error](req.TotalBytes > fsm.MaxTransferBytes, fmt.Errorf("%w: TotalBytes=%d 超限", fsm.ErrTransferSizeExceeded, req.TotalBytes), fmt.Errorf("%w: TransferDest/TransferID/Generation 无效", ErrInvalidRequest))
+		return hop, 0, renameSpec, pickIf[error](req.TotalBytes > fsm.MaxTransferBytes, domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "TotalBytes"), domi18n.Uint64("size", req.TotalBytes), domi18n.Uint64("limit", fsm.MaxTransferBytes)), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TransferDest/TransferID/Generation")))
 	}
 	renameSpec, e1 := s.validateStartDirectionFields(*req)
 	perm, e2 := resolvePerm(req.Perm, pickIf(req.Dest.Direction() == fsm.TransferDirectionUpload, defaultRemoteFilePerm, defaultLocalStagePerm))
 	req.JournalVersion, req.Generation = pickIf(req.JournalVersion == fsm.JournalVersionInvalid, fsm.JournalVersionV2, req.JournalVersion), 1
-	return hop, perm, renameSpec, firstErr(e1, e2, pickIf[error](req.JournalVersion.IsValid(), nil, fmt.Errorf("%w: JournalVersion 无效", ErrInvalidRequest)))
+	return hop, perm, renameSpec, firstErr(e1, e2, pickIf[error](req.JournalVersion.IsValid(), nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "JournalVersion"))))
 }
 func (s *Service) validateStartDirectionFields(req StartTransferRequest) (renameSpec ports.RemoteRenameSpec, err error) {
 	if err = validateOptionalUploadAttrs(req.ModTime, req.ExpectedDigest); err != nil {
@@ -98,7 +98,7 @@ func (s *Service) validateStartDirectionFields(req StartTransferRequest) (rename
 	}
 	lr, okL := req.LocalRoot.Get()
 	rs, okR := req.RemoteSource.Get()
-	return renameSpec, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, pickIf[error](!okL || !lr.IsValid() || !okR || !rs.IsValid() || req.ExpectedAnchor.IsSome(), fmt.Errorf("%w: 下载传输须提供有效 LocalRoot/RemoteSource 且禁设 ExpectedAnchor", ErrInvalidRequest), nil))
+	return renameSpec, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, pickIf[error](!okL || !lr.IsValid() || !okR || !rs.IsValid() || req.ExpectedAnchor.IsSome(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LocalRoot/RemoteSource/ExpectedAnchor")), nil))
 }
 func (s *Service) dropActiveHandle(tid security.OperationID, h plan.ManagedHandle[plan.KindTransfer], release bool) {
 	s.handles.drop(tid, h)
@@ -140,7 +140,7 @@ func (s *Service) registerStreamSession(ctx context.Context, binding security.Op
 	}
 	if !s.handles.tryPut(info.TransferID, info.Handle) {
 		_ = pool.ReleaseHandle[plan.KindTransfer](s.pool, info.Handle)
-		return TransferHandleInfo{}, fmt.Errorf("%w: 传输 %s 已存在并发活跃句柄", ports.ErrAlreadyExists, info.TransferID)
+		return TransferHandleInfo{}, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyUCTransferDualActive, domi18n.BoundStr("id", info.TransferID.String()))
 	}
 	if err = s.persistJournalEffects(ctx, startEffs); err != nil {
 		s.dropActiveHandle(info.TransferID, info.Handle, true)
@@ -163,13 +163,13 @@ func (s *Service) WriteTransferChunk(ctx context.Context, req WriteTransferChunk
 	defer closeStream(req.OperationStream)
 	hop, err := s.validateHandleCall(ctx, req.CallBase, req.Handle)
 	if err != nil || len(req.Data) == 0 || uint64(len(req.Data)) > fsm.MaxTransferChunkBytes {
-		return WriteTransferChunkResult{}, pickIf[error](err != nil, err, fmt.Errorf("%w: 分片长度 %d 越界", fsm.ErrInvalidChunkOffset, len(req.Data)))
+		return WriteTransferChunkResult{}, pickIf[error](err != nil, err, domi18n.EF(fsm.ErrInvalidChunkOffset, domi18n.KeyCommonFieldRange, domi18n.Str("field", "chunk_len"), domi18n.Int("value", len(req.Data)), domi18n.Int("min", 1), domi18n.Uint64("max", fsm.MaxTransferChunkBytes)))
 	}
 	return runAuthorizedHandleVal(ctx, s, req.CallBase, hop, req.Handle, "write_chunk", security.RiskModerate, func(hCtx context.Context, _ gate.Authorized[security.CapTransfer], sess *managedTransferSession, emitter *transferEmitter) (WriteTransferChunkResult, error) {
 		stagePath, okS := sess.remoteStagePath.Get()
 		finalPath, okF := sess.meta.Dest().Remote().Get()
 		if sess.meta.Direction() != fsm.TransferDirectionUpload || !okS || !okF {
-			return WriteTransferChunkResult{}, pickIf[error](sess.meta.Direction() != fsm.TransferDirectionUpload, fmt.Errorf("%w: 仅适用于上传", ErrTransferHandleMismatch), ErrInvalidRequest)
+			return WriteTransferChunkResult{}, pickIf[error](sess.meta.Direction() != fsm.TransferDirectionUpload, domi18n.EF(ErrTransferHandleMismatch, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "write_chunk"), domi18n.Str("state", sess.meta.Direction().String())), ErrInvalidRequest)
 		}
 		if dErr := remotecanon.VerifyPathAuthorized(hCtx, s.strictPaths(), sess.rfs, req.Handle.Binding(), finalPath, canonSentinels()); dErr != nil {
 			return WriteTransferChunkResult{}, dErr
@@ -185,7 +185,7 @@ func (s *Service) PullTransferChunk(ctx context.Context, req PullTransferChunkRe
 	hop, err := s.validateHandleCall(ctx, req.CallBase, req.Handle)
 	maxChunk := pickIf(req.MaxChunkBytes == 0, uint64(s.defaultChunkSize), req.MaxChunkBytes)
 	if err != nil || s.scopedFS == nil || maxChunk == 0 || maxChunk > fsm.MaxTransferChunkBytes {
-		return PullTransferChunkResult{}, firstErr(err, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, fmt.Errorf("%w: MaxChunkBytes 越界", ErrInvalidRequest)))
+		return PullTransferChunkResult{}, firstErr(err, pickIf[error](s.scopedFS == nil, ErrScopedFSUnavailable, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRange, domi18n.Str("field", "MaxChunkBytes"), domi18n.Uint64("value", maxChunk), domi18n.Int("min", 1), domi18n.Uint64("max", fsm.MaxTransferChunkBytes))))
 	}
 	return runAuthorizedHandleVal(ctx, s, req.CallBase, hop, req.Handle, "pull_chunk", security.RiskSafe, func(hCtx context.Context, _ gate.Authorized[security.CapTransfer], sess *managedTransferSession, emitter *transferEmitter) (PullTransferChunkResult, error) {
 		return s.pullOneDownloadChunk(hCtx, sess, emitter, maxChunk, req.Handle.Binding())
@@ -194,7 +194,7 @@ func (s *Service) PullTransferChunk(ctx context.Context, req PullTransferChunkRe
 func (s *Service) pullOneDownloadChunk(ctx context.Context, sess *managedTransferSession, emitter *transferEmitter, maxChunk uint64, handleBinding security.OperationBinding) (PullTransferChunkResult, error) {
 	streamSt, ok := sess.state.(*fsm.TransferStreaming)
 	if sess.meta.Direction() != fsm.TransferDirectionDownload || !ok {
-		return PullTransferChunkResult{}, pickIf(sess.meta.Direction() != fsm.TransferDirectionDownload, fmt.Errorf("%w: PullTransferChunk 仅适用于下载", ErrTransferHandleMismatch), fmt.Errorf("%w: 当前状态 %s 不能拉取分片", fsm.ErrIllegalTransition, sess.state.Kind()))
+		return PullTransferChunkResult{}, pickIf(sess.meta.Direction() != fsm.TransferDirectionDownload, domi18n.EF(ErrTransferHandleMismatch, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "pull_chunk"), domi18n.Str("state", sess.meta.Direction().String())), domi18n.EF(fsm.ErrIllegalTransition, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "pull_chunk"), domi18n.Str("state", sess.state.Kind().String())))
 	}
 	rs, okR := sess.opts.RemoteSource.Get()
 	lr, okL := sess.opts.LocalRoot.Get()
@@ -303,7 +303,7 @@ func runReleasableHandleVal[T any](ctx context.Context, s *Service, base CallBas
 }
 func (s *Service) driveCommitTransfer(ctx context.Context, auth gate.Authorized[security.CapTransfer], sess *managedTransferSession, emitter *transferEmitter, handleBinding security.OperationBinding) (CommitTransferResult, bool, error) {
 	if sess.state.Kind() != fsm.TransferKindVerifying {
-		return CommitTransferResult{}, false, fmt.Errorf("%w: CommitTransfer 要求 Verifying 状态，当前=%s", fsm.ErrIllegalTransition, sess.state.Kind())
+		return CommitTransferResult{}, false, domi18n.EF(fsm.ErrIllegalTransition, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "commit"), domi18n.Str("state", sess.state.Kind().String()))
 	}
 	out := CommitTransferResult{TransferID: sess.meta.TransferID(), Generation: sess.meta.Generation()}
 	actualDig, vErr := s.verifyStagedDigest(ctx, sess)
@@ -341,7 +341,7 @@ func transitionCommitWALFailure(ctx context.Context, auth gate.Authorized[securi
 		}
 	}
 	reportUnknownOutcome(auth, "journal_commit_append_failed", walErr.Error())
-	return out, true, fmt.Errorf("%w: %w", ErrUncertainCommit, walErr)
+	return out, true, domi18n.WrapSentinel(ErrUncertainCommit, walErr)
 }
 func (s *Service) finalizeCommitState(ctx context.Context, auth gate.Authorized[security.CapTransfer], sess *managedTransferSession, out CommitTransferResult, endSt fsm.TransferState, reason string, commitErr error) (CommitTransferResult, bool, error) {
 	out.State = endSt
@@ -353,7 +353,7 @@ func (s *Service) finalizeCommitState(ctx context.Context, auth gate.Authorized[
 		return out, true, commitErr
 	case *fsm.TransferUncertainCommit:
 		reportUnknownOutcome(auth, "transfer_uncertain_commit", reason)
-		return out, true, fmt.Errorf("%w: %w", ErrUncertainCommit, commitErr)
+		return out, true, domi18n.WrapSentinel(ErrUncertainCommit, commitErr)
 	case *fsm.TransferInitialized, *fsm.TransferStreaming, *fsm.TransferVerifying, *fsm.TransferCommitting:
 		return out, false, fsm.ErrInvalidState
 	default:
@@ -366,7 +366,7 @@ func (s *Service) InspectTransfer(ctx context.Context, req InspectTransferReques
 	defer closeStream(req.OperationStream)
 	hop, err := s.validateBaseCall(ctx, req.CallBase)
 	if h, ok := req.Handle.Get(); err != nil || !req.TransferID.IsValid() || (ok && !h.IsValid()) {
-		return TransferStatusSnapshot{}, pickIf[error](err != nil, err, fmt.Errorf("%w: TransferID 或 Handle 无效", ErrInvalidRequest))
+		return TransferStatusSnapshot{}, pickIf[error](err != nil, err, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TransferID/Handle")))
 	}
 	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "transfer", action: "inspect", params: map[string]string{"transfer_id": req.TransferID.String()}, defaultRisk: security.RiskSafe, summary: "transfer inspect " + req.TransferID.String()}
 	return runAuthorizedVal[security.CapTransfer](ctx, s, spec, func(authCtx context.Context, _ gate.Authorized[security.CapTransfer], _ *transferEmitter) (TransferStatusSnapshot, error) {
@@ -404,7 +404,7 @@ func (s *Service) inspectAuthorizedTransfer(ctx context.Context, req InspectTran
 }
 func (s *Service) validateHandleCall(ctx context.Context, base CallBase, handle plan.ManagedHandle[plan.KindTransfer]) (hop plan.HopSpec, err error) {
 	if hop, err = s.validateBaseCall(ctx, base); err != nil || s.journals == nil || !handle.IsValid() || !handle.MatchesPlan(base.Plan.PlanDigest()) {
-		return zeroVal[plan.HopSpec](), firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, pickIf[error](!handle.IsValid(), fmt.Errorf("%w: ManagedHandle 无效", ErrInvalidRequest), fmt.Errorf("%w: 托管句柄与连接计划不匹配", ErrTransferHandleMismatch))))
+		return zeroVal[plan.HopSpec](), firstErr(err, pickIf[error](s.journals == nil, ErrJournalStoreUnavailable, pickIf[error](!handle.IsValid(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ManagedHandle")), domi18n.EF(ErrTransferHandleMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ManagedHandle")))))
 	}
 	return hop, nil
 }

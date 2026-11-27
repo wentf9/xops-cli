@@ -4,13 +4,13 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -71,11 +71,14 @@ type Service struct {
 // NewService 校验配置项并构造资产与目标解析 Service；仅提供 Phase 2.5 最小配置时完全兼容。
 func NewService(cfg ServiceConfig) (*Service, error) {
 	if err := cfg.GlobalOptions.Validate(); err != nil {
-		return nil, fmt.Errorf("%w: GlobalOptions 无效: %w", ErrInvalidConfig, err)
+		return nil, domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "GlobalOptions"))
 	}
 	maxDepth := pickIf(cfg.MaxJumpDepth == 0, defaultMaxJumpDepth, cfg.MaxJumpDepth)
-	if maxDepth < 0 || maxDepth > maxAllowedJumpDepth || cfg.DefaultEnrollTTL.IsNegative() {
-		return nil, fmt.Errorf("%w: MaxJumpDepth=%d 越界或 DefaultEnrollTTL 为负", ErrInvalidConfig, cfg.MaxJumpDepth)
+	if maxDepth < 0 || maxDepth > maxAllowedJumpDepth {
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldRange, domi18n.Str("field", "MaxJumpDepth"), domi18n.Int("value", cfg.MaxJumpDepth), domi18n.Int("min", 0), domi18n.Int("max", maxAllowedJumpDepth))
+	}
+	if cfg.DefaultEnrollTTL.IsNegative() {
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "DefaultEnrollTTL"))
 	}
 	importers, err := buildImporterRegistry(cfg.Importers)
 	var knownStores []string
@@ -98,7 +101,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 			Gate: svc.gate, Vault: svc.vault, VaultControl: svc.vaultControl, Store: svc.store,
 			Interaction: svc.interaction, Clock: svc.clock, Entropy: svc.entropy, PendingRefs: svc,
 		}); err != nil {
-			return nil, fmt.Errorf("%w: 初始化内置 CredentialService 失败: %w", ErrInvalidConfig, err)
+			return nil, domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "initialize built-in CredentialService"))
 		}
 	}
 	return svc, nil
@@ -116,7 +119,7 @@ func (s *Service) ActivePendingSecretRefs() []inventory.PendingSecretRef {
 func validateExtraPending(extra []inventory.PendingSecretRef) error {
 	for i, p := range extra {
 		if !p.Ref.IsValid() {
-			return fmt.Errorf("%w: ExtraPending[%d] 包含无效 secret.Ref", ErrInvalidRequest, i)
+			return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "ExtraPending"), domi18n.Int("index", i))
 		}
 	}
 	return nil
@@ -154,7 +157,7 @@ func (s *Service) requireStoreAndGate(ctx context.Context, risk algebraic.Option
 	case s.gate == nil:
 		return ErrGateUnavailable
 	case risk.IsSome() && !risk.OrElse(zeroVal[security.RiskLevel]()).IsValid():
-		return fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel"))
 	}
 	return nil
 }
@@ -167,7 +170,7 @@ func runInspect[T any](ctx context.Context, s *Service, action, summary string, 
 	}
 	gateReq, err := credential.BuildGateRequest[security.CapInspect](security.CapabilityInspect, toolInventory, action, "", nil, risk.OrElse(security.RiskSafe), summary, approval, stream)
 	if err != nil {
-		return out, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return out, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	err = gate.WithAuthorized[security.CapInspect](ctx, s.gate, gateReq, func(c context.Context, _ gate.Authorized[security.CapInspect]) (rErr error) {
 		out, rErr = fn(c)
@@ -184,7 +187,7 @@ func runMutate[T any](ctx context.Context, s *Service, action, nodeID, summary s
 	}
 	gateReq, err := credential.BuildGateRequest[security.CapMutate](security.CapabilityMutate, toolInventory, action, nodeID, nil, risk.OrElse(security.RiskModerate), summary, approval, stream)
 	if err != nil {
-		return out, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return out, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	err = gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(c context.Context, auth gate.Authorized[security.CapMutate]) (rErr error) {
 		var unkCode, unkDetail string
@@ -225,7 +228,7 @@ func (s *Service) resolveAuthoritativeKnownStores(ctx context.Context, base inve
 	if s.vaultControl != nil {
 		st, err := s.vaultControl.Status(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("查询凭据库权威存储表失败: %w", err)
+			return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "query authoritative vault known stores"))
 		}
 		vaultStores = st.KnownStores()
 	}
@@ -331,19 +334,22 @@ func (s *Service) commitGraphCAS(ctx context.Context, baseRev ports.Revision, ne
 }
 func wrapCommitError(sentinel error, detail string, cause error) error {
 	if cause != nil {
-		return fmt.Errorf("%w: %w", sentinel, cause)
+		return domi18n.WrapSentinel(sentinel, cause)
 	}
-	return pickIf(detail != "", fmt.Errorf("%w: %s", sentinel, detail), sentinel)
+	if detail != "" {
+		return domi18n.WrapSentinel(sentinel, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", detail)))
+	}
+	return sentinel
 }
 func buildImporterRegistry(raw []ports.FormatImporter) (map[string]ports.FormatImporter, error) {
 	reg := make(map[string]ports.FormatImporter, len(raw))
 	for i, imp := range raw {
 		if imp == nil || strings.TrimSpace(imp.Format()) == "" {
-			return nil, fmt.Errorf("%w: Importers[%d] 为空或 Format() 为空", ErrInvalidConfig, i)
+			return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "Importers"), domi18n.Int("index", i))
 		}
 		name := strings.ToLower(strings.TrimSpace(imp.Format()))
 		if _, dup := reg[name]; dup {
-			return nil, fmt.Errorf("%w: 重复注册导入格式 %q", ErrInvalidConfig, name)
+			return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "import format"), domi18n.BoundStr("value", name))
 		}
 		reg[name] = imp
 	}
@@ -354,7 +360,7 @@ func normalizeKnownStores(raw []string) ([]string, error) {
 	for _, s := range raw {
 		t := strings.TrimSpace(s)
 		if t == "" {
-			return nil, fmt.Errorf("%w: KnownStores 不能包含空字符串", ErrInvalidConfig)
+			return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "KnownStores entry"))
 		}
 		out = append(out, t)
 	}

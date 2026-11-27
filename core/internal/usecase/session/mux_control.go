@@ -3,7 +3,6 @@ package session
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"maps"
@@ -59,13 +58,13 @@ func (s *Service) ControlMux(ctx context.Context, req MuxControlRequest) (ports.
 		return zeroVal[ports.MuxControlResponse](), err
 	}
 	if req.Action == ports.MuxActionProxy {
-		return zeroVal[ports.MuxControlResponse](), fmt.Errorf("%w: MuxActionProxy 请调用 WithMuxProxy 或 RunMuxProxy", ErrInvalidRequest)
+		return zeroVal[ports.MuxControlResponse](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "MuxActionProxy"))
 	}
 	extra := map[string]string{"action": req.Action.String()}
 	call := func(authCtx context.Context, sockPath pathalg.LocalSourcePath) (ports.MuxControlResponse, error) {
 		muxReq, err := ports.NewMuxControlRequest(req.Action, sockPath, req.Forward)
 		if err != nil {
-			return zeroVal[ports.MuxControlResponse](), fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+			return zeroVal[ports.MuxControlResponse](), domi18n.WrapSentinel(ErrInvalidRequest, err)
 		}
 		return s.cfg.MuxSocket.Control(authCtx, muxReq)
 	}
@@ -207,7 +206,7 @@ func (s *Service) WithMuxConn(ctx context.Context, req MuxRequest, fn func(ctx c
 	}
 	leafDigest, ok := req.Plan.HopDigestAt(req.Plan.Len() - 1)
 	if !ok || !leafDigest.IsValid() {
-		return fmt.Errorf("%w: 计划缺少有效末跳摘要", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "leaf_hop_digest"))
 	}
 	return runMuxAuthorized[security.CapTunnel](ctx, s, req, "mux_dial", security.RiskModerate, nil, func(authCtx context.Context, targetHop plan.HopSpec, nodeID string, sockPath pathalg.LocalSourcePath, effMaster option.ControlMasterMode) error {
 		conn, err := s.dialVerifiedMuxConn(authCtx, nodeID, sockPath, targetHop, leafDigest, effMaster)
@@ -264,7 +263,7 @@ func confirmAutoAskMuxAttach(ctx context.Context, muxPort ports.MuxSocketPort, i
 func verifyDialedMuxConn(conn ports.TransportConn, leafDigest plan.HopDigest, ep netaddr.Endpoint) (ports.TransportConn, bool, error) {
 	if conn == nil || !conn.IsAlive() || !conn.HopDigest().Equal(leafDigest) || !conn.Endpoint().Equal(ep) {
 		_ = closeClosers(conn)
-		return nil, false, fmt.Errorf("%w: DialMux 返回连接无效或与计划末跳身份不匹配", ErrMuxMasterUnavailable)
+		return nil, false, domi18n.EF(ErrMuxMasterUnavailable, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "mux_conn"))
 	}
 	return conn, true, nil
 }
@@ -285,7 +284,7 @@ func buildMuxGateReq[C security.Capability](connPlan plan.SealedConnectionPlan, 
 	params := map[string]string{"socket_path": sockPath.String(), "effective_master": effMaster.String(), "effective_persist": targetHop.Transport().ControlPolicy().EffectivePersist().String()}
 	maps.Copy(params, extra)
 	return buildGateReq[C](gateReqInput{
-		plan: connPlan, targetHop: targetHop, nodeID: nodeID, action: action, summary: fmt.Sprintf("%s on %s (%s)", action, nodeID, sockPath.String()),
+		plan: connPlan, targetHop: targetHop, nodeID: nodeID, action: action, summary: action + " on " + nodeID + " (" + sockPath.String() + ")",
 		risk: risk, params: params, approval: approval, stream: stream,
 	})
 }
@@ -294,7 +293,7 @@ func (s *Service) validateMuxBaseCall(ctx context.Context, connPlan plan.SealedC
 		return err
 	}
 	if s.cfg.MuxSocket == nil {
-		return fmt.Errorf("%w: MuxSocketPort 未配置", ErrPortUnavailable)
+		return domi18n.EF(ErrPortUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "MuxSocketPort"))
 	}
 	return nil
 }
@@ -308,7 +307,7 @@ func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (zh plan.Hop
 	}
 	cp := targetHop.Transport().ControlPolicy()
 	if cp.IsDisabled() {
-		return zh, "", zp, option.ControlMasterNo, fmt.Errorf("%w: ControlPath 已显式禁用（none）", ErrControlMasterDisabled)
+		return zh, "", zp, option.ControlMasterNo, domi18n.EF(ErrControlMasterDisabled, domi18n.KeyUCSessMuxDisabledInfo, domi18n.Str("mode", "none"))
 	}
 	eff = cp.EffectiveMaster()
 	if p, ok := req.SocketPath.Get(); ok {
@@ -316,7 +315,7 @@ func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (zh plan.Hop
 			eff = cp.Master()
 		}
 		if !p.IsValid() {
-			return zh, "", zp, option.ControlMasterNo, fmt.Errorf("%w: 显式 SocketPath 无效", ErrInvalidRequest)
+			return zh, "", zp, option.ControlMasterNo, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SocketPath"))
 		}
 		return targetHop, nodeID, p, eff, nil
 	}
@@ -328,7 +327,7 @@ func (s *Service) prepareMuxOp(ctx context.Context, req MuxRequest) (zh plan.Hop
 // 对任何无法展开的前导 ~（含 Env 缺失、HomeDir 为空、~user 或字面量 ~）一律严格失败关闭。
 func expandControlPath(targetHop plan.HopSpec, spec option.ControlPathSpec, env ports.EnvPort) (pathalg.LocalSourcePath, error) {
 	if !spec.IsEnabled() {
-		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: ControlPath 未启用", ErrControlMasterDisabled)
+		return zeroVal[pathalg.LocalSourcePath](), domi18n.EF(ErrControlMasterDisabled, domi18n.KeyUCSessMuxDisabledInfo, domi18n.Str("mode", "unset"))
 	}
 	raw := spec.String()
 	tokCtx := option.TokenContext{
@@ -343,20 +342,20 @@ func expandControlPath(targetHop plan.HopSpec, spec option.ControlPathSpec, env 
 	if !spec.IsLiteral() {
 		expanded, err := option.ExpandPathTokens(raw, tokCtx)
 		if err != nil {
-			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 展开 ControlPath 模板失败: %w", ErrInvalidRequest, err)
+			return zeroVal[pathalg.LocalSourcePath](), domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "expand_control_path"))
 		}
 		raw = expanded
 	}
 	if strings.HasPrefix(raw, "~") {
 		home, hErr := pathalg.ParseLocalSourcePath(tokCtx.HomeDir)
 		if (!strings.HasPrefix(raw, "~/") && !strings.HasPrefix(raw, `~\`)) || hErr != nil || !home.IsAbs() {
-			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 拒绝未展开的前导 ~ 控制套接字路径 %q", ErrInvalidRequest, raw)
+			return zeroVal[pathalg.LocalSourcePath](), domi18n.EF(ErrInvalidRequest, domi18n.KeyUCSessControlTilde, domi18n.BoundStr("path", raw))
 		}
 		raw = strings.TrimRight(tokCtx.HomeDir, `/\`) + raw[1:]
 	}
 	p, err := pathalg.ParseLocalSourcePath(raw)
 	if err != nil {
-		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 非法控制套接字路径 %q: %w", ErrInvalidRequest, raw, err)
+		return zeroVal[pathalg.LocalSourcePath](), domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "control_socket_path"), domi18n.BoundStr("value", raw))
 	}
 	return p, nil
 }

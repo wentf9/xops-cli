@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
-	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // ExtractAndProcessScreenshot 从远端 GUI 捕获输出中提取显式标记包裹的 Base64 图像载荷，
@@ -19,22 +20,22 @@ func ExtractAndProcessScreenshot(rawStdout []byte) (ProcessedScreenshot, error) 
 		return ProcessedScreenshot{}, err
 	}
 	if len(b64Payload) == 0 || len(b64Payload) > base64.StdEncoding.EncodedLen(maxScreenshotRawBytes) {
-		return ProcessedScreenshot{}, fmt.Errorf("%w: Base64 截图载荷为空或超过字节上限", ErrScreenshotInvalid)
+		return ProcessedScreenshot{}, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "screenshot_base64"), domi18n.Int("size", len(b64Payload)), domi18n.Int("limit", base64.StdEncoding.EncodedLen(maxScreenshotRawBytes)))
 	}
 	decoded, err := base64.StdEncoding.DecodeString(b64Payload)
 	if err != nil || len(decoded) == 0 || len(decoded) > maxScreenshotRawBytes {
-		return ProcessedScreenshot{}, fmt.Errorf("%w: Base64 解码失败或超限", ErrScreenshotInvalid)
+		return ProcessedScreenshot{}, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyCommonBase64DecodeFailed)
 	}
 	return ProcessScreenshotBytes(decoded)
 }
 func extractMarkedPayload(stdout string) (string, error) {
 	_, rest, ok := strings.Cut(stdout, screenshotStartMarker)
 	if !ok {
-		return "", fmt.Errorf("%w: 缺少截图起始标记", ErrScreenshotInvalid)
+		return "", domi18n.EF(ErrScreenshotInvalid, domi18n.KeyUCObsScreenshotMarker)
 	}
 	body, _, ok := strings.Cut(rest, screenshotEndMarker)
 	if !ok {
-		return "", fmt.Errorf("%w: 截图载荷截断（缺少结束标记）", ErrScreenshotInvalid)
+		return "", domi18n.EF(ErrScreenshotInvalid, domi18n.KeyUCObsScreenshotMarker)
 	}
 	return strings.TrimSpace(body), nil
 }
@@ -54,7 +55,7 @@ func stripMarkedPayload(stdout string) string {
 // 合法 WebP 在完整校验 RIFF/VP8/VP8L/VP8X 尺寸头后有界透传，不支持或受损图像严格失败关闭返回 ErrScreenshotInvalid。
 func ProcessScreenshotBytes(raw []byte) (ProcessedScreenshot, error) {
 	if len(raw) < 12 || len(raw) > maxScreenshotRawBytes {
-		return ProcessedScreenshot{}, fmt.Errorf("%w: 图像字节长度非法", ErrScreenshotInvalid)
+		return ProcessedScreenshot{}, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "image"), domi18n.Int("size", len(raw)), domi18n.Int("limit", maxScreenshotRawBytes))
 	}
 	if isWebP(raw) {
 		w, h, err := parseWebPDimensions(raw)
@@ -74,7 +75,7 @@ func ProcessScreenshotBytes(raw []byte) (ProcessedScreenshot, error) {
 	}
 	var out bytes.Buffer
 	if err := jpeg.Encode(&out, scaled, &jpeg.Options{Quality: screenshotJPEGQuality}); err != nil {
-		return ProcessedScreenshot{}, fmt.Errorf("%w: JPEG 编码失败: %w", ErrScreenshotInvalid, err)
+		return ProcessedScreenshot{}, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "jpeg_encode"))
 	}
 	return ProcessedScreenshot{MIMEType: "image/jpeg", Width: dstW, Height: dstH, OrigWidth: origW, OrigHeight: origH, Data: out.Bytes()}, nil
 }
@@ -89,7 +90,7 @@ func isJPEG(raw []byte) bool {
 }
 func validateImageDimensions(w, h int) error {
 	if w <= 0 || h <= 0 || w > maxScreenshotDim || h > maxScreenshotDim || int64(w)*int64(h) > maxScreenshotPixels {
-		return fmt.Errorf("%w: 图像尺寸 %dx%d 超过安全上限", ErrScreenshotInvalid, w, h)
+		return domi18n.EF(ErrScreenshotInvalid, domi18n.KeyUCObsImageDimensions, domi18n.Int("width", w), domi18n.Int("height", h))
 	}
 	return nil
 }
@@ -97,35 +98,35 @@ func validateImageDimensions(w, h int) error {
 // parseWebPDimensions 纯 Go 解析 WebP RIFF 容器长度与 VP8/VP8L/VP8X 宽高头，阻断截断伪造载荷与像素炸弹。
 func parseWebPDimensions(raw []byte) (int, int, error) {
 	if len(raw) < 20 || !isWebP(raw) {
-		return 0, 0, fmt.Errorf("%w: WebP 头截断", ErrScreenshotInvalid)
+		return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_header"))
 	}
 	riffSize := uint64(binary.LittleEndian.Uint32(raw[4:8]))
 	chunkSize := uint64(binary.LittleEndian.Uint32(raw[16:20]))
 	if riffSize < 12 || riffSize+8 > uint64(len(raw)) || 20+chunkSize > uint64(len(raw)) {
-		return 0, 0, fmt.Errorf("%w: WebP RIFF/Chunk 长度越界", ErrScreenshotInvalid)
+		return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_chunk_size"))
 	}
 	var w, h int
 	switch string(raw[12:16]) {
 	case "VP8 ":
 		if chunkSize < 10 || raw[20]&0x01 != 0 || raw[23] != 0x9d || raw[24] != 0x01 || raw[25] != 0x2a {
-			return 0, 0, fmt.Errorf("%w: 非法 VP8 关键帧头", ErrScreenshotInvalid)
+			return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8_header"))
 		}
 		w = int(binary.LittleEndian.Uint16(raw[26:28]) & 0x3fff)
 		h = int(binary.LittleEndian.Uint16(raw[28:30]) & 0x3fff)
 	case "VP8L":
 		if chunkSize < 5 || raw[20] != 0x2f {
-			return 0, 0, fmt.Errorf("%w: 非法 VP8L 无损头", ErrScreenshotInvalid)
+			return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8l_header"))
 		}
 		bits := binary.LittleEndian.Uint32(raw[21:25])
 		w, h = int(bits&0x3fff)+1, int((bits>>14)&0x3fff)+1
 	case "VP8X":
 		if chunkSize < 10 {
-			return 0, 0, fmt.Errorf("%w: 非法 VP8X 扩展头", ErrScreenshotInvalid)
+			return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "webp_vp8x_header"))
 		}
 		w = int(uint32(raw[24])|uint32(raw[25])<<8|uint32(raw[26])<<16) + 1
 		h = int(uint32(raw[27])|uint32(raw[28])<<8|uint32(raw[29])<<16) + 1
 	default:
-		return 0, 0, fmt.Errorf("%w: 不支持的 WebP Chunk 类型 %q", ErrScreenshotInvalid, string(raw[12:16]))
+		return 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "webp_chunk"), domi18n.BoundStr("value", string(raw[12:16])))
 	}
 	if err := validateImageDimensions(w, h); err != nil {
 		return 0, 0, err
@@ -145,17 +146,17 @@ func decodeGuardedImage(raw []byte) (image.Image, int, int, error) {
 		cfg, err = jpeg.DecodeConfig(bytes.NewReader(raw))
 		decodeFn = func(r *bytes.Reader) (image.Image, error) { return jpeg.Decode(r) }
 	default:
-		return nil, 0, 0, fmt.Errorf("%w: 仅支持 PNG / JPEG / WebP 图像格式", ErrScreenshotInvalid)
+		return nil, 0, 0, domi18n.EF(ErrScreenshotInvalid, domi18n.KeyUCObsImageFormat)
 	}
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("%w: 图像头解析失败: %w", ErrScreenshotInvalid, err)
+		return nil, 0, 0, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "image_header_decode"))
 	}
 	if err := validateImageDimensions(cfg.Width, cfg.Height); err != nil {
 		return nil, 0, 0, err
 	}
 	img, err := decodeFn(bytes.NewReader(raw))
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("%w: 图像解码失败: %w", ErrScreenshotInvalid, err)
+		return nil, 0, 0, domi18n.WrapS(ErrScreenshotInvalid, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "image_decode"))
 	}
 	b := img.Bounds()
 	return img, b.Dx(), b.Dy(), nil

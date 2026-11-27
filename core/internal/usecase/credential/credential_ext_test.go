@@ -15,6 +15,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -29,9 +30,10 @@ import (
 
 // 编译期接口断言统一置于外置 *_ext_test.go。
 var (
-	_ encoding.TextAppender  = credential.DoctorSeverityInfo
-	_ encoding.TextMarshaler = credential.DoctorSeverityInfo
-	_ error                  = (*credential.SecretReferencedError)(nil)
+	_ encoding.TextAppender   = credential.DoctorSeverityInfo
+	_ encoding.TextMarshaler  = credential.DoctorSeverityInfo
+	_ error                   = (*credential.SecretReferencedError)(nil)
+	_ domi18n.LocalizableNode = (*credential.SecretReferencedError)(nil)
 )
 
 type stubPendingProvider struct {
@@ -633,8 +635,44 @@ func assertAllSixLocationsBlockDelete(t *testing.T, h *credHarness, rPass, rKey,
 	for _, tc := range wantLocs {
 		err := h.svc.DeleteSecret(context.Background(), credential.DeleteSecretRequest{Ref: tc.ref})
 		refErr, ok := errors.AsType[*credential.SecretReferencedError](err)
-		if !errors.Is(err, credential.ErrSecretStillReferenced) || !ok || len(refErr.References()) != 1 || refErr.References()[0].Location != tc.loc {
+		if !errors.Is(err, credential.ErrSecretStillReferenced) || !ok || !refErr.IsValid() || len(refErr.References()) != 1 || refErr.References()[0].Location != tc.loc {
 			t.Fatalf("位置 %s 必须阻断删除并返回精确 SecretReferencedError，实际=%v", tc.loc, err)
+		}
+		assertCredSecretRefLocalizable(t, refErr, tc.ref, tc.loc)
+	}
+}
+
+func assertCredSecretRefLocalizable(t *testing.T, refErr *credential.SecretReferencedError, wantRef secret.Ref, wantLoc inventory.SecretRefLocation) {
+	t.Helper()
+	view, ok := domi18n.InspectNode(refErr)
+	if !ok || !errors.Is(view.Sentinel, credential.ErrSecretStillReferenced) || view.Message.ID() != domi18n.KeyUCCredSecretRefDetail {
+		t.Fatalf("SecretReferencedError.LocalizableView 失配: ok=%v view=%+v", ok, view)
+	}
+	if id, okID := domi18n.ErrorID(refErr); !okID || id != domi18n.KeyUCCredSecretRefDetail {
+		t.Fatalf("ErrorID 期望 %s，实际 ok=%v id=%s", domi18n.KeyUCCredSecretRefDetail, okID, id)
+	}
+	gotText := refErr.Error()
+	if gotText != domi18n.CanonicalError(refErr) || !strings.Contains(gotText, wantRef.String()) || !strings.Contains(gotText, wantLoc.String()) {
+		t.Fatalf("SecretReferencedError.Error 与 CanonicalError 失配: got=%q", gotText)
+	}
+}
+
+func TestSecretReferencedError_NilAndZeroLocalizableSafety(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	var nilErr *credential.SecretReferencedError
+	var zeroVal credential.SecretReferencedError
+	zeroErr := &zeroVal
+	want := credential.ErrSecretStillReferenced.Error()
+	for name, e := range map[string]*credential.SecretReferencedError{"nil": nilErr, "zero": zeroErr} {
+		if e.IsValid() || e.Unwrap() != nil || errors.Is(e, credential.ErrSecretStillReferenced) {
+			t.Fatalf("%s SecretReferencedError 必须零值失效且 Unwrap==nil", name)
+		}
+		view := e.LocalizableView()
+		if !errors.Is(view.Sentinel, credential.ErrSecretStillReferenced) || view.Message.IsValid() {
+			t.Fatalf("%s LocalizableView 必须退化为纯哨兵视图: %+v", name, view)
+		}
+		if e.Error() != want || domi18n.CanonicalError(e) != want {
+			t.Fatalf("%s Error/CanonicalError 期望 %q，实际 err=%q canon=%q", name, want, e.Error(), domi18n.CanonicalError(e))
 		}
 	}
 }

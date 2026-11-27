@@ -2,12 +2,12 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -122,11 +122,11 @@ func (e *Engine) RunSSH(ctx context.Context, req RunSSHRequest) (execution.Execu
 func (e *Engine) resolveTargetForSession(ctx context.Context, preResolved ResolvedTarget, targetSpec string, cliOpts option.OptionLayer, explicitOrigin algebraic.Option[option.OriginKind], explicitAuth inventory.AuthMethod) (ResolvedTarget, error) {
 	hasPre, hasSpec := !preResolved.IsZero(), strings.TrimSpace(targetSpec) != ""
 	if hasPre == hasSpec {
-		return zeroVal[ResolvedTarget](), fmt.Errorf("%w: Target 与 TargetSpec 必须二选一", ErrInvalidRequest)
+		return zeroVal[ResolvedTarget](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "Target, TargetSpec"))
 	}
 	if hasPre {
 		if !preResolved.IsValid() || !cliOpts.IsUnset() || explicitOrigin.IsSome() || explicitAuth != nil {
-			return zeroVal[ResolvedTarget](), fmt.Errorf("%w: 预解析 Target 无效或禁止同时指定 CLIOptions/ExplicitOrigin/ExplicitAuth", ErrInvalidRequest)
+			return zeroVal[ResolvedTarget](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Target"))
 		}
 		return preResolved, nil
 	}
@@ -140,11 +140,11 @@ func compileExecCommandPlan(planOpt algebraic.Option[execution.CommandPlan], raw
 		}
 	}
 	if sources != 1 {
-		return zeroCP, fmt.Errorf("%w: CommandPlan、Command 与 CommandArgs 必须三选一", ErrInvalidRequest)
+		return zeroCP, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "CommandPlan, Command, CommandArgs"))
 	}
 	if cp, ok := planOpt.Get(); ok {
 		if !cp.IsValid() {
-			return zeroCP, fmt.Errorf("%w: CommandPlan 无效", ErrInvalidRequest)
+			return zeroCP, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "CommandPlan"))
 		}
 		return cp, nil
 	}
@@ -153,7 +153,7 @@ func compileExecCommandPlan(planOpt algebraic.Option[execution.CommandPlan], raw
 	}
 	cp, err := execution.NewCommandPlan(execution.CommandPlanSpec{Kind: execution.PlanKindCommand, Profile: execution.DefaultServerLaunchProfile(), Command: rawCmd, Timeout: timeout})
 	if err != nil {
-		return zeroCP, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return zeroCP, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	return cp, nil
 }

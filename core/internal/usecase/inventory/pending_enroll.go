@@ -2,8 +2,6 @@ package inventory
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -11,6 +9,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -138,7 +137,7 @@ func (s *Service) WithPendingEnrollment(ctx context.Context, req PendingEnrollme
 	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, "pending enrollment "+req.Node.ID().String())
 	gateReq, err := credential.BuildGateRequest[security.CapMutate](security.CapabilityMutate, toolInventory, "pending_enrollment", req.Node.ID().String(), nil, req.Risk.OrElse(security.RiskModerate), summary, req.Approval, req.OperationStream)
 	if err != nil {
-		return res, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return res, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	var (
 		emitter    *credential.OpEmitter
@@ -178,7 +177,7 @@ func (s *Service) validatePendingEnrollRequest(ctx context.Context, req PendingE
 	case len(req.PinnedRefs) > 0 && s.vault == nil:
 		return ErrVaultUnavailable
 	case !req.Node.IsValid() || req.TTL.IsNegative() || (hasH && !h.IsValid()) || (hasI && !id.IsValid()) || (hasR && !rev.IsValid()):
-		return fmt.Errorf("%w: 首连暂存登记请求参数无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "PendingEnrollmentRequest"))
 	default:
 		return validateExtraPending(req.ExtraPending)
 	}
@@ -189,7 +188,7 @@ func (s *Service) runPendingEnrollmentScope(ctx context.Context, leaseID securit
 		StagedAt: s.clock.Now().UTC().Round(0), TTL: pickIf(req.TTL.IsZero(), s.defaultEnrollTTL, req.TTL),
 	})
 	if err != nil {
-		return res, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return res, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	lease := &PendingEnrollmentLease{svc: s, req: req, state: fsm.NewPendingEnrollState(), emitter: emitter, valid: true}
 	if err = lease.driveNew(ctx, false, func() (fsm.PendingEnrollInput, error) { return fsm.EnrollInputStage(enrollCtx) }); err != nil {
@@ -295,12 +294,12 @@ func (l *PendingEnrollmentLease) convergeUnfinished(ctx context.Context, phase f
 	switch phase {
 	case fsm.PendingEnrollPhaseCommitting:
 		// CommitCAS 期间 panic 绝不可投递 Cancel（FSM 拒绝），须按结果未知转入 Uncertain 并保留钉住。
-		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_commit_panic", errors.New(reason))
+		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_commit_panic", domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
 		return l.driveNew(ctx, true, func() (fsm.PendingEnrollInput, error) {
 			return fsm.EnrollInputCommitResult(fsm.DurabilityOutcomeUnknown, reason)
 		})
 	case fsm.PendingEnrollPhaseCleaningUp:
-		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_cleanup_interrupted", errors.New(reason))
+		l.recordCommitMeta(zeroVal[ports.Revision](), zeroVal[ports.DurabilityOutcome](), "enroll_cleanup_interrupted", domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
 		return l.driveNew(ctx, true, func() (fsm.PendingEnrollInput, error) {
 			return fsm.EnrollInputCleanupResult(fsm.SideEffectOutcomeUnknown, reason)
 		})
@@ -403,7 +402,7 @@ func mergeStagedAsset[T any](items []T, staged algebraic.Option[T], kind string,
 	if idx := slices.IndexFunc(items, func(x T) bool { return sameID(x, val) }); idx < 0 {
 		return append(items, val), nil
 	} else if !equal(items[idx], val) {
-		return nil, fmt.Errorf("%w: %s %q", ErrAssetAlreadyExists, kind, idStr(val))
+		return nil, domi18n.EF(ErrAssetAlreadyExists, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", kind), domi18n.BoundStr("value", idStr(val)))
 	}
 	return items, nil
 }

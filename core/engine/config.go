@@ -3,13 +3,13 @@ package engine
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -117,13 +117,13 @@ type Config struct {
 func compileGuardrailPolicy(cfg GuardrailConfig) (gate.GuardrailPolicy, error) {
 	fb, err := cfg.NoElicitFallback.toGateFallback()
 	if err != nil {
-		return zeroVal[gate.GuardrailPolicy](), wrapCfgErr("NoElicitFallback 无效", err)
+		return zeroVal[gate.GuardrailPolicy](), wrapCfgFieldErr("NoElicitFallback", err)
 	}
 	rules := append(make([]pathalg.ProtectedRule, 0, len(cfg.ProtectedRules)+len(cfg.ProtectedPatterns)), cfg.ProtectedRules...)
 	for _, pat := range cfg.ProtectedPatterns {
 		r, pErr := pathalg.ParseProtectedRule(pat)
 		if pErr != nil {
-			return zeroVal[gate.GuardrailPolicy](), fmt.Errorf("%w: 受保护路径模式 %q 无效: %w", ErrInvalidConfig, pat, pErr)
+			return zeroVal[gate.GuardrailPolicy](), domi18n.WrapS(ErrInvalidConfig, pErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ProtectedPatterns"), domi18n.BoundStr("value", pat))
 		}
 		rules = append(rules, r)
 	}
@@ -132,23 +132,23 @@ func compileGuardrailPolicy(cfg GuardrailConfig) (gate.GuardrailPolicy, error) {
 		ProtectedRules: rules, ProtectedPathRisk: cfg.ProtectedPathRisk, ApprovalTTL: cfg.ApprovalTTL,
 		MaxPendingChallenges: cfg.MaxPendingChallenges, MaxReplayHistory: cfg.MaxReplayHistory,
 	})
-	return pol, wrapCfgErr("护栏策略无效", err)
+	return pol, wrapCfgFieldErr("GuardrailPolicy", err)
 }
 func validateBaseConfig(cfg Config) (gate.PolicyProfileKind, gate.GuardrailPolicy, error) {
 	zeroPol := zeroVal[gate.GuardrailPolicy]()
 	prof, err := cfg.Profile.toGateProfile()
 	if err != nil {
-		return gate.PolicyProfileInvalid, zeroPol, wrapCfgErr("PolicyProfile 无效", err)
+		return gate.PolicyProfileInvalid, zeroPol, wrapCfgFieldErr("PolicyProfile", err)
 	}
 	pol, err := compileGuardrailPolicy(cfg.Guardrail)
 	if err != nil {
 		return gate.PolicyProfileInvalid, zeroPol, err
 	}
 	if cfg.Clock == nil || cfg.Entropy == nil || cfg.AuditSink == nil {
-		return gate.PolicyProfileInvalid, zeroPol, fmt.Errorf("%w: Clock/Entropy/AuditSink 均不能为 nil", ErrInvalidConfig)
+		return gate.PolicyProfileInvalid, zeroPol, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Clock/Entropy/AuditSink"))
 	}
 	if (cfg.SystemBus != nil && cfg.SystemBus.IsClosed()) || cfg.SystemBusBuffer < 0 {
-		return gate.PolicyProfileInvalid, zeroPol, fmt.Errorf("%w: SystemBus 已关闭或 SystemBusBuffer 为负", ErrInvalidConfig)
+		return gate.PolicyProfileInvalid, zeroPol, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SystemBus/SystemBusBuffer"))
 	}
 	return prof, pol, nil
 }
@@ -209,7 +209,7 @@ func buildHostTrustPort(cfg Config) (*hostTrustObserver, error) {
 		return newHostTrustObserver(cfg.HostTrust), nil
 	}
 	if cfg.ScopedFS == nil {
-		return nil, fmt.Errorf("%w: 未注入 HostTrust 时必须提供 ScopedFS", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ScopedFS"))
 	}
 	homeOpt, khDir, err := resolveHostTrustDirs(cfg)
 	if err != nil {
@@ -220,32 +220,32 @@ func buildHostTrustPort(cfg Config) (*hostTrustObserver, error) {
 		MaxFileBytes: cfg.KnownHostsMaxBytes, SSHFPLookup: cfg.SSHFPLookup, HashHostnames: cfg.HashKnownHosts,
 		Entropy: cfg.Entropy, Clock: cfg.Clock,
 	})
-	return validOrZero(err == nil, newHostTrustObserver(db)), wrapCfgErr("初始化 KnownHostsDB 失败", err)
+	return validOrZero(err == nil, newHostTrustObserver(db)), wrapInitErr("KnownHostsDB", err)
 }
 func resolveHostTrustDirs(cfg Config) (homeOpt algebraic.Option[pathalg.LocalDir], khDir pathalg.LocalDir, err error) {
 	if home, ok := cfg.HomeDir.Get(); ok {
 		if !home.IsValid() {
-			return homeOpt, khDir, fmt.Errorf("%w: HomeDir 无效", ErrInvalidConfig)
+			return homeOpt, khDir, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "HomeDir"))
 		}
 		homeOpt = algebraic.Some(home)
 	} else if cfg.Env != nil {
 		if id, lErr := cfg.Env.LookupLocalIdentity(); lErr == nil && id.IsValid() && id.HomeDir() != "" {
 			parsed, pErr := pathalg.ParseLocalDir(id.HomeDir())
 			if pErr != nil {
-				return homeOpt, khDir, wrapCfgErr("Env.LookupLocalIdentity.HomeDir 无效", pErr)
+				return homeOpt, khDir, wrapCfgFieldErr("Env.LookupLocalIdentity.HomeDir", pErr)
 			}
 			homeOpt = algebraic.Some(parsed)
 		}
 	}
 	if dir, ok := cfg.KnownHostsDir.Get(); ok {
-		return homeOpt, dir, validOrZero(!dir.IsValid(), fmt.Errorf("%w: KnownHostsDir 无效", ErrInvalidConfig))
+		return homeOpt, dir, validOrZero(!dir.IsValid(), domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "KnownHostsDir")))
 	}
 	home, ok := homeOpt.Get()
 	if !ok {
-		return homeOpt, khDir, fmt.Errorf("%w: 缺少 KnownHostsDir 且无法从 HomeDir/Env 推导默认 ~/.ssh 目录", ErrInvalidConfig)
+		return homeOpt, khDir, domi18n.EF(ErrInvalidConfig, domi18n.KeyEngineKHDirMissing)
 	}
 	sshDir, jErr := home.JoinComponent(".ssh")
-	return homeOpt, sshDir, wrapCfgErr("推导 ~/.ssh 目录失败", jErr)
+	return homeOpt, sshDir, wrapCfgFieldErr("~/.ssh", jErr)
 }
 
 type resolvedPorts struct {
@@ -263,7 +263,7 @@ func resolveDefaultKeySigner(cfg Config) (ports.KeySignerPort, error) {
 	ks, err := dial.NewKeySigner(dial.KeySignerConfig{
 		ReadFS: cfg.OperatorReadFS, Vault: cfg.Vault, Agent: cfg.Agent, Env: cfg.Env, Entropy: cfg.Entropy,
 	})
-	return ks, wrapCfgErr("初始化 sshnet/dial/keysigner 失败", err)
+	return ks, wrapInitErr("sshnet/dial/keysigner", err)
 }
 
 // resolveDefaultPorts 为未显式注入的可选协议端口装配真实 sshnet/* 生产默认实现；
@@ -275,13 +275,13 @@ func resolveDefaultPorts(cfg Config, activity *muxActivityHub) (rp resolvedPorts
 	rp.escalator = cfg.PrivilegeEscalation
 	if rp.escalator == nil {
 		if rp.escalator, err = priv.NewEscalator(priv.Config{Entropy: cfg.Entropy, Clock: cfg.Clock}); err != nil {
-			return resolvedPorts{}, wrapCfgErr("初始化 sshnet/priv 失败", err)
+			return resolvedPorts{}, wrapInitErr("sshnet/priv", err)
 		}
 	}
 	rp.shellProbe = cfg.ShellProbe
 	if rp.shellProbe == nil {
 		if rp.shellProbe, err = probe.NewProber(probe.Config{}); err != nil {
-			return resolvedPorts{}, wrapCfgErr("初始化 sshnet/probe 失败", err)
+			return resolvedPorts{}, wrapInitErr("sshnet/probe", err)
 		}
 	}
 	rp.forwarder = cfg.Forwarder
@@ -386,12 +386,12 @@ func buildRealDialer(cfg Config, hostTrust ports.HostTrustPort, keySigner ports.
 		Clock: cfg.Clock, Env: cfg.Env, DialContext: dial.DialContextFunc(cfg.DialContext),
 		OpenRemoteFS: sftp.Open, ClientVersion: cfg.ClientVersion,
 	})
-	return d, wrapCfgErr("初始化 sshnet/dial 失败", err)
+	return d, wrapInitErr("sshnet/dial", err)
 }
 func optPosStdDuration(opt algebraic.Option[algebraic.Duration], name string) (time.Duration, error) {
 	if d, ok := opt.Get(); ok {
 		if !d.IsPositive() {
-			return 0, fmt.Errorf("%w: %s 必须为正时长", ErrInvalidConfig, name)
+			return 0, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldPositive, domi18n.Str("field", name))
 		}
 		return d.Std(), nil
 	}

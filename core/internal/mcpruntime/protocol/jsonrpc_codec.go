@@ -5,11 +5,11 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // JSON-RPC 2.0 规范版本及标准/XOps 应用层错误码定义。
@@ -53,7 +53,7 @@ type RequestID struct {
 // StringRequestID 构造字符串形态的不可变 JSON-RPC RequestID。
 func StringRequestID(v string) (RequestID, error) {
 	if v == "" {
-		return RequestID{}, fmt.Errorf("%w: 字符串 id 不能为空", ErrInvalidRequestID)
+		return RequestID{}, domi18n.EF(ErrInvalidRequestID, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "id"))
 	}
 	return RequestID{kind: requestIDString, strVal: v, valid: true}, nil
 }
@@ -126,7 +126,7 @@ func (id *RequestID) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	*id = RequestID{}
 	tok, err := dec.ReadToken()
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidRequestID, err)
+		return domi18n.WrapSentinel(ErrInvalidRequestID, err)
 	}
 	switch tok.Kind() {
 	case '"':
@@ -139,16 +139,16 @@ func (id *RequestID) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	case '0':
 		raw := tok.String()
 		if strings.ContainsAny(raw, ".eE") {
-			return fmt.Errorf("%w: 数值 id 必须为精确整数而非浮点 %q", ErrInvalidRequestID, raw)
+			return domi18n.EF(ErrInvalidRequestID, domi18n.KeyMCPProtoIDType)
 		}
 		n, nErr := strconv.ParseInt(raw, 10, 64)
 		if nErr != nil {
-			return fmt.Errorf("%w: 整数 id 越界 %q: %w", ErrInvalidRequestID, raw, nErr)
+			return domi18n.WrapS(ErrInvalidRequestID, nErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "id"), domi18n.BoundStr("value", raw))
 		}
 		*id = IntRequestID(n)
 		return nil
 	default:
-		return fmt.Errorf("%w: 仅接受字符串或整数 id", ErrInvalidRequestID)
+		return domi18n.EF(ErrInvalidRequestID, domi18n.KeyMCPProtoIDType)
 	}
 }
 
@@ -166,13 +166,13 @@ func (r Request) IsNotification() bool { return !r.ID.IsSome() }
 // Validate 严格校验 JSON-RPC 2.0 版本、非空方法名与可选 ID 合法性。
 func (r Request) Validate() error {
 	if r.JSONRPC != JSONRPCVersion {
-		return fmt.Errorf("%w: jsonrpc 版本必须为 %q，实际=%q", ErrInvalidJSONRPC, JSONRPCVersion, r.JSONRPC)
+		return domi18n.EF(ErrInvalidJSONRPC, domi18n.KeyCommonMismatch, domi18n.Str("field", "jsonrpc"), domi18n.Str("expected", JSONRPCVersion), domi18n.BoundStr("actual", r.JSONRPC))
 	}
 	if strings.TrimSpace(r.Method) == "" {
-		return fmt.Errorf("%w: method 不能为空", ErrInvalidJSONRPC)
+		return domi18n.EF(ErrInvalidJSONRPC, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "method"))
 	}
 	if id, ok := r.ID.Get(); ok && !id.IsValid() {
-		return fmt.Errorf("%w: id 无效", ErrInvalidJSONRPC)
+		return domi18n.EF(ErrInvalidJSONRPC, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "id"))
 	}
 	return nil
 }
@@ -182,14 +182,14 @@ func (r Request) Validate() error {
 func DecodeRequest(raw []byte) (Request, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return Request{}, fmt.Errorf("%w: 空报文", ErrParseJSON)
+		return Request{}, domi18n.EF(ErrParseJSON, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "payload"))
 	}
 	var req Request
 	if err := jsonv2.Unmarshal(trimmed, &req, jsonv2.RejectUnknownMembers(true)); err != nil {
 		if _, isSyntax := errors.AsType[*jsontext.SyntacticError](err); isSyntax {
-			return Request{}, fmt.Errorf("%w: %w", ErrParseJSON, err)
+			return Request{}, domi18n.WrapSentinel(ErrParseJSON, err)
 		}
-		return Request{}, fmt.Errorf("%w: %w", ErrInvalidJSONRPC, err)
+		return Request{}, domi18n.WrapSentinel(ErrInvalidJSONRPC, err)
 	}
 	if err := req.Validate(); err != nil {
 		return Request{}, err
@@ -266,10 +266,10 @@ func MarshalCanonical(v any) ([]byte, error) {
 func UnmarshalStrict(raw []byte, dst any) error {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
-		return fmt.Errorf("%w: JSON 载荷不能为空", ErrInvalidParams)
+		return domi18n.EF(ErrInvalidParams, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "payload"))
 	}
 	if err := jsonv2.Unmarshal(trimmed, dst, jsonv2.RejectUnknownMembers(true)); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidParams, err)
+		return domi18n.WrapSentinel(ErrInvalidParams, err)
 	}
 	return nil
 }
@@ -281,7 +281,7 @@ func NewResultResponse(id RequestID, result any) (Response, error) {
 	}
 	raw, err := MarshalCanonical(result)
 	if err != nil {
-		return Response{}, fmt.Errorf("编码 JSON-RPC result 失败: %w", err)
+		return Response{}, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal JSON-RPC result"))
 	}
 	return Response{
 		JSONRPC: JSONRPCVersion,
@@ -299,7 +299,7 @@ func NewErrorResponse(id algebraic.Option[RequestID], code int, msg string, data
 	if data != nil {
 		encoded, err := MarshalCanonical(data)
 		if err != nil {
-			return Response{}, fmt.Errorf("编码 JSON-RPC error.data 失败: %w", err)
+			return Response{}, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "marshal JSON-RPC error.data"))
 		}
 		rawData = jsontext.Value(encoded)
 	}

@@ -3,12 +3,12 @@ package tools
 import (
 	"context"
 	"encoding/json/jsontext"
-	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -46,7 +46,7 @@ type transferArgs struct {
 
 func (r *Registry) callTransfer(ctx context.Context, rawArgs jsontext.Value) (protocol.CallToolResult, error) {
 	if r.transfer == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: TransferService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "TransferService"))
 	}
 	args, err := decodeToolArgs[transferArgs](rawArgs)
 	if err != nil {
@@ -77,14 +77,14 @@ func (r *Registry) callTransfer(ctx context.Context, rawArgs jsontext.Value) (pr
 	case "inspect":
 		return r.transferInspect(ctx, base, args)
 	default:
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 未知 transfer action %q", protocol.ErrInvalidParams, args.Action)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "transfer action"), domi18n.BoundStr("value", args.Action))
 	}
 }
 
 func (r *Registry) transferStart(ctx context.Context, base uctrans.CallBase, args transferArgs) (protocol.CallToolResult, error) {
 	dir, err := fsm.ParseTransferDirection(args.Direction)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: direction 须为 upload 或 download: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "direction"))
 	}
 	dest, sessOpts, err := r.buildTransferDestAndOpts(dir, args)
 	if err != nil {
@@ -127,11 +127,11 @@ func (r *Registry) buildTransferDestAndOpts(dir fsm.TransferDirection, args tran
 	}
 	localRoot, okRoot := r.transferRoot.Get()
 	if !okRoot || !localRoot.IsValid() {
-		return zeroDest, uctrans.TransferSessionOptions{}, fmt.Errorf("%w: 下载流式传输需要服务端配置沙箱 TransferRoot", uctrans.ErrScopedFSUnavailable)
+		return zeroDest, uctrans.TransferSessionOptions{}, domi18n.EF(uctrans.ErrScopedFSUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "TransferRoot"))
 	}
 	localDest, lErr := pathalg.ParseLocalRootedDest(args.LocalDest)
 	if lErr != nil {
-		return zeroDest, uctrans.TransferSessionOptions{}, fmt.Errorf("%w: local_dest 必须为沙箱相对路径: %w", protocol.ErrInvalidParams, lErr)
+		return zeroDest, uctrans.TransferSessionOptions{}, domi18n.WrapS(protocol.ErrInvalidParams, lErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local_dest"))
 	}
 	dest, dErr := fsm.NewDownloadDest(localDest)
 	if dErr != nil {
@@ -174,7 +174,7 @@ func (r *Registry) recordAndEncodeTransferHandle(base uctrans.CallBase, info uct
 func (r *Registry) resolveTransferHandle(args transferArgs) (plan.ManagedHandle[plan.KindTransfer], error) {
 	if h, ok := args.Handle.Get(); ok {
 		if !h.IsValid() {
-			return zeroVal[plan.ManagedHandle[plan.KindTransfer]](), fmt.Errorf("%w: handle 无效", protocol.ErrInvalidParams)
+			return zeroVal[plan.ManagedHandle[plan.KindTransfer]](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "handle"))
 		}
 		return h, nil
 	}
@@ -192,7 +192,7 @@ func (r *Registry) resolveTransferHandle(args transferArgs) (plan.ManagedHandle[
 			}
 		}
 	}
-	return zeroVal[plan.ManagedHandle[plan.KindTransfer]](), fmt.Errorf("%w: 未找到对应的传输受管句柄", ErrHandleNotFound)
+	return zeroVal[plan.ManagedHandle[plan.KindTransfer]](), ErrHandleNotFound
 }
 
 func (r *Registry) transferChunk(ctx context.Context, base uctrans.CallBase, args transferArgs) (protocol.CallToolResult, error) {
@@ -285,7 +285,7 @@ func (r *Registry) dropTransferByHandle(h plan.ManagedHandle[plan.KindTransfer])
 func (r *Registry) transferResume(ctx context.Context, base uctrans.CallBase, args transferArgs) (protocol.CallToolResult, error) {
 	tid, err := security.ParseOperationID(args.TransferID)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "transfer_id"))
 	}
 	permOpt, err := parseOptionalPerm(args.Perm)
 	if err != nil {
@@ -315,7 +315,7 @@ func (r *Registry) transferResume(ctx context.Context, base uctrans.CallBase, ar
 func (r *Registry) transferRecoverOne(ctx context.Context, base uctrans.CallBase, args transferArgs) (protocol.CallToolResult, error) {
 	tid, err := security.ParseOperationID(args.TransferID)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "transfer_id"))
 	}
 	res, err := r.transfer.RecoverTransfer(ctx, uctrans.RecoverTransferRequest{
 		CallBase: base, TransferID: tid, PruneSuperseded: args.PruneSuperseded, LocalRootForClean: r.transferRoot,
@@ -349,13 +349,13 @@ func (r *Registry) transferRecoverAll(ctx context.Context, args transferArgs) (p
 		Parameters: map[string]string{"prune_superseded": strconv.FormatBool(args.PruneSuperseded)},
 	})
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	gReq, err := gate.NewGateRequest[security.CapTransfer](gate.GateRequestSpec[security.CapTransfer]{
 		Binding: binding, Risk: effRisk, ScopeSummary: summary, Approval: approval,
 	})
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	var res uctrans.RecoverAllResult
 	if err := gate.WithAuthorized[security.CapTransfer](ctx, r.gate, gReq, func(authCtx context.Context, _ gate.Authorized[security.CapTransfer]) error {
@@ -428,7 +428,7 @@ func (r *Registry) resolveTransferInspectID(args transferArgs) (security.Operati
 	if rawID := strings.TrimSpace(args.TransferID); rawID != "" {
 		tid, err := security.ParseOperationID(rawID)
 		if err != nil {
-			return zeroID, algebraic.None[plan.ManagedHandle[plan.KindTransfer]](), fmt.Errorf("%w: transfer_id 无效: %w", protocol.ErrInvalidParams, err)
+			return zeroID, algebraic.None[plan.ManagedHandle[plan.KindTransfer]](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "transfer_id"))
 		}
 		return tid, args.Handle, nil
 	}
@@ -448,7 +448,7 @@ func (r *Registry) resolveTransferInspectID(args transferArgs) (security.Operati
 			return b.transferID, hOpt, nil
 		}
 	}
-	return zeroID, algebraic.None[plan.ManagedHandle[plan.KindTransfer]](), fmt.Errorf("%w: 缺少有效 transfer_id 或已登记 handle_token", protocol.ErrInvalidParams)
+	return zeroID, algebraic.None[plan.ManagedHandle[plan.KindTransfer]](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "transfer_id, handle_token"))
 }
 
 func transferRecoveryDTO(res uctrans.TransferRecoveryResult) any {

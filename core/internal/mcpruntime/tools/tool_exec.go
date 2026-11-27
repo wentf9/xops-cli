@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -72,13 +72,13 @@ func (r *Registry) callTerminalExec(ctx context.Context, rawArgs jsontext.Value)
 	case "run_playbook":
 		return r.execPlaybook(ctx, args, risk, approval)
 	default:
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 未知 terminal_exec action %q", protocol.ErrInvalidParams, args.Action)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "terminal_exec action"), domi18n.BoundStr("value", args.Action))
 	}
 }
 
 func compileMCPCommandPlan(args terminalExecArgs) (execution.CommandPlan, error) {
 	if strings.TrimSpace(args.Command) == "" {
-		return zeroVal[execution.CommandPlan](), fmt.Errorf("%w: command 不能为空", protocol.ErrInvalidParams)
+		return zeroVal[execution.CommandPlan](), domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "command"))
 	}
 	var wdOpt algebraic.Option[pathalg.RemotePath]
 	if args.WorkDir != "" {
@@ -103,14 +103,14 @@ func compileMCPCommandPlan(args terminalExecArgs) (execution.CommandPlan, error)
 		PTY:            args.PTY,
 	})
 	if err != nil {
-		return zeroVal[execution.CommandPlan](), fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return zeroVal[execution.CommandPlan](), domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	return cp, nil
 }
 
 func (r *Registry) execSingle(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.session == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SessionService"))
 	}
 	resolved, err := r.resolveTarget(ctx, args.Target, option.UnsetOptionLayer())
 	if err != nil {
@@ -158,16 +158,16 @@ func (r *Registry) checkExecOutcomeError(out execution.ExecutionOutcome, execErr
 	}
 	if unk, ok := out.(*execution.OutcomeUnknown); ok && unk != nil && unk.IsValid() {
 		if execErr != nil {
-			return fmt.Errorf("%w (%s): %w", protocol.ErrOutcomeUnknown, unk.Code(), execErr)
+			return domi18n.WrapS(protocol.ErrOutcomeUnknown, execErr, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", unk.Code()))
 		}
-		return fmt.Errorf("%w (%s): %s", protocol.ErrOutcomeUnknown, unk.Code(), unk.Reason())
+		return domi18n.EF(protocol.ErrOutcomeUnknown, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", unk.Code()+": "+unk.Reason()))
 	}
 	return execErr
 }
 
 func (r *Registry) execPrivileged(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.session == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SessionService"))
 	}
 	resolved, err := r.resolveTarget(ctx, args.Target, option.UnsetOptionLayer())
 	if err != nil {
@@ -194,7 +194,7 @@ func buildPrivilegeReq(args terminalExecArgs) (ports.PrivilegeRequest, algebraic
 	zeroReq, zeroRef := zeroVal[ports.PrivilegeRequest](), algebraic.None[secret.Ref]()
 	method, ok := args.PrivilegeMethod.Get()
 	if !ok || !method.IsValid() {
-		return zeroReq, zeroRef, fmt.Errorf("%w: privilege_method 必填且须为 sudo/su/doas", protocol.ErrInvalidParams)
+		return zeroReq, zeroRef, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "privilege_method"))
 	}
 	cp, err := compileMCPCommandPlan(args)
 	if err != nil {
@@ -204,7 +204,7 @@ func buildPrivilegeReq(args terminalExecArgs) (ports.PrivilegeRequest, algebraic
 	if args.TargetUser != "" {
 		u, uErr := option.ParseUsername(args.TargetUser)
 		if uErr != nil {
-			return zeroReq, zeroRef, fmt.Errorf("%w: target_user 非法: %w", protocol.ErrInvalidParams, uErr)
+			return zeroReq, zeroRef, domi18n.WrapS(protocol.ErrInvalidParams, uErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "target_user"))
 		}
 		targetUser = algebraic.Some(u)
 	}
@@ -212,7 +212,7 @@ func buildPrivilegeReq(args terminalExecArgs) (ports.PrivilegeRequest, algebraic
 	if args.PasswordRef != "" {
 		ref, rErr := secret.ParseRef(args.PasswordRef)
 		if rErr != nil {
-			return zeroReq, zeroRef, fmt.Errorf("%w: password_ref 非法: %w", protocol.ErrInvalidParams, rErr)
+			return zeroReq, zeroRef, domi18n.WrapS(protocol.ErrInvalidParams, rErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "password_ref"))
 		}
 		pwRef = algebraic.Some(ref)
 	}
@@ -220,14 +220,14 @@ func buildPrivilegeReq(args terminalExecArgs) (ports.PrivilegeRequest, algebraic
 		Method: method, Command: cp, TargetUser: targetUser, NonInteractive: args.NonInteractive, Timeout: args.Timeout,
 	})
 	if err != nil {
-		return zeroReq, zeroRef, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return zeroReq, zeroRef, domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	return privReq, pwRef, nil
 }
 
 func (r *Registry) execProbeShell(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.session == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SessionService"))
 	}
 	resolved, err := r.resolveTarget(ctx, args.Target, option.UnsetOptionLayer())
 	if err != nil {
@@ -257,13 +257,13 @@ func (r *Registry) resolveTargetNodes(ctx context.Context, targets []string) ([]
 		}
 		nid, nErr := SynthesizeTargetNodeID(resolved.NodeID(), resolved.OriginKind(), resolved.Plan())
 		if nErr != nil {
-			return nil, fmt.Errorf("%w: 目标节点标识 %q 非法: %w", protocol.ErrInvalidParams, resolved.NodeID(), nErr)
+			return nil, domi18n.WrapS(protocol.ErrInvalidParams, nErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "node_id"), domi18n.BoundStr("value", resolved.NodeID()))
 		}
 		tn, tErr := ucauto.NewTargetNode(ucauto.TargetNodeSpec{
 			NodeID: nid, Plan: resolved.Plan(), Tags: resolved.Tags(), DefaultProfile: resolved.DefaultProfile(),
 		})
 		if tErr != nil {
-			return nil, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, tErr)
+			return nil, domi18n.WrapSentinel(protocol.ErrInvalidParams, tErr)
 		}
 		out = append(out, tn)
 	}
@@ -272,10 +272,10 @@ func (r *Registry) resolveTargetNodes(ctx context.Context, targets []string) ([]
 
 func (r *Registry) execBatch(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.automation == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: AutomationService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "AutomationService"))
 	}
 	if args.Stdin != "" {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: batch_exec 不支持 stdin 参数", protocol.ErrInvalidParams)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "batch_exec stdin"))
 	}
 	cp, err := compileMCPCommandPlan(args)
 	if err != nil {
@@ -298,11 +298,11 @@ func (r *Registry) execBatch(ctx context.Context, args terminalExecArgs, risk al
 
 func (r *Registry) execPlaybook(ctx context.Context, args terminalExecArgs, risk algebraic.Option[security.RiskLevel], approval algebraic.Option[gate.ApprovalSubmission]) (protocol.CallToolResult, error) {
 	if r.automation == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: AutomationService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "AutomationService"))
 	}
 	pb, ok := args.Playbook.Get()
 	if !ok || !pb.IsValid() {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 缺少有效的 playbook 对象", protocol.ErrInvalidParams)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "playbook"))
 	}
 	nodes, err := r.resolveTargetNodes(ctx, args.Targets)
 	if err != nil {

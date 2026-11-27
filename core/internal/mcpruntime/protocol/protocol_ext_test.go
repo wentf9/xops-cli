@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"go.uber.org/goleak"
 
@@ -137,6 +138,11 @@ func assertToolSchemaValid(t *testing.T, d protocol.ToolDescriptor, wantName str
 	t.Helper()
 	if d.Name != wantName || strings.TrimSpace(d.Description) == "" {
 		t.Fatalf("工具名称或描述异常: got=%q want=%q", d.Name, wantName)
+	}
+	for _, r := range d.Description + string(d.InputSchema) {
+		if unicode.Is(unicode.Han, r) || (r >= 0x3000 && r <= 0x303F) || (r >= 0xFF00 && r <= 0xFFEF) {
+			t.Fatalf("MCP 工具 %q 描述或 Schema 必须为纯英文机器契约，禁止出现汉字/全角标点 %q: desc=%q", d.Name, r, d.Description)
+		}
 	}
 	var schemaObj map[string]any
 	if err := jsonv2.Unmarshal(d.InputSchema, &schemaObj); err != nil {

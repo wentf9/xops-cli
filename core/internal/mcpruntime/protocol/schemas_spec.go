@@ -2,7 +2,8 @@ package protocol
 
 import (
 	"encoding/json/jsontext"
-	"fmt"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // 7 个强类型判别式 MCP 工具名称常量（对应 RFC §4.2 / Plan P3-T5）。
@@ -276,19 +277,19 @@ type rawToolSchema struct {
 // ToolDescriptors 返回全部 7 个强类型判别式 MCP 工具的标准描述符与规范化 JSON Schema（零可变全局状态）。
 func ToolDescriptors() ([]ToolDescriptor, error) {
 	specs := []rawToolSchema{
-		{ToolNameNodes, "资产查询、CAS CRUD、Tarjan DAG 校验、只读诊断、目标解析与统一导入。", schemaNodes},
-		{ToolNameTerminalExec, "受能力门控的远端单次执行、提权执行、两阶段 Shell 探测、并发批量执行与 Playbook vNext 运行。", schemaTerminalExec},
-		{ToolNameTerminalSession, "跨请求持久 PTY 受管会话生命周期管理（open/read/write/resize/signal/inspect/close）。", schemaTerminalSession},
-		{ToolNameFile, "远端 SFTP 原子文件读写、FSTAT 锚定补丁、重命名、目录列表与工作区变更（0 OperatorReadFS）。", schemaFile},
-		{ToolNameTransfer, "最高 10 GiB 可恢复流式传输控制面（start/chunk/pull/commit/abort/resume/recover/inspect）与 HTTP 流端点绑定。", schemaTransfer},
-		{ToolNameTunnel, "SSH 端口转发（-L/-R/-D/StreamLocal/TUN）与 ControlMaster 多路复用受管会话控制。", schemaTunnel},
-		{ToolNameGUI, "POSIX 强校验远端 GUI 动作、纯 Go 防炸弹截图压缩与受管 X11/VNC 隧道会话（0 OperatorReadFS）。", schemaGUI},
+		{ToolNameNodes, "Inventory query, CAS CRUD, Tarjan DAG validation, read-only doctor, target resolution, and unified import.", schemaNodes},
+		{ToolNameTerminalExec, "Gate-authorized remote one-shot execution, privilege escalation, two-phase shell probing, concurrent batch execution, and Playbook vNext runs.", schemaTerminalExec},
+		{ToolNameTerminalSession, "Managed persistent PTY session lifecycle across requests (open/read/write/resize/signal/inspect/close).", schemaTerminalSession},
+		{ToolNameFile, "Remote SFTP atomic file read/write, FSTAT-anchored patch, rename, directory listing, and workspace mutations (zero OperatorReadFS).", schemaFile},
+		{ToolNameTransfer, "Resumable streaming transfer control plane up to 10 GiB (start/chunk/pull/commit/abort/resume/recover/inspect) with HTTP streaming bindings.", schemaTransfer},
+		{ToolNameTunnel, "SSH port forwarding (-L/-R/-D/StreamLocal/TUN) and managed ControlMaster multiplexing control.", schemaTunnel},
+		{ToolNameGUI, "POSIX-validated remote GUI actions, pure-Go bomb-safe screenshot compression, and managed X11/VNC tunnel sessions (zero OperatorReadFS).", schemaGUI},
 	}
 	out := make([]ToolDescriptor, 0, len(specs))
 	for _, sp := range specs {
 		val := jsontext.Value(sp.raw)
 		if err := val.Canonicalize(); err != nil {
-			return nil, fmt.Errorf("%w: 工具 %s Schema 非法: %w", ErrInvalidSchema, sp.name, err)
+			return nil, domi18n.WrapS(ErrInvalidSchema, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "canonicalize tool schema"), domi18n.BoundStr("target", sp.name))
 		}
 		out = append(out, ToolDescriptor{
 			Name:        sp.name,

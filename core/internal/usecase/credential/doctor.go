@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -53,7 +54,7 @@ func (s DoctorSeverity) String() string {
 // AppendText 实现 encoding.TextAppender（值接收者），零值失败关闭。
 func (s DoctorSeverity) AppendText(b []byte) ([]byte, error) {
 	if !s.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 DoctorSeverity=%d", ErrInvalidRequest, uint8(s))
+		return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "DoctorSeverity"), domi18n.Uint64("value", uint64(s)))
 	}
 	return append(b, s.String()...), nil
 }
@@ -68,7 +69,7 @@ func ParseDoctorSeverity(raw string) (DoctorSeverity, error) {
 	case "error":
 		return DoctorSeverityError, nil
 	default:
-		return DoctorSeverityInvalid, fmt.Errorf("%w: 无效 DoctorSeverity %q", ErrInvalidRequest, raw)
+		return DoctorSeverityInvalid, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "DoctorSeverity"), domi18n.BoundStr("value", raw))
 	}
 }
 
@@ -78,7 +79,7 @@ func (s DoctorSeverity) MarshalText() ([]byte, error) { return s.AppendText(nil)
 // UnmarshalText 实现 encoding.TextUnmarshaler；非法文本时失败关闭将接收者归零为 DoctorSeverityInvalid。
 func (s *DoctorSeverity) UnmarshalText(text []byte) error {
 	if s == nil {
-		return fmt.Errorf("%w: DoctorSeverity 接收者不能为 nil", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNil, domi18n.Str("field", "DoctorSeverity receiver"))
 	}
 	parsed, err := ParseDoctorSeverity(string(text))
 	if err != nil {
@@ -132,7 +133,7 @@ func (s *Service) Doctor(ctx context.Context, req DoctorRequest) (DoctorReport, 
 	}
 	gateReq, err := buildInspectGateRequest("vault_doctor", "", nil, req.Risk.OrElse(security.RiskSafe), "credential doctor", req.Approval, req.OperationStream)
 	if err != nil {
-		return DoctorReport{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return DoctorReport{}, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	var rep DoctorReport
 	err = gate.WithAuthorized[security.CapInspect](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
@@ -174,7 +175,7 @@ func InspectVaultAndSecrets(ctx context.Context, spec VaultSecretCheckSpec) Vaul
 		return res
 	}
 	if spec.Vault == nil {
-		appendVaultFinding(&res, DoctorSeverityWarn, "vault_unavailable", "", "未配置 SecretVault，无法执行凭据只读探活")
+		appendVaultFinding(&res, DoctorSeverityWarn, "vault_unavailable", "", "SecretVault is not configured; skipping read-only secret probe")
 		return res
 	}
 	if vState.unlocked {
@@ -217,7 +218,7 @@ func checkVaultControlStatus(ctx context.Context, ctrl ports.VaultControlPort, h
 	}
 	st, err := ctrl.Status(ctx)
 	if err != nil {
-		appendVaultFinding(res, DoctorSeverityError, "vault_status_failed", "", "查询凭据库状态失败: "+err.Error())
+		appendVaultFinding(res, DoctorSeverityError, "vault_status_failed", "", "failed to query vault status: "+err.Error())
 		return vaultDoctorState{}
 	}
 	res.VaultStatus = algebraic.Some(st)
@@ -225,13 +226,13 @@ func checkVaultControlStatus(ctx context.Context, ctrl ports.VaultControlPort, h
 	case ports.VaultStateUnlocked:
 		return vaultDoctorState{knownStores: st.KnownStores(), unlocked: true}
 	case ports.VaultStateLocked:
-		appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", "", "凭据库处于锁定状态，跳过凭据条目只读探活")
+		appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", "", "vault is locked; skipping read-only secret probe")
 		return vaultDoctorState{knownStores: st.KnownStores()}
 	case ports.VaultStateUninitialized:
-		appendVaultFinding(res, DoctorSeverityWarn, "vault_uninitialized", "", "凭据库尚未初始化")
+		appendVaultFinding(res, DoctorSeverityWarn, "vault_uninitialized", "", "vault is not initialized")
 		return vaultDoctorState{knownStores: st.KnownStores()}
 	default:
-		appendVaultFinding(res, DoctorSeverityError, "vault_state_invalid", "", "凭据库返回无效状态")
+		appendVaultFinding(res, DoctorSeverityError, "vault_state_invalid", "", "vault returned invalid state")
 		return vaultDoctorState{}
 	}
 }
@@ -246,7 +247,7 @@ func (s *Service) doctorLoadGraphRefs(
 	}
 	snap, err := s.store.Load(ctx)
 	if err != nil {
-		addDoctorFinding(rep, DoctorSeverityError, "store_load_failed", "", "加载资产图失败: "+err.Error())
+		addDoctorFinding(rep, DoctorSeverityError, "store_load_failed", "", "failed to load inventory graph: "+err.Error())
 		// 存储加载失败时仍保留活跃 Pending 凭据引用参与后续存储白名单与只读探活诊断。
 		return pendingToSecretRefs(pending), nil
 	}
@@ -271,7 +272,7 @@ func checkUnknownSecretStores(allRefs []inventory.SecretReference, knownStores [
 	for _, sr := range allRefs {
 		if !slices.Contains(knownStores, sr.Ref.Store()) {
 			appendVaultFinding(res, DoctorSeverityError, "unknown_secret_store", sr.Ref.String(),
-				fmt.Sprintf("%s (%s) 引用了未注册凭据存储 %q", sr.OwnerID, sr.Location, sr.Ref.Store()))
+				fmt.Sprintf("%s (%s) references unregistered secret store %q", sr.OwnerID, sr.Location, sr.Ref.Store()))
 		}
 	}
 }
@@ -287,11 +288,11 @@ func probeDistinctSecrets(ctx context.Context, vault ports.SecretVault, distinct
 		switch {
 		case err == nil:
 		case errors.Is(err, ports.ErrSecretNotFound):
-			appendVaultFinding(res, DoctorSeverityError, "secret_not_found", ref.String(), "凭据库中缺少被引用的凭据条目")
+			appendVaultFinding(res, DoctorSeverityError, "secret_not_found", ref.String(), "referenced secret entry is missing from vault")
 		case errors.Is(err, ports.ErrVaultLocked):
-			appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", ref.String(), "凭据库已锁定，无法探活条目")
+			appendVaultFinding(res, DoctorSeverityWarn, "vault_locked", ref.String(), "vault is locked; unable to probe secret entry")
 		default:
-			appendVaultFinding(res, DoctorSeverityError, "secret_probe_failed", ref.String(), "凭据只读探活失败: "+err.Error())
+			appendVaultFinding(res, DoctorSeverityError, "secret_probe_failed", ref.String(), "read-only secret probe failed: "+err.Error())
 		}
 	}
 }

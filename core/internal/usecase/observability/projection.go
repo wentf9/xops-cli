@@ -11,6 +11,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/events"
 )
 
@@ -76,7 +77,7 @@ func NewProjection(ctx context.Context, cfg ProjectionConfig) (*Projection, erro
 		return nil, ErrNilContext
 	}
 	if cfg.SystemBus != nil && cfg.SystemBus.IsClosed() {
-		return nil, fmt.Errorf("%w: SystemBus 未初始化或已关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "SystemBus"))
 	}
 	busBuf, maxLogs, maxDiags, maxPool, maxOps, maxMet, err := normalizeProjectionCaps(cfg)
 	if err != nil {
@@ -112,7 +113,7 @@ func normalizeProjectionCaps(cfg ProjectionConfig) (busBuf, maxLogs, maxDiags, m
 	maxPool, maxOps, maxMet = pickIf(cfg.MaxPoolEvents == 0, 256, cfg.MaxPoolEvents), pickIf(cfg.MaxOperations == 0, 256, cfg.MaxOperations), pickIf(cfg.MaxMetrics == 0, 512, cfg.MaxMetrics)
 	for _, n := range [...]int{busBuf, maxLogs, maxDiags, maxPool, maxOps, maxMet} {
 		if n < 1 || n > maxProjectionBufferCap {
-			return 0, 0, 0, 0, 0, 0, fmt.Errorf("%w: Projection 缓冲容量 %d 须落在 [1, %d]", ErrInvalidConfig, n, maxProjectionBufferCap)
+			return 0, 0, 0, 0, 0, 0, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldRange, domi18n.Str("field", "projection_buffer"), domi18n.Int("value", n), domi18n.Int("min", 1), domi18n.Int("max", maxProjectionBufferCap))
 		}
 	}
 	return busBuf, maxLogs, maxDiags, maxPool, maxOps, maxMet, nil
@@ -124,7 +125,7 @@ func (p *Projection) AttachOperationStream(stream *events.OperationStream) error
 		return ErrProjectionClosed
 	}
 	if stream == nil {
-		return fmt.Errorf("%w: OperationStream 不能为 nil", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNil, domi18n.Str("field", "OperationStream"))
 	}
 	p.mu.Lock()
 	if p.closed {
@@ -174,7 +175,7 @@ func (p *Projection) ApplyEvent(ev events.Event) error {
 		return ErrProjectionClosed
 	}
 	if ev == nil || !ev.IsValid() {
-		return fmt.Errorf("%w: 无效事件", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "event"))
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -224,7 +225,7 @@ func (p *Projection) applyEventLocked(ev events.Event) error {
 	case *events.BusDroppedEvent:
 		p.dropped += v.DroppedDelta()
 	default:
-		return fmt.Errorf("%w: 不支持的事件类型 %T", ErrInvalidRequest, ev)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "event_type"), domi18n.BoundStr("value", fmt.Sprintf("%T", ev)))
 	}
 	return nil
 }

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"go.uber.org/goleak"
 
@@ -819,5 +820,86 @@ with urllib.request.urlopen(del_req, timeout=15) as resp:
 	})
 	if runErr != nil {
 		t.Fatalf("Python Streamable HTTP interop: %v", runErr)
+	}
+}
+
+// assertZeroHanContract 校验 MCP JSON 报文严格遵守纯英文机器契约，零汉字与零全角中文标点。
+func assertZeroHanContract(t *testing.T, label string, payload []byte) {
+	t.Helper()
+	for _, r := range string(payload) {
+		if unicode.Is(unicode.Han, r) || (r >= 0x3000 && r <= 0x303F) || (r >= 0xFF00 && r <= 0xFFEF) {
+			t.Fatalf("MCP %s 响应包含禁止的汉字或全角标点 %q: %s", label, r, string(payload))
+		}
+	}
+}
+
+func TestEngineMCP_CanonicalEnglishZeroHanContract(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	rig, srv := newEngineMCPRig(t, security.RiskModerate, false, 4096)
+	defer rig.close(t)
+
+	if _, err := srv.Prepare(context.Background()); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	requests := []struct {
+		label string
+		req   map[string]any
+	}{
+		{
+			label: "tools/list",
+			req:   map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+		},
+		{
+			label: "tools/call(nodes list_nodes)",
+			req: map[string]any{
+				"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+				"params": map[string]any{"name": protocol.ToolNameNodes, "arguments": map[string]any{"action": "list_nodes"}},
+			},
+		},
+		{
+			label: "tools/call(invalid action)",
+			req: map[string]any{
+				"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+				"params": map[string]any{"name": protocol.ToolNameNodes, "arguments": map[string]any{"action": "nonexistent"}},
+			},
+		},
+		{
+			label: "tools/call(unknown tool)",
+			req: map[string]any{
+				"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+				"params": map[string]any{"name": "no_such_tool", "arguments": map[string]any{}},
+			},
+		},
+		{
+			label: "tools/call(missing tool name)",
+			req: map[string]any{
+				"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+				"params": map[string]any{"name": "", "arguments": map[string]any{}},
+			},
+		},
+		{
+			label: "tools/call(approval_required challenge)",
+			req: map[string]any{
+				"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+				"params": map[string]any{
+					"name": protocol.ToolNameFile,
+					"arguments": map[string]any{
+						"action": "write", "target": "ops@10.20.0.1:22",
+						"path": "/tmp/zero-han.txt", "content": "hello",
+					},
+				},
+			},
+		},
+	}
+	for _, tc := range requests {
+		rawReq, err := protocol.MarshalCanonical(tc.req)
+		if err != nil {
+			t.Fatalf("MarshalCanonical(%s): %v", tc.label, err)
+		}
+		respBytes, hasResp, err := srv.HandleMessage(context.Background(), rawReq)
+		if err != nil || !hasResp {
+			t.Fatalf("HandleMessage(%s): hasResp=%v err=%v", tc.label, hasResp, err)
+		}
+		assertZeroHanContract(t, tc.label, respBytes)
 	}
 }

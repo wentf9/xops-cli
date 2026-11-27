@@ -15,13 +15,12 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
-	"fmt"
 	"slices"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -55,22 +54,22 @@ const (
 
 // 本包导出的不可变哨兵错误，供 core/engine、CLI/MCP 与测试经 errors.Is 精确区分故障类别。
 var (
-	ErrNilContext              = errors.New("usecase/automation: context 不能为 nil")
-	ErrInvalidConfig           = errors.New("usecase/automation: 无效的 ServiceConfig 配置")
-	ErrServiceNotInitialized   = errors.New("usecase/automation: Service 未初始化")
-	ErrInvalidRequest          = errors.New("usecase/automation: 无效的自动化执行请求")
-	ErrNoTargets               = errors.New("usecase/automation: 筛选后不存在可执行目标节点")
-	ErrOperatorReadUnavailable = errors.New("usecase/automation: 未配置 OperatorReadFS，拒绝读取操作员本地源路径")
-	ErrScopedFSUnavailable     = errors.New("usecase/automation: 未配置 ScopedRootFS")
-	ErrInventoryUnavailable    = errors.New("usecase/automation: 未配置 InventoryService，无法按选择器解析目标节点")
-	ErrTemplateRender          = errors.New("usecase/automation: 模板解析或渲染失败")
-	ErrBatchFailed             = errors.New("usecase/automation: 批量命令执行存在失败节点")
-	ErrPlaybookFailed          = errors.New("usecase/automation: Playbook 执行存在失败步骤")
-	ErrPlaybookAborted         = errors.New("usecase/automation: Playbook 执行被策略中止")
-	ErrUncertainOutcome        = errors.New("usecase/automation: 存在执行结果未知（OutcomeUnknown），严禁重试")
-	ErrUncertainDurability     = errors.New("usecase/automation: 远端变更已应用但持久性不确定，严禁重试")
-	ErrUnsupportedAction       = errors.New("usecase/automation: 不支持的 Playbook 步骤动作类型")
-	ErrSymlinkPolicyDenied     = errors.New("usecase/automation: 符号链接策略不允许当前读取或远端展开超限")
+	ErrNilContext              = domi18n.Sentinel(domi18n.KeyUCAutoNilContext)
+	ErrInvalidConfig           = domi18n.Sentinel(domi18n.KeyUCAutoInvalidConfig)
+	ErrServiceNotInitialized   = domi18n.Sentinel(domi18n.KeyUCAutoNotInitialized)
+	ErrInvalidRequest          = domi18n.Sentinel(domi18n.KeyUCAutoInvalidRequest)
+	ErrNoTargets               = domi18n.Sentinel(domi18n.KeyUCAutoNoTargets)
+	ErrOperatorReadUnavailable = domi18n.Sentinel(domi18n.KeyUCAutoOpReadUnavail)
+	ErrScopedFSUnavailable     = domi18n.Sentinel(domi18n.KeyUCAutoScopedFSUnavail)
+	ErrInventoryUnavailable    = domi18n.Sentinel(domi18n.KeyUCAutoInvUnavail)
+	ErrTemplateRender          = domi18n.Sentinel(domi18n.KeyUCAutoTemplateRender)
+	ErrBatchFailed             = domi18n.Sentinel(domi18n.KeyUCAutoBatchFailed)
+	ErrPlaybookFailed          = domi18n.Sentinel(domi18n.KeyUCAutoPlaybookFailed)
+	ErrPlaybookAborted         = domi18n.Sentinel(domi18n.KeyUCAutoPlaybookAborted)
+	ErrUncertainOutcome        = domi18n.Sentinel(domi18n.KeyUCAutoUncertainOutcome)
+	ErrUncertainDurability     = domi18n.Sentinel(domi18n.KeyUCAutoUncertainDurable)
+	ErrUnsupportedAction       = domi18n.Sentinel(domi18n.KeyUCAutoUnsupportedAction)
+	ErrSymlinkPolicyDenied     = domi18n.Sentinel(domi18n.KeyUCAutoSymlinkDenied)
 )
 
 // ServiceConfig 定义自动化用例服务 Service 的显式出站依赖配置；
@@ -118,10 +117,10 @@ type TargetNode struct {
 // NewTargetNode 校验节点标识、Merkle 连接计划、标签与可选启动配置并构造不可变 TargetNode。
 func NewTargetNode(spec TargetNodeSpec) (TargetNode, error) {
 	if !spec.NodeID.IsValid() || !spec.Plan.IsValid() {
-		return TargetNode{}, fmt.Errorf("%w: TargetNode 的 NodeID 与 SealedConnectionPlan 均须有效", ErrInvalidRequest)
+		return TargetNode{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TargetNode.NodeID/Plan"))
 	}
 	if prof, ok := spec.DefaultProfile.Get(); ok && !prof.IsValid() {
-		return TargetNode{}, fmt.Errorf("%w: TargetNode.DefaultProfile 无效", ErrInvalidRequest)
+		return TargetNode{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TargetNode.DefaultProfile"))
 	}
 	tags, err := canonicalizeTags(spec.Tags)
 	if err != nil {

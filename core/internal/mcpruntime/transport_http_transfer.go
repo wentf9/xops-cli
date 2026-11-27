@@ -2,7 +2,6 @@ package mcpruntime
 
 import (
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -39,21 +39,21 @@ func (s *Server) handleTransferHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	sid := strings.TrimSpace(r.Header.Get(headerMCPSessionID))
 	if sid == "" || !s.hasHTTPSession(sid) {
-		writeHTTPJSONError(w, http.StatusUnauthorized, "invalid_session", "传输流端点要求有效的 Mcp-Session-Id", false)
+		writeHTTPJSONError(w, http.StatusUnauthorized, "invalid_session", "transfer stream endpoint requires a valid Mcp-Session-Id", false)
 		return
 	}
 	tid, err := parseTransferStreamPath(r.URL.Path)
 	if err != nil {
-		writeHTTPJSONError(w, http.StatusNotFound, "not_found", "无效的传输流端点路径（应为 /transfers/{transfer_id}/stream）", false)
+		writeHTTPJSONError(w, http.StatusNotFound, "not_found", "invalid transfer stream path (expected /transfers/{transfer_id}/stream)", false)
 		return
 	}
 	binding, found := s.registry.LookupTransfer(tid)
 	if !found {
-		writeHTTPJSONError(w, http.StatusNotFound, "transfer_not_found", "未找到活跃流式传输绑定或已终结", false)
+		writeHTTPJSONError(w, http.StatusNotFound, "transfer_not_found", "active streaming transfer binding not found or already finalized", false)
 		return
 	}
 	if s.registry.TransferService() == nil {
-		writeHTTPJSONError(w, http.StatusServiceUnavailable, "service_unavailable", "TransferService 未装配", false)
+		writeHTTPJSONError(w, http.StatusServiceUnavailable, "service_unavailable", "TransferService is not configured", false)
 		return
 	}
 	switch r.Method {
@@ -63,7 +63,7 @@ func (s *Server) handleTransferHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleHTTPStreamDownload(w, r, binding)
 	default:
 		w.Header().Set("Allow", "GET, PUT, POST")
-		writeHTTPJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "仅允许 GET/PUT/POST", false)
+		writeHTTPJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET, PUT, and POST are allowed", false)
 	}
 }
 
@@ -72,7 +72,7 @@ func parseTransferStreamPath(urlPath string) (security.OperationID, error) {
 	trimmed := strings.TrimPrefix(urlPath, "/transfers/")
 	idStr, suffix, ok := strings.Cut(trimmed, "/")
 	if !ok || suffix != "stream" || idStr == "" {
-		return zeroID, errors.New("无效传输流路径")
+		return zeroID, domi18n.E(domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "transfer stream path"), domi18n.BoundStr("value", urlPath))
 	}
 	tid, err := security.ParseOperationID(idStr)
 	if err != nil {
@@ -83,7 +83,7 @@ func parseTransferStreamPath(urlPath string) (security.OperationID, error) {
 
 func (s *Server) handleHTTPStreamUpload(w http.ResponseWriter, r *http.Request, binding tools.TransferBinding) {
 	if binding.Direction() != fsm.TransferDirectionUpload {
-		writeHTTPJSONError(w, http.StatusBadRequest, "direction_mismatch", "当前传输会话方向不是 upload", false)
+		writeHTTPJSONError(w, http.StatusBadRequest, "direction_mismatch", "transfer session direction is not upload", false)
 		return
 	}
 	startOffset, err := parseStartOffsetHeader(r.Header.Get(headerStartOffset))
@@ -148,7 +148,7 @@ func (s *Server) streamUploadBody(
 			return written, offset, lastState, approvalConsumed, nil
 		}
 		if readErr != nil {
-			return 0, 0, fsm.TransferKindInvalid, approvalConsumed, fmt.Errorf("%w: %w", protocol.ErrInvalidParams, readErr)
+			return 0, 0, fsm.TransferKindInvalid, approvalConsumed, domi18n.WrapSentinel(protocol.ErrInvalidParams, readErr)
 		}
 	}
 }
@@ -186,7 +186,7 @@ func (s *Server) writeOneUploadChunk(
 
 func writeUploadStreamErr(w http.ResponseWriter, err error) {
 	if errors.Is(err, ErrMessageTooLarge) {
-		writeHTTPJSONError(w, http.StatusRequestEntityTooLarge, "transfer_size_exceeded", "上传流字节数超出已声明的 total_bytes 上限", false)
+		writeHTTPJSONError(w, http.StatusRequestEntityTooLarge, "transfer_size_exceeded", "upload stream byte count exceeds declared total_bytes limit", false)
 		return
 	}
 	writeClassifiedHTTPError(w, err)
@@ -219,7 +219,7 @@ func (s *Server) maybeCommitHTTPUpload(
 
 func (s *Server) handleHTTPStreamDownload(w http.ResponseWriter, r *http.Request, binding tools.TransferBinding) {
 	if binding.Direction() != fsm.TransferDirectionDownload {
-		writeHTTPJSONError(w, http.StatusBadRequest, "direction_mismatch", "当前传输会话方向不是 download", false)
+		writeHTTPJSONError(w, http.StatusBadRequest, "direction_mismatch", "transfer session direction is not download", false)
 		return
 	}
 	approvalOpt, err := parseApprovalHeader(r.Header.Get(headerApproval))
@@ -231,7 +231,7 @@ func (s *Server) handleHTTPStreamDownload(w http.ResponseWriter, r *http.Request
 	localRoot, okRoot := binding.LocalRoot().Get()
 	localDest, okDest := binding.LocalDest().Get()
 	if scopedFS == nil || !okRoot || !okDest {
-		writeHTTPJSONError(w, http.StatusServiceUnavailable, "scoped_fs_unavailable", "沙箱 ScopedRootFS 或目标绑定缺失", false)
+		writeHTTPJSONError(w, http.StatusServiceUnavailable, "scoped_fs_unavailable", "sandbox ScopedRootFS or destination binding is missing", false)
 		return
 	}
 	// 先探测实时状态：已在 Verifying（例如上次 GET 拉取完分片后因 CommitTransfer 挑战 428 返回）则跳过拉取直进 CommitTransfer；
@@ -347,7 +347,7 @@ func parseStartOffsetHeader(raw string) (uint64, error) {
 	}
 	v, err := strconv.ParseUint(trimmed, 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("无效的 %s 头 %q: %w", headerStartOffset, raw, err)
+		return 0, domi18n.Wrap(err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", headerStartOffset), domi18n.BoundStr("value", raw))
 	}
 	return v, nil
 }
@@ -359,7 +359,7 @@ func parseApprovalHeader(raw string) (algebraic.Option[gate.ApprovalSubmission],
 	}
 	var in protocol.ApprovalSubmissionDTO
 	if err := protocol.UnmarshalStrict([]byte(trimmed), &in); err != nil {
-		return algebraic.None[gate.ApprovalSubmission](), fmt.Errorf("无效的 %s 头: %w", headerApproval, err)
+		return algebraic.None[gate.ApprovalSubmission](), domi18n.Wrap(err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", headerApproval))
 	}
 	return protocol.DecodeApprovalSubmission(algebraic.Some(in))
 }

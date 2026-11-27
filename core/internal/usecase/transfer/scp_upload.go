@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"slices"
@@ -17,6 +16,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -107,10 +107,10 @@ func (s *Service) buildUploadStagePath(finalDest pathalg.RemotePath, resume bool
 }
 func resolveRecursiveLimits(maxFiles int, maxBytes uint64) (int, uint64, error) {
 	if maxFiles < 0 || maxFiles > maxRecursiveFilesLimit {
-		return 0, 0, fmt.Errorf("%w: MaxFiles 越界", ErrInvalidRequest)
+		return 0, 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRange, domi18n.Str("field", "MaxFiles"), domi18n.Int("value", maxFiles), domi18n.Int("min", 0), domi18n.Int("max", maxRecursiveFilesLimit))
 	}
 	if maxBytes > fsm.MaxTransferBytes {
-		return 0, 0, fmt.Errorf("%w: MaxTotalBytes 超出 10 GiB 上限", fsm.ErrTransferSizeExceeded)
+		return 0, 0, domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "MaxTotalBytes"), domi18n.Uint64("size", maxBytes), domi18n.Uint64("limit", fsm.MaxTransferBytes))
 	}
 	return pickIf(maxFiles == 0, defaultMaxRecursiveFiles, maxFiles), pickIf(maxBytes == 0, fsm.MaxTransferBytes, maxBytes), nil
 }
@@ -119,7 +119,7 @@ func (s *Service) validateSCPUploadRequest(ctx context.Context, req SCPUploadReq
 		return hop, params, err
 	}
 	if !req.Source.IsValid() || (req.Source.Kind() == LocalUploadSourceOperator && s.operatorReadFS == nil) || (req.Source.Kind() == LocalUploadSourceScoped && s.scopedFS == nil) {
-		return hop, params, pickIf[error](!req.Source.IsValid(), fmt.Errorf("%w: LocalUploadSource 无效", ErrInvalidRequest), pickIf[error](req.Source.Kind() == LocalUploadSourceOperator, ErrOperatorReadUnavailable, ErrScopedFSUnavailable))
+		return hop, params, pickIf[error](!req.Source.IsValid(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "LocalUploadSource")), pickIf[error](req.Source.Kind() == LocalUploadSourceOperator, ErrOperatorReadUnavailable, ErrScopedFSUnavailable))
 	}
 	maxFiles, maxBytes, e0 := validateRecursiveUploadParams(req)
 	e1 := validateOptionalUploadAttrs(req.ModTime, req.ExpectedDigest)
@@ -133,17 +133,17 @@ func validateRecursiveUploadParams(req SCPUploadRequest) (int, uint64, error) {
 		return defaultMaxRecursiveFiles, fsm.MaxTransferBytes, nil
 	}
 	if req.Source.Kind() != LocalUploadSourceScoped {
-		return 0, 0, fmt.Errorf("%w: %w: 递归目录上传仅支持 ScopedRootFS 沙箱源", ErrInvalidRequest, ports.ErrUnsupported)
+		return 0, 0, domi18n.WrapS(ErrInvalidRequest, ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "recursive_operator_upload"))
 	}
 	if !req.SymlinkPolicy.IsValid() || req.SymlinkPolicy != pathalg.SymlinkReject {
-		return 0, 0, fmt.Errorf("%w: %w: 沙箱递归上传仅允许 SymlinkReject 策略", ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected)
+		return 0, 0, domi18n.WrapS(ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SymlinkPolicy"), domi18n.Str("value", req.SymlinkPolicy.String()))
 	}
 	return resolveRecursiveLimits(req.MaxFiles, req.MaxTotalBytes)
 }
 func validateOptionalUploadAttrs(modTime algebraic.Option[time.Time], expDig algebraic.Option[security.Digest]) error {
 	mt, okM := modTime.Get()
 	dig, okD := expDig.Get()
-	return firstErr(pickIf[error](okM && !validRFC3339(mt), fmt.Errorf("%w: ModTime 必须为有效 RFC 3339 非零时刻", ErrInvalidRequest), nil), pickIf[error](okD && !dig.IsValid(), fmt.Errorf("%w: ExpectedDigest 无效", ErrInvalidRequest), nil))
+	return firstErr(pickIf[error](okM && !validRFC3339(mt), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ModTime")), nil), pickIf[error](okD && !dig.IsValid(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExpectedDigest")), nil))
 }
 func (s *Service) openSourceAndUpload(ctx context.Context, rfs ports.RemoteFSPort, emitter *transferEmitter, params uploadExecParams) (res SCPUploadResult, err error) {
 	src := params.req.Source
@@ -171,7 +171,7 @@ func (s *Service) openSourceAndUpload(ctx context.Context, rfs ports.RemoteFSPor
 // uploadFromBoundedReader 同步消费借用句柄 r 并经 conc.RunWait 扇出并发 WriteChunk（r 绝不逃逸至 n.Go）。
 func uploadFromBoundedReader(ctx context.Context, rfs ports.RemoteFSPort, emitter *transferEmitter, r ports.BoundedReadHandle, size int64, params uploadExecParams) (SCPUploadResult, error) {
 	if size < 0 || uint64(size) > fsm.MaxTransferBytes {
-		return SCPUploadResult{}, fmt.Errorf("%w: 本地文件大小 %d 超出 10 GiB 上限", fsm.ErrTransferSizeExceeded, size)
+		return SCPUploadResult{}, domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_file"), domi18n.Int64("size", size), domi18n.Uint64("limit", fsm.MaxTransferBytes))
 	}
 	resumeOffset, err := calcResumeOffset(size, params.chunkSize, params.req.Resume, func() (int64, bool, error) {
 		st, sErr := rfs.Lstat(ctx, params.stagePath)
@@ -192,7 +192,7 @@ func uploadFromBoundedReader(ctx context.Context, rfs ports.RemoteFSPort, emitte
 	}
 	if expDig, ok := params.req.ExpectedDigest.Get(); ok && !expDig.Equal(digest) {
 		dropStage = true
-		return SCPUploadResult{}, fmt.Errorf("%w: 上传源摘要与 ExpectedDigest 不一致", ErrDigestMismatch)
+		return SCPUploadResult{}, domi18n.EF(ErrDigestMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "sha256"), domi18n.Str("expected", expDig.String()), domi18n.Str("actual", digest.String()))
 	}
 	preserved, err := commitUploadedStage(ctx, rfs, params)
 	committed = err == nil
@@ -304,7 +304,7 @@ func (s *Service) executeRecursiveSCPUpload(ctx context.Context, binding securit
 		}
 		switch {
 		case lstat.IsSymlink():
-			return fmt.Errorf("%w: %w: 策略 %s 禁止上传软链 %s", ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, params.req.SymlinkPolicy, src.scopedPath)
+			return domi18n.WrapS(ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, domi18n.KeyUCTransferSymlinkPol, domi18n.Str("policy", params.req.SymlinkPolicy.String()), domi18n.BoundStr("path", src.scopedPath.String()))
 		case lstat.IsRegular():
 			isRegular, regSize = true, lstat.Size()
 			return nil
@@ -312,14 +312,14 @@ func (s *Service) executeRecursiveSCPUpload(ctx context.Context, binding securit
 			out, sErr = s.uploadScopedDirectoryTree(ctx, binding, rfs, root, emitter, lstat, params)
 			return sErr
 		default:
-			return fmt.Errorf("%w: 不支持的本地上传对象 %s", ports.ErrNotRegularFile, src.scopedPath)
+			return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", src.scopedPath.String()), domi18n.Str("reason", "not_regular_file"))
 		}
 	})
 	if err != nil || !isRegular {
 		return out, err
 	}
 	if uint64(regSize) > params.maxBytes {
-		return out, fmt.Errorf("%w: 本地文件大小 %d 超限 %d", fsm.ErrTransferSizeExceeded, regSize, params.maxBytes)
+		return out, domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "local_file"), domi18n.Int64("size", regSize), domi18n.Uint64("limit", params.maxBytes))
 	}
 	return s.executeSingleSCPUpload(ctx, binding, rfs, emitter, params)
 }
@@ -344,7 +344,7 @@ func (s *Service) uploadScopedDirectoryTree(ctx context.Context, binding securit
 		return SCPUploadResult{}, err
 	}
 	if cErr := pathalg.CheckPathCollisions(pl.allLocal); cErr != nil {
-		return SCPUploadResult{}, fmt.Errorf("%w: %w", ErrSymlinkPolicyDenied, cErr)
+		return SCPUploadResult{}, domi18n.WrapSentinel(ErrSymlinkPolicyDenied, cErr)
 	}
 	out := SCPUploadResult{RemotePath: rootRemote}
 	if err = s.createRemoteUploadDirs(ctx, binding, rfs, pl.dirs, &out); err != nil {
@@ -363,7 +363,7 @@ func (s *Service) uploadScopedDirectoryTree(ctx context.Context, binding securit
 }
 func walkLocalUploadTree(ctx context.Context, root ports.RootHandle, localDir pathalg.LocalRootedDest, dirStat ports.LocalFileInfo, remoteDir pathalg.RemotePath, preserveMode bool, pl *recursiveUploadPlan) error {
 	if err := ctx.Err(); err != nil || len(pl.allLocal) >= pl.maxFiles {
-		return pickIf[error](err != nil, err, fmt.Errorf("%w: 递归上传对象数超限 %d", ports.ErrLimitExceeded, pl.maxFiles))
+		return pickIf[error](err != nil, err, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "upload_entries"), domi18n.Int("count", len(pl.allLocal)), domi18n.Int("limit", pl.maxFiles)))
 	}
 	pl.dirs, pl.allLocal = append(pl.dirs, plannedUploadDir{remote: remoteDir, perm: pickIf(preserveMode && dirStat.Perm() != 0, dirStat.Perm(), defaultDirPerm), modTime: dirStat.ModTime()}), append(pl.allLocal, localDir)
 	entries, err := root.ReadDir(algebraic.Some(localDir))
@@ -380,7 +380,7 @@ func walkLocalUploadTree(ctx context.Context, root ports.RootHandle, localDir pa
 }
 func walkLocalUploadEntry(ctx context.Context, root ports.RootHandle, localDir pathalg.LocalRootedDest, remoteDir pathalg.RemotePath, ent ports.LocalDirEntry, preserveMode bool, pl *recursiveUploadPlan) error {
 	if len(pl.allLocal) >= pl.maxFiles {
-		return fmt.Errorf("%w: 递归上传对象数超限 %d", ports.ErrLimitExceeded, pl.maxFiles)
+		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "upload_entries"), domi18n.Int("count", len(pl.allLocal)), domi18n.Int("limit", pl.maxFiles))
 	}
 	childLocal, e1 := localDir.JoinComponent(ent.Name())
 	rName, e2 := pathalg.ParseRemoteName(ent.Name())
@@ -394,17 +394,17 @@ func walkLocalUploadEntry(ctx context.Context, root ports.RootHandle, localDir p
 	}
 	switch {
 	case childStat.IsSymlink():
-		return fmt.Errorf("%w: %w: 策略 %s 禁止上传软链 %s", ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, pathalg.SymlinkReject, childLocal)
+		return domi18n.WrapS(ErrSymlinkPolicyDenied, ports.ErrSymlinkRejected, domi18n.KeyUCTransferSymlinkPol, domi18n.Str("policy", pathalg.SymlinkReject.String()), domi18n.BoundStr("path", childLocal.String()))
 	case childStat.IsDir():
 		return walkLocalUploadTree(ctx, root, childLocal, childStat, childRemote, preserveMode, pl)
 	case childStat.IsRegular():
 		if uint64(childStat.Size()) > pl.maxBytes-pl.totalBytes {
-			return fmt.Errorf("%w: 递归上传总大小超限 %d", fsm.ErrTransferSizeExceeded, pl.maxBytes)
+			return domi18n.EF(fsm.ErrTransferSizeExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "upload_total"), domi18n.Uint64("size", pl.totalBytes+uint64(childStat.Size())), domi18n.Uint64("limit", pl.maxBytes))
 		}
 		pl.totalBytes, pl.files, pl.allLocal = pl.totalBytes+uint64(childStat.Size()), append(pl.files, plannedUploadFile{plannedUploadDir: plannedUploadDir{remote: childRemote, perm: childStat.Perm(), modTime: childStat.ModTime()}, local: childLocal}), append(pl.allLocal, childLocal)
 		return nil
 	default:
-		return fmt.Errorf("%w: 本地路径 %s 为不受支持的非常规对象", ports.ErrNotRegularFile, childLocal)
+		return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", childLocal.String()), domi18n.Str("reason", "not_regular_file"))
 	}
 }
 func (s *Service) createRemoteUploadDirs(ctx context.Context, binding security.OperationBinding, rfs ports.RemoteFSPort, dirs []plannedUploadDir, out *SCPUploadResult) error {
@@ -413,7 +413,7 @@ func (s *Service) createRemoteUploadDirs(ctx context.Context, binding security.O
 			return err
 		}
 		if exists, isDir, err := remotecanon.InspectUploadTarget(ctx, rfs, d.remote); err != nil || (exists && !isDir) {
-			return pickIf[error](err != nil, err, fmt.Errorf("%w: 远端路径 %s 已存在且非目录", ports.ErrAlreadyExists, d.remote))
+			return pickIf[error](err != nil, err, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", d.remote.String()), domi18n.Str("reason", "exists_non_dir")))
 		}
 		if err := rfs.MkdirAll(ctx, d.remote, d.perm); err != nil {
 			return err
@@ -424,7 +424,7 @@ func (s *Service) createRemoteUploadDirs(ctx context.Context, binding security.O
 }
 func (s *Service) uploadOnePlannedFile(ctx context.Context, binding security.OperationBinding, rfs ports.RemoteFSPort, root ports.RootHandle, emitter *transferEmitter, f plannedUploadFile, limits ports.ReadLimits, base uploadExecParams, out *SCPUploadResult) error {
 	if exists, isDir, err := remotecanon.InspectUploadTarget(ctx, rfs, f.remote); err != nil || (exists && (isDir || base.req.NoClobber)) {
-		return pickIf[error](err != nil, err, pickIf(isDir, fmt.Errorf("%w: 远端路径 %s 为目录，无法写入文件", ports.ErrRemoteIsDir, f.remote), fmt.Errorf("%w: 远端目标 %s 已存在", ports.ErrAlreadyExists, f.remote)))
+		return pickIf[error](err != nil, err, pickIf(isDir, domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", f.remote.String()), domi18n.Str("reason", "target_is_dir")), domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", f.remote.String()), domi18n.Str("reason", "already_exists"))))
 	}
 	if err := remotecanon.VerifyPathAuthorized(ctx, s.strictPaths(), rfs, binding, f.remote, canonSentinels()); err != nil {
 		return err

@@ -13,6 +13,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -54,14 +55,14 @@ func (s *Service) validateAndPrepareBatch(ctx context.Context, req BatchExecRequ
 		return nil, 0, 0, err
 	}
 	if !req.Command.IsValid() {
-		return nil, 0, 0, fmt.Errorf("%w: CommandPlan 无效", ErrInvalidRequest)
+		return nil, 0, 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "CommandPlan"))
 	}
 	if r, ok := req.Risk.Get(); ok && !r.IsValid() {
-		return nil, 0, 0, fmt.Errorf("%w: RiskLevel 无效", ErrInvalidRequest)
+		return nil, 0, 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel"))
 	}
 	if outDir, hasOut := req.OutputDir.Get(); hasOut {
 		if !outDir.IsValid() {
-			return nil, 0, 0, fmt.Errorf("%w: OutputDir 无效", ErrInvalidRequest)
+			return nil, 0, 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "OutputDir"))
 		}
 		if s.scopedFS == nil {
 			return nil, 0, 0, ErrScopedFSUnavailable
@@ -73,7 +74,7 @@ func (s *Service) validateAndPrepareBatch(ctx context.Context, req BatchExecRequ
 	}
 	maxOut := pickIf(req.MaxOutputBytes == 0, req.Command.MaxOutputBytes(), req.MaxOutputBytes)
 	if maxOut == 0 || maxOut > execution.MaxAllowedOutputBytes {
-		return nil, 0, 0, fmt.Errorf("%w: max_output_bytes=%d 越界", ErrInvalidRequest, maxOut)
+		return nil, 0, 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRange, domi18n.Str("field", "max_output_bytes"), domi18n.Uint64("value", maxOut), domi18n.Uint64("min", 1), domi18n.Uint64("max", execution.MaxAllowedOutputBytes))
 	}
 	targets, err := s.resolveTargets(ctx, req.Targets, req.Selector, req.CLIOptions, req.ExcludeNodes, req.ExcludeTags)
 	if err != nil {
@@ -225,7 +226,7 @@ func prepareBatchJobs(targets []TargetNode, prebound map[inventory.NodeID]*event
 		if st == nil && factory != nil {
 			var err error
 			if st, err = factory(target.nodeID, traceID, opID); err != nil {
-				return nil, created, fmt.Errorf("创建节点 %s 隔离事件流失败: %w", target.nodeID, err)
+				return nil, created, domi18n.Wrap(err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "create node event stream"), domi18n.BoundStr("target", target.nodeID.String()))
 			}
 			if st != nil {
 				created = append(created, st)
@@ -321,7 +322,7 @@ func (s *Service) runSingleNodeCommand(ctx context.Context, req BatchExecRequest
 func (s *Service) execCommandWithLease(ctx context.Context, connPlan plan.SealedConnectionPlan, cmd execution.CommandPlan, authBinding security.OperationBinding, verifyWorkDir bool, stdout, stderr io.Writer) (execution.ExecutionOutcome, error) {
 	targetHop, ok := connPlan.Target()
 	if !ok {
-		err := fmt.Errorf("%w: 连接计划缺少末跳目标", ErrInvalidRequest)
+		err := domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "connection plan target hop"))
 		return makeNotStartedOutcome(execution.StartPhaseValidate, "invalid_plan", err), err
 	}
 	var outcome execution.ExecutionOutcome

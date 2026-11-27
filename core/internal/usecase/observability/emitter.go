@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"slices"
 	"strings"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -198,7 +198,7 @@ func resolveCanonicalRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p p
 		}
 		suffix, cur = append(suffix, base), cur.Dir()
 	}
-	return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端路径规范化深度超限", ErrInvalidRequest)
+	return zeroVal[pathalg.RemotePath](), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "canonical_depth"), domi18n.Int("value", maxRemoteCanonicalHops), domi18n.Int("max", maxRemoteCanonicalHops))
 }
 
 func expandDanglingSymlink(ctx context.Context, rfs ports.RemoteFSPort, cur pathalg.RemotePath, hops *int) (pathalg.RemotePath, bool, error) {
@@ -210,7 +210,7 @@ func expandDanglingSymlink(ctx context.Context, rfs ports.RemoteFSPort, cur path
 		return zeroVal[pathalg.RemotePath](), false, err
 	}
 	if *hops >= pathalg.MaxSymlinkHops {
-		return zeroVal[pathalg.RemotePath](), false, fmt.Errorf("%w: 远端软链跳数超限 %d", ErrSymlinkPolicyDenied, pathalg.MaxSymlinkHops)
+		return zeroVal[pathalg.RemotePath](), false, domi18n.EF(ErrSymlinkPolicyDenied, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "symlink_hops"), domi18n.Int("value", pathalg.MaxSymlinkHops), domi18n.Int("max", pathalg.MaxSymlinkHops))
 	}
 	*hops++
 	raw, err := rfs.ReadLink(ctx, cur)
@@ -241,7 +241,7 @@ func verifyRemotePathAuthorized(ctx context.Context, enforce bool, rfs ports.Rem
 	}
 	cs := canon.String()
 	if !slices.Contains(binding.CanonicalPaths(), cs) && !slices.ContainsFunc(binding.RecursivePaths(), func(r string) bool { return r == "/" || cs == r || strings.HasPrefix(cs, r+"/") }) {
-		return fmt.Errorf("%w: 远端路径 %s 规范化漂移至未授权目标 %s", gate.ErrScopeEscalated, target, canon)
+		return domi18n.EF(gate.ErrScopeEscalated, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", target.String()), domi18n.BoundStr("reason", canon.String()))
 	}
 	return nil
 }

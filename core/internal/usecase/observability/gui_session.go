@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
@@ -127,16 +128,16 @@ func (s *Service) validateOpenGUISession(ctx context.Context, req OpenGUISession
 		return guiSessionPrepared{}, ErrForwarderUnavailable
 	}
 	if !req.Spec.Kind.IsValid() || req.Spec.DisplayNum < 0 || req.Spec.DisplayNum > maxGUIDisplayNum {
-		return guiSessionPrepared{}, fmt.Errorf("%w: GUI 会话协议或显示编号越界 [0,%d]", ErrInvalidGUIInput, maxGUIDisplayNum)
+		return guiSessionPrepared{}, domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldRange, domi18n.Str("field", "display_num"), domi18n.Int("value", req.Spec.DisplayNum), domi18n.Int("min", 0), domi18n.Int("max", maxGUIDisplayNum))
 	}
 	bindHost := pickIf(req.Spec.LocalBindHost == "", "127.0.0.1", req.Spec.LocalBindHost)
 	addr, pErr := netip.ParseAddr(bindHost)
 	if pErr != nil {
-		return guiSessionPrepared{}, fmt.Errorf("%w: LocalBindHost 必须为合法 IP 字面量", ErrInvalidGUIInput)
+		return guiSessionPrepared{}, domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "LocalBindHost"), domi18n.BoundStr("value", bindHost))
 	}
 	nonLoopback := !addr.IsLoopback()
 	if nonLoopback && !req.Spec.AllowNonLoopbackBind {
-		return guiSessionPrepared{}, fmt.Errorf("%w: 默认禁止非回环地址 %s 绑定", ErrInvalidGUIInput, bindHost)
+		return guiSessionPrepared{}, domi18n.EF(ErrInvalidGUIInput, domi18n.KeyUCObsNonLoopback, domi18n.BoundStr("addr", bindHost))
 	}
 	fwdSpec, remoteDesc, err := buildGUISessionForwardSpec(req.Spec, netip.AddrPortFrom(addr, req.Spec.LocalBindPort).String())
 	if err != nil {
@@ -147,7 +148,7 @@ func (s *Service) validateOpenGUISession(ctx context.Context, req OpenGUISession
 func buildGUISessionForwardSpec(spec GUISessionSpec, bindAddr string) (ports.ForwardSpec, string, error) {
 	if spec.UseUnixSocket {
 		if spec.Kind != GUISessionX11 {
-			return zeroVal[ports.ForwardSpec](), "", fmt.Errorf("%w: 仅 X11 GUI 会话支持 Unix 套接字转发", ErrInvalidGUIInput)
+			return zeroVal[ports.ForwardSpec](), "", domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "unix_socket_for_vnc"))
 		}
 		sockPath := fmt.Sprintf("/tmp/.X11-unix/X%d", spec.DisplayNum)
 		fs, err := ports.NewTypedForwardSpec(ports.ForwardLocal, ports.ForwardEndpointTCP, bindAddr, ports.ForwardEndpointUnix, sockPath)
@@ -188,7 +189,7 @@ func startManagedGUITunnel(leaseCtx, revokeCtx context.Context, fwd ports.Forwar
 		if fh != nil {
 			_ = fh.Close()
 		}
-		return nil, fmt.Errorf("%w: ForwarderPort 返回无效 ForwardHandle", ErrInvalidRequest)
+		return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ForwardHandle"))
 	}
 	n, err := conc.NewNursery(revokeCtx)
 	if err != nil {

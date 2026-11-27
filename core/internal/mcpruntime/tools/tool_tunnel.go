@@ -3,10 +3,10 @@ package tools
 import (
 	"context"
 	"encoding/json/jsontext"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -40,7 +40,7 @@ type tunnelArgs struct {
 
 func (r *Registry) callTunnel(ctx context.Context, rawArgs jsontext.Value) (protocol.CallToolResult, error) {
 	if r.session == nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: SessionService 未配置", ErrServiceUnavailable)
+		return protocol.CallToolResult{}, domi18n.EF(ErrServiceUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SessionService"))
 	}
 	args, err := decodeToolArgs[tunnelArgs](rawArgs)
 	if err != nil {
@@ -62,30 +62,30 @@ func (r *Registry) callTunnel(ctx context.Context, rawArgs jsontext.Value) (prot
 	case "probe_mux", "control_mux":
 		return r.tunnelProbeOrControlMux(ctx, args, risk, approval)
 	default:
-		return protocol.CallToolResult{}, fmt.Errorf("%w: 未知 tunnel action %q", protocol.ErrInvalidParams, args.Action)
+		return protocol.CallToolResult{}, domi18n.EF(protocol.ErrInvalidParams, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "tunnel action"), domi18n.BoundStr("value", args.Action))
 	}
 }
 
 func parseForwardSpecArgs(args tunnelArgs) (ports.ForwardSpec, error) {
 	dir, err := ports.ParseForwardDirection(args.Direction)
 	if err != nil {
-		return zeroVal[ports.ForwardSpec](), fmt.Errorf("%w: direction 非法: %w", protocol.ErrInvalidParams, err)
+		return zeroVal[ports.ForwardSpec](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "direction"))
 	}
 	if dir == ports.ForwardTUN {
 		mode, mErr := ports.ParseTUNMode(args.TUNMode)
 		if mErr != nil {
-			return zeroVal[ports.ForwardSpec](), fmt.Errorf("%w: tun_mode 非法: %w", protocol.ErrInvalidParams, mErr)
+			return zeroVal[ports.ForwardSpec](), domi18n.WrapS(protocol.ErrInvalidParams, mErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "tun_mode"))
 		}
 		tunSpec, tErr := ports.NewTUNSpec(mode, args.TUNLocalUnit.OrElse(ports.TUNUnitAny), args.TUNRemoteUnit.OrElse(ports.TUNUnitAny))
 		if tErr != nil {
-			return zeroVal[ports.ForwardSpec](), fmt.Errorf("%w: %w", protocol.ErrInvalidParams, tErr)
+			return zeroVal[ports.ForwardSpec](), domi18n.WrapSentinel(protocol.ErrInvalidParams, tErr)
 		}
 		return ports.NewForwardTUNSpec(tunSpec)
 	}
 	bindKind := ports.ForwardEndpointTCP
 	if args.BindKind != "" {
 		if bindKind, err = ports.ParseForwardEndpointKind(args.BindKind); err != nil {
-			return zeroVal[ports.ForwardSpec](), fmt.Errorf("%w: bind_kind 非法: %w", protocol.ErrInvalidParams, err)
+			return zeroVal[ports.ForwardSpec](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "bind_kind"))
 		}
 	}
 	targetKind := ports.ForwardEndpointTCP
@@ -93,12 +93,12 @@ func parseForwardSpecArgs(args tunnelArgs) (ports.ForwardSpec, error) {
 		targetKind = ports.ForwardEndpointInvalid
 	} else if args.TargetKind != "" {
 		if targetKind, err = ports.ParseForwardEndpointKind(args.TargetKind); err != nil {
-			return zeroVal[ports.ForwardSpec](), fmt.Errorf("%w: target_kind 非法: %w", protocol.ErrInvalidParams, err)
+			return zeroVal[ports.ForwardSpec](), domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "target_kind"))
 		}
 	}
 	spec, err := ports.NewTypedForwardSpec(dir, bindKind, args.BindAddr, targetKind, args.TargetAddr)
 	if err != nil {
-		return zeroVal[ports.ForwardSpec](), fmt.Errorf("%w: %w", protocol.ErrInvalidParams, err)
+		return zeroVal[ports.ForwardSpec](), domi18n.WrapSentinel(protocol.ErrInvalidParams, err)
 	}
 	return spec, nil
 }
@@ -197,7 +197,7 @@ func (r *Registry) tunnelStartMux(
 		var err error
 		cliOpts, err = option.ParseOptionLayer(directives...)
 		if err != nil {
-			return protocol.CallToolResult{}, fmt.Errorf("%w: ControlMaster 选项非法: %w", protocol.ErrInvalidParams, err)
+			return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ControlMaster options"))
 		}
 	}
 	resolved, err := r.resolveTarget(ctx, args.Target, cliOpts)
@@ -278,7 +278,7 @@ func (r *Registry) tunnelProbeOrControlMux(
 	if strings.TrimSpace(args.SocketPath) != "" {
 		sp, sErr := pathalg.ParseLocalSourcePath(args.SocketPath)
 		if sErr != nil {
-			return protocol.CallToolResult{}, fmt.Errorf("%w: socket_path 非法: %w", protocol.ErrInvalidParams, sErr)
+			return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, sErr, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "socket_path"))
 		}
 		sockOpt = algebraic.Some(sp)
 	}
@@ -298,7 +298,7 @@ func (r *Registry) tunnelProbeOrControlMux(
 	}
 	muxAct, err := ports.ParseMuxControlAction(args.MuxAction)
 	if err != nil {
-		return protocol.CallToolResult{}, fmt.Errorf("%w: mux_action 非法: %w", protocol.ErrInvalidParams, err)
+		return protocol.CallToolResult{}, domi18n.WrapS(protocol.ErrInvalidParams, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "mux_action"))
 	}
 	var fwdOpt algebraic.Option[ports.ForwardSpec]
 	if muxAct == ports.MuxActionForward || muxAct == ports.MuxActionCancel {

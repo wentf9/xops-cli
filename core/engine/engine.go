@@ -3,11 +3,11 @@ package engine
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/events"
@@ -69,11 +69,17 @@ func (b *pendingRefBridge) ActivePendingSecretRefs() []inventory.PendingSecretRe
 	}
 	return nil
 }
-func wrapCfgErr(msg string, err error) error {
+func wrapInitErr(component string, err error) error {
 	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("%w: %s: %w", ErrInvalidConfig, msg, err)
+	return domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyEngineInitCompFailed, domi18n.Str("component", component))
+}
+func wrapCfgFieldErr(field string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return domi18n.WrapS(ErrInvalidConfig, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", field))
 }
 func rollbackNew(opCancel context.CancelCauseFunc, p *pool.Pool, ownsBus bool, bus *events.SystemBus, cause error) {
 	if opCancel != nil {
@@ -118,7 +124,7 @@ func New(cfg Config) (eng *Engine, err error) {
 	if pCfg, pErr := buildPoolConfig(cfg, dialer, bus); pErr != nil {
 		return nil, pErr
 	} else if p, err = pool.NewPool(context.Background(), pCfg); err != nil {
-		return nil, wrapCfgErr("初始化连接池失败", err)
+		return nil, wrapInitErr("pool", err)
 	}
 	if g, err = buildEngineGate(cfg, profile, policy, bus, p); err != nil {
 		return nil, err
@@ -140,7 +146,7 @@ func resolveSystemBus(cfg Config) (*events.SystemBus, bool, error) {
 		cfg.SystemBusBuffer = defaultSystemBusBuffer
 	}
 	bus, err := events.NewSystemBus(events.SystemBusConfig{DefaultSubscriberBuffer: cfg.SystemBusBuffer})
-	return bus, err == nil, wrapCfgErr("创建默认 SystemBus 失败", err)
+	return bus, err == nil, wrapInitErr("SystemBus", err)
 }
 func buildEngineGate(cfg Config, profile gate.PolicyProfileKind, policy gate.GuardrailPolicy, bus *events.SystemBus, p *pool.Pool) (*gate.Gate, error) {
 	userOnHalt := cfg.OnHalt
@@ -155,7 +161,7 @@ func buildEngineGate(cfg Config, profile gate.PolicyProfileKind, policy gate.Gua
 			}
 		},
 	})
-	return g, wrapCfgErr("初始化安全门控失败", err)
+	return g, wrapInitErr("gate", err)
 }
 func (e *Engine) initServices(cfg Config, rp resolvedPorts) (err error) {
 	bridge := &pendingRefBridge{}
@@ -164,7 +170,7 @@ func (e *Engine) initServices(cfg Config, rp resolvedPorts) (err error) {
 			Gate: e.gate, Vault: cfg.Vault, VaultControl: cfg.VaultControl, Store: cfg.InventoryStore,
 			Interaction: cfg.Interaction, Clock: cfg.Clock, Entropy: cfg.Entropy, PendingRefs: bridge,
 		}); err != nil {
-			return wrapCfgErr("初始化凭据服务失败", err)
+			return wrapInitErr("credential service", err)
 		}
 	}
 	if e.inventory, err = ucinv.NewService(ucinv.ServiceConfig{
@@ -174,7 +180,7 @@ func (e *Engine) initServices(cfg Config, rp resolvedPorts) (err error) {
 		Clock: cfg.Clock, Entropy: cfg.Entropy, Importers: cfg.Importers, KnownStores: cfg.KnownStores,
 		DefaultEnrollTTL: cfg.DefaultEnrollTTL.OrElse(zeroVal[algebraic.Duration]()),
 	}); err != nil {
-		return wrapCfgErr("初始化资产服务失败", err)
+		return wrapInitErr("inventory service", err)
 	}
 	bridge.inv.Store(e.inventory)
 	if e.session, err = ucsess.NewService(ucsess.ServiceConfig{
@@ -182,7 +188,7 @@ func (e *Engine) initServices(cfg Config, rp resolvedPorts) (err error) {
 		Escalator: rp.escalator, Vault: cfg.Vault, Interaction: cfg.Interaction,
 		ShellProbe: rp.shellProbe, Forwarder: rp.forwarder, TUNDevice: cfg.TUNDevice, MuxSocket: rp.muxSocket,
 	}); err != nil {
-		return wrapCfgErr("初始化会话服务失败", err)
+		return wrapInitErr("session service", err)
 	}
 	e.muxActivity.bind(e.session)
 	return e.initTransferAutoObsServices(cfg, rp)
@@ -193,7 +199,7 @@ func (e *Engine) initTransferAutoObsServices(cfg Config, rp resolvedPorts) (err 
 		OperatorReadFS: cfg.OperatorReadFS, Journals: cfg.JournalStore, SystemBus: e.bus,
 		DefaultChunkSize: cfg.TransferDefaultChunkSize, DefaultMaxReadBytes: cfg.TransferDefaultMaxReadBytes, DefaultConcurrency: cfg.TransferDefaultConcurrency,
 	}); err != nil {
-		return wrapCfgErr("初始化传输服务失败", err)
+		return wrapInitErr("transfer service", err)
 	}
 	// 派生共享活跃句柄表但物理 0 OperatorReadFS 的 MCP 沙箱传输视图，消除同进程 InspectTransfer 视角分裂。
 	e.mcpTransfer = e.transfer.WithoutOperatorReadFS()
@@ -203,20 +209,20 @@ func (e *Engine) initTransferAutoObsServices(cfg Config, rp resolvedPorts) (err 
 		MaxScriptBytes: cfg.AutomationMaxScriptBytes, MaxTemplateBytes: cfg.AutomationMaxTemplateBytes, MaxCopyBytes: cfg.AutomationMaxCopyBytes,
 	}
 	if e.automation, err = ucauto.NewService(aCfg); err != nil {
-		return wrapCfgErr("初始化自动化服务失败", err)
+		return wrapInitErr("automation service", err)
 	}
 	e.mcpAutomation = e.automation
 	if cfg.OperatorReadFS != nil {
 		aCfg.OperatorReadFS = nil
 		if e.mcpAutomation, err = ucauto.NewService(aCfg); err != nil {
-			return wrapCfgErr("初始化 MCP 沙箱自动化服务失败", err)
+			return wrapInitErr("MCP sandbox automation service", err)
 		}
 	}
 	e.observability, err = ucobs.NewService(ucobs.ServiceConfig{
 		Gate: e.gate, Pool: e.pool, Clock: cfg.Clock, Entropy: cfg.Entropy, Env: cfg.Env,
 		ScopedFS: cfg.ScopedFS, Forwarder: rp.forwarder, ShellProbe: rp.shellProbe, SystemBus: e.bus,
 	})
-	return wrapCfgErr("初始化可观测性与 GUI 服务失败", err)
+	return wrapInitErr("observability service", err)
 }
 
 // ReconcileCrashedAudits 执行启动期 O(1) 跨进程崩溃审计对账（ADR-008 / RFC §3.4）。
@@ -228,7 +234,7 @@ func (e *Engine) ReconcileCrashedAudits(ctx context.Context) (ReconcileReport, e
 func (e *Engine) NewOperationStream(ctx context.Context, buffer int) (*events.OperationStream, error) {
 	return runOp(e, ctx, func(context.Context) (*events.OperationStream, error) {
 		if buffer < 0 {
-			return nil, fmt.Errorf("%w: OperationStream 缓冲容量不能为负", ErrInvalidRequest)
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "OperationStream buffer"))
 		}
 		if buffer == 0 {
 			buffer = defaultOperationStreamBuffer
@@ -236,7 +242,7 @@ func (e *Engine) NewOperationStream(ctx context.Context, buffer int) (*events.Op
 		tid, e1 := trace.NewTraceIDFrom(e.entropy)
 		oid, e2 := trace.NewOpIDFrom(e.entropy)
 		if err := errors.Join(e1, e2); err != nil {
-			return nil, fmt.Errorf("engine: 分配 TraceID/OperationID 失败: %w", err)
+			return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "allocate TraceID/OperationID"))
 		}
 		return events.NewOperationStream(events.OperationStreamConfig{TraceID: tid, OperationID: oid, OperationBuffer: buffer})
 	})

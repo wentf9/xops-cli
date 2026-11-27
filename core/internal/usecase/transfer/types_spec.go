@@ -11,13 +11,12 @@
 package transfer
 
 import (
-	"errors"
-	"fmt"
 	"io/fs"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -45,23 +44,23 @@ const (
 
 // 本包导出的不可变哨兵错误，供 core/engine、mcpruntime 与测试经 errors.Is 精确区分故障类别。
 var (
-	ErrNilContext              = errors.New("usecase/transfer: context 不能为 nil")
-	ErrInvalidConfig           = errors.New("usecase/transfer: 无效的 ServiceConfig 配置")
-	ErrServiceNotInitialized   = errors.New("usecase/transfer: Service 未初始化")
-	ErrInvalidRequest          = errors.New("usecase/transfer: 无效的传输请求")
-	ErrOperatorReadUnavailable = errors.New("usecase/transfer: 未配置 OperatorReadFS，拒绝读取操作员本地路径")
-	ErrScopedFSUnavailable     = errors.New("usecase/transfer: 未配置 ScopedRootFS")
-	ErrJournalStoreUnavailable = errors.New("usecase/transfer: 未配置 JournalStore")
-	ErrPatchConflict           = errors.New("usecase/transfer: 远端文件补丁应用冲突")
-	ErrPatchNoMatch            = errors.New("usecase/transfer: 补丁目标文本未找到匹配项")
-	ErrPatchAmbiguous          = errors.New("usecase/transfer: 补丁目标文本存在多处歧义匹配")
-	ErrUncertainCommit         = errors.New("usecase/transfer: 传输处于 TransferUncertainCommit，严禁重试或清理")
-	ErrCorruptJournal          = errors.New("usecase/transfer: 传输 Journal 损坏或违反恢复不变量")
-	ErrTransferNotFound        = errors.New("usecase/transfer: 传输任务不存在")
-	ErrTransferHandleMismatch  = errors.New("usecase/transfer: 传输托管句柄与目标任务不匹配")
-	ErrSymlinkPolicyDenied     = errors.New("usecase/transfer: 符号链接被安全策略拒绝")
-	ErrRemoteObjectUnsupported = errors.New("usecase/transfer: 远端对象类型不受支持")
-	ErrDigestMismatch          = errors.New("usecase/transfer: SHA-256 摘要校验不匹配")
+	ErrNilContext              = domi18n.Sentinel(domi18n.KeyUCTransferNilContext)
+	ErrInvalidConfig           = domi18n.Sentinel(domi18n.KeyUCTransferInvalidCfg)
+	ErrServiceNotInitialized   = domi18n.Sentinel(domi18n.KeyUCTransferNotInit)
+	ErrInvalidRequest          = domi18n.Sentinel(domi18n.KeyUCTransferInvalidReq)
+	ErrOperatorReadUnavailable = domi18n.Sentinel(domi18n.KeyUCTransferOpReadUnav)
+	ErrScopedFSUnavailable     = domi18n.Sentinel(domi18n.KeyUCTransferScopedUnav)
+	ErrJournalStoreUnavailable = domi18n.Sentinel(domi18n.KeyUCTransferJournalUnav)
+	ErrPatchConflict           = domi18n.Sentinel(domi18n.KeyUCTransferPatchConf)
+	ErrPatchNoMatch            = domi18n.Sentinel(domi18n.KeyUCTransferPatchNoHit)
+	ErrPatchAmbiguous          = domi18n.Sentinel(domi18n.KeyUCTransferPatchAmbig)
+	ErrUncertainCommit         = domi18n.Sentinel(domi18n.KeyUCTransferUncertain)
+	ErrCorruptJournal          = domi18n.Sentinel(domi18n.KeyUCTransferCorruptJrn)
+	ErrTransferNotFound        = domi18n.Sentinel(domi18n.KeyUCTransferNotFound)
+	ErrTransferHandleMismatch  = domi18n.Sentinel(domi18n.KeyUCTransferHandleDiff)
+	ErrSymlinkPolicyDenied     = domi18n.Sentinel(domi18n.KeyUCTransferSymlinkDeny)
+	ErrRemoteObjectUnsupported = domi18n.Sentinel(domi18n.KeyUCTransferRemoteUnsup)
+	ErrDigestMismatch          = domi18n.Sentinel(domi18n.KeyUCTransferDigestDiff)
 )
 
 // ServiceConfig 定义 transfer.Service 的出站依赖与限流；MCP 路径物理上不注入 OperatorReadFS。
@@ -133,11 +132,11 @@ type LocalUploadSource struct {
 // NewOperatorUploadSource / NewScopedUploadSource 构造双模态不可变上传源规格（Scoped 零 OperatorReadFS 依赖）。
 func NewOperatorUploadSource(src pathalg.LocalSourcePath, policy pathalg.SymlinkPolicy) (LocalUploadSource, error) {
 	ok := src.IsValid() && policy.IsValid()
-	return pickIf(ok, LocalUploadSource{kind: LocalUploadSourceOperator, operatorPath: src, symlinkPolicy: policy, valid: true}, LocalUploadSource{}), pickIf[error](ok, nil, fmt.Errorf("%w: OperatorUploadSource 参数无效", ErrInvalidRequest))
+	return pickIf(ok, LocalUploadSource{kind: LocalUploadSourceOperator, operatorPath: src, symlinkPolicy: policy, valid: true}, LocalUploadSource{}), pickIf[error](ok, nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "OperatorUploadSource")))
 }
 func NewScopedUploadSource(rootDir pathalg.LocalDir, rel pathalg.LocalRootedDest) (LocalUploadSource, error) {
 	ok := rootDir.IsValid() && rel.IsValid()
-	return pickIf(ok, LocalUploadSource{kind: LocalUploadSourceScoped, scopedRoot: rootDir, scopedPath: rel, valid: true}, LocalUploadSource{}), pickIf[error](ok, nil, fmt.Errorf("%w: ScopedUploadSource 参数无效", ErrInvalidRequest))
+	return pickIf(ok, LocalUploadSource{kind: LocalUploadSourceScoped, scopedRoot: rootDir, scopedPath: rel, valid: true}, LocalUploadSource{}), pickIf[error](ok, nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ScopedUploadSource")))
 }
 func (s LocalUploadSource) IsValid() bool {
 	return s.valid && pickIf(s.kind == LocalUploadSourceOperator, s.operatorPath.IsValid() && s.symlinkPolicy.IsValid(), s.kind == LocalUploadSourceScoped && s.scopedRoot.IsValid() && s.scopedPath.IsValid())
@@ -161,7 +160,7 @@ type TextEdit struct {
 
 // NewTextEdit 校验旧文本非空后构造不可变 TextEdit。
 func NewTextEdit(oldText, newText string, replaceAll bool) (TextEdit, error) {
-	return pickIf(oldText != "", TextEdit{oldText: oldText, newText: newText, replaceAll: replaceAll, valid: true}, TextEdit{}), pickIf[error](oldText != "", nil, fmt.Errorf("%w: TextEdit.OldText 不能为空", ErrInvalidRequest))
+	return pickIf(oldText != "", TextEdit{oldText: oldText, newText: newText, replaceAll: replaceAll, valid: true}, TextEdit{}), pickIf[error](oldText != "", nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "TextEdit.OldText")))
 }
 func (e TextEdit) IsValid() bool    { return e.valid && e.oldText != "" }
 func (e TextEdit) OldText() string  { return pickIf(e.IsValid(), e.oldText, "") }

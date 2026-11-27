@@ -5,11 +5,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/mcpruntime/protocol"
 )
 
@@ -22,7 +22,7 @@ const stdioReadBufBytes = 64 * 1024
 //     调用方需同时关闭传入的 in 读端以立即解除底层阻塞读取并完成优雅停机。
 func (s *Server) ServeStdio(ctx context.Context, in io.Reader, out io.Writer) error {
 	if in == nil || out == nil {
-		return fmt.Errorf("%w: stdio 输入与输出流不能为 nil", ErrInvalidConfig)
+		return domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "stdio reader/writer"))
 	}
 	runCtx, cleanup, err := s.beginTransport(ctx)
 	if err != nil {

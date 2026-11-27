@@ -2,11 +2,11 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/events"
@@ -25,11 +25,11 @@ func toAutoTargetNodes(targets []ResolvedTarget) ([]ucauto.TargetNode, error) {
 	out := make([]ucauto.TargetNode, 0, len(targets))
 	for i, t := range targets {
 		if !t.IsValid() {
-			return nil, fmt.Errorf("%w: targets[%d] 无效", ErrInvalidRequest, i)
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "targets"), domi18n.Int("index", i))
 		}
 		nid, err := mcptools.SynthesizeTargetNodeID(t.NodeID(), t.OriginKind(), t.Plan())
 		if err != nil {
-			return nil, fmt.Errorf("%w: targets[%d] 节点标识 %q 非法: %w", ErrInvalidRequest, i, t.NodeID(), err)
+			return nil, domi18n.WrapS(ErrInvalidRequest, err, domi18n.KeyCommonIndexValueInvalid, domi18n.Str("field", "targets"), domi18n.Int("index", i), domi18n.BoundStr("value", t.NodeID()))
 		}
 		spec := ucauto.TargetNodeSpec{NodeID: nid, Plan: t.Plan()}
 		if t.OriginKind() == option.OriginManaged {
@@ -37,7 +37,7 @@ func toAutoTargetNodes(targets []ResolvedTarget) ([]ucauto.TargetNode, error) {
 		}
 		tn, err := ucauto.NewTargetNode(spec)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+			return nil, domi18n.WrapSentinel(ErrInvalidRequest, err)
 		}
 		out = append(out, tn)
 	}

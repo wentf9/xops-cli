@@ -2,13 +2,13 @@ package inventory
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"maps"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -148,13 +148,13 @@ func validateImportSource(src ImportSourceRequest, expRev algebraic.Option[ports
 	b, _ := src.Bundle.Get()
 	switch {
 	case expRev.IsSome() && !expRev.OrElse(zeroVal[ports.Revision]()).IsValid():
-		return fmt.Errorf("%w: ExpectedRevision 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExpectedRevision"))
 	case hasBundle && (hasFormat || hasReader):
-		return fmt.Errorf("%w: Bundle 与 Format/Reader 互斥，不可同时指定", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonMutuallyExclusive, domi18n.Str("first", "Bundle"), domi18n.Str("second", "Format/Reader"))
 	case hasBundle && !b.IsValid():
-		return fmt.Errorf("%w: %w", ErrInvalidRequest, inventory.ErrInvalidImportBundle)
+		return domi18n.WrapSentinel(ErrInvalidRequest, inventory.ErrInvalidImportBundle)
 	case !hasBundle && (!hasFormat || !hasReader):
-		return fmt.Errorf("%w: 必须提供 Bundle 或完整的 (Format, Reader)", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonOneOfRequired, domi18n.Str("options", "Bundle, (Format, Reader)"))
 	}
 	return nil
 }
@@ -213,7 +213,7 @@ func (s *Service) execApplyImport(ctx context.Context, req ApplyImportRequest) (
 	}
 	baseRes := ImportResult{revision: snap.Revision(), report: report, valid: true}
 	if report.HasConflicts() {
-		return baseRes, "", fmt.Errorf("%w: 发现 %d 处导入冲突", ErrImportConflict, report.ConflictCount)
+		return baseRes, "", domi18n.EF(ErrImportConflict, domi18n.KeyUCInvImportConflicts, domi18n.Int("count", report.ConflictCount))
 	}
 	if req.DryRun || report.AddCount == 0 {
 		return baseRes, "", nil
@@ -235,11 +235,14 @@ func (s *Service) resolveImportBundle(ctx context.Context, req ImportSourceReque
 	fmtName := strings.ToLower(strings.TrimSpace(req.Format))
 	imp, ok := s.importers[fmtName]
 	if !ok {
-		return z, fmt.Errorf("%w: %q", ErrUnknownImportFormat, fmtName)
+		return z, domi18n.EF(ErrUnknownImportFormat, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "import format"), domi18n.BoundStr("value", fmtName))
 	}
 	bundle, err := imp.Import(ctx, pickIf(strings.TrimSpace(req.SourceName) != "", req.SourceName, fmtName), req.Reader)
-	if err != nil || !bundle.IsValid() {
-		return z, pickIf[error](err != nil, err, fmt.Errorf("%w: 导入器 %q 返回无效 ImportBundle", inventory.ErrInvalidImportBundle, fmtName))
+	if err != nil {
+		return z, err
+	}
+	if !bundle.IsValid() {
+		return z, domi18n.EF(inventory.ErrInvalidImportBundle, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "import bundle validation"), domi18n.BoundStr("target", fmtName))
 	}
 	return bundle, nil
 }
@@ -276,12 +279,12 @@ func (s *Service) Doctor(ctx context.Context, req DoctorRequest) (DoctorReport, 
 func (s *Service) runDoctor(ctx context.Context, req DoctorRequest, pending []inventory.PendingSecretRef) DoctorReport {
 	rep := DoctorReport{Healthy: true, ActivePendingCount: len(pending)}
 	for _, p := range pending {
-		addFinding(&rep, DoctorSeverityInfo, "active_pending_secret_pin", p.Ref.String(), "凭据正由暂存登记租约钉住防 GC: "+p.OwnerID)
+		addFinding(&rep, DoctorSeverityInfo, "active_pending_secret_pin", p.Ref.String(), "secret is pinned by pending enrollment lease to prevent GC: "+p.OwnerID)
 	}
 	var allRefs []inventory.SecretReference
 	var graphStores []string
 	if snap, err := s.store.Load(ctx); err != nil {
-		addFinding(&rep, DoctorSeverityError, "store_load_failed", "", "加载资产存储快照失败: "+err.Error())
+		addFinding(&rep, DoctorSeverityError, "store_load_failed", "", "failed to load inventory store snapshot: "+err.Error())
 		for _, p := range pending {
 			allRefs = append(allRefs, inventory.SecretReference{Location: inventory.SecretLocPending, OwnerID: p.OwnerID, Ref: p.Ref})
 		}
@@ -304,7 +307,7 @@ func (s *Service) runDoctor(ctx context.Context, req DoctorRequest, pending []in
 }
 func (s *Service) doctorCheckGraphTopology(ctx context.Context, g inventory.Graph, checkKeys bool, rep *DoctorReport) {
 	if dagRep, err := inventory.ValidateProxyDAG(g.Nodes(), s.doctorCheckOpenSSH(ctx, g, rep), s.maxJumpDepth); err != nil {
-		addFinding(rep, DoctorSeverityError, "proxy_dag_invalid", "", "跨命名空间 ProxyJump DAG 校验失败: "+err.Error())
+		addFinding(rep, DoctorSeverityError, "proxy_dag_invalid", "", "cross-namespace ProxyJump DAG validation failed: "+err.Error())
 	} else {
 		rep.DAGMaxDepth = dagRep.MaxObservedDepth
 	}
@@ -313,12 +316,12 @@ func (s *Service) doctorCheckGraphTopology(ctx context.Context, g inventory.Grap
 	}
 	for _, h := range g.Hosts() {
 		if len(g.FindHostReferences(h.ID())) == 0 {
-			addFinding(rep, DoctorSeverityInfo, "unused_host", h.ID().String(), "Host 未被任何 Node 引用")
+			addFinding(rep, DoctorSeverityInfo, "unused_host", h.ID().String(), "Host is not referenced by any Node")
 		}
 	}
 	for _, id := range g.Identities() {
 		if len(g.FindIdentityReferences(id.ID())) == 0 {
-			addFinding(rep, DoctorSeverityInfo, "unused_identity", id.ID().String(), "Identity 未被任何 Node 引用")
+			addFinding(rep, DoctorSeverityInfo, "unused_identity", id.ID().String(), "Identity is not referenced by any Node")
 		}
 	}
 }
@@ -328,25 +331,25 @@ func (s *Service) doctorCheckOpenSSH(ctx context.Context, g inventory.Graph, rep
 	}
 	vhs, err := s.openSSH.ListVirtualHosts(ctx)
 	if err != nil {
-		addFinding(rep, DoctorSeverityWarn, "openssh_source_error", "", "读取 OpenSSH 只读配置失败: "+err.Error())
+		addFinding(rep, DoctorSeverityWarn, "openssh_source_error", "", "failed to read OpenSSH read-only configuration: "+err.Error())
 		return nil
 	}
 	managed := indexManagedNames(g.Nodes())
 	for _, vh := range vhs {
 		if vh.IsValid() && managed[vh.Alias()] {
-			addFinding(rep, DoctorSeverityWarn, "openssh_alias_shadowed", vh.Alias(), "托管节点 ID 或别名遮蔽了同名 OpenSSH Host 别名")
+			addFinding(rep, DoctorSeverityWarn, "openssh_alias_shadowed", vh.Alias(), "managed node ID or alias shadows OpenSSH Host alias")
 		}
 	}
 	jns, err := virtualHostsToJumpNodes(vhs)
 	if err != nil {
-		addFinding(rep, DoctorSeverityWarn, "openssh_jump_invalid", "", "OpenSSH 虚拟主机跳板配置无效: "+err.Error())
+		addFinding(rep, DoctorSeverityWarn, "openssh_jump_invalid", "", "invalid OpenSSH virtual host jump configuration: "+err.Error())
 		return nil
 	}
 	return jns
 }
 func (s *Service) doctorCheckPrivateKeys(ctx context.Context, g inventory.Graph, rep *DoctorReport) {
 	if s.keySigner == nil {
-		addFinding(rep, DoctorSeverityWarn, "key_signer_unavailable", "", "未配置 KeySignerPort，无法执行私钥核验")
+		addFinding(rep, DoctorSeverityWarn, "key_signer_unavailable", "", "KeySignerPort is not configured; skipping private key verification")
 		return
 	}
 	for _, id := range g.Identities() {
@@ -377,13 +380,13 @@ func (s *Service) checkPrivateKeySet(ctx context.Context, ownerID string, pk *in
 	matched, inspected := !hasPB, false
 	for _, kp := range pk.KeyPaths().Slice() {
 		if fp, err := s.keySigner.InspectPrivateKeyFingerprint(ctx, kp, passOpt); err != nil {
-			addFinding(rep, DoctorSeverityError, "private_key_inspect_failed", ownerID, "核验私钥失败 ("+kp.String()+"): "+err.Error())
+			addFinding(rep, DoctorSeverityError, "private_key_inspect_failed", ownerID, "failed to verify private key ("+kp.String()+"): "+err.Error())
 		} else {
 			inspected, matched = true, matched || (hasPB && fp.Equal(pb.KeyFingerprint()))
 		}
 	}
 	if hasPB && inspected && !matched {
-		addFinding(rep, DoctorSeverityError, "private_key_fingerprint_mismatch", ownerID, "加密私钥实际指纹与配置绑定指纹不一致")
+		addFinding(rep, DoctorSeverityError, "private_key_fingerprint_mismatch", ownerID, "encrypted private key fingerprint does not match configured binding")
 	}
 }
 func addFinding(rep *DoctorReport, sev DoctorSeverity, code, subject, msg string) {

@@ -9,6 +9,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -71,14 +72,14 @@ func (s *Service) FindReferences(ctx context.Context, req FindReferencesRequest)
 		return nil, ErrStoreUnavailable
 	}
 	if !req.Ref.IsValid() {
-		return nil, fmt.Errorf("%w: Ref 无效", ErrInvalidRequest)
+		return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Ref"))
 	}
 	gateReq, err := buildInspectGateRequest(
 		"find_secret_references", "", map[string]string{"secret_ref": req.Ref.String()},
 		req.Risk.OrElse(security.RiskSafe), "find secret references "+req.Ref.String(), req.Approval, req.OperationStream,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return nil, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	var refs []inventory.SecretReference
 	err = gate.WithAuthorized[security.CapInspect](ctx, s.gate, gateReq, func(authCtx context.Context, _ gate.Authorized[security.CapInspect]) error {
@@ -113,7 +114,7 @@ func (s *Service) DeleteSecret(ctx context.Context, req DeleteSecretRequest) err
 		return ErrStoreUnavailable
 	}
 	if !req.Ref.IsValid() {
-		return fmt.Errorf("%w: Ref 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Ref"))
 	}
 	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, "delete secret "+req.Ref.String())
 	gateReq, err := buildMutateGateRequest(
@@ -121,7 +122,7 @@ func (s *Service) DeleteSecret(ctx context.Context, req DeleteSecretRequest) err
 		req.Risk.OrElse(security.RiskDangerous), summary, req.Approval, req.OperationStream,
 	)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	return gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[security.CapMutate]) error {
 		snap, lErr := s.store.Load(authCtx)
@@ -163,7 +164,7 @@ func (s *Service) GCUnreferencedSecrets(ctx context.Context, req GCUnreferencedR
 	summary := pickIf(req.ScopeSummary != "", req.ScopeSummary, fmt.Sprintf("gc %d candidate secrets", len(candidates)))
 	gateReq, err := buildMutateGateRequest("vault_gc_secrets", "", nil, req.Risk.OrElse(security.RiskModerate), summary, req.Approval, req.OperationStream)
 	if err != nil {
-		return GCUnreferencedResult{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+		return GCUnreferencedResult{}, domi18n.WrapSentinel(ErrInvalidRequest, err)
 	}
 	var out GCUnreferencedResult
 	err = gate.WithAuthorized[security.CapMutate](ctx, s.gate, gateReq, func(authCtx context.Context, auth gate.Authorized[security.CapMutate]) error {
@@ -244,7 +245,7 @@ func reportUnknownAuditOutcome(auth gate.Authorized[security.CapMutate], code, d
 // 保留私钥指纹绑定、AuthComposite 嵌套结构与全图不变量，返回新图与替换计数。
 func ReplaceSecretRefInGraph(g inventory.Graph, oldRef, newRef secret.Ref) (inventory.Graph, int, error) {
 	if !g.IsValid() || !oldRef.IsValid() || !newRef.IsValid() || oldRef.Equal(newRef) {
-		return zeroVal[inventory.Graph](), 0, fmt.Errorf("%w: 图或新旧凭据引用无效", ErrInvalidRequest)
+		return zeroVal[inventory.Graph](), 0, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "graph/oldRef/newRef"))
 	}
 	nextIdents, identCount, err := replaceSecretInIdentities(g.Identities(), oldRef, newRef)
 	if err != nil {
@@ -256,7 +257,7 @@ func ReplaceSecretRefInGraph(g inventory.Graph, oldRef, newRef secret.Ref) (inve
 	}
 	knownStores := g.KnownStores()
 	if len(knownStores) > 0 && !slices.Contains(knownStores, newRef.Store()) {
-		return zeroVal[inventory.Graph](), 0, fmt.Errorf("%w: 新凭据存储 %q 不在 KnownStores 内", inventory.ErrUnknownSecretStore, newRef.Store())
+		return zeroVal[inventory.Graph](), 0, domi18n.EF(inventory.ErrUnknownSecretStore, domi18n.KeyUCCredStoreUnknown, domi18n.BoundStr("store", newRef.Store()))
 	}
 	nextGraph, err := inventory.NewGraph(inventory.GraphSpec{
 		Hosts:        g.Hosts(),
@@ -428,9 +429,9 @@ func canonicalizeSecretRefs(raw []secret.Ref) ([]secret.Ref, error) {
 		return nil, nil
 	}
 	out := slices.Clone(raw)
-	for _, r := range out {
+	for i, r := range out {
 		if !r.IsValid() {
-			return nil, fmt.Errorf("%w: Candidates 包含无效 Ref", ErrInvalidRequest)
+			return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "Candidates"), domi18n.Int("index", i))
 		}
 	}
 	slices.SortFunc(out, secret.Ref.Compare)

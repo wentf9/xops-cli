@@ -1,10 +1,10 @@
 package inventory
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -19,7 +19,7 @@ import (
 func compileHopAuth(policy option.EffectivePolicy, user option.Username, env ports.EnvPort, explicit inventory.AuthMethod) (inventory.AuthMethod, error) {
 	if explicit != nil {
 		if !explicit.IsValid() {
-			return nil, fmt.Errorf("%w: 显式 AuthMethod 无效", ErrNoAuthMethod)
+			return nil, domi18n.EF(ErrNoAuthMethod, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "explicit AuthMethod"))
 		}
 		return explicit, nil
 	}
@@ -52,7 +52,7 @@ func assembleOrderedAuth(explicitKeys bool, privKey, agentAuth, kiAuth inventory
 	}
 	switch len(methods) {
 	case 0:
-		return nil, fmt.Errorf("%w: %w", ErrNoAuthMethod, ports.ErrAuthFailed)
+		return nil, domi18n.WrapSentinel(ErrNoAuthMethod, ports.ErrAuthFailed)
 	case 1:
 		return methods[0], nil
 	default:
@@ -98,7 +98,7 @@ func expandOptionPaths[T any](list option.PathList, label string, tc option.Toke
 		}
 		v, err := parse(expanded)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %s %q 无效: %w", ErrInvalidTarget, label, entry.String(), err)
+			return nil, domi18n.WrapS(ErrInvalidTarget, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", label), domi18n.BoundStr("value", entry.String()))
 		}
 		out = append(out, v)
 	}
@@ -161,17 +161,17 @@ func expandOptionPathEntry(entry option.PathEntry, tc option.TokenContext, env p
 		expanded, err = expandEnvBraces(expanded, env)
 	}
 	if err != nil {
-		return "", fmt.Errorf("%w: 展开路径模板 %q 失败: %w", ErrInvalidTarget, raw, err)
+		return "", domi18n.WrapS(ErrInvalidTarget, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "expand path template"), domi18n.BoundStr("target", raw))
 	}
 	if strings.ContainsRune(expanded, '%') || strings.Contains(expanded, "${") {
-		return "", fmt.Errorf("%w: 路径模板 %q 展开后包含受禁字符 '%%' 或 '${'（拒绝以防下游二次展开）", ErrInvalidTarget, raw)
+		return "", domi18n.EF(ErrInvalidTarget, domi18n.KeyUCInvTemplateToken, domi18n.BoundStr("template", raw))
 	}
 	return expanded, nil
 }
 
 func expandEnvBraces(raw string, env ports.EnvPort) (string, error) {
 	if env == nil {
-		return "", fmt.Errorf("未注入 EnvPort，无法展开环境变量引用")
+		return "", domi18n.E(domi18n.KeyCommonMissingDep, domi18n.Str("component", "EnvPort"))
 	}
 	var b strings.Builder
 	b.Grow(len(raw))
@@ -184,12 +184,12 @@ func expandEnvBraces(raw string, env ports.EnvPort) (string, error) {
 		b.WriteString(raw[i : i+idx])
 		end := strings.IndexByte(raw[i+idx+2:], '}')
 		if end <= 0 {
-			return "", fmt.Errorf("存在未闭合或空的环境变量占位符")
+			return "", domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "environment variable placeholder"))
 		}
 		name := raw[i+idx+2 : i+idx+2+end]
 		val, ok := env.LookupEnv(name)
 		if !ok || val == "" {
-			return "", fmt.Errorf("环境变量 %q 未设置或为空", name)
+			return "", domi18n.E(domi18n.KeyUCInvEnvVarMissing, domi18n.BoundStr("name", name))
 		}
 		b.WriteString(val)
 		i += idx + 2 + end + 1

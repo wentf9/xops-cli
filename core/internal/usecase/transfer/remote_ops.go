@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
@@ -67,11 +68,11 @@ func (s *Service) RemoveDir(ctx context.Context, req RemoveDirRequest) error {
 	return runSFTPPathMut(ctx, s, req, "remove_dir", ports.RemoteFSPort.RemoveDir)
 }
 func (s *Service) Chmod(ctx context.Context, req ChmodRequest) error {
-	preErr := pickIf[error](req.Perm != 0 && req.Perm == req.Perm.Perm(), nil, fmt.Errorf("%w: Chmod 权限位 %#o 非法", ErrInvalidRequest, req.Perm))
+	preErr := pickIf[error](req.Perm != 0 && req.Perm == req.Perm.Perm(), nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonPermInvalid, domi18n.Str("perm", fmt.Sprintf("%#o", req.Perm))))
 	return runSFTPMut(ctx, s, req.CallBase, "chmod", req.Path, map[string]string{"perm": fmt.Sprintf("%#o", req.Perm)}, preErr, func(c context.Context, rfs ports.RemoteFSPort) error { return rfs.Chmod(c, req.Path, req.Perm) })
 }
 func (s *Service) Chtimes(ctx context.Context, req ChtimesRequest) error {
-	preErr := pickIf[error](validRFC3339(req.Atime) && validRFC3339(req.Mtime), nil, fmt.Errorf("%w: Chtimes 时间戳非法", ErrInvalidRequest))
+	preErr := pickIf[error](validRFC3339(req.Atime) && validRFC3339(req.Mtime), nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Atime/Mtime")))
 	return runSFTPMut(ctx, s, req.CallBase, "chtimes", req.Path, nil, preErr, func(c context.Context, rfs ports.RemoteFSPort) error {
 		return rfs.Chtimes(c, req.Path, req.Atime, req.Mtime)
 	})
@@ -87,7 +88,7 @@ func (s *Service) ReadFile(ctx context.Context, req ReadFileRequest) (ReadFileRe
 }
 func (s *Service) WriteFile(ctx context.Context, req WriteFileRequest) (WriteFileResult, error) {
 	perm, e1 := resolvePerm(req.Perm, defaultRemoteFilePerm)
-	e2 := pickIf[error](int64(len(req.Content)) > maxAtomicReadBytes, fmt.Errorf("%w: 载荷超限 %d", ports.ErrLimitExceeded, maxAtomicReadBytes), nil)
+	e2 := pickIf[error](int64(len(req.Content)) > maxAtomicReadBytes, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "payload"), domi18n.Int("size", len(req.Content)), domi18n.Int64("limit", maxAtomicReadBytes)), nil)
 	writeSpec, e3 := ports.NewRemoteWriteSpec(ports.RemoteWriteSpecInput{Perm: perm, ExpectedAnchor: req.ExpectedAnchor, NoClobber: req.NoClobber, AtomicRename: true})
 	return runRemotePathOp[security.CapFileMut](ctx, s, req.CallBase, "file", "write", req.Path, security.RiskModerate, nil, firstErr(e1, e2, e3), func(c context.Context, rfs ports.RemoteFSPort) (WriteFileResult, error) {
 		if dir := req.Path.Dir(); req.CreateParents && !dir.IsRoot() && dir.String() != "." {
@@ -104,7 +105,7 @@ func (s *Service) PatchFile(ctx context.Context, req PatchFileRequest) (PatchFil
 	dig, okD := req.ExpectedDigest.Get()
 	bad := len(req.Edits) == 0 || slices.ContainsFunc(req.Edits, func(ed TextEdit) bool { return !ed.IsValid() }) || (okA && !anc.IsValid()) || (okD && !dig.IsValid())
 	limits, e2 := s.resolveReadLimits(req.MaxBytes)
-	preErr := firstErr(pickIf[error](bad, fmt.Errorf("%w: PatchFile Edits/ExpectedAnchor/ExpectedDigest 无效", ErrInvalidRequest), nil), e2)
+	preErr := firstErr(pickIf[error](bad, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Edits/ExpectedAnchor/ExpectedDigest")), nil), e2)
 	return runRemotePathOp[security.CapFileMut](ctx, s, req.CallBase, "file", "patch", req.Path, security.RiskModerate, nil, preErr, func(c context.Context, rfs ports.RemoteFSPort) (PatchFileResult, error) {
 		return executeAnchoredPatch(c, rfs, req, limits)
 	})
@@ -115,13 +116,13 @@ func executeAnchoredPatch(ctx context.Context, rfs ports.RemoteFSPort, req Patch
 		return PatchFileResult{}, err
 	}
 	if expAnc, okA := req.ExpectedAnchor.Get(); okA && !expAnc.Matches(beforeStat.Anchor()) {
-		return PatchFileResult{}, fmt.Errorf("%w: 补丁前置锚点不匹配", ports.ErrRemoteAnchorMismatch)
+		return PatchFileResult{}, domi18n.EF(ports.ErrRemoteAnchorMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExpectedAnchor"))
 	} else if expDig, okD := req.ExpectedDigest.Get(); okD && !expDig.Equal(beforeDigest) {
-		return PatchFileResult{}, fmt.Errorf("%w: %w", ErrPatchConflict, ErrDigestMismatch)
+		return PatchFileResult{}, domi18n.WrapSentinel(ErrPatchConflict, ErrDigestMismatch)
 	}
 	patched, replacements, err := applyTextEdits(string(origBytes), req.Edits)
 	if err != nil || int64(len(patched)) > maxAtomicReadBytes {
-		return PatchFileResult{}, pickIf[error](err != nil, err, fmt.Errorf("%w: 补丁后大小超限 %d", ports.ErrLimitExceeded, maxAtomicReadBytes))
+		return PatchFileResult{}, pickIf[error](err != nil, err, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "patched_file"), domi18n.Int("size", len(patched)), domi18n.Int64("limit", maxAtomicReadBytes)))
 	}
 	writeSpec, err := ports.NewRemoteWriteSpec(ports.RemoteWriteSpecInput{Perm: pickIf(beforeStat.Perm() != 0, beforeStat.Perm(), defaultRemoteFilePerm), ExpectedAnchor: algebraic.Some(beforeStat.Anchor()), AtomicRename: true})
 	var afterStat ports.RemoteFileStat
@@ -136,7 +137,7 @@ func applyTextEdits(content string, edits []TextEdit) (string, int, error) {
 	for i, ed := range edits {
 		oldStr, count := ed.OldText(), strings.Count(cur, ed.OldText())
 		if count == 0 || (!ed.ReplaceAll() && count > 1) {
-			return "", 0, pickIf(count == 0, fmt.Errorf("%w: %w: Edits[%d]", ErrPatchConflict, ErrPatchNoMatch, i), fmt.Errorf("%w: %w: Edits[%d] 命中 %d 处", ErrPatchConflict, ErrPatchAmbiguous, i, count))
+			return "", 0, pickIf(count == 0, domi18n.WrapS(ErrPatchConflict, ErrPatchNoMatch, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "Edits"), domi18n.Int("index", i)), domi18n.WrapS(ErrPatchConflict, ErrPatchAmbiguous, domi18n.KeyUCTransferPatchMulti, domi18n.Int("index", i), domi18n.Int("count", count)))
 		}
 		cur, total = strings.Replace(cur, oldStr, ed.NewText(), pickIf(ed.ReplaceAll(), -1, 1)), total+pickIf(ed.ReplaceAll(), count, 1)
 	}
@@ -146,7 +147,7 @@ func (s *Service) RenameFile(ctx context.Context, req RenameFileRequest) error {
 	defer closeStream(req.OperationStream)
 	hop, e1 := s.validateBaseCall(ctx, req.CallBase)
 	renameSpec, e2 := ports.NewRemoteRenameSpec(ports.RemoteRenameSpecInput{ExpectedAnchor: req.ExpectedAnchor, NoClobber: req.NoClobber})
-	if err := firstErr(e1, pickIf[error](req.OldPath.IsValid() && req.NewPath.IsValid(), nil, fmt.Errorf("%w: RenameFile 源/目标路径无效", ErrInvalidRequest)), e2); err != nil {
+	if err := firstErr(e1, pickIf[error](req.OldPath.IsValid() && req.NewPath.IsValid(), nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "OldPath/NewPath"))), e2); err != nil {
 		return err
 	}
 	spec := authOpSpec{base: req.CallBase, targetHop: hop, tool: "file", action: "rename", paths: []pathalg.RemotePath{req.OldPath, req.NewPath}, defaultRisk: security.RiskModerate, summary: "file rename " + req.OldPath.String() + " -> " + req.NewPath.String(), canonicalize: true}

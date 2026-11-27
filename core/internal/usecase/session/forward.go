@@ -3,7 +3,6 @@ package session
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strconv"
 	"sync"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -67,10 +67,10 @@ func (i ForwardInfo) Done() <-chan struct{} {
 // Wait 阻塞等待受管转发终止或 ctx 取消，并在终止后返回终态传输错误（正常 StopForward 停止返回 nil，零值严格失败关闭）。
 func (i ForwardInfo) Wait(ctx context.Context) error {
 	if ctx == nil {
-		return fmt.Errorf("%w: %w", ErrNilContext, ports.ErrNilContext)
+		return domi18n.WrapSentinel(ErrNilContext, ports.ErrNilContext)
 	}
 	if !i.IsValid() || i.doneCh == nil {
-		return fmt.Errorf("%w: %w: ForwardInfo 无效", ErrInvalidRequest, ports.ErrInvalidArgument)
+		return domi18n.WrapS(ErrInvalidRequest, ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ForwardInfo"))
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -146,7 +146,7 @@ func (s *Service) startManagedForward(leaseCtx, revokeCtx context.Context, conn 
 	}
 	if leaseCtx.Err() != nil || fh == nil || !fh.IsValid() || fh.BoundAddr() == "" {
 		_ = closeClosers(fh)
-		return nil, firstNonNilErr(leaseCtx.Err(), fmt.Errorf("%w: ForwarderPort 返回无效 ForwardHandle", ErrInvalidRequest))
+		return nil, firstNonNilErr(leaseCtx.Err(), domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ForwardHandle")))
 	}
 	mf := &managedForward{valid: true, spec: spec, boundAddr: fh.BoundAddr(), handle: fh, conn: conn, doneCh: make(chan struct{})}
 	return finishManagedForward(revokeCtx, mf, func(wCtx context.Context) error {
@@ -175,7 +175,7 @@ func (f *managedForward) watchHandle(wCtx context.Context, fh ports.ForwardHandl
 func startDirectTUNBridge(leaseCtx, revokeCtx context.Context, conn ports.TransportConn, tunPort ports.TUNDevicePort, spec ports.ForwardSpec) (*managedForward, error) {
 	tunSpec, ok := spec.TUN().Get()
 	if !ok || !tunSpec.IsValid() {
-		return nil, fmt.Errorf("%w: ForwardTUN 缺少有效 TUNSpec", ErrInvalidRequest)
+		return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "TUNSpec"))
 	}
 	hsCtx, cleanupHS := deriveHandshakeContext(leaseCtx, revokeCtx)
 	defer cleanupHS()
@@ -185,7 +185,7 @@ func startDirectTUNBridge(leaseCtx, revokeCtx context.Context, conn ports.Transp
 	}
 	if localDev == nil || ifaceName == "" {
 		_ = closeClosers(localDev)
-		return nil, fmt.Errorf("%w: TUNDevicePort 返回无效设备句柄或空接口名", ErrInvalidRequest)
+		return nil, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TUNDevice"))
 	}
 	remoteTUN, err := conn.OpenTUN(hsCtx, tunSpec)
 	if err != nil {
@@ -309,7 +309,7 @@ func (s *Service) StartForward(ctx context.Context, req StartForwardRequest) (Fo
 	}
 	gateReq, err := buildGateReq[security.CapTunnel](gateReqInput{
 		plan: req.Plan, targetHop: targetHop, nodeID: nodeID, action: "forward_start",
-		summary: fmt.Sprintf("forward %s %s -> %s on %s", req.Spec.Direction(), req.Spec.BindAddr(), req.Spec.TargetAddr(), nodeID),
+		summary: "forward " + req.Spec.Direction().String() + " " + req.Spec.BindAddr() + " -> " + req.Spec.TargetAddr() + " on " + nodeID,
 		risk:    req.Risk.OrElse(defaultForwardRisk(req.Spec)), params: buildForwardBindingParams(req.Spec, targetHop),
 		approval: req.Approval, stream: req.OperationStream,
 	})
@@ -335,13 +335,13 @@ func (s *Service) validateStartForwardCall(ctx context.Context, req StartForward
 		return err
 	}
 	if !req.Spec.IsValid() {
-		return fmt.Errorf("%w: ForwardSpec 无效", ErrInvalidRequest)
+		return domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ForwardSpec"))
 	}
 	if req.Spec.Direction() == ports.ForwardTUN && s.cfg.TUNDevice != nil {
 		return nil
 	}
 	if s.cfg.Forwarder == nil {
-		return fmt.Errorf("%w: ForwarderPort 未配置（ForwardTUN 亦可配置 TUNDevicePort）", ErrPortUnavailable)
+		return domi18n.EF(ErrPortUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ForwarderPort"))
 	}
 	return nil
 }

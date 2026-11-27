@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fmt"
 	"io"
 	"path"
 	"slices"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
@@ -41,7 +41,7 @@ func pickIf[T any](cond bool, yes, no T) T {
 func JoinRemoteBase(dir pathalg.RemotePath, base string, invalidErr error) (pathalg.RemotePath, error) {
 	name, err := pathalg.ParseRemoteName(path.Base(base))
 	if err != nil {
-		return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 非法远端文件名 %q: %w", invalidErr, base, err)
+		return zeroVal[pathalg.RemotePath](), domi18n.WrapS(invalidErr, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "remote_name"), domi18n.BoundStr("value", base))
 	}
 	return dir.Join(name)
 }
@@ -52,7 +52,7 @@ func ReadChunkExact(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.Remot
 	buf.Grow(int(want))
 	got, err := rfs.ReadChunk(ctx, p, offset, &buf, want)
 	if (err != nil && !errors.Is(err, io.EOF)) || got != want {
-		return nil, pickIf[error](err != nil && !errors.Is(err, io.EOF), err, fmt.Errorf("%w: 远端分片 offset=%d 期望 %d 实际 %d", io.ErrUnexpectedEOF, offset, want, got))
+		return nil, pickIf[error](err != nil && !errors.Is(err, io.EOF), err, domi18n.EF(io.ErrUnexpectedEOF, domi18n.KeyCommonMismatch, domi18n.Str("field", "remote_chunk_bytes"), domi18n.Int64("expected", want), domi18n.Int64("actual", got)))
 	}
 	return buf.Bytes(), nil
 }
@@ -103,9 +103,9 @@ func ResolveUploadTarget(ctx context.Context, rfs ports.RemoteFSPort, dest patha
 		return zeroVal[pathalg.RemotePath](), err
 	}
 	if exists && isDir != wantDir {
-		return zeroVal[pathalg.RemotePath](), pickIf(wantDir, fmt.Errorf("%w: 远端目标 %s 已存在且非目录", ports.ErrAlreadyExists, dest), fmt.Errorf("%w: 远端目标 %s 为目录（禁止覆写或二次展开）", ports.ErrRemoteIsDir, dest))
+		return zeroVal[pathalg.RemotePath](), pickIf(wantDir, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "exists_non_dir")), domi18n.EF(ports.ErrRemoteIsDir, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "target_is_dir")))
 	}
-	return dest, pickIf[error](exists && noClobber, fmt.Errorf("%w: 远端目标 %s 已存在（含悬空软链）", ports.ErrAlreadyExists, dest), nil)
+	return dest, pickIf[error](exists && noClobber, domi18n.EF(ports.ErrAlreadyExists, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dest.String()), domi18n.Str("reason", "no_clobber")), nil)
 }
 func expandUploadContainer(ctx context.Context, rfs ports.RemoteFSPort, dest pathalg.RemotePath, sourceBase string, invalidErr error) (pathalg.RemotePath, bool, bool, error) {
 	joined, err := JoinRemoteBase(dest, sourceBase, invalidErr)
@@ -180,7 +180,7 @@ func ResolveCanonicalPath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg
 		}
 		suffix, cur = append(suffix, base), cur.Dir()
 	}
-	return zeroVal[pathalg.RemotePath](), fmt.Errorf("%w: 远端路径规范化超限 %d", s.Invalid, maxRemoteCanonicalDepth)
+	return zeroVal[pathalg.RemotePath](), domi18n.EF(s.Invalid, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "canonical_depth"), domi18n.Int("value", maxRemoteCanonicalDepth), domi18n.Int("max", maxRemoteCanonicalDepth))
 }
 func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.RemotePath, invalidErr error) (pathalg.RemotePath, error) {
 	if p.IsAbs() {
@@ -189,7 +189,7 @@ func anchorRemotePath(ctx context.Context, rfs ports.RemoteFSPort, p pathalg.Rem
 	dot, _ := pathalg.ParseRemotePath(".")
 	cwd, err := rfs.RealPath(ctx, dot)
 	if err != nil || !cwd.IsAbs() {
-		return zeroVal[pathalg.RemotePath](), pickIf[error](err != nil, err, fmt.Errorf("%w: 远端工作目录非绝对路径", invalidErr))
+		return zeroVal[pathalg.RemotePath](), pickIf[error](err != nil, err, domi18n.EF(invalidErr, domi18n.KeyUCTransferRemoteAbs))
 	}
 	return cwd.Resolve(p)
 }
@@ -199,7 +199,7 @@ func expandDanglingSymlinkStep(ctx context.Context, rfs ports.RemoteFSPort, cur 
 		return zeroVal[pathalg.RemotePath](), false, nil
 	}
 	if err != nil || *hops >= pathalg.MaxSymlinkHops {
-		return zeroVal[pathalg.RemotePath](), false, pickIf[error](err != nil, err, fmt.Errorf("%w: 远端软链展开跳数超过上限 %d", s.Symlink, pathalg.MaxSymlinkHops))
+		return zeroVal[pathalg.RemotePath](), false, pickIf[error](err != nil, err, domi18n.EF(s.Symlink, domi18n.KeyUCTransferRemoteHops, domi18n.Int("limit", pathalg.MaxSymlinkHops)))
 	}
 	*hops++
 	raw, err := rfs.ReadLink(ctx, cur)
@@ -221,7 +221,7 @@ func expandDanglingSymlinkStep(ctx context.Context, rfs ports.RemoteFSPort, cur 
 func resolveRelativeLinkBase(ctx context.Context, rfs ports.RemoteFSPort, parent, rel pathalg.RemotePath, invalidErr error) (pathalg.RemotePath, error) {
 	realParent, err := rfs.RealPath(ctx, parent)
 	if err != nil || !realParent.IsAbs() {
-		return zeroVal[pathalg.RemotePath](), pickIf[error](err != nil, err, fmt.Errorf("%w: 远端父目录非绝对路径", invalidErr))
+		return zeroVal[pathalg.RemotePath](), pickIf[error](err != nil, err, domi18n.EF(invalidErr, domi18n.KeyUCTransferRemoteAbs))
 	}
 	return realParent.Resolve(rel)
 }
@@ -245,7 +245,7 @@ func VerifyPathAuthorized(ctx context.Context, enforce bool, rfs ports.RemoteFSP
 	}
 	cs := canon.String()
 	ok := slices.Contains(binding.CanonicalPaths(), cs) || slices.ContainsFunc(binding.RecursivePaths(), func(root string) bool { return root == "/" || cs == root || strings.HasPrefix(cs, root+"/") })
-	return pickIf[error](ok, nil, fmt.Errorf("%w: 远端路径 %s 规范化漂移至未授权目标 %s", gate.ErrScopeEscalated, target, canon))
+	return pickIf[error](ok, nil, domi18n.EF(gate.ErrScopeEscalated, domi18n.KeyUCTransferRemoteDrift, domi18n.BoundStr("path", target.String()), domi18n.BoundStr("target", canon.String())))
 }
 
 // VerifyDownloadSource 复核远端下载源未发生软链漂移且 Lstat 锚点/大小/修改时间与起始快照完全一致。
@@ -264,10 +264,10 @@ func VerifyDownloadSource(ctx context.Context, enforce bool, rfs ports.RemoteFSP
 func HashRemoteStage(ctx context.Context, rfs ports.RemoteFSPort, stageOpt algebraic.Option[pathalg.RemotePath], totalBytes uint64, chunkSize int64, invalidErr error) (security.Digest, error) {
 	stagePath, ok := stageOpt.Get()
 	if !ok {
-		return zeroVal[security.Digest](), fmt.Errorf("%w: 缺少远端暂存路径", invalidErr)
+		return zeroVal[security.Digest](), domi18n.EF(invalidErr, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "remote_stage_path"))
 	}
 	if st, err := rfs.Lstat(ctx, stagePath); err != nil || !st.IsRegular() || uint64(st.Size()) != totalBytes {
-		return zeroVal[security.Digest](), pickIf[error](err != nil, err, pickIf(!st.IsRegular(), ports.ErrNotRegularFile, fmt.Errorf("%w: 远端暂存大小 %d 与预期 %d 不符", io.ErrUnexpectedEOF, st.Size(), totalBytes)))
+		return zeroVal[security.Digest](), pickIf[error](err != nil, err, pickIf(!st.IsRegular(), ports.ErrNotRegularFile, domi18n.EF(io.ErrUnexpectedEOF, domi18n.KeyCommonMismatch, domi18n.Str("field", "remote_stage_size"), domi18n.Uint64("expected", totalBytes), domi18n.Int64("actual", st.Size()))))
 	}
 	h := sha256.New()
 	for offset := int64(0); uint64(offset) < totalBytes; {

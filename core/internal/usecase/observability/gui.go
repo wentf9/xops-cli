@@ -10,6 +10,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -39,7 +40,7 @@ func ValidateX11Display(raw string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("%w: 非法 X11 DISPLAY %q", ErrInvalidGUIInput, raw)
+	return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "DISPLAY"), domi18n.BoundStr("value", raw))
 }
 
 // ValidateWaylandDisplay 严格校验 WAYLAND_DISPLAY 格式（仅允许 "wayland-N"）。
@@ -47,22 +48,22 @@ func ValidateWaylandDisplay(raw string) error {
 	if num, ok := strings.CutPrefix(raw, "wayland-"); ok && isASCIIDigits(num, 1, 4) {
 		return nil
 	}
-	return fmt.Errorf("%w: 非法 WAYLAND_DISPLAY %q", ErrInvalidGUIInput, raw)
+	return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "WAYLAND_DISPLAY"), domi18n.BoundStr("value", raw))
 }
 
 // ValidateGUIKeySpec 严格校验按键或组合和弦名称（如 "Return"、"ctrl+c"），拒绝前导 "-"、空白与 Shell 元字符。
 func ValidateGUIKeySpec(raw string) error {
 	parts := strings.Split(raw, "+")
 	if raw == "" || len(raw) > 64 || len(parts) > 5 {
-		return fmt.Errorf("%w: 按键规格长度或节数非法 %q", ErrInvalidGUIInput, raw)
+		return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "key"), domi18n.BoundStr("value", raw))
 	}
 	for _, p := range parts {
 		if len(p) == 0 || len(p) > 24 {
-			return fmt.Errorf("%w: 非法按键标识 %q", ErrInvalidGUIInput, raw)
+			return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "key"), domi18n.BoundStr("value", raw))
 		}
 		for i := range len(p) {
 			if !isGUIKeyChar(p[i]) {
-				return fmt.Errorf("%w: 非法按键标识 %q", ErrInvalidGUIInput, raw)
+				return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "key"), domi18n.BoundStr("value", raw))
 			}
 		}
 	}
@@ -72,7 +73,7 @@ func ValidateGUIKeySpec(raw string) error {
 // ValidateGUIAction 对 GUIActionSpec 执行全量失败关闭校验（归一化坐标 [0,1000]、Display、键位、滚轮与文本边界）。
 func ValidateGUIAction(spec GUIActionSpec) error {
 	if !spec.Action.IsValid() {
-		return fmt.Errorf("%w: 未知 GUI 动作", ErrInvalidGUIInput)
+		return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "action"))
 	}
 	if spec.Display != "" {
 		if err := ValidateX11Display(spec.Display); err != nil {
@@ -100,15 +101,15 @@ func validateGUIActionArgs(spec GUIActionSpec) error {
 			return err
 		}
 		if clicks := pickIf(spec.Clicks == 0, 3, spec.Clicks); !spec.Direction.IsValid() || clicks < 1 || clicks > maxGUIClicks {
-			return fmt.Errorf("%w: 滚轮方向或步数非法", ErrInvalidGUIInput)
+			return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "scroll"))
 		}
 		return nil
 	case GUIActionType:
 		if spec.Text == "" || len(spec.Text) > maxGUITypeTextBytes || strings.ContainsRune(spec.Text, 0) {
-			return fmt.Errorf("%w: type 文本为空、超长或含 NUL", ErrInvalidGUIInput)
+			return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "text"))
 		}
 		if _, err := execution.QuotePOSIX(spec.Text); err != nil {
-			return fmt.Errorf("%w: type 文本含非法控制/Bidi/UTF-8 字符: %w", ErrInvalidGUIInput, err)
+			return domi18n.WrapS(ErrInvalidGUIInput, err, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "text"))
 		}
 		return nil
 	case GUIActionKey:
@@ -120,7 +121,7 @@ func validateGUIActionArgs(spec GUIActionSpec) error {
 
 func validateNormCoord(x, y int) error {
 	if x < 0 || x > 1000 || y < 0 || y > 1000 {
-		return fmt.Errorf("%w: 归一化坐标 (%d,%d) 须落在 [0,1000]", ErrInvalidGUIInput, x, y)
+		return domi18n.EF(ErrInvalidGUIInput, domi18n.KeyUCObsCoordsRange, domi18n.Int("x", x), domi18n.Int("y", y))
 	}
 	return nil
 }
@@ -352,7 +353,7 @@ func (s *Service) validateGUIExecRequest(ctx context.Context, req GUIExecRequest
 	}
 	if art, hasArt := req.Artifact.Get(); hasArt {
 		if !art.RootDir.IsValid() || !art.File.IsValid() {
-			return guiExecPrepared{}, fmt.Errorf("%w: Artifact 路径无效", ErrInvalidRequest)
+			return guiExecPrepared{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Artifact"))
 		}
 		if s.scopedFS == nil {
 			return guiExecPrepared{}, ErrScopedFSUnavailable
