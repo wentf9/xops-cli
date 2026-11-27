@@ -3,13 +3,13 @@ package dial
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"slices"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
@@ -43,7 +43,7 @@ func (d *Dialer) DialHop(ctx context.Context, hop plan.HopSpec, hopDigest plan.H
 
 func (d *Dialer) checkDialArgs(ctx context.Context, hop plan.HopSpec, hopDigest plan.HopDigest, parent ports.TransportConn) error {
 	if d == nil || !d.valid {
-		return fmt.Errorf("%w: Dialer 未初始化", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "Dialer"))
 	}
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -52,14 +52,14 @@ func (d *Dialer) checkDialArgs(ctx context.Context, hop plan.HopSpec, hopDigest 
 		return err
 	}
 	if !hop.IsValid() || !hopDigest.IsValid() {
-		return fmt.Errorf("%w: HopSpec 与 HopDigest 均须有效", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "HopSpec or HopDigest"))
 	}
 	if parent == nil {
 		if hop.HopIndex() > 0 {
-			return fmt.Errorf("%w: 多跳节点 hop[%d] 缺少上游 parent 连接", ports.ErrInvalidArgument, hop.HopIndex())
+			return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyDialParentRequired)
 		}
 		if _, isJump := hop.Transport().ProxyRoute().(*option.ProxyJumpChain); isJump {
-			return fmt.Errorf("%w: ProxyJump 路由要求注入上游 parent 连接（禁止退化直连）", ports.ErrInvalidArgument)
+			return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyDialParentRequired)
 		}
 	}
 	return nil
@@ -109,7 +109,7 @@ func resolveSupportedSSHAlgos(tp plan.TransportPolicySpec) (ciphers, macs, kex, 
 	kex = filterAlgorithms(tp.KexAlgorithms(), sup.KeyExchanges, insec.KeyExchanges)
 	hostKey = filterAlgorithms(tp.HostKeyAlgos(), sup.HostKeys, insec.HostKeys)
 	if len(ciphers) == 0 || len(macs) == 0 || len(kex) == 0 || len(hostKey) == 0 {
-		return nil, nil, nil, nil, fmt.Errorf("%w: 策略算法与 x/crypto/ssh 支持集交集为空", ports.ErrDialFailed)
+		return nil, nil, nil, nil, domi18n.EF(ports.ErrDialFailed, domi18n.KeyDialEmptyAlgoIntersect)
 	}
 	return ciphers, macs, kex, hostKey, nil
 }
@@ -127,32 +127,32 @@ func filterAlgorithms(policy, supported, insecure []string) []string {
 func (d *Dialer) dialUnderlyingConn(ctx context.Context, hop plan.HopSpec, parent ports.TransportConn) (net.Conn, error) {
 	if parent != nil {
 		if !parent.IsAlive() {
-			return nil, fmt.Errorf("%w: 上游父跳板已断开", ports.ErrDialFailed)
+			return nil, domi18n.EF(ports.ErrDialFailed, domi18n.KeyDialParentRequired)
 		}
 		conn, err := parent.DialTCP(ctx, hop.Endpoint().HostPort())
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			return nil, fmt.Errorf("%w: 经父跳板打开 direct-tcpip 通道失败: %w", ports.ErrDialFailed, err)
+			return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyDialDirectTCPIPFailed)
 		}
 		return conn, nil
 	}
 	if hop.HopIndex() > 0 {
-		return nil, fmt.Errorf("%w: 多跳节点 hop[%d] 缺少上游 parent 连接", ports.ErrInvalidArgument, hop.HopIndex())
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyDialParentRequired)
 	}
 	switch route := hop.Transport().ProxyRoute().(type) {
 	case nil, *option.ProxyUnset, *option.ProxyDisabled:
 		return d.dialDirectTCP(ctx, hop)
 	case *option.ProxyCommandSpec:
 		if !route.IsValid() {
-			return nil, fmt.Errorf("%w: 无效 ProxyCommandSpec", ports.ErrInvalidArgument)
+			return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ProxyCommandSpec"))
 		}
 		return d.dialProxyCommand(ctx, hop, route)
 	case *option.ProxyJumpChain:
-		return nil, fmt.Errorf("%w: ProxyJump 路由要求注入上游 parent 连接（禁止退化直连）", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyDialParentRequired)
 	default:
-		return nil, fmt.Errorf("%w: 不支持的代理路由变体 %T", ports.ErrInvalidArgument, route)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "proxy route variant"))
 	}
 }
 
@@ -162,40 +162,40 @@ func (d *Dialer) dialDirectTCP(ctx context.Context, hop plan.HopSpec) (net.Conn,
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("%w: TCP 拨号 %s 失败: %w", ports.ErrDialFailed, hop.Endpoint(), err)
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyDialTCPFailed, domi18n.BoundStr("addr", hop.Endpoint().String()))
 	}
 	return conn, nil
 }
 
 func (d *Dialer) dialProxyCommand(ctx context.Context, hop plan.HopSpec, cmdSpec *option.ProxyCommandSpec) (net.Conn, error) {
 	if d.process == nil {
-		return nil, fmt.Errorf("%w: ProxyCommand 需要注入 ProcessPort", ports.ErrDialFailed)
+		return nil, domi18n.EF(ports.ErrDialFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ProcessPort"))
 	}
 	tc := d.buildHopTokenContext(hop)
 	expanded, err := option.ExpandTokens(cmdSpec.Command().String(), tc)
 	if err != nil {
-		return nil, fmt.Errorf("%w: ProxyCommand 令牌展开失败: %w", ports.ErrDialFailed, err)
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "expand ProxyCommand tokens"))
 	}
 	parts, err := splitProxyCommandTokens(expanded)
 	if err != nil {
-		return nil, fmt.Errorf("%w: ProxyCommand 解析失败: %w", ports.ErrDialFailed, err)
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "parse ProxyCommand"))
 	}
 	if len(parts) == 0 {
-		return nil, fmt.Errorf("%w: ProxyCommand 展开为空", ports.ErrDialFailed)
+		return nil, domi18n.EF(ports.ErrDialFailed, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "ProxyCommand"))
 	}
 	procSpec, err := ports.NewProcessSpec(ports.ProcessSpecInput{
 		Command: parts[0],
 		Args:    parts[1:],
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ports.ErrDialFailed, err)
+		return nil, domi18n.WrapSentinel(ports.ErrDialFailed, err)
 	}
 	conn, err := d.process.DialStdio(ctx, procSpec)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("%w: ProxyCommand 启动失败: %w", ports.ErrDialFailed, err)
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "start ProxyCommand"))
 	}
 	return conn, nil
 }
@@ -272,7 +272,7 @@ func scanProxyQuote(raw string, start int) (string, int, error) {
 		}
 		b.WriteByte(raw[i])
 	}
-	return "", 0, fmt.Errorf("存在未闭合引号")
+	return "", 0, domi18n.E(domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ProxyCommand quotes"))
 }
 
 // performSSHHandshake 在 core/conc.RunScoped 取消看门狗保护下执行 ssh.NewClientConn，
@@ -314,7 +314,7 @@ func classifyHandshakeErr(ctx context.Context, err error) error {
 		return err
 	}
 	if strings.Contains(err.Error(), "unable to authenticate") {
-		return fmt.Errorf("%w: %w", ports.ErrAuthFailed, err)
+		return domi18n.WrapSentinel(ports.ErrAuthFailed, err)
 	}
-	return fmt.Errorf("%w: %w", ports.ErrDialFailed, err)
+	return domi18n.WrapSentinel(ports.ErrDialFailed, err)
 }

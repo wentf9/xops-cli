@@ -3,14 +3,15 @@ package pool
 import (
 	"cmp"
 	"context"
-	"fmt"
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/plan"
-	"github.com/wentf9/xops-cli/core/domain/security"
-	"github.com/wentf9/xops-cli/core/events"
 	"slices"
 	"sync"
 	"sync/atomic"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/core/domain/plan"
+	"github.com/wentf9/xops-cli/core/domain/security"
+	"github.com/wentf9/xops-cli/core/events"
 )
 
 // ManagedResource 表示可托管于连接池世代 SlotMap 的跨请求长生命周期资源契约
@@ -82,7 +83,7 @@ func registerHandleCore[K plan.HandleKind, R ComparableManagedResource](p *Pool,
 	}
 	id, err := plan.NewHandleIDFrom(p.entropy)
 	if err != nil {
-		return zero, fmt.Errorf("%w: 生成 HandleID 失败: %w", ErrInvalidHandle, err)
+		return zero, domi18n.WrapS(ErrInvalidHandle, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate HandleID"))
 	}
 	meta, err := p.slots.allocateHandle(p, id, planDigest, binding, resource, plan.HandleKindOf[K]())
 	if err != nil {

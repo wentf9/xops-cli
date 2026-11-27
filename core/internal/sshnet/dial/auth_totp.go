@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -33,7 +34,7 @@ const (
 // 绝不向外部或错误消息泄露种子明文（零 nolint）。
 func (d *Dialer) computeTOTPFromVault(ctx context.Context, ref secret.Ref) (string, error) {
 	if d.vault == nil {
-		return "", fmt.Errorf("%w: TOTP 质询需要注入 SecretVault", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SecretVault"))
 	}
 	now := time.Now()
 	if d.clock != nil {
@@ -41,7 +42,7 @@ func (d *Dialer) computeTOTPFromVault(ctx context.Context, ref secret.Ref) (stri
 	}
 	unixSec := now.Unix()
 	if unixSec < 0 {
-		return "", fmt.Errorf("%w: TOTP 时钟早于 Unix 纪元", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 	}
 	var code string
 	err := d.vault.WithSecret(ctx, ref, func(box *secret.SecretBox) error {
@@ -64,7 +65,7 @@ func (d *Dialer) computeTOTPFromVault(ctx context.Context, ref secret.Ref) (stri
 func computeTOTPFromPlainBytes(plain []byte, unixSec int64) (string, error) {
 	raw := strings.TrimSpace(string(plain))
 	if raw == "" {
-		return "", fmt.Errorf("%w: TOTP 种子为空", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 	}
 	if strings.HasPrefix(strings.ToLower(raw), "otpauth://") {
 		return computeOTPAuthTOTP(raw, unixSec)
@@ -82,7 +83,7 @@ func computeOTPAuthTOTP(raw string, unixSec int64) (string, error) {
 	hostAndPath, query, hasQuery := strings.Cut(restNoFrag, "?")
 	otpType, _, _ := strings.Cut(hostAndPath, "/")
 	if !strings.EqualFold(otpType, "totp") || !hasQuery {
-		return "", fmt.Errorf("%w: 仅支持包含查询参数的 otpauth://totp URI", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 	}
 	algo := totpAlgoSHA1
 	digits := defaultTOTPDigits
@@ -105,13 +106,13 @@ func computeOTPAuthTOTP(raw string, unixSec int64) (string, error) {
 		case "period":
 			p, pErr := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 			if pErr != nil || p <= 0 {
-				return "", fmt.Errorf("%w: TOTP period 参数须为正整数", ports.ErrAuthFailed)
+				return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 			}
 			period = p
 		}
 	}
 	if secretCount != 1 || b32Source == "" || algo == totpAlgoInvalid || digits == 0 {
-		return "", fmt.Errorf("%w: otpauth URI 缺少有效或存在重复 secret/algorithm/digits 参数", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 	}
 	return decodeURIQueryAndComputeTOTP(b32Source, algo, digits, period, unixSec)
 }
@@ -152,12 +153,12 @@ func decodeURIQueryAndComputeTOTP(raw string, algo totpAlgorithm, digits int, pe
 			c = ' '
 		case '%':
 			if i+2 >= len(raw) {
-				return "", fmt.Errorf("%w: otpauth secret 包含截断的百分号转义", ports.ErrAuthFailed)
+				return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 			}
 			hi := strings.IndexByte(hexTable, raw[i+1])
 			lo := strings.IndexByte(hexTable, raw[i+2])
 			if hi < 0 || lo < 0 {
-				return "", fmt.Errorf("%w: otpauth secret 包含非法百分号转义", ports.ErrAuthFailed)
+				return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 			}
 			c = byte(((hi & 0x0f) << 4) | (lo & 0x0f))
 			i += 2
@@ -183,14 +184,14 @@ func isIgnoredBase32Char(c byte) bool {
 //xops:secretuse
 func decodeCleanedBase32AndCompute(cleaned []byte, algo totpAlgorithm, digits int, period, unixSec int64) (string, error) {
 	if len(cleaned) == 0 {
-		return "", fmt.Errorf("%w: TOTP Base32 种子为空", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 	}
 	enc := base32.StdEncoding.WithPadding(base32.NoPadding)
 	key := make([]byte, enc.DecodedLen(len(cleaned)))
 	defer clear(key)
 	n, decErr := enc.Decode(key, cleaned)
 	if decErr != nil || n == 0 {
-		return "", fmt.Errorf("%w: TOTP Base32 密钥解码失败", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialTOTPInvalid)
 	}
 	return computeRFC6238Code(key[:n], algo, digits, period, unixSec), nil
 }

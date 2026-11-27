@@ -6,10 +6,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"fmt"
 	"io"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -58,23 +58,23 @@ func parseKnownHostsLine(rawLine string) (parsedEntry, error) {
 	}
 	marker, rest, ok := cutEntryMarker(line)
 	if !ok {
-		return parsedEntry{}, fmt.Errorf("无效 known_hosts 标记")
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid marker"))
 	}
 	hostField, rest, ok := cutSpaceField(rest)
 	if !ok {
-		return parsedEntry{}, fmt.Errorf("缺少主机字段")
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "missing host field"))
 	}
 	algo, rest, ok := cutSpaceField(rest)
 	if !ok {
-		return parsedEntry{}, fmt.Errorf("缺少算法字段")
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "missing algorithm field"))
 	}
 	keyB64, _, ok := cutSpaceField(rest)
 	if !ok {
-		return parsedEntry{}, fmt.Errorf("缺少公钥字段")
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "missing public key field"))
 	}
 	blob, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil || len(blob) == 0 {
-		return parsedEntry{}, fmt.Errorf("公钥 Base64 解码失败")
+		return parsedEntry{}, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid base64 public key"))
 	}
 	entry := parsedEntry{
 		marker:      marker,
@@ -99,15 +99,15 @@ func decodeHashedHostField(field string) (salt, digest []byte, err error) {
 	rest := strings.TrimPrefix(field, "|1|")
 	saltB64, hashB64, ok := strings.Cut(rest, "|")
 	if !ok || saltB64 == "" || hashB64 == "" || strings.ContainsRune(hashB64, '|') {
-		return nil, nil, fmt.Errorf("畸形哈希主机字段")
+		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "malformed hashed host field"))
 	}
 	salt, err = base64.StdEncoding.DecodeString(saltB64)
 	if err != nil || len(salt) == 0 {
-		return nil, nil, fmt.Errorf("哈希主机盐值解码失败")
+		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid hashed host salt"))
 	}
 	digest, err = base64.StdEncoding.DecodeString(hashB64)
 	if err != nil || len(digest) != sha1.Size {
-		return nil, nil, fmt.Errorf("哈希主机摘要解码失败")
+		return nil, nil, domi18n.E(domi18n.KeyHostKeyLineMalformed, domi18n.Str("reason", "invalid hashed host digest"))
 	}
 	return salt, digest, nil
 }
@@ -246,11 +246,11 @@ func formatHostField(ep netaddr.Endpoint, hashHost bool, entropy io.Reader) (str
 		return key, nil
 	}
 	if entropy == nil {
-		return "", fmt.Errorf("%w: 缺少哈希主机名所需的熵源", ports.ErrInvalidArgument)
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Entropy"))
 	}
 	var salt [sshHashSaltBytes]byte
 	if _, err := io.ReadFull(entropy, salt[:]); err != nil {
-		return "", fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err)
+		return "", domi18n.WrapSentinel(ports.ErrEntropyShortRead, err)
 	}
 	mac := hmac.New(sha1.New, salt[:])
 	_, _ = mac.Write([]byte(key))

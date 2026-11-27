@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -92,7 +93,7 @@ func negotiateSOCKS5Method(conn net.Conn) error {
 		return err
 	}
 	if hdr[0] != socks5Version || hdr[1] == 0 {
-		return fmt.Errorf("%w: 非法 SOCKS5 协商头", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyForwardSOCKS5Header)
 	}
 	methods := make([]byte, hdr[1])
 	if _, err := io.ReadFull(conn, methods); err != nil {
@@ -105,7 +106,7 @@ func negotiateSOCKS5Method(conn net.Conn) error {
 		}
 	}
 	_, _ = conn.Write([]byte{socks5Version, socks5MethodNoAcceptable})
-	return fmt.Errorf("%w: SOCKS5 客户端不支持无认证模式", ports.ErrPermissionDenied)
+	return domi18n.EF(ports.ErrPermissionDenied, domi18n.KeyForwardSOCKS5NoAuth)
 }
 
 // readSOCKS5ConnectTarget 解析 SOCKS5 请求并强制只接受 CONNECT 命令（拒绝 BIND 与 UDP ASSOCIATE）；
@@ -117,11 +118,11 @@ func readSOCKS5ConnectTarget(conn net.Conn) (netaddr.HostPort, error) {
 	}
 	if hdr[0] != socks5Version || hdr[2] != 0x00 {
 		_ = writeSOCKS5Reply(conn, socks5RepGeneralFailure)
-		return zeroVal[netaddr.HostPort](), fmt.Errorf("%w: 非法 SOCKS5 请求头或非零 RSV", ports.ErrInvalidArgument)
+		return zeroVal[netaddr.HostPort](), domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyForwardSOCKS5Header)
 	}
 	if hdr[1] != socks5CmdConnect {
 		_ = writeSOCKS5Reply(conn, socks5RepCmdUnsupported)
-		return zeroVal[netaddr.HostPort](), fmt.Errorf("%w: SOCKS5 仅支持 CONNECT，拒绝命令 %#x", ports.ErrUnsupported, hdr[1])
+		return zeroVal[netaddr.HostPort](), domi18n.EF(ports.ErrUnsupported, domi18n.KeyForwardSOCKS5CmdReject, domi18n.Str("cmd", fmt.Sprintf("%#x", hdr[1])))
 	}
 	host, repCode, err := readSOCKS5Address(conn, hdr[3])
 	if err != nil {
@@ -136,7 +137,7 @@ func readSOCKS5ConnectTarget(conn net.Conn) (netaddr.HostPort, error) {
 	hp, err := netaddr.NewHostPort(host, port)
 	if err != nil {
 		_ = writeSOCKS5Reply(conn, socks5RepAddrUnsupported)
-		return zeroVal[netaddr.HostPort](), fmt.Errorf("%w: SOCKS5 目标端口非法: %w", ports.ErrInvalidArgument, err)
+		return zeroVal[netaddr.HostPort](), domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SOCKS5 target port"))
 	}
 	return hp, nil
 }
@@ -160,7 +161,7 @@ func readSOCKS5Address(conn net.Conn, atyp byte) (netaddr.CanonicalHost, byte, e
 	case socks5AtypDomain:
 		return readSOCKS5Domain(conn)
 	default:
-		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, fmt.Errorf("%w: 不支持的 SOCKS5 ATYP %#x", ports.ErrUnsupported, atyp)
+		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", fmt.Sprintf("SOCKS5 ATYP %#x", atyp)))
 	}
 }
 
@@ -170,7 +171,7 @@ func readSOCKS5Domain(conn net.Conn) (netaddr.CanonicalHost, byte, error) {
 		return zeroVal[netaddr.CanonicalHost](), socks5RepGeneralFailure, err
 	}
 	if lenBuf[0] == 0 {
-		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, fmt.Errorf("%w: SOCKS5 域名不能为空", ports.ErrInvalidArgument)
+		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "SOCKS5 domain"))
 	}
 	raw := make([]byte, lenBuf[0])
 	if _, err := io.ReadFull(conn, raw); err != nil {
@@ -179,7 +180,7 @@ func readSOCKS5Domain(conn net.Conn) (netaddr.CanonicalHost, byte, error) {
 	// 仅执行纯数学域名规范化，零 net.LookupHost 调用，确保 100% 域名解析发生在远端 SSH 出口。
 	h, err := netaddr.ParseCanonicalHost(string(raw))
 	if err != nil {
-		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, fmt.Errorf("%w: 非法 SOCKS5 域名 %q: %w", ports.ErrInvalidArgument, string(raw), err)
+		return zeroVal[netaddr.CanonicalHost](), socks5RepAddrUnsupported, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SOCKS5 domain"), domi18n.BoundStr("value", string(raw)))
 	}
 	return h, socks5RepAddrUnsupported, nil
 }

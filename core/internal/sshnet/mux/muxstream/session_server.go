@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -71,7 +72,7 @@ func claimAndStartRemoteSession(ctx context.Context, sess ports.RemoteSession, m
 	case SessMsgStartShell:
 		startErr = startShellOnUpstream(ctx, sess, &rd, inR)
 	default:
-		startErr = fmt.Errorf("%w: 会话首帧非法 %#x", ports.ErrCorruptData, msgType)
+		startErr = domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxUnexpectedFrame, domi18n.Str("actual", fmt.Sprintf("%#x", msgType)), domi18n.Str("expected", "SessMsgStartExec/SessMsgStartShell"))
 	}
 	if startErr != nil {
 		_ = inR.Close()
@@ -226,7 +227,7 @@ func handleSessionResizeFrame(ctx context.Context, fw *SyncFrameWriter, sess por
 		return
 	}
 	if cols == 0 || cols > math.MaxUint16 || rows == 0 || rows > math.MaxUint16 {
-		sendSessionCtrlReply(fw, reqID, fmt.Errorf("%w: PTY 尺寸越界 (%dx%d)", ports.ErrInvalidTTYSize, cols, rows))
+		sendSessionCtrlReply(fw, reqID, domi18n.EF(ports.ErrInvalidTTYSize, domi18n.KeyMuxPTYSizeInvalid, domi18n.Uint64("cols", uint64(cols)), domi18n.Uint64("rows", uint64(rows))))
 		return
 	}
 	sz, err := ports.NewTerminalSize(uint16(cols), uint16(rows))

@@ -2,11 +2,11 @@ package gate
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -51,13 +51,13 @@ func validateSubmissionEnvelopeConsistency(req rawGateRequest, sub ApprovalSubmi
 	}
 	matched, err := env.MatchesDigest(dig)
 	if err != nil || !matched {
-		return fmt.Errorf("%w: 回执摘要与提交信封摘要不一致", ErrApprovalMismatch)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "approval response digest"))
 	}
 	if env.Binding().Capability() != req.capKind {
-		return fmt.Errorf("%w: 信封能力 %s 与请求能力 %s 不一致", ErrApprovalMismatch, env.Binding().Capability(), req.capKind)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "envelope capability"), domi18n.Str("expected", req.capKind.String()), domi18n.Str("actual", env.Binding().Capability().String()))
 	}
 	if reqOp, ok := req.operationID.Get(); ok && !reqOp.Equal(env.OperationID()) {
-		return fmt.Errorf("%w: 信封 OperationID 与请求不一致", ErrApprovalMismatch)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "envelope OperationID"))
 	}
 	return nil
 }
@@ -87,7 +87,7 @@ func (g *Gate) claimPendingChallenge(
 	}
 	pc, found := g.pending[dig]
 	if !found {
-		return nil, "approval_unknown", fmt.Errorf("%w: 未找到匹配的挂起审批挑战（禁止提交伪造或未签发信封）", ErrApprovalMismatch)
+		return nil, "approval_unknown", domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalPendingMiss)
 	}
 	delete(g.pending, dig)
 	g.recordConsumedLocked(dig, pc.nonce, pc.expiresAt, consumedKindUsed, now)
@@ -96,23 +96,23 @@ func (g *Gate) claimPendingChallenge(
 
 func validateClaimedChallengeAgainstRequest(req rawGateRequest, sub ApprovalSubmission, pc *pendingChallenge) error {
 	if pc.capKind != req.capKind {
-		return fmt.Errorf("%w: 挑战能力 %s 与请求能力 %s 不一致", ErrApprovalMismatch, pc.capKind, req.capKind)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "challenge capability"), domi18n.Str("expected", pc.capKind.String()), domi18n.Str("actual", req.capKind.String()))
 	}
 	if reqOp, ok := req.operationID.Get(); ok && !reqOp.Equal(pc.opID) {
-		return fmt.Errorf("%w: 请求 OperationID 与挂起挑战不一致", ErrApprovalMismatch)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalRound2Diff)
 	}
 	if env, ok := sub.Envelope().Get(); ok && !env.Equal(pc.envelope) {
-		return fmt.Errorf("%w: 提交信封与门控签发信封不一致", ErrApprovalMismatch)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalRound2Diff)
 	}
 	if pc.hadCanonical != (req.canonicalize != nil) {
-		return fmt.Errorf("%w: %w: Round-2 规范化模式与原始挂起挑战不一致", ErrApprovalInvalidated, ErrApprovalMismatch)
+		return domi18n.WrapS(ErrApprovalInvalidated, ErrApprovalMismatch, domi18n.KeyGateApprovalRound2Diff)
 	}
 	// INV-E5：在发起任何 Round-2 远端探测之前先强制锚定路径与全部绑定字段，阻断跨路径令牌探测预言机。
 	if !pc.hadCanonical && !pc.binding.Equal(req.binding) {
-		return fmt.Errorf("%w: 请求绑定作用域与已签发挑战不一致", ErrApprovalMismatch)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalRound2Diff)
 	}
 	if pc.hadCanonical && !req.binding.Equal(pc.fsmState.Context().LexicalBinding()) && !req.binding.Equal(pc.binding) {
-		return fmt.Errorf("%w: 规范化二次提交绑定与词法/挑战绑定均不一致", ErrApprovalMismatch)
+		return domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalRound2Diff)
 	}
 	return nil
 }
@@ -126,13 +126,13 @@ func (g *Gate) reprobeClaimedChallenge(
 	zSt, zBind := zeroVal[fsm.ApprovalState](), zeroVal[security.OperationBinding]()
 	if pc.hadCanonical {
 		if req.canonicalize == nil {
-			err := fmt.Errorf("%w: %w: 缺少必需的 Round-2 Canonicalize 复检回调", ErrApprovalInvalidated, ErrApprovalMismatch)
+			err := domi18n.WrapS(ErrApprovalInvalidated, ErrApprovalMismatch, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "Round-2 Canonicalize"))
 			return zSt, zBind, denyRejection(err, pc.opID, pc.binding, pc.fsmState.EffectiveRisk(), "round2_canonicalize_missing")
 		}
 		return g.runRound2Reprobe(ctx, traceID, pc.opID, req, pc.fsmState, pc.binding)
 	}
 	if req.canonicalize != nil {
-		err := fmt.Errorf("%w: 非规范化挑战禁止在二次提交时追加 Canonicalize", ErrApprovalMismatch)
+		err := domi18n.EF(ErrApprovalMismatch, domi18n.KeyGateApprovalRound2Diff)
 		return zSt, zBind, denyRejection(err, pc.opID, pc.binding, pc.fsmState.EffectiveRisk(), "approval_mismatch")
 	}
 	return g.verifyNonCanonicalScope(req, pc)
@@ -149,13 +149,13 @@ func (g *Gate) verifyNonCanonicalScope(
 		g.profile, req.binding, req.risk, req.verdict, req.decisionFloor, req.paths, req.recursivePaths,
 	)
 	if err != nil {
-		return zSt, zBind, denyRejection(fmt.Errorf("%w: %w", ErrAuthorizationDenied, err), pc.opID, req.binding, req.risk, "policy_eval_failed")
+		return zSt, zBind, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, err), pc.opID, req.binding, req.risk, "policy_eval_failed")
 	}
 	if curSnap.Verdict().Denied() || curSnap.Decision().Kind() == security.DecisionKindDeny {
-		return zSt, zBind, denyRejection(fmt.Errorf("%w: 二次提交护栏求值被拒绝", ErrAuthorizationDenied), pc.opID, req.binding, curSnap.Risk(), "policy_denied")
+		return zSt, zBind, denyRejection(domi18n.EF(ErrAuthorizationDenied, domi18n.KeyGateApprovalRound2Diff), pc.opID, req.binding, curSnap.Risk(), "policy_denied")
 	}
 	if security.InspectScopeEscalation(pc.fsmState.ActiveSnapshot(), curSnap).Escalated() {
-		err := fmt.Errorf("%w: %w: 非规范化二次提交触发作用域升级", ErrScopeEscalated, ErrApprovalInvalidated)
+		err := domi18n.WrapSentinel(ErrScopeEscalated, ErrApprovalInvalidated)
 		return zSt, zBind, denyRejection(err, pc.opID, req.binding, curSnap.Risk(), "scope_escalated")
 	}
 	return pc.fsmState, req.binding, nil
@@ -179,26 +179,20 @@ func (g *Gate) runRound2Reprobe(
 		if tErr == nil {
 			g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prev, inv, evs)
 		}
-		return zSt, zBind, denyRejection(
-			fmt.Errorf("%w: %w", ErrApprovalInvalidated, err), opID, activeBinding, st.EffectiveRisk(), "round2_probe_failed",
-		)
+		return zSt, zBind, denyRejection(domi18n.WrapSentinel(ErrApprovalInvalidated, err), opID, activeBinding, st.EffectiveRisk(), "round2_probe_failed")
 	}
 	canIn, err := fsm.ApprovalInputCanonicalized(canSnap, canBinding)
 	if err != nil {
-		return zSt, zBind, denyRejection(
-			fmt.Errorf("%w: %w", ErrApprovalInvalidated, err), opID, activeBinding, st.EffectiveRisk(), "canonical_input_invalid",
-		)
+		return zSt, zBind, denyRejection(domi18n.WrapSentinel(ErrApprovalInvalidated, err), opID, activeBinding, st.EffectiveRisk(), "canonical_input_invalid")
 	}
 	prev := st.Phase()
 	next, _, evs, err := fsm.TransitionApproval(st, canIn)
 	if err != nil {
-		return zSt, zBind, denyRejection(
-			fmt.Errorf("%w: %w", ErrApprovalInvalidated, err), opID, canBinding, canSnap.Risk(), "reprobe_transition_failed",
-		)
+		return zSt, zBind, denyRejection(domi18n.WrapSentinel(ErrApprovalInvalidated, err), opID, canBinding, canSnap.Risk(), "reprobe_transition_failed")
 	}
 	g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prev, next, evs)
 	if next.Phase() == fsm.ApprovalPhaseTokenInvalidated {
-		err := fmt.Errorf("%w: %w: %s", ErrScopeEscalated, ErrApprovalInvalidated, next.Reason())
+		err := domi18n.WrapSentinel(ErrScopeEscalated, domi18n.WrapSentinel(ErrApprovalInvalidated, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", sanitizeReason(next.Reason(), "scope escalated")))))
 		return zSt, zBind, denyRejection(err, opID, canBinding, next.EffectiveRisk(), "scope_escalated")
 	}
 	return next, canBinding, nil
@@ -218,12 +212,12 @@ func (g *Gate) verifyTokenWithFSM(
 	now := g.clock.Now().UTC().Round(0)
 	verifyIn, err := fsm.ApprovalInputVerifyToken(resp.EnvelopeDigest(), verifyBinding, now, resp.Approved())
 	if err != nil {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrApprovalMismatch, err), opID, verifyBinding, st.EffectiveRisk(), "approval_verify_input_invalid")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrApprovalMismatch, err), opID, verifyBinding, st.EffectiveRisk(), "approval_verify_input_invalid")
 	}
 	prev := st.Phase()
 	finalState, _, evs, err := fsm.TransitionApproval(st, verifyIn)
 	if err != nil {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrApprovalInvalidated, err), opID, verifyBinding, st.EffectiveRisk(), "approval_verify_failed")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrApprovalInvalidated, err), opID, verifyBinding, st.EffectiveRisk(), "approval_verify_failed")
 	}
 	g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prev, finalState, evs)
 
@@ -239,7 +233,7 @@ func (g *Gate) verifyTokenWithFSM(
 		if !env.IsActiveAt(now) {
 			return approvalOutcome{}, needApprovalRejection(ErrApprovalExpired, opID, verifyBinding, st.EffectiveRisk(), "approval_expired")
 		}
-		err := fmt.Errorf("%w: %s", ErrApprovalMismatch, sanitizeReason(finalState.Reason(), "token invalidated"))
+		err := domi18n.WrapSentinel(ErrApprovalMismatch, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", sanitizeReason(finalState.Reason(), "token invalidated"))))
 		return approvalOutcome{}, denyRejection(err, opID, verifyBinding, st.EffectiveRisk(), "approval_mismatch")
 	default:
 		return approvalOutcome{}, denyRejection(ErrApprovalInvalidated, opID, verifyBinding, st.EffectiveRisk(), "approval_invalidated")
@@ -253,7 +247,7 @@ func (g *Gate) runCanonicalizeProbe(ctx context.Context, req rawGateRequest) (se
 		return zSnap, zBind, err
 	}
 	if !res.Binding.IsValid() || res.Binding.Capability() != req.capKind {
-		return zSnap, zBind, fmt.Errorf("%w: 规范化绑定无效或能力漂移", ErrScopeEscalated)
+		return zSnap, zBind, domi18n.EF(ErrScopeEscalated, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "canonicalized binding"))
 	}
 	canRisk := req.risk
 	if r, ok := res.Risk.Get(); ok {

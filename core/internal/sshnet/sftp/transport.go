@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -131,7 +131,7 @@ func performHandshake(ctx context.Context, rw io.ReadWriteCloser) (map[string]st
 			return err
 		}
 		if pktType != sshFXPVersion {
-			return fmt.Errorf("%w: SFTP 握手期望 SSH_FXP_VERSION，收到类型 %d", ports.ErrCorruptData, pktType)
+			return domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(pktType)), domi18n.Str("expected", "SSH_FXP_VERSION"))
 		}
 		parsed, err := decodeVersionPacket(body)
 		if err != nil {
@@ -153,7 +153,7 @@ func decodeVersionPacket(body []byte) (map[string]string, error) {
 		return nil, err
 	}
 	if ver != sftpProtocolVersion {
-		return nil, fmt.Errorf("%w: 远端 SFTP 协议版本 %d 不兼容（仅支持 v3）", ports.ErrUnsupported, ver)
+		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeySFTPProtoVersion, domi18n.Uint64("version", uint64(ver)))
 	}
 	exts := make(map[string]string)
 	for r.remaining() > 0 {
@@ -237,7 +237,7 @@ func (c *Client) readLoop() {
 			return
 		}
 		if len(body) < 4 {
-			c.failAllPending(fmt.Errorf("%w: SFTP 响应缺少 request-id", ports.ErrCorruptData))
+			c.failAllPending(domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPPacketTruncated))
 			return
 		}
 		reqID := binary.BigEndian.Uint32(body[:4])
@@ -368,7 +368,7 @@ func readRawPacket(r io.Reader) (byte, []byte, error) {
 	}
 	pktLen := binary.BigEndian.Uint32(hdr[:])
 	if pktLen < 1 || pktLen > maxInboundPacketBytes {
-		return 0, nil, fmt.Errorf("%w: SFTP 报文长度 %d 非法", ports.ErrCorruptData, pktLen)
+		return 0, nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SFTP packet length"), domi18n.Uint64("value", uint64(pktLen)))
 	}
 	buf := make([]byte, pktLen)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -397,7 +397,7 @@ func (c *Client) expectStatusOK(ctx context.Context, pktType byte, body []byte) 
 		return err
 	}
 	if respType != sshFXPStatus {
-		return fmt.Errorf("%w: SFTP 期望 SSH_FXP_STATUS，收到类型 %d", ports.ErrCorruptData, respType)
+		return domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(respType)), domi18n.Str("expected", "SSH_FXP_STATUS"))
 	}
 	return decodeStatus(respBody)
 }

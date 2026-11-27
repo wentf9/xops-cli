@@ -2,7 +2,6 @@ package mux
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -129,7 +129,7 @@ func (c *MuxTransportConn) dialXOpsStream(ctx context.Context, msgType uint32, b
 		return nil, err
 	}
 	if !c.supportsXOps {
-		return nil, fmt.Errorf("%w: ControlMaster 未协商 xops-stream-mux 扩展", ports.ErrUnsupported)
+		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyMuxExtNotNegotiated)
 	}
 	conn, _, err := c.mux.dialVerified(ctx, c.ctrlPath)
 	if err != nil {
@@ -140,7 +140,7 @@ func (c *MuxTransportConn) dialXOpsStream(ctx context.Context, msgType uint32, b
 	}
 	if err := chanconn.RunWithAbortWatchdog(ctx, func() { _ = conn.Close() }, func() error {
 		if _, hErr := muxstream.ExchangeClientHello(conn); hErr != nil {
-			return fmt.Errorf("%w: %w", ports.ErrMuxUnavailable, hErr)
+			return domi18n.WrapSentinel(ports.ErrMuxUnavailable, hErr)
 		}
 		return roundTripControlOK(conn, msgType, body, 1)
 	}); err != nil {
@@ -166,7 +166,7 @@ func (c *MuxTransportConn) SendKeepalive(ctx context.Context) error {
 	defer func() { _ = conn.Close() }()
 	err = chanconn.RunWithAbortWatchdog(ctx, func() { _ = conn.Close() }, func() error {
 		if _, hErr := muxstream.ExchangeClientHello(conn); hErr != nil {
-			return fmt.Errorf("%w: %w", ports.ErrMuxUnavailable, hErr)
+			return domi18n.WrapSentinel(ports.ErrMuxUnavailable, hErr)
 		}
 		_, aErr := muxstream.SendAliveCheck(conn, 1)
 		return aErr
@@ -206,7 +206,7 @@ func (c *MuxTransportConn) OpenRemoteFS(ctx context.Context) (ports.RemoteFSPort
 // DialTCP 经 ControlMaster 发起远端 direct-tcpip 通道并返回原始双向流。
 func (c *MuxTransportConn) DialTCP(ctx context.Context, target netaddr.HostPort) (net.Conn, error) {
 	if !target.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 DialTCP 目标 HostPort", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "DialTCP target"))
 	}
 	body := muxstream.AppendU32(muxstream.AppendStr(muxstream.AppendU32(nil, 1), target.Host().String()), uint32(target.Port()))
 	return c.dialXOpsStream(ctx, muxstream.XOpsCDialTCP, body)
@@ -215,7 +215,7 @@ func (c *MuxTransportConn) DialTCP(ctx context.Context, target netaddr.HostPort)
 // DialStreamLocal 经 ControlMaster 发起远端 direct-streamlocal@openssh.com 通道并返回原始双向流。
 func (c *MuxTransportConn) DialStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Conn, error) {
 	if !remoteSocket.IsValid() {
-		return nil, fmt.Errorf("%w: 无效远端 Unix 套接字路径", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix socket path"))
 	}
 	return c.dialXOpsStream(ctx, muxstream.XOpsCDialStreamLocal, muxstream.AppendStr(muxstream.AppendU32(nil, 1), remoteSocket.String()))
 }
@@ -223,7 +223,7 @@ func (c *MuxTransportConn) DialStreamLocal(ctx context.Context, remoteSocket pat
 // OpenTUN 经 ControlMaster 打开远端 tun@openssh.com 通道并返回双向帧流。
 func (c *MuxTransportConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, error) {
 	if !spec.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 TUNSpec", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TUNSpec"))
 	}
 	body := muxstream.AppendU32(muxstream.AppendU32(muxstream.AppendU32(muxstream.AppendU32(nil, 1), uint32(spec.Mode())), spec.LocalUnit()), spec.RemoteUnit())
 	return c.dialXOpsStream(ctx, muxstream.XOpsCOpenTUN, body)
@@ -240,14 +240,14 @@ func (c *MuxTransportConn) ListenTCP(ctx context.Context, bindAddr string) (net.
 func validateMuxListenTCPAddr(bindAddr string) error {
 	host, portStr, err := net.SplitHostPort(bindAddr)
 	if err != nil || portStr == "" || strings.HasPrefix(portStr, "+") || strings.HasPrefix(portStr, "-") {
-		return fmt.Errorf("%w: 非法 ListenTCP 绑定地址 %q", ports.ErrInvalidArgument, bindAddr)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ListenTCP bind address"), domi18n.BoundStr("value", bindAddr))
 	}
 	if _, err := strconv.ParseUint(portStr, 10, 16); err != nil {
-		return fmt.Errorf("%w: 非法 ListenTCP 绑定端口 %q", ports.ErrInvalidArgument, portStr)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ListenTCP bind port"), domi18n.BoundStr("value", portStr))
 	}
 	if host != "" && host != "*" {
 		if _, err := netaddr.ParseCanonicalHost(host); err != nil {
-			return fmt.Errorf("%w: 非法 ListenTCP 绑定主机 %q: %w", ports.ErrInvalidArgument, host, err)
+			return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ListenTCP bind host"), domi18n.BoundStr("value", host))
 		}
 	}
 	return nil
@@ -256,7 +256,7 @@ func validateMuxListenTCPAddr(bindAddr string) error {
 // ListenStreamLocal 经 ControlMaster 在远端发起 streamlocal-forward@openssh.com 监听并返回 net.Listener。
 func (c *MuxTransportConn) ListenStreamLocal(ctx context.Context, remoteSocket pathalg.RemotePath) (net.Listener, error) {
 	if !remoteSocket.IsValid() {
-		return nil, fmt.Errorf("%w: 无效远端 Unix 监听路径", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix listen path"))
 	}
 	return c.openRemoteMuxListener(ctx, muxstream.XOpsCListenStreamLocal, "unix", remoteSocket.String())
 }
@@ -266,7 +266,7 @@ func (c *MuxTransportConn) openRemoteMuxListener(ctx context.Context, msgType ui
 		return nil, err
 	}
 	if !c.supportsXOps {
-		return nil, fmt.Errorf("%w: ControlMaster 未协商 xops-stream-mux 扩展", ports.ErrUnsupported)
+		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyMuxExtNotNegotiated)
 	}
 	conn, _, err := c.mux.dialVerified(ctx, c.ctrlPath)
 	if err != nil {
@@ -293,7 +293,7 @@ func (c *MuxTransportConn) openRemoteMuxListener(ctx context.Context, msgType ui
 
 func handshakeRemoteListener(conn *net.UnixConn, msgType uint32, addr string) (string, error) {
 	if _, err := muxstream.ExchangeClientHello(conn); err != nil {
-		return "", fmt.Errorf("%w: %w", ports.ErrMuxUnavailable, err)
+		return "", domi18n.WrapSentinel(ports.ErrMuxUnavailable, err)
 	}
 	if err := muxstream.WritePacket(conn, msgType, muxstream.AppendStr(muxstream.AppendU32(nil, 1), addr)); err != nil {
 		return "", err

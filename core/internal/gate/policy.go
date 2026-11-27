@@ -3,10 +3,10 @@ package gate
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"fmt"
 	"slices"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -52,10 +52,10 @@ type GuardrailPolicy struct {
 // 并计算确定性策略摘要，构造不可变 GuardrailPolicy。
 func NewGuardrailPolicy(spec GuardrailPolicySpec) (GuardrailPolicy, error) {
 	if !spec.ApprovalThreshold.IsValid() {
-		return GuardrailPolicy{}, fmt.Errorf("%w: approval_threshold 必须有效", ErrInvalidPolicy)
+		return GuardrailPolicy{}, domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "approval_threshold"))
 	}
 	if !spec.NoElicitFallback.IsValid() {
-		return GuardrailPolicy{}, fmt.Errorf("%w: %w", ErrInvalidPolicy, ErrInvalidFallback)
+		return GuardrailPolicy{}, domi18n.WrapSentinel(ErrInvalidPolicy, ErrInvalidFallback)
 	}
 	overrides, err := resolvePolicyOverrides(spec.NodeOverrides)
 	if err != nil {
@@ -75,7 +75,7 @@ func NewGuardrailPolicy(spec GuardrailPolicySpec) (GuardrailPolicy, error) {
 	}
 	matcher, err := pathalg.NewClassifiedProtectedPathMatcher(spec.ProtectedRules)
 	if err != nil {
-		return GuardrailPolicy{}, fmt.Errorf("%w: %w", ErrInvalidPolicy, err)
+		return GuardrailPolicy{}, domi18n.WrapSentinel(ErrInvalidPolicy, err)
 	}
 	dig := computePolicyDigest(spec.ApprovalThreshold, spec.NoElicitFallback, overrides, spec.ProtectedRules, protRisk, ttl)
 	return GuardrailPolicy{
@@ -98,7 +98,7 @@ func NewGuardrailPolicyFromPatterns(threshold security.RiskLevel, fallback NoEli
 	for _, pat := range patterns {
 		r, err := pathalg.ParseProtectedRule(pat)
 		if err != nil {
-			return GuardrailPolicy{}, fmt.Errorf("%w: %w", ErrInvalidPolicy, err)
+			return GuardrailPolicy{}, domi18n.WrapSentinel(ErrInvalidPolicy, err)
 		}
 		rules = append(rules, r)
 	}
@@ -115,7 +115,7 @@ func resolvePolicyOverrides(opt algebraic.Option[security.NodeOverrides]) (secur
 		return security.EmptyNodeOverrides(), nil
 	}
 	if !ov.IsValid() {
-		return zeroVal[security.NodeOverrides](), fmt.Errorf("%w: node_overrides 无效", ErrInvalidPolicy)
+		return zeroVal[security.NodeOverrides](), domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "node_overrides"))
 	}
 	return ov, nil
 }
@@ -126,7 +126,7 @@ func resolveProtectedRisk(opt algebraic.Option[security.RiskLevel]) (security.Ri
 		return security.RiskDangerous, nil
 	}
 	if !r.IsValid() {
-		return security.RiskUnknown, fmt.Errorf("%w: protected_path_risk 无效", ErrInvalidPolicy)
+		return security.RiskUnknown, domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "protected_path_risk"))
 	}
 	return r, nil
 }
@@ -137,14 +137,14 @@ func resolveApprovalTTL(opt algebraic.Option[algebraic.Duration]) (algebraic.Dur
 		return algebraic.FromStdDuration(defaultApprovalTTL), nil
 	}
 	if !d.IsPositive() || d.Std() > maxApprovalTTL {
-		return algebraic.ZeroDuration(), fmt.Errorf("%w: approval_ttl 必须落在 (0, %s] 区间内", ErrInvalidPolicy, maxApprovalTTL)
+		return algebraic.ZeroDuration(), domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldRange, domi18n.Str("field", "approval_ttl"), domi18n.Dur("value", d.Std()), domi18n.Str("min", "1ns"), domi18n.Dur("max", maxApprovalTTL))
 	}
 	return d, nil
 }
 
 func resolvePolicyLimits(maxPending, maxReplay int) (int, int, error) {
 	if maxPending < 0 || maxReplay < 0 {
-		return 0, 0, fmt.Errorf("%w: 待审批容量或防重放容量上限不能为负", ErrInvalidPolicy)
+		return 0, 0, domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "policy capacity limit"))
 	}
 	if maxPending == 0 {
 		maxPending = defaultPendingCapacity
@@ -256,11 +256,11 @@ func (p GuardrailPolicy) evaluateScopeSnapshot(
 	paths, recursivePaths []string,
 ) (security.ScopeSnapshot, error) {
 	if !p.IsValid() || !profile.IsValid() || !binding.IsValid() || !baseRisk.IsValid() {
-		return zeroVal[security.ScopeSnapshot](), fmt.Errorf("%w: 策略、配置档、绑定或基准风险无效", ErrInvalidPolicy)
+		return zeroVal[security.ScopeSnapshot](), domi18n.EF(ErrInvalidPolicy, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "policy evaluation input"))
 	}
 	scopedPaths, anyProtected, pathErr := p.matchScopedPaths(paths, recursivePaths)
 	if pathErr != nil {
-		return zeroVal[security.ScopeSnapshot](), fmt.Errorf("%w: 受保护路径校验失败: %w", ErrAuthorizationDenied, pathErr)
+		return zeroVal[security.ScopeSnapshot](), domi18n.WrapS(ErrAuthorizationDenied, pathErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "protected path check"))
 	}
 	effRisk := baseRisk
 	if anyProtected {

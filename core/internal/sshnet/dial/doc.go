@@ -14,10 +14,10 @@ package dial
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/keysigner"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -102,14 +102,14 @@ type Dialer struct {
 // NewDialer 校验必填 HostTrustPort 与可选客户端版本标识并构造不可变 Dialer。
 func NewDialer(cfg Config) (*Dialer, error) {
 	if cfg.HostTrust == nil {
-		return nil, fmt.Errorf("%w: HostTrust 端口不能为 nil", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "HostTrust"))
 	}
 	clientVer := cfg.ClientVersion
 	if clientVer == "" {
 		clientVer = defaultClientVersion
 	}
 	if !strings.HasPrefix(clientVer, "SSH-2.0-") || strings.ContainsAny(clientVer, "\r\n") {
-		return nil, fmt.Errorf("%w: 非法 SSH ClientVersion %q", ports.ErrInvalidArgument, clientVer)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "ClientVersion"), domi18n.BoundStr("value", clientVer))
 	}
 	dialFn := cfg.DialContext
 	if dialFn == nil {

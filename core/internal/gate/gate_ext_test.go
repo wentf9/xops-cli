@@ -9,6 +9,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
 	"github.com/wentf9/xops-cli/core/internal/gate"
@@ -19,6 +20,9 @@ import (
 var (
 	_ gate.Authorizer          = (*gate.Gate)(nil)
 	_ gate.OutcomeCarrier      = (*gate.OutcomeError)(nil)
+	_ domi18n.LocalizableNode  = (*gate.OutcomeError)(nil)
+	_ domi18n.LocalizableNode  = (*gate.OperationPanicError)(nil)
+	_ domi18n.LocalizableNode  = (*gate.ApprovalChallengeError)(nil)
 	_ encoding.TextAppender    = gate.PolicyProfileInvalid
 	_ encoding.TextMarshaler   = gate.PolicyProfileInvalid
 	_ encoding.TextUnmarshaler = (*gate.PolicyProfileKind)(nil)
@@ -193,6 +197,46 @@ func TestExternalConsumerAccessorsPassLinearLease(t *testing.T) {
 	var zeroPol gate.GuardrailPolicy
 	_, _, zErr := zeroPol.MatchScopedPaths([]string{"/etc/passwd"}, nil)
 	extRequireErrIs(t, zErr, gate.ErrInvalidPolicy, "零值策略 MatchScopedPaths 必须失败关闭")
+}
+
+func TestCustomErrorsLocalizableNodeContract(t *testing.T) {
+	// 1. OutcomeError：保留 Cause、OutcomeCarrier 与 KeyGateExecutionOutcome 结构化节点。
+	unk, err := execution.NewOutcomeUnknown(execution.ExecPhaseRunning, "drop", "lost")
+	extRequireNoErr(t, err, "NewOutcomeUnknown")
+	outErr, err := gate.WrapOutcomeError(unk, ports.ErrClosed)
+	extRequireNoErr(t, err, "WrapOutcomeError")
+	view, ok := domi18n.InspectNode(outErr)
+	extRequireTrue(t, ok && view.Message.ID() == domi18n.KeyGateExecutionOutcome && errors.Is(view.Cause, ports.ErrClosed), "OutcomeError LocalizableView 异常")
+	extRequireTrue(t, outErr.Error() == domi18n.CanonicalError(outErr) && errors.Is(outErr, ports.ErrClosed), "OutcomeError CanonicalError 或 Unwrap 异常")
+
+	// 2. ApprovalChallengeError：通过真实 Gate 路径验证 LocalizableNode、Envelope 与哨兵链。
+	pid, err := ports.ParseProcessInstanceID("ext-i18n-01")
+	extRequireNoErr(t, err, "ParseProcessInstanceID")
+	pol, err := gate.NewGuardrailPolicyFromPatterns(security.RiskModerate, gate.NoElicitFallbackChallenge, nil)
+	extRequireNoErr(t, err, "NewGuardrailPolicyFromPatterns")
+	g, err := gate.NewGate(gate.GateConfig{
+		Profile: gate.PolicyProfileStrictAgent, Policy: pol,
+		AuditSink: extStubAuditSink{id: pid, allowOK: true}, Clock: extStubClock{}, Entropy: &extStubEntropy{seed: 17},
+	})
+	extRequireNoErr(t, err, "NewGate")
+	bind, err := security.NewOperationBinding(security.OperationBindingSpec{
+		Capability: security.CapabilityInspect, Tool: "nodes", Action: "inspect", NodeID: "n1",
+	})
+	extRequireNoErr(t, err, "NewOperationBinding")
+
+	highReq, err := gate.NewGateRequest(gate.GateRequestSpec[security.CapInspect]{Binding: bind, Risk: security.RiskDangerous})
+	extRequireNoErr(t, err, "NewGateRequest(dangerous)")
+	chErr := gate.WithAuthorized(context.Background(), g, highReq, func(context.Context, gate.Authorized[security.CapInspect]) error { return nil })
+	ce, ok := errors.AsType[*gate.ApprovalChallengeError](chErr)
+	extRequireTrue(t, ok && errors.Is(chErr, gate.ErrApprovalRequired) && ce.Envelope().IsValid() && ce.EnvelopeDigest().IsValid(), "ApprovalChallengeError 契约失配")
+	cView, ok := domi18n.InspectNode(ce)
+	extRequireTrue(t, ok && cView.Message.ID() == domi18n.KeyGateApprovalChallenge && errors.Is(cView.Sentinel, gate.ErrApprovalRequired), "ApprovalChallengeError LocalizableView 异常")
+	extRequireTrue(t, ce.Error() == domi18n.CanonicalError(ce), "ApprovalChallengeError CanonicalError 失配")
+
+	// 3. typed-nil 自定义错误结构仍须经 LocalizableNode 返回安全失败关闭英文文案。
+	var nilPanic *gate.OperationPanicError
+	pView, ok := domi18n.InspectNode(nilPanic)
+	extRequireTrue(t, ok && pView.Message.ID() == domi18n.KeyGateOperationPanicked && nilPanic.Error() == domi18n.CanonicalError(nilPanic), "typed-nil OperationPanicError LocalizableView 异常")
 }
 
 type extStubAuditSink struct {

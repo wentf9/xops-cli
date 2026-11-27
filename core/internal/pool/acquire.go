@@ -4,12 +4,13 @@ import (
 	"cmp"
 	"context"
 	"errors"
-	"fmt"
+	"slices"
+
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/internal/foundation/actor"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
-	"slices"
 )
 
 // WithLease 按不可变 Merkle 连接计划申请单条同步借用连接租约，在即将进入用户回调 fn 前注入
@@ -88,7 +89,7 @@ func canonicalizePlanList(plans []plan.SealedConnectionPlan) ([]plan.SealedConne
 	items := make([]indexedPlan, len(plans))
 	for i, pl := range plans {
 		if !pl.IsValid() {
-			return nil, nil, fmt.Errorf("%w: plans[%d] 无效", ErrInvalidPlan, i)
+			return nil, nil, domi18n.EF(ErrInvalidPlan, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "plans"), domi18n.Int("index", i))
 		}
 		items[i] = indexedPlan{origIdx: i, plan: pl}
 	}

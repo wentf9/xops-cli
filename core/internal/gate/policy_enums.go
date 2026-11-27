@@ -1,8 +1,9 @@
 package gate
 
 import (
-	"fmt"
 	"strings"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // PolicyProfileKind 标识能力门控运行时的安全策略配置档（RFC §3.1 / §4.2 / ADR-008）；
@@ -36,7 +37,7 @@ func ParsePolicyProfileKind(raw string) (PolicyProfileKind, error) {
 	case "strict_agent":
 		return PolicyProfileStrictAgent, nil
 	default:
-		return PolicyProfileInvalid, fmt.Errorf("%w: %q", ErrInvalidProfile, raw)
+		return PolicyProfileInvalid, domi18n.EF(ErrInvalidProfile, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 	}
 }
 
@@ -97,7 +98,7 @@ func ParseNoElicitFallback(raw string) (NoElicitFallback, error) {
 	case "challenge":
 		return NoElicitFallbackChallenge, nil
 	default:
-		return NoElicitFallbackDeny, fmt.Errorf("%w: %q", ErrInvalidFallback, raw)
+		return NoElicitFallbackDeny, domi18n.EF(ErrInvalidFallback, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 	}
 }
 
@@ -126,7 +127,7 @@ func (f *NoElicitFallback) UnmarshalText(text []byte) error {
 
 func appendValidEnumText(b []byte, valid bool, name string, baseErr error, raw uint8) ([]byte, error) {
 	if !valid {
-		return nil, fmt.Errorf("%w: %d", baseErr, raw)
+		return nil, domi18n.EF(baseErr, domi18n.KeyCommonValueInvalid, domi18n.Uint64("value", uint64(raw)))
 	}
 	return append(b, name...), nil
 }

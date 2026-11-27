@@ -3,11 +3,11 @@ package priv
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -23,7 +23,7 @@ func generateHandshakeTokens(entropy ports.Entropy) (handshakeTokens, error) {
 	}
 	var raw [nonceRawBytes * 2]byte
 	if _, err := io.ReadFull(r, raw[:]); err != nil {
-		return handshakeTokens{}, fmt.Errorf("%w: 生成提权随机令牌失败: %w", ports.ErrEntropyShortRead, err)
+		return handshakeTokens{}, domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate privilege handshake tokens"))
 	}
 	return handshakeTokens{
 		prompt: "[xops-priv-prompt-" + hex.EncodeToString(raw[:nonceRawBytes]) + "]",
@@ -38,22 +38,22 @@ func buildEscalationPlan(req ports.PrivilegeRequest, tokens handshakeTokens) (ex
 	var zero execution.CommandPlan
 	cmd := req.Command()
 	if dialect := cmd.Profile().Dialect(); dialect != execution.DialectUnknown && dialect != execution.DialectPOSIX {
-		return zero, "", false, fmt.Errorf("%w: 提权仅支持 POSIX 启动方言（拒绝 %s）", ports.ErrUnsupported, dialect)
+		return zero, "", false, domi18n.EF(ports.ErrUnsupported, domi18n.KeyPrivDialectPOSIXOnly, domi18n.Str("dialect", dialect.String()))
 	}
 	innerCmd, err := cmd.RenderCommand()
 	if err != nil {
-		return zero, "", false, fmt.Errorf("%w: 渲染提权目标命令失败: %w", ports.ErrInvalidArgument, err)
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "render privilege target command"))
 	}
 	scriptBody, hasScript := cmd.StdinPayload()
 
 	qReady, err := execution.QuotePOSIX(tokens.ready)
 	if err != nil {
-		return zero, "", false, fmt.Errorf("%w: 引用就绪帧令牌失败: %w", ports.ErrInvalidArgument, err)
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote ready frame token"))
 	}
 	elevBody := "printf '%s' " + qReady + " >&2; " + innerCmd
 	qElevBody, err := execution.QuotePOSIX(elevBody)
 	if err != nil {
-		return zero, "", false, fmt.Errorf("%w: 引用提权执行体失败: %w", ports.ErrInvalidArgument, err)
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote privilege payload"))
 	}
 
 	wrapped, err := formatPrivilegeWrapper(req, tokens.prompt, qElevBody)
@@ -69,7 +69,7 @@ func buildEscalationPlan(req ports.PrivilegeRequest, tokens handshakeTokens) (ex
 		MaxOutputBytes: algebraic.Some(cmd.MaxOutputBytes()),
 	})
 	if err != nil {
-		return zero, "", false, fmt.Errorf("%w: 构造提权包装计划失败: %w", ports.ErrInvalidArgument, err)
+		return zero, "", false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "build privilege command plan"))
 	}
 	return plan, scriptBody, hasScript, nil
 }
@@ -83,7 +83,7 @@ func formatPrivilegeWrapper(req ports.PrivilegeRequest, promptToken, qElevBody s
 	case ports.PrivilegeMethodDoas:
 		return formatDoasWrapper(req, qElevBody)
 	default:
-		return "", fmt.Errorf("%w: 不支持的提权方式 %s", ports.ErrInvalidArgument, req.Method())
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "privilege method "+req.Method().String()))
 	}
 }
 
@@ -94,14 +94,14 @@ func formatSudoWrapper(req ports.PrivilegeRequest, promptToken, qElevBody string
 	} else {
 		qPrompt, err := execution.QuotePOSIX(promptToken)
 		if err != nil {
-			return "", fmt.Errorf("%w: 引用 sudo 提示令牌失败: %w", ports.ErrInvalidArgument, err)
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote sudo prompt token"))
 		}
 		prefix = "LC_ALL=C sudo -S -p " + qPrompt
 	}
 	if u, hasUser := req.TargetUser().Get(); hasUser {
 		qUser, uErr := execution.QuotePOSIX(u.String())
 		if uErr != nil {
-			return "", fmt.Errorf("%w: 引用目标用户失败: %w", ports.ErrInvalidArgument, uErr)
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, uErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote target user"))
 		}
 		prefix += " -u " + qUser
 	}
@@ -115,11 +115,11 @@ func formatSuWrapper(req ports.PrivilegeRequest, qElevBody string) (string, erro
 	}
 	qUser, err := execution.QuotePOSIX(targetUser)
 	if err != nil {
-		return "", fmt.Errorf("%w: 引用 su 目标用户失败: %w", ports.ErrInvalidArgument, err)
+		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote su target user"))
 	}
 	qInner, err := execution.QuotePOSIX("exec /bin/sh -c " + qElevBody)
 	if err != nil {
-		return "", fmt.Errorf("%w: 引用 su 执行载荷失败: %w", ports.ErrInvalidArgument, err)
+		return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote su payload"))
 	}
 	return "LC_ALL=C su " + qUser + " -c " + qInner, nil
 }
@@ -132,7 +132,7 @@ func formatDoasWrapper(req ports.PrivilegeRequest, qElevBody string) (string, er
 	if u, hasUser := req.TargetUser().Get(); hasUser {
 		qUser, err := execution.QuotePOSIX(u.String())
 		if err != nil {
-			return "", fmt.Errorf("%w: 引用 doas 目标用户失败: %w", ports.ErrInvalidArgument, err)
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "quote doas target user"))
 		}
 		prefix += " -u " + qUser
 	}

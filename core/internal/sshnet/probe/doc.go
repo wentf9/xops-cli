@@ -10,11 +10,10 @@
 package probe
 
 import (
-	"errors"
-	"fmt"
 	"strings"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -26,7 +25,7 @@ const (
 )
 
 // ErrProbeFailed 标识两阶段远端 Shell 探测无法确认合法启动方言或可用解释器（Fail-Closed）。
-var ErrProbeFailed = errors.New("sshnet/probe: 远端 Shell 探测失败或结果不可信")
+var ErrProbeFailed = domi18n.Sentinel(domi18n.KeyProbeFailed)
 
 // Config 描述 Prober 的显式运行期配置（零全局状态与隐式环境变量）。
 type Config struct {
@@ -55,10 +54,10 @@ type Prober struct {
 // NewProber 校验配置并构造不可变 Prober 实例。
 func NewProber(cfg Config) (*Prober, error) {
 	if cfg.CommandTimeout < 0 {
-		return nil, fmt.Errorf("%w: CommandTimeout 不能为负", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "CommandTimeout"))
 	}
 	if cfg.MaxOutputBytes > maxAllowedOutputBytes {
-		return nil, fmt.Errorf("%w: MaxOutputBytes 超过上限 %d", ports.ErrInvalidArgument, maxAllowedOutputBytes)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldMaxExceeded, domi18n.Str("field", "MaxOutputBytes"), domi18n.Uint64("value", cfg.MaxOutputBytes), domi18n.Uint64("max", maxAllowedOutputBytes))
 	}
 	timeout := cfg.CommandTimeout
 	if timeout == 0 {

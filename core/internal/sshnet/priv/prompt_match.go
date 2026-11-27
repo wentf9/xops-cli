@@ -10,7 +10,6 @@ import (
 const (
 	sudoRSPromptPrefix   = "[sudo: "
 	maxSudoRSSuffixBytes = 64
-	fullWidthColonUTF8   = "\xef\xbc\x9a"
 )
 
 // sudoPromptFeedback 在识别到 sudo-rs 封套提示后抑制紧随其后的回显掩码字节（* / \b / 空格 / \r），
@@ -77,7 +76,8 @@ func expandSudoRSEnvelope(data []byte, start, end int) (int, int, bool, bool) {
 }
 
 func findPromptColonEnd(win []byte) (int, bool) {
-	fwColon := []byte(fullWidthColonUTF8)
+	// 按原始 UTF-8 字节序列匹配本地化 sudo-rs 提示尾部的全角冒号（U+FF1A），避免生产源码出现全角字符字面量。
+	fwColon := []byte{0xef, 0xbc, 0x9a}
 	for i := 0; i < len(win); i++ {
 		if win[i] == '\r' || win[i] == '\n' {
 			return 0, false

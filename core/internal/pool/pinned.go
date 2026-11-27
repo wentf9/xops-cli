@@ -2,16 +2,17 @@ package pool
 
 import (
 	"context"
-	"fmt"
+	"io"
+	"net"
+	"sync/atomic"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
-	"io"
-	"net"
-	"sync/atomic"
 )
 
 var _ ports.TransportConn = (*pinnedTransportConn)(nil)
@@ -213,7 +214,7 @@ func RegisterLeaseHandleWith[K plan.HandleKind, R ComparableManagedResource](p *
 	}
 	id, err := plan.NewHandleIDFrom(p.entropy)
 	if err != nil {
-		return zero, fmt.Errorf("%w: 生成 HandleID 失败: %w", ErrInvalidHandle, err)
+		return zero, domi18n.WrapS(ErrInvalidHandle, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate HandleID"))
 	}
 	meta, err := p.slots.allocateHandle(p, id, planDig, binding, nil, plan.HandleKindOf[K]())
 	if err != nil {

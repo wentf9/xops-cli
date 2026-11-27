@@ -21,9 +21,9 @@
 package priv
 
 import (
-	"fmt"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -59,7 +59,7 @@ type Escalator struct {
 // NewEscalator 校验配置并构造不可变 Escalator 实例。
 func NewEscalator(cfg Config) (*Escalator, error) {
 	if cfg.HandshakeTimeout < 0 {
-		return nil, fmt.Errorf("%w: HandshakeTimeout 不能为负", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "HandshakeTimeout"))
 	}
 	hsTimeout := cfg.HandshakeTimeout
 	if hsTimeout == 0 {

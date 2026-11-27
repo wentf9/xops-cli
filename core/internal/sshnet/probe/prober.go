@@ -3,10 +3,10 @@ package probe
 import (
 	"bytes"
 	"context"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -20,7 +20,7 @@ func (p *Prober) ProbeShell(
 ) (ports.ShellProbeResult, error) {
 	var zero ports.ShellProbeResult
 	if p == nil || !p.valid {
-		return zero, fmt.Errorf("%w: Prober 未初始化", ports.ErrInvalidArgument)
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "Prober"))
 	}
 	if ctx == nil {
 		return zero, ports.ErrNilContext
@@ -29,7 +29,7 @@ func (p *Prober) ProbeShell(
 		return zero, err
 	}
 	if opener == nil {
-		return zero, fmt.Errorf("%w: SessionOpener 不能为 nil", ports.ErrInvalidArgument)
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "SessionOpener"))
 	}
 
 	hit, err := p.runStage1(ctx, opener)
@@ -65,7 +65,7 @@ func (p *Prober) runStage1(
 			return hit, nil
 		}
 	}
-	return stage1Hit{}, fmt.Errorf("%w: 阶段 1 未识别出受支持的合法启动方言", ErrProbeFailed)
+	return stage1Hit{}, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeNoDialect)
 }
 
 func (p *Prober) runStage2(
@@ -84,7 +84,7 @@ func (p *Prober) runStage2(
 		return zero, err
 	}
 	if !succeeded {
-		return zero, fmt.Errorf("%w: 阶段 2 解释器枚举命令执行失败（方言=%s）", ErrProbeFailed, hit.dialect)
+		return zero, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "stage 2 interpreter enumeration"), domi18n.Str("target", hit.dialect.String()))
 	}
 	interpreters, err := parseStage2Interpreters(output)
 	if err != nil {
@@ -92,7 +92,7 @@ func (p *Prober) runStage2(
 	}
 	selected, ok := selectRecommendedInterpreter(hit, interpreters)
 	if !ok {
-		return zero, fmt.Errorf("%w: 阶段 2 未发现与方言 %s 兼容的合法解释器", ErrProbeFailed, hit.dialect)
+		return zero, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeNoInterpreter, domi18n.Str("dialect", hit.dialect.String()))
 	}
 	return ports.NewShellProbeResult(ports.ShellProbeResultSpec{
 		Dialect:     hit.dialect,
@@ -122,7 +122,7 @@ func (p *Prober) execProbeCommand(
 		MaxOutputBytes: algebraic.Some(p.maxOutputBytes),
 	})
 	if err != nil {
-		return "", false, fmt.Errorf("%w: %w", ErrProbeFailed, err)
+		return "", false, domi18n.WrapSentinel(ErrProbeFailed, err)
 	}
 	sess, err := opener.OpenSession(cmdCtx)
 	if err != nil {
@@ -143,19 +143,19 @@ func (p *Prober) execProbeCommand(
 
 func inspectProbeOutcome(out execution.ExecutionOutcome, stdout string, maxBytes uint64) (string, bool, error) {
 	if out == nil || !out.IsValid() {
-		return "", false, fmt.Errorf("%w: 远端会话未返回有效 ExecutionOutcome", ErrProbeFailed)
+		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ExecutionOutcome"))
 	}
 	switch v := out.(type) {
 	case *execution.OutcomeCompleted:
 		if v.Truncated() || uint64(len(stdout)) > maxBytes {
-			return "", false, fmt.Errorf("%w: 探测输出超过上限 %d 字节被截断", ErrProbeFailed, maxBytes)
+			return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "probe output"), domi18n.Uint64("size", uint64(len(stdout))), domi18n.Uint64("limit", maxBytes))
 		}
 		return stdout, v.Succeeded(), nil
 	case *execution.OutcomeNotStarted:
-		return "", false, fmt.Errorf("%w: 探测会话未启动 (%s)", ErrProbeFailed, v.Code())
+		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "start probe session"), domi18n.BoundStr("target", v.Code()))
 	case *execution.OutcomeUnknown:
-		return "", false, fmt.Errorf("%w: 探测会话执行结果不确定 (%s)", ErrProbeFailed, v.Code())
+		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "probe session execution"), domi18n.BoundStr("target", v.Code()))
 	default:
-		return "", false, fmt.Errorf("%w: 不支持的执行结果变体 %T", ErrProbeFailed, out)
+		return "", false, domi18n.EF(ErrProbeFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "execution outcome variant"))
 	}
 }

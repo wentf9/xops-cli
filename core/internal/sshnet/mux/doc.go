@@ -17,12 +17,12 @@ package mux
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"os"
 	"sync"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -216,7 +216,7 @@ func (m *MuxSocket) Probe(ctx context.Context, socketPath pathalg.LocalSourcePat
 	case osfs.SocketProbeMissing, osfs.SocketProbeStale:
 		return ports.NewMuxControlResponse(false, 0, "not running")
 	case osfs.SocketProbeNotSocket:
-		return muxstream.ZeroVal[ports.MuxControlResponse](), fmt.Errorf("%w: 目标路径不是控制套接字", ports.ErrMuxUnavailable)
+		return muxstream.ZeroVal[ports.MuxControlResponse](), domi18n.EF(ports.ErrMuxUnavailable, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "control socket path"))
 	}
 	return m.probeLiveSocket(ctx, ctrlPath)
 }
@@ -233,11 +233,11 @@ func (m *MuxSocket) probeLiveSocket(ctx context.Context, ctrlPath osfs.ControlSo
 	var pid uint32
 	err = chanconn.RunWithAbortWatchdog(ctx, func() { _ = conn.Close() }, func() error {
 		if _, hErr := muxstream.ExchangeClientHello(conn); hErr != nil {
-			return fmt.Errorf("%w: PROTOCOL.mux 握手失败: %w", ports.ErrMuxUnavailable, hErr)
+			return domi18n.WrapS(ports.ErrMuxUnavailable, hErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "PROTOCOL.mux handshake"))
 		}
 		p, aErr := muxstream.SendAliveCheck(conn, 1)
 		if aErr != nil {
-			return fmt.Errorf("%w: 探活失败: %w", ports.ErrMuxUnavailable, aErr)
+			return domi18n.WrapS(ports.ErrMuxUnavailable, aErr, domi18n.KeyCommonOpFailed, domi18n.Str("op", "ControlMaster alive check"))
 		}
 		pid = p
 		return nil
@@ -254,7 +254,7 @@ func (m *MuxSocket) Control(ctx context.Context, req ports.MuxControlRequest) (p
 		return muxstream.ZeroVal[ports.MuxControlResponse](), err
 	}
 	if !req.IsValid() || req.Action() == ports.MuxActionProxy {
-		return muxstream.ZeroVal[ports.MuxControlResponse](), fmt.Errorf("%w: MuxControlRequest 无效或需改用 OpenProxy", ports.ErrInvalidArgument)
+		return muxstream.ZeroVal[ports.MuxControlResponse](), domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "MuxControlRequest"))
 	}
 	ctrlPath, err := toControlSocketPath(req.SocketPath())
 	if err != nil {
@@ -269,7 +269,7 @@ func (m *MuxSocket) Control(ctx context.Context, req ports.MuxControlRequest) (p
 	err = chanconn.RunWithAbortWatchdog(ctx, func() { _ = conn.Close() }, func() error {
 		exts, hErr := muxstream.ExchangeClientHello(conn)
 		if hErr != nil {
-			return fmt.Errorf("%w: %w", ports.ErrMuxUnavailable, hErr)
+			return domi18n.WrapSentinel(ports.ErrMuxUnavailable, hErr)
 		}
 		r, cErr := m.execControlAction(conn, req, exts)
 		if cErr != nil {
@@ -313,7 +313,7 @@ func (m *MuxSocket) DialMux(ctx context.Context, socketPath pathalg.LocalSourceP
 		return nil, err
 	}
 	if !hopDigest.IsValid() || !endpoint.IsValid() {
-		return nil, fmt.Errorf("%w: DialMux 需要有效 HopDigest 与 Endpoint", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "HopDigest or Endpoint"))
 	}
 	ctrlPath, err := toControlSocketPath(socketPath)
 	if err != nil {
@@ -337,7 +337,7 @@ func (m *MuxSocket) DialMux(ctx context.Context, socketPath pathalg.LocalSourceP
 	})
 	_ = conn.Close()
 	if err != nil {
-		return nil, fmt.Errorf("%w: ControlMaster 握手或探活失败: %w", ports.ErrMuxUnavailable, err)
+		return nil, domi18n.WrapS(ports.ErrMuxUnavailable, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "ControlMaster handshake or alive check"))
 	}
 	return newMuxTransportConn(m, ctrlPath, hopDigest, endpoint, exts[muxstream.ExtXOpsStreamMux] == "1", formatPeerDetail(cred))
 }
@@ -346,10 +346,10 @@ func (m *MuxSocket) dialVerified(ctx context.Context, ctrlPath osfs.ControlSocke
 	conn, cred, err := osfs.DialUnixVerified(ctx, ctrlPath)
 	if err != nil {
 		if isMuxUnavailableErr(err) {
-			return nil, muxstream.ZeroVal[osfs.PeerCred](), fmt.Errorf("%w: %w", ports.ErrMuxUnavailable, err)
+			return nil, muxstream.ZeroVal[osfs.PeerCred](), domi18n.WrapSentinel(ports.ErrMuxUnavailable, err)
 		}
 		if errors.Is(err, osfs.ErrUnauthorizedPeer) {
-			return nil, muxstream.ZeroVal[osfs.PeerCred](), fmt.Errorf("%w: %w", ports.ErrPermissionDenied, err)
+			return nil, muxstream.ZeroVal[osfs.PeerCred](), domi18n.WrapSentinel(ports.ErrPermissionDenied, err)
 		}
 		return nil, muxstream.ZeroVal[osfs.PeerCred](), err
 	}
@@ -359,11 +359,11 @@ func (m *MuxSocket) dialVerified(ctx context.Context, ctrlPath osfs.ControlSocke
 
 func toControlSocketPath(src pathalg.LocalSourcePath) (osfs.ControlSocketPath, error) {
 	if !src.IsValid() {
-		return muxstream.ZeroVal[osfs.ControlSocketPath](), fmt.Errorf("%w: 控制套接字路径无效", ports.ErrInvalidArgument)
+		return muxstream.ZeroVal[osfs.ControlSocketPath](), domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "control socket path"))
 	}
 	cp, err := osfs.ControlSocketPathFromSource(src)
 	if err != nil {
-		return muxstream.ZeroVal[osfs.ControlSocketPath](), fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return muxstream.ZeroVal[osfs.ControlSocketPath](), domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	return cp, nil
 }
@@ -373,10 +373,10 @@ func mapSlotBindError(err error) error {
 		return nil
 	}
 	if errors.Is(err, osfs.ErrSlotOccupied) {
-		return fmt.Errorf("%w: %w", ports.ErrAlreadyExists, err)
+		return domi18n.WrapSentinel(ports.ErrAlreadyExists, err)
 	}
 	if errors.Is(err, osfs.ErrNotSocket) || errors.Is(err, osfs.ErrInvalidControlPath) || errors.Is(err, osfs.ErrControlPathTooLong) {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	return err
 }

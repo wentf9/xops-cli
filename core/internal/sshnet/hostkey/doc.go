@@ -12,10 +12,10 @@
 package hostkey
 
 import (
-	"fmt"
 	"io/fs"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -72,13 +72,13 @@ type KnownHostsDB struct {
 // NewKnownHostsDB 校验配置依赖、默认目录/文件名、读取上限及可选哈希熵源并构造不可变 KnownHostsDB。
 func NewKnownHostsDB(cfg Config) (*KnownHostsDB, error) {
 	if cfg.RootFS == nil {
-		return nil, fmt.Errorf("%w: RootFS 不能为 nil", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "RootFS"))
 	}
 	if !cfg.DefaultDir.IsValid() {
-		return nil, fmt.Errorf("%w: DefaultDir 必须有效", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "DefaultDir"))
 	}
 	if home, ok := cfg.HomeDir.Get(); ok && !home.IsValid() {
-		return nil, fmt.Errorf("%w: HomeDir 无效", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "HomeDir"))
 	}
 	fileName := cfg.DefaultFileName
 	if fileName == "" {
@@ -86,7 +86,7 @@ func NewKnownHostsDB(cfg Config) (*KnownHostsDB, error) {
 	}
 	defaultDest, err := pathalg.ParseLocalRootedDest(fileName)
 	if err != nil {
-		return nil, fmt.Errorf("%w: DefaultFileName %q 非法: %w", ports.ErrInvalidArgument, fileName, err)
+		return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "DefaultFileName"), domi18n.BoundStr("value", fileName))
 	}
 	maxBytes := cfg.MaxFileBytes
 	if maxBytes <= 0 {
@@ -97,7 +97,7 @@ func NewKnownHostsDB(cfg Config) (*KnownHostsDB, error) {
 		return nil, err
 	}
 	if cfg.HashHostnames && cfg.Entropy == nil {
-		return nil, fmt.Errorf("%w: 启用 HashHostnames 时必须注入 Entropy", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonMissingDep, domi18n.Str("component", "Entropy"))
 	}
 	return &KnownHostsDB{
 		rootFS:        cfg.RootFS,

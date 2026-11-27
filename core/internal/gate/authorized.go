@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
 )
@@ -196,13 +197,13 @@ func validateWithAuthorizedInputs[C security.Capability](
 	}
 	capKind := security.CapabilityKindOf[C]()
 	if !capKind.IsValid() {
-		return fmt.Errorf("%w: 禁止以未具象化 Capability 接口调用 WithAuthorized", ErrCapabilityMismatch)
+		return domi18n.EF(ErrCapabilityMismatch, domi18n.KeyGateAbstractCapability)
 	}
 	if !req.IsValid() {
 		return ErrInvalidRequest
 	}
 	if req.raw.capKind != capKind || req.raw.binding.Capability() != capKind {
-		return fmt.Errorf("%w: 能力类型 %s 与请求绑定 %s 不一致", ErrCapabilityMismatch, capKind, req.raw.binding.Capability())
+		return domi18n.EF(ErrCapabilityMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "capability"), domi18n.Str("expected", capKind.String()), domi18n.Str("actual", req.raw.binding.Capability().String()))
 	}
 	return nil
 }
@@ -282,15 +283,15 @@ func (e *OutcomeError) Unwrap() error {
 	}
 	return e.cause
 }
-func (e *OutcomeError) Error() string {
+
+// LocalizableView 返回 *OutcomeError 的只读结构化错误视图（零值与 typed-nil 失败关闭）。
+func (e *OutcomeError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return ErrInvalidOutcome.Error()
+		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyGateInvalidOutcome)}
 	}
-	if e.cause == nil {
-		return fmt.Sprintf("gate: execution outcome=%s", e.outcome.Kind())
-	}
-	return fmt.Sprintf("gate: execution outcome=%s: %v", e.outcome.Kind(), e.cause)
+	return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyGateExecutionOutcome, domi18n.Str("outcome", e.outcome.Kind().String())), Cause: e.cause}
 }
+func (e *OutcomeError) Error() string { return domi18n.CanonicalError(e) }
 
 // OperationPanicError 记录受权回调发生 panic 时的原始值与堆栈，用于终态审计归因。
 //
@@ -315,12 +316,15 @@ func (e *OperationPanicError) Unwrap() error {
 	}
 	return ErrOperationPanicked
 }
-func (e *OperationPanicError) Error() string {
+
+// LocalizableView 返回 *OperationPanicError 的只读结构化错误视图（以 BoundStr 净化 panic 负载）。
+func (e *OperationPanicError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return ErrOperationPanicked.Error()
+		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyGateOperationPanicked)}
 	}
-	return fmt.Sprintf("%s: %v", ErrOperationPanicked.Error(), e.value)
+	return domi18n.ErrorNode{Sentinel: ErrOperationPanicked, Message: domi18n.NewMessage(domi18n.KeyGateOpPanickedDetail, domi18n.BoundStr("panic", fmt.Sprint(e.value)))}
 }
+func (e *OperationPanicError) Error() string { return domi18n.CanonicalError(e) }
 
 // ApprovalChallengeError 承载两步审批回退模式（NoElicitFallbackChallenge）签发的不可变 ApprovalEnvelope，
 // 实现 Unwrap() -> ErrApprovalRequired，使外部宿主（如 MCP）可直接展示并回传审批回执。
@@ -371,9 +375,12 @@ func (e *ApprovalChallengeError) Unwrap() error {
 	}
 	return ErrApprovalRequired
 }
-func (e *ApprovalChallengeError) Error() string {
+
+// LocalizableView 返回 *ApprovalChallengeError 的只读结构化错误视图（保留 ErrApprovalRequired 哨兵语义）。
+func (e *ApprovalChallengeError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return ErrApprovalRequired.Error()
+		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyGateApprovalRequired)}
 	}
-	return fmt.Sprintf("%s (op=%s, escalated=%v): %s", ErrApprovalRequired.Error(), e.envelope.OperationID(), e.escalated, e.reason)
+	return domi18n.ErrorNode{Sentinel: ErrApprovalRequired, Message: domi18n.NewMessage(domi18n.KeyGateApprovalChallenge, domi18n.Str("op", e.envelope.OperationID().String()), domi18n.Bool("escalated", e.escalated), domi18n.BoundStr("reason", e.reason))}
 }
+func (e *ApprovalChallengeError) Error() string { return domi18n.CanonicalError(e) }

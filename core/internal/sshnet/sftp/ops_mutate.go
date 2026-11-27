@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -39,7 +40,7 @@ func (c *Client) checkRenameArgs(ctx context.Context, oldPath, newPath pathalg.R
 		return err
 	}
 	if !newPath.IsValid() || !spec.IsValid() {
-		return fmt.Errorf("%w: RenameAtomic 目标路径或规格无效", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RenameAtomic destination or spec"))
 	}
 	if oldPath.IsRoot() || newPath.IsRoot() {
 		return ports.ErrPermissionDenied
@@ -102,7 +103,7 @@ func (c *Client) Chmod(ctx context.Context, p pathalg.RemotePath, perm fs.FileMo
 		return err
 	}
 	if perm == 0 || perm != perm.Perm() {
-		return fmt.Errorf("%w: Chmod 权限位 %#o 非法", ports.ErrInvalidArgument, perm)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonPermInvalid, domi18n.Str("perm", fmt.Sprintf("%#o", perm)))
 	}
 	body := appendAttrs(appendString(nil, p.String()), wireAttrs{flags: attrFlagPermissions, perm: uint32(perm)})
 	return c.expectStatusOK(ctx, sshFXPSetstat, body)
@@ -114,7 +115,7 @@ func (c *Client) Chtimes(ctx context.Context, p pathalg.RemotePath, atime, mtime
 		return err
 	}
 	if !isValidSFTPTimestamp(atime) || !isValidSFTPTimestamp(mtime) {
-		return fmt.Errorf("%w: Chtimes 时间戳无效或超出 SFTP v3 范围", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Chtimes timestamp"))
 	}
 	body := appendAttrs(appendString(nil, p.String()), wireAttrs{
 		flags: attrFlagACModTime,
@@ -226,7 +227,7 @@ func (c *Client) RemoveDir(ctx context.Context, dir pathalg.RemotePath) error {
 		if _, sErr := c.Lstat(ctx, dir); errors.Is(sErr, ports.ErrNotFound) {
 			return ports.ErrNotFound
 		}
-		return fmt.Errorf("%w: 远端目标不是空目录: %w", ports.ErrInvalidArgument, err)
+		return domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote directory (not empty)"))
 	}
 	return err
 }

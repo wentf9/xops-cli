@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"slices"
 	"strings"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
@@ -72,7 +72,7 @@ func (db *KnownHostsDB) RecordHostKey(ctx context.Context, endpoint netaddr.Endp
 		return err
 	}
 	if isHostCertificateAlgorithm(key.Algorithm()) {
-		return fmt.Errorf("%w: 禁止以 TOFU 方式记录原始 SSH 主机证书 %q", ports.ErrInvalidArgument, key.Algorithm())
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyHostKeyCertTOFU, domi18n.BoundStr("key", key.Algorithm()))
 	}
 	targets, err := db.resolveTargets(endpoint, knownHosts)
 	if err != nil {
@@ -162,7 +162,7 @@ func (db *KnownHostsDB) recordInRoot(ctx context.Context, root ports.RootHandle,
 
 func (db *KnownHostsDB) checkCall(ctx context.Context, argsValid bool) error {
 	if db == nil || !db.valid {
-		return fmt.Errorf("%w: KnownHostsDB 未初始化", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "KnownHostsDB"))
 	}
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -255,18 +255,18 @@ func (db *KnownHostsDB) resolveOneTarget(ep netaddr.Endpoint, entry option.PathE
 	}
 	src, err := pathalg.ParseLocalSourcePath(expanded)
 	if err != nil {
-		return knownHostsTarget{}, false, fmt.Errorf("%w: UserKnownHostsFile 路径 %q 非法: %w", ports.ErrInvalidArgument, raw, err)
+		return knownHostsTarget{}, false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "UserKnownHostsFile"), domi18n.BoundStr("value", raw))
 	}
 	if !src.IsAbs() {
 		dest, dErr := pathalg.ParseLocalRootedDest(src.String())
 		if dErr != nil {
-			return knownHostsTarget{}, false, fmt.Errorf("%w: 相对 known_hosts 路径 %q 非法: %w", ports.ErrInvalidArgument, raw, dErr)
+			return knownHostsTarget{}, false, domi18n.WrapS(ports.ErrInvalidArgument, dErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "relative known_hosts path"), domi18n.BoundStr("value", raw))
 		}
 		return knownHostsTarget{dir: db.defaultDir, dest: dest}, false, nil
 	}
 	dest, err := pathalg.ParseLocalRootedDest(src.Base())
 	if err != nil {
-		return knownHostsTarget{}, false, fmt.Errorf("%w: known_hosts 文件名 %q 非法: %w", ports.ErrInvalidArgument, src.Base(), err)
+		return knownHostsTarget{}, false, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "known_hosts file name"), domi18n.BoundStr("value", src.Base()))
 	}
 	return knownHostsTarget{dir: src.Dir(), dest: dest}, false, nil
 }
@@ -289,7 +289,7 @@ func (db *KnownHostsDB) expandKnownHostsPath(ep netaddr.Endpoint, entry option.P
 		}
 		expanded, err := option.ExpandPathTokens(target, tc)
 		if err != nil {
-			return "", fmt.Errorf("%w: 展开 known_hosts 模板 %q 失败: %w", ports.ErrInvalidArgument, raw, err)
+			return "", domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "expand known_hosts template"), domi18n.BoundStr("target", raw))
 		}
 		if hasTildePrefix {
 			out = "~/" + expanded
@@ -300,7 +300,7 @@ func (db *KnownHostsDB) expandKnownHostsPath(ep netaddr.Endpoint, entry option.P
 	if strings.HasPrefix(out, "~/") || strings.HasPrefix(out, `~\`) {
 		home, ok := db.homeDir.Get()
 		if !ok {
-			return "", fmt.Errorf("%w: 展开 %q 需要配置 HomeDir", ports.ErrInvalidArgument, raw)
+			return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonMissingDep, domi18n.Str("component", "HomeDir"))
 		}
 		out = strings.TrimRight(home.String(), `/\`) + "/" + out[2:]
 	}

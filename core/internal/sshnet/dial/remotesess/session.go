@@ -3,7 +3,6 @@ package remotesess
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"net"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -160,7 +160,7 @@ func (s *Session) Start(ctx context.Context, cmd execution.CommandPlan, streams 
 	}
 	rendered, err := cmd.RenderCommand()
 	if err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	stdinSrc := buildCommandStdinReader(cmd, streams.Stdin)
 	return s.launchSession(ctx, streams, cmd.MaxOutputBytes(), stdinSrc, true, func() error {

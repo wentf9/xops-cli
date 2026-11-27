@@ -3,22 +3,23 @@ package pool
 import (
 	"context"
 	"errors"
-	"fmt"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/foundation/actor"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
 	"github.com/wentf9/xops-cli/core/ports"
-	"strconv"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 // errFastPathMiss 为包内不可变哨兵，用于指示整链快路径未命中并回退至逐跳多跳解析。
-var errFastPathMiss = errors.New("pool: 整链快路径未命中")
+var errFastPathMiss = domi18n.Sentinel(domi18n.KeyPoolFastPathMiss)
 
 // Pool 是完全解耦于具体 SSH 实现的双通道纯内存 Actor Merkle 连接池（ADR-009 / Plan P2-T5）。
 //
@@ -80,7 +81,7 @@ func NewPool(ctx context.Context, cfg PoolConfig) (*Pool, error) {
 	}
 	poolTID, err := trace.NewTraceIDFrom(norm.Entropy)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 无法从 Entropy 生成池级 TraceID: %w", ErrInvalidPoolConfig, err)
+		return nil, domi18n.WrapS(ErrInvalidPoolConfig, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate pool TraceID"))
 	}
 	return buildAndStartPool(ctx, norm, poolTID)
 }
@@ -95,7 +96,7 @@ func normalizePoolConfig(cfg PoolConfig) (PoolConfig, error) {
 		cfg.Domain = DefaultDomain
 	}
 	if _, err := trace.NewLeaseScope(cfg.Domain, "init"); err != nil {
-		return PoolConfig{}, fmt.Errorf("%w: Domain 非法: %w", ErrInvalidPoolConfig, err)
+		return PoolConfig{}, domi18n.WrapS(ErrInvalidPoolConfig, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "Domain"))
 	}
 	if cfg.AcquireBuffer == 0 {
 		cfg.AcquireBuffer = DefaultAcquireBuffer
@@ -108,13 +109,13 @@ func normalizePoolConfig(cfg PoolConfig) (PoolConfig, error) {
 func validatePoolPorts(cfg PoolConfig) error {
 	switch {
 	case cfg.Dialer == nil:
-		return fmt.Errorf("%w: Dialer 不能为 nil", ErrInvalidPoolConfig)
+		return domi18n.EF(ErrInvalidPoolConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Dialer"))
 	case cfg.Clock == nil:
-		return fmt.Errorf("%w: Clock 不能为 nil", ErrInvalidPoolConfig)
+		return domi18n.EF(ErrInvalidPoolConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Clock"))
 	case cfg.Entropy == nil:
-		return fmt.Errorf("%w: Entropy 不能为 nil", ErrInvalidPoolConfig)
+		return domi18n.EF(ErrInvalidPoolConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Entropy"))
 	case cfg.Bus != nil && cfg.Bus.IsClosed():
-		return fmt.Errorf("%w: SystemBus 必须处于已初始化且未关闭状态", ErrInvalidPoolConfig)
+		return domi18n.EF(ErrInvalidPoolConfig, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "SystemBus"))
 	default:
 		return nil
 	}
@@ -122,7 +123,7 @@ func validatePoolPorts(cfg PoolConfig) error {
 func validatePoolLimits(cfg PoolConfig) error {
 	if cfg.AcquireBuffer < 0 || cfg.MaxConns < 0 || cfg.MaxHandles < 0 ||
 		cfg.TeardownGrace < 0 || cfg.IdleTTL < 0 || cfg.DefaultKeepaliveInterval < 0 {
-		return fmt.Errorf("%w: 容量与时长上限参数不能为负", ErrInvalidPoolConfig)
+		return domi18n.EF(ErrInvalidPoolConfig, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "pool capacity or duration limit"))
 	}
 	return nil
 }
@@ -221,7 +222,7 @@ func (p *Pool) recordHaltReason(reason error) error {
 	case errors.Is(reason, ErrGateHalted):
 		p.haltErr = reason
 	default:
-		p.haltErr = fmt.Errorf("%w: %w", ErrGateHalted, reason)
+		p.haltErr = domi18n.WrapSentinel(ErrGateHalted, reason)
 	}
 	p.halted.Store(true)
 	return p.haltErr

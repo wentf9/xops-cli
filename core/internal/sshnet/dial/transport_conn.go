@@ -12,6 +12,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
@@ -169,7 +170,7 @@ func (c *TransportConn) SendGlobalRequest(ctx context.Context, name string, want
 		return false, nil, err
 	}
 	if name == "" {
-		return false, nil, fmt.Errorf("%w: 全局请求名不能为空", ports.ErrInvalidArgument)
+		return false, nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "global request name"))
 	}
 	type reqResp struct {
 		ok   bool
@@ -222,7 +223,7 @@ func (c *TransportConn) OpenChannel(ctx context.Context, chanType string, extraD
 		return nil, nil, err
 	}
 	if chanType == "" {
-		return nil, nil, fmt.Errorf("%w: 通道类型不能为空", ports.ErrInvalidArgument)
+		return nil, nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "channel type"))
 	}
 	pair, err := chanconn.RunMultiplexedOp(ctx, c.lifeNursery, func() (openedChannelPair, error) {
 		ch, reqs, oErr := c.client.OpenChannel(chanType, extraData)
@@ -267,7 +268,7 @@ func (c *TransportConn) OpenSubsystem(ctx context.Context, subsystem string) (*c
 		return nil, err
 	}
 	if subsystem == "" {
-		return nil, fmt.Errorf("%w: 子系统名称不能为空", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "subsystem"))
 	}
 	ch, reqs, err := c.OpenChannel(ctx, "session", nil)
 	if err != nil {
@@ -282,7 +283,7 @@ func (c *TransportConn) OpenSubsystem(ctx context.Context, subsystem string) (*c
 		if rErr != nil {
 			return nil, rErr
 		}
-		return nil, fmt.Errorf("%w: 远端拒绝启动子系统 %q", ports.ErrUnsupported, subsystem)
+		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", "subsystem "+subsystem))
 	}
 	localAddr := chanconn.NewAddr("subsystem", c.endpoint.String())
 	remoteAddr := chanconn.NewAddr("subsystem", subsystem+"@"+c.endpoint.String())
@@ -304,7 +305,7 @@ func (c *TransportConn) DialTCP(ctx context.Context, target netaddr.HostPort) (n
 		return nil, err
 	}
 	if !target.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 DialTCP 目标 HostPort", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "DialTCP target"))
 	}
 	payload := ssh.Marshal(&directTCPIPMsg{
 		DestAddr:   target.Host().String(),
@@ -325,7 +326,7 @@ func (c *TransportConn) ListenTCP(ctx context.Context, bindAddr string) (net.Lis
 		return nil, err
 	}
 	if bindAddr == "" {
-		return nil, fmt.Errorf("%w: bindAddr 不能为空", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "bindAddr"))
 	}
 	return chanconn.RunMultiplexedOp(ctx, c.lifeNursery, func() (net.Listener, error) {
 		return c.client.Listen("tcp", bindAddr)
@@ -345,7 +346,7 @@ func (c *TransportConn) DialStreamLocal(ctx context.Context, remoteSocket pathal
 		return nil, err
 	}
 	if !remoteSocket.IsValid() {
-		return nil, fmt.Errorf("%w: 无效远端 Unix 套接字路径", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix socket path"))
 	}
 	payload := ssh.Marshal(&directStreamLocalMsg{SocketPath: remoteSocket.String()})
 	wc, err := c.OpenWatchedChannel(ctx, "direct-streamlocal@openssh.com", payload, chanconn.NewAddr("unix", remoteSocket.String()))
@@ -361,7 +362,7 @@ func (c *TransportConn) ListenStreamLocal(ctx context.Context, remoteSocket path
 		return nil, err
 	}
 	if !remoteSocket.IsValid() {
-		return nil, fmt.Errorf("%w: 无效远端 Unix 监听路径", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix listen path"))
 	}
 	return chanconn.RunMultiplexedOp(ctx, c.lifeNursery, func() (net.Listener, error) {
 		return c.client.ListenUnix(remoteSocket.String())
@@ -380,7 +381,7 @@ func (c *TransportConn) OpenTUN(ctx context.Context, spec ports.TUNSpec) (io.Rea
 		return nil, err
 	}
 	if !spec.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 TUNSpec", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TUNSpec"))
 	}
 	mode := uint32(1)
 	if spec.Mode() == ports.TUNModeEthernet {

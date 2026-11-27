@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/mux/muxstream"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -12,7 +13,7 @@ import (
 func (m *MuxSocket) execControlAction(conn *net.UnixConn, req ports.MuxControlRequest, exts map[string]string) (ports.MuxControlResponse, error) {
 	pid, err := muxstream.SendAliveCheck(conn, 1)
 	if err != nil {
-		return muxstream.ZeroVal[ports.MuxControlResponse](), fmt.Errorf("%w: %w", ports.ErrMuxUnavailable, err)
+		return muxstream.ZeroVal[ports.MuxControlResponse](), domi18n.WrapSentinel(ports.ErrMuxUnavailable, err)
 	}
 	if req.Action() == ports.MuxActionCheck {
 		return ports.NewMuxControlResponse(true, pid, "check")
@@ -35,21 +36,21 @@ func sendControlCommand(conn *net.UnixConn, reqID uint32, req ports.MuxControlRe
 	case ports.MuxActionCancel:
 		return sendForwardControl(conn, reqID, req, false, hasXOps)
 	default:
-		return "", fmt.Errorf("%w: 不支持的 Control 动作 %s", ports.ErrInvalidArgument, req.Action())
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "control action "+req.Action().String()))
 	}
 }
 
 func sendForwardControl(conn *net.UnixConn, reqID uint32, req ports.MuxControlRequest, isOpen, hasXOps bool) (string, error) {
 	fwd, ok := req.Forward().Get()
 	if !ok || !fwd.IsValid() {
-		return "", fmt.Errorf("%w: forward/cancel 缺少有效 ForwardSpec", ports.ErrInvalidArgument)
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ForwardSpec"))
 	}
 	msgType, body, err := muxstream.EncodeForwardWire(reqID, fwd)
 	if err != nil {
 		return "", err
 	}
 	if msgType == muxstream.XOpsCOpenTUNFwd && !hasXOps {
-		return "", fmt.Errorf("%w: 目标 ControlMaster 不支持 TUN 动态控制", ports.ErrUnsupported)
+		return "", domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "TUN dynamic forwarding"))
 	}
 	if !isOpen {
 		if msgType == muxstream.XOpsCOpenTUNFwd {
@@ -113,7 +114,7 @@ func roundTripControlOK(conn *net.UnixConn, msgType uint32, body []byte, reqID u
 
 func negotiateProxyMode(conn *net.UnixConn) error {
 	if _, err := muxstream.ExchangeClientHello(conn); err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrMuxUnavailable, err)
+		return domi18n.WrapSentinel(ports.ErrMuxUnavailable, err)
 	}
 	if err := muxstream.WritePacket(conn, muxstream.CProxy, muxstream.AppendU32(nil, 1)); err != nil {
 		return err

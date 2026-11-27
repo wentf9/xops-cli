@@ -3,12 +3,12 @@ package dial
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -25,14 +25,14 @@ func (d *Dialer) buildAuthMethods(ctx context.Context, hop plan.HopSpec) ([]ssh.
 		return nil, err
 	}
 	if len(methods) == 0 {
-		return nil, fmt.Errorf("%w: 未构建出任何可用的 SSH 认证方法", ports.ErrAuthFailed)
+		return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialNoAuthMethods)
 	}
 	return methods, nil
 }
 
 func (d *Dialer) compileAuthMethod(ctx context.Context, hop plan.HopSpec, auth inventory.AuthMethod, loginPassRef algebraic.Option[secret.Ref]) ([]ssh.AuthMethod, error) {
 	if auth == nil || !auth.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 AuthMethod", ports.ErrAuthFailed)
+		return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "AuthMethod"))
 	}
 	switch v := auth.(type) {
 	case *inventory.AuthPassword:
@@ -50,7 +50,7 @@ func (d *Dialer) compileAuthMethod(ctx context.Context, hop plan.HopSpec, auth i
 	case *inventory.AuthComposite:
 		return d.buildCompositeAuth(ctx, hop, v, loginPassRef)
 	default:
-		return nil, fmt.Errorf("%w: 不支持的认证变体 %T", ports.ErrAuthFailed, auth)
+		return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "auth method variant"))
 	}
 }
 
@@ -78,7 +78,7 @@ func (d *Dialer) buildCompositeAuth(ctx context.Context, hop plan.HopSpec, comp 
 
 func (d *Dialer) buildPasswordAuth(ctx context.Context, ref secret.Ref) (ssh.AuthMethod, error) {
 	if d.vault == nil {
-		return nil, fmt.Errorf("%w: 密码认证需要注入 SecretVault", ports.ErrAuthFailed)
+		return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SecretVault"))
 	}
 	var method ssh.AuthMethod
 	err := d.vault.WithSecret(ctx, ref, func(box *secret.SecretBox) error {
@@ -88,21 +88,21 @@ func (d *Dialer) buildPasswordAuth(ctx context.Context, ref secret.Ref) (ssh.Aut
 		})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("%w: 读取密码凭据失败: %w", ports.ErrAuthFailed, err)
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "read password secret"))
 	}
 	return method, nil
 }
 
 func (d *Dialer) buildAgentAuth(ctx context.Context, spec algebraic.Option[inventory.AgentSpec]) ([]ssh.AuthMethod, error) {
 	if d.agent == nil {
-		return nil, fmt.Errorf("%w: 未注入 SSHAgentPort", ports.ErrSignerUnavailable)
+		return nil, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SSHAgentPort"))
 	}
 	keys, err := d.agent.ListAgentKeys(ctx, spec)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: %w", ports.ErrSignerUnavailable, err)
+		return nil, domi18n.WrapSentinel(ports.ErrSignerUnavailable, err)
 	}
 	signers, err := keysigner.WrapPortSigners(keys, func(fp inventory.KeyFingerprint, algo string, data []byte) (ports.Signature, error) {
 		return d.agent.SignWithAgent(ctx, spec, fp, algo, data)
@@ -134,7 +134,7 @@ func (d *Dialer) buildPrivateKeyAuth(ctx context.Context, hop plan.HopSpec, v *i
 		signers = append(signers, fsSigners...)
 	}
 	if len(signers) == 0 {
-		return nil, fmt.Errorf("%w: 无可用私钥签名器（请注入 KeySignerPort 或 OperatorReadFS）", ports.ErrSignerUnavailable)
+		return nil, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "KeySignerPort or OperatorReadFS"))
 	}
 	return []ssh.AuthMethod{ssh.PublicKeys(signers...)}, nil
 }
@@ -184,7 +184,7 @@ func (d *Dialer) loadSignersFromReadFS(ctx context.Context, hop plan.HopSpec, v 
 		rawSigners = append(rawSigners, s)
 	}
 	if len(rawSigners) == 0 {
-		return nil, fmt.Errorf("%w: %w: 未找到任何可用私钥文件", ports.ErrAuthFailed, ports.ErrSignerUnavailable)
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, ports.ErrSignerUnavailable, domi18n.KeyKeySignerNoKeysFound)
 	}
 	if err := keysigner.VerifyPassphraseBindingLoaded(rawSigners, v.Passphrase()); err != nil {
 		return nil, err

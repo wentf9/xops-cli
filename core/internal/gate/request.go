@@ -2,13 +2,13 @@ package gate
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -47,11 +47,11 @@ type ApprovalSubmission struct {
 // NewApprovalSubmission 校验审批回执及可选完整信封后构造不可变 ApprovalSubmission。
 func NewApprovalSubmission(spec ApprovalSubmissionSpec) (ApprovalSubmission, error) {
 	if !spec.Response.IsValid() {
-		return ApprovalSubmission{}, fmt.Errorf("%w: ApprovalDecisionResponse 无效", ErrApprovalMismatch)
+		return ApprovalSubmission{}, domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ApprovalDecisionResponse"))
 	}
 	if env, ok := spec.Envelope.Get(); ok {
 		if !env.IsValid() {
-			return ApprovalSubmission{}, fmt.Errorf("%w: ApprovalEnvelope 无效", ErrApprovalMismatch)
+			return ApprovalSubmission{}, domi18n.EF(ErrApprovalMismatch, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ApprovalEnvelope"))
 		}
 	}
 	return ApprovalSubmission{
@@ -138,16 +138,16 @@ type rawGateRequest struct {
 func NewGateRequest[C security.Capability](spec GateRequestSpec[C]) (GateRequest[C], error) {
 	capKind := security.CapabilityKindOf[C]()
 	if !capKind.IsValid() {
-		return GateRequest[C]{}, fmt.Errorf("%w: 禁止使用未具象化的 Capability 接口类型", ErrCapabilityMismatch)
+		return GateRequest[C]{}, domi18n.EF(ErrCapabilityMismatch, domi18n.KeyGateAbstractCapability)
 	}
 	if !spec.Binding.IsValid() {
-		return GateRequest[C]{}, fmt.Errorf("%w: OperationBinding 无效", ErrInvalidRequest)
+		return GateRequest[C]{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "OperationBinding"))
 	}
 	if spec.Binding.Capability() != capKind {
-		return GateRequest[C]{}, fmt.Errorf("%w: 期望 %s，实际 %s", ErrCapabilityMismatch, capKind, spec.Binding.Capability())
+		return GateRequest[C]{}, domi18n.EF(ErrCapabilityMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "capability"), domi18n.Str("expected", capKind.String()), domi18n.Str("actual", spec.Binding.Capability().String()))
 	}
 	if !spec.Risk.IsValid() {
-		return GateRequest[C]{}, fmt.Errorf("%w: RiskLevel 必须有效", ErrInvalidRequest)
+		return GateRequest[C]{}, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "RiskLevel"))
 	}
 	traceID, opID, err := resolveGateRequestOptionals(
 		spec.TraceID, spec.OperationID, spec.Verdict, spec.DecisionFloor, spec.Approval, spec.OperationStream,
@@ -193,10 +193,10 @@ func resolveGateRequestOptionals(
 ) (algebraic.Option[security.TraceID], algebraic.Option[security.OperationID], error) {
 	noneT, noneO := algebraic.None[security.TraceID](), algebraic.None[security.OperationID]()
 	if optInvalid(tid) || optInvalid(opID) || optInvalid(verdict) || optInvalid(approval) {
-		return noneT, noneO, fmt.Errorf("%w: 可选 trace_id/operation_id/verdict/approval 不能为无效零值", ErrInvalidRequest)
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "optional request field"))
 	}
 	if fl, ok := floor.Get(); ok && (fl == nil || !fl.IsValid()) {
-		return noneT, noneO, fmt.Errorf("%w: decision_floor 不能为 nil 或无效零值", ErrInvalidRequest)
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "decision_floor"))
 	}
 	if opStream == nil {
 		return tid, opID, nil
@@ -212,21 +212,21 @@ func alignIDsWithOperationStream(
 ) (algebraic.Option[security.TraceID], algebraic.Option[security.OperationID], error) {
 	noneT, noneO := algebraic.None[security.TraceID](), algebraic.None[security.OperationID]()
 	if opStream.IsClosed() {
-		return noneT, noneO, fmt.Errorf("%w: operation_stream 未初始化或已关闭", ErrInvalidRequest)
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "operation_stream"))
 	}
 	streamTID, streamOpID := opStream.TraceID(), opStream.OperationID()
 	if !streamTID.IsValid() || !streamOpID.IsValid() {
-		return noneT, noneO, fmt.Errorf("%w: operation_stream 绑定标识无效", ErrInvalidRequest)
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "operation_stream binding"))
 	}
 	if explicitT, ok := tid.Get(); ok && !explicitT.Equal(streamTID) {
-		return noneT, noneO, fmt.Errorf("%w: trace_id 与 OperationStream 绑定不一致", ErrInvalidRequest)
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonMismatch, domi18n.Str("field", "trace_id"), domi18n.Str("expected", streamTID.String()), domi18n.Str("actual", explicitT.String()))
 	}
 	if explicitO, ok := opID.Get(); ok && !explicitO.Equal(streamOpID) {
-		return noneT, noneO, fmt.Errorf("%w: operation_id 与 OperationStream 绑定不一致", ErrInvalidRequest)
+		return noneT, noneO, domi18n.EF(ErrInvalidRequest, domi18n.KeyCommonMismatch, domi18n.Str("field", "operation_id"), domi18n.Str("expected", streamOpID.String()), domi18n.Str("actual", explicitO.String()))
 	}
 	if sub, ok := approval.Get(); ok {
 		if env, hasEnv := sub.Envelope().Get(); hasEnv && !env.OperationID().Equal(streamOpID) {
-			return noneT, noneO, fmt.Errorf("%w: %w: 审批信封 OperationID 与 OperationStream 不一致", ErrInvalidRequest, ErrApprovalMismatch)
+			return noneT, noneO, domi18n.WrapS(ErrInvalidRequest, ErrApprovalMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "envelope OperationID"), domi18n.Str("expected", streamOpID.String()), domi18n.Str("actual", env.OperationID().String()))
 		}
 	}
 	return algebraic.Some(streamTID), algebraic.Some(streamOpID), nil
@@ -262,7 +262,7 @@ func buildScopeSummary(raw string, b security.OperationBinding) string {
 	if node == "" {
 		node = "global"
 	}
-	return truncateUTF8(fmt.Sprintf("%s.%s capability=%s node=%s", b.Tool(), b.Action(), b.Capability(), node), maxSummaryBytes)
+	return truncateUTF8(b.Tool()+"."+b.Action()+" capability="+b.Capability().String()+" node="+node, maxSummaryBytes)
 }
 
 // IsValid 报告 GateRequest[C] 是否经合法构造且能力绑定一致。

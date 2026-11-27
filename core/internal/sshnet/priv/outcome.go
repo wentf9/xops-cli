@@ -3,10 +3,10 @@ package priv
 import (
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -138,9 +138,9 @@ func classifyEscalationErr(
 	if errors.Is(err, errHandshakeEndedBeforeReady) {
 		diag := state.diagText()
 		if sentAttempts > 0 || req.NonInteractive() || isAuthRejectionDiagnostic(diag) {
-			return fmt.Errorf("%w: 提权认证在命令启动前被拒绝", ports.ErrAuthFailed)
+			return domi18n.EF(ports.ErrAuthFailed, domi18n.KeyPrivAuthRejected)
 		}
-		return fmt.Errorf("%w: %w", ports.ErrAuthFailed, err)
+		return domi18n.WrapSentinel(ports.ErrAuthFailed, err)
 	}
 	return err
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -478,5 +479,33 @@ func dispatchSFTPSubsysReq(n *conc.Nursery, ch ssh.Channel, req *ssh.Request, sf
 			sftpSrv.serve(ch)
 			return nil
 		})
+	}
+}
+
+func TestSFTPStatusErrorLocalizableNodeContract(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	cli, _ := openStubSFTPClient(t, stubSFTPServerOpts{}, sftp.Config{})
+	defer func() { _ = cli.Close() }()
+
+	missing, err := pathalg.ParseRemotePath("/definitely-missing-i18n-file")
+	if err != nil {
+		t.Fatalf("ParseRemotePath 失败: %v", err)
+	}
+	_, statErr := cli.Stat(context.Background(), missing)
+	if !errors.Is(statErr, ports.ErrNotFound) {
+		t.Fatalf("Stat 缺失路径期望匹配 ErrNotFound，实际=%v", statErr)
+	}
+	view, ok := domi18n.InspectNode(statErr)
+	if !ok {
+		t.Fatalf("sftpStatusError 必须实现 domi18n.LocalizableNode: %v", statErr)
+	}
+	if view.Message.ID() != domi18n.KeySFTPStatusCode && view.Message.ID() != domi18n.KeySFTPStatusCodeDetail {
+		t.Fatalf("sftpStatusError MessageID 异常: %v", view.Message.ID())
+	}
+	if !errors.Is(view.Sentinel, ports.ErrNotFound) {
+		t.Fatalf("sftpStatusError Sentinel 期望 ErrNotFound，实际=%v", view.Sentinel)
+	}
+	if statErr.Error() != domi18n.CanonicalError(statErr) {
+		t.Fatalf("sftpStatusError.Error()=%q 与 CanonicalError=%q 不一致", statErr.Error(), domi18n.CanonicalError(statErr))
 	}
 }

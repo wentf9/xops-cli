@@ -2,13 +2,13 @@ package forward
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/osfs"
@@ -127,7 +127,7 @@ func (f *Forwarder) StartForward(ctx context.Context, transport ports.TunnelTran
 		return nil, ports.ErrClosed
 	}
 	if transport == nil || !spec.IsValid() {
-		return nil, fmt.Errorf("%w: StartForward 缺少有效 TunnelTransport 或 ForwardSpec", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TunnelTransport or ForwardSpec"))
 	}
 	if ac, ok := transport.(aliveChecker); ok && !ac.IsAlive() {
 		return nil, ports.ErrClosed
@@ -142,7 +142,7 @@ func (f *Forwarder) StartForward(ctx context.Context, transport ports.TunnelTran
 	case ports.ForwardTUN:
 		return f.startTUNForward(ctx, transport, spec)
 	default:
-		return nil, fmt.Errorf("%w: 不支持的转发方向 %s", ports.ErrInvalidArgument, spec.Direction())
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "forward direction "+spec.Direction().String()))
 	}
 }
 
@@ -154,7 +154,7 @@ func (f *Forwarder) startLocalForward(ctx context.Context, transport ports.Tunne
 	if spec.BindKind() == ports.ForwardEndpointUnix {
 		return f.startLocalUnixForward(ctx, transport, spec, remoteDial)
 	}
-	ln, err := f.listenLocalTCP(ctx, spec.BindAddr(), "本地 TCP")
+	ln, err := f.listenLocalTCP(ctx, spec.BindAddr(), "listen local TCP")
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func (f *Forwarder) listenLocalTCP(ctx context.Context, bindAddr, label string) 
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "tcp", listenAddr)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 监听%s %q 失败: %w", ports.ErrDialFailed, label, listenAddr, err)
+		return nil, domi18n.WrapS(ports.ErrDialFailed, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", label), domi18n.BoundStr("target", listenAddr))
 	}
 	if !f.allowGatewayPorts {
 		if err := verifyBoundLoopback(ln); err != nil {
@@ -185,7 +185,7 @@ func (f *Forwarder) listenLocalTCP(ctx context.Context, bindAddr, label string) 
 func (f *Forwarder) startLocalUnixForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec, remoteDial connDialFunc) (*Handle, error) {
 	sockPath, err := osfs.ValidateControlSocketPath(spec.BindAddr())
 	if err != nil {
-		return nil, fmt.Errorf("%w: 本地 Unix 监听路径非法: %w", ports.ErrInvalidArgument, err)
+		return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "local Unix bind path"))
 	}
 	n, err := conc.NewNursery(context.Background())
 	if err != nil {
@@ -257,7 +257,7 @@ func openRemoteListener(ctx context.Context, transport ports.TunnelTransport, sp
 	if spec.BindKind() == ports.ForwardEndpointUnix {
 		rp, err := pathalg.ParseRemotePath(spec.BindAddr())
 		if err != nil {
-			return nil, fmt.Errorf("%w: 远端 Unix 监听路径非法: %w", ports.ErrInvalidArgument, err)
+			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote Unix bind path"))
 		}
 		return transport.ListenStreamLocal(ctx, rp)
 	}
@@ -268,7 +268,7 @@ func openRemoteListener(ctx context.Context, transport ports.TunnelTransport, sp
 }
 
 func (f *Forwarder) startDynamicForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (*Handle, error) {
-	ln, err := f.listenLocalTCP(ctx, spec.BindAddr(), "本地 SOCKS5")
+	ln, err := f.listenLocalTCP(ctx, spec.BindAddr(), "listen local SOCKS5")
 	if err != nil {
 		return nil, err
 	}
@@ -280,10 +280,10 @@ func (f *Forwarder) startDynamicForward(ctx context.Context, transport ports.Tun
 func (f *Forwarder) startTUNForward(ctx context.Context, transport ports.TunnelTransport, spec ports.ForwardSpec) (*Handle, error) {
 	tunSpec, ok := spec.TUN().Get()
 	if !ok || !tunSpec.IsValid() {
-		return nil, fmt.Errorf("%w: ForwardTUN 缺少有效 TUNSpec", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TUNSpec"))
 	}
 	if f.tunDevice == nil {
-		return nil, fmt.Errorf("%w: 未配置 TUNDevicePort", ports.ErrUnsupported)
+		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonMissingDep, domi18n.Str("component", "TUNDevicePort"))
 	}
 	localDev, ifaceName, err := f.tunDevice.OpenLocalTUN(ctx, tunSpec)
 	if err != nil {
@@ -293,7 +293,7 @@ func (f *Forwarder) startTUNForward(ctx context.Context, transport ports.TunnelT
 		if localDev != nil {
 			_ = localDev.Close()
 		}
-		return nil, fmt.Errorf("%w: TUNDevicePort 返回无效设备句柄或空接口名", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "TUN device handle or interface name"))
 	}
 	remoteTUN, err := transport.OpenTUN(ctx, tunSpec)
 	if err != nil {

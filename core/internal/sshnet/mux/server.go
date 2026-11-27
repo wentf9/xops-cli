@@ -2,7 +2,6 @@ package mux
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/mux/muxstream"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -73,7 +73,7 @@ func (m *MuxSocket) Serve(
 		return err
 	}
 	if ln == nil || upstream == nil {
-		return fmt.Errorf("%w: Serve 需要非 nil 的 net.Listener 与 upstream", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "listener or upstream"))
 	}
 	if !upstream.IsAlive() {
 		return ports.ErrClosed

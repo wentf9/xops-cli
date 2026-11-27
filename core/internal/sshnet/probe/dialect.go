@@ -1,12 +1,12 @@
 package probe
 
 import (
-	"fmt"
 	"path"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const (
@@ -59,7 +59,7 @@ func stage2EnumCommand(dialect execution.LaunchDialect) (string, error) {
 	case execution.DialectPowerShell:
 		return stage2EnumPowerShell, nil
 	default:
-		return "", fmt.Errorf("%w: 无法在方言 %s 上执行阶段 2 解释器枚举", ErrProbeFailed, dialect)
+		return "", domi18n.EF(ErrProbeFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "stage 2 probe for dialect "+dialect.String()))
 	}
 }
 
@@ -212,7 +212,7 @@ func parseStage2Interpreters(output string) ([]execution.Interpreter, error) {
 		line = strings.TrimSuffix(line, "\r")
 		if line == frameInterpEnd {
 			if ended {
-				return nil, fmt.Errorf("%w: 阶段 2 出现重复结束帧", ErrProbeFailed)
+				return nil, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeFrameInvalid)
 			}
 			ended = true
 			continue
@@ -223,12 +223,12 @@ func parseStage2Interpreters(output string) ([]execution.Interpreter, error) {
 		}
 		interp, err := parseAllowedProbeInterpreter(val)
 		if ended || err != nil || slices.Contains(out, interp) {
-			return nil, fmt.Errorf("%w: 阶段 2 解释器帧非法或重复", ErrProbeFailed)
+			return nil, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeFrameInvalid)
 		}
 		out = append(out, interp)
 	}
 	if !ended {
-		return nil, fmt.Errorf("%w: 阶段 2 缺失结束帧", ErrProbeFailed)
+		return nil, domi18n.EF(ErrProbeFailed, domi18n.KeyProbeFrameInvalid)
 	}
 	return out, nil
 }

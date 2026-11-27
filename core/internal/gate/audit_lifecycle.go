@@ -3,12 +3,12 @@ package gate
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sync/atomic"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
@@ -53,11 +53,11 @@ func (g *Gate) stageAndAuthorize(
 ) (issuedPermit, error) {
 	startedAt := g.clock.Now().UTC().Round(0)
 	if !isValidRFC3339Time(startedAt) {
-		return issuedPermit{}, fmt.Errorf("%w: 时钟返回无效授权时刻", ErrInvalidConfig)
+		return issuedPermit{}, domi18n.EF(ErrInvalidConfig, domi18n.KeyGateInvalidClockTime)
 	}
 	// 严格顺序第 1 步：只追加登记 +<opID>\n 至当前进程 .lock。
 	if err := g.sink.StageOperation(ctx, approved.opID); err != nil {
-		return issuedPermit{}, fmt.Errorf("%w: %w", ErrAuditStageFailed, err)
+		return issuedPermit{}, domi18n.WrapSentinel(ErrAuditStageFailed, err)
 	}
 	decision := approvalDecisionKind(approved.approvedViaChg)
 	authEntry, err := ports.NewAuditEntry(ports.AuditEntrySpec{
@@ -74,14 +74,14 @@ func (g *Gate) stageAndAuthorize(
 	})
 	if err != nil {
 		_ = g.sink.UnstageOperation(context.WithoutCancel(ctx), approved.opID)
-		return issuedPermit{}, fmt.Errorf("%w: %w", ErrAuditPreWriteFailed, err)
+		return issuedPermit{}, domi18n.WrapSentinel(ErrAuditPreWriteFailed, err)
 	}
 	// 严格顺序第 2 步：同步落盘 Audit(Authorized)，失败时尽力注销 +opID 且绝不执行回调。
 	if err := g.sink.Record(ctx, authEntry); err != nil {
 		unstageErr := g.sink.UnstageOperation(context.WithoutCancel(ctx), approved.opID)
-		preErr := fmt.Errorf("%w: %w", ErrAuditPreWriteFailed, err)
+		preErr := domi18n.WrapSentinel(ErrAuditPreWriteFailed, err)
 		if unstageErr != nil {
-			return issuedPermit{}, errors.Join(preErr, fmt.Errorf("%w: %w", ErrAuditUnstageFailed, unstageErr))
+			return issuedPermit{}, errors.Join(preErr, domi18n.WrapSentinel(ErrAuditUnstageFailed, unstageErr))
 		}
 		return issuedPermit{}, preErr
 	}
@@ -166,7 +166,7 @@ func (g *Gate) finalizeAudit(ctx context.Context, permit issuedPermit, runErr er
 		if errors.Is(unstageErr, ports.ErrAuditPostWrite) && g.profile.HaltsOnAuditPostWriteError() {
 			g.triggerHalt(algebraic.Some(permit.opID), "audit_unstage_post_write_failed", unstageErr)
 		}
-		return joinRunAndAuditErr(runErr, fmt.Errorf("%w: %w", ErrAuditUnstageFailed, unstageErr))
+		return joinRunAndAuditErr(runErr, domi18n.WrapSentinel(ErrAuditUnstageFailed, unstageErr))
 	}
 	return runErr
 }
@@ -174,7 +174,7 @@ func (g *Gate) finalizeAudit(ctx context.Context, permit issuedPermit, runErr er
 func (g *Gate) buildFinalizedAuditEntry(permit issuedPermit, runErr error) (ports.AuditEntry, error) {
 	now := g.clock.Now().UTC().Round(0)
 	if !isValidRFC3339Time(now) {
-		return zeroVal[ports.AuditEntry](), fmt.Errorf("%w: 时钟返回无效终态时刻", ErrInvalidConfig)
+		return zeroVal[ports.AuditEntry](), domi18n.EF(ErrInvalidConfig, domi18n.KeyGateInvalidClockTime)
 	}
 	elapsed := g.clock.Since(permit.startedAt)
 	if elapsed < 0 {
@@ -218,7 +218,7 @@ func ensureAuditPostWriteError(opID security.OperationID, writeErr error) error 
 	}
 	pw, err := ports.NewAuditPostWriteError(opID, writeErr)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrAuditPostWrite, writeErr)
+		return domi18n.WrapSentinel(ports.ErrAuditPostWrite, writeErr)
 	}
 	return pw
 }
@@ -229,13 +229,13 @@ func (g *Gate) recordDeniedAudit(ctx context.Context, traceID security.TraceID, 
 	if !opID.IsValid() {
 		genID, err := security.NewOperationIDFrom(g.entropy)
 		if err != nil {
-			return errors.Join(rej.err, fmt.Errorf("%w: %w", ErrAuditPreWriteFailed, err))
+			return errors.Join(rej.err, domi18n.WrapSentinel(ErrAuditPreWriteFailed, err))
 		}
 		opID = genID
 	}
 	now := g.clock.Now().UTC().Round(0)
 	if !isValidRFC3339Time(now) || !rej.binding.IsValid() || !rej.risk.IsValid() {
-		return errors.Join(rej.err, fmt.Errorf("%w: 拒绝审计时间戳、绑定或风险无效", ErrAuditPreWriteFailed))
+		return errors.Join(rej.err, domi18n.EF(ErrAuditPreWriteFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "denied audit metadata")))
 	}
 	entry, err := ports.NewAuditEntry(ports.AuditEntrySpec{
 		ProcessID:   g.procID,
@@ -251,13 +251,13 @@ func (g *Gate) recordDeniedAudit(ctx context.Context, traceID security.TraceID, 
 		Reason:      sanitizeReason(rej.reason, "authorization denied"),
 	})
 	if err != nil {
-		return errors.Join(rej.err, fmt.Errorf("%w: %w", ErrAuditPreWriteFailed, err))
+		return errors.Join(rej.err, domi18n.WrapSentinel(ErrAuditPreWriteFailed, err))
 	}
 	if writeErr := g.sink.Record(context.WithoutCancel(ctx), entry); writeErr != nil {
 		if errors.Is(writeErr, ports.ErrAuditPostWrite) && g.profile.HaltsOnAuditPostWriteError() {
 			g.triggerHalt(algebraic.Some(opID), "audit_denied_post_write_failed", writeErr)
 		}
-		return errors.Join(rej.err, fmt.Errorf("%w: %w", ErrAuditPreWriteFailed, writeErr))
+		return errors.Join(rej.err, domi18n.WrapSentinel(ErrAuditPreWriteFailed, writeErr))
 	}
 	return rej.err
 }

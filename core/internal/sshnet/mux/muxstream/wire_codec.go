@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -93,7 +93,7 @@ func (r *Reader) Remaining() int { return len(r.buf) }
 // ReadUint32 读取一个大端 32 位无符号整数。
 func (r *Reader) ReadUint32() (uint32, error) {
 	if len(r.buf) < 4 {
-		return 0, fmt.Errorf("%w: PROTOCOL.mux 报文截断（缺少 uint32）", ports.ErrCorruptData)
+		return 0, domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxFrameTruncated)
 	}
 	v := binary.BigEndian.Uint32(r.buf[:4])
 	r.buf = r.buf[4:]
@@ -107,7 +107,7 @@ func (r *Reader) ReadBytes() ([]byte, error) {
 		return nil, err
 	}
 	if uint64(n) > uint64(len(r.buf)) {
-		return nil, fmt.Errorf("%w: PROTOCOL.mux 字节段越界 %d > %d", ports.ErrCorruptData, n, len(r.buf))
+		return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxFrameTruncated)
 	}
 	out := r.buf[:n]
 	r.buf = r.buf[n:]
@@ -142,7 +142,7 @@ func AppendStr(dst []byte, s string) []byte {
 func WritePacket(w io.Writer, msgType uint32, body []byte) error {
 	pktLen := 4 + len(body)
 	if pktLen > MaxPacketBytes {
-		return fmt.Errorf("%w: PROTOCOL.mux 出站报文 %d 超过上限", ports.ErrLimitExceeded, pktLen)
+		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "PROTOCOL.mux outbound packet"), domi18n.Int("size", pktLen), domi18n.Int("limit", MaxPacketBytes))
 	}
 	frame := make([]byte, 4+pktLen)
 	binary.BigEndian.PutUint32(frame[0:4], uint32(pktLen))
@@ -169,7 +169,7 @@ func ReadPacket(r io.Reader) (uint32, []byte, error) {
 	}
 	pktLen := binary.BigEndian.Uint32(hdr[:])
 	if pktLen < 4 || pktLen > MaxPacketBytes {
-		return 0, nil, fmt.Errorf("%w: PROTOCOL.mux 入站报文长度 %d 非法", ports.ErrCorruptData, pktLen)
+		return 0, nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "PROTOCOL.mux packet length"), domi18n.Uint64("value", uint64(pktLen)))
 	}
 	buf := make([]byte, pktLen)
 	if _, err := io.ReadFull(r, buf); err != nil {
@@ -194,7 +194,7 @@ func ReadHello(r io.Reader) (map[string]string, error) {
 		return nil, err
 	}
 	if msgType != MsgHello {
-		return nil, fmt.Errorf("%w: 期望 MUX_MSG_HELLO，收到 %#x", ports.ErrCorruptData, msgType)
+		return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxUnexpectedFrame, domi18n.Str("actual", fmt.Sprintf("%#x", msgType)), domi18n.Str("expected", "MUX_MSG_HELLO"))
 	}
 	rd := NewReader(body)
 	ver, err := rd.ReadUint32()
@@ -202,7 +202,7 @@ func ReadHello(r io.Reader) (map[string]string, error) {
 		return nil, err
 	}
 	if ver != ProtocolVersion {
-		return nil, fmt.Errorf("%w: 不支持的 PROTOCOL.mux 版本 %d（仅支持 v4）", ports.ErrUnsupported, ver)
+		return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyMuxProtoVersion, domi18n.Uint64("version", uint64(ver)))
 	}
 	exts := make(map[string]string)
 	for rd.Remaining() > 0 {
@@ -243,7 +243,7 @@ func SendAliveCheck(rw io.ReadWriter, reqID uint32) (uint32, error) {
 		return 0, err
 	}
 	if gotID != reqID {
-		return 0, fmt.Errorf("%w: MUX_S_ALIVE reqID 不匹配 (%d != %d)", ports.ErrCorruptData, gotID, reqID)
+		return 0, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonMismatch, domi18n.Str("field", "MUX_S_ALIVE reqID"), domi18n.Uint64("expected", uint64(reqID)), domi18n.Uint64("actual", uint64(gotID)))
 	}
 	return pid, nil
 }
@@ -255,14 +255,14 @@ func DecodeServerError(msgType uint32, body []byte) error {
 	reason, _ := rd.ReadString()
 	switch msgType {
 	case SPermissionDenied:
-		return fmt.Errorf("%w: %s", ports.ErrPermissionDenied, reason)
+		return domi18n.WrapSentinel(ports.ErrPermissionDenied, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
 	case SFailure:
 		if reason == "" {
 			return ports.ErrInvalidArgument
 		}
-		return fmt.Errorf("%w: %s", ports.ErrInvalidArgument, reason)
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason)))
 	default:
-		return fmt.Errorf("%w: 非预期 PROTOCOL.mux 响应类型 %#x", ports.ErrCorruptData, msgType)
+		return domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxUnexpectedFrame, domi18n.Str("actual", fmt.Sprintf("%#x", msgType)), domi18n.Str("expected", "PROTOCOL.mux response"))
 	}
 }
 
@@ -375,7 +375,7 @@ func WireToTUNMode(v uint32) (ports.TUNMode, error) {
 	case uint32(ports.TUNModeEthernet):
 		return ports.TUNModeEthernet, nil
 	default:
-		return ports.TUNModeInvalid, fmt.Errorf("%w: 非法 TUNMode 线缆值 %d", ports.ErrInvalidArgument, v)
+		return ports.TUNModeInvalid, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "TUNMode wire value"), domi18n.Uint64("value", uint64(v)))
 	}
 }
 
@@ -388,7 +388,7 @@ func directionToWireFwdType(dir ports.ForwardDirection) (uint32, error) {
 	case ports.ForwardDynamic:
 		return FwdDynamic, nil
 	default:
-		return 0, fmt.Errorf("%w: 不支持的转发方向 %s", ports.ErrInvalidArgument, dir)
+		return 0, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "forward direction "+dir.String()))
 	}
 }
 
@@ -401,7 +401,7 @@ func wireFwdTypeToDirection(t uint32) (ports.ForwardDirection, error) {
 	case FwdDynamic:
 		return ports.ForwardDynamic, nil
 	default:
-		return ports.ForwardDirectionInvalid, fmt.Errorf("%w: 非法 PROTOCOL.mux 转发类型 %d", ports.ErrInvalidArgument, t)
+		return ports.ForwardDirectionInvalid, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "PROTOCOL.mux forward type"), domi18n.Uint64("value", uint64(t)))
 	}
 }
 
@@ -411,11 +411,11 @@ func encodeEndpointHostPort(kind ports.ForwardEndpointKind, addr string) (string
 	}
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return "", 0, fmt.Errorf("%w: 非法 TCP 地址 %q: %w", ports.ErrInvalidArgument, addr, err)
+		return "", 0, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "TCP address"), domi18n.BoundStr("value", addr))
 	}
 	p, err := strconv.ParseUint(portStr, 10, 16)
 	if err != nil {
-		return "", 0, fmt.Errorf("%w: 非法 TCP 端口 %q: %w", ports.ErrInvalidArgument, portStr, err)
+		return "", 0, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "TCP port"), domi18n.BoundStr("value", portStr))
 	}
 	return host, uint32(p), nil
 }
@@ -425,7 +425,7 @@ func decodeEndpointHostPort(host string, port uint32) (ports.ForwardEndpointKind
 		return ports.ForwardEndpointUnix, host, nil
 	}
 	if port > math.MaxUint16 {
-		return ports.ForwardEndpointTCP, "", fmt.Errorf("%w: PROTOCOL.mux TCP 端口越界 %d", ports.ErrInvalidArgument, port)
+		return ports.ForwardEndpointTCP, "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldRange, domi18n.Str("field", "PROTOCOL.mux TCP port"), domi18n.Uint64("value", uint64(port)), domi18n.Int("min", 0), domi18n.Int("max", math.MaxUint16))
 	}
 	return ports.ForwardEndpointTCP, net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10)), nil
 }
@@ -482,7 +482,7 @@ func DecodeOutcomePayload(body []byte) (execution.ExecutionOutcome, error, error
 	}
 	var waitErr error
 	if errStr != "" {
-		waitErr = errors.New(errStr)
+		waitErr = domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", errStr))
 	}
 	return outcome, waitErr, nil
 }
@@ -526,7 +526,7 @@ func decodePTYOpt(rd *Reader) (algebraic.Option[ports.PTYRequest], error) {
 		return algebraic.None[ports.PTYRequest](), err
 	}
 	if cols == 0 || cols > math.MaxUint16 || rows == 0 || rows > math.MaxUint16 {
-		return algebraic.None[ports.PTYRequest](), fmt.Errorf("%w: PTY 尺寸越界 (%dx%d)", ports.ErrInvalidTTYSize, cols, rows)
+		return algebraic.None[ports.PTYRequest](), domi18n.EF(ports.ErrInvalidTTYSize, domi18n.KeyMuxPTYSizeInvalid, domi18n.Uint64("cols", uint64(cols)), domi18n.Uint64("rows", uint64(rows)))
 	}
 	sz, err := ports.NewTerminalSize(uint16(cols), uint16(rows))
 	if err != nil {

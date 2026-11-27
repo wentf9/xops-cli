@@ -2,11 +2,11 @@ package gate
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -91,12 +91,12 @@ func (g *Gate) evaluateFreshRequest(
 	}
 	st, err := initApprovalFSM(opID, req.binding, lexSnap, g.policy.Digest())
 	if err != nil {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrAuthorizationDenied, err), opID, req.binding, lexSnap.Risk(), "approval_init_failed")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, err), opID, req.binding, lexSnap.Risk(), "approval_init_failed")
 	}
 	prevPhase := st.Phase()
 	next, _, evs, err := fsm.TransitionApproval(st, fsm.ApprovalInputEvaluateLexical(req.canonicalize != nil))
 	if err != nil {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrAuthorizationDenied, err), opID, req.binding, lexSnap.Risk(), "approval_lexical_failed")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, err), opID, req.binding, lexSnap.Risk(), "approval_lexical_failed")
 	}
 	g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prevPhase, next, evs)
 	return g.dispatchFreshPhase(ctx, traceID, opID, req, next)
@@ -115,14 +115,14 @@ func (g *Gate) dispatchFreshPhase(
 			opID: opID, binding: st.ActiveBinding(), risk: st.EffectiveRisk(), reason: "policy_allow",
 		}, nil
 	case fsm.ApprovalPhaseDenied:
-		err := fmt.Errorf("%w: %s", ErrAuthorizationDenied, sanitizeReason(st.Reason(), "guardrail denied"))
+		err := domi18n.WrapSentinel(ErrAuthorizationDenied, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", sanitizeReason(st.Reason(), "guardrail denied"))))
 		return approvalOutcome{}, denyRejection(err, opID, st.ActiveBinding(), st.EffectiveRisk(), "policy_denied")
 	case fsm.ApprovalPhaseCanonicalizing:
 		return g.driveFreshCanonicalization(ctx, traceID, opID, req, st)
 	case fsm.ApprovalPhaseChallengePending:
 		return g.handleChallengePending(ctx, traceID, opID, req, st)
 	default:
-		err := fmt.Errorf("%w: 非预期审批状态 %s", ErrAuthorizationDenied, st.Phase())
+		err := domi18n.EF(ErrAuthorizationDenied, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "approval phase"), domi18n.Str("value", st.Phase().String()))
 		return approvalOutcome{}, denyRejection(err, opID, req.binding, req.risk, "invalid_approval_phase")
 	}
 }
@@ -141,25 +141,25 @@ func (g *Gate) driveFreshCanonicalization(
 		if tErr == nil {
 			g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prev, denied, evs)
 		}
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrAuthorizationDenied, err), opID, st.ActiveBinding(), st.EffectiveRisk(), "round2_probe_failed")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, err), opID, st.ActiveBinding(), st.EffectiveRisk(), "round2_probe_failed")
 	}
 	canIn, err := fsm.ApprovalInputCanonicalized(canSnap, canBinding)
 	if err != nil {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrAuthorizationDenied, err), opID, st.ActiveBinding(), st.EffectiveRisk(), "canonical_input_invalid")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, err), opID, st.ActiveBinding(), st.EffectiveRisk(), "canonical_input_invalid")
 	}
 	prev := st.Phase()
 	st, _, evs, err := fsm.TransitionApproval(st, canIn)
 	if err != nil {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrAuthorizationDenied, err), opID, canBinding, canSnap.Risk(), "canonical_transition_failed")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, err), opID, canBinding, canSnap.Risk(), "canonical_transition_failed")
 	}
 	g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prev, st, evs)
 	if st.Phase() == fsm.ApprovalPhaseDenied {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %s", ErrAuthorizationDenied, st.Reason()), opID, st.ActiveBinding(), st.EffectiveRisk(), "canonical_denied")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", sanitizeReason(st.Reason(), "canonical denied")))), opID, st.ActiveBinding(), st.EffectiveRisk(), "canonical_denied")
 	}
 	prev = st.Phase()
 	st, _, evs, err = fsm.TransitionApproval(st, fsm.ApprovalInputEvaluateEscalation())
 	if err != nil {
-		return approvalOutcome{}, denyRejection(fmt.Errorf("%w: %w", ErrAuthorizationDenied, err), opID, st.ActiveBinding(), st.EffectiveRisk(), "escalation_eval_failed")
+		return approvalOutcome{}, denyRejection(domi18n.WrapSentinel(ErrAuthorizationDenied, err), opID, st.ActiveBinding(), st.EffectiveRisk(), "escalation_eval_failed")
 	}
 	g.emitApprovalEvents(ctx, req.opStream, traceID, opID, prev, st, evs)
 	return g.dispatchPostEscalationPhase(ctx, traceID, opID, req, st)
@@ -178,12 +178,12 @@ func (g *Gate) dispatchPostEscalationPhase(
 			opID: opID, binding: st.ActiveBinding(), risk: st.EffectiveRisk(), reason: "canonical_allow",
 		}, nil
 	case fsm.ApprovalPhaseDenied:
-		err := fmt.Errorf("%w: %s", ErrAuthorizationDenied, sanitizeReason(st.Reason(), "canonical guardrail denied"))
+		err := domi18n.WrapSentinel(ErrAuthorizationDenied, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", sanitizeReason(st.Reason(), "canonical guardrail denied"))))
 		return approvalOutcome{}, denyRejection(err, opID, st.ActiveBinding(), st.EffectiveRisk(), "canonical_denied")
 	case fsm.ApprovalPhaseChallengePending:
 		return g.handleChallengePending(ctx, traceID, opID, req, st)
 	default:
-		err := fmt.Errorf("%w: 规范化后出现非法审批状态 %s", ErrAuthorizationDenied, st.Phase())
+		err := domi18n.EF(ErrAuthorizationDenied, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "post-canonicalization approval phase"), domi18n.Str("value", st.Phase().String()))
 		return approvalOutcome{}, denyRejection(err, opID, st.ActiveBinding(), st.EffectiveRisk(), "invalid_approval_phase")
 	}
 }
@@ -197,7 +197,7 @@ func (g *Gate) handleChallengePending(
 ) (approvalOutcome, *policyRejection) {
 	canInteract := g.interaction != nil && g.interaction.CanInteract()
 	if !canInteract && g.policy.NoElicitFallback() == NoElicitFallbackDeny {
-		err := fmt.Errorf("%w: %w", ErrApprovalRequired, ports.ErrInteractionUnavailable)
+		err := domi18n.WrapSentinel(ErrApprovalRequired, ports.ErrInteractionUnavailable)
 		return approvalOutcome{}, needApprovalRejection(err, opID, st.ActiveBinding(), st.EffectiveRisk(), "interaction_unavailable")
 	}
 	env, issuedState, dig, err := g.mintAndIssueChallenge(ctx, traceID, opID, req, st)
@@ -220,11 +220,11 @@ func (g *Gate) mintAndIssueChallenge(
 	zEnv, zSt, zDig := zeroVal[security.ApprovalEnvelope](), zeroVal[fsm.ApprovalState](), zeroVal[security.Digest]()
 	now := g.clock.Now().UTC().Round(0)
 	if !isValidRFC3339Time(now) {
-		return zEnv, zSt, zDig, fmt.Errorf("%w: 时钟返回无效时刻", ErrInvalidConfig)
+		return zEnv, zSt, zDig, domi18n.EF(ErrInvalidConfig, domi18n.KeyGateInvalidClockTime)
 	}
 	nonce, err := security.NewApprovalNonceFrom(g.entropy)
 	if err != nil {
-		return zEnv, zSt, zDig, fmt.Errorf("%w: %w", ErrApprovalRequired, err)
+		return zEnv, zSt, zDig, domi18n.WrapSentinel(ErrApprovalRequired, err)
 	}
 	effRisk := st.EffectiveRisk()
 	needDec, err := security.NewDecisionNeedApproval(effRisk, sanitizeReason(st.Reason(), "approval required"))
@@ -311,7 +311,7 @@ func (g *Gate) runInteractiveApproval(
 	resp, pErr := g.interaction.PromptApproval(ctx, env)
 	g.recordSingleUseEnvelope(dig, env, pErr != nil || !resp.IsValid() || !resp.Approved() || !dig.Equal(resp.EnvelopeDigest()))
 	if pErr != nil {
-		err := fmt.Errorf("%w: %w", ErrApprovalRejected, pErr)
+		err := domi18n.WrapSentinel(ErrApprovalRejected, pErr)
 		return approvalOutcome{}, needApprovalRejection(err, opID, st.ActiveBinding(), st.EffectiveRisk(), "interaction_failed")
 	}
 	if !resp.IsValid() {

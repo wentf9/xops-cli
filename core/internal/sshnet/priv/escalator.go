@@ -2,8 +2,6 @@ package priv
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -11,11 +9,12 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
-var errHandshakeEndedBeforeReady = errors.New("sshnet/priv: 远端在提权就绪帧到达前结束输出")
+var errHandshakeEndedBeforeReady = domi18n.Sentinel(domi18n.KeyPrivHandshakeEnded)
 
 // RunPrivileged 通过借用的 opener 打开远端会话并按 req 执行随机化 -p / 就绪帧提权握手，
 // 实现 ports.PrivilegeEscalationPort；口令仅在调用方同步协程内写入经验证的 (ports.RemoteSession).StdinPipe。
@@ -51,7 +50,7 @@ func (e *Escalator) RunPrivilegedWithCombinedSecret(
 		return nil, err
 	}
 	if primary == nil || secondary == nil || !secondary.IsValid() {
-		return nil, fmt.Errorf("%w: 双因素提权需要两个有效的 SecretBox", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "combined SecretBox"))
 	}
 	return e.executeEscalation(ctx, opener, req, primary, secondary, streams)
 }
@@ -66,7 +65,7 @@ func (e *Escalator) validateCall(
 	streams ports.ExecStreams,
 ) error {
 	if e == nil || !e.valid {
-		return fmt.Errorf("%w: Escalator 未初始化", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "Escalator"))
 	}
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -75,13 +74,13 @@ func (e *Escalator) validateCall(
 		return err
 	}
 	if opener == nil || !req.IsValid() {
-		return fmt.Errorf("%w: SessionOpener 与 PrivilegeRequest 均须有效", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "SessionOpener or PrivilegeRequest"))
 	}
 	if password != nil && !password.IsValid() {
-		return fmt.Errorf("%w: 提权口令 SecretBox 无效或已失效", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "password SecretBox"))
 	}
 	if ptyReq, ok := streams.PTY.Get(); ok && !ptyReq.IsValid() {
-		return fmt.Errorf("%w: PTYRequest 无效", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "PTYRequest"))
 	}
 	return nil
 }
@@ -290,7 +289,7 @@ func (e *Escalator) awaitHandshakeOnCaller(
 				return attempts, err
 			}
 		case <-timerCh:
-			return attempts, fmt.Errorf("%w: 等待远端提权握手超时", context.DeadlineExceeded)
+			return attempts, domi18n.EF(context.DeadlineExceeded, domi18n.KeyPrivHandshakeTimeout)
 		case <-ctx.Done():
 			return attempts, ctx.Err()
 		}
@@ -321,7 +320,7 @@ func handlePromptSignal(
 		return false, err
 	}
 	if err := writeSecret(); err != nil {
-		return false, fmt.Errorf("%w: 写入提权口令失败: %w", ports.ErrAuthFailed, err)
+		return false, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "write privilege password"))
 	}
 	*attempts++
 	return false, nil
@@ -329,10 +328,10 @@ func handlePromptSignal(
 
 func checkCanSendPassword(req ports.PrivilegeRequest, hasSecret bool, attempts int) error {
 	if req.NonInteractive() || !hasSecret {
-		return fmt.Errorf("%w: 远端提权需要口令但未提供或处于非交互模式", ports.ErrAuthFailed)
+		return domi18n.EF(ports.ErrAuthFailed, domi18n.KeyPrivPasswordRequired)
 	}
 	if attempts >= 1 {
-		return fmt.Errorf("%w: 提权口令被远端拒绝（重复质询）", ports.ErrAuthFailed)
+		return domi18n.EF(ports.ErrAuthFailed, domi18n.KeyPrivAuthRejected)
 	}
 	return nil
 }

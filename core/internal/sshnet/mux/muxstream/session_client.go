@@ -12,6 +12,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -229,7 +230,7 @@ func (s *RemoteSession) beginStart(streams ports.ExecStreams, maxBytes uint64, h
 
 func checkStartedReply(respType uint32, respBody []byte) error {
 	if respType != SessMsgStarted {
-		return fmt.Errorf("%w: 会话启动期望 SessMsgStarted，收到 %#x", ports.ErrCorruptData, respType)
+		return domi18n.EF(ports.ErrCorruptData, domi18n.KeyMuxUnexpectedFrame, domi18n.Str("actual", fmt.Sprintf("%#x", respType)), domi18n.Str("expected", "SessMsgStarted"))
 	}
 	rd := NewReader(respBody)
 	okFlag, e1 := rd.ReadUint32()
@@ -238,7 +239,7 @@ func checkStartedReply(respType uint32, respBody []byte) error {
 		return err
 	}
 	if okFlag == 0 {
-		return fmt.Errorf("%w: %s", ports.ErrInvalidArgument, msg)
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", msg)))
 	}
 	return nil
 }

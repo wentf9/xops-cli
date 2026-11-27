@@ -2,12 +2,12 @@ package sftp
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"math"
 	"slices"
 	"sync/atomic"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -54,7 +54,7 @@ func (c *Client) ReadLink(ctx context.Context, p pathalg.RemotePath) (string, er
 	if err != nil {
 		if isStatusCode(err, sshFXFailure) {
 			if st, sErr := c.Lstat(ctx, p); sErr == nil && !st.IsSymlink() {
-				return "", fmt.Errorf("%w: %q 不是符号链接", ports.ErrInvalidArgument, p.String())
+				return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeySFTPNotSymlink, domi18n.BoundStr("path", p.String()))
 			}
 		}
 		return "", err
@@ -83,7 +83,7 @@ func (c *Client) ReadDir(ctx context.Context, dir pathalg.RemotePath) ([]ports.R
 			break
 		}
 		if len(batch) == 0 {
-			return nil, fmt.Errorf("%w: SSH_FXP_READDIR 返回空目录批次", ports.ErrCorruptData)
+			return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "SSH_FXP_READDIR batch"))
 		}
 		out, err = appendValidatedDirEntries(out, batch)
 		if err != nil {
@@ -103,13 +103,13 @@ func (c *Client) openDirHandle(ctx context.Context, dir pathalg.RemotePath) ([]b
 		stErr := decodeStatus(respBody)
 		if isStatusCode(stErr, sshFXFailure) {
 			if st, sErr := c.Stat(ctx, dir); sErr == nil && !st.IsDir() {
-				return nil, fmt.Errorf("%w: %q 不是目录", ports.ErrInvalidArgument, dir.String())
+				return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonPathForbidden, domi18n.BoundStr("path", dir.String()), domi18n.Str("reason", "not a directory"))
 			}
 		}
 		return nil, stErr
 	}
 	if respType != sshFXPHandle {
-		return nil, fmt.Errorf("%w: SSH_FXP_OPENDIR 期望 HANDLE，收到 %d", ports.ErrCorruptData, respType)
+		return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(respType)), domi18n.Str("expected", "SSH_FXP_HANDLE"))
 	}
 	r := wireReader{buf: respBody}
 	return r.readBytes()
@@ -128,7 +128,7 @@ func (c *Client) readDirBatch(ctx context.Context, handle []byte) ([]wireNameEnt
 		return nil, false, stErr
 	}
 	if respType != sshFXPName {
-		return nil, false, fmt.Errorf("%w: SSH_FXP_READDIR 期望 NAME/STATUS，收到 %d", ports.ErrCorruptData, respType)
+		return nil, false, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(respType)), domi18n.Str("expected", "SSH_FXP_NAME/STATUS"))
 	}
 	entries, err := decodeNameList(respBody)
 	return entries, false, err
@@ -140,11 +140,11 @@ func appendValidatedDirEntries(dst []ports.RemoteDirEntry, batch []wireNameEntry
 			continue
 		}
 		if len(dst) >= maxReadDirEntries {
-			return nil, fmt.Errorf("%w: 远端目录条目数超过上限 %d", ports.ErrLimitExceeded, maxReadDirEntries)
+			return nil, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "remote directory entries"), domi18n.Int("count", len(dst)+1), domi18n.Int("limit", maxReadDirEntries))
 		}
 		rn, err := pathalg.ParseRemoteName(item.filename)
 		if err != nil {
-			return nil, fmt.Errorf("%w: 远端目录项名 %q 非法: %w", ports.ErrInvalidArgument, item.filename, err)
+			return nil, domi18n.WrapS(ports.ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "remote directory entry name"), domi18n.BoundStr("value", item.filename))
 		}
 		ent, err := wireEntryToRemoteDirEntry(rn, item.attrs)
 		if err != nil {
@@ -157,7 +157,7 @@ func appendValidatedDirEntries(dst []ports.RemoteDirEntry, batch []wireNameEntry
 
 func wireEntryToRemoteDirEntry(rn pathalg.RemoteName, a wireAttrs) (ports.RemoteDirEntry, error) {
 	if a.size > math.MaxInt64 {
-		return zeroVal[ports.RemoteDirEntry](), fmt.Errorf("%w: 远端目录项大小溢出 int64", ports.ErrLimitExceeded)
+		return zeroVal[ports.RemoteDirEntry](), domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote directory entry"), domi18n.Uint64("size", a.size), domi18n.Int64("limit", math.MaxInt64))
 	}
 	ft, fm := posixModeToRemote(a)
 	return ports.NewRemoteDirEntry(ports.RemoteDirEntrySpec{
@@ -185,7 +185,7 @@ func (c *Client) WithReadFile(ctx context.Context, p pathalg.RemotePath, limits 
 		return ports.ErrInvalidReadLimits
 	}
 	if !p.IsValid() {
-		return fmt.Errorf("%w: 无效远端路径", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote path"))
 	}
 	handle, st, err := c.openRegularForRead(ctx, p)
 	if err != nil {
@@ -194,7 +194,7 @@ func (c *Client) WithReadFile(ctx context.Context, p pathalg.RemotePath, limits 
 	defer c.closeHandle(ctx, handle)
 
 	if st.Size() > limits.MaxBytes() {
-		return fmt.Errorf("%w: 远端文件大小 %d 超出上限 %d", ports.ErrLimitExceeded, st.Size(), limits.MaxBytes())
+		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote file"), domi18n.Int64("size", st.Size()), domi18n.Int64("limit", limits.MaxBytes()))
 	}
 	sr := &sftpScopedReader{
 		client:   c,
@@ -213,7 +213,7 @@ func (c *Client) ReadChunk(ctx context.Context, p pathalg.RemotePath, offset int
 		return 0, err
 	}
 	if offset < 0 || length < 0 || dst == nil {
-		return 0, fmt.Errorf("%w: ReadChunk 参数非法", ports.ErrInvalidArgument)
+		return 0, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "ReadChunk arguments"))
 	}
 	handle, _, err := c.openRegularForRead(ctx, p)
 	if err != nil {
@@ -235,7 +235,7 @@ func (c *Client) streamReadChunk(ctx context.Context, handle []byte, off uint64,
 			return total, err
 		}
 		if int64(len(chunk)) > want {
-			return total, fmt.Errorf("%w: SSH_FXP_DATA 长度 %d 超过请求上限 %d", ports.ErrCorruptData, len(chunk), want)
+			return total, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "SSH_FXP_DATA"), domi18n.Int("size", len(chunk)), domi18n.Int64("limit", want))
 		}
 		written, wErr := writeChunkExact(dst, chunk)
 		total += written
@@ -341,7 +341,7 @@ func (sr *sftpScopedReader) Read(p []byte) (int, error) {
 	}
 	sr.offset += uint64(len(chunk))
 	if sr.readSoFar+int64(len(chunk)) > sr.maxBytes {
-		return 0, fmt.Errorf("%w: 远端流读取期间超出 ReadLimits 上限 %d", ports.ErrLimitExceeded, sr.maxBytes)
+		return 0, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote stream"), domi18n.Int64("size", sr.readSoFar+int64(len(chunk))), domi18n.Int64("limit", sr.maxBytes))
 	}
 	sr.readSoFar += int64(len(chunk))
 	n := copy(p, chunk)
@@ -356,7 +356,7 @@ func (c *Client) checkPathOp(ctx context.Context, p pathalg.RemotePath) error {
 		return err
 	}
 	if !p.IsValid() {
-		return fmt.Errorf("%w: 无效远端路径", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "remote path"))
 	}
 	return nil
 }
@@ -370,14 +370,14 @@ func (c *Client) singleNameOp(ctx context.Context, pktType byte, rawPath string)
 		return wireNameEntry{}, decodeStatus(respBody)
 	}
 	if respType != sshFXPName {
-		return wireNameEntry{}, fmt.Errorf("%w: SFTP 期望 NAME，收到类型 %d", ports.ErrCorruptData, respType)
+		return wireNameEntry{}, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(respType)), domi18n.Str("expected", "SSH_FXP_NAME"))
 	}
 	entries, err := decodeNameList(respBody)
 	if err != nil {
 		return wireNameEntry{}, err
 	}
 	if len(entries) == 0 {
-		return wireNameEntry{}, fmt.Errorf("%w: SFTP NAME 响应为空", ports.ErrCorruptData)
+		return wireNameEntry{}, domi18n.EF(ports.ErrCorruptData, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "SFTP NAME response"))
 	}
 	return entries[0], nil
 }
@@ -391,7 +391,7 @@ func (c *Client) attrsOp(ctx context.Context, pktType byte, body []byte) (wireAt
 		return wireAttrs{}, decodeStatus(respBody)
 	}
 	if respType != sshFXPAttrs {
-		return wireAttrs{}, fmt.Errorf("%w: SFTP 期望 ATTRS，收到类型 %d", ports.ErrCorruptData, respType)
+		return wireAttrs{}, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(respType)), domi18n.Str("expected", "SSH_FXP_ATTRS"))
 	}
 	r := wireReader{buf: respBody}
 	return decodeAttrs(&r)
@@ -409,7 +409,7 @@ func (c *Client) openHandle(ctx context.Context, rawPath string, pflags uint32, 
 		return nil, decodeStatus(respBody)
 	}
 	if respType != sshFXPHandle {
-		return nil, fmt.Errorf("%w: SSH_FXP_OPEN 期望 HANDLE，收到类型 %d", ports.ErrCorruptData, respType)
+		return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(respType)), domi18n.Str("expected", "SSH_FXP_HANDLE"))
 	}
 	r := wireReader{buf: respBody}
 	return r.readBytes()
@@ -435,7 +435,7 @@ func (c *Client) readHandleAt(ctx context.Context, handle []byte, offset uint64,
 		return nil, false, stErr
 	}
 	if respType != sshFXPData {
-		return nil, false, fmt.Errorf("%w: SSH_FXP_READ 期望 DATA/STATUS，收到类型 %d", ports.ErrCorruptData, respType)
+		return nil, false, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPUnexpectedPacket, domi18n.Uint64("actual", uint64(respType)), domi18n.Str("expected", "SSH_FXP_DATA/STATUS"))
 	}
 	r := wireReader{buf: respBody}
 	data, err := r.readBytes()

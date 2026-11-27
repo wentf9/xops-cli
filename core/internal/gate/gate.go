@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
@@ -116,26 +117,26 @@ type Gate struct {
 // 与未初始化或已关闭 SystemBus），构造并初始化不可绕过的 Gate 实例。
 func NewGate(cfg GateConfig) (*Gate, error) {
 	if !cfg.Profile.IsValid() {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, ErrInvalidProfile)
+		return nil, domi18n.WrapSentinel(ErrInvalidConfig, ErrInvalidProfile)
 	}
 	if !cfg.Policy.IsValid() {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, ErrInvalidPolicy)
+		return nil, domi18n.WrapSentinel(ErrInvalidConfig, ErrInvalidPolicy)
 	}
 	if cfg.AuditSink == nil {
-		return nil, fmt.Errorf("%w: AuditSink 不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "AuditSink"))
 	}
 	procID := cfg.AuditSink.ProcessInstanceID()
 	if !procID.IsValid() {
-		return nil, fmt.Errorf("%w: AuditSink.ProcessInstanceID 无效", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "AuditSink.ProcessInstanceID"))
 	}
 	if cfg.Clock == nil {
-		return nil, fmt.Errorf("%w: Clock 不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Clock"))
 	}
 	if cfg.Entropy == nil {
-		return nil, fmt.Errorf("%w: Entropy 不能为 nil", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldNil, domi18n.Str("field", "Entropy"))
 	}
 	if cfg.SystemBus != nil && cfg.SystemBus.IsClosed() {
-		return nil, fmt.Errorf("%w: SystemBus 未初始化或已关闭", ErrInvalidConfig)
+		return nil, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "SystemBus"))
 	}
 	return &Gate{
 		profile:       cfg.Profile,
@@ -290,7 +291,7 @@ func (g *Gate) ReconcileCrashedAudits(ctx context.Context) (ports.CrashReconcile
 	}
 	now := g.clock.Now().UTC().Round(0)
 	if !isValidRFC3339Time(now) {
-		return zRep, fmt.Errorf("%w: 时钟返回无效对账时刻", ErrInvalidConfig)
+		return zRep, domi18n.EF(ErrInvalidConfig, domi18n.KeyGateInvalidClockTime)
 	}
 	report, err := g.reconciler.ReconcileCrashedAudits(ctx, now)
 	if err != nil {
@@ -298,7 +299,7 @@ func (g *Gate) ReconcileCrashedAudits(ctx context.Context) (ports.CrashReconcile
 		return zRep, err
 	}
 	if !report.IsValid() {
-		return zRep, fmt.Errorf("%w: AuditReconciler 返回无效 CrashReconcileReport", ErrInvalidConfig)
+		return zRep, domi18n.EF(ErrInvalidConfig, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "CrashReconcileReport"))
 	}
 	g.emitReconcileDiagnostic(report)
 	return report, nil
@@ -315,9 +316,9 @@ func (g *Gate) haltedErrLocked() error {
 		return nil
 	}
 	if g.haltInfo.cause != nil {
-		return fmt.Errorf("%w (%s): %w", ErrGateHalted, g.haltInfo.reason, g.haltInfo.cause)
+		return domi18n.WrapSentinel(ErrGateHalted, domi18n.Wrap(g.haltInfo.cause, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", g.haltInfo.reason)))
 	}
-	return fmt.Errorf("%w: %s", ErrGateHalted, g.haltInfo.reason)
+	return domi18n.WrapSentinel(ErrGateHalted, domi18n.E(domi18n.KeyCommonDetail, domi18n.BoundStr("detail", g.haltInfo.reason)))
 }
 
 func (g *Gate) emitReconcileDiagnostic(report ports.CrashReconcileReport) {

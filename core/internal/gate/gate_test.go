@@ -12,6 +12,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/internal/foundation/trace"
@@ -514,4 +515,12 @@ func invokeAndRecoverPanic(fn func()) (recovered any) {
 	}()
 	fn()
 	return nil
+}
+
+func TestOperationPanicErrorLocalizableNode(t *testing.T) {
+	pe := newOperationPanicError("boom\x00detail", []byte("stack"))
+	requireErrIs(t, pe, ErrOperationPanicked, "OperationPanicError Unwrap")
+	view, ok := domi18n.InspectNode(pe)
+	requireTrue(t, ok && view.Message.ID() == domi18n.KeyGateOpPanickedDetail && errors.Is(view.Sentinel, ErrOperationPanicked), "OperationPanicError LocalizableView 异常")
+	requireTrue(t, pe.Error() == domi18n.CanonicalError(pe) && pe.Error() != "", "OperationPanicError CanonicalError 异常")
 }

@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
-	"fmt"
 	"io"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
@@ -22,7 +22,7 @@ func (k *KeySigner) ListPublicKeys(ctx context.Context, auth inventory.AuthMetho
 		return nil, err
 	}
 	if auth == nil || !auth.IsValid() {
-		return nil, fmt.Errorf("%w: 无效 AuthMethod", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "AuthMethod"))
 	}
 	return k.listForAuth(ctx, auth)
 }
@@ -38,13 +38,13 @@ func (k *KeySigner) listForAuth(ctx context.Context, auth inventory.AuthMethod) 
 	case *inventory.AuthPassword, *inventory.AuthKeyboardInteractive:
 		return nil, nil
 	default:
-		return nil, fmt.Errorf("%w: 不支持的认证方式变体 %T", ports.ErrInvalidArgument, auth)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "auth method variant"))
 	}
 }
 
 func (k *KeySigner) listPrivateKeys(ctx context.Context, v *inventory.AuthPrivateKey) ([]ports.PublicKeyInfo, error) {
 	if k.readFS == nil {
-		return nil, fmt.Errorf("%w: 列举本地私钥需要注入 OperatorReadFS", ports.ErrSignerUnavailable)
+		return nil, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "OperatorReadFS"))
 	}
 	tc := k.baseTokenContext()
 	certs, err := LoadCertificates(ctx, k.readFS, k.env, tc, v.CertPaths())
@@ -64,7 +64,7 @@ func (k *KeySigner) listPrivateKeys(ctx context.Context, v *inventory.AuthPrivat
 		rawSigners = append(rawSigners, signer)
 	}
 	if len(rawSigners) == 0 {
-		return nil, fmt.Errorf("%w: 未找到任何可用本地私钥", ports.ErrSignerUnavailable)
+		return nil, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyKeySignerNoKeysFound)
 	}
 	if err := VerifyPassphraseBindingLoaded(rawSigners, v.Passphrase()); err != nil {
 		return nil, err
@@ -84,14 +84,14 @@ func (k *KeySigner) listPrivateKeys(ctx context.Context, v *inventory.AuthPrivat
 
 func (k *KeySigner) listAgentKeys(ctx context.Context, spec algebraic.Option[inventory.AgentSpec]) ([]ports.PublicKeyInfo, error) {
 	if k.agent == nil {
-		return nil, fmt.Errorf("%w: 未注入 SSHAgentPort", ports.ErrSignerUnavailable)
+		return nil, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SSHAgentPort"))
 	}
 	keys, err := k.agent.ListAgentKeys(ctx, spec)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, err
 		}
-		return nil, fmt.Errorf("%w: %w", ports.ErrSignerUnavailable, err)
+		return nil, domi18n.WrapSentinel(ports.ErrSignerUnavailable, err)
 	}
 	k.mu.Lock()
 	for _, pk := range keys {
@@ -130,7 +130,7 @@ func (k *KeySigner) Sign(ctx context.Context, key inventory.KeyFingerprint, algo
 		return zero, err
 	}
 	if !key.IsValid() || len(data) == 0 {
-		return zero, fmt.Errorf("%w: 签名指纹或待签数据无效", ports.ErrInvalidArgument)
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "key fingerprint or signing data"))
 	}
 	fpKey := key.String()
 	k.mu.RLock()
@@ -143,7 +143,7 @@ func (k *KeySigner) Sign(ctx context.Context, key inventory.KeyFingerprint, algo
 	if hasAgent && k.agent != nil {
 		return k.agent.SignWithAgent(ctx, agEntry.spec, key, algorithm, data)
 	}
-	return zero, fmt.Errorf("%w: 未找到指纹 %s 对应的签名器", ports.ErrSignerUnavailable, fpKey)
+	return zero, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyKeySignerNotFound, domi18n.BoundStr("fingerprint", fpKey))
 }
 
 func (k *KeySigner) signWithLocal(signer ssh.Signer, algorithm string, data []byte) (ports.Signature, error) {
@@ -164,7 +164,7 @@ func (k *KeySigner) signWithLocal(signer ssh.Signer, algorithm string, data []by
 		sig, err = signer.Sign(rnd, data)
 	}
 	if err != nil {
-		return zero, fmt.Errorf("%w: SSH 私钥签名失败: %w", ports.ErrSignerUnavailable, err)
+		return zero, domi18n.WrapS(ports.ErrSignerUnavailable, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "SSH private key sign"))
 	}
 	return ports.NewSignature(sig.Format, sig.Blob)
 }
@@ -205,14 +205,14 @@ func (k *KeySigner) InspectPrivateKeyFingerprint(
 		return zero, err
 	}
 	if !keyPath.IsValid() {
-		return zero, fmt.Errorf("%w: KeyPathSpec 无效", ports.ErrInvalidArgument)
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "KeyPathSpec"))
 	}
 	passRef, hasPass := passphrase.Get()
 	if hasPass && !passRef.IsValid() {
-		return zero, fmt.Errorf("%w: 口令凭据引用无效", ports.ErrInvalidArgument)
+		return zero, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "passphrase secret reference"))
 	}
 	if k.readFS == nil {
-		return zero, fmt.Errorf("%w: 核验私钥指纹需要注入 OperatorReadFS", ports.ErrSignerUnavailable)
+		return zero, domi18n.EF(ports.ErrSignerUnavailable, domi18n.KeyCommonMissingDep, domi18n.Str("component", "OperatorReadFS"))
 	}
 	srcPath, err := ResolveLocalFilePath(k.env, k.baseTokenContext(), keyPath.String())
 	if err != nil {
@@ -220,7 +220,7 @@ func (k *KeySigner) InspectPrivateKeyFingerprint(
 	}
 	raw, err := ReadBoundedFile(ctx, k.readFS, srcPath, MaxPrivateKeyFileBytes)
 	if err != nil {
-		return zero, fmt.Errorf("%w: 读取私钥 %q 失败: %w", ports.ErrAuthFailed, keyPath.String(), err)
+		return zero, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "read private key"), domi18n.BoundStr("target", keyPath.String()))
 	}
 	var fp inventory.KeyFingerprint
 	err = secret.WithBytes(raw, func(keyBox *secret.SecretBox) error {
@@ -237,7 +237,7 @@ func (k *KeySigner) InspectPrivateKeyFingerprint(
 		return zero, err
 	}
 	if !fp.IsValid() {
-		return zero, fmt.Errorf("%w: 解析出的私钥指纹无效", ports.ErrAuthFailed)
+		return zero, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", "private key fingerprint"))
 	}
 	return fp, nil
 }
@@ -248,20 +248,20 @@ func (k *KeySigner) InspectPrivateKeyFingerprint(
 func (k *KeySigner) parseInspectKeyBytes(ctx context.Context, keyBytes []byte, passRef secret.Ref, hasPass bool) (ssh.Signer, error) {
 	if hasPass {
 		if k.vault == nil {
-			return nil, fmt.Errorf("%w: 解密私钥口令需要注入 SecretVault", ports.ErrAuthFailed)
+			return nil, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SecretVault"))
 		}
 		return decryptKeyWithVaultRef(ctx, k.vault, keyBytes, passRef)
 	}
 	signer, err := ssh.ParsePrivateKey(keyBytes)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 解析私钥失败: %w", ports.ErrAuthFailed, err)
+		return nil, domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "parse private key"))
 	}
 	return signer, nil
 }
 
 func (k *KeySigner) checkBase(ctx context.Context) error {
 	if k == nil || !k.valid {
-		return fmt.Errorf("%w: KeySigner 未初始化", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "KeySigner"))
 	}
 	if ctx == nil {
 		return ports.ErrNilContext

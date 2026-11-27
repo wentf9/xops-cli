@@ -19,12 +19,12 @@
 package gate
 
 import (
-	"errors"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -40,35 +40,35 @@ const (
 
 // 本包导出的不可变哨兵错误，供用例服务、MCP 运行时、仿真器与测试通过 errors.Is 精确匹配。
 var (
-	ErrNilContext            = errors.New("gate: context 不能为 nil")
-	ErrNilAuthorizer         = errors.New("gate: Authorizer 不能为 nil")
-	ErrNilCallback           = errors.New("gate: WithAuthorized 回调函数不能为 nil")
-	ErrInvalidConfig         = errors.New("gate: 无效的 GateConfig 配置")
-	ErrInvalidPolicy         = errors.New("gate: 无效的 GuardrailPolicy 护栏策略")
-	ErrInvalidProfile        = errors.New("gate: 无效的 PolicyProfileKind 策略配置档")
-	ErrInvalidFallback       = errors.New("gate: 无效的 NoElicitFallback 不可交互回退策略")
-	ErrInvalidRequest        = errors.New("gate: 无效的 GateRequest 授权请求")
-	ErrInvalidOutcome        = errors.New("gate: 无效的 ExecutionOutcome 执行结果")
-	ErrCapabilityMismatch    = errors.New("gate: 幻影能力类型 C 与 OperationBinding.Capability 不匹配或无效")
-	ErrGateNotInitialized    = errors.New("gate: Gate 未经有效初始化")
-	ErrGateHalted            = errors.New("gate: Gate 已进入不可逆 Halted 熔断态")
-	ErrInvalidPermit         = errors.New("gate: Authorized 能力证明无效或未初始化")
-	ErrPermitRevoked         = errors.New("gate: Authorized 能力证明已吊销或超出借用作用域")
-	ErrAuthorizationDenied   = errors.New("gate: 安全护栏策略拒绝该操作")
-	ErrApprovalRequired      = errors.New("gate: 操作需要用户显式审批挑战")
-	ErrApprovalRejected      = errors.New("gate: 用户拒绝了审批挑战")
-	ErrApprovalExpired       = errors.New("gate: 审批挑战信封已过期或尚未生效")
-	ErrApprovalReplayed      = errors.New("gate: 审批挑战信封或 Nonce 已被消费，禁止重放")
-	ErrApprovalMismatch      = errors.New("gate: 审批挑战信封与操作标识、能力或绑定作用域不匹配")
-	ErrApprovalInvalidated   = errors.New("gate: 审批挑战令牌已作废")
-	ErrPendingLimitExceeded  = errors.New("gate: 活跃待审批挑战数量已达上限")
-	ErrScopeEscalated        = errors.New("gate: 规范化阶段检测到安全作用域升级或受保护路径重定向")
-	ErrAuditStageFailed      = errors.New("gate: 只追加审计操作登记 StageOperation 失败")
-	ErrAuditPreWriteFailed   = errors.New("gate: 前置审计记录落盘失败，拒绝执行副作用")
-	ErrAuditUnstageFailed    = errors.New("gate: 终态闭合后注销登记 UnstageOperation 失败")
-	ErrReconcilerUnavailable = errors.New("gate: 未配置 AuditReconciler 启动期崩溃对账端口")
-	ErrOperationPanicked     = errors.New("gate: 授权回调执行期间发生 panic")
-	ErrOperationAborted      = errors.New("gate: 授权回调异常中止（如 runtime.Goexit）")
+	ErrNilContext            = domi18n.Sentinel(domi18n.KeyGateNilContext)
+	ErrNilAuthorizer         = domi18n.Sentinel(domi18n.KeyGateNilAuthorizer)
+	ErrNilCallback           = domi18n.Sentinel(domi18n.KeyGateNilCallback)
+	ErrInvalidConfig         = domi18n.Sentinel(domi18n.KeyGateInvalidConfig)
+	ErrInvalidPolicy         = domi18n.Sentinel(domi18n.KeyGateInvalidPolicy)
+	ErrInvalidProfile        = domi18n.Sentinel(domi18n.KeyGateInvalidProfile)
+	ErrInvalidFallback       = domi18n.Sentinel(domi18n.KeyGateInvalidFallback)
+	ErrInvalidRequest        = domi18n.Sentinel(domi18n.KeyGateInvalidRequest)
+	ErrInvalidOutcome        = domi18n.Sentinel(domi18n.KeyGateInvalidOutcome)
+	ErrCapabilityMismatch    = domi18n.Sentinel(domi18n.KeyGateCapabilityMismatch)
+	ErrGateNotInitialized    = domi18n.Sentinel(domi18n.KeyGateNotInitialized)
+	ErrGateHalted            = domi18n.Sentinel(domi18n.KeyGateHalted)
+	ErrInvalidPermit         = domi18n.Sentinel(domi18n.KeyGateInvalidPermit)
+	ErrPermitRevoked         = domi18n.Sentinel(domi18n.KeyGatePermitRevoked)
+	ErrAuthorizationDenied   = domi18n.Sentinel(domi18n.KeyGateAuthorizationDenied)
+	ErrApprovalRequired      = domi18n.Sentinel(domi18n.KeyGateApprovalRequired)
+	ErrApprovalRejected      = domi18n.Sentinel(domi18n.KeyGateApprovalRejected)
+	ErrApprovalExpired       = domi18n.Sentinel(domi18n.KeyGateApprovalExpired)
+	ErrApprovalReplayed      = domi18n.Sentinel(domi18n.KeyGateApprovalReplayed)
+	ErrApprovalMismatch      = domi18n.Sentinel(domi18n.KeyGateApprovalMismatch)
+	ErrApprovalInvalidated   = domi18n.Sentinel(domi18n.KeyGateApprovalInvalidated)
+	ErrPendingLimitExceeded  = domi18n.Sentinel(domi18n.KeyGatePendingLimitExceeded)
+	ErrScopeEscalated        = domi18n.Sentinel(domi18n.KeyGateScopeEscalated)
+	ErrAuditStageFailed      = domi18n.Sentinel(domi18n.KeyGateAuditStageFailed)
+	ErrAuditPreWriteFailed   = domi18n.Sentinel(domi18n.KeyGateAuditPreWriteFailed)
+	ErrAuditUnstageFailed    = domi18n.Sentinel(domi18n.KeyGateAuditUnstageFailed)
+	ErrReconcilerUnavailable = domi18n.Sentinel(domi18n.KeyGateReconcilerUnavail)
+	ErrOperationPanicked     = domi18n.Sentinel(domi18n.KeyGateOperationPanicked)
+	ErrOperationAborted      = domi18n.Sentinel(domi18n.KeyGateOperationAborted)
 )
 
 func zeroVal[T any]() (z T) { return z }

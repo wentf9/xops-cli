@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial/chanconn"
@@ -69,7 +70,7 @@ func openUpstreamSubsystem(ctx context.Context, upstream ports.TransportConn, su
 	if so, ok := upstream.(subsystemOpener); ok {
 		return so.OpenSubsystem(ctx, subsystem)
 	}
-	return nil, fmt.Errorf("%w: upstream does not support raw %s subsystem", ports.ErrUnsupported, subsystem)
+	return nil, domi18n.EF(ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.BoundStr("feature", "raw "+subsystem+" subsystem"))
 }
 
 func (st *muxServerState) handleOpenSFTP(ctx context.Context, conn net.Conn, body []byte) {

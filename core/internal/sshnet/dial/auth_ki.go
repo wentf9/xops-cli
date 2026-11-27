@@ -2,7 +2,6 @@ package dial
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"unicode/utf8"
 
@@ -115,7 +114,7 @@ func checkKIRoundLimit(ctx context.Context, rounds, questionCount int) error {
 		return err
 	}
 	if rounds > maxKIChallengeRounds || questionCount > maxKIQuestionsPerRound {
-		return fmt.Errorf("%w: Keyboard-Interactive 质询轮次或问题数超过安全上限", ports.ErrAuthFailed)
+		return domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonLimitExceeded)
 	}
 	return nil
 }
@@ -147,7 +146,7 @@ func (d *Dialer) planKIQuestion(
 
 func (d *Dialer) planInteractiveKIQuestion(ctx context.Context, hop plan.HopSpec, instruction, prompt string, echo bool) (kiQuestionPlan, error) {
 	if hop.Transport().BatchMode() || d.interaction == nil || !d.interaction.CanInteract() {
-		return kiQuestionPlan{}, fmt.Errorf("%w: 质询 %q 未命中可用自动规则且不可交互", ports.ErrAuthFailed, prompt)
+		return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialChallengeUnmatched, domi18n.BoundStr("prompt", prompt))
 	}
 	if !echo {
 		req, err := newChallengeSecretPrompt(hop.Endpoint().String(), instruction, prompt)
@@ -223,13 +222,13 @@ func (d *Dialer) planMatchedRuleKIQuestion(ctx context.Context, rule inventory.C
 		return kiQuestionPlan{action: kiActionLiteral, answer: code}, nil
 	case *inventory.RuleSecretRef:
 		if d.vault == nil {
-			return kiQuestionPlan{}, fmt.Errorf("%w: 质询凭据消费需要注入 SecretVault", ports.ErrAuthFailed)
+			return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "SecretVault"))
 		}
 		return kiQuestionPlan{action: kiActionVaultSecret, secretRef: r.SecretRef()}, nil
 	case *inventory.RuleLoginPassword:
 		ref, hasRef := loginPassRef.Get()
 		if !hasRef || d.vault == nil {
-			return kiQuestionPlan{}, fmt.Errorf("%w: RuleLoginPassword 缺少关联登录密码凭据引用或 SecretVault", ports.ErrAuthFailed)
+			return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "login password secret or SecretVault"))
 		}
 		return kiQuestionPlan{action: kiActionVaultSecret, secretRef: ref}, nil
 	case *inventory.RuleCommand:
@@ -239,7 +238,7 @@ func (d *Dialer) planMatchedRuleKIQuestion(ctx context.Context, rule inventory.C
 		}
 		return kiQuestionPlan{action: kiActionLiteral, answer: ans}, nil
 	default:
-		return kiQuestionPlan{}, fmt.Errorf("%w: 未知质询规则 %T", ports.ErrAuthFailed, rule)
+		return kiQuestionPlan{}, domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "challenge rule"))
 	}
 }
 
@@ -287,7 +286,7 @@ func (d *Dialer) promptInteractiveText(ctx context.Context, subject, instruction
 
 func (d *Dialer) runChallengeCommand(ctx context.Context, rule *inventory.RuleCommand) (string, error) {
 	if d.process == nil {
-		return "", fmt.Errorf("%w: RuleCommand 需要注入 ProcessPort", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ProcessPort"))
 	}
 	spec, err := ports.NewProcessSpec(ports.ProcessSpecInput{
 		Command: rule.Command(),
@@ -299,13 +298,13 @@ func (d *Dialer) runChallengeCommand(ctx context.Context, rule *inventory.RuleCo
 	}
 	res, err := d.process.Run(ctx, spec, nil)
 	if err != nil {
-		return "", fmt.Errorf("%w: 执行质询命令失败: %w", ports.ErrAuthFailed, err)
+		return "", domi18n.WrapS(ports.ErrAuthFailed, err, domi18n.KeyDialChallengeCmdFailed)
 	}
 	if !res.Succeeded() {
-		return "", fmt.Errorf("%w: 质询命令返回非零退出状态", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialChallengeCmdFailed)
 	}
 	if res.Truncated() {
-		return "", fmt.Errorf("%w: 质询命令输出被截断", ports.ErrAuthFailed)
+		return "", domi18n.EF(ports.ErrAuthFailed, domi18n.KeyDialChallengeCmdFailed)
 	}
 	return strings.TrimRight(string(res.Stdout()), "\r\n"), nil
 }

@@ -16,9 +16,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"io"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/internal/sshnet/dial"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -90,7 +90,7 @@ func OpenStream(ctx context.Context, rw io.ReadWriteCloser, cfg Config) (*Client
 		return nil, err
 	}
 	if rw == nil {
-		return nil, fmt.Errorf("%w: SFTP 底层字节流不能为 nil", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "SFTP stream"))
 	}
 	return newClient(ctx, rw, cfg)
 }
@@ -102,7 +102,7 @@ func randomTempSuffix(entropy ports.Entropy) (string, error) {
 	}
 	var raw [8]byte
 	if _, err := io.ReadFull(src, raw[:]); err != nil {
-		return "", fmt.Errorf("%w: 生成远端临时文件随机后缀失败: %w", ports.ErrEntropyShortRead, err)
+		return "", domi18n.WrapS(ports.ErrEntropyShortRead, err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "generate remote temp suffix"))
 	}
 	return ".xops-tmp-" + hex.EncodeToString(raw[:]), nil
 }

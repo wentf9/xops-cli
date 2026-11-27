@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 )
 
@@ -356,7 +356,7 @@ func (sc *streamScanner) handleMatchedPrompt(pStart, pEnd int) error {
 	case sc.state.promptCh <- struct{}{}:
 		return nil
 	default:
-		return fmt.Errorf("%w: 远端发送过多提权口令质询", ports.ErrAuthFailed)
+		return domi18n.EF(ports.ErrAuthFailed, domi18n.KeyPrivAuthRejected)
 	}
 }
 

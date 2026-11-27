@@ -9,12 +9,12 @@
 package keysigner
 
 import (
-	"fmt"
 	"sync"
 
 	"golang.org/x/crypto/ssh"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -64,7 +64,7 @@ type KeySigner struct {
 // NewKeySigner 校验至少注入 ReadFS 或 Agent 端口后构造不可变 KeySigner。
 func NewKeySigner(cfg Config) (*KeySigner, error) {
 	if cfg.ReadFS == nil && cfg.Agent == nil {
-		return nil, fmt.Errorf("%w: KeySigner 需要至少注入 ReadFS 或 Agent 端口", ports.ErrInvalidArgument)
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonMissingDep, domi18n.Str("component", "ReadFS or Agent"))
 	}
 	return &KeySigner{
 		readFS:    cfg.ReadFS,

@@ -3,12 +3,12 @@ package sftp
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io/fs"
 	"math"
 	"strconv"
 	"time"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -85,20 +85,36 @@ const (
 	posixISVTX  uint32 = 0o001000
 )
 
-// sftpStatusError 封装服务端返回的 SSH_FXP_STATUS 原始错误码与说明文本，并映射至规范 ports 哨兵。
+// sftpStatusError 封装服务端返回的 SSH_FXP_STATUS 原始错误码与说明文本，并映射至规范 ports 哨兵；
+// 实现 domi18n.LocalizableNode 并将 Error() 委托给 domi18n.CanonicalError，确保边界延迟本地化一致。
 type sftpStatusError struct {
 	code uint32
 	msg  string
 }
 
-func (e *sftpStatusError) Error() string {
-	if e.msg == "" {
-		return fmt.Sprintf("sftp: status=%d", e.code)
+// LocalizableView 返回 *sftpStatusError 的只读结构化错误视图（以 BoundStr 净化服务端原始说明文本）。
+func (e *sftpStatusError) LocalizableView() domi18n.ErrorNode {
+	if e == nil {
+		return domi18n.ErrorNode{}
 	}
-	return fmt.Sprintf("sftp: status=%d (%s)", e.code, e.msg)
+	if e.msg == "" {
+		return domi18n.ErrorNode{
+			Sentinel: e.Unwrap(),
+			Message:  domi18n.NewMessage(domi18n.KeySFTPStatusCode, domi18n.Uint64("code", uint64(e.code))),
+		}
+	}
+	return domi18n.ErrorNode{
+		Sentinel: e.Unwrap(),
+		Message:  domi18n.NewMessage(domi18n.KeySFTPStatusCodeDetail, domi18n.Uint64("code", uint64(e.code)), domi18n.BoundStr("detail", e.msg)),
+	}
 }
 
+func (e *sftpStatusError) Error() string { return domi18n.CanonicalError(e) }
+
 func (e *sftpStatusError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
 	switch e.code {
 	case sshFXNoSuchFile:
 		return ports.ErrNotFound
@@ -151,7 +167,7 @@ func (r *wireReader) remaining() int { return len(r.buf) }
 
 func (r *wireReader) readUint32() (uint32, error) {
 	if len(r.buf) < 4 {
-		return 0, fmt.Errorf("%w: SFTP 报文截断（缺少 uint32）", ports.ErrCorruptData)
+		return 0, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPPacketTruncated)
 	}
 	v := binary.BigEndian.Uint32(r.buf[:4])
 	r.buf = r.buf[4:]
@@ -160,7 +176,7 @@ func (r *wireReader) readUint32() (uint32, error) {
 
 func (r *wireReader) readUint64() (uint64, error) {
 	if len(r.buf) < 8 {
-		return 0, fmt.Errorf("%w: SFTP 报文截断（缺少 uint64）", ports.ErrCorruptData)
+		return 0, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPPacketTruncated)
 	}
 	v := binary.BigEndian.Uint64(r.buf[:8])
 	r.buf = r.buf[8:]
@@ -173,7 +189,7 @@ func (r *wireReader) readBytes() ([]byte, error) {
 		return nil, err
 	}
 	if uint64(n) > uint64(len(r.buf)) {
-		return nil, fmt.Errorf("%w: SFTP 字段长度 %d 超出剩余报文 %d", ports.ErrCorruptData, n, len(r.buf))
+		return nil, domi18n.EF(ports.ErrCorruptData, domi18n.KeySFTPPacketTruncated)
 	}
 	out := r.buf[:n]
 	r.buf = r.buf[n:]
@@ -353,7 +369,7 @@ func decodeNameList(payload []byte) ([]wireNameEntry, error) {
 		return nil, err
 	}
 	if count > maxReadDirEntries {
-		return nil, fmt.Errorf("%w: SFTP NAME 列表条目数 %d 超限", ports.ErrLimitExceeded, count)
+		return nil, domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "SFTP NAME entries"), domi18n.Uint64("count", uint64(count)), domi18n.Int("limit", maxReadDirEntries))
 	}
 	entries := make([]wireNameEntry, 0, min(int(count), 1024))
 	for range count {
@@ -418,7 +434,7 @@ func attrsToAnchor(a wireAttrs) (ports.RemoteFileAnchor, fs.FileMode, error) {
 
 func attrsToRemoteStat(p pathalg.RemotePath, a wireAttrs) (ports.RemoteFileStat, error) {
 	if a.size > math.MaxInt64 {
-		return zeroVal[ports.RemoteFileStat](), fmt.Errorf("%w: 远端文件大小溢出 int64", ports.ErrLimitExceeded)
+		return zeroVal[ports.RemoteFileStat](), domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "remote file"), domi18n.Uint64("size", a.size), domi18n.Int64("limit", math.MaxInt64))
 	}
 	anc, fm, err := attrsToAnchor(a)
 	if err != nil {
