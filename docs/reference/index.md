@@ -4,15 +4,16 @@
 
 ## 全局选项
 
-可置于子命令之前或子命令参数列表内：
+可置于子命令之前或子命令参数列表内（`-V`/`--version` 仅支持根级/子命令前调用）：
 
 | 选项 | 说明 |
 | --- | --- |
+| `--lang <en\|zh>` | 显式指定本次运行的界面显示语言（支持前置/后置与末次覆盖，不持久化、`--help`/`version` 零触盘）；命令感知扫描在 `--` 及 `ssh`/`exec` 首个位置参数处停止以透传远端参数；非法或缺值以退出码 `2`（`usage_error`）失败关闭 |
 | `--json`（支持 `=true\|false`） | 在 `stdout` 输出规范确定性 JSON/v2（`Deterministic(true)`）；交互式 `tui` 与交互式 `sftp <target>` 拒绝 `--json` |
 | `--policy <profile>` | 安全策略配置档：`direct_operator`（CLI 默认）\| `strict` / `strict_operator` \| `strict_agent`（MCP 默认） |
 | `-F <configfile>` / `--ssh-config <file>` | 替代每用户 OpenSSH 配置文件（传 `none` 禁用） |
-| `-h` / `--help` | 显示根帮助或子命令帮助 |
-| `-V` / `--version` | 输出构建版本元信息（不初始化 Engine） |
+| `-h` / `--help` | 显示根帮助或子命令帮助（不初始化 Engine、零触盘） |
+| `-V` / `--version` | 输出构建版本元信息（仅支持根级/子命令前调用，不初始化 Engine、零触盘） |
 
 ## 顶层命令总览
 
@@ -31,7 +32,7 @@
 | `audit` | — | 跨进程崩溃锁 O(1) 对账（`reconcile`）与本地 `audit.jsonl` 查询（`list`/`tail`/`inspect`） |
 | `config` | — | 列出注册导入格式（`formats`）与导入外部配置（`import --format openssh\|csv`） |
 | `mcp` | — | 启动内置 7 工具沙箱 MCP 服务端（`stdio` 或 Streamable HTTP） |
-| `tui` | — | 启动 Bubble Tea v2 实时交互式终端工作台 |
+| `tui` | — | 启动 Bubble Tea v2 实时交互式终端工作台（支持按大写 `L` 实时热切中英文并同步 `Enter` SSH 接管提示） |
 | `version` | `-V`, `--version` | 输出版本、Commit、构建时间与 Go 工具链元信息（零 Engine 初始化） |
 | `help` | `-h`, `--help` | 查看根帮助或指定主题帮助（`xops help <topic>`） |
 
@@ -119,7 +120,8 @@ xops audit inspect <operation_id> [--json]
 xops mcp [serve] [--transport stdio|http] [--listen <addr>] [--transfer-root <dir>] [--artifact-root <dir>]
                  [--allow-non-loopback] [--allowed-origin <o>] [--allowed-host <h>]
 
-xops tui [--node <id>] [--refresh <duration>] [--no-alt-screen]
+xops tui [--node <id>] [--refresh <duration>] [--no-alt-screen] [--lang <en|zh>]
+  # 交互式工作台拒绝 --json；按大写 L 实时热切中英文并同步 Enter SSH 接管提示（与小写 l 日志流区分，过滤模式 / 下不误触）
 ```
 
 ## 退出码规范
@@ -142,17 +144,23 @@ xops tui [--node <id>] [--refresh <duration>] [--no-alt-screen]
   "error_code": "approval_required",
   "exit_code": 1,
   "ok": false,
-  "approval_challenge": { "digest": "sha256:...", "escalated": false, "envelope": {} }
+  "approval_challenge": { "digest": "sha256:...", "escalated": false, "reason": "protected_path", "envelope": {} }
 }
 ```
 
 常见 `error_code`：`usage_error`、`engine_halted`、`approval_required`、`approval_rejected`、`authorization_denied`、`not_found`、`already_exists`、`revision_conflict`、`still_referenced`、`import_conflict`、`uncertain_durability`、`outcome_unknown`、`vault_unavailable`、`vault_locked`、`secret_not_found`、`auth_failed`、`host_key_unknown`、`host_key_mismatch`、`host_key_revoked`、`dial_failed`、`remote_anchor_mismatch`、`patch_conflict`、`digest_mismatch`、`symlink_rejected`、`limit_exceeded`、`unsupported`、`canceled`、`timeout`。
+
+> **国际化与机器契约边界**：无论 `--lang` 或 `XOPS_LANG` 取值为何，所有 `--json` 结构字段名、`error_code`、枚举值、`approval_challenge.reason`、`xops doctor --json`（`inventory.findings[].message`、`vault.findings[].message`、`vault_note`）、`xops creds doctor --json`（`findings[].message`）与 `xops config import --json`（`report.warnings[].message`）均恒保持规范英文；仅面向人工阅读的 `ErrorEnvelope.error`（及执行结果视图的 `diagnostic`）随当前语种本地化。
 
 ## 环境变量
 
 | 变量 | 用途 |
 | --- | --- |
 | `XOPS_HOME` | 覆盖默认状态目录 `~/.xops`（影响 `config.yaml`、`vault/`、`audit.jsonl`、`run/`、`journals/`） |
+| `XOPS_LANG` | 覆盖默认界面显示语言（`en` \| `zh`，不持久化至 `~/.xops/config.yaml`、`--help`/`version` 零触盘）；优先级低于 `--lang`、高于 POSIX 区域变量 |
+| `LC_ALL` / `LC_MESSAGES` / `LANG` | POSIX 区域语言探测链路（按此序回退，刻意忽略 GNU `LANGUAGE`）；`LC_ALL=C` / `POSIX`（含 `.UTF-8` 后缀）显式解析为 `en` 并阻断低优先级 `LANG` |
 | `HOME` / `USERPROFILE` | 用户主目录（决定 `~/.ssh/config` 与默认 `~/.xops` 位置） |
 | `SSH_AUTH_SOCK` | Unix 下 `ssh-agent` 套接字路径（Windows 自动连接受验 `\\.\pipe\openssh-ssh-agent`） |
 | `DBUS_SESSION_BUS_ADDRESS` | Linux `os_keychain`（Secret Service）连接 D-Bus 会话总线地址 |
+
+> **语种探测优先级**：`--lang > XOPS_LANG > LC_ALL > LC_MESSAGES > LANG > OS Locale > en`（Windows 在环境变量全空时经 `GetUserDefaultLocaleName` 查询系统区域；Unix/macOS 零子进程、零触盘仅依赖 POSIX 环境变量；无持久化配置且 `--help`/`version` 零触盘；未知非空环境变量或系统区域标签安全回退为 `en` 并阻断穿透，所有 `zh*` 变体归并至简体中文 `zh`）。

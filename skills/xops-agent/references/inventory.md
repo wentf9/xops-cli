@@ -16,7 +16,7 @@ xops doctor --json                         # combined read-only inventory + vaul
 xops doctor --scope inventory --check-vault --check-keys --json
 ```
 
-All `hosts` queries support aliases `host` and `inventory`, plus `--lang <en|zh>` (before or after the subcommand, before `--`). Listing and resolving do not open remote SSH connections. Diagnostic fields in `xops doctor --json` (`findings[].message`, `vault_note`) and `xops config import --json` (`report.warnings[].message`) always remain canonical English regardless of `--lang` or `XOPS_LANG`.
+All `hosts` queries support aliases `host` and `inventory`, plus `--lang <en|zh>` (before or after the subcommand, before `--`). Listing and resolving do not open remote SSH connections. Diagnostic fields in `xops doctor --json` (`inventory.findings[].message`, `vault.findings[].message`, `vault_note`), `xops creds doctor --json` (top-level `findings[].message`), and `xops config import --json` (`report.warnings[].message`) always remain canonical English regardless of `--lang` or `XOPS_LANG`.
 
 ## Declarative CAS CRUD (`xops hosts`)
 

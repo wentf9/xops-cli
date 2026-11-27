@@ -4,15 +4,16 @@ Complete summary of **XOps v2** commands, aliases, core flags, exit codes, canon
 
 ## Global Flags
 
-Accepted before or inside subcommand arguments:
+Accepted before or inside subcommand arguments (`-V`/`--version` is root/prefix-only):
 
 | Flag | Description |
 | --- | --- |
+| `--lang <en\|zh>` | Override the display language for this invocation (accepted before or after subcommands, last-wins, zero persistence, zero disk touch on `--help`/`version`); command-aware scanning stops at `--` and at the first positional argument of `ssh`/`exec` so remote arguments pass through untouched; invalid or missing values fail closed with exit code `2` (`usage_error`) |
 | `--json` (accepts `=true\|false`) | Emit canonical deterministic JSON/v2 (`Deterministic(true)`) on `stdout`; rejected by interactive `tui` and interactive `sftp <target>` |
 | `--policy <profile>` | Policy profile: `direct_operator` (CLI default) \| `strict` / `strict_operator` \| `strict_agent` (MCP default) |
 | `-F <configfile>` / `--ssh-config <file>` | Alternative per-user OpenSSH configuration file (`none` disables) |
-| `-h` / `--help` | Show root or subcommand help |
-| `-V` / `--version` | Print build version metadata without initializing Engine state |
+| `-h` / `--help` | Show root or subcommand help (never initializes Engine or touches disk) |
+| `-V` / `--version` | Print build version metadata (root/prefix-only; never initializes Engine or touches disk) |
 
 ## Top-Level Commands
 
@@ -31,7 +32,7 @@ Accepted before or inside subcommand arguments:
 | `audit` | — | O(1) crash-lock reconciliation (`reconcile`) and local `audit.jsonl` queries (`list`/`tail`/`inspect`) |
 | `config` | — | List registered import formats (`formats`) and import external configs (`import --format openssh\|csv`) |
 | `mcp` | — | Start the built-in 7-tool sandboxed MCP server (`stdio` or Streamable HTTP) |
-| `tui` | — | Launch the Bubble Tea v2 interactive terminal workbench |
+| `tui` | — | Launch the Bubble Tea v2 interactive terminal workbench (supports uppercase `L` live EN/ZH toggle synced with `Enter` SSH takeover prompts) |
 | `version` | `-V`, `--version` | Print version, commit, build time, and Go toolchain metadata without Engine init |
 | `help` | `-h`, `--help` | Show root or topic help (`xops help <topic>`) |
 
@@ -119,7 +120,8 @@ xops audit inspect <operation_id> [--json]
 xops mcp [serve] [--transport stdio|http] [--listen <addr>] [--transfer-root <dir>] [--artifact-root <dir>]
                  [--allow-non-loopback] [--allowed-origin <o>] [--allowed-host <h>]
 
-xops tui [--node <id>] [--refresh <duration>] [--no-alt-screen]
+xops tui [--node <id>] [--refresh <duration>] [--no-alt-screen] [--lang <en|zh>]
+  # Interactive workbench rejects --json; press uppercase L to hot-switch EN/ZH and sync Enter SSH takeover prompts (distinct from lowercase l logs; safe in / filter mode)
 ```
 
 ## Exit Codes
@@ -142,17 +144,23 @@ When `--json` is enabled and a command fails, `stdout` always receives a determi
   "error_code": "approval_required",
   "exit_code": 1,
   "ok": false,
-  "approval_challenge": { "digest": "sha256:...", "escalated": false, "envelope": {} }
+  "approval_challenge": { "digest": "sha256:...", "escalated": false, "reason": "protected_path", "envelope": {} }
 }
 ```
 
 Standard `error_code` values: `usage_error`, `engine_halted`, `approval_required`, `approval_rejected`, `authorization_denied`, `not_found`, `already_exists`, `revision_conflict`, `still_referenced`, `import_conflict`, `uncertain_durability`, `outcome_unknown`, `vault_unavailable`, `vault_locked`, `secret_not_found`, `auth_failed`, `host_key_unknown`, `host_key_mismatch`, `host_key_revoked`, `dial_failed`, `remote_anchor_mismatch`, `patch_conflict`, `digest_mismatch`, `symlink_rejected`, `limit_exceeded`, `unsupported`, `canceled`, `timeout`.
+
+> **Localization & Machine Contract Boundary**: Regardless of `--lang` or `XOPS_LANG`, all `--json` field names, `error_code` constants, enum values, `approval_challenge.reason`, `xops doctor --json` (`inventory.findings[].message`, `vault.findings[].message`, `vault_note`), `xops creds doctor --json` (`findings[].message`), and `xops config import --json` (`report.warnings[].message`) always remain canonical English; only human-facing `ErrorEnvelope.error` (and `diagnostic` in execution outcome views) localizes to the active language.
 
 ## Environment Variables
 
 | Variable | Purpose |
 | --- | --- |
 | `XOPS_HOME` | Override default `~/.xops` state directory (`config.yaml`, `vault/`, `audit.jsonl`, `run/`, `journals/`) |
+| `XOPS_LANG` | Override default display language (`en` \| `zh`; never persisted to `~/.xops/config.yaml`, zero disk touch on `--help`/`version`); lower precedence than `--lang`, higher than POSIX locale variables |
+| `LC_ALL` / `LC_MESSAGES` / `LANG` | POSIX locale detection chain (evaluated in this order; GNU `LANGUAGE` is intentionally ignored); `LC_ALL=C` / `POSIX` (including `.UTF-8` suffixes) explicitly resolves to `en` and blocks lower-priority `LANG` |
 | `HOME` / `USERPROFILE` | User home directory (resolves `~/.ssh/config` and default `~/.xops`) |
 | `SSH_AUTH_SOCK` | Unix `ssh-agent` socket path (Windows automatically uses ACL-verified `\\.\pipe\openssh-ssh-agent`) |
 | `DBUS_SESSION_BUS_ADDRESS` | D-Bus session bus address for Linux `os_keychain` (Secret Service) |
+
+> **Locale Detection Precedence**: `--lang > XOPS_LANG > LC_ALL > LC_MESSAGES > LANG > OS Locale > en` (Windows queries `GetUserDefaultLocaleName` only when all locale env vars are blank; Unix/macOS perform zero subprocesses and zero disk I/O, relying solely on POSIX env vars; zero persistence and zero disk touch on `--help`/`version`; unrecognized non-empty env or OS tags safely fall back to `en` and stop fallthrough; all `zh*` variants normalize to Simplified Chinese `zh`).

@@ -1,7 +1,7 @@
 # XOps v2 全新架构分阶段实施计划（Implementation Plan）
 
 > **关联架构宪法**：[XOps v2 全新架构定稿规范（Architecture RFC）](./v2-architecture-rfc.md)（ADR-001 – ADR-017）  
-> **计划状态**：**Phase 0 – Phase 5 全量收口完成，后续演进全仓国际化（i18n）M1–M3 已闭环、M4 推进中**——Phase 0（`Gate G0-R2`）至 Phase 5（`Gate G5`，`core/v1.0.0` 已在根 `go.mod` 锁定）均已全量完成；v2 后续演进 **全仓国际化（i18n，Plan v2.2）** 已完成 M1（基础设施/10 大分析器/v2.1 修订）、M2（入口与交互层双语/TUI `L` 热切/命令感知 `--lang`）与 M3（全仓 `core` & `host` 迁移/1,506 双语词条/v2.2 无环叶包分解与规则 4–5 全仓合闸，`HEAD=3e054fa`），当前进入 M4（开发/用户文档与 Skill 同步，及待授权 `core/v1.1.0` 跨模块发版验收）  
+> **计划状态**：**Phase 0 – Phase 5 全量收口完成，后续演进全仓国际化（i18n）M1–M3 已闭环、M4 文档/Skill 已同步（余待授权发版）**——Phase 0（`Gate G0-R2`）至 Phase 5（`Gate G5`，`core/v1.0.0` 已在根 `go.mod` 锁定）均已全量完成；v2 后续演进 **全仓国际化（i18n，Plan v2.2）** 已完成 M1（基础设施/10 大分析器/v2.1 修订）、M2（入口与交互层双语/TUI `L` 热切/命令感知 `--lang`）与 M3（全仓 `core` & `host` 迁移/1,506 双语词条/v2.2 无环叶包分解与规则 4–5 全仓合闸，`HEAD=3e054fa`），M4 开发/双语用户文档与 Agent Skill 均已完成同步，仅余待用户授权的 `core/v1.1.0` 跨模块发版验收  
 > **执行铁律**：**Go 1.27+** · 全仓 3 个 `go.mod` 零 `replace`（`core/` 与 `tools/xopsvet/` 全程 `GOWORK=off`，根 CLI 开发期经 `go.work`，打 `core/v1.x.y` Tag 发布时三模块全量 `GOWORK=off`）· **先筑 `xopsvet` 护栏与四端统一 `verify.go` CI 再写业务代码** · **Gate G2 后即交付 Walking Skeleton 纵向真机闭环** · 严禁新旧双轨补丁
 
 ---
@@ -260,7 +260,7 @@ go run ./scripts/ci/verify.go --stage=dst
 - **TUI 全状态延迟渲染与 `L` 实时热切换**：`internal/entry/tui` 将全部状态文本、错误、横幅、指标/日志标签、`?` 帮助与底栏推迟至 `View()` 实时渲染；新增大写 `L` 快捷键（过滤输入态守卫、与小写 `l` 日志流区分），经 `OnLocaleChange` 联动 `Interaction.SetLocalizer` 同步接管会话提示；同步将 `i18nguard` 规则 2/3 扩至 M2 入口与交互包。
 
 ### M3：全仓 `core` & `host` 迁移、Plan v2.2 内部叶包分解与规则 4–5 合闸（`[x]` 已完成，基线 `3e054fa`）
-- **5 批次全仓结构化错误迁移（Wave 3A–3E）**：覆盖 `core/domain/**`、`core/{ports,events,osfs,conc}`、`core/internal/{foundation,pool,gate,sshnet/**,usecase/**,mcpruntime/**}`、`core/engine` 与 `internal/host/**` 共 **3,200+** 处生产错误构造调用（含 8 类核心/运行时自定义错误类型实现 `LocalizableNode`、`core/conc` 保持零仓内依赖规范英文并由 `internal/i18n.RenderError` 无侵入映射）；MCP 7 工具描述与 JSON-RPC 响应全面收口规范英文并补充零 Han 字符断言；双语镜像词库扩展至 11 对 YAML 文件共 **1,506** 条词条（`core` 889 含包内私有 `keyCommonDetail` + 根模块 617，100% 双射与占位符对称）。
+- **5 批次全仓结构化错误迁移（Wave 3A–3E）**：覆盖 `core/domain/**`、`core/{ports,events,osfs,conc}`、`core/internal/{foundation,pool,gate,sshnet/**,usecase/**,mcpruntime/**}`、`core/engine` 与 `internal/host/**` 约 **2,700+** 处生产错误构造调用（连同 M2 `internal/entry/**` 与 `cmd/xops` 全仓合计 **3,200+** 处结构化错误构造调用；含 8 类核心/运行时自定义错误类型实现 `LocalizableNode`、`core/conc` 保持零仓内依赖规范英文并由 `internal/i18n.RenderError` 无侵入映射）；MCP 7 工具描述与 JSON-RPC 响应全面收口规范英文并补充零 Han 字符断言；双语镜像词库扩展至 11 对 YAML 文件共 **1,506** 条词条（`core` 889 含包内私有 `keyCommonDetail` + 根模块 617，100% 双射与占位符对称）。
 - **Plan v2.2 双路架构修订合入**：
   1. **3,000 LOC 永久可扩展内部叶包分解**：`core/domain/i18n` 算法与兜底表下沉至零仓内依赖叶包 `internal/{textalg,errchain}` 及路由 + 5 域分片 `internal/corecatalog/{common,domain,ports,runtime,usecase}`，根模块兜底与键枚举下沉至零仓内依赖叶包 `internal/i18n/internal/rootcatalog`，`archbound` 锁死单向无环 DAG 及 `corecatalog/**`/`rootcatalog/**` 生产仅 `"slices"`；
   2. **`keyCommonDetail` 私有化与 `i18nguard` 规则 4–5 全仓合闸**：导出 `WrapSentinelDetail` 与 `DynamicDetailError`（均注册 `secretfact` `SinkError`）；全仓生产源码强制启用 `i18nguard` 规则 1–5（规则 4 拦截动态原语常量字面量、`EF`/`WrapS` 传 `common.detail` 及哨兵语义吞噬；规则 5 拦截 `Str`/`BoundStr` 常量散文参数回流）；
@@ -272,11 +272,11 @@ go run ./scripts/ci/verify.go --stage=dst
 
 ### M4：文档/Skill 同步与待授权 `core/v1.1.0` 跨模块发版验收（`[~]` 进行中）
 - `[x]` 开发文档与工程宪法同步（`AGENTS.md`、`docs/development/{v2-architecture-rfc,v2-implementation-plan,index,v2-local-multiplatform-ci}.md`）。
-- `[ ]` 对外双语用户文档（`README.md`/`README_en.md`、`docs/guide/**` & `docs/en/guide/**`，不动旧版 `docs/reference/commands/`）与 `skills/xops-agent/**` 同步（独立工作流推进中）。
+- `[x]` 对外双语用户文档（`README.md`/`README_en.md`、`docs/guide/**` & `docs/en/guide/**`、`docs/reference/index.md` & `docs/en/reference/index.md`，不动旧版 `docs/reference/commands/`）与 `skills/xops-agent/**` 同步。
 - `[ ]` **待用户明确授权后执行**：打 `core/v1.1.0` Tag → 更新根 `go.mod` 锁定 `github.com/wentf9/xops-cli/core v1.1.0`（当前根 `go.mod` 仍锁定 `v1.0.0`，日常开发经 `go.work` 联合验证）→ 同步 `scripts/ci/verify.go` 发版注释 → 运行 `go run ./scripts/ci/verify.go --stage=all --gowork-off`、`--stage=cross`、`--stage=dst` 及多平台原生实机验收。
 
 ### i18n 演进持久化清单
 - **M1（底座 + 10 大分析器 + Plan v2.1 修订）**：`[x] core/domain/i18n` · `[x] internal/i18n` · `[x] host/sys/locale*.go` · `[x] xopsvet 10 分析器与 v2.1 加固`
 - **M2（入口与交互双语闭环）**：`[x] InteractionPort 13+ 提示与热同步` · `[x] 命令感知 ScanPreFlags --lang/--json 与 CLI/SFTP Shell` · `[x] TUI 全状态延迟渲染与 L 热切`
 - **M3（全仓 `core` & `host` 迁移 + Plan v2.2 修订，`HEAD=3e054fa`）**：`[x] Wave 3A–3E 与 MCP 规范英文收口` · `[x] 1,506 双语词条与内部叶包分解` · `[x] i18nguard 规则 1–5 全仓合闸与双轨投影` · `[x] 本地 Linux 9 项门禁全绿`
-- **M4（文档/Skill 同步与 `core/v1.1.0` 待授权发版）**：`[x] 开发文档与 AGENTS.md 同步` · `[ ] 双语用户文档与 Skill 同步` · `[ ] 待授权 core/v1.1.0 Tag、锁根 go.mod 与 --gowork-off / 多平台原生验收`
+- **M4（文档/Skill 同步与 `core/v1.1.0` 待授权发版）**：`[x] 开发文档与 AGENTS.md 同步` · `[x] 双语用户文档与 Skill 同步` · `[ ] 待授权 core/v1.1.0 Tag、锁根 go.mod 与 --gowork-off / 多平台原生验收`

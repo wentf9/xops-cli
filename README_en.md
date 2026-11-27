@@ -83,7 +83,7 @@ xops tui
 
 ### 4. Global Flags and Bilingual Localization
 
-All CLI commands accept uniform global flags: `--lang <en|zh>`, `--json`, `--policy <profile>`, `-F`/`--ssh-config <file>`, `-h`/`--help`, and `-V`/`--version`.
+Almost every command supports uniform global flags before or after the subcommand: `--lang <en|zh>`, `--json` (rejected by interactive `tui` and interactive `sftp <target>`), `--policy <profile>`, `-F`/`--ssh-config <file>`, and `-h`/`--help`; `-V`/`--version` is only available at the root or before a subcommand.
 
 ```bash
 # Switch display language to Simplified Chinese or English (valid before or after subcommand, before '--', last-wins, zero persistence, zero disk touch on --help/version)

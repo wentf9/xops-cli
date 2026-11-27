@@ -83,7 +83,7 @@ xops tui
 
 ### 4. 全局选项与中英双语切换
 
-所有 CLI 命令均支持统一的全局选项：`--lang <en|zh>`、`--json`、`--policy <profile>`、`-F`/`--ssh-config <file>`、`-h`/`--help`、`-V`/`--version`。
+几乎所有命令均支持统一的前置或子命令级全局选项：`--lang <en|zh>`、`--json`（交互式 `tui` 与交互式 `sftp <target>` 不支持）、`--policy <profile>`、`-F`/`--ssh-config <file>`、`-h`/`--help`；`-V`/`--version` 仅在根命令/子命令前可用。
 
 ```bash
 # 按需切换简体中文或英文界面（可置于子命令前或后、'--' 之前，末次生效，零持久化且 --help/version 零触盘）
