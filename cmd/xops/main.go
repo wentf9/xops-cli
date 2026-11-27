@@ -30,7 +30,10 @@ func main() {
 func runProcess(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stop()
+	return runProcessWithContext(ctx, args, stdin, stdout, stderr)
+}
 
+func runProcessWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	buildInfo := currentBuildInfo()
 	app, err := cli.NewApp(cli.AppConfig{
 		BuildInfo: buildInfo,

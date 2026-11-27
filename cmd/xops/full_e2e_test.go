@@ -19,6 +19,7 @@ import (
 	"go.uber.org/goleak"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 )
 
 func shortE2EMuxSocketPath(t *testing.T, name string) string {
@@ -45,14 +46,6 @@ func reserveFreeLoopbackAddr(t *testing.T) string {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 	return addr
-}
-
-func stopChildGracefully(cmd *exec.Cmd, cancel context.CancelFunc) {
-	if runtime.GOOS != "windows" && cmd.Process != nil {
-		_ = cmd.Process.Signal(os.Interrupt)
-		return
-	}
-	cancel()
 }
 
 // TestE2E_CompiledBinarySCPAndSFTP 验证真实编译二进制的 scp 上传/下载、sftp 单步命令与交互式 sftpshell 闭环。
@@ -167,7 +160,7 @@ func TestE2E_CompiledBinaryTunnelLocalForward(t *testing.T) {
 
 	line, err := bufio.NewReader(stdoutPipe).ReadBytes('\n')
 	if err != nil {
-		stopChildGracefully(cmd, cancel)
+		terminateChildOnEarlyFailure(cmd, cancel)
 		_ = cmd.Wait()
 		t.Fatalf("读取 tunnel 就绪 JSON 失败: %v stderr=%q", err, stderrBuf.String())
 	}
@@ -178,7 +171,7 @@ func TestE2E_CompiledBinaryTunnelLocalForward(t *testing.T) {
 		} `json:"forwards"`
 	}
 	if err := jsonv2.Unmarshal(line, &ready); err != nil || !ready.OK || len(ready.Forwards) != 1 || ready.Forwards[0].BindAddr == "" {
-		stopChildGracefully(cmd, cancel)
+		terminateChildOnEarlyFailure(cmd, cancel)
 		_ = cmd.Wait()
 		t.Fatalf("tunnel 就绪 JSON 异常: raw=%q err=%v", string(line), err)
 	}
@@ -186,22 +179,19 @@ func TestE2E_CompiledBinaryTunnelLocalForward(t *testing.T) {
 	var nd net.Dialer
 	conn, err := nd.DialContext(ctx, "tcp", ready.Forwards[0].BindAddr)
 	if err != nil {
-		stopChildGracefully(cmd, cancel)
+		terminateChildOnEarlyFailure(cmd, cancel)
 		_ = cmd.Wait()
 		t.Fatalf("拨号本地隧道端口失败: %v", err)
 	}
 	_, _ = io.WriteString(conn, "ping-tunnel\n")
 	reply, rErr := bufio.NewReader(conn).ReadString('\n')
 	_ = conn.Close()
-	stopChildGracefully(cmd, cancel)
-	waitErr := cmd.Wait()
 	if rErr != nil || reply != "fwd[10.99.0.1:8080]:ping-tunnel\n" {
+		terminateChildOnEarlyFailure(cmd, cancel)
+		_ = cmd.Wait()
 		t.Fatalf("隧道回显失配: reply=%q err=%v stderr=%q", reply, rErr, stderrBuf.String())
 	}
-	if runtime.GOOS != "windows" && waitErr != nil {
-		t.Fatalf("tunnel 收到 SIGINT 期望退出码 0，实际=%v stderr=%q", waitErr, stderrBuf.String())
-	}
-	assertNoRemainingLocks(t, iso.xopsHome)
+	stopChildAndVerifyShutdown(t, binPath, iso.env, iso.xopsHome, cmd, cancel, "tunnel", stderrBuf.String)
 }
 
 // TestE2E_CompiledBinaryMuxDaemonReuseAndFinitePersist 验证真实编译二进制 `xops mux daemon`、
@@ -237,7 +227,7 @@ func TestE2E_CompiledBinaryMuxDaemonReuseAndFinitePersist(t *testing.T) {
 	}
 	banner, err := bufio.NewReader(outPipe).ReadString('\n')
 	if err != nil || !strings.Contains(banner, "mux daemon ready (master)") {
-		stopChildGracefully(daemonCmd, cancel)
+		terminateChildOnEarlyFailure(daemonCmd, cancel)
 		_ = daemonCmd.Wait()
 		t.Fatalf("mux daemon 未输出就绪横幅: banner=%q err=%v stderr=%q", banner, err, daemonErr.String())
 	}
@@ -248,7 +238,7 @@ func TestE2E_CompiledBinaryMuxDaemonReuseAndFinitePersist(t *testing.T) {
 		"mux", "check", "-F", "none", "-p", portStr, "-l", "deploy", "-S", sockPath, "127.0.0.1",
 	)
 	if err != nil || code != 0 || !strings.Contains(stdout, "master running") {
-		stopChildGracefully(daemonCmd, cancel)
+		terminateChildOnEarlyFailure(daemonCmd, cancel)
 		_ = daemonCmd.Wait()
 		t.Fatalf("mux check 失配: code=%d err=%v stdout=%q stderr=%q", code, err, stdout, stderr)
 	}
@@ -263,12 +253,12 @@ func TestE2E_CompiledBinaryMuxDaemonReuseAndFinitePersist(t *testing.T) {
 		"127.0.0.1", "via-mux-daemon",
 	)
 	if err != nil || code != 0 || stdout != "exec:via-mux-daemon\n" {
-		stopChildGracefully(daemonCmd, cancel)
+		terminateChildOnEarlyFailure(daemonCmd, cancel)
 		_ = daemonCmd.Wait()
 		t.Fatalf("mux 复用 ssh 失败: code=%d err=%v stdout=%q stderr=%q", code, err, stdout, stderr)
 	}
 	if srv.dialCount.Load() != dialsBefore {
-		stopChildGracefully(daemonCmd, cancel)
+		terminateChildOnEarlyFailure(daemonCmd, cancel)
 		_ = daemonCmd.Wait()
 		t.Fatalf("mux 复用期间不应触发新 SSH 拨号: before=%d after=%d", dialsBefore, srv.dialCount.Load())
 	}
@@ -279,7 +269,7 @@ func TestE2E_CompiledBinaryMuxDaemonReuseAndFinitePersist(t *testing.T) {
 		"mux", "exit", "-F", "none", "-p", portStr, "-l", "deploy", "-S", sockPath, "127.0.0.1",
 	)
 	if err != nil || code != 0 {
-		stopChildGracefully(daemonCmd, cancel)
+		terminateChildOnEarlyFailure(daemonCmd, cancel)
 		_ = daemonCmd.Wait()
 		t.Fatalf("mux exit 失败: code=%d err=%v stdout=%q stderr=%q", code, err, stdout, stderr)
 	}
@@ -317,8 +307,8 @@ func TestE2E_CompiledBinaryMCPStdioAndHTTP(t *testing.T) {
 
 	initReq := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"1.0"}}}` + "\n"
 	assertMCPStdioLoopback(t, binPath, iso.env, initReq)
-	assertMCPHTTPLoopback(t, binPath, iso.env, initReq)
 	assertNoRemainingLocks(t, iso.xopsHome)
+	assertMCPHTTPLoopback(t, binPath, iso.env, iso.xopsHome, initReq)
 }
 
 func assertMCPStdioLoopback(t *testing.T, binPath string, env []string, initReq string) {
@@ -340,7 +330,7 @@ func assertMCPStdioLoopback(t *testing.T, binPath string, env []string, initReq 
 	}
 }
 
-func assertMCPHTTPLoopback(t *testing.T, binPath string, env []string, initReq string) {
+func assertMCPHTTPLoopback(t *testing.T, binPath string, env []string, xopsHome pathalg.LocalDir, initReq string) {
 	t.Helper()
 	listenAddr := reserveFreeLoopbackAddr(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -357,20 +347,18 @@ func assertMCPHTTPLoopback(t *testing.T, binPath string, env []string, initReq s
 
 	readyLine, err := bufio.NewReader(errPipe).ReadString('\n')
 	if err != nil || !strings.Contains(readyLine, "xops-mcp: ready transport=http") {
-		stopChildGracefully(httpCmd, cancel)
+		terminateChildOnEarlyFailure(httpCmd, cancel)
 		_ = httpCmd.Wait()
 		t.Fatalf("mcp http 未就绪: line=%q err=%v", readyLine, err)
 	}
 
 	statusCode, respBody, reqErr := postMCPHTTPWithRetry(ctx, "http://"+listenAddr+"/mcp", initReq)
-	stopChildGracefully(httpCmd, cancel)
-	waitErr := httpCmd.Wait()
 	if reqErr != nil || statusCode != http.StatusOK || !strings.Contains(string(respBody), `"protocolVersion"`) {
-		t.Fatalf("mcp http POST /mcp 失败: status=%d body=%q reqErr=%v waitErr=%v", statusCode, string(respBody), reqErr, waitErr)
+		terminateChildOnEarlyFailure(httpCmd, cancel)
+		_ = httpCmd.Wait()
+		t.Fatalf("mcp http POST /mcp 失败: status=%d body=%q reqErr=%v", statusCode, string(respBody), reqErr)
 	}
-	if runtime.GOOS != "windows" && waitErr != nil {
-		t.Fatalf("mcp http 收到 SIGINT 期望退出码 0，实际=%v", waitErr)
-	}
+	stopChildAndVerifyShutdown(t, binPath, env, xopsHome, httpCmd, cancel, "mcp http", func() string { return readyLine })
 }
 
 func postMCPHTTPWithRetry(ctx context.Context, url, payload string) (int, []byte, error) {
