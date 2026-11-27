@@ -22,7 +22,7 @@ npm run docs:preview
 
 中文页面位于根路径，英文镜像位于 `en/`；两种语言保持相同文件名。修改指南时同时更新两种语言。`npm run docs:check` 检查目录对齐；VitePress 构建检查站内链接。自动检查不能判断译文是否准确。
 
-开发资料保留在仓库的 `docs/development/`（不再强制维护 `docs/en/development/` 镜像）中，不参与用户文档站点构建或站内搜索。面向用户的操作说明应放入双语使用指南。
+开发资料统一以简体中文保留在仓库的 `docs/development/`（历史归档位于 `docs/development/archive/`，不再维护英文开发文档镜像）中，不参与用户文档站点构建或站内搜索。面向用户的操作说明应放入双语使用指南。
 
 ## GitHub Pages
 

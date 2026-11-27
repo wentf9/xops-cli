@@ -1,46 +1,49 @@
-# 参与开发
+# 参与开发（XOps v2）
 
-Go 版本要求为 **1.26+**。修改逻辑时同步测试和相关文档，提交 PR 前运行：
+XOps v2 采用 **Go 1.27+**（`CGO_ENABLED=0`）与三模块 Go Workspace（[`go.work`](../../go.work)）：
+
+- 根 CLI 模块（[`go.mod`](../../go.mod)）：本机宿主适配器 `internal/host/**`、入站入口 `internal/entry/**` 与唯一组合根 `cmd/xops`；
+- 六边形核心模块（[`core/go.mod`](../../core/go.mod)）：无宿主假设的核心契约、运行期与领域模型；
+- 自建静态分析器模块（[`tools/xopsvet/go.mod`](../../tools/xopsvet/go.mod)）：9 大正交架构/安全/并发编译器护栏。
+
+全仓开发与架构约束以仓库根目录的 **[工程宪法与 AI 协作规范（AGENTS.md）](../../AGENTS.md)** 为最高事实源，严禁引入 v1 兼容垫片或长期 `replace`。
+
+## 本地验证门禁
+
+全仓统一通过单一事实源脚本 [`scripts/ci/verify.go`](../../scripts/ci/verify.go)（外层不设 `GOWORK=off`，由脚本按模块控制隔离环境）执行验证；修改代码或文档后，提交 PR 前请按改动范围运行对应门禁：
 
 ```bash
-go build ./...
-go test ./...
-golangci-lint run ./...
+# 1. 全量三模块构建、xopsvet 护栏、golangci-lint 与竞态测试（等价于 make verify）
+go run ./scripts/ci/verify.go --stage=all
+
+# 2. Windows / macOS 跨平台交叉编译与交叉 Lint（等价于 make cross）
+go run ./scripts/ci/verify.go --stage=cross
+
+# 3. 确定性仿真门禁 DST（等价于 make dst）
+go run ./scripts/ci/verify.go --stage=dst
+
+# 4. 正式发布前锁定 core Tag 的三模块全量 GOWORK=off 验收（等价于 make verify-release）
+go run ./scripts/ci/verify.go --stage=all --gowork-off
+
+# 5. CI 变更分类脚本单测与用户文档双语一致性校验
+python3 -m unittest discover -s scripts -p test_ci_changes.py -v
+npm run docs:check
 ```
 
-复用包负责包装并传递错误，由 CLI 层呈现。网络操作需超时，资源与 goroutine 需要确定的退出路径。Windows 特性不能仅凭交叉编译宣称运行验证通过。
+交叉编译与静态检查不等于目标平台原生测试通过；Windows、macOS 与 FreeBSD 平台特性以原生环境执行结果为准（搭建方案见[本地多平台测试与私有 CI 指南](./v2-local-multiplatform-ci.md)）。
 
-## 架构与历史资料
+## 活跃开发文档（XOps v2）
 
-历史开发文档统一归集于 `docs/development/archive/`，以下链接打开 GitHub：
+根据 [AGENTS.md](../../AGENTS.md) 第 5 节约定，开发文档统一使用简体中文维护，不纳入面向用户的双语站点构建：
 
-- [历史开发文档总索引](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/README.md)
-- [凭据后端 ADR](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/adr/0001-credential-persistence-backends.md)
-- [离线库 ADR](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/adr/0002-offline-encrypted-credential-store.md)
-- [凭据实现设计](https://github.com/wentf9/xops-cli/blob/master/docs/development/archive/design/credential-persistence.md)
-
-历史实施记录反映当时的验证范围，不自动代表当前所有平台已经验证。文档贡献流程见[文档维护](./docs)。
-
-## 设计与实施文档
-
-实现状态与验证范围以各文档说明为准。
-
-- [XOps v2 全新架构定稿规范（Architecture RFC）](./v2-architecture-rfc.md)
+- [工程宪法与 AI 协作规范（AGENTS.md）](../../AGENTS.md)
+- [XOps v2 全新架构定稿规范（Architecture RFC v2.3.3）](./v2-architecture-rfc.md)
 - [XOps v2 全新架构分阶段实施计划（Implementation Plan）](./v2-implementation-plan.md)
-- [XOps v2 本地多平台测试与私有 CI 环境搭建方案](./v2-local-multiplatform-ci.md)
-- [代码架构与治理地图](./governance/architecture-map.md)
-- [架构不变量、隐式契约与防漂移基线](./governance/invariants.md)
-- [OpenSSH 连接多路复用设计方案](./openssh-multiplexing-design.md)
-- [SSH 多解释器执行与兼容性设计](./ssh-execution-compatibility.md)
-- [SSH 执行兼容性实施计划](./ssh-execution-implementation.md)
-- [SSH 解释器与启动方言自动探测设计](./ssh-execution-probe-design.md)
-- [SSH 执行环境探针实施记录（M1–M4）](./ssh-execution-probe-implementation.md)
-- [SSH OTP 与 keyboard-interactive 登录设计方案](./ssh-otp-keyboard-interactive-design.md)
-- [公共代码与 MCP 接口解耦设计](./shared-core-decoupling)
-- [MCP Streamable HTTP 与文件流转发设计](./mcp-http-transfer-design.md)
-- [MCP 极简全能型工具架构重构设计](./mcp-minimal-tools-design.md)
-- [基于 FreeBSD 实机验证的 MCP 改进方案](./mcp-freebsd-validation-plan.md)
-- [离线凭据库兼容性](./compatibility.md)
-- [凭据零配置体验设计](./credential-experience-design)
-- [凭据体验实施计划](./credential-experience-plan)
-- [更新说明草案](./credential-experience-release)
+- [XOps v2 本地多平台测试与私有 CI 搭建指南](./v2-local-multiplatform-ci.md)
+- [文档维护指南](./docs.md)
+
+## 历史文档归档
+
+早期 v1 设计/治理/实施记录及已停用的英文开发文档镜像统一归档于 `docs/development/archive/`，仅作客观历史资料只读参考（不代表 XOps v2 当前架构契约，严禁向 v2 回流旧架构结构）：
+
+- [历史开发文档归档总索引](./archive/README.md)
