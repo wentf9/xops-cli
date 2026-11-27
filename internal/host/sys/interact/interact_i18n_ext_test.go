@@ -6,6 +6,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"testing/fstest"
+	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -43,19 +45,37 @@ func newTestStreamUI(t *testing.T, input string, loc *i18n.Localizer) (*interact
 	return ui, &out
 }
 
-// TestInteractionBilingualConfirmAndSanitization 验证 Confirm 在英文/简体中文下的结构化渲染、
-// 风险等级本地化、参数转义序列脱敏以及 ASCII [y/N]: 确认契约（中文非 ASCII 确认词严格拒绝）。
+// TestInteractionBilingualConfirmAndSanitization 验证 Confirm 在构造期严格拒绝含控制字符的结构化 BodyMessage，
+// 并在英文/简体中文下正确渲染结构化提示、风险等级本地化以及 ASCII [y/N]: 确认契约（中文非 ASCII 确认词严格拒绝）。
 func TestInteractionBilingualConfirmAndSanitization(t *testing.T) {
 	defer goleak.VerifyNone(t)
 	enLoc, zhLoc := loadTestLocalizers(t)
 	ctx := context.Background()
 
 	titleMsg := domi18n.NewMessage(domi18n.KeyInteractHostKeyTitle)
-	bodyMsg := domi18n.NewMessage(
+	// 构造期防线：BodyMessage 参数含 ESC 转义或 CRLF 控制字符时，ports.NewConfirmRequest 必须严格拒绝。
+	dirtyBodyMsg := domi18n.NewMessage(
 		domi18n.KeyInteractHostKeyBody,
 		domi18n.BoundStr("algorithm", "ssh-ed25519"),
 		domi18n.BoundStr("fingerprint", "SHA256:abc123\x1b[31m"),
 		domi18n.BoundStr("endpoint", "10.0.0.1:22\r\nFAKE"),
+	)
+	if _, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{
+		Title:        titleMsg.Canonical(),
+		Message:      dirtyBodyMsg.Canonical(),
+		Subject:      "10.0.0.1:22",
+		Risk:         security.RiskModerate,
+		TitleMessage: algebraic.Some(titleMsg),
+		BodyMessage:  algebraic.Some(dirtyBodyMsg),
+	}); !errors.Is(err, ports.ErrInvalidArgument) {
+		t.Fatalf("含控制字符的 BodyMessage 应被 NewConfirmRequest 拒绝返回 ErrInvalidArgument，实际: %v", err)
+	}
+
+	bodyMsg := domi18n.NewMessage(
+		domi18n.KeyInteractHostKeyBody,
+		domi18n.BoundStr("algorithm", "ssh-ed25519"),
+		domi18n.BoundStr("fingerprint", "SHA256:abc123"),
+		domi18n.BoundStr("endpoint", "10.0.0.1:22"),
 	)
 	req, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{
 		Title:        titleMsg.Canonical(),
@@ -70,14 +90,125 @@ func TestInteractionBilingualConfirmAndSanitization(t *testing.T) {
 	}
 
 	assertConfirmRender(t, ctx, enLoc, req, "yes\n", security.VerdictAllow,
-		`[moderate] SSH Host Key Verification: (10.0.0.1:22) Trust unknown SSH host key ssh-ed25519 (SHA256:abc123\x1b[31m) for 10.0.0.1:22\r\nFAKE? [y/N]: `)
+		`[moderate] SSH Host Key Verification: (10.0.0.1:22) Trust unknown SSH host key ssh-ed25519 (SHA256:abc123) for 10.0.0.1:22? [y/N]: `)
 	assertConfirmRender(t, ctx, zhLoc, req, "y\n", security.VerdictAllow,
-		`[中等风险] SSH 主机密钥验证: (10.0.0.1:22) 是否信任 10.0.0.1:22\r\nFAKE 的未知 SSH 主机密钥 ssh-ed25519（SHA256:abc123\x1b[31m）？ [y/N]: `)
+		`[中等风险] SSH 主机密钥验证: (10.0.0.1:22) 是否信任 10.0.0.1:22 的未知 SSH 主机密钥 ssh-ed25519（SHA256:abc123）？ [y/N]: `)
 	// 中文 "是" 必须严格失败关闭，仅接受 ASCII y/yes。
 	assertConfirmRender(t, ctx, zhLoc, req, "是\n", security.VerdictDeny,
-		`[中等风险] SSH 主机密钥验证: (10.0.0.1:22) 是否信任 10.0.0.1:22\r\nFAKE 的未知 SSH 主机密钥 ssh-ed25519（SHA256:abc123\x1b[31m）？ [y/N]: `)
+		`[中等风险] SSH 主机密钥验证: (10.0.0.1:22) 是否信任 10.0.0.1:22 的未知 SSH 主机密钥 ssh-ed25519（SHA256:abc123）？ [y/N]: `)
 
 	assertRiskLevelLabels(t, ctx, enLoc, zhLoc)
+}
+
+// TestInteractionRenderSideSanitizationAndByteBounds 验证渲染端纵深防御：
+// 即使外部词库模板注入控制/Bidi 字符或展开超过 128B(标题)/512B(正文)，
+// Confirm、PromptText 与 PromptSecret 输出仍恒为合法 UTF-8、无原始控制字符且按完整 rune 边界截断。
+func TestInteractionRenderSideSanitizationAndByteBounds(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	advLoc := buildAdversarialLocalizer(t)
+	ctx := context.Background()
+
+	cTitle := domi18n.NewMessage(domi18n.KeyInteractHostKeyTitle)
+	cBody := domi18n.NewMessage(
+		domi18n.KeyInteractHostKeyBody,
+		domi18n.BoundStr("algorithm", "ssh-ed25519"),
+		domi18n.BoundStr("fingerprint", "SHA256:ok"),
+		domi18n.BoundStr("endpoint", "10.0.0.1:22"),
+	)
+	cReq, err := ports.NewConfirmRequest(ports.ConfirmRequestSpec{
+		Title: cTitle.Canonical(), Message: cBody.Canonical(), Subject: "10.0.0.1:22",
+		Risk: security.RiskModerate, TitleMessage: algebraic.Some(cTitle), BodyMessage: algebraic.Some(cBody),
+	})
+	if err != nil {
+		t.Fatalf("NewConfirmRequest 失败: %v", err)
+	}
+	cUI, cOut := newTestStreamUI(t, "n\n", advLoc)
+	if _, err := cUI.Confirm(ctx, cReq); err != nil {
+		t.Fatalf("adversarial Confirm 失败: %v", err)
+	}
+	assertBoundedSanitizedPrompt(t, "Confirm", cOut.String(), "[moderate] ", ": (10.0.0.1:22) ", " [y/N]: ")
+
+	tTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+	tBody := domi18n.NewMessage(domi18n.KeyInteractChallengeResponse)
+	tReq, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
+		Title: tTitle.Canonical(), Prompt: tBody.Canonical(), Subject: "node-1",
+		TitleMessage: algebraic.Some(tTitle), BodyMessage: algebraic.Some(tBody),
+	})
+	if err != nil {
+		t.Fatalf("NewTextPromptRequest 失败: %v", err)
+	}
+	tUI, tOut := newTestStreamUI(t, "ok\n", advLoc)
+	if _, err := tUI.PromptText(ctx, tReq); err != nil {
+		t.Fatalf("adversarial PromptText 失败: %v", err)
+	}
+	assertBoundedSanitizedPrompt(t, "PromptText", tOut.String(), "", ": (node-1) ", " ")
+
+	sReq, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+		Title: tTitle.Canonical(), Prompt: tBody.Canonical(), Subject: "node-1",
+		TitleMessage: algebraic.Some(tTitle), BodyMessage: algebraic.Some(tBody),
+	})
+	if err != nil {
+		t.Fatalf("NewSecretPromptRequest 失败: %v", err)
+	}
+	sUI, sOut := newTestStreamUI(t, tck.TestSecretTokenA+"\n", advLoc)
+	if err := sUI.PromptSecret(ctx, sReq, func(*secret.SecretBox) error { return nil }); err != nil {
+		t.Fatalf("adversarial PromptSecret 失败: %v", err)
+	}
+	assertBoundedSanitizedPrompt(t, "PromptSecret", sOut.String(), "", ": (node-1) ", " ")
+}
+
+func buildAdversarialLocalizer(t *testing.T) *i18n.Localizer {
+	t.Helper()
+	dirtyTitle := `\u001b[31m\r\n\u202e` + strings.Repeat("汉", 60)
+	dirtyBody := `\u001b]52;c;abc\u0007\r\n` + strings.Repeat("中", 200) + ` {algorithm} {fingerprint} {endpoint}`
+	dirtyResp := `\u001b[33m\r\n` + strings.Repeat("答", 200)
+	fsys := fstest.MapFS{
+		"locales/en/interact.yaml": &fstest.MapFile{Data: []byte(
+			"interact.hostkey.title: \"SSH Host Key Verification\"\n" +
+				"interact.hostkey.body: \"Trust {algorithm} {fingerprint} {endpoint}\"\n" +
+				"interact.ssh_challenge.title: \"SSH Challenge\"\n" +
+				"interact.ssh_challenge.response: \"Response:\"\n",
+		)},
+		"locales/zh/interact.yaml": &fstest.MapFile{Data: []byte(
+			"interact.hostkey.title: \"" + dirtyTitle + "\"\n" +
+				"interact.hostkey.body: \"" + dirtyBody + "\"\n" +
+				"interact.ssh_challenge.title: \"" + dirtyTitle + "\"\n" +
+				"interact.ssh_challenge.response: \"" + dirtyResp + "\"\n",
+		)},
+	}
+	cat, err := i18n.LoadCatalogFromFS(fsys)
+	if err != nil {
+		t.Fatalf("LoadCatalogFromFS 失败: %v", err)
+	}
+	return cat.For(domi18n.LocaleZh)
+}
+
+func assertBoundedSanitizedPrompt(t *testing.T, name, got, prefix, mid, suffix string) {
+	t.Helper()
+	if !utf8.ValidString(got) {
+		t.Fatalf("%s 渲染输出包含非法 UTF-8: %q", name, got)
+	}
+	if strings.ContainsAny(got, "\x1b\r\n\x07\u202e") {
+		t.Fatalf("%s 渲染输出残留未脱敏控制或 Bidi 字符: %q", name, got)
+	}
+	rest, ok := strings.CutPrefix(got, prefix)
+	if !ok {
+		t.Fatalf("%s 缺少预期前缀 %q: %q", name, prefix, got)
+	}
+	rest, ok = strings.CutSuffix(rest, suffix)
+	if !ok {
+		t.Fatalf("%s 缺少预期后缀 %q: %q", name, suffix, got)
+	}
+	title, body, ok := strings.Cut(rest, mid)
+	if !ok {
+		t.Fatalf("%s 缺少主体分隔段 %q: %q", name, mid, got)
+	}
+	if len(title) > 128 || len(title) < 120 || !utf8.ValidString(title) {
+		t.Fatalf("%s 标题段字节界限异常: len=%d validUTF8=%v", name, len(title), utf8.ValidString(title))
+	}
+	if len(body) > 512 || len(body) < 500 || !utf8.ValidString(body) {
+		t.Fatalf("%s 正文段字节界限异常: len=%d validUTF8=%v", name, len(body), utf8.ValidString(body))
+	}
 }
 
 func assertConfirmRender(
@@ -215,20 +346,23 @@ func assertBilingualTextPrompts(t *testing.T, ctx context.Context, enLoc, zhLoc 
 	if err != nil {
 		t.Fatalf("NewTextPromptRequest 失败: %v", err)
 	}
-	enUI, enOut := newTestStreamUI(t, "123456\n", enLoc)
-	if got, err := enUI.PromptText(ctx, localReq); err != nil || got != "123456" {
-		t.Fatalf("en PromptText = (%q, %v)", got, err)
+	assertTextPromptRender(t, ctx, enLoc, localReq, "123456", "SSH Challenge: (node-1) Response: ")
+	assertTextPromptRender(t, ctx, zhLoc, localReq, "123456", "SSH 身份验证质询: (node-1) 请输入应答： ")
+
+	// 携带远端横幅的空问题质询（KeyInteractChallengeBannerResponse）在 EN/ZH 下均保留横幅并本地化应答尾缀。
+	bannerBody := domi18n.NewMessage(domi18n.KeyInteractChallengeBannerResponse, domi18n.BoundStr("banner", "PAM MFA Notice"))
+	bannerReq, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
+		Title:        tTitle.Canonical(),
+		Prompt:       bannerBody.Canonical(),
+		Subject:      "node-1",
+		TitleMessage: algebraic.Some(tTitle),
+		BodyMessage:  algebraic.Some(bannerBody),
+	})
+	if err != nil {
+		t.Fatalf("NewTextPromptRequest(banner) 失败: %v", err)
 	}
-	if want := "SSH Challenge: (node-1) Response: "; enOut.String() != want {
-		t.Fatalf("en PromptText 提示 = %q, 期望 %q", enOut.String(), want)
-	}
-	zhUI, zhOut := newTestStreamUI(t, "123456\n", zhLoc)
-	if got, err := zhUI.PromptText(ctx, localReq); err != nil || got != "123456" {
-		t.Fatalf("zh PromptText = (%q, %v)", got, err)
-	}
-	if want := "SSH 身份验证质询: (node-1) 请输入应答： "; zhOut.String() != want {
-		t.Fatalf("zh PromptText 提示 = %q, 期望 %q", zhOut.String(), want)
-	}
+	assertTextPromptRender(t, ctx, enLoc, bannerReq, "111222", "SSH Challenge: (node-1) PAM MFA Notice | Response: ")
+	assertTextPromptRender(t, ctx, zhLoc, bannerReq, "111222", "SSH 身份验证质询: (node-1) PAM MFA Notice | 请输入应答： ")
 
 	// 远端 SSH PAM 质询（BodyMessage=None）仅本地化标题，远端提示原文脱敏透传。
 	remoteReq, err := ports.NewTextPromptRequest(ports.TextPromptRequestSpec{
@@ -241,12 +375,24 @@ func assertBilingualTextPrompts(t *testing.T, ctx context.Context, enLoc, zhLoc 
 	if err != nil {
 		t.Fatalf("NewTextPromptRequest(remote PAM) 失败: %v", err)
 	}
-	zhRemUI, zhRemOut := newTestStreamUI(t, "654321\n", zhLoc)
-	if got, err := zhRemUI.PromptText(ctx, remoteReq); err != nil || got != "654321" {
-		t.Fatalf("zh remote PAM PromptText = (%q, %v)", got, err)
+	assertTextPromptRender(t, ctx, zhLoc, remoteReq, "654321", "SSH 身份验证质询: (bastion) OTP verification code: ")
+}
+
+func assertTextPromptRender(
+	t *testing.T,
+	ctx context.Context,
+	loc *i18n.Localizer,
+	req ports.TextPromptRequest,
+	wantVal string,
+	wantPrompt string,
+) {
+	t.Helper()
+	ui, out := newTestStreamUI(t, wantVal+"\n", loc)
+	if got, err := ui.PromptText(ctx, req); err != nil || got != wantVal {
+		t.Fatalf("PromptText = (%q, %v), 期望 (%q, nil)", got, err, wantVal)
 	}
-	if want := "SSH 身份验证质询: (bastion) OTP verification code: "; zhRemOut.String() != want {
-		t.Fatalf("zh remote PAM 提示 = %q, 期望 %q", zhRemOut.String(), want)
+	if out.String() != wantPrompt {
+		t.Fatalf("PromptText 提示不匹配:\n got: %q\nwant: %q", out.String(), wantPrompt)
 	}
 }
 
@@ -271,8 +417,23 @@ func assertBilingualSecretPrompts(t *testing.T, ctx context.Context, enLoc, zhLo
 	assertSecretPromptRender(t, ctx, enLoc, privReq, tck.TestSecretTokenA, "Privilege Escalation: (db-01) Enter sudo password for db-01 ")
 	assertSecretPromptRender(t, ctx, zhLoc, privReq, tck.TestSecretTokenA, "权限提升认证: (db-01) 请输入节点 db-01 的 sudo 提权密码 ")
 
-	// 远端无回显 SSH PAM 质询（BodyMessage=None）在中文模式下须保持远端 PAM 原文不变。
+	// 无回显横幅质询（KeyInteractChallengeBannerResponse）在 EN/ZH 下均保留横幅并本地化应答尾缀。
 	pamTitle := domi18n.NewMessage(domi18n.KeyInteractSSHChallengeTitle)
+	bannerBody := domi18n.NewMessage(domi18n.KeyInteractChallengeBannerResponse, domi18n.BoundStr("banner", "PAM MFA Notice"))
+	bannerSecReq, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
+		Title:        pamTitle.Canonical(),
+		Prompt:       bannerBody.Canonical(),
+		Subject:      "prod-edge",
+		TitleMessage: algebraic.Some(pamTitle),
+		BodyMessage:  algebraic.Some(bannerBody),
+	})
+	if err != nil {
+		t.Fatalf("NewSecretPromptRequest(banner) 失败: %v", err)
+	}
+	assertSecretPromptRender(t, ctx, enLoc, bannerSecReq, tck.TestSecretTokenA, "SSH Challenge: (prod-edge) PAM MFA Notice | Response: ")
+	assertSecretPromptRender(t, ctx, zhLoc, bannerSecReq, tck.TestSecretTokenA, "SSH 身份验证质询: (prod-edge) PAM MFA Notice | 请输入应答： ")
+
+	// 远端无回显 SSH PAM 质询（BodyMessage=None）在中文模式下须保持远端 PAM 原文不变。
 	pamReq, err := ports.NewSecretPromptRequest(ports.SecretPromptRequestSpec{
 		Title:        pamTitle.Canonical(),
 		Prompt:       "Duo Push or Passcode:",
@@ -340,9 +501,9 @@ func TestInteractionSetLocalizerHotSwapAndFallback(t *testing.T) {
 		t.Fatalf("NewConfirmRequest 失败: %v", err)
 	}
 
-	// StreamSpec.Localizer == nil 时自动回退英文；随后依次热切至中文、nil、无效零值 Localizer。
+	// StreamSpec.Localizer == nil 时自动回退英文；随后依次热切至中文、nil、再次切中文再传无效零值 Localizer 验证失败关闭回退。
 	var invalidLoc i18n.Localizer
-	ui, out := newTestStreamUI(t, "n\nn\nn\nn\n", nil)
+	ui, out := newTestStreamUI(t, "n\nn\nn\nn\nn\n", nil)
 	steps := []struct {
 		name string
 		set  func()
@@ -351,6 +512,7 @@ func TestInteractionSetLocalizerHotSwapAndFallback(t *testing.T) {
 		{"initial-nil-default-en", func() {}, "[moderate] ControlMaster Confirmation: Start ControlMaster listener [y/N]: "},
 		{"hotswap-zh", func() { ui.SetLocalizer(zhLoc) }, "[中等风险] ControlMaster 确认: 是否启动 ControlMaster 监听器 [y/N]: "},
 		{"reset-nil-en", func() { ui.SetLocalizer(nil) }, "[moderate] ControlMaster Confirmation: Start ControlMaster listener [y/N]: "},
+		{"hotswap-zh-before-invalid", func() { ui.SetLocalizer(zhLoc) }, "[中等风险] ControlMaster 确认: 是否启动 ControlMaster 监听器 [y/N]: "},
 		{"reset-invalid-en", func() { ui.SetLocalizer(&invalidLoc) }, "[moderate] ControlMaster Confirmation: Start ControlMaster listener [y/N]: "},
 	}
 	for _, st := range steps {
@@ -415,6 +577,12 @@ func TestInteractionStructuredErrorsBilingual(t *testing.T) {
 
 	_, errNilFiles := interact.NewFileInteraction(nil, nil)
 	_, errNilStream := interact.NewStreamInteraction(interact.StreamSpec{})
+	var invalidLoc i18n.Localizer
+	_, errInvalidLoc := interact.NewStreamInteraction(interact.StreamSpec{
+		In:        strings.NewReader(""),
+		Out:       &bytes.Buffer{},
+		Localizer: &invalidLoc,
+	})
 
 	var zeroConfirm ports.ConfirmRequest
 	var zeroApproval security.ApprovalEnvelope
@@ -441,6 +609,7 @@ func TestInteractionStructuredErrorsBilingual(t *testing.T) {
 	}{
 		{"nil_files", errNilFiles, ports.ErrInvalidArgument, i18n.KeyInteractNilFileHandles},
 		{"nil_stream", errNilStream, ports.ErrInvalidArgument, i18n.KeyInteractNilStreamHandles},
+		{"invalid_localizer", errInvalidLoc, ports.ErrInvalidArgument, i18n.KeyInteractInvalidRequest},
 		{"zero_confirm", errZeroConfirm, ports.ErrInvalidArgument, i18n.KeyInteractInvalidRequest},
 		{"zero_approval", errZeroApproval, ports.ErrInvalidArgument, i18n.KeyInteractInvalidRequest},
 		{"zero_text", errZeroText, ports.ErrInvalidArgument, i18n.KeyInteractInvalidRequest},

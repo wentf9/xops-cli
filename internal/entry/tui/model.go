@@ -214,14 +214,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// applyHaltedState 单调锁存安全门控熔断态；同时携带结构化 Err 与文本 Reason 时保留规范化后的 Reason，
+// 以便在 Err 渲染为空白时仍可回退展示 Reason（均为空时由 View 回退默认本地化原因）。
 func (m *Model) applyHaltedState(msg HaltedStateMsg) {
 	m.gateHalted = true
+	reason := strings.TrimSpace(msg.Reason)
 	if msg.Err != nil {
 		m.haltErr = msg.Err
-		m.haltReason = ""
-	} else if strings.TrimSpace(msg.Reason) != "" {
+		m.haltReason = reason
+	} else if reason != "" {
 		m.haltErr = nil
-		m.haltReason = msg.Reason
+		m.haltReason = reason
 	}
 	m.statusMsg = i18n.NewMessage(i18n.KeyTUIStatusGateHalted)
 }

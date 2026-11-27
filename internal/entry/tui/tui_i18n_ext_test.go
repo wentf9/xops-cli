@@ -286,6 +286,24 @@ func TestModel_HaltedBannerVariantsAndFailClosedEdgeCases(t *testing.T) {
 	m = sendMsgToModel(m, tui.HaltedStateMsg{Reason: "disk full"})
 	assertContainsAll(t, "ZH raw reason halt", m.View().Content, "安全门控已熔断：disk full")
 
+	// 2b. 同时传 Err（渲染为空白）与非空 Reason 时，须保留 Reason 作为回退，而非过早退回默认熔断文案。
+	m = sendMsgToModel(m, tui.HaltedStateMsg{Err: errors.New("   "), Reason: "  audit fsync fallback  "})
+	assertContainsAll(t, "ZH blank err fallback to reason", m.View().Content, "安全门控已熔断：audit fsync fallback")
+	assertContainsNone(t, "ZH blank err must not drop reason", m.View().Content, "审计落盘失败")
+	m = pressKey(m, tea.KeyPressMsg{Code: 'L', Text: "L"})
+	assertContainsAll(t, "EN blank err fallback to reason", m.View().Content, "SECURITY GATE HALTED: audit fsync fallback")
+	assertContainsNone(t, "EN blank err must not drop reason", m.View().Content, "audit post-write failure")
+
+	// 2c. 同时传有效结构化 Err 与 Reason 时优先本地化渲染 Err；新消息均为空白 Err + 空 Reason 时清理旧 Reason 并回退默认原因。
+	m = sendMsgToModel(m, tui.HaltedStateMsg{Err: context.DeadlineExceeded, Reason: "secondary fallback"})
+	assertContainsAll(t, "EN structured err priority", m.View().Content, "SECURITY GATE HALTED: context deadline exceeded")
+	assertContainsNone(t, "EN structured err suppresses fallback", m.View().Content, "secondary fallback")
+	m = sendMsgToModel(m, tui.HaltedStateMsg{Err: errors.New(""), Reason: ""})
+	assertContainsAll(t, "EN empty err+reason default halt", m.View().Content, "SECURITY GATE HALTED: audit post-write failure")
+	assertContainsNone(t, "EN empty err+reason clears stale reason", m.View().Content, "secondary fallback")
+	m = pressKey(m, tea.KeyPressMsg{Code: 'L', Text: "L"})
+	assertContainsAll(t, "ZH empty err+reason default halt", m.View().Content, "安全门控已熔断：审计落盘失败")
+
 	// 3. 无效 StreamKind 严格失败关闭（不污染状态与流活跃标志）。
 	var zeroKind tui.StreamKind
 	if zeroKind.IsValid() || !zeroKind.IsZero() || zeroKind.LabelKey().IsValid() {

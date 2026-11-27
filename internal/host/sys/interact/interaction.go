@@ -19,7 +19,8 @@ import (
 )
 
 // StreamSpec 是构造基于自定义输入/输出流的确定性 Interaction 的显式入参规格（供 TCK 与单元测试使用）。
-// Localizer 为可选配置；为 nil 或无效时自动回退至内置英文默认 Localizer。
+// Localizer 为可选配置：为 nil 时自动回退至内置英文默认 Localizer；
+// 若传入非 nil 但未初始化或无效的 *i18n.Localizer，NewStreamInteraction 严格失败关闭返回 ports.ErrInvalidArgument。
 type StreamSpec struct {
 	In          io.Reader
 	Out         io.Writer
@@ -84,9 +85,13 @@ func NewFileInteraction(in, out *os.File) (*Interaction, error) {
 }
 
 // NewStreamInteraction 构造基于内存/管道流的确定性交互适配器，供 TCK 与上层测试驱动。
+// 若 spec.Localizer 非 nil 但无效（!spec.Localizer.IsValid()），严格失败关闭返回 ports.ErrInvalidArgument。
 func NewStreamInteraction(spec StreamSpec) (*Interaction, error) {
 	if spec.In == nil || spec.Out == nil {
 		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyInteractNilStreamHandles)
+	}
+	if spec.Localizer != nil && !spec.Localizer.IsValid() {
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyInteractInvalidRequest, i18n.Str("kind", "StreamSpec.Localizer"))
 	}
 	ui := &Interaction{
 		streamMode:  true,
@@ -100,7 +105,10 @@ func NewStreamInteraction(spec StreamSpec) (*Interaction, error) {
 }
 
 // SetLocalizer 并发安全地热切换当前交互适配器使用的本地化渲染器（供 TUI 切换语言后同步 SSH 接管提示）。
-// 接收者为 nil 或未初始化时安全忽略；传入 nil 或无效 Localizer 时回退至规范英文渲染器。
+// 契约约定：
+//   - 接收者为 nil 或未初始化零值时安全忽略（保持失败关闭）；
+//   - 传入有效 *i18n.Localizer 时原子切换为新渲染器；
+//   - 传入 nil（显式重置）或非 nil 无效 *i18n.Localizer（失败关闭降级）均原子重置为内置规范英文回退渲染器。
 func (i *Interaction) SetLocalizer(loc *i18n.Localizer) {
 	if i == nil || !i.valid {
 		return
@@ -318,22 +326,18 @@ func finishStreamLineOnErr(out []byte, err error) ([]byte, error) {
 func formatConfirmPrompt(loc *i18n.Localizer, req ports.ConfirmRequest) string {
 	var b strings.Builder
 	b.WriteString("[")
-	b.WriteString(security.SanitizePromptText(localizeRiskLevel(loc, req.Risk())))
+	b.WriteString(boundPromptSegment(localizeRiskLevel(loc, req.Risk()), maxInteractTitleBytes))
 	b.WriteString("] ")
-	if title := security.SanitizePromptText(renderOptionalMessage(loc, req.TitleMessage(), req.Title())); title != "" {
+	if title := renderOptionalMessage(loc, req.TitleMessage(), req.Title(), maxInteractTitleBytes); title != "" {
 		b.WriteString(title)
 		b.WriteString(": ")
 	}
-	if req.Subject() != "" {
+	if subject := boundPromptSegment(req.Subject(), maxInteractTitleBytes); subject != "" {
 		b.WriteString("(")
-		b.WriteString(security.SanitizePromptText(req.Subject()))
+		b.WriteString(subject)
 		b.WriteString(") ")
 	}
-	body := security.SanitizePromptText(renderOptionalMessage(loc, req.BodyMessage(), req.Message()))
-	if body == "" {
-		body = security.SanitizePromptText(req.Message())
-	}
-	b.WriteString(body)
+	b.WriteString(renderOptionalMessage(loc, req.BodyMessage(), req.Message(), maxInteractBodyBytes))
 	b.WriteString(" [y/N]: ")
 	return b.String()
 }
@@ -341,13 +345,13 @@ func formatConfirmPrompt(loc *i18n.Localizer, req ports.ConfirmRequest) string {
 func formatApprovalPrompt(loc *i18n.Localizer, env security.ApprovalEnvelope, dig security.Digest) string {
 	var b strings.Builder
 	b.WriteString("[")
-	b.WriteString(security.SanitizePromptText(localizeLabel(loc, i18n.KeyInteractApprovalBanner, "APPROVAL")))
+	b.WriteString(boundPromptSegment(localizeLabel(loc, i18n.KeyInteractApprovalBanner, "APPROVAL"), maxInteractTitleBytes))
 	b.WriteString(" ")
-	b.WriteString(security.SanitizePromptText(localizeRiskLevel(loc, env.Risk())))
+	b.WriteString(boundPromptSegment(localizeRiskLevel(loc, env.Risk()), maxInteractTitleBytes))
 	b.WriteString("] ")
 	b.WriteString(security.SanitizePromptText(env.ScopeSummary()))
 	b.WriteString(" (")
-	b.WriteString(security.SanitizePromptText(localizeLabel(loc, i18n.KeyInteractApprovalDigestLabel, "digest")))
+	b.WriteString(boundPromptSegment(localizeLabel(loc, i18n.KeyInteractApprovalDigestLabel, "digest"), maxInteractTitleBytes))
 	b.WriteString("=")
 	b.WriteString(security.SanitizePromptText(dig.String()))
 	b.WriteString(") [approve/N]: ")
@@ -363,19 +367,16 @@ func formatTextPrompt(
 	fallbackBody string,
 ) string {
 	var b strings.Builder
-	if title := security.SanitizePromptText(renderOptionalMessage(loc, titleMsg, fallbackTitle)); title != "" {
+	if title := renderOptionalMessage(loc, titleMsg, fallbackTitle, maxInteractTitleBytes); title != "" {
 		b.WriteString(title)
 		b.WriteString(": ")
 	}
-	if subject != "" {
+	if cleanSubj := boundPromptSegment(subject, maxInteractTitleBytes); cleanSubj != "" {
 		b.WriteString("(")
-		b.WriteString(security.SanitizePromptText(subject))
+		b.WriteString(cleanSubj)
 		b.WriteString(") ")
 	}
-	sanitized := security.SanitizePromptText(renderOptionalMessage(loc, bodyMsg, fallbackBody))
-	if sanitized == "" {
-		sanitized = security.SanitizePromptText(fallbackBody)
-	}
+	sanitized := renderOptionalMessage(loc, bodyMsg, fallbackBody, maxInteractBodyBytes)
 	b.WriteString(sanitized)
 	if !strings.HasSuffix(sanitized, " ") {
 		b.WriteString(" ")
@@ -383,13 +384,21 @@ func formatTextPrompt(
 	return b.String()
 }
 
-func renderOptionalMessage(loc *i18n.Localizer, opt algebraic.Option[domi18n.Message], fallback string) string {
+// renderOptionalMessage 渲染可选结构化提示消息并在渲染端执行脱敏与 UTF-8 安全字节截断；
+// 渲染结果为空白时回退至受同上界约束的规范英文 fallback。
+func renderOptionalMessage(loc *i18n.Localizer, opt algebraic.Option[domi18n.Message], fallback string, maxBytes int) string {
 	if msg, ok := opt.Get(); ok && msg.IsValid() {
-		if rendered := loc.Render(msg); rendered != "" {
+		if rendered := boundPromptSegment(loc.Render(msg), maxBytes); strings.TrimSpace(rendered) != "" {
 			return rendered
 		}
 	}
-	return fallback
+	return boundPromptSegment(fallback, maxBytes)
+}
+
+// boundPromptSegment 对单段提示文本执行控制/Bidi 字符脱敏与按完整 UTF-8 rune 边界的字节封顶，
+// 作为渲染端纵深防御（确保任意词库模板展开结果均安全、有效 UTF-8 且不超过 maxBytes）。
+func boundPromptSegment(raw string, maxBytes int) string {
+	return domi18n.BoundDisplayText(security.SanitizePromptText(raw), maxBytes)
 }
 
 func localizeRiskLevel(loc *i18n.Localizer, risk security.RiskLevel) string {
