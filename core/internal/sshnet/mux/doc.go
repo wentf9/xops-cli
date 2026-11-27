@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
@@ -48,6 +49,9 @@ type Config struct {
 	SelfPID uint32
 	// OnActivity 可选在 ControlMaster 收到活跃客户端请求时回调（供上层刷新 ControlPersist 空闲计时器）。
 	OnActivity func()
+	// OnSocketActivity 可选在 ControlMaster 收到活跃客户端请求或客户端断开时回调，
+	// 携带与当前 Serve 生命周期绑定的 ctx 与监听套接字地址，供上层按套接字无死锁刷新 ControlPersist 计时器。
+	OnSocketActivity func(ctx context.Context, socketAddr string)
 	// ProxyHandler 可选定制 Serve 收到 MUX_C_PROXY 后的双向代理流处理逻辑。
 	ProxyHandler ProxyHandler
 }
@@ -61,7 +65,10 @@ type MuxSocket struct {
 	handshakeTimeout time.Duration
 	selfPID          uint32
 	onActivity       func()
+	onSocketActivity func(ctx context.Context, socketAddr string)
 	proxyHandler     ProxyHandler
+	boundMu          sync.Mutex
+	boundPaths       map[string]string
 	valid            bool
 }
 
@@ -80,9 +87,42 @@ func NewMuxSocket(cfg Config) *MuxSocket {
 		handshakeTimeout: timeout,
 		selfPID:          pid,
 		onActivity:       cfg.OnActivity,
+		onSocketActivity: cfg.OnSocketActivity,
 		proxyHandler:     cfg.ProxyHandler,
+		boundPaths:       make(map[string]string),
 		valid:            true,
 	}
+}
+
+func (m *MuxSocket) registerBoundPath(rawAddr, canonical string) {
+	if rawAddr == "" || canonical == "" {
+		return
+	}
+	m.boundMu.Lock()
+	m.boundPaths[rawAddr] = canonical
+	m.boundMu.Unlock()
+}
+
+func (m *MuxSocket) unregisterBoundPath(rawAddr string) {
+	if rawAddr == "" {
+		return
+	}
+	m.boundMu.Lock()
+	delete(m.boundPaths, rawAddr)
+	m.boundMu.Unlock()
+}
+
+func (m *MuxSocket) resolveBoundPath(rawAddr string) string {
+	if rawAddr == "" {
+		return ""
+	}
+	m.boundMu.Lock()
+	canonical, ok := m.boundPaths[rawAddr]
+	m.boundMu.Unlock()
+	if ok && canonical != "" {
+		return canonical
+	}
+	return rawAddr
 }
 
 func (m *MuxSocket) checkReady(ctx context.Context) error {
@@ -124,6 +164,14 @@ func (m *MuxSocket) WithListener(ctx context.Context, socketPath pathalg.LocalSo
 		return err
 	}
 	err = osfs.WithSocketSlot(ctx, ctrlPath, osfs.SocketSlotOptions{ReplaceStale: !m.keepStale}, func(slot *osfs.SocketSlot) error {
+		rawAddr := ""
+		if lnAddr := slot.Listener().Addr(); lnAddr != nil {
+			rawAddr = lnAddr.String()
+		}
+		if rawAddr != "" {
+			m.registerBoundPath(rawAddr, slot.Path().NativePath())
+			defer m.unregisterBoundPath(rawAddr)
+		}
 		return fn(slot.Listener())
 	})
 	return mapSlotBindError(err)

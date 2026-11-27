@@ -41,6 +41,7 @@ type Engine struct {
 	scopedFS                      ports.ScopedRootFS
 	bus                           *events.SystemBus
 	hostTrustObs                  *hostTrustObserver
+	muxActivity                   *muxActivityHub
 	pool                          *pool.Pool
 	gate                          *gate.Gate
 	inventory                     *ucinv.Service
@@ -93,7 +94,8 @@ func New(cfg Config) (eng *Engine, err error) {
 	if err != nil {
 		return nil, err
 	}
-	rp, err := resolveDefaultPorts(cfg)
+	muxActivity := newMuxActivityHub()
+	rp, err := resolveDefaultPorts(cfg, muxActivity)
 	if err != nil {
 		return nil, err
 	}
@@ -125,7 +127,7 @@ func New(cfg Config) (eng *Engine, err error) {
 	opCtx, opCancel = context.WithCancelCause(context.Background())
 	eng = &Engine{
 		initialized: true, ownsBus: ownsBus, clock: cfg.Clock, entropy: cfg.Entropy, scopedFS: cfg.ScopedFS,
-		bus: bus, hostTrustObs: hostTrustObs, pool: p, gate: g, opCtx: opCtx, opCancel: opCancel,
+		bus: bus, hostTrustObs: hostTrustObs, muxActivity: muxActivity, pool: p, gate: g, opCtx: opCtx, opCancel: opCancel,
 		mcpServers: map[*MCPServer]struct{}{}, projections: map[*Projection]struct{}{},
 	}
 	return eng, eng.initServices(cfg, rp)
@@ -182,6 +184,7 @@ func (e *Engine) initServices(cfg Config, rp resolvedPorts) (err error) {
 	}); err != nil {
 		return wrapCfgErr("初始化会话服务失败", err)
 	}
+	e.muxActivity.bind(e.session)
 	return e.initTransferAutoObsServices(cfg, rp)
 }
 func (e *Engine) initTransferAutoObsServices(cfg Config, rp resolvedPorts) (err error) {
@@ -303,6 +306,7 @@ func (e *Engine) shutdownReverseOrder(ctx context.Context) error {
 		errs = append(errs, proj.Close())
 	}
 	e.opCancel(ErrEngineClosed)
+	e.muxActivity.clear()
 	if waitCh != nil {
 		select {
 		case <-waitCh:

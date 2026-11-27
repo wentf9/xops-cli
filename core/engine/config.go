@@ -268,7 +268,7 @@ func resolveDefaultKeySigner(cfg Config) (ports.KeySignerPort, error) {
 
 // resolveDefaultPorts 为未显式注入的可选协议端口装配真实 sshnet/* 生产默认实现；
 // 凡调用方显式注入的端口槽位均原样保留，确保仿真测试与上层宿主覆写 100% 兼容。
-func resolveDefaultPorts(cfg Config) (rp resolvedPorts, err error) {
+func resolveDefaultPorts(cfg Config, activity *muxActivityHub) (rp resolvedPorts, err error) {
 	if rp.keySigner, err = resolveDefaultKeySigner(cfg); err != nil {
 		return resolvedPorts{}, err
 	}
@@ -293,7 +293,11 @@ func resolveDefaultPorts(cfg Config) (rp resolvedPorts, err error) {
 	}
 	rp.muxSocket = cfg.MuxSocket
 	if rp.muxSocket == nil {
-		rp.muxSocket = mux.NewMuxSocket(mux.Config{Clock: cfg.Clock})
+		var onSocketActivity func(context.Context, string)
+		if activity != nil {
+			onSocketActivity = activity.notify
+		}
+		rp.muxSocket = mux.NewMuxSocket(mux.Config{Clock: cfg.Clock, OnSocketActivity: onSocketActivity})
 	}
 	return rp, nil
 }

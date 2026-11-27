@@ -120,7 +120,13 @@ func (e *Engine) StopForward(ctx context.Context, handle plan.ManagedHandle[plan
 }
 func (e *Engine) StartControlMaster(ctx context.Context, req ControlMasterRequest) (ControlMasterInfo, error) {
 	return runTargetOp(e, ctx, req.RemoteCall, func(c context.Context, r ResolvedTarget) (ControlMasterInfo, error) {
-		return e.session.StartControlMaster(c, ucsess.ControlMasterRequest{Plan: r.Plan(), NodeID: r.NodeID(), Risk: req.Risk, Approval: req.Approval, OperationStream: req.OperationStream})
+		info, err := e.session.StartControlMaster(c, ucsess.ControlMasterRequest{Plan: r.Plan(), NodeID: r.NodeID(), Risk: req.Risk, Approval: req.Approval, OperationStream: req.OperationStream})
+		if err == nil && !info.ReusedExisting() {
+			if h, ok := info.Handle().Get(); ok && h.IsValid() {
+				e.muxActivity.register(info.SocketPath().String(), h)
+			}
+		}
+		return info, err
 	})
 }
 func (e *Engine) InspectControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) (ControlMasterStatus, error) {
@@ -130,6 +136,7 @@ func (e *Engine) TouchControlMaster(ctx context.Context, handle plan.ManagedHand
 	return callSessErr(e, ctx, (*ucsess.Service).TouchControlMaster, handle)
 }
 func (e *Engine) StopControlMaster(ctx context.Context, handle plan.ManagedHandle[plan.KindMux]) error {
+	e.muxActivity.unregisterHandle(handle)
 	return callSessErr(e, ctx, (*ucsess.Service).StopControlMaster, handle)
 }
 func (e *Engine) ProbeMux(ctx context.Context, req MuxControlRequest) (MuxControlResponse, error) {

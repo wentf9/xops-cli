@@ -31,6 +31,7 @@ type forwardEntry struct {
 //   - CStopListening (-O stop): 仅停止接受新连接，允许已在途的复用会话与流平滑排空完成后自然退出。
 type muxServerState struct {
 	owner            *MuxSocket
+	socketAddr       string
 	upstream         ports.TransportConn
 	forwarder        ports.ForwarderPort
 	cancelServe      context.CancelFunc
@@ -45,6 +46,18 @@ type muxServerState struct {
 
 func (st *muxServerState) triggerStopListening() {
 	st.stopListenOnce.Do(func() { close(st.stopListenCh) })
+}
+
+func (st *muxServerState) notifyActivity(ctx context.Context) {
+	if st.stoppedByControl.Load() {
+		return
+	}
+	if st.owner.onActivity != nil {
+		st.owner.onActivity()
+	}
+	if st.owner.onSocketActivity != nil && st.socketAddr != "" && ctx.Err() == nil {
+		st.owner.onSocketActivity(ctx, st.socketAddr)
+	}
 }
 
 // Serve 在借用的 net.Listener（须经参数级 //xops:borrowed 确保零逃逸）上运行 OpenSSH PROTOCOL.mux v4
@@ -65,11 +78,16 @@ func (m *MuxSocket) Serve(
 	if !upstream.IsAlive() {
 		return ports.ErrClosed
 	}
+	socketAddr := ""
+	if ln.Addr() != nil {
+		socketAddr = m.resolveBoundPath(ln.Addr().String())
+	}
 	serveCtx, cancelServe := context.WithCancel(ctx)
 	defer cancelServe()
 
 	st := &muxServerState{
 		owner:        m,
+		socketAddr:   socketAddr,
 		upstream:     upstream,
 		forwarder:    forwarder,
 		cancelServe:  cancelServe,
@@ -199,9 +217,8 @@ func (st *muxServerState) handleClientConn(ctx context.Context, conn net.Conn) {
 	if _, err := muxstream.ReadHello(conn); err != nil {
 		return
 	}
-	if st.owner.onActivity != nil {
-		st.owner.onActivity()
-	}
+	st.notifyActivity(ctx)
+	defer st.notifyActivity(ctx)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -210,9 +227,7 @@ func (st *muxServerState) handleClientConn(ctx context.Context, conn net.Conn) {
 		if err != nil {
 			return
 		}
-		if st.owner.onActivity != nil {
-			st.owner.onActivity()
-		}
+		st.notifyActivity(ctx)
 		if stop, _ := st.dispatchPacket(ctx, conn, msgType, body); stop {
 			return
 		}
