@@ -2,9 +2,9 @@
 
 XOps v2 采用 **Go 1.27+**（`CGO_ENABLED=0`）与三模块 Go Workspace（[`go.work`](../../go.work)）：
 
-- 根 CLI 模块（[`go.mod`](../../go.mod)）：本机宿主适配器 `internal/host/**`、入站入口 `internal/entry/**` 与唯一组合根 `cmd/xops`；
-- 六边形核心模块（[`core/go.mod`](../../core/go.mod)）：无宿主假设的核心契约、运行期与领域模型；
-- 自建静态分析器模块（[`tools/xopsvet/go.mod`](../../tools/xopsvet/go.mod)）：9 大正交架构/安全/并发编译器护栏。
+- 根 CLI 模块（[`go.mod`](../../go.mod)）：纯叶层国际化词库 `internal/i18n`、本机宿主适配器 `internal/host/**`、入站入口 `internal/entry/**` 与唯一组合根 `cmd/xops`；
+- 六边形核心模块（[`core/go.mod`](../../core/go.mod)）：无宿主假设的核心契约、运行期与领域模型（含纯数据延迟本地化绝对叶包 `core/domain/i18n`）；
+- 自建静态分析器模块（[`tools/xopsvet/go.mod`](../../tools/xopsvet/go.mod)）：10 大正交架构/安全/并发/国际化编译器护栏。
 
 全仓开发与架构约束以仓库根目录的 **[工程宪法与 AI 协作规范（AGENTS.md）](../../AGENTS.md)** 为最高事实源，严禁引入 v1 兼容垫片或长期 `replace`。
 
@@ -16,7 +16,7 @@ XOps v2 采用 **Go 1.27+**（`CGO_ENABLED=0`）与三模块 Go Workspace（[`go
 # 1. 全量三模块构建、xopsvet 护栏、golangci-lint 与竞态测试（等价于 make verify）
 go run ./scripts/ci/verify.go --stage=all
 
-# 2. Windows / macOS 跨平台交叉编译与交叉 Lint（等价于 make cross）
+# 2. Windows / macOS 跨平台交叉编译、跨平台 xopsvet 与交叉 Lint（等价于 make cross）
 go run ./scripts/ci/verify.go --stage=cross
 
 # 3. 确定性仿真门禁 DST（等价于 make dst）
@@ -34,10 +34,10 @@ npm run docs:check
 
 ## 活跃开发文档（XOps v2）
 
-根据 [AGENTS.md](../../AGENTS.md) 第 5 节约定，开发文档统一使用简体中文维护，不纳入面向用户的双语站点构建：
+根据 [AGENTS.md](../../AGENTS.md) 第 7 节约定，开发文档统一使用简体中文维护，不纳入面向用户的双语站点构建：
 
 - [工程宪法与 AI 协作规范（AGENTS.md）](../../AGENTS.md)
-- [XOps v2 全新架构定稿规范（Architecture RFC v2.3.3）](./v2-architecture-rfc.md)
+- [XOps v2 全新架构定稿规范（Architecture RFC）](./v2-architecture-rfc.md)
 - [XOps v2 全新架构分阶段实施计划（Implementation Plan）](./v2-implementation-plan.md)
 - [XOps v2 本地多平台测试与私有 CI 搭建指南](./v2-local-multiplatform-ci.md)
 - [文档维护指南](./docs.md)

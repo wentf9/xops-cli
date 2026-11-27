@@ -1,8 +1,8 @@
 # XOps v2 全新架构分阶段实施计划（Implementation Plan）
 
-> **关联架构宪法**：[XOps v2 全新架构定稿规范（Architecture RFC v2.3.3 校准终稿）](./v2-architecture-rfc.md)（ADR-001 – ADR-016）  
-> **计划状态**：**Phase 0 – Phase 5 全量收口完成**——Phase 0（`Gate G0-R2`）、Phase 1（`Gate G1`）、Phase 2（`P2-T1`–`P2-T6` + `Gate G2`）、Phase 2.5（`P2.5-T1`–`P2.5-T2` + `Gate G2.5` Walking Skeleton）、Phase 3（`P3-T1`–`P3-T5` + `Gate G3`）、Phase 4（`P4-T1`–`P4-T4` + `core/engine` 真实协议装配 + `Gate G4`）与 **Phase 5（`P5-T1`–`P5-T4` + `Gate G5`）** 均已全量完成（`core/v1.0.0` 已在根 `go.mod` 锁定正式版本，三模块全量 `--gowork-off` 验证通过，`core/ports` 零漂移，Gate G0/G0-R/G0-R2 → G1 → G2 → G2.5 → G3 ∥ G4 → G5 全部过闸闭环）  
-> **执行铁律**：**Go 1.27+** · 全仓 3 个 `go.mod` 零 `replace`（`core/` 与 `tools/xopsvet/` 全程 `GOWORK=off`，根 CLI 开发期经 `go.work`，打 **`core/v1.0.0`** Tag 发布时三模块全量 `GOWORK=off`）· **先筑 `xopsvet` 护栏与四端统一 `verify.go` CI 再写业务代码** · **Gate G2 后即交付 Walking Skeleton 纵向真机闭环** · 严禁新旧双轨补丁
+> **关联架构宪法**：[XOps v2 全新架构定稿规范（Architecture RFC）](./v2-architecture-rfc.md)（ADR-001 – ADR-017）  
+> **计划状态**：**Phase 0 – Phase 5 全量收口完成，后续演进全仓国际化（i18n）M1–M3 已闭环、M4 推进中**——Phase 0（`Gate G0-R2`）至 Phase 5（`Gate G5`，`core/v1.0.0` 已在根 `go.mod` 锁定）均已全量完成；v2 后续演进 **全仓国际化（i18n，Plan v2.2）** 已完成 M1（基础设施/10 大分析器/v2.1 修订）、M2（入口与交互层双语/TUI `L` 热切/命令感知 `--lang`）与 M3（全仓 `core` & `host` 迁移/1,506 双语词条/v2.2 无环叶包分解与规则 4–5 全仓合闸，`HEAD=3e054fa`），当前进入 M4（开发/用户文档与 Skill 同步，及待授权 `core/v1.1.0` 跨模块发版验收）  
+> **执行铁律**：**Go 1.27+** · 全仓 3 个 `go.mod` 零 `replace`（`core/` 与 `tools/xopsvet/` 全程 `GOWORK=off`，根 CLI 开发期经 `go.work`，打 `core/v1.x.y` Tag 发布时三模块全量 `GOWORK=off`）· **先筑 `xopsvet` 护栏与四端统一 `verify.go` CI 再写业务代码** · **Gate G2 后即交付 Walking Skeleton 纵向真机闭环** · 严禁新旧双轨补丁
 
 ---
 
@@ -10,7 +10,7 @@
 
 1. **隔离重构分支**：从定稿提交新建独立分支 `refactor/v2-architecture`（绝不在 `master` 或 `feat/openssh-compatibility` 上清场；旧代码随时可通过 `git show b15df20:<path>` 只读查阅客观领域规则）。
 2. **Commit 0 干净清场**：在 `refactor/v2-architecture` 首个提交中清零旧 Go 源码树（旧 `cmd/`、`pkg/`、`core/`、`internal/`），保留治理文档、跨平台验证骨架（`scripts/validation/`、`deploy/macos-vm/`）与 CI/Makefile 模板；随即在最终规范路径初始化 **Go 1.27+** 三模块工作区（`go.work`、`go.mod`、`core/go.mod`、`tools/xopsvet/go.mod`）。
-3. **护栏前置 + 纵向早验**：`Phase 0` 建成 `tools/xopsvet` 全部 **9 大正交分析器**（共享 `vetutil`/`vetssa`/`secretfact` 底座）、`scripts/ci/verify.go` 四端统一 CI SSOT 与 `core/conc` / `core/internal/foundation/{actor,trace}` 地基并通过 **`Gate G0-R`** 后方可进入 `Phase 1`；`Gate G2` 通过后立即进入 **`Phase 2.5 Walking Skeleton`** 在 Linux/Windows(ConPTY)/macOS 三平台真机实测最小 `xops ssh` 二进制并锁定端口契约，随后并行铺开 Phase 3 与 Phase 4。
+3. **护栏前置 + 纵向早验**：`Phase 0` 建成 `tools/xopsvet` 首批基础正交分析器（共享 `vetutil`/`vetssa`/`secretfact` 底座，后续 i18n M1 扩展为 **10 大正交分析器** 含 `i18nguard`）、`scripts/ci/verify.go` 四端统一 CI SSOT 与 `core/conc` / `core/internal/foundation/{actor,trace}` 地基并通过 **`Gate G0-R`** 后方可进入 `Phase 1`；`Gate G2` 通过后立即进入 **`Phase 2.5 Walking Skeleton`** 在 Linux/Windows(ConPTY)/macOS 三平台真机实测最小 `xops ssh` 二进制并锁定端口契约，随后并行铺开 Phase 3 与 Phase 4。
 4. **体量、复杂度与编码红线（ADR-001, ADR-013, ADR-014）**：单包生产代码上限 **3,000 LOC**；业务逻辑/状态机单文件上限 **500 LOC**，纯声明式文件（`*_spec.go` / `*_variants.go` / `*_codec.go`）上限 **800 LOC**；认知复杂度 **`gocognit <= 15`**；8 个特权包生产源码外（含全仓所有白盒与外置测试）**0 行内 `//nolint:`**；`core/domain/**` **100% 零 `sync` / `sync/atomic`**；持久化/序列化 DTO 禁裸 `time.Duration`；平台特异实现拆入构建标签文件以规避 `go/ssa` 死块剪枝。
 
 ---
@@ -22,7 +22,7 @@ flowchart TD
     G0_START["P0-T1: Go 1.27+ 三模块、scripts/ci/verify.go 四端 SSOT 与 Makefile/双 CI 对齐"] --> P0_VET_A["P0-T2: xopsvet 共享底座与规则组 A<br/>(vetutil/vetssa/secretfact / archbound含osfs_net四防线 / noimplicit含JSON-YAML DTO与按文件nolint / osboundary SSA)"]
     G0_START --> P0_VET_B["P0-T3: xopsvet 规则组 B<br/>(sumexhaust / failclosed含atomic.Bool与极性 / digestcover / secretbox / secrettaint Rule2 / linearlease SSA)"]
     G0_START --> P0_CONC["P0-T4: core/conc & foundation/{actor,trace}<br/>(Nursery双吸收态无私哨 / DualActor全路径stopCh优先+reset / trace显式io.Reader熵)"]
-    P0_VET_A --> GATE0{"Gate G0-R: 9分析器、CI SSOT与并发地基全绿"}
+    P0_VET_A --> GATE0{"Gate G0-R: 首批分析器、CI SSOT与并发地基全绿"}
     P0_VET_B --> GATE0
     P0_CONC --> GATE0
 
@@ -86,7 +86,7 @@ flowchart TD
 
 ## 3. 分阶段任务清单与验收门禁（28 个工作包，7 道硬门禁）
 
-### Phase 0：Go 1.27+ 多模块工作区、9 大正交编译器护栏、CI SSOT 与并发地基
+### Phase 0：Go 1.27+ 多模块工作区、正交编译器护栏基线、CI SSOT 与并发地基
 
 | 任务 ID | 工作包内容 | 目标路径 / 产物 | 关键不变量与 ADR |
 | :--- | :--- | :--- | :--- |
@@ -236,3 +236,47 @@ go run ./scripts/ci/verify.go --stage=dst
 - **Phase 3（全量用例服务、MCP 运行时与 `core/engine` 全量门面闭环，`Gate G3` 已通过且 `core/ports` 零漂移）**：`[x] P3-T1` · `[x] P3-T2` · `[x] P3-T3` · `[x] P3-T4` · `[x] P3-T5` · **`[x] Gate G3`**
 - **Phase 4（全量真实协议、本机宿主适配器、`core/engine` 真实默认装配与 Phase 5 就绪性闭环，`Gate G4` 已通过且 `core/ports` 零漂移）**：`[x] P4-T1` · `[x] P4-T2` · `[x] P4-T3` · `[x] P4-T4` · **`[x] Gate G4`**
 - **Phase 5（全量极薄入口、完整 `cmd/xops` 组合根、发布与文档收口，`core/v1.0.0` 已在根 `go.mod` 锁定且三模块 `--gowork-off` 与 `Gate G5` 已通过）**：`[x] P5-T1` · `[x] P5-T2` · `[x] P5-T3` · `[x] P5-T4` · **`[x] Gate G5`**
+
+---
+
+## 6. v2 后续演进：全仓国际化（i18n）M1–M4 实施记录
+
+在 Phase 0–5 全量收口后，依据 **ADR-017**（详见 [v2-architecture-rfc.md §6](./v2-architecture-rfc.md#6-全仓国际化i18n架构规范)）开展全仓双语（`en` / `zh`）国际化演进，严守零全局可变单例、零 `init()`、零新增第三方库、`core/domain` 纯数学无 I/O、`core/conc` 零仓内依赖、`--help`/`version` 零触盘、单包 `<= 3,000 LOC` / 单文件 `<= 500(800) LOC` / `gocognit <= 15` 与 **10 大静态分析器** 0 违例，按 **M1 → M2 → M3 → M4** 分阶段推进：
+
+### M1：基础设施、10 大分析器与 Plan v2.1 双路架构修订（`[x]` 已完成）
+- **核心与根模块底座**：
+  - 落地零仓内依赖绝对叶包 `core/domain/i18n`（`Locale`/`MessageID`/`Param`/`Message`/`Error`/`LocalizableNode` 与 `encoding/json/v2` 确定性编解码、5 组 Fuzz 测试）；
+  - 落地根模块纯叶层 `internal/i18n`（`LayerInternalI18n`、`embed_fs.go` 唯一六重门控只读 `//go:embed locales/*/*.yaml` `embed.FS`、`Entry.UnmarshalYAML` 严格节点解码、不可变 `Catalog` / `Localizer`、`DefaultLocalizer()` 纯内存零触盘兜底）；
+  - 落地 `internal/host/sys/locale*.go` 跨平台启动语种探测（`XOPS_LANG > LC_ALL > LC_MESSAGES > LANG > 平台 OS 区域 > en`，Windows 走局部 `kernel32.dll!GetUserDefaultLocaleName` 零包级 `var` + `proc.Find()` + `runtime.KeepAlive`，Unix/macOS 严守零 `os/exec` 零触盘）。
+- **静态护栏升级（9 → 10 大分析器）**：
+  - `tools/xopsvet` 新增第 10 分析器 `i18nguard`，并同步扩展 `archbound`（`LayerInternalI18n` 与 `time` 非确定性符号封禁）、`.golangci.yml` `i18n-decoupling`、`noimplicit`（六重门控只读 `embed.FS`、`i18n.Sentinel` 同域常量、跨包只读哨兵重导出）与 `secretfact`/`secrettaint`（全部 `i18n` 符号注册为 `SinkError`）。
+- **Plan v2.1 双路架构修订合入**：
+  - 统一错误链折叠代数下沉至 `core/domain/i18n/error_render.go`（显式 `SuppressedSentinels` + `WrapSentinel` + `RenderErrorChain`/`CanonicalError`，`internal/i18n/render_error.go` 退化为 3 钩子薄适配器，数学保证 `enLoc.RenderError(err) == err.Error()`）；
+  - 跨模块 `*WithFallback` 收拢为 4 个受控原语并下沉 `BoundDisplayText`/`BoundStr`；`secretfact`/`secrettaint` 强制汇点与 `//xops:syncclosure` 互斥并闭环闭包 `retMask != 0` 失败关闭拦截（含局部捕获型 IIFE）；`i18nguard` 规则 2 升级为强制自定义 `error` 实现匹配接收者集合的 `LocalizableNode`。
+
+### M2：入口与交互层端到端双语体验（`[x]` 已完成）
+- **交互端口与全部 13+ 处提示结构化**：`core/ports/interaction.go` 扩展可选 `TitleMessage`/`BodyMessage`（`algebraic.Option[domi18n.Message]`）并完成 `core/internal/{sshnet/dial,usecase/{inventory,session}}` 与 `internal/entry/cli/cmdasset/vault*.go` 全部 13+ 处构造点接入；`internal/host/sys/interact` 以 `atomic.Pointer[i18n.Localizer]` 实现并发安全热同步（保持 `ApprovalEnvelope.Digest()`、`ScopeSummary()` 与 ASCII `[y/N]`/`[approve/N]` 确认词不变）。
+- **命令感知 `--lang` 与 CLI / SFTP Shell / Daemon**：`internal/entry/cli/clikit` 实现 `ScanPreFlags` / `ScanLangFlag`（`ssh`/`exec` 遇 `--` 或首位置参数即止，杜绝误拦远端命令参数；末次覆盖；非法 `--lang` 失败关闭返 `ErrUsage`；`--help`/`version` 全路径零触盘）；全量 CLI 帮助、退出码诊断、`--json` `ErrorEnvelope.Error`（保留恒定规范英文 `error_code` 与 JSON 键）、SFTP Shell、`mcpcmd`/`muxdaemon` 迁移完成（保留 OpenSSH `-O` 与启动就绪行规范英文契约）。
+- **TUI 全状态延迟渲染与 `L` 实时热切换**：`internal/entry/tui` 将全部状态文本、错误、横幅、指标/日志标签、`?` 帮助与底栏推迟至 `View()` 实时渲染；新增大写 `L` 快捷键（过滤输入态守卫、与小写 `l` 日志流区分），经 `OnLocaleChange` 联动 `Interaction.SetLocalizer` 同步接管会话提示；同步将 `i18nguard` 规则 2/3 扩至 M2 入口与交互包。
+
+### M3：全仓 `core` & `host` 迁移、Plan v2.2 内部叶包分解与规则 4–5 合闸（`[x]` 已完成，基线 `3e054fa`）
+- **5 批次全仓结构化错误迁移（Wave 3A–3E）**：覆盖 `core/domain/**`、`core/{ports,events,osfs,conc}`、`core/internal/{foundation,pool,gate,sshnet/**,usecase/**,mcpruntime/**}`、`core/engine` 与 `internal/host/**` 共 **3,200+** 处生产错误构造调用（含 8 类核心/运行时自定义错误类型实现 `LocalizableNode`、`core/conc` 保持零仓内依赖规范英文并由 `internal/i18n.RenderError` 无侵入映射）；MCP 7 工具描述与 JSON-RPC 响应全面收口规范英文并补充零 Han 字符断言；双语镜像词库扩展至 11 对 YAML 文件共 **1,506** 条词条（`core` 889 含包内私有 `keyCommonDetail` + 根模块 617，100% 双射与占位符对称）。
+- **Plan v2.2 双路架构修订合入**：
+  1. **3,000 LOC 永久可扩展内部叶包分解**：`core/domain/i18n` 算法与兜底表下沉至零仓内依赖叶包 `internal/{textalg,errchain}` 及路由 + 5 域分片 `internal/corecatalog/{common,domain,ports,runtime,usecase}`，根模块兜底与键枚举下沉至零仓内依赖叶包 `internal/i18n/internal/rootcatalog`，`archbound` 锁死单向无环 DAG 及 `corecatalog/**`/`rootcatalog/**` 生产仅 `"slices"`；
+  2. **`keyCommonDetail` 私有化与 `i18nguard` 规则 4–5 全仓合闸**：导出 `WrapSentinelDetail` 与 `DynamicDetailError`（均注册 `secretfact` `SinkError`）；全仓生产源码强制启用 `i18nguard` 规则 1–5（规则 4 拦截动态原语常量字面量、`EF`/`WrapS` 传 `common.detail` 及哨兵语义吞噬；规则 5 拦截 `Str`/`BoundStr` 常量散文参数回流）；
+  3. **状态机/策略/诊断双轨本地化**：`core/internal/gate/internal/reasonmsg` 实现封闭规范英文原因 → `KeyGateReason*` 投影（`ApprovalEnvelope.Digest()` 0 字节变更），`fsm.ApprovalState` 进入挑战待审态保留 `reason`，`ApprovalChallengeError.ReasonParam` / `engine.ApprovalChallenge.ReasonParam` 跨层透传至 `clikit.Runtime.Fail` 与 `sftpshell`；`DoctorFinding`（`Localized`/`Cause` 均 `json:"-"`）、`openssh.StreamDiagnostic` 与 `inventory.ImportWarning` 落地单源双轨；
+  4. **`ensureErrorMessage` 缺失占位符闭环与跨平台 `xopsvet`**：接入 O(n) 零分配 `textalg.HasMissingPlaceholder` 快路径、`CollectFormatPlaceholderKeys` 必填抢救与 `<invalid>` 回填；`scripts/ci/verify.go --stage=cross` 纳入 Windows/macOS 跨平台 `go vet -vettool=bin/xopsvet`。
+- **本地 Linux 验收记录（`HEAD=3e054fa`）**：
+  - 已通过 `verify.go --stage=xopsvet`、`--stage=all`（`tools/xopsvet`、`core` `GOWORK=off`、根模块 `go.work`，10 大分析器与 `golangci-lint` 均 0 issues）、`--stage=cross`（Windows/macOS 交叉编译 + 跨平台 `xopsvet` + 交叉 Lint）、FreeBSD 交叉 `xopsvet`、`--stage=dst`（10,000 种子）、50 轮并发 `-race` 压测、`core/domain/i18n` 5 项 Fuzz 冒烟、`verify.go --self-test`、`test_ci_changes.py` 及全仓 98 个生产包体量红线巡检（最高 `core/osfs` 2,994 `<= 3,000`，逻辑文件 `<= 500`，`*_spec.go` `<= 800`，0 `//nolint:`，0 未格式化文件）。
+  - **未运行项（平台诚实声明）**：非 Linux 平台（Windows 原生 `GetUserDefaultLocaleName`/ConPTY/OSFS、macOS 原生 Runner、FreeBSD 原生 VM）实机测试与 `core/v1.1.0` 打标后 `--gowork-off` 独立发布验收尚未执行。
+
+### M4：文档/Skill 同步与待授权 `core/v1.1.0` 跨模块发版验收（`[~]` 进行中）
+- `[x]` 开发文档与工程宪法同步（`AGENTS.md`、`docs/development/{v2-architecture-rfc,v2-implementation-plan,index,v2-local-multiplatform-ci}.md`）。
+- `[ ]` 对外双语用户文档（`README.md`/`README_en.md`、`docs/guide/**` & `docs/en/guide/**`，不动旧版 `docs/reference/commands/`）与 `skills/xops-agent/**` 同步（独立工作流推进中）。
+- `[ ]` **待用户明确授权后执行**：打 `core/v1.1.0` Tag → 更新根 `go.mod` 锁定 `github.com/wentf9/xops-cli/core v1.1.0`（当前根 `go.mod` 仍锁定 `v1.0.0`，日常开发经 `go.work` 联合验证）→ 同步 `scripts/ci/verify.go` 发版注释 → 运行 `go run ./scripts/ci/verify.go --stage=all --gowork-off`、`--stage=cross`、`--stage=dst` 及多平台原生实机验收。
+
+### i18n 演进持久化清单
+- **M1（底座 + 10 大分析器 + Plan v2.1 修订）**：`[x] core/domain/i18n` · `[x] internal/i18n` · `[x] host/sys/locale*.go` · `[x] xopsvet 10 分析器与 v2.1 加固`
+- **M2（入口与交互双语闭环）**：`[x] InteractionPort 13+ 提示与热同步` · `[x] 命令感知 ScanPreFlags --lang/--json 与 CLI/SFTP Shell` · `[x] TUI 全状态延迟渲染与 L 热切`
+- **M3（全仓 `core` & `host` 迁移 + Plan v2.2 修订，`HEAD=3e054fa`）**：`[x] Wave 3A–3E 与 MCP 规范英文收口` · `[x] 1,506 双语词条与内部叶包分解` · `[x] i18nguard 规则 1–5 全仓合闸与双轨投影` · `[x] 本地 Linux 9 项门禁全绿`
+- **M4（文档/Skill 同步与 `core/v1.1.0` 待授权发版）**：`[x] 开发文档与 AGENTS.md 同步` · `[ ] 双语用户文档与 Skill 同步` · `[ ] 待授权 core/v1.1.0 Tag、锁根 go.mod 与 --gowork-off / 多平台原生验收`

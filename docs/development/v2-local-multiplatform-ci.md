@@ -2,7 +2,7 @@
 
 > **适用范围**：XOps v2 开发与 Gate `G0`–`G5` 验收（参见 [v2-implementation-plan.md](./v2-implementation-plan.md)）。  
 > **架构模式**：**层 A（无服务多平台 Gate 编排脚本）+ 层 B（自建私有 Forgejo + 原生 `forgejo-runner`）**。  
-> **平台覆盖策略**：本地原生覆盖 **Linux（容器/宿主机 + 隔离 Linux VM）、Windows 11、FreeBSD**；**macOS** 日常通过本地 `GOOS=darwin` 交叉编译与交叉 Lint 检查，里程碑 Gate（`G2`/`G2.5`/`G4`/`G5`）交由 GitHub Actions `macos-latest` 云端原生 Runner 补齐（避免在非 Apple 硬件上维护高成本、低复现性的 macOS 虚拟化环境）。
+> **平台覆盖策略**：本地原生覆盖 **Linux（容器/宿主机 + 隔离 Linux VM）、Windows 11、FreeBSD**；**macOS** 日常通过本地 `GOOS=darwin` 交叉编译、跨平台 `xopsvet` 与交叉 Lint 检查，里程碑 Gate（`G2`/`G2.5`/`G4`/`G5`）交由 GitHub Actions `macos-latest` 云端原生 Runner 补齐（避免在非 Apple 硬件上维护高成本、低复现性的 macOS 虚拟化环境）。
 
 ---
 
@@ -173,15 +173,15 @@ git remote add local ssh://git@<HOST_LAN_IP>:2222/<FORGEJO_USER>/xops-cli.git
 
 | Runner 角色 | 建议运行方式 | 注册 Label | 覆盖的 XOps v2 验证项 |
 | :--- | :--- | :--- | :--- |
-| **`runner-linux-fast`** | 宿主机守护进程 + 本地预构建镜像 `xops-ci-linux:go1.27`（Go 1.27 + `golangci-lint` + Node） | `linux-fast:docker://xops-ci-linux:go1.27` | `xopsvet`、`core/` 独立 `GOWORK=off`、Windows/Darwin 交叉编译与交叉 Lint、DST、`docs:check` |
-| **`runner-windows-native`** | Windows 计划任务/服务（`host` 模式，`capacity: 1`） | `windows-native:host` | `core/osfs`（旁路锁/DACL/长路径/AF_UNIX）、ConPTY Relay、Credential Manager、无 `sh.exe` Make |
+| **`runner-linux-fast`** | 宿主机守护进程 + 本地预构建镜像 `xops-ci-linux:go1.27`（Go 1.27 + `golangci-lint` + Node） | `linux-fast:docker://xops-ci-linux:go1.27` | `xopsvet`（10 大分析器）、`core/` 独立 `GOWORK=off`、Windows/Darwin 交叉编译、跨平台 `xopsvet` 与交叉 Lint、DST、`docs:check` |
+| **`runner-windows-native`** | Windows 计划任务/服务（`host` 模式，`capacity: 1`） | `windows-native:host` | `core/osfs`（旁路锁/DACL/长路径/AF_UNIX）、ConPTY Relay、Credential Manager、`GetUserDefaultLocaleName` 区域探测、无 `sh.exe` Make |
 | **`runner-ubuntu-native`** | Ubuntu `systemd --user`（`host` 模式 + `linger`） | `ubuntu-native:host` | `fish`/`zsh` 探测、原生 `sudo` PTY、`ssh -G` 差分、D-Bus Keyring、离线 Vault 演练 |
 | **`runner-freebsd-native`** | FreeBSD `rc.d` 服务（`host` 模式） | `freebsd-native:host` | BSD `kqueue`、非阻塞管道、Unix 套接字对端凭证、FreeBSD 原生构建测试 |
 
 ### 3.3 渐进式多平台流水线（`.forgejo/workflows/local-ci.yml` + 统一 `scripts/ci/verify.go` SSOT）
 
 仓库中的 [.forgejo/workflows/local-ci.yml](../../.forgejo/workflows/local-ci.yml)、[Makefile](../../Makefile)、[.github/workflows/ci.yml](../../.github/workflows/ci.yml) 与 [scripts/local-ci/run.sh](../../scripts/local-ci/run.sh) 统一委托纯 Go 标准库校验驱动 **[scripts/ci/verify.go](../../scripts/ci/verify.go)**（`//go:build ignore`）作为四端唯一验证事实源：
-- **零环境漂移与跨平台一致性**：统一通过 `go run ./scripts/ci/verify.go ...` 调用（外层不设 `GOWORK=off`，兼容 Windows 无 `sh.exe` Make 与 Phase 2.5+ 根 CLI），由 `verify.go` 在子进程按模块显式设置或剔除 `GOWORK`（`tools/xopsvet` 与 `core/` 强制 `GOWORK=off`，根 CLI 默认走 `go.work`，发版传 `--gowork-off`）；支持 `--stage=xopsvet|core|root|cross|dst|all`、`--pkg`、`--verbose`、`--skip-lint`、`--gowork-off` 与 `--self-test`，全模块强制 `-race -shuffle=on`，并自检自身 `gofmt` 与根默认环境 `go vet`；
+- **零环境漂移与跨平台一致性**：统一通过 `go run ./scripts/ci/verify.go ...` 调用（外层不设 `GOWORK=off`，兼容 Windows 无 `sh.exe` Make 与 Phase 2.5+ 根 CLI），由 `verify.go` 在子进程按模块显式设置或剔除 `GOWORK`（`tools/xopsvet` 与 `core/` 强制 `GOWORK=off`，根 CLI 默认走 `go.work`，发版传 `--gowork-off`）；支持 `--stage=xopsvet|core|root|cross|dst|all`（`--stage=cross` 同步执行 Windows/macOS 交叉编译、宿主机 `xopsvet` 跨平台静态检查与 `golangci-lint`）、`--pkg`、`--verbose`、`--skip-lint`、`--gowork-off` 与 `--self-test`，全模块强制 `-race -shuffle=on`，并自检自身 `gofmt` 与根默认环境 `go vet`；
 - **纯内网 `git` 检出**：通过 Forgejo 注入的 `${GITHUB_SERVER_URL}` 与 `${GITHUB_TOKEN}` 直接执行浅克隆（全部 bash step 统一 `set -eu`），**无需在靶机安装 Node.js，也不依赖外网下载 Action**；
 - **与 GitHub Actions 零冲突**：GitHub 仅解析 `.github/workflows/`，自动忽略 `.forgejo/workflows/`；
 - **按实施阶段渐进激活**：`Phase 0` 起自动在各原生靶机完整执行 `xopsvet` 单测/自检/lint 与 `core/` `GOWORK=off` 验证（规避 `runtime.GOOS` 死块剪枝盲区），随着 `cmd/xops` 与 `internal/host` 落地自动解锁根 CLI 与 `ubuntu-native` `-tags=integration` 门禁。
