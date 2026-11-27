@@ -33,6 +33,8 @@ type Shell struct {
 	initialRemoteDir algebraic.Option[pathalg.RemotePath]
 	homeRemoteDir    pathalg.RemotePath
 	remoteDir        pathalg.RemotePath
+	sandboxRoot      pathalg.LocalDir
+	sandboxSub       []string
 	localDir         pathalg.LocalDir
 	localFS          LocalFS
 	scopedLocalOnly  bool
@@ -78,6 +80,7 @@ func NewShell(cfg Config) (*Shell, error) {
 		stderr:           cfg.Stderr,
 		prompt:           prompt,
 		initialRemoteDir: cfg.InitialRemoteDir,
+		sandboxRoot:      localDir,
 		localDir:         localDir,
 		localFS:          cfg.LocalFS,
 		scopedLocalOnly:  cfg.ScopedLocalOnly,
@@ -151,6 +154,19 @@ func (s *Shell) initSession(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if hasInitial {
+		st, sErr := s.eng.StatRemoteFile(ctx, engine.RemoteStatRequest{
+			RemoteCall:     s.remoteCall(nil),
+			Path:           realPath,
+			FollowSymlinks: true,
+		})
+		if sErr != nil {
+			return sErr
+		}
+		if !st.IsDir() {
+			return fmt.Errorf("%w: 初始远端路径 %s 不是目录 (%s)", ErrInvalidConfig, realPath.String(), st.FileType().String())
+		}
+	}
 	s.homeRemoteDir = realPath
 	s.remoteDir = realPath
 	return nil
@@ -159,56 +175,69 @@ func (s *Shell) initSession(ctx context.Context) error {
 func (s *Shell) readEvalLoop(ctx context.Context) error {
 	reader := bufio.NewReaderSize(s.stdin, 4096)
 	for {
-		line, eof, err := s.readPromptLine(ctx, reader)
+		line, eof, tooLong, err := s.readPromptLine(ctx, reader)
 		if err != nil {
 			return err
 		}
-		if eof && strings.TrimSpace(line) == "" {
-			return nil
-		}
-		quit, fatalErr := s.handleInputLine(ctx, line)
+		done, fatalErr := s.stepEvalLine(ctx, line, eof, tooLong)
 		if fatalErr != nil {
 			return fatalErr
 		}
-		if quit || eof {
+		if done {
 			return nil
 		}
 	}
 }
 
-func (s *Shell) readPromptLine(ctx context.Context, reader *bufio.Reader) (string, bool, error) {
-	if err := ctx.Err(); err != nil {
-		return "", false, err
+func (s *Shell) stepEvalLine(ctx context.Context, line string, eof, tooLong bool) (done bool, fatalErr error) {
+	if tooLong {
+		s.writeCommandErr(fmt.Errorf("%w: 单行命令超过最大长度 %d 字节（已丢弃该行并返回提示符）", ErrSyntax, maxLineBytes))
+		return eof, nil
 	}
-	_, _ = io.WriteString(s.stdout, s.prompt)
-	line, eof, err := readBoundedLine(reader)
-	if err == nil {
-		return line, eof, nil
+	if eof && strings.TrimSpace(line) == "" {
+		return true, nil
 	}
-	if ctx.Err() != nil {
-		return "", false, ctx.Err()
-	}
-	return "", false, err
+	quit, err := s.handleInputLine(ctx, line)
+	return quit || eof, err
 }
 
-func readBoundedLine(r *bufio.Reader) (string, bool, error) {
+func (s *Shell) readPromptLine(ctx context.Context, reader *bufio.Reader) (string, bool, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", false, false, err
+	}
+	_, _ = io.WriteString(s.stdout, s.prompt)
+	line, eof, tooLong, err := readBoundedLine(reader)
+	if err == nil {
+		return line, eof, tooLong, nil
+	}
+	if ctx.Err() != nil {
+		return "", false, false, ctx.Err()
+	}
+	return "", false, false, err
+}
+
+// readBoundedLine 有界读取单行命令；若超长则继续排空至换行符或 EOF 后返回 tooLong=true，确保会话可恢复而非被撕毁。
+func readBoundedLine(r *bufio.Reader) (string, bool, bool, error) {
 	var b strings.Builder
+	tooLong := false
 	for {
 		chunk, isPrefix, err := r.ReadLine()
-		if len(chunk) > 0 {
+		if !tooLong && len(chunk) > 0 {
 			if b.Len()+len(chunk) > maxLineBytes {
-				return "", false, fmt.Errorf("%w: 单行命令超过最大长度 %d 字节", ErrSyntax, maxLineBytes)
+				tooLong = true
+				b.Reset()
+			} else {
+				b.Write(chunk)
 			}
-			b.Write(chunk)
 		}
 		if errors.Is(err, io.EOF) {
-			return b.String(), true, nil
+			return b.String(), true, tooLong, nil
 		}
 		if err != nil {
-			return "", false, err
+			return "", false, false, err
 		}
 		if !isPrefix {
-			return b.String(), false, nil
+			return b.String(), false, tooLong, nil
 		}
 	}
 }
@@ -233,9 +262,11 @@ func (s *Shell) handleInputLine(ctx context.Context, line string) (quit bool, fa
 	return false, s.handleCommandError(ctx, cmdErr)
 }
 
-// executeCommandSupervised 为单条交互命令建立独立可取消子上下文并经 core/conc.RunScoped 监督中断监听，
-// 保证中断通道触发时仅取消当前在途命令并在返回提示符前 100% 排空监听协程。
+// executeCommandSupervised 为单条交互命令建立独立可取消子上下文并经 core/conc.RunScoped 监督中断监听：
+//   - 执行前先非阻塞排空空闲期残留的缓冲中断信号，防止误杀下一条命令；
+//   - 并发中断绝不掩盖已成功结果（err==nil）或致命/不可重试错误（ErrEngineHalted/ErrEngineClosed/ErrOutcomeUnknown）。
 func (s *Shell) executeCommandSupervised(sessionCtx context.Context, cmd string, args []string) error {
+	s.drainPendingInterrupts()
 	cmdCtx, cancelCause := context.WithCancelCause(sessionCtx)
 	defer cancelCause(nil)
 
@@ -246,24 +277,57 @@ func (s *Shell) executeCommandSupervised(sessionCtx context.Context, cmd string,
 	}
 
 	err := conc.RunScoped(cmdCtx, func(runCtx context.Context, nursery *conc.Nursery) error {
-		if s.interruptCh != nil {
-			if gErr := nursery.Go(func(wCtx context.Context) error {
-				select {
-				case <-s.interruptCh:
-					cancelCause(ErrCommandCanceled)
-				case <-wCtx.Done():
-				}
-				return nil
-			}); gErr != nil {
-				return gErr
-			}
+		if gErr := s.startInterruptWatcher(nursery, cancelCause); gErr != nil {
+			return gErr
 		}
 		return s.dispatchCommand(runCtx, cmd, args)
 	})
-	if errors.Is(context.Cause(cmdCtx), ErrCommandCanceled) && sessionCtx.Err() == nil {
+	return classifyCommandError(sessionCtx, cmdCtx, err)
+}
+
+func (s *Shell) startInterruptWatcher(nursery *conc.Nursery, cancelCause context.CancelCauseFunc) error {
+	if s.interruptCh == nil {
+		return nil
+	}
+	return nursery.Go(func(wCtx context.Context) error {
+		select {
+		case _, ok := <-s.interruptCh:
+			if ok {
+				cancelCause(ErrCommandCanceled)
+			}
+		case <-wCtx.Done():
+		}
+		return nil
+	})
+}
+
+func classifyCommandError(sessionCtx, cmdCtx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, engine.ErrEngineHalted) || errors.Is(err, engine.ErrEngineClosed) || errors.Is(err, engine.ErrOutcomeUnknown) {
+		return err
+	}
+	if errors.Is(err, context.Canceled) && errors.Is(context.Cause(cmdCtx), ErrCommandCanceled) && sessionCtx.Err() == nil {
 		return ErrCommandCanceled
 	}
 	return err
+}
+
+func (s *Shell) drainPendingInterrupts() {
+	if s.interruptCh == nil {
+		return
+	}
+	for {
+		select {
+		case _, ok := <-s.interruptCh:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
 }
 
 func (s *Shell) dispatchCommand(ctx context.Context, cmd string, args []string) error {

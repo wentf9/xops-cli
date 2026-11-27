@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -78,6 +79,7 @@ func (v ViewKind) Prev() ViewKind {
 // HostItem 是从 core/engine InventorySnapshot 投影出的不可变主机/节点行视图。
 type HostItem struct {
 	NodeID      string
+	TargetSpec  string
 	HostID      string
 	Endpoint    string
 	User        string
@@ -85,6 +87,12 @@ type HostItem struct {
 	Aliases     []string
 	Tags        []string
 	Description string
+}
+
+// EffectiveTarget 返回面向 core/engine 目标解析的真实目标规格：
+// 受管节点返回 NodeID，独立 Host 返回其可直连 Endpoint（缺失时回退 NodeID）。
+func (h HostItem) EffectiveTarget() string {
+	return pickStr(h.TargetSpec, h.NodeID)
 }
 
 // MatchesFilter 判定主机条目是否匹配不区分大小写的筛选关键词。
@@ -145,12 +153,21 @@ func BuildHostItemsFromEntities(hosts []inventory.Host, idents []inventory.Ident
 		}
 		items = append(items, hostItemFromStandaloneHost(h))
 	}
+	slices.SortFunc(items, func(a, b HostItem) int {
+		return cmp.Or(
+			cmp.Compare(a.NodeID, b.NodeID),
+			cmp.Compare(a.HostID, b.HostID),
+			cmp.Compare(a.Endpoint, b.Endpoint),
+		)
+	})
 	return items
 }
 
 func hostItemFromNode(n inventory.Node, hosts map[string]inventory.Host, idents map[string]inventory.Identity) HostItem {
+	nodeID := n.ID().String()
 	item := HostItem{
-		NodeID:      n.ID().String(),
+		NodeID:      nodeID,
+		TargetSpec:  nodeID,
 		HostID:      n.HostRef().String(),
 		Origin:      n.OriginKind().String(),
 		Description: n.Description(),
@@ -171,10 +188,13 @@ func hostItemFromNode(n inventory.Node, hosts map[string]inventory.Host, idents 
 }
 
 func hostItemFromStandaloneHost(h inventory.Host) HostItem {
+	ep := h.Endpoint().String()
+	id := h.ID().String()
 	item := HostItem{
-		NodeID:      h.ID().String(),
-		HostID:      h.ID().String(),
-		Endpoint:    h.Endpoint().String(),
+		NodeID:      id,
+		TargetSpec:  pickStr(ep, id),
+		HostID:      id,
+		Endpoint:    ep,
 		Origin:      "host",
 		Description: h.Description(),
 	}
@@ -196,9 +216,31 @@ type (
 		Err      error
 	}
 
+	// ProjectionView 是从 engine.ProjectionSnapshot 解包得到的纯值投影视图，
+	// 使状态折叠、去重同步与无头多轮测试共用同一不可变数据结构。
+	ProjectionView struct {
+		Valid             bool
+		Version           uint64
+		TotalEvents       uint64
+		DroppedEvents     uint64
+		GateHalted        bool
+		HasUnknownOutcome bool
+		ActiveStreams     int
+		Operations        []engine.OperationView
+		Metrics           []engine.MetricPoint
+		Logs              []engine.LogEntry
+		Diagnostics       []engine.DiagnosticRecord
+		PoolEvents        []engine.PoolRecord
+	}
+
 	// ProjectionUpdatedMsg 携带来自 engine.Projection.WaitUpdate 的最新不可变聚合快照。
 	ProjectionUpdatedMsg struct {
 		Snapshot engine.ProjectionSnapshot
+	}
+
+	// ProjectionViewMsg 携带解包后的 ProjectionView，供多轮快照折叠与无头集成测试直接驱动。
+	ProjectionViewMsg struct {
+		View ProjectionView
 	}
 
 	// MetricsFrameMsg 携带来自 Engine.StreamMetrics OnFrame 回调的实时主机指标帧。
@@ -216,11 +258,12 @@ type (
 		OccurredAt time.Time
 	}
 
-	// StreamStateMsg 报告活跃远端流（metrics/logs）的启动、停止或出错状态。
+	// StreamStateMsg 报告活跃远端流（metrics/logs）的启动、停止或出错状态；Seq 用于过滤切换目标后的陈旧状态消息。
 	StreamStateMsg struct {
 		Kind   string // "metrics" 或 "logs"
 		Target string
 		Active bool
+		Seq    uint64
 		Err    error
 	}
 
@@ -258,6 +301,27 @@ type (
 		UnknownOut  bool
 	}
 )
+
+// ProjectionViewFromSnapshot 将不可变 engine.ProjectionSnapshot 解包为纯值 ProjectionView；零值或无效快照返回 Valid=false。
+func ProjectionViewFromSnapshot(snap engine.ProjectionSnapshot) ProjectionView {
+	if !snap.IsValid() {
+		return ProjectionView{}
+	}
+	return ProjectionView{
+		Valid:             true,
+		Version:           snap.Version(),
+		TotalEvents:       snap.TotalEvents(),
+		DroppedEvents:     snap.DroppedEvents(),
+		GateHalted:        snap.GateHalted(),
+		HasUnknownOutcome: snap.HasUnknownOutcome(),
+		ActiveStreams:     snap.ActiveStreams(),
+		Operations:        snap.Operations(),
+		Metrics:           snap.Metrics(),
+		Logs:              snap.Logs(),
+		Diagnostics:       snap.Diagnostics(),
+		PoolEvents:        snap.PoolEvents(),
+	}
+}
 
 // ProjectEvent 穷尽匹配全部 12 类封闭 core/events.Event 变体并投影为强类型 EventProjectedMsg；
 // 对 nil、无效事件或未知变体严格失败关闭返回 ErrInvalidEvent（满足 xopsvet/sumexhaust）。

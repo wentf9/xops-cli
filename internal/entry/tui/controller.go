@@ -3,7 +3,6 @@ package tui
 import (
 	"context"
 	"errors"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/wentf9/xops-cli/core/conc"
@@ -36,15 +35,24 @@ func startBackgroundWatchers(
 			return err
 		}
 	}
-	if attachInitialStreams {
-		for _, stream := range cfg.OperationStreams {
-			st := stream
-			if err := nursery.Go(func(wCtx context.Context) error { return watchOperationStream(wCtx, st, prog) }); err != nil {
-				return err
-			}
+	// 当存在 Projection 时，初始 OperationStreams 已在 Run 中直接挂载至 Projection（避免双重消费）；
+	// 仅在无 Projection 模式下由本控制器启动独立监督消费协程。
+	if proj == nil && attachInitialStreams {
+		if err := watchInitialOperationStreams(nursery, cfg.OperationStreams, prog); err != nil {
+			return err
 		}
 	}
 	return nursery.Go(func(wCtx context.Context) error { return ctrl.run(wCtx, actionCh) })
+}
+
+func watchInitialOperationStreams(nursery *conc.Nursery, streams []*events.OperationStream, prog *tea.Program) error {
+	for _, stream := range streams {
+		st := stream
+		if err := nursery.Go(func(wCtx context.Context) error { return watchOperationStream(wCtx, st, prog) }); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func resolveRawSystemBus(cfg Config, proj ProjectionSource) *events.SystemBus {
@@ -128,9 +136,11 @@ func watchExternalMsgs(ctx context.Context, ch <-chan tea.Msg, prog *tea.Program
 // workbenchController 集中管理按需触发的资产刷新与远端指标/日志流独立子作用域，
 // 分别用独立 Nursery 监督 metrics 与 logs 流，确保重选目标或退出时旧流 100% 取消并排空。
 type workbenchController struct {
-	cfg  Config
-	proj ProjectionSource
-	prog *tea.Program
+	cfg        Config
+	proj       ProjectionSource
+	prog       *tea.Program
+	metricsSeq uint64
+	logsSeq    uint64
 }
 
 type streamSlots struct {
@@ -170,15 +180,21 @@ func (c *workbenchController) handleAction(ctx context.Context, req actionReques
 		c.refreshInventory(ctx)
 	case actionStopStreams:
 		slots.stopAll()
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Active: false})
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Active: false})
+		c.metricsSeq++
+		c.logsSeq++
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Active: false, Seq: c.metricsSeq})
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Active: false, Seq: c.logsSeq})
 	case actionStartMetrics:
+		c.metricsSeq++
+		seq := c.metricsSeq
 		c.replaceStreamSlot(ctx, &slots.metrics, func(wCtx context.Context) error {
-			return c.runMetricsStream(wCtx, req.target, req.sortBy)
+			return c.runMetricsStream(wCtx, req.target, req.sortBy, seq)
 		})
 	case actionStartLogs:
+		c.logsSeq++
+		seq := c.logsSeq
 		c.replaceStreamSlot(ctx, &slots.logs, func(wCtx context.Context) error {
-			return c.runLogsStream(wCtx, req.target)
+			return c.runLogsStream(wCtx, req.target, seq)
 		})
 	}
 }
@@ -212,6 +228,23 @@ func (c *workbenchController) refreshInventory(ctx context.Context) {
 		sendMsg(ctx, c.prog, HaltedStateMsg{Reason: reason})
 	}
 	q := engine.InventoryQueryRequest{}
+	// 优先走单次原子 GetInventorySnapshot（1 条审计、0 撕裂读）；对最小测试桩回退三路列表查询。
+	if sc, ok := c.cfg.Engine.(InventorySnapshotClient); ok {
+		snap, err := sc.GetInventorySnapshot(ctx, q)
+		if err != nil {
+			c.reportInventoryErr(ctx, err)
+			return
+		}
+		sendMsg(ctx, c.prog, InventoryLoadedMsg{
+			Revision: snap.Revision().String(),
+			Hosts:    BuildHostItems(snap),
+		})
+		return
+	}
+	c.refreshInventoryFallback(ctx, q)
+}
+
+func (c *workbenchController) refreshInventoryFallback(ctx context.Context, q engine.InventoryQueryRequest) {
 	hosts, rev, err := c.cfg.Engine.ListHosts(ctx, q)
 	if err != nil {
 		c.reportInventoryErr(ctx, err)
@@ -243,17 +276,47 @@ func (c *workbenchController) reportInventoryErr(ctx context.Context, err error)
 	sendMsg(ctx, c.prog, InventoryLoadedMsg{Err: err})
 }
 
-func (c *workbenchController) runMetricsStream(ctx context.Context, target string, sortBy engine.ProcessSortBy) error {
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Target: target, Active: true})
-	stream, err := c.openAndAttachOpStream(ctx)
-	if err != nil {
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Target: target, Active: false, Err: err})
-		return nil
-	}
+// runMetricsStream 以有界最大连续批次（默认 MaxSamples=10000）驱动实时指标流，
+// 避免核心默认 MaxSamples=1 导致首帧 0% 增量 CPU 后立即退出的问题；单批完成后自动续接直至取消。
+func (c *workbenchController) runMetricsStream(ctx context.Context, target string, sortBy engine.ProcessSortBy, seq uint64) error {
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Target: target, Active: true, Seq: seq})
 	topN := c.cfg.MetricsTopProcesses
 	if topN <= 0 {
 		topN = defaultTopProcesses
 	}
+	batchSamples := c.cfg.MetricsMaxSamples
+	if batchSamples <= 0 {
+		batchSamples = metricsBatchMaxSamples
+	}
+	var finalErr error
+	for ctx.Err() == nil {
+		frames, bErr := c.runMetricsBatch(ctx, target, sortBy, topN, batchSamples)
+		if bErr != nil {
+			finalErr = bErr
+			break
+		}
+		if frames == 0 {
+			break
+		}
+	}
+	if errors.Is(finalErr, context.Canceled) {
+		finalErr = nil
+	}
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Target: target, Active: false, Seq: seq, Err: finalErr})
+	return nil
+}
+
+func (c *workbenchController) runMetricsBatch(
+	ctx context.Context,
+	target string,
+	sortBy engine.ProcessSortBy,
+	topN, maxSamples int,
+) (int, error) {
+	stream, err := c.openAndAttachOpStream(ctx)
+	if err != nil {
+		return 0, err
+	}
+	var frames int
 	runErr := conc.RunWait(ctx, func(wCtx context.Context, n *conc.Nursery) error {
 		defer closeStreamIfNonNil(stream)
 		if stream != nil && c.proj == nil {
@@ -267,46 +330,55 @@ func (c *workbenchController) runMetricsStream(ctx context.Context, target strin
 				CallOptions: engine.CallOptions{OperationStream: stream},
 			},
 			Interval:     c.cfg.MetricsInterval,
+			MaxSamples:   maxSamples,
 			TopProcesses: topN,
 			SortBy:       algebraic.Some(sortBy),
 			OnFrame: func(frame engine.HostMetricsFrame) {
+				frames++
 				sendMsg(wCtx, c.prog, MetricsFrameMsg{Target: target, Frame: frame})
 			},
 		})
 		return sErr
 	})
-	if errors.Is(runErr, context.Canceled) {
-		runErr = nil
-	}
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "metrics", Target: target, Active: false, Err: runErr})
-	return nil
+	return frames, runErr
 }
 
-func (c *workbenchController) runLogsStream(ctx context.Context, target string) error {
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: true})
+// runLogsStream 启动远端日志跟随流：存在 OperationStream 时统一经事件流单路径消费（避免与 Output 重复入队），
+// 仅在无 OperationStream 的极简桩环境下使用绑定 wCtx 的行缓冲写入器回退。
+func (c *workbenchController) runLogsStream(ctx context.Context, target string, seq uint64) error {
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: true, Seq: seq})
 	logTarget, err := resolveDefaultLogTarget(c.cfg)
 	if err != nil {
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Err: err})
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Seq: seq, Err: err})
 		return nil
 	}
 	stream, err := c.openAndAttachOpStream(ctx)
 	if err != nil {
-		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Err: err})
+		sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Seq: seq, Err: err})
 		return nil
 	}
 	tailLines := c.cfg.LogTailLines
 	if tailLines <= 0 {
 		tailLines = defaultLogTailLines
 	}
-	writer := &logChunkWriter{ctx: ctx, prog: c.prog, target: target}
-	runErr := conc.RunWait(ctx, func(wCtx context.Context, n *conc.Nursery) error {
+	runErr := c.execLogStreamInNursery(ctx, stream, target, logTarget, tailLines)
+	if errors.Is(runErr, context.Canceled) {
+		runErr = nil
+	}
+	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Seq: seq, Err: runErr})
+	return nil
+}
+
+func (c *workbenchController) execLogStreamInNursery(
+	ctx context.Context,
+	stream *events.OperationStream,
+	target string,
+	logTarget engine.LogTarget,
+	tailLines int,
+) error {
+	return conc.RunWait(ctx, func(wCtx context.Context, n *conc.Nursery) error {
 		defer closeStreamIfNonNil(stream)
-		if stream != nil && c.proj == nil {
-			if gErr := n.Go(func(pCtx context.Context) error { return watchOperationStream(pCtx, stream, c.prog) }); gErr != nil {
-				return gErr
-			}
-		}
-		_, sErr := c.cfg.Engine.StreamLogs(wCtx, engine.LogStreamRequest{
+		req := engine.LogStreamRequest{
 			RemoteCall: engine.RemoteCall{
 				TargetInput: engine.TargetInput{TargetSpec: target, CLIOptions: c.cfg.CLIOptions},
 				CallOptions: engine.CallOptions{OperationStream: stream},
@@ -314,15 +386,19 @@ func (c *workbenchController) runLogsStream(ctx context.Context, target string) 
 			Target:    logTarget,
 			TailLines: tailLines,
 			Follow:    true,
-			Output:    writer,
-		})
+		}
+		if stream == nil {
+			writer := &lineBufferedLogWriter{ctx: wCtx, prog: c.prog, target: target}
+			defer writer.flush()
+			req.Output = writer
+		} else if c.proj == nil {
+			if gErr := n.Go(func(pCtx context.Context) error { return watchOperationStream(pCtx, stream, c.prog) }); gErr != nil {
+				return gErr
+			}
+		}
+		_, sErr := c.cfg.Engine.StreamLogs(wCtx, req)
 		return sErr
 	})
-	if errors.Is(runErr, context.Canceled) {
-		runErr = nil
-	}
-	sendMsg(ctx, c.prog, StreamStateMsg{Kind: "logs", Target: target, Active: false, Err: runErr})
-	return nil
 }
 
 func (c *workbenchController) openAndAttachOpStream(ctx context.Context) (*events.OperationStream, error) {
@@ -347,28 +423,6 @@ func closeStreamIfNonNil(s *events.OperationStream) {
 	if s != nil {
 		s.Close()
 	}
-}
-
-type logChunkWriter struct {
-	ctx    context.Context
-	prog   *tea.Program
-	target string
-}
-
-func (w *logChunkWriter) Write(p []byte) (int, error) {
-	if err := w.ctx.Err(); err != nil {
-		return 0, err
-	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	sendMsg(w.ctx, w.prog, LogChunkMsg{
-		Target:     w.target,
-		Stream:     events.OutputStreamStdout,
-		Text:       string(p),
-		OccurredAt: time.Now().UTC(),
-	})
-	return len(p), nil
 }
 
 func sendMsg(ctx context.Context, prog *tea.Program, msg tea.Msg) {

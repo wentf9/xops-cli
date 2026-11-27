@@ -83,9 +83,21 @@ func (f *fakeTransferClient) NewOperationStream(_ context.Context, buffer int) (
 	return events.NewOperationStream(events.OperationStreamConfig{TraceID: tid, OperationID: oid, OperationBuffer: max(buffer, 16)})
 }
 
+// SCPUpload 强制执行真实 transfer.Service.SCPUpload 的参数不变量（递归上传必须为 Scoped + SymlinkReject）。
 func (f *fakeTransferClient) SCPUpload(ctx context.Context, req engine.SCPUploadRequest) (engine.SCPUploadResult, error) {
 	if err := f.checkHalted(); err != nil {
 		return engine.SCPUploadResult{}, err
+	}
+	if !req.Source.IsValid() {
+		return engine.SCPUploadResult{}, engine.ErrInvalidRequest
+	}
+	if req.Recursive {
+		if req.Source.Kind() != engine.LocalUploadSourceScoped {
+			return engine.SCPUploadResult{}, fmt.Errorf("%w: 递归目录上传仅支持 ScopedRootFS 沙箱源", engine.ErrInvalidRequest)
+		}
+		if req.SymlinkPolicy != pathalg.SymlinkReject {
+			return engine.SCPUploadResult{}, engine.ErrSymlinkRejected
+		}
 	}
 	f.mu.Lock()
 	f.lastUpload = req
@@ -100,9 +112,16 @@ func (f *fakeTransferClient) SCPUpload(ctx context.Context, req engine.SCPUpload
 	return engine.SCPUploadResult{RemotePath: req.RemoteDest, FilesUploaded: 1, BytesTransferred: 1024}, nil
 }
 
+// SCPDownload 强制执行真实 transfer.Service.SCPDownload 的参数不变量（拒绝 SymlinkFollowOperatorSource）。
 func (f *fakeTransferClient) SCPDownload(ctx context.Context, req engine.SCPDownloadRequest) (engine.SCPDownloadResult, error) {
 	if err := f.checkHalted(); err != nil {
 		return engine.SCPDownloadResult{}, err
+	}
+	if !req.LocalRoot.IsValid() || !req.LocalDest.IsValid() {
+		return engine.SCPDownloadResult{}, engine.ErrInvalidRequest
+	}
+	if !req.SymlinkPolicy.IsValid() || req.SymlinkPolicy == pathalg.SymlinkFollowOperatorSource {
+		return engine.SCPDownloadResult{}, engine.ErrSymlinkRejected
 	}
 	f.mu.Lock()
 	f.lastDownload = req
@@ -605,7 +624,7 @@ func TestShell_FatalHaltedAndLocalFSUnsupportedAndEOF(t *testing.T) {
 	}
 }
 
-func TestShell_TimeoutScopedUploadOutcomeUnknownAndEdgeCases(t *testing.T) {
+func TestShell_TimeoutOperatorFeaturesAndEdgeCases(t *testing.T) {
 	defer goleak.VerifyNone(t)
 
 	eng := newFakeTransferClient()
@@ -624,20 +643,25 @@ func TestShell_TimeoutScopedUploadOutcomeUnknownAndEdgeCases(t *testing.T) {
 	script := strings.Join([]string{
 		"lcd ..",
 		"lpwd",
-		"put nested/file.bin",
+		"put ././nested/./file.bin",
+		"put -r subdir",
 		"put slow.bin timeout.bin",
 		"put risky.bin unknown.bin",
 		"get note.txt",
+		"get note.txt .",
+		"get note.txt out/",
 		"get note.txt /tmp/abs_note.txt",
 		"cd note.txt",
 		"cd sub",
 		"cd",
 		"pwd",
-		"write -p dir/a.txt hello",
+		"write -p dir/a.txt '-n' -p --no-clobber",
+		"cat dir/a.txt",
 		"rename dir/a.txt dir/b.txt",
 		"stat -L cur",
 		"chtimes 1700000000 2026-06-03T01:02:03Z dir/b.txt",
 		"chtimes 999999999999999 dir/b.txt",
+		"help lstat",
 		"quit",
 	}, "\n") + "\n"
 
@@ -649,14 +673,203 @@ func TestShell_TimeoutScopedUploadOutcomeUnknownAndEdgeCases(t *testing.T) {
 		Stdout:          &stdout,
 		Stderr:          &stderr,
 		InitialLocalDir: algebraic.Some(initLocal),
-		ScopedLocalOnly: true,
+		SymlinkPolicy:   pathalg.SymlinkFollowOperatorSource,
 		CommandTimeout:  algebraic.Some(algebraic.FromStdDuration(15 * time.Millisecond)),
 	})
 	if err != nil {
 		t.Fatalf("Run 失败: %v\nstderr=%s", err, stderr.String())
 	}
-	assertContainsAll(t, stdout.String(), []string{"C:/work", "uploaded nested/file.bin -> /home/alice/file.bin", "downloaded /home/alice/note.txt -> note.txt", "downloaded /home/alice/note.txt -> abs_note.txt", "Type: regular"})
-	assertContainsAll(t, stderr.String(), []string{"command timed out (returned to prompt)", "CRITICAL OutcomeUnknown", "不是目录", "超出 RFC3339 年份范围"})
+	assertContainsAll(t, stdout.String(), []string{
+		"C:/work",
+		"uploaded ././nested/./file.bin -> /home/alice/file.bin",
+		"uploaded subdir -> /home/alice/subdir",
+		"downloaded /home/alice/note.txt -> note.txt",
+		"downloaded /home/alice/note.txt -> abs_note.txt",
+		"-n -p --no-clobber",
+		"Type: regular",
+		"without following symlinks",
+	})
+	assertContainsAll(t, stderr.String(), []string{
+		"command timed out (returned to prompt)",
+		"CRITICAL OutcomeUnknown",
+		"不是目录",
+		"超出 RFC3339 年份范围",
+	})
+}
+
+func TestShell_ScopedLocalOnlySandboxInescapableAndDisallowedPaths(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	eng := newFakeTransferClient()
+	sandbox, _ := pathalg.ParseLocalDir("/sandbox")
+	var stdout, stderr bytes.Buffer
+
+	// 1. ScopedLocalOnly + SymlinkFollowOperatorSource 必须在配置阶段失败关闭。
+	if err := sftpshell.Run(context.Background(), sftpshell.Config{
+		Engine:          eng,
+		TargetSpec:      "alice@example.com",
+		Stdout:          &stdout,
+		Stderr:          &stderr,
+		InitialLocalDir: algebraic.Some(sandbox),
+		ScopedLocalOnly: true,
+		SymlinkPolicy:   pathalg.SymlinkFollowOperatorSource,
+	}); !errors.Is(err, sftpshell.ErrInvalidConfig) {
+		t.Fatalf("ScopedLocalOnly + SymlinkFollowOperatorSource 期望 ErrInvalidConfig，实际=%v", err)
+	}
+
+	// 2. 沙箱内合法操作全部锚定于 /sandbox；所有越界、绝对路径、UNC/盘符相对路径全部失败关闭。
+	localFS := &fakeLocalFS{
+		dirs: map[string][]sftpshell.LocalDirEntry{
+			"/sandbox":     {{Name: "sub", IsDir: true, Mode: fs.ModeDir | 0o755}},
+			"/sandbox/sub": {{Name: "f.bin", Size: 10, Mode: 0o644}},
+		},
+	}
+	script := strings.Join([]string{
+		"lcd ..",
+		"lcd /etc",
+		"lls /etc",
+		"lls ..",
+		`lcd \\server\share\x`,
+		`lcd \rootrel`,
+		`lcd C:relpath`,
+		"put /etc/passwd",
+		"put ../outside.txt",
+		"put .",
+		"get note.txt /tmp/escape.txt",
+		"get note.txt ../escape.txt",
+		"lcd sub",
+		"lpwd",
+		"put ./f.bin",
+		"get note.txt .",
+		"lcd ..",
+		"lpwd",
+		"get note.txt sub/",
+		"quit",
+	}, "\n") + "\n"
+
+	stdout.Reset()
+	stderr.Reset()
+	err := sftpshell.Run(context.Background(), sftpshell.Config{
+		Engine:          eng,
+		TargetSpec:      "alice@example.com",
+		Stdin:           strings.NewReader(script),
+		Stdout:          &stdout,
+		Stderr:          &stderr,
+		InitialLocalDir: algebraic.Some(sandbox),
+		LocalFS:         localFS,
+		ScopedLocalOnly: true,
+	})
+	if err != nil {
+		t.Fatalf("ScopedLocalOnly Run 失败: %v\nstderr=%s", err, stderr.String())
+	}
+	assertContainsAll(t, stdout.String(), []string{
+		"/sandbox/sub",
+		"uploaded ./f.bin -> /home/alice/f.bin",
+		"downloaded /home/alice/note.txt -> sub/note.txt",
+	})
+	if eng.lastUpload.Source.Kind() != engine.LocalUploadSourceScoped {
+		t.Fatalf("ScopedLocalOnly 上传必须使用 LocalUploadSourceScoped")
+	}
+	if eng.lastDownload.LocalRoot.String() != "/sandbox" || eng.lastDownload.LocalDest.String() != "sub/note.txt" {
+		t.Fatalf("ScopedLocalOnly 下载必须锚定 /sandbox: root=%s dest=%s", eng.lastDownload.LocalRoot, eng.lastDownload.LocalDest)
+	}
+	assertContainsAll(t, stderr.String(), []string{
+		"越出沙箱根目录",
+		"禁止使用绝对本地路径",
+		"UNC、设备命名空间或根相对反斜杠前缀",
+		"盘符相对路径",
+		"不能为沙箱根目录",
+	})
+}
+
+func TestShell_StaleInterruptDrainConcurrentFatalAndOversizedLineRecovery(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	// 1. 预置空闲期滞留中断信号 + 超过 1 MiB 的超长行 -> 滞留信号不误杀 pwd，超长行排空后恢复提示符。
+	eng := newFakeTransferClient()
+	staleCh := make(chan struct{}, 2)
+	staleCh <- struct{}{}
+	staleCh <- struct{}{}
+	oversized := strings.Repeat("a", (1<<20)+128)
+	var stdout, stderr bytes.Buffer
+	err := sftpshell.Run(context.Background(), sftpshell.Config{
+		Engine:      eng,
+		TargetSpec:  "alice@example.com",
+		Stdin:       strings.NewReader("pwd\n" + oversized + "\npwd\nquit\n"),
+		Stdout:      &stdout,
+		Stderr:      &stderr,
+		InterruptCh: staleCh,
+	})
+	if err != nil {
+		t.Fatalf("滞留中断与超长行恢复期望 nil，实际=%v", err)
+	}
+	if strings.Count(stdout.String(), "/home/alice") < 2 || !strings.Contains(stderr.String(), "单行命令超过最大长度") {
+		t.Fatalf("滞留中断排空或超长行恢复异常:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+
+	// 2. 并发中断绝不掩盖 ErrEngineHalted，仍应立即失败关闭终止会话。
+	eng2 := newFakeTransferClient()
+	intCh2 := make(chan struct{}, 1)
+	eng2.onUpload = func(_ context.Context, _ engine.SCPUploadRequest) (engine.SCPUploadResult, error) {
+		intCh2 <- struct{}{}
+		return engine.SCPUploadResult{}, engine.ErrEngineHalted
+	}
+	stdout.Reset()
+	stderr.Reset()
+	err = sftpshell.Run(context.Background(), sftpshell.Config{
+		Engine:      eng2,
+		TargetSpec:  "alice@example.com",
+		Stdin:       strings.NewReader("put a.bin\npwd\n"),
+		Stdout:      &stdout,
+		Stderr:      &stderr,
+		InterruptCh: intCh2,
+	})
+	if !errors.Is(err, engine.ErrEngineHalted) {
+		t.Fatalf("并发中断下 ErrEngineHalted 不得被掩盖，实际=%v", err)
+	}
+
+	// 3. 并发中断下 ErrOutcomeUnknown 与已成功变更（err==nil）均不得被掩盖为 "command canceled"。
+	eng3 := newFakeTransferClient()
+	intCh3 := make(chan struct{}, 2)
+	eng3.onUpload = func(_ context.Context, req engine.SCPUploadRequest) (engine.SCPUploadResult, error) {
+		intCh3 <- struct{}{}
+		if strings.HasSuffix(req.RemoteDest.String(), "unk.bin") {
+			return engine.SCPUploadResult{}, engine.ErrOutcomeUnknown
+		}
+		return engine.SCPUploadResult{RemotePath: req.RemoteDest, FilesUploaded: 1, BytesTransferred: 8}, nil
+	}
+	stdout.Reset()
+	stderr.Reset()
+	err = sftpshell.Run(context.Background(), sftpshell.Config{
+		Engine:      eng3,
+		TargetSpec:  "alice@example.com",
+		Stdin:       strings.NewReader("put a.bin unk.bin\nput b.bin ok.bin\nquit\n"),
+		Stdout:      &stdout,
+		Stderr:      &stderr,
+		InterruptCh: intCh3,
+	})
+	if err != nil {
+		t.Fatalf("Run 失败: %v", err)
+	}
+	if !strings.Contains(stderr.String(), "CRITICAL OutcomeUnknown") || strings.Contains(stderr.String(), "command canceled") {
+		t.Fatalf("并发中断掩盖了 OutcomeUnknown 或成功变更:\nstdout=%s\nstderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "uploaded b.bin -> /home/alice/ok.bin") {
+		t.Fatalf("已成功变更输出缺失: %s", stdout.String())
+	}
+
+	// 4. 显式 InitialRemoteDir 指向普通文件时 initSession 必须失败关闭。
+	filePath, _ := pathalg.ParseAbsRemotePath("/home/alice/note.txt")
+	if err := sftpshell.Run(context.Background(), sftpshell.Config{
+		Engine:           eng,
+		TargetSpec:       "alice@example.com",
+		Stdin:            strings.NewReader("pwd\n"),
+		Stdout:           &stdout,
+		Stderr:           &stderr,
+		InitialRemoteDir: algebraic.Some(filePath),
+	}); !errors.Is(err, sftpshell.ErrInvalidConfig) {
+		t.Fatalf("InitialRemoteDir 指向非目录期望 ErrInvalidConfig，实际=%v", err)
+	}
 }
 
 func assertContainsAll(t *testing.T, haystack string, needles []string) {

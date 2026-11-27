@@ -26,27 +26,58 @@ func (m *Model) applyInventoryLoaded(msg InventoryLoadedMsg) {
 }
 
 func (m *Model) applyProjectionSnapshot(snap engine.ProjectionSnapshot) {
-	if !snap.IsValid() || snap.Version() < m.projVersion {
+	m.applyProjectionView(ProjectionViewFromSnapshot(snap))
+}
+
+// applyProjectionView 原子替换最新 Projection 快照视图并与直连流状态无损合并：
+// 绝不将全量环形 snap.Logs() 重复追加至历史日志，也不覆盖独立 OperationStream 的操作与指标状态。
+func (m *Model) applyProjectionView(view ProjectionView) {
+	if !view.Valid || view.Version < m.projVersion {
 		return
 	}
-	m.projVersion = snap.Version()
-	m.totalEvents = max(m.totalEvents, snap.TotalEvents())
-	m.droppedEvents = max(m.droppedEvents, snap.DroppedEvents())
-	m.activeStreams = snap.ActiveStreams()
-	m.gateHalted = m.gateHalted || snap.GateHalted()
-	m.hasUnknownOut = m.hasUnknownOut || snap.HasUnknownOutcome()
-	m.operations = snap.Operations()
-	m.metrics = snap.Metrics()
-	m.diagnostics = snap.Diagnostics()
-	m.poolEvents = snap.PoolEvents()
-	for _, entry := range snap.Logs() {
-		m.appendUniqueLog(entry)
+	m.projVersion = view.Version
+	m.projSnap = normalizeProjectionView(view, m.logLimit())
+	m.activeStreams = view.ActiveStreams
+	m.gateHalted = m.gateHalted || view.GateHalted
+	m.hasUnknownOut = m.hasUnknownOut || view.HasUnknownOutcome
+	m.totalEvents = m.projSnap.TotalEvents + m.directEvents
+	m.droppedEvents = max(m.droppedEvents, m.projSnap.DroppedEvents+m.directDropped)
+	m.rebuildMergedViews()
+}
+
+func normalizeProjectionView(view ProjectionView, maxLogs int) ProjectionView {
+	out := ProjectionView{
+		Valid:             true,
+		Version:           view.Version,
+		TotalEvents:       view.TotalEvents,
+		DroppedEvents:     view.DroppedEvents,
+		GateHalted:        view.GateHalted,
+		HasUnknownOutcome: view.HasUnknownOutcome,
+		ActiveStreams:     view.ActiveStreams,
+		Operations:        slices.Clone(view.Operations),
+		Metrics:           cloneMetricPoints(view.Metrics),
+		Diagnostics:       slices.Clone(view.Diagnostics),
+		PoolEvents:        slices.Clone(view.PoolEvents),
 	}
+	for _, entry := range view.Logs {
+		out.Logs = appendNormalizedLogEntry(out.Logs, entry, maxLogs)
+	}
+	return out
+}
+
+func cloneMetricPoints(src []engine.MetricPoint) []engine.MetricPoint {
+	out := slices.Clone(src)
+	for i := range out {
+		out[i].Labels = maps.Clone(out[i].Labels)
+	}
+	return out
 }
 
 func (m *Model) applyProjectedEvent(msg EventProjectedMsg) {
-	m.totalEvents++
-	m.droppedEvents += msg.Dropped
+	m.directEvents++
+	m.directDropped += msg.Dropped
+	m.totalEvents = m.projSnap.TotalEvents + m.directEvents
+	m.droppedEvents = max(m.droppedEvents, m.projSnap.DroppedEvents+m.directDropped)
 	m.gateHalted = m.gateHalted || msg.GateHalted
 	m.hasUnknownOut = m.hasUnknownOut || msg.UnknownOut
 	if msg.Operation != nil {
@@ -56,14 +87,15 @@ func (m *Model) applyProjectedEvent(msg EventProjectedMsg) {
 		m.upsertDirectMetric(*msg.Metric)
 	}
 	if msg.Log != nil {
-		m.appendBoundedLog(*msg.Log)
+		m.directLogs = appendNormalizedLogEntry(m.directLogs, *msg.Log, m.logLimit())
 	}
 	if msg.Diagnostic != nil {
-		m.diagnostics = appendBoundedSlice(m.diagnostics, *msg.Diagnostic, defaultMaxSystemItems)
+		m.directDiags = appendBoundedSlice(m.directDiags, *msg.Diagnostic, defaultMaxSystemItems)
 	}
 	if msg.Pool != nil {
-		m.poolEvents = appendBoundedSlice(m.poolEvents, *msg.Pool, defaultMaxSystemItems)
+		m.directPool = appendBoundedSlice(m.directPool, *msg.Pool, defaultMaxSystemItems)
 	}
+	m.rebuildMergedViews()
 }
 
 func (m *Model) upsertDirectOp(in engine.OperationView) {
@@ -82,12 +114,6 @@ func (m *Model) upsertDirectOp(in engine.OperationView) {
 		cur = mergeOperationView(cur, in)
 	}
 	m.directOpsByID[in.OperationID] = cur
-	m.operations = make([]engine.OperationView, 0, len(m.directOpOrder))
-	for _, id := range m.directOpOrder {
-		if op, ok := m.directOpsByID[id]; ok {
-			m.operations = append(m.operations, op)
-		}
-	}
 }
 
 func mergeOperationView(cur, in engine.OperationView) engine.OperationView {
@@ -115,16 +141,104 @@ func (m *Model) upsertDirectMetric(pt engine.MetricPoint) {
 	}
 	pt.Labels = maps.Clone(pt.Labels)
 	if len(m.directMetricByID) >= defaultMaxMetrics {
-		if _, ok := m.directMetricByID[pt.Key]; !ok && len(m.metrics) > 0 {
-			delete(m.directMetricByID, m.metrics[0].Key)
+		if _, ok := m.directMetricByID[pt.Key]; !ok {
+			evictOldestMetricKey(m.directMetricByID)
 		}
 	}
 	m.directMetricByID[pt.Key] = pt
-	m.metrics = make([]engine.MetricPoint, 0, len(m.directMetricByID))
-	for _, v := range m.directMetricByID {
-		m.metrics = append(m.metrics, v)
+}
+
+func evictOldestMetricKey(m map[string]engine.MetricPoint) {
+	var minKey string
+	for k := range m {
+		if minKey == "" || k < minKey {
+			minKey = k
+		}
 	}
-	slices.SortFunc(m.metrics, func(a, b engine.MetricPoint) int { return cmp.Compare(a.Key, b.Key) })
+	if minKey != "" {
+		delete(m, minKey)
+	}
+}
+
+func (m *Model) rebuildMergedViews() {
+	m.operations = mergeOperationSlices(m.projSnap.Operations, m.directOpOrder, m.directOpsByID)
+	m.metrics = mergeMetricSlices(m.projSnap.Metrics, m.directMetricByID)
+	m.logs = mergeBoundedSlices(m.projSnap.Logs, m.directLogs, m.logLimit())
+	m.diagnostics = mergeBoundedSlices(m.projSnap.Diagnostics, m.directDiags, defaultMaxSystemItems)
+	m.poolEvents = mergeBoundedSlices(m.projSnap.PoolEvents, m.directPool, defaultMaxSystemItems)
+}
+
+func mergeOperationSlices(projOps []engine.OperationView, directOrder []string, directMap map[string]engine.OperationView) []engine.OperationView {
+	if len(directMap) == 0 {
+		return slices.Clone(projOps)
+	}
+	if len(projOps) == 0 {
+		out := make([]engine.OperationView, 0, len(directOrder))
+		for _, id := range directOrder {
+			if op, ok := directMap[id]; ok {
+				out = append(out, op)
+			}
+		}
+		return out
+	}
+	merged := make(map[string]engine.OperationView, len(projOps)+len(directMap))
+	order := make([]string, 0, len(projOps)+len(directOrder))
+	for _, op := range projOps {
+		merged[op.OperationID] = op
+		order = append(order, op.OperationID)
+	}
+	for _, id := range directOrder {
+		op, ok := directMap[id]
+		if !ok {
+			continue
+		}
+		if existing, exists := merged[id]; exists {
+			merged[id] = mergeOperationView(existing, op)
+			continue
+		}
+		merged[id] = op
+		order = append(order, id)
+	}
+	out := make([]engine.OperationView, 0, len(order))
+	for _, id := range order {
+		out = append(out, merged[id])
+	}
+	return out
+}
+
+func mergeMetricSlices(projMetrics []engine.MetricPoint, directMap map[string]engine.MetricPoint) []engine.MetricPoint {
+	if len(directMap) == 0 {
+		return cloneMetricPoints(projMetrics)
+	}
+	merged := make(map[string]engine.MetricPoint, len(projMetrics)+len(directMap))
+	for _, pt := range projMetrics {
+		pt.Labels = maps.Clone(pt.Labels)
+		merged[pt.Key] = pt
+	}
+	for k, pt := range directMap {
+		pt.Labels = maps.Clone(pt.Labels)
+		merged[k] = pt
+	}
+	out := make([]engine.MetricPoint, 0, len(merged))
+	for _, pt := range merged {
+		out = append(out, pt)
+	}
+	slices.SortFunc(out, func(a, b engine.MetricPoint) int { return cmp.Compare(a.Key, b.Key) })
+	return out
+}
+
+func mergeBoundedSlices[T any](projItems, directItems []T, maxLen int) []T {
+	total := len(projItems) + len(directItems)
+	if total == 0 {
+		return nil
+	}
+	combined := make([]T, 0, total)
+	combined = append(combined, projItems...)
+	combined = append(combined, directItems...)
+	if maxLen > 0 && len(combined) > maxLen {
+		combined = combined[len(combined)-maxLen:]
+	}
+	return combined
 }
 
 func (m *Model) appendLogChunk(msg LogChunkMsg) {
@@ -132,46 +246,53 @@ func (m *Model) appendLogChunk(msg LogChunkMsg) {
 	if !streamKind.IsValid() {
 		streamKind = events.OutputStreamStdout
 	}
-	for line := range strings.SplitSeq(strings.ReplaceAll(msg.Text, "\r\n", "\n"), "\n") {
-		if line == "" && !msg.Truncated {
+	entry := engine.LogEntry{
+		NodeID:     msg.Target,
+		Stream:     streamKind,
+		Data:       msg.Text,
+		Truncated:  msg.Truncated,
+		OccurredAt: msg.OccurredAt,
+	}
+	m.directLogs = appendNormalizedLogEntry(m.directLogs, entry, m.logLimit())
+	m.rebuildMergedViews()
+}
+
+// appendNormalizedLogEntry 将可能包含多行换行符的单条 LogEntry 拆分为单行记录，
+// 保障视图行窗口分页切片与环形容量上限精确一致。
+func appendNormalizedLogEntry(dst []engine.LogEntry, entry engine.LogEntry, maxLen int) []engine.LogEntry {
+	norm := strings.ReplaceAll(entry.Data, "\r\n", "\n")
+	lines := strings.Split(norm, "\n")
+	if len(lines) > 1 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	for i, line := range lines {
+		if line == "" && !entry.Truncated {
 			continue
 		}
-		m.appendBoundedLog(engine.LogEntry{
-			NodeID: msg.Target, Stream: streamKind, Data: line,
-			Truncated: msg.Truncated, OccurredAt: msg.OccurredAt,
-		})
+		item := entry
+		item.Data = line
+		item.Truncated = entry.Truncated && i == len(lines)-1
+		dst = appendBoundedSlice(dst, item, maxLen)
 	}
+	return dst
 }
 
-func (m *Model) appendUniqueLog(entry engine.LogEntry) {
-	if len(m.logs) > 0 {
-		last := m.logs[len(m.logs)-1]
-		if last.TraceID == entry.TraceID && last.ChunkIndex == entry.ChunkIndex && last.Data == entry.Data && last.OccurredAt.Equal(entry.OccurredAt) {
-			return
-		}
+func (m Model) logLimit() int {
+	if m.maxLogs <= 0 {
+		return defaultMaxLogLines
 	}
-	m.appendBoundedLog(entry)
-}
-
-func (m *Model) appendBoundedLog(entry engine.LogEntry) {
-	limit := m.maxLogs
-	if limit <= 0 {
-		limit = defaultMaxLogLines
-	}
-	m.logs = appendBoundedSlice(m.logs, entry, limit)
+	return m.maxLogs
 }
 
 func (m *Model) applyStreamState(msg StreamStateMsg) {
 	switch msg.Kind {
 	case "metrics":
-		m.metricsActive = msg.Active
-		if msg.Target != "" {
-			m.metricsTarget = msg.Target
+		if !applyStreamSlotState(&m.metricsSeq, &m.metricsActive, &m.metricsTarget, msg) {
+			return
 		}
 	case "logs":
-		m.logsActive = msg.Active
-		if msg.Target != "" {
-			m.logsTarget = msg.Target
+		if !applyStreamSlotState(&m.logsSeq, &m.logsActive, &m.logsTarget, msg) {
+			return
 		}
 	}
 	if msg.Err != nil {
@@ -185,6 +306,20 @@ func (m *Model) applyStreamState(msg StreamStateMsg) {
 		return
 	}
 	m.statusMsg = fmt.Sprintf("%s stream idle", msg.Kind)
+}
+
+func applyStreamSlotState(curSeq *uint64, active *bool, target *string, msg StreamStateMsg) bool {
+	if msg.Seq > 0 && msg.Seq < *curSeq {
+		return false
+	}
+	if msg.Seq > *curSeq {
+		*curSeq = msg.Seq
+	}
+	*active = msg.Active
+	if msg.Target != "" {
+		*target = msg.Target
+	}
+	return true
 }
 
 func (m *Model) applyTakeoverResult(msg TakeoverResultMsg) {
@@ -231,8 +366,7 @@ func appendBoundedSlice[T any](items []T, v T, maxLen int) []T {
 	}
 	if len(items) >= maxLen {
 		copy(items, items[len(items)-maxLen+1:])
-		items[maxLen-1] = v
-		return items[:maxLen]
+		items = items[:maxLen-1]
 	}
 	return append(items, v)
 }

@@ -34,13 +34,18 @@ type Model struct {
 	logScroll        int
 	metricsActive    bool
 	metricsTarget    string
+	metricsSeq       uint64
 	logsActive       bool
 	logsTarget       string
+	logsSeq          uint64
 	latestFrame      algebraic.Option[engine.HostMetricsFrame]
 	gateHalted       bool
 	haltReason       string
 	hasUnknownOut    bool
 	projVersion      uint64
+	projSnap         ProjectionView
+	directEvents     uint64
+	directDropped    uint64
 	totalEvents      uint64
 	droppedEvents    uint64
 	activeStreams    int
@@ -52,6 +57,9 @@ type Model struct {
 	directOpsByID    map[string]engine.OperationView
 	directOpOrder    []string
 	directMetricByID map[string]engine.MetricPoint
+	directLogs       []engine.LogEntry
+	directDiags      []engine.DiagnosticRecord
+	directPool       []engine.PoolRecord
 }
 
 // ModelOptions 控制纯 Model 构造的初始视图、窗口尺寸与可选异步动作派发通道。
@@ -111,19 +119,39 @@ func (m Model) ActiveView() ViewKind                                { return m.a
 func (m Model) FilterQuery() string                                 { return m.filterQuery }
 func (m Model) GateHalted() bool                                    { return m.gateHalted }
 func (m Model) HasUnknownOutcome() bool                             { return m.hasUnknownOut }
+func (m Model) MetricsActive() bool                                 { return m.metricsActive }
+func (m Model) LogsActive() bool                                    { return m.logsActive }
 func (m Model) PendingTakeover() (TakeoverRequest, bool)            { return m.pendingTakeover.Get() }
 func (m Model) LatestMetricsFrame() (engine.HostMetricsFrame, bool) { return m.latestFrame.Get() }
 func (m Model) DroppedEvents() uint64                               { return m.droppedEvents }
 func (m Model) Operations() []engine.OperationView                  { return slices.Clone(m.operations) }
+func (m Model) Metrics() []engine.MetricPoint                       { return slices.Clone(m.metrics) }
 func (m Model) Logs() []engine.LogEntry                             { return slices.Clone(m.logs) }
+func (m Model) Diagnostics() []engine.DiagnosticRecord              { return slices.Clone(m.diagnostics) }
+func (m Model) PoolEvents() []engine.PoolRecord                     { return slices.Clone(m.poolEvents) }
 
-// SelectedTarget 返回当前光标选中的目标节点标识；列表为空时回退至 InitialTarget。
+// SelectedTarget 返回当前光标选中主机的可解析目标规格（节点返回 NodeID，独立主机返回 Endpoint）；列表为空时回退至 InitialTarget。
 func (m Model) SelectedTarget() string {
-	filtered := m.filteredHosts()
-	if len(filtered) > 0 && m.selectedHost >= 0 && m.selectedHost < len(filtered) {
-		return filtered[m.selectedHost].NodeID
+	if item, ok := m.selectedHostItem(); ok {
+		return item.EffectiveTarget()
 	}
 	return m.initialTarget
+}
+
+func (m Model) selectedHostItem() (HostItem, bool) {
+	filtered := m.filteredHosts()
+	if len(filtered) > 0 && m.selectedHost >= 0 && m.selectedHost < len(filtered) {
+		return filtered[m.selectedHost], true
+	}
+	return HostItem{}, false
+}
+
+// resetActiveStreams 在一轮 TUI 运行退出（如切入交互接管）时清零瞬时流活跃标志与序号，防止重入后显示过期 [streaming]。
+func (m *Model) resetActiveStreams() {
+	m.metricsActive = false
+	m.logsActive = false
+	m.metricsSeq = 0
+	m.logsSeq = 0
 }
 
 // Update 实现 tea.Model，按纯消息驱动方式更新工作台状态并按需派发非阻塞后台动作。
@@ -140,6 +168,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyInventoryLoaded(v)
 	case ProjectionUpdatedMsg:
 		m.applyProjectionSnapshot(v.Snapshot)
+	case ProjectionViewMsg:
+		m.applyProjectionView(v.View)
 	case EventProjectedMsg:
 		m.applyProjectedEvent(v)
 	case MetricsFrameMsg:
@@ -150,7 +180,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StreamStateMsg:
 		m.applyStreamState(v)
 	case SystemBusDroppedMsg:
-		m.droppedEvents = max(m.droppedEvents+v.Delta, v.Total)
+		m.directDropped += v.Delta
+		m.droppedEvents = max(m.projSnap.DroppedEvents+m.directDropped, v.Total)
 	case HaltedStateMsg:
 		m.gateHalted, m.haltReason = true, v.Reason
 		m.statusMsg = "CRITICAL: Engine security gate HALTED"
@@ -291,12 +322,17 @@ func (m Model) triggerTakeover() (tea.Model, tea.Cmd) {
 	if m.activeView != ViewHosts || !m.canTakeover {
 		return m, nil
 	}
-	target := m.SelectedTarget()
+	nodeID, target := "", m.initialTarget
+	if item, ok := m.selectedHostItem(); ok {
+		nodeID, target = item.NodeID, item.EffectiveTarget()
+	} else {
+		nodeID = target
+	}
 	if target == "" {
 		m.lastErr = "no host selected for interactive session"
 		return m, nil
 	}
-	m.pendingTakeover = algebraic.Some(TakeoverRequest{NodeID: target, TargetSpec: target})
+	m.pendingTakeover = algebraic.Some(TakeoverRequest{NodeID: nodeID, TargetSpec: target})
 	m.quitting = true
 	return m, tea.Quit
 }

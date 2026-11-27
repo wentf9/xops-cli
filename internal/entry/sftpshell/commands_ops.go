@@ -52,7 +52,7 @@ func (s *Shell) cmdPut(ctx context.Context, args []string) error {
 	if len(f.args) < 1 || len(f.args) > 2 {
 		return fmt.Errorf("%w: 用法: put [-r] [-n] [--resume] [-p] <local-path> [remote-path]", ErrSyntax)
 	}
-	src, baseName, err := s.buildUploadSource(f.args[0])
+	src, baseName, err := s.buildUploadSource(f.args[0], f.recursive)
 	if err != nil {
 		return err
 	}
@@ -73,7 +73,7 @@ func (s *Shell) cmdPut(ctx context.Context, args []string) error {
 			Resume:        f.resume,
 			PreserveMode:  f.preserve,
 			PreserveTimes: f.preserve,
-			SymlinkPolicy: s.symlinkPolicy,
+			SymlinkPolicy: s.uploadSymlinkPolicy(f.recursive),
 		})
 		return uErr
 	})
@@ -84,22 +84,47 @@ func (s *Shell) cmdPut(ctx context.Context, args []string) error {
 	return nil
 }
 
-func (s *Shell) buildUploadSource(rawLocal string) (engine.LocalUploadSource, string, error) {
+// buildUploadSource 按模式与递归标志构造满足 core/engine.SCPUpload 不变量的上传源：
+//   - ScopedLocalOnly=true：始终锚定于不可变 sandboxRoot（ScopedUploadSource）；
+//   - 递归目录上传（put -r）：即便在默认操作员模式也构造 ScopedUploadSource（Engine 仅允许 *os.Root 遍历目录树）；
+//   - 单文件操作员上传：构造 OperatorUploadSource。
+func (s *Shell) buildUploadSource(rawLocal string, recursive bool) (engine.LocalUploadSource, string, error) {
 	if s.scopedLocalOnly {
-		norm := strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(rawLocal), `\`, "/"), "./")
-		rel, err := pathalg.ParseLocalRootedDest(norm)
+		rel, err := resolveScopedUploadTarget(s.sandboxSub, rawLocal)
 		if err != nil {
 			return zeroVal[engine.LocalUploadSource](), "", err
 		}
-		src, err := engine.NewScopedUploadSource(s.localDir, rel)
+		src, err := engine.NewScopedUploadSource(s.sandboxRoot, rel)
 		return src, rel.Base(), err
 	}
 	srcPath, err := resolveLocalUploadPath(s.localDir, rawLocal)
 	if err != nil {
 		return zeroVal[engine.LocalUploadSource](), "", err
 	}
+	if recursive {
+		relBase, err := pathalg.ParseLocalRootedDest(srcPath.Base())
+		if err != nil {
+			return zeroVal[engine.LocalUploadSource](), "", err
+		}
+		src, err := engine.NewScopedUploadSource(srcPath.Dir(), relBase)
+		return src, relBase.Base(), err
+	}
 	src, err := engine.NewOperatorUploadSource(srcPath, s.symlinkPolicy)
 	return src, srcPath.Base(), err
+}
+
+func (s *Shell) uploadSymlinkPolicy(recursive bool) pathalg.SymlinkPolicy {
+	if recursive && s.symlinkPolicy == pathalg.SymlinkFollowOperatorSource {
+		return pathalg.SymlinkReject
+	}
+	return s.symlinkPolicy
+}
+
+func (s *Shell) downloadSymlinkPolicy() pathalg.SymlinkPolicy {
+	if s.symlinkPolicy == pathalg.SymlinkFollowOperatorSource {
+		return pathalg.SymlinkReject
+	}
+	return s.symlinkPolicy
 }
 
 func (s *Shell) resolvePutRemoteDest(args []string, localBase string) (pathalg.RemotePath, bool, error) {
@@ -131,7 +156,7 @@ func (s *Shell) cmdGet(ctx context.Context, args []string) error {
 	if len(f.args) == 2 {
 		localArg = f.args[1]
 	}
-	localRoot, localDest, err := resolveLocalDownloadTarget(s.localDir, remoteSrc, localArg)
+	localRoot, localDest, err := resolveLocalDownloadTarget(s.localDir, s.sandboxRoot, s.sandboxSub, s.scopedLocalOnly, remoteSrc, localArg)
 	if err != nil {
 		return err
 	}
@@ -147,7 +172,7 @@ func (s *Shell) cmdGet(ctx context.Context, args []string) error {
 			NoClobber:     f.noClobber,
 			Resume:        f.resume,
 			PreserveTimes: f.preserve,
-			SymlinkPolicy: s.symlinkPolicy,
+			SymlinkPolicy: s.downloadSymlinkPolicy(),
 		})
 		return dErr
 	})
@@ -182,23 +207,12 @@ func (s *Shell) cmdCat(ctx context.Context, args []string) error {
 }
 
 func (s *Shell) cmdWrite(ctx context.Context, args []string) error {
-	noClobber, createParents := false, false
-	var positional []string
-	for _, arg := range args {
-		switch arg {
-		case "-n", "--no-clobber":
-			noClobber = true
-		case "-p", "--parents":
-			createParents = true
-		default:
-			if strings.HasPrefix(arg, "-") && len(positional) == 0 {
-				return fmt.Errorf("%w: write 未知选项 %q", ErrSyntax, arg)
-			}
-			positional = append(positional, arg)
-		}
+	noClobber, createParents, positional, err := parseWriteArgs(args)
+	if err != nil {
+		return err
 	}
 	if len(positional) < 2 {
-		return fmt.Errorf("%w: 用法: write [-n] [-p] <remote-path> <content>", ErrSyntax)
+		return fmt.Errorf("%w: 用法: write [-n] [-p] [--] <remote-path> <content>", ErrSyntax)
 	}
 	target, err := resolveRemotePath(s.remoteDir, positional[0])
 	if err != nil {
@@ -217,6 +231,32 @@ func (s *Shell) cmdWrite(ctx context.Context, args []string) error {
 	}
 	_, _ = fmt.Fprintf(s.stdout, "wrote %s (%d bytes)\n", target.String(), res.BytesWritten)
 	return nil
+}
+
+// parseWriteArgs 仅在遇到首个位置参数或 "--" 之前解析 -n/-p 选项，避免正文内容中的 "-n"/"-p" 被误删。
+func parseWriteArgs(args []string) (noClobber, createParents bool, positional []string, err error) {
+	parsingFlags := true
+	for _, arg := range args {
+		if !parsingFlags {
+			positional = append(positional, arg)
+			continue
+		}
+		switch arg {
+		case "--":
+			parsingFlags = false
+		case "-n", "--no-clobber":
+			noClobber = true
+		case "-p", "--parents":
+			createParents = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return false, false, nil, fmt.Errorf("%w: write 未知选项 %q", ErrSyntax, arg)
+			}
+			parsingFlags = false
+			positional = append(positional, arg)
+		}
+	}
+	return noClobber, createParents, positional, nil
 }
 
 func (s *Shell) cmdRename(ctx context.Context, args []string) error {

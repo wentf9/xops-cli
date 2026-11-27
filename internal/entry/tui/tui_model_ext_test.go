@@ -355,3 +355,101 @@ func TestModel_ViewKindCycleFilterEditSortScrollAndBanners(t *testing.T) {
 		t.Fatalf("Drop 计数或 Takeover 错误横幅缺失: dropped=%d\n%s", m.DroppedEvents(), m.View().Content)
 	}
 }
+
+func TestModel_MultiTickProjectionNoLogDuplicationAndNoDirectClobber(t *testing.T) {
+	m := tui.NewModel(tui.ModelOptions{InitialWidth: 100, InitialHeight: 24, MaxLogLines: 10})
+	ts := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+
+	// 先投递一条直连 OperationStream 事件，验证后续 Projection 更新不会将其抹除。
+	opMeta := mustTestMeta(t, true)
+	started := mustOK(t, "OpStarted", func() (events.Event, error) {
+		return events.NewOperationStartedEvent(events.OperationStartedSpec{
+			Meta: opMeta, Capability: security.CapabilityInspect, Tool: "direct", Action: "ping", Summary: "direct op",
+		})
+	})
+	directMsg := mustOK(t, "ProjectEvent", func() (tea.Msg, error) { return tui.ProjectEvent(started) })
+	next, _ := m.Update(directMsg)
+	m = next.(tui.Model)
+
+	log0 := engine.LogEntry{TraceID: "t1", NodeID: "n1", Stream: events.OutputStreamStdout, ChunkIndex: 1, Data: "alpha\nbeta\n", OccurredAt: ts}
+	log1 := engine.LogEntry{TraceID: "t1", NodeID: "n1", Stream: events.OutputStreamStdout, ChunkIndex: 2, Data: "gamma", OccurredAt: ts}
+	log2 := engine.LogEntry{TraceID: "t1", NodeID: "n1", Stream: events.OutputStreamStderr, ChunkIndex: 3, Data: "delta", OccurredAt: ts}
+	projOp := engine.OperationView{OperationID: "proj-op-1", Tool: "obs", Action: "metrics", Summary: "proj"}
+
+	// v1 -> v2 -> v3 重复携带全量历史 snap.Logs()，绝不可产生任何重复行，且必须保留直连 op。
+	for _, view := range []tui.ProjectionView{
+		{Valid: true, Version: 1, TotalEvents: 1, Operations: []engine.OperationView{projOp}, Logs: []engine.LogEntry{log0}},
+		{Valid: true, Version: 2, TotalEvents: 2, Operations: []engine.OperationView{projOp}, Logs: []engine.LogEntry{log0, log1}},
+		{Valid: true, Version: 3, TotalEvents: 3, Operations: []engine.OperationView{projOp}, Logs: []engine.LogEntry{log0, log1}, Metrics: []engine.MetricPoint{{Key: "k1", Name: "cpu", Value: 50}}},
+	} {
+		next, _ = m.Update(tui.ProjectionViewMsg{View: view})
+		m = next.(tui.Model)
+	}
+	wantLines := []string{"alpha", "beta", "gamma"}
+	assertLogLinesEqual(t, m.Logs(), wantLines)
+	if len(m.Operations()) != 2 || len(m.Metrics()) != 1 {
+		t.Fatalf("Projection 与直连事件合并异常: ops=%d metrics=%d", len(m.Operations()), len(m.Metrics()))
+	}
+
+	// 陈旧版本 v2 必须被忽略；v4 环形淘汰 log0 后应准确反映 [gamma, delta]。
+	next, _ = m.Update(tui.ProjectionViewMsg{View: tui.ProjectionView{Valid: true, Version: 2, Logs: []engine.LogEntry{log0}}})
+	m = next.(tui.Model)
+	assertLogLinesEqual(t, m.Logs(), wantLines)
+
+	next, _ = m.Update(tui.ProjectionViewMsg{View: tui.ProjectionView{Valid: true, Version: 4, TotalEvents: 4, Logs: []engine.LogEntry{log1, log2}}})
+	m = next.(tui.Model)
+	assertLogLinesEqual(t, m.Logs(), []string{"gamma", "delta"})
+}
+
+func assertLogLinesEqual(t *testing.T, got []engine.LogEntry, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("日志行数失配: got=%d (%+v) want=%d (%v)", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i].Data != want[i] {
+			t.Fatalf("logs[%d].Data=%q，期望 %q", i, got[i].Data, want[i])
+		}
+	}
+}
+
+func TestModel_StandaloneHostTargetAndStreamSeqOrdering(t *testing.T) {
+	hStandaloneID := mustOK(t, "ParseHostID", func() (inventory.HostID, error) { return inventory.ParseHostID("z-bare") })
+	ep := mustOK(t, "ParseEndpoint", func() (netaddr.Endpoint, error) { return netaddr.ParseEndpoint("10.9.9.9:2222") })
+	hStandalone := mustOK(t, "NewHost", func() (inventory.Host, error) {
+		return inventory.NewHost(inventory.HostSpec{ID: hStandaloneID, Endpoint: ep})
+	})
+	hNodeID := mustOK(t, "ParseHostID", func() (inventory.HostID, error) { return inventory.ParseHostID("a-host") })
+	ep2 := mustOK(t, "ParseEndpoint", func() (netaddr.Endpoint, error) { return netaddr.ParseEndpoint("10.0.0.1:22") })
+	hNode := mustOK(t, "NewHost", func() (inventory.Host, error) {
+		return inventory.NewHost(inventory.HostSpec{ID: hNodeID, Endpoint: ep2})
+	})
+
+	// 故意乱序输入两台独立主机，验证 BuildHostItemsFromEntities 确定性排序及独立主机 EffectiveTarget 解析为 Endpoint。
+	items := tui.BuildHostItemsFromEntities([]inventory.Host{hStandalone, hNode}, nil, nil)
+	if len(items) != 2 || items[0].NodeID != "a-host" || items[1].NodeID != "z-bare" {
+		t.Fatalf("HostItem 未确定性排序: %+v", items)
+	}
+	if items[1].EffectiveTarget() != "10.9.9.9:2222" {
+		t.Fatalf("独立 Host 目标应解析为 Endpoint，实际=%q", items[1].EffectiveTarget())
+	}
+
+	m := tui.NewModel(tui.ModelOptions{CanTakeover: true})
+	var next tea.Model
+	next, _ = m.Update(tui.InventoryLoadedMsg{Hosts: items})
+	m = next.(tui.Model)
+	next, _ = m.Update(tea.KeyPressMsg{Code: 'j', Text: "j"})
+	m = next.(tui.Model)
+	if m.SelectedTarget() != "10.9.9.9:2222" {
+		t.Fatalf("选中独立 Host 期望 SelectedTarget=10.9.9.9:2222，实际=%q", m.SelectedTarget())
+	}
+
+	// 验证旧流延迟到达的 idle 状态不会覆盖新序号流状态。
+	next, _ = m.Update(tui.StreamStateMsg{Kind: "metrics", Target: "host-b", Active: true, Seq: 2})
+	m = next.(tui.Model)
+	next, _ = m.Update(tui.StreamStateMsg{Kind: "metrics", Target: "host-a", Active: false, Seq: 1})
+	m = next.(tui.Model)
+	if !m.MetricsActive() {
+		t.Fatalf("陈旧序号 Seq=1 的 idle 消息不应覆盖 Seq=2 的活跃状态")
+	}
+}

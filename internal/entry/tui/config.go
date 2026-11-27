@@ -16,17 +16,19 @@ import (
 )
 
 const (
-	defaultMaxLogLines    = 512
-	defaultMaxMetrics     = 256
-	defaultMaxOperations  = 256
-	defaultMaxSystemItems = 256
-	defaultStreamBuffer   = 64
-	defaultTopProcesses   = 10
-	defaultLogTailLines   = 100
-	defaultActionQueueCap = 32
-	defaultWindowWidth    = 100
-	defaultWindowHeight   = 30
-	defaultRemoteLogPath  = "/var/log/syslog"
+	defaultMaxLogLines     = 512
+	defaultMaxMetrics      = 256
+	defaultMaxOperations   = 256
+	defaultMaxSystemItems  = 256
+	defaultStreamBuffer    = 64
+	defaultTopProcesses    = 10
+	defaultLogTailLines    = 100
+	defaultActionQueueCap  = 32
+	defaultWindowWidth     = 100
+	defaultWindowHeight    = 30
+	defaultRemoteLogPath   = "/var/log/syslog"
+	metricsBatchMaxSamples = 10000
+	maxLineBufferBytes     = 64 << 10
 )
 
 // 本包导出的不可变哨兵错误，供组合根 cmd/xops、entry/cli 与测试通过 errors.Is 精确区分故障类别。
@@ -60,10 +62,17 @@ type ProjectionSource interface {
 	Close() error
 }
 
+// InventorySnapshotClient 为支持单次原子资产图快照查询的可选扩展接口（由 *engine.Engine 原生实现），
+// 优先使用可避免多次拆分列表调用引发的撕裂读与冗余审计条目。
+type InventorySnapshotClient interface {
+	GetInventorySnapshot(ctx context.Context, req engine.InventoryQueryRequest) (engine.InventorySnapshot, error)
+}
+
 // 编译期契约断言：确保 *engine.Engine 与 *engine.Projection 完整满足本包入站依赖接口。
 var (
-	_ EngineClient     = (*engine.Engine)(nil)
-	_ ProjectionSource = (*engine.Projection)(nil)
+	_ EngineClient            = (*engine.Engine)(nil)
+	_ InventorySnapshotClient = (*engine.Engine)(nil)
+	_ ProjectionSource        = (*engine.Projection)(nil)
 )
 
 // TerminalHooks 提供可选的宿主终端接管/释放/恢复生命周期钩子，供组合根与无头测试观测终端状态确定性收尾。
@@ -122,8 +131,10 @@ type Config struct {
 	InitialTarget string
 	CLIOptions    option.OptionLayer
 
-	// MetricsInterval / MetricsTopProcesses / DefaultLogTarget / LogTailLines 控制实时指标与日志流默认参数。
+	// MetricsInterval / MetricsMaxSamples / MetricsTopProcesses / DefaultLogTarget / LogTailLines 控制实时指标与日志流默认参数。
+	// MetricsMaxSamples 为 0 时采用核心允许的单批最大连续采样数（10000），并在到达批次上限后自动续接，避免单样本退出与 0% 增量 CPU。
 	MetricsInterval     algebraic.Option[algebraic.Duration]
+	MetricsMaxSamples   int
 	MetricsTopProcesses int
 	DefaultLogTarget    algebraic.Option[engine.LogTarget]
 	LogTailLines        int
@@ -148,8 +159,9 @@ func validateConfig(cfg Config) error {
 		return fmt.Errorf("%w: 无效的 InitialView (%d)", ErrInvalidConfig, cfg.InitialView)
 	}
 	if cfg.InitialWidth < 0 || cfg.InitialHeight < 0 || cfg.MaxLogLines < 0 || cfg.MaxStreamBuffer < 0 ||
+		cfg.MetricsMaxSamples < 0 || cfg.MetricsMaxSamples > metricsBatchMaxSamples ||
 		cfg.MetricsTopProcesses < 0 || cfg.LogTailLines < 0 {
-		return fmt.Errorf("%w: 窗口尺寸、缓冲容量与采样条数不能为负", ErrInvalidConfig)
+		return fmt.Errorf("%w: 窗口尺寸、缓冲容量与采样条数越界", ErrInvalidConfig)
 	}
 	if err := cfg.CLIOptions.Validate(); err != nil {
 		return fmt.Errorf("%w: CLIOptions 无效: %w", ErrInvalidConfig, err)

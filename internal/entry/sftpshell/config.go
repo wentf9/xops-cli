@@ -95,9 +95,11 @@ type Config struct {
 	// LocalFS 为可选本机目录查询回调（用于 lls 与 lcd 目录存在性校验）。
 	LocalFS LocalFS
 
-	// ScopedLocalOnly 为 true 时，put 使用 NewScopedUploadSource（沙箱模式）；默认使用 NewOperatorUploadSource。
+	// ScopedLocalOnly 为 true 时，将 InitialLocalDir（默认 "."）锁定为不可越出的本地沙箱根目录：
+	// lcd/lls/put/get 均拒绝绝对本地路径与向上穿越 ".."，且 put/get 始终锚定于该沙箱根目录（ScopedRootFS）。
 	ScopedLocalOnly bool
-	// SymlinkPolicy 控制本地/远端传输软链策略（零值 pathalg.SymlinkReject 严格失败关闭）。
+	// SymlinkPolicy 控制传输软链策略（零值 pathalg.SymlinkReject 严格失败关闭）。
+	// ScopedLocalOnly=true 时严禁配置 SymlinkFollowOperatorSource；非沙箱模式下该策略仅作用于单文件 put，get 与 put -r 收紧为 SymlinkReject。
 	SymlinkPolicy pathalg.SymlinkPolicy
 
 	// InterruptCh 为可选单命令取消信号通道：收到信号时仅取消当前在途命令并恢复提示符，不退出整个 Shell。
@@ -151,6 +153,9 @@ func validateOptionalConfig(cfg Config) error {
 	}
 	if !cfg.SymlinkPolicy.IsValid() {
 		return fmt.Errorf("%w: SymlinkPolicy 无效", ErrInvalidConfig)
+	}
+	if cfg.ScopedLocalOnly && cfg.SymlinkPolicy == pathalg.SymlinkFollowOperatorSource {
+		return fmt.Errorf("%w: ScopedLocalOnly 沙箱模式下禁止使用 SymlinkFollowOperatorSource", ErrInvalidConfig)
 	}
 	if d, ok := cfg.CommandTimeout.Get(); ok && !d.IsPositive() {
 		return fmt.Errorf("%w: CommandTimeout 必须为正时长", ErrInvalidConfig)

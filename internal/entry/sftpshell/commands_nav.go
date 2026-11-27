@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 )
 
@@ -99,7 +100,7 @@ func (s *Shell) cmdLCD(ctx context.Context, args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("%w: 用法: lcd <local-path>", ErrSyntax)
 	}
-	nextDir, err := resolveLocalDir(s.localDir, args[0])
+	nextDir, nextSub, err := s.resolveLocalDirArg(args[0])
 	if err != nil {
 		return err
 	}
@@ -113,7 +114,23 @@ func (s *Shell) cmdLCD(ctx context.Context, args []string) error {
 		}
 	}
 	s.localDir = nextDir
+	if s.scopedLocalOnly {
+		s.sandboxSub = nextSub
+	}
 	return nil
+}
+
+func (s *Shell) resolveLocalDirArg(raw string) (pathalg.LocalDir, []string, error) {
+	if s.scopedLocalOnly {
+		nextSub, err := resolveScopedLocalSegments(s.sandboxSub, raw)
+		if err != nil {
+			return zeroVal[pathalg.LocalDir](), nil, err
+		}
+		nextDir, err := joinLocalDirSegments(s.sandboxRoot, nextSub)
+		return nextDir, nextSub, err
+	}
+	nextDir, err := resolveLocalDir(s.localDir, raw)
+	return nextDir, nil, err
 }
 
 func (s *Shell) cmdLLS(ctx context.Context, args []string) error {
@@ -126,7 +143,7 @@ func (s *Shell) cmdLLS(ctx context.Context, args []string) error {
 	}
 	target := s.localDir
 	if pathArg != "" {
-		if target, err = resolveLocalDir(s.localDir, pathArg); err != nil {
+		if target, _, err = s.resolveLocalDirArg(pathArg); err != nil {
 			return err
 		}
 	}
@@ -321,7 +338,8 @@ func shellHelpSummary() string {
   Metadata & Inspection:
     chmod <octal-mode> <remote-path>                Change remote file permissions (0001..0777)
     chtimes <mtime> <remote-path>                   Update remote atime/mtime (or <atime> <mtime> <path>)
-    stat [-L] <remote-path>                         Inspect remote metadata & FSTAT anchor (alias: lstat)
+    stat [-L] <remote-path>                         Inspect remote metadata & FSTAT anchor (follows symlinks)
+    lstat <remote-path>                             Inspect remote metadata without following symlinks
     realpath <remote-path>                          Resolve canonical remote path
     readlink <remote-path>                          Read remote symlink target
 
@@ -345,8 +363,10 @@ func shellHelpTopic(topic string) (string, bool) {
 		return "chtimes <mtime> <remote-path> | chtimes <atime> <mtime> <remote-path>: set RFC3339 or Unix epoch timestamps", true
 	case "write":
 		return "write [-n|--no-clobber] [-p|--parents] <remote-path> <text>: atomically write UTF-8 text to remote file", true
-	case "stat", "lstat":
-		return "stat [-L|--follow] <remote-path> / lstat <remote-path>: display type, mode, size, mtime, and FSTAT anchor", true
+	case "stat":
+		return "stat [-L|--follow] <remote-path>: inspect remote metadata & FSTAT anchor (follows symlinks by default)", true
+	case "lstat":
+		return "lstat <remote-path>: inspect remote metadata & FSTAT anchor without following symlinks (pass -L to follow)", true
 	case "cd", "pwd", "ls", "lpwd", "lcd", "lls", "mkdir", "rm", "rmdir", "cat", "realpath", "readlink", "exit", "quit", "bye":
 		return fmt.Sprintf("command %q: run 'help' to see full command reference", topic), true
 	default:

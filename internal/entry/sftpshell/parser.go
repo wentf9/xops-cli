@@ -3,6 +3,7 @@ package sftpshell
 import (
 	"fmt"
 	"io/fs"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -119,12 +120,32 @@ func resolveRemotePath(cwd pathalg.RemotePath, raw string) (pathalg.RemotePath, 
 	return cwd.Resolve(target)
 }
 
-// resolveLocalDir 基于纯 pathalg.LocalDir 代数解析本机目录切换（支持绝对路径、"."、".." 与多段相对路径），
+// rejectDisallowedLocalInput 在任何路径规范化之前严格拦截禁止的 UNC、设备命名空间、根相对反斜杠、
+// 盘符相对路径（如 C:foo）以及混用反斜杠的 POSIX 绝对路径，保持与 core/domain/pathalg 失败关闭语义一致。
+func rejectDisallowedLocalInput(raw string) error {
+	if strings.HasPrefix(raw, `\`) || strings.HasPrefix(raw, "//") || strings.HasPrefix(raw, "/??/") || raw == "/??" {
+		return fmt.Errorf("%w: 本地路径 %q 使用了禁止的 UNC、设备命名空间或根相对反斜杠前缀", ErrSyntax, raw)
+	}
+	if len(raw) >= 2 && isASCIIAlpha(raw[0]) && raw[1] == ':' {
+		if len(raw) < 3 || (raw[2] != '/' && raw[2] != '\\') {
+			return fmt.Errorf("%w: 本地路径 %q 为禁止的盘符相对路径", ErrSyntax, raw)
+		}
+	}
+	if strings.HasPrefix(raw, "/") && strings.ContainsRune(raw, '\\') {
+		return fmt.Errorf("%w: POSIX 绝对路径 %q 禁止混用反斜杠", ErrSyntax, raw)
+	}
+	return nil
+}
+
+// resolveLocalDir 基于纯 pathalg.LocalDir 代数解析操作员模式下的本机目录切换（支持绝对路径、"."、".." 与多段相对路径），
 // 绝不依赖 path/filepath 或 os.Getwd/os.Chdir。
 func resolveLocalDir(cwd pathalg.LocalDir, raw string) (pathalg.LocalDir, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return zeroVal[pathalg.LocalDir](), fmt.Errorf("%w: 本地目录路径不能为空", ErrSyntax)
+	}
+	if err := rejectDisallowedLocalInput(trimmed); err != nil {
+		return zeroVal[pathalg.LocalDir](), err
 	}
 	if isAbsLocalInput(trimmed) {
 		return pathalg.ParseLocalDir(trimmed)
@@ -137,11 +158,57 @@ func resolveLocalDir(cwd pathalg.LocalDir, raw string) (pathalg.LocalDir, error)
 	return rebuildLocalDir(cwd, segs)
 }
 
+// resolveScopedLocalSegments 在 ScopedLocalOnly 模式下严格将输入解析为位于 sandboxRoot 之内的相对分量切片：
+// 拒绝一切绝对路径、非法前缀、非法本地分量及向上穿越 sandboxRoot 的 ".."。
+func resolveScopedLocalSegments(curSub []string, raw string) ([]string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return nil, fmt.Errorf("%w: 本地路径不能为空", ErrSyntax)
+	}
+	if err := rejectDisallowedLocalInput(trimmed); err != nil {
+		return nil, err
+	}
+	if isAbsLocalInput(trimmed) {
+		return nil, fmt.Errorf("%w: ScopedLocalOnly 沙箱模式下禁止使用绝对本地路径 %q", ErrSyntax, raw)
+	}
+	return walkContainedRelSegments(curSub, strings.ReplaceAll(trimmed, `\`, "/"))
+}
+
+func walkContainedRelSegments(baseSub []string, norm string) ([]string, error) {
+	segs := slices.Clone(baseSub)
+	for part := range strings.SplitSeq(norm, "/") {
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(segs) == 0 {
+				return nil, fmt.Errorf("%w: 本地路径禁止通过 '..' 越出沙箱根目录", ErrSyntax)
+			}
+			segs = segs[:len(segs)-1]
+		default:
+			if err := pathalg.ValidateLocalComponent(part); err != nil {
+				return nil, fmt.Errorf("%w: 非法本地路径分量 %q: %w", ErrSyntax, part, err)
+			}
+			segs = append(segs, part)
+		}
+	}
+	return segs, nil
+}
+
+func joinLocalDirSegments(base pathalg.LocalDir, extra []string) (pathalg.LocalDir, error) {
+	segs := append(localDirSegments(base), extra...)
+	return rebuildLocalDir(base, segs)
+}
+
 func isAbsLocalInput(raw string) bool {
 	if strings.HasPrefix(raw, "/") {
 		return true
 	}
 	return len(raw) >= 3 && isASCIIAlpha(raw[0]) && raw[1] == ':' && (raw[2] == '/' || raw[2] == '\\')
+}
+
+func isDirInputHint(raw string) bool {
+	return raw == "." || raw == "./" || raw == `.\` || strings.HasSuffix(raw, "/") || strings.HasSuffix(raw, `\`)
 }
 
 func isASCIIAlpha(b byte) bool {
@@ -211,11 +278,14 @@ func rebuildLocalDir(base pathalg.LocalDir, segs []string) (pathalg.LocalDir, er
 	}
 }
 
-// resolveLocalUploadPath 解析 put 命令的本机源文件路径，支持相对当前 localDir 或显式绝对本地路径。
+// resolveLocalUploadPath 解析操作员模式下 put 命令的本机源文件路径，支持相对当前 localDir 或显式绝对本地路径。
 func resolveLocalUploadPath(cwd pathalg.LocalDir, raw string) (pathalg.LocalSourcePath, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
 		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("%w: 本地源路径不能为空", ErrSyntax)
+	}
+	if err := rejectDisallowedLocalInput(trimmed); err != nil {
+		return zeroVal[pathalg.LocalSourcePath](), err
 	}
 	if isAbsLocalInput(trimmed) {
 		return pathalg.ParseLocalSourcePath(trimmed)
@@ -227,37 +297,137 @@ func resolveLocalUploadPath(cwd pathalg.LocalDir, raw string) (pathalg.LocalSour
 	return pathalg.ParseLocalSourcePath(dir.String())
 }
 
-// resolveLocalDownloadTarget 解析 get 命令的本地沙箱根与相对落盘目标，确保远端文件名经 ValidateLocalComponent 校验。
-func resolveLocalDownloadTarget(cwd pathalg.LocalDir, remote pathalg.RemotePath, localArg string) (pathalg.LocalDir, pathalg.LocalRootedDest, error) {
+// resolveScopedUploadTarget 解析 ScopedLocalOnly 模式下相对 sandboxRoot 的上传源路径，严禁逃逸或指向空根 "."。
+func resolveScopedUploadTarget(sandboxSub []string, raw string) (pathalg.LocalRootedDest, error) {
+	segs, err := resolveScopedLocalSegments(sandboxSub, raw)
+	if err != nil {
+		return zeroVal[pathalg.LocalRootedDest](), err
+	}
+	if len(segs) == 0 {
+		return zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: ScopedLocalOnly 上传源路径不能为沙箱根目录 '.'", ErrSyntax)
+	}
+	return pathalg.LocalRootedDestFromComponents(segs...)
+}
+
+// resolveLocalDownloadTarget 解析 get 命令的本地沙箱根与相对落盘目标，支持 "." 与尾斜杠目录写法；
+// 当 scopedOnly 为 true 时强制锚定于不可变 sandboxRoot 并禁止任何绝对路径或越界穿越。
+func resolveLocalDownloadTarget(
+	cwd, sandboxRoot pathalg.LocalDir,
+	sandboxSub []string,
+	scopedOnly bool,
+	remote pathalg.RemotePath,
+	localArg string,
+) (pathalg.LocalDir, pathalg.LocalRootedDest, error) {
 	trimmed := strings.TrimSpace(localArg)
+	if scopedOnly {
+		return resolveScopedDownloadTarget(sandboxRoot, sandboxSub, remote, trimmed)
+	}
+	return resolveOperatorDownloadTarget(cwd, remote, trimmed)
+}
+
+func resolveScopedDownloadTarget(
+	sandboxRoot pathalg.LocalDir,
+	sandboxSub []string,
+	remote pathalg.RemotePath,
+	trimmed string,
+) (pathalg.LocalDir, pathalg.LocalRootedDest, error) {
+	var segs []string
+	appendRemoteBase := trimmed == "" || isDirInputHint(trimmed)
 	if trimmed == "" {
-		base, ok := remote.Base()
-		if !ok {
-			return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: 无法从远端路径 %q 推导本地文件名，请显式指定目标路径", ErrSyntax, remote.String())
-		}
-		dest, err := pathalg.ParseLocalRootedDest(base.String())
-		if err != nil {
+		segs = slices.Clone(sandboxSub)
+	} else {
+		var err error
+		if segs, err = resolveScopedLocalSegments(sandboxSub, trimmed); err != nil {
 			return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
 		}
-		return cwd, dest, nil
 	}
-	if isAbsLocalInput(trimmed) {
-		src, err := pathalg.ParseLocalSourcePath(trimmed)
+	if appendRemoteBase {
+		base, err := remoteBaseComponent(remote)
 		if err != nil {
 			return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
 		}
-		dest, err := pathalg.ParseLocalRootedDest(src.Base())
-		if err != nil {
-			return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
-		}
-		return src.Dir(), dest, nil
+		segs = append(segs, base)
 	}
-	norm := strings.ReplaceAll(trimmed, `\`, "/")
-	dest, err := pathalg.ParseLocalRootedDest(strings.TrimPrefix(norm, "./"))
+	if len(segs) == 0 {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: 下载目标路径无效", ErrSyntax)
+	}
+	dest, err := pathalg.LocalRootedDestFromComponents(segs...)
 	if err != nil {
 		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
 	}
-	return cwd, dest, nil
+	return sandboxRoot, dest, nil
+}
+
+func resolveOperatorDownloadTarget(
+	cwd pathalg.LocalDir,
+	remote pathalg.RemotePath,
+	trimmed string,
+) (pathalg.LocalDir, pathalg.LocalRootedDest, error) {
+	if trimmed == "" {
+		return downloadIntoDir(cwd, remote)
+	}
+	if err := rejectDisallowedLocalInput(trimmed); err != nil {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+	}
+	if isDirInputHint(trimmed) {
+		dir, err := resolveLocalDir(cwd, trimmed)
+		if err != nil {
+			return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+		}
+		return downloadIntoDir(dir, remote)
+	}
+	if isAbsLocalInput(trimmed) {
+		return splitAbsLocalFileTarget(trimmed)
+	}
+	norm := strings.ReplaceAll(trimmed, `\`, "/")
+	if segs, err := walkContainedRelSegments(nil, norm); err == nil && len(segs) > 0 {
+		dest, dErr := pathalg.LocalRootedDestFromComponents(segs...)
+		if dErr != nil {
+			return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), dErr
+		}
+		return cwd, dest, nil
+	}
+	src, err := resolveLocalUploadPath(cwd, trimmed)
+	if err != nil {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+	}
+	dest, err := pathalg.ParseLocalRootedDest(src.Base())
+	if err != nil {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+	}
+	return src.Dir(), dest, nil
+}
+
+func downloadIntoDir(dir pathalg.LocalDir, remote pathalg.RemotePath) (pathalg.LocalDir, pathalg.LocalRootedDest, error) {
+	base, err := remoteBaseComponent(remote)
+	if err != nil {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+	}
+	dest, err := pathalg.ParseLocalRootedDest(base)
+	if err != nil {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+	}
+	return dir, dest, nil
+}
+
+func splitAbsLocalFileTarget(trimmed string) (pathalg.LocalDir, pathalg.LocalRootedDest, error) {
+	src, err := pathalg.ParseLocalSourcePath(trimmed)
+	if err != nil {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+	}
+	dest, err := pathalg.ParseLocalRootedDest(src.Base())
+	if err != nil {
+		return zeroVal[pathalg.LocalDir](), zeroVal[pathalg.LocalRootedDest](), err
+	}
+	return src.Dir(), dest, nil
+}
+
+func remoteBaseComponent(remote pathalg.RemotePath) (string, error) {
+	base, ok := remote.Base()
+	if !ok {
+		return "", fmt.Errorf("%w: 无法从远端路径 %q 推导本地文件名，请显式指定目标路径", ErrSyntax, remote.String())
+	}
+	return base.String(), nil
 }
 
 // parseOctalPerm 严格解析 POSIX 权限八进制数字（0o001..0o777，拒绝零值与越界特殊位）。

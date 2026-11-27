@@ -1,13 +1,16 @@
 package tui
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/wentf9/xops-cli/core/conc"
+	"github.com/wentf9/xops-cli/core/events"
 )
 
 // terminalGuard 保证宿主终端接管/释放/恢复钩子在正常退出、Ctrl+C、ctx 取消或错误路径下严格有序且幂等执行。
@@ -99,8 +102,23 @@ func Run(ctx context.Context, cfg Config) (retErr error) {
 			}
 		}()
 	}
+	if err := attachInitialProjectionStreams(proj, cfg.OperationStreams); err != nil {
+		return err
+	}
 
 	return runWorkbenchLoop(ctx, cfg, proj, guard)
+}
+
+func attachInitialProjectionStreams(proj ProjectionSource, streams []*events.OperationStream) error {
+	if proj == nil {
+		return nil
+	}
+	for _, stream := range streams {
+		if err := proj.AttachOperationStream(stream); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func resolveProjection(ctx context.Context, cfg Config) (ProjectionSource, bool, error) {
@@ -149,31 +167,37 @@ func runWorkbenchLoop(ctx context.Context, cfg Config, proj ProjectionSource, gu
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		takeoverErr := runSupervisedTakeover(ctx, cfg.OnTakeover, takeoverReq, guard)
+		// 本轮工作台已退出并排空全部后台流，先清零瞬时流活跃标志，防止接管恢复后残留过期 [streaming] 状态。
+		model.resetActiveStreams()
+		takeoverErr, termErr := runSupervisedTakeover(ctx, cfg.OnTakeover, takeoverReq, guard)
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if termErr != nil {
+			// 终端释放或重入失败严格失败关闭：立即中止循环并由外层 defer guard.restore() 收尾，绝不在未就绪终端重启 TUI。
+			return errors.Join(takeoverErr, termErr)
 		}
 		model.quitting = false
 		model.applyTakeoverResult(TakeoverResultMsg{Target: takeoverReq.TargetSpec, Err: takeoverErr})
 	}
 }
 
-func runSupervisedTakeover(ctx context.Context, fn TakeoverFunc, req TakeoverRequest, guard *terminalGuard) error {
+func runSupervisedTakeover(ctx context.Context, fn TakeoverFunc, req TakeoverRequest, guard *terminalGuard) (takeoverErr, termErr error) {
 	if fn == nil {
-		return ErrTakeoverDisabled
+		return ErrTakeoverDisabled, nil
 	}
 	if err := guard.release(); err != nil {
-		return err
+		return nil, err
 	}
-	runErr := conc.RunScoped(ctx, func(tCtx context.Context, _ *conc.Nursery) error {
+	takeoverErr = conc.RunScoped(ctx, func(tCtx context.Context, _ *conc.Nursery) error {
 		return fn(tCtx, req)
 	})
 	if ctx.Err() == nil {
 		if reErr := guard.reenter(); reErr != nil {
-			return errors.Join(runErr, reErr)
+			return takeoverErr, reErr
 		}
 	}
-	return runErr
+	return takeoverErr, nil
 }
 
 func runSingleProgramPass(
@@ -246,4 +270,70 @@ func classifyProgramExitError(parentCtx context.Context, runErr error) error {
 		return nil
 	}
 	return runErr
+}
+
+// lineBufferedLogWriter 仅在无 OperationStream 回退路径下使用，按完整换行切分且限制单行缓冲上限，避免截断半行。
+type lineBufferedLogWriter struct {
+	ctx    context.Context
+	prog   *tea.Program
+	emit   func(tea.Msg)
+	target string
+	mu     sync.Mutex
+	buf    []byte
+}
+
+func (w *lineBufferedLogWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	for {
+		idx := bytes.IndexByte(w.buf, '\n')
+		if idx < 0 {
+			break
+		}
+		line := string(bytes.TrimSuffix(w.buf[:idx], []byte{'\r'}))
+		w.buf = w.buf[idx+1:]
+		w.emitLineLocked(line, false)
+	}
+	if len(w.buf) >= maxLineBufferBytes {
+		line := string(w.buf[:maxLineBufferBytes])
+		w.buf = w.buf[maxLineBufferBytes:]
+		w.emitLineLocked(line, true)
+	}
+	return len(p), nil
+}
+
+func (w *lineBufferedLogWriter) flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.buf) == 0 {
+		return
+	}
+	line := string(bytes.TrimSuffix(w.buf, []byte{'\r'}))
+	w.buf = nil
+	w.emitLineLocked(line, false)
+}
+
+func (w *lineBufferedLogWriter) emitLineLocked(line string, truncated bool) {
+	if line == "" && !truncated {
+		return
+	}
+	msg := LogChunkMsg{
+		Target:     w.target,
+		Stream:     events.OutputStreamStdout,
+		Text:       line,
+		Truncated:  truncated,
+		OccurredAt: time.Now().UTC(),
+	}
+	if w.emit != nil {
+		w.emit(msg)
+		return
+	}
+	sendMsg(w.ctx, w.prog, msg)
 }
