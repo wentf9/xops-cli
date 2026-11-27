@@ -5,12 +5,12 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/playbook"
@@ -241,7 +241,7 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		return nil, err
 	}
 	if _, err := dec.ReadToken(); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("%w: JSON 输入包含多余尾随内容", ErrInvalidEvent)
+		return nil, domi18n.EF(ErrInvalidEvent, domi18n.KeyCommonJSONTrailingData)
 	}
 	return ev, nil
 }
@@ -315,11 +315,11 @@ func encodeEventWire(ev Event) (any, error) {
 // peekEventKind 在单次顶层扫描中提取并严格校验唯一字符串判别字段 "kind"，拒绝非对象与重复 kind 键。
 func peekEventKind(raw jsontext.Value) (EventKind, error) {
 	if raw.Kind() != '{' {
-		return EventKindInvalid, fmt.Errorf("%w: Event JSON 必须为对象", ErrInvalidEvent)
+		return EventKindInvalid, domi18n.EF(ErrInvalidEvent, domi18n.KeyEventsJSONObjectRequired)
 	}
 	dec := jsontext.NewDecoder(bytes.NewReader(raw))
 	if tok, err := dec.ReadToken(); err != nil || tok.Kind() != '{' {
-		return EventKindInvalid, fmt.Errorf("%w: 无法读取事件对象起点", ErrInvalidEvent)
+		return EventKindInvalid, domi18n.EF(ErrInvalidEvent, domi18n.KeyEventsJSONObjectRequired)
 	}
 	return scanKindField(dec)
 }
@@ -330,7 +330,7 @@ func scanKindField(dec *jsontext.Decoder) (EventKind, error) {
 	for dec.PeekKind() != '}' {
 		keyTok, err := dec.ReadToken()
 		if err != nil || keyTok.Kind() != '"' {
-			return EventKindInvalid, fmt.Errorf("%w: 读取对象键失败", ErrInvalidEvent)
+			return EventKindInvalid, fieldErr(ErrInvalidEvent, "json_key")
 		}
 		if keyTok.String() != "kind" {
 			if err := dec.SkipValue(); err != nil {
@@ -345,18 +345,18 @@ func scanKindField(dec *jsontext.Decoder) (EventKind, error) {
 		kind, found = parsed, true
 	}
 	if !found {
-		return EventKindInvalid, fmt.Errorf("%w: 缺少必需的 event.kind 字段", ErrInvalidEventKind)
+		return EventKindInvalid, missingFieldErr(ErrInvalidEventKind, "kind")
 	}
 	return kind, nil
 }
 
 func readUniqueKindToken(dec *jsontext.Decoder, alreadyFound bool) (EventKind, error) {
 	if alreadyFound {
-		return EventKindInvalid, fmt.Errorf("%w: 检测到重复的 kind 字段", ErrInvalidEvent)
+		return EventKindInvalid, domi18n.EF(ErrInvalidEvent, domi18n.KeyCommonDuplicateItem, domi18n.Str("kind", "field"), domi18n.Str("value", "kind"))
 	}
 	valTok, err := dec.ReadToken()
 	if err != nil || valTok.Kind() != '"' {
-		return EventKindInvalid, fmt.Errorf("%w: kind 字段必须为有效字符串", ErrInvalidEventKind)
+		return EventKindInvalid, fieldErr(ErrInvalidEventKind, "kind")
 	}
 	return ParseEventKind(valTok.String())
 }
@@ -388,7 +388,7 @@ func decodeEventByKind(kind EventKind, raw jsontext.Value) (Event, error) {
 	case EventKindBusDropped:
 		return decodeStrictWire(raw, decodeBusDroppedWire)
 	default:
-		return nil, fmt.Errorf("%w: 未知事件类别 %d", ErrInvalidEventKind, uint8(kind))
+		return nil, domi18n.EF(ErrInvalidEventKind, domi18n.KeyCommonUnknownValue, domi18n.Str("kind", "event_kind"), domi18n.Uint64("value", uint64(kind)))
 	}
 }
 
@@ -410,19 +410,19 @@ func decodeOpStartedWire(w opStartedWire) (*OperationStartedEvent, error) {
 }
 func decodeOpCompletedWire(w opCompletedWire) (*OperationCompletedEvent, error) {
 	if w.Duration.IsNone() || w.Succeeded.IsNone() {
-		return nil, fmt.Errorf("%w: operation_completed 缺少必需字段", ErrInvalidEvent)
+		return nil, missingFieldErr(ErrInvalidEvent, "duration/succeeded")
 	}
 	return NewOperationCompletedEvent(OperationCompletedSpec{optVal(w.Meta), optVal(w.Capability), optVal(w.Duration), optOutcomeFromBox(w.Outcome), optVal(w.Succeeded), w.Code, w.Message})
 }
 func decodeOutputChunkWire(w outputChunkWire) (*OutputChunkEvent, error) {
 	if w.ChunkIndex.IsNone() {
-		return nil, fmt.Errorf("%w: output_chunk 缺少必需字段", ErrInvalidEvent)
+		return nil, missingFieldErr(ErrInvalidEvent, "chunk_index")
 	}
 	return NewOutputChunkEvent(OutputChunkSpec{optVal(w.Meta), optVal(w.Stream), optVal(w.ChunkIndex), optVal(w.Data), w.Truncated})
 }
 func decodeStepWire(w stepEventWire) (*StepEvent, error) {
 	if w.Duration.IsNone() {
-		return nil, fmt.Errorf("%w: step 缺少必需字段", ErrInvalidEvent)
+		return nil, missingFieldErr(ErrInvalidEvent, "duration")
 	}
 	return NewStepEvent(StepEventSpec{optVal(w.Meta), w.PlaybookID, optVal(w.StepID), optVal(w.Status), optVal(w.Duration), optOutcomeFromBox(w.Outcome), w.Message})
 }
@@ -434,25 +434,25 @@ func decodeApprovalChallengeWire(w approvalChallengeWire) (*ApprovalChallengeEve
 }
 func decodeTransferProgressWire(w transferProgressWire) (*TransferProgressEvent, error) {
 	if w.BytesTransferred.IsNone() || w.Elapsed.IsNone() {
-		return nil, fmt.Errorf("%w: transfer_progress 缺少必需字段", ErrInvalidEvent)
+		return nil, missingFieldErr(ErrInvalidEvent, "bytes_transferred/elapsed")
 	}
 	return NewTransferProgressEvent(TransferProgressSpec{optVal(w.Meta), optVal(w.TransferID), optVal(w.Direction), optVal(w.BytesTransferred), w.TotalBytes, w.ChunksCompleted, optVal(w.Elapsed), w.RateBytesPerSec, w.Stage})
 }
 func decodeMetricSampleWire(w metricSampleWire) (*MetricSampleEvent, error) {
 	if w.Value.IsNone() || w.Interval.IsNone() {
-		return nil, fmt.Errorf("%w: metric_sample 缺少必需字段", ErrInvalidEvent)
+		return nil, missingFieldErr(ErrInvalidEvent, "value/interval")
 	}
 	return NewMetricSampleEvent(MetricSampleSpec{optVal(w.Meta), optVal(w.MetricName), w.Unit, optVal(w.Value), optVal(w.Interval), w.Labels})
 }
 func decodeAuditRecordWire(w auditRecordWire) (*AuditRecordEvent, error) {
 	if w.Duration.IsNone() {
-		return nil, fmt.Errorf("%w: audit_record 缺少必需字段", ErrInvalidEvent)
+		return nil, missingFieldErr(ErrInvalidEvent, "duration")
 	}
 	return NewAuditRecordEvent(AuditRecordSpec{optVal(w.Meta), optVal(w.Stage), optVal(w.ProcessInstanceID), optVal(w.Capability), optVal(w.Decision).value, optVal(w.Risk), w.Binding, optOutcomeFromBox(w.Outcome), optVal(w.Duration), w.Reason})
 }
 func decodePoolStateWire(w poolStateWire) (*PoolStateEvent, error) {
 	if w.Latency.IsNone() {
-		return nil, fmt.Errorf("%w: pool_state 缺少必需字段", ErrInvalidEvent)
+		return nil, missingFieldErr(ErrInvalidEvent, "latency")
 	}
 	return NewPoolStateEvent(PoolStateSpec{optVal(w.Meta), optVal(w.Action), w.PlanDigest, w.HopDigest, w.Endpoint, w.HandleKind, w.HandleID, w.Generation, w.ActiveLeases, optVal(w.Latency), w.Detail})
 }
@@ -476,7 +476,7 @@ func uEv[T any, P interface {
 		return err
 	}
 	if ev.Kind() != want {
-		return fmt.Errorf("%w: 期望变体 %s，实际=%s", ErrInvalidEventKind, want, ev.Kind())
+		return domi18n.EF(ErrInvalidEventKind, domi18n.KeyCommonMismatch, domi18n.Str("field", "kind"), domi18n.Str("expected", want.String()), domi18n.Str("actual", ev.Kind().String()))
 	}
 	typed, ok := ev.(P)
 	if !ok || typed == nil {

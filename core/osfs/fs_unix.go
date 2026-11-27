@@ -4,7 +4,7 @@ package osfs
 
 import (
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/sys/unix"
@@ -18,7 +18,7 @@ import (
 
 func localPathToNativeOS(kind pathalg.LocalPathKind, raw string) (string, error) {
 	if kind == pathalg.LocalPathWindowsDrive {
-		return "", fmt.Errorf("%w: Unix 不支持 Windows 盘符路径 %q", ports.ErrInvalidArgument, raw)
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyOSFSPathPlatformMismatch, domi18n.BoundStr("path", raw))
 	}
 	return raw, nil
 }
@@ -79,7 +79,7 @@ func ensureDirOS(nativeDir string, mode fs.FileMode) error { return ensureDirRaw
 // 容忍 OS 级祖先软链（如 macOS /tmp -> /private/tmp），同时严格拒绝末段或新建路径中的符号链接。
 func ensureDirRawUnix(nativeDir string, mode fs.FileMode) error {
 	if nativeDir == "" {
-		return fmt.Errorf("%w: 目标目录路径为空", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "dir"))
 	}
 	target := filepath.Clean(nativeDir)
 	base, missing, err := walkExistingAncestorUnix(target)
@@ -106,7 +106,7 @@ func walkExistingAncestorUnix(target string) (string, []string, error) {
 	for cur := target; ; {
 		if st, err := os.Stat(cur); err == nil {
 			if !st.IsDir() {
-				return "", nil, fmt.Errorf("%w: 路径 %q 不是目录", ports.ErrNotRegularFile, cur)
+				return "", nil, domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotDirectory, domi18n.BoundStr("path", cur))
 			}
 			return cur, missing, nil
 		} else if parent := filepath.Dir(cur); !errors.Is(err, os.ErrNotExist) || parent == cur {
@@ -146,7 +146,7 @@ func verifyRegularFDUnix(fd int, rel string, clearNonblock bool) error {
 		return mapOSError(err)
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return fmt.Errorf("%w: 目标 %q 不是常规文件", ports.ErrNotRegularFile, rel)
+		return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotRegularFile, domi18n.BoundStr("path", rel))
 	}
 	if clearNonblock {
 		return mapOSError(unix.SetNonblock(fd, false))
@@ -163,7 +163,7 @@ func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.Fi
 		flags |= unix.O_NOFOLLOW
 	case pathalg.SymlinkFollowOperatorSource:
 	default:
-		return nil, 0, fmt.Errorf("%w: 不支持的软链接策略 %v", ports.ErrInvalidArgument, policy)
+		return nil, 0, errField(ports.ErrInvalidArgument, "symlink_policy")
 	}
 	f, err := os.OpenFile(nativePath, flags, 0)
 	if err != nil {
@@ -172,14 +172,14 @@ func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.Fi
 	st, err := f.Stat()
 	if err != nil || !st.Mode().IsRegular() {
 		_ = f.Close()
-		return nil, 0, pickIf[error](err != nil, mapOSError(err), fmt.Errorf("%w: 源路径 %q 不是常规文件", ports.ErrNotRegularFile, nativePath))
+		return nil, 0, pickIf[error](err != nil, mapOSError(err), domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotRegularFile, domi18n.BoundStr("path", nativePath)))
 	}
 	return f, st.Size(), nil
 }
 func mapUnixDirOpenError(dirFD int, name string, err error) error {
 	var st unix.Stat_t
 	if errors.Is(err, unix.ENOTDIR) && unix.Fstatat(dirFD, name, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
-		return fmt.Errorf("%w: %w", ports.ErrSymlinkRejected, err)
+		return wrapS(ports.ErrSymlinkRejected, err)
 	}
 	return mapUnixOpenError(err)
 }
@@ -188,9 +188,9 @@ func mapUnixOpenError(err error) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, unix.ELOOP), errors.Is(err, unix.EMLINK), isBSDFileTypeErr(err):
-		return fmt.Errorf("%w: %w", ports.ErrSymlinkRejected, err)
+		return wrapS(ports.ErrSymlinkRejected, err)
 	case errors.Is(err, unix.EISDIR), errors.Is(err, unix.ENOTDIR), errors.Is(err, unix.ENXIO):
-		return fmt.Errorf("%w: %w", ports.ErrNotRegularFile, err)
+		return wrapS(ports.ErrNotRegularFile, err)
 	default:
 		return mapOSError(err)
 	}
@@ -215,7 +215,7 @@ func flockFileUnix(f *os.File, how int) error {
 func tryLockFileOS(f *os.File, exclusive bool) error {
 	err := flockFileUnix(f, pickIf(exclusive, unix.LOCK_EX|unix.LOCK_NB, unix.LOCK_SH|unix.LOCK_NB))
 	if errors.Is(err, unix.EWOULDBLOCK) || errors.Is(err, unix.EAGAIN) {
-		return fmt.Errorf("%w: %w", ports.ErrLockBusy, err)
+		return wrapS(ports.ErrLockBusy, err)
 	}
 	return mapOSError(err)
 }

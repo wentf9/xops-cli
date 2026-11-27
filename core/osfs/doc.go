@@ -7,7 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"io/fs"
@@ -27,15 +27,32 @@ const (
 
 // 本包导出的规范化哨兵错误（供调用方以 errors.Is 精确判定）。
 var (
-	ErrSlotOccupied        = errors.New("osfs: 控制套接字槽位已被占用")
-	ErrNotSocket           = errors.New("osfs: 目标路径不是本地 AF_UNIX 套接字")
-	ErrInvalidControlPath  = errors.New("osfs: 控制套接字路径非法")
-	ErrControlPathTooLong  = errors.New("osfs: 控制套接字路径超过平台 sun_path 长度上限")
-	ErrUnauthorizedPeer    = errors.New("osfs: 本地 AF_UNIX 对端身份校验未通过")
-	ErrUnsupportedPeerCred = errors.New("osfs: 当前平台不支持查询本地 AF_UNIX 对端凭据")
-	ErrInsecurePermissions = errors.New("osfs: 对象权限或 DACL 不满足安全不变量")
-	ErrSameFileMismatch    = errors.New("osfs: 句柄与路径 SameFile 锚定校验失败")
+	ErrSlotOccupied        = domi18n.Sentinel(domi18n.KeyOSFSSlotOccupied)
+	ErrNotSocket           = domi18n.Sentinel(domi18n.KeyOSFSNotSocket)
+	ErrInvalidControlPath  = domi18n.Sentinel(domi18n.KeyOSFSInvalidControlPath)
+	ErrControlPathTooLong  = domi18n.Sentinel(domi18n.KeyOSFSControlPathTooLong)
+	ErrUnauthorizedPeer    = domi18n.Sentinel(domi18n.KeyOSFSUnauthorizedPeer)
+	ErrUnsupportedPeerCred = domi18n.Sentinel(domi18n.KeyOSFSUnsupportedPeerCred)
+	ErrInsecurePermissions = domi18n.Sentinel(domi18n.KeyOSFSInsecurePermissions)
+	ErrSameFileMismatch    = domi18n.Sentinel(domi18n.KeyOSFSSameFileMismatch)
 )
+
+func wrapS(s, c error) error { return domi18n.WrapSentinel(s, c) }
+func errField(s error, f string) error {
+	return domi18n.EF(s, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", f))
+}
+func errFieldNil(s error, f string) error {
+	return domi18n.EF(s, domi18n.KeyCommonFieldNil, domi18n.Str("field", f))
+}
+func wrapOp(s, c error, op string) error {
+	return domi18n.WrapS(s, c, domi18n.KeyCommonOpFailed, domi18n.Str("op", op))
+}
+func errWrongKind(p string, wantDir bool) error {
+	if wantDir {
+		return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotDirectory, domi18n.BoundStr("path", p))
+	}
+	return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotRegularFile, domi18n.BoundStr("path", p))
+}
 
 func zeroVal[T any]() (z T) { return z }
 func pickIf[T any](ok bool, yes, no T) T {
@@ -56,7 +73,7 @@ func mapOSError(err error) error {
 		{os.ErrPermission, ports.ErrPermissionDenied}, {os.ErrClosed, ports.ErrClosed},
 	} {
 		if errors.Is(err, m.osErr) {
-			return fmt.Errorf("%w: %w", m.portErr, err)
+			return wrapS(m.portErr, err)
 		}
 	}
 	return err
@@ -71,7 +88,7 @@ func isAlreadyNormalizedError(err error) bool {
 func sanitizeFilePerm(p, fb fs.FileMode) fs.FileMode { return pickIf(p.Perm() != 0, p.Perm(), fb) }
 func fileInfoToLocalFileInfo(name string, fi os.FileInfo) (ports.LocalFileInfo, error) {
 	if fi == nil {
-		return zeroVal[ports.LocalFileInfo](), fmt.Errorf("%w: FileInfo 为空", ports.ErrInvalidArgument)
+		return zeroVal[ports.LocalFileInfo](), errFieldNil(ports.ErrInvalidArgument, "file_info")
 	}
 	return ports.NewLocalFileInfo(ports.LocalFileInfoSpec{Name: name, Size: fi.Size(), Mode: fi.Mode(), ModTime: fi.ModTime()})
 }
@@ -84,7 +101,7 @@ func siblingDest(dest pathalg.LocalRootedDest, name string) (pathalg.LocalRooted
 func randomHexToken(n int) (string, error) {
 	buf := make([]byte, n)
 	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("osfs: 生成随机后缀失败: %w", err)
+		return "", domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "random_hex"))
 	}
 	return hex.EncodeToString(buf), nil
 }

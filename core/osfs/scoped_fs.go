@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"cmp"
 	"errors"
-	"fmt"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"io"
@@ -30,7 +30,7 @@ func NewScopedRootFS() *ScopedFS { return &ScopedFS{valid: true} }
 // EnsureRoot 实现 ports.ScopedRootFS.EnsureRoot，在 WithRoot 前安全引导沙箱根目录存在。
 func (s *ScopedFS) EnsureRoot(dir pathalg.LocalDir, perm fs.FileMode) error {
 	if s == nil || !s.valid {
-		return fmt.Errorf("%w: ScopedFS 未初始化", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "ScopedFS"))
 	}
 	return EnsureDir(dir, perm)
 }
@@ -44,7 +44,7 @@ func (s *ScopedFS) WithRoot(dir pathalg.LocalDir, fn func(root ports.RootHandle)
 		return ports.ErrNilCallback
 	}
 	if s == nil || !s.valid || !dir.IsValid() {
-		return fmt.Errorf("%w: ScopedFS 未初始化或根目录无效", ports.ErrInvalidArgument)
+		return errField(ports.ErrInvalidArgument, "root_dir")
 	}
 	nativeDir, err := localPathToNativeOS(dir.Kind(), dir.String())
 	if err != nil {
@@ -77,7 +77,7 @@ func (h *rootHandle) checkActiveDest(dest pathalg.LocalRootedDest) error {
 	if err := h.checkActive(); err != nil {
 		return err
 	}
-	return pickIf[error](dest.IsValid(), nil, fmt.Errorf("%w: 无效沙箱目标路径", ports.ErrInvalidArgument))
+	return pickIf[error](dest.IsValid(), nil, errField(ports.ErrInvalidArgument, "dest"))
 }
 func (h *rootHandle) prepareDest(dest pathalg.LocalRootedDest) error {
 	if err := h.checkActiveDest(dest); err != nil {
@@ -126,7 +126,7 @@ func (h *rootHandle) WithReadRegular(dest pathalg.LocalRootedDest, limits ports.
 		return mapOSError(err)
 	}
 	if st.Size() > limits.MaxBytes() {
-		return fmt.Errorf("%w: %q 大小超限", ports.ErrLimitExceeded, dest.String())
+		return domi18n.EF(ports.ErrLimitExceeded, domi18n.KeyCommonSizeLimit, domi18n.BoundStr("kind", dest.String()), domi18n.Int64("size", st.Size()), domi18n.Int64("limit", limits.MaxBytes()))
 	}
 	active.Store(true)
 	return fn(&borrowedReader{r: f, remaining: limits.MaxBytes(), maxBytes: limits.MaxBytes(), limited: true, active: &active}, st.Size())
@@ -178,7 +178,7 @@ func (h *rootHandle) WriteChunk(dest pathalg.LocalRootedDest, offset int64, r io
 		return 0, err
 	}
 	if r == nil || offset < 0 || length < 0 || offset > math.MaxInt64-length || perm == 0 || perm != perm.Perm() {
-		return 0, fmt.Errorf("%w: WriteChunk 参数无效、权限非法或偏移溢出", ports.ErrInvalidArgument)
+		return 0, errField(ports.ErrInvalidArgument, "write_chunk")
 	}
 	f, err := openLeafInRootOS(h.root, dest, leafOpWriteChunk, perm)
 	if err != nil {
@@ -210,7 +210,7 @@ func (h *rootHandle) Rename(oldDest, newDest pathalg.LocalRootedDest) error {
 		return mapOSError(err)
 	}
 	if srcInfo.Mode()&fs.ModeSymlink != 0 {
-		return fmt.Errorf("%w: 源路径 %q 为符号链接", ports.ErrSymlinkRejected, oldDest.String())
+		return domi18n.EF(ports.ErrSymlinkRejected, domi18n.KeyOSFSSymlinkDetected, domi18n.BoundStr("path", oldDest.String()))
 	}
 	if _, err := checkLstatKind(h.root, newDest.String(), srcInfo.IsDir(), true); err != nil {
 		return err
@@ -263,7 +263,7 @@ func (h *rootHandle) writeScopedFile(f *os.File, writeDest, renameTarget pathalg
 // AppendLine 以只追加语义向常规文件末尾单次写入 line + '\n'，严格拒绝内嵌 '\r' 或 '\n'。
 func (h *rootHandle) AppendLine(dest pathalg.LocalRootedDest, perm fs.FileMode, line []byte) error {
 	if bytes.ContainsAny(line, "\r\n") {
-		return fmt.Errorf("%w: AppendLine 严禁包含内嵌换行符", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyOSFSAppendNewline)
 	}
 	if err := h.checkActiveDest(dest); err != nil {
 		return err
@@ -370,7 +370,7 @@ func (h *rootHandle) CreateSymlink(link pathalg.LocalRootedDest, target string) 
 		return err
 	}
 	if err := pathalg.ValidateContainedSymlink(target, link.Depth()-1); err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return wrapS(ports.ErrInvalidArgument, err)
 	}
 	return mapOSError(h.root.Symlink(target, link.String()))
 }
@@ -385,14 +385,14 @@ func (h *rootHandle) Chtimes(dest pathalg.LocalRootedDest, atime, mtime time.Tim
 		return err
 	}
 	if !isValidRFC3339Time(atime) || !isValidRFC3339Time(mtime) {
-		return fmt.Errorf("%w: Chtimes 时间戳为零值或超出 RFC 3339 年份范围 [1,9999]", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyPortsModTimeOutOfRange)
 	}
 	if lst, err := h.root.Lstat(dest.String()); err != nil {
 		return mapOSError(err)
 	} else if lst.Mode()&fs.ModeSymlink != 0 {
-		return fmt.Errorf("%w: 路径 %q 为符号链接", ports.ErrSymlinkRejected, dest.String())
+		return domi18n.EF(ports.ErrSymlinkRejected, domi18n.KeyOSFSSymlinkDetected, domi18n.BoundStr("path", dest.String()))
 	} else if !lst.Mode().IsRegular() && !lst.IsDir() {
-		return fmt.Errorf("%w: 路径 %q 不是常规文件或目录", ports.ErrNotRegularFile, dest.String())
+		return domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotRegularFile, domi18n.BoundStr("path", dest.String()))
 	}
 	return mapOSError(h.root.Chtimes(dest.String(), atime, mtime))
 }
@@ -410,10 +410,10 @@ func checkLstatKind(root *os.Root, rel string, wantDir, allowMissing bool) (os.F
 		return nil, pickIf[error](allowMissing && errors.Is(err, os.ErrNotExist), nil, mapOSError(err))
 	}
 	if lst.Mode()&fs.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%w: 路径 %q 为符号链接", ports.ErrSymlinkRejected, rel)
+		return nil, domi18n.EF(ports.ErrSymlinkRejected, domi18n.KeyOSFSSymlinkDetected, domi18n.BoundStr("path", rel))
 	}
 	if wantDir != lst.IsDir() || (!wantDir && !lst.Mode().IsRegular()) {
-		return nil, fmt.Errorf("%w: 路径 %q 类型不符合预期", ports.ErrNotRegularFile, rel)
+		return nil, errWrongKind(rel, wantDir)
 	}
 	return lst, nil
 }
@@ -423,7 +423,7 @@ func verifyRegularSameFile(root *os.Root, rel string, f *os.File, allowMissing b
 		return false, mapOSError(err)
 	}
 	if !openSt.Mode().IsRegular() {
-		return false, fmt.Errorf("%w: 目标 %q 不是常规文件", ports.ErrNotRegularFile, rel)
+		return false, domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotRegularFile, domi18n.BoundStr("path", rel))
 	}
 	pathSt, err := checkLstatKind(root, rel, false, allowMissing)
 	if err != nil || pathSt == nil {

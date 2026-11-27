@@ -4,7 +4,7 @@ package osfs
 
 import (
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/sys/windows"
@@ -21,7 +21,7 @@ const winAppendAccess uint32 = (windows.FILE_GENERIC_WRITE &^ windows.FILE_WRITE
 
 func localPathToNativeOS(kind pathalg.LocalPathKind, raw string) (string, error) {
 	if kind == pathalg.LocalPathPOSIXAbs {
-		return "", fmt.Errorf("%w: Windows 不支持裸 POSIX 绝对路径 %q", ports.ErrInvalidArgument, raw)
+		return "", domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyOSFSPathPlatformMismatch, domi18n.BoundStr("path", raw))
 	}
 	return NormalizeWin32LongPath(filepath.FromSlash(raw)), nil
 }
@@ -29,7 +29,7 @@ func localPathToNativeOS(kind pathalg.LocalPathKind, raw string) (string, error)
 // ntCreateAtHandle 相对已打开目录句柄原子打开/创建单个分量，主路径启用 OBJ_DONT_REPARSE，旧内核以 FILE_OPEN_REPARSE_POINT 回退。
 func ntCreateAtHandle(dirHandle windows.Handle, leaf string, access, disposition, options, fileAttrs uint32, sd *windows.SECURITY_DESCRIPTOR) (windows.Handle, error) {
 	if dirHandle == 0 || dirHandle == windows.InvalidHandle || leaf == "" || leaf == ".." || strings.ContainsAny(leaf, `\/:`) {
-		return windows.InvalidHandle, fmt.Errorf("%w: 非法相对目录分量 %q", ports.ErrInvalidArgument, leaf)
+		return windows.InvalidHandle, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "leaf"), domi18n.BoundStr("value", leaf))
 	}
 	ntName, err := windows.NewNTUnicodeString(leaf)
 	if err != nil {
@@ -148,7 +148,7 @@ func openOperatorReadOS(nativePath string, policy pathalg.SymlinkPolicy) (*os.Fi
 		flags, rejectReparse = flags|windows.FILE_FLAG_OPEN_REPARSE_POINT, true
 	case pathalg.SymlinkFollowOperatorSource:
 	default:
-		return nil, 0, fmt.Errorf("%w: 不支持的软链接策略 %v", ports.ErrInvalidArgument, policy)
+		return nil, 0, errField(ports.ErrInvalidArgument, "symlink_policy")
 	}
 	pathPtr, err := windows.UTF16PtrFromString(nativePath)
 	if err != nil {
@@ -166,7 +166,7 @@ func wrapValidatedWindowsFile(handle windows.Handle, path string, rejectReparse 
 		if f := os.NewFile(uintptr(handle), path); f != nil {
 			return f, (int64(info.FileSizeHigh) << 32) | int64(info.FileSizeLow), nil
 		}
-		err = fmt.Errorf("%w: os.NewFile 返回空句柄", ports.ErrInvalidArgument)
+		err = errFieldNil(ports.ErrInvalidArgument, "os.NewFile")
 	}
 	_ = windows.CloseHandle(handle)
 	return nil, 0, err
@@ -176,26 +176,29 @@ func validateWindowsHandle(handle windows.Handle, path string, expectDir, reject
 	if ft, err := windows.GetFileType(handle); err != nil {
 		return info, mapOSError(err)
 	} else if ft != windows.FILE_TYPE_DISK {
-		return info, fmt.Errorf("%w: %q 不是磁盘对象", ports.ErrNotRegularFile, path)
+		return info, domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotRegularFile, domi18n.BoundStr("path", path))
 	}
 	if err := windows.GetFileInformationByHandle(handle, &info); err != nil {
 		return info, mapOSError(err)
 	}
 	if rejectReparse && info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return info, fmt.Errorf("%w: %q 为重解析点/符号链接", ports.ErrSymlinkRejected, path)
+		return info, domi18n.EF(ports.ErrSymlinkRejected, domi18n.KeyOSFSSymlinkDetected, domi18n.BoundStr("path", path))
 	}
 	if info.FileAttributes&windows.FILE_ATTRIBUTE_DEVICE != 0 || (info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0) != expectDir {
-		return info, fmt.Errorf("%w: %q 对象类型不符合预期", ports.ErrNotRegularFile, path)
+		return info, errWrongKind(path, expectDir)
 	}
 	return info, nil
 }
 
 type winErrMap struct{ src, out error }
 
+func wrapTarget(s, c error, op, tgt string) error {
+	return domi18n.WrapS(s, c, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", op), domi18n.BoundStr("target", tgt))
+}
 func mapWinErrTable(path string, err error, tbl []winErrMap) error {
 	for _, m := range tbl {
 		if errors.Is(err, m.src) {
-			return fmt.Errorf("%w: %s: %w", m.out, path, err)
+			return wrapTarget(m.out, err, "open", path)
 		}
 	}
 	return nil
@@ -237,7 +240,7 @@ func tryLockFileOS(f *os.File, exclusive bool) error {
 	err := windows.LockFileEx(windows.Handle(f.Fd()), flags, 0, ^uint32(0), ^uint32(0), &ol)
 	runtime.KeepAlive(f)
 	if errors.Is(err, windows.ERROR_LOCK_VIOLATION) || errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
-		return fmt.Errorf("%w: %w", ports.ErrLockBusy, err)
+		return wrapS(ports.ErrLockBusy, err)
 	}
 	return err
 }

@@ -3,11 +3,11 @@ package events
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"strings"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -168,11 +168,11 @@ func eP[T eventEnum](raw string, _ T, err error) (T, error) {
 			return v, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: %q", err, raw)
+	return 0, domi18n.EF(err, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 func eA[T eventEnum](b []byte, v T, err error) ([]byte, error) {
 	if !v.IsValid() {
-		return nil, fmt.Errorf("%w: %d", err, uint8(v))
+		return nil, domi18n.EF(err, domi18n.KeyCommonValueInvalid, domi18n.Uint64("value", uint64(v)))
 	}
 	return append(b, v.String()...), nil
 }
@@ -299,7 +299,7 @@ func NewEventMeta(spec EventMetaSpec) (EventMeta, error) {
 	nodeID, hasNode := spec.NodeID.Get()
 	utc := spec.OccurredAt.UTC().Round(0)
 	if !spec.TraceID.IsValid() || !isValidEventTime(utc) || (hasOp && !opID.IsValid()) || (hasNode && !nodeID.IsValid()) {
-		return EventMeta{}, fmt.Errorf("%w: trace_id/occurred_at(RFC3339 1..9999) 及可选 operation_id/node_id 均须有效", ErrInvalidEventMeta)
+		return EventMeta{}, fieldErr(ErrInvalidEventMeta, "event_meta")
 	}
 	return EventMeta{spec.TraceID, spec.OperationID, utc, spec.Seq, spec.NodeID, true}, nil
 }
@@ -355,7 +355,7 @@ func (m EventMeta) MarshalJSONTo(enc *jsontext.Encoder) error {
 func (m *EventMeta) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	return unmarshalJSONWithNullReject(m, dec, ErrInvalidEventMeta, func(w eventMetaWire) (EventMeta, error) {
 		if w.TraceID.IsNone() || w.OccurredAt.IsNone() {
-			return EventMeta{}, fmt.Errorf("%w: 缺少必需的 trace_id 或 occurred_at 字段", ErrInvalidEventMeta)
+			return EventMeta{}, missingFieldErr(ErrInvalidEventMeta, "trace_id/occurred_at")
 		}
 		return NewEventMeta(EventMetaSpec{optVal(w.TraceID), w.OperationID, optVal(w.OccurredAt), w.Seq, w.NodeID})
 	})

@@ -8,14 +8,14 @@ package ports
 import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
-	"fmt"
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"slices"
 	"strings"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 const maxPortTokenLen, maxPortDetailBytes, maxPortEnvCount, maxPortEnvValBytes = 128, 512, 256, 8192
@@ -23,53 +23,57 @@ const maxPortTokenLen, maxPortDetailBytes, maxPortEnvCount, maxPortEnvValBytes =
 // 本包导出的规范化哨兵错误，供用例、连接池、能力门控、宿主适配器、仿真器与 TCK 统一以 errors.Is 判定。
 var (
 	// 通用契约与参数错误。
-	ErrNilContext       = errors.New("ports: context 不能为 nil")
-	ErrNilCallback      = errors.New("ports: 作用域回调函数不能为 nil")
-	ErrNilReceiver      = errors.New("ports: 反序列化目标接收者不能为 nil")
-	ErrInvalidArgument  = errors.New("ports: 端口调用参数无效")
-	ErrUnsupported      = errors.New("ports: 当前适配器不支持该操作")
-	ErrClosed           = errors.New("ports: 端口或会话已关闭")
-	ErrNotFound         = errors.New("ports: 目标资源不存在")
-	ErrAlreadyExists    = errors.New("ports: 目标资源已存在")
-	ErrPermissionDenied = errors.New("ports: 权限不足或安全策略拒绝")
-	ErrLimitExceeded    = errors.New("ports: 数据超出安全大小或数量上限")
+	ErrNilContext       = domi18n.Sentinel(domi18n.KeyPortsNilContext)
+	ErrNilCallback      = domi18n.Sentinel(domi18n.KeyPortsNilCallback)
+	ErrNilReceiver      = domi18n.Sentinel(domi18n.KeyPortsNilReceiver)
+	ErrInvalidArgument  = domi18n.Sentinel(domi18n.KeyPortsInvalidArgument)
+	ErrUnsupported      = domi18n.Sentinel(domi18n.KeyPortsUnsupported)
+	ErrClosed           = domi18n.Sentinel(domi18n.KeyPortsClosed)
+	ErrNotFound         = domi18n.Sentinel(domi18n.KeyPortsNotFound)
+	ErrAlreadyExists    = domi18n.Sentinel(domi18n.KeyPortsAlreadyExists)
+	ErrPermissionDenied = domi18n.Sentinel(domi18n.KeyPortsPermissionDenied)
+	ErrLimitExceeded    = domi18n.Sentinel(domi18n.KeyPortsLimitExceeded)
 	// 配置存储、CAS 与持久化结果错误。
-	ErrRevisionConflict  = errors.New("ports: 资产配置版本 CAS 冲突")
-	ErrCorruptData       = errors.New("ports: 持久化数据损坏或完整性校验失败")
-	ErrInvalidRevision   = errors.New("ports: 无效的配置版本 Revision")
-	ErrInvalidDurability = errors.New("ports: 无效的持久化提交结果 DurabilityOutcome")
+	ErrRevisionConflict  = domi18n.Sentinel(domi18n.KeyPortsRevisionConflict)
+	ErrCorruptData       = domi18n.Sentinel(domi18n.KeyPortsCorruptData)
+	ErrInvalidRevision   = domi18n.Sentinel(domi18n.KeyPortsInvalidRevision)
+	ErrInvalidDurability = domi18n.Sentinel(domi18n.KeyPortsInvalidDurability)
 	// 本地双模态文件系统与文件锁错误。
-	ErrInvalidLockMode   = errors.New("ports: 无效的文件锁模式 LockMode")
-	ErrInvalidReadLimits = errors.New("ports: 无效的读取上限 ReadLimits")
-	ErrLockBusy          = errors.New("ports: 文件锁已被其他持有者占用")
-	ErrNotRegularFile    = errors.New("ports: 目标路径不是常规文件")
-	ErrSymlinkRejected   = errors.New("ports: 符号链接被当前安全策略拒绝")
-	ErrHandleExpired     = errors.New("ports: 作用域借用句柄已超出生命周期并失效")
+	ErrInvalidLockMode   = domi18n.Sentinel(domi18n.KeyPortsInvalidLockMode)
+	ErrInvalidReadLimits = domi18n.Sentinel(domi18n.KeyPortsInvalidReadLimits)
+	ErrLockBusy          = domi18n.Sentinel(domi18n.KeyPortsLockBusy)
+	ErrNotRegularFile    = domi18n.Sentinel(domi18n.KeyPortsNotRegularFile)
+	ErrSymlinkRejected   = domi18n.Sentinel(domi18n.KeyPortsSymlinkRejected)
+	ErrHandleExpired     = domi18n.Sentinel(domi18n.KeyPortsHandleExpired)
 	// 凭据库、签名器与主机密钥信任错误。
-	ErrVaultLocked        = errors.New("ports: 凭据库处于锁定状态")
-	ErrSecretNotFound     = errors.New("ports: 凭据条目不存在")
-	ErrSecretVerifyFailed = errors.New("ports: 凭据写入后常量时间回读校验不一致")
-	ErrHostKeyMismatch    = errors.New("ports: 远端主机密钥指纹与信任库不匹配")
-	ErrHostKeyUnknown     = errors.New("ports: 远端主机密钥未知且策略禁止自动信任")
-	ErrHostKeyRevoked     = errors.New("ports: 远端主机密钥已被吊销")
-	ErrSignerUnavailable  = errors.New("ports: 密钥签名器或 SSH Agent 不可用")
+	ErrVaultLocked        = domi18n.Sentinel(domi18n.KeyPortsVaultLocked)
+	ErrSecretNotFound     = domi18n.Sentinel(domi18n.KeyPortsSecretNotFound)
+	ErrSecretVerifyFailed = domi18n.Sentinel(domi18n.KeyPortsSecretVerifyFailed)
+	ErrHostKeyMismatch    = domi18n.Sentinel(domi18n.KeyPortsHostKeyMismatch)
+	ErrHostKeyUnknown     = domi18n.Sentinel(domi18n.KeyPortsHostKeyUnknown)
+	ErrHostKeyRevoked     = domi18n.Sentinel(domi18n.KeyPortsHostKeyRevoked)
+	ErrSignerUnavailable  = domi18n.Sentinel(domi18n.KeyPortsSignerUnavailable)
 	// 传输拨号、多路复用与远端 SFTP 错误。
-	ErrDialFailed           = errors.New("ports: 建立远端传输连接失败")
-	ErrAuthFailed           = errors.New("ports: 远端身份认证失败")
-	ErrMuxUnavailable       = errors.New("ports: 多路复用控制套接字不可用")
-	ErrRemoteAnchorMismatch = errors.New("ports: 远端文件 FSTAT 类型或 (dev,ino) 锚点不匹配")
-	ErrRemoteIsDir          = errors.New("ports: 远端目标为目录而非文件")
+	ErrDialFailed           = domi18n.Sentinel(domi18n.KeyPortsDialFailed)
+	ErrAuthFailed           = domi18n.Sentinel(domi18n.KeyPortsAuthFailed)
+	ErrMuxUnavailable       = domi18n.Sentinel(domi18n.KeyPortsMuxUnavailable)
+	ErrRemoteAnchorMismatch = domi18n.Sentinel(domi18n.KeyPortsRemoteAnchorMismatch)
+	ErrRemoteIsDir          = domi18n.Sentinel(domi18n.KeyPortsRemoteIsDir)
 	// 安全审计、崩溃对账、系统与交互错误。
-	ErrAuditWriteFailed         = errors.New("ports: 审计日志写入失败")
-	ErrAuditPostWrite           = errors.New("ports: 审计后置终态写入失败")
-	ErrAuditHalted              = errors.New("ports: 审计门控已触发 Halted 熔断")
-	ErrInvalidAuditEntry        = errors.New("ports: 无效的审计记录 AuditEntry")
-	ErrInvalidProcessInstanceID = errors.New("ports: 无效的进程实例标识 ProcessInstanceID")
-	ErrInteractionUnavailable   = errors.New("ports: 当前运行环境不支持用户交互")
-	ErrInteractionCanceled      = errors.New("ports: 用户取消或拒绝交互请求")
-	ErrEntropyShortRead         = errors.New("ports: 熵源读取字节数不足")
-	ErrInvalidTTYSize           = errors.New("ports: 无效的终端窗口尺寸 TerminalSize")
+	ErrAuditWriteFailed         = domi18n.Sentinel(domi18n.KeyPortsAuditWriteFailed)
+	ErrAuditPostWrite           = domi18n.Sentinel(domi18n.KeyPortsAuditPostWrite)
+	ErrAuditHalted              = domi18n.Sentinel(domi18n.KeyPortsAuditHalted)
+	ErrInvalidAuditEntry        = domi18n.Sentinel(domi18n.KeyPortsInvalidAuditEntry)
+	ErrInvalidProcessInstanceID = domi18n.Sentinel(domi18n.KeyPortsInvalidProcInstID)
+	ErrInteractionUnavailable   = domi18n.Sentinel(domi18n.KeyPortsInteractionUnavail)
+	ErrInteractionCanceled      = domi18n.Sentinel(domi18n.KeyPortsInteractionCanceled)
+	ErrEntropyShortRead         = domi18n.Sentinel(domi18n.KeyPortsEntropyShortRead)
+	ErrInvalidTTYSize           = domi18n.Sentinel(domi18n.KeyPortsInvalidTTYSize)
 )
+
+func fieldErr(sentinel error, field string) error {
+	return domi18n.EF(sentinel, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", field))
+}
 
 func pickIf[T any](ok bool, yes, no T) T {
 	if ok {
@@ -113,7 +117,7 @@ func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseEr
 	*dst = zeroVal[T]()
 	if dec.PeekKind() == 'n' {
 		_, err := dec.ReadToken()
-		return firstErr(err, fmt.Errorf("%w: JSON null 不是有效值", baseErr))
+		return firstErr(err, domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden))
 	}
 	var wire W
 	if err := jsonv2.UnmarshalDecode(dec, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
@@ -125,7 +129,7 @@ func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseEr
 }
 func marshalValidJSON[W any](enc *jsontext.Encoder, valid bool, badErr error, wire W) error {
 	if enc == nil {
-		return fmt.Errorf("%w: encoder 不能为 nil", ErrInvalidArgument)
+		return domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldNil, domi18n.Str("field", "encoder"))
 	}
 	if !valid {
 		return badErr
@@ -147,9 +151,9 @@ func isValidRFC3339Time(t time.Time) bool {
 // sanitizeBoundedText 校验并规范化单行非敏感说明文本，拒绝非法 UTF-8、控制字符、Bidi/Cf 字符与超长输入。
 func sanitizeBoundedText(raw string, maxBytes int, allowEmpty bool, baseErr error) (string, error) {
 	if trimmed := strings.TrimSpace(raw); trimmed == "" {
-		return "", pickIf[error](allowEmpty, nil, fmt.Errorf("%w: 文本不能为空", baseErr))
+		return "", pickIf[error](allowEmpty, nil, domi18n.EF(baseErr, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "text")))
 	} else if len(trimmed) > maxBytes || hasForbiddenControl(trimmed) {
-		return "", fmt.Errorf("%w: 文本超长或包含非法 UTF-8/控制/Bidi 字符", baseErr)
+		return "", domi18n.EF(baseErr, domi18n.KeyCommonInvalidTextChars, domi18n.Str("field", "text"))
 	} else {
 		return trimmed, nil
 	}

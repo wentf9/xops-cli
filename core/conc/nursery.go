@@ -60,7 +60,7 @@ func newPanicError(value any, stack []byte) *PanicError {
 
 // Error 返回包含 panic 值与堆栈摘要的格式化错误文本。
 func (e *PanicError) Error() string {
-	if e == nil {
+	if e == nil || (e.value == nil && len(e.stack) == 0) {
 		return ErrTaskPanicked.Error()
 	}
 	if len(e.stack) == 0 {

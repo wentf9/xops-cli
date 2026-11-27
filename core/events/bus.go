@@ -2,10 +2,11 @@ package events
 
 import (
 	"context"
-	"fmt"
 	"iter"
 	"sync"
 	"sync/atomic"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // SystemBusConfig 定义系统诊断与连接池事件总线 SystemBus 的初始化参数（无 time.Duration）。
@@ -53,7 +54,7 @@ type SystemSubscription struct {
 // NewSystemBus 校验缓冲容量与订阅上限并构造 SystemBus。
 func NewSystemBus(cfg SystemBusConfig) (*SystemBus, error) {
 	if cfg.DefaultSubscriberBuffer <= 0 || cfg.MaxSubscribers < 0 {
-		return nil, fmt.Errorf("%w: default_subscriber_buffer 须大于 0 且 max_subscribers 不能为负", ErrInvalidBusConfig)
+		return nil, fieldErr(ErrInvalidBusConfig, "system_bus_config")
 	}
 	return &SystemBus{
 		defaultBuf: cfg.DefaultSubscriberBuffer, maxSubs: cfg.MaxSubscribers,
@@ -70,7 +71,7 @@ func (b *SystemBus) Publish(ev Event) error {
 		return ErrInvalidEvent
 	}
 	if ev.Class() != EventClassSystem {
-		return fmt.Errorf("%w: SystemBus 仅接受 system 类事件，实际=%s", ErrUnsupportedEventClass, ev.Class())
+		return domi18n.EF(ErrUnsupportedEventClass, domi18n.KeyEventsClassMismatch, domi18n.Str("expected", EventClassSystem.String()), domi18n.Str("actual", ev.Class().String()))
 	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -105,7 +106,7 @@ func (b *SystemBus) SubscribeWithBuffer(buffer int) (*SystemSubscription, error)
 		return nil, ErrBusNotInitialized
 	}
 	if buffer <= 0 {
-		return nil, fmt.Errorf("%w: 订阅缓冲区容量必须大于 0", ErrInvalidBusConfig)
+		return nil, domi18n.EF(ErrInvalidBusConfig, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "buffer"))
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -113,7 +114,7 @@ func (b *SystemBus) SubscribeWithBuffer(buffer int) (*SystemSubscription, error)
 		return nil, ErrBusClosed
 	}
 	if b.maxSubs > 0 && len(b.subs) >= b.maxSubs {
-		return nil, fmt.Errorf("%w: 上限=%d", ErrBusSubscriberLimit, b.maxSubs)
+		return nil, domi18n.EF(ErrBusSubscriberLimit, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "subscribers"), domi18n.Int("count", len(b.subs)), domi18n.Int("limit", b.maxSubs))
 	}
 	b.nextSubID++
 	sub := &SystemSubscription{id: b.nextSubID, bus: b, ch: make(chan Event, buffer), initialized: true}

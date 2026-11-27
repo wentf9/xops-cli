@@ -2,7 +2,8 @@ package trace
 
 import (
 	"context"
-	"fmt"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 type leaseScopeCtxKey struct{}
@@ -99,7 +100,7 @@ func CheckNonReentrant(ctx context.Context) error {
 		return ErrNilContext
 	}
 	if scope, ok := LeaseScopeFromContext(ctx); ok {
-		return fmt.Errorf("%w: domain=%s lease=%s", ErrReentrantLease, scope.domain, scope.leaseID)
+		return domi18n.EF(ErrReentrantLease, domi18n.KeyTraceReentrantDetail, domi18n.Str("domain", scope.domain), domi18n.Str("lease", scope.leaseID))
 	}
 	return nil
 }

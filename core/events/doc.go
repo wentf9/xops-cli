@@ -15,13 +15,12 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"errors"
-	"fmt"
 	"iter"
 	"maps"
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -37,37 +36,44 @@ const (
 
 // 本包导出的不可变哨兵错误集合，均由失败关闭路径返回以便上层通过 errors.Is 精确识别。
 var (
-	ErrNilContext                    = errors.New("events: context 不能为 nil")
-	ErrNilReceiver                   = errors.New("events: 反序列化目标接收者不能为 nil")
-	ErrNilWriter                     = errors.New("events: 编码输出目标不能为 nil")
-	ErrInvalidEvent                  = errors.New("events: 无效的事件实例或变体字段")
-	ErrInvalidEventMeta              = errors.New("events: 无效的 EventMeta 元数据")
-	ErrInvalidEventKind              = errors.New("events: 无效的 EventKind")
-	ErrInvalidEventClass             = errors.New("events: 无效的 EventClass")
-	ErrInvalidBackpressure           = errors.New("events: 无效的 BackpressurePolicy")
-	ErrInvalidSeverity               = errors.New("events: 无效的 Severity")
-	ErrInvalidOutputStream           = errors.New("events: 无效的 OutputStreamKind")
-	ErrInvalidAuditStage             = errors.New("events: 无效的 AuditStage")
-	ErrInvalidPoolAction             = errors.New("events: 无效的 PoolEventAction")
-	ErrInvalidDiagnosticScope        = errors.New("events: 无效的 DiagnosticScope")
-	ErrInvalidFSMMachine             = errors.New("events: 无效的 FSMMachineKind")
-	ErrUnsupportedEventClass         = errors.New("events: 当前通道不支持该事件类别")
-	ErrOperationMismatch             = errors.New("events: 事件 TraceID 或 OperationID 与操作流绑定不一致")
-	ErrInvalidStreamConfig           = errors.New("events: 无效的 OperationStream 配置")
-	ErrStreamNotInitialized          = errors.New("events: OperationStream 未初始化")
-	ErrStreamClosed                  = errors.New("events: OperationStream 已关闭")
-	ErrInvalidFoldFunc               = errors.New("events: Fold 归约函数不能为 nil")
-	ErrInvalidAuditConfig            = errors.New("events: 无效的 AuditDispatcher 配置")
-	ErrNilAuditWriter                = errors.New("events: AuditWriter 不能为 nil")
-	ErrAuditDispatcherNotInitialized = errors.New("events: AuditDispatcher 未初始化")
-	ErrAuditHalted                   = errors.New("events: AuditDispatcher 已进入 Halted 熔断态")
-	ErrAuditDispatchFailed           = errors.New("events: 同步审计分发失败")
-	ErrInvalidBusConfig              = errors.New("events: 无效的 SystemBus 配置")
-	ErrBusNotInitialized             = errors.New("events: SystemBus 未初始化")
-	ErrBusClosed                     = errors.New("events: SystemBus 已关闭")
-	ErrBusSubscriberLimit            = errors.New("events: SystemBus 订阅者数量已达上限")
-	ErrSubscriptionNotInitialized    = errors.New("events: SystemSubscription 未初始化")
+	ErrNilContext                    = domi18n.Sentinel(domi18n.KeyEventsNilContext)
+	ErrNilReceiver                   = domi18n.Sentinel(domi18n.KeyEventsNilReceiver)
+	ErrNilWriter                     = domi18n.Sentinel(domi18n.KeyEventsNilWriter)
+	ErrInvalidEvent                  = domi18n.Sentinel(domi18n.KeyEventsInvalidEvent)
+	ErrInvalidEventMeta              = domi18n.Sentinel(domi18n.KeyEventsInvalidEventMeta)
+	ErrInvalidEventKind              = domi18n.Sentinel(domi18n.KeyEventsInvalidEventKind)
+	ErrInvalidEventClass             = domi18n.Sentinel(domi18n.KeyEventsInvalidEventClass)
+	ErrInvalidBackpressure           = domi18n.Sentinel(domi18n.KeyEventsInvalidBackpressure)
+	ErrInvalidSeverity               = domi18n.Sentinel(domi18n.KeyEventsInvalidSeverity)
+	ErrInvalidOutputStream           = domi18n.Sentinel(domi18n.KeyEventsInvalidOutputStream)
+	ErrInvalidAuditStage             = domi18n.Sentinel(domi18n.KeyEventsInvalidAuditStage)
+	ErrInvalidPoolAction             = domi18n.Sentinel(domi18n.KeyEventsInvalidPoolAction)
+	ErrInvalidDiagnosticScope        = domi18n.Sentinel(domi18n.KeyEventsInvalidDiagScope)
+	ErrInvalidFSMMachine             = domi18n.Sentinel(domi18n.KeyEventsInvalidFSMMachine)
+	ErrUnsupportedEventClass         = domi18n.Sentinel(domi18n.KeyEventsUnsupportedClass)
+	ErrOperationMismatch             = domi18n.Sentinel(domi18n.KeyEventsOperationMismatch)
+	ErrInvalidStreamConfig           = domi18n.Sentinel(domi18n.KeyEventsInvalidStreamConfig)
+	ErrStreamNotInitialized          = domi18n.Sentinel(domi18n.KeyEventsStreamNotInit)
+	ErrStreamClosed                  = domi18n.Sentinel(domi18n.KeyEventsStreamClosed)
+	ErrInvalidFoldFunc               = domi18n.Sentinel(domi18n.KeyEventsInvalidFoldFunc)
+	ErrInvalidAuditConfig            = domi18n.Sentinel(domi18n.KeyEventsInvalidAuditConfig)
+	ErrNilAuditWriter                = domi18n.Sentinel(domi18n.KeyEventsNilAuditWriter)
+	ErrAuditDispatcherNotInitialized = domi18n.Sentinel(domi18n.KeyEventsAuditDispNotInit)
+	ErrAuditHalted                   = domi18n.Sentinel(domi18n.KeyEventsAuditHalted)
+	ErrAuditDispatchFailed           = domi18n.Sentinel(domi18n.KeyEventsAuditDispatchFailed)
+	ErrInvalidBusConfig              = domi18n.Sentinel(domi18n.KeyEventsInvalidBusConfig)
+	ErrBusNotInitialized             = domi18n.Sentinel(domi18n.KeyEventsBusNotInit)
+	ErrBusClosed                     = domi18n.Sentinel(domi18n.KeyEventsBusClosed)
+	ErrBusSubscriberLimit            = domi18n.Sentinel(domi18n.KeyEventsBusSubscriberLimit)
+	ErrSubscriptionNotInitialized    = domi18n.Sentinel(domi18n.KeyEventsSubNotInit)
 )
+
+func fieldErr(sentinel error, field string) error {
+	return domi18n.EF(sentinel, domi18n.KeyCommonFieldValueInvalid, domi18n.Str("field", field))
+}
+func missingFieldErr(sentinel error, field string) error {
+	return domi18n.EF(sentinel, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", field))
+}
 
 func pickIf[T any](ok bool, yes, no T) T {
 	if ok {
@@ -116,12 +122,12 @@ func canonicalizeKVMap(raw map[string]string, baseErr error) (map[string]string,
 		return nil, nil
 	}
 	if len(raw) > maxMapEntries {
-		return nil, fmt.Errorf("%w: 键值数量 %d 超出上限 %d", baseErr, len(raw), maxMapEntries)
+		return nil, domi18n.EF(baseErr, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "labels"), domi18n.Int("count", len(raw)), domi18n.Int("limit", maxMapEntries))
 	}
 	out := make(map[string]string, len(raw))
 	for k, v := range raw {
 		if !isValidASCIIToken(k, maxLabelKeyBytes) {
-			return nil, fmt.Errorf("%w: 非法标签键 %q", baseErr, k)
+			return nil, domi18n.EF(baseErr, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "label_key"), domi18n.BoundStr("value", k))
 		}
 		out[k] = sanitizeText(v, maxLabelValBytes)
 	}
@@ -154,7 +160,7 @@ func rejectJSONNull(dec *jsontext.Decoder, baseErr error) (bool, error) {
 	if _, err := dec.ReadToken(); err != nil {
 		return true, err
 	}
-	return true, fmt.Errorf("%w: JSON null 不是有效值", baseErr)
+	return true, domi18n.EF(baseErr, domi18n.KeyCommonJSONNullForbidden)
 }
 
 func unmarshalJSONWithNullReject[T, W any](dst *T, dec *jsontext.Decoder, baseErr error, build func(W) (T, error)) error {

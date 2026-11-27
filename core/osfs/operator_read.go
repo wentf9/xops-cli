@@ -3,7 +3,7 @@ package osfs
 import (
 	"context"
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"io"
@@ -15,7 +15,7 @@ import (
 // Unix 逐段使用 Mkdirat + O_DIRECTORY|O_NOFOLLOW 建目录（默认 0700）；Windows 当 perm&0o077==0 时附带 Owner-Only DACL。
 func EnsureDir(dir pathalg.LocalDir, perm fs.FileMode) error {
 	if !dir.IsValid() || perm == 0 || perm != perm.Perm() {
-		return fmt.Errorf("%w: 无效本地目录或权限 %#o", ports.ErrInvalidArgument, perm)
+		return errField(ports.ErrInvalidArgument, "dir/perm")
 	}
 	nativeDir, err := localPathToNativeOS(dir.Kind(), dir.String())
 	if err != nil {
@@ -66,7 +66,7 @@ func checkOperatorReadArgs(ctx context.Context, o *OperatorFS, path pathalg.Loca
 	case fnNil:
 		return ports.ErrNilCallback
 	case o == nil || !o.valid || !path.IsValid() || !policy.IsValid():
-		return fmt.Errorf("%w: OperatorFS 未初始化或本地只读源路径/软链策略无效", ports.ErrInvalidArgument)
+		return errField(ports.ErrInvalidArgument, "operator_read")
 	default:
 		return ctx.Err()
 	}
@@ -108,7 +108,7 @@ func (b *borrowedReader) ReadAt(p []byte, off int64) (int, error) {
 		return 0, ports.ErrHandleExpired
 	}
 	if off < 0 {
-		return 0, fmt.Errorf("%w: ReadAt 偏移不能为负", ports.ErrInvalidArgument)
+		return 0, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "offset"))
 	}
 	if len(p) == 0 || !b.limited {
 		return pickIf(len(p) == 0, func() (int, error) { return 0, nil }, func() (int, error) { return b.r.ReadAt(p, off) })()

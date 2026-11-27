@@ -5,7 +5,7 @@ package osfs
 import (
 	"context"
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/sys/windows"
 	"net"
@@ -99,12 +99,12 @@ func queryPeerCredFD(fd uintptr) (PeerCred, error) {
 		(*byte)(unsafe.Pointer(&peerPID)), uint32(unsafe.Sizeof(peerPID)), &bytesReturned, nil, 0)
 	if err != nil {
 		if errors.Is(err, windows.WSAEOPNOTSUPP) || errors.Is(err, windows.WSAEINVAL) || errors.Is(err, windows.WSAENOPROTOOPT) {
-			return PeerCred{}, fmt.Errorf("%w: %w: %w", ErrUnauthorizedPeer, ErrUnsupportedPeerCred, err)
+			return PeerCred{}, wrapS(ErrUnauthorizedPeer, wrapS(ErrUnsupportedPeerCred, err))
 		}
-		return PeerCred{}, fmt.Errorf("%w: WSAIoctl(SIO_AF_UNIX_GETPEERPID) 失败: %w", ErrUnauthorizedPeer, err)
+		return PeerCred{}, wrapOp(ErrUnauthorizedPeer, err, "WSAIoctl(SIO_AF_UNIX_GETPEERPID)")
 	}
 	if (bytesReturned != 0 && bytesReturned != uint32(unsafe.Sizeof(peerPID))) || peerPID == 0 {
-		return PeerCred{}, fmt.Errorf("%w: SIO_AF_UNIX_GETPEERPID 返回异常 (bytes=%d, pid=%d)", ErrUnauthorizedPeer, bytesReturned, peerPID)
+		return PeerCred{}, errField(ErrUnauthorizedPeer, "peer_pid")
 	}
 	return PeerCred{pid: peerPID, hasPID: true, valid: true}, nil
 }
@@ -117,14 +117,14 @@ func verifyPeerCurrentUserFD(fd uintptr) (PeerCred, error) {
 	}
 	currSID, err := CurrentProcessUserSID()
 	if err != nil {
-		return PeerCred{}, fmt.Errorf("%w: 查询当前用户 SID 失败: %w", ErrUnauthorizedPeer, err)
+		return PeerCred{}, wrapOp(ErrUnauthorizedPeer, err, "CurrentProcessUserSID")
 	}
 	peerSID, err := ProcessUserSID(cred.pid)
 	if err != nil {
-		return PeerCred{}, fmt.Errorf("%w: 查询对端 PID %d SID 失败: %w", ErrUnauthorizedPeer, cred.pid, err)
+		return PeerCred{}, wrapOp(ErrUnauthorizedPeer, err, "ProcessUserSID")
 	}
 	if !peerSID.IsValid() || !currSID.IsValid() || !peerSID.Equals(currSID) {
-		return PeerCred{}, fmt.Errorf("%w: 对端进程 PID %d 用户 SID 不匹配", ErrUnauthorizedPeer, cred.pid)
+		return PeerCred{}, domi18n.EF(ErrUnauthorizedPeer, domi18n.KeyOSFSPeerSIDMismatch, domi18n.Uint64("pid", uint64(cred.pid)))
 	}
 	return cred, nil
 }

@@ -2,9 +2,10 @@ package events
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
 
 // AuditWriter 定义 core/events 侧同步失败关闭审计写入抽象（零缓冲、零后台协程，物理隔离 core/ports）。
@@ -66,13 +67,13 @@ type AuditDispatcher struct {
 // NewAuditDispatcher 校验写入器非空（含拒绝 typed-nil AuditWriterFunc(nil)）与可选诊断总线已初始化，构造同步失败关闭的 AuditDispatcher。
 func NewAuditDispatcher(cfg AuditDispatcherConfig) (*AuditDispatcher, error) {
 	if cfg.Writer == nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidAuditConfig, ErrNilAuditWriter)
+		return nil, domi18n.WrapSentinel(ErrInvalidAuditConfig, ErrNilAuditWriter)
 	}
 	if fn, ok := cfg.Writer.(AuditWriterFunc); ok && fn == nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidAuditConfig, ErrNilAuditWriter)
+		return nil, domi18n.WrapSentinel(ErrInvalidAuditConfig, ErrNilAuditWriter)
 	}
 	if cfg.DiagnosticBus != nil && !cfg.DiagnosticBus.initialized {
-		return nil, fmt.Errorf("%w: diagnostic_bus 未初始化", ErrInvalidAuditConfig)
+		return nil, domi18n.EF(ErrInvalidAuditConfig, domi18n.KeyCommonComponentClosed, domi18n.Str("component", "diagnostic_bus"))
 	}
 	return &AuditDispatcher{
 		writer: cfg.Writer, haltOnWriteError: cfg.HaltOnWriteError,
@@ -105,7 +106,7 @@ func (d *AuditDispatcher) Dispatch(ctx context.Context, ev *AuditRecordEvent) er
 			d.Halt("audit_write_failed", err)
 		}
 		d.mirrorFailureDiag(ev, err)
-		return fmt.Errorf("%w: %w", ErrAuditDispatchFailed, err)
+		return domi18n.WrapSentinel(ErrAuditDispatchFailed, err)
 	}
 	d.dispatched.Add(1)
 	return nil
@@ -125,7 +126,7 @@ func (d *AuditDispatcher) DispatchEvent(ctx context.Context, ev Event) error {
 	case *OperationStartedEvent, *OperationCompletedEvent, *OutputChunkEvent, *StepEvent,
 		*FSMTransitionEvent, *ApprovalChallengeEvent, *TransferProgressEvent, *MetricSampleEvent,
 		*PoolStateEvent, *DiagnosticEvent, *BusDroppedEvent:
-		return fmt.Errorf("%w: AuditDispatcher 仅接受 audit_record 事件，实际=%s", ErrUnsupportedEventClass, v.Kind())
+		return domi18n.EF(ErrUnsupportedEventClass, domi18n.KeyEventsClassMismatch, domi18n.Str("expected", EventKindAuditRecord.String()), domi18n.Str("actual", v.Kind().String()))
 	default:
 		return ErrInvalidEvent
 	}
@@ -185,9 +186,9 @@ func (d *AuditDispatcher) haltedErr() error {
 		return nil
 	}
 	if cause != nil {
-		return fmt.Errorf("%w (%s): %w", ErrAuditHalted, reason, cause)
+		return domi18n.WrapS(ErrAuditHalted, cause, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason))
 	}
-	return fmt.Errorf("%w: %s", ErrAuditHalted, reason)
+	return domi18n.EF(ErrAuditHalted, domi18n.KeyCommonDetail, domi18n.BoundStr("detail", reason))
 }
 
 func (d *AuditDispatcher) mirrorFailureDiag(ev *AuditRecordEvent, writeErr error) {

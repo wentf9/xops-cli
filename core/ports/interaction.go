@@ -2,7 +2,6 @@ package ports
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -17,6 +16,8 @@ type promptCore struct {
 	allowEmpty, valid      bool
 }
 
+func badPromptMsgErr() error { return domi18n.EF(ErrInvalidArgument, domi18n.KeyPortsPromptMsgInvalid) }
+
 // validatePromptMessage 递归严格校验可选结构化提示消息：
 // 拒绝非法 UTF-8、任何控制/转义/Bidi 字符，并累计整棵嵌套消息树与规范渲染文本的字节预算，
 // 确保结构化消息在构造期即满足「构造即安全」不变量（零逃生口）。
@@ -26,14 +27,11 @@ func validatePromptMessage(opt algebraic.Option[domi18n.Message], maxBytes int) 
 		return nil
 	}
 	if !msg.IsValid() {
-		return fmt.Errorf("%w: 结构化提示消息无效", ErrInvalidArgument)
+		return badPromptMsgErr()
 	}
 	canon := msg.Canonical()
-	if len(canon) > maxBytes || hasForbiddenControl(canon) {
-		return fmt.Errorf("%w: 结构化提示消息规范文本超长或包含非法 UTF-8/控制/Bidi 字符", ErrInvalidArgument)
-	}
-	if strings.TrimSpace(canon) == "" {
-		return fmt.Errorf("%w: 结构化提示消息规范文本不能为空", ErrInvalidArgument)
+	if len(canon) > maxBytes || hasForbiddenControl(canon) || strings.TrimSpace(canon) == "" {
+		return badPromptMsgErr()
 	}
 	used := 0
 	return inspectPromptMessageTree(msg, 0, maxBytes, &used)
@@ -41,18 +39,15 @@ func validatePromptMessage(opt algebraic.Option[domi18n.Message], maxBytes int) 
 
 func inspectPromptMessageTree(msg domi18n.Message, depth uint8, maxBytes int, used *int) error {
 	if !msg.IsValid() || depth > domi18n.MaxMessageDepth {
-		return fmt.Errorf("%w: 结构化提示消息无效或嵌套超深", ErrInvalidArgument)
+		return badPromptMsgErr()
 	}
 	fb := msg.Fallback()
-	if hasForbiddenControl(fb) {
-		return fmt.Errorf("%w: 结构化提示消息模板包含非法 UTF-8/控制/Bidi 字符", ErrInvalidArgument)
-	}
-	if depth > 0 && len(msg.Canonical()) > maxBytes {
-		return fmt.Errorf("%w: 嵌套结构化提示消息规范文本超长", ErrInvalidArgument)
+	if hasForbiddenControl(fb) || (depth > 0 && len(msg.Canonical()) > maxBytes) {
+		return badPromptMsgErr()
 	}
 	*used += len(msg.ID()) + len(fb)
 	if *used > maxBytes {
-		return fmt.Errorf("%w: 结构化提示消息字节预算超限", ErrInvalidArgument)
+		return badPromptMsgErr()
 	}
 	for _, p := range msg.Params() {
 		if err := inspectPromptMessageParam(p, depth, maxBytes, used); err != nil {
@@ -64,22 +59,22 @@ func inspectPromptMessageTree(msg domi18n.Message, depth uint8, maxBytes int, us
 
 func inspectPromptMessageParam(p domi18n.Param, depth uint8, maxBytes int, used *int) error {
 	if !p.IsValid() {
-		return fmt.Errorf("%w: 结构化提示消息参数无效", ErrInvalidArgument)
+		return badPromptMsgErr()
 	}
 	if p.Kind() == domi18n.ParamKindMessage {
 		child, ok := p.MessageVal()
 		if !ok {
-			return fmt.Errorf("%w: 结构化提示消息嵌套子消息无效", ErrInvalidArgument)
+			return badPromptMsgErr()
 		}
 		return inspectPromptMessageTree(child, depth+1, maxBytes, used)
 	}
 	text := p.FormatCanonical()
 	if hasForbiddenControl(text) {
-		return fmt.Errorf("%w: 结构化提示消息参数包含非法 UTF-8/控制/Bidi 字符", ErrInvalidArgument)
+		return badPromptMsgErr()
 	}
 	*used += len(text)
 	if *used > maxBytes {
-		return fmt.Errorf("%w: 结构化提示消息参数文本超长", ErrInvalidArgument)
+		return badPromptMsgErr()
 	}
 	return nil
 }
@@ -166,7 +161,7 @@ type ConfirmRequest struct {
 // 递归严格拒绝非法控制/Bidi 字符与字节预算超限后构造不可变 ConfirmRequest。
 func NewConfirmRequest(spec ConfirmRequestSpec) (ConfirmRequest, error) {
 	if !spec.Risk.IsValid() {
-		return ConfirmRequest{}, fmt.Errorf("%w: ConfirmRequest 需要有效 RiskLevel", ErrInvalidArgument)
+		return ConfirmRequest{}, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "risk"))
 	}
 	c, err := buildPromptCore(spec.Title, spec.Message, spec.Subject, false, spec.TitleMessage, spec.BodyMessage)
 	return ConfirmRequest{core: c, risk: spec.Risk}, err
@@ -237,7 +232,7 @@ type ApprovalDecisionResponse struct {
 // NewApprovalDecisionResponse 校验判定值与信封摘要并构造不可变 ApprovalDecisionResponse。
 func NewApprovalDecisionResponse(verdict security.Verdict, envelopeDigest security.Digest, comment string) (ApprovalDecisionResponse, error) {
 	if !verdict.IsValid() || !envelopeDigest.IsValid() {
-		return ApprovalDecisionResponse{}, fmt.Errorf("%w: ApprovalDecisionResponse 需要有效 Verdict 与 EnvelopeDigest", ErrInvalidArgument)
+		return ApprovalDecisionResponse{}, fieldErr(ErrInvalidArgument, "approval_decision_response")
 	}
 	clean, err := sanitizeBoundedText(security.SanitizePromptText(comment), maxPortDetailBytes, true, ErrInvalidArgument)
 	return ApprovalDecisionResponse{verdict: verdict, envelopeDigest: envelopeDigest, comment: clean, valid: err == nil}, err

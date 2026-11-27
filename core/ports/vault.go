@@ -3,14 +3,14 @@ package ports
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"net"
+	"slices"
+
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
-	"net"
-	"slices"
 )
 
 const maxKeyAlgoBytes, maxWireBlobBytes, sshfpSHA1Bytes, sshfpSHA256Bytes = 128, 64 * 1024, 20, 32
@@ -58,7 +58,7 @@ type VaultStatus struct {
 func NewVaultStatus(spec VaultStatusSpec) (VaultStatus, error) {
 	detail, err := sanitizeBoundedText(spec.Detail, maxPortDetailBytes, true, ErrInvalidArgument)
 	if !spec.State.IsValid() || slices.ContainsFunc(spec.KnownStores, func(s string) bool { return !isValidASCIIToken(s, maxPortTokenLen) }) || err != nil {
-		return VaultStatus{}, firstErr(err, fmt.Errorf("%w: VaultStatus 状态或凭据存储名非法", ErrInvalidArgument))
+		return VaultStatus{}, firstErr(err, fieldErr(ErrInvalidArgument, "vault_status"))
 	}
 	stores := cloneSliceNilIfEmpty(spec.KnownStores)
 	slices.Sort(stores)
@@ -104,7 +104,7 @@ type PublicKeyInfo struct {
 // NewPublicKeyInfo 校验算法名、指纹与非空公钥线缆载荷并构造不可变 PublicKeyInfo。
 func NewPublicKeyInfo(spec PublicKeyInfoSpec) (PublicKeyInfo, error) {
 	if !isValidASCIIToken(spec.Algorithm, maxKeyAlgoBytes) || !spec.Fingerprint.IsValid() || len(spec.WireBlob) == 0 || len(spec.WireBlob) > maxWireBlobBytes {
-		return PublicKeyInfo{}, fmt.Errorf("%w: 公钥算法、指纹或 wire 载荷非法", ErrInvalidArgument)
+		return PublicKeyInfo{}, fieldErr(ErrInvalidArgument, "public_key_info")
 	}
 	comment, err := sanitizeBoundedText(spec.Comment, maxPortDetailBytes, true, ErrInvalidArgument)
 	spec.WireBlob, spec.Comment = bytes.Clone(spec.WireBlob), comment
@@ -135,7 +135,7 @@ type Signature struct {
 // NewSignature 校验签名算法格式与非空载荷并构造不可变 Signature。
 func NewSignature(format string, blob []byte) (Signature, error) {
 	if !isValidASCIIToken(format, maxKeyAlgoBytes) || len(blob) == 0 || len(blob) > maxWireBlobBytes {
-		return Signature{}, fmt.Errorf("%w: 签名格式或载荷非法", ErrInvalidArgument)
+		return Signature{}, fieldErr(ErrInvalidArgument, "signature")
 	}
 	return Signature{format: format, blob: bytes.Clone(blob), valid: true}, nil
 }
@@ -181,7 +181,7 @@ type SSHFPRecord struct {
 func NewSSHFPRecord(spec SSHFPRecordSpec) (SSHFPRecord, error) {
 	wantLen := pickIf(spec.FingerprintType == 1, sshfpSHA1Bytes, pickIf(spec.FingerprintType == 2, sshfpSHA256Bytes, 0))
 	if spec.Algorithm == 0 || wantLen == 0 || len(spec.Digest) != wantLen {
-		return SSHFPRecord{}, fmt.Errorf("%w: SSHFP 算法/摘要类型或长度非法", ErrInvalidArgument)
+		return SSHFPRecord{}, fieldErr(ErrInvalidArgument, "sshfp_record")
 	}
 	spec.Digest = bytes.Clone(spec.Digest)
 	return SSHFPRecord{s: spec, valid: true}, nil
@@ -235,7 +235,7 @@ type HostTrustRequest struct {
 // NewHostTrustRequest 校验端点、远端公钥与校验模式并构造不可变 HostTrustRequest。
 func NewHostTrustRequest(spec HostTrustRequestSpec) (HostTrustRequest, error) {
 	if !spec.Endpoint.IsValid() || !spec.Presented.IsValid() || spec.Mode.String() == "" {
-		return HostTrustRequest{}, fmt.Errorf("%w: Endpoint、Presented 公钥与模式均须有效", ErrInvalidArgument)
+		return HostTrustRequest{}, fieldErr(ErrInvalidArgument, "host_trust_request")
 	}
 	return HostTrustRequest{s: spec, valid: true}, nil
 }
@@ -269,7 +269,7 @@ type HostTrustCheck struct {
 // NewHostTrustCheck 校验核验状态、端点、呈递公钥与可选预期指纹列表并构造不可变 HostTrustCheck。
 func NewHostTrustCheck(spec HostTrustCheckSpec) (HostTrustCheck, error) {
 	if !spec.Status.IsValid() || !spec.Endpoint.IsValid() || !spec.Presented.IsValid() || slices.ContainsFunc(spec.ExpectedFingerprints, inventory.KeyFingerprint.IsZero) {
-		return HostTrustCheck{}, fmt.Errorf("%w: HostTrustCheck 缺少有效字段或含无效预期指纹", ErrInvalidArgument)
+		return HostTrustCheck{}, fieldErr(ErrInvalidArgument, "host_trust_check")
 	}
 	reason, err := sanitizeBoundedText(spec.Reason, maxPortDetailBytes, true, ErrInvalidArgument)
 	spec.ExpectedFingerprints, spec.Reason = cloneSliceNilIfEmpty(spec.ExpectedFingerprints), reason

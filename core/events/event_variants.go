@@ -2,7 +2,6 @@ package events
 
 import (
 	"bytes"
-	"fmt"
 	"maps"
 	"math"
 	"slices"
@@ -292,7 +291,7 @@ func NewOperationStartedEvent(s OperationStartedSpec) (*OperationStartedEvent, e
 		return nil, err
 	}
 	if !s.Capability.IsValid() || !isValidASCIIToken(s.Tool, maxCodeBytes) || !isValidASCIIToken(s.Action, maxCodeBytes) || optInvalid(s.PlanDigest) {
-		return nil, fmt.Errorf("%w: operation_started 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "operation_started")
 	}
 	return &OperationStartedEvent{newBase(EventKindOperationStarted, EventClassOperation, s.Meta), s.Capability, s.Tool, s.Action, sanitizeText(s.Summary, maxTextBytes), s.PlanDigest}, nil
 }
@@ -303,7 +302,7 @@ func NewOperationCompletedEvent(s OperationCompletedSpec) (*OperationCompletedEv
 		return nil, err
 	}
 	if !s.Capability.IsValid() || s.Duration.IsNegative() || (s.Code != "" && !isValidASCIIToken(s.Code, maxCodeBytes)) {
-		return nil, fmt.Errorf("%w: operation_completed 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "operation_completed")
 	}
 	if err := validateCompletedOutcomeConsistency(s.Succeeded, s.Outcome); err != nil {
 		return nil, err
@@ -317,7 +316,7 @@ func NewOutputChunkEvent(s OutputChunkSpec) (*OutputChunkEvent, error) {
 		return nil, err
 	}
 	if !s.Stream.IsValid() || len(s.Data) > maxOutputChunkBytes || (len(s.Data) == 0 && !s.Truncated) {
-		return nil, fmt.Errorf("%w: output_chunk 通道或字节载荷非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "output_chunk")
 	}
 	return &OutputChunkEvent{newBase(EventKindOutputChunk, EventClassOperation, s.Meta), s.Stream, s.ChunkIndex, bytes.Clone(s.Data), s.Truncated}, nil
 }
@@ -328,7 +327,7 @@ func NewStepEvent(s StepEventSpec) (*StepEvent, error) {
 		return nil, err
 	}
 	if optInvalid(s.PlaybookID) || !s.StepID.IsValid() || !s.Status.IsValid() || s.Duration.IsNegative() {
-		return nil, fmt.Errorf("%w: step 事件参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "step")
 	}
 	if err := validateStepOutcomeConsistency(s.Status, s.Outcome); err != nil {
 		return nil, err
@@ -342,7 +341,7 @@ func NewFSMTransitionEvent(s FSMTransitionSpec) (*FSMTransitionEvent, error) {
 		return nil, err
 	}
 	if !s.Machine.IsValid() || !isValidASCIIToken(s.FromState, maxCodeBytes) || !isValidASCIIToken(s.ToState, maxCodeBytes) || !isValidASCIIToken(s.EventName, maxCodeBytes) {
-		return nil, fmt.Errorf("%w: fsm_transition 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "fsm_transition")
 	}
 	return &FSMTransitionEvent{newBase(EventKindFSMTransition, EventClassOperation, s.Meta), s.Machine, s.FromState, s.ToState, s.EventName, sanitizeText(s.Detail, maxTextBytes), s.Terminal}, nil
 }
@@ -355,7 +354,7 @@ type fsmStateToken interface {
 
 func newTypedFSMTransition[S, K fsmStateToken](meta EventMeta, m FSMMachineKind, from, to S, evOk bool, evKind K, detail string, terminal bool) (*FSMTransitionEvent, error) {
 	if !from.IsValid() || !to.IsValid() || !evOk {
-		return nil, fmt.Errorf("%w: 无效的 %s 状态或事件", ErrInvalidEvent, m)
+		return nil, fieldErr(ErrInvalidEvent, m.String())
 	}
 	return NewFSMTransitionEvent(FSMTransitionSpec{meta, m, from.String(), to.String(), evKind.String(), detail, terminal})
 }
@@ -381,10 +380,10 @@ func NewApprovalChallengeEvent(s ApprovalChallengeSpec) (*ApprovalChallengeEvent
 		return nil, err
 	}
 	if !s.Envelope.IsValid() || !s.Phase.IsValid() {
-		return nil, fmt.Errorf("%w: approval_challenge 需要有效 envelope 与 phase", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "approval_challenge")
 	}
 	if !approvalOpMatches(s.Meta, s.Envelope) {
-		return nil, fmt.Errorf("%w: approval_challenge 的 envelope.operation_id 与 meta.operation_id 不一致", ErrOperationMismatch)
+		return nil, fieldErr(ErrOperationMismatch, "operation_id")
 	}
 	return &ApprovalChallengeEvent{newBase(EventKindApprovalChallenge, EventClassOperation, s.Meta), s.Envelope, s.Phase, s.Escalated, sanitizeText(s.Reason, maxTextBytes)}, nil
 }
@@ -395,7 +394,7 @@ func NewTransferProgressEvent(s TransferProgressSpec) (*TransferProgressEvent, e
 		return nil, err
 	}
 	if !s.TransferID.IsValid() || !s.Direction.IsValid() || s.Elapsed.IsNegative() || (s.TotalBytes > 0 && s.BytesTransferred > s.TotalBytes) || (s.Stage != "" && !isValidASCIIToken(s.Stage, maxCodeBytes)) {
-		return nil, fmt.Errorf("%w: transfer_progress 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "transfer_progress")
 	}
 	return &TransferProgressEvent{newBase(EventKindTransferProgress, EventClassProgress, s.Meta), s.TransferID, s.Direction, s.BytesTransferred, s.TotalBytes, s.ChunksCompleted, s.RateBytesPerSec, s.Elapsed, s.Stage}, nil
 }
@@ -406,7 +405,7 @@ func NewMetricSampleEvent(s MetricSampleSpec) (*MetricSampleEvent, error) {
 		return nil, err
 	}
 	if !isValidASCIIToken(s.MetricName, maxCodeBytes) || math.IsNaN(s.Value) || math.IsInf(s.Value, 0) || s.Interval.IsNegative() || (s.Unit != "" && !isValidASCIIToken(s.Unit, maxLabelKeyBytes)) {
-		return nil, fmt.Errorf("%w: metric_sample 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "metric_sample")
 	}
 	labels, err := canonicalizeKVMap(s.Labels, ErrInvalidEvent)
 	if err != nil {
@@ -421,7 +420,7 @@ func NewAuditRecordEvent(s AuditRecordSpec) (*AuditRecordEvent, error) {
 		return nil, err
 	}
 	if !s.Stage.IsValid() || !isValidASCIIToken(s.ProcessInstanceID, maxCodeBytes) || !s.Capability.IsValid() || s.Decision == nil || !s.Decision.IsValid() || !s.Risk.IsValid() || s.Duration.IsNegative() {
-		return nil, fmt.Errorf("%w: audit_record 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "audit_record")
 	}
 	if err := validateAuditOptionals(s.Stage, s.Capability, s.Decision, s.Binding, s.Outcome); err != nil {
 		return nil, err
@@ -433,7 +432,7 @@ func NewAuditRecordEvent(s AuditRecordSpec) (*AuditRecordEvent, error) {
 func NewPoolStateEvent(s PoolStateSpec) (*PoolStateEvent, error) {
 	if !s.Meta.IsValid() || !s.Action.IsValid() || s.Latency.IsNegative() ||
 		optInvalid(s.PlanDigest) || optInvalid(s.HopDigest) || optInvalid(s.Endpoint) || optInvalid(s.HandleKind) || optInvalid(s.HandleID) {
-		return nil, fmt.Errorf("%w: pool_state 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "pool_state")
 	}
 	return &PoolStateEvent{newBase(EventKindPoolState, EventClassSystem, s.Meta), s.Action, s.PlanDigest, s.HopDigest, s.Endpoint, s.HandleKind, s.HandleID, s.Generation, s.ActiveLeases, s.Latency, sanitizeText(s.Detail, maxTextBytes)}, nil
 }
@@ -442,7 +441,7 @@ func NewPoolStateEvent(s PoolStateSpec) (*PoolStateEvent, error) {
 func NewDiagnosticEvent(s DiagnosticSpec) (*DiagnosticEvent, error) {
 	msg := sanitizeText(s.Message, maxTextBytes)
 	if !s.Meta.IsValid() || !s.Scope.IsValid() || !s.Severity.IsValid() || msg == "" || (s.Code != "" && !isValidASCIIToken(s.Code, maxCodeBytes)) {
-		return nil, fmt.Errorf("%w: diagnostic 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "diagnostic")
 	}
 	attrs, err := canonicalizeKVMap(s.Attrs, ErrInvalidEvent)
 	if err != nil {
@@ -454,7 +453,7 @@ func NewDiagnosticEvent(s DiagnosticSpec) (*DiagnosticEvent, error) {
 // NewBusDroppedEvent 校验作用域与单调丢弃计数（delta>0 且 total>=delta）并构造 *BusDroppedEvent。
 func NewBusDroppedEvent(s BusDroppedSpec) (*BusDroppedEvent, error) {
 	if !s.Meta.IsValid() || !s.Scope.IsValid() || s.DroppedDelta == 0 || s.DroppedTotal < s.DroppedDelta {
-		return nil, fmt.Errorf("%w: bus_dropped 参数非法", ErrInvalidEvent)
+		return nil, fieldErr(ErrInvalidEvent, "bus_dropped")
 	}
 	return &BusDroppedEvent{newBase(EventKindBusDropped, EventClassSystem, s.Meta), s.Scope, s.DroppedTotal, s.DroppedDelta, sanitizeText(s.Reason, maxTextBytes)}, nil
 }

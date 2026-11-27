@@ -3,13 +3,15 @@ package ports
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
+
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/plan"
-	"io"
-	"net"
 )
 
 // PTYRequest 描述远端伪终端分配请求（终端类型与窗口尺寸）；零值恒无效。
@@ -26,9 +28,9 @@ type PTYRequest struct {
 func NewPTYRequest(term string, size TerminalSize) (PTYRequest, error) {
 	switch {
 	case !isValidASCIIToken(term, maxPortTokenLen):
-		return PTYRequest{}, fmt.Errorf("%w: 非法 TERM 标识 %q", ErrInvalidArgument, term)
+		return PTYRequest{}, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "term"), domi18n.BoundStr("value", term))
 	case !size.IsValid():
-		return PTYRequest{}, fmt.Errorf("%w: %w", ErrInvalidArgument, ErrInvalidTTYSize)
+		return PTYRequest{}, domi18n.WrapSentinel(ErrInvalidArgument, ErrInvalidTTYSize)
 	default:
 		return PTYRequest{term: term, size: size, valid: true}, nil
 	}
@@ -92,7 +94,7 @@ func NewTypedForwardSpec(direction ForwardDirection, bindKind ForwardEndpointKin
 	target, e2 := sanitizeBoundedText(targetAddr, maxPortDetailBytes, direction == ForwardDynamic, ErrInvalidArgument)
 	validKinds := pickIf(direction == ForwardDynamic, bindKind == ForwardEndpointTCP && targetKind == ForwardEndpointInvalid && target == "", bindKind.IsValid() && targetKind.IsValid() && target != "")
 	if !direction.IsValid() || direction == ForwardTUN || firstErr(e1, e2) != nil || !validKinds {
-		return ForwardSpec{}, fmt.Errorf("%w: ForwardSpec 方向、端点类型或地址组合非法", ErrInvalidArgument)
+		return ForwardSpec{}, fieldErr(ErrInvalidArgument, "forward_spec")
 	}
 	return ForwardSpec{direction: direction, bindKind: bindKind, targetKind: targetKind, bindAddr: bind, targetAddr: target, valid: true}, nil
 }
@@ -100,7 +102,7 @@ func NewTypedForwardSpec(direction ForwardDirection, bindKind ForwardEndpointKin
 // NewForwardTUNSpec 校验强类型 TUNSpec 并构造 ForwardTUN 方向的不可变 ForwardSpec。
 func NewForwardTUNSpec(tun TUNSpec) (ForwardSpec, error) {
 	if !tun.IsValid() {
-		return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN 需要有效 TUNSpec", ErrInvalidArgument)
+		return ForwardSpec{}, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "tun"))
 	}
 	return ForwardSpec{direction: ForwardTUN, bindAddr: formatTUNUnitAddr(tun.Mode(), tun.LocalUnit()), targetAddr: formatTUNUnitAddr(tun.Mode(), tun.RemoteUnit()), tun: algebraic.Some(tun), valid: true}, nil
 }
@@ -220,7 +222,7 @@ func NewMuxControlRequest(action MuxControlAction, socketPath pathalg.LocalSourc
 	fwd, hasFwd := forward.Get()
 	needsFwd := action == MuxActionForward || action == MuxActionCancel
 	if !action.IsValid() || !socketPath.IsValid() || (needsFwd && (!hasFwd || !fwd.IsValid())) || (!needsFwd && hasFwd) {
-		return MuxControlRequest{}, fmt.Errorf("%w: MuxControlRequest 动作、路径或 ForwardSpec 组合非法", ErrInvalidArgument)
+		return MuxControlRequest{}, fieldErr(ErrInvalidArgument, "mux_control_request")
 	}
 	return MuxControlRequest{action: action, socketPath: socketPath, forward: forward, valid: true}, nil
 }
@@ -245,7 +247,7 @@ type MuxControlResponse struct {
 // NewMuxControlResponse 校验主进程状态与诊断说明并构造不可变 MuxControlResponse。
 func NewMuxControlResponse(alive bool, masterPID uint32, detail string) (MuxControlResponse, error) {
 	if !alive && masterPID != 0 {
-		return MuxControlResponse{}, fmt.Errorf("%w: 非存活响应不得携带非零 master_pid", ErrInvalidArgument)
+		return MuxControlResponse{}, fieldErr(ErrInvalidArgument, "master_pid")
 	}
 	clean, err := sanitizeBoundedText(detail, maxPortDetailBytes, true, ErrInvalidArgument)
 	return pickIf(err == nil, MuxControlResponse{alive: alive, masterPID: masterPID, detail: clean, valid: true}, MuxControlResponse{}), err

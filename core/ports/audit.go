@@ -6,14 +6,15 @@ import (
 	"encoding/hex"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/domain/security"
 	"io"
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
 const processInstanceEntropyBytes, maxProcessInstanceIDLen, maxAuditErrorCodeLen = 16, 64, 64
@@ -27,17 +28,17 @@ type ProcessInstanceID struct{ value string }
 // NewProcessInstanceIDFrom 从显式熵源读取 16 字节非全零随机数据并生成 32 位小写十六进制 ProcessInstanceID。
 func NewProcessInstanceIDFrom(entropy io.Reader) (ProcessInstanceID, error) {
 	if entropy == nil {
-		return ProcessInstanceID{}, fmt.Errorf("%w: 熵源不能为 nil", ErrInvalidProcessInstanceID)
+		return ProcessInstanceID{}, domi18n.EF(ErrInvalidProcessInstanceID, domi18n.KeyCommonFieldNil, domi18n.Str("field", "entropy"))
 	}
 	var raw [processInstanceEntropyBytes]byte
 	if _, err := io.ReadFull(entropy, raw[:]); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			err = fmt.Errorf("%w: %w", ErrEntropyShortRead, err)
+			err = domi18n.WrapSentinel(ErrEntropyShortRead, err)
 		}
-		return ProcessInstanceID{}, fmt.Errorf("%w: %w", ErrInvalidProcessInstanceID, err)
+		return ProcessInstanceID{}, domi18n.WrapSentinel(ErrInvalidProcessInstanceID, err)
 	}
 	if raw == ([processInstanceEntropyBytes]byte{}) {
-		return ProcessInstanceID{}, fmt.Errorf("%w: 熵源返回全零字节", ErrInvalidProcessInstanceID)
+		return ProcessInstanceID{}, domi18n.EF(ErrInvalidProcessInstanceID, domi18n.KeyCommonZeroEntropy)
 	}
 	return ProcessInstanceID{value: hex.EncodeToString(raw[:])}, nil
 }
@@ -45,10 +46,10 @@ func NewProcessInstanceIDFrom(entropy io.Reader) (ProcessInstanceID, error) {
 // ParseProcessInstanceID 校验并构造 ProcessInstanceID（1..64 位安全 ASCII 标识符，满足跨平台单文件名规则）。
 func ParseProcessInstanceID(raw string) (ProcessInstanceID, error) {
 	if len(raw) == 0 || len(raw) > maxProcessInstanceIDLen || !isSafeProcessIDChars(raw) {
-		return ProcessInstanceID{}, fmt.Errorf("%w: %q 格式非法", ErrInvalidProcessInstanceID, raw)
+		return ProcessInstanceID{}, domi18n.EF(ErrInvalidProcessInstanceID, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "process_instance_id"), domi18n.BoundStr("value", raw))
 	}
 	if err := pathalg.ValidateLocalComponent(raw + ".lock"); err != nil {
-		return ProcessInstanceID{}, fmt.Errorf("%w: %w", ErrInvalidProcessInstanceID, err)
+		return ProcessInstanceID{}, domi18n.WrapSentinel(ErrInvalidProcessInstanceID, err)
 	}
 	return ProcessInstanceID{value: raw}, nil
 }
@@ -148,7 +149,7 @@ func isValidAuditEntrySpec(s AuditEntrySpec) bool {
 }
 func validateAuditEntrySpec(s AuditEntrySpec) error {
 	if !isValidAuditEntrySpec(s) {
-		return fmt.Errorf("%w: 审计记录字段或阶段/结果/决策组合非法", ErrInvalidAuditEntry)
+		return fieldErr(ErrInvalidAuditEntry, "audit_entry")
 	}
 	return nil
 }
@@ -195,7 +196,7 @@ type AuditPostWriteError struct {
 // NewAuditPostWriteError 校验 operationID 有效后构造不可变 *AuditPostWriteError。
 func NewAuditPostWriteError(opID security.OperationID, cause error) (*AuditPostWriteError, error) {
 	if !opID.IsValid() {
-		return nil, fmt.Errorf("%w: AuditPostWriteError 需要有效 OperationID", ErrInvalidArgument)
+		return nil, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "operation_id"))
 	}
 	return &AuditPostWriteError{operationID: opID, cause: pickIf[error](cause != nil, cause, ErrAuditPostWrite), valid: true}, nil
 }
@@ -208,12 +209,20 @@ func (e *AuditPostWriteError) OperationID() security.OperationID {
 	}
 	return e.operationID
 }
-func (e *AuditPostWriteError) Error() string {
+
+// LocalizableView 返回结构化错误节点视图，供边界无穿透本地化并在默认 cause==ErrAuditPostWrite 时精准折叠。
+func (e *AuditPostWriteError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
-		return ErrAuditPostWrite.Error()
+		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyPortsAuditPostWrite)}
 	}
-	return fmt.Sprintf("%s (op=%s): %v", ErrAuditPostWrite.Error(), e.operationID, e.cause)
+	return domi18n.ErrorNode{
+		Sentinel:            ErrAuditPostWrite,
+		Message:             domi18n.NewMessage(domi18n.KeyPortsAuditPostWriteOp, domi18n.BoundStr("op", e.operationID.String())),
+		Cause:               e.cause,
+		SuppressedSentinels: []error{ErrAuditPostWrite},
+	}
 }
+func (e *AuditPostWriteError) Error() string { return domi18n.CanonicalError(e) }
 func (e *AuditPostWriteError) Unwrap() error {
 	if !e.IsValid() {
 		return nil
@@ -242,7 +251,7 @@ func NewCrashReconcileReport(spec CrashReconcileReportSpec) (CrashReconcileRepor
 	if spec.ScannedLocks < 0 || spec.LiveLocksSkipped < 0 || spec.DeadLocksClaimed < 0 ||
 		spec.LiveLocksSkipped+spec.DeadLocksClaimed > spec.ScannedLocks ||
 		slices.ContainsFunc(spec.AbortedOperations, security.OperationID.IsZero) {
-		return CrashReconcileReport{}, fmt.Errorf("%w: 崩溃对账锁统计计数或 aborted_operations 非法", ErrInvalidArgument)
+		return CrashReconcileReport{}, fieldErr(ErrInvalidArgument, "crash_reconcile_report")
 	}
 	ops := cloneSliceNilIfEmpty(spec.AbortedOperations)
 	slices.SortFunc(ops, security.OperationID.Compare)

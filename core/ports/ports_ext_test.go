@@ -382,6 +382,21 @@ func TestAuditPostWriteErrorContract(t *testing.T) {
 	if got, ok := errors.AsType[*ports.AuditPostWriteError](pwErr); !ok || !got.OperationID().Equal(opID) {
 		t.Fatalf("errors.AsType[*ports.AuditPostWriteError] 失败")
 	}
+	var _ domi18n.LocalizableNode = pwErr
+	if id, ok := domi18n.ErrorID(pwErr); !ok || id != domi18n.KeyPortsAuditPostWriteOp {
+		t.Fatalf("AuditPostWriteError ErrorID = (%q, %v), want %q", id, ok, domi18n.KeyPortsAuditPostWriteOp)
+	}
+	if want := "ports: audit post-write failed (op=" + opID.String() + "): ENOSPC"; pwErr.Error() != want {
+		t.Fatalf("AuditPostWriteError.Error() = %q, want %q", pwErr.Error(), want)
+	}
+	// 默认 cause==nil 时内部持 ErrAuditPostWrite，SuppressedSentinels 精准折叠重复尾段。
+	defaultPW, err := ports.NewAuditPostWriteError(opID, nil)
+	if err != nil || !errors.Is(defaultPW, ports.ErrAuditPostWrite) {
+		t.Fatalf("NewAuditPostWriteError(nil) 异常: (%v, %v)", defaultPW, err)
+	}
+	if want := "ports: audit post-write failed (op=" + opID.String() + ")"; defaultPW.Error() != want {
+		t.Fatalf("默认 cause AuditPostWriteError.Error() = %q, want %q", defaultPW.Error(), want)
+	}
 }
 
 func TestAuditPostWriteErrorInvalidGuards(t *testing.T) {

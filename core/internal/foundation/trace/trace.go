@@ -8,9 +8,9 @@ package trace
 
 import (
 	"context"
-	"errors"
 	"io"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -20,13 +20,13 @@ const (
 )
 
 // ErrInvalidLeaseScope 表示 LeaseScope 的域或租约标识无效。
-var ErrInvalidLeaseScope = errors.New("trace: LeaseScope 无效")
+var ErrInvalidLeaseScope = domi18n.Sentinel(domi18n.KeyTraceInvalidLeaseScope)
 
 // ErrNilContext 表示传入的 context.Context 为 nil（拒绝隐式回退到 Background）。
-var ErrNilContext = errors.New("trace: context 不能为 nil")
+var ErrNilContext = domi18n.Sentinel(domi18n.KeyTraceNilContext)
 
 // ErrReentrantLease 表示当前上下文已处于全局活跃连接租约作用域内，禁止任何同池或跨池嵌套重入申请租约。
-var ErrReentrantLease = errors.New("trace: 当前上下文已处于活跃连接租约作用域，禁止重入申请租约")
+var ErrReentrantLease = domi18n.Sentinel(domi18n.KeyTraceReentrantLease)
 
 type traceCtxKey struct{}
 

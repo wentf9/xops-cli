@@ -1,7 +1,7 @@
 package osfs
 
 import (
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"strings"
 	"unicode"
@@ -30,7 +30,7 @@ func ValidateControlSocketPath(raw string) (ControlSocketPath, error) {
 func nativeControlBase(kind pathalg.LocalPathKind, raw string) (string, error) {
 	native, err := localPathToNativeOS(kind, raw)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", ErrInvalidControlPath, err)
+		return "", wrapS(ErrInvalidControlPath, err)
 	}
 	return stripWin32LongPathPrefix(native), nil
 }
@@ -39,7 +39,7 @@ func nativeControlBase(kind pathalg.LocalPathKind, raw string) (string, error) {
 // 兼容 Unix 下 OpenSSH %r@%h:%p 含 ':' 文件名，并在 Windows 上剥离 \\?\ 前缀后执行 sun_path 校验。
 func ControlSocketPathFromSource(src pathalg.LocalSourcePath) (ControlSocketPath, error) {
 	if !src.IsValid() {
-		return ControlSocketPath{}, fmt.Errorf("%w: 控制套接字源路径无效", ErrInvalidControlPath)
+		return ControlSocketPath{}, errField(ErrInvalidControlPath, "socket_source")
 	}
 	native, err := nativeControlBase(src.Kind(), src.String())
 	if err != nil {
@@ -51,7 +51,7 @@ func ControlSocketPathFromSource(src pathalg.LocalSourcePath) (ControlSocketPath
 // BuildManagedMuxSocketPath 基于经校验的沙箱目录与 OpenSSH %C 40 位小写十六进制摘要构造自管套接字路径。
 func BuildManagedMuxSocketPath(dir pathalg.LocalDir, percentC string) (ControlSocketPath, error) {
 	if !dir.IsValid() || !isLowerHex40(percentC) {
-		return ControlSocketPath{}, fmt.Errorf("%w: 控制套接字目录或 %%C 摘要 %q 无效", ErrInvalidControlPath, percentC)
+		return ControlSocketPath{}, domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "percent_c"), domi18n.BoundStr("value", percentC))
 	}
 	nativeDir, err := nativeControlBase(dir.Kind(), dir.String())
 	if err != nil {
@@ -86,7 +86,7 @@ func hasInvalidSocketTail(p string) bool {
 // ValidateUnixControlSocketPath 按 Unix 规则校验套接字路径：允许文件名含 ':'，拒绝 '..'、尾随分隔符/'.' 与超长 sun_path。
 func ValidateUnixControlSocketPath(raw string, maxBytes int) (ControlSocketPath, error) {
 	if maxBytes <= 0 || hasInvalidSocketTail(raw) || hasForbiddenControlPathRune(raw) {
-		return ControlSocketPath{}, fmt.Errorf("%w: Unix 套接字路径 %q 非法", ErrInvalidControlPath, raw)
+		return ControlSocketPath{}, domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "unix_socket_path"), domi18n.BoundStr("value", raw))
 	}
 	prefix := pickIf(strings.HasPrefix(raw, "/"), "/", "")
 	segs, err := splitCheckedSegments(strings.TrimPrefix(raw, "/"), false)
@@ -99,18 +99,18 @@ func ValidateUnixControlSocketPath(raw string, maxBytes int) (ControlSocketPath,
 // ValidateWindowsControlSocketPath 按 Windows/NTFS 规则严格校验套接字路径：除盘符前缀外严禁 ':'、前导分隔符与尾随分隔符/'.'。
 func ValidateWindowsControlSocketPath(raw string, maxBytes int) (ControlSocketPath, error) {
 	if maxBytes <= 0 || raw == "" || hasForbiddenControlPathRune(raw) || strings.HasPrefix(raw, `\`) || strings.HasPrefix(raw, "/") {
-		return ControlSocketPath{}, fmt.Errorf("%w: Windows 套接字路径 %q 非法", ErrInvalidControlPath, raw)
+		return ControlSocketPath{}, domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "windows_socket_path"), domi18n.BoundStr("value", raw))
 	}
 	prefix, rest, err := splitWindowsSocketPrefix(raw)
 	if err != nil {
 		return ControlSocketPath{}, err
 	}
 	if strings.ContainsRune(rest, ':') {
-		return ControlSocketPath{}, fmt.Errorf("%w: Windows/NTFS 套接字路径 %q 禁止文件名包含 ':'", ErrInvalidControlPath, raw)
+		return ControlSocketPath{}, domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "windows_socket_path"), domi18n.BoundStr("value", raw))
 	}
 	slashRest := strings.ReplaceAll(rest, `\`, "/")
 	if hasInvalidSocketTail(slashRest) {
-		return ControlSocketPath{}, fmt.Errorf("%w: Windows 套接字路径 %q 缺少合法文件名", ErrInvalidControlPath, raw)
+		return ControlSocketPath{}, domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "windows_socket_path"), domi18n.BoundStr("value", raw))
 	}
 	segs, err := splitCheckedSegments(slashRest, true)
 	if err != nil {
@@ -121,7 +121,7 @@ func ValidateWindowsControlSocketPath(raw string, maxBytes int) (ControlSocketPa
 func splitWindowsSocketPrefix(raw string) (string, string, error) {
 	if len(raw) >= 2 && isASCIIAlphaByte(raw[0]) && raw[1] == ':' {
 		if len(raw) < 3 || !isWin32Sep(raw[2]) {
-			return "", "", fmt.Errorf("%w: Windows 路径 %q 禁止盘符相对写法", ErrInvalidControlPath, raw)
+			return "", "", domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "windows_socket_path"), domi18n.BoundStr("value", raw))
 		}
 		return strings.ToUpper(raw[:1]) + `:\`, raw[3:], nil
 	}
@@ -135,22 +135,22 @@ func splitCheckedSegments(slashRest string, strictWin bool) ([]string, error) {
 		}
 		if strictWin {
 			if err := pathalg.ValidateLocalComponent(seg); err != nil {
-				return nil, fmt.Errorf("%w: Windows 套接字分量 %q 非法: %w", ErrInvalidControlPath, seg, err)
+				return nil, domi18n.WrapS(ErrInvalidControlPath, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "socket_segment"), domi18n.BoundStr("value", seg))
 			}
 		} else if seg == ".." || len(seg) > pathalg.MaxComponentBytes {
-			return nil, fmt.Errorf("%w: Unix 套接字分量 %q 非法或超长", ErrInvalidControlPath, seg)
+			return nil, domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "socket_segment"), domi18n.BoundStr("value", seg))
 		}
 		segs = append(segs, seg)
 	}
 	if len(segs) == 0 {
-		return nil, fmt.Errorf("%w: 套接字路径缺少文件名", ErrInvalidControlPath)
+		return nil, domi18n.EF(ErrInvalidControlPath, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "socket_name"))
 	}
 	return segs, nil
 }
 func buildControlSocketPath(prefix, sep string, segs []string, maxBytes int) (ControlSocketPath, error) {
 	native := prefix + strings.Join(segs, sep)
 	if len(native) > maxBytes {
-		return ControlSocketPath{}, fmt.Errorf("%w: 套接字路径长度 %d 超过上限 %d", ErrControlPathTooLong, len(native), maxBytes)
+		return ControlSocketPath{}, domi18n.EF(ErrControlPathTooLong, domi18n.KeyCommonSizeLimit, domi18n.Str("kind", "socket_path"), domi18n.Int("size", len(native)), domi18n.Int("limit", maxBytes))
 	}
 	dir := pickIf(prefix != "", prefix, ".")
 	if len(segs) > 1 {

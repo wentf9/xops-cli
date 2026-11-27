@@ -5,7 +5,7 @@ package osfs
 import (
 	"context"
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"golang.org/x/sys/unix"
 	"io/fs"
 	"net"
@@ -40,7 +40,7 @@ func verifySocketTargetBeforeDialOS(nativePath string) error {
 	case status == SocketProbeMissing:
 		return mapOSError(os.ErrNotExist)
 	case status == SocketProbeNotSocket:
-		return fmt.Errorf("%w: %q 不是 Unix 套接字", ErrNotSocket, nativePath)
+		return domi18n.EF(ErrNotSocket, domi18n.KeyOSFSNotUnixSocket, domi18n.BoundStr("path", nativePath))
 	}
 	return nil
 }
@@ -75,7 +75,7 @@ func listenSocketLockedOS(ctx context.Context, path ControlSocketPath) (*net.Uni
 			return nil, nil, err
 		}
 		if lErr := os.Link(tmpPath, target); lErr != nil {
-			return nil, nil, cleanupSocketBind(uln, tmpPath, pickIf(errors.Is(lErr, os.ErrExist), fmt.Errorf("%w: %q", ErrSlotOccupied, target), mapOSError(lErr)))
+			return nil, nil, cleanupSocketBind(uln, tmpPath, pickIf(errors.Is(lErr, os.ErrExist), domi18n.EF(ErrSlotOccupied, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "link_socket"), domi18n.BoundStr("target", target)), mapOSError(lErr)))
 		}
 		_ = os.Remove(tmpPath)
 		return uln, origID, nil
@@ -104,10 +104,10 @@ func verifyPeerCurrentUserFD(fd uintptr) (PeerCred, error) {
 		return PeerCred{}, err
 	}
 	if !cred.IsValid() || !cred.hasUID {
-		return PeerCred{}, fmt.Errorf("%w: 对端凭据缺少有效 UID", ErrUnauthorizedPeer)
+		return PeerCred{}, domi18n.EF(ErrUnauthorizedPeer, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "peer_uid"))
 	}
 	if wantUID := uint32(os.Geteuid()); cred.uid != wantUID {
-		return PeerCred{}, fmt.Errorf("%w: 对端 UID %d 与当前 EUID %d 不匹配", ErrUnauthorizedPeer, cred.uid, wantUID)
+		return PeerCred{}, domi18n.EF(ErrUnauthorizedPeer, domi18n.KeyOSFSPeerUIDMismatch, domi18n.Uint64("actual", uint64(cred.uid)), domi18n.Uint64("expected", uint64(wantUID)))
 	}
 	return cred, nil
 }

@@ -2,12 +2,12 @@ package events
 
 import (
 	"bytes"
-	"fmt"
 	"maps"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/plan"
 	"github.com/wentf9/xops-cli/core/domain/playbook"
@@ -173,7 +173,7 @@ func EqualEvent(a, b Event) bool {
 
 func requireOpMeta(meta EventMeta) error {
 	if !meta.IsValid() || meta.OperationID().IsNone() {
-		return fmt.Errorf("%w: 当前事件类别必须绑定有效的 EventMeta 与 OperationID", ErrInvalidEventMeta)
+		return domi18n.EF(ErrInvalidEventMeta, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "operation_id"))
 	}
 	return nil
 }
@@ -203,7 +203,7 @@ func completedOutcomeConsistent(succeeded bool, opt algebraic.Option[execution.E
 
 func validateCompletedOutcomeConsistency(succeeded bool, opt algebraic.Option[execution.ExecutionOutcome]) error {
 	if !completedOutcomeConsistent(succeeded, opt) {
-		return fmt.Errorf("%w: operation_completed 的 succeeded=%v 与 outcome 不一致或 outcome 无效", ErrInvalidEvent, succeeded)
+		return domi18n.EF(ErrInvalidEvent, domi18n.KeyEventsOutcomeConflict)
 	}
 	return nil
 }
@@ -233,7 +233,7 @@ func stepOutcomeConsistent(status playbook.StepStatus, opt algebraic.Option[exec
 
 func validateStepOutcomeConsistency(status playbook.StepStatus, opt algebraic.Option[execution.ExecutionOutcome]) error {
 	if !stepOutcomeConsistent(status, opt) {
-		return fmt.Errorf("%w: step 状态 %s 与 outcome 不一致或 outcome 无效", ErrInvalidEvent, status)
+		return domi18n.EF(ErrInvalidEvent, domi18n.KeyEventsOutcomeConflict)
 	}
 	return nil
 }
@@ -270,19 +270,26 @@ func auditCrossFieldsValid(stage AuditStage, capKind security.CapabilityKind, de
 	return true
 }
 
+func decisionKindText(dec security.GuardrailDecision) string {
+	if dec == nil {
+		return "invalid"
+	}
+	return dec.Kind().String()
+}
+
 func validateAuditOptionals(stage AuditStage, capKind security.CapabilityKind, dec security.GuardrailDecision, binding algebraic.Option[security.OperationBinding], outcome algebraic.Option[execution.ExecutionOutcome]) error {
 	if !auditStageDecisionOK(stage, dec) {
-		return fmt.Errorf("%w: 审计阶段 %s 与安全决策 %s 矛盾", ErrInvalidEvent, stage, dec.Kind())
+		return domi18n.EF(ErrInvalidEvent, domi18n.KeyEventsAuditConflict, domi18n.Str("stage", stage.String()), domi18n.Str("decision", decisionKindText(dec)))
 	}
 	b, hasB := binding.Get()
 	if hasB && (!b.IsValid() || b.Capability() != capKind) {
-		return fmt.Errorf("%w: audit binding 无效或与 capability=%s 不一致", ErrInvalidEvent, capKind)
+		return fieldErr(ErrInvalidEvent, "binding")
 	}
 	if !hasB && (stage == AuditStageAuthorized || stage == AuditStageFinalized || stage == AuditStageAbortedByCrash) {
-		return fmt.Errorf("%w: 审计阶段 %s 必须携带有效 OperationBinding", ErrInvalidEvent, stage)
+		return domi18n.EF(ErrInvalidEvent, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "binding"))
 	}
 	if optOutcomeInvalid(outcome) {
-		return fmt.Errorf("%w: audit outcome 存在时必须有效", ErrInvalidEvent)
+		return fieldErr(ErrInvalidEvent, "outcome")
 	}
 	return nil
 }

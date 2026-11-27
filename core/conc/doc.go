@@ -14,19 +14,19 @@ package conc
 import "errors"
 
 // ErrNurseryNotInitialized 表示在未通过 NewNursery 初始化的 Nursery 实例（含 nil）上执行操作。
-var ErrNurseryNotInitialized = errors.New("conc: Nursery 未初始化")
+var ErrNurseryNotInitialized = errors.New("conc: nursery is not initialized")
 
 // ErrNurseryClosed 表示 Nursery 已关闭或已进入 Wait 阶段，拒绝再派生新子协程。
-var ErrNurseryClosed = errors.New("conc: Nursery 已关闭或已进入 Wait，拒绝新增任务")
+var ErrNurseryClosed = errors.New("conc: nursery is closed or waiting and rejects new tasks")
 
 // ErrNilTask 表示传入的任务闭包或回调函数为 nil。
-var ErrNilTask = errors.New("conc: 任务回调不能为 nil")
+var ErrNilTask = errors.New("conc: task callback must not be nil")
 
 // ErrTaskPanicked 表示受 Nursery 监督的协程或作用域闭包在执行过程中发生 panic。
-var ErrTaskPanicked = errors.New("conc: 受监督协程发生 panic")
+var ErrTaskPanicked = errors.New("conc: supervised goroutine panicked")
 
 // ErrMutexNotInitialized 表示在未通过 NewCtxMutex 初始化的 CtxMutex 实例（含 nil）上执行操作。
-var ErrMutexNotInitialized = errors.New("conc: CtxMutex 未初始化")
+var ErrMutexNotInitialized = errors.New("conc: CtxMutex is not initialized")
 
 // ErrNilContext 表示传入的 context.Context 为 nil（所有阻塞或作用域原语均采用失败关闭策略）。
-var ErrNilContext = errors.New("conc: context 不能为 nil")
+var ErrNilContext = errors.New("conc: context must not be nil")

@@ -4,7 +4,6 @@ package osfs
 
 import (
 	"context"
-	"fmt"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"io/fs"
@@ -15,7 +14,7 @@ import (
 type socketFileID struct{}
 
 func errUnsupportedPeer() (PeerCred, error) {
-	return PeerCred{}, fmt.Errorf("%w: %w", ErrUnauthorizedPeer, ErrUnsupportedPeerCred)
+	return PeerCred{}, wrapS(ErrUnauthorizedPeer, ErrUnsupportedPeerCred)
 }
 func sameSocketFileID(_, _ socketFileID) bool { return false }
 func localPathToNativeOS(pathalg.LocalPathKind, string) (string, error) {

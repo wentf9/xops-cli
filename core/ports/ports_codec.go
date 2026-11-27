@@ -3,17 +3,18 @@ package ports
 import (
 	"encoding/base64"
 	"encoding/json/jsontext"
-	"fmt"
+	"io/fs"
+	"strings"
+	"time"
+
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
-	"io/fs"
-	"strings"
-	"time"
 )
 
 // 本文件集中维护 core/ports 全部失败关闭枚举的名称表/TextCodec 与不透明值对象的严格 json/v2 编解码器。
@@ -52,7 +53,7 @@ func epErr[T portEnum](raw string, err error) (T, error) {
 			return v, nil
 		}
 	}
-	return 0, fmt.Errorf("%w: %q", err, raw)
+	return 0, domi18n.EF(err, domi18n.KeyCommonValueInvalid, domi18n.BoundStr("value", raw))
 }
 func eaErr[T portEnum](b []byte, v T, err error) ([]byte, error) {
 	return appendValidText(b, v.IsValid(), v.String(), err)
@@ -64,8 +65,10 @@ func ep[T portEnum](s string) (T, error)           { return epErr[T](s, ErrInval
 func epA[T portEnum](s string) (T, error)          { return epErr[T](s, ErrInvalidAuditEntry) }
 func ea[T portEnum](b []byte, v T) ([]byte, error) { return eaErr(b, v, ErrInvalidArgument) }
 func eu[T portEnum](dst *T, t []byte) error        { return euErr(dst, t, ErrInvalidArgument) }
-func missingField(e error, f string) error         { return fmt.Errorf("%w: 缺少必需的 %s 字段", e, f) }
-func un[T any](o algebraic.Option[T]) T            { return o.OrElse(zeroVal[T]()) }
+func missingField(e error, f string) error {
+	return domi18n.EF(e, domi18n.KeyCommonJSONMissingField, domi18n.Str("field", f))
+}
+func un[T any](o algebraic.Option[T]) T { return o.OrElse(zeroVal[T]()) }
 func optModTime(t time.Time) algebraic.Option[time.Time] {
 	return pickIf(t.IsZero(), algebraic.None[time.Time](), algebraic.Some(t.UTC()))
 }
@@ -80,7 +83,7 @@ func decE[T, W any](d *T, c jDec, err error, fn func(W) (T, error)) error {
 func decodeB64Strict(s string) ([]byte, error) {
 	b, err := base64.StdEncoding.Strict().DecodeString(s)
 	if err != nil {
-		return nil, fmt.Errorf("%w: Base64 解码失败: %w", ErrInvalidArgument, err)
+		return nil, domi18n.WrapS(ErrInvalidArgument, err, domi18n.KeyCommonBase64DecodeFailed)
 	}
 	return b, nil
 }
@@ -288,10 +291,10 @@ func decodeDurWire(w durWire) (DurabilityOutcome, error) {
 		if rev, okR := w.Revision.Get(); okR && w.Detail == "" {
 			return NewDurabilityCommitted(rev)
 		}
-		return DurabilityOutcome{}, fmt.Errorf("%w: committed 须携带有效 revision 且无 detail", ErrInvalidDurability)
+		return DurabilityOutcome{}, domi18n.EF(ErrInvalidDurability, domi18n.KeyPortsDurabilitySpec, domi18n.Str("status", w.Status.String()))
 	case fsm.DurabilityNotApplied, fsm.DurabilityOutcomeUnknown:
 		if w.Revision.IsSome() {
-			return DurabilityOutcome{}, fmt.Errorf("%w: %s 不得携带 revision", ErrInvalidDurability, w.Status)
+			return DurabilityOutcome{}, domi18n.EF(ErrInvalidDurability, domi18n.KeyPortsDurabilitySpec, domi18n.Str("status", w.Status.String()))
 		}
 		return pickIf(w.Status == fsm.DurabilityNotApplied, NewDurabilityNotApplied, NewDurabilityOutcomeUnknown)(w.Detail)
 	case fsm.DurabilityAppliedNotDurable:
@@ -308,11 +311,11 @@ func decFwd(w fwdWire) (ForwardSpec, error) {
 	}
 	tun, ok := w.TUN.Get()
 	if !ok || w.BindKind != ForwardEndpointInvalid || w.TargetKind != ForwardEndpointInvalid {
-		return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN 缺少 tun 字段或携带非法端点类型", ErrInvalidArgument)
+		return ForwardSpec{}, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonJSONVariantInvalid, domi18n.Str("variant", "tun"))
 	}
 	spec, err := NewForwardTUNSpec(tun)
 	if err == nil && ((w.BindAddr != "" && w.BindAddr != spec.BindAddr()) || (w.TargetAddr != "" && w.TargetAddr != spec.TargetAddr())) {
-		return ForwardSpec{}, fmt.Errorf("%w: ForwardTUN bind_addr/target_addr 与 tun 规格冲突", ErrInvalidArgument)
+		return ForwardSpec{}, domi18n.EF(ErrInvalidArgument, domi18n.KeyPortsTUNSpecConflict)
 	}
 	return spec, err
 }
@@ -449,7 +452,7 @@ func (r CrashReconcileReport) MarshalJSONTo(e jEnc) error {
 	return enc(e, r.IsValid(), crashRepWire{sOpt(r.s.ScannedLocks), sOpt(r.s.LiveLocksSkipped), sOpt(r.s.DeadLocksClaimed), r.s.AbortedOperations})
 }
 func (r *CrashReconcileReport) UnmarshalJSONFrom(c jDec) error {
-	return decReq(r, c, ErrInvalidArgument, "崩溃对账计数", func(w crashRepWire) bool {
+	return decReq(r, c, ErrInvalidArgument, "scanned_locks/live_locks_skipped/dead_locks_claimed", func(w crashRepWire) bool {
 		return w.ScannedLocks.IsSome() && w.LiveLocksSkipped.IsSome() && w.DeadLocksClaimed.IsSome()
 	}, func(w crashRepWire) (CrashReconcileReport, error) {
 		return NewCrashReconcileReport(CrashReconcileReportSpec{un(w.ScannedLocks), un(w.LiveLocksSkipped), un(w.DeadLocksClaimed), w.AbortedOperations})

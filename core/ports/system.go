@@ -3,17 +3,18 @@ package ports
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/execution"
-	"github.com/wentf9/xops-cli/core/domain/option"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
-	"github.com/wentf9/xops-cli/core/domain/security"
 	"io"
 	"maps"
 	"net"
 	"slices"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/core/domain/option"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
+	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
 const (
@@ -131,7 +132,7 @@ func NewProcessSpec(in ProcessSpecInput) (ProcessSpec, error) {
 }
 func validateProcessArgs(raw []string) ([]string, error) {
 	if len(raw) > maxProcessArgs || slices.ContainsFunc(raw, func(a string) bool { return len(a) > maxPortEnvValBytes || hasForbiddenControl(a) }) {
-		return nil, fmt.Errorf("%w: 子进程参数数量超限或包含非法字符", ErrInvalidArgument)
+		return nil, fieldErr(ErrInvalidArgument, "args")
 	}
 	return cloneSliceNilIfEmpty(raw), nil
 }
@@ -140,18 +141,18 @@ func validateProcessOpts(wd algebraic.Option[pathalg.LocalDir], to algebraic.Opt
 	t, hasT := to.Get()
 	maxOut := mo.OrElse(defaultProcessMaxOutputBytes)
 	if (hasD && !d.IsValid()) || (hasT && !t.IsPositive()) || maxOut == 0 || maxOut > maxProcessOutputBytes {
-		return 0, fmt.Errorf("%w: work_dir、timeout 或 max_output_bytes 非法", ErrInvalidArgument)
+		return 0, fieldErr(ErrInvalidArgument, "process_spec")
 	}
 	return maxOut, nil
 }
 func canonicalizeProcessEnv(raw map[string]string) ([]processEnvEntry, error) {
 	if len(raw) > maxPortEnvCount {
-		return nil, fmt.Errorf("%w: 环境变量数量超限", ErrInvalidArgument)
+		return nil, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonCountLimit, domi18n.Str("kind", "env"), domi18n.Int("count", len(raw)), domi18n.Int("limit", maxPortEnvCount))
 	}
 	var out []processEnvEntry
 	for _, k := range slices.Sorted(maps.Keys(raw)) {
 		if v := raw[k]; !isValidASCIIToken(k, maxPortTokenLen) || slices.Contains([]byte(k), '=') || len(v) > maxPortEnvValBytes || hasForbiddenControl(v) {
-			return nil, fmt.Errorf("%w: 环境变量 %q 非法", ErrInvalidArgument, k)
+			return nil, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "env"), domi18n.BoundStr("value", k))
 		}
 		out = append(out, processEnvEntry{k, raw[k]})
 	}
@@ -197,7 +198,7 @@ type ProcessResult struct {
 // NewProcessResult 校验 ExitStatus 非空有效并构造不可变 ProcessResult。
 func NewProcessResult(spec ProcessResultSpec) (ProcessResult, error) {
 	if spec.ExitStatus == nil || !spec.ExitStatus.IsValid() {
-		return ProcessResult{}, fmt.Errorf("%w: ProcessResult 需要有效 ExitStatus", ErrInvalidArgument)
+		return ProcessResult{}, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "exit_status"))
 	}
 	spec.Stdout, spec.Stderr = cloneSliceNilIfEmpty(spec.Stdout), cloneSliceNilIfEmpty(spec.Stderr)
 	return ProcessResult{s: spec, valid: true}, nil
@@ -233,7 +234,7 @@ type TerminalSize struct {
 // NewTerminalSize 校验列数与行数均为正整数并构造不可变 TerminalSize。
 func NewTerminalSize(cols, rows uint16) (TerminalSize, error) {
 	if cols == 0 || rows == 0 {
-		return TerminalSize{}, fmt.Errorf("%w: cols=%d rows=%d 必须大于 0", ErrInvalidTTYSize, cols, rows)
+		return TerminalSize{}, domi18n.EF(ErrInvalidTTYSize, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "cols/rows"))
 	}
 	return TerminalSize{cols: cols, rows: rows, valid: true}, nil
 }

@@ -3,16 +3,17 @@ package ports
 import (
 	"cmp"
 	"context"
-	"fmt"
+	"io"
+	"slices"
+	"strings"
+
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/security"
-	"io"
-	"slices"
-	"strings"
 )
 
 // Revision 表示资产存储快照的不透明 CAS 版本令牌；零值恒无效并失败关闭。
@@ -24,7 +25,7 @@ type Revision struct{ value string }
 // ParseRevision 校验并构造不可变 CAS 版本令牌（1..128 位可打印非空白 ASCII）。
 func ParseRevision(raw string) (Revision, error) {
 	if !isValidASCIIToken(raw, maxPortTokenLen) {
-		return Revision{}, fmt.Errorf("%w: %q", ErrInvalidRevision, raw)
+		return Revision{}, domi18n.EF(ErrInvalidRevision, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "revision"), domi18n.BoundStr("value", raw))
 	}
 	return Revision{value: raw}, nil
 }
@@ -54,10 +55,10 @@ type InventorySnapshot struct {
 // NewInventorySnapshot 校验版本令牌与资产图均有效后构造不可变 InventorySnapshot。
 func NewInventorySnapshot(revision Revision, graph inventory.Graph) (InventorySnapshot, error) {
 	if !revision.IsValid() {
-		return InventorySnapshot{}, fmt.Errorf("%w: 快照必须携带有效 Revision", ErrInvalidRevision)
+		return InventorySnapshot{}, domi18n.EF(ErrInvalidRevision, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "revision"))
 	}
 	if !graph.IsValid() {
-		return InventorySnapshot{}, fmt.Errorf("%w: %w", ErrInvalidArgument, inventory.ErrInvalidGraph)
+		return InventorySnapshot{}, domi18n.WrapSentinel(ErrInvalidArgument, inventory.ErrInvalidGraph)
 	}
 	return InventorySnapshot{revision: revision, graph: graph, valid: true}, nil
 }
@@ -83,7 +84,7 @@ type DurabilityOutcome struct {
 // NewDurabilityCommitted 构造已生效且已落盘（Applied && Durable）的提交结果。
 func NewDurabilityCommitted(revision Revision) (DurabilityOutcome, error) {
 	if !revision.IsValid() {
-		return DurabilityOutcome{}, fmt.Errorf("%w: committed 必须携带有效 Revision", ErrInvalidDurability)
+		return DurabilityOutcome{}, domi18n.EF(ErrInvalidDurability, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "revision"))
 	}
 	return DurabilityOutcome{status: fsm.DurabilityCommitted, revision: algebraic.Some(revision), valid: true}, nil
 }
@@ -96,7 +97,7 @@ func NewDurabilityNotApplied(detail string) (DurabilityOutcome, error) {
 // NewDurabilityAppliedNotDurable 构造已生效但未确认落盘（Applied && !Durable）的停机结果。
 func NewDurabilityAppliedNotDurable(revision algebraic.Option[Revision], detail string) (DurabilityOutcome, error) {
 	if rev, ok := revision.Get(); ok && !rev.IsValid() {
-		return DurabilityOutcome{}, fmt.Errorf("%w: 可选 Revision 无效", ErrInvalidDurability)
+		return DurabilityOutcome{}, fieldErr(ErrInvalidDurability, "revision")
 	}
 	return newDurDetail(fsm.DurabilityAppliedNotDurable, revision, detail, false)
 }
@@ -154,7 +155,7 @@ type JournalGenerationSnapshot struct {
 // NewJournalGenerationSnapshot 校验世代号与非空同代记录列表并构造健康世代快照。
 func NewJournalGenerationSnapshot(generation uint64, records []fsm.TransferJournalRecord) (JournalGenerationSnapshot, error) {
 	if generation == 0 || len(records) == 0 || slices.ContainsFunc(records, func(r fsm.TransferJournalRecord) bool { return !r.IsValid() || r.Generation() != generation }) {
-		return JournalGenerationSnapshot{}, fmt.Errorf("%w: JournalGenerationSnapshot 需要正世代号及有效同代非空记录", ErrInvalidArgument)
+		return JournalGenerationSnapshot{}, fieldErr(ErrInvalidArgument, "journal_generation_snapshot")
 	}
 	return JournalGenerationSnapshot{generation: generation, records: slices.Clone(records), valid: true}, nil
 }
@@ -162,7 +163,7 @@ func NewJournalGenerationSnapshot(generation uint64, records []fsm.TransferJourn
 // NewCorruptJournalGenerationSnapshot 构造显式标记损坏的世代快照，并可选保留损坏点前已校验的同代前缀记录。
 func NewCorruptJournalGenerationSnapshot(generation uint64, cause error, partialPrefix ...fsm.TransferJournalRecord) (JournalGenerationSnapshot, error) {
 	if generation == 0 || cause == nil || slices.ContainsFunc(partialPrefix, func(r fsm.TransferJournalRecord) bool { return !r.IsValid() || r.Generation() != generation }) {
-		return JournalGenerationSnapshot{}, fmt.Errorf("%w: 损坏世代快照须提供正世代号、非空根因与有效同代前缀记录", ErrInvalidArgument)
+		return JournalGenerationSnapshot{}, fieldErr(ErrInvalidArgument, "corrupt_journal_generation_snapshot")
 	}
 	return JournalGenerationSnapshot{generation: generation, records: cloneSliceNilIfEmpty(partialPrefix), corrupt: true, err: cause, valid: true}, nil
 }
@@ -231,11 +232,11 @@ func NewOpenSSHVirtualHost(spec OpenSSHVirtualHostSpec) (OpenSSHVirtualHost, err
 	ep, hasEP := spec.Endpoint.Get()
 	u, hasU := spec.User.Get()
 	if !isValidASCIIToken(alias, maxPortTokenLen) || strings.EqualFold(alias, "none") || (hasEP && !ep.IsValid()) || (hasU && !u.IsValid()) {
-		return OpenSSHVirtualHost{}, fmt.Errorf("%w: OpenSSH 别名、endpoint 或 user 非法", ErrInvalidArgument)
+		return OpenSSHVirtualHost{}, fieldErr(ErrInvalidArgument, "openssh_virtual_host")
 	}
 	src, e1 := sanitizeBoundedText(spec.SourceFile, maxPortDetailBytes, true, ErrInvalidArgument)
 	if err := firstErr(e1, option.ValidateProxyRoute(spec.Proxy), spec.Layer.Validate()); err != nil {
-		return OpenSSHVirtualHost{}, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		return OpenSSHVirtualHost{}, domi18n.WrapSentinel(ErrInvalidArgument, err)
 	}
 	proxy := pickIf[option.ProxyRoute](spec.Proxy != nil, spec.Proxy, option.NewProxyUnset())
 	spec.Alias, spec.SourceFile = alias, src

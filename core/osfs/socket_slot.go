@@ -3,7 +3,7 @@ package osfs
 import (
 	"context"
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
 	"net"
 	"os"
@@ -67,16 +67,16 @@ func VerifyUnixPeerCurrentUser(c *net.UnixConn) (PeerCred, error) {
 //xops:syncclosure
 func runPeerCredControl(conn *net.UnixConn, op func(fd uintptr) (PeerCred, error)) (PeerCred, error) {
 	if conn == nil {
-		return PeerCred{}, fmt.Errorf("%w: UnixConn 不能为 nil", ports.ErrInvalidArgument)
+		return PeerCred{}, errFieldNil(ports.ErrInvalidArgument, "unix_conn")
 	}
 	rawConn, err := conn.SyscallConn()
 	if err != nil {
-		return PeerCred{}, fmt.Errorf("%w: 获取 RawConn 失败: %w", ErrUnauthorizedPeer, err)
+		return PeerCred{}, wrapOp(ErrUnauthorizedPeer, err, "SyscallConn")
 	}
 	var cred PeerCred
 	var opErr error
 	if ctrlErr := rawConn.Control(func(fd uintptr) { cred, opErr = op(fd) }); ctrlErr != nil {
-		return PeerCred{}, fmt.Errorf("%w: RawConn.Control 失败: %w", ErrUnauthorizedPeer, ctrlErr)
+		return PeerCred{}, wrapOp(ErrUnauthorizedPeer, ctrlErr, "RawConn.Control")
 	}
 	return cred, opErr
 }
@@ -134,7 +134,7 @@ func validateSocketCtxPath(ctx context.Context, path ControlSocketPath) error {
 	case ctx == nil:
 		return ports.ErrNilContext
 	case !path.IsValid():
-		return fmt.Errorf("%w: 无效控制套接字路径", ErrInvalidControlPath)
+		return errField(ErrInvalidControlPath, "control_socket_path")
 	default:
 		return ctx.Err()
 	}
@@ -260,17 +260,17 @@ func prepareSocketSlotLocked(ctx context.Context, path ControlSocketPath, replac
 		return err
 	}
 	if status == SocketProbeNotSocket {
-		return fmt.Errorf("%w: %q 已存在且非套接字", ErrNotSocket, path.NativePath())
+		return domi18n.EF(ErrNotSocket, domi18n.KeyOSFSNotUnixSocket, domi18n.BoundStr("path", path.NativePath()))
 	}
 	if !replaceStale {
-		return fmt.Errorf("%w: %q 已被占用", ErrSlotOccupied, path.NativePath())
+		return domi18n.EF(ErrSlotOccupied, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "acquire_slot"), domi18n.BoundStr("target", path.NativePath()))
 	}
 	probed, pErr := ProbeStaleUnixSocket(ctx, path)
 	if errors.Is(pErr, context.Canceled) || errors.Is(pErr, context.DeadlineExceeded) {
 		return pErr
 	}
 	if pErr != nil || probed != SocketProbeStale {
-		return fmt.Errorf("%w: 无法确认 %q 为过期套接字 (status=%s): %w", ErrSlotOccupied, path.NativePath(), probed, pErr)
+		return domi18n.WrapS(ErrSlotOccupied, pErr, domi18n.KeyOSFSStaleProbeFailed, domi18n.BoundStr("path", path.NativePath()), domi18n.Str("status", probed.String()))
 	}
 	return unlinkSameSocket(path.NativePath(), origID)
 }
@@ -278,12 +278,12 @@ func listenUnixNoAutoUnlink(ctx context.Context, addr string) (*net.UnixListener
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "unix", addr)
 	if err != nil {
-		return nil, pickIf(isAddrInUseOS(err) || errors.Is(err, os.ErrExist), fmt.Errorf("%w: %w", ErrSlotOccupied, err), mapOSError(err))
+		return nil, pickIf(isAddrInUseOS(err) || errors.Is(err, os.ErrExist), wrapS(ErrSlotOccupied, err), mapOSError(err))
 	}
 	uln, ok := ln.(*net.UnixListener)
 	if !ok {
 		_ = ln.Close()
-		return nil, fmt.Errorf("%w: 监听器不是 *net.UnixListener", ErrNotSocket)
+		return nil, errField(ErrNotSocket, "unix_listener")
 	}
 	uln.SetUnlinkOnClose(false)
 	return uln, nil

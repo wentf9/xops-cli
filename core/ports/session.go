@@ -2,12 +2,13 @@ package ports
 
 import (
 	"context"
-	"fmt"
+	"io"
+
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
-	"io"
 )
 
 // TUNUnitAny 表示由对端动态分配 TUN/TAP 单元号（对应 OpenSSH -w any:any）；maxTUNUnit 为显式单元号上限。
@@ -38,7 +39,7 @@ type TUNSpec struct {
 // NewTUNSpec 校验 TUN 模式与合法单元号（0..4096 或 TUNUnitAny）并构造不可变 TUNSpec。
 func NewTUNSpec(mode TUNMode, localUnit, remoteUnit uint32) (TUNSpec, error) {
 	if !mode.IsValid() || !isValidTUNUnit(localUnit) || !isValidTUNUnit(remoteUnit) {
-		return TUNSpec{}, fmt.Errorf("%w: TUNSpec 模式或单元号非法", ErrInvalidArgument)
+		return TUNSpec{}, fieldErr(ErrInvalidArgument, "tun_spec")
 	}
 	return TUNSpec{mode: mode, localUnit: localUnit, remoteUnit: remoteUnit, valid: true}, nil
 }
@@ -113,7 +114,7 @@ func NewPrivilegeRequest(spec PrivilegeRequestSpec) (PrivilegeRequest, error) {
 	u, hasU := spec.TargetUser.Get()
 	d, hasD := spec.Timeout.Get()
 	if !spec.Method.IsValid() || !spec.Command.IsValid() || (hasU && !u.IsValid()) || (hasD && !d.IsPositive()) {
-		return PrivilegeRequest{}, fmt.Errorf("%w: PrivilegeRequest 字段无效", ErrInvalidArgument)
+		return PrivilegeRequest{}, fieldErr(ErrInvalidArgument, "privilege_request")
 	}
 	return PrivilegeRequest{s: spec, valid: true}, nil
 }
@@ -161,12 +162,12 @@ type ShellProbeResult struct {
 func NewShellProbeResult(spec ShellProbeResultSpec) (ShellProbeResult, error) {
 	if !spec.Dialect.IsValid() || !spec.Interpreter.IsValid() || (spec.ProbeStage != 1 && spec.ProbeStage != 2) ||
 		(spec.OSFamily != "" && !isValidASCIIToken(spec.OSFamily, maxPortTokenLen)) {
-		return ShellProbeResult{}, fmt.Errorf("%w: ShellProbeResult 方言/解释器/阶段或 os_family 非法", ErrInvalidArgument)
+		return ShellProbeResult{}, fieldErr(ErrInvalidArgument, "shell_probe_result")
 	}
 	profile, e1 := execution.NewLaunchProfile(execution.LaunchProfileSpec{Dialect: algebraic.Some(spec.Dialect), Interpreter: spec.Interpreter, Login: execution.LoginModeInherit})
 	banner, e2 := sanitizeBoundedText(spec.RawBanner, maxPortDetailBytes, true, ErrInvalidArgument)
 	if err := firstErr(e1, e2); err != nil {
-		return ShellProbeResult{}, fmt.Errorf("%w: %w", ErrInvalidArgument, err)
+		return ShellProbeResult{}, domi18n.WrapSentinel(ErrInvalidArgument, err)
 	}
 	spec.RawBanner = banner
 	return ShellProbeResult{s: spec, profile: profile, valid: true}, nil

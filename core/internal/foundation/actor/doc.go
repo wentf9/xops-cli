@@ -7,19 +7,19 @@
 //     请求面采用有界通道提供背压并经 acqMu/acqClosed/acqSenders 屏障保证停机排空零丢请求。
 package actor
 
-import "errors"
+import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // ErrActorNotInitialized 表示在未通过 NewDualActor 初始化的 DualActor 实例（含 nil）上执行操作。
-var ErrActorNotInitialized = errors.New("actor: DualActor 未初始化")
+var ErrActorNotInitialized = domi18n.Sentinel(domi18n.KeyActorNotInitialized)
 
 // ErrActorAlreadyStarted 表示同一个 DualActor 实例被重复调用 Run 启动。
-var ErrActorAlreadyStarted = errors.New("actor: DualActor 已启动，禁止重复调用 Run")
+var ErrActorAlreadyStarted = domi18n.Sentinel(domi18n.KeyActorAlreadyStarted)
 
 // ErrActorStopped 表示 DualActor 已停止或正在停机排空，无法继续受理请求。
-var ErrActorStopped = errors.New("actor: DualActor 已停止")
+var ErrActorStopped = domi18n.Sentinel(domi18n.KeyActorStopped)
 
 // ErrInvalidActorConfig 表示 NewDualActor 收到的配置参数非法（如缓冲区大小非正或缺少必需回调）。
-var ErrInvalidActorConfig = errors.New("actor: DualActor 配置无效")
+var ErrInvalidActorConfig = domi18n.Sentinel(domi18n.KeyActorInvalidConfig)
 
 // ErrNilContext 表示传入的 context.Context 为 nil（拒绝隐式回退到 Background）。
-var ErrNilContext = errors.New("actor: context 不能为 nil")
+var ErrNilContext = domi18n.Sentinel(domi18n.KeyActorNilContext)

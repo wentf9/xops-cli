@@ -3,7 +3,7 @@ package osfs
 import (
 	"context"
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"io"
@@ -52,7 +52,7 @@ func (l *lockedFile) Truncate(size int64) error {
 		return err
 	}
 	if size < 0 {
-		return fmt.Errorf("%w: Truncate 大小不能为负", ports.ErrInvalidArgument)
+		return domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "size"))
 	}
 	return mapOSError(l.file.Truncate(size))
 }
@@ -167,13 +167,13 @@ func (h *rootHandle) tryAcquireLockedHandle(dest pathalg.LocalRootedDest, mode p
 			return nil, false, vErr
 		}
 	}
-	return nil, false, fmt.Errorf("%w: 加锁目标 %q 持续发生替换", ErrSameFileMismatch, dest.String())
+	return nil, false, domi18n.EF(ErrSameFileMismatch, domi18n.KeyOSFSLockTargetReplaced, domi18n.BoundStr("path", dest.String()))
 }
 
 // SidecarLockDest 为目标文件构造同目录旁路锁路径 <name>.lock（ADR-007）。
 func SidecarLockDest(dest pathalg.LocalRootedDest) (pathalg.LocalRootedDest, error) {
 	if !dest.IsValid() {
-		return zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: 无效沙箱目标路径", ports.ErrInvalidArgument)
+		return zeroVal[pathalg.LocalRootedDest](), errField(ports.ErrInvalidArgument, "dest")
 	}
 	return siblingDest(dest, dest.Base()+".lock")
 }
@@ -182,7 +182,7 @@ func SidecarLockDest(dest pathalg.LocalRootedDest) (pathalg.LocalRootedDest, err
 // 持独占锁截断清空刷盘 -> 解锁关句柄 -> Remove（忽略 ErrNotFound），消除 Windows 共享冲突。
 func RemoveLockedFileSafely(root ports.RootHandle, lockDest pathalg.LocalRootedDest) (bool, error) {
 	if root == nil || !lockDest.IsValid() {
-		return false, fmt.Errorf("%w: 无效 RootHandle 或锁文件路径", ports.ErrInvalidArgument)
+		return false, errField(ports.ErrInvalidArgument, "root/lock_dest")
 	}
 	acquired, err := root.TryWithLockedFile(lockDest, ports.LockExclusive, false, 0, func(lf ports.LockedFile) error {
 		return errors.Join(lf.Truncate(0), lf.Sync())
@@ -214,7 +214,7 @@ type WriteFileFunc func(w io.Writer) error
 type LockedFileFunc func(f ports.LockedFile) error
 
 func checkRootCB(root ports.RootHandle, fnNil bool) error {
-	return pickIf[error](root == nil, fmt.Errorf("%w: RootHandle 不能为 nil", ports.ErrInvalidArgument), pickIf[error](fnNil, ports.ErrNilCallback, nil))
+	return pickIf[error](root == nil, errFieldNil(ports.ErrInvalidArgument, "root"), pickIf[error](fnNil, ports.ErrNilCallback, nil))
 }
 
 // OpenRegular / CreateExclusive / OpenLockedContext / AtomicReplace 为 ports.RootHandle 提供包级显式作用域原语（ADR-007）。
@@ -283,7 +283,7 @@ func AtomicReplaceWithSidecarLock(ctx context.Context, root ports.RootHandle, de
 		return err
 	}
 	if !dest.IsValid() {
-		return fmt.Errorf("%w: 无效沙箱目标路径", ports.ErrInvalidArgument)
+		return errField(ports.ErrInvalidArgument, "dest")
 	}
 	mode := sanitizeFilePerm(perm, defaultFilePerm)
 	return WithSidecarLock(ctx, root, dest, ports.LockExclusive, mode, func(ports.LockedFile) error {

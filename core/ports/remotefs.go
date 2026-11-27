@@ -2,12 +2,12 @@ package ports
 
 import (
 	"context"
-	"fmt"
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"io"
 	"io/fs"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 )
 
 // RemoteFileType 标识远端 SFTP 文件系统对象类型；零值 RemoteFileTypeInvalid 严格失败关闭。
@@ -37,7 +37,7 @@ type RemoteFileAnchor struct {
 // NewRemoteFileAnchor 校验文件类型与可选 (dev, ino) 并构造不可变 RemoteFileAnchor。
 func NewRemoteFileAnchor(fileType RemoteFileType, hasDevIno bool, dev, ino uint64) (RemoteFileAnchor, error) {
 	if !fileType.IsValid() || (!hasDevIno && (dev != 0 || ino != 0)) {
-		return RemoteFileAnchor{}, fmt.Errorf("%w: RemoteFileAnchor 类型无效或 dev/ino 冲突", ErrInvalidArgument)
+		return RemoteFileAnchor{}, fieldErr(ErrInvalidArgument, "remote_file_anchor")
 	}
 	return RemoteFileAnchor{fileType: fileType, hasDevIno: hasDevIno, dev: dev, ino: ino, valid: true}, nil
 }
@@ -75,7 +75,7 @@ type RemoteFileStat struct {
 // NewRemoteFileStat 校验远端路径、非负大小、时间戳与锚点并构造不可变 RemoteFileStat。
 func NewRemoteFileStat(spec RemoteFileStatSpec) (RemoteFileStat, error) {
 	if !spec.Path.IsValid() || !spec.Anchor.IsValid() || spec.Size < 0 {
-		return RemoteFileStat{}, fmt.Errorf("%w: RemoteFileStat 路径、锚点无效或大小为负", ErrInvalidArgument)
+		return RemoteFileStat{}, fieldErr(ErrInvalidArgument, "remote_file_stat")
 	}
 	modUTC, err := normalizeOptionalModTime(spec.ModTime)
 	spec.ModTime = modUTC
@@ -120,7 +120,7 @@ type RemoteDirEntry struct {
 // NewRemoteDirEntry 校验远端目录项名、文件类型、非负大小与时间戳并构造不可变 RemoteDirEntry。
 func NewRemoteDirEntry(spec RemoteDirEntrySpec) (RemoteDirEntry, error) {
 	if !spec.Name.IsValid() || !spec.FileType.IsValid() || spec.Size < 0 {
-		return RemoteDirEntry{}, fmt.Errorf("%w: RemoteDirEntry 名称、类型无效或大小为负", ErrInvalidArgument)
+		return RemoteDirEntry{}, fieldErr(ErrInvalidArgument, "remote_dir_entry")
 	}
 	modUTC, err := normalizeOptionalModTime(spec.ModTime)
 	spec.ModTime = modUTC
@@ -165,7 +165,7 @@ func validRemotePrecond(noClobber bool, anc algebraic.Option[RemoteFileAnchor]) 
 // NewRemoteWriteSpec 校验标准权限位（0o001..0o777）与可选 FSTAT 锚点并构造不可变 RemoteWriteSpec。
 func NewRemoteWriteSpec(in RemoteWriteSpecInput) (RemoteWriteSpec, error) {
 	if in.Perm == 0 || in.Perm != in.Perm.Perm() || !validRemotePrecond(in.NoClobber, in.ExpectedAnchor) {
-		return RemoteWriteSpec{}, fmt.Errorf("%w: 远端写权限 %#o 或锚点/no_clobber 组合非法", ErrInvalidArgument, in.Perm)
+		return RemoteWriteSpec{}, fieldErr(ErrInvalidArgument, "remote_write_spec")
 	}
 	return RemoteWriteSpec{in: in, valid: true}, nil
 }
@@ -201,7 +201,7 @@ type RemoteRenameSpec struct {
 // NewRemoteRenameSpec 校验互斥的 NoClobber 与可选 FSTAT ExpectedAnchor 并构造不可变 RemoteRenameSpec。
 func NewRemoteRenameSpec(in RemoteRenameSpecInput) (RemoteRenameSpec, error) {
 	if !validRemotePrecond(in.NoClobber, in.ExpectedAnchor) {
-		return RemoteRenameSpec{}, fmt.Errorf("%w: expected_anchor 无效或与 no_clobber 互斥", ErrInvalidArgument)
+		return RemoteRenameSpec{}, fieldErr(ErrInvalidArgument, "remote_rename_spec")
 	}
 	return RemoteRenameSpec{in: in, valid: true}, nil
 }

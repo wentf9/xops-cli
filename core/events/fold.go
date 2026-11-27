@@ -2,10 +2,10 @@ package events
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/playbook"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
@@ -20,7 +20,7 @@ func FoldEvents[Acc any](initial Acc, items []Event, fn func(acc Acc, ev Event) 
 	acc := initial
 	for i, ev := range items {
 		if ev == nil || !ev.IsValid() {
-			return zeroVal[Acc](), fmt.Errorf("%w: items[%d] 无效", ErrInvalidEvent, i)
+			return zeroVal[Acc](), domi18n.EF(ErrInvalidEvent, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "items"), domi18n.Int("index", i))
 		}
 		next, err := fn(acc, ev)
 		if err != nil {
@@ -113,7 +113,7 @@ func (s OperationSummary) Equal(o OperationSummary) bool {
 // FoldOperationSummary 以纯函数方式将单次操作的事件切片归约为不可变 OperationSummary。
 func FoldOperationSummary(items []Event) (OperationSummary, error) {
 	if len(items) == 0 {
-		return OperationSummary{}, fmt.Errorf("%w: 空事件切片无法折叠 OperationSummary", ErrInvalidEvent)
+		return OperationSummary{}, domi18n.EF(ErrInvalidEvent, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "items"))
 	}
 	return FoldEvents(OperationSummary{}, items, applySummaryEvent)
 }
@@ -157,7 +157,7 @@ func applySummaryEvent(acc OperationSummary, ev Event) (OperationSummary, error)
 	case *MetricSampleEvent:
 		next.progressCnt++
 	case *AuditRecordEvent, *PoolStateEvent, *DiagnosticEvent, *BusDroppedEvent:
-		return OperationSummary{}, fmt.Errorf("%w: OperationSummary 仅折叠操作流事件，拒绝 %s", ErrUnsupportedEventClass, ev.Kind())
+		return OperationSummary{}, domi18n.EF(ErrUnsupportedEventClass, domi18n.KeyEventsClassMismatch, domi18n.Str("expected", "operation/progress"), domi18n.Str("actual", ev.Kind().String()))
 	default:
 		return OperationSummary{}, ErrInvalidEvent
 	}
@@ -168,14 +168,14 @@ func bindSummaryIdentity(acc OperationSummary, ev Event) (OperationSummary, erro
 	meta := ev.Meta()
 	opID, hasOp := meta.OperationID().Get()
 	if !meta.IsValid() || !hasOp {
-		return OperationSummary{}, fmt.Errorf("%w: 操作摘要折叠要求事件绑定有效 OperationID", ErrOperationMismatch)
+		return OperationSummary{}, domi18n.EF(ErrOperationMismatch, domi18n.KeyCommonFieldRequired, domi18n.Str("field", "operation_id"))
 	}
 	if !acc.valid {
 		acc.traceID, acc.opID, acc.valid = meta.TraceID(), opID, true
 		return acc, nil
 	}
 	if !acc.traceID.Equal(meta.TraceID()) || !acc.opID.Equal(opID) {
-		return OperationSummary{}, fmt.Errorf("%w: 事件归属与当前摘要不一致", ErrOperationMismatch)
+		return OperationSummary{}, domi18n.EF(ErrOperationMismatch, domi18n.KeyCommonMismatch, domi18n.Str("field", "operation_id"), domi18n.Str("expected", acc.opID.String()), domi18n.Str("actual", opID.String()))
 	}
 	return acc, nil
 }

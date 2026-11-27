@@ -4,7 +4,6 @@ package osfs
 
 import (
 	"errors"
-	"fmt"
 	"golang.org/x/sys/unix"
 )
 
@@ -15,7 +14,7 @@ func isBSDFileTypeErr(err error) bool { return errors.Is(err, unix.EFTYPE) }
 func queryPeerCredFD(fd uintptr) (PeerCred, error) {
 	xucred, err := unix.GetsockoptXucred(int(fd), unix.SOL_LOCAL, unix.LOCAL_PEERCRED)
 	if err != nil {
-		return PeerCred{}, fmt.Errorf("%w: getsockopt(LOCAL_PEERCRED) 失败: %w", ErrUnauthorizedPeer, err)
+		return PeerCred{}, wrapOp(ErrUnauthorizedPeer, err, "getsockopt(LOCAL_PEERCRED)")
 	}
 	cred := PeerCred{uid: xucred.Uid, hasUID: true, valid: true}
 	if xucred.Ngroups > 0 {

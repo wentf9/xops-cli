@@ -4,7 +4,7 @@ package osfs
 
 import (
 	"errors"
-	"fmt"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
 	"golang.org/x/sys/windows"
@@ -31,14 +31,14 @@ func CurrentProcessUserSID() (*windows.SID, error) {
 // ProcessUserSID 查询目标 PID 对应进程访问令牌的用户 SID。
 func ProcessUserSID(pid uint32) (*windows.SID, error) {
 	if pid == 0 {
-		return nil, errors.New("osfs: 目标进程 PID 不能为 0")
+		return nil, domi18n.EF(ports.ErrInvalidArgument, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "pid"))
 	}
 	if pid == uint32(os.Getpid()) {
 		return CurrentProcessUserSID()
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		return nil, fmt.Errorf("osfs: OpenProcess(%d) 失败: %w", pid, err)
+		return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "OpenProcess"))
 	}
 	defer func() { _ = windows.CloseHandle(h) }()
 	return tokenUserSIDForProcess(h)
@@ -46,12 +46,12 @@ func ProcessUserSID(pid uint32) (*windows.SID, error) {
 func tokenUserSIDForProcess(procHandle windows.Handle) (*windows.SID, error) {
 	var tok windows.Token
 	if err := windows.OpenProcessToken(procHandle, windows.TOKEN_QUERY, &tok); err != nil {
-		return nil, fmt.Errorf("osfs: OpenProcessToken 失败: %w", err)
+		return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "OpenProcessToken"))
 	}
 	defer func() { _ = tok.Close() }()
 	tu, err := tok.GetTokenUser()
 	if err != nil || tu == nil || tu.User.Sid == nil {
-		return nil, fmt.Errorf("osfs: 查询进程令牌用户 SID 失败: %w", err)
+		return nil, domi18n.Wrap(err, domi18n.KeyCommonOpFailed, domi18n.Str("op", "GetTokenUser"))
 	}
 	return tu.User.Sid.Copy()
 }
@@ -72,7 +72,7 @@ func sidAccessEntry(sid *windows.SID, t windows.TRUSTEE_TYPE, inh uint32) window
 // NewOwnerOnlySecurityDescriptor 构造 GC 安全的自相对（self-relative）受保护 Owner-Only 安全描述符。
 func NewOwnerOnlySecurityDescriptor(ownerSID *windows.SID, inheritance uint32) (*windows.SECURITY_DESCRIPTOR, error) {
 	if ownerSID == nil || !ownerSID.IsValid() {
-		return nil, fmt.Errorf("%w: 无效所有者 SID", ErrInsecurePermissions)
+		return nil, errField(ErrInsecurePermissions, "owner_sid")
 	}
 	sysSID, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
 	if err != nil {
@@ -102,11 +102,11 @@ func NewOwnerOnlySecurityDescriptor(ownerSID *windows.SID, inheritance uint32) (
 func currentOwnerOnlySD(inheritance uint32) (*windows.SECURITY_DESCRIPTOR, *windows.SID, error) {
 	currSID, err := CurrentProcessUserSID()
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: 查询当前用户 SID 失败: %w", ErrInsecurePermissions, err)
+		return nil, nil, wrapOp(ErrInsecurePermissions, err, "CurrentProcessUserSID")
 	}
 	sd, err := NewOwnerOnlySecurityDescriptor(currSID, inheritance)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: 构造 Owner-Only DACL 失败: %w", ErrInsecurePermissions, err)
+		return nil, nil, wrapOp(ErrInsecurePermissions, err, "NewOwnerOnlySecurityDescriptor")
 	}
 	return sd, currSID, nil
 }
@@ -138,7 +138,7 @@ func OpenObjectHandleNoFollow(path string, desiredAccess uint32) (windows.Handle
 func openObjectHandleInfoNoFollow(path string, desiredAccess uint32) (windows.Handle, windows.ByHandleFileInformation, error) {
 	var info windows.ByHandleFileInformation
 	if strings.TrimSpace(path) == "" {
-		return windows.InvalidHandle, info, fmt.Errorf("%w: Windows 对象路径不能为空", ErrInsecurePermissions)
+		return windows.InvalidHandle, info, domi18n.EF(ErrInsecurePermissions, domi18n.KeyCommonFieldEmpty, domi18n.Str("field", "path"))
 	}
 	pathPtr, err := windows.UTF16PtrFromString(NormalizeWin32LongPath(path))
 	if err != nil {
@@ -151,7 +151,7 @@ func openObjectHandleInfoNoFollow(path string, desiredAccess uint32) (windows.Ha
 	if ft, fErr := windows.GetFileType(handle); fErr != nil {
 		err = fErr
 	} else if ft != windows.FILE_TYPE_DISK {
-		err = fmt.Errorf("%w: 非磁盘对象句柄类型 %d", ErrInsecurePermissions, ft)
+		err = errField(ErrInsecurePermissions, "file_type")
 	} else {
 		err = windows.GetFileInformationByHandle(handle, &info)
 	}
@@ -185,10 +185,10 @@ func checkDirAttrsNoFollowWin(p string) error {
 	}
 	_ = windows.CloseHandle(h)
 	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return fmt.Errorf("%w: %w: %q 为重解析点", ErrInsecurePermissions, ports.ErrSymlinkRejected, p)
+		return wrapS(ErrInsecurePermissions, domi18n.EF(ports.ErrSymlinkRejected, domi18n.KeyOSFSSymlinkDetected, domi18n.BoundStr("path", p)))
 	}
 	if attrs&windows.FILE_ATTRIBUTE_DIRECTORY == 0 {
-		return fmt.Errorf("%w: %w: %q 不是目录", ErrInsecurePermissions, ports.ErrNotRegularFile, p)
+		return wrapS(ErrInsecurePermissions, domi18n.EF(ports.ErrNotRegularFile, domi18n.KeyOSFSNotDirectory, domi18n.BoundStr("path", p)))
 	}
 	return nil
 }
@@ -221,11 +221,11 @@ func collectMissingDirs(dir string) (string, []string, error) {
 		if checkErr := checkDirAttrsNoFollowWin(cur); checkErr == nil {
 			return absDir, toCreate, nil
 		} else if !errors.Is(checkErr, ports.ErrNotFound) {
-			return "", nil, fmt.Errorf("%w: 检查祖先目录 %q 失败: %w", ErrInsecurePermissions, cur, checkErr)
+			return "", nil, wrapTarget(ErrInsecurePermissions, checkErr, "check_dir", cur)
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
-			return "", nil, fmt.Errorf("%w: 卷根目录 %q 不可访问", ErrInsecurePermissions, cur)
+			return "", nil, domi18n.EF(ErrInsecurePermissions, domi18n.KeyCommonOpTargetFailed, domi18n.Str("op", "access_root"), domi18n.BoundStr("target", cur))
 		}
 		toCreate, cur = append(toCreate, cur), parent
 	}
@@ -238,7 +238,7 @@ func openWinSecHandleChecked(path string, access uint32, expectDir, expectSocket
 	if expectSocket {
 		err = verifyAFUnixReparseHandle(handle, path)
 	} else if !isSafeWin32ObjectAttrs(attrs, expectDir, false) {
-		err = fmt.Errorf("%w: 对象 %q 属性不满足预期", ErrInsecurePermissions, path)
+		err = domi18n.EF(ErrInsecurePermissions, domi18n.KeyOSFSDACLCheckFailed, domi18n.BoundStr("path", path))
 	}
 	if err != nil {
 		_ = windows.CloseHandle(handle)
@@ -266,11 +266,11 @@ func hardenObjectOwnerOnlyByHandle(path string, expectDir, expectSocket bool, in
 	defer func() { _ = windows.CloseHandle(handle) }()
 	dacl, _, err := sd.DACL()
 	if err != nil || dacl == nil {
-		return fmt.Errorf("%w: 提取受保护 DACL 失败", ErrInsecurePermissions)
+		return errField(ErrInsecurePermissions, "dacl")
 	}
 	err = windows.SetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
 	runtime.KeepAlive(sd)
-	return pickIf[error](err == nil, nil, fmt.Errorf("%w: SetSecurityInfo 失败: %w", ErrInsecurePermissions, err))
+	return pickIf[error](err == nil, nil, wrapOp(ErrInsecurePermissions, err, "SetSecurityInfo"))
 }
 
 // VerifyOwnerOnlyDirectoryByHandle / VerifyOwnerOnlyFileByHandle / VerifyOwnerOnlySocketByHandle 通过无跟随句柄校验 Owner-Only DACL。
@@ -287,7 +287,7 @@ func verifyOwnerOnlyPathByHandle(path string, expectDir, expectSocket bool, curr
 	if currSID == nil {
 		var err error
 		if currSID, err = CurrentProcessUserSID(); err != nil {
-			return fmt.Errorf("%w: 查询当前用户 SID 失败: %w", ErrInsecurePermissions, err)
+			return wrapOp(ErrInsecurePermissions, err, "CurrentProcessUserSID")
 		}
 	}
 	handle, attrs, err := openWinSecHandleChecked(path, windows.READ_CONTROL, expectDir, expectSocket)
@@ -297,29 +297,29 @@ func verifyOwnerOnlyPathByHandle(path string, expectDir, expectSocket bool, curr
 	defer func() { _ = windows.CloseHandle(handle) }()
 	sd, err := windows.GetSecurityInfo(handle, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil || sd == nil {
-		return fmt.Errorf("%w: GetSecurityInfo(%q) 失败: %w", ErrInsecurePermissions, path, err)
+		return wrapTarget(ErrInsecurePermissions, err, "GetSecurityInfo", path)
 	}
 	owner, _, oErr := sd.Owner()
 	dacl, _, dErr := sd.DACL()
 	if oErr != nil || owner == nil || dErr != nil || dacl == nil {
-		return fmt.Errorf("%w: %q 缺少有效所有者或 DACL", ErrInsecurePermissions, path)
+		return domi18n.EF(ErrInsecurePermissions, domi18n.KeyOSFSDACLCheckFailed, domi18n.BoundStr("path", path))
 	}
 	aces, err := parseWindowsACL(dacl, currSID)
 	if err != nil {
 		return err
 	}
 	if EvaluateWindowsObjectACL(WindowsACLInput{Mode: WindowsACLOwnerOnly, Attrs: attrs, ExpectDir: expectDir, AllowReparse: expectSocket, OwnerTrusted: IsTrustedPrincipalSID(owner, currSID), HasDACL: true, ACEs: aces}) != security.VerdictAllow {
-		return fmt.Errorf("%w: %q 未通过 Owner-Only DACL 校验", ErrInsecurePermissions, path)
+		return domi18n.EF(ErrInsecurePermissions, domi18n.KeyOSFSDACLCheckFailed, domi18n.BoundStr("path", path))
 	}
 	return nil
 }
 func verifyAFUnixReparseHandle(handle windows.Handle, path string) error {
 	var tag winFileAttributeTagInfo
 	if err := windows.GetFileInformationByHandleEx(handle, windows.FileAttributeTagInfo, (*byte)(unsafe.Pointer(&tag)), uint32(unsafe.Sizeof(tag))); err != nil {
-		return fmt.Errorf("%w: 查询重解析标签失败: %w", ErrNotSocket, err)
+		return wrapOp(ErrNotSocket, err, "GetFileInformationByHandleEx")
 	}
 	if tag.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 || tag.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT == 0 || tag.ReparseTag != ioReparseTagAFUnix {
-		return fmt.Errorf("%w: %q 不是 AF_UNIX 套接字 (tag=0x%x)", ErrNotSocket, path, tag.ReparseTag)
+		return domi18n.EF(ErrNotSocket, domi18n.KeyOSFSNotUnixSocket, domi18n.BoundStr("path", path))
 	}
 	return nil
 }
@@ -328,7 +328,7 @@ func parseWindowsACL(dacl *windows.ACL, currSID *windows.SID) ([]ParsedWindowsAC
 	for i := range uint32(dacl.AceCount) {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, i, &ace); err != nil || ace == nil {
-			return nil, fmt.Errorf("%w: 解码 DACL ACE #%d 失败", ErrInsecurePermissions, i)
+			return nil, domi18n.EF(ErrInsecurePermissions, domi18n.KeyCommonIndexInvalid, domi18n.Str("field", "dacl_ace"), domi18n.Uint64("index", uint64(i)))
 		}
 		parsed, err := decodeSingleWindowsACE(ace, currSID)
 		if err != nil {
@@ -340,7 +340,7 @@ func parseWindowsACL(dacl *windows.ACL, currSID *windows.SID) ([]ParsedWindowsAC
 }
 func decodeSingleWindowsACE(ace *windows.ACCESS_ALLOWED_ACE, currSID *windows.SID) (ParsedWindowsACE, error) {
 	if uintptr(ace.Header.AceSize) < unsafe.Sizeof(windows.ACE_HEADER{}) {
-		return ParsedWindowsACE{}, fmt.Errorf("%w: ACE 头部畸形", ErrInsecurePermissions)
+		return ParsedWindowsACE{}, errField(ErrInsecurePermissions, "ace_header")
 	}
 	parsed := ParsedWindowsACE{ACEType: ace.Header.AceType, ACEFlags: ace.Header.AceFlags}
 	if parsed.ACEType != WinACETypeAllow {
@@ -349,11 +349,11 @@ func decodeSingleWindowsACE(ace *windows.ACCESS_ALLOWED_ACE, currSID *windows.SI
 	const minSIDBytes = uintptr(8)
 	sidOffset := unsafe.Offsetof(ace.SidStart)
 	if uintptr(ace.Header.AceSize) < sidOffset+minSIDBytes {
-		return ParsedWindowsACE{}, fmt.Errorf("%w: ACE SID 越界", ErrInsecurePermissions)
+		return ParsedWindowsACE{}, errField(ErrInsecurePermissions, "ace_sid")
 	}
 	aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 	if !aceSID.IsValid() || aceSID.Len() < int(minSIDBytes) || uintptr(ace.Header.AceSize) < sidOffset+uintptr(aceSID.Len()) {
-		return ParsedWindowsACE{}, fmt.Errorf("%w: ACE SID 无效", ErrInsecurePermissions)
+		return ParsedWindowsACE{}, errField(ErrInsecurePermissions, "ace_sid")
 	}
 	parsed.Mask, parsed.SIDValid, parsed.SIDTrusted = uint32(ace.Mask), true, IsTrustedPrincipalSID(aceSID, currSID)
 	return parsed, nil

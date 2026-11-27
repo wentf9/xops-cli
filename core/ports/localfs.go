@@ -2,12 +2,13 @@ package ports
 
 import (
 	"context"
-	"fmt"
-	"github.com/wentf9/xops-cli/core/domain/algebraic"
-	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"io"
 	"io/fs"
 	"time"
+
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 )
 
 // LockMode 定义句柄级本地文件锁的加锁模式（INV-A5）；零值 LockModeInvalid 严格失败关闭。
@@ -34,7 +35,7 @@ type ReadLimits struct {
 // NewReadLimits 校验上限严格为正整数后构造不可变 ReadLimits。
 func NewReadLimits(maxBytes int64) (ReadLimits, error) {
 	if maxBytes <= 0 {
-		return ReadLimits{}, fmt.Errorf("%w: max_bytes=%d 必须大于 0", ErrInvalidReadLimits, maxBytes)
+		return ReadLimits{}, domi18n.EF(ErrInvalidReadLimits, domi18n.KeyCommonFieldPositive, domi18n.Str("field", "max_bytes"))
 	}
 	return ReadLimits{maxBytes: maxBytes, valid: true}, nil
 }
@@ -56,13 +57,13 @@ func (m localMeta) ok() bool            { return m.valid && m.name != "" && m.si
 func (m localMeta) eq(o localMeta) bool { return m.ok() && o.ok() && m == o }
 func validateLocalNameSize(name string, size int64) error {
 	if err := pathalg.ValidateLocalComponent(name); err != nil {
-		return fmt.Errorf("%w: 非法本地文件名 %q: %w", ErrInvalidArgument, name, err)
+		return domi18n.WrapS(ErrInvalidArgument, err, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "name"), domi18n.BoundStr("value", name))
 	}
-	return pickIf[error](size < 0, fmt.Errorf("%w: 文件大小不能为负", ErrInvalidArgument), nil)
+	return pickIf[error](size < 0, domi18n.EF(ErrInvalidArgument, domi18n.KeyCommonFieldNegative, domi18n.Str("field", "size")), nil)
 }
 func normalizeOptionalModTime(t time.Time) (time.Time, error) {
 	if !t.IsZero() && !isValidRFC3339Time(t) {
-		return time.Time{}, fmt.Errorf("%w: 修改时间超出 RFC 3339 合法年份范围", ErrInvalidArgument)
+		return time.Time{}, domi18n.EF(ErrInvalidArgument, domi18n.KeyPortsModTimeOutOfRange)
 	}
 	return pickIf(t.IsZero(), time.Time{}, t.UTC().Round(0)), nil
 }

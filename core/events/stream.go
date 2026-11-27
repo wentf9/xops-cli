@@ -2,10 +2,10 @@ package events
 
 import (
 	"context"
-	"fmt"
 	"iter"
 	"sync"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
 )
 
@@ -52,7 +52,7 @@ type OperationStream struct {
 // NewOperationStream 校验绑定标识与缓冲配置，创建并初始化一个 OperationStream。
 func NewOperationStream(cfg OperationStreamConfig) (*OperationStream, error) {
 	if !cfg.TraceID.IsValid() || !cfg.OperationID.IsValid() || cfg.OperationBuffer <= 0 || cfg.MaxCoalesceKeys < 0 {
-		return nil, fmt.Errorf("%w: trace_id/operation_id 须有效、operation_buffer>0 且 max_coalesce_keys>=0", ErrInvalidStreamConfig)
+		return nil, fieldErr(ErrInvalidStreamConfig, "operation_stream_config")
 	}
 	return &OperationStream{
 		traceID: cfg.TraceID, opID: cfg.OperationID, opCap: cfg.OperationBuffer,
@@ -86,7 +86,7 @@ func (s *OperationStream) Emit(ctx context.Context, ev Event) error {
 	case BackpressureBlockWithContext:
 		return s.emitBlocking(ctx, ev)
 	default:
-		return fmt.Errorf("%w: 不支持的背压策略 %s", ErrUnsupportedEventClass, ev.Backpressure())
+		return domi18n.EF(ErrUnsupportedEventClass, domi18n.KeyCommonNotSupported, domi18n.Str("feature", ev.Backpressure().String()))
 	}
 }
 
@@ -101,11 +101,11 @@ func (s *OperationStream) validateEmitInput(ctx context.Context, ev Event) error
 		return ErrInvalidEvent
 	}
 	if cls := ev.Class(); cls != EventClassOperation && cls != EventClassProgress {
-		return fmt.Errorf("%w: OperationStream 仅接受 operation/progress 事件，实际=%s", ErrUnsupportedEventClass, cls)
+		return domi18n.EF(ErrUnsupportedEventClass, domi18n.KeyEventsClassMismatch, domi18n.Str("expected", "operation/progress"), domi18n.Str("actual", cls.String()))
 	}
 	meta := ev.Meta()
 	if opID, ok := meta.OperationID().Get(); !meta.TraceID().Equal(s.traceID) || !ok || !opID.Equal(s.opID) {
-		return fmt.Errorf("%w: 期望 trace=%s op=%s", ErrOperationMismatch, s.traceID, s.opID)
+		return fieldErr(ErrOperationMismatch, "trace_id/operation_id")
 	}
 	return nil
 }
@@ -127,7 +127,7 @@ func (s *OperationStream) emitCoalesced(ctx context.Context, ev Event) error {
 		return ErrStreamClosed
 	}
 	if s.completed {
-		return fmt.Errorf("%w: 操作已终结，拒绝继续写入进度事件", ErrInvalidEvent)
+		return domi18n.EF(ErrInvalidEvent, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "emit"), domi18n.Str("state", "completed"))
 	}
 	s.upsertCoalescedLocked(key, ev)
 	s.publishedTotal++
@@ -179,7 +179,7 @@ func (s *OperationStream) tryEnqueueOp(ev Event) (<-chan struct{}, bool, error) 
 		return nil, true, ErrStreamClosed
 	}
 	if s.completed {
-		return nil, true, fmt.Errorf("%w: 操作已终结，拒绝继续写入事件", ErrInvalidEvent)
+		return nil, true, domi18n.EF(ErrInvalidEvent, domi18n.KeyCommonStateForbidden, domi18n.Str("action", "emit"), domi18n.Str("state", "completed"))
 	}
 	if s.opCount < s.opCap {
 		s.opQueue[(s.opHead+s.opCount)%s.opCap] = ev
