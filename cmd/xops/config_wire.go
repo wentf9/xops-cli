@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"path"
 	"slices"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/internal/host/store"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type runtimeMode uint8
@@ -69,7 +69,7 @@ func decodeGlobalOptions(dto *store.OptionLayerDTO) (option.OptionLayer, error) 
 	}
 	layer, err := store.DecodeOptionLayerDTO(dto)
 	if err != nil {
-		return option.UnsetOptionLayer(), fmt.Errorf("decode config.yaml global options failed: %w", err)
+		return option.UnsetOptionLayer(), i18n.Wrap(err, i18n.KeyCmdConfigDecodeFailed, i18n.Str("field", "options"))
 	}
 	return layer, nil
 }
@@ -79,9 +79,11 @@ func resolveEffectiveProfile(cliOverride engine.PolicyProfile, pol *store.Policy
 		return cliOverride, nil
 	}
 	raw := ""
+	field := "policy.cli_default"
 	if pol != nil {
 		if mode == runtimeModeMCP {
 			raw = strings.TrimSpace(pol.MCPDefault)
+			field = "policy.mcp_default"
 		} else {
 			raw = strings.TrimSpace(pol.CLIDefault)
 		}
@@ -89,7 +91,7 @@ func resolveEffectiveProfile(cliOverride engine.PolicyProfile, pol *store.Policy
 	if raw != "" {
 		parsed, err := engine.ParsePolicyProfile(raw)
 		if err != nil {
-			return engine.PolicyProfileInvalid, fmt.Errorf("invalid policy default profile %q: %w", raw, err)
+			return engine.PolicyProfileInvalid, i18n.Wrap(err, i18n.KeyCmdConfigInvalidValue, i18n.Str("field", field), i18n.BoundStr("value", raw))
 		}
 		return parsed, nil
 	}
@@ -114,7 +116,7 @@ func buildGuardrailFromPolicy(pol *store.PolicyConfigDTO) (engine.GuardrailConfi
 	if len(g.NodeOverrides) > 0 {
 		ov, err := store.DecodeNodeOverridesDTO(g.NodeOverrides)
 		if err != nil {
-			return engine.GuardrailConfig{}, fmt.Errorf("decode policy.guardrail.node_overrides failed: %w", err)
+			return engine.GuardrailConfig{}, i18n.Wrap(err, i18n.KeyCmdConfigDecodeFailed, i18n.Str("field", "policy.guardrail.node_overrides"))
 		}
 		cfg.NodeOverrides = algebraic.Some(ov)
 	}
@@ -128,14 +130,14 @@ func applyGuardrailScalars(cfg *engine.GuardrailConfig, g *store.GuardrailConfig
 	if raw := strings.TrimSpace(g.ApprovalThreshold); raw != "" {
 		lvl, err := security.ParseRiskLevel(raw)
 		if err != nil {
-			return fmt.Errorf("invalid policy.guardrail.approval_threshold %q: %w", raw, err)
+			return i18n.Wrap(err, i18n.KeyCmdConfigInvalidValue, i18n.Str("field", "policy.guardrail.approval_threshold"), i18n.BoundStr("value", raw))
 		}
 		cfg.ApprovalThreshold = lvl
 	}
 	if raw := strings.TrimSpace(g.NoElicitFallback); raw != "" {
 		fb, err := engine.ParseNoElicitFallback(raw)
 		if err != nil {
-			return fmt.Errorf("invalid policy.guardrail.no_elicit_fallback %q: %w", raw, err)
+			return i18n.Wrap(err, i18n.KeyCmdConfigInvalidValue, i18n.Str("field", "policy.guardrail.no_elicit_fallback"), i18n.BoundStr("value", raw))
 		}
 		cfg.NoElicitFallback = fb
 	}
@@ -158,7 +160,7 @@ func resolveAuditLocation(
 	if relUnderState, inside := stripAuditStatePrefix(raw, stateDir); inside {
 		relDest, err := pathalg.ParseLocalRootedDest(relUnderState)
 		if err != nil {
-			return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), fmt.Errorf("invalid policy.guardrail.audit_log under stateDir %q: %w", raw, err)
+			return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "policy.guardrail.audit_log"), i18n.BoundStr("path", raw))
 		}
 		return stateDir, algebraic.Some(relDest), nil
 	}
@@ -169,7 +171,7 @@ func resolveAuditLocation(
 	// 禁止将裸 homeDir（如 ~/xops-audit.jsonl）作为 FileSink.RootDir：
 	// Windows 下 %USERPROFILE% 含继承 ACL 会触发 EnsureOwnerOnlyDirectory 失败，Unix 下会污染 ~/run/*.lock。
 	if rootDir.Equal(homeDir) {
-		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), fmt.Errorf("policy.guardrail.audit_log %q cannot place audit root directly in home directory; use a path under state directory or a dedicated private directory", pol.Guardrail.AuditLog)
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.E(i18n.KeyCmdAuditLogInHomeDir, i18n.BoundStr("path", pol.Guardrail.AuditLog))
 	}
 	return rootDir, fileOpt, nil
 }
@@ -204,7 +206,7 @@ func splitAbsoluteAuditLocation(raw string) (pathalg.LocalDir, algebraic.Option[
 	dirPart := path.Dir(norm)
 	basePart := path.Base(norm)
 	if dirPart == "." || dirPart == "" || basePart == "." || basePart == "/" || basePart == "" {
-		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), fmt.Errorf("invalid policy.guardrail.audit_log path %q", raw)
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.E(i18n.KeyCmdInvalidDirPath, i18n.Str("target", "policy.guardrail.audit_log"), i18n.BoundStr("path", raw))
 	}
 	// Windows 盘符根目录（如 "C:"）补全斜杠以满足 ParseLocalDir。
 	if len(dirPart) == 2 && dirPart[1] == ':' {
@@ -212,11 +214,11 @@ func splitAbsoluteAuditLocation(raw string) (pathalg.LocalDir, algebraic.Option[
 	}
 	rootDir, err := pathalg.ParseLocalDir(dirPart)
 	if err != nil {
-		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), fmt.Errorf("invalid policy.guardrail.audit_log dir %q: %w", raw, err)
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "policy.guardrail.audit_log dir"), i18n.BoundStr("path", raw))
 	}
 	fileDest, err := pathalg.ParseLocalRootedDest(basePart)
 	if err != nil {
-		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), fmt.Errorf("invalid policy.guardrail.audit_log file %q: %w", raw, err)
+		return zeroVal[pathalg.LocalDir](), algebraic.None[pathalg.LocalRootedDest](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "policy.guardrail.audit_log file"), i18n.BoundStr("path", raw))
 	}
 	return rootDir, algebraic.Some(fileDest), nil
 }

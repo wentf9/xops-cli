@@ -5,7 +5,6 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/osfs"
@@ -25,6 +25,8 @@ import (
 	"github.com/wentf9/xops-cli/internal/entry/tui"
 	"github.com/wentf9/xops-cli/internal/host/store"
 	"github.com/wentf9/xops-cli/internal/host/sys"
+	"github.com/wentf9/xops-cli/internal/host/sys/interact"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -33,9 +35,16 @@ const (
 	auditFileNameDefault              = "audit.jsonl"
 )
 
-// runTUISubEntry 装配完整 CLI 运行期并启动 Bubble Tea v2 实时工作台，退出时严格逆序停机。
-func runTUISubEntry(ctx context.Context, req cli.TUIStartRequest) (retErr error) {
-	rt, err := wireRuntime(ctx, req.InitOptions, runtimeModeCLI, req.Stdin, req.Stdout)
+// runTUISubEntry 装配完整 CLI 运行期并启动 Bubble Tea v2 实时工作台，支持按大写 L 热同步交互提示语种，退出时严格逆序停机。
+func runTUISubEntry(
+	ctx context.Context,
+	req cli.TUIStartRequest,
+	catalog *i18n.Catalog,
+	defaultLocale domi18n.Locale,
+) (retErr error) {
+	initLocale := effectiveLocale(req.Locale, effectiveLocale(req.InitOptions.Locale, defaultLocale))
+	loc := resolveLocalizer(catalog, initLocale, defaultLocale)
+	rt, err := wireRuntimeWithLocalizer(ctx, req.InitOptions, runtimeModeCLI, req.Stdin, req.Stdout, loc)
 	if err != nil {
 		return err
 	}
@@ -50,8 +59,22 @@ func runTUISubEntry(ctx context.Context, req cli.TUIStartRequest) (retErr error)
 		DisableSignalHandler: true,
 		InitialTarget:        req.InitialNode,
 		MetricsInterval:      req.RefreshInterval,
+		Catalog:              catalog,
+		Locale:               initLocale,
+		OnLocaleChange:       buildTUILocaleSync(catalog, rt.interaction),
 		OnTakeover:           buildTUITakeover(rt.engine, req.Stdin, req.Stdout, req.Stderr),
 	})
+}
+
+// buildTUILocaleSync 构造 TUI 按大写 L 切换界面语言时同步更新宿主交互适配器 Localizer 的回调，
+// 确保后续按 Enter 触发 SSH OnTakeover 时的主机密钥与口令提示即时切换语种。
+func buildTUILocaleSync(catalog *i18n.Catalog, ui *interact.Interaction) func(domi18n.Locale) {
+	return func(loc domi18n.Locale) {
+		if ui == nil || catalog == nil || !catalog.IsValid() {
+			return
+		}
+		ui.SetLocalizer(catalog.For(loc))
+	}
 }
 
 // buildTUITakeover 构造 TUI 终端接管回调：调用 Engine.InteractiveSSH 启动交互式远端 Shell，
@@ -80,21 +103,44 @@ func checkTakeoverOutcome(out execution.ExecutionOutcome) error {
 	switch v := out.(type) {
 	case *execution.OutcomeCompleted:
 		if !v.IsValid() {
-			return errors.New("interactive ssh takeover returned invalid completed outcome")
+			return i18n.E(i18n.KeyCmdTakeoverInvalidOutcome)
 		}
 		return nil
 	case *execution.OutcomeNotStarted:
-		return fmt.Errorf("interactive ssh takeover not started (%s/%s): %s", v.Phase(), v.Code(), v.Reason())
+		if !v.IsValid() {
+			return i18n.E(i18n.KeyCmdTakeoverInvalidOutcome)
+		}
+		return i18n.E(
+			i18n.KeyCmdTakeoverNotStarted,
+			i18n.BoundStr("phase", v.Phase().String()),
+			i18n.BoundStr("code", v.Code()),
+			i18n.BoundStr("reason", v.Reason()),
+		)
 	case *execution.OutcomeUnknown:
-		return fmt.Errorf("interactive ssh takeover outcome unknown (%s/%s): %s", v.Phase(), v.Code(), v.Reason())
+		if !v.IsValid() {
+			return i18n.E(i18n.KeyCmdTakeoverInvalidOutcome)
+		}
+		return i18n.E(
+			i18n.KeyCmdTakeoverOutcomeUnknown,
+			i18n.BoundStr("phase", v.Phase().String()),
+			i18n.BoundStr("code", v.Code()),
+			i18n.BoundStr("reason", v.Reason()),
+		)
 	default:
-		return errors.New("interactive ssh takeover returned unexpected outcome")
+		return i18n.E(i18n.KeyCmdTakeoverInvalidOutcome)
 	}
 }
 
-// runSFTPShellSubEntry 装配完整 CLI 运行期与基于 ScopedRootFS 的本机目录适配器，启动交互式 SFTP Shell。
-func runSFTPShellSubEntry(ctx context.Context, req cli.SFTPShellStartRequest) (retErr error) {
-	rt, err := wireRuntime(ctx, req.InitOptions, runtimeModeCLI, req.Stdin, req.Stdout)
+// runSFTPShellSubEntry 装配完整 CLI 运行期与基于 ScopedRootFS 的本机目录适配器，并注入生效 Localizer 启动交互式 SFTP Shell。
+func runSFTPShellSubEntry(
+	ctx context.Context,
+	req cli.SFTPShellStartRequest,
+	catalog *i18n.Catalog,
+	defaultLocale domi18n.Locale,
+) (retErr error) {
+	initLocale := effectiveLocale(req.Locale, effectiveLocale(req.InitOptions.Locale, defaultLocale))
+	loc := resolveLocalizer(catalog, initLocale, defaultLocale)
+	rt, err := wireRuntimeWithLocalizer(ctx, req.InitOptions, runtimeModeCLI, req.Stdin, req.Stdout, loc)
 	if err != nil {
 		return err
 	}
@@ -104,7 +150,7 @@ func runSFTPShellSubEntry(ctx context.Context, req cli.SFTPShellStartRequest) (r
 	if trimmed := strings.TrimSpace(req.InitialDir); trimmed != "" {
 		rp, pErr := pathalg.ParseRemotePath(trimmed)
 		if pErr != nil {
-			return fmt.Errorf("invalid initial remote dir %q: %w", req.InitialDir, pErr)
+			return i18n.Wrap(pErr, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "initial remote dir"), i18n.BoundStr("path", req.InitialDir))
 		}
 		initRemote = algebraic.Some(rp)
 	}
@@ -125,6 +171,7 @@ func runSFTPShellSubEntry(ctx context.Context, req cli.SFTPShellStartRequest) (r
 		LocalFS:          newScopedLocalFSAdapter(rt.scopedFS),
 		SymlinkPolicy:    pathalg.SymlinkFollowOperatorSource,
 		ShowProgress:     true,
+		Localizer:        loc,
 	})
 }
 
@@ -253,7 +300,7 @@ func readAndFilterAuditLog(
 		return cli.AuditQueryResult{}, nil
 	}
 	if readErr != nil {
-		return cli.AuditQueryResult{}, fmt.Errorf("read audit log failed: %w", readErr)
+		return cli.AuditQueryResult{}, i18n.Wrap(readErr, i18n.KeyCmdAuditReadFailed)
 	}
 	return filterAuditRecords(raw, req)
 }
@@ -269,7 +316,7 @@ func filterAuditRecords(raw []byte, req cli.AuditQueryRequest) (cli.AuditQueryRe
 		}
 		var entry ports.AuditEntry
 		if err := jsonv2.Unmarshal(trimmed, &entry); err != nil {
-			return cli.AuditQueryResult{}, fmt.Errorf("audit log line %d invalid: %w", lineNo, err)
+			return cli.AuditQueryResult{}, i18n.Wrap(err, i18n.KeyCmdAuditLineInvalid, i18n.Int("line", lineNo))
 		}
 		if matchesAuditFilter(entry, req) {
 			matched = append(matched, auditEntryToView(entry))
@@ -346,14 +393,25 @@ func readOperatorFileHook(
 	var data []byte
 	err := readFS.WithOperatorRead(ctx, srcPath, policy, func(rd ports.BoundedReadHandle, size int64) error {
 		if size > maxBytes {
-			return fmt.Errorf("%w: 文件 %q 大小 %d 字节超过上限 %d 字节", engine.ErrLimitExceeded, srcPath.String(), size, maxBytes)
+			return i18n.EF(
+				engine.ErrLimitExceeded,
+				i18n.KeyCmdFileSizeExceedsLimit,
+				i18n.BoundStr("path", srcPath.String()),
+				i18n.Int64("size", size),
+				i18n.Int64("max", maxBytes),
+			)
 		}
 		buf, rErr := io.ReadAll(io.LimitReader(rd, maxBytes+1))
 		if rErr != nil {
 			return rErr
 		}
 		if int64(len(buf)) > maxBytes {
-			return fmt.Errorf("%w: 文件 %q 超过最大允许大小 %d 字节", engine.ErrLimitExceeded, srcPath.String(), maxBytes)
+			return i18n.EF(
+				engine.ErrLimitExceeded,
+				i18n.KeyCmdFileTooLarge,
+				i18n.BoundStr("path", srcPath.String()),
+				i18n.Int64("max", maxBytes),
+			)
 		}
 		data = buf
 		return nil
@@ -365,7 +423,7 @@ func readOperatorFileHook(
 func resolveWorkDir() (pathalg.LocalDir, error) {
 	abs, err := filepath.Abs(".")
 	if err != nil {
-		return zeroVal[pathalg.LocalDir](), fmt.Errorf("resolve working directory failed: %w", err)
+		return zeroVal[pathalg.LocalDir](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "working directory"))
 	}
 	return pathalg.ParseLocalDir(abs)
 }

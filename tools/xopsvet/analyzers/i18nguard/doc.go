@@ -17,6 +17,7 @@
 //   - 规则 3（禁止生产源码硬编码 CJK 与全角中文标点）：检查生产文件 STRING/CHAR 字面量（含转义解码后），
 //     拦截任何 unicode.Han 字符以及 U+3000..U+303F、U+FF00..U+FFEF 全角标点。
 //
-// 分阶段合闸策略：M1 阶段规则 1 全仓生效，规则 2/3 通过独立函数 isRules23Enforced 限定作用于
-// core/domain/i18n 与 internal/i18n；M2 扩展至入口与交互层；M3 全仓迁移完成后移除阶段过滤并全面合闸。
+// 分阶段合闸策略：M1 阶段规则 1 全仓生效，规则 2/3 仅作用于 core/domain/i18n 与 internal/i18n；
+// M2 阶段（当前）通过 isRules23Enforced 将规则 2/3 扩展至 internal/entry/**、cmd/xops 与
+// internal/host/sys/interact；M3 全仓迁移完成后移除阶段过滤并对全仓生产源码全面合闸。
 package i18nguard

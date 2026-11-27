@@ -380,6 +380,7 @@ func newIsolatedOwnerOnlyEnv(t *testing.T) isolatedTestEnv {
 		"USERPROFILE":  nativeHome,
 		"XOPS_HOME":    nativeXops,
 		"XOPS_E2E_ENV": "hello-v2",
+		"XOPS_LANG":    "en",
 	})
 	return isolatedTestEnv{
 		homeDir:  homeDir,
@@ -436,7 +437,10 @@ func TestE2E_CompiledBinaryVersionAndFallback(t *testing.T) {
 	ldflags := "-X 'main.buildVersion=v2.5.0-e2e' -X 'main.buildCommit=deadbeef' -X 'main.buildTime=2026-11-25T10:20:30Z'"
 	binWithLD := buildCompiledXops(t, ldflags)
 	unusedXopsHome := filepath.Join(t.TempDir(), "never-created-xops-home")
-	env := mergeEnv(os.Environ(), map[string]string{"XOPS_HOME": unusedXopsHome})
+	env := mergeEnv(os.Environ(), map[string]string{
+		"XOPS_HOME": unusedXopsHome,
+		"XOPS_LANG": "en",
+	})
 
 	stdout, stderr, code, err := runCompiledXops(binWithLD, env, nil, "version")
 	if err != nil || code != 0 {

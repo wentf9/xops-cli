@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const defaultShutdownGrace = 5 * time.Second
@@ -75,7 +76,7 @@ func (s *shutdownStack) Close(ctx context.Context) error {
 				hook(item.stage)
 			}
 			if err := item.fn(shutCtx); err != nil {
-				errs = append(errs, fmt.Errorf("shutdown %s: %w", item.stage, err))
+				errs = append(errs, i18n.Wrap(err, i18n.KeyCmdShutdownStageFailed, i18n.BoundStr("stage", item.stage)))
 			}
 		}
 		s.closeErr = errors.Join(errs...)

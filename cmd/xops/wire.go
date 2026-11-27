@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/osfs"
@@ -21,21 +21,23 @@ import (
 	"github.com/wentf9/xops-cli/internal/host/sys/interact"
 	"github.com/wentf9/xops-cli/internal/host/sys/sshfp"
 	"github.com/wentf9/xops-cli/internal/host/sys/tun"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const engineRollbackTimeout = 5 * time.Second
 
 type wiredRuntime struct {
-	engine     *engine.Engine
-	engineCfg  engine.Config
-	env        ports.EnvPort
-	scopedFS   ports.ScopedRootFS
-	readFS     ports.OperatorReadFS
-	stateDir   pathalg.LocalDir
-	auditRoot  pathalg.LocalDir
-	auditFile  algebraic.Option[pathalg.LocalRootedDest]
-	shutdown   *shutdownStack
-	reconciled bool
+	engine      *engine.Engine
+	engineCfg   engine.Config
+	env         ports.EnvPort
+	scopedFS    ports.ScopedRootFS
+	readFS      ports.OperatorReadFS
+	interaction *interact.Interaction
+	stateDir    pathalg.LocalDir
+	auditRoot   pathalg.LocalDir
+	auditFile   algebraic.Option[pathalg.LocalRootedDest]
+	shutdown    *shutdownStack
+	reconciled  bool
 }
 
 func (r *wiredRuntime) Close(ctx context.Context) error {
@@ -53,7 +55,7 @@ type hostAdapters struct {
 	env          ports.EnvPort
 	proc         ports.ProcessPort
 	term         ports.TerminalPort
-	interaction  ports.InteractionPort
+	interaction  *interact.Interaction
 	sshAgent     ports.SSHAgentPort
 	tunDevice    ports.TUNDevicePort
 	sshfpLookup  ports.SSHFPLookupPort
@@ -69,9 +71,36 @@ type hostAdapters struct {
 	policyCfg    resolvedPolicyConfig
 }
 
-// wireEngine 供 CLI EngineFactory 按需装配完整 CLI 模式核心引擎，并执行启动期 O(1) 崩溃审计对账。
-func wireEngine(ctx context.Context, opts cli.EngineInitOptions, stdin io.Reader, stdout io.Writer) (cli.EngineHandle, error) {
-	rt, err := wireRuntime(ctx, opts, runtimeModeCLI, stdin, stdout)
+// effectiveLocale 按请求语言 -> 宿主默认语言 -> 英文兜底确定生效界面语种。
+func effectiveLocale(requested, fallback domi18n.Locale) domi18n.Locale {
+	if requested.IsValid() {
+		return requested
+	}
+	if fallback.IsValid() {
+		return fallback
+	}
+	return domi18n.LocaleEn
+}
+
+// resolveLocalizer 基于已加载双语词库与生效语种构造不可变 Localizer；词库未注入时返回 nil（由调用方回退默认英文）。
+func resolveLocalizer(catalog *i18n.Catalog, requested, fallback domi18n.Locale) *i18n.Localizer {
+	if catalog == nil || !catalog.IsValid() {
+		return nil
+	}
+	return catalog.For(effectiveLocale(requested, fallback))
+}
+
+// wireEngine 供 CLI EngineFactory 按需装配完整 CLI 模式核心引擎，同步宿主交互提示语种，并执行启动期 O(1) 崩溃审计对账。
+func wireEngine(
+	ctx context.Context,
+	opts cli.EngineInitOptions,
+	stdin io.Reader,
+	stdout io.Writer,
+	catalog *i18n.Catalog,
+	defaultLocale domi18n.Locale,
+) (cli.EngineHandle, error) {
+	loc := resolveLocalizer(catalog, opts.Locale, defaultLocale)
+	rt, err := wireRuntimeWithLocalizer(ctx, opts, runtimeModeCLI, stdin, stdout, loc)
 	if err != nil {
 		return cli.EngineHandle{}, err
 	}
@@ -81,15 +110,27 @@ func wireEngine(ctx context.Context, opts cli.EngineInitOptions, stdin io.Reader
 	}, nil
 }
 
-// wireRuntime 统一装配全部 Phase 4 真实宿主适配器与核心引擎，按严格启动正序登记逆序停机栈：
+// wireRuntime 统一装配全部真实宿主适配器与核心引擎（使用默认英文交互渲染器），按严格启动正序登记逆序停机栈：
 // Sys/Relay -> Audit -> Store -> Vault -> Engine（停机时自动逆序关闭，含可选 Entry 阶段）。
-// MCP 模式严格保证 engine.Config.OperatorReadFS == nil、Interaction == nil，且将对账交由 MCPServer.Prepare(ctx) 统一执行。
 func wireRuntime(
 	ctx context.Context,
 	opts cli.EngineInitOptions,
 	mode runtimeMode,
 	stdin io.Reader,
 	stdout io.Writer,
+) (*wiredRuntime, error) {
+	return wireRuntimeWithLocalizer(ctx, opts, mode, stdin, stdout, nil)
+}
+
+// wireRuntimeWithLocalizer 统一装配全部真实宿主适配器与核心引擎，并将可选 Localizer 注入宿主交互适配器。
+// MCP 模式严格保证 engine.Config.OperatorReadFS == nil、Interaction == nil，且将对账交由 MCPServer.Prepare(ctx) 统一执行。
+func wireRuntimeWithLocalizer(
+	ctx context.Context,
+	opts cli.EngineInitOptions,
+	mode runtimeMode,
+	stdin io.Reader,
+	stdout io.Writer,
+	loc *i18n.Localizer,
 ) (rt *wiredRuntime, err error) {
 	stack := newShutdownStack(defaultShutdownGrace)
 	defer func() {
@@ -100,7 +141,7 @@ func wireRuntime(
 		}
 	}()
 
-	adapters, err := assembleHostAdapters(ctx, opts, mode, stdin, stdout, stack)
+	adapters, err := assembleHostAdapters(ctx, opts, mode, stdin, stdout, loc, stack)
 	if err != nil {
 		return nil, err
 	}
@@ -115,22 +156,23 @@ func wireRuntime(
 	reconciled := false
 	if mode == runtimeModeCLI {
 		if _, err := eng.ReconcileCrashedAudits(ctx); err != nil {
-			return nil, fmt.Errorf("startup crash audit reconciliation failed: %w", err)
+			return nil, i18n.Wrap(err, i18n.KeyCmdReconcileFailed)
 		}
 		reconciled = true
 	}
 
 	return &wiredRuntime{
-		engine:     eng,
-		engineCfg:  engCfg,
-		env:        adapters.env,
-		scopedFS:   adapters.scopedFS,
-		readFS:     adapters.readFS,
-		stateDir:   adapters.stateDir,
-		auditRoot:  adapters.policyCfg.auditRootDir,
-		auditFile:  adapters.policyCfg.auditFileOpt,
-		shutdown:   stack,
-		reconciled: reconciled,
+		engine:      eng,
+		engineCfg:   engCfg,
+		env:         adapters.env,
+		scopedFS:    adapters.scopedFS,
+		readFS:      adapters.readFS,
+		interaction: adapters.interaction,
+		stateDir:    adapters.stateDir,
+		auditRoot:   adapters.policyCfg.auditRootDir,
+		auditFile:   adapters.policyCfg.auditFileOpt,
+		shutdown:    stack,
+		reconciled:  reconciled,
 	}, nil
 }
 
@@ -140,6 +182,7 @@ func assembleHostAdapters(
 	mode runtimeMode,
 	stdin io.Reader,
 	stdout io.Writer,
+	loc *i18n.Localizer,
 	stack *shutdownStack,
 ) (hostAdapters, error) {
 	var a hostAdapters
@@ -159,7 +202,7 @@ func assembleHostAdapters(
 		return hostAdapters{}, err
 	}
 	// 先校验模式相关入口前置约束（含显式 `-F <configfile>` 存在性校验），避免配置错误时提前触碰 audit 目录。
-	if err = initModeSpecificAdapters(ctx, opts, mode, localID, stdin, stdout, &a); err != nil {
+	if err = initModeSpecificAdapters(ctx, opts, mode, localID, stdin, stdout, loc, &a); err != nil {
 		return hostAdapters{}, err
 	}
 	if err = initStoreAndPolicy(ctx, opts, mode, localID, &a, stack); err != nil {
@@ -181,11 +224,11 @@ func initStoreAndPolicy(
 		ScopedFS: a.scopedFS,
 		RootDir:  a.stateDir,
 	}); err != nil {
-		return fmt.Errorf("initialize inventory store failed: %w", err)
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "inventory store"))
 	}
 	doc, _, err := a.invStore.LoadDocument(ctx)
 	if err != nil {
-		return fmt.Errorf("load config.yaml failed: %w", err)
+		return i18n.Wrap(err, i18n.KeyCmdLoadConfigFailed)
 	}
 	if a.policyCfg, err = resolveDocumentConfig(doc, opts.PolicyProfile, mode, a.stateDir, a.homeDir); err != nil {
 		return err
@@ -194,7 +237,7 @@ func initStoreAndPolicy(
 		ScopedFS: a.scopedFS,
 		RootDir:  a.stateDir,
 	}); err != nil {
-		return fmt.Errorf("initialize WAL journal store failed: %w", err)
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "WAL journal store"))
 	}
 	if a.importers, err = buildFormatImporters(localID); err != nil {
 		return err
@@ -229,6 +272,7 @@ func initModeSpecificAdapters(
 	localID ports.LocalIdentityInfo,
 	stdin io.Reader,
 	stdout io.Writer,
+	loc *i18n.Localizer,
 	a *hostAdapters,
 ) error {
 	if mode == runtimeModeMCP {
@@ -245,16 +289,16 @@ func initModeSpecificAdapters(
 	a.readFS = osfs.NewOperatorReadFS()
 	var err error
 	if a.term, err = buildTerminalAdapter(stdin, stdout); err != nil {
-		return fmt.Errorf("initialize terminal adapter failed: %w", err)
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "terminal adapter"))
 	}
-	if a.interaction, err = buildInteractionAdapter(stdin, stdout); err != nil {
-		return fmt.Errorf("initialize interaction adapter failed: %w", err)
+	if a.interaction, err = buildInteractionAdapter(stdin, stdout, loc); err != nil {
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "interaction adapter"))
 	}
 	if a.sshfpLookup, err = sshfp.NewSystemLookup(sshfp.Spec{
 		OperatorFS: a.readFS,
 		Entropy:    a.entropy,
 	}); err != nil {
-		return fmt.Errorf("initialize sshfp lookup adapter failed: %w", err)
+		return i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "sshfp lookup adapter"))
 	}
 	if a.openSSH, err = buildOpenSSHSource(ctx, opts.OpenSSHConfigFile, a.homeDir, localID, a.scopedFS, a.readFS); err != nil {
 		return err
@@ -288,7 +332,9 @@ func buildEngineConfig(a hostAdapters, mode runtimeMode) engine.Config {
 	if mode == runtimeModeCLI {
 		cfg.OperatorReadFS = a.readFS
 		cfg.Terminal = a.term
-		cfg.Interaction = a.interaction
+		if a.interaction != nil {
+			cfg.Interaction = a.interaction
+		}
 		cfg.SSHFPLookup = a.sshfpLookup
 	}
 	return cfg
@@ -299,11 +345,11 @@ func buildFormatImporters(localID ports.LocalIdentityInfo) ([]ports.FormatImport
 		LocalIdentity: algebraic.Some(localID),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("initialize openssh importer failed: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "openssh importer"))
 	}
 	csvImp, err := store.NewCSVImporter(store.CSVImporterSpec{})
 	if err != nil {
-		return nil, fmt.Errorf("initialize csv importer failed: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "csv importer"))
 	}
 	return []ports.FormatImporter{openSSHImp, csvImp}, nil
 }
@@ -324,18 +370,25 @@ func buildTerminalAdapter(stdin io.Reader, stdout io.Writer) (ports.TerminalPort
 	})
 }
 
-// buildInteractionAdapter 按注入流类型构造交互确认与口令输入适配器：
+// buildInteractionAdapter 按注入流类型构造交互确认与口令输入适配器，并绑定初始本地化渲染器：
 //   - 当直接绑定进程 os.Stdin/os.Stdout 时使用 NewTTYInteraction（支持 Unix /dev/tty 回退）；
 //   - 当为显式 *os.File 时使用 NewFileInteraction（不回退 /dev/tty）；
 //   - 当为内存流或测试缓冲时使用非交互 NewStreamInteraction（避免测试误触发真实控制终端）。
-func buildInteractionAdapter(stdin io.Reader, stdout io.Writer) (ports.InteractionPort, error) {
+func buildInteractionAdapter(stdin io.Reader, stdout io.Writer, loc *i18n.Localizer) (*interact.Interaction, error) {
 	inFile, inOK := stdin.(*os.File)
 	outFile, outOK := stdout.(*os.File)
 	if inOK && outOK && inFile != nil && outFile != nil {
 		if inFile == os.Stdin && outFile == os.Stdout {
-			return interact.NewTTYInteraction(), nil
+			ui := interact.NewTTYInteraction()
+			ui.SetLocalizer(loc)
+			return ui, nil
 		}
-		return interact.NewFileInteraction(inFile, outFile)
+		ui, err := interact.NewFileInteraction(inFile, outFile)
+		if err != nil {
+			return nil, err
+		}
+		ui.SetLocalizer(loc)
+		return ui, nil
 	}
 	in := stdin
 	if in == nil {
@@ -349,6 +402,7 @@ func buildInteractionAdapter(stdin io.Reader, stdout io.Writer) (ports.Interacti
 		In:          in,
 		Out:         out,
 		Interactive: false,
+		Localizer:   loc,
 	})
 }
 
@@ -360,7 +414,7 @@ func buildAuditAdapters(
 ) (*audit.FileSink, *audit.FileReconciler, error) {
 	procID, err := ports.NewProcessInstanceIDFrom(entropy)
 	if err != nil {
-		return nil, nil, fmt.Errorf("generate process instance id failed: %w", err)
+		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "process instance id"))
 	}
 	sink, err := audit.NewFileSink(audit.SinkSpec{
 		ScopedFS:  scopedFS,
@@ -369,7 +423,7 @@ func buildAuditAdapters(
 		AuditFile: auditFile,
 	})
 	if err != nil {
-		return nil, nil, fmt.Errorf("initialize audit sink failed: %w", err)
+		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "audit sink"))
 	}
 	reconciler, err := audit.NewFileReconciler(audit.ReconcilerSpec{
 		ScopedFS:  scopedFS,
@@ -378,7 +432,7 @@ func buildAuditAdapters(
 	})
 	if err != nil {
 		_ = sink.Close()
-		return nil, nil, fmt.Errorf("initialize audit reconciler failed: %w", err)
+		return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "audit reconciler"))
 	}
 	return sink, reconciler, nil
 }

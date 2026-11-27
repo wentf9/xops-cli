@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/host/openssh"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -56,7 +56,7 @@ func zeroVal[T any]() (z T) { return z }
 
 func (e *homeAwareEnv) LookupLocalIdentity() (ports.LocalIdentityInfo, error) {
 	if e == nil || !e.valid {
-		return zeroVal[ports.LocalIdentityInfo](), fmt.Errorf("%w: homeAwareEnv 未初始化", ports.ErrInvalidArgument)
+		return zeroVal[ports.LocalIdentityInfo](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyCmdEnvNotInitialized)
 	}
 	id, err := e.base.LookupLocalIdentity()
 	if err != nil {
@@ -77,22 +77,22 @@ func (e *homeAwareEnv) LookupLocalIdentity() (ports.LocalIdentityInfo, error) {
 func resolveHostDirs(env ports.EnvPort) (homeDir, stateDir pathalg.LocalDir, localID ports.LocalIdentityInfo, err error) {
 	localID, err = env.LookupLocalIdentity()
 	if err != nil {
-		return homeDir, stateDir, localID, fmt.Errorf("resolve local identity failed: %w", err)
+		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "local identity"))
 	}
 	homeDir, err = pathalg.ParseLocalDir(localID.HomeDir())
 	if err != nil {
-		return homeDir, stateDir, localID, fmt.Errorf("invalid home directory %q: %w", localID.HomeDir(), err)
+		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "home directory"), i18n.BoundStr("path", localID.HomeDir()))
 	}
 	if rawHome, ok := env.LookupEnv(xopsHomeEnvKey); ok && strings.TrimSpace(rawHome) != "" {
 		stateDir, err = pathalg.ParseLocalDir(strings.TrimSpace(rawHome))
 		if err != nil {
-			return homeDir, stateDir, localID, fmt.Errorf("invalid %s %q: %w", xopsHomeEnvKey, rawHome, err)
+			return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", xopsHomeEnvKey), i18n.BoundStr("path", rawHome))
 		}
 		return homeDir, stateDir, localID, nil
 	}
 	stateDir, err = homeDir.JoinComponent(defaultStateDirName)
 	if err != nil {
-		return homeDir, stateDir, localID, fmt.Errorf("resolve default state directory failed: %w", err)
+		return homeDir, stateDir, localID, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default state directory"))
 	}
 	return homeDir, stateDir, localID, nil
 }
@@ -119,7 +119,7 @@ func buildOpenSSHSource(
 		if err := readFS.WithOperatorRead(ctx, cfgPath, pathalg.SymlinkFollowOperatorSource, func(ports.BoundedReadHandle, int64) error {
 			return nil
 		}); err != nil {
-			return nil, fmt.Errorf("cannot read OpenSSH config file %q: %w", overridePath, err)
+			return nil, i18n.Wrap(err, i18n.KeyCmdOpenSSHConfigUnreadable, i18n.BoundStr("path", overridePath))
 		}
 	}
 	return openssh.NewConfigSource(openssh.SourceSpec{
@@ -136,18 +136,18 @@ func resolveOpenSSHConfigPath(override string, homeDir pathalg.LocalDir) (pathal
 	if override == "" {
 		sshDir, err := homeDir.JoinComponent(defaultSSHDirName)
 		if err != nil {
-			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("resolve default .ssh directory failed: %w", err)
+			return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default .ssh directory"))
 		}
 		joined, err := sshDir.JoinComponent(defaultSSHConfigName)
 		if err != nil {
-			return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("resolve default ssh config path failed: %w", err)
+			return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default ssh config"))
 		}
 		return pathalg.ParseLocalSourcePath(joined.String())
 	}
 	expanded := expandTildePrefix(override, homeDir)
 	p, err := pathalg.ParseLocalSourcePath(expanded)
 	if err != nil {
-		return zeroVal[pathalg.LocalSourcePath](), fmt.Errorf("invalid OpenSSH config file %q: %w", override, err)
+		return zeroVal[pathalg.LocalSourcePath](), i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.Str("target", "OpenSSH config"), i18n.BoundStr("path", override))
 	}
 	return p, nil
 }

@@ -5,10 +5,11 @@
 //   - 构建元信息仅通过满足 noimplicit 六重门控的只读 //xops:buildvar 变量接收链接期
 //     -X 'main.buildVersion/buildCommit/buildTime' 注入（未注入时回退 runtime/debug.ReadBuildInfo()），
 //     并转换为显式值结构体 cli.BuildInfo 注入 internal/entry/cli；
-//   - 按需装配全部真实宿主出站适配器（ScopedRootFS、OperatorReadFS、YAMLInventoryStore、WALJournalStore、
-//     OpenSSH/CSV FormatImporter、OpenSSH ConfigSource、多后端 RouterVault、SystemClock/CryptoEntropy/
-//     homeAwareEnv/SystemProcess/Terminal/Interaction/SSHAgent/TUNDevice/SSHFPLookup、Audit FileSink + FileReconciler），
-//     绝不在 `xops version` 或 `--help` 路径下初始化 Engine 或触碰 `~/.xops`；
+//   - 启动期仅经纯内存 embed.FS 加载只读双语词库（i18n.LoadCatalog）并零触盘零 exec 探测默认语言
+//     （sys.DetectLocale），按需装配全部真实宿主出站适配器（ScopedRootFS、OperatorReadFS、YAMLInventoryStore、
+//     WALJournalStore、OpenSSH/CSV FormatImporter、OpenSSH ConfigSource、多后端 RouterVault、SystemClock/
+//     CryptoEntropy/homeAwareEnv/SystemProcess/Terminal/Interaction/SSHAgent/TUNDevice/SSHFPLookup、
+//     Audit FileSink + FileReconciler），绝不在 `xops version` 或 `--help` 路径下初始化 Engine 或触碰 `~/.xops`；
 //   - MCP 模式物理隔离：严禁向 Engine 注入 OperatorReadFS 或本地交互终端，仅暴露 ScopedRootFS 并运行 MCPServer.Prepare(ctx)；
 //   - 退出期严格遵循 Entry -> Engine/UseCases -> Pool -> Vault -> Store -> Audit -> Sys/Relay 逆序停机。
 package main
@@ -21,6 +22,8 @@ import (
 	"os/signal"
 
 	"github.com/wentf9/xops-cli/internal/entry/cli"
+	"github.com/wentf9/xops-cli/internal/host/sys"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func main() {
@@ -34,14 +37,29 @@ func runProcess(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 }
 
 func runProcessWithContext(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	// 纯内存加载内置 embed.FS 双语词库并探测宿主默认语言，零触盘、零 os/exec。
+	catalog, err := i18n.LoadCatalog()
+	if err != nil {
+		if stderr != nil {
+			_, _ = fmt.Fprintf(stderr, "xops: %v\n", err)
+		}
+		return 1
+	}
+	defaultLocale := sys.DetectLocale(sys.NewSystemEnv())
 	buildInfo := currentBuildInfo()
 	app, err := cli.NewApp(cli.AppConfig{
-		BuildInfo: buildInfo,
+		BuildInfo:     buildInfo,
+		Catalog:       catalog,
+		DefaultLocale: defaultLocale,
 		EngineFactory: func(callCtx context.Context, opts cli.EngineInitOptions) (cli.EngineHandle, error) {
-			return wireEngine(callCtx, opts, stdin, stdout)
+			return wireEngine(callCtx, opts, stdin, stdout, catalog, defaultLocale)
 		},
-		RunTUI:       runTUISubEntry,
-		RunSFTPShell: runSFTPShellSubEntry,
+		RunTUI: func(callCtx context.Context, req cli.TUIStartRequest) error {
+			return runTUISubEntry(callCtx, req, catalog, defaultLocale)
+		},
+		RunSFTPShell: func(callCtx context.Context, req cli.SFTPShellStartRequest) error {
+			return runSFTPShellSubEntry(callCtx, req, catalog, defaultLocale)
+		},
 		RunMCP: func(callCtx context.Context, req cli.MCPStartRequest) error {
 			return runMCPSubEntry(callCtx, req, buildInfo)
 		},
@@ -54,7 +72,9 @@ func runProcessWithContext(ctx context.Context, args []string, stdin io.Reader, 
 		Stderr:           stderr,
 	})
 	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "xops: %v\n", err)
+		if stderr != nil {
+			_, _ = fmt.Fprintf(stderr, "xops: %s\n", catalog.For(defaultLocale).RenderError(err))
+		}
 		return 1
 	}
 	return app.Run(ctx, args)

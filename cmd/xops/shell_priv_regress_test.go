@@ -630,7 +630,7 @@ func runCLIWithInjectedVaultAndInteraction(
 		BuildInfo: currentBuildInfo(),
 		EngineFactory: func(callCtx context.Context, opts cli.EngineInitOptions) (cli.EngineHandle, error) {
 			stack := newShutdownStack(defaultShutdownGrace)
-			adapters, aErr := assembleHostAdapters(callCtx, opts, runtimeModeCLI, strings.NewReader(""), io.Discard, stack)
+			adapters, aErr := assembleHostAdapters(callCtx, opts, runtimeModeCLI, strings.NewReader(""), io.Discard, nil, stack)
 			if aErr != nil {
 				_ = stack.Close(context.Background())
 				return cli.EngineHandle{}, aErr

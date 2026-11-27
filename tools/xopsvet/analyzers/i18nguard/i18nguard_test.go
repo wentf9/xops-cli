@@ -7,7 +7,7 @@ import (
 	"golang.org/x/tools/go/analysis/analysistest"
 )
 
-func TestI18nGuardM1StagedScope(t *testing.T) {
+func TestI18nGuardM2StagedScope(t *testing.T) {
 	testdata := analysistest.TestData()
 	analysistest.Run(
 		t,
@@ -15,6 +15,10 @@ func TestI18nGuardM1StagedScope(t *testing.T) {
 		i18nguard.NewAnalyzer(),
 		"github.com/wentf9/xops-cli/core/domain/i18n",
 		"github.com/wentf9/xops-cli/internal/i18n",
+		"github.com/wentf9/xops-cli/internal/entry/cli",
+		"github.com/wentf9/xops-cli/cmd/xops",
+		"github.com/wentf9/xops-cli/internal/host/sys/interact",
+		"github.com/wentf9/xops-cli/internal/host/sys",
 		"github.com/wentf9/xops-cli/core/engine",
 		"github.com/wentf9/xops-cli/core/ports/tck",
 		"github.com/wentf9/xops-cli/core/internal/sim",

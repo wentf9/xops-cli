@@ -51,6 +51,7 @@ func setupIsolatedRootEnv(t *testing.T) (homeDir, xopsHome pathalg.LocalDir) {
 	t.Setenv("HOME", hRaw)
 	t.Setenv("USERPROFILE", hRaw)
 	t.Setenv("XOPS_HOME", xRaw)
+	t.Setenv("XOPS_LANG", "en")
 	return homeDir, xopsHome
 }
 

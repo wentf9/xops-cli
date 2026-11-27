@@ -9,11 +9,12 @@ import (
 )
 
 const (
-	coreDomainI18nPkgPath = vetutil.ModulePrefix + "/core/domain/i18n"
-	internalI18nPkgPath   = vetutil.ModulePrefix + "/internal/i18n"
+	coreDomainI18nPkgPath  = vetutil.ModulePrefix + "/core/domain/i18n"
+	internalI18nPkgPath    = vetutil.ModulePrefix + "/internal/i18n"
+	hostSysInteractPkgPath = vetutil.ModulePrefix + "/internal/host/sys/interact"
 )
 
-// NewAnalyzer 创建并返回 i18nguard 国际化静态护栏分析器实例（M1 阶段分阶段作用域）。
+// NewAnalyzer 创建并返回 i18nguard 国际化静态护栏分析器实例（M2 阶段分阶段作用域）。
 func NewAnalyzer() *analysis.Analyzer {
 	return newAnalyzer(false)
 }
@@ -40,7 +41,7 @@ func run(pass *analysis.Pass, enforceAllRules23 bool) (any, error) {
 	}
 	// 规则 1：M1 起在全仓所有生产包立即生效。
 	checkMessageIDIntegrity(pass, pkgInfo)
-	// 规则 2 与规则 3：M1 阶段按 isRules23Enforced 分阶段合闸。
+	// 规则 2 与规则 3：M2 阶段按 isRules23Enforced 分阶段合闸。
 	if enforceAllRules23 || isRules23Enforced(pkgInfo) {
 		checkRawErrorConstructions(pass, pkgInfo)
 		checkCJKLiterals(pass)
@@ -58,15 +59,27 @@ func isAlwaysSkippedPkg(pkgInfo vetutil.PkgInfo) bool {
 
 // isRules23Enforced 隔离 M1/M2 分阶段合闸范围：
 //   - M1：仅对 core/domain/i18n 与 internal/i18n 强制规则 2/3；
-//   - M2：扩展至 internal/entry/**、cmd/xops 与 internal/host/sys/interact；
+//   - M2（当前）：扩展至 internal/entry/**、cmd/xops 与 internal/host/sys/interact（含子包）；
 //   - M3：全仓迁移收尾后删除本函数并对全仓生产源码无条件合闸。
 func isRules23Enforced(pkgInfo vetutil.PkgInfo) bool {
-	return pkgInfo.Layer == vetutil.LayerInternalI18n || isCoreDomainI18nPkg(pkgInfo)
+	if pkgInfo.IsExternalTest {
+		return false
+	}
+	return pkgInfo.Layer == vetutil.LayerInternalI18n ||
+		isCoreDomainI18nPkg(pkgInfo) ||
+		pkgInfo.Layer == vetutil.LayerEntry ||
+		pkgInfo.Layer == vetutil.LayerCmdXops ||
+		isHostSysInteractPkg(pkgInfo)
 }
 
 func isCoreDomainI18nPkg(pkgInfo vetutil.PkgInfo) bool {
 	return !pkgInfo.IsExternalTest && pkgInfo.Layer == vetutil.LayerCoreDomain &&
 		matchPkgPrefix(pkgInfo.BasePath, coreDomainI18nPkgPath)
+}
+
+func isHostSysInteractPkg(pkgInfo vetutil.PkgInfo) bool {
+	return !pkgInfo.IsExternalTest && pkgInfo.Layer == vetutil.LayerHostSys &&
+		matchPkgPrefix(pkgInfo.BasePath, hostSysInteractPkgPath)
 }
 
 func isMessageIDOwnerPkg(pkgPath string) bool {

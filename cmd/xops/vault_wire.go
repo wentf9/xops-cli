@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"maps"
 	"slices"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/wentf9/xops-cli/internal/host/vault"
 	"github.com/wentf9/xops-cli/internal/host/vault/helper"
 	"github.com/wentf9/xops-cli/internal/host/vault/offline"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -113,7 +113,7 @@ func buildVaultAdapters(
 func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps vaultWireDeps) (wiredVault, error) {
 	vaultDir, err := deps.stateDir.JoinComponent(defaultVaultDirName)
 	if err != nil {
-		return wiredVault{}, fmt.Errorf("resolve default vault directory failed: %w", err)
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdResolveDirFailed, i18n.Str("target", "default vault directory"))
 	}
 	offVault, err := offline.NewVault(offline.Spec{
 		ScopedFS:   deps.scopedFS,
@@ -122,12 +122,12 @@ func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps
 		StoreNames: []string{defaultOfflineStoreName},
 	})
 	if err != nil {
-		return wiredVault{}, fmt.Errorf("initialize default offline vault failed: %w", err)
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "default offline vault"))
 	}
 	osKeychain, err := createOSKeychainVault(deps)
 	if err != nil {
 		_ = offVault.Lock(context.Background())
-		return wiredVault{}, fmt.Errorf("initialize platform os_keychain vault failed: %w", err)
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "platform os_keychain vault"))
 	}
 	stores := map[string]ports.SecretVault{
 		defaultOfflineStoreName:    offVault,
@@ -138,7 +138,7 @@ func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps
 		selected, ok := stores[defaultName]
 		if !ok {
 			closeBuiltVaults(stores)
-			return wiredVault{}, fmt.Errorf("vault.default_store %q is not a known default store", defaultName)
+			return wiredVault{}, i18n.E(i18n.KeyCmdVaultUnknownDefault, i18n.BoundStr("store", defaultName))
 		}
 		defaultBackend = selected
 	}
@@ -148,7 +148,7 @@ func buildDefaultVaultAdapters(defaultName string, invKnownStores []string, deps
 	})
 	if err != nil {
 		closeBuiltVaults(stores)
-		return wiredVault{}, fmt.Errorf("initialize router vault failed: %w", err)
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "router vault"))
 	}
 	return wiredVault{
 		router:      router,
@@ -183,7 +183,7 @@ func buildConfiguredVaultAdapters(
 	})
 	if err != nil {
 		closeBuiltVaults(stores)
-		return wiredVault{}, fmt.Errorf("initialize configured router vault failed: %w", err)
+		return wiredVault{}, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.Str("component", "configured router vault"))
 	}
 	return wiredVault{
 		router:      router,
@@ -201,7 +201,7 @@ func instantiateVaultStore(
 	case "offline_aead":
 		dir, err := resolveVaultDir(dto.Path, deps.stateDir, deps.homeDir)
 		if err != nil {
-			return nil, nil, fmt.Errorf("vault store %q path invalid: %w", name, err)
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInvalidDirPath, i18n.BoundStr("target", "vault store "+name), i18n.BoundStr("path", dto.Path))
 		}
 		v, err := offline.NewVault(offline.Spec{
 			ScopedFS:   deps.scopedFS,
@@ -210,13 +210,13 @@ func instantiateVaultStore(
 			StoreNames: []string{name},
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("initialize offline_aead vault %q failed: %w", name, err)
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.BoundStr("component", "offline_aead vault "+name))
 		}
 		return v, v, nil
 	case "os_keychain":
 		v, err := createOSKeychainVault(deps)
 		if err != nil {
-			return nil, nil, fmt.Errorf("initialize os_keychain vault %q failed: %w", name, err)
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.BoundStr("component", "os_keychain vault "+name))
 		}
 		return v, nil, nil
 	case "external_helper":
@@ -231,13 +231,13 @@ func instantiateVaultStore(
 			Timeout: timeoutOpt,
 		})
 		if err != nil {
-			return nil, nil, fmt.Errorf("initialize external_helper vault %q failed: %w", name, err)
+			return nil, nil, i18n.Wrap(err, i18n.KeyCmdInitComponentFailed, i18n.BoundStr("component", "external_helper vault "+name))
 		}
 		return v, nil, nil
 	case "none":
 		return disabledVault{}, nil, nil
 	default:
-		return nil, nil, fmt.Errorf("unsupported vault store %q kind %q", name, dto.Kind)
+		return nil, nil, i18n.E(i18n.KeyCmdVaultUnsupportedKind, i18n.BoundStr("name", name), i18n.BoundStr("kind", dto.Kind))
 	}
 }
 
