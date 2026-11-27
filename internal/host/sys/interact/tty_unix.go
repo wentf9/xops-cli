@@ -5,11 +5,11 @@ package interact
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"runtime"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/unix"
 )
 
@@ -77,13 +77,13 @@ func readPromptFromUnixFDs(ctx context.Context, inFD, outFD int, prompt string, 
 func disableEchoUnixFD(fd int) (func() error, error) {
 	orig, err := unix.IoctlGetTermios(fd, ioctlReadTermios)
 	if err != nil {
-		return nil, fmt.Errorf("读取 Unix 终端 termios 失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyInteractUnixReadTermios)
 	}
 	saved := *orig
 	muted := *orig
 	muted.Lflag &^= unix.ECHO
 	if err := unix.IoctlSetTermios(fd, ioctlWriteTermios, &muted); err != nil {
-		return nil, fmt.Errorf("禁用 Unix 终端回显失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyInteractUnixDisableEcho)
 	}
 	return func() error {
 		return unix.IoctlSetTermios(fd, ioctlWriteTermios, &saved)
@@ -93,7 +93,7 @@ func disableEchoUnixFD(fd int) (func() error, error) {
 func readCancelableLineUnixFD(ctx context.Context, inFD int) ([]byte, error) {
 	wakeR, wakeW, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("创建终端唤醒管道失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyInteractUnixWakePipe)
 	}
 	defer func() {
 		_ = wakeW.Close()
@@ -130,7 +130,7 @@ func readCancelableLineUnixFD(ctx context.Context, inFD int) ([]byte, error) {
 		if len(out) >= maxPromptLineBytes {
 			clear(out)
 			drainUnixFDToNewline(ctx, inFD, fds, wakeR)
-			return nil, fmt.Errorf("%w: 输入行长度超过上限 %d 字节", ports.ErrLimitExceeded, maxPromptLineBytes)
+			return nil, i18n.EF(ports.ErrLimitExceeded, i18n.KeyInteractLineTooLong, i18n.Int("max", maxPromptLineBytes))
 		}
 		out = append(out, one[0])
 	}

@@ -5,7 +5,6 @@ package interact
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/windows"
 )
 
@@ -59,12 +59,12 @@ func disableEchoWindowsConsole(in *os.File) (func() error, error) {
 	var orig uint32
 	if err := windows.GetConsoleMode(inH, &orig); err != nil {
 		runtime.KeepAlive(in)
-		return nil, fmt.Errorf("读取 Windows 控制台输入模式失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyInteractWinReadConsole)
 	}
 	muted := orig &^ windows.ENABLE_ECHO_INPUT
 	if err := windows.SetConsoleMode(inH, muted); err != nil {
 		runtime.KeepAlive(in)
-		return nil, fmt.Errorf("禁用 Windows 控制台回显失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyInteractWinDisableEcho)
 	}
 	runtime.KeepAlive(in)
 	return func() error {
@@ -79,7 +79,7 @@ func disableEchoWindowsConsole(in *os.File) (func() error, error) {
 func readCancelableLineWindows(ctx context.Context, in *os.File) ([]byte, error) {
 	stopEv, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
-		return nil, fmt.Errorf("创建 Windows 取消事件失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyInteractWinCancelEvent)
 	}
 	inH := windows.Handle(in.Fd())
 	var canceled, reading atomic.Bool
@@ -122,7 +122,7 @@ func scanWindowsConsoleLine(ctx context.Context, inH, stopEv windows.Handle, can
 		if len(out) >= maxPromptLineBytes {
 			clear(out)
 			drainWindowsConsoleToNewline(ctx, inH, stopEv, canceled, reading)
-			return nil, fmt.Errorf("%w: 输入行长度超过上限 %d 字节", ports.ErrLimitExceeded, maxPromptLineBytes)
+			return nil, i18n.EF(ports.ErrLimitExceeded, i18n.KeyInteractLineTooLong, i18n.Int("max", maxPromptLineBytes))
 		}
 		out = append(out, one[0])
 	}
