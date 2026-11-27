@@ -3,8 +3,8 @@ package i18n
 import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // 本文件声明本地人工交互适配器（internal/host/sys/interact）与 CLI 凭据库 6 处交互提示的强类型 MessageID 常量。
-// 交互适配器错误与 6 处 CLI 凭据库结构化提示键登记于 interactErrorAndPromptKeys（确保 Message.Canonical() 规范英文兜底）；
-// 风险等级与审批外框纯展示标签仅登记于 interactDisplayKeys（确认词 [y/N]: 与 [approve/N]: 保持稳定 ASCII）。
+// 交互适配器错误与 6 处 CLI 凭据库结构化提示键在 internal/rootcatalog 登记规范英文兜底（确保 Message.Canonical() 稳定）；
+// 风险等级与审批外框纯展示标签仅登记于 rootcatalog.AllKeys()（确认词 [y/N]: 与 [approve/N]: 保持稳定 ASCII）。
 const (
 	// 交互适配器错误键（internal/host/sys/interact）。
 	KeyInteractNilFileHandles   domi18n.MessageID = "interact.err.nil_file_handles"   // 输入或输出文件句柄为 nil
@@ -43,24 +43,3 @@ const (
 	KeyInteractApprovalBanner      domi18n.MessageID = "interact.approval.banner"       // 审批横幅前缀标签
 	KeyInteractApprovalDigestLabel domi18n.MessageID = "interact.approval.digest_label" // 审批信封摘要字段标签
 )
-
-func interactErrorAndPromptKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyInteractNilFileHandles, KeyInteractNilStreamHandles, KeyInteractInvalidRequest,
-		KeyInteractEmptyText, KeyInteractEmptySecret, KeyInteractLineTooLong,
-		KeyInteractUnixReadTermios, KeyInteractUnixDisableEcho, KeyInteractUnixWakePipe,
-		KeyInteractWinReadConsole, KeyInteractWinDisableEcho, KeyInteractWinCancelEvent,
-		KeyInteractVaultInitTitle, KeyInteractVaultUnlockTitle, KeyInteractVaultMasterPrompt,
-		KeyInteractVaultConfirmTitle, KeyInteractVaultConfirmPrompt, KeyInteractVaultEnrollPassTitle,
-		KeyInteractVaultEnrollPassPrompt, KeyInteractVaultNodePrivTitle, KeyInteractVaultNodePrivPrompt,
-		KeyInteractVaultRotateTitle, KeyInteractVaultRotatePrompt, KeyInteractVaultEnrollKeyTitle,
-		KeyInteractVaultEnrollKeyPrompt,
-	}
-}
-
-func interactDisplayKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyInteractRiskUnknown, KeyInteractRiskSafe, KeyInteractRiskModerate, KeyInteractRiskDangerous,
-		KeyInteractApprovalBanner, KeyInteractApprovalDigestLabel,
-	}
-}

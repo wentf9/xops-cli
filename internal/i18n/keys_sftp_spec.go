@@ -6,7 +6,7 @@ import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 // （internal/entry/mcpcmd、internal/entry/muxdaemon）的强类型 MessageID 常量。
 // 守护进程机器英文就绪行（xops-mcp: ready / mux daemon ready）保持稳定契约不本地化。
 const (
-	// SFTP Shell 5 个哨兵、配置与语法错误键（登记于 sftpAndDaemonErrorKeys + fallback_sftp_spec.go）。
+	// SFTP Shell 5 个哨兵、配置与语法错误键（规范英文兜底登记于 internal/rootcatalog）。
 	KeySFTPNilContext               domi18n.MessageID = "sftpshell.err.nil_context"                // 上下文为 nil（哨兵）
 	KeySFTPInvalidConfig            domi18n.MessageID = "sftpshell.err.invalid_config"             // SFTP Shell 配置无效（哨兵）
 	KeySFTPNotInitialized           domi18n.MessageID = "sftpshell.err.not_initialized"            // Shell 未初始化（哨兵）
@@ -103,36 +103,3 @@ const (
 	KeyMuxDaemonStopForwardFailed       domi18n.MessageID = "muxdaemon.err.stop_forward_failed"       // 停机关闭转发句柄失败
 	KeyMuxDaemonStopMasterFailed        domi18n.MessageID = "muxdaemon.err.stop_master_failed"        // 停机关闭 ControlMaster 失败
 )
-
-func sftpAndDaemonErrorKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeySFTPNilContext, KeySFTPInvalidConfig, KeySFTPNotInitialized, KeySFTPCommandCanceled, KeySFTPSyntax,
-		KeySFTPConfigNilEngine, KeySFTPConfigNilStdStreams, KeySFTPConfigTargetXOR, KeySFTPConfigTargetConflict,
-		KeySFTPConfigInvalidField, KeySFTPConfigScopedSymlink, KeySFTPConfigTimeoutPositive, KeySFTPConfigStreamBufNeg,
-		KeySFTPConfigDefaultLocalDir, KeySFTPInitialRemoteNotDir, KeySFTPUnclosedQuote, KeySFTPEmptyRemotePath,
-		KeySFTPEmptyLocalPath, KeySFTPDisallowedLocalPrefix, KeySFTPDisallowedDriveRel, KeySFTPDisallowedPOSIXBackslash,
-		KeySFTPLocalRelEscape, KeySFTPScopedAbsForbidden, KeySFTPScopedEscape, KeySFTPInvalidLocalComponent,
-		KeySFTPScopedUploadRoot, KeySFTPInvalidDownloadDest, KeySFTPCannotInferLocalName, KeySFTPEmptyPerm,
-		KeySFTPInvalidPerm, KeySFTPEmptyTimestamp, KeySFTPInvalidTimestamp, KeySFTPTimestampOutOfRange,
-		KeySFTPLineTooLong, KeySFTPUnknownCommand, KeySFTPNoArgsAllowed, KeySFTPUsage, KeySFTPRemoteNotDir,
-		KeySFTPLocalNotDir, KeySFTPLocalFSUnavailable, KeySFTPUnknownOption, KeySFTPListTooManyPaths,
-		KeySFTPUnknownHelpTopic, KeySFTPMkdirMissingMode,
-		KeyMCPNilContext, KeyMCPInvalidConfig, KeyMCPInvalidTransport, KeyMCPInvalidTransportValue,
-		KeyMCPCreateServerFailed, KeyMCPNilServer, KeyMCPPrepareFailed, KeyMCPNoEngineOrFactory,
-		KeyMCPShutdownTimeoutPositive, KeyMCPStdioNilStreams, KeyMCPStdioForbidsListener, KeyMCPHTTPMissingEndpoint,
-		KeyMuxDaemonNilContext, KeyMuxDaemonInvalidConfig, KeyMuxDaemonNilClient, KeyMuxDaemonNilBackend,
-		KeyMuxDaemonMissingTarget, KeyMuxDaemonInvalidForward, KeyMuxDaemonShutdownTimeoutPositive,
-		KeyMuxDaemonInvalidSocketPath, KeyMuxDaemonInvalidControlPath, KeyMuxDaemonInvalidCLIOpts,
-		KeyMuxDaemonNilDoneChan, KeyMuxDaemonStopForwardFailed, KeyMuxDaemonStopMasterFailed,
-	}
-}
-
-func sftpDisplayKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeySFTPMsgCanceled, KeySFTPMsgTimeout, KeySFTPMsgRemoteIsDirHint, KeySFTPMsgOutcomeUnknown,
-		KeySFTPMsgApprovalRequired, KeySFTPOutputStat, KeySFTPOutputUploaded, KeySFTPOutputDownloaded,
-		KeySFTPOutputWrote, KeySFTPOutputProgress, KeySFTPHelpSummary, KeySFTPHelpPut, KeySFTPHelpGet,
-		KeySFTPHelpMV, KeySFTPHelpChmod, KeySFTPHelpChtimes, KeySFTPHelpWrite, KeySFTPHelpStat,
-		KeySFTPHelpLstat, KeySFTPHelpGeneric,
-	}
-}

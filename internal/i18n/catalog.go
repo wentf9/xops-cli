@@ -223,7 +223,7 @@ func loadLocaleDir(fsys fs.FS, loc domi18n.Locale) (map[string]Entry, error) {
 		filePath := path.Join(dir, name)
 		data, readErr := fs.ReadFile(fsys, filePath)
 		if readErr != nil {
-			return nil, WrapS(ErrCatalogCorrupt, readErr, KeyCatalogLoadFailed, domi18n.Str("file", filePath))
+			return nil, WrapS(ErrCatalogCorrupt, readErr, KeyCatalogLoadFailed, domi18n.BoundStr("file", filePath))
 		}
 		if parseErr := parseCatalogFile(loc, filePath, data, table); parseErr != nil {
 			return nil, parseErr
@@ -252,25 +252,25 @@ func decodeSingleMappingRoot(filePath string, data []byte) (*yaml.Node, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	var doc yaml.Node
 	if err := dec.Decode(&doc); err != nil {
-		return nil, WrapS(ErrCatalogCorrupt, err, KeyCatalogInvalidYAML, domi18n.Str("file", filePath))
+		return nil, WrapS(ErrCatalogCorrupt, err, KeyCatalogInvalidYAML, domi18n.BoundStr("file", filePath))
 	}
 	var trailing yaml.Node
 	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.Str("file", filePath))
+		return nil, EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.BoundStr("file", filePath))
 	}
 	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
-		return nil, EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.Str("file", filePath))
+		return nil, EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.BoundStr("file", filePath))
 	}
 	root := doc.Content[0]
 	if root == nil || root.Kind != yaml.MappingNode || len(root.Content)%2 != 0 {
-		return nil, EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.Str("file", filePath))
+		return nil, EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.BoundStr("file", filePath))
 	}
 	return root, nil
 }
 
 func parseCatalogPair(loc domi18n.Locale, filePath string, kNode, vNode *yaml.Node, dst map[string]Entry) error {
 	if kNode == nil || kNode.Kind != yaml.ScalarNode || kNode.ShortTag() != yamlStringTag {
-		return EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.Str("file", filePath))
+		return EF(ErrCatalogCorrupt, KeyCatalogInvalidYAML, domi18n.BoundStr("file", filePath))
 	}
 	rawKey := kNode.Value
 	if !isValidCatalogKey(rawKey) {

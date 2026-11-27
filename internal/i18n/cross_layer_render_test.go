@@ -203,12 +203,43 @@ func hasRawPlaceholderToken(s string) bool {
 }
 
 func isPlaceholderIdent(k string) bool {
+	if len(k) == 0 || len(k) > domi18n.MaxParamKeyBytes {
+		return false
+	}
 	for i := range len(k) {
 		c := k[i]
-		isValid := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
-		if !isValid {
+		isBase := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+		isSep := i > 0 && (c == '.' || c == '-')
+		if !isBase && !isSep {
 			return false
 		}
 	}
-	return len(k) > 0
+	return true
+}
+
+func TestHasRawPlaceholderToken_AlignedWithParamKeyCharset(t *testing.T) {
+	positives := []string{
+		"missing {host}",
+		"missing {node.id}",
+		"missing {retry-count}",
+		"missing {0_a.b-c}",
+	}
+	for _, s := range positives {
+		if !hasRawPlaceholderToken(s) {
+			t.Errorf("hasRawPlaceholderToken(%q) = false, 期望 true", s)
+		}
+	}
+	negatives := []string{
+		"no placeholder",
+		"bad {.leading_dot}",
+		"bad {-leading_dash}",
+		"bad {}",
+		"bad {a b}",
+		"bad {" + strings.Repeat("a", domi18n.MaxParamKeyBytes+1) + "}",
+	}
+	for _, s := range negatives {
+		if hasRawPlaceholderToken(s) {
+			t.Errorf("hasRawPlaceholderToken(%q) = true, 期望 false", s)
+		}
+	}
 }

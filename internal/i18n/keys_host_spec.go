@@ -4,7 +4,7 @@ import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // 本文件声明本地宿主适配器层（internal/host/{audit,openssh,store,store/yamlcodec,sys,sys/agent,sys/sshfp,sys/tun,vault/**}）
 // 的全部强类型结构化错误与哨兵 MessageID 常量。
-// 所有常量均登记于 hostErrorKeys -> RootErrorKeys() 与 fallback_host_spec.go，
+// 所有常量均登记于 internal/rootcatalog（经 RootErrorKeys() 与 rootFallback 暴露），
 // 并与 locales/{en,zh}/host.yaml 保持 100% 键双射、占位符一致与规范英文兜底逐字相等。
 const (
 	// 宿主层跨包共享通用校验、路径与 I/O 错误键（14 个）。
@@ -159,50 +159,3 @@ const (
 	KeyHostVaultSSDBusCallFailed      domi18n.MessageID = "host.vault.ss_dbus_call_failed"        // Secret Service D-Bus 调用失败
 	KeyHostVaultWinCredCallFailed     domi18n.MessageID = "host.vault.wincred_call_failed"        // Windows Credential Manager 调用失败
 )
-
-func hostErrorKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyHostNotInitialized, KeyHostNilDependency, KeyHostInvalidField, KeyHostInvalidSecretRef, KeyHostInvalidSecretBox,
-		KeyHostLimitOutOfRange, KeyHostDurationMustBePositive, KeyHostValueMustBeNonNegative, KeyHostValueMustBeNonZero,
-		KeyHostPathIsSymlink, KeyHostPathNotDir, KeyHostPathNotRegular, KeyHostSizeExceedsLimit, KeyHostReadFailed,
-		KeyHostAuditCorruptLog, KeyHostAuditUnreconciledLock, KeyHostAuditLockIOFailed, KeyHostAuditLockCompactFailed,
-		KeyHostAuditLineUnmarshalFailed, KeyHostAuditAppendAbortedFailed,
-		KeyHostOpenSSHIncludeCycle, KeyHostOpenSSHIncludeDepthExceeded, KeyHostOpenSSHInvalidConfig,
-		KeyHostOpenSSHIncludeNeedsHome, KeyHostOpenSSHIncludeGlobNeedsFS, KeyHostOpenSSHIncludeGlobDotDot,
-		KeyHostOpenSSHInvalidGlob, KeyHostOpenSSHMatchMissingCriteria, KeyHostOpenSSHMatchModifierInvalid,
-		KeyHostOpenSSHMatchCriterionMissingArg, KeyHostOpenSSHIncludeDepthAt, KeyHostOpenSSHIncludeCycleAt,
-		KeyHostOpenSSHIncludeFilesExceeded, KeyHostOpenSSHFileTooLarge, KeyHostOpenSSHLineError,
-		KeyHostOpenSSHInvalidClause, KeyHostOpenSSHDirectiveMissingValue, KeyHostOpenSSHUnclosedQuote,
-		KeyHostStoreUnsupportedSchema, KeyHostStorePlaintextSecretForbidden, KeyHostStoreInvalidCSV,
-		KeyHostStoreCorruptJournalFrame, KeyHostStoreCSVEmpty, KeyHostStoreCSVTooManyRows, KeyHostStoreCSVForbiddenColumn,
-		KeyHostStoreCSVDupOrEmptyColumn, KeyHostStoreCSVMissingReqColumns, KeyHostStoreCSVUnknownColumn,
-		KeyHostStoreCSVColumnCountMismatch, KeyHostStoreCSVRowInvalidField, KeyHostStoreCSVInvalidPort,
-		KeyHostStoreCSVCertRequiresKey, KeyHostStoreOpenSSHNoNodes, KeyHostStoreRevisionOverflow,
-		KeyHostStoreWALGenerationCorrupt, KeyHostStoreWALEmpty, KeyHostStoreWALTruncatedLine, KeyHostStoreWALLineError,
-		KeyHostStoreWALMarshalFailed, KeyHostStoreWALInvalidFrame, KeyHostStoreWALCRCMismatch, KeyHostStoreWALPayloadFailed,
-		KeyHostYAMLUnsupportedSchema, KeyHostYAMLSectionKey, KeyHostYAMLEmptyConfig, KeyHostYAMLDecodeFailed,
-		KeyHostYAMLInvalidVersion, KeyHostYAMLMultipleDocs, KeyHostYAMLNodeOverrideInvalid, KeyHostYAMLDuplicateField,
-		KeyHostYAMLUnknownField, KeyHostYAMLNodeOverrideFieldInvalid, KeyHostYAMLInvalidFieldValue,
-		KeyHostYAMLVaultStoreInvalid, KeyHostYAMLVaultDefaultUndeclared, KeyHostYAMLPassphraseBindingPair,
-		KeyHostYAMLInvalidFieldCombo, KeyHostYAMLLiteralPathRequired, KeyHostYAMLAlgoMissingTokens,
-		KeyHostYAMLAlgoInvalidToken, KeyHostYAMLPathItemInvalid, KeyHostYAMLEnvPatternPrefix,
-		KeyHostSysOrphanedProcessGroup, KeyHostSysInputCanceled, KeyHostSysHostnameFailed, KeyHostSysSyscallFailed,
-		KeyHostSysTerminalStreamReq, KeyHostSysTerminalSizeFailed, KeyHostSysTerminalNonPosSize,
-		KeyHostSysTerminalRawModeFailed, KeyHostSysCancelHandleFailed, KeyHostAgentInvalidSignArgs, KeyHostAgentDisabled,
-		KeyHostAgentEnvUnset, KeyHostAgentKeyNotFound, KeyHostSSHFPDNSRcode, KeyHostSSHFPNoServers,
-		KeyHostSSHFPInvalidServerAddr, KeyHostSSHFPWinAdaptersFailed, KeyHostSSHFPInvalidDNSName,
-		KeyHostSSHFPDNSHeaderMismatch, KeyHostSSHFPDNSBadQDCount, KeyHostSSHFPDNSQuestionMismatch,
-		KeyHostSSHFPDNSWireMalformed, KeyHostSSHFPCNAMELoop, KeyHostSSHFPCNAMETooDeep, KeyHostTUNDarwinL3Only,
-		KeyHostTUNPlatformUnsupported, KeyHostTUNInvalidIPVersion,
-		KeyHostVaultRouterEmpty, KeyHostVaultRouterInvalidStore, KeyHostVaultStoreNotRegistered, KeyHostVaultHelperProtocol,
-		KeyHostVaultHelperReadOnly, KeyHostVaultHelperNonZeroExit, KeyHostVaultHelperBase64Failed,
-		KeyHostVaultHelperBadResponse, KeyHostVaultKDFParamsInvalid, KeyHostVaultKDFSubprocessFailed,
-		KeyHostVaultKeychainLoadFramework, KeyHostVaultKeychainResolveSymbol, KeyHostVaultKeychainOSStatus,
-		KeyHostVaultOfflineMetaDecode, KeyHostVaultOfflineUnsupportedFmt, KeyHostVaultOfflineItemDecode,
-		KeyHostVaultOfflineCorruptField, KeyHostVaultOfflineAEADFailed, KeyHostVaultSSInvalidDHKey,
-		KeyHostVaultSSInvalidCiphertext, KeyHostVaultSSDBusInvalidAddr, KeyHostVaultSSDBusAbstractDenied,
-		KeyHostVaultSSDBusUnknownParam, KeyHostVaultSSEnvRequired, KeyHostVaultSSConnectFailed,
-		KeyHostVaultSSHandshakeFailed, KeyHostVaultSSBadDBusValue, KeyHostVaultSSDBusCallFailed,
-		KeyHostVaultWinCredCallFailed,
-	}
-}

@@ -1,13 +1,14 @@
 package i18n
 
 import (
-	"slices"
 	"time"
 
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/internal/i18n/internal/rootcatalog"
 )
 
-// 本文件声明根模块专属强类型 MessageID 常量、不可变哨兵错误及紧凑结构化消息/错误构造封装。
+// 本文件声明根模块专属强类型 MessageID 常量、不可变哨兵错误及紧凑结构化消息/错误构造封装，
+// 并将根模块规范英文兜底查表与全量键索引单向委托至零依赖纯叶包 internal/i18n/internal/rootcatalog。
 // 所有常量均通过 xopsvet/i18nguard 规则 1 保护，并与 locales/{en,zh}/*.yaml 保持 100% 双射。
 const (
 	// KeyCatalogCorrupt 表示国际化词库元数据或内容损坏（哨兵）。
@@ -72,25 +73,38 @@ var (
 	ErrCatalogCorrupt = Sentinel(KeyCatalogCorrupt)
 )
 
-// RootErrorKeys 返回根模块中须在 rootFallback 登记规范英文兜底模板的全部错误、诊断与提示 MessageID 列表。
-func RootErrorKeys() []domi18n.MessageID {
-	base := []domi18n.MessageID{
-		KeyCatalogCorrupt, KeyCatalogLoadFailed, KeyCatalogMissingLocale, KeyCatalogInvalidYAML,
-		KeyCatalogInvalidKey, KeyCatalogDuplicateKey, KeyCatalogInvalidEntry, KeyCatalogInvalidEntryNode,
-		KeyCatalogEmptyEntry, KeyCatalogUnknownField, KeyCatalogDuplicateField, KeyCatalogNonScalarField,
-		KeyCatalogMissingOther, KeyCatalogInvalidTemplate, KeyCatalogPluralPlaceholderMismatch,
-		KeyCatalogPlaceholderMismatch, KeyCatalogMissingKey,
-		KeyStdContextCanceled, KeyStdDeadlineExceeded,
-		KeyConcNurseryNotInitialized, KeyConcNurseryClosed, KeyConcNilTask, KeyConcTaskPanicked,
-		KeyConcMutexNotInitialized, KeyConcNilContext, KeyConcPanic,
-	}
-	return slices.Concat(base, cliErrorKeys(), tuiErrorKeys(), sftpAndDaemonErrorKeys(), interactErrorAndPromptKeys(), hostErrorKeys())
+// rootFallback 返回根模块错误、诊断与提示类 MessageID 对应的规范英文兜底模板（委托零依赖纯叶包 rootcatalog）。
+// 每条返回文本须与 locales/en/*.yaml 中的对应词条保持 100% 逐字一致，由 catalog_test.go 强制锁死。
+func rootFallback(id domi18n.MessageID) string {
+	return rootcatalog.Lookup(string(id))
 }
 
-// RootKeys 返回根模块注册的全部有效 MessageID 列表（包含错误/提示键与全部纯 UI/帮助/TUI/SFTP 展示键），
-// 供 catalog_test.go 执行与 locales/{en,zh}/*.yaml 的 100% 双射校验与反向兜底穷尽校验。
+// fallbackForID 先查根模块规范英文兜底表，未命中再回退核心规范英文兜底表。
+func fallbackForID(id domi18n.MessageID) string {
+	if text := rootFallback(id); text != "" {
+		return text
+	}
+	return domi18n.CanonicalFallback(id)
+}
+
+// RootErrorKeys 返回根模块中须在 rootcatalog 登记规范英文兜底模板的全部错误、诊断与提示 MessageID 列表
+// （严格按字典序升序排列、去重，且每次返回独立切片副本）。
+func RootErrorKeys() []domi18n.MessageID {
+	return toMessageIDs(rootcatalog.ErrorKeys())
+}
+
+// RootKeys 返回根模块注册的全部有效 MessageID 列表（包含错误/提示键与全部纯 UI/帮助/TUI/SFTP 展示键，
+// 严格按字典序升序排列、去重，且每次返回独立切片副本），供双语词库与常量双射校验使用。
 func RootKeys() []domi18n.MessageID {
-	return slices.Concat(RootErrorKeys(), cliDisplayKeys(), tuiDisplayKeys(), sftpDisplayKeys(), interactDisplayKeys())
+	return toMessageIDs(rootcatalog.AllKeys())
+}
+
+func toMessageIDs(raw []string) []domi18n.MessageID {
+	out := make([]domi18n.MessageID, len(raw))
+	for i, k := range raw {
+		out[i] = domi18n.MessageID(k)
+	}
+	return out
 }
 
 // Sentinel 构造带根模块规范英文兜底的不可变哨兵错误（单参签名，供 var ErrX = i18n.Sentinel(i18n.KeyX) 使用）。

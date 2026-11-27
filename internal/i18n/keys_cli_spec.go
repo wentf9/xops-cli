@@ -4,7 +4,8 @@ import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // 本文件声明 CLI 命令族（cli / clikit / cmdssh / cmdtransfer / cmdasset / cmdops）
 // 与组合根 cmd/xops 的强类型 MessageID 常量。
-// 纯帮助与展示类键仅登记于 cliDisplayKeys（零 Go 兜底膨胀）；错误与诊断键登记于 cliErrorKeys。
+// 纯帮助与展示类键仅登记于 rootcatalog.AllKeys()（零 Go 兜底膨胀）；
+// 错误、诊断与嵌套标签键登记于 rootcatalog.ErrorKeys() 与 rootcatalog.Lookup。
 const (
 	// CLI 16 组帮助文档键（纯展示类，仅存于 cli_help.yaml）。
 	KeyCLIHelpRoot     domi18n.MessageID = "cli.help.root"     // 根命令帮助文档
@@ -90,7 +91,7 @@ const (
 	KeyCLIPlaybookSummary             domi18n.MessageID = "cli.playbook.summary"                // Playbook 执行汇总行
 	KeyCLIPlaybookUnknownWarning      domi18n.MessageID = "cli.playbook.unknown_warning"        // Playbook 含未知终态步骤警告
 
-	// CLI 5 个核心哨兵与运行期配置错误键（登记于 cliErrorKeys + fallback_cli_spec.go）。
+	// CLI 5 个核心哨兵与运行期配置错误键（规范英文兜底登记于 internal/rootcatalog）。
 	KeyCLIInvalidConfig           domi18n.MessageID = "cli.err.invalid_config"            // 无效的 AppConfig 配置（哨兵）
 	KeyCLIAppNotInitialized       domi18n.MessageID = "cli.err.app_not_initialized"       // App 未初始化（哨兵）
 	KeyCLIUsage                   domi18n.MessageID = "cli.err.usage"                     // 命令行参数无效（哨兵）
@@ -212,7 +213,7 @@ const (
 	KeyCmdLoadConfigFailed        domi18n.MessageID = "cmd.err.load_config_failed"        // 加载 config.yaml 失败
 	KeyCmdReconcileFailed         domi18n.MessageID = "cmd.err.reconcile_failed"          // 启动期崩溃审计对账失败
 
-	// CLI 参数字段嵌套标签键（用于 KeyCLIInvalidField 嵌套 i18n.Msg 参数，登记于 cliErrorKeys + fallback_cli_spec.go）。
+	// CLI 参数字段嵌套标签键（用于 KeyCLIInvalidField 嵌套 i18n.Msg 参数，规范英文兜底登记于 internal/rootcatalog）。
 	KeyCLIFieldLocalFilePath     domi18n.MessageID = "cli.field.local_file_path"     // 字段标签：本地文件路径
 	KeyCLIFieldControlSocketPath domi18n.MessageID = "cli.field.control_socket_path" // 字段标签：控制套接字路径
 	KeyCLIFieldRemoteDestPath    domi18n.MessageID = "cli.field.remote_dest_path"    // 字段标签：远端目标路径
@@ -264,73 +265,3 @@ const (
 	KeyCmdCompOSKeychainVault       domi18n.MessageID = "cmd.comp.os_keychain_vault"       // 组件标签：os_keychain 凭据库（含 {name}）
 	KeyCmdCompExternalHelperVault   domi18n.MessageID = "cmd.comp.external_helper_vault"   // 组件标签：external_helper 凭据库（含 {name}）
 )
-
-func cliErrorKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyCLIInvalidConfig, KeyCLIAppNotInitialized, KeyCLIUsage, KeyCLINotConfigured, KeyCLIUnsupportedRunner,
-		KeyCLINilContext, KeyCLINilEngineFactory, KeyCLINilStdStreams, KeyCLIShutdownTimeoutPositive,
-		KeyCLINilSessionRunner, KeyCLICapabilityRequired, KeyCLIHookNotConfigured, KeyCLIInputTooLarge,
-		KeyCLIUnknownCommand, KeyCLIUnknownSubcommand, KeyCLIHelpTooManyTopics, KeyCLIUnknownHelpTopic,
-		KeyCLIVersionInvalidArg, KeyCLIMissingShortValue, KeyCLIMissingLongValue, KeyCLIHelpNoValue,
-		KeyCLIUnknownShortFlag, KeyCLIUnknownLongFlag, KeyCLIUnexpectedArg, KeyCLIEmptyConfigFile,
-		KeyCLIInvalidBoolFlag, KeyCLIInvalidPositiveInt, KeyCLIInvalidNonNegInt, KeyCLIInvalidDuration,
-		KeyCLIEmptyPerm, KeyCLIInvalidOctalPerm, KeyCLIInvalidKeyValue, KeyCLIInvalidFlagValue,
-		KeyCLIInvalidFlagValueEnum, KeyCLIInvalidField, KeyCLIInvalidLaunchProfile, KeyCLIInvalidOptionLayer,
-		KeyCLIMissingRequiredFlag, KeyCLIMutuallyExclusiveFlags, KeyCLIExactlyOneFlagRequired,
-		KeyCLIArgCountExact, KeyCLIArgCountAtLeast, KeyCLIInteractiveNoJSON,
-		KeyCLIExitInvalidOutcome, KeyCLIExitUnexpectedOutcome, KeyCLIExitInvalidStatus, KeyCLIExitUnreadableCode,
-		KeyCLIExitUnexpectedStatus, KeyCLIExitSignal, KeyCLIExitSignalCore, KeyCLIExitSignalMsg,
-		KeyCLIExitSignalCoreMsg, KeyCLIExitUnknown, KeyCLIExitUnknownReason, KeyCLIExitNotStarted,
-		KeyCLIExitNotStartedReason, KeyCLIExitOutcomeUnknown, KeyCLIExitOutcomeUnknownReason,
-		KeyCLIForwardEmpty, KeyCLIForwardInvalidDir, KeyCLIForwardInvalidSpec, KeyCLIForwardInvalidPort,
-		KeyCLITUNEmpty, KeyCLITUNInvalidUnit, KeyCLISSHMissingTarget, KeyCLISSHFlagConflictCmd,
-		KeyCLISSHControlConflictBg, KeyCLISSHBgRequiresForward, KeyCLISSHNoCmdRequiresForward,
-		KeyCLISSHStdioFwdUnsupported, KeyCLIMuxRequiresSingleForward, KeyCLITunnelRequiresForward,
-		KeyCLIExecMissingTarget, KeyCLIExecMissingCommand, KeyCLIExecBatchPrivUnsupported, KeyCLIExecPlanFailed,
-		KeyCLIExecSelectorInvalid, KeyCLISCPEndpointMismatch, KeyCLISCPDownloadSymlinkPolicy,
-		KeyCLISCPRecursiveSymlinkPolicy, KeyCLISCPLocalRootRelative, KeyCLISCPRecursiveDotAbs, KeyCLISCPNoRemoteBase,
-		KeyCLISFTPRecoverUsage, KeyCLIVaultIdentityExists, KeyCLIVaultNodeNotFound, KeyCLIPlaybookDecodeFailed,
-		KeyCLIPlaybookEmpty, KeyCLIPlaybookMustBeObject, KeyCLIPlaybookYAMLFailed, KeyCLIPlaybookYAMLDupKey,
-		KeyCLIPlaybookYAMLNoAlias,
-		KeyCmdConfigDecodeFailed, KeyCmdConfigInvalidValue, KeyCmdAuditLogInHomeDir, KeyCmdEnvNotInitialized,
-		KeyCmdResolveDirFailed, KeyCmdInvalidDirPath, KeyCmdOpenSSHConfigUnreadable, KeyCmdTakeoverInvalidOutcome,
-		KeyCmdTakeoverNotStarted, KeyCmdTakeoverOutcomeUnknown, KeyCmdAuditReadFailed, KeyCmdAuditLineInvalid,
-		KeyCmdFileTooLarge, KeyCmdFileSizeExceedsLimit, KeyCmdShutdownStageFailed, KeyCmdVaultUnknownDefault,
-		KeyCmdVaultUnsupportedKind, KeyCmdInitComponentFailed, KeyCmdLoadConfigFailed, KeyCmdReconcileFailed,
-		KeyCLIFieldLocalFilePath, KeyCLIFieldControlSocketPath, KeyCLIFieldRemoteDestPath, KeyCLIFieldRemoteSourcePath,
-		KeyCLIFieldLocalSourcePath, KeyCLIFieldLocalRelPath, KeyCLIFieldLocalDirName, KeyCLIFieldLocalDestPath,
-		KeyCLIFieldLocalDestFilename, KeyCLIFieldLocalDestRelPath, KeyCLIFieldRemotePath, KeyCLIFieldOldPath,
-		KeyCLIFieldNewPath, KeyCLIFieldTransferID, KeyCLIFieldTag, KeyCLIFieldAlias, KeyCLIFieldSecretRef,
-		KeyCmdTargetAuditLogDir, KeyCmdTargetAuditLogFile, KeyCmdTargetLocalIdentity, KeyCmdTargetHomeDir,
-		KeyCmdTargetDefaultStateDir, KeyCmdTargetDefaultSSHDir, KeyCmdTargetDefaultSSHConfig, KeyCmdTargetOpenSSHConfig,
-		KeyCmdTargetInitialRemoteDir, KeyCmdTargetWorkingDir, KeyCmdTargetDefaultVaultDir, KeyCmdTargetVaultStore,
-		KeyCmdCompInventoryStore, KeyCmdCompWALJournalStore, KeyCmdCompTerminalAdapter, KeyCmdCompInteractionAdapter,
-		KeyCmdCompSSHFPLookupAdapter, KeyCmdCompOpenSSHImporter, KeyCmdCompCSVImporter, KeyCmdCompProcessInstanceID,
-		KeyCmdCompAuditSink, KeyCmdCompAuditReconciler, KeyCmdCompDefaultOfflineVault, KeyCmdCompPlatformKeychainVault,
-		KeyCmdCompRouterVault, KeyCmdCompConfiguredRouterVault, KeyCmdCompOfflineAEADVault, KeyCmdCompOSKeychainVault,
-		KeyCmdCompExternalHelperVault,
-	}
-}
-
-func cliDisplayKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyCLIHelpRoot, KeyCLIHelpVersion, KeyCLIHelpSSH, KeyCLIHelpExec, KeyCLIHelpTunnel, KeyCLIHelpMux,
-		KeyCLIHelpSCP, KeyCLIHelpSFTP, KeyCLIHelpHosts, KeyCLIHelpVault, KeyCLIHelpConfig, KeyCLIHelpPlaybook,
-		KeyCLIHelpDoctor, KeyCLIHelpAudit, KeyCLIHelpMCP, KeyCLIHelpTUI,
-		KeyCLIVersionOutput, KeyCLIShutdownFailed, KeyCLIMarshalJSONFailed, KeyCLICleanupFailed, KeyCLICommandFailed,
-		KeyCLIApprovalRequired, KeyCLIRefAsset, KeyCLIRefSecret, KeyCLIExitJoinDiag,
-		KeyCLISSHMasterActive, KeyCLISSHForwardListening, KeyCLIExecBatchSummary, KeyCLIExecBatchNodeHeader,
-		KeyCLIExecStatusOK, KeyCLIExecStatusFailed, KeyCLIExecStatusNotStarted, KeyCLIExecStatusCompleted, KeyCLIExecStatusUnknown,
-		KeyCLISCPUploaded, KeyCLISCPDownloaded, KeyCLISFTPStat, KeyCLISFTPWrote, KeyCLISFTPPatch, KeyCLISFTPActionOK,
-		KeyCLISFTPRenamed, KeyCLISFTPChmodOK, KeyCLISFTPRecoveredOne, KeyCLISFTPRecoverUncertainInspect,
-		KeyCLISFTPRecoveredAll, KeyCLISFTPRecoverEntry, KeyCLISFTPRecoverError, KeyCLISFTPRecoverUncertainNoRetry,
-		KeyCLIConfigNoFormats, KeyCLIConfigImportSummary, KeyCLIConfigImportLabelPlan, KeyCLIConfigImportLabelImport,
-		KeyCLIConfigImportWarnLine, KeyCLIHostsResolved, KeyCLIHostsDAGValid,
-		KeyCLIHostsFoundRefs, KeyCLIHostsMutationOK, KeyCLIHostsAllSummary, KeyCLIVaultStatus, KeyCLIVaultStatusDetail,
-		KeyCLIVaultActionOK, KeyCLIVaultLocked, KeyCLIVaultDoctorSummary, KeyCLIVaultSagaResult,
-		KeyCLIVaultSagaUncertain, KeyCLIVaultRefsSummary, KeyCLIVaultDeleted, KeyCLIVaultGCComplete,
-		KeyCLIVaultEnrolled, KeyCLIAuditReconcileSummary, KeyCLIAuditEntriesSummary, KeyCLIDoctorVaultNoCap,
-		KeyCLIDoctorVaultNotConfigured, KeyCLIDoctorSummary, KeyCLIDoctorInventory, KeyCLIDoctorVault,
-		KeyCLIDoctorVaultNote, KeyCLIPlaybookValid, KeyCLIPlaybookSummary, KeyCLIPlaybookUnknownWarning,
-	}
-}

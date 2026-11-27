@@ -3,9 +3,9 @@ package i18n
 import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
 // 本文件声明 Bubble Tea v2 终端工作台（internal/entry/tui）的全部强类型 MessageID 常量。
-// 哨兵、配置错误与可包装错误参数键登记于 tuiErrorKeys；纯视图、状态与帮助文案仅登记于 tuiDisplayKeys。
+// 哨兵、配置错误与可包装错误参数键在 internal/rootcatalog 登记规范英文兜底；纯视图、状态与帮助文案仅登记于 rootcatalog.AllKeys()。
 const (
-	// TUI 哨兵与运行期/配置错误键（登记于 tuiErrorKeys + fallback_tui_spec.go）。
+	// TUI 哨兵与运行期/配置错误键（规范英文兜底登记于 internal/rootcatalog）。
 	KeyTUINilContext             domi18n.MessageID = "tui.err.nil_context"               // TUI 上下文为 nil（哨兵）
 	KeyTUIInvalidConfig          domi18n.MessageID = "tui.err.invalid_config"            // TUI 配置无效（哨兵）
 	KeyTUIInvalidEvent           domi18n.MessageID = "tui.err.invalid_event"             // 收到无效或不支持的事件变体（哨兵）
@@ -91,32 +91,3 @@ const (
 	KeyTUIStatusTakeoverErr         domi18n.MessageID = "tui.status.takeover_err"          // 交互接管异常结束提示
 	KeyTUIStatusTakeoverDone        domi18n.MessageID = "tui.status.takeover_done"         // 交互接管正常返回提示
 )
-
-func tuiErrorKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyTUINilContext, KeyTUIInvalidConfig, KeyTUIInvalidEvent, KeyTUITerminalRestore, KeyTUITakeoverDisabled,
-		KeyTUIConfigNoSource, KeyTUIConfigInvalidView, KeyTUIConfigOutOfBounds, KeyTUIConfigInvalidCLIOpts,
-		KeyTUIConfigNilOpStream, KeyTUIConfigMetricsInterval, KeyTUIConfigInvalidLogTarget, KeyTUIEventEmpty,
-		KeyTUIEventUnsupportedType, KeyTUINoHostForMetrics, KeyTUINoHostForLogs, KeyTUINoHostForTakeover,
-		KeyTUIActionQueueBusy, KeyTUIInventoryErr, KeyTUIStreamErr, KeyTUITakeoverErr,
-		KeyTUIStreamKindMetrics, KeyTUIStreamKindLogs,
-	}
-}
-
-func tuiDisplayKeys() []domi18n.MessageID {
-	return []domi18n.MessageID{
-		KeyTUIWindowTitle, KeyTUIBrand, KeyTUIViewHosts, KeyTUIViewMetrics, KeyTUIViewLogs, KeyTUIViewOperations,
-		KeyTUIViewHelp, KeyTUIViewInvalid, KeyTUIHeaderMeta, KeyTUIBannerHalted, KeyTUIBannerHaltedDefaultReason,
-		KeyTUIBannerUnknownOutcome, KeyTUIFilterLabel, KeyTUIFilterEditing, KeyTUIHostsTitle, KeyTUIHostsEmpty,
-		KeyTUIStreamIdle, KeyTUIStreamStreaming, KeyTUIMetricsTitle, KeyTUIMetricsEmpty, KeyTUIMetricsFrameSummary,
-		KeyTUIMetricsDisks, KeyTUIMetricsTopProcesses, KeyTUILogsTitle, KeyTUILogsEmpty, KeyTUILogsTruncated,
-		KeyTUIOpsTitle, KeyTUIOpsEmpty, KeyTUIOpStatusRunning, KeyTUIOpStatusOK, KeyTUIOpStatusFailed,
-		KeyTUIOpStatusUnknown, KeyTUIHelpTitle, KeyTUIHelpBody, KeyTUIFooterErrPrefix, KeyTUIFooterHelp,
-		KeyTUISortCPU, KeyTUISortMem, KeyTUILangNameEn, KeyTUILangNameZh,
-		KeyTUIStatusReady, KeyTUIStatusLanguageSwitched, KeyTUIStatusMetricsUpdated, KeyTUIStatusGateHalted,
-		KeyTUIStatusFilterMode, KeyTUIStatusFilterCleared, KeyTUIStatusFilterApplied, KeyTUIStatusRefreshingInventory,
-		KeyTUIStatusInventoryFailed, KeyTUIStatusInventoryLoaded, KeyTUIStatusStartingMetrics, KeyTUIStatusStartingLogs,
-		KeyTUIStatusStoppingStreams, KeyTUIStatusProcessSort, KeyTUIStatusStreamErr, KeyTUIStatusStreamActive,
-		KeyTUIStatusStreamIdle, KeyTUIStatusTakeoverErr, KeyTUIStatusTakeoverDone,
-	}
-}

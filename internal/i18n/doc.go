@@ -10,7 +10,9 @@
 //   - 零源码中文字面量与统一错误链渲染代数：全部错误段连接符取自 YAML 词条 common.error_join，RenderError 经
 //     3 钩子薄适配器委托至 domi18n.RenderErrorChain，与 domi18n.CanonicalError 共享唯一折叠引擎，
 //     并按精确叶子校验（CORE-2）无侵入本地化 context、core/conc 哨兵及 *conc.PanicError；
-//   - 单包一站式根模块入口：在 keys_root_spec.go 聚合根模块 MessageID 常量、4 原语错误桥接构造器及 10 个零开销参数转发器。
+//   - 单包一站式根模块入口：在 keys_*_spec.go 声明根模块强类型 MessageID 常量，
+//     并将规范英文兜底模板与键枚举单向下沉至零依赖纯叶包 internal/i18n/internal/rootcatalog，
+//     同时在 keys_root_spec.go 提供 4 原语错误桥接构造器及 10 个零开销参数转发器。
 package i18n
 
 import "go.yaml.in/yaml/v3"

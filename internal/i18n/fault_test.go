@@ -2,8 +2,13 @@ package i18n
 
 import (
 	"errors"
+	"io/fs"
+	"path"
+	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
+	"unicode/utf8"
 
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"go.yaml.in/yaml/v3"
@@ -225,6 +230,198 @@ func TestEntryDirectUnmarshalYAML(t *testing.T) {
 		seeded := Entry{Other: "seed"}
 		if err := yaml.Unmarshal([]byte(doc), &seeded); err == nil || seeded != (Entry{}) {
 			t.Fatalf("非法 Entry YAML(%q) 应失败并清空接收者: entry=%+v err=%v", doc, seeded, err)
+		}
+	}
+}
+
+// faultCatalogFS 为自定义纯内存 fs.FS 故障桩，支持注入超长与非 UTF-8 文件名及指定读取错误，
+// 用于验证 LoadCatalogFromFS 所有报错路径通过 BoundStr 安全净化文件名且绝不退化为 "<invalid>"。
+type faultCatalogFS struct {
+	dirs    map[string][]string
+	files   map[string][]byte
+	readErr map[string]error
+}
+
+func (f *faultCatalogFS) Open(name string) (fs.File, error) {
+	return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+}
+
+func (f *faultCatalogFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	names, ok := f.dirs[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "readdir", Path: name, Err: fs.ErrNotExist}
+	}
+	entries := make([]fs.DirEntry, len(names))
+	for i, n := range names {
+		entries[i] = faultDirEntry{name: n}
+	}
+	return entries, nil
+}
+
+func (f *faultCatalogFS) ReadFile(name string) ([]byte, error) {
+	if err, ok := f.readErr[name]; ok {
+		return nil, err
+	}
+	data, ok := f.files[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "readfile", Path: name, Err: fs.ErrNotExist}
+	}
+	return data, nil
+}
+
+type faultDirEntry struct{ name string }
+
+func (e faultDirEntry) Name() string               { return e.name }
+func (e faultDirEntry) IsDir() bool                { return false }
+func (e faultDirEntry) Type() fs.FileMode          { return 0 }
+func (e faultDirEntry) Info() (fs.FileInfo, error) { return faultFileInfo(e), nil }
+
+type faultFileInfo struct{ name string }
+
+func (i faultFileInfo) Name() string       { return i.name }
+func (i faultFileInfo) Size() int64        { return 0 }
+func (i faultFileInfo) Mode() fs.FileMode  { return 0o444 }
+func (i faultFileInfo) ModTime() time.Time { return time.Time{} }
+func (i faultFileInfo) IsDir() bool        { return false }
+func (i faultFileInfo) Sys() any           { return nil }
+
+func TestLoadCatalogFromFS_BoundStrOversizedAndNonUTF8FileNames(t *testing.T) {
+	enLoc, zhLoc := mustLoadBilingualLocalizers(t)
+	oversizedName := strings.Repeat("a", domi18n.MaxParamStringBytes+128) + ".yaml"
+	nonUTF8Name := "bad\xff\xfe.yaml"
+
+	cases := []struct {
+		name     string
+		fileName string
+		data     []byte
+		readErr  error
+		wantID   domi18n.MessageID
+		wantEn   string
+		wantZh   string
+	}{
+		{
+			name:     "oversized_read_error",
+			fileName: oversizedName,
+			readErr:  errors.New("io fault"),
+			wantID:   KeyCatalogLoadFailed,
+			wantEn:   "i18n: failed to load catalog file locales/en/aaaa",
+			wantZh:   "加载国际化词库文件 locales/en/aaaa",
+		},
+		{
+			name:     "oversized_invalid_yaml_syntax",
+			fileName: oversizedName,
+			data:     []byte(":\n  - [\n"),
+			wantID:   KeyCatalogInvalidYAML,
+			wantEn:   "i18n: invalid YAML catalog in locales/en/aaaa",
+			wantZh:   "国际化词库文件 locales/en/aaaa",
+		},
+		{
+			name:     "oversized_multi_document_yaml",
+			fileName: oversizedName,
+			data:     []byte("common.not_found: \"a\"\n---\ncommon.timeout: \"b\"\n"),
+			wantID:   KeyCatalogInvalidYAML,
+			wantEn:   "i18n: invalid YAML catalog in locales/en/aaaa",
+			wantZh:   "国际化词库文件 locales/en/aaaa",
+		},
+		{
+			name:     "oversized_non_mapping_root",
+			fileName: oversizedName,
+			data:     []byte("- item1\n- item2\n"),
+			wantID:   KeyCatalogInvalidYAML,
+			wantEn:   "i18n: invalid YAML catalog in locales/en/aaaa",
+			wantZh:   "国际化词库文件 locales/en/aaaa",
+		},
+		{
+			name:     "oversized_non_string_key",
+			fileName: oversizedName,
+			data:     []byte("123: \"value\"\n"),
+			wantID:   KeyCatalogInvalidYAML,
+			wantEn:   "i18n: invalid YAML catalog in locales/en/aaaa",
+			wantZh:   "国际化词库文件 locales/en/aaaa",
+		},
+		{
+			name:     "non_utf8_read_error",
+			fileName: nonUTF8Name,
+			readErr:  errors.New("io fault"),
+			wantID:   KeyCatalogLoadFailed,
+			wantEn:   "i18n: failed to load catalog file locales/en/bad\uFFFD.yaml",
+			wantZh:   "加载国际化词库文件 locales/en/bad\uFFFD.yaml 失败",
+		},
+		{
+			name:     "non_utf8_invalid_yaml",
+			fileName: nonUTF8Name,
+			data:     []byte("- item1\n"),
+			wantID:   KeyCatalogInvalidYAML,
+			wantEn:   "i18n: invalid YAML catalog in locales/en/bad\uFFFD.yaml",
+			wantZh:   "国际化词库文件 locales/en/bad\uFFFD.yaml 的 YAML 格式无效",
+		},
+		{
+			name:     "non_utf8_non_string_key",
+			fileName: nonUTF8Name,
+			data:     []byte("123: \"value\"\n"),
+			wantID:   KeyCatalogInvalidYAML,
+			wantEn:   "i18n: invalid YAML catalog in locales/en/bad\uFFFD.yaml",
+			wantZh:   "国际化词库文件 locales/en/bad\uFFFD.yaml 的 YAML 格式无效",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fsys := buildSingleFileFaultFS(tc.fileName, tc.data, tc.readErr)
+			cat, err := LoadCatalogFromFS(fsys)
+			if err == nil || cat != nil {
+				t.Fatalf("预期加载失败, 实际 cat=%v err=%v", cat, err)
+			}
+			assertBoundedFileError(t, err, tc.wantID, tc.wantEn, tc.wantZh, enLoc, zhLoc)
+		})
+	}
+}
+
+func buildSingleFileFaultFS(fileName string, data []byte, readErr error) *faultCatalogFS {
+	fullPath := path.Join("locales/en", fileName)
+	fsys := &faultCatalogFS{
+		dirs: map[string][]string{
+			"locales/en": {fileName},
+			"locales/zh": {"common.yaml"},
+		},
+		files: map[string][]byte{
+			"locales/zh/common.yaml": []byte("common.not_found: \"不存在\"\n"),
+		},
+		readErr: map[string]error{},
+	}
+	if readErr != nil {
+		fsys.readErr[fullPath] = readErr
+	} else {
+		fsys.files[fullPath] = data
+	}
+	return fsys
+}
+
+func assertBoundedFileError(t *testing.T, err error, wantID domi18n.MessageID, wantEn, wantZh string, enLoc, zhLoc *Localizer) {
+	t.Helper()
+	if !errors.Is(err, ErrCatalogCorrupt) {
+		t.Fatalf("预期包装 ErrCatalogCorrupt, 实际 %v", err)
+	}
+	if id, ok := domi18n.ErrorID(err); !ok || id != wantID {
+		t.Fatalf("ErrorID = (%q, %v), 期望 %q", id, ok, wantID)
+	}
+	enText := enLoc.RenderError(err)
+	if enText != err.Error() {
+		t.Fatalf("en RenderError 与 err.Error() 不一致:\nRenderError: %q\nerr.Error(): %q", enText, err.Error())
+	}
+	zhText := zhLoc.RenderError(err)
+	for _, out := range []struct{ label, text, want string }{
+		{"en", enText, wantEn},
+		{"zh", zhText, wantZh},
+	} {
+		if !utf8.ValidString(out.text) {
+			t.Fatalf("%s 渲染输出包含非法 UTF-8: %q", out.label, out.text)
+		}
+		if strings.Contains(out.text, "<invalid>") || strings.Contains(out.text, "{file}") {
+			t.Fatalf("%s 渲染退化为 <invalid> 或残留占位符: %q", out.label, out.text)
+		}
+		if !strings.Contains(out.text, out.want) {
+			t.Fatalf("%s 渲染缺少期望片段 %q: got=%q", out.label, out.want, out.text)
 		}
 	}
 }
