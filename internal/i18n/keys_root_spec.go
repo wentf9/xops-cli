@@ -1,6 +1,10 @@
 package i18n
 
-import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+import (
+	"time"
+
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+)
 
 // 本文件声明根模块专属强类型 MessageID 常量、不可变哨兵错误及紧凑结构化消息/错误构造封装。
 // 所有常量均通过 xopsvet/i18nguard 规则 1 保护，并与 locales/{en,zh}/*.yaml 保持 100% 双射。
@@ -122,20 +126,73 @@ func NewPluralMessage(id domi18n.MessageID, count int64, params ...domi18n.Param
 
 // E 构造携带根模块规范英文兜底与强类型参数的独立结构化错误。
 func E(id domi18n.MessageID, params ...domi18n.Param) error {
-	return domi18n.EWithFallback(id, fallbackForID(id), params...)
+	return domi18n.NewErrorWithFallback(nil, nil, id, fallbackForID(id), params...)
 }
 
 // EF 构造同时绑定分类哨兵 sentinel 与根模块参数化消息的结构化错误。
 func EF(sentinel error, id domi18n.MessageID, params ...domi18n.Param) error {
-	return domi18n.EFWithFallback(sentinel, id, fallbackForID(id), params...)
+	return domi18n.NewErrorWithFallback(sentinel, nil, id, fallbackForID(id), params...)
 }
 
 // Wrap 以根模块规范英文兜底与强类型参数包装下层根因错误 cause。
 func Wrap(cause error, id domi18n.MessageID, params ...domi18n.Param) error {
-	return domi18n.WrapWithFallback(cause, id, fallbackForID(id), params...)
+	return domi18n.NewErrorWithFallback(nil, cause, id, fallbackForID(id), params...)
 }
 
 // WrapS 同时绑定分类哨兵 sentinel、下层根因 cause 与根模块参数化消息。
 func WrapS(sentinel, cause error, id domi18n.MessageID, params ...domi18n.Param) error {
-	return domi18n.WrapSWithFallback(sentinel, cause, id, fallbackForID(id), params...)
+	return domi18n.NewErrorWithFallback(sentinel, cause, id, fallbackForID(id), params...)
+}
+
+// 以下 10 个零开销参数构造转发器使根模块（internal/host/** 与 internal/entry/**）
+// 仅导入 internal/i18n 即可一站式完成结构化消息与错误构造，无需重复导入 core/domain/i18n。
+
+// Str 转发 core/domain/i18n.Str，构造严格校验的有界 UTF-8 字符串参数。
+func Str(k, v string) domi18n.Param {
+	return domi18n.Str(k, v)
+}
+
+// BoundStr 转发 core/domain/i18n.BoundStr，对外部不可信字符串执行确定性 UTF-8 净化与按 rune 边界裁剪。
+func BoundStr(k, v string) domi18n.Param {
+	return domi18n.BoundStr(k, v)
+}
+
+// Int 转发 core/domain/i18n.Int，构造整数参数。
+func Int(k string, v int) domi18n.Param {
+	return domi18n.Int(k, v)
+}
+
+// Int64 转发 core/domain/i18n.Int64，构造 64 位有符号整数参数。
+func Int64(k string, v int64) domi18n.Param {
+	return domi18n.Int64(k, v)
+}
+
+// Uint64 转发 core/domain/i18n.Uint64，构造 64 位无符号整数参数。
+func Uint64(k string, v uint64) domi18n.Param {
+	return domi18n.Uint64(k, v)
+}
+
+// Float 转发 core/domain/i18n.Float，构造有限 64 位浮点数参数。
+func Float(k string, v float64, prec int) domi18n.Param {
+	return domi18n.Float(k, v, prec)
+}
+
+// Bool 转发 core/domain/i18n.Bool，构造布尔参数。
+func Bool(k string, v bool) domi18n.Param {
+	return domi18n.Bool(k, v)
+}
+
+// Dur 转发 core/domain/i18n.Dur，构造时长参数。
+func Dur(k string, d time.Duration) domi18n.Param {
+	return domi18n.Dur(k, d)
+}
+
+// DurNanos 转发 core/domain/i18n.DurNanos，以显式纳秒整数构造时长参数。
+func DurNanos(k string, nanos int64) domi18n.Param {
+	return domi18n.DurNanos(k, nanos)
+}
+
+// Msg 转发 core/domain/i18n.Msg，构造受限深度嵌套的结构化 Message 参数。
+func Msg(k string, m domi18n.Message) domi18n.Param {
+	return domi18n.Msg(k, m)
 }

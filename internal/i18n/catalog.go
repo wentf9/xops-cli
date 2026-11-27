@@ -7,9 +7,7 @@ import (
 	"io/fs"
 	"path"
 	"slices"
-	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"go.yaml.in/yaml/v3"
@@ -97,7 +95,7 @@ func applyPluralField(kNode, vNode *yaml.Node, dst *Entry, seenOne, seenOther *b
 	case "other":
 		return assignPluralValue("other", vNode, &dst.Other, seenOther)
 	default:
-		return EF(ErrCatalogCorrupt, KeyCatalogUnknownField, domi18n.Str("field", boundDisplayText(field, domi18n.MaxParamKeyBytes)))
+		return EF(ErrCatalogCorrupt, KeyCatalogUnknownField, domi18n.Str("field", domi18n.BoundDisplayText(field, domi18n.MaxParamKeyBytes)))
 	}
 }
 
@@ -277,8 +275,8 @@ func parseCatalogPair(loc domi18n.Locale, filePath string, kNode, vNode *yaml.No
 	rawKey := kNode.Value
 	if !isValidCatalogKey(rawKey) {
 		return EF(ErrCatalogCorrupt, KeyCatalogInvalidKey,
-			domi18n.Str("key", boundDisplayText(rawKey, maxCatalogKeyBytes)),
-			domi18n.Str("file", filePath),
+			domi18n.Str("key", domi18n.BoundDisplayText(rawKey, maxCatalogKeyBytes)),
+			domi18n.BoundStr("file", filePath),
 		)
 	}
 	if _, exists := dst[rawKey]; exists {
@@ -388,25 +386,4 @@ func isValidCatalogKey(s string) bool {
 		}
 	}
 	return true
-}
-
-// boundDisplayText 将异常输入安全裁剪为有效 UTF-8 有界字符串，用于构造内部诊断错误参数。
-func boundDisplayText(raw string, maxBytes int) string {
-	if maxBytes <= 0 {
-		return ""
-	}
-	if !utf8.ValidString(raw) {
-		raw = strconv.Quote(raw)
-	}
-	if len(raw) <= maxBytes {
-		return raw
-	}
-	end := 0
-	for idx := range raw {
-		if idx > maxBytes {
-			break
-		}
-		end = idx
-	}
-	return raw[:end]
 }

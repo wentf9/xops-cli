@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 )
@@ -74,25 +75,48 @@ func assertTableBijection(t *testing.T, locale string, expected map[string]domi1
 
 func assertFallbackVerbatimEquality(t *testing.T, enTable map[string]Entry) {
 	t.Helper()
+	assertCoreFallbackParity(t, enTable)
+	assertRootFallbackParity(t, enTable)
+}
+
+func assertCoreFallbackParity(t *testing.T, enTable map[string]Entry) {
+	t.Helper()
 	for _, id := range domi18n.CoreKeys() {
 		fb := domi18n.CanonicalFallback(id)
 		en := enTable[string(id)].Other
 		if fb == "" || fb != en {
 			t.Errorf("CoreKey %q CanonicalFallback=%q 与 en YAML=%q 不一致", id, fb, en)
 		}
+		if shadow := rootFallback(id); shadow != "" {
+			t.Errorf("CoreKey %q 不应在 rootFallback 中重复登记影子兜底: %q", id, shadow)
+		}
 	}
+}
+
+func assertRootFallbackParity(t *testing.T, enTable map[string]Entry) {
+	t.Helper()
 	rootAll := make(map[domi18n.MessageID]bool, len(RootKeys()))
 	for _, id := range RootKeys() {
 		rootAll[id] = true
 	}
+	rootErrSet := make(map[domi18n.MessageID]bool, len(RootErrorKeys()))
 	for _, id := range RootErrorKeys() {
 		if !rootAll[id] {
 			t.Errorf("RootErrorKeys() 包含未在 RootKeys() 中登记的键 %q", id)
 		}
+		rootErrSet[id] = true
 		fb := rootFallback(id)
 		en := enTable[string(id)].Other
 		if fb == "" || fb != en {
 			t.Errorf("RootErrorKey %q rootFallback=%q 与 en YAML=%q 不一致", id, fb, en)
+		}
+	}
+	// 反向兜底穷尽断言：所有非错误类 RootKeys 均须满足 rootFallback(id) == ""，杜绝未受检影子兜底。
+	for _, id := range RootKeys() {
+		if !rootErrSet[id] {
+			if fb := rootFallback(id); fb != "" {
+				t.Errorf("非错误类 RootKey %q 不应在 rootFallback 中登记影子兜底: %q", id, fb)
+			}
 		}
 	}
 }
@@ -101,14 +125,8 @@ func assertPlaceholderParity(t *testing.T, enTable, zhTable map[string]Entry) {
 	t.Helper()
 	for key, enEntry := range enTable {
 		zhEntry := zhTable[key]
-		enPH, err := domi18n.ExtractPlaceholders(enEntry.Other)
-		if err != nil {
-			t.Fatalf("en %q Other 模板非法: %v", key, err)
-		}
-		zhPH, err := domi18n.ExtractPlaceholders(zhEntry.Other)
-		if err != nil {
-			t.Fatalf("zh %q Other 模板非法: %v", key, err)
-		}
+		enPH := mustExtractBoundedPlaceholders(t, "en", key, "Other", enEntry.Other)
+		zhPH := mustExtractBoundedPlaceholders(t, "zh", key, "Other", zhEntry.Other)
 		if !slices.Equal(enPH, zhPH) {
 			t.Errorf("键 %q 占位符不一致: en=%v zh=%v", key, enPH, zhPH)
 		}
@@ -122,13 +140,22 @@ func assertPluralPlaceholderParity(t *testing.T, locale, key string, entry Entry
 	if entry.One == "" {
 		return
 	}
-	onePH, err := domi18n.ExtractPlaceholders(entry.One)
-	if err != nil {
-		t.Fatalf("%s %q One 模板非法: %v", locale, key, err)
-	}
+	onePH := mustExtractBoundedPlaceholders(t, locale, key, "One", entry.One)
 	if !slices.Equal(onePH, otherPH) {
 		t.Errorf("%s %q 复数 one/other 占位符不一致: one=%v other=%v", locale, key, onePH, otherPH)
 	}
+}
+
+func mustExtractBoundedPlaceholders(t *testing.T, locale, key, form, tmpl string) []string {
+	t.Helper()
+	ph, err := domi18n.ExtractPlaceholders(tmpl)
+	if err != nil {
+		t.Fatalf("%s %q %s 模板非法: %v", locale, key, form, err)
+	}
+	if len(ph) > domi18n.MaxMessageParams {
+		t.Errorf("%s %q %s 模板占位符个数 %d 超出 MaxMessageParams(%d)", locale, key, form, len(ph), domi18n.MaxMessageParams)
+	}
+	return ph
 }
 
 func TestLocalizerZeroValueAndNestedRendering(t *testing.T) {
@@ -165,7 +192,8 @@ func assertInvalidLocalizerBehavior(t *testing.T, loc *Localizer, msg domi18n.Me
 	if got := loc.Render(msg); got != msg.Canonical() {
 		t.Fatalf("零值 Localizer.Render = %q, 期望 %q", got, msg.Canonical())
 	}
-	if got := loc.Render(domi18n.Message{}); got != "" {
+	var invalidMsg domi18n.Message
+	if got := loc.Render(invalidMsg); got != "" {
 		t.Fatalf("无效 Message Render 应为空串, 实际 %q", got)
 	}
 	if got := loc.RenderError(rawErr); got != rawErr.Error() {
@@ -230,9 +258,41 @@ func assertRootConstructors(t *testing.T) {
 	if !errors.Is(w, cause) || w.Error() != "i18n: failed to load catalog file a.yaml: eof" {
 		t.Fatalf("Wrap 异常: %v", w)
 	}
-	ws := WrapS(ErrCatalogCorrupt, cause, KeyCatalogInvalidYAML, domi18n.Str("file", "a.yaml"))
+	ws := WrapS(ErrCatalogCorrupt, cause, KeyCatalogInvalidYAML, Str("file", "a.yaml"))
 	if !errors.Is(ws, ErrCatalogCorrupt) || !errors.Is(ws, cause) {
 		t.Fatalf("WrapS 应同时保留哨兵与根因: %v", ws)
+	}
+	coreBridge := EF(ErrCatalogCorrupt, domi18n.KeyCommonInvalidArgument)
+	if !errors.Is(coreBridge, ErrCatalogCorrupt) || coreBridge.Error() != "invalid argument" {
+		t.Fatalf("根桥接函数传核心键应回退 CanonicalFallback: %v", coreBridge)
+	}
+	assertParamForwarders(t)
+}
+
+func assertParamForwarders(t *testing.T) {
+	t.Helper()
+	nestedMsg := NewMessage(KeyCatalogCorrupt)
+	oversized := strings.Repeat("x", domi18n.MaxParamStringBytes+64)
+	pairs := []struct {
+		name string
+		got  domi18n.Param
+		want domi18n.Param
+	}{
+		{"Str", Str("k", "v"), domi18n.Str("k", "v")},
+		{"BoundStr", BoundStr("k", oversized), domi18n.BoundStr("k", oversized)},
+		{"Int", Int("n", -7), domi18n.Int("n", -7)},
+		{"Int64", Int64("n64", -9000000000), domi18n.Int64("n64", -9000000000)},
+		{"Uint64", Uint64("u64", 42), domi18n.Uint64("u64", 42)},
+		{"Float", Float("f", 3.14159, 2), domi18n.Float("f", 3.14159, 2)},
+		{"Bool", Bool("ok", true), domi18n.Bool("ok", true)},
+		{"Dur", Dur("d", 5*time.Second), domi18n.Dur("d", 5*time.Second)},
+		{"DurNanos", DurNanos("dn", 1250000), domi18n.DurNanos("dn", 1250000)},
+		{"Msg", Msg("m", nestedMsg), domi18n.Msg("m", nestedMsg)},
+	}
+	for _, tc := range pairs {
+		if !tc.got.Equal(tc.want) {
+			t.Errorf("参数转发器 %s 行为与 core/domain/i18n 不一致: got=%v want=%v", tc.name, tc.got, tc.want)
+		}
 	}
 }
 

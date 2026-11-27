@@ -7,8 +7,10 @@
 //     所有 Catalog 与 Localizer 均由组合根按需纯内存构造并显式注入；
 //   - 严格失败关闭：Catalog 与 Localizer 均标注 //xops:opaque 与 //xops:failclosed；零值或 nil *Localizer
 //     对 Render(msg) 回退 msg.Canonical()，对 RenderError(err) 回退 err.Error()，对 T(id)/TPlural(id) 失败关闭返回 string(id)；
-//   - 零源码中文字面量与结构化错误展开：全部错误段连接符取自 YAML 词条 common.error_join，RenderError 经
-//     domi18n.InspectNode 与 UnwrapDirect 逐层展开并结构化去重，同时无入侵本地化 context 与 core/conc 哨兵及 *conc.PanicError。
+//   - 零源码中文字面量与统一错误链渲染代数：全部错误段连接符取自 YAML 词条 common.error_join，RenderError 经
+//     3 钩子薄适配器委托至 domi18n.RenderErrorChain，与 domi18n.CanonicalError 共享唯一折叠引擎，
+//     并按精确叶子校验（CORE-2）无侵入本地化 context、core/conc 哨兵及 *conc.PanicError；
+//   - 单包一站式根模块入口：在 keys_root_spec.go 聚合根模块 MessageID 常量、4 原语错误桥接构造器及 10 个零开销参数转发器。
 package i18n
 
 import "go.yaml.in/yaml/v3"
