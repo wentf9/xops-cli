@@ -1,12 +1,40 @@
 version: 2
 updates:
-  # 监控 Go 项目依赖
+  # 监控根 CLI 模块 Go 依赖
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
       interval: "weekly"
     groups:
       go-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+
+  # 监控 core 模块 Go 依赖
+  - package-ecosystem: "gomod"
+    directory: "/core"
+    schedule:
+      interval: "weekly"
+    groups:
+      go-core-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+
+  # 监控 tools/xopsvet 模块 Go 依赖
+  - package-ecosystem: "gomod"
+    directory: "/tools/xopsvet"
+    schedule:
+      interval: "weekly"
+    groups:
+      go-xopsvet-dependencies:
         patterns:
           - "*"
     open-pull-requests-limit: 10

@@ -1,92 +1,79 @@
 # =============================================================================
-# XOps Playbook 示例 — Web 应用部署
-# 路径建议: ~/.xops/playbooks/deploy-web.yaml
-# 用法: xops play deploy-web.yaml --var app_version=2.1.0
+# XOps Playbook v2 示例 — Web 应用部署
+# 校验: xops playbook validate examples/playbooks/deploy-web.yaml --json
+# 运行: xops playbook run examples/playbooks/deploy-web.yaml --var app_version=2.1.0 --concurrency 3
+# 完整 Schema 参考: docs/guide/automation.md
 # =============================================================================
+version: 2
+id: deploy-web
+name: "Deploy Web Application"
+description: "Install nginx, render config, copy release manifest, and verify deployment"
+on_error: fail_fast # fail_fast | continue | abort
 
-name: deploy-web
-description: "将 Web 应用部署到所有生产 web 服务器"
+# 目标节点选择器（支持 tags / nodes / exclude_nodes）
+target:
+  tags: [web, prod]
+  exclude_nodes: [web-maint-01]
 
-# 目标主机（三种方式任选其一或多个组合）
-targets:
-  tags: [web, prod]       # 按标签选择（推荐）
-  # nodes: [web-1, web-2] # 按节点名精确选择
-  # hosts: [192.168.1.10] # 按 IP 地址选择
-
-# 全局执行配置
-settings:
-  concurrency: 3          # 最大并行主机数（默认: 1）
-  sudo: false             # 全局是否提权
-  on_error: stop          # 失败策略: continue | stop | abort_all
-  timeout: 600s           # 整体超时限制
-
-# 变量定义（支持 {{ .VarName }} 模板替换）
-# CLI 通过 --var key=value 可覆盖这些值
+# 模板变量（可通过 CLI --var key=value 覆写）
 vars:
   app_version: "2.0.0"
-  app_dir: "/opt/myapp"
-  app_user: "www-data"
-  config_src: "./configs/app.conf"
-  backup_dir: "/opt/backups"
+  app_port: "8080"
+  env_name: "prod"
 
-# 任务步骤（按顺序在每台主机上执行）
+# 声明式步骤列表（action.kind 支持 ensure | template | copy | script | shell）
 steps:
-  # --- 步骤 1: 确保依赖已安装（幂等性）---
-  - name: "确保 nginx 已安装"
-    ensure:
-      check: "nginx -v"
-      action: "apt-get install -y nginx"
-    sudo: true
+  - id: ensure-nginx
+    name: "Ensure nginx package is installed"
+    action:
+      kind: ensure
+      check:
+        kind: shell
+        command: "command -v nginx >/dev/null 2>&1"
+      action:
+        kind: shell
+        command: "apt-get update && apt-get install -y nginx"
+        timeout: 3m
+      max_retries: 1
 
-  - name: "确保部署目录存在"
-    ensure:
-      check: "test -d {{ .app_dir }}"
-      action: "mkdir -p {{ .app_dir }} && chown {{ .app_user }} {{ .app_dir }}"
-    sudo: true
-
-  # --- 步骤 2: 备份旧版本 ---
-  - name: "备份当前版本"
-    shell: "cp -r {{ .app_dir }} {{ .backup_dir }}/app-$(date +%Y%m%d-%H%M%S) 2>/dev/null || true"
-    sudo: true
-    ignore_error: true    # 首次部署时目录可能不存在，忽略错误
-
-  # --- 步骤 3: 停止旧服务 ---
-  - name: "停止应用服务"
-    shell: "systemctl stop myapp"
-    sudo: true
-    ignore_error: true    # 服务可能未运行
-
-  # --- 步骤 4: 文件分发 ---
-  - name: "上传配置文件"
-    copy:
-      src: "{{ .config_src }}"
-      dest: "{{ .app_dir }}/app.conf"
+  - id: upload-conf
+    name: "Render and atomically publish nginx config"
+    action:
+      kind: template
+      source: "./templates/nginx.conf.tmpl"
+      dest: "/etc/nginx/conf.d/app.conf"
+      vars:
+        listen_port: "8080"
       mode: "0644"
+      overwrite: true
+      atomic: true
 
-  - name: "上传应用包"
-    copy:
-      src: "./dist/myapp-{{ .app_version }}.tar.gz"
-      dest: "{{ .app_dir }}/myapp.tar.gz"
+  - id: copy-manifest
+    name: "Copy release manifest"
+    when_tags: [web]
+    action:
+      kind: copy
+      source: "./manifest.json"
+      dest: "/srv/www/manifest.json"
+      mode: "0644"
+      overwrite: true
+      atomic: true
 
-  # --- 步骤 5: 运行部署脚本 ---
-  - name: "解压并安装"
-    script: "./scripts/install.sh"
-    sudo: true
+  - id: reload-nginx
+    name: "Reload nginx service"
+    action:
+      kind: shell
+      command: "nginx -t && systemctl reload nginx"
+      timeout: 30s
 
-  # --- 步骤 6: 启动服务并验证 ---
-  - name: "启动应用服务"
-    shell: "systemctl start myapp"
-    sudo: true
-
-  - name: "验证服务已运行"
-    ensure:
-      check: "systemctl is-active myapp"
-      action: "systemctl restart myapp"
-    sudo: true
-    retries: 3            # 失败重试 3 次
-    retry_delay: 5s       # 每次等待 5 秒
-
-  - name: "健康检查"
-    shell: "curl -sf http://localhost:8080/health"
-    retries: 5
-    retry_delay: 10s
+  - id: verify-script
+    name: "Run post-deploy check script"
+    on_error: continue
+    action:
+      kind: script
+      source: "./scripts/verify.sh"
+      args: ["--strict"]
+      work_dir: "/srv/www"
+      env:
+        APP_ENV: "prod"
+      timeout: 30s

@@ -62,7 +62,6 @@ CROSS_PLATFORM_EXACT = {
     "tools/xopsvet/go.sum",
     ".golangci.yml",
     "scripts/ci/verify.go",
-    "scripts/verify_native_platform.sh",
     ".github/workflows/ci.yml",
     "scripts/ci_changes.py",
     "scripts/test_ci_changes.py",
@@ -99,8 +98,6 @@ def is_core_file(path: str) -> bool:
     if path.startswith("core/") or path.startswith("tools/xopsvet/"):
         return True
     if path in CORE_EXACT:
-        return True
-    if path.startswith("scripts/mcp/"):
         return True
     return False
 

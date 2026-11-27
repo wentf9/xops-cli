@@ -155,7 +155,6 @@ class TestCIChangesClassification(unittest.TestCase):
             ("tools/xopsvet/go.sum", True, True, True),
             (".golangci.yml", True, True, True),
             ("scripts/ci/verify.go", True, True, True),
-            ("scripts/verify_native_platform.sh", True, False, True),
             (".github/workflows/ci.yml", True, True, True),
             ("scripts/ci_changes.py", True, True, True),
             ("scripts/test_ci_changes.py", True, True, True),
@@ -273,9 +272,9 @@ class TestCIChangesClassification(unittest.TestCase):
 
     def test_path_normalization(self):
         """Test Windows backslashes and leading ./ normalization."""
-        self.assertEqual(ci_changes.normalize_path(".\\core\\ssh\\client.go"), "core/ssh/client.go")
-        self.assertEqual(ci_changes.normalize_path("./pkg/config/AGENTS.md"), "pkg/config/AGENTS.md")
-        self.assertEqual(ci_changes.normalize_path(".///internal/terminal/conpty.go"), "internal/terminal/conpty.go")
+        self.assertEqual(ci_changes.normalize_path(".\\core\\osfs\\root.go"), "core/osfs/root.go")
+        self.assertEqual(ci_changes.normalize_path("./core/domain/AGENTS.md"), "core/domain/AGENTS.md")
+        self.assertEqual(ci_changes.normalize_path(".///internal/host/sys/pty_windows.go"), "internal/host/sys/pty_windows.go")
 
 
 class TestGitIntegrationAndFailSafe(unittest.TestCase):

@@ -9,9 +9,7 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - 'cmd/**'
-      - 'pkg/i18n/**'
-      - 'go.mod'
-      - 'go.sum'
+      - 'internal/entry/cli/**'
       - '.github/workflows/docs.yml'
   pull_request:
     branches: [master]
@@ -21,9 +19,7 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - 'cmd/**'
-      - 'pkg/i18n/**'
-      - 'go.mod'
-      - 'go.sum'
+      - 'internal/entry/cli/**'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -46,11 +42,6 @@ jobs:
         with:
           node-version: '24'
           cache: npm
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache: true
-          cache-dependency-path: go.sum
       - run: npm ci
       - run: npm run docs:build
       - uses: actions/upload-pages-artifact@v5

@@ -16,7 +16,7 @@ MACOS_VNC_PORT="${MACOS_VNC_PORT:-5999}"
 MACOS_USER="${MACOS_USER:-user}"
 MACOS_PASS="${MACOS_PASS:-alpine}"
 MACOS_HOST="127.0.0.1"
-GUEST_GO_VERSION="${GUEST_GO_VERSION:-1.26.0}"
+GUEST_GO_VERSION="${GUEST_GO_VERSION:-1.27.0}"
 
 log_info() {
     printf "[INFO] %s\n" "$*"
@@ -343,24 +343,25 @@ ssh_vm() {
 check_or_install_guest_go() {
     ensure_ssh_key
     read -ra opts < <(get_ssh_opts "yes")
-    log_info "检查虚拟机客体 Go 工具链版本 (要求: Go 1.26+)..."
+    log_info "检查虚拟机客体 Go 工具链版本 (要求: Go 1.27+)..."
 
     local go_ver_out
     if go_ver_out=$(ssh "${opts[@]}" "${MACOS_USER}@${MACOS_HOST}" "bash -lc 'command -v go && go version'" 2>/dev/null); then
         log_info "客体已安装 Go: $go_ver_out"
-        if echo "$go_ver_out" | grep -q -E "go1\.(2[6-9]|[3-9][0-9])"; then
-            log_pass "客体 Go 版本满足规范 (>= 1.26)"
+        if echo "$go_ver_out" | grep -q -E "go1\.(2[7-9]|[3-9][0-9])"; then
+            log_pass "客体 Go 版本满足规范 (>= 1.27)"
             return 0
         else
-            log_warn "客体 Go 版本低于 1.26 ($go_ver_out)，需要安装 Go ${GUEST_GO_VERSION}"
+            log_warn "客体 Go 版本低于 1.27 ($go_ver_out)，需要安装 Go ${GUEST_GO_VERSION}"
         fi
     else
         log_warn "客体未检测到 Go 工具链，正在准备自动配置..."
     fi
 
     log_info "正在向虚拟机客体安装 Go ${GUEST_GO_VERSION}..."
-    ssh "${opts[@]}" "${MACOS_USER}@${MACOS_HOST}" "bash -s" <<'EOF'
+    ssh "${opts[@]}" "${MACOS_USER}@${MACOS_HOST}" "bash -s -- '${GUEST_GO_VERSION}'" <<'EOF'
 set -euo pipefail
+GO_VERSION="$1"
 GUEST_ARCH=$(uname -m)
 case "$GUEST_ARCH" in
     x86_64) GO_ARCH="amd64" ;;
@@ -368,7 +369,7 @@ case "$GUEST_ARCH" in
     *)      GO_ARCH="amd64" ;;
 esac
 
-TARBALL="go1.26.0.darwin-${GO_ARCH}.tar.gz"
+TARBALL="go${GO_VERSION}.darwin-${GO_ARCH}.tar.gz"
 URL="https://go.dev/dl/${TARBALL}"
 
 echo "[GUEST] Downloading Go for darwin-${GO_ARCH} from ${URL}..."
@@ -378,7 +379,7 @@ if ! curl -fsSL -o "/tmp/${TARBALL}" "${URL}"; then
         brew install go
         exit 0
     fi
-    echo "[GUEST] Cannot download Go tarball or use brew. Please install Go 1.26+ manually."
+    echo "[GUEST] Cannot download Go tarball or use brew. Please install Go 1.27+ manually."
     exit 1
 fi
 
@@ -441,8 +442,8 @@ run_tests() {
     check_or_install_guest_go
     sync_code "--clean"
     read -ra opts < <(get_ssh_opts "yes")
-    log_info "在 macOS 虚拟机内执行原生平台验证脚本..."
-    ssh "${opts[@]}" "${MACOS_USER}@${MACOS_HOST}" "bash -lc 'cd ~/xops-cli && ./scripts/verify_native_platform.sh'"
+    log_info "在 macOS 虚拟机内执行原生平台验证脚本 (scripts/ci/verify.go)..."
+    ssh "${opts[@]}" "${MACOS_USER}@${MACOS_HOST}" "bash -lc 'cd ~/xops-cli && go run ./scripts/ci/verify.go --stage=all'"
 }
 
 show_help() {
@@ -458,9 +459,9 @@ show_help() {
   auth         向虚拟机客体安装专用公钥以建立免密通道
   logs         查看虚拟机启动与 QEMU 控制台实时日志
   ssh [cmd]    通过 SSH 登录虚拟机交互终端或直接执行远程命令
-  setup-go     在虚拟机客体内安装或升级 Go 1.26+ 工具链
+  setup-go     在虚拟机客体内安装或升级 Go 1.27+ 工具链
   sync [--clean] 将当前仓库源码严格镜像同步到虚拟机 ~/xops-cli (支持删除同步)
-  test         纯净同步代码并在 macOS 虚拟机中运行 ./scripts/verify_native_platform.sh
+  test         纯净同步代码并在 macOS 虚拟机中运行 go run ./scripts/ci/verify.go --stage=all
   help         显示本帮助信息
 
 环境变量:
@@ -471,7 +472,7 @@ show_help() {
   MACOS_RAM         虚拟机内存大小 (GB, 默认: 8)
   MACOS_SMP         虚拟机 CPU 核心数 (默认: 4)
   MACOS_SYNC_CLEAN  是否每次同步强制清空目标目录 (默认: false)
-  GUEST_GO_VERSION  客体安装的 Go 版本 (默认: 1.26.0)
+  GUEST_GO_VERSION  客体安装的 Go 版本 (默认: 1.27.0)
   DOCKER_OSX_IMAGE  使用的 Docker-OSX 镜像 (默认: sickcodes/docker-osx:latest)
 EOF
 }

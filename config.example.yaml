@@ -1,0 +1,177 @@
+# =============================================================================
+# XOps v2 示例配置文件
+# 默认路径: ~/.xops/config.yaml（可通过环境变量 XOPS_HOME 覆写根目录）
+# Schema v2 严格启用 KnownFields(true)，仅保存 { store, item } 凭据引用，零明文密码。
+# 完整字段参考: docs/reference/config.md
+# =============================================================================
+version: 2
+revision: 1
+
+# =============================================================================
+# vault — 多后端凭据路由
+# 支持 offline_aead | os_keychain | external_helper | none
+# 通过 `xops creds init` / `xops creds enroll-password` / `xops creds enroll-key` 管理机密。
+# =============================================================================
+vault:
+  default_store: offline
+  remember_prompted: ask          # always | ask | never
+  stores:
+    offline:
+      kind: offline_aead
+      path: ~/.xops/vault
+    os_keychain:
+      kind: os_keychain
+    corp_helper:
+      kind: external_helper
+      command: /usr/local/bin/xops-secret-helper
+      args: ["--env", "prod"]
+      timeout: 15s
+    # none:
+    #   kind: none
+
+# =============================================================================
+# policy — 安全策略配置档与 Fail-Closed 护栏
+# =============================================================================
+policy:
+  cli_default: direct_operator    # direct_operator | strict | strict_operator | strict_agent
+  mcp_default: strict_agent
+  guardrail:
+    approval_threshold: moderate  # safe | moderate | dangerous | critical
+    no_elicit_fallback: challenge # deny | challenge
+    audit_log: ~/.xops/audit.jsonl
+    approval_ttl: 5m              # 有效范围 (0, 24h]
+    protected_paths:
+      - "/etc/**"
+      - "/root/**"
+      - "C:/Windows/**"
+    node_overrides:
+      "prod-*":
+        approval_threshold: safe
+        decision_floor: need_approval # allow | need_approval | deny
+      "staging-*": moderate           # 标量简写，等价于仅设置 approval_threshold
+
+# =============================================================================
+# options — Tier-3 XOps 全局 OpenSSH 选项层
+# 四层代数折叠优先级: CLI > 托管节点 > XOps 全局 > ~/.ssh/config
+# =============================================================================
+options:
+  connect_timeout: 15s
+  server_alive_interval: 30s
+  server_alive_count_max: 3
+  strict_host_key_checking: ask   # yes | ask | accept-new | no
+  identities_only: false
+  forward_agent: false
+  control:
+    master: auto                  # no | yes | auto | ask | autoask
+    path: "~/.xops/mux-%C"
+    persist: "10m"
+
+# =============================================================================
+# inventory — 结构化资产图（Host / Identity / Node 三实体解耦）
+# =============================================================================
+inventory:
+  known_stores:
+    - offline
+    - os_keychain
+    - corp_helper
+
+  hosts:
+    h-bastion:
+      address: bastion.example.com
+      port: 22
+      tags: [infra, bastion]
+      description: "Jump host for internal fleet"
+
+    h-web1:
+      address: 192.0.2.10
+      port: 22
+      alias: web1-ip
+      tags: [prod, web]
+      description: "Production web 1"
+
+    h-db-primary:
+      address: 198.51.100.20
+      port: 2222
+      tags: [prod, database]
+      description: "Primary database host"
+
+  identities:
+    # 1. SSH Agent 认证（推荐用于 MCP 沙箱模式）
+    id-agent:
+      user: deploy
+      auth:
+        kind: agent
+
+    # 2. 私钥认证（若带口令，passphrase_ref 与 key_fingerprint 必须成对提供）
+    id-key:
+      user: deploy
+      auth:
+        kind: private_key
+        key_paths: ["~/.ssh/id_ed25519"]
+        cert_paths: ["~/.ssh/id_ed25519-cert.pub"]
+        passphrase_ref:
+          store: offline
+          item: deploy-key-pass
+        key_fingerprint: "SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU"
+
+    # 3. 密码认证（仅引用 Vault 条目，零明文密码）
+    id-pass:
+      user: app
+      auth:
+        kind: password
+        password_ref:
+          store: offline
+          item: app-login-pass
+
+    # 4. 组合多因素认证（Agent + Keyboard-Interactive TOTP）
+    id-mfa:
+      user: ops
+      auth:
+        kind: composite
+        methods:
+          - kind: agent
+          - kind: keyboard_interactive
+            rules:
+              - kind: totp
+                name: "authenticator-otp"
+                prompt_pattern: "(?i)verification code|otp"
+                totp_secret_ref:
+                  store: offline
+                  item: ops-totp
+
+  nodes:
+    bastion:
+      host: h-bastion
+      identity: id-agent
+      tags: [infra, bastion]
+      description: "Production bastion"
+
+    web-01:
+      host: h-web1
+      identity: id-key
+      aliases: [prod-web-1]
+      tags: [prod, web]
+      proxy:
+        kind: jump
+        hops: [bastion]
+      execution:
+        launch_dialect: posix     # posix | powershell | cmd | raw
+        interpreter: bash         # server | sh | bash | zsh | powershell | pwsh | cmd
+        login: disabled           # disabled | login | inherit
+      privilege_password_ref:
+        store: offline
+        item: web01-sudo
+      description: "Primary web server"
+
+    db-primary:
+      host: h-db-primary
+      identity: id-pass
+      tags: [prod, database]
+      proxy:
+        kind: jump
+        hops: [bastion]
+      execution:
+        launch_dialect: posix
+        interpreter: sh
+        login: disabled
+      description: "Primary database node"

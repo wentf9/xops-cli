@@ -6,10 +6,9 @@
     "node": ">=22"
   },
   "scripts": {
-    "docs:generate": "node scripts/docs/generate.mjs",
-    "docs:check": "node --test scripts/docs/*.test.mjs && node scripts/docs/check-locales.mjs",
-    "docs:dev": "npm run docs:generate && node scripts/docs/vitepress.mjs dev",
-    "docs:build": "npm run docs:check && npm run docs:generate && node scripts/docs/vitepress.mjs build",
+    "docs:check": "node scripts/docs/check-locales.mjs",
+    "docs:dev": "node scripts/docs/vitepress.mjs dev",
+    "docs:build": "npm run docs:check && node scripts/docs/vitepress.mjs build",
     "docs:preview": "node scripts/docs/vitepress.mjs preview"
   },
   "devDependencies": {

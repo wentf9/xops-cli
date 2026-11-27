@@ -2,7 +2,7 @@
 
 ## 本地开发
 
-需要 Node.js 22+ 和 Go 1.26+。在仓库根目录运行：
+需要 Node.js 22+。在仓库根目录运行：
 
 ```bash
 npm ci
@@ -16,13 +16,13 @@ npm run docs:build
 npm run docs:preview
 ```
 
-CLI 参考在构建前从源码生成，输出目录为 `reference/commands/` 与 `en/reference/commands/`，不提交生成文件。脚本只调用 `--help`，使用临时配置目录，不读取生产配置或连接主机。
+面向用户的 CLI 命令参考以静态双语页面 `docs/reference/index.md` 与 `docs/en/reference/index.md` 作为单一事实源维护，修改 `internal/entry/cli/**` 的对外契约时同步更新双语参考页。
 
 ## 双语约定
 
-中文页面位于根路径，英文镜像位于 `en/`；两种语言保持相同文件名。修改指南时同时更新两种语言。`npm run docs:check` 检查目录对齐与生成器测试；VitePress 构建检查站内链接。自动检查不能判断译文是否准确。
+中文页面位于根路径，英文镜像位于 `en/`；两种语言保持相同文件名。修改指南时同时更新两种语言。`npm run docs:check` 检查目录对齐；VitePress 构建检查站内链接。自动检查不能判断译文是否准确。
 
-不要手工编辑自动命令参考，应修改 CLI 中的 i18n 文案和帮助信息。开发资料保留在仓库的 `docs/development/` 和 `docs/en/development/` 中，不参与用户文档站点构建或站内搜索。面向用户的操作说明应放入双语使用指南。
+开发资料保留在仓库的 `docs/development/`（不再强制维护 `docs/en/development/` 镜像）中，不参与用户文档站点构建或站内搜索。面向用户的操作说明应放入双语使用指南。
 
 ## GitHub Pages
 
