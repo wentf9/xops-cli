@@ -4,16 +4,17 @@ import (
 	"context"
 	"crypto/cipher"
 	"errors"
-	"fmt"
 	"io"
 	"slices"
 	"sync"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/host/vault/helper"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -51,14 +52,14 @@ type Vault struct {
 // NewVault 校验沙箱 FS、根目录、熵源与可选隔离 KDF 规格并构造离线加密凭据库实例。
 func NewVault(spec Spec) (*Vault, error) {
 	if spec.ScopedFS == nil || !spec.RootDir.IsValid() || spec.Entropy == nil {
-		return nil, fmt.Errorf("%w: ScopedFS、RootDir 与 Entropy 均须有效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ScopedFS/RootDir/Entropy"))
 	}
 	params := spec.KDFParams
 	if !params.IsValid() {
 		params = helper.DefaultArgon2idParams()
 	}
 	if spec.KDFProcess != nil && !spec.KDFSpec.IsValid() {
-		return nil, fmt.Errorf("%w: 配置 KDFProcess 时必须提供有效 KDFSpec", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "KDFSpec"))
 	}
 	stores := slices.Clone(spec.StoreNames)
 	if len(stores) == 0 {
@@ -248,7 +249,7 @@ func (v *Vault) PutAndVerify(
 		return err
 	}
 	if !box.IsValid() {
-		return fmt.Errorf("%w: SecretBox 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretBox)
 	}
 	encoded, aead, err := v.sealItem(ref, box)
 	if err != nil {
@@ -362,7 +363,7 @@ func (v *Vault) deriveKEKAEAD(
 func (v *Vault) fillRandom(bufs ...[]byte) error {
 	for _, b := range bufs {
 		if _, err := io.ReadFull(v.entropy, b); err != nil {
-			return fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err)
+			return domi18n.WrapSentinel(ports.ErrEntropyShortRead, err)
 		}
 	}
 	return nil
@@ -376,10 +377,10 @@ func (v *Vault) checkControlArgs(ctx context.Context, pass *secret.SecretBox, ne
 		return err
 	}
 	if v == nil || !v.valid {
-		return fmt.Errorf("%w: offline Vault 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "offline.Vault"))
 	}
 	if needPass && !pass.IsValid() {
-		return fmt.Errorf("%w: 主口令 SecretBox 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretBox)
 	}
 	return nil
 }
@@ -392,10 +393,10 @@ func (v *Vault) checkSecretArgs(ctx context.Context, ref secret.Ref) error {
 		return err
 	}
 	if v == nil || !v.valid {
-		return fmt.Errorf("%w: offline Vault 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "offline.Vault"))
 	}
 	if !ref.IsValid() {
-		return fmt.Errorf("%w: 无效凭据引用", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretRef)
 	}
 	return nil
 }

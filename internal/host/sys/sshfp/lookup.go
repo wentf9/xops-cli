@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -13,10 +12,12 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/host/sys"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type dnsSystemConfig struct {
@@ -60,7 +61,7 @@ func NewSystemLookup(spec Spec) (*SystemLookup, error) {
 	wait := defaultPerTryWait
 	if d, ok := spec.PerTryTimeout.Get(); ok {
 		if !d.IsPositive() {
-			return nil, fmt.Errorf("%w: PerTryTimeout 必须大于 0", ports.ErrInvalidArgument)
+			return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostDurationMustBePositive, i18n.Str("field", "PerTryTimeout"))
 		}
 		wait = d.Std()
 	}
@@ -113,10 +114,10 @@ func (l *SystemLookup) checkArgs(ctx context.Context, host netaddr.CanonicalHost
 		return err
 	}
 	if l == nil || !l.valid {
-		return fmt.Errorf("%w: SystemLookup 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "SystemLookup"))
 	}
 	if !host.IsValid() {
-		return fmt.Errorf("%w: CanonicalHost 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "CanonicalHost"))
 	}
 	return nil
 }
@@ -131,7 +132,7 @@ func (l *SystemLookup) resolveDNSConfig(ctx context.Context) (dnsSystemConfig, e
 func (l *SystemLookup) nextTXID() (uint16, error) {
 	var raw [2]byte
 	if _, err := io.ReadFull(l.entropy, raw[:]); err != nil {
-		return 0, fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err)
+		return 0, domi18n.WrapSentinel(ports.ErrEntropyShortRead, err)
 	}
 	return binary.BigEndian.Uint16(raw[:]), nil
 }
@@ -154,13 +155,13 @@ func (l *SystemLookup) queryServers(ctx context.Context, cfg dnsSystemConfig, tx
 			return nil, ports.ErrNotFound
 		}
 		if msg.rcode != dnsRcodeNoError {
-			lastErr = fmt.Errorf("DNS 服务器 %s 返回错误码 RCODE=%d", srv, msg.rcode)
+			lastErr = i18n.E(i18n.KeyHostSSHFPDNSRcode, i18n.BoundStr("server", srv), i18n.Int("rcode", int(msg.rcode)))
 			continue
 		}
 		return extractSSHFPRecords(msg, qname, msg.ad && cfg.trustAD)
 	}
 	if lastErr == nil {
-		return nil, fmt.Errorf("%w: 未配置可用 DNS 服务器", ports.ErrNotFound)
+		return nil, i18n.EF(ports.ErrNotFound, i18n.KeyHostSSHFPNoServers)
 	}
 	return nil, lastErr
 }
@@ -228,7 +229,7 @@ func exchangeTCP(ctx context.Context, server string, query []byte) ([]byte, erro
 	}
 	respLen := int(binary.BigEndian.Uint16(lenBuf[:]))
 	if respLen < dnsHeaderBytes || respLen > maxDNSTCPMessageLen {
-		return nil, fmt.Errorf("%w: DNS TCP 应答帧长度非法 (%d)", ports.ErrCorruptData, respLen)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostSSHFPDNSWireMalformed)
 	}
 	resp := make([]byte, respLen)
 	if _, err := io.ReadFull(conn, resp); err != nil {
@@ -275,14 +276,14 @@ func normalizeExplicitServers(raw []string) ([]string, error) {
 func normalizeServerAddr(raw string) (string, error) {
 	s := strings.TrimSpace(raw)
 	if s == "" {
-		return "", fmt.Errorf("%w: DNS 服务器地址不能为空", ports.ErrInvalidArgument)
+		return "", i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostSSHFPInvalidServerAddr, i18n.BoundStr("addr", raw))
 	}
 	if addr, err := netip.ParseAddr(s); err == nil {
 		return net.JoinHostPort(addr.String(), "53"), nil
 	}
 	host, port, err := net.SplitHostPort(s)
 	if err != nil || host == "" || port == "" {
-		return "", fmt.Errorf("%w: 非法 DNS 服务器地址 %q", ports.ErrInvalidArgument, raw)
+		return "", i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostSSHFPInvalidServerAddr, i18n.BoundStr("addr", raw))
 	}
 	return net.JoinHostPort(host, port), nil
 }

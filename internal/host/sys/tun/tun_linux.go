@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,7 +27,7 @@ func openLocalTUNOS(_ context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, 
 	ifr, err := unix.NewIfreq(ifName)
 	if err != nil {
 		_ = unix.Close(fd)
-		return nil, "", fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return nil, "", domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	ifr.SetUint16(flags)
 	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
@@ -54,16 +56,16 @@ func linuxIfreqSpec(spec ports.TUNSpec) (string, uint16, error) {
 		}
 		return fmt.Sprintf("tap%d", spec.LocalUnit()), flags, nil
 	default:
-		return "", 0, fmt.Errorf("%w: 不支持的 TUNMode", ports.ErrInvalidArgument)
+		return "", 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "TUNMode"))
 	}
 }
 
 func mapLinuxTUNErr(err error) error {
 	switch {
 	case errors.Is(err, unix.EPERM), errors.Is(err, unix.EACCES):
-		return fmt.Errorf("%w: %w", ports.ErrPermissionDenied, err)
+		return domi18n.WrapSentinel(ports.ErrPermissionDenied, err)
 	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.ENODEV), errors.Is(err, unix.ENXIO):
-		return fmt.Errorf("%w: %w", ports.ErrUnsupported, err)
+		return domi18n.WrapSentinel(ports.ErrUnsupported, err)
 	default:
 		return err
 	}

@@ -52,7 +52,7 @@ func attachDialCleanup(cmd *exec.Cmd) func() {
 
 func exitStatusFromState(ps *os.ProcessState) (execution.ExitStatus, error) {
 	if ps == nil {
-		return execution.NewExitUnknown("进程退出状态缺失"), nil
+		return execution.NewExitUnknown("process exit status unavailable"), nil
 	}
 	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 		sigName := strings.TrimPrefix(strings.ToUpper(unix.SignalName(ws.Signal())), "SIG")

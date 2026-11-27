@@ -5,17 +5,18 @@ import (
 	"context"
 	"encoding/csv"
 	"errors"
-	"fmt"
 	"io"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const csvFormatName = "csv"
@@ -52,8 +53,11 @@ func (i *CSVImporter) Format() string { return csvFormatName }
 
 // Import 从有界只读流解析 CSV 资产清单并产出经全量唯一性校验的不可变 inventory.ImportBundle。
 func (i *CSVImporter) Import(ctx context.Context, _ string, r io.Reader) (inventory.ImportBundle, error) {
-	if err := checkCtxReady(ctx, i != nil && i.valid && r != nil, "CSVImporter 或输入流"); err != nil {
+	if err := checkCtxReady(ctx, i != nil && i.valid, "CSVImporter"); err != nil {
 		return zeroVal[inventory.ImportBundle](), err
+	}
+	if r == nil {
+		return zeroVal[inventory.ImportBundle](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "r"))
 	}
 	raw, err := readBoundedStream(r, i.maxImportBytes)
 	if err != nil {
@@ -96,14 +100,14 @@ func (i *CSVImporter) parseCSVBytes(ctx context.Context, raw []byte) (inventory.
 		return zeroVal[inventory.ImportBundle](), err
 	}
 	if len(rows) == 0 {
-		return zeroVal[inventory.ImportBundle](), fmt.Errorf("%w: %w: CSV 输入为空", ports.ErrCorruptData, ErrInvalidCSV)
+		return zeroVal[inventory.ImportBundle](), domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVEmpty))
 	}
 	cols, dataRows, err := resolveCSVColumns(rows)
 	if err != nil {
 		return zeroVal[inventory.ImportBundle](), err
 	}
 	if len(dataRows) == 0 {
-		return zeroVal[inventory.ImportBundle](), fmt.Errorf("%w: %w: CSV 缺少数据行", ports.ErrCorruptData, ErrInvalidCSV)
+		return zeroVal[inventory.ImportBundle](), domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVEmpty))
 	}
 	return i.buildBundleFromCSVRows(cols, dataRows)
 }
@@ -119,13 +123,13 @@ func readNonBlankCSVRows(ctx context.Context, cr *csv.Reader) ([][]string, error
 			return rows, nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%w: %w: %w", ports.ErrCorruptData, ErrInvalidCSV, err)
+			return nil, domi18n.WrapSentinel(ports.ErrCorruptData, domi18n.WrapSentinel(ErrInvalidCSV, err))
 		}
 		if isBlankCSVRow(rec) {
 			continue
 		}
 		if len(rows) >= defaultMaxCSVRecords {
-			return nil, fmt.Errorf("%w: CSV 行数超过上限 %d", ports.ErrLimitExceeded, defaultMaxCSVRecords)
+			return nil, i18n.EF(ports.ErrLimitExceeded, i18n.KeyHostStoreCSVTooManyRows, i18n.Int("max", defaultMaxCSVRecords))
 		}
 		rows = append(rows, rec)
 	}
@@ -218,10 +222,10 @@ func parseCSVHeader(header []string) (csvColumnMap, error) {
 	for idx, raw := range header {
 		key := normalizeCSVHeader(raw)
 		if isForbiddenSecretCSVColumn(key) {
-			return csvColumnMap{}, fmt.Errorf("%w: %w (列 %q)", ports.ErrInvalidArgument, ErrPlaintextSecretForbidden, raw)
+			return csvColumnMap{}, domi18n.WrapSentinel(ports.ErrInvalidArgument, i18n.EF(ErrPlaintextSecretForbidden, i18n.KeyHostStoreCSVForbiddenColumn, i18n.BoundStr("column", raw)))
 		}
 		if key == "" || seen[key] {
-			return csvColumnMap{}, fmt.Errorf("%w: %w: 表头包含空列或重复列 %q", ports.ErrCorruptData, ErrInvalidCSV, raw)
+			return csvColumnMap{}, domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVDupOrEmptyColumn, i18n.BoundStr("column", raw)))
 		}
 		seen[key] = true
 		if err := assignCSVColumn(&cols, key, idx); err != nil {
@@ -229,7 +233,7 @@ func parseCSVHeader(header []string) (csvColumnMap, error) {
 		}
 	}
 	if cols.alias < 0 || cols.address < 0 || cols.user < 0 {
-		return csvColumnMap{}, fmt.Errorf("%w: %w: CSV 表头必须包含 name/alias、address/host 与 user 列", ports.ErrCorruptData, ErrInvalidCSV)
+		return csvColumnMap{}, domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVMissingReqColumns))
 	}
 	return cols, nil
 }
@@ -257,13 +261,13 @@ func assignCSVColumn(cols *csvColumnMap, key string, idx int) error {
 	case "description", "desc":
 		return setUniqueCol(&cols.description, idx, key)
 	default:
-		return fmt.Errorf("%w: %w: 未知 CSV 列 %q", ports.ErrCorruptData, ErrInvalidCSV, key)
+		return domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVUnknownColumn, i18n.BoundStr("column", key)))
 	}
 }
 
 func setUniqueCol(slot *int, idx int, key string) error {
 	if *slot >= 0 {
-		return fmt.Errorf("%w: %w: 语义重复列 %q", ports.ErrCorruptData, ErrInvalidCSV, key)
+		return domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVDupOrEmptyColumn, i18n.BoundStr("column", key)))
 	}
 	*slot = idx
 	return nil
@@ -289,10 +293,10 @@ func (i *CSVImporter) buildBundleFromCSVRows(cols csvColumnMap, rows [][]string)
 	}
 	for rowIdx, rec := range rows {
 		if cols.hasHeader && len(rec) != cols.headerLen {
-			return zeroVal[inventory.ImportBundle](), fmt.Errorf("%w: %w: 第 %d 行列数 %d 与表头列数 %d 不一致", ports.ErrCorruptData, ErrInvalidCSV, rowIdx+1, len(rec), cols.headerLen)
+			return zeroVal[inventory.ImportBundle](), domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVColumnCountMismatch, i18n.Int("row", rowIdx+1), i18n.Int("got", len(rec)), i18n.Int("want", cols.headerLen)))
 		}
 		if !cols.hasHeader && len(rec) != 4 {
-			return zeroVal[inventory.ImportBundle](), fmt.Errorf("%w: %w: 第 %d 行期望 4 列（alias,address,port,user），实际 %d 列", ports.ErrCorruptData, ErrInvalidCSV, rowIdx+1, len(rec))
+			return zeroVal[inventory.ImportBundle](), domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrInvalidCSV, i18n.KeyHostStoreCSVColumnCountMismatch, i18n.Int("row", rowIdx+1), i18n.Int("got", len(rec)), i18n.Int("want", 4)))
 		}
 		h, id, n, err := i.decodeCSVRow(cols, rec, rowIdx+1)
 		if err != nil {
@@ -308,19 +312,19 @@ func (i *CSVImporter) buildBundleFromCSVRows(cols csvColumnMap, rows [][]string)
 func (i *CSVImporter) decodeCSVRow(cols csvColumnMap, rec []string, rowNo int) (h inventory.Host, id inventory.Identity, n inventory.Node, err error) {
 	nid, err := inventory.ParseNodeID(csvCell(rec, cols.alias))
 	if err != nil {
-		return h, id, n, fmt.Errorf("%w: 第 %d 行节点名非法: %w", ErrInvalidCSV, rowNo, err)
+		return h, id, n, i18n.WrapS(ErrInvalidCSV, err, i18n.KeyHostStoreCSVRowInvalidField, i18n.Int("row", rowNo), i18n.Str("field", "alias"))
 	}
 	ep, err := parseCSVEndpoint(csvCell(rec, cols.address), csvCell(rec, cols.port), i.defaultPort)
 	if err != nil {
-		return h, id, n, fmt.Errorf("%w: 第 %d 行端点非法: %w", ErrInvalidCSV, rowNo, err)
+		return h, id, n, i18n.WrapS(ErrInvalidCSV, err, i18n.KeyHostStoreCSVRowInvalidField, i18n.Int("row", rowNo), i18n.Str("field", "endpoint"))
 	}
 	user, err := option.ParseUsername(csvCell(rec, cols.user))
 	if err != nil {
-		return h, id, n, fmt.Errorf("%w: 第 %d 行用户名非法: %w", ErrInvalidCSV, rowNo, err)
+		return h, id, n, i18n.WrapS(ErrInvalidCSV, err, i18n.KeyHostStoreCSVRowInvalidField, i18n.Int("row", rowNo), i18n.Str("field", "user"))
 	}
 	auth, err := parseCSVAuth(csvCell(rec, cols.keyPath), csvCell(rec, cols.certPath))
 	if err != nil {
-		return h, id, n, fmt.Errorf("%w: 第 %d 行认证配置非法: %w", ErrInvalidCSV, rowNo, err)
+		return h, id, n, i18n.WrapS(ErrInvalidCSV, err, i18n.KeyHostStoreCSVRowInvalidField, i18n.Int("row", rowNo), i18n.Str("field", "auth"))
 	}
 	return buildCSVEntities(nid, ep, user, auth, cols, rec, rowNo)
 }
@@ -335,15 +339,15 @@ func buildCSVEntities(
 	}
 	proxy, err := parseCSVProxy(csvCell(rec, cols.proxyJump))
 	if err != nil {
-		return h, id, n, fmt.Errorf("%w: 第 %d 行 proxy_jump 非法: %w", ErrInvalidCSV, rowNo, err)
+		return h, id, n, i18n.WrapS(ErrInvalidCSV, err, i18n.KeyHostStoreCSVRowInvalidField, i18n.Int("row", rowNo), i18n.Str("field", "proxy_jump"))
 	}
 	aliases, err := mapSliceErr(splitCSVMultiVal(csvCell(rec, cols.aliases)), inventory.ParseAlias)
 	if err != nil {
-		return h, id, n, fmt.Errorf("%w: 第 %d 行 aliases 非法: %w", ErrInvalidCSV, rowNo, err)
+		return h, id, n, i18n.WrapS(ErrInvalidCSV, err, i18n.KeyHostStoreCSVRowInvalidField, i18n.Int("row", rowNo), i18n.Str("field", "aliases"))
 	}
 	tags, err := mapSliceErr(splitCSVMultiVal(csvCell(rec, cols.tags)), inventory.ParseTag)
 	if err != nil {
-		return h, id, n, fmt.Errorf("%w: 第 %d 行 tags 非法: %w", ErrInvalidCSV, rowNo, err)
+		return h, id, n, i18n.WrapS(ErrInvalidCSV, err, i18n.KeyHostStoreCSVRowInvalidField, i18n.Int("row", rowNo), i18n.Str("field", "tags"))
 	}
 	n, err = inventory.NewNode(inventory.NodeSpec{
 		ID: nid, HostRef: h.ID(), IdentityRef: id.ID(), Aliases: aliases, Tags: tags,
@@ -384,7 +388,7 @@ func parseCSVEndpoint(rawHost, rawPort string, defPort uint16) (netaddr.Endpoint
 	if rawPort != "" {
 		v, pErr := strconv.ParseUint(rawPort, 10, 16)
 		if pErr != nil || v == 0 {
-			return zeroVal[netaddr.Endpoint](), fmt.Errorf("端口 %q 超出 1..65535 范围", rawPort)
+			return zeroVal[netaddr.Endpoint](), i18n.E(i18n.KeyHostStoreCSVInvalidPort, i18n.BoundStr("port", rawPort))
 		}
 		port = uint16(v)
 	}
@@ -395,7 +399,7 @@ func parseCSVAuth(rawKeys, rawCerts string) (inventory.AuthMethod, error) {
 	keyStrs, certStrs := splitCSVMultiVal(rawKeys), splitCSVMultiVal(rawCerts)
 	if len(keyStrs) == 0 {
 		if len(certStrs) > 0 {
-			return nil, fmt.Errorf("配置 cert_path 时必须同时提供 key_path")
+			return nil, i18n.E(i18n.KeyHostStoreCSVCertRequiresKey)
 		}
 		return inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
 	}

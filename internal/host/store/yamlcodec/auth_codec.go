@@ -1,12 +1,11 @@
 package yamlcodec
 
 import (
-	"fmt"
-
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // IdentityDTO、AuthMethodDTO 与 ChallengeRuleDTO 为 YAML vNext version: 2 认证身份的强判别式 DTO，
@@ -133,7 +132,7 @@ func decodeAuthMethodDTO(dto AuthMethodDTO) (inventory.AuthMethod, error) {
 
 func decodeAuthPasswordDTO(dto AuthMethodDTO, mask uint8) (inventory.AuthMethod, error) {
 	if mask != 1 || dto.PasswordRef == nil {
-		return nil, fmt.Errorf("%w: password 认证仅允许 password_ref 字段", inventory.ErrInvalidAuthMethod)
+		return nil, i18n.EF(inventory.ErrInvalidAuthMethod, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "password"))
 	}
 	ref, err := decodeSecretRefDTO(dto.PasswordRef)
 	if err != nil {
@@ -144,7 +143,7 @@ func decodeAuthPasswordDTO(dto AuthMethodDTO, mask uint8) (inventory.AuthMethod,
 
 func decodeAuthPrivateKeyDTO(dto AuthMethodDTO, mask uint8) (inventory.AuthMethod, error) {
 	if mask != 2 || len(dto.KeyPaths) == 0 {
-		return nil, fmt.Errorf("%w: private_key 认证字段组合非法", inventory.ErrInvalidAuthMethod)
+		return nil, i18n.EF(inventory.ErrInvalidAuthMethod, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "private_key"))
 	}
 	kps, err := mapSliceErr(dto.KeyPaths, inventory.ParseKeyPathSpec)
 	if err != nil {
@@ -170,7 +169,7 @@ func decodePassphraseBindingDTO(refDTO *SecretRefDTO, rawFP string) (algebraic.O
 		return algebraic.None[inventory.KeyPassphraseBinding](), nil
 	}
 	if refDTO == nil || rawFP == "" {
-		return algebraic.None[inventory.KeyPassphraseBinding](), fmt.Errorf("%w: passphrase_ref 与 key_fingerprint 必须成对出现", inventory.ErrInvalidKeySpec)
+		return algebraic.None[inventory.KeyPassphraseBinding](), i18n.EF(inventory.ErrInvalidKeySpec, i18n.KeyHostYAMLPassphraseBindingPair)
 	}
 	ref, err := decodeSecretRefDTO(refDTO)
 	if err != nil {
@@ -189,7 +188,7 @@ func decodePassphraseBindingDTO(refDTO *SecretRefDTO, rawFP string) (algebraic.O
 
 func decodeAuthAgentDTO(dto AuthMethodDTO, mask uint8) (inventory.AuthMethod, error) {
 	if mask&^4 != 0 {
-		return nil, fmt.Errorf("%w: agent 认证禁止携带无关字段", inventory.ErrInvalidAuthMethod)
+		return nil, i18n.EF(inventory.ErrInvalidAuthMethod, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "agent"))
 	}
 	spOpt, err := parseOptional(dto.AgentSpec, inventory.ParseAgentSpec)
 	if err != nil {
@@ -200,7 +199,7 @@ func decodeAuthAgentDTO(dto AuthMethodDTO, mask uint8) (inventory.AuthMethod, er
 
 func decodeAuthListDTO[W, T any, R inventory.AuthMethod](ok bool, raw []W, decFn func(W) (T, error), build func(algebraic.NonEmpty[T]) (R, error)) (inventory.AuthMethod, error) {
 	if !ok {
-		return nil, fmt.Errorf("%w: 认证列表字段组合非法", inventory.ErrInvalidAuthMethod)
+		return nil, i18n.EF(inventory.ErrInvalidAuthMethod, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "auth_list"))
 	}
 	items, err := mapSliceErr(raw, decFn)
 	if err != nil {
@@ -258,7 +257,7 @@ func decodeChallengeRuleDTO(dto ChallengeRuleDTO) (inventory.ChallengeRule, erro
 			return inventory.NewRuleLoginPassword(meta)
 		}
 	}
-	return nil, fmt.Errorf("%w: 质询规则 %q 字段组合非法", inventory.ErrInvalidChallengeRule, dto.Kind)
+	return nil, i18n.EF(inventory.ErrInvalidChallengeRule, i18n.KeyHostYAMLInvalidFieldCombo, i18n.BoundStr("kind", dto.Kind))
 }
 
 func decodeChallengeSecretRule[R inventory.ChallengeRule](
@@ -268,7 +267,7 @@ func decodeChallengeSecretRule[R inventory.ChallengeRule](
 	build func(inventory.ChallengeRuleMeta, secret.Ref) (R, error),
 ) (inventory.ChallengeRule, error) {
 	if !maskOK || refDTO == nil {
-		return nil, fmt.Errorf("%w: 机密引用质询规则字段组合非法", inventory.ErrInvalidChallengeRule)
+		return nil, i18n.EF(inventory.ErrInvalidChallengeRule, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "secret_rule"))
 	}
 	ref, err := decodeSecretRefDTO(refDTO)
 	if err != nil {

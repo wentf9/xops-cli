@@ -8,12 +8,13 @@ import (
 	"crypto/hkdf"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"math/big"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // RFC 2409 Second Oakley Group (1024-bit MODP prime)，为 FreeDesktop Secret Service 规范固定素数。
@@ -50,7 +51,7 @@ func generateDHKeyPair(rng io.Reader) (dhKeyPair, error) {
 	privBytes := make([]byte, dhPrimeBytes)
 	defer clear(privBytes)
 	if _, err := io.ReadFull(rng, privBytes); err != nil {
-		return dhKeyPair{}, fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err)
+		return dhKeyPair{}, domi18n.WrapSentinel(ports.ErrEntropyShortRead, err)
 	}
 	priv := new(big.Int).SetBytes(privBytes)
 	one := big.NewInt(1)
@@ -70,13 +71,13 @@ func deriveDHAES128Key(priv *big.Int, peerPubBytes []byte) ([]byte, error) {
 		return nil, err
 	}
 	if len(peerPubBytes) == 0 || len(peerPubBytes) > dhPrimeBytes {
-		return nil, fmt.Errorf("%w: DH 服务端公钥长度非法", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSInvalidDHKey)
 	}
 	peerPub := new(big.Int).SetBytes(peerPubBytes)
 	one := big.NewInt(1)
 	pMinus1 := new(big.Int).Sub(p, one)
 	if peerPub.Cmp(one) <= 0 || peerPub.Cmp(pMinus1) >= 0 {
-		return nil, fmt.Errorf("%w: DH 服务端公钥落入弱子群范围", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSInvalidDHKey)
 	}
 	sharedInt := new(big.Int).Exp(peerPub, priv, p)
 	shared := make([]byte, dhPrimeBytes)
@@ -91,7 +92,7 @@ func encryptBoxAES128CBC(aesKey, iv []byte, box *secret.SecretBox) ([]byte, erro
 		return nil, err
 	}
 	if len(iv) != aes.BlockSize {
-		return nil, fmt.Errorf("%w: AES-CBC IV 长度非法", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostVaultSSInvalidCiphertext)
 	}
 	var cipherOut []byte
 	err = box.Use(func(plain []byte) error {
@@ -113,7 +114,7 @@ func encryptBoxAES128CBC(aesKey, iv []byte, box *secret.SecretBox) ([]byte, erro
 
 func decryptAES128CBC(aesKey, iv, ct []byte) ([]byte, error) {
 	if len(iv) != aes.BlockSize || len(ct) == 0 || len(ct)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("%w: AES-CBC 密文或 IV 长度非法", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSInvalidCiphertext)
 	}
 	block, err := aes.NewCipher(aesKey)
 	if err != nil {
@@ -134,18 +135,18 @@ func decryptAES128CBC(aesKey, iv, ct []byte) ([]byte, error) {
 
 func unpadPKCS7(b []byte) ([]byte, error) {
 	if len(b) == 0 || len(b)%aes.BlockSize != 0 {
-		return nil, fmt.Errorf("%w: PKCS#7 填充长度非法", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSInvalidCiphertext)
 	}
 	pad := int(b[len(b)-1])
 	if pad == 0 || pad > aes.BlockSize || pad > len(b) {
-		return nil, fmt.Errorf("%w: PKCS#7 填充字节越界", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSInvalidCiphertext)
 	}
 	var bad byte
 	for i := len(b) - pad; i < len(b); i++ {
 		bad |= b[i] ^ byte(pad)
 	}
 	if bad != 0 {
-		return nil, fmt.Errorf("%w: PKCS#7 填充校验失败", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSInvalidCiphertext)
 	}
 	return b[:len(b)-pad], nil
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // StreamDiagnostic 描述纯内存流式解析 OpenSSH 配置时产生的非致命结构化告警
@@ -36,7 +37,7 @@ func ParseConfigStream(sourceName string, raw []byte, localID algebraic.Option[p
 		name = "ssh_config"
 	}
 	if id, ok := localID.Get(); ok && !id.IsValid() {
-		return ParsedStreamResult{}, fmt.Errorf("%w: LocalIdentity 无效", ports.ErrInvalidArgument)
+		return ParsedStreamResult{}, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "LocalIdentity"))
 	}
 	doc, diags, err := parseStreamBytes(name, raw)
 	if err != nil {
@@ -113,7 +114,7 @@ func parseStreamBytes(sourceName string, raw []byte) (*parsedFile, []StreamDiagn
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, nil, fmt.Errorf("%w: 读取 %s 失败: %w", ErrInvalidConfig, sourceName, err)
+		return nil, nil, i18n.WrapS(ErrInvalidConfig, err, i18n.KeyHostReadFailed, i18n.BoundStr("path", sourceName))
 	}
 	return doc, diags, nil
 }
@@ -125,7 +126,7 @@ func parseStreamLine(sourceName string, lineNo int, rawLine string) (configStmt,
 	}
 	key, val, err := splitConfigKeywordValue(trimmed)
 	if err != nil {
-		return configStmt{}, false, StreamDiagnostic{}, fmt.Errorf("%w: %s:%d: %w", ErrInvalidConfig, sourceName, lineNo, err)
+		return configStmt{}, false, StreamDiagnostic{}, i18n.WrapS(ErrInvalidConfig, err, i18n.KeyHostOpenSSHLineError, i18n.BoundStr("file", sourceName), i18n.Int("line", lineNo))
 	}
 	switch strings.ToLower(key) {
 	case "host":
@@ -148,13 +149,13 @@ func parseStreamLine(sourceName string, lineNo int, rawLine string) (configStmt,
 func parseStreamInclude(sourceName string, lineNo int, key, val string) (configStmt, bool, StreamDiagnostic, error) {
 	pats, err := splitConfigTokens(val)
 	if err != nil || len(pats) == 0 {
-		return configStmt{}, false, StreamDiagnostic{}, fmt.Errorf("%w: %s:%d: Include 路径非法", ErrInvalidConfig, sourceName, lineNo)
+		return configStmt{}, false, StreamDiagnostic{}, i18n.EF(ErrInvalidConfig, i18n.KeyHostOpenSSHInvalidClause, i18n.BoundStr("file", sourceName), i18n.Int("line", lineNo), i18n.Str("clause", "Include"))
 	}
 	diag := StreamDiagnostic{
 		Code:    "include_skipped",
 		Line:    lineNo,
 		Subject: pats[0],
-		Message: fmt.Sprintf("第 %d 行 Include %q 在纯流式导入中未展开本地文件", lineNo, strings.Join(pats, " ")),
+		Message: fmt.Sprintf("line %d: Include %q skipped in stream-only import (local files are not expanded)", lineNo, strings.Join(pats, " ")),
 	}
 	return configStmt{kind: stmtInclude, file: sourceName, line: lineNo, key: key, rawVal: val, patterns: pats}, true, diag, nil
 }
@@ -165,7 +166,7 @@ func matchStreamDiagnostic(stmt configStmt) StreamDiagnostic {
 			Code:    "match_canonical_ignored",
 			Line:    stmt.line,
 			Subject: "canonical",
-			Message: fmt.Sprintf("第 %d 行 Match canonical 块按安全策略失败关闭未生效", stmt.line),
+			Message: fmt.Sprintf("line %d: Match canonical block ignored (fail-closed by security policy)", stmt.line),
 		}
 	}
 	for i := 0; i < len(stmt.patterns); {
@@ -179,7 +180,7 @@ func matchStreamDiagnostic(stmt configStmt) StreamDiagnostic {
 				Code:    "match_exec_ignored",
 				Line:    stmt.line,
 				Subject: "exec",
-				Message: fmt.Sprintf("第 %d 行 Match exec 块按安全策略失败关闭且永不执行外部命令", stmt.line),
+				Message: fmt.Sprintf("line %d: Match exec block ignored (fail-closed; external commands are never executed)", stmt.line),
 			}
 		}
 		_, nextIdx, ok := readMatchCriterionArg(stmt.patterns, i, inlineVal, hasEq)

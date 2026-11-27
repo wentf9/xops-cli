@@ -5,13 +5,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type stmtKind uint8
@@ -60,15 +60,15 @@ func (st *loadState) loadFile(ctx context.Context, filePath pathalg.LocalSourceP
 		return nil, false, err
 	}
 	if depth > st.source.maxIncludeDepth {
-		return nil, false, fmt.Errorf("%w: %s (depth=%d)", ErrIncludeDepthExceeded, filePath.String(), depth)
+		return nil, false, i18n.EF(ErrIncludeDepthExceeded, i18n.KeyHostOpenSSHIncludeDepthAt, i18n.BoundStr("path", filePath.String()), i18n.Int("depth", depth))
 	}
 	canon := filePath.String()
 	if st.ancestors[canon] {
-		return nil, false, fmt.Errorf("%w: %s", ErrIncludeCycle, canon)
+		return nil, false, i18n.EF(ErrIncludeCycle, i18n.KeyHostOpenSSHIncludeCycleAt, i18n.BoundStr("path", canon))
 	}
 	st.fileCount++
 	if st.fileCount > st.source.maxIncludedFiles {
-		return nil, false, fmt.Errorf("%w: Include 加载文件数超过上限 %d", ports.ErrLimitExceeded, st.source.maxIncludedFiles)
+		return nil, false, i18n.EF(ports.ErrLimitExceeded, i18n.KeyHostOpenSSHIncludeFilesExceeded, i18n.Int("max", st.source.maxIncludedFiles))
 	}
 	raw, exists, err := st.readFileBounded(ctx, filePath)
 	if err != nil || !exists {
@@ -83,14 +83,14 @@ func (st *loadState) readFileBounded(ctx context.Context, filePath pathalg.Local
 	var data []byte
 	err := st.source.reader.WithOperatorRead(ctx, filePath, st.source.symlinkPolicy, func(r ports.BoundedReadHandle, size int64) error {
 		if size > st.source.maxFileBytes {
-			return fmt.Errorf("%w: %s 大小 %d 超过上限 %d", ports.ErrLimitExceeded, filePath.String(), size, st.source.maxFileBytes)
+			return i18n.EF(ports.ErrLimitExceeded, i18n.KeyHostOpenSSHFileTooLarge, i18n.BoundStr("path", filePath.String()), i18n.Int64("max", st.source.maxFileBytes))
 		}
 		buf, rErr := io.ReadAll(io.LimitReader(r, st.source.maxFileBytes+1))
 		if rErr != nil {
 			return rErr
 		}
 		if int64(len(buf)) > st.source.maxFileBytes {
-			return fmt.Errorf("%w: %s 读取超出上限 %d", ports.ErrLimitExceeded, filePath.String(), st.source.maxFileBytes)
+			return i18n.EF(ports.ErrLimitExceeded, i18n.KeyHostOpenSSHFileTooLarge, i18n.BoundStr("path", filePath.String()), i18n.Int64("max", st.source.maxFileBytes))
 		}
 		data = buf
 		return nil
@@ -123,7 +123,7 @@ func (st *loadState) parseFileBytes(ctx context.Context, filePath string, raw []
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, false, fmt.Errorf("%w: 读取 %s 失败: %w", ErrInvalidConfig, filePath, err)
+		return nil, false, i18n.WrapS(ErrInvalidConfig, err, i18n.KeyHostReadFailed, i18n.BoundStr("path", filePath))
 	}
 	return doc, true, nil
 }
@@ -135,7 +135,7 @@ func (st *loadState) parseLine(ctx context.Context, filePath string, lineNo int,
 	}
 	key, val, err := splitConfigKeywordValue(trimmed)
 	if err != nil {
-		return configStmt{}, false, fmt.Errorf("%w: %s:%d: %w", ErrInvalidConfig, filePath, lineNo, err)
+		return configStmt{}, false, i18n.WrapS(ErrInvalidConfig, err, i18n.KeyHostOpenSSHLineError, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo))
 	}
 	switch strings.ToLower(key) {
 	case "host":
@@ -152,7 +152,7 @@ func (st *loadState) parseLine(ctx context.Context, filePath string, lineNo int,
 func parseHostStmt(filePath string, lineNo int, key, val string) (configStmt, bool, error) {
 	pats, pErr := splitConfigTokens(val)
 	if pErr != nil || len(pats) == 0 {
-		return configStmt{}, false, fmt.Errorf("%w: %s:%d: host 模式列表非法", ErrInvalidConfig, filePath, lineNo)
+		return configStmt{}, false, i18n.EF(ErrInvalidConfig, i18n.KeyHostOpenSSHInvalidClause, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo), i18n.Str("clause", "Host"))
 	}
 	return configStmt{kind: stmtHost, file: filePath, line: lineNo, key: key, rawVal: val, patterns: pats}, true, nil
 }
@@ -160,11 +160,11 @@ func parseHostStmt(filePath string, lineNo int, key, val string) (configStmt, bo
 func parseMatchStmt(filePath string, lineNo int, key, val string) (configStmt, bool, error) {
 	toks, mErr := splitConfigTokens(val)
 	if mErr != nil || len(toks) == 0 {
-		return configStmt{}, false, fmt.Errorf("%w: %s:%d: match 条件非法", ErrInvalidConfig, filePath, lineNo)
+		return configStmt{}, false, i18n.EF(ErrInvalidConfig, i18n.KeyHostOpenSSHInvalidClause, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo), i18n.Str("clause", "Match"))
 	}
 	isFinal, isCanonical, vErr := validateMatchTokens(toks)
 	if vErr != nil {
-		return configStmt{}, false, fmt.Errorf("%w: %s:%d: %w", ErrInvalidConfig, filePath, lineNo, vErr)
+		return configStmt{}, false, i18n.WrapS(ErrInvalidConfig, vErr, i18n.KeyHostOpenSSHLineError, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo))
 	}
 	return configStmt{
 		kind: stmtMatch, file: filePath, line: lineNo, key: key, rawVal: val,
@@ -178,7 +178,8 @@ func parseDirectiveStmt(filePath string, lineNo int, key, val string) (configStm
 		cleanedVal = stripUnquotedInlineComment(val)
 	}
 	if cleanedVal == "" {
-		return configStmt{}, false, fmt.Errorf("%w: %s:%d: 指令 %s 缺少参数值", ErrInvalidConfig, filePath, lineNo, key)
+		missingErr := i18n.E(i18n.KeyHostOpenSSHDirectiveMissingValue, i18n.BoundStr("key", key))
+		return configStmt{}, false, i18n.WrapS(ErrInvalidConfig, missingErr, i18n.KeyHostOpenSSHLineError, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo))
 	}
 	stmt := configStmt{kind: stmtDirective, file: filePath, line: lineNo, key: key, rawVal: cleanedVal}
 	// 与真实 ssh -G 对齐：凡已注册核心选项均在解析期立即执行语法与值域校验（即便位于未命中的 Host/Match 块内），
@@ -186,7 +187,7 @@ func parseDirectiveStmt(filePath string, lineNo int, key, val string) (configStm
 	if _, known := option.CanonicalOptionKey(key); known {
 		parsed, err := option.ParseOptionKV(key, cleanedVal)
 		if err != nil {
-			return configStmt{}, false, fmt.Errorf("%w: %s:%d: %w", ErrInvalidConfig, filePath, lineNo, err)
+			return configStmt{}, false, i18n.WrapS(ErrInvalidConfig, err, i18n.KeyHostOpenSSHLineError, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo))
 		}
 		stmt.parsed = parsed
 		stmt.hasParsed = true
@@ -249,13 +250,13 @@ func advanceInsideQuote(val string, i int, quote byte) (int, byte) {
 func (st *loadState) parseIncludeStmt(ctx context.Context, filePath string, lineNo int, key, val string, depth int) (configStmt, bool, error) {
 	patterns, err := splitConfigTokens(val)
 	if err != nil || len(patterns) == 0 {
-		return configStmt{}, false, fmt.Errorf("%w: %s:%d: Include 路径非法", ErrInvalidConfig, filePath, lineNo)
+		return configStmt{}, false, i18n.EF(ErrInvalidConfig, i18n.KeyHostOpenSSHInvalidClause, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo), i18n.Str("clause", "Include"))
 	}
 	stmt := configStmt{kind: stmtInclude, file: filePath, line: lineNo, key: key, rawVal: val, patterns: patterns}
 	for _, pat := range patterns {
 		targets, rErr := st.resolveIncludePattern(pat)
 		if rErr != nil {
-			return configStmt{}, false, fmt.Errorf("%w: %s:%d: %w", ErrInvalidConfig, filePath, lineNo, rErr)
+			return configStmt{}, false, i18n.WrapS(ErrInvalidConfig, rErr, i18n.KeyHostOpenSSHLineError, i18n.BoundStr("file", filePath), i18n.Int("line", lineNo))
 		}
 		for _, target := range targets {
 			child, exists, lErr := st.loadFile(ctx, target, depth+1)
@@ -273,7 +274,7 @@ func (st *loadState) parseIncludeStmt(ctx context.Context, filePath string, line
 func splitConfigKeywordValue(line string) (key, val string, err error) {
 	i := strings.IndexFunc(line, func(r rune) bool { return r == ' ' || r == '\t' || r == '=' })
 	if i <= 0 {
-		return "", "", fmt.Errorf("缺少参数值 %q", line)
+		return "", "", i18n.E(i18n.KeyHostOpenSSHDirectiveMissingValue, i18n.BoundStr("key", line))
 	}
 	key = line[:i]
 	rest := strings.TrimLeft(line[i:], " \t")
@@ -282,7 +283,7 @@ func splitConfigKeywordValue(line string) (key, val string, err error) {
 	}
 	val = strings.TrimSpace(rest)
 	if val == "" {
-		return "", "", fmt.Errorf("指令 %s 缺少参数值", key)
+		return "", "", i18n.E(i18n.KeyHostOpenSSHDirectiveMissingValue, i18n.BoundStr("key", key))
 	}
 	return key, val, nil
 }
@@ -342,5 +343,5 @@ func scanConfigQuote(raw string, start int) (string, int, error) {
 		}
 		b.WriteByte(raw[i])
 	}
-	return "", 0, fmt.Errorf("未闭合引号")
+	return "", 0, i18n.E(i18n.KeyHostOpenSSHUnclosedQuote)
 }

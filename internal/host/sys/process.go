@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"net"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const processWaitDelay = time.Second
@@ -94,7 +94,7 @@ func (p *SystemProcess) DialStdio(ctx context.Context, spec ports.ProcessSpec) (
 
 func (p *SystemProcess) checkArgs(ctx context.Context, spec ports.ProcessSpec) error {
 	if p == nil || !p.valid {
-		return fmt.Errorf("%w: SystemProcess 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "SystemProcess"))
 	}
 	if ctx == nil {
 		return ports.ErrNilContext
@@ -103,7 +103,7 @@ func (p *SystemProcess) checkArgs(ctx context.Context, spec ports.ProcessSpec) e
 		return err
 	}
 	if !spec.IsValid() {
-		return fmt.Errorf("%w: ProcessSpec 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ProcessSpec"))
 	}
 	return nil
 }

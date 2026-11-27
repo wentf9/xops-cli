@@ -15,8 +15,6 @@ package audit
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
 	"io/fs"
 	"maps"
 	"slices"
@@ -26,6 +24,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -44,7 +43,7 @@ const (
 // 本包导出的规范化哨兵错误，供调用方与诊断层精确识别审计日志损坏故障。
 var (
 	// ErrCorruptAuditLog 表示审计 JSONL 文件包含无法反序列化或校验失败的损坏记录。
-	ErrCorruptAuditLog = errors.New("audit: 审计日志记录损坏或格式非法")
+	ErrCorruptAuditLog = i18n.Sentinel(i18n.KeyHostAuditCorruptLog)
 )
 
 // SinkSpec 是构造 FileSink（ports.AuditSink）的显式入参规格。
@@ -87,7 +86,7 @@ func zeroVal[T any]() (z T) { return z }
 func resolveAuditPaths(auditOpt, runOpt algebraic.Option[pathalg.LocalRootedDest]) (auditDest, runDest pathalg.LocalRootedDest, err error) {
 	if a, ok := auditOpt.Get(); ok {
 		if !a.IsValid() {
-			return zeroVal[pathalg.LocalRootedDest](), zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: AuditFile 路径无效", ports.ErrInvalidArgument)
+			return zeroVal[pathalg.LocalRootedDest](), zeroVal[pathalg.LocalRootedDest](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "AuditFile"))
 		}
 		auditDest = a
 	} else {
@@ -98,7 +97,7 @@ func resolveAuditPaths(auditOpt, runOpt algebraic.Option[pathalg.LocalRootedDest
 	}
 	if r, ok := runOpt.Get(); ok {
 		if !r.IsValid() {
-			return zeroVal[pathalg.LocalRootedDest](), zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: RunDir 路径无效", ports.ErrInvalidArgument)
+			return zeroVal[pathalg.LocalRootedDest](), zeroVal[pathalg.LocalRootedDest](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "RunDir"))
 		}
 		runDest = r
 	} else {

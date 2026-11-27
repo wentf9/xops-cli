@@ -2,10 +2,10 @@ package tun
 
 import (
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // driverOpener 为包内白盒 TCK 与单测预留的非导出底层设备打开缝隙，生产默认绑定 openLocalTUNOS。
@@ -47,10 +47,10 @@ func (d *SystemTUNDevice) OpenLocalTUN(ctx context.Context, spec ports.TUNSpec) 
 		return nil, "", err
 	}
 	if d == nil || !d.valid || d.opener == nil {
-		return nil, "", fmt.Errorf("%w: SystemTUNDevice 未初始化", ports.ErrInvalidArgument)
+		return nil, "", i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "SystemTUNDevice"))
 	}
 	if !spec.IsValid() {
-		return nil, "", fmt.Errorf("%w: TUNSpec 无效", ports.ErrInvalidArgument)
+		return nil, "", i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "TUNSpec"))
 	}
 	return d.opener(ctx, spec)
 }

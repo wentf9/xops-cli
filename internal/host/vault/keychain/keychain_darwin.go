@@ -3,7 +3,6 @@
 package keychain
 
 import (
-	"fmt"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -11,6 +10,7 @@ import (
 	"github.com/ebitengine/purego"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -44,12 +44,12 @@ func (b *darwinSecurityBackend) ensureLoaded() error {
 	b.once.Do(func() {
 		secLib, err := purego.Dlopen(securityFrameworkPath, purego.RTLD_LAZY|purego.RTLD_LOCAL)
 		if err != nil {
-			b.loadErr = fmt.Errorf("%w: 加载 Security.framework 失败: %w", ports.ErrUnsupported, err)
+			b.loadErr = i18n.WrapS(ports.ErrUnsupported, err, i18n.KeyHostVaultKeychainLoadFramework, i18n.Str("framework", "Security.framework"))
 			return
 		}
 		cfLib, err := purego.Dlopen(coreFoundationFrameworkPath, purego.RTLD_LAZY|purego.RTLD_LOCAL)
 		if err != nil {
-			b.loadErr = fmt.Errorf("%w: 加载 CoreFoundation.framework 失败: %w", ports.ErrUnsupported, err)
+			b.loadErr = i18n.WrapS(ports.ErrUnsupported, err, i18n.KeyHostVaultKeychainLoadFramework, i18n.Str("framework", "CoreFoundation.framework"))
 			return
 		}
 		b.loadErr = b.resolveSymbols(secLib, cfLib)
@@ -74,7 +74,7 @@ func (b *darwinSecurityBackend) resolveSymbols(secLib, cfLib uintptr) error {
 	for _, t := range targets {
 		sym, err := purego.Dlsym(t.lib, t.name)
 		if err != nil || sym == 0 {
-			return fmt.Errorf("%w: 解析符号 %s 失败", ports.ErrUnsupported, t.name)
+			return i18n.EF(ports.ErrUnsupported, i18n.KeyHostVaultKeychainResolveSymbol, i18n.Str("symbol", t.name))
 		}
 		*t.dst = sym
 	}
@@ -237,6 +237,6 @@ func mapDarwinSecStatus(status int32) error {
 	case errSecInteractionNotAllowed, errSecAuthFailed:
 		return ports.ErrVaultLocked
 	default:
-		return fmt.Errorf("%w: macOS Keychain OSStatus=%d", ports.ErrUnsupported, status)
+		return i18n.EF(ports.ErrUnsupported, i18n.KeyHostVaultKeychainOSStatus, i18n.Int("status", int(status)))
 	}
 }

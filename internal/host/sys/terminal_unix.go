@@ -5,7 +5,6 @@ package sys
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"os/signal"
@@ -13,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/unix"
 )
 
@@ -37,7 +37,7 @@ func queryFileSize(in, out *os.File) (ports.TerminalSize, error) {
 		ws, err = unix.IoctlGetWinsize(int(in.Fd()), unix.TIOCGWINSZ)
 		runtime.KeepAlive(in)
 		if err != nil {
-			return zeroVal[ports.TerminalSize](), fmt.Errorf("查询 Unix 终端窗口尺寸失败: %w", err)
+			return zeroVal[ports.TerminalSize](), i18n.Wrap(err, i18n.KeyHostSysTerminalSizeFailed)
 		}
 	}
 	return ports.NewTerminalSize(ws.Col, ws.Row)
@@ -48,7 +48,7 @@ func enterRawFileOS(in, _ *os.File) (func() error, error) {
 	orig, err := unix.IoctlGetTermios(fd, ioctlReadTermios)
 	runtime.KeepAlive(in)
 	if err != nil {
-		return nil, fmt.Errorf("读取原始 termios 状态失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyHostSysTerminalRawModeFailed)
 	}
 	saved := *orig
 	raw := *orig
@@ -61,7 +61,7 @@ func enterRawFileOS(in, _ *os.File) (func() error, error) {
 	raw.Cc[unix.VTIME] = 0
 	if err := unix.IoctlSetTermios(fd, ioctlWriteTermios, &raw); err != nil {
 		runtime.KeepAlive(in)
-		return nil, fmt.Errorf("切换 Unix 终端至原始模式失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyHostSysTerminalRawModeFailed)
 	}
 	runtime.KeepAlive(in)
 
@@ -105,7 +105,7 @@ type unixCancelableFileReader struct {
 func newCancelableFileReaderOS(in *os.File) (io.Reader, func(), func(), error) {
 	wakeR, wakeW, err := os.Pipe()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("创建终端输入唤醒管道失败: %w", err)
+		return nil, nil, nil, i18n.Wrap(err, i18n.KeyHostSysCancelHandleFailed)
 	}
 	r := &unixCancelableFileReader{in: in, wakeR: wakeR, wakeW: wakeW}
 	return r, r.unblock, r.close, nil

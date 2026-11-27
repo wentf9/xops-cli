@@ -2,15 +2,16 @@ package audit
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/conc"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type lockCmdKind uint8
@@ -60,7 +61,7 @@ type FileSink struct {
 // 以非阻塞独占锁抢占 run/<ProcessID>.lock 并返回可用的 FileSink。
 func NewFileSink(spec SinkSpec) (*FileSink, error) {
 	if spec.ScopedFS == nil || !spec.RootDir.IsValid() || !spec.ProcessID.IsValid() {
-		return nil, fmt.Errorf("%w: ScopedFS、RootDir 或 ProcessID 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ScopedFS/RootDir/ProcessID"))
 	}
 	maxLines, err := normalizeMaxLockLogLines(spec.MaxLockLogLines)
 	if err != nil {
@@ -89,7 +90,7 @@ func normalizeMaxLockLogLines(raw int) (int, error) {
 		return defaultMaxLockLogLines, nil
 	}
 	if raw < 0 || raw > maxAllowedLockLogLines {
-		return 0, fmt.Errorf("%w: MaxLockLogLines=%d 超出范围", ports.ErrInvalidArgument, raw)
+		return 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostLimitOutOfRange, i18n.Str("field", "MaxLockLogLines"), i18n.Int("value", raw), i18n.Int("max", maxAllowedLockLogLines))
 	}
 	return raw, nil
 }
@@ -287,7 +288,7 @@ func (s *FileSink) Record(ctx context.Context, entry ports.AuditEntry) error {
 	}
 	rawJSON, err := entry.CanonicalJSON()
 	if err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidAuditEntry, err)
+		return domi18n.WrapSentinel(ports.ErrInvalidAuditEntry, err)
 	}
 	if err := s.appendAuditLineLocked(ctx, rawJSON); err != nil {
 		return wrapAuditRecordError(entry, err)
@@ -308,9 +309,9 @@ func wrapAuditRecordError(entry ports.AuditEntry, cause error) error {
 		if pw, err := ports.NewAuditPostWriteError(entry.OperationID(), cause); err == nil {
 			return pw
 		}
-		return fmt.Errorf("%w: %w", ports.ErrAuditPostWrite, cause)
+		return domi18n.WrapSentinel(ports.ErrAuditPostWrite, cause)
 	}
-	return fmt.Errorf("%w: %w", ports.ErrAuditWriteFailed, cause)
+	return domi18n.WrapSentinel(ports.ErrAuditWriteFailed, cause)
 }
 
 // Close 幂等释放进程级 .lock 内核锁并等待锁持有协程彻底退出：
@@ -318,7 +319,7 @@ func wrapAuditRecordError(entry ports.AuditEntry, cause error) error {
 // 若仍存在未闭合操作（如 AuditPostWriteError 触发 Halted 熔断），仅刷盘释放内核锁并保留 .lock 供启动期崩溃对账恢复。
 func (s *FileSink) Close() error {
 	if s == nil || !s.valid {
-		return fmt.Errorf("%w: FileSink 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "FileSink"))
 	}
 	s.rwMu.Lock()
 	if s.closed {
@@ -343,10 +344,10 @@ func (s *FileSink) checkOpArgs(ctx context.Context, opID security.OperationID) e
 		return err
 	}
 	if s == nil || !s.valid {
-		return fmt.Errorf("%w: FileSink 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "FileSink"))
 	}
 	if !opID.IsValid() {
-		return fmt.Errorf("%w: OperationID 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "OperationID"))
 	}
 	return nil
 }
@@ -359,7 +360,7 @@ func (s *FileSink) checkRecordArgs(ctx context.Context, entry ports.AuditEntry) 
 		return err
 	}
 	if s == nil || !s.valid {
-		return fmt.Errorf("%w: FileSink 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "FileSink"))
 	}
 	if !entry.IsValid() {
 		return ports.ErrInvalidAuditEntry

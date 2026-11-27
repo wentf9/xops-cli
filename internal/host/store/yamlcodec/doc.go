@@ -9,20 +9,20 @@
 package yamlcodec
 
 import (
-	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // SchemaVersionV2 是 XOps v2 YAML vNext 唯一接受的配置版本号（100% 零 v1 兼容）。
 const SchemaVersionV2 = 2
 
 // ErrUnsupportedSchemaVersion 表示配置文件缺失 version 字段或版本不是唯一合法的 version: 2。
-var ErrUnsupportedSchemaVersion = errors.New("yamlcodec: 不受支持的配置 schema 版本（仅支持 version: 2）")
+var ErrUnsupportedSchemaVersion = i18n.Sentinel(i18n.KeyHostYAMLUnsupportedSchema)
 
 func zeroVal[T any]() (z T) { return z }
 
@@ -74,7 +74,7 @@ func decodeSortedMap[V, T any](section string, m map[string]V, decFn func(string
 	for _, k := range keys {
 		item, err := decFn(k, m[k])
 		if err != nil {
-			return nil, fmt.Errorf("%s.%s: %w", section, k, err)
+			return nil, i18n.Wrap(err, i18n.KeyHostYAMLSectionKey, i18n.Str("section", section), i18n.BoundStr("key", k))
 		}
 		out = append(out, item)
 	}

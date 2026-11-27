@@ -7,11 +7,13 @@ import (
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/host/openssh"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const openSSHFormatName = "openssh"
@@ -38,10 +40,10 @@ func NewOpenSSHImporter(spec OpenSSHImporterSpec) (*OpenSSHImporter, error) {
 		return nil, err
 	}
 	if id, ok := spec.LocalIdentity.Get(); ok && !id.IsValid() {
-		return nil, fmt.Errorf("%w: LocalIdentity 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "LocalIdentity"))
 	}
 	if u, ok := spec.DefaultUser.Get(); ok && !u.IsValid() {
-		return nil, fmt.Errorf("%w: DefaultUser 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "DefaultUser"))
 	}
 	return &OpenSSHImporter{
 		maxImportBytes: maxBytes,
@@ -56,8 +58,11 @@ func (i *OpenSSHImporter) Format() string { return openSSHFormatName }
 
 // Import 解析单份 OpenSSH 配置流并构造格式无关 inventory.ImportBundle。
 func (i *OpenSSHImporter) Import(ctx context.Context, sourceName string, r io.Reader) (inventory.ImportBundle, error) {
-	if err := checkCtxReady(ctx, i != nil && i.valid && r != nil, "OpenSSHImporter 或输入流"); err != nil {
+	if err := checkCtxReady(ctx, i != nil && i.valid, "OpenSSHImporter"); err != nil {
 		return zeroVal[inventory.ImportBundle](), err
+	}
+	if r == nil {
+		return zeroVal[inventory.ImportBundle](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "r"))
 	}
 	raw, err := readBoundedStream(r, i.maxImportBytes)
 	if err != nil {
@@ -69,7 +74,7 @@ func (i *OpenSSHImporter) Import(ctx context.Context, sourceName string, r io.Re
 	}
 	parsed, err := openssh.ParseConfigStream(srcName, raw, i.localIdentity)
 	if err != nil {
-		return zeroVal[inventory.ImportBundle](), fmt.Errorf("%w: %w", ports.ErrCorruptData, err)
+		return zeroVal[inventory.ImportBundle](), domi18n.WrapSentinel(ports.ErrCorruptData, err)
 	}
 	return i.convertParsedStream(srcName, parsed)
 }
@@ -85,7 +90,7 @@ func (i *OpenSSHImporter) convertParsedStream(srcName string, parsed openssh.Par
 		}
 	}
 	if len(spec.Nodes) == 0 {
-		return zeroVal[inventory.ImportBundle](), fmt.Errorf("%w: OpenSSH 配置流中未解析出可导入的有效主机节点", ports.ErrCorruptData)
+		return zeroVal[inventory.ImportBundle](), i18n.EF(ports.ErrCorruptData, i18n.KeyHostStoreOpenSSHNoNodes)
 	}
 	return inventory.NewImportBundle(spec)
 }
@@ -93,17 +98,17 @@ func (i *OpenSSHImporter) convertParsedStream(srcName string, parsed openssh.Par
 func (i *OpenSSHImporter) appendVirtualHost(spec *inventory.ImportBundleSpec, srcName string, vh ports.OpenSSHVirtualHost) error {
 	nid, err := inventory.ParseNodeID(vh.Alias())
 	if err != nil {
-		appendImportWarning(spec, "alias_skipped", vh.Alias(), "别名不符合托管 NodeID 命名规范，已跳过")
+		appendImportWarning(spec, "alias_skipped", vh.Alias(), "alias does not satisfy managed NodeID naming rules; skipped")
 		return nil
 	}
 	ep, hasEP := vh.Endpoint().Get()
 	if !hasEP || !ep.IsValid() {
-		appendImportWarning(spec, "host_unresolved", vh.Alias(), "缺少可解析的 HostName 或合法主机名，已跳过")
+		appendImportWarning(spec, "host_unresolved", vh.Alias(), "missing resolvable HostName or valid host; skipped")
 		return nil
 	}
 	user, uErr := i.resolveImportUser(vh)
 	if uErr != nil {
-		appendImportWarning(spec, "user_missing", vh.Alias(), "缺少 User 且未配置默认用户名，已跳过")
+		appendImportWarning(spec, "user_missing", vh.Alias(), "missing User and no default username configured; skipped")
 		return nil
 	}
 	auth, err := buildOpenSSHImportAuth(spec, vh.Alias(), vh.Layer())
@@ -123,7 +128,7 @@ func (i *OpenSSHImporter) resolveImportUser(vh ports.OpenSSHVirtualHost) (option
 	if id, ok := i.localIdentity.Get(); ok {
 		return option.ParseUsername(id.LocalUser())
 	}
-	return zeroVal[option.Username](), fmt.Errorf("%w: 缺少有效用户名", ports.ErrInvalidArgument)
+	return zeroVal[option.Username](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "user"))
 }
 
 func buildOpenSSHImportAuth(spec *inventory.ImportBundleSpec, alias string, layer option.OptionLayer) (inventory.AuthMethod, error) {
@@ -131,7 +136,7 @@ func buildOpenSSHImportAuth(spec *inventory.ImportBundleSpec, alias string, laye
 	certs := collectLiteralSpecs(spec, alias, layer.CertificateFiles(), inventory.ParseCertPathSpec, "template_cert_skipped", "CertificateFile")
 	if len(keys) == 0 {
 		if len(certs) > 0 {
-			appendImportWarning(spec, "cert_without_key_skipped", alias, "无可用字面 IdentityFile，已跳过未绑定的 CertificateFile")
+			appendImportWarning(spec, "cert_without_key_skipped", alias, "no usable literal IdentityFile; skipped unbound CertificateFile")
 		}
 		return inventory.NewAuthAgent(algebraic.None[inventory.AgentSpec]())
 	}
@@ -153,7 +158,7 @@ func collectLiteralSpecs[T any](
 	for _, raw := range pl.RawItems() {
 		v, err := parseFn(raw)
 		if err != nil {
-			appendImportWarning(spec, warnCode, alias, fmt.Sprintf("跳过不支持直接导入的 %s %q", directive, raw))
+			appendImportWarning(spec, warnCode, alias, fmt.Sprintf("skipped unsupported %s %q for direct import", directive, raw))
 			continue
 		}
 		out = append(out, v)

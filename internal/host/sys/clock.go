@@ -2,10 +2,10 @@ package sys
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // SystemClock 实现 ports.Clock，封装真实系统墙钟、单调耗时计算与可取消睡眠等待；零值恒无效。
@@ -46,7 +46,7 @@ func (c *SystemClock) NewTimer(d time.Duration) ports.Timer {
 // Sleep 在 ctx 取消控制下阻塞等待时长 d，期间 ctx 取消立即停止定时器并返回 ctx.Err()。
 func (c *SystemClock) Sleep(ctx context.Context, d time.Duration) error {
 	if c == nil || !c.valid {
-		return fmt.Errorf("%w: SystemClock 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "SystemClock"))
 	}
 	if ctx == nil {
 		return ports.ErrNilContext

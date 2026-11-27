@@ -11,10 +11,12 @@ import (
 	"math"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // YAMLInventoryStore 实现 ports.InventoryStore，提供 YAML vNext（version: 2）乐观并发 CAS 持久化：
@@ -37,7 +39,7 @@ type YAMLInventoryStore struct {
 // NewYAMLInventoryStore 校验沙箱端口、根目录、配置文件相对路径与字节读取上限后构造 YAMLInventoryStore。
 func NewYAMLInventoryStore(spec InventoryStoreSpec) (*YAMLInventoryStore, error) {
 	if spec.ScopedFS == nil || !spec.RootDir.IsValid() {
-		return nil, fmt.Errorf("%w: ScopedFS 或 RootDir 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ScopedFS/RootDir"))
 	}
 	cfgDest, err := resolveRootedPath(spec.ConfigFile, defaultConfigFileName, "ConfigFile")
 	if err != nil {
@@ -94,10 +96,10 @@ func (s *YAMLInventoryStore) CommitCAS(ctx context.Context, expected ports.Revis
 		return zeroVal[ports.DurabilityOutcome](), err
 	}
 	if !expected.IsValid() {
-		return zeroVal[ports.DurabilityOutcome](), fmt.Errorf("%w: expected Revision 无效", ports.ErrInvalidRevision)
+		return zeroVal[ports.DurabilityOutcome](), i18n.EF(ports.ErrInvalidRevision, i18n.KeyHostInvalidField, i18n.Str("field", "expected"))
 	}
 	if !next.IsValid() {
-		return zeroVal[ports.DurabilityOutcome](), fmt.Errorf("%w: %w", ports.ErrInvalidArgument, inventory.ErrInvalidGraph)
+		return zeroVal[ports.DurabilityOutcome](), domi18n.WrapSentinel(ports.ErrInvalidArgument, inventory.ErrInvalidGraph)
 	}
 	if err := s.fs.EnsureRoot(s.rootDir, storeDirPerm); err != nil {
 		return zeroVal[ports.DurabilityOutcome](), err
@@ -169,7 +171,7 @@ func (s *YAMLInventoryStore) commitLocked(root ports.RootHandle, expected ports.
 		return zeroVal[ports.DurabilityOutcome](), ports.ErrRevisionConflict
 	}
 	if st.doc.Revision == math.MaxUint64 {
-		return zeroVal[ports.DurabilityOutcome](), fmt.Errorf("%w: 配置修订号已达 uint64 上限", ports.ErrInvalidRevision)
+		return zeroVal[ports.DurabilityOutcome](), i18n.EF(ports.ErrInvalidRevision, i18n.KeyHostStoreRevisionOverflow)
 	}
 	nextInvDTO, err := EncodeInventoryGraphDTO(next)
 	if err != nil {

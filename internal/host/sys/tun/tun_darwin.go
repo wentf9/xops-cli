@@ -5,11 +5,12 @@ package tun
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,7 +22,7 @@ const (
 
 func openLocalTUNOS(_ context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, string, error) {
 	if spec.Mode() != ports.TUNModePointToPoint {
-		return nil, "", fmt.Errorf("%w: macOS 原生 utun 仅支持 L3 点对点隧道", ports.ErrUnsupported)
+		return nil, "", i18n.EF(ports.ErrUnsupported, i18n.KeyHostTUNDarwinL3Only)
 	}
 	fd, err := unix.Socket(unix.AF_SYSTEM, unix.SOCK_DGRAM, darwinSysProtoControl)
 	if err != nil {
@@ -62,9 +63,9 @@ func openLocalTUNOS(_ context.Context, spec ports.TUNSpec) (io.ReadWriteCloser, 
 func mapDarwinTUNErr(err error) error {
 	switch {
 	case errors.Is(err, unix.EPERM), errors.Is(err, unix.EACCES):
-		return fmt.Errorf("%w: %w", ports.ErrPermissionDenied, err)
+		return domi18n.WrapSentinel(ports.ErrPermissionDenied, err)
 	case errors.Is(err, unix.ENOENT), errors.Is(err, unix.EAFNOSUPPORT), errors.Is(err, unix.EPROTONOSUPPORT):
-		return fmt.Errorf("%w: %w", ports.ErrUnsupported, err)
+		return domi18n.WrapSentinel(ports.ErrUnsupported, err)
 	default:
 		return err
 	}

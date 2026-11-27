@@ -5,13 +5,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"slices"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/host/vault/helper"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type vaultMetaWire struct {
@@ -64,26 +65,26 @@ func encodeVaultMeta(m parsedVaultMeta) ([]byte, error) {
 func decodeVaultMeta(raw []byte) (parsedVaultMeta, error) {
 	var wire vaultMetaWire
 	if err := jsonv2.Unmarshal(raw, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
-		return parsedVaultMeta{}, fmt.Errorf("%w: 解析凭据库元数据失败: %w", ports.ErrCorruptData, err)
+		return parsedVaultMeta{}, i18n.WrapS(ports.ErrCorruptData, err, i18n.KeyHostVaultOfflineMetaDecode)
 	}
 	if wire.FormatVersion != vaultFormatVersion || wire.KDF != "argon2id" {
-		return parsedVaultMeta{}, fmt.Errorf("%w: 不支持的凭据库格式版本或 KDF", ports.ErrCorruptData)
+		return parsedVaultMeta{}, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineUnsupportedFmt)
 	}
 	params, err := helper.NewArgon2idParams(wire.KDFTime, wire.KDFMemoryKiB, wire.KDFThreads)
 	if err != nil {
-		return parsedVaultMeta{}, fmt.Errorf("%w: %w", ports.ErrCorruptData, err)
+		return parsedVaultMeta{}, domi18n.WrapSentinel(ports.ErrCorruptData, err)
 	}
 	saltSlice, err := base64.StdEncoding.DecodeString(wire.SaltB64)
 	if err != nil || len(saltSlice) != vaultSaltBytes {
-		return parsedVaultMeta{}, fmt.Errorf("%w: 凭据库盐值损坏", ports.ErrCorruptData)
+		return parsedVaultMeta{}, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineCorruptField, i18n.Str("field", "salt"))
 	}
 	nonce, err := base64.StdEncoding.DecodeString(wire.WrapNonceB64)
 	if err != nil || len(nonce) != vaultNonceBytes {
-		return parsedVaultMeta{}, fmt.Errorf("%w: DEK 包装随机数长度非法", ports.ErrCorruptData)
+		return parsedVaultMeta{}, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineCorruptField, i18n.Str("field", "wrap_nonce"))
 	}
 	wrapped, err := base64.StdEncoding.DecodeString(wire.WrappedDEKB64)
 	if err != nil || len(wrapped) < vaultDEKBytes+16 {
-		return parsedVaultMeta{}, fmt.Errorf("%w: DEK 密文损坏", ports.ErrCorruptData)
+		return parsedVaultMeta{}, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineCorruptField, i18n.Str("field", "wrapped_dek"))
 	}
 	var salt [vaultSaltBytes]byte
 	copy(salt[:], saltSlice)
@@ -113,18 +114,18 @@ func encodeVaultItem(ref secret.Ref, nonce, ciphertext []byte) ([]byte, error) {
 func decodeVaultItem(raw []byte, wantRef secret.Ref) (parsedVaultItem, error) {
 	var wire vaultItemWire
 	if err := jsonv2.Unmarshal(raw, &wire, jsonv2.RejectUnknownMembers(true)); err != nil {
-		return parsedVaultItem{}, fmt.Errorf("%w: 解析凭据条目失败: %w", ports.ErrCorruptData, err)
+		return parsedVaultItem{}, i18n.WrapS(ports.ErrCorruptData, err, i18n.KeyHostVaultOfflineItemDecode)
 	}
 	if wire.FormatVersion != vaultFormatVersion || wire.Ref != wantRef.String() {
-		return parsedVaultItem{}, fmt.Errorf("%w: 凭据条目版本或引用标识不匹配", ports.ErrCorruptData)
+		return parsedVaultItem{}, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineCorruptField, i18n.Str("field", "ref"))
 	}
 	nonce, err := base64.StdEncoding.DecodeString(wire.NonceB64)
 	if err != nil || len(nonce) != vaultNonceBytes {
-		return parsedVaultItem{}, fmt.Errorf("%w: 凭据条目随机数长度非法", ports.ErrCorruptData)
+		return parsedVaultItem{}, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineCorruptField, i18n.Str("field", "nonce"))
 	}
 	ct, err := base64.StdEncoding.DecodeString(wire.CiphertextB64)
 	if err != nil || len(ct) < 16 {
-		return parsedVaultItem{}, fmt.Errorf("%w: 凭据条目密文损坏", ports.ErrCorruptData)
+		return parsedVaultItem{}, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineCorruptField, i18n.Str("field", "ciphertext"))
 	}
 	return parsedVaultItem{nonce: nonce, ciphertext: ct}, nil
 }

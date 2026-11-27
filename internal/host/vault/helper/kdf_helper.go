@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -47,7 +47,7 @@ func DefaultArgon2idParams() Argon2idParams {
 // NewArgon2idParams 校验安全下限并构造不可变 Argon2idParams（允许测试选用低内存参数加速单测）。
 func NewArgon2idParams(timeCost, memoryKiB uint32, threads uint8) (Argon2idParams, error) {
 	if timeCost == 0 || timeCost > 64 || memoryKiB < 64 || memoryKiB > 1024*1024 || threads == 0 || threads > 16 {
-		return Argon2idParams{}, fmt.Errorf("%w: Argon2id 参数越界 (t=%d, m=%d KiB, p=%d)", ports.ErrInvalidArgument, timeCost, memoryKiB, threads)
+		return Argon2idParams{}, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostVaultKDFParamsInvalid, i18n.Uint64("time", uint64(timeCost)), i18n.Uint64("memory_kib", uint64(memoryKiB)), i18n.Int("threads", int(threads)))
 	}
 	return Argon2idParams{timeCost: timeCost, memoryKiB: memoryKiB, threads: threads, valid: true}, nil
 }
@@ -77,7 +77,7 @@ func DeriveArgon2idSubprocess(
 	var res ports.ProcessResult
 	err := pass.Use(func(plain []byte) error {
 		if len(plain) == 0 || len(plain) > kdfMaxPasswordBytes {
-			return fmt.Errorf("%w: 主口令长度非法", ports.ErrInvalidArgument)
+			return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "passphrase"))
 		}
 		hdr := buildKDFRequestHeader(params, salt, len(plain))
 		frame := make([]byte, kdfReqHeaderBytes+len(plain))
@@ -92,7 +92,7 @@ func DeriveArgon2idSubprocess(
 		return zero, err
 	}
 	if !res.IsValid() || res.Truncated() || !res.Succeeded() {
-		return zero, fmt.Errorf("%w: KDF 子进程执行失败", ErrProtocol)
+		return zero, i18n.EF(ErrProtocol, i18n.KeyHostVaultKDFSubprocessFailed)
 	}
 	out := res.Stdout()
 	defer clear(out)
@@ -107,7 +107,7 @@ func checkKDFSubprocessArgs(ctx context.Context, proc ports.ProcessPort, spec po
 		return err
 	}
 	if proc == nil || !spec.IsValid() || !params.IsValid() || !pass.IsValid() {
-		return fmt.Errorf("%w: KDF 子进程参数无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "kdf_subprocess_args"))
 	}
 	return nil
 }
@@ -116,7 +116,7 @@ func checkKDFSubprocessArgs(ctx context.Context, proc ports.ProcessPort, spec po
 // 运行 Argon2id 派生后将结果帧写入 w，并在退出前零化口令与派生密钥缓冲。
 func ServeArgon2idWorker(r io.Reader, w io.Writer) error {
 	if r == nil || w == nil {
-		return fmt.Errorf("%w: KDF Worker 输入输出流不能为 nil", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "r/w"))
 	}
 	raw, err := io.ReadAll(io.LimitReader(r, kdfMaxRequestBytes+1))
 	defer clear(raw)

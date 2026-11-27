@@ -4,10 +4,10 @@ package secretservice
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // Spec 是构造 Linux FreeDesktop Secret Service 凭据库适配器 Store 的显式入参规格。
@@ -27,7 +27,7 @@ type Store struct{ valid bool }
 // NewStore 校验参数并构造非 Linux 平台占位 Store。
 func NewStore(spec Spec) (*Store, error) {
 	if spec.Entropy == nil {
-		return nil, fmt.Errorf("%w: secretservice Entropy 不能为 nil", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "secretservice.Entropy"))
 	}
 	return &Store{valid: true}, nil
 }
@@ -52,7 +52,7 @@ func (s *Store) PutAndVerify(ctx context.Context, ref secret.Ref, box *secret.Se
 		return err
 	}
 	if !box.IsValid() {
-		return fmt.Errorf("%w: SecretBox 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretBox)
 	}
 	return ports.ErrUnsupported
 }
@@ -72,8 +72,11 @@ func (s *Store) checkArgs(ctx context.Context, ref secret.Ref) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if s == nil || !s.valid || !ref.IsValid() {
-		return fmt.Errorf("%w: secretservice Store 或凭据引用无效", ports.ErrInvalidArgument)
+	if s == nil || !s.valid {
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "secretservice.Store"))
+	}
+	if !ref.IsValid() {
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretRef)
 	}
 	return nil
 }

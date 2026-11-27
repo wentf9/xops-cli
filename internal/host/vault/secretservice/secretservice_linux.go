@@ -7,13 +7,14 @@ import (
 	"context"
 	"crypto/aes"
 	"errors"
-	"fmt"
 	"io"
 
 	"github.com/godbus/dbus/v5"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -60,10 +61,10 @@ type Store struct {
 // NewStore 校验熵源与环境端口并构造 Linux Secret Service 适配器。
 func NewStore(spec Spec) (*Store, error) {
 	if spec.Entropy == nil {
-		return nil, fmt.Errorf("%w: secretservice Entropy 不能为 nil", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "secretservice.Entropy"))
 	}
 	if spec.BusAddress == "" && spec.Env == nil {
-		return nil, fmt.Errorf("%w: 未显式指定 BusAddress 时必须注入 EnvPort", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostVaultSSEnvRequired)
 	}
 	return &Store{
 		env:                spec.Env,
@@ -124,7 +125,7 @@ func (s *Store) PutAndVerify(
 		return err
 	}
 	if !box.IsValid() {
-		return fmt.Errorf("%w: SecretBox 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretBox)
 	}
 	if err := s.writeBox(ctx, ref, box); err != nil {
 		return err
@@ -136,7 +137,7 @@ func (s *Store) PutAndVerify(
 		return nil
 	})
 	if verifyErr != nil && !errors.Is(verifyErr, ports.ErrSecretVerifyFailed) && ctx.Err() == nil {
-		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, verifyErr)
+		return domi18n.WrapSentinel(ports.ErrSecretVerifyFailed, verifyErr)
 	}
 	return verifyErr
 }
@@ -219,7 +220,7 @@ func (s *Store) writeBox(ctx context.Context, ref secret.Ref, box *secret.Secret
 func (s *Store) createItemDH(ctx context.Context, coll dbus.BusObject, sess *ssSession, props map[string]dbus.Variant, box *secret.SecretBox) error {
 	iv := make([]byte, aes.BlockSize)
 	if _, err := io.ReadFull(s.entropy, iv); err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrEntropyShortRead, err)
+		return domi18n.WrapSentinel(ports.ErrEntropyShortRead, err)
 	}
 	ct, err := encryptBoxAES128CBC(sess.aesKey, iv, box)
 	if err != nil {
@@ -272,23 +273,23 @@ func (s *Store) openSession(ctx context.Context) (*ssSession, error) {
 	}
 	sock, err := ParseSessionBusUnixSocket(addr)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ports.ErrUnsupported, err)
+		return nil, domi18n.WrapSentinel(ports.ErrUnsupported, err)
 	}
 	ctrlPath, err := osfs.ValidateControlSocketPath(sock)
 	if err != nil {
-		return nil, fmt.Errorf("%w: D-Bus 套接字路径安全校验失败: %w", ports.ErrUnsupported, err)
+		return nil, i18n.WrapS(ports.ErrUnsupported, err, i18n.KeyHostVaultSSConnectFailed)
 	}
 	rawConn, _, err := osfs.DialUnixVerified(ctx, ctrlPath)
 	if err != nil {
 		if cErr := ctx.Err(); cErr != nil {
 			return nil, cErr
 		}
-		return nil, fmt.Errorf("%w: 连接并核验 D-Bus 会话总线失败: %w", ports.ErrUnsupported, err)
+		return nil, i18n.WrapS(ports.ErrUnsupported, err, i18n.KeyHostVaultSSConnectFailed)
 	}
 	conn, err := dbus.NewConn(rawConn)
 	if err != nil {
 		_ = rawConn.Close()
-		return nil, fmt.Errorf("%w: 创建 D-Bus 连接失败: %w", ports.ErrUnsupported, err)
+		return nil, i18n.WrapS(ports.ErrUnsupported, err, i18n.KeyHostVaultSSConnectFailed)
 	}
 	stopHandshake := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	authErr := conn.Auth(nil)
@@ -303,11 +304,11 @@ func (s *Store) openSession(ctx context.Context) (*ssSession, error) {
 	}
 	if authErr != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("%w: D-Bus 认证失败: %w", ports.ErrUnsupported, authErr)
+		return nil, i18n.WrapS(ports.ErrUnsupported, authErr, i18n.KeyHostVaultSSHandshakeFailed, i18n.Str("step", "Auth"))
 	}
 	if helloErr != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("%w: D-Bus Hello 失败: %w", ports.ErrUnsupported, helloErr)
+		return nil, i18n.WrapS(ports.ErrUnsupported, helloErr, i18n.KeyHostVaultSSHandshakeFailed, i18n.Str("step", "Hello"))
 	}
 	sess, err := s.negotiateSession(ctx, conn)
 	if err != nil {
@@ -352,7 +353,7 @@ func (s *Store) tryOpenDHSession(ctx context.Context, conn *dbus.Conn, svc dbus.
 	}
 	peerPub, ok := out.Value().([]byte)
 	if !ok {
-		return nil, fmt.Errorf("%w: D-Bus OpenSession 返回非字节 DH 公钥", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSBadDBusValue, i18n.Str("member", "OpenSession"))
 	}
 	aesKey, err := deriveDHAES128Key(kp.priv, peerPub)
 	if err != nil {
@@ -396,7 +397,7 @@ func isCollectionLocked(ctx context.Context, coll dbus.BusObject) (bool, error) 
 	}
 	locked, ok := v.Value().(bool)
 	if !ok {
-		return true, fmt.Errorf("%w: Collection.Locked 属性类型异常", ports.ErrCorruptData)
+		return true, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultSSBadDBusValue, i18n.Str("member", "Collection.Locked"))
 	}
 	return locked, nil
 }
@@ -437,7 +438,7 @@ func mapDBusError(err error) error {
 			return ports.ErrPermissionDenied
 		}
 	}
-	return fmt.Errorf("%w: Secret Service D-Bus 调用失败: %w", ports.ErrUnsupported, err)
+	return i18n.WrapS(ports.ErrUnsupported, err, i18n.KeyHostVaultSSDBusCallFailed)
 }
 
 func (s *Store) checkArgs(ctx context.Context, ref secret.Ref) error {
@@ -448,10 +449,10 @@ func (s *Store) checkArgs(ctx context.Context, ref secret.Ref) error {
 		return err
 	}
 	if s == nil || !s.valid {
-		return fmt.Errorf("%w: secretservice Store 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "secretservice.Store"))
 	}
 	if !ref.IsValid() {
-		return fmt.Errorf("%w: 无效凭据引用", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretRef)
 	}
 	return nil
 }

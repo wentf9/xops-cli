@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // ProxyRouteDTO、ControlPolicyDTO、AlgoPolicyDTO、PathListDTO、KnownHostsListDTO、EnvFilterDTO 与 OptionLayerDTO
@@ -104,7 +105,7 @@ func encodeProxyRouteDTO(route option.ProxyRoute) (*ProxyRouteDTO, error) {
 		}
 		return &ProxyRouteDTO{Kind: "command", Command: v.Command().String()}, nil
 	default:
-		return nil, fmt.Errorf("%w: 未知 ProxyRoute 变体 %T", option.ErrInvalidProxyRoute, route)
+		return nil, i18n.EF(option.ErrInvalidProxyRoute, i18n.KeyHostInvalidField, i18n.Str("field", "proxy_route"))
 	}
 }
 
@@ -137,7 +138,7 @@ func decodeProxyRouteDTO(dto *ProxyRouteDTO) (option.ProxyRoute, error) {
 	switch kind {
 	case "unset":
 		if hasJump || dto.Scope != "" || dto.Command != "" {
-			return nil, fmt.Errorf("%w: unset 代理路由禁止携带多余字段", option.ErrInvalidProxyRoute)
+			return nil, i18n.EF(option.ErrInvalidProxyRoute, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "unset"))
 		}
 		return option.NewProxyUnset(), nil
 	case "disabled":
@@ -146,7 +147,7 @@ func decodeProxyRouteDTO(dto *ProxyRouteDTO) (option.ProxyRoute, error) {
 		return decodeProxyJumpDTO(dto)
 	case "command":
 		if hasJump || dto.Scope != "" || strings.TrimSpace(dto.Command) == "" {
-			return nil, fmt.Errorf("%w: command 代理路由字段组合非法", option.ErrInvalidProxyRoute)
+			return nil, i18n.EF(option.ErrInvalidProxyRoute, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "command"))
 		}
 		cmd, err := option.NewProxySanitizedCmd(dto.Command)
 		if err != nil {
@@ -154,13 +155,13 @@ func decodeProxyRouteDTO(dto *ProxyRouteDTO) (option.ProxyRoute, error) {
 		}
 		return option.NewProxyCommandSpec(cmd)
 	default:
-		return nil, fmt.Errorf("%w: 未知代理路由类别 %q", option.ErrInvalidProxyRoute, dto.Kind)
+		return nil, i18n.EF(option.ErrInvalidProxyRoute, i18n.KeyHostYAMLInvalidFieldValue, i18n.Str("field", "proxy.kind"), i18n.BoundStr("value", dto.Kind))
 	}
 }
 
 func decodeProxyDisabledDTO(dto *ProxyRouteDTO, hasJump bool) (option.ProxyRoute, error) {
 	if hasJump || dto.Command != "" {
-		return nil, fmt.Errorf("%w: disabled 代理路由禁止携带跳板或命令", option.ErrInvalidProxyRoute)
+		return nil, i18n.EF(option.ErrInvalidProxyRoute, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "disabled"))
 	}
 	switch strings.ToLower(strings.TrimSpace(dto.Scope)) {
 	case "", "all":
@@ -168,13 +169,13 @@ func decodeProxyDisabledDTO(dto *ProxyRouteDTO, hasJump bool) (option.ProxyRoute
 	case "jump_only":
 		return option.NewProxyJumpDisabled(), nil
 	default:
-		return nil, fmt.Errorf("%w: 无效代理禁用范围 %q", option.ErrInvalidProxyRoute, dto.Scope)
+		return nil, i18n.EF(option.ErrInvalidProxyRoute, i18n.KeyHostYAMLInvalidFieldValue, i18n.Str("field", "proxy.scope"), i18n.BoundStr("value", dto.Scope))
 	}
 }
 
 func decodeProxyJumpDTO(dto *ProxyRouteDTO) (option.ProxyRoute, error) {
 	if dto.Scope != "" || dto.Command != "" || len(dto.Hops) == 0 || (dto.ShadowedDisabled && dto.ShadowedCmd != "") {
-		return nil, fmt.Errorf("%w: jump 代理路由字段组合非法", option.ErrInvalidProxyRoute)
+		return nil, i18n.EF(option.ErrInvalidProxyRoute, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "jump"))
 	}
 	hops, err := mapSliceErr(dto.Hops, option.ParseHopTarget)
 	if err != nil {
@@ -182,7 +183,7 @@ func decodeProxyJumpDTO(dto *ProxyRouteDTO) (option.ProxyRoute, error) {
 	}
 	ne, err := algebraic.NonEmptyFromSlice(hops)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", option.ErrInvalidProxyRoute, err)
+		return nil, domi18n.WrapSentinel(option.ErrInvalidProxyRoute, err)
 	}
 	jc, err := option.NewProxyJumpChain(ne)
 	if err != nil {
@@ -269,7 +270,7 @@ func applyOptionScalars(l option.OptionLayer, dto *OptionLayerDTO) (option.Optio
 	}
 	if dto.Port != nil {
 		if *dto.Port == 0 {
-			return option.UnsetOptionLayer(), fmt.Errorf("%w: options.port 不能为 0", option.ErrInvalidOption)
+			return option.UnsetOptionLayer(), i18n.EF(option.ErrInvalidOption, i18n.KeyHostValueMustBeNonZero, i18n.Str("field", "options.port"))
 		}
 		l = l.WithPort(*dto.Port)
 	}
@@ -337,7 +338,7 @@ func applyNonNegDuration(l option.OptionLayer, d *algebraic.Duration, name strin
 		return l, nil
 	}
 	if d.IsNegative() {
-		return option.UnsetOptionLayer(), fmt.Errorf("%w: %s 不能为负", option.ErrInvalidOption, name)
+		return option.UnsetOptionLayer(), i18n.EF(option.ErrInvalidOption, i18n.KeyHostValueMustBeNonNegative, i18n.Str("field", name))
 	}
 	return set(l, *d), nil
 }
@@ -378,7 +379,7 @@ func encodeControlPolicyDTO(c option.ControlPolicy) *ControlPolicyDTO {
 
 func decodeControlPolicyDTO(dto *ControlPolicyDTO) (option.ControlPolicy, error) {
 	if dto.LiteralPath && (strings.TrimSpace(dto.Path) == "" || strings.EqualFold(strings.TrimSpace(dto.Path), "none")) {
-		return option.UnsetControlPolicy(), fmt.Errorf("%w: literal_path 要求有效字面路径", option.ErrInvalidControlPolicy)
+		return option.UnsetControlPolicy(), i18n.EF(option.ErrInvalidControlPolicy, i18n.KeyHostYAMLLiteralPathRequired)
 	}
 	cp := option.UnsetControlPolicy()
 	if dto.Master != "" {
@@ -426,7 +427,7 @@ func decodeAlgoPolicyDTO(dto *AlgoPolicyDTO) (option.AlgoPolicy, error) {
 		return option.UnsetAlgoPolicy(), nil
 	}
 	if len(dto.Tokens) == 0 {
-		return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 算法策略 %q 缺少 tokens", option.ErrInvalidAlgoPolicy, dto.Op)
+		return option.UnsetAlgoPolicy(), i18n.EF(option.ErrInvalidAlgoPolicy, i18n.KeyHostYAMLAlgoMissingTokens, i18n.BoundStr("op", dto.Op))
 	}
 	spec, ok := map[string]struct {
 		prefix string
@@ -438,12 +439,12 @@ func decodeAlgoPolicyDTO(dto *AlgoPolicyDTO) (option.AlgoPolicy, error) {
 		"prepend": {"^", option.AlgoOpPrepend},
 	}[op]
 	if !ok {
-		return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 未知算法算子 %q", option.ErrInvalidAlgoPolicy, dto.Op)
+		return option.UnsetAlgoPolicy(), i18n.EF(option.ErrInvalidAlgoPolicy, i18n.KeyHostYAMLInvalidFieldValue, i18n.Str("field", "algo.op"), i18n.BoundStr("value", dto.Op))
 	}
 	for _, tok := range dto.Tokens {
 		if tok == "" || strings.TrimSpace(tok) != tok || strings.ContainsRune(tok, ',') ||
 			tok[0] == '+' || tok[0] == '-' || tok[0] == '^' {
-			return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 算法令牌 %q 包含非法算子前缀、空白或逗号", option.ErrInvalidAlgoPolicy, tok)
+			return option.UnsetAlgoPolicy(), i18n.EF(option.ErrInvalidAlgoPolicy, i18n.KeyHostYAMLAlgoInvalidToken, i18n.BoundStr("token", tok))
 		}
 	}
 	ap, err := option.ParseAlgoPolicy(spec.prefix + strings.Join(dto.Tokens, ","))
@@ -451,7 +452,7 @@ func decodeAlgoPolicyDTO(dto *AlgoPolicyDTO) (option.AlgoPolicy, error) {
 		return option.UnsetAlgoPolicy(), err
 	}
 	if ap.Op() != spec.op || len(ap.Tokens()) != len(dto.Tokens) {
-		return option.UnsetAlgoPolicy(), fmt.Errorf("%w: 算法策略算子或令牌数与判别式 %q 不一致", option.ErrInvalidAlgoPolicy, dto.Op)
+		return option.UnsetAlgoPolicy(), i18n.EF(option.ErrInvalidAlgoPolicy, i18n.KeyHostYAMLInvalidFieldValue, i18n.Str("field", "algo.op"), i18n.BoundStr("value", dto.Op))
 	}
 	return ap, nil
 }
@@ -485,7 +486,7 @@ func decodePathListDTO(dto *PathListDTO) (option.PathList, error) {
 		}
 		return pl, nil
 	default:
-		return option.UnsetPathList(), fmt.Errorf("%w: 非法 PathList 状态 %q", option.ErrInvalidPathList, dto.State)
+		return option.UnsetPathList(), i18n.EF(option.ErrInvalidPathList, i18n.KeyHostYAMLInvalidFieldValue, i18n.Str("field", "path_list.state"), i18n.BoundStr("value", dto.State))
 	}
 }
 
@@ -511,7 +512,7 @@ func decodeKnownHostsListDTO(dto *KnownHostsListDTO) (option.KnownHostsList, err
 		}
 		return option.NewKnownHostsList(entries...)
 	default:
-		return option.UnsetKnownHostsList(), fmt.Errorf("%w: 非法 KnownHostsList 状态 %q", option.ErrInvalidPathList, dto.State)
+		return option.UnsetKnownHostsList(), i18n.EF(option.ErrInvalidPathList, i18n.KeyHostYAMLInvalidFieldValue, i18n.Str("field", "known_hosts.state"), i18n.BoundStr("value", dto.State))
 	}
 }
 
@@ -519,11 +520,11 @@ func parseStrictSetPathEntries(items []string) ([]option.PathEntry, error) {
 	entries := make([]option.PathEntry, 0, len(items))
 	for _, raw := range items {
 		if strings.TrimSpace(raw) != raw {
-			return nil, fmt.Errorf("%w: state=set 路径项 %q 禁止包含首尾空白", option.ErrInvalidPathList, raw)
+			return nil, i18n.EF(option.ErrInvalidPathList, i18n.KeyHostYAMLPathItemInvalid, i18n.BoundStr("entry", raw))
 		}
 		entry, err := option.ParsePathEntry(raw)
 		if err != nil {
-			return nil, fmt.Errorf("%w: state=set 路径项 %q 非法: %w", option.ErrInvalidPathList, raw, err)
+			return nil, i18n.WrapS(option.ErrInvalidPathList, err, i18n.KeyHostYAMLPathItemInvalid, i18n.BoundStr("entry", raw))
 		}
 		entries = append(entries, entry)
 	}
@@ -544,13 +545,13 @@ func decodeEnvFilterDTO(dto *EnvFilterDTO) (option.EnvFilter, error) {
 	tokens := make([]string, 0, len(dto.Clear)+len(dto.Added))
 	for _, c := range dto.Clear {
 		if strings.HasPrefix(c, "-") {
-			return option.UnsetEnvFilter(), fmt.Errorf("%w: clear 模式 %q 不得重复携带 '-' 前缀", option.ErrInvalidEnvFilter, c)
+			return option.UnsetEnvFilter(), i18n.EF(option.ErrInvalidEnvFilter, i18n.KeyHostYAMLEnvPatternPrefix, i18n.Str("field", "clear"), i18n.BoundStr("pattern", c))
 		}
 		tokens = append(tokens, "-"+c)
 	}
 	for _, a := range dto.Added {
 		if strings.HasPrefix(a, "-") {
-			return option.UnsetEnvFilter(), fmt.Errorf("%w: added 模式 %q 禁止以 '-' 开头", option.ErrInvalidEnvFilter, a)
+			return option.UnsetEnvFilter(), i18n.EF(option.ErrInvalidEnvFilter, i18n.KeyHostYAMLEnvPatternPrefix, i18n.Str("field", "added"), i18n.BoundStr("pattern", a))
 		}
 		tokens = append(tokens, a)
 	}

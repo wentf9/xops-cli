@@ -6,15 +6,16 @@ import (
 	"encoding/base64"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
 	"maps"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // HelperSpec 是构造不可变外部凭据助手适配器 HelperVault 的显式入参规格（非持久化 DTO）。
@@ -49,7 +50,7 @@ type helperResponse struct {
 // NewHelperVault 校验 ProcessPort 与子进程执行规格并构造外部凭据助手适配器。
 func NewHelperVault(spec HelperSpec) (*HelperVault, error) {
 	if spec.Process == nil {
-		return nil, fmt.Errorf("%w: HelperSpec.Process 不能为 nil", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "HelperSpec.Process"))
 	}
 	timeout := spec.Timeout
 	if timeout.IsNone() {
@@ -110,10 +111,10 @@ func (v *HelperVault) PutAndVerify(
 		return err
 	}
 	if !box.IsValid() {
-		return fmt.Errorf("%w: SecretBox 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretBox)
 	}
 	if v.readOnly {
-		return fmt.Errorf("%w: 外部凭据助手处于只读模式", ports.ErrPermissionDenied)
+		return i18n.EF(ports.ErrPermissionDenied, i18n.KeyHostVaultHelperReadOnly)
 	}
 	if err := v.execStore(ctx, ref, box); err != nil {
 		return err
@@ -125,7 +126,7 @@ func (v *HelperVault) PutAndVerify(
 		return nil
 	})
 	if verifyErr != nil && !errors.Is(verifyErr, ports.ErrSecretVerifyFailed) && ctx.Err() == nil {
-		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, verifyErr)
+		return domi18n.WrapSentinel(ports.ErrSecretVerifyFailed, verifyErr)
 	}
 	return verifyErr
 }
@@ -163,7 +164,7 @@ func (v *HelperVault) Delete(ctx context.Context, ref secret.Ref) error {
 		return err
 	}
 	if v.readOnly {
-		return fmt.Errorf("%w: 外部凭据助手处于只读模式", ports.ErrPermissionDenied)
+		return i18n.EF(ports.ErrPermissionDenied, i18n.KeyHostVaultHelperReadOnly)
 	}
 	reqBytes := buildNonSecretRequest("erase", ref)
 	res, err := v.proc.Run(ctx, v.baseSpec, bytes.NewReader(reqBytes))
@@ -178,13 +179,13 @@ func (v *HelperVault) checkBase(ctx context.Context, ref secret.Ref) error {
 		return ports.ErrNilContext
 	}
 	if v == nil || !v.valid {
-		return fmt.Errorf("%w: HelperVault 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "HelperVault"))
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if !ref.IsValid() {
-		return fmt.Errorf("%w: 无效凭据引用", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretRef)
 	}
 	return nil
 }
@@ -210,14 +211,14 @@ func decodeSecretResponse(res ports.ProcessResult) ([]byte, error) {
 		return nil, mapHelperErrorCode(resp.Code)
 	}
 	if !res.Succeeded() {
-		return nil, fmt.Errorf("%w: 外部凭据助手非零退出", ports.ErrUnsupported)
+		return nil, i18n.EF(ports.ErrUnsupported, i18n.KeyHostVaultHelperNonZeroExit)
 	}
 	if resp.SecretB64 == nil {
 		return nil, ports.ErrSecretNotFound
 	}
 	raw, err := base64.StdEncoding.DecodeString(*resp.SecretB64)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 凭据载荷 Base64 解码失败", ErrProtocol)
+		return nil, i18n.EF(ErrProtocol, i18n.KeyHostVaultHelperBase64Failed)
 	}
 	return raw, nil
 }
@@ -230,7 +231,7 @@ func checkStatusResponse(res ports.ProcessResult) error {
 		if res.Succeeded() {
 			return nil
 		}
-		return fmt.Errorf("%w: 外部凭据助手返回非零退出状态", ports.ErrUnsupported)
+		return i18n.EF(ports.ErrUnsupported, i18n.KeyHostVaultHelperNonZeroExit)
 	}
 	resp, err := parseHelperResponse(res)
 	if err != nil {
@@ -240,24 +241,24 @@ func checkStatusResponse(res ports.ProcessResult) error {
 		return mapHelperErrorCode(resp.Code)
 	}
 	if !res.Succeeded() {
-		return fmt.Errorf("%w: 外部凭据助手非零退出", ports.ErrUnsupported)
+		return i18n.EF(ports.ErrUnsupported, i18n.KeyHostVaultHelperNonZeroExit)
 	}
 	return nil
 }
 
 func parseHelperResponse(res ports.ProcessResult) (helperResponse, error) {
 	if !res.IsValid() || res.Truncated() {
-		return helperResponse{}, fmt.Errorf("%w: 助手输出无效或超过大小上限", ErrProtocol)
+		return helperResponse{}, i18n.EF(ErrProtocol, i18n.KeyHostVaultHelperBadResponse)
 	}
 	rawOut := res.Stdout()
 	defer clear(rawOut)
 	out := bytes.TrimSpace(rawOut)
 	if len(out) == 0 {
-		return helperResponse{}, fmt.Errorf("%w: 助手返回空响应", ErrProtocol)
+		return helperResponse{}, i18n.EF(ErrProtocol, i18n.KeyHostVaultHelperBadResponse)
 	}
 	var resp helperResponse
 	if err := jsonv2.Unmarshal(out, &resp, jsonv2.RejectUnknownMembers(true)); err != nil {
-		return helperResponse{}, fmt.Errorf("%w: 解析助手 JSON 响应失败", ErrProtocol)
+		return helperResponse{}, i18n.EF(ErrProtocol, i18n.KeyHostVaultHelperBadResponse)
 	}
 	return resp, nil
 }

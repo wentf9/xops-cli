@@ -3,16 +3,17 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
-	"fmt"
 	"net"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
 	"github.com/wentf9/xops-cli/internal/host/sys"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/crypto/ssh"
 	sshagent "golang.org/x/crypto/ssh/agent"
 )
@@ -91,7 +92,7 @@ func (a *SystemAgent) SignWithAgent(
 		return zeroVal[ports.Signature](), err
 	}
 	if !key.IsValid() || strings.TrimSpace(algorithm) == "" {
-		return zeroVal[ports.Signature](), fmt.Errorf("%w: 公钥指纹与签名算法均须有效", ports.ErrInvalidArgument)
+		return zeroVal[ports.Signature](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostAgentInvalidSignArgs)
 	}
 	conn, err := a.DialAgent(ctx, spec)
 	if err != nil {
@@ -122,7 +123,7 @@ func (a *SystemAgent) checkBase(ctx context.Context) error {
 		return err
 	}
 	if a == nil || !a.valid {
-		return fmt.Errorf("%w: SystemAgent 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "SystemAgent"))
 	}
 	return nil
 }
@@ -130,11 +131,11 @@ func (a *SystemAgent) checkBase(ctx context.Context) error {
 func (a *SystemAgent) resolveTarget(spec algebraic.Option[inventory.AgentSpec]) (string, error) {
 	if sp, has := spec.Get(); has {
 		if !sp.IsValid() {
-			return "", fmt.Errorf("%w: AgentSpec 无效", ports.ErrInvalidArgument)
+			return "", i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "AgentSpec"))
 		}
 		raw := sp.String()
 		if strings.EqualFold(raw, agentKeywordNone) {
-			return "", fmt.Errorf("%w: Agent 已被显式禁用", ports.ErrSignerUnavailable)
+			return "", i18n.EF(ports.ErrSignerUnavailable, i18n.KeyHostAgentDisabled)
 		}
 		if !strings.EqualFold(raw, agentKeywordDefault) {
 			return raw, nil
@@ -146,7 +147,7 @@ func (a *SystemAgent) resolveTarget(spec algebraic.Option[inventory.AgentSpec]) 
 	if def := defaultAgentTarget(); def != "" {
 		return def, nil
 	}
-	return "", fmt.Errorf("%w: 未配置 %s 环境变量", ports.ErrSignerUnavailable, envSSHAuthSock)
+	return "", i18n.EF(ports.ErrSignerUnavailable, i18n.KeyHostAgentEnvUnset, i18n.Str("env", envSSHAuthSock))
 }
 
 func bindConnCancel(ctx context.Context, conn net.Conn) func() bool {
@@ -159,7 +160,7 @@ func mapAgentOpError(ctx context.Context, err error) error {
 	if cErr := ctx.Err(); cErr != nil {
 		return cErr
 	}
-	return fmt.Errorf("%w: %w", ports.ErrSignerUnavailable, err)
+	return domi18n.WrapSentinel(ports.ErrSignerUnavailable, err)
 }
 
 func findMatchingAgentKey(ctx context.Context, client sshagent.ExtendedAgent, want inventory.KeyFingerprint) (ssh.PublicKey, error) {
@@ -176,7 +177,7 @@ func findMatchingAgentKey(ctx context.Context, client sshagent.ExtendedAgent, wa
 			return k, nil
 		}
 	}
-	return nil, fmt.Errorf("%w: SSH Agent 中未找到指定指纹的公钥", ports.ErrSignerUnavailable)
+	return nil, i18n.EF(ports.ErrSignerUnavailable, i18n.KeyHostAgentKeyNotFound)
 }
 
 func agentKeyToPublicKeyInfo(k *sshagent.Key) (ports.PublicKeyInfo, error) {

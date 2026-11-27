@@ -8,10 +8,11 @@ package wincred
 import (
 	"context"
 	"errors"
-	"fmt"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const targetPrefix = "xops:"
@@ -40,7 +41,7 @@ func NewStore() *Store {
 // NewStoreWithBackend 使用显式注入后端构造 Store（供跨平台 TCK 与确定性故障测试复用）。
 func NewStoreWithBackend(backend Backend) (*Store, error) {
 	if backend == nil {
-		return nil, fmt.Errorf("%w: wincred Backend 不能为 nil", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "wincred.Backend"))
 	}
 	return &Store{backend: backend, valid: true}, nil
 }
@@ -83,7 +84,7 @@ func (s *Store) PutAndVerify(
 		return err
 	}
 	if !box.IsValid() {
-		return fmt.Errorf("%w: SecretBox 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretBox)
 	}
 	target := TargetName(ref)
 	if err := s.backend.Write(target, ref.Item(), box); err != nil {
@@ -96,7 +97,7 @@ func (s *Store) PutAndVerify(
 		return nil
 	})
 	if verifyErr != nil && !errors.Is(verifyErr, ports.ErrSecretVerifyFailed) && ctx.Err() == nil {
-		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, verifyErr)
+		return domi18n.WrapSentinel(ports.ErrSecretVerifyFailed, verifyErr)
 	}
 	return verifyErr
 }
@@ -117,10 +118,10 @@ func (s *Store) checkArgs(ctx context.Context, ref secret.Ref) error {
 		return err
 	}
 	if s == nil || !s.valid || s.backend == nil {
-		return fmt.Errorf("%w: wincred Store 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "wincred.Store"))
 	}
 	if !ref.IsValid() {
-		return fmt.Errorf("%w: 无效凭据引用", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretRef)
 	}
 	return nil
 }

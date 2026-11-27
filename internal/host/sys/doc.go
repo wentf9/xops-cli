@@ -11,14 +11,14 @@
 //   - 全包生产与测试源码零行内 //nolint:、零裸 OS 文件系统绕过。
 package sys
 
-import "errors"
+import "github.com/wentf9/xops-cli/internal/i18n"
 
 // 本包导出的规范化哨兵错误，供上层以 errors.Is 精确区分系统适配层故障。
 var (
 	// ErrOrphanedProcessGroup 表示当前进程处于 POSIX 孤儿进程组或会话首进程，不可安全挂起（INV-E1）。
-	ErrOrphanedProcessGroup = errors.New("sys: 当前进程处于孤儿进程组或会话首进程，禁止执行挂起")
+	ErrOrphanedProcessGroup = i18n.Sentinel(i18n.KeyHostSysOrphanedProcessGroup)
 	// errInputCanceled 为内部哨兵，用于标识本机终端输入读取因 Relay 作用域结束而被主动唤醒取消。
-	errInputCanceled = errors.New("sys: 终端输入读取已随作用域取消")
+	errInputCanceled = i18n.Sentinel(i18n.KeyHostSysInputCanceled)
 )
 
 func zeroVal[T any]() (z T) { return z }

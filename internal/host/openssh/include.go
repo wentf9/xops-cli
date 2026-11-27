@@ -2,13 +2,13 @@ package openssh
 
 import (
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // resolveIncludePattern 将单条 Include 模式展开为有序且去重的只读配置文件路径列表；
@@ -32,7 +32,7 @@ func (st *loadState) expandIncludePath(rawPat string) (string, error) {
 	norm := strings.ReplaceAll(rawPat, "\\", "/")
 	if rest, ok := strings.CutPrefix(norm, "~/"); ok {
 		if st.source.homeDir == "" {
-			return "", fmt.Errorf("展开 include 路径 %q 需要有效 HomeDir", rawPat)
+			return "", i18n.E(i18n.KeyHostOpenSSHIncludeNeedsHome, i18n.BoundStr("pattern", rawPat))
 		}
 		return joinSlashPath(strings.ReplaceAll(st.source.homeDir, "\\", "/"), rest), nil
 	}
@@ -44,7 +44,7 @@ func (st *loadState) expandIncludePath(rawPat string) (string, error) {
 
 func (st *loadState) expandIncludeGlob(pattern string) ([]pathalg.LocalSourcePath, error) {
 	if st.source.scopedFS == nil {
-		return nil, fmt.Errorf("%w: 通配符 Include %q 需要提供 ScopedFS", ports.ErrInvalidArgument, pattern)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostOpenSSHIncludeGlobNeedsFS, i18n.BoundStr("pattern", pattern))
 	}
 	baseDir, globSegs, err := splitStaticBaseAndGlob(pattern)
 	if err != nil {
@@ -67,11 +67,11 @@ func (st *loadState) expandIncludeGlob(pattern string) ([]pathalg.LocalSourcePat
 func splitStaticBaseAndGlob(pattern string) (pathalg.LocalDir, []string, error) {
 	prefix, segs := splitRootPrefixAndSegments(pattern)
 	if slices.Contains(segs, "..") {
-		return zeroVal[pathalg.LocalDir](), nil, fmt.Errorf("通配符 include 路径 %q 禁止包含 '..' 路径段", pattern)
+		return zeroVal[pathalg.LocalDir](), nil, i18n.E(i18n.KeyHostOpenSSHIncludeGlobDotDot, i18n.BoundStr("pattern", pattern))
 	}
 	firstGlob := slices.IndexFunc(segs, hasIncludeGlobMeta)
 	if firstGlob < 0 {
-		return zeroVal[pathalg.LocalDir](), nil, fmt.Errorf("内部错误：路径 %q 不含通配符", pattern)
+		return zeroVal[pathalg.LocalDir](), nil, i18n.E(i18n.KeyHostOpenSSHInvalidGlob, i18n.BoundStr("pattern", pattern))
 	}
 	for _, seg := range segs[firstGlob:] {
 		if err := validateIncludeGlobSegment(seg); err != nil {
@@ -237,7 +237,7 @@ func matchIncludeGlobAtom(ch byte, pat string, pi int) (bool, int, error) {
 func scanGlobCharClass(pat string, start int, target byte, eval bool) (bool, int, error) {
 	i := start + 1
 	if i >= len(pat) {
-		return false, i, fmt.Errorf("通配符 %q 存在未闭合 '['", pat)
+		return false, i, i18n.E(i18n.KeyHostOpenSSHInvalidGlob, i18n.BoundStr("pattern", pat))
 	}
 	// 严格遵循 POSIX glob(3) 与 OpenSSH readconf.c 语义：仅 '[!...]' 取反，前导 '^' 按字面字符匹配。
 	negated := pat[i] == '!'
@@ -256,7 +256,7 @@ func scanGlobCharClass(pat string, start int, target byte, eval bool) (bool, int
 		matched = matched || hit
 		i, count = next, count+1
 	}
-	return false, i, fmt.Errorf("通配符 %q 存在未闭合 '['", pat)
+	return false, i, i18n.E(i18n.KeyHostOpenSSHInvalidGlob, i18n.BoundStr("pattern", pat))
 }
 
 func scanGlobClassItem(pat string, i int, target byte, eval bool) (bool, int, error) {
@@ -264,7 +264,7 @@ func scanGlobClassItem(pat string, i int, target byte, eval bool) (bool, int, er
 	if i+2 < len(pat) && pat[i+1] == '-' && pat[i+2] != ']' {
 		hi := pat[i+2]
 		if lo > hi {
-			return false, i, fmt.Errorf("通配符 %q 存在非法字符范围 [%c-%c]", pat, lo, hi)
+			return false, i, i18n.E(i18n.KeyHostOpenSSHInvalidGlob, i18n.BoundStr("pattern", pat))
 		}
 		return eval && target >= lo && target <= hi, i + 3, nil
 	}

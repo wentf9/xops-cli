@@ -2,8 +2,8 @@ package store
 
 import (
 	"errors"
-	"fmt"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -41,7 +41,7 @@ type (
 func DecodeConfigDocumentYAML(raw []byte) (ConfigDocument, inventory.Graph, error) {
 	doc, graph, err := yamlcodec.DecodeConfigDocumentYAML(raw)
 	if errors.Is(err, yamlcodec.ErrUnsupportedSchemaVersion) {
-		return doc, graph, fmt.Errorf("%w: %w", ErrUnsupportedSchemaVersion, err)
+		return doc, graph, domi18n.WrapSentinel(ErrUnsupportedSchemaVersion, err, yamlcodec.ErrUnsupportedSchemaVersion)
 	}
 	return doc, graph, err
 }
@@ -50,7 +50,7 @@ func DecodeConfigDocumentYAML(raw []byte) (ConfigDocument, inventory.Graph, erro
 func EncodeConfigDocumentYAML(doc ConfigDocument) ([]byte, error) {
 	out, err := yamlcodec.EncodeConfigDocumentYAML(doc)
 	if errors.Is(err, yamlcodec.ErrUnsupportedSchemaVersion) {
-		return nil, fmt.Errorf("%w: %w", ErrUnsupportedSchemaVersion, err)
+		return nil, domi18n.WrapSentinel(ErrUnsupportedSchemaVersion, err, yamlcodec.ErrUnsupportedSchemaVersion)
 	}
 	return out, err
 }

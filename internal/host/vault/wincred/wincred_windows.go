@@ -5,12 +5,13 @@ package wincred
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"runtime"
 	"unsafe"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/windows"
 )
 
@@ -61,7 +62,7 @@ func newPlatformBackend() Backend {
 func (b *winAdvapi32Backend) Read(target string) ([]byte, error) {
 	targetPtr, err := windows.UTF16PtrFromString(target)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return nil, domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	var credPtr *credentialW
 	r1, _, lastErr := b.credReadW.Call(
@@ -90,15 +91,15 @@ func (b *winAdvapi32Backend) Read(target string) ([]byte, error) {
 func (b *winAdvapi32Backend) Write(target, user string, box *secret.SecretBox) error {
 	targetPtr, err := windows.UTF16PtrFromString(target)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	userPtr, err := windows.UTF16PtrFromString(user)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	return box.Use(func(plain []byte) error {
 		if len(plain) > maxWinCredBlobBytes {
-			return fmt.Errorf("%w: Windows Credential 字节长度超出上限 %d", ports.ErrLimitExceeded, maxWinCredBlobBytes)
+			return i18n.EF(ports.ErrLimitExceeded, i18n.KeyHostSizeExceedsLimit, i18n.Int64("max", maxWinCredBlobBytes))
 		}
 		// 复制为本作用域自持独立切片，满足 linearlease 借用零别名不变量，同时仍完整受 secrettaint 污点审计并立即 clear 零化。
 		localBlob := bytes.Clone(plain)
@@ -127,7 +128,7 @@ func (b *winAdvapi32Backend) Write(target, user string, box *secret.SecretBox) e
 func (b *winAdvapi32Backend) Delete(target string) error {
 	targetPtr, err := windows.UTF16PtrFromString(target)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ports.ErrInvalidArgument, err)
+		return domi18n.WrapSentinel(ports.ErrInvalidArgument, err)
 	}
 	r1, _, lastErr := b.credDeleteW.Call(
 		uintptr(unsafe.Pointer(targetPtr)),
@@ -152,5 +153,5 @@ func mapWinCredError(err error) error {
 			return ports.ErrPermissionDenied
 		}
 	}
-	return fmt.Errorf("%w: Windows Credential Manager 调用失败", ports.ErrUnsupported)
+	return i18n.EF(ports.ErrUnsupported, i18n.KeyHostVaultWinCredCallFailed)
 }

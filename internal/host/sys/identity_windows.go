@@ -3,18 +3,18 @@
 package sys
 
 import (
-	"fmt"
 	"os"
 	"os/user"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func lookupLocalIdentityOS() (ports.LocalIdentityInfo, error) {
 	host, err := os.Hostname()
 	if err != nil {
-		return zeroVal[ports.LocalIdentityInfo](), fmt.Errorf("查询本机主机名失败: %w", err)
+		return zeroVal[ports.LocalIdentityInfo](), i18n.Wrap(err, i18n.KeyHostSysHostnameFailed)
 	}
 	var username, uid, home string
 	if cur, uErr := user.Current(); uErr == nil && cur != nil {

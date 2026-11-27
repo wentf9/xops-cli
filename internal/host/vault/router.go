@@ -3,7 +3,6 @@ package vault
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type vaultLocker interface {
@@ -42,12 +42,12 @@ type RouterVault struct {
 // NewRouterVault 校验注册表并构造不可变 RouterVault（深拷贝注册表防止外部并发篡改）。
 func NewRouterVault(spec RouterSpec) (*RouterVault, error) {
 	if len(spec.Stores) == 0 && spec.DefaultStore == nil {
-		return nil, fmt.Errorf("%w: RouterVault 至少需要配置一个存储后端或 DefaultStore", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostVaultRouterEmpty)
 	}
 	copied := make(map[string]ports.SecretVault, len(spec.Stores))
 	for k, v := range spec.Stores {
 		if k == "" || v == nil {
-			return nil, fmt.Errorf("%w: 凭据存储名 %q 或后端实现无效", ports.ErrInvalidArgument, k)
+			return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostVaultRouterInvalidStore, i18n.BoundStr("name", k))
 		}
 		copied[k] = v
 	}
@@ -157,13 +157,13 @@ func (r *RouterVault) resolve(ctx context.Context, ref secret.Ref) (ports.Secret
 		return nil, err
 	}
 	if r == nil || !r.valid {
-		return nil, fmt.Errorf("%w: RouterVault 未初始化", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "RouterVault"))
 	}
 	if r.closed.Load() {
 		return nil, ports.ErrClosed
 	}
 	if !ref.IsValid() {
-		return nil, fmt.Errorf("%w: 无效凭据引用", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidSecretRef)
 	}
 	if b, ok := r.stores[ref.Store()]; ok {
 		return b, nil
@@ -171,5 +171,5 @@ func (r *RouterVault) resolve(ctx context.Context, ref secret.Ref) (ports.Secret
 	if r.defaultStore != nil {
 		return r.defaultStore, nil
 	}
-	return nil, fmt.Errorf("%w: 未注册凭据存储 %q", ports.ErrSecretNotFound, ref.Store())
+	return nil, i18n.EF(ports.ErrSecretNotFound, i18n.KeyHostVaultStoreNotRegistered, i18n.BoundStr("name", ref.Store()))
 }

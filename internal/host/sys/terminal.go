@@ -3,13 +3,13 @@ package sys
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // StreamTerminalSpec 是构造面向确定性测试或自定义流的内存/管道 Terminal 的显式入参规格。
@@ -60,7 +60,7 @@ func NewSystemTerminal() *Terminal {
 // NewFileTerminal 构造绑定至指定本机文件句柄（如独立 PTY 从端或控制台句柄）的终端适配器。
 func NewFileTerminal(in, out *os.File) (*Terminal, error) {
 	if in == nil || out == nil {
-		return nil, fmt.Errorf("%w: Terminal 输入输出文件句柄不能为 nil", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNilDependency, i18n.Str("field", "in/out"))
 	}
 	inter, err := probeFileInteractive(in, out)
 	if err != nil {
@@ -78,7 +78,7 @@ func NewFileTerminal(in, out *os.File) (*Terminal, error) {
 // NewStreamTerminal 构造基于自定义读写流与可选窗口事件的终端适配器（供无头环境与跨平台契约验证复用）。
 func NewStreamTerminal(spec StreamTerminalSpec) (*Terminal, error) {
 	if spec.Interactive && (spec.In == nil || spec.Out == nil || spec.SizeFn == nil) {
-		return nil, fmt.Errorf("%w: 交互式流终端必须提供 In、Out 与 SizeFn", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostSysTerminalStreamReq)
 	}
 	return &Terminal{
 		streamIn:    spec.In,
@@ -100,7 +100,7 @@ func (t *Terminal) IsInteractive() bool {
 // Size 查询当前交互式终端窗口尺寸（列数、行数）；非交互或未初始化时返回错误。
 func (t *Terminal) Size() (ports.TerminalSize, error) {
 	if t == nil || !t.valid {
-		return zeroVal[ports.TerminalSize](), fmt.Errorf("%w: Terminal 未初始化", ports.ErrInvalidArgument)
+		return zeroVal[ports.TerminalSize](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "Terminal"))
 	}
 	if !t.interactive {
 		return zeroVal[ports.TerminalSize](), ports.ErrUnsupported
@@ -115,7 +115,7 @@ func (t *Terminal) Size() (ports.TerminalSize, error) {
 // 任何系统调用错误或非支持平台（Windows）均失败关闭返回 security.VerdictDeny。
 func (t *Terminal) CanSuspendProcessGroup() (security.Verdict, error) {
 	if t == nil || !t.valid {
-		return security.VerdictDeny, fmt.Errorf("%w: Terminal 未初始化", ports.ErrInvalidArgument)
+		return security.VerdictDeny, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "Terminal"))
 	}
 	return checkSuspendProcessGroupOS()
 }
@@ -170,7 +170,7 @@ func (t *Terminal) checkRawArgs(ctx context.Context, fnNil bool) error {
 		return ports.ErrNilCallback
 	}
 	if t == nil || !t.valid {
-		return fmt.Errorf("%w: Terminal 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "Terminal"))
 	}
 	if err := ctx.Err(); err != nil {
 		return err

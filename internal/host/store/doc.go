@@ -17,7 +17,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"io/fs"
 	"strings"
@@ -29,6 +28,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -56,13 +56,13 @@ const (
 // 本包导出的规范化哨兵错误，供调用方与诊断层以 errors.Is 精确区分配置/WAL/导入故障。
 var (
 	// ErrUnsupportedSchemaVersion 表示配置文件缺失 version 字段或版本不是唯一合法的 version: 2。
-	ErrUnsupportedSchemaVersion = errors.New("store: 不受支持的配置 schema 版本（仅支持 version: 2）")
+	ErrUnsupportedSchemaVersion = i18n.Sentinel(i18n.KeyHostStoreUnsupportedSchema)
 	// ErrPlaintextSecretForbidden 表示输入中出现严禁持久化的明文密码/机密列或字段（ADR-006）。
-	ErrPlaintextSecretForbidden = errors.New("store: 禁止在配置或导入源中携带明文密码或机密")
+	ErrPlaintextSecretForbidden = i18n.Sentinel(i18n.KeyHostStorePlaintextSecretForbidden)
 	// ErrInvalidCSV 表示 CSV 导入流格式非法、列结构错误或缺失有效记录。
-	ErrInvalidCSV = errors.New("store: CSV 导入格式或记录字段非法")
+	ErrInvalidCSV = i18n.Sentinel(i18n.KeyHostStoreInvalidCSV)
 	// ErrCorruptJournalFrame 表示 WAL 单行帧头、CRC32 校验和或载荷完整性校验失败。
-	ErrCorruptJournalFrame = errors.New("store: WAL 记录帧格式或 CRC32 校验失败")
+	ErrCorruptJournalFrame = i18n.Sentinel(i18n.KeyHostStoreCorruptJournalFrame)
 )
 
 // InventoryStoreSpec 是构造 YAMLInventoryStore（ports.InventoryStore）的显式入参规格。
@@ -117,7 +117,7 @@ func checkCtxReady(ctx context.Context, valid bool, name string) error {
 		return err
 	}
 	if !valid {
-		return fmt.Errorf("%w: %s 未初始化", ports.ErrInvalidArgument, name)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", name))
 	}
 	return nil
 }
@@ -127,7 +127,7 @@ func normalizeBoundedLimit(val, defVal, maxVal int64, label string) (int64, erro
 		return defVal, nil
 	}
 	if val < 0 || val > maxVal {
-		return 0, fmt.Errorf("%w: %s=%d 超出允许范围 (0..%d]", ports.ErrInvalidArgument, label, val, maxVal)
+		return 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostLimitOutOfRange, i18n.Str("field", label), i18n.Int64("value", val), i18n.Int64("max", maxVal))
 	}
 	return val, nil
 }
@@ -135,7 +135,7 @@ func normalizeBoundedLimit(val, defVal, maxVal int64, label string) (int64, erro
 func resolveRootedPath(opt algebraic.Option[pathalg.LocalRootedDest], defRel, label string) (pathalg.LocalRootedDest, error) {
 	if d, ok := opt.Get(); ok {
 		if !d.IsValid() {
-			return zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: %s 路径无效", ports.ErrInvalidArgument, label)
+			return zeroVal[pathalg.LocalRootedDest](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", label))
 		}
 		return d, nil
 	}
@@ -162,7 +162,7 @@ func readBoundedStream(r io.Reader, maxBytes int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(raw)) > maxBytes {
-		return nil, fmt.Errorf("%w: 输入大小超过上限 %d 字节", ports.ErrLimitExceeded, maxBytes)
+		return nil, i18n.EF(ports.ErrLimitExceeded, i18n.KeyHostSizeExceedsLimit, i18n.Int64("max", maxBytes))
 	}
 	return raw, nil
 }
@@ -192,10 +192,10 @@ func checkLstatDir(root ports.RootHandle, dest pathalg.LocalRootedDest) (bool, e
 		return false, err
 	}
 	if info.IsSymlink() {
-		return false, fmt.Errorf("%w: 目录 %q 为符号链接", ports.ErrSymlinkRejected, dest.String())
+		return false, i18n.EF(ports.ErrSymlinkRejected, i18n.KeyHostPathIsSymlink, i18n.BoundStr("path", dest.String()))
 	}
 	if !info.IsDir() {
-		return false, fmt.Errorf("%w: %q 不是目录", ports.ErrNotRegularFile, dest.String())
+		return false, i18n.EF(ports.ErrNotRegularFile, i18n.KeyHostPathNotDir, i18n.BoundStr("path", dest.String()))
 	}
 	return true, nil
 }
@@ -210,10 +210,10 @@ func checkLstatRegular(root ports.RootHandle, dest pathalg.LocalRootedDest) (boo
 		return false, err
 	}
 	if info.IsSymlink() {
-		return false, fmt.Errorf("%w: 文件 %q 为符号链接", ports.ErrSymlinkRejected, dest.String())
+		return false, i18n.EF(ports.ErrSymlinkRejected, i18n.KeyHostPathIsSymlink, i18n.BoundStr("path", dest.String()))
 	}
 	if !info.IsRegular() {
-		return false, fmt.Errorf("%w: %q 不是常规文件", ports.ErrNotRegularFile, dest.String())
+		return false, i18n.EF(ports.ErrNotRegularFile, i18n.KeyHostPathNotRegular, i18n.BoundStr("path", dest.String()))
 	}
 	return true, nil
 }

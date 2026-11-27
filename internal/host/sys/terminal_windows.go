@@ -5,7 +5,6 @@ package sys
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/windows"
 )
 
@@ -39,12 +39,12 @@ func queryFileSize(_, out *os.File) (ports.TerminalSize, error) {
 	err := windows.GetConsoleScreenBufferInfo(windows.Handle(out.Fd()), &info)
 	runtime.KeepAlive(out)
 	if err != nil {
-		return zeroVal[ports.TerminalSize](), fmt.Errorf("查询 Windows 控制台窗口尺寸失败: %w", err)
+		return zeroVal[ports.TerminalSize](), i18n.Wrap(err, i18n.KeyHostSysTerminalSizeFailed)
 	}
 	cols := int(info.Window.Right - info.Window.Left + 1)
 	rows := int(info.Window.Bottom - info.Window.Top + 1)
 	if cols <= 0 || rows <= 0 {
-		return zeroVal[ports.TerminalSize](), fmt.Errorf("%w: Windows 控制台返回非正尺寸 %dx%d", ports.ErrInvalidTTYSize, cols, rows)
+		return zeroVal[ports.TerminalSize](), i18n.EF(ports.ErrInvalidTTYSize, i18n.KeyHostSysTerminalNonPosSize, i18n.Int("cols", cols), i18n.Int("rows", rows))
 	}
 	return ports.NewTerminalSize(uint16(cols), uint16(rows))
 }
@@ -54,11 +54,11 @@ func enterRawFileOS(in, out *os.File) (func() error, error) {
 	var origIn, origOut uint32
 	if err := windows.GetConsoleMode(inH, &origIn); err != nil {
 		runtime.KeepAlive(in)
-		return nil, fmt.Errorf("读取 Windows 控制台输入模式失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyHostSysTerminalRawModeFailed)
 	}
 	if err := windows.GetConsoleMode(outH, &origOut); err != nil {
 		runtime.KeepAlive(out)
-		return nil, fmt.Errorf("读取 Windows 控制台输出模式失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyHostSysTerminalRawModeFailed)
 	}
 
 	// 窗口缩放由 watchResizeOS 经 GetConsoleScreenBufferInfo 独立监测，显式屏蔽 WINDOW/MOUSE 事件，
@@ -67,7 +67,7 @@ func enterRawFileOS(in, out *os.File) (func() error, error) {
 		windows.ENABLE_VIRTUAL_TERMINAL_INPUT
 	if err := windows.SetConsoleMode(inH, rawIn); err != nil {
 		runtime.KeepAlive(in)
-		return nil, fmt.Errorf("切换 Windows 控制台至原始 VT 输入模式失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyHostSysTerminalRawModeFailed)
 	}
 	// 启用 VT 输出处理以兼容 ConPTY ANSI 序列；旧版控制台不支持时回退保留原输出模式。
 	rawOut := origOut | windows.ENABLE_PROCESSED_OUTPUT | windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -123,7 +123,7 @@ type windowsCancelableFileReader struct {
 func newCancelableFileReaderOS(in *os.File) (io.Reader, func(), func(), error) {
 	ev, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("创建 Windows 终端取消事件失败: %w", err)
+		return nil, nil, nil, i18n.Wrap(err, i18n.KeyHostSysCancelHandleFailed)
 	}
 	var mode uint32
 	isConsole := windows.GetConsoleMode(windows.Handle(in.Fd()), &mode) == nil

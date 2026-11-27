@@ -5,7 +5,6 @@ import (
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -16,6 +15,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // FileReconciler 实现 ports.AuditReconciler，在启动期提供 O(1) 零扫描快路径与多终端安全的崩溃恢复慢路径（ADR-008）。
@@ -36,7 +36,7 @@ type FileReconciler struct {
 // NewFileReconciler 校验沙箱端口、目录路径与字节读取上限后构造 FileReconciler。
 func NewFileReconciler(spec ReconcilerSpec) (*FileReconciler, error) {
 	if spec.ScopedFS == nil || !spec.RootDir.IsValid() {
-		return nil, fmt.Errorf("%w: ScopedFS 或 RootDir 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ScopedFS/RootDir"))
 	}
 	auditDest, runDest, err := resolveAuditPaths(spec.AuditFile, spec.RunDir)
 	if err != nil {
@@ -63,14 +63,14 @@ func normalizeReconcilerLimits(spec ReconcilerSpec) (maxAudit, maxLock int64, er
 		maxAudit = defaultMaxAuditReadBytes
 	}
 	if maxAudit < 0 || maxAudit > maxAllowedAuditReadBytes {
-		return 0, 0, fmt.Errorf("%w: MaxAuditBytes=%d 超出范围", ports.ErrInvalidArgument, spec.MaxAuditBytes)
+		return 0, 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostLimitOutOfRange, i18n.Str("field", "MaxAuditBytes"), i18n.Int64("value", spec.MaxAuditBytes), i18n.Int64("max", maxAllowedAuditReadBytes))
 	}
 	maxLock = spec.MaxLockBytes
 	if maxLock == 0 {
 		maxLock = defaultMaxLockReadBytes
 	}
 	if maxLock < 0 || maxLock > maxAllowedLockReadBytes {
-		return 0, 0, fmt.Errorf("%w: MaxLockBytes=%d 超出范围", ports.ErrInvalidArgument, spec.MaxLockBytes)
+		return 0, 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostLimitOutOfRange, i18n.Str("field", "MaxLockBytes"), i18n.Int64("value", spec.MaxLockBytes), i18n.Int64("max", maxAllowedLockReadBytes))
 	}
 	return maxAudit, maxLock, nil
 }
@@ -111,10 +111,10 @@ func (r *FileReconciler) checkArgs(ctx context.Context, now time.Time) error {
 		return err
 	}
 	if r == nil || !r.valid {
-		return fmt.Errorf("%w: FileReconciler 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "FileReconciler"))
 	}
 	if now.IsZero() || now.UTC().Year() < 1 || now.UTC().Year() > 9999 {
-		return fmt.Errorf("%w: 对账时间戳 now 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "now"))
 	}
 	return nil
 }
@@ -192,7 +192,7 @@ func (r *FileReconciler) parseLockCandidate(entry ports.LocalDirEntry) (ports.Pr
 	}
 	// 先校验 .lock 后缀再判定对象类型，防止 run/ 目录中被植入同名目录或符号链接时静默跳过。
 	if !entry.IsRegular() {
-		return zeroVal[ports.ProcessInstanceID](), zeroVal[pathalg.LocalRootedDest](), false, fmt.Errorf("%w: run 目录存在非常规锁对象 %q", ports.ErrNotRegularFile, entry.Name())
+		return zeroVal[ports.ProcessInstanceID](), zeroVal[pathalg.LocalRootedDest](), false, i18n.EF(ports.ErrNotRegularFile, i18n.KeyHostPathNotRegular, i18n.BoundStr("path", entry.Name()))
 	}
 	procID, err := ports.ParseProcessInstanceID(rawID)
 	if err != nil {
@@ -247,7 +247,7 @@ func (r *FileReconciler) readLockPendingOps(lf ports.LockedFile) ([]security.Ope
 		return nil, err
 	}
 	if int64(len(raw)) > r.maxLockBytes {
-		return nil, fmt.Errorf("%w: 死亡进程锁文件大小超过上限 %d", ports.ErrLimitExceeded, r.maxLockBytes)
+		return nil, i18n.EF(ports.ErrLimitExceeded, i18n.KeyHostSizeExceedsLimit, i18n.Int64("max", r.maxLockBytes))
 	}
 	return replayLockLog(raw), nil
 }
@@ -322,10 +322,10 @@ func checkSingleLstatDir(root ports.RootHandle, dir pathalg.LocalRootedDest) (bo
 		return false, err
 	}
 	if info.IsSymlink() {
-		return false, fmt.Errorf("%w: 目录 %q 为符号链接", ports.ErrSymlinkRejected, dir.String())
+		return false, i18n.EF(ports.ErrSymlinkRejected, i18n.KeyHostPathIsSymlink, i18n.BoundStr("path", dir.String()))
 	}
 	if !info.IsDir() {
-		return false, fmt.Errorf("%w: 路径 %q 不是目录", ports.ErrNotRegularFile, dir.String())
+		return false, i18n.EF(ports.ErrNotRegularFile, i18n.KeyHostPathNotDir, i18n.BoundStr("path", dir.String()))
 	}
 	return true, nil
 }
@@ -342,7 +342,7 @@ func parseAuditEntriesForProcess(raw []byte, procID ports.ProcessInstanceID) (ma
 		}
 		var entry ports.AuditEntry
 		if err := jsonv2.Unmarshal(trimmed, &entry); err != nil {
-			return nil, nil, fmt.Errorf("%w: 第 %d 行反序列化失败: %w", ErrCorruptAuditLog, lineNo, err)
+			return nil, nil, i18n.WrapS(ErrCorruptAuditLog, err, i18n.KeyHostAuditLineUnmarshalFailed, i18n.Int("line", lineNo))
 		}
 		if !entry.ProcessID().Equal(procID) {
 			continue
@@ -392,7 +392,7 @@ func appendAbortedEntries(
 			return nil, err
 		}
 		if err := root.AppendLine(auditDest, auditFilePerm, rawJSON); err != nil {
-			return nil, fmt.Errorf("%w: 补写 AbortedByCrash 失败: %w", ports.ErrAuditWriteFailed, err)
+			return nil, i18n.WrapS(ports.ErrAuditWriteFailed, err, i18n.KeyHostAuditAppendAbortedFailed)
 		}
 		aborted = append(aborted, opID)
 	}

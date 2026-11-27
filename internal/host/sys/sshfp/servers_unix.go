@@ -4,11 +4,11 @@ package sshfp
 
 import (
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -28,11 +28,11 @@ func loadSystemDNSConfigOS(ctx context.Context, opFS ports.OperatorReadFS) (dnsS
 		return rErr
 	})
 	if err != nil {
-		return dnsSystemConfig{}, fmt.Errorf("通过 OperatorReadFS 读取 %s 失败: %w", unixResolvConfPath, err)
+		return dnsSystemConfig{}, i18n.Wrap(err, i18n.KeyHostReadFailed, i18n.Str("path", unixResolvConfPath))
 	}
 	servers, trustAD := ParseResolvConf(raw)
 	if len(servers) == 0 {
-		return dnsSystemConfig{}, fmt.Errorf("%w: %s 未包含可用 nameserver", ports.ErrNotFound, unixResolvConfPath)
+		return dnsSystemConfig{}, i18n.EF(ports.ErrNotFound, i18n.KeyHostSSHFPNoServers)
 	}
 	return dnsSystemConfig{servers: servers, trustAD: trustAD}, nil
 }

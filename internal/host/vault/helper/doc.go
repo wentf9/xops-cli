@@ -7,8 +7,9 @@
 package helper
 
 import (
-	"errors"
 	"time"
+
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -23,5 +24,5 @@ const (
 // 本包导出的规范化哨兵错误。
 var (
 	// ErrProtocol 表示外部凭据助手或隔离 KDF Helper 返回了畸形协议帧。
-	ErrProtocol = errors.New("vault/helper: 助手协议帧非法")
+	ErrProtocol = i18n.Sentinel(i18n.KeyHostVaultHelperProtocol)
 )

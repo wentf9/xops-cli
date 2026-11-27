@@ -1,11 +1,11 @@
 package audit
 
 import (
-	"fmt"
 	"io"
 
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type lockLogWriterState struct {
@@ -40,7 +40,7 @@ func (s *FileSink) holdProcessLockInRoot(root ports.RootHandle, signalReady func
 		}
 		if st.Size() > 0 {
 			// 严禁静默截断尚未完成崩溃对账的非空残留 .lock 文件（防止误复用 ProcessInstanceID 擦除未闭合记录）。
-			unreconciledErr := fmt.Errorf("%w: 进程锁文件 %q 包含未对账残留记录，请先执行崩溃对账或使用新的 ProcessInstanceID", ports.ErrAlreadyExists, s.lockDest.String())
+			unreconciledErr := i18n.EF(ports.ErrAlreadyExists, i18n.KeyHostAuditUnreconciledLock, i18n.BoundStr("path", s.lockDest.String()))
 			signalReady(unreconciledErr)
 			return unreconciledErr
 		}
@@ -101,14 +101,14 @@ func applyLockCommand(lf ports.LockedFile, cmd lockCommand, st *lockLogWriterSta
 	line := formatLockLogFrame(cmd, st.needNewline)
 	if err := writeAll(lf, line); err != nil {
 		rollbackLockFrame(lf, st)
-		return fmt.Errorf("%w: 写入进程锁日志失败: %w", ports.ErrAuditWriteFailed, err)
+		return i18n.WrapS(ports.ErrAuditWriteFailed, err, i18n.KeyHostAuditLockIOFailed)
 	}
 	if cmd.kind == lockCmdUnstage && cmd.truncateAfter {
 		return compactLockAfterDrain(lf, st)
 	}
 	if err := lf.Sync(); err != nil {
 		rollbackLockFrame(lf, st)
-		return fmt.Errorf("%w: 刷盘进程锁日志失败: %w", ports.ErrAuditWriteFailed, err)
+		return i18n.WrapS(ports.ErrAuditWriteFailed, err, i18n.KeyHostAuditLockIOFailed)
 	}
 	st.confirmedOffset += int64(len(line))
 	st.offsetKnown = true
@@ -122,7 +122,7 @@ func reanchorLockOffset(lf ports.LockedFile, st *lockLogWriterState) error {
 	}
 	pos, err := lf.Seek(0, io.SeekEnd)
 	if err != nil {
-		return fmt.Errorf("%w: 重新锚定进程锁文件偏移失败: %w", ports.ErrAuditWriteFailed, err)
+		return i18n.WrapS(ports.ErrAuditWriteFailed, err, i18n.KeyHostAuditLockIOFailed)
 	}
 	st.confirmedOffset = pos
 	st.offsetKnown = true
@@ -138,18 +138,18 @@ func reanchorLockOffset(lf ports.LockedFile, st *lockLogWriterState) error {
 func compactLockAfterDrain(lf ports.LockedFile, st *lockLogWriterState) error {
 	if err := lf.Truncate(0); err != nil {
 		rollbackLockFrame(lf, st)
-		return fmt.Errorf("%w: 排空后截断进程锁失败: %w", ports.ErrAuditWriteFailed, err)
+		return i18n.WrapS(ports.ErrAuditWriteFailed, err, i18n.KeyHostAuditLockCompactFailed)
 	}
 	st.confirmedOffset = 0
 	if _, err := lf.Seek(0, io.SeekStart); err != nil {
 		st.offsetKnown = false
 		st.needNewline = true
-		return fmt.Errorf("%w: 排空截断后重置进程锁偏移失败: %w", ports.ErrAuditWriteFailed, err)
+		return i18n.WrapS(ports.ErrAuditWriteFailed, err, i18n.KeyHostAuditLockCompactFailed)
 	}
 	if err := lf.Sync(); err != nil {
 		st.offsetKnown = false
 		st.needNewline = true
-		return fmt.Errorf("%w: 排空截断后刷盘进程锁失败: %w", ports.ErrAuditWriteFailed, err)
+		return i18n.WrapS(ports.ErrAuditWriteFailed, err, i18n.KeyHostAuditLockCompactFailed)
 	}
 	st.offsetKnown = true
 	st.needNewline = false

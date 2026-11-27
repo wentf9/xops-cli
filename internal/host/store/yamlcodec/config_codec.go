@@ -3,7 +3,6 @@ package yamlcodec
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -11,12 +10,14 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -120,24 +121,24 @@ type (
 // 任何非 version: 2（含 v1）、未知字段、多文档尾随数据或图不变量违例均严格失败关闭并返回包装 ports.ErrCorruptData 的错误。
 func DecodeConfigDocumentYAML(raw []byte) (doc ConfigDocument, graph inventory.Graph, err error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return doc, graph, fmt.Errorf("%w: 配置文件为空", ports.ErrCorruptData)
+		return doc, graph, i18n.EF(ports.ErrCorruptData, i18n.KeyHostYAMLEmptyConfig)
 	}
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err = dec.Decode(&doc); err != nil {
-		return ConfigDocument{}, graph, fmt.Errorf("%w: YAML vNext 解析失败: %w", ports.ErrCorruptData, err)
+		return ConfigDocument{}, graph, i18n.WrapS(ports.ErrCorruptData, err, i18n.KeyHostYAMLDecodeFailed)
 	}
 	if err = rejectTrailingYAMLDocs(dec); err != nil {
 		return ConfigDocument{}, graph, err
 	}
 	if doc.Version != SchemaVersionV2 {
-		return ConfigDocument{}, graph, fmt.Errorf("%w: %w (got=%d)", ports.ErrCorruptData, ErrUnsupportedSchemaVersion, doc.Version)
+		return ConfigDocument{}, graph, domi18n.WrapSentinel(ports.ErrCorruptData, i18n.EF(ErrUnsupportedSchemaVersion, i18n.KeyHostYAMLInvalidVersion, i18n.Int("version", doc.Version)))
 	}
 	if err = validateTopSections(doc.Vault, doc.Policy, doc.Options); err != nil {
-		return ConfigDocument{}, graph, fmt.Errorf("%w: %w", ports.ErrCorruptData, err)
+		return ConfigDocument{}, graph, domi18n.WrapSentinel(ports.ErrCorruptData, err)
 	}
 	if graph, err = decodeInventoryGraph(doc.Inventory, doc.Vault); err != nil {
-		return ConfigDocument{}, zeroVal[inventory.Graph](), fmt.Errorf("%w: %w", ports.ErrCorruptData, err)
+		return ConfigDocument{}, zeroVal[inventory.Graph](), domi18n.WrapSentinel(ports.ErrCorruptData, err)
 	}
 	return doc, graph, nil
 }
@@ -147,15 +148,15 @@ func rejectTrailingYAMLDocs(dec *yaml.Decoder) error {
 	if err := dec.Decode(&extra); errors.Is(err, io.EOF) {
 		return nil
 	} else if err != nil {
-		return fmt.Errorf("%w: 存在非法尾随 YAML 文档: %w", ports.ErrCorruptData, err)
+		return i18n.WrapS(ports.ErrCorruptData, err, i18n.KeyHostYAMLMultipleDocs)
 	}
-	return fmt.Errorf("%w: 配置文件禁止包含多份 YAML 文档", ports.ErrCorruptData)
+	return i18n.EF(ports.ErrCorruptData, i18n.KeyHostYAMLMultipleDocs)
 }
 
 // EncodeConfigDocumentYAML 将 version: 2 文档确定性编码为规范 2 空格缩进 YAML 字节流。
 func EncodeConfigDocumentYAML(doc ConfigDocument) ([]byte, error) {
 	if doc.Version != SchemaVersionV2 {
-		return nil, fmt.Errorf("%w: 仅允许编码 version=%d", ErrUnsupportedSchemaVersion, SchemaVersionV2)
+		return nil, i18n.EF(ErrUnsupportedSchemaVersion, i18n.KeyHostYAMLInvalidVersion, i18n.Int("version", doc.Version))
 	}
 	if err := validateTopSections(doc.Vault, doc.Policy, doc.Options); err != nil {
 		return nil, err
@@ -205,14 +206,14 @@ func validateTopSections(v *VaultConfigDTO, p *PolicyConfigDTO, opts *OptionLaye
 // 对未知字段、重复键或空值严格失败关闭。
 func (d *NodeOverrideDTO) UnmarshalYAML(value *yaml.Node) error {
 	if value == nil || value.Tag == "!!null" {
-		return fmt.Errorf("policy.guardrail.node_overrides 规则值不能为空")
+		return i18n.E(i18n.KeyHostYAMLNodeOverrideInvalid)
 	}
 	if value.Kind == yaml.ScalarNode {
 		*d = NodeOverrideDTO{ApprovalThreshold: value.Value}
 		return nil
 	}
 	if value.Kind != yaml.MappingNode || len(value.Content)%2 != 0 {
-		return fmt.Errorf("policy.guardrail.node_overrides 规则必须为阈值字符串或映射对象")
+		return i18n.E(i18n.KeyHostYAMLNodeOverrideInvalid)
 	}
 	return decodeNodeOverrideMapping(d, value.Content)
 }
@@ -223,21 +224,21 @@ func decodeNodeOverrideMapping(dst *NodeOverrideDTO, content []*yaml.Node) error
 	for i := 0; i < len(content); i += 2 {
 		kNode, vNode := content[i], content[i+1]
 		if vNode.Kind != yaml.ScalarNode || vNode.Tag == "!!null" {
-			return fmt.Errorf("policy.guardrail.node_overrides.%s 必须为非空字符串", kNode.Value)
+			return i18n.E(i18n.KeyHostYAMLNodeOverrideInvalid)
 		}
 		switch kNode.Value {
 		case "approval_threshold":
 			if seenThreshold {
-				return fmt.Errorf("policy.guardrail.node_overrides 重复字段 approval_threshold")
+				return i18n.E(i18n.KeyHostYAMLDuplicateField, i18n.Str("section", "policy.guardrail.node_overrides"), i18n.Str("field", "approval_threshold"))
 			}
 			parsed.ApprovalThreshold, seenThreshold = vNode.Value, true
 		case "decision_floor":
 			if seenFloor {
-				return fmt.Errorf("policy.guardrail.node_overrides 重复字段 decision_floor")
+				return i18n.E(i18n.KeyHostYAMLDuplicateField, i18n.Str("section", "policy.guardrail.node_overrides"), i18n.Str("field", "decision_floor"))
 			}
 			parsed.DecisionFloor, seenFloor = vNode.Value, true
 		default:
-			return fmt.Errorf("policy.guardrail.node_overrides 包含未知字段 %q", kNode.Value)
+			return i18n.E(i18n.KeyHostYAMLUnknownField, i18n.Str("section", "policy.guardrail.node_overrides"), i18n.BoundStr("field", kNode.Value))
 		}
 	}
 	*dst = parsed
@@ -265,14 +266,14 @@ func decodeSingleNodeOverride(pattern string, dto NodeOverrideDTO) (security.Nod
 	var zero security.NodeOverrideRule
 	th, err := security.ParseRiskLevel(dto.ApprovalThreshold)
 	if err != nil {
-		return zero, fmt.Errorf("node_overrides[%q].approval_threshold 无效: %w", pattern, err)
+		return zero, i18n.Wrap(err, i18n.KeyHostYAMLNodeOverrideFieldInvalid, i18n.BoundStr("pattern", pattern), i18n.Str("field", "approval_threshold"))
 	}
 	if strings.TrimSpace(dto.DecisionFloor) == "" {
 		return security.NewNodeOverrideRule(pattern, th)
 	}
 	fl, err := security.ParseDecisionKind(dto.DecisionFloor)
 	if err != nil {
-		return zero, fmt.Errorf("node_overrides[%q].decision_floor 无效: %w", pattern, err)
+		return zero, i18n.Wrap(err, i18n.KeyHostYAMLNodeOverrideFieldInvalid, i18n.BoundStr("pattern", pattern), i18n.Str("field", "decision_floor"))
 	}
 	return security.NewNodeOverrideRuleWithFloor(pattern, th, fl)
 }
@@ -302,19 +303,19 @@ func validateVaultConfigDTO(v *VaultConfigDTO) error {
 		return nil
 	}
 	if !isEmptyOrIn(v.RememberPrompted, "always", "ask", "never") {
-		return fmt.Errorf("vault.remember_prompted=%q 非法", v.RememberPrompted)
+		return i18n.E(i18n.KeyHostYAMLInvalidFieldValue, i18n.Str("field", "vault.remember_prompted"), i18n.BoundStr("value", v.RememberPrompted))
 	}
 	for name, st := range v.Stores {
 		if strings.TrimSpace(name) == "" || !isIn(st.Kind, "offline_aead", "os_keychain", "external_helper", "none") {
-			return fmt.Errorf("vault.stores.%s 名称或 kind=%q 非法", name, st.Kind)
+			return i18n.E(i18n.KeyHostYAMLVaultStoreInvalid, i18n.BoundStr("name", name), i18n.BoundStr("kind", st.Kind))
 		}
 		if st.Timeout != nil && !st.Timeout.IsPositive() {
-			return fmt.Errorf("vault.stores.%s.timeout 必须为正时长", name)
+			return i18n.E(i18n.KeyHostDurationMustBePositive, i18n.BoundStr("field", "vault.stores."+name+".timeout"))
 		}
 	}
 	if v.DefaultStore != "" && len(v.Stores) > 0 {
 		if _, ok := v.Stores[v.DefaultStore]; !ok {
-			return fmt.Errorf("vault.default_store=%q 未在 vault.stores 中声明", v.DefaultStore)
+			return i18n.E(i18n.KeyHostYAMLVaultDefaultUndeclared, i18n.BoundStr("store", v.DefaultStore))
 		}
 	}
 	return nil
@@ -326,18 +327,18 @@ func validatePolicyConfigDTO(p *PolicyConfigDTO) error {
 	}
 	if !isEmptyOrIn(p.CLIDefault, "direct_operator", "strict", "strict_operator", "strict_agent") ||
 		!isEmptyOrIn(p.MCPDefault, "direct_operator", "strict", "strict_operator", "strict_agent") {
-		return fmt.Errorf("policy 默认策略配置非法")
+		return i18n.E(i18n.KeyHostInvalidField, i18n.Str("field", "policy"))
 	}
 	if g := p.Guardrail; g != nil {
 		if !isEmptyOrIn(g.ApprovalThreshold, "safe", "moderate", "dangerous", "critical") ||
 			!isEmptyOrIn(g.NoElicitFallback, "deny", "challenge") {
-			return fmt.Errorf("policy.guardrail 阈值或降级策略非法")
+			return i18n.E(i18n.KeyHostInvalidField, i18n.Str("field", "policy.guardrail"))
 		}
 		if g.ApprovalTTL != nil && !g.ApprovalTTL.IsPositive() {
-			return fmt.Errorf("policy.guardrail.approval_ttl 必须为正时长")
+			return i18n.E(i18n.KeyHostDurationMustBePositive, i18n.Str("field", "policy.guardrail.approval_ttl"))
 		}
 		if _, err := DecodeNodeOverridesDTO(g.NodeOverrides); err != nil {
-			return fmt.Errorf("policy.guardrail.node_overrides 非法: %w", err)
+			return i18n.Wrap(err, i18n.KeyHostInvalidField, i18n.Str("field", "policy.guardrail.node_overrides"))
 		}
 	}
 	return nil
@@ -395,7 +396,7 @@ func decodeHostDTO(rawID string, dto HostDTO) (z inventory.Host, err error) {
 	port := netaddr.DefaultSSHPort
 	if dto.Port != nil {
 		if *dto.Port == 0 {
-			return z, fmt.Errorf("%w: host port 不能为 0", inventory.ErrInvalidHost)
+			return z, i18n.EF(inventory.ErrInvalidHost, i18n.KeyHostValueMustBeNonZero, i18n.Str("field", "host.port"))
 		}
 		port = *dto.Port
 	}
@@ -554,7 +555,7 @@ func decodeNodeOriginDTO(dto *NodeOriginDTO) (inventory.NodeOrigin, error) {
 	}
 	kind, err := option.ParseOriginKind(dto.Kind)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", inventory.ErrInvalidNodeOrigin, err)
+		return nil, domi18n.WrapSentinel(inventory.ErrInvalidNodeOrigin, err)
 	}
 	mask := fieldMask(dto.HostPattern != "", dto.BaseAlias != "", dto.SourceFile != "", dto.ParentNode != "")
 	switch kind {
@@ -573,12 +574,12 @@ func decodeNodeOriginDTO(dto *NodeOriginDTO) (inventory.NodeOrigin, error) {
 	case option.OriginAdHoc:
 		return decodeAdHocOriginDTO(dto.ParentNode, mask)
 	}
-	return nil, fmt.Errorf("%w: 节点来源 %q 字段组合非法", inventory.ErrInvalidNodeOrigin, dto.Kind)
+	return nil, i18n.EF(inventory.ErrInvalidNodeOrigin, i18n.KeyHostYAMLInvalidFieldCombo, i18n.BoundStr("kind", dto.Kind))
 }
 
 func decodeAdHocOriginDTO(parentRaw string, mask uint8) (inventory.NodeOrigin, error) {
 	if mask&^8 != 0 {
-		return nil, fmt.Errorf("%w: ad_hoc 来源字段组合非法", inventory.ErrInvalidNodeOrigin)
+		return nil, i18n.EF(inventory.ErrInvalidNodeOrigin, i18n.KeyHostYAMLInvalidFieldCombo, i18n.Str("kind", "ad_hoc"))
 	}
 	parentOpt, err := parseOptional(parentRaw, inventory.ParseNodeID)
 	if err != nil {

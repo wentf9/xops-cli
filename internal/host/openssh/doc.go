@@ -12,8 +12,6 @@ package openssh
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
@@ -21,6 +19,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -35,11 +34,11 @@ const (
 // 本包导出的规范化哨兵错误，供上层以 errors.Is 精确识别 OpenSSH 配置故障。
 var (
 	// ErrIncludeCycle 表示 OpenSSH Include 存在直接或间接循环引用。
-	ErrIncludeCycle = errors.New("openssh: 检测到 Include 循环引用")
+	ErrIncludeCycle = i18n.Sentinel(i18n.KeyHostOpenSSHIncludeCycle)
 	// ErrIncludeDepthExceeded 表示 OpenSSH Include 嵌套深度超过安全上限。
-	ErrIncludeDepthExceeded = errors.New("openssh: Include 嵌套深度超出上限")
+	ErrIncludeDepthExceeded = i18n.Sentinel(i18n.KeyHostOpenSSHIncludeDepthExceeded)
 	// ErrInvalidConfig 表示 OpenSSH 配置文件语法或已注册选项值非法。
-	ErrInvalidConfig = errors.New("openssh: 无效的 OpenSSH 配置文件或指令")
+	ErrInvalidConfig = i18n.Sentinel(i18n.KeyHostOpenSSHInvalidConfig)
 )
 
 // SourceSpec 是构造只读 OpenSSHConfigSource 的显式入参规格。
@@ -89,14 +88,14 @@ type ConfigSource struct {
 // NewConfigSource 严格校验所有入参边界后构造只读 OpenSSH ConfigSource。
 func NewConfigSource(spec SourceSpec) (*ConfigSource, error) {
 	if !spec.ConfigPath.IsValid() || spec.Reader == nil || !spec.SymlinkPolicy.IsValid() {
-		return nil, fmt.Errorf("%w: ConfigPath、Reader 或 SymlinkPolicy 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ConfigPath/Reader/SymlinkPolicy"))
 	}
 	baseDir, err := resolveIncludeBaseDir(spec.ConfigPath, spec.IncludeBaseDir)
 	if err != nil {
 		return nil, err
 	}
 	if id, ok := spec.LocalIdentity.Get(); ok && !id.IsValid() {
-		return nil, fmt.Errorf("%w: LocalIdentity 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "LocalIdentity"))
 	}
 	maxBytes, maxDepth, maxFiles, err := normalizeSourceLimits(spec)
 	if err != nil {
@@ -128,13 +127,13 @@ func zeroVal[T any]() (z T) { return z }
 func resolveIncludeBaseDir(cfgPath pathalg.LocalSourcePath, optBase algebraic.Option[pathalg.LocalDir]) (pathalg.LocalDir, error) {
 	if base, ok := optBase.Get(); ok {
 		if !base.IsValid() {
-			return zeroVal[pathalg.LocalDir](), fmt.Errorf("%w: IncludeBaseDir 无效", ports.ErrInvalidArgument)
+			return zeroVal[pathalg.LocalDir](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "IncludeBaseDir"))
 		}
 		return base, nil
 	}
 	dir := cfgPath.Dir()
 	if !dir.IsValid() {
-		return zeroVal[pathalg.LocalDir](), fmt.Errorf("%w: 无法推导 ConfigPath 所在目录", ports.ErrInvalidArgument)
+		return zeroVal[pathalg.LocalDir](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ConfigPath.Dir"))
 	}
 	return dir, nil
 }
@@ -145,21 +144,21 @@ func normalizeSourceLimits(spec SourceSpec) (maxBytes int64, maxDepth, maxFiles 
 		maxBytes = defaultMaxFileBytes
 	}
 	if maxBytes < 0 || maxBytes > maxAllowedFileBytes {
-		return 0, 0, 0, fmt.Errorf("%w: MaxFileBytes=%d 超出范围", ports.ErrInvalidArgument, spec.MaxFileBytes)
+		return 0, 0, 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostLimitOutOfRange, i18n.Str("field", "MaxFileBytes"), i18n.Int64("value", spec.MaxFileBytes), i18n.Int64("max", maxAllowedFileBytes))
 	}
 	maxDepth = spec.MaxIncludeDepth
 	if maxDepth == 0 {
 		maxDepth = defaultMaxIncludeDepth
 	}
 	if maxDepth < 0 || maxDepth > maxAllowedIncludeDepth {
-		return 0, 0, 0, fmt.Errorf("%w: MaxIncludeDepth=%d 超出范围", ports.ErrInvalidArgument, spec.MaxIncludeDepth)
+		return 0, 0, 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostLimitOutOfRange, i18n.Str("field", "MaxIncludeDepth"), i18n.Int("value", spec.MaxIncludeDepth), i18n.Int("max", maxAllowedIncludeDepth))
 	}
 	maxFiles = spec.MaxIncludedFiles
 	if maxFiles == 0 {
 		maxFiles = defaultMaxIncludedFiles
 	}
 	if maxFiles < 0 || maxFiles > maxAllowedIncludedFiles {
-		return 0, 0, 0, fmt.Errorf("%w: MaxIncludedFiles=%d 超出范围", ports.ErrInvalidArgument, spec.MaxIncludedFiles)
+		return 0, 0, 0, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostLimitOutOfRange, i18n.Str("field", "MaxIncludedFiles"), i18n.Int("value", spec.MaxIncludedFiles), i18n.Int("max", maxAllowedIncludedFiles))
 	}
 	return maxBytes, maxDepth, maxFiles, nil
 }
@@ -196,10 +195,10 @@ func (s *ConfigSource) ResolveTier4(ctx context.Context, target option.OriginalH
 		return option.UnsetOptionLayer(), err
 	}
 	if !target.IsValid() {
-		return option.UnsetOptionLayer(), fmt.Errorf("%w: target OriginalHostSpec 无效", ports.ErrInvalidArgument)
+		return option.UnsetOptionLayer(), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "target"))
 	}
 	if ep, hasEP := endpoint.Get(); hasEP && !ep.IsValid() {
-		return option.UnsetOptionLayer(), fmt.Errorf("%w: endpoint 无效", ports.ErrInvalidArgument)
+		return option.UnsetOptionLayer(), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "endpoint"))
 	}
 	doc, exists, err := s.loadRootDocument(ctx)
 	if err != nil || !exists {
@@ -216,7 +215,7 @@ func (s *ConfigSource) checkReady(ctx context.Context) error {
 		return err
 	}
 	if s == nil || !s.valid {
-		return fmt.Errorf("%w: OpenSSH ConfigSource 未初始化", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "OpenSSH ConfigSource"))
 	}
 	return nil
 }

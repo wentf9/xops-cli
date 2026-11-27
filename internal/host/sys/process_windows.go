@@ -76,7 +76,7 @@ func createKillOnCloseJob() (windows.Handle, error) {
 
 func exitStatusFromState(ps *os.ProcessState) (execution.ExitStatus, error) {
 	if ps == nil {
-		return execution.NewExitUnknown("进程退出状态缺失"), nil
+		return execution.NewExitUnknown("process exit status unavailable"), nil
 	}
 	return execution.NewExitCode(int32(ps.ExitCode())), nil
 }

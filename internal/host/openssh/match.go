@@ -1,12 +1,12 @@
 package openssh
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type aliasCandidate struct {
@@ -133,7 +133,7 @@ func (ec *evalContext) evalStmt(stmt configStmt, parentActive, active, passFinal
 		}
 		return active, nil
 	default:
-		return false, fmt.Errorf("%w: 未知语句类型 %d", ErrInvalidConfig, stmt.kind)
+		return false, i18n.EF(ErrInvalidConfig, i18n.KeyHostInvalidField, i18n.Str("field", "stmt.kind"))
 	}
 }
 
@@ -153,14 +153,14 @@ func (ec *evalContext) evalMatchStmt(stmt configStmt, parentActive, passFinal bo
 //   - 任何带参条件缺少参数或参数为空均立即返回错误。
 func validateMatchTokens(tokens []string) (hasFinal, hasCanonical bool, err error) {
 	if len(tokens) == 0 {
-		return false, false, fmt.Errorf("match 缺少条件")
+		return false, false, i18n.E(i18n.KeyHostOpenSSHMatchMissingCriteria)
 	}
 	criteriaCount := 0
 	for i := 0; i < len(tokens); {
 		kw, negated, inlineVal, hasEq := parseMatchKeyword(tokens[i])
 		i++
 		if kw == "" {
-			return false, false, fmt.Errorf("match 条件关键字为空")
+			return false, false, i18n.E(i18n.KeyHostOpenSSHMatchMissingCriteria)
 		}
 		nextIdx, isFinal, isCanon, isCrit, stepErr := validateMatchStep(kw, negated, inlineVal, hasEq, tokens, i, criteriaCount, hasFinal, hasCanonical)
 		if stepErr != nil {
@@ -174,7 +174,7 @@ func validateMatchTokens(tokens []string) (hasFinal, hasCanonical bool, err erro
 		i = nextIdx
 	}
 	if criteriaCount == 0 {
-		return false, false, fmt.Errorf("match canonical/final 缺少后续匹配条件")
+		return false, false, i18n.E(i18n.KeyHostOpenSSHMatchMissingCriteria)
 	}
 	return hasFinal, hasCanonical, nil
 }
@@ -183,23 +183,23 @@ func validateMatchStep(kw string, negated bool, inlineVal string, hasEq bool, to
 	switch kw {
 	case "all":
 		if negated || hasEq || criteriaCount > 0 || idx != len(tokens) {
-			return idx, false, false, false, fmt.Errorf("match all 禁止取反、赋值或与其他条件混用")
+			return idx, false, false, false, i18n.E(i18n.KeyHostOpenSSHMatchModifierInvalid, i18n.Str("modifier", "all"))
 		}
 		return idx, false, false, true, nil
 	case "canonical":
 		if negated || hasEq || criteriaCount > 0 || seenCanonical {
-			return idx, false, false, false, fmt.Errorf("match canonical 禁止取反、赋值、重复或置于其他条件之后")
+			return idx, false, false, false, i18n.E(i18n.KeyHostOpenSSHMatchModifierInvalid, i18n.Str("modifier", "canonical"))
 		}
 		return idx, false, true, false, nil
 	case "final":
 		if negated || hasEq || criteriaCount > 0 || seenFinal {
-			return idx, false, false, false, fmt.Errorf("match final 禁止取反、赋值、重复或置于其他条件之后")
+			return idx, false, false, false, i18n.E(i18n.KeyHostOpenSSHMatchModifierInvalid, i18n.Str("modifier", "final"))
 		}
 		return idx, true, false, false, nil
 	default:
 		_, afterIdx, ok := readMatchCriterionArg(tokens, idx, inlineVal, hasEq)
 		if !ok {
-			return afterIdx, false, false, false, fmt.Errorf("match 条件 %q 缺少有效参数", kw)
+			return afterIdx, false, false, false, i18n.E(i18n.KeyHostOpenSSHMatchCriterionMissingArg, i18n.BoundStr("keyword", kw))
 		}
 		return afterIdx, false, false, true, nil
 	}

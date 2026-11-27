@@ -4,13 +4,14 @@ import (
 	"context"
 	"crypto/cipher"
 	"errors"
-	"fmt"
 	"io"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func writeAndVerifyLocked(
@@ -37,12 +38,12 @@ func writeAndVerifyLocked(
 	readBack, err := root.ReadAllBounded(itemDest, limits)
 	if err != nil {
 		rollbackItem(root, itemDest, hadPrev, prevRaw)
-		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, err)
+		return domi18n.WrapSentinel(ports.ErrSecretVerifyFailed, err)
 	}
 	plain, err := decryptItem(aead, ref, readBack)
 	if err != nil {
 		rollbackItem(root, itemDest, hadPrev, prevRaw)
-		return fmt.Errorf("%w: %w", ports.ErrSecretVerifyFailed, err)
+		return domi18n.WrapSentinel(ports.ErrSecretVerifyFailed, err)
 	}
 	defer clear(plain)
 	verifyErr := secret.WithBytes(plain, func(got *secret.SecretBox) error {
@@ -83,7 +84,7 @@ func decryptItem(aead cipher.AEAD, ref secret.Ref, raw []byte) ([]byte, error) {
 	}
 	plain, err := aead.Open(nil, item.nonce, item.ciphertext, []byte(itemAADPrefix+ref.String()))
 	if err != nil {
-		return nil, fmt.Errorf("%w: 凭据密文认证失败", ports.ErrCorruptData)
+		return nil, i18n.EF(ports.ErrCorruptData, i18n.KeyHostVaultOfflineAEADFailed)
 	}
 	return plain, nil
 }

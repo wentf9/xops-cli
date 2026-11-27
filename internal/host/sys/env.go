@@ -1,11 +1,11 @@
 package sys
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 // SystemEnv 实现 ports.EnvPort，提供只读本机环境变量快照与本机主机/用户/UID/主目录查询；零值恒无效。
@@ -45,7 +45,7 @@ func (e *SystemEnv) Environ() map[string]string {
 // LookupLocalIdentity 查询并校验本机主机名、用户名、可选 UID 与主目录，构造不可变 LocalIdentityInfo。
 func (e *SystemEnv) LookupLocalIdentity() (ports.LocalIdentityInfo, error) {
 	if e == nil || !e.valid {
-		return zeroVal[ports.LocalIdentityInfo](), fmt.Errorf("%w: SystemEnv 未初始化", ports.ErrInvalidArgument)
+		return zeroVal[ports.LocalIdentityInfo](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostNotInitialized, i18n.Str("component", "SystemEnv"))
 	}
 	return lookupLocalIdentityOS()
 }

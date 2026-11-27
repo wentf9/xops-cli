@@ -10,10 +10,12 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 const (
@@ -49,7 +51,7 @@ type WALJournalStore struct {
 // NewWALJournalStore 校验沙箱端口、根目录、日志子目录与单文件上限后构造 WALJournalStore。
 func NewWALJournalStore(spec JournalStoreSpec) (*WALJournalStore, error) {
 	if spec.ScopedFS == nil || !spec.RootDir.IsValid() {
-		return nil, fmt.Errorf("%w: ScopedFS 或 RootDir 无效", ports.ErrInvalidArgument)
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "ScopedFS/RootDir"))
 	}
 	dirDest, err := resolveRootedPath(spec.JournalDir, defaultJournalDirName, "JournalDir")
 	if err != nil {
@@ -75,7 +77,7 @@ func NewWALJournalStore(spec JournalStoreSpec) (*WALJournalStore, error) {
 // JournalGenerationFile 返回指定 (transferID, generation) 对应的沙箱内相对 WAL 文件路径。
 func (s *WALJournalStore) JournalGenerationFile(transferID security.OperationID, generation uint64) (pathalg.LocalRootedDest, error) {
 	if s == nil || !s.valid || !transferID.IsValid() || generation == 0 {
-		return zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: WALJournalStore、transferID 或 generation 无效", ports.ErrInvalidArgument)
+		return zeroVal[pathalg.LocalRootedDest](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "WALJournalStore/transferID/generation"))
 	}
 	return s.walFileDest(transferID, generation)
 }
@@ -86,7 +88,7 @@ func (s *WALJournalStore) Append(ctx context.Context, record fsm.TransferJournal
 		return err
 	}
 	if !record.IsValid() {
-		return fmt.Errorf("%w: TransferJournalRecord 无效", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "TransferJournalRecord"))
 	}
 	frame, err := encodeWALFrame(record)
 	if err != nil {
@@ -123,7 +125,7 @@ func (s *WALJournalStore) Load(ctx context.Context, transferID security.Operatio
 	var out []fsm.TransferJournalRecord
 	for _, snap := range snaps {
 		if snap.Corrupt() {
-			return nil, fmt.Errorf("%w: generation %d: %w", ports.ErrCorruptData, snap.Generation(), snap.Err())
+			return nil, i18n.WrapS(ports.ErrCorruptData, snap.Err(), i18n.KeyHostStoreWALGenerationCorrupt, i18n.Uint64("generation", snap.Generation()))
 		}
 		out = append(out, snap.Records()...)
 	}
@@ -177,7 +179,7 @@ func (s *WALJournalStore) PruneGeneration(ctx context.Context, transferID securi
 		return err
 	}
 	if generation == 0 {
-		return fmt.Errorf("%w: generation 不能为 0", ports.ErrInvalidArgument)
+		return i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostValueMustBeNonZero, i18n.Str("field", "generation"))
 	}
 	walDest, err := s.walFileDest(transferID, generation)
 	if err != nil {
@@ -263,7 +265,7 @@ func (s *WALJournalStore) prepareTransferOp(ctx context.Context, transferID secu
 		return zeroVal[pathalg.LocalRootedDest](), err
 	}
 	if !transferID.IsValid() {
-		return zeroVal[pathalg.LocalRootedDest](), fmt.Errorf("%w: transferID 无效", ports.ErrInvalidArgument)
+		return zeroVal[pathalg.LocalRootedDest](), i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostInvalidField, i18n.Str("field", "transferID"))
 	}
 	return s.transferLockTarget(transferID)
 }
@@ -350,9 +352,9 @@ func ensureRegularWALEntry(e ports.LocalDirEntry) error {
 		return nil
 	}
 	if e.IsSymlink() {
-		return fmt.Errorf("%w: WAL 条目 %q 为符号链接", ports.ErrSymlinkRejected, e.Name())
+		return i18n.EF(ports.ErrSymlinkRejected, i18n.KeyHostPathIsSymlink, i18n.BoundStr("path", e.Name()))
 	}
-	return fmt.Errorf("%w: WAL 条目 %q 不是常规文件", ports.ErrNotRegularFile, e.Name())
+	return i18n.EF(ports.ErrNotRegularFile, i18n.KeyHostPathNotRegular, i18n.BoundStr("path", e.Name()))
 }
 
 func (s *WALJournalStore) readSingleGenerationLocked(root ports.RootHandle, transferID security.OperationID, gen uint64) (ports.JournalGenerationSnapshot, error) {
@@ -363,7 +365,7 @@ func (s *WALJournalStore) readSingleGenerationLocked(root ports.RootHandle, tran
 	raw, err := root.ReadAllBounded(walDest, s.limits)
 	if err != nil {
 		if errors.Is(err, ports.ErrLimitExceeded) || errors.Is(err, ports.ErrCorruptData) {
-			return ports.NewCorruptJournalGenerationSnapshot(gen, fmt.Errorf("%w: %w", ports.ErrCorruptData, err))
+			return ports.NewCorruptJournalGenerationSnapshot(gen, domi18n.WrapSentinel(ports.ErrCorruptData, err))
 		}
 		return zeroVal[ports.JournalGenerationSnapshot](), err
 	}

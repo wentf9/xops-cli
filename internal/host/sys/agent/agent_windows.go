@@ -4,10 +4,10 @@ package agent
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
 )
@@ -30,7 +30,7 @@ func dialAgentPlatform(ctx context.Context, target string) (net.Conn, error) {
 	}
 	ctrlPath, err := osfs.ValidateControlSocketPath(target)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ports.ErrSignerUnavailable, err)
+		return nil, domi18n.WrapSentinel(ports.ErrSignerUnavailable, err)
 	}
 	conn, _, err := osfs.DialUnixVerified(ctx, ctrlPath)
 	if err != nil {

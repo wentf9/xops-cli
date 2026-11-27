@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/unix"
 )
 
@@ -35,7 +36,7 @@ func newUnixTUNConn(fd int, stripAFHeader bool) (*unixTUNConn, error) {
 	wakeR, wakeW, err := os.Pipe()
 	if err != nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("创建 TUN 唤醒管道失败: %w", err)
+		return nil, i18n.Wrap(err, i18n.KeyHostSysCancelHandleFailed)
 	}
 	return &unixTUNConn{
 		fd:            fd,
@@ -216,7 +217,7 @@ func prependDarwinAFHeader(pkt []byte) ([]byte, error) {
 	case 6:
 		af = uint32(unix.AF_INET6)
 	default:
-		return nil, fmt.Errorf("%w: utun L3 帧首字节版本无效 (0x%02x)", ports.ErrInvalidArgument, pkt[0])
+		return nil, i18n.EF(ports.ErrInvalidArgument, i18n.KeyHostTUNInvalidIPVersion, i18n.Str("byte", fmt.Sprintf("0x%02x", pkt[0])))
 	}
 	out := make([]byte, darwinAFHeaderBytes+len(pkt))
 	binary.BigEndian.PutUint32(out[:darwinAFHeaderBytes], af)

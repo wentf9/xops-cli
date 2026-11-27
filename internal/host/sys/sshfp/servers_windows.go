@@ -5,12 +5,12 @@ package sshfp
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"unsafe"
 
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"golang.org/x/sys/windows"
 )
 
@@ -18,11 +18,11 @@ func loadSystemDNSConfigOS(_ context.Context, _ ports.OperatorReadFS) (dnsSystem
 	flags := uint32(windows.GAA_FLAG_SKIP_UNICAST | windows.GAA_FLAG_SKIP_ANYCAST | windows.GAA_FLAG_SKIP_MULTICAST | windows.GAA_FLAG_SKIP_FRIENDLY_NAME)
 	buf, err := queryAdaptersBuffer(flags)
 	if err != nil {
-		return dnsSystemConfig{}, fmt.Errorf("查询 Windows 网卡 DNS 服务器列表失败: %w", err)
+		return dnsSystemConfig{}, i18n.Wrap(err, i18n.KeyHostSSHFPWinAdaptersFailed)
 	}
 	servers := collectWindowsDNSServers((*windows.IpAdapterAddresses)(unsafe.Pointer(&buf[0])))
 	if len(servers) == 0 {
-		return dnsSystemConfig{}, fmt.Errorf("%w: 未发现可用本机 DNS 服务器", ports.ErrNotFound)
+		return dnsSystemConfig{}, i18n.EF(ports.ErrNotFound, i18n.KeyHostSSHFPNoServers)
 	}
 	// Windows 本地 DNS 桩默认不透传上游 DNSSEC AD 信任标记，保持 TrustAD=false 失败关闭。
 	return dnsSystemConfig{servers: servers, trustAD: false}, nil
