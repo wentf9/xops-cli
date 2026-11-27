@@ -40,7 +40,6 @@ const (
 	KeyInteractRiskSafe            domi18n.MessageID = "interact.risk.safe"             // 风险等级标签：安全
 	KeyInteractRiskModerate        domi18n.MessageID = "interact.risk.moderate"         // 风险等级标签：中等风险
 	KeyInteractRiskDangerous       domi18n.MessageID = "interact.risk.dangerous"        // 风险等级标签：高风险
-	KeyInteractRiskCritical        domi18n.MessageID = "interact.risk.critical"         // 风险等级标签：极高风险
 	KeyInteractApprovalBanner      domi18n.MessageID = "interact.approval.banner"       // 审批横幅前缀标签
 	KeyInteractApprovalDigestLabel domi18n.MessageID = "interact.approval.digest_label" // 审批信封摘要字段标签
 )
@@ -62,6 +61,6 @@ func interactErrorAndPromptKeys() []domi18n.MessageID {
 func interactDisplayKeys() []domi18n.MessageID {
 	return []domi18n.MessageID{
 		KeyInteractRiskUnknown, KeyInteractRiskSafe, KeyInteractRiskModerate, KeyInteractRiskDangerous,
-		KeyInteractRiskCritical, KeyInteractApprovalBanner, KeyInteractApprovalDigestLabel,
+		KeyInteractApprovalBanner, KeyInteractApprovalDigestLabel,
 	}
 }

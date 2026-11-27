@@ -6,12 +6,12 @@ cli.help.root: |
     xops [全局选项] <命令> [选项] [参数...]
 
   全局选项：
-    --lang <zh|en>      界面语言：zh | en（覆盖 XOPS_LANG 与系统区域环境变量）
-    --json              在标准输出以规范 JSON/v2 格式输出结果
-    --policy <profile>  安全策略配置档：direct_operator、strict_operator、strict_agent
-    -F <configfile>     指定替代的用户级 OpenSSH 配置文件（传 "none" 禁用）
-    -h, --help          显示帮助信息
-    -V, --version       打印 XOps 构建版本元信息
+    --lang <zh|en>           界面语言：zh | en（覆盖 XOPS_LANG 与系统区域环境变量；可置于命令前或命令后、'--' 之前）
+    --json                   在标准输出以规范 JSON/v2 格式输出结果
+    --policy <profile>       安全策略配置档：direct_operator | strict_operator | strict_agent
+    -F, --ssh-config <file>  指定替代的用户级 OpenSSH 配置文件（传 "none" 禁用）
+    -h, --help               显示帮助信息
+    -V, --version            打印 XOps 构建版本元信息
 
   命令：
     ssh                 连接远端主机、执行单次命令或管理端口转发与连接复用
@@ -61,9 +61,9 @@ cli.help.ssh: |
     -f                     转入后台并移交 muxdaemon 托管运行
     -t                     强制分配伪终端（-tt 在本地无 TTY 时仍强制分配）
     -T                     禁用伪终端分配
-    -F <configfile>        指定替代的用户级 OpenSSH 配置文件（传 "none" 禁用）
+    -F, --ssh-config <file>  指定替代的用户级 OpenSSH 配置文件（传 "none" 禁用）
     --tun-mode <mode>      TUN 转发封装模式：point_to_point（默认）| ethernet
-    --policy <profile>     安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>     安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>         界面语言：zh | en
     --json                 以规范 JSON/v2 输出（仅适用于非交互命令与多路复用控制）
     -h, --help             显示此帮助信息
@@ -96,7 +96,7 @@ cli.help.exec: |
     --privilege-user <user>   提权目标用户（如 root）
     --password-ref <s/i>      提权密码的凭据库引用
     --prompt-password         交互式提示输入提权密码
-    --policy <profile>        安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>        安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>            界面语言：zh | en
     --json                    以规范 JSON/v2 输出
     -h, --help                显示此帮助信息
@@ -116,27 +116,29 @@ cli.help.tunnel: |
     -p/-l/-i/-J/-o/-F        标准 OpenSSH 连接选项
     -L / -R / -D / -w        OpenSSH 转发规格（可重复指定）
     --tun-mode <mode>        TUN 模式：point_to_point | ethernet
-    --policy <profile>       安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>       安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>           界面语言：zh | en
     --json                   以规范 JSON/v2 输出摘要
     -h, --help               显示此帮助信息
 
 cli.help.mux: |
   用法：
-    xops mux start   [ssh选项] [-S <socket>] [-f|--daemon] [-L/-R/-D/-w ...] <目标>
-    xops mux check   [ssh选项] [-S <socket>] <目标>
-    xops mux forward [ssh选项] [-S <socket>] (-L|-R|-D|-w <规格>) <目标>
-    xops mux cancel  [ssh选项] [-S <socket>] (-L|-R|-D|-w <规格>) <目标>
-    xops mux exit    [ssh选项] [-S <socket>] <目标>
-    xops mux stop    [ssh选项] [-S <socket>] <目标>
-    xops mux proxy   [ssh选项] [-S <socket>] <目标>
-    xops mux daemon  [ssh选项] [-S <socket>] [-L/-R/-D/-w ...] <目标>
+    xops mux start        [ssh选项] [-S <socket>] [-f|--daemon] [-L/-R/-D/-w ...] <目标>
+    xops mux check|status [ssh选项] [-S <socket>] <目标>
+    xops mux forward      [ssh选项] [-S <socket>] (-L|-R|-D|-w <规格>) <目标>
+    xops mux cancel       [ssh选项] [-S <socket>] (-L|-R|-D|-w <规格>) <目标>
+    xops mux exit         [ssh选项] [-S <socket>] <目标>
+    xops mux stop         [ssh选项] [-S <socket>] <目标>
+    xops mux proxy        [ssh选项] [-S <socket>] <目标>
+    xops mux daemon       [ssh选项] [-S <socket>] [-L/-R/-D/-w ...] <目标>
 
   选项：
     -p/-l/-i/-J/-o/-F        标准 OpenSSH 连接选项
+    -L / -R / -D / -w        OpenSSH 转发规格（可重复指定）
+    --tun-mode <mode>        TUN 转发封装模式：point_to_point（默认）| ethernet
     -S, --socket <path>      覆盖 ControlMaster 控制套接字路径
     -f, --daemon             移交至后台 muxdaemon 守护进程运行
-    --policy <profile>       安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>       安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>           界面语言：zh | en
     --json                   以规范 JSON/v2 输出
     -h, --help               显示此帮助信息
@@ -154,7 +156,7 @@ cli.help.scp: |
     -i <identity_file>         认证所用私钥文件路径（可重复指定）
     -J <proxy_jump>            跳板机链路
     -o <Key=Value>             OpenSSH 选项覆盖（可重复指定）
-    -F <configfile>            指定替代的用户级 OpenSSH 配置文件
+    -F, --ssh-config <file>    指定替代的用户级 OpenSSH 配置文件
     --resume                   校验摘要后断点续传未完成传输
     --no-clobber               拒绝覆盖已存在的目标文件
     --expand-into-dir[=bool]   将上传文件展开写入已有远端目录（默认 true）
@@ -166,7 +168,7 @@ cli.help.scp: |
     --max-files <n>            递归传输允许的最大文件数
     --max-bytes <n>            传输允许的最大总字节数
     --expected-digest <sha256> 校验内容 SHA-256 摘要
-    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>         安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>             界面语言：zh | en
     --json                     以规范 JSON/v2 输出传输报告
     -h, --help                 显示此帮助信息
@@ -177,7 +179,7 @@ cli.help.sftp: |
     xops sftp ls       [ssh选项] <目标> <远端路径>
     xops sftp stat     [ssh选项] [--follow-symlinks] <目标> <远端路径>
     xops sftp read|cat [ssh选项] [--max-bytes N] <目标> <远端路径>
-    xops sftp write    [ssh选项] [--file <本地路径>|-] [--perm 0644] [--no-clobber] [--create-parents] <目标> <远端路径>
+    xops sftp write    [ssh选项] [--file <本地路径>|-] [--symlink-policy <策略>] [--perm 0644] [--no-clobber] [--create-parents] <目标> <远端路径>
     xops sftp patch    [ssh选项] --old <旧文本> --new <新文本> [--all] <目标> <远端路径>
     xops sftp mkdir    [ssh选项] [--perm 0755] <目标> <远端路径>
     xops sftp mv|rename [ssh选项] [--no-clobber] <目标> <旧路径> <新路径>
@@ -190,7 +192,8 @@ cli.help.sftp: |
 
   选项：
     -P/-p/-l/-i/-J/-o/-F       标准 OpenSSH 连接选项
-    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    --symlink-policy <policy>  sftp write --file 软链策略：reject | contained_relative | follow_operator_source
+    --policy <profile>         安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>             界面语言：zh | en
     --json                     以规范 JSON/v2 输出
     -h, --help                 显示此帮助信息
@@ -216,7 +219,7 @@ cli.help.hosts: |
     host, inventory
 
   通用选项：
-    --policy <profile>           安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>           安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>               界面语言：zh | en
     --json                       以规范 JSON/v2 输出
     -h, --help                   显示此帮助信息
@@ -240,7 +243,7 @@ cli.help.vault: |
     cred, vault
 
   通用选项：
-    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>    安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>        界面语言：zh | en
     --json                以规范 JSON/v2 输出
     -h, --help            显示此帮助信息
@@ -259,7 +262,7 @@ cli.help.config: |
     --expected-revision <rev>    可选 CAS 预期版本令牌
     --source-name <name>         覆盖诊断报告中的逻辑来源标签
     --symlink-policy <policy>    软链策略：reject | contained_relative | follow_operator_source
-    --policy <profile>           安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>           安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>               界面语言：zh | en
     --json                       以规范 JSON/v2 输出
     -h, --help                   显示此帮助信息
@@ -285,7 +288,7 @@ cli.help.playbook: |
     --dialect <dialect>        默认启动方言：posix | powershell | cmd | raw
     --interpreter <interp>     默认解释器：server | sh | bash | zsh | powershell | pwsh | cmd
     --login <mode>             默认登录模式：disabled | login | inherit
-    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>         安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>             界面语言：zh | en
     --json                     以规范 JSON/v2 输出执行报告
     -h, --help                 显示此帮助信息
@@ -299,7 +302,7 @@ cli.help.doctor: |
     --check-vault         校验已解锁凭据库中引用的机密是否存在
     --check-keys          校验本地私钥文件指纹
     --skip-vault-probe    凭据库诊断期间跳过逐条机密探测
-    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>    安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>        界面语言：zh | en
     --json                以规范 JSON/v2 输出诊断报告
     -h, --help            显示此帮助信息
@@ -318,7 +321,7 @@ cli.help.audit: |
     --node <id>           按目标节点 ID 过滤
     --op-id <id>          按 OperationID 过滤
     --trace-id <id>       按 TraceID 过滤
-    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
+    --policy <profile>    安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>        界面语言：zh | en
     --json                以规范 JSON/v2 输出
     -h, --help            显示此帮助信息
@@ -335,8 +338,8 @@ cli.help.mcp: |
     --allow-non-loopback       允许在非回环网卡上绑定 HTTP 监听
     --allowed-origin <origin>  允许的 HTTP Origin 请求头（可重复指定）
     --allowed-host <host>      允许的 HTTP Host 请求头（可重复指定）
-    -F <configfile>            指定替代的 OpenSSH 配置文件
-    --policy <profile>         安全策略配置档：direct_operator | strict | strict_agent
+    -F, --ssh-config <file>    指定替代的 OpenSSH 配置文件
+    --policy <profile>         安全策略配置档：direct_operator | strict_operator | strict_agent
     --lang <zh|en>             界面语言：zh | en
     -h, --help                 显示此帮助信息
 
@@ -345,10 +348,10 @@ cli.help.tui: |
     xops tui [选项]
 
   选项：
-    --node <id>           初始聚焦的目标节点 ID
-    --refresh <duration>  指标与投影刷新周期（如 2s）
-    --no-alt-screen       禁用交替屏幕缓冲区
-    -F <configfile>       指定替代的 OpenSSH 配置文件
-    --policy <profile>    安全策略配置档：direct_operator | strict | strict_agent
-    --lang <zh|en>        界面语言：zh | en
-    -h, --help            显示此帮助信息
+    --node <id>              初始聚焦的目标节点 ID
+    --refresh <duration>     指标与投影刷新周期（如 2s）
+    --no-alt-screen          禁用交替屏幕缓冲区
+    -F, --ssh-config <file>  指定替代的 OpenSSH 配置文件
+    --policy <profile>       安全策略配置档：direct_operator | strict_operator | strict_agent
+    --lang <zh|en>           界面语言：zh | en
+    -h, --help               显示此帮助信息

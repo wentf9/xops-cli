@@ -6,12 +6,12 @@ cli.help.root: |
     xops [global flags] <command> [flags] [args...]
 
   Global Flags:
-    --lang <zh|en>      Display language: zh | en (overrides XOPS_LANG / locale env)
-    --json              Emit canonical JSON/v2 output on stdout
-    --policy <profile>  Security policy profile: direct_operator, strict_operator, strict_agent
-    -F <configfile>     Alternative per-user OpenSSH configuration file ("none" to disable)
-    -h, --help          Show help information
-    -V, --version       Print XOps build version metadata
+    --lang <zh|en>           Display language: zh | en (overrides XOPS_LANG / locale env; valid before or after command, before '--')
+    --json                   Emit canonical JSON/v2 output on stdout
+    --policy <profile>       Security policy profile: direct_operator | strict_operator | strict_agent
+    -F, --ssh-config <file>  Alternative per-user OpenSSH configuration file ("none" to disable)
+    -h, --help               Show help information
+    -V, --version            Print XOps build version metadata
 
   Commands:
     ssh                 Connect to a remote host, execute a command, or manage forwards/mux
@@ -61,9 +61,9 @@ cli.help.ssh: |
     -f                     Background / hand off to muxdaemon before execution
     -t                     Force pseudo-terminal allocation (-tt forces even without local TTY)
     -T                     Disable pseudo-terminal allocation
-    -F <configfile>        Alternative per-user OpenSSH configuration file ("none" to disable)
+    -F, --ssh-config <file>  Alternative per-user OpenSSH configuration file ("none" to disable)
     --tun-mode <mode>      TUN forwarding mode: point_to_point (default) | ethernet
-    --policy <profile>     Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>     Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>         Display language: zh | en
     --json                 Emit canonical JSON/v2 output (non-interactive commands & mux control)
     -h, --help             Show this help message
@@ -96,7 +96,7 @@ cli.help.exec: |
     --privilege-user <user>   Target escalation user (e.g. root)
     --password-ref <s/i>      Vault secret reference for privilege password
     --prompt-password         Prompt interactively for privilege password
-    --policy <profile>        Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>        Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>            Display language: zh | en
     --json                    Emit canonical JSON/v2 output
     -h, --help                Show this help message
@@ -116,27 +116,29 @@ cli.help.tunnel: |
     -p/-l/-i/-J/-o/-F        Standard OpenSSH connection options
     -L / -R / -D / -w        OpenSSH forwarding specifications (repeatable)
     --tun-mode <mode>        TUN mode: point_to_point | ethernet
-    --policy <profile>       Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>       Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>           Display language: zh | en
     --json                   Emit canonical JSON/v2 summary
     -h, --help               Show this help message
 
 cli.help.mux: |
   Usage:
-    xops mux start   [ssh-flags] [-S <socket>] [-f|--daemon] [-L/-R/-D/-w ...] <target>
-    xops mux check   [ssh-flags] [-S <socket>] <target>
-    xops mux forward [ssh-flags] [-S <socket>] (-L|-R|-D|-w <spec>) <target>
-    xops mux cancel  [ssh-flags] [-S <socket>] (-L|-R|-D|-w <spec>) <target>
-    xops mux exit    [ssh-flags] [-S <socket>] <target>
-    xops mux stop    [ssh-flags] [-S <socket>] <target>
-    xops mux proxy   [ssh-flags] [-S <socket>] <target>
-    xops mux daemon  [ssh-flags] [-S <socket>] [-L/-R/-D/-w ...] <target>
+    xops mux start        [ssh-flags] [-S <socket>] [-f|--daemon] [-L/-R/-D/-w ...] <target>
+    xops mux check|status [ssh-flags] [-S <socket>] <target>
+    xops mux forward      [ssh-flags] [-S <socket>] (-L|-R|-D|-w <spec>) <target>
+    xops mux cancel       [ssh-flags] [-S <socket>] (-L|-R|-D|-w <spec>) <target>
+    xops mux exit         [ssh-flags] [-S <socket>] <target>
+    xops mux stop         [ssh-flags] [-S <socket>] <target>
+    xops mux proxy        [ssh-flags] [-S <socket>] <target>
+    xops mux daemon       [ssh-flags] [-S <socket>] [-L/-R/-D/-w ...] <target>
 
   Flags:
     -p/-l/-i/-J/-o/-F        Standard OpenSSH connection options
+    -L / -R / -D / -w        OpenSSH forwarding specifications (repeatable)
+    --tun-mode <mode>        TUN forwarding mode: point_to_point (default) | ethernet
     -S, --socket <path>      ControlMaster socket path override
     -f, --daemon             Hand off to background muxdaemon runner
-    --policy <profile>       Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>       Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>           Display language: zh | en
     --json                   Emit canonical JSON/v2 output
     -h, --help               Show this help message
@@ -154,7 +156,7 @@ cli.help.scp: |
     -i <identity_file>         Private key file for authentication (repeatable)
     -J <proxy_jump>            Jump host destination chain
     -o <Key=Value>             OpenSSH option override (repeatable)
-    -F <configfile>            Alternative per-user OpenSSH configuration file
+    -F, --ssh-config <file>    Alternative per-user OpenSSH configuration file
     --resume                   Resume interrupted transfer with digest verification
     --no-clobber               Refuse to overwrite existing destination file
     --expand-into-dir[=bool]   Expand uploaded file into existing remote directory (default true)
@@ -166,7 +168,7 @@ cli.help.scp: |
     --max-files <n>            Maximum files for recursive transfer
     --max-bytes <n>            Maximum total bytes for transfer
     --expected-digest <sha256> Verify content SHA-256 digest
-    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>         Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>             Display language: zh | en
     --json                     Emit canonical JSON/v2 transfer report
     -h, --help                 Show this help message
@@ -177,7 +179,7 @@ cli.help.sftp: |
     xops sftp ls       [ssh-flags] <target> <remote_path>
     xops sftp stat     [ssh-flags] [--follow-symlinks] <target> <remote_path>
     xops sftp read|cat [ssh-flags] [--max-bytes N] <target> <remote_path>
-    xops sftp write    [ssh-flags] [--file <local>|-] [--perm 0644] [--no-clobber] [--create-parents] <target> <remote_path>
+    xops sftp write    [ssh-flags] [--file <local>|-] [--symlink-policy <policy>] [--perm 0644] [--no-clobber] [--create-parents] <target> <remote_path>
     xops sftp patch    [ssh-flags] --old <text> --new <text> [--all] <target> <remote_path>
     xops sftp mkdir    [ssh-flags] [--perm 0755] <target> <remote_path>
     xops sftp mv|rename [ssh-flags] [--no-clobber] <target> <old_path> <new_path>
@@ -190,7 +192,8 @@ cli.help.sftp: |
 
   Flags:
     -P/-p/-l/-i/-J/-o/-F       Standard OpenSSH connection options
-    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    --symlink-policy <policy>  Symlink policy for 'sftp write --file': reject | contained_relative | follow_operator_source
+    --policy <profile>         Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>             Display language: zh | en
     --json                     Emit canonical JSON/v2 output
     -h, --help                 Show this help message
@@ -216,7 +219,7 @@ cli.help.hosts: |
     host, inventory
 
   Common Flags:
-    --policy <profile>           Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>           Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>               Display language: zh | en
     --json                       Emit canonical JSON/v2 output
     -h, --help                   Show this help message
@@ -240,7 +243,7 @@ cli.help.vault: |
     cred, vault
 
   Common Flags:
-    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>    Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>        Display language: zh | en
     --json                Emit canonical JSON/v2 output
     -h, --help            Show this help message
@@ -259,7 +262,7 @@ cli.help.config: |
     --expected-revision <rev>    Optional CAS expected revision token
     --source-name <name>         Override logical source label in diagnostics
     --symlink-policy <policy>    reject | contained_relative | follow_operator_source
-    --policy <profile>           Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>           Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>               Display language: zh | en
     --json                       Emit canonical JSON/v2 output
     -h, --help                   Show this help message
@@ -285,7 +288,7 @@ cli.help.playbook: |
     --dialect <dialect>        Default launch dialect: posix | powershell | cmd | raw
     --interpreter <interp>     Default interpreter: server | sh | bash | zsh | powershell | pwsh | cmd
     --login <mode>             Default login mode: disabled | login | inherit
-    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>         Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>             Display language: zh | en
     --json                     Emit canonical JSON/v2 report
     -h, --help                 Show this help message
@@ -299,7 +302,7 @@ cli.help.doctor: |
     --check-vault         Verify referenced secrets exist in unlocked vault
     --check-keys          Verify local private key fingerprints
     --skip-vault-probe    Skip probing individual secrets during vault doctor
-    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>    Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>        Display language: zh | en
     --json                Emit canonical JSON/v2 diagnostic report
     -h, --help            Show this help message
@@ -318,7 +321,7 @@ cli.help.audit: |
     --node <id>           Filter by target node ID
     --op-id <id>          Filter by OperationID
     --trace-id <id>       Filter by TraceID
-    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
+    --policy <profile>    Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>        Display language: zh | en
     --json                Emit canonical JSON/v2 output
     -h, --help            Show this help message
@@ -335,8 +338,8 @@ cli.help.mcp: |
     --allow-non-loopback       Allow binding HTTP listener on non-loopback interfaces
     --allowed-origin <origin>  Allowed HTTP Origin header (repeatable)
     --allowed-host <host>      Allowed HTTP Host header (repeatable)
-    -F <configfile>            Alternative OpenSSH configuration file
-    --policy <profile>         Policy profile: direct_operator | strict | strict_agent
+    -F, --ssh-config <file>    Alternative OpenSSH configuration file
+    --policy <profile>         Policy profile: direct_operator | strict_operator | strict_agent
     --lang <zh|en>             Display language: zh | en
     -h, --help                 Show this help message
 
@@ -345,10 +348,10 @@ cli.help.tui: |
     xops tui [flags]
 
   Flags:
-    --node <id>           Initial focused node ID
-    --refresh <duration>  Metrics/projection refresh interval (e.g. 2s)
-    --no-alt-screen       Disable alternate screen buffer
-    -F <configfile>       Alternative OpenSSH configuration file
-    --policy <profile>    Policy profile: direct_operator | strict | strict_agent
-    --lang <zh|en>        Display language: zh | en
-    -h, --help            Show this help message
+    --node <id>              Initial focused node ID
+    --refresh <duration>     Metrics/projection refresh interval (e.g. 2s)
+    --no-alt-screen          Disable alternate screen buffer
+    -F, --ssh-config <file>  Alternative OpenSSH configuration file
+    --policy <profile>       Policy profile: direct_operator | strict_operator | strict_agent
+    --lang <zh|en>           Display language: zh | en
+    -h, --help               Show this help message

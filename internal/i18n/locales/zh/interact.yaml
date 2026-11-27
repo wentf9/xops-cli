@@ -35,7 +35,6 @@ interact.risk.unknown: "未知风险"
 interact.risk.safe: "安全"
 interact.risk.moderate: "中等风险"
 interact.risk.dangerous: "高风险"
-interact.risk.critical: "极高风险"
 interact.approval.banner: "审批确认"
 interact.approval.digest_label: "摘要"
 

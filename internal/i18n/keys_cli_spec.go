@@ -38,6 +38,11 @@ const (
 	KeyCLISSHForwardListening         domi18n.MessageID = "cli.ssh.forward_listening"           // 端口/套接字转发监听就绪行
 	KeyCLIExecBatchSummary            domi18n.MessageID = "cli.exec.batch_summary"              // 批量执行汇总统计行
 	KeyCLIExecBatchNodeHeader         domi18n.MessageID = "cli.exec.batch_node_header"          // 批量执行单节点标题行
+	KeyCLIExecStatusOK                domi18n.MessageID = "cli.exec.status.ok"                  // 批量执行节点状态：成功
+	KeyCLIExecStatusFailed            domi18n.MessageID = "cli.exec.status.failed"              // 批量执行节点状态：失败
+	KeyCLIExecStatusNotStarted        domi18n.MessageID = "cli.exec.status.not_started"         // 批量执行节点状态：未启动
+	KeyCLIExecStatusCompleted         domi18n.MessageID = "cli.exec.status.completed"           // 批量执行节点状态：已完成
+	KeyCLIExecStatusUnknown           domi18n.MessageID = "cli.exec.status.unknown"             // 批量执行节点状态：未知
 	KeyCLISCPUploaded                 domi18n.MessageID = "cli.scp.uploaded"                    // SCP 上传完成摘要行
 	KeyCLISCPDownloaded               domi18n.MessageID = "cli.scp.downloaded"                  // SCP 下载完成摘要行
 	KeyCLISFTPStat                    domi18n.MessageID = "cli.sftp.stat"                       // SFTP stat 元数据展示块
@@ -54,6 +59,9 @@ const (
 	KeyCLISFTPRecoverUncertainNoRetry domi18n.MessageID = "cli.sftp.recover_uncertain_no_retry" // 传输不确定提交禁重试警告
 	KeyCLIConfigNoFormats             domi18n.MessageID = "cli.config.no_formats"               // 未注册导入格式提示
 	KeyCLIConfigImportSummary         domi18n.MessageID = "cli.config.import_summary"           // 配置导入/预览汇总行
+	KeyCLIConfigImportLabelPlan       domi18n.MessageID = "cli.config.import_label.plan"        // 配置导入汇总标签：预检计划
+	KeyCLIConfigImportLabelImport     domi18n.MessageID = "cli.config.import_label.import"      // 配置导入汇总标签：导入
+	KeyCLIConfigImportWarnLine        domi18n.MessageID = "cli.config.import_warn_line"         // 配置导入单条告警明细行
 	KeyCLIHostsResolved               domi18n.MessageID = "cli.hosts.resolved"                  // hosts resolve 目标解析结果行
 	KeyCLIHostsDAGValid               domi18n.MessageID = "cli.hosts.dag_valid"                 // hosts validate-dag 校验结果行
 	KeyCLIHostsFoundRefs              domi18n.MessageID = "cli.hosts.found_refs"                // hosts check-secret-refs 计数行
@@ -203,6 +211,58 @@ const (
 	KeyCmdInitComponentFailed     domi18n.MessageID = "cmd.err.init_component_failed"     // 宿主组件初始化失败
 	KeyCmdLoadConfigFailed        domi18n.MessageID = "cmd.err.load_config_failed"        // 加载 config.yaml 失败
 	KeyCmdReconcileFailed         domi18n.MessageID = "cmd.err.reconcile_failed"          // 启动期崩溃审计对账失败
+
+	// CLI 参数字段嵌套标签键（用于 KeyCLIInvalidField 嵌套 i18n.Msg 参数，登记于 cliErrorKeys + fallback_cli_spec.go）。
+	KeyCLIFieldLocalFilePath     domi18n.MessageID = "cli.field.local_file_path"     // 字段标签：本地文件路径
+	KeyCLIFieldControlSocketPath domi18n.MessageID = "cli.field.control_socket_path" // 字段标签：控制套接字路径
+	KeyCLIFieldRemoteDestPath    domi18n.MessageID = "cli.field.remote_dest_path"    // 字段标签：远端目标路径
+	KeyCLIFieldRemoteSourcePath  domi18n.MessageID = "cli.field.remote_source_path"  // 字段标签：远端源路径
+	KeyCLIFieldLocalSourcePath   domi18n.MessageID = "cli.field.local_source_path"   // 字段标签：本地源路径
+	KeyCLIFieldLocalRelPath      domi18n.MessageID = "cli.field.local_rel_path"      // 字段标签：本地相对路径
+	KeyCLIFieldLocalDirName      domi18n.MessageID = "cli.field.local_dir_name"      // 字段标签：本地目录名
+	KeyCLIFieldLocalDestPath     domi18n.MessageID = "cli.field.local_dest_path"     // 字段标签：本地目标路径
+	KeyCLIFieldLocalDestFilename domi18n.MessageID = "cli.field.local_dest_filename" // 字段标签：本地目标文件名
+	KeyCLIFieldLocalDestRelPath  domi18n.MessageID = "cli.field.local_dest_rel_path" // 字段标签：本地目标相对路径
+	KeyCLIFieldRemotePath        domi18n.MessageID = "cli.field.remote_path"         // 字段标签：远端路径
+	KeyCLIFieldOldPath           domi18n.MessageID = "cli.field.old_path"            // 字段标签：旧路径
+	KeyCLIFieldNewPath           domi18n.MessageID = "cli.field.new_path"            // 字段标签：新路径
+	KeyCLIFieldTransferID        domi18n.MessageID = "cli.field.transfer_id"         // 字段标签：传输 ID
+	KeyCLIFieldTag               domi18n.MessageID = "cli.field.tag"                 // 字段标签：标签
+	KeyCLIFieldAlias             domi18n.MessageID = "cli.field.alias"               // 字段标签：别名
+	KeyCLIFieldSecretRef         domi18n.MessageID = "cli.field.secret_ref"          // 字段标签：凭据引用
+
+	// 组合根 cmd/xops 目标目录与配置路径嵌套标签键（用于 KeyCmdResolveDirFailed / KeyCmdInvalidDirPath）。
+	KeyCmdTargetAuditLogDir      domi18n.MessageID = "cmd.target.audit_log_dir"      // 目标标签：审计日志目录
+	KeyCmdTargetAuditLogFile     domi18n.MessageID = "cmd.target.audit_log_file"     // 目标标签：审计日志文件
+	KeyCmdTargetLocalIdentity    domi18n.MessageID = "cmd.target.local_identity"     // 目标标签：本机身份
+	KeyCmdTargetHomeDir          domi18n.MessageID = "cmd.target.home_dir"           // 目标标签：用户主目录
+	KeyCmdTargetDefaultStateDir  domi18n.MessageID = "cmd.target.default_state_dir"  // 目标标签：默认状态目录
+	KeyCmdTargetDefaultSSHDir    domi18n.MessageID = "cmd.target.default_ssh_dir"    // 目标标签：默认 .ssh 目录
+	KeyCmdTargetDefaultSSHConfig domi18n.MessageID = "cmd.target.default_ssh_config" // 目标标签：默认 SSH 配置文件
+	KeyCmdTargetOpenSSHConfig    domi18n.MessageID = "cmd.target.openssh_config"     // 目标标签：OpenSSH 配置
+	KeyCmdTargetInitialRemoteDir domi18n.MessageID = "cmd.target.initial_remote_dir" // 目标标签：初始远端目录
+	KeyCmdTargetWorkingDir       domi18n.MessageID = "cmd.target.working_dir"        // 目标标签：工作目录
+	KeyCmdTargetDefaultVaultDir  domi18n.MessageID = "cmd.target.default_vault_dir"  // 目标标签：默认凭据库目录
+	KeyCmdTargetVaultStore       domi18n.MessageID = "cmd.target.vault_store"        // 目标标签：命名凭据库存储（含 {name}）
+
+	// 组合根 cmd/xops 宿主组件嵌套标签键（用于 KeyCmdInitComponentFailed）。
+	KeyCmdCompInventoryStore        domi18n.MessageID = "cmd.comp.inventory_store"         // 组件标签：资产存储
+	KeyCmdCompWALJournalStore       domi18n.MessageID = "cmd.comp.wal_journal_store"       // 组件标签：WAL 日志存储
+	KeyCmdCompTerminalAdapter       domi18n.MessageID = "cmd.comp.terminal_adapter"        // 组件标签：终端适配器
+	KeyCmdCompInteractionAdapter    domi18n.MessageID = "cmd.comp.interaction_adapter"     // 组件标签：交互适配器
+	KeyCmdCompSSHFPLookupAdapter    domi18n.MessageID = "cmd.comp.sshfp_lookup_adapter"    // 组件标签：SSHFP 查询适配器
+	KeyCmdCompOpenSSHImporter       domi18n.MessageID = "cmd.comp.openssh_importer"        // 组件标签：OpenSSH 导入器
+	KeyCmdCompCSVImporter           domi18n.MessageID = "cmd.comp.csv_importer"            // 组件标签：CSV 导入器
+	KeyCmdCompProcessInstanceID     domi18n.MessageID = "cmd.comp.process_instance_id"     // 组件标签：进程实例 ID
+	KeyCmdCompAuditSink             domi18n.MessageID = "cmd.comp.audit_sink"              // 组件标签：审计落盘器
+	KeyCmdCompAuditReconciler       domi18n.MessageID = "cmd.comp.audit_reconciler"        // 组件标签：审计对账器
+	KeyCmdCompDefaultOfflineVault   domi18n.MessageID = "cmd.comp.default_offline_vault"   // 组件标签：默认离线凭据库
+	KeyCmdCompPlatformKeychainVault domi18n.MessageID = "cmd.comp.platform_keychain_vault" // 组件标签：平台 os_keychain 凭据库
+	KeyCmdCompRouterVault           domi18n.MessageID = "cmd.comp.router_vault"            // 组件标签：路由凭据库
+	KeyCmdCompConfiguredRouterVault domi18n.MessageID = "cmd.comp.configured_router_vault" // 组件标签：已配置路由凭据库
+	KeyCmdCompOfflineAEADVault      domi18n.MessageID = "cmd.comp.offline_aead_vault"      // 组件标签：offline_aead 凭据库（含 {name}）
+	KeyCmdCompOSKeychainVault       domi18n.MessageID = "cmd.comp.os_keychain_vault"       // 组件标签：os_keychain 凭据库（含 {name}）
+	KeyCmdCompExternalHelperVault   domi18n.MessageID = "cmd.comp.external_helper_vault"   // 组件标签：external_helper 凭据库（含 {name}）
 )
 
 func cliErrorKeys() []domi18n.MessageID {
@@ -237,6 +297,18 @@ func cliErrorKeys() []domi18n.MessageID {
 		KeyCmdTakeoverNotStarted, KeyCmdTakeoverOutcomeUnknown, KeyCmdAuditReadFailed, KeyCmdAuditLineInvalid,
 		KeyCmdFileTooLarge, KeyCmdFileSizeExceedsLimit, KeyCmdShutdownStageFailed, KeyCmdVaultUnknownDefault,
 		KeyCmdVaultUnsupportedKind, KeyCmdInitComponentFailed, KeyCmdLoadConfigFailed, KeyCmdReconcileFailed,
+		KeyCLIFieldLocalFilePath, KeyCLIFieldControlSocketPath, KeyCLIFieldRemoteDestPath, KeyCLIFieldRemoteSourcePath,
+		KeyCLIFieldLocalSourcePath, KeyCLIFieldLocalRelPath, KeyCLIFieldLocalDirName, KeyCLIFieldLocalDestPath,
+		KeyCLIFieldLocalDestFilename, KeyCLIFieldLocalDestRelPath, KeyCLIFieldRemotePath, KeyCLIFieldOldPath,
+		KeyCLIFieldNewPath, KeyCLIFieldTransferID, KeyCLIFieldTag, KeyCLIFieldAlias, KeyCLIFieldSecretRef,
+		KeyCmdTargetAuditLogDir, KeyCmdTargetAuditLogFile, KeyCmdTargetLocalIdentity, KeyCmdTargetHomeDir,
+		KeyCmdTargetDefaultStateDir, KeyCmdTargetDefaultSSHDir, KeyCmdTargetDefaultSSHConfig, KeyCmdTargetOpenSSHConfig,
+		KeyCmdTargetInitialRemoteDir, KeyCmdTargetWorkingDir, KeyCmdTargetDefaultVaultDir, KeyCmdTargetVaultStore,
+		KeyCmdCompInventoryStore, KeyCmdCompWALJournalStore, KeyCmdCompTerminalAdapter, KeyCmdCompInteractionAdapter,
+		KeyCmdCompSSHFPLookupAdapter, KeyCmdCompOpenSSHImporter, KeyCmdCompCSVImporter, KeyCmdCompProcessInstanceID,
+		KeyCmdCompAuditSink, KeyCmdCompAuditReconciler, KeyCmdCompDefaultOfflineVault, KeyCmdCompPlatformKeychainVault,
+		KeyCmdCompRouterVault, KeyCmdCompConfiguredRouterVault, KeyCmdCompOfflineAEADVault, KeyCmdCompOSKeychainVault,
+		KeyCmdCompExternalHelperVault,
 	}
 }
 
@@ -248,10 +320,12 @@ func cliDisplayKeys() []domi18n.MessageID {
 		KeyCLIVersionOutput, KeyCLIShutdownFailed, KeyCLIMarshalJSONFailed, KeyCLICleanupFailed, KeyCLICommandFailed,
 		KeyCLIApprovalRequired, KeyCLIRefAsset, KeyCLIRefSecret, KeyCLIExitJoinDiag,
 		KeyCLISSHMasterActive, KeyCLISSHForwardListening, KeyCLIExecBatchSummary, KeyCLIExecBatchNodeHeader,
+		KeyCLIExecStatusOK, KeyCLIExecStatusFailed, KeyCLIExecStatusNotStarted, KeyCLIExecStatusCompleted, KeyCLIExecStatusUnknown,
 		KeyCLISCPUploaded, KeyCLISCPDownloaded, KeyCLISFTPStat, KeyCLISFTPWrote, KeyCLISFTPPatch, KeyCLISFTPActionOK,
 		KeyCLISFTPRenamed, KeyCLISFTPChmodOK, KeyCLISFTPRecoveredOne, KeyCLISFTPRecoverUncertainInspect,
 		KeyCLISFTPRecoveredAll, KeyCLISFTPRecoverEntry, KeyCLISFTPRecoverError, KeyCLISFTPRecoverUncertainNoRetry,
-		KeyCLIConfigNoFormats, KeyCLIConfigImportSummary, KeyCLIHostsResolved, KeyCLIHostsDAGValid,
+		KeyCLIConfigNoFormats, KeyCLIConfigImportSummary, KeyCLIConfigImportLabelPlan, KeyCLIConfigImportLabelImport,
+		KeyCLIConfigImportWarnLine, KeyCLIHostsResolved, KeyCLIHostsDAGValid,
 		KeyCLIHostsFoundRefs, KeyCLIHostsMutationOK, KeyCLIHostsAllSummary, KeyCLIVaultStatus, KeyCLIVaultStatusDetail,
 		KeyCLIVaultActionOK, KeyCLIVaultLocked, KeyCLIVaultDoctorSummary, KeyCLIVaultSagaResult,
 		KeyCLIVaultSagaUncertain, KeyCLIVaultRefsSummary, KeyCLIVaultDeleted, KeyCLIVaultGCComplete,

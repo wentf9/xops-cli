@@ -35,7 +35,6 @@ interact.risk.unknown: "unknown"
 interact.risk.safe: "safe"
 interact.risk.moderate: "moderate"
 interact.risk.dangerous: "dangerous"
-interact.risk.critical: "critical"
 interact.approval.banner: "APPROVAL"
 interact.approval.digest_label: "digest"
 

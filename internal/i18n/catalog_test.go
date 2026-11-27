@@ -361,7 +361,7 @@ func TestM2DomainCatalogRenderingContracts(t *testing.T) {
 
 func assertCLIHelpContracts(t *testing.T, enLoc, zhLoc *Localizer) {
 	t.Helper()
-	// 全部 16 条 CLI 帮助文档在中英文词库中均须包含 --lang <zh|en> 并以换行结尾。
+	// 全部 16 条 CLI 帮助文档在中英文词库中均须包含 --lang <zh|en>、尾部换行并统一策略档位术语。
 	helpKeys := []domi18n.MessageID{
 		KeyCLIHelpRoot, KeyCLIHelpVersion, KeyCLIHelpSSH, KeyCLIHelpExec, KeyCLIHelpTunnel, KeyCLIHelpMux,
 		KeyCLIHelpSCP, KeyCLIHelpSFTP, KeyCLIHelpHosts, KeyCLIHelpVault, KeyCLIHelpConfig, KeyCLIHelpPlaybook,
@@ -371,12 +371,37 @@ func assertCLIHelpContracts(t *testing.T, enLoc, zhLoc *Localizer) {
 		assertHelpTextValid(t, "en", id, enLoc.T(id))
 		assertHelpTextValid(t, "zh", id, zhLoc.T(id))
 	}
+	assertCLIHelpFlagCoverage(t, "en", enLoc)
+	assertCLIHelpFlagCoverage(t, "zh", zhLoc)
 }
 
 func assertHelpTextValid(t *testing.T, locale string, id domi18n.MessageID, text string) {
 	t.Helper()
 	if !strings.Contains(text, "--lang <zh|en>") || !strings.HasSuffix(text, "\n") {
 		t.Errorf("%s %q 帮助文档缺少 --lang <zh|en> 或尾部换行", locale, id)
+	}
+	if strings.Contains(text, "| strict |") {
+		t.Errorf("%s %q 帮助文档仍残留未统一的策略别名 '| strict |'", locale, id)
+	}
+	if id != KeyCLIHelpVersion && !strings.Contains(text, "direct_operator | strict_operator | strict_agent") {
+		t.Errorf("%s %q 帮助文档缺少统一策略配置档枚举", locale, id)
+	}
+}
+
+func assertCLIHelpFlagCoverage(t *testing.T, locale string, loc *Localizer) {
+	t.Helper()
+	rootText := loc.T(KeyCLIHelpRoot)
+	if !strings.Contains(rootText, "--ssh-config") || !strings.Contains(rootText, "'--'") {
+		t.Errorf("%s cli.help.root 缺少 --ssh-config 或 --lang 位置说明", locale)
+	}
+	muxText := loc.T(KeyCLIHelpMux)
+	for _, token := range []string{"check|status", "-L / -R / -D / -w", "--tun-mode <mode>"} {
+		if !strings.Contains(muxText, token) {
+			t.Errorf("%s cli.help.mux 缺少 %q", locale, token)
+		}
+	}
+	if !strings.Contains(loc.T(KeyCLIHelpSFTP), "--symlink-policy <policy>") {
+		t.Errorf("%s cli.help.sftp 缺少 --symlink-policy <policy>", locale)
 	}
 }
 
@@ -395,12 +420,20 @@ func assertTUIAndInteractContracts(t *testing.T, enLoc, zhLoc *Localizer) {
 	if vaultTitle.Canonical() != "Vault init" || zhLoc.Render(vaultTitle) != "初始化凭据库" {
 		t.Fatalf("凭据库提示渲染异常: en=%q zh=%q", vaultTitle.Canonical(), zhLoc.Render(vaultTitle))
 	}
+	// 已清理死键 interact.risk.critical 不得存在于英中词库。
+	if _, ok := enLoc.Catalog().entries[domi18n.LocaleEn]["interact.risk.critical"]; ok {
+		t.Fatal("死键 interact.risk.critical 应已从词库移除")
+	}
 }
 
 func assertM2SampleErrorRendering(t *testing.T, enLoc, zhLoc *Localizer) {
 	t.Helper()
 	sampleErrs := []error{
 		EF(Sentinel(KeyCLIUsage), KeyCLIInvalidFlagValueEnum, Str("flag", "--lang"), Str("allowed", "zh|en"), Str("value", "fr")),
+		EF(Sentinel(KeyCLIUsage), KeyCLIInvalidField, Msg("field", NewMessage(KeyCLIFieldRemoteDestPath)), BoundStr("value", "/bad")),
+		E(KeyCmdResolveDirFailed, Msg("target", NewMessage(KeyCmdTargetWorkingDir))),
+		E(KeyCmdInvalidDirPath, Msg("target", NewMessage(KeyCmdTargetVaultStore, BoundStr("name", "corp"))), BoundStr("path", "/bad")),
+		E(KeyCmdInitComponentFailed, Msg("component", NewMessage(KeyCmdCompOfflineAEADVault, BoundStr("name", "corp")))),
 		Wrap(Sentinel(KeySFTPCommandCanceled), KeySFTPUnknownOption, Str("cmd", "put"), Str("option", "-z")),
 		EF(Sentinel(KeyMCPInvalidTransport), KeyMCPInvalidTransportValue, Str("value", "grpc")),
 		Wrap(Sentinel(KeyMuxDaemonInvalidConfig), KeyMuxDaemonStopMasterFailed, Str("socket", "/tmp/mux.sock")),
@@ -415,5 +448,34 @@ func assertM2SampleErrorRendering(t *testing.T, enLoc, zhLoc *Localizer) {
 		if gotZh == "" || strings.ContainsAny(gotZh, "{}") {
 			t.Errorf("zh RenderError 异常或存在占位符残留: %q", gotZh)
 		}
+	}
+	assertNestedFieldAndDisplayContracts(t, enLoc, zhLoc)
+}
+
+func assertNestedFieldAndDisplayContracts(t *testing.T, enLoc, zhLoc *Localizer) {
+	t.Helper()
+	usageSent := Sentinel(KeyCLIUsage)
+	nestedErr := EF(usageSent, KeyCLIInvalidField, Msg("field", NewMessage(KeyCLIFieldLocalFilePath)), BoundStr("value", "/bad"))
+	if !errors.Is(nestedErr, usageSent) {
+		t.Error("EF 嵌套字段错误应保留哨兵匹配")
+	}
+	if wantEn := "invalid local file path /bad"; nestedErr.Error() != wantEn {
+		t.Errorf("嵌套字段规范英文 = %q, 期望 %q", nestedErr.Error(), wantEn)
+	}
+	if wantZh := "本地文件路径 取值 /bad 非法"; zhLoc.RenderError(nestedErr) != wantZh {
+		t.Errorf("嵌套字段中文渲染 = %q, 期望 %q", zhLoc.RenderError(nestedErr), wantZh)
+	}
+	vaultErr := E(KeyCmdInitComponentFailed, Msg("component", NewMessage(KeyCmdCompOfflineAEADVault, BoundStr("name", "corp"))))
+	if vaultErr.Error() != "failed to initialize offline_aead vault corp" || zhLoc.RenderError(vaultErr) != "初始化组件 offline_aead 凭据库 corp 失败" {
+		t.Errorf("参数化组件嵌套渲染异常: en=%q zh=%q", vaultErr.Error(), zhLoc.RenderError(vaultErr))
+	}
+	warnEn := enLoc.T(KeyCLIConfigImportWarnLine, BoundStr("code", "W01"), BoundStr("subject", "web"), BoundStr("message", "skipped"))
+	warnZh := zhLoc.T(KeyCLIConfigImportWarnLine, BoundStr("code", "W01"), BoundStr("subject", "web"), BoundStr("message", "skipped"))
+	if warnEn != "  [warn] W01 (web): skipped" || warnZh != "  [警告] W01（web）：skipped" {
+		t.Errorf("配置导入告警行渲染异常: en=%q zh=%q", warnEn, warnZh)
+	}
+	if enLoc.T(KeyCLIExecStatusOK) != "ok" || zhLoc.T(KeyCLIExecStatusOK) != "成功" ||
+		enLoc.T(KeyCLIConfigImportLabelPlan) != "plan" || zhLoc.T(KeyCLIConfigImportLabelPlan) != "预检计划" {
+		t.Error("CLI 展示标签中英文渲染异常")
 	}
 }

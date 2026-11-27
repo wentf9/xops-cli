@@ -2,7 +2,7 @@ package i18n
 
 import domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 
-// fallbackCLI 返回 CLI 命令族与组合根 cmd/xops 全部错误/诊断键的规范英文兜底模板。
+// fallbackCLI 返回 CLI 命令族与组合根 cmd/xops 全部错误/诊断及嵌套字段/组件标签键的规范英文兜底模板。
 func fallbackCLI(id domi18n.MessageID) string {
 	if text := fallbackCLISentinelsAndFlags(id); text != "" {
 		return text
@@ -10,7 +10,13 @@ func fallbackCLI(id domi18n.MessageID) string {
 	if text := fallbackCLIExitAndCommands(id); text != "" {
 		return text
 	}
-	return fallbackCmdXops(id)
+	if text := fallbackCmdXops(id); text != "" {
+		return text
+	}
+	if text := fallbackCLIFields(id); text != "" {
+		return text
+	}
+	return fallbackCmdTargetsAndComponents(id)
 }
 
 func fallbackCLISentinelsAndFlags(id domi18n.MessageID) string {
@@ -253,6 +259,112 @@ func fallbackCmdXops(id domi18n.MessageID) string {
 		return "failed to load config.yaml"
 	case KeyCmdReconcileFailed:
 		return "startup crash audit reconciliation failed"
+	default:
+		return ""
+	}
+}
+
+func fallbackCLIFields(id domi18n.MessageID) string {
+	switch id {
+	case KeyCLIFieldLocalFilePath:
+		return "local file path"
+	case KeyCLIFieldControlSocketPath:
+		return "control socket path"
+	case KeyCLIFieldRemoteDestPath:
+		return "remote destination path"
+	case KeyCLIFieldRemoteSourcePath:
+		return "remote source path"
+	case KeyCLIFieldLocalSourcePath:
+		return "local source path"
+	case KeyCLIFieldLocalRelPath:
+		return "local relative path"
+	case KeyCLIFieldLocalDirName:
+		return "local directory name"
+	case KeyCLIFieldLocalDestPath:
+		return "local destination path"
+	case KeyCLIFieldLocalDestFilename:
+		return "local destination filename"
+	case KeyCLIFieldLocalDestRelPath:
+		return "local destination relative path"
+	case KeyCLIFieldRemotePath:
+		return "remote path"
+	case KeyCLIFieldOldPath:
+		return "old path"
+	case KeyCLIFieldNewPath:
+		return "new path"
+	case KeyCLIFieldTransferID:
+		return "transfer_id"
+	case KeyCLIFieldTag:
+		return "tag"
+	case KeyCLIFieldAlias:
+		return "alias"
+	case KeyCLIFieldSecretRef:
+		return "secret ref"
+	default:
+		return ""
+	}
+}
+
+func fallbackCmdTargetsAndComponents(id domi18n.MessageID) string {
+	switch id {
+	case KeyCmdTargetAuditLogDir:
+		return "policy.guardrail.audit_log dir"
+	case KeyCmdTargetAuditLogFile:
+		return "policy.guardrail.audit_log file"
+	case KeyCmdTargetLocalIdentity:
+		return "local identity"
+	case KeyCmdTargetHomeDir:
+		return "home directory"
+	case KeyCmdTargetDefaultStateDir:
+		return "default state directory"
+	case KeyCmdTargetDefaultSSHDir:
+		return "default .ssh directory"
+	case KeyCmdTargetDefaultSSHConfig:
+		return "default ssh config"
+	case KeyCmdTargetOpenSSHConfig:
+		return "OpenSSH config"
+	case KeyCmdTargetInitialRemoteDir:
+		return "initial remote dir"
+	case KeyCmdTargetWorkingDir:
+		return "working directory"
+	case KeyCmdTargetDefaultVaultDir:
+		return "default vault directory"
+	case KeyCmdTargetVaultStore:
+		return "vault store {name}"
+	case KeyCmdCompInventoryStore:
+		return "inventory store"
+	case KeyCmdCompWALJournalStore:
+		return "WAL journal store"
+	case KeyCmdCompTerminalAdapter:
+		return "terminal adapter"
+	case KeyCmdCompInteractionAdapter:
+		return "interaction adapter"
+	case KeyCmdCompSSHFPLookupAdapter:
+		return "sshfp lookup adapter"
+	case KeyCmdCompOpenSSHImporter:
+		return "openssh importer"
+	case KeyCmdCompCSVImporter:
+		return "csv importer"
+	case KeyCmdCompProcessInstanceID:
+		return "process instance id"
+	case KeyCmdCompAuditSink:
+		return "audit sink"
+	case KeyCmdCompAuditReconciler:
+		return "audit reconciler"
+	case KeyCmdCompDefaultOfflineVault:
+		return "default offline vault"
+	case KeyCmdCompPlatformKeychainVault:
+		return "platform os_keychain vault"
+	case KeyCmdCompRouterVault:
+		return "router vault"
+	case KeyCmdCompConfiguredRouterVault:
+		return "configured router vault"
+	case KeyCmdCompOfflineAEADVault:
+		return "offline_aead vault {name}"
+	case KeyCmdCompOSKeychainVault:
+		return "os_keychain vault {name}"
+	case KeyCmdCompExternalHelperVault:
+		return "external_helper vault {name}"
 	default:
 		return ""
 	}
