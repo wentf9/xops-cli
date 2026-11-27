@@ -7,7 +7,8 @@
 //   - core/osfs 仅允许本地 AF_UNIX 相关 net 符号（18 包级符号 + 3 含 ctx 方法 + 3 包级直接绑定 + 四道防线）；
 //   - core/conc 与 core/internal/foundation/{actor,trace} 零例外共享纯内存非 I/O stdlib 约束，
 //     并全路径封死未登记 core/internal/foundation/* 子包；
-//   - core/internal/mcpruntime 物理禁止引用 ports.OperatorReadFS。
+//   - core/internal/mcpruntime 物理禁止引用 ports.OperatorReadFS；
+//   - internal/i18n 纯内存词库叶层仅允许 embed 与纯内存标准库、go.yaml.in/yaml/v3 及 core/{domain,conc}。
 package archbound
 
 import (

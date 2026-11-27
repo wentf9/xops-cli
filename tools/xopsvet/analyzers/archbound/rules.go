@@ -74,6 +74,10 @@ func checkStdlibImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 		if isPureMemoryStdlibBanned(impPath) {
 			return fmt.Sprintf("core/conc 与 core/internal/foundation/{actor,trace} 禁止导入非纯内存 I/O、反射或随机标准库 %q", impPath), false
 		}
+	case vetutil.LayerInternalI18n:
+		if !isInternalI18nAllowedStdlib(impPath) {
+			return fmt.Sprintf("internal/i18n 禁止导入非纯内存/非白名单标准库 %q", impPath), false
+		}
 	case vetutil.LayerCoreOther:
 		return fmt.Sprintf("未知 core/ 包路径 %q，未在 RFC §2.1/§2.3 授权包清单内", src.BasePath), false
 	case vetutil.LayerCoreFoundationOther:
@@ -120,6 +124,17 @@ func isDomainAllowedStdlib(basePath, impPath string) bool {
 	}, impPath)
 }
 
+// isInternalI18nAllowedStdlib 精确匹配 internal/i18n 纯内存词库叶层的允许标准库白名单（含 embed 与 context 错误映射）。
+func isInternalI18nAllowedStdlib(impPath string) bool {
+	return slices.Contains([]string{
+		"bytes", "cmp", "context", "embed",
+		"encoding/json/jsontext", "encoding/json/v2",
+		"errors", "fmt", "io", "io/fs", "iter", "maps", "math",
+		"path", "slices", "sort", "strconv", "strings",
+		"sync", "sync/atomic", "time", "unicode", "unicode/utf8",
+	}, impPath)
+}
+
 func matchBasePrefix(basePath, prefix string) bool {
 	return basePath == prefix || strings.HasPrefix(basePath, prefix+"/")
 }
@@ -136,6 +151,10 @@ func checkExternalImport(src vetutil.PkgInfo, impPath string) (string, bool) {
 		}
 	case vetutil.LayerCoreOSFS:
 		if impPath == "golang.org/x/sys/unix" || impPath == "golang.org/x/sys/windows" {
+			return "", true
+		}
+	case vetutil.LayerInternalI18n:
+		if impPath == "go.yaml.in/yaml/v3" {
 			return "", true
 		}
 	case vetutil.LayerCorePorts, vetutil.LayerCoreEvents, vetutil.LayerCoreConc,
@@ -206,14 +225,23 @@ func isCoreRuntimeOrRootLayerAllowed(src, dst vetutil.Layer) bool {
 
 func isHostOrEntryLayerAllowed(src, dst vetutil.Layer) bool {
 	switch src {
+	case vetutil.LayerInternalI18n:
+		return slices.Contains([]vetutil.Layer{
+			vetutil.LayerCoreDomain, vetutil.LayerCoreConc, vetutil.LayerInternalI18n,
+		}, dst)
 	case vetutil.LayerHostSys, vetutil.LayerHostVault, vetutil.LayerHostOther:
-		return isHostLayer(dst) || slices.Contains([]vetutil.Layer{vetutil.LayerCoreDomain, vetutil.LayerCorePorts, vetutil.LayerCoreOSFS, vetutil.LayerCoreConc}, dst)
+		return isHostLayer(dst) || slices.Contains([]vetutil.Layer{
+			vetutil.LayerCoreDomain, vetutil.LayerCorePorts, vetutil.LayerCoreOSFS, vetutil.LayerCoreConc, vetutil.LayerInternalI18n,
+		}, dst)
 	case vetutil.LayerEntry:
-		return slices.Contains([]vetutil.Layer{vetutil.LayerCoreDomain, vetutil.LayerCoreEvents, vetutil.LayerCoreConc, vetutil.LayerCoreEngine, vetutil.LayerEntry}, dst)
+		return slices.Contains([]vetutil.Layer{
+			vetutil.LayerCoreDomain, vetutil.LayerCoreEvents, vetutil.LayerCoreConc, vetutil.LayerCoreEngine, vetutil.LayerEntry, vetutil.LayerInternalI18n,
+		}, dst)
 	case vetutil.LayerCmdXops:
 		return isHostLayer(dst) || slices.Contains([]vetutil.Layer{
 			vetutil.LayerCoreDomain, vetutil.LayerCorePorts, vetutil.LayerCoreEvents,
-			vetutil.LayerCoreOSFS, vetutil.LayerCoreConc, vetutil.LayerCoreEngine, vetutil.LayerEntry, vetutil.LayerCmdXops,
+			vetutil.LayerCoreOSFS, vetutil.LayerCoreConc, vetutil.LayerCoreEngine,
+			vetutil.LayerEntry, vetutil.LayerInternalI18n, vetutil.LayerCmdXops,
 		}, dst)
 	case vetutil.LayerToolsXopsvet:
 		return dst == vetutil.LayerToolsXopsvet

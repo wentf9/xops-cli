@@ -1,4 +1,4 @@
-// 命令 xopsvet 是 XOps v2 的自建静态编译器护栏入口，通过 go vet -vettool 执行 9 个正交分析器联合检查。
+// 命令 xopsvet 是 XOps v2 的自建静态编译器护栏入口，通过 go vet -vettool 执行 10 个正交分析器联合检查。
 package main
 
 import (
@@ -7,6 +7,7 @@ import (
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/archbound"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/digestcover"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/failclosed"
+	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/i18nguard"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/linearlease"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/noimplicit"
 	"github.com/wentf9/xops-cli/tools/xopsvet/analyzers/osboundary"
@@ -29,5 +30,6 @@ func main() {
 		secretbox.NewAnalyzer(sf),
 		secrettaint.NewAnalyzer(sf),
 		linearlease.NewAnalyzer(sf),
+		i18nguard.NewAnalyzer(),
 	)
 }

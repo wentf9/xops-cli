@@ -46,6 +46,26 @@ linters:
               desc: "internal/host/** must not depend on core/engine"
             - pkg: "github.com/wentf9/xops-cli/internal/entry"
               desc: "internal/host/** must not depend on internal/entry/**"
+        i18n-decoupling:
+          files:
+            - "**/internal/i18n/**/*.go"
+          deny:
+            - pkg: "github.com/wentf9/xops-cli/cmd"
+              desc: "internal/i18n/** must not depend on cmd/**"
+            - pkg: "github.com/wentf9/xops-cli/internal/host"
+              desc: "internal/i18n/** must not depend on internal/host/**"
+            - pkg: "github.com/wentf9/xops-cli/internal/entry"
+              desc: "internal/i18n/** must not depend on internal/entry/**"
+            - pkg: "github.com/wentf9/xops-cli/core/engine"
+              desc: "internal/i18n/** must not depend on core/engine"
+            - pkg: "github.com/wentf9/xops-cli/core/osfs"
+              desc: "internal/i18n/** must not depend on core/osfs"
+            - pkg: "github.com/wentf9/xops-cli/core/ports"
+              desc: "internal/i18n/** must not depend on core/ports/**"
+            - pkg: "github.com/wentf9/xops-cli/core/events"
+              desc: "internal/i18n/** must not depend on core/events"
+            - pkg: "github.com/wentf9/xops-cli/core/internal"
+              desc: "internal/i18n/** must not depend on core/internal/**"
   exclusions:
     rules:
       - path: "_test\\.go"

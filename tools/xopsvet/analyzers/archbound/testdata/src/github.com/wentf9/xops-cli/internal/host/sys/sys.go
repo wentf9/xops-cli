@@ -5,6 +5,7 @@ import (
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 type HostSys struct {
@@ -12,4 +13,5 @@ type HostSys struct {
 	D algebraic.Duration
 	L osfs.LocalFS
 	F ports.OperatorReadFS
+	C *i18n.Catalog
 }

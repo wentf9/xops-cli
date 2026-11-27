@@ -2,8 +2,9 @@
 //
 // 本分析器在生产与测试文件中统一执行以下静态约束（仅跳过合成 .test 入口包）：
 //   - 禁止定义 func init()；
-//   - 禁止可变包级 var（仅豁免编译期零副作用接口断言、不可变哨兵错误及 cmd/xops 只读 //xops:buildvar，
-//     并覆盖 Go 1.27 new(expr) 与非结构体复合字面量 Key 纯度校验、全包级 error 哨兵不可变保护）；
+//   - 禁止可变包级 var（仅豁免编译期零副作用接口断言、不可变哨兵错误含 i18n.Sentinel 与跨包只读重导出、
+//     cmd/xops 只读 //xops:buildvar 及 internal/i18n 六重门控只读 //go:embed embed.FS，
+//     并覆盖 Go 1.27 new(expr) 与非结构体复合字面量 Key 纯度校验、全包级只读变量不可变保护）；
 //   - 禁止 core/internal/foundation/trace 之外使用 context.WithValue / ctx.Value，
 //     并基于 vetssa 封堵 Value(any) any 窄接口声明、擦除（含 ChangeType/TypeAssert）与 IsInvoke 调用；
 //   - 禁止匿名接口断言（含泛型 IndexExpr/IndexListExpr 与 type switch）；
@@ -38,7 +39,7 @@ func run(pass *analysis.Pass) (any, error) {
 	if vetutil.IsSyntheticTestMain(pass) {
 		return nil, nil
 	}
-	pkgInfo := vetutil.ClassifyPackage(pass.Pkg.Path())
+	pkgInfo := vetutil.ClassifyPass(pass)
 	checkPackageDecls(pass, pkgInfo)
 	checkContextAndAnonIfaces(pass, pkgInfo)
 	checkNolintComments(pass, pkgInfo)
@@ -49,6 +50,7 @@ func run(pass *analysis.Pass) (any, error) {
 func checkPackageDecls(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 	sentinels := collectSentinelVars(pass)
 	buildVars := collectBuildVars(pass, pkgInfo)
+	embedVars := collectEmbedVars(pass, pkgInfo)
 	for _, file := range pass.Files {
 		for _, decl := range file.Decls {
 			switch d := decl.(type) {
@@ -58,10 +60,10 @@ func checkPackageDecls(pass *analysis.Pass, pkgInfo vetutil.PkgInfo) {
 				}
 			case *ast.GenDecl:
 				if d.Tok == token.VAR {
-					checkPkgVarDecl(pass, d, sentinels, buildVars)
+					checkPkgVarDecl(pass, d, sentinels, buildVars, embedVars)
 				}
 			}
 		}
 	}
-	checkImmutableVarMutations(pass, sentinels, buildVars)
+	checkImmutableVarMutations(pass, sentinels, buildVars, embedVars)
 }

@@ -6,6 +6,7 @@ import (
 	"github.com/wentf9/xops-cli/core/osfs"
 	"github.com/wentf9/xops-cli/internal/entry/cli"
 	"github.com/wentf9/xops-cli/internal/host/sys"
+	"github.com/wentf9/xops-cli/internal/i18n"
 )
 
 func main() {
@@ -14,4 +15,5 @@ func main() {
 	_ = sys.HostSys{}
 	_ = engine.Engine{}
 	_ = cli.CLI{}
+	_ = i18n.Catalog{}
 }

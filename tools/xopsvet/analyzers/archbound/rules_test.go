@@ -322,6 +322,64 @@ func TestCheckImportAllowedConcActorEngineAndLayers(t *testing.T) {
 	}
 }
 
+func TestCheckImportAllowedInternalI18n(t *testing.T) {
+	tests := []struct {
+		name    string
+		pkgPath string
+		isTest  bool
+		impPath string
+		wantOK  bool
+	}{
+		{name: "i18n_allows_embed", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "embed", wantOK: true},
+		{name: "i18n_allows_io_fs", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "io/fs", wantOK: true},
+		{name: "i18n_allows_context", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "context", wantOK: true},
+		{name: "i18n_allows_sync_atomic", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "sync/atomic", wantOK: true},
+		{name: "i18n_allows_json_v2", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "encoding/json/v2", wantOK: true},
+		{name: "i18n_allows_yaml_v3", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "go.yaml.in/yaml/v3", wantOK: true},
+		{name: "i18n_denies_other_thirdparty", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "gopkg.in/yaml.v3", wantOK: false},
+		{name: "i18n_denies_os", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "os", wantOK: false},
+		{name: "i18n_denies_os_exec", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "os/exec", wantOK: false},
+		{name: "i18n_denies_net", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "net", wantOK: false},
+		{name: "i18n_denies_net_http", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "net/http", wantOK: false},
+		{name: "i18n_denies_syscall", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "syscall", wantOK: false},
+		{name: "i18n_denies_unsafe", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "unsafe", wantOK: false},
+		{name: "i18n_denies_reflect", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "reflect", wantOK: false},
+		{name: "i18n_denies_log", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "log", wantOK: false},
+		{name: "i18n_denies_log_slog", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "log/slog", wantOK: false},
+		{name: "i18n_denies_plugin", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "plugin", wantOK: false},
+		{name: "i18n_denies_math_rand", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "math/rand", wantOK: false},
+		{name: "i18n_denies_crypto_rand", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "crypto/rand", wantOK: false},
+		{name: "i18n_denies_filepath", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "path/filepath", wantOK: false},
+		{name: "i18n_denies_flag", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "flag", wantOK: false},
+		{name: "i18n_denies_mime", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: "mime", wantOK: false},
+		{name: "i18n_allows_core_domain", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/core/domain/i18n", wantOK: true},
+		{name: "i18n_allows_core_conc", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/core/conc", wantOK: true},
+		{name: "i18n_allows_self_subpkg", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/internal/i18n/sub", wantOK: true},
+		{name: "i18n_denies_core_ports", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/core/ports", wantOK: false},
+		{name: "i18n_denies_core_engine", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/core/engine", wantOK: false},
+		{name: "i18n_denies_host_sys", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/internal/host/sys", wantOK: false},
+		{name: "i18n_denies_entry_cli", pkgPath: vetutil.ModulePrefix + "/internal/i18n", impPath: vetutil.ModulePrefix + "/internal/entry/cli", wantOK: false},
+		{name: "i18n_test_allows_fstest", pkgPath: vetutil.ModulePrefix + "/internal/i18n", isTest: true, impPath: "testing/fstest", wantOK: true},
+		{name: "entry_allows_internal_i18n", pkgPath: vetutil.ModulePrefix + "/internal/entry/cli", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: true},
+		{name: "host_sys_allows_internal_i18n", pkgPath: vetutil.ModulePrefix + "/internal/host/sys/interact", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: true},
+		{name: "host_vault_allows_internal_i18n", pkgPath: vetutil.ModulePrefix + "/internal/host/vault", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: true},
+		{name: "host_other_allows_internal_i18n", pkgPath: vetutil.ModulePrefix + "/internal/host/store", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: true},
+		{name: "cmd_xops_allows_internal_i18n", pkgPath: vetutil.ModulePrefix + "/cmd/xops", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: true},
+		{name: "conc_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/conc", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
+		{name: "core_engine_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/engine", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
+		{name: "core_domain_denies_internal_i18n", pkgPath: vetutil.ModulePrefix + "/core/domain/i18n", impPath: vetutil.ModulePrefix + "/internal/i18n", wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			src := vetutil.ClassifyPackage(tc.pkgPath)
+			reason, ok := checkImportAllowed(src, tc.isTest, tc.impPath)
+			if ok != tc.wantOK {
+				t.Fatalf("checkImportAllowed(%s, test=%v, %s) = (%q, %v), want %v", tc.pkgPath, tc.isTest, tc.impPath, reason, ok, tc.wantOK)
+			}
+		})
+	}
+}
+
 func TestCheckRestrictedNetCompositeLitRejectsUnkeyed(t *testing.T) {
 	lit := &ast.CompositeLit{
 		Elts: []ast.Expr{

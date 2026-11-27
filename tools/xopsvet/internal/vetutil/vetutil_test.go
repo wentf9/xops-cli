@@ -176,6 +176,19 @@ func TestClassifyPackageAndWhitelists(t *testing.T) {
 			wantIsCore:  true,
 		},
 		{
+			name:      "internal_i18n_no_privileges",
+			pkgPath:   "github.com/wentf9/xops-cli/internal/i18n",
+			wantLayer: vetutil.LayerInternalI18n,
+			wantXops:  true,
+		},
+		{
+			name:        "internal_i18n_external_test",
+			pkgPath:     "github.com/wentf9/xops-cli/internal/i18n_test",
+			wantLayer:   vetutil.LayerInternalI18n,
+			wantExtTest: true,
+			wantXops:    true,
+		},
+		{
 			name:      "cmd_xops_no_nolint",
 			pkgPath:   "github.com/wentf9/xops-cli/cmd/xops",
 			wantLayer: vetutil.LayerCmdXops,

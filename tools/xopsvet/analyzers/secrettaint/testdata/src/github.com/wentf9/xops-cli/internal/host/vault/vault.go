@@ -16,8 +16,10 @@ import (
 	"slices"
 	"strings"
 
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/secret"
 	"github.com/wentf9/xops-cli/core/events"
+	"github.com/wentf9/xops-cli/internal/i18n"
 	"gopkg.in/yaml.v3"
 )
 
@@ -519,6 +521,18 @@ func badV232B3Regressions(box *secret.SecretBox, cond bool) {
 		copy([]byte("xxxx"), plain)
 		copy([]byte(nil), plain)
 		copy(make([]byte, len(plain)), plain)
+		return nil
+	})
+}
+
+func badI18nSinkLeaks(box *secret.SecretBox, loc *i18n.Localizer) {
+	_ = box.Use(func(plain []byte) error {
+		s := string(plain)
+		_ = domi18n.Str("secret", s) // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = domi18n.E(domi18n.KeySample, domi18n.Int("len", len(plain)))
+		_ = i18n.E(domi18n.KeySample, domi18n.Str("k", s)) // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = loc.T(domi18n.KeySample, domi18n.Str("k", s))  // want "禁止将明文机密.*传入错误格式化汇点"
+		_ = loc.Render(domi18n.NewMessage(domi18n.KeySample, domi18n.Int("len", len(plain))))
 		return nil
 	})
 }

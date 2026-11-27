@@ -9,9 +9,11 @@ import (
 )
 
 const (
-	eventsPkgPath = vetutil.ModulePrefix + "/core/events"
-	auditPkgPath  = vetutil.ModulePrefix + "/internal/host/audit"
-	portsPkgPath  = vetutil.ModulePrefix + "/core/ports"
+	eventsPkgPath         = vetutil.ModulePrefix + "/core/events"
+	auditPkgPath          = vetutil.ModulePrefix + "/internal/host/audit"
+	portsPkgPath          = vetutil.ModulePrefix + "/core/ports"
+	coreDomainI18nPkgPath = vetutil.ModulePrefix + "/core/domain/i18n"
+	internalI18nPkgPath   = vetutil.ModulePrefix + "/internal/i18n"
 )
 
 // SinkKind 标识机密（SecretBox 或明文）严禁流入的公共高危汇点类别（供 secretbox 与 secrettaint 共享）。
@@ -70,6 +72,24 @@ func classifyLogOrErrorSink(pkgPath, name string) SinkKind {
 		}
 	case "fmt":
 		if name == "Errorf" || hasAnyPrefix(name, "Print", "Fprint", "Sprint", "Append") {
+			return SinkError
+		}
+	case coreDomainI18nPkgPath:
+		if slices.Contains([]string{
+			"Str", "Int", "Int64", "Uint64", "Float", "Bool", "Dur", "DurNanos", "Msg",
+			"NewMessage", "NewMessageWithFallback", "NewPluralMessage", "NewPluralMessageWithFallback",
+			"Sentinel", "SentinelWithFallback", "E", "EF", "Wrap", "WrapS", "WrapSentinel",
+			"EWithFallback", "EFWithFallback", "WrapWithFallback", "WrapSWithFallback",
+			"FormatTemplate",
+		}, name) {
+			return SinkError
+		}
+	case internalI18nPkgPath:
+		if slices.Contains([]string{
+			"Sentinel", "E", "EF", "Wrap", "WrapS",
+			"NewMessage", "NewPluralMessage",
+			"T", "TPlural", "Render", "RenderError",
+		}, name) {
 			return SinkError
 		}
 	}

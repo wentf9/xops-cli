@@ -33,6 +33,7 @@ const (
 	LayerCoreSSHNetOther
 	LayerCoreSim
 	LayerCoreOther
+	LayerInternalI18n
 	LayerHostSys
 	LayerHostVault
 	LayerHostOther
@@ -123,6 +124,7 @@ func classifyRelPath(rel string) Layer {
 		{"core/conc", LayerCoreConc},
 		{"core/engine", LayerCoreEngine},
 		{"core", LayerCoreOther},
+		{"internal/i18n", LayerInternalI18n},
 		{"internal/host/sys", LayerHostSys},
 		{"internal/host/vault", LayerHostVault},
 		{"internal/host", LayerHostOther},
