@@ -1,0 +1,110 @@
+package i18n
+
+// 本文件声明 Wave 3C（core/internal/{pool,gate,sshnet/**}）全部哨兵、自定义结构与上下文强类型 MessageID 常量。
+const (
+	// core/internal/pool 哨兵错误标识（24 导出 + 1 内部哨兵）。
+	KeyPoolNotInitialized       MessageID = "pool.not_initialized"            // 连接池未初始化
+	KeyPoolInvalidConfig        MessageID = "pool.invalid_config"             // 连接池配置无效
+	KeyPoolClosed               MessageID = "pool.closed"                     // 连接池已关闭
+	KeyPoolGateHalted           MessageID = "pool.gate_halted"                // 安全门控已熔断
+	KeyPoolNilContext           MessageID = "pool.nil_context"                // context 为 nil
+	KeyPoolNilCallback          MessageID = "pool.nil_callback"               // 作用域回调为 nil
+	KeyPoolInvalidPlan          MessageID = "pool.invalid_plan"               // 连接计划或摘要无效
+	KeyPoolEmptyPlanList        MessageID = "pool.empty_plan_list"            // 批量租约计划列表为空
+	KeyPoolCapacityExceeded     MessageID = "pool.capacity_exceeded"          // 连接池容量已满
+	KeyPoolParentEpochChanged   MessageID = "pool.parent_epoch_changed"       // 父跳板世代变更拒发布陈旧连接
+	KeyPoolInvalidTransportConn MessageID = "pool.invalid_transport_conn"     // 传输连接无效或摘要失配
+	KeyPoolLeaseInvalid         MessageID = "pool.lease_invalid"              // 连接租约无效
+	KeyPoolLeaseExpired         MessageID = "pool.lease_expired"              // 连接租约超作用域失效
+	KeyPoolLeaseRevoked         MessageID = "pool.lease_revoked"              // 连接租约已吊销
+	KeyPoolHopRetired           MessageID = "pool.hop_retired"                // 传输连接已退役
+	KeyPoolTeardownEscalated    MessageID = "pool.teardown_escalated"         // 连接拆断超时并升级根跳板
+	KeyPoolInvalidResource      MessageID = "pool.invalid_resource"           // 托管资源无效
+	KeyPoolInvalidHandle        MessageID = "pool.invalid_handle"             // 托管句柄无效
+	KeyPoolHandleNotFound       MessageID = "pool.handle_not_found"           // 托管句柄不存在或已释放
+	KeyPoolHandleRevoked        MessageID = "pool.handle_revoked"             // 托管句柄已吊销
+	KeyPoolHandleGenMismatch    MessageID = "pool.handle_generation_mismatch" // 托管句柄世代失配
+	KeyPoolHandleBindMismatch   MessageID = "pool.handle_binding_mismatch"    // 托管句柄绑定信息失配
+	KeyPoolHandleTypeMismatch   MessageID = "pool.handle_type_mismatch"       // 托管资源类型失配
+	KeyPoolHandleLimitExceeded  MessageID = "pool.handle_limit_exceeded"      // 托管句柄数量达上限
+	KeyPoolFastPathMiss         MessageID = "pool.fast_path_miss"             // 整链快路径未命中
+
+	// core/internal/gate 哨兵、3 类自定义结构与上下文错误标识（29 哨兵 + 7 上下文）。
+	KeyGateNilContext           MessageID = "gate.nil_context"               // context 为 nil
+	KeyGateNilAuthorizer        MessageID = "gate.nil_authorizer"            // Authorizer 为 nil
+	KeyGateNilCallback          MessageID = "gate.nil_callback"              // 授权回调为 nil
+	KeyGateInvalidConfig        MessageID = "gate.invalid_config"            // GateConfig 无效
+	KeyGateInvalidPolicy        MessageID = "gate.invalid_policy"            // 护栏策略无效
+	KeyGateInvalidProfile       MessageID = "gate.invalid_profile"           // 策略配置档无效
+	KeyGateInvalidFallback      MessageID = "gate.invalid_fallback"          // 不可交互回退策略无效
+	KeyGateInvalidRequest       MessageID = "gate.invalid_request"           // 授权请求无效
+	KeyGateInvalidOutcome       MessageID = "gate.invalid_outcome"           // 执行结果无效
+	KeyGateCapabilityMismatch   MessageID = "gate.capability_mismatch"       // 幻影能力与绑定能力失配
+	KeyGateNotInitialized       MessageID = "gate.not_initialized"           // Gate 未初始化
+	KeyGateHalted               MessageID = "gate.halted"                    // Gate 已不可逆熔断
+	KeyGateInvalidPermit        MessageID = "gate.invalid_permit"            // 能力证明无效
+	KeyGatePermitRevoked        MessageID = "gate.permit_revoked"            // 能力证明已吊销或越域
+	KeyGateAuthorizationDenied  MessageID = "gate.authorization_denied"      // 安全护栏策略拒绝
+	KeyGateApprovalRequired     MessageID = "gate.approval_required"         // 需要用户显式审批挑战
+	KeyGateApprovalRejected     MessageID = "gate.approval_rejected"         // 用户拒绝审批挑战
+	KeyGateApprovalExpired      MessageID = "gate.approval_expired"          // 审批信封过期或未生效
+	KeyGateApprovalReplayed     MessageID = "gate.approval_replayed"         // 审批信封或 Nonce 重放拒绝
+	KeyGateApprovalMismatch     MessageID = "gate.approval_mismatch"         // 审批信封与操作或绑定失配
+	KeyGateApprovalInvalidated  MessageID = "gate.approval_invalidated"      // 审批挑战令牌已作废
+	KeyGatePendingLimitExceeded MessageID = "gate.pending_limit_exceeded"    // 待审批挑战数量达上限
+	KeyGateScopeEscalated       MessageID = "gate.scope_escalated"           // 规范化检测到作用域升级
+	KeyGateAuditStageFailed     MessageID = "gate.audit_stage_failed"        // 审计登记 StageOperation 失败
+	KeyGateAuditPreWriteFailed  MessageID = "gate.audit_pre_write_failed"    // 前置审计落盘失败拒执行
+	KeyGateAuditUnstageFailed   MessageID = "gate.audit_unstage_failed"      // 终态后注销登记失败
+	KeyGateReconcilerUnavail    MessageID = "gate.reconciler_unavailable"    // 未配置崩溃对账端口
+	KeyGateOperationPanicked    MessageID = "gate.operation_panicked"        // 授权回调发生 panic
+	KeyGateOperationAborted     MessageID = "gate.operation_aborted"         // 授权回调异常中止
+	KeyGateExecutionOutcome     MessageID = "gate.execution_outcome"         // OutcomeError 节点模板
+	KeyGateOpPanickedDetail     MessageID = "gate.operation_panicked_detail" // OperationPanicError 节点模板
+	KeyGateApprovalChallenge    MessageID = "gate.approval_challenge_detail" // ApprovalChallengeError 节点模板
+	KeyGateApprovalPendingMiss  MessageID = "gate.approval_pending_missing"  // 未找到匹配挂起审批挑战
+	KeyGateApprovalRound2Diff   MessageID = "gate.approval_round2_mismatch"  // 二次提交审批与挂起挑战失配
+	KeyGateAbstractCapability   MessageID = "gate.abstract_capability"       // 禁止以抽象接口调用 WithAuthorized
+	KeyGateInvalidClockTime     MessageID = "gate.invalid_clock_time"        // 时钟返回无效时间戳
+
+	// core/internal/sshnet/** 哨兵、sftpStatusError 与协议上下文错误标识（2 哨兵 + 37 上下文）。
+	KeyPrivHandshakeEnded     MessageID = "sshnet.priv.handshake_ended_before_ready" // 提权就绪帧到达前远端结束输出
+	KeyProbeFailed            MessageID = "sshnet.probe.failed"                      // 远端 Shell 探测失败（哨兵）
+	KeyDialParentRequired     MessageID = "sshnet.dial.parent_required"              // 多跳连接缺少活跃父跳板
+	KeyDialNoAuthMethods      MessageID = "sshnet.dial.no_auth_methods"              // 无可用 SSH 认证方式
+	KeyDialEmptyAlgoIntersect MessageID = "sshnet.dial.empty_algo_intersection"      // 策略与传输算法交集为空
+	KeyDialChallengeUnmatched MessageID = "sshnet.dial.challenge_unmatched"          // 质询未命中自动规则且不可交互
+	KeyDialChallengeCmdFailed MessageID = "sshnet.dial.challenge_cmd_failed"         // 质询应答命令执行失败
+	KeyDialTOTPInvalid        MessageID = "sshnet.dial.totp_invalid"                 // TOTP 配置或密钥非法
+	KeyDialTCPFailed          MessageID = "sshnet.dial.tcp_failed"                   // TCP 拨号目标失败
+	KeyDialDirectTCPIPFailed  MessageID = "sshnet.dial.direct_tcpip_failed"          // 经父跳板打开直连通道失败
+	KeyKeySignerPassphraseReq MessageID = "sshnet.keysigner.passphrase_required"     // 加密私钥缺少绑定口令凭据
+	KeyKeySignerFPMismatch    MessageID = "sshnet.keysigner.fingerprint_mismatch"    // 私钥指纹与口令绑定失配
+	KeyKeySignerNoKeysFound   MessageID = "sshnet.keysigner.no_keys_found"           // 未找到可用本地私钥
+	KeyKeySignerNotFound      MessageID = "sshnet.keysigner.not_found"               // 未找到指纹对应签名器
+	KeyKeySignerInvalidCert   MessageID = "sshnet.keysigner.invalid_cert"            // 文件非有效 SSH 证书
+	KeyForwardNonLoopback     MessageID = "sshnet.forward.non_loopback_denied"       // 非回环绑定需开启 GatewayPorts
+	KeyForwardSOCKS5Header    MessageID = "sshnet.forward.socks5_header"             // SOCKS5 协议头非法
+	KeyForwardSOCKS5NoAuth    MessageID = "sshnet.forward.socks5_no_auth"            // SOCKS5 不支持无认证模式
+	KeyForwardSOCKS5CmdReject MessageID = "sshnet.forward.socks5_cmd_rejected"       // SOCKS5 拒绝非 CONNECT 命令
+	KeyHostKeyCertTOFU        MessageID = "sshnet.hostkey.cert_tofu_forbidden"       // 禁止以 TOFU 记录主机证书
+	KeyHostKeyLineMalformed   MessageID = "sshnet.hostkey.line_malformed"            // known_hosts 条目格式畸形
+	KeyMuxExtNotNegotiated    MessageID = "sshnet.mux.ext_not_negotiated"            // 未协商流多路复用扩展
+	KeyMuxProtoVersion        MessageID = "sshnet.mux.proto_version"                 // 不支持的 PROTOCOL.mux 版本
+	KeyMuxUnexpectedFrame     MessageID = "sshnet.mux.unexpected_frame"              // 非预期 PROTOCOL.mux 帧类型
+	KeyMuxFrameTruncated      MessageID = "sshnet.mux.frame_truncated"               // PROTOCOL.mux 报文截断
+	KeyMuxPTYSizeInvalid      MessageID = "sshnet.mux.pty_size_invalid"              // PTY 窗口尺寸越界
+	KeyPrivDialectPOSIXOnly   MessageID = "sshnet.priv.dialect_posix_only"           // 提权仅支持 POSIX 启动方言
+	KeyPrivHandshakeTimeout   MessageID = "sshnet.priv.handshake_timeout"            // 等待远端提权握手超时
+	KeyPrivPasswordRequired   MessageID = "sshnet.priv.password_required"            // 远端提权需要口令
+	KeyPrivAuthRejected       MessageID = "sshnet.priv.auth_rejected"                // 远端提权认证被拒绝
+	KeyProbeNoDialect         MessageID = "sshnet.probe.no_dialect"                  // 阶段 1 未识别受支持启动方言
+	KeyProbeNoInterpreter     MessageID = "sshnet.probe.no_interpreter"              // 阶段 2 未发现兼容解释器
+	KeyProbeFrameInvalid      MessageID = "sshnet.probe.frame_invalid"               // 阶段 2 探测帧非法或不完整
+	KeySFTPStatusCode         MessageID = "sshnet.sftp.status_code"                  // sftpStatusError 无详情模板
+	KeySFTPStatusCodeDetail   MessageID = "sshnet.sftp.status_code_detail"           // sftpStatusError 含详情模板
+	KeySFTPProtoVersion       MessageID = "sshnet.sftp.proto_version"                // 不支持的 SFTP 协议版本
+	KeySFTPUnexpectedPacket   MessageID = "sshnet.sftp.unexpected_packet"            // 非预期 SFTP 报文类型
+	KeySFTPPacketTruncated    MessageID = "sshnet.sftp.packet_truncated"             // SFTP 报文截断或畸形
+	KeySFTPNotSymlink         MessageID = "sshnet.sftp.not_symlink"                  // 远端路径不是符号链接
+)
