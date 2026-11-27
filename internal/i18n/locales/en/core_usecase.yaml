@@ -163,6 +163,7 @@ uc.observability.non_loopback_denied: "binding non-loopback address {addr} is fo
 uc.observability.jpeg_encode_failed: "failed to encode screenshot as JPEG"
 uc.observability.image_decode_failed: "failed to decode screenshot image"
 uc.observability.probe_shell_failed: "failed to probe remote shell for POSIX compatibility"
+uc.obs.vnc_unix_socket_unsupported: "VNC over Unix domain socket is not supported"
 
 # ---- Session Usecase (core/internal/usecase/session) ----
 uc.session.nil_context: "usecase/session: context must not be nil"
@@ -214,6 +215,7 @@ uc.transfer.remote_dir_cycle: "detected remote directory cycle at {path}"
 uc.transfer.remote_abs_required: "remote working or parent directory must be absolute"
 uc.transfer.remote_symlink_hops: "remote symlink expansion exceeded limit {limit}"
 uc.transfer.remote_not_regular: "remote path {path} has unsupported type {kind}"
+uc.transfer.recursive_upload_unsupported: "recursive upload from operator read path is not supported"
 uc.transfer.reason.exists_non_dir: "target path exists and is not a directory"
 uc.transfer.reason.target_is_dir: "target path is a directory"
 uc.transfer.reason.no_clobber: "target already exists and overwrite is disabled"

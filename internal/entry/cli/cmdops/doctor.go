@@ -191,10 +191,12 @@ func renderDoctorFindingMessage(eff *i18n.Localizer, f engine.DoctorFinding) str
 	if msg, ok := f.Localized.Get(); ok && msg.IsValid() {
 		head := eff.Render(msg)
 		if f.Cause != nil {
-			head = eff.T(domi18n.KeyCommonErrorJoin,
-				i18n.BoundStr("head", head),
-				i18n.BoundStr("tail", eff.RenderError(f.Cause)),
-			)
+			if tail := eff.RenderError(f.Cause); tail != "" {
+				head = eff.T(domi18n.KeyCommonErrorJoin,
+					i18n.BoundStr("head", head),
+					i18n.BoundStr("tail", tail),
+				)
+			}
 		}
 		return security.SanitizePromptText(head)
 	}

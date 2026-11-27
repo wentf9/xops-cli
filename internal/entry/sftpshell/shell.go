@@ -10,6 +10,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/option"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/engine"
@@ -420,8 +421,8 @@ func (s *Shell) formatCommandError(err error) string {
 	case errors.Is(err, engine.ErrOutcomeUnknown):
 		return s.loc.T(i18n.KeySFTPMsgOutcomeUnknown, i18n.BoundStr("err", s.loc.RenderError(err)))
 	case errors.Is(err, engine.ErrApprovalRequired):
-		if ch, ok := engine.ExtractApprovalChallenge(err); ok {
-			return s.formatApprovalRequired(ch.Reason(), ch.EnvelopeDigest().String())
+		if ch, ok := engine.ExtractApprovalChallenge(err); ok && ch.IsValid() {
+			return s.formatApprovalRequired(ch.ReasonParam("reason"), ch.EnvelopeDigest().String())
 		}
 		return s.loc.RenderError(err)
 	default:
@@ -429,9 +430,9 @@ func (s *Shell) formatCommandError(err error) string {
 	}
 }
 
-func (s *Shell) formatApprovalRequired(reason, digest string) string {
+func (s *Shell) formatApprovalRequired(reasonParam domi18n.Param, digest string) string {
 	return s.loc.T(i18n.KeySFTPMsgApprovalRequired,
-		i18n.BoundStr("reason", reason),
+		reasonParam,
 		i18n.BoundStr("digest", digest),
 	)
 }

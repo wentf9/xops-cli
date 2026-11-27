@@ -166,12 +166,10 @@ const (
 	VaultStateUninitialized = ports.VaultStateUninitialized
 	VaultStateLocked        = ports.VaultStateLocked
 	VaultStateUnlocked      = ports.VaultStateUnlocked
-
-	PrivilegeMethodInvalid = ports.PrivilegeMethodInvalid
-	PrivilegeMethodSudo    = ports.PrivilegeMethodSudo
-	PrivilegeMethodSu      = ports.PrivilegeMethodSu
-	PrivilegeMethodDoas    = ports.PrivilegeMethodDoas
-
+	PrivilegeMethodInvalid  = ports.PrivilegeMethodInvalid
+	PrivilegeMethodSudo     = ports.PrivilegeMethodSudo
+	PrivilegeMethodSu       = ports.PrivilegeMethodSu
+	PrivilegeMethodDoas     = ports.PrivilegeMethodDoas
 	ForwardDirectionInvalid = ports.ForwardDirectionInvalid
 	ForwardLocal            = ports.ForwardLocal
 	ForwardRemote           = ports.ForwardRemote
@@ -184,25 +182,22 @@ const (
 	TUNModePointToPoint     = ports.TUNModePointToPoint
 	TUNModeEthernet         = ports.TUNModeEthernet
 	TUNUnitAny              = ports.TUNUnitAny
-
-	MuxActionInvalid = ports.MuxActionInvalid
-	MuxActionCheck   = ports.MuxActionCheck
-	MuxActionForward = ports.MuxActionForward
-	MuxActionCancel  = ports.MuxActionCancel
-	MuxActionExit    = ports.MuxActionExit
-	MuxActionStop    = ports.MuxActionStop
-	MuxActionProxy   = ports.MuxActionProxy
-
-	RemoteFileTypeInvalid = ports.RemoteFileTypeInvalid
-	RemoteFileRegular     = ports.RemoteFileRegular
-	RemoteFileDir         = ports.RemoteFileDir
-	RemoteFileSymlink     = ports.RemoteFileSymlink
-	RemoteFileOther       = ports.RemoteFileOther
-
-	DoctorSeverityInvalid = uccred.DoctorSeverityInvalid
-	DoctorSeverityInfo    = uccred.DoctorSeverityInfo
-	DoctorSeverityWarn    = uccred.DoctorSeverityWarn
-	DoctorSeverityError   = uccred.DoctorSeverityError
+	MuxActionInvalid        = ports.MuxActionInvalid
+	MuxActionCheck          = ports.MuxActionCheck
+	MuxActionForward        = ports.MuxActionForward
+	MuxActionCancel         = ports.MuxActionCancel
+	MuxActionExit           = ports.MuxActionExit
+	MuxActionStop           = ports.MuxActionStop
+	MuxActionProxy          = ports.MuxActionProxy
+	RemoteFileTypeInvalid   = ports.RemoteFileTypeInvalid
+	RemoteFileRegular       = ports.RemoteFileRegular
+	RemoteFileDir           = ports.RemoteFileDir
+	RemoteFileSymlink       = ports.RemoteFileSymlink
+	RemoteFileOther         = ports.RemoteFileOther
+	DoctorSeverityInvalid   = uccred.DoctorSeverityInvalid
+	DoctorSeverityInfo      = uccred.DoctorSeverityInfo
+	DoctorSeverityWarn      = uccred.DoctorSeverityWarn
+	DoctorSeverityError     = uccred.DoctorSeverityError
 
 	LocalUploadSourceInvalid  = uctrans.LocalUploadSourceInvalid
 	LocalUploadSourceOperator = uctrans.LocalUploadSourceOperator
@@ -315,13 +310,14 @@ type ApprovalChallenge struct {
 	digest    security.Digest
 	escalated bool
 	reason    string
+	reasonMsg algebraic.Option[domi18n.Message]
 	valid     bool
 }
 
 // ExtractApprovalChallenge 从任意 Engine 返回的 error 链中提取结构化两步审批挑战。
 func ExtractApprovalChallenge(err error) (ApprovalChallenge, bool) {
 	if ch, ok := errors.AsType[*gate.ApprovalChallengeError](err); ok && ch != nil && ch.IsValid() {
-		return ApprovalChallenge{envelope: ch.Envelope(), digest: ch.EnvelopeDigest(), escalated: ch.Escalated(), reason: ch.Reason(), valid: true}, true
+		return ApprovalChallenge{envelope: ch.Envelope(), digest: ch.EnvelopeDigest(), escalated: ch.Escalated(), reason: ch.Reason(), reasonMsg: ch.ReasonMessage(), valid: true}, true
 	}
 	return ApprovalChallenge{}, false
 }
@@ -332,6 +328,22 @@ func (c ApprovalChallenge) Envelope() security.ApprovalEnvelope { return c.envel
 func (c ApprovalChallenge) EnvelopeDigest() security.Digest     { return c.digest }
 func (c ApprovalChallenge) Escalated() bool                     { return c.valid && c.escalated }
 func (c ApprovalChallenge) Reason() string                      { return c.reason }
+
+// ReasonMessage / ReasonParam 暴露结构化审批原因（封闭原因按语种渲染，无效零值失败关闭至默认审批原因）。
+func (c ApprovalChallenge) ReasonMessage() algebraic.Option[domi18n.Message] {
+	return validOrZero(c.IsValid(), c.reasonMsg)
+}
+func (c ApprovalChallenge) ReasonParam(key string) domi18n.Param {
+	if c.IsValid() {
+		if msg, ok := c.reasonMsg.Get(); ok && msg.IsValid() {
+			return domi18n.Msg(key, msg)
+		}
+		if c.reason != "" {
+			return domi18n.BoundStr(key, c.reason)
+		}
+	}
+	return domi18n.Msg(key, domi18n.NewMessage(domi18n.KeyGateReasonApprovalRequired))
+}
 
 // 公共入参复用结构体及面向目标解析/跨用例门面扩展的公开请求 DTO（零明文、零裸 time.Duration）。
 type (

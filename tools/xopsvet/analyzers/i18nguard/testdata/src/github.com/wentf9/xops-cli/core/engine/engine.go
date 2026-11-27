@@ -260,11 +260,14 @@ func badRule4AndRule5(cause error) {
 	_ = i18n.Str("op", "decrypt")               // want "禁止向 Str\\(\"op\", ...\\) 传入非空编译期字符串常量"
 	_ = i18n.BoundStr("reason", constProse)     // want "禁止向 BoundStr\\(\"reason\", ...\\) 传入非空编译期字符串常量"
 
-	// 规则 5B 违规：field / kind / component / feature / expected / action 禁止含空格散文常量。
-	_ = domi18n.Str("field", "jump host")                        // want "禁止向 Str\\(\"field\", ...\\) 传入含空格的散文常量"
-	_ = domi18n.BoundStr("kind", "import format")                // want "禁止向 BoundStr\\(\"kind\", ...\\) 传入含空格的散文常量"
-	_ = i18n.Str("component", "KeySignerPort or OperatorReadFS") // want "禁止向 Str\\(\"component\", ...\\) 传入含空格的散文常量"
-	_ = domi18n.Str("feature", "stdin in batch_exec")            // want "禁止向 Str\\(\"feature\", ...\\) 传入含空格的散文常量"
-	_ = i18n.Str("expected", "non-empty string")                 // want "禁止向 Str\\(\"expected\", ...\\) 传入含空格的散文常量"
-	_ = i18n.BoundStr("action", "delete host")                   // want "禁止向 BoundStr\\(\"action\", ...\\) 传入含空格的散文常量"
+	// 规则 5B 违规：field / kind / component / feature / expected / action 禁止含空白字符散文常量。
+	_ = domi18n.Str("field", "jump host")                        // want "禁止向 Str\\(\"field\", ...\\) 传入含空白字符的散文常量"
+	_ = domi18n.BoundStr("kind", "import format")                // want "禁止向 BoundStr\\(\"kind\", ...\\) 传入含空白字符的散文常量"
+	_ = i18n.Str("component", "KeySignerPort or OperatorReadFS") // want "禁止向 Str\\(\"component\", ...\\) 传入含空白字符的散文常量"
+	_ = domi18n.Str("feature", "stdin in batch_exec")            // want "禁止向 Str\\(\"feature\", ...\\) 传入含空白字符的散文常量"
+	_ = i18n.Str("expected", "non-empty string")                 // want "禁止向 Str\\(\"expected\", ...\\) 传入含空白字符的散文常量"
+	_ = i18n.BoundStr("action", "delete host")                   // want "禁止向 BoundStr\\(\"action\", ...\\) 传入含空白字符的散文常量"
+	_ = domi18n.Str("field", "jump\thost")                       // want "禁止向 Str\\(\"field\", ...\\) 传入含空白字符的散文常量"
+	_ = domi18n.BoundStr("feature", "line1\nline2")              // want "禁止向 BoundStr\\(\"feature\", ...\\) 传入含空白字符的散文常量"
+	_ = i18n.Str("action", "delete\rhost")                       // want "禁止向 Str\\(\"action\", ...\\) 传入含空白字符的散文常量"
 }

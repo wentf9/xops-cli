@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	jsonv2 "encoding/json/v2"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -227,4 +228,33 @@ func TestRunDoctor_BilingualTextAndCanonicalJSON(t *testing.T) {
 	if !strings.Contains(outNVJSON, `"vault_note":"vault not configured"`) {
 		t.Fatalf("Doctor JSON 缺少规范英文 vault_note:\n%s", outNVJSON)
 	}
+
+	// 验证 f.Cause 非空但渲染为空串时不得残留尾随冒号（EN ":" 与 ZH "："）。
+	emptyCauseStub := &doctorStub{
+		invRep: engine.InventoryDoctorRep{
+			Healthy:    false,
+			ErrorCount: 1,
+			Findings: []engine.DoctorFinding{
+				{
+					Severity:  engine.DoctorSeverityError,
+					Code:      "empty_cause",
+					Subject:   "offline/sec-2",
+					Message:   "read-only secret probe failed",
+					Localized: algebraic.Some(domi18n.NewMessage(domi18n.KeyUCDoctorSecretProbeFailed)),
+					Cause:     errors.New(""),
+				},
+			},
+		},
+		vaultRep: engine.CredentialDoctorRep{Healthy: true},
+	}
+	_, outECEn := runDoctorWithLocale(t, emptyCauseStub, cat.For(domi18n.LocaleEn), []string{"--scope", "inventory"})
+	assertDoctorTextOutput(t, "EN-empty-cause", outECEn,
+		[]string{"[error] empty_cause (offline/sec-2): read-only secret probe failed\n"},
+		[]string{"read-only secret probe failed:"},
+	)
+	_, outECZh := runDoctorWithLocale(t, emptyCauseStub, cat.For(domi18n.LocaleZh), []string{"--scope", "inventory"})
+	assertDoctorTextOutput(t, "ZH-empty-cause", outECZh,
+		[]string{"[错误] empty_cause（offline/sec-2）：只读凭据探活失败\n"},
+		[]string{"只读凭据探活失败："},
+	)
 }

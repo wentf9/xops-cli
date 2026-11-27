@@ -26,5 +26,5 @@
 //     哨兵前缀（ErrInvalid*/ErrUsage/ErrCorrupt*/ErrCatalogCorrupt）的包级哨兵使用泛化空壳骨架键；
 //   - 规则 5（编译期常量参数散文拦截）：拦截全仓生产包对 {core/domain/i18n, internal/i18n}.{Str, BoundStr} 的调用，
 //     5A 对 "reason"/"detail"/"op" 槽位禁止任何非空编译期字符串常量，
-//     5B 对 "field"/"kind"/"component"/"feature"/"expected"/"action" 槽位禁止包含 ASCII 空格。
+//     5B 对 "field"/"kind"/"component"/"feature"/"expected"/"action" 槽位禁止包含 ASCII 空白字符（空格/制表/换行）。
 package i18nguard

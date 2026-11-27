@@ -133,7 +133,7 @@ func validateRecursiveUploadParams(req SCPUploadRequest) (int, uint64, error) {
 		return defaultMaxRecursiveFiles, fsm.MaxTransferBytes, nil
 	}
 	if req.Source.Kind() != LocalUploadSourceScoped {
-		return 0, 0, domi18n.WrapS(ErrInvalidRequest, ports.ErrUnsupported, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "recursive_operator_upload"))
+		return 0, 0, domi18n.WrapS(ErrInvalidRequest, ports.ErrUnsupported, domi18n.KeyUCTransferRecursiveUploadUnsup)
 	}
 	if !req.SymlinkPolicy.IsValid() || req.SymlinkPolicy != pathalg.SymlinkReject {
 		return 0, 0, domi18n.WrapSentinel(ErrSymlinkPolicyDenied, domi18n.Wrap(ports.ErrSymlinkRejected, domi18n.KeyCommonFieldInvalid, domi18n.Str("field", "SymlinkPolicy"), domi18n.Str("value", req.SymlinkPolicy.String())), ports.ErrSymlinkRejected)

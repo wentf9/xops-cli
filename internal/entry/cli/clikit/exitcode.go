@@ -192,11 +192,14 @@ func formatSignalDiag(loc *i18n.Localizer, sig *execution.ExitSignal) string {
 	}
 }
 
+const defaultExitUnknownReason = "process exit status unavailable"
+
 func buildExitUnknownErr(u *execution.ExitUnknown) error {
-	if reason := strings.TrimSpace(u.Reason()); reason != "" {
-		return i18n.E(i18n.KeyCLIExitUnknownReason, i18n.BoundStr("reason", reason))
+	reason := strings.TrimSpace(u.Reason())
+	if reason == "" || reason == defaultExitUnknownReason {
+		return i18n.E(i18n.KeyCLIExitUnknown)
 	}
-	return i18n.E(i18n.KeyCLIExitUnknown)
+	return i18n.E(i18n.KeyCLIExitUnknownReason, i18n.BoundStr("reason", reason))
 }
 
 func buildNotStartedErr(ns *execution.OutcomeNotStarted, runErr error) error {

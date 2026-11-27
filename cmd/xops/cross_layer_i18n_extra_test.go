@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	jsonv2 "encoding/json/v2"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +21,9 @@ import (
 	"github.com/wentf9/xops-cli/core/engine"
 	"github.com/wentf9/xops-cli/core/events"
 	"github.com/wentf9/xops-cli/core/ports"
+	"github.com/wentf9/xops-cli/internal/entry/cli"
+	"github.com/wentf9/xops-cli/internal/entry/cli/clikit"
+	"github.com/wentf9/xops-cli/internal/entry/sftpshell"
 	"github.com/wentf9/xops-cli/internal/host/sys"
 	"github.com/wentf9/xops-cli/internal/i18n"
 )
@@ -358,4 +363,236 @@ func TestHasRawPlaceholderInCmd_AlignedWithParamKey(t *testing.T) {
 			t.Errorf("hasRawPlaceholderInCmd(%q) = true, want false", s)
 		}
 	}
+}
+
+type challengeSFTPStub struct {
+	sftpshell.TransferClient
+	challengeErr error
+}
+
+func (c challengeSFTPStub) RealPathRemote(context.Context, engine.RemotePathOpRequest) (pathalg.RemotePath, error) {
+	return pathalg.ParseRemotePath("/home/ops")
+}
+
+func (c challengeSFTPStub) WriteRemoteFile(context.Context, engine.RemoteFileWriteRequest) (engine.WriteFileResult, error) {
+	return engine.WriteFileResult{}, c.challengeErr
+}
+
+func TestCrossLayer_ApprovalChallenge_CLIFailAndSFTPShellBilingual(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	_, xopsHome := setupIsolatedRootEnv(t)
+
+	cfgPath := filepath.Join(filepath.FromSlash(xopsHome.String()), "config.yaml")
+	cfgYAML := `version: 2
+policy:
+  mcp_default: strict_agent
+  guardrail:
+    approval_threshold: dangerous
+    no_elicit_fallback: challenge
+    protected_paths:
+      - /etc/**
+    node_overrides:
+      "prod-*":
+        approval_threshold: dangerous
+        decision_floor: need_approval
+inventory:
+  hosts:
+    h1:
+      address: 127.0.0.1
+      port: 22
+  identities:
+    i1:
+      user: ops
+      auth:
+        kind: agent
+  nodes:
+    n1:
+      host: h1
+      identity: i1
+    prod-1:
+      host: h1
+      identity: i1
+`
+	if err := os.WriteFile(cfgPath, []byte(cfgYAML), 0o600); err != nil {
+		t.Fatalf("WriteFile(config.yaml): %v", err)
+	}
+
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog: %v", err)
+	}
+	runApprovalChallengeCrossLayerSuite(t, context.Background(), cat, cat.For(domi18n.LocaleEn), cat.For(domi18n.LocaleZh))
+	assertZeroRemainingLocks(t, xopsHome)
+}
+
+func runApprovalChallengeCrossLayerSuite(
+	t *testing.T,
+	ctx context.Context,
+	cat *i18n.Catalog,
+	enLoc, zhLoc *i18n.Localizer,
+) {
+	t.Helper()
+	rt, err := wireRuntimeWithLocalizer(ctx, cli.EngineInitOptions{
+		OpenSSHConfigFile: "none",
+		Locale:            domi18n.LocaleZh,
+	}, runtimeModeMCP, strings.NewReader(""), io.Discard, zhLoc)
+	if err != nil {
+		t.Fatalf("wireRuntimeWithLocalizer(MCP): %v", err)
+	}
+	defer func() {
+		if cErr := rt.Close(ctx); cErr != nil {
+			t.Errorf("rt.Close(MCP): %v", cErr)
+		}
+	}()
+
+	// 触发两类真实 *gate.ApprovalChallengeError：风险阈值触发与节点覆盖策略触发。
+	var execOut bytes.Buffer
+	_, riskErr := rt.engine.Exec(ctx, engine.ExecRequest{
+		TargetSpec: "n1",
+		Command:    "uname -a",
+		Risk:       algebraic.Some(security.RiskDangerous),
+		Stdout:     &execOut,
+	})
+	_, nodeOverrideErr := rt.engine.Exec(ctx, engine.ExecRequest{
+		TargetSpec: "prod-1",
+		Command:    "uptime",
+		Risk:       algebraic.Some(security.RiskSafe),
+		Stdout:     &execOut,
+	})
+
+	cases := []struct {
+		name         string
+		err          error
+		wantEnReason string
+		wantZhReason string
+	}{
+		{
+			name:         "risk-threshold",
+			err:          riskErr,
+			wantEnReason: "operation risk meets or exceeds approval threshold",
+			wantZhReason: "操作风险达到或超过审批阈值",
+		},
+		{
+			name:         "node-override",
+			err:          nodeOverrideErr,
+			wantEnReason: "node override requires explicit approval",
+			wantZhReason: "节点策略覆盖要求显式审批",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertApprovalChallengeCrossLayerRendering(t, ctx, rt.engine, cat, enLoc, zhLoc, tc.err, tc.wantEnReason, tc.wantZhReason)
+		})
+	}
+}
+
+func assertApprovalChallengeCrossLayerRendering(
+	t *testing.T,
+	ctx context.Context,
+	eng *engine.Engine,
+	cat *i18n.Catalog,
+	enLoc, zhLoc *i18n.Localizer,
+	chErr error,
+	wantEnReason, wantZhReason string,
+) {
+	t.Helper()
+	if !errors.Is(chErr, engine.ErrApprovalRequired) {
+		t.Fatalf("期望 engine.ErrApprovalRequired，实际=%v", chErr)
+	}
+	ch, ok := engine.ExtractApprovalChallenge(chErr)
+	if !ok || !ch.IsValid() {
+		t.Fatalf("ExtractApprovalChallenge 失败: ok=%v err=%v", ok, chErr)
+	}
+	if ch.Reason() != wantEnReason {
+		t.Fatalf("ch.Reason() = %q，期望 %q", ch.Reason(), wantEnReason)
+	}
+	forbidZh := []string{
+		"operation risk meets or exceeds approval threshold",
+		"node override requires explicit approval",
+		"operation touches protected path",
+		"approval required",
+		"protected path",
+		"approval challenge required",
+	}
+
+	// 1. CLI clikit.Runtime.Fail --lang zh 文本模式：首行错误与第二行审批摘要 100% 中文且零英文原因泄露。
+	var zhOut, zhErrBuf bytes.Buffer
+	zhRT := &clikit.Runtime{Stdout: &zhOut, Stderr: &zhErrBuf, Catalog: cat, Localizer: zhLoc}
+	if code := zhRT.Fail(clikit.ExitGeneral, false, chErr); code != clikit.ExitGeneral {
+		t.Fatalf("zh Fail exitCode = %d", code)
+	}
+	zhLines := strings.Split(strings.TrimSpace(zhErrBuf.String()), "\n")
+	if len(zhLines) != 2 {
+		t.Fatalf("zh Fail 期望 2 行（首行错误+第二行审批摘要），实际 %d 行:\n%s", len(zhLines), zhErrBuf.String())
+	}
+	assertChineseCleanText(t, "cli Fail zh line1", zhLines[0], []string{"操作需要两阶段人工审批确认", wantZhReason}, forbidZh)
+	assertChineseCleanText(t, "cli Fail zh line2", zhLines[1], []string{"需要人工审批：摘要=" + ch.EnvelopeDigest().String(), "原因=" + wantZhReason}, forbidZh)
+
+	// 2. CLI clikit.Runtime.Fail --lang en 文本模式：与 ch.Reason() 100% 逐字同构。
+	var enOut, enErrBuf bytes.Buffer
+	enRT := &clikit.Runtime{Stdout: &enOut, Stderr: &enErrBuf, Catalog: cat, Localizer: enLoc}
+	_ = enRT.Fail(clikit.ExitGeneral, false, chErr)
+	enLines := strings.Split(strings.TrimSpace(enErrBuf.String()), "\n")
+	if len(enLines) != 2 {
+		t.Fatalf("en Fail 期望 2 行，实际 %d 行:\n%s", len(enLines), enErrBuf.String())
+	}
+	assertEnglishCleanText(t, "cli Fail en line1", enLines[0], []string{ch.Reason()})
+	assertEnglishCleanText(t, "cli Fail en line2", enLines[1], []string{"approval required: digest=" + ch.EnvelopeDigest().String(), "reason=" + ch.Reason()})
+
+	// 3. CLI clikit.Runtime.Fail --lang zh --json：error 中文化，但 approval_challenge.reason 保持规范纯英文。
+	var jsonOut, jsonErrBuf bytes.Buffer
+	zhJSONRT := &clikit.Runtime{Stdout: &jsonOut, Stderr: &jsonErrBuf, Catalog: cat, Localizer: zhLoc}
+	_ = zhJSONRT.Fail(clikit.ExitGeneral, true, chErr)
+	var env clikit.ErrorEnvelope
+	if err := jsonv2.Unmarshal(jsonOut.Bytes(), &env); err != nil {
+		t.Fatalf("Fail --json 反序列化失败: %v\nraw=%s", err, jsonOut.String())
+	}
+	if env.ErrorCode != "approval_required" || env.Challenge == nil {
+		t.Fatalf("Fail --json 信封缺少 approval_challenge: %+v", env)
+	}
+	assertChineseCleanText(t, "cli Fail zh --json error", env.Error, []string{"操作需要两阶段人工审批确认", wantZhReason}, forbidZh)
+	if env.Challenge.Reason != ch.Reason() {
+		t.Fatalf("approval_challenge.reason = %q，期望规范英文 %q", env.Challenge.Reason, ch.Reason())
+	}
+	assertEnglishCleanText(t, "cli Fail zh --json challenge.reason", env.Challenge.Reason, []string{ch.Reason()})
+
+	// 4. sftpshell formatCommandError 双语渲染（经真实 sftpshell.Run 触发）。
+	assertSFTPShellChallengeRendering(t, ctx, eng, enLoc, zhLoc, chErr, ch, wantZhReason, forbidZh)
+}
+
+func assertSFTPShellChallengeRendering(
+	t *testing.T,
+	ctx context.Context,
+	eng *engine.Engine,
+	enLoc, zhLoc *i18n.Localizer,
+	chErr error,
+	ch engine.ApprovalChallenge,
+	wantZhReason string,
+	forbidZh []string,
+) {
+	t.Helper()
+	stub := challengeSFTPStub{TransferClient: eng, challengeErr: chErr}
+
+	var zhOut, zhErr bytes.Buffer
+	if err := sftpshell.Run(ctx, sftpshell.Config{
+		Engine: stub, TargetSpec: "n1",
+		Stdin: strings.NewReader("write /etc/hosts payload\nquit\n"), Stdout: &zhOut, Stderr: &zhErr,
+		Localizer: zhLoc,
+	}); err != nil {
+		t.Fatalf("sftpshell.Run(zh): %v", err)
+	}
+	wantSFTPZh := "sftp: 需要人工审批（" + wantZhReason + "，摘要=" + ch.EnvelopeDigest().String() + "）"
+	assertChineseCleanText(t, "sftpshell zh stderr", zhErr.String(), []string{wantSFTPZh}, forbidZh)
+
+	var enOut, enErr bytes.Buffer
+	if err := sftpshell.Run(ctx, sftpshell.Config{
+		Engine: stub, TargetSpec: "n1",
+		Stdin: strings.NewReader("write /etc/hosts payload\nquit\n"), Stdout: &enOut, Stderr: &enErr,
+		Localizer: enLoc,
+	}); err != nil {
+		t.Fatalf("sftpshell.Run(en): %v", err)
+	}
+	wantSFTPEn := "sftp: approval required (" + ch.Reason() + ", digest=" + ch.EnvelopeDigest().String() + ")"
+	assertEnglishCleanText(t, "sftpshell en stderr", enErr.String(), []string{wantSFTPEn})
 }

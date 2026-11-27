@@ -265,6 +265,8 @@ func lookupUsecase(id string) string {
 		return "failed to decode screenshot image"
 	case "uc.observability.probe_shell_failed":
 		return "failed to probe remote shell for POSIX compatibility"
+	case "uc.obs.vnc_unix_socket_unsupported":
+		return "VNC over Unix domain socket is not supported"
 	case "uc.session.nil_context":
 		return "usecase/session: context must not be nil"
 	case "uc.session.invalid_config":
@@ -359,6 +361,8 @@ func lookupUsecase(id string) string {
 		return "remote symlink expansion exceeded limit {limit}"
 	case "uc.transfer.remote_not_regular":
 		return "remote path {path} has unsupported type {kind}"
+	case "uc.transfer.recursive_upload_unsupported":
+		return "recursive upload from operator read path is not supported"
 	case "uc.transfer.reason.exists_non_dir":
 		return "target path exists and is not a directory"
 	case "uc.transfer.reason.target_is_dir":
@@ -511,6 +515,7 @@ func keysUsecase() []string {
 		"uc.observability.jpeg_encode_failed",
 		"uc.observability.image_decode_failed",
 		"uc.observability.probe_shell_failed",
+		"uc.obs.vnc_unix_socket_unsupported",
 		"uc.session.nil_context",
 		"uc.session.invalid_config",
 		"uc.session.not_initialized",
@@ -558,6 +563,7 @@ func keysUsecase() []string {
 		"uc.transfer.remote_abs_required",
 		"uc.transfer.remote_symlink_hops",
 		"uc.transfer.remote_not_regular",
+		"uc.transfer.recursive_upload_unsupported",
 		"uc.transfer.reason.exists_non_dir",
 		"uc.transfer.reason.target_is_dir",
 		"uc.transfer.reason.no_clobber",

@@ -25,6 +25,7 @@ import (
 	"github.com/wentf9/xops-cli/core/conc"
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/inventory"
 	"github.com/wentf9/xops-cli/core/domain/netaddr"
 	"github.com/wentf9/xops-cli/core/domain/option"
@@ -722,6 +723,8 @@ func TestGUISessionX11VNCLifecycleAndGateHaltedRevocation(t *testing.T) {
 		Plan: rig2.plan, Spec: observability.GUISessionSpec{Kind: observability.GUISessionVNC, DisplayNum: 1, UseUnixSocket: true},
 	}); !errors.Is(err, observability.ErrInvalidGUIInput) {
 		t.Fatalf("expected VNC+UseUnixSocket rejected, got %v", err)
+	} else if id, ok := domi18n.ErrorID(err); !ok || id != domi18n.KeyUCObsVNCUnixSocketUnsup {
+		t.Fatalf("expected VNC+UseUnixSocket key %s, got (%q, %v) err=%q", domi18n.KeyUCObsVNCUnixSocketUnsup, id, ok, err.Error())
 	}
 	_, err = rig2.svc.OpenGUISession(context.Background(), observability.OpenGUISessionRequest{
 		Plan: rig2.plan, Spec: observability.GUISessionSpec{Kind: observability.GUISessionVNC, DisplayNum: 1, LocalBindHost: "0.0.0.0", LocalBindPort: 15901, AllowNonLoopbackBind: true},

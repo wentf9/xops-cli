@@ -12,7 +12,7 @@ import (
 // checkConstParamProse 执行规则 5：拦截全仓生产包对 {core/domain/i18n, internal/i18n}.{Str, BoundStr}
 // 传入编译期散文常量：
 //   - 规则 5A：key ∈ {"reason", "detail", "op"} 时禁止任何非空编译期字符串常量；
-//   - 规则 5B：key ∈ {"field", "kind", "component", "feature", "expected", "action"} 时禁止含 ASCII 空格。
+//   - 规则 5B：key ∈ {"field", "kind", "component", "feature", "expected", "action"} 时禁止含 ASCII 空白字符（空格/制表/换行）。
 func checkConstParamProse(pass *analysis.Pass) {
 	vetutil.InspectorOf(pass).Preorder([]ast.Node{(*ast.CallExpr)(nil)}, func(n ast.Node) {
 		call, ok := n.(*ast.CallExpr)
@@ -42,8 +42,8 @@ func checkConstParamProseArgs(pass *analysis.Pass, fnName string, keyArg, valArg
 		pass.ReportRangef(valArg, "i18nguard: 禁止向 %s(%q, ...) 传入非空编译期字符串常量 %q，请改用 Msg(%q, NewMessage(...)) 或专用 MessageID", fnName, key, val, key)
 		return
 	}
-	if isSingleIdentParamSlot(key) && strings.ContainsRune(val, ' ') {
-		pass.ReportRangef(valArg, "i18nguard: 禁止向 %s(%q, ...) 传入含空格的散文常量 %q，请改用单标识符、Msg(...) 或专用 MessageID", fnName, key, val)
+	if isSingleIdentParamSlot(key) && strings.ContainsAny(val, " \t\r\n") {
+		pass.ReportRangef(valArg, "i18nguard: 禁止向 %s(%q, ...) 传入含空白字符的散文常量 %q，请改用单标识符、Msg(...) 或专用 MessageID", fnName, key, val)
 	}
 }
 
@@ -57,7 +57,7 @@ func isForbiddenConstValueSlot(key string) bool {
 	}
 }
 
-// isSingleIdentParamSlot 返回仅允许单标识符、禁止含 ASCII 空格散文的参数槽位集合（规则 5B）。
+// isSingleIdentParamSlot 返回仅允许单标识符、禁止含 ASCII 空白字符散文的参数槽位集合（规则 5B）。
 func isSingleIdentParamSlot(key string) bool {
 	switch key {
 	case "field", "kind", "component", "feature", "expected", "action":

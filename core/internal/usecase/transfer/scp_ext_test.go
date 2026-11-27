@@ -14,6 +14,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/fsm"
+	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/events"
@@ -775,6 +776,10 @@ func assertRecursiveSCPUploadAdversarialGuards(t *testing.T) {
 		Recursive: true, SymlinkPolicy: pathalg.SymlinkReject,
 	})
 	requireErrIs(t, err, ports.ErrUnsupported, "Operator 源递归上传必须拒绝")
+	requireErrIs(t, err, transfer.ErrInvalidRequest, "Operator 源递归上传须保留 ErrInvalidRequest")
+	if id, ok := domi18n.ErrorID(err); !ok || id != domi18n.KeyUCTransferRecursiveUploadUnsup {
+		t.Fatalf("Operator 源递归上传应使用专用键 %s，实际=(%q, %v) err=%q", domi18n.KeyUCTransferRecursiveUploadUnsup, id, ok, err.Error())
+	}
 
 	// 2. 非 SymlinkReject 策略必须拒绝
 	requireNoErr(t, rig.scopedFS.WithRoot(rig.localRoot, func(root ports.RootHandle) error {

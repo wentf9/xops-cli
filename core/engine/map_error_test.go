@@ -8,6 +8,7 @@ import (
 
 	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
+	"github.com/wentf9/xops-cli/core/domain/pathalg"
 	"github.com/wentf9/xops-cli/core/domain/security"
 	"github.com/wentf9/xops-cli/core/internal/gate"
 	"github.com/wentf9/xops-cli/core/internal/sim"
@@ -69,9 +70,15 @@ func assertApprovalChallengeMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSinkFromEntropy: %v", err)
 	}
+	etcRule, err := pathalg.NewProtectedRule("/etc/**", "etc")
+	if err != nil {
+		t.Fatalf("NewProtectedRule: %v", err)
+	}
 	pol, err := gate.NewGuardrailPolicy(gate.GuardrailPolicySpec{
 		ApprovalThreshold: security.RiskModerate,
 		NoElicitFallback:  gate.NoElicitFallbackChallenge,
+		ProtectedRules:    []pathalg.ProtectedRule{etcRule},
+		ProtectedPathRisk: algebraic.Some(security.RiskModerate),
 	})
 	if err != nil {
 		t.Fatalf("NewGuardrailPolicy: %v", err)
@@ -108,18 +115,110 @@ func assertApprovalChallengeMapping(t *testing.T) {
 	if !errors.Is(mapped, ErrApprovalRequired) || !errors.Is(mapped, gate.ErrApprovalRequired) {
 		t.Fatalf("ApprovalChallengeError 映射丢失哨兵: %v", mapped)
 	}
-	if ch, ok := ExtractApprovalChallenge(mapped); !ok || !ch.IsValid() {
+	ch, ok := ExtractApprovalChallenge(mapped)
+	if !ok || !ch.IsValid() {
 		t.Fatalf("ExtractApprovalChallenge 失败: ok=%v ch=%+v", ok, ch)
 	}
+	assertExtractedChallengeReasonProjection(t, ch)
 	if mapped.Error() != domi18n.CanonicalError(mapped) {
 		t.Fatalf("ApprovalChallengeError CanonicalError 失配: err=%q canonical=%q", mapped.Error(), domi18n.CanonicalError(mapped))
 	}
+
+	assertProtectedPathChallengeProjection(t, clk, rng, auditSink, etcRule)
 
 	// 7. 零值与 typed-nil *gate.ApprovalChallengeError 负例：绝不可误包 ErrApprovalRequired 或产生双头段。
 	var zeroCh gate.ApprovalChallengeError
 	assertInvalidApprovalChallengeNotWrapped(t, "zero", &zeroCh)
 	var typedNil *gate.ApprovalChallengeError
 	assertInvalidApprovalChallengeNotWrapped(t, "typed-nil", typedNil)
+}
+
+func assertProtectedPathChallengeProjection(
+	t *testing.T,
+	clk ports.Clock,
+	rng *sim.SeededRand,
+	auditSink ports.AuditSink,
+	etcRule pathalg.ProtectedRule,
+) {
+	t.Helper()
+	protPol, err := gate.NewGuardrailPolicy(gate.GuardrailPolicySpec{
+		ApprovalThreshold: security.RiskDangerous,
+		NoElicitFallback:  gate.NoElicitFallbackChallenge,
+		ProtectedRules:    []pathalg.ProtectedRule{etcRule},
+		ProtectedPathRisk: algebraic.Some(security.RiskModerate),
+	})
+	if err != nil {
+		t.Fatalf("NewGuardrailPolicy(prot): %v", err)
+	}
+	protGate, err := gate.NewGate(gate.GateConfig{
+		Profile: gate.PolicyProfileStrictAgent, Policy: protPol,
+		AuditSink: auditSink, Clock: clk, Entropy: rng.Fork(),
+	})
+	if err != nil {
+		t.Fatalf("NewGate(prot): %v", err)
+	}
+	protBinding, err := security.NewOperationBinding(security.OperationBindingSpec{
+		Capability: security.CapabilityKindOf[security.CapMutate](),
+		Tool:       "file", Action: "write", NodeID: "web-1",
+		CanonicalPaths: []string{"/etc/hosts"},
+	})
+	if err != nil {
+		t.Fatalf("NewOperationBinding(prot): %v", err)
+	}
+	protReq, err := gate.NewGateRequest[security.CapMutate](gate.GateRequestSpec[security.CapMutate]{
+		Binding: protBinding, Risk: security.RiskSafe, ScopeSummary: "write /etc/hosts",
+		Paths: []string{"/etc/hosts"}, Approval: algebraic.None[gate.ApprovalSubmission](),
+	})
+	if err != nil {
+		t.Fatalf("NewGateRequest(prot): %v", err)
+	}
+	protErr := mapEngineError(gate.WithAuthorized[security.CapMutate](context.Background(), protGate, protReq, func(context.Context, gate.Authorized[security.CapMutate]) error {
+		return nil
+	}))
+	protCh, okProt := ExtractApprovalChallenge(protErr)
+	if !okProt || !protCh.IsValid() || protCh.Reason() != "operation touches protected path" {
+		t.Fatalf("protected path ExtractApprovalChallenge 失败: ok=%v reason=%q err=%v", okProt, protCh.Reason(), protErr)
+	}
+	if pm, okPM := protCh.ReasonMessage().Get(); !okPM || pm.ID() != domi18n.KeyGateReasonProtectedPath {
+		t.Fatalf("protected path ReasonMessage = (%v, %v)，期望 KeyGateReasonProtectedPath", pm, okPM)
+	}
+	if pn, okPN := protCh.ReasonParam("reason").MessageVal(); !okPN || pn.ID() != domi18n.KeyGateReasonProtectedPath {
+		t.Fatalf("protected path ReasonParam = (%v, %v)，期望 KeyGateReasonProtectedPath", pn, okPN)
+	}
+}
+
+func assertExtractedChallengeReasonProjection(t *testing.T, ch ApprovalChallenge) {
+	t.Helper()
+	const wantReason = "operation risk meets or exceeds approval threshold"
+	if ch.Reason() != wantReason {
+		t.Fatalf("ApprovalChallenge.Reason() = %q，期望 %q", ch.Reason(), wantReason)
+	}
+	msg, okMsg := ch.ReasonMessage().Get()
+	if !okMsg || msg.ID() != domi18n.KeyGateReasonRiskMeetsThreshold || msg.Canonical() != wantReason {
+		t.Fatalf("ApprovalChallenge.ReasonMessage() = (%v, %v)，期望 %s", msg, okMsg, domi18n.KeyGateReasonRiskMeetsThreshold)
+	}
+	rp := ch.ReasonParam("reason")
+	nested, okP := rp.MessageVal()
+	if rp.Kind() != domi18n.ParamKindMessage || !okP || nested.ID() != domi18n.KeyGateReasonRiskMeetsThreshold || nested.Canonical() != wantReason {
+		t.Fatalf("ApprovalChallenge.ReasonParam() = (%v, %v)，期望 %s", rp, nested, domi18n.KeyGateReasonRiskMeetsThreshold)
+	}
+
+	// 无效零值、有效态空原因与有效态自由文本回退边界核验。
+	var zero ApprovalChallenge
+	if zero.IsValid() || zero.Reason() != "" || zero.ReasonMessage().IsSome() {
+		t.Fatalf("零值 ApprovalChallenge 应无效且 ReasonMessage 为 None: %+v", zero)
+	}
+	if zn, ok := zero.ReasonParam("reason").MessageVal(); !ok || zn.ID() != domi18n.KeyGateReasonApprovalRequired {
+		t.Fatalf("零值 ReasonParam 应失败关闭至 KeyGateReasonApprovalRequired: %v", zn)
+	}
+	emptyReason := ApprovalChallenge{envelope: ch.Envelope(), digest: ch.EnvelopeDigest(), valid: true}
+	if en, ok := emptyReason.ReasonParam("reason").MessageVal(); !ok || en.ID() != domi18n.KeyGateReasonApprovalRequired {
+		t.Fatalf("有效态空原因 ReasonParam 应回退 KeyGateReasonApprovalRequired: %v", en)
+	}
+	freeReason := ApprovalChallenge{envelope: ch.Envelope(), digest: ch.EnvelopeDigest(), reason: "custom host rule", valid: true}
+	if s, ok := freeReason.ReasonParam("reason").StringVal(); !ok || s != "custom host rule" {
+		t.Fatalf("有效态自由文本 ReasonParam 应回退 BoundStr: got=(%q, %v)", s, ok)
+	}
 }
 
 func assertInvalidApprovalChallengeNotWrapped(t *testing.T, label string, raw error) {

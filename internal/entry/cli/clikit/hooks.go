@@ -373,7 +373,7 @@ func (r *Runtime) Fail(exitCode int, jsonOut bool, err error) int {
 				i18n.KeyCLIApprovalRequired,
 				i18n.BoundStr("digest", ch.EnvelopeDigest().String()),
 				i18n.Bool("escalated", ch.Escalated()),
-				i18n.BoundStr("reason", ch.Reason()),
+				ch.ReasonParam("reason"),
 			))
 		}
 	}

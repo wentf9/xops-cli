@@ -167,6 +167,51 @@ func TestBuildExecOutcomeView_FailClosedAndDoNotRetry(t *testing.T) {
 	}
 }
 
+func TestMapOutcomeToExitLocalized_ExitUnknownDefaultReasonSuppressed(t *testing.T) {
+	defer goleak.VerifyNone(t)
+
+	cat, err := i18n.LoadCatalog()
+	if err != nil {
+		t.Fatalf("LoadCatalog 失败: %v", err)
+	}
+	enLoc := cat.For(domi18n.LocaleEn)
+	zhLoc := cat.For(domi18n.LocaleZh)
+
+	defaultOut, err := execution.NewOutcomeCompleted(execution.NewExitUnknown("process exit status unavailable"), false)
+	if err != nil {
+		t.Fatalf("NewOutcomeCompleted(default): %v", err)
+	}
+	emptyOut, err := execution.NewOutcomeCompleted(execution.NewExitUnknown(""), false)
+	if err != nil {
+		t.Fatalf("NewOutcomeCompleted(empty): %v", err)
+	}
+	customOut, err := execution.NewOutcomeCompleted(execution.NewExitUnknown("ssh channel closed"), false)
+	if err != nil {
+		t.Fatalf("NewOutcomeCompleted(custom): %v", err)
+	}
+
+	for _, out := range []execution.ExecutionOutcome{defaultOut, emptyOut} {
+		codeEn, diagEn, _ := clikit.MapOutcomeToExitLocalized(enLoc, out, nil)
+		codeZh, diagZh, _ := clikit.MapOutcomeToExitLocalized(zhLoc, out, nil)
+		if codeEn != clikit.ExitSSHError || codeZh != clikit.ExitSSHError {
+			t.Fatalf("ExitUnknown 退出码异常: en=%d zh=%d", codeEn, codeZh)
+		}
+		if diagEn != "remote process exited without exit status" {
+			t.Fatalf("EN ExitUnknown 诊断异常: %q", diagEn)
+		}
+		if diagZh != "远端进程已退出但未返回退出状态" {
+			t.Fatalf("ZH ExitUnknown 诊断不得残留默认英文原因: %q", diagZh)
+		}
+	}
+
+	_, customEn, _ := clikit.MapOutcomeToExitLocalized(enLoc, customOut, nil)
+	_, customZh, _ := clikit.MapOutcomeToExitLocalized(zhLoc, customOut, nil)
+	if customEn != "remote process exited without exit status: ssh channel closed" ||
+		customZh != "远端进程已退出但未返回退出状态：ssh channel closed" {
+		t.Fatalf("自定义 ExitUnknown 原因渲染异常: en=%q zh=%q", customEn, customZh)
+	}
+}
+
 func TestRuntime_WithEngineAndReadLocalInputFailClosed(t *testing.T) {
 	defer goleak.VerifyNone(t)
 

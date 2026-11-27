@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 	"sync/atomic"
 
+	"github.com/wentf9/xops-cli/core/domain/algebraic"
 	"github.com/wentf9/xops-cli/core/domain/execution"
 	domi18n "github.com/wentf9/xops-cli/core/domain/i18n"
 	"github.com/wentf9/xops-cli/core/domain/security"
@@ -73,45 +74,16 @@ func (a Authorized[C]) Capability() security.CapabilityKind {
 	return a.binding.Capability()
 }
 
-// TraceID 返回当前授权操作绑定的链路追踪标识；无效或已吊销时返回零值。
-func (a Authorized[C]) TraceID() security.TraceID {
-	if !a.IsValid() {
-		return zeroVal[security.TraceID]()
-	}
-	return a.traceID
-}
-
-// OperationID 返回当前授权操作绑定的唯一操作标识；无效或已吊销时返回零值。
-func (a Authorized[C]) OperationID() security.OperationID {
-	if !a.IsValid() {
-		return zeroVal[security.OperationID]()
-	}
-	return a.opID
-}
-
-// Binding 返回当前授权操作绑定的不可变规范操作快照；无效或已吊销时返回零值。
+// TraceID / OperationID / Binding 返回当前授权操作绑定的只读标识与规范快照；无效或已吊销时返回零值。
+func (a Authorized[C]) TraceID() security.TraceID         { return validOrZero(a.IsValid(), a.traceID) }
+func (a Authorized[C]) OperationID() security.OperationID { return validOrZero(a.IsValid(), a.opID) }
 func (a Authorized[C]) Binding() security.OperationBinding {
-	if !a.IsValid() {
-		return zeroVal[security.OperationBinding]()
-	}
-	return a.binding
+	return validOrZero(a.IsValid(), a.binding)
 }
 
-// Profile 返回签发本证明时的安全策略配置档；无效或已吊销时返回 PolicyProfileInvalid。
-func (a Authorized[C]) Profile() PolicyProfileKind {
-	if !a.IsValid() {
-		return PolicyProfileInvalid
-	}
-	return a.profile
-}
-
-// Risk 返回本次授权最终生效的风险等级；无效或已吊销时返回 RiskUnknown。
-func (a Authorized[C]) Risk() security.RiskLevel {
-	if !a.IsValid() {
-		return security.RiskUnknown
-	}
-	return a.risk
-}
+// Profile / Risk 返回签发本证明时的策略配置档与最终风险等级；无效或已吊销时返回失败关闭零值。
+func (a Authorized[C]) Profile() PolicyProfileKind { return validOrZero(a.IsValid(), a.profile) }
+func (a Authorized[C]) Risk() security.RiskLevel   { return validOrZero(a.IsValid(), a.risk) }
 
 // ReportOutcome 允许受权回调向 WithAuthorized 上报强类型 execution.ExecutionOutcome，
 // 确保 *execution.OutcomeUnknown 在终态审计中严格映射为 ports.AuditOutcomeUnknown（严禁降级）。
@@ -377,11 +349,40 @@ func (e *ApprovalChallengeError) Unwrap() error {
 	return ErrApprovalRequired
 }
 
+func validOrZero[T any](ok bool, v T) (z T) {
+	if ok {
+		return v
+	}
+	return z
+}
+
+// ReasonMessage 将封闭规范英文原因投影为结构化消息；无效态或未登记自由文本返回 None。
+func (e *ApprovalChallengeError) ReasonMessage() algebraic.Option[domi18n.Message] {
+	if !e.IsValid() {
+		return algebraic.None[domi18n.Message]()
+	}
+	if msg, ok := reasonmsg.ProjectMessage(e.reason); ok {
+		return algebraic.Some(msg)
+	}
+	if e.reason == "" {
+		return algebraic.Some(domi18n.NewMessage(domi18n.KeyGateReasonApprovalRequired))
+	}
+	return algebraic.None[domi18n.Message]()
+}
+
+// ReasonParam 构造审批挑战原因参数（封闭原因投影为嵌套消息，无效态失败关闭至默认审批原因）。
+func (e *ApprovalChallengeError) ReasonParam(key string) domi18n.Param {
+	if !e.IsValid() {
+		return domi18n.Msg(key, domi18n.NewMessage(domi18n.KeyGateReasonApprovalRequired))
+	}
+	return reasonmsg.Param(key, e.reason, domi18n.KeyGateReasonApprovalRequired)
+}
+
 // LocalizableView 返回 *ApprovalChallengeError 的只读结构化错误视图（保留 ErrApprovalRequired 哨兵语义）。
 func (e *ApprovalChallengeError) LocalizableView() domi18n.ErrorNode {
 	if !e.IsValid() {
 		return domi18n.ErrorNode{Message: domi18n.NewMessage(domi18n.KeyGateApprovalRequired)}
 	}
-	return domi18n.ErrorNode{Sentinel: ErrApprovalRequired, Message: domi18n.NewMessage(domi18n.KeyGateApprovalChallenge, domi18n.Str("op", e.envelope.OperationID().String()), domi18n.Bool("escalated", e.escalated), reasonmsg.Param("reason", e.reason, domi18n.KeyGateReasonApprovalRequired))}
+	return domi18n.ErrorNode{Sentinel: ErrApprovalRequired, Message: domi18n.NewMessage(domi18n.KeyGateApprovalChallenge, domi18n.Str("op", e.envelope.OperationID().String()), domi18n.Bool("escalated", e.escalated), e.ReasonParam("reason"))}
 }
 func (e *ApprovalChallengeError) Error() string { return domi18n.CanonicalError(e) }

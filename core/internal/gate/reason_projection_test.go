@@ -309,14 +309,60 @@ func assertChallengeReasonProjected(t *testing.T, ch *ApprovalChallengeError, wa
 	if ch.Reason() != wantRaw {
 		t.Fatalf("ApprovalChallengeError.Reason() = %q，期望 %q", ch.Reason(), wantRaw)
 	}
+	msgOpt := ch.ReasonMessage()
+	msg, okOpt := msgOpt.Get()
+	if !okOpt || !msg.IsValid() || msg.ID() != wantID || msg.Canonical() != wantRaw {
+		t.Fatalf("ApprovalChallengeError.ReasonMessage() = (%v, %v)，期望 id=%s canonical=%q", msg, okOpt, wantID, wantRaw)
+	}
+	rp := ch.ReasonParam("reason")
 	view := ch.LocalizableView()
 	requireTrue(t, errors.Is(view.Sentinel, ErrApprovalRequired) && view.Message.ID() == domi18n.KeyGateApprovalChallenge, "挑战视图哨兵与消息 ID 必须匹配")
 	p, ok := view.Message.ParamByKey("reason")
-	requireTrue(t, ok && p.Kind() == domi18n.ParamKindMessage, "挑战 reason 参数必须为结构化嵌套消息")
+	requireTrue(t, ok && p.Kind() == domi18n.ParamKindMessage && rp.Equal(p), "挑战 reason 参数必须与 ReasonParam 一致且为结构化嵌套消息")
 	nested, okM := p.MessageVal()
 	if !okM || nested.ID() != wantID || nested.Canonical() != wantRaw {
 		t.Fatalf("挑战 reason 嵌套消息 = (%v, %v)，期望 id=%s canonical=%q", nested, okM, wantID, wantRaw)
 	}
+}
+
+// TestApprovalChallengeError_ReasonMessageAndParamBoundaries 覆盖无效零值、typed-nil、空原因与自由文本的失败关闭语义。
+func TestApprovalChallengeError_ReasonMessageAndParamBoundaries(t *testing.T) {
+	var zeroCh ApprovalChallengeError
+	var typedNil *ApprovalChallengeError
+	for _, ch := range []*ApprovalChallengeError{&zeroCh, typedNil} {
+		requireTrue(t, ch.Reason() == "" && ch.ReasonMessage().IsNone(), "无效 ApprovalChallengeError 必须返回空原因与 None")
+		p := ch.ReasonParam("reason")
+		nested, ok := p.MessageVal()
+		requireTrue(t, ok && nested.ID() == domi18n.KeyGateReasonApprovalRequired, "无效 ApprovalChallengeError.ReasonParam 必须失败关闭至 KeyGateReasonApprovalRequired")
+	}
+
+	b := mustBinding(t, security.CapabilityMutate, "file_write", "write", "web-01", "/etc/hosts")
+	opID := security.OperationIDFromBytes([16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16})
+	nonce, err := security.NewApprovalNonceFrom(bytes.NewReader([]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}))
+	requireNoErr(t, err, "NewApprovalNonceFrom")
+	dec, err := security.NewDecisionNeedApproval(security.RiskDangerous, "custom external reason")
+	requireNoErr(t, err, "NewDecisionNeedApproval")
+	env, err := security.NewApprovalEnvelope(security.ApprovalEnvelopeSpec{
+		OperationID: opID, Binding: b, Risk: security.RiskDangerous, Decision: dec,
+		ScopeSummary: "write /etc/hosts", IssuedAt: baseTestTime(),
+		TTL: algebraic.FromStdDuration(time.Minute), Nonce: nonce,
+	})
+	requireNoErr(t, err, "NewApprovalEnvelope")
+	dig, err := env.Digest()
+	requireNoErr(t, err, "Digest")
+
+	freeCh := newApprovalChallengeError(env, dig, false, "custom external reason")
+	requireTrue(t, freeCh.Reason() == "custom external reason" && freeCh.ReasonMessage().IsNone(), "未登记自由文本 ReasonMessage 应返回 None")
+	fp := freeCh.ReasonParam("reason")
+	gotStr, okStr := fp.StringVal()
+	requireTrue(t, fp.Kind() == domi18n.ParamKindString && okStr && gotStr == "custom external reason", "自由文本 ReasonParam 应回退 BoundStr")
+
+	emptyReasonCh := &ApprovalChallengeError{envelope: env, digest: dig, reason: "", valid: true}
+	emptyMsg, okEmpty := emptyReasonCh.ReasonMessage().Get()
+	requireTrue(t, okEmpty && emptyMsg.ID() == domi18n.KeyGateReasonApprovalRequired, "有效态空原因 ReasonMessage 应回退 KeyGateReasonApprovalRequired")
+	ep := emptyReasonCh.ReasonParam("reason")
+	emptyNested, okEN := ep.MessageVal()
+	requireTrue(t, okEN && emptyNested.ID() == domi18n.KeyGateReasonApprovalRequired, "有效态空原因 ReasonParam 应回退 KeyGateReasonApprovalRequired")
 }
 
 // TestReasonMsgFallbackAndFreeFormBoundary 验证空原因、非法兜底键与未知自由文本的失败关闭回退语义。

@@ -148,7 +148,7 @@ func (s *Service) validateOpenGUISession(ctx context.Context, req OpenGUISession
 func buildGUISessionForwardSpec(spec GUISessionSpec, bindAddr string) (ports.ForwardSpec, string, error) {
 	if spec.UseUnixSocket {
 		if spec.Kind != GUISessionX11 {
-			return zeroVal[ports.ForwardSpec](), "", domi18n.EF(ErrInvalidGUIInput, domi18n.KeyCommonNotSupported, domi18n.Str("feature", "unix_socket_for_vnc"))
+			return zeroVal[ports.ForwardSpec](), "", domi18n.EF(ErrInvalidGUIInput, domi18n.KeyUCObsVNCUnixSocketUnsup)
 		}
 		sockPath := fmt.Sprintf("/tmp/.X11-unix/X%d", spec.DisplayNum)
 		fs, err := ports.NewTypedForwardSpec(ports.ForwardLocal, ports.ForwardEndpointTCP, bindAddr, ports.ForwardEndpointUnix, sockPath)
