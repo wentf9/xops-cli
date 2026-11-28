@@ -14,7 +14,7 @@
 
 ## 2. 三模块架构与单向依赖矩阵
 
-**Go 1.27+**（`CGO_ENABLED=0`）三模块 Workspace（[go.work](go.work)），全仓 3 个 `go.mod` 与 `go.work` **永久 0 `replace`**；`core/go.mod` 遵 Go Module SIV（`github.com/wentf9/xops-cli/core` 无 `/v2` 后缀，根 [go.mod](go.mod) 当前锁 `core/v1.0.0`，演进发 `core/v1.x.y` Tag）：
+**Go 1.27+**（`CGO_ENABLED=0`）三模块 Workspace（[go.work](go.work)），全仓 3 个 `go.mod` 与 `go.work` **永久 0 `replace`**；`core/go.mod` 遵 Go Module SIV（`github.com/wentf9/xops-cli/core` 无 `/v2` 后缀，根 [go.mod](go.mod) 当前锁 `core/v1.1.0`，演进发 `core/v1.x.y` Tag）：
 
 1. **`tools/xopsvet/`**（[tools/xopsvet/go.mod](tools/xopsvet/go.mod)）：独立静态分析器模块（隔离 `golang.org/x/tools`），含 **10 大正交分析器**（含第 10 分析器 `i18nguard`）。
 2. **`core/`**（[core/go.mod](core/go.mod)）：无宿主假设六边形核心。仅公开 6 包：`core/domain/...`（其中 `core/domain/i18n` 为绝对叶包，纯数据延迟本地化，无环内部叶包 `internal/{textalg,errchain,corecatalog/{common,domain,ports,runtime,usecase}}` 零仓内依赖且 `corecatalog/**` 生产仅导 `"slices"`）、`core/ports`（含 `ScopedRootFS`/`OperatorReadFS`/`FormatImporter`/`tck`）、`core/events`、`core/osfs`、`core/conc`（`Nursery`+`CtxMutex`，维持零仓内依赖不动摇）、`core/engine`；其余 100% 封锁于 `core/internal/`（`foundation/{actor,trace}`、`pool`、`gate`（含 `internal/reasonmsg`）、`usecase/*`、`mcpruntime/{protocol,tools}`、`sshnet/*`、`sim`）。

@@ -236,7 +236,7 @@ verify-dst:
 
 dst: verify-dst
 
-# 正式发布锁定 core/v1.0.0 Tag 后的三模块全量 GOWORK=off 验收门禁
+# 正式发布锁定 core/v1.x.y Tag 后的三模块全量 GOWORK=off 验收门禁
 verify-release:
 	$(VERIFY_CMD) --stage=all --gowork-off
 

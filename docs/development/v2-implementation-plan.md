@@ -1,7 +1,7 @@
 # XOps v2 全新架构分阶段实施计划（Implementation Plan）
 
 > **关联架构宪法**：[XOps v2 全新架构定稿规范（Architecture RFC）](./v2-architecture-rfc.md)（ADR-001 – ADR-017）  
-> **计划状态**：**Phase 0 – Phase 5 全量收口完成，后续演进全仓国际化（i18n）M1–M3 已闭环、M4 文档/Skill 已同步（余待授权发版）**——Phase 0（`Gate G0-R2`）至 Phase 5（`Gate G5`，`core/v1.0.0` 已在根 `go.mod` 锁定）均已全量完成；v2 后续演进 **全仓国际化（i18n，Plan v2.2）** 已完成 M1（基础设施/10 大分析器/v2.1 修订）、M2（入口与交互层双语/TUI `L` 热切/命令感知 `--lang`）与 M3（全仓 `core` & `host` 迁移/1,506 双语词条/v2.2 无环叶包分解与规则 4–5 全仓合闸，`HEAD=3e054fa`），M4 开发/双语用户文档与 Agent Skill 均已完成同步，仅余待用户授权的 `core/v1.1.0` 跨模块发版验收  
+> **计划状态**：**Phase 0 – Phase 5 全量收口完成，后续演进全仓国际化（i18n）M1–M4 已在本地闭环并锁定 `core/v1.1.0`**——Phase 0（`Gate G0-R2`）至 Phase 5（`Gate G5`）均已全量完成；v2 后续演进 **全仓国际化（i18n，Plan v2.2）** 已完成 M1（基础设施/10 大分析器/v2.1 修订）、M2（入口与交互层双语/TUI `L` 热切/命令感知 `--lang`）、M3（全仓 `core` & `host` 迁移/1,506 双语词条/v2.2 无环叶包分解与规则 4–5 全仓合闸）与 M4（开发/双语用户文档与 Agent Skill 同步、本地创建 `core/v1.1.0` Tag 锁定根 `go.mod` 并通过 `make verify-release` 三模块 `GOWORK=off` 验收；远端 `git push` 与非 Linux 原生实机验收待后续按需触发）  
 > **执行铁律**：**Go 1.27+** · 全仓 3 个 `go.mod` 零 `replace`（`core/` 与 `tools/xopsvet/` 全程 `GOWORK=off`，根 CLI 开发期经 `go.work`，打 `core/v1.x.y` Tag 发布时三模块全量 `GOWORK=off`）· **先筑 `xopsvet` 护栏与四端统一 `verify.go` CI 再写业务代码** · **Gate G2 后即交付 Walking Skeleton 纵向真机闭环** · 严禁新旧双轨补丁
 
 ---
@@ -268,15 +268,16 @@ go run ./scripts/ci/verify.go --stage=dst
   4. **`ensureErrorMessage` 缺失占位符闭环与跨平台 `xopsvet`**：接入 O(n) 零分配 `textalg.HasMissingPlaceholder` 快路径、`CollectFormatPlaceholderKeys` 必填抢救与 `<invalid>` 回填；`scripts/ci/verify.go --stage=cross` 纳入 Windows/macOS 跨平台 `go vet -vettool=bin/xopsvet`。
 - **本地 Linux 验收记录（`HEAD=3e054fa`）**：
   - 已通过 `verify.go --stage=xopsvet`、`--stage=all`（`tools/xopsvet`、`core` `GOWORK=off`、根模块 `go.work`，10 大分析器与 `golangci-lint` 均 0 issues）、`--stage=cross`（Windows/macOS 交叉编译 + 跨平台 `xopsvet` + 交叉 Lint）、FreeBSD 交叉 `xopsvet`、`--stage=dst`（10,000 种子）、50 轮并发 `-race` 压测、`core/domain/i18n` 5 项 Fuzz 冒烟、`verify.go --self-test`、`test_ci_changes.py` 及全仓 98 个生产包体量红线巡检（最高 `core/osfs` 2,994 `<= 3,000`，逻辑文件 `<= 500`，`*_spec.go` `<= 800`，0 `//nolint:`，0 未格式化文件）。
-  - **未运行项（平台诚实声明）**：非 Linux 平台（Windows 原生 `GetUserDefaultLocaleName`/ConPTY/OSFS、macOS 原生 Runner、FreeBSD 原生 VM）实机测试与 `core/v1.1.0` 打标后 `--gowork-off` 独立发布验收尚未执行。
+  - **未运行项（平台诚实声明）**：非 Linux 平台（Windows 原生 `GetUserDefaultLocaleName`/ConPTY/OSFS、macOS 原生 Runner、FreeBSD 原生 VM）实机测试尚未在本地 Linux 宿主机执行。
 
-### M4：文档/Skill 同步与待授权 `core/v1.1.0` 跨模块发版验收（`[~]` 进行中）
+### M4：文档/Skill 同步与 `core/v1.1.0` 跨模块发版验收（`[x]` 本地已闭环）
 - `[x]` 开发文档与工程宪法同步（`AGENTS.md`、`docs/development/{v2-architecture-rfc,v2-implementation-plan,index,v2-local-multiplatform-ci}.md`）。
 - `[x]` 对外双语用户文档（`README.md`/`README_en.md`、`docs/guide/**` & `docs/en/guide/**`、`docs/reference/index.md` & `docs/en/reference/index.md`，不动旧版 `docs/reference/commands/`）与 `skills/xops-agent/**` 同步。
-- `[ ]` **待用户明确授权后执行**：打 `core/v1.1.0` Tag → 更新根 `go.mod` 锁定 `github.com/wentf9/xops-cli/core v1.1.0`（当前根 `go.mod` 仍锁定 `v1.0.0`，日常开发经 `go.work` 联合验证）→ 同步 `scripts/ci/verify.go` 发版注释 → 运行 `go run ./scripts/ci/verify.go --stage=all --gowork-off`、`--stage=cross`、`--stage=dst` 及多平台原生实机验收。
+- `[x]` **经用户授权本地发版锁定**：已在 `0ae2a64` 创建本地 `core/v1.1.0` 附注 Tag、更新根 `go.mod`/`go.sum` 锁定 `github.com/wentf9/xops-cli/core v1.1.0`、同步 `scripts/ci/verify.go`/`Makefile`/`AGENTS.md` 发版说明，并通过 `make verify-release`（`go run ./scripts/ci/verify.go --stage=all --gowork-off`）、`--stage=cross` 与 `--stage=dst` 三模块全量独立验收。
+- `[ ]` **远端推送与非 Linux 原生实机验收**：`git push`（含推送 `core/v1.1.0` Tag 至远端以供远端 Runner 在 `GOWORK=off` 下拉取）及 Windows/macOS/FreeBSD 原生靶机实测待用户另行触发。
 
 ### i18n 演进持久化清单
 - **M1（底座 + 10 大分析器 + Plan v2.1 修订）**：`[x] core/domain/i18n` · `[x] internal/i18n` · `[x] host/sys/locale*.go` · `[x] xopsvet 10 分析器与 v2.1 加固`
 - **M2（入口与交互双语闭环）**：`[x] InteractionPort 13+ 提示与热同步` · `[x] 命令感知 ScanPreFlags --lang/--json 与 CLI/SFTP Shell` · `[x] TUI 全状态延迟渲染与 L 热切`
 - **M3（全仓 `core` & `host` 迁移 + Plan v2.2 修订，`HEAD=3e054fa`）**：`[x] Wave 3A–3E 与 MCP 规范英文收口` · `[x] 1,506 双语词条与内部叶包分解` · `[x] i18nguard 规则 1–5 全仓合闸与双轨投影` · `[x] 本地 Linux 9 项门禁全绿`
-- **M4（文档/Skill 同步与 `core/v1.1.0` 待授权发版）**：`[x] 开发文档与 AGENTS.md 同步` · `[x] 双语用户文档与 Skill 同步` · `[ ] 待授权 core/v1.1.0 Tag、锁根 go.mod 与 --gowork-off / 多平台原生验收`
+- **M4（文档/Skill 同步与 `core/v1.1.0` 发版验收）**：`[x] 开发文档与 AGENTS.md 同步` · `[x] 双语用户文档与 Skill 同步` · `[x] 本地 core/v1.1.0 Tag、锁根 go.mod 与 make verify-release (--gowork-off)` · `[ ] 远端推送与多平台原生实机验收`

@@ -87,7 +87,7 @@ func parseOptions(args []string) (options, error) {
 	fs.StringVar(&opts.pkg, "pkg", "./...", "传递给 core/root go test 的包匹配模式")
 	fs.BoolVar(&opts.verbose, "verbose", false, "向 go test 透传 -v 输出详细用例日志")
 	fs.BoolVar(&opts.skipLint, "skip-lint", false, "跳过 golangci-lint（适配外部 lint Action 或无 lint Runner）")
-	fs.BoolVar(&opts.goworkOff, "gowork-off", false, "对根 CLI 模块也强制 GOWORK=off（正式发版锁 core/v1.0.0 Tag 验收）")
+	fs.BoolVar(&opts.goworkOff, "gowork-off", false, "对根 CLI 模块也强制 GOWORK=off（正式发版锁 core/v1.x.y Tag 验收）")
 	fs.BoolVar(&opts.test, "self-test", false, "仅执行 verify.go 自检、replace 守卫与内部不变量测试")
 	fs.StringVar(&opts.dstSeeds, "dst-seeds", strings.TrimSpace(os.Getenv("XOPS_DST_SEEDS")), "传递给 --stage=dst 的 XOPS_DST_SEEDS 种子数")
 	if err := fs.Parse(args); err != nil {
