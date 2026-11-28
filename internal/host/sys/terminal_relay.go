@@ -200,7 +200,7 @@ func copyRemoteOutput(scopeCtx context.Context, dst io.Writer, remoteOut io.Read
 			}
 		}
 		if rErr != nil {
-			if errors.Is(rErr, io.EOF) {
+			if errors.Is(rErr, io.EOF) || (scopeCtx.Err() != nil && errors.Is(rErr, io.ErrClosedPipe)) {
 				return scopeCtx.Err()
 			}
 			return rErr

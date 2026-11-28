@@ -143,7 +143,8 @@ func relayPipesThroughTerminal(
 	pr, pw := io.Pipe()
 	defer func() { _ = pr.Close() }()
 	var abortOnce sync.Once
-	abort := func() { abortOnce.Do(func() { _ = closeClosers(pr, pw, sess) }) }
+	// 先关闭写入端 pw 使阻塞于 pr.Read 的终端中继以 io.EOF 干净唤醒，再关 pr/sess 解除写端阻塞。
+	abort := func() { abortOnce.Do(func() { _ = closeClosers(pw, pr, sess) }) }
 	onResize := buildResizeCallback(sess, wantPTY)
 	var relayErr, pumpErr error
 	runErr := conc.RunWait(ctx, func(wCtx context.Context, n *conc.Nursery) error {
@@ -161,6 +162,9 @@ func relayPipesThroughTerminal(
 		}
 		return relayErr
 	})
+	if ctx.Err() != nil && isRemotePipeClosedErr(relayErr) {
+		relayErr = ctx.Err()
+	}
 	return firstNonNilErr(pumpErr, relayErr, runErr)
 }
 func buildResizeCallback(sess ports.RemoteSession, wantPTY bool) func(context.Context, ports.TerminalSize) error {

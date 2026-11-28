@@ -78,7 +78,10 @@ var (
 
 func TestSessionInteractive_CancelAndStderrErrorNoDeadlock(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	assertIdleRawTerminalCancelNoDeadlock(t)
+	// 多轮触发取消竞态，验证任何调度序下均返回 context.Canceled 而非内部管道关闭态 io.ErrClosedPipe。
+	for range 10 {
+		assertIdleRawTerminalCancelNoDeadlock(t)
+	}
 	assertIdleRawTerminalStderrWriteErrorNoDeadlock(t)
 }
 

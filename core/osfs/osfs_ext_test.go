@@ -343,6 +343,39 @@ func TestConcurrentAtomicReplaceWithSidecarLock(t *testing.T) {
 	}
 }
 
+// TestConcurrentColdSidecarLockCreation 在多个全新空目录上高并发冷创建旁路锁与原子替换，
+// 回归验证 macOS XNU/APFS 并发 openat(O_CREAT) 不因假性 ENOENT 失败。
+func TestConcurrentColdSidecarLockCreation(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	fsPort := osfs.NewScopedRootFS()
+	target := mustLocalDest(t, "cold.yaml")
+	for round := range 12 {
+		rootDir := mustLocalDir(t, t.TempDir())
+		start := make(chan struct{})
+		err := conc.RunWait(context.Background(), func(_ context.Context, n *conc.Nursery) error {
+			for worker := range 8 {
+				fill := byte('a' + worker)
+				if gErr := n.Go(func(c context.Context) error {
+					<-start
+					return fsPort.WithRoot(rootDir, func(root ports.RootHandle) error {
+						return osfs.AtomicReplaceWithSidecarLock(c, root, target, 0o600, func(w io.Writer) error {
+							_, wErr := w.Write(bytes.Repeat([]byte{fill}, 64))
+							return wErr
+						})
+					})
+				}); gErr != nil {
+					return gErr
+				}
+			}
+			close(start)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("round %d 冷启动并发旁路锁创建失败: %v", round, err)
+		}
+	}
+}
+
 func verifySymlinkAdversarialOps(t *testing.T, root ports.RootHandle, lim ports.ReadLimits) error {
 	t.Helper()
 	link := mustLocalDest(t, "keep.link")

@@ -304,7 +304,7 @@ func copyStreamWithCtx(ctx context.Context, dst io.Writer, src io.Reader) error 
 			}
 		}
 		if rErr != nil {
-			if errors.Is(rErr, io.EOF) {
+			if errors.Is(rErr, io.EOF) || (ctx.Err() != nil && errors.Is(rErr, io.ErrClosedPipe)) {
 				return ctx.Err()
 			}
 			return rErr

@@ -33,11 +33,16 @@ func openLeafInRootOS(root *os.Root, dest pathalg.LocalRootedDest, op rootLeafOp
 	return openLeafInRootUnix(root, dest, flags[op], perm)
 }
 func openatNoFollow(dirFD int, name string, flags int, mode uint32) (int, error) {
-	for {
+	for n, retry := 0, flags&(unix.O_CREAT|unix.O_EXCL) == unix.O_CREAT; ; {
 		fd, err := unix.Openat(dirFD, name, flags, mode)
-		if !errors.Is(err, syscall.EINTR) {
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if !retry || !errors.Is(err, unix.ENOENT) || n >= 32 { // 规避 macOS XNU/APFS 并发 O_CREAT 假性 ENOENT 竞态
 			return fd, err
 		}
+		n++
+		runtime.Gosched()
 	}
 }
 
